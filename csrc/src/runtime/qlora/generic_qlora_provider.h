@@ -100,6 +100,9 @@ private:
     /// Build the layer → offload groups mapping from weight names.
     void build_layer_offload_map();
 
+    /// Configure offload prefetch lookahead from env/defaults.
+    void configure_offload_prefetch_policy();
+
     std::unique_ptr<GenericWeightManager> mWeightMgr;
 
     // Deferred auto-tune: run after first training step when all lazy allocs are settled.
@@ -123,6 +126,16 @@ private:
 
     /// EP size (> 1 means LLEP may use extra GPU memory for foreign weight transfers).
     int mEPSize = 1;
+
+    /// Number of traversal positions to prefetch when the executor asks for
+    /// the next layer. Values > 1 are useful only when the resident window can
+    /// hold previous/current/future groups.
+    int mOffloadPrefetchAhead = 1;
+
+    /// Last layer index seen by prefetch_for_layer(), used to infer traversal
+    /// direction for lookahead in forward and backward passes.
+    int mLastPrefetchLayer = -1;
+    int mLastPrefetchDirection = 1;
 };
 
 }  // namespace qlora

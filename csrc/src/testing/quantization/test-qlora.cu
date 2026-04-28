@@ -3,10 +3,12 @@
 //
 
 #include <vector>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <algorithm>
 #include <numeric>
+#include <string>
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -18,6 +20,8 @@
 #include <catch2/catch_approx.hpp>
 
 #include "kernels/kernels.h"
+#include "runtime/qlora/offload_manager.h"
+#include "runtime/qlora/quantized_tensor.h"
 #include "utilities/utils.h"
 #include "../utilities/test_utils.h"
 
@@ -50,6 +54,53 @@ float compute_mae(const std::vector<float>& a, const std::vector<float>& b) {
 }
 
 }  // anonymous namespace
+
+TEST_CASE("offload manager evicts least recently used resident group", "[qlora][offload]") {
+    auto allocator = std::make_shared<TensorAllocator>();
+
+    qlora::OffloadConfig config;
+    config.max_resident_groups = 2;
+    config.enable_prefetch = true;
+    config.use_pinned_memory = true;
+    CUDA_CHECK(cudaGetDevice(&config.device_id));
+
+    auto manager = qlora::create_offload_manager(config, allocator);
+    manager->set_immutable(true);
+
+    std::array<qlora::QuantizedTensor, 3> tensors;
+    for (int i = 0; i < 3; ++i) {
+        tensors[i].M = 1;
+        tensors[i].K = 16;
+        tensors[i].format = qlora::QuantFormat::BNB_NF4;
+        tensors[i].block_size = 16;
+        tensors[i].data = allocator->allocate(ETensorDType::BYTE,
+                                              ("offload_test_data_" + std::to_string(i)).c_str(),
+                                              EAllocationType::PINNED,
+                                              {16});
+        auto* bytes = reinterpret_cast<unsigned char*>(tensors[i].data.Data);
+        std::fill(bytes, bytes + 16, static_cast<unsigned char>(i + 1));
+        manager->register_tensor(&tensors[i], i, "group_" + std::to_string(i));
+    }
+
+    cudaStream_t stream = nullptr;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+
+    REQUIRE(manager->load_group(0, stream));
+    manager->prefetch_group(1, stream);
+    REQUIRE(manager->load_group(1, stream));
+
+    // Touch group 0 again so group 1 becomes the LRU victim.
+    REQUIRE(manager->load_group(0, stream));
+    REQUIRE(manager->load_group(2, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    REQUIRE(manager->is_resident(0));
+    REQUIRE_FALSE(manager->is_resident(1));
+    REQUIRE(manager->is_resident(2));
+    REQUIRE(manager->num_resident() == 2);
+
+    CUDA_CHECK(cudaStreamDestroy(stream));
+}
 
 TEST_CASE("per-block quantization roundtrip", "[quantization][qlora]") {
     // Test parameters

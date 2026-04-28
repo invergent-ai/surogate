@@ -50,7 +50,6 @@ public:
           mCurrentStep(0) {
         if (mConfig.enable_prefetch) {
             CUDA_CHECK(cudaStreamCreateWithFlags(&mPrefetchStream, cudaStreamNonBlocking));
-            CUDA_CHECK(cudaEventCreateWithFlags(&mPrefetchEvent, cudaEventDisableTiming));
         }
     }
 
@@ -58,11 +57,12 @@ public:
         if (mPrefetchStream) {
             cudaStreamDestroy(mPrefetchStream);
         }
-        if (mPrefetchEvent) {
-            cudaEventDestroy(mPrefetchEvent);
-        }
         // Free GPU shadow buffers for all groups
         for (auto& [gid, group] : mGroups) {
+            if (group.prefetch_done) {
+                cudaEventDestroy(group.prefetch_done);
+                group.prefetch_done = nullptr;
+            }
             free_gpu_buffers(group);
             free_owned_host_buffers(group);
         }
@@ -113,8 +113,7 @@ public:
         }
         auto& group = it->second;
 
-        // Update LRU timestamp
-        group.last_access_step = mCurrentStep;
+        touch_group(group);
 
         if (group.state == GroupState::RESIDENT) {
             return true;  // Already loaded
@@ -122,8 +121,8 @@ public:
 
         if (group.state == GroupState::LOADING) {
             // Prefetch in progress - wait for it to complete
-            if (mPrefetchEvent) {
-                CUDA_CHECK(cudaStreamWaitEvent(stream, mPrefetchEvent, 0));
+            if (group.prefetch_done) {
+                CUDA_CHECK(cudaStreamWaitEvent(stream, group.prefetch_done, 0));
             }
             group.state = GroupState::RESIDENT;
             mNumResident++;
@@ -162,8 +161,8 @@ public:
 
         if (group.state == GroupState::LOADING) {
             // Wait for prefetch to finish before unloading
-            if (mPrefetchStream) {
-                CUDA_CHECK(cudaStreamSynchronize(mPrefetchStream));
+            if (group.prefetch_done) {
+                CUDA_CHECK(cudaStreamWaitEvent(stream, group.prefetch_done, 0));
             }
         }
 
@@ -195,6 +194,8 @@ public:
         }
         auto& group = it->second;
 
+        touch_group(group);
+
         if (group.state == GroupState::RESIDENT || group.state == GroupState::LOADING) {
             return;  // Already loaded or being loaded
         }
@@ -219,7 +220,10 @@ public:
         transfer_to_gpu(group, mPrefetchStream);
 
         // Record event so load_group() can wait on it
-        CUDA_CHECK(cudaEventRecord(mPrefetchEvent, mPrefetchStream));
+        if (!group.prefetch_done) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&group.prefetch_done, cudaEventDisableTiming));
+        }
+        CUDA_CHECK(cudaEventRecord(group.prefetch_done, mPrefetchStream));
 
         group.state = GroupState::LOADING;
     }
@@ -345,6 +349,7 @@ private:
         size_t total_bytes = 0;
         int64_t last_access_step = 0;
         int load_count = 0;
+        cudaEvent_t prefetch_done = nullptr;
     };
 
     // =========================================================================
@@ -357,6 +362,10 @@ private:
             it = mGroups.emplace(group_id, Group{}).first;
         }
         return it->second;
+    }
+
+    void touch_group(Group& group) {
+        group.last_access_step = ++mAccessCounter;
     }
 
     /// Find the LRU resident group (excluding the specified group).
@@ -619,12 +628,12 @@ private:
     std::unordered_map<int, Group> mGroups;
 
     int64_t mCurrentStep = 0;
+    int64_t mAccessCounter = 0;
     int mNumResident = 0;
     bool mImmutableTensors = false;
 
     // Prefetch infrastructure
     cudaStream_t mPrefetchStream = nullptr;
-    cudaEvent_t mPrefetchEvent = nullptr;
 };
 
 }  // anonymous namespace

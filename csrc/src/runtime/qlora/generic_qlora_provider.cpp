@@ -52,6 +52,16 @@ bool env_flag_enabled(const char* name) {
     return value == "1" || value == "true" || value == "yes" || value == "on";
 }
 
+int env_int_or_default(const char* name, int fallback) {
+    const char* raw = std::getenv(name);
+    if (!raw || raw[0] == '\0') return fallback;
+    try {
+        return std::stoi(raw);
+    } catch (...) {
+        return fallback;
+    }
+}
+
 }  // anonymous namespace
 
 // =============================================================================
@@ -70,6 +80,7 @@ GenericQLoRAProvider::GenericQLoRAProvider(std::unique_ptr<GenericWeightManager>
     }
 
     build_layer_offload_map();
+    configure_offload_prefetch_policy();
 
     // QLoRA base weights are frozen
     mWeightMgr->set_frozen(true);
@@ -134,6 +145,7 @@ void GenericQLoRAProvider::import_and_quantize(const std::string& file_name,
 
     // Build layer → offload group mapping
     build_layer_offload_map();
+    configure_offload_prefetch_policy();
 
     // QLoRA base weights are frozen — mark them so that new_step() skips
     // dequant cache invalidation. This avoids redundant FP4/FP8→BF16
@@ -175,6 +187,7 @@ void GenericQLoRAProvider::import_from_external(const std::string& file_name,
 
     // Build layer → offload group mapping
     build_layer_offload_map();
+    configure_offload_prefetch_policy();
 
     // QLoRA base weights are frozen
     mWeightMgr->set_frozen(true);
@@ -219,9 +232,22 @@ void GenericQLoRAProvider::prefetch_for_layer(int layer_idx, cudaStream_t stream
         return;
     }
 
-    // Prefetch all offload groups that have weights in this layer
-    for (int group_id : it->second) {
-        mWeightMgr->prefetch_group(group_id, stream);
+    int direction = mLastPrefetchDirection;
+    if (mLastPrefetchLayer >= 0 && layer_idx != mLastPrefetchLayer) {
+        direction = (layer_idx > mLastPrefetchLayer) ? 1 : -1;
+        mLastPrefetchDirection = direction;
+    }
+    mLastPrefetchLayer = layer_idx;
+
+    for (int ahead = 0; ahead < mOffloadPrefetchAhead; ++ahead) {
+        const int target_layer = layer_idx + ahead * direction;
+        auto group_it = mLayerOffloadGroups.find(target_layer);
+        if (group_it == mLayerOffloadGroups.end()) {
+            continue;
+        }
+        for (int group_id : group_it->second) {
+            mWeightMgr->prefetch_group(group_id, stream);
+        }
     }
 }
 
@@ -298,7 +324,18 @@ void GenericQLoRAProvider::auto_tune_offloading() {
     }
     const size_t available = (gpu_free > reserve) ? (gpu_free - reserve) : 0;
     int new_max = (max_grp > 0) ? static_cast<int>(available / max_grp) : om->max_resident_groups();
-    new_max = std::max(2, std::min(new_max, num_grp));
+    new_max = std::min(new_max, num_grp);
+
+    // For overlapped streaming, a two-group window often degenerates into
+    // previous+current and leaves no room for async next-layer prefetch.  When
+    // memory allows, keep enough slots for previous/current plus lookahead.
+    const int desired_prefetch_ahead = std::max(1, env_int_or_default("SUROGATE_QLORA_OFFLOAD_PREFETCH_AHEAD", 2));
+    const int overlap_floor = std::min(num_grp, std::max(2, desired_prefetch_ahead + 2));
+    if (new_max >= overlap_floor) {
+        new_max = std::max(new_max, overlap_floor);
+    } else {
+        new_max = std::max(2, new_max);
+    }
 
     fprintf(stderr,
             "Offload auto-tune: gpu_free=%.1f GB, reserve=%.1f GB, "
@@ -311,6 +348,8 @@ void GenericQLoRAProvider::auto_tune_offloading() {
             new_max,
             (new_max >= num_grp) ? " (all fit)" : "");
     om->set_max_resident_groups(new_max);
+    configure_offload_prefetch_policy();
+    fprintf(stderr, "Offload auto-tune: prefetch_ahead=%d\n", mOffloadPrefetchAhead);
 }
 
 // =============================================================================
@@ -345,6 +384,22 @@ void GenericQLoRAProvider::build_layer_offload_map() {
             mLayerOffloadGroups[layer_idx].insert(offload_group);
         }
     }
+}
+
+void GenericQLoRAProvider::configure_offload_prefetch_policy() {
+    mOffloadPrefetchAhead = 1;
+    mLastPrefetchLayer = -1;
+    mLastPrefetchDirection = 1;
+
+    if (!mWeightMgr || !mHasOffloading) {
+        return;
+    }
+
+    auto* om = mWeightMgr->offload_manager();
+    const int resident_limit = om ? om->max_resident_groups() : 0;
+    const bool has_room_for_overlap = resident_limit == 0 || resident_limit >= 3;
+    const int default_ahead = has_room_for_overlap ? 2 : 1;
+    mOffloadPrefetchAhead = std::max(1, env_int_or_default("SUROGATE_QLORA_OFFLOAD_PREFETCH_AHEAD", default_ahead));
 }
 
 }  // namespace qlora
