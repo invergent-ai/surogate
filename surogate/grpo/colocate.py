@@ -1,8 +1,8 @@
-"""Unified GRPO runner: starts vLLM, trainer, and orchestrator in a single process.
+"""Co-locate GRPO runner: starts vLLM, trainer, and orchestrator in a single process.
 
-In co-locate mode, vLLM's engine runs in a child process and the surogate trainer
-runs in the parent. CUDA IPC is used to share quantized weight GPU memory between
-the two processes (zero-copy).
+vLLM's engine runs in a child process and the surogate trainer runs in the parent;
+both share the same set of GPUs. CUDA IPC is used to share quantized weight GPU
+memory between the two processes (zero-copy).
 
 The orchestrator runs in the main async event loop, communicating with vLLM via HTTP.
 
@@ -327,7 +327,7 @@ def _run_trainer(
         raise
 
 
-def grpo_unified(
+def grpo_colocate(
     train_config: GRPOTrainConfig,
     infer_config: GRPOInferenceConfig,
     orch_config: GRPOOrchestratorConfig,
@@ -339,7 +339,7 @@ def grpo_unified(
     3. Surogate C++ trainer (background thread, borrows vLLM's weights)
     4. Orchestrator (main async event loop)
     """
-    logger.info("Starting unified GRPO pipeline (co-locate mode)")
+    logger.info("Starting GRPO pipeline (co-locate mode)")
 
     # Trainer uses filesystem broadcast for LoRA adapter updates — the vLLM
     # engine runs in a child process, so in-process shared state doesn't work.
@@ -429,7 +429,7 @@ def grpo_unified(
         logger.error(f"Orchestrator error: {e}")
         raise
     finally:
-        logger.info("Unified GRPO pipeline shutting down")
+        logger.info("GRPO pipeline shutting down")
 
         # Wait for trainer to finish (it stops when orchestrator writes the stop signal)
         trainer_thread.join(timeout=30.0)
