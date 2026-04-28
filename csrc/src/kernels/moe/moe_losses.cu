@@ -585,6 +585,134 @@ void moe_compute_routing_stats_from_logits(float* stats,
                                                                                        z_loss_coef);
 }
 
+__global__ void moe_expert_fractions_kernel(float* __restrict__ expert_fractions,
+                                            const int* __restrict__ expert_indices,
+                                            int total_assignments,
+                                            int num_experts) {
+    const float inv_total = total_assignments > 0 ? 1.0f / static_cast<float>(total_assignments) : 0.0f;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < total_assignments; i += blockDim.x * gridDim.x) {
+        const int expert_id = expert_indices[i];
+        if (expert_id >= 0 && expert_id < num_experts) {
+            atomicAdd(&expert_fractions[expert_id], inv_total);
+        }
+    }
+}
+
+void moe_compute_expert_fractions(float* expert_fractions,
+                                  const int* expert_indices,
+                                  int num_tokens,
+                                  int num_experts,
+                                  int top_k,
+                                  cudaStream_t stream) {
+    CUDA_CHECK(cudaMemsetAsync(expert_fractions, 0, static_cast<std::size_t>(num_experts) * sizeof(float), stream));
+    const int total_assignments = num_tokens * top_k;
+    if (total_assignments <= 0 || num_experts <= 0) {
+        return;
+    }
+    const int block_size = 256;
+    const int grid_size = std::min(1024, (total_assignments + block_size - 1) / block_size);
+    moe_expert_fractions_kernel<<<grid_size, block_size, 0, stream>>>(expert_fractions,
+                                                                      expert_indices,
+                                                                      total_assignments,
+                                                                      num_experts);
+}
+
+__global__ void moe_router_regularization_logits_backward_kernel(float* __restrict__ d_logits,
+                                                                 const float* __restrict__ router_logits,
+                                                                 const float* __restrict__ expert_fractions,
+                                                                 int num_tokens,
+                                                                 int num_experts,
+                                                                 float aux_loss_coef,
+                                                                 float z_loss_coef) {
+    constexpr int BLOCK_SIZE = 256;
+    const int token_idx = blockIdx.x;
+    if (token_idx >= num_tokens) return;
+
+    const float* row = router_logits + token_idx * num_experts;
+    float* d_row = d_logits + token_idx * num_experts;
+
+    float thread_max = -FLT_MAX;
+    for (int e = threadIdx.x; e < num_experts; e += BLOCK_SIZE) {
+        thread_max = fmaxf(thread_max, row[e]);
+    }
+
+    float row_max = warpReduceMax(thread_max);
+    __shared__ float smem[35];
+    const int warp_id = threadIdx.x / 32;
+    const int lane_id = threadIdx.x % 32;
+    if (lane_id == 0) {
+        smem[warp_id] = row_max;
+    }
+    __syncthreads();
+    if (warp_id == 0) {
+        float val = (lane_id < (BLOCK_SIZE / 32)) ? smem[lane_id] : -FLT_MAX;
+        row_max = warpReduceMax(val);
+        if (lane_id == 0) smem[0] = row_max;
+    }
+    __syncthreads();
+    row_max = smem[0];
+
+    float thread_sum = 0.0f;
+    float thread_aux_dot = 0.0f;
+    for (int e = threadIdx.x; e < num_experts; e += BLOCK_SIZE) {
+        const float expv = expf(row[e] - row_max);
+        thread_sum += expv;
+        thread_aux_dot += expv * expert_fractions[e];
+    }
+
+    float row_sum = warpReduceSum(thread_sum);
+    float aux_dot_sum = warpReduceSum(thread_aux_dot);
+    if (lane_id == 0) {
+        smem[warp_id] = row_sum;
+        smem[8 + warp_id] = aux_dot_sum;
+    }
+    __syncthreads();
+    if (warp_id == 0) {
+        float sum_val = (lane_id < (BLOCK_SIZE / 32)) ? smem[lane_id] : 0.0f;
+        float aux_val = (lane_id < (BLOCK_SIZE / 32)) ? smem[8 + lane_id] : 0.0f;
+        row_sum = warpReduceSum(sum_val);
+        aux_dot_sum = warpReduceSum(aux_val);
+        if (lane_id == 0) {
+            smem[0] = row_sum;
+            smem[1] = aux_dot_sum;
+        }
+    }
+    __syncthreads();
+    row_sum = fmaxf(smem[0], 1e-20f);
+    const float aux_dot = smem[1] / row_sum;
+    const float logsumexp = row_max + logf(row_sum);
+    const float inv_tokens = num_tokens > 0 ? 1.0f / static_cast<float>(num_tokens) : 0.0f;
+    const float aux_scale = aux_loss_coef * static_cast<float>(num_experts) * inv_tokens;
+    const float z_scale = z_loss_coef * 2.0f * logsumexp * inv_tokens;
+
+    for (int e = threadIdx.x; e < num_experts; e += BLOCK_SIZE) {
+        const float prob = expf(row[e] - row_max) / row_sum;
+        const float d_aux = aux_scale * prob * (expert_fractions[e] - aux_dot);
+        const float d_z = z_scale * prob;
+        d_row[e] += d_aux + d_z;
+    }
+}
+
+void moe_router_regularization_logits_backward(float* d_logits,
+                                               const float* router_logits,
+                                               const float* expert_fractions,
+                                               int num_tokens,
+                                               int num_experts,
+                                               float aux_loss_coef,
+                                               float z_loss_coef,
+                                               cudaStream_t stream) {
+    if (num_tokens <= 0 || num_experts <= 0 || (aux_loss_coef == 0.0f && z_loss_coef == 0.0f)) {
+        return;
+    }
+    moe_router_regularization_logits_backward_kernel<<<num_tokens, 256, 0, stream>>>(d_logits,
+                                                                                     router_logits,
+                                                                                     expert_fractions,
+                                                                                     num_tokens,
+                                                                                     num_experts,
+                                                                                     aux_loss_coef,
+                                                                                     z_loss_coef);
+}
+
 void moe_router_z_loss_forward(float* z_loss,
                                const nv_bfloat16* router_logits,
                                int num_tokens,

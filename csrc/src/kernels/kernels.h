@@ -3572,6 +3572,28 @@ void moe_compute_routing_stats_from_logits(float* stats,
                                            float z_loss_coef,
                                            cudaStream_t stream);
 
+/// @brief Compute per-expert assignment fractions used by router auxiliary loss backward.
+/// fraction_e = count(assignments to expert e) / (num_tokens * top_k)
+void moe_compute_expert_fractions(float* expert_fractions,
+                                  const int* expert_indices,
+                                  int num_tokens,
+                                  int num_experts,
+                                  int top_k,
+                                  cudaStream_t stream);
+
+/// @brief Add router auxiliary/z-loss gradients to an existing dense d_logits tensor.
+/// Assumes router_logits are pre-softmax logits and expert_fractions are produced by
+/// moe_compute_expert_fractions. Gradients are normalized per token, matching the
+/// logged aux/z-loss values.
+void moe_router_regularization_logits_backward(float* d_logits,
+                                               const float* router_logits,
+                                               const float* expert_fractions,
+                                               int num_tokens,
+                                               int num_experts,
+                                               float aux_loss_coef,
+                                               float z_loss_coef,
+                                               cudaStream_t stream);
+
 // MoE Backward Kernels
 
 /// @brief Backward pass for softmax routing.

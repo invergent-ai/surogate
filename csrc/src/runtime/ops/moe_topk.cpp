@@ -229,6 +229,25 @@ void CompiledExecutor::dispatch_moe_topk_backward(const CompiledOp& op) {
                           full_softmax,
                           mRunState.MainStream);
 
+        if (softmax && (mRunState.moe_aux_loss_coef() != 0.0f || mRunState.moe_z_loss_coef() != 0.0f)) {
+            Tensor expert_fractions =
+                mRunState.Stack.allocate(ETensorDType::FP32, {static_cast<long>(num_experts)}, "moe_aux_fractions");
+            moe_compute_expert_fractions(expert_fractions.get<float>(),
+                                         expert_indices.get<int>(),
+                                         num_tokens,
+                                         num_experts,
+                                         top_k,
+                                         mRunState.MainStream);
+            moe_router_regularization_logits_backward(d_probs_f32.get<float>(),
+                                                      probs_f32.get<float>(),
+                                                      expert_fractions.get<float>(),
+                                                      num_tokens,
+                                                      num_experts,
+                                                      mRunState.moe_aux_loss_coef(),
+                                                      mRunState.moe_z_loss_coef(),
+                                                      mRunState.MainStream);
+        }
+
         // Cast output back to BF16
         convert_dtype(d_probs.get<nv_bfloat16>(), d_probs_f32.get<float>(), d_probs.nelem(), mRunState.MainStream);
     } else {
@@ -245,6 +264,25 @@ void CompiledExecutor::dispatch_moe_topk_backward(const CompiledOp& op) {
                           softmax,
                           full_softmax,
                           mRunState.MainStream);
+
+        if (softmax && (mRunState.moe_aux_loss_coef() != 0.0f || mRunState.moe_z_loss_coef() != 0.0f)) {
+            Tensor expert_fractions =
+                mRunState.Stack.allocate(ETensorDType::FP32, {static_cast<long>(num_experts)}, "moe_aux_fractions");
+            moe_compute_expert_fractions(expert_fractions.get<float>(),
+                                         expert_indices.get<int>(),
+                                         num_tokens,
+                                         num_experts,
+                                         top_k,
+                                         mRunState.MainStream);
+            moe_router_regularization_logits_backward(d_probs.get<float>(),
+                                                      probs.get<float>(),
+                                                      expert_fractions.get<float>(),
+                                                      num_tokens,
+                                                      num_experts,
+                                                      mRunState.moe_aux_loss_coef(),
+                                                      mRunState.moe_z_loss_coef(),
+                                                      mRunState.MainStream);
+        }
     }
 
     store_tensor(op.outputs[0], d_probs);
