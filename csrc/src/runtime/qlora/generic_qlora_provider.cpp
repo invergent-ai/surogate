@@ -249,6 +249,12 @@ const qlora::QuantizedTensor* GenericQLoRAProvider::try_get_quantized(std::strin
     return mWeightMgr->get_quantized(std::string(name));
 }
 
+const qlora::QuantizedTensor* GenericQLoRAProvider::ensure_quantized_resident(std::string_view name,
+                                                                              cudaStream_t stream) {
+    if (!mWeightMgr) return nullptr;
+    return mWeightMgr->ensure_quantized_resident(std::string(name), stream);
+}
+
 qlora::IQuantizer* GenericQLoRAProvider::get_quantizer() const {
     if (!mWeightMgr) return nullptr;
     return mWeightMgr->quantizer();
@@ -295,7 +301,7 @@ void GenericQLoRAProvider::auto_tune_offloading() {
     new_max = std::max(2, std::min(new_max, num_grp));
 
     fprintf(stderr,
-            "[QLoRA] Offload auto-tune: gpu_free=%.1f GB, reserve=%.1f GB, "
+            "Offload auto-tune: gpu_free=%.1f GB, reserve=%.1f GB, "
             "max_group=%.1f MB, %d groups -> max_resident: %d -> %d%s\n",
             static_cast<double>(gpu_free) / (1024.0 * 1024.0 * 1024.0),
             static_cast<double>(reserve) / (1024.0 * 1024.0 * 1024.0),

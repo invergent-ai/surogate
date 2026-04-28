@@ -393,6 +393,7 @@ NB_MODULE(_surogate, m) {
                bool use_fused_rope,
                bool doc_masking,
                int fp8_amax_history,
+               bool fp4_four_over_six,
                const std::string& fp4_backend,
                int skip_quant_first_layers,
                int skip_quant_last_layers,
@@ -400,6 +401,7 @@ NB_MODULE(_surogate, m) {
                 // Build recipe options
                 recipes::RecipeConfig recipe_options;
                 recipe_options.fp8_amax_history_len = fp8_amax_history;
+                recipe_options.fp4_four_over_six = fp4_four_over_six;
                 recipe_options.fp4_backend = matmul_backend_from_str(fp4_backend);
                 recipe_options.skip_quant_first_layers = skip_quant_first_layers;
                 recipe_options.skip_quant_last_layers = skip_quant_last_layers;
@@ -477,6 +479,7 @@ NB_MODULE(_surogate, m) {
             nb::arg("use_fused_rope") = false,
             nb::arg("doc_masking") = true,
             nb::arg("fp8_amax_history") = 1024,
+            nb::arg("fp4_four_over_six") = true,
             nb::arg("fp4_backend") = "cutlass",
             nb::arg("skip_quant_first_layers") = 0,
             nb::arg("skip_quant_last_layers") = 0,

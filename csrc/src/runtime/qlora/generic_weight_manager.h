@@ -284,6 +284,14 @@ public:
     /// @return Pointer to QuantizedTensor, or nullptr if not found
     const QuantizedTensor* get_quantized(const std::string& name) const;
 
+    /// Ensure a weight's quantized storage is resident on GPU without
+    /// dequantizing it to BF16.
+    ///
+    /// @param name    Weight name
+    /// @param stream  CUDA stream to wait on any in-flight prefetch/load
+    /// @return Pointer to device-resident QuantizedTensor, or nullptr if missing
+    const QuantizedTensor* ensure_quantized_resident(const std::string& name, cudaStream_t stream);
+
     /// Check if a weight exists.
     [[nodiscard]] bool has_weight(const std::string& name) const;
 

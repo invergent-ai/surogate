@@ -304,6 +304,7 @@ class Qwen3_5CausalModel(nn.Model):
     linear_num_value_heads="text_config.linear_num_value_heads",
     layer_types="text_config.layer_types",
     full_attention_interval="text_config.full_attention_interval",
+    use_visual_inputs="vision_config",
 )
 class Qwen3_5ConditionalModel(nn.Model):
     """Qwen3.5 dense text model for ``Qwen3_5ForConditionalGeneration``."""
@@ -335,6 +336,7 @@ class Qwen3_5ConditionalModel(nn.Model):
         layer_types: list[str] | None = None,
         full_attention_interval: int = 4,
         chunk_size: int = 64,
+        use_visual_inputs: bool | dict | None = False,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -359,6 +361,7 @@ class Qwen3_5ConditionalModel(nn.Model):
         self.linear_num_value_heads = linear_num_value_heads
         self.full_attention_interval = full_attention_interval
         self.chunk_size = chunk_size
+        self.use_visual_inputs = bool(use_visual_inputs)
 
         # Derived
         self.D = head_size if head_size > 0 else d_model // num_query_heads
@@ -448,12 +451,13 @@ class Qwen3_5ConditionalModel(nn.Model):
         self._register_activation("token_ids", ("B", "T"), dtype="int32", scope=G)
         self._register_activation("position_ids", (3, "B", "T"), dtype="int32", scope=G)
         self._register_activation("targets", ("B", "T"), dtype="int32", scope=G, aliases=["labels"])
-        self._register_activation(
-            "visual_pos_masks", ("B", "T"), dtype="int32", scope=G, description="Mask for visual token positions"
-        )
-        self._register_activation(
-            "visual_embeds", ("B * T", "d_model"), scope=G, description="Visual embeddings (packed by mask)"
-        )
+        if self.use_visual_inputs:
+            self._register_activation(
+                "visual_pos_masks", ("B", "T"), dtype="int32", scope=G, description="Mask for visual token positions"
+            )
+            self._register_activation(
+                "visual_embeds", ("B * T", "d_model"), scope=G, description="Visual embeddings (packed by mask)"
+            )
         self._register_activation(
             "freq_cis", ("max_seq", "rotary_dim // 2", 2), dtype="fp32", scope=G, aliases=["rope_freqs"]
         )
@@ -472,7 +476,8 @@ class Qwen3_5ConditionalModel(nn.Model):
 
         # Embedding + visual injection
         x = self.embedding(token_ids)
-        x = self._mask_scatter(x, visual_pos_masks, visual_embeds, name="x0")
+        if self.use_visual_inputs:
+            x = self._mask_scatter(x, visual_pos_masks, visual_embeds, name="x0")
 
         residual = self._zeros(["B", "T", "d_model"])
         x, residual = self.hybrid_blocks(x, residual, position_ids)

@@ -79,6 +79,7 @@ public:
     // =========================================================================
 
     const qlora::QuantizedTensor* try_get_quantized(std::string_view name) const override;
+    const qlora::QuantizedTensor* ensure_quantized_resident(std::string_view name, cudaStream_t stream) override;
     qlora::IQuantizer* get_quantizer() const override;
     void auto_tune_offloading() override;
 

@@ -17,6 +17,7 @@
 #include "runtime/dsl/op_shape_signatures.h"
 #include "runtime/executor/graph_executor_helpers.h"
 #include "runtime/executor/graph_executor_utils.h"
+#include "runtime/qlora/quantized_tensor.h"
 #include "runtime/lora/lora_slice_dispatch.h"
 #include "kernels/kernels.h"
 #include "utilities/dtype.h"
@@ -32,6 +33,52 @@ void attach_input_role(modules::MatmulContext& ctx, const CompiledGraph* graph, 
         ctx.input_role = *role;
         ctx.has_input_role = true;
     }
+}
+
+bool attach_resident_qlora_fp4_cache(modules::MatmulContext& ctx,
+                                     DslParamStore& weights,
+                                     DslRunState& run_state,
+                                     std::vector<Tensor>& temps,
+                                     Tensor& data_view,
+                                     Tensor& scales_view,
+                                     const std::string& weight_name,
+                                     bool capturing) {
+    if (capturing) {
+        return false;
+    }
+    auto* provider = weights.qlora_provider();
+    if (!provider) {
+        return false;
+    }
+    const auto* qt = provider->ensure_quantized_resident(weight_name, run_state.MainStream);
+    if (!qt || qt->format != qlora::QuantFormat::FP4_BLOCK_2D || qt->data.is_null() || qt->scales.is_null() ||
+        qt->is_on_host()) {
+        return false;
+    }
+    if (qt->M <= 0 || qt->K <= 0 || qt->K % 2 != 0) {
+        return false;
+    }
+    data_view = Tensor::from_pointer(qt->data.Data,
+                                     qt->data.Device,
+                                     ETensorDType::BYTE,
+                                     std::vector<long>{static_cast<long>(qt->M), static_cast<long>(qt->K / 2)});
+    std::vector<long> scales_shape;
+    scales_shape.reserve(static_cast<std::size_t>(qt->scales.Rank));
+    for (int i = 0; i < qt->scales.Rank; ++i) {
+        scales_shape.push_back(qt->scales.Sizes[i]);
+    }
+    scales_view = Tensor::from_pointer(qt->scales.Data, qt->scales.Device, ETensorDType::BYTE, scales_shape);
+    ctx.cached_fp4_data = &data_view;
+    ctx.cached_fp4_scales = &scales_view;
+
+    Tensor amax = run_state.temp_alloc(ETensorDType::FP32, {1}, "qlora_fp4_cached_amax");
+    constexpr float kFP8Max = 448.0f;
+    constexpr float kFP4Max = 6.0f;
+    const float host_amax = qt->global_scale * kFP8Max * kFP4Max;
+    CUDA_CHECK(cudaMemcpyAsync(amax.Data, &host_amax, sizeof(float), cudaMemcpyHostToDevice, run_state.MainStream));
+    temps.push_back(amax);
+    ctx.cached_fp4_amax = amax.get<float>();
+    return true;
 }
 
 struct LoRAForwardApplyContext {
@@ -68,23 +115,38 @@ void apply_lora_forward_payload(void* opaque) {
 
 void CompiledExecutor::dispatch_matmul_swiglu(const CompiledOp& op, const modules::ForwardHook* hook) {
     Tensor& a = resolve_tensor(op.inputs[0]);
-    Tensor& b = resolve_tensor(op.inputs[1]);
     Tensor& out = ensure_output_tensor(op.outputs[0]);
     Tensor& up_out = ensure_output_tensor(op.outputs[1]);
     const std::string& weight_name = op.inputs[1].name;
+    Tensor b_template{};
+    Tensor* b_resolved = nullptr;
+    if (mWeights.has(weight_name)) {
+        b_template = mWeights.template_tensor(weight_name);
+    } else {
+        b_resolved = &resolve_tensor(op.inputs[1]);
+        b_template = *b_resolved;
+    }
+    auto resolve_weight = [&]() -> Tensor& {
+        if (!b_resolved) {
+            b_resolved = &resolve_tensor(op.inputs[1]);
+        }
+        return *b_resolved;
+    };
 
     int M = 0, N = 0, K = 0;
-    matmul_dims(a, b, op.attrs.transpose, M, N, K);
+    matmul_dims(a, b_template, op.attrs.transpose, M, N, K);
     const long D = N / 2;
 
     bool used_recipe = false;
     modules::MatmulContext ctx{};
+    Tensor resident_fp4_data_view{};
+    Tensor resident_fp4_scales_view{};
     modules::MatmulContext* ctx_ptr = nullptr;
     if (mRecipe && op.attrs.transpose == EMMTranspose::NT && a.Sizes[0] == mB * mT && op.attrs.allow_quant &&
         op.attrs.matmul_op.has_value()) {
         ctx.out = &up_out;
         ctx.inp = &a;
-        ctx.weight = &b;
+        ctx.weight = b_resolved ? b_resolved : &b_template;
         ctx.bias = nullptr;
         ctx.B = static_cast<int>(mB);
         ctx.T = static_cast<int>(mT);
@@ -103,6 +165,8 @@ void CompiledExecutor::dispatch_matmul_swiglu(const CompiledOp& op, const module
         ctx.allow_fp4 = mRecipe->uses_fp4_forward();
 
         if (ctx.allow_fp8) {
+            Tensor& b = resolve_weight();
+            ctx.weight = &b;
             ctx.inp_quant = fp8_forward_buffer(mRunState, *op.attrs.matmul_op);
             ctx.delayed_quantizer_idx = fp8_quantizer_index(mRunState, *op.attrs.matmul_op, op.attrs.layer_idx);
 
@@ -131,6 +195,19 @@ void CompiledExecutor::dispatch_matmul_swiglu(const CompiledOp& op, const module
                 ctx.cached_fp4_amax = it->second.amax.get<float>();
             }
         }
+        if (ctx.allow_fp4 && !ctx.cached_fp4_data) {
+            (void)attach_resident_qlora_fp4_cache(ctx,
+                                                  mWeights,
+                                                  mRunState,
+                                                  mTemps,
+                                                  resident_fp4_data_view,
+                                                  resident_fp4_scales_view,
+                                                  weight_name,
+                                                  mCapturing);
+        }
+        if (!ctx.cached_fp4_data && !ctx.cached_weight) {
+            ctx.weight = &resolve_weight();
+        }
 
         mRecipe->forward_matmul(ctx);
         used_recipe = true;
@@ -138,6 +215,7 @@ void CompiledExecutor::dispatch_matmul_swiglu(const CompiledOp& op, const module
     }
 
     if (!used_recipe) {
+        Tensor& b = resolve_weight();
         matmul(up_out,
                b,
                a,

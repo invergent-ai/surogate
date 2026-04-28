@@ -34,7 +34,8 @@ std::unique_ptr<Recipe> RecipeFactory::create(const std::string& name, const Rec
         NVFP4Recipe::Config nvfp4_config{.disable_2d_quantization = config.fp4_disable_2d_quantization,
                                          .skip_quant_first_layers = config.skip_quant_first_layers,
                                          .skip_quant_last_layers = config.skip_quant_last_layers,
-                                         .backend = config.fp4_backend};
+                                         .backend = config.fp4_backend,
+                                         .enable_four_over_six = config.fp4_four_over_six};
         return std::make_unique<NVFP4Recipe>(nvfp4_config);
     }
 

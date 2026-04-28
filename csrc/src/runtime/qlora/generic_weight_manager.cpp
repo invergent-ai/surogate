@@ -534,6 +534,21 @@ const QuantizedTensor* GenericWeightManager::get_quantized(const std::string& na
     return &it->second.quantized;
 }
 
+const QuantizedTensor* GenericWeightManager::ensure_quantized_resident(const std::string& name, cudaStream_t stream) {
+    auto it = mWeights.find(name);
+    if (it == mWeights.end()) {
+        return nullptr;
+    }
+    auto& entry = it->second;
+    if (!entry.is_quantized_weight) {
+        return nullptr;
+    }
+    if (entry.offload_group >= 0 && mOffloadManager) {
+        mOffloadManager->load_group(entry.offload_group, stream);
+    }
+    return &entry.quantized;
+}
+
 bool GenericWeightManager::has_weight(const std::string& name) const {
     return mWeights.count(name) > 0;
 }

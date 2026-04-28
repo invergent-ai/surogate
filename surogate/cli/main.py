@@ -1,6 +1,30 @@
 import argparse
+import os
 import runpy
 import sys
+
+
+def _apply_grpo_split_gpu_mask() -> None:
+    """For `surogate grpo --trainer-gpus ...`, mask the parent process to those GPUs.
+
+    Must run BEFORE any import that touches CUDA (e.g. ``surogate.utils.system_info``
+    enumerates GPUs at module-init time, which initializes the CUDA context and locks
+    in the visible-device set).
+    """
+    argv = sys.argv
+    if len(argv) < 2 or argv[1] != "grpo":
+        return
+    for i in range(2, len(argv)):
+        tok = argv[i]
+        if tok == "--trainer-gpus" and i + 1 < len(argv):
+            os.environ["CUDA_VISIBLE_DEVICES"] = argv[i + 1]
+            return
+        if tok.startswith("--trainer-gpus="):
+            os.environ["CUDA_VISIBLE_DEVICES"] = tok.split("=", 1)[1]
+            return
+
+
+_apply_grpo_split_gpu_mask()
 
 from surogate.utils.logger import get_logger
 from surogate.utils.system_info import get_system_info, print_system_diagnostics

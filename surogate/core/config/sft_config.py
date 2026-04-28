@@ -314,6 +314,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
     recipe: Literal["bf16", "fp8_hybrid", "nvfp4", "nvfp4_quartet"] | None = "bf16"
     use_fused_rope: bool | None = False
     fp8_amax_history: int | None = 16
+    fp4_four_over_six: bool | None = True
     fp4_backend: Literal["cutlass", "cudnn"] | None = "cutlass"
     skip_quant_first_layers: int | None = 0
     skip_quant_last_layers: int | None = 0
@@ -498,6 +499,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         self.qlora_block_size = cfg.get("qlora_block_size", self.qlora_block_size)
         self.qlora_bnb_block_size = cfg.get("qlora_bnb_block_size", self.qlora_bnb_block_size)
         self.qlora_bnb_double_quant = cfg.get("qlora_bnb_double_quant", self.qlora_bnb_double_quant)
+        self.fp4_four_over_six = cfg.get("fp4_four_over_six", self.fp4_four_over_six)
         self.qlora_four_over_six = cfg.get("qlora_four_over_six", self.qlora_four_over_six)
         self.qlora_selective_expert_dequant = cfg.get(
             "qlora_selective_expert_dequant", self.qlora_selective_expert_dequant
@@ -799,6 +801,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
             recipe=self.recipe,
             use_fused_rope=self.use_fused_rope,
             fp8_amax_history=self.fp8_amax_history,
+            fp4_four_over_six=self.fp4_four_over_six,
             fp4_backend=self.fp4_backend,
             skip_quant_first_layers=self.skip_quant_first_layers,
             skip_quant_last_layers=self.skip_quant_last_layers,

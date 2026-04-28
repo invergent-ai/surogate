@@ -199,6 +199,7 @@ struct GpuTempAlloc {
     void* data = nullptr;
     void* scales = nullptr;
     void* meta = nullptr;
+    void* meta2 = nullptr;
 
     void free_all() {
         if (data) {
@@ -213,11 +214,15 @@ struct GpuTempAlloc {
             cudaFree(meta);
             meta = nullptr;
         }
+        if (meta2) {
+            cudaFree(meta2);
+            meta2 = nullptr;
+        }
     }
 };
 
-/// Check if an expert weight spec should use CPU offloading.
-bool should_offload_expert(const WeightLoadSpec& spec, const DslQLoRAPipelineConfig& config) {
+/// Check if a quantized weight spec should use CPU offloading.
+bool should_offload_quantized(const WeightLoadSpec& spec, const DslQLoRAPipelineConfig& config) {
     return spec.offload_group >= 0 && config.weight_manager_config.enable_offloading &&
            config.weight_manager_config.offload_config.max_resident_groups > 0;
 }
@@ -296,6 +301,49 @@ GpuTempAlloc allocate_qt_gpu_temp(int M, int K, QuantizedTensor& qt, const Quant
                                          0,
                                          ETensorDType::FP32,
                                          std::vector<long>{scale_rows * scale_cols});
+    } else if (qconfig.format == QuantFormat::BNB_NF4) {
+        qt.format = QuantFormat::BNB_NF4;
+        qt.block_size = qconfig.block_size;
+        qt.double_quant = qconfig.double_quant;
+        qt.double_quant_group_size = qconfig.double_quant_group_size;
+
+        const long num_elements = static_cast<long>(M) * K;
+        const long num_blocks = (num_elements + qt.block_size - 1) / qt.block_size;
+        const long packed_bytes = (num_elements + 1) / 2;
+
+        CUDA_CHECK(cudaMalloc(&alloc.data, packed_bytes));
+        qt.data = Tensor::from_pointer(static_cast<std::byte*>(alloc.data),
+                                       0,
+                                       ETensorDType::BYTE,
+                                       std::vector<long>{packed_bytes});
+
+        if (qt.double_quant) {
+            const long num_groups = (num_blocks + qt.double_quant_group_size - 1) / qt.double_quant_group_size;
+
+            CUDA_CHECK(cudaMalloc(&alloc.scales, num_blocks));
+            qt.scales = Tensor::from_pointer(static_cast<std::byte*>(alloc.scales),
+                                             0,
+                                             ETensorDType::BYTE,
+                                             std::vector<long>{num_blocks});
+
+            CUDA_CHECK(cudaMalloc(&alloc.meta, num_groups * sizeof(float)));
+            qt.meta = Tensor::from_pointer(static_cast<std::byte*>(alloc.meta),
+                                           0,
+                                           ETensorDType::FP32,
+                                           std::vector<long>{num_groups});
+
+            CUDA_CHECK(cudaMalloc(&alloc.meta2, num_groups * sizeof(float)));
+            qt.meta2 = Tensor::from_pointer(static_cast<std::byte*>(alloc.meta2),
+                                            0,
+                                            ETensorDType::FP32,
+                                            std::vector<long>{num_groups});
+        } else {
+            CUDA_CHECK(cudaMalloc(&alloc.scales, num_blocks * sizeof(float)));
+            qt.scales = Tensor::from_pointer(static_cast<std::byte*>(alloc.scales),
+                                             0,
+                                             ETensorDType::FP32,
+                                             std::vector<long>{num_blocks});
+        }
     } else {
         throw std::runtime_error("allocate_qt_gpu_temp: unsupported format " +
                                  std::to_string(static_cast<int>(qconfig.format)));
@@ -322,6 +370,7 @@ void relocate_qt_to_pinned(QuantizedTensor& qt, GpuTempAlloc& gpu, cudaStream_t 
     relocate_tensor(qt.data, gpu.data);
     relocate_tensor(qt.scales, gpu.scales);
     relocate_tensor(qt.meta, gpu.meta);
+    relocate_tensor(qt.meta2, gpu.meta2);
 
     gpu.free_all();
 }
@@ -590,7 +639,7 @@ bool is_module_not_converted(const std::string& hf_name, const std::vector<std::
             }
         } else {
             // Literal: check prefix or exact match
-            if (hf_name == pattern || hf_name.find(pattern) == 0 || hf_name.find(pattern + ".") != std::string::npos) {
+            if (hf_name == pattern || hf_name.rfind(pattern + ".", 0) == 0) {
                 return true;
             }
         }
@@ -1342,9 +1391,19 @@ std::unique_ptr<GenericWeightManager> import_prequantized_weights(const std::str
                                              "'");
                 }
 
-                // Allocate quantized storage for the fused result
+                // Allocate quantized storage for the fused result. When this
+                // weight is offloaded, use temporary device buffers for the
+                // import/quantize kernels and relocate them to pinned host
+                // before registration; TensorAllocator allocations are not
+                // individually freed and would otherwise accumulate on GPU.
                 QuantizedTensor qt;
-                quantizer->allocate_storage(spec.M, spec.K, qt, *allocator, EAllocationType::ON_DEVICE, spec.name);
+                GpuTempAlloc gpu_temp;
+                const bool offload_this = should_offload_quantized(spec, config);
+                if (offload_this) {
+                    gpu_temp = allocate_qt_gpu_temp(spec.M, spec.K, qt, config.quantizer_config);
+                } else {
+                    quantizer->allocate_storage(spec.M, spec.K, qt, *allocator, EAllocationType::ON_DEVICE, spec.name);
+                }
 
                 // Grow the reusable BF16 buffer to hold the full fused tensor
                 const size_t fused_bytes = static_cast<size_t>(spec.M) * spec.K * sizeof(nv_bfloat16);
@@ -1538,6 +1597,9 @@ std::unique_ptr<GenericWeightManager> import_prequantized_weights(const std::str
                 quantizer->quantize(fused_bf16, qt, stream);
                 CUDA_CHECK(cudaStreamSynchronize(stream));
 
+                if (offload_this) {
+                    relocate_qt_to_pinned(qt, gpu_temp, stream);
+                }
                 weight_mgr->store_prequantized(spec.name, std::move(qt), spec.offload_group, spec.shape);
                 loaded++;
                 continue;
@@ -1576,10 +1638,6 @@ std::unique_ptr<GenericWeightManager> import_prequantized_weights(const std::str
                 continue;
             }
 
-            // Allocate quantized storage
-            QuantizedTensor qt;
-            quantizer->allocate_storage(spec.M, spec.K, qt, *allocator, EAllocationType::ON_DEVICE, spec.name);
-
             // Resolve HF data tensor name
             std::string data_hf = config.data_suffix.empty() ? hf_name : (hf_name + config.data_suffix);
             const auto* data_entry_ptr = try_find_entry(reader, data_hf);
@@ -1590,6 +1648,15 @@ std::unique_ptr<GenericWeightManager> import_prequantized_weights(const std::str
                 continue;
             }
             const auto& data_entry = *data_entry_ptr;
+
+            QuantizedTensor qt;
+            GpuTempAlloc gpu_temp;
+            const bool offload_this = should_offload_quantized(spec, config);
+            if (offload_this) {
+                gpu_temp = allocate_qt_gpu_temp(spec.M, spec.K, qt, config.quantizer_config);
+            } else {
+                quantizer->allocate_storage(spec.M, spec.K, qt, *allocator, EAllocationType::ON_DEVICE, spec.name);
+            }
 
             // Check if the HF entry is actually pre-quantized or still float.
             // Some "pre-quantized" models store BF16 weights with quantization
@@ -1615,8 +1682,13 @@ std::unique_ptr<GenericWeightManager> import_prequantized_weights(const std::str
                 if (success) {
                     quantizer->quantize(bf16_buf, qt, stream);
                     CUDA_CHECK(cudaStreamSynchronize(stream));
+                    if (offload_this) {
+                        relocate_qt_to_pinned(qt, gpu_temp, stream);
+                    }
                     weight_mgr->store_prequantized(spec.name, std::move(qt), spec.offload_group, spec.shape);
                     loaded++;
+                } else {
+                    gpu_temp.free_all();
                 }
                 continue;
             }
@@ -1637,12 +1709,16 @@ std::unique_ptr<GenericWeightManager> import_prequantized_weights(const std::str
 
                 bool ok = recover_bnb_double_quant_absmax(reader, hf_name, qt.scales.Data, num_blocks, stream);
                 if (!ok) {
+                    gpu_temp.free_all();
                     if (load_full_precision(spec, "missing BnB double quant data")) {
                         loaded++;
                     }
                     continue;
                 }
 
+                if (offload_this) {
+                    relocate_qt_to_pinned(qt, gpu_temp, stream);
+                }
                 weight_mgr->store_prequantized(spec.name, std::move(qt), spec.offload_group, spec.shape);
                 loaded++;
                 continue;
@@ -1652,6 +1728,7 @@ std::unique_ptr<GenericWeightManager> import_prequantized_weights(const std::str
             std::string scale_hf = hf_name + config.scale_suffix;
             const auto* scale_entry_ptr = try_find_entry(reader, scale_hf);
             if (!scale_entry_ptr) {
+                gpu_temp.free_all();
                 if (load_full_precision(spec, "missing prequant scales")) {
                     loaded++;
                 }
@@ -1673,6 +1750,7 @@ std::unique_ptr<GenericWeightManager> import_prequantized_weights(const std::str
                 std::string scale2_hf = hf_name + config.scale2_suffix;
                 const auto* scale2_entry_ptr = try_find_entry(reader, scale2_hf);
                 if (!scale2_entry_ptr) {
+                    gpu_temp.free_all();
                     if (load_full_precision(spec, "missing prequant scale2")) {
                         loaded++;
                     }
@@ -1692,6 +1770,9 @@ std::unique_ptr<GenericWeightManager> import_prequantized_weights(const std::str
             // weights: pre-quantized HF models (MXFP4, FP8, NVFP4) store packed
             // data in the GEMM-ready layout (matching DSL parameter shape), so the
             // Transform("transpose") mapping only applies to BF16 weight import.
+            if (offload_this) {
+                relocate_qt_to_pinned(qt, gpu_temp, stream);
+            }
             weight_mgr->store_prequantized(spec.name, std::move(qt), spec.offload_group, spec.shape);
             loaded++;
         } else {
@@ -1772,7 +1853,7 @@ std::unique_ptr<GenericWeightManager> import_prequantized_weights(const std::str
         // TensorAllocator GPU memory.
         QuantizedTensor qt;
         GpuTempAlloc gpu_temp;
-        const bool offload_this = should_offload_expert(spec, config);
+        const bool offload_this = should_offload_quantized(spec, config);
 
         if (offload_this) {
             gpu_temp = allocate_qt_gpu_temp(spec.M, spec.K, qt, config.quantizer_config);

@@ -23,6 +23,7 @@
 #include "utilities/dtype.h"
 #include "runtime/executor/graph_executor_helpers.h"
 #include "runtime/core/forward_hooks.h"
+#include "runtime/qlora/quantized_tensor.h"
 #include "runtime/lora/lora_model_utils.h"
 #include "runtime/lora/lora_run_state.h"
 #include "runtime/lora/lora_slice_dispatch.h"
@@ -47,6 +48,52 @@ void attach_input_role(modules::MatmulContext& ctx, const CompiledGraph* graph, 
         ctx.input_role = *role;
         ctx.has_input_role = true;
     }
+}
+
+bool attach_resident_qlora_fp4_cache(modules::MatmulContext& ctx,
+                                     DslParamStore& weights,
+                                     DslRunState& run_state,
+                                     std::vector<Tensor>& temps,
+                                     Tensor& data_view,
+                                     Tensor& scales_view,
+                                     const std::string& weight_name,
+                                     bool capturing) {
+    if (capturing) {
+        return false;
+    }
+    auto* provider = weights.qlora_provider();
+    if (!provider) {
+        return false;
+    }
+    const auto* qt = provider->ensure_quantized_resident(weight_name, run_state.MainStream);
+    if (!qt || qt->format != qlora::QuantFormat::FP4_BLOCK_2D || qt->data.is_null() || qt->scales.is_null() ||
+        qt->is_on_host()) {
+        return false;
+    }
+    if (qt->M <= 0 || qt->K <= 0 || qt->K % 2 != 0) {
+        return false;
+    }
+    data_view = Tensor::from_pointer(qt->data.Data,
+                                     qt->data.Device,
+                                     ETensorDType::BYTE,
+                                     std::vector<long>{static_cast<long>(qt->M), static_cast<long>(qt->K / 2)});
+    std::vector<long> scales_shape;
+    scales_shape.reserve(static_cast<std::size_t>(qt->scales.Rank));
+    for (int i = 0; i < qt->scales.Rank; ++i) {
+        scales_shape.push_back(qt->scales.Sizes[i]);
+    }
+    scales_view = Tensor::from_pointer(qt->scales.Data, qt->scales.Device, ETensorDType::BYTE, scales_shape);
+    ctx.cached_fp4_data = &data_view;
+    ctx.cached_fp4_scales = &scales_view;
+
+    Tensor amax = run_state.temp_alloc(ETensorDType::FP32, {1}, "qlora_fp4_cached_amax");
+    constexpr float kFP8Max = 448.0f;
+    constexpr float kFP4Max = 6.0f;
+    const float host_amax = qt->global_scale * kFP8Max * kFP4Max;
+    CUDA_CHECK(cudaMemcpyAsync(amax.Data, &host_amax, sizeof(float), cudaMemcpyHostToDevice, run_state.MainStream));
+    temps.push_back(amax);
+    ctx.cached_fp4_amax = amax.get<float>();
+    return true;
 }
 
 struct LoRAForwardApplyContext {
@@ -86,10 +133,23 @@ void apply_lora_forward_payload(void* opaque) {
 
 void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::ForwardHook* hook) {
     Tensor& a = resolve_tensor(op.inputs[0]);
-    Tensor& b = resolve_tensor(op.inputs[1]);
     Tensor& out = ensure_output_tensor(op.outputs[0]);
     const std::string& weight_name = op.inputs[1].name;
     const bool is_gate_projection = is_mlp_gate_weight(weight_name);
+    Tensor b_template{};
+    Tensor* b_resolved = nullptr;
+    if (mWeights.has(weight_name)) {
+        b_template = mWeights.template_tensor(weight_name);
+    } else {
+        b_resolved = &resolve_tensor(op.inputs[1]);
+        b_template = *b_resolved;
+    }
+    auto resolve_weight = [&]() -> Tensor& {
+        if (!b_resolved) {
+            b_resolved = &resolve_tensor(op.inputs[1]);
+        }
+        return *b_resolved;
+    };
 
     const bool is_shared_weight = is_shared_expert_weight_name(weight_name);
 
@@ -99,96 +159,102 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
     }
 
     int M = 0, N = 0, K = 0;
-    matmul_dims(a, b, op.attrs.transpose, M, N, K);
+    matmul_dims(a, b_template, op.attrs.transpose, M, N, K);
 
     // Router matmul: match HF by computing logits in FP32 using FP32 inputs/weights.
     // Skip the string search for dense (non-MoE) models — they have no router.
     const bool is_router = (mConfig.NumExperts > 0) && is_router_weight_name(weight_name);
-    if (is_router &&
-        (a.DType != ETensorDType::FP32 || b.DType != ETensorDType::FP32 || out.DType != ETensorDType::FP32)) {
-        auto shape_vec = [](const Tensor& t) {
-            return std::vector<long>(t.Sizes.begin(), t.Sizes.begin() + t.Rank);
-        };
-        Tensor a_f = a;
-        if (a.DType != ETensorDType::FP32) {
-            a_f = mRunState.temp_alloc(ETensorDType::FP32, shape_vec(a), "matmul_router_a_fp32");
-            mTemps.push_back(a_f);
-            if (a.DType == ETensorDType::BF16) {
-                convert_dtype(a_f.get<float>(), a.get<nv_bfloat16>(), a.nelem(), mRunState.MainStream);
-            } else {
-                throw std::runtime_error("router matmul: unsupported input dtype");
-            }
-        }
-
-        Tensor b_f = b;
-        if (b.DType != ETensorDType::FP32) {
-            b_f = mRunState.temp_alloc(ETensorDType::FP32, shape_vec(b), "matmul_router_b_fp32");
-            mTemps.push_back(b_f);
-            if (b.DType == ETensorDType::BF16) {
-                convert_dtype(b_f.get<float>(), b.get<nv_bfloat16>(), b.nelem(), mRunState.MainStream);
-            } else {
-                throw std::runtime_error("router matmul: unsupported weight dtype");
-            }
-        }
-
-        std::optional<Tensor> bias_f;
-        if (bias.has_value()) {
-            if (bias->DType == ETensorDType::FP32) {
-                bias_f = bias;
-            } else {
-                Tensor tmp = mRunState.temp_alloc(ETensorDType::FP32, shape_vec(*bias), "matmul_router_bias_fp32");
-                mTemps.push_back(tmp);
-                if (bias->DType == ETensorDType::BF16) {
-                    convert_dtype(tmp.get<float>(), bias->get<nv_bfloat16>(), bias->nelem(), mRunState.MainStream);
+    if (is_router) {
+        Tensor& b = resolve_weight();
+        if (!(a.DType != ETensorDType::FP32 || b.DType != ETensorDType::FP32 || out.DType != ETensorDType::FP32)) {
+            // Already FP32; continue through the regular path below.
+        } else {
+            auto shape_vec = [](const Tensor& t) {
+                return std::vector<long>(t.Sizes.begin(), t.Sizes.begin() + t.Rank);
+            };
+            Tensor a_f = a;
+            if (a.DType != ETensorDType::FP32) {
+                a_f = mRunState.temp_alloc(ETensorDType::FP32, shape_vec(a), "matmul_router_a_fp32");
+                mTemps.push_back(a_f);
+                if (a.DType == ETensorDType::BF16) {
+                    convert_dtype(a_f.get<float>(), a.get<nv_bfloat16>(), a.nelem(), mRunState.MainStream);
                 } else {
-                    throw std::runtime_error("router matmul: unsupported bias dtype");
+                    throw std::runtime_error("router matmul: unsupported input dtype");
                 }
-                bias_f = tmp;
             }
-        }
 
-        Tensor out_f = out;
-        if (out.DType != ETensorDType::FP32) {
-            out_f = mRunState.temp_alloc(ETensorDType::FP32, shape_vec(out), "matmul_router_out_fp32");
-            mTemps.push_back(out_f);
-        }
-
-        EMMTranspose mode_col = swap_transpose(op.attrs.transpose);
-        matmul(out_f,
-               b_f,
-               a_f,
-               bias_f,
-               nullptr,
-               nullptr,
-               mRunState.CublasLtHandle,
-               mRunState.CuBlasWorkspace,
-               N,
-               M,
-               K,
-               mode_col,
-               false,
-               mRunState.MainStream);
-        if (out.DType != ETensorDType::FP32) {
-            if (out.DType == ETensorDType::BF16) {
-                convert_dtype(out.get<nv_bfloat16>(), out_f.get<float>(), out.nelem(), mRunState.MainStream);
-            } else if (out.DType == ETensorDType::FP32) {
-                // no-op
-            } else {
-                throw std::runtime_error("router matmul: unsupported output dtype");
+            Tensor b_f = b;
+            if (b.DType != ETensorDType::FP32) {
+                b_f = mRunState.temp_alloc(ETensorDType::FP32, shape_vec(b), "matmul_router_b_fp32");
+                mTemps.push_back(b_f);
+                if (b.DType == ETensorDType::BF16) {
+                    convert_dtype(b_f.get<float>(), b.get<nv_bfloat16>(), b.nelem(), mRunState.MainStream);
+                } else {
+                    throw std::runtime_error("router matmul: unsupported weight dtype");
+                }
             }
+
+            std::optional<Tensor> bias_f;
+            if (bias.has_value()) {
+                if (bias->DType == ETensorDType::FP32) {
+                    bias_f = bias;
+                } else {
+                    Tensor tmp = mRunState.temp_alloc(ETensorDType::FP32, shape_vec(*bias), "matmul_router_bias_fp32");
+                    mTemps.push_back(tmp);
+                    if (bias->DType == ETensorDType::BF16) {
+                        convert_dtype(tmp.get<float>(), bias->get<nv_bfloat16>(), bias->nelem(), mRunState.MainStream);
+                    } else {
+                        throw std::runtime_error("router matmul: unsupported bias dtype");
+                    }
+                    bias_f = tmp;
+                }
+            }
+
+            Tensor out_f = out;
+            if (out.DType != ETensorDType::FP32) {
+                out_f = mRunState.temp_alloc(ETensorDType::FP32, shape_vec(out), "matmul_router_out_fp32");
+                mTemps.push_back(out_f);
+            }
+
+            EMMTranspose mode_col = swap_transpose(op.attrs.transpose);
+            matmul(out_f,
+                   b_f,
+                   a_f,
+                   bias_f,
+                   nullptr,
+                   nullptr,
+                   mRunState.CublasLtHandle,
+                   mRunState.CuBlasWorkspace,
+                   N,
+                   M,
+                   K,
+                   mode_col,
+                   false,
+                   mRunState.MainStream);
+            if (out.DType != ETensorDType::FP32) {
+                if (out.DType == ETensorDType::BF16) {
+                    convert_dtype(out.get<nv_bfloat16>(), out_f.get<float>(), out.nelem(), mRunState.MainStream);
+                } else if (out.DType == ETensorDType::FP32) {
+                    // no-op
+                } else {
+                    throw std::runtime_error("router matmul: unsupported output dtype");
+                }
+            }
+            return;
         }
-        return;
     }
 
     bool used_recipe = false;
     modules::MatmulContext ctx{};
+    Tensor resident_fp4_data_view{};
+    Tensor resident_fp4_scales_view{};
     modules::MatmulContext* ctx_ptr = nullptr;
     try {
         if (mRecipe && op.attrs.transpose == EMMTranspose::NT && a.Sizes[0] == mB * mT && !is_shared_weight) {
             if (op.attrs.allow_quant && op.attrs.matmul_op.has_value()) {
                 ctx.out = &out;
                 ctx.inp = &a;
-                ctx.weight = &b;
+                ctx.weight = b_resolved ? b_resolved : &b_template;
                 ctx.bias = bias ? &*bias : nullptr;
                 ctx.B = static_cast<int>(mB);
                 ctx.T = static_cast<int>(mT);
@@ -208,6 +274,8 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
 
                 // Wire FP8/FP4 buffers + static weight caches (GraphExecutor primes caches before CUDA graph capture).
                 if (ctx.allow_fp8) {
+                    Tensor& b = resolve_weight();
+                    ctx.weight = &b;
                     ctx.inp_quant = fp8_forward_buffer(mRunState, *op.attrs.matmul_op);
                     ctx.delayed_quantizer_idx = fp8_quantizer_index(mRunState, *op.attrs.matmul_op, op.attrs.layer_idx);
 
@@ -240,6 +308,19 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
                         ctx.cached_fp4_amax = it->second.amax.get<float>();
                     }
                 }
+                if (ctx.allow_fp4 && !ctx.cached_fp4_data) {
+                    (void)attach_resident_qlora_fp4_cache(ctx,
+                                                          mWeights,
+                                                          mRunState,
+                                                          mTemps,
+                                                          resident_fp4_data_view,
+                                                          resident_fp4_scales_view,
+                                                          weight_name,
+                                                          mCapturing);
+                }
+                if (!ctx.cached_fp4_data && !ctx.cached_weight) {
+                    ctx.weight = &resolve_weight();
+                }
 
                 used_recipe = true;
                 mRecipe->forward_matmul(ctx);
@@ -248,6 +329,7 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
         }
 
         if (!used_recipe) {
+            Tensor& b = resolve_weight();
             EMMTranspose mode_col = swap_transpose(op.attrs.transpose);
             matmul(out,
                    b,
@@ -269,10 +351,10 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
                                  "' transpose=" + std::to_string(static_cast<int>(op.attrs.transpose)) +
                                  " used_recipe=" + std::string(used_recipe ? "1" : "0") + " M=" + std::to_string(M) +
                                  " N=" + std::to_string(N) + " K=" + std::to_string(K) +
-                                 " a_rank=" + std::to_string(a.Rank) + " b_rank=" + std::to_string(b.Rank) +
+                                 " a_rank=" + std::to_string(a.Rank) + " b_rank=" + std::to_string(b_template.Rank) +
                                  " out_rank=" + std::to_string(out.Rank) +
                                  " a_dtype=" + std::to_string(static_cast<int>(a.DType)) +
-                                 " b_dtype=" + std::to_string(static_cast<int>(b.DType)) +
+                                 " b_dtype=" + std::to_string(static_cast<int>(b_template.DType)) +
                                  " out_dtype=" + std::to_string(static_cast<int>(out.DType)) + ": " + e.what());
     }
 

@@ -6,12 +6,12 @@ which has already had its own ``CUDA_VISIBLE_DEVICES`` set by the CLI before any
 import happens. Weight broadcast goes through the filesystem backend — there is no
 shared GPU memory between the two GPU sets.
 
-Startup sequence:
+Startup sequence (all three components launch concurrently):
     1. Spawn vLLM subprocess with ``CUDA_VISIBLE_DEVICES=<vllm gpu ids>``.
-    2. Poll vLLM /health until it serves.
-    3. Start the surogate trainer in a background thread (parent process,
+    2. Start the surogate trainer in a background thread (parent process,
        ``CUDA_VISIBLE_DEVICES=<trainer gpu ids>`` already applied by the CLI).
-    4. Run the orchestrator in the main async event loop.
+    3. Run the orchestrator in the main async event loop. The orchestrator
+       polls vLLM /health internally and blocks until inference is ready.
 
 Module-level imports here MUST stay torch-free: this module is re-imported in the
 spawned vLLM child, where torch must not be loaded until ``CUDA_VISIBLE_DEVICES``
@@ -20,9 +20,8 @@ has been re-set.
 
 import asyncio
 import multiprocessing as mp
-import time
-import urllib.error
-import urllib.request
+import os
+import signal
 from threading import Thread
 
 from surogate.core.config.grpo_inference_config import GRPOInferenceConfig
@@ -50,33 +49,19 @@ def _run_vllm_subprocess(infer_config: GRPOInferenceConfig, vllm_gpu_ids: str):
     # which contains our split-mode flags (--vllm-gpus etc.) that vLLM rejects.
     sys.argv = sys.argv[:1]
 
+    # Become a new session leader so vLLM's engine workers (spawned by vLLM via
+    # multiprocessing internally) share our process group. Lets the parent kill
+    # the whole vLLM process tree atomically via os.killpg() on shutdown, and
+    # detaches us from the terminal so terminal SIGINT no longer reaches us —
+    # the parent owns lifecycle.
+    os.setsid()
+
     # Filesystem broadcast — vLLM workers and the trainer don't share GPU memory.
     infer_config.weight_broadcast_type = "filesystem"
 
     from surogate.grpo.inference.grpo_infer import grpo_infer
 
     grpo_infer(infer_config)
-
-
-def _wait_for_vllm_ready(proc: "mp.Process", host: str | None, port: int, timeout: float = 600.0) -> bool:
-    """Poll vLLM /health until it returns 200, the subprocess dies, or we hit the timeout."""
-    deadline = time.time() + timeout
-    target_host = host or "localhost"
-    url = f"http://{target_host}:{port}/health"
-    last_err: Exception | None = None
-    while time.time() < deadline:
-        if not proc.is_alive():
-            logger.error(f"vLLM subprocess exited during startup (exitcode={proc.exitcode})")
-            return False
-        try:
-            with urllib.request.urlopen(url, timeout=2.0) as resp:
-                if resp.status == 200:
-                    return True
-        except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
-            last_err = e
-        time.sleep(2.0)
-    logger.error(f"vLLM /health did not become ready within {timeout:.0f}s (last error: {last_err})")
-    return False
 
 
 def _run_trainer(train_config: GRPOTrainConfig):
@@ -131,25 +116,23 @@ def grpo_split(
         name="vllm-subprocess",
         daemon=False,
     )
+    # SIGTERM → SIGINT so a plain `kill <pid>` (and orchestrator code that calls
+    # signal.raise_signal(SIGTERM) on stop) takes the same KeyboardInterrupt path
+    # that Ctrl-C does, ensuring the finally block tears down the vLLM tree.
+    signal.signal(signal.SIGTERM, lambda *_: signal.raise_signal(signal.SIGINT))
+
+    logger.info("Spawning vLLM, trainer, and orchestrator in parallel")
     vllm_proc.start()
 
-    trainer_thread: Thread | None = None
+    trainer_thread = Thread(
+        target=_run_trainer,
+        args=(train_config,),
+        daemon=True,
+        name="grpo-trainer",
+    )
+    trainer_thread.start()
+
     try:
-        ready = _wait_for_vllm_ready(vllm_proc, infer_config.host, infer_config.port, timeout=600.0)
-        if not ready:
-            raise RuntimeError("vLLM did not become ready in time")
-        logger.info("vLLM server ready")
-
-        logger.info("Starting GRPO trainer")
-        trainer_thread = Thread(
-            target=_run_trainer,
-            args=(train_config,),
-            daemon=True,
-            name="grpo-trainer",
-        )
-        trainer_thread.start()
-
-        logger.info("Starting orchestrator")
         from surogate.grpo.orchestrator.grpo_orch import orchestrate
 
         asyncio.run(orchestrate(orch_config))
@@ -161,16 +144,36 @@ def grpo_split(
     finally:
         logger.info("Split GRPO pipeline shutting down")
 
-        if trainer_thread is not None:
-            trainer_thread.join(timeout=30.0)
-            if trainer_thread.is_alive():
-                logger.warning("Trainer thread did not finish within 30s")
+        # Ignore further Ctrl-Cs/SIGTERMs so cleanup runs to completion. Without this,
+        # a second Ctrl-C interrupts the vLLM teardown and leaks the subprocess tree.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
-        if vllm_proc.is_alive():
-            logger.info("Terminating vLLM subprocess")
-            vllm_proc.terminate()
-            vllm_proc.join(timeout=10.0)
-            if vllm_proc.is_alive():
-                logger.warning("vLLM subprocess did not exit in 10s; killing")
-                vllm_proc.kill()
-                vllm_proc.join(timeout=5.0)
+        # Reap vLLM first — the heavy resource the user wants released.
+        _terminate_vllm_tree(vllm_proc)
+
+        # Trainer runs as a daemon thread; a brief join lets it flush logs, after
+        # which it dies with the process. No reason to block for 30s here.
+        trainer_thread.join(timeout=2.0)
+        if trainer_thread.is_alive():
+            logger.warning("Trainer thread still running; will exit with the process")
+
+
+def _terminate_vllm_tree(vllm_proc: "mp.Process") -> None:
+    """SIGTERM the vLLM process group, escalate to SIGKILL if it doesn't exit."""
+    if not vllm_proc.is_alive() or vllm_proc.pid is None:
+        return
+    pgid = vllm_proc.pid  # vllm_proc called setsid() so its pid == its pgid
+    logger.info("Terminating vLLM subprocess group")
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    vllm_proc.join(timeout=10.0)
+    if vllm_proc.is_alive():
+        logger.warning("vLLM did not exit in 10s; sending SIGKILL to process group")
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        vllm_proc.join(timeout=5.0)

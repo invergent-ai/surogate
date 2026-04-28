@@ -1,11 +1,11 @@
-model: Qwen/Qwen3.6-27B
+model: Qwen/Qwen3.6-27B-FP8
 output_dir: ./output_q36
 
-per_device_train_batch_size: 2
+per_device_train_batch_size: 1
 gradient_accumulation_steps: 4
 
 sample_packing: true
-sequence_len: 2048
+sequence_len: 1024
 
 max_steps: 5
 eval_steps: 25

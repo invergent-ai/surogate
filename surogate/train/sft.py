@@ -79,6 +79,19 @@ class SurogateSFT(TokenizeDatasets):
         finally:
             trainer.shutdown()
 
+    def _cleanup_failed_trainer(self) -> None:
+        import gc
+
+        gc.collect()
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+        except Exception:
+            pass
+
     def train_with_oom_recovery(self, train_files, eval_files):
         original_batch_size = self.config.per_device_train_batch_size
         original_grad_accum = self.config.gradient_accumulation_steps
@@ -87,12 +100,14 @@ class SurogateSFT(TokenizeDatasets):
         max_attempts = 10
         res = None
 
-        trainer = SurogateTrainerWrapper(config=self.config, train_files=train_files, eval_files=eval_files)
+        trainer = None
 
         while self.config.per_device_train_batch_size >= min_batch_size and attempt < max_attempts:
             attempt += 1
+            retry_after_oom = False
 
             try:
+                trainer = SurogateTrainerWrapper(config=self.config, train_files=train_files, eval_files=eval_files)
                 res = trainer.train()
                 logger.info("Training completed successfully.")
                 break
@@ -103,10 +118,7 @@ class SurogateSFT(TokenizeDatasets):
                 )
                 if is_oom:
                     logger.warning(f"Out of memory error encountered during training attempt {attempt}.")
-
-                    import gc
-
-                    gc.collect()
+                    trainer = None
 
                     current_batch = self.config.per_device_train_batch_size
                     current_grad_accum = self.config.gradient_accumulation_steps
@@ -131,14 +143,13 @@ class SurogateSFT(TokenizeDatasets):
                         "New effective batch size",
                         f"{current_batch * current_grad_accum} → {new_batch_size * new_grad_accum}",
                     )
-
-                    trainer = SurogateTrainerWrapper(
-                        config=self.config,
-                        train_files=train_files,
-                        eval_files=eval_files,
-                    )
+                    retry_after_oom = True
                 else:
                     raise
+
+            if retry_after_oom:
+                self._cleanup_failed_trainer()
+                continue
 
         if attempt >= max_attempts:
             logger.error(f"Training failed after {max_attempts} attempts")
