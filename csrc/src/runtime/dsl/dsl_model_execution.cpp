@@ -387,15 +387,11 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
         mGrads->configure(grad_config);
     }
 
-    // CPU-RAM centric training: per-layer base-model gradient streaming.
-    //
-    // Skipped under LoRA because the base model is frozen and produces no gradients —
-    // streaming a never-written buffer would be a no-op. This is NOT a LoRA + CPU
-    // incompatibility: LoRA + CPU training works correctly. Base weights are placed
-    // on CPU pinned memory via `mOptions.CpuTraining` flowing into the weight manager's
-    // `cpu_training` config (independent of this gate); LoRA adapter weights and
-    // gradients live on GPU via the dedicated LoRA grad manager.
-    if (mGrads && mOptions.CpuTraining && !lora_enabled() && !mGrads->param_names().empty()) {
+    // CPU-RAM centric training: stream any trainable DSL parameter gradients
+    // through rotating device buffers. LoRA-only runs usually have no DSL grads,
+    // but train_router=true leaves router parameters trainable alongside LoRA,
+    // so this must be keyed on the actual grad set rather than lora_enabled().
+    if (mGrads && mOptions.CpuTraining && !mGrads->param_names().empty()) {
         // For single-GPU, configure() may not have been called yet (it requires world_size > 1).
         // Ensure the layer map is built by calling configure with minimal config.
         if (comm.world_size() == 1) {

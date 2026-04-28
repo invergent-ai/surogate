@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>
 #include <stdexcept>
 #include <utility>
 #include <variant>
@@ -686,6 +687,58 @@ void NCCLCommunicator::all_reduce_avg(Tensor& tensor, cudaStream_t stream) {
             fprintf(stderr, "[DEBUG] all_reduce_avg ERROR: unsupported dtype %d\n", (int)tensor.DType);
             throw std::runtime_error(fmt::format("NCCLCommunicator::all_reduce_avg: unsupported tensor dtype {}",
                                                  dtype_to_str(tensor.DType)));
+    }
+
+    const bool debug_tensor = std::getenv("SUROGATE_DEBUG_NCCL_TENSOR") != nullptr;
+    if (debug_tensor) {
+        cudaPointerAttributes attrs{};
+        cudaError_t attr_status = cudaPointerGetAttributes(&attrs, tensor.Data);
+        if (attr_status != cudaSuccess) {
+            const char* err_name = cudaGetErrorName(attr_status);
+            (void)cudaGetLastError();
+            throw std::runtime_error(
+                fmt::format("NCCLCommunicator::all_reduce_avg: invalid tensor pointer {} "
+                            "(dtype={}, nelem={}, rank={}, device={}, cudaPointerGetAttributes={})",
+                            static_cast<const void*>(tensor.Data),
+                            dtype_to_str(tensor.DType),
+                            tensor.nelem(),
+                            tensor.Rank,
+                            tensor.Device,
+                            err_name));
+        }
+#if CUDART_VERSION >= 10000
+        const bool is_device_accessible = attrs.type == cudaMemoryTypeDevice || attrs.type == cudaMemoryTypeManaged;
+        const int attr_device = attrs.device;
+        const int attr_type = static_cast<int>(attrs.type);
+#else
+        const bool is_device_accessible = attrs.memoryType == cudaMemoryTypeDevice;
+        const int attr_device = attrs.device;
+        const int attr_type = static_cast<int>(attrs.memoryType);
+#endif
+        if (!is_device_accessible) {
+            throw std::runtime_error(fmt::format("NCCLCommunicator::all_reduce_avg: tensor pointer is not device "
+                                                 "memory {} (dtype={}, nelem={}, rank={}, tensor_device={}, "
+                                                 "ptr_device={}, ptr_type={})",
+                                                 static_cast<const void*>(tensor.Data),
+                                                 dtype_to_str(tensor.DType),
+                                                 tensor.nelem(),
+                                                 tensor.Rank,
+                                                 tensor.Device,
+                                                 attr_device,
+                                                 attr_type));
+        }
+        fprintf(stderr,
+                "[NCCL_DEBUG_TENSOR] all_reduce_avg rank=%d world=%d ptr=%p dtype=%s nelem=%zu rank_dims=%d "
+                "tensor_device=%d ptr_device=%d ptr_type=%d\n",
+                mRank,
+                mWorld,
+                static_cast<void*>(tensor.Data),
+                dtype_to_str(tensor.DType),
+                tensor.nelem(),
+                tensor.Rank,
+                tensor.Device,
+                attr_device,
+                attr_type);
     }
 
     ncclCheck(ncclAllReduce(tensor.Data, tensor.Data, tensor.nelem(), nccl_dtype, ncclAvg, mNcclComm, stream));

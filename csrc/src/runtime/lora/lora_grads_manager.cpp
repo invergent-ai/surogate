@@ -319,6 +319,14 @@ void ModularLoRAGradsManager::set_schema_hook_registry(const dsl::HookRegistry* 
 void ModularLoRAGradsManager::reduce_gradients(cudaStream_t stream, NCCLCommunicator& comm) {
     if (comm.world_size() == 1) return;
 
+    // In pure EP runs (dp_size == 1), expert LoRA grads are local by
+    // construction while replicated adapter grads still use the global
+    // communicator. Keep those collectives in the direct layer/target order
+    // here; dispatching through schema callbacks can make the reduction order
+    // depend on structural slot metadata and is not buying us overlap for this
+    // mode.
+    const bool use_schema_hooks = mSchemaHookDispatchEnabled && !(comm.ep_enabled() && comm.dp_size() == 1);
+
     for (int layer = 0; layer < static_cast<int>(mFullGrads.blocks.size()); ++layer) {
         dsl::GradientOffloadHookPayload payload;
         payload.lora_grads = this;
@@ -326,7 +334,9 @@ void ModularLoRAGradsManager::reduce_gradients(cudaStream_t stream, NCCLCommunic
         payload.compute_stream = stream;
         payload.copy_stream = stream;
         payload.lora_gradients = true;
-        dispatch_schema_layer_hooks(layer, stream, &payload);
+        if (use_schema_hooks) {
+            dispatch_schema_layer_hooks(layer, stream, &payload);
+        }
         if (!payload.lora_reduced) {
             reduce_layer_gradients(layer, stream, comm);
         }

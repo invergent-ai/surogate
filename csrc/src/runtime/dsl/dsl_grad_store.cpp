@@ -366,6 +366,7 @@ void DslGradStore::zero_all(cudaStream_t stream) {
 void DslGradStore::reduce_all(NCCLCommunicator& comm, cudaStream_t stream) {
     const bool ep_active = comm.ep_enabled();
     for (auto& kv : mGrads) {
+        if (!kv.second.Data || kv.second.nelem() == 0) continue;
         // EP: expert weight gradients average across DP group only (same experts),
         // everything else (dense, router, norms) averages across all GPUs.
         if (ep_active && use_expert_parallel_grad_route(kv.first, "DslGradStore::reduce_all")) {
@@ -392,6 +393,7 @@ void DslGradStore::reduce_all_async(NCCLCommunicator& comm, cudaStream_t stream,
 
     // Helper: reduce a single gradient using the appropriate communicator
     auto reduce_one = [&](const std::string& name, Tensor& grad) {
+        if (!grad.Data || grad.nelem() == 0) return;
         if (ep_active && use_expert_parallel_grad_route(name, "DslGradStore::reduce_all_async")) {
             comm.all_reduce_avg_dp(grad, stream);
         } else {
@@ -399,16 +401,38 @@ void DslGradStore::reduce_all_async(NCCLCommunicator& comm, cudaStream_t stream,
         }
     };
 
-    // If overlapped reduction is enabled and we have layer gradients that were already reduced,
-    // only reduce non-layer gradients (embeddings, lm_head, final_norm)
-    if (is_overlapped_enabled() && mHasLayerGrads && !ep_only) {
-        // Collect non-layer gradient names (those not in any layer)
+    auto collect_layer_grads = [&]() {
         std::unordered_set<std::string> layer_grads;
         for (const auto& layer_names : mLayerGradNames) {
             for (const auto& name : layer_names) {
                 layer_grads.insert(name);
             }
         }
+        return layer_grads;
+    };
+
+    if (mStreamGrads && mHasLayerGrads) {
+        // Layer grads were reduced and offloaded at layer end through the
+        // streaming path. The map still contains metadata-only placeholders, so
+        // the final barrier must only reduce non-layer device-resident grads.
+        const auto layer_grads = collect_layer_grads();
+        for (auto& kv : mGrads) {
+            if (layer_grads.find(kv.first) == layer_grads.end()) {
+                reduce_one(kv.first, kv.second);
+            }
+        }
+        if (done_event) {
+            CUDA_CHECK(cudaEventRecord(done_event, stream));
+        }
+        mReducePending = true;
+        return;
+    }
+
+    // If overlapped reduction is enabled and we have layer gradients that were already reduced,
+    // only reduce non-layer gradients (embeddings, lm_head, final_norm)
+    if (is_overlapped_enabled() && mHasLayerGrads && !ep_only) {
+        // Collect non-layer gradient names (those not in any layer)
+        const auto layer_grads = collect_layer_grads();
 
         // Reduce non-layer gradients
         for (auto& kv : mGrads) {

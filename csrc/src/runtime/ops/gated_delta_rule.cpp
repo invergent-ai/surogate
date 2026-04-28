@@ -410,6 +410,7 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
         if (has_output) {
             Tensor& out_ref = ensure_output_tensor(op.outputs[out_idx]);
             bool ok = true;
+            if (!out_ref.Data) ok = false;
             if (out_ref.DType != dtype) ok = false;
             if (shape.size() == 4 && !tensor_shape_matches(out_ref, shape[0], shape[1], shape[2], shape[3])) ok = false;
             if (shape.size() == 3 && (out_ref.Rank != 3 || out_ref.Sizes[0] != shape[0] ||

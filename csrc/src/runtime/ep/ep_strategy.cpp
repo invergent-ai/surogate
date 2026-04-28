@@ -246,6 +246,15 @@ void EPStrategy::cleanup_all() {
 // ============================================================================
 
 bool LLEP::enable_llep_for_layer(bool separate_up_projection) const {
+    // LLEP transfers expert weights between EP peers and keeps merged
+    // per-expert device pointers for the MoE kernels. CPU-training /
+    // offload-master mode streams base weights through transient buffers, so
+    // those pointers are not stable enough for the LLEP transfer path. Static
+    // EP remains valid because it resolves only local experts at use time.
+    if (mOptions.CpuTraining || mOptions.OffloadMaster) {
+        return false;
+    }
+
     // Nemotron-style `experts_up` layers are not LLEP-compatible yet
     // (foreign-weight transfer assumes fused gate_up). Fall back to static
     // mapping for those layers transparently.
@@ -346,7 +355,15 @@ void EPStrategy::parse_forward_layout(CompiledExecutor& exec,
             printed_marker = true;
         }
     }
-    if (ctx.separate_up_projection && supports_llep() && !ctx.llep_supported_for_layer) {
+    if ((mOptions.CpuTraining || mOptions.OffloadMaster) && supports_llep() && !ctx.llep_supported_for_layer) {
+        static bool warned = false;
+        if (!warned && exec.mComm && exec.mComm->rank() == 0) {
+            fprintf(stderr,
+                    "[EP] LLEP disabled for cpu_training/offload_master; "
+                    "using static expert mapping with stable local weight pointers.\n");
+            warned = true;
+        }
+    } else if (ctx.separate_up_projection && supports_llep() && !ctx.llep_supported_for_layer) {
         static bool warned = false;
         if (!warned && exec.mComm && exec.mComm->rank() == 0) {
             fprintf(stderr,
