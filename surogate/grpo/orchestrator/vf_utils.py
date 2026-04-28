@@ -1,8 +1,11 @@
 import asyncio
 import logging
 import multiprocessing as mp
+import queue as _queue_mod
 from collections.abc import Awaitable, Callable
 from itertools import cycle
+from logging.handlers import QueueHandler
+from threading import Event, Thread
 from typing import Any
 
 import verifiers as vf
@@ -17,12 +20,117 @@ REQUIRED_STATE_COLUMNS = ["trajectory", "sampling_args"]
 DEFAULT_STATE_COLUMNS = []
 
 
-def _run_env_server_with_path(env_path: str | None, *args, **kwargs):
+def _install_subprocess_log_forwarding(log_queue: "mp.Queue", log_prefix: str) -> None:
+    """Forward env-subprocess log records to the parent's listener.
+
+    Strategy: attach a single QueueHandler to the root logger. Records from the
+    env's own modules already propagate to root. The verifiers logger has
+    `propagate=False` after `setup_logging` runs, so we monkey-patch that
+    function to flip propagation back on after it configures its own handlers.
+    Filtering thresholds set by `setup_logging` (console/file levels) still
+    apply per-logger; we just relay whatever passes them.
+    """
+    import logging
+    import verifiers.utils.logging_utils as _vf_log_mod
+
+    class _PrefixFilter(logging.Filter):
+        def __init__(self, prefix: str):
+            super().__init__()
+            self._prefix = prefix
+
+        def filter(self, record: logging.LogRecord) -> bool:
+            record.surogate_env_prefix = self._prefix
+            return True
+
+    qh = QueueHandler(log_queue)
+    qh.setLevel(logging.DEBUG)
+    qh.addFilter(_PrefixFilter(log_prefix))
+
+    root = logging.getLogger()
+    root.addHandler(qh)
+    root.setLevel(logging.DEBUG)
+
+    _orig_setup = _vf_log_mod.setup_logging
+
+    def _patched_setup_logging(*args, **kwargs):
+        _orig_setup(*args, **kwargs)
+        # setup_logging sets verifiers.propagate=False; override so its records
+        # reach our root QueueHandler. Per-logger thresholds it set are kept.
+        logging.getLogger("verifiers").propagate = True
+
+    _vf_log_mod.setup_logging = _patched_setup_logging
+    # ZMQEnvServer imports vf.setup_logging under that exact name; rebind.
+    import verifiers as _vf
+
+    _vf.setup_logging = _patched_setup_logging
+
+
+def _run_env_server_with_path(
+    env_path: str | None,
+    log_queue: "mp.Queue | None",
+    log_prefix: str | None,
+    *args,
+    **kwargs,
+):
     if env_path:
         import sys
 
         sys.path.insert(0, env_path)
+    if log_queue is not None and log_prefix is not None:
+        _install_subprocess_log_forwarding(log_queue, log_prefix)
     ZMQEnvServer.run_server(*args, **kwargs)
+
+
+def start_env_log_listener(log_queue: "mp.Queue") -> tuple[Thread, Event]:
+    """Drain log records from `log_queue` and emit them via the surogate logger.
+
+    Each record carries a `surogate_env_prefix` attribute (set by the env
+    subprocess's filter) which is rendered as a "[<env>]" prefix on the
+    forwarded message. Returns (thread, stop_event); call `stop_event.set()` and
+    put a `None` on the queue to terminate the listener cleanly.
+    """
+    from surogate.grpo.utils.logger import get_logger
+
+    parent_logger = get_logger()
+    stop_event = Event()
+
+    _LEVEL_NAMES = {
+        logging.DEBUG: "DEBUG",
+        logging.INFO: "INFO",
+        logging.WARNING: "WARNING",
+        logging.ERROR: "ERROR",
+        logging.CRITICAL: "ERROR",  # surogate disables critical; map to error
+    }
+
+    def _drain():
+        while not stop_event.is_set():
+            try:
+                record = log_queue.get(timeout=0.5)
+            except _queue_mod.Empty:
+                continue
+            except (EOFError, OSError):
+                # Producer side died (e.g. SIGKILL on env subprocess); queue is
+                # broken. Nothing more to drain.
+                return
+            if record is None:
+                break
+            try:
+                prefix = getattr(record, "surogate_env_prefix", None)
+                # QueueHandler.prepare() in the child has already inlined
+                # exc_info into the formatted message and nulled record.args
+                # and exc_text. record.getMessage() returns the formatted text.
+                msg = record.getMessage()
+                if prefix:
+                    msg = f"[{prefix}] {msg}"
+                level = _LEVEL_NAMES.get(record.levelno, "INFO")
+                parent_logger.log(level, msg)
+            except Exception:
+                # Never let a log forwarding failure kill the listener.
+                pass
+
+    thread = Thread(target=_drain, daemon=True, name="env-log-listener")
+    thread.start()
+    return thread, stop_event
 
 
 def spawn_env_server(
@@ -31,6 +139,8 @@ def spawn_env_server(
     extra_env_kwargs: dict[str, Any],
     address: str | None = None,
     env_path: str | None = None,
+    log_queue: "mp.Queue | None" = None,
+    log_prefix: str | None = None,
     # logging configs
     log_level: str | None = None,
     log_file: str | None = None,
@@ -50,6 +160,8 @@ def spawn_env_server(
         target=_run_env_server_with_path,
         args=(
             env_path,
+            log_queue,
+            log_prefix,
             env_id,
             env_args,
             extra_env_kwargs,
