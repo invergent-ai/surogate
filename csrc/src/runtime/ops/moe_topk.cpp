@@ -113,6 +113,7 @@ void CompiledExecutor::dispatch_moe_topk(const CompiledOp& op) {
                                                       num_experts,
                                                       top_k,
                                                       mRunState.moe_aux_loss_coef(),
+                                                      mRunState.moe_z_loss_coef(),
                                                       mRunState.MainStream);
             } else {
                 moe_compute_routing_stats(stats,
@@ -133,6 +134,7 @@ void CompiledExecutor::dispatch_moe_topk(const CompiledOp& op) {
                                                       num_experts,
                                                       top_k,
                                                       mRunState.moe_aux_loss_coef(),
+                                                      mRunState.moe_z_loss_coef(),
                                                       mRunState.MainStream);
             } else {
                 moe_compute_routing_stats(stats,

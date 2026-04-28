@@ -934,6 +934,50 @@ TEST_CASE("moe_router_z_loss_forward FP32", "[moe][z_loss]") {
     REQUIRE(std::abs(z_loss_gpu - z_loss_cpu_val) < 1e-5f);
 }
 
+TEST_CASE("moe_routing_stats_from_logits accumulates z-loss", "[moe][z_loss][stats]") {
+    const int num_tokens = 16;
+    const int num_experts = 8;
+    const int top_k = 2;
+    const float aux_loss_coef = 0.05f;
+    const float z_loss_coef = 0.001f;
+
+    std::vector<float> h_logits(num_tokens * num_experts);
+    for (int i = 0; i < num_tokens * num_experts; ++i) {
+        h_logits[i] = 2.0f * (static_cast<float>(rand()) / RAND_MAX) - 1.0f;
+    }
+
+    std::vector<int> h_indices(num_tokens * top_k);
+    for (int t = 0; t < num_tokens; ++t) {
+        h_indices[t * top_k + 0] = t % num_experts;
+        h_indices[t * top_k + 1] = (t + 3) % num_experts;
+    }
+
+    const float z_loss_cpu_val = z_loss_cpu(h_logits.data(), num_tokens, num_experts, z_loss_coef);
+
+    thrust::device_vector<float> d_logits = to_device(h_logits);
+    thrust::device_vector<int> d_indices = to_device(h_indices);
+    thrust::device_vector<float> d_stats(11, 0.0f);
+
+    moe_compute_routing_stats_from_logits(thrust::raw_pointer_cast(d_stats.data()),
+                                          thrust::raw_pointer_cast(d_logits.data()),
+                                          thrust::raw_pointer_cast(d_indices.data()),
+                                          num_tokens,
+                                          num_experts,
+                                          top_k,
+                                          aux_loss_coef,
+                                          z_loss_coef,
+                                          0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<float> h_stats(11);
+    thrust::copy(d_stats.begin(), d_stats.end(), h_stats.begin());
+
+    INFO("CPU z-loss: " << z_loss_cpu_val);
+    INFO("Stats z-loss: " << h_stats[1]);
+    REQUIRE(h_stats[4] == Catch::Approx(1.0f));
+    REQUIRE(std::abs(h_stats[1] - z_loss_cpu_val) < 1e-5f);
+}
+
 TEST_CASE("moe_router_z_loss_forward BF16", "[moe][z_loss]") {
     const int num_tokens = 64;
     const int num_experts = 16;

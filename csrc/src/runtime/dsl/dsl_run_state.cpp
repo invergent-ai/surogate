@@ -1247,10 +1247,11 @@ void DslRunState::configure_backward_graphs(bool hooked) {
     mBackwardGraphsHooked = hooked;
 }
 
-void DslRunState::set_moe_config(int num_experts, float aux_loss_coef) {
+void DslRunState::set_moe_config(int num_experts, float aux_loss_coef, float z_loss_coef) {
     if (num_experts <= 0) return;
     mNumMoEExperts = num_experts;
     mMoEAuxLossCoef = aux_loss_coef;
+    mMoEZLossCoef = z_loss_coef;
     if (!mMoEStatsDevice) {
         CUDA_CHECK(cudaMalloc(&mMoEStatsDevice, kMoEStatsSize * sizeof(float)));
         CUDA_CHECK(cudaMemset(mMoEStatsDevice, 0, kMoEStatsSize * sizeof(float)));

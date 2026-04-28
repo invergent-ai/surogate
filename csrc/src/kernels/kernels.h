@@ -3535,6 +3535,7 @@ void moe_compute_aux_loss(float* aux_loss,
 /// @param num_experts Number of experts.
 /// @param top_k Number of experts per token.
 /// @param aux_loss_coef Auxiliary loss coefficient.
+/// @param z_loss_coef Router z-loss coefficient. Only used by *_from_logits variants.
 /// @param stream CUDA stream.
 void moe_compute_routing_stats(float* stats,
                                const float* routing_probs,
@@ -3559,6 +3560,7 @@ void moe_compute_routing_stats_from_logits(float* stats,
                                            int num_experts,
                                            int top_k,
                                            float aux_loss_coef,
+                                           float z_loss_coef,
                                            cudaStream_t stream);
 void moe_compute_routing_stats_from_logits(float* stats,
                                            const nv_bfloat16* routing_logits,
@@ -3567,6 +3569,7 @@ void moe_compute_routing_stats_from_logits(float* stats,
                                            int num_experts,
                                            int top_k,
                                            float aux_loss_coef,
+                                           float z_loss_coef,
                                            cudaStream_t stream);
 
 // MoE Backward Kernels

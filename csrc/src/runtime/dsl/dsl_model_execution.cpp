@@ -468,7 +468,8 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
     // Enable MoE routing stats tracking
     if (mModelConfig.NumExperts > 0) {
         float aux_coef = mModelConfig.moe_config.has_value() ? mModelConfig.moe_config->router_aux_loss_coef : 0.01f;
-        mRunState->set_moe_config(mModelConfig.NumExperts, aux_coef);
+        float z_coef = mModelConfig.moe_config.has_value() ? mModelConfig.moe_config->router_z_loss_coef : 0.001f;
+        mRunState->set_moe_config(mModelConfig.NumExperts, aux_coef, z_coef);
     }
 
     if (lora_enabled()) {

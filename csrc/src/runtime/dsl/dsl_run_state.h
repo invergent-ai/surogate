@@ -349,12 +349,15 @@ public:
     }
 
     /// @brief Set MoE config and allocate stats buffers (call once after construction)
-    void set_moe_config(int num_experts, float aux_loss_coef);
+    void set_moe_config(int num_experts, float aux_loss_coef, float z_loss_coef);
     [[nodiscard]] int moe_num_experts() const {
         return mNumMoEExperts;
     }
     [[nodiscard]] float moe_aux_loss_coef() const {
         return mMoEAuxLossCoef;
+    }
+    [[nodiscard]] float moe_z_loss_coef() const {
+        return mMoEZLossCoef;
     }
 
 private:
@@ -449,6 +452,7 @@ private:
     float* mMoEStatsHost = nullptr;    ///< Pinned host buffer for readback
     int mNumMoEExperts = 0;            ///< 0 = not MoE
     float mMoEAuxLossCoef = 0.01f;     ///< Auxiliary loss coefficient
+    float mMoEZLossCoef = 0.001f;      ///< Router z-loss coefficient
 };
 
 }  // namespace dsl

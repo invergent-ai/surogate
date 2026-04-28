@@ -1241,6 +1241,14 @@ DslModel::DslModel(const PretrainedConfig& config,
     apply_arch_from_hf_config(*mConfig, *mModule);
     mRuntimeConfig = build_runtime_config(*mModule, *mConfig);
     mModelConfig = build_model_config(*mModule, *mConfig, mRuntimeConfig);
+    if (mModelConfig.moe_config.has_value()) {
+        if (mOptions.RouterAuxLossCoef >= 0.0f) {
+            mModelConfig.moe_config->router_aux_loss_coef = mOptions.RouterAuxLossCoef;
+        }
+        if (mOptions.RouterZLossCoef >= 0.0f) {
+            mModelConfig.moe_config->router_z_loss_coef = mOptions.RouterZLossCoef;
+        }
+    }
 
     if (const char* assert_schema = std::getenv("SUROGATE_BLOCK_SCHEMA_PLAN_ASSERT");
         assert_schema && std::string_view(assert_schema) == "1") {
