@@ -266,12 +266,6 @@ void GenericQLoRAProvider::auto_tune_offloading() {
     if (env_flag_enabled("SUROGATE_QLORA_OFFLOAD_AUTOTUNE_DISABLE")) {
         return;
     }
-    if (mEPSize > 1 && !env_flag_enabled("SUROGATE_QLORA_EP_OFFLOAD_AUTOTUNE")) {
-        fprintf(stderr,
-                "[QLoRA] Offload auto-tune skipped for EP offload run "
-                "(set SUROGATE_QLORA_EP_OFFLOAD_AUTOTUNE=1 to opt in)\n");
-        return;
-    }
 
     // If called before the first training step, defer to after step 0
     // when all lazy runtime allocations are settled.
