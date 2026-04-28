@@ -810,6 +810,7 @@ TEST_CASE("dsl fusion rewrites: production rules compile to fused descriptors", 
         REQUIRE(compiled.ops[0].outputs[0].name == "routing_weights");
         REQUIRE(compiled.ops[0].outputs[1].name == "routing_indices");
         REQUIRE(compiled.ops[0].attrs.topk_softmax);
+        REQUIRE(compiled.ops[0].attrs.topk_full_softmax);
         REQUIRE_FALSE(compiled.ops[0].attrs.normalize_weights);
     }
 
@@ -850,6 +851,33 @@ TEST_CASE("dsl fusion rewrites: production rules compile to fused descriptors", 
         REQUIRE(compiled.ops[0].inputs[1].name == "router_logits");
         REQUIRE(compiled.ops[0].outputs[0].name == "d_router_logits");
         REQUIRE(compiled.ops[0].attrs.topk_softmax);
+        REQUIRE(compiled.ops[0].attrs.topk_full_softmax);
+        REQUIRE_FALSE(compiled.ops[0].attrs.normalize_weights);
+    }
+
+    SECTION("direct moe_topk softmax keeps selected-softmax semantics") {
+        dsl::Graph graph;
+        graph.name = "direct_moe_topk_softmax";
+        graph.params.emplace("router_logits", make_info({2, 4}, ETensorDType::FP32));
+        graph.outputs.emplace("routing_weights", make_info({2, 2}, ETensorDType::FP32, true));
+        graph.outputs.emplace("routing_indices", make_info({2, 2}, ETensorDType::INT32, true));
+
+        dsl::Operation topk;
+        topk.id = "router_topk";
+        topk.name = "moe_topk";
+        topk.kernel_type = "moe_topk";
+        topk.inputs = {"router_logits"};
+        topk.outputs = {"routing_weights", "routing_indices"};
+        topk.attrs["top_k"] = dsl::AttrValue(static_cast<std::int64_t>(2));
+        topk.attrs["normalize"] = dsl::AttrValue(false);
+        topk.attrs["softmax"] = dsl::AttrValue(true);
+        graph.operations.push_back(topk);
+
+        auto compiled = compile(graph, cfg);
+        REQUIRE(compiled.ops.size() == 1);
+        REQUIRE(compiled.ops[0].type == dsl::CompiledOpType::MoETopK);
+        REQUIRE(compiled.ops[0].attrs.topk_softmax);
+        REQUIRE_FALSE(compiled.ops[0].attrs.topk_full_softmax);
         REQUIRE_FALSE(compiled.ops[0].attrs.normalize_weights);
     }
 }

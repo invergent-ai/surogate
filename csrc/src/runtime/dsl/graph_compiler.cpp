@@ -1136,6 +1136,7 @@ void GraphCompiler::apply_fusion_rewrites(CompiledGraph& graph, bool is_backward
             fused.op_id = softmax.op_id + "+" + fused.op_id;
             fused.inputs[0] = softmax.inputs[0];
             fused.attrs.topk_softmax = true;
+            fused.attrs.topk_full_softmax = true;
             populate_descriptor(fused, is_backward);
             preview.applied = true;
             preview.reason = "applied";
@@ -1151,6 +1152,7 @@ void GraphCompiler::apply_fusion_rewrites(CompiledGraph& graph, bool is_backward
             fused.inputs[1].name = tensor_base_from_grad_name(softmax_bwd.outputs[0].name);
             fused.outputs = softmax_bwd.outputs;
             fused.attrs.topk_softmax = true;
+            fused.attrs.topk_full_softmax = true;
             populate_descriptor(fused, is_backward);
             preview.applied = true;
             preview.reason = "applied";
@@ -1863,6 +1865,11 @@ GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType type, const Sha
         if (auto* soft_attr = find_attr(op.attrs, "softmax")) {
             if (auto v = attr_bool(*soft_attr)) {
                 attrs.topk_softmax = *v;
+            }
+        }
+        if (auto* full_soft_attr = find_attr(op.attrs, "topk_full_softmax")) {
+            if (auto v = attr_bool(*full_soft_attr)) {
+                attrs.topk_full_softmax = *v;
             }
         }
 

@@ -103,7 +103,7 @@ Completed subphase:
 - Fusion rewrites are production-enabled by default for supported rules; there is no global or per-rule rollback env for production rewrites.
 - Removed the rollout-era per-rule opt-in path; unsupported rules are preview-only until their production parity evidence exists.
 - Production descriptor rewrites now cover every registered rule that has a real fused runtime descriptor: `matmul_bias`, `matmul_swiglu`, `qkv_qknorm_rope` (`qkv_qk_norm + rope -> qkv_qk_norm_rope`), `residual_rmsnorm`, `lmhead_loss`, and `moe_routing_topk_softmax`.
-- `moe_routing_topk_softmax` forward rewrites `moe_softmax -> moe_topk` to `moe_topk(softmax=True)` for both selected-normalized and full-softmax selected-weight routing, and backward rewrites `moe_topk_backward -> moe_softmax_backward` to `moe_topk_backward(softmax=True)`.
+- `moe_routing_topk_softmax` forward rewrites `moe_softmax -> moe_topk` to `moe_topk(softmax=True, topk_full_softmax=True)` for full-softmax selected-weight routing, and backward rewrites `moe_topk_backward -> moe_softmax_backward` to `moe_topk_backward(softmax=True, topk_full_softmax=True)`. Direct GPT-OSS `moe_topk(softmax=True, normalize=False)` keeps selected-top-k softmax semantics.
 - Rules without a fused runtime descriptor remain preview-only and are not required runtime paths: `qkv_qknorm`, `mamba_gated_rmsnorm`, and `moe_permute_quantize`.
 - MoE and Mamba fusion candidates report explicit unsupported-runtime reasons instead of silent scaffold behavior.
 - Regression artifacts now include `fusion_preview` alongside descriptor, schema, buffer-plan, and arena summaries.
@@ -122,6 +122,7 @@ Validation evidence:
 - 2026-04-28: `make wheel-dev` passed and refreshed the `.venv` extension.
 - 2026-04-28: 5-step `qwen3_5__fp8__single_gpu__gpu__dense` regression passed in `regression_baselines/current/fusion_rewrites_20260428`; the artifact includes `fusion_preview` and no candidates for this already-fused model graph.
 - 2026-04-28: 5-step `qwen3_5_moe__fp8__single_gpu__gpu__moe_grouped` regression passed in `regression_baselines/current/moe_routing_fusion_saved_logits_20260428`; artifact shows all 80 MoE routing candidates applied (`40` forward `moe_routing_topk_softmax`, `40` backward `moe_routing_topk_softmax_backward`).
+- 2026-04-28: 20-step `examples/sft/gpt-oss/gptoss-lora-mxfp4.yaml` direct run passed after separating direct selected-top-k softmax from fused full-router softmax; loss stayed in the `1.1-2.2` range after warmup and gradient norms stayed bounded (`~1.7-7.0`).
 
 ## Track 6 - Remove Remaining Name-Only Gradient Fallback - COMPLETE
 

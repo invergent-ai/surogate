@@ -141,6 +141,7 @@ __global__ void moe_topk_forward_kernel(int* __restrict__ expert_indices,       
                                         int top_k,
                                         bool normalize_weights,
                                         bool softmax_weights,
+                                        bool full_softmax_weights,
                                         bool sort_by_index,
                                         float rounding_scale) {
     const int warps_per_block = blockDim.x / MOE_WARP_SIZE;
@@ -171,15 +172,16 @@ __global__ void moe_topk_forward_kernel(int* __restrict__ expert_indices,       
     // Must sum over top_k (runtime), not K (template), since K may be larger
     // when top_k doesn't match a specialized template (e.g. top_k=3, K=8).
     if (softmax_weights) {
+        const bool use_full_softmax = full_softmax_weights && !normalize_weights;
         float maxv = -INFINITY;
-        const int limit = normalize_weights ? top_k : num_experts;
+        const int limit = use_full_softmax ? num_experts : top_k;
         for (int k = 0; k < limit; ++k) {
-            const float v = normalize_weights ? topk_vals[k] : static_cast<float>(token_scores[k]);
+            const float v = use_full_softmax ? static_cast<float>(token_scores[k]) : topk_vals[k];
             maxv = fmaxf(maxv, v);
         }
         float sum = 0.0f;
         for (int k = 0; k < limit; ++k) {
-            const float v = normalize_weights ? topk_vals[k] : static_cast<float>(token_scores[k]);
+            const float v = use_full_softmax ? static_cast<float>(token_scores[k]) : topk_vals[k];
             sum += expf(v - maxv);
         }
         sum = fmaxf(sum, 1e-9f);
@@ -261,7 +263,8 @@ __global__ void moe_topk_backward_kernel(float* __restrict__ d_probs,           
                                          int num_experts,
                                          int top_k,
                                          bool normalize_weights,
-                                         bool softmax_weights) {
+                                         bool softmax_weights,
+                                         bool full_softmax_weights) {
     constexpr int MAX_K = 8;
     int token_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (token_idx >= num_tokens) return;
@@ -273,7 +276,8 @@ __global__ void moe_topk_backward_kernel(float* __restrict__ d_probs,           
     const int* idx_row = expert_indices + token_idx * top_k;
 
     if (softmax_weights) {
-        if (normalize_weights) {
+        const bool use_full_softmax = full_softmax_weights && !normalize_weights;
+        if (!use_full_softmax) {
             float maxv = -INFINITY;
             float z_vals[MAX_K];
 #pragma unroll
@@ -398,6 +402,7 @@ static void moe_topk_forward_dispatch(int* expert_indices,
                                       int top_k,
                                       bool normalize_weights,
                                       bool softmax_weights,
+                                      bool full_softmax_weights,
                                       bool sort_by_index,
                                       float rounding_scale,
                                       cudaStream_t stream) {
@@ -418,6 +423,7 @@ static void moe_topk_forward_dispatch(int* expert_indices,
                                                                                 top_k,
                                                                                 normalize_weights,
                                                                                 softmax_weights,
+                                                                                full_softmax_weights,
                                                                                 sort_by_index,
                                                                                 rounding_scale);
             break;
@@ -431,6 +437,7 @@ static void moe_topk_forward_dispatch(int* expert_indices,
                                                                                 top_k,
                                                                                 normalize_weights,
                                                                                 softmax_weights,
+                                                                                full_softmax_weights,
                                                                                 sort_by_index,
                                                                                 rounding_scale);
             break;
@@ -444,6 +451,7 @@ static void moe_topk_forward_dispatch(int* expert_indices,
                                                                                 top_k,
                                                                                 normalize_weights,
                                                                                 softmax_weights,
+                                                                                full_softmax_weights,
                                                                                 sort_by_index,
                                                                                 rounding_scale);
             break;
@@ -459,6 +467,7 @@ static void moe_topk_forward_dispatch(int* expert_indices,
                                                                                 top_k,
                                                                                 normalize_weights,
                                                                                 softmax_weights,
+                                                                                full_softmax_weights,
                                                                                 sort_by_index,
                                                                                 rounding_scale);
             break;
@@ -474,6 +483,7 @@ void moe_topk_forward(int* expert_indices,
                       int top_k,
                       bool normalize_weights,
                       bool softmax_weights,
+                      bool full_softmax_weights,
                       bool sort_by_index,
                       float rounding_scale,
                       cudaStream_t stream) {
@@ -486,6 +496,7 @@ void moe_topk_forward(int* expert_indices,
                               top_k,
                               normalize_weights,
                               softmax_weights,
+                              full_softmax_weights,
                               sort_by_index,
                               rounding_scale,
                               stream);
@@ -500,6 +511,7 @@ void moe_topk_forward(int* expert_indices,
                       int top_k,
                       bool normalize_weights,
                       bool softmax_weights,
+                      bool full_softmax_weights,
                       bool sort_by_index,
                       float rounding_scale,
                       cudaStream_t stream) {
@@ -512,6 +524,7 @@ void moe_topk_forward(int* expert_indices,
                               top_k,
                               normalize_weights,
                               softmax_weights,
+                              full_softmax_weights,
                               sort_by_index,
                               rounding_scale,
                               stream);
@@ -526,6 +539,7 @@ void moe_topk_backward(float* d_probs,
                        int top_k,
                        bool normalize_weights,
                        bool softmax_weights,
+                       bool full_softmax_weights,
                        cudaStream_t stream) {
     int block_size = 256;
     int grid_size = (num_tokens + block_size - 1) / block_size;
@@ -537,5 +551,6 @@ void moe_topk_backward(float* d_probs,
                                                                    num_experts,
                                                                    top_k,
                                                                    normalize_weights,
-                                                                   softmax_weights);
+                                                                   softmax_weights,
+                                                                   full_softmax_weights);
 }

@@ -36,6 +36,7 @@ void CompiledExecutor::dispatch_moe_topk(const CompiledOp& op) {
     const int top_k = op.attrs.top_k;
     const bool normalize = op.attrs.normalize_weights;
     const bool softmax = op.attrs.topk_softmax;
+    const bool full_softmax = op.attrs.topk_full_softmax;
     const float scaling_factor = op.attrs.scaling_factor;
     const float rounding_scale = op.attrs.topk_rounding_scale;
     const bool sort_by_index = op.attrs.topk_sort_by_index;
@@ -61,6 +62,7 @@ void CompiledExecutor::dispatch_moe_topk(const CompiledOp& op) {
                          top_k,
                          normalize,
                          softmax,
+                         full_softmax,
                          sort_by_index,
                          rounding_scale,
                          mRunState.MainStream);
@@ -74,6 +76,7 @@ void CompiledExecutor::dispatch_moe_topk(const CompiledOp& op) {
                          top_k,
                          normalize,
                          softmax,
+                         full_softmax,
                          sort_by_index,
                          rounding_scale,
                          mRunState.MainStream);
@@ -155,6 +158,7 @@ void CompiledExecutor::dispatch_moe_topk_backward(const CompiledOp& op) {
     const int top_k = op.attrs.top_k;
     const bool normalize = op.attrs.normalize_weights;
     const bool softmax = op.attrs.topk_softmax;
+    const bool full_softmax = op.attrs.topk_full_softmax;
     const float scaling_factor = op.attrs.scaling_factor;
     // If scaling_factor != 1.0, scale d_routing_weights by the factor before backward.
     // Forward was: output = topk(probs) * sf, so d_topk = d_output * sf
@@ -220,6 +224,7 @@ void CompiledExecutor::dispatch_moe_topk_backward(const CompiledOp& op) {
                           top_k,
                           normalize,
                           softmax,
+                          full_softmax,
                           mRunState.MainStream);
 
         // Cast output back to BF16
@@ -236,6 +241,7 @@ void CompiledExecutor::dispatch_moe_topk_backward(const CompiledOp& op) {
                           top_k,
                           normalize,
                           softmax,
+                          full_softmax,
                           mRunState.MainStream);
     }
 
@@ -258,7 +264,7 @@ std::vector<Operation> moe_topk_backward(const BackwardRuleContext& ctx) {
         std::string probs = fwd.inputs[0];
         std::string indices = fwd.outputs.size() > 1 ? fwd.outputs[1] : "indices";
 
-        AttrMap attrs = copy_attrs(fwd.attrs, {"top_k", "normalize", "scaling_factor", "softmax"});
+        AttrMap attrs = copy_attrs(fwd.attrs, {"top_k", "normalize", "scaling_factor", "softmax", "topk_full_softmax"});
 
         ops.push_back(make_operation("moe_topk_backward_" + std::to_string(ctx.op_counter++),
                                      "moe_topk_backward",

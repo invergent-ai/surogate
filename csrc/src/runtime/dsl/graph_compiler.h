@@ -250,6 +250,7 @@ struct CompiledAttrs {
     bool normalize_weights = true;
     float scaling_factor = 1.0f;
     bool topk_softmax = false;
+    bool topk_full_softmax = false;
     float topk_rounding_scale = 0.0f;
     bool topk_sort_by_index = false;
     bool gate_up_interleaved = false;

@@ -415,6 +415,7 @@ TEST_CASE("moe_topk_forward fp32 matches CPU", "[moe][topk]") {
                      normalize,
                      false,
                      false,
+                     false,
                      0.0f,
                      0);
 
@@ -804,6 +805,7 @@ TEST_CASE("moe full forward pass integration", "[moe][integration]") {
                      num_experts,
                      top_k,
                      true,
+                     false,
                      false,
                      false,
                      0.0f,

@@ -3253,7 +3253,8 @@ void moe_scale_forward(nv_bfloat16* out, const nv_bfloat16* inp, float scale, in
 /// @param num_experts Number of experts.
 /// @param top_k Number of experts per token.
 /// @param normalize_weights Whether to normalize weights to sum to 1.
-/// @param softmax_weights Whether to apply softmax over selected logits.
+/// @param softmax_weights Whether to apply softmax to logits for selected routing weights.
+/// @param full_softmax_weights Whether softmax_weights normalizes over all experts instead of selected experts.
 /// @param stream CUDA stream.
 void moe_topk_forward(int* expert_indices,
                       float* routing_weights,
@@ -3264,6 +3265,7 @@ void moe_topk_forward(int* expert_indices,
                       int top_k,
                       bool normalize_weights,
                       bool softmax_weights,
+                      bool full_softmax_weights,
                       bool sort_by_index,
                       float rounding_scale,
                       cudaStream_t stream);
@@ -3276,6 +3278,7 @@ void moe_topk_forward(int* expert_indices,
                       int top_k,
                       bool normalize_weights,
                       bool softmax_weights,
+                      bool full_softmax_weights,
                       bool sort_by_index,
                       float rounding_scale,
                       cudaStream_t stream);
@@ -3294,6 +3297,7 @@ void moe_topk_backward(float* d_probs,
                        int top_k,
                        bool normalize_weights,
                        bool softmax_weights,
+                       bool full_softmax_weights,
                        cudaStream_t stream);
 
 /// @brief Add per-expert bias to permuted tokens.
