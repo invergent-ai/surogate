@@ -39,7 +39,18 @@ def prepare_command_parser(parser=None):
         "-p",
         type=str,
         default=DEFAULT_ENV_DIR_PATH,
-        help="Path to environments directory",
+        help="Path to environments directory (used by verifiers for output/result lookups, NOT for module import)",
+    )
+    parser.add_argument(
+        "--env-path",
+        type=str,
+        default=None,
+        help=(
+            "Directory prepended to sys.path before importing the env module. "
+            "Use when the env is checked out locally and not pip-installed. "
+            "Must be the parent of a Python package named after env_id (with dashes -> underscores) "
+            "that exposes a top-level load_environment function."
+        ),
     )
     parser.add_argument(
         "--endpoints-path",
@@ -470,6 +481,13 @@ if __name__ == "__main__":
             save_to_hf_hub=raw.get("save_to_hf_hub", False),
             hf_hub_dataset_name=raw.get("hf_hub_dataset_name", ""),
         )
+
+    # If --env-path is set, prepend to sys.path so vf.load_environment can import a
+    # locally-checked-out env package without needing pip install. Mirrors the
+    # orchestrator's GRPOEnvConfig.path field.
+    if args.env_path and args.env_path not in sys.path:
+        sys.path.insert(0, args.env_path)
+        logger.debug(f"Inserted --env-path into sys.path: {args.env_path}")
 
     # Check Hub environments are installed before running
     missing_envs = []
