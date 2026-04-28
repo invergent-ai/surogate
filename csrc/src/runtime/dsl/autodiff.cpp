@@ -189,6 +189,9 @@ Graph derive_backward_graph(const Graph& forward, const DeriveBackwardOptions& o
     auto is_stopped = [&](const std::string& name) -> bool {
         return stop_set.find(name) != stop_set.end();
     };
+    auto is_differentiable = [&](const std::string& name) -> bool {
+        return !is_non_differentiable(forward, name) && !is_stopped(name);
+    };
 
     // Force BackwardRuleRegistry initialization (triggers
     // register_builtin_backward_rules, which is now a thin shim that
@@ -221,11 +224,16 @@ Graph derive_backward_graph(const Graph& forward, const DeriveBackwardOptions& o
 
     // Start from loss (or all outputs if loss not found)
     if (forward.outputs.count(options.loss_name)) {
-        worklist.push(options.loss_name);
-        needs_grad.insert(options.loss_name);
+        if (is_differentiable(options.loss_name)) {
+            worklist.push(options.loss_name);
+            needs_grad.insert(options.loss_name);
+        }
     } else {
         // Fall back to all outputs
         for (const auto& [name, _] : forward.outputs) {
+            if (!is_differentiable(name)) {
+                continue;
+            }
             worklist.push(name);
             needs_grad.insert(name);
         }
@@ -243,7 +251,7 @@ Graph derive_backward_graph(const Graph& forward, const DeriveBackwardOptions& o
 
         const auto& op = forward.operations[it->second];
         for (const auto& inp : op.inputs) {
-            if (is_non_differentiable(forward, inp) || is_stopped(inp)) {
+            if (!is_differentiable(inp)) {
                 continue;
             }
             if (needs_grad.insert(inp).second) {
@@ -258,7 +266,7 @@ Graph derive_backward_graph(const Graph& forward, const DeriveBackwardOptions& o
 
     // Initialize gradient for loss/outputs (cotangent = 1, but typically provided externally)
     for (const auto& [name, _] : forward.outputs) {
-        if (needs_grad.count(name)) {
+        if (needs_grad.count(name) && is_differentiable(name)) {
             grad_map[name] = options.grad_prefix + name;
         }
     }
@@ -275,7 +283,7 @@ Graph derive_backward_graph(const Graph& forward, const DeriveBackwardOptions& o
         // Check if any output of this op needs gradient
         bool has_grad_output = false;
         for (const auto& out : fwd_op.outputs) {
-            if (needs_grad.count(out) && grad_map.count(out)) {
+            if (is_differentiable(out) && needs_grad.count(out) && grad_map.count(out)) {
                 has_grad_output = true;
                 break;
             }
@@ -296,6 +304,9 @@ Graph derive_backward_graph(const Graph& forward, const DeriveBackwardOptions& o
         std::string d_output;
         for (size_t i = 0; i < fwd_op.outputs.size(); ++i) {
             const auto& out = fwd_op.outputs[i];
+            if (!is_differentiable(out)) {
+                continue;
+            }
             auto it_grad = grad_map.find(out);
             if (it_grad != grad_map.end()) {
                 d_outputs[i] = it_grad->second;
@@ -313,7 +324,7 @@ Graph derive_backward_graph(const Graph& forward, const DeriveBackwardOptions& o
         d_inputs.reserve(fwd_op.inputs.size());
         for (size_t i = 0; i < fwd_op.inputs.size(); ++i) {
             const auto& inp = fwd_op.inputs[i];
-            if (needs_grad.count(inp) && !is_non_differentiable(forward, inp) && !is_stopped(inp)) {
+            if (needs_grad.count(inp) && is_differentiable(inp)) {
                 // Use simple name if first gradient for this tensor, else unique name
                 std::string d_inp;
                 if (!grad_map.count(inp)) {
@@ -364,6 +375,9 @@ Graph derive_backward_graph(const Graph& forward, const DeriveBackwardOptions& o
 
     // Set backward graph inputs (gradients of forward outputs)
     for (const auto& [name, info] : forward.outputs) {
+        if (!is_differentiable(name) || !needs_grad.count(name)) {
+            continue;
+        }
         std::string d_name = options.grad_prefix + name;
         backward.inputs[d_name] = info;
     }

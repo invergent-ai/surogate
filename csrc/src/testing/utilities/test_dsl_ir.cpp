@@ -4,6 +4,7 @@
 // Unit tests for DSL IR JSON loader + shape resolution.
 
 #include <cstdlib>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -11,6 +12,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include "runtime/dsl/autodiff.h"
 #include "runtime/dsl/buffer_plan.h"
 #include "runtime/dsl/graph_compiler.h"
 #include "runtime/dsl/hook_registry.h"
@@ -817,4 +819,53 @@ TEST_CASE("Schema hook dispatch defaults on with env opt-out") {
     } else {
         unsetenv("SUROGATE_ENABLE_SCHEMA_HOOK_DISPATCH");
     }
+}
+
+TEST_CASE("Autodiff ignores MoE side-channel outputs") {
+    dsl::Graph forward;
+    forward.name = "moe_ep_side_channel_forward";
+    forward.inputs["permuted"] = dsl::TensorInfo{{dsl::Dim::concrete(8), dsl::Dim::concrete(16)}, ETensorDType::BF16};
+    forward.inputs["routing_indices"] =
+        dsl::TensorInfo{{dsl::Dim::concrete(8), dsl::Dim::concrete(2)}, ETensorDType::INT32};
+    forward.inputs["scatter_indices"] =
+        dsl::TensorInfo{{dsl::Dim::concrete(8), dsl::Dim::concrete(2)}, ETensorDType::INT32};
+    forward.outputs["recv_sorted"] =
+        dsl::TensorInfo{{dsl::Dim::concrete(8), dsl::Dim::concrete(16)}, ETensorDType::BF16};
+    forward.outputs["blocks[39].ep_recv_scatter"] =
+        dsl::TensorInfo{{dsl::Dim::concrete(8), dsl::Dim::concrete(2)}, std::nullopt};
+    forward.intermediates["blocks[39].ep_recv_scatter"] =
+        dsl::TensorInfo{{dsl::Dim::concrete(8), dsl::Dim::concrete(2)}, std::nullopt};
+
+    forward.operations.push_back(dsl::make_operation("ep_dispatch_0",
+                                                     "ep_dispatch",
+                                                     "ep_dispatch",
+                                                     {"permuted", "routing_indices", "scatter_indices"},
+                                                     {"recv_sorted", "blocks[39].ep_recv_scatter"}));
+
+    dsl::Graph backward = dsl::derive_backward_graph(forward);
+
+    REQUIRE(backward.inputs.count("d_recv_sorted") == 1);
+    REQUIRE(backward.inputs.count("d_blocks[39].ep_recv_scatter") == 0);
+    REQUIRE(backward.outputs.count("d_permuted") == 1);
+    REQUIRE(backward.outputs.count("d_routing_indices") == 0);
+    REQUIRE(backward.outputs.count("d_scatter_indices") == 0);
+
+    bool saw_ep_backward = false;
+    for (const auto& op : backward.operations) {
+        REQUIRE(op.name != "add");
+        for (const auto& input : op.inputs) {
+            REQUIRE(input.find("d_blocks[39].ep_recv_scatter") == std::string::npos);
+        }
+        for (const auto& output : op.outputs) {
+            REQUIRE(output.find("d_blocks[39].ep_recv_scatter") == std::string::npos);
+        }
+        if (op.name == "ep_dispatch_backward") {
+            saw_ep_backward = true;
+            REQUIRE(op.inputs.size() == 1);
+            REQUIRE(op.inputs[0] == "d_recv_sorted");
+            REQUIRE(op.outputs.size() == 1);
+            REQUIRE(op.outputs[0] == "d_permuted");
+        }
+    }
+    REQUIRE(saw_ep_backward);
 }

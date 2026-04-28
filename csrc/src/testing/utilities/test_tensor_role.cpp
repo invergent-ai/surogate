@@ -90,6 +90,7 @@ TEST_CASE("TensorRole classifies MoE ownership and distribution conservatively",
         REQUIRE(tensor_role_is_moe_side_channel_name("gather_indices"));
         REQUIRE(tensor_role_is_moe_side_channel_name("expert_offsets"));
         REQUIRE(tensor_role_is_moe_side_channel_name("blocks[0].routing_indices"));
+        REQUIRE(tensor_role_is_moe_side_channel_name("blocks[39].ep_recv_scatter"));
         REQUIRE(tensor_role_is_moe_side_channel_name("ep_recv_scatter_indices"));
         REQUIRE_FALSE(tensor_role_is_moe_side_channel_name("blocks[0].expert_gate_up"));
     }
