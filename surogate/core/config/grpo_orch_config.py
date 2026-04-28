@@ -12,21 +12,17 @@ class GRPOModelConfig:
 
     Args:
         name: Name or path of the HF model to use.
-        lora_adapter: Name of the LoRA adapter. If None, auto-generated from rank and alpha.
-        lora_rank: LoRA rank for this run. Must be <= trainer's max rank. If None, uses trainer's rank.
-        lora_alpha: LoRA alpha for this run. If None, uses trainer's alpha.
+        lora_adapter: Name of the LoRA adapter to register with vLLM. When set, weight broadcasts
+            are routed through vLLM's `/load_lora_adapter` endpoint and the served model name
+            switches to this adapter after the first update. Required when training with LoRA.
     """
 
     name: str | None = None
     lora_adapter: str | None = None
-    lora_rank: int | None = None
-    lora_alpha: int | None = None
 
     def __init__(self, cfg: DictDefault):
         self.name = cfg.get("name", self.name)
         self.lora_adapter = cfg.get("lora_adapter", self.lora_adapter)
-        self.lora_rank = cfg.get("lora_rank", self.lora_rank)
-        self.lora_alpha = cfg.get("lora_alpha", self.lora_alpha)
 
 
 @dataclass

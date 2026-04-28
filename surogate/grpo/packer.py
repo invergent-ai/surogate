@@ -304,7 +304,6 @@ def init_multi_run_manager(output_dir: str, max_runs: int = 1):
         output_dir=Path(output_dir),
         max_runs=max_runs,
         device=torch.device("cuda", 0),
-        lora_config=None,
     )
     logger.info(f"MultiRunManager initialized (output_dir={output_dir}, max_runs={max_runs})")
 

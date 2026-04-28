@@ -90,8 +90,6 @@ max_lora_rank: 32
 model:
   name: Qwen/Qwen3-0.6B
   lora_adapter: default
-  lora_rank: 16
-  lora_alpha: 32
 
 env:
   - id: reverse-text
