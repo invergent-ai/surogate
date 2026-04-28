@@ -1082,13 +1082,6 @@ void EPStrategy::finalize_native_only_state(CompiledExecutor& exec, DispatchForw
     if (auto* provider = exec.mWeights.qlora_provider()) {
         if (provider->has_offloading()) {
             allow = false;
-            static bool warned = false;
-            if (!warned && exec.mComm && exec.mComm->rank() == 0) {
-                fprintf(stderr,
-                        "[EP] QLoRA offloading detected: disabling native-pointer EP fallback "
-                        "to avoid stale expert pointers.\n");
-                warned = true;
-            }
         }
     }
     if (!allow) return;
