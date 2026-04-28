@@ -640,6 +640,7 @@ class GRPOOrchestratorConfig:
         token_batch_size: Number of tokens to train on per step (token-based batching). Set this OR batch_size.
         max_inflight_rollouts: Maximum number of rollouts to keep in-flight. Required for token-based batching. If batch_size is set and this is unset, defaults to batch_size * oversampling_factor (or batch_size when oversampling_factor is unset).
         verification: Rollout verification configuration
+        dump_metrics: Whether to dump metrics to '/tmp/grpo_metrics.jsonl' at each logging step.
     """
 
     client: GRPOClientConfig | None = None
@@ -678,6 +679,7 @@ class GRPOOrchestratorConfig:
     use_token_client: bool | None = True
     token_batch_size: int | None = None
     max_inflight_rollouts: int | None = None
+    dump_metrics: bool | None = False
 
     def __init__(self, cfg: DictDefault):
         self.client = GRPOClientConfig(cfg.get("client", {}))
@@ -792,6 +794,8 @@ class GRPOOrchestratorConfig:
         self.use_token_client = cfg.get("use_token_client", self.use_token_client)
         self.token_batch_size = cfg.get("token_batch_size", self.token_batch_size)
         self.max_inflight_rollouts = cfg.get("max_inflight_rollouts", self.max_inflight_rollouts)
+
+        self.dump_metrics = cfg.get("dump_metrics", self.dump_metrics)
 
         self.__post_init__()
 

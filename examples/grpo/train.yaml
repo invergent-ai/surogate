@@ -1,6 +1,6 @@
 # GRPO RL Training Example
 
-model: "./reverse-text-qwen3-2"
+model: "Qwen/Qwen3-0.6B"
 output_dir: ./outputs
 
 per_device_train_batch_size: 1
@@ -35,3 +35,5 @@ lora_target_modules:
 save_steps: 100
 checkpoint_dir: ./outputs/checkpoints
 
+report_to:
+  - surogate

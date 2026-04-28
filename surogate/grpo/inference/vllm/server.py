@@ -7,7 +7,6 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.datastructures import State
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.chat_utils import load_chat_template
-from vllm.entrypoints.cli.serve import run_api_server_worker_proc
 from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.openai.api_server import init_app_state
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionResponse
@@ -20,6 +19,7 @@ from vllm.entrypoints.serve.lora.protocol import LoadLoRAAdapterRequest
 from vllm.entrypoints.utils import load_aware_call, with_cancellation
 from vllm.logger import init_logger
 from vllm.utils.argparse_utils import FlexibleArgumentParser
+from vllm.v1.utils import run_api_server_worker_proc
 
 from surogate.core.config.grpo_inference_config import GRPOInferenceConfig
 from surogate.grpo.inference.patches import (
@@ -209,16 +209,16 @@ def custom_run_api_server_worker_proc(listen_address, sock, args, client_config=
     run_api_server_worker_proc(listen_address, sock, args, client_config, **uvicorn_kwargs)
 
 
-import vllm.entrypoints.cli.serve
 import vllm.entrypoints.openai.api_server
+import vllm.v1.utils
 from vllm.entrypoints.openai.api_server import build_app as _original_build_app
 
 
-def custom_build_app(args: Namespace, supported_tasks: tuple):
+def custom_build_app(args: Namespace, supported_tasks=None, model_config=None):
     """
     Wrap build_app to include our custom router.
     """
-    app = _original_build_app(args, supported_tasks)
+    app = _original_build_app(args, supported_tasks, model_config)
     app.include_router(router)
     return app
 
@@ -228,7 +228,7 @@ def custom_build_app(args: Namespace, supported_tasks: tuple):
 # re-import modules and would otherwise use the original run_server_worker
 vllm.entrypoints.openai.api_server.init_app_state = custom_init_app_state
 vllm.entrypoints.openai.api_server.build_app = custom_build_app
-vllm.entrypoints.cli.serve.run_api_server_worker_proc = custom_run_api_server_worker_proc
+vllm.v1.utils.run_api_server_worker_proc = custom_run_api_server_worker_proc
 
 
 # Adapted from vllm/entrypoints/cli/serve.py

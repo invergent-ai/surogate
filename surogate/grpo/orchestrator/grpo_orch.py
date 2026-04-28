@@ -376,6 +376,13 @@ async def orchestrate(config: GRPOOrchestratorConfig):
     # Persistent ThreadPoolExecutor for parallel rollout processing
     rollout_executor = ThreadPoolExecutor(max_workers=64)
 
+    # Optional per-step metrics dump (one JSON object per line)
+    metrics_dump_file = None
+    if config.dump_metrics:
+        metrics_dump_path = "/tmp/grpo_metrics.jsonl"
+        metrics_dump_file = open(metrics_dump_path, "a")
+        logger.info(f"Dumping per-step metrics to {metrics_dump_path}")
+
     while True:
         # Check if this run has been evicted by the trainer
         evicted_path = Path(config.output_dir) / "control" / "evicted.txt"
@@ -743,6 +750,12 @@ async def orchestrate(config: GRPOOrchestratorConfig):
         # Log metrics to monitor(s)
         monitor.log(to_log, step=progress.step)
 
+        # Dump raw per-step metrics to JSONL if enabled
+        if metrics_dump_file is not None:
+            entry = {"step": progress.step, "ts": time.time(), **to_log}
+            metrics_dump_file.write(json.dumps(entry, default=str) + "\n")
+            metrics_dump_file.flush()
+
         # Log samples to monitor(s) if enabled
         subset_train_rollouts = random.sample(train_rollouts, min(8, len(train_rollouts)))
         monitor.log_samples(subset_train_rollouts, step=progress.step)
@@ -796,6 +809,10 @@ async def orchestrate(config: GRPOOrchestratorConfig):
     if ckpt_manager is not None:
         logger.info("Writing final checkpoint")
         ckpt_manager.save(progress, buffer, step=progress.step)
+
+    # Close metrics dump file
+    if metrics_dump_file is not None:
+        metrics_dump_file.close()
 
     # Close training batch sender
     training_batch_sender.close()

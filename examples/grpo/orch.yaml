@@ -1,13 +1,13 @@
 # GRPO Orchestrator Example
 
 model:
-  name: "./reverse-text-qwen3-2"
+  name: "Qwen/Qwen3-0.6B"
   lora_adapter: "default"
   lora_rank: 16
   lora_alpha: 32
 
 env:
-  - id: reverse-text
+  - id: markdown-table-qa
 
 batch_size: 128
 rollouts_per_example: 16
@@ -19,5 +19,7 @@ sampling:
   max_tokens: 128
 
 client:
-  base_url: 
+  base_url:
     - http://localhost:8007/v1
+
+dump_metrics: true
