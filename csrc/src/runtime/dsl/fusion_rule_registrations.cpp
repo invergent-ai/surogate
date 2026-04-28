@@ -68,6 +68,10 @@ REGISTER_FUSION_RULE(make_rule("lmhead_loss", {"matmul", "cross_entropy_loss"}, 
 REGISTER_FUSION_RULE(
     make_rule("mamba_gated_rmsnorm", {"mamba_ssm_scan", "mamba_gated_rmsnorm"}, no_collective_comm_fusion, 75));
 REGISTER_FUSION_RULE(make_rule("moe_routing_topk_softmax", {"moe_softmax", "moe_topk"}, moe_routing_fusion, 70));
+REGISTER_FUSION_RULE(make_rule("moe_routing_topk_softmax_backward",
+                               {"moe_topk_backward", "moe_softmax_backward"},
+                               moe_routing_fusion,
+                               69));
 REGISTER_FUSION_RULE(
     make_rule("moe_permute_quantize", {"moe_permute", "moe_grouped_gemm"}, moe_grouped_consumer_fusion, 65));
 

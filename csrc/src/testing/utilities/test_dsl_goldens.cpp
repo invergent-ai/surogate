@@ -603,7 +603,7 @@ TEST_CASE("dsl fusion rewrites: production rules compile to fused descriptors", 
         return info;
     };
 
-    auto compile = [](dsl::Graph graph, const PretrainedConfig& cfg) {
+    auto compile = [](dsl::Graph graph, const PretrainedConfig& cfg, bool is_backward = false) {
         dsl::Module module;
         module.name = "fusion_rewrite";
         module.kind = "model";
@@ -621,7 +621,7 @@ TEST_CASE("dsl fusion rewrites: production rules compile to fused descriptors", 
         dsl::DslParamStore params(module, graph, options, cfg, allocator, nullptr, nullptr, false);
         dsl::DslGradStore grads(params, allocator, false, EAllocationType::ON_DEVICE, 1, false);
         dsl::GraphCompiler compiler(module, model_cfg, options, params, grads);
-        return compiler.compile(graph, /*B=*/1, /*T=*/1);
+        return compiler.compile(graph, /*B=*/1, /*T=*/1, is_backward);
     };
 
     PretrainedConfig cfg;
@@ -772,6 +772,85 @@ TEST_CASE("dsl fusion rewrites: production rules compile to fused descriptors", 
         REQUIRE(compiled.ops[0].inputs[0].name == "x");
         REQUIRE(compiled.ops[0].inputs[1].name == "weight");
         REQUIRE(compiled.ops[0].inputs[2].name == "targets");
+    }
+
+    SECTION("moe_routing_topk_softmax forward") {
+        dsl::Graph graph;
+        graph.name = "moe_routing_topk_softmax_rewrite";
+        graph.params.emplace("router_logits", make_info({2, 4}, ETensorDType::FP32));
+        graph.intermediates.emplace("router_probs", make_info({2, 4}, ETensorDType::FP32));
+        graph.outputs.emplace("routing_weights", make_info({2, 2}, ETensorDType::FP32, true));
+        graph.outputs.emplace("routing_indices", make_info({2, 2}, ETensorDType::INT32, true));
+
+        dsl::Operation softmax;
+        softmax.id = "router_softmax";
+        softmax.name = "moe_softmax";
+        softmax.kernel_type = "moe_softmax";
+        softmax.inputs = {"router_logits"};
+        softmax.outputs = {"router_probs"};
+        graph.operations.push_back(softmax);
+
+        dsl::Operation topk;
+        topk.id = "router_topk";
+        topk.name = "moe_topk";
+        topk.kernel_type = "moe_topk";
+        topk.inputs = {"router_probs"};
+        topk.outputs = {"routing_weights", "routing_indices"};
+        topk.attrs["top_k"] = dsl::AttrValue(static_cast<std::int64_t>(2));
+        topk.attrs["normalize"] = dsl::AttrValue(false);
+        graph.operations.push_back(topk);
+
+        auto compiled = compile(graph, cfg);
+        REQUIRE(compiled.ops.size() == 1);
+        REQUIRE(compiled.fusion_rewrite_preview.size() == 1);
+        REQUIRE(compiled.fusion_rewrite_preview[0].rule_name == "moe_routing_topk_softmax");
+        REQUIRE(compiled.fusion_rewrite_preview[0].applied);
+        REQUIRE(compiled.ops[0].type == dsl::CompiledOpType::MoETopK);
+        REQUIRE(compiled.ops[0].inputs[0].name == "router_logits");
+        REQUIRE(compiled.ops[0].outputs[0].name == "routing_weights");
+        REQUIRE(compiled.ops[0].outputs[1].name == "routing_indices");
+        REQUIRE(compiled.ops[0].attrs.topk_softmax);
+        REQUIRE_FALSE(compiled.ops[0].attrs.normalize_weights);
+    }
+
+    SECTION("moe_routing_topk_softmax backward") {
+        dsl::Graph graph;
+        graph.name = "moe_routing_topk_softmax_backward_rewrite";
+        graph.params.emplace("d_routing_weights", make_info({2, 2}, ETensorDType::FP32));
+        graph.params.emplace("saved.router_probs", make_info({2, 4}, ETensorDType::FP32));
+        graph.params.emplace("saved.router_logits", make_info({2, 4}, ETensorDType::FP32));
+        graph.params.emplace("saved.routing_indices", make_info({2, 2}, ETensorDType::INT32));
+        graph.intermediates.emplace("d_router_probs", make_info({2, 4}, ETensorDType::FP32));
+        graph.outputs.emplace("d_router_logits", make_info({2, 4}, ETensorDType::FP32, true));
+
+        dsl::Operation topk_bwd;
+        topk_bwd.id = "router_topk_backward";
+        topk_bwd.name = "moe_topk_backward";
+        topk_bwd.kernel_type = "moe_topk_backward";
+        topk_bwd.inputs = {"d_routing_weights", "saved.router_probs", "saved.routing_indices"};
+        topk_bwd.outputs = {"d_router_probs"};
+        topk_bwd.attrs["top_k"] = dsl::AttrValue(static_cast<std::int64_t>(2));
+        topk_bwd.attrs["normalize"] = dsl::AttrValue(false);
+        graph.operations.push_back(topk_bwd);
+
+        dsl::Operation softmax_bwd;
+        softmax_bwd.id = "router_softmax_backward";
+        softmax_bwd.name = "moe_softmax_backward";
+        softmax_bwd.kernel_type = "moe_softmax_backward";
+        softmax_bwd.inputs = {"d_router_probs", "saved.router_probs"};
+        softmax_bwd.outputs = {"d_router_logits"};
+        graph.operations.push_back(softmax_bwd);
+
+        auto compiled = compile(graph, cfg, /*is_backward=*/true);
+        REQUIRE(compiled.ops.size() == 1);
+        REQUIRE(compiled.fusion_rewrite_preview.size() == 1);
+        REQUIRE(compiled.fusion_rewrite_preview[0].rule_name == "moe_routing_topk_softmax_backward");
+        REQUIRE(compiled.fusion_rewrite_preview[0].applied);
+        REQUIRE(compiled.ops[0].type == dsl::CompiledOpType::MoETopKBackward);
+        REQUIRE(compiled.ops[0].inputs[1].name == "router_logits");
+        REQUIRE(compiled.ops[0].outputs[0].name == "d_router_logits");
+        REQUIRE(compiled.ops[0].attrs.topk_softmax);
+        REQUIRE_FALSE(compiled.ops[0].attrs.normalize_weights);
     }
 }
 

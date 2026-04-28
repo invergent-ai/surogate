@@ -171,18 +171,20 @@ __global__ void moe_topk_forward_kernel(int* __restrict__ expert_indices,       
     // Must sum over top_k (runtime), not K (template), since K may be larger
     // when top_k doesn't match a specialized template (e.g. top_k=3, K=8).
     if (softmax_weights) {
-        float maxv = topk_vals[0];
-        for (int k = 1; k < top_k; ++k) {
-            maxv = fmaxf(maxv, topk_vals[k]);
+        float maxv = -INFINITY;
+        const int limit = normalize_weights ? top_k : num_experts;
+        for (int k = 0; k < limit; ++k) {
+            const float v = normalize_weights ? topk_vals[k] : static_cast<float>(token_scores[k]);
+            maxv = fmaxf(maxv, v);
         }
         float sum = 0.0f;
-        for (int k = 0; k < top_k; ++k) {
-            topk_vals[k] = expf(topk_vals[k] - maxv);
-            sum += topk_vals[k];
+        for (int k = 0; k < limit; ++k) {
+            const float v = normalize_weights ? topk_vals[k] : static_cast<float>(token_scores[k]);
+            sum += expf(v - maxv);
         }
         sum = fmaxf(sum, 1e-9f);
         for (int k = 0; k < top_k; ++k) {
-            topk_vals[k] /= sum;
+            topk_vals[k] = expf(topk_vals[k] - maxv) / sum;
         }
     } else if (normalize_weights) {
         float sum = 0.0f;
@@ -271,42 +273,76 @@ __global__ void moe_topk_backward_kernel(float* __restrict__ d_probs,           
     const int* idx_row = expert_indices + token_idx * top_k;
 
     if (softmax_weights) {
-        float maxv = -INFINITY;
-        float z_vals[MAX_K];
+        if (normalize_weights) {
+            float maxv = -INFINITY;
+            float z_vals[MAX_K];
 #pragma unroll
-        for (int k = 0; k < MAX_K; ++k) {
-            if (k >= top_k) break;
-            int e = idx_row[k];
-            float z = (e >= 0 && e < num_experts) ? p_row[e] : -INFINITY;
-            z_vals[k] = z;
-            maxv = fmaxf(maxv, z);
-        }
+            for (int k = 0; k < MAX_K; ++k) {
+                if (k >= top_k) break;
+                int e = idx_row[k];
+                float z = (e >= 0 && e < num_experts) ? p_row[e] : -INFINITY;
+                z_vals[k] = z;
+                maxv = fmaxf(maxv, z);
+            }
 
-        float sum = 0.0f;
-        float w_vals[MAX_K];
+            float sum = 0.0f;
+            float w_vals[MAX_K];
 #pragma unroll
-        for (int k = 0; k < MAX_K; ++k) {
-            if (k >= top_k) break;
-            float w = expf(z_vals[k] - maxv);
-            w_vals[k] = w;
-            sum += w;
-        }
-        sum = fmaxf(sum, 1e-20f);
-        float dot = 0.0f;
+            for (int k = 0; k < MAX_K; ++k) {
+                if (k >= top_k) break;
+                float w = expf(z_vals[k] - maxv);
+                w_vals[k] = w;
+                sum += w;
+            }
+            sum = fmaxf(sum, 1e-20f);
+            float dot = 0.0f;
 #pragma unroll
-        for (int k = 0; k < MAX_K; ++k) {
-            if (k >= top_k) break;
-            w_vals[k] /= sum;
-            dot += d_w_row[k] * w_vals[k];
-        }
+            for (int k = 0; k < MAX_K; ++k) {
+                if (k >= top_k) break;
+                w_vals[k] /= sum;
+                dot += d_w_row[k] * w_vals[k];
+            }
 
 #pragma unroll
-        for (int k = 0; k < MAX_K; ++k) {
-            if (k >= top_k) break;
-            int e = idx_row[k];
-            if (e >= 0 && e < num_experts) {
-                float d_z = w_vals[k] * (d_w_row[k] - dot);
-                d_row[e] = d_z;
+            for (int k = 0; k < MAX_K; ++k) {
+                if (k >= top_k) break;
+                int e = idx_row[k];
+                if (e >= 0 && e < num_experts) {
+                    float d_z = w_vals[k] * (d_w_row[k] - dot);
+                    d_row[e] = d_z;
+                }
+            }
+        } else {
+            float maxv = -INFINITY;
+            for (int e = 0; e < num_experts; ++e) {
+                maxv = fmaxf(maxv, p_row[e]);
+            }
+            float sum = 0.0f;
+            for (int e = 0; e < num_experts; ++e) {
+                sum += expf(p_row[e] - maxv);
+            }
+            sum = fmaxf(sum, 1e-20f);
+
+            float dot = 0.0f;
+#pragma unroll
+            for (int k = 0; k < MAX_K; ++k) {
+                if (k >= top_k) break;
+                int e = idx_row[k];
+                if (e >= 0 && e < num_experts) {
+                    dot += d_w_row[k] * (expf(p_row[e] - maxv) / sum);
+                }
+            }
+            for (int e = 0; e < num_experts; ++e) {
+                float prob = expf(p_row[e] - maxv) / sum;
+                float grad = 0.0f;
+#pragma unroll
+                for (int k = 0; k < MAX_K; ++k) {
+                    if (k >= top_k) break;
+                    if (idx_row[k] == e) {
+                        grad = d_w_row[k];
+                    }
+                }
+                d_row[e] = prob * (grad - dot);
             }
         }
         return;

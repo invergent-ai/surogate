@@ -4,7 +4,7 @@ This document tracks the remaining implementation work needed to move from the c
 
 ## Status
 
-Tracked phases 0-5 are complete for the scoped, guarded implementation. The remaining work is mostly replacing guarded/scaffold/diagnostic paths with authoritative runtime paths, then validating the end state.
+Tracked phases 0-5 are complete for the scoped implementation. The remaining work is mostly replacing compatibility fallbacks with authoritative runtime paths, then validating the end state.
 
 ## Track 1 - Remove Native FP8 MoE WGrad
 
@@ -93,25 +93,26 @@ Acceptance:
 
 - [x] Add a non-mutating graph rewrite preview that lists exact fusion candidates and replacement descriptors.
 - [x] Implement the first descriptor-driven rewrite for a low-risk dense fusion family.
-- [x] Keep MoE and Mamba candidates visible in preview but inert until explicit parity tests exist.
-- [x] Add rollback/disable flags per fusion family for safe rollout.
+- [x] Keep MoE and Mamba candidates visible in preview with explicit unsupported-runtime reasons until fused descriptors and parity tests exist.
+- [x] Remove rollout rollback flags; supported fusion rewrites are the default runtime path.
 
 Completed subphase:
 
 - Compiled graphs now keep a deterministic `fusion_rewrite_preview` with rule name, replacement op, candidate span, source op ids/names, applied state, and rollout reason.
 - Forward `matmul -> bias_add` is rewritten to the existing `matmul_bias` descriptor when the matmul output has exactly one consumer and operand arity matches the fused kernel contract.
-- Fusion rewrites are production-enabled by default for supported rules. `SUROGATE_ENABLE_FUSION_REWRITES=0` disables rewrites globally, and `SUROGATE_DISABLE_FUSION_<RULE>=1` disables a specific rule such as `SUROGATE_DISABLE_FUSION_MATMUL_BIAS=1`.
+- Fusion rewrites are production-enabled by default for supported rules; there is no global or per-rule rollback env for production rewrites.
 - Removed the rollout-era per-rule opt-in path; unsupported rules are preview-only until their production parity evidence exists.
-- Production descriptor rewrites now cover every registered rule that has a real fused runtime descriptor: `matmul_bias`, `matmul_swiglu`, `qkv_qknorm_rope` (`qkv_qk_norm + rope -> qkv_qk_norm_rope`), `residual_rmsnorm`, and `lmhead_loss`.
-- Rules without a fused runtime descriptor remain preview-only: `qkv_qknorm`, `mamba_gated_rmsnorm`, `moe_routing_topk_softmax`, and `moe_permute_quantize`.
-- MoE and Mamba fusion candidates remain preview-only and report explicit inert reasons.
+- Production descriptor rewrites now cover every registered rule that has a real fused runtime descriptor: `matmul_bias`, `matmul_swiglu`, `qkv_qknorm_rope` (`qkv_qk_norm + rope -> qkv_qk_norm_rope`), `residual_rmsnorm`, `lmhead_loss`, and `moe_routing_topk_softmax`.
+- `moe_routing_topk_softmax` forward rewrites `moe_softmax -> moe_topk` to `moe_topk(softmax=True)` for both selected-normalized and full-softmax selected-weight routing, and backward rewrites `moe_topk_backward -> moe_softmax_backward` to `moe_topk_backward(softmax=True)`.
+- Rules without a fused runtime descriptor remain preview-only and are not required runtime paths: `qkv_qknorm`, `mamba_gated_rmsnorm`, and `moe_permute_quantize`.
+- MoE and Mamba fusion candidates report explicit unsupported-runtime reasons instead of silent scaffold behavior.
 - Regression artifacts now include `fusion_preview` alongside descriptor, schema, buffer-plan, and arena summaries.
 
 Acceptance:
 
 - [x] Fusion preview is deterministic and appears in regression artifacts.
 - [x] At least one dense fusion rewrite is enabled by default with numerical parity and no perf regression.
-- [x] MoE fusion candidates remain inert until explicit parity tests exist.
+- [x] MoE fusion candidates are explicitly unsupported as runtime rewrites until fused descriptors and parity tests exist.
 
 Validation evidence:
 
@@ -120,6 +121,7 @@ Validation evidence:
 - 2026-04-28: `.venv/bin/pytest -q tests/test_regression_artifact_writer.py tests/test_regression_baseline_runner.py --no-gpu` passed.
 - 2026-04-28: `make wheel-dev` passed and refreshed the `.venv` extension.
 - 2026-04-28: 5-step `qwen3_5__fp8__single_gpu__gpu__dense` regression passed in `regression_baselines/current/fusion_rewrites_20260428`; the artifact includes `fusion_preview` and no candidates for this already-fused model graph.
+- 2026-04-28: 5-step `qwen3_5_moe__fp8__single_gpu__gpu__moe_grouped` regression passed in `regression_baselines/current/moe_routing_fusion_saved_logits_20260428`; artifact shows all 80 MoE routing candidates applied (`40` forward `moe_routing_topk_softmax`, `40` backward `moe_routing_topk_softmax_backward`).
 
 ## Track 6 - Remove Remaining Name-Only Gradient Fallback - COMPLETE
 
@@ -149,7 +151,7 @@ Acceptance:
 
 Acceptance:
 
-- [ ] No required path depends on scaffold-only, inert-only, or diagnostic-only implementation for the refactor goals.
+- [ ] No required path depends on scaffold-only, inert-only, or diagnostic-only implementation for the refactor goals; preview-only fusion families without runtime descriptors are explicitly non-required unsupported paths.
 - [ ] All remaining fallback paths are either explicit unsupported-mode fallbacks or documented operational safety fallbacks.
 - [ ] `git status --short` is clean after final commits.
 

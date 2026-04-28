@@ -203,7 +203,7 @@ struct DebugDescriptorSummary {
 };
 
 //! Deterministic descriptor rewrite preview. One entry per matching fusion
-//! candidate, including candidates deliberately kept inert for rollout.
+//! candidate, including unsupported candidates kept visible for planning.
 struct DebugFusionCandidate {
     DebugGraphKind graph = DebugGraphKind::Forward;
     std::string rule_name;

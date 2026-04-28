@@ -387,6 +387,112 @@ void moe_compute_routing_stats(float* stats,
                                                                            aux_loss_coef);
 }
 
+template <typename T>
+__global__ void moe_routing_stats_from_logits_kernel(float* __restrict__ stats,
+                                                     const T* __restrict__ routing_logits,
+                                                     const int* __restrict__ expert_indices,
+                                                     int num_tokens,
+                                                     int num_experts,
+                                                     int top_k,
+                                                     float aux_loss_coef) {
+    extern __shared__ float smem[];
+    float* expert_counts = smem;
+    float* expert_probs = smem + num_experts;
+
+    for (int e = threadIdx.x; e < num_experts; e += blockDim.x) {
+        expert_counts[e] = 0.0f;
+        expert_probs[e] = 0.0f;
+    }
+    __syncthreads();
+
+    const int total_assignments = num_tokens * top_k;
+    for (int i = threadIdx.x; i < total_assignments; i += blockDim.x) {
+        int expert_id = expert_indices[i];
+        if (expert_id >= 0 && expert_id < num_experts) {
+            atomicAdd(&expert_counts[expert_id], 1.0f);
+        }
+    }
+
+    for (int t = threadIdx.x; t < num_tokens; t += blockDim.x) {
+        const T* row = routing_logits + t * num_experts;
+        float max_logit = -INFINITY;
+        for (int e = 0; e < num_experts; ++e) {
+            max_logit = fmaxf(max_logit, static_cast<float>(row[e]));
+        }
+        float denom = 0.0f;
+        for (int e = 0; e < num_experts; ++e) {
+            denom += expf(static_cast<float>(row[e]) - max_logit);
+        }
+        denom = fmaxf(denom, 1e-20f);
+        for (int e = 0; e < num_experts; ++e) {
+            const float prob = expf(static_cast<float>(row[e]) - max_logit) / denom;
+            atomicAdd(&expert_probs[e], prob / num_tokens);
+        }
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        float aux_loss = 0.0f;
+        float max_count = 0.0f;
+        const float mean_count = static_cast<float>(total_assignments) / num_experts;
+        int active_experts = 0;
+
+        for (int e = 0; e < num_experts; e++) {
+            const float fraction = expert_counts[e] / total_assignments;
+            aux_loss += fraction * expert_probs[e];
+            if (expert_counts[e] > max_count) max_count = expert_counts[e];
+            if (expert_counts[e] > 0.0f) active_experts++;
+        }
+        aux_loss *= num_experts * aux_loss_coef;
+
+        const float utilization = static_cast<float>(active_experts) / num_experts;
+        const float load_imbalance = (mean_count > 0.0f) ? (max_count / mean_count) : 0.0f;
+
+        atomicAdd(&stats[0], aux_loss);
+        atomicAdd(&stats[2], utilization);
+        atomicAdd(&stats[3], load_imbalance);
+        atomicAdd(&stats[4], 1.0f);
+    }
+}
+
+void moe_compute_routing_stats_from_logits(float* stats,
+                                           const nv_bfloat16* routing_logits,
+                                           const int* expert_indices,
+                                           int num_tokens,
+                                           int num_experts,
+                                           int top_k,
+                                           float aux_loss_coef,
+                                           cudaStream_t stream) {
+    int block_size = 256;
+    int shared_mem = 2 * num_experts * sizeof(float);
+    moe_routing_stats_from_logits_kernel<nv_bfloat16><<<1, block_size, shared_mem, stream>>>(stats,
+                                                                                             routing_logits,
+                                                                                             expert_indices,
+                                                                                             num_tokens,
+                                                                                             num_experts,
+                                                                                             top_k,
+                                                                                             aux_loss_coef);
+}
+
+void moe_compute_routing_stats_from_logits(float* stats,
+                                           const float* routing_logits,
+                                           const int* expert_indices,
+                                           int num_tokens,
+                                           int num_experts,
+                                           int top_k,
+                                           float aux_loss_coef,
+                                           cudaStream_t stream) {
+    int block_size = 256;
+    int shared_mem = 2 * num_experts * sizeof(float);
+    moe_routing_stats_from_logits_kernel<float><<<1, block_size, shared_mem, stream>>>(stats,
+                                                                                       routing_logits,
+                                                                                       expert_indices,
+                                                                                       num_tokens,
+                                                                                       num_experts,
+                                                                                       top_k,
+                                                                                       aux_loss_coef);
+}
+
 void moe_router_z_loss_forward(float* z_loss,
                                const nv_bfloat16* router_logits,
                                int num_tokens,

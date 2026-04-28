@@ -3545,6 +3545,22 @@ void moe_compute_routing_stats(float* stats,
                                int top_k,
                                float aux_loss_coef,
                                cudaStream_t stream);
+void moe_compute_routing_stats_from_logits(float* stats,
+                                           const float* routing_logits,
+                                           const int* expert_indices,
+                                           int num_tokens,
+                                           int num_experts,
+                                           int top_k,
+                                           float aux_loss_coef,
+                                           cudaStream_t stream);
+void moe_compute_routing_stats_from_logits(float* stats,
+                                           const nv_bfloat16* routing_logits,
+                                           const int* expert_indices,
+                                           int num_tokens,
+                                           int num_experts,
+                                           int top_k,
+                                           float aux_loss_coef,
+                                           cudaStream_t stream);
 
 // MoE Backward Kernels
 

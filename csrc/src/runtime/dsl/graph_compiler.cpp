@@ -65,41 +65,10 @@ bool env_flag_enabled(const char* name) {
     return text == "1" || text == "true" || text == "TRUE" || text == "on" || text == "ON";
 }
 
-bool env_flag_disabled(const char* name) {
-    const char* value = std::getenv(name);
-    if (!value) return false;
-    const std::string_view text(value);
-    return text == "0" || text == "false" || text == "FALSE" || text == "off" || text == "OFF";
-}
-
-std::string fusion_rule_env_suffix(std::string_view rule_name) {
-    std::string out;
-    out.reserve(rule_name.size());
-    for (char ch : rule_name) {
-        if ((ch >= 'a' && ch <= 'z')) {
-            out.push_back(static_cast<char>(ch - 'a' + 'A'));
-        } else if ((ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')) {
-            out.push_back(ch);
-        } else {
-            out.push_back('_');
-        }
-    }
-    return out;
-}
-
-bool fusion_rewrites_globally_enabled() {
-    return !env_flag_disabled("SUROGATE_ENABLE_FUSION_REWRITES");
-}
-
-bool fusion_rule_disabled(std::string_view rule_name) {
-    const std::string suffix = fusion_rule_env_suffix(rule_name);
-    const std::string env_name = "SUROGATE_DISABLE_FUSION_" + suffix;
-    return env_flag_enabled(env_name.c_str());
-}
-
 bool fusion_rule_production_enabled(std::string_view rule_name) {
     return rule_name == "matmul_bias" || rule_name == "matmul_swiglu" || rule_name == "qkv_qknorm_rope" ||
-           rule_name == "residual_rmsnorm" || rule_name == "lmhead_loss";
+           rule_name == "residual_rmsnorm" || rule_name == "lmhead_loss" || rule_name == "moe_routing_topk_softmax" ||
+           rule_name == "moe_routing_topk_softmax_backward";
 }
 
 std::string fusion_rule_replacement_op(std::string_view rule_name) {
@@ -108,7 +77,25 @@ std::string fusion_rule_replacement_op(std::string_view rule_name) {
     if (rule_name == "qkv_qknorm_rope") return "qkv_qk_norm_rope";
     if (rule_name == "residual_rmsnorm") return "fused_residual_rmsnorm";
     if (rule_name == "lmhead_loss") return "fused_lm_head_loss";
+    if (rule_name == "moe_routing_topk_softmax") return "moe_topk";
+    if (rule_name == "moe_routing_topk_softmax_backward") return "moe_topk_backward";
     return std::string(rule_name);
+}
+
+std::string tensor_base_from_grad_name(std::string grad_name) {
+    if (grad_name.rfind("d_", 0) == 0) {
+        grad_name.erase(0, 2);
+    }
+    if (const std::size_t pos = grad_name.rfind("_from_"); pos != std::string::npos) {
+        grad_name.erase(pos);
+    }
+    if (const std::size_t pos = grad_name.rfind("_accum_"); pos != std::string::npos) {
+        grad_name.erase(pos);
+    }
+    if (grad_name.rfind(kSavedPrefix, 0) == 0) {
+        grad_name.erase(0, kSavedPrefix.size());
+    }
+    return grad_name;
 }
 
 void set_forward_hook_schema_slot(CompiledAttrs& attrs, modules::ForwardHookPoint point, std::string_view schema_slot) {
@@ -947,6 +934,89 @@ void GraphCompiler::apply_fusion_rewrites(CompiledGraph& graph, bool is_backward
         return true;
     };
 
+    auto can_apply_moe_routing_topk_softmax = [&](std::size_t start, std::string& reason) -> bool {
+        if (is_backward) {
+            reason = "forward-only rewrite";
+            return false;
+        }
+        if (start + 1 >= graph.ops.size()) {
+            reason = "truncated candidate";
+            return false;
+        }
+        const CompiledOp& softmax = graph.ops[start];
+        const CompiledOp& topk = graph.ops[start + 1];
+        if (softmax.type != CompiledOpType::MoESoftmax || topk.type != CompiledOpType::MoETopK) {
+            reason = "candidate op types changed";
+            return false;
+        }
+        if (softmax.inputs.size() != 1 || softmax.outputs.size() != 1 || topk.inputs.size() != 1 ||
+            topk.outputs.size() != 2) {
+            reason = "unsupported operand arity";
+            return false;
+        }
+        const std::string& probs = softmax.outputs[0].name;
+        if (probs.empty() || topk.inputs[0].name != probs) {
+            reason = "moe_topk does not consume moe_softmax output directly";
+            return false;
+        }
+        if (input_use_count[probs] != 1) {
+            reason = "moe_softmax output has multiple consumers";
+            return false;
+        }
+        if (topk.attrs.topk_softmax) {
+            reason = "moe_topk already applies softmax";
+            return false;
+        }
+        if (topk.attrs.topk_rounding_scale != 0.0f) {
+            reason = "top-k rounding changes selection semantics";
+            return false;
+        }
+        reason.clear();
+        return true;
+    };
+
+    auto can_apply_moe_routing_topk_softmax_backward = [&](std::size_t start, std::string& reason) -> bool {
+        if (!is_backward) {
+            reason = "backward-only rewrite";
+            return false;
+        }
+        if (start + 1 >= graph.ops.size()) {
+            reason = "truncated candidate";
+            return false;
+        }
+        const CompiledOp& topk_bwd = graph.ops[start];
+        const CompiledOp& softmax_bwd = graph.ops[start + 1];
+        if (topk_bwd.type != CompiledOpType::MoETopKBackward ||
+            softmax_bwd.type != CompiledOpType::MoESoftmaxBackward) {
+            reason = "candidate op types changed";
+            return false;
+        }
+        if (topk_bwd.inputs.size() != 3 || topk_bwd.outputs.size() != 1 || softmax_bwd.inputs.size() != 2 ||
+            softmax_bwd.outputs.size() != 1) {
+            reason = "unsupported operand arity";
+            return false;
+        }
+        const std::string& d_probs = topk_bwd.outputs[0].name;
+        if (d_probs.empty() || softmax_bwd.inputs[0].name != d_probs) {
+            reason = "moe_softmax_backward does not consume moe_topk_backward output directly";
+            return false;
+        }
+        if (input_use_count[d_probs] != 1) {
+            reason = "moe_topk_backward output has multiple consumers";
+            return false;
+        }
+        if (topk_bwd.attrs.topk_softmax) {
+            reason = "moe_topk_backward already applies softmax derivative";
+            return false;
+        }
+        if (topk_bwd.attrs.topk_rounding_scale != 0.0f) {
+            reason = "top-k rounding changes selection semantics";
+            return false;
+        }
+        reason.clear();
+        return true;
+    };
+
     std::vector<CompiledOp> rewritten;
     rewritten.reserve(graph.ops.size());
     for (std::size_t i = 0; i < graph.ops.size();) {
@@ -960,11 +1030,7 @@ void GraphCompiler::apply_fusion_rewrites(CompiledGraph& graph, bool is_backward
         const FusionRule& rule = *matches.front();
         FusionRewritePreview preview = make_preview(i, rule);
         bool apply = false;
-        if (!fusion_rewrites_globally_enabled()) {
-            preview.reason = "disabled by SUROGATE_ENABLE_FUSION_REWRITES=0";
-        } else if (fusion_rule_disabled(rule.name)) {
-            preview.reason = "disabled by per-rule flag";
-        } else if (fusion_rule_production_enabled(rule.name)) {
+        if (fusion_rule_production_enabled(rule.name)) {
             if (rule.name == "matmul_bias") {
                 apply = can_apply_matmul_bias(i, preview.reason);
             } else if (rule.name == "matmul_swiglu") {
@@ -975,13 +1041,17 @@ void GraphCompiler::apply_fusion_rewrites(CompiledGraph& graph, bool is_backward
                 apply = can_apply_residual_rmsnorm(i, preview.reason);
             } else if (rule.name == "lmhead_loss") {
                 apply = can_apply_lmhead_loss(i, preview.reason);
+            } else if (rule.name == "moe_routing_topk_softmax") {
+                apply = can_apply_moe_routing_topk_softmax(i, preview.reason);
+            } else if (rule.name == "moe_routing_topk_softmax_backward") {
+                apply = can_apply_moe_routing_topk_softmax_backward(i, preview.reason);
             }
         } else if (rule.name.rfind("moe_", 0) == 0) {
-            preview.reason = "MoE fusion rewrites remain inert until explicit parity tests exist";
+            preview.reason = "unsupported: MoE fusion rule has no production fused descriptor/parity evidence";
         } else if (rule.name.rfind("mamba_", 0) == 0) {
-            preview.reason = "Mamba fusion rewrites remain inert until explicit parity tests exist";
+            preview.reason = "unsupported: Mamba fusion rule has no production fused descriptor/parity evidence";
         } else {
-            preview.reason = "fusion rule is preview-only until production parity exists";
+            preview.reason = "unsupported: fusion rule has no production fused descriptor/parity evidence";
         }
 
         if (apply && rule.name == "matmul_bias") {
@@ -1052,6 +1122,35 @@ void GraphCompiler::apply_fusion_rewrites(CompiledGraph& graph, bool is_backward
             fused.type = CompiledOpType::FusedLMHeadLoss;
             fused.op_id = matmul.op_id + "+" + fused.op_id;
             fused.inputs = {matmul.inputs[0], matmul.inputs[1], fused.inputs[1]};
+            populate_descriptor(fused, is_backward);
+            preview.applied = true;
+            preview.reason = "applied";
+            rewritten.push_back(std::move(fused));
+            graph.fusion_rewrite_preview.push_back(std::move(preview));
+            i += rule.pattern.size();
+            continue;
+        }
+        if (apply && rule.name == "moe_routing_topk_softmax") {
+            CompiledOp fused = graph.ops[i + 1];
+            const CompiledOp& softmax = graph.ops[i];
+            fused.op_id = softmax.op_id + "+" + fused.op_id;
+            fused.inputs[0] = softmax.inputs[0];
+            fused.attrs.topk_softmax = true;
+            populate_descriptor(fused, is_backward);
+            preview.applied = true;
+            preview.reason = "applied";
+            rewritten.push_back(std::move(fused));
+            graph.fusion_rewrite_preview.push_back(std::move(preview));
+            i += rule.pattern.size();
+            continue;
+        }
+        if (apply && rule.name == "moe_routing_topk_softmax_backward") {
+            CompiledOp fused = graph.ops[i];
+            const CompiledOp& softmax_bwd = graph.ops[i + 1];
+            fused.op_id = fused.op_id + "+" + softmax_bwd.op_id;
+            fused.inputs[1].name = tensor_base_from_grad_name(softmax_bwd.outputs[0].name);
+            fused.outputs = softmax_bwd.outputs;
+            fused.attrs.topk_softmax = true;
             populate_descriptor(fused, is_backward);
             preview.applied = true;
             preview.reason = "applied";
