@@ -62,7 +62,7 @@ FusionRule make_rule(std::string_view name,
 REGISTER_FUSION_RULE(make_rule("matmul_bias", {"matmul", "bias_add"}, dense_matmul_fusion, 100));
 REGISTER_FUSION_RULE(make_rule("matmul_swiglu", {"matmul", "swiglu"}, dense_matmul_fusion, 95));
 REGISTER_FUSION_RULE(make_rule("qkv_qknorm", {"matmul", "qkv_qk_norm"}, no_collective_comm_fusion, 90));
-REGISTER_FUSION_RULE(make_rule("qkv_qknorm_rope", {"matmul", "qkv_qk_norm", "rope"}, no_collective_comm_fusion, 89));
+REGISTER_FUSION_RULE(make_rule("qkv_qknorm_rope", {"qkv_qk_norm", "rope"}, no_collective_comm_fusion, 89));
 REGISTER_FUSION_RULE(make_rule("residual_rmsnorm", {"add", "rmsnorm"}, no_collective_comm_fusion, 85));
 REGISTER_FUSION_RULE(make_rule("lmhead_loss", {"matmul", "cross_entropy_loss"}, dense_matmul_fusion, 80));
 REGISTER_FUSION_RULE(

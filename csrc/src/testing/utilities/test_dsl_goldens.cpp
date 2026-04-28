@@ -592,6 +592,189 @@ TEST_CASE("dsl fusion rewrites: matmul followed by bias_add compiles to matmul_b
     REQUIRE(compiled.ops[0].outputs[0].name == "out");
 }
 
+TEST_CASE("dsl fusion rewrites: production rules compile to fused descriptors", "[dsl][fusion_rule]") {
+    auto make_info = [](std::initializer_list<long> shape, ETensorDType dtype, bool is_output = false) {
+        dsl::TensorInfo info;
+        info.shape = to_dims(std::vector<long>(shape.begin(), shape.end()));
+        info.dtype = dtype;
+        info.is_param = !is_output;
+        info.is_input = false;
+        info.is_output = is_output;
+        return info;
+    };
+
+    auto compile = [](dsl::Graph graph, const PretrainedConfig& cfg) {
+        dsl::Module module;
+        module.name = "fusion_rewrite";
+        module.kind = "model";
+        module.forward = graph;
+
+        RuntimeOptions options;
+        options.UseCudaGraphs = false;
+        options.Recompute = RecomputeLevel::None;
+        options.ModelType = cfg.DType;
+        options.MatmulType = cfg.DType;
+        options.GradientType = cfg.DType;
+
+        auto allocator = std::make_shared<TensorAllocator>();
+        modules::ModelConfig model_cfg = modules::ModelConfig::from_pretrained_config(cfg);
+        dsl::DslParamStore params(module, graph, options, cfg, allocator, nullptr, nullptr, false);
+        dsl::DslGradStore grads(params, allocator, false, EAllocationType::ON_DEVICE, 1, false);
+        dsl::GraphCompiler compiler(module, model_cfg, options, params, grads);
+        return compiler.compile(graph, /*B=*/1, /*T=*/1);
+    };
+
+    PretrainedConfig cfg;
+    cfg.DType = ETensorDType::FP32;
+    cfg.NumLayers = 1;
+    cfg.NumQueryHeads = 2;
+    cfg.NumKeyValHeads = 1;
+    cfg.HeadDim = 2;
+    cfg.HiddenSize = 4;
+    cfg.IntermediateSize = 4;
+    cfg.VocabSize = 8;
+    cfg.MaxPositionEmbeddings = 4;
+    cfg.RmsNormEps = 1e-5f;
+
+    SECTION("matmul_swiglu") {
+        dsl::Graph graph;
+        graph.name = "matmul_swiglu_rewrite";
+        graph.params.emplace("a", make_info({2, 3}, ETensorDType::FP32));
+        graph.params.emplace("b", make_info({4, 3}, ETensorDType::FP32));
+        graph.outputs.emplace("act", make_info({2, 2}, ETensorDType::FP32, true));
+
+        dsl::Operation matmul;
+        matmul.id = "matmul";
+        matmul.name = "matmul";
+        matmul.kernel_type = "matmul";
+        matmul.inputs = {"a", "b"};
+        matmul.outputs = {"up"};
+        matmul.attrs["transpose"] = dsl::AttrValue("NT");
+        graph.operations.push_back(matmul);
+
+        dsl::Operation swiglu;
+        swiglu.id = "swiglu";
+        swiglu.name = "swiglu";
+        swiglu.kernel_type = "swiglu";
+        swiglu.inputs = {"up"};
+        swiglu.outputs = {"act"};
+        graph.operations.push_back(swiglu);
+
+        auto compiled = compile(graph, cfg);
+        REQUIRE(compiled.ops.size() == 1);
+        REQUIRE(compiled.ops[0].type == dsl::CompiledOpType::MatmulSwiGLU);
+        REQUIRE(compiled.ops[0].outputs[0].name == "act");
+        REQUIRE(compiled.ops[0].outputs[1].name == "up");
+    }
+
+    SECTION("qkv_qknorm_rope") {
+        dsl::Graph graph;
+        graph.name = "qkv_qknorm_rope_rewrite";
+        graph.params.emplace("qkv", make_info({1, 2, 4, 2}, ETensorDType::FP32));
+        graph.params.emplace("q_norm", make_info({2}, ETensorDType::FP32));
+        graph.params.emplace("k_norm", make_info({2}, ETensorDType::FP32));
+        graph.params.emplace("freqs", make_info({2, 2}, ETensorDType::FP32));
+        graph.params.emplace("position_ids", make_info({1, 2}, ETensorDType::INT32));
+        graph.outputs.emplace("qkv_rope", make_info({1, 2, 4, 2}, ETensorDType::FP32, true));
+
+        dsl::Operation qknorm;
+        qknorm.id = "qknorm";
+        qknorm.name = "qkv_qk_norm";
+        qknorm.kernel_type = "qkv_qk_norm";
+        qknorm.inputs = {"qkv", "q_norm", "k_norm"};
+        qknorm.outputs = {"qkv_norm", "q_rstd", "k_rstd"};
+        qknorm.attrs["eps"] = dsl::AttrValue(1e-6);
+        graph.operations.push_back(qknorm);
+
+        dsl::Operation rope;
+        rope.id = "rope";
+        rope.name = "rope";
+        rope.kernel_type = "rope";
+        rope.inputs = {"qkv_norm", "freqs", "position_ids"};
+        rope.outputs = {"qkv_rope"};
+        rope.attrs["rotary_dim"] = dsl::AttrValue(static_cast<std::int64_t>(2));
+        graph.operations.push_back(rope);
+
+        auto compiled = compile(graph, cfg);
+        REQUIRE(compiled.ops.size() == 1);
+        REQUIRE(compiled.ops[0].type == dsl::CompiledOpType::QKVQKNormRoPE);
+        REQUIRE(compiled.ops[0].inputs.size() == 5);
+        REQUIRE(compiled.ops[0].outputs[0].name == "qkv_rope");
+        REQUIRE(compiled.ops[0].outputs[1].name == "q_rstd");
+        REQUIRE(compiled.ops[0].outputs[2].name == "k_rstd");
+    }
+
+    SECTION("residual_rmsnorm") {
+        dsl::Graph graph;
+        graph.name = "residual_rmsnorm_rewrite";
+        graph.params.emplace("residual", make_info({2, 4}, ETensorDType::FP32));
+        graph.params.emplace("x", make_info({2, 4}, ETensorDType::FP32));
+        graph.params.emplace("weight", make_info({4}, ETensorDType::FP32));
+        graph.outputs.emplace("y", make_info({2, 4}, ETensorDType::FP32, true));
+
+        dsl::Operation add;
+        add.id = "add";
+        add.name = "add";
+        add.kernel_type = "add";
+        add.inputs = {"residual", "x"};
+        add.outputs = {"res_out"};
+        graph.operations.push_back(add);
+
+        dsl::Operation rmsnorm;
+        rmsnorm.id = "rmsnorm";
+        rmsnorm.name = "rmsnorm";
+        rmsnorm.kernel_type = "rmsnorm";
+        rmsnorm.inputs = {"res_out", "weight"};
+        rmsnorm.outputs = {"y", "rstd"};
+        rmsnorm.attrs["eps"] = dsl::AttrValue(1e-5);
+        graph.operations.push_back(rmsnorm);
+
+        auto compiled = compile(graph, cfg);
+        REQUIRE(compiled.ops.size() == 1);
+        REQUIRE(compiled.ops[0].type == dsl::CompiledOpType::FusedResidualRMSNorm);
+        REQUIRE(compiled.ops[0].outputs[0].name == "res_out");
+        REQUIRE(compiled.ops[0].outputs[1].name == "y");
+        REQUIRE(compiled.ops[0].outputs[2].name == "rstd");
+    }
+
+    SECTION("lmhead_loss") {
+        dsl::Graph graph;
+        graph.name = "lmhead_loss_rewrite";
+        graph.params.emplace("x", make_info({2, 4}, ETensorDType::FP32));
+        graph.params.emplace("weight", make_info({8, 4}, ETensorDType::FP32));
+        dsl::TensorInfo targets = make_info({2}, ETensorDType::INT32);
+        targets.is_param = false;
+        targets.is_input = true;
+        graph.inputs.emplace("targets", targets);
+        graph.outputs.emplace("loss", make_info({2}, ETensorDType::FP32, true));
+
+        dsl::Operation matmul;
+        matmul.id = "lm_head";
+        matmul.name = "matmul";
+        matmul.kernel_type = "matmul";
+        matmul.inputs = {"x", "weight"};
+        matmul.outputs = {"logits"};
+        matmul.attrs["transpose"] = dsl::AttrValue("NT");
+        graph.operations.push_back(matmul);
+
+        dsl::Operation loss;
+        loss.id = "loss";
+        loss.name = "cross_entropy_loss";
+        loss.kernel_type = "cross_entropy_loss";
+        loss.inputs = {"logits", "targets"};
+        loss.outputs = {"loss"};
+        loss.attrs["compute_accuracy"] = dsl::AttrValue(true);
+        graph.operations.push_back(loss);
+
+        auto compiled = compile(graph, cfg);
+        REQUIRE(compiled.ops.size() == 1);
+        REQUIRE(compiled.ops[0].type == dsl::CompiledOpType::FusedLMHeadLoss);
+        REQUIRE(compiled.ops[0].inputs[0].name == "x");
+        REQUIRE(compiled.ops[0].inputs[1].name == "weight");
+        REQUIRE(compiled.ops[0].inputs[2].name == "targets");
+    }
+}
+
 std::pair<long, long> infer_B_T(const GoldenCase& gc) {
     const auto B_meta = meta_long(gc.meta, "B");
     const auto T_meta = meta_long(gc.meta, "T");

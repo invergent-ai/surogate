@@ -98,7 +98,17 @@ bool fusion_rule_disabled(std::string_view rule_name) {
 }
 
 bool fusion_rule_production_enabled(std::string_view rule_name) {
-    return rule_name == "matmul_bias";
+    return rule_name == "matmul_bias" || rule_name == "matmul_swiglu" || rule_name == "qkv_qknorm_rope" ||
+           rule_name == "residual_rmsnorm" || rule_name == "lmhead_loss";
+}
+
+std::string fusion_rule_replacement_op(std::string_view rule_name) {
+    if (rule_name == "matmul_bias") return "matmul_bias";
+    if (rule_name == "matmul_swiglu") return "matmul_swiglu";
+    if (rule_name == "qkv_qknorm_rope") return "qkv_qk_norm_rope";
+    if (rule_name == "residual_rmsnorm") return "fused_residual_rmsnorm";
+    if (rule_name == "lmhead_loss") return "fused_lm_head_loss";
+    return std::string(rule_name);
 }
 
 void set_forward_hook_schema_slot(CompiledAttrs& attrs, modules::ForwardHookPoint point, std::string_view schema_slot) {
@@ -760,7 +770,7 @@ void GraphCompiler::apply_fusion_rewrites(CompiledGraph& graph, bool is_backward
     auto make_preview = [&](std::size_t start, const FusionRule& rule) {
         FusionRewritePreview preview;
         preview.rule_name = rule.name;
-        preview.replacement_op = rule.name;
+        preview.replacement_op = fusion_rule_replacement_op(rule.name);
         preview.start = start;
         preview.length = rule.pattern.size();
         preview.op_ids.reserve(rule.pattern.size());
@@ -805,6 +815,138 @@ void GraphCompiler::apply_fusion_rewrites(CompiledGraph& graph, bool is_backward
         return true;
     };
 
+    auto can_apply_matmul_swiglu = [&](std::size_t start, std::string& reason) -> bool {
+        if (is_backward) {
+            reason = "forward-only rewrite";
+            return false;
+        }
+        if (start + 1 >= graph.ops.size()) {
+            reason = "truncated candidate";
+            return false;
+        }
+        const CompiledOp& matmul = graph.ops[start];
+        const CompiledOp& swiglu = graph.ops[start + 1];
+        if (matmul.type != CompiledOpType::Matmul || swiglu.type != CompiledOpType::SwiGLU) {
+            reason = "candidate op types changed";
+            return false;
+        }
+        if (matmul.inputs.size() < 2 || matmul.outputs.size() != 1 || swiglu.inputs.size() != 1 ||
+            swiglu.outputs.size() != 1) {
+            reason = "unsupported operand arity";
+            return false;
+        }
+        const std::string& matmul_out = matmul.outputs[0].name;
+        if (matmul_out.empty() || swiglu.inputs[0].name != matmul_out) {
+            reason = "swiglu does not consume matmul output directly";
+            return false;
+        }
+        if (input_use_count[matmul_out] != 1) {
+            reason = "matmul output has multiple consumers";
+            return false;
+        }
+        reason.clear();
+        return true;
+    };
+
+    auto can_apply_qkv_qknorm_rope = [&](std::size_t start, std::string& reason) -> bool {
+        if (is_backward) {
+            reason = "forward-only rewrite";
+            return false;
+        }
+        if (start + 1 >= graph.ops.size()) {
+            reason = "truncated candidate";
+            return false;
+        }
+        const CompiledOp& qknorm = graph.ops[start];
+        const CompiledOp& rope = graph.ops[start + 1];
+        if (qknorm.type != CompiledOpType::QKVQKNorm || rope.type != CompiledOpType::RoPE) {
+            reason = "candidate op types changed";
+            return false;
+        }
+        if (qknorm.inputs.size() != 3 || qknorm.outputs.size() != 3 || rope.inputs.size() != 3 ||
+            rope.outputs.size() != 1) {
+            reason = "unsupported operand arity";
+            return false;
+        }
+        const std::string& qknorm_out = qknorm.outputs[0].name;
+        if (qknorm_out.empty() || rope.inputs[0].name != qknorm_out) {
+            reason = "rope does not consume qkv_qk_norm output directly";
+            return false;
+        }
+        if (input_use_count[qknorm_out] != 1) {
+            reason = "qkv_qk_norm output has multiple consumers";
+            return false;
+        }
+        reason.clear();
+        return true;
+    };
+
+    auto can_apply_residual_rmsnorm = [&](std::size_t start, std::string& reason) -> bool {
+        if (is_backward) {
+            reason = "forward-only rewrite";
+            return false;
+        }
+        if (start + 1 >= graph.ops.size()) {
+            reason = "truncated candidate";
+            return false;
+        }
+        const CompiledOp& add = graph.ops[start];
+        const CompiledOp& rmsnorm = graph.ops[start + 1];
+        if (add.type != CompiledOpType::Add || rmsnorm.type != CompiledOpType::RMSNorm) {
+            reason = "candidate op types changed";
+            return false;
+        }
+        if (add.inputs.size() != 2 || add.outputs.size() != 1 || rmsnorm.inputs.size() != 2 ||
+            rmsnorm.outputs.size() != 2) {
+            reason = "unsupported operand arity";
+            return false;
+        }
+        const std::string& add_out = add.outputs[0].name;
+        if (add_out.empty() || rmsnorm.inputs[0].name != add_out) {
+            reason = "rmsnorm does not consume add output directly";
+            return false;
+        }
+        reason.clear();
+        return true;
+    };
+
+    auto can_apply_lmhead_loss = [&](std::size_t start, std::string& reason) -> bool {
+        if (is_backward) {
+            reason = "forward-only rewrite";
+            return false;
+        }
+        if (start + 1 >= graph.ops.size()) {
+            reason = "truncated candidate";
+            return false;
+        }
+        const CompiledOp& matmul = graph.ops[start];
+        const CompiledOp& loss = graph.ops[start + 1];
+        if (matmul.type != CompiledOpType::Matmul || loss.type != CompiledOpType::CrossEntropyLoss) {
+            reason = "candidate op types changed";
+            return false;
+        }
+        if (matmul.inputs.size() < 2 || matmul.outputs.size() != 1 || loss.inputs.size() != 2 ||
+            loss.outputs.size() != 1) {
+            reason = "unsupported operand arity";
+            return false;
+        }
+        if (matmul.attrs.transpose != EMMTranspose::NT) {
+            reason = "lmhead fused loss requires NT matmul";
+            return false;
+        }
+        const std::string& logits = matmul.outputs[0].name;
+        if (logits.empty() || loss.inputs[0].name != logits) {
+            reason = "cross_entropy_loss does not consume matmul output directly";
+            return false;
+        }
+        if (input_use_count[logits] != 1) {
+            reason = "matmul logits have multiple consumers";
+            return false;
+        }
+        reason.clear();
+        return true;
+    };
+
     std::vector<CompiledOp> rewritten;
     rewritten.reserve(graph.ops.size());
     for (std::size_t i = 0; i < graph.ops.size();) {
@@ -822,8 +964,18 @@ void GraphCompiler::apply_fusion_rewrites(CompiledGraph& graph, bool is_backward
             preview.reason = "disabled by SUROGATE_ENABLE_FUSION_REWRITES=0";
         } else if (fusion_rule_disabled(rule.name)) {
             preview.reason = "disabled by per-rule flag";
-        } else if (rule.name == "matmul_bias" && fusion_rule_production_enabled(rule.name)) {
-            apply = can_apply_matmul_bias(i, preview.reason);
+        } else if (fusion_rule_production_enabled(rule.name)) {
+            if (rule.name == "matmul_bias") {
+                apply = can_apply_matmul_bias(i, preview.reason);
+            } else if (rule.name == "matmul_swiglu") {
+                apply = can_apply_matmul_swiglu(i, preview.reason);
+            } else if (rule.name == "qkv_qknorm_rope") {
+                apply = can_apply_qkv_qknorm_rope(i, preview.reason);
+            } else if (rule.name == "residual_rmsnorm") {
+                apply = can_apply_residual_rmsnorm(i, preview.reason);
+            } else if (rule.name == "lmhead_loss") {
+                apply = can_apply_lmhead_loss(i, preview.reason);
+            }
         } else if (rule.name.rfind("moe_", 0) == 0) {
             preview.reason = "MoE fusion rewrites remain inert until explicit parity tests exist";
         } else if (rule.name.rfind("mamba_", 0) == 0) {
@@ -832,13 +984,74 @@ void GraphCompiler::apply_fusion_rewrites(CompiledGraph& graph, bool is_backward
             preview.reason = "fusion rule is preview-only until production parity exists";
         }
 
-        if (apply) {
+        if (apply && rule.name == "matmul_bias") {
             CompiledOp fused = graph.ops[i];
             const CompiledOp& bias_add = graph.ops[i + 1];
             fused.type = CompiledOpType::MatmulBias;
             fused.op_id = fused.op_id + "+" + bias_add.op_id;
             fused.inputs.push_back(bias_add.inputs[1]);
             fused.outputs = bias_add.outputs;
+            populate_descriptor(fused, is_backward);
+            preview.applied = true;
+            preview.reason = "applied";
+            rewritten.push_back(std::move(fused));
+            graph.fusion_rewrite_preview.push_back(std::move(preview));
+            i += rule.pattern.size();
+            continue;
+        }
+        if (apply && rule.name == "matmul_swiglu") {
+            CompiledOp fused = graph.ops[i];
+            const CompiledOp& swiglu = graph.ops[i + 1];
+            fused.type = CompiledOpType::MatmulSwiGLU;
+            fused.op_id = fused.op_id + "+" + swiglu.op_id;
+            fused.outputs = {swiglu.outputs[0], graph.ops[i].outputs[0]};
+            populate_descriptor(fused, is_backward);
+            preview.applied = true;
+            preview.reason = "applied";
+            rewritten.push_back(std::move(fused));
+            graph.fusion_rewrite_preview.push_back(std::move(preview));
+            i += rule.pattern.size();
+            continue;
+        }
+        if (apply && rule.name == "qkv_qknorm_rope") {
+            CompiledOp fused = graph.ops[i];
+            const CompiledOp& rope = graph.ops[i + 1];
+            fused.type = CompiledOpType::QKVQKNormRoPE;
+            fused.op_id = fused.op_id + "+" + rope.op_id;
+            fused.inputs.push_back(rope.inputs[1]);
+            fused.inputs.push_back(rope.inputs[2]);
+            fused.outputs = {rope.outputs[0], fused.outputs[1], fused.outputs[2]};
+            fused.attrs.rotary_dim = rope.attrs.rotary_dim;
+            fused.attrs.mrope_section = rope.attrs.mrope_section;
+            populate_descriptor(fused, is_backward);
+            preview.applied = true;
+            preview.reason = "applied";
+            rewritten.push_back(std::move(fused));
+            graph.fusion_rewrite_preview.push_back(std::move(preview));
+            i += rule.pattern.size();
+            continue;
+        }
+        if (apply && rule.name == "residual_rmsnorm") {
+            const CompiledOp& add = graph.ops[i];
+            CompiledOp fused = graph.ops[i + 1];
+            fused.type = CompiledOpType::FusedResidualRMSNorm;
+            fused.op_id = add.op_id + "+" + fused.op_id;
+            fused.inputs = {add.inputs[0], add.inputs[1], fused.inputs[1]};
+            fused.outputs = {add.outputs[0], fused.outputs[0], fused.outputs[1]};
+            populate_descriptor(fused, is_backward);
+            preview.applied = true;
+            preview.reason = "applied";
+            rewritten.push_back(std::move(fused));
+            graph.fusion_rewrite_preview.push_back(std::move(preview));
+            i += rule.pattern.size();
+            continue;
+        }
+        if (apply && rule.name == "lmhead_loss") {
+            const CompiledOp& matmul = graph.ops[i];
+            CompiledOp fused = graph.ops[i + 1];
+            fused.type = CompiledOpType::FusedLMHeadLoss;
+            fused.op_id = matmul.op_id + "+" + fused.op_id;
+            fused.inputs = {matmul.inputs[0], matmul.inputs[1], fused.inputs[1]};
             populate_descriptor(fused, is_backward);
             preview.applied = true;
             preview.reason = "applied";

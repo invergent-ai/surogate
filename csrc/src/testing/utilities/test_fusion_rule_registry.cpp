@@ -112,6 +112,11 @@ TEST_CASE("built-in fusion rule declarations are registered deterministically", 
     REQUIRE(matmul_bias->priority == 100);
     REQUIRE(matmul_bias->comm_aware);
 
+    const FusionRule* qkv_qknorm_rope = FusionRuleRegistry::instance().find_by_name("qkv_qknorm_rope");
+    REQUIRE(qkv_qknorm_rope != nullptr);
+    REQUIRE(qkv_qknorm_rope->pattern == std::vector<std::string>{"qkv_qk_norm", "rope"});
+    REQUIRE(qkv_qknorm_rope->priority == 89);
+
     const FusionRule* moe_permute_quantize = FusionRuleRegistry::instance().find_by_name("moe_permute_quantize");
     REQUIRE(moe_permute_quantize != nullptr);
     REQUIRE(moe_permute_quantize->pattern == std::vector<std::string>{"moe_permute", "moe_grouped_gemm"});

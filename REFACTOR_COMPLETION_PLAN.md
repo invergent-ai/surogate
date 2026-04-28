@@ -102,6 +102,8 @@ Completed subphase:
 - Forward `matmul -> bias_add` is rewritten to the existing `matmul_bias` descriptor when the matmul output has exactly one consumer and operand arity matches the fused kernel contract.
 - Fusion rewrites are production-enabled by default for supported rules. `SUROGATE_ENABLE_FUSION_REWRITES=0` disables rewrites globally, and `SUROGATE_DISABLE_FUSION_<RULE>=1` disables a specific rule such as `SUROGATE_DISABLE_FUSION_MATMUL_BIAS=1`.
 - Removed the rollout-era per-rule opt-in path; unsupported rules are preview-only until their production parity evidence exists.
+- Production descriptor rewrites now cover every registered rule that has a real fused runtime descriptor: `matmul_bias`, `matmul_swiglu`, `qkv_qknorm_rope` (`qkv_qk_norm + rope -> qkv_qk_norm_rope`), `residual_rmsnorm`, and `lmhead_loss`.
+- Rules without a fused runtime descriptor remain preview-only: `qkv_qknorm`, `mamba_gated_rmsnorm`, `moe_routing_topk_softmax`, and `moe_permute_quantize`.
 - MoE and Mamba fusion candidates remain preview-only and report explicit inert reasons.
 - Regression artifacts now include `fusion_preview` alongside descriptor, schema, buffer-plan, and arena summaries.
 
@@ -114,7 +116,7 @@ Acceptance:
 Validation evidence:
 
 - 2026-04-28: `cmake --build csrc/build --target unit-tests -j 16` passed.
-- 2026-04-28: `./csrc/build/unit-tests "[fusion_rule]"` passed, including a compile test that rewrites `matmul + bias_add` into `matmul_bias`.
+- 2026-04-28: `./csrc/build/unit-tests "[fusion_rule]"` passed, including compile tests for all production descriptor rewrites.
 - 2026-04-28: `.venv/bin/pytest -q tests/test_regression_artifact_writer.py tests/test_regression_baseline_runner.py --no-gpu` passed.
 - 2026-04-28: `make wheel-dev` passed and refreshed the `.venv` extension.
 - 2026-04-28: 5-step `qwen3_5__fp8__single_gpu__gpu__dense` regression passed in `regression_baselines/current/fusion_rewrites_20260428`; the artifact includes `fusion_preview` and no candidates for this already-fused model graph.
