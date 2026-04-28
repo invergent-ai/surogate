@@ -358,9 +358,7 @@ void EPStrategy::parse_forward_layout(CompiledExecutor& exec,
     if ((mOptions.CpuTraining || mOptions.OffloadMaster) && supports_llep() && !ctx.llep_supported_for_layer) {
         static bool warned = false;
         if (!warned && exec.mComm && exec.mComm->rank() == 0) {
-            fprintf(stderr,
-                    "[EP] LLEP disabled for cpu_training/offload_master; "
-                    "using static expert mapping with stable local weight pointers.\n");
+            fprintf(stderr, "[EP] LLEP disabled.\n");
             warned = true;
         }
     } else if (ctx.separate_up_projection && supports_llep() && !ctx.llep_supported_for_layer) {
