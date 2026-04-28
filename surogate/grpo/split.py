@@ -20,8 +20,10 @@ has been re-set.
 
 import asyncio
 import multiprocessing as mp
+import multiprocessing.connection
 import os
 import signal
+import threading
 from threading import Thread
 
 from surogate.core.config.grpo_inference_config import GRPOInferenceConfig
@@ -64,15 +66,50 @@ def _run_vllm_subprocess(infer_config: GRPOInferenceConfig, vllm_gpu_ids: str):
     grpo_infer(infer_config)
 
 
-def _run_trainer(train_config: GRPOTrainConfig):
-    """Run the GRPO trainer in a background thread (parent process)."""
+def _run_trainer(train_config: GRPOTrainConfig, failure_event: threading.Event):
+    """Run the GRPO trainer in a background thread (parent process).
+
+    Sets `failure_event` on any exception so the watchdog can interrupt the
+    orchestrator. Re-raising here would be silently dropped by daemon-thread
+    teardown — the event is the propagation channel to the main thread.
+    """
     from surogate.grpo.trainer import GRPOTrainer
 
     try:
         GRPOTrainer(train_config, external_weights=None).train()
     except Exception:
         logger.exception("Trainer thread crashed")
-        raise
+        failure_event.set()
+
+
+def _watch_components(
+    vllm_proc: "mp.Process",
+    trainer_thread: Thread,
+    trainer_failed: threading.Event,
+    shutdown_event: threading.Event,
+) -> None:
+    """Watchdog: aborts the pipeline if vLLM or the trainer dies unexpectedly.
+
+    Sleeps on `vllm_proc.sentinel` with a 1s timeout so we can also poll the
+    trainer's failure flag. On unexpected death we deliver SIGINT to the main
+    thread, which has the existing SIGINT/KeyboardInterrupt teardown path.
+    """
+    crashed: str | None = None
+    while not shutdown_event.is_set():
+        ready = multiprocessing.connection.wait([vllm_proc.sentinel], timeout=1.0)
+        if shutdown_event.is_set():
+            return
+        if ready:
+            crashed = f"vLLM subprocess died unexpectedly (exitcode={vllm_proc.exitcode})"
+            break
+        if trainer_failed.is_set():
+            crashed = "Trainer thread crashed"
+            break
+    if crashed is None:
+        return
+    logger.error(f"{crashed} — aborting GRPO pipeline")
+    # Wake the main thread out of asyncio.run; existing finally block tears down.
+    os.kill(os.getpid(), signal.SIGINT)
 
 
 def grpo_split(
@@ -124,13 +161,26 @@ def grpo_split(
     logger.info("Spawning vLLM, trainer, and orchestrator in parallel")
     vllm_proc.start()
 
+    trainer_failed = threading.Event()
     trainer_thread = Thread(
         target=_run_trainer,
-        args=(train_config,),
+        args=(train_config, trainer_failed),
         daemon=True,
         name="grpo-trainer",
     )
     trainer_thread.start()
+
+    # Watchdog must come up after both targets but before the orchestrator runs
+    # so we never miss an early crash. shutdown_event suppresses spurious aborts
+    # during the planned teardown in the finally block below.
+    shutdown_event = threading.Event()
+    watchdog_thread = Thread(
+        target=_watch_components,
+        args=(vllm_proc, trainer_thread, trainer_failed, shutdown_event),
+        daemon=True,
+        name="grpo-watchdog",
+    )
+    watchdog_thread.start()
 
     try:
         from surogate.grpo.orchestrator.grpo_orch import orchestrate
@@ -143,6 +193,10 @@ def grpo_split(
         raise
     finally:
         logger.info("Split GRPO pipeline shutting down")
+
+        # Tell the watchdog this teardown is intentional; otherwise it would see
+        # vLLM's planned death and re-fire SIGINT.
+        shutdown_event.set()
 
         # Ignore further Ctrl-Cs/SIGTERMs so cleanup runs to completion. Without this,
         # a second Ctrl-C interrupts the vLLM teardown and leaks the subprocess tree.
@@ -157,6 +211,8 @@ def grpo_split(
         trainer_thread.join(timeout=2.0)
         if trainer_thread.is_alive():
             logger.warning("Trainer thread still running; will exit with the process")
+
+        watchdog_thread.join(timeout=2.0)
 
 
 def _terminate_vllm_tree(vllm_proc: "mp.Process") -> None:

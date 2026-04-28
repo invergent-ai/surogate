@@ -16,6 +16,8 @@ Startup sequence:
 
 import asyncio
 import logging
+import os
+import signal
 import sys
 from threading import Event, Thread
 
@@ -327,6 +329,23 @@ def _run_trainer(
         raise
 
 
+def _watch_components(error_event: Event, shutdown_event: Event) -> None:
+    """Watchdog: aborts the orchestrator if vLLM or the trainer raise.
+
+    Both `_run_vllm_server` and `_run_trainer` set `error_event` in their
+    except branches. This watchdog waits on it and SIGINTs the main thread
+    so the existing KeyboardInterrupt teardown path runs. If `shutdown_event`
+    fires first, the watchdog exits silently — that signals planned teardown.
+    """
+    while not shutdown_event.is_set():
+        if error_event.wait(timeout=1.0):
+            break
+    if shutdown_event.is_set():
+        return
+    logger.error("vLLM or trainer reported an error — aborting GRPO pipeline")
+    os.kill(os.getpid(), signal.SIGINT)
+
+
 def grpo_colocate(
     train_config: GRPOTrainConfig,
     infer_config: GRPOInferenceConfig,
@@ -419,6 +438,18 @@ def grpo_colocate(
 
     # Phase 4: Run orchestrator in main thread (async event loop)
     logger.info("Starting orchestrator")
+
+    # Watchdog must come up before the orchestrator so we never miss an early
+    # vLLM/trainer crash. shutdown_event suppresses spurious aborts during
+    # the planned teardown in the finally block below.
+    watchdog_thread = Thread(
+        target=_watch_components,
+        args=(error_event, shutdown_event),
+        daemon=True,
+        name="grpo-watchdog",
+    )
+    watchdog_thread.start()
+
     try:
         from surogate.grpo.orchestrator.grpo_orch import orchestrate
 
@@ -431,14 +462,18 @@ def grpo_colocate(
     finally:
         logger.info("GRPO pipeline shutting down")
 
+        # Tell the watchdog this teardown is intentional and tell the vLLM
+        # thread that the upcoming "Event loop stopped" RuntimeError is expected.
+        shutdown_event.set()
+
         # Wait for trainer to finish (it stops when orchestrator writes the stop signal)
         trainer_thread.join(timeout=30.0)
         if trainer_thread.is_alive():
             logger.warning("Trainer thread did not finish within 30s")
 
-        # Stop vLLM event loop gracefully. Set shutdown_event first so the
-        # vLLM thread knows the "Event loop stopped" RuntimeError is expected.
-        shutdown_event.set()
+        # Stop vLLM event loop gracefully.
         if event_loop is not None and not event_loop.is_closed():
             event_loop.call_soon_threadsafe(event_loop.stop)
             vllm_thread.join(timeout=10.0)
+
+        watchdog_thread.join(timeout=2.0)
