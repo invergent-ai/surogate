@@ -100,7 +100,8 @@ Completed subphase:
 
 - Compiled graphs now keep a deterministic `fusion_rewrite_preview` with rule name, replacement op, candidate span, source op ids/names, applied state, and rollout reason.
 - Forward `matmul -> bias_add` is rewritten to the existing `matmul_bias` descriptor when the matmul output has exactly one consumer and operand arity matches the fused kernel contract.
-- `SUROGATE_ENABLE_FUSION_REWRITES=0` disables rewrites globally, and `SUROGATE_DISABLE_FUSION_<RULE>=1` disables a specific rule such as `SUROGATE_DISABLE_FUSION_MATMUL_BIAS=1`.
+- Fusion rewrites are production-enabled by default for supported rules. `SUROGATE_ENABLE_FUSION_REWRITES=0` disables rewrites globally, and `SUROGATE_DISABLE_FUSION_<RULE>=1` disables a specific rule such as `SUROGATE_DISABLE_FUSION_MATMUL_BIAS=1`.
+- Removed the rollout-era per-rule opt-in path; unsupported rules are preview-only until their production parity evidence exists.
 - MoE and Mamba fusion candidates remain preview-only and report explicit inert reasons.
 - Regression artifacts now include `fusion_preview` alongside descriptor, schema, buffer-plan, and arena summaries.
 

@@ -105,7 +105,7 @@ TEST_CASE("fusion rule registry updates duplicate rule names", "[fusion_rule]") 
     REQUIRE_FALSE(found->comm_aware);
 }
 
-TEST_CASE("built-in fusion rule declarations are registered inertly", "[fusion_rule]") {
+TEST_CASE("built-in fusion rule declarations are registered deterministically", "[fusion_rule]") {
     const FusionRule* matmul_bias = FusionRuleRegistry::instance().find_by_name("matmul_bias");
     REQUIRE(matmul_bias != nullptr);
     REQUIRE(matmul_bias->pattern == std::vector<std::string>{"matmul", "bias_add"});

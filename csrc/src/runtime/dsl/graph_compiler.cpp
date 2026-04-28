@@ -97,13 +97,7 @@ bool fusion_rule_disabled(std::string_view rule_name) {
     return env_flag_enabled(env_name.c_str());
 }
 
-bool fusion_rule_explicitly_enabled(std::string_view rule_name) {
-    const std::string suffix = fusion_rule_env_suffix(rule_name);
-    const std::string env_name = "SUROGATE_ENABLE_FUSION_" + suffix;
-    return env_flag_enabled(env_name.c_str());
-}
-
-bool fusion_rule_default_enabled(std::string_view rule_name) {
+bool fusion_rule_production_enabled(std::string_view rule_name) {
     return rule_name == "matmul_bias";
 }
 
@@ -828,15 +822,14 @@ void GraphCompiler::apply_fusion_rewrites(CompiledGraph& graph, bool is_backward
             preview.reason = "disabled by SUROGATE_ENABLE_FUSION_REWRITES=0";
         } else if (fusion_rule_disabled(rule.name)) {
             preview.reason = "disabled by per-rule flag";
-        } else if (rule.name == "matmul_bias" &&
-                   (fusion_rule_default_enabled(rule.name) || fusion_rule_explicitly_enabled(rule.name))) {
+        } else if (rule.name == "matmul_bias" && fusion_rule_production_enabled(rule.name)) {
             apply = can_apply_matmul_bias(i, preview.reason);
         } else if (rule.name.rfind("moe_", 0) == 0) {
             preview.reason = "MoE fusion rewrites remain inert until explicit parity tests exist";
         } else if (rule.name.rfind("mamba_", 0) == 0) {
             preview.reason = "Mamba fusion rewrites remain inert until explicit parity tests exist";
         } else {
-            preview.reason = "rewrite implementation not enabled for this fusion family";
+            preview.reason = "fusion rule is preview-only until production parity exists";
         }
 
         if (apply) {
