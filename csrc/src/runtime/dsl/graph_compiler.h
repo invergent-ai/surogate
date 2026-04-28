@@ -583,6 +583,17 @@ std::string dump_instruction_stream(const std::vector<Instruction>& stream);
 /// Returns empty string on success; otherwise a human-readable error list.
 std::string validate_instruction_stream(const std::vector<Instruction>& stream, std::size_t num_ops);
 
+struct FusionRewritePreview {
+    std::string rule_name;
+    std::string replacement_op;
+    std::size_t start = 0;
+    std::size_t length = 0;
+    std::vector<std::string> op_ids;
+    std::vector<std::string> op_names;
+    bool applied = false;
+    std::string reason;
+};
+
 // ============================================================================
 // Compiled Graph
 // ============================================================================
@@ -814,6 +825,10 @@ struct CompiledGraph {
     std::size_t total_ops = 0;
     std::size_t matmul_ops = 0;
     std::size_t view_ops = 0;
+
+    // Deterministic rewrite plan preview. Populated before supported rewrites
+    // mutate `ops`; entries also record whether a candidate was applied.
+    std::vector<FusionRewritePreview> fusion_rewrite_preview;
 };
 
 // ============================================================================
@@ -855,6 +870,10 @@ public:
 
 private:
     CompiledOpType classify_op(const std::string& op_type) const;
+
+    void populate_descriptor(CompiledOp& compiled, bool is_backward) const;
+
+    void apply_fusion_rewrites(CompiledGraph& graph, bool is_backward) const;
 
     TensorRef resolve_tensor_ref(const std::string& name, bool is_output, const Operation& op, const ShapeEnv& env);
 

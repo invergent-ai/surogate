@@ -202,6 +202,24 @@ struct DebugDescriptorSummary {
     DebugGraphDescriptorSummary backward;
 };
 
+//! Deterministic descriptor rewrite preview. One entry per matching fusion
+//! candidate, including candidates deliberately kept inert for rollout.
+struct DebugFusionCandidate {
+    DebugGraphKind graph = DebugGraphKind::Forward;
+    std::string rule_name;
+    std::string replacement_op;
+    std::uint64_t start = 0;
+    std::uint64_t length = 0;
+    std::vector<std::string> op_ids;
+    std::vector<std::string> op_names;
+    bool applied = false;
+    std::string reason;
+};
+
+struct DebugFusionPreview {
+    std::vector<DebugFusionCandidate> candidates;
+};
+
 //! BufferPlan summary for schema-driven allocation migration. Count and byte
 //! fields mirror BufferPlan's Phase 4b dual-path diagnostics.
 struct DebugBufferPlanSummary {
@@ -320,6 +338,9 @@ DebugArenaSummary collect_arena_summary(const DslModel& model);
 
 //! Aggregate descriptor/capability counts across both compiled graphs.
 DebugDescriptorSummary collect_descriptor_summary(const DslModel& model);
+
+//! Collect deterministic fusion rewrite previews across both compiled graphs.
+DebugFusionPreview collect_fusion_preview(const DslModel& model);
 
 //! BufferPlan schema/allocation diagnostics for regression artifacts.
 DebugBufferPlanSummary collect_buffer_plan_summary(const DslModel& model);

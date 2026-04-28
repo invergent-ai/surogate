@@ -81,6 +81,7 @@ class RegressionArtifacts:
     block_schema_summary: dict[str, int] = field(default_factory=dict)
     buffer_plan_summary: dict[str, int] = field(default_factory=dict)
     arena_summary: dict[str, int] = field(default_factory=dict)
+    fusion_preview: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
     def from_json(cls, path: Path) -> "RegressionArtifacts":
@@ -101,6 +102,7 @@ class RegressionArtifacts:
             "block_schema_summary": data.get("block_schema_summary", {}),
             "buffer_plan_summary": data.get("buffer_plan_summary", {}),
             "arena_summary": data.get("arena_summary", {}),
+            "fusion_preview": data.get("fusion_preview", []),
         }
         return cls(**known)
 

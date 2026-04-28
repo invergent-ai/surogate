@@ -2059,6 +2059,37 @@ NB_MODULE(_surogate, m) {
             "Descriptor/capability counts for forward + backward compiled graphs.\n"
             "Returns count-only sub-dicts suitable for regression artifacts.")
         .def(
+            "get_debug_fusion_preview",
+            [](MultiGPUPyTrainer* trainer) {
+                auto preview = trainer->get_debug_fusion_preview();
+                nb::list out;
+                for (const auto& candidate : preview.candidates) {
+                    nb::dict d;
+                    d["graph"] = dsl::debug_graph_kind_name(candidate.graph);
+                    d["rule_name"] = candidate.rule_name;
+                    d["replacement_op"] = candidate.replacement_op;
+                    d["start"] = candidate.start;
+                    d["length"] = candidate.length;
+                    nb::list op_ids;
+                    for (const auto& op_id : candidate.op_ids) {
+                        op_ids.append(op_id);
+                    }
+                    d["op_ids"] = op_ids;
+                    nb::list op_names;
+                    for (const auto& op_name : candidate.op_names) {
+                        op_names.append(op_name);
+                    }
+                    d["op_names"] = op_names;
+                    d["applied"] = candidate.applied;
+                    d["reason"] = candidate.reason;
+                    out.append(std::move(d));
+                }
+                return out;
+            },
+            "Deterministic descriptor fusion rewrite preview.\n"
+            "Each entry records the rule, candidate op ids/names, replacement op,\n"
+            "whether the rewrite was applied, and the rollout reason.")
+        .def(
             "get_debug_buffer_plan_summary",
             [](MultiGPUPyTrainer* trainer) {
                 auto s = trainer->get_debug_buffer_plan_summary();

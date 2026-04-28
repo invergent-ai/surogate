@@ -282,6 +282,19 @@ def test_artifact_schema_accepts_descriptor_summary():
             "arena_summary": {
                 "arena_fwd_stack_bytes": 2048,
             },
+            "fusion_preview": [
+                {
+                    "graph": "forward",
+                    "rule_name": "matmul_bias",
+                    "replacement_op": "matmul_bias",
+                    "start": 4,
+                    "length": 2,
+                    "op_ids": ["matmul_4", "bias_add_5"],
+                    "op_names": ["matmul", "bias_add"],
+                    "applied": True,
+                    "reason": "applied",
+                }
+            ],
         }
     )
 
@@ -298,6 +311,19 @@ def test_artifact_schema_accepts_descriptor_summary():
         "schema_record_count": 2,
         "schema_activation_shape_savings_bytes": 1024,
     }
+    assert artifacts.fusion_preview == [
+        {
+            "graph": "forward",
+            "rule_name": "matmul_bias",
+            "replacement_op": "matmul_bias",
+            "start": 4,
+            "length": 2,
+            "op_ids": ["matmul_4", "bias_add_5"],
+            "op_names": ["matmul", "bias_add"],
+            "applied": True,
+            "reason": "applied",
+        }
+    ]
     assert artifacts.arena_summary == {
         "arena_fwd_stack_bytes": 2048,
     }

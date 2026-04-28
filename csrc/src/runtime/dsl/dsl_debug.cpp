@@ -194,7 +194,9 @@ void fill_graph_descriptor_summary(DebugGraphDescriptorSummary& out, const Compi
     out.activation_epilogue_ops = static_cast<std::uint64_t>(graph->count_ops_with_epilogue(EpilogueSupportActivation));
     out.cpu_pinned_stream_ops =
         static_cast<std::uint64_t>(graph->count_ops_supporting_storage(StorageTier::CpuPinnedStream));
-    out.fusion_candidate_starts = static_cast<std::uint64_t>(graph->count_fusion_candidate_starts());
+    out.fusion_candidate_starts = graph->fusion_rewrite_preview.empty()
+                                      ? static_cast<std::uint64_t>(graph->count_fusion_candidate_starts())
+                                      : static_cast<std::uint64_t>(graph->fusion_rewrite_preview.size());
     out.fp8_pending_tensors = static_cast<std::uint64_t>(graph->count_tensors_with_quant_state(QuantState::FP8Pending));
     out.fp8_ready_tensors = static_cast<std::uint64_t>(graph->count_tensors_with_quant_state(QuantState::FP8Ready));
     out.fp4_ready_tensors = static_cast<std::uint64_t>(graph->count_tensors_with_quant_state(QuantState::FP4Ready));
@@ -223,6 +225,26 @@ void fill_graph_descriptor_summary(DebugGraphDescriptorSummary& out, const Compi
                 }
             }
         }
+    }
+}
+
+void append_fusion_preview(DebugFusionPreview& out, const CompiledGraph* graph, DebugGraphKind kind) {
+    if (!graph) {
+        return;
+    }
+    out.candidates.reserve(out.candidates.size() + graph->fusion_rewrite_preview.size());
+    for (const FusionRewritePreview& src : graph->fusion_rewrite_preview) {
+        DebugFusionCandidate dst;
+        dst.graph = kind;
+        dst.rule_name = src.rule_name;
+        dst.replacement_op = src.replacement_op;
+        dst.start = static_cast<std::uint64_t>(src.start);
+        dst.length = static_cast<std::uint64_t>(src.length);
+        dst.op_ids = src.op_ids;
+        dst.op_names = src.op_names;
+        dst.applied = src.applied;
+        dst.reason = src.reason;
+        out.candidates.push_back(std::move(dst));
     }
 }
 
@@ -299,6 +321,17 @@ DebugDescriptorSummary collect_descriptor_summary(const DslModel& model) {
     fill_graph_descriptor_summary(s.forward, exec->compiled_forward(), DebugGraphKind::Forward);
     fill_graph_descriptor_summary(s.backward, exec->compiled_backward(), DebugGraphKind::Backward);
     return s;
+}
+
+DebugFusionPreview collect_fusion_preview(const DslModel& model) {
+    DebugFusionPreview out;
+    const GraphExecutor* exec = model.graph_executor();
+    if (!exec) {
+        return out;
+    }
+    append_fusion_preview(out, exec->compiled_forward(), DebugGraphKind::Forward);
+    append_fusion_preview(out, exec->compiled_backward(), DebugGraphKind::Backward);
+    return out;
 }
 
 DebugBufferPlanSummary collect_buffer_plan_summary(const DslModel& model) {

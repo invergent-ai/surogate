@@ -27,6 +27,7 @@
 #include "runtime/core/backward_hooks.h"
 #include "runtime/core/forward_hooks.h"
 #include "runtime/dsl/buffer_plan.h"
+#include "runtime/executor/compiled_ops.h"
 #include "runtime/lora/lora_types.h"
 
 namespace dsl {
@@ -62,6 +63,48 @@ bool env_flag_enabled(const char* name) {
     if (!value) return false;
     const std::string_view text(value);
     return text == "1" || text == "true" || text == "TRUE" || text == "on" || text == "ON";
+}
+
+bool env_flag_disabled(const char* name) {
+    const char* value = std::getenv(name);
+    if (!value) return false;
+    const std::string_view text(value);
+    return text == "0" || text == "false" || text == "FALSE" || text == "off" || text == "OFF";
+}
+
+std::string fusion_rule_env_suffix(std::string_view rule_name) {
+    std::string out;
+    out.reserve(rule_name.size());
+    for (char ch : rule_name) {
+        if ((ch >= 'a' && ch <= 'z')) {
+            out.push_back(static_cast<char>(ch - 'a' + 'A'));
+        } else if ((ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')) {
+            out.push_back(ch);
+        } else {
+            out.push_back('_');
+        }
+    }
+    return out;
+}
+
+bool fusion_rewrites_globally_enabled() {
+    return !env_flag_disabled("SUROGATE_ENABLE_FUSION_REWRITES");
+}
+
+bool fusion_rule_disabled(std::string_view rule_name) {
+    const std::string suffix = fusion_rule_env_suffix(rule_name);
+    const std::string env_name = "SUROGATE_DISABLE_FUSION_" + suffix;
+    return env_flag_enabled(env_name.c_str());
+}
+
+bool fusion_rule_explicitly_enabled(std::string_view rule_name) {
+    const std::string suffix = fusion_rule_env_suffix(rule_name);
+    const std::string env_name = "SUROGATE_ENABLE_FUSION_" + suffix;
+    return env_flag_enabled(env_name.c_str());
+}
+
+bool fusion_rule_default_enabled(std::string_view rule_name) {
+    return rule_name == "matmul_bias";
 }
 
 void set_forward_hook_schema_slot(CompiledAttrs& attrs, modules::ForwardHookPoint point, std::string_view schema_slot) {
@@ -687,6 +730,148 @@ void GraphCompiler::update_dimensions(long B, long T) {
 
 CompiledOpType GraphCompiler::classify_op(const std::string& op_type) const {
     return op_type_from_string(op_type);
+}
+
+void GraphCompiler::populate_descriptor(CompiledOp& compiled, bool is_backward) const {
+    if (const OpDescriptor* desc = OpRegistry::instance().find(compiled.type)) {
+        compiled.fn = is_backward ? desc->backward_fn : (desc->forward_fn ? desc->forward_fn : desc->backward_fn);
+        compiled.semantic_kind = desc->semantic_kind;
+        compiled.distribution_kind = desc->distribution_kind;
+        compiled.default_caps = desc->default_caps;
+        compiled.epilogue_support = desc->epilogue_support;
+        compiled.storage_compat = desc->storage_compat;
+        compiled.moe_caps = desc->moe_caps;
+        compiled.matmul_caps = desc->matmul_caps;
+        compiled.comm_profile = desc->comm_profile;
+        compiled.grouped_semantics = desc->grouped_semantics;
+        compiled.descriptor_flags = desc->descriptor_flags;
+    }
+}
+
+void GraphCompiler::apply_fusion_rewrites(CompiledGraph& graph, bool is_backward) const {
+    graph.fusion_rewrite_preview.clear();
+    if (graph.ops.empty()) {
+        return;
+    }
+
+    std::unordered_map<std::string, int> input_use_count;
+    for (const auto& op : graph.ops) {
+        for (const auto& input : op.inputs) {
+            if (!input.name.empty()) {
+                input_use_count[input.name] += 1;
+            }
+        }
+    }
+
+    auto make_preview = [&](std::size_t start, const FusionRule& rule) {
+        FusionRewritePreview preview;
+        preview.rule_name = rule.name;
+        preview.replacement_op = rule.name;
+        preview.start = start;
+        preview.length = rule.pattern.size();
+        preview.op_ids.reserve(rule.pattern.size());
+        preview.op_names.reserve(rule.pattern.size());
+        for (std::size_t j = 0; j < rule.pattern.size() && start + j < graph.ops.size(); ++j) {
+            preview.op_ids.push_back(graph.ops[start + j].op_id);
+            preview.op_names.push_back(op_type_to_string(graph.ops[start + j].type));
+        }
+        return preview;
+    };
+
+    auto can_apply_matmul_bias = [&](std::size_t start, std::string& reason) -> bool {
+        if (is_backward) {
+            reason = "forward-only rewrite";
+            return false;
+        }
+        if (start + 1 >= graph.ops.size()) {
+            reason = "truncated candidate";
+            return false;
+        }
+        const CompiledOp& matmul = graph.ops[start];
+        const CompiledOp& bias_add = graph.ops[start + 1];
+        if (matmul.type != CompiledOpType::Matmul || bias_add.type != CompiledOpType::BiasAdd) {
+            reason = "candidate op types changed";
+            return false;
+        }
+        if (matmul.inputs.size() < 2 || matmul.outputs.size() != 1 || bias_add.inputs.size() != 2 ||
+            bias_add.outputs.size() != 1) {
+            reason = "unsupported operand arity";
+            return false;
+        }
+        const std::string& matmul_out = matmul.outputs[0].name;
+        if (matmul_out.empty() || bias_add.inputs[0].name != matmul_out) {
+            reason = "bias_add does not consume matmul output directly";
+            return false;
+        }
+        if (input_use_count[matmul_out] != 1) {
+            reason = "matmul output has multiple consumers";
+            return false;
+        }
+        reason.clear();
+        return true;
+    };
+
+    std::vector<CompiledOp> rewritten;
+    rewritten.reserve(graph.ops.size());
+    for (std::size_t i = 0; i < graph.ops.size();) {
+        const auto matches = FusionRuleRegistry::instance().matching_rules_at(graph.ops, i);
+        if (matches.empty()) {
+            rewritten.push_back(std::move(graph.ops[i]));
+            ++i;
+            continue;
+        }
+
+        const FusionRule& rule = *matches.front();
+        FusionRewritePreview preview = make_preview(i, rule);
+        bool apply = false;
+        if (!fusion_rewrites_globally_enabled()) {
+            preview.reason = "disabled by SUROGATE_ENABLE_FUSION_REWRITES=0";
+        } else if (fusion_rule_disabled(rule.name)) {
+            preview.reason = "disabled by per-rule flag";
+        } else if (rule.name == "matmul_bias" &&
+                   (fusion_rule_default_enabled(rule.name) || fusion_rule_explicitly_enabled(rule.name))) {
+            apply = can_apply_matmul_bias(i, preview.reason);
+        } else if (rule.name.rfind("moe_", 0) == 0) {
+            preview.reason = "MoE fusion rewrites remain inert until explicit parity tests exist";
+        } else if (rule.name.rfind("mamba_", 0) == 0) {
+            preview.reason = "Mamba fusion rewrites remain inert until explicit parity tests exist";
+        } else {
+            preview.reason = "rewrite implementation not enabled for this fusion family";
+        }
+
+        if (apply) {
+            CompiledOp fused = graph.ops[i];
+            const CompiledOp& bias_add = graph.ops[i + 1];
+            fused.type = CompiledOpType::MatmulBias;
+            fused.op_id = fused.op_id + "+" + bias_add.op_id;
+            fused.inputs.push_back(bias_add.inputs[1]);
+            fused.outputs = bias_add.outputs;
+            populate_descriptor(fused, is_backward);
+            preview.applied = true;
+            preview.reason = "applied";
+            rewritten.push_back(std::move(fused));
+            graph.fusion_rewrite_preview.push_back(std::move(preview));
+            i += rule.pattern.size();
+            continue;
+        }
+
+        graph.fusion_rewrite_preview.push_back(std::move(preview));
+        rewritten.push_back(std::move(graph.ops[i]));
+        ++i;
+    }
+
+    graph.ops = std::move(rewritten);
+    graph.total_ops = graph.ops.size();
+    graph.matmul_ops = 0;
+    graph.view_ops = 0;
+    for (const auto& op : graph.ops) {
+        if (op.type == CompiledOpType::Matmul || op.type == CompiledOpType::MatmulBias ||
+            op.type == CompiledOpType::MatmulBackward) {
+            graph.matmul_ops += 1;
+        } else if (op.type == CompiledOpType::View || op.type == CompiledOpType::ViewBackward) {
+            graph.view_ops += 1;
+        }
+    }
 }
 
 TensorRef
@@ -5242,25 +5427,9 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
             throw std::runtime_error("GraphCompiler: unsupported operation type: " + op_type);
         }
 
-        // Bake the dispatch function pointer into the op. For the
-        // backward graph prefer the backward_fn; for the forward graph
-        // use forward_fn. Standalone op goldens can compile explicit
-        // backward-only ops without marking the whole graph as backward, so
-        // fall back to backward_fn when the forward slot is intentionally empty.
-        // Null means "no handler" — execute will throw when it tries to call it.
-        if (const OpDescriptor* desc = OpRegistry::instance().find(compiled.type)) {
-            compiled.fn = is_backward ? desc->backward_fn : (desc->forward_fn ? desc->forward_fn : desc->backward_fn);
-            compiled.semantic_kind = desc->semantic_kind;
-            compiled.distribution_kind = desc->distribution_kind;
-            compiled.default_caps = desc->default_caps;
-            compiled.epilogue_support = desc->epilogue_support;
-            compiled.storage_compat = desc->storage_compat;
-            compiled.moe_caps = desc->moe_caps;
-            compiled.matmul_caps = desc->matmul_caps;
-            compiled.comm_profile = desc->comm_profile;
-            compiled.grouped_semantics = desc->grouped_semantics;
-            compiled.descriptor_flags = desc->descriptor_flags;
-        }
+        // Bake the dispatch function pointer and descriptor metadata into the
+        // op. Null means "no handler" — execute will throw when it calls it.
+        populate_descriptor(compiled, is_backward);
 
         // Validate operation shapes at compile time.
         // In hybrid models (e.g., Gemma4 with sliding + full attention), per-block
@@ -6174,6 +6343,8 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
 
         result.ops.push_back(std::move(compiled));
     }
+
+    apply_fusion_rewrites(result, is_backward);
 
     // Annotate layer boundaries for prefetch
     annotate_layer_boundaries(result);

@@ -754,6 +754,13 @@ class SurogateTrainerWrapper:
             except Exception as exc:
                 arena_summary = {"arena_summary_error": 1}
                 logger.warning(f"Failed to collect regression arena summary: {exc}")
+        fusion_preview: list[dict] = []
+        if hasattr(self.trainer, "get_debug_fusion_preview"):
+            try:
+                fusion_preview = [dict(candidate) for candidate in self.trainer.get_debug_fusion_preview()]
+            except Exception as exc:
+                fusion_preview = [{"error": "fusion_preview_error"}]
+                logger.warning(f"Failed to collect regression fusion preview: {exc}")
 
         path = Path(self._regression_artifact_path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -769,6 +776,7 @@ class SurogateTrainerWrapper:
             "block_schema_summary": self._block_schema_summary,
             "buffer_plan_summary": buffer_plan_summary,
             "arena_summary": arena_summary,
+            "fusion_preview": fusion_preview,
         }
         path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 

@@ -495,6 +495,103 @@ GoldenCase load_case(const fs::path& path) {
     return gc;
 }
 
+fs::path find_goldens_dir();
+
+TEST_CASE("dsl fusion rewrites: matmul followed by bias_add compiles to matmul_bias", "[dsl][fusion_rule]") {
+    const fs::path goldens_dir = find_goldens_dir();
+    const fs::path golden_path = goldens_dir / "matmul_bias_small_case_1.json";
+    if (!fs::exists(golden_path)) {
+        SKIP("Golden file not found: " + golden_path.string());
+    }
+
+    const GoldenCase gc = load_case(golden_path);
+    const auto& a = gc.inputs.at("a");
+    const auto& b = gc.inputs.at("b");
+    const auto& bias = gc.inputs.at("bias");
+    const auto& out = gc.outputs.at("out");
+
+    PretrainedConfig cfg;
+    cfg.DType = ETensorDType::FP32;
+    cfg.NumLayers = 1;
+    cfg.NumQueryHeads = 1;
+    cfg.NumKeyValHeads = 1;
+    cfg.HiddenSize = static_cast<int>(out.shape.back());
+    cfg.IntermediateSize = static_cast<int>(b.shape.back());
+    cfg.VocabSize = 1;
+    cfg.MaxPositionEmbeddings = 1;
+    cfg.RmsNormEps = 1e-5f;
+    modules::ModelConfig model_cfg = modules::ModelConfig::from_pretrained_config(cfg);
+
+    RuntimeOptions options;
+    options.UseCudaGraphs = false;
+    options.Recompute = RecomputeLevel::None;
+    options.ModelType = cfg.DType;
+    options.MatmulType = cfg.DType;
+    options.GradientType = cfg.DType;
+
+    dsl::Module module;
+    module.name = "fusion_rewrite";
+    module.kind = "model";
+
+    dsl::Graph graph;
+    graph.name = "fusion_rewrite";
+
+    auto add_param = [&](const std::string& name, const GoldenTensor& tensor) {
+        dsl::TensorInfo info;
+        info.shape = to_dims(tensor.shape);
+        info.dtype = device_dtype_for(tensor.dtype);
+        info.is_param = true;
+        graph.params.emplace(name, std::move(info));
+    };
+    add_param("a", a);
+    add_param("b", b);
+    add_param("bias", bias);
+
+    dsl::TensorInfo out_info;
+    out_info.shape = to_dims(out.shape);
+    out_info.dtype = device_dtype_for(out.dtype);
+    out_info.is_output = true;
+    graph.outputs.emplace("out", std::move(out_info));
+
+    dsl::Operation matmul;
+    matmul.id = "rewrite_matmul";
+    matmul.name = "matmul";
+    matmul.kernel_type = "matmul";
+    matmul.inputs = {"a", "b"};
+    matmul.outputs = {"tmp"};
+    matmul.attrs = gc.attrs;
+    graph.operations.push_back(matmul);
+
+    dsl::Operation bias_add;
+    bias_add.id = "rewrite_bias";
+    bias_add.name = "bias_add";
+    bias_add.kernel_type = "bias_add";
+    bias_add.inputs = {"tmp", "bias"};
+    bias_add.outputs = {"out"};
+    graph.operations.push_back(bias_add);
+
+    module.forward = graph;
+    auto allocator = std::make_shared<TensorAllocator>();
+    dsl::DslParamStore params(module, graph, options, cfg, allocator, nullptr, nullptr, false);
+    dsl::DslGradStore grads(params, allocator, false, EAllocationType::ON_DEVICE, 1, false);
+
+    dsl::GraphCompiler compiler(module, model_cfg, options, params, grads);
+    auto compiled = compiler.compile(graph, /*B=*/1, /*T=*/1);
+
+    REQUIRE(compiled.fusion_rewrite_preview.size() == 1);
+    REQUIRE(compiled.fusion_rewrite_preview[0].rule_name == "matmul_bias");
+    REQUIRE(compiled.fusion_rewrite_preview[0].applied);
+    REQUIRE(compiled.fusion_rewrite_preview[0].reason == "applied");
+    REQUIRE(compiled.ops.size() == 1);
+    REQUIRE(compiled.ops[0].type == dsl::CompiledOpType::MatmulBias);
+    REQUIRE(compiled.ops[0].inputs.size() == 3);
+    REQUIRE(compiled.ops[0].inputs[0].name == "a");
+    REQUIRE(compiled.ops[0].inputs[1].name == "b");
+    REQUIRE(compiled.ops[0].inputs[2].name == "bias");
+    REQUIRE(compiled.ops[0].outputs.size() == 1);
+    REQUIRE(compiled.ops[0].outputs[0].name == "out");
+}
+
 std::pair<long, long> infer_B_T(const GoldenCase& gc) {
     const auto B_meta = meta_long(gc.meta, "B");
     const auto T_meta = meta_long(gc.meta, "T");

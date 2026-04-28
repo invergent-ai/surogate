@@ -151,6 +151,9 @@ public:
     //! Descriptor/capability counts across forward + backward graphs.
     dsl::DebugDescriptorSummary get_debug_descriptor_summary();
 
+    //! Deterministic fusion rewrite preview across forward + backward graphs.
+    dsl::DebugFusionPreview get_debug_fusion_preview();
+
     //! BufferPlan schema/allocation diagnostics.
     dsl::DebugBufferPlanSummary get_debug_buffer_plan_summary();
 
