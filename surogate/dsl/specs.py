@@ -13,6 +13,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from .block_schema import BlockSchema
     from .graph_builder import GraphBuilder
     from .tensor_type import TensorAnnotation
 
@@ -412,6 +413,10 @@ class BlockSpec(BaseModuleSpec):
 
     # Activation layout for this block (per-layer activations and gradients)
     activations: ActivationLayoutSpec | None = None
+
+    # Phase 4 storage/distribution declaration. Initially metadata-only; the
+    # runtime BufferPlan migration consumes this after parity instrumentation.
+    schema: BlockSchema | None = None
 
     # HuggingFace weight mapping (from @hf_mapping or _hf_block_mappings_)
     hf_mapping: HFMappingSpec | None = None

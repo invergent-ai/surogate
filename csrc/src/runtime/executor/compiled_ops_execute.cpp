@@ -20,6 +20,7 @@
 #include <iostream>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
@@ -30,6 +31,7 @@
 
 #include "runtime/executor/compiled_ops_helpers.h"
 #include "runtime/dsl/dsl_runtime.h"
+#include "runtime/dsl/tensor_role.h"
 #include "runtime/dsl/dsl_weight_manager.h"
 #include "runtime/executor/graph_executor_helpers.h"
 #include "runtime/executor/graph_executor_utils.h"
@@ -48,6 +50,52 @@
 #include "utilities/dtype.h"
 
 namespace dsl {
+
+namespace {
+
+std::optional<bool> rope_role_from_ref(const CompiledGraph* graph, const TensorRef& ref) {
+    if (!graph) return std::nullopt;
+    if (const TensorRole* role = graph->role_for_tensor_id(ref.tensor_id)) {
+        return role->is_rope_freq();
+    }
+    if (!ref.name.empty()) {
+        if (const TensorRole* role = graph->role_for_name(ref.name)) {
+            return role->is_rope_freq();
+        }
+    }
+    return std::nullopt;
+}
+
+bool is_rope_freq_ref(const CompiledGraph* graph, const TensorRef& ref, const char* context) {
+    (void)context;
+    return rope_role_from_ref(graph, ref).value_or(tensor_role_is_rope_name(ref.name));
+}
+
+bool is_moe_ep_sync_boundary(CompiledOpType type) {
+    switch (type) {
+        case CompiledOpType::MoETopK:
+        case CompiledOpType::MoEPermute:
+        case CompiledOpType::MoEGroupedGemm:
+        case CompiledOpType::MoEGroupedGemmGateUp:
+        case CompiledOpType::MoEGroupedGemmDown:
+        case CompiledOpType::MoEUnpermute:
+        case CompiledOpType::MoEExpertBiasAdd:
+        case CompiledOpType::MoETopKBackward:
+        case CompiledOpType::MoEPermuteBackward:
+        case CompiledOpType::MoEGroupedGemmBackward:
+        case CompiledOpType::MoEGroupedGemmGateUpBackward:
+        case CompiledOpType::MoEGroupedGemmDownBackward:
+        case CompiledOpType::MoEUnpermuteBackward:
+        case CompiledOpType::MoEExpertBiasAddBackward:
+        case CompiledOpType::EpDispatch:
+        case CompiledOpType::EpCombine:
+        case CompiledOpType::EpDispatchBackward:
+        case CompiledOpType::EpCombineBackward: return true;
+        default: return false;
+    }
+}
+
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // replay_layer_forward — torch-style gradient checkpointing
@@ -203,8 +251,7 @@ void CompiledExecutor::replay_layer_forward(int layer_idx,
                     if (Tensor* bp = block_activation_ptr(mRunState, lyr, slot)) {
                         resolved = *bp;
                     }
-                } else if (inp.name.find("freq_cis") != std::string::npos ||
-                           inp.name.find("rope_freqs") != std::string::npos) {
+                } else if (is_rope_freq_ref(mCurrentGraph, inp, "compiled_ops_execute::resolve_input")) {
                     // Rope frequencies come through unqualified global names;
                     // inp.slot would be FreqCis and line 217 already handled
                     // compile-classified refs. This fallback covers names the
@@ -247,10 +294,9 @@ void CompiledExecutor::replay_layer_forward(int layer_idx,
                 fill_zero(resolved, mRunState.MainStream);
             }
 
-            // Embedding output (embed_1, embed_0, …) — substring match because
-            // this family of names isn't (yet) in the slot registry. Routes to
-            // the Encoded slot buffer.
-            if (!resolved.Data && !inp.name.empty() && inp.name.find("embed") != std::string::npos) {
+            // Embedding output (embed_1, embed_0, ...) routes to the Encoded
+            // slot buffer via TensorRole while the slot registry catches up.
+            if (!resolved.Data && !inp.name.empty() && tensor_role_is_embedding_name(inp.name)) {
                 if (Tensor* gp = global_activation_ptr(mRunState, TensorSlot::Encoded)) {
                     resolved = *gp;
                 }
@@ -1126,6 +1172,16 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     // Main dispatch loop - no string comparisons, direct function pointer dispatch
     const char* op_trace_env = std::getenv("SUROGATE_OP_TRACE");
     const bool op_trace = op_trace_env && std::string(op_trace_env) != "0";
+    const char* op_trace_sync_env = std::getenv("SUROGATE_OP_TRACE_SYNC");
+    const bool op_trace_sync = op_trace_sync_env && std::string(op_trace_sync_env) != "0";
+    const bool sync_moe_ep_ops =
+        env_int("SUROGATE_SYNC_CAPTURE_UNSAFE_OPS",
+                (mWeights.qlora_provider() && mWeights.qlora_provider()->has_offloading()) ? 1 : 0) != 0;
+    auto sync_after_forward_op = [&](const CompiledOp& op) {
+        if (op_trace_sync || (sync_moe_ep_ops && is_moe_ep_sync_boundary(op.type))) {
+            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+        }
+    };
     const int debug_nonfinite_mode = env_int("SUROGATE_DEBUG_CHECK_NONFINITE", 0);
     const bool debug_nonfinite_forward = (debug_nonfinite_mode & 0x1) != 0;
     const char* watch_tensor_env = std::getenv("SUROGATE_DEBUG_WATCH_TENSOR");
@@ -1418,7 +1474,19 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                             const auto& op = graph.ops[i];
                             if (!op.fn) continue;
                             check_op_io_aliasing(op, i, "fwd");
-                            op.fn(*this, op, static_cast<const void*>(hook));
+                            if (op_trace) {
+                                std::cerr << "[OP " << i << "] " << op_type_to_string(op.type) << " id=" << op.op_id
+                                          << std::endl;
+                            }
+                            try {
+                                op.fn(*this, op, static_cast<const void*>(hook));
+                                sync_after_forward_op(op);
+                            } catch (const std::exception& e) {
+                                std::ostringstream oss;
+                                oss << "execute_forward stream op=" << i << " type=" << op_type_to_string(op.type)
+                                    << " id=" << op.op_id << ": " << e.what();
+                                throw std::runtime_error(oss.str());
+                            }
                         }
                     }
                     break;
@@ -1617,11 +1685,21 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
             // Phase 2a: dispatch via the function pointer baked into
             // op.fn at graph compile time. One indirect call, no switch.
             if (!op.fn) {
-                throw std::runtime_error(std::string("CompiledExecutor: no dispatch fn for forward op type ") +
-                                         op_type_to_string(op.type));
+                std::ostringstream oss;
+                oss << "CompiledExecutor: no dispatch fn for forward op type " << op_type_to_string(op.type)
+                    << " (semantic=" << op_semantic_kind_name(op.semantic_kind)
+                    << ", comm=" << communication_kind_name(op.comm_profile.kind)
+                    << ", distribution=" << distribution_kind_name(op.distribution_kind)
+                    << ", caps=" << op_capability_flags_string(op.default_caps)
+                    << ", matmul_caps=" << matmul_capability_flags_string(op.matmul_caps)
+                    << ", moe_caps=" << moe_capability_flags_string(op.moe_caps)
+                    << ", epilogue=" << epilogue_support_flags_string(op.epilogue_support)
+                    << ", storage=" << storage_compatibility_flags_string(op.storage_compat) << ")";
+                throw std::runtime_error(oss.str());
             }
             check_op_io_aliasing(op, idx, "fwd");
             op.fn(*this, op, static_cast<const void*>(hook));
+            sync_after_forward_op(op);
             check_nonfinite_refs(op, op.outputs);
             if (watch_tensor_enabled) {
                 bool watch_post_valid = false;
@@ -2251,7 +2329,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     // Build the set of gradients that require accumulation (not the first micro-step).
     // Also bind parameter gradient tensors so they're used instead of temporaries.
     for (const auto& param_name : mGrads.param_names()) {
-        if (param_name.find("rope_freqs") != std::string::npos) {
+        if (tensor_role_is_rope_name(param_name)) {
             continue;
         }
         bool accumulate = false;
@@ -2384,6 +2462,22 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     // Use pre-computed last-use data from graph compilation (avoids rebuilding every backward).
     const auto& last_use_names = graph.last_use_names;
     const auto& last_use = graph.last_use_index;
+    std::unordered_set<std::string> consumed_backward_names;
+    std::unordered_set<std::string> externally_observable_backward_outputs;
+    for (const auto& op : graph.ops) {
+        for (const auto& ref : op.inputs) {
+            if (!ref.name.empty()) {
+                consumed_backward_names.insert(ref.name);
+            }
+        }
+    }
+    for (const auto& op : graph.ops) {
+        for (const auto& ref : op.outputs) {
+            if (!ref.name.empty() && consumed_backward_names.find(ref.name) == consumed_backward_names.end()) {
+                externally_observable_backward_outputs.insert(ref.name);
+            }
+        }
+    }
     std::unordered_map<int, std::byte*> persisted_backward_by_tid;
     std::unordered_map<std::byte*, int> persisted_backward_refcount;
     auto release_persisted_backward_ptr = [&](std::byte* ptr) {
@@ -2436,6 +2530,9 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             return;
         }
         for (const auto& name : last_use_names[idx]) {
+            if (externally_observable_backward_outputs.find(name) != externally_observable_backward_outputs.end()) {
+                continue;
+            }
             if (mCurrentGraph) {
                 int tid = mCurrentGraph->find_tensor_id(name);
                 if (tid >= 0 && static_cast<std::size_t>(tid) < mTensors.size()) {
@@ -2450,6 +2547,16 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     static const bool debug_replay = std::getenv("SUROGATE_DEBUG_REPLAY") != nullptr;
     const char* op_trace_env = std::getenv("SUROGATE_OP_TRACE");
     const bool op_trace = op_trace_env && std::string(op_trace_env) != "0";
+    const char* op_trace_sync_env = std::getenv("SUROGATE_OP_TRACE_SYNC");
+    const bool op_trace_sync = op_trace_sync_env && std::string(op_trace_sync_env) != "0";
+    const bool sync_moe_ep_ops =
+        env_int("SUROGATE_SYNC_CAPTURE_UNSAFE_OPS",
+                (mWeights.qlora_provider() && mWeights.qlora_provider()->has_offloading()) ? 1 : 0) != 0;
+    auto sync_after_backward_op = [&](const CompiledOp& op) {
+        if (op_trace_sync || (sync_moe_ep_ops && is_moe_ep_sync_boundary(op.type))) {
+            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+        }
+    };
     const char* bwd_filter_env = std::getenv("SUROGATE_DEBUG_BWD_FILTER");
     const std::string bwd_filter = bwd_filter_env ? std::string(bwd_filter_env) : std::string();
     const bool bwd_filter_enabled = !bwd_filter.empty();
@@ -2701,12 +2808,22 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             if (mDebugDumpBackwardLayerFn) mDebugDumpBackwardLayerFn(L);
 
             if (mGrads.is_streaming_grads()) {
-                if (mComm && mComm->world_size() > 1) {
+                GradientOffloadHookPayload offload_payload;
+                offload_payload.grads = &mGrads;
+                offload_payload.comm = mComm;
+                offload_payload.compute_stream = mRunState.MainStream;
+                offload_payload.copy_stream = mRunState.side_stream();
+                offload_payload.sync_event = mRunState.side_stream_event();
+                offload_payload.capturing = capturing;
+                dispatch_schema_layer_hooks(HookEventKind::AfterAllReduce, L, &offload_payload);
+                if (!offload_payload.offloaded && mComm && mComm->world_size() > 1) {
                     CUDA_CHECK(cudaEventRecord(mRunState.side_stream_event(), mRunState.MainStream));
                     CUDA_CHECK(cudaStreamWaitEvent(mRunState.side_stream(), mRunState.side_stream_event(), 0));
                     mGrads.reduce_layer_grads(L, mRunState.side_stream(), *mComm);
                 }
-                mGrads.offload_layer_grads(L, mRunState.MainStream, mRunState.side_stream());
+                if (!offload_payload.offloaded) {
+                    mGrads.offload_layer_grads(L, mRunState.MainStream, mRunState.side_stream());
+                }
             } else if (mComm && mComm->world_size() > 1) {
                 CUDA_CHECK(cudaEventRecord(mRunState.side_stream_event(), mRunState.MainStream));
                 CUDA_CHECK(cudaStreamWaitEvent(mRunState.side_stream(), mRunState.side_stream_event(), 0));
@@ -2783,7 +2900,19 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                         }
 
                         check_op_io_aliasing(op, i, "bwd");
-                        op.fn(*this, op, static_cast<const void*>(hook));
+                        if (op_trace) {
+                            std::cerr << "[BWD OP " << i << "] " << op_type_to_string(op.type) << " id=" << op.op_id
+                                      << std::endl;
+                        }
+                        try {
+                            op.fn(*this, op, static_cast<const void*>(hook));
+                            sync_after_backward_op(op);
+                        } catch (const std::exception& e) {
+                            std::ostringstream oss;
+                            oss << "execute_backward stream op=" << i << " type=" << op_type_to_string(op.type)
+                                << " id=" << op.op_id << ": " << e.what();
+                            throw std::runtime_error(oss.str());
+                        }
                         // LM-head post-dispatch cleanup: free the d_logits payload
                         // after the first matmul_backward (see line ~2372 comment).
                         if (op.type == CompiledOpType::MatmulBackward && i == 1) {
@@ -2871,8 +3000,8 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 };
                 std::cerr << "[BWD_FILTER] idx=" << idx << " op_id=" << op.op_id
                           << " type=" << op_type_to_string(op.type) << " layer_start=" << op.layer_start
-                          << " layer_end=" << op.layer_end << " inputs=[" << dump_refs(op.inputs) << "]"
-                          << " outputs=[" << dump_refs(op.outputs) << "]" << std::endl;
+                          << " layer_end=" << op.layer_end << " inputs=[" << dump_refs(op.inputs) << "]" << " outputs=["
+                          << dump_refs(op.outputs) << "]" << std::endl;
             }
         }
 
@@ -2970,11 +3099,23 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             if (!op.fn) {
                 std::ostringstream oss;
                 oss << "CompiledExecutor: no dispatch fn for backward op at idx " << idx
-                    << " (type=" << op_type_to_string(op.type) << ", id=" << op.op_id << ")";
+                    << " (type=" << op_type_to_string(op.type) << ", id=" << op.op_id
+                    << ", semantic=" << op_semantic_kind_name(op.semantic_kind)
+                    << ", comm=" << communication_kind_name(op.comm_profile.kind)
+                    << ", distribution=" << distribution_kind_name(op.distribution_kind)
+                    << ", caps=" << op_capability_flags_string(op.default_caps)
+                    << ", matmul_caps=" << matmul_capability_flags_string(op.matmul_caps)
+                    << ", moe_caps=" << moe_capability_flags_string(op.moe_caps)
+                    << ", epilogue=" << epilogue_support_flags_string(op.epilogue_support)
+                    << ", storage=" << storage_compatibility_flags_string(op.storage_compat) << ")";
                 throw std::runtime_error(oss.str());
             }
             check_op_io_aliasing(op, idx, "bwd");
+            if (op_trace) {
+                std::cerr << "[BWD OP " << idx << "] " << op_type_to_string(op.type) << " id=" << op.op_id << std::endl;
+            }
             op.fn(*this, op, static_cast<const void*>(hook));
+            sync_after_backward_op(op);
             if (bwd_filter_matched && bwd_filter_dump && mDebugDumpFn) {
                 std::vector<std::string> dump_names;
                 dump_names.reserve(op.inputs.size() + op.outputs.size());
@@ -3141,6 +3282,43 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         cudaFreeAsync(ptr, mRunState.MainStream);
     }
     mReplayCopiedBuffers.clear();
+
+    if (mRunState.Allocator) {
+        for (const auto& name : externally_observable_backward_outputs) {
+            Tensor* tensor = nullptr;
+            int tid = -1;
+            if (mCurrentGraph) {
+                tid = mCurrentGraph->find_tensor_id(name);
+                if (tid >= 0 && static_cast<std::size_t>(tid) < mTensors.size() &&
+                    mTensors[static_cast<std::size_t>(tid)].Data) {
+                    tensor = &mTensors[static_cast<std::size_t>(tid)];
+                }
+            }
+            if (!tensor) {
+                auto it = mNamedTensors.find(name);
+                if (it != mNamedTensors.end() && it->second.Data) {
+                    tensor = &it->second;
+                }
+            }
+            if (!tensor || !tensor->Data || !mRunState.Stack.owns(tensor->Data)) {
+                continue;
+            }
+            std::vector<long> shape(tensor->Sizes.begin(), tensor->Sizes.begin() + tensor->Rank);
+            Tensor stable = mRunState.Allocator->allocate(tensor->DType,
+                                                          ("backward_output_" + name).c_str(),
+                                                          EAllocationType::ON_DEVICE,
+                                                          shape);
+            CUDA_CHECK(cudaMemcpyAsync(stable.Data,
+                                       tensor->Data,
+                                       tensor->bytes(),
+                                       cudaMemcpyDeviceToDevice,
+                                       mRunState.MainStream));
+            if (tid >= 0 && static_cast<std::size_t>(tid) < mTensors.size()) {
+                mTensors[static_cast<std::size_t>(tid)] = stable;
+            }
+            mNamedTensors[name] = stable;
+        }
+    }
 
     // Final cleanup - pass -1 to allow full pruning (backward complete)
     mRunState.Stack.restore(initial_checkpoint);

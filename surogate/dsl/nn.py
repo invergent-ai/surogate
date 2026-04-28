@@ -607,6 +607,7 @@ class Block(Module):
             params=tracer.params,
             forward=forward_spec,
             activations=activation_layout,
+            schema=getattr(type(self), "schema", None),
         )
 
         # Register in block registry (both class name and override name)

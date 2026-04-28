@@ -8,7 +8,7 @@ with the C++ runtime.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from .decorators import _block_registry, _model_registry, _module_registry, _primitive_registry
@@ -87,6 +87,7 @@ class GraphIR:
     nodes: list[OpIR] = field(default_factory=list)
     save_list: list[str] = field(default_factory=list)
     recompute_list: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -154,6 +155,7 @@ class ModuleIR:
     is_block: bool = False
     # Activation layout for this module (block activations or global model activations)
     activation_layout: ActivationLayoutIR | None = None
+    block_schema: dict[str, Any] = field(default_factory=dict)
 
 
 # =============================================================================
@@ -866,6 +868,31 @@ def _inline_stacked_blocks(
     new_intermediates: dict[str, TensorRef] = {}
     new_save: list[str] = []
     op_id = 0
+    block_schema_records: list[dict[str, Any]] = list(graph.metadata.get("block_schemas", []))
+
+    def _record_block_schema(
+        *,
+        layer_idx: int,
+        block_idx: int,
+        block_type: str,
+        blocks_param: str,
+        block_spec: BlockSpec,
+    ) -> None:
+        if block_spec.schema is None:
+            return
+        errors = block_spec.schema.contract_errors()
+        if errors:
+            raise DSLSyntaxError(f"invalid block schema for {block_spec.name}: {'; '.join(errors)}")
+        block_schema_records.append(
+            {
+                "layer": layer_idx,
+                "block_index": block_idx,
+                "block_type": block_type,
+                "blocks_param": blocks_param,
+                "block_name": block_spec.name,
+                "schema": asdict(block_spec.schema),
+            }
+        )
 
     def _has_shape(ref: TensorRef | None) -> bool:
         return ref is not None and bool(ref.shape)
@@ -1022,6 +1049,13 @@ def _inline_stacked_blocks(
                 block_type_indices[block_type] += 1
 
                 blocks_param = block_type_to_param[block_type]
+                _record_block_schema(
+                    layer_idx=layer_idx,
+                    block_idx=block_idx,
+                    block_type=block_type,
+                    blocks_param=blocks_param,
+                    block_spec=block_spec,
+                )
 
                 # Always materialize the block's own outputs under their
                 # per-layer internal names, even for the final layer. The last
@@ -1178,6 +1212,14 @@ def _inline_stacked_blocks(
             deepstack_layers = int(node.attrs.get("deepstack_layers", 0)) if node.attrs else 0
 
             for layer_idx in range(int(n_layers)):
+                _record_block_schema(
+                    layer_idx=layer_idx,
+                    block_idx=layer_idx,
+                    block_type=block_spec.name,
+                    blocks_param=blocks_param,
+                    block_spec=block_spec,
+                )
+
                 # Keep the final block's canonical per-layer outputs as
                 # `blocks[N].*` too, then alias them to the outer graph outputs
                 # after inlining. This mirrors the HybridStackedBlocks path and
@@ -1269,6 +1311,8 @@ def _inline_stacked_blocks(
     graph.intermediates = new_intermediates
     if new_save:
         graph.save_list = list(graph.save_list) + new_save
+    if block_schema_records:
+        graph.metadata["block_schemas"] = block_schema_records
     return graph
 
 
@@ -1759,6 +1803,11 @@ def compile_block_spec(
         extends=spec.extends,
         config=config,
     )
+    if spec.schema:
+        errors = spec.schema.contract_errors()
+        if errors:
+            raise DSLSyntaxError(f"invalid block schema for {spec.name}: {'; '.join(errors)}")
+        ir.block_schema = asdict(spec.schema)
 
     # Create instance first so we can build dim_map for param resolution
     instance = None
@@ -1966,7 +2015,7 @@ def _tensor_ref_to_dict(ref: TensorRef) -> dict[str, Any]:
 
 def _graph_ir_to_dict(graph: GraphIR) -> dict[str, Any]:
     """Convert GraphIR to JSON-serializable dict."""
-    return {
+    result = {
         "name": graph.name,
         "num_ops": len(graph.nodes),
         "inputs": {name: _tensor_ref_to_dict(ref) for name, ref in graph.inputs.items()},
@@ -1987,6 +2036,9 @@ def _graph_ir_to_dict(graph: GraphIR) -> dict[str, Any]:
             for op in graph.nodes
         ],
     }
+    if graph.metadata:
+        result["metadata"] = graph.metadata
+    return result
 
 
 def _activation_slot_ir_to_dict(slot: ActivationSlotIR) -> dict[str, Any]:
@@ -2065,6 +2117,9 @@ def _module_ir_to_dict(ir: ModuleIR) -> dict[str, Any]:
 
     if ir.activation_layout:
         result["activation_layout"] = _activation_layout_ir_to_dict(ir.activation_layout)
+
+    if ir.block_schema:
+        result["block_schema"] = ir.block_schema
 
     return result
 

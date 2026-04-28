@@ -26,11 +26,29 @@ from surogate.grpo.loss import compute_grpo_per_token_grads
 from surogate.grpo.runs import get_multi_run_manager
 from surogate.grpo.weight_broadcast import SurogateWeightBroadcast
 from surogate.train.lr_schedule import LRSchedule
+from surogate.train.metrics_writer import MetricsWriter
 from surogate.utils.hf import get_model_weights_path
 from surogate.utils.logger import get_logger
 from surogate.utils.tensor import to_surogate_dtype
 
 logger = get_logger()
+
+
+def _filtered_config_for_logging(config: GRPOTrainConfig) -> dict:
+    """Flatten config into JSON-serializable scalars for metrics_writer.log_config()."""
+    raw = dict(vars(config))
+    raw.pop("model_info", None)
+    raw.pop("model", None)
+    raw.pop("tokenizer", None)
+    out: dict[str, bool | int | float | str] = {}
+    for k, v in raw.items():
+        if v is None:
+            out[k] = ""
+        elif isinstance(v, (bool, int, float, str)):
+            out[k] = v
+        else:
+            out[k] = str(v)
+    return out
 
 
 def _find_sample_boundaries(position_ids_flat: np.ndarray) -> list[tuple[int, int]]:
@@ -153,6 +171,15 @@ class GRPOTrainer:
         # Data loader setup is deferred to train() since packer must run first
         self.data_loader: GRPODataLoader | None = None
         self.packer = None
+
+        # Optional metrics writers (driven by config.report_to)
+        self.metrics_writer: MetricsWriter | None = None
+        backends = config.report_to or []
+        if isinstance(backends, str):
+            backends = [backends]
+        if "surogate" in backends:
+            self.metrics_writer = MetricsWriter(output_path=config.surogate_metrics_path)
+            self.metrics_writer.log_config(**_filtered_config_for_logging(config))
 
     def _copy_tokenizer_files(self, src_dir: str, dst_dir: str):
         """Copy tokenizer, vocab, and config files from source model to output directory."""
@@ -452,6 +479,29 @@ class GRPOTrainer:
                     f"time={step_time:.2f}s"
                 )
 
+                if self.metrics_writer is not None:
+                    duration_ms = step_time * 1000.0
+                    total_tokens = int(step_metrics.get("total_tokens", 0))
+                    tps = total_tokens / step_time if step_time > 0 else 0.0
+                    self.metrics_writer.track(
+                        step,
+                        **{
+                            "train/policy_loss": avg_metrics.get("policy_loss", 0.0),
+                            "train/mismatch_kl": avg_metrics.get("mismatch_kl", 0.0),
+                            "train/is_masked": avg_metrics.get("is_masked", 0.0),
+                            "train/keep_tokens": float(step_metrics.get("keep_tokens", 0)),
+                            "train/total_tokens": float(total_tokens),
+                            "train/grad_norm": float(result["norm"]),
+                            "train/lr": float(lr),
+                            "train/micro_batches": float(n_mb),
+                            "train/vtc": float(vtc),
+                            "train/expected_loss_scale": float(expected_loss_scale),
+                            "train/duration_ms": duration_ms,
+                            "train/tokens_per_second": tps,
+                            "train/orch_step": float(orch_step),
+                        },
+                    )
+
             # 7. Checkpointing
             if config.save_steps > 0 and step > 0 and step % config.save_steps == 0 and config.checkpoint_dir:
                 logger.info(f"Saving checkpoint at step {step}...")
@@ -478,8 +528,16 @@ class GRPOTrainer:
 
         logger.info(f"GRPO training complete after {step} steps")
 
+    def close(self):
+        if self.metrics_writer is not None:
+            self.metrics_writer.close()
+            self.metrics_writer = None
+
 
 def grpo_train(config: GRPOTrainConfig):
     """Entry point for GRPO training."""
     trainer = GRPOTrainer(config)
-    trainer.train()
+    try:
+        trainer.train()
+    finally:
+        trainer.close()

@@ -41,6 +41,7 @@ class DslRunState;
 class DslParamStore;
 class DslGradStore;
 class DslWeightManager;
+class HookRegistry;
 class GraphCompiler;
 class CompiledExecutor;
 struct CompiledGraph;
@@ -244,6 +245,7 @@ public:
     void set_hook_context(void* context) override {
         mHookContext = context;
     }
+    void set_schema_hook_registry(const HookRegistry* registry);
 
     bool has_derived_backward() const override {
         return mDerivedBackward.has_value();
@@ -398,6 +400,7 @@ private:
     // Hook context (opaque pointer passed to any remaining hook callbacks;
     // LoRA itself is slice-driven and no longer uses this).
     void* mHookContext = nullptr;
+    const HookRegistry* mSchemaHookRegistry = nullptr;
 
     // Optional weight manager for streaming/sharding (owned by DslModel)
     DslWeightManager* mWeightManager = nullptr;
@@ -424,6 +427,7 @@ private:
     // FP8/FP4 weight caches (use namespace-level types for compatibility with CompiledExecutor)
     std::unordered_map<std::string, FP8WeightCacheEntry> mFP8WeightCache;
     std::unordered_map<std::string, FP8WeightCacheEntry> mFP8WeightCacheT;  ///< Backward dinp (transposed layout)
+    std::unordered_map<std::string, MoEFP8WeightCacheEntry> mMoEFP8WeightCache;
     std::unordered_map<std::string, FP4WeightCacheEntry> mFP4WeightCache;   ///< Forward pass (normal layout)
     std::unordered_map<std::string, FP4WeightCacheEntry> mFP4WeightCacheT;  ///< Backward dgrad (transposed layout)
 

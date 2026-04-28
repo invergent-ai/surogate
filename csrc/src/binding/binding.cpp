@@ -393,6 +393,7 @@ NB_MODULE(_surogate, m) {
                bool use_fused_rope,
                bool doc_masking,
                int fp8_amax_history,
+               bool fp4_four_over_six,
                const std::string& fp4_backend,
                int skip_quant_first_layers,
                int skip_quant_last_layers,
@@ -400,6 +401,7 @@ NB_MODULE(_surogate, m) {
                 // Build recipe options
                 recipes::RecipeConfig recipe_options;
                 recipe_options.fp8_amax_history_len = fp8_amax_history;
+                recipe_options.fp4_four_over_six = fp4_four_over_six;
                 recipe_options.fp4_backend = matmul_backend_from_str(fp4_backend);
                 recipe_options.skip_quant_first_layers = skip_quant_first_layers;
                 recipe_options.skip_quant_last_layers = skip_quant_last_layers;
@@ -477,6 +479,7 @@ NB_MODULE(_surogate, m) {
             nb::arg("use_fused_rope") = false,
             nb::arg("doc_masking") = true,
             nb::arg("fp8_amax_history") = 1024,
+            nb::arg("fp4_four_over_six") = true,
             nb::arg("fp4_backend") = "cutlass",
             nb::arg("skip_quant_first_layers") = 0,
             nb::arg("skip_quant_last_layers") = 0,
@@ -1676,17 +1679,35 @@ NB_MODULE(_surogate, m) {
         .def(
             "get_moe_stats",
             [](MultiGPUPyTrainer* trainer) {
-                auto [aux_loss, z_loss, utilization, imbalance, valid] = trainer->get_moe_stats();
+                auto [aux_loss,
+                      z_loss,
+                      utilization,
+                      imbalance,
+                      active_experts,
+                      max_expert_fraction,
+                      min_active_expert_fraction,
+                      load_cv,
+                      router_entropy,
+                      router_confidence,
+                      valid] = trainer->get_moe_stats();
                 nb::dict ret;
                 ret["aux_loss"] = aux_loss;
                 ret["z_loss"] = z_loss;
                 ret["expert_utilization"] = utilization;
                 ret["load_imbalance"] = imbalance;
+                ret["active_experts"] = active_experts;
+                ret["max_expert_fraction"] = max_expert_fraction;
+                ret["min_active_expert_fraction"] = min_active_expert_fraction;
+                ret["load_cv"] = load_cv;
+                ret["router_entropy"] = router_entropy;
+                ret["router_confidence"] = router_confidence;
                 ret["valid"] = valid;
                 return ret;
             },
             "Get MoE training statistics from the last forward pass.\n\n"
-            "Returns: dict with keys {aux_loss, z_loss, expert_utilization, load_imbalance, valid}.\n"
+            "Returns: dict with keys {aux_loss, z_loss, expert_utilization, load_imbalance, "
+            "active_experts, max_expert_fraction, min_active_expert_fraction, load_cv, "
+            "router_entropy, router_confidence, valid}.\n"
             "For non-MoE models, valid=False and other values are zero.")
         .def(
             "step_with_custom_loss",
@@ -1971,6 +1992,7 @@ NB_MODULE(_surogate, m) {
                 r["arenas_allocated"] = s.arenas_allocated;
                 r["arena_persistent_bytes"] = s.arena_persistent_bytes;
                 r["arena_persistent_activation_bytes"] = s.arena_persistent_activation_bytes;
+                r["arena_model_scope_persistent_bytes"] = s.arena_model_scope_persistent_bytes;
                 r["arena_accumulator_bytes"] = s.arena_accumulator_bytes;
                 r["arena_fwd_stack_bytes"] = s.arena_fwd_stack_bytes;
                 r["arena_bwd_stack_bytes"] = s.arena_bwd_stack_bytes;
@@ -1978,6 +2000,18 @@ NB_MODULE(_surogate, m) {
                 r["arena_unified_stack_bytes"] = s.arena_unified_stack_bytes;
                 r["arena_bwd_cross_layer_bytes"] = s.arena_bwd_cross_layer_bytes;
                 r["arena_moe_saved_bytes"] = s.arena_moe_saved_bytes;
+                r["arena_schema_allocation_authoritative"] = s.arena_schema_allocation_authoritative;
+                r["arena_compiled_fwd_stack_bytes"] = s.arena_compiled_fwd_stack_bytes;
+                r["arena_compiled_save_for_bwd_bytes"] = s.arena_compiled_save_for_bwd_bytes;
+                r["arena_schema_frame_arena_bytes"] = s.arena_schema_frame_arena_bytes;
+                r["arena_schema_save_for_bwd_arena_bytes"] = s.arena_schema_save_for_bwd_arena_bytes;
+                r["arena_schema_persistent_activation_bytes"] = s.arena_schema_persistent_activation_bytes;
+                r["arena_schema_host_stream_activation_bytes"] = s.arena_schema_host_stream_activation_bytes;
+                r["arena_schema_total_activation_arena_bytes"] = s.arena_schema_total_activation_arena_bytes;
+                r["arena_schema_frame_arena_safety_bytes"] = s.arena_schema_frame_arena_safety_bytes;
+                r["arena_schema_save_for_bwd_safety_bytes"] = s.arena_schema_save_for_bwd_safety_bytes;
+                r["arena_schema_frame_arena_extra_bytes"] = s.arena_schema_frame_arena_extra_bytes;
+                r["arena_schema_save_for_bwd_extra_bytes"] = s.arena_schema_save_for_bwd_extra_bytes;
                 nb::list bases;
                 for (auto b : s.arena_save_for_bwd_block_bases) {
                     bases.append(b);
@@ -1990,6 +2024,172 @@ NB_MODULE(_surogate, m) {
             "Aggregate arena sizes + per-graph coverage + per-region tid counts.\n"
             "Returns dict with `arena_*_bytes` (what was cudaMalloc'd) plus `forward`\n"
             "and `backward` sub-dicts containing per-graph stats.")
+        .def(
+            "get_debug_descriptor_summary",
+            [](MultiGPUPyTrainer* trainer) {
+                auto s = trainer->get_debug_descriptor_summary();
+                auto graph_descriptor_to_dict = [](const dsl::DebugGraphDescriptorSummary& g) {
+                    nb::dict d;
+                    d["graph"] = dsl::debug_graph_kind_name(g.graph);
+                    d["name"] = g.name;
+                    d["num_tensors"] = g.num_tensors;
+                    d["num_ops"] = g.num_ops;
+                    d["no_comm_ops"] = g.no_comm_ops;
+                    d["all_reduce_after_ops"] = g.all_reduce_after_ops;
+                    d["reduce_scatter_after_ops"] = g.reduce_scatter_after_ops;
+                    d["all_to_all_in_ops"] = g.all_to_all_in_ops;
+                    d["all_to_all_out_ops"] = g.all_to_all_out_ops;
+                    d["expert_parallel_routed_ops"] = g.expert_parallel_routed_ops;
+                    d["grouped_ops"] = g.grouped_ops;
+                    d["dense_matmul_ops"] = g.dense_matmul_ops;
+                    d["grouped_matmul_ops"] = g.grouped_matmul_ops;
+                    d["moe_routed_ops"] = g.moe_routed_ops;
+                    d["fp8_eligible_ops"] = g.fp8_eligible_ops;
+                    d["fp4_eligible_ops"] = g.fp4_eligible_ops;
+                    d["matmul_fp8_forward_eligible_ops"] = g.matmul_fp8_forward_eligible_ops;
+                    d["matmul_fp8_backward_eligible_ops"] = g.matmul_fp8_backward_eligible_ops;
+                    d["matmul_fp4_forward_eligible_ops"] = g.matmul_fp4_forward_eligible_ops;
+                    d["matmul_fp4_backward_eligible_ops"] = g.matmul_fp4_backward_eligible_ops;
+                    d["moe_fp8_grouped_eligible_ops"] = g.moe_fp8_grouped_eligible_ops;
+                    d["moe_fp4_grouped_eligible_ops"] = g.moe_fp4_grouped_eligible_ops;
+                    d["moe_fp8_backward_implemented_ops"] = g.moe_fp8_backward_implemented_ops;
+                    d["moe_nvfp4_no_fallback_ops"] = g.moe_nvfp4_no_fallback_ops;
+                    d["lora_compatible_ops"] = g.lora_compatible_ops;
+                    d["weight_cache_eligible_ops"] = g.weight_cache_eligible_ops;
+                    d["activation_epilogue_ops"] = g.activation_epilogue_ops;
+                    d["cpu_pinned_stream_ops"] = g.cpu_pinned_stream_ops;
+                    d["fusion_candidate_starts"] = g.fusion_candidate_starts;
+                    d["fp8_pending_tensors"] = g.fp8_pending_tensors;
+                    d["fp8_ready_tensors"] = g.fp8_ready_tensors;
+                    d["fp4_ready_tensors"] = g.fp4_ready_tensors;
+                    d["lora_slices"] = g.lora_slices;
+                    d["lora_schema_slot_slices"] = g.lora_schema_slot_slices;
+                    d["lora_schema_target_slices"] = g.lora_schema_target_slices;
+                    d["grouped_lora_schema_slot_slices"] = g.grouped_lora_schema_slot_slices;
+                    d["grouped_lora_schema_target_slices"] = g.grouped_lora_schema_target_slices;
+                    d["forward_hook_points"] = g.forward_hook_points;
+                    d["forward_hook_schema_slot_points"] = g.forward_hook_schema_slot_points;
+                    d["forward_hook_schema_target_points"] = g.forward_hook_schema_target_points;
+                    return d;
+                };
+                nb::dict r;
+                r["forward"] = graph_descriptor_to_dict(s.forward);
+                r["backward"] = graph_descriptor_to_dict(s.backward);
+                return r;
+            },
+            "Descriptor/capability counts for forward + backward compiled graphs.\n"
+            "Returns count-only sub-dicts suitable for regression artifacts.")
+        .def(
+            "get_debug_fusion_preview",
+            [](MultiGPUPyTrainer* trainer) {
+                auto preview = trainer->get_debug_fusion_preview();
+                nb::list out;
+                for (const auto& candidate : preview.candidates) {
+                    nb::dict d;
+                    d["graph"] = dsl::debug_graph_kind_name(candidate.graph);
+                    d["rule_name"] = candidate.rule_name;
+                    d["replacement_op"] = candidate.replacement_op;
+                    d["start"] = candidate.start;
+                    d["length"] = candidate.length;
+                    nb::list op_ids;
+                    for (const auto& op_id : candidate.op_ids) {
+                        op_ids.append(op_id);
+                    }
+                    d["op_ids"] = op_ids;
+                    nb::list op_names;
+                    for (const auto& op_name : candidate.op_names) {
+                        op_names.append(op_name);
+                    }
+                    d["op_names"] = op_names;
+                    d["applied"] = candidate.applied;
+                    d["reason"] = candidate.reason;
+                    out.append(std::move(d));
+                }
+                return out;
+            },
+            "Deterministic descriptor fusion rewrite preview.\n"
+            "Each entry records the rule, candidate op ids/names, replacement op,\n"
+            "whether the rewrite was applied, and the rollout reason.")
+        .def(
+            "get_debug_buffer_plan_summary",
+            [](MultiGPUPyTrainer* trainer) {
+                auto s = trainer->get_debug_buffer_plan_summary();
+                nb::dict d;
+                d["schema_record_count"] = s.schema_record_count;
+                d["schema_routing_layers"] = s.schema_routing_layers;
+                d["schema_ep_layers"] = s.schema_ep_layers;
+                d["schema_dense_layers"] = s.schema_dense_layers;
+                d["schema_moe_layers"] = s.schema_moe_layers;
+                d["schema_mamba_layers"] = s.schema_mamba_layers;
+                d["schema_linear_mixer_layers"] = s.schema_linear_mixer_layers;
+                d["schema_slot_count"] = s.schema_slot_count;
+                d["schema_param_slots"] = s.schema_param_slots;
+                d["schema_activation_slots"] = s.schema_activation_slots;
+                d["schema_op_lifetime_slots"] = s.schema_op_lifetime_slots;
+                d["schema_layer_lifetime_slots"] = s.schema_layer_lifetime_slots;
+                d["schema_block_lifetime_slots"] = s.schema_block_lifetime_slots;
+                d["schema_model_lifetime_slots"] = s.schema_model_lifetime_slots;
+                d["schema_persistent_lifetime_slots"] = s.schema_persistent_lifetime_slots;
+                d["schema_registry_registered_activation_slots"] = s.schema_registry_registered_activation_slots;
+                d["schema_registry_missing_activation_slots"] = s.schema_registry_missing_activation_slots;
+                d["schema_registry_save_for_backward_activation_slots"] =
+                    s.schema_registry_save_for_backward_activation_slots;
+                d["schema_registry_save_for_backward_mismatch_slots"] =
+                    s.schema_registry_save_for_backward_mismatch_slots;
+                d["schema_resolved_activation_shape_slots"] = s.schema_resolved_activation_shape_slots;
+                d["schema_unresolved_activation_shape_slots"] = s.schema_unresolved_activation_shape_slots;
+                d["schema_dynamic_activation_shape_slots"] = s.schema_dynamic_activation_shape_slots;
+                d["schema_resolved_activation_shape_bytes"] = s.schema_resolved_activation_shape_bytes;
+                d["schema_save_for_backward_activation_slots"] = s.schema_save_for_backward_activation_slots;
+                d["schema_frame_activation_slots"] = s.schema_frame_activation_slots;
+                d["schema_save_for_backward_activation_bytes"] = s.schema_save_for_backward_activation_bytes;
+                d["schema_frame_activation_bytes"] = s.schema_frame_activation_bytes;
+                d["schema_allocation_authoritative"] = s.schema_allocation_authoritative;
+                d["schema_allocation_authoritative_layers"] = s.schema_allocation_authoritative_layers;
+                d["schema_allocation_unresolved_slots"] = s.schema_allocation_unresolved_slots;
+                d["schema_authoritative_frame_arena_bytes"] = s.schema_authoritative_frame_arena_bytes;
+                d["schema_authoritative_save_for_backward_arena_bytes"] =
+                    s.schema_authoritative_save_for_backward_arena_bytes;
+                d["schema_authoritative_persistent_activation_bytes"] =
+                    s.schema_authoritative_persistent_activation_bytes;
+                d["schema_authoritative_host_stream_activation_bytes"] =
+                    s.schema_authoritative_host_stream_activation_bytes;
+                d["schema_authoritative_total_activation_arena_bytes"] =
+                    s.schema_authoritative_total_activation_arena_bytes;
+                d["schema_max_layer_activation_shape_bytes"] = s.schema_max_layer_activation_shape_bytes;
+                d["schema_baseline_max_activation_shape_bytes"] = s.schema_baseline_max_activation_shape_bytes;
+                d["schema_activation_shape_savings_bytes"] = s.schema_activation_shape_savings_bytes;
+                d["schema_resolved_param_shape_slots"] = s.schema_resolved_param_shape_slots;
+                d["schema_unresolved_param_shape_slots"] = s.schema_unresolved_param_shape_slots;
+                d["schema_expert_parallel_param_slots"] = s.schema_expert_parallel_param_slots;
+                d["schema_resolved_param_shape_bytes"] = s.schema_resolved_param_shape_bytes;
+                d["schema_resolved_param_shape_local_bytes"] = s.schema_resolved_param_shape_local_bytes;
+                d["schema_expert_parallel_param_shape_bytes"] = s.schema_expert_parallel_param_shape_bytes;
+                d["schema_expert_parallel_param_shape_local_bytes"] = s.schema_expert_parallel_param_shape_local_bytes;
+                d["schema_expert_parallel_param_shape_savings_bytes"] =
+                    s.schema_expert_parallel_param_shape_savings_bytes;
+                d["hook_after_produce_targets"] = s.hook_after_produce_targets;
+                d["hook_before_consume_targets"] = s.hook_before_consume_targets;
+                d["hook_after_consume_targets"] = s.hook_after_consume_targets;
+                d["hook_after_communication_targets"] = s.hook_after_communication_targets;
+                d["hook_after_all_to_all_targets"] = s.hook_after_all_to_all_targets;
+                d["hook_after_all_reduce_targets"] = s.hook_after_all_reduce_targets;
+                d["hook_after_reduce_scatter_targets"] = s.hook_after_reduce_scatter_targets;
+                d["schema_hook_dispatch_enabled"] = s.schema_hook_dispatch_enabled;
+                d["hook_registry_registrations"] = s.hook_registry_registrations;
+                d["hook_registry_distribution_aware_registrations"] = s.hook_registry_distribution_aware_registrations;
+                d["hook_registry_after_produce_registrations"] = s.hook_registry_after_produce_registrations;
+                d["hook_registry_before_consume_registrations"] = s.hook_registry_before_consume_registrations;
+                d["hook_registry_after_consume_registrations"] = s.hook_registry_after_consume_registrations;
+                d["hook_registry_after_communication_registrations"] =
+                    s.hook_registry_after_communication_registrations;
+                d["hook_registry_after_all_reduce_registrations"] = s.hook_registry_after_all_reduce_registrations;
+                d["hook_registry_after_all_to_all_registrations"] = s.hook_registry_after_all_to_all_registrations;
+                d["hook_registry_after_reduce_scatter_registrations"] =
+                    s.hook_registry_after_reduce_scatter_registrations;
+                return d;
+            },
+            "BufferPlan schema/allocation diagnostics suitable for regression artifacts.")
         .def(
             "get_debug_phase_tree",
             [](MultiGPUPyTrainer* trainer, bool is_backward) {
@@ -2405,8 +2605,23 @@ NB_MODULE(_surogate, m) {
              "- loss: Training loss.\n"
              "- lr: Learning rate.")
         .def("log_step_moe",
-             nb::overload_cast<int, float, int, int, float, float, float, float, float, float, float>(
-                 &TrainingRunLogger::log_step),
+             nb::overload_cast<int,
+                               float,
+                               int,
+                               int,
+                               float,
+                               float,
+                               float,
+                               float,
+                               float,
+                               float,
+                               float,
+                               float,
+                               float,
+                               float,
+                               float,
+                               float,
+                               float>(&TrainingRunLogger::log_step),
              nb::arg("step"),
              nb::arg("epoch"),
              nb::arg("step_tokens"),
@@ -2418,6 +2633,12 @@ NB_MODULE(_surogate, m) {
              nb::arg("moe_z_loss"),
              nb::arg("moe_load_imbalance"),
              nb::arg("moe_expert_utilization"),
+             nb::arg("moe_active_experts"),
+             nb::arg("moe_max_expert_fraction"),
+             nb::arg("moe_min_active_expert_fraction"),
+             nb::arg("moe_load_cv"),
+             nb::arg("moe_router_entropy"),
+             nb::arg("moe_router_confidence"),
              "Log a training step with MoE metrics inline.\n\n"
              "Parameters:\n"
              "- step: Global step index.\n"
@@ -2430,7 +2651,13 @@ NB_MODULE(_surogate, m) {
              "- moe_aux_loss: MoE auxiliary load balancing loss.\n"
              "- moe_z_loss: MoE router z-loss.\n"
              "- moe_load_imbalance: MoE load imbalance ratio.\n"
-             "- moe_expert_utilization: Fraction of experts receiving tokens.")
+             "- moe_expert_utilization: Fraction of experts receiving tokens.\n"
+             "- moe_active_experts: Average active experts per layer.\n"
+             "- moe_max_expert_fraction: Fraction of assignments sent to busiest expert.\n"
+             "- moe_min_active_expert_fraction: Fraction of assignments sent to least-used active expert.\n"
+             "- moe_load_cv: Expert load coefficient of variation.\n"
+             "- moe_router_entropy: Average normalized router entropy.\n"
+             "- moe_router_confidence: Average max normalized routing probability.")
         .def("set_phase",
              &TrainingRunLogger::set_phase,
              nb::arg("phase"),
@@ -2457,13 +2684,25 @@ NB_MODULE(_surogate, m) {
              nb::arg("z_loss"),
              nb::arg("expert_utilization"),
              nb::arg("load_imbalance"),
+             nb::arg("active_experts"),
+             nb::arg("max_expert_fraction"),
+             nb::arg("min_active_expert_fraction"),
+             nb::arg("load_cv"),
+             nb::arg("router_entropy"),
+             nb::arg("router_confidence"),
              "Log MoE training statistics.\n\n"
              "Parameters:\n"
              "- step: Global step index.\n"
              "- aux_loss: Load balancing auxiliary loss.\n"
              "- z_loss: Router z-loss.\n"
              "- expert_utilization: Fraction of experts receiving tokens (0-1).\n"
-             "- load_imbalance: Ratio of max to mean token counts (1.0 = balanced).")
+             "- load_imbalance: Ratio of max to mean token counts (1.0 = balanced).\n"
+             "- active_experts: Average active experts per layer.\n"
+             "- max_expert_fraction: Fraction of assignments sent to busiest expert.\n"
+             "- min_active_expert_fraction: Fraction of assignments sent to least-used active expert.\n"
+             "- load_cv: Expert load coefficient of variation.\n"
+             "- router_entropy: Average normalized router entropy.\n"
+             "- router_confidence: Average max normalized routing probability.")
         .def("log_gpu_state",
              &TrainingRunLogger::log_gpu_state,
              nb::arg("step"),

@@ -11,13 +11,13 @@
 #include "runtime/dsl/dsl_weight_loader.h"
 
 #include <algorithm>
-#include <cctype>
 #include <cstring>
 #include <stdexcept>
 #include <string_view>
 
 #include "config/pretrained_config.h"
 #include "kernels/kernels.h"
+#include "runtime/dsl/tensor_role.h"
 #include "utilities/allocator.h"
 #include "utilities/dtype.h"
 #include "utilities/safetensors.h"
@@ -838,23 +838,14 @@ Tensor DslWeightLoader::slice_dim0(const Tensor& base, long offset, long length)
 }
 
 std::vector<long> DslWeightLoader::infer_fuse_slices(const std::string& name, int num_sources) const {
-    // Case-insensitive name matching for common fuse patterns.
-    auto lower = [](const std::string& s) {
-        std::string r = s;
-        for (char& c : r)
-            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        return r;
-    };
-    const std::string lname = lower(name);
-
-    if (lname.find("qkv") != std::string::npos) {
+    if (tensor_role_is_fused_qkv_name(name)) {
         const long hs = mConfig.head_size();
         const long q_rows = static_cast<long>(mConfig.NumQueryHeads) * hs;
         const long kv_rows = static_cast<long>(mConfig.NumKeyValHeads) * hs;
         return {q_rows, kv_rows, kv_rows};
     }
 
-    if (lname.find("mlp_up") != std::string::npos || lname.find("gate_up") != std::string::npos) {
+    if (tensor_role_is_fused_mlp_up_name(name)) {
         const long m = mConfig.IntermediateSize;
         return std::vector<long>(num_sources, m);
     }

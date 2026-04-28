@@ -364,6 +364,11 @@ void TrainingRunLogger::log_step(int step,
  * @param moe_aux_loss MoE auxiliary load balancing loss.
  * @param moe_z_loss MoE router z-loss.
  * @param moe_load_imbalance MoE load imbalance ratio.
+ * @param moe_active_experts Average active expert count.
+ * @param moe_max_expert_fraction Fraction of assignments sent to busiest expert.
+ * @param moe_load_cv Expert assignment count coefficient of variation.
+ * @param moe_router_entropy Normalized router entropy.
+ * @param moe_router_confidence Average max routing probability.
  */
 void TrainingRunLogger::log_step(int step,
                                  float epoch,
@@ -375,7 +380,13 @@ void TrainingRunLogger::log_step(int step,
                                  float moe_aux_loss,
                                  float moe_z_loss,
                                  float moe_load_imbalance,
-                                 float moe_expert_utilization) {
+                                 float moe_expert_utilization,
+                                 float moe_active_experts,
+                                 float moe_max_expert_fraction,
+                                 float moe_min_active_expert_fraction,
+                                 float moe_load_cv,
+                                 float moe_router_entropy,
+                                 float moe_router_confidence) {
     if (mRank != 0) return;
     mTotalTrainingLoss += loss;
     ++mTotalTrainingSteps;
@@ -440,10 +451,12 @@ void TrainingRunLogger::log_step(int step,
         }
 
         // MoE metrics string
-        std::string moe_str = fmt::format(" | aux {:.4f} | imbal {:.2f} | util {:.2f}",
+        std::string moe_str = fmt::format(" | aux {:.4f} | imbal {:.2f} | util {:.2f} | hot {:.2f} | ent {:.2f}",
                                           moe_aux_loss,
                                           moe_load_imbalance,
-                                          moe_expert_utilization);
+                                          moe_expert_utilization,
+                                          moe_max_expert_fraction,
+                                          moe_router_entropy);
 
         std::string phase_str = mPhase.empty() ? "" : fmt::format(" | {}", mPhase);
 
@@ -465,7 +478,7 @@ void TrainingRunLogger::log_step(int step,
 
     std::string phase_json = mPhase.empty() ? "" : fmt::format(R"(, "phase": "{}")", mPhase);
     log_line(fmt::format(
-        R"(  {{"log": "step", "time": "{}", "step": {}, "epoch": {}, "step_tokens": {}, "duration_ms": {}, "norm": {}, "loss": {}, "lr": {}, "moe_aux_loss": {}, "moe_z_loss": {}, "moe_load_imbalance": {}, "moe_expert_utilization": {}{}}})",
+        R"(  {{"log": "step", "time": "{}", "step": {}, "epoch": {}, "step_tokens": {}, "duration_ms": {}, "norm": {}, "loss": {}, "lr": {}, "moe_aux_loss": {}, "moe_z_loss": {}, "moe_load_imbalance": {}, "moe_expert_utilization": {}, "moe_active_experts": {}, "moe_max_expert_fraction": {}, "moe_min_active_expert_fraction": {}, "moe_load_cv": {}, "moe_router_entropy": {}, "moe_router_confidence": {}{}}})",
         std::chrono::system_clock::now(),
         step,
         epoch,
@@ -478,6 +491,12 @@ void TrainingRunLogger::log_step(int step,
         sanitize_float_for_json(moe_z_loss),
         sanitize_float_for_json(moe_load_imbalance),
         sanitize_float_for_json(moe_expert_utilization),
+        sanitize_float_for_json(moe_active_experts),
+        sanitize_float_for_json(moe_max_expert_fraction),
+        sanitize_float_for_json(moe_min_active_expert_fraction),
+        sanitize_float_for_json(moe_load_cv),
+        sanitize_float_for_json(moe_router_entropy),
+        sanitize_float_for_json(moe_router_confidence),
         phase_json));
 }
 
@@ -537,16 +556,28 @@ void TrainingRunLogger::log_moe_stats(int step,
                                       float aux_loss,
                                       float z_loss,
                                       float expert_utilization,
-                                      float load_imbalance) {
+                                      float load_imbalance,
+                                      float active_experts,
+                                      float max_expert_fraction,
+                                      float min_active_expert_fraction,
+                                      float load_cv,
+                                      float router_entropy,
+                                      float router_confidence) {
     if (mRank != 0) return;
     log_line(fmt::format(
-        R"(  {{"log": "moe", "time": "{}", "step": {}, "aux_loss": {}, "z_loss": {}, "expert_utilization": {}, "load_imbalance": {}}})",
+        R"(  {{"log": "moe", "time": "{}", "step": {}, "aux_loss": {}, "z_loss": {}, "expert_utilization": {}, "load_imbalance": {}, "active_experts": {}, "max_expert_fraction": {}, "min_active_expert_fraction": {}, "load_cv": {}, "router_entropy": {}, "router_confidence": {}}})",
         std::chrono::system_clock::now(),
         step,
         sanitize_float_for_json(aux_loss),
         sanitize_float_for_json(z_loss),
         sanitize_float_for_json(expert_utilization),
-        sanitize_float_for_json(load_imbalance)));
+        sanitize_float_for_json(load_imbalance),
+        sanitize_float_for_json(active_experts),
+        sanitize_float_for_json(max_expert_fraction),
+        sanitize_float_for_json(min_active_expert_fraction),
+        sanitize_float_for_json(load_cv),
+        sanitize_float_for_json(router_entropy),
+        sanitize_float_for_json(router_confidence)));
 }
 
 /**

@@ -102,9 +102,9 @@ public:
 
     std::vector<GPUUtilInfo> get_gpu_info();
 
-    // MoE stats (returns {aux_loss, z_loss, expert_utilization, load_imbalance, valid})
+    // MoE stats (returns aux/z/load/router diagnostics plus valid flag)
     // Returns zeros with valid=false for non-MoE models
-    std::tuple<float, float, float, float, bool> get_moe_stats();
+    std::tuple<float, float, float, float, float, float, float, float, float, float, bool> get_moe_stats();
 
     int world_size() const;
     int local_world_size() const {
@@ -147,6 +147,15 @@ public:
 
     //! Arena sizes + per-graph coverage / per-region counts.
     dsl::DebugArenaSummary get_debug_arena_summary();
+
+    //! Descriptor/capability counts across forward + backward graphs.
+    dsl::DebugDescriptorSummary get_debug_descriptor_summary();
+
+    //! Deterministic fusion rewrite preview across forward + backward graphs.
+    dsl::DebugFusionPreview get_debug_fusion_preview();
+
+    //! BufferPlan schema/allocation diagnostics.
+    dsl::DebugBufferPlanSummary get_debug_buffer_plan_summary();
 
     //! Phase tree + flattened instruction stream for one graph.
     dsl::DebugPhaseTree get_debug_phase_tree(bool is_backward);

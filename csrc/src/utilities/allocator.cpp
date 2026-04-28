@@ -214,8 +214,12 @@ TensorAllocator::allocate_impl(ETensorDType dtype, const char* name, EAllocation
     try {
         Tensor allocated = allocate_tensor(dtype, kind, shape);
         const char* safe_name = name ? name : "<unnamed>";
-        m_Pointers.emplace_back(
-            sAllocationData{kind, allocated.Data, narrow<long>(allocated.bytes()), safe_name, m_Stats->Context});
+        m_Pointers.emplace_back(sAllocationData{kind,
+                                                allocated.Data,
+                                                narrow<long>(allocated.bytes()),
+                                                allocated.Device,
+                                                safe_name,
+                                                m_Stats->Context});
         record_stats(m_Stats->TensorStats, name, kind, allocated.bytes());
         if (!m_Stats->Context.empty()) {
             record_stats(m_Stats->ContextStats, m_Stats->Context, kind, allocated.bytes());
@@ -261,7 +265,18 @@ void TensorAllocator::free(Tensor& tensor) {
     const long bytes = it->Size;
     switch (it->Kind) {
         case EAllocationType::ON_DEVICE:
-        case EAllocationType::MANAGED: CUDA_CHECK(cudaFree(it->Pointer)); break;
+        case EAllocationType::MANAGED: {
+            int previous_device = -1;
+            (void)cudaGetDevice(&previous_device);
+            if (it->Device >= 0) {
+                CUDA_CHECK(cudaSetDevice(it->Device));
+            }
+            CUDA_CHECK(cudaFree(it->Pointer));
+            if (previous_device >= 0 && previous_device != it->Device) {
+                CUDA_CHECK(cudaSetDevice(previous_device));
+            }
+            break;
+        }
         case EAllocationType::PINNED:
         case EAllocationType::WRITE_CMB: CUDA_CHECK(cudaFreeHost(it->Pointer)); break;
         case EAllocationType::ON_HOST: delete[] it->Pointer; break;
@@ -313,6 +328,7 @@ TensorAllocator::~TensorAllocator() noexcept {
         did = -1;
         (void)cudaGetLastError();
     }
+    const int original_device = did;
     for (auto& ptr : m_Pointers) {
         const char* kind_str;
         switch (ptr.Kind) {
@@ -327,12 +343,32 @@ TensorAllocator::~TensorAllocator() noexcept {
         switch (ptr.Kind) {
             case EAllocationType::ON_DEVICE:
             case EAllocationType::MANAGED: {
+                int free_device = did;
+                if (ptr.Device >= 0) {
+                    const cudaError_t set_status = cudaSetDevice(ptr.Device);
+                    if (set_status != cudaSuccess) {
+                        fprintf(stderr,
+                                "WARNING: Cuda error selecting device %d for allocation %p [%s/%s of size %ld]: %s\n",
+                                ptr.Device,
+                                ptr.Pointer,
+                                ptr.Context.c_str(),
+                                ptr.Name.c_str(),
+                                ptr.Size,
+                                cudaGetErrorString(set_status));
+                        fflush(stderr);
+                        (void)cudaGetLastError();
+                    } else {
+                        free_device = ptr.Device;
+                    }
+                }
                 const cudaError_t st = cudaFree(ptr.Pointer);
                 if (st != cudaSuccess) {
                     fprintf(stderr,
-                            "WARNING: Cuda error on device %d when freeing allocation %p [%s of size %ld]: %s\n",
-                            did,
+                            "WARNING: Cuda error on device %d when freeing allocation %p [%s/%s, %s of size %ld]: %s\n",
+                            free_device,
                             ptr.Pointer,
+                            ptr.Context.c_str(),
+                            ptr.Name.c_str(),
                             kind_str,
                             ptr.Size,
                             cudaGetErrorString(st));
@@ -359,6 +395,9 @@ TensorAllocator::~TensorAllocator() noexcept {
             }
             case EAllocationType::ON_HOST: delete[] ptr.Pointer; break;
         }
+    }
+    if (original_device >= 0) {
+        (void)cudaSetDevice(original_device);
     }
 }
 

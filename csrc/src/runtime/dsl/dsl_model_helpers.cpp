@@ -14,6 +14,7 @@
 
 #include <fmt/format.h>
 
+#include "runtime/dsl/tensor_role.h"
 #include "utilities/dtype.h"
 
 namespace dsl {
@@ -445,13 +446,13 @@ bool is_bias_param_name(const std::string& name) {
 }
 
 std::vector<long> infer_fuse_slices(const std::string& name, const PretrainedConfig& cfg, int num_sources) {
-    if (contains_ci(name, "qkv")) {
+    if (tensor_role_is_fused_qkv_name(name)) {
         const long hs = cfg.head_size();
         const long q_rows = static_cast<long>(cfg.NumQueryHeads) * hs;
         const long kv_rows = static_cast<long>(cfg.NumKeyValHeads) * hs;
         return {q_rows, kv_rows, kv_rows};
     }
-    if (contains_ci(name, "mlp_up") || contains_ci(name, "gate_up")) {
+    if (tensor_role_is_fused_mlp_up_name(name)) {
         const long m = cfg.IntermediateSize;
         return std::vector<long>(num_sources, m);
     }

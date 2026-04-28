@@ -1,3 +1,4 @@
+import json
 import math
 import os
 import re
@@ -30,11 +31,250 @@ from surogate.utils.tensor import to_surogate_dtype
 logger = get_logger()
 
 
+def _schema_hook_dispatch_enabled() -> int:
+    value = os.environ.get("SUROGATE_ENABLE_SCHEMA_HOOK_DISPATCH")
+    if value is None:
+        return 1
+    return int(value.lower() not in {"0", "false", "off"})
+
+
+def _percentile_summary(values: list[float]) -> dict[str, float]:
+    if not values:
+        return {}
+    ordered = sorted(float(v) for v in values)
+
+    def pct(q: float) -> float:
+        idx = min(len(ordered) - 1, max(0, int(round((len(ordered) - 1) * q))))
+        return ordered[idx]
+
+    return {
+        "mean": float(sum(ordered) / len(ordered)),
+        "p50": pct(0.50),
+        "p95": pct(0.95),
+    }
+
+
+def _flatten_descriptor_summary(summary: dict) -> dict[str, int]:
+    flattened: dict[str, int] = {}
+    fusion_candidate_starts = 0
+    totals = {
+        "matmul_fp8_forward_eligible_ops": 0,
+        "matmul_fp8_backward_eligible_ops": 0,
+        "matmul_fp4_forward_eligible_ops": 0,
+        "matmul_fp4_backward_eligible_ops": 0,
+        "moe_fp8_grouped_eligible_ops": 0,
+        "moe_fp4_grouped_eligible_ops": 0,
+        "moe_fp8_backward_implemented_ops": 0,
+        "moe_nvfp4_no_fallback_ops": 0,
+        "lora_slices": 0,
+        "lora_schema_slot_slices": 0,
+        "lora_schema_target_slices": 0,
+        "grouped_lora_schema_slot_slices": 0,
+        "grouped_lora_schema_target_slices": 0,
+        "forward_hook_points": 0,
+        "forward_hook_schema_slot_points": 0,
+        "forward_hook_schema_target_points": 0,
+    }
+    for graph_name in ("forward", "backward"):
+        graph = summary.get(graph_name)
+        if not isinstance(graph, dict):
+            continue
+        for key, value in graph.items():
+            if isinstance(value, int):
+                flattened[f"{graph_name}_{key}"] = int(value)
+                if key == "fusion_candidate_starts":
+                    fusion_candidate_starts += int(value)
+                if key in totals:
+                    totals[key] += int(value)
+    flattened["fusion_candidate_starts"] = fusion_candidate_starts
+    flattened.update(totals)
+    return flattened
+
+
+def _flatten_arena_summary(summary: dict) -> dict[str, int]:
+    flattened: dict[str, int] = {}
+    for key, value in summary.items():
+        if key in {"forward", "backward"} or isinstance(value, list):
+            continue
+        if isinstance(value, bool):
+            flattened[key] = int(value)
+        elif isinstance(value, int):
+            flattened[key] = int(value)
+    for graph_name in ("forward", "backward"):
+        graph = summary.get(graph_name)
+        if not isinstance(graph, dict):
+            continue
+        for key, value in graph.items():
+            if key == "regions" and isinstance(value, list):
+                for region in value:
+                    if not isinstance(region, dict):
+                        continue
+                    region_name = str(region.get("region") or "unknown").lower()
+                    for metric in ("tid_count", "tid_bytes"):
+                        metric_value = region.get(metric)
+                        if isinstance(metric_value, int):
+                            flattened[f"{graph_name}_region_{region_name}_{metric}"] = int(metric_value)
+                continue
+            if isinstance(value, int):
+                flattened[f"{graph_name}_{key}"] = int(value)
+    return flattened
+
+
+def _summarize_block_schemas(ir_json: str | None) -> dict[str, int]:
+    if not ir_json:
+        return {}
+    try:
+        root = json.loads(ir_json)
+    except Exception:
+        return {"block_schema_summary_error": 1}
+
+    summary = {
+        "block_schema_records": 0,
+        "block_schema_expected_layers": 0,
+        "block_schema_missing_layers": 0,
+        "block_schema_dense_layers": 0,
+        "block_schema_moe_layers": 0,
+        "block_schema_mamba_layers": 0,
+        "block_schema_linear_mixer_layers": 0,
+        "block_schema_routing_layers": 0,
+        "block_schema_ep_layers": 0,
+        "block_schema_slots": 0,
+        "block_schema_param_slots": 0,
+        "block_schema_activation_slots": 0,
+        "block_schema_op_lifetime_slots": 0,
+        "block_schema_layer_lifetime_slots": 0,
+        "block_schema_block_lifetime_slots": 0,
+        "block_schema_model_lifetime_slots": 0,
+        "block_schema_persistent_lifetime_slots": 0,
+        "block_schema_shape_slots": 0,
+        "block_schema_activation_shape_slots": 0,
+        "block_schema_save_for_backward_slots": 0,
+        "block_schema_grouped_slots": 0,
+        "block_schema_expert_parallel_slots": 0,
+        "block_schema_expert_parallel_param_slots": 0,
+        "block_schema_auto_resident_slots": 0,
+        "block_schema_cpu_stream_slots": 0,
+        "hook_after_produce_targets": 0,
+        "hook_before_consume_targets": 0,
+        "hook_after_consume_targets": 0,
+        "hook_after_communication_targets": 0,
+        "hook_after_all_to_all_targets": 0,
+        "hook_after_all_reduce_targets": 0,
+        "hook_after_reduce_scatter_targets": 0,
+        "schema_hook_dispatch_enabled": _schema_hook_dispatch_enabled(),
+    }
+    for module in root.get("modules", []):
+        forward = module.get("forward") or {}
+        records = ((forward.get("metadata") or {}).get("block_schemas")) or []
+        if not isinstance(records, list):
+            continue
+        config = module.get("config") or {}
+        n_layers = int(config.get("n_layers") or 0)
+        if n_layers > 0:
+            summary["block_schema_expected_layers"] += n_layers
+            layers = {int(record.get("layer")) for record in records if isinstance(record, dict) and "layer" in record}
+            summary["block_schema_missing_layers"] += max(n_layers - len(layers), 0)
+
+        summary["block_schema_records"] += len(records)
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            schema = record.get("schema") or {}
+            attrs = schema.get("attrs") or {}
+            family = str(attrs.get("block_family") or "").lower()
+            if "moe" in family:
+                summary["block_schema_moe_layers"] += 1
+            elif "mamba" in family:
+                summary["block_schema_mamba_layers"] += 1
+            elif "linear" in family:
+                summary["block_schema_linear_mixer_layers"] += 1
+            elif family:
+                summary["block_schema_dense_layers"] += 1
+
+            routing = schema.get("routing")
+            if isinstance(routing, dict) and routing.get("kind") not in (None, "", "none"):
+                summary["block_schema_routing_layers"] += 1
+            if isinstance(schema.get("ep_topology"), dict):
+                summary["block_schema_ep_layers"] += 1
+
+            for slot in schema.get("slots") or []:
+                if not isinstance(slot, dict):
+                    continue
+                summary["block_schema_slots"] += 1
+                kind = slot.get("kind") or "activation"
+                if kind == "param":
+                    summary["block_schema_param_slots"] += 1
+                else:
+                    summary["block_schema_activation_slots"] += 1
+                lifetime = slot.get("lifetime") or "layer"
+                if lifetime == "op":
+                    summary["block_schema_op_lifetime_slots"] += 1
+                elif lifetime == "block":
+                    summary["block_schema_block_lifetime_slots"] += 1
+                elif lifetime == "model":
+                    summary["block_schema_model_lifetime_slots"] += 1
+                elif lifetime == "persistent":
+                    summary["block_schema_persistent_lifetime_slots"] += 1
+                else:
+                    summary["block_schema_layer_lifetime_slots"] += 1
+                shape = slot.get("shape") or []
+                if isinstance(shape, list) and shape:
+                    summary["block_schema_shape_slots"] += 1
+                    if kind != "param":
+                        summary["block_schema_activation_shape_slots"] += 1
+                if slot.get("save_for_backward"):
+                    summary["block_schema_save_for_backward_slots"] += 1
+                if slot.get("grouped"):
+                    summary["block_schema_grouped_slots"] += 1
+                distribution = slot.get("distribution") or {}
+                distribution_kind = distribution.get("kind")
+                if distribution_kind == "expert_parallel":
+                    summary["block_schema_expert_parallel_slots"] += 1
+                    if kind == "param":
+                        summary["block_schema_expert_parallel_param_slots"] += 1
+                residency = slot.get("residency")
+                if residency == "auto":
+                    summary["block_schema_auto_resident_slots"] += 1
+                elif residency == "cpu_pinned_stream":
+                    summary["block_schema_cpu_stream_slots"] += 1
+                if kind != "param" and slot.get("name") in {
+                    "qkv",
+                    "att_out",
+                    "mlp_up",
+                    "mlp_down",
+                    "router_logits",
+                    "expert_gate_up",
+                    "expert_up",
+                    "expert_down",
+                }:
+                    summary["hook_after_produce_targets"] += 1
+                streaming_hint = slot.get("streaming_hint") or {}
+                has_prefetch = isinstance(streaming_hint, dict) and streaming_hint.get("prefetch_distance") is not None
+                if kind == "param" and (
+                    has_prefetch or residency in {"auto", "cpu_pinned_stream", "cpu_pageable", "nvme_offload"}
+                ):
+                    summary["hook_before_consume_targets"] += 1
+                    summary["hook_after_consume_targets"] += 1
+                if kind != "param" and distribution_kind == "expert_parallel":
+                    summary["hook_after_communication_targets"] += 1
+                    summary["hook_after_all_to_all_targets"] += 1
+                if kind == "param" and distribution_kind in {None, "", "replicated", "router_replicated"}:
+                    summary["hook_after_all_reduce_targets"] += 1
+                if kind == "param" and distribution_kind in {"sharded_dim", "expert_parallel"}:
+                    summary["hook_after_reduce_scatter_targets"] += 1
+    return summary
+
+
 class SurogateTrainerWrapper:
     def __init__(self, config: SFTConfig, train_files: list[str], eval_files: list[str] | None = None):
         self.config = config
         self._block_types = None
         self._train_vision = bool(config.train_vision and config.is_multimodal)
+        self._regression_artifact_path = os.environ.get("SUROGATE_REGRESSION_ARTIFACT")
+        self._regression_curve: list[dict[str, float]] = []
+        self._regression_step_times_ms: list[float] = []
+        self._regression_cuda_peak_memory_bytes: int | None = None
+        self._block_schema_summary: dict[str, int] = {}
 
         # Multimodal on-the-fly training intentionally runs in eager mode.
         # Ensure runtime CUDA graph capture is disabled before constructing
@@ -55,6 +295,7 @@ class SurogateTrainerWrapper:
             dsl_extra["ep_size"] = config.ep_size
         ir_json = build_dsl_ir_for_model(config.model_dir, extra_config=dsl_extra or None)
         config.runtime_config.dsl_ir_json = ir_json
+        self._block_schema_summary = _summarize_block_schemas(ir_json)
 
         # Compile JIT kernels (e.g. gated delta rule Triton kernels)
         from surogate.kernels.jit_compile import compile_jit_kernels
@@ -416,6 +657,8 @@ class SurogateTrainerWrapper:
             else:
                 self.run_training_loop(train_logger)
 
+            self._write_regression_artifact()
+
             # Save final model
             if self.config.lora:
                 # Export LoRA adapter in PEFT-compatible format
@@ -460,6 +703,82 @@ class SurogateTrainerWrapper:
                 generate_training_plot(self.config.log_file, Path(self.config.output_dir) / "training_plot.png")
 
             logger.info(f"\nTraining complete! Logs saved to {self.config.log_file}")
+
+    def _record_regression_step(self, metrics: StepMetrics) -> None:
+        if not self._regression_artifact_path:
+            return
+        self._regression_curve.append(
+            {
+                "step": float(metrics.step + 1),
+                "loss": float(metrics.loss),
+                "grad_norm": float(metrics.grad_norm),
+                "lr": float(metrics.lr),
+            }
+        )
+        self._regression_step_times_ms.append(float(metrics.elapsed_ms))
+        try:
+            for info in self.trainer.get_gpu_info():
+                used = (
+                    int(info.mem_reserved) if int(info.mem_reserved) > 0 else int(info.mem_total) - int(info.mem_free)
+                )
+                if used <= 0:
+                    continue
+                if self._regression_cuda_peak_memory_bytes is None:
+                    self._regression_cuda_peak_memory_bytes = used
+                else:
+                    self._regression_cuda_peak_memory_bytes = max(self._regression_cuda_peak_memory_bytes, used)
+        except Exception:
+            return
+
+    def _write_regression_artifact(self) -> None:
+        if not self._regression_artifact_path:
+            return
+        descriptor_summary: dict[str, int] = {}
+        if hasattr(self.trainer, "get_debug_descriptor_summary"):
+            try:
+                descriptor_summary = _flatten_descriptor_summary(self.trainer.get_debug_descriptor_summary())
+            except Exception as exc:
+                descriptor_summary = {"descriptor_summary_error": 1}
+                logger.warning(f"Failed to collect regression descriptor summary: {exc}")
+        buffer_plan_summary: dict[str, int] = {}
+        if hasattr(self.trainer, "get_debug_buffer_plan_summary"):
+            try:
+                buffer_plan_summary = dict(self.trainer.get_debug_buffer_plan_summary())
+            except Exception as exc:
+                buffer_plan_summary = {"buffer_plan_summary_error": 1}
+                logger.warning(f"Failed to collect regression buffer-plan summary: {exc}")
+        arena_summary: dict[str, int] = {}
+        if hasattr(self.trainer, "get_debug_arena_summary"):
+            try:
+                arena_summary = _flatten_arena_summary(self.trainer.get_debug_arena_summary())
+            except Exception as exc:
+                arena_summary = {"arena_summary_error": 1}
+                logger.warning(f"Failed to collect regression arena summary: {exc}")
+        fusion_preview: list[dict] = []
+        if hasattr(self.trainer, "get_debug_fusion_preview"):
+            try:
+                fusion_preview = [dict(candidate) for candidate in self.trainer.get_debug_fusion_preview()]
+            except Exception as exc:
+                fusion_preview = [{"error": "fusion_preview_error"}]
+                logger.warning(f"Failed to collect regression fusion preview: {exc}")
+
+        path = Path(self._regression_artifact_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema_version": 1,
+            "activation_snapshots": {},
+            "gradient_snapshots": {},
+            "convergence_curve": self._regression_curve,
+            "step_time_ms": _percentile_summary(self._regression_step_times_ms),
+            "cuda_peak_memory_bytes": self._regression_cuda_peak_memory_bytes,
+            "nccl": {},
+            "descriptor_summary": descriptor_summary,
+            "block_schema_summary": self._block_schema_summary,
+            "buffer_plan_summary": buffer_plan_summary,
+            "arena_summary": arena_summary,
+            "fusion_preview": fusion_preview,
+        }
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
     def run_training_loop_mm(self, train_logger: _surogate.TrainingRunLogger):
         use_full_step_graphs = False
@@ -617,6 +936,7 @@ class SurogateTrainerWrapper:
             )
             moe_monitor.step(metrics.moe, step)
             advisor.step(metrics, step)
+            self._record_regression_step(metrics)
 
             if early_stopping is not None and early_stopping.check_step(metrics.loss, phase, step):
                 break
@@ -635,6 +955,12 @@ class SurogateTrainerWrapper:
                         metrics.moe.z_loss,
                         metrics.moe.load_imbalance,
                         metrics.moe.expert_utilization,
+                        metrics.moe.active_experts,
+                        metrics.moe.max_expert_fraction,
+                        metrics.moe.min_active_expert_fraction,
+                        metrics.moe.load_cv,
+                        metrics.moe.router_entropy,
+                        metrics.moe.router_confidence,
                     )
                 else:
                     train_logger.log_step(
@@ -923,6 +1249,7 @@ class SurogateTrainerWrapper:
             )
             moe_monitor.step(metrics.moe, step)
             advisor.step(metrics, step)
+            self._record_regression_step(metrics)
 
             if early_stopping is not None and early_stopping.check_step(metrics.loss, phase, step):
                 break
@@ -942,6 +1269,12 @@ class SurogateTrainerWrapper:
                         metrics.moe.z_loss,
                         metrics.moe.load_imbalance,
                         metrics.moe.expert_utilization,
+                        metrics.moe.active_experts,
+                        metrics.moe.max_expert_fraction,
+                        metrics.moe.min_active_expert_fraction,
+                        metrics.moe.load_cv,
+                        metrics.moe.router_entropy,
+                        metrics.moe.router_confidence,
                     )
                 else:
                     train_logger.log_step(

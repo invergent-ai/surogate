@@ -1,0 +1,23 @@
+{
+  "artifacts": {},
+  "case": {
+    "config": "examples/sft/gemma4/gemma4-e2b-lora-fp8.yaml",
+    "distribution": "single_gpu",
+    "env_model_path": "GEMMA4_MODEL_PATH",
+    "model": "gemma4",
+    "op_kind": "dense",
+    "recipe": "fp8",
+    "storage": "gpu",
+    "supported": true
+  },
+  "command": [
+    "surogate",
+    "sft",
+    "examples/sft/gemma4/gemma4-e2b-lora-fp8.yaml"
+  ],
+  "duration_s": 0.0,
+  "metrics": {},
+  "reason": "not executed; pass --run to launch GPU workload",
+  "started_at": 0.0,
+  "status": "skipped"
+}

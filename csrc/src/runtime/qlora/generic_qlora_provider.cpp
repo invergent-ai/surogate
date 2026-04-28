@@ -5,6 +5,8 @@
 
 #include "runtime/qlora/generic_qlora_provider.h"
 
+#include <cctype>
+#include <cstdlib>
 #include <stdexcept>
 
 #include <fmt/format.h>
@@ -38,6 +40,16 @@ int parse_layer_index(std::string_view name) {
     } catch (...) {
         return -1;
     }
+}
+
+bool env_flag_enabled(const char* name) {
+    const char* raw = std::getenv(name);
+    if (!raw) return false;
+    std::string value(raw);
+    for (char& ch : value) {
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+    return value == "1" || value == "true" || value == "yes" || value == "on";
 }
 
 }  // anonymous namespace
@@ -237,6 +249,12 @@ const qlora::QuantizedTensor* GenericQLoRAProvider::try_get_quantized(std::strin
     return mWeightMgr->get_quantized(std::string(name));
 }
 
+const qlora::QuantizedTensor* GenericQLoRAProvider::ensure_quantized_resident(std::string_view name,
+                                                                              cudaStream_t stream) {
+    if (!mWeightMgr) return nullptr;
+    return mWeightMgr->ensure_quantized_resident(std::string(name), stream);
+}
+
 qlora::IQuantizer* GenericQLoRAProvider::get_quantizer() const {
     if (!mWeightMgr) return nullptr;
     return mWeightMgr->quantizer();
@@ -250,6 +268,10 @@ void GenericQLoRAProvider::auto_tune_offloading() {
     if (!mWeightMgr) return;
     auto* om = mWeightMgr->offload_manager();
     if (!om || om->num_groups() == 0 || om->max_resident_groups() == 0) return;
+
+    if (env_flag_enabled("SUROGATE_QLORA_OFFLOAD_AUTOTUNE_DISABLE")) {
+        return;
+    }
 
     // If called before the first training step, defer to after step 0
     // when all lazy runtime allocations are settled.
@@ -279,7 +301,7 @@ void GenericQLoRAProvider::auto_tune_offloading() {
     new_max = std::max(2, std::min(new_max, num_grp));
 
     fprintf(stderr,
-            "[QLoRA] Offload auto-tune: gpu_free=%.1f GB, reserve=%.1f GB, "
+            "Offload auto-tune: gpu_free=%.1f GB, reserve=%.1f GB, "
             "max_group=%.1f MB, %d groups -> max_resident: %d -> %d%s\n",
             static_cast<double>(gpu_free) / (1024.0 * 1024.0 * 1024.0),
             static_cast<double>(reserve) / (1024.0 * 1024.0 * 1024.0),

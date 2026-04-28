@@ -94,6 +94,14 @@ public:
         return nullptr;
     }
 
+    /// Ensure quantized storage for a parameter is device-resident without
+    /// dequantizing it to BF16. Providers with CPU/GPU offload can use this for
+    /// native quantized kernels that do not need full-precision weights.
+    virtual const qlora::QuantizedTensor* ensure_quantized_resident(std::string_view name, cudaStream_t stream) {
+        (void)stream;
+        return try_get_quantized(name);
+    }
+
     /// Get the quantizer used by this provider (for remote dequantization).
     /// Returns nullptr if no quantizer is available.
     virtual qlora::IQuantizer* get_quantizer() const {

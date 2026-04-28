@@ -10,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -21,6 +22,8 @@
 namespace dsl {
 
 class DslParamStore;
+class HookRegistry;
+enum class HookEventKind;
 struct CompiledGraph;
 struct PhaseArenas;
 
@@ -53,6 +56,7 @@ public:
 
     /// Configure multi-GPU gradient reduction
     void configure(const DslGradStoreConfig& config);
+    void set_schema_hook_registry(const HookRegistry* registry, std::vector<std::string> schema_ids_by_layer);
 
     void start_micro_step(cudaStream_t stream, int micro_step, int total_steps);
     void end_micro_step(cudaStream_t stream, NCCLCommunicator& comm);
@@ -131,6 +135,7 @@ public:
 
     /// Async D2H copy layer gradients to CPU (call at layer_end in backward).
     void offload_layer_grads(int layer_idx, cudaStream_t compute_stream, cudaStream_t copy_stream);
+    void accumulate_layer_to_sharded(int layer_idx, cudaStream_t stream);
 
     /// Per-layer NCCL all-reduce (multi-GPU). Call at layer_end BEFORE offload.
     void reduce_layer_grads(int layer_idx, cudaStream_t stream, NCCLCommunicator& comm);
@@ -186,6 +191,7 @@ private:
     void destroy_layer_events() noexcept;
     void allocate_sharded_grads();
     void accumulate_to_sharded(int layer_idx, cudaStream_t stream);
+    int dispatch_schema_layer_hooks(HookEventKind event, int layer_idx, cudaStream_t stream, void* payload = nullptr);
 
     std::shared_ptr<TensorAllocator> mAllocator;
     std::unordered_map<std::string, Tensor> mGrads;         ///< Full gradients (always on device for NCCL)
@@ -207,6 +213,9 @@ private:
     std::vector<std::vector<std::string>> mLayerGradNames;  ///< Gradient names per layer
     std::vector<cudaEvent_t> mLayerReduceEvents;            ///< One event per layer
     bool mHasLayerGrads = false;  ///< True if we have any layer gradients (false for LoRA-only)
+    const HookRegistry* mSchemaHookRegistry = nullptr;
+    std::vector<std::string> mHookSchemaIdsByLayer;
+    bool mSchemaHookDispatchEnabled = false;
 
     // Bulk gradient zeroing (single kernel launch instead of per-param memsets)
     Tensor mZeroPtrs;    ///< Device array of gradient data pointers (uint64_t)

@@ -271,16 +271,89 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
                                                       static_cast<long>(B),
                                                       static_cast<long>(T),
                                                       initial_act_dtype,
-                                                      /*grad_dtype=*/initial_act_dtype);
+                                                      /*grad_dtype=*/initial_act_dtype,
+                                                      &mBlockSchemaPlanRecords);
     long required_size = required_stack_bytes(initial_plan, /*bwd_graph=*/nullptr, mModelConfig, mOptions);
 
     if (options.DebugMemoryBreakdown && comm.rank() == 0) {
         size_t free_mem, total_mem;
         cudaMemGetInfo(&free_mem, &total_mem);
-        std::cerr << "[DEBUG-STACK] plan_peak=" << initial_plan.plan_stack_peak_bytes() / (1024 * 1024) << " MiB"
-                  << ", initial_required=" << required_size / (1024 * 1024) << " MiB"
-                  << ", GPU used=" << (total_mem - free_mem) / (1024 * 1024) << " MiB"
-                  << ", free=" << free_mem / (1024 * 1024) << " MiB" << std::endl;
+        std::cerr
+            << "[DEBUG-STACK] plan_peak=" << initial_plan.plan_stack_peak_bytes() / (1024 * 1024) << " MiB"
+            << ", initial_required=" << required_size / (1024 * 1024) << " MiB"
+            << ", block_schema_records=" << initial_plan.schema_record_count
+            << ", block_schema_routing_layers=" << initial_plan.schema_routing_layers
+            << ", block_schema_ep_layers=" << initial_plan.schema_ep_layers
+            << ", block_schema_dense_layers=" << initial_plan.schema_dense_layers
+            << ", block_schema_moe_layers=" << initial_plan.schema_moe_layers
+            << ", block_schema_mamba_layers=" << initial_plan.schema_mamba_layers
+            << ", block_schema_linear_mixer_layers=" << initial_plan.schema_linear_mixer_layers
+            << ", block_schema_slots=" << initial_plan.schema_slot_count
+            << ", block_schema_op_lifetime_slots=" << initial_plan.schema_op_lifetime_slots
+            << ", block_schema_layer_lifetime_slots=" << initial_plan.schema_layer_lifetime_slots
+            << ", block_schema_block_lifetime_slots=" << initial_plan.schema_block_lifetime_slots
+            << ", block_schema_model_lifetime_slots=" << initial_plan.schema_model_lifetime_slots
+            << ", block_schema_persistent_lifetime_slots=" << initial_plan.schema_persistent_lifetime_slots
+            << ", block_schema_sharded_dim_slots=" << initial_plan.schema_sharded_dim_slots
+            << ", block_schema_router_replicated_slots=" << initial_plan.schema_router_replicated_slots
+            << ", block_schema_expert_parallel_slots=" << initial_plan.schema_expert_parallel_slots
+            << ", block_schema_streaming_slots=" << initial_plan.schema_streaming_slots
+            << ", block_schema_auto_resident_slots=" << initial_plan.schema_auto_resident_slots
+            << ", block_schema_cpu_stream_slots=" << initial_plan.schema_cpu_pinned_stream_slots
+            << ", block_schema_nvme_offload_slots=" << initial_plan.schema_nvme_offload_slots
+            << ", block_schema_registry_registered_activation_slots="
+            << initial_plan.schema_registry_registered_activation_slots
+            << ", block_schema_registry_missing_activation_slots="
+            << initial_plan.schema_registry_missing_activation_slots
+            << ", block_schema_registry_save_for_backward_activation_slots="
+            << initial_plan.schema_registry_save_for_backward_activation_slots
+            << ", block_schema_registry_save_for_backward_mismatch_slots="
+            << initial_plan.schema_registry_save_for_backward_mismatch_slots
+            << ", block_schema_resolved_activation_shape_slots=" << initial_plan.schema_resolved_activation_shape_slots
+            << ", block_schema_unresolved_activation_shape_slots="
+            << initial_plan.schema_unresolved_activation_shape_slots
+            << ", block_schema_dynamic_activation_shape_slots=" << initial_plan.schema_dynamic_activation_shape_slots
+            << ", block_schema_resolved_activation_shape_bytes=" << initial_plan.schema_resolved_activation_shape_bytes
+            << ", block_schema_save_for_backward_activation_slots="
+            << initial_plan.schema_save_for_backward_activation_slots
+            << ", block_schema_frame_activation_slots=" << initial_plan.schema_frame_activation_slots
+            << ", block_schema_save_for_backward_activation_bytes="
+            << initial_plan.schema_save_for_backward_activation_bytes
+            << ", block_schema_frame_activation_bytes=" << initial_plan.schema_frame_activation_bytes
+            << ", block_schema_allocation_authoritative=" << (initial_plan.schema_allocation_authoritative ? 1 : 0)
+            << ", block_schema_allocation_authoritative_layers=" << initial_plan.schema_allocation_authoritative_layers
+            << ", block_schema_allocation_unresolved_slots=" << initial_plan.schema_allocation_unresolved_slots
+            << ", block_schema_authoritative_frame_arena_bytes=" << initial_plan.schema_authoritative_frame_arena_bytes
+            << ", block_schema_authoritative_save_for_backward_arena_bytes="
+            << initial_plan.schema_authoritative_save_for_backward_arena_bytes
+            << ", block_schema_authoritative_persistent_activation_bytes="
+            << initial_plan.schema_authoritative_persistent_activation_bytes
+            << ", block_schema_authoritative_host_stream_activation_bytes="
+            << initial_plan.schema_authoritative_host_stream_activation_bytes
+            << ", block_schema_authoritative_total_activation_arena_bytes="
+            << initial_plan.schema_authoritative_total_activation_arena_bytes
+            << ", block_schema_max_layer_activation_shape_bytes="
+            << initial_plan.schema_max_layer_activation_shape_bytes
+            << ", block_schema_baseline_max_activation_shape_bytes="
+            << initial_plan.schema_baseline_max_activation_shape_bytes
+            << ", block_schema_activation_shape_savings_bytes=" << initial_plan.schema_activation_shape_savings_bytes
+            << ", block_schema_resolved_param_shape_slots=" << initial_plan.schema_resolved_param_shape_slots
+            << ", block_schema_unresolved_param_shape_slots=" << initial_plan.schema_unresolved_param_shape_slots
+            << ", block_schema_expert_parallel_param_slots=" << initial_plan.schema_expert_parallel_param_slots
+            << ", block_schema_resolved_param_shape_bytes=" << initial_plan.schema_resolved_param_shape_bytes
+            << ", block_schema_resolved_param_shape_local_bytes="
+            << initial_plan.schema_resolved_param_shape_local_bytes
+            << ", block_schema_expert_parallel_param_shape_bytes="
+            << initial_plan.schema_expert_parallel_param_shape_bytes
+            << ", block_schema_expert_parallel_param_shape_local_bytes="
+            << initial_plan.schema_expert_parallel_param_shape_local_bytes
+            << ", block_schema_expert_parallel_param_shape_savings_bytes="
+            << initial_plan.schema_expert_parallel_param_shape_savings_bytes
+            << ", block_schema_scoring_bias_layers=" << initial_plan.schema_scoring_bias_routing_layers
+            << ", block_schema_shared_expert_layers=" << initial_plan.schema_shared_expert_routing_layers
+            << ", block_schema_weight_transfer_layers=" << initial_plan.schema_weight_transfer_layers
+            << ", GPU used=" << (total_mem - free_mem) / (1024 * 1024) << " MiB"
+            << ", free=" << free_mem / (1024 * 1024) << " MiB" << std::endl;
     }
 
     mRunState = std::make_unique<DslRunState>(mModelConfig,
@@ -292,7 +365,8 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
                                               lora_enabled(),
                                               mQLoRAConfig.is_prequantized(),
                                               static_cast<std::size_t>(required_size),
-                                              layout);
+                                              layout,
+                                              &mBlockSchemaPlanRecords);
     mRunState->WorldSize = comm.world_size();
     if (mParams) {
         mParams->set_default_stream(mRunState->MainStream);
@@ -339,6 +413,9 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
     exec_opts.debug_print_backward = false;
     mExecutor =
         std::make_unique<GraphExecutor>(*mModule, *mRunState, *mParams, *mGrads, mModelConfig, mOptions, exec_opts);
+    if (auto* graph_exec = dynamic_cast<GraphExecutor*>(mExecutor.get())) {
+        graph_exec->set_schema_hook_registry(&mHookRegistry);
+    }
     if (!mRngState.empty()) {
         mExecutor->set_rng_state(mRngState);
     }
@@ -391,7 +468,8 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
     // Enable MoE routing stats tracking
     if (mModelConfig.NumExperts > 0) {
         float aux_coef = mModelConfig.moe_config.has_value() ? mModelConfig.moe_config->router_aux_loss_coef : 0.01f;
-        mRunState->set_moe_config(mModelConfig.NumExperts, aux_coef);
+        float z_coef = mModelConfig.moe_config.has_value() ? mModelConfig.moe_config->router_z_loss_coef : 0.001f;
+        mRunState->set_moe_config(mModelConfig.NumExperts, aux_coef, z_coef);
     }
 
     if (lora_enabled()) {

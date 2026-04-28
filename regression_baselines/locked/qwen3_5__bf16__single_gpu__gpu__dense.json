@@ -1,0 +1,23 @@
+{
+  "artifacts": {},
+  "case": {
+    "config": "examples/sft/qwen35/qwen35-text-lora-bf16-1step.yaml",
+    "distribution": "single_gpu",
+    "env_model_path": "QWEN3_5_MODEL_PATH",
+    "model": "qwen3_5",
+    "op_kind": "dense",
+    "recipe": "bf16",
+    "storage": "gpu",
+    "supported": true
+  },
+  "command": [
+    "surogate",
+    "sft",
+    "examples/sft/qwen35/qwen35-text-lora-bf16-1step.yaml"
+  ],
+  "duration_s": 0.0,
+  "metrics": {},
+  "reason": "not executed; pass --run to launch GPU workload",
+  "started_at": 0.0,
+  "status": "skipped"
+}

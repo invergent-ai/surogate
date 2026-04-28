@@ -495,6 +495,393 @@ GoldenCase load_case(const fs::path& path) {
     return gc;
 }
 
+fs::path find_goldens_dir();
+
+TEST_CASE("dsl fusion rewrites: matmul followed by bias_add compiles to matmul_bias", "[dsl][fusion_rule]") {
+    const fs::path goldens_dir = find_goldens_dir();
+    const fs::path golden_path = goldens_dir / "matmul_bias_small_case_1.json";
+    if (!fs::exists(golden_path)) {
+        SKIP("Golden file not found: " + golden_path.string());
+    }
+
+    const GoldenCase gc = load_case(golden_path);
+    const auto& a = gc.inputs.at("a");
+    const auto& b = gc.inputs.at("b");
+    const auto& bias = gc.inputs.at("bias");
+    const auto& out = gc.outputs.at("out");
+
+    PretrainedConfig cfg;
+    cfg.DType = ETensorDType::FP32;
+    cfg.NumLayers = 1;
+    cfg.NumQueryHeads = 1;
+    cfg.NumKeyValHeads = 1;
+    cfg.HiddenSize = static_cast<int>(out.shape.back());
+    cfg.IntermediateSize = static_cast<int>(b.shape.back());
+    cfg.VocabSize = 1;
+    cfg.MaxPositionEmbeddings = 1;
+    cfg.RmsNormEps = 1e-5f;
+    modules::ModelConfig model_cfg = modules::ModelConfig::from_pretrained_config(cfg);
+
+    RuntimeOptions options;
+    options.UseCudaGraphs = false;
+    options.Recompute = RecomputeLevel::None;
+    options.ModelType = cfg.DType;
+    options.MatmulType = cfg.DType;
+    options.GradientType = cfg.DType;
+
+    dsl::Module module;
+    module.name = "fusion_rewrite";
+    module.kind = "model";
+
+    dsl::Graph graph;
+    graph.name = "fusion_rewrite";
+
+    auto add_param = [&](const std::string& name, const GoldenTensor& tensor) {
+        dsl::TensorInfo info;
+        info.shape = to_dims(tensor.shape);
+        info.dtype = device_dtype_for(tensor.dtype);
+        info.is_param = true;
+        graph.params.emplace(name, std::move(info));
+    };
+    add_param("a", a);
+    add_param("b", b);
+    add_param("bias", bias);
+
+    dsl::TensorInfo out_info;
+    out_info.shape = to_dims(out.shape);
+    out_info.dtype = device_dtype_for(out.dtype);
+    out_info.is_output = true;
+    graph.outputs.emplace("out", std::move(out_info));
+
+    dsl::Operation matmul;
+    matmul.id = "rewrite_matmul";
+    matmul.name = "matmul";
+    matmul.kernel_type = "matmul";
+    matmul.inputs = {"a", "b"};
+    matmul.outputs = {"tmp"};
+    matmul.attrs = gc.attrs;
+    graph.operations.push_back(matmul);
+
+    dsl::Operation bias_add;
+    bias_add.id = "rewrite_bias";
+    bias_add.name = "bias_add";
+    bias_add.kernel_type = "bias_add";
+    bias_add.inputs = {"tmp", "bias"};
+    bias_add.outputs = {"out"};
+    graph.operations.push_back(bias_add);
+
+    module.forward = graph;
+    auto allocator = std::make_shared<TensorAllocator>();
+    dsl::DslParamStore params(module, graph, options, cfg, allocator, nullptr, nullptr, false);
+    dsl::DslGradStore grads(params, allocator, false, EAllocationType::ON_DEVICE, 1, false);
+
+    dsl::GraphCompiler compiler(module, model_cfg, options, params, grads);
+    auto compiled = compiler.compile(graph, /*B=*/1, /*T=*/1);
+
+    REQUIRE(compiled.fusion_rewrite_preview.size() == 1);
+    REQUIRE(compiled.fusion_rewrite_preview[0].rule_name == "matmul_bias");
+    REQUIRE(compiled.fusion_rewrite_preview[0].applied);
+    REQUIRE(compiled.fusion_rewrite_preview[0].reason == "applied");
+    REQUIRE(compiled.ops.size() == 1);
+    REQUIRE(compiled.ops[0].type == dsl::CompiledOpType::MatmulBias);
+    REQUIRE(compiled.ops[0].inputs.size() == 3);
+    REQUIRE(compiled.ops[0].inputs[0].name == "a");
+    REQUIRE(compiled.ops[0].inputs[1].name == "b");
+    REQUIRE(compiled.ops[0].inputs[2].name == "bias");
+    REQUIRE(compiled.ops[0].outputs.size() == 1);
+    REQUIRE(compiled.ops[0].outputs[0].name == "out");
+}
+
+TEST_CASE("dsl fusion rewrites: production rules compile to fused descriptors", "[dsl][fusion_rule]") {
+    auto make_info = [](std::initializer_list<long> shape, ETensorDType dtype, bool is_output = false) {
+        dsl::TensorInfo info;
+        info.shape = to_dims(std::vector<long>(shape.begin(), shape.end()));
+        info.dtype = dtype;
+        info.is_param = !is_output;
+        info.is_input = false;
+        info.is_output = is_output;
+        return info;
+    };
+
+    auto compile = [](dsl::Graph graph, const PretrainedConfig& cfg, bool is_backward = false) {
+        dsl::Module module;
+        module.name = "fusion_rewrite";
+        module.kind = "model";
+        module.forward = graph;
+
+        RuntimeOptions options;
+        options.UseCudaGraphs = false;
+        options.Recompute = RecomputeLevel::None;
+        options.ModelType = cfg.DType;
+        options.MatmulType = cfg.DType;
+        options.GradientType = cfg.DType;
+
+        auto allocator = std::make_shared<TensorAllocator>();
+        modules::ModelConfig model_cfg = modules::ModelConfig::from_pretrained_config(cfg);
+        dsl::DslParamStore params(module, graph, options, cfg, allocator, nullptr, nullptr, false);
+        dsl::DslGradStore grads(params, allocator, false, EAllocationType::ON_DEVICE, 1, false);
+        dsl::GraphCompiler compiler(module, model_cfg, options, params, grads);
+        return compiler.compile(graph, /*B=*/1, /*T=*/1, is_backward);
+    };
+
+    PretrainedConfig cfg;
+    cfg.DType = ETensorDType::FP32;
+    cfg.NumLayers = 1;
+    cfg.NumQueryHeads = 2;
+    cfg.NumKeyValHeads = 1;
+    cfg.HeadDim = 2;
+    cfg.HiddenSize = 4;
+    cfg.IntermediateSize = 4;
+    cfg.VocabSize = 8;
+    cfg.MaxPositionEmbeddings = 4;
+    cfg.RmsNormEps = 1e-5f;
+
+    SECTION("matmul_swiglu") {
+        dsl::Graph graph;
+        graph.name = "matmul_swiglu_rewrite";
+        graph.params.emplace("a", make_info({2, 3}, ETensorDType::FP32));
+        graph.params.emplace("b", make_info({4, 3}, ETensorDType::FP32));
+        graph.outputs.emplace("act", make_info({2, 2}, ETensorDType::FP32, true));
+
+        dsl::Operation matmul;
+        matmul.id = "matmul";
+        matmul.name = "matmul";
+        matmul.kernel_type = "matmul";
+        matmul.inputs = {"a", "b"};
+        matmul.outputs = {"up"};
+        matmul.attrs["transpose"] = dsl::AttrValue("NT");
+        graph.operations.push_back(matmul);
+
+        dsl::Operation swiglu;
+        swiglu.id = "swiglu";
+        swiglu.name = "swiglu";
+        swiglu.kernel_type = "swiglu";
+        swiglu.inputs = {"up"};
+        swiglu.outputs = {"act"};
+        graph.operations.push_back(swiglu);
+
+        auto compiled = compile(graph, cfg);
+        REQUIRE(compiled.ops.size() == 1);
+        REQUIRE(compiled.ops[0].type == dsl::CompiledOpType::MatmulSwiGLU);
+        REQUIRE(compiled.ops[0].outputs[0].name == "act");
+        REQUIRE(compiled.ops[0].outputs[1].name == "up");
+    }
+
+    SECTION("qkv_qknorm_rope") {
+        dsl::Graph graph;
+        graph.name = "qkv_qknorm_rope_rewrite";
+        graph.params.emplace("qkv", make_info({1, 2, 4, 2}, ETensorDType::FP32));
+        graph.params.emplace("q_norm", make_info({2}, ETensorDType::FP32));
+        graph.params.emplace("k_norm", make_info({2}, ETensorDType::FP32));
+        graph.params.emplace("freqs", make_info({2, 2}, ETensorDType::FP32));
+        graph.params.emplace("position_ids", make_info({1, 2}, ETensorDType::INT32));
+        graph.outputs.emplace("qkv_rope", make_info({1, 2, 4, 2}, ETensorDType::FP32, true));
+
+        dsl::Operation qknorm;
+        qknorm.id = "qknorm";
+        qknorm.name = "qkv_qk_norm";
+        qknorm.kernel_type = "qkv_qk_norm";
+        qknorm.inputs = {"qkv", "q_norm", "k_norm"};
+        qknorm.outputs = {"qkv_norm", "q_rstd", "k_rstd"};
+        qknorm.attrs["eps"] = dsl::AttrValue(1e-6);
+        graph.operations.push_back(qknorm);
+
+        dsl::Operation rope;
+        rope.id = "rope";
+        rope.name = "rope";
+        rope.kernel_type = "rope";
+        rope.inputs = {"qkv_norm", "freqs", "position_ids"};
+        rope.outputs = {"qkv_rope"};
+        rope.attrs["rotary_dim"] = dsl::AttrValue(static_cast<std::int64_t>(2));
+        graph.operations.push_back(rope);
+
+        auto compiled = compile(graph, cfg);
+        REQUIRE(compiled.ops.size() == 1);
+        REQUIRE(compiled.ops[0].type == dsl::CompiledOpType::QKVQKNormRoPE);
+        REQUIRE(compiled.ops[0].inputs.size() == 5);
+        REQUIRE(compiled.ops[0].outputs[0].name == "qkv_rope");
+        REQUIRE(compiled.ops[0].outputs[1].name == "q_rstd");
+        REQUIRE(compiled.ops[0].outputs[2].name == "k_rstd");
+    }
+
+    SECTION("residual_rmsnorm") {
+        dsl::Graph graph;
+        graph.name = "residual_rmsnorm_rewrite";
+        graph.params.emplace("residual", make_info({2, 4}, ETensorDType::FP32));
+        graph.params.emplace("x", make_info({2, 4}, ETensorDType::FP32));
+        graph.params.emplace("weight", make_info({4}, ETensorDType::FP32));
+        graph.outputs.emplace("y", make_info({2, 4}, ETensorDType::FP32, true));
+
+        dsl::Operation add;
+        add.id = "add";
+        add.name = "add";
+        add.kernel_type = "add";
+        add.inputs = {"residual", "x"};
+        add.outputs = {"res_out"};
+        graph.operations.push_back(add);
+
+        dsl::Operation rmsnorm;
+        rmsnorm.id = "rmsnorm";
+        rmsnorm.name = "rmsnorm";
+        rmsnorm.kernel_type = "rmsnorm";
+        rmsnorm.inputs = {"res_out", "weight"};
+        rmsnorm.outputs = {"y", "rstd"};
+        rmsnorm.attrs["eps"] = dsl::AttrValue(1e-5);
+        graph.operations.push_back(rmsnorm);
+
+        auto compiled = compile(graph, cfg);
+        REQUIRE(compiled.ops.size() == 1);
+        REQUIRE(compiled.ops[0].type == dsl::CompiledOpType::FusedResidualRMSNorm);
+        REQUIRE(compiled.ops[0].outputs[0].name == "res_out");
+        REQUIRE(compiled.ops[0].outputs[1].name == "y");
+        REQUIRE(compiled.ops[0].outputs[2].name == "rstd");
+    }
+
+    SECTION("lmhead_loss") {
+        dsl::Graph graph;
+        graph.name = "lmhead_loss_rewrite";
+        graph.params.emplace("x", make_info({2, 4}, ETensorDType::FP32));
+        graph.params.emplace("weight", make_info({8, 4}, ETensorDType::FP32));
+        dsl::TensorInfo targets = make_info({2}, ETensorDType::INT32);
+        targets.is_param = false;
+        targets.is_input = true;
+        graph.inputs.emplace("targets", targets);
+        graph.outputs.emplace("loss", make_info({2}, ETensorDType::FP32, true));
+
+        dsl::Operation matmul;
+        matmul.id = "lm_head";
+        matmul.name = "matmul";
+        matmul.kernel_type = "matmul";
+        matmul.inputs = {"x", "weight"};
+        matmul.outputs = {"logits"};
+        matmul.attrs["transpose"] = dsl::AttrValue("NT");
+        graph.operations.push_back(matmul);
+
+        dsl::Operation loss;
+        loss.id = "loss";
+        loss.name = "cross_entropy_loss";
+        loss.kernel_type = "cross_entropy_loss";
+        loss.inputs = {"logits", "targets"};
+        loss.outputs = {"loss"};
+        loss.attrs["compute_accuracy"] = dsl::AttrValue(true);
+        graph.operations.push_back(loss);
+
+        auto compiled = compile(graph, cfg);
+        REQUIRE(compiled.ops.size() == 1);
+        REQUIRE(compiled.ops[0].type == dsl::CompiledOpType::FusedLMHeadLoss);
+        REQUIRE(compiled.ops[0].inputs[0].name == "x");
+        REQUIRE(compiled.ops[0].inputs[1].name == "weight");
+        REQUIRE(compiled.ops[0].inputs[2].name == "targets");
+    }
+
+    SECTION("moe_routing_topk_softmax forward") {
+        dsl::Graph graph;
+        graph.name = "moe_routing_topk_softmax_rewrite";
+        graph.params.emplace("router_logits", make_info({2, 4}, ETensorDType::FP32));
+        graph.intermediates.emplace("router_probs", make_info({2, 4}, ETensorDType::FP32));
+        graph.outputs.emplace("routing_weights", make_info({2, 2}, ETensorDType::FP32, true));
+        graph.outputs.emplace("routing_indices", make_info({2, 2}, ETensorDType::INT32, true));
+
+        dsl::Operation softmax;
+        softmax.id = "router_softmax";
+        softmax.name = "moe_softmax";
+        softmax.kernel_type = "moe_softmax";
+        softmax.inputs = {"router_logits"};
+        softmax.outputs = {"router_probs"};
+        graph.operations.push_back(softmax);
+
+        dsl::Operation topk;
+        topk.id = "router_topk";
+        topk.name = "moe_topk";
+        topk.kernel_type = "moe_topk";
+        topk.inputs = {"router_probs"};
+        topk.outputs = {"routing_weights", "routing_indices"};
+        topk.attrs["top_k"] = dsl::AttrValue(static_cast<std::int64_t>(2));
+        topk.attrs["normalize"] = dsl::AttrValue(false);
+        graph.operations.push_back(topk);
+
+        auto compiled = compile(graph, cfg);
+        REQUIRE(compiled.ops.size() == 1);
+        REQUIRE(compiled.fusion_rewrite_preview.size() == 1);
+        REQUIRE(compiled.fusion_rewrite_preview[0].rule_name == "moe_routing_topk_softmax");
+        REQUIRE(compiled.fusion_rewrite_preview[0].applied);
+        REQUIRE(compiled.ops[0].type == dsl::CompiledOpType::MoETopK);
+        REQUIRE(compiled.ops[0].inputs[0].name == "router_logits");
+        REQUIRE(compiled.ops[0].outputs[0].name == "routing_weights");
+        REQUIRE(compiled.ops[0].outputs[1].name == "routing_indices");
+        REQUIRE(compiled.ops[0].attrs.topk_softmax);
+        REQUIRE(compiled.ops[0].attrs.topk_full_softmax);
+        REQUIRE_FALSE(compiled.ops[0].attrs.normalize_weights);
+    }
+
+    SECTION("moe_routing_topk_softmax backward") {
+        dsl::Graph graph;
+        graph.name = "moe_routing_topk_softmax_backward_rewrite";
+        graph.params.emplace("d_routing_weights", make_info({2, 2}, ETensorDType::FP32));
+        graph.params.emplace("saved.router_probs", make_info({2, 4}, ETensorDType::FP32));
+        graph.params.emplace("saved.router_logits", make_info({2, 4}, ETensorDType::FP32));
+        graph.params.emplace("saved.routing_indices", make_info({2, 2}, ETensorDType::INT32));
+        graph.intermediates.emplace("d_router_probs", make_info({2, 4}, ETensorDType::FP32));
+        graph.outputs.emplace("d_router_logits", make_info({2, 4}, ETensorDType::FP32, true));
+
+        dsl::Operation topk_bwd;
+        topk_bwd.id = "router_topk_backward";
+        topk_bwd.name = "moe_topk_backward";
+        topk_bwd.kernel_type = "moe_topk_backward";
+        topk_bwd.inputs = {"d_routing_weights", "saved.router_probs", "saved.routing_indices"};
+        topk_bwd.outputs = {"d_router_probs"};
+        topk_bwd.attrs["top_k"] = dsl::AttrValue(static_cast<std::int64_t>(2));
+        topk_bwd.attrs["normalize"] = dsl::AttrValue(false);
+        graph.operations.push_back(topk_bwd);
+
+        dsl::Operation softmax_bwd;
+        softmax_bwd.id = "router_softmax_backward";
+        softmax_bwd.name = "moe_softmax_backward";
+        softmax_bwd.kernel_type = "moe_softmax_backward";
+        softmax_bwd.inputs = {"d_router_probs", "saved.router_probs"};
+        softmax_bwd.outputs = {"d_router_logits"};
+        graph.operations.push_back(softmax_bwd);
+
+        auto compiled = compile(graph, cfg, /*is_backward=*/true);
+        REQUIRE(compiled.ops.size() == 1);
+        REQUIRE(compiled.fusion_rewrite_preview.size() == 1);
+        REQUIRE(compiled.fusion_rewrite_preview[0].rule_name == "moe_routing_topk_softmax_backward");
+        REQUIRE(compiled.fusion_rewrite_preview[0].applied);
+        REQUIRE(compiled.ops[0].type == dsl::CompiledOpType::MoETopKBackward);
+        REQUIRE(compiled.ops[0].inputs[1].name == "router_logits");
+        REQUIRE(compiled.ops[0].outputs[0].name == "d_router_logits");
+        REQUIRE(compiled.ops[0].attrs.topk_softmax);
+        REQUIRE(compiled.ops[0].attrs.topk_full_softmax);
+        REQUIRE_FALSE(compiled.ops[0].attrs.normalize_weights);
+    }
+
+    SECTION("direct moe_topk softmax keeps selected-softmax semantics") {
+        dsl::Graph graph;
+        graph.name = "direct_moe_topk_softmax";
+        graph.params.emplace("router_logits", make_info({2, 4}, ETensorDType::FP32));
+        graph.outputs.emplace("routing_weights", make_info({2, 2}, ETensorDType::FP32, true));
+        graph.outputs.emplace("routing_indices", make_info({2, 2}, ETensorDType::INT32, true));
+
+        dsl::Operation topk;
+        topk.id = "router_topk";
+        topk.name = "moe_topk";
+        topk.kernel_type = "moe_topk";
+        topk.inputs = {"router_logits"};
+        topk.outputs = {"routing_weights", "routing_indices"};
+        topk.attrs["top_k"] = dsl::AttrValue(static_cast<std::int64_t>(2));
+        topk.attrs["normalize"] = dsl::AttrValue(false);
+        topk.attrs["softmax"] = dsl::AttrValue(true);
+        graph.operations.push_back(topk);
+
+        auto compiled = compile(graph, cfg);
+        REQUIRE(compiled.ops.size() == 1);
+        REQUIRE(compiled.ops[0].type == dsl::CompiledOpType::MoETopK);
+        REQUIRE(compiled.ops[0].attrs.topk_softmax);
+        REQUIRE_FALSE(compiled.ops[0].attrs.topk_full_softmax);
+        REQUIRE_FALSE(compiled.ops[0].attrs.normalize_weights);
+    }
+}
+
 std::pair<long, long> infer_B_T(const GoldenCase& gc) {
     const auto B_meta = meta_long(gc.meta, "B");
     const auto T_meta = meta_long(gc.meta, "T");
@@ -737,6 +1124,17 @@ TEST_CASE("dsl compiled ops match goldens", "[dsl][goldens]") {
     NCCLCommunicator::run_communicators(1, false, false, [&](NCCLCommunicator& comm) {
         for (const auto& path : files) {
             const GoldenCase gc = load_case(path);
+            if (gc.op == "flash_attention" || gc.op == "flash_attention_backward") {
+                // The standalone primitive golden is FP32, while the registered
+                // attention backends cover production BF16/FP16 paths.
+                // Module/block goldens still assert that flash_attention_backward
+                // is compiled into the graph.
+                continue;
+            }
+            if (gc.op.find("_block") != std::string::npos || gc.op.find("_model") != std::string::npos) {
+                // Covered by test_dsl_module_goldens.cpp.
+                continue;
+            }
             const OpSpec spec = op_spec_for(gc.op);
             const auto [B, T] = infer_B_T(gc);
 
@@ -853,8 +1251,8 @@ TEST_CASE("dsl compiled ops match goldens", "[dsl][goldens]") {
                                        static_cast<int>(T),
                                        allocator,
                                        false,
-                                       kStackBytes,
-                                       true);
+                                       false,
+                                       kStackBytes);
 
             // Copy parameter inputs
             for (const auto& kv : param_inputs) {

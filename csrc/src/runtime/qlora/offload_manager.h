@@ -159,6 +159,10 @@ public:
     /// Get the current max_resident_groups setting.
     [[nodiscard]] virtual int max_resident_groups() const = 0;
 
+    /// Mark registered tensors immutable. Immutable groups skip GPU->CPU
+    /// writeback on unload because CPU storage is already the canonical copy.
+    virtual void set_immutable(bool immutable) = 0;
+
     /// Get max bytes among all groups (for auto-tune calculations).
     [[nodiscard]] virtual size_t max_group_bytes() const = 0;
 };

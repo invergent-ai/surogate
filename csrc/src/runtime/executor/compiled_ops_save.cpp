@@ -17,6 +17,7 @@
 #include <iostream>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
@@ -27,6 +28,7 @@
 #include "runtime/executor/compiled_ops_helpers.h"
 #include "runtime/dsl/dsl_runtime.h"
 #include "runtime/dsl/dsl_weight_manager.h"
+#include "runtime/dsl/tensor_role.h"
 #include "runtime/executor/graph_executor_helpers.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "runtime/dsl/op_shape_signatures.h"
@@ -92,23 +94,35 @@ std::optional<bool> is_mapped_slot(const TensorSlotRegistry* registry, const std
     return std::nullopt;
 }
 
-bool is_moe_tensor_name(const std::string& n) {
-    switch (resolve_block_slot(n)) {
-        case TensorSlot::BlockRouterLogits:
-        case TensorSlot::BlockRouterProbs:
-        case TensorSlot::BlockRoutingWeights:
-        case TensorSlot::BlockRoutingIndices:
-        case TensorSlot::BlockPermutedInput:
-        case TensorSlot::BlockScatterIndices:
-        case TensorSlot::BlockExpertGateUp:
-        case TensorSlot::BlockExpertAct:
-        case TensorSlot::BlockExpertDown:
-        case TensorSlot::BlockMoeOut: return true;
-        default: break;
+std::optional<bool> moe_role_from_tensor_id(const CompiledGraph* graph, int tid) {
+    if (!graph) return std::nullopt;
+    if (const TensorRole* role = graph->role_for_tensor_id(tid)) {
+        return role->is_moe_owned();
     }
-    // Global MoE side-channels (not modelled as per-block slots).
-    const std::string probe = strip_ssa_suffix(n);
-    return probe == "moe_expert_offsets" || probe == "moe_gather_indices" || n.rfind("ep_", 0) == 0;
+    return std::nullopt;
+}
+
+bool is_moe_tensor_name(const std::string& n, const char* context = "compiled_ops_save::is_moe_tensor_name") {
+    (void)context;
+    return tensor_role_is_moe_name(n);
+}
+
+bool classify_moe_tensor(const CompiledGraph* graph, int tid, const std::string& name, const char* context) {
+    (void)context;
+    return moe_role_from_tensor_id(graph, tid).value_or(tensor_role_is_moe_name(name));
+}
+
+std::optional<bool> rope_role_from_name(const CompiledGraph* graph, const std::string& name) {
+    if (!graph) return std::nullopt;
+    if (const TensorRole* role = graph->role_for_name(name)) {
+        return role->is_rope_freq();
+    }
+    return std::nullopt;
+}
+
+bool is_rope_freq_name(const CompiledGraph* graph, const std::string& name, const char* context) {
+    (void)context;
+    return rope_role_from_name(graph, name).value_or(tensor_role_is_rope_name(name));
 }
 
 }  // namespace
@@ -165,12 +179,9 @@ void CompiledExecutor::save_moe_layer_tensors(int layer_idx) {
             continue;
         }
 
-        // Check if this is an MoE-related tensor that needs persistent storage
-        bool is_moe_tensor =
-            (name.find("moe_") != std::string::npos || name.find("ep_") != std::string::npos ||
-             name.find("scatter_indices") != std::string::npos || name.find("routing_weights") != std::string::npos ||
-             name.find("routing_indices") != std::string::npos || name.find("router_") != std::string::npos ||
-             name.find("permuted") != std::string::npos || name.find("expert_") != std::string::npos);
+        // Check if this is an MoE-related tensor that needs persistent storage.
+        const bool is_moe_tensor =
+            classify_moe_tensor(mCurrentGraph, tid, name, "CompiledExecutor::save_moe_layer_tensors");
 
         if (!is_moe_tensor) continue;
         if (tid < 0 || static_cast<std::size_t>(tid) >= mTensors.size()) continue;
@@ -349,7 +360,7 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
             return mRunState.rope_freqs(name);
         }
         // Qualified rope references (blocks[N].rope_freqs, …) still need the name.
-        if (name.find("rope_freqs") != std::string::npos || name.find("freq_cis") != std::string::npos) {
+        if (is_rope_freq_name(mCurrentGraph, name, "compiled_ops_save::resolve_source")) {
             return mRunState.rope_freqs(name);
         }
 
@@ -847,7 +858,7 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
             continue;
         }
         // Qualified rope references (blocks[N].rope_freqs, …) still need the name.
-        if (name.find("rope_freqs") != std::string::npos || name.find("freq_cis") != std::string::npos) {
+        if (is_rope_freq_name(mCurrentGraph, name, "compiled_ops_save::save_tensors")) {
             save_tensor_with_policy(name, mRunState.rope_freqs(name), prefer_live, force_persist_name);
             continue;
         }
@@ -947,7 +958,7 @@ Tensor* CompiledExecutor::try_resolve_saved_live(const std::string& name, const 
     if (glob_slot == TensorSlot::FreqCis) {
         return map_view(mRunState.rope_freqs(name));
     }
-    if (name.find("rope_freqs") != std::string::npos || name.find("freq_cis") != std::string::npos) {
+    if (is_rope_freq_name(mCurrentGraph, name, "compiled_ops_save::resolve_tensor")) {
         return map_view(mRunState.rope_freqs(name));
     }
 

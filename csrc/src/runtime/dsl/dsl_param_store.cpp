@@ -14,6 +14,7 @@
 #include "runtime/dsl/ir.h"
 #include "runtime/dsl/dsl_weight_manager.h"
 #include "runtime/dsl/graph_compiler.h"
+#include "runtime/dsl/tensor_role.h"
 #include "runtime/training/runtime_options.h"
 #include "runtime/training/model.h"
 #include "runtime/lora/lora_config.h"
@@ -24,7 +25,11 @@ namespace dsl {
 namespace {
 
 bool is_rope_param(const std::string& name) {
-    return name.find("rope_freqs") != std::string::npos;
+    return tensor_role_is_rope_name(name);
+}
+
+bool is_router_param(const std::string& name) {
+    return tensor_role_is_router_name(name);
 }
 
 void augment_shape_env(ShapeEnv& env, const AttrMap& config) {
@@ -173,9 +178,6 @@ DslParamStore::DslParamStore(const Module& module,
 
     const bool freeze_base = lora_config && lora_config->enabled();
     const bool train_router = freeze_base && lora_config->train_router;
-    auto is_router_param = [&](const std::string& name) -> bool {
-        return name.find("router") != std::string::npos;
-    };
 
     if (external_params) {
         mExternalParams = *external_params;
@@ -220,10 +222,10 @@ Tensor& DslParamStore::get(const std::string& name) {
     auto it = mParams.find(name);
     if (it == mParams.end()) {
         std::cerr << "[ERROR] DslParamStore::get: parameter '" << name << "' not found. Available params: ";
+        std::size_t printed = 0;
         for (auto& p : mParams) {
-            if (p.first.find("mlp_up") != std::string::npos || p.first.find("experts") != std::string::npos) {
-                std::cerr << p.first << ", ";
-            }
+            if (printed++ >= 32) break;
+            std::cerr << p.first << ", ";
         }
         std::cerr << std::endl;
         throw std::runtime_error("DslParamStore: missing parameter " + name);

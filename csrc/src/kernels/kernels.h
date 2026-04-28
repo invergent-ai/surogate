@@ -619,6 +619,22 @@ void matmul(nv_bfloat16* c,
             bool accumulate,
             cudaStream_t stream);
 
+void matmul(nv_bfloat16* c,
+            const __nv_fp8_e5m2* a,
+            const __nv_fp8_e4m3* b,
+            const nv_bfloat16* bias,
+            const float* scale_a,
+            const float* scale_b,
+            cublasLtHandle_t handle,
+            std::byte* workspace,
+            std::size_t workspace_size,
+            int M,
+            int N,
+            int K,
+            EMMTranspose mode,
+            bool accumulate,
+            cudaStream_t stream);
+
 // Matmul with explicit alpha/beta: C = alpha * (A @ B) + beta * C
 // Raw pointer overloads with alpha/beta for fused scaling
 void matmul(nv_bfloat16* c,
@@ -3237,7 +3253,8 @@ void moe_scale_forward(nv_bfloat16* out, const nv_bfloat16* inp, float scale, in
 /// @param num_experts Number of experts.
 /// @param top_k Number of experts per token.
 /// @param normalize_weights Whether to normalize weights to sum to 1.
-/// @param softmax_weights Whether to apply softmax over selected logits.
+/// @param softmax_weights Whether to apply softmax to logits for selected routing weights.
+/// @param full_softmax_weights Whether softmax_weights normalizes over all experts instead of selected experts.
 /// @param stream CUDA stream.
 void moe_topk_forward(int* expert_indices,
                       float* routing_weights,
@@ -3248,6 +3265,7 @@ void moe_topk_forward(int* expert_indices,
                       int top_k,
                       bool normalize_weights,
                       bool softmax_weights,
+                      bool full_softmax_weights,
                       bool sort_by_index,
                       float rounding_scale,
                       cudaStream_t stream);
@@ -3260,6 +3278,7 @@ void moe_topk_forward(int* expert_indices,
                       int top_k,
                       bool normalize_weights,
                       bool softmax_weights,
+                      bool full_softmax_weights,
                       bool sort_by_index,
                       float rounding_scale,
                       cudaStream_t stream);
@@ -3278,6 +3297,7 @@ void moe_topk_backward(float* d_probs,
                        int top_k,
                        bool normalize_weights,
                        bool softmax_weights,
+                       bool full_softmax_weights,
                        cudaStream_t stream);
 
 /// @brief Add per-expert bias to permuted tokens.
@@ -3503,15 +3523,19 @@ void moe_compute_aux_loss(float* aux_loss,
                           float aux_loss_coef,
                           cudaStream_t stream);
 
-/// @brief Compute MoE routing statistics for monitoring (aux_loss, utilization, load_imbalance).
+/// @brief Compute MoE routing statistics for monitoring.
 /// Accumulates into a persistent buffer using atomicAdd (call once per MoE layer per step).
-/// @param stats Output buffer [5]: {aux_loss_sum, z_loss_sum, utilization_sum, load_imbalance_sum, layer_count}.
+/// @param stats Output buffer:
+/// {aux_loss_sum, z_loss_sum, utilization_sum, load_imbalance_sum, layer_count,
+///  active_experts_sum, max_expert_fraction_sum, min_active_expert_fraction_sum,
+///  load_cv_sum, router_entropy_sum, router_confidence_sum}.
 /// @param routing_probs Routing probabilities post-softmax/sigmoid (num_tokens, num_experts).
 /// @param expert_indices Expert indices from topk (num_tokens, top_k).
 /// @param num_tokens Number of tokens.
 /// @param num_experts Number of experts.
 /// @param top_k Number of experts per token.
 /// @param aux_loss_coef Auxiliary loss coefficient.
+/// @param z_loss_coef Router z-loss coefficient. Only used by *_from_logits variants.
 /// @param stream CUDA stream.
 void moe_compute_routing_stats(float* stats,
                                const float* routing_probs,
@@ -3529,6 +3553,46 @@ void moe_compute_routing_stats(float* stats,
                                int top_k,
                                float aux_loss_coef,
                                cudaStream_t stream);
+void moe_compute_routing_stats_from_logits(float* stats,
+                                           const float* routing_logits,
+                                           const int* expert_indices,
+                                           int num_tokens,
+                                           int num_experts,
+                                           int top_k,
+                                           float aux_loss_coef,
+                                           float z_loss_coef,
+                                           cudaStream_t stream);
+void moe_compute_routing_stats_from_logits(float* stats,
+                                           const nv_bfloat16* routing_logits,
+                                           const int* expert_indices,
+                                           int num_tokens,
+                                           int num_experts,
+                                           int top_k,
+                                           float aux_loss_coef,
+                                           float z_loss_coef,
+                                           cudaStream_t stream);
+
+/// @brief Compute per-expert assignment fractions used by router auxiliary loss backward.
+/// fraction_e = count(assignments to expert e) / (num_tokens * top_k)
+void moe_compute_expert_fractions(float* expert_fractions,
+                                  const int* expert_indices,
+                                  int num_tokens,
+                                  int num_experts,
+                                  int top_k,
+                                  cudaStream_t stream);
+
+/// @brief Add router auxiliary/z-loss gradients to an existing dense d_logits tensor.
+/// Assumes router_logits are pre-softmax logits and expert_fractions are produced by
+/// moe_compute_expert_fractions. Gradients are normalized per token, matching the
+/// logged aux/z-loss values.
+void moe_router_regularization_logits_backward(float* d_logits,
+                                               const float* router_logits,
+                                               const float* expert_fractions,
+                                               int num_tokens,
+                                               int num_experts,
+                                               float aux_loss_coef,
+                                               float z_loss_coef,
+                                               cudaStream_t stream);
 
 // MoE Backward Kernels
 

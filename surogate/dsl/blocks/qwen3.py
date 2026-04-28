@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from .. import nn
+from ..block_schema import BlockSchema, SlotDecl
 from ..modules import GenericGQAttention, GenericMLP, RMSNorm
 from ..attention import AttentionConfig
 from ..mlp import MLPConfig
@@ -13,6 +14,17 @@ class Qwen3Block(nn.Block):
     """Qwen3 transformer block: QK-norm GQA + SwiGLU MLP."""
 
     _name_remap_ = DENSE_BLOCK_NAME_REMAP
+    schema = BlockSchema(
+        slots=(
+            SlotDecl("qkv_weight", kind="param", shape=("QKV", "C")),
+            SlotDecl("out_weight", kind="param", shape=("C", "AttnDim")),
+            SlotDecl("mlp_up_weight", kind="param", shape=("2M", "C"), residency="auto"),
+            SlotDecl("mlp_down_weight", kind="param", shape=("C", "M"), residency="auto"),
+            SlotDecl("res_att", shape=("B", "T", "C")),
+            SlotDecl("qkv_rope", shape=("B", "T", "QKV"), save_for_backward=True),
+        ),
+        attrs={"block_family": "qwen3_dense"},
+    )
 
     def __init__(
         self,

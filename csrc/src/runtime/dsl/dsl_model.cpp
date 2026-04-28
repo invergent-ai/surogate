@@ -23,7 +23,9 @@
 #include <nlohmann/json.hpp>
 
 #include "runtime/executor/graph_executor.h"
+#include "runtime/dsl/dsl_grad_store.h"
 #include "runtime/dsl/dsl_runtime.h"
+#include "runtime/dsl/tensor_role.h"
 #include "runtime/core/qlora_provider.h"
 #include "runtime/dsl/dsl_weight_manager.h"
 #include "runtime/dsl/dsl_model_internal.h"
@@ -42,6 +44,7 @@
 #include "runtime/optimizers/normuon.h"
 #include "runtime/optimizers/normuon_optimizer.h"
 #include "runtime/core/fp8_scaling_state.h"
+#include "utilities/comm.h"
 #include "utilities/comm.h"
 #include "utilities/dtype.h"
 #include "utilities/safetensors.h"
@@ -76,7 +79,7 @@ bool graph_has_kernel(const Module& module, std::string_view kernel) {
 bool is_qlora_param_name(std::string_view name) {
     const std::string_view clean = trim_optional(name);
     // Router weights are always kept full precision (not quantized in QLoRA).
-    if (clean.find("router") != std::string_view::npos) {
+    if (tensor_role_is_router_name(clean)) {
         return false;
     }
     int layer_idx = -1;
@@ -88,8 +91,7 @@ bool is_qlora_param_name(std::string_view name) {
         if (field == "qkv_weight" || field == "out_weight" || field == "o_proj_weight" || field == "mlp_up_weight" ||
             field == "mlp_down_weight" || field == "up_weight" || field == "down_weight" || field == "ln1_weight" ||
             field == "ln2_weight" || field == "q_norm_weight" || field == "k_norm_weight" ||
-            field == "experts_gate_up" || field == "experts_up" || field == "experts_down" ||
-            field == "shared_expert_gate" || field == "shared_expert_up" || field == "shared_expert_down") {
+            tensor_role_is_expert_weight_name(field) || tensor_role_is_shared_expert_name(field)) {
             return true;
         }
         if (ends_with(field, "in_proj_weight") || ends_with(field, "in_proj_bias") ||
@@ -139,6 +141,16 @@ struct DslConfigView {
     std::optional<bool> norm_topk_prob;
     std::optional<bool> use_shared_expert;
     std::optional<long> shared_expert_intermediate;
+    std::optional<long> linear_conv_kernel_dim;
+    std::optional<long> linear_key_head_dim;
+    std::optional<long> linear_value_head_dim;
+    std::optional<long> linear_num_key_heads;
+    std::optional<long> linear_num_value_heads;
+    std::optional<long> d_per_layer_input;
+    std::optional<long> mamba_num_heads;
+    std::optional<long> mamba_head_dim;
+    std::optional<long> ssm_state_size;
+    std::optional<long> n_groups;
     std::optional<std::string> hybrid_pattern;
     std::optional<double> routed_scaling_factor;
     std::optional<std::string> mlp_activation;
@@ -274,6 +286,17 @@ DslConfigView parse_dsl_config(const Module& module) {
     view.shared_expert_intermediate = get_long_attr(cfg, "shared_expert_intermediate");
     if (!view.shared_expert_intermediate)
         view.shared_expert_intermediate = get_long_attr(cfg, "shared_expert_intermediate_size");
+    view.linear_conv_kernel_dim = get_long_attr(cfg, "linear_conv_kernel_dim");
+    view.linear_key_head_dim = get_long_attr(cfg, "linear_key_head_dim");
+    view.linear_value_head_dim = get_long_attr(cfg, "linear_value_head_dim");
+    view.linear_num_key_heads = get_long_attr(cfg, "linear_num_key_heads");
+    view.linear_num_value_heads = get_long_attr(cfg, "linear_num_value_heads");
+    view.d_per_layer_input = get_long_attr(cfg, "d_per_layer_input");
+    if (!view.d_per_layer_input) view.d_per_layer_input = get_long_attr(cfg, "hidden_size_per_layer_input");
+    view.mamba_num_heads = get_long_attr(cfg, "mamba_num_heads");
+    view.mamba_head_dim = get_long_attr(cfg, "mamba_head_dim");
+    view.ssm_state_size = get_long_attr(cfg, "ssm_state_size");
+    view.n_groups = get_long_attr(cfg, "n_groups");
     view.hybrid_pattern = get_string_attr(cfg, "hybrid_pattern");
     view.routed_scaling_factor = get_double_attr(cfg, "routed_scaling_factor");
     view.mlp_activation = get_string_attr(cfg, "mlp_activation");
@@ -306,6 +329,16 @@ DslRuntimeConfig build_runtime_config(const Module& module, const PretrainedConf
     if (!runtime.use_shared_expert && runtime.shared_expert_intermediate > 0) {
         runtime.use_shared_expert = true;
     }
+    runtime.linear_conv_kernel_dim = static_cast<int>(view.linear_conv_kernel_dim.value_or(0));
+    runtime.linear_key_head_dim = static_cast<int>(view.linear_key_head_dim.value_or(0));
+    runtime.linear_value_head_dim = static_cast<int>(view.linear_value_head_dim.value_or(0));
+    runtime.linear_num_key_heads = static_cast<int>(view.linear_num_key_heads.value_or(0));
+    runtime.linear_num_value_heads = static_cast<int>(view.linear_num_value_heads.value_or(0));
+    runtime.d_per_layer_input = static_cast<int>(view.d_per_layer_input.value_or(0));
+    runtime.mamba_num_heads = static_cast<int>(view.mamba_num_heads.value_or(0));
+    runtime.mamba_head_dim = static_cast<int>(view.mamba_head_dim.value_or(0));
+    runtime.ssm_state_size = static_cast<int>(view.ssm_state_size.value_or(0));
+    runtime.n_groups = static_cast<int>(view.n_groups.value_or(0));
 
     if (view.moe_intermediate_size.has_value()) {
         runtime.moe_intermediate_size = static_cast<int>(view.moe_intermediate_size.value());
@@ -882,7 +915,7 @@ int count_router_fp_weights(const Module& module) {
     for (const auto& kv : module.forward->params) {
         const std::string& name = kv.first;
         const TensorInfo& info = kv.second;
-        if (name.find("router") == std::string::npos) {
+        if (!tensor_role_is_router_name(name)) {
             continue;
         }
         if (!info.quantizable) {
@@ -934,11 +967,10 @@ create_dsl_qlora_provider(const Module& module,
     config.ep_size = options.EPSize;
 
     // Adjust expert weight specs to local dimensions when EP is active.
-    // Only slice actual expert weights (name contains "experts"), not other 3D
-    // weights like conv1d in linear attention layers.
+    // Only slice actual expert weights, not other 3D weights like conv1d in
+    // linear attention layers.
     auto is_expert_name = [](const std::string& n) {
-        return n.find("experts") != std::string::npos || n.find("expert_gate_up") != std::string::npos ||
-               n.find("expert_down") != std::string::npos;
+        return tensor_role_is_expert_weight_name(n);
     };
     if (config.ep_size > 1) {
         for (auto& spec : config.weight_specs) {
@@ -1104,10 +1136,128 @@ DslModel::DslModel(const PretrainedConfig& config,
         throw std::runtime_error(error_msg);
     }
     mModule = &pick_model_module(mIr);
+    if (mModule->forward.has_value()) {
+        mBlockSchemaPlanRecords = collect_block_schema_plan_records(*mModule->forward);
+        for (const HookTarget& target :
+             collect_schema_hook_targets(mBlockSchemaPlanRecords, HookEventKind::AfterProduce)) {
+            mHookRegistry.on_after_produce(target, "schema_lora_after_produce", [](HookContext& context) {
+                auto* payload = static_cast<AfterProduceHookPayload*>(context.payload);
+                if (!payload || payload->lora_applied) {
+                    return;
+                }
+                if (payload->apply_lora) {
+                    payload->apply_lora(payload->action_context);
+                } else if (payload->apply_lora_action) {
+                    payload->apply_lora_action();
+                } else {
+                    return;
+                }
+                payload->lora_applied = true;
+            });
+        }
+        for (const HookTarget& target :
+             collect_schema_hook_targets(mBlockSchemaPlanRecords, HookEventKind::BeforeConsume)) {
+            mHookRegistry.on_before_consume(target, "schema_prefetch", [](HookContext& context) {
+                auto* payload = static_cast<BeforeConsumeHookPayload*>(context.payload);
+                if (!payload || payload->current_layer_handled || payload->capturing || !payload->weight_manager ||
+                    !payload->comm || !payload->weight_manager->needs_block_gather()) {
+                    return;
+                }
+                payload->weight_manager->gather_block(context.layer_idx, *payload->comm, payload->prefetch_stream);
+                payload->weight_manager->wait_for_gather(context.layer_idx, payload->wait_stream);
+                payload->current_layer_handled = true;
+            });
+        }
+        for (const HookTarget& target :
+             collect_schema_hook_targets(mBlockSchemaPlanRecords, HookEventKind::AfterConsume)) {
+            mHookRegistry.on_after_consume(target, "schema_release", [](HookContext& context) {
+                auto* payload = static_cast<AfterConsumeHookPayload*>(context.payload);
+                if (!payload || payload->current_layer_released || payload->capturing || !payload->weight_manager ||
+                    !payload->weight_manager->needs_block_gather()) {
+                    return;
+                }
+                payload->weight_manager->release_block(context.layer_idx, payload->release_stream);
+                payload->current_layer_released = true;
+            });
+        }
+        for (const HookTarget& target :
+             collect_schema_hook_targets(mBlockSchemaPlanRecords, HookEventKind::AfterAllToAll)) {
+            mHookRegistry.on_after_all_to_all(target, "schema_after_all_to_all", [](HookContext& context) {
+                auto* payload = static_cast<CommunicationHookPayload*>(context.payload);
+                if (!payload || !payload->token_all_to_all_completed) {
+                    return;
+                }
+                payload->after_all_to_all_observed = true;
+            });
+        }
+        for (const HookTarget& target :
+             collect_schema_hook_targets(mBlockSchemaPlanRecords, HookEventKind::AfterCommunication)) {
+            mHookRegistry.on_after_communication(target, "schema_after_communication", [](HookContext& context) {
+                auto* payload = static_cast<CommunicationHookPayload*>(context.payload);
+                if (!payload || !payload->token_all_to_all_completed) {
+                    return;
+                }
+                payload->after_communication_observed = true;
+            });
+        }
+        for (const HookTarget& target :
+             collect_schema_hook_targets(mBlockSchemaPlanRecords, HookEventKind::AfterAllReduce)) {
+            mHookRegistry.on_after_all_reduce(target, "schema_after_all_reduce", [](HookContext& context) {
+                auto* payload = static_cast<GradientOffloadHookPayload*>(context.payload);
+                if (payload && payload->lora_gradients && payload->lora_grads && payload->comm &&
+                    !payload->lora_reduced) {
+                    payload->lora_grads->reduce_layer_gradients(context.layer_idx,
+                                                                payload->compute_stream,
+                                                                *payload->comm);
+                    payload->lora_reduced = true;
+                    return;
+                }
+                if (!payload || payload->offloaded || payload->capturing || !payload->grads ||
+                    !payload->grads->is_streaming_grads()) {
+                    return;
+                }
+                if (payload->comm && payload->comm->world_size() > 1) {
+                    CUDA_CHECK(cudaEventRecord(payload->sync_event, payload->compute_stream));
+                    CUDA_CHECK(cudaStreamWaitEvent(payload->copy_stream, payload->sync_event, 0));
+                    payload->grads->reduce_layer_grads(context.layer_idx, payload->copy_stream, *payload->comm);
+                }
+                payload->grads->offload_layer_grads(context.layer_idx, payload->compute_stream, payload->copy_stream);
+                payload->offloaded = true;
+            });
+        }
+        for (const HookTarget& target :
+             collect_schema_hook_targets(mBlockSchemaPlanRecords, HookEventKind::AfterReduceScatter)) {
+            mHookRegistry.on_after_reduce_scatter(target, "schema_after_reduce_scatter", [](HookContext& context) {
+                auto* payload = static_cast<GradientOffloadHookPayload*>(context.payload);
+                if (!payload || !payload->reduce_scattered || payload->sharded_accumulated || !payload->grads) {
+                    return;
+                }
+                payload->grads->accumulate_layer_to_sharded(context.layer_idx, payload->compute_stream);
+                payload->sharded_accumulated = true;
+            });
+        }
+    }
     validate_ir();
     apply_arch_from_hf_config(*mConfig, *mModule);
     mRuntimeConfig = build_runtime_config(*mModule, *mConfig);
     mModelConfig = build_model_config(*mModule, *mConfig, mRuntimeConfig);
+    if (mModelConfig.moe_config.has_value()) {
+        if (mOptions.RouterAuxLossCoef >= 0.0f) {
+            mModelConfig.moe_config->router_aux_loss_coef = mOptions.RouterAuxLossCoef;
+        }
+        if (mOptions.RouterZLossCoef >= 0.0f) {
+            mModelConfig.moe_config->router_z_loss_coef = mOptions.RouterZLossCoef;
+        }
+    }
+
+    if (const char* assert_schema = std::getenv("SUROGATE_BLOCK_SCHEMA_PLAN_ASSERT");
+        assert_schema && std::string_view(assert_schema) == "1") {
+        const auto schema_coverage =
+            validate_block_schema_plan_coverage(mBlockSchemaPlanRecords, mModelConfig.NumLayers);
+        if (!schema_coverage.ok) {
+            throw std::runtime_error("DSL model: " + schema_coverage.message);
+        }
+    }
 
     // Expert Parallelism: set EPSize and compute NumLocalExperts
     mModelConfig.EPSize = mOptions.EPSize;
@@ -1174,6 +1324,12 @@ DslModel::DslModel(const PretrainedConfig& config,
                                             mConfig->TiedWordEmbeddings,
                                             grad_dtype_override,
                                             options.CpuTraining);
+    std::vector<std::string> grad_hook_schema_ids(static_cast<std::size_t>(std::max(mModelConfig.NumLayers, 0)));
+    for (const BlockSchemaPlanRecord& record : mBlockSchemaPlanRecords) {
+        if (record.layer < 0 || record.layer >= mModelConfig.NumLayers) continue;
+        grad_hook_schema_ids[static_cast<std::size_t>(record.layer)] = schema_id_for_hook_target(record);
+    }
+    mGrads->set_schema_hook_registry(&mHookRegistry, std::move(grad_hook_schema_ids));
 
     // Create weight manager for streaming/sharding if enabled
     if (use_weight_manager) {
@@ -1247,6 +1403,13 @@ DslModel::DslModel(const PretrainedConfig& config,
             gm.train_router = mLoRAConfig->train_router;
         }
         mLoRAGrads = std::make_unique<modules::ModularLoRAGradsManager>(gm, mAllocator);
+        std::vector<std::string> lora_grad_hook_schema_ids(
+            static_cast<std::size_t>(std::max(mModelConfig.NumLayers, 0)));
+        for (const BlockSchemaPlanRecord& record : mBlockSchemaPlanRecords) {
+            if (record.layer < 0 || record.layer >= mModelConfig.NumLayers) continue;
+            lora_grad_hook_schema_ids[static_cast<std::size_t>(record.layer)] = schema_id_for_hook_target(record);
+        }
+        mLoRAGrads->set_schema_hook_registry(&mHookRegistry, std::move(lora_grad_hook_schema_ids));
     }
 
     for (const auto& kv : mModule->hf_mapping) {

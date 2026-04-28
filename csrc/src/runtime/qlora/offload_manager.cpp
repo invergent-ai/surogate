@@ -167,8 +167,12 @@ public:
             }
         }
 
-        // Transfer data back to CPU buffers
-        transfer_to_cpu(group, stream);
+        if (mImmutableTensors) {
+            restore_cpu_pointers(group);
+        } else {
+            // Transfer mutable data back to CPU buffers.
+            transfer_to_cpu(group, stream);
+        }
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
         // Free GPU shadow buffers
@@ -284,6 +288,10 @@ public:
 
     [[nodiscard]] int max_resident_groups() const override {
         return mConfig.max_resident_groups;
+    }
+
+    void set_immutable(bool immutable) override {
+        mImmutableTensors = immutable;
     }
 
     [[nodiscard]] size_t max_group_bytes() const override {
@@ -511,6 +519,32 @@ private:
         }
     }
 
+    /// Restore tensor descriptors to canonical CPU storage without copying data.
+    /// This is valid only for immutable quantized weights: GPU shadows are read-only
+    /// replicas of CPU-backed quantized storage, so eviction can drop them directly.
+    void restore_cpu_pointers(Group& group) {
+        for (auto& entry : group.entries) {
+            if (!entry.tensor) continue;
+
+            if (entry.cpu_data && entry.cpu_data_bytes > 0) {
+                entry.tensor->data.Data = entry.cpu_data;
+                entry.tensor->data.Device = -1;
+            }
+            if (entry.cpu_scales && entry.cpu_scales_bytes > 0) {
+                entry.tensor->scales.Data = entry.cpu_scales;
+                entry.tensor->scales.Device = -1;
+            }
+            if (entry.cpu_meta && entry.cpu_meta_bytes > 0) {
+                entry.tensor->meta.Data = entry.cpu_meta;
+                entry.tensor->meta.Device = -1;
+            }
+            if (entry.cpu_meta2 && entry.cpu_meta2_bytes > 0) {
+                entry.tensor->meta2.Data = entry.cpu_meta2;
+                entry.tensor->meta2.Device = -1;
+            }
+        }
+    }
+
     std::byte* alloc_host_buffer(size_t bytes) {
         if (bytes == 0) {
             return nullptr;
@@ -586,6 +620,7 @@ private:
 
     int64_t mCurrentStep = 0;
     int mNumResident = 0;
+    bool mImmutableTensors = false;
 
     // Prefetch infrastructure
     cudaStream_t mPrefetchStream = nullptr;

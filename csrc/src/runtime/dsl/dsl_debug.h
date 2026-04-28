@@ -125,6 +125,7 @@ struct DebugArenaSummary {
     //! PhaseArenas sizes (what `allocate_phase_arenas` actually cudaMalloc'd).
     std::uint64_t arena_persistent_bytes = 0;
     std::uint64_t arena_persistent_activation_bytes = 0;
+    std::uint64_t arena_model_scope_persistent_bytes = 0;
     std::uint64_t arena_accumulator_bytes = 0;
     std::uint64_t arena_fwd_stack_bytes = 0;
     std::uint64_t arena_bwd_stack_bytes = 0;
@@ -132,10 +133,159 @@ struct DebugArenaSummary {
     std::uint64_t arena_unified_stack_bytes = 0;
     std::uint64_t arena_bwd_cross_layer_bytes = 0;
     std::uint64_t arena_moe_saved_bytes = 0;
+    std::uint64_t arena_schema_allocation_authoritative = 0;
+    std::uint64_t arena_compiled_fwd_stack_bytes = 0;
+    std::uint64_t arena_compiled_save_for_bwd_bytes = 0;
+    std::uint64_t arena_schema_frame_arena_bytes = 0;
+    std::uint64_t arena_schema_save_for_bwd_arena_bytes = 0;
+    std::uint64_t arena_schema_persistent_activation_bytes = 0;
+    std::uint64_t arena_schema_host_stream_activation_bytes = 0;
+    std::uint64_t arena_schema_total_activation_arena_bytes = 0;
+    std::uint64_t arena_schema_frame_arena_safety_bytes = 0;
+    std::uint64_t arena_schema_save_for_bwd_safety_bytes = 0;
+    std::uint64_t arena_schema_frame_arena_extra_bytes = 0;
+    std::uint64_t arena_schema_save_for_bwd_extra_bytes = 0;
     std::vector<std::uint64_t> arena_save_for_bwd_block_bases;
     bool arenas_allocated = false;
     DebugGraphArena forward;
     DebugGraphArena backward;
+};
+
+//! Descriptor/capability summary for one compiled graph. This is intentionally
+//! count-based so regression artifacts can track descriptor coverage without
+//! depending on enum dumps or graph-specific op ordering.
+struct DebugGraphDescriptorSummary {
+    DebugGraphKind graph = DebugGraphKind::Forward;
+    std::string name;
+    std::uint64_t num_tensors = 0;
+    std::uint64_t num_ops = 0;
+    std::uint64_t no_comm_ops = 0;
+    std::uint64_t all_reduce_after_ops = 0;
+    std::uint64_t reduce_scatter_after_ops = 0;
+    std::uint64_t all_to_all_in_ops = 0;
+    std::uint64_t all_to_all_out_ops = 0;
+    std::uint64_t expert_parallel_routed_ops = 0;
+    std::uint64_t grouped_ops = 0;
+    std::uint64_t dense_matmul_ops = 0;
+    std::uint64_t grouped_matmul_ops = 0;
+    std::uint64_t moe_routed_ops = 0;
+    std::uint64_t fp8_eligible_ops = 0;
+    std::uint64_t fp4_eligible_ops = 0;
+    std::uint64_t matmul_fp8_forward_eligible_ops = 0;
+    std::uint64_t matmul_fp8_backward_eligible_ops = 0;
+    std::uint64_t matmul_fp4_forward_eligible_ops = 0;
+    std::uint64_t matmul_fp4_backward_eligible_ops = 0;
+    std::uint64_t moe_fp8_grouped_eligible_ops = 0;
+    std::uint64_t moe_fp4_grouped_eligible_ops = 0;
+    std::uint64_t moe_fp8_backward_implemented_ops = 0;
+    std::uint64_t moe_nvfp4_no_fallback_ops = 0;
+    std::uint64_t lora_compatible_ops = 0;
+    std::uint64_t weight_cache_eligible_ops = 0;
+    std::uint64_t activation_epilogue_ops = 0;
+    std::uint64_t cpu_pinned_stream_ops = 0;
+    std::uint64_t fusion_candidate_starts = 0;
+    std::uint64_t fp8_pending_tensors = 0;
+    std::uint64_t fp8_ready_tensors = 0;
+    std::uint64_t fp4_ready_tensors = 0;
+    std::uint64_t lora_slices = 0;
+    std::uint64_t lora_schema_slot_slices = 0;
+    std::uint64_t lora_schema_target_slices = 0;
+    std::uint64_t grouped_lora_schema_slot_slices = 0;
+    std::uint64_t grouped_lora_schema_target_slices = 0;
+    std::uint64_t forward_hook_points = 0;
+    std::uint64_t forward_hook_schema_slot_points = 0;
+    std::uint64_t forward_hook_schema_target_points = 0;
+};
+
+struct DebugDescriptorSummary {
+    DebugGraphDescriptorSummary forward;
+    DebugGraphDescriptorSummary backward;
+};
+
+//! Deterministic descriptor rewrite preview. One entry per matching fusion
+//! candidate, including unsupported candidates kept visible for planning.
+struct DebugFusionCandidate {
+    DebugGraphKind graph = DebugGraphKind::Forward;
+    std::string rule_name;
+    std::string replacement_op;
+    std::uint64_t start = 0;
+    std::uint64_t length = 0;
+    std::vector<std::string> op_ids;
+    std::vector<std::string> op_names;
+    bool applied = false;
+    std::string reason;
+};
+
+struct DebugFusionPreview {
+    std::vector<DebugFusionCandidate> candidates;
+};
+
+//! BufferPlan summary for schema-driven allocation migration. Count and byte
+//! fields mirror BufferPlan's Phase 4b dual-path diagnostics.
+struct DebugBufferPlanSummary {
+    std::uint64_t schema_record_count = 0;
+    std::uint64_t schema_routing_layers = 0;
+    std::uint64_t schema_ep_layers = 0;
+    std::uint64_t schema_dense_layers = 0;
+    std::uint64_t schema_moe_layers = 0;
+    std::uint64_t schema_mamba_layers = 0;
+    std::uint64_t schema_linear_mixer_layers = 0;
+    std::uint64_t schema_slot_count = 0;
+    std::uint64_t schema_param_slots = 0;
+    std::uint64_t schema_activation_slots = 0;
+    std::uint64_t schema_op_lifetime_slots = 0;
+    std::uint64_t schema_layer_lifetime_slots = 0;
+    std::uint64_t schema_block_lifetime_slots = 0;
+    std::uint64_t schema_model_lifetime_slots = 0;
+    std::uint64_t schema_persistent_lifetime_slots = 0;
+    std::uint64_t schema_registry_registered_activation_slots = 0;
+    std::uint64_t schema_registry_missing_activation_slots = 0;
+    std::uint64_t schema_registry_save_for_backward_activation_slots = 0;
+    std::uint64_t schema_registry_save_for_backward_mismatch_slots = 0;
+    std::uint64_t schema_resolved_activation_shape_slots = 0;
+    std::uint64_t schema_unresolved_activation_shape_slots = 0;
+    std::uint64_t schema_dynamic_activation_shape_slots = 0;
+    std::uint64_t schema_resolved_activation_shape_bytes = 0;
+    std::uint64_t schema_save_for_backward_activation_slots = 0;
+    std::uint64_t schema_frame_activation_slots = 0;
+    std::uint64_t schema_save_for_backward_activation_bytes = 0;
+    std::uint64_t schema_frame_activation_bytes = 0;
+    std::uint64_t schema_allocation_authoritative = 0;
+    std::uint64_t schema_allocation_authoritative_layers = 0;
+    std::uint64_t schema_allocation_unresolved_slots = 0;
+    std::uint64_t schema_authoritative_frame_arena_bytes = 0;
+    std::uint64_t schema_authoritative_save_for_backward_arena_bytes = 0;
+    std::uint64_t schema_authoritative_persistent_activation_bytes = 0;
+    std::uint64_t schema_authoritative_host_stream_activation_bytes = 0;
+    std::uint64_t schema_authoritative_total_activation_arena_bytes = 0;
+    std::uint64_t schema_max_layer_activation_shape_bytes = 0;
+    std::uint64_t schema_baseline_max_activation_shape_bytes = 0;
+    std::uint64_t schema_activation_shape_savings_bytes = 0;
+    std::uint64_t schema_resolved_param_shape_slots = 0;
+    std::uint64_t schema_unresolved_param_shape_slots = 0;
+    std::uint64_t schema_expert_parallel_param_slots = 0;
+    std::uint64_t schema_resolved_param_shape_bytes = 0;
+    std::uint64_t schema_resolved_param_shape_local_bytes = 0;
+    std::uint64_t schema_expert_parallel_param_shape_bytes = 0;
+    std::uint64_t schema_expert_parallel_param_shape_local_bytes = 0;
+    std::uint64_t schema_expert_parallel_param_shape_savings_bytes = 0;
+    std::uint64_t hook_after_produce_targets = 0;
+    std::uint64_t hook_before_consume_targets = 0;
+    std::uint64_t hook_after_consume_targets = 0;
+    std::uint64_t hook_after_communication_targets = 0;
+    std::uint64_t hook_after_all_to_all_targets = 0;
+    std::uint64_t hook_after_all_reduce_targets = 0;
+    std::uint64_t hook_after_reduce_scatter_targets = 0;
+    std::uint64_t schema_hook_dispatch_enabled = 0;
+    std::uint64_t hook_registry_registrations = 0;
+    std::uint64_t hook_registry_distribution_aware_registrations = 0;
+    std::uint64_t hook_registry_after_produce_registrations = 0;
+    std::uint64_t hook_registry_before_consume_registrations = 0;
+    std::uint64_t hook_registry_after_consume_registrations = 0;
+    std::uint64_t hook_registry_after_communication_registrations = 0;
+    std::uint64_t hook_registry_after_all_reduce_registrations = 0;
+    std::uint64_t hook_registry_after_all_to_all_registrations = 0;
+    std::uint64_t hook_registry_after_reduce_scatter_registrations = 0;
 };
 
 //! One pair of overlapping `(region, block_layer_idx, offset, bytes)` ranges
@@ -185,6 +335,15 @@ std::vector<DebugTensorEntry> collect_tensor_layout(const DslModel& model);
 
 //! Aggregate arena sizes + coverage across both graphs and the PhaseArenas.
 DebugArenaSummary collect_arena_summary(const DslModel& model);
+
+//! Aggregate descriptor/capability counts across both compiled graphs.
+DebugDescriptorSummary collect_descriptor_summary(const DslModel& model);
+
+//! Collect deterministic fusion rewrite previews across both compiled graphs.
+DebugFusionPreview collect_fusion_preview(const DslModel& model);
+
+//! BufferPlan schema/allocation diagnostics for regression artifacts.
+DebugBufferPlanSummary collect_buffer_plan_summary(const DslModel& model);
 
 //! Collect the phase tree + instruction stream for one graph.
 //! `DebugPhaseTree::present == false` if the graph has no phase tree

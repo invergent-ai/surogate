@@ -406,7 +406,8 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
     // IMPORTANT: Do NOT store pointers into mTemps — subsequent push_back() calls
     // can reallocate the vector, invalidating any prior pointers. Store as values.
     auto ensure_or_temp_val = [&](std::size_t out_idx, ETensorDType dtype, const std::vector<long>& shape) -> Tensor {
-        if (op.outputs.size() > out_idx && !op.outputs[out_idx].name.empty()) {
+        const bool has_output = op.outputs.size() > out_idx && !op.outputs[out_idx].name.empty();
+        if (has_output) {
             Tensor& out_ref = ensure_output_tensor(op.outputs[out_idx]);
             bool ok = true;
             if (out_ref.DType != dtype) ok = false;
@@ -416,12 +417,9 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
                 ok = false;
             if (ok) return out_ref;
         }
-        return make_persistent_tensor(mRunState,
-                                      mMoeSavedBuffers,
-                                      mMoeSavedSizes,
-                                      op.op_id + ".bwd_out" + std::to_string(out_idx) + ".fallback",
-                                      dtype,
-                                      shape);
+        Tensor tmp = mRunState.temp_alloc(dtype, shape, ("gated_delta_rule_bwd_out" + std::to_string(out_idx)).c_str());
+        mTemps.push_back(tmp);
+        return tmp;
     };
 
     if (debug_replay) fprintf(stderr, "[GDR_BWD] allocating outputs B=%ld T=%ld H=%ld K=%ld V=%ld\n", B, T, H, K, V);
@@ -844,16 +842,16 @@ std::vector<Operation> chunk_gated_delta_rule_backward_rule(const BackwardRuleCo
 // alignment independently — see `DeviceMemoryStack::allocate`.
 //
 // Inputs (validated at compile time, see shape signatures below):
-//   inputs[0] = q    [B, T, H, K]
-//   inputs[2] = v    [B, T, H_v, V]   (H_v may differ from H for GQA)
+//   inputs[2] = q    [B, T, H, K]
+//   inputs[4] = v    [B, T, H_v, V]   (H_v may differ from H for GQA)
 long cgr_backward_stack_bound(const CompiledOp& op, const BufferPlan& plan) {
     long H = 0, K = 0, V = 0;
-    if (op.inputs.size() >= 1 && op.inputs[0].shape.size() == 4) {
-        H = op.inputs[0].shape[2];
-        K = op.inputs[0].shape[3];
-    }
     if (op.inputs.size() >= 3 && op.inputs[2].shape.size() == 4) {
-        V = op.inputs[2].shape[3];
+        H = op.inputs[2].shape[2];
+        K = op.inputs[2].shape[3];
+    }
+    if (op.inputs.size() >= 5 && op.inputs[4].shape.size() == 4) {
+        V = op.inputs[4].shape[3];
     }
     if (H <= 0 || K <= 0 || V <= 0) return 0;
 
@@ -878,6 +876,12 @@ long cgr_backward_stack_bound(const CompiledOp& op, const BufferPlan& plan) {
     bytes += align_stack_bytes(B * T * H * K * BF16) * 4;
     bytes += align_stack_bytes(B * T * H * FP32) * 4;
     // Backward-specific temps
+    // Empty gradient outputs use stack temporaries so absent optional grads do
+    // not accumulate persistent cudaMalloc buffers across layers.
+    bytes += align_stack_bytes(B * T * H * K * BF16) * 2;   // d_q/d_k fallback
+    bytes += align_stack_bytes(B * T * H * V * BF16);       // d_v fallback
+    bytes += align_stack_bytes(B * T * H * FP32) * 2;       // d_g/d_beta fallback
+    bytes += align_stack_bytes(B * H * K * V * FP32);       // d_initial fallback
     bytes += align_stack_bytes(B * NT * H * K * V * BF16);  // dh
     bytes += align_stack_bytes(B * T * H * V * BF16);       // dv2
     bytes += align_stack_bytes(B * H * K * V * FP32);       // dht_zero

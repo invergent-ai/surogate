@@ -27,6 +27,7 @@ from ..modules import (
     _resolve_rotary_dim,
 )
 from ..activations import Activation
+from ..block_schema import BlockSchema, DistributionDecl, EPTopology, RoutingSchema, SlotDecl, StreamingHint
 from ..dim import B, T
 from ..mlp import MLPConfig
 
@@ -138,6 +139,70 @@ _GEMMA4_GELU_MLP_CONFIG = MLPConfig(
     gated=True,
     fuse_gate_up=False,
 )
+
+
+def _gemma4_dense_schema(block_family: str, *, shared_kv: bool = False) -> BlockSchema:
+    attn_weight = (
+        SlotDecl("self_attn_q_weight", kind="param", shape=("AttnDim", "C"))
+        if shared_kv
+        else SlotDecl("qkv_weight", kind="param", shape=("QKV", "C"))
+    )
+    return BlockSchema(
+        slots=(
+            attn_weight,
+            SlotDecl("out_weight", kind="param", shape=("C", "AttnDim")),
+            SlotDecl("mlp_gate_weight", kind="param", shape=("M", "C"), residency="auto"),
+            SlotDecl("mlp_up_weight", kind="param", shape=("M", "C"), residency="auto"),
+            SlotDecl("mlp_down_weight", kind="param", shape=("C", "M"), residency="auto"),
+            SlotDecl("layer_scalar", kind="param", shape=(1,), dtype="bf16"),
+            SlotDecl("res_att", shape=("B", "T", "C")),
+            SlotDecl("qkv_rope", shape=("B", "T", "QKV"), save_for_backward=True),
+        ),
+        attrs={"block_family": block_family, "shared_kv": shared_kv},
+    )
+
+
+def _gemma4_moe_schema(block_family: str) -> BlockSchema:
+    return BlockSchema(
+        slots=(
+            SlotDecl("qkv_weight", kind="param", shape=("QKV", "C")),
+            SlotDecl("out_weight", kind="param", shape=("C", "AttnDim")),
+            SlotDecl("mlp_gate_weight", kind="param", shape=("M", "C"), residency="auto"),
+            SlotDecl("mlp_up_weight", kind="param", shape=("M", "C"), residency="auto"),
+            SlotDecl("mlp_down_weight", kind="param", shape=("C", "M"), residency="auto"),
+            SlotDecl(
+                "router_weight", kind="param", shape=("E", "C"), distribution=DistributionDecl.router_replicated()
+            ),
+            SlotDecl("router_scale", kind="param", shape=("C",), dtype="bf16"),
+            SlotDecl("per_expert_scale", kind="param", shape=("E",), dtype="bf16"),
+            SlotDecl(
+                "experts_gate_up",
+                kind="param",
+                shape=("E", "2M", "C"),
+                residency="auto",
+                distribution=DistributionDecl.expert_parallel(global_experts="num_experts"),
+                grouped=True,
+                streaming_hint=StreamingHint(prefetch_distance=1),
+            ),
+            SlotDecl(
+                "experts_down",
+                kind="param",
+                shape=("E", "C", "M"),
+                residency="auto",
+                distribution=DistributionDecl.expert_parallel(global_experts="num_experts"),
+                grouped=True,
+                streaming_hint=StreamingHint(prefetch_distance=1),
+            ),
+            SlotDecl(
+                "permuted_input", shape=("dispatched_tokens", "C"), distribution=DistributionDecl.expert_parallel()
+            ),
+            SlotDecl("res_att", shape=("B", "T", "C")),
+        ),
+        routing=RoutingSchema(kind="topk_softmax", topk="num_experts_per_tok", norm_topk_prob=True),
+        ep_topology=EPTopology(ep_size_param="ep_size"),
+        attrs={"block_family": block_family},
+    )
+
 
 # ============================================================================
 # Helpers shared across block types
@@ -261,6 +326,7 @@ class Gemma4SlidingBlock(nn.Block):
     """Sliding-window attention + GeLU-gated MLP. Optional per-layer input gating."""
 
     _name_remap_ = GEMMA4_BLOCK_NAME_REMAP
+    schema = _gemma4_dense_schema("gemma4_sliding")
 
     def __init__(
         self,
@@ -348,6 +414,7 @@ class Gemma4SlidingMoEBlock(nn.Block):
     """Sliding attention + parallel MLP/MoE. For 26B-A4B sliding layers."""
 
     _name_remap_ = GEMMA4_BLOCK_NAME_REMAP
+    schema = _gemma4_moe_schema("gemma4_sliding_moe")
 
     def __init__(
         self,
@@ -412,6 +479,7 @@ class Gemma4FullMoEBlock(nn.Block):
     """Full attention (k_eq_v) + parallel MLP/MoE. For 26B-A4B full layers."""
 
     _name_remap_ = GEMMA4_BLOCK_NAME_REMAP
+    schema = _gemma4_moe_schema("gemma4_full_moe")
 
     def __init__(
         self,
@@ -483,6 +551,7 @@ class Gemma4FullBlock(nn.Block):
     """Full attention (optional k_eq_v) + GeLU-gated MLP. Optional per-layer input gating."""
 
     _name_remap_ = GEMMA4_BLOCK_NAME_REMAP
+    schema = _gemma4_dense_schema("gemma4_full")
 
     def __init__(
         self,
@@ -583,6 +652,7 @@ class Gemma4SharedKVBlock(nn.Block):
     """
 
     _name_remap_ = GEMMA4_BLOCK_NAME_REMAP
+    schema = _gemma4_dense_schema("gemma4_shared_kv", shared_kv=True)
 
     def __init__(
         self,

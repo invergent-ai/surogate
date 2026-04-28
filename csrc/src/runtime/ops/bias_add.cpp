@@ -53,12 +53,16 @@ void CompiledExecutor::dispatch_bias_add_backward(const CompiledOp& op) {
             OC = static_cast<int>(d_out.Sizes[2]);
         }
 
-        Tensor& d_bias = ensure_output_tensor(op.outputs[1]);
+        const TensorRef& d_bias_ref = op.outputs[1];
+        Tensor& d_bias = ensure_output_tensor(d_bias_ref);
         bool accumulate = mAccumulateTensors.count(op.outputs[1].name) > 0;
         if (!accumulate && !op.outputs[1].name.empty() && mCurrentGraph) {
             if (auto base = base_param_from_grad_kind(op.outputs[1].tensor_id, *mCurrentGraph)) {
                 accumulate = mAccumulateTensors.count("d_" + *base) > 0;
             }
+        }
+        if (!accumulate) {
+            fill_zero(d_bias, mRunState.MainStream);
         }
 
         // Allocate scratch buffer for bias reduction

@@ -5,13 +5,17 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 
 #include "runtime/dsl/dsl_model.h"
+#include "runtime/dsl/dsl_run_state.h"
 #include "runtime/dsl/graph_compiler.h"
+#include "runtime/dsl/hook_registry.h"
 #include "runtime/executor/graph_executor.h"
 
 namespace dsl {
@@ -145,6 +149,105 @@ void fill_graph_arena(DebugGraphArena& out,
     });
 }
 
+void fill_graph_descriptor_summary(DebugGraphDescriptorSummary& out, const CompiledGraph* graph, DebugGraphKind kind) {
+    out.graph = kind;
+    if (!graph) {
+        return;
+    }
+    out.name = graph->name;
+    out.num_tensors = static_cast<std::uint64_t>(graph->num_tensors);
+    out.num_ops = static_cast<std::uint64_t>(graph->ops.size());
+    out.no_comm_ops = static_cast<std::uint64_t>(graph->count_ops_with_comm(CommunicationKind::NoComm));
+    out.all_reduce_after_ops =
+        static_cast<std::uint64_t>(graph->count_ops_with_comm(CommunicationKind::AllReduceAfter));
+    out.reduce_scatter_after_ops =
+        static_cast<std::uint64_t>(graph->count_ops_with_comm(CommunicationKind::ReduceScatterAfter));
+    out.all_to_all_in_ops = static_cast<std::uint64_t>(graph->count_ops_with_comm(CommunicationKind::AllToAllIn));
+    out.all_to_all_out_ops = static_cast<std::uint64_t>(graph->count_ops_with_comm(CommunicationKind::AllToAllOut));
+    out.expert_parallel_routed_ops =
+        static_cast<std::uint64_t>(graph->count_ops_with_comm(CommunicationKind::ExpertParallelRouted));
+    out.grouped_ops = static_cast<std::uint64_t>(graph->count_grouped_ops());
+    out.dense_matmul_ops = static_cast<std::uint64_t>(graph->count_ops_with_capability(OpCapabilityDenseMatmul));
+    out.grouped_matmul_ops = static_cast<std::uint64_t>(graph->count_ops_with_capability(OpCapabilityGroupedMatmul));
+    out.moe_routed_ops = static_cast<std::uint64_t>(graph->count_ops_with_capability(OpCapabilityMoeRouted));
+    out.fp8_eligible_ops = static_cast<std::uint64_t>(graph->count_ops_with_capability(OpCapabilityFp8Eligible));
+    out.fp4_eligible_ops = static_cast<std::uint64_t>(graph->count_ops_with_capability(OpCapabilityFp4Eligible));
+    out.matmul_fp8_forward_eligible_ops =
+        static_cast<std::uint64_t>(graph->count_ops_with_matmul_capability(MatmulCapabilityFp8ForwardEligible));
+    out.matmul_fp8_backward_eligible_ops =
+        static_cast<std::uint64_t>(graph->count_ops_with_matmul_capability(MatmulCapabilityFp8BackwardEligible));
+    out.matmul_fp4_forward_eligible_ops =
+        static_cast<std::uint64_t>(graph->count_ops_with_matmul_capability(MatmulCapabilityFp4ForwardEligible));
+    out.matmul_fp4_backward_eligible_ops =
+        static_cast<std::uint64_t>(graph->count_ops_with_matmul_capability(MatmulCapabilityFp4BackwardEligible));
+    out.moe_fp8_grouped_eligible_ops =
+        static_cast<std::uint64_t>(graph->count_ops_with_moe_capability(MoECapabilityFp8GroupedEligible));
+    out.moe_fp4_grouped_eligible_ops =
+        static_cast<std::uint64_t>(graph->count_ops_with_moe_capability(MoECapabilityFp4GroupedEligible));
+    out.moe_fp8_backward_implemented_ops =
+        static_cast<std::uint64_t>(graph->count_ops_with_moe_capability(MoECapabilityFp8BackwardImplemented));
+    out.moe_nvfp4_no_fallback_ops =
+        static_cast<std::uint64_t>(graph->count_ops_with_moe_capability(MoECapabilityNvfp4NoFallback));
+    out.lora_compatible_ops = static_cast<std::uint64_t>(graph->count_ops_with_capability(OpCapabilityLoRACompatible));
+    out.weight_cache_eligible_ops =
+        static_cast<std::uint64_t>(graph->count_ops_with_capability(OpCapabilityWeightCacheEligible));
+    out.activation_epilogue_ops = static_cast<std::uint64_t>(graph->count_ops_with_epilogue(EpilogueSupportActivation));
+    out.cpu_pinned_stream_ops =
+        static_cast<std::uint64_t>(graph->count_ops_supporting_storage(StorageTier::CpuPinnedStream));
+    out.fusion_candidate_starts = graph->fusion_rewrite_preview.empty()
+                                      ? static_cast<std::uint64_t>(graph->count_fusion_candidate_starts())
+                                      : static_cast<std::uint64_t>(graph->fusion_rewrite_preview.size());
+    out.fp8_pending_tensors = static_cast<std::uint64_t>(graph->count_tensors_with_quant_state(QuantState::FP8Pending));
+    out.fp8_ready_tensors = static_cast<std::uint64_t>(graph->count_tensors_with_quant_state(QuantState::FP8Ready));
+    out.fp4_ready_tensors = static_cast<std::uint64_t>(graph->count_tensors_with_quant_state(QuantState::FP4Ready));
+    for (const CompiledOp& op : graph->ops) {
+        if (op.attrs.forward_hook_point.has_value()) {
+            out.forward_hook_points += 1;
+            if (!op.attrs.forward_hook_schema_slot.empty()) {
+                out.forward_hook_schema_slot_points += 1;
+                if (!op.attrs.hook_schema_id.empty()) {
+                    out.forward_hook_schema_target_points += 1;
+                }
+            }
+        }
+        for (const LoRASlice& slice : op.attrs.lora_slices) {
+            out.lora_slices += 1;
+            if (!slice.schema_slot.empty()) {
+                out.lora_schema_slot_slices += 1;
+                if (!op.attrs.hook_schema_id.empty()) {
+                    out.lora_schema_target_slices += 1;
+                    if (slice.grouped) {
+                        out.grouped_lora_schema_target_slices += 1;
+                    }
+                }
+                if (slice.grouped) {
+                    out.grouped_lora_schema_slot_slices += 1;
+                }
+            }
+        }
+    }
+}
+
+void append_fusion_preview(DebugFusionPreview& out, const CompiledGraph* graph, DebugGraphKind kind) {
+    if (!graph) {
+        return;
+    }
+    out.candidates.reserve(out.candidates.size() + graph->fusion_rewrite_preview.size());
+    for (const FusionRewritePreview& src : graph->fusion_rewrite_preview) {
+        DebugFusionCandidate dst;
+        dst.graph = kind;
+        dst.rule_name = src.rule_name;
+        dst.replacement_op = src.replacement_op;
+        dst.start = static_cast<std::uint64_t>(src.start);
+        dst.length = static_cast<std::uint64_t>(src.length);
+        dst.op_ids = src.op_ids;
+        dst.op_names = src.op_names;
+        dst.applied = src.applied;
+        dst.reason = src.reason;
+        out.candidates.push_back(std::move(dst));
+    }
+}
+
 }  // namespace
 
 // ----------------------------------------------------------------------------
@@ -180,6 +283,7 @@ DebugArenaSummary collect_arena_summary(const DslModel& model) {
     s.arenas_allocated = arenas.allocated;
     s.arena_persistent_bytes = static_cast<std::uint64_t>(arenas.persistent_bytes);
     s.arena_persistent_activation_bytes = static_cast<std::uint64_t>(arenas.persistent_activation_bytes);
+    s.arena_model_scope_persistent_bytes = static_cast<std::uint64_t>(arenas.model_scope_persistent_bytes);
     s.arena_accumulator_bytes = static_cast<std::uint64_t>(arenas.accumulator_bytes);
     s.arena_fwd_stack_bytes = static_cast<std::uint64_t>(arenas.fwd_stack_bytes);
     s.arena_bwd_stack_bytes = static_cast<std::uint64_t>(arenas.bwd_stack_bytes);
@@ -187,10 +291,146 @@ DebugArenaSummary collect_arena_summary(const DslModel& model) {
     s.arena_unified_stack_bytes = static_cast<std::uint64_t>(arenas.unified_stack_bytes);
     s.arena_bwd_cross_layer_bytes = static_cast<std::uint64_t>(arenas.bwd_cross_layer_bytes);
     s.arena_moe_saved_bytes = static_cast<std::uint64_t>(arenas.moe_saved_bytes);
+    s.arena_schema_allocation_authoritative = arenas.schema_allocation_authoritative ? 1 : 0;
+    s.arena_compiled_fwd_stack_bytes = static_cast<std::uint64_t>(arenas.compiled_fwd_stack_bytes);
+    s.arena_compiled_save_for_bwd_bytes = static_cast<std::uint64_t>(arenas.compiled_save_for_bwd_bytes);
+    s.arena_schema_frame_arena_bytes = static_cast<std::uint64_t>(arenas.schema_frame_arena_bytes);
+    s.arena_schema_save_for_bwd_arena_bytes = static_cast<std::uint64_t>(arenas.schema_save_for_bwd_arena_bytes);
+    s.arena_schema_persistent_activation_bytes = static_cast<std::uint64_t>(arenas.schema_persistent_activation_bytes);
+    s.arena_schema_host_stream_activation_bytes =
+        static_cast<std::uint64_t>(arenas.schema_host_stream_activation_bytes);
+    s.arena_schema_total_activation_arena_bytes =
+        static_cast<std::uint64_t>(arenas.schema_total_activation_arena_bytes);
+    s.arena_schema_frame_arena_safety_bytes = static_cast<std::uint64_t>(arenas.schema_frame_arena_safety_bytes);
+    s.arena_schema_save_for_bwd_safety_bytes = static_cast<std::uint64_t>(arenas.schema_save_for_bwd_safety_bytes);
+    s.arena_schema_frame_arena_extra_bytes = static_cast<std::uint64_t>(arenas.schema_frame_arena_extra_bytes);
+    s.arena_schema_save_for_bwd_extra_bytes = static_cast<std::uint64_t>(arenas.schema_save_for_bwd_extra_bytes);
     s.arena_save_for_bwd_block_bases.assign(arenas.save_for_bwd_block_bases.begin(),
                                             arenas.save_for_bwd_block_bases.end());
     fill_graph_arena(s.forward, exec->compiled_forward(), arenas, DebugGraphKind::Forward);
     fill_graph_arena(s.backward, exec->compiled_backward(), arenas, DebugGraphKind::Backward);
+    return s;
+}
+
+DebugDescriptorSummary collect_descriptor_summary(const DslModel& model) {
+    DebugDescriptorSummary s{};
+    const GraphExecutor* exec = model.graph_executor();
+    if (!exec) {
+        return s;
+    }
+    fill_graph_descriptor_summary(s.forward, exec->compiled_forward(), DebugGraphKind::Forward);
+    fill_graph_descriptor_summary(s.backward, exec->compiled_backward(), DebugGraphKind::Backward);
+    return s;
+}
+
+DebugFusionPreview collect_fusion_preview(const DslModel& model) {
+    DebugFusionPreview out;
+    const GraphExecutor* exec = model.graph_executor();
+    if (!exec) {
+        return out;
+    }
+    append_fusion_preview(out, exec->compiled_forward(), DebugGraphKind::Forward);
+    append_fusion_preview(out, exec->compiled_backward(), DebugGraphKind::Backward);
+    return out;
+}
+
+DebugBufferPlanSummary collect_buffer_plan_summary(const DslModel& model) {
+    DebugBufferPlanSummary s{};
+    const auto* rs = dynamic_cast<const DslRunState*>(&model.get_run_state());
+    if (!rs) {
+        return s;
+    }
+    const BufferPlan& p = rs->buffer_plan();
+    auto u64 = [](auto value) -> std::uint64_t {
+        return value > 0 ? static_cast<std::uint64_t>(value) : 0;
+    };
+    s.schema_record_count = u64(p.schema_record_count);
+    s.schema_routing_layers = u64(p.schema_routing_layers);
+    s.schema_ep_layers = u64(p.schema_ep_layers);
+    s.schema_dense_layers = u64(p.schema_dense_layers);
+    s.schema_moe_layers = u64(p.schema_moe_layers);
+    s.schema_mamba_layers = u64(p.schema_mamba_layers);
+    s.schema_linear_mixer_layers = u64(p.schema_linear_mixer_layers);
+    s.schema_slot_count = u64(p.schema_slot_count);
+    s.schema_param_slots = u64(p.schema_param_slots);
+    s.schema_activation_slots = u64(p.schema_activation_slots);
+    s.schema_op_lifetime_slots = u64(p.schema_op_lifetime_slots);
+    s.schema_layer_lifetime_slots = u64(p.schema_layer_lifetime_slots);
+    s.schema_block_lifetime_slots = u64(p.schema_block_lifetime_slots);
+    s.schema_model_lifetime_slots = u64(p.schema_model_lifetime_slots);
+    s.schema_persistent_lifetime_slots = u64(p.schema_persistent_lifetime_slots);
+    s.schema_registry_registered_activation_slots = u64(p.schema_registry_registered_activation_slots);
+    s.schema_registry_missing_activation_slots = u64(p.schema_registry_missing_activation_slots);
+    s.schema_registry_save_for_backward_activation_slots = u64(p.schema_registry_save_for_backward_activation_slots);
+    s.schema_registry_save_for_backward_mismatch_slots = u64(p.schema_registry_save_for_backward_mismatch_slots);
+    s.schema_resolved_activation_shape_slots = u64(p.schema_resolved_activation_shape_slots);
+    s.schema_unresolved_activation_shape_slots = u64(p.schema_unresolved_activation_shape_slots);
+    s.schema_dynamic_activation_shape_slots = u64(p.schema_dynamic_activation_shape_slots);
+    s.schema_resolved_activation_shape_bytes = u64(p.schema_resolved_activation_shape_bytes);
+    s.schema_save_for_backward_activation_slots = u64(p.schema_save_for_backward_activation_slots);
+    s.schema_frame_activation_slots = u64(p.schema_frame_activation_slots);
+    s.schema_save_for_backward_activation_bytes = u64(p.schema_save_for_backward_activation_bytes);
+    s.schema_frame_activation_bytes = u64(p.schema_frame_activation_bytes);
+    s.schema_allocation_authoritative = p.schema_allocation_authoritative ? 1 : 0;
+    s.schema_allocation_authoritative_layers = u64(p.schema_allocation_authoritative_layers);
+    s.schema_allocation_unresolved_slots = u64(p.schema_allocation_unresolved_slots);
+    s.schema_authoritative_frame_arena_bytes = u64(p.schema_authoritative_frame_arena_bytes);
+    s.schema_authoritative_save_for_backward_arena_bytes = u64(p.schema_authoritative_save_for_backward_arena_bytes);
+    s.schema_authoritative_persistent_activation_bytes = u64(p.schema_authoritative_persistent_activation_bytes);
+    s.schema_authoritative_host_stream_activation_bytes = u64(p.schema_authoritative_host_stream_activation_bytes);
+    s.schema_authoritative_total_activation_arena_bytes = u64(p.schema_authoritative_total_activation_arena_bytes);
+    s.schema_max_layer_activation_shape_bytes = u64(p.schema_max_layer_activation_shape_bytes);
+    s.schema_baseline_max_activation_shape_bytes = u64(p.schema_baseline_max_activation_shape_bytes);
+    s.schema_activation_shape_savings_bytes = u64(p.schema_activation_shape_savings_bytes);
+    s.schema_resolved_param_shape_slots = u64(p.schema_resolved_param_shape_slots);
+    s.schema_unresolved_param_shape_slots = u64(p.schema_unresolved_param_shape_slots);
+    s.schema_expert_parallel_param_slots = u64(p.schema_expert_parallel_param_slots);
+    s.schema_resolved_param_shape_bytes = u64(p.schema_resolved_param_shape_bytes);
+    s.schema_resolved_param_shape_local_bytes = u64(p.schema_resolved_param_shape_local_bytes);
+    s.schema_expert_parallel_param_shape_bytes = u64(p.schema_expert_parallel_param_shape_bytes);
+    s.schema_expert_parallel_param_shape_local_bytes = u64(p.schema_expert_parallel_param_shape_local_bytes);
+    s.schema_expert_parallel_param_shape_savings_bytes = u64(p.schema_expert_parallel_param_shape_savings_bytes);
+    s.schema_hook_dispatch_enabled = schema_hook_dispatch_enabled() ? 1 : 0;
+    for (const BlockSchemaLayerSummary& layer : p.schema_layers) {
+        for (const BlockSchemaSlotSummary& slot : layer.slots) {
+            if (schema_slot_matches_hook_event(slot, HookEventKind::AfterProduce)) {
+                s.hook_after_produce_targets += 1;
+            }
+            if (schema_slot_matches_hook_event(slot, HookEventKind::BeforeConsume)) {
+                s.hook_before_consume_targets += 1;
+                s.hook_after_consume_targets += 1;
+            }
+            if (schema_slot_matches_hook_event(slot, HookEventKind::AfterCommunication)) {
+                s.hook_after_communication_targets += 1;
+                s.hook_after_all_to_all_targets += 1;
+            }
+            if (schema_slot_matches_hook_event(slot, HookEventKind::AfterAllReduce)) {
+                s.hook_after_all_reduce_targets += 1;
+            }
+            if (schema_slot_matches_hook_event(slot, HookEventKind::AfterReduceScatter)) {
+                s.hook_after_reduce_scatter_targets += 1;
+            }
+        }
+    }
+    const HookRegistry& hook_registry = model.hook_registry();
+    s.hook_registry_registrations = u64(hook_registry.size());
+    s.hook_registry_distribution_aware_registrations = static_cast<std::uint64_t>(
+        std::count_if(hook_registry.registrations().begin(),
+                      hook_registry.registrations().end(),
+                      [](const HookRegistration& registration) { return registration.distribution_aware; }));
+    auto count_registry_event = [&](HookEventKind event) -> std::uint64_t {
+        return static_cast<std::uint64_t>(
+            std::count_if(hook_registry.registrations().begin(),
+                          hook_registry.registrations().end(),
+                          [event](const HookRegistration& registration) { return registration.event == event; }));
+    };
+    s.hook_registry_after_produce_registrations = count_registry_event(HookEventKind::AfterProduce);
+    s.hook_registry_before_consume_registrations = count_registry_event(HookEventKind::BeforeConsume);
+    s.hook_registry_after_consume_registrations = count_registry_event(HookEventKind::AfterConsume);
+    s.hook_registry_after_communication_registrations = count_registry_event(HookEventKind::AfterCommunication);
+    s.hook_registry_after_all_reduce_registrations = count_registry_event(HookEventKind::AfterAllReduce);
+    s.hook_registry_after_all_to_all_registrations = count_registry_event(HookEventKind::AfterAllToAll);
+    s.hook_registry_after_reduce_scatter_registrations = count_registry_event(HookEventKind::AfterReduceScatter);
     return s;
 }
 

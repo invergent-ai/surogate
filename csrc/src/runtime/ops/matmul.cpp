@@ -16,30 +16,142 @@
 #include "runtime/executor/compiled_ops_helpers.h"
 #include "runtime/dsl/autodiff.h"
 #include "runtime/dsl/op_shape_signatures.h"
+#include "runtime/dsl/tensor_role.h"
 #include "runtime/executor/op_registry.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "kernels/kernels.h"
 #include "utilities/dtype.h"
 #include "runtime/executor/graph_executor_helpers.h"
 #include "runtime/core/forward_hooks.h"
+#include "runtime/qlora/quantized_tensor.h"
 #include "runtime/lora/lora_model_utils.h"
 #include "runtime/lora/lora_run_state.h"
 #include "runtime/lora/lora_slice_dispatch.h"
 
 namespace dsl {
 
+namespace {
+
+bool is_shared_expert_weight_name(const std::string& weight_name) {
+    return tensor_role_is_shared_expert_name(weight_name);
+}
+
+bool is_router_weight_name(const std::string& weight_name) {
+    return tensor_role_is_router_name(weight_name);
+}
+
+void attach_input_role(modules::MatmulContext& ctx, const CompiledGraph* graph, const TensorRef& ref) {
+    if (!graph) {
+        return;
+    }
+    if (const TensorRole* role = graph->role_for_tensor_id(ref.tensor_id)) {
+        ctx.input_role = *role;
+        ctx.has_input_role = true;
+    }
+}
+
+bool attach_resident_qlora_fp4_cache(modules::MatmulContext& ctx,
+                                     DslParamStore& weights,
+                                     DslRunState& run_state,
+                                     std::vector<Tensor>& temps,
+                                     Tensor& data_view,
+                                     Tensor& scales_view,
+                                     const std::string& weight_name,
+                                     bool capturing) {
+    if (capturing) {
+        return false;
+    }
+    auto* provider = weights.qlora_provider();
+    if (!provider) {
+        return false;
+    }
+    const auto* qt = provider->ensure_quantized_resident(weight_name, run_state.MainStream);
+    if (!qt || qt->format != qlora::QuantFormat::FP4_BLOCK_2D || qt->data.is_null() || qt->scales.is_null() ||
+        qt->is_on_host()) {
+        return false;
+    }
+    if (qt->M <= 0 || qt->K <= 0 || qt->K % 2 != 0) {
+        return false;
+    }
+    data_view = Tensor::from_pointer(qt->data.Data,
+                                     qt->data.Device,
+                                     ETensorDType::BYTE,
+                                     std::vector<long>{static_cast<long>(qt->M), static_cast<long>(qt->K / 2)});
+    std::vector<long> scales_shape;
+    scales_shape.reserve(static_cast<std::size_t>(qt->scales.Rank));
+    for (int i = 0; i < qt->scales.Rank; ++i) {
+        scales_shape.push_back(qt->scales.Sizes[i]);
+    }
+    scales_view = Tensor::from_pointer(qt->scales.Data, qt->scales.Device, ETensorDType::BYTE, scales_shape);
+    ctx.cached_fp4_data = &data_view;
+    ctx.cached_fp4_scales = &scales_view;
+
+    Tensor amax = run_state.temp_alloc(ETensorDType::FP32, {1}, "qlora_fp4_cached_amax");
+    constexpr float kFP8Max = 448.0f;
+    constexpr float kFP4Max = 6.0f;
+    const float host_amax = qt->global_scale * kFP8Max * kFP4Max;
+    CUDA_CHECK(cudaMemcpyAsync(amax.Data, &host_amax, sizeof(float), cudaMemcpyHostToDevice, run_state.MainStream));
+    temps.push_back(amax);
+    ctx.cached_fp4_amax = amax.get<float>();
+    return true;
+}
+
+struct LoRAForwardApplyContext {
+    const std::vector<LoRASlice>* slices = nullptr;
+    int layer_idx = -1;
+    Tensor input_2d;
+    Tensor output_2d;
+    int BT = 0;
+    modules::ModularLoRAWeightsManager* weights = nullptr;
+    const modules::ModularLoRAConfig* config = nullptr;
+    modules::LoRARunState* run_state = nullptr;
+    cublasLtHandle_t handle = nullptr;
+    Tensor* workspace = nullptr;
+    cudaStream_t stream = nullptr;
+};
+
+void apply_lora_forward_payload(void* opaque) {
+    auto* ctx = static_cast<LoRAForwardApplyContext*>(opaque);
+    if (!ctx || !ctx->slices || !ctx->workspace) return;
+    modules::detail::apply_lora_slices_forward(*ctx->slices,
+                                               ctx->layer_idx,
+                                               ctx->input_2d,
+                                               ctx->output_2d,
+                                               ctx->BT,
+                                               ctx->weights,
+                                               ctx->config,
+                                               ctx->run_state,
+                                               ctx->handle,
+                                               *ctx->workspace,
+                                               ctx->stream);
+}
+
+}  // namespace
+
 // flatten_bt now lives in runtime/executor/graph_executor_utils.h so it
 // can be reused by LoRA slice dispatch (lora_slice_dispatch.h).
 
 void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::ForwardHook* hook) {
     Tensor& a = resolve_tensor(op.inputs[0]);
-    Tensor& b = resolve_tensor(op.inputs[1]);
     Tensor& out = ensure_output_tensor(op.outputs[0]);
     const std::string& weight_name = op.inputs[1].name;
     const bool is_gate_projection = is_mlp_gate_weight(weight_name);
+    Tensor b_template{};
+    Tensor* b_resolved = nullptr;
+    if (mWeights.has(weight_name)) {
+        b_template = mWeights.template_tensor(weight_name);
+    } else {
+        b_resolved = &resolve_tensor(op.inputs[1]);
+        b_template = *b_resolved;
+    }
+    auto resolve_weight = [&]() -> Tensor& {
+        if (!b_resolved) {
+            b_resolved = &resolve_tensor(op.inputs[1]);
+        }
+        return *b_resolved;
+    };
 
-    const bool is_shared_weight = (weight_name.find("shared_expert_up") != std::string::npos) ||
-                                  (weight_name.find("shared_expert_down") != std::string::npos);
+    const bool is_shared_weight = is_shared_expert_weight_name(weight_name);
 
     std::optional<Tensor> bias;
     if (op.type == CompiledOpType::MatmulBias && op.inputs.size() > 2) {
@@ -47,96 +159,102 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
     }
 
     int M = 0, N = 0, K = 0;
-    matmul_dims(a, b, op.attrs.transpose, M, N, K);
+    matmul_dims(a, b_template, op.attrs.transpose, M, N, K);
 
     // Router matmul: match HF by computing logits in FP32 using FP32 inputs/weights.
     // Skip the string search for dense (non-MoE) models — they have no router.
-    const bool is_router = (mConfig.NumExperts > 0) && (weight_name.find("router_weight") != std::string::npos);
-    if (is_router &&
-        (a.DType != ETensorDType::FP32 || b.DType != ETensorDType::FP32 || out.DType != ETensorDType::FP32)) {
-        auto shape_vec = [](const Tensor& t) {
-            return std::vector<long>(t.Sizes.begin(), t.Sizes.begin() + t.Rank);
-        };
-        Tensor a_f = a;
-        if (a.DType != ETensorDType::FP32) {
-            a_f = mRunState.temp_alloc(ETensorDType::FP32, shape_vec(a), "matmul_router_a_fp32");
-            mTemps.push_back(a_f);
-            if (a.DType == ETensorDType::BF16) {
-                convert_dtype(a_f.get<float>(), a.get<nv_bfloat16>(), a.nelem(), mRunState.MainStream);
-            } else {
-                throw std::runtime_error("router matmul: unsupported input dtype");
-            }
-        }
-
-        Tensor b_f = b;
-        if (b.DType != ETensorDType::FP32) {
-            b_f = mRunState.temp_alloc(ETensorDType::FP32, shape_vec(b), "matmul_router_b_fp32");
-            mTemps.push_back(b_f);
-            if (b.DType == ETensorDType::BF16) {
-                convert_dtype(b_f.get<float>(), b.get<nv_bfloat16>(), b.nelem(), mRunState.MainStream);
-            } else {
-                throw std::runtime_error("router matmul: unsupported weight dtype");
-            }
-        }
-
-        std::optional<Tensor> bias_f;
-        if (bias.has_value()) {
-            if (bias->DType == ETensorDType::FP32) {
-                bias_f = bias;
-            } else {
-                Tensor tmp = mRunState.temp_alloc(ETensorDType::FP32, shape_vec(*bias), "matmul_router_bias_fp32");
-                mTemps.push_back(tmp);
-                if (bias->DType == ETensorDType::BF16) {
-                    convert_dtype(tmp.get<float>(), bias->get<nv_bfloat16>(), bias->nelem(), mRunState.MainStream);
+    const bool is_router = (mConfig.NumExperts > 0) && is_router_weight_name(weight_name);
+    if (is_router) {
+        Tensor& b = resolve_weight();
+        if (!(a.DType != ETensorDType::FP32 || b.DType != ETensorDType::FP32 || out.DType != ETensorDType::FP32)) {
+            // Already FP32; continue through the regular path below.
+        } else {
+            auto shape_vec = [](const Tensor& t) {
+                return std::vector<long>(t.Sizes.begin(), t.Sizes.begin() + t.Rank);
+            };
+            Tensor a_f = a;
+            if (a.DType != ETensorDType::FP32) {
+                a_f = mRunState.temp_alloc(ETensorDType::FP32, shape_vec(a), "matmul_router_a_fp32");
+                mTemps.push_back(a_f);
+                if (a.DType == ETensorDType::BF16) {
+                    convert_dtype(a_f.get<float>(), a.get<nv_bfloat16>(), a.nelem(), mRunState.MainStream);
                 } else {
-                    throw std::runtime_error("router matmul: unsupported bias dtype");
+                    throw std::runtime_error("router matmul: unsupported input dtype");
                 }
-                bias_f = tmp;
             }
-        }
 
-        Tensor out_f = out;
-        if (out.DType != ETensorDType::FP32) {
-            out_f = mRunState.temp_alloc(ETensorDType::FP32, shape_vec(out), "matmul_router_out_fp32");
-            mTemps.push_back(out_f);
-        }
-
-        EMMTranspose mode_col = swap_transpose(op.attrs.transpose);
-        matmul(out_f,
-               b_f,
-               a_f,
-               bias_f,
-               nullptr,
-               nullptr,
-               mRunState.CublasLtHandle,
-               mRunState.CuBlasWorkspace,
-               N,
-               M,
-               K,
-               mode_col,
-               false,
-               mRunState.MainStream);
-        if (out.DType != ETensorDType::FP32) {
-            if (out.DType == ETensorDType::BF16) {
-                convert_dtype(out.get<nv_bfloat16>(), out_f.get<float>(), out.nelem(), mRunState.MainStream);
-            } else if (out.DType == ETensorDType::FP32) {
-                // no-op
-            } else {
-                throw std::runtime_error("router matmul: unsupported output dtype");
+            Tensor b_f = b;
+            if (b.DType != ETensorDType::FP32) {
+                b_f = mRunState.temp_alloc(ETensorDType::FP32, shape_vec(b), "matmul_router_b_fp32");
+                mTemps.push_back(b_f);
+                if (b.DType == ETensorDType::BF16) {
+                    convert_dtype(b_f.get<float>(), b.get<nv_bfloat16>(), b.nelem(), mRunState.MainStream);
+                } else {
+                    throw std::runtime_error("router matmul: unsupported weight dtype");
+                }
             }
+
+            std::optional<Tensor> bias_f;
+            if (bias.has_value()) {
+                if (bias->DType == ETensorDType::FP32) {
+                    bias_f = bias;
+                } else {
+                    Tensor tmp = mRunState.temp_alloc(ETensorDType::FP32, shape_vec(*bias), "matmul_router_bias_fp32");
+                    mTemps.push_back(tmp);
+                    if (bias->DType == ETensorDType::BF16) {
+                        convert_dtype(tmp.get<float>(), bias->get<nv_bfloat16>(), bias->nelem(), mRunState.MainStream);
+                    } else {
+                        throw std::runtime_error("router matmul: unsupported bias dtype");
+                    }
+                    bias_f = tmp;
+                }
+            }
+
+            Tensor out_f = out;
+            if (out.DType != ETensorDType::FP32) {
+                out_f = mRunState.temp_alloc(ETensorDType::FP32, shape_vec(out), "matmul_router_out_fp32");
+                mTemps.push_back(out_f);
+            }
+
+            EMMTranspose mode_col = swap_transpose(op.attrs.transpose);
+            matmul(out_f,
+                   b_f,
+                   a_f,
+                   bias_f,
+                   nullptr,
+                   nullptr,
+                   mRunState.CublasLtHandle,
+                   mRunState.CuBlasWorkspace,
+                   N,
+                   M,
+                   K,
+                   mode_col,
+                   false,
+                   mRunState.MainStream);
+            if (out.DType != ETensorDType::FP32) {
+                if (out.DType == ETensorDType::BF16) {
+                    convert_dtype(out.get<nv_bfloat16>(), out_f.get<float>(), out.nelem(), mRunState.MainStream);
+                } else if (out.DType == ETensorDType::FP32) {
+                    // no-op
+                } else {
+                    throw std::runtime_error("router matmul: unsupported output dtype");
+                }
+            }
+            return;
         }
-        return;
     }
 
     bool used_recipe = false;
     modules::MatmulContext ctx{};
+    Tensor resident_fp4_data_view{};
+    Tensor resident_fp4_scales_view{};
     modules::MatmulContext* ctx_ptr = nullptr;
     try {
         if (mRecipe && op.attrs.transpose == EMMTranspose::NT && a.Sizes[0] == mB * mT && !is_shared_weight) {
             if (op.attrs.allow_quant && op.attrs.matmul_op.has_value()) {
                 ctx.out = &out;
                 ctx.inp = &a;
-                ctx.weight = &b;
+                ctx.weight = b_resolved ? b_resolved : &b_template;
                 ctx.bias = bias ? &*bias : nullptr;
                 ctx.B = static_cast<int>(mB);
                 ctx.T = static_cast<int>(mT);
@@ -146,23 +264,24 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
                 ctx.stream = mRunState.MainStream;
                 ctx.layer_idx = op.attrs.layer_idx;
                 ctx.op = *op.attrs.matmul_op;
+                ctx.op_caps = op.default_caps;
+                ctx.matmul_caps = op.matmul_caps;
+                ctx.epilogue_support = op.epilogue_support;
+                ctx.storage_compat = op.storage_compat;
+                attach_input_role(ctx, mCurrentGraph, op.inputs[0]);
                 ctx.allow_fp8 = mRecipe->uses_fp8_forward();
                 ctx.allow_fp4 = mRecipe->uses_fp4_forward();
 
                 // Wire FP8/FP4 buffers + static weight caches (GraphExecutor primes caches before CUDA graph capture).
                 if (ctx.allow_fp8) {
+                    Tensor& b = resolve_weight();
+                    ctx.weight = &b;
                     ctx.inp_quant = fp8_forward_buffer(mRunState, *op.attrs.matmul_op);
                     ctx.delayed_quantizer_idx = fp8_quantizer_index(mRunState, *op.attrs.matmul_op, op.attrs.layer_idx);
 
                     // Check if the upstream activation dispatch has already pre-quantized
                     // the input into the FP8 buffer (co-located quantization).
-                    DslRunState::FP8BufferReady ready_flag = DslRunState::FP8Ready_None;
-                    switch (*op.attrs.matmul_op) {
-                        case modules::MatmulOp::QKV: ready_flag = DslRunState::FP8Ready_LN1; break;
-                        case modules::MatmulOp::MLPUp: ready_flag = DslRunState::FP8Ready_LN2; break;
-                        case modules::MatmulOp::MLPDown: ready_flag = DslRunState::FP8Ready_SwiGLU; break;
-                        default: break;
-                    }
+                    DslRunState::FP8BufferReady ready_flag = fp8_ready_flag_for_matmul_op(*op.attrs.matmul_op);
                     if (ready_flag != DslRunState::FP8Ready_None) {
                         if (is_gate_projection && mRunState.is_fp8_buffer_ready(ready_flag)) {
                             ctx.inp_quant_ready = true;
@@ -189,6 +308,19 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
                         ctx.cached_fp4_amax = it->second.amax.get<float>();
                     }
                 }
+                if (ctx.allow_fp4 && !ctx.cached_fp4_data) {
+                    (void)attach_resident_qlora_fp4_cache(ctx,
+                                                          mWeights,
+                                                          mRunState,
+                                                          mTemps,
+                                                          resident_fp4_data_view,
+                                                          resident_fp4_scales_view,
+                                                          weight_name,
+                                                          mCapturing);
+                }
+                if (!ctx.cached_fp4_data && !ctx.cached_weight) {
+                    ctx.weight = &resolve_weight();
+                }
 
                 used_recipe = true;
                 mRecipe->forward_matmul(ctx);
@@ -197,6 +329,7 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
         }
 
         if (!used_recipe) {
+            Tensor& b = resolve_weight();
             EMMTranspose mode_col = swap_transpose(op.attrs.transpose);
             matmul(out,
                    b,
@@ -218,10 +351,10 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
                                  "' transpose=" + std::to_string(static_cast<int>(op.attrs.transpose)) +
                                  " used_recipe=" + std::string(used_recipe ? "1" : "0") + " M=" + std::to_string(M) +
                                  " N=" + std::to_string(N) + " K=" + std::to_string(K) +
-                                 " a_rank=" + std::to_string(a.Rank) + " b_rank=" + std::to_string(b.Rank) +
+                                 " a_rank=" + std::to_string(a.Rank) + " b_rank=" + std::to_string(b_template.Rank) +
                                  " out_rank=" + std::to_string(out.Rank) +
                                  " a_dtype=" + std::to_string(static_cast<int>(a.DType)) +
-                                 " b_dtype=" + std::to_string(static_cast<int>(b.DType)) +
+                                 " b_dtype=" + std::to_string(static_cast<int>(b_template.DType)) +
                                  " out_dtype=" + std::to_string(static_cast<int>(out.DType)) + ": " + e.what());
     }
 
@@ -255,6 +388,26 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
 
     (void)hook;
 
+    LoRAForwardApplyContext lora_apply_ctx;
+    AfterProduceHookPayload after_produce_payload;
+    if (!op.attrs.lora_slices.empty()) {
+        Tensor a_flat = flatten_bt(a, mB, mT);
+        Tensor out_flat = flatten_bt(out, mB, mT);
+        lora_apply_ctx.slices = &op.attrs.lora_slices;
+        lora_apply_ctx.layer_idx = op.attrs.layer_idx;
+        lora_apply_ctx.input_2d = a_flat;
+        lora_apply_ctx.output_2d = out_flat;
+        lora_apply_ctx.BT = static_cast<int>(a_flat.Sizes[0]);
+        lora_apply_ctx.weights = mLoRAWeights;
+        lora_apply_ctx.config = mLoRAConfig;
+        lora_apply_ctx.run_state = mLoRARunState;
+        lora_apply_ctx.handle = mRunState.CublasLtHandle;
+        lora_apply_ctx.workspace = &mRunState.CuBlasWorkspace;
+        lora_apply_ctx.stream = mRunState.MainStream;
+        after_produce_payload.action_context = &lora_apply_ctx;
+        after_produce_payload.apply_lora = apply_lora_forward_payload;
+    }
+
     // Rebind the per-layer activation slot to the just-produced buffer so
     // backward replays read the live tensor rather than a stale one.
     if (op.attrs.forward_hook_point.has_value() && op.attrs.layer_idx >= 0 && op.attrs.layer_idx < mConfig.NumLayers) {
@@ -264,6 +417,7 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
             case modules::ForwardHookPoint::AfterAttnOutProjection: slot = TensorSlot::BlockAttOut; break;
             case modules::ForwardHookPoint::AfterMLPUpProjection: slot = TensorSlot::BlockMLPUp; break;
             case modules::ForwardHookPoint::AfterMLPDownProjection: slot = TensorSlot::BlockMLPDown; break;
+            case modules::ForwardHookPoint::AfterRouterProjection: slot = TensorSlot::BlockRouterLogits; break;
             default: break;
         }
         if (slot != TensorSlot::Mapped) {
@@ -271,23 +425,15 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
                 t->Data = out.Data;
             }
         }
+        dispatch_schema_hook(HookEventKind::AfterProduce,
+                             op.attrs.layer_idx,
+                             op.attrs.hook_schema_id,
+                             op.attrs.forward_hook_schema_slot,
+                             op.attrs.lora_slices.empty() ? nullptr : &after_produce_payload);
     }
 
-    if (!op.attrs.lora_slices.empty()) {
-        Tensor a_flat = flatten_bt(a, mB, mT);
-        Tensor out_flat = flatten_bt(out, mB, mT);
-        const int BT = static_cast<int>(a_flat.Sizes[0]);
-        modules::detail::apply_lora_slices_forward(op.attrs.lora_slices,
-                                                   op.attrs.layer_idx,
-                                                   a_flat,
-                                                   out_flat,
-                                                   BT,
-                                                   mLoRAWeights,
-                                                   mLoRAConfig,
-                                                   mLoRARunState,
-                                                   mRunState.CublasLtHandle,
-                                                   mRunState.CuBlasWorkspace,
-                                                   mRunState.MainStream);
+    if (!op.attrs.lora_slices.empty() && !after_produce_payload.lora_applied) {
+        apply_lora_forward_payload(&lora_apply_ctx);
     }
 }
 
@@ -508,6 +654,11 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
         ctx.stream = mRunState.MainStream;
         ctx.layer_idx = layer_idx;
         ctx.op = op.attrs.matmul_op.value_or(modules::MatmulOp::LMHead);
+        ctx.op_caps = op.default_caps;
+        ctx.matmul_caps = op.matmul_caps;
+        ctx.epilogue_support = op.epilogue_support;
+        ctx.storage_compat = op.storage_compat;
+        attach_input_role(ctx, mCurrentGraph, op.inputs[0]);
         ctx.accumulate = do_accumulate;
         ctx.skip_weight_grad = skip_weight_grad || !dB_ptr;
         ctx.allow_fp8 = allow_quant && mRecipe->uses_fp8_hybrid_backward();

@@ -14,8 +14,10 @@
 
 #include <cublas_v2.h>
 
+#include "runtime/dsl/buffer_plan.h"
 #include "runtime/dsl/ir.h"
 #include "runtime/dsl/dsl_runtime_config.h"
+#include "runtime/dsl/hook_registry.h"
 #include "runtime/core/model_config.h"
 #include "runtime/lora/lora_config.h"
 #include "runtime/lora/lora_grads_manager.h"
@@ -169,6 +171,9 @@ public:
         return *mLoRAConfig;
     }
     const DslGradStore& grads() const;
+    [[nodiscard]] const HookRegistry& hook_registry() const {
+        return mHookRegistry;
+    }
 
     std::vector<std::byte> rng_state() const override;
     void set_rng_state(const std::vector<std::byte>& state) override;
@@ -339,6 +344,8 @@ private:
     IRFile mIr;
     const Module* mModule = nullptr;
     DslRuntimeConfig mRuntimeConfig;
+    std::vector<BlockSchemaPlanRecord> mBlockSchemaPlanRecords;
+    HookRegistry mHookRegistry;
     std::unique_ptr<DslParamStore> mParams;
     std::unique_ptr<DslGradStore> mGrads;
     std::unique_ptr<DslWeightManager> mWeightManager;  // Optional - for streaming/sharding

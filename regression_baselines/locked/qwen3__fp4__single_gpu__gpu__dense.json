@@ -1,0 +1,19 @@
+{
+  "artifacts": {},
+  "case": {
+    "config": null,
+    "distribution": "single_gpu",
+    "env_model_path": null,
+    "model": "qwen3",
+    "op_kind": "dense",
+    "recipe": "fp4",
+    "storage": "gpu",
+    "supported": false
+  },
+  "command": [],
+  "duration_s": 0.0,
+  "metrics": {},
+  "reason": "unsupported in first-month matrix",
+  "started_at": 0.0,
+  "status": "skipped"
+}

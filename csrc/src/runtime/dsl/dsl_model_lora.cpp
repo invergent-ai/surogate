@@ -310,51 +310,16 @@ void DslModel::populate_lora_norm_pointers(NCCLCommunicator& comm, cudaStream_t 
         h_dtype_flags.push_back(t.DType == ETensorDType::BF16 ? 1 : 0);
     };
 
-    auto collect_layer = [&](const auto& layer) {
-        if (!layer.has_value()) return;
-        collect_tensor(layer->A);
-        collect_tensor(layer->B);
-    };
-
-    auto collect_grouped_layer = [&](const auto& layer) {
-        if (!layer.has_value()) return;
-        collect_tensor(layer->A);
-        collect_tensor(layer->B);
+    auto collect_layer = [&](auto, auto& layer) {
+        collect_tensor(layer.A);
+        collect_tensor(layer.B);
     };
 
     for (int l = 0; l < mModelConfig.NumLayers; ++l) {
         bool unused_acc = false;
         auto& g = mLoRAGrads->get_block_full(l, stream, comm, unused_acc);
 
-        collect_layer(g.attention.q);
-        collect_layer(g.attention.k);
-        collect_layer(g.attention.v);
-        collect_layer(g.attention.o);
-        collect_layer(g.mlp.gate);
-        collect_layer(g.mlp.gate_up);
-        collect_layer(g.mlp.up);
-        collect_layer(g.mlp.down);
-
-        if (g.moe.use_grouped) {
-            collect_grouped_layer(g.moe.grouped.gate);
-            collect_grouped_layer(g.moe.grouped.gate_up);
-            collect_grouped_layer(g.moe.grouped.up);
-            collect_grouped_layer(g.moe.grouped.down);
-        } else {
-            for (auto& expert : g.moe.experts) {
-                collect_layer(expert.gate);
-                collect_layer(expert.gate_up);
-                collect_layer(expert.up);
-                collect_layer(expert.down);
-            }
-        }
-
-        if (g.moe.shared.has_value()) {
-            collect_layer(g.moe.shared->up);
-            collect_layer(g.moe.shared->down);
-        }
-
-        collect_layer(g.router);
+        modules::for_each_lora_layer_weight(g, collect_layer);
     }
 
     lrs.norm_num_tensors = static_cast<int>(h_data_ptrs.size());
@@ -483,93 +448,10 @@ void DslModel::initialize_lora_multi_tensor_state(NCCLCommunicator& comm, cudaSt
 
     for (int l = 0; l < mModelConfig.NumLayers; ++l) {
         auto& lora_w = mLoRAWeights->get_master_block(l, stream);
-
-        if (lora_w.attention.q.has_value()) {
-            collect_tensor(lora_w.attention.q->A);
-            collect_tensor(lora_w.attention.q->B);
-        }
-        if (lora_w.attention.k.has_value()) {
-            collect_tensor(lora_w.attention.k->A);
-            collect_tensor(lora_w.attention.k->B);
-        }
-        if (lora_w.attention.v.has_value()) {
-            collect_tensor(lora_w.attention.v->A);
-            collect_tensor(lora_w.attention.v->B);
-        }
-        if (lora_w.attention.o.has_value()) {
-            collect_tensor(lora_w.attention.o->A);
-            collect_tensor(lora_w.attention.o->B);
-        }
-        if (lora_w.mlp.gate.has_value()) {
-            collect_tensor(lora_w.mlp.gate->A);
-            collect_tensor(lora_w.mlp.gate->B);
-        }
-        if (lora_w.mlp.gate_up.has_value()) {
-            collect_tensor(lora_w.mlp.gate_up->A);
-            collect_tensor(lora_w.mlp.gate_up->B);
-        }
-        if (lora_w.mlp.up.has_value()) {
-            collect_tensor(lora_w.mlp.up->A);
-            collect_tensor(lora_w.mlp.up->B);
-        }
-        if (lora_w.mlp.down.has_value()) {
-            collect_tensor(lora_w.mlp.down->A);
-            collect_tensor(lora_w.mlp.down->B);
-        }
-
-        if (lora_w.moe.use_grouped) {
-            if (lora_w.moe.grouped.gate.has_value()) {
-                collect_tensor(lora_w.moe.grouped.gate->A);
-                collect_tensor(lora_w.moe.grouped.gate->B);
-            }
-            if (lora_w.moe.grouped.gate_up.has_value()) {
-                collect_tensor(lora_w.moe.grouped.gate_up->A);
-                collect_tensor(lora_w.moe.grouped.gate_up->B);
-            }
-            if (lora_w.moe.grouped.up.has_value()) {
-                collect_tensor(lora_w.moe.grouped.up->A);
-                collect_tensor(lora_w.moe.grouped.up->B);
-            }
-            if (lora_w.moe.grouped.down.has_value()) {
-                collect_tensor(lora_w.moe.grouped.down->A);
-                collect_tensor(lora_w.moe.grouped.down->B);
-            }
-        } else {
-            for (auto& expert : lora_w.moe.experts) {
-                if (expert.gate.has_value()) {
-                    collect_tensor(expert.gate->A);
-                    collect_tensor(expert.gate->B);
-                }
-                if (expert.gate_up.has_value()) {
-                    collect_tensor(expert.gate_up->A);
-                    collect_tensor(expert.gate_up->B);
-                }
-                if (expert.up.has_value()) {
-                    collect_tensor(expert.up->A);
-                    collect_tensor(expert.up->B);
-                }
-                if (expert.down.has_value()) {
-                    collect_tensor(expert.down->A);
-                    collect_tensor(expert.down->B);
-                }
-            }
-        }
-
-        if (lora_w.moe.shared.has_value()) {
-            if (lora_w.moe.shared->up.has_value()) {
-                collect_tensor(lora_w.moe.shared->up->A);
-                collect_tensor(lora_w.moe.shared->up->B);
-            }
-            if (lora_w.moe.shared->down.has_value()) {
-                collect_tensor(lora_w.moe.shared->down->A);
-                collect_tensor(lora_w.moe.shared->down->B);
-            }
-        }
-
-        if (lora_w.router.has_value() && lora_w.router->has_value()) {
-            collect_tensor(lora_w.router->A);
-            collect_tensor(lora_w.router->B);
-        }
+        modules::for_each_lora_layer_weight(lora_w, [&](auto, auto& layer) {
+            collect_tensor(layer.A);
+            collect_tensor(layer.B);
+        });
     }
 
     state.num_tensors = static_cast<int>(h_param_ptrs.size());
@@ -652,48 +534,14 @@ void DslModel::update_lora_grad_pointers(NCCLCommunicator& comm, cudaStream_t st
     h_grad_ptrs.reserve(state.num_tensors);
     bool unused_acc = false;
 
-    auto collect_grad = [&](std::optional<modules::LoRALayerWeights<Tensor>>& grad_opt) {
-        if (!grad_opt.has_value()) return;
-        if (grad_opt->A.Data) h_grad_ptrs.push_back(grad_opt->A.Data);
-        if (grad_opt->B.Data) h_grad_ptrs.push_back(grad_opt->B.Data);
-    };
-    auto collect_grouped_grad = [&](std::optional<modules::LoRAGroupedLayerWeights<Tensor>>& grad_opt) {
-        if (!grad_opt.has_value()) return;
-        if (grad_opt->A.Data) h_grad_ptrs.push_back(grad_opt->A.Data);
-        if (grad_opt->B.Data) h_grad_ptrs.push_back(grad_opt->B.Data);
+    auto collect_layer = [&](auto, auto& layer) {
+        if (layer.A.Data) h_grad_ptrs.push_back(layer.A.Data);
+        if (layer.B.Data) h_grad_ptrs.push_back(layer.B.Data);
     };
 
     for (int l = 0; l < mModelConfig.NumLayers; ++l) {
         auto& lora_g = mLoRAGrads->get_block_full(l, stream, comm, unused_acc);
-        collect_grad(lora_g.attention.q);
-        collect_grad(lora_g.attention.k);
-        collect_grad(lora_g.attention.v);
-        collect_grad(lora_g.attention.o);
-        collect_grad(lora_g.mlp.gate);
-        collect_grad(lora_g.mlp.gate_up);
-        collect_grad(lora_g.mlp.up);
-        collect_grad(lora_g.mlp.down);
-
-        if (lora_g.moe.use_grouped) {
-            collect_grouped_grad(lora_g.moe.grouped.gate);
-            collect_grouped_grad(lora_g.moe.grouped.gate_up);
-            collect_grouped_grad(lora_g.moe.grouped.up);
-            collect_grouped_grad(lora_g.moe.grouped.down);
-        } else {
-            for (auto& expert : lora_g.moe.experts) {
-                collect_grad(expert.gate);
-                collect_grad(expert.gate_up);
-                collect_grad(expert.up);
-                collect_grad(expert.down);
-            }
-        }
-
-        if (lora_g.moe.shared.has_value()) {
-            collect_grad(lora_g.moe.shared->up);
-            collect_grad(lora_g.moe.shared->down);
-        }
-
-        collect_grad(lora_g.router);
+        modules::for_each_lora_layer_weight(lora_g, collect_layer);
     }
 
     if (h_grad_ptrs.size() != static_cast<std::size_t>(state.num_tensors)) {
@@ -735,93 +583,10 @@ void DslModel::initialize_lora_adamw_state(NCCLCommunicator& comm, cudaStream_t 
 
     for (int l = 0; l < mModelConfig.NumLayers; ++l) {
         auto& lora_w = mLoRAWeights->get_master_block(l, stream);
-
-        if (lora_w.attention.q.has_value()) {
-            collect_tensor(lora_w.attention.q->A);
-            collect_tensor(lora_w.attention.q->B);
-        }
-        if (lora_w.attention.k.has_value()) {
-            collect_tensor(lora_w.attention.k->A);
-            collect_tensor(lora_w.attention.k->B);
-        }
-        if (lora_w.attention.v.has_value()) {
-            collect_tensor(lora_w.attention.v->A);
-            collect_tensor(lora_w.attention.v->B);
-        }
-        if (lora_w.attention.o.has_value()) {
-            collect_tensor(lora_w.attention.o->A);
-            collect_tensor(lora_w.attention.o->B);
-        }
-        if (lora_w.mlp.gate.has_value()) {
-            collect_tensor(lora_w.mlp.gate->A);
-            collect_tensor(lora_w.mlp.gate->B);
-        }
-        if (lora_w.mlp.gate_up.has_value()) {
-            collect_tensor(lora_w.mlp.gate_up->A);
-            collect_tensor(lora_w.mlp.gate_up->B);
-        }
-        if (lora_w.mlp.up.has_value()) {
-            collect_tensor(lora_w.mlp.up->A);
-            collect_tensor(lora_w.mlp.up->B);
-        }
-        if (lora_w.mlp.down.has_value()) {
-            collect_tensor(lora_w.mlp.down->A);
-            collect_tensor(lora_w.mlp.down->B);
-        }
-
-        if (lora_w.moe.use_grouped) {
-            if (lora_w.moe.grouped.gate.has_value()) {
-                collect_tensor(lora_w.moe.grouped.gate->A);
-                collect_tensor(lora_w.moe.grouped.gate->B);
-            }
-            if (lora_w.moe.grouped.gate_up.has_value()) {
-                collect_tensor(lora_w.moe.grouped.gate_up->A);
-                collect_tensor(lora_w.moe.grouped.gate_up->B);
-            }
-            if (lora_w.moe.grouped.up.has_value()) {
-                collect_tensor(lora_w.moe.grouped.up->A);
-                collect_tensor(lora_w.moe.grouped.up->B);
-            }
-            if (lora_w.moe.grouped.down.has_value()) {
-                collect_tensor(lora_w.moe.grouped.down->A);
-                collect_tensor(lora_w.moe.grouped.down->B);
-            }
-        } else {
-            for (auto& expert : lora_w.moe.experts) {
-                if (expert.gate.has_value()) {
-                    collect_tensor(expert.gate->A);
-                    collect_tensor(expert.gate->B);
-                }
-                if (expert.gate_up.has_value()) {
-                    collect_tensor(expert.gate_up->A);
-                    collect_tensor(expert.gate_up->B);
-                }
-                if (expert.up.has_value()) {
-                    collect_tensor(expert.up->A);
-                    collect_tensor(expert.up->B);
-                }
-                if (expert.down.has_value()) {
-                    collect_tensor(expert.down->A);
-                    collect_tensor(expert.down->B);
-                }
-            }
-        }
-
-        if (lora_w.moe.shared.has_value()) {
-            if (lora_w.moe.shared->up.has_value()) {
-                collect_tensor(lora_w.moe.shared->up->A);
-                collect_tensor(lora_w.moe.shared->up->B);
-            }
-            if (lora_w.moe.shared->down.has_value()) {
-                collect_tensor(lora_w.moe.shared->down->A);
-                collect_tensor(lora_w.moe.shared->down->B);
-            }
-        }
-
-        if (lora_w.router.has_value() && lora_w.router->has_value()) {
-            collect_tensor(lora_w.router->A);
-            collect_tensor(lora_w.router->B);
-        }
+        modules::for_each_lora_layer_weight(lora_w, [&](auto, auto& layer) {
+            collect_tensor(layer.A);
+            collect_tensor(layer.B);
+        });
     }
 
     state.num_tensors = static_cast<int>(h_param_ptrs.size());
@@ -887,48 +652,14 @@ void DslModel::update_lora_adamw_grad_pointers(NCCLCommunicator& comm, cudaStrea
     h_grad_ptrs.reserve(state.num_tensors);
     bool unused_acc = false;
 
-    auto collect_grad = [&](std::optional<modules::LoRALayerWeights<Tensor>>& grad_opt) {
-        if (!grad_opt.has_value()) return;
-        if (grad_opt->A.Data) h_grad_ptrs.push_back(grad_opt->A.Data);
-        if (grad_opt->B.Data) h_grad_ptrs.push_back(grad_opt->B.Data);
-    };
-    auto collect_grouped_grad = [&](std::optional<modules::LoRAGroupedLayerWeights<Tensor>>& grad_opt) {
-        if (!grad_opt.has_value()) return;
-        if (grad_opt->A.Data) h_grad_ptrs.push_back(grad_opt->A.Data);
-        if (grad_opt->B.Data) h_grad_ptrs.push_back(grad_opt->B.Data);
+    auto collect_layer = [&](auto, auto& layer) {
+        if (layer.A.Data) h_grad_ptrs.push_back(layer.A.Data);
+        if (layer.B.Data) h_grad_ptrs.push_back(layer.B.Data);
     };
 
     for (int l = 0; l < mModelConfig.NumLayers; ++l) {
         auto& lora_g = mLoRAGrads->get_block_full(l, stream, comm, unused_acc);
-        collect_grad(lora_g.attention.q);
-        collect_grad(lora_g.attention.k);
-        collect_grad(lora_g.attention.v);
-        collect_grad(lora_g.attention.o);
-        collect_grad(lora_g.mlp.gate);
-        collect_grad(lora_g.mlp.gate_up);
-        collect_grad(lora_g.mlp.up);
-        collect_grad(lora_g.mlp.down);
-
-        if (lora_g.moe.use_grouped) {
-            collect_grouped_grad(lora_g.moe.grouped.gate);
-            collect_grouped_grad(lora_g.moe.grouped.gate_up);
-            collect_grouped_grad(lora_g.moe.grouped.up);
-            collect_grouped_grad(lora_g.moe.grouped.down);
-        } else {
-            for (auto& expert : lora_g.moe.experts) {
-                collect_grad(expert.gate);
-                collect_grad(expert.gate_up);
-                collect_grad(expert.up);
-                collect_grad(expert.down);
-            }
-        }
-
-        if (lora_g.moe.shared.has_value()) {
-            collect_grad(lora_g.moe.shared->up);
-            collect_grad(lora_g.moe.shared->down);
-        }
-
-        collect_grad(lora_g.router);
+        modules::for_each_lora_layer_weight(lora_g, collect_layer);
     }
 
     if (h_grad_ptrs.size() != static_cast<std::size_t>(state.num_tensors)) {
@@ -1361,92 +1092,10 @@ void DslModel::update_lora_normuon(NCCLCommunicator& comm, const optimizers::Opt
 
         for (int l = 0; l < L; ++l) {
             auto& lora_w = mLoRAWeights->get_master_block(l, main_stream);
-            if (lora_w.attention.q.has_value()) {
-                add_param(lora_w.attention.q->A);
-                add_param(lora_w.attention.q->B);
-            }
-            if (lora_w.attention.k.has_value()) {
-                add_param(lora_w.attention.k->A);
-                add_param(lora_w.attention.k->B);
-            }
-            if (lora_w.attention.v.has_value()) {
-                add_param(lora_w.attention.v->A);
-                add_param(lora_w.attention.v->B);
-            }
-            if (lora_w.attention.o.has_value()) {
-                add_param(lora_w.attention.o->A);
-                add_param(lora_w.attention.o->B);
-            }
-            if (lora_w.mlp.gate.has_value()) {
-                add_param(lora_w.mlp.gate->A);
-                add_param(lora_w.mlp.gate->B);
-            }
-            if (lora_w.mlp.gate_up.has_value()) {
-                add_param(lora_w.mlp.gate_up->A);
-                add_param(lora_w.mlp.gate_up->B);
-            }
-            if (lora_w.mlp.up.has_value()) {
-                add_param(lora_w.mlp.up->A);
-                add_param(lora_w.mlp.up->B);
-            }
-            if (lora_w.mlp.down.has_value()) {
-                add_param(lora_w.mlp.down->A);
-                add_param(lora_w.mlp.down->B);
-            }
-
-            if (lora_w.moe.use_grouped) {
-                if (lora_w.moe.grouped.gate.has_value()) {
-                    add_param(lora_w.moe.grouped.gate->A);
-                    add_param(lora_w.moe.grouped.gate->B);
-                }
-                if (lora_w.moe.grouped.gate_up.has_value()) {
-                    add_param(lora_w.moe.grouped.gate_up->A);
-                    add_param(lora_w.moe.grouped.gate_up->B);
-                }
-                if (lora_w.moe.grouped.up.has_value()) {
-                    add_param(lora_w.moe.grouped.up->A);
-                    add_param(lora_w.moe.grouped.up->B);
-                }
-                if (lora_w.moe.grouped.down.has_value()) {
-                    add_param(lora_w.moe.grouped.down->A);
-                    add_param(lora_w.moe.grouped.down->B);
-                }
-            } else {
-                for (auto& expert : lora_w.moe.experts) {
-                    if (expert.gate.has_value()) {
-                        add_param(expert.gate->A);
-                        add_param(expert.gate->B);
-                    }
-                    if (expert.gate_up.has_value()) {
-                        add_param(expert.gate_up->A);
-                        add_param(expert.gate_up->B);
-                    }
-                    if (expert.up.has_value()) {
-                        add_param(expert.up->A);
-                        add_param(expert.up->B);
-                    }
-                    if (expert.down.has_value()) {
-                        add_param(expert.down->A);
-                        add_param(expert.down->B);
-                    }
-                }
-            }
-
-            if (lora_w.moe.shared.has_value()) {
-                if (lora_w.moe.shared->up.has_value()) {
-                    add_param(lora_w.moe.shared->up->A);
-                    add_param(lora_w.moe.shared->up->B);
-                }
-                if (lora_w.moe.shared->down.has_value()) {
-                    add_param(lora_w.moe.shared->down->A);
-                    add_param(lora_w.moe.shared->down->B);
-                }
-            }
-
-            if (lora_w.router.has_value() && lora_w.router->has_value()) {
-                add_param(lora_w.router->A);
-                add_param(lora_w.router->B);
-            }
+            modules::for_each_lora_layer_weight(lora_w, [&](auto, auto& layer) {
+                add_param(layer.A);
+                add_param(layer.B);
+            });
         }
 
         state.num_blocks = (state.state_elems + BLOCK_SIZE - 1) / BLOCK_SIZE;
@@ -1546,94 +1195,10 @@ void DslModel::update_lora_normuon(NCCLCommunicator& comm, const optimizers::Opt
         auto& lora_w = mLoRAWeights->get_master_block(l, main_stream);
         auto& lora_g = mLoRAGrads->get_block_full(l, main_stream, comm, unused_acc);
 
-        if (lora_w.attention.q.has_value() && lora_g.attention.q.has_value()) {
-            update_param(lora_w.attention.q->A, lora_g.attention.q->A);
-            update_param(lora_w.attention.q->B, lora_g.attention.q->B);
-        }
-        if (lora_w.attention.k.has_value() && lora_g.attention.k.has_value()) {
-            update_param(lora_w.attention.k->A, lora_g.attention.k->A);
-            update_param(lora_w.attention.k->B, lora_g.attention.k->B);
-        }
-        if (lora_w.attention.v.has_value() && lora_g.attention.v.has_value()) {
-            update_param(lora_w.attention.v->A, lora_g.attention.v->A);
-            update_param(lora_w.attention.v->B, lora_g.attention.v->B);
-        }
-        if (lora_w.attention.o.has_value() && lora_g.attention.o.has_value()) {
-            update_param(lora_w.attention.o->A, lora_g.attention.o->A);
-            update_param(lora_w.attention.o->B, lora_g.attention.o->B);
-        }
-        if (lora_w.mlp.gate.has_value() && lora_g.mlp.gate.has_value()) {
-            update_param(lora_w.mlp.gate->A, lora_g.mlp.gate->A);
-            update_param(lora_w.mlp.gate->B, lora_g.mlp.gate->B);
-        }
-        if (lora_w.mlp.gate_up.has_value() && lora_g.mlp.gate_up.has_value()) {
-            update_param(lora_w.mlp.gate_up->A, lora_g.mlp.gate_up->A);
-            update_param(lora_w.mlp.gate_up->B, lora_g.mlp.gate_up->B);
-        }
-        if (lora_w.mlp.up.has_value() && lora_g.mlp.up.has_value()) {
-            update_param(lora_w.mlp.up->A, lora_g.mlp.up->A);
-            update_param(lora_w.mlp.up->B, lora_g.mlp.up->B);
-        }
-        if (lora_w.mlp.down.has_value() && lora_g.mlp.down.has_value()) {
-            update_param(lora_w.mlp.down->A, lora_g.mlp.down->A);
-            update_param(lora_w.mlp.down->B, lora_g.mlp.down->B);
-        }
-
-        if (lora_w.moe.use_grouped) {
-            if (lora_w.moe.grouped.gate.has_value() && lora_g.moe.grouped.gate.has_value()) {
-                update_param(lora_w.moe.grouped.gate->A, lora_g.moe.grouped.gate->A);
-                update_param(lora_w.moe.grouped.gate->B, lora_g.moe.grouped.gate->B);
-            }
-            if (lora_w.moe.grouped.gate_up.has_value() && lora_g.moe.grouped.gate_up.has_value()) {
-                update_param(lora_w.moe.grouped.gate_up->A, lora_g.moe.grouped.gate_up->A);
-                update_param(lora_w.moe.grouped.gate_up->B, lora_g.moe.grouped.gate_up->B);
-            }
-            if (lora_w.moe.grouped.up.has_value() && lora_g.moe.grouped.up.has_value()) {
-                update_param(lora_w.moe.grouped.up->A, lora_g.moe.grouped.up->A);
-                update_param(lora_w.moe.grouped.up->B, lora_g.moe.grouped.up->B);
-            }
-            if (lora_w.moe.grouped.down.has_value() && lora_g.moe.grouped.down.has_value()) {
-                update_param(lora_w.moe.grouped.down->A, lora_g.moe.grouped.down->A);
-                update_param(lora_w.moe.grouped.down->B, lora_g.moe.grouped.down->B);
-            }
-        } else {
-            for (std::size_t e = 0; e < lora_w.moe.experts.size() && e < lora_g.moe.experts.size(); ++e) {
-                auto& w_exp = lora_w.moe.experts[e];
-                auto& g_exp = lora_g.moe.experts[e];
-                if (w_exp.gate.has_value() && g_exp.gate.has_value()) {
-                    update_param(w_exp.gate->A, g_exp.gate->A);
-                    update_param(w_exp.gate->B, g_exp.gate->B);
-                }
-                if (w_exp.gate_up.has_value() && g_exp.gate_up.has_value()) {
-                    update_param(w_exp.gate_up->A, g_exp.gate_up->A);
-                    update_param(w_exp.gate_up->B, g_exp.gate_up->B);
-                }
-                if (w_exp.up.has_value() && g_exp.up.has_value()) {
-                    update_param(w_exp.up->A, g_exp.up->A);
-                    update_param(w_exp.up->B, g_exp.up->B);
-                }
-                if (w_exp.down.has_value() && g_exp.down.has_value()) {
-                    update_param(w_exp.down->A, g_exp.down->A);
-                    update_param(w_exp.down->B, g_exp.down->B);
-                }
-            }
-        }
-
-        if (lora_w.moe.shared.has_value() && lora_g.moe.shared.has_value()) {
-            if (lora_w.moe.shared->up.has_value() && lora_g.moe.shared->up.has_value()) {
-                update_param(lora_w.moe.shared->up->A, lora_g.moe.shared->up->A);
-                update_param(lora_w.moe.shared->up->B, lora_g.moe.shared->up->B);
-            }
-            if (lora_w.moe.shared->down.has_value() && lora_g.moe.shared->down.has_value()) {
-                update_param(lora_w.moe.shared->down->A, lora_g.moe.shared->down->A);
-                update_param(lora_w.moe.shared->down->B, lora_g.moe.shared->down->B);
-            }
-        }
-
-        if (lora_w.router.has_value() && lora_g.router.has_value()) {
-            update_param(lora_w.router->A, lora_g.router->A);
-            update_param(lora_w.router->B, lora_g.router->B);
-        }
+        modules::for_each_lora_layer_weight_pair(lora_w, lora_g, [&](auto, auto& w_layer, auto& g_layer) {
+            update_param(w_layer.A, g_layer.A);
+            update_param(w_layer.B, g_layer.B);
+        });
     }
 
     if (rs.has_fp8_delayed_scaling()) {

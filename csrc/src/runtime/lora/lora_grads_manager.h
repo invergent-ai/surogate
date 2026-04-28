@@ -6,6 +6,7 @@
 #define SUROGATE_SRC_MODULES_LORA_LORA_GRADS_MANAGER_H
 
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "lora_types.h"
@@ -15,6 +16,10 @@
 
 class TensorAllocator;
 class NCCLCommunicator;
+
+namespace dsl {
+class HookRegistry;
+}  // namespace dsl
 
 namespace modules {
 
@@ -89,6 +94,8 @@ public:
      * @brief Notify gradient computation complete for a block
      */
     void notify_block(int layer_idx, cudaStream_t stream, NCCLCommunicator& comm);
+    void set_schema_hook_registry(const dsl::HookRegistry* registry, std::vector<std::string> schema_ids_by_layer);
+    void reduce_layer_gradients(int layer_idx, cudaStream_t stream, NCCLCommunicator& comm);
 
     [[nodiscard]] bool is_first_micro_step() const {
         return mIsFirstMicroStep;
@@ -109,9 +116,13 @@ private:
 
     bool mIsFirstMicroStep = true;
     bool mIsLastMicroStep = false;
+    const dsl::HookRegistry* mSchemaHookRegistry = nullptr;
+    std::vector<std::string> mHookSchemaIdsByLayer;
+    bool mSchemaHookDispatchEnabled = false;
 
     void allocate_gradients();
     void reduce_gradients(cudaStream_t stream, NCCLCommunicator& comm);
+    int dispatch_schema_layer_hooks(int layer_idx, cudaStream_t stream, void* payload = nullptr);
 };
 
 }  // namespace modules

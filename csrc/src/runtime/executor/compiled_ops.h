@@ -16,6 +16,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -23,6 +24,7 @@
 #include <cuda_runtime.h>
 
 #include "runtime/dsl/forward_plan.h"
+#include "runtime/dsl/hook_registry.h"
 #include "runtime/ep/ep_state.h"
 #include "runtime/executor/graph_executor_internal.h"
 #include "runtime/dsl/ir.h"
@@ -118,6 +120,7 @@ public:
     void set_weight_manager(DslWeightManager* weight_manager);
     void set_recipe(const recipes::Recipe* recipe);
     void set_hook_context(void* context);
+    void set_schema_hook_registry(const HookRegistry* registry);
     /// Set the GPU buffer that receives per-token log P(target|context) values.
     /// When non-null, dispatch_fused_lm_head_loss writes log-probs and returns early
     /// (no loss accumulation, no gradient state update).
@@ -186,6 +189,7 @@ public:
     // Cache management
     void set_fp8_cache(std::unordered_map<std::string, FP8WeightCacheEntry>* cache);
     void set_fp8_cache_transposed(std::unordered_map<std::string, FP8WeightCacheEntry>* cache_t);
+    void set_moe_fp8_cache(std::unordered_map<std::string, MoEFP8WeightCacheEntry>* cache);
     void set_fp4_cache(std::unordered_map<std::string, FP4WeightCacheEntry>* cache,
                        std::unordered_map<std::string, FP4WeightCacheEntry>* cache_t);
     void set_saved_tensors(std::unordered_map<std::string, Tensor>* saved);
@@ -316,6 +320,13 @@ private:
 
     // Save MoE layer tensors to persistent storage at layer boundaries
     void save_moe_layer_tensors(int layer_idx);
+    int dispatch_schema_hook(HookEventKind event,
+                             int layer_idx,
+                             std::string_view schema_id,
+                             std::string_view slot_name,
+                             void* payload = nullptr);
+    int dispatch_schema_layer_hooks(HookEventKind event, int layer_idx, void* payload = nullptr);
+    [[nodiscard]] int schema_hook_layer_idx(const CompiledOp& op) const;
 
 public:
     // Direct dispatch functions. Public so op_registry trampolines can
@@ -486,6 +497,8 @@ private:
 
     Tensor* try_resolve_saved_live(const std::string& name, const Tensor& saved);
     Tensor resolve_moe_expert_offsets(const CompiledOp& op);
+    void attach_moe_fp8_cache(modules::MoeMatmulContext& ctx, const std::string& weight_name);
+    void invalidate_moe_fp8_cache(const std::string& weight_name);
 
     // Get host-side MoE expert offsets for a layer, using cache or syncing from device.
     const int* get_or_sync_moe_host_offsets(int layer_idx, const int* device_offsets, int num_experts);
@@ -560,6 +573,8 @@ private:
     DslWeightManager* mWeightManager = nullptr;
     const recipes::Recipe* mRecipe = nullptr;
     void* mHookContext = nullptr;
+    const HookRegistry* mSchemaHookRegistry = nullptr;
+    bool mSchemaHookDispatchEnabled = false;
     std::function<void(int, long, long, bool)> mRecomputeFn;
     bool mRecomputeEnabled = false;
     bool mRecomputeUseGraphs = true;
@@ -570,6 +585,9 @@ private:
     // Caches
     std::unordered_map<std::string, FP8WeightCacheEntry>* mFP8Cache = nullptr;
     std::unordered_map<std::string, FP8WeightCacheEntry>* mFP8CacheT = nullptr;
+    std::unordered_map<std::string, MoEFP8WeightCacheEntry>* mMoEFP8Cache = nullptr;
+    std::size_t mMoEFP8CacheBytes = 0;
+    std::optional<std::size_t> mMoEFP8CacheBudgetBytes;
     std::unordered_map<std::string, FP4WeightCacheEntry>* mFP4Cache = nullptr;
     std::unordered_map<std::string, FP4WeightCacheEntry>* mFP4CacheT = nullptr;
     std::unordered_map<std::string, Tensor>* mSaved = nullptr;

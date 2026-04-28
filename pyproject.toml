@@ -42,7 +42,10 @@ dependencies = [
     "qwen-vl-utils==0.0.14",
     "ray>=2.5.0",
     "verifiers==0.1.11",
-    "wandb==0.25.1"
+    "wandb==0.25.1",
+    "jaxtyping",
+    "aiolimiter",
+    "openai==2.32.0"
 ]
 scripts = { "surogate" = "surogate.cli.main:cli_main" }
 

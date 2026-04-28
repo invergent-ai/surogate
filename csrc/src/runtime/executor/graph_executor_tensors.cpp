@@ -10,6 +10,7 @@
 
 #include "runtime/dsl/dsl_runtime.h"
 #include "runtime/dsl/dsl_weight_manager.h"
+#include "runtime/dsl/tensor_role.h"
 #include "runtime/dsl/tensor_slot_dispatch.h"
 #include "runtime/dsl/tensor_slot_registry.h"
 #include "runtime/executor/graph_executor_utils.h"
@@ -226,7 +227,7 @@ Tensor& ensure_tensor(ExecState& st, const std::string& name, ETensorDType dtype
 }
 
 Tensor& resolve_param_tensor(ExecState& st, const std::string& name) {
-    if (name.find("rope_freqs") != std::string::npos) {
+    if (tensor_role_is_rope_name(name)) {
         auto& freqs = st.rs.rope_freqs(name);
         if (!freqs.Data) {
             throw std::runtime_error("DSL graph executor: RoPE frequencies not allocated");

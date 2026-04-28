@@ -1,0 +1,23 @@
+{
+  "artifacts": {},
+  "case": {
+    "config": "examples/sft/gpt-oss/gptoss-lora-mxfp4.yaml",
+    "distribution": "single_gpu",
+    "env_model_path": "GPT_OSS_MODEL_PATH",
+    "model": "gpt_oss",
+    "op_kind": "moe_grouped",
+    "recipe": "fp8",
+    "storage": "gpu",
+    "supported": true
+  },
+  "command": [
+    "surogate",
+    "sft",
+    "examples/sft/gpt-oss/gptoss-lora-mxfp4.yaml"
+  ],
+  "duration_s": 0.0,
+  "metrics": {},
+  "reason": "not executed; pass --run to launch GPU workload",
+  "started_at": 0.0,
+  "status": "skipped"
+}

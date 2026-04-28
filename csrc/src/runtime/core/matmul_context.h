@@ -10,6 +10,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 
+#include "runtime/executor/op_descriptor_types.h"
 #include "utilities/tensor.h"
 
 // Forward declaration of the global IRunState (defined in runtime/training/model.h)
@@ -110,6 +111,12 @@ struct MatmulContext {
 
     int layer_idx = 0;            ///< Current transformer layer index (0-based)
     MatmulOp op = MatmulOp::QKV;  ///< Which matmul operation
+    dsl::OpCapabilities op_caps{};
+    dsl::MatmulCapabilities matmul_caps{};
+    dsl::EpilogueSupport epilogue_support{};
+    dsl::StorageCompatibility storage_compat{};
+    dsl::TensorRole input_role{};
+    bool has_input_role = false;
 
     // =========================================================================
     // Backward-specific flags
@@ -270,6 +277,13 @@ struct MoeMatmulContext {
     Tensor* dout_quant = nullptr;    ///< E5M2 quantized gradient buffer (backward)
     int delayed_quantizer_idx = -1;  ///< Quantizer index for delayed scaling (-1 = JIT)
 
+    // Optional executor-owned FP8 expert weight cache. The recipe writes these
+    // during forward and reuses them during backward dgrad/wgrad when valid.
+    Tensor* cached_moe_weights_e4m3 = nullptr;
+    Tensor* cached_moe_weight_amax = nullptr;
+    Tensor* cached_moe_weight_scales = nullptr;
+    bool* cached_moe_weights_initialized = nullptr;
+
     // =========================================================================
     // Dimensions
     // =========================================================================
@@ -279,6 +293,12 @@ struct MoeMatmulContext {
     int K = 0;             ///< Input dimension per expert
     int total_tokens = 0;  ///< Total tokens across all experts
     int layer_idx = 0;     ///< Current layer index (for delayed scaling)
+    dsl::OpCapabilities op_caps{};
+    dsl::MoECapabilities moe_caps{};
+    dsl::EpilogueSupport epilogue_support{};
+    dsl::StorageCompatibility storage_compat{};
+    dsl::TensorRole token_role{};
+    bool has_token_role = false;
 
     // =========================================================================
     // Runtime
@@ -286,8 +306,9 @@ struct MoeMatmulContext {
 
     IRunState* run_state = nullptr;  ///< Run state for temp buffer allocation
     cudnnHandle_t cudnn_handle = nullptr;
-    void* cublas_handle = nullptr;   ///< cublasLtHandle_t for FP8×FP8 matmul
-    std::byte* workspace = nullptr;  ///< cuDNN/cuBLAS workspace
+    void* cublas_handle = nullptr;    ///< cublasHandle_t for BF16 grouped GEMM fallback
+    void* cublaslt_handle = nullptr;  ///< cublasLtHandle_t for FP8×FP8 grouped GEMM
+    std::byte* workspace = nullptr;   ///< cuDNN/cuBLAS workspace
     std::size_t workspace_size = 0;
     cudaStream_t stream = nullptr;
 

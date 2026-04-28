@@ -7,24 +7,60 @@ This gives you:
 - Surogate's near-SOL training throughput (LoRA, QLoRA, FP8)
 - Async RL pipeline (rollouts, reward computation, sample packing)
 - vLLM for fast inference and generation
-- Optional zero-copy GPU weight sharing between trainer and inference (co-locate mode)
+- Two single-command runners — split-GPU (`grpo`) and co-locate (`grpo-colocate`)
 - Training & Evaluation with [Environments](./rl-environments.md)
-  
+
 ## Architecture
 
-GRPO training supports two deployment modes: **co-locate** (single command, recommended) and **multi-process** (three separate processes).
+GRPO training supports three deployment modes:
 
-### Co-locate mode (single command)
+| Mode | Command | When to use |
+| --- | --- | --- |
+| **Split-GPU** | `surogate grpo` | Multiple GPUs available; want vLLM and the trainer on disjoint GPU sets |
+| **Co-locate** | `surogate grpo-colocate` | Single GPU, or any case where vLLM and the trainer should share GPUs (zero-copy base weights) |
+| **Multi-process** | `surogate grpo-infer` + `grpo-orch` + `grpo-train` | Multi-node, or when each component must run in its own process |
 
-The recommended way to run GRPO. A single `surogate grpo` command starts all three components in one process with zero-copy GPU weight sharing:
+### Split-GPU mode
+
+vLLM runs in a spawned subprocess with its own `CUDA_VISIBLE_DEVICES`; the trainer runs in the parent process on the remaining GPUs. Weight broadcasts go through the filesystem (no shared GPU memory):
 
 ```
-surogate grpo --train train.yaml --infer infer.yaml --orch orch.yaml
+surogate grpo --train train.yaml --infer infer.yaml --orch orch.yaml \
+    --vllm-gpus 0,1,2,3 --trainer-gpus 4,5,6,7
 ```
 
 ```
 ┌───────────────────────────────────────────────────────────┐
-│  surogate grpo (single process)                           │
+│  surogate grpo (split mode)                               │
+│                                                           │
+│  Parent process (CUDA_VISIBLE_DEVICES=<trainer ids>)      │
+│   ├─ Trainer thread                                       │
+│   │   └─ Loads its own copy of base weights from disk     │
+│   └─ Orchestrator (main async event loop)                 │
+│                                                           │
+│  Spawned vLLM subprocess (CUDA_VISIBLE_DEVICES=<vllm ids>)│
+│   └─ vLLM serves /v1/chat/completions                     │
+│                                                           │
+│  Communication:                                           │
+│   - Rollouts:  Orchestrator → vLLM via HTTP               │
+│   - Batches:   Orchestrator → Trainer via filesystem/zmq  │
+│   - Weights:   Trainer → vLLM via filesystem broadcast    │
+└───────────────────────────────────────────────────────────┘
+```
+
+The CLI is the source of truth for the trainer GPU count: `--trainer-gpus 4,5,6,7` automatically sets `train.gpus = 4`, and (for MoE models) `ep_size` is set to the same value. The YAML `gpus` field is ignored in this mode. The vLLM count must equal `infer.dp * infer.tp`.
+
+### Co-locate mode
+
+A single `surogate grpo-colocate` command starts all three components in one process with zero-copy GPU weight sharing:
+
+```
+surogate grpo-colocate --train train.yaml --infer infer.yaml --orch orch.yaml
+```
+
+```
+┌───────────────────────────────────────────────────────────┐
+│  surogate grpo-colocate (single process)                  │
 │                                                           │
 │  1. vLLM server (background thread, engine in subprocess) │
 │     └─ Owns quantized base weights on GPU                 │
@@ -46,9 +82,9 @@ surogate grpo --train train.yaml --infer infer.yaml --orch orch.yaml
 
 **Automatic memory management**: The trainer's GPU memory footprint (LoRA parameters, activations, dequantization buffers) is estimated automatically, and `gpu_memory_utilization` is computed so vLLM uses the remaining GPU memory for its KV cache. No manual tuning needed.
 
-### Multi-process mode (three processes)
+### Multi-process mode
 
-The original three-process architecture, useful for multi-node setups or when inference and training run on different GPUs:
+The original three-process architecture, useful for multi-node setups or any case where each component must live in its own process:
 
 ```
 ┌─────────────┐    rollouts    ┌──────────────┐    batches    ┌──────────────────┐
@@ -64,9 +100,9 @@ The original three-process architecture, useful for multi-node setups or when in
 
 The three processes communicate via a shared filesystem directory (`output_dir`).
 
-## Quick Start (co-locate mode)
+## Quick Start (split-GPU mode)
 
-This walkthrough uses the **reverse-text** example — a lightweight task that runs on a single GPU.
+This walkthrough uses the **reverse-text** example. Split-GPU mode needs at least two GPUs (one for vLLM, one for the trainer). For a single-GPU setup, see [Co-locate mode](#quick-start-co-locate-mode) below.
 
 ### 1. Create the three config files
 
@@ -75,7 +111,7 @@ This walkthrough uses the **reverse-text** example — a lightweight task that r
 ```yaml
 model: "Qwen/Qwen3-0.6B"
 output_dir: ./outputs
-gpus: 1
+gpus: 1  # ignored in split mode (auto-derived from --trainer-gpus)
 
 per_device_train_batch_size: 1
 sequence_len: 2048
@@ -143,22 +179,33 @@ sampling:
 ### 2. Run with a single command
 
 ```bash
-surogate grpo --train train.yaml --infer infer.yaml --orch orch.yaml
+surogate grpo --train train.yaml --infer infer.yaml --orch orch.yaml \
+    --vllm-gpus 0 --trainer-gpus 1
 ```
 
 That's it. The command:
 
-1. Starts the vLLM inference server in the background
-2. Extracts GPU weight pointers via CUDA IPC for zero-copy sharing
-3. Starts the Surogate trainer (borrows vLLM's weights)
+1. Spawns the vLLM inference server as a subprocess with `CUDA_VISIBLE_DEVICES=0`
+2. Polls `/health` until vLLM is ready
+3. Starts the Surogate trainer in a background thread, restricted to GPU 1
 4. Runs the orchestrator, which coordinates rollouts and training steps
-5. Shuts down cleanly when `max_steps` is reached
+5. Shuts down vLLM and the trainer cleanly when `max_steps` is reached
 
-You do **not** need to set `gpu_memory_utilization` in co-locate mode — it is computed automatically based on the trainer's memory requirements.
+`--trainer-gpus` doubles as the trainer's GPU count, so the YAML `gpus` field is optional. For MoE models, `ep_size` is also auto-set to the same count.
+
+## Quick Start (co-locate mode)
+
+For a single-GPU setup, run vLLM and the trainer on the same GPU with `surogate grpo-colocate`:
+
+```bash
+surogate grpo-colocate --train train.yaml --infer infer.yaml --orch orch.yaml
+```
+
+You do **not** need to set `gpu_memory_utilization` in co-locate mode — it is computed automatically based on the trainer's memory requirements. Base weights are shared zero-copy via CUDA IPC.
 
 ## Quick Start (multi-process mode)
 
-If you prefer separate processes (e.g., inference and training on different GPUs), use the three individual commands:
+For multi-node setups, or any case where you want each component in its own process, use the three individual commands:
 
 ```bash
 # Terminal 1: Start vLLM inference server (GPU 0)
@@ -172,25 +219,6 @@ CUDA_VISIBLE_DEVICES=1 surogate grpo-train train.yaml
 ```
 
 The trainer blocks at startup until the orchestrator delivers the first batch. The orchestrator blocks until inference has generated enough rollouts. Once all three are running, the pipeline flows automatically.
-
-### Single-GPU multi-process setup
-
-If you only have one GPU, share it between inference and training. Set `gpu_memory_utilization` in `infer.yaml` to limit vLLM's memory:
-
-```yaml
-# infer.yaml
-model: "Qwen/Qwen3-0.6B"
-enable_lora: true
-gpu_memory_utilization: 0.5
-```
-
-```bash
-CUDA_VISIBLE_DEVICES=0 surogate grpo-infer infer.yaml
-surogate grpo-orch orch.yaml
-CUDA_VISIBLE_DEVICES=0 surogate grpo-train train.yaml
-```
-
-For single-GPU setups, co-locate mode is generally better since it shares base weights and computes memory splits automatically.
 
 ## How the Training Loop Works
 
@@ -258,6 +286,26 @@ $$
 $$
 
 where $\mu$ is the rollout policy, $\pi_\theta$ is the current trainer policy, $\hat{A}_{i,t}$ is the token-level advantage, and $\delta$ is the importance-sampling clip ratio (`token_mask_high`). The token masking thresholds (`token_mask_low`, `token_mask_high`, `geo_mask_low`, `geo_mask_high`) guard against tokens or sequences with extreme importance ratios caused by the off-policy gap.
+
+## Split-GPU Mode Details
+
+### GPU assignment
+
+The `--vllm-gpus` and `--trainer-gpus` CLI flags use **driver-level GPU indices** (the same values you would put in `CUDA_VISIBLE_DEVICES`). The two sets must be disjoint.
+
+- `--vllm-gpus N0,N1,...` count must equal `infer.dp * infer.tp`.
+- `--trainer-gpus M0,M1,...` count overrides `train.gpus`. The YAML field is ignored when present.
+- For MoE models, `ep_size` is set to the trainer GPU count automatically. The runner re-validates that `num_experts` is divisible by `ep_size`; if not, the run fails fast with a clear error.
+
+The CLI applies `CUDA_VISIBLE_DEVICES=<trainer ids>` to the parent process **before** any torch import, and `CUDA_VISIBLE_DEVICES=<vllm ids>` to the spawned vLLM child via its own environment. The two values are interpreted by the CUDA driver independently — the parent's mask does not propagate to the child.
+
+### Weight broadcast
+
+In split mode, weight broadcasts use the filesystem backend regardless of what is configured in the YAML. Each broadcast writes the LoRA adapter (~10 MB) to `{output_dir}/broadcasts/step_N/`; vLLM polls for the `STABLE` marker file and hot-reloads the adapter.
+
+### Lifecycle
+
+The `surogate grpo` process owns the vLLM subprocess: it terminates and (if necessary) kills the child during shutdown. If the parent is `SIGKILL`ed, the vLLM subprocess and its engine workers can be left orphaned holding GPU memory — clean up with `nvidia-smi` if that happens.
 
 ## Co-locate Mode Details
 
@@ -381,7 +429,7 @@ noise_scheduler:
 - Tasks where reward signal diversity is low (many rollouts get the same reward)
 - Pre-quantized models (NVFP4, FP8) where quantization already introduces noise — QeRL amplifies this effect in a controlled way
 
-QeRL works with both co-locate and multi-process modes.
+QeRL works in all three deployment modes (split, co-locate, multi-process).
 
 ### On-Policy Distillation
 
@@ -688,7 +736,7 @@ GRPO trainer configs inherit all fields from `SFTConfig`. The most relevant ones
 | Parameter                     | Default    | Description                                                 |
 | ----------------------------- | ---------- | ----------------------------------------------------------- |
 | `model`                       | (required) | HuggingFace model ID or local path                          |
-| `gpus`                        | 1          | Number of GPUs                                              |
+| `gpus`                        | 1          | Number of GPUs (auto-derived from `--trainer-gpus` in split mode) |
 | `sequence_len`                | 1024       | Maximum sequence length                                     |
 | `learning_rate`               | 2e-4       | Initial learning rate                                       |
 | `max_steps`                   | -1         | Training steps (-1 = run until orchestrator stops)          |

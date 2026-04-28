@@ -51,7 +51,8 @@ public:
                 bool lora_only_mode = false,
                 bool prequantized = false,
                 std::size_t stack_bytes = kDefaultStackBytes,
-                const ActivationLayoutIR* activation_layout = nullptr);
+                const ActivationLayoutIR* activation_layout = nullptr,
+                const std::vector<BlockSchemaPlanRecord>* block_schema_records = nullptr);
     ~DslRunState();
 
     /// Swap the backing stack buffer (used to resize the stack after the
@@ -339,18 +340,24 @@ public:
     }
 
     /// @brief Get device pointer to MoE stats buffer for kernel accumulation.
-    /// Layout: [aux_loss_sum, z_loss_sum, utilization_sum, load_imbalance_sum, layer_count]
+    /// Layout:
+    /// [aux_loss_sum, z_loss_sum, utilization_sum, load_imbalance_sum, layer_count,
+    ///  active_experts_sum, max_expert_fraction_sum, min_active_expert_fraction_sum,
+    ///  load_cv_sum, router_entropy_sum, router_confidence_sum]
     float* moe_stats_device() {
         return mMoEStatsDevice;
     }
 
     /// @brief Set MoE config and allocate stats buffers (call once after construction)
-    void set_moe_config(int num_experts, float aux_loss_coef);
+    void set_moe_config(int num_experts, float aux_loss_coef, float z_loss_coef);
     [[nodiscard]] int moe_num_experts() const {
         return mNumMoEExperts;
     }
     [[nodiscard]] float moe_aux_loss_coef() const {
         return mMoEAuxLossCoef;
+    }
+    [[nodiscard]] float moe_z_loss_coef() const {
+        return mMoEZLossCoef;
     }
 
 private:
@@ -439,12 +446,13 @@ private:
     void allocate_graph_arrays(int num_layers);
 
     // MoE routing stats accumulation buffer (GPU)
-    // Layout: [aux_loss_sum, z_loss_sum, utilization_sum, load_imbalance_sum, layer_count]
-    static constexpr int kMoEStatsSize = 5;
+    // Layout matches moe_stats_device().
+    static constexpr int kMoEStatsSize = 11;
     float* mMoEStatsDevice = nullptr;  ///< Device buffer for kernel accumulation
     float* mMoEStatsHost = nullptr;    ///< Pinned host buffer for readback
     int mNumMoEExperts = 0;            ///< 0 = not MoE
     float mMoEAuxLossCoef = 0.01f;     ///< Auxiliary loss coefficient
+    float mMoEZLossCoef = 0.001f;      ///< Router z-loss coefficient
 };
 
 }  // namespace dsl

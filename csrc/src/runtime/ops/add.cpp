@@ -21,7 +21,35 @@ namespace dsl {
 void CompiledExecutor::dispatch_add(const CompiledOp& op) {
     Tensor& a = resolve_tensor(op.inputs[0]);
     Tensor& b = resolve_tensor(op.inputs[1]);
-    Tensor& out = ensure_output_tensor(op.outputs[0]);
+    Tensor* out_ptr = nullptr;
+    const TensorRef& out_ref = op.outputs[0];
+    if (out_ref.slot == TensorSlot::Mapped && out_ref.shape.empty()) {
+        const int tid = out_ref.tensor_id;
+        if (tid >= 0 && static_cast<std::size_t>(tid) < mTensors.size() &&
+            mTensors[static_cast<std::size_t>(tid)].Data) {
+            out_ptr = &mTensors[static_cast<std::size_t>(tid)];
+        } else if (!out_ref.name.empty()) {
+            auto it = mNamedTensors.find(out_ref.name);
+            if (it != mNamedTensors.end() && it->second.Data) {
+                out_ptr = &it->second;
+            }
+        }
+        if (!out_ptr) {
+            std::vector<long> shape(a.Sizes.begin(), a.Sizes.begin() + a.Rank);
+            Tensor allocated = mRunState.temp_alloc(a.DType, shape, "add");
+            mTemps.push_back(allocated);
+            if (tid >= 0) {
+                mTensors[static_cast<std::size_t>(tid)] = allocated;
+                out_ptr = &mTensors[static_cast<std::size_t>(tid)];
+            } else {
+                mNamedTensors[out_ref.name] = allocated;
+                out_ptr = &mNamedTensors[out_ref.name];
+            }
+        }
+    } else {
+        out_ptr = &ensure_output_tensor(out_ref);
+    }
+    Tensor& out = *out_ptr;
 
     // Backward accumulation outputs (e.g. d_*_accum_N) should not reuse aliased
     // buffers: they are reduction nodes and can become incorrect if out aliases
@@ -162,7 +190,6 @@ void CompiledExecutor::dispatch_add_backward(const CompiledOp& op) {
                 store_tensor(ref, view_tensor(*base_grad, ref.shape));
                 return;
             }
-            // Fall back to aliasing if the base grad has no storage yet (non-stack temps).
             base_grad->Data = d_out.Data;
             store_tensor(ref, view_tensor(*base_grad, ref.shape));
             return;

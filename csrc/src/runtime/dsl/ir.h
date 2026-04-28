@@ -195,6 +195,7 @@ struct Graph {
     std::vector<std::string> save;
     std::vector<std::string> recompute;
     std::vector<Operation> operations;
+    AttrMap metadata;
 };
 
 struct Module {

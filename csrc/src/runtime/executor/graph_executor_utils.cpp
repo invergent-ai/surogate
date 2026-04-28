@@ -23,6 +23,33 @@ namespace {
 // Forward declaration for local helper
 Tensor* try_get_tensor(ExecState& st, const std::string& name, std::unordered_map<std::string, Tensor>& saved);
 
+bool has_grouped_lora_target(const CompiledOp& op, modules::LoRATargetId target_id) {
+    for (const LoRASlice& slice : op.attrs.lora_slices) {
+        if (slice.grouped && slice.id == target_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string_view structural_output_slot(const CompiledOp& op) {
+    if (op.outputs.empty()) {
+        return {};
+    }
+    std::string_view name = op.outputs[0].name;
+    if (starts_with(name, "saved.")) {
+        name.remove_prefix(6);
+    }
+    if (!(starts_with(name, "blocks[") || starts_with(name, "blocks.") || starts_with(name, "layer"))) {
+        return {};
+    }
+    const std::size_t dot = name.rfind('.');
+    if (dot == std::string_view::npos || dot + 1 >= name.size()) {
+        return {};
+    }
+    return name.substr(dot + 1);
+}
+
 }  // namespace
 
 // String utilities
@@ -46,41 +73,13 @@ bool env_enabled(const char* name) {
     return std::string_view(value) != "0" && std::string_view(value) != "false";
 }
 
-// Gradient name parsing (compile-time heuristic, always followed by a
-// validation check against the parameter store). See header for details.
-std::optional<std::string> base_param_from_grad_heuristic(std::string_view name) {
-    if (!starts_with(name, "d_")) {
-        return std::nullopt;
-    }
-    std::string base(name.substr(2));
-    const std::string_view accum_tag = "_accum_";
-    const std::string_view from_tag = "_from_";
-    std::size_t pos = std::string::npos;
-    std::size_t pos_accum = base.find(accum_tag);
-    std::size_t pos_from = base.find(from_tag);
-    if (pos_accum != std::string::npos) {
-        pos = pos_accum;
-    }
-    if (pos_from != std::string::npos) {
-        if (pos == std::string::npos || pos_from < pos) {
-            pos = pos_from;
-        }
-    }
-    if (pos != std::string::npos) {
-        base = base.substr(0, pos);
-    }
-    return base;
-}
-
 // Classifier-backed resolution: consults TensorKind instead of guessing from
 // the name shape. Returns the param name ONLY when kind == ParamGrad AND
 // base_param_tid points to a tid in the tensor_name_to_id map. In every other
 // case — ActivationGrad, AccumTemp, Scratch, etc. — returns nullopt, which is
 // what callers that intend to route through the parameter-gradient store want.
 //
-// This is the non-guessing replacement for the heuristic `base_param_from_grad`
-// above. The heuristic should be migrated away from every call site that has
-// access to the compiled graph.
+// This is the non-guessing replacement for name-derived gradient routing.
 std::optional<std::string> base_param_from_grad_kind(int tensor_id, const CompiledGraph& graph) {
     if (tensor_id < 0 || static_cast<std::size_t>(tensor_id) >= graph.tensor_meta.size()) {
         return std::nullopt;
@@ -599,6 +598,20 @@ void matmul_dims(const Tensor& a, const Tensor& b, EMMTranspose mode, int& M, in
     M = static_cast<int>(a_rows);
     N = static_cast<int>(b_cols);
     K = static_cast<int>(a_cols);
+}
+
+std::string_view
+grouped_lora_after_produce_slot(const CompiledOp& op, modules::LoRATargetId target_id, std::string_view legacy_slot) {
+    if (!has_grouped_lora_target(op, target_id)) {
+        return {};
+    }
+    if (!op.attrs.forward_hook_schema_slot.empty()) {
+        return op.attrs.forward_hook_schema_slot;
+    }
+    if (std::string_view slot = structural_output_slot(op); !slot.empty()) {
+        return slot;
+    }
+    return legacy_slot;
 }
 
 // Graph utilities

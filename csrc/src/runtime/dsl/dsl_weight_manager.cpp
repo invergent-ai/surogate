@@ -15,6 +15,7 @@
 
 #include "config/pretrained_config.h"
 #include "kernels/kernels.h"
+#include "runtime/dsl/tensor_role.h"
 #include "runtime/lora/lora_config.h"
 #include "runtime/training/runtime_options.h"
 #include "utilities/comm.h"
@@ -28,11 +29,11 @@ namespace dsl {
 namespace {
 
 bool is_rope_param(const std::string& name) {
-    return name.find("rope_freqs") != std::string::npos;
+    return tensor_role_is_rope_name(name);
 }
 
 bool is_router_param(const std::string& name) {
-    return name.find("router") != std::string::npos;
+    return tensor_role_is_router_name(name);
 }
 
 std::string_view trim_optional(std::string_view name) {

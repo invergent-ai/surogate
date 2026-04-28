@@ -4,16 +4,16 @@ output_dir: ./output_35_moe
 per_device_train_batch_size: 1
 gradient_accumulation_steps: 4
 
-gpus: 2
-ep_size: 2
+gpus: 4
+ep_size: 4
 ep_load_balance_threshold: 1.0
 
 sample_packing: true
 sequence_len: 512
 
-max_steps: 100
+max_steps: 20
 eval_steps: 25
-learning_rate: 2e-4
+learning_rate: 5e-5
 warmup_ratio: 0.1
 
 recipe: fp8-hybrid
@@ -23,6 +23,10 @@ lora: true
 lora_rank: 16
 lora_alpha: 32
 lora_dtype: bf16
+
+train_router: true
+router_aux_loss_coef: 0.01
+router_z_loss_coef: 0.001
 
 qlora_offload_experts: true
 

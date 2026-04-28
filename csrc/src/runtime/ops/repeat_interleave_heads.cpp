@@ -10,6 +10,7 @@
 
 #include "runtime/executor/compiled_ops_helpers.h"
 #include "runtime/dsl/autodiff.h"
+#include "runtime/dsl/buffer_plan.h"
 #include "runtime/executor/op_registry.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "kernels/kernels.h"
@@ -63,14 +64,8 @@ void CompiledExecutor::dispatch_repeat_interleave_heads_backward(const CompiledO
     }
 
     const std::vector<long> d_x_shape{x.Sizes[0], x.Sizes[1], x.Sizes[2], x.Sizes[3]};
-    Tensor d_x = ensure_output_tensor_or_persistent(ensure_output_tensor(op.outputs[0]),
-                                                    mRunState,
-                                                    mMoeSavedBuffers,
-                                                    mMoeSavedSizes,
-                                                    op.op_id + "." + op.outputs[0].name + ".d_x",
-                                                    x.DType,
-                                                    d_x_shape,
-                                                    "repeat_interleave_heads_backward");
+    Tensor d_x = mRunState.temp_alloc(x.DType, d_x_shape, "repeat_interleave_heads_backward_d_x");
+    mTemps.push_back(d_x);
 
     repeat_interleave_heads_backward(d_x, d_out, repeats, mRunState.MainStream);
     store_tensor(op.outputs[0], d_x);
@@ -109,3 +104,26 @@ std::vector<Operation> repeat_interleave_heads_backward_rule(const BackwardRuleC
 }  // namespace dsl
 
 REGISTER_AUTODIFF("repeat_interleave_heads", ::dsl::repeat_interleave_heads_backward_rule);
+
+namespace dsl {
+namespace {
+
+long repeat_interleave_heads_backward_stack_bound(const CompiledOp& op, const BufferPlan& plan) {
+    if (op.inputs.size() < 2 || op.inputs[1].shape.size() != 4) {
+        return 0;
+    }
+    const long H = op.inputs[1].shape[2];
+    const long D = op.inputs[1].shape[3];
+    if (H <= 0 || D <= 0) {
+        return 0;
+    }
+    const long input_bytes = static_cast<long>(get_dtype_size(plan.act_dtype));
+    return align_stack_bytes(plan.B * plan.T * H * D * input_bytes);
+}
+
+}  // namespace
+}  // namespace dsl
+
+REGISTER_STACK_BOUND("repeat_interleave_heads_backward",
+                     RepeatInterleaveHeadsBackward,
+                     ::dsl::repeat_interleave_heads_backward_stack_bound);

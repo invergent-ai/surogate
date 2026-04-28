@@ -11,6 +11,7 @@
 #include <cuda_fp4.h>
 
 #include "runtime/core/matmul_context.h"
+#include "recipes/capability_predicates.h"
 #include "kernels/kernels.h"
 #include "utilities/dtype.h"
 #include "runtime/training/model.h"
@@ -33,8 +34,9 @@ void NVFP4QuartetRecipe::forward_matmul(modules::MatmulContext& ctx) const {
         throw std::runtime_error("NVFP4QuartetRecipe::forward_matmul: required tensors are null");
     }
 
-    // Fall back to BF16 matmul if FP4 is not allowed for this layer (skip_quant_first/last_layers)
-    if (!ctx.allow_fp4) {
+    // Fall back to BF16 matmul if FP4 is not allowed for this layer or descriptor.
+    if (!ctx.allow_fp4 || !descriptor_allows_fp4(ctx.op_caps, "NVFP4QuartetRecipe::forward_matmul") ||
+        !descriptor_allows_matmul_fp4_forward(ctx.matmul_caps, "NVFP4QuartetRecipe::forward_matmul")) {
         IRunState& rs = *ctx.run_state;
         const int M = ctx.B * ctx.T;
         const int N = ctx.C_out;
@@ -196,8 +198,9 @@ void NVFP4QuartetRecipe::backward_matmul(modules::MatmulContext& ctx) const {
         throw std::runtime_error("NVFP4QuartetRecipe::backward_matmul: inp/weight/dout must be BF16");
     }
 
-    // Fall back to BF16 matmul if FP4 is not allowed for this layer
-    if (!ctx.allow_fp4) {
+    // Fall back to BF16 matmul if FP4 is not allowed for this layer or descriptor.
+    if (!ctx.allow_fp4 || !descriptor_allows_fp4(ctx.op_caps, "NVFP4QuartetRecipe::backward_matmul") ||
+        !descriptor_allows_matmul_fp4_backward(ctx.matmul_caps, "NVFP4QuartetRecipe::backward_matmul")) {
         IRunState& rs = *ctx.run_state;
         const int B = ctx.B;
         const int T = ctx.T;

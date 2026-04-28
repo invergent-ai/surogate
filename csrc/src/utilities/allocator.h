@@ -114,6 +114,7 @@ private:
         EAllocationType Kind;
         std::byte* Pointer;
         long Size;
+        int Device;
         std::string Name;
         std::string Context;
     };

@@ -16,10 +16,12 @@
 #include <functional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "runtime/dsl/graph_compiler.h"
 #include "runtime/dsl/ir.h"
+#include "runtime/executor/op_descriptor_types.h"
 
 namespace dsl {
 
@@ -59,7 +61,132 @@ struct OpDescriptor {
     OpExecFn backward_fn = nullptr;                 // backward-graph dispatch
     AutodiffFn autodiff_fn;                         // backward-graph generator (autodiff rule)
     StackBoundFn stack_bound_fn = nullptr;          // op-internal stack bytes (optional)
+    OpSemanticKind semantic_kind = OpSemanticKind::Unknown;
+    DistributionKind distribution_kind = DistributionKind::Replicated;
+    OpCapabilities default_caps{};
+    EpilogueSupport epilogue_support{};
+    StorageCompatibility storage_compat{};
+    MoECapabilities moe_caps{};
+    MatmulCapabilities matmul_caps{};
+    CommunicationProfile comm_profile{};
+    GroupedSemantics grouped_semantics{};
+    std::uint32_t descriptor_flags = 0;
 };
+
+inline OpDescriptor
+make_dispatch_descriptor(std::string name, CompiledOpType type, OpExecFn forward_fn, OpExecFn backward_fn) {
+    OpDescriptor desc;
+    desc.name = std::move(name);
+    desc.type = type;
+    desc.forward_fn = forward_fn;
+    desc.backward_fn = backward_fn;
+    return desc;
+}
+
+inline OpDescriptor make_full_descriptor(std::string name,
+                                         CompiledOpType type,
+                                         OpExecFn forward_fn,
+                                         OpExecFn backward_fn,
+                                         AutodiffFn autodiff_fn) {
+    OpDescriptor desc = make_dispatch_descriptor(std::move(name), type, forward_fn, backward_fn);
+    desc.autodiff_fn = std::move(autodiff_fn);
+    return desc;
+}
+
+inline OpDescriptor make_autodiff_descriptor(std::string name, AutodiffFn autodiff_fn) {
+    OpDescriptor desc;
+    desc.name = std::move(name);
+    desc.autodiff_fn = std::move(autodiff_fn);
+    return desc;
+}
+
+inline OpDescriptor make_stack_bound_descriptor(std::string name, CompiledOpType type, StackBoundFn stack_bound_fn) {
+    OpDescriptor desc;
+    desc.name = std::move(name);
+    desc.type = type;
+    desc.stack_bound_fn = stack_bound_fn;
+    return desc;
+}
+
+inline OpDescriptor make_metadata_descriptor(std::string name,
+                                             OpSemanticKind semantic_kind,
+                                             DistributionKind distribution_kind,
+                                             CommunicationProfile comm_profile,
+                                             GroupedSemantics grouped_semantics,
+                                             std::uint32_t descriptor_flags) {
+    OpDescriptor desc;
+    desc.name = std::move(name);
+    desc.semantic_kind = semantic_kind;
+    desc.distribution_kind = distribution_kind;
+    desc.comm_profile = comm_profile;
+    desc.grouped_semantics = grouped_semantics;
+    desc.descriptor_flags = descriptor_flags;
+    return desc;
+}
+
+inline OpDescriptor make_capability_descriptor(std::string name,
+                                               OpCapabilities default_caps,
+                                               EpilogueSupport epilogue_support,
+                                               StorageCompatibility storage_compat) {
+    OpDescriptor desc;
+    desc.name = std::move(name);
+    desc.default_caps = default_caps;
+    desc.epilogue_support = epilogue_support;
+    desc.storage_compat = storage_compat;
+    return desc;
+}
+
+inline OpDescriptor make_moe_capability_descriptor(std::string name,
+                                                   MoECapabilities moe_caps,
+                                                   StorageCompatibility expert_storage,
+                                                   EpAwareness ep_awareness) {
+    OpDescriptor desc;
+    desc.name = std::move(name);
+    desc.moe_caps = moe_caps;
+    desc.moe_caps.expert_storage = expert_storage;
+    desc.moe_caps.ep_awareness = ep_awareness;
+    return desc;
+}
+
+inline OpDescriptor make_matmul_capability_descriptor(std::string name,
+                                                      MatmulCapabilities matmul_caps,
+                                                      EpilogueSupport supported_epilogues,
+                                                      QuantColocation colocation,
+                                                      StorageCompatibility weight_storage,
+                                                      int recipe_priority) {
+    OpDescriptor desc;
+    desc.name = std::move(name);
+    desc.matmul_caps = matmul_caps;
+    desc.matmul_caps.supported_epilogues = supported_epilogues;
+    desc.matmul_caps.colocate_input = colocation;
+    desc.matmul_caps.weight_storage = weight_storage;
+    desc.matmul_caps.recipe_priority = recipe_priority;
+    return desc;
+}
+
+inline OpDescriptor make_compiled_op_descriptor(std::string name,
+                                                CompiledOpType type,
+                                                OpExecFn forward_fn,
+                                                OpExecFn backward_fn,
+                                                OpSemanticKind semantic_kind,
+                                                DistributionKind distribution_kind,
+                                                CommunicationProfile comm_profile,
+                                                GroupedSemantics grouped_semantics,
+                                                OpCapabilities default_caps,
+                                                EpilogueSupport epilogue_support,
+                                                StorageCompatibility storage_compat,
+                                                std::uint32_t descriptor_flags) {
+    OpDescriptor desc = make_dispatch_descriptor(std::move(name), type, forward_fn, backward_fn);
+    desc.semantic_kind = semantic_kind;
+    desc.distribution_kind = distribution_kind;
+    desc.comm_profile = comm_profile;
+    desc.grouped_semantics = grouped_semantics;
+    desc.default_caps = default_caps;
+    desc.epilogue_support = epilogue_support;
+    desc.storage_compat = storage_compat;
+    desc.descriptor_flags = descriptor_flags;
+    return desc;
+}
 
 class OpRegistry {
 public:
@@ -109,7 +236,7 @@ private:
 #define REGISTER_OP(name_str, op_type_enum, fwd_fn, bwd_fn)                   \
     static const int SUROGATE_OP_REG_CONCAT(_surogate_op_reg_, __COUNTER__) = \
         ::dsl::OpRegistry::instance().register_op(                            \
-            ::dsl::OpDescriptor{name_str, ::dsl::CompiledOpType::op_type_enum, fwd_fn, bwd_fn, {}})
+            ::dsl::make_dispatch_descriptor(name_str, ::dsl::CompiledOpType::op_type_enum, fwd_fn, bwd_fn))
 
 // Register an op with forward/backward dispatch AND an autodiff rule.
 // Used by ops whose backward graph is derived by this rule during
@@ -117,7 +244,92 @@ private:
 #define REGISTER_OP_FULL(name_str, op_type_enum, fwd_fn, bwd_fn, autodiff_fn_) \
     static const int SUROGATE_OP_REG_CONCAT(_surogate_op_reg_, __COUNTER__) =  \
         ::dsl::OpRegistry::instance().register_op(                             \
-            ::dsl::OpDescriptor{name_str, ::dsl::CompiledOpType::op_type_enum, fwd_fn, bwd_fn, autodiff_fn_})
+            ::dsl::make_full_descriptor(name_str, ::dsl::CompiledOpType::op_type_enum, fwd_fn, bwd_fn, autodiff_fn_))
+
+// Register dispatch and descriptor facets in one declaration. This is the
+// Phase-2 target surface for newly migrated ops; legacy split registration
+// macros stay available while existing families move over incrementally.
+#define REGISTER_COMPILED_OP(name_str,                                                 \
+                             op_type_enum,                                             \
+                             fwd_fn,                                                   \
+                             bwd_fn,                                                   \
+                             semantic_kind_enum,                                       \
+                             distribution_kind_enum,                                   \
+                             comm_kind_enum,                                           \
+                             can_overlap_,                                             \
+                             reduction_priority_,                                      \
+                             is_grouped_,                                              \
+                             routes_tokens_,                                           \
+                             expert_dim_,                                              \
+                             ep_aware_,                                                \
+                             caps_flags_,                                              \
+                             epilogue_flags_,                                          \
+                             storage_flags_,                                           \
+                             flags_)                                                   \
+    static const int SUROGATE_OP_REG_CONCAT(_surogate_compiled_op_reg_, __COUNTER__) = \
+        ::dsl::OpRegistry::instance().register_op(::dsl::make_compiled_op_descriptor(  \
+            name_str,                                                                  \
+            ::dsl::CompiledOpType::op_type_enum,                                       \
+            fwd_fn,                                                                    \
+            bwd_fn,                                                                    \
+            ::dsl::OpSemanticKind::semantic_kind_enum,                                 \
+            ::dsl::DistributionKind::distribution_kind_enum,                           \
+            ::dsl::CommunicationProfile{::dsl::CommunicationKind::comm_kind_enum,      \
+                                        static_cast<bool>(can_overlap_),               \
+                                        static_cast<int>(reduction_priority_)},        \
+            ::dsl::GroupedSemantics{static_cast<bool>(is_grouped_),                    \
+                                    static_cast<bool>(routes_tokens_),                 \
+                                    static_cast<int>(expert_dim_),                     \
+                                    static_cast<bool>(ep_aware_)},                     \
+            ::dsl::OpCapabilities{static_cast<std::uint32_t>(caps_flags_)},            \
+            ::dsl::EpilogueSupport{static_cast<std::uint32_t>(epilogue_flags_)},       \
+            ::dsl::StorageCompatibility{static_cast<std::uint32_t>(storage_flags_)},   \
+            static_cast<std::uint32_t>(flags_)))
+
+#define REGISTER_COMPILED_OP_NO_COMM(name_str, op_type_enum, fwd_fn, bwd_fn, semantic_kind_enum) \
+    REGISTER_COMPILED_OP(name_str,                                                               \
+                         op_type_enum,                                                           \
+                         fwd_fn,                                                                 \
+                         bwd_fn,                                                                 \
+                         semantic_kind_enum,                                                     \
+                         Replicated,                                                             \
+                         NoComm,                                                                 \
+                         false,                                                                  \
+                         0,                                                                      \
+                         false,                                                                  \
+                         false,                                                                  \
+                         -1,                                                                     \
+                         false,                                                                  \
+                         ::dsl::OpCapabilityNone,                                                \
+                         ::dsl::EpilogueSupportNone,                                             \
+                         ::dsl::StorageCompatibilityGpuResident,                                 \
+                         0)
+
+#define REGISTER_COMPILED_OP_NO_COMM_CAPS(name_str,           \
+                                          op_type_enum,       \
+                                          fwd_fn,             \
+                                          bwd_fn,             \
+                                          semantic_kind_enum, \
+                                          caps_flags_,        \
+                                          epilogue_flags_,    \
+                                          storage_flags_)     \
+    REGISTER_COMPILED_OP(name_str,                            \
+                         op_type_enum,                        \
+                         fwd_fn,                              \
+                         bwd_fn,                              \
+                         semantic_kind_enum,                  \
+                         Replicated,                          \
+                         NoComm,                              \
+                         false,                               \
+                         0,                                   \
+                         false,                               \
+                         false,                               \
+                         -1,                                  \
+                         false,                               \
+                         caps_flags_,                         \
+                         epilogue_flags_,                     \
+                         storage_flags_,                      \
+                         0)
 
 // Register an autodiff rule only — for names that don't have a
 // CompiledOpType counterpart (e.g. "softmax", "attention", "identity"
@@ -125,8 +337,7 @@ private:
 // Unknown so it's excluded from the type → descriptor index.
 #define REGISTER_AUTODIFF(name_str, autodiff_fn_)                             \
     static const int SUROGATE_OP_REG_CONCAT(_surogate_op_reg_, __COUNTER__) = \
-        ::dsl::OpRegistry::instance().register_op(                            \
-            ::dsl::OpDescriptor{name_str, ::dsl::CompiledOpType::Unknown, nullptr, nullptr, autodiff_fn_})
+        ::dsl::OpRegistry::instance().register_op(::dsl::make_autodiff_descriptor(name_str, autodiff_fn_))
 
 // Attach a stack-bound function to an already-registered op. Pairs with a
 // prior REGISTER_OP (typically in op_registrations.cpp): the bound fn lives
@@ -135,6 +346,77 @@ private:
 #define REGISTER_STACK_BOUND(name_str, op_type_enum, stack_fn)                         \
     static const int SUROGATE_OP_REG_CONCAT(_surogate_stack_bound_reg_, __COUNTER__) = \
         ::dsl::OpRegistry::instance().register_op(                                     \
-            ::dsl::OpDescriptor{name_str, ::dsl::CompiledOpType::op_type_enum, nullptr, nullptr, {}, stack_fn})
+            ::dsl::make_stack_bound_descriptor(name_str, ::dsl::CompiledOpType::op_type_enum, stack_fn))
+
+// Attach descriptor metadata without changing dispatch/autodiff behavior.
+#define REGISTER_OP_DESCRIPTOR_METADATA(name_str,                                                                 \
+                                        semantic_kind_enum,                                                       \
+                                        distribution_kind_enum,                                                   \
+                                        comm_kind_enum,                                                           \
+                                        can_overlap_,                                                             \
+                                        reduction_priority_,                                                      \
+                                        is_grouped_,                                                              \
+                                        routes_tokens_,                                                           \
+                                        expert_dim_,                                                              \
+                                        ep_aware_,                                                                \
+                                        flags_)                                                                   \
+    static const int SUROGATE_OP_REG_CONCAT(_surogate_op_meta_reg_, __COUNTER__) =                                \
+        ::dsl::OpRegistry::instance().register_op(                                                                \
+            ::dsl::make_metadata_descriptor(name_str,                                                             \
+                                            ::dsl::OpSemanticKind::semantic_kind_enum,                            \
+                                            ::dsl::DistributionKind::distribution_kind_enum,                      \
+                                            ::dsl::CommunicationProfile{::dsl::CommunicationKind::comm_kind_enum, \
+                                                                        static_cast<bool>(can_overlap_),          \
+                                                                        static_cast<int>(reduction_priority_)},   \
+                                            ::dsl::GroupedSemantics{static_cast<bool>(is_grouped_),               \
+                                                                    static_cast<bool>(routes_tokens_),            \
+                                                                    static_cast<int>(expert_dim_),                \
+                                                                    static_cast<bool>(ep_aware_)},                \
+                                            static_cast<std::uint32_t>(flags_)))
+
+#define REGISTER_OP_METADATA(name_str, semantic_kind_enum, distribution_kind_enum, flags_) \
+    REGISTER_OP_DESCRIPTOR_METADATA(name_str,                                              \
+                                    semantic_kind_enum,                                    \
+                                    distribution_kind_enum,                                \
+                                    NoComm,                                                \
+                                    false,                                                 \
+                                    0,                                                     \
+                                    false,                                                 \
+                                    false,                                                 \
+                                    -1,                                                    \
+                                    false,                                                 \
+                                    flags_)
+
+// Attach capability metadata without changing dispatch/autodiff behavior.
+#define REGISTER_OP_CAPABILITIES(name_str, caps_flags_, epilogue_flags_, storage_flags_) \
+    static const int SUROGATE_OP_REG_CONCAT(_surogate_op_caps_reg_, __COUNTER__) =       \
+        ::dsl::OpRegistry::instance().register_op(::dsl::make_capability_descriptor(     \
+            name_str,                                                                    \
+            ::dsl::OpCapabilities{static_cast<std::uint32_t>(caps_flags_)},              \
+            ::dsl::EpilogueSupport{static_cast<std::uint32_t>(epilogue_flags_)},         \
+            ::dsl::StorageCompatibility{static_cast<std::uint32_t>(storage_flags_)}))
+
+#define REGISTER_MOE_CAPABILITIES(name_str, moe_caps_flags_, expert_storage_flags_, ep_awareness_enum) \
+    static const int SUROGATE_OP_REG_CONCAT(_surogate_moe_caps_reg_, __COUNTER__) =                    \
+        ::dsl::OpRegistry::instance().register_op(::dsl::make_moe_capability_descriptor(               \
+            name_str,                                                                                  \
+            ::dsl::MoECapabilities{static_cast<std::uint32_t>(moe_caps_flags_)},                       \
+            ::dsl::StorageCompatibility{static_cast<std::uint32_t>(expert_storage_flags_)},            \
+            ::dsl::EpAwareness::ep_awareness_enum))
+
+#define REGISTER_MATMUL_CAPABILITIES(name_str,                                              \
+                                     matmul_caps_flags_,                                    \
+                                     epilogue_flags_,                                       \
+                                     colocation_enum,                                       \
+                                     weight_storage_flags_,                                 \
+                                     priority_)                                             \
+    static const int SUROGATE_OP_REG_CONCAT(_surogate_matmul_caps_reg_, __COUNTER__) =      \
+        ::dsl::OpRegistry::instance().register_op(::dsl::make_matmul_capability_descriptor( \
+            name_str,                                                                       \
+            ::dsl::MatmulCapabilities{static_cast<std::uint32_t>(matmul_caps_flags_)},      \
+            ::dsl::EpilogueSupport{static_cast<std::uint32_t>(epilogue_flags_)},            \
+            ::dsl::QuantColocation::colocation_enum,                                        \
+            ::dsl::StorageCompatibility{static_cast<std::uint32_t>(weight_storage_flags_)}, \
+            static_cast<int>(priority_)))
 
 #endif  // SUROGATE_SRC_EXECUTOR_OP_REGISTRY_H

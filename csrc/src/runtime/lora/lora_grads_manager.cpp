@@ -6,11 +6,14 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <string>
+#include <string_view>
 
 #include "kernels/kernels.h"
 #include "runtime/core/model_config.h"
+#include "runtime/dsl/hook_registry.h"
 #include "utilities/allocator.h"
 #include "utilities/comm.h"
 
@@ -20,6 +23,8 @@ ModularLoRAGradsManager::ModularLoRAGradsManager(const Config& config,
                                                  const std::shared_ptr<TensorAllocator>& allocator)
     : mConfig(config),
       mAllocator(allocator) {
+    mSchemaHookDispatchEnabled = dsl::schema_hook_dispatch_enabled();
+
     mFullGrads.config = config.lora_config;
     mShardedGrads.config = config.lora_config;
 
@@ -261,42 +266,11 @@ void ModularLoRAGradsManager::zero_all(cudaStream_t stream) {
     if (!mConfig.lora_config.enabled()) return;
 
     for (auto& block : mFullGrads.blocks) {
-        auto zero_layer = [stream](auto& opt_layer) {
-            if (!opt_layer.has_value()) return;
-            if (opt_layer->A.Data) fill_zero(opt_layer->A, stream);
-            if (opt_layer->B.Data) fill_zero(opt_layer->B, stream);
+        auto zero_layer = [stream](auto, auto& layer) {
+            if (layer.A.Data) fill_zero(layer.A, stream);
+            if (layer.B.Data) fill_zero(layer.B, stream);
         };
-        zero_layer(block.attention.q);
-        zero_layer(block.attention.k);
-        zero_layer(block.attention.v);
-        zero_layer(block.attention.o);
-        zero_layer(block.mlp.gate);
-        zero_layer(block.mlp.gate_up);
-        zero_layer(block.mlp.up);
-        zero_layer(block.mlp.down);
-
-        if (block.moe.use_grouped) {
-            zero_layer(block.moe.grouped.gate);
-            zero_layer(block.moe.grouped.gate_up);
-            zero_layer(block.moe.grouped.up);
-            zero_layer(block.moe.grouped.down);
-        } else {
-            // MoE expert LoRA gradients
-            for (auto& expert : block.moe.experts) {
-                zero_layer(expert.gate);
-                zero_layer(expert.gate_up);
-                zero_layer(expert.up);
-                zero_layer(expert.down);
-            }
-        }
-
-        if (block.moe.shared.has_value()) {
-            zero_layer(block.moe.shared->up);
-            zero_layer(block.moe.shared->down);
-        }
-
-        // Router LoRA gradients
-        zero_layer(block.router);
+        for_each_lora_layer_weight(block, zero_layer);
     }
 }
 
@@ -336,83 +310,73 @@ void ModularLoRAGradsManager::notify_block(int layer_idx, cudaStream_t stream, N
     // No-op for now (reduction batched in end_micro_step).
 }
 
+void ModularLoRAGradsManager::set_schema_hook_registry(const dsl::HookRegistry* registry,
+                                                       std::vector<std::string> schema_ids_by_layer) {
+    mSchemaHookRegistry = registry;
+    mHookSchemaIdsByLayer = std::move(schema_ids_by_layer);
+}
+
 void ModularLoRAGradsManager::reduce_gradients(cudaStream_t stream, NCCLCommunicator& comm) {
     if (comm.world_size() == 1) return;
-    const bool ep_active = comm.ep_enabled();
 
-    auto all_reduce_layer = [&](std::optional<LoRALayerWeights<Tensor>>& layer) {
-        if (!layer.has_value()) return;
-        if (layer->A.Data) comm.all_reduce_avg(layer->A, stream);
-        if (layer->B.Data) comm.all_reduce_avg(layer->B, stream);
-    };
-
-    auto all_reduce_layer_dp = [&](std::optional<LoRALayerWeights<Tensor>>& layer) {
-        if (!layer.has_value()) return;
-        if (layer->A.Data) comm.all_reduce_avg_dp(layer->A, stream);
-        if (layer->B.Data) comm.all_reduce_avg_dp(layer->B, stream);
-    };
-
-    auto all_reduce_grouped_layer = [&](std::optional<LoRAGroupedLayerWeights<Tensor>>& layer) {
-        if (!layer.has_value()) return;
-        if (layer->A.Data) comm.all_reduce_avg(layer->A, stream);
-        if (layer->B.Data) comm.all_reduce_avg(layer->B, stream);
-    };
-
-    auto all_reduce_grouped_layer_dp = [&](std::optional<LoRAGroupedLayerWeights<Tensor>>& layer) {
-        if (!layer.has_value()) return;
-        if (layer->A.Data) comm.all_reduce_avg_dp(layer->A, stream);
-        if (layer->B.Data) comm.all_reduce_avg_dp(layer->B, stream);
-    };
-
-    for (auto& block : mFullGrads.blocks) {
-        all_reduce_layer(block.attention.q);
-        all_reduce_layer(block.attention.k);
-        all_reduce_layer(block.attention.v);
-        all_reduce_layer(block.attention.o);
-        all_reduce_layer(block.mlp.gate);
-        all_reduce_layer(block.mlp.gate_up);
-        all_reduce_layer(block.mlp.up);
-        all_reduce_layer(block.mlp.down);
-
-        if (block.moe.use_grouped) {
-            // Expert LoRA tensors are sharded by EP rank. Reducing across the full world
-            // would mix different experts; reduce across DP group only when EP is active.
-            if (ep_active) {
-                all_reduce_grouped_layer_dp(block.moe.grouped.gate);
-                all_reduce_grouped_layer_dp(block.moe.grouped.gate_up);
-                all_reduce_grouped_layer_dp(block.moe.grouped.up);
-                all_reduce_grouped_layer_dp(block.moe.grouped.down);
-            } else {
-                all_reduce_grouped_layer(block.moe.grouped.gate);
-                all_reduce_grouped_layer(block.moe.grouped.gate_up);
-                all_reduce_grouped_layer(block.moe.grouped.up);
-                all_reduce_grouped_layer(block.moe.grouped.down);
-            }
-        } else {
-            // MoE expert LoRA gradients
-            for (auto& expert : block.moe.experts) {
-                if (ep_active) {
-                    all_reduce_layer_dp(expert.gate);
-                    all_reduce_layer_dp(expert.gate_up);
-                    all_reduce_layer_dp(expert.up);
-                    all_reduce_layer_dp(expert.down);
-                } else {
-                    all_reduce_layer(expert.gate);
-                    all_reduce_layer(expert.gate_up);
-                    all_reduce_layer(expert.up);
-                    all_reduce_layer(expert.down);
-                }
-            }
+    for (int layer = 0; layer < static_cast<int>(mFullGrads.blocks.size()); ++layer) {
+        dsl::GradientOffloadHookPayload payload;
+        payload.lora_grads = this;
+        payload.comm = &comm;
+        payload.compute_stream = stream;
+        payload.copy_stream = stream;
+        payload.lora_gradients = true;
+        dispatch_schema_layer_hooks(layer, stream, &payload);
+        if (!payload.lora_reduced) {
+            reduce_layer_gradients(layer, stream, comm);
         }
-
-        if (block.moe.shared.has_value()) {
-            all_reduce_layer(block.moe.shared->up);
-            all_reduce_layer(block.moe.shared->down);
-        }
-
-        // Router LoRA gradients
-        all_reduce_layer(block.router);
     }
+}
+
+void ModularLoRAGradsManager::reduce_layer_gradients(int layer_idx, cudaStream_t stream, NCCLCommunicator& comm) {
+    if (layer_idx < 0 || layer_idx >= static_cast<int>(mFullGrads.blocks.size())) {
+        return;
+    }
+    const bool ep_active = comm.ep_enabled();
+    auto all_reduce_layer = [&](LoRATargetId id, auto& layer) {
+        // Expert adapters are EP-sharded; reducing them over the full world would mix experts.
+        const bool reduce_dp_only = ep_active && lora_target_is_expert(id);
+        if (layer.A.Data) {
+            reduce_dp_only ? comm.all_reduce_avg_dp(layer.A, stream) : comm.all_reduce_avg(layer.A, stream);
+        }
+        if (layer.B.Data) {
+            reduce_dp_only ? comm.all_reduce_avg_dp(layer.B, stream) : comm.all_reduce_avg(layer.B, stream);
+        }
+    };
+    for_each_lora_layer_weight(mFullGrads.blocks[static_cast<std::size_t>(layer_idx)], all_reduce_layer);
+}
+
+int ModularLoRAGradsManager::dispatch_schema_layer_hooks(int layer_idx, cudaStream_t stream, void* payload) {
+    if (!mSchemaHookDispatchEnabled || !mSchemaHookRegistry || layer_idx < 0 ||
+        layer_idx >= static_cast<int>(mHookSchemaIdsByLayer.size())) {
+        return 0;
+    }
+    const std::string& schema_id = mHookSchemaIdsByLayer[static_cast<std::size_t>(layer_idx)];
+    if (schema_id.empty()) {
+        return 0;
+    }
+    int dispatched = 0;
+    for (const dsl::HookRegistration& registration : mSchemaHookRegistry->registrations()) {
+        if (registration.event != dsl::HookEventKind::AfterAllReduce || registration.target.schema_id != schema_id) {
+            continue;
+        }
+        dsl::HookContext context;
+        context.layer_idx = layer_idx;
+        context.target = registration.target;
+        context.event = registration.event;
+        context.stream = stream;
+        context.payload = payload;
+        if (registration.callback) {
+            registration.callback(context);
+        }
+        ++dispatched;
+    }
+    return dispatched;
 }
 
 }  // namespace modules

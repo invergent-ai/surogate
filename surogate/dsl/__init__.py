@@ -33,6 +33,14 @@ Key components:
 
 # Import subpackages to ensure registration
 from . import blocks, models, modules, primitives
+from .block_schema import (
+    BlockSchema,
+    DistributionDecl,
+    EPTopology,
+    RoutingSchema,
+    SlotDecl,
+    StreamingHint,
+)
 from .decorators import (
     Activation,
     Gradient,
@@ -184,6 +192,12 @@ __all__ = [
     "Tensor",
     "TensorType",
     "Array",
+    "BlockSchema",
+    "DistributionDecl",
+    "EPTopology",
+    "RoutingSchema",
+    "SlotDecl",
+    "StreamingHint",
     # Decorators
     "module",
     "block",

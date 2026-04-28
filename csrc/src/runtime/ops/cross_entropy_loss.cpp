@@ -94,8 +94,10 @@ void CompiledExecutor::dispatch_cross_entropy_loss_backward(const CompiledOp& op
     // The actual normalization by accumulated valid tokens happens in global_norm_sqrt.
     // Robustly seed d_loss even if the name has SSA suffixes or mapped to loss/losses.
     const std::string d_loss_name = strip_ssa_suffix(op.inputs[0].name);
-    if (op.inputs[0].slot == TensorSlot::DLoss || op.inputs[0].slot == TensorSlot::Losses || d_loss_name == "d_loss" ||
-        d_loss_name == "loss" || d_loss_name == "losses") {
+    const bool standalone_explicit_backward = mCurrentGraph && mCurrentGraph->ops.size() == 1;
+    if (!standalone_explicit_backward &&
+        (op.inputs[0].slot == TensorSlot::DLoss || op.inputs[0].slot == TensorSlot::Losses || d_loss_name == "d_loss" ||
+         d_loss_name == "loss" || d_loss_name == "losses")) {
         fill_constant(d_loss, 1.0f, static_cast<std::size_t>(d_loss.nelem()), mRunState.MainStream);
     }
 

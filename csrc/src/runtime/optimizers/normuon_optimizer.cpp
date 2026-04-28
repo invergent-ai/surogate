@@ -24,6 +24,7 @@
 #include "runtime/dsl/dsl_model_internal.h"
 #include "runtime/dsl/dsl_run_state.h"
 #include "runtime/dsl/dsl_weight_manager.h"
+#include "runtime/dsl/tensor_role.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "runtime/optimizers/adamw_8bit.h"
 #include "runtime/optimizers/normuon.h"
@@ -46,12 +47,12 @@ bool is_normuon_param(const std::string& name, const Tensor& param) {
 
     auto lower = name;
     std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-    if (lower.find("embed") != std::string::npos) return false;
-    if (lower.find("lm_head") != std::string::npos) return false;
+    if (dsl::tensor_role_is_embedding_name(lower)) return false;
+    if (dsl::tensor_role_is_lm_head_name(lower)) return false;
 
-    // MoE router gates use AdamW (special case from study implementation)
-    if (lower.find("router") != std::string::npos) return false;
-    if (lower.find("gate") != std::string::npos && lower.find("mlp") == std::string::npos) return false;
+    // MoE router gates use AdamW (special case from study implementation).
+    if (dsl::tensor_role_is_router_name(lower)) return false;
+    if (dsl::tensor_role_is_standalone_gate_name(lower)) return false;
 
     return true;
 }

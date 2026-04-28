@@ -7,6 +7,7 @@
 #include "runtime/executor/compiled_ops_helpers.h"
 #include "runtime/dsl/autodiff.h"
 #include "runtime/dsl/op_shape_signatures.h"
+#include "runtime/dsl/tensor_role.h"
 #include "runtime/executor/op_registry.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "kernels/kernels.h"
@@ -54,10 +55,10 @@ Tensor CompiledExecutor::resolve_moe_expert_offsets(const CompiledOp& op) {
         auto it_saved = mMoeSavedBuffers.find(key);
         std::string size_key = key;
         if (it_saved == mMoeSavedBuffers.end()) {
-            const std::string legacy_key = "blocks[" + std::to_string(layer_idx_any) + "].moe_expert_offsets";
-            it_saved = mMoeSavedBuffers.find(legacy_key);
+            const std::string compat_key = "blocks[" + std::to_string(layer_idx_any) + "].moe_expert_offsets";
+            it_saved = mMoeSavedBuffers.find(compat_key);
             if (it_saved != mMoeSavedBuffers.end()) {
-                size_key = legacy_key;
+                size_key = compat_key;
             }
         }
         if (it_saved != mMoeSavedBuffers.end() && it_saved->second != nullptr) {
@@ -226,8 +227,7 @@ void CompiledExecutor::dispatch_moe_expert_bias_add_backward(const CompiledOp& o
     }
 
     // GPT-OSS uses per-expert bias tensors; skip backward to avoid unstable CUDA errors for now.
-    if (op.outputs[1].name.find("experts_") != std::string::npos &&
-        op.outputs[1].name.find("_bias") != std::string::npos) {
+    if (tensor_role_is_expert_bias_name(op.outputs[1].name)) {
         if (mCurrentGraph) {
             if (auto base = base_param_from_grad_kind(op.outputs[1].tensor_id, *mCurrentGraph)) {
                 bool grad_accum = false;

@@ -54,6 +54,15 @@ struct FP8WeightCacheEntry {
     bool initialized = false;
 };
 
+// FP8 expert-weight cache for MoE grouped GEMMs. Unlike dense weights, MoE
+// uses per-expert scales, so a single two-float stats tensor is insufficient.
+struct MoEFP8WeightCacheEntry {
+    Tensor weights_e4m3;   ///< (num_experts, N, K)
+    Tensor weight_amax;    ///< (num_experts)
+    Tensor weight_scales;  ///< (num_experts)
+    bool initialized = false;
+};
+
 // FP4 weight cache entry for NVFP4 recipe (Blackwell+)
 struct FP4WeightCacheEntry {
     Tensor data;    ///< FP4 packed data (N, K/2) for forward; (K, N/2) for transposed

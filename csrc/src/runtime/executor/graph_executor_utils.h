@@ -16,6 +16,7 @@
 
 #include "runtime/executor/graph_executor_internal.h"
 #include "runtime/dsl/ir.h"
+#include "runtime/lora/lora_types.h"
 #include "kernels/kernels.h"
 #include "utilities/stack.h"
 #include "utilities/tensor.h"
@@ -30,22 +31,8 @@ bool ends_with(std::string_view value, std::string_view suffix);
 // Environment variable check
 bool env_enabled(const char* name);
 
-// *** COMPILE-TIME HEURISTIC ONLY — DO NOT CALL FROM RUNTIME DISPATCHERS. ***
-//
-// Returns Some(base) for ANY name starting with `d_` (after stripping
-// `_from_N` / `_accum_N`). Does NOT verify the base is a real parameter — that
-// is the caller's job (e.g. `mWeights.has(*base)` after the call). This
-// pattern (heuristic + validate) is acceptable at compile time where we have
-// no compiled graph yet. Any runtime dispatcher that has access to the
-// compiled graph MUST use `base_param_from_grad_kind()` instead; the
-// classifier is the only source of truth for "is this a parameter gradient?".
-//
-// Named `_heuristic` so greps for "base_param_from_grad(" land on the
-// authoritative classifier overload first and nobody accidentally re-
-// introduces the misclassification bug class we retired.
-std::optional<std::string> base_param_from_grad_heuristic(std::string_view name);
-
 struct CompiledGraph;  // fwd
+struct CompiledOp;     // fwd
 
 // Classifier-backed resolution. Returns the parameter name ONLY when the
 // tensor has TensorKind::ParamGrad. For ActivationGrad / AccumTemp /
@@ -98,6 +85,10 @@ bool is_mlp_gate_weight(std::string_view name);
 EMMTranspose parse_transpose(const AttrMap& attrs);
 EMMTranspose swap_transpose(EMMTranspose mode);
 void matmul_dims(const Tensor& a, const Tensor& b, EMMTranspose mode, int& M, int& N, int& K);
+
+// LoRA hook slot resolution
+std::string_view
+grouped_lora_after_produce_slot(const CompiledOp& op, modules::LoRATargetId target_id, std::string_view legacy_slot);
 
 // Graph utilities
 bool is_required_op(const Operation& op, const std::unordered_set<std::string>& needed);

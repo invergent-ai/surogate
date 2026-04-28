@@ -1,4 +1,4 @@
-model: "./reverse-text-qwen3-2"
+model: "Qwen/Qwen3-0.6B"
 enable_lora: true
 max_lora_rank: 32
 max_model_len: 2048

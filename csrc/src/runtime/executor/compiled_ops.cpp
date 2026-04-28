@@ -19,6 +19,7 @@
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -46,7 +47,33 @@
 
 namespace dsl {
 
-namespace {}  // namespace
+namespace {
+
+std::size_t parse_mib_env(const char* name, std::size_t default_mib) {
+    const char* value = std::getenv(name);
+    if (!value || !*value) {
+        return default_mib * 1024ULL * 1024ULL;
+    }
+    char* end = nullptr;
+    const unsigned long long mib = std::strtoull(value, &end, 10);
+    if (end == value) {
+        return default_mib * 1024ULL * 1024ULL;
+    }
+    return static_cast<std::size_t>(mib) * 1024ULL * 1024ULL;
+}
+
+std::size_t moe_fp8_cache_entry_bytes(int num_experts, int n, int k) {
+    if (num_experts <= 0 || n <= 0 || k <= 0) {
+        return 0;
+    }
+    const auto experts = static_cast<std::size_t>(num_experts);
+    const auto rows = static_cast<std::size_t>(n);
+    const auto cols = static_cast<std::size_t>(k);
+    return experts * rows * cols * get_dtype_size(ETensorDType::FP8_E4M3) +
+           2 * experts * get_dtype_size(ETensorDType::FP32);
+}
+
+}  // namespace
 
 // MoE compact weight information (moved out of anonymous namespace for split files)
 MoeCompactInfo build_moe_compact_info(const int* expert_offsets_dev,
@@ -356,6 +383,7 @@ CompiledExecutor::CompiledExecutor(DslRunState& run_state,
       mEpStates(mEpStrategy->ep_states()),
       mLLEPStates(mEpStrategy->llep_states()),
       mEPLayerMeta(mEpStrategy->layer_meta()) {
+    mSchemaHookDispatchEnabled = schema_hook_dispatch_enabled();
     // Load JIT-compiled Triton kernels for gated delta rule (if manifests available)
     if (!options.JitKernelManifests.empty()) {
         mGdrKernels.load(options.JitKernelManifests);
@@ -460,6 +488,78 @@ void CompiledExecutor::set_recipe(const recipes::Recipe* recipe) {
 
 void CompiledExecutor::set_hook_context(void* context) {
     mHookContext = context;
+}
+
+void CompiledExecutor::set_schema_hook_registry(const HookRegistry* registry) {
+    mSchemaHookRegistry = registry;
+}
+
+int CompiledExecutor::dispatch_schema_hook(HookEventKind event,
+                                           int layer_idx,
+                                           std::string_view schema_id,
+                                           std::string_view slot_name,
+                                           void* payload) {
+    if (!mSchemaHookDispatchEnabled || !mSchemaHookRegistry || schema_id.empty() || slot_name.empty()) {
+        return 0;
+    }
+    HookContext context;
+    context.layer_idx = layer_idx;
+    context.target = HookTarget{std::string(schema_id), std::string(slot_name)};
+    context.event = event;
+    context.stream = mRunState.MainStream;
+    context.payload = payload;
+    return mSchemaHookRegistry->dispatch(context);
+}
+
+int CompiledExecutor::dispatch_schema_layer_hooks(HookEventKind event, int layer_idx, void* payload) {
+    if (!mSchemaHookDispatchEnabled || !mSchemaHookRegistry || layer_idx < 0 ||
+        layer_idx >= static_cast<int>(mRunState.buffer_plan().schema_layers.size())) {
+        return 0;
+    }
+    const BlockSchemaLayerSummary& layer = mRunState.buffer_plan().schema_layers[static_cast<std::size_t>(layer_idx)];
+    if (!layer.has_schema || layer.block_family.empty()) {
+        return 0;
+    }
+    int dispatched = 0;
+    for (const HookRegistration& registration : mSchemaHookRegistry->registrations()) {
+        if (registration.event != event || registration.target.schema_id != layer.block_family) {
+            continue;
+        }
+        HookContext context;
+        context.layer_idx = layer_idx;
+        context.target = registration.target;
+        context.event = event;
+        context.stream = mRunState.MainStream;
+        context.payload = payload;
+        if (registration.callback) {
+            registration.callback(context);
+        }
+        ++dispatched;
+    }
+    return dispatched;
+}
+
+int CompiledExecutor::schema_hook_layer_idx(const CompiledOp& op) const {
+    if (op.attrs.layer_idx >= 0) {
+        return op.attrs.layer_idx;
+    }
+    if (op.layer_start >= 0) {
+        return op.layer_start;
+    }
+    if (op.layer_end >= 0) {
+        return op.layer_end;
+    }
+    for (const TensorRef& ref : op.outputs) {
+        if (ref.layer_idx >= 0) {
+            return ref.layer_idx;
+        }
+    }
+    for (const TensorRef& ref : op.inputs) {
+        if (ref.layer_idx >= 0) {
+            return ref.layer_idx;
+        }
+    }
+    return -1;
 }
 
 void CompiledExecutor::set_recompute_fn(std::function<void(int, long, long, bool)> fn) {
@@ -615,9 +715,8 @@ std::byte* CompiledExecutor::allocate_bwd_cross_layer(std::size_t nbytes) {
     const bool capturing = (cap_status != cudaStreamCaptureStatusNone);
     if (capturing) {
         std::ostringstream oss;
-        oss << "allocate_bwd_cross_layer: arena exhausted under CUDA graph capture "
-            << "(req=" << nbytes << " bytes, used=" << mBwdCrossLayerBumpOffset
-            << ", cap=" << mPhaseArenas->bwd_cross_layer_bytes
+        oss << "allocate_bwd_cross_layer: arena exhausted under CUDA graph capture " << "(req=" << nbytes
+            << " bytes, used=" << mBwdCrossLayerBumpOffset << ", cap=" << mPhaseArenas->bwd_cross_layer_bytes
             << "). Set SUROGATE_BWD_CROSS_LAYER_MB above the eager high-water mark.";
         throw std::runtime_error(oss.str());
     }
@@ -714,6 +813,19 @@ void CompiledExecutor::set_fp8_cache_transposed(std::unordered_map<std::string, 
     mFP8CacheT = cache_t;
 }
 
+void CompiledExecutor::set_moe_fp8_cache(std::unordered_map<std::string, MoEFP8WeightCacheEntry>* cache) {
+    mMoEFP8Cache = cache;
+    mMoEFP8CacheBytes = 0;
+    mMoEFP8CacheBudgetBytes.reset();
+    if (mMoEFP8Cache) {
+        for (const auto& [_, entry] : *mMoEFP8Cache) {
+            mMoEFP8CacheBytes += entry.weights_e4m3.bytes();
+            mMoEFP8CacheBytes += entry.weight_amax.bytes();
+            mMoEFP8CacheBytes += entry.weight_scales.bytes();
+        }
+    }
+}
+
 void CompiledExecutor::set_fp4_cache(std::unordered_map<std::string, FP4WeightCacheEntry>* cache,
                                      std::unordered_map<std::string, FP4WeightCacheEntry>* cache_t) {
     mFP4Cache = cache;
@@ -732,6 +844,62 @@ void CompiledExecutor::set_save_list(const std::vector<std::string>* save_list) 
     }
 }
 
+void CompiledExecutor::attach_moe_fp8_cache(modules::MoeMatmulContext& ctx, const std::string& weight_name) {
+    const char* env = std::getenv("SUROGATE_FP8_MOE_WEIGHT_CACHE");
+    if (!env || std::string_view(env) == "0" || !mMoEFP8Cache || weight_name.empty() || ctx.num_experts <= 0 ||
+        ctx.N <= 0 || ctx.K <= 0) {
+        return;
+    }
+    auto it = mMoEFP8Cache->find(weight_name);
+    if (it == mMoEFP8Cache->end()) {
+        if (!mMoEFP8CacheBudgetBytes.has_value()) {
+            mMoEFP8CacheBudgetBytes = parse_mib_env("SUROGATE_FP8_MOE_CACHE_BUDGET_MB", 1024);
+        }
+        const std::size_t entry_bytes = moe_fp8_cache_entry_bytes(ctx.num_experts, ctx.N, ctx.K);
+        if (entry_bytes == 0 || mMoEFP8CacheBytes + entry_bytes > *mMoEFP8CacheBudgetBytes) {
+            if (std::getenv("SUROGATE_DEBUG_FP8_MOE_CACHE")) {
+                std::fprintf(stderr,
+                             "[FP8 MoE cache] skip %s: requested %.1f MiB, budget %.1f MiB, used %.1f MiB\n",
+                             weight_name.c_str(),
+                             static_cast<double>(entry_bytes) / (1024.0 * 1024.0),
+                             static_cast<double>(*mMoEFP8CacheBudgetBytes) / (1024.0 * 1024.0),
+                             static_cast<double>(mMoEFP8CacheBytes) / (1024.0 * 1024.0));
+            }
+            return;
+        }
+        MoEFP8WeightCacheEntry entry{};
+        entry.weights_e4m3 = mRunState.Allocator->allocate(ETensorDType::FP8_E4M3,
+                                                           ("fp8_moe_cache_" + weight_name).c_str(),
+                                                           EAllocationType::ON_DEVICE,
+                                                           {ctx.num_experts, ctx.N, ctx.K});
+        entry.weight_amax = mRunState.Allocator->allocate(ETensorDType::FP32,
+                                                          ("fp8_moe_cache_" + weight_name + "_amax").c_str(),
+                                                          EAllocationType::ON_DEVICE,
+                                                          {ctx.num_experts});
+        entry.weight_scales = mRunState.Allocator->allocate(ETensorDType::FP32,
+                                                            ("fp8_moe_cache_" + weight_name + "_scales").c_str(),
+                                                            EAllocationType::ON_DEVICE,
+                                                            {ctx.num_experts});
+        auto [insert_it, _] = mMoEFP8Cache->emplace(weight_name, std::move(entry));
+        it = insert_it;
+        mMoEFP8CacheBytes += entry_bytes;
+    }
+    ctx.cached_moe_weights_e4m3 = &it->second.weights_e4m3;
+    ctx.cached_moe_weight_amax = &it->second.weight_amax;
+    ctx.cached_moe_weight_scales = &it->second.weight_scales;
+    ctx.cached_moe_weights_initialized = &it->second.initialized;
+}
+
+void CompiledExecutor::invalidate_moe_fp8_cache(const std::string& weight_name) {
+    if (!mMoEFP8Cache || weight_name.empty()) {
+        return;
+    }
+    auto it = mMoEFP8Cache->find(weight_name);
+    if (it != mMoEFP8Cache->end()) {
+        it->second.initialized = false;
+    }
+}
+
 void CompiledExecutor::set_last_inputs_cpu(const Tensor* inputs_cpu) {
     mLastInputsCpu = inputs_cpu;
 }
@@ -741,6 +909,10 @@ void CompiledExecutor::set_rng_seed_fn(std::function<unsigned int()> fn) {
 }
 
 const Tensor* CompiledExecutor::try_get_tensor(const std::string& name) const {
+    if (auto it = mNamedTensors.find(name); it != mNamedTensors.end() && it->second.Data) {
+        return &it->second;
+    }
+
     // Fast path: check flat tensor vector using compile-time ID
     if (mCurrentGraph) {
         int tid = mCurrentGraph->find_tensor_id(name);
@@ -801,7 +973,16 @@ const Tensor* CompiledExecutor::try_get_tensor_fuzzy(const std::string& name) {
 }
 
 void CompiledExecutor::handle_layer_start(int layer_idx) {
-    if (mWeightManager && mWeightManager->needs_block_gather() && !mCapturing) {
+    BeforeConsumeHookPayload before_consume_payload;
+    before_consume_payload.weight_manager = mWeightManager;
+    before_consume_payload.comm = mComm;
+    before_consume_payload.prefetch_stream = mRunState.side_stream();
+    before_consume_payload.wait_stream = mRunState.MainStream;
+    before_consume_payload.capturing = mCapturing;
+    dispatch_schema_layer_hooks(HookEventKind::BeforeConsume, layer_idx, &before_consume_payload);
+
+    if (!before_consume_payload.current_layer_handled && mWeightManager && mWeightManager->needs_block_gather() &&
+        !mCapturing) {
         // Ensure the current layer's weights are present in a prefetch slot.
         // For strict-reverse backward orders (Q3 pure attention), the prior
         // layer_start's prefetch already did this and gather_block(layer_idx)
@@ -836,8 +1017,15 @@ void CompiledExecutor::handle_layer_start(int layer_idx) {
 }
 
 void CompiledExecutor::handle_layer_end(int layer_idx) {
+    AfterConsumeHookPayload after_consume_payload;
+    after_consume_payload.weight_manager = mWeightManager;
+    after_consume_payload.release_stream = mRunState.MainStream;
+    after_consume_payload.capturing = mCapturing;
+    dispatch_schema_layer_hooks(HookEventKind::AfterConsume, layer_idx, &after_consume_payload);
+
     // Release previous layer's weights
-    if (mWeightManager && mWeightManager->needs_block_gather() && !mCapturing) {
+    if (!after_consume_payload.current_layer_released && mWeightManager && mWeightManager->needs_block_gather() &&
+        !mCapturing) {
         mWeightManager->release_block(layer_idx, mRunState.MainStream);
     }
 
@@ -856,7 +1044,14 @@ void CompiledExecutor::dispatch_forward_op(const CompiledOp& op, const modules::
     if (!op.fn) {
         std::ostringstream oss;
         oss << "dispatch_forward_op: no dispatch fn for op type " << op_type_to_string(op.type) << " (id=" << op.op_id
-            << ")";
+            << ", semantic=" << op_semantic_kind_name(op.semantic_kind)
+            << ", comm=" << communication_kind_name(op.comm_profile.kind)
+            << ", distribution=" << distribution_kind_name(op.distribution_kind)
+            << ", caps=" << op_capability_flags_string(op.default_caps)
+            << ", matmul_caps=" << matmul_capability_flags_string(op.matmul_caps)
+            << ", moe_caps=" << moe_capability_flags_string(op.moe_caps)
+            << ", epilogue=" << epilogue_support_flags_string(op.epilogue_support)
+            << ", storage=" << storage_compatibility_flags_string(op.storage_compat) << ")";
         throw std::runtime_error(oss.str());
     }
     op.fn(*this, op, static_cast<const void*>(hook));
@@ -866,7 +1061,14 @@ void CompiledExecutor::dispatch_backward_op(const CompiledOp& op, const modules:
     if (!op.fn) {
         std::ostringstream oss;
         oss << "dispatch_backward_op: no dispatch fn for op type " << op_type_to_string(op.type) << " (id=" << op.op_id
-            << ")";
+            << ", semantic=" << op_semantic_kind_name(op.semantic_kind)
+            << ", comm=" << communication_kind_name(op.comm_profile.kind)
+            << ", distribution=" << distribution_kind_name(op.distribution_kind)
+            << ", caps=" << op_capability_flags_string(op.default_caps)
+            << ", matmul_caps=" << matmul_capability_flags_string(op.matmul_caps)
+            << ", moe_caps=" << moe_capability_flags_string(op.moe_caps)
+            << ", epilogue=" << epilogue_support_flags_string(op.epilogue_support)
+            << ", storage=" << storage_compatibility_flags_string(op.storage_compat) << ")";
         throw std::runtime_error(oss.str());
     }
     op.fn(*this, op, static_cast<const void*>(hook));

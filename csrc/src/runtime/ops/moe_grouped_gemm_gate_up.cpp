@@ -24,6 +24,19 @@
 #include "runtime/lora/lora_model_utils.h"
 
 namespace dsl {
+namespace {
+
+void attach_token_role(modules::MoeMatmulContext& ctx, const CompiledGraph* graph, const TensorRef& ref) {
+    if (!graph) {
+        return;
+    }
+    if (const TensorRole* role = graph->role_for_tensor_id(ref.tensor_id)) {
+        ctx.token_role = *role;
+        ctx.has_token_role = true;
+    }
+}
+
+}  // namespace
 
 void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op) {
     Tensor& inp = resolve_tensor(op.inputs[0]);
@@ -194,8 +207,11 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op) {
     // Refresh MoE expert weights for this layer using the current routing offsets.
     auto* qlora_provider = mWeights.qlora_provider();
     if (host_offsets_ptr && layer_idx_any >= 0 && qlora_provider && qlora_provider->supports_selective_moe()) {
-        (void)
+        const bool refreshed =
             refresh_moe_experts_if_needed(layer_idx_any, host_offsets_ptr, num_experts, mWeights, mRunState.MainStream);
+        if (refreshed) {
+            invalidate_moe_fp8_cache(op.inputs[1].name);
+        }
     }
 
     MoeCompactInfo compact = host_offsets_ptr ? build_moe_compact_info_from_host(host_offsets_ptr,
@@ -285,9 +301,17 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op) {
         ctx.total_tokens = static_cast<int>(total_tokens);
         ctx.run_state = &mRunState;
         ctx.cudnn_handle = mRunState.CudnnHandle;
+        ctx.cublas_handle = mRunState.cublas_handle();
+        ctx.cublaslt_handle = mRunState.CublasLtHandle;
         ctx.workspace = mRunState.CuBlasWorkspace.get<std::byte>();
         ctx.workspace_size = mRunState.CuBlasWorkspace.bytes();
         ctx.stream = mRunState.MainStream;
+        ctx.op_caps = op.default_caps;
+        ctx.moe_caps = op.moe_caps;
+        ctx.epilogue_support = op.epilogue_support;
+        ctx.storage_compat = op.storage_compat;
+        attach_token_role(ctx, mCurrentGraph, op.inputs[0]);
+        attach_moe_fp8_cache(ctx, op.inputs[1].name);
         mRecipe->forward_moe_matmul(ctx);
     } else if (weights.DType == ETensorDType::BF16) {
         moe_grouped_gemm_gate_up(out.get<nv_bfloat16>(),
@@ -321,9 +345,12 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op) {
                                  llep_weight_ptrs);
     }
 
-    // Apply grouped MoE LoRA (gate/up) when enabled.
-    if (mLoRAConfig && mLoRAWeights && mLoRARunState && mLoRAConfig->enabled() && mLoRAWeights->enabled() &&
-        layer_idx_any >= 0) {
+    auto apply_grouped_moe_gate_up_lora = [&]() {
+        // Apply grouped MoE LoRA (gate/up) when enabled.
+        if (!(mLoRAConfig && mLoRAWeights && mLoRARunState && mLoRAConfig->enabled() && mLoRAWeights->enabled() &&
+              layer_idx_any >= 0)) {
+            return;
+        }
         auto& lora_block = mLoRAWeights->get_block(layer_idx_any, mRunState.MainStream);
         if (lora_block.moe.use_grouped) {
             // When LLEP is active, use merged LoRA tensors [num_merged, ...]
@@ -577,6 +604,27 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op) {
                 }
             }
         }
+    };
+
+    AfterProduceHookPayload after_produce_payload;
+    std::string_view after_produce_slot =
+        grouped_lora_after_produce_slot(op, modules::LoRATargetId::ExpertGateUp, "expert_gate_up");
+    if (after_produce_slot.empty()) {
+        after_produce_slot = grouped_lora_after_produce_slot(op, modules::LoRATargetId::ExpertGate, "expert_gate_up");
+    }
+    if (after_produce_slot.empty()) {
+        after_produce_slot = grouped_lora_after_produce_slot(op, modules::LoRATargetId::ExpertUp, "expert_gate_up");
+    }
+    if (!after_produce_slot.empty()) {
+        after_produce_payload.apply_lora_action = apply_grouped_moe_gate_up_lora;
+        dispatch_schema_hook(HookEventKind::AfterProduce,
+                             layer_idx_any,
+                             op.attrs.hook_schema_id,
+                             after_produce_slot,
+                             &after_produce_payload);
+    }
+    if (!after_produce_payload.lora_applied) {
+        apply_grouped_moe_gate_up_lora();
     }
 
     store_tensor(op.outputs[0], out);
@@ -813,8 +861,11 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up_backward(const Compiled
     if (qlora_provider && qlora_provider->supports_selective_moe()) {
         const int* refresh_offsets = host_offsets_ptr;
         if (refresh_offsets) {
-            (void)
+            const bool refreshed =
                 refresh_moe_experts_if_needed(layer_idx, refresh_offsets, num_experts, mWeights, mRunState.MainStream);
+            if (refreshed) {
+                invalidate_moe_fp8_cache(op.inputs[2].name);
+            }
         }
     }
 

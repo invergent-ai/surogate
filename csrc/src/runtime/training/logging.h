@@ -68,9 +68,25 @@ public:
                   float moe_aux_loss,
                   float moe_z_loss,
                   float moe_load_imbalance,
-                  float moe_expert_utilization);
+                  float moe_expert_utilization,
+                  float moe_active_experts,
+                  float moe_max_expert_fraction,
+                  float moe_min_active_expert_fraction,
+                  float moe_load_cv,
+                  float moe_router_entropy,
+                  float moe_router_confidence);
     void log_eval(int step, float epoch, int eval_tokens, int duration_ms, float loss);
-    void log_moe_stats(int step, float aux_loss, float z_loss, float expert_utilization, float load_imbalance);
+    void log_moe_stats(int step,
+                       float aux_loss,
+                       float z_loss,
+                       float expert_utilization,
+                       float load_imbalance,
+                       float active_experts,
+                       float max_expert_fraction,
+                       float min_active_expert_fraction,
+                       float load_cv,
+                       float router_entropy,
+                       float router_confidence);
     void log_gpu_state(int step, int gpu_id, const GPUUtilInfo& gpu_util);
     void log_allocator(const std::vector<std::pair<std::string, sSegmentMemory>>& stats,
                        const std::vector<std::pair<std::string, long>>& stack_info);

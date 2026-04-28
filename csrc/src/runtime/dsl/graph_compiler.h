@@ -23,6 +23,9 @@
 
 #include "runtime/dsl/tensor_slot.h"
 #include "runtime/dsl/tensor_slot_registry.h"
+#include "runtime/dsl/tensor_role.h"
+#include "runtime/dsl/fusion_rule_registry.h"
+#include "runtime/executor/op_descriptor_types.h"
 #include "runtime/lora/lora_types.h"
 #include "kernels/kernels.h"
 
@@ -36,6 +39,7 @@ enum class BackwardHookPoint;
 struct RuntimeOptions;
 
 namespace dsl {
+struct BufferPlan;
 
 // Helper function to strip SSA-style numeric suffixes from tensor names
 std::string strip_ssa_suffix(const std::string& field);
@@ -48,10 +52,11 @@ std::string strip_ssa_suffix(const std::string& field);
 /// unknown (for dropout-seed hashing + error messages).
 struct LoRASlice {
     modules::LoRATargetId id = modules::LoRATargetId::Unknown;
-    std::string name;      ///< Raw target name; only read when id == Unknown or on error.
-    int offset = 0;        ///< Element offset on the output dim (0 for unfused).
-    int size = 0;          ///< Output slice size in elements (0 = full output dim).
-    bool grouped = false;  ///< True for MoE batched-expert LoRA (uses grouped GEMM path).
+    std::string name;         ///< Raw target name; only read when id == Unknown or on error.
+    std::string schema_slot;  ///< Structural BlockSchema param slot inferred from the weight name.
+    int offset = 0;           ///< Element offset on the output dim (0 for unfused).
+    int size = 0;             ///< Output slice size in elements (0 = full output dim).
+    bool grouped = false;     ///< True for MoE batched-expert LoRA (uses grouped GEMM path).
 };
 
 class DslRunState;
@@ -229,6 +234,7 @@ struct CompiledAttrs {
     std::optional<modules::MatmulOp> matmul_op;
     int layer_idx = -1;
     bool allow_quant = false;
+    std::string hook_schema_id;  ///< Structural BlockSchema id for hook-target diagnostics.
 
     // Activation-slot alias point. The matmul dispatch uses this to rebind
     // block-scope slot entries (``qkv`` / ``att_out`` / ``mlp_up`` /
@@ -237,12 +243,14 @@ struct CompiledAttrs {
     // values are consumed for this purpose; they are not invoked as
     // callbacks anymore (LoRA dispatch is slice-driven).
     std::optional<modules::ForwardHookPoint> forward_hook_point;
+    std::string forward_hook_schema_slot;  ///< Structural activation slot used by schema hook dispatch.
 
     // MoE-specific
     int top_k = 0;
     bool normalize_weights = true;
     float scaling_factor = 1.0f;
     bool topk_softmax = false;
+    bool topk_full_softmax = false;
     float topk_rounding_scale = 0.0f;
     bool topk_sort_by_index = false;
     bool gate_up_interleaved = false;
@@ -330,6 +338,19 @@ struct CompiledOp {
     // Pre-resolved attributes
     CompiledAttrs attrs;
 
+    // Descriptor facets copied from OpRegistry at compile time. These are
+    // metadata only for now; execution continues through `fn`.
+    OpSemanticKind semantic_kind = OpSemanticKind::Unknown;
+    DistributionKind distribution_kind = DistributionKind::Replicated;
+    OpCapabilities default_caps{};
+    EpilogueSupport epilogue_support{};
+    StorageCompatibility storage_compat{};
+    MoECapabilities moe_caps{};
+    MatmulCapabilities matmul_caps{};
+    CommunicationProfile comm_profile{};
+    GroupedSemantics grouped_semantics{};
+    std::uint32_t descriptor_flags = 0;
+
     // Layer boundary info (for prefetch optimization)
     int layer_start = -1;  // If >= 0, this op starts a new layer
     int layer_end = -1;    // If >= 0, this op ends a layer
@@ -403,6 +424,7 @@ struct TensorMeta {
 
     // Classification (populated by classify_tensors() after build_tensor_metadata).
     TensorKind kind = TensorKind::Unknown;
+    TensorRole role{};
     int base_param_tid = -1;     ///< ParamGrad -> tid of the parameter
     int base_producer_tid = -1;  ///< ActivationGrad -> tid of the forward activation
     int base_grad_tid = -1;      ///< AccumTemp -> tid of the non-accum parent gradient
@@ -562,6 +584,17 @@ std::string dump_instruction_stream(const std::vector<Instruction>& stream);
 /// Returns empty string on success; otherwise a human-readable error list.
 std::string validate_instruction_stream(const std::vector<Instruction>& stream, std::size_t num_ops);
 
+struct FusionRewritePreview {
+    std::string rule_name;
+    std::string replacement_op;
+    std::size_t start = 0;
+    std::size_t length = 0;
+    std::vector<std::string> op_ids;
+    std::vector<std::string> op_names;
+    bool applied = false;
+    std::string reason;
+};
+
 // ============================================================================
 // Compiled Graph
 // ============================================================================
@@ -619,6 +652,13 @@ struct CompiledGraph {
         return &tensor_meta[static_cast<std::size_t>(tid)];
     }
 
+    const TensorRole* role_for_tensor_id(int tid) const {
+        if (const TensorMeta* meta = meta_for_tensor_id(tid)) {
+            return &meta->role;
+        }
+        return nullptr;
+    }
+
     /// Reverse lookup table `(layer_idx, slot) -> tid`, populated by
     /// compute_layout. Row layout:
     /// `slot_tid_by_layer[layer_idx][static_cast<std::size_t>(slot)]`.
@@ -640,6 +680,95 @@ struct CompiledGraph {
     const TensorMeta* meta_for_name(const std::string& name) const {
         int tid = find_tensor_id(name);
         return tid >= 0 ? meta_for_tensor_id(tid) : nullptr;
+    }
+
+    const TensorRole* role_for_name(const std::string& name) const {
+        int tid = find_tensor_id(name);
+        return tid >= 0 ? role_for_tensor_id(tid) : nullptr;
+    }
+
+    std::size_t count_tensors_with_quant_state(QuantState state) const {
+        std::size_t count = 0;
+        for (const auto& meta : tensor_meta) {
+            if (meta.role.quant_state == state) {
+                ++count;
+            }
+        }
+        return count;
+    }
+
+    std::size_t count_ops_with_comm(CommunicationKind kind) const {
+        std::size_t count = 0;
+        for (const auto& op : ops) {
+            if (op.comm_profile.kind == kind) {
+                ++count;
+            }
+        }
+        return count;
+    }
+
+    std::size_t count_grouped_ops() const {
+        std::size_t count = 0;
+        for (const auto& op : ops) {
+            if (op.grouped_semantics.is_grouped) {
+                ++count;
+            }
+        }
+        return count;
+    }
+
+    std::size_t count_ops_with_capability(std::uint32_t flag) const {
+        std::size_t count = 0;
+        for (const auto& op : ops) {
+            if (op.default_caps.has(flag)) {
+                ++count;
+            }
+        }
+        return count;
+    }
+
+    std::size_t count_ops_with_epilogue(std::uint32_t flag) const {
+        std::size_t count = 0;
+        for (const auto& op : ops) {
+            if (op.epilogue_support.has(flag)) {
+                ++count;
+            }
+        }
+        return count;
+    }
+
+    std::size_t count_ops_with_moe_capability(std::uint32_t flag) const {
+        std::size_t count = 0;
+        for (const auto& op : ops) {
+            if (op.moe_caps.has(flag)) {
+                ++count;
+            }
+        }
+        return count;
+    }
+
+    std::size_t count_ops_with_matmul_capability(std::uint32_t flag) const {
+        std::size_t count = 0;
+        for (const auto& op : ops) {
+            if (op.matmul_caps.has(flag)) {
+                ++count;
+            }
+        }
+        return count;
+    }
+
+    std::size_t count_ops_supporting_storage(StorageTier tier) const {
+        std::size_t count = 0;
+        for (const auto& op : ops) {
+            if (op.storage_compat.supports(tier)) {
+                ++count;
+            }
+        }
+        return count;
+    }
+
+    std::size_t count_fusion_candidate_starts() const {
+        return FusionRuleRegistry::instance().count_matching_starts(ops);
     }
 
     /// Debuggability (P4.7): format "tid=5 name='blocks[3].ln1' region=FwdStack
@@ -697,6 +826,10 @@ struct CompiledGraph {
     std::size_t total_ops = 0;
     std::size_t matmul_ops = 0;
     std::size_t view_ops = 0;
+
+    // Deterministic rewrite plan preview. Populated before supported rewrites
+    // mutate `ops`; entries also record whether a candidate was applied.
+    std::vector<FusionRewritePreview> fusion_rewrite_preview;
 };
 
 // ============================================================================
@@ -738,6 +871,10 @@ public:
 
 private:
     CompiledOpType classify_op(const std::string& op_type) const;
+
+    void populate_descriptor(CompiledOp& compiled, bool is_backward) const;
+
+    void apply_fusion_rewrites(CompiledGraph& graph, bool is_backward) const;
 
     TensorRef resolve_tensor_ref(const std::string& name, bool is_output, const Operation& op, const ShapeEnv& env);
 
@@ -802,6 +939,7 @@ private:
     std::unordered_map<std::string, ETensorDType> mTensorDtypes;
     bool mDebugShapes = false;      // Set via SUROGATE_DEBUG_SHAPES env var
     bool mHasHybridBlocks = false;  // True if model uses HybridStackedBlocks
+    std::vector<std::string> mHookSchemaIdByLayer;
 
     // Per-layer dimensions for hybrid models (populated from IR param shapes)
     std::vector<BlockTypeDims> mPerLayerDims;
@@ -828,9 +966,8 @@ private:
 
     // Classify every tensor (kind + base_*_tid) by authoritative lookup against
     // the parameter store and the op producer map. Called after
-    // build_tensor_metadata. Replaces ad-hoc string predicates like
-    // base_param_from_grad / should_alias_autodiff_accum_name (Phase 0: data
-    // only; callers still use the legacy predicates until Phase 1 flips them).
+    // build_tensor_metadata. Replaces ad-hoc string predicates for gradient
+    // routing and autodiff accumulator aliasing.
     void classify_tensors(CompiledGraph& graph);
 };
 
@@ -913,6 +1050,19 @@ struct PhaseArenas {
     std::byte* moe_saved_ptr = nullptr;
     std::size_t moe_saved_bytes = 0;
 
+    bool schema_allocation_authoritative = false;
+    std::size_t compiled_fwd_stack_bytes = 0;
+    std::size_t compiled_save_for_bwd_bytes = 0;
+    std::size_t schema_frame_arena_bytes = 0;
+    std::size_t schema_save_for_bwd_arena_bytes = 0;
+    std::size_t schema_persistent_activation_bytes = 0;
+    std::size_t schema_host_stream_activation_bytes = 0;
+    std::size_t schema_total_activation_arena_bytes = 0;
+    std::size_t schema_frame_arena_safety_bytes = 0;
+    std::size_t schema_save_for_bwd_safety_bytes = 0;
+    std::size_t schema_frame_arena_extra_bytes = 0;
+    std::size_t schema_save_for_bwd_extra_bytes = 0;
+
     bool allocated = false;
 };
 
@@ -924,7 +1074,8 @@ void compute_arena_sizes(PhaseArenas& arenas,
                          int num_layers,
                          std::size_t stack_bytes = 0,
                          std::size_t bwd_cross_layer_bytes = 0,
-                         std::size_t moe_saved_bytes = 0);
+                         std::size_t moe_saved_bytes = 0,
+                         const BufferPlan* schema_plan = nullptr);
 
 /// Static upper bound on bytes the BwdCrossLayer arena needs across one
 /// backward call. Mirrors the runtime persist logic in

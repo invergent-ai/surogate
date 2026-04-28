@@ -1,6 +1,30 @@
 import argparse
+import os
 import runpy
 import sys
+
+
+def _apply_grpo_split_gpu_mask() -> None:
+    """For `surogate grpo --trainer-gpus ...`, mask the parent process to those GPUs.
+
+    Must run BEFORE any import that touches CUDA (e.g. ``surogate.utils.system_info``
+    enumerates GPUs at module-init time, which initializes the CUDA context and locks
+    in the visible-device set).
+    """
+    argv = sys.argv
+    if len(argv) < 2 or argv[1] != "grpo":
+        return
+    for i in range(2, len(argv)):
+        tok = argv[i]
+        if tok == "--trainer-gpus" and i + 1 < len(argv):
+            os.environ["CUDA_VISIBLE_DEVICES"] = argv[i + 1]
+            return
+        if tok.startswith("--trainer-gpus="):
+            os.environ["CUDA_VISIBLE_DEVICES"] = tok.split("=", 1)[1]
+            return
+
+
+_apply_grpo_split_gpu_mask()
 
 from surogate.utils.logger import get_logger
 from surogate.utils.system_info import get_system_info, print_system_diagnostics
@@ -11,6 +35,7 @@ COMMAND_MAPPING: dict[str, str] = {
     "sft": "surogate.cli.sft",
     "pt": "surogate.cli.pt",
     "grpo": "surogate.cli.grpo",
+    "grpo-colocate": "surogate.cli.grpo_colocate",
     "grpo-train": "surogate.cli.grpo_train",
     "grpo-infer": "surogate.cli.grpo_infer",
     "grpo-orch": "surogate.cli.grpo_orch",
@@ -53,10 +78,17 @@ def parse_args():
 
     pt_prepare_command_parser(subparsers.add_parser("pt", help="Pretraining"))
 
-    # grpo command (unified co-locate mode)
+    # grpo command (split-GPU mode)
     from surogate.cli.grpo import prepare_command_parser as grpo_prepare_command_parser
 
-    grpo_prepare_command_parser(subparsers.add_parser("grpo", help="GRPO RL (unified co-locate mode)"))
+    grpo_prepare_command_parser(subparsers.add_parser("grpo", help="GRPO RL (vLLM and trainer on disjoint GPU sets)"))
+
+    # grpo-colocate command (shared-GPU mode)
+    from surogate.cli.grpo_colocate import prepare_command_parser as grpo_colocate_prepare_command_parser
+
+    grpo_colocate_prepare_command_parser(
+        subparsers.add_parser("grpo-colocate", help="GRPO RL (vLLM and trainer share GPUs via CUDA IPC)")
+    )
 
     # grpo-infer command
     from surogate.cli.grpo_infer import prepare_command_parser as grpo_infer_prepare_command_parser

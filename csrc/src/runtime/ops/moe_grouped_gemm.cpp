@@ -11,6 +11,7 @@
 #include "runtime/executor/compiled_ops_helpers.h"
 #include "runtime/dsl/autodiff.h"
 #include "runtime/dsl/buffer_plan.h"
+#include "runtime/dsl/tensor_role.h"
 #include "runtime/executor/op_registry.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "kernels/kernels.h"
@@ -23,6 +24,19 @@
 #include "runtime/lora/lora_weights_manager.h"
 
 namespace dsl {
+namespace {
+
+void attach_token_role(modules::MoeMatmulContext& ctx, const CompiledGraph* graph, const TensorRef& ref) {
+    if (!graph) {
+        return;
+    }
+    if (const TensorRole* role = graph->role_for_tensor_id(ref.tensor_id)) {
+        ctx.token_role = *role;
+        ctx.has_token_role = true;
+    }
+}
+
+}  // namespace
 
 void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
     Tensor& inp = resolve_tensor(op.inputs[0]);
@@ -141,11 +155,11 @@ void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
                                                       static_cast<std::size_t>(local_idx) * expert_bytes;
                 }
                 llep_weight_ptrs = refreshed_native_weight_ptrs.data();
-            } else if (wname.find("gate_up") != std::string_view::npos && !llep.gate_up_weight_ptrs.empty()) {
+            } else if (tensor_role_is_expert_gate_up_name(wname) && !llep.gate_up_weight_ptrs.empty()) {
                 llep_weight_ptrs = llep.gate_up_weight_ptrs.data();
-            } else if (wname.find("down") != std::string_view::npos && !llep.down_weight_ptrs.empty()) {
+            } else if (tensor_role_is_expert_down_name(wname) && !llep.down_weight_ptrs.empty()) {
                 llep_weight_ptrs = llep.down_weight_ptrs.data();
-            } else if (wname.find("_up") != std::string_view::npos && !llep.gate_up_weight_ptrs.empty()) {
+            } else if (tensor_role_is_expert_up_name(wname) && !llep.gate_up_weight_ptrs.empty()) {
                 // Separate up projection (Nemotron-H / Nemotron Nano "experts_up") — reuses
                 // gate_up_weight_ptrs since ep_dispatch populates it from whichever up-projection
                 // weight exists.
@@ -190,8 +204,11 @@ void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
     // Refresh MoE expert weights for this layer using the current routing offsets.
     auto* qlora_provider = mWeights.qlora_provider();
     if (host_offsets_ptr && layer_idx_any >= 0 && qlora_provider && qlora_provider->supports_selective_moe()) {
-        (void)
+        const bool refreshed =
             refresh_moe_experts_if_needed(layer_idx_any, host_offsets_ptr, num_experts, mWeights, mRunState.MainStream);
+        if (refreshed) {
+            invalidate_moe_fp8_cache(op.inputs[1].name);
+        }
     }
 
     MoeCompactInfo compact = host_offsets_ptr ? build_moe_compact_info_from_host(host_offsets_ptr,
@@ -236,14 +253,21 @@ void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
         ctx.run_state = &mRunState;
         ctx.cudnn_handle = mRunState.CudnnHandle;
         ctx.cublas_handle = mRunState.cublas_handle();
+        ctx.cublaslt_handle = mRunState.CublasLtHandle;
         ctx.workspace = mRunState.CuBlasWorkspace.get<std::byte>();
         ctx.workspace_size = mRunState.CuBlasWorkspace.bytes();
         ctx.stream = mRunState.MainStream;
+        ctx.op_caps = op.default_caps;
+        ctx.moe_caps = op.moe_caps;
+        ctx.epilogue_support = op.epilogue_support;
+        ctx.storage_compat = op.storage_compat;
+        attach_token_role(ctx, mCurrentGraph, op.inputs[0]);
         ctx.host_offsets = host_offsets_ptr;
         ctx.active_experts = active_ptr;
         ctx.num_active = num_active;
         ctx.weight_is_compact = weight_is_compact;
         ctx.allow_fp8 = op.attrs.allow_quant;
+        attach_moe_fp8_cache(ctx, op.inputs[1].name);
 
         // Allocate FP8 buffers if using FP8 hybrid recipe
         Tensor inp_quant_buf, inp_stats_buf;
@@ -299,9 +323,12 @@ void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
                          llep_weight_ptrs);
     }
 
-    // Apply grouped MoE LoRA (up projection) when enabled.
-    if (mLoRAConfig && mLoRAWeights && mLoRARunState && mLoRAConfig->enabled() && mLoRAWeights->enabled() &&
-        layer_idx_any >= 0) {
+    auto apply_grouped_moe_up_lora = [&]() {
+        // Apply grouped MoE LoRA (up projection) when enabled.
+        if (!(mLoRAConfig && mLoRAWeights && mLoRARunState && mLoRAConfig->enabled() && mLoRAWeights->enabled() &&
+              layer_idx_any >= 0)) {
+            return;
+        }
         auto& lora_block = mLoRAWeights->get_block(layer_idx_any, mRunState.MainStream);
         if (lora_block.moe.use_grouped) {
             // When LLEP is active, use merged LoRA tensors
@@ -460,6 +487,21 @@ void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
                 }
             }  // if (up_ptr && up_ptr->has_value())
         }  // if (use_grouped)
+    };
+
+    AfterProduceHookPayload after_produce_payload;
+    const std::string_view after_produce_slot =
+        grouped_lora_after_produce_slot(op, modules::LoRATargetId::ExpertUp, "expert_up");
+    if (!after_produce_slot.empty()) {
+        after_produce_payload.apply_lora_action = apply_grouped_moe_up_lora;
+        dispatch_schema_hook(HookEventKind::AfterProduce,
+                             layer_idx_any,
+                             op.attrs.hook_schema_id,
+                             after_produce_slot,
+                             &after_produce_payload);
+    }
+    if (!after_produce_payload.lora_applied) {
+        apply_grouped_moe_up_lora();
     }
 
     store_tensor(op.outputs[0], out);
@@ -600,11 +642,11 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
                                                       static_cast<std::size_t>(local_idx) * expert_bytes;
                 }
                 llep_weight_ptrs = refreshed_native_weight_ptrs.data();
-            } else if (wname.find("gate_up") != std::string_view::npos && !llep.gate_up_weight_ptrs.empty()) {
+            } else if (tensor_role_is_expert_gate_up_name(wname) && !llep.gate_up_weight_ptrs.empty()) {
                 llep_weight_ptrs = llep.gate_up_weight_ptrs.data();
-            } else if (wname.find("down") != std::string_view::npos && !llep.down_weight_ptrs.empty()) {
+            } else if (tensor_role_is_expert_down_name(wname) && !llep.down_weight_ptrs.empty()) {
                 llep_weight_ptrs = llep.down_weight_ptrs.data();
-            } else if (wname.find("_up") != std::string_view::npos && !llep.gate_up_weight_ptrs.empty()) {
+            } else if (tensor_role_is_expert_up_name(wname) && !llep.gate_up_weight_ptrs.empty()) {
                 llep_weight_ptrs = llep.gate_up_weight_ptrs.data();
             }
             num_experts = llep.num_merged_experts;
@@ -699,11 +741,14 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
     if (qlora_provider && qlora_provider->supports_selective_moe()) {
         const int* refresh_offsets = host_offsets_ptr;
         if (refresh_offsets) {
-            (void)refresh_moe_experts_if_needed(layer_idx_any,
-                                                refresh_offsets,
-                                                num_experts,
-                                                mWeights,
-                                                mRunState.MainStream);
+            const bool refreshed = refresh_moe_experts_if_needed(layer_idx_any,
+                                                                 refresh_offsets,
+                                                                 num_experts,
+                                                                 mWeights,
+                                                                 mRunState.MainStream);
+            if (refreshed) {
+                invalidate_moe_fp8_cache(op.inputs[2].name);
+            }
         }
     }
 
@@ -731,16 +776,23 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
         ctx.layer_idx = layer_idx_any;
         ctx.run_state = &mRunState;
         ctx.cublas_handle = mRunState.cublas_handle();
+        ctx.cublaslt_handle = mRunState.CublasLtHandle;
         ctx.stream = mRunState.MainStream;
+        ctx.op_caps = op.default_caps;
+        ctx.moe_caps = op.moe_caps;
+        ctx.epilogue_support = op.epilogue_support;
+        ctx.storage_compat = op.storage_compat;
+        attach_token_role(ctx, mCurrentGraph, op.inputs[1]);
         ctx.host_offsets = host_offsets_ptr;
         ctx.active_experts = active_ptr;
         ctx.num_active = num_active;
         ctx.weight_is_compact = weight_is_compact;
         ctx.skip_weight_grad = false;
         ctx.allow_fp8 = op.attrs.allow_quant;
+        attach_moe_fp8_cache(ctx, op.inputs[2].name);
 
         // Allocate FP8 buffers if using FP8 hybrid recipe
-        Tensor dout_quant_buf, dout_stats_buf;
+        Tensor dout_quant_buf, dout_stats_buf, inp_quant_buf, inp_stats_buf;
         if (mRecipe->is_fp8_hybrid() && ctx.allow_fp8) {
             const long num_elements = total_tokens * out_features;
             dout_quant_buf = mRunState.temp_alloc(ETensorDType::FP8_E5M2,
@@ -752,6 +804,15 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
             ctx.dout_quant = &dout_quant_buf;
             mTemps.push_back(dout_quant_buf);
             mTemps.push_back(dout_stats_buf);
+
+            inp_quant_buf = mRunState.temp_alloc(ETensorDType::FP8_E4M3,
+                                                 {total_tokens, static_cast<long>(in_features)},
+                                                 "moe_grouped_gemm_bwd_inp_quant_buf");
+            inp_stats_buf = mRunState.temp_alloc(ETensorDType::FP32, {2}, "moe_grouped_gemm_bwd_inp_stats_buf");
+            inp_quant_buf.Stats = inp_stats_buf.get<float>();
+            ctx.inp_quant = &inp_quant_buf;
+            mTemps.push_back(inp_quant_buf);
+            mTemps.push_back(inp_stats_buf);
         }
 
         mRecipe->backward_moe_matmul(ctx);

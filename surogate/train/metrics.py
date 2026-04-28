@@ -19,6 +19,12 @@ class MoEMetrics:
     z_loss: float = 0.0
     load_imbalance: float = 0.0
     expert_utilization: float = 0.0
+    active_experts: float = 0.0
+    max_expert_fraction: float = 0.0
+    min_active_expert_fraction: float = 0.0
+    load_cv: float = 0.0
+    router_entropy: float = 0.0
+    router_confidence: float = 0.0
 
     @staticmethod
     def from_dict(d: dict) -> MoEMetrics | None:
@@ -33,6 +39,12 @@ class MoEMetrics:
             z_loss=d.get("z_loss", 0.0),
             load_imbalance=d.get("load_imbalance", 0.0),
             expert_utilization=d.get("expert_utilization", 0.0),
+            active_experts=d.get("active_experts", 0.0),
+            max_expert_fraction=d.get("max_expert_fraction", 0.0),
+            min_active_expert_fraction=d.get("min_active_expert_fraction", 0.0),
+            load_cv=d.get("load_cv", 0.0),
+            router_entropy=d.get("router_entropy", 0.0),
+            router_confidence=d.get("router_confidence", 0.0),
         )
 
 
@@ -84,4 +96,10 @@ class StepMetrics:
             d["moe_z_loss"] = self.moe.z_loss
             d["moe_load_imbalance"] = self.moe.load_imbalance
             d["moe_expert_utilization"] = self.moe.expert_utilization
+            d["moe_active_experts"] = self.moe.active_experts
+            d["moe_max_expert_fraction"] = self.moe.max_expert_fraction
+            d["moe_min_active_expert_fraction"] = self.moe.min_active_expert_fraction
+            d["moe_load_cv"] = self.moe.load_cv
+            d["moe_router_entropy"] = self.moe.router_entropy
+            d["moe_router_confidence"] = self.moe.router_confidence
         return d

@@ -8,6 +8,7 @@
 #include "runtime/dsl/buffer_plan.h"
 #include "runtime/executor/compiled_ops.h"
 #include "runtime/dsl/dsl_runtime.h"
+#include "runtime/dsl/tensor_role.h"
 #include "runtime/dsl/tensor_slot_dispatch.h"
 #include "runtime/dsl/dsl_weight_manager.h"
 #include "runtime/executor/graph_executor_internal.h"
@@ -137,6 +138,16 @@ inline bool graph_has_capture_unsafe_ops(const CompiledGraph* g) {
         }
     }
     return false;
+}
+
+inline bool env_flag_enabled(const char* name) {
+    const char* raw = std::getenv(name);
+    if (!raw) return false;
+    std::string value(raw);
+    for (char& ch : value) {
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+    return value == "1" || value == "true" || value == "yes" || value == "on";
 }
 
 inline void sync_event_if_not_capturing(cudaEvent_t event, cudaStream_t stream) {
@@ -484,11 +495,13 @@ void GraphExecutor::init(const GraphExecutorOptions& options) {
                 }
             }
 
+            std::unordered_set<std::string> param_grad_outputs;
+            param_grad_outputs.reserve(mGrads.param_names().size());
+            for (const std::string& param_name : mGrads.param_names()) {
+                param_grad_outputs.insert("d_" + param_name);
+            }
             auto is_param_grad = [&](const std::string& name) {
-                if (auto base = base_param_from_grad_heuristic(name)) {
-                    return mWeights.has(*base);
-                }
-                return false;
+                return param_grad_outputs.find(name) != param_grad_outputs.end();
             };
 
             std::vector<char> core(op_count, 0);
@@ -649,6 +662,7 @@ void GraphExecutor::init_compiled_execution() {
         mCompiledExecutor->set_recipe(mOptions.TrainingRecipe.get());
     }
     mCompiledExecutor->set_hook_context(mHookContext);
+    mCompiledExecutor->set_schema_hook_registry(mSchemaHookRegistry);
     mCompiledExecutor->set_recompute_fn([this](int layer_idx, long B, long T, bool /*use_graph*/) {
         if (mCompiledForward) {
             // LoRA replay is slice-driven (see ``CompiledAttrs::lora_slices``).
@@ -658,6 +672,7 @@ void GraphExecutor::init_compiled_execution() {
     });
     mCompiledExecutor->set_fp8_cache(&mFP8WeightCache);
     mCompiledExecutor->set_fp8_cache_transposed(&mFP8WeightCacheT);
+    mCompiledExecutor->set_moe_fp8_cache(&mMoEFP8WeightCache);
     mCompiledExecutor->set_fp4_cache(&mFP4WeightCache, &mFP4WeightCacheT);
     mCompiledExecutor->set_saved_tensors(&mSaved);
     mCompiledExecutor->set_save_list(&mSaveList);
@@ -717,8 +732,7 @@ void GraphExecutor::init_compiled_execution() {
         };
 
         const auto maybe_rope = [&](std::string_view probe) -> std::optional<Tensor> {
-            if (probe.find("rope_freqs") != std::string_view::npos ||
-                probe.find("freq_cis") != std::string_view::npos) {
+            if (tensor_role_is_rope_name(probe)) {
                 Tensor t = mRunState.rope_freqs(name);
                 if (t.Data) {
                     log_debug_dump_choice("rope", t);
@@ -896,6 +910,13 @@ void GraphExecutor::init_compiled_execution() {
     mCompiledT = 0;
 }
 
+void GraphExecutor::set_schema_hook_registry(const HookRegistry* registry) {
+    mSchemaHookRegistry = registry;
+    if (mCompiledExecutor) {
+        mCompiledExecutor->set_schema_hook_registry(registry);
+    }
+}
+
 void GraphExecutor::compile_graphs(long B, long T) {
     if (!mCompiler || !mCompiledExecutor) {
         return;
@@ -1029,7 +1050,8 @@ void GraphExecutor::compile_graphs(long B, long T) {
                                          static_cast<int>(mConfig.NumLayers),
                                          stack_bytes,
                                          bwd_cross_layer_bytes,
-                                         moe_saved_bytes);
+                                         moe_saved_bytes,
+                                         &mRunState.buffer_plan());
                 // Persistent arena holds only weight-like storage (weights,
                 // WM master/work/prefetch, LoRA master/work, non-graph extras)
                 // in four slabs:
@@ -1307,7 +1329,10 @@ void GraphExecutor::execute_forward(long B,
     const bool doc_masking_active = doc_masking_active_raw && !force_full_capture;
     const bool has_tiled_mlp = mCompiledForward && !mCompiledForward->mlp_tile_groups.empty();
     const bool needs_split = doc_masking_active || has_capture_unsafe_ops || has_tiled_mlp;
-    const bool use_split_attention = needs_split && mOptions.UseCudaGraphs && !in_capture;
+    const bool capture_unsafe_split_allowed =
+        !has_capture_unsafe_ops || env_flag_enabled("SUROGATE_ENABLE_CAPTURE_UNSAFE_SPLIT_GRAPHS");
+    const bool use_split_attention =
+        needs_split && capture_unsafe_split_allowed && mOptions.UseCudaGraphs && !in_capture;
     const bool use_graphs = mGraphsEnabled && !in_capture && !needs_split;
     if (use_graphs && (mGraphB != B || mGraphT != T)) {
         reset_cuda_graphs();
@@ -1426,7 +1451,10 @@ void GraphExecutor::execute_backward(long B,
     const bool has_capture_unsafe_bwd = has_capture_unsafe_ops;
     const bool has_tiled_mlp_bwd = mCompiledBackward && !mCompiledBackward->mlp_tile_groups.empty();
     const bool needs_split_bwd = doc_masking_active_bwd || has_capture_unsafe_bwd || has_tiled_mlp_bwd;
-    const bool use_split_attention_bwd = needs_split_bwd && mOptions.UseCudaGraphs && !in_capture;
+    const bool capture_unsafe_split_allowed_bwd =
+        !has_capture_unsafe_bwd || env_flag_enabled("SUROGATE_ENABLE_CAPTURE_UNSAFE_SPLIT_GRAPHS");
+    const bool use_split_attention_bwd =
+        needs_split_bwd && capture_unsafe_split_allowed_bwd && mOptions.UseCudaGraphs && !in_capture;
     const bool use_graphs = mBackwardGraphsEnabled && mBackwardGraphCapturable && !in_capture && !needs_split_bwd;
     mCompiledExecutor->set_split_attention_graphs(use_split_attention_bwd);
     if (use_graphs && (mGraphB != B || mGraphT != T)) {

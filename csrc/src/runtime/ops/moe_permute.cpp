@@ -210,8 +210,8 @@ void CompiledExecutor::dispatch_moe_permute_backward(const CompiledOp& op) {
         auto it = mMoeSavedBuffers.find(key);
         if (it == mMoeSavedBuffers.end()) {
             // Backward-compatible fallback for unsuffixed key.
-            const std::string legacy_key = "blocks[" + std::to_string(layer_idx) + "].moe_gather_indices";
-            it = mMoeSavedBuffers.find(legacy_key);
+            const std::string compat_key = "blocks[" + std::to_string(layer_idx) + "].moe_gather_indices";
+            it = mMoeSavedBuffers.find(compat_key);
         }
         if (it != mMoeSavedBuffers.end() && it->second != nullptr) {
             const int top_k = op.attrs.top_k > 0 ? op.attrs.top_k : 1;

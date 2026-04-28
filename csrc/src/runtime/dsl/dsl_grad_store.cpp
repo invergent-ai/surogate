@@ -18,6 +18,8 @@
 
 #include "runtime/dsl/dsl_param_store.h"
 #include "runtime/dsl/graph_compiler.h"
+#include "runtime/dsl/hook_registry.h"
+#include "runtime/dsl/tensor_role.h"
 #include "kernels/kernels.h"
 #include "utilities/comm.h"
 #include "utilities/utils.h"
@@ -36,6 +38,11 @@ bool is_lm_head_name(const std::string& name) {
     return name == "lm_head" || name == "lm_head_weight";
 }
 
+bool use_expert_parallel_grad_route(const std::string& name, const char* context) {
+    (void)context;
+    return tensor_role_is_expert_parallel_name(name);
+}
+
 }  // namespace
 
 DslGradStore::DslGradStore(const DslParamStore& params,
@@ -51,6 +58,8 @@ DslGradStore::DslGradStore(const DslParamStore& params,
       mCpuTraining(cpu_training),
       mOffloadAlloc(offload_alloc),
       mGradDtypeOverride(grad_dtype_override) {
+    mSchemaHookDispatchEnabled = schema_hook_dispatch_enabled();
+
     if (!mAllocator) {
         throw std::runtime_error("DslGradStore: allocator is null");
     }
@@ -162,6 +171,12 @@ void DslGradStore::configure(const DslGradStoreConfig& config) {
     }
 }
 
+void DslGradStore::set_schema_hook_registry(const HookRegistry* registry,
+                                            std::vector<std::string> schema_ids_by_layer) {
+    mSchemaHookRegistry = registry;
+    mHookSchemaIdsByLayer = std::move(schema_ids_by_layer);
+}
+
 void DslGradStore::build_layer_grad_map() {
     mLayerGradNames.clear();
     mLayerGradNames.resize(mConfig.num_layers);
@@ -203,10 +218,10 @@ void DslGradStore::build_layer_grad_map() {
 void DslGradStore::build_zero_segments() {
     // Free previous segment arrays if they exist (e.g., rebuild after enable_streaming)
     if (mZeroPtrs.Data) {
-        cudaFree(mZeroPtrs.Data);
+        mAllocator->free(mZeroPtrs);
     }
     if (mZeroSizes.Data) {
-        cudaFree(mZeroSizes.Data);
+        mAllocator->free(mZeroSizes);
     }
     mZeroPtrs = {};
     mZeroSizes = {};
@@ -353,11 +368,20 @@ void DslGradStore::reduce_all(NCCLCommunicator& comm, cudaStream_t stream) {
     for (auto& kv : mGrads) {
         // EP: expert weight gradients average across DP group only (same experts),
         // everything else (dense, router, norms) averages across all GPUs.
-        if (ep_active && kv.first.find("experts_") != std::string::npos) {
+        if (ep_active && use_expert_parallel_grad_route(kv.first, "DslGradStore::reduce_all")) {
             comm.all_reduce_avg_dp(kv.second, stream);
         } else {
             comm.all_reduce_avg(kv.second, stream);
         }
+    }
+    GradientOffloadHookPayload payload;
+    payload.grads = this;
+    payload.comm = &comm;
+    payload.compute_stream = stream;
+    payload.copy_stream = stream;
+    payload.all_reduced = true;
+    for (int layer = 0; layer < static_cast<int>(mHookSchemaIdsByLayer.size()); ++layer) {
+        dispatch_schema_layer_hooks(HookEventKind::AfterAllReduce, layer, stream, &payload);
     }
     mReducePending = false;
 }
@@ -368,7 +392,7 @@ void DslGradStore::reduce_all_async(NCCLCommunicator& comm, cudaStream_t stream,
 
     // Helper: reduce a single gradient using the appropriate communicator
     auto reduce_one = [&](const std::string& name, Tensor& grad) {
-        if (ep_active && name.find("experts_") != std::string::npos) {
+        if (ep_active && use_expert_parallel_grad_route(name, "DslGradStore::reduce_all_async")) {
             comm.all_reduce_avg_dp(grad, stream);
         } else {
             comm.all_reduce_avg(grad, stream);
@@ -481,7 +505,7 @@ void DslGradStore::scatter_reduce_layer(int layer_idx, cudaStream_t stream, NCCL
         // First pass: reduce dense/router grads via global comm transaction
         bool has_dense = false;
         for (const auto& name : grad_names) {
-            if (name.find("experts_") == std::string::npos) {
+            if (!use_expert_parallel_grad_route(name, "DslGradStore::scatter_reduce_layer.has_dense")) {
                 has_dense = true;
                 break;
             }
@@ -489,7 +513,7 @@ void DslGradStore::scatter_reduce_layer(int layer_idx, cudaStream_t stream, NCCL
         if (has_dense) {
             comm.begin_transaction(stream);
             for (const auto& name : grad_names) {
-                if (name.find("experts_") != std::string::npos) continue;
+                if (use_expert_parallel_grad_route(name, "DslGradStore::scatter_reduce_layer.dense")) continue;
                 auto it = mGrads.find(name);
                 if (it != mGrads.end() && it->second.Data && it->second.nelem() > 0) {
                     if (mConfig.shard_gradients) {
@@ -504,7 +528,7 @@ void DslGradStore::scatter_reduce_layer(int layer_idx, cudaStream_t stream, NCCL
 
         // Second pass: reduce expert grads via DP comm (individual calls)
         for (const auto& name : grad_names) {
-            if (name.find("experts_") == std::string::npos) continue;
+            if (!use_expert_parallel_grad_route(name, "DslGradStore::scatter_reduce_layer.expert")) continue;
             auto it = mGrads.find(name);
             if (it != mGrads.end() && it->second.Data && it->second.nelem() > 0) {
                 comm.all_reduce_avg_dp(it->second, stream);
@@ -526,10 +550,56 @@ void DslGradStore::scatter_reduce_layer(int layer_idx, cudaStream_t stream, NCCL
         comm.execute_transaction(ev);
     }
 
-    // ZeRO-2 with offloading: accumulate reduced shards into host storage
-    if (mConfig.shard_gradients && !mShardedGrads.empty()) {
+    GradientOffloadHookPayload reduce_payload;
+    reduce_payload.grads = this;
+    reduce_payload.compute_stream = stream;
+    reduce_payload.copy_stream = stream;
+    reduce_payload.reduce_scattered = mConfig.shard_gradients;
+    dispatch_schema_layer_hooks(mConfig.shard_gradients ? HookEventKind::AfterReduceScatter
+                                                        : HookEventKind::AfterAllReduce,
+                                layer_idx,
+                                stream,
+                                &reduce_payload);
+
+    // ZeRO-2 with offloading: accumulate reduced shards into host storage.
+    if (mConfig.shard_gradients && !reduce_payload.sharded_accumulated && !mShardedGrads.empty()) {
         accumulate_to_sharded(layer_idx, stream);
     }
+}
+
+int DslGradStore::dispatch_schema_layer_hooks(HookEventKind event, int layer_idx, cudaStream_t stream, void* payload) {
+    if (!mSchemaHookDispatchEnabled || !mSchemaHookRegistry || layer_idx < 0 ||
+        layer_idx >= static_cast<int>(mHookSchemaIdsByLayer.size())) {
+        return 0;
+    }
+    const std::string& schema_id = mHookSchemaIdsByLayer[static_cast<std::size_t>(layer_idx)];
+    if (schema_id.empty()) {
+        return 0;
+    }
+    int dispatched = 0;
+    for (const HookRegistration& registration : mSchemaHookRegistry->registrations()) {
+        if (registration.event != event || registration.target.schema_id != schema_id) {
+            continue;
+        }
+        HookContext context;
+        context.layer_idx = layer_idx;
+        context.target = registration.target;
+        context.event = event;
+        context.stream = stream;
+        context.payload = payload;
+        if (registration.callback) {
+            registration.callback(context);
+        }
+        ++dispatched;
+    }
+    return dispatched;
+}
+
+void DslGradStore::accumulate_layer_to_sharded(int layer_idx, cudaStream_t stream) {
+    if (!mConfig.shard_gradients || mShardedGrads.empty()) {
+        return;
+    }
+    accumulate_to_sharded(layer_idx, stream);
 }
 
 void DslGradStore::allocate_sharded_grads() {

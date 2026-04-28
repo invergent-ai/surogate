@@ -17,31 +17,136 @@
 #include "runtime/dsl/op_shape_signatures.h"
 #include "runtime/executor/graph_executor_helpers.h"
 #include "runtime/executor/graph_executor_utils.h"
+#include "runtime/qlora/quantized_tensor.h"
 #include "runtime/lora/lora_slice_dispatch.h"
 #include "kernels/kernels.h"
 #include "utilities/dtype.h"
 
 namespace dsl {
+namespace {
+
+void attach_input_role(modules::MatmulContext& ctx, const CompiledGraph* graph, const TensorRef& ref) {
+    if (!graph) {
+        return;
+    }
+    if (const TensorRole* role = graph->role_for_tensor_id(ref.tensor_id)) {
+        ctx.input_role = *role;
+        ctx.has_input_role = true;
+    }
+}
+
+bool attach_resident_qlora_fp4_cache(modules::MatmulContext& ctx,
+                                     DslParamStore& weights,
+                                     DslRunState& run_state,
+                                     std::vector<Tensor>& temps,
+                                     Tensor& data_view,
+                                     Tensor& scales_view,
+                                     const std::string& weight_name,
+                                     bool capturing) {
+    if (capturing) {
+        return false;
+    }
+    auto* provider = weights.qlora_provider();
+    if (!provider) {
+        return false;
+    }
+    const auto* qt = provider->ensure_quantized_resident(weight_name, run_state.MainStream);
+    if (!qt || qt->format != qlora::QuantFormat::FP4_BLOCK_2D || qt->data.is_null() || qt->scales.is_null() ||
+        qt->is_on_host()) {
+        return false;
+    }
+    if (qt->M <= 0 || qt->K <= 0 || qt->K % 2 != 0) {
+        return false;
+    }
+    data_view = Tensor::from_pointer(qt->data.Data,
+                                     qt->data.Device,
+                                     ETensorDType::BYTE,
+                                     std::vector<long>{static_cast<long>(qt->M), static_cast<long>(qt->K / 2)});
+    std::vector<long> scales_shape;
+    scales_shape.reserve(static_cast<std::size_t>(qt->scales.Rank));
+    for (int i = 0; i < qt->scales.Rank; ++i) {
+        scales_shape.push_back(qt->scales.Sizes[i]);
+    }
+    scales_view = Tensor::from_pointer(qt->scales.Data, qt->scales.Device, ETensorDType::BYTE, scales_shape);
+    ctx.cached_fp4_data = &data_view;
+    ctx.cached_fp4_scales = &scales_view;
+
+    Tensor amax = run_state.temp_alloc(ETensorDType::FP32, {1}, "qlora_fp4_cached_amax");
+    constexpr float kFP8Max = 448.0f;
+    constexpr float kFP4Max = 6.0f;
+    const float host_amax = qt->global_scale * kFP8Max * kFP4Max;
+    CUDA_CHECK(cudaMemcpyAsync(amax.Data, &host_amax, sizeof(float), cudaMemcpyHostToDevice, run_state.MainStream));
+    temps.push_back(amax);
+    ctx.cached_fp4_amax = amax.get<float>();
+    return true;
+}
+
+struct LoRAForwardApplyContext {
+    const std::vector<LoRASlice>* slices = nullptr;
+    int layer_idx = -1;
+    Tensor input_2d;
+    Tensor output_2d;
+    int BT = 0;
+    modules::ModularLoRAWeightsManager* weights = nullptr;
+    const modules::ModularLoRAConfig* config = nullptr;
+    modules::LoRARunState* run_state = nullptr;
+    cublasLtHandle_t handle = nullptr;
+    Tensor* workspace = nullptr;
+    cudaStream_t stream = nullptr;
+};
+
+void apply_lora_forward_payload(void* opaque) {
+    auto* ctx = static_cast<LoRAForwardApplyContext*>(opaque);
+    if (!ctx || !ctx->slices || !ctx->workspace) return;
+    modules::detail::apply_lora_slices_forward(*ctx->slices,
+                                               ctx->layer_idx,
+                                               ctx->input_2d,
+                                               ctx->output_2d,
+                                               ctx->BT,
+                                               ctx->weights,
+                                               ctx->config,
+                                               ctx->run_state,
+                                               ctx->handle,
+                                               *ctx->workspace,
+                                               ctx->stream);
+}
+
+}  // namespace
 
 void CompiledExecutor::dispatch_matmul_swiglu(const CompiledOp& op, const modules::ForwardHook* hook) {
     Tensor& a = resolve_tensor(op.inputs[0]);
-    Tensor& b = resolve_tensor(op.inputs[1]);
     Tensor& out = ensure_output_tensor(op.outputs[0]);
     Tensor& up_out = ensure_output_tensor(op.outputs[1]);
     const std::string& weight_name = op.inputs[1].name;
+    Tensor b_template{};
+    Tensor* b_resolved = nullptr;
+    if (mWeights.has(weight_name)) {
+        b_template = mWeights.template_tensor(weight_name);
+    } else {
+        b_resolved = &resolve_tensor(op.inputs[1]);
+        b_template = *b_resolved;
+    }
+    auto resolve_weight = [&]() -> Tensor& {
+        if (!b_resolved) {
+            b_resolved = &resolve_tensor(op.inputs[1]);
+        }
+        return *b_resolved;
+    };
 
     int M = 0, N = 0, K = 0;
-    matmul_dims(a, b, op.attrs.transpose, M, N, K);
+    matmul_dims(a, b_template, op.attrs.transpose, M, N, K);
     const long D = N / 2;
 
     bool used_recipe = false;
     modules::MatmulContext ctx{};
+    Tensor resident_fp4_data_view{};
+    Tensor resident_fp4_scales_view{};
     modules::MatmulContext* ctx_ptr = nullptr;
     if (mRecipe && op.attrs.transpose == EMMTranspose::NT && a.Sizes[0] == mB * mT && op.attrs.allow_quant &&
         op.attrs.matmul_op.has_value()) {
         ctx.out = &up_out;
         ctx.inp = &a;
-        ctx.weight = &b;
+        ctx.weight = b_resolved ? b_resolved : &b_template;
         ctx.bias = nullptr;
         ctx.B = static_cast<int>(mB);
         ctx.T = static_cast<int>(mT);
@@ -51,22 +156,23 @@ void CompiledExecutor::dispatch_matmul_swiglu(const CompiledOp& op, const module
         ctx.stream = mRunState.MainStream;
         ctx.layer_idx = op.attrs.layer_idx;
         ctx.op = *op.attrs.matmul_op;
+        ctx.op_caps = op.default_caps;
+        ctx.matmul_caps = op.matmul_caps;
+        ctx.epilogue_support = op.epilogue_support;
+        ctx.storage_compat = op.storage_compat;
+        attach_input_role(ctx, mCurrentGraph, op.inputs[0]);
         ctx.allow_fp8 = mRecipe->uses_fp8_forward();
         ctx.allow_fp4 = mRecipe->uses_fp4_forward();
 
         if (ctx.allow_fp8) {
+            Tensor& b = resolve_weight();
+            ctx.weight = &b;
             ctx.inp_quant = fp8_forward_buffer(mRunState, *op.attrs.matmul_op);
             ctx.delayed_quantizer_idx = fp8_quantizer_index(mRunState, *op.attrs.matmul_op, op.attrs.layer_idx);
 
             // Check if the upstream rmsnorm dispatch has already pre-quantized
             // the LN2 output into the FP8 buffer.
-            DslRunState::FP8BufferReady ready_flag = DslRunState::FP8Ready_None;
-            switch (*op.attrs.matmul_op) {
-                case modules::MatmulOp::QKV: ready_flag = DslRunState::FP8Ready_LN1; break;
-                case modules::MatmulOp::MLPUp: ready_flag = DslRunState::FP8Ready_LN2; break;
-                case modules::MatmulOp::MLPDown: ready_flag = DslRunState::FP8Ready_SwiGLU; break;
-                default: break;
-            }
+            DslRunState::FP8BufferReady ready_flag = fp8_ready_flag_for_matmul_op(*op.attrs.matmul_op);
             if (ready_flag != DslRunState::FP8Ready_None && mRunState.consume_fp8_buffer_ready(ready_flag)) {
                 ctx.inp_quant_ready = true;
             }
@@ -89,6 +195,19 @@ void CompiledExecutor::dispatch_matmul_swiglu(const CompiledOp& op, const module
                 ctx.cached_fp4_amax = it->second.amax.get<float>();
             }
         }
+        if (ctx.allow_fp4 && !ctx.cached_fp4_data) {
+            (void)attach_resident_qlora_fp4_cache(ctx,
+                                                  mWeights,
+                                                  mRunState,
+                                                  mTemps,
+                                                  resident_fp4_data_view,
+                                                  resident_fp4_scales_view,
+                                                  weight_name,
+                                                  mCapturing);
+        }
+        if (!ctx.cached_fp4_data && !ctx.cached_weight) {
+            ctx.weight = &resolve_weight();
+        }
 
         mRecipe->forward_matmul(ctx);
         used_recipe = true;
@@ -96,6 +215,7 @@ void CompiledExecutor::dispatch_matmul_swiglu(const CompiledOp& op, const module
     }
 
     if (!used_recipe) {
+        Tensor& b = resolve_weight();
         matmul(up_out,
                b,
                a,
@@ -114,31 +234,43 @@ void CompiledExecutor::dispatch_matmul_swiglu(const CompiledOp& op, const module
 
     (void)hook;
 
+    LoRAForwardApplyContext lora_apply_ctx;
+    AfterProduceHookPayload after_produce_payload;
+    if (!op.attrs.lora_slices.empty()) {
+        Tensor a_flat = flatten_bt(a, mB, mT);
+        Tensor up_flat = flatten_bt(up_out, mB, mT);
+        lora_apply_ctx.slices = &op.attrs.lora_slices;
+        lora_apply_ctx.layer_idx = op.attrs.layer_idx;
+        lora_apply_ctx.input_2d = a_flat;
+        lora_apply_ctx.output_2d = up_flat;
+        lora_apply_ctx.BT = static_cast<int>(a_flat.Sizes[0]);
+        lora_apply_ctx.weights = mLoRAWeights;
+        lora_apply_ctx.config = mLoRAConfig;
+        lora_apply_ctx.run_state = mLoRARunState;
+        lora_apply_ctx.handle = mRunState.CublasLtHandle;
+        lora_apply_ctx.workspace = &mRunState.CuBlasWorkspace;
+        lora_apply_ctx.stream = mRunState.MainStream;
+        after_produce_payload.action_context = &lora_apply_ctx;
+        after_produce_payload.apply_lora = apply_lora_forward_payload;
+    }
+
     // Rebind the per-layer mlp_up activation slot to the live buffer so
     // backward replays read the fresh tensor.
     if (op.attrs.forward_hook_point.has_value() && op.attrs.layer_idx >= 0 && op.attrs.layer_idx < mConfig.NumLayers) {
         if (Tensor* mlp_up = block_activation_ptr(mRunState, op.attrs.layer_idx, TensorSlot::BlockMLPUp)) {
             mlp_up->Data = up_out.Data;
         }
+        dispatch_schema_hook(HookEventKind::AfterProduce,
+                             op.attrs.layer_idx,
+                             op.attrs.hook_schema_id,
+                             op.attrs.forward_hook_schema_slot,
+                             op.attrs.lora_slices.empty() ? nullptr : &after_produce_payload);
     }
 
     // Apply DSL-declared LoRA adapters (up/gate/...) to ``up_out`` before
     // the SwiGLU activation.
-    if (!op.attrs.lora_slices.empty()) {
-        Tensor a_flat = flatten_bt(a, mB, mT);
-        Tensor up_flat = flatten_bt(up_out, mB, mT);
-        const int BT = static_cast<int>(a_flat.Sizes[0]);
-        modules::detail::apply_lora_slices_forward(op.attrs.lora_slices,
-                                                   op.attrs.layer_idx,
-                                                   a_flat,
-                                                   up_flat,
-                                                   BT,
-                                                   mLoRAWeights,
-                                                   mLoRAConfig,
-                                                   mLoRARunState,
-                                                   mRunState.CublasLtHandle,
-                                                   mRunState.CuBlasWorkspace,
-                                                   mRunState.MainStream);
+    if (!op.attrs.lora_slices.empty() && !after_produce_payload.lora_applied) {
+        apply_lora_forward_payload(&lora_apply_ctx);
     }
 
     Tensor up_3d = view_tensor(up_out, {mB, mT, static_cast<long>(N)});
@@ -339,6 +471,11 @@ void CompiledExecutor::dispatch_matmul_swiglu_backward(const CompiledOp& op, con
         ctx.stream = mRunState.MainStream;
         ctx.layer_idx = layer_idx;
         ctx.op = *op.attrs.matmul_op;
+        ctx.op_caps = op.default_caps;
+        ctx.matmul_caps = op.matmul_caps;
+        ctx.epilogue_support = op.epilogue_support;
+        ctx.storage_compat = op.storage_compat;
+        attach_input_role(ctx, mCurrentGraph, op.inputs[0]);
         ctx.accumulate = do_accumulate;
         ctx.skip_weight_grad = skip_weight_grad || !d_weight_ptr;
         ctx.allow_fp8 = allow_quant && mRecipe->uses_fp8_hybrid_backward();

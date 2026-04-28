@@ -1,0 +1,68 @@
+{
+  "acceptance": {
+    "status": "pass",
+    "notes": [
+      "Direct .venv 2-GPU EP Qwen3.6 MoE FP8 validation completed 5 steps on 2026-04-27.",
+      "EP QLoRA offload auto-tune was skipped by default.",
+      "MoE/EP capture-unsafe boundary synchronization was enabled by default for QLoRA offload.",
+      "Logged norm is the scaled pre-clip gradient norm. Values above max_grad_norm=1 imply clipped updates, not unclipped optimizer steps."
+    ]
+  },
+  "command": {
+    "env": {
+      "SUROGATE_BLOCK_SCHEMA_PLAN_ASSERT": "1"
+    },
+    "entrypoint": ".venv/bin/surogate sft",
+    "source_config": "examples/sft/qwen36moe/qwen36moe-lora-fp8.yaml",
+    "temp_config": "/tmp/qwen36moe-lora-fp8-5step-sync.C52wcD.yaml"
+  },
+  "convergence_curve": [
+    {
+      "grad_norm": 28.102905,
+      "loss": 7.2491207,
+      "lr": 0.0002,
+      "step": 0
+    },
+    {
+      "grad_norm": 8.001911,
+      "loss": 7.173252,
+      "lr": 0.00016,
+      "step": 1
+    },
+    {
+      "grad_norm": 13.746795,
+      "loss": 7.041152,
+      "lr": 0.00012,
+      "step": 2
+    },
+    {
+      "grad_norm": 10.172262,
+      "loss": 7.1136374,
+      "lr": 8e-05,
+      "step": 3
+    },
+    {
+      "grad_norm": 47.28317,
+      "loss": 6.31849,
+      "lr": 4e-05,
+      "step": 4
+    }
+  ],
+  "distribution": {
+    "ep_size": 2,
+    "gpus": 2
+  },
+  "gradient_norm_semantics": {
+    "clip_threshold": 1.0,
+    "logged_norm": "scaled_pre_clip",
+    "source": "global_norm_sqrt_prescaled"
+  },
+  "log_file": "output_36moe_5step_sync/log-lyrical-detergent-20260427-081853.json",
+  "model": "Qwen/Qwen3.6-35B-A3B-FP8",
+  "recipe": "fp8-hybrid",
+  "storage": {
+    "qlora_offload_experts": true,
+    "strategy": "prequant_fp8"
+  },
+  "steps": 5
+}

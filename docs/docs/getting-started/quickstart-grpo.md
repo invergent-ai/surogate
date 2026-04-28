@@ -12,17 +12,30 @@ Example configs are in `examples/grpo/`. GRPO uses three config files:
 
 ## 2) Run
 
+GRPO can run in two single-command modes depending on your GPU layout:
+
+### Split-GPU mode — `surogate grpo` (recommended for ≥2 GPUs)
+
+vLLM and the trainer run on disjoint GPU sets, communicating via the filesystem. You explicitly assign GPU ids to each side:
+
 ```bash
-surogate grpo --train examples/grpo/train.yaml --infer examples/grpo/infer.yaml --orch examples/grpo/orch.yaml
+surogate grpo --train examples/grpo/train.yaml --infer examples/grpo/infer.yaml --orch examples/grpo/orch.yaml \
+    --vllm-gpus 0 --trainer-gpus 1
 ```
 
-If you use `uv`:
+The trainer's GPU count is derived from `--trainer-gpus` automatically — the YAML `gpus` field becomes optional. For MoE models, `ep_size` is also auto-set to the trainer GPU count.
+
+### Co-locate mode — `surogate grpo-colocate` (single-GPU or shared-GPU setups)
+
+vLLM and the trainer share the same GPUs and exchange base weights via zero-copy CUDA IPC:
 
 ```bash
-uv run surogate grpo --train examples/grpo/train.yaml --infer examples/grpo/infer.yaml --orch examples/grpo/orch.yaml
+surogate grpo-colocate --train examples/grpo/train.yaml --infer examples/grpo/infer.yaml --orch examples/grpo/orch.yaml
 ```
 
-This starts all three components in a single process with zero-copy GPU weight sharing (co-locate mode). No manual memory tuning needed — `gpu_memory_utilization` is computed automatically.
+No manual memory tuning needed — `gpu_memory_utilization` is computed automatically.
+
+If you use `uv`, prefix any of the above with `uv run`.
 
 ## 3) Outputs
 
@@ -30,14 +43,14 @@ Outputs (checkpoints, LoRA adapters, logs) are written under the trainer's `outp
 
 ## 4) Example Configuration
 
-A minimal setup using the **reverse-text** environment on a single GPU:
+A minimal setup using the **reverse-text** environment. With co-locate (`grpo-colocate`) this runs on a single GPU; with split (`grpo`) it runs on two GPUs (one for vLLM, one for the trainer):
 
 **`train.yaml`**:
 
 ```yaml
 model: Qwen/Qwen3-0.6B
 output_dir: ./outputs
-gpus: 1
+gpus: 1  # ignored in split mode — derived from --trainer-gpus
 
 per_device_train_batch_size: 1
 sequence_len: 2048
@@ -139,9 +152,9 @@ All precision options from SFT are available:
 - **BF16** (`recipe: bf16`): Maximum accuracy
 - **QLoRA**: Add `qlora_fp8: true`, `qlora_bnb: true`, or `qlora_fp4: true` for quantized base weights
 
-## 6) Multi-Process Mode
+## 6) Advanced: Three-Process Mode
 
-If you need inference and training on separate GPUs (or separate nodes), run three commands instead:
+For multi-node setups (or any case where you want each component in its own process), run three commands separately:
 
 ```bash
 # Terminal 1: Inference server
@@ -154,7 +167,7 @@ surogate grpo-orch orch.yaml
 CUDA_VISIBLE_DEVICES=1 surogate grpo-train train.yaml
 ```
 
-For single-GPU setups, co-locate mode is recommended since it shares base weights automatically.
+For single-host runs, prefer `surogate grpo` (split GPUs) or `surogate grpo-colocate` (shared GPUs) — they manage the lifecycle of all three components for you.
 
 ## Notes
 

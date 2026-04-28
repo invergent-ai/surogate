@@ -11,6 +11,7 @@
 #include <cuda_fp8.h>
 
 #include "runtime/core/matmul_context.h"
+#include "recipes/capability_predicates.h"
 #include "kernels/kernels.h"
 #include "utilities/dtype.h"
 #include "runtime/training/model.h"
@@ -26,8 +27,9 @@ void NVFP4Recipe::forward_matmul(modules::MatmulContext& ctx) const {
         throw std::runtime_error("NVFP4Recipe::forward_matmul: required tensors are null");
     }
 
-    // Fall back to BF16 matmul if FP4 is not allowed for this layer (skip_quant_first/last_layers)
-    if (!ctx.allow_fp4) {
+    // Fall back to BF16 matmul if FP4 is not allowed for this layer or descriptor.
+    if (!ctx.allow_fp4 || !descriptor_allows_fp4(ctx.op_caps, "NVFP4Recipe::forward_matmul") ||
+        !descriptor_allows_matmul_fp4_forward(ctx.matmul_caps, "NVFP4Recipe::forward_matmul")) {
         IRunState& rs = *ctx.run_state;
         const int M = ctx.B * ctx.T;
         const int N = ctx.C_out;
@@ -239,8 +241,9 @@ void NVFP4Recipe::backward_matmul(modules::MatmulContext& ctx) const {
         throw std::runtime_error("NVFP4Recipe::backward_matmul: inp/weight/dout must be BF16");
     }
 
-    // Fall back to BF16 matmul if FP4 is not allowed for this layer (skip_quant_first/last_layers)
-    if (!ctx.allow_fp4) {
+    // Fall back to BF16 matmul if FP4 is not allowed for this layer or descriptor.
+    if (!ctx.allow_fp4 || !descriptor_allows_fp4(ctx.op_caps, "NVFP4Recipe::backward_matmul") ||
+        !descriptor_allows_matmul_fp4_backward(ctx.matmul_caps, "NVFP4Recipe::backward_matmul")) {
         IRunState& rs = *ctx.run_state;
         const int B = ctx.B;
         const int T = ctx.T;
@@ -1083,7 +1086,7 @@ void NVFP4Recipe::forward_moe_matmul(modules::MoeMatmulContext& ctx) const {
     // (on-the-fly quantization is not worthwhile for MoE due to the large
     // aggregate weight size E*N*K — the quantization cost exceeds bandwidth savings).
 
-    if (ctx.has_fp4_weights()) {
+    if (ctx.has_fp4_weights() && descriptor_allows_moe_fp4_grouped(ctx.moe_caps, "NVFP4Recipe::forward_moe_matmul")) {
         bool success = moe_cudnn_grouped_gemm_fp4(ctx.out,
                                                   ctx.inp,
                                                   ctx.weights_fp4,

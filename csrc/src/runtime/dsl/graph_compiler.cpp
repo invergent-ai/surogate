@@ -23,11 +23,101 @@
 #include "runtime/executor/graph_executor_utils.h"
 #include "runtime/executor/op_registry.h"
 #include "runtime/dsl/op_shape_signatures.h"
+#include "runtime/dsl/tensor_role.h"
 #include "runtime/core/backward_hooks.h"
 #include "runtime/core/forward_hooks.h"
+#include "runtime/dsl/buffer_plan.h"
+#include "runtime/executor/compiled_ops.h"
 #include "runtime/lora/lora_types.h"
 
 namespace dsl {
+
+namespace {
+
+std::string schema_slot_from_weight_name(std::string_view weight_name) {
+    const std::size_t dot = weight_name.rfind('.');
+    std::string_view slot = (dot == std::string_view::npos) ? weight_name : weight_name.substr(dot + 1);
+    if (!slot.empty() && slot.back() == '?') {
+        slot.remove_suffix(1);
+    }
+    return std::string(slot);
+}
+
+std::string schema_slot_from_block_tensor_name(std::string_view tensor_name) {
+    int layer_idx = -1;
+    std::string field;
+    if (!parse_block_param(tensor_name, layer_idx, field)) {
+        return {};
+    }
+    return strip_ssa_suffix(field);
+}
+
+std::string hook_schema_id_from_record(const BlockSchemaPlanRecord& record) {
+    if (!record.block_family.empty()) return record.block_family;
+    if (!record.block_name.empty()) return record.block_name;
+    return record.block_type;
+}
+
+bool env_flag_enabled(const char* name) {
+    const char* value = std::getenv(name);
+    if (!value) return false;
+    const std::string_view text(value);
+    return text == "1" || text == "true" || text == "TRUE" || text == "on" || text == "ON";
+}
+
+bool fusion_rule_production_enabled(std::string_view rule_name) {
+    return rule_name == "matmul_bias" || rule_name == "matmul_swiglu" || rule_name == "qkv_qknorm_rope" ||
+           rule_name == "residual_rmsnorm" || rule_name == "lmhead_loss" || rule_name == "moe_routing_topk_softmax" ||
+           rule_name == "moe_routing_topk_softmax_backward";
+}
+
+std::string fusion_rule_replacement_op(std::string_view rule_name) {
+    if (rule_name == "matmul_bias") return "matmul_bias";
+    if (rule_name == "matmul_swiglu") return "matmul_swiglu";
+    if (rule_name == "qkv_qknorm_rope") return "qkv_qk_norm_rope";
+    if (rule_name == "residual_rmsnorm") return "fused_residual_rmsnorm";
+    if (rule_name == "lmhead_loss") return "fused_lm_head_loss";
+    if (rule_name == "moe_routing_topk_softmax") return "moe_topk";
+    if (rule_name == "moe_routing_topk_softmax_backward") return "moe_topk_backward";
+    return std::string(rule_name);
+}
+
+std::string tensor_base_from_grad_name(std::string grad_name) {
+    if (grad_name.rfind("d_", 0) == 0) {
+        grad_name.erase(0, 2);
+    }
+    if (const std::size_t pos = grad_name.rfind("_from_"); pos != std::string::npos) {
+        grad_name.erase(pos);
+    }
+    if (const std::size_t pos = grad_name.rfind("_accum_"); pos != std::string::npos) {
+        grad_name.erase(pos);
+    }
+    if (grad_name.rfind(kSavedPrefix, 0) == 0) {
+        grad_name.erase(0, kSavedPrefix.size());
+    }
+    return grad_name;
+}
+
+void set_forward_hook_schema_slot(CompiledAttrs& attrs, modules::ForwardHookPoint point, std::string_view schema_slot) {
+    attrs.forward_hook_point = point;
+    attrs.forward_hook_schema_slot = std::string(schema_slot);
+}
+
+TensorRoleKind role_kind_from_tensor_kind(TensorKind kind) {
+    switch (kind) {
+        case TensorKind::ForwardParam: return TensorRoleKind::Param;
+        case TensorKind::ForwardActivation: return TensorRoleKind::Activation;
+        case TensorKind::ParamGrad: return TensorRoleKind::ParamGrad;
+        case TensorKind::ActivationGrad:
+        case TensorKind::AccumTemp: return TensorRoleKind::ActivationGrad;
+        case TensorKind::LossInput: return TensorRoleKind::LossInput;
+        case TensorKind::Scratch: return TensorRoleKind::Scratch;
+        case TensorKind::Unknown: return TensorRoleKind::Unknown;
+    }
+    return TensorRoleKind::Unknown;
+}
+
+}  // namespace
 
 /// Strip trailing SSA-style numeric suffix (e.g., "qkv_rope_7" -> "qkv_rope")
 /// The DSL IR generates unique tensor names with suffixes like _0, _7, _10, etc.
@@ -142,9 +232,7 @@ GlobalRole global_role_for_name(std::string_view name) {
     if (name == "xF_flat") return GlobalRole::FinalNormOutFlat;
     if (name == "ln_final_flat") return GlobalRole::FinalNormOutput;
     if (name == "labels") return GlobalRole::LossBatch;
-    // Substring matches for rope frequencies (handles qualified names like
-    // "blocks[0].rope_freqs" when they surface at the global level).
-    if (name.find("rope_freqs") != std::string_view::npos || name.find("freq_cis") != std::string_view::npos) {
+    if (tensor_role_is_rope_name(name)) {
         return GlobalRole::RopeFreqs;
     }
     return GlobalRole::None;
@@ -444,6 +532,12 @@ GraphCompiler::GraphCompiler(const Module& module,
     if (mModule.forward.has_value()) {
         const auto& graph = mModule.forward.value();
         const int num_layers = config.NumLayers;
+        mHookSchemaIdByLayer.assign(static_cast<std::size_t>(std::max(num_layers, 0)), std::string{});
+        for (const BlockSchemaPlanRecord& record : collect_block_schema_plan_records(graph)) {
+            if (record.layer < 0 || record.layer >= num_layers) continue;
+            mHookSchemaIdByLayer[static_cast<std::size_t>(record.layer)] = hook_schema_id_from_record(record);
+        }
+
         const long hq = config.NumQueryHeads;
         const long default_hkv = config.NumKeyValHeads;
         const long default_hs = config.head_size();
@@ -627,6 +721,464 @@ void GraphCompiler::update_dimensions(long B, long T) {
 
 CompiledOpType GraphCompiler::classify_op(const std::string& op_type) const {
     return op_type_from_string(op_type);
+}
+
+void GraphCompiler::populate_descriptor(CompiledOp& compiled, bool is_backward) const {
+    if (const OpDescriptor* desc = OpRegistry::instance().find(compiled.type)) {
+        compiled.fn = is_backward ? desc->backward_fn : (desc->forward_fn ? desc->forward_fn : desc->backward_fn);
+        compiled.semantic_kind = desc->semantic_kind;
+        compiled.distribution_kind = desc->distribution_kind;
+        compiled.default_caps = desc->default_caps;
+        compiled.epilogue_support = desc->epilogue_support;
+        compiled.storage_compat = desc->storage_compat;
+        compiled.moe_caps = desc->moe_caps;
+        compiled.matmul_caps = desc->matmul_caps;
+        compiled.comm_profile = desc->comm_profile;
+        compiled.grouped_semantics = desc->grouped_semantics;
+        compiled.descriptor_flags = desc->descriptor_flags;
+    }
+}
+
+void GraphCompiler::apply_fusion_rewrites(CompiledGraph& graph, bool is_backward) const {
+    graph.fusion_rewrite_preview.clear();
+    if (graph.ops.empty()) {
+        return;
+    }
+
+    std::unordered_map<std::string, int> input_use_count;
+    for (const auto& op : graph.ops) {
+        for (const auto& input : op.inputs) {
+            if (!input.name.empty()) {
+                input_use_count[input.name] += 1;
+            }
+        }
+    }
+
+    auto make_preview = [&](std::size_t start, const FusionRule& rule) {
+        FusionRewritePreview preview;
+        preview.rule_name = rule.name;
+        preview.replacement_op = fusion_rule_replacement_op(rule.name);
+        preview.start = start;
+        preview.length = rule.pattern.size();
+        preview.op_ids.reserve(rule.pattern.size());
+        preview.op_names.reserve(rule.pattern.size());
+        for (std::size_t j = 0; j < rule.pattern.size() && start + j < graph.ops.size(); ++j) {
+            preview.op_ids.push_back(graph.ops[start + j].op_id);
+            preview.op_names.push_back(op_type_to_string(graph.ops[start + j].type));
+        }
+        return preview;
+    };
+
+    auto can_apply_matmul_bias = [&](std::size_t start, std::string& reason) -> bool {
+        if (is_backward) {
+            reason = "forward-only rewrite";
+            return false;
+        }
+        if (start + 1 >= graph.ops.size()) {
+            reason = "truncated candidate";
+            return false;
+        }
+        const CompiledOp& matmul = graph.ops[start];
+        const CompiledOp& bias_add = graph.ops[start + 1];
+        if (matmul.type != CompiledOpType::Matmul || bias_add.type != CompiledOpType::BiasAdd) {
+            reason = "candidate op types changed";
+            return false;
+        }
+        if (matmul.inputs.size() < 2 || matmul.outputs.size() != 1 || bias_add.inputs.size() != 2 ||
+            bias_add.outputs.size() != 1) {
+            reason = "unsupported operand arity";
+            return false;
+        }
+        const std::string& matmul_out = matmul.outputs[0].name;
+        if (matmul_out.empty() || bias_add.inputs[0].name != matmul_out) {
+            reason = "bias_add does not consume matmul output directly";
+            return false;
+        }
+        if (input_use_count[matmul_out] != 1) {
+            reason = "matmul output has multiple consumers";
+            return false;
+        }
+        reason.clear();
+        return true;
+    };
+
+    auto can_apply_matmul_swiglu = [&](std::size_t start, std::string& reason) -> bool {
+        if (is_backward) {
+            reason = "forward-only rewrite";
+            return false;
+        }
+        if (start + 1 >= graph.ops.size()) {
+            reason = "truncated candidate";
+            return false;
+        }
+        const CompiledOp& matmul = graph.ops[start];
+        const CompiledOp& swiglu = graph.ops[start + 1];
+        if (matmul.type != CompiledOpType::Matmul || swiglu.type != CompiledOpType::SwiGLU) {
+            reason = "candidate op types changed";
+            return false;
+        }
+        if (matmul.inputs.size() < 2 || matmul.outputs.size() != 1 || swiglu.inputs.size() != 1 ||
+            swiglu.outputs.size() != 1) {
+            reason = "unsupported operand arity";
+            return false;
+        }
+        const std::string& matmul_out = matmul.outputs[0].name;
+        if (matmul_out.empty() || swiglu.inputs[0].name != matmul_out) {
+            reason = "swiglu does not consume matmul output directly";
+            return false;
+        }
+        if (input_use_count[matmul_out] != 1) {
+            reason = "matmul output has multiple consumers";
+            return false;
+        }
+        reason.clear();
+        return true;
+    };
+
+    auto can_apply_qkv_qknorm_rope = [&](std::size_t start, std::string& reason) -> bool {
+        if (is_backward) {
+            reason = "forward-only rewrite";
+            return false;
+        }
+        if (start + 1 >= graph.ops.size()) {
+            reason = "truncated candidate";
+            return false;
+        }
+        const CompiledOp& qknorm = graph.ops[start];
+        const CompiledOp& rope = graph.ops[start + 1];
+        if (qknorm.type != CompiledOpType::QKVQKNorm || rope.type != CompiledOpType::RoPE) {
+            reason = "candidate op types changed";
+            return false;
+        }
+        if (qknorm.inputs.size() != 3 || qknorm.outputs.size() != 3 || rope.inputs.size() != 3 ||
+            rope.outputs.size() != 1) {
+            reason = "unsupported operand arity";
+            return false;
+        }
+        const std::string& qknorm_out = qknorm.outputs[0].name;
+        if (qknorm_out.empty() || rope.inputs[0].name != qknorm_out) {
+            reason = "rope does not consume qkv_qk_norm output directly";
+            return false;
+        }
+        if (input_use_count[qknorm_out] != 1) {
+            reason = "qkv_qk_norm output has multiple consumers";
+            return false;
+        }
+        reason.clear();
+        return true;
+    };
+
+    auto can_apply_residual_rmsnorm = [&](std::size_t start, std::string& reason) -> bool {
+        if (is_backward) {
+            reason = "forward-only rewrite";
+            return false;
+        }
+        if (start + 1 >= graph.ops.size()) {
+            reason = "truncated candidate";
+            return false;
+        }
+        const CompiledOp& add = graph.ops[start];
+        const CompiledOp& rmsnorm = graph.ops[start + 1];
+        if (add.type != CompiledOpType::Add || rmsnorm.type != CompiledOpType::RMSNorm) {
+            reason = "candidate op types changed";
+            return false;
+        }
+        if (add.inputs.size() != 2 || add.outputs.size() != 1 || rmsnorm.inputs.size() != 2 ||
+            rmsnorm.outputs.size() != 2) {
+            reason = "unsupported operand arity";
+            return false;
+        }
+        const std::string& add_out = add.outputs[0].name;
+        if (add_out.empty() || rmsnorm.inputs[0].name != add_out) {
+            reason = "rmsnorm does not consume add output directly";
+            return false;
+        }
+        reason.clear();
+        return true;
+    };
+
+    auto can_apply_lmhead_loss = [&](std::size_t start, std::string& reason) -> bool {
+        if (is_backward) {
+            reason = "forward-only rewrite";
+            return false;
+        }
+        if (start + 1 >= graph.ops.size()) {
+            reason = "truncated candidate";
+            return false;
+        }
+        const CompiledOp& matmul = graph.ops[start];
+        const CompiledOp& loss = graph.ops[start + 1];
+        if (matmul.type != CompiledOpType::Matmul || loss.type != CompiledOpType::CrossEntropyLoss) {
+            reason = "candidate op types changed";
+            return false;
+        }
+        if (matmul.inputs.size() < 2 || matmul.outputs.size() != 1 || loss.inputs.size() != 2 ||
+            loss.outputs.size() != 1) {
+            reason = "unsupported operand arity";
+            return false;
+        }
+        if (matmul.attrs.transpose != EMMTranspose::NT) {
+            reason = "lmhead fused loss requires NT matmul";
+            return false;
+        }
+        const std::string& logits = matmul.outputs[0].name;
+        if (logits.empty() || loss.inputs[0].name != logits) {
+            reason = "cross_entropy_loss does not consume matmul output directly";
+            return false;
+        }
+        if (input_use_count[logits] != 1) {
+            reason = "matmul logits have multiple consumers";
+            return false;
+        }
+        reason.clear();
+        return true;
+    };
+
+    auto can_apply_moe_routing_topk_softmax = [&](std::size_t start, std::string& reason) -> bool {
+        if (is_backward) {
+            reason = "forward-only rewrite";
+            return false;
+        }
+        if (start + 1 >= graph.ops.size()) {
+            reason = "truncated candidate";
+            return false;
+        }
+        const CompiledOp& softmax = graph.ops[start];
+        const CompiledOp& topk = graph.ops[start + 1];
+        if (softmax.type != CompiledOpType::MoESoftmax || topk.type != CompiledOpType::MoETopK) {
+            reason = "candidate op types changed";
+            return false;
+        }
+        if (softmax.inputs.size() != 1 || softmax.outputs.size() != 1 || topk.inputs.size() != 1 ||
+            topk.outputs.size() != 2) {
+            reason = "unsupported operand arity";
+            return false;
+        }
+        const std::string& probs = softmax.outputs[0].name;
+        if (probs.empty() || topk.inputs[0].name != probs) {
+            reason = "moe_topk does not consume moe_softmax output directly";
+            return false;
+        }
+        if (input_use_count[probs] != 1) {
+            reason = "moe_softmax output has multiple consumers";
+            return false;
+        }
+        if (topk.attrs.topk_softmax) {
+            reason = "moe_topk already applies softmax";
+            return false;
+        }
+        if (topk.attrs.topk_rounding_scale != 0.0f) {
+            reason = "top-k rounding changes selection semantics";
+            return false;
+        }
+        reason.clear();
+        return true;
+    };
+
+    auto can_apply_moe_routing_topk_softmax_backward = [&](std::size_t start, std::string& reason) -> bool {
+        if (!is_backward) {
+            reason = "backward-only rewrite";
+            return false;
+        }
+        if (start + 1 >= graph.ops.size()) {
+            reason = "truncated candidate";
+            return false;
+        }
+        const CompiledOp& topk_bwd = graph.ops[start];
+        const CompiledOp& softmax_bwd = graph.ops[start + 1];
+        if (topk_bwd.type != CompiledOpType::MoETopKBackward ||
+            softmax_bwd.type != CompiledOpType::MoESoftmaxBackward) {
+            reason = "candidate op types changed";
+            return false;
+        }
+        if (topk_bwd.inputs.size() != 3 || topk_bwd.outputs.size() != 1 || softmax_bwd.inputs.size() != 2 ||
+            softmax_bwd.outputs.size() != 1) {
+            reason = "unsupported operand arity";
+            return false;
+        }
+        const std::string& d_probs = topk_bwd.outputs[0].name;
+        if (d_probs.empty() || softmax_bwd.inputs[0].name != d_probs) {
+            reason = "moe_softmax_backward does not consume moe_topk_backward output directly";
+            return false;
+        }
+        if (input_use_count[d_probs] != 1) {
+            reason = "moe_topk_backward output has multiple consumers";
+            return false;
+        }
+        if (topk_bwd.attrs.topk_softmax) {
+            reason = "moe_topk_backward already applies softmax derivative";
+            return false;
+        }
+        if (topk_bwd.attrs.topk_rounding_scale != 0.0f) {
+            reason = "top-k rounding changes selection semantics";
+            return false;
+        }
+        reason.clear();
+        return true;
+    };
+
+    std::vector<CompiledOp> rewritten;
+    rewritten.reserve(graph.ops.size());
+    for (std::size_t i = 0; i < graph.ops.size();) {
+        const auto matches = FusionRuleRegistry::instance().matching_rules_at(graph.ops, i);
+        if (matches.empty()) {
+            rewritten.push_back(std::move(graph.ops[i]));
+            ++i;
+            continue;
+        }
+
+        const FusionRule& rule = *matches.front();
+        FusionRewritePreview preview = make_preview(i, rule);
+        bool apply = false;
+        if (fusion_rule_production_enabled(rule.name)) {
+            if (rule.name == "matmul_bias") {
+                apply = can_apply_matmul_bias(i, preview.reason);
+            } else if (rule.name == "matmul_swiglu") {
+                apply = can_apply_matmul_swiglu(i, preview.reason);
+            } else if (rule.name == "qkv_qknorm_rope") {
+                apply = can_apply_qkv_qknorm_rope(i, preview.reason);
+            } else if (rule.name == "residual_rmsnorm") {
+                apply = can_apply_residual_rmsnorm(i, preview.reason);
+            } else if (rule.name == "lmhead_loss") {
+                apply = can_apply_lmhead_loss(i, preview.reason);
+            } else if (rule.name == "moe_routing_topk_softmax") {
+                apply = can_apply_moe_routing_topk_softmax(i, preview.reason);
+            } else if (rule.name == "moe_routing_topk_softmax_backward") {
+                apply = can_apply_moe_routing_topk_softmax_backward(i, preview.reason);
+            }
+        } else if (rule.name.rfind("moe_", 0) == 0) {
+            preview.reason = "unsupported: MoE fusion rule has no production fused descriptor/parity evidence";
+        } else if (rule.name.rfind("mamba_", 0) == 0) {
+            preview.reason = "unsupported: Mamba fusion rule has no production fused descriptor/parity evidence";
+        } else {
+            preview.reason = "unsupported: fusion rule has no production fused descriptor/parity evidence";
+        }
+
+        if (apply && rule.name == "matmul_bias") {
+            CompiledOp fused = graph.ops[i];
+            const CompiledOp& bias_add = graph.ops[i + 1];
+            fused.type = CompiledOpType::MatmulBias;
+            fused.op_id = fused.op_id + "+" + bias_add.op_id;
+            fused.inputs.push_back(bias_add.inputs[1]);
+            fused.outputs = bias_add.outputs;
+            populate_descriptor(fused, is_backward);
+            preview.applied = true;
+            preview.reason = "applied";
+            rewritten.push_back(std::move(fused));
+            graph.fusion_rewrite_preview.push_back(std::move(preview));
+            i += rule.pattern.size();
+            continue;
+        }
+        if (apply && rule.name == "matmul_swiglu") {
+            CompiledOp fused = graph.ops[i];
+            const CompiledOp& swiglu = graph.ops[i + 1];
+            fused.type = CompiledOpType::MatmulSwiGLU;
+            fused.op_id = fused.op_id + "+" + swiglu.op_id;
+            fused.outputs = {swiglu.outputs[0], graph.ops[i].outputs[0]};
+            populate_descriptor(fused, is_backward);
+            preview.applied = true;
+            preview.reason = "applied";
+            rewritten.push_back(std::move(fused));
+            graph.fusion_rewrite_preview.push_back(std::move(preview));
+            i += rule.pattern.size();
+            continue;
+        }
+        if (apply && rule.name == "qkv_qknorm_rope") {
+            CompiledOp fused = graph.ops[i];
+            const CompiledOp& rope = graph.ops[i + 1];
+            fused.type = CompiledOpType::QKVQKNormRoPE;
+            fused.op_id = fused.op_id + "+" + rope.op_id;
+            fused.inputs.push_back(rope.inputs[1]);
+            fused.inputs.push_back(rope.inputs[2]);
+            fused.outputs = {rope.outputs[0], fused.outputs[1], fused.outputs[2]};
+            fused.attrs.rotary_dim = rope.attrs.rotary_dim;
+            fused.attrs.mrope_section = rope.attrs.mrope_section;
+            populate_descriptor(fused, is_backward);
+            preview.applied = true;
+            preview.reason = "applied";
+            rewritten.push_back(std::move(fused));
+            graph.fusion_rewrite_preview.push_back(std::move(preview));
+            i += rule.pattern.size();
+            continue;
+        }
+        if (apply && rule.name == "residual_rmsnorm") {
+            const CompiledOp& add = graph.ops[i];
+            CompiledOp fused = graph.ops[i + 1];
+            fused.type = CompiledOpType::FusedResidualRMSNorm;
+            fused.op_id = add.op_id + "+" + fused.op_id;
+            fused.inputs = {add.inputs[0], add.inputs[1], fused.inputs[1]};
+            fused.outputs = {add.outputs[0], fused.outputs[0], fused.outputs[1]};
+            populate_descriptor(fused, is_backward);
+            preview.applied = true;
+            preview.reason = "applied";
+            rewritten.push_back(std::move(fused));
+            graph.fusion_rewrite_preview.push_back(std::move(preview));
+            i += rule.pattern.size();
+            continue;
+        }
+        if (apply && rule.name == "lmhead_loss") {
+            const CompiledOp& matmul = graph.ops[i];
+            CompiledOp fused = graph.ops[i + 1];
+            fused.type = CompiledOpType::FusedLMHeadLoss;
+            fused.op_id = matmul.op_id + "+" + fused.op_id;
+            fused.inputs = {matmul.inputs[0], matmul.inputs[1], fused.inputs[1]};
+            populate_descriptor(fused, is_backward);
+            preview.applied = true;
+            preview.reason = "applied";
+            rewritten.push_back(std::move(fused));
+            graph.fusion_rewrite_preview.push_back(std::move(preview));
+            i += rule.pattern.size();
+            continue;
+        }
+        if (apply && rule.name == "moe_routing_topk_softmax") {
+            CompiledOp fused = graph.ops[i + 1];
+            const CompiledOp& softmax = graph.ops[i];
+            fused.op_id = softmax.op_id + "+" + fused.op_id;
+            fused.inputs[0] = softmax.inputs[0];
+            fused.attrs.topk_softmax = true;
+            fused.attrs.topk_full_softmax = true;
+            populate_descriptor(fused, is_backward);
+            preview.applied = true;
+            preview.reason = "applied";
+            rewritten.push_back(std::move(fused));
+            graph.fusion_rewrite_preview.push_back(std::move(preview));
+            i += rule.pattern.size();
+            continue;
+        }
+        if (apply && rule.name == "moe_routing_topk_softmax_backward") {
+            CompiledOp fused = graph.ops[i];
+            const CompiledOp& softmax_bwd = graph.ops[i + 1];
+            fused.op_id = fused.op_id + "+" + softmax_bwd.op_id;
+            fused.inputs[1].name = tensor_base_from_grad_name(softmax_bwd.outputs[0].name);
+            fused.outputs = softmax_bwd.outputs;
+            fused.attrs.topk_softmax = true;
+            fused.attrs.topk_full_softmax = true;
+            populate_descriptor(fused, is_backward);
+            preview.applied = true;
+            preview.reason = "applied";
+            rewritten.push_back(std::move(fused));
+            graph.fusion_rewrite_preview.push_back(std::move(preview));
+            i += rule.pattern.size();
+            continue;
+        }
+
+        graph.fusion_rewrite_preview.push_back(std::move(preview));
+        rewritten.push_back(std::move(graph.ops[i]));
+        ++i;
+    }
+
+    graph.ops = std::move(rewritten);
+    graph.total_ops = graph.ops.size();
+    graph.matmul_ops = 0;
+    graph.view_ops = 0;
+    for (const auto& op : graph.ops) {
+        if (op.type == CompiledOpType::Matmul || op.type == CompiledOpType::MatmulBias ||
+            op.type == CompiledOpType::MatmulBackward) {
+            graph.matmul_ops += 1;
+        } else if (op.type == CompiledOpType::View || op.type == CompiledOpType::ViewBackward) {
+            graph.view_ops += 1;
+        }
+    }
 }
 
 TensorRef
@@ -1009,6 +1561,7 @@ GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType type, const Sha
             if (slice.id == modules::LoRATargetId::Unknown) {
                 slice.name = t.name;
             }
+            slice.schema_slot = schema_slot_from_weight_name(weight_name);
             slice.offset = t.offset;
             slice.size = t.size;
             slice.grouped = t.grouped;
@@ -1201,21 +1754,36 @@ GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType type, const Sha
             attrs.matmul_op = matmul_op;
             attrs.layer_idx = layer_idx;
             attrs.allow_quant = matmul_op.has_value() && allow_quant_layer(mOptions, mConfig, layer_idx);
+            if (!matmul_op.has_value()) {
+                std::string field;
+                if (parse_block_param(op.inputs[1], layer_idx, field) && tensor_role_is_router_name(field)) {
+                    attrs.layer_idx = layer_idx;
+                    set_forward_hook_schema_slot(attrs,
+                                                 modules::ForwardHookPoint::AfterRouterProjection,
+                                                 "router_logits");
+                }
+            }
             if (matmul_op.has_value()) {
                 switch (*matmul_op) {
                     case modules::MatmulOp::QKV:
-                        attrs.forward_hook_point = modules::ForwardHookPoint::AfterQKVProjection;
+                        set_forward_hook_schema_slot(attrs, modules::ForwardHookPoint::AfterQKVProjection, "qkv");
                         break;
                     case modules::MatmulOp::AttnOut:
-                        attrs.forward_hook_point = modules::ForwardHookPoint::AfterAttnOutProjection;
+                        set_forward_hook_schema_slot(attrs,
+                                                     modules::ForwardHookPoint::AfterAttnOutProjection,
+                                                     "att_out");
                         break;
                     case modules::MatmulOp::MLPUp:
                         if (!is_gate_projection) {
-                            attrs.forward_hook_point = modules::ForwardHookPoint::AfterMLPUpProjection;
+                            set_forward_hook_schema_slot(attrs,
+                                                         modules::ForwardHookPoint::AfterMLPUpProjection,
+                                                         "mlp_up");
                         }
                         break;
                     case modules::MatmulOp::MLPDown:
-                        attrs.forward_hook_point = modules::ForwardHookPoint::AfterMLPDownProjection;
+                        set_forward_hook_schema_slot(attrs,
+                                                     modules::ForwardHookPoint::AfterMLPDownProjection,
+                                                     "mlp_down");
                         break;
                     default: break;
                 }
@@ -1232,7 +1800,7 @@ GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType type, const Sha
             attrs.layer_idx = layer_idx;
             attrs.allow_quant = matmul_op.has_value() && allow_quant_layer(mOptions, mConfig, layer_idx);
             if (matmul_op.has_value() && *matmul_op == modules::MatmulOp::MLPUp) {
-                attrs.forward_hook_point = modules::ForwardHookPoint::AfterMLPUpProjection;
+                set_forward_hook_schema_slot(attrs, modules::ForwardHookPoint::AfterMLPUpProjection, "mlp_up");
             }
         }
     }
@@ -1299,6 +1867,11 @@ GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType type, const Sha
                 attrs.topk_softmax = *v;
             }
         }
+        if (auto* full_soft_attr = find_attr(op.attrs, "topk_full_softmax")) {
+            if (auto v = attr_bool(*full_soft_attr)) {
+                attrs.topk_full_softmax = *v;
+            }
+        }
 
         // scaling_factor attribute (e.g. routed_scaling_factor for Nemotron-H)
         if (auto* sf_attr = find_attr(op.attrs, "scaling_factor")) {
@@ -1328,6 +1901,30 @@ GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType type, const Sha
                 attrs.gate_up_interleaved = *v;
             } else if (auto v_int = attr_int(*interleaved_attr)) {
                 attrs.gate_up_interleaved = (*v_int != 0);
+            }
+        }
+    }
+
+    if (type == CompiledOpType::MoEGroupedGemm || type == CompiledOpType::MoEGroupedGemmGateUp ||
+        type == CompiledOpType::MoEGroupedGemmDown || type == CompiledOpType::MoEGroupedGemmBackward ||
+        type == CompiledOpType::MoEGroupedGemmGateUpBackward || type == CompiledOpType::MoEGroupedGemmDownBackward) {
+        const std::size_t weight_idx =
+            (type == CompiledOpType::MoEGroupedGemm || type == CompiledOpType::MoEGroupedGemmGateUp ||
+             type == CompiledOpType::MoEGroupedGemmDown)
+                ? 1
+                : 2;
+        if (op.inputs.size() > weight_idx) {
+            int layer_idx = -1;
+            std::string field;
+            if (parse_block_param(op.inputs[weight_idx], layer_idx, field)) {
+                attrs.layer_idx = layer_idx;
+                attrs.allow_quant = allow_quant_layer(mOptions, mConfig, layer_idx);
+            }
+        }
+        if (type == CompiledOpType::MoEGroupedGemm || type == CompiledOpType::MoEGroupedGemmGateUp ||
+            type == CompiledOpType::MoEGroupedGemmDown) {
+            if (!op.outputs.empty()) {
+                attrs.forward_hook_schema_slot = schema_slot_from_block_tensor_name(op.outputs[0]);
             }
         }
     }
@@ -1523,6 +2120,27 @@ GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType type, const Sha
         if (type == CompiledOpType::MoEPermuteBackward) {
             if (auto it = mTensorIdMap.find("moe_gather_indices"); it != mTensorIdMap.end()) {
                 attrs.moe_gather_tensor_id = it->second;
+            }
+        }
+    }
+
+    if (attrs.layer_idx >= 0 && static_cast<std::size_t>(attrs.layer_idx) < mHookSchemaIdByLayer.size()) {
+        attrs.hook_schema_id = mHookSchemaIdByLayer[static_cast<std::size_t>(attrs.layer_idx)];
+    }
+
+    if (env_flag_enabled("SUROGATE_HOOK_SCHEMA_PARITY")) {
+        if ((attrs.forward_hook_point.has_value() || !attrs.lora_slices.empty()) && attrs.hook_schema_id.empty()) {
+            throw std::runtime_error("graph_compiler: op '" + op.name +
+                                     "' has hook schema slots without schema-id parity");
+        }
+        if (attrs.forward_hook_point.has_value() && attrs.forward_hook_schema_slot.empty()) {
+            throw std::runtime_error("graph_compiler: op '" + op.name +
+                                     "' has legacy forward hook point without schema slot parity");
+        }
+        for (const LoRASlice& slice : attrs.lora_slices) {
+            if (slice.schema_slot.empty()) {
+                throw std::runtime_error("graph_compiler: op '" + op.name +
+                                         "' has LoRA slice without schema slot parity");
             }
         }
     }
@@ -3079,7 +3697,8 @@ void compute_arena_sizes(PhaseArenas& arenas,
                          int num_layers,
                          std::size_t stack_bytes,
                          std::size_t bwd_cross_layer_bytes,
-                         std::size_t moe_saved_bytes) {
+                         std::size_t moe_saved_bytes,
+                         const BufferPlan* schema_plan) {
     // UnifiedStack arena sizing. The design calls for Stack to be backed
     // by the phase-arena bookkeeping, but the adoption sequence
     // (cudaMalloc → memcpy-rebase → free original) briefly holds two
@@ -3092,6 +3711,18 @@ void compute_arena_sizes(PhaseArenas& arenas,
     arenas.unified_stack_bytes = 0;
     arenas.bwd_cross_layer_bytes = bwd_cross_layer_bytes;
     arenas.moe_saved_bytes = moe_saved_bytes;
+    arenas.schema_allocation_authoritative = schema_plan && schema_plan->schema_allocation_authoritative;
+    if (schema_plan) {
+        arenas.schema_frame_arena_bytes = static_cast<std::size_t>(schema_plan->schema_authoritative_frame_arena_bytes);
+        arenas.schema_save_for_bwd_arena_bytes =
+            static_cast<std::size_t>(schema_plan->schema_authoritative_save_for_backward_arena_bytes);
+        arenas.schema_persistent_activation_bytes =
+            static_cast<std::size_t>(schema_plan->schema_authoritative_persistent_activation_bytes);
+        arenas.schema_host_stream_activation_bytes =
+            static_cast<std::size_t>(schema_plan->schema_authoritative_host_stream_activation_bytes);
+        arenas.schema_total_activation_arena_bytes =
+            static_cast<std::size_t>(schema_plan->schema_authoritative_total_activation_arena_bytes);
+    }
 
     // Persistent (weights) + Accumulator (grads): both default-on. The
     // executor clamps each to what its owner can actually rebind —
@@ -3109,7 +3740,8 @@ void compute_arena_sizes(PhaseArenas& arenas,
     // each layer's activations into the arena just-in-time before
     // backward ops read, matching `Recomputed[i]` in
     // design/buffer-runtime-v4.md.
-    arenas.fwd_stack_bytes = fwd.fwd_stack_peak;
+    arenas.compiled_fwd_stack_bytes = fwd.fwd_stack_peak;
+    arenas.fwd_stack_bytes = arenas.compiled_fwd_stack_bytes;
     arenas.bwd_stack_bytes = bwd.bwd_stack_peak;
 
     // SaveForBwd: per-block slots persist across the fwd-exit / bwd-entry
@@ -3124,7 +3756,32 @@ void compute_arena_sizes(PhaseArenas& arenas,
         arenas.save_for_bwd_block_bases[idx] = total;
         total += std::max(fwd_bytes, bwd_bytes);
     }
-    arenas.save_for_bwd_bytes = total;
+    arenas.compiled_save_for_bwd_bytes = total;
+    arenas.save_for_bwd_bytes = arenas.compiled_save_for_bwd_bytes;
+
+    if (arenas.schema_allocation_authoritative) {
+        if (arenas.schema_frame_arena_bytes > 0) {
+            arenas.fwd_stack_bytes = std::max(arenas.compiled_fwd_stack_bytes, arenas.schema_frame_arena_bytes);
+            if (arenas.compiled_fwd_stack_bytes > arenas.schema_frame_arena_bytes) {
+                arenas.schema_frame_arena_safety_bytes =
+                    arenas.compiled_fwd_stack_bytes - arenas.schema_frame_arena_bytes;
+            } else {
+                arenas.schema_frame_arena_extra_bytes =
+                    arenas.schema_frame_arena_bytes - arenas.compiled_fwd_stack_bytes;
+            }
+        }
+        if (arenas.schema_save_for_bwd_arena_bytes > 0) {
+            arenas.save_for_bwd_bytes =
+                std::max(arenas.compiled_save_for_bwd_bytes, arenas.schema_save_for_bwd_arena_bytes);
+            if (arenas.compiled_save_for_bwd_bytes > arenas.schema_save_for_bwd_arena_bytes) {
+                arenas.schema_save_for_bwd_safety_bytes =
+                    arenas.compiled_save_for_bwd_bytes - arenas.schema_save_for_bwd_arena_bytes;
+            } else {
+                arenas.schema_save_for_bwd_extra_bytes =
+                    arenas.schema_save_for_bwd_arena_bytes - arenas.compiled_save_for_bwd_bytes;
+            }
+        }
+    }
 }
 
 std::size_t estimate_bwd_cross_layer_bytes(const CompiledGraph& bwd) {
@@ -3415,6 +4072,18 @@ void release_phase_arenas(PhaseArenas& arenas) {
     arenas.unified_stack_bytes = 0;
     arenas.bwd_cross_layer_bytes = 0;
     arenas.moe_saved_bytes = 0;
+    arenas.schema_allocation_authoritative = false;
+    arenas.compiled_fwd_stack_bytes = 0;
+    arenas.compiled_save_for_bwd_bytes = 0;
+    arenas.schema_frame_arena_bytes = 0;
+    arenas.schema_save_for_bwd_arena_bytes = 0;
+    arenas.schema_persistent_activation_bytes = 0;
+    arenas.schema_host_stream_activation_bytes = 0;
+    arenas.schema_total_activation_arena_bytes = 0;
+    arenas.schema_frame_arena_safety_bytes = 0;
+    arenas.schema_save_for_bwd_safety_bytes = 0;
+    arenas.schema_frame_arena_extra_bytes = 0;
+    arenas.schema_save_for_bwd_extra_bytes = 0;
     arenas.save_for_bwd_block_bases.clear();
     arenas.allocated = false;
 }
@@ -4516,6 +5185,8 @@ void GraphCompiler::build_tensor_metadata(CompiledGraph& graph) {
             }
         }
 
+        meta.role = infer_tensor_role_from_name(name, meta.block_layer_idx);
+        meta.role.block_slot = static_cast<int>(resolve_block_slot(name));
         graph.tensor_meta[static_cast<std::size_t>(id)] = meta;
     }
 
@@ -4541,7 +5212,7 @@ void GraphCompiler::build_tensor_metadata(CompiledGraph& graph) {
 }
 
 // ============================================================================
-// Tensor classification (Phase 0 of the TensorKind rollout)
+// Tensor classification
 // ============================================================================
 //
 // Populates TensorMeta::kind and the base_*_tid fields once at compile time
@@ -4549,8 +5220,7 @@ void GraphCompiler::build_tensor_metadata(CompiledGraph& graph) {
 // replaces runtime string predicates (base_param_from_grad,
 // should_alias_autodiff_accum_name, etc.) that historically misclassified
 // intermediate gradients as parameter gradients, causing accumulator temps
-// to collide with their base tensor's buffer. Phase 0 only populates data;
-// callers still use the legacy string predicates until Phase 1 flips them.
+// to collide with their base tensor's buffer.
 
 const char* tensor_kind_name(TensorKind k) {
     switch (k) {
@@ -4591,6 +5261,22 @@ std::pair<std::string, bool> strip_autodiff_accum_tag(const std::string& name) {
         }
     }
     return {name, false};
+}
+
+std::optional<std::string> debug_base_param_guess_from_grad_name(std::string_view name) {
+    if (!starts_with(name, "d_")) {
+        return std::nullopt;
+    }
+    std::string base(name.substr(2));
+    for (const char* tag : {"_from_", "_accum_"}) {
+        const std::string_view tag_view(tag);
+        const std::size_t pos = base.find(tag_view);
+        if (pos != std::string::npos) {
+            base = base.substr(0, pos);
+            break;
+        }
+    }
+    return base;
 }
 
 }  // namespace
@@ -4729,10 +5415,10 @@ void GraphCompiler::classify_tensors(CompiledGraph& graph) {
         if (graph.tensor_meta[i].kind == TensorKind::Unknown) {
             graph.tensor_meta[i].kind = TensorKind::Scratch;
         }
+        graph.tensor_meta[i].role.kind = role_kind_from_tensor_kind(graph.tensor_meta[i].kind);
     }
 
-    // Optional: dump classification on demand for debugging and for comparing
-    // against the legacy string predicates during the rollout.
+    // Optional: dump classification on demand for debugging.
     const char* dump_env = std::getenv("SUROGATE_DEBUG_TENSOR_KIND");
     const bool dump_enabled = dump_env && std::string_view(dump_env) != "0";
     if (dump_enabled) {
@@ -4754,14 +5440,12 @@ void GraphCompiler::classify_tensors(CompiledGraph& graph) {
                      counts[static_cast<std::size_t>(TensorKind::Scratch)]);
     }
 
-    // Cross-check: the legacy `base_param_from_grad_heuristic(name)` predicate returns
+    // Cross-check: the older d_<base> name heuristic would return
     // Some(base) for ANY name starting with `d_` (after stripping
     // `_from_N`/`_accum_N`). Our classifier returns ParamGrad ONLY when the
-    // base is a real parameter. For every tid where the legacy predicate says
+    // base is a real parameter. For every tid where the old heuristic says
     // "this is a param grad" but the classifier disagrees, report it — those
     // are the latent bugs (intermediate gradients misread as param grads).
-    // Callers that switch to the classifier in Phase 1 will see those cases
-    // routed correctly.
     const char* check_env = std::getenv("SUROGATE_CHECK_TENSOR_KIND");
     const bool check_enabled = dump_enabled || (check_env && std::string_view(check_env) != "0");
     if (check_enabled) {
@@ -4769,46 +5453,47 @@ void GraphCompiler::classify_tensors(CompiledGraph& graph) {
         for (const auto& [name, id] : graph.tensor_name_to_id) {
             if (id < 0 || static_cast<std::size_t>(id) >= graph.tensor_meta.size()) continue;
             const auto& meta = graph.tensor_meta[static_cast<std::size_t>(id)];
-            auto legacy = base_param_from_grad_heuristic(name);
-            if (!legacy.has_value()) {
-                // Legacy says "not a gradient name" — classifier should agree
+            auto heuristic = debug_base_param_guess_from_grad_name(name);
+            if (!heuristic.has_value()) {
+                // Heuristic says "not a gradient name" — classifier should agree
                 // (no ParamGrad without a `d_` prefix).
                 if (meta.kind == TensorKind::ParamGrad) {
                     std::fprintf(stderr,
                                  "[classify_tensors][DISAGREE] %s tid=%d kind=ParamGrad "
-                                 "but legacy base_param_from_grad_heuristic returned nullopt\n",
+                                 "but debug d_<base> guess returned nullopt\n",
                                  name.c_str(),
                                  id);
                     disagreements++;
                 }
                 continue;
             }
-            // Legacy says "this is some d_<base>". The classifier agrees IFF
-            // kind == ParamGrad AND base_param_tid resolves to <base>.
-            const bool legacy_is_param_grad_guess = true;  // legacy always assumes this
+            // The d_<base> heuristic says this is some parameter grad. The
+            // classifier agrees IFF kind == ParamGrad and base_param_tid
+            // resolves to <base>.
+            const bool heuristic_is_param_grad_guess = true;
             const bool classifier_says_param_grad = (meta.kind == TensorKind::ParamGrad);
-            if (legacy_is_param_grad_guess && !classifier_says_param_grad) {
-                // Most common case: legacy returns a base string for an
+            if (heuristic_is_param_grad_guess && !classifier_says_param_grad) {
+                // Most common case: the heuristic returns a base string for an
                 // intermediate / activation gradient / accum temp. Classifier
                 // correctly refuses to call it a ParamGrad. This is exactly
                 // the bug class we're eliminating.
                 disagreements++;
                 if (disagreements <= 10) {
                     std::fprintf(stderr,
-                                 "[classify_tensors][LEGACY_OVERREACH] %s tid=%d "
-                                 "legacy_base=%s but classifier says kind=%s "
-                                 "(would-be silent misroute fixed by Phase 1)\n",
+                                 "[classify_tensors][HEURISTIC_OVERREACH] %s tid=%d "
+                                 "heuristic_base=%s but classifier says kind=%s "
+                                 "(would-be silent misroute fixed by tensor classification)\n",
                                  name.c_str(),
                                  id,
-                                 legacy->c_str(),
+                                 heuristic->c_str(),
                                  tensor_kind_name(meta.kind));
                 }
             }
         }
         if (disagreements > 0) {
             std::fprintf(stderr,
-                         "[classify_tensors] %s: %zu legacy/classifier disagreements "
-                         "(legacy would have misclassified these as ParamGrad)\n",
+                         "[classify_tensors] %s: %zu heuristic/classifier disagreements "
+                         "(heuristic would have misclassified these as ParamGrad)\n",
                          graph.name.c_str(),
                          disagreements);
         }
@@ -5054,13 +5739,9 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
             throw std::runtime_error("GraphCompiler: unsupported operation type: " + op_type);
         }
 
-        // Bake the dispatch function pointer into the op. For the
-        // backward graph prefer the backward_fn; for the forward graph
-        // use forward_fn. Null means "no handler" — execute will throw
-        // when it tries to call it.
-        if (const OpDescriptor* desc = OpRegistry::instance().find(compiled.type)) {
-            compiled.fn = is_backward ? desc->backward_fn : desc->forward_fn;
-        }
+        // Bake the dispatch function pointer and descriptor metadata into the
+        // op. Null means "no handler" — execute will throw when it calls it.
+        populate_descriptor(compiled, is_backward);
 
         // Validate operation shapes at compile time.
         // In hybrid models (e.g., Gemma4 with sliding + full attention), per-block
@@ -5932,19 +6613,6 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
                 ref.shape = {Bdim, Tdim, emb_dim};
             }
 
-            // If an explicit gradient dtype override is configured, apply it to parameter gradients.
-            if (mOptions.GradientType.has_value() && ref.is_gradient) {
-                const std::string grad_name = strip_ssa_suffix(ref.name);
-                if (auto base = base_param_from_grad_heuristic(grad_name)) {
-                    if (mWeights.has(*base)) {
-                        ref.dtype = *mOptions.GradientType;
-                        if (const char* env = std::getenv("SUROGATE_DEBUG_GRAD_DTYPE")) {
-                            fprintf(stderr, "[DEBUG_GRAD_DTYPE] %s -> %s\n", ref.name.c_str(), dtype_to_str(ref.dtype));
-                        }
-                    }
-                }
-            }
-
             if (const char* env = std::getenv("SUROGATE_DEBUG_DTYPES")) {
                 const GlobalRole dbg_role = global_role_for_name(strip_ssa_suffix(ref.name));
                 if (dbg_role == GlobalRole::FinalNormOutput || dbg_role == GlobalRole::FinalNormOutFlat) {
@@ -5988,6 +6656,8 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
         result.ops.push_back(std::move(compiled));
     }
 
+    apply_fusion_rewrites(result, is_backward);
+
     // Annotate layer boundaries for prefetch
     annotate_layer_boundaries(result);
 
@@ -6030,10 +6700,21 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
     // Classify every tensor (ForwardParam / ForwardActivation / ParamGrad /
     // ActivationGrad / AccumTemp / LossInput / Scratch) using authoritative
     // lookups against the parameter store and op producer map. Runtime code
-    // will read TensorMeta::kind instead of string-matching names.
-    // (Phase 0: data-only; callers still use legacy string predicates until
-    // Phase 1 flips them.)
+    // reads TensorMeta::kind instead of string-matching names.
     classify_tensors(result);
+
+    if (mOptions.GradientType.has_value()) {
+        for (auto& cop : result.ops) {
+            for (auto& ref : cop.outputs) {
+                if (!ref.is_gradient || ref.tensor_id < 0) continue;
+                if (!base_param_from_grad_kind(ref.tensor_id, result).has_value()) continue;
+                ref.dtype = *mOptions.GradientType;
+                if (const char* env = std::getenv("SUROGATE_DEBUG_GRAD_DTYPE")) {
+                    fprintf(stderr, "[DEBUG_GRAD_DTYPE] %s -> %s\n", ref.name.c_str(), dtype_to_str(ref.dtype));
+                }
+            }
+        }
+    }
 
     // Derive region assignment. Runs after classify_tensors so
     // TensorMeta::kind is populated.

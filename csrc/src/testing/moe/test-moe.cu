@@ -10,6 +10,7 @@
 #include <numeric>
 
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cublas_v2.h>
 
 #include <thrust/device_vector.h>
@@ -414,6 +415,7 @@ TEST_CASE("moe_topk_forward fp32 matches CPU", "[moe][topk]") {
                      normalize,
                      false,
                      false,
+                     false,
                      0.0f,
                      0);
 
@@ -805,6 +807,7 @@ TEST_CASE("moe full forward pass integration", "[moe][integration]") {
                      true,
                      false,
                      false,
+                     false,
                      0.0f,
                      0);
 
@@ -896,6 +899,54 @@ z_loss_backward_cpu(float* d_logits, const float* router_logits, int num_tokens,
     }
 }
 
+static void
+compute_expert_fractions_cpu(float* fractions, const int* expert_indices, int num_tokens, int num_experts, int top_k) {
+    std::fill(fractions, fractions + num_experts, 0.0f);
+    const float inv_total = 1.0f / static_cast<float>(num_tokens * top_k);
+    for (int i = 0; i < num_tokens * top_k; ++i) {
+        const int e = expert_indices[i];
+        if (e >= 0 && e < num_experts) {
+            fractions[e] += inv_total;
+        }
+    }
+}
+
+static void router_regularization_backward_cpu(float* d_logits,
+                                               const float* router_logits,
+                                               const float* expert_fractions,
+                                               int num_tokens,
+                                               int num_experts,
+                                               float aux_loss_coef,
+                                               float z_loss_coef) {
+    for (int t = 0; t < num_tokens; ++t) {
+        const float* logits = router_logits + t * num_experts;
+        float* d_row = d_logits + t * num_experts;
+
+        const float lse = logsumexp_cpu(logits, num_experts);
+        float max_val = logits[0];
+        for (int e = 1; e < num_experts; ++e) {
+            max_val = std::max(max_val, logits[e]);
+        }
+        float sum = 0.0f;
+        for (int e = 0; e < num_experts; ++e) {
+            sum += std::exp(logits[e] - max_val);
+        }
+
+        float aux_dot = 0.0f;
+        for (int e = 0; e < num_experts; ++e) {
+            const float p = std::exp(logits[e] - max_val) / sum;
+            aux_dot += expert_fractions[e] * p;
+        }
+
+        const float aux_scale = aux_loss_coef * num_experts / num_tokens;
+        const float z_scale = z_loss_coef * 2.0f * lse / num_tokens;
+        for (int e = 0; e < num_experts; ++e) {
+            const float p = std::exp(logits[e] - max_val) / sum;
+            d_row[e] += aux_scale * p * (expert_fractions[e] - aux_dot) + z_scale * p;
+        }
+    }
+}
+
 TEST_CASE("moe_router_z_loss_forward FP32", "[moe][z_loss]") {
     const int num_tokens = 32;
     const int num_experts = 8;
@@ -929,6 +980,108 @@ TEST_CASE("moe_router_z_loss_forward FP32", "[moe][z_loss]") {
     INFO("CPU z-loss: " << z_loss_cpu_val);
     INFO("GPU z-loss: " << z_loss_gpu);
     REQUIRE(std::abs(z_loss_gpu - z_loss_cpu_val) < 1e-5f);
+}
+
+TEST_CASE("moe_routing_stats_from_logits accumulates z-loss", "[moe][z_loss][stats]") {
+    const int num_tokens = 16;
+    const int num_experts = 8;
+    const int top_k = 2;
+    const float aux_loss_coef = 0.05f;
+    const float z_loss_coef = 0.001f;
+
+    std::vector<float> h_logits(num_tokens * num_experts);
+    for (int i = 0; i < num_tokens * num_experts; ++i) {
+        h_logits[i] = 2.0f * (static_cast<float>(rand()) / RAND_MAX) - 1.0f;
+    }
+
+    std::vector<int> h_indices(num_tokens * top_k);
+    for (int t = 0; t < num_tokens; ++t) {
+        h_indices[t * top_k + 0] = t % num_experts;
+        h_indices[t * top_k + 1] = (t + 3) % num_experts;
+    }
+
+    const float z_loss_cpu_val = z_loss_cpu(h_logits.data(), num_tokens, num_experts, z_loss_coef);
+
+    thrust::device_vector<float> d_logits = to_device(h_logits);
+    thrust::device_vector<int> d_indices = to_device(h_indices);
+    thrust::device_vector<float> d_stats(11, 0.0f);
+
+    moe_compute_routing_stats_from_logits(thrust::raw_pointer_cast(d_stats.data()),
+                                          thrust::raw_pointer_cast(d_logits.data()),
+                                          thrust::raw_pointer_cast(d_indices.data()),
+                                          num_tokens,
+                                          num_experts,
+                                          top_k,
+                                          aux_loss_coef,
+                                          z_loss_coef,
+                                          0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<float> h_stats(11);
+    thrust::copy(d_stats.begin(), d_stats.end(), h_stats.begin());
+
+    INFO("CPU z-loss: " << z_loss_cpu_val);
+    INFO("Stats z-loss: " << h_stats[1]);
+    REQUIRE(h_stats[4] == Catch::Approx(1.0f));
+    REQUIRE(std::abs(h_stats[1] - z_loss_cpu_val) < 1e-5f);
+}
+
+TEST_CASE("moe_router_regularization_logits_backward matches CPU", "[moe][auxloss][z_loss]") {
+    const int num_tokens = 12;
+    const int num_experts = 8;
+    const int top_k = 2;
+    const float aux_loss_coef = 0.05f;
+    const float z_loss_coef = 0.001f;
+
+    std::vector<float> h_logits(num_tokens * num_experts);
+    for (int i = 0; i < num_tokens * num_experts; ++i) {
+        h_logits[i] = 2.0f * (static_cast<float>(rand()) / RAND_MAX) - 1.0f;
+    }
+    std::vector<int> h_indices(num_tokens * top_k);
+    for (int t = 0; t < num_tokens; ++t) {
+        h_indices[t * top_k + 0] = (t * 3) % num_experts;
+        h_indices[t * top_k + 1] = (t * 3 + 5) % num_experts;
+    }
+
+    std::vector<float> h_fractions(num_experts);
+    compute_expert_fractions_cpu(h_fractions.data(), h_indices.data(), num_tokens, num_experts, top_k);
+
+    std::vector<float> h_grad_cpu(num_tokens * num_experts, 0.25f);
+    router_regularization_backward_cpu(h_grad_cpu.data(),
+                                       h_logits.data(),
+                                       h_fractions.data(),
+                                       num_tokens,
+                                       num_experts,
+                                       aux_loss_coef,
+                                       z_loss_coef);
+
+    thrust::device_vector<float> d_logits = to_device(h_logits);
+    thrust::device_vector<int> d_indices = to_device(h_indices);
+    thrust::device_vector<float> d_fractions(num_experts, 0.0f);
+    thrust::device_vector<float> d_grad(num_tokens * num_experts, 0.25f);
+
+    moe_compute_expert_fractions(thrust::raw_pointer_cast(d_fractions.data()),
+                                 thrust::raw_pointer_cast(d_indices.data()),
+                                 num_tokens,
+                                 num_experts,
+                                 top_k,
+                                 0);
+    moe_router_regularization_logits_backward(thrust::raw_pointer_cast(d_grad.data()),
+                                              thrust::raw_pointer_cast(d_logits.data()),
+                                              thrust::raw_pointer_cast(d_fractions.data()),
+                                              num_tokens,
+                                              num_experts,
+                                              aux_loss_coef,
+                                              z_loss_coef,
+                                              0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<float> h_grad_gpu(num_tokens * num_experts);
+    thrust::copy(d_grad.begin(), d_grad.end(), h_grad_gpu.begin());
+
+    for (int i = 0; i < num_tokens * num_experts; ++i) {
+        REQUIRE(h_grad_gpu[i] == Catch::Approx(h_grad_cpu[i]).margin(1e-5f));
+    }
 }
 
 TEST_CASE("moe_router_z_loss_forward BF16", "[moe][z_loss]") {

@@ -325,6 +325,10 @@ target_sources(surogate-common PRIVATE
     src/runtime/dsl/op_shape_signatures.cpp
     src/runtime/dsl/tensor_slot_registry.cpp
     src/runtime/dsl/tensor_slot_dispatch.cpp
+    src/runtime/dsl/tensor_role.cpp
+    src/runtime/dsl/fusion_rule_registry.cpp
+    src/runtime/dsl/fusion_rule_registrations.cpp
+    src/runtime/dsl/hook_registry.cpp
 
     src/runtime/ops/embedding.cpp
     src/runtime/ops/zeros.cpp
@@ -442,7 +446,18 @@ target_sources(surogate-common PRIVATE
     src/kernels/gelu_glu.cu
     src/kernels/activation.cu
     src/kernels/fast_lora_silu.cu
-    src/kernels/moe_kernels.cu
+    src/kernels/moe/moe_backward_dispatch.cu
+    src/kernels/moe/moe_diagnostics.cu
+    src/kernels/moe/moe_dispatch_permute.cu
+    src/kernels/moe/moe_expert_bias.cu
+    src/kernels/moe/moe_fp8_grouped_gemm.cu
+    src/kernels/moe/moe_gpt_oss_activation.cu
+    src/kernels/moe/moe_grouped_gemm_backward.cu
+    src/kernels/moe/moe_grouped_gemm_core.cu
+    src/kernels/moe/moe_grouped_gemm_expert.cu
+    src/kernels/moe/moe_losses.cu
+    src/kernels/moe/moe_routing_activation.cu
+    src/kernels/moe/moe_topk.cu
     src/kernels/ep_dispatch.cu
     src/kernels/mamba_kernels.cu
     src/kernels/rope.cu
@@ -722,6 +737,9 @@ if (BUILD_TESTS OR BUILD_TESTS_UNIT OR BUILD_TESTS_INTEGRATION)
             src/testing/utilities/test_dsl_ir.cpp
             src/testing/utilities/test_dsl_goldens.cpp
             src/testing/utilities/test_dsl_module_goldens.cpp
+            src/testing/utilities/test_fusion_rule_registry.cpp
+            src/testing/utilities/test_op_registry.cpp
+            src/testing/utilities/test_tensor_role.cpp
         )
         target_link_libraries(unit-tests PRIVATE surogate-common Catch2::Catch2 CLI11::CLI11 fmt::fmt-header-only)
         target_compile_options(unit-tests PRIVATE

@@ -36,6 +36,7 @@ void CompiledExecutor::dispatch_moe_topk(const CompiledOp& op) {
     const int top_k = op.attrs.top_k;
     const bool normalize = op.attrs.normalize_weights;
     const bool softmax = op.attrs.topk_softmax;
+    const bool full_softmax = op.attrs.topk_full_softmax;
     const float scaling_factor = op.attrs.scaling_factor;
     const float rounding_scale = op.attrs.topk_rounding_scale;
     const bool sort_by_index = op.attrs.topk_sort_by_index;
@@ -61,6 +62,7 @@ void CompiledExecutor::dispatch_moe_topk(const CompiledOp& op) {
                          top_k,
                          normalize,
                          softmax,
+                         full_softmax,
                          sort_by_index,
                          rounding_scale,
                          mRunState.MainStream);
@@ -74,6 +76,7 @@ void CompiledExecutor::dispatch_moe_topk(const CompiledOp& op) {
                          top_k,
                          normalize,
                          softmax,
+                         full_softmax,
                          sort_by_index,
                          rounding_scale,
                          mRunState.MainStream);
@@ -95,27 +98,54 @@ void CompiledExecutor::dispatch_moe_topk(const CompiledOp& op) {
 
     store_tensor(op.outputs[0], weights);
     store_tensor(op.outputs[1], indices);
+    if (softmax && !op.inputs.empty()) {
+        save_tensors({op.inputs[0].name}, /*force_persist=*/true);
+    }
 
     // Accumulate MoE routing stats for monitoring (non-gradient path)
     if (float* stats = mRunState.moe_stats_device()) {
         if (probs.DType == ETensorDType::BF16) {
-            moe_compute_routing_stats(stats,
-                                      probs.get<nv_bfloat16>(),
-                                      indices.get<int>(),
-                                      num_tokens,
-                                      num_experts,
-                                      top_k,
-                                      mRunState.moe_aux_loss_coef(),
-                                      mRunState.MainStream);
+            if (softmax) {
+                moe_compute_routing_stats_from_logits(stats,
+                                                      probs.get<nv_bfloat16>(),
+                                                      indices.get<int>(),
+                                                      num_tokens,
+                                                      num_experts,
+                                                      top_k,
+                                                      mRunState.moe_aux_loss_coef(),
+                                                      mRunState.moe_z_loss_coef(),
+                                                      mRunState.MainStream);
+            } else {
+                moe_compute_routing_stats(stats,
+                                          probs.get<nv_bfloat16>(),
+                                          indices.get<int>(),
+                                          num_tokens,
+                                          num_experts,
+                                          top_k,
+                                          mRunState.moe_aux_loss_coef(),
+                                          mRunState.MainStream);
+            }
         } else {
-            moe_compute_routing_stats(stats,
-                                      probs.get<float>(),
-                                      indices.get<int>(),
-                                      num_tokens,
-                                      num_experts,
-                                      top_k,
-                                      mRunState.moe_aux_loss_coef(),
-                                      mRunState.MainStream);
+            if (softmax) {
+                moe_compute_routing_stats_from_logits(stats,
+                                                      probs.get<float>(),
+                                                      indices.get<int>(),
+                                                      num_tokens,
+                                                      num_experts,
+                                                      top_k,
+                                                      mRunState.moe_aux_loss_coef(),
+                                                      mRunState.moe_z_loss_coef(),
+                                                      mRunState.MainStream);
+            } else {
+                moe_compute_routing_stats(stats,
+                                          probs.get<float>(),
+                                          indices.get<int>(),
+                                          num_tokens,
+                                          num_experts,
+                                          top_k,
+                                          mRunState.moe_aux_loss_coef(),
+                                          mRunState.MainStream);
+            }
         }
     }
 }
@@ -130,6 +160,7 @@ void CompiledExecutor::dispatch_moe_topk_backward(const CompiledOp& op) {
     const int top_k = op.attrs.top_k;
     const bool normalize = op.attrs.normalize_weights;
     const bool softmax = op.attrs.topk_softmax;
+    const bool full_softmax = op.attrs.topk_full_softmax;
     const float scaling_factor = op.attrs.scaling_factor;
     // If scaling_factor != 1.0, scale d_routing_weights by the factor before backward.
     // Forward was: output = topk(probs) * sf, so d_topk = d_output * sf
@@ -195,7 +226,27 @@ void CompiledExecutor::dispatch_moe_topk_backward(const CompiledOp& op) {
                           top_k,
                           normalize,
                           softmax,
+                          full_softmax,
                           mRunState.MainStream);
+
+        if (softmax && (mRunState.moe_aux_loss_coef() != 0.0f || mRunState.moe_z_loss_coef() != 0.0f)) {
+            Tensor expert_fractions =
+                mRunState.Stack.allocate(ETensorDType::FP32, {static_cast<long>(num_experts)}, "moe_aux_fractions");
+            moe_compute_expert_fractions(expert_fractions.get<float>(),
+                                         expert_indices.get<int>(),
+                                         num_tokens,
+                                         num_experts,
+                                         top_k,
+                                         mRunState.MainStream);
+            moe_router_regularization_logits_backward(d_probs_f32.get<float>(),
+                                                      probs_f32.get<float>(),
+                                                      expert_fractions.get<float>(),
+                                                      num_tokens,
+                                                      num_experts,
+                                                      mRunState.moe_aux_loss_coef(),
+                                                      mRunState.moe_z_loss_coef(),
+                                                      mRunState.MainStream);
+        }
 
         // Cast output back to BF16
         convert_dtype(d_probs.get<nv_bfloat16>(), d_probs_f32.get<float>(), d_probs.nelem(), mRunState.MainStream);
@@ -211,7 +262,27 @@ void CompiledExecutor::dispatch_moe_topk_backward(const CompiledOp& op) {
                           top_k,
                           normalize,
                           softmax,
+                          full_softmax,
                           mRunState.MainStream);
+
+        if (softmax && (mRunState.moe_aux_loss_coef() != 0.0f || mRunState.moe_z_loss_coef() != 0.0f)) {
+            Tensor expert_fractions =
+                mRunState.Stack.allocate(ETensorDType::FP32, {static_cast<long>(num_experts)}, "moe_aux_fractions");
+            moe_compute_expert_fractions(expert_fractions.get<float>(),
+                                         expert_indices.get<int>(),
+                                         num_tokens,
+                                         num_experts,
+                                         top_k,
+                                         mRunState.MainStream);
+            moe_router_regularization_logits_backward(d_probs.get<float>(),
+                                                      probs.get<float>(),
+                                                      expert_fractions.get<float>(),
+                                                      num_tokens,
+                                                      num_experts,
+                                                      mRunState.moe_aux_loss_coef(),
+                                                      mRunState.moe_z_loss_coef(),
+                                                      mRunState.MainStream);
+        }
     }
 
     store_tensor(op.outputs[0], d_probs);
@@ -233,7 +304,7 @@ std::vector<Operation> moe_topk_backward(const BackwardRuleContext& ctx) {
         std::string probs = fwd.inputs[0];
         std::string indices = fwd.outputs.size() > 1 ? fwd.outputs[1] : "indices";
 
-        AttrMap attrs = copy_attrs(fwd.attrs, {"top_k", "normalize", "scaling_factor", "softmax"});
+        AttrMap attrs = copy_attrs(fwd.attrs, {"top_k", "normalize", "scaling_factor", "softmax", "topk_full_softmax"});
 
         ops.push_back(make_operation("moe_topk_backward_" + std::to_string(ctx.op_counter++),
                                      "moe_topk_backward",

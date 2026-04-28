@@ -9,6 +9,7 @@ logs/**
 *.bin
 build*/**
 output*/**
+regression_baselines/current/**
 wandb/**
 __pycache__/
 *.pyc

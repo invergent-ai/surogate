@@ -1,13 +1,13 @@
-model: surogate/Qwen3.5-0.8B-FP8
+model: Qwen/Qwen3.5-0.8B
 output_dir: ./output_q35
 
 per_device_train_batch_size: 2
 gradient_accumulation_steps: 4
 
 sample_packing: true
-sequence_len: 4096
+sequence_len: 2048
 
-max_steps: 100
+max_steps: 5
 eval_steps: 25
 
 learning_rate: 2e-4
