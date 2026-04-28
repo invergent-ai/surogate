@@ -588,6 +588,13 @@ void GenericWeightManager::new_step() {
     }
 }
 
+void GenericWeightManager::set_frozen(bool frozen) {
+    mFrozenWeights = frozen;
+    if (mOffloadManager) {
+        mOffloadManager->set_immutable(frozen);
+    }
+}
+
 // =============================================================================
 // Statistics
 // =============================================================================

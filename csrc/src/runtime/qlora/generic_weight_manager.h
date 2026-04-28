@@ -365,9 +365,7 @@ public:
     ///
     /// Pool-evicted buffers still get re-dequantized on next access (the
     /// eviction path sets dequant_valid = false regardless of frozen state).
-    void set_frozen(bool frozen) {
-        mFrozenWeights = frozen;
-    }
+    void set_frozen(bool frozen);
 
     /// Whether weights are frozen.
     [[nodiscard]] bool is_frozen() const {
