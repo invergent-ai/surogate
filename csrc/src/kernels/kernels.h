@@ -3523,9 +3523,12 @@ void moe_compute_aux_loss(float* aux_loss,
                           float aux_loss_coef,
                           cudaStream_t stream);
 
-/// @brief Compute MoE routing statistics for monitoring (aux_loss, utilization, load_imbalance).
+/// @brief Compute MoE routing statistics for monitoring.
 /// Accumulates into a persistent buffer using atomicAdd (call once per MoE layer per step).
-/// @param stats Output buffer [5]: {aux_loss_sum, z_loss_sum, utilization_sum, load_imbalance_sum, layer_count}.
+/// @param stats Output buffer:
+/// {aux_loss_sum, z_loss_sum, utilization_sum, load_imbalance_sum, layer_count,
+///  active_experts_sum, max_expert_fraction_sum, min_active_expert_fraction_sum,
+///  load_cv_sum, router_entropy_sum, router_confidence_sum}.
 /// @param routing_probs Routing probabilities post-softmax/sigmoid (num_tokens, num_experts).
 /// @param expert_indices Expert indices from topk (num_tokens, top_k).
 /// @param num_tokens Number of tokens.

@@ -1676,17 +1676,35 @@ NB_MODULE(_surogate, m) {
         .def(
             "get_moe_stats",
             [](MultiGPUPyTrainer* trainer) {
-                auto [aux_loss, z_loss, utilization, imbalance, valid] = trainer->get_moe_stats();
+                auto [aux_loss,
+                      z_loss,
+                      utilization,
+                      imbalance,
+                      active_experts,
+                      max_expert_fraction,
+                      min_active_expert_fraction,
+                      load_cv,
+                      router_entropy,
+                      router_confidence,
+                      valid] = trainer->get_moe_stats();
                 nb::dict ret;
                 ret["aux_loss"] = aux_loss;
                 ret["z_loss"] = z_loss;
                 ret["expert_utilization"] = utilization;
                 ret["load_imbalance"] = imbalance;
+                ret["active_experts"] = active_experts;
+                ret["max_expert_fraction"] = max_expert_fraction;
+                ret["min_active_expert_fraction"] = min_active_expert_fraction;
+                ret["load_cv"] = load_cv;
+                ret["router_entropy"] = router_entropy;
+                ret["router_confidence"] = router_confidence;
                 ret["valid"] = valid;
                 return ret;
             },
             "Get MoE training statistics from the last forward pass.\n\n"
-            "Returns: dict with keys {aux_loss, z_loss, expert_utilization, load_imbalance, valid}.\n"
+            "Returns: dict with keys {aux_loss, z_loss, expert_utilization, load_imbalance, "
+            "active_experts, max_expert_fraction, min_active_expert_fraction, load_cv, "
+            "router_entropy, router_confidence, valid}.\n"
             "For non-MoE models, valid=False and other values are zero.")
         .def(
             "step_with_custom_loss",
@@ -2584,8 +2602,23 @@ NB_MODULE(_surogate, m) {
              "- loss: Training loss.\n"
              "- lr: Learning rate.")
         .def("log_step_moe",
-             nb::overload_cast<int, float, int, int, float, float, float, float, float, float, float>(
-                 &TrainingRunLogger::log_step),
+             nb::overload_cast<int,
+                               float,
+                               int,
+                               int,
+                               float,
+                               float,
+                               float,
+                               float,
+                               float,
+                               float,
+                               float,
+                               float,
+                               float,
+                               float,
+                               float,
+                               float,
+                               float>(&TrainingRunLogger::log_step),
              nb::arg("step"),
              nb::arg("epoch"),
              nb::arg("step_tokens"),
@@ -2597,6 +2630,12 @@ NB_MODULE(_surogate, m) {
              nb::arg("moe_z_loss"),
              nb::arg("moe_load_imbalance"),
              nb::arg("moe_expert_utilization"),
+             nb::arg("moe_active_experts"),
+             nb::arg("moe_max_expert_fraction"),
+             nb::arg("moe_min_active_expert_fraction"),
+             nb::arg("moe_load_cv"),
+             nb::arg("moe_router_entropy"),
+             nb::arg("moe_router_confidence"),
              "Log a training step with MoE metrics inline.\n\n"
              "Parameters:\n"
              "- step: Global step index.\n"
@@ -2609,7 +2648,13 @@ NB_MODULE(_surogate, m) {
              "- moe_aux_loss: MoE auxiliary load balancing loss.\n"
              "- moe_z_loss: MoE router z-loss.\n"
              "- moe_load_imbalance: MoE load imbalance ratio.\n"
-             "- moe_expert_utilization: Fraction of experts receiving tokens.")
+             "- moe_expert_utilization: Fraction of experts receiving tokens.\n"
+             "- moe_active_experts: Average active experts per layer.\n"
+             "- moe_max_expert_fraction: Fraction of assignments sent to busiest expert.\n"
+             "- moe_min_active_expert_fraction: Fraction of assignments sent to least-used active expert.\n"
+             "- moe_load_cv: Expert load coefficient of variation.\n"
+             "- moe_router_entropy: Average normalized router entropy.\n"
+             "- moe_router_confidence: Average max normalized routing probability.")
         .def("set_phase",
              &TrainingRunLogger::set_phase,
              nb::arg("phase"),
@@ -2636,13 +2681,25 @@ NB_MODULE(_surogate, m) {
              nb::arg("z_loss"),
              nb::arg("expert_utilization"),
              nb::arg("load_imbalance"),
+             nb::arg("active_experts"),
+             nb::arg("max_expert_fraction"),
+             nb::arg("min_active_expert_fraction"),
+             nb::arg("load_cv"),
+             nb::arg("router_entropy"),
+             nb::arg("router_confidence"),
              "Log MoE training statistics.\n\n"
              "Parameters:\n"
              "- step: Global step index.\n"
              "- aux_loss: Load balancing auxiliary loss.\n"
              "- z_loss: Router z-loss.\n"
              "- expert_utilization: Fraction of experts receiving tokens (0-1).\n"
-             "- load_imbalance: Ratio of max to mean token counts (1.0 = balanced).")
+             "- load_imbalance: Ratio of max to mean token counts (1.0 = balanced).\n"
+             "- active_experts: Average active experts per layer.\n"
+             "- max_expert_fraction: Fraction of assignments sent to busiest expert.\n"
+             "- min_active_expert_fraction: Fraction of assignments sent to least-used active expert.\n"
+             "- load_cv: Expert load coefficient of variation.\n"
+             "- router_entropy: Average normalized router entropy.\n"
+             "- router_confidence: Average max normalized routing probability.")
         .def("log_gpu_state",
              &TrainingRunLogger::log_gpu_state,
              nb::arg("step"),

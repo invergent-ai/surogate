@@ -368,12 +368,18 @@ public:
 
     /// @brief MoE training statistics (accumulated across layers per step)
     struct MoEStats {
-        float aux_loss = 0.0f;            ///< Load balancing auxiliary loss (summed across layers)
-        float z_loss = 0.0f;              ///< Router z-loss (summed across layers)
-        float expert_utilization = 0.0f;  ///< Fraction of experts that received tokens (0-1)
-        float load_imbalance = 0.0f;      ///< max(token_counts) / mean(token_counts)
-        int num_layers = 0;               ///< Number of MoE layers in model
-        bool valid = false;               ///< True if stats were computed this step
+        float aux_loss = 0.0f;                    ///< Load balancing auxiliary loss (summed across layers)
+        float z_loss = 0.0f;                      ///< Router z-loss (summed across layers)
+        float expert_utilization = 0.0f;          ///< Fraction of experts that received tokens (0-1)
+        float load_imbalance = 0.0f;              ///< max(token_counts) / mean(token_counts)
+        float active_experts = 0.0f;              ///< Average active expert count per layer
+        float max_expert_fraction = 0.0f;         ///< Largest per-expert assignment fraction
+        float min_active_expert_fraction = 0.0f;  ///< Smallest non-zero per-expert assignment fraction
+        float load_cv = 0.0f;                     ///< Coefficient of variation of expert assignment counts
+        float router_entropy = 0.0f;              ///< Average normalized router entropy (0=sharp, 1=uniform)
+        float router_confidence = 0.0f;           ///< Average max normalized routing probability per token
+        int num_layers = 0;                       ///< Number of MoE layers in model
+        bool valid = false;                       ///< True if stats were computed this step
     };
 
     /// @brief Get MoE stats from the last forward pass (only valid for MoE models)

@@ -955,6 +955,12 @@ class SurogateTrainerWrapper:
                         metrics.moe.z_loss,
                         metrics.moe.load_imbalance,
                         metrics.moe.expert_utilization,
+                        metrics.moe.active_experts,
+                        metrics.moe.max_expert_fraction,
+                        metrics.moe.min_active_expert_fraction,
+                        metrics.moe.load_cv,
+                        metrics.moe.router_entropy,
+                        metrics.moe.router_confidence,
                     )
                 else:
                     train_logger.log_step(
@@ -1263,6 +1269,12 @@ class SurogateTrainerWrapper:
                         metrics.moe.z_loss,
                         metrics.moe.load_imbalance,
                         metrics.moe.expert_utilization,
+                        metrics.moe.active_experts,
+                        metrics.moe.max_expert_fraction,
+                        metrics.moe.min_active_expert_fraction,
+                        metrics.moe.load_cv,
+                        metrics.moe.router_entropy,
+                        metrics.moe.router_confidence,
                     )
                 else:
                     train_logger.log_step(

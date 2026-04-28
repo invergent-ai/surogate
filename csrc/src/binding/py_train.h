@@ -102,9 +102,9 @@ public:
 
     std::vector<GPUUtilInfo> get_gpu_info();
 
-    // MoE stats (returns {aux_loss, z_loss, expert_utilization, load_imbalance, valid})
+    // MoE stats (returns aux/z/load/router diagnostics plus valid flag)
     // Returns zeros with valid=false for non-MoE models
-    std::tuple<float, float, float, float, bool> get_moe_stats();
+    std::tuple<float, float, float, float, float, float, float, float, float, float, bool> get_moe_stats();
 
     int world_size() const;
     int local_world_size() const {

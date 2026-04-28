@@ -1272,10 +1272,16 @@ IRunState::MoEStats DslRunState::get_moe_stats() const {
     if (num_layers <= 0) {
         return stats;
     }
-    stats.aux_loss = mMoEStatsHost[0];                         // summed across layers
-    stats.z_loss = mMoEStatsHost[1];                           // summed across layers
-    stats.expert_utilization = mMoEStatsHost[2] / num_layers;  // average
-    stats.load_imbalance = mMoEStatsHost[3] / num_layers;      // average
+    stats.aux_loss = mMoEStatsHost[0];                                 // summed across layers
+    stats.z_loss = mMoEStatsHost[1];                                   // summed across layers
+    stats.expert_utilization = mMoEStatsHost[2] / num_layers;          // average
+    stats.load_imbalance = mMoEStatsHost[3] / num_layers;              // average
+    stats.active_experts = mMoEStatsHost[5] / num_layers;              // average
+    stats.max_expert_fraction = mMoEStatsHost[6] / num_layers;         // average
+    stats.min_active_expert_fraction = mMoEStatsHost[7] / num_layers;  // average
+    stats.load_cv = mMoEStatsHost[8] / num_layers;                     // average
+    stats.router_entropy = mMoEStatsHost[9] / num_layers;              // average
+    stats.router_confidence = mMoEStatsHost[10] / num_layers;          // average
     stats.num_layers = num_layers;
     stats.valid = true;
     return stats;

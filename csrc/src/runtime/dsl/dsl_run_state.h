@@ -340,7 +340,10 @@ public:
     }
 
     /// @brief Get device pointer to MoE stats buffer for kernel accumulation.
-    /// Layout: [aux_loss_sum, z_loss_sum, utilization_sum, load_imbalance_sum, layer_count]
+    /// Layout:
+    /// [aux_loss_sum, z_loss_sum, utilization_sum, load_imbalance_sum, layer_count,
+    ///  active_experts_sum, max_expert_fraction_sum, min_active_expert_fraction_sum,
+    ///  load_cv_sum, router_entropy_sum, router_confidence_sum]
     float* moe_stats_device() {
         return mMoEStatsDevice;
     }
@@ -440,8 +443,8 @@ private:
     void allocate_graph_arrays(int num_layers);
 
     // MoE routing stats accumulation buffer (GPU)
-    // Layout: [aux_loss_sum, z_loss_sum, utilization_sum, load_imbalance_sum, layer_count]
-    static constexpr int kMoEStatsSize = 5;
+    // Layout matches moe_stats_device().
+    static constexpr int kMoEStatsSize = 11;
     float* mMoEStatsDevice = nullptr;  ///< Device buffer for kernel accumulation
     float* mMoEStatsHost = nullptr;    ///< Pinned host buffer for readback
     int mNumMoEExperts = 0;            ///< 0 = not MoE
