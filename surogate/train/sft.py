@@ -39,8 +39,10 @@ class SurogateSFT(TokenizeDatasets):
         eval_files = sorted([str(p) for p in output_path.glob("eval*.bin")])
 
         if not train_files:
-            logger.error(f"No training files found matching '{self.config.output_dir}/train-*.bin'")
-            return
+            raise RuntimeError(
+                f"No training files found matching '{self.config.output_dir}/train-*.bin'. "
+                "Tokenization produced no usable rows (all dataset rows were dropped)."
+            )
         if not eval_files:
             logger.warning(f"No eval files found matching '{self.config.output_dir}/eval*.bin'")
 
