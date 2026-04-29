@@ -519,6 +519,27 @@ class GRPOTrainer:
             adapter_dir.mkdir(parents=True, exist_ok=True)
             self.trainer.export_adapter(str(adapter_dir))
             logger.info(f"Final LoRA adapter saved to {adapter_dir}")
+
+            if config.merge_adapter:
+                from surogate.utils.adapter_merge import merge_adapter
+
+                merged_dir = output_path / "final_merged"
+                merged_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    merge_adapter(
+                        base_model_path=config.model_dir,
+                        adapter_path=str(adapter_dir),
+                        output_path=str(merged_dir),
+                        max_shard_size="5GB",
+                        cpu_offload=True,
+                    )
+                    self._copy_tokenizer_files(config.model_dir, str(merged_dir))
+                    logger.info(f"Merged model saved to {merged_dir}")
+                except Exception as e:
+                    logger.error(f"Failed to merge adapter: {e}")
+                    import traceback
+
+                    logger.error(f"Traceback:\n{traceback.format_exc()}")
         else:
             model_dir = output_path / "final_model"
             model_dir.mkdir(parents=True, exist_ok=True)
