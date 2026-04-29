@@ -10,8 +10,6 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-import torch
-import torch.distributed as dist
 import wandb
 
 from surogate.core.config.grpo_orch_config import GRPOEnvConfig, GRPOEvalEnvConfig
@@ -122,8 +120,8 @@ def capitalize(s: str) -> str:
 
 def clean_exit(func: Callable) -> Callable:
     """
-    A decorator that ensures the a torch.distributed process group is properly
-    cleaned up after the decorated function runs or raises an exception.
+    A decorator that ensures wandb is properly finalized after the decorated
+    function runs or raises an exception.
     """
     if asyncio.iscoroutinefunction(func):
 
@@ -137,9 +135,6 @@ def clean_exit(func: Callable) -> Callable:
                 logger.error(f"Fatal error in {func.__name__}\n{traceback.format_exc()}")
                 wandb.finish(exit_code=1)
                 raise e
-            finally:
-                if dist.is_initialized():
-                    dist.destroy_process_group()
 
         return async_wrapper
     else:
@@ -154,9 +149,6 @@ def clean_exit(func: Callable) -> Callable:
                 logger.error(f"Fatal error in {func.__name__}\n{traceback.format_exc()}")
                 wandb.finish(exit_code=1)
                 raise e
-            finally:
-                if dist.is_initialized():
-                    dist.destroy_process_group()
 
         return sync_wrapper
 
@@ -255,15 +247,6 @@ def get_free_port() -> int:
     return port
 
 
-def get_cuda_visible_devices() -> list[int]:
-    """Returns the list of availble CUDA devices, taking into account the CUDA_VISIBLE_DEVICES environment variable."""
-    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if cuda_visible is None:
-        # Default to all devices if the environment variable is not set
-        return list(range(torch.cuda.device_count()))
-    return list(sorted([int(device) for device in cuda_visible.split(",")]))
-
-
 def get_latest_ckpt_step(weights_dir: Path) -> int | None:
     step_dirs = list(weights_dir.glob("step_*"))
     if len(step_dirs) == 0:
@@ -284,16 +267,6 @@ def mean_normalize(values: list[float] | list[int]) -> list[float]:
     """Mean-Normalize a list of values to 0-1."""
     sum_values = sum(values)
     return [value / sum_values if sum_values > 0 else 0.0 for value in values]
-
-
-@contextmanager
-def default_dtype(dtype):
-    prev = torch.get_default_dtype()
-    torch.set_default_dtype(dtype)
-    try:
-        yield
-    finally:
-        torch.set_default_dtype(prev)
 
 
 def strip_env_version(env_id: str) -> str:
