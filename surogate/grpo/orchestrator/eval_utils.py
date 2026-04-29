@@ -102,7 +102,13 @@ async def evaluate_env(
     ckpt_step: int,
     step: int,
     get_client: Callable[[], Awaitable[vf.ClientConfig]],
-):
+) -> dict[str, Any]:
+    """Run evaluation against ``env`` and return the per-env eval metrics.
+
+    Returns a dict like ``{"eval/<env_name>/avg@N": …, "eval/<env_name>/pass@1": …,
+    "progress/ckpt_step": …, "step": …}`` so callers can persist it (for example,
+    to ``dump_metrics``) in addition to the monitor sink that's also written to here.
+    """
     logger = get_logger()
     logger.info(f"Evaluating {env_name} ({num_examples=}, {rollouts_per_example=})")
     eval_start_time = time.perf_counter()
@@ -174,3 +180,4 @@ async def evaluate_env(
     eval_metrics.update({"progress/ckpt_step": ckpt_step, "step": step})
     monitor = get_monitor()
     monitor.log(eval_metrics, step=step)
+    return eval_metrics

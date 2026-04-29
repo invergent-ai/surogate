@@ -643,6 +643,37 @@ Healthy signals during a run:
 - `ruler/total_judge_latency_ms` × `max_concurrent_judges`-amortization fits within `time/step` — otherwise the judge is the bottleneck (use a smaller judge or add replicas to `ruler.judge.base_url`)
 - Under `mode: replace`, `reward/mean` should equal `ruler/score_mean` exactly
 
+#### Evaluating a RULER-trained model
+
+RULER attaches **only to training environments**. Two paths run the env's *native, ground-truth* rubric instead — by design:
+
+| Path                                | Rubric used                       | Why                                                                                |
+| ----------------------------------- | --------------------------------- | ---------------------------------------------------------------------------------- |
+| `eval:` block in `orch.yaml`        | Eval env's own rubric             | Online evaluation during training measures task improvement, not judge fit          |
+| `surogate vf-eval` (standalone CLI) | Env's own rubric                  | `vf-eval` doesn't import the orchestrator config; it loads the env directly         |
+
+This separation is the point. If you trained against the judge, evaluating against the same judge is circular — the model just learns to look good to *that* judge. Evaluating against the env's hand-crafted verifier tells you whether the RULER training actually improved task performance.
+
+The recommended workflow:
+
+1. Train with RULER as the reward source (`ruler.enabled: true`, optionally `mode: replace` if no native rubric exists).
+2. Evaluate the trained model with `surogate vf-eval` against the env's native rubric:
+
+   ```bash
+   surogate vf-eval markdown-table-qa \
+       --model Qwen/Qwen3-0.6B \
+       --api-base-url http://localhost:8007/v1 \
+       --num-examples 200 --rollouts-per-example 1 \
+       --save-results
+   ```
+
+3. Compare to a baseline run (untrained model, or trained without RULER) to isolate the RULER training effect.
+
+**When the env has no usable rubric** (open-ended generation, agentic tasks), `vf-eval` can't measure ground truth. Two pragmatic options:
+
+- Use a *different, stronger* judge model for offline evaluation than the one used during training. Hold it out from the training loop entirely. This breaks the circularity but doesn't eliminate judge bias.
+- Run `ruler.mode: metric` during training so the judge logs `ruler/score_mean` for observability without driving the gradient. Useful for sanity-checking judge alignment as you iterate on the rubric prompt.
+
 A complete worked example — `train.yaml`, `infer.yaml`, `judge.yaml`, `orch.yaml`, and a step-by-step runbook — lives in [`examples/ruler/`](https://github.com/invergent-ai/surogate/tree/main/examples/ruler).
 
 #### Reasoning-mode judges and token budgets

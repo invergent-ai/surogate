@@ -159,6 +159,184 @@ df[["step", "time/step", "ruler/total_judge_latency_ms"]]
 | `ruler.rubric: "<custom text>"` | Custom grading rubric. Score distributions should reflect the new criteria. |
 | `rollouts_per_example: 8` (and bump `batch_size` to a multiple) | Higher group size — judge prompts grow; verify the judge model's `max_model_len` (16384 in `judge.yaml`) is sufficient. |
 
+## Step 7 — Read the automatic baseline-vs-trained eval
+
+The training run scored rollouts with the **judge** (RULER). To know whether
+training actually improved the model, you need numbers on the env's
+**native, ground-truth rubric** — `markdown-table-qa`'s answer-match verifier.
+If you eval with the same judge you trained against, you measure judge fit,
+not task performance.
+
+The orchestrator handles this automatically. The `eval:` block in
+`orch.yaml`:
+
+```yaml
+eval:
+  env:
+    - id: markdown-table-qa
+  num_examples: 50
+  rollouts_per_example: 4
+  interval: 100              # don't run mid-training (max_steps=10 < 100)
+  eval_base_model: true      # baseline before training
+```
+
+triggers two evaluations against the env's native rubric:
+
+1. **Pre-training baseline** (`eval_base_model: true`) — the base model
+   evaluated *before* any policy update happens, on the same 50 examples.
+2. **End-of-training final eval** — the trained adapter evaluated on the
+   same 50 examples after the loop ends.
+
+Both share the same examples, the same sampling args, the same vLLM, and
+the same env. RULER does **not** participate in either — `task_uses_group_scoring`
+auto-detection only wraps train envs, not eval envs (see [grpo_orch.py:184-201](https://github.com/invergent-ai/surogate/blob/main/surogate/grpo/orchestrator/grpo_orch.py#L184-L201)).
+
+### What to look for in the orchestrator log
+
+Within the first ~10 seconds of `surogate grpo` starting, you'll see the
+baseline eval:
+
+```
+INFO Running evals for checkpoint step 0
+INFO Evaluating markdown-table-qa (num_examples=50, rollouts_per_example=4)
+SUCCESS Evaluated markdown-table-qa in 4.12s (Avg@4=0.4400, Pass@1: 0.2200, Pass@2: 0.3600, Pass@4: 0.5400, ...
+```
+
+After the training loop completes, the final eval runs against the trained
+model:
+
+```
+INFO Running final evals
+SUCCESS Evaluated markdown-table-qa in 3.97s (Avg@4=0.5800, Pass@1: 0.3400, Pass@2: 0.4900, Pass@4: 0.7200, ...
+```
+
+The delta between the two `SUCCESS` lines is the answer to "did RULER
+training improve the model?"
+
+### What to look for in the metrics dump
+
+When `dump_metrics: true` is set in `orch.yaml`, each eval pass appends
+one row to `/tmp/grpo_metrics.jsonl` carrying `eval/<env_name>/*` keys
+(the row is distinguished from training rows by the `eval/` namespace —
+training rows don't have those keys).
+
+```bash
+python3 -c "
+import json
+for line in open('/tmp/grpo_metrics.jsonl'):
+    d = json.loads(line)
+    if any(k.startswith('eval/') for k in d):
+        ckpt = d.get('progress/ckpt_step', '?')
+        avg = d.get('eval/markdown-table-qa/avg@4')
+        p1 = d.get('eval/markdown-table-qa/pass@1')
+        p4 = d.get('eval/markdown-table-qa/pass@4')
+        # pass@k may be absent if the rubric isn't binary
+        bits = [f'Avg@4={avg:.4f}']
+        if p1 is not None: bits.append(f'Pass@1={p1:.4f}')
+        if p4 is not None: bits.append(f'Pass@4={p4:.4f}')
+        print(f'ckpt_step={ckpt}: ' + ', '.join(bits))
+"
+```
+
+You'll get two rows: one for `ckpt_step=0` (baseline) and one for the final
+step (trained). Compute the delta directly.
+
+If your env's reward is **non-binary** (continuous score in [0, 1] or
+similar), `vf-eval` skips `pass@k` and you'll only see `avg@N`,
+`completion_len/*`, `is_truncated/mean`, and `no_response/*`. Avg@N is
+still the headline number to compare.
+
+### Reading the result
+
+A useful improvement on this smoke run looks like **+5 to +20 points on
+`Pass@4`** between the baseline and the RULER-trained model. Things to
+expect — none of which are bugs:
+
+- **Flat or slightly worse Avg@4** with only 10 training steps. Convergence
+  on Qwen3-0.6B + markdown-table-qa typically takes 100s of steps; 10 is a
+  smoke test.
+- **`Completion Length` drops** even when accuracy is flat — a common
+  RULER signal: the judge prefers concise correct answers, so the policy
+  learns to stop generating earlier.
+- **`Pass@4` improves more than `Pass@1`** — relative ranking pressure
+  encourages diversity in the policy's output distribution.
+- **Worse numbers** can mean the judge and the env's rubric disagree on
+  what "good" looks like (RULER thinks formatting matters more, the
+  rubric thinks exact-match matters more). Inspect a few of the judge's
+  per-trajectory explanations from the training log (`debug: true` mode)
+  to see what it was rewarding.
+
+### Long-form baseline
+
+For a real comparison (not a smoke), bump `train.yaml` `max_steps: 200`
+and `orch.yaml` `max_steps: 200`, and increase `eval.num_examples: 500`.
+The smoke configs in this directory are tuned for a ~12 s training run
+that exercises every code path; they are not tuned for a model that
+would actually move metrics.
+
+### Tracking learning curves with interval evals
+
+The smoke config gives you exactly two eval points (baseline + final).
+For real training runs, drop `eval.interval` to a fraction of `max_steps`
+to also get mid-training data points — useful for watching the policy
+improve, catching plateaus early, and spotting RULER-vs-rubric drift
+before the run ends.
+
+A reasonable production config (assume `max_steps: 200` and ~17 s per eval pass):
+
+```yaml
+eval:
+  env:
+    - id: markdown-table-qa
+  num_examples: 100        # smaller per-pass for faster intervals
+  rollouts_per_example: 4
+  interval: 25             # ~8 mid-training evals at ~10% wall-clock overhead
+  eval_base_model: true
+  # cancel_inflight_rollouts_on_eval: true   # only if eval saturates the rollout vLLM
+```
+
+Cost guidance:
+
+| Cadence (`interval`)              | Eval passes | Wall-clock added (Qwen3-0.6B, 100 ex × 4 ro) |
+| --------------------------------- | ----------- | -------------------------------------------- |
+| `100` (only base + final)         | 2           | ~35 s                                        |
+| `50` on `max_steps: 200`          | 5           | ~85 s                                        |
+| `25` on `max_steps: 200`          | 9           | ~150 s                                       |
+| `10` on `max_steps: 200`          | 21          | ~360 s (heavy)                               |
+
+Eval is **blocking** — weight broadcasts pause for the duration ([grpo_orch.py:504](https://github.com/invergent-ai/surogate/blob/main/surogate/grpo/orchestrator/grpo_orch.py#L504)) — so each pass adds directly to total wall-clock. Rule of thumb: pick `interval ≈ max_steps / 10` to land at ~10% overhead.
+
+#### Plotting the curve
+
+With `dump_metrics: true`, every eval pass appends a row to
+`/tmp/grpo_metrics.jsonl`. Plot the curve in two lines of pandas:
+
+```python
+import json, pandas as pd
+rows = [json.loads(line) for line in open("/tmp/grpo_metrics.jsonl")]
+eval_rows = [r for r in rows if any(k.startswith("eval/") for k in r)]
+df = pd.DataFrame(eval_rows).set_index("progress/ckpt_step")
+df[["eval/markdown-table-qa/avg@4",
+    "eval/markdown-table-qa/pass@1",
+    "eval/markdown-table-qa/pass@4"]].plot(marker="o")
+```
+
+To overlay the training-side RULER score on the same axis (training reward
+on the same `step` axis as eval), join on `step`:
+
+```python
+all_rows = pd.DataFrame(rows)
+train = all_rows[all_rows["ruler/score_mean"].notna()].set_index("step")["ruler/score_mean"]
+evalc = pd.DataFrame(eval_rows).set_index("step")["eval/markdown-table-qa/avg@4"]
+pd.concat({"train: ruler/score_mean": train, "eval: avg@4": evalc}, axis=1).plot(marker="o")
+```
+
+If the two curves diverge — RULER score climbing while eval avg@4 flat or
+falling — that's the **judge-rubric drift** signal: the judge is rewarding
+something the rubric doesn't care about. Either tighten `ruler.rubric` to
+align with the env's verifier, or switch to `ruler.mode: add` so RULER
+augments rather than replaces the rubric.
+
 ## Troubleshooting
 
 **`ValueError: ruler.enabled requires verification.enabled=True`** —
@@ -204,3 +382,16 @@ its control file to `<orch.output_dir>/control/orch.yaml`; the trainer scans
 `<train.output_dir>/run_*/control/orch.yaml`. They must match: set
 `output_dir: ./outputs/ruler/run_default` in `orch.yaml` (already done in this
 example).
+
+**No `eval/<env>/avg@4` rows appear in `/tmp/grpo_metrics.jsonl`** — the
+`eval:` block is missing from `orch.yaml`, or the eval env didn't load.
+Confirm `Running evals for checkpoint step 0` appears in the orchestrator
+log within ~10 s of startup. If not, re-check `orch.yaml` has an `eval:`
+block with `eval_base_model: true`.
+
+**Baseline and final eval produce identical numbers** — likely the
+training adapter wasn't applied to the eval rollouts. Confirm in the
+log that you see two distinct `Loaded new LoRA adapter` lines (one
+during training, and the eval reads the latest). Also check
+`progress/ckpt_step` differs between the two `eval/*` rows in the
+metrics dump.

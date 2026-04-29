@@ -428,12 +428,25 @@ async def orchestrate(config: GRPOOrchestratorConfig):
         # Persistent ThreadPoolExecutor for parallel rollout processing
         rollout_executor = ThreadPoolExecutor(max_workers=64)
 
-        # Optional per-step metrics dump (one JSON object per line)
+        # Optional per-step metrics dump (one JSON object per line). Both training
+        # and eval rows are written here when enabled — eval rows are emitted by
+        # `_dump_eval_metrics` at every eval pass and carry an "eval/<env>/*" namespace.
         metrics_dump_file = None
         if config.dump_metrics:
             metrics_dump_path = "/tmp/grpo_metrics.jsonl"
             metrics_dump_file = open(metrics_dump_path, "a")
             logger.info(f"Dumping per-step metrics to {metrics_dump_path}")
+
+        def _dump_eval_metrics(metrics_per_env: list[dict]) -> None:
+            """Append one JSONL row per env eval to the dump file (if open)."""
+            if metrics_dump_file is None:
+                return
+            for metrics in metrics_per_env:
+                if not metrics:
+                    continue
+                entry = {"ts": time.time(), **metrics}
+                metrics_dump_file.write(json.dumps(entry, default=str) + "\n")
+            metrics_dump_file.flush()
 
         while True:
             # Check if this run has been evicted by the trainer
@@ -513,6 +526,7 @@ async def orchestrate(config: GRPOOrchestratorConfig):
                         for eval_env, eval_env_name, eval_env_config in zip(eval_envs, eval_env_names, config.eval.env)
                     ]
                 )
+                _dump_eval_metrics(results)
 
                 # Resume weight updates
                 scheduler.checkpoint_ready.set()
@@ -878,6 +892,7 @@ async def orchestrate(config: GRPOOrchestratorConfig):
                     for eval_env, eval_env_name, eval_env_config in zip(eval_envs, eval_env_names, config.eval.env)
                 ]
             )
+            _dump_eval_metrics(results)
 
         # Log final (immutable) samples and distributions to monitor(s)
         monitor.log_final_samples()

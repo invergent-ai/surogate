@@ -71,10 +71,19 @@ ruler:
     chat_template_kwargs:
       enable_thinking: false
   swallow_exceptions: true
-  debug: false
+  debug: true
   # Cost rates for the judge — leave unset to log token totals but no USD math.
   # cost:
   #   input_per_million: 0.0
   #   output_per_million: 0.0
+
+eval:
+  env:
+    - id: markdown-table-qa
+  num_examples: 75
+  rollouts_per_example: 4
+  interval: 25
+  eval_base_model: true
+  cancel_inflight_rollouts_on_eval: true
 
 dump_metrics: true
