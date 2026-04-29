@@ -17,7 +17,7 @@
   </a>
 </p>
 
-<h3>⚡ Training/Fine-tuning at the speed of light</h3>
+<h3>⚡ FP8/FP4 Training, Fine-tuning and RL at the speed of light</h3>
 <h4></h4>
 <div>
 <a href="https://surogate.ai">Home</a> ·
