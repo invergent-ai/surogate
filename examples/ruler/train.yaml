@@ -1,0 +1,39 @@
+# GRPO trainer for the RULER smoke run. Mirrors examples/grpo/train.yaml with
+# a smaller batch since the orchestrator below uses batch_size=16.
+
+model: "Qwen/Qwen3-0.6B"
+output_dir: ./outputs/ruler
+
+per_device_train_batch_size: 1
+sequence_len: 2048
+
+# Must match orch.yaml max_steps.
+max_steps: 10
+logging_steps: 1
+
+learning_rate: 1e-4
+lr_scheduler_type: constant
+warmup_steps: 0
+max_grad_norm: 1.0
+weight_decay: 0.01
+optimizer: adamw
+
+recipe: bf16
+
+lora: true
+lora_rank: 16
+lora_alpha: 32
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+
+save_steps: 0
+checkpoint_dir: ./outputs/ruler/checkpoints
+
+report_to:
+  - surogate

@@ -1,0 +1,80 @@
+# GRPO orchestrator with RULER (LLM-as-judge) reward.
+#
+# Topology (4-GPU node):
+#   GPU 0 — rollout vLLM (Qwen3-0.6B, the student) at :8007  [examples/ruler/infer.yaml]
+#   GPU 1 — trainer (Qwen3-0.6B + LoRA + AdamW)              [examples/ruler/train.yaml]
+#   GPU 2 — judge vLLM (Qwen3-1.7B, frozen) at :8001         [examples/ruler/judge.yaml]
+#
+# The orchestrator wraps every train env's rubric in a vf.RubricGroup that adds
+# a group-level RULER reward; under mode=replace it bypasses the env's existing
+# rubric entirely.
+
+# Must live under train.yaml's output_dir as `<train_output_dir>/run_<id>` so
+# the trainer's MultiRunManager can discover this run via the control file at
+# `<output_dir>/control/orch.yaml`. With train.yaml's output_dir=./outputs/ruler,
+# this run is named `run_default`.
+output_dir: ./outputs/ruler/run_default
+
+model:
+  name: "Qwen/Qwen3-0.6B"
+  lora_adapter: "default"
+
+env:
+  - id: markdown-table-qa
+
+# Rollout sampling client: the *student* vLLM
+client:
+  base_url:
+    - http://localhost:8007/v1
+
+# RULER requires rollouts_per_example >= 2; ART recommends 4-8.
+batch_size: 16
+rollouts_per_example: 4
+seq_len: 2048
+max_steps: 10
+use_token_client: false
+
+sampling:
+  max_tokens: 256
+
+# Verification must be enabled for any reward to flow through; RULER plugs
+# into the same group-scoring path as group-level rubrics.
+verification:
+  enabled: true
+
+ruler:
+  enabled: true
+  # 'replace' drops the env's existing rubric and uses RULER as the sole reward.
+  # Switch to 'add' to combine ground-truth + RULER, or 'metric' for read-only.
+  mode: replace
+  judge_model: "Qwen/Qwen3-1.7B"
+  judge:
+    base_url:
+      - http://localhost:8001/v1
+    api_key_var: RULER_JUDGE_API_KEY
+    timeout: 90.0
+  weight: 1.0
+  # 4 groups per step (batch_size / rollouts_per_example), so 8 is plenty of
+  # headroom for concurrent judging across two consecutive steps.
+  max_concurrent_judges: 8
+  sampling:
+    temperature: 0.0
+    # Generous budget so the judge can't get truncated mid-JSON. Reasoning-mode
+    # models (e.g. Qwen3 with thinking on) can consume thousands of tokens before
+    # emitting the schema; the rubric retries with a doubled budget if it does
+    # hit the cap, but starting high avoids the wasted call.
+    max_completion_tokens: 4096
+  # Qwen3 has chain-of-thought thinking enabled by default — turn it off for the
+  # judge so the entire token budget goes toward producing JSON. Drop this block
+  # if you swap to a non-Qwen judge.
+  extra_body:
+    chat_template_kwargs:
+      enable_thinking: false
+  swallow_exceptions: true
+  debug: false
+  # Cost rates for the judge — leave unset to log token totals but no USD math.
+  # cost:
+  #   input_per_million: 0.0
+  #   output_per_million: 0.0
+
+dump_metrics: true

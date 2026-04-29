@@ -425,6 +425,144 @@ FilterConfigType: TypeAlias = GRPOGibberishFilterConfig | GRPORepetitionFilterCo
 
 
 @dataclass
+class GRPORulerJudgeConfig:
+    """
+    Judge inference endpoint(s) used by RULER to score rollout groups.
+
+    Args:
+        base_url: One or more OpenAI-compatible base URLs. When multiple are provided, judge calls round-robin across them.
+        api_key_var: Name of the environment variable holding the API key. Set to a placeholder when the endpoint is unauthenticated.
+        timeout: Per-request timeout (seconds) for the judge.
+        connect_timeout: Per-request connect timeout (seconds) for the judge.
+        max_connections: Max total connections in the judge's HTTP pool (per base_url).
+        max_keepalive_connections: Max keep-alive connections in the judge's HTTP pool (per base_url).
+        max_retries: Max number of automatic retries inside the OpenAI client.
+        headers: Extra HTTP headers attached to every judge request.
+    """
+
+    base_url: list[str] | None = None
+    api_key_var: str | None = "RULER_JUDGE_API_KEY"
+    timeout: float | None = 120.0
+    connect_timeout: float | None = 5.0
+    max_connections: int | None = 256
+    max_keepalive_connections: int | None = 256
+    max_retries: int | None = 4
+    headers: dict[str, str] | None = field(default_factory=dict)
+
+    def __init__(self, cfg: DictDefault):
+        base_url = cfg.get("base_url", self.base_url)
+        if isinstance(base_url, str):
+            base_url = [base_url]
+        self.base_url = base_url
+        self.api_key_var = cfg.get("api_key_var", self.api_key_var)
+        self.timeout = cfg.get("timeout", self.timeout)
+        self.connect_timeout = cfg.get("connect_timeout", self.connect_timeout)
+        self.max_connections = cfg.get("max_connections", self.max_connections)
+        self.max_keepalive_connections = cfg.get("max_keepalive_connections", self.max_keepalive_connections)
+        self.max_retries = cfg.get("max_retries", self.max_retries)
+        self.headers = cfg.get("headers", {}) or {}
+
+
+@dataclass
+class GRPORulerCostConfig:
+    """
+    Token-cost rates for the judge model in USD per 1M tokens. Used to compute per-step judge cost metrics.
+
+    When unset, cost metrics report token counts but not USD figures.
+
+    Args:
+        input_per_million: USD per 1M input (prompt) tokens.
+        output_per_million: USD per 1M output (completion + reasoning) tokens.
+    """
+
+    input_per_million: float | None = None
+    output_per_million: float | None = None
+
+    def __init__(self, cfg: DictDefault):
+        self.input_per_million = cfg.get("input_per_million", self.input_per_million)
+        self.output_per_million = cfg.get("output_per_million", self.output_per_million)
+
+
+@dataclass
+class GRPORulerConfig:
+    """
+    RULER (Relative Universal LLM-Elicited Rewards) configuration.
+
+    RULER scores a *group* of rollouts at a time using an OpenAI-compatible LLM-as-judge.
+    The judge sees all rollouts that belong to the same scenario and assigns each a score
+    in [0, 1] using a rubric. Scores are written to ``state["reward"]`` and per-rollout
+    judge metadata (token usage, cost, latency) is recorded under ``state["metrics"]``.
+
+    Args:
+        enabled: Master switch. When True, RULER is attached to every train environment's rubric.
+        mode:
+            ``replace``  - RULER becomes the sole reward signal; the env's existing rubric is bypassed.
+            ``add``      - RULER is summed with the env's existing rubric scores (each weighted).
+            ``metric``   - RULER runs only for observability; weight is ignored and existing rubric drives training.
+        judge_model: The judge model name (must be served by ``judge.base_url``).
+        judge: Inference endpoint configuration for the judge.
+        rubric: Free-form rubric text passed to the judge as grading guidance. When None, a sensible default is used.
+        weight: Multiplier applied to the RULER score before it is added to the reward (``add`` mode only).
+        max_concurrent_judges: Upper bound on concurrent judge HTTP requests across all groups. ``None`` means unbounded.
+        request_timeout: Per-judge-call timeout (seconds). Falls back to ``judge.timeout`` when unset.
+        max_retries_on_parse_error: Number of retries when the judge returns malformed JSON. Each retry re-issues the request.
+        swallow_exceptions: When True, judge failures fail the group (rollouts dropped) instead of raising. Recommended in production.
+        debug: When True, the judge's per-group reasoning is logged at INFO level. Otherwise it's DEBUG only.
+        extra_body: Extra body fields passed verbatim with every judge request (e.g. vLLM ``guided_json`` knobs).
+        sampling: Sampling overrides applied to the judge call (temperature, max_completion_tokens, reasoning_effort, top_p).
+        cost: Per-token cost rates. Used to surface USD figures in step metrics.
+    """
+
+    enabled: bool | None = False
+    mode: Literal["replace", "add", "metric"] | None = "replace"
+    judge_model: str | None = None
+    judge: GRPORulerJudgeConfig | None = None
+    rubric: str | None = None
+    weight: float | None = 1.0
+    max_concurrent_judges: int | None = 32
+    request_timeout: float | None = None
+    max_retries_on_parse_error: int | None = 2
+    swallow_exceptions: bool | None = True
+    debug: bool | None = False
+    extra_body: dict[str, Any] | None = field(default_factory=dict)
+    sampling: dict[str, Any] | None = field(default_factory=dict)
+    cost: GRPORulerCostConfig | None = None
+
+    def __init__(self, cfg: DictDefault):
+        self.enabled = cfg.get("enabled", self.enabled)
+        self.mode = cfg.get("mode", self.mode)
+        self.judge_model = cfg.get("judge_model", self.judge_model)
+        self.judge = GRPORulerJudgeConfig(cfg.get("judge", {}) or DictDefault({}))
+        self.rubric = cfg.get("rubric", self.rubric)
+        self.weight = cfg.get("weight", self.weight)
+        self.max_concurrent_judges = cfg.get("max_concurrent_judges", self.max_concurrent_judges)
+        self.request_timeout = cfg.get("request_timeout", self.request_timeout)
+        self.max_retries_on_parse_error = cfg.get("max_retries_on_parse_error", self.max_retries_on_parse_error)
+        self.swallow_exceptions = cfg.get("swallow_exceptions", self.swallow_exceptions)
+        self.debug = cfg.get("debug", self.debug)
+        self.extra_body = cfg.get("extra_body", {}) or {}
+        self.sampling = cfg.get("sampling", {}) or {}
+        self.cost = GRPORulerCostConfig(cfg.get("cost", {}) or DictDefault({}))
+        self.__post_init__()
+
+    def __post_init__(self):
+        if not self.enabled:
+            return
+        if self.mode not in ("replace", "add", "metric"):
+            raise ValueError(f"ruler.mode must be one of replace/add/metric, got {self.mode!r}")
+        if not self.judge_model:
+            raise ValueError("ruler.judge_model is required when ruler.enabled is True")
+        if not self.judge or not self.judge.base_url:
+            raise ValueError("ruler.judge.base_url must be a non-empty list when ruler.enabled is True")
+        if self.weight is None or self.weight <= 0:
+            raise ValueError(f"ruler.weight must be > 0 (got {self.weight}); for observability-only use mode='metric'")
+        if self.max_concurrent_judges is not None and self.max_concurrent_judges < 1:
+            raise ValueError(f"ruler.max_concurrent_judges must be >= 1 or null (got {self.max_concurrent_judges})")
+        if self.max_retries_on_parse_error is None or self.max_retries_on_parse_error < 0:
+            raise ValueError(f"ruler.max_retries_on_parse_error must be >= 0 (got {self.max_retries_on_parse_error})")
+
+
+@dataclass
 class GRPOLogConfig:
     """
     Configures the GRPO logger.
@@ -639,6 +777,7 @@ class GRPOOrchestratorConfig:
         token_batch_size: Number of tokens to train on per step (token-based batching). Set this OR batch_size.
         max_inflight_rollouts: Maximum number of rollouts to keep in-flight. Required for token-based batching. If batch_size is set and this is unset, defaults to batch_size * oversampling_factor (or batch_size when oversampling_factor is unset).
         verification: Rollout verification configuration
+        ruler: RULER (LLM-as-judge) reward configuration. When enabled, attaches an LLM-judge group reward function to every train environment's rubric. See GRPORulerConfig for details.
         dump_metrics: Whether to dump metrics to '/tmp/grpo_metrics.jsonl' at each logging step.
     """
 
@@ -657,6 +796,7 @@ class GRPOOrchestratorConfig:
     report_to: GRPOReportingConfig | None = None
     ckpt: GRPOCheckpointConfig | None = None
     val: GRPOValConfig | None = None
+    ruler: GRPORulerConfig | None = None
     weight_broadcast: (
         FileSystemWeightBroadcastConfig | NCCLWeightBroadcastConfig | ColocateWeightBroadcastConfig | None
     ) = None
@@ -738,6 +878,8 @@ class GRPOOrchestratorConfig:
 
         if cfg.get("val") is not None:
             self.val = GRPOValConfig(cfg.get("val"))
+
+        self.ruler = GRPORulerConfig(cfg.get("ruler", {}) or DictDefault({}))
 
         if cfg.get("weight_broadcast") is not None:
             wb_type = cfg.get("weight_broadcast").get("type")
@@ -891,3 +1033,18 @@ class GRPOOrchestratorConfig:
                 "verification.enabled cannot be False when buffer.hard_threshold is set. "
                 "Hard threshold depends on rewards which are disabled when verification.enabled=False."
             )
+
+        if self.ruler.enabled:
+            if self.rollouts_per_example < 2:
+                raise ValueError(
+                    f"ruler.enabled requires rollouts_per_example >= 2 (got {self.rollouts_per_example}); "
+                    "RULER assigns relative scores within a group and is meaningless with a single rollout. "
+                    "ART recommends 4-8 rollouts per scenario."
+                )
+            if not self.verification.enabled:
+                raise ValueError(
+                    "ruler.enabled requires verification.enabled=True; the orchestrator's deferred "
+                    "group-scoring path is gated on verification.enabled and is what drives RULER. "
+                    "Set verification.enabled=True (existing rubrics are bypassed under "
+                    "ruler.mode='replace' but stay active under 'add' or 'metric')."
+                )

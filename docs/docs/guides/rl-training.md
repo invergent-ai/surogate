@@ -523,6 +523,145 @@ When teacher log-probabilities are present, the trainer logs an additional metri
 A decreasing `teacher_kl` confirms the student is learning to match the teacher's distribution.
 
 
+### RULER (LLM-as-Judge Rewards)
+
+RULER ([Relative Universal LLM-Elicited Rewards](https://art.openpipe.ai/fundamentals/ruler)) replaces or augments the env's hand-crafted rubric with an LLM judge that ranks all rollouts in a group. It works because GRPO normalizes scores within each group — only the *relative* ordering matters, so the judge doesn't need to produce calibrated absolute values.
+
+Use it when:
+
+- You don't have a verifiable reward function for your task (open-ended generation, agentic tasks)
+- Hand-crafting a rubric would take days; you'd rather pay for judge tokens
+- You want richer reward signal than a pass/fail check from the env
+- You need a quick baseline before investing in a custom rubric
+
+#### How it works
+
+1. The orchestrator wraps each train env's rubric in a `vf.RubricGroup` that adds a group-level RULER reward function
+2. When all `rollouts_per_example` rollouts of a scenario complete, the orchestrator sends the full group to the judge in a single request
+3. The judge returns one score in `[0, 1]` per rollout plus a short explanation
+4. Scores become per-rollout rewards; GRPO computes advantages via group-mean normalization as usual
+
+Group judging runs concurrently with rollout generation — the scheduler dispatches each completed group as an `asyncio.Task` so judge latency is amortized over the next step's rollouts rather than blocking the pipeline. Concurrency is capped globally by `ruler.max_concurrent_judges`.
+
+RULER requires `rollouts_per_example >= 2` (a single rollout has no peers to rank against); ART's launch report recommends **4–8 rollouts per scenario** for stable relative rankings.
+
+#### Configuration
+
+The judge runs as a *separate* OpenAI-compatible inference server — start it independently before launching `surogate grpo`:
+
+**Terminal 1** — judge vLLM:
+
+```bash
+CUDA_VISIBLE_DEVICES=2 surogate grpo-infer judge.yaml
+```
+
+where `judge.yaml` is a stock inference config (`enable_lora: false`, the model you want to judge with). Any OpenAI-compatible endpoint works — local vLLM, hosted API, or a LiteLLM proxy.
+
+**Terminal 2** — `surogate grpo` with RULER enabled in `orch.yaml`:
+
+```yaml
+verification:
+  enabled: true   # required: RULER plugs into the deferred group-scoring path
+
+batch_size: 16
+rollouts_per_example: 4   # >= 2 required; 4-8 recommended
+
+ruler:
+  enabled: true
+  mode: replace                  # 'replace' | 'add' | 'metric'
+  judge_model: "Qwen/Qwen3-1.7B"
+  judge:
+    base_url: ["http://localhost:8001/v1"]
+    api_key_var: RULER_JUDGE_API_KEY
+    timeout: 90.0
+  weight: 1.0
+  max_concurrent_judges: 8
+  sampling:
+    temperature: 0.0
+    max_completion_tokens: 1024
+  swallow_exceptions: true
+  debug: true
+```
+
+#### Modes
+
+| Mode      | Behavior                                                                                  |
+| --------- | ----------------------------------------------------------------------------------------- |
+| `replace` | Drop the env's existing rubric. RULER is the sole reward source.                          |
+| `add`     | Sum RULER's score with the env's existing rubric (each weighted). Combines both signals.  |
+| `metric`  | Run RULER for observability only — `weight=0`, the env's rubric drives the reward.        |
+
+In `add` and `metric` mode, the env must have a rubric that produces non-zero rewards (otherwise `metric` mode trains on zeros). `replace` is the right default when the env has no usable rubric.
+
+#### Custom rubric
+
+The built-in rubric is generic (efficiency, goal achievement, partial credit, hallucination penalty). Override per-task when needed:
+
+```yaml
+ruler:
+  enabled: true
+  rubric: |
+    - Reward concise, well-formatted answers.
+    - Penalize tool-call hallucinations and off-topic responses.
+    - Award partial credit for incomplete but on-track attempts.
+```
+
+The env's system prompts give the judge implicit context — make sure each env clearly states the agent's goal.
+
+#### Cost tracking
+
+Set per-token rates (USD per 1M tokens) to surface a cost-in-dollars metric:
+
+```yaml
+ruler:
+  cost:
+    input_per_million: 0.15
+    output_per_million: 0.60
+```
+
+#### Monitoring
+
+When RULER is enabled, the orchestrator adds these metrics:
+
+| Metric                         | Description                                                                              |
+| ------------------------------ | ---------------------------------------------------------------------------------------- |
+| `ruler/total_judge_calls`      | Total judge HTTP calls this step (= `batch_size / rollouts_per_example` in steady state) |
+| `ruler/total_input_tokens`     | Step total of judge prompt tokens                                                        |
+| `ruler/total_output_tokens`    | Step total of judge completion tokens                                                    |
+| `ruler/total_judge_latency_ms` | Step total of judge compute time (sum of per-call durations)                             |
+| `ruler/total_judge_cost_usd`   | Step total of judge USD cost (zero unless `ruler.cost.*` is set)                         |
+| `ruler/score_mean`             | Mean RULER score across the batch                                                        |
+| `ruler/score_std`              | Std-dev of RULER scores — collapses to 0 when the judge is undiscriminating              |
+| `ruler/judge_failure_rate`     | Fraction of groups where the judge call raised; >0 indicates trouble                     |
+| `metrics/ruler_*`              | Per-rollout averages of the same fields                                                  |
+
+Healthy signals during a run:
+
+- `ruler/total_judge_calls` exactly equals `batch_size / rollouts_per_example` (no retries firing)
+- `ruler/judge_failure_rate == 0`
+- `ruler/score_std > 0` and ideally > 0.1 (the judge is meaningfully discriminating between rollouts)
+- `ruler/total_judge_latency_ms` × `max_concurrent_judges`-amortization fits within `time/step` — otherwise the judge is the bottleneck (use a smaller judge or add replicas to `ruler.judge.base_url`)
+- Under `mode: replace`, `reward/mean` should equal `ruler/score_mean` exactly
+
+A complete worked example — `train.yaml`, `infer.yaml`, `judge.yaml`, `orch.yaml`, and a step-by-step runbook — lives in [`examples/ruler/`](https://github.com/invergent-ai/surogate/tree/main/examples/ruler).
+
+#### Reasoning-mode judges and token budgets
+
+Reasoning models (Qwen3 with thinking on, OpenAI o-series, DeepSeek-R1) can consume thousands of tokens chain-of-thought before they begin emitting the JSON schema. If the judge runs out of tokens mid-response, the OpenAI SDK raises `LengthFinishReasonError`. RULER catches this and retries with a doubled `max_completion_tokens` (capped at 16K), but the wasted first attempt costs latency and tokens. Two things help:
+
+1. Set a generous budget up front: `ruler.sampling.max_completion_tokens: 4096` is a safe starting point for non-reasoning judges; bump to 8192+ if you want a reasoning judge.
+2. Disable reasoning on the judge entirely. For Qwen3:
+
+   ```yaml
+   ruler:
+     extra_body:
+       chat_template_kwargs:
+         enable_thinking: false
+   ```
+
+   For OpenAI o-series, set `ruler.sampling.reasoning_effort: minimal`.
+
+
 ### Learning Rate
 
 RL training typically uses a lower learning rate than SFT (5e-7 to 5e-5). Start with `5e-6` and adjust based on the KL divergence metrics.
@@ -712,6 +851,33 @@ Key orchestrator settings:
 | `report_to.samples`       | `null`       | Log prompt/response samples        |
 | `report_to.distributions` | `null`       | Log reward/advantage distributions |
 | `report_to.interval`      | `10`         | Logging interval in steps          |
+
+**RULER** (`ruler.*`) — see [RULER (LLM-as-Judge Rewards)](#ruler-llm-as-judge-rewards) above:
+
+| Key                                     | Default                 | Description                                                                                           |
+| --------------------------------------- | ----------------------- | ----------------------------------------------------------------------------------------------------- |
+| `ruler.enabled`                         | `false`                 | Master switch                                                                                         |
+| `ruler.mode`                            | `"replace"`             | `"replace"` (RULER alone), `"add"` (sum with env rubric), `"metric"` (observability only, weight 0)   |
+| `ruler.judge_model`                     | `null`                  | Judge model name (must be served by `judge.base_url`); required when `enabled: true`                  |
+| `ruler.judge.base_url`                  | `null`                  | List of OpenAI-compatible judge endpoints (round-robined); required when `enabled: true`              |
+| `ruler.judge.api_key_var`               | `"RULER_JUDGE_API_KEY"` | Env var holding the judge API key (use any string for unauthenticated local vLLM)                     |
+| `ruler.judge.timeout`                   | `120.0`                 | Per-request timeout in seconds                                                                        |
+| `ruler.judge.connect_timeout`           | `5.0`                   | Per-request connect timeout in seconds                                                                |
+| `ruler.judge.max_connections`           | `256`                   | Max HTTP connections per endpoint                                                                     |
+| `ruler.judge.max_keepalive_connections` | `256`                   | Max keep-alive HTTP connections per endpoint                                                          |
+| `ruler.judge.max_retries`               | `4`                     | Auto-retries inside the OpenAI client                                                                 |
+| `ruler.judge.headers`                   | `{}`                    | Extra HTTP headers sent with each judge request                                                       |
+| `ruler.rubric`                          | (built-in default)      | Free-form rubric text passed to the judge as grading guidance                                         |
+| `ruler.weight`                          | `1.0`                   | Multiplier on RULER score before combining with the reward; ignored in `metric` mode                  |
+| `ruler.max_concurrent_judges`           | `32`                    | Global cap on concurrent judge HTTP calls across all envs (`null` = unbounded)                        |
+| `ruler.request_timeout`                 | `null`                  | Per-judge-call timeout override (falls back to `judge.timeout`)                                       |
+| `ruler.max_retries_on_parse_error`      | `2`                     | Retries when the judge returns malformed JSON                                                         |
+| `ruler.swallow_exceptions`              | `true`                  | When true, judge failures drop the group instead of crashing the orchestrator                         |
+| `ruler.debug`                           | `false`                 | Log per-group judge reasoning at INFO (otherwise DEBUG)                                               |
+| `ruler.extra_body`                      | `{}`                    | Extra request-body fields forwarded to the judge (e.g. vLLM `guided_json` knobs)                      |
+| `ruler.sampling`                        | `{}`                    | Sampling overrides for the judge call (`temperature`, `max_completion_tokens`, `reasoning_effort`)    |
+| `ruler.cost.input_per_million`          | `null`                  | USD per 1M input tokens (drives `ruler/total_judge_cost_usd`)                                         |
+| `ruler.cost.output_per_million`         | `null`                  | USD per 1M output tokens                                                                              |
 
 **Transport** (`rollout_transport.*`, `weight_broadcast.*`):
 

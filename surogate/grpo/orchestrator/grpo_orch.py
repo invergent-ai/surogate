@@ -59,6 +59,7 @@ from surogate.grpo.utils.client import (
     init_nccl_broadcast,
     setup_inference_pool,
 )
+from surogate.rewards.ruler import JudgeClientPool, build_ruler_rubric
 from surogate.grpo.utils.logger import setup_logger
 from surogate.grpo.utils.monitor import setup_monitor
 from surogate.grpo.utils.temp_scheduling import compute_temperature
@@ -180,6 +181,25 @@ async def orchestrate(config: GRPOOrchestratorConfig):
         env_names=train_env_names,
         map_kwargs=dict(writer_batch_size=1),  # set defensively to not error on map operations on large datasets
     )
+
+    # Set up RULER (LLM-as-judge) before group-scoring auto-detection so the
+    # detector picks RULER's group func up automatically.
+    ruler_judge_pool: JudgeClientPool | None = None
+    if config.ruler.enabled:
+        logger.info(
+            f"Initializing RULER (judge_model={config.ruler.judge_model}, mode={config.ruler.mode}, "
+            f"weight={config.ruler.weight}, max_concurrent={config.ruler.max_concurrent_judges}, "
+            f"endpoints={config.ruler.judge.base_url})"
+        )
+        ruler_judge_pool = JudgeClientPool(config.ruler.judge, config.ruler.max_concurrent_judges)
+        for env_name, env in zip(train_env_names, train_env_group.envs):
+            ruler_rubric = build_ruler_rubric(config.ruler, ruler_judge_pool)
+            if config.ruler.mode == "replace":
+                env.rubric = ruler_rubric
+            else:
+                # 'add' and 'metric' both compose with the existing rubric.
+                env.rubric = vf.RubricGroup([env.rubric, ruler_rubric])
+            logger.info(f"  attached RULER to env '{env_name}' (mode={config.ruler.mode})")
 
     verification_enabled = config.verification.enabled
     train_env_deferred_group_scoring_tasks = (
@@ -639,6 +659,27 @@ async def orchestrate(config: GRPOOrchestratorConfig):
             # Gather individual reward function metrics
             metrics_df = pd.DataFrame([rollout["metrics"] for rollout in train_rollouts])
 
+            # Aggregate RULER step totals (per-rollout values are written as
+            # group-totals divided by group size, so summing across the batch
+            # recovers the true step total).
+            ruler_step_totals: dict[str, float] = {}
+            if config.ruler.enabled and not metrics_df.empty:
+                ruler_sum_cols = [
+                    "ruler_judge_calls",
+                    "ruler_input_tokens",
+                    "ruler_output_tokens",
+                    "ruler_judge_cost_usd",
+                    "ruler_judge_latency_ms",
+                ]
+                for col in ruler_sum_cols:
+                    if col in metrics_df.columns:
+                        ruler_step_totals[f"ruler/total_{col[len('ruler_') :]}"] = float(metrics_df[col].sum())
+                if "ruler_judge_failed" in metrics_df.columns:
+                    ruler_step_totals["ruler/judge_failure_rate"] = float(metrics_df["ruler_judge_failed"].mean())
+                if "ruler_score" in metrics_df.columns:
+                    ruler_step_totals["ruler/score_mean"] = float(metrics_df["ruler_score"].mean())
+                    ruler_step_totals["ruler/score_std"] = float(metrics_df["ruler_score"].std())
+
             val_results_df = (
                 pd.DataFrame(
                     {
@@ -737,6 +778,8 @@ async def orchestrate(config: GRPOOrchestratorConfig):
                 },
                 # Env metrics
                 **{f"metrics/{metric}": metrics_df[metric].mean() for metric in metrics_df.columns},
+                # RULER step totals (gated on config.ruler.enabled; empty when disabled)
+                **ruler_step_totals,
                 # Time metrics
                 "time/step": step_time,
                 "time/generate_completions": generate_completions_time,
@@ -863,6 +906,9 @@ async def orchestrate(config: GRPOOrchestratorConfig):
 
         if teacher_inference_pool is not None:
             await teacher_inference_pool.stop()
+
+        if ruler_judge_pool is not None:
+            await ruler_judge_pool.aclose()
 
         # Cancel event loop lag monitor task
         await safe_cancel(event_loop_lag_monitor_task)

@@ -1,0 +1,10 @@
+# vLLM serving the *student* model that is being RL-trained.
+# LoRA is enabled because the trainer streams adapter updates here.
+
+model: "Qwen/Qwen3-0.6B"
+port: 8007
+
+enable_lora: true
+max_lora_rank: 32
+max_model_len: 4096
+gpu_memory_utilization: 0.5

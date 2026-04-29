@@ -1,0 +1,13 @@
+# vLLM serving the *judge* model that RULER calls to score rollout groups.
+# This server is fully independent of the rollout/trainer pipeline — its weights
+# never change, no LoRA, no /update_weights traffic. It must support OpenAI
+# structured outputs (response_format=json_schema), which vLLM provides via
+# xgrammar/outlines.
+
+model: "Qwen/Qwen3-1.7B"
+port: 8001
+
+enable_lora: false
+max_model_len: 16384       # RULER bundles up to N rollouts in one prompt
+gpu_memory_utilization: 0.85
+seed: 0

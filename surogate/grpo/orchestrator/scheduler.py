@@ -4,7 +4,7 @@ import asyncio
 import time
 from collections import Counter, defaultdict
 from dataclasses import field
-from typing import NamedTuple
+from typing import NamedTuple, cast
 
 import verifiers as vf
 from aiolimiter import AsyncLimiter
@@ -104,6 +104,12 @@ class Scheduler:
         # Track in-flight requests: task -> info
         self.inflight_requests: dict[asyncio.Task, InflightRolloutInfo] = {}
 
+        # Track in-flight group-scoring tasks (one per completed group, awaits the
+        # rubric's score_group call). Persisted across generate_batch calls so a
+        # scoring task that finishes after batch_progress hits its target is still
+        # consumed on the next step rather than discarded.
+        self.scoring_tasks: dict[asyncio.Task, str] = {}
+
         # Track in-progress groups while rollouts are generated independently.
         self.next_group_id = 0
         self.groups: dict[int, GroupState] = {}
@@ -148,12 +154,24 @@ class Scheduler:
         self.sampling_args = sampling_args
 
     async def cancel_inflight_rollouts(self):
-        """Cancel all in-flight rollout requests."""
+        """Cancel all in-flight rollout requests.
+
+        In-flight group-scoring tasks are NOT cancelled — they don't depend on the
+        current policy and may safely complete in the background. They will be
+        picked up by the next generate_batch call.
+        """
         count = len(self.inflight_requests)
         await safe_cancel_all(list(self.inflight_requests))
         self.inflight_requests.clear()
         self.groups.clear()
         self.cancelled_rollouts_count += count
+
+    async def cancel_scoring_tasks(self):
+        """Cancel any in-flight group-scoring tasks. Used at scheduler shutdown."""
+        if not self.scoring_tasks:
+            return
+        await safe_cancel_all(list(self.scoring_tasks))
+        self.scoring_tasks.clear()
 
     @staticmethod
     def _client_identity(c: vf.ClientConfig) -> tuple[str, str | None]:
@@ -380,10 +398,19 @@ class Scheduler:
 
         while batch_progress < self.batch_target:
             await self._fill_inflight_requests()
-            inflight_tasks = list(self.inflight_requests.keys())
+            pending: list[asyncio.Task] = list(self.inflight_requests.keys())
+            pending.extend(self.scoring_tasks.keys())
+
+            if not pending:
+                # Defensive: with a non-empty buffer this should not occur because
+                # _fill_inflight_requests schedules until max_inflight_rollouts is
+                # reached. If it does (e.g. transient buffer exhaustion), yield to
+                # avoid a tight loop.
+                await asyncio.sleep(0.01)
+                continue
 
             finished_tasks, _ = await asyncio.wait(
-                inflight_tasks,
+                pending,
                 return_when=asyncio.FIRST_COMPLETED,
             )
             await self.checkpoint_ready.wait()
@@ -392,6 +419,25 @@ class Scheduler:
                 if batch_progress >= self.batch_target:
                     break
 
+                # Branch 1: a group-scoring task has completed.
+                if finished_task in self.scoring_tasks:
+                    task_name = self.scoring_tasks.pop(finished_task)
+                    try:
+                        completed_rollouts = finished_task.result()
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception as e:
+                        self.logger.warning(f"Group scoring failed for task {task_name!r}: {e}")
+                        continue
+                    self.buffer.update(completed_rollouts)
+                    accepted_rollouts = self.buffer.sample_rollouts(n=self.rollouts_per_example)
+                    batch_rollouts.extend(accepted_rollouts)
+                    progress_increment = self.get_batch_progress_increment(accepted_rollouts)
+                    batch_progress += progress_increment
+                    pbar.update(progress_increment)
+                    continue
+
+                # Branch 2: a rollout has completed.
                 rollout_info = self.inflight_requests.pop(finished_task, None)
                 if rollout_info is None:
                     continue
@@ -429,8 +475,8 @@ class Scheduler:
                     group.completed_rollouts.append(rollout)
                     if len(group.completed_rollouts) < self.rollouts_per_example:
                         continue
+
                     completed_rollouts = self.groups.pop(group_id).completed_rollouts
-                    completed_rollouts = await self._score_group_if_deferred(completed_rollouts)
                 except asyncio.CancelledError:
                     if group_id is not None:
                         await self.drop_group(group_id)
@@ -441,13 +487,18 @@ class Scheduler:
                         await self.drop_group(group_id)
                     continue
 
-                self.buffer.update(completed_rollouts)
-                accepted_rollouts = self.buffer.sample_rollouts(n=self.rollouts_per_example)
-
-                batch_rollouts.extend(accepted_rollouts)
-                progress_increment = self.get_batch_progress_increment(accepted_rollouts)
-                batch_progress += progress_increment
-                pbar.update(progress_increment)
+                # Group is complete. Either dispatch deferred scoring (concurrent with
+                # ongoing rollouts/scoring) or accept the rollouts directly.
+                if self._should_defer_group_scoring(rollout_info.task):
+                    scoring_task = asyncio.create_task(self._score_group_if_deferred(completed_rollouts))
+                    self.scoring_tasks[scoring_task] = rollout_info.task
+                else:
+                    self.buffer.update(completed_rollouts)
+                    accepted_rollouts = self.buffer.sample_rollouts(n=self.rollouts_per_example)
+                    batch_rollouts.extend(accepted_rollouts)
+                    progress_increment = self.get_batch_progress_increment(accepted_rollouts)
+                    batch_progress += progress_increment
+                    pbar.update(progress_increment)
 
         await self._fill_inflight_requests()
 
@@ -458,6 +509,7 @@ class Scheduler:
 
     async def stop(self) -> None:
         await self.cancel_inflight_rollouts()
+        await self.cancel_scoring_tasks()
         if self.update_policy_task is not None:
             await safe_cancel(self.update_policy_task)
             self.update_policy_task = None
