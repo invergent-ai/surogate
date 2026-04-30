@@ -4,6 +4,7 @@
 // Unit tests for DSL IR JSON loader + shape resolution.
 
 #include <cstdlib>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -15,6 +16,7 @@
 
 #include "runtime/dsl/autodiff.h"
 #include "runtime/dsl/buffer_plan.h"
+#include "runtime/dsl/dsl_run_state.h"
 #include "runtime/dsl/graph_compiler.h"
 #include "runtime/dsl/hook_registry.h"
 #include "runtime/dsl/ir.h"
@@ -830,6 +832,84 @@ TEST_CASE("embedding profile builds non LM runtime bindings") {
     REQUIRE(request.requested_outputs.size() == 1);
     REQUIRE(request.requested_outputs[0] == "encoded");
     REQUIRE_NOTHROW(dsl::validate_execution_request(request));
+}
+
+TEST_CASE("execution profiles declare run state requirements") {
+    dsl::CausalLMExecutionProfile causal_profile;
+    const auto causal = causal_profile.run_state_requirements();
+    REQUIRE(causal.token_inputs);
+    REQUIRE(causal.position_ids);
+    REQUIRE(causal.targets);
+    REQUIRE(causal.loss_metrics);
+    REQUIRE(causal.logits_output);
+    REQUIRE(causal.cross_entropy_scratch);
+    REQUIRE(causal.encoder_backward_scratch);
+    REQUIRE(causal.transformer_quant_state);
+    REQUIRE(causal.residual_buffers);
+    REQUIRE(causal.per_layer_graph_state);
+
+    dsl::EmbeddingExecutionProfile embedding_profile;
+    const auto embedding = embedding_profile.run_state_requirements();
+    REQUIRE(embedding.token_inputs);
+    REQUIRE_FALSE(embedding.position_ids);
+    REQUIRE_FALSE(embedding.targets);
+    REQUIRE_FALSE(embedding.loss_metrics);
+    REQUIRE_FALSE(embedding.logits_output);
+    REQUIRE_FALSE(embedding.cross_entropy_scratch);
+    REQUIRE_FALSE(embedding.encoder_backward_scratch);
+    REQUIRE_FALSE(embedding.transformer_quant_state);
+    REQUIRE_FALSE(embedding.residual_buffers);
+    REQUIRE_FALSE(embedding.per_layer_graph_state);
+}
+
+TEST_CASE("embedding run state skips causal LM allocations") {
+    int device_count = 0;
+    const cudaError_t device_status = cudaGetDeviceCount(&device_count);
+    if (device_status != cudaSuccess || device_count == 0) {
+        SKIP("CUDA device required for DslRunState allocation test");
+    }
+
+    PretrainedConfig cfg;
+    cfg.HiddenSize = 8;
+    cfg.IntermediateSize = 16;
+    cfg.VocabSize = 32;
+    cfg.NumQueryHeads = 2;
+    cfg.NumKeyValHeads = 2;
+    cfg.NumLayers = 2;
+    cfg.MaxPositionEmbeddings = 8;
+    cfg.DType = ETensorDType::BF16;
+
+    dsl::DslRuntimeConfig runtime_config;
+    RuntimeOptions options;
+    auto allocator = std::make_shared<TensorAllocator>();
+    dsl::DslRunState run_state(cfg,
+                               runtime_config,
+                               options,
+                               /*B=*/1,
+                               /*T=*/2,
+                               allocator,
+                               /*lora_only_mode=*/false,
+                               /*prequantized=*/false,
+                               /*stack_bytes=*/1024 * 1024,
+                               nullptr,
+                               nullptr,
+                               dsl::RuntimeRunStateRequirements::embedding());
+
+    REQUIRE(run_state.Inputs.has_value());
+    REQUIRE_FALSE(run_state.PositionIDs.has_value());
+    REQUIRE_FALSE(run_state.Targets.has_value());
+    REQUIRE_FALSE(run_state.Losses.has_value());
+    REQUIRE(run_state.non_block_activations().encoded.has_value());
+    REQUIRE_FALSE(run_state.non_block_activations().ln_final.has_value());
+    REQUIRE_FALSE(run_state.non_block_activations().ln_final_rstd.has_value());
+    REQUIRE_FALSE(run_state.non_block_activations().output.has_value());
+    REQUIRE_FALSE(run_state.non_block_gradients().d_ln_final.has_value());
+    REQUIRE_FALSE(run_state.non_block_gradients().d_embeddings.has_value());
+    REQUIRE_FALSE(run_state.scratch().cross_entropy_dloss.has_value());
+    REQUIRE_FALSE(run_state.scratch().encoder_bwd_scratch.has_value());
+    REQUIRE_FALSE(run_state.has_grad_quants());
+    REQUIRE_THROWS_AS(run_state.get_residual(0, run_state.MainStream), std::runtime_error);
+    REQUIRE_THROWS_AS(run_state.forward_block_graph(0), std::out_of_range);
 }
 
 TEST_CASE("Grouped MoE LoRA hook slots prefer structural activation slots") {

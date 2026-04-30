@@ -7,6 +7,7 @@
 #define SUROGATE_SRC_RUNTIME_EXECUTOR_CAUSAL_LM_EXECUTION_PROFILE_H
 
 #include "runtime/executor/execution_request.h"
+#include "runtime/core/run_state_requirements.h"
 
 #include <cstdint>
 #include <optional>
@@ -67,6 +68,10 @@ public:
                                                          int micro_step) const;
 
     [[nodiscard]] std::vector<std::string> backward_save_exclusions() const;
+
+    [[nodiscard]] RuntimeRunStateRequirements run_state_requirements() const {
+        return RuntimeRunStateRequirements::causal_lm();
+    }
 };
 
 }  // namespace dsl

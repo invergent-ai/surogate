@@ -9,6 +9,7 @@
 #include <utility>
 #include <vector>
 
+#include "runtime/core/run_state_requirements.h"
 #include "runtime/executor/execution_request.h"
 
 namespace dsl {
@@ -23,6 +24,10 @@ public:
         request.bindings.push_back(RuntimeBinding{"input_ids", input_ids});
         request.requested_outputs = std::move(outputs);
         return request;
+    }
+
+    [[nodiscard]] RuntimeRunStateRequirements run_state_requirements() const {
+        return RuntimeRunStateRequirements::embedding();
     }
 };
 

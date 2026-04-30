@@ -15,6 +15,7 @@
 #include "utilities/stack.h"
 #include "utilities/tensor.h"
 #include "config/pretrained_config.h"
+#include "runtime/core/run_state_requirements.h"
 #include "runtime/optimizers/optimizer_config.h"
 
 class ITensorContainer;
@@ -201,7 +202,8 @@ public:
     IRunState(std::unique_ptr<PretrainedConfig> config,
               long batch_size,
               long seq_len,
-              std::shared_ptr<TensorAllocator> alloc);
+              std::shared_ptr<TensorAllocator> alloc,
+              dsl::RuntimeRunStateRequirements requirements = dsl::RuntimeRunStateRequirements::causal_lm());
     ~IRunState();
 
     IRunState(const IRunState&) = delete;
@@ -238,6 +240,7 @@ public:
 
     std::shared_ptr<TensorAllocator> Allocator;
     DeviceMemoryStack Stack;
+    dsl::RuntimeRunStateRequirements Requirements;
 
     Tensor Inputs;                              // (B, T) Int32
     Tensor PositionIDs;                         // (B, T) or (3, B, T) Int32 - explicit position IDs

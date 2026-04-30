@@ -312,8 +312,9 @@ DslRunState::DslRunState(const PretrainedConfig& config,
                          bool prequantized,
                          std::size_t stack_bytes,
                          const ActivationLayoutIR* activation_layout,
-                         const std::vector<BlockSchemaPlanRecord>* block_schema_records)
-    : IRunState(config.clone(), B, T, allocator),
+                         const std::vector<BlockSchemaPlanRecord>* block_schema_records,
+                         RuntimeRunStateRequirements run_state_requirements)
+    : IRunState(config.clone(), B, T, allocator, run_state_requirements),
       mAllocator(allocator),
       mRuntimeConfig(runtime_config),
       mRecomputeLevel(options.Recompute),
@@ -341,6 +342,7 @@ DslRunState::DslRunState(const PretrainedConfig& config,
         mGradQuantDtype = options.GradientType.value_or(mMatmulDtype);
     }
     mEnableFp8Forward = options.fp8_forward_enabled();
+    mRunStateRequirements = run_state_requirements;
     if (options.LMHeadChunks < 1) {
         throw std::runtime_error("lmhead_chunks must be >= 1");
     }
@@ -411,12 +413,18 @@ DslRunState::DslRunState(const PretrainedConfig& config,
     }
 
     allocate_non_block_state(config);
-    allocate_simplified_quant_buffers(config, options);
-    allocate_residual_buffers(config, options.OffloadResidual);
+    if (mRunStateRequirements.transformer_quant_state) {
+        allocate_simplified_quant_buffers(config, options);
+    }
+    if (mRunStateRequirements.residual_buffers) {
+        allocate_residual_buffers(config, options.OffloadResidual);
+    }
     allocate_scratch_buffers(config);
 
     // Allocate per-layer CUDA graph arrays
-    allocate_graph_arrays(config.NumLayers);
+    if (mRunStateRequirements.per_layer_graph_state) {
+        allocate_graph_arrays(config.NumLayers);
+    }
 }
 
 DslRunState::~DslRunState() {
@@ -580,15 +588,23 @@ void DslRunState::allocate_non_block_state(const PretrainedConfig& cfg) {
     const long V = cfg.VocabSize;
     const auto dtype = mActivationDtype;
 
-    mNonBlockActivations.encoded = mAllocator->allocate(dtype, "encoded", EAllocationType::ON_DEVICE, {B, T, C});
-    mNonBlockActivations.ln_final = mAllocator->allocate(dtype, "ln_final", EAllocationType::ON_DEVICE, {B, T, C});
-    mNonBlockActivations.ln_final_rstd =
-        mAllocator->allocate(ETensorDType::FP32, "ln_final_rstd", EAllocationType::ON_DEVICE, {B, T});
+    if (mRunStateRequirements.encoded_activation) {
+        mNonBlockActivations.encoded = mAllocator->allocate(dtype, "encoded", EAllocationType::ON_DEVICE, {B, T, C});
+    }
+    if (mRunStateRequirements.final_norm_activation) {
+        mNonBlockActivations.ln_final = mAllocator->allocate(dtype, "ln_final", EAllocationType::ON_DEVICE, {B, T, C});
+    }
+    if (mRunStateRequirements.final_norm_rstd) {
+        mNonBlockActivations.ln_final_rstd =
+            mAllocator->allocate(ETensorDType::FP32, "ln_final_rstd", EAllocationType::ON_DEVICE, {B, T});
+    }
 
-    // Output buffer (persistent; avoids large stack pressure for full fine-tuning).
-    const long lmhead_chunks = static_cast<long>(mLMHeadChunks);
-    const long out_size = (B * T) / lmhead_chunks;
-    mNonBlockActivations.output = mAllocator->allocate(dtype, "output", EAllocationType::ON_DEVICE, {out_size, V});
+    if (mRunStateRequirements.logits_output) {
+        // Output buffer (persistent; avoids large stack pressure for full fine-tuning).
+        const long lmhead_chunks = static_cast<long>(mLMHeadChunks);
+        const long out_size = (B * T) / lmhead_chunks;
+        mNonBlockActivations.output = mAllocator->allocate(dtype, "output", EAllocationType::ON_DEVICE, {out_size, V});
+    }
 
     // RoPE frequencies (if not using fused RoPE).
     // Two sources of position IDs that exceed the training sequence length T:
@@ -615,7 +631,7 @@ void DslRunState::allocate_non_block_state(const PretrainedConfig& cfg) {
             max_seq_len = std::min(cfg.MaxPositionEmbeddings, max_seq_len * 4);
         }
     }
-    if (max_seq_len > 0) {
+    if (mRunStateRequirements.rope_freqs && max_seq_len > 0) {
         const int head_size = cfg.head_size();
         const RopeInvFreq rope_params = compute_rope_inv_freq(cfg, head_size, max_seq_len);
         if (dtype == ETensorDType::BF16) {
@@ -684,16 +700,20 @@ void DslRunState::allocate_non_block_state(const PretrainedConfig& cfg) {
         }
     }
 
-    mNonBlockGradients.d_ln_final =
-        mAllocator->allocate(mGradDtype, "d_ln_final", EAllocationType::ON_DEVICE, {B, T, C});
+    if (mRunStateRequirements.final_norm_grad) {
+        mNonBlockGradients.d_ln_final =
+            mAllocator->allocate(mGradDtype, "d_ln_final", EAllocationType::ON_DEVICE, {B, T, C});
+    }
     // Always allocate d_embeddings even in LoRA-only mode. While embedding backward
     // is skipped in LoRA mode, the autodiff graph still produces d_embed_1 as an
     // intermediate. Without a persistent buffer, ensure_output_tensor allocates it on
     // the stack where it blocks can_restore_stack for the entire backward pass (its
     // last_use is the final embedding_backward op), preventing per-layer stack restores
     // and causing stack OOM on MoE models with many layers.
-    mNonBlockGradients.d_embeddings =
-        mAllocator->allocate(mGradDtype, "d_embeddings", EAllocationType::ON_DEVICE, {B, T, C});
+    if (mRunStateRequirements.embedding_grad) {
+        mNonBlockGradients.d_embeddings =
+            mAllocator->allocate(mGradDtype, "d_embeddings", EAllocationType::ON_DEVICE, {B, T, C});
+    }
 }
 
 void DslRunState::rebind_non_block_to_persistent_arena(const CompiledGraph& graph,
@@ -783,13 +803,6 @@ std::size_t DslRunState::non_graph_persistent_extras_bytes() const {
     // `rebind_non_graph_persistent_to_arena` — same tensors, same order,
     // so bump-allocated offsets are deterministic.
     std::size_t total = 0;
-    total += mNonBlockActivations.output.bytes();
-    total += mNonBlockActivations.ln_final_rstd.bytes();
-    total += mNonBlockActivations.freq_cis.bytes();
-    total += mNonBlockGradients.d_embeddings.bytes();
-    for (const auto& rf : mPerLayerRopeFreqs) {
-        total += rf.bytes();
-    }
     // Device scratch buffers — small individually but several per model.
     // `bytes()` relies on the DType field being a valid enum; tensors that
     // may be left default-constructed (DType uninitialized — e.g.
@@ -801,6 +814,13 @@ std::size_t DslRunState::non_graph_persistent_extras_bytes() const {
     auto safe_bytes = [](const Tensor& t) -> std::size_t {
         return t.has_value() ? t.bytes() : 0;
     };
+    total += safe_bytes(mNonBlockActivations.output);
+    total += safe_bytes(mNonBlockActivations.ln_final_rstd);
+    total += safe_bytes(mNonBlockActivations.freq_cis);
+    total += safe_bytes(mNonBlockGradients.d_embeddings);
+    for (const auto& rf : mPerLayerRopeFreqs) {
+        total += safe_bytes(rf);
+    }
     total += safe_bytes(mScratch.rmsnorm_scratch);
     total += safe_bytes(mScratch.matmul_bias_scratch);
     total += safe_bytes(mScratch.norm_buffer);
@@ -999,46 +1019,51 @@ void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {
             rmsnorm_scratch_max_c = std::max(rmsnorm_scratch_max_c, static_cast<long>(pld.attn_dim));
         }
     }
-    const long rmsnorm_scratch_bytes =
-        static_cast<long>(get_rmsnorm_backward_scratch_size(static_cast<int>(rmsnorm_scratch_max_c), DeviceProp));
-    mScratch.rmsnorm_scratch = mAllocator->allocate(ETensorDType::BYTE,
-                                                    "rmsnorm_scratch",
-                                                    EAllocationType::ON_DEVICE,
-                                                    {rmsnorm_scratch_bytes});
-
-    const long M = cfg.IntermediateSize;
-    const long MUp = static_cast<long>(resolve_mlp_up_factor(cfg)) * M;
-    const long V = cfg.VocabSize;
-    const long max_bias_channels = std::max<long>(QKV, std::max<long>(C, std::max<long>(MUp, V)));
-    const long bias_scratch_bytes =
-        static_cast<long>(get_bias_backward_scratch_size(mGradDtype, static_cast<int>(max_bias_channels), DeviceProp));
-    mScratch.matmul_bias_scratch = mAllocator->allocate(ETensorDType::FP32,
-                                                        "bias_scratch",
+    if (mRunStateRequirements.common_scratch) {
+        const long rmsnorm_scratch_bytes =
+            static_cast<long>(get_rmsnorm_backward_scratch_size(static_cast<int>(rmsnorm_scratch_max_c), DeviceProp));
+        mScratch.rmsnorm_scratch = mAllocator->allocate(ETensorDType::BYTE,
+                                                        "rmsnorm_scratch",
                                                         EAllocationType::ON_DEVICE,
-                                                        {bias_scratch_bytes / static_cast<long>(sizeof(float))});
+                                                        {rmsnorm_scratch_bytes});
 
-    const long num_block_sums = std::max<long>(2, static_cast<long>(get_max_num_block_sums(DeviceProp)));
-    mScratch.norm_buffer =
-        mAllocator->allocate(ETensorDType::FP32, "norm_buffer", EAllocationType::ON_DEVICE, {num_block_sums});
+        const long M = cfg.IntermediateSize;
+        const long MUp = static_cast<long>(resolve_mlp_up_factor(cfg)) * M;
+        const long V = cfg.VocabSize;
+        const long max_bias_channels = std::max<long>(QKV, std::max<long>(C, std::max<long>(MUp, V)));
+        const long bias_scratch_bytes = static_cast<long>(
+            get_bias_backward_scratch_size(mGradDtype, static_cast<int>(max_bias_channels), DeviceProp));
+        mScratch.matmul_bias_scratch = mAllocator->allocate(ETensorDType::FP32,
+                                                            "bias_scratch",
+                                                            EAllocationType::ON_DEVICE,
+                                                            {bias_scratch_bytes / static_cast<long>(sizeof(float))});
 
-    mScratch.matmul_scales =
-        mAllocator->allocate(ETensorDType::FP32, "matmul_scales", EAllocationType::ON_DEVICE, {2L});
+        const long num_block_sums = std::max<long>(2, static_cast<long>(get_max_num_block_sums(DeviceProp)));
+        mScratch.norm_buffer =
+            mAllocator->allocate(ETensorDType::FP32, "norm_buffer", EAllocationType::ON_DEVICE, {num_block_sums});
+
+        mScratch.matmul_scales =
+            mAllocator->allocate(ETensorDType::FP32, "matmul_scales", EAllocationType::ON_DEVICE, {2L});
+    }
 
     const long BT = B * T;
-    mScratch.cross_entropy_dloss =
-        mAllocator->allocate(ETensorDType::FP32, "cross_entropy_dloss", EAllocationType::ON_DEVICE, {BT});
-    mScratch.cross_entropy_logsumexp =
-        mAllocator->allocate(ETensorDType::FP32, "cross_entropy_logsumexp", EAllocationType::ON_DEVICE, {BT});
-    const int n_chunks = static_cast<int>((V + CROSS_ENTROPY_MAX_FUSED_SIZE - 1) / CROSS_ENTROPY_MAX_FUSED_SIZE);
-    if (n_chunks > 1) {
-        mScratch.cross_entropy_chunk_logsumexp = mAllocator->allocate(ETensorDType::FP32,
-                                                                      "cross_entropy_chunk_logsumexp",
-                                                                      EAllocationType::ON_DEVICE,
-                                                                      {BT, n_chunks});
+    if (mRunStateRequirements.cross_entropy_scratch) {
+        const long V = cfg.VocabSize;
+        mScratch.cross_entropy_dloss =
+            mAllocator->allocate(ETensorDType::FP32, "cross_entropy_dloss", EAllocationType::ON_DEVICE, {BT});
+        mScratch.cross_entropy_logsumexp =
+            mAllocator->allocate(ETensorDType::FP32, "cross_entropy_logsumexp", EAllocationType::ON_DEVICE, {BT});
+        const int n_chunks = static_cast<int>((V + CROSS_ENTROPY_MAX_FUSED_SIZE - 1) / CROSS_ENTROPY_MAX_FUSED_SIZE);
+        if (n_chunks > 1) {
+            mScratch.cross_entropy_chunk_logsumexp = mAllocator->allocate(ETensorDType::FP32,
+                                                                          "cross_entropy_chunk_logsumexp",
+                                                                          EAllocationType::ON_DEVICE,
+                                                                          {BT, n_chunks});
+        }
     }
 
     // Encoder backward scratch buffers - skip in LoRA-only mode since embedding backward is skipped entirely
-    if (!mLoraOnlyMode) {
+    if (mRunStateRequirements.encoder_backward_scratch && !mLoraOnlyMode) {
         const long group_width = static_cast<long>(16 / get_dtype_size(mGradDtype) * 32);
         const long num_c_groups = (C + group_width - 1) / group_width;
         mScratch.encoder_bwd_scratch = mAllocator->allocate(ETensorDType::INT32,
@@ -1055,38 +1080,42 @@ void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {
                                                          {B, T, 4 * num_c_groups});
     }
 
-    const int attn_chunks = mAttnBwdChunks;
-    if (attn_chunks < 1) {
-        throw std::runtime_error("attn_bwd_chunks must be >= 1");
-    }
-    const long attn_ws_batch_size = (attn_chunks == 1) ? B : div_exact(B, static_cast<long>(attn_chunks));
-    // For hybrid models, use max head_size for cuDNN workspace sizing.
-    long max_D = D;
-    if (mRuntimeConfig.has_per_layer_dims()) {
-        for (const auto& pld : mRuntimeConfig.per_layer_dims) {
-            max_D = std::max(max_D, pld.head_size);
+    if (mRunStateRequirements.attention_workspace) {
+        const int attn_chunks = mAttnBwdChunks;
+        if (attn_chunks < 1) {
+            throw std::runtime_error("attn_bwd_chunks must be >= 1");
         }
-    }
-    // Delegate workspace sizing to the attention-backend registry.
-    // Only cuDNN has a persistent workspace; other backends report 0.
-    const long cudnn_ws_size =
-        static_cast<long>(AttentionBackendRegistry::instance().max_workspace_bytes(static_cast<int>(attn_ws_batch_size),
-                                                                                   static_cast<int>(T),
-                                                                                   static_cast<int>(Hq),
-                                                                                   static_cast<int>(Hkv),
-                                                                                   static_cast<int>(max_D),
-                                                                                   CudnnHandle,
-                                                                                   cublas_handle()));
-    if (cudnn_ws_size > 0) {
-        // Pre-allocate cudnn_workspace using the persistent allocator to avoid overlap with
-        // stack-allocated gradient buffers. The workspace is large (~192MB) and if allocated
-        // from the temp stack, checkpoint restores during backward can cause it to be reallocated
-        // in a region that overlaps with gradient buffers.
-        mScratch.cudnn_workspace =
-            mAllocator->allocate(ETensorDType::BYTE, "cudnn_workspace", EAllocationType::ON_DEVICE, {cudnn_ws_size});
-    } else {
-        // Leave an empty descriptor; attention ops will fail later if invoked with invalid head size.
-        mScratch.cudnn_workspace = Tensor::empty(ETensorDType::BYTE, {0});
+        const long attn_ws_batch_size = (attn_chunks == 1) ? B : div_exact(B, static_cast<long>(attn_chunks));
+        // For hybrid models, use max head_size for cuDNN workspace sizing.
+        long max_D = D;
+        if (mRuntimeConfig.has_per_layer_dims()) {
+            for (const auto& pld : mRuntimeConfig.per_layer_dims) {
+                max_D = std::max(max_D, pld.head_size);
+            }
+        }
+        // Delegate workspace sizing to the attention-backend registry.
+        // Only cuDNN has a persistent workspace; other backends report 0.
+        const long cudnn_ws_size = static_cast<long>(
+            AttentionBackendRegistry::instance().max_workspace_bytes(static_cast<int>(attn_ws_batch_size),
+                                                                     static_cast<int>(T),
+                                                                     static_cast<int>(Hq),
+                                                                     static_cast<int>(Hkv),
+                                                                     static_cast<int>(max_D),
+                                                                     CudnnHandle,
+                                                                     cublas_handle()));
+        if (cudnn_ws_size > 0) {
+            // Pre-allocate cudnn_workspace using the persistent allocator to avoid overlap with
+            // stack-allocated gradient buffers. The workspace is large (~192MB) and if allocated
+            // from the temp stack, checkpoint restores during backward can cause it to be reallocated
+            // in a region that overlaps with gradient buffers.
+            mScratch.cudnn_workspace = mAllocator->allocate(ETensorDType::BYTE,
+                                                            "cudnn_workspace",
+                                                            EAllocationType::ON_DEVICE,
+                                                            {cudnn_ws_size});
+        } else {
+            // Leave an empty descriptor; attention ops will fail later if invoked with invalid head size.
+            mScratch.cudnn_workspace = Tensor::empty(ETensorDType::BYTE, {0});
+        }
     }
 }
 

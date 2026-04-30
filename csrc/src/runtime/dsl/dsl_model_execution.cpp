@@ -291,7 +291,8 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
                                               mQLoRAConfig.is_prequantized(),
                                               static_cast<std::size_t>(required_size),
                                               layout,
-                                              &mBlockSchemaPlanRecords);
+                                              &mBlockSchemaPlanRecords,
+                                              causal_lm_profile().run_state_requirements());
     mRunState->WorldSize = comm.world_size();
     if (mParams) {
         mParams->set_default_stream(mRunState->MainStream);
