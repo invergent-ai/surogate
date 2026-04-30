@@ -19,6 +19,7 @@
 #include "runtime/dsl/graph_compiler.h"
 #include "runtime/dsl/ir.h"
 #include "runtime/dsl/forward_plan.h"
+#include "runtime/executor/execution_request.h"
 #include "runtime/core/forward_hooks.h"
 #include "runtime/core/backward_hooks.h"
 #include "utilities/stack.h"
@@ -61,47 +62,18 @@ struct GraphExecutorOptions {
 
     // Whether to print derived backward graph for debugging
     bool debug_print_backward = false;
+
+    // Profile-provided tensors that should not be retained as backward saves.
+    std::vector<std::string> excluded_save_tensors;
 };
 
 class IGraphExecutor {
 public:
     virtual ~IGraphExecutor() = default;
 
-    virtual void forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm, int micro_step) = 0;
-    virtual float
-    validate(Tensor inputs, Tensor position_ids, Tensor targets, NCCLCommunicator& comm, int micro_step) = 0;
-    virtual void
-    backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, int grad_accum_steps, int micro_step) = 0;
-
-    // Hook-enabled forward/backward methods (matching ModularModel interface)
-    virtual void forward_with_hook(Tensor inputs,
-                                   Tensor position_ids,
-                                   NCCLCommunicator& comm,
-                                   int micro_step,
-                                   const modules::ForwardHook& hook) {
-        // Default: forward without hooks
-        forward(inputs, position_ids, comm, micro_step);
-    }
-
-    virtual float validate_with_hook(Tensor inputs,
-                                     Tensor position_ids,
-                                     Tensor targets,
-                                     NCCLCommunicator& comm,
-                                     int micro_step,
-                                     const modules::ForwardHook& hook) {
-        // Default: validate without hooks
-        return validate(inputs, position_ids, targets, comm, micro_step);
-    }
-
-    virtual void backward_with_hook(Tensor inputs,
-                                    Tensor targets,
-                                    NCCLCommunicator& comm,
-                                    int grad_accum_steps,
-                                    int micro_step,
-                                    const modules::BackwardHook& hook) {
-        // Default: backward without hooks
-        backward(inputs, targets, comm, grad_accum_steps, micro_step);
-    }
+    virtual ExecutionResult execute_forward(const ExecutionRequest& request, NCCLCommunicator& comm) = 0;
+    virtual ExecutionResult execute_eval(const ExecutionRequest& request, NCCLCommunicator& comm) = 0;
+    virtual ExecutionResult execute_backward(const ExecutionRequest& request, NCCLCommunicator& comm) = 0;
 
     // Check if backward graph was auto-derived
     virtual bool has_derived_backward() const = 0;
@@ -219,28 +191,9 @@ public:
     // Set optional weight manager for streaming/sharding
     void set_weight_manager(DslWeightManager* weight_manager);
 
-    void forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm, int micro_step) override;
-    float validate(Tensor inputs, Tensor position_ids, Tensor targets, NCCLCommunicator& comm, int micro_step) override;
-    void backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, int grad_accum_steps, int micro_step) override;
-
-    // Hook-enabled methods (matching ModularModel interface for LoRA integration)
-    void forward_with_hook(Tensor inputs,
-                           Tensor position_ids,
-                           NCCLCommunicator& comm,
-                           int micro_step,
-                           const modules::ForwardHook& hook) override;
-    float validate_with_hook(Tensor inputs,
-                             Tensor position_ids,
-                             Tensor targets,
-                             NCCLCommunicator& comm,
-                             int micro_step,
-                             const modules::ForwardHook& hook) override;
-    void backward_with_hook(Tensor inputs,
-                            Tensor targets,
-                            NCCLCommunicator& comm,
-                            int grad_accum_steps,
-                            int micro_step,
-                            const modules::BackwardHook& hook) override;
+    ExecutionResult execute_forward(const ExecutionRequest& request, NCCLCommunicator& comm) override;
+    ExecutionResult execute_eval(const ExecutionRequest& request, NCCLCommunicator& comm) override;
+    ExecutionResult execute_backward(const ExecutionRequest& request, NCCLCommunicator& comm) override;
 
     void set_hook_context(void* context) override {
         mHookContext = context;
@@ -269,42 +222,6 @@ public:
     size_t saved_buffers_total_bytes() const override;
     int saved_buffers_count() const override;
     const std::unordered_map<std::string, size_t>& saved_buffers_sizes() const override;
-
-    /// Execute a forward pass to extract per-token log-probabilities.
-    ///
-    /// input_ids_cpu: CPU int32 token IDs, shape [B*T] (row-major).
-    /// targets_cpu:   CPU int32 target IDs, shape [B*T]; -100 = masked.
-    /// logprobs_cpu:  CPU output buffer, shape [B*T]; receives log P(target|context).
-    ///                Masked positions (target == -100) receive 0.
-    /// hook:          Optional LoRA forward hook (nullptr to skip LoRA, e.g. reference model).
-    void execute_logprobs_forward(long B,
-                                  long T,
-                                  const std::int32_t* input_ids_cpu,
-                                  const std::int32_t* targets_cpu,
-                                  float* logprobs_cpu,
-                                  const modules::ForwardHook* hook,
-                                  NCCLCommunicator& comm,
-                                  const std::int32_t* position_ids_cpu = nullptr,
-                                  const float* temperatures_cpu = nullptr);
-
-    /// Execute a backward pass with custom per-token d_loss values (for GRPO).
-    ///
-    /// Identical to backward_with_hook() except the d_loss tensor is seeded from
-    /// per_token_grads_cpu instead of being filled with 1.0. This allows Python
-    /// to feed externally-computed per-token GRPO gradients back through the model.
-    ///
-    /// per_token_grads_cpu: CPU float32 buffer of shape [B*T].
-    ///   Values represent dL_GRPO/d(log_prob_policy)[t] for each token.
-    ///   Masked positions should be 0.
-    /// hook: Optional backward hook (for LoRA gradient computation; may be nullptr).
-    void backward_with_custom_dloss(Tensor inputs,
-                                    Tensor targets,
-                                    const float* per_token_grads_cpu,
-                                    NCCLCommunicator& comm,
-                                    int grad_accum_steps,
-                                    int micro_step,
-                                    const modules::BackwardHook* hook,
-                                    const float* temperatures_cpu = nullptr);
 
     /// Estimate the peak stack usage during backward execution.
     ///
@@ -368,8 +285,6 @@ public:
                                          int count,
                                          int total_q) override;
     void reissue_cu_seqlens_for_micro_step(int micro_step) override;
-    void set_inv_temperature_context(const float* inv_temperature_gpu);
-
     /// Destroy every CUDA-graph capture this executor owns (whole-graph,
     /// per-layer forward/backward, split-attention per-segment) plus the
     /// stack checkpoints that referenced them. Intended for callers that
@@ -421,6 +336,7 @@ private:
     std::unordered_map<std::string, std::string> mViewSources;
     std::unordered_map<std::string, std::string> mViewSourcesReverse;
     Tensor mLastInputsCpu{};
+    const ExecutionRequest* mActiveExecutionRequest = nullptr;
     bool mFP8ScalingInitialized = false;
     std::vector<LayerForwardPlan> mForwardPlan;
 
@@ -437,7 +353,8 @@ private:
     const Tensor* get_fp8_cached_weight(const std::string& name, Tensor& weight, cudaStream_t stream);
     void prime_fp8_weight_cache_transposed(const std::vector<char>& required);
     const Tensor* get_fp8_cached_weight_transposed(const std::string& name, Tensor& weight, cudaStream_t stream);
-    void prime_fp8_lm_head_cache(bool transposed);
+    void prime_fp8_non_block_weight_cache(const std::string& group, bool transposed);
+    void prime_profile_fp8_weight_caches(bool backward, bool transposed);
 
     // FP4 weight cache helpers (for NVFP4 recipe on Blackwell+)
     void prime_fp4_weight_cache(const std::vector<char>& required);
@@ -478,7 +395,6 @@ private:
     int mPrefetchedLayer = -1;
     cudaEvent_t mPrefetchEvent = nullptr;
     bool mPrefetchEnabled = false;
-    bool mHasLossOp = false;
     bool mWeightCachesPrimed = false;  // True after first eager FP8/FP4 cache priming
 
     // Pre-computed layer boundaries for predictable prefetch

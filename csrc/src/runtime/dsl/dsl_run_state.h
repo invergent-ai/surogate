@@ -52,7 +52,8 @@ public:
                 bool prequantized = false,
                 std::size_t stack_bytes = kDefaultStackBytes,
                 const ActivationLayoutIR* activation_layout = nullptr,
-                const std::vector<BlockSchemaPlanRecord>* block_schema_records = nullptr);
+                const std::vector<BlockSchemaPlanRecord>* block_schema_records = nullptr,
+                RuntimeRunStateRequirements run_state_requirements = RuntimeRunStateRequirements::causal_lm());
     ~DslRunState();
 
     /// Swap the backing stack buffer (used to resize the stack after the
@@ -306,19 +307,20 @@ public:
 
     // IRunState overrides (quantization unsupported in DSL runtime for now).
     [[nodiscard]] bool has_activation_quants() const override {
-        return mMatmulDtype != mActivationDtype;
+        return mRunStateRequirements.transformer_quant_state && mMatmulDtype != mActivationDtype;
     }
     [[nodiscard]] bool has_grad_quants() const override {
-        return mGradQuantDtype != mGradDtype;
+        return mRunStateRequirements.transformer_quant_state && mGradQuantDtype != mGradDtype;
     }
     [[nodiscard]] bool has_fp8_forward() const override {
-        return mEnableFp8Forward;
+        return mRunStateRequirements.transformer_quant_state && mEnableFp8Forward;
     }
     [[nodiscard]] bool has_fp8_hybrid_backward() const override {
-        return mEnableFp8Forward && mGradQuantDtype == ETensorDType::FP8_E5M2;
+        return mRunStateRequirements.transformer_quant_state && mEnableFp8Forward &&
+               mGradQuantDtype == ETensorDType::FP8_E5M2;
     }
     [[nodiscard]] bool has_fp8_delayed_scaling() const override {
-        return mFP8ScalingState != nullptr;
+        return mRunStateRequirements.transformer_quant_state && mFP8ScalingState != nullptr;
     }
     [[nodiscard]] bool has_fp4_forward() const override {
         return false;
@@ -388,6 +390,7 @@ private:
     ETensorDType mGradQuantDtype = ETensorDType::BF16;
     bool mEnableFp8Forward = false;
     bool mOffloadResiduals = false;
+    RuntimeRunStateRequirements mRunStateRequirements;
     int mLMHeadChunks = 1;
     int mAttnBwdChunks = 1;
 

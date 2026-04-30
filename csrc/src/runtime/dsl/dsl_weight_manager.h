@@ -9,6 +9,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -120,6 +121,8 @@ public:
     void release_final_norm(cudaStream_t stream);
     void gather_lm_head(NCCLCommunicator& comm, cudaStream_t stream);
     void release_lm_head(cudaStream_t stream);
+    void gather_non_block_group(std::string_view group, NCCLCommunicator& comm, cudaStream_t stream);
+    void release_non_block_group(std::string_view group, cudaStream_t stream);
 
     // Synchronization helpers
     void wait_for_gather(int layer_idx, cudaStream_t stream);

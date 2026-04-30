@@ -70,34 +70,39 @@ Tensor& IModel::get_deepstack_visual_embeds_buffer(int index) {
 IRunState::IRunState(std::unique_ptr<PretrainedConfig> config,
                      long batch_size,
                      long seq_len,
-                     std::shared_ptr<TensorAllocator> alloc)
+                     std::shared_ptr<TensorAllocator> alloc,
+                     dsl::RuntimeRunStateRequirements requirements)
     : Config(std::move(config)),
       B(batch_size),
       T(seq_len),
-      Allocator(std::move(alloc)) {
+      Allocator(std::move(alloc)),
+      Requirements(requirements) {
     int did;
     CUDA_CHECK(cudaGetDevice(&did));
     DeviceId = did;
     CUDA_CHECK(cudaGetDeviceProperties(&DeviceProp, did));
 
-    Inputs = Allocator->allocate(ETensorDType::INT32, "inputs", {B, T});
+    if (Requirements.token_inputs) {
+        Inputs = Allocator->allocate(ETensorDType::INT32, "inputs", {B, T});
+        Inputs_CPU = Allocator->allocate(ETensorDType::INT32, "inputs_cpu", EAllocationType::PINNED, {B, T});
+    }
     const bool multimodal_rope = Config && Config->Rope.is_multimodal();
     const long pos_planes = multimodal_rope ? 3 : 1;
-    if (pos_planes > 1) {
-        PositionIDs = Allocator->allocate(ETensorDType::INT32, "pos_ids", {pos_planes, B, T});
-    } else {
-        PositionIDs = Allocator->allocate(ETensorDType::INT32, "pos_ids", {B, T});
+    if (Requirements.position_ids) {
+        if (pos_planes > 1) {
+            PositionIDs = Allocator->allocate(ETensorDType::INT32, "pos_ids", {pos_planes, B, T});
+            PositionIDs_CPU =
+                Allocator->allocate(ETensorDType::INT32, "pos_ids_cpu", EAllocationType::PINNED, {pos_planes, B, T});
+        } else {
+            PositionIDs = Allocator->allocate(ETensorDType::INT32, "pos_ids", {B, T});
+            PositionIDs_CPU = Allocator->allocate(ETensorDType::INT32, "pos_ids_cpu", EAllocationType::PINNED, {B, T});
+        }
     }
-    Targets = Allocator->allocate(ETensorDType::INT32, "targets", {B, T});
-    Inputs_CPU = Allocator->allocate(ETensorDType::INT32, "inputs_cpu", EAllocationType::PINNED, {B, T});
-    if (pos_planes > 1) {
-        PositionIDs_CPU =
-            Allocator->allocate(ETensorDType::INT32, "pos_ids_cpu", EAllocationType::PINNED, {pos_planes, B, T});
-    } else {
-        PositionIDs_CPU = Allocator->allocate(ETensorDType::INT32, "pos_ids_cpu", EAllocationType::PINNED, {B, T});
+    if (Requirements.targets) {
+        Targets = Allocator->allocate(ETensorDType::INT32, "targets", {B, T});
+        Targets_CPU = Allocator->allocate(ETensorDType::INT32, "targets_cpu", EAllocationType::PINNED, {B, T});
     }
-    Targets_CPU = Allocator->allocate(ETensorDType::INT32, "targets_cpu", EAllocationType::PINNED, {B, T});
-    if (Config && Config->UseVisualInputs) {
+    if (Requirements.visual_inputs && Config && Config->UseVisualInputs) {
         const long C = Config->HiddenSize;
         const long max_visual = B * T;
         VisualPosMasks = Allocator->allocate(ETensorDType::INT32, "visual_pos_masks", {B, T});
@@ -129,9 +134,11 @@ IRunState::IRunState(std::unique_ptr<PretrainedConfig> config,
             }
         }
     }
-    Losses = Allocator->allocate(ETensorDType::FP32, "losses", {B, T});
-    ValidTokenCount = Allocator->allocate(ETensorDType::INT32, "valid_token_count", {1});
-    CorrectCount = Allocator->allocate(ETensorDType::INT32, "correct_count", {1});
+    if (Requirements.loss_metrics) {
+        Losses = Allocator->allocate(ETensorDType::FP32, "losses", {B, T});
+        ValidTokenCount = Allocator->allocate(ETensorDType::INT32, "valid_token_count", {1});
+        CorrectCount = Allocator->allocate(ETensorDType::INT32, "correct_count", {1});
+    }
 
     CudnnHandle = create_cudnn_handle();
     CublasLtHandle = create_cublaslt_handle();
@@ -256,6 +263,7 @@ IRunState::IRunState(IRunState&& other) noexcept
       WorldSize(other.WorldSize),
       Allocator(std::move(other.Allocator)),
       Stack(std::move(other.Stack)),
+      Requirements(other.Requirements),
       Inputs(std::move(other.Inputs)),
       PositionIDs(std::move(other.PositionIDs)),
       Targets(std::move(other.Targets)),
