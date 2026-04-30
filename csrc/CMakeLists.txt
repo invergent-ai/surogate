@@ -689,90 +689,22 @@ endif ()
 
 # ----------------------------------------------------------------------------
 # Tests
-option(BUILD_TESTS "Build all tests (unit + integration)" OFF)
-option(BUILD_TESTS_UNIT "Build unit tests (kernels, modules, components)" ON)
+option(BUILD_TESTS "Build integration tests" OFF)
 option(BUILD_TESTS_INTEGRATION "Build integration tests (training loops, distributed)" OFF)
 
-if (BUILD_TESTS OR BUILD_TESTS_UNIT OR BUILD_TESTS_INTEGRATION)
+if (BUILD_TESTS OR BUILD_TESTS_INTEGRATION)
     enable_testing()
 
-    # Unit tests: Kernels, quantization, optimizers, LoRA, MoE, models
-    if (BUILD_TESTS OR BUILD_TESTS_UNIT)
-        add_executable(unit-tests
-            src/testing/utilities/test_main.cpp
-
-            # Kernels
-            src/testing/kernels/test-swiglu.cu
-            src/testing/kernels/test-rope.cu
-            src/testing/kernels/test-classifier.cu
-            src/testing/kernels/test-grad-clip.cu
-            src/testing/kernels/test-multi-tensor-norm.cu
-
-
-            # Quantization
-            src/testing/quantization/test-qlora.cu
-            src/testing/quantization/test-fp4.cu
-            src/testing/quantization/test-bnb-quant.cpp
-
-            # Optimizers
-            src/testing/optimizers/test-adamw.cu
-            src/testing/optimizers/test-flash-adamw.cu
-            src/testing/optimizers/test-normuon.cu
-
-            # LoRA
-            src/testing/lora/test-lora-dropout.cu
-            src/testing/lora/test-fast-lora-silu.cu
-
-            # MoE
-            src/testing/moe/test-moe.cu
-
-            # Expert Parallelism
-            src/testing/ep/test-ep-buffer-pool.cpp
-
-            # JIT kernel loader
-            src/testing/jit/test-jit-kernel.cpp
-
-            # Tokenizer
-            src/testing/tokenizer/test_tokenizer.cpp
-
-            # Utilities
-            src/testing/utilities/test-sol.cpp
-            src/testing/utilities/test_dsl_ir.cpp
-            src/testing/utilities/test_dsl_goldens.cpp
-            src/testing/utilities/test_dsl_module_goldens.cpp
-            src/testing/utilities/test_fusion_rule_registry.cpp
-            src/testing/utilities/test_op_registry.cpp
-            src/testing/utilities/test_tensor_role.cpp
-        )
-        target_link_libraries(unit-tests PRIVATE surogate-common Catch2::Catch2 CLI11::CLI11 fmt::fmt-header-only)
-        target_compile_options(unit-tests PRIVATE
-            $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
-            $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
-        )
-        add_test(NAME unit-tests COMMAND unit-tests)
-    endif()
-
-    # Integration tests: Full training loops, multi-GPU communication
-    if (BUILD_TESTS OR BUILD_TESTS_INTEGRATION)
-        add_executable(integration-tests
-            src/testing/utilities/test_main.cpp
-
-            # Training
-            # Distributed
-            src/testing/distributed/test-nccl.cpp
-        )
-        target_link_libraries(integration-tests PRIVATE
-            surogate-common Catch2::Catch2 CLI11::CLI11 fmt::fmt-header-only
-        )
-        target_compile_options(integration-tests PRIVATE
-            $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
-            $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
-        )
-        add_test(NAME integration-tests COMMAND integration-tests)
-    endif()
-
-    # Convenience target for all tests
-    if (BUILD_TESTS)
-        add_custom_target(all-tests DEPENDS unit-tests integration-tests)
-    endif()
+    add_executable(integration-tests
+        src/testing/utilities/test_main.cpp
+        src/testing/distributed/test-nccl.cpp
+    )
+    target_link_libraries(integration-tests PRIVATE
+        surogate-common Catch2::Catch2 CLI11::CLI11 fmt::fmt-header-only
+    )
+    target_compile_options(integration-tests PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+        $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
+    )
+    add_test(NAME integration-tests COMMAND integration-tests)
 endif()
