@@ -154,6 +154,32 @@ class JudgeClientPool:
             if self._semaphore is not None:
                 self._semaphore.release()
 
+    async def wait_for_ready(self, *, timeout: float = 600.0, poll_interval: float = 2.0) -> None:
+        """Block until every judge endpoint serves a successful ``/v1/models`` response.
+
+        Without this, the first few groups can hit the judge before its model finishes
+        loading (auto-spawned judges typically take 5–30s to come up). The rubric's
+        retry path *would* recover, but the wasted attempts inflate cost and latency
+        for the first step. Polling once at startup avoids that.
+        """
+        log = get_logger()
+        log.info(f"Waiting for RULER judge pool to be ready ({len(self._clients)} endpoint(s))")
+        deadline = asyncio.get_event_loop().time() + timeout
+        for client in self._clients:
+            base = str(client.base_url).rstrip("/")
+            while True:
+                try:
+                    await client.models.list()
+                    log.debug(f"RULER judge endpoint ready: {base}")
+                    break
+                except Exception as e:
+                    if asyncio.get_event_loop().time() > deadline:
+                        raise TimeoutError(
+                            f"RULER judge at {base} not ready after {timeout:.0f}s: {type(e).__name__}: {e}"
+                        ) from e
+                    await asyncio.sleep(poll_interval)
+        log.success("RULER judge pool ready")
+
     async def aclose(self) -> None:
         for http_client in self._http_clients:
             try:

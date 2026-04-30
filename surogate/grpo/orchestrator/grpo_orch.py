@@ -374,6 +374,12 @@ async def orchestrate(config: GRPOOrchestratorConfig):
             await teacher_inference_pool.wait_for_ready(config.teacher_model.model.name)
             logger.success("Teacher inference pool ready")
 
+        # Block until the RULER judge pool is up. Without this, the first batch's
+        # group-scoring HTTP calls can land while the judge model is still loading
+        # — they'd be retried internally but inflate the first step's cost/latency.
+        if ruler_judge_pool is not None:
+            await ruler_judge_pool.wait_for_ready()
+
         # Set up weight broadcast backend
         logger.info(f"Initializing weight broadcast ({config.weight_broadcast})")
         if config.weight_broadcast.type == "nccl":

@@ -5,6 +5,11 @@ vLLM and the trainer occupy disjoint sets of GPUs. We set ``CUDA_VISIBLE_DEVICES
 the trainer side BEFORE any torch import (in this module's ``__main__`` block) and
 launch vLLM as a subprocess with its own ``CUDA_VISIBLE_DEVICES``.
 
+For RULER training, also pass ``--judge-infer judge.yaml --judge-gpus 6,7`` to spawn
+a second vLLM serving the judge model alongside the rollout vLLM. The judge
+runs in its own subprocess on its own GPU set; the orchestrator hits it over HTTP
+at the URL configured under ``orch.yaml`` ``ruler.judge.base_url``.
+
 For shared-GPU mode, see `surogate grpo-colocate`.
 """
 
@@ -52,6 +57,25 @@ def prepare_command_parser(parser=None):
         required=True,
         help="Comma-separated GPU ids for the trainer (e.g. '4,5,6,7'). Count must equal train.gpus.",
     )
+    parser.add_argument(
+        "--judge-infer",
+        type=str,
+        default=None,
+        help=(
+            "Path to a GRPO inference config YAML for the RULER judge. When set together "
+            "with --judge-gpus AND orch.yaml has ruler.enabled=true, surogate grpo spawns "
+            "a second vLLM subprocess serving the judge. Omit to point at an externally-running judge."
+        ),
+    )
+    parser.add_argument(
+        "--judge-gpus",
+        type=_gpu_list,
+        default=None,
+        help=(
+            "Comma-separated GPU ids for the judge vLLM (e.g. '6,7'). Must be disjoint from "
+            "--vllm-gpus and --trainer-gpus. Count must equal judge_infer.dp * judge_infer.tp."
+        ),
+    )
     return parser
 
 
@@ -61,6 +85,16 @@ if __name__ == "__main__":
     overlap = sorted(set(args.vllm_gpus) & set(args.trainer_gpus))
     if overlap:
         logger.error(f"--vllm-gpus and --trainer-gpus overlap on {overlap}")
+        sys.exit(1)
+
+    # --judge-infer and --judge-gpus are paired: both or neither. Catching here
+    # gives a clearer CLI error than letting grpo_split raise mid-startup.
+    if (args.judge_infer is None) != (args.judge_gpus is None):
+        logger.error(
+            "--judge-infer and --judge-gpus must be provided together (or both omitted); "
+            f"got --judge-infer={'set' if args.judge_infer else 'unset'}, "
+            f"--judge-gpus={'set' if args.judge_gpus else 'unset'}"
+        )
         sys.exit(1)
 
     # Mask the parent process to the trainer GPUs BEFORE any torch import below.
@@ -81,6 +115,8 @@ if __name__ == "__main__":
     infer_config = load_config(GRPOInferenceConfig, args.infer)
     orch_config = load_config(GRPOOrchestratorConfig, args.orch)
 
+    judge_infer_config = load_config(GRPOInferenceConfig, args.judge_infer) if args.judge_infer else None
+
     # The CLI is the source of truth for the trainer GPU count; the YAML field
     # becomes optional in split mode.
     train_config.gpus = len(args.trainer_gpus)
@@ -98,4 +134,6 @@ if __name__ == "__main__":
         orch_config,
         vllm_gpu_ids=args.vllm_gpus,
         trainer_gpu_ids=args.trainer_gpus,
+        judge_infer_config=judge_infer_config,
+        judge_gpu_ids=args.judge_gpus,
     )

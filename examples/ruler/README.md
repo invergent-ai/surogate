@@ -34,46 +34,62 @@ small env is enough to see every code path execute and to catch regressions.
    downloadable. Run `huggingface-cli login` if either is gated for you.
 4. **Disk**: writes to `./outputs/ruler/`. Allow ~2 GB.
 
-## Step 1 — start the judge vLLM (Terminal A)
+## Step 1 — start the entire pipeline with one command
 
-The judge is independent infrastructure — it does not participate in
-`surogate grpo`'s rollout-vLLM-plus-trainer launch sequence, so you must start
-it first and leave it running.
+`surogate grpo` can spawn the rollout vLLM, the judge vLLM, and the trainer
+together when you pass `--judge-infer` and `--judge-gpus`. This is the
+production path — one process tree, single shutdown signal, watchdog watches
+all four components for unexpected death.
 
 ```bash
-CUDA_VISIBLE_DEVICES=2 RULER_JUDGE_API_KEY=EMPTY \
-    surogate grpo-infer examples/ruler/judge.yaml
+RULER_JUDGE_API_KEY=EMPTY surogate grpo \
+    --train       examples/ruler/train.yaml \
+    --infer       examples/ruler/infer.yaml \
+    --orch        examples/ruler/orch.yaml \
+    --judge-infer examples/ruler/judge.yaml \
+    --vllm-gpus   0 \
+    --trainer-gpus 1 \
+    --judge-gpus  2
 ```
 
-Wait for `Application startup complete.` (≈30 s after the model finishes
-downloading on first run). Sanity-check from another shell:
+The runner enforces:
+
+- `--vllm-gpus`, `--trainer-gpus`, `--judge-gpus` are all pairwise disjoint.
+- Each GPU count matches the corresponding inference config's `dp * tp` (or `train.gpus`).
+- The judge port (in `judge.yaml`) differs from the rollout port (in `infer.yaml`).
+- `orch.yaml` has `ruler.enabled: true` (otherwise the judge would never be called).
+
+The `RULER_JUDGE_API_KEY` env var name is set in `orch.yaml`
+(`ruler.judge.api_key_var`); the value `EMPTY` is fine for an unauthenticated
+local vLLM. Use a real API key here if pointing the judge at a hosted endpoint.
+
+### Alternative: judge in a separate terminal
+
+If you'd rather manage the judge process yourself (separate logs, easier to
+restart independently, or pointing at a hosted endpoint), omit the `--judge-*`
+flags and start the judge as a free-standing `grpo-infer`:
+
+```bash
+# Terminal A — judge vLLM
+CUDA_VISIBLE_DEVICES=2 RULER_JUDGE_API_KEY=EMPTY \
+    surogate grpo-infer examples/ruler/judge.yaml
+
+# Terminal B — rollout vLLM + trainer + orchestrator
+RULER_JUDGE_API_KEY=EMPTY surogate grpo \
+    --train examples/ruler/train.yaml \
+    --infer examples/ruler/infer.yaml \
+    --orch  examples/ruler/orch.yaml \
+    --vllm-gpus 0 --trainer-gpus 1
+```
+
+Sanity-check the standalone judge from another shell:
 
 ```bash
 curl -s http://localhost:8001/v1/models | python -m json.tool
 # Expect: data[0].id == "Qwen/Qwen3-1.7B"
 ```
 
-If you see the model entry, the judge is ready.
-
-## Step 2 — start the GRPO pipeline (Terminal B)
-
-This single command launches the rollout vLLM (GPU 0), the trainer (GPU 1), and
-the orchestrator process — all wired up via filesystem weight broadcast.
-
-```bash
-RULER_JUDGE_API_KEY=EMPTY surogate grpo \
-    --train examples/ruler/train.yaml \
-    --infer examples/ruler/infer.yaml \
-    --orch examples/ruler/orch.yaml \
-    --vllm-gpus 0 \
-    --trainer-gpus 1
-```
-
-The `RULER_JUDGE_API_KEY` env var name is set in `orch.yaml`
-(`ruler.judge.api_key_var`); the value `EMPTY` is fine for an unauthenticated
-local vLLM. Use a real API key here if pointing the judge at a hosted endpoint.
-
-## Step 3 — watch for the RULER wiring banner
+## Step 2 — watch for the RULER wiring banner
 
 Within the first few seconds of the orchestrator coming up, you should see:
 
@@ -89,7 +105,7 @@ The "Deferred group scoring enabled" line is the key confirmation: it means
 orchestrator will route rubric scoring through the deferred path that supports
 concurrent judging.
 
-## Step 4 — observe per-group judge calls
+## Step 3 — observe per-group judge calls
 
 With `debug: true` in `orch.yaml`, each completed group emits:
 
@@ -104,7 +120,7 @@ RULER judged group of 4 (sent=4, calls=1, latency=420ms, in=2150 out=180): score
 `sent=4` confirms all rollouts were unique (no all-identical fallback).
 `calls=1` confirms one judge HTTP call per group.
 
-## Step 5 — verify metrics
+## Step 4 — verify metrics
 
 Per-step metrics dump to `/tmp/grpo_metrics.jsonl` (`dump_metrics: true`).
 After the run finishes, check the last entry:
@@ -133,7 +149,7 @@ The most important check: `ruler/total_judge_calls == 4` per step. If it's
 higher, retries are firing (transient errors or judge parse failures); inspect
 the orchestrator log for `RULER judge … error`.
 
-## Step 6 — confirm concurrent judging is happening
+## Step 5 — confirm concurrent judging is happening
 
 Compare `ruler/total_judge_latency_ms` (sum across all 4 group calls) to
 `time/step` (the orchestrator step duration). If the judge is the bottleneck
@@ -159,7 +175,7 @@ df[["step", "time/step", "ruler/total_judge_latency_ms"]]
 | `ruler.rubric: "<custom text>"` | Custom grading rubric. Score distributions should reflect the new criteria. |
 | `rollouts_per_example: 8` (and bump `batch_size` to a multiple) | Higher group size — judge prompts grow; verify the judge model's `max_model_len` (16384 in `judge.yaml`) is sufficient. |
 
-## Step 7 — Read the automatic baseline-vs-trained eval
+## Step 6 — Read the automatic baseline-vs-trained eval
 
 The training run scored rollouts with the **judge** (RULER). To know whether
 training actually improved the model, you need numbers on the env's

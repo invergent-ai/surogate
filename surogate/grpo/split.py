@@ -6,11 +6,15 @@ which has already had its own ``CUDA_VISIBLE_DEVICES`` set by the CLI before any
 import happens. Weight broadcast goes through the filesystem backend — there is no
 shared GPU memory between the two GPU sets.
 
-Startup sequence (all three components launch concurrently):
-    1. Spawn vLLM subprocess with ``CUDA_VISIBLE_DEVICES=<vllm gpu ids>``.
-    2. Start the surogate trainer in a background thread (parent process,
+Startup sequence (all components launch concurrently):
+    1. Spawn rollout vLLM subprocess with ``CUDA_VISIBLE_DEVICES=<vllm gpu ids>``.
+    2. (Optional) Spawn judge vLLM subprocess with ``CUDA_VISIBLE_DEVICES=<judge gpu ids>``
+       when ``orch_config.ruler.enabled`` and judge args are provided. Lets a single
+       ``surogate grpo`` invocation own the entire RULER training topology — no
+       separate ``surogate grpo-infer`` for the judge.
+    3. Start the surogate trainer in a background thread (parent process,
        ``CUDA_VISIBLE_DEVICES=<trainer gpu ids>`` already applied by the CLI).
-    3. Run the orchestrator in the main async event loop. The orchestrator
+    4. Run the orchestrator in the main async event loop. The orchestrator
        polls vLLM /health internally and blocks until inference is ready.
 
 Module-level imports here MUST stay torch-free: this module is re-imported in the
@@ -83,24 +87,30 @@ def _run_trainer(train_config: GRPOTrainConfig, failure_event: threading.Event):
 
 
 def _watch_components(
-    vllm_proc: "mp.Process",
-    trainer_thread: Thread,
+    vllm_procs: list[tuple["mp.Process", str]],
     trainer_failed: threading.Event,
     shutdown_event: threading.Event,
 ) -> None:
-    """Watchdog: aborts the pipeline if vLLM or the trainer dies unexpectedly.
+    """Watchdog: aborts the pipeline if any vLLM or the trainer dies unexpectedly.
 
-    Sleeps on `vllm_proc.sentinel` with a 1s timeout so we can also poll the
-    trainer's failure flag. On unexpected death we deliver SIGINT to the main
-    thread, which has the existing SIGINT/KeyboardInterrupt teardown path.
+    Sleeps on the union of all vLLM sentinels with a 1s timeout so we can also
+    poll the trainer's failure flag. On unexpected death we deliver SIGINT to
+    the main thread, which has the existing SIGINT/KeyboardInterrupt teardown path.
+
+    ``vllm_procs`` is a list of (process, label) tuples so the crash message can
+    distinguish rollout-vLLM death from judge-vLLM death.
     """
+    sentinels = [proc.sentinel for proc, _ in vllm_procs]
     crashed: str | None = None
     while not shutdown_event.is_set():
-        ready = multiprocessing.connection.wait([vllm_proc.sentinel], timeout=1.0)
+        ready = multiprocessing.connection.wait(sentinels, timeout=1.0)
         if shutdown_event.is_set():
             return
-        if ready:
-            crashed = f"vLLM subprocess died unexpectedly (exitcode={vllm_proc.exitcode})"
+        for proc, label in vllm_procs:
+            if proc.sentinel in ready:
+                crashed = f"{label} subprocess died unexpectedly (exitcode={proc.exitcode})"
+                break
+        if crashed:
             break
         if trainer_failed.is_set():
             crashed = "Trainer thread crashed"
@@ -118,27 +128,44 @@ def grpo_split(
     orch_config: GRPOOrchestratorConfig,
     vllm_gpu_ids: list[int],
     trainer_gpu_ids: list[int],
+    judge_infer_config: GRPOInferenceConfig | None = None,
+    judge_gpu_ids: list[int] | None = None,
 ):
     """Run the full GRPO pipeline with vLLM and trainer on disjoint GPU sets.
+
+    When ``judge_infer_config`` and ``judge_gpu_ids`` are both provided AND
+    ``orch_config.ruler.enabled`` is True, also spawns a second vLLM subprocess
+    serving the RULER judge model on the given GPU ids. This lets a single
+    ``surogate grpo`` invocation own the entire RULER topology (rollout vLLM +
+    judge vLLM + trainer + orchestrator). When the judge args are omitted, the
+    orchestrator is expected to point at an externally-running judge, exactly
+    as in the pre-judge-spawn workflow.
 
     The CLI is expected to have set ``os.environ["CUDA_VISIBLE_DEVICES"]`` to the
     trainer GPU ids BEFORE importing torch. We do not set it again here because
     the parent has already imported the surogate stack by this point.
     """
-    if set(vllm_gpu_ids) & set(trainer_gpu_ids):
-        overlap = sorted(set(vllm_gpu_ids) & set(trainer_gpu_ids))
-        raise ValueError(f"--vllm-gpus and --trainer-gpus overlap on {overlap}")
+    # Validate judge args FIRST so judge-config errors surface before unrelated
+    # rollout/trainer overlap errors confuse the user.
+    _validate_judge_args(
+        judge_infer_config=judge_infer_config,
+        judge_gpu_ids=judge_gpu_ids,
+        orch_config=orch_config,
+        vllm_gpu_ids=vllm_gpu_ids,
+        trainer_gpu_ids=trainer_gpu_ids,
+        rollout_infer_config=infer_config,
+    )
 
-    expected_vllm = (infer_config.dp or 1) * (infer_config.tp or 1)
-    if len(vllm_gpu_ids) != expected_vllm:
-        raise ValueError(
-            f"--vllm-gpus has {len(vllm_gpu_ids)} GPU(s) but inference config implies "
-            f"dp({infer_config.dp}) * tp({infer_config.tp}) = {expected_vllm}"
-        )
+    _check_disjoint_gpus(("--vllm-gpus", vllm_gpu_ids), ("--trainer-gpus", trainer_gpu_ids))
+    _check_gpu_count_matches_topology("--vllm-gpus", vllm_gpu_ids, infer_config)
     if len(trainer_gpu_ids) != train_config.gpus:
         raise ValueError(f"--trainer-gpus has {len(trainer_gpu_ids)} GPU(s) but train.gpus = {train_config.gpus}")
 
-    logger.info(f"Starting GRPO pipeline (split mode) — vLLM GPUs: {vllm_gpu_ids}, trainer GPUs: {trainer_gpu_ids}")
+    spawn_judge = judge_infer_config is not None
+    topology = f"vLLM GPUs: {vllm_gpu_ids}, trainer GPUs: {trainer_gpu_ids}" + (
+        f", judge GPUs: {judge_gpu_ids}" if spawn_judge else ""
+    )
+    logger.info(f"Starting GRPO pipeline (split mode) — {topology}")
 
     # No CUDA-IPC weight sharing in split mode — both sides go through disk.
     train_config.weight_broadcast_type = "filesystem"
@@ -147,19 +174,23 @@ def grpo_split(
     # Spawn (not fork) so the child gets a fresh interpreter and doesn't inherit
     # any torch/CUDA state from the parent's trainer-side GPU mask.
     ctx = mp.get_context("spawn")
-    vllm_proc = ctx.Process(
-        target=_run_vllm_subprocess,
-        args=(infer_config, ",".join(str(g) for g in vllm_gpu_ids)),
-        name="vllm-subprocess",
-        daemon=False,
-    )
+    vllm_proc = _spawn_vllm(ctx, infer_config, vllm_gpu_ids, name="vllm-subprocess")
+
     # SIGTERM → SIGINT so a plain `kill <pid>` (and orchestrator code that calls
     # signal.raise_signal(SIGTERM) on stop) takes the same KeyboardInterrupt path
     # that Ctrl-C does, ensuring the finally block tears down the vLLM tree.
     signal.signal(signal.SIGTERM, lambda *_: signal.raise_signal(signal.SIGINT))
 
-    logger.info("Spawning vLLM, trainer, and orchestrator in parallel")
+    judge_proc: mp.Process | None = None
+    if spawn_judge:
+        assert judge_infer_config is not None and judge_gpu_ids is not None  # for type narrowing
+        judge_proc = _spawn_vllm(ctx, judge_infer_config, judge_gpu_ids, name="judge-vllm-subprocess")
+
+    components = "rollout vLLM, " + ("judge vLLM, " if judge_proc is not None else "") + "trainer, and orchestrator"
+    logger.info(f"Spawning {components} in parallel")
     vllm_proc.start()
+    if judge_proc is not None:
+        judge_proc.start()
 
     trainer_failed = threading.Event()
     trainer_thread = Thread(
@@ -170,13 +201,15 @@ def grpo_split(
     )
     trainer_thread.start()
 
-    # Watchdog must come up after both targets but before the orchestrator runs
-    # so we never miss an early crash. shutdown_event suppresses spurious aborts
-    # during the planned teardown in the finally block below.
+    # Watchdog watches every vLLM we spawned plus the trainer thread. shutdown_event
+    # suppresses spurious aborts during the planned teardown in the finally block.
+    watched_vllms: list[tuple[mp.Process, str]] = [(vllm_proc, "rollout vLLM")]
+    if judge_proc is not None:
+        watched_vllms.append((judge_proc, "judge vLLM"))
     shutdown_event = threading.Event()
     watchdog_thread = Thread(
         target=_watch_components,
-        args=(vllm_proc, trainer_thread, trainer_failed, shutdown_event),
+        args=(watched_vllms, trainer_failed, shutdown_event),
         daemon=True,
         name="grpo-watchdog",
     )
@@ -203,8 +236,9 @@ def grpo_split(
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
-        # Reap vLLM first — the heavy resource the user wants released.
-        _terminate_vllm_tree(vllm_proc)
+        # Reap vLLMs in parallel — each can take up to 15s on SIGTERM→SIGKILL escalation.
+        # Sequential teardown would double that on a typical RULER topology.
+        _terminate_vllm_trees_in_parallel(watched_vllms)
 
         # Trainer runs as a daemon thread; a brief join lets it flush logs, after
         # which it dies with the process. No reason to block for 30s here.
@@ -215,19 +249,120 @@ def grpo_split(
         watchdog_thread.join(timeout=2.0)
 
 
-def _terminate_vllm_tree(vllm_proc: "mp.Process") -> None:
+def _spawn_vllm(
+    ctx: mp.context.SpawnContext, infer_config: GRPOInferenceConfig, gpu_ids: list[int], *, name: str
+) -> mp.Process:
+    """Build (don't yet start) a vLLM subprocess pinned to the given GPU ids."""
+    return ctx.Process(
+        target=_run_vllm_subprocess,
+        args=(infer_config, ",".join(str(g) for g in gpu_ids)),
+        name=name,
+        daemon=False,
+    )
+
+
+def _check_disjoint_gpus(*labeled_sets: tuple[str, list[int]]) -> None:
+    """Raise ValueError if any pair in ``labeled_sets`` shares a GPU id."""
+    for i, (a_label, a_ids) in enumerate(labeled_sets):
+        for b_label, b_ids in labeled_sets[i + 1 :]:
+            overlap = sorted(set(a_ids) & set(b_ids))
+            if overlap:
+                raise ValueError(f"{a_label} and {b_label} overlap on {overlap}")
+
+
+def _check_gpu_count_matches_topology(label: str, gpu_ids: list[int], infer_config: GRPOInferenceConfig) -> None:
+    """Raise ValueError if ``len(gpu_ids) != dp * tp`` of the inference config."""
+    expected = (infer_config.dp or 1) * (infer_config.tp or 1)
+    if len(gpu_ids) != expected:
+        raise ValueError(
+            f"{label} has {len(gpu_ids)} GPU(s) but inference config implies "
+            f"dp({infer_config.dp}) * tp({infer_config.tp}) = {expected}"
+        )
+
+
+def _validate_judge_args(
+    *,
+    judge_infer_config: GRPOInferenceConfig | None,
+    judge_gpu_ids: list[int] | None,
+    orch_config: GRPOOrchestratorConfig,
+    vllm_gpu_ids: list[int],
+    trainer_gpu_ids: list[int],
+    rollout_infer_config: GRPOInferenceConfig,
+) -> None:
+    """Validate the judge spawn args.
+
+    Both ``judge_infer_config`` and ``judge_gpu_ids`` must be set together (or
+    both omitted; this defensive check catches non-CLI callers — the CLI layer
+    rejects partial args earlier with a friendlier error). When set, RULER must
+    be enabled, the judge GPU set must be disjoint from rollout-vLLM and
+    trainer GPUs, the GPU count must match ``dp * tp``, and the judge port
+    must differ from the rollout port.
+    """
+    if (judge_infer_config is None) != (judge_gpu_ids is None):
+        raise ValueError(
+            "--judge-infer and --judge-gpus must be provided together (or both omitted); "
+            f"got judge_infer_config={'set' if judge_infer_config else 'unset'}, "
+            f"judge_gpu_ids={'set' if judge_gpu_ids else 'unset'}"
+        )
+    if judge_infer_config is None:
+        return
+
+    assert judge_gpu_ids is not None
+    if not orch_config.ruler or not orch_config.ruler.enabled:
+        raise ValueError(
+            "Judge spawn args were provided but orch_config.ruler.enabled is False. "
+            "Either enable RULER (orch.yaml: ruler.enabled: true) or omit --judge-infer/--judge-gpus."
+        )
+    if not judge_gpu_ids:
+        raise ValueError("--judge-gpus must list at least one GPU id")
+    _check_disjoint_gpus(
+        ("--judge-gpus", judge_gpu_ids),
+        ("--vllm-gpus", vllm_gpu_ids),
+        ("--trainer-gpus", trainer_gpu_ids),
+    )
+    _check_gpu_count_matches_topology("--judge-gpus", judge_gpu_ids, judge_infer_config)
+    if judge_infer_config.port == rollout_infer_config.port:
+        raise ValueError(
+            f"Judge and rollout vLLM cannot share port {judge_infer_config.port}. "
+            "Set a different `port` in the judge inference config (e.g. 8001)."
+        )
+
+
+def _terminate_vllm_trees_in_parallel(watched: list[tuple["mp.Process", str]]) -> None:
+    """SIGTERM all vLLM subprocesses concurrently and wait for them in parallel.
+
+    Each call to ``_terminate_vllm_tree`` can block up to ~15s waiting for the
+    SIGTERM→SIGKILL escalation. With two vLLMs (rollout + judge), serial
+    teardown doubles shutdown latency for no reason. Threads are sufficient
+    here — the work is mostly waiting on ``Process.join``.
+    """
+    if len(watched) <= 1:
+        for proc, label in watched:
+            _terminate_vllm_tree(proc, label=label)
+        return
+    threads = [
+        Thread(target=_terminate_vllm_tree, args=(proc,), kwargs={"label": label}, name=f"reap-{label}")
+        for proc, label in watched
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+
+def _terminate_vllm_tree(vllm_proc: "mp.Process", *, label: str = "vLLM") -> None:
     """SIGTERM the vLLM process group, escalate to SIGKILL if it doesn't exit."""
     if not vllm_proc.is_alive() or vllm_proc.pid is None:
         return
     pgid = vllm_proc.pid  # vllm_proc called setsid() so its pid == its pgid
-    logger.info("Terminating vLLM subprocess group")
+    logger.info(f"Terminating {label} subprocess group")
     try:
         os.killpg(pgid, signal.SIGTERM)
     except ProcessLookupError:
         pass
     vllm_proc.join(timeout=10.0)
     if vllm_proc.is_alive():
-        logger.warning("vLLM did not exit in 10s; sending SIGKILL to process group")
+        logger.warning(f"{label} did not exit in 10s; sending SIGKILL to process group")
         try:
             os.killpg(pgid, signal.SIGKILL)
         except ProcessLookupError:
