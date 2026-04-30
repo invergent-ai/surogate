@@ -177,16 +177,11 @@ void CompiledExecutor::replay_layer_forward(int layer_idx,
     // the mTensors[tid] cache and write to the arena.
     populate_fwd_stack_bindings(fwd_graph);
 
-    // Bind known inputs
-    bind_tensor("token_ids", mRunState.Inputs);
-    bind_tensor("position_ids", mRunState.PositionIDs);
-    if (mRunState.VisualPosMasks.Data) {
-        bind_tensor("visual_pos_masks", mRunState.VisualPosMasks);
+    if (mRuntimeBindings) {
+        for (const auto& binding : *mRuntimeBindings) {
+            bind_tensor(binding.name, binding.tensor);
+        }
     }
-    if (mRunState.VisualEmbeds.Data) {
-        bind_tensor("visual_embeds", mRunState.VisualEmbeds);
-    }
-    bind_tensor("x0", mRunState.non_block_activations().encoded);
 
     // Take stack checkpoint — backward will restore this after consuming replay data
     auto replay_checkpoint = mRunState.Stack.checkpoint();
@@ -1108,51 +1103,19 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
         if (L >= 0) handle_layer_end(L);
     };
 
-    // Bind known inputs (into both flat vector and write-through mirror).
-    // Binds every stable non-param global at entry so resolve_tensor finds
-    // them via mNamedTensors / mTensors[tid] without falling through to
-    // the slot switch. Each rs.X pointer is stable after allocation.
-    bind_tensor("token_ids", mRunState.Inputs);
-    bind_tensor("position_ids", mRunState.PositionIDs);
-    if (mRunState.VisualPosMasks.Data) {
-        bind_tensor("visual_pos_masks", mRunState.VisualPosMasks);
-    }
-    if (mRunState.VisualEmbeds.Data) {
-        bind_tensor("visual_embeds", mRunState.VisualEmbeds);
-    }
-    if (!mRunState.DeepstackVisualEmbeds.empty()) {
-        for (std::size_t i = 0; i < mRunState.DeepstackVisualEmbeds.size(); ++i) {
-            if (!mRunState.DeepstackVisualEmbeds[i].Data) {
-                continue;
-            }
-            bind_tensor("deepstack_visual_embeds_" + std::to_string(i), mRunState.DeepstackVisualEmbeds[i]);
+    if (mRuntimeBindings) {
+        for (const auto& binding : *mRuntimeBindings) {
+            bind_tensor(binding.name, binding.tensor);
         }
-    }
-    // encoded/x0 alias the same backing tensor; bind under both names.
-    bind_tensor("x0", mRunState.non_block_activations().encoded);
-    bind_tensor("encoded", mRunState.non_block_activations().encoded);
-    // LM-head-adjacent globals (present in the compiled graph when the
-    // head is on the forward graph — no-op for heads split onto backward).
-    if (mRunState.non_block_activations().ln_final.Data) {
-        bind_tensor("ln_final", mRunState.non_block_activations().ln_final);
-        bind_tensor("xF", mRunState.non_block_activations().ln_final);
-    }
-    if (mRunState.non_block_activations().ln_final_rstd.Data) {
-        bind_tensor("ln_final_rstd", mRunState.non_block_activations().ln_final_rstd);
-    }
-    // Loss I/O — losses/targets have their own fixed runtime slots.
-    if (mRunState.Targets.Data) {
-        bind_tensor("targets", mRunState.Targets);
-    }
-    if (mRunState.Losses.Data) {
-        bind_tensor("loss", mRunState.Losses);
-        bind_tensor("losses", mRunState.Losses);
     }
 
     // Ensure non-block weights are gathered if streaming/offload is enabled
     if (mWeightManager && (mWeightManager->is_streaming_enabled() || mWeightManager->is_offload_enabled())) {
-        mWeightManager->gather_embeddings(comm, mRunState.MainStream);
-        mWeightManager->gather_final_norm(comm, mRunState.MainStream);
+        if (mExecutionRequest) {
+            for (const auto& group : mExecutionRequest->gather_before_forward_weight_groups) {
+                mWeightManager->gather_non_block_group(group, comm, mRunState.MainStream);
+            }
+        }
     }
 
     // Prefetch layer 0 before loop
@@ -1828,8 +1791,11 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     }
 
     if (mWeightManager && (mWeightManager->is_streaming_enabled() || mWeightManager->is_offload_enabled())) {
-        mWeightManager->release_embeddings(mRunState.MainStream);
-        mWeightManager->release_final_norm(mRunState.MainStream);
+        if (mExecutionRequest) {
+            for (const auto& group : mExecutionRequest->release_after_forward_weight_groups) {
+                mWeightManager->release_non_block_group(group, mRunState.MainStream);
+            }
+        }
     }
 
     mRunState.set_active_executor(nullptr);
@@ -1984,30 +1950,10 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     // gradient slot (and build the zero-list on first compile).
     populate_bwd_stack_bindings(graph);
 
-    // Bind every stable non-param global into mTensors + mNamedTensors at
-    // backward entry so resolve_tensor finds them via the tid/name cache
-    // without falling through to the slot switch. Runtime pointers are
-    // stable across steps — each cleared mTensors slot is re-bound here.
-    bind_tensor("token_ids", mRunState.Inputs);
-    bind_tensor("position_ids", mRunState.PositionIDs);
-    bind_tensor("x0", mRunState.non_block_activations().encoded);
-    bind_tensor("encoded", mRunState.non_block_activations().encoded);
-    if (mRunState.non_block_activations().ln_final.Data) {
-        bind_tensor("ln_final", mRunState.non_block_activations().ln_final);
-        bind_tensor("xF", mRunState.non_block_activations().ln_final);
-    }
-    if (mRunState.non_block_activations().ln_final_rstd.Data) {
-        bind_tensor("ln_final_rstd", mRunState.non_block_activations().ln_final_rstd);
-    }
-    if (mRunState.Targets.Data) {
-        bind_tensor("targets", mRunState.Targets);
-    }
-    if (mRunState.Losses.Data) {
-        bind_tensor("loss", mRunState.Losses);
-        bind_tensor("losses", mRunState.Losses);
-    }
-    if (mRunState.scratch().cross_entropy_dloss.Data) {
-        bind_tensor("d_loss", mRunState.scratch().cross_entropy_dloss);
+    if (mRuntimeBindings) {
+        for (const auto& binding : *mRuntimeBindings) {
+            bind_tensor(binding.name, binding.tensor);
+        }
     }
 
     // Pre-populate mTensors for every saved-source tid. mSaved was filled
@@ -2028,8 +1974,8 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     }
 
     // Clear activation/non-block gradients for each micro-step.
-    // When called from GraphExecutor::backward_with_hook(), the caller already zeroes these
-    // buffers, so skip_zeroing=true avoids redundant GPU work.
+    // When the graph executor has already zeroed these buffers, skip_zeroing=true
+    // avoids redundant GPU work.
     if (!skip_zeroing) {
         fill_zero(mRunState.non_block_gradients().d_ln_final, mRunState.MainStream);
         if (mRunState.non_block_gradients().d_embeddings.Data && !mRunState.is_lora_only_mode()) {
@@ -2045,9 +1991,10 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     }
 
     if (mWeightManager && (mWeightManager->is_streaming_enabled() || mWeightManager->is_offload_enabled())) {
-        mWeightManager->gather_final_norm(comm, mRunState.MainStream);
-        if (mOptions.LMHeadChunks <= 1) {
-            mWeightManager->gather_lm_head(comm, mRunState.MainStream);
+        if (mExecutionRequest) {
+            for (const auto& group : mExecutionRequest->gather_before_backward_weight_groups) {
+                mWeightManager->gather_non_block_group(group, comm, mRunState.MainStream);
+            }
         }
     }
 
@@ -2101,26 +2048,6 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             }
         }
     };
-
-    // Bind initial gradient tensors (from loss computation)
-    // d_logits is stored in the output buffer after loss backward (only when lmhead_chunks == 1)
-    auto& output = mRunState.non_block_activations().output;
-    if (!output.Data) {
-        throw std::runtime_error("CompiledExecutor: output tensor has no data (B=" + std::to_string(mB) +
-                                 ", T=" + std::to_string(mT) + ")");
-    }
-
-    if (mOptions.LMHeadChunks <= 1) {
-        Tensor logits_view = view_tensor(output, {mB, mT, static_cast<long>(mConfig.VocabSize)});
-        bind_tensor("d_logits", logits_view);
-        // Also provide flattened version for matmul backward ops
-        Tensor logits_flat = view_tensor(output, {mB * mT, static_cast<long>(mConfig.VocabSize)});
-        if (logits_flat.Rank != 2) {
-            throw std::runtime_error(
-                "CompiledExecutor: d_logits_flat has wrong rank=" + std::to_string(logits_flat.Rank) + " expected 2");
-        }
-        bind_tensor("d_logits_flat", logits_flat);
-    }
 
     // Bind gradient output buffers for final layer norm backward
     // DSL-driven: use slot registry to derive all mappings from gradient_of relationships
@@ -2308,21 +2235,9 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         // Note: NOT adding to mTemps since this is persistent memory managed separately
     }
 
-    // Also bind standard inputs that backward ops may reference
-    bind_tensor("token_ids", mRunState.Inputs);
-    bind_tensor("position_ids", mRunState.PositionIDs);
-    if (mRunState.VisualPosMasks.Data) {
-        bind_tensor("visual_pos_masks", mRunState.VisualPosMasks);
-    }
-    if (mRunState.VisualEmbeds.Data) {
-        bind_tensor("visual_embeds", mRunState.VisualEmbeds);
-    }
-    if (!mRunState.DeepstackVisualEmbeds.empty()) {
-        for (std::size_t i = 0; i < mRunState.DeepstackVisualEmbeds.size(); ++i) {
-            if (!mRunState.DeepstackVisualEmbeds[i].Data) {
-                continue;
-            }
-            bind_tensor("deepstack_visual_embeds_" + std::to_string(i), mRunState.DeepstackVisualEmbeds[i]);
+    if (mRuntimeBindings) {
+        for (const auto& binding : *mRuntimeBindings) {
+            bind_tensor(binding.name, binding.tensor);
         }
     }
 
@@ -2445,16 +2360,17 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         return detected_any;
     };
 
-    const bool skip_logits_grad = (mOptions.LMHeadChunks > 1);
-    auto is_logits_grad_name = [](const std::string& name) {
-        return name == "d_logits" || name == "d_logits_flat";
+    const bool skip_profile_backward_tensors = mSkippedBackwardTensors && !mSkippedBackwardTensors->empty();
+    auto is_skipped_backward_tensor = [&](const std::string& name) {
+        return std::find(mSkippedBackwardTensors->begin(), mSkippedBackwardTensors->end(), name) !=
+               mSkippedBackwardTensors->end();
     };
-    auto is_logits_grad_op = [&](const CompiledOp& op) {
+    auto is_skipped_backward_op = [&](const CompiledOp& op) {
         for (const auto& ref : op.inputs) {
-            if (is_logits_grad_name(ref.name)) return true;
+            if (is_skipped_backward_tensor(ref.name)) return true;
         }
         for (const auto& ref : op.outputs) {
-            if (is_logits_grad_name(ref.name)) return true;
+            if (is_skipped_backward_tensor(ref.name)) return true;
         }
         return false;
     };
@@ -2878,7 +2794,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 case dsl::InstKind::SegmentDispatch:
                     for (std::size_t i = inst.op_start; i < inst.op_end; ++i) {
                         const auto& op = graph.ops[i];
-                        if (skip_logits_grad && is_logits_grad_op(op)) continue;
+                        if (skip_profile_backward_tensors && is_skipped_backward_op(op)) continue;
                         if (!op.fn) continue;
 
                         // Per-op recompute trigger (MoE fix): mirrors the
@@ -2913,8 +2829,9 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                                 << " id=" << op.op_id << ": " << e.what();
                             throw std::runtime_error(oss.str());
                         }
-                        // LM-head post-dispatch cleanup: free the d_logits payload
-                        // after the first matmul_backward (see line ~2372 comment).
+                        // Profile-controlled memory cleanup: after the first
+                        // backward matmul consumes the output payload, release
+                        // it so the remaining backward pass can reuse memory.
                         if (op.type == CompiledOpType::MatmulBackward && i == 1) {
                             mRunState.temp_free(mRunState.non_block_activations().output);
                             mTemps.clear();
@@ -2967,7 +2884,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     for (std::size_t idx = 0; !bwd_stream_driven && idx < graph.ops.size(); ++idx) {
         const auto& op = graph.ops[idx];
         const int op_layer_any = op_layer_idx_any(op);
-        if (skip_logits_grad && is_logits_grad_op(op)) {
+        if (skip_profile_backward_tensors && is_skipped_backward_op(op)) {
             continue;
         }
 
@@ -3172,9 +3089,8 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 log_live_refs("outputs", op.outputs);
             }
 
-            // Post-dispatch side effect: after the first matmul_backward
-            // (LM-head backward) free the output tensor to reclaim the
-            // ~1.2 GB of stack memory its d_logits payload occupies.
+            // Post-dispatch side effect: after the first backward matmul frees
+            // the profile-bound output payload, reclaim its stack memory.
             // This depends on local backward-loop state
             // (initial_checkpoint, mTemps) and cannot live inside the
             // dispatch function, so we key it off op.type here.
@@ -3337,9 +3253,10 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     }
 
     if (mWeightManager && (mWeightManager->is_streaming_enabled() || mWeightManager->is_offload_enabled())) {
-        mWeightManager->release_final_norm(mRunState.MainStream);
-        if (mOptions.LMHeadChunks <= 1) {
-            mWeightManager->release_lm_head(mRunState.MainStream);
+        if (mExecutionRequest) {
+            for (const auto& group : mExecutionRequest->release_after_backward_weight_groups) {
+                mWeightManager->release_non_block_group(group, mRunState.MainStream);
+            }
         }
     }
 

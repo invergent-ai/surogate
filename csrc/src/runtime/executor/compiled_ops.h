@@ -25,6 +25,7 @@
 
 #include "runtime/dsl/forward_plan.h"
 #include "runtime/dsl/hook_registry.h"
+#include "runtime/executor/execution_request.h"
 #include "runtime/ep/ep_state.h"
 #include "runtime/executor/graph_executor_internal.h"
 #include "runtime/dsl/ir.h"
@@ -102,8 +103,7 @@ public:
                               const modules::ForwardHook* hook);
 
     // Execute a compiled backward graph
-    // When skip_zeroing is true, gradient buffers are assumed to already be zeroed by the caller
-    // (e.g., GraphExecutor::backward_with_hook zeros them before calling execute_backward).
+    // When skip_zeroing is true, gradient buffers are assumed to already be zeroed by the caller.
     void execute_backward(const CompiledGraph& graph,
                           NCCLCommunicator& comm,
                           int grad_accum_steps,
@@ -121,27 +121,16 @@ public:
     void set_recipe(const recipes::Recipe* recipe);
     void set_hook_context(void* context);
     void set_schema_hook_registry(const HookRegistry* registry);
-    /// Set the GPU buffer that receives per-token log P(target|context) values.
-    /// When non-null, dispatch_fused_lm_head_loss writes log-probs and returns early
-    /// (no loss accumulation, no gradient state update).
-    void set_logprobs_context(float* logprobs_gpu) {
-        mLogprobsGpu = logprobs_gpu;
-    }
 
-    /// Set per-token inverse temperatures (1 / T) for logprob/CE computation.
-    /// When non-null, logits are scaled by inv_temperature before logsoftmax,
-    /// and gradients are chained through the scaling in backward.
-    void set_inv_temperature_context(const float* inv_temperature_gpu) {
-        mInvTemperatureGpu = inv_temperature_gpu;
-    }
-
-    /// Set the GPU buffer containing per-token custom d_loss values for GRPO backward.
-    /// When non-null, dispatch_fused_lm_head_loss_backward copies these values into
-    /// d_loss instead of seeding with 1.0 (standard cross-entropy training).
-    /// Buffer must contain B*T float32 values (same layout as the loss tensor).
-    /// Lifetime must extend through the execute_backward call.
-    void set_custom_dloss_context(float* custom_dloss_gpu) {
-        mCustomDLossGpu = custom_dloss_gpu;
+    /// Set profile-provided, task-scoped execution context. The compiled op
+    /// layer owns interpretation because these pointers are consumed by
+    /// task-specific ops; graph_executor only forwards the request boundary.
+    void set_execution_request_context(const ExecutionRequest* request) {
+        mExecutionRequest = request;
+        mLogprobsGpu = request ? request->logprobs_gpu : nullptr;
+        mInvTemperatureGpu = request ? request->inv_temperature_gpu : nullptr;
+        mCustomDLossGpu = request ? request->custom_dloss_gpu : nullptr;
+        mSkippedBackwardTensors = request ? &request->skipped_backward_tensors : nullptr;
     }
 
     /// Set document masking context for Flash Attention varlen dispatch.
@@ -194,6 +183,9 @@ public:
                        std::unordered_map<std::string, FP4WeightCacheEntry>* cache_t);
     void set_saved_tensors(std::unordered_map<std::string, Tensor>* saved);
     void set_save_list(const std::vector<std::string>* save_list);
+    void set_runtime_bindings(const std::vector<RuntimeBinding>* bindings) {
+        mRuntimeBindings = bindings;
+    }
 
     /// Bind phase-tree arenas. When set and arenas are allocated,
     /// persist_saved_layer_tensors writes SaveForBwd tids directly into the
@@ -556,6 +548,8 @@ private:
     // Custom per-token d_loss for GRPO backward (null = standard d_loss=1 seeding)
     float* mCustomDLossGpu = nullptr;
     const float* mInvTemperatureGpu = nullptr;
+    const ExecutionRequest* mExecutionRequest = nullptr;
+    const std::vector<std::string>* mSkippedBackwardTensors = nullptr;
 
     // Document masking context for Flash Attention varlen (null = disabled)
     const std::int32_t* mCuSeqlensGpu = nullptr;
@@ -592,7 +586,8 @@ private:
     std::unordered_map<std::string, FP4WeightCacheEntry>* mFP4CacheT = nullptr;
     std::unordered_map<std::string, Tensor>* mSaved = nullptr;
     const std::vector<std::string>* mSaveList = nullptr;  // Tensors to preserve for backward
-    dsl::PhaseArenas* mPhaseArenas = nullptr;             // Non-owning; set via set_phase_arenas
+    const std::vector<RuntimeBinding>* mRuntimeBindings = nullptr;
+    dsl::PhaseArenas* mPhaseArenas = nullptr;  // Non-owning; set via set_phase_arenas
     // Per-step bump cursor into the bwd_cross_layer arena. Reset at the
     // start of each backward call; advanced by allocate_bwd_cross_layer.
     std::size_t mBwdCrossLayerBumpOffset = 0;

@@ -8,8 +8,10 @@
 #include "runtime/dsl/dsl_model_internal.h"
 #include "runtime/dsl/dsl_runtime.h"
 #include "runtime/dsl/graph_compiler.h"
+#include "runtime/executor/causal_lm_execution_profile.h"
 #include "runtime/executor/graph_executor.h"
 #include "runtime/executor/graph_executor_helpers.h"
+#include "runtime/executor/graph_executor_utils.h"
 
 #include <algorithm>
 #include <cctype>
@@ -34,69 +36,9 @@
 
 namespace dsl {
 
-// ============================================================================
-// Document masking: detect document boundaries from position_ids resets
-// ============================================================================
-
-struct DocMaskingInfo {
-    std::vector<std::int32_t> cu_seqlens;  // (num_docs + 1,) cumulative offsets
-    int num_docs;
-    int max_seqlen;
-    int total_q;
-};
-
-/// Scan position_ids for non-consecutive transitions to detect document
-/// boundaries in packed sequences. Returns nullopt if no boundaries found (i.e.
-/// single contiguous sequence per batch element — standard SFT/PT).
-///
-/// When \p mrope is true the position_ids come from a multimodal RoPE model
-/// (e.g. Qwen3-VL / Qwen3.5-VL).  In that case image/video tokens share the
-/// same temporal position (the value stays constant across visual tokens within
-/// one image), so `curr - prev != 1` would create hundreds of false document
-/// boundaries.  We detect boundaries only by strict *decreases* in position
-/// (resets), which correctly identifies sample-packing boundaries while
-/// ignoring the flat temporal positions inside image regions.
-static std::optional<DocMaskingInfo>
-compute_doc_masking(const std::int32_t* position_ids, int B, int T, bool mrope = false) {
-    if (!position_ids) return std::nullopt;
-
-    std::vector<std::int32_t> cu_seqlens;
-    cu_seqlens.push_back(0);
-    int max_seqlen = 0;
-    bool has_boundaries = false;
-
-    for (int b = 0; b < B; ++b) {
-        int doc_start = b * T;
-        for (int t = 1; t < T; ++t) {
-            int idx = b * T + t;
-            const int prev = position_ids[idx - 1];
-            const int curr = position_ids[idx];
-            const bool is_boundary = mrope ? (curr < prev) : (curr - prev != 1);
-            if (is_boundary) {
-                // Document boundary: position_ids are not strictly consecutive.
-                // Mirrors HF packed-sequence detection (diff != 1).
-                int doc_len = (b * T + t) - doc_start;
-                if (doc_len > 0) {
-                    cu_seqlens.push_back(cu_seqlens.back() + doc_len);
-                    max_seqlen = std::max(max_seqlen, doc_len);
-                }
-                doc_start = b * T + t;
-                has_boundaries = true;
-            }
-        }
-        // Last document in this batch element
-        int last_len = (b + 1) * T - doc_start;
-        if (last_len > 0) {
-            cu_seqlens.push_back(cu_seqlens.back() + last_len);
-            max_seqlen = std::max(max_seqlen, last_len);
-        }
-    }
-
-    if (!has_boundaries) return std::nullopt;
-
-    int num_docs = static_cast<int>(cu_seqlens.size()) - 1;
-    int total_q = cu_seqlens.back();
-    return DocMaskingInfo{std::move(cu_seqlens), num_docs, max_seqlen, total_q};
+static const CausalLMExecutionProfile& causal_lm_profile() {
+    static const CausalLMExecutionProfile profile;
+    return profile;
 }
 
 void DslModel::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm, int micro_step) {
@@ -104,31 +46,13 @@ void DslModel::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& com
         throw std::logic_error("DslModel::forward called before allocate_run_state()");
     }
 
-    // Detect document boundaries for packed sequence masking.
-    // Position_ids with per-document resets (e.g. [0,1,2, 0,1, 0,1,2,3])
-    // trigger Flash Attention varlen with cu_seqlens instead of cuDNN full-attention.
-    mDocMaskingActive = false;
-    if (mOptions.DocMasking && position_ids.Data && position_ids.Device == -1) {
-        const auto* pos_ptr = reinterpret_cast<const std::int32_t*>(position_ids.Data);
-        const int B = static_cast<int>(inputs.Sizes[0]);
-        const int T = static_cast<int>(inputs.Sizes[1]);
-        const bool mrope = mModelConfig.Rope.is_multimodal();
-        auto doc_info = compute_doc_masking(pos_ptr, B, T, mrope);
-        if (doc_info) {
-            mExecutor->set_doc_masking(doc_info->cu_seqlens.data(),
-                                       doc_info->num_docs,
-                                       doc_info->max_seqlen,
-                                       doc_info->total_q,
-                                       micro_step);
-            mDocMaskingActive = true;
-        }
-    }
-    if (mOptions.DocMasking && !mDocMaskingActive) {
-        mExecutor->clear_doc_masking();
-    }
+    mDocMaskingActive =
+        causal_lm_profile().apply_doc_masking(*mExecutor, mOptions, mModelConfig, inputs, position_ids, micro_step);
 
     if (!lora_enabled()) {
-        mExecutor->forward(inputs, position_ids, comm, micro_step);
+        auto request = causal_lm_profile()
+                           .make_forward_request(*mRunState, mModelConfig, mOptions, inputs, position_ids, micro_step);
+        mExecutor->execute_forward(request, comm);
         return;
     }
 
@@ -141,7 +65,9 @@ void DslModel::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& com
     mLoRARunState->micro_step = micro_step;
     mLoRARunState->is_training = true;
 
-    mExecutor->forward(inputs, position_ids, comm, micro_step);
+    auto request =
+        causal_lm_profile().make_forward_request(*mRunState, mModelConfig, mOptions, inputs, position_ids, micro_step);
+    mExecutor->execute_forward(request, comm);
 }
 
 float DslModel::validate(Tensor inputs, Tensor position_ids, Tensor targets, NCCLCommunicator& comm, int micro_step) {
@@ -149,30 +75,15 @@ float DslModel::validate(Tensor inputs, Tensor position_ids, Tensor targets, NCC
         throw std::logic_error("DslModel::validate called before allocate_run_state()");
     }
 
-    // Packed-sequence validation must mirror forward() so debug/compare tools
-    // see the same document-level attention masking as training.
-    mDocMaskingActive = false;
-    if (mOptions.DocMasking && position_ids.Data && position_ids.Device == -1) {
-        const auto* pos_ptr = reinterpret_cast<const std::int32_t*>(position_ids.Data);
-        const int B = static_cast<int>(inputs.Sizes[0]);
-        const int T = static_cast<int>(inputs.Sizes[1]);
-        const bool mrope = mModelConfig.Rope.is_multimodal();
-        auto doc_info = compute_doc_masking(pos_ptr, B, T, mrope);
-        if (doc_info) {
-            mExecutor->set_doc_masking(doc_info->cu_seqlens.data(),
-                                       doc_info->num_docs,
-                                       doc_info->max_seqlen,
-                                       doc_info->total_q,
-                                       micro_step);
-            mDocMaskingActive = true;
-        }
-    }
-    if (mOptions.DocMasking && !mDocMaskingActive) {
-        mExecutor->clear_doc_masking();
-    }
+    mDocMaskingActive =
+        causal_lm_profile().apply_doc_masking(*mExecutor, mOptions, mModelConfig, inputs, position_ids, micro_step);
 
     if (!lora_enabled()) {
-        const float loss = mExecutor->validate(inputs, position_ids, targets, comm, micro_step);
+        auto request =
+            causal_lm_profile()
+                .make_eval_request(*mRunState, mModelConfig, mOptions, inputs, position_ids, targets, micro_step);
+        const auto result = mExecutor->execute_eval(request, comm);
+        const float loss = result.loss.value_or(0.0f);
         if (mDocMaskingActive) {
             mExecutor->clear_doc_masking();
             mDocMaskingActive = false;
@@ -186,7 +97,11 @@ float DslModel::validate(Tensor inputs, Tensor position_ids, Tensor targets, NCC
     mLoRARunState->is_training = false;
     mLoRARunState->micro_step = micro_step;
 
-    const float loss = mExecutor->validate(inputs, position_ids, targets, comm, micro_step);
+    auto request =
+        causal_lm_profile()
+            .make_eval_request(*mRunState, mModelConfig, mOptions, inputs, position_ids, targets, micro_step);
+    const auto result = mExecutor->execute_eval(request, comm);
+    const float loss = result.loss.value_or(0.0f);
     if (mDocMaskingActive) {
         mExecutor->clear_doc_masking();
         mDocMaskingActive = false;
@@ -201,7 +116,14 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
     mUseTokenScale = true;
 
     if (!lora_enabled()) {
-        mExecutor->backward(inputs, targets, comm, grad_accum_steps, micro_step);
+        auto request = causal_lm_profile().make_backward_request(*mRunState,
+                                                                 mModelConfig,
+                                                                 mOptions,
+                                                                 inputs,
+                                                                 targets,
+                                                                 grad_accum_steps,
+                                                                 micro_step);
+        mExecutor->execute_backward(request, comm);
         if (mDocMaskingActive) {
             mExecutor->clear_doc_masking();
             mDocMaskingActive = false;
@@ -216,7 +138,10 @@ void DslModel::backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, i
 
     mLoRAGrads->start_micro_step(main_stream, micro_step, grad_accum_steps);
 
-    mExecutor->backward(inputs, targets, comm, grad_accum_steps, micro_step);
+    auto request =
+        causal_lm_profile()
+            .make_backward_request(*mRunState, mModelConfig, mOptions, inputs, targets, grad_accum_steps, micro_step);
+    mExecutor->execute_backward(request, comm);
 
     if (mDocMaskingActive) {
         mExecutor->clear_doc_masking();
@@ -407,6 +332,7 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
     GraphExecutorOptions exec_opts;
     exec_opts.auto_backward = true;
     exec_opts.debug_print_backward = false;
+    exec_opts.excluded_save_tensors = causal_lm_profile().backward_save_exclusions();
     mExecutor =
         std::make_unique<GraphExecutor>(*mModule, *mRunState, *mParams, *mGrads, mModelConfig, mOptions, exec_opts);
     if (auto* graph_exec = dynamic_cast<GraphExecutor*>(mExecutor.get())) {
@@ -545,11 +471,6 @@ std::vector<float> DslModel::compute_logprobs(const std::int32_t* input_ids,
         throw std::logic_error("DslModel::compute_logprobs called before allocate_run_state()");
     }
 
-    auto* graph_exec = dynamic_cast<GraphExecutor*>(mExecutor.get());
-    if (!graph_exec) {
-        throw std::runtime_error("DslModel::compute_logprobs: executor is not a GraphExecutor");
-    }
-
     const int BT = B * T;
     std::vector<float> result(static_cast<std::size_t>(BT), 0.0f);
 
@@ -559,33 +480,74 @@ std::vector<float> DslModel::compute_logprobs(const std::int32_t* input_ids,
         mLoRARunState->is_training = false;
     }
 
-    // Detect document boundaries and enable flash varlen masking if needed.
-    const bool mrope = mModelConfig.Rope.is_multimodal();
-    std::optional<DocMaskingInfo> doc_info;
-    if (mOptions.DocMasking) {
-        doc_info = compute_doc_masking(position_ids, B, T, mrope);
+    auto& rs = *mRunState;
+    const std::size_t token_count = static_cast<std::size_t>(BT);
+    const std::size_t token_bytes = token_count * sizeof(std::int32_t);
+    Tensor input_tensor = Tensor::from_pointer(reinterpret_cast<std::byte*>(const_cast<std::int32_t*>(input_ids)),
+                                               -1,
+                                               ETensorDType::INT32,
+                                               std::vector<long>{B, T});
+    Tensor target_tensor = Tensor::from_pointer(reinterpret_cast<std::byte*>(const_cast<std::int32_t*>(targets)),
+                                                -1,
+                                                ETensorDType::INT32,
+                                                std::vector<long>{B, T});
+
+    std::vector<std::int32_t> default_positions;
+    const std::int32_t* position_source = position_ids;
+    if (!position_source) {
+        default_positions.resize(token_count);
+        for (int b = 0; b < B; ++b) {
+            for (int t = 0; t < T; ++t) {
+                default_positions[static_cast<std::size_t>(b * T + t)] = t;
+            }
+        }
+        position_source = default_positions.data();
     }
-    if (doc_info) {
-        graph_exec->set_doc_masking(doc_info->cu_seqlens.data(),
-                                    doc_info->num_docs,
-                                    doc_info->max_seqlen,
-                                    doc_info->total_q);
-    } else if (mOptions.DocMasking) {
-        graph_exec->clear_doc_masking();
+    Tensor position_tensor =
+        Tensor::from_pointer(reinterpret_cast<std::byte*>(const_cast<std::int32_t*>(position_source)),
+                             -1,
+                             ETensorDType::INT32,
+                             std::vector<long>{B, T});
+    const bool doc_masking_active =
+        causal_lm_profile().apply_doc_masking(*mExecutor, mOptions, mModelConfig, input_tensor, position_tensor);
+
+    float* logprobs_gpu = nullptr;
+    CUDA_CHECK(cudaMalloc(&logprobs_gpu, token_count * sizeof(float)));
+    CUDA_CHECK(cudaMemsetAsync(logprobs_gpu, 0, token_count * sizeof(float), rs.MainStream));
+
+    float* inv_temperature_gpu = nullptr;
+    if (temperatures) {
+        std::vector<float> inv_temp(token_count);
+        for (std::size_t i = 0; i < token_count; ++i) {
+            inv_temp[i] = 1.0f / temperatures[i];
+        }
+        CUDA_CHECK(cudaMalloc(&inv_temperature_gpu, token_count * sizeof(float)));
+        CUDA_CHECK(cudaMemcpyAsync(inv_temperature_gpu,
+                                   inv_temp.data(),
+                                   token_count * sizeof(float),
+                                   cudaMemcpyHostToDevice,
+                                   rs.MainStream));
     }
 
-    graph_exec->execute_logprobs_forward((long)B,
-                                         (long)T,
-                                         input_ids,
-                                         targets,
-                                         result.data(),
-                                         hook_ptr,
-                                         comm,
-                                         position_ids,
-                                         temperatures);
+    auto request = causal_lm_profile()
+                       .make_eval_request(rs, mModelConfig, mOptions, input_tensor, position_tensor, target_tensor, 0);
+    request.mode = ExecutionMode::Forward;
+    request.reduce_loss_on_completion = false;
+    request.disable_forward_saves = true;
+    request.logprobs_gpu = logprobs_gpu;
+    request.inv_temperature_gpu = inv_temperature_gpu;
+    request.forward_hook = hook_ptr;
+    mExecutor->execute_forward(request, comm);
 
-    if (doc_info) {
-        graph_exec->clear_doc_masking();
+    CUDA_CHECK(cudaMemcpyAsync(result.data(), logprobs_gpu, token_bytes, cudaMemcpyDeviceToHost, rs.MainStream));
+    CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
+    CUDA_CHECK(cudaFree(logprobs_gpu));
+    if (inv_temperature_gpu) {
+        CUDA_CHECK(cudaFree(inv_temperature_gpu));
+    }
+
+    if (doc_masking_active) {
+        mExecutor->clear_doc_masking();
     }
 
     return result;
@@ -604,30 +566,10 @@ void DslModel::step_with_custom_loss(Tensor inputs,
     }
     mUseTokenScale = false;
 
-    auto* graph_exec = dynamic_cast<GraphExecutor*>(mExecutor.get());
-    if (!graph_exec) {
-        throw std::runtime_error("DslModel::step_with_custom_loss: executor is not a GraphExecutor");
-    }
-
-    // Detect document boundaries and enable flash varlen masking if needed.
     const int B_val = static_cast<int>(inputs.Sizes[0]);
     const int T_val = static_cast<int>(inputs.Sizes[1]);
-    const std::int32_t* position_ids_ptr = (position_ids.Data && position_ids.Device == -1)
-                                               ? reinterpret_cast<const std::int32_t*>(position_ids.Data)
-                                               : nullptr;
-    const bool mrope = mModelConfig.Rope.is_multimodal();
-    std::optional<DocMaskingInfo> doc_info;
-    if (mOptions.DocMasking) {
-        doc_info = compute_doc_masking(position_ids_ptr, B_val, T_val, mrope);
-    }
-    if (doc_info) {
-        graph_exec->set_doc_masking(doc_info->cu_seqlens.data(),
-                                    doc_info->num_docs,
-                                    doc_info->max_seqlen,
-                                    doc_info->total_q);
-    } else if (mOptions.DocMasking) {
-        graph_exec->clear_doc_masking();
-    }
+    const bool doc_masking_active =
+        causal_lm_profile().apply_doc_masking(*mExecutor, mOptions, mModelConfig, inputs, position_ids, micro_step);
 
     auto& rs = *mRunState;
     cudaStream_t main_stream = rs.MainStream;
@@ -644,25 +586,44 @@ void DslModel::step_with_custom_loss(Tensor inputs,
                                    bt * sizeof(float),
                                    cudaMemcpyHostToDevice,
                                    main_stream));
-        graph_exec->set_inv_temperature_context(inv_temperature_gpu);
     }
 
-    // Forward pass (with LoRA hooks if enabled) — saves activations for backward.
-    forward(inputs, position_ids, comm, micro_step);
+    if (lora_enabled()) {
+        ensure_lora_run_state(comm, B_val, T_val);
+        if (qlora_enabled() && micro_step == 0 && mQLoRAProvider) {
+            mQLoRAProvider->invalidate_cache();
+        }
+        mLoRARunState->micro_step = micro_step;
+        mLoRARunState->is_training = true;
+    }
+
+    auto forward_request =
+        causal_lm_profile().make_eval_request(rs, mModelConfig, mOptions, inputs, position_ids, targets, micro_step);
+    forward_request.mode = ExecutionMode::Forward;
+    forward_request.reduce_loss_on_completion = false;
+    forward_request.inv_temperature_gpu = inv_temperature_gpu;
+    mExecutor->execute_forward(forward_request, comm);
+
+    const std::size_t bt = static_cast<std::size_t>(B_val) * static_cast<std::size_t>(T_val);
+    float* custom_dloss_gpu = nullptr;
+    CUDA_CHECK(cudaMalloc(&custom_dloss_gpu, bt * sizeof(float)));
+    CUDA_CHECK(cudaMemcpyAsync(custom_dloss_gpu,
+                               per_token_grads_cpu,
+                               bt * sizeof(float),
+                               cudaMemcpyHostToDevice,
+                               main_stream));
 
     if (!lora_enabled()) {
-        // No LoRA: plain backward with custom d_loss.
-        graph_exec->backward_with_custom_dloss(inputs,
-                                               targets,
-                                               per_token_grads_cpu,
-                                               comm,
-                                               grad_accum_steps,
-                                               micro_step,
-                                               nullptr,
-                                               nullptr);
-        if (doc_info) graph_exec->clear_doc_masking();
+        auto backward_request =
+            causal_lm_profile()
+                .make_backward_request(rs, mModelConfig, mOptions, inputs, targets, grad_accum_steps, micro_step);
+        backward_request.custom_dloss_gpu = custom_dloss_gpu;
+        backward_request.inv_temperature_gpu = inv_temperature_gpu;
+        mExecutor->execute_backward(backward_request, comm);
+        CUDA_CHECK(cudaStreamSynchronize(main_stream));
+        CUDA_CHECK(cudaFree(custom_dloss_gpu));
+        if (doc_masking_active) mExecutor->clear_doc_masking();
         if (inv_temperature_gpu) {
-            graph_exec->set_inv_temperature_context(nullptr);
             CUDA_CHECK(cudaFree(inv_temperature_gpu));
         }
         return;
@@ -673,18 +634,17 @@ void DslModel::step_with_custom_loss(Tensor inputs,
 
     mLoRAGrads->start_micro_step(main_stream, micro_step, grad_accum_steps);
 
-    graph_exec->backward_with_custom_dloss(inputs,
-                                           targets,
-                                           per_token_grads_cpu,
-                                           comm,
-                                           grad_accum_steps,
-                                           micro_step,
-                                           nullptr,
-                                           nullptr);
+    auto backward_request =
+        causal_lm_profile()
+            .make_backward_request(rs, mModelConfig, mOptions, inputs, targets, grad_accum_steps, micro_step);
+    backward_request.custom_dloss_gpu = custom_dloss_gpu;
+    backward_request.inv_temperature_gpu = inv_temperature_gpu;
+    mExecutor->execute_backward(backward_request, comm);
+    CUDA_CHECK(cudaStreamSynchronize(main_stream));
+    CUDA_CHECK(cudaFree(custom_dloss_gpu));
 
-    if (doc_info) graph_exec->clear_doc_masking();
+    if (doc_masking_active) mExecutor->clear_doc_masking();
     if (inv_temperature_gpu) {
-        graph_exec->set_inv_temperature_context(nullptr);
         CUDA_CHECK(cudaFree(inv_temperature_gpu));
     }
 
@@ -709,31 +669,11 @@ std::vector<float> DslModel::forward_for_grpo(Tensor inputs,
     }
     mUseTokenScale = false;
 
-    auto* graph_exec = dynamic_cast<GraphExecutor*>(mExecutor.get());
-    if (!graph_exec) {
-        throw std::runtime_error("DslModel::forward_for_grpo: executor is not a GraphExecutor");
-    }
-
-    // Detect document boundaries and enable flash varlen masking if needed.
     const int B_val = static_cast<int>(inputs.Sizes[0]);
     const int T_val = static_cast<int>(inputs.Sizes[1]);
     const std::size_t BT = static_cast<std::size_t>(B_val) * static_cast<std::size_t>(T_val);
-    const std::int32_t* position_ids_ptr = (position_ids.Data && position_ids.Device == -1)
-                                               ? reinterpret_cast<const std::int32_t*>(position_ids.Data)
-                                               : nullptr;
-    const bool mrope = mModelConfig.Rope.is_multimodal();
-    std::optional<DocMaskingInfo> doc_info;
-    if (mOptions.DocMasking) {
-        doc_info = compute_doc_masking(position_ids_ptr, B_val, T_val, mrope);
-    }
-    if (doc_info) {
-        graph_exec->set_doc_masking(doc_info->cu_seqlens.data(),
-                                    doc_info->num_docs,
-                                    doc_info->max_seqlen,
-                                    doc_info->total_q);
-    } else if (mOptions.DocMasking) {
-        graph_exec->clear_doc_masking();
-    }
+    mDocMaskingActive =
+        causal_lm_profile().apply_doc_masking(*mExecutor, mOptions, mModelConfig, inputs, position_ids, micro_step);
 
     auto& rs = *mRunState;
     cudaStream_t main_stream = rs.MainStream;
@@ -754,7 +694,6 @@ std::vector<float> DslModel::forward_for_grpo(Tensor inputs,
                                    BT * sizeof(float),
                                    cudaMemcpyHostToDevice,
                                    main_stream));
-        graph_exec->set_inv_temperature_context(mGrpoInvTemperatureGpu);
     }
 
     // Always zero the losses buffer so we get per-micro-batch losses
@@ -763,8 +702,21 @@ std::vector<float> DslModel::forward_for_grpo(Tensor inputs,
     fill_zero(rs.ValidTokenCount, main_stream);
     fill_zero(rs.CorrectCount, main_stream);
 
-    // Forward pass (with LoRA hooks if enabled) — saves activations for backward.
-    forward(inputs, position_ids, comm, micro_step);
+    if (lora_enabled()) {
+        ensure_lora_run_state(comm, B_val, T_val);
+        if (qlora_enabled() && micro_step == 0 && mQLoRAProvider) {
+            mQLoRAProvider->invalidate_cache();
+        }
+        mLoRARunState->micro_step = micro_step;
+        mLoRARunState->is_training = true;
+    }
+
+    auto request =
+        causal_lm_profile().make_eval_request(rs, mModelConfig, mOptions, inputs, position_ids, targets, micro_step);
+    request.mode = ExecutionMode::Forward;
+    request.reduce_loss_on_completion = false;
+    request.inv_temperature_gpu = mGrpoInvTemperatureGpu;
+    mExecutor->execute_forward(request, comm);
 
     // Extract logprobs from the Losses buffer.
     // cross_entropy_forward writes: losses[t] = logsumexp - logit[target[t]] = -logprob[t].
@@ -795,51 +747,53 @@ void DslModel::backward_grpo(Tensor inputs,
         throw std::logic_error("DslModel::backward_grpo called before allocate_run_state()");
     }
 
-    auto* graph_exec = dynamic_cast<GraphExecutor*>(mExecutor.get());
-    if (!graph_exec) {
-        throw std::runtime_error("DslModel::backward_grpo: executor is not a GraphExecutor");
-    }
-
     auto& rs = *mRunState;
     cudaStream_t main_stream = rs.MainStream;
+    const int B_val = static_cast<int>(inputs.Sizes[0]);
+    const int T_val = static_cast<int>(inputs.Sizes[1]);
+    const std::size_t bt = static_cast<std::size_t>(B_val) * static_cast<std::size_t>(T_val);
+
+    float* custom_dloss_gpu = nullptr;
+    CUDA_CHECK(cudaMalloc(&custom_dloss_gpu, bt * sizeof(float)));
+    CUDA_CHECK(cudaMemcpyAsync(custom_dloss_gpu,
+                               per_token_grads_cpu,
+                               bt * sizeof(float),
+                               cudaMemcpyHostToDevice,
+                               main_stream));
 
     if (!lora_enabled()) {
-        // No LoRA: plain backward with custom d_loss.
-        // Temperature context is already set from forward_for_grpo (pass nullptr to skip re-allocation).
-        graph_exec->backward_with_custom_dloss(inputs,
-                                               targets,
-                                               per_token_grads_cpu,
-                                               comm,
-                                               grad_accum_steps,
-                                               micro_step,
-                                               nullptr,
-                                               nullptr);
+        auto request =
+            causal_lm_profile()
+                .make_backward_request(rs, mModelConfig, mOptions, inputs, targets, grad_accum_steps, micro_step);
+        request.custom_dloss_gpu = custom_dloss_gpu;
+        request.inv_temperature_gpu = mGrpoInvTemperatureGpu;
+        mExecutor->execute_backward(request, comm);
     } else {
         // LoRA backward: mirror step_with_custom_loss LoRA backward path exactly.
         ensure_lora_run_state(comm, (int)inputs.Sizes[0], (int)inputs.Sizes[1]);
 
         mLoRAGrads->start_micro_step(main_stream, micro_step, grad_accum_steps);
 
-        graph_exec->backward_with_custom_dloss(inputs,
-                                               targets,
-                                               per_token_grads_cpu,
-                                               comm,
-                                               grad_accum_steps,
-                                               micro_step,
-                                               nullptr,
-                                               nullptr);
+        auto request =
+            causal_lm_profile()
+                .make_backward_request(rs, mModelConfig, mOptions, inputs, targets, grad_accum_steps, micro_step);
+        request.custom_dloss_gpu = custom_dloss_gpu;
+        request.inv_temperature_gpu = mGrpoInvTemperatureGpu;
+        mExecutor->execute_backward(request, comm);
 
         mLoRAGrads->end_micro_step(main_stream, comm);
         internal::record_event_if_not_capturing(rs.BackwardDone, main_stream);
     }
 
+    CUDA_CHECK(cudaStreamSynchronize(main_stream));
+    CUDA_CHECK(cudaFree(custom_dloss_gpu));
+
     // Clean up state that was set by forward_for_grpo.
     if (mDocMaskingActive) {
-        graph_exec->clear_doc_masking();
+        mExecutor->clear_doc_masking();
         mDocMaskingActive = false;
     }
     if (mGrpoInvTemperatureGpu) {
-        graph_exec->set_inv_temperature_context(nullptr);
         CUDA_CHECK(cudaFree(mGrpoInvTemperatureGpu));
         mGrpoInvTemperatureGpu = nullptr;
     }

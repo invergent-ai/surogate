@@ -10,6 +10,7 @@
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 #include <nlohmann/json.hpp>
 
 #include "runtime/dsl/autodiff.h"
@@ -17,6 +18,9 @@
 #include "runtime/dsl/graph_compiler.h"
 #include "runtime/dsl/hook_registry.h"
 #include "runtime/dsl/ir.h"
+#include "runtime/executor/causal_lm_execution_profile.h"
+#include "runtime/executor/embedding_execution_profile.h"
+#include "runtime/executor/execution_request.h"
 #include "runtime/executor/graph_executor_utils.h"
 
 TEST_CASE("DSL IR loader parses module and resolves shapes") {
@@ -104,6 +108,7 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     }
   ]
 }
+
 )JSON";
 
     nlohmann::json root = nlohmann::json::parse(kJson);
@@ -775,6 +780,56 @@ TEST_CASE("DSL IR loader parses module and resolves shapes") {
     REQUIRE(comm_payload.after_all_to_all_observed);
 
     REQUIRE_THROWS_AS(hook_registry.on_after_produce({"", "qkv"}, "broken"), std::invalid_argument);
+}
+
+TEST_CASE("execution request rejects duplicate runtime bindings") {
+    int data = 0;
+    Tensor t = Tensor::from_pointer(reinterpret_cast<std::byte*>(&data), -1, ETensorDType::INT32, std::vector<long>{1});
+
+    dsl::ExecutionRequest request;
+    request.batch = 1;
+    request.sequence = 1;
+    request.mode = dsl::ExecutionMode::Forward;
+    request.bindings.push_back(dsl::RuntimeBinding{"input_ids", t});
+    request.bindings.push_back(dsl::RuntimeBinding{"input_ids", t});
+
+    REQUIRE_THROWS_WITH(dsl::validate_execution_request(request),
+                        Catch::Matchers::ContainsSubstring("duplicate runtime binding 'input_ids'"));
+}
+
+TEST_CASE("causal LM profile detects packed document masks") {
+    const std::int32_t position_ids[5] = {0, 1, 0, 1, 2};
+    dsl::CausalLMExecutionProfile profile;
+    auto info = profile.compute_doc_masking(position_ids, /*B=*/1, /*T=*/5);
+
+    REQUIRE(info.has_value());
+    REQUIRE(info->num_docs == 2);
+    REQUIRE(info->max_seqlen == 3);
+    REQUIRE(info->total_q == 5);
+    REQUIRE(info->cu_seqlens == std::vector<std::int32_t>{0, 2, 5});
+
+    const std::int32_t contiguous_position_ids[4] = {0, 1, 2, 3};
+    REQUIRE_FALSE(profile.compute_doc_masking(contiguous_position_ids, /*B=*/1, /*T=*/4).has_value());
+}
+
+TEST_CASE("embedding profile builds non LM runtime bindings") {
+    int input_data[3] = {1, 2, 3};
+    Tensor inputs = Tensor::from_pointer(reinterpret_cast<std::byte*>(input_data),
+                                         -1,
+                                         ETensorDType::INT32,
+                                         std::vector<long>{1, 3});
+
+    dsl::EmbeddingExecutionProfile profile;
+    dsl::ExecutionRequest request = profile.forward_request(inputs, {"encoded"});
+
+    REQUIRE(request.batch == 1);
+    REQUIRE(request.sequence == 3);
+    REQUIRE(request.mode == dsl::ExecutionMode::Forward);
+    REQUIRE(request.find_binding("input_ids") != nullptr);
+    REQUIRE(request.find_binding("token_ids") == nullptr);
+    REQUIRE(request.requested_outputs.size() == 1);
+    REQUIRE(request.requested_outputs[0] == "encoded");
+    REQUIRE_NOTHROW(dsl::validate_execution_request(request));
 }
 
 TEST_CASE("Grouped MoE LoRA hook slots prefer structural activation slots") {

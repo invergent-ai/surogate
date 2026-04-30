@@ -306,6 +306,7 @@ target_sources(surogate-common PRIVATE
     src/runtime/dsl/dsl_debug.cpp
     src/runtime/dsl/buffer_plan.cpp
     src/runtime/dsl/dsl_weight_manager.cpp
+    src/runtime/executor/causal_lm_execution_profile.cpp
     src/runtime/executor/graph_executor.cpp
     src/runtime/executor/graph_executor_utils.cpp
     src/runtime/executor/graph_executor_tensors.cpp

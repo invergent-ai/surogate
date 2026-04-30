@@ -909,6 +909,30 @@ void DslWeightManager::release_lm_head(cudaStream_t stream) {
     mLmHeadStatus.is_ready = true;
 }
 
+void DslWeightManager::gather_non_block_group(std::string_view group, NCCLCommunicator& comm, cudaStream_t stream) {
+    if (group == "embeddings") {
+        gather_embeddings(comm, stream);
+    } else if (group == "final_norm") {
+        gather_final_norm(comm, stream);
+    } else if (group == "lm_head") {
+        gather_lm_head(comm, stream);
+    } else {
+        throw std::runtime_error("DslWeightManager: unknown non-block weight group '" + std::string(group) + "'");
+    }
+}
+
+void DslWeightManager::release_non_block_group(std::string_view group, cudaStream_t stream) {
+    if (group == "embeddings") {
+        release_embeddings(stream);
+    } else if (group == "final_norm") {
+        release_final_norm(stream);
+    } else if (group == "lm_head") {
+        release_lm_head(stream);
+    } else {
+        throw std::runtime_error("DslWeightManager: unknown non-block weight group '" + std::string(group) + "'");
+    }
+}
+
 void DslWeightManager::invalidate() {
     ++mVersion;
 }

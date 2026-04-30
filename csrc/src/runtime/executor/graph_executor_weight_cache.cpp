@@ -302,7 +302,10 @@ GraphExecutor::get_fp8_cached_weight_transposed(const std::string& name, Tensor&
     return &it->second.weight;
 }
 
-void GraphExecutor::prime_fp8_lm_head_cache(bool transposed) {
+void GraphExecutor::prime_fp8_non_block_weight_cache(const std::string& group, bool transposed) {
+    if (group != "lm_head") {
+        return;
+    }
     if (std::getenv("SUROGATE_DISABLE_FP8_LMHEAD") != nullptr) {
         return;
     }
@@ -470,6 +473,15 @@ void GraphExecutor::prime_fp4_weight_cache(const std::vector<char>& required) {
               << " | Skipped: " << skipped_fwd << " fwd + " << skipped_bwd << " bwd"
               << " | Failed: " << failed_fwd << " fwd + " << failed_bwd << " bwd"
               << " | Cache sizes: fwd=" << mFP4WeightCache.size() << " bwd=" << mFP4WeightCacheT.size() << std::endl;
+}
+
+void GraphExecutor::prime_profile_fp8_weight_caches(bool backward, bool transposed) {
+    if (!mActiveExecutionRequest) return;
+    const auto& groups = backward ? mActiveExecutionRequest->fp8_backward_cache_weight_groups
+                                  : mActiveExecutionRequest->fp8_forward_cache_weight_groups;
+    for (const auto& group : groups) {
+        prime_fp8_non_block_weight_cache(group, transposed);
+    }
 }
 
 const FP4WeightCacheEntry*
