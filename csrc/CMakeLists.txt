@@ -316,6 +316,8 @@ target_sources(surogate-common PRIVATE
     src/runtime/executor/compiled_ops_save.cpp
     src/runtime/executor/compiled_ops_tiled_mlp.cpp
     src/runtime/executor/compiled_ops_execute.cpp
+    src/runtime/executor/compiled_ops_execute_forward.cpp
+    src/runtime/executor/compiled_ops_execute_backward.cpp
     src/runtime/executor/op_registry.cpp
     src/runtime/executor/op_registrations.cpp
     src/runtime/dsl/graph_compiler.cpp

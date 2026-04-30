@@ -514,6 +514,37 @@ private:
     // Layer boundary handling
     void handle_layer_start(int layer_idx);
     void handle_layer_end(int layer_idx);
+    void bind_runtime_bindings();
+    [[nodiscard]] bool needs_non_block_weight_transfer() const;
+    void initialize_forward_execution(const CompiledGraph& graph, NCCLCommunicator& comm, bool full);
+    void gather_forward_non_block_weights(NCCLCommunicator& comm);
+    void prefetch_forward_layer_zero(NCCLCommunicator& comm);
+    void persist_forward_saved_layer_tensors(const CompiledGraph& graph,
+                                             int layer_idx,
+                                             bool fwd_stream_capturing,
+                                             bool forward_replay_active,
+                                             int& arena_persists,
+                                             int& cudaMalloc_persists);
+    void dump_forward_debug_tensors();
+    void snapshot_forward_execution_state();
+    void release_forward_non_block_weights();
+    void initialize_backward_execution(const CompiledGraph& graph, NCCLCommunicator& comm, int micro_step);
+    void restore_forward_snapshot_for_backward(const CompiledGraph& graph);
+    void bind_saved_tensors_for_backward();
+    void zero_backward_entry_gradients(bool skip_zeroing);
+    void gather_backward_non_block_weights(NCCLCommunicator& comm);
+    void prefetch_backward_last_layer(NCCLCommunicator& comm);
+    void bind_backward_entry_gradient_tensors();
+    void restore_moe_expert_offsets_for_backward();
+    void bind_param_gradient_tensors_for_backward();
+    void report_backward_op_profile(const std::unordered_map<std::string, double>& totals_by_op,
+                                    const std::unordered_map<std::string, std::size_t>& counts_by_op,
+                                    cudaEvent_t start_event,
+                                    cudaEvent_t end_event);
+    void cleanup_backward_replay_buffers();
+    void stabilize_backward_observable_outputs(const std::unordered_set<std::string>& output_names);
+    void clear_large_backward_stack_slots_after_replay();
+    void release_backward_non_block_weights();
 
     // State
     DslRunState& mRunState;
