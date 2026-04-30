@@ -1,0 +1,21 @@
+[project]
+name = "ruler-task"
+description = "Generic verifiers env for RULER training. Bring a dataset and a system prompt; RULER provides the reward."
+tags = ["ruler", "llm-as-judge", "rl", "train", "eval", "no-rubric"]
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "verifiers>=0.1.11",
+    "datasets>=2.14",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+include = ["ruler_task.py", "pyproject.toml", "README.md"]
+
+[tool.verifiers.eval]
+num_examples = 50
+rollouts_per_example = 4
