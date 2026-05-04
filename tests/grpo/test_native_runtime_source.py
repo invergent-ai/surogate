@@ -22,6 +22,7 @@ def _function_body(source: str, signature: str) -> str:
 def test_legacy_grpo_and_custom_loss_do_not_allocate_transient_gpu_buffers():
     source = DSL_EXECUTION.read_text()
     no_alloc_signatures = [
+        "std::vector<float> DslModel::compute_logprobs(",
         "void DslModel::step_with_custom_loss(",
         "std::vector<float> DslModel::forward_for_grpo(",
         "void DslModel::backward_grpo(",

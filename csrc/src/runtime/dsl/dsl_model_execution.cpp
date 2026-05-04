@@ -541,7 +541,12 @@ std::vector<float> DslModel::compute_logprobs(const std::int32_t* input_ids,
 
     auto& rs = *mRunState;
     const std::size_t token_count = static_cast<std::size_t>(BT);
-    const std::size_t token_bytes = token_count * sizeof(std::int32_t);
+    const std::size_t token_bytes = token_count * sizeof(float);
+    auto& scratch = rs.grpo_native_scratch();
+    if (token_count > static_cast<std::size_t>(scratch.max_tokens)) {
+        throw std::runtime_error("compute_logprobs inputs exceed allocated scratch capacity");
+    }
+    const int staging_slot = acquire_grpo_host_staging_slot(scratch);
     Tensor input_tensor = Tensor::from_pointer(reinterpret_cast<std::byte*>(const_cast<std::int32_t*>(input_ids)),
                                                -1,
                                                ETensorDType::INT32,
@@ -570,23 +575,12 @@ std::vector<float> DslModel::compute_logprobs(const std::int32_t* input_ids,
     const bool doc_masking_active =
         causal_lm_profile().apply_doc_masking(*mExecutor, mOptions, mModelConfig, input_tensor, position_tensor);
 
-    float* logprobs_gpu = nullptr;
-    CUDA_CHECK(cudaMalloc(&logprobs_gpu, token_count * sizeof(float)));
-    CUDA_CHECK(cudaMemsetAsync(logprobs_gpu, 0, token_count * sizeof(float), rs.MainStream));
+    auto* logprobs_gpu = scratch.custom_dloss.get<float>();
+    CUDA_CHECK(cudaMemsetAsync(logprobs_gpu, 0, token_bytes, rs.MainStream));
 
-    float* inv_temperature_gpu = nullptr;
-    if (temperatures) {
-        std::vector<float> inv_temp(token_count);
-        for (std::size_t i = 0; i < token_count; ++i) {
-            inv_temp[i] = 1.0f / temperatures[i];
-        }
-        CUDA_CHECK(cudaMalloc(&inv_temperature_gpu, token_count * sizeof(float)));
-        CUDA_CHECK(cudaMemcpyAsync(inv_temperature_gpu,
-                                   inv_temp.data(),
-                                   token_count * sizeof(float),
-                                   cudaMemcpyHostToDevice,
-                                   rs.MainStream));
-    }
+    const float* inv_temperature_gpu =
+        upload_inv_temperature_scratch(scratch, staging_slot, temperatures, token_count, rs.MainStream);
+    record_grpo_host_staging_slot(scratch, staging_slot, rs.MainStream);
 
     auto request = causal_lm_profile()
                        .make_eval_request(rs, mModelConfig, mOptions, input_tensor, position_tensor, target_tensor, 0);
@@ -598,12 +592,13 @@ std::vector<float> DslModel::compute_logprobs(const std::int32_t* input_ids,
     request.forward_hook = hook_ptr;
     mExecutor->execute_forward(request, comm);
 
-    CUDA_CHECK(cudaMemcpyAsync(result.data(), logprobs_gpu, token_bytes, cudaMemcpyDeviceToHost, rs.MainStream));
+    CUDA_CHECK(cudaMemcpyAsync(scratch.host_inference_logprobs[staging_slot].Data,
+                               logprobs_gpu,
+                               token_bytes,
+                               cudaMemcpyDeviceToHost,
+                               rs.MainStream));
     CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
-    CUDA_CHECK(cudaFree(logprobs_gpu));
-    if (inv_temperature_gpu) {
-        CUDA_CHECK(cudaFree(inv_temperature_gpu));
-    }
+    std::memcpy(result.data(), scratch.host_inference_logprobs[staging_slot].get<float>(), token_bytes);
 
     if (doc_masking_active) {
         mExecutor->clear_doc_masking();
