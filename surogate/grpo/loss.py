@@ -198,3 +198,38 @@ def compute_grpo_per_token_grads(
             agg_metrics["teacher_kl"] /= n_samples
 
     return per_token_grads, agg_metrics
+
+
+def compute_native_shifted_grpo_dloss_reference(
+    trainer_logprobs: np.ndarray,
+    inference_logprobs: np.ndarray,
+    advantages: np.ndarray,
+    loss_mask: np.ndarray,
+    loss_config: GRPOLossConfig,
+    sample_ranges: list[tuple[int, int]],
+    teacher_logprobs: np.ndarray | None = None,
+    loss_scale: float = 1.0,
+) -> np.ndarray:
+    """Reference for the native CUDA GRPO dloss layout.
+
+    Native GRPO consumes trainer logprobs in logical token layout, then writes
+    dloss in the shifted target layout expected by the LM-head backward:
+    gradient for logical token ``t`` is written at target slot ``t - 1`` within
+    the same packed sample.
+    """
+    per_token_grads, _ = compute_grpo_per_token_grads(
+        trainer_logprobs=trainer_logprobs,
+        inference_logprobs=inference_logprobs,
+        advantages=advantages,
+        loss_mask=loss_mask,
+        loss_config=loss_config,
+        sample_ranges=sample_ranges,
+        teacher_logprobs=teacher_logprobs,
+    )
+    shifted = np.zeros_like(per_token_grads)
+    for start, end in sample_ranges:
+        if end - start > 1:
+            shifted[start : end - 1] = per_token_grads[start + 1 : end]
+    if loss_scale != 1.0:
+        shifted = shifted / float(loss_scale)
+    return shifted
