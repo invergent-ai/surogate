@@ -11,6 +11,7 @@
 #include <utility>
 #include <thread>
 #include <functional>
+#include <unordered_map>
 #include <vector>
 #include <cstddef>
 #include <cstdint>
@@ -236,6 +237,7 @@ public:
                           float adv_tau,
                           float teacher_tau,
                           float kl_tau);
+    std::unordered_map<std::string, float> get_grpo_native_metrics();
 
 private:
     std::unique_ptr<PretrainedConfig> mConfig;  // unique_ptr to preserve polymorphism

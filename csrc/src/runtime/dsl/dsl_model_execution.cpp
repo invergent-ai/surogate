@@ -38,6 +38,23 @@
 
 namespace dsl {
 
+namespace {
+enum GrpoMetricOffset {
+    GRPO_METRIC_POLICY_LOSS = 0,
+    GRPO_METRIC_MISMATCH_KL = 1,
+    GRPO_METRIC_MASKED_MISMATCH_KL = 2,
+    GRPO_METRIC_UNMASKED_MISMATCH_KL = 3,
+    GRPO_METRIC_IS_MASKED = 4,
+    GRPO_METRIC_IS_MASKED_LOW = 5,
+    GRPO_METRIC_IS_MASKED_HIGH = 6,
+    GRPO_METRIC_TEACHER_KL = 7,
+    GRPO_METRIC_SAMPLE_COUNT = 8,
+    GRPO_METRIC_KEEP_TOKENS = 9,
+    GRPO_METRIC_TOTAL_TOKENS = 10,
+    GRPO_METRIC_COUNT = 11,
+};
+}  // namespace
+
 static const CausalLMExecutionProfile& causal_lm_profile() {
     static const CausalLMExecutionProfile profile;
     return profile;
@@ -841,6 +858,12 @@ void DslModel::step_grpo_native(Tensor inputs,
         static_cast<std::size_t>(sample_count) > static_cast<std::size_t>(scratch.max_samples)) {
         throw std::runtime_error("step_grpo_native inputs exceed allocated GRPO scratch capacity");
     }
+    if (micro_step == 0) {
+        CUDA_CHECK(cudaMemsetAsync(scratch.metrics.Data,
+                                   0,
+                                   static_cast<std::size_t>(GRPO_METRIC_COUNT) * sizeof(float),
+                                   main_stream));
+    }
 
     const int staging_slot = scratch.next_host_slot;
     scratch.next_host_slot = (scratch.next_host_slot + 1) % modules::GrpoNativeScratch::kHostStagingSlots;
@@ -920,6 +943,7 @@ void DslModel::step_grpo_native(Tensor inputs,
     mExecutor->execute_forward(forward_request, comm);
 
     compute_grpo_custom_dloss(scratch.custom_dloss.get<float>(),
+                              scratch.metrics.get<float>(),
                               rs.Losses.get<float>(),
                               scratch.inference_logprobs.get<float>(),
                               scratch.advantages.get<float>(),
@@ -958,6 +982,35 @@ void DslModel::step_grpo_native(Tensor inputs,
     if (doc_masking_active) mExecutor->clear_doc_masking();
     mLoRAGrads->end_micro_step(main_stream, comm);
     internal::record_event_if_not_capturing(rs.BackwardDone, main_stream);
+}
+
+GrpoNativeMetrics DslModel::consume_grpo_native_metrics() {
+    if (!mRunState) {
+        throw std::logic_error("DslModel::consume_grpo_native_metrics called before allocate_run_state()");
+    }
+    auto& rs = *mRunState;
+    auto& scratch = rs.grpo_native_scratch();
+    CUDA_CHECK(cudaMemcpyAsync(scratch.host_metrics.Data,
+                               scratch.metrics.Data,
+                               static_cast<std::size_t>(GRPO_METRIC_COUNT) * sizeof(float),
+                               cudaMemcpyDeviceToHost,
+                               rs.MainStream));
+    CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
+
+    const auto* values = scratch.host_metrics.get<float>();
+    const float sample_count = std::max(values[GRPO_METRIC_SAMPLE_COUNT], 1.0f);
+    GrpoNativeMetrics metrics;
+    metrics.policy_loss = values[GRPO_METRIC_POLICY_LOSS] / sample_count;
+    metrics.mismatch_kl = values[GRPO_METRIC_MISMATCH_KL] / sample_count;
+    metrics.masked_mismatch_kl = values[GRPO_METRIC_MASKED_MISMATCH_KL] / sample_count;
+    metrics.unmasked_mismatch_kl = values[GRPO_METRIC_UNMASKED_MISMATCH_KL] / sample_count;
+    metrics.is_masked = values[GRPO_METRIC_IS_MASKED] / sample_count;
+    metrics.is_masked_low = values[GRPO_METRIC_IS_MASKED_LOW] / sample_count;
+    metrics.is_masked_high = values[GRPO_METRIC_IS_MASKED_HIGH] / sample_count;
+    metrics.teacher_kl = values[GRPO_METRIC_TEACHER_KL] / sample_count;
+    metrics.keep_tokens = values[GRPO_METRIC_KEEP_TOKENS];
+    metrics.total_tokens = values[GRPO_METRIC_TOTAL_TOKENS];
+    return metrics;
 }
 
 }  // namespace dsl

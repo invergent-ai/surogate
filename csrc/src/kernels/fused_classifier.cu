@@ -1165,7 +1165,23 @@ void extract_logprobs(const nv_bfloat16* logits,
 // ----------------------------------------------------------------------------
 // Native GRPO custom dloss generation
 
+enum GrpoMetricOffset {
+    GRPO_METRIC_POLICY_LOSS = 0,
+    GRPO_METRIC_MISMATCH_KL = 1,
+    GRPO_METRIC_MASKED_MISMATCH_KL = 2,
+    GRPO_METRIC_UNMASKED_MISMATCH_KL = 3,
+    GRPO_METRIC_IS_MASKED = 4,
+    GRPO_METRIC_IS_MASKED_LOW = 5,
+    GRPO_METRIC_IS_MASKED_HIGH = 6,
+    GRPO_METRIC_TEACHER_KL = 7,
+    GRPO_METRIC_SAMPLE_COUNT = 8,
+    GRPO_METRIC_KEEP_TOKENS = 9,
+    GRPO_METRIC_TOTAL_TOKENS = 10,
+    GRPO_METRIC_COUNT = 11,
+};
+
 __global__ void grpo_custom_dloss_kernel(float* custom_dloss,
+                                         float* metrics,
                                          const float* losses,
                                          const float* inference_logprobs,
                                          const float* advantages,
@@ -1181,6 +1197,8 @@ __global__ void grpo_custom_dloss_kernel(float* custom_dloss,
                                          float adv_tau,
                                          float teacher_tau,
                                          float kl_tau) {
+    __shared__ float reductions[GRPO_METRIC_COUNT][256];
+
     const int sample_idx = static_cast<int>(blockIdx.x);
     if (sample_idx >= sample_count) {
         return;
@@ -1191,6 +1209,19 @@ __global__ void grpo_custom_dloss_kernel(float* custom_dloss,
     if (start < 0 || end > BT || start >= end) {
         return;
     }
+
+    float policy_sum = 0.0f;
+    float mismatch_sum = 0.0f;
+    float masked_mismatch_sum = 0.0f;
+    float unmasked_mismatch_sum = 0.0f;
+    float is_masked_sum = 0.0f;
+    float is_masked_low_sum = 0.0f;
+    float is_masked_high_sum = 0.0f;
+    float teacher_kl_sum = 0.0f;
+    float keep_count = 0.0f;
+    float total_count = 0.0f;
+    float masked_count = 0.0f;
+    float unmasked_count = 0.0f;
 
     for (int out_idx = start + static_cast<int>(threadIdx.x); out_idx < end; out_idx += static_cast<int>(blockDim.x)) {
         if (out_idx + 1 >= end) {
@@ -1210,20 +1241,83 @@ __global__ void grpo_custom_dloss_kernel(float* custom_dloss,
         const float importance_ratio = expf(log_importance_ratio);
         const float probs_diff = expf(trainer_logprob) - expf(inference_logprob);
         const bool is_masked = (probs_diff > ipo_mask_high) || (probs_diff < -ipo_mask_low);
+        const bool is_masked_low = probs_diff < -ipo_mask_low;
+        const bool is_masked_high = probs_diff > ipo_mask_high;
+        const bool keep = !is_masked;
 
         float dloss = -2.0f * kl_tau * log_importance_ratio;
-        if (!is_masked) {
-            float scaled_advantage = adv_tau * advantages[logical_idx];
-            if (teacher_logprobs) {
-                scaled_advantage += teacher_tau * (teacher_logprobs[logical_idx] - trainer_logprob);
-            }
-            dloss += scaled_advantage * importance_ratio;
+        float scaled_advantage = adv_tau * advantages[logical_idx];
+        if (teacher_logprobs) {
+            const float teacher_kl = teacher_logprobs[logical_idx] - trainer_logprob;
+            scaled_advantage += teacher_tau * teacher_kl;
+            teacher_kl_sum += teacher_kl;
         }
+        if (keep) {
+            dloss += scaled_advantage * importance_ratio;
+            policy_sum -= scaled_advantage * importance_ratio;
+            keep_count += 1.0f;
+            unmasked_mismatch_sum += importance_ratio - log_importance_ratio - 1.0f;
+            unmasked_count += 1.0f;
+        }
+        const float mismatch_kl = importance_ratio - log_importance_ratio - 1.0f;
+        const float kl_loss = kl_tau * log_importance_ratio * log_importance_ratio;
+        policy_sum += kl_loss;
+        mismatch_sum += mismatch_kl;
+        masked_mismatch_sum += is_masked ? mismatch_kl : 0.0f;
+        masked_count += is_masked ? 1.0f : 0.0f;
+        is_masked_sum += is_masked ? 1.0f : 0.0f;
+        is_masked_low_sum += is_masked_low ? 1.0f : 0.0f;
+        is_masked_high_sum += is_masked_high ? 1.0f : 0.0f;
+        total_count += 1.0f;
         custom_dloss[out_idx] = dloss * inv_loss_scale;
+    }
+
+    reductions[GRPO_METRIC_POLICY_LOSS][threadIdx.x] = policy_sum;
+    reductions[GRPO_METRIC_MISMATCH_KL][threadIdx.x] = mismatch_sum;
+    reductions[GRPO_METRIC_MASKED_MISMATCH_KL][threadIdx.x] = masked_mismatch_sum;
+    reductions[GRPO_METRIC_UNMASKED_MISMATCH_KL][threadIdx.x] = unmasked_mismatch_sum;
+    reductions[GRPO_METRIC_IS_MASKED][threadIdx.x] = is_masked_sum;
+    reductions[GRPO_METRIC_IS_MASKED_LOW][threadIdx.x] = is_masked_low_sum;
+    reductions[GRPO_METRIC_IS_MASKED_HIGH][threadIdx.x] = is_masked_high_sum;
+    reductions[GRPO_METRIC_TEACHER_KL][threadIdx.x] = teacher_kl_sum;
+    reductions[GRPO_METRIC_SAMPLE_COUNT][threadIdx.x] = total_count > 0.0f ? 1.0f : 0.0f;
+    reductions[GRPO_METRIC_KEEP_TOKENS][threadIdx.x] = keep_count;
+    reductions[GRPO_METRIC_TOTAL_TOKENS][threadIdx.x] = total_count;
+    __syncthreads();
+
+    for (int stride = static_cast<int>(blockDim.x) / 2; stride > 0; stride >>= 1) {
+        if (static_cast<int>(threadIdx.x) < stride) {
+            for (int metric_idx = 0; metric_idx < GRPO_METRIC_COUNT; ++metric_idx) {
+                reductions[metric_idx][threadIdx.x] += reductions[metric_idx][threadIdx.x + stride];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0 && reductions[GRPO_METRIC_TOTAL_TOKENS][0] > 0.0f) {
+        const float sample_total = reductions[GRPO_METRIC_TOTAL_TOKENS][0];
+        const float sample_masked = reductions[GRPO_METRIC_MASKED_MISMATCH_KL][0];
+        const float sample_unmasked = reductions[GRPO_METRIC_UNMASKED_MISMATCH_KL][0];
+        const float masked_denom = fmaxf(reductions[GRPO_METRIC_IS_MASKED][0], 1.0f);
+        const float unmasked_denom = fmaxf(reductions[GRPO_METRIC_KEEP_TOKENS][0], 1.0f);
+        atomicAdd(metrics + GRPO_METRIC_POLICY_LOSS, reductions[GRPO_METRIC_POLICY_LOSS][0] / sample_total);
+        atomicAdd(metrics + GRPO_METRIC_MISMATCH_KL, reductions[GRPO_METRIC_MISMATCH_KL][0] / sample_total);
+        atomicAdd(metrics + GRPO_METRIC_MASKED_MISMATCH_KL, sample_masked / masked_denom);
+        atomicAdd(metrics + GRPO_METRIC_UNMASKED_MISMATCH_KL, sample_unmasked / unmasked_denom);
+        atomicAdd(metrics + GRPO_METRIC_IS_MASKED, reductions[GRPO_METRIC_IS_MASKED][0] / sample_total);
+        atomicAdd(metrics + GRPO_METRIC_IS_MASKED_LOW, reductions[GRPO_METRIC_IS_MASKED_LOW][0] / sample_total);
+        atomicAdd(metrics + GRPO_METRIC_IS_MASKED_HIGH, reductions[GRPO_METRIC_IS_MASKED_HIGH][0] / sample_total);
+        if (teacher_logprobs) {
+            atomicAdd(metrics + GRPO_METRIC_TEACHER_KL, reductions[GRPO_METRIC_TEACHER_KL][0] / sample_total);
+        }
+        atomicAdd(metrics + GRPO_METRIC_SAMPLE_COUNT, 1.0f);
+        atomicAdd(metrics + GRPO_METRIC_KEEP_TOKENS, reductions[GRPO_METRIC_KEEP_TOKENS][0]);
+        atomicAdd(metrics + GRPO_METRIC_TOTAL_TOKENS, sample_total);
     }
 }
 
 void compute_grpo_custom_dloss(float* custom_dloss,
+                               float* metrics,
                                const float* losses,
                                const float* inference_logprobs,
                                const float* advantages,
@@ -1246,6 +1340,7 @@ void compute_grpo_custom_dloss(float* custom_dloss,
     CUDA_CHECK(cudaMemsetAsync(custom_dloss, 0, static_cast<std::size_t>(BT) * sizeof(float), stream));
     const float inv_loss_scale = (loss_scale == 0.0f) ? 1.0f : (1.0f / loss_scale);
     grpo_custom_dloss_kernel<<<sample_count, 256, 0, stream>>>(custom_dloss,
+                                                               metrics,
                                                                losses,
                                                                inference_logprobs,
                                                                advantages,

@@ -1866,6 +1866,16 @@ NB_MODULE(_surogate, m) {
             nb::arg("per_token_grads"),
             nb::arg("position_ids") = nb::none(),
             "GRPO backward pass using activations saved by forward_for_grpo().")
+        .def(
+            "get_grpo_native_metrics",
+            [](MultiGPUPyTrainer* trainer) {
+                nb::dict out;
+                for (const auto& [key, value] : trainer->get_grpo_native_metrics()) {
+                    out[key.c_str()] = value;
+                }
+                return out;
+            },
+            "Return native GRPO metrics accumulated since the current grad-accum step started.")
         .def("set_grad_accumulation",
              &MultiGPUPyTrainer::set_grad_accumulation,
              nb::arg("n"),

@@ -2309,6 +2309,33 @@ void MultiGPUPyTrainer::step_grpo_native(const std::int32_t* inputs,
     ++mTrainMicroStep;
 }
 
+std::unordered_map<std::string, float> MultiGPUPyTrainer::get_grpo_native_metrics() {
+    std::unordered_map<std::string, float> result;
+    run_work([&result](sThreadContext& ctx) {
+        auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+        if (!dsl_model) {
+            throw std::runtime_error("get_grpo_native_metrics: model is not a DslModel");
+        }
+        if (ctx.Communicator->local_rank() != 0) {
+            return;
+        }
+        const auto metrics = dsl_model->consume_grpo_native_metrics();
+        result = {
+            {"policy_loss", metrics.policy_loss},
+            {"mismatch_kl", metrics.mismatch_kl},
+            {"masked_mismatch_kl", metrics.masked_mismatch_kl},
+            {"unmasked_mismatch_kl", metrics.unmasked_mismatch_kl},
+            {"is_masked", metrics.is_masked},
+            {"is_masked_low", metrics.is_masked_low},
+            {"is_masked_high", metrics.is_masked_high},
+            {"teacher_kl", metrics.teacher_kl},
+            {"keep_tokens", metrics.keep_tokens},
+            {"total_tokens", metrics.total_tokens},
+        };
+    });
+    return result;
+}
+
 std::vector<float> MultiGPUPyTrainer::forward_for_grpo(const std::int32_t* inputs,
                                                        const std::int32_t* targets,
                                                        const std::int32_t* position_ids,

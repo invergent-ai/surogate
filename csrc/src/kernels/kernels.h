@@ -1655,6 +1655,7 @@ void extract_logprobs(const Tensor& logits,
                       cudaStream_t stream);
 
 void compute_grpo_custom_dloss(float* custom_dloss,
+                               float* metrics,
                                const float* losses,
                                const float* inference_logprobs,
                                const float* advantages,

@@ -62,6 +62,19 @@ struct GrpoNativeLossConfig {
     float kl_tau = 1.0e-3f;
 };
 
+struct GrpoNativeMetrics {
+    float policy_loss = 0.0f;
+    float mismatch_kl = 0.0f;
+    float masked_mismatch_kl = 0.0f;
+    float unmasked_mismatch_kl = 0.0f;
+    float is_masked = 0.0f;
+    float is_masked_low = 0.0f;
+    float is_masked_high = 0.0f;
+    float teacher_kl = 0.0f;
+    float keep_tokens = 0.0f;
+    float total_tokens = 0.0f;
+};
+
 class EmptyTensorContainer final : public ITensorContainer {
 public:
     void iterate_tensors(const std::function<void(std::string, const TensorShard&)>&) override {
@@ -281,6 +294,7 @@ public:
                           const GrpoNativeLossConfig& loss_config,
                           const float* temperatures_cpu = nullptr,
                           const float* teacher_logprobs_cpu = nullptr);
+    GrpoNativeMetrics consume_grpo_native_metrics();
 
     void init_weights(NCCLCommunicator& comm) override;
     void import_weights(const std::string& file_name, bool allow_cast, NCCLCommunicator& comm) override;
