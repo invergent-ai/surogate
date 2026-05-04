@@ -842,55 +842,63 @@ void DslModel::step_grpo_native(Tensor inputs,
         throw std::runtime_error("step_grpo_native inputs exceed allocated GRPO scratch capacity");
     }
 
+    const int staging_slot = scratch.next_host_slot;
+    scratch.next_host_slot = (scratch.next_host_slot + 1) % modules::GrpoNativeScratch::kHostStagingSlots;
+    if (scratch.host_copy_recorded[staging_slot]) {
+        CUDA_CHECK(cudaEventSynchronize(scratch.host_copy_done[staging_slot]));
+    }
+
     auto copy_float_input = [main_stream, bt](Tensor& host, Tensor& device, const float* src) {
         std::memcpy(host.get<float>(), src, bt * sizeof(float));
         CUDA_CHECK(cudaMemcpyAsync(device.Data, host.Data, bt * sizeof(float), cudaMemcpyHostToDevice, main_stream));
     };
 
-    copy_float_input(scratch.host_inference_logprobs, scratch.inference_logprobs, inference_logprobs_cpu);
-    copy_float_input(scratch.host_advantages, scratch.advantages, advantages_cpu);
-    std::memcpy(scratch.host_loss_mask.get<std::uint8_t>(), loss_mask_cpu, bt * sizeof(std::uint8_t));
+    copy_float_input(scratch.host_inference_logprobs[staging_slot], scratch.inference_logprobs, inference_logprobs_cpu);
+    copy_float_input(scratch.host_advantages[staging_slot], scratch.advantages, advantages_cpu);
+    std::memcpy(scratch.host_loss_mask[staging_slot].get<std::uint8_t>(), loss_mask_cpu, bt * sizeof(std::uint8_t));
     CUDA_CHECK(cudaMemcpyAsync(scratch.loss_mask.Data,
-                               scratch.host_loss_mask.Data,
+                               scratch.host_loss_mask[staging_slot].Data,
                                bt * sizeof(std::uint8_t),
                                cudaMemcpyHostToDevice,
                                main_stream));
-    std::memcpy(scratch.host_sample_starts.get<std::int32_t>(),
+    std::memcpy(scratch.host_sample_starts[staging_slot].get<std::int32_t>(),
                 sample_starts_cpu,
                 static_cast<std::size_t>(sample_count) * sizeof(std::int32_t));
-    std::memcpy(scratch.host_sample_ends.get<std::int32_t>(),
+    std::memcpy(scratch.host_sample_ends[staging_slot].get<std::int32_t>(),
                 sample_ends_cpu,
                 static_cast<std::size_t>(sample_count) * sizeof(std::int32_t));
     CUDA_CHECK(cudaMemcpyAsync(scratch.sample_starts.Data,
-                               scratch.host_sample_starts.Data,
+                               scratch.host_sample_starts[staging_slot].Data,
                                static_cast<std::size_t>(sample_count) * sizeof(std::int32_t),
                                cudaMemcpyHostToDevice,
                                main_stream));
     CUDA_CHECK(cudaMemcpyAsync(scratch.sample_ends.Data,
-                               scratch.host_sample_ends.Data,
+                               scratch.host_sample_ends[staging_slot].Data,
                                static_cast<std::size_t>(sample_count) * sizeof(std::int32_t),
                                cudaMemcpyHostToDevice,
                                main_stream));
 
     const float* teacher_logprobs_gpu = nullptr;
     if (teacher_logprobs_cpu) {
-        copy_float_input(scratch.host_teacher_logprobs, scratch.teacher_logprobs, teacher_logprobs_cpu);
+        copy_float_input(scratch.host_teacher_logprobs[staging_slot], scratch.teacher_logprobs, teacher_logprobs_cpu);
         teacher_logprobs_gpu = scratch.teacher_logprobs.get<float>();
     }
 
     const float* inv_temperature_gpu = nullptr;
     if (temperatures_cpu) {
-        auto* inv_temp = scratch.host_temperatures.get<float>();
+        auto* inv_temp = scratch.host_temperatures[staging_slot].get<float>();
         for (std::size_t i = 0; i < bt; ++i) {
             inv_temp[i] = 1.0f / temperatures_cpu[i];
         }
         CUDA_CHECK(cudaMemcpyAsync(scratch.inv_temperature.Data,
-                                   scratch.host_temperatures.Data,
+                                   scratch.host_temperatures[staging_slot].Data,
                                    bt * sizeof(float),
                                    cudaMemcpyHostToDevice,
                                    main_stream));
         inv_temperature_gpu = scratch.inv_temperature.get<float>();
     }
+    CUDA_CHECK(cudaEventRecord(scratch.host_copy_done[staging_slot], main_stream));
+    scratch.host_copy_recorded[staging_slot] = true;
 
     const bool doc_masking_active =
         causal_lm_profile().apply_doc_masking(*mExecutor, mOptions, mModelConfig, inputs, position_ids, micro_step);

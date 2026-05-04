@@ -82,6 +82,8 @@ struct ScratchBuffers {
  * cudaMemcpyAsync sources in the Python-facing training path.
  */
 struct GrpoNativeScratch {
+    static constexpr int kHostStagingSlots = 4;
+
     Tensor inference_logprobs;  ///< Device FP32 [B*T]
     Tensor advantages;          ///< Device FP32 [B*T]
     Tensor teacher_logprobs;    ///< Device FP32 [B*T]
@@ -91,16 +93,19 @@ struct GrpoNativeScratch {
     Tensor custom_dloss;        ///< Device FP32 [B*T], shifted for LM-head backward
     Tensor inv_temperature;     ///< Device FP32 [B*T]
 
-    Tensor host_inference_logprobs;  ///< Pinned FP32 [B*T]
-    Tensor host_advantages;          ///< Pinned FP32 [B*T]
-    Tensor host_teacher_logprobs;    ///< Pinned FP32 [B*T]
-    Tensor host_temperatures;        ///< Pinned FP32 [B*T]
-    Tensor host_loss_mask;           ///< Pinned BYTE [B*T]
-    Tensor host_sample_starts;       ///< Pinned INT32 [max_samples]
-    Tensor host_sample_ends;         ///< Pinned INT32 [max_samples]
+    std::array<Tensor, kHostStagingSlots> host_inference_logprobs;  ///< Pinned FP32 [B*T]
+    std::array<Tensor, kHostStagingSlots> host_advantages;          ///< Pinned FP32 [B*T]
+    std::array<Tensor, kHostStagingSlots> host_teacher_logprobs;    ///< Pinned FP32 [B*T]
+    std::array<Tensor, kHostStagingSlots> host_temperatures;        ///< Pinned FP32 [B*T]
+    std::array<Tensor, kHostStagingSlots> host_loss_mask;           ///< Pinned BYTE [B*T]
+    std::array<Tensor, kHostStagingSlots> host_sample_starts;       ///< Pinned INT32 [max_samples]
+    std::array<Tensor, kHostStagingSlots> host_sample_ends;         ///< Pinned INT32 [max_samples]
+    std::array<cudaEvent_t, kHostStagingSlots> host_copy_done{};
+    std::array<bool, kHostStagingSlots> host_copy_recorded{};
 
     long max_tokens = 0;
     long max_samples = 0;
+    int next_host_slot = 0;
 };
 
 /**
