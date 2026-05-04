@@ -13,6 +13,7 @@
 #include <functional>
 #include <vector>
 #include <cstddef>
+#include <cstdint>
 #include <cuda_runtime.h>
 
 #include "config/pretrained_config.h"
@@ -217,6 +218,24 @@ public:
     // GRPO backward pass using activations saved by forward_for_grpo().
     // Inputs/targets/position_ids are reused from forward_for_grpo (already in GPU buffers).
     void backward_grpo(const float* per_token_grads);
+
+    void step_grpo_native(const std::int32_t* inputs,
+                          const std::int32_t* targets,
+                          const float* inference_logprobs,
+                          const float* advantages,
+                          const std::uint8_t* loss_mask,
+                          const std::int32_t* sample_starts,
+                          const std::int32_t* sample_ends,
+                          int sample_count,
+                          const std::int32_t* position_ids,
+                          const float* temperatures,
+                          const float* teacher_logprobs,
+                          float loss_scale,
+                          float ipo_mask_low,
+                          float ipo_mask_high,
+                          float adv_tau,
+                          float teacher_tau,
+                          float kl_tau);
 
 private:
     std::unique_ptr<PretrainedConfig> mConfig;  // unique_ptr to preserve polymorphism

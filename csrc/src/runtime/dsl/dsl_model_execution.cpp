@@ -15,7 +15,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <numeric>
 #include <stdexcept>
 #include <string_view>
@@ -798,6 +800,156 @@ void DslModel::backward_grpo(Tensor inputs,
         CUDA_CHECK(cudaFree(mGrpoInvTemperatureGpu));
         mGrpoInvTemperatureGpu = nullptr;
     }
+}
+
+void DslModel::step_grpo_native(Tensor inputs,
+                                Tensor position_ids,
+                                Tensor targets,
+                                const float* inference_logprobs_cpu,
+                                const float* advantages_cpu,
+                                const std::uint8_t* loss_mask_cpu,
+                                const std::int32_t* sample_starts_cpu,
+                                const std::int32_t* sample_ends_cpu,
+                                int sample_count,
+                                int grad_accum_steps,
+                                int micro_step,
+                                NCCLCommunicator& comm,
+                                const GrpoNativeLossConfig& loss_config,
+                                const float* temperatures_cpu,
+                                const float* teacher_logprobs_cpu) {
+    if (!mExecutor) {
+        throw std::logic_error("DslModel::step_grpo_native called before allocate_run_state()");
+    }
+    if (!inference_logprobs_cpu || !advantages_cpu || !loss_mask_cpu || !sample_starts_cpu || !sample_ends_cpu) {
+        throw std::invalid_argument(
+            "step_grpo_native requires inference_logprobs, advantages, loss_mask, sample ranges");
+    }
+    if (sample_count <= 0) {
+        throw std::invalid_argument("step_grpo_native requires at least one sample range");
+    }
+    if (!(loss_config.loss_scale > 0.0f) || !std::isfinite(loss_config.loss_scale)) {
+        throw std::invalid_argument("step_grpo_native loss_scale must be finite and positive");
+    }
+
+    auto& rs = *mRunState;
+    auto& scratch = rs.grpo_native_scratch();
+    cudaStream_t main_stream = rs.MainStream;
+    const int B_val = static_cast<int>(inputs.Sizes[0]);
+    const int T_val = static_cast<int>(inputs.Sizes[1]);
+    const std::size_t bt = static_cast<std::size_t>(B_val) * static_cast<std::size_t>(T_val);
+    if (bt > static_cast<std::size_t>(scratch.max_tokens) ||
+        static_cast<std::size_t>(sample_count) > static_cast<std::size_t>(scratch.max_samples)) {
+        throw std::runtime_error("step_grpo_native inputs exceed allocated GRPO scratch capacity");
+    }
+
+    auto copy_float_input = [main_stream, bt](Tensor& host, Tensor& device, const float* src) {
+        std::memcpy(host.get<float>(), src, bt * sizeof(float));
+        CUDA_CHECK(cudaMemcpyAsync(device.Data, host.Data, bt * sizeof(float), cudaMemcpyHostToDevice, main_stream));
+    };
+
+    copy_float_input(scratch.host_inference_logprobs, scratch.inference_logprobs, inference_logprobs_cpu);
+    copy_float_input(scratch.host_advantages, scratch.advantages, advantages_cpu);
+    std::memcpy(scratch.host_loss_mask.get<std::uint8_t>(), loss_mask_cpu, bt * sizeof(std::uint8_t));
+    CUDA_CHECK(cudaMemcpyAsync(scratch.loss_mask.Data,
+                               scratch.host_loss_mask.Data,
+                               bt * sizeof(std::uint8_t),
+                               cudaMemcpyHostToDevice,
+                               main_stream));
+    std::memcpy(scratch.host_sample_starts.get<std::int32_t>(),
+                sample_starts_cpu,
+                static_cast<std::size_t>(sample_count) * sizeof(std::int32_t));
+    std::memcpy(scratch.host_sample_ends.get<std::int32_t>(),
+                sample_ends_cpu,
+                static_cast<std::size_t>(sample_count) * sizeof(std::int32_t));
+    CUDA_CHECK(cudaMemcpyAsync(scratch.sample_starts.Data,
+                               scratch.host_sample_starts.Data,
+                               static_cast<std::size_t>(sample_count) * sizeof(std::int32_t),
+                               cudaMemcpyHostToDevice,
+                               main_stream));
+    CUDA_CHECK(cudaMemcpyAsync(scratch.sample_ends.Data,
+                               scratch.host_sample_ends.Data,
+                               static_cast<std::size_t>(sample_count) * sizeof(std::int32_t),
+                               cudaMemcpyHostToDevice,
+                               main_stream));
+
+    const float* teacher_logprobs_gpu = nullptr;
+    if (teacher_logprobs_cpu) {
+        copy_float_input(scratch.host_teacher_logprobs, scratch.teacher_logprobs, teacher_logprobs_cpu);
+        teacher_logprobs_gpu = scratch.teacher_logprobs.get<float>();
+    }
+
+    const float* inv_temperature_gpu = nullptr;
+    if (temperatures_cpu) {
+        auto* inv_temp = scratch.host_temperatures.get<float>();
+        for (std::size_t i = 0; i < bt; ++i) {
+            inv_temp[i] = 1.0f / temperatures_cpu[i];
+        }
+        CUDA_CHECK(cudaMemcpyAsync(scratch.inv_temperature.Data,
+                                   scratch.host_temperatures.Data,
+                                   bt * sizeof(float),
+                                   cudaMemcpyHostToDevice,
+                                   main_stream));
+        inv_temperature_gpu = scratch.inv_temperature.get<float>();
+    }
+
+    const bool doc_masking_active =
+        causal_lm_profile().apply_doc_masking(*mExecutor, mOptions, mModelConfig, inputs, position_ids, micro_step);
+
+    if (lora_enabled()) {
+        ensure_lora_run_state(comm, B_val, T_val);
+        if (qlora_enabled() && micro_step == 0 && mQLoRAProvider) {
+            mQLoRAProvider->invalidate_cache();
+        }
+        mLoRARunState->micro_step = micro_step;
+        mLoRARunState->is_training = true;
+    }
+
+    auto forward_request =
+        causal_lm_profile().make_eval_request(rs, mModelConfig, mOptions, inputs, position_ids, targets, micro_step);
+    forward_request.mode = ExecutionMode::Forward;
+    forward_request.reduce_loss_on_completion = false;
+    forward_request.inv_temperature_gpu = inv_temperature_gpu;
+    mExecutor->execute_forward(forward_request, comm);
+
+    compute_grpo_custom_dloss(scratch.custom_dloss.get<float>(),
+                              rs.Losses.get<float>(),
+                              scratch.inference_logprobs.get<float>(),
+                              scratch.advantages.get<float>(),
+                              scratch.loss_mask.get<std::uint8_t>(),
+                              teacher_logprobs_gpu,
+                              scratch.sample_starts.get<std::int32_t>(),
+                              scratch.sample_ends.get<std::int32_t>(),
+                              sample_count,
+                              static_cast<int>(bt),
+                              loss_config.loss_scale,
+                              loss_config.ipo_mask_low,
+                              loss_config.ipo_mask_high,
+                              loss_config.adv_tau,
+                              loss_config.teacher_tau,
+                              loss_config.kl_tau,
+                              main_stream);
+
+    if (!lora_enabled()) {
+        auto backward_request =
+            causal_lm_profile()
+                .make_backward_request(rs, mModelConfig, mOptions, inputs, targets, grad_accum_steps, micro_step);
+        backward_request.custom_dloss_gpu = scratch.custom_dloss.get<float>();
+        backward_request.inv_temperature_gpu = inv_temperature_gpu;
+        mExecutor->execute_backward(backward_request, comm);
+        if (doc_masking_active) mExecutor->clear_doc_masking();
+        return;
+    }
+
+    mLoRAGrads->start_micro_step(main_stream, micro_step, grad_accum_steps);
+    auto backward_request =
+        causal_lm_profile()
+            .make_backward_request(rs, mModelConfig, mOptions, inputs, targets, grad_accum_steps, micro_step);
+    backward_request.custom_dloss_gpu = scratch.custom_dloss.get<float>();
+    backward_request.inv_temperature_gpu = inv_temperature_gpu;
+    mExecutor->execute_backward(backward_request, comm);
+    if (doc_masking_active) mExecutor->clear_doc_masking();
+    mLoRAGrads->end_micro_step(main_stream, comm);
+    internal::record_event_if_not_capturing(rs.BackwardDone, main_stream);
 }
 
 }  // namespace dsl
