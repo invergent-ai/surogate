@@ -116,8 +116,8 @@ class GRPOTrainConfig(SFTConfig):
         # while still allowing position_ids (RoPE resets) to be passed.
         self.runtime_config.doc_masking = self.doc_masking
 
-        # Disable CUDA graphs for GRPO — the compute_logprobs → step_with_custom_loss
-        # pattern means save buffers aren't preallocated in the right order for capture.
+        # Disable CUDA graphs for GRPO for now. The native GRPO step removes the
+        # Python logprob round trip, but graph capture needs separate wiring.
         if self.use_cuda_graphs:
             self.use_cuda_graphs = False
             self.runtime_config.use_cuda_graphs = False

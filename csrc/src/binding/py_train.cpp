@@ -2202,6 +2202,140 @@ void MultiGPUPyTrainer::step_with_custom_loss(const std::int32_t* inputs,
     ++mTrainMicroStep;
 }
 
+void MultiGPUPyTrainer::step_grpo_native(const std::int32_t* inputs,
+                                         const std::int32_t* targets,
+                                         const float* inference_logprobs,
+                                         const float* advantages,
+                                         const std::uint8_t* loss_mask,
+                                         const std::int32_t* sample_starts,
+                                         const std::int32_t* sample_ends,
+                                         int sample_count,
+                                         const std::int32_t* position_ids,
+                                         const float* temperatures,
+                                         const float* teacher_logprobs,
+                                         float loss_scale,
+                                         float ipo_mask_low,
+                                         float ipo_mask_high,
+                                         float adv_tau,
+                                         float teacher_tau,
+                                         float kl_tau) {
+    const int ep_size = std::max(1, mOptions.EPSize);
+    for (int i = 0; i < (int)mContexts.size(); ++i) {
+        auto& ctx = mContexts.at(i);
+        if (!ctx.Model) {
+            throw std::runtime_error(fmt::format("step_grpo_native: ctx[{}].Model is null", i));
+        }
+        auto* ib = ctx.Model->get_input_buffer().get<std::int32_t>();
+        auto* tb = ctx.Model->get_target_buffer().get<std::int32_t>();
+        Tensor pos_buf = ctx.Model->get_position_ids_buffer();
+        auto* pb = pos_buf.get<std::int32_t>();
+        const int pos_planes = (pos_buf.Rank == 3) ? static_cast<int>(pos_buf.Sizes[0]) : 1;
+        const std::size_t bt = static_cast<std::size_t>(B) * static_cast<std::size_t>(T);
+        const int src_row = host_batch_row_for_local_rank(i, ep_size);
+
+        std::memcpy(ib, inputs + src_row * B * T, B * T * sizeof(std::int32_t));
+        std::memcpy(tb, targets + src_row * B * T, B * T * sizeof(std::int32_t));
+        if (position_ids) {
+            const auto* src = position_ids + static_cast<std::ptrdiff_t>(src_row) * static_cast<std::ptrdiff_t>(bt);
+            for (int p = 0; p < pos_planes; ++p) {
+                std::memcpy(pb + p * bt, src, bt * sizeof(std::int32_t));
+            }
+        } else {
+            fill_sequential_position_ids(pb, pos_planes, B, T);
+        }
+    }
+
+    if (mTrainMicroStep >= mGradAccumulation) {
+        throw std::runtime_error(
+            fmt::format("step_grpo_native: micro_step {} >= grad_accumulation {}", mTrainMicroStep, mGradAccumulation));
+    }
+
+    const dsl::GrpoNativeLossConfig loss_config{
+        .loss_scale = loss_scale,
+        .ipo_mask_low = ipo_mask_low,
+        .ipo_mask_high = ipo_mask_high,
+        .adv_tau = adv_tau,
+        .teacher_tau = teacher_tau,
+        .kl_tau = kl_tau,
+    };
+
+    run_work([micro_idx = mTrainMicroStep,
+              micro_batches = mGradAccumulation,
+              inference_logprobs,
+              advantages,
+              loss_mask,
+              sample_starts,
+              sample_ends,
+              sample_count,
+              temperatures,
+              teacher_logprobs,
+              loss_config,
+              B = this->B,
+              T = this->T](sThreadContext& ctx) {
+        auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+        if (!dsl_model) {
+            throw std::runtime_error("step_grpo_native: model is not a DslModel");
+        }
+
+        Tensor inputs_tensor = ctx.Model->get_input_buffer();
+        Tensor position_ids_tensor = ctx.Model->get_position_ids_buffer();
+        Tensor targets_tensor = ctx.Model->get_target_buffer();
+
+        const int gpu_rank = ctx.Communicator->local_rank();
+        const int gpu_ep_size = ctx.Communicator->ep_size();
+        const int src_row = host_batch_row_for_local_rank(gpu_rank, gpu_ep_size);
+        const float* temps_for_this_gpu = nullptr;
+        if (temperatures) {
+            temps_for_this_gpu = temperatures + static_cast<std::ptrdiff_t>(src_row) * B * T;
+        }
+
+        dsl_model->step_grpo_native(inputs_tensor,
+                                    position_ids_tensor,
+                                    targets_tensor,
+                                    inference_logprobs,
+                                    advantages,
+                                    loss_mask,
+                                    sample_starts,
+                                    sample_ends,
+                                    sample_count,
+                                    micro_batches,
+                                    micro_idx,
+                                    *ctx.Communicator,
+                                    loss_config,
+                                    temps_for_this_gpu,
+                                    teacher_logprobs);
+    });
+
+    ++mTrainMicroStep;
+}
+
+std::unordered_map<std::string, float> MultiGPUPyTrainer::get_grpo_native_metrics() {
+    std::unordered_map<std::string, float> result;
+    run_work([&result](sThreadContext& ctx) {
+        auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+        if (!dsl_model) {
+            throw std::runtime_error("get_grpo_native_metrics: model is not a DslModel");
+        }
+        if (ctx.Communicator->local_rank() != 0) {
+            return;
+        }
+        const auto metrics = dsl_model->consume_grpo_native_metrics();
+        result = {
+            {"policy_loss", metrics.policy_loss},
+            {"mismatch_kl", metrics.mismatch_kl},
+            {"masked_mismatch_kl", metrics.masked_mismatch_kl},
+            {"unmasked_mismatch_kl", metrics.unmasked_mismatch_kl},
+            {"is_masked", metrics.is_masked},
+            {"is_masked_low", metrics.is_masked_low},
+            {"is_masked_high", metrics.is_masked_high},
+            {"teacher_kl", metrics.teacher_kl},
+            {"keep_tokens", metrics.keep_tokens},
+            {"total_tokens", metrics.total_tokens},
+        };
+    });
+    return result;
+}
+
 std::vector<float> MultiGPUPyTrainer::forward_for_grpo(const std::int32_t* inputs,
                                                        const std::int32_t* targets,
                                                        const std::int32_t* position_ids,

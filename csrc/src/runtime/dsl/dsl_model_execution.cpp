@@ -15,7 +15,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <numeric>
 #include <stdexcept>
 #include <string_view>
@@ -35,6 +37,62 @@
 #include <vector>
 
 namespace dsl {
+
+namespace {
+enum GrpoMetricOffset {
+    GRPO_METRIC_POLICY_LOSS = 0,
+    GRPO_METRIC_MISMATCH_KL = 1,
+    GRPO_METRIC_MASKED_MISMATCH_KL = 2,
+    GRPO_METRIC_UNMASKED_MISMATCH_KL = 3,
+    GRPO_METRIC_IS_MASKED = 4,
+    GRPO_METRIC_IS_MASKED_LOW = 5,
+    GRPO_METRIC_IS_MASKED_HIGH = 6,
+    GRPO_METRIC_TEACHER_KL = 7,
+    GRPO_METRIC_SAMPLE_COUNT = 8,
+    GRPO_METRIC_KEEP_TOKENS = 9,
+    GRPO_METRIC_TOTAL_TOKENS = 10,
+    GRPO_METRIC_COUNT = 11,
+};
+
+int acquire_grpo_host_staging_slot(modules::GrpoNativeScratch& scratch) {
+    const int slot = scratch.next_host_slot;
+    scratch.next_host_slot = (scratch.next_host_slot + 1) % modules::GrpoNativeScratch::kHostStagingSlots;
+    if (scratch.host_copy_recorded[slot]) {
+        CUDA_CHECK(cudaEventSynchronize(scratch.host_copy_done[slot]));
+    }
+    return slot;
+}
+
+void record_grpo_host_staging_slot(modules::GrpoNativeScratch& scratch, int slot, cudaStream_t stream) {
+    CUDA_CHECK(cudaEventRecord(scratch.host_copy_done[slot], stream));
+    scratch.host_copy_recorded[slot] = true;
+}
+
+void upload_float_scratch(Tensor& host, Tensor& device, const float* src, std::size_t count, cudaStream_t stream) {
+    std::memcpy(host.get<float>(), src, count * sizeof(float));
+    CUDA_CHECK(cudaMemcpyAsync(device.Data, host.Data, count * sizeof(float), cudaMemcpyHostToDevice, stream));
+}
+
+const float* upload_inv_temperature_scratch(modules::GrpoNativeScratch& scratch,
+                                            int staging_slot,
+                                            const float* temperatures,
+                                            std::size_t count,
+                                            cudaStream_t stream) {
+    if (!temperatures) {
+        return nullptr;
+    }
+    auto* inv_temp = scratch.host_temperatures[staging_slot].get<float>();
+    for (std::size_t i = 0; i < count; ++i) {
+        inv_temp[i] = 1.0f / temperatures[i];
+    }
+    CUDA_CHECK(cudaMemcpyAsync(scratch.inv_temperature.Data,
+                               scratch.host_temperatures[staging_slot].Data,
+                               count * sizeof(float),
+                               cudaMemcpyHostToDevice,
+                               stream));
+    return scratch.inv_temperature.get<float>();
+}
+}  // namespace
 
 static const CausalLMExecutionProfile& causal_lm_profile() {
     static const CausalLMExecutionProfile profile;
@@ -483,7 +541,12 @@ std::vector<float> DslModel::compute_logprobs(const std::int32_t* input_ids,
 
     auto& rs = *mRunState;
     const std::size_t token_count = static_cast<std::size_t>(BT);
-    const std::size_t token_bytes = token_count * sizeof(std::int32_t);
+    const std::size_t token_bytes = token_count * sizeof(float);
+    auto& scratch = rs.grpo_native_scratch();
+    if (token_count > static_cast<std::size_t>(scratch.max_tokens)) {
+        throw std::runtime_error("compute_logprobs inputs exceed allocated scratch capacity");
+    }
+    const int staging_slot = acquire_grpo_host_staging_slot(scratch);
     Tensor input_tensor = Tensor::from_pointer(reinterpret_cast<std::byte*>(const_cast<std::int32_t*>(input_ids)),
                                                -1,
                                                ETensorDType::INT32,
@@ -512,23 +575,12 @@ std::vector<float> DslModel::compute_logprobs(const std::int32_t* input_ids,
     const bool doc_masking_active =
         causal_lm_profile().apply_doc_masking(*mExecutor, mOptions, mModelConfig, input_tensor, position_tensor);
 
-    float* logprobs_gpu = nullptr;
-    CUDA_CHECK(cudaMalloc(&logprobs_gpu, token_count * sizeof(float)));
-    CUDA_CHECK(cudaMemsetAsync(logprobs_gpu, 0, token_count * sizeof(float), rs.MainStream));
+    auto* logprobs_gpu = scratch.custom_dloss.get<float>();
+    CUDA_CHECK(cudaMemsetAsync(logprobs_gpu, 0, token_bytes, rs.MainStream));
 
-    float* inv_temperature_gpu = nullptr;
-    if (temperatures) {
-        std::vector<float> inv_temp(token_count);
-        for (std::size_t i = 0; i < token_count; ++i) {
-            inv_temp[i] = 1.0f / temperatures[i];
-        }
-        CUDA_CHECK(cudaMalloc(&inv_temperature_gpu, token_count * sizeof(float)));
-        CUDA_CHECK(cudaMemcpyAsync(inv_temperature_gpu,
-                                   inv_temp.data(),
-                                   token_count * sizeof(float),
-                                   cudaMemcpyHostToDevice,
-                                   rs.MainStream));
-    }
+    const float* inv_temperature_gpu =
+        upload_inv_temperature_scratch(scratch, staging_slot, temperatures, token_count, rs.MainStream);
+    record_grpo_host_staging_slot(scratch, staging_slot, rs.MainStream);
 
     auto request = causal_lm_profile()
                        .make_eval_request(rs, mModelConfig, mOptions, input_tensor, position_tensor, target_tensor, 0);
@@ -540,12 +592,13 @@ std::vector<float> DslModel::compute_logprobs(const std::int32_t* input_ids,
     request.forward_hook = hook_ptr;
     mExecutor->execute_forward(request, comm);
 
-    CUDA_CHECK(cudaMemcpyAsync(result.data(), logprobs_gpu, token_bytes, cudaMemcpyDeviceToHost, rs.MainStream));
+    CUDA_CHECK(cudaMemcpyAsync(scratch.host_inference_logprobs[staging_slot].Data,
+                               logprobs_gpu,
+                               token_bytes,
+                               cudaMemcpyDeviceToHost,
+                               rs.MainStream));
     CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
-    CUDA_CHECK(cudaFree(logprobs_gpu));
-    if (inv_temperature_gpu) {
-        CUDA_CHECK(cudaFree(inv_temperature_gpu));
-    }
+    std::memcpy(result.data(), scratch.host_inference_logprobs[staging_slot].get<float>(), token_bytes);
 
     if (doc_masking_active) {
         mExecutor->clear_doc_masking();
@@ -574,20 +627,11 @@ void DslModel::step_with_custom_loss(Tensor inputs,
 
     auto& rs = *mRunState;
     cudaStream_t main_stream = rs.MainStream;
-    float* inv_temperature_gpu = nullptr;
-    if (temperatures) {
-        const std::size_t bt = static_cast<std::size_t>(B_val) * static_cast<std::size_t>(T_val);
-        std::vector<float> inv_temp(bt);
-        for (std::size_t i = 0; i < bt; ++i) {
-            inv_temp[i] = 1.0f / temperatures[i];
-        }
-        CUDA_CHECK(cudaMalloc(&inv_temperature_gpu, bt * sizeof(float)));
-        CUDA_CHECK(cudaMemcpyAsync(inv_temperature_gpu,
-                                   inv_temp.data(),
-                                   bt * sizeof(float),
-                                   cudaMemcpyHostToDevice,
-                                   main_stream));
-    }
+    auto& scratch = rs.grpo_native_scratch();
+    const std::size_t bt = static_cast<std::size_t>(B_val) * static_cast<std::size_t>(T_val);
+    const int staging_slot = acquire_grpo_host_staging_slot(scratch);
+    const float* inv_temperature_gpu =
+        upload_inv_temperature_scratch(scratch, staging_slot, temperatures, bt, main_stream);
 
     if (lora_enabled()) {
         ensure_lora_run_state(comm, B_val, T_val);
@@ -605,28 +649,21 @@ void DslModel::step_with_custom_loss(Tensor inputs,
     forward_request.inv_temperature_gpu = inv_temperature_gpu;
     mExecutor->execute_forward(forward_request, comm);
 
-    const std::size_t bt = static_cast<std::size_t>(B_val) * static_cast<std::size_t>(T_val);
-    float* custom_dloss_gpu = nullptr;
-    CUDA_CHECK(cudaMalloc(&custom_dloss_gpu, bt * sizeof(float)));
-    CUDA_CHECK(cudaMemcpyAsync(custom_dloss_gpu,
-                               per_token_grads_cpu,
-                               bt * sizeof(float),
-                               cudaMemcpyHostToDevice,
-                               main_stream));
+    upload_float_scratch(scratch.host_inference_logprobs[staging_slot],
+                         scratch.custom_dloss,
+                         per_token_grads_cpu,
+                         bt,
+                         main_stream);
+    record_grpo_host_staging_slot(scratch, staging_slot, main_stream);
 
     if (!lora_enabled()) {
         auto backward_request =
             causal_lm_profile()
                 .make_backward_request(rs, mModelConfig, mOptions, inputs, targets, grad_accum_steps, micro_step);
-        backward_request.custom_dloss_gpu = custom_dloss_gpu;
+        backward_request.custom_dloss_gpu = scratch.custom_dloss.get<float>();
         backward_request.inv_temperature_gpu = inv_temperature_gpu;
         mExecutor->execute_backward(backward_request, comm);
-        CUDA_CHECK(cudaStreamSynchronize(main_stream));
-        CUDA_CHECK(cudaFree(custom_dloss_gpu));
         if (doc_masking_active) mExecutor->clear_doc_masking();
-        if (inv_temperature_gpu) {
-            CUDA_CHECK(cudaFree(inv_temperature_gpu));
-        }
         return;
     }
 
@@ -638,16 +675,11 @@ void DslModel::step_with_custom_loss(Tensor inputs,
     auto backward_request =
         causal_lm_profile()
             .make_backward_request(rs, mModelConfig, mOptions, inputs, targets, grad_accum_steps, micro_step);
-    backward_request.custom_dloss_gpu = custom_dloss_gpu;
+    backward_request.custom_dloss_gpu = scratch.custom_dloss.get<float>();
     backward_request.inv_temperature_gpu = inv_temperature_gpu;
     mExecutor->execute_backward(backward_request, comm);
-    CUDA_CHECK(cudaStreamSynchronize(main_stream));
-    CUDA_CHECK(cudaFree(custom_dloss_gpu));
 
     if (doc_masking_active) mExecutor->clear_doc_masking();
-    if (inv_temperature_gpu) {
-        CUDA_CHECK(cudaFree(inv_temperature_gpu));
-    }
 
     mLoRAGrads->end_micro_step(main_stream, comm);
     // Extend the base-model BackwardDone event to include LoRA gradient reductions.
@@ -678,24 +710,13 @@ std::vector<float> DslModel::forward_for_grpo(Tensor inputs,
 
     auto& rs = *mRunState;
     cudaStream_t main_stream = rs.MainStream;
+    auto& scratch = rs.grpo_native_scratch();
+    const int staging_slot = acquire_grpo_host_staging_slot(scratch);
 
     // Set up per-token inverse temperatures (persists for backward_grpo).
-    if (mGrpoInvTemperatureGpu) {
-        CUDA_CHECK(cudaFree(mGrpoInvTemperatureGpu));
-        mGrpoInvTemperatureGpu = nullptr;
-    }
-    if (temperatures) {
-        std::vector<float> inv_temp(BT);
-        for (std::size_t i = 0; i < BT; ++i) {
-            inv_temp[i] = 1.0f / temperatures[i];
-        }
-        CUDA_CHECK(cudaMalloc(&mGrpoInvTemperatureGpu, BT * sizeof(float)));
-        CUDA_CHECK(cudaMemcpyAsync(mGrpoInvTemperatureGpu,
-                                   inv_temp.data(),
-                                   BT * sizeof(float),
-                                   cudaMemcpyHostToDevice,
-                                   main_stream));
-    }
+    mGrpoInvTemperatureGpu =
+        const_cast<float*>(upload_inv_temperature_scratch(scratch, staging_slot, temperatures, BT, main_stream));
+    record_grpo_host_staging_slot(scratch, staging_slot, main_stream);
 
     // Always zero the losses buffer so we get per-micro-batch losses
     // (not accumulated from previous micro-steps).
@@ -753,20 +774,21 @@ void DslModel::backward_grpo(Tensor inputs,
     const int B_val = static_cast<int>(inputs.Sizes[0]);
     const int T_val = static_cast<int>(inputs.Sizes[1]);
     const std::size_t bt = static_cast<std::size_t>(B_val) * static_cast<std::size_t>(T_val);
+    auto& scratch = rs.grpo_native_scratch();
+    const int staging_slot = acquire_grpo_host_staging_slot(scratch);
 
-    float* custom_dloss_gpu = nullptr;
-    CUDA_CHECK(cudaMalloc(&custom_dloss_gpu, bt * sizeof(float)));
-    CUDA_CHECK(cudaMemcpyAsync(custom_dloss_gpu,
-                               per_token_grads_cpu,
-                               bt * sizeof(float),
-                               cudaMemcpyHostToDevice,
-                               main_stream));
+    upload_float_scratch(scratch.host_inference_logprobs[staging_slot],
+                         scratch.custom_dloss,
+                         per_token_grads_cpu,
+                         bt,
+                         main_stream);
+    record_grpo_host_staging_slot(scratch, staging_slot, main_stream);
 
     if (!lora_enabled()) {
         auto request =
             causal_lm_profile()
                 .make_backward_request(rs, mModelConfig, mOptions, inputs, targets, grad_accum_steps, micro_step);
-        request.custom_dloss_gpu = custom_dloss_gpu;
+        request.custom_dloss_gpu = scratch.custom_dloss.get<float>();
         request.inv_temperature_gpu = mGrpoInvTemperatureGpu;
         mExecutor->execute_backward(request, comm);
     } else {
@@ -778,7 +800,7 @@ void DslModel::backward_grpo(Tensor inputs,
         auto request =
             causal_lm_profile()
                 .make_backward_request(rs, mModelConfig, mOptions, inputs, targets, grad_accum_steps, micro_step);
-        request.custom_dloss_gpu = custom_dloss_gpu;
+        request.custom_dloss_gpu = scratch.custom_dloss.get<float>();
         request.inv_temperature_gpu = mGrpoInvTemperatureGpu;
         mExecutor->execute_backward(request, comm);
 
@@ -786,18 +808,206 @@ void DslModel::backward_grpo(Tensor inputs,
         internal::record_event_if_not_capturing(rs.BackwardDone, main_stream);
     }
 
-    CUDA_CHECK(cudaStreamSynchronize(main_stream));
-    CUDA_CHECK(cudaFree(custom_dloss_gpu));
-
     // Clean up state that was set by forward_for_grpo.
     if (mDocMaskingActive) {
         mExecutor->clear_doc_masking();
         mDocMaskingActive = false;
     }
-    if (mGrpoInvTemperatureGpu) {
-        CUDA_CHECK(cudaFree(mGrpoInvTemperatureGpu));
-        mGrpoInvTemperatureGpu = nullptr;
+    mGrpoInvTemperatureGpu = nullptr;
+}
+
+void DslModel::step_grpo_native(Tensor inputs,
+                                Tensor position_ids,
+                                Tensor targets,
+                                const float* inference_logprobs_cpu,
+                                const float* advantages_cpu,
+                                const std::uint8_t* loss_mask_cpu,
+                                const std::int32_t* sample_starts_cpu,
+                                const std::int32_t* sample_ends_cpu,
+                                int sample_count,
+                                int grad_accum_steps,
+                                int micro_step,
+                                NCCLCommunicator& comm,
+                                const GrpoNativeLossConfig& loss_config,
+                                const float* temperatures_cpu,
+                                const float* teacher_logprobs_cpu) {
+    if (!mExecutor) {
+        throw std::logic_error("DslModel::step_grpo_native called before allocate_run_state()");
     }
+    if (!inference_logprobs_cpu || !advantages_cpu || !loss_mask_cpu || !sample_starts_cpu || !sample_ends_cpu) {
+        throw std::invalid_argument(
+            "step_grpo_native requires inference_logprobs, advantages, loss_mask, sample ranges");
+    }
+    if (sample_count <= 0) {
+        throw std::invalid_argument("step_grpo_native requires at least one sample range");
+    }
+    if (!(loss_config.loss_scale > 0.0f) || !std::isfinite(loss_config.loss_scale)) {
+        throw std::invalid_argument("step_grpo_native loss_scale must be finite and positive");
+    }
+
+    auto& rs = *mRunState;
+    auto& scratch = rs.grpo_native_scratch();
+    cudaStream_t main_stream = rs.MainStream;
+    const int B_val = static_cast<int>(inputs.Sizes[0]);
+    const int T_val = static_cast<int>(inputs.Sizes[1]);
+    const std::size_t bt = static_cast<std::size_t>(B_val) * static_cast<std::size_t>(T_val);
+    if (bt > static_cast<std::size_t>(scratch.max_tokens) ||
+        static_cast<std::size_t>(sample_count) > static_cast<std::size_t>(scratch.max_samples)) {
+        throw std::runtime_error("step_grpo_native inputs exceed allocated GRPO scratch capacity");
+    }
+    if (micro_step == 0) {
+        CUDA_CHECK(cudaMemsetAsync(scratch.metrics.Data,
+                                   0,
+                                   static_cast<std::size_t>(GRPO_METRIC_COUNT) * sizeof(float),
+                                   main_stream));
+    }
+
+    const int staging_slot = scratch.next_host_slot;
+    scratch.next_host_slot = (scratch.next_host_slot + 1) % modules::GrpoNativeScratch::kHostStagingSlots;
+    if (scratch.host_copy_recorded[staging_slot]) {
+        CUDA_CHECK(cudaEventSynchronize(scratch.host_copy_done[staging_slot]));
+    }
+
+    auto copy_float_input = [main_stream, bt](Tensor& host, Tensor& device, const float* src) {
+        std::memcpy(host.get<float>(), src, bt * sizeof(float));
+        CUDA_CHECK(cudaMemcpyAsync(device.Data, host.Data, bt * sizeof(float), cudaMemcpyHostToDevice, main_stream));
+    };
+
+    copy_float_input(scratch.host_inference_logprobs[staging_slot], scratch.inference_logprobs, inference_logprobs_cpu);
+    copy_float_input(scratch.host_advantages[staging_slot], scratch.advantages, advantages_cpu);
+    std::memcpy(scratch.host_loss_mask[staging_slot].get<std::uint8_t>(), loss_mask_cpu, bt * sizeof(std::uint8_t));
+    CUDA_CHECK(cudaMemcpyAsync(scratch.loss_mask.Data,
+                               scratch.host_loss_mask[staging_slot].Data,
+                               bt * sizeof(std::uint8_t),
+                               cudaMemcpyHostToDevice,
+                               main_stream));
+    std::memcpy(scratch.host_sample_starts[staging_slot].get<std::int32_t>(),
+                sample_starts_cpu,
+                static_cast<std::size_t>(sample_count) * sizeof(std::int32_t));
+    std::memcpy(scratch.host_sample_ends[staging_slot].get<std::int32_t>(),
+                sample_ends_cpu,
+                static_cast<std::size_t>(sample_count) * sizeof(std::int32_t));
+    CUDA_CHECK(cudaMemcpyAsync(scratch.sample_starts.Data,
+                               scratch.host_sample_starts[staging_slot].Data,
+                               static_cast<std::size_t>(sample_count) * sizeof(std::int32_t),
+                               cudaMemcpyHostToDevice,
+                               main_stream));
+    CUDA_CHECK(cudaMemcpyAsync(scratch.sample_ends.Data,
+                               scratch.host_sample_ends[staging_slot].Data,
+                               static_cast<std::size_t>(sample_count) * sizeof(std::int32_t),
+                               cudaMemcpyHostToDevice,
+                               main_stream));
+
+    const float* teacher_logprobs_gpu = nullptr;
+    if (teacher_logprobs_cpu) {
+        copy_float_input(scratch.host_teacher_logprobs[staging_slot], scratch.teacher_logprobs, teacher_logprobs_cpu);
+        teacher_logprobs_gpu = scratch.teacher_logprobs.get<float>();
+    }
+
+    const float* inv_temperature_gpu = nullptr;
+    if (temperatures_cpu) {
+        auto* inv_temp = scratch.host_temperatures[staging_slot].get<float>();
+        for (std::size_t i = 0; i < bt; ++i) {
+            inv_temp[i] = 1.0f / temperatures_cpu[i];
+        }
+        CUDA_CHECK(cudaMemcpyAsync(scratch.inv_temperature.Data,
+                                   scratch.host_temperatures[staging_slot].Data,
+                                   bt * sizeof(float),
+                                   cudaMemcpyHostToDevice,
+                                   main_stream));
+        inv_temperature_gpu = scratch.inv_temperature.get<float>();
+    }
+    CUDA_CHECK(cudaEventRecord(scratch.host_copy_done[staging_slot], main_stream));
+    scratch.host_copy_recorded[staging_slot] = true;
+
+    const bool doc_masking_active =
+        causal_lm_profile().apply_doc_masking(*mExecutor, mOptions, mModelConfig, inputs, position_ids, micro_step);
+
+    if (lora_enabled()) {
+        ensure_lora_run_state(comm, B_val, T_val);
+        if (qlora_enabled() && micro_step == 0 && mQLoRAProvider) {
+            mQLoRAProvider->invalidate_cache();
+        }
+        mLoRARunState->micro_step = micro_step;
+        mLoRARunState->is_training = true;
+    }
+
+    auto forward_request =
+        causal_lm_profile().make_eval_request(rs, mModelConfig, mOptions, inputs, position_ids, targets, micro_step);
+    forward_request.mode = ExecutionMode::Forward;
+    forward_request.reduce_loss_on_completion = false;
+    forward_request.inv_temperature_gpu = inv_temperature_gpu;
+    mExecutor->execute_forward(forward_request, comm);
+
+    compute_grpo_custom_dloss(scratch.custom_dloss.get<float>(),
+                              scratch.metrics.get<float>(),
+                              rs.Losses.get<float>(),
+                              scratch.inference_logprobs.get<float>(),
+                              scratch.advantages.get<float>(),
+                              scratch.loss_mask.get<std::uint8_t>(),
+                              teacher_logprobs_gpu,
+                              scratch.sample_starts.get<std::int32_t>(),
+                              scratch.sample_ends.get<std::int32_t>(),
+                              sample_count,
+                              static_cast<int>(bt),
+                              loss_config.loss_scale,
+                              loss_config.ipo_mask_low,
+                              loss_config.ipo_mask_high,
+                              loss_config.adv_tau,
+                              loss_config.teacher_tau,
+                              loss_config.kl_tau,
+                              main_stream);
+
+    if (!lora_enabled()) {
+        auto backward_request =
+            causal_lm_profile()
+                .make_backward_request(rs, mModelConfig, mOptions, inputs, targets, grad_accum_steps, micro_step);
+        backward_request.custom_dloss_gpu = scratch.custom_dloss.get<float>();
+        backward_request.inv_temperature_gpu = inv_temperature_gpu;
+        mExecutor->execute_backward(backward_request, comm);
+        if (doc_masking_active) mExecutor->clear_doc_masking();
+        return;
+    }
+
+    mLoRAGrads->start_micro_step(main_stream, micro_step, grad_accum_steps);
+    auto backward_request =
+        causal_lm_profile()
+            .make_backward_request(rs, mModelConfig, mOptions, inputs, targets, grad_accum_steps, micro_step);
+    backward_request.custom_dloss_gpu = scratch.custom_dloss.get<float>();
+    backward_request.inv_temperature_gpu = inv_temperature_gpu;
+    mExecutor->execute_backward(backward_request, comm);
+    if (doc_masking_active) mExecutor->clear_doc_masking();
+    mLoRAGrads->end_micro_step(main_stream, comm);
+    internal::record_event_if_not_capturing(rs.BackwardDone, main_stream);
+}
+
+GrpoNativeMetrics DslModel::consume_grpo_native_metrics() {
+    if (!mRunState) {
+        throw std::logic_error("DslModel::consume_grpo_native_metrics called before allocate_run_state()");
+    }
+    auto& rs = *mRunState;
+    auto& scratch = rs.grpo_native_scratch();
+    CUDA_CHECK(cudaMemcpyAsync(scratch.host_metrics.Data,
+                               scratch.metrics.Data,
+                               static_cast<std::size_t>(GRPO_METRIC_COUNT) * sizeof(float),
+                               cudaMemcpyDeviceToHost,
+                               rs.MainStream));
+    CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
+
+    const auto* values = scratch.host_metrics.get<float>();
+    const float sample_count = std::max(values[GRPO_METRIC_SAMPLE_COUNT], 1.0f);
+    GrpoNativeMetrics metrics;
+    metrics.policy_loss = values[GRPO_METRIC_POLICY_LOSS] / sample_count;
+    metrics.mismatch_kl = values[GRPO_METRIC_MISMATCH_KL] / sample_count;
+    metrics.masked_mismatch_kl = values[GRPO_METRIC_MASKED_MISMATCH_KL] / sample_count;
+    metrics.unmasked_mismatch_kl = values[GRPO_METRIC_UNMASKED_MISMATCH_KL] / sample_count;
+    metrics.is_masked = values[GRPO_METRIC_IS_MASKED] / sample_count;
+    metrics.is_masked_low = values[GRPO_METRIC_IS_MASKED_LOW] / sample_count;
+    metrics.is_masked_high = values[GRPO_METRIC_IS_MASKED_HIGH] / sample_count;
+    metrics.teacher_kl = values[GRPO_METRIC_TEACHER_KL] / sample_count;
+    metrics.keep_tokens = values[GRPO_METRIC_KEEP_TOKENS];
+    metrics.total_tokens = values[GRPO_METRIC_TOTAL_TOKENS];
+    return metrics;
 }
 
 }  // namespace dsl

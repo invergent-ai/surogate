@@ -1783,6 +1783,79 @@ NB_MODULE(_surogate, m) {
             "Call backward_grpo() after computing per-token gradient multipliers.\n"
             "Returns: float32 logprobs shaped [B, T].")
         .def(
+            "step_grpo_native",
+            [](MultiGPUPyTrainer* trainer,
+               nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig> input_ids,
+               nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig> targets,
+               nb::ndarray<float, nb::ndim<1>, nb::c_contig> inference_logprobs,
+               nb::ndarray<float, nb::ndim<1>, nb::c_contig> advantages,
+               nb::ndarray<std::uint8_t, nb::ndim<1>, nb::c_contig> loss_mask,
+               nb::ndarray<std::int32_t, nb::ndim<1>, nb::c_contig> sample_starts,
+               nb::ndarray<std::int32_t, nb::ndim<1>, nb::c_contig> sample_ends,
+               nb::object position_ids_obj,
+               nb::object temperatures_obj,
+               nb::object teacher_logprobs_obj,
+               float loss_scale,
+               float ipo_mask_low,
+               float ipo_mask_high,
+               float adv_tau,
+               float teacher_tau,
+               float kl_tau) {
+                if (sample_starts.shape(0) != sample_ends.shape(0)) {
+                    throw std::invalid_argument("sample_starts and sample_ends must have the same length");
+                }
+                const std::int32_t* position_ids_ptr = nullptr;
+                if (!position_ids_obj.is_none()) {
+                    auto position_ids = nb::cast<nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig>>(position_ids_obj);
+                    position_ids_ptr = position_ids.data();
+                }
+                const float* temperatures_ptr = nullptr;
+                if (!temperatures_obj.is_none()) {
+                    auto temperatures = nb::cast<nb::ndarray<float, nb::ndim<2>, nb::c_contig>>(temperatures_obj);
+                    temperatures_ptr = temperatures.data();
+                }
+                const float* teacher_logprobs_ptr = nullptr;
+                if (!teacher_logprobs_obj.is_none()) {
+                    auto teacher_logprobs =
+                        nb::cast<nb::ndarray<float, nb::ndim<1>, nb::c_contig>>(teacher_logprobs_obj);
+                    teacher_logprobs_ptr = teacher_logprobs.data();
+                }
+                trainer->step_grpo_native(input_ids.data(),
+                                          targets.data(),
+                                          inference_logprobs.data(),
+                                          advantages.data(),
+                                          loss_mask.data(),
+                                          sample_starts.data(),
+                                          sample_ends.data(),
+                                          static_cast<int>(sample_starts.shape(0)),
+                                          position_ids_ptr,
+                                          temperatures_ptr,
+                                          teacher_logprobs_ptr,
+                                          loss_scale,
+                                          ipo_mask_low,
+                                          ipo_mask_high,
+                                          adv_tau,
+                                          teacher_tau,
+                                          kl_tau);
+            },
+            nb::arg("input_ids"),
+            nb::arg("targets"),
+            nb::arg("inference_logprobs"),
+            nb::arg("advantages"),
+            nb::arg("loss_mask"),
+            nb::arg("sample_starts"),
+            nb::arg("sample_ends"),
+            nb::arg("position_ids") = nb::none(),
+            nb::arg("temperatures") = nb::none(),
+            nb::arg("teacher_logprobs") = nb::none(),
+            nb::arg("loss_scale") = 1.0f,
+            nb::arg("ipo_mask_low") = 0.2f,
+            nb::arg("ipo_mask_high") = 0.2f,
+            nb::arg("adv_tau") = 1.0f,
+            nb::arg("teacher_tau") = 0.0f,
+            nb::arg("kl_tau") = 1.0e-3f,
+            "Run one GRPO training micro-step with native CUDA per-token gradient generation.")
+        .def(
             "backward_grpo",
             [](MultiGPUPyTrainer* trainer,
                nb::ndarray<float, nb::ndim<2>, nb::c_contig> per_token_grads,
@@ -1793,6 +1866,16 @@ NB_MODULE(_surogate, m) {
             nb::arg("per_token_grads"),
             nb::arg("position_ids") = nb::none(),
             "GRPO backward pass using activations saved by forward_for_grpo().")
+        .def(
+            "get_grpo_native_metrics",
+            [](MultiGPUPyTrainer* trainer) {
+                nb::dict out;
+                for (const auto& [key, value] : trainer->get_grpo_native_metrics()) {
+                    out[key.c_str()] = value;
+                }
+                return out;
+            },
+            "Return native GRPO metrics accumulated since the current grad-accum step started.")
         .def("set_grad_accumulation",
              &MultiGPUPyTrainer::set_grad_accumulation,
              nb::arg("n"),

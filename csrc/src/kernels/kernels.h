@@ -1654,6 +1654,25 @@ void extract_logprobs(const Tensor& logits,
                       int P,
                       cudaStream_t stream);
 
+void compute_grpo_custom_dloss(float* custom_dloss,
+                               float* metrics,
+                               const float* losses,
+                               const float* inference_logprobs,
+                               const float* advantages,
+                               const std::uint8_t* loss_mask,
+                               const float* teacher_logprobs,
+                               const std::int32_t* sample_starts,
+                               const std::int32_t* sample_ends,
+                               int sample_count,
+                               int BT,
+                               float loss_scale,
+                               float ipo_mask_low,
+                               float ipo_mask_high,
+                               float adv_tau,
+                               float teacher_tau,
+                               float kl_tau,
+                               cudaStream_t stream);
+
 /// Scale logits rows by per-token inverse temperature (in-place).
 /// logits is [BT, P], inv_temperature is [BT].
 void scale_logits_rows(float* logits, const float* inv_temperature, int BT, int V, int P, cudaStream_t stream);

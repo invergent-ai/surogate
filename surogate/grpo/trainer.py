@@ -3,9 +3,7 @@
 Training loop:
     1. Wait for batch from orchestrator (packer on master, transport to all ranks)
     2. For each micro-batch (packed sequence with multiple samples):
-       a. compute_logprobs() on packed batch -> current policy log-probs
-       b. compute_grpo_per_token_grads() -> per-token gradient multipliers
-       c. step_with_custom_loss() on packed batch -> forward + backward
+       a. step_grpo_native() on packed batch -> forward + native GRPO dloss + backward
     3. update_with_config() -> optimizer step
     4. Broadcast updated weights to inference engine
 
@@ -22,7 +20,6 @@ import numpy as np
 from surogate import _surogate
 from surogate.grpo.config import GRPOTrainConfig
 from surogate.grpo.data import GRPODataLoader
-from surogate.grpo.loss import compute_grpo_per_token_grads
 from surogate.grpo.runs import get_multi_run_manager
 from surogate.grpo.weight_broadcast import SurogateWeightBroadcast
 from surogate.train.lr_schedule import LRSchedule
@@ -322,17 +319,7 @@ class GRPOTrainer:
             # (loss = total_loss / loss_scale).
 
             # 4. Process each micro-batch (gradients accumulate in C++)
-            step_metrics = {
-                "policy_loss": 0.0,
-                "mismatch_kl": 0.0,
-                "is_masked": 0.0,
-                "keep_tokens": 0,
-                "total_tokens": 0,
-            }
-
-            for mb_idx, mb in enumerate(micro_batches):
-                mb_start = time.time()
-
+            for mb in micro_batches:
                 # Original micro-batch data
                 orig_input_ids = mb["input_ids"]  # [1, T_mb]
                 orig_position_ids = mb["position_ids"]  # [1, T_mb]
@@ -393,58 +380,38 @@ class GRPOTrainer:
                     targets_step = np.tile(targets_padded, (ngpu, 1))
                     temp_step = np.tile(temp_padded, (ngpu, 1))
 
-                # --- Single forward pass: logprobs + save activations ---
-                logprob_start = time.time()
-                raw_lp_full = self.trainer.forward_for_grpo(
+                inference_padded = np.zeros(seq_len, dtype=np.float32)
+                inference_padded[:T_actual] = inference_lp[:T_actual]
+                advantages_padded = np.zeros(seq_len, dtype=np.float32)
+                advantages_padded[:T_actual] = advantages_flat[:T_actual]
+                loss_mask_padded = np.zeros(seq_len, dtype=np.uint8)
+                loss_mask_padded[:T_actual] = loss_mask_flat[:T_actual].astype(np.uint8)
+                teacher_padded = None
+                if teacher_lp is not None:
+                    teacher_padded = np.zeros(seq_len, dtype=np.float32)
+                    teacher_padded[:T_actual] = teacher_lp[:T_actual]
+
+                sample_starts = np.asarray([start for start, _ in sample_ranges], dtype=np.int32)
+                sample_ends = np.asarray([end for _, end in sample_ranges], dtype=np.int32)
+
+                self.trainer.step_grpo_native(
                     input_step,
                     targets_step,
+                    inference_padded,
+                    advantages_padded,
+                    loss_mask_padded,
+                    sample_starts,
+                    sample_ends,
                     position_ids=pos_step,
                     temperatures=temp_step,
+                    teacher_logprobs=teacher_padded,
+                    loss_scale=float(loss_scale),
+                    ipo_mask_low=float(config.loss.ipo_mask_low),
+                    ipo_mask_high=float(config.loss.ipo_mask_high),
+                    adv_tau=float(config.loss.adv_tau),
+                    teacher_tau=float(config.loss.teacher_tau),
+                    kl_tau=float(config.loss.kl_tau),
                 )
-                raw_lp = np.asarray(raw_lp_full[0, :T_actual], dtype=np.float32)
-                logprob_time = time.time() - logprob_start
-
-                # Right-shift globally (packed sequence),
-                # shift_tensor_right after a packed shift_tensor_left.
-                all_trainer_logprobs = np.zeros(T_actual, dtype=np.float32)
-                if T_actual > 1:
-                    all_trainer_logprobs[1:T_actual] = raw_lp[: T_actual - 1]
-                if self._pad_logprob is not None and T_actual > 0:
-                    all_trainer_logprobs[0] = self._pad_logprob
-
-                # --- GRPO gradient computation (per-sample) ---
-                grpo_start = time.time()
-                per_token_grads_flat, mb_metrics = compute_grpo_per_token_grads(
-                    trainer_logprobs=all_trainer_logprobs,
-                    inference_logprobs=inference_lp[:T_actual],
-                    advantages=advantages_flat[:T_actual],
-                    loss_mask=loss_mask_flat[:T_actual],
-                    loss_config=config.loss,
-                    sample_ranges=sample_ranges,
-                    teacher_logprobs=teacher_lp[:T_actual] if teacher_lp is not None else None,
-                )
-                if loss_scale > 1:
-                    per_token_grads_flat = per_token_grads_flat / float(loss_scale)
-
-                # --- Global left-shift of gradients (packed sequence) ---
-                # Align with global next-token shift used for labels.
-                surogate_grads = np.zeros(T_actual, dtype=np.float32)
-                if T_actual > 1:
-                    surogate_grads[: T_actual - 1] = per_token_grads_flat[1:T_actual]
-
-                grads_padded = np.zeros((1, seq_len), dtype=np.float32)
-                grads_padded[0, :T_actual] = surogate_grads
-
-                if ngpu > 1:
-                    grads_padded = np.tile(grads_padded, (ngpu, 1))
-
-                # --- Backward pass only (reuses saved activations from forward) ---
-                self.trainer.backward_grpo(grads_padded)
-
-                # Accumulate metrics
-                for key in step_metrics:
-                    if key in mb_metrics:
-                        step_metrics[key] += mb_metrics[key]
 
             # 5. Optimizer step — one per orchestrator step
             lr = self.lr_schedule.get_lr(orch_step)
@@ -462,17 +429,17 @@ class GRPOTrainer:
             expected_loss_scale = loss_scale
 
             result = self.trainer.update_with_config(opt_config, step + 1)
+            step_metrics = dict(self.trainer.get_grpo_native_metrics())
 
             step_time = time.time() - step_start
 
             # 6. Logging
             if step % config.logging_steps == 0:
-                avg_metrics = {k: v / max(n_mb, 1) for k, v in step_metrics.items() if isinstance(v, float)}
                 logger.info(
-                    f"step={step} loss={avg_metrics.get('policy_loss', 0):.4f} "
+                    f"step={step} loss={step_metrics.get('policy_loss', 0):.4f} "
                     f"grad_norm={result['norm']:.4f} lr={lr:.2e} "
-                    f"kl={avg_metrics.get('mismatch_kl', 0):.4f} "
-                    f"masked={avg_metrics.get('is_masked', 0):.2%} "
+                    f"kl={step_metrics.get('mismatch_kl', 0):.4f} "
+                    f"masked={step_metrics.get('is_masked', 0):.2%} "
                     f"tokens={step_metrics.get('total_tokens', 0)} "
                     f"micro_batches={n_mb} "
                     f"vtc={vtc} expected={expected_loss_scale} "
@@ -486,10 +453,15 @@ class GRPOTrainer:
                     self.metrics_writer.track(
                         step,
                         **{
-                            "train/policy_loss": avg_metrics.get("policy_loss", 0.0),
-                            "train/mismatch_kl": avg_metrics.get("mismatch_kl", 0.0),
-                            "train/is_masked": avg_metrics.get("is_masked", 0.0),
-                            "train/keep_tokens": float(step_metrics.get("keep_tokens", 0)),
+                            "train/policy_loss": float(step_metrics.get("policy_loss", 0.0)),
+                            "train/mismatch_kl": float(step_metrics.get("mismatch_kl", 0.0)),
+                            "train/masked_mismatch_kl": float(step_metrics.get("masked_mismatch_kl", 0.0)),
+                            "train/unmasked_mismatch_kl": float(step_metrics.get("unmasked_mismatch_kl", 0.0)),
+                            "train/is_masked": float(step_metrics.get("is_masked", 0.0)),
+                            "train/is_masked_low": float(step_metrics.get("is_masked_low", 0.0)),
+                            "train/is_masked_high": float(step_metrics.get("is_masked_high", 0.0)),
+                            "train/teacher_kl": float(step_metrics.get("teacher_kl", 0.0)),
+                            "train/keep_tokens": float(step_metrics.get("keep_tokens", 0.0)),
                             "train/total_tokens": float(total_tokens),
                             "train/grad_norm": float(result["norm"]),
                             "train/lr": float(lr),
