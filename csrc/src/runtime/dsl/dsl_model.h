@@ -8,6 +8,7 @@
 
 #include <memory>
 #include <optional>
+#include <cstdint>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -51,6 +52,15 @@ class DslParamStore;
 class DslGradStore;
 class DslRunState;
 class DslWeightManager;
+
+struct GrpoNativeLossConfig {
+    float loss_scale = 1.0f;
+    float ipo_mask_low = 0.2f;
+    float ipo_mask_high = 0.2f;
+    float adv_tau = 1.0f;
+    float teacher_tau = 0.0f;
+    float kl_tau = 1.0e-3f;
+};
 
 class EmptyTensorContainer final : public ITensorContainer {
 public:
@@ -255,6 +265,22 @@ public:
                        int grad_accum_steps,
                        int micro_step,
                        NCCLCommunicator& comm);
+
+    void step_grpo_native(Tensor inputs,
+                          Tensor position_ids,
+                          Tensor targets,
+                          const float* inference_logprobs_cpu,
+                          const float* advantages_cpu,
+                          const std::uint8_t* loss_mask_cpu,
+                          const std::int32_t* sample_starts_cpu,
+                          const std::int32_t* sample_ends_cpu,
+                          int sample_count,
+                          int grad_accum_steps,
+                          int micro_step,
+                          NCCLCommunicator& comm,
+                          const GrpoNativeLossConfig& loss_config,
+                          const float* temperatures_cpu = nullptr,
+                          const float* teacher_logprobs_cpu = nullptr);
 
     void init_weights(NCCLCommunicator& comm) override;
     void import_weights(const std::string& file_name, bool allow_cast, NCCLCommunicator& comm) override;

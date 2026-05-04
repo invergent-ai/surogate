@@ -1062,6 +1062,39 @@ void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {
         }
     }
 
+    mGrpoNativeScratch.max_tokens = BT;
+    mGrpoNativeScratch.max_samples = BT;
+    mGrpoNativeScratch.inference_logprobs =
+        mAllocator->allocate(ETensorDType::FP32, "grpo_inference_logprobs", EAllocationType::ON_DEVICE, {BT});
+    mGrpoNativeScratch.advantages =
+        mAllocator->allocate(ETensorDType::FP32, "grpo_advantages", EAllocationType::ON_DEVICE, {BT});
+    mGrpoNativeScratch.teacher_logprobs =
+        mAllocator->allocate(ETensorDType::FP32, "grpo_teacher_logprobs", EAllocationType::ON_DEVICE, {BT});
+    mGrpoNativeScratch.loss_mask =
+        mAllocator->allocate(ETensorDType::BYTE, "grpo_loss_mask", EAllocationType::ON_DEVICE, {BT});
+    mGrpoNativeScratch.sample_starts =
+        mAllocator->allocate(ETensorDType::INT32, "grpo_sample_starts", EAllocationType::ON_DEVICE, {BT});
+    mGrpoNativeScratch.sample_ends =
+        mAllocator->allocate(ETensorDType::INT32, "grpo_sample_ends", EAllocationType::ON_DEVICE, {BT});
+    mGrpoNativeScratch.custom_dloss =
+        mAllocator->allocate(ETensorDType::FP32, "grpo_custom_dloss", EAllocationType::ON_DEVICE, {BT});
+    mGrpoNativeScratch.inv_temperature =
+        mAllocator->allocate(ETensorDType::FP32, "grpo_inv_temperature", EAllocationType::ON_DEVICE, {BT});
+    mGrpoNativeScratch.host_inference_logprobs =
+        mAllocator->allocate(ETensorDType::FP32, "grpo_host_inference_logprobs", EAllocationType::PINNED, {BT});
+    mGrpoNativeScratch.host_advantages =
+        mAllocator->allocate(ETensorDType::FP32, "grpo_host_advantages", EAllocationType::PINNED, {BT});
+    mGrpoNativeScratch.host_teacher_logprobs =
+        mAllocator->allocate(ETensorDType::FP32, "grpo_host_teacher_logprobs", EAllocationType::PINNED, {BT});
+    mGrpoNativeScratch.host_temperatures =
+        mAllocator->allocate(ETensorDType::FP32, "grpo_host_temperatures", EAllocationType::PINNED, {BT});
+    mGrpoNativeScratch.host_loss_mask =
+        mAllocator->allocate(ETensorDType::BYTE, "grpo_host_loss_mask", EAllocationType::PINNED, {BT});
+    mGrpoNativeScratch.host_sample_starts =
+        mAllocator->allocate(ETensorDType::INT32, "grpo_host_sample_starts", EAllocationType::PINNED, {BT});
+    mGrpoNativeScratch.host_sample_ends =
+        mAllocator->allocate(ETensorDType::INT32, "grpo_host_sample_ends", EAllocationType::PINNED, {BT});
+
     // Encoder backward scratch buffers - skip in LoRA-only mode since embedding backward is skipped entirely
     if (mRunStateRequirements.encoder_backward_scratch && !mLoraOnlyMode) {
         const long group_width = static_cast<long>(16 / get_dtype_size(mGradDtype) * 32);

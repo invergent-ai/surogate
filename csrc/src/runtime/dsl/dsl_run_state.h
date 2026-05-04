@@ -172,6 +172,9 @@ public:
     modules::ScratchBuffers& scratch() {
         return mScratch;
     }
+    modules::GrpoNativeScratch& grpo_native_scratch() {
+        return mGrpoNativeScratch;
+    }
     Tensor& rope_freqs(std::string_view name);
     const Tensor& rope_freqs(std::string_view name) const;
 
@@ -397,6 +400,7 @@ private:
     modules::NonBlockActivations mNonBlockActivations;
     modules::NonBlockGradientBuffers mNonBlockGradients;
     modules::ScratchBuffers mScratch;
+    modules::GrpoNativeScratch mGrpoNativeScratch;
     TensorSlotRegistry mSlotRegistry;
     /// Compile-time buffer-sharing plan. Built once in the constructor (after
     /// the slot registry is initialized from the DSL layout) and consumed by
