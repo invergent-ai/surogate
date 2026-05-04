@@ -1,7 +1,11 @@
 import numpy as np
 
 from surogate.grpo.config import GRPOLossConfig
-from surogate.grpo.loss import compute_grpo_per_token_grads, compute_native_shifted_grpo_dloss_reference
+from surogate.grpo.loss import (
+    compute_grpo_per_token_grads,
+    compute_native_grpo_metrics_reference,
+    compute_native_shifted_grpo_dloss_reference,
+)
 
 
 def _expected_shifted_dloss(
@@ -93,3 +97,37 @@ def test_native_shifted_formula_matches_existing_grpo_loss_with_teacher():
         loss_scale=2.0,
     )
     np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-7)
+
+
+def test_native_metrics_reference_matches_existing_grpo_metrics():
+    trainer_logprobs = np.array([-7.0, -1.2, -0.8, -3.1, -2.0, -0.4, -5.0], dtype=np.float32)
+    inference_logprobs = np.array([-7.0, -1.4, -0.7, -2.8, -2.1, -0.5, -4.6], dtype=np.float32)
+    teacher_logprobs = np.array([-7.0, -1.0, -1.1, -3.0, -2.3, -0.9, -4.9], dtype=np.float32)
+    advantages = np.array([0.0, 1.5, -0.2, 0.7, 0.0, 2.0, -1.0], dtype=np.float32)
+    loss_mask = np.array([False, True, True, True, False, True, True])
+    sample_ranges = [(0, 4), (4, 7)]
+    config = GRPOLossConfig(ipo_mask_low=0.15, ipo_mask_high=0.15, adv_tau=0.9, teacher_tau=0.3, kl_tau=0.03)
+
+    _, expected = compute_grpo_per_token_grads(
+        trainer_logprobs=trainer_logprobs,
+        inference_logprobs=inference_logprobs,
+        advantages=advantages,
+        loss_mask=loss_mask,
+        loss_config=config,
+        sample_ranges=sample_ranges,
+        teacher_logprobs=teacher_logprobs,
+    )
+
+    actual = compute_native_grpo_metrics_reference(
+        trainer_logprobs=trainer_logprobs,
+        inference_logprobs=inference_logprobs,
+        advantages=advantages,
+        loss_mask=loss_mask,
+        loss_config=config,
+        sample_ranges=sample_ranges,
+        teacher_logprobs=teacher_logprobs,
+    )
+
+    for key, expected_value in expected.items():
+        assert key in actual
+        assert actual[key] == expected_value

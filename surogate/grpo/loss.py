@@ -233,3 +233,25 @@ def compute_native_shifted_grpo_dloss_reference(
     if loss_scale != 1.0:
         shifted = shifted / float(loss_scale)
     return shifted
+
+
+def compute_native_grpo_metrics_reference(
+    trainer_logprobs: np.ndarray,
+    inference_logprobs: np.ndarray,
+    advantages: np.ndarray,
+    loss_mask: np.ndarray,
+    loss_config: GRPOLossConfig,
+    sample_ranges: list[tuple[int, int]],
+    teacher_logprobs: np.ndarray | None = None,
+) -> dict[str, float]:
+    """Reference metrics for the native GRPO CUDA accumulator."""
+    _, metrics = compute_grpo_per_token_grads(
+        trainer_logprobs=trainer_logprobs,
+        inference_logprobs=inference_logprobs,
+        advantages=advantages,
+        loss_mask=loss_mask,
+        loss_config=loss_config,
+        sample_ranges=sample_ranges,
+        teacher_logprobs=teacher_logprobs,
+    )
+    return metrics
