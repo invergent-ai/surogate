@@ -1163,6 +1163,108 @@ void extract_logprobs(const nv_bfloat16* logits,
 }
 
 // ----------------------------------------------------------------------------
+// Native GRPO custom dloss generation
+
+__global__ void grpo_custom_dloss_kernel(float* custom_dloss,
+                                         const float* losses,
+                                         const float* inference_logprobs,
+                                         const float* advantages,
+                                         const std::uint8_t* loss_mask,
+                                         const float* teacher_logprobs,
+                                         const std::int32_t* sample_starts,
+                                         const std::int32_t* sample_ends,
+                                         int sample_count,
+                                         int BT,
+                                         float inv_loss_scale,
+                                         float ipo_mask_low,
+                                         float ipo_mask_high,
+                                         float adv_tau,
+                                         float teacher_tau,
+                                         float kl_tau) {
+    const int sample_idx = static_cast<int>(blockIdx.x);
+    if (sample_idx >= sample_count) {
+        return;
+    }
+
+    const int start = sample_starts[sample_idx];
+    const int end = sample_ends[sample_idx];
+    if (start < 0 || end > BT || start >= end) {
+        return;
+    }
+
+    for (int out_idx = start + static_cast<int>(threadIdx.x); out_idx < end; out_idx += static_cast<int>(blockDim.x)) {
+        if (out_idx + 1 >= end) {
+            custom_dloss[out_idx] = 0.0f;
+            continue;
+        }
+
+        const int logical_idx = out_idx + 1;
+        if (loss_mask[logical_idx] == 0) {
+            custom_dloss[out_idx] = 0.0f;
+            continue;
+        }
+
+        const float trainer_logprob = -losses[out_idx];
+        const float inference_logprob = inference_logprobs[logical_idx];
+        const float log_importance_ratio = trainer_logprob - inference_logprob;
+        const float importance_ratio = expf(log_importance_ratio);
+        const float probs_diff = expf(trainer_logprob) - expf(inference_logprob);
+        const bool is_masked = (probs_diff > ipo_mask_high) || (probs_diff < -ipo_mask_low);
+
+        float dloss = -2.0f * kl_tau * log_importance_ratio;
+        if (!is_masked) {
+            float scaled_advantage = adv_tau * advantages[logical_idx];
+            if (teacher_logprobs) {
+                scaled_advantage += teacher_tau * (teacher_logprobs[logical_idx] - trainer_logprob);
+            }
+            dloss += scaled_advantage * importance_ratio;
+        }
+        custom_dloss[out_idx] = dloss * inv_loss_scale;
+    }
+}
+
+void compute_grpo_custom_dloss(float* custom_dloss,
+                               const float* losses,
+                               const float* inference_logprobs,
+                               const float* advantages,
+                               const std::uint8_t* loss_mask,
+                               const float* teacher_logprobs,
+                               const std::int32_t* sample_starts,
+                               const std::int32_t* sample_ends,
+                               int sample_count,
+                               int BT,
+                               float loss_scale,
+                               float ipo_mask_low,
+                               float ipo_mask_high,
+                               float adv_tau,
+                               float teacher_tau,
+                               float kl_tau,
+                               cudaStream_t stream) {
+    if (sample_count <= 0 || BT <= 0) {
+        return;
+    }
+    CUDA_CHECK(cudaMemsetAsync(custom_dloss, 0, static_cast<std::size_t>(BT) * sizeof(float), stream));
+    const float inv_loss_scale = (loss_scale == 0.0f) ? 1.0f : (1.0f / loss_scale);
+    grpo_custom_dloss_kernel<<<sample_count, 256, 0, stream>>>(custom_dloss,
+                                                               losses,
+                                                               inference_logprobs,
+                                                               advantages,
+                                                               loss_mask,
+                                                               teacher_logprobs,
+                                                               sample_starts,
+                                                               sample_ends,
+                                                               sample_count,
+                                                               BT,
+                                                               inv_loss_scale,
+                                                               ipo_mask_low,
+                                                               ipo_mask_high,
+                                                               adv_tau,
+                                                               teacher_tau,
+                                                               kl_tau);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// ----------------------------------------------------------------------------
 // Per-token temperature scaling (in-place): logits[idx, :] *= inv_temperature[idx]
 
 template <class floatX>
