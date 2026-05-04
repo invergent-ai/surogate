@@ -319,10 +319,6 @@ class GRPOTrainer:
             # (loss = total_loss / loss_scale).
 
             # 4. Process each micro-batch (gradients accumulate in C++)
-            step_metrics = {
-                "total_tokens": 0,
-            }
-
             for mb in micro_batches:
                 # Original micro-batch data
                 orig_input_ids = mb["input_ids"]  # [1, T_mb]
@@ -417,8 +413,6 @@ class GRPOTrainer:
                     kl_tau=float(config.loss.kl_tau),
                 )
 
-                step_metrics["total_tokens"] += int(loss_mask_padded.sum())
-
             # 5. Optimizer step — one per orchestrator step
             lr = self.lr_schedule.get_lr(orch_step)
             opt_config = _surogate.OptimizerConfig(
@@ -435,16 +429,17 @@ class GRPOTrainer:
             expected_loss_scale = loss_scale
 
             result = self.trainer.update_with_config(opt_config, step + 1)
+            step_metrics = dict(self.trainer.get_grpo_native_metrics())
 
             step_time = time.time() - step_start
 
             # 6. Logging
             if step % config.logging_steps == 0:
                 logger.info(
-                    f"step={step} loss=n/a "
+                    f"step={step} loss={step_metrics.get('policy_loss', 0):.4f} "
                     f"grad_norm={result['norm']:.4f} lr={lr:.2e} "
-                    f"kl=n/a "
-                    f"masked=n/a "
+                    f"kl={step_metrics.get('mismatch_kl', 0):.4f} "
+                    f"masked={step_metrics.get('is_masked', 0):.2%} "
                     f"tokens={step_metrics.get('total_tokens', 0)} "
                     f"micro_batches={n_mb} "
                     f"vtc={vtc} expected={expected_loss_scale} "
@@ -458,6 +453,15 @@ class GRPOTrainer:
                     self.metrics_writer.track(
                         step,
                         **{
+                            "train/policy_loss": float(step_metrics.get("policy_loss", 0.0)),
+                            "train/mismatch_kl": float(step_metrics.get("mismatch_kl", 0.0)),
+                            "train/masked_mismatch_kl": float(step_metrics.get("masked_mismatch_kl", 0.0)),
+                            "train/unmasked_mismatch_kl": float(step_metrics.get("unmasked_mismatch_kl", 0.0)),
+                            "train/is_masked": float(step_metrics.get("is_masked", 0.0)),
+                            "train/is_masked_low": float(step_metrics.get("is_masked_low", 0.0)),
+                            "train/is_masked_high": float(step_metrics.get("is_masked_high", 0.0)),
+                            "train/teacher_kl": float(step_metrics.get("teacher_kl", 0.0)),
+                            "train/keep_tokens": float(step_metrics.get("keep_tokens", 0.0)),
                             "train/total_tokens": float(total_tokens),
                             "train/grad_norm": float(result["norm"]),
                             "train/lr": float(lr),
