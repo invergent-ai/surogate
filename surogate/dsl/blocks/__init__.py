@@ -9,6 +9,7 @@ from .gemma4 import (
 )
 from .gpt_oss import GptOssBlock
 from .llama import LlamaBlock
+from .lfm2 import Lfm2AttentionBlock, Lfm2ConvBlock
 from .nemotron_h import (
     NemotronHAttentionBlock,
     NemotronHMamba2Block,
@@ -31,6 +32,8 @@ __all__ = [
     "Qwen3MoEBlock",
     "GptOssBlock",
     "LlamaBlock",
+    "Lfm2AttentionBlock",
+    "Lfm2ConvBlock",
     # Gemma4 hybrid blocks
     "Gemma4SlidingBlock",
     "Gemma4FullBlock",

@@ -534,7 +534,7 @@ void apply_arch_from_hf_config(PretrainedConfig& cfg, const Module& module) {
 }
 
 /// Parse a standardised hybrid pattern string into per-layer overrides.
-/// Standard alphabet: M=Mamba, A=Attention, P=MLP, E=MoE.
+/// Standard alphabet: M=Mamba, A=Attention, P=MLP, E=MoE, C=Conv.
 std::vector<modules::LayerOverride> parse_hybrid_pattern_to_overrides(const std::string& pattern) {
     std::vector<modules::LayerOverride> overrides;
     overrides.reserve(pattern.size());
@@ -544,9 +544,10 @@ std::vector<modules::LayerOverride> parse_hybrid_pattern_to_overrides(const std:
             case 'A': overrides.push_back(modules::LayerOverride::attention(i)); break;
             case 'P': overrides.push_back(modules::LayerOverride::mlp(i)); break;
             case 'E': overrides.push_back(modules::LayerOverride::moe(i)); break;
+            case 'C': overrides.push_back(modules::LayerOverride::conv(i)); break;
             default:
                 throw std::runtime_error(fmt::format("Invalid character '{}' at index {} in hybrid_pattern. "
-                                                     "Expected 'M', 'A', 'P', or 'E'.",
+                                                     "Expected 'M', 'A', 'P', 'E', or 'C'.",
                                                      pattern[i],
                                                      i));
         }
@@ -588,6 +589,8 @@ parse_layer_types_to_overrides(const std::vector<std::string>& layer_types) {
             overrides.push_back(modules::LayerOverride::mlp(i));
         } else if (lower == "mamba") {
             overrides.push_back(modules::LayerOverride::mamba(i));
+        } else if (lower == "conv" || lower == "short_conv") {
+            overrides.push_back(modules::LayerOverride::conv(i));
         } else if (lower == "moe") {
             overrides.push_back(modules::LayerOverride::moe(i));
         } else if (lower == "switch_moe" || lower == "switchmoe") {
@@ -1547,6 +1550,15 @@ void DslModel::validate_config_mapping(const Module& module) const {
             throw std::runtime_error("DSL model: missing module config param " + kv.first);
         }
         auto actual = internal::attr_to_value(it->second);
+        if (kv.first == "d_ff") {
+            const auto* auto_adjust_attr = internal::find_key(&module.config, "block_auto_adjust_ff_dim");
+            const auto auto_adjust = auto_adjust_attr ? internal::as_bool(*auto_adjust_attr).value_or(false) : false;
+            const auto* m_attr = internal::find_key(&module.config, "M");
+            const auto m_value = m_attr ? internal::attr_to_value(*m_attr) : std::nullopt;
+            if (auto_adjust && actual && m_value && internal::values_match(*actual, *m_value)) {
+                continue;
+            }
+        }
         if (!actual || !internal::values_match(*expected, *actual)) {
             throw std::runtime_error("DSL model: config mismatch for param " + kv.first);
         }

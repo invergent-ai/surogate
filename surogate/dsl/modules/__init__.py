@@ -32,6 +32,7 @@ from .moe import (
     NemotronSharedExpert,
 )
 from .rmsnorm import FusedResidualRMSNorm, RMSNorm, RMSNormPlus1
+from .short_conv import Lfm2ShortConv
 
 __all__ = [
     # Norms
@@ -48,6 +49,7 @@ __all__ = [
     "SwiGLUMLP",
     "GatedMLP",
     "SimpleMLP",
+    "Lfm2ShortConv",
     # Attention
     "GenericGQAttention",
     "GQAAttention",

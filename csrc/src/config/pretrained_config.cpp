@@ -312,6 +312,10 @@ std::unique_ptr<PretrainedConfig> load_pretrained_config(const char* file_name, 
     // Norm + tying
     if (auto v = get_opt_float("rms_norm_eps")) cfg->RmsNormEps = *v;
     if (auto v = get_opt_float("layer_norm_eps")) cfg->RmsNormEps = *v;
+    if (auto v = get_opt_float("norm_eps")) cfg->RmsNormEps = *v;
+    if (cfg->ModelTypeName == "lfm2" || cfg->ArchitectureName == "Lfm2ForCausalLM") {
+        cfg->TiedWordEmbeddings = true;
+    }
     if (auto v = get_opt<bool>(config_json, "tie_word_embeddings")) cfg->TiedWordEmbeddings = *v;
     if (auto v = get_opt<bool>(config_json, "tie_embeddings")) cfg->TiedWordEmbeddings = *v;
 

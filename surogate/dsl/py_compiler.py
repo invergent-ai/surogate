@@ -31,6 +31,7 @@ from .specs import (
     BlockSpec,
     ForwardSpec,
     HFTransformSpec,
+    IOSpec,
     LoRATarget,
     ModelSpec,
     ModuleSpec,
@@ -663,7 +664,7 @@ def _compile_graph_builder(
     graph = GraphIR()
 
     # Add inputs from the forward spec
-    for i, io_spec in enumerate(spec.inputs):
+    for io_spec in spec.inputs:
         ann = io_spec.tensor_type
         graph.inputs[io_spec.name] = _tensor_annotation_to_ref(ann, is_input=True)
 
@@ -757,7 +758,7 @@ def _init_instance_from_config(instance: Any, cls: type, config: dict[str, Any])
         return
 
     kwargs: dict[str, Any] = {}
-    for name, param in sig.parameters.items():
+    for name in sig.parameters:
         if name == "self":
             continue
         if name in config:
@@ -1400,7 +1401,7 @@ def _compile_merged_activation_layout(
     # deduplicating by slot name so common slots (ln1, ln2, mlp_up, etc.) appear once.
     seen_slot_names: set = set()
     seen_grad_names: set = set()
-    for param_name, param_spec in spec.params.items():
+    for param_spec in spec.params.values():
         if param_spec.kind != ParamKind.ARRAY or not param_spec.element_type:
             continue
         block_spec = get_block_spec(param_spec.element_type)
@@ -1509,7 +1510,7 @@ def _capture_forward_graph(
 
     # Find all modules that might have imported graph
     modules_to_patch = []
-    for name, mod in list(sys.modules.items()):
+    for mod in list(sys.modules.values()):
         if mod is not None and hasattr(mod, "graph") and getattr(mod, "graph", None) is original_graph:
             modules_to_patch.append((mod, "graph", original_graph))
 
@@ -1660,14 +1661,16 @@ def compile_model_spec(
             # These are attributes that exist on the instance but not in config.
             # Also capture important string attributes like hybrid_pattern for runtime config.
             _important_string_attrs = {"hybrid_pattern", "mlp_activation", "activation"}
+            _important_int_attrs = {"d_ff"}
             _important_float_attrs = {"routed_scaling_factor"}
             for attr_name in dir(instance):
                 if attr_name.startswith("_"):
                     continue
                 # Always re-capture important string/float attrs from the instance —
                 # __init__ may translate/transform the raw HF value (e.g.
-                # hybrid_pattern: Nemotron '*'/'-' → standard 'A'/'P').
-                _force_recapture = _important_string_attrs | _important_float_attrs
+                # hybrid_pattern: Nemotron '*'/'-' → standard 'A'/'P',
+                # d_ff: LFM2 raw intermediate_size → adjusted FFN width).
+                _force_recapture = _important_string_attrs | _important_int_attrs | _important_float_attrs
                 if attr_name in config and attr_name not in _force_recapture:
                     continue
                 try:
@@ -2254,17 +2257,14 @@ def compile_model_for_hf(
 
     # Find model spec by architecture
     spec = None
-    model_name = None
 
-    for name, model_spec in _model_registry.items():
+    for model_spec in _model_registry.values():
         if model_spec.hf_config:
             if model_spec.hf_config.architecture == architecture:
                 spec = model_spec
-                model_name = name
                 break
             if model_spec.hf_config.model_type == architecture:
                 spec = model_spec
-                model_name = name
                 break
 
     if spec is None:
