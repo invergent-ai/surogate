@@ -330,7 +330,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
     final_lr_fraction: float | None = 0.0
     gradient_accumulation_steps: int | None = 4
     max_grad_norm: float | None = 1.0
-    weight_decay: float | None = 0.01
+    weight_decay: float | None = 0
     max_steps: int | None = -1
     adamw_beta1: float | None = 0.9
     adamw_beta2: float | None = 0.999
