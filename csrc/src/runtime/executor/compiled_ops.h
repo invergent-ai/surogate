@@ -405,6 +405,22 @@ public:
     // Lazily (re)allocate the lm-head row-compaction scratch buffers when BT
     // exceeds the current capacity. Buffers are tiny (~tens of KB total).
     void ensure_lmhead_compact_buffers(int BT);
+
+    // Forward lm_head matmul that picks the FP8-cached path when the recipe and
+    // dtypes line up, falling back to the BF16 matmul otherwise. Shared between
+    // the standard and row-compaction dispatchers so both benefit from FP8.
+    void lm_head_logits_matmul(Tensor& logits,
+                               Tensor& weight,
+                               Tensor& xF_slice,
+                               const std::string& weight_name,
+                               int V,
+                               int C,
+                               int M);
+
+    // Backward lm_head dxF matmul using the FP8 transposed-cache path when
+    // available. Returns true on FP8 success; the caller does the BF16
+    // fallback matmul on false.
+    bool lm_head_dx_matmul(Tensor& d_xF_slice, Tensor& dlogits, const std::string& weight_name, int V, int C, int M);
     // MoE backward dispatch
     void dispatch_moe_softmax_backward(const CompiledOp& op);
     void dispatch_moe_sigmoid_backward(const CompiledOp& op);

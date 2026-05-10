@@ -83,6 +83,115 @@ void CompiledExecutor::ensure_lmhead_compact_buffers(int BT) {
     mLmheadCompactBTCap = BT;
 }
 
+void CompiledExecutor::lm_head_logits_matmul(Tensor& logits,
+                                             Tensor& weight,
+                                             Tensor& xF_slice,
+                                             const std::string& weight_name,
+                                             int V,
+                                             int C,
+                                             int M) {
+    const bool use_fp8_lm_head = fp8_lm_head_enabled(mRecipe);
+    const Tensor* cached_weight = nullptr;
+    if (use_fp8_lm_head && xF_slice.DType == ETensorDType::BF16 && logits.DType == ETensorDType::BF16) {
+        cached_weight = find_cached_lm_head(mFP8Cache, weight_name, V, C);
+    }
+    if (cached_weight) {
+        Tensor xF_fp8 =
+            mRunState.temp_alloc(ETensorDType::FP8_E4M3, {static_cast<long>(M), static_cast<long>(C)}, "lm_head_x_fp8");
+        Tensor xF_stats = mRunState.temp_alloc(ETensorDType::FP32, {2}, "lm_head_x_fp8_stats");
+        xF_fp8.Stats = xF_stats.get<float>();
+        const long numel = static_cast<long>(M) * static_cast<long>(C);
+        abs_max(xF_fp8.abs_max(), xF_slice, numel, mRunState.DeviceProp, mRunState.MainStream);
+        quantize_with_abs_max(xF_fp8,
+                              xF_fp8.scale(),
+                              xF_slice,
+                              xF_fp8.abs_max(),
+                              numel,
+                              mRunState.DeviceProp,
+                              mRunState.MainStream);
+        matmul(logits,
+               *cached_weight,
+               xF_fp8,
+               std::nullopt,
+               const_cast<Tensor*>(cached_weight)->scale(),
+               xF_fp8.scale(),
+               mRunState.CublasLtHandle,
+               mRunState.CuBlasWorkspace,
+               V,
+               M,
+               C,
+               swap_transpose(EMMTranspose::NT),
+               false,
+               mRunState.MainStream);
+        mRunState.temp_free(xF_stats);
+        mRunState.temp_free(xF_fp8);
+        return;
+    }
+
+    matmul(logits,
+           weight,
+           xF_slice,
+           std::nullopt,
+           nullptr,
+           nullptr,
+           mRunState.CublasLtHandle,
+           mRunState.CuBlasWorkspace,
+           V,
+           M,
+           C,
+           swap_transpose(EMMTranspose::NT),
+           false,
+           mRunState.MainStream);
+}
+
+bool CompiledExecutor::lm_head_dx_matmul(Tensor& d_xF_slice,
+                                         Tensor& dlogits,
+                                         const std::string& weight_name,
+                                         int V,
+                                         int C,
+                                         int M) {
+    const bool use_fp8_lm_head = fp8_lm_head_enabled(mRecipe);
+    const Tensor* cached_weight_t = nullptr;
+    if (use_fp8_lm_head && d_xF_slice.DType == ETensorDType::BF16 && dlogits.DType == ETensorDType::BF16) {
+        cached_weight_t = find_cached_lm_head(mFP8CacheT, weight_name, C, V);
+    }
+    if (!cached_weight_t) {
+        return false;
+    }
+
+    Tensor dlogits_fp8 = mRunState.temp_alloc(ETensorDType::FP8_E5M2,
+                                              {static_cast<long>(M), static_cast<long>(V)},
+                                              "lm_head_dlogits_e5m2");
+    Tensor dlogits_stats = mRunState.temp_alloc(ETensorDType::FP32, {2}, "lm_head_dlogits_e5m2_stats");
+    dlogits_fp8.Stats = dlogits_stats.get<float>();
+    const long numel = static_cast<long>(M) * static_cast<long>(V);
+    abs_max(dlogits_fp8.abs_max(), dlogits, numel, mRunState.DeviceProp, mRunState.MainStream);
+    quantize_with_abs_max(dlogits_fp8,
+                          dlogits_fp8.scale(),
+                          dlogits,
+                          dlogits_fp8.abs_max(),
+                          numel,
+                          mRunState.DeviceProp,
+                          mRunState.MainStream);
+    matmul(d_xF_slice,
+           *cached_weight_t,
+           dlogits_fp8,
+           std::nullopt,
+           const_cast<Tensor*>(cached_weight_t)->scale(),
+           dlogits_fp8.scale(),
+           mRunState.CublasLtHandle,
+           mRunState.CuBlasWorkspace,
+           C,
+           M,
+           V,
+           EMMTranspose::TN,
+           false,
+           mRunState.MainStream);
+    mRunState.temp_free(dlogits_stats);
+    mRunState.temp_free(dlogits_fp8);
+    return true;
+}
+
 void CompiledExecutor::dispatch_fused_lm_head_loss(const CompiledOp& op) {
     Tensor& xF_flat = resolve_tensor(op.inputs[0]);
     Tensor& weight = resolve_tensor(op.inputs[1]);
@@ -96,8 +205,10 @@ void CompiledExecutor::dispatch_fused_lm_head_loss(const CompiledOp& op) {
 
     // Drop rows whose target == -100 before the matmul (lm-head row compaction).
     // Skipped in logprob-extraction mode, when the FP8 lm_head cache is active,
-    // or when xF/weight aren't BF16 (v1 supports BF16 only). Falls through to
-    // the non-compact path otherwise.
+    // or when xF/weight aren't BF16 (v1 supports BF16 only). The compact path
+    // reuses lm_head_logits_matmul / lm_head_dx_matmul, but FP8 + compact has a
+    // numerical issue (gradients explode by ~1e13 on Qwen3-0.6B GRPO LoRA). The
+    // gate keeps fp8-hybrid on the non-compact path until that's debugged.
     if (mOptions.SkipIgnoredLMHeadRows && !mLogprobsGpu && xF_flat.DType == ETensorDType::BF16 &&
         weight.DType == ETensorDType::BF16 && !fp8_lm_head_enabled(mRecipe)) {
         dispatch_fused_lm_head_loss_compact(op);
@@ -113,63 +224,7 @@ void CompiledExecutor::dispatch_fused_lm_head_loss(const CompiledOp& op) {
     if (need_lm_head && mComm) {
         mWeightManager->gather_lm_head(*mComm, mRunState.MainStream);
     }
-    const bool use_fp8_lm_head = fp8_lm_head_enabled(mRecipe);
     const std::string weight_name = op.inputs.size() > 1 ? op.inputs[1].name : std::string();
-
-    auto lm_head_logits_matmul = [&](Tensor& logits, Tensor& xF_slice) {
-        const Tensor* cached_weight = nullptr;
-        if (use_fp8_lm_head && xF_slice.DType == ETensorDType::BF16 && logits.DType == ETensorDType::BF16) {
-            cached_weight = find_cached_lm_head(mFP8Cache, weight_name, V, C);
-        }
-        if (cached_weight) {
-            Tensor xF_fp8 = mRunState.temp_alloc(ETensorDType::FP8_E4M3,
-                                                 {xF_slice.Sizes[0], static_cast<long>(C)},
-                                                 "lm_head_x_fp8");
-            Tensor xF_stats = mRunState.temp_alloc(ETensorDType::FP32, {2}, "lm_head_x_fp8_stats");
-            xF_fp8.Stats = xF_stats.get<float>();
-            const long numel = xF_slice.Sizes[0] * static_cast<long>(C);
-            abs_max(xF_fp8.abs_max(), xF_slice, numel, mRunState.DeviceProp, mRunState.MainStream);
-            quantize_with_abs_max(xF_fp8,
-                                  xF_fp8.scale(),
-                                  xF_slice,
-                                  xF_fp8.abs_max(),
-                                  numel,
-                                  mRunState.DeviceProp,
-                                  mRunState.MainStream);
-            matmul(logits,
-                   *cached_weight,
-                   xF_fp8,
-                   std::nullopt,
-                   const_cast<Tensor*>(cached_weight)->scale(),
-                   xF_fp8.scale(),
-                   mRunState.CublasLtHandle,
-                   mRunState.CuBlasWorkspace,
-                   V,
-                   static_cast<int>(xF_slice.Sizes[0]),
-                   C,
-                   swap_transpose(EMMTranspose::NT),
-                   false,
-                   mRunState.MainStream);
-            mRunState.temp_free(xF_stats);
-            mRunState.temp_free(xF_fp8);
-            return;
-        }
-
-        matmul(logits,
-               weight,
-               xF_slice,
-               std::nullopt,
-               nullptr,
-               nullptr,
-               mRunState.CublasLtHandle,
-               mRunState.CuBlasWorkspace,
-               V,
-               static_cast<int>(xF_slice.Sizes[0]),
-               C,
-               swap_transpose(EMMTranspose::NT),
-               false,
-               mRunState.MainStream);
-    };
 
     // -----------------------------------------------------------------------
     // Log-prob mode: compute log P(target | context) for all BT tokens, skip loss.
@@ -203,7 +258,7 @@ void CompiledExecutor::dispatch_fused_lm_head_loss(const CompiledOp& op) {
             logits.Sizes[1] = V;
             logits.Rank = 2;
 
-            lm_head_logits_matmul(logits, xF_slice);
+            lm_head_logits_matmul(logits, weight, xF_slice, weight_name, V, C, static_cast<int>(nano_batch_size));
 
             if (op.attrs.softcap > 0.0f) {
                 softcap_logits(logits, op.attrs.softcap, static_cast<int>(nano_batch_size), V, mRunState.MainStream);
@@ -262,7 +317,7 @@ void CompiledExecutor::dispatch_fused_lm_head_loss(const CompiledOp& op) {
         logits.Sizes[1] = V;
         logits.Rank = 2;
 
-        lm_head_logits_matmul(logits, xF_slice);
+        lm_head_logits_matmul(logits, weight, xF_slice, weight_name, V, C, static_cast<int>(nano_batch_size));
 
         const bool fuse_softcap_forward = (op.attrs.softcap > 0.0f) && (mInvTemperatureGpu == nullptr);
 
@@ -406,105 +461,7 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_backward(const CompiledOp& op
     if (need_lm_head && mComm) {
         mWeightManager->gather_lm_head(*mComm, mRunState.MainStream);
     }
-    const bool use_fp8_lm_head = fp8_lm_head_enabled(mRecipe);
     const std::string weight_name = op.inputs.size() > 2 ? op.inputs[2].name : std::string();
-
-    auto lm_head_logits_matmul = [&](Tensor& logits, Tensor& xF_slice) {
-        const Tensor* cached_weight = nullptr;
-        if (use_fp8_lm_head && xF_slice.DType == ETensorDType::BF16 && logits.DType == ETensorDType::BF16) {
-            cached_weight = find_cached_lm_head(mFP8Cache, weight_name, V, C);
-        }
-        if (cached_weight) {
-            Tensor xF_fp8 = mRunState.temp_alloc(ETensorDType::FP8_E4M3,
-                                                 {xF_slice.Sizes[0], static_cast<long>(C)},
-                                                 "lm_head_bwd_x_fp8");
-            Tensor xF_stats = mRunState.temp_alloc(ETensorDType::FP32, {2}, "lm_head_bwd_x_fp8_stats");
-            xF_fp8.Stats = xF_stats.get<float>();
-            const long numel = xF_slice.Sizes[0] * static_cast<long>(C);
-            abs_max(xF_fp8.abs_max(), xF_slice, numel, mRunState.DeviceProp, mRunState.MainStream);
-            quantize_with_abs_max(xF_fp8,
-                                  xF_fp8.scale(),
-                                  xF_slice,
-                                  xF_fp8.abs_max(),
-                                  numel,
-                                  mRunState.DeviceProp,
-                                  mRunState.MainStream);
-            matmul(logits,
-                   *cached_weight,
-                   xF_fp8,
-                   std::nullopt,
-                   const_cast<Tensor*>(cached_weight)->scale(),
-                   xF_fp8.scale(),
-                   mRunState.CublasLtHandle,
-                   mRunState.CuBlasWorkspace,
-                   V,
-                   static_cast<int>(xF_slice.Sizes[0]),
-                   C,
-                   swap_transpose(EMMTranspose::NT),
-                   false,
-                   mRunState.MainStream);
-            mRunState.temp_free(xF_stats);
-            mRunState.temp_free(xF_fp8);
-            return;
-        }
-
-        matmul(logits,
-               weight,
-               xF_slice,
-               std::nullopt,
-               nullptr,
-               nullptr,
-               mRunState.CublasLtHandle,
-               mRunState.CuBlasWorkspace,
-               V,
-               static_cast<int>(xF_slice.Sizes[0]),
-               C,
-               swap_transpose(EMMTranspose::NT),
-               false,
-               mRunState.MainStream);
-    };
-
-    auto lm_head_dx_matmul = [&](Tensor& d_xF_slice, Tensor& dlogits) -> bool {
-        const Tensor* cached_weight_t = nullptr;
-        if (use_fp8_lm_head && d_xF_slice.DType == ETensorDType::BF16 && dlogits.DType == ETensorDType::BF16) {
-            cached_weight_t = find_cached_lm_head(mFP8CacheT, weight_name, C, V);
-        }
-        if (!cached_weight_t) {
-            return false;
-        }
-
-        Tensor dlogits_fp8 = mRunState.temp_alloc(ETensorDType::FP8_E5M2,
-                                                  {dlogits.Sizes[0], static_cast<long>(V)},
-                                                  "lm_head_dlogits_e5m2");
-        Tensor dlogits_stats = mRunState.temp_alloc(ETensorDType::FP32, {2}, "lm_head_dlogits_e5m2_stats");
-        dlogits_fp8.Stats = dlogits_stats.get<float>();
-        const long numel = dlogits.Sizes[0] * static_cast<long>(V);
-        abs_max(dlogits_fp8.abs_max(), dlogits, numel, mRunState.DeviceProp, mRunState.MainStream);
-        quantize_with_abs_max(dlogits_fp8,
-                              dlogits_fp8.scale(),
-                              dlogits,
-                              dlogits_fp8.abs_max(),
-                              numel,
-                              mRunState.DeviceProp,
-                              mRunState.MainStream);
-        matmul(d_xF_slice,
-               *cached_weight_t,
-               dlogits_fp8,
-               std::nullopt,
-               const_cast<Tensor*>(cached_weight_t)->scale(),
-               dlogits_fp8.scale(),
-               mRunState.CublasLtHandle,
-               mRunState.CuBlasWorkspace,
-               C,
-               static_cast<int>(dlogits.Sizes[0]),
-               V,
-               EMMTranspose::TN,
-               false,
-               mRunState.MainStream);
-        mRunState.temp_free(dlogits_stats);
-        mRunState.temp_free(dlogits_fp8);
-        return true;
-    };
 
     const std::size_t xf_stride = get_dtype_size(xF_flat.DType);
     const std::size_t tgt_stride = get_dtype_size(targets.DType);
@@ -537,7 +494,7 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_backward(const CompiledOp& op
         logits.Sizes[1] = V;
         logits.Rank = 2;
 
-        lm_head_logits_matmul(logits, xF_slice);
+        lm_head_logits_matmul(logits, weight, xF_slice, weight_name, V, C, static_cast<int>(nano_batch_size));
 
         const bool fuse_softcap_backward = (op.attrs.softcap > 0.0f) && (mInvTemperatureGpu == nullptr);
 
@@ -649,7 +606,7 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_backward(const CompiledOp& op
             d_xF_slice.Sizes[1] = C;
             d_xF_slice.Rank = 2;
 
-            if (!lm_head_dx_matmul(d_xF_slice, logits)) {
+            if (!lm_head_dx_matmul(d_xF_slice, logits, weight_name, V, C, static_cast<int>(nano_batch_size))) {
                 matmul(d_xF_slice,
                        weight,
                        logits,
@@ -692,6 +649,7 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_compact(const CompiledOp& op)
     const int V = static_cast<int>(weight.Sizes[0]);
     const int C = static_cast<int>(weight.Sizes[1]);
     const int P = V;
+    const std::string weight_name = op.inputs.size() > 1 ? op.inputs[1].name : std::string();
 
     const bool need_lm_head =
         mWeightManager && (mWeightManager->is_streaming_enabled() || mWeightManager->is_offload_enabled());
@@ -788,20 +746,7 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_compact(const CompiledOp& op)
         logits.Sizes[1] = V;
         logits.Rank = 2;
 
-        matmul(logits,
-               weight,
-               xF_slice,
-               std::nullopt,
-               nullptr,
-               nullptr,
-               mRunState.CublasLtHandle,
-               mRunState.CuBlasWorkspace,
-               V,
-               static_cast<int>(nano),
-               C,
-               swap_transpose(EMMTranspose::NT),
-               false,
-               mRunState.MainStream);
+        lm_head_logits_matmul(logits, weight, xF_slice, weight_name, V, C, static_cast<int>(nano));
 
         const bool fuse_softcap_forward = (op.attrs.softcap > 0.0f) && !has_inv_t_compact;
         if ((op.attrs.softcap > 0.0f) && !fuse_softcap_forward) {
@@ -948,6 +893,7 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_backward_compact(const Compil
     if (need_lm_head && mComm) {
         mWeightManager->gather_lm_head(*mComm, mRunState.MainStream);
     }
+    const std::string weight_name = op.inputs.size() > 2 ? op.inputs[2].name : std::string();
 
     const int lmhead_chunks = std::max(1, mOptions.LMHeadChunks);
     const long max_nano = std::max<long>(1, BT / static_cast<long>(lmhead_chunks));
@@ -1027,20 +973,7 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_backward_compact(const Compil
         logits.Sizes[1] = V;
         logits.Rank = 2;
 
-        matmul(logits,
-               weight,
-               xF_slice,
-               std::nullopt,
-               nullptr,
-               nullptr,
-               mRunState.CublasLtHandle,
-               mRunState.CuBlasWorkspace,
-               V,
-               static_cast<int>(nano),
-               C,
-               swap_transpose(EMMTranspose::NT),
-               false,
-               mRunState.MainStream);
+        lm_head_logits_matmul(logits, weight, xF_slice, weight_name, V, C, static_cast<int>(nano));
 
         const bool fuse_softcap_backward = (op.attrs.softcap > 0.0f) && !has_inv_t_compact;
         if ((op.attrs.softcap > 0.0f) && !fuse_softcap_backward) {
@@ -1138,20 +1071,22 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_backward_compact(const Compil
             d_xF_slice.Sizes[1] = C;
             d_xF_slice.Rank = 2;
 
-            matmul(d_xF_slice,
-                   weight,
-                   logits,
-                   std::nullopt,
-                   nullptr,
-                   nullptr,
-                   mRunState.CublasLtHandle,
-                   mRunState.CuBlasWorkspace,
-                   static_cast<int>(C),
-                   static_cast<int>(nano),
-                   static_cast<int>(V),
-                   swap_transpose(EMMTranspose::NN),
-                   false,
-                   mRunState.MainStream);
+            if (!lm_head_dx_matmul(d_xF_slice, logits, weight_name, V, C, static_cast<int>(nano))) {
+                matmul(d_xF_slice,
+                       weight,
+                       logits,
+                       std::nullopt,
+                       nullptr,
+                       nullptr,
+                       mRunState.CublasLtHandle,
+                       mRunState.CuBlasWorkspace,
+                       static_cast<int>(C),
+                       static_cast<int>(nano),
+                       static_cast<int>(V),
+                       swap_transpose(EMMTranspose::NN),
+                       false,
+                       mRunState.MainStream);
+            }
         }
     }
 
