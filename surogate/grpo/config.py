@@ -83,14 +83,11 @@ class GRPOTrainConfig(SFTConfig):
 
         # GRPO packed batches are heavily masked (prompt + padding tokens are -100,
         # only the response gets loss). The compact lm_head path skips work on those
-        # rows for a meaningful step-time win — measured ~13% on Qwen3-0.6B LoRA.
-        # FP8 + compact currently has a numerical issue (grad-norm explosion); the
-        # C++ side falls back to the non-compact path under the FP8 lm_head cache,
-        # but we also leave the flag off for fp8-hybrid here so we don't disable
-        # CUDA graphs for a path that won't get the speedup.
+        # rows for a meaningful step-time win — measured ~13% on Qwen3-0.6B BF16
+        # LoRA, ~14-21% on fp8-hybrid (the helpers route the gathered slices
+        # through the FP8 cache lookup + on-the-fly quantization).
         if "lmhead_drop_ignored_rows" not in cfg:
-            recipe = cfg.get("recipe", "bf16")
-            cfg["lmhead_drop_ignored_rows"] = recipe not in ("fp8-hybrid", "fp8_hybrid")
+            cfg["lmhead_drop_ignored_rows"] = True
 
         super().__init__(cfg)
 

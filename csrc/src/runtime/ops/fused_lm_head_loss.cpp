@@ -204,13 +204,14 @@ void CompiledExecutor::dispatch_fused_lm_head_loss(const CompiledOp& op) {
     const int P = V;
 
     // Drop rows whose target == -100 before the matmul (lm-head row compaction).
-    // Skipped in logprob-extraction mode, when the FP8 lm_head cache is active,
-    // or when xF/weight aren't BF16 (v1 supports BF16 only). The compact path
-    // reuses lm_head_logits_matmul / lm_head_dx_matmul, but FP8 + compact has a
-    // numerical issue (gradients explode by ~1e13 on Qwen3-0.6B GRPO LoRA). The
-    // gate keeps fp8-hybrid on the non-compact path until that's debugged.
+    // Skipped only in logprob-extraction mode or when xF/weight aren't BF16
+    // (v1 supports BF16 only). FP8-hybrid works through here because
+    // lm_head_logits_matmul / lm_head_dx_matmul handle the FP8 cache lookup +
+    // on-the-fly quantization for the gathered xF_compact / dlogits_compact
+    // slices. NOTE: forward and backward gates MUST stay aligned so backward
+    // reads the per-valid-row logsumexp the compact forward saved.
     if (mOptions.SkipIgnoredLMHeadRows && !mLogprobsGpu && xF_flat.DType == ETensorDType::BF16 &&
-        weight.DType == ETensorDType::BF16 && !fp8_lm_head_enabled(mRecipe)) {
+        weight.DType == ETensorDType::BF16) {
         dispatch_fused_lm_head_loss_compact(op);
         return;
     }
@@ -395,9 +396,10 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_backward(const CompiledOp& op
     Tensor& targets = resolve_tensor(op.inputs[3]);
 
     // Dispatch to the compact backward only if the matching forward also took
-    // that path (signalled by mLmheadCompactNValid >= 0).
+    // that path (signalled by mLmheadCompactNValid >= 0). Forward and backward
+    // gates MUST match — otherwise backward reads stale logsumexp scratch.
     if (mOptions.SkipIgnoredLMHeadRows && mLmheadCompactNValid >= 0 && xF_flat.DType == ETensorDType::BF16 &&
-        weight.DType == ETensorDType::BF16 && !fp8_lm_head_enabled(mRecipe)) {
+        weight.DType == ETensorDType::BF16) {
         dispatch_fused_lm_head_loss_backward_compact(op);
         return;
     }
