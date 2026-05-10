@@ -63,6 +63,135 @@ const Tensor* find_cached_lm_head(std::unordered_map<std::string, FP8WeightCache
 
 }  // namespace
 
+void CompiledExecutor::ensure_lmhead_compact_buffers(int BT) {
+    if (BT <= mLmheadCompactBTCap) return;
+    if (mLmheadCompactValidIdx) {
+        cudaFree(mLmheadCompactValidIdx);
+        mLmheadCompactValidIdx = nullptr;
+    }
+    if (mLmheadCompactNValidDev) {
+        cudaFree(mLmheadCompactNValidDev);
+        mLmheadCompactNValidDev = nullptr;
+    }
+    if (mLmheadCompactLogsumexp) {
+        cudaFree(mLmheadCompactLogsumexp);
+        mLmheadCompactLogsumexp = nullptr;
+    }
+    CUDA_CHECK(cudaMalloc(&mLmheadCompactValidIdx, static_cast<size_t>(BT) * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&mLmheadCompactNValidDev, sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&mLmheadCompactLogsumexp, static_cast<size_t>(BT) * sizeof(float)));
+    mLmheadCompactBTCap = BT;
+}
+
+void CompiledExecutor::lm_head_logits_matmul(Tensor& logits,
+                                             Tensor& weight,
+                                             Tensor& xF_slice,
+                                             const std::string& weight_name,
+                                             int V,
+                                             int C,
+                                             int M) {
+    const bool use_fp8_lm_head = fp8_lm_head_enabled(mRecipe);
+    const Tensor* cached_weight = nullptr;
+    if (use_fp8_lm_head && xF_slice.DType == ETensorDType::BF16 && logits.DType == ETensorDType::BF16) {
+        cached_weight = find_cached_lm_head(mFP8Cache, weight_name, V, C);
+    }
+    if (cached_weight) {
+        Tensor xF_fp8 =
+            mRunState.temp_alloc(ETensorDType::FP8_E4M3, {static_cast<long>(M), static_cast<long>(C)}, "lm_head_x_fp8");
+        Tensor xF_stats = mRunState.temp_alloc(ETensorDType::FP32, {2}, "lm_head_x_fp8_stats");
+        xF_fp8.Stats = xF_stats.get<float>();
+        const long numel = static_cast<long>(M) * static_cast<long>(C);
+        abs_max(xF_fp8.abs_max(), xF_slice, numel, mRunState.DeviceProp, mRunState.MainStream);
+        quantize_with_abs_max(xF_fp8,
+                              xF_fp8.scale(),
+                              xF_slice,
+                              xF_fp8.abs_max(),
+                              numel,
+                              mRunState.DeviceProp,
+                              mRunState.MainStream);
+        matmul(logits,
+               *cached_weight,
+               xF_fp8,
+               std::nullopt,
+               const_cast<Tensor*>(cached_weight)->scale(),
+               xF_fp8.scale(),
+               mRunState.CublasLtHandle,
+               mRunState.CuBlasWorkspace,
+               V,
+               M,
+               C,
+               swap_transpose(EMMTranspose::NT),
+               false,
+               mRunState.MainStream);
+        mRunState.temp_free(xF_stats);
+        mRunState.temp_free(xF_fp8);
+        return;
+    }
+
+    matmul(logits,
+           weight,
+           xF_slice,
+           std::nullopt,
+           nullptr,
+           nullptr,
+           mRunState.CublasLtHandle,
+           mRunState.CuBlasWorkspace,
+           V,
+           M,
+           C,
+           swap_transpose(EMMTranspose::NT),
+           false,
+           mRunState.MainStream);
+}
+
+bool CompiledExecutor::lm_head_dx_matmul(Tensor& d_xF_slice,
+                                         Tensor& dlogits,
+                                         const std::string& weight_name,
+                                         int V,
+                                         int C,
+                                         int M) {
+    const bool use_fp8_lm_head = fp8_lm_head_enabled(mRecipe);
+    const Tensor* cached_weight_t = nullptr;
+    if (use_fp8_lm_head && d_xF_slice.DType == ETensorDType::BF16 && dlogits.DType == ETensorDType::BF16) {
+        cached_weight_t = find_cached_lm_head(mFP8CacheT, weight_name, C, V);
+    }
+    if (!cached_weight_t) {
+        return false;
+    }
+
+    Tensor dlogits_fp8 = mRunState.temp_alloc(ETensorDType::FP8_E5M2,
+                                              {static_cast<long>(M), static_cast<long>(V)},
+                                              "lm_head_dlogits_e5m2");
+    Tensor dlogits_stats = mRunState.temp_alloc(ETensorDType::FP32, {2}, "lm_head_dlogits_e5m2_stats");
+    dlogits_fp8.Stats = dlogits_stats.get<float>();
+    const long numel = static_cast<long>(M) * static_cast<long>(V);
+    abs_max(dlogits_fp8.abs_max(), dlogits, numel, mRunState.DeviceProp, mRunState.MainStream);
+    quantize_with_abs_max(dlogits_fp8,
+                          dlogits_fp8.scale(),
+                          dlogits,
+                          dlogits_fp8.abs_max(),
+                          numel,
+                          mRunState.DeviceProp,
+                          mRunState.MainStream);
+    matmul(d_xF_slice,
+           *cached_weight_t,
+           dlogits_fp8,
+           std::nullopt,
+           const_cast<Tensor*>(cached_weight_t)->scale(),
+           dlogits_fp8.scale(),
+           mRunState.CublasLtHandle,
+           mRunState.CuBlasWorkspace,
+           C,
+           M,
+           V,
+           EMMTranspose::TN,
+           false,
+           mRunState.MainStream);
+    mRunState.temp_free(dlogits_stats);
+    mRunState.temp_free(dlogits_fp8);
+    return true;
+}
+
 void CompiledExecutor::dispatch_fused_lm_head_loss(const CompiledOp& op) {
     Tensor& xF_flat = resolve_tensor(op.inputs[0]);
     Tensor& weight = resolve_tensor(op.inputs[1]);
@@ -74,6 +203,19 @@ void CompiledExecutor::dispatch_fused_lm_head_loss(const CompiledOp& op) {
     const int C = static_cast<int>(weight.Sizes[1]);
     const int P = V;
 
+    // Drop rows whose target == -100 before the matmul (lm-head row compaction).
+    // Skipped only in logprob-extraction mode or when xF/weight aren't BF16
+    // (v1 supports BF16 only). FP8-hybrid works through here because
+    // lm_head_logits_matmul / lm_head_dx_matmul handle the FP8 cache lookup +
+    // on-the-fly quantization for the gathered xF_compact / dlogits_compact
+    // slices. NOTE: forward and backward gates MUST stay aligned so backward
+    // reads the per-valid-row logsumexp the compact forward saved.
+    if (mOptions.SkipIgnoredLMHeadRows && !mLogprobsGpu && xF_flat.DType == ETensorDType::BF16 &&
+        weight.DType == ETensorDType::BF16) {
+        dispatch_fused_lm_head_loss_compact(op);
+        return;
+    }
+
     const int lmhead_chunks = std::max(1, mOptions.LMHeadChunks);
     const long nano_batch_size = BT / static_cast<long>(lmhead_chunks);
     const int n_chunks = (V + CROSS_ENTROPY_MAX_FUSED_SIZE - 1) / CROSS_ENTROPY_MAX_FUSED_SIZE;
@@ -83,63 +225,7 @@ void CompiledExecutor::dispatch_fused_lm_head_loss(const CompiledOp& op) {
     if (need_lm_head && mComm) {
         mWeightManager->gather_lm_head(*mComm, mRunState.MainStream);
     }
-    const bool use_fp8_lm_head = fp8_lm_head_enabled(mRecipe);
     const std::string weight_name = op.inputs.size() > 1 ? op.inputs[1].name : std::string();
-
-    auto lm_head_logits_matmul = [&](Tensor& logits, Tensor& xF_slice) {
-        const Tensor* cached_weight = nullptr;
-        if (use_fp8_lm_head && xF_slice.DType == ETensorDType::BF16 && logits.DType == ETensorDType::BF16) {
-            cached_weight = find_cached_lm_head(mFP8Cache, weight_name, V, C);
-        }
-        if (cached_weight) {
-            Tensor xF_fp8 = mRunState.temp_alloc(ETensorDType::FP8_E4M3,
-                                                 {xF_slice.Sizes[0], static_cast<long>(C)},
-                                                 "lm_head_x_fp8");
-            Tensor xF_stats = mRunState.temp_alloc(ETensorDType::FP32, {2}, "lm_head_x_fp8_stats");
-            xF_fp8.Stats = xF_stats.get<float>();
-            const long numel = xF_slice.Sizes[0] * static_cast<long>(C);
-            abs_max(xF_fp8.abs_max(), xF_slice, numel, mRunState.DeviceProp, mRunState.MainStream);
-            quantize_with_abs_max(xF_fp8,
-                                  xF_fp8.scale(),
-                                  xF_slice,
-                                  xF_fp8.abs_max(),
-                                  numel,
-                                  mRunState.DeviceProp,
-                                  mRunState.MainStream);
-            matmul(logits,
-                   *cached_weight,
-                   xF_fp8,
-                   std::nullopt,
-                   const_cast<Tensor*>(cached_weight)->scale(),
-                   xF_fp8.scale(),
-                   mRunState.CublasLtHandle,
-                   mRunState.CuBlasWorkspace,
-                   V,
-                   static_cast<int>(xF_slice.Sizes[0]),
-                   C,
-                   swap_transpose(EMMTranspose::NT),
-                   false,
-                   mRunState.MainStream);
-            mRunState.temp_free(xF_stats);
-            mRunState.temp_free(xF_fp8);
-            return;
-        }
-
-        matmul(logits,
-               weight,
-               xF_slice,
-               std::nullopt,
-               nullptr,
-               nullptr,
-               mRunState.CublasLtHandle,
-               mRunState.CuBlasWorkspace,
-               V,
-               static_cast<int>(xF_slice.Sizes[0]),
-               C,
-               swap_transpose(EMMTranspose::NT),
-               false,
-               mRunState.MainStream);
-    };
 
     // -----------------------------------------------------------------------
     // Log-prob mode: compute log P(target | context) for all BT tokens, skip loss.
@@ -173,7 +259,7 @@ void CompiledExecutor::dispatch_fused_lm_head_loss(const CompiledOp& op) {
             logits.Sizes[1] = V;
             logits.Rank = 2;
 
-            lm_head_logits_matmul(logits, xF_slice);
+            lm_head_logits_matmul(logits, weight, xF_slice, weight_name, V, C, static_cast<int>(nano_batch_size));
 
             if (op.attrs.softcap > 0.0f) {
                 softcap_logits(logits, op.attrs.softcap, static_cast<int>(nano_batch_size), V, mRunState.MainStream);
@@ -232,7 +318,7 @@ void CompiledExecutor::dispatch_fused_lm_head_loss(const CompiledOp& op) {
         logits.Sizes[1] = V;
         logits.Rank = 2;
 
-        lm_head_logits_matmul(logits, xF_slice);
+        lm_head_logits_matmul(logits, weight, xF_slice, weight_name, V, C, static_cast<int>(nano_batch_size));
 
         const bool fuse_softcap_forward = (op.attrs.softcap > 0.0f) && (mInvTemperatureGpu == nullptr);
 
@@ -309,6 +395,15 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_backward(const CompiledOp& op
     Tensor& weight = resolve_tensor(op.inputs[2]);
     Tensor& targets = resolve_tensor(op.inputs[3]);
 
+    // Dispatch to the compact backward only if the matching forward also took
+    // that path (signalled by mLmheadCompactNValid >= 0). Forward and backward
+    // gates MUST match — otherwise backward reads stale logsumexp scratch.
+    if (mOptions.SkipIgnoredLMHeadRows && mLmheadCompactNValid >= 0 && xF_flat.DType == ETensorDType::BF16 &&
+        weight.DType == ETensorDType::BF16) {
+        dispatch_fused_lm_head_loss_backward_compact(op);
+        return;
+    }
+
     Tensor* d_xF_ptr = nullptr;
     if (!op.outputs.empty() && !op.outputs[0].name.empty()) {
         d_xF_ptr = &ensure_output_tensor(op.outputs[0]);
@@ -368,105 +463,7 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_backward(const CompiledOp& op
     if (need_lm_head && mComm) {
         mWeightManager->gather_lm_head(*mComm, mRunState.MainStream);
     }
-    const bool use_fp8_lm_head = fp8_lm_head_enabled(mRecipe);
     const std::string weight_name = op.inputs.size() > 2 ? op.inputs[2].name : std::string();
-
-    auto lm_head_logits_matmul = [&](Tensor& logits, Tensor& xF_slice) {
-        const Tensor* cached_weight = nullptr;
-        if (use_fp8_lm_head && xF_slice.DType == ETensorDType::BF16 && logits.DType == ETensorDType::BF16) {
-            cached_weight = find_cached_lm_head(mFP8Cache, weight_name, V, C);
-        }
-        if (cached_weight) {
-            Tensor xF_fp8 = mRunState.temp_alloc(ETensorDType::FP8_E4M3,
-                                                 {xF_slice.Sizes[0], static_cast<long>(C)},
-                                                 "lm_head_bwd_x_fp8");
-            Tensor xF_stats = mRunState.temp_alloc(ETensorDType::FP32, {2}, "lm_head_bwd_x_fp8_stats");
-            xF_fp8.Stats = xF_stats.get<float>();
-            const long numel = xF_slice.Sizes[0] * static_cast<long>(C);
-            abs_max(xF_fp8.abs_max(), xF_slice, numel, mRunState.DeviceProp, mRunState.MainStream);
-            quantize_with_abs_max(xF_fp8,
-                                  xF_fp8.scale(),
-                                  xF_slice,
-                                  xF_fp8.abs_max(),
-                                  numel,
-                                  mRunState.DeviceProp,
-                                  mRunState.MainStream);
-            matmul(logits,
-                   *cached_weight,
-                   xF_fp8,
-                   std::nullopt,
-                   const_cast<Tensor*>(cached_weight)->scale(),
-                   xF_fp8.scale(),
-                   mRunState.CublasLtHandle,
-                   mRunState.CuBlasWorkspace,
-                   V,
-                   static_cast<int>(xF_slice.Sizes[0]),
-                   C,
-                   swap_transpose(EMMTranspose::NT),
-                   false,
-                   mRunState.MainStream);
-            mRunState.temp_free(xF_stats);
-            mRunState.temp_free(xF_fp8);
-            return;
-        }
-
-        matmul(logits,
-               weight,
-               xF_slice,
-               std::nullopt,
-               nullptr,
-               nullptr,
-               mRunState.CublasLtHandle,
-               mRunState.CuBlasWorkspace,
-               V,
-               static_cast<int>(xF_slice.Sizes[0]),
-               C,
-               swap_transpose(EMMTranspose::NT),
-               false,
-               mRunState.MainStream);
-    };
-
-    auto lm_head_dx_matmul = [&](Tensor& d_xF_slice, Tensor& dlogits) -> bool {
-        const Tensor* cached_weight_t = nullptr;
-        if (use_fp8_lm_head && d_xF_slice.DType == ETensorDType::BF16 && dlogits.DType == ETensorDType::BF16) {
-            cached_weight_t = find_cached_lm_head(mFP8CacheT, weight_name, C, V);
-        }
-        if (!cached_weight_t) {
-            return false;
-        }
-
-        Tensor dlogits_fp8 = mRunState.temp_alloc(ETensorDType::FP8_E5M2,
-                                                  {dlogits.Sizes[0], static_cast<long>(V)},
-                                                  "lm_head_dlogits_e5m2");
-        Tensor dlogits_stats = mRunState.temp_alloc(ETensorDType::FP32, {2}, "lm_head_dlogits_e5m2_stats");
-        dlogits_fp8.Stats = dlogits_stats.get<float>();
-        const long numel = dlogits.Sizes[0] * static_cast<long>(V);
-        abs_max(dlogits_fp8.abs_max(), dlogits, numel, mRunState.DeviceProp, mRunState.MainStream);
-        quantize_with_abs_max(dlogits_fp8,
-                              dlogits_fp8.scale(),
-                              dlogits,
-                              dlogits_fp8.abs_max(),
-                              numel,
-                              mRunState.DeviceProp,
-                              mRunState.MainStream);
-        matmul(d_xF_slice,
-               *cached_weight_t,
-               dlogits_fp8,
-               std::nullopt,
-               const_cast<Tensor*>(cached_weight_t)->scale(),
-               dlogits_fp8.scale(),
-               mRunState.CublasLtHandle,
-               mRunState.CuBlasWorkspace,
-               C,
-               static_cast<int>(dlogits.Sizes[0]),
-               V,
-               EMMTranspose::TN,
-               false,
-               mRunState.MainStream);
-        mRunState.temp_free(dlogits_stats);
-        mRunState.temp_free(dlogits_fp8);
-        return true;
-    };
 
     const std::size_t xf_stride = get_dtype_size(xF_flat.DType);
     const std::size_t tgt_stride = get_dtype_size(targets.DType);
@@ -499,7 +496,7 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_backward(const CompiledOp& op
         logits.Sizes[1] = V;
         logits.Rank = 2;
 
-        lm_head_logits_matmul(logits, xF_slice);
+        lm_head_logits_matmul(logits, weight, xF_slice, weight_name, V, C, static_cast<int>(nano_batch_size));
 
         const bool fuse_softcap_backward = (op.attrs.softcap > 0.0f) && (mInvTemperatureGpu == nullptr);
 
@@ -611,7 +608,7 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_backward(const CompiledOp& op
             d_xF_slice.Sizes[1] = C;
             d_xF_slice.Rank = 2;
 
-            if (!lm_head_dx_matmul(d_xF_slice, logits)) {
+            if (!lm_head_dx_matmul(d_xF_slice, logits, weight_name, V, C, static_cast<int>(nano_batch_size))) {
                 matmul(d_xF_slice,
                        weight,
                        logits,
@@ -629,6 +626,503 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_backward(const CompiledOp& op
             }
         }
     }
+
+    if (need_lm_head) {
+        mWeightManager->release_lm_head(mRunState.MainStream);
+    }
+}
+
+// =============================================================================
+// LM-head row-compaction path. Drops rows whose target == -100 before the
+// lm_head matmul + cross-entropy. State is shared with the matching backward
+// via mLmheadCompactValidIdx / mLmheadCompactNValid (forward writes, backward
+// reads then clears). v1 limitations: BF16 xF/weight only, no FP8 lm_head
+// cache, not used in logprob-extraction mode. softcap, per-token temperature,
+// and GRPO custom dloss are all supported.
+// =============================================================================
+
+void CompiledExecutor::dispatch_fused_lm_head_loss_compact(const CompiledOp& op) {
+    Tensor& xF_flat = resolve_tensor(op.inputs[0]);
+    Tensor& weight = resolve_tensor(op.inputs[1]);
+    Tensor& targets = resolve_tensor(op.inputs[2]);
+    Tensor& loss = ensure_output_tensor(op.outputs[0]);
+
+    const long BT = xF_flat.Sizes[0];
+    const int V = static_cast<int>(weight.Sizes[0]);
+    const int C = static_cast<int>(weight.Sizes[1]);
+    const int P = V;
+    const std::string weight_name = op.inputs.size() > 1 ? op.inputs[1].name : std::string();
+
+    const bool need_lm_head =
+        mWeightManager && (mWeightManager->is_streaming_enabled() || mWeightManager->is_offload_enabled());
+    if (need_lm_head && mComm) {
+        mWeightManager->gather_lm_head(*mComm, mRunState.MainStream);
+    }
+
+    ensure_lmhead_compact_buffers(static_cast<int>(BT));
+
+    // Compute valid indices on device, then sync n_valid to host.
+    compact_valid_indices(targets.get<int>(),
+                          mLmheadCompactValidIdx,
+                          mLmheadCompactNValidDev,
+                          static_cast<int>(BT),
+                          mRunState.MainStream);
+    int n_valid = 0;
+    CUDA_CHECK(
+        cudaMemcpyAsync(&n_valid, mLmheadCompactNValidDev, sizeof(int), cudaMemcpyDeviceToHost, mRunState.MainStream));
+    CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+    mLmheadCompactNValid = n_valid;
+
+    if (n_valid == 0) {
+        // Whole micro-batch masked. No work; loss[BT] keeps its accumulated value.
+        if (need_lm_head) {
+            mWeightManager->release_lm_head(mRunState.MainStream);
+        }
+        return;
+    }
+
+    const int lmhead_chunks = std::max(1, mOptions.LMHeadChunks);
+    const long max_nano = std::max<long>(1, BT / static_cast<long>(lmhead_chunks));
+    const int n_chunks_vocab = (V + CROSS_ENTROPY_MAX_FUSED_SIZE - 1) / CROSS_ENTROPY_MAX_FUSED_SIZE;
+
+    // Allocate compact buffers via the temp stack.
+    Tensor xF_compact = mRunState.temp_alloc(ETensorDType::BF16,
+                                             {static_cast<long>(n_valid), static_cast<long>(C)},
+                                             "lmhead_xF_compact");
+    Tensor targets_compact =
+        mRunState.temp_alloc(ETensorDType::INT32, {static_cast<long>(n_valid)}, "lmhead_targets_compact");
+    Tensor losses_compact =
+        mRunState.temp_alloc(ETensorDType::FP32, {static_cast<long>(n_valid)}, "lmhead_losses_compact");
+    Tensor inv_t_compact{};
+    bool has_inv_t_compact = false;
+    if (mInvTemperatureGpu) {
+        inv_t_compact = mRunState.temp_alloc(ETensorDType::FP32, {static_cast<long>(n_valid)}, "lmhead_inv_t_compact");
+        has_inv_t_compact = true;
+    }
+
+    gather_rows_bf16(xF_flat.get<nv_bfloat16>(),
+                     mLmheadCompactValidIdx,
+                     xF_compact.get<nv_bfloat16>(),
+                     n_valid,
+                     C,
+                     mRunState.MainStream);
+    gather_int(targets.get<int>(), mLmheadCompactValidIdx, targets_compact.get<int>(), n_valid, mRunState.MainStream);
+    if (has_inv_t_compact) {
+        gather_float(mInvTemperatureGpu,
+                     mLmheadCompactValidIdx,
+                     inv_t_compact.get<float>(),
+                     n_valid,
+                     mRunState.MainStream);
+    }
+    // CE forward accumulates into losses[*]; we want it fresh per micro-step here.
+    CUDA_CHECK(
+        cudaMemsetAsync(losses_compact.Data, 0, static_cast<size_t>(n_valid) * sizeof(float), mRunState.MainStream));
+
+    const std::size_t xf_stride = get_dtype_size(xF_compact.DType);
+    const std::size_t tgt_stride = get_dtype_size(targets_compact.DType);
+    const std::size_t loss_stride = get_dtype_size(losses_compact.DType);
+    const std::size_t lse_stride = sizeof(float);
+
+    for (long start = 0; start < n_valid; start += max_nano) {
+        const long nano = std::min<long>(max_nano, static_cast<long>(n_valid) - start);
+
+        Tensor xF_slice = xF_compact;
+        xF_slice.Data = static_cast<std::byte*>(xF_compact.Data) +
+                        static_cast<std::size_t>(start) * xf_stride * static_cast<std::size_t>(C);
+        xF_slice.Sizes[0] = nano;
+        xF_slice.Sizes[1] = C;
+        xF_slice.Rank = 2;
+
+        Tensor tgt_slice = targets_compact;
+        tgt_slice.Data = static_cast<std::byte*>(targets_compact.Data) + static_cast<std::size_t>(start) * tgt_stride;
+        tgt_slice.Sizes[0] = nano;
+        tgt_slice.Rank = 1;
+
+        Tensor loss_slice = losses_compact;
+        loss_slice.Data = static_cast<std::byte*>(losses_compact.Data) + static_cast<std::size_t>(start) * loss_stride;
+        loss_slice.Sizes[0] = nano;
+        loss_slice.Rank = 1;
+
+        Tensor logits = mRunState.non_block_activations().output;
+        logits.Sizes[0] = nano;
+        logits.Sizes[1] = V;
+        logits.Rank = 2;
+
+        lm_head_logits_matmul(logits, weight, xF_slice, weight_name, V, C, static_cast<int>(nano));
+
+        const bool fuse_softcap_forward = (op.attrs.softcap > 0.0f) && !has_inv_t_compact;
+        if ((op.attrs.softcap > 0.0f) && !fuse_softcap_forward) {
+            softcap_logits(logits, op.attrs.softcap, static_cast<int>(nano), V, mRunState.MainStream);
+        }
+
+        if (has_inv_t_compact) {
+            const float* inv_t = inv_t_compact.get<float>() + start;
+            scale_logits_rows(logits, inv_t, static_cast<int>(nano), V, P, mRunState.MainStream);
+        }
+
+        // logsumexp_compact[start : start+nano]
+        Tensor logsumexp_view{};
+        logsumexp_view.DType = ETensorDType::FP32;
+        logsumexp_view.Data = reinterpret_cast<std::byte*>(mLmheadCompactLogsumexp + start);
+        logsumexp_view.Sizes[0] = nano;
+        logsumexp_view.Rank = 1;
+
+        if (V > CROSS_ENTROPY_MAX_FUSED_SIZE) {
+            if (!mRunState.scratch().cross_entropy_chunk_logsumexp.Data) {
+                throw std::runtime_error("fused_lm_head_loss_compact: chunk logsumexp buffer not allocated");
+            }
+            Tensor chunk_lse = mRunState.scratch().cross_entropy_chunk_logsumexp;
+            chunk_lse.Data =
+                static_cast<std::byte*>(chunk_lse.Data) + static_cast<std::size_t>(start) * lse_stride * n_chunks_vocab;
+            chunk_lse.Sizes[0] = nano;
+            chunk_lse.Sizes[1] = n_chunks_vocab;
+            chunk_lse.Rank = 2;
+
+            chunked_cross_entropy_forward(logits,
+                                          loss_slice,
+                                          &logsumexp_view,
+                                          chunk_lse,
+                                          tgt_slice,
+                                          &mRunState.ValidTokenCount,
+                                          op.attrs.compute_accuracy ? &mRunState.CorrectCount : nullptr,
+                                          static_cast<int>(nano),
+                                          V,
+                                          P,
+                                          n_chunks_vocab,
+                                          fuse_softcap_forward ? op.attrs.softcap : 0.0f,
+                                          mRunState.MainStream);
+        } else {
+            fused_cross_entropy_forward(logits,
+                                        loss_slice,
+                                        &logsumexp_view,
+                                        tgt_slice,
+                                        &mRunState.ValidTokenCount,
+                                        op.attrs.compute_accuracy ? &mRunState.CorrectCount : nullptr,
+                                        static_cast<int>(nano),
+                                        V,
+                                        P,
+                                        fuse_softcap_forward ? op.attrs.softcap : 0.0f,
+                                        mRunState.MainStream);
+        }
+    }
+
+    // Scatter losses_compact into loss[BT] (atomicAdd; -100 rows untouched).
+    scatter_loss_add(losses_compact.get<float>(),
+                     mLmheadCompactValidIdx,
+                     loss.get<float>(),
+                     n_valid,
+                     mRunState.MainStream);
+
+    if (has_inv_t_compact) {
+        mRunState.temp_free(inv_t_compact);
+    }
+    mRunState.temp_free(losses_compact);
+    mRunState.temp_free(targets_compact);
+    mRunState.temp_free(xF_compact);
+
+    if (need_lm_head) {
+        mWeightManager->release_lm_head(mRunState.MainStream);
+    }
+}
+
+void CompiledExecutor::dispatch_fused_lm_head_loss_backward_compact(const CompiledOp& op) {
+    Tensor& d_loss = resolve_tensor(op.inputs[0]);
+    Tensor& xF_flat = resolve_tensor(op.inputs[1]);
+    Tensor& weight = resolve_tensor(op.inputs[2]);
+    Tensor& targets = resolve_tensor(op.inputs[3]);
+
+    Tensor* d_xF_ptr = nullptr;
+    if (!op.outputs.empty() && !op.outputs[0].name.empty()) {
+        d_xF_ptr = &ensure_output_tensor(op.outputs[0]);
+    }
+
+    Tensor* d_weight_ptr = nullptr;
+    bool d_weight_accumulate = false;
+    if (op.outputs.size() > 1 && !op.outputs[1].name.empty() && mCurrentGraph) {
+        if (auto weight_name = base_param_from_grad_kind(op.outputs[1].tensor_id, *mCurrentGraph)) {
+            bool accum = false;
+            Tensor* grad = mGrads.get_param_grad(*weight_name, accum);
+            d_weight_accumulate = mAccumulateTensors.count(op.outputs[1].name) > 0;
+            if (!d_weight_accumulate) {
+                d_weight_accumulate = mAccumulateTensors.count("d_" + *weight_name) > 0;
+            }
+            if (grad && grad->Data) {
+                d_weight_ptr = &ensure_output_tensor(op.outputs[1]);
+            }
+        }
+    }
+
+    // Seed d_loss[BT] (mirror the existing path).
+    const std::string d_loss_name = strip_ssa_suffix(op.inputs[0].name);
+    bool d_loss_seeded = false;
+    const bool d_loss_like = starts_with(d_loss_name, "d_loss") || d_loss_name == "loss" || d_loss_name == "losses";
+    const bool standalone_explicit_backward = mCurrentGraph && mCurrentGraph->ops.size() == 1;
+    if (!standalone_explicit_backward &&
+        (op.inputs[0].slot == TensorSlot::DLoss || op.inputs[0].slot == TensorSlot::Losses || d_loss_like)) {
+        if (mCustomDLossGpu) {
+            CUDA_CHECK(cudaMemcpyAsync(d_loss.Data,
+                                       mCustomDLossGpu,
+                                       static_cast<std::size_t>(d_loss.nelem()) * sizeof(float),
+                                       cudaMemcpyDeviceToDevice,
+                                       mRunState.MainStream));
+        } else {
+            fill_constant(d_loss, 1.0f, static_cast<std::size_t>(d_loss.nelem()), mRunState.MainStream);
+        }
+        d_loss_seeded = true;
+    }
+
+    const long BT = xF_flat.Sizes[0];
+    const int V = static_cast<int>(weight.Sizes[0]);
+    const int C = static_cast<int>(weight.Sizes[1]);
+    const int P = V;
+
+    const int n_valid = mLmheadCompactNValid;
+
+    if (n_valid == 0) {
+        if (d_xF_ptr) {
+            // Zero d_xF_flat — no rows contributed.
+            CUDA_CHECK(cudaMemsetAsync(d_xF_ptr->Data,
+                                       0,
+                                       static_cast<size_t>(d_xF_ptr->nelem()) * get_dtype_size(d_xF_ptr->DType),
+                                       mRunState.MainStream));
+        }
+        mLmheadCompactNValid = -1;
+        return;
+    }
+
+    const bool need_lm_head =
+        mWeightManager && (mWeightManager->is_streaming_enabled() || mWeightManager->is_offload_enabled());
+    if (need_lm_head && mComm) {
+        mWeightManager->gather_lm_head(*mComm, mRunState.MainStream);
+    }
+    const std::string weight_name = op.inputs.size() > 2 ? op.inputs[2].name : std::string();
+
+    const int lmhead_chunks = std::max(1, mOptions.LMHeadChunks);
+    const long max_nano = std::max<long>(1, BT / static_cast<long>(lmhead_chunks));
+
+    Tensor xF_compact = mRunState.temp_alloc(ETensorDType::BF16,
+                                             {static_cast<long>(n_valid), static_cast<long>(C)},
+                                             "lmhead_bwd_xF_compact");
+    Tensor targets_compact =
+        mRunState.temp_alloc(ETensorDType::INT32, {static_cast<long>(n_valid)}, "lmhead_bwd_targets_compact");
+    Tensor d_loss_compact =
+        mRunState.temp_alloc(ETensorDType::FP32, {static_cast<long>(n_valid)}, "lmhead_bwd_dloss_compact");
+    Tensor d_xF_compact{};
+    bool has_d_xF = false;
+    if (d_xF_ptr) {
+        d_xF_compact = mRunState.temp_alloc(d_xF_ptr->DType,
+                                            {static_cast<long>(n_valid), static_cast<long>(C)},
+                                            "lmhead_bwd_d_xF_compact");
+        has_d_xF = true;
+    }
+    Tensor inv_t_compact{};
+    bool has_inv_t_compact = false;
+    if (mInvTemperatureGpu) {
+        inv_t_compact =
+            mRunState.temp_alloc(ETensorDType::FP32, {static_cast<long>(n_valid)}, "lmhead_bwd_inv_t_compact");
+        has_inv_t_compact = true;
+    }
+
+    gather_rows_bf16(xF_flat.get<nv_bfloat16>(),
+                     mLmheadCompactValidIdx,
+                     xF_compact.get<nv_bfloat16>(),
+                     n_valid,
+                     C,
+                     mRunState.MainStream);
+    gather_int(targets.get<int>(), mLmheadCompactValidIdx, targets_compact.get<int>(), n_valid, mRunState.MainStream);
+    gather_float(d_loss.get<float>(),
+                 mLmheadCompactValidIdx,
+                 d_loss_compact.get<float>(),
+                 n_valid,
+                 mRunState.MainStream);
+    if (has_inv_t_compact) {
+        gather_float(mInvTemperatureGpu,
+                     mLmheadCompactValidIdx,
+                     inv_t_compact.get<float>(),
+                     n_valid,
+                     mRunState.MainStream);
+    }
+
+    const std::size_t xf_stride = get_dtype_size(xF_compact.DType);
+    const std::size_t tgt_stride = get_dtype_size(targets_compact.DType);
+    const std::size_t dloss_stride = get_dtype_size(d_loss_compact.DType);
+    const std::size_t dxf_stride = has_d_xF ? get_dtype_size(d_xF_compact.DType) : 0;
+    const std::size_t lse_stride = sizeof(float);
+
+    for (long start = 0; start < n_valid; start += max_nano) {
+        const long nano = std::min<long>(max_nano, static_cast<long>(n_valid) - start);
+
+        Tensor xF_slice = xF_compact;
+        xF_slice.Data = static_cast<std::byte*>(xF_compact.Data) +
+                        static_cast<std::size_t>(start) * xf_stride * static_cast<std::size_t>(C);
+        xF_slice.Sizes[0] = nano;
+        xF_slice.Sizes[1] = C;
+        xF_slice.Rank = 2;
+
+        Tensor tgt_slice = targets_compact;
+        tgt_slice.Data = static_cast<std::byte*>(targets_compact.Data) + static_cast<std::size_t>(start) * tgt_stride;
+        tgt_slice.Sizes[0] = nano;
+        tgt_slice.Rank = 1;
+
+        Tensor dloss_slice = d_loss_compact;
+        dloss_slice.Data =
+            static_cast<std::byte*>(d_loss_compact.Data) + static_cast<std::size_t>(start) * dloss_stride;
+        dloss_slice.Sizes[0] = nano;
+        dloss_slice.Rank = 1;
+
+        Tensor logits = mRunState.non_block_activations().output;
+        logits.Sizes[0] = nano;
+        logits.Sizes[1] = V;
+        logits.Rank = 2;
+
+        lm_head_logits_matmul(logits, weight, xF_slice, weight_name, V, C, static_cast<int>(nano));
+
+        const bool fuse_softcap_backward = (op.attrs.softcap > 0.0f) && !has_inv_t_compact;
+        if ((op.attrs.softcap > 0.0f) && !fuse_softcap_backward) {
+            softcap_logits(logits, op.attrs.softcap, static_cast<int>(nano), V, mRunState.MainStream);
+        }
+
+        Tensor capped_logits_for_softcap_backward{};
+        Tensor* capped_logits_ptr = nullptr;
+        if ((op.attrs.softcap > 0.0f) && !fuse_softcap_backward) {
+            capped_logits_for_softcap_backward =
+                mRunState.temp_alloc(logits.DType, {nano, static_cast<long>(V)}, "lmhead_bwd_softcap_logits");
+            const std::size_t bytes =
+                static_cast<std::size_t>(nano) * static_cast<std::size_t>(V) * get_dtype_size(logits.DType);
+            CUDA_CHECK(cudaMemcpyAsync(capped_logits_for_softcap_backward.Data,
+                                       logits.Data,
+                                       bytes,
+                                       cudaMemcpyDeviceToDevice,
+                                       mRunState.MainStream));
+            capped_logits_ptr = &capped_logits_for_softcap_backward;
+        }
+
+        Tensor logsumexp_view{};
+        logsumexp_view.DType = ETensorDType::FP32;
+        logsumexp_view.Data = reinterpret_cast<std::byte*>(mLmheadCompactLogsumexp + start);
+        logsumexp_view.Sizes[0] = nano;
+        logsumexp_view.Rank = 1;
+
+        if (has_inv_t_compact) {
+            const float* inv_t = inv_t_compact.get<float>() + start;
+            scale_logits_rows(logits, inv_t, static_cast<int>(nano), V, P, mRunState.MainStream);
+        }
+
+        if (V > CROSS_ENTROPY_MAX_FUSED_SIZE) {
+            chunked_cross_entropy_backward(logits,
+                                           logits,
+                                           &logsumexp_view,
+                                           dloss_slice,
+                                           tgt_slice,
+                                           static_cast<int>(nano),
+                                           V,
+                                           P,
+                                           fuse_softcap_backward ? op.attrs.softcap : 0.0f,
+                                           mRunState.MainStream);
+        } else {
+            fused_cross_entropy_backward(logits,
+                                         logits,
+                                         &logsumexp_view,
+                                         dloss_slice,
+                                         tgt_slice,
+                                         static_cast<int>(nano),
+                                         V,
+                                         P,
+                                         fuse_softcap_backward ? op.attrs.softcap : 0.0f,
+                                         mRunState.MainStream);
+        }
+
+        if (has_inv_t_compact) {
+            const float* inv_t = inv_t_compact.get<float>() + start;
+            scale_logits_rows(logits, inv_t, static_cast<int>(nano), V, P, mRunState.MainStream);
+        }
+
+        if (capped_logits_ptr) {
+            softcap_logits_backward(logits,
+                                    *capped_logits_ptr,
+                                    op.attrs.softcap,
+                                    static_cast<int>(nano),
+                                    V,
+                                    mRunState.MainStream);
+            mRunState.temp_free(*capped_logits_ptr);
+        }
+
+        if (d_weight_ptr) {
+            const bool accumulate = d_weight_accumulate || (start != 0);
+            matmul(*d_weight_ptr,
+                   xF_slice,
+                   logits,
+                   std::nullopt,
+                   nullptr,
+                   nullptr,
+                   mRunState.CublasLtHandle,
+                   mRunState.CuBlasWorkspace,
+                   static_cast<int>(C),
+                   static_cast<int>(V),
+                   static_cast<int>(nano),
+                   swap_transpose(EMMTranspose::TN),
+                   accumulate,
+                   mRunState.MainStream);
+        }
+
+        if (has_d_xF) {
+            Tensor d_xF_slice = d_xF_compact;
+            d_xF_slice.Data = static_cast<std::byte*>(d_xF_compact.Data) +
+                              static_cast<std::size_t>(start) * dxf_stride * static_cast<std::size_t>(C);
+            d_xF_slice.Sizes[0] = nano;
+            d_xF_slice.Sizes[1] = C;
+            d_xF_slice.Rank = 2;
+
+            if (!lm_head_dx_matmul(d_xF_slice, logits, weight_name, V, C, static_cast<int>(nano))) {
+                matmul(d_xF_slice,
+                       weight,
+                       logits,
+                       std::nullopt,
+                       nullptr,
+                       nullptr,
+                       mRunState.CublasLtHandle,
+                       mRunState.CuBlasWorkspace,
+                       static_cast<int>(C),
+                       static_cast<int>(nano),
+                       static_cast<int>(V),
+                       swap_transpose(EMMTranspose::NN),
+                       false,
+                       mRunState.MainStream);
+            }
+        }
+    }
+
+    // Scatter d_xF_compact -> d_xF_flat with zero-fill at -100 rows.
+    if (has_d_xF) {
+        if (d_xF_ptr->DType == ETensorDType::BF16) {
+            scatter_rows_zerofill_bf16(d_xF_compact.get<nv_bfloat16>(),
+                                       mLmheadCompactValidIdx,
+                                       d_xF_ptr->get<nv_bfloat16>(),
+                                       static_cast<int>(BT),
+                                       n_valid,
+                                       C,
+                                       mRunState.MainStream);
+        } else if (d_xF_ptr->DType == ETensorDType::FP32) {
+            scatter_rows_zerofill_fp32(d_xF_compact.get<float>(),
+                                       mLmheadCompactValidIdx,
+                                       d_xF_ptr->get<float>(),
+                                       static_cast<int>(BT),
+                                       n_valid,
+                                       C,
+                                       mRunState.MainStream);
+        } else {
+            throw std::runtime_error("fused_lm_head_loss_backward_compact: unsupported d_xF dtype");
+        }
+    }
+
+    if (has_inv_t_compact) mRunState.temp_free(inv_t_compact);
+    if (has_d_xF) mRunState.temp_free(d_xF_compact);
+    mRunState.temp_free(d_loss_compact);
+    mRunState.temp_free(targets_compact);
+    mRunState.temp_free(xF_compact);
+
+    // Consume forward state so a stray backward (without a paired forward) can't reuse it.
+    mLmheadCompactNValid = -1;
 
     if (need_lm_head) {
         mWeightManager->release_lm_head(mRunState.MainStream);

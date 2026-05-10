@@ -485,6 +485,7 @@ target_sources(surogate-common PRIVATE
     src/runtime/optimizers/adamw_8bit_optimizer.cpp
     src/runtime/optimizers/normuon_optimizer.cpp
     src/kernels/fused_classifier.cu
+    src/kernels/lmhead_compact.cu
     src/kernels/transpose.cu
     src/kernels/vector_add.cu
     src/kernels/slice_add.cu

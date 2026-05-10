@@ -383,6 +383,7 @@ NB_MODULE(_surogate, m) {
                bool init_projections_to_zero,
                bool debug_memory_breakdown,
                int lmhead_chunks,
+               bool skip_ignored_lmhead_rows,
                int attn_bwd_chunks,
                bool long_context,
                const std::string matmul_type,
@@ -423,6 +424,7 @@ NB_MODULE(_surogate, m) {
                 new (t) RuntimeOptions{.Recompute = recompute_level,
                                        .OffloadResidual = offload_residual,
                                        .LMHeadChunks = lmhead_chunks,
+                                       .SkipIgnoredLMHeadRows = skip_ignored_lmhead_rows,
                                        .AttBwdChunks = attn_bwd_chunks,
                                        .LongContext = long_context,
                                        .UseCudaGraphs = cpu_training ? false : use_cuda_graphs,
@@ -469,6 +471,7 @@ NB_MODULE(_surogate, m) {
             nb::arg("init_projections_to_zero") = false,
             nb::arg("debug_memory_breakdown") = false,
             nb::arg("lmhead_chunks") = 1,
+            nb::arg("skip_ignored_lmhead_rows") = false,
             nb::arg("attn_bwd_chunks") = 1,
             nb::arg("long_context") = false,
             nb::arg("matmul_type") = "",
@@ -513,6 +516,10 @@ NB_MODULE(_surogate, m) {
             "Enable activation recomputation: 'true' or 'false'.")
         .def_rw("offload_residual", &RuntimeOptions::OffloadResidual, "Offload residual stream buffers.")
         .def_rw("lmhead_chunks", &RuntimeOptions::LMHeadChunks, "Split LM head computation into this many chunks.")
+        .def_rw("skip_ignored_lmhead_rows",
+                &RuntimeOptions::SkipIgnoredLMHeadRows,
+                "Drop rows whose target == -100 before the lm_head matmul (Gap 2). "
+                "Disables CUDA graphs because n_valid varies per step.")
         .def_rw("attn_bwd_chunks", &RuntimeOptions::AttBwdChunks, "Split attention backward into this many chunks.")
         .def_rw("long_context",
                 &RuntimeOptions::LongContext,

@@ -81,6 +81,14 @@ class GRPOTrainConfig(SFTConfig):
         cfg["sample_packing"] = "false"
         cfg["datasets"] = []
 
+        # GRPO packed batches are heavily masked (prompt + padding tokens are -100,
+        # only the response gets loss). The compact lm_head path skips work on those
+        # rows for a meaningful step-time win — measured ~13% on Qwen3-0.6B BF16
+        # LoRA, ~14-21% on fp8-hybrid (the helpers route the gathered slices
+        # through the FP8 cache lookup + on-the-fly quantization).
+        if "lmhead_drop_ignored_rows" not in cfg:
+            cfg["lmhead_drop_ignored_rows"] = True
+
         super().__init__(cfg)
 
         # Parse nested loss config

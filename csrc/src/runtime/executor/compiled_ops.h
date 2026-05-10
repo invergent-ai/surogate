@@ -356,6 +356,7 @@ public:
     void dispatch_flash_attention(const CompiledOp& op);
     void dispatch_cross_entropy_loss(const CompiledOp& op);
     void dispatch_fused_lm_head_loss(const CompiledOp& op);
+    void dispatch_fused_lm_head_loss_compact(const CompiledOp& op);
     // MoE forward dispatch
     void dispatch_moe_softmax(const CompiledOp& op);
     void dispatch_moe_sigmoid(const CompiledOp& op);
@@ -399,6 +400,27 @@ public:
     void dispatch_embedding_backward(const CompiledOp& op);
     void dispatch_cross_entropy_loss_backward(const CompiledOp& op);
     void dispatch_fused_lm_head_loss_backward(const CompiledOp& op);
+    void dispatch_fused_lm_head_loss_backward_compact(const CompiledOp& op);
+
+    // Lazily (re)allocate the lm-head row-compaction scratch buffers when BT
+    // exceeds the current capacity. Buffers are tiny (~tens of KB total).
+    void ensure_lmhead_compact_buffers(int BT);
+
+    // Forward lm_head matmul that picks the FP8-cached path when the recipe and
+    // dtypes line up, falling back to the BF16 matmul otherwise. Shared between
+    // the standard and row-compaction dispatchers so both benefit from FP8.
+    void lm_head_logits_matmul(Tensor& logits,
+                               Tensor& weight,
+                               Tensor& xF_slice,
+                               const std::string& weight_name,
+                               int V,
+                               int C,
+                               int M);
+
+    // Backward lm_head dxF matmul using the FP8 transposed-cache path when
+    // available. Returns true on FP8 success; the caller does the BF16
+    // fallback matmul on false.
+    bool lm_head_dx_matmul(Tensor& d_xF_slice, Tensor& dlogits, const std::string& weight_name, int V, int C, int M);
     // MoE backward dispatch
     void dispatch_moe_softmax_backward(const CompiledOp& op);
     void dispatch_moe_sigmoid_backward(const CompiledOp& op);
@@ -579,6 +601,16 @@ private:
     // Custom per-token d_loss for GRPO backward (null = standard d_loss=1 seeding)
     float* mCustomDLossGpu = nullptr;
     const float* mInvTemperatureGpu = nullptr;
+
+    // --- LM-head row-compaction state (shared across forward/backward) ---
+    // Lazily allocated owned device buffers, shared between dispatch_fused_lm_head_loss_compact
+    // and its matching backward inside one micro-step. Sized to the current BT. Only used when
+    // RuntimeOptions::SkipIgnoredLMHeadRows is true and mLogprobsGpu is null.
+    int* mLmheadCompactValidIdx = nullptr;     // [BT_cap] indices of rows whose target != -100
+    int* mLmheadCompactNValidDev = nullptr;    // [1] device int, written by compact_valid_indices
+    float* mLmheadCompactLogsumexp = nullptr;  // [BT_cap] per-valid-row logsumexp (forward writes, backward reads)
+    int mLmheadCompactBTCap = 0;
+    int mLmheadCompactNValid = -1;  // -1 = forward has not run; >=0 = ready for backward
     const ExecutionRequest* mExecutionRequest = nullptr;
     const std::vector<std::string>* mSkippedBackwardTensors = nullptr;
 

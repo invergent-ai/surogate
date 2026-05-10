@@ -1630,6 +1630,41 @@ void chunked_cross_entropy_backward(Tensor& dlogits,
                                     float softcap,
                                     cudaStream_t stream);
 
+// --- lmhead_compact: token-row compaction for the lm_head loss path -------
+// Compute valid_idx[n_valid] from targets[BT] in-place; n_valid is written to
+// `n_valid_dev` (one int) and copied to host by the caller.
+void compact_valid_indices(const int* targets, int* valid_idx, int* n_valid_dev, int BT, cudaStream_t stream);
+
+void gather_rows_bf16(const nv_bfloat16* src,
+                      const int* valid_idx,
+                      nv_bfloat16* dst,
+                      int n_valid,
+                      int C,
+                      cudaStream_t stream);
+
+void gather_rows_fp32(const float* src, const int* valid_idx, float* dst, int n_valid, int C, cudaStream_t stream);
+
+void gather_int(const int* src, const int* valid_idx, int* dst, int n_valid, cudaStream_t stream);
+void gather_float(const float* src, const int* valid_idx, float* dst, int n_valid, cudaStream_t stream);
+
+void scatter_rows_zerofill_bf16(const nv_bfloat16* src,
+                                const int* valid_idx,
+                                nv_bfloat16* dst,
+                                int BT,
+                                int n_valid,
+                                int C,
+                                cudaStream_t stream);
+
+void scatter_rows_zerofill_fp32(const float* src,
+                                const int* valid_idx,
+                                float* dst,
+                                int BT,
+                                int n_valid,
+                                int C,
+                                cudaStream_t stream);
+
+void scatter_loss_add(const float* src, const int* valid_idx, float* dst, int n_valid, cudaStream_t stream);
+
 /// Extract per-token log-probabilities: logprobs[t] = logit[target[t]] - logsumexp(logits[t]).
 /// Masked tokens (target == -100) receive 0.
 void extract_logprobs(const float* logits,
