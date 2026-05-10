@@ -115,6 +115,13 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
             Whether to train the model from scratch (random initialization) rather than fine-tuning a pre-trained model.
         lmhead_chunks (Optional[int], defaults to 1):
             Split LM-head computation into N chunks, so that the required size of the logit tensor is reduced by a factor of N.
+        auto_lmhead_chunks (Optional[bool], defaults to None):
+            If true and `lmhead_chunks` is left at 1, pick the largest power-of-2 chunk count
+            (cap 32) that evenly divides `per_device_train_batch_size * sequence_len`, targeting
+            ~256 rows per chunk. Inspired by TRL's chunked-NLL loss (huggingface/trl#5575).
+            When None (default), this resolves to True for FFT (`lora=False`) and False for LoRA
+            (which falls back to the conservative cap-8 LoRA+recompute carveout). Pass explicit
+            true/false to override.
         attn_bwd_chunks (Optional[int], defaults to 1):
             Split attention backward pass into N chunks to save workspace memory.
         gradient_dtype (Optional[str], defaults to None):
@@ -308,6 +315,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
     init_projections_to_zero: bool | None = False
     from_scratch: bool | None = False
     lmhead_chunks: int | None = 1
+    auto_lmhead_chunks: bool | None = None
     attn_bwd_chunks: int | None = 1
     gradient_dtype: str | None = None
     master_dtype: str | None = None
@@ -437,6 +445,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         self.init_projections_to_zero = cfg.get("init_projections_to_zero", self.init_projections_to_zero)
         self.from_scratch = cfg.get("from_scratch", self.from_scratch)
         self.lmhead_chunks = cfg.get("lmhead_chunks", self.lmhead_chunks)
+        self.auto_lmhead_chunks = cfg.get("auto_lmhead_chunks", self.auto_lmhead_chunks)
         self.attn_bwd_chunks = cfg.get("attn_bwd_chunks", self.attn_bwd_chunks)
         self.gradient_dtype = cfg.get("gradient_dtype", self.gradient_dtype)
         self.master_dtype = cfg.get("master_dtype", self.master_dtype)
@@ -575,16 +584,39 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
                 f"Your learning rate {self.learning_rate} is set to a very high value. Consider decreasing it to avoid exploding gradients!"
             )
 
-        # Auto-tune lmhead_chunks for LoRA + recompute to reduce logit buffer memory.
+        # Default: aggressive auto-tune for FFT, conservative LoRA carveout for LoRA.
+        if self.auto_lmhead_chunks is None:
+            self.auto_lmhead_chunks = not self.lora
+
+        # Auto-tune lmhead_chunks to reduce logit buffer memory.
         # The output buffer is {B*T/chunks, V} in bf16 which can be >1 GiB with chunks=1.
-        if self.lora and self.recompute and self.lmhead_chunks == 1:
+        if self.lmhead_chunks == 1:
             total_tokens = self.per_device_train_batch_size * self.sequence_len
-            chunk_order = (2, 4, 8) if self.recipe in ("fp8-hybrid", "fp8_hybrid") else (8, 4, 2)
-            for chunks in chunk_order:
-                if total_tokens % chunks == 0:
-                    self.lmhead_chunks = chunks
-                    logger.info(f"Auto-setting lmhead_chunks={chunks}")
-                    break
+            if self.auto_lmhead_chunks:
+                # Aggressive: target ~256 rows/chunk (matches TRL chunked-NLL), cap 32.
+                target_rows = 256
+                cap = 32
+                desired = max(1, total_tokens // target_rows)
+                chosen = 1
+                candidate = 2
+                while candidate <= min(desired, cap):
+                    if total_tokens % candidate == 0:
+                        chosen = candidate
+                    candidate *= 2
+                if chosen > 1:
+                    self.lmhead_chunks = chosen
+                    logger.info(
+                        f"auto_lmhead_chunks: setting lmhead_chunks={chosen} "
+                        f"(BT={total_tokens}, target ~{target_rows} rows/chunk)"
+                    )
+            elif self.lora and self.recompute:
+                # Conservative LoRA+recompute carveout: cap 8.
+                chunk_order = (2, 4, 8) if self.recipe in ("fp8-hybrid", "fp8_hybrid") else (8, 4, 2)
+                for chunks in chunk_order:
+                    if total_tokens % chunks == 0:
+                        self.lmhead_chunks = chunks
+                        logger.info(f"Auto-setting lmhead_chunks={chunks}")
+                        break
 
         self._validate_chunking_config()
 
