@@ -122,6 +122,12 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
             When None (default), this resolves to True for FFT (`lora=False`) and False for LoRA
             (which falls back to the conservative cap-8 LoRA+recompute carveout). Pass explicit
             true/false to override.
+        lmhead_drop_ignored_rows (Optional[bool], defaults to False):
+            Skip the lm_head matmul + cross-entropy on rows whose target == -100
+            (e.g. prompt tokens in completion-only SFT, masked tokens in GRPO). Recovers the
+            FLOPs that the existing chunked path still spends on those rows. Disables CUDA
+            graphs because the number of valid rows varies per step. v1 supports BF16 lm_head
+            only and does not stack with the FP8 lm_head cache.
         attn_bwd_chunks (Optional[int], defaults to 1):
             Split attention backward pass into N chunks to save workspace memory.
         gradient_dtype (Optional[str], defaults to None):
@@ -316,6 +322,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
     from_scratch: bool | None = False
     lmhead_chunks: int | None = 1
     auto_lmhead_chunks: bool | None = None
+    lmhead_drop_ignored_rows: bool | None = False
     attn_bwd_chunks: int | None = 1
     gradient_dtype: str | None = None
     master_dtype: str | None = None
@@ -446,6 +453,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         self.from_scratch = cfg.get("from_scratch", self.from_scratch)
         self.lmhead_chunks = cfg.get("lmhead_chunks", self.lmhead_chunks)
         self.auto_lmhead_chunks = cfg.get("auto_lmhead_chunks", self.auto_lmhead_chunks)
+        self.lmhead_drop_ignored_rows = cfg.get("lmhead_drop_ignored_rows", self.lmhead_drop_ignored_rows)
         self.attn_bwd_chunks = cfg.get("attn_bwd_chunks", self.attn_bwd_chunks)
         self.gradient_dtype = cfg.get("gradient_dtype", self.gradient_dtype)
         self.master_dtype = cfg.get("master_dtype", self.master_dtype)
@@ -809,6 +817,13 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
             self.use_cuda_graphs = False
             logger.info("[debug_time_breakdown]: disabling CUDA graphs for accurate per-phase timing.")
 
+        if self.lmhead_drop_ignored_rows and self.use_cuda_graphs:
+            self.use_cuda_graphs = False
+            logger.info(
+                "[lmhead_drop_ignored_rows]: disabling CUDA graphs (n_valid varies per step, "
+                "so the captured matmul dimensions can't be replayed)."
+            )
+
         self.runtime_config = _surogate.RuntimeOptions(
             recompute="true" if self.recompute else "false",
             offload_residual=self.offload_residual,
@@ -826,6 +841,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
             init_projections_to_zero=self.init_projections_to_zero,
             debug_memory_breakdown=self.debug_memory_breakdown,
             lmhead_chunks=self.lmhead_chunks,
+            skip_ignored_lmhead_rows=bool(self.lmhead_drop_ignored_rows),
             attn_bwd_chunks=self.attn_bwd_chunks,
             matmul_type="",
             gradient_type=self.gradient_dtype or "",

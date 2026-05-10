@@ -424,6 +424,7 @@ struct ModelOptions {
 
     // LM head settings
     int lmhead_chunks = 1;
+    bool skip_ignored_lmhead_rows = false;
     int attention_bwd_chunks = 1;
 
     // CUDA graphs
@@ -562,6 +563,7 @@ struct ModelOptions {
         }
         opts.OffloadResidual = offload_residuals;
         opts.LMHeadChunks = lmhead_chunks;
+        opts.SkipIgnoredLMHeadRows = skip_ignored_lmhead_rows;
         opts.AttBwdChunks = attention_bwd_chunks;
         opts.UseCudaGraphs = use_cuda_graphs;
         opts.TriggerTimingEvents = trigger_timing_events;
@@ -601,6 +603,7 @@ struct ModelOptions {
         options.recompute_block = recompute_enabled;
         options.offload_residuals = opts.OffloadResidual;
         options.lmhead_chunks = opts.LMHeadChunks;
+        options.skip_ignored_lmhead_rows = opts.SkipIgnoredLMHeadRows;
         options.attention_bwd_chunks = opts.AttBwdChunks;
         options.use_cuda_graphs = opts.UseCudaGraphs;
         options.trigger_timing_events = opts.TriggerTimingEvents;

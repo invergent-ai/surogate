@@ -47,6 +47,7 @@ struct RuntimeOptions {
     RecomputeLevel Recompute = RecomputeLevel::None;
     bool OffloadResidual = false;
     int LMHeadChunks = 1;
+    bool SkipIgnoredLMHeadRows = false;
     int AttBwdChunks = 1;
     bool LongContext = false;
     bool UseCudaGraphs = false;
