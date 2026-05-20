@@ -104,8 +104,22 @@ docker run --gpus=all -v /my/local/config.yaml:/home/surogate/config.yaml -v /my
 ```
 
 #### Option B: Install via script
+The `install.sh` script auto-detects your CUDA version (12.8, 12.9, or 13.x) and installs the matching pre-built wheel into a local `.venv/`.
+
+Install the latest release:
 ```bash
-curl -LsSf https://surogate.ai/install.sh | sh
+curl -LsSf https://github.com/invergent-ai/surogate/releases/latest/download/install.sh | bash
+```
+
+Or pin to a specific release (e.g. `v0.0.1`):
+```bash
+curl -LsSf https://github.com/invergent-ai/surogate/releases/download/v0.0.1/install.sh | bash
+```
+
+After installation:
+```bash
+source .venv/bin/activate
+surogate sft examples/sft/qwen3/qwen3-lora-bf16.yaml
 ```
 
 #### Option C: Build from source (dev / contributors)
