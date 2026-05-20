@@ -13,6 +13,12 @@ fi
 REPO="invergent-ai/surogate"
 VENV_DIR=".venv"
 
+# Pinned by the release workflow. When set, install.sh uses this version and
+# constructs download URLs directly from the release tag, skipping the GitHub
+# API lookup. Leave empty in-tree so install.sh from main still resolves the
+# latest release dynamically.
+VERSION_OVERRIDE=""
+
 # Check for required tools
 if ! command -v curl &> /dev/null; then
     echo "Error: curl is required but not installed."
@@ -108,12 +114,18 @@ install_surogate_wheel() {
     local wheel_pattern="surogate-${version}%2B${cuda_suffix}-cp312-abi3-manylinux_2_39_x86_64.whl"
 
     local download_url
-    download_url=$(echo "$RELEASE_JSON" | grep -oP '"browser_download_url":\s*"\K[^"]+' | grep "$wheel_pattern" || true)
+    if [ -n "$VERSION_OVERRIDE" ]; then
+        download_url="https://github.com/${REPO}/releases/download/v${version}/surogate-${version}%2B${cuda_suffix}-cp312-abi3-manylinux_2_39_x86_64.whl"
+    else
+        download_url=$(echo "$RELEASE_JSON" | grep -oP '"browser_download_url":\s*"\K[^"]+' | grep "$wheel_pattern" || true)
+    fi
 
     if [ -z "$download_url" ]; then
         echo "Error: Could not find wheel for CUDA $cuda_suffix (looking for $wheel_name)"
-        echo "Available wheels:"
-        echo "$RELEASE_JSON" | grep -oP '"browser_download_url":\s*"\K[^"]+' | grep '\.whl$' || echo "  (none found)"
+        if [ -z "$VERSION_OVERRIDE" ]; then
+            echo "Available wheels:"
+            echo "$RELEASE_JSON" | grep -oP '"browser_download_url":\s*"\K[^"]+' | grep '\.whl$' || echo "  (none found)"
+        fi
         exit 1
     fi
 
@@ -164,19 +176,24 @@ CUDA_MINOR=$(echo $CUDA_VERSION | cut -d. -f2)
 
 echo "Detected CUDA version: $CUDA_VERSION"
 
-# --- Fetch latest release ---
+# --- Resolve target version ---
 
-echo "Fetching latest release from GitHub..."
-RELEASE_JSON=$(curl -sL "https://api.github.com/repos/${REPO}/releases/latest")
+if [ -n "$VERSION_OVERRIDE" ]; then
+    VERSION="$VERSION_OVERRIDE"
+    echo "Using pinned version: $VERSION"
+else
+    echo "Fetching latest release from GitHub..."
+    RELEASE_JSON=$(curl -sL "https://api.github.com/repos/${REPO}/releases/latest")
 
-if [ -z "$RELEASE_JSON" ] || echo "$RELEASE_JSON" | grep -q '"message": "Not Found"'; then
-    echo "Error: Could not fetch release information from GitHub."
-    exit 1
+    if [ -z "$RELEASE_JSON" ] || echo "$RELEASE_JSON" | grep -q '"message": "Not Found"'; then
+        echo "Error: Could not fetch release information from GitHub."
+        exit 1
+    fi
+
+    TAG_NAME=$(echo "$RELEASE_JSON" | grep -oP '"tag_name":\s*"\K[^"]+')
+    VERSION="${TAG_NAME#v}"
+    echo "Latest version: $VERSION"
 fi
-
-TAG_NAME=$(echo "$RELEASE_JSON" | grep -oP '"tag_name":\s*"\K[^"]+')
-VERSION="${TAG_NAME#v}"
-echo "Latest version: $VERSION"
 
 # --- Dispatch to the right install function ---
 
