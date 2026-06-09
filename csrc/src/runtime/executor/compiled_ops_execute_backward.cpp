@@ -1194,13 +1194,19 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                         // recompute trigger misses them. Detect the op's
                         // effective layer from its inputs/outputs and fire
                         // recompute there. Idempotent via mLastRecomputeLayer.
+                        //
+                        // Gradient-only ops (no non-grad refs) never trigger:
+                        // they read no forward activations, and replaying for
+                        // them is not just wasted work — replay_layer_forward
+                        // restores the Stack to the previous replay's
+                        // checkpoint, which would clobber live backward
+                        // gradients mid-block (Gemma4 shared-KV accum adds
+                        // would otherwise flip the layer back and forth).
                         if (mRecomputeEnabled && mRecomputeFn) {
                             const int non_grad_layer = op_layer_idx(op);
-                            const int any_layer = op_layer_idx_any(op);
-                            const int effective_layer_idx = (non_grad_layer >= 0) ? non_grad_layer : any_layer;
-                            if (effective_layer_idx >= 0 && effective_layer_idx != mLastRecomputeLayer) {
-                                mRecomputeFn(effective_layer_idx, mB, mT, mRecomputeUseGraphs);
-                                mLastRecomputeLayer = effective_layer_idx;
+                            if (non_grad_layer >= 0 && non_grad_layer != mLastRecomputeLayer) {
+                                mRecomputeFn(non_grad_layer, mB, mT, mRecomputeUseGraphs);
+                                mLastRecomputeLayer = non_grad_layer;
                             }
                         }
 
@@ -1380,21 +1386,21 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         }
 
         if (mRecomputeEnabled && mRecomputeFn) {
+            // Gradient-only ops never trigger recompute: they read no forward
+            // activations, and replay_layer_forward's deferred-checkpoint
+            // Stack restore would clobber live backward gradients mid-block
+            // (see the stream-path trigger above).
             const int layer_idx = op_layer_idx(op);
-            const int layer_idx_any = op_layer_idx_any(op);
-            const int effective_layer_idx = (layer_idx >= 0) ? layer_idx : layer_idx_any;
-            if (effective_layer_idx >= 0 && effective_layer_idx != mLastRecomputeLayer) {
+            if (layer_idx >= 0 && layer_idx != mLastRecomputeLayer) {
                 if (debug_replay) {
                     fprintf(stderr,
-                            "[BWD] op_layer_detect=%d (non_grad=%d any=%d) for op %zu type=%s\n",
-                            effective_layer_idx,
+                            "[BWD] op_layer_detect=%d for op %zu type=%s\n",
                             layer_idx,
-                            layer_idx_any,
                             idx,
                             op_type_to_string(op.type));
                 }
-                mRecomputeFn(effective_layer_idx, mB, mT, mRecomputeUseGraphs);
-                mLastRecomputeLayer = effective_layer_idx;
+                mRecomputeFn(layer_idx, mB, mT, mRecomputeUseGraphs);
+                mLastRecomputeLayer = layer_idx;
             }
         }
 

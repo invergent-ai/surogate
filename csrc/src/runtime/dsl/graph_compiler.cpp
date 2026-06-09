@@ -2194,34 +2194,21 @@ void GraphCompiler::annotate_layer_boundaries(CompiledGraph& graph) {
         return -1;
     };
 
-    auto ref_layer_idx_any = [&](const TensorRef& ref) -> int {
-        if (ref.layer_idx >= 0) {
-            return ref.layer_idx;
-        }
-        if (ref.name.empty()) {
-            return -1;
-        }
-        std::string_view name = ref.name;
-        if (name.rfind("d_", 0) == 0) {
-            name.remove_prefix(2);
-        }
-        if (name.rfind("saved.", 0) == 0) {
-            name.remove_prefix(6);
-        }
-        int layer_idx = -1;
-        std::string field;
-        if (parse_block_param(name, layer_idx, field)) {
-            return layer_idx;
-        }
-        return -1;
-    };
-
     for (std::size_t i = 0; i < graph.ops.size(); ++i) {
         auto& op = graph.ops[i];
 
         // Check inputs/outputs for layer index. Use the highest layer index found,
         // since some ops (e.g., LN1 fused residual) consume previous-layer tensors
         // but are parameterized by the current layer's weights.
+        //
+        // Only non-gradient refs (params, forward activations, saved tensors)
+        // and explicit attrs.layer_idx may open/close a layer span. Gradient-only
+        // ops (d_* views at block-backward heads, cross-layer accumulation adds
+        // such as Gemma4's shared-KV `d_blocks[src].qkv_rope` accum) are glue
+        // absorbed into the surrounding span: attributing them by stripped
+        // gradient name plants layer_end markers mid-block, which makes the
+        // per-op backward cleanup persist/restore the Stack in the middle of a
+        // block's backward and fragments the phase tree.
         int detected_layer = -1;
         for (const auto& ref : op.inputs) {
             if (is_grad_ref(ref)) {
@@ -2239,20 +2226,6 @@ void GraphCompiler::annotate_layer_boundaries(CompiledGraph& graph) {
             const int layer_idx = ref_layer_idx(ref);
             if (layer_idx >= 0) {
                 detected_layer = std::max(detected_layer, layer_idx);
-            }
-        }
-        if (detected_layer < 0) {
-            for (const auto& ref : op.inputs) {
-                const int layer_idx = ref_layer_idx_any(ref);
-                if (layer_idx >= 0) {
-                    detected_layer = std::max(detected_layer, layer_idx);
-                }
-            }
-            for (const auto& ref : op.outputs) {
-                const int layer_idx = ref_layer_idx_any(ref);
-                if (layer_idx >= 0) {
-                    detected_layer = std::max(detected_layer, layer_idx);
-                }
             }
         }
         if (op.attrs.layer_idx >= 0) {
