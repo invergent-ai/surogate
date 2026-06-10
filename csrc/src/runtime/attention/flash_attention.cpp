@@ -273,8 +273,18 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
     }
 
     const int Hq = static_cast<int>(mConfig.NumQueryHeads);
-    const int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
+    int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
     const int Hs = derive_head_size(qkv, Hq, Hkv, static_cast<int>(mConfig.head_size()));
+
+    // Derive actual Hkv from tensor shape for hybrid models where block types
+    // have fewer KV heads than global config (e.g. Gemma4 full-attention
+    // layers with num_global_key_value_heads < num_key_value_heads).
+    if (qkv.Rank == 4) {
+        const int actual_heads = static_cast<int>(qkv.Sizes[2]);
+        if (actual_heads < Hq + 2 * Hkv) {
+            Hkv = std::max(0, (actual_heads - Hq) / 2);
+        }
+    }
 
     const Tensor& out_candidate = ensure_output_tensor(op.outputs[0]);
     const Tensor& lse_candidate = ensure_output_tensor(op.outputs[1]);
@@ -414,8 +424,17 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
                                                       d_qkv_shape,
                                                       "flash_attention_backward");
     const int Hq = static_cast<int>(mConfig.NumQueryHeads);
-    const int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
+    int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
     const int Hs = derive_head_size(qkv, Hq, Hkv, static_cast<int>(mConfig.head_size()));
+
+    // Same Hkv derivation as forward: hybrid block types may have fewer KV
+    // heads than global config (Gemma4 k_eq_v full-attention layers).
+    if (qkv.Rank == 4) {
+        const int actual_heads = static_cast<int>(qkv.Sizes[2]);
+        if (actual_heads < Hq + 2 * Hkv) {
+            Hkv = std::max(0, (actual_heads - Hq) / 2);
+        }
+    }
 
     const int layer_idx = resolve_layer_idx(op, /*explicit_idx_input=*/3);
 

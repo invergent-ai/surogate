@@ -1,6 +1,6 @@
 """Model Definitions for Python DSL"""
 
-from .gemma4 import Gemma4CausalModel, Gemma4ConditionalModel
+from .gemma4 import Gemma4CausalModel, Gemma4ConditionalModel, Gemma4UnifiedModel
 from .gpt_oss import GptOssModel
 from .llama import LlamaModel
 from .lfm2 import Lfm2Model
@@ -24,6 +24,7 @@ __all__ = [
     "Lfm2Model",
     "Gemma4CausalModel",
     "Gemma4ConditionalModel",
+    "Gemma4UnifiedModel",
     "NemotronHModel",
     "parse_hybrid_pattern",
     "to_standard_hybrid_pattern",

@@ -409,7 +409,15 @@ DslRuntimeConfig build_runtime_config(const Module& module, const PretrainedConf
                 d.intermediate = default_dff;
                 d.mlp_up = 2 * default_dff;  // gated activation default
             }
-            // Override from actual IR param shapes
+            // Override from actual IR param shapes. Two passes, mirroring
+            // GraphCompiler's per-layer dims derivation: out_weight is
+            // authoritative for attn_dim/head_size (its columns are exactly
+            // Hq*Hs regardless of QKV packing), while the qkv_weight row
+            // count is ambiguous — Gemma4 k_eq_v full layers pack Hq+Hkv
+            // heads, not Hq+2*Hkv, so deriving head_size from it produced
+            // attn_dim 4352 instead of 8192 and undersized LoRA B buffers
+            // (apply_lora_contribution then read past them).
+            std::vector<bool> attn_from_out(static_cast<std::size_t>(num_layers), false);
             for (const auto& [name, info] : graph.params) {
                 int layer_idx = -1;
                 std::string field;
@@ -421,19 +429,10 @@ DslRuntimeConfig build_runtime_config(const Module& module, const PretrainedConf
                 long s1 = (info.shape[1].kind == DimKind::Concrete) ? info.shape[1].value : 0;
                 if (s0 == 0 || s1 == 0) continue;
 
-                if (field == "qkv_weight") {
-                    d.qkv_channels = s0;
-                    long total_heads = hq + 2 * default_hkv;
-                    if (total_heads > 0) d.head_size = s0 / total_heads;
-                    d.attn_dim = hq * d.head_size;
-                } else if (field == "self_attn_q_weight") {
-                    // Shared-KV block: Q-only projection
-                    d.qkv_channels = s0;  // Q dim
-                    if (hq > 0) d.head_size = s0 / hq;
-                    d.attn_dim = s0;
-                } else if (field == "out_weight") {
+                if (field == "out_weight") {
                     d.attn_dim = s1;
                     if (hq > 0) d.head_size = s1 / hq;
+                    attn_from_out[static_cast<std::size_t>(layer_idx)] = true;
                 } else if (field == "mlp_down_weight") {
                     d.intermediate = s1;
                     d.mlp_up = s1;  // for GatedMLP: down_weight is (C, M)
@@ -444,6 +443,36 @@ DslRuntimeConfig build_runtime_config(const Module& module, const PretrainedConf
                     // SwiGLU: up_weight is (MUp, C) where MUp = 2*M
                     // GatedMLP: up_weight is (M, C)
                     // Use mlp_down_weight to disambiguate (set above)
+                }
+            }
+            for (const auto& [name, info] : graph.params) {
+                int layer_idx = -1;
+                std::string field;
+                if (!parse_block_param(name, layer_idx, field)) continue;
+                if (layer_idx < 0 || layer_idx >= num_layers) continue;
+                auto& d = runtime.per_layer_dims[layer_idx];
+                if (info.shape.size() < 2) continue;
+                long s0 = (info.shape[0].kind == DimKind::Concrete) ? info.shape[0].value : 0;
+                long s1 = (info.shape[1].kind == DimKind::Concrete) ? info.shape[1].value : 0;
+                if (s0 == 0 || s1 == 0) continue;
+                const bool from_out = attn_from_out[static_cast<std::size_t>(layer_idx)];
+
+                if (field == "qkv_weight") {
+                    d.qkv_channels = s0;
+                    if (from_out) {
+                        if (hq > 0) d.head_size = d.attn_dim / hq;
+                    } else {
+                        long total_heads = hq + 2 * default_hkv;
+                        if (total_heads > 0) d.head_size = s0 / total_heads;
+                        d.attn_dim = hq * d.head_size;
+                    }
+                } else if (field == "self_attn_q_weight") {
+                    // Shared-KV block: Q-only projection
+                    d.qkv_channels = s0;  // Q dim
+                    if (!from_out) {
+                        if (hq > 0) d.head_size = s0 / hq;
+                        d.attn_dim = s0;
+                    }
                 }
             }
         }

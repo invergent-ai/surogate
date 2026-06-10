@@ -773,12 +773,21 @@ def _init_instance_from_config(instance: Any, cls: type, config: dict[str, Any])
         pass
 
 
-def _expand_hybrid_hf_mappings(ir: ModuleIR, block_types: list, block_mappings: dict) -> None:
+def _expand_hybrid_hf_mappings(
+    ir: ModuleIR,
+    block_types: list,
+    block_mappings: dict,
+    type_overrides: dict | None = None,
+) -> None:
     """Expand template-based HF mappings for hybrid models with physical layer indices.
 
     In hybrid models, all blocks use ``blocks[N]`` with physical layer indices.
     This function generates per-param HF mapping entries by looking up the block
     type for each physical layer and applying the corresponding HF mapping template.
+
+    ``type_overrides`` maps a block type to a dict of per-param mappings that
+    take precedence over ``block_mappings`` for layers of that type (e.g. Gemma4
+    full-attention layers with ``attention_k_eq_v`` fuse q+k only, no v_proj).
     """
 
     def _replace_layer(spec, phys: int):
@@ -819,9 +828,16 @@ def _expand_hybrid_hf_mappings(ir: ModuleIR, block_types: list, block_mappings: 
             continue
         if phys_layer < 0 or phys_layer >= len(block_types):
             continue
-        if field not in block_mappings:
-            continue
-        serialized = _serialize_hf_spec(block_mappings[field])
+        mapping_spec = None
+        if type_overrides:
+            per_type = type_overrides.get(block_types[phys_layer])
+            if per_type and field in per_type:
+                mapping_spec = per_type[field]
+        if mapping_spec is None:
+            if field not in block_mappings:
+                continue
+            mapping_spec = block_mappings[field]
+        serialized = _serialize_hf_spec(mapping_spec)
         ir.hf_weight_mapping[param_name] = _replace_layer(serialized, phys_layer)
 
 
@@ -1747,7 +1763,12 @@ def compile_model_spec(
             and spec.python_class
             and hasattr(spec.python_class, "_hf_block_mappings_")
         ):
-            _expand_hybrid_hf_mappings(ir, instance.block_types, spec.python_class._hf_block_mappings_)
+            _expand_hybrid_hf_mappings(
+                ir,
+                instance.block_types,
+                spec.python_class._hf_block_mappings_,
+                type_overrides=getattr(instance, "_hf_block_type_mappings_", None),
+            )
 
     # Save/recompute
     if spec.forward:

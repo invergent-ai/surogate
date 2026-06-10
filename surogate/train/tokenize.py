@@ -486,7 +486,7 @@ def _encode_and_prepare_native(
 
     def collect_results(results):
         """Convert encoding results to numpy arrays."""
-        nonlocal n_skipped
+        nonlocal n_skipped, n_empty
         for result in results:
             if result is None:
                 n_skipped += 1

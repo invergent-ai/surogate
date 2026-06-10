@@ -584,6 +584,17 @@ Tokenizer Tokenizer::from_pretrained(const std::string& model_dir) {
                             "{% if add_generation_prompt %}"
                             "<|start_header_id|>assistant<|end_header_id|>\n\n"
                             "{% endif %}";
+        } else if (architecture == "gemma4" || architecture == "gemma4_unified") {
+            // Matches the official gemma-4 chat_template.jinja for plain text turns
+            // (system passes through as a role; assistant renders as "model").
+            fallback_tmpl = "{{ bos_token }}"
+                            "{% for message in messages %}"
+                            "<|turn>{{ 'model' if message['role'] == 'assistant' else message['role'] }}\n"
+                            "{{ message['content'] | trim }}<turn|>\n"
+                            "{% endfor %}"
+                            "{% if add_generation_prompt %}"
+                            "<|turn>model\n"
+                            "{% endif %}";
         }
 
         if (!fallback_tmpl.empty()) {

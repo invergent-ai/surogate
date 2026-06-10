@@ -1014,14 +1014,17 @@ class Gemma4Attention(Module):
 
         if self.k_eq_v:
             # --- k_eq_v mode: Q+K projection only, V = raw K ---
-            qk = g.view(
+            # All splits/concats stay in rank-3 channel space (like the
+            # standard branch below): the C++ shape inference and backward
+            # rules only handle channel-dim splits, not 4D head-count splits.
+            qkv3 = g.view(
                 qkv_flat,
-                shape=[B, T, self.num_query_heads + self.num_kv_heads, self.head_size],
+                shape=[B, T, _qkv_dim],
                 out_name=qkv_slot,
             )
             q_part, k_raw = g.split(
-                qk,
-                split_size=[self.num_query_heads, self.num_kv_heads],
+                qkv3,
+                split_size=[_hq, _hkv],
                 dim=2,
             )
             v_raw = k_raw
@@ -1033,9 +1036,7 @@ class Gemma4Attention(Module):
             q_normed_flat, _ = g.rmsnorm(
                 q_flat_2d, tracer.prefixed("q_norm_weight"), eps=self.eps, y_name=tracer.prefixed("q_normed_flat")
             )
-            q_normed = g.view(
-                q_normed_flat, shape=[B, T, self.num_query_heads, self.head_size], out_name=tracer.prefixed("q_normed")
-            )
+            q_normed = g.view(q_normed_flat, shape=[B, T, _hq], out_name=tracer.prefixed("q_normed"))
 
             # K-norm: direct weight
             k_flat_2d = g.view(
@@ -1044,22 +1045,21 @@ class Gemma4Attention(Module):
             k_normed_flat, _ = g.rmsnorm(
                 k_flat_2d, tracer.prefixed("k_norm_weight"), eps=self.eps, y_name=tracer.prefixed("k_normed_flat")
             )
-            k_normed = g.view(
-                k_normed_flat, shape=[B, T, self.num_kv_heads, self.head_size], out_name=tracer.prefixed("k_normed")
-            )
+            k_normed = g.view(k_normed_flat, shape=[B, T, _hkv], out_name=tracer.prefixed("k_normed"))
 
             # V-norm: RMS-only (no learnable scale), on raw K
             v_flat_2d = g.view(
                 v_raw, shape=[B * T * self.num_kv_heads, self.head_size], out_name=tracer.prefixed("v_flat_2d")
             )
             v_normed_flat, _ = g.rmsnorm(v_flat_2d, ones_d, eps=self.eps, y_name=tracer.prefixed("v_normed_2d"))
-            v_normed = g.view(
-                v_normed_flat, shape=[B, T, self.num_kv_heads, self.head_size], out_name=tracer.prefixed("v_normed")
-            )
+            v_normed = g.view(v_normed_flat, shape=[B, T, _hkv], out_name=tracer.prefixed("v_normed"))
 
-            qk_normed = g.concat(q_normed, k_normed, dim=2, split_size=[self.num_query_heads, self.num_kv_heads])
-            qkv_normed = g.concat(
-                qk_normed, v_normed, dim=2, split_size=[self.num_query_heads + self.num_kv_heads, self.num_kv_heads]
+            qk_normed = g.concat(q_normed, k_normed, dim=2, split_size=[_hq, _hkv])
+            qkv_normed_3d = g.concat(qk_normed, v_normed, dim=2, split_size=[_hq + _hkv, _hkv])
+            qkv_normed = g.view(
+                qkv_normed_3d,
+                shape=[B, T, self.num_query_heads + 2 * self.num_kv_heads, self.head_size],
+                out_name=tracer.prefixed("qkv_normed_4d"),
             )
 
         else:
@@ -1142,10 +1142,12 @@ class Gemma4Attention(Module):
             **fa_kwargs,
         )
 
-        # Output projection
+        # Output projection. Numeric dim (not self.AttnDim) — symbolic Hq*D
+        # resolves against global config dims, which are wrong for hybrid
+        # block types with per-type head_size/num_kv_heads.
         attn_flat = g.view(
             attn_out,
-            shape=[B * T, self.AttnDim],
+            shape=[B * T, _attn_dim],
             out_name=tracer.prefixed("att_flat"),
         )
         out_flat = g.matmul(

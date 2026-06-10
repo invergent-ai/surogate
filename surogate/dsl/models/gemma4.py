@@ -137,6 +137,24 @@ def _build_gemma4_block_mappings(
     }
 
 
+def _build_gemma4_k_eq_v_overrides(layer_prefix: str) -> dict[str, dict[str, object]]:
+    """Per-block-type HF mapping overrides for ``attention_k_eq_v`` checkpoints.
+
+    Full-attention layers ship q_proj + k_proj only (V reuses the K projection),
+    so the fused qkv weight has two sources instead of three. Applied via
+    ``_hf_block_type_mappings_`` during hybrid mapping expansion.
+    """
+    return {
+        "full": {
+            "qkv_weight": fuse(
+                f"{layer_prefix}.self_attn.q_proj.weight",
+                f"{layer_prefix}.self_attn.k_proj.weight",
+                dim=0,
+            ),
+        },
+    }
+
+
 def _build_gemma4_model(
     cls,
     vocab_size,
@@ -189,6 +207,10 @@ def _build_gemma4_model(
     cls.vocab_size_per_layer_input = vocab_size_per_layer_input
     cls.k_eq_v = k_eq_v
     cls.final_logit_softcapping = final_logit_softcapping
+
+    # k_eq_v checkpoints have no v_proj on full-attention layers; switch their
+    # qkv fuse mapping to the two-source (q+k) variant.
+    cls._hf_block_type_mappings_ = cls._hf_k_eq_v_overrides_ if k_eq_v else None
 
     if global_num_kv_heads is None:
         global_num_kv_heads = num_kv_heads
@@ -494,6 +516,124 @@ class Gemma4CausalModel(nn.Model):
         "model.layers.{layer}",
         "model",
     )
+    _hf_k_eq_v_overrides_ = _build_gemma4_k_eq_v_overrides("model.layers.{layer}")
+
+    def __init__(
+        self,
+        vocab_size: int = 262144,
+        d_model: int = 2304,
+        n_layers: int = 30,
+        num_query_heads: int = 8,
+        num_kv_heads: int = 4,
+        d_ff: int = 9216,
+        max_seq: int = 131072,
+        head_size: int = 256,
+        eps: float = 1e-6,
+        sliding_window: int = 512,
+        layer_types: list[str] | None = None,
+        sliding_rope_theta: float = 10000.0,
+        sliding_rope_type: str = "default",
+        global_head_dim: int = 512,
+        global_num_kv_heads: int | None = None,
+        full_rope_theta: float = 1000000.0,
+        full_rope_type: str = "proportional",
+        full_partial_rotary_factor: float = 0.25,
+        d_per_layer_input: int = 256,
+        vocab_size_per_layer_input: int = 262144,
+        k_eq_v: bool = False,
+        final_logit_softcapping: float | None = None,
+        enable_moe_block: bool = False,
+        num_experts: int = 0,
+        top_k_experts: int = 0,
+        moe_intermediate_size: int = 0,
+        num_kv_shared_layers: int = 0,
+        use_double_wide_mlp: bool = False,
+    ):
+        super().__init__()
+        _build_gemma4_model(
+            self,
+            vocab_size,
+            d_model,
+            n_layers,
+            num_query_heads,
+            num_kv_heads,
+            d_ff,
+            max_seq,
+            head_size,
+            eps,
+            sliding_window,
+            layer_types,
+            sliding_rope_theta,
+            sliding_rope_type,
+            global_head_dim,
+            global_num_kv_heads,
+            full_rope_theta,
+            full_rope_type,
+            full_partial_rotary_factor,
+            d_per_layer_input,
+            vocab_size_per_layer_input,
+            k_eq_v,
+            final_logit_softcapping,
+            enable_moe_block=enable_moe_block,
+            num_experts=num_experts or 0,
+            top_k_experts=top_k_experts or 0,
+            moe_intermediate_size=moe_intermediate_size or 0,
+            num_kv_shared_layers=num_kv_shared_layers,
+            use_double_wide_mlp=use_double_wide_mlp,
+        )
+
+    def forward(self, token_ids, position_ids, targets):
+        return _gemma4_forward(self, token_ids, position_ids, targets)
+
+
+# Shared text_config mapping for the multimodal gemma4 variants
+# (Gemma4ForConditionalGeneration and Gemma4UnifiedForConditionalGeneration).
+_GEMMA4_TEXT_CONFIG_MAPPING = dict(
+    d_model="text_config.hidden_size",
+    n_layers="text_config.num_hidden_layers",
+    num_query_heads="text_config.num_attention_heads",
+    num_kv_heads="text_config.num_key_value_heads",
+    d_ff="text_config.intermediate_size",
+    vocab_size="text_config.vocab_size",
+    max_seq="text_config.max_position_embeddings",
+    head_size="text_config.head_dim",
+    eps="text_config.rms_norm_eps",
+    sliding_window="text_config.sliding_window",
+    layer_types="text_config.layer_types",
+    sliding_rope_theta="text_config.rope_parameters.sliding_attention.rope_theta",
+    sliding_rope_type="text_config.rope_parameters.sliding_attention.rope_type",
+    global_head_dim="text_config.global_head_dim",
+    global_num_kv_heads="text_config.num_global_key_value_heads",
+    full_rope_theta="text_config.rope_parameters.full_attention.rope_theta",
+    full_rope_type="text_config.rope_parameters.full_attention.rope_type",
+    full_partial_rotary_factor="text_config.rope_parameters.full_attention.partial_rotary_factor",
+    d_per_layer_input="text_config.hidden_size_per_layer_input",
+    vocab_size_per_layer_input="text_config.vocab_size_per_layer_input",
+    k_eq_v="text_config.attention_k_eq_v",
+    final_logit_softcapping="text_config.final_logit_softcapping",
+    enable_moe_block="text_config.enable_moe_block",
+    num_experts="text_config.num_experts",
+    top_k_experts="text_config.top_k_experts",
+    moe_intermediate_size="text_config.moe_intermediate_size",
+    num_kv_shared_layers="text_config.num_kv_shared_layers",
+    use_double_wide_mlp="text_config.use_double_wide_mlp",
+)
+
+
+@nn.hf_config(
+    architecture="Gemma4ForConditionalGeneration",
+    model_type="gemma4",
+    **_GEMMA4_TEXT_CONFIG_MAPPING,
+)
+class Gemma4ConditionalModel(nn.Model):
+    """Gemma4 text backbone for ``Gemma4ForConditionalGeneration`` (multimodal)."""
+
+    _name_remap_ = GEMMA4_MODEL_NAME_REMAP
+    _hf_block_mappings_ = _build_gemma4_block_mappings(
+        "model.language_model.layers.{layer}",
+        "model.language_model",
+    )
+    _hf_k_eq_v_overrides_ = _build_gemma4_k_eq_v_overrides("model.language_model.layers.{layer}")
 
     def __init__(
         self,
@@ -564,109 +704,14 @@ class Gemma4CausalModel(nn.Model):
 
 
 @nn.hf_config(
-    architecture="Gemma4ForConditionalGeneration",
-    model_type="gemma4",
-    d_model="text_config.hidden_size",
-    n_layers="text_config.num_hidden_layers",
-    num_query_heads="text_config.num_attention_heads",
-    num_kv_heads="text_config.num_key_value_heads",
-    d_ff="text_config.intermediate_size",
-    vocab_size="text_config.vocab_size",
-    max_seq="text_config.max_position_embeddings",
-    head_size="text_config.head_dim",
-    eps="text_config.rms_norm_eps",
-    sliding_window="text_config.sliding_window",
-    layer_types="text_config.layer_types",
-    sliding_rope_theta="text_config.rope_parameters.sliding_attention.rope_theta",
-    sliding_rope_type="text_config.rope_parameters.sliding_attention.rope_type",
-    global_head_dim="text_config.global_head_dim",
-    global_num_kv_heads="text_config.num_global_key_value_heads",
-    full_rope_theta="text_config.rope_parameters.full_attention.rope_theta",
-    full_rope_type="text_config.rope_parameters.full_attention.rope_type",
-    full_partial_rotary_factor="text_config.rope_parameters.full_attention.partial_rotary_factor",
-    d_per_layer_input="text_config.hidden_size_per_layer_input",
-    vocab_size_per_layer_input="text_config.vocab_size_per_layer_input",
-    k_eq_v="text_config.attention_k_eq_v",
-    final_logit_softcapping="text_config.final_logit_softcapping",
-    enable_moe_block="text_config.enable_moe_block",
-    num_experts="text_config.num_experts",
-    top_k_experts="text_config.top_k_experts",
-    moe_intermediate_size="text_config.moe_intermediate_size",
-    num_kv_shared_layers="text_config.num_kv_shared_layers",
-    use_double_wide_mlp="text_config.use_double_wide_mlp",
+    architecture="Gemma4UnifiedForConditionalGeneration",
+    model_type="gemma4_unified",
+    **_GEMMA4_TEXT_CONFIG_MAPPING,
 )
-class Gemma4ConditionalModel(nn.Model):
-    """Gemma4 text backbone for ``Gemma4ForConditionalGeneration`` (multimodal)."""
+class Gemma4UnifiedModel(Gemma4ConditionalModel):
+    """Gemma4 text backbone for ``Gemma4UnifiedForConditionalGeneration`` (omni).
 
-    _name_remap_ = GEMMA4_MODEL_NAME_REMAP
-    _hf_block_mappings_ = _build_gemma4_block_mappings(
-        "model.language_model.layers.{layer}",
-        "model.language_model",
-    )
-
-    def __init__(
-        self,
-        vocab_size: int = 262144,
-        d_model: int = 2304,
-        n_layers: int = 30,
-        num_query_heads: int = 8,
-        num_kv_heads: int = 4,
-        d_ff: int = 9216,
-        max_seq: int = 131072,
-        head_size: int = 256,
-        eps: float = 1e-6,
-        sliding_window: int = 512,
-        layer_types: list[str] | None = None,
-        sliding_rope_theta: float = 10000.0,
-        sliding_rope_type: str = "default",
-        global_head_dim: int = 512,
-        global_num_kv_heads: int | None = None,
-        full_rope_theta: float = 1000000.0,
-        full_rope_type: str = "proportional",
-        full_partial_rotary_factor: float = 0.25,
-        d_per_layer_input: int = 256,
-        vocab_size_per_layer_input: int = 262144,
-        k_eq_v: bool = False,
-        final_logit_softcapping: float | None = None,
-        enable_moe_block: bool = False,
-        num_experts: int = 0,
-        top_k_experts: int = 0,
-        moe_intermediate_size: int = 0,
-        num_kv_shared_layers: int = 0,
-        use_double_wide_mlp: bool = False,
-    ):
-        super().__init__()
-        _build_gemma4_model(
-            self,
-            vocab_size,
-            d_model,
-            n_layers,
-            num_query_heads,
-            num_kv_heads,
-            d_ff,
-            max_seq,
-            head_size,
-            eps,
-            sliding_window,
-            layer_types,
-            sliding_rope_theta,
-            sliding_rope_type,
-            global_head_dim,
-            global_num_kv_heads,
-            full_rope_theta,
-            full_rope_type,
-            full_partial_rotary_factor,
-            d_per_layer_input,
-            vocab_size_per_layer_input,
-            k_eq_v,
-            final_logit_softcapping,
-            enable_moe_block=enable_moe_block,
-            num_experts=num_experts or 0,
-            top_k_experts=top_k_experts or 0,
-            moe_intermediate_size=moe_intermediate_size or 0,
-            num_kv_shared_layers=num_kv_shared_layers,
-            use_double_wide_mlp=use_double_wide_mlp,
-        )
-
-    def forward(self, token_ids, position_ids, targets):
-        return _gemma4_forward(self, token_ids, position_ids, targets)
+    Unified checkpoints share the conditional layout: nested ``text_config``
+    and weights under ``model.language_model.*``, plus audio/vision towers
+    that the text trainer ignores.
+    """
