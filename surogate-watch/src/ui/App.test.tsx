@@ -22,10 +22,10 @@ test("App renders Monitor without crashing", async () => {
   await new Promise((r) => setTimeout(r, 300));
   const frame = lastFrame() ?? "";
   assert.match(frame, /surogate/);
-  assert.match(frame, /Monitor/);
+  assert.match(frame, /Monitor/); // sidebar nav
   assert.match(frame, /Qwen\/Qwen3-0\.6B/);
-  assert.match(frame, /vitals/);
-  assert.match(frame, /devices/);
+  assert.match(frame, /INSIGHTS/); // right rail
+  assert.match(frame, /devices/); // main page panel
   unmount();
   fs.rmSync(p, { force: true });
 });

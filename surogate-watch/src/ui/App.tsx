@@ -4,10 +4,13 @@ import type { Feed } from "../feed.ts";
 import { WatchState } from "../state.ts";
 import { ChartRenderer } from "../render.ts";
 import { C } from "./theme.ts";
-import { Monitor } from "./Monitor.tsx";
+import { NAV, Sidebar, type NavItem } from "./Sidebar.tsx";
+import { InsightsRail } from "./InsightsRail.tsx";
+import { Page } from "./Pages.tsx";
 import { Launch } from "./Launch.tsx";
 
-type Tab = "monitor" | "launch";
+const SIDEBAR_W = 14;
+const RAIL_W = 26;
 
 export interface AppProps {
   feed: Feed;
@@ -22,17 +25,18 @@ export function App({ feed, feedPath, surogateBin, repoRoot }: AppProps) {
   const stateRef = useRef(new WatchState());
   const chartRef = useRef(new ChartRenderer());
   const [, force] = useState(0);
-  const [tab, setTab] = useState<Tab>("monitor");
+  const [navIdx, setNavIdx] = useState(0);
   const [paused, setPaused] = useState(false);
   const pausedRef = useRef(paused);
   pausedRef.current = paused;
 
   const cols = stdout?.columns ?? 120;
   const rows = stdout?.rows ?? 40;
-  const chartCols = Math.max(20, cols - 6);
-  const chartHeight = Math.max(6, rows - 26);
+  const mainW = Math.max(30, cols - SIDEBAR_W - RAIL_W - 2);
+  const chartCols = Math.max(20, mainW - 4);
+  const chartHeight = Math.max(6, rows - 18);
+  const nav: NavItem = NAV[navIdx]!;
 
-  // feed -> state
   useEffect(() => {
     feed.start((records) => {
       if (!pausedRef.current) {
@@ -43,88 +47,85 @@ export function App({ feed, feedPath, surogateBin, repoRoot }: AppProps) {
     return () => void feed.stop();
   }, [feed]);
 
-  // chart + clock refresh
   useEffect(() => {
     const t = setInterval(async () => {
-      const changed = await chartRef.current.maybeRender(stateRef.current, chartCols, chartHeight, Date.now());
+      await chartRef.current.maybeRender(stateRef.current, chartCols, chartHeight, Date.now());
       force((n) => n + 1);
-      void changed;
     }, 500);
     return () => clearInterval(t);
   }, [chartCols, chartHeight]);
 
+  const onLaunch = nav === "Launch";
   useInput((input, key) => {
-    if (input === "q" || key.escape) exit();
-    else if (input === "m") setTab("monitor");
-    else if (input === "l") setTab("launch");
+    if (input === "q") exit();
     else if (input === "p") setPaused((p) => !p);
+    else if (!onLaunch && (key.upArrow || input === "k")) setNavIdx((i) => (i - 1 + NAV.length) % NAV.length);
+    else if (!onLaunch && (key.downArrow || input === "j")) setNavIdx((i) => (i + 1) % NAV.length);
+    else if (input >= "1" && input <= String(NAV.length)) setNavIdx(Number(input) - 1);
   });
 
   const s = stateRef.current;
-  const model = s.model ?? (typeof s.configFields["output_dir"] === "string"
-    ? (s.configFields["output_dir"] as string).split("/").pop()!
-    : "run");
+  const model =
+    s.model ??
+    (typeof s.configFields["output_dir"] === "string" ? (s.configFields["output_dir"] as string).split("/").pop()! : "run");
   const recipe = s.recipe ?? "?";
 
   return (
     <Box flexDirection="column" width={cols} height={rows}>
-      {/* header */}
+      {/* top bar */}
       <Box justifyContent="space-between" paddingX={1}>
         <Text>
           <Text bold color={C.accent}>
             ◆ surogate
           </Text>
-          <Text color={C.muted}> watch — </Text>
+          <Text color={C.muted}> · </Text>
           <Text color={C.text}>
             {model} · {recipe}
           </Text>
-          {paused && <Text color={C.warm}> (paused)</Text>}
+          {s.lora && <Text color={C.accent}> · LoRA</Text>}
         </Text>
-        <Text color={C.muted}>{feedPath}</Text>
+        <Text>
+          {paused ? <Text color={C.warm}>‖ paused</Text> : <Text color={C.green}>● live</Text>}
+          <Text color={C.dim}>{"  "}{feedPath}</Text>
+        </Text>
       </Box>
-      {/* tab bar */}
-      <Box paddingX={1}>
-        <Tab label="Monitor" active={tab === "monitor"} />
-        <Text> </Text>
-        <Tab label="Launch" active={tab === "launch"} />
+
+      {/* middle: sidebar · page · rail */}
+      <Box flexGrow={1}>
+        <Sidebar active={nav} s={s} width={SIDEBAR_W} />
+        <Box flexGrow={1} flexDirection="column" paddingX={1}>
+          {nav === "Launch" ? (
+            <Launch feedPath={feedPath} surogateBin={surogateBin} repoRoot={repoRoot} onLaunched={() => setNavIdx(0)} />
+          ) : (
+            <Page nav={nav} s={s} chartImage={chartRef.current.current()} chartHeight={chartHeight} />
+          )}
+        </Box>
+        <InsightsRail s={s} width={RAIL_W} />
       </Box>
-      {/* body */}
-      {tab === "monitor" ? (
-        <Monitor s={s} chartImage={chartRef.current.current()} chartHeight={chartHeight} />
-      ) : (
-        <Launch feedPath={feedPath} surogateBin={surogateBin} repoRoot={repoRoot} onLaunched={() => setTab("monitor")} />
-      )}
-      {/* footer */}
-      <Box paddingX={1}>
+
+      {/* bottom bar */}
+      <Box justifyContent="space-between" paddingX={1}>
         <Text color={C.muted}>
-          <Text color={C.accent} bold>
-            q
-          </Text>{" "}
-          quit{"   "}
-          <Text color={C.accent} bold>
-            m
-          </Text>{" "}
-          monitor{"   "}
-          <Text color={C.accent} bold>
-            l
-          </Text>{" "}
-          launch{"   "}
-          <Text color={C.accent} bold>
-            p
-          </Text>{" "}
-          pause
+          <Hint k="q" label="quit" />
+          <Hint k="↑↓" label="nav" />
+          <Hint k="enter" label="select" />
+          <Hint k="p" label="pause" />
+        </Text>
+        <Text color={C.dim}>
+          {s.hasGpus ? `${s.gpusSorted().length} GPU` : "no GPU"} · {nav.toLowerCase()}
         </Text>
       </Box>
     </Box>
   );
 }
 
-function Tab({ label, active }: { label: string; active: boolean }) {
-  return active ? (
-    <Text backgroundColor={C.accent} color="#0e1018" bold>
-      {` ${label} `}
+function Hint({ k, label }: { k: string; label: string }) {
+  return (
+    <Text>
+      <Text color={C.accent} bold>
+        {k}
+      </Text>
+      <Text color={C.muted}> {label}{"   "}</Text>
     </Text>
-  ) : (
-    <Text color={C.muted}>{` ${label} `}</Text>
   );
 }
