@@ -203,7 +203,17 @@ export function spawnGrpo(
     { env, stdio: ["ignore", log, log], detached: true },
   );
   child.unref();
+  if (child.pid) writePidFile(metricsPath, child.pid);
   return child.pid ?? -1;
+}
+
+/** Record a launched run's PID next to its feed so the dashboard can control it. */
+export function writePidFile(metricsPath: string, pid: number): void {
+  try {
+    fs.writeFileSync(`${metricsPath}.pid`, String(pid));
+  } catch {
+    /* ignore */
+  }
 }
 
 function RUNS_OVERLAY_DIR(): string {
@@ -269,6 +279,7 @@ export function spawnTraining(
     detached: true,
   });
   child.unref();
+  if (child.pid) writePidFile(metricsPath, child.pid);
   return child.pid ?? -1;
 }
 

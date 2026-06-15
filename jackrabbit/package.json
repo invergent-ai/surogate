@@ -25,6 +25,7 @@
     "echarts": "^6.1.0",
     "ink": "^7.0.6",
     "react": "^19.2.0",
+    "sixel": "^0.16.0",
     "terminal-image": "^4.3.0"
   },
   "devDependencies": {

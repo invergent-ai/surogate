@@ -12,11 +12,14 @@ const GRID = "#241f12";
 const AXIS = "#3a3320";
 const MUTED = "#8a8270";
 
+const COMPARE = "#9fd0ff"; // cool blue overlay for the compared run
+
 export interface LossChartData {
   title?: string;
   steps: number[]; // x for each train point
   train: number[]; // train loss per step
   evals: Array<[number, number]>; // [step, eval loss]
+  compare?: { label: string; steps: number[]; train: number[] }; // overlay run
 }
 
 /** Render the loss chart to an SVG string at logical width/height (cells*cellpx). */
@@ -33,7 +36,7 @@ export function lossChartSvg(data: LossChartData, width: number, height: number)
     animation: false,
     grid: { left: font * 4, right: font * 1.5, top: font * 2, bottom: font * 2 },
     title: {
-      text: data.title ?? "training loss",
+      text: data.compare ? `training loss   (vs ${data.compare.label})` : (data.title ?? "training loss"),
       left: font,
       top: Math.round(font / 2),
       textStyle: { color: MUTED, fontSize: font, fontWeight: 600 },
@@ -76,6 +79,18 @@ export function lossChartSvg(data: LossChartData, width: number, height: number)
           },
         },
       },
+      ...(data.compare
+        ? [
+            {
+              name: "compare",
+              type: "line",
+              showSymbol: false,
+              smooth: true,
+              data: data.compare.steps.map((s, i) => [s, data.compare!.train[i]]),
+              lineStyle: { color: COMPARE, width: Math.max(1, lineW - 1), type: "dashed" },
+            },
+          ]
+        : []),
       {
         name: "eval",
         type: "scatter",
@@ -96,4 +111,16 @@ export function lossChartPng(data: LossChartData, logicalW: number, logicalH: nu
   const svg = lossChartSvg(data, logicalW, logicalH);
   const png = new Resvg(svg, { fitTo: { mode: "width", value: pixelW }, background: BG }).render().asPng();
   return Buffer.from(png);
+}
+
+/** Render the loss chart to raw RGBA pixels (for the Sixel path). */
+export function lossChartRgba(
+  data: LossChartData,
+  logicalW: number,
+  logicalH: number,
+  pixelW = 1200,
+): { data: Uint8Array; width: number; height: number } {
+  const svg = lossChartSvg(data, logicalW, logicalH);
+  const r = new Resvg(svg, { fitTo: { mode: "width", value: pixelW }, background: BG }).render();
+  return { data: r.pixels, width: r.width, height: r.height };
 }
