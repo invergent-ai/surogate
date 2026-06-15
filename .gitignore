@@ -28,3 +28,11 @@ reverse*/
 surogate.db
 .claude/**
 debug/**
+
+# Node / surogate-watch (Ink) package
+node_modules/
+surogate-watch/node_modules/
+surogate-watch/dist/
+.superpowers/
+watch-out/
+watch-run.yaml*
