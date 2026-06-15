@@ -6,6 +6,7 @@ import { render } from "ink";
 import supportsTerminalGraphics from "supports-terminal-graphics";
 import { resolveFeedPath } from "./launch.ts";
 import { setSixelPreferred } from "./term-image.ts";
+import { enableSynchronizedOutput } from "./sync-output.ts";
 import { App } from "./ui/App.tsx";
 
 interface Args {
@@ -14,10 +15,11 @@ interface Args {
   surogateBin: string;
   repoRoot: string;
   sixel: "auto" | "on" | "off";
+  sync: boolean;
 }
 
 function parseArgs(argv: string[]): Args {
-  const out: Args = { fromStart: false, surogateBin: "surogate", repoRoot: process.cwd(), sixel: "auto" };
+  const out: Args = { fromStart: false, surogateBin: "surogate", repoRoot: process.cwd(), sixel: "auto", sync: true };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
     if (a === "--from-start") out.fromStart = true;
@@ -25,6 +27,7 @@ function parseArgs(argv: string[]): Args {
     else if (a === "--repo-root") out.repoRoot = path.resolve(argv[++i] ?? ".");
     else if (a === "--sixel") out.sixel = "on";
     else if (a === "--no-sixel") out.sixel = "off";
+    else if (a === "--no-sync") out.sync = false;
     else if (a === "-h" || a === "--help") {
       printHelp();
       process.exit(0);
@@ -77,6 +80,7 @@ async function main() {
     process.exit(0);
   }
 
+  const restoreSync = args.sync ? enableSynchronizedOutput() : () => {};
   const { waitUntilExit } = render(
     <App
       initialFeedPath={feedPath}
@@ -87,7 +91,11 @@ async function main() {
     />,
     { exitOnCtrlC: true },
   );
-  await waitUntilExit();
+  try {
+    await waitUntilExit();
+  } finally {
+    restoreSync();
+  }
 }
 
 main().catch((err) => {

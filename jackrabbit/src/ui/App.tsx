@@ -5,7 +5,7 @@ import { WatchState } from "../state.ts";
 import { ChartRenderer, type CompareRun } from "../render.ts";
 import { listRuns, type RunInfo } from "../runs.ts";
 import { AlertEngine, desktopNotify } from "../alerts.ts";
-import { runControllable, stopRun } from "../controls.ts";
+import { pauseRun, resumeRun, runControllable, stopRun } from "../controls.ts";
 import { C } from "./theme.ts";
 import { NAV, Sidebar, type NavItem } from "./Sidebar.tsx";
 import { InsightsRail } from "./InsightsRail.tsx";
@@ -37,6 +37,7 @@ export function App({ initialFeedPath, fromStart, surogateBin, repoRoot, version
   const feedRef = useRef<Feed | null>(null);
   const alertRef = useRef(new AlertEngine());
   const compareRef = useRef<CompareRun | null>(null);
+  const suspendedRef = useRef(new Set<string>());
   const bannerTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [, force] = useState(0);
   const rerender = () => force((n) => n + 1);
@@ -147,6 +148,23 @@ export function App({ initialFeedPath, fromStart, surogateBin, repoRoot, version
       return;
     }
 
+    // pause / resume the current launched run (SIGSTOP / SIGCONT)
+    if (input === "z" && !(nav === "Launch" && focus === "content")) {
+      if (!runControllable(feedDesc.path)) {
+        flashBanner("no controllable run on this feed", C.muted, 3000);
+        return;
+      }
+      const set = suspendedRef.current;
+      if (set.has(feedDesc.path)) {
+        if (resumeRun(feedDesc.path)) set.delete(feedDesc.path);
+        flashBanner("▶ resumed", C.green, 3000);
+      } else {
+        if (pauseRun(feedDesc.path)) set.add(feedDesc.path);
+        flashBanner("⏸ run paused (SIGSTOP) — z to resume", C.warm, 5000);
+      }
+      return;
+    }
+
     // stop the current launched run (two-press confirm) — except inside the Launch form
     if (input === "x" && !(nav === "Launch" && focus === "content")) {
       if (!runControllable(feedDesc.path)) {
@@ -221,6 +239,7 @@ export function App({ initialFeedPath, fromStart, surogateBin, repoRoot, version
           {s.lora && <Text color={C.accent}> · LoRA</Text>}
         </Text>
         <Text>
+          {suspendedRef.current.has(feedDesc.path) && <Text color={C.warm}>⏸ suspended  </Text>}
           {compareFeed && <Text color={C.eval}>◆ compare  </Text>}
           {paused ? <Text color={C.warm}>‖ paused</Text> : <Text color={C.green}>● live</Text>}
           <Text color={C.dim}>{"  "}{feedDesc.path}</Text>
@@ -280,8 +299,13 @@ export function App({ initialFeedPath, fromStart, surogateBin, repoRoot, version
               <Hint k="q" label="quit" />
               <Hint k="↑↓" label="nav" />
               <Hint k="⏎" label={nav === "Launch" ? "configure" : "select"} />
-              <Hint k="p" label="pause" />
-              {runControllable(feedDesc.path) && <Hint k="x" label="stop" />}
+              <Hint k="p" label="pause view" />
+              {runControllable(feedDesc.path) && (
+                <>
+                  <Hint k="z" label={suspendedRef.current.has(feedDesc.path) ? "resume" : "suspend"} />
+                  <Hint k="x" label="stop" />
+                </>
+              )}
             </>
           )}
         </Text>

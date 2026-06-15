@@ -29,9 +29,9 @@ export function runControllable(feedPath: string): boolean {
   return pid !== null && pidAlive(pid);
 }
 
-/** Stop a launched run. We spawned it `detached`, so it leads its own process
- *  group — signal the whole group so children (vLLM, workers) die too. */
-export function stopRun(feedPath: string, signal: NodeJS.Signals = "SIGTERM"): boolean {
+/** Signal a launched run's whole process group (it was spawned `detached`, so
+ *  children — vLLM, workers — get the signal too). Falls back to the single pid. */
+export function signalRun(feedPath: string, signal: NodeJS.Signals): boolean {
   const pid = readRunPid(feedPath);
   if (pid === null) return false;
   try {
@@ -45,4 +45,20 @@ export function stopRun(feedPath: string, signal: NodeJS.Signals = "SIGTERM"): b
       return false;
     }
   }
+}
+
+/** Stop a run (SIGTERM the group). */
+export function stopRun(feedPath: string): boolean {
+  return signalRun(feedPath, "SIGTERM");
+}
+
+/** Pause a run (SIGSTOP). Note: freezing a multi-GPU job holds VRAM and can
+ *  upset NCCL — best-effort, intended for single-GPU / quick holds. */
+export function pauseRun(feedPath: string): boolean {
+  return signalRun(feedPath, "SIGSTOP");
+}
+
+/** Resume a paused run (SIGCONT). */
+export function resumeRun(feedPath: string): boolean {
+  return signalRun(feedPath, "SIGCONT");
 }
