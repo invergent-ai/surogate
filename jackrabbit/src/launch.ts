@@ -138,6 +138,7 @@ export interface GrpoConfigs {
   train: string;
   infer: string;
   orch: string;
+  judge?: string; // RULER only
 }
 
 /** Default GRPO example config paths shipped with surogate. */
@@ -146,8 +147,19 @@ export function exampleGrpoConfigs(repoRoot: string): GrpoConfigs {
   return { train: path.join(d, "train.yaml"), infer: path.join(d, "infer.yaml"), orch: path.join(d, "orch.yaml") };
 }
 
+/** RULER example configs (GRPO + an LLM-judge inference server). */
+export function exampleRulerConfigs(repoRoot: string): GrpoConfigs {
+  const d = path.join(repoRoot, "examples", "ruler");
+  return {
+    train: path.join(d, "train.yaml"),
+    infer: path.join(d, "infer.yaml"),
+    orch: path.join(d, "orch.yaml"),
+    judge: path.join(d, "judge.yaml"),
+  };
+}
+
 export function grpoConfigsExist(c: GrpoConfigs): boolean {
-  return fs.existsSync(c.train) && fs.existsSync(c.infer) && fs.existsSync(c.orch);
+  return fs.existsSync(c.train) && fs.existsSync(c.infer) && fs.existsSync(c.orch) && (!c.judge || fs.existsSync(c.judge));
 }
 
 export function buildGrpoCommand(
@@ -155,11 +167,13 @@ export function buildGrpoCommand(
   vllmGpus: number[],
   c: GrpoConfigs,
   surogateBin = "surogate",
+  judgeGpus: number[] = [],
 ): string {
-  return (
+  let cmd =
     `${surogateBin} grpo --train ${c.train} --infer ${c.infer} --orch ${c.orch} ` +
-    `--trainer-gpus ${trainerGpus.join(",")} --vllm-gpus ${vllmGpus.join(",")}`
-  );
+    `--trainer-gpus ${trainerGpus.join(",")} --vllm-gpus ${vllmGpus.join(",")}`;
+  if (c.judge && judgeGpus.length) cmd += ` --judge-infer ${c.judge} --judge-gpus ${judgeGpus.join(",")}`;
+  return cmd;
 }
 
 /** Spawn `surogate grpo …`. Writes a train-config overlay that points the
@@ -170,6 +184,7 @@ export function spawnGrpo(
   vllmGpus: number[],
   metricsPath: string,
   surogateBin = "surogate",
+  judgeGpus: number[] = [],
 ): number {
   // overlay: copy the train config and ensure it reports to the surogate feed
   const overlayPath = path.join(RUNS_OVERLAY_DIR(), `grpo-train-${path.basename(metricsPath)}.yaml`);
@@ -185,23 +200,21 @@ export function spawnGrpo(
 
   const env = { ...process.env, SUROGATE_METRICS_PATH: metricsPath };
   const log = fs.openSync(`${metricsPath}.log`, "w");
-  const child = spawn(
-    surogateBin,
-    [
-      "grpo",
-      "--train",
-      overlayPath,
-      "--infer",
-      c.infer,
-      "--orch",
-      c.orch,
-      "--trainer-gpus",
-      trainerGpus.join(","),
-      "--vllm-gpus",
-      vllmGpus.join(","),
-    ],
-    { env, stdio: ["ignore", log, log], detached: true },
-  );
+  const argv = [
+    "grpo",
+    "--train",
+    overlayPath,
+    "--infer",
+    c.infer,
+    "--orch",
+    c.orch,
+    "--trainer-gpus",
+    trainerGpus.join(","),
+    "--vllm-gpus",
+    vllmGpus.join(","),
+  ];
+  if (c.judge && judgeGpus.length) argv.push("--judge-infer", c.judge, "--judge-gpus", judgeGpus.join(","));
+  const child = spawn(surogateBin, argv, { env, stdio: ["ignore", log, log], detached: true });
   child.unref();
   if (child.pid) writePidFile(metricsPath, child.pid);
   return child.pid ?? -1;

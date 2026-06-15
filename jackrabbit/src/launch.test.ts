@@ -67,3 +67,23 @@ test("buildGrpoCommand has split gpus + 3 configs", () => {
   assert.match(cmd, /surogate grpo --train t\.yaml --infer i\.yaml --orch o\.yaml/);
   assert.match(cmd, /--trainer-gpus 4,5 --vllm-gpus 0,1,2,3/);
 });
+
+import { buildGrpoCommand as bgc, exampleRulerConfigs } from "./launch.ts";
+
+test("RULER command adds judge-infer + judge-gpus", () => {
+  const c = { train: "t.yaml", infer: "i.yaml", orch: "o.yaml", judge: "j.yaml" };
+  const cmd = bgc([4, 5], [0, 1], c, "surogate", [6, 7]);
+  assert.match(cmd, /--trainer-gpus 4,5 --vllm-gpus 0,1/);
+  assert.match(cmd, /--judge-infer j\.yaml --judge-gpus 6,7/);
+});
+
+test("GRPO without judge omits judge args", () => {
+  const c = { train: "t", infer: "i", orch: "o" };
+  assert.doesNotMatch(bgc([1], [2], c, "surogate", []), /--judge/);
+});
+
+test("exampleRulerConfigs points at examples/ruler with judge", () => {
+  const c = exampleRulerConfigs("/repo");
+  assert.match(c.train, /examples\/ruler\/train\.yaml$/);
+  assert.ok(c.judge && /examples\/ruler\/judge\.yaml$/.test(c.judge));
+});

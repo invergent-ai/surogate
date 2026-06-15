@@ -11,6 +11,7 @@ import {
   discoverGpus,
   estimateRunVramGB,
   exampleGrpoConfigs,
+  exampleRulerConfigs,
   fitOnGpu,
   gpuFreeGB,
   grpoConfigsExist,
@@ -23,8 +24,8 @@ import {
 import { newRunFeedPath } from "../runs.ts";
 import { C } from "./theme.ts";
 
-type Mode = "sft" | "grpo";
-type Phase = "mode" | "gpus" | "tgpus" | "vgpus" | "recipe" | "confirm" | "started";
+type Mode = "sft" | "grpo" | "ruler";
+type Phase = "mode" | "gpus" | "tgpus" | "vgpus" | "jgpus" | "recipe" | "confirm" | "started";
 
 function gpuLabel(g: Gpu, estGB: number | null): string {
   const free = gpuFreeGB(g);
@@ -56,6 +57,7 @@ export function Launch({
   const [selected, setSelected] = useState<number[]>([]);
   const [trainerGpus, setTrainerGpus] = useState<number[]>([]);
   const [vllmGpus, setVllmGpus] = useState<number[]>([]);
+  const [judgeGpus, setJudgeGpus] = useState<number[]>([]);
   const [recipe, setRecipe] = useState<Recipe>(DEFAULT_FIELDS.recipe);
   const [pid, setPid] = useState<number | null>(null);
 
@@ -71,7 +73,10 @@ export function Launch({
   };
   const estGB = estimateRunVramGB(fields);
   const grpo = exampleGrpoConfigs(repoRoot);
+  const ruler = exampleRulerConfigs(repoRoot);
   const grpoOk = grpoConfigsExist(grpo);
+  const rulerOk = grpoConfigsExist(ruler);
+  const rlConfigs = mode === "ruler" ? ruler : grpo;
 
   const doLaunchSft = () => {
     const metricsPath = newRunFeedPath(`sft-${recipe}`, Date.now());
@@ -84,8 +89,8 @@ export function Launch({
   };
 
   const doLaunchGrpo = () => {
-    const metricsPath = newRunFeedPath("grpo", Date.now());
-    const p = spawnGrpo(grpo, trainerGpus, vllmGpus, metricsPath, surogateBin);
+    const metricsPath = newRunFeedPath(mode, Date.now());
+    const p = spawnGrpo(rlConfigs, trainerGpus, vllmGpus, metricsPath, surogateBin, judgeGpus);
     setPid(p);
     setPhase("started");
     setTimeout(() => onLaunched(metricsPath), 1200);
@@ -94,7 +99,7 @@ export function Launch({
   const command =
     mode === "sft"
       ? buildCommand(selected, path.join(repoRoot, "watch-run.yaml"), surogateBin)
-      : buildGrpoCommand(trainerGpus, vllmGpus, grpo, surogateBin);
+      : buildGrpoCommand(trainerGpus, vllmGpus, rlConfigs, surogateBin, judgeGpus);
 
   return (
     <Box flexDirection="column" flexGrow={1} paddingX={1} paddingTop={1}>
@@ -131,10 +136,12 @@ export function Launch({
             options={[
               { label: "SFT — supervised fine-tuning", value: "sft" },
               { label: grpoOk ? "GRPO — RL (split GPUs)" : "GRPO — needs examples/grpo/*.yaml", value: "grpo" },
+              { label: rulerOk ? "RULER — RL + LLM judge (3-way GPU split)" : "RULER — needs examples/ruler/*.yaml", value: "ruler" },
             ]}
             onChange={(v) => {
               const m = v as Mode;
               if (m === "grpo" && !grpoOk) return;
+              if (m === "ruler" && !rulerOk) return;
               setMode(m);
               setPhase(m === "sft" ? "gpus" : "tgpus");
             }}
@@ -165,8 +172,9 @@ export function Launch({
         </Box>
       )}
 
-      {/* GRPO: trainer + vllm gpus */}
-      {mode === "grpo" && (phase === "tgpus" || phase === "vgpus" || phase === "confirm" || phase === "started") && (
+      {/* GRPO / RULER: trainer + vllm (+ judge) gpus */}
+      {(mode === "grpo" || mode === "ruler") &&
+        (phase === "tgpus" || phase === "vgpus" || phase === "jgpus" || phase === "confirm" || phase === "started") && (
         <Box marginTop={1} flexDirection="column">
           <Text color={phase === "tgpus" ? C.accent : C.muted} bold>
             2 · Trainer GPUs
@@ -196,11 +204,32 @@ export function Launch({
                     .map((g) => ({ label: gpuLabel(g, null), value: String(g.id) }))}
                   onSubmit={(values) => {
                     setVllmGpus(values.map(Number));
-                    setPhase("confirm");
+                    setPhase(mode === "ruler" ? "jgpus" : "confirm");
                   }}
                 />
               ) : (
                 <Text color={C.text}>{vllmGpus.map((g) => `gpu${g}`).join(", ") || "—"}</Text>
+              )}
+            </Box>
+          )}
+          {mode === "ruler" && (phase === "jgpus" || phase === "confirm" || phase === "started") && (
+            <Box flexDirection="column" marginTop={1}>
+              <Text color={phase === "jgpus" ? C.accent : C.muted} bold>
+                4 · Judge GPUs — LLM-as-judge vLLM (disjoint)
+              </Text>
+              {phase === "jgpus" ? (
+                <MultiSelect
+                  isDisabled={!active}
+                  options={gpus
+                    .filter((g) => !trainerGpus.includes(g.id) && !vllmGpus.includes(g.id))
+                    .map((g) => ({ label: gpuLabel(g, null), value: String(g.id) }))}
+                  onSubmit={(values) => {
+                    setJudgeGpus(values.map(Number));
+                    setPhase("confirm");
+                  }}
+                />
+              ) : (
+                <Text color={C.text}>{judgeGpus.map((g) => `gpu${g}`).join(", ") || "—"}</Text>
               )}
             </Box>
           )}
