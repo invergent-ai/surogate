@@ -131,11 +131,18 @@ def render(version: str = "") -> str:
 
 
 def print_banner(version: str = "") -> None:
-    """Print the startup banner to stdout (local master rank only)."""
-    if int(os.environ.get("LOCAL_RANK", -1)) not in (-1, 0):
-        return
-    sys.stdout.write(render(version))
-    sys.stdout.flush()
+    """Print the startup banner to stdout (local master rank only).
+
+    Best-effort and decorative: any failure (e.g. a malformed ``LOCAL_RANK`` or
+    a missing ``sys.stdout``) is swallowed so it can never break CLI startup.
+    """
+    try:
+        if int(os.environ.get("LOCAL_RANK", -1) or -1) not in (-1, 0):
+            return
+        sys.stdout.write(render(version))
+        sys.stdout.flush()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
