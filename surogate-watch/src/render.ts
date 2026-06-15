@@ -13,9 +13,12 @@ export function chartDataFromState(s: WatchState): LossChartData {
 /** Render the loss chart to a terminal string sized to `cols` x `rows` cells. */
 export async function renderChartString(s: WatchState, cols: number, rows: number): Promise<string> {
   if (s.lossHistory.length === 0 || cols < 4 || rows < 2) return "";
-  const pngW = Math.max(600, cols * 12);
-  const pngH = Math.max(220, rows * 24);
-  const png = lossChartPng(chartDataFromState(s), pngW, pngH, pngW);
+  // Render at the panel's pixel aspect (cell ≈ 9x19 px), then 2x supersample
+  // for a crisp inline image (the previous low resolution looked pixelated).
+  const logicalW = Math.min(2400, cols * 9);
+  const logicalH = Math.min(1200, rows * 19);
+  const pixelW = Math.min(3200, logicalW * 2);
+  const png = lossChartPng(chartDataFromState(s), logicalW, logicalH, pixelW);
   return terminalImage.buffer(png, { width: cols, height: rows, preserveAspectRatio: true });
 }
 

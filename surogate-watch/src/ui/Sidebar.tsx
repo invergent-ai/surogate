@@ -6,15 +6,26 @@ import { C } from "./theme.ts";
 export const NAV = ["Monitor", "GPUs", "Data", "Launch", "Logs"] as const;
 export type NavItem = (typeof NAV)[number];
 
-export function Sidebar({ active, s, width }: { active: NavItem; s: WatchState; width: number }) {
+export function Sidebar({
+  active,
+  s,
+  width,
+  focusedNav = true,
+}: {
+  active: NavItem;
+  s: WatchState;
+  width: number;
+  focusedNav?: boolean;
+}) {
   return (
     <Box flexDirection="column" width={width} borderStyle="single" borderColor={C.border} borderTop={false} borderBottom={false} borderLeft={false} paddingX={1}>
       <Text color={C.dim}>NAV</Text>
       {NAV.map((item) => {
         const on = item === active;
+        const cursor = on ? (focusedNav ? "▸ " : "· ") : "  ";
         return (
           <Text key={item} color={on ? C.accent : C.text} bold={on}>
-            {on ? "▸ " : "  "}
+            {cursor}
             {item}
           </Text>
         );

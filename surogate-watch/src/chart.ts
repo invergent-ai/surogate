@@ -5,12 +5,12 @@
 import * as echarts from "echarts";
 import { Resvg } from "@resvg/resvg-js";
 
-const BG = "#0e1018";
-const TRAIN = "#5ad1c4";
-const EVAL = "#d18fff";
-const GRID = "#1b1e28";
-const AXIS = "#2a2e3a";
-const MUTED = "#6b7280";
+const BG = "#14120c"; // warm dark (brand)
+const TRAIN = "#ffd15c"; // brand gold
+const EVAL = "#9fd0ff"; // cool blue
+const GRID = "#241f12";
+const AXIS = "#3a3320";
+const MUTED = "#8a8270";
 
 export interface LossChartData {
   title?: string;
@@ -24,22 +24,26 @@ export function lossChartSvg(data: LossChartData, width: number, height: number)
   const chart = echarts.init(null, null, { renderer: "svg", ssr: true, width, height });
   const minStep = data.steps.length ? data.steps[0]! : 0;
   const maxStep = data.steps.length ? data.steps[data.steps.length - 1]! : 1;
+  // scale styling with the render height so high-DPI renders stay proportional
+  const font = Math.max(11, Math.round(height / 22));
+  const lineW = Math.max(2, Math.round(height / 95));
+  const symbol = Math.max(8, Math.round(height / 24));
   chart.setOption({
     backgroundColor: BG,
     animation: false,
-    grid: { left: 56, right: 22, top: 26, bottom: 28 },
+    grid: { left: font * 4, right: font * 1.5, top: font * 2, bottom: font * 2 },
     title: {
       text: data.title ?? "training loss",
-      left: 12,
-      top: 6,
-      textStyle: { color: MUTED, fontSize: 13, fontWeight: 600 },
+      left: font,
+      top: Math.round(font / 2),
+      textStyle: { color: MUTED, fontSize: font, fontWeight: 600 },
     },
     xAxis: {
       type: "value",
       min: minStep,
       max: maxStep,
-      axisLine: { lineStyle: { color: AXIS } },
-      axisLabel: { color: MUTED },
+      axisLine: { lineStyle: { color: AXIS, width: Math.max(1, Math.round(lineW / 2)) } },
+      axisLabel: { color: MUTED, fontSize: font },
       splitLine: { show: false },
     },
     yAxis: {
@@ -47,8 +51,8 @@ export function lossChartSvg(data: LossChartData, width: number, height: number)
       scale: true,
       axisLine: { show: false },
       axisTick: { show: false },
-      axisLabel: { color: MUTED },
-      splitLine: { lineStyle: { color: GRID } },
+      axisLabel: { color: MUTED, fontSize: font },
+      splitLine: { lineStyle: { color: GRID, width: Math.max(1, Math.round(lineW / 2)) } },
     },
     series: [
       {
@@ -57,7 +61,7 @@ export function lossChartSvg(data: LossChartData, width: number, height: number)
         showSymbol: false,
         smooth: true,
         data: data.steps.map((s, i) => [s, data.train[i]]),
-        lineStyle: { color: TRAIN, width: 2.5 },
+        lineStyle: { color: TRAIN, width: lineW },
         areaStyle: {
           color: {
             type: "linear",
@@ -66,8 +70,8 @@ export function lossChartSvg(data: LossChartData, width: number, height: number)
             x2: 0,
             y2: 1,
             colorStops: [
-              { offset: 0, color: "rgba(90,209,196,0.35)" },
-              { offset: 1, color: "rgba(90,209,196,0.02)" },
+              { offset: 0, color: "rgba(255,209,92,0.34)" },
+              { offset: 1, color: "rgba(255,209,92,0.02)" },
             ],
           },
         },
@@ -77,8 +81,8 @@ export function lossChartSvg(data: LossChartData, width: number, height: number)
         type: "scatter",
         data: data.evals,
         symbol: "diamond",
-        symbolSize: 11,
-        itemStyle: { color: EVAL, borderColor: BG, borderWidth: 1.5 },
+        symbolSize: symbol,
+        itemStyle: { color: EVAL, borderColor: BG, borderWidth: Math.max(1, Math.round(symbol / 7)) },
       },
     ],
   });

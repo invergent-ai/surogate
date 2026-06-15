@@ -18,7 +18,19 @@ test("App renders Monitor without crashing", async () => {
       '{"type":"gpu","gpu_id":0,"step":2,"ts":2,"temperature":55,"gpu_util":97,"mem_util":31,"power":325000}\n',
   );
   const feed = new Feed(p, true);
-  const { lastFrame, unmount } = render(React.createElement(App, { feed, feedPath: p, surogateBin: "surogate", repoRoot: process.cwd() }));
+  const { lastFrame, stdin, unmount } = render(
+    React.createElement(App, { feed, feedPath: p, surogateBin: "surogate", repoRoot: process.cwd(), version: "0.1.0" }),
+  );
+  await new Promise((r) => setTimeout(r, 200));
+
+  // splash first: mascot menu with tips + devices
+  const splash = lastFrame() ?? "";
+  assert.match(splash, /DEVICES/);
+  assert.match(splash, /TIPS/);
+  assert.match(splash, /enter to open the dashboard/);
+
+  // enter -> dashboard
+  stdin.write("\r");
   await new Promise((r) => setTimeout(r, 300));
   const frame = lastFrame() ?? "";
   assert.match(frame, /surogate/);

@@ -1,15 +1,17 @@
-// Shared color palette (matches the chart).
+// Shared color palette — Surogate brand gold.
 export const C = {
-  accent: "#5ad1c4",
-  eval: "#d18fff",
-  train: "#5ad1c4",
-  muted: "#6b7280",
-  dim: "#4b5163",
-  text: "#c7ccd6",
+  accent: "#ffd15c", // brand gold
+  gold: "#ffd15c",
+  goldDeep: "#e4961c",
+  eval: "#9fd0ff", // cool blue, contrasts with gold
+  train: "#ffd15c",
+  muted: "#8a8f9a",
+  dim: "#54585f",
+  text: "#d7d3c8",
   warm: "#ffb454",
-  red: "#ff5c5c",
-  green: "#5ad17a",
-  border: "#3a3f4b",
+  red: "#ff6b5c",
+  green: "#8fd17a",
+  border: "#4a4434",
 } as const;
 
 export function tempColor(t: number | null): string {

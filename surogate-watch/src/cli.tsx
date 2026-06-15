@@ -61,7 +61,7 @@ async function main() {
 
   const feed = new Feed(feedPath, args.fromStart);
   const { waitUntilExit } = render(
-    <App feed={feed} feedPath={feedPath} surogateBin={args.surogateBin} repoRoot={args.repoRoot} />,
+    <App feed={feed} feedPath={feedPath} surogateBin={args.surogateBin} repoRoot={args.repoRoot} version="0.1.0" />,
     { exitOnCtrlC: true },
   );
   await waitUntilExit();

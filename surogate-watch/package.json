@@ -16,7 +16,7 @@
     "build": "tsup src/cli.tsx --format esm --target node20 --clean",
     "dev": "tsx src/cli.tsx",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test \"src/**/*.test.ts\" \"src/**/*.test.tsx\""
+    "test": "tsx --test --test-force-exit \"src/**/*.test.ts\" \"src/**/*.test.tsx\""
   },
   "dependencies": {
     "@inkjs/ui": "^2.0.0",

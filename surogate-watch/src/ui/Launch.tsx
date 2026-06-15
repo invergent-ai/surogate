@@ -20,11 +20,13 @@ export function Launch({
   feedPath,
   surogateBin,
   repoRoot,
+  active,
   onLaunched,
 }: {
   feedPath: string;
   surogateBin: string;
   repoRoot: string;
+  active: boolean;
   onLaunched: () => void;
 }) {
   const gpus = useMemo(() => discoverGpus(), []);
@@ -51,6 +53,12 @@ export function Launch({
         Launch a training run
       </Text>
       <Text color={C.muted}>model {fields.model} · {fields.maxSteps} steps · bsz {fields.perDeviceBatch} · seq {fields.sequenceLen}</Text>
+      {!active && (
+        <Box marginTop={1}>
+          <Text color={C.gold}>press ⏎ to configure</Text>
+          <Text color={C.dim}> · esc to go back to nav</Text>
+        </Box>
+      )}
 
       <Box marginTop={1} flexDirection="column">
         <Text color={phase === "gpus" ? C.accent : C.muted} bold>
@@ -58,6 +66,7 @@ export function Launch({
         </Text>
         {phase === "gpus" ? (
           <MultiSelect
+            isDisabled={!active}
             options={gpus.map((g) => ({
               label: `${g.name}  ·  id ${g.id}${g.memMB ? `  ·  ${(g.memMB / 1024).toFixed(0)} GB` : ""}`,
               value: String(g.id),
@@ -79,6 +88,7 @@ export function Launch({
           </Text>
           {phase === "recipe" ? (
             <Select
+              isDisabled={!active}
               options={RECIPES.map((r) => ({ label: r, value: r }))}
               onChange={(v) => {
                 setRecipe(v as Recipe);
@@ -99,7 +109,7 @@ export function Launch({
           <Text color={C.green}>$ {command}</Text>
           <Box>
             <Text color={C.text}>Start this training run? </Text>
-            <ConfirmInput onConfirm={doLaunch} onCancel={() => setPhase("gpus")} />
+            <ConfirmInput isDisabled={!active} onConfirm={doLaunch} onCancel={() => setPhase("gpus")} />
           </Box>
         </Box>
       )}
