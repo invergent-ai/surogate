@@ -26,6 +26,7 @@ def _apply_grpo_split_gpu_mask() -> None:
 
 _apply_grpo_split_gpu_mask()
 
+from surogate.utils.banner import print_banner
 from surogate.utils.logger import get_logger
 from surogate.utils.system_info import get_system_info, print_system_diagnostics
 
@@ -62,7 +63,7 @@ def _get_version() -> str:
 
 
 def parse_args():
-    logger.banner(f"Surogate LLMOps CLI v{_get_version()}")
+    print_banner(_get_version())
 
     parser = argparse.ArgumentParser(description="Surogate LLMOps Framework")
     parser.set_defaults(func=lambda _args, p=parser: p.print_help())
