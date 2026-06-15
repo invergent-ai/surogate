@@ -52,7 +52,7 @@ async function main() {
 
   if (!process.stdout.isTTY) {
     process.stderr.write(
-      `surogate-watch needs an interactive terminal.\nMetrics feed: ${feedPath}\n` +
+      `jackrabbit needs an interactive terminal.\nMetrics feed: ${feedPath}\n` +
         "Tail it directly, or use wandb/aim (report_to in your training config).\n",
     );
     process.exit(0);
