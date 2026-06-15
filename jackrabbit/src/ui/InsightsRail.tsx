@@ -34,7 +34,7 @@ function Section({ title, items }: { title: string; items: Insight[] }) {
 }
 
 export function InsightsRail({ s, width }: { s: WatchState; width: number }) {
-  const g = computeInsights(s);
+  const g = computeInsights(s, Date.now());
   return (
     <Box
       flexDirection="column"

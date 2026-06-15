@@ -3,6 +3,7 @@
 
 import type { WatchState } from "./state.ts";
 import { fmtCount, fmtEta, fmtFloat } from "./format.ts";
+import { TIPS, type TipTag } from "./tips.ts";
 
 export type InsightColor = "green" | "warm" | "red" | "accent" | "eval" | "muted";
 export interface Insight {
@@ -57,17 +58,51 @@ export function computeAlerts(s: WatchState): Insight[] {
   return out;
 }
 
-export function computeTips(s: WatchState): Insight[] {
-  const out: Insight[] = [];
+/** Context tags that are "active" for the current run — used to filter tips so
+ *  the feed shows things relevant to what's actually happening. */
+export function activeTags(s: WatchState): Set<TipTag> {
+  const a = new Set<TipTag>();
   const recipe = s.recipe ?? "";
-  if (recipe === "bf16") out.push({ icon: "💡", text: "fp8-hybrid ≈1.8× faster than bf16", color: "muted" });
-  else if (recipe.startsWith("fp8") || recipe.startsWith("nvfp4")) out.push({ icon: "💡", text: `${recipe} fast path active`, color: "muted" });
-  if (s.gradNorm !== null && s.gradNorm < 0.3) out.push({ icon: "💡", text: "grad-norm low → LR headroom", color: "muted" });
-  else if (s.gradNorm !== null && s.gradNorm > 5) out.push({ icon: "💡", text: "grad-norm high → lower LR / clip", color: "muted" });
+  if (recipe === "bf16") a.add("bf16");
+  else if (recipe.startsWith("fp8")) a.add("fp8");
+  else if (recipe.startsWith("nvfp4")) a.add("nvfp4");
+  if (s.lora) a.add("lora");
+  else if (s.lora === false) a.add("fft");
+  if (Object.keys(s.configFields).some((k) => k.startsWith("qlora") && s.configFields[k])) a.add("qlora");
+  if (/moe|a\d+b/i.test(s.model ?? "") || (num(s.configFields["ep_size"]) ?? 0) > 1) a.add("moe");
+  if (Object.keys(s.configFields).some((k) => /kl|rollout|grpo|advantage|reward/i.test(k))) a.add("grpo");
   const gpus = s.gpusSorted();
-  if (gpus.length && gpus.every((g) => g.memUtil !== null && g.memUtil < 0.6))
-    out.push({ icon: "💡", text: "memory headroom → larger batch", color: "muted" });
-  if (out.length === 0) out.push({ icon: "💡", text: "report_to:[surogate] enables this view", color: "muted" });
+  if (gpus.some((g) => g.memUtil !== null && g.memUtil >= 0.85)) a.add("memtight");
+  if (gpus.length && gpus.every((g) => g.memUtil !== null && g.memUtil < 0.6)) a.add("memroom");
+  if (gpus.some((g) => g.temp !== null && g.temp >= 78)) a.add("hot");
+  if (s.step > 2 && gpus.some((g) => g.smUtil !== null && g.smUtil < 50)) a.add("lowutil");
+  const trend = s.lossTrend(20);
+  const rel = Math.abs(trend) / (Math.abs(s.latestTrainLoss ?? 1) || 1);
+  if (s.lossHistory.length >= 5 && rel <= 0.005) a.add("plateau");
+  if (s.lossHistory.length >= 5 && trend > 0 && rel > 0.01) a.add("diverge");
+  if ((num(s.configFields["sequence_len"]) ?? 0) >= 8192) a.add("longseq");
+  if (gpus.length >= 2) a.add("multigpu");
+  a.add("throughput"); // broadly useful
+  return a;
+}
+
+/** Eligible tips = general (untagged) + any whose tag matches the live run. */
+export function eligibleTips(s: WatchState): string[] {
+  const active = activeTags(s);
+  return TIPS.filter((t) => !t.tags || t.tags.length === 0 || t.tags.some((tag) => active.has(tag))).map((t) => t.t);
+}
+
+const TIP_ROTATE_MS = 4500;
+
+/** A rotating window of `count` tips, advancing over time (a live feed). */
+export function computeTips(s: WatchState, nowMs: number, count = 2): Insight[] {
+  const pool = eligibleTips(s);
+  if (pool.length === 0) return [];
+  const base = Math.floor(nowMs / TIP_ROTATE_MS);
+  const out: Insight[] = [];
+  for (let i = 0; i < Math.min(count, pool.length); i++) {
+    out.push({ icon: "💡", text: pool[(base + i) % pool.length]!, color: "muted" });
+  }
   return out;
 }
 
@@ -87,11 +122,11 @@ export function computeFacts(s: WatchState): Insight[] {
   return out;
 }
 
-export function computeInsights(s: WatchState): InsightGroups {
+export function computeInsights(s: WatchState, nowMs: number): InsightGroups {
   return {
     health: computeHealth(s),
     alerts: computeAlerts(s),
-    tips: computeTips(s),
+    tips: computeTips(s, nowMs),
     facts: computeFacts(s),
   };
 }

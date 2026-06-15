@@ -2,15 +2,18 @@ import React, { useMemo } from "react";
 import { Box, Text } from "ink";
 import fs from "node:fs";
 import { discoverGpus } from "../launch.ts";
+import { TIPS as TIP_DB } from "../tips.ts";
 import { C } from "./theme.ts";
 import { GOLD, RABBIT, TAGLINE, WORDMARK, goldAt } from "./brand.ts";
 
-const TIPS = [
-  "↑↓ navigate pages · l launch a run · p pause · q quit",
-  "report_to: [surogate] in your training config feeds this UI",
-  "fp8-hybrid ≈ 1.8× faster than bf16 on Blackwell",
-  "real inline graphs on Kitty · Ghostty · iTerm2 · WezTerm",
-];
+// One keybind reminder + a few grounded tips, rotated per launch so the menu
+// feels fresh each time.
+function splashTips(): string[] {
+  const general = TIP_DB.filter((t) => !t.tags || t.tags.length === 0).map((t) => t.t);
+  const base = Math.floor(Date.now() / 6000);
+  const picks = [0, 1, 2].map((i) => general[(base + i) % general.length]!);
+  return ["↑↓ navigate · ⏎ select · l launch · p pause · q quit", ...picks];
+}
 
 export function StartScreen({ feedPath, version }: { feedPath: string; version: string }) {
   const gpus = useMemo(() => discoverGpus(), []);
@@ -87,7 +90,7 @@ export function StartScreen({ feedPath, version }: { feedPath: string; version: 
           <Text color={GOLD} bold>
             TIPS
           </Text>
-          {TIPS.map((t, i) => (
+          {splashTips().map((t, i) => (
             <Text key={i} color={C.text}>
               <Text color={GOLD}>💡</Text> {t}
             </Text>
