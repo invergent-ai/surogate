@@ -4,7 +4,7 @@ import { searchModels, modelDetail, paramsB } from "./hf.ts";
 
 const realFetch = globalThis.fetch;
 function mockFetch(payload: unknown, status = 200) {
-  globalThis.fetch = (async () => ({ ok: status < 400, status, json: async () => payload })) as typeof fetch;
+  globalThis.fetch = (async () => ({ ok: status < 400, status, json: async () => payload })) as unknown as typeof fetch;
 }
 
 test("searchModels parses hits", async () => {

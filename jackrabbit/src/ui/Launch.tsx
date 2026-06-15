@@ -40,12 +40,14 @@ export function Launch({
   surogateBin,
   repoRoot,
   active,
+  picked,
   onLaunched,
 }: {
   feedPath: string;
   surogateBin: string;
   repoRoot: string;
   active: boolean;
+  picked?: { model?: { id: string; t: { supported: boolean; recipes: readonly string[] } }; dataset?: string };
   onLaunched: (metricsPath: string) => void;
 }) {
   const gpus = useMemo(() => discoverGpus(), []);
@@ -57,7 +59,16 @@ export function Launch({
   const [recipe, setRecipe] = useState<Recipe>(DEFAULT_FIELDS.recipe);
   const [pid, setPid] = useState<number | null>(null);
 
-  const fields = { ...DEFAULT_FIELDS, recipe };
+  // models/datasets picked from the HF browser override the defaults
+  const recipeChoices = (picked?.model?.t.supported ? picked.model.t.recipes : RECIPES).filter((r): r is Recipe =>
+    (RECIPES as readonly string[]).includes(r),
+  );
+  const fields = {
+    ...DEFAULT_FIELDS,
+    recipe,
+    model: picked?.model?.id ?? DEFAULT_FIELDS.model,
+    datasetPath: picked?.dataset ?? DEFAULT_FIELDS.datasetPath,
+  };
   const estGB = estimateRunVramGB(fields);
   const grpo = exampleGrpoConfigs(repoRoot);
   const grpoOk = grpoConfigsExist(grpo);
@@ -90,11 +101,18 @@ export function Launch({
       <Text bold color={C.accent}>
         Launch a training run
       </Text>
-      {estGB !== null && (
-        <Text color={C.muted}>
-          {fields.model} · {fields.maxSteps} steps · ≈ est <Text color={C.gold}>{estGB} GB</Text> VRAM · pick GPUs with room
-        </Text>
-      )}
+      <Text color={C.muted}>
+        <Text color={picked?.model ? C.green : C.dim}>{fields.model}</Text>
+        {" · "}
+        {fields.datasetPath}
+        {estGB !== null && (
+          <Text>
+            {" · ≈ est "}
+            <Text color={C.gold}>{estGB} GB</Text>
+          </Text>
+        )}
+      </Text>
+      {!picked?.model && <Text color={C.dim}>tip: open Models to search HF + check surogate support</Text>}
       {!active && (
         <Box marginTop={1}>
           <Text color={C.gold}>press ⏎ to configure</Text>
@@ -198,7 +216,7 @@ export function Launch({
           {phase === "recipe" ? (
             <Select
               isDisabled={!active}
-              options={RECIPES.map((r) => ({ label: r, value: r }))}
+              options={recipeChoices.map((r) => ({ label: r, value: r }))}
               onChange={(v) => {
                 setRecipe(v as Recipe);
                 setPhase("confirm");

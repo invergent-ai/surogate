@@ -11,7 +11,9 @@ import { NAV, Sidebar, type NavItem } from "./Sidebar.tsx";
 import { InsightsRail } from "./InsightsRail.tsx";
 import { Page } from "./Pages.tsx";
 import { Launch } from "./Launch.tsx";
+import { Browse } from "./Browse.tsx";
 import { StartScreen } from "./StartScreen.tsx";
+import type { Trainability } from "../supported.ts";
 
 const SIDEBAR_W = 14;
 const RAIL_W = 26;
@@ -51,6 +53,7 @@ export function App({ initialFeedPath, fromStart, surogateBin, repoRoot, version
   const [banner, setBannerState] = useState<{ text: string; color: string } | null>(null);
   const [compareFeed, setCompareFeed] = useState<string | null>(null);
   const [stopArmed, setStopArmed] = useState(false);
+  const [picked, setPicked] = useState<{ model?: { id: string; t: Trainability }; dataset?: string }>({});
   const pausedRef = useRef(paused);
   pausedRef.current = paused;
 
@@ -134,12 +137,19 @@ export function App({ initialFeedPath, fromStart, surogateBin, repoRoot, version
   const runs: RunInfo[] = nav === "Runs" ? listRuns([initialFeedPath, feedDesc.path], Date.now()) : [];
 
   useInput((input, key) => {
-    if (input === "q") return exit();
-
     if (!started) {
       if (key.return || input === " ") setStarted(true);
+      else if (input === "q") exit();
       return;
     }
+
+    // While typing in the HF search box, only Esc is ours — Browse handles the rest.
+    if (focus === "content" && (nav === "Models" || nav === "Datasets")) {
+      if (key.escape) setFocus("nav");
+      return;
+    }
+
+    if (input === "q") return exit();
 
     if (stopArmed && input !== "x") setStopArmed(false);
 
@@ -183,7 +193,7 @@ export function App({ initialFeedPath, fromStart, surogateBin, repoRoot, version
     }
 
     if (focus === "content") {
-      if (key.escape || key.leftArrow) {
+      if (key.escape) {
         setFocus("nav");
         return;
       }
@@ -205,7 +215,11 @@ export function App({ initialFeedPath, fromStart, surogateBin, repoRoot, version
     if (key.upArrow || input === "k") setNavIdx((i) => (i - 1 + NAV.length) % NAV.length);
     else if (key.downArrow || input === "j") setNavIdx((i) => (i + 1) % NAV.length);
     else if (input >= "1" && input <= String(NAV.length)) setNavIdx(Number(input) - 1);
-    else if ((key.return || key.rightArrow) && (nav === "Launch" || nav === "Runs")) setFocus("content");
+    else if (
+      (key.return || key.rightArrow) &&
+      (nav === "Launch" || nav === "Runs" || nav === "Models" || nav === "Datasets")
+    )
+      setFocus("content");
   });
 
   const s = stateRef.current;
@@ -224,6 +238,7 @@ export function App({ initialFeedPath, fromStart, surogateBin, repoRoot, version
   const recipe = s.recipe ?? "?";
   const launchActive = nav === "Launch" && focus === "content";
   const runsActive = nav === "Runs" && focus === "content";
+  const browseActive = (nav === "Models" || nav === "Datasets") && focus === "content";
 
   return (
     <Box flexDirection="column" width={cols} height={rows}>
@@ -263,7 +278,23 @@ export function App({ initialFeedPath, fromStart, surogateBin, repoRoot, version
               surogateBin={surogateBin}
               repoRoot={repoRoot}
               active={launchActive}
+              picked={picked}
               onLaunched={(metricsPath) => switchFeed(metricsPath)}
+            />
+          ) : nav === "Models" || nav === "Datasets" ? (
+            <Browse
+              kind={nav === "Models" ? "models" : "datasets"}
+              active={focus === "content"}
+              onPickModel={(id, t) => {
+                setPicked((p) => ({ ...p, model: { id, t } }));
+                setFocus("nav");
+                setNavIdx(NAV.indexOf("Launch"));
+                flashBanner(`model set: ${id}${t.supported ? "" : " (unsupported!)"}`, t.supported ? C.green : C.red, 5000);
+              }}
+              onPickDataset={(id) => {
+                setPicked((p) => ({ ...p, dataset: id }));
+                flashBanner(`dataset set: ${id}`, C.eval, 4000);
+              }}
             />
           ) : (
             <Page
@@ -283,7 +314,14 @@ export function App({ initialFeedPath, fromStart, surogateBin, repoRoot, version
 
       <Box justifyContent="space-between" paddingX={1}>
         <Text color={C.muted}>
-          {launchActive ? (
+          {browseActive ? (
+            <>
+              <Hint k="type" label="search" />
+              <Hint k="↑↓" label="browse" />
+              <Hint k="⏎" label={nav === "Models" ? "use model" : "use dataset"} />
+              <Hint k="esc" label="back" />
+            </>
+          ) : launchActive ? (
             <>
               <Hint k="esc" label="back" />
               <Hint k="↑↓/⏎" label="form" />

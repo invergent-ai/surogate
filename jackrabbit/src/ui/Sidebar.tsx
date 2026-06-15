@@ -3,7 +3,7 @@ import { Box, Text } from "ink";
 import type { WatchState } from "../state.ts";
 import { C } from "./theme.ts";
 
-export const NAV = ["Monitor", "GPUs", "Data", "Runs", "Launch", "Logs"] as const;
+export const NAV = ["Monitor", "GPUs", "Data", "Runs", "Models", "Datasets", "Launch", "Logs"] as const;
 export type NavItem = (typeof NAV)[number];
 
 export function Sidebar({

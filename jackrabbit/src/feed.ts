@@ -71,16 +71,17 @@ export class Feed {
     tail.on("tail_error", () => {});
     tail.on("error", () => {});
 
-    await tail.start();
+    // Start the tailer in the background — don't block startup on it. The feed
+    // file may not exist yet (the tailer waits for it / errors are swallowed),
+    // so the UI shows a waiting state and picks up data once it appears.
+    void tail.start().catch(() => {});
   }
 
   async stop(): Promise<void> {
     if (this.tail) {
-      try {
-        await this.tail.quit();
-      } catch {
-        /* ignore */
-      }
+      // quit() can hang if the tailer is still waiting for a not-yet-existent
+      // file — fire-and-forget so callers never block.
+      void this.tail.quit().catch(() => {});
       this.tail = null;
     }
   }
