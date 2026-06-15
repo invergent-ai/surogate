@@ -1,10 +1,10 @@
 {
-  "name": "@surogate/watch",
+  "name": "jackrabbit",
   "version": "0.1.0",
-  "description": "Live terminal dashboard for surogate training runs (Ink, real graphs).",
+  "description": "Jackrabbit — live terminal dashboard for surogate training runs (Ink, real graphs).",
   "type": "module",
   "bin": {
-    "surogate-watch": "dist/cli.js"
+    "jackrabbit": "dist/cli.js"
   },
   "files": [
     "dist"

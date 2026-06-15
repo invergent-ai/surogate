@@ -31,8 +31,8 @@ debug/**
 
 # Node / surogate-watch (Ink) package
 node_modules/
-surogate-watch/node_modules/
-surogate-watch/dist/
+jackrabbit/node_modules/
+jackrabbit/dist/
 .superpowers/
 watch-out/
 watch-run.yaml*

@@ -46,7 +46,12 @@ export function StartScreen({ feedPath, version }: { feedPath: string; version: 
           <Box marginTop={1}>
             <Text color={C.text}>{TAGLINE}</Text>
           </Box>
-          <Text color={C.dim}>live training dashboard {version ? `· v${version}` : ""}</Text>
+          <Text>
+            <Text color={C.gold} bold>
+              jackrabbit
+            </Text>
+            <Text color={C.dim}> · live training dashboard {version ? `· v${version}` : ""}</Text>
+          </Text>
         </Box>
       </Box>
 

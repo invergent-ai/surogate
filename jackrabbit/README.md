@@ -1,4 +1,4 @@
-# @surogate/watch
+# jackrabbit 🐇
 
 A live terminal dashboard for [surogate](https://surogate.ai) training runs —
 built with **Ink** (React for CLIs) and **real raster graphs** (not ASCII/braille).
@@ -21,7 +21,7 @@ fallback on terminals without a graphics protocol.
 ## Install & build
 
 ```bash
-cd surogate-watch
+cd jackrabbit
 npm install
 npm run build      # -> dist/cli.js
 ```
@@ -39,13 +39,13 @@ logging_steps: 1
 Then, in another terminal:
 
 ```bash
-node dist/cli.js                 # live tail of /tmp/surogate_metrics.jsonl
-node dist/cli.js <path>          # a specific feed file
-node dist/cli.js --from-start    # replay a finished run from the top
-node dist/cli.js --repo-root /path/to/surogate   # for example train files in Launch
+jackrabbit                 # live tail of /tmp/surogate_metrics.jsonl
+jackrabbit <path>          # a specific feed file
+jackrabbit --from-start    # replay a finished run from the top
+jackrabbit --repo-root /path/to/surogate   # for example train files in Launch
 ```
 
-(After `npm link` or publish: `surogate-watch` instead of `node dist/cli.js`.)
+(After `npm link` or publish: `jackrabbit` instead of `jackrabbit`.)
 
 Keys: **q** quit · **m** monitor · **l** launch · **p** pause.
 

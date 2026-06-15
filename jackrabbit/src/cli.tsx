@@ -31,16 +31,16 @@ function parseArgs(argv: string[]): Args {
 function printHelp() {
   process.stdout.write(
     [
-      "surogate-watch — live training dashboard (Ink, real graphs)",
+      "jackrabbit — live training dashboard for surogate (Ink, real graphs)",
       "",
-      "Usage: surogate-watch [path] [options]",
+      "Usage: jackrabbit [path] [options]",
       "",
       "  path                metrics JSONL file (default: $SUROGATE_METRICS_PATH or /tmp/surogate_metrics.jsonl)",
       "  --from-start        replay the feed from the beginning",
       "  --surogate-bin <b>  surogate executable for the Launch tab (default: surogate)",
       "  --repo-root <dir>   surogate repo root for example train files (default: cwd)",
       "",
-      "Keys: q quit · m monitor · l launch · p pause",
+      "Keys: q quit · ↑↓ nav · ⏎ select · p pause",
       "",
     ].join("\n"),
   );
