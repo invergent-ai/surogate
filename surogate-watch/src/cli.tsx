@@ -3,7 +3,6 @@ import React from "react";
 import process from "node:process";
 import path from "node:path";
 import { render } from "ink";
-import { Feed } from "./feed.ts";
 import { resolveFeedPath } from "./launch.ts";
 import { App } from "./ui/App.tsx";
 
@@ -59,9 +58,14 @@ async function main() {
     process.exit(0);
   }
 
-  const feed = new Feed(feedPath, args.fromStart);
   const { waitUntilExit } = render(
-    <App feed={feed} feedPath={feedPath} surogateBin={args.surogateBin} repoRoot={args.repoRoot} version="0.1.0" />,
+    <App
+      initialFeedPath={feedPath}
+      fromStart={args.fromStart}
+      surogateBin={args.surogateBin}
+      repoRoot={args.repoRoot}
+      version="0.1.0"
+    />,
     { exitOnCtrlC: true },
   );
   await waitUntilExit();

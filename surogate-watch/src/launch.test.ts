@@ -39,3 +39,31 @@ test("discoverGpus never empty", () => {
   assert.ok(g.length >= 1);
   assert.equal(typeof g[0]!.id, "number");
 });
+
+import { buildGrpoCommand, estimateRunVramGB, fitOnGpu, paramsBFromModel } from "./launch.ts";
+
+test("paramsBFromModel parses sizes incl MoE active", () => {
+  assert.equal(paramsBFromModel("Qwen/Qwen3-0.6B"), 0.6);
+  assert.equal(paramsBFromModel("meta-llama/Llama-3.1-8B"), 8);
+  assert.equal(paramsBFromModel("Qwen/Qwen3-30B-A3B"), 3); // active params
+  assert.equal(paramsBFromModel("no-size-here"), null);
+});
+
+test("estimateRunVramGB is a positive ballpark", () => {
+  const gb = estimateRunVramGB(DEFAULT_FIELDS);
+  assert.ok(gb !== null && gb > 0 && gb < 30);
+});
+
+test("fitOnGpu verdicts", () => {
+  assert.equal(fitOnGpu(6, 30), "fits");
+  assert.equal(fitOnGpu(6, 7), "tight");
+  assert.equal(fitOnGpu(6, 3), "risk");
+  assert.equal(fitOnGpu(null, 30), "unknown");
+});
+
+test("buildGrpoCommand has split gpus + 3 configs", () => {
+  const c = { train: "t.yaml", infer: "i.yaml", orch: "o.yaml" };
+  const cmd = buildGrpoCommand([4, 5], [0, 1, 2, 3], c, "surogate");
+  assert.match(cmd, /surogate grpo --train t\.yaml --infer i\.yaml --orch o\.yaml/);
+  assert.match(cmd, /--trainer-gpus 4,5 --vllm-gpus 0,1,2,3/);
+});

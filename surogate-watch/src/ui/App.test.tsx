@@ -5,7 +5,6 @@ import { render } from "ink-testing-library";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { Feed } from "../feed.ts";
 import { App } from "./App.tsx";
 
 test("App renders Monitor without crashing", async () => {
@@ -17,9 +16,14 @@ test("App renders Monitor without crashing", async () => {
       '{"step":2,"ts":2,"train/loss":1.6,"train/lr":2e-4}\n' +
       '{"type":"gpu","gpu_id":0,"step":2,"ts":2,"temperature":55,"gpu_util":97,"mem_util":31,"power":325000}\n',
   );
-  const feed = new Feed(p, true);
   const { lastFrame, stdin, unmount } = render(
-    React.createElement(App, { feed, feedPath: p, surogateBin: "surogate", repoRoot: process.cwd(), version: "0.1.0" }),
+    React.createElement(App, {
+      initialFeedPath: p,
+      fromStart: true,
+      surogateBin: "surogate",
+      repoRoot: process.cwd(),
+      version: "0.1.0",
+    }),
   );
   await new Promise((r) => setTimeout(r, 200));
 

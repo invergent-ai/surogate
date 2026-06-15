@@ -1,8 +1,9 @@
 import React, { useEffect, useRef, useState } from "react";
 import { Box, Text, useApp, useInput, useStdout } from "ink";
-import type { Feed } from "../feed.ts";
+import { Feed } from "../feed.ts";
 import { WatchState } from "../state.ts";
 import { ChartRenderer } from "../render.ts";
+import { listRuns, type RunInfo } from "../runs.ts";
 import { C } from "./theme.ts";
 import { NAV, Sidebar, type NavItem } from "./Sidebar.tsx";
 import { InsightsRail } from "./InsightsRail.tsx";
@@ -14,23 +15,32 @@ const SIDEBAR_W = 14;
 const RAIL_W = 26;
 
 export interface AppProps {
-  feed: Feed;
-  feedPath: string;
+  initialFeedPath: string;
+  fromStart: boolean;
   surogateBin: string;
   repoRoot: string;
   version: string;
 }
 
-export function App({ feed, feedPath, surogateBin, repoRoot, version }: AppProps) {
+interface FeedDesc {
+  path: string;
+  fromStart: boolean;
+}
+
+export function App({ initialFeedPath, fromStart, surogateBin, repoRoot, version }: AppProps) {
   const { exit } = useApp();
   const { stdout } = useStdout();
   const stateRef = useRef(new WatchState());
   const chartRef = useRef(new ChartRenderer());
+  const feedRef = useRef<Feed | null>(null);
   const [, force] = useState(0);
+  const rerender = () => force((n) => n + 1);
+
   const [started, setStarted] = useState(false);
+  const [feedDesc, setFeedDesc] = useState<FeedDesc>({ path: initialFeedPath, fromStart });
   const [navIdx, setNavIdx] = useState(0);
-  // focus: "nav" = sidebar navigation; "content" = active page captures input (Launch form)
   const [focus, setFocus] = useState<"nav" | "content">("nav");
+  const [runSel, setRunSel] = useState(0);
   const [paused, setPaused] = useState(false);
   const pausedRef = useRef(paused);
   pausedRef.current = paused;
@@ -42,24 +52,43 @@ export function App({ feed, feedPath, surogateBin, repoRoot, version }: AppProps
   const chartHeight = Math.max(6, rows - 18);
   const nav: NavItem = NAV[navIdx]!;
 
-  // feed starts immediately so data accumulates even on the splash
+  // (re)create the feed whenever the watched feed path changes — resets state so
+  // runs never bleed into each other.
   useEffect(() => {
+    let cancelled = false;
+    void feedRef.current?.stop();
+    stateRef.current = new WatchState();
+    chartRef.current = new ChartRenderer();
+    const feed = new Feed(feedDesc.path, feedDesc.fromStart);
+    feedRef.current = feed;
     feed.start((records) => {
-      if (!pausedRef.current) {
+      if (!cancelled && !pausedRef.current) {
         stateRef.current.ingest(records);
-        force((n) => n + 1);
+        rerender();
       }
     });
-    return () => void feed.stop();
-  }, [feed]);
+    rerender();
+    return () => {
+      cancelled = true;
+      void feed.stop();
+    };
+  }, [feedDesc]);
 
   useEffect(() => {
     const t = setInterval(async () => {
       if (started) await chartRef.current.maybeRender(stateRef.current, chartCols, chartHeight, Date.now());
-      force((n) => n + 1);
+      rerender();
     }, 500);
     return () => clearInterval(t);
   }, [chartCols, chartHeight, started]);
+
+  const switchFeed = (p: string) => {
+    setFeedDesc({ path: p, fromStart: true });
+    setFocus("nav");
+    setNavIdx(0);
+  };
+
+  const runs: RunInfo[] = nav === "Runs" ? listRuns([initialFeedPath, feedDesc.path], Date.now()) : [];
 
   useInput((input, key) => {
     if (input === "q") return exit();
@@ -70,21 +99,28 @@ export function App({ feed, feedPath, surogateBin, repoRoot, version }: AppProps
     }
 
     if (input === "p") {
-      setPaused((p) => !p);
+      setPaused((x) => !x);
       return;
     }
 
     if (focus === "content") {
-      // Launch form is active; only Esc returns to the sidebar.
-      if (key.escape || key.leftArrow) setFocus("nav");
-      return;
+      if (key.escape || key.leftArrow) {
+        setFocus("nav");
+        return;
+      }
+      if (nav === "Runs") {
+        if (key.upArrow || input === "k") setRunSel((i) => Math.max(0, i - 1));
+        else if (key.downArrow || input === "j") setRunSel((i) => Math.min(Math.max(0, runs.length - 1), i + 1));
+        else if (key.return && runs[runSel]) switchFeed(runs[runSel]!.path);
+      }
+      return; // Launch widgets handle their own keys
     }
 
     // focus === "nav"
     if (key.upArrow || input === "k") setNavIdx((i) => (i - 1 + NAV.length) % NAV.length);
     else if (key.downArrow || input === "j") setNavIdx((i) => (i + 1) % NAV.length);
     else if (input >= "1" && input <= String(NAV.length)) setNavIdx(Number(input) - 1);
-    else if ((key.return || key.rightArrow) && nav === "Launch") setFocus("content");
+    else if ((key.return || key.rightArrow) && (nav === "Launch" || nav === "Runs")) setFocus("content");
   });
 
   const s = stateRef.current;
@@ -92,7 +128,7 @@ export function App({ feed, feedPath, surogateBin, repoRoot, version }: AppProps
   if (!started) {
     return (
       <Box width={cols} height={rows}>
-        <StartScreen feedPath={feedPath} version={version} />
+        <StartScreen feedPath={feedDesc.path} version={version} />
       </Box>
     );
   }
@@ -102,10 +138,10 @@ export function App({ feed, feedPath, surogateBin, repoRoot, version }: AppProps
     (typeof s.configFields["output_dir"] === "string" ? (s.configFields["output_dir"] as string).split("/").pop()! : "run");
   const recipe = s.recipe ?? "?";
   const launchActive = nav === "Launch" && focus === "content";
+  const runsActive = nav === "Runs" && focus === "content";
 
   return (
     <Box flexDirection="column" width={cols} height={rows}>
-      {/* top bar */}
       <Box justifyContent="space-between" paddingX={1}>
         <Text>
           <Text bold color={C.accent}>
@@ -119,45 +155,49 @@ export function App({ feed, feedPath, surogateBin, repoRoot, version }: AppProps
         </Text>
         <Text>
           {paused ? <Text color={C.warm}>‖ paused</Text> : <Text color={C.green}>● live</Text>}
-          <Text color={C.dim}>{"  "}{feedPath}</Text>
+          <Text color={C.dim}>{"  "}{feedDesc.path}</Text>
         </Text>
       </Box>
 
-      {/* middle: sidebar · page · rail */}
       <Box flexGrow={1}>
         <Sidebar active={nav} s={s} width={SIDEBAR_W} focusedNav={focus === "nav"} />
         <Box flexGrow={1} flexDirection="column" paddingX={1}>
           {nav === "Launch" ? (
             <Launch
-              feedPath={feedPath}
+              feedPath={feedDesc.path}
               surogateBin={surogateBin}
               repoRoot={repoRoot}
               active={launchActive}
-              onLaunched={() => {
-                setFocus("nav");
-                setNavIdx(0);
-              }}
+              onLaunched={(metricsPath) => switchFeed(metricsPath)}
             />
           ) : (
-            <Page nav={nav} s={s} chartImage={chartRef.current.current()} chartHeight={chartHeight} />
+            <Page
+              nav={nav}
+              s={s}
+              chartImage={chartRef.current.current()}
+              chartHeight={chartHeight}
+              runs={runs}
+              runSel={runSel}
+              runsActive={runsActive}
+              currentFeed={feedDesc.path}
+            />
           )}
         </Box>
         <InsightsRail s={s} width={RAIL_W} />
       </Box>
 
-      {/* bottom bar */}
       <Box justifyContent="space-between" paddingX={1}>
         <Text color={C.muted}>
-          {launchActive ? (
+          {launchActive || runsActive ? (
             <>
               <Hint k="esc" label="back" />
-              <Hint k="↑↓/⏎" label="form" />
+              <Hint k="↑↓/⏎" label={runsActive ? "watch run" : "form"} />
             </>
           ) : (
             <>
               <Hint k="q" label="quit" />
               <Hint k="↑↓" label="nav" />
-              <Hint k="⏎" label={nav === "Launch" ? "configure" : "select"} />
+              <Hint k="⏎" label={nav === "Launch" ? "configure" : nav === "Runs" ? "pick" : "select"} />
               <Hint k="p" label="pause" />
             </>
           )}

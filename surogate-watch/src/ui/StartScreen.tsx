@@ -63,12 +63,16 @@ export function StartScreen({ feedPath, version }: { feedPath: string; version: 
                   <Text color={C.green}>●</Text> {n}× {name}
                 </Text>
               ))}
-              {gpus.slice(0, 8).map((g) => (
-                <Text key={g.id} color={C.muted}>
-                  {"  "}gpu{g.id}
-                  {g.memMB ? ` · ${(g.memMB / 1024).toFixed(0)} GB` : ""}
-                </Text>
-              ))}
+              {gpus.slice(0, 8).map((g) => {
+                const free = g.memMB === null ? null : (g.memMB - (g.memUsedMB ?? 0)) / 1024;
+                return (
+                  <Text key={g.id} color={C.muted}>
+                    {"  "}gpu{g.id}
+                    {free !== null ? ` · ${free.toFixed(0)}/${((g.memMB ?? 0) / 1024).toFixed(0)} GB free` : ""}
+                    {g.busy ? <Text color={C.warm}> · busy</Text> : <Text color={C.green}> · idle</Text>}
+                  </Text>
+                );
+              })}
             </>
           ) : (
             <Text color={C.muted}>no GPUs detected</Text>

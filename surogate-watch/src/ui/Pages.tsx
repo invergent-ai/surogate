@@ -2,10 +2,64 @@ import React from "react";
 import { Box, Text } from "ink";
 import type { WatchState } from "../state.ts";
 import { fmtCount, fmtFloat } from "../format.ts";
+import { isActive, type RunInfo } from "../runs.ts";
 import { C, memColor, meterParts, tempColor } from "./theme.ts";
 import { Panel } from "./Panel.tsx";
 import { Chart } from "./Monitor.tsx";
 import type { NavItem } from "./Sidebar.tsx";
+
+function fmtAge(ms: number): string {
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s}s ago`;
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m}m ago`;
+  return `${Math.round(m / 60)}h ago`;
+}
+
+function RunsPage({
+  runs,
+  runSel,
+  active,
+  currentFeed,
+}: {
+  runs: RunInfo[];
+  runSel: number;
+  active: boolean;
+  currentFeed: string;
+}) {
+  return (
+    <Panel title="runs" flexGrow={1}>
+      <Box flexDirection="column" marginTop={1}>
+        <Text color={C.muted}>
+          {active ? "↑↓ choose · ⏎ watch · esc back" : "⏎ to browse runs — each launched run has its own feed"}
+        </Text>
+        {runs.length === 0 ? (
+          <Box marginTop={1}>
+            <Text color={C.muted}>no run feeds yet — launch one, or point at a feed file</Text>
+          </Box>
+        ) : (
+          <Box flexDirection="column" marginTop={1}>
+            {runs.map((r, i) => {
+              const on = active && i === runSel;
+              const cur = r.path === currentFeed;
+              return (
+                <Text key={r.path} color={on ? C.accent : C.text} bold={on}>
+                  {on ? "▸ " : "  "}
+                  {isActive(r) ? <Text color={C.green}>●</Text> : <Text color={C.dim}>○</Text>}{" "}
+                  {r.name.padEnd(34).slice(0, 34)}
+                  <Text color={C.muted}>
+                    {" "}
+                    {fmtAge(r.ageMs).padStart(7)} · {(r.sizeBytes / 1024).toFixed(0)}KB{cur ? " · watching" : ""}
+                  </Text>
+                </Text>
+              );
+            })}
+          </Box>
+        )}
+      </Box>
+    </Panel>
+  );
+}
 
 function Headline({ s }: { s: WatchState }) {
   const trend = s.lossTrend();
@@ -156,17 +210,27 @@ export function Page({
   s,
   chartImage,
   chartHeight,
+  runs,
+  runSel,
+  runsActive,
+  currentFeed,
 }: {
   nav: NavItem;
   s: WatchState;
   chartImage: string;
   chartHeight: number;
+  runs: RunInfo[];
+  runSel: number;
+  runsActive: boolean;
+  currentFeed: string;
 }) {
   switch (nav) {
     case "GPUs":
       return <GpusPage s={s} />;
     case "Data":
       return <DataPage s={s} />;
+    case "Runs":
+      return <RunsPage runs={runs} runSel={runSel} active={runsActive} currentFeed={currentFeed} />;
     case "Logs":
       return <LogsPage s={s} />;
     default:
