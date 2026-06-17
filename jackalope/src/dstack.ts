@@ -14,16 +14,17 @@ import { promisify } from "node:util";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import YAML from "yaml";
 import { pipeMetrics } from "./feed-pipe.ts";
 import { newRunFeedPath, runArtifacts, writeRunMeta } from "./runs.ts";
 
 const execFileP = promisify(execFile);
 
 // ── backend credentials ───────────────────────────────────────────────────────
-// dstack reads backend creds from ~/.dstack/server/config.yml. We write the chosen
-// backend there so `dstack apply` can provision it. The creds go to dstack's own
-// config (never into jackalope's providers.json). The YAML shape is small and
-// fixed, so we emit it directly rather than pull in a YAML dependency.
+// dstack reads backend creds from ~/.dstack/server/config.yml. We merge the chosen
+// backend into that file (preserving the user's other projects/backends) so
+// `dstack apply` can provision it. The creds go to dstack's own config (never into
+// jackalope's providers.json).
 const DSTACK_CONFIG = (): string => path.join(os.homedir(), ".dstack", "server", "config.yml");
 
 // The credential fields each backend needs — drives the UI form and the config
@@ -123,26 +124,70 @@ function credsYaml(backend: string, f: Record<string, string>): string[] {
   }
 }
 
-/** Write a single active backend into dstack's server config so `dstack apply`
- *  can use it. Returns { ok, reason? }. */
+interface DstackBackend {
+  type?: string;
+  [k: string]: unknown;
+}
+interface DstackProject {
+  name?: string;
+  backends?: DstackBackend[];
+  [k: string]: unknown;
+}
+interface DstackServerConfig {
+  projects?: DstackProject[];
+  [k: string]: unknown;
+}
+
+/** Merge a backend into the `main` project of dstack's server config, returning
+ *  the new document. Same-type backend is replaced (re-config is idempotent);
+ *  other backends and other projects are preserved untouched. */
+export function mergeDstackBackend(existing: DstackServerConfig | null, backend: string, fields: Record<string, string>): DstackServerConfig {
+  // Parse the single backend we generate (a YAML list item) into an object.
+  const parsed = YAML.parse(["backends:", ...credsYaml(backend, fields)].join("\n")) as { backends: DstackBackend[] };
+  const entry = parsed.backends[0]!;
+
+  const doc: DstackServerConfig = existing && typeof existing === "object" ? existing : {};
+  if (!Array.isArray(doc.projects)) doc.projects = [];
+  let main = doc.projects.find((p) => p?.name === "main");
+  if (!main) {
+    main = { name: "main", backends: [] };
+    doc.projects.push(main);
+  }
+  if (!Array.isArray(main.backends)) main.backends = [];
+  const i = main.backends.findIndex((b) => b?.type === entry.type);
+  if (i >= 0) main.backends[i] = entry; // replace same-type backend
+  else main.backends.push(entry);
+  return doc;
+}
+
+/** Merge a backend into dstack's server config (preserving the user's other
+ *  projects/backends) so `dstack apply` can use it. Returns { ok, reason? }. */
 export function configureDstackBackend(backend: string, fields: Record<string, string>): { ok: boolean; reason?: string } {
   try {
-    const yaml = ["projects:", "- name: main", "  backends:", ...credsYaml(backend, fields), ""].join("\n");
     const cfg = DSTACK_CONFIG();
     fs.mkdirSync(path.dirname(cfg), { recursive: true });
-    // This sets a single active backend. Preserve the user's ORIGINAL config:
-    // back it up to .bak only if no backup exists yet, so re-configuring twice
-    // can't clobber the original backup with a jackalope-written one. (A full
-    // parse-and-merge into an existing multi-backend config is a future
-    // enhancement — it needs a YAML parser we don't currently bundle.)
-    if (fs.existsSync(cfg) && !fs.existsSync(cfg + ".bak")) {
+
+    let existing: DstackServerConfig | null = null;
+    if (fs.existsSync(cfg)) {
+      // Back the original up once (only if no .bak yet) so a malformed re-parse
+      // or any surprise is always recoverable.
+      if (!fs.existsSync(cfg + ".bak")) {
+        try {
+          fs.copyFileSync(cfg, cfg + ".bak");
+        } catch {
+          /* best effort */
+        }
+      }
       try {
-        fs.copyFileSync(cfg, cfg + ".bak");
+        const v = YAML.parse(fs.readFileSync(cfg, "utf8")) as DstackServerConfig;
+        if (v && typeof v === "object") existing = v;
       } catch {
-        /* best effort */
+        /* malformed config → start fresh (the .bak preserves the original) */
       }
     }
-    fs.writeFileSync(cfg, yaml, { mode: 0o600 });
+
+    const doc = mergeDstackBackend(existing, backend, fields);
+    fs.writeFileSync(cfg, YAML.stringify(doc), { mode: 0o600 });
     return { ok: true };
   } catch (e) {
     return { ok: false, reason: `${backend}: ${(e as Error).message}` };
