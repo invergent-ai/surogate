@@ -215,6 +215,40 @@ else
     echo "Successfully installed surogate $VERSION"
 fi
 
+# --- Install the jackalope dashboard binary (best effort) ---
+# jackalope is a standalone, Node-free TUI shipped on its own release channel
+# (independent of the CUDA wheel). If the fetch fails, `surogate jackalope` will
+# download it on first run, so this step is non-fatal.
+install_jackalope() {
+    local arch os asset
+    case "$(uname -m)" in
+        x86_64 | amd64) arch="x64" ;;
+        aarch64 | arm64) arch="arm64" ;;
+        *) echo "jackalope: no binary for $(uname -m), skipping"; return 0 ;;
+    esac
+    case "$(uname -s)" in
+        Linux) os="linux" ;;
+        Darwin) os="darwin" ;;
+        *) echo "jackalope: unsupported OS $(uname -s), skipping"; return 0 ;;
+    esac
+    asset="jackalope-${os}-${arch}"
+    # Honor the same pin the runtime uses (SUROGATE_JACKALOPE_VERSION), so a
+    # version pinned at install time matches `surogate jackalope`'s.
+    local tag="${SUROGATE_JACKALOPE_VERSION:-${JACKALOPE_VERSION:-jackalope-latest}}"
+    local url="https://github.com/${REPO}/releases/download/${tag}/${asset}"
+    local dest="${VENV_DIR}/bin/jackalope"
+    echo ""
+    echo "Installing jackalope dashboard (${asset})..."
+    if curl -fsSL "$url" -o "$dest"; then
+        chmod +x "$dest"
+        echo "  installed — run it with: surogate jackalope"
+    else
+        rm -f "$dest"
+        echo "  not published yet — 'surogate jackalope' will fetch it on first run"
+    fi
+}
+install_jackalope || true
+
 # Download examples
 EXAMPLES_DIR="examples"
 if [ ! -d "$EXAMPLES_DIR" ]; then

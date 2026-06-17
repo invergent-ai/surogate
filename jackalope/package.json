@@ -1,0 +1,40 @@
+{
+  "name": "jackalope",
+  "version": "0.1.0",
+  "description": "Jackalope — live terminal dashboard for surogate training runs (Ink, real graphs).",
+  "type": "module",
+  "bin": {
+    "jackalope": "dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsup src/cli.tsx --format esm --target node20 --clean",
+    "build:binary": "bun scripts/build-binary.mjs",
+    "dev": "tsx src/cli.tsx",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test --test-force-exit \"src/**/*.test.ts\" \"src/**/*.test.tsx\""
+  },
+  "dependencies": {
+    "@inkjs/ui": "^2.0.0",
+    "@logdna/tail-file": "^4.0.2",
+    "@resvg/resvg-js": "^2.6.2",
+    "echarts": "^6.1.0",
+    "ink": "^7.0.6",
+    "react": "^19.2.0",
+    "sixel": "^0.16.0",
+    "terminal-image": "^4.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.0.0",
+    "ink-testing-library": "^4.0.0",
+    "tsup": "^8.3.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

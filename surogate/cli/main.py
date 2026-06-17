@@ -26,6 +26,13 @@ def _apply_grpo_split_gpu_mask() -> None:
 
 _apply_grpo_split_gpu_mask()
 
+# `surogate jackalope ...` launches the TUI dashboard. Handle it here, before any
+# CUDA-touching import, so the dashboard starts instantly and runs on machines
+# with no GPU. os.execv replaces the process, so this never returns for jackalope.
+from surogate.cli._jackalope import maybe_exec_jackalope
+
+maybe_exec_jackalope()
+
 from surogate.utils.logger import get_logger
 from surogate.utils.system_info import get_system_info, print_system_diagnostics
 
@@ -129,6 +136,13 @@ def parse_args():
     from surogate.cli.debug import prepare_command_parser as debug_prepare_command_parser
 
     debug_prepare_command_parser(subparsers.add_parser("debug", help="Introspection and diagnostics for DSL models"))
+
+    # jackalope is intercepted before argparse (see maybe_exec_jackalope); this
+    # entry exists only so it shows up in `surogate --help`. add_help=False so its
+    # own `--help` passes through to the dashboard binary.
+    subparsers.add_parser(
+        "jackalope", help="Launch the jackalope live-training dashboard (TUI)", add_help=False
+    )
 
     args = parser.parse_args(sys.argv[1:])
     if args.command is None:
