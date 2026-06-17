@@ -398,10 +398,12 @@ export function App({ initialFeedPath, fromStart, surogateBin, repoRoot, version
             flashBanner("⚠ this run's outputs aren't downloadable (dstack) — push to the Hub instead", C.warm, 7000);
           } else {
             flashBanner(`⬇ fetching ${run.name} artifacts…`, C.eval, 60000);
-            void fetchArtifacts(run.path).then((res) => {
-              if (res.ok) flashBanner(`✓ artifacts → ${res.dest}`, C.green, 10000);
-              else flashBanner(`✗ fetch failed — ${res.reason}`, C.red, 9000);
-            });
+            void fetchArtifacts(run.path)
+              .then((res) => {
+                if (res.ok) flashBanner(`✓ artifacts → ${res.dest}`, C.green, 10000);
+                else flashBanner(`✗ fetch failed — ${res.reason}`, C.red, 9000);
+              })
+              .catch((err) => flashBanner(`✗ fetch failed — ${(err as Error).message}`, C.red, 9000));
           }
         } else if (input === "r" && runs[runSel]) {
           const run = runs[runSel]!;
@@ -475,9 +477,11 @@ export function App({ initialFeedPath, fromStart, surogateBin, repoRoot, version
     );
   }
 
-  const model =
-    s.model ??
-    (typeof s.configFields["output_dir"] === "string" ? (s.configFields["output_dir"] as string).split("/").pop()! : "run");
+  // last non-empty path segment, so a trailing slash (output_dir: ./watch-out/)
+  // doesn't yield an empty name
+  const outDir = typeof s.configFields["output_dir"] === "string" ? (s.configFields["output_dir"] as string) : "";
+  const outSegs = outDir.split("/").filter(Boolean);
+  const model = s.model ?? (outSegs.length ? outSegs[outSegs.length - 1]! : "run");
   const recipe = s.recipe ?? "?";
   // short, friendly name of the watched run (the run folder, not the long path)
   const feedParts = feedDesc.path.split("/");

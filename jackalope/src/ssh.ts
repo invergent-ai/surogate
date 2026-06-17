@@ -6,7 +6,7 @@
 // the remote metrics.jsonl back into a LOCAL run folder with `tail -F`, so the
 // rest of the dashboard (Feed, Runs, Monitor) works unchanged on a local file.
 
-import { type ChildProcess, execFile, execFileSync, spawn } from "node:child_process";
+import { type ChildProcess, execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import fs from "node:fs";
 import path from "node:path";
@@ -206,11 +206,15 @@ export async function launchRemoteRun(
   return { ok: true, feed, session, host: t.host };
 }
 
-/** Stop a remote run by killing its tmux session. */
+/** Stop a remote run by killing its tmux session. Fire-and-forget over SSH so a
+ *  slow/unresponsive host can't freeze the TUI; returns whether the ssh process
+ *  was launched (the kill itself completes in the background). */
 export function stopRemoteSession(t: SshTarget, session: string): boolean {
   try {
-    execFileSync("ssh", [...sshBaseArgs(t), t.host, `tmux kill-session -t ${session}`], { timeout: 15000 });
-    return true;
+    const child = spawn("ssh", [...sshBaseArgs(t), t.host, `tmux kill-session -t ${session}`], { stdio: "ignore", detached: true });
+    child.on("error", () => {});
+    child.unref();
+    return !!child.pid;
   } catch {
     return false;
   }

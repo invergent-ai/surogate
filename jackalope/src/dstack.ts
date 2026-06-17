@@ -130,9 +130,12 @@ export function configureDstackBackend(backend: string, fields: Record<string, s
     const yaml = ["projects:", "- name: main", "  backends:", ...credsYaml(backend, fields), ""].join("\n");
     const cfg = DSTACK_CONFIG();
     fs.mkdirSync(path.dirname(cfg), { recursive: true });
-    // This sets a single active backend; back up any existing config first so a
-    // user's hand-managed multi-backend setup isn't lost irrecoverably.
-    if (fs.existsSync(cfg)) {
+    // This sets a single active backend. Preserve the user's ORIGINAL config:
+    // back it up to .bak only if no backup exists yet, so re-configuring twice
+    // can't clobber the original backup with a jackalope-written one. (A full
+    // parse-and-merge into an existing multi-backend config is a future
+    // enhancement — it needs a YAML parser we don't currently bundle.)
+    if (fs.existsSync(cfg) && !fs.existsSync(cfg + ".bak")) {
       try {
         fs.copyFileSync(cfg, cfg + ".bak");
       } catch {

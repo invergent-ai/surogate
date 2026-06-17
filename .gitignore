@@ -29,10 +29,10 @@ surogate.db
 .claude/**
 debug/**
 
-# Node / surogate-watch (Ink) package
+# Node / jackalope (Ink) package
 node_modules/
-jackrabbit/node_modules/
-jackrabbit/dist/
+jackalope/node_modules/
+jackalope/dist/
 .superpowers/
 watch-out/
 watch-run.yaml*

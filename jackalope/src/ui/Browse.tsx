@@ -31,7 +31,7 @@ function clean(s: string | undefined | null): string {
     // desync the terminal's column count (Ink's width math goes wrong → the row's
     // background doesn't fill → "black" gaps that cut across the panel). RTL/LTR
     // overrides (U+202A–202E, U+2066–2069) are the worst offenders.
-    .replace(/[​-‏‪-‮⁠-⁯﻿]/g, "")
+    .replace(/[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/g, "")
     .replace(/[\x00-\x1f\x7f]+/g, " ") // control chars
     .replace(/\s+/g, " ") // collapse whitespace/newlines to single spaces
     .trim();
