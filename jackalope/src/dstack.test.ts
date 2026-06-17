@@ -29,6 +29,11 @@ test("mergeDstackBackend preserves other projects and other backends", () => {
   assert.equal(main.backends.find((b: any) => b.type === "vastai").creds.api_key, "keep_me");
 });
 
+test("mergeDstackBackend refuses a non-list projects rather than clobbering it", () => {
+  // a malformed-but-present config must not be silently overwritten
+  assert.throws(() => mergeDstackBackend({ projects: { default: "x" } as any }, "runpod", { api_key: "k" }), /non-list `projects`/);
+});
+
 test("mergeDstackBackend replaces a same-type backend (idempotent re-config)", () => {
   const existing = { projects: [{ name: "main", backends: [{ type: "runpod", creds: { type: "api_key", api_key: "old" } }] }] };
   const doc = mergeDstackBackend(existing, "runpod", { api_key: "new" }) as any;

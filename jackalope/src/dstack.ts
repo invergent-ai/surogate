@@ -69,18 +69,12 @@ export const DSTACK_BACKEND_FIELDS: Record<string, BackendField[]> = {
   ],
 };
 
-// Indent a multi-line file's contents as a YAML block scalar body.
-function block(content: string, indent: string): string[] {
-  return content.replace(/\r/g, "").replace(/\s+$/, "").split("\n").map((l) => indent + l);
-}
-
-/** The `creds:` block (with any backend-level fields) for a backend. Throws with
- *  a readable reason if a required field is missing or a key file can't be read. */
-function credsYaml(backend: string, f: Record<string, string>): string[] {
+/** The backend object (type + any backend-level fields + creds) for a backend.
+ *  `yaml` handles quoting and block scalars on write, so we build a plain object.
+ *  Throws with a readable reason if a required field is missing or a key file
+ *  can't be read. */
+function credsBackend(backend: string, f: Record<string, string>): DstackBackend {
   const v = (k: string) => (f[k] ?? "").trim();
-  // YAML-quote a scalar value (a JSON string is a valid YAML double-quoted scalar),
-  // so secrets containing ':' '#' or other meta-chars can't corrupt the document.
-  const q = (k: string) => JSON.stringify(v(k));
   const fields = DSTACK_BACKEND_FIELDS[backend];
   if (!fields) throw new Error(`unknown backend ${backend}`);
   for (const fld of fields) if (!v(fld.key)) throw new Error(`missing ${fld.label}`);
@@ -93,7 +87,7 @@ function credsYaml(backend: string, f: Record<string, string>): string[] {
     let p = raw;
     if (p === "~" || p.startsWith("~/")) p = path.join(os.homedir(), p.slice(1)); // expand ~
     try {
-      if (fs.statSync(p).isFile()) return fs.readFileSync(p, "utf8");
+      if (fs.statSync(p).isFile()) return fs.readFileSync(p, "utf8").replace(/\r/g, "").replace(/\s+$/, "");
     } catch {
       /* not a readable file — decide below whether it was meant as a path */
     }
@@ -102,23 +96,23 @@ function credsYaml(backend: string, f: Record<string, string>): string[] {
     // rather than writing the path string itself into the backend config. (Anchored
     // to the start so base64 key bodies, which contain '/', aren't mistaken for paths.)
     if (!raw.includes("\n") && /^(~|\.{0,2}\/)/.test(raw)) throw new Error(`could not read ${k}: ${raw}`);
-    return raw;
+    return raw.replace(/\r/g, "").replace(/\s+$/, "");
   };
   switch (backend) {
     case "runpod":
     case "lambda":
     case "vastai":
-      return [`  - type: ${backend}`, `    creds:`, `      type: api_key`, `      api_key: ${q("api_key")}`];
+      return { type: backend, creds: { type: "api_key", api_key: v("api_key") } };
     case "aws":
-      return [`  - type: aws`, `    creds:`, `      type: access_key`, `      access_key: ${q("access_key")}`, `      secret_key: ${q("secret_key")}`];
+      return { type: "aws", creds: { type: "access_key", access_key: v("access_key"), secret_key: v("secret_key") } };
     case "gcp":
-      return [`  - type: gcp`, `    project_id: ${q("project_id")}`, `    creds:`, `      type: service_account`, `      filename: ""`, `      data: |`, ...block(fileText("data_file"), "        ")];
+      return { type: "gcp", project_id: v("project_id"), creds: { type: "service_account", filename: "", data: fileText("data_file") } };
     case "azure":
-      return [`  - type: azure`, `    tenant_id: ${q("tenant_id")}`, `    subscription_id: ${q("subscription_id")}`, `    creds:`, `      type: client`, `      client_id: ${q("client_id")}`, `      client_secret: ${q("client_secret")}`];
+      return { type: "azure", tenant_id: v("tenant_id"), subscription_id: v("subscription_id"), creds: { type: "client", client_id: v("client_id"), client_secret: v("client_secret") } };
     case "nebius":
-      return [`  - type: nebius`, `    creds:`, `      type: service_account`, `      service_account_id: ${q("service_account_id")}`, `      public_key_id: ${q("public_key_id")}`, `      private_key_content: |`, ...block(fileText("private_key_file"), "        ")];
+      return { type: "nebius", creds: { type: "service_account", service_account_id: v("service_account_id"), public_key_id: v("public_key_id"), private_key_content: fileText("private_key_file") } };
     case "oci":
-      return [`  - type: oci`, `    region: ${q("region")}`, `    creds:`, `      type: client`, `      user: ${q("user")}`, `      tenancy: ${q("tenancy")}`, `      fingerprint: ${q("fingerprint")}`, `      key_content: |`, ...block(fileText("key_file"), "        ")];
+      return { type: "oci", region: v("region"), creds: { type: "client", user: v("user"), tenancy: v("tenancy"), fingerprint: v("fingerprint"), key_content: fileText("key_file") } };
     default:
       throw new Error(`unsupported backend ${backend}`);
   }
@@ -142,18 +136,20 @@ interface DstackServerConfig {
  *  the new document. Same-type backend is replaced (re-config is idempotent);
  *  other backends and other projects are preserved untouched. */
 export function mergeDstackBackend(existing: DstackServerConfig | null, backend: string, fields: Record<string, string>): DstackServerConfig {
-  // Parse the single backend we generate (a YAML list item) into an object.
-  const parsed = YAML.parse(["backends:", ...credsYaml(backend, fields)].join("\n")) as { backends: DstackBackend[] };
-  const entry = parsed.backends[0]!;
+  const entry = credsBackend(backend, fields);
 
   const doc: DstackServerConfig = existing && typeof existing === "object" ? existing : {};
-  if (!Array.isArray(doc.projects)) doc.projects = [];
+  // An absent `projects` is fine (we create it); a present-but-wrong-shape one
+  // means the file isn't what we think — refuse rather than silently clobber it.
+  if (doc.projects == null) doc.projects = [];
+  else if (!Array.isArray(doc.projects)) throw new Error("existing dstack config has a non-list `projects` — not overwriting");
   let main = doc.projects.find((p) => p?.name === "main");
   if (!main) {
     main = { name: "main", backends: [] };
     doc.projects.push(main);
   }
-  if (!Array.isArray(main.backends)) main.backends = [];
+  if (main.backends == null) main.backends = [];
+  else if (!Array.isArray(main.backends)) throw new Error("existing dstack config's `main` project has non-list `backends` — not overwriting");
   const i = main.backends.findIndex((b) => b?.type === entry.type);
   if (i >= 0) main.backends[i] = entry; // replace same-type backend
   else main.backends.push(entry);
@@ -181,8 +177,12 @@ export function configureDstackBackend(backend: string, fields: Record<string, s
       try {
         const v = YAML.parse(fs.readFileSync(cfg, "utf8")) as DstackServerConfig;
         if (v && typeof v === "object") existing = v;
-      } catch {
-        /* malformed config → start fresh (the .bak preserves the original) */
+        // `null`/empty file is fine (treated as a fresh config); other scalars are not.
+        else if (v != null) throw new Error("not a mapping");
+      } catch (e) {
+        // Don't silently discard a config we can't understand — refuse and point
+        // the user at the backup. (The .bak above preserves the original.)
+        return { ok: false, reason: `existing ${cfg} is not valid dstack config (${(e as Error).message}); backed up to ${path.basename(cfg)}.bak — fix or remove it` };
       }
     }
 

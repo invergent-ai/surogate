@@ -210,6 +210,10 @@ export async function launchRemoteRun(
  *  slow/unresponsive host can't freeze the TUI; returns whether the ssh process
  *  was launched (the kill itself completes in the background). */
 export function stopRemoteSession(t: SshTarget, session: string): boolean {
+  // The session name is interpolated into a remote shell command, so only allow
+  // the tmux-safe charset jackalope generates — never anything that could break
+  // out of the `tmux kill-session -t …` argument.
+  if (!/^[A-Za-z0-9_.-]+$/.test(session)) return false;
   try {
     const child = spawn("ssh", [...sshBaseArgs(t), t.host, `tmux kill-session -t ${session}`], { stdio: "ignore", detached: true });
     child.on("error", () => {});
