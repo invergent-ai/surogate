@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -79,7 +80,13 @@ public:
     // Returns the formatted string ready for encode().
     // If add_generation_prompt is true, appends the assistant header so the
     // model can continue generating.
-    std::string apply_chat_template(const std::vector<ChatMessage>& messages, bool add_generation_prompt = false) const;
+    // enable_thinking, when set, is passed to the template (e.g. Qwen3 emits an
+    // open "<think>\n" generation prompt when true vs. an empty
+    // "<think>\n\n</think>\n\n" block when false); std::nullopt leaves it unset
+    // so the template falls back to its own default.
+    std::string apply_chat_template(const std::vector<ChatMessage>& messages,
+                                    bool add_generation_prompt = false,
+                                    std::optional<bool> enable_thinking = std::nullopt) const;
 
     // Convenience: apply_chat_template + encode_with_special_tokens in one call.
     std::vector<int32_t> apply_chat_template_and_encode(const std::vector<ChatMessage>& messages,
