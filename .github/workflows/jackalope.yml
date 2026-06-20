@@ -1,0 +1,127 @@
+name: jackalope
+
+# Build the jackalope dashboard into standalone, Node-free binaries and publish
+# them on their own release channel — independent of the surogate CUDA wheel.
+#
+#   • push to main touching jackalope/  → refresh the moving `jackalope-latest`
+#     release (this is how the dashboard ships day-to-day; users get it via
+#     `surogate jackalope --update`).
+#   • push a `jackalope-vX.Y.Z` tag      → cut a pinned, immutable release too.
+#
+# jackalope is pure UI (no CUDA), so it runs on far more than surogate does: a
+# laptop on any OS can run the dashboard to drive remote/cloud training over SSH.
+# Linux x64 is the binary bundled into `surogate jackalope` (surogate is Linux
+# x86_64 only); the rest exist for standalone laptop installs.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'jackalope/**'
+      - '.github/workflows/jackalope.yml'
+    tags:
+      - 'jackalope-v*'
+
+permissions:
+  contents: write
+
+jobs:
+  # Tests are platform-agnostic logic — run them once, not per-target.
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: jackalope
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: jackalope/package-lock.json
+      - run: npm ci
+      - run: npm test
+
+  build:
+    name: build (${{ matrix.asset }})
+    needs: test
+    runs-on: ${{ matrix.runs-on }}
+    # Experimental targets (Intel mac, Windows) are best-effort: a failure there
+    # must not block publishing the core Linux/Apple-Silicon binaries.
+    continue-on-error: ${{ matrix.experimental || false }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runs-on: ubuntu-latest
+            target: bun-linux-x64
+            asset: jackalope-linux-x64
+          - runs-on: ubuntu-24.04-arm
+            target: bun-linux-arm64
+            asset: jackalope-linux-arm64
+          - runs-on: macos-14
+            target: bun-darwin-arm64
+            asset: jackalope-darwin-arm64
+          - runs-on: macos-13
+            target: bun-darwin-x64
+            asset: jackalope-darwin-x64
+            experimental: true
+          - runs-on: windows-latest
+            target: bun-windows-x64
+            asset: jackalope-windows-x64.exe
+            experimental: true
+    defaults:
+      run:
+        working-directory: jackalope
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: jackalope/package-lock.json
+
+      # npm ci installs the platform-native @resvg/resvg-js addon for THIS
+      # runner, so each binary embeds the correct native code (compiled natively,
+      # not cross-compiled — which is why this is a per-OS matrix).
+      - name: Install deps
+        run: npm ci
+
+      - name: Build standalone binary
+        run: bun scripts/build-binary.mjs ${{ matrix.target }} dist/${{ matrix.asset }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: jackalope/dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    name: publish
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Publish (tag → pinned release, otherwise the latest channel)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/jackalope-v') && github.ref_name || 'jackalope-latest' }}
+          name: ${{ startsWith(github.ref, 'refs/tags/jackalope-v') && github.ref_name || 'jackalope (latest build)' }}
+          files: artifacts/*
+          prerelease: ${{ !startsWith(github.ref, 'refs/tags/jackalope-v') }}
+          body: |
+            Standalone jackalope dashboard binaries (no Node required).
+            Run via `surogate jackalope`, or update with `surogate jackalope --update`.
+
+            Linux x64 is what `surogate jackalope` bundles. The macOS / Windows
+            builds are for running the dashboard on a laptop to drive remote or
+            cloud training over SSH (jackalope needs no GPU or surogate locally).

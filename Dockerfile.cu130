@@ -58,6 +58,13 @@ RUN ~/.local/bin/uv pip install "torch==2.10.0+${CUDA_TAG}" "torchvision==0.25.0
 RUN curl --connect-timeout 60 --max-time 240 --retry 1 --output /usr/local/bin/dstack-runner https://dstack-runner-downloads.s3.eu-west-1.amazonaws.com/${DSTACK_RUNNER_VERSION}/binaries/dstack-runner-linux-amd64 \
     && chmod +x /usr/local/bin/dstack-runner
 
+# Add the jackalope dashboard (standalone binary, no Node needed). Non-fatal if
+# the release isn't published yet — `surogate jackalope` fetches it on first run.
+ARG JACKALOPE_TAG=jackalope-latest
+RUN curl -fsSL "https://github.com/invergent-ai/surogate/releases/download/${JACKALOPE_TAG}/jackalope-linux-x64" \
+      -o /root/.venv/bin/jackalope && chmod +x /root/.venv/bin/jackalope \
+    || echo "jackalope binary not available yet — skipping"
+
 # Default entrypoint
 ENTRYPOINT ["/root/.venv/bin/surogate"]
 CMD ["--help"]

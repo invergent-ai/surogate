@@ -1,0 +1,12 @@
+# dependencies
+node_modules/
+
+# build output (binaries are produced by CI, never committed)
+dist/
+
+# local run / smoke-test artifacts
+test_outputs/
+watch-out/
+
+# scratch
+.pr-body.md
