@@ -1031,8 +1031,7 @@ __global__ void kd_normalize_teacher_topk_kernel(float* q_out,
     const float inv_sum = 1.0f / block_sum;
     for (int k = threadIdx.x; k < K; k += blockDim.x) {
         int id = ids[base + k];
-        q_out[base + k] =
-            (id >= 0 && id < V) ? expf(teacher_logprobs[base + k] * inv_tau - block_max) * inv_sum : 0.0f;
+        q_out[base + k] = (id >= 0 && id < V) ? expf(teacher_logprobs[base + k] * inv_tau - block_max) * inv_sum : 0.0f;
     }
 }
 
@@ -1693,6 +1692,158 @@ void compute_grpo_custom_dloss(float* custom_dloss,
                                                                adv_tau,
                                                                teacher_tau,
                                                                kl_tau);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// --- DPO custom dloss -------------------------------------------------------
+// Reduce one sample's response-token log-prob sums (policy and reference) plus
+// the response-token count. All 256 block threads must call this in lock-step;
+// it is invoked twice per block (chosen then rejected) and reuses the same
+// shared buffers, so a trailing __syncthreads() guards the next invocation.
+__device__ void dpo_reduce_sample(const float* losses,
+                                  const float* ref_logprobs,
+                                  const std::uint8_t* loss_mask,
+                                  int start,
+                                  int end,
+                                  double& s_pol,
+                                  double& s_ref,
+                                  int& len) {
+    __shared__ double sh_pol[256];
+    __shared__ double sh_ref[256];
+    __shared__ int sh_len[256];
+
+    double lp = 0.0;
+    double lr = 0.0;
+    int n = 0;
+    for (int t = start + 1 + static_cast<int>(threadIdx.x); t < end; t += static_cast<int>(blockDim.x)) {
+        if (loss_mask[t] == 0) {
+            continue;
+        }
+        const int out_idx = t - 1;  // shifted layout: trainer_logprob = -losses[out_idx]
+        lp += -static_cast<double>(losses[out_idx]);
+        lr += static_cast<double>(ref_logprobs[out_idx]);
+        n += 1;
+    }
+
+    sh_pol[threadIdx.x] = lp;
+    sh_ref[threadIdx.x] = lr;
+    sh_len[threadIdx.x] = n;
+    __syncthreads();
+
+    for (int stride = static_cast<int>(blockDim.x) / 2; stride > 0; stride >>= 1) {
+        if (static_cast<int>(threadIdx.x) < stride) {
+            sh_pol[threadIdx.x] += sh_pol[threadIdx.x + stride];
+            sh_ref[threadIdx.x] += sh_ref[threadIdx.x + stride];
+            sh_len[threadIdx.x] += sh_len[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    s_pol = sh_pol[0];
+    s_ref = sh_ref[0];
+    len = sh_len[0];
+    __syncthreads();  // all threads finished reading before the next call rewrites shared
+}
+
+__global__ void dpo_custom_dloss_kernel(float* custom_dloss,
+                                        float* metrics,
+                                        const float* losses,
+                                        const float* ref_logprobs,
+                                        const std::uint8_t* loss_mask,
+                                        const std::int32_t* sample_starts,
+                                        const std::int32_t* sample_ends,
+                                        const std::int32_t* pair_chosen,
+                                        const std::int32_t* pair_rejected,
+                                        int pair_count,
+                                        int BT,
+                                        float inv_loss_scale,
+                                        float beta,
+                                        int length_norm) {
+    const int pair = static_cast<int>(blockIdx.x);
+    if (pair >= pair_count) {
+        return;
+    }
+    const int ci = pair_chosen[pair];
+    const int ri = pair_rejected[pair];
+    const int c_start = sample_starts[ci];
+    const int c_end = sample_ends[ci];
+    const int r_start = sample_starts[ri];
+    const int r_end = sample_ends[ri];
+    if (c_start < 0 || c_end > BT || c_start >= c_end || r_start < 0 || r_end > BT || r_start >= r_end) {
+        return;
+    }
+
+    double sc_pol, sc_ref, sr_pol, sr_ref;
+    int len_c, len_r;
+    dpo_reduce_sample(losses, ref_logprobs, loss_mask, c_start, c_end, sc_pol, sc_ref, len_c);
+    dpo_reduce_sample(losses, ref_logprobs, loss_mask, r_start, r_end, sr_pol, sr_ref, len_r);
+
+    const double wc = (length_norm && len_c > 0) ? 1.0 / static_cast<double>(len_c) : 1.0;
+    const double wr = (length_norm && len_r > 0) ? 1.0 / static_cast<double>(len_r) : 1.0;
+    const double margin = static_cast<double>(beta) * ((sc_pol - sc_ref) * wc - (sr_pol - sr_ref) * wr);
+    // g = beta * sigmoid(-margin); custom_dloss = -dL/dlogp_theta = +g*w (chosen) / -g*w (rejected).
+    const double g = static_cast<double>(beta) * (1.0 / (1.0 + exp(margin)));
+
+    for (int t = c_start + 1 + static_cast<int>(threadIdx.x); t < c_end; t += static_cast<int>(blockDim.x)) {
+        if (loss_mask[t] != 0) {
+            custom_dloss[t - 1] = static_cast<float>((g * wc) * static_cast<double>(inv_loss_scale));
+        }
+    }
+    for (int t = r_start + 1 + static_cast<int>(threadIdx.x); t < r_end; t += static_cast<int>(blockDim.x)) {
+        if (loss_mask[t] != 0) {
+            custom_dloss[t - 1] = static_cast<float>((-g * wr) * static_cast<double>(inv_loss_scale));
+        }
+    }
+
+    if (threadIdx.x == 0) {
+        const double loss = -log(1.0 / (1.0 + exp(-margin)));  // -log sigmoid(margin)
+        atomicAdd(metrics + 0, static_cast<float>(loss));
+        atomicAdd(metrics + 1, margin > 0.0 ? 1.0f : 0.0f);
+        atomicAdd(metrics + 2, static_cast<float>(margin));
+        atomicAdd(metrics + 3, 1.0f);
+    }
+}
+
+void compute_dpo_custom_dloss(float* custom_dloss,
+                              float* metrics,
+                              const float* losses,
+                              const float* ref_logprobs,
+                              const std::uint8_t* loss_mask,
+                              const std::int32_t* sample_starts,
+                              const std::int32_t* sample_ends,
+                              const std::int32_t* pair_chosen,
+                              const std::int32_t* pair_rejected,
+                              int pair_count,
+                              int BT,
+                              float loss_scale,
+                              float beta,
+                              int length_norm,
+                              cudaStream_t stream) {
+    if (BT <= 0) {
+        return;
+    }
+    // Zero the full dloss buffer so backward never consumes stale values for the
+    // prompt / padding / final-no-next-token slots the kernel does not write.
+    CUDA_CHECK(cudaMemsetAsync(custom_dloss, 0, static_cast<std::size_t>(BT) * sizeof(float), stream));
+    CUDA_CHECK(cudaMemsetAsync(metrics, 0, 4 * sizeof(float), stream));
+    if (pair_count <= 0) {
+        return;
+    }
+    const float inv_loss_scale = (loss_scale == 0.0f) ? 1.0f : (1.0f / loss_scale);
+    dpo_custom_dloss_kernel<<<pair_count, 256, 0, stream>>>(custom_dloss,
+                                                            metrics,
+                                                            losses,
+                                                            ref_logprobs,
+                                                            loss_mask,
+                                                            sample_starts,
+                                                            sample_ends,
+                                                            pair_chosen,
+                                                            pair_rejected,
+                                                            pair_count,
+                                                            BT,
+                                                            inv_loss_scale,
+                                                            beta,
+                                                            length_norm);
     CUDA_CHECK(cudaGetLastError());
 }
 

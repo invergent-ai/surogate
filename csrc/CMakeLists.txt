@@ -702,6 +702,7 @@ if (BUILD_TESTS OR BUILD_TESTS_INTEGRATION)
     add_executable(integration-tests
         src/testing/utilities/test_main.cpp
         src/testing/distributed/test-nccl.cpp
+        src/testing/kernels/test-dpo-dloss.cu
         src/testing/tokenizer/test-chat-template.cpp
     )
     target_link_libraries(integration-tests PRIVATE
