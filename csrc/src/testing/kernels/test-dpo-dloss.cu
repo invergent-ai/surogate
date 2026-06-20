@@ -137,6 +137,7 @@ void run_case(const DpoCfg& cfg) {
     float* d_metrics = nullptr;
     REQUIRE(cudaMalloc(&d_dloss, BT * sizeof(float)) == cudaSuccess);
     REQUIRE(cudaMalloc(&d_metrics, 4 * sizeof(float)) == cudaSuccess);
+    REQUIRE(cudaMemset(d_metrics, 0, 4 * sizeof(float)) == cudaSuccess);
 
     compute_dpo_custom_dloss(d_dloss,
                              d_metrics,
@@ -224,6 +225,7 @@ TEST_CASE("dpo dloss step-0 identity gives loss log2 and +/- beta/2", "[dpo][ker
     float* d_metrics = nullptr;
     REQUIRE(cudaMalloc(&d_dloss, BT * sizeof(float)) == cudaSuccess);
     REQUIRE(cudaMalloc(&d_metrics, 4 * sizeof(float)) == cudaSuccess);
+    REQUIRE(cudaMemset(d_metrics, 0, 4 * sizeof(float)) == cudaSuccess);
 
     compute_dpo_custom_dloss(d_dloss,
                              d_metrics,

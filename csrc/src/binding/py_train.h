@@ -185,22 +185,21 @@ public:
     std::vector<float> dispatch_pp_forward_hidden(const std::int32_t* inputs);
     std::vector<float> dispatch_pp_forward_subranges(const std::int32_t* inputs, int split_after_block);
     std::vector<float> dispatch_pp_grad_norms_whole(const std::int32_t* inputs, const std::int32_t* targets);
-    std::vector<float> dispatch_pp_grad_norms_subranges(const std::int32_t* inputs,
-                                                              const std::int32_t* targets,
-                                                              int split_after_block);
+    std::vector<float>
+    dispatch_pp_grad_norms_subranges(const std::int32_t* inputs, const std::int32_t* targets, int split_after_block);
     // Round-robin forward dispatch of contiguous block stages [los[i]..his[i]]
     // across the GPU pool (stage i -> GPU i % ngpu), handing the boundary residual
     // GPU->host->GPU between stages. Returns the final hidden state as flat f32.
     std::vector<float> dispatch_pp_forward_hidden_multigpu(const std::int32_t* inputs,
-                                                                 const std::vector<int>& los,
-                                                                 const std::vector<int>& his);
+                                                           const std::vector<int>& los,
+                                                           const std::vector<int>& his);
     // Round-robin backward dispatch (reverse stage order) across the GPU pool,
     // handing the boundary gradients GPU->host->GPU. Returns per-block weight-grad
     // L2 norms collected from whichever GPU computed each block.
     std::vector<float> dispatch_pp_grad_norms_multigpu(const std::int32_t* inputs,
-                                                             const std::int32_t* targets,
-                                                             const std::vector<int>& los,
-                                                             const std::vector<int>& his);
+                                                       const std::int32_t* targets,
+                                                       const std::vector<int>& los,
+                                                       const std::vector<int>& his);
     // Per-GPU weight-residency snapshot (GPU 0; the pool is homogeneous): total
     // device-resident weight bytes, the streaming block double-buffer footprint,
     // and the slot count. Proves the dispatch-PP memory invariant — GPU weight
@@ -209,9 +208,9 @@ public:
     // One full single-GPU dispatch-PP training step (forward -> loss, backward ->
     // grads, optimizer update) through the sub-range executor. Returns the loss.
     float dispatch_pp_train_step(const std::int32_t* inputs,
-                                       const std::int32_t* targets,
-                                       const optimizers::OptimizerConfig& opt_config,
-                                       int step_idx);
+                                 const std::int32_t* targets,
+                                 const optimizers::OptimizerConfig& opt_config,
+                                 int step_idx);
     // One full multi-GPU dispatch-PP training step: round-robin backward dispatch
     // with cross-GPU boundary handoff -> collect per-stage grads -> optimizer on the
     // master replica -> broadcast updated weights to every GPU. Returns the loss.
@@ -220,13 +219,13 @@ public:
     // RoundPipe one-step staleness. Call dispatch_pp_flush_pending at the end to
     // apply the last deferred grads.
     float dispatch_pp_train_step_multigpu(const std::int32_t* inputs,
-                                                const std::int32_t* targets,
-                                                const std::vector<int>& los,
-                                                const std::vector<int>& his,
-                                                const optimizers::OptimizerConfig& opt_config,
-                                                int step_idx,
-                                                bool stale,
-                                                int num_microbatches = 1);
+                                          const std::int32_t* targets,
+                                          const std::vector<int>& los,
+                                          const std::vector<int>& his,
+                                          const optimizers::OptimizerConfig& opt_config,
+                                          int step_idx,
+                                          bool stale,
+                                          int num_microbatches = 1);
     // Grad norm computed by the last dispatch_pp optimizer apply (for the loss display).
     float dispatch_pp_last_grad_norm() const {
         return mDispatchPpLastGradNorm;
@@ -309,6 +308,34 @@ public:
     // local, mirroring get_grpo_native_metrics). Consumes the accumulator on
     // every rank.
     float get_kd_loss();
+    // Offline DPO micro-step. Per-token arrays (ref_logprobs / loss_mask) and the
+    // sample/pair arrays follow the same GrpoHostLayout sharding as
+    // step_grpo_native; pair arrays shard together with the sample arrays
+    // (sample_rows). Each pair row holds `pair_count` entries padded with -1.
+    void step_dpo_native(const std::int32_t* inputs,
+                         const std::int32_t* targets,
+                         const float* ref_logprobs,
+                         const std::uint8_t* loss_mask,
+                         const std::int32_t* sample_starts,
+                         const std::int32_t* sample_ends,
+                         int sample_count,
+                         const std::int32_t* pair_chosen,
+                         const std::int32_t* pair_rejected,
+                         int pair_count,
+                         const std::int32_t* position_ids,
+                         float loss_scale,
+                         float beta,
+                         int length_norm,
+                         GrpoHostLayout layout);
+    std::unordered_map<std::string, float> get_dpo_native_metrics();
+
+    // DPO reference log-probs via the fused-loss forward (fp8/multi-GPU-safe).
+    // `inputs`/`targets`/`position_ids` are [host_rows*B, T] (one B-block per host
+    // batch row). Returns logprobs for ALL host rows, [host_rows*B*T] in row order.
+    std::vector<float> compute_ref_logprobs_dpo(const std::int32_t* inputs,
+                                                const std::int32_t* targets,
+                                                const std::int32_t* position_ids,
+                                                int input_rows);
 
 private:
     std::unique_ptr<PretrainedConfig> mConfig;  // unique_ptr to preserve polymorphism
@@ -390,7 +417,8 @@ private:
     // the updated weights to every replica. opt_step_1based is the Adam step index.
     void dispatch_pp_apply_grads_(const std::vector<std::pair<std::string, std::vector<std::byte>>>& collected,
                                   const optimizers::OptimizerConfig& opt_config,
-                                  int opt_step_1based, int valid_tokens);
+                                  int opt_step_1based,
+                                  int valid_tokens);
     // dispatch-PP one-step-stale state: gradients deferred from the previous step,
     // and the count of optimizer updates applied so far (1-based Adam step).
     std::vector<std::pair<std::string, std::vector<std::byte>>> mDispatchPpPendingGrads;

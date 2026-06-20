@@ -1824,8 +1824,9 @@ void compute_dpo_custom_dloss(float* custom_dloss,
     }
     // Zero the full dloss buffer so backward never consumes stale values for the
     // prompt / padding / final-no-next-token slots the kernel does not write.
+    // metrics is NOT reset here: the kernel atomicAdds across micro-steps and the
+    // caller resets it once per optimizer step (step_dpo_native, micro_step 0).
     CUDA_CHECK(cudaMemsetAsync(custom_dloss, 0, static_cast<std::size_t>(BT) * sizeof(float), stream));
-    CUDA_CHECK(cudaMemsetAsync(metrics, 0, 4 * sizeof(float), stream));
     if (pair_count <= 0) {
         return;
     }

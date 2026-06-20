@@ -1077,6 +1077,10 @@ void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {
         mAllocator->allocate(ETensorDType::INT32, "grpo_sample_starts", EAllocationType::ON_DEVICE, {BT});
     mGrpoNativeScratch.sample_ends =
         mAllocator->allocate(ETensorDType::INT32, "grpo_sample_ends", EAllocationType::ON_DEVICE, {BT});
+    mGrpoNativeScratch.pair_chosen =
+        mAllocator->allocate(ETensorDType::INT32, "grpo_pair_chosen", EAllocationType::ON_DEVICE, {BT});
+    mGrpoNativeScratch.pair_rejected =
+        mAllocator->allocate(ETensorDType::INT32, "grpo_pair_rejected", EAllocationType::ON_DEVICE, {BT});
     mGrpoNativeScratch.custom_dloss =
         mAllocator->allocate(ETensorDType::FP32, "grpo_custom_dloss", EAllocationType::ON_DEVICE, {BT});
     mGrpoNativeScratch.inv_temperature =
@@ -1118,6 +1122,15 @@ void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {
                                                                          ("grpo_host_sample_ends_" + suffix).c_str(),
                                                                          EAllocationType::PINNED,
                                                                          {BT});
+        mGrpoNativeScratch.host_pair_chosen[slot] = mAllocator->allocate(ETensorDType::INT32,
+                                                                         ("grpo_host_pair_chosen_" + suffix).c_str(),
+                                                                         EAllocationType::PINNED,
+                                                                         {BT});
+        mGrpoNativeScratch.host_pair_rejected[slot] =
+            mAllocator->allocate(ETensorDType::INT32,
+                                 ("grpo_host_pair_rejected_" + suffix).c_str(),
+                                 EAllocationType::PINNED,
+                                 {BT});
     }
 
     // Encoder backward scratch buffers - skip in LoRA-only mode since embedding backward is skipped entirely
