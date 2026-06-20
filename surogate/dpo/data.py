@@ -176,12 +176,18 @@ def precompute_ref_logprobs(trainer, batch: PrefBatch, engine_b: int, host_rows:
     """Reference per-token log-probs of the frozen start checkpoint, in the shifted
     layout (ref[k, j] = logprob of token j+1).
 
+    WARNING — batch-invariant recipes only (e.g. bf16). NOT used by the DPO trainer,
+    which computes the reference INLINE per micro-step (see surogate/dpo/trainer.py).
+    Offline precompute is INCORRECT under fp8-hybrid: fp8 derives the activation scale
+    from the current batch's amax, so these fixed sequential chunks scale each pair
+    differently from the training loop's reshuffled batches → a spurious nonzero margin
+    at init. Kept only for batch-invariant (bf16) experiments / debugging.
+
     Uses `trainer.compute_ref_logprobs_dpo` — the SAME fused-loss forward that
-    `step_dpo_native` runs (fp8- and multi-GPU-safe), with no backward. It must be
-    called BEFORE any optimizer step: LoRA B is zero-initialised, so at init the
-    adapter contributes nothing and the forward equals the start checkpoint = π_ref.
-    Rows are fed in fixed `[host_rows * engine_b, max_len]` chunks (one B-block per
-    data-parallel rank); a short final chunk is padded and its extra rows discarded.
+    `step_dpo_native` runs, with no backward. Must be called BEFORE any optimizer step:
+    LoRA B is zero-initialised, so at init the adapter contributes nothing and the
+    forward equals the start checkpoint = π_ref. Rows are fed in fixed
+    `[host_rows * engine_b, max_len]` chunks (one B-block per data-parallel rank).
     """
     n_seq, max_len = batch.input_ids.shape
     chunk = engine_b * max(1, host_rows)

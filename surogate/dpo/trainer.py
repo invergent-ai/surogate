@@ -1,12 +1,21 @@
 """Offline DPO trainer.
 
 Static (prompt, chosen, rejected) pairs are tokenized one sequence per row
-(surogate/dpo/data.py); a reference forward of the frozen start checkpoint
-(LoRA disabled) is precomputed once and cached. Each optimizer step runs
-`grad_accum` micro-steps; each micro-step feeds `ngpu` host rows (distinct pairs
-per GPU = data-parallel sharding), every host row holding B sequences = B/2
-atomic pairs. step_dpo_native computes the sigmoid-DPO gradient natively and
-backpropagates; the optimizer then updates the LoRA adapter.
+(surogate/dpo/data.py). Each optimizer step runs `grad_accum` micro-steps; each
+micro-step feeds `ngpu` host rows (distinct pairs per GPU = data-parallel
+sharding), every host row holding B sequences = B/2 atomic pairs. step_dpo_native
+computes the sigmoid-DPO gradient natively and backpropagates; the optimizer then
+updates the LoRA adapter.
+
+Reference log-probs (frozen start checkpoint, LoRA disabled) are computed INLINE
+per micro-step on the EXACT same rows as the policy forward, not precomputed
+offline. This is required for fp8: fp8-hybrid derives the activation scale from
+the current batch's amax, so a sequence's log-probs depend on its batch-mates. An
+offline pass (fixed sequential chunks) and the training loop (reshuffled batches)
+would scale the same pair differently → a spurious nonzero margin at init (where
+π_θ == π_ref). Computing the reference in the same micro-batch makes both forwards
+share the identical scale, so at init the margin is exactly 0 (loss = log 2) under
+fp8 and bf16 alike. Cost: one extra (no-backward) forward per micro-step.
 
 No rollouts, no inference engine — purely offline.
 """
@@ -19,14 +28,7 @@ import numpy as np
 
 from surogate import _surogate
 from surogate.dpo.config import DPOTrainConfig
-from surogate.dpo.data import (
-    load_ref_sidecar,
-    precompute_ref_logprobs,
-    rows_digest,
-    save_ref_sidecar,
-    sidecar_hash,
-    tokenize_preference_pairs,
-)
+from surogate.dpo.data import tokenize_preference_pairs
 from surogate.train.lr_schedule import LRSchedule
 from surogate.utils.hf import get_model_weights_path
 from surogate.utils.logger import get_logger
@@ -65,7 +67,6 @@ def _gpu_batch(pair_idx: list[int], batch, T: int):
     targets = batch.targets[seq_rows]
     position_ids = batch.position_ids[seq_rows]
     loss_mask = batch.loss_mask[seq_rows].reshape(-1)  # [B*T]
-    ref = batch.ref[seq_rows].reshape(-1)  # [B*T]
     sample_starts = np.array([i * T for i in range(B)], dtype=np.int32)
     sample_ends = np.array([i * T + int(batch.seq_len[seq_rows[i]]) for i in range(B)], dtype=np.int32)
     pair_chosen = np.array([2 * k for k in range(len(pair_idx))], dtype=np.int32)
@@ -75,7 +76,6 @@ def _gpu_batch(pair_idx: list[int], batch, T: int):
         "targets": targets.astype(np.int32),
         "position_ids": position_ids.astype(np.int32),
         "loss_mask": loss_mask.astype(np.uint8),
-        "ref": ref.astype(np.float32),
         "sample_starts": sample_starts,
         "sample_ends": sample_ends,
         "pair_chosen": pair_chosen,
@@ -128,20 +128,10 @@ def dpo_main(config: DPOTrainConfig, args=None) -> None:
     rows = _load_pref_rows(config.datasets[0].path)
     batch = tokenize_preference_pairs(rows, config.tokenizer, max_len=T)
     logger.info(f"Tokenized {batch.n_pairs} preference pairs (from {len(rows)} rows)")
-
-    # --- reference logprobs (frozen start model), cached in a sidecar -------
-    sidecar_path = str(Path(config.output_dir) / "ref_logprobs.npz")
     Path(config.output_dir).mkdir(parents=True, exist_ok=True)
-    key = sidecar_hash(model=config.model_dir, max_len=T, n_rows=len(rows), rows_digest=rows_digest(rows))
-    ref = load_ref_sidecar(sidecar_path, key)
-    if ref is None or ref.shape[0] != batch.n_seq:
-        logger.info("Precomputing reference logprobs (LoRA disabled)...")
-        ref = precompute_ref_logprobs(trainer, batch, engine_b=B, host_rows=ngpu)
-        save_ref_sidecar(sidecar_path, key, ref)
-        logger.info(f"Reference logprobs cached -> {sidecar_path}")
-    else:
-        logger.info(f"Loaded cached reference logprobs <- {sidecar_path}")
-    batch.ref = ref  # attach for _gpu_batch
+    # Reference log-probs are computed INLINE per micro-step (see module docstring):
+    # the frozen-ref forward must share the policy step's exact batch so fp8's
+    # current-batch activation scaling produces a matching scale (margin == 0 at init).
 
     # --- schedule ----------------------------------------------------------
     pairs_per_step = pairs_per_gpu * ngpu * int(config.gradient_accumulation_steps)
@@ -197,8 +187,16 @@ def dpo_main(config: DPOTrainConfig, args=None) -> None:
             pos_step = np.concatenate([gb["position_ids"] for gb in gpu_batches], axis=0)
             targets_step = np.concatenate([gb["targets"] for gb in gpu_batches], axis=0)
 
+            # Frozen reference (LoRA disabled) on the SAME rows/scale as the policy
+            # forward below — fp8-correct (see module docstring). [ngpu*B, T] row order
+            # matches input_step, so reshaping to [ngpu, B*T] aligns with the per-GPU layout.
+            ref_2d = np.asarray(
+                trainer.compute_ref_logprobs_dpo(input_step, targets_step, position_ids=pos_step),
+                dtype=np.float32,
+            )  # [ngpu*B, T]
+
             if ngpu > 1:
-                ref_step = np.stack([gb["ref"] for gb in gpu_batches])  # [ngpu, B*T]
+                ref_step = ref_2d.reshape(ngpu, B * T)  # [ngpu, B*T]
                 loss_mask_step = np.stack([gb["loss_mask"] for gb in gpu_batches])
                 sample_starts = np.stack([gb["sample_starts"] for gb in gpu_batches])  # [ngpu, B]
                 sample_ends = np.stack([gb["sample_ends"] for gb in gpu_batches])
@@ -206,7 +204,7 @@ def dpo_main(config: DPOTrainConfig, args=None) -> None:
                 pair_rejected = np.stack([gb["pair_rejected"] for gb in gpu_batches])
             else:
                 gb = gpu_batches[0]
-                ref_step = gb["ref"]
+                ref_step = ref_2d.reshape(B * T)
                 loss_mask_step = gb["loss_mask"]
                 sample_starts = gb["sample_starts"]
                 sample_ends = gb["sample_ends"]

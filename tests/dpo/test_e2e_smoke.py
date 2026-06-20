@@ -22,7 +22,8 @@ MODEL = "ro/train/out_opmix_wordform_s50_a010_eval"
 
 
 @pytest.mark.slow
-def test_dpo_end_to_end(tmp_path):
+@pytest.mark.parametrize("recipe", ["bf16", "fp8-hybrid"])
+def test_dpo_end_to_end(tmp_path, recipe):
     data = tmp_path / "pairs.jsonl"
     with open(data, "w", encoding="utf-8") as f:
         for _ in range(8):
@@ -47,7 +48,11 @@ def test_dpo_end_to_end(tmp_path):
                 "lora_rank": 8,
                 "lora_alpha": 16,
                 "lora_target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-                "recipe": "bf16",
+                # Both recipes must hit the step-0 identity below. fp8-hybrid is the
+                # regression guard for the inline-reference fix: its current-batch
+                # activation scaling only agrees with the policy forward because the
+                # reference is computed in the SAME micro-batch (not precomputed offline).
+                "recipe": recipe,
                 "optimizer": "adamw_8bit",
                 "learning_rate": 5.0e-7,
                 "lr_scheduler_type": "constant",
