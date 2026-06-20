@@ -136,7 +136,7 @@ def dpo_main(config: DPOTrainConfig, args=None) -> None:
     ref = load_ref_sidecar(sidecar_path, key)
     if ref is None or ref.shape[0] != batch.n_seq:
         logger.info("Precomputing reference logprobs (LoRA disabled)...")
-        ref = precompute_ref_logprobs(trainer, batch, engine_b=B)
+        ref = precompute_ref_logprobs(trainer, batch, engine_b=B, host_rows=ngpu)
         save_ref_sidecar(sidecar_path, key, ref)
         logger.info(f"Reference logprobs cached -> {sidecar_path}")
     else:

@@ -172,30 +172,30 @@ def sidecar_hash(
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
 
 
-def precompute_ref_logprobs(trainer, batch: PrefBatch, engine_b: int) -> np.ndarray:
+def precompute_ref_logprobs(trainer, batch: PrefBatch, engine_b: int, host_rows: int = 1) -> np.ndarray:
     """Reference per-token log-probs of the frozen start checkpoint, in the shifted
     layout (ref[k, j] = logprob of token j+1).
 
-    Uses `trainer.forward_for_grpo` (the regular training forward, which — unlike
-    `compute_logprobs`'s forward-only path — is correct for the Qwen3.5 gated
-    DeltaNet ops). It must be called BEFORE any optimizer step: LoRA B is
-    zero-initialised, so at init the adapter contributes nothing and the forward
-    equals the start checkpoint = π_ref. Rows are fed in fixed [engine_b, max_len]
-    chunks (the engine's static batch shape); a short final chunk is padded and its
-    extra rows discarded.
+    Uses `trainer.compute_ref_logprobs_dpo` — the SAME fused-loss forward that
+    `step_dpo_native` runs (fp8- and multi-GPU-safe), with no backward. It must be
+    called BEFORE any optimizer step: LoRA B is zero-initialised, so at init the
+    adapter contributes nothing and the forward equals the start checkpoint = π_ref.
+    Rows are fed in fixed `[host_rows * engine_b, max_len]` chunks (one B-block per
+    data-parallel rank); a short final chunk is padded and its extra rows discarded.
     """
     n_seq, max_len = batch.input_ids.shape
+    chunk = engine_b * max(1, host_rows)
     ref = np.zeros((n_seq, max_len), dtype=np.float32)
-    for start in range(0, n_seq, engine_b):
-        end = min(start + engine_b, n_seq)
+    for start in range(0, n_seq, chunk):
+        end = min(start + chunk, n_seq)
         rows = end - start
-        ids = np.zeros((engine_b, max_len), dtype=np.int32)
-        tgt = np.zeros((engine_b, max_len), dtype=np.int32)
-        pos = np.zeros((engine_b, max_len), dtype=np.int32)
+        ids = np.zeros((chunk, max_len), dtype=np.int32)
+        tgt = np.zeros((chunk, max_len), dtype=np.int32)
+        pos = np.zeros((chunk, max_len), dtype=np.int32)
         ids[:rows] = batch.input_ids[start:end]
         tgt[:rows] = batch.targets[start:end]
         pos[:rows] = batch.position_ids[start:end]
-        out = trainer.forward_for_grpo(ids, tgt, position_ids=pos)
+        out = trainer.compute_ref_logprobs_dpo(ids, tgt, position_ids=pos)
         ref[start:end] = np.asarray(out, dtype=np.float32)[:rows]
     return ref
 
