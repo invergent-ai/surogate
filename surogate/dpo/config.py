@@ -44,10 +44,15 @@ class DPOTrainConfig(SFTConfig):
 
     def __init__(self, cfg: DictDefault):
         # The DPO per-token gradient is beta * sigmoid(-margin) * (softmax - 1{target}),
-        # typically far smaller than an SFT gradient — keep fp32 master/grad so BF16
-        # rounding does not swamp the preference signal (mirrors GRPO).
-        if "master_dtype" not in cfg:
-            cfg["master_dtype"] = "fp32"
+        # far smaller than an SFT gradient, so keep the trainable parameters in fp32 to
+        # avoid BF16 rounding swamping the signal. This is a LoRA-only run (the base is
+        # frozen), so precision must come from the *adapter*, not a full-model master:
+        #   - lora_dtype defaults to "fp32" -> the trainable LoRA weights are fp32.
+        #   - gradient_dtype=fp32 -> the (tiny) LoRA gradients are fp32.
+        # Do NOT force master_dtype=fp32: it would allocate an fp32 copy of the entire
+        # frozen base (~2x the model, e.g. +9 GB for a 2B) in the persistent arena for
+        # no benefit, and that waste is what tipped fp8-hybrid / multi-GPU / large-batch
+        # runs into spurious arena OOMs at trainer construction.
         if "gradient_dtype" not in cfg:
             cfg["gradient_dtype"] = "fp32"
 
