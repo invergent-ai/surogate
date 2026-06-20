@@ -54,14 +54,14 @@ def test_dpo_end_to_end(tmp_path, recipe):
                 # reference is computed in the SAME micro-batch (not precomputed offline).
                 "recipe": recipe,
                 "optimizer": "adamw_8bit",
-                "learning_rate": 5.0e-7,
+                "learning_rate": 1.0e-4,  # aggressive: drive the margin off 0 within a few steps
                 "lr_scheduler_type": "constant",
                 "gpus": 1,
                 "per_device_train_batch_size": 2,
                 "gradient_accumulation_steps": 1,
                 "sequence_len": 256,
-                "max_steps": 3,
-                "save_steps": 2,
+                "max_steps": 24,
+                "save_steps": 12,
                 "logging_steps": 1,
                 "output_dir": str(out),
                 "surogate_metrics_path": str(out / "metrics.jsonl"),
@@ -80,10 +80,20 @@ def test_dpo_end_to_end(tmp_path, recipe):
     log = r.stdout + r.stderr
     assert r.returncode == 0, log[-4000:]
 
-    # step-0 identity: pi_theta == pi_ref => dpo_loss == log 2.
     metrics = [json.loads(line) for line in (out / "metrics.jsonl").read_text().splitlines() if line.strip()]
+
+    # (1) step-0 identity: LoRA is zero-init so pi_theta == pi_ref => margin 0, dpo_loss == log 2.
     step0 = next(m for m in metrics if m["step"] == 0)
     assert abs(step0["dpo_loss"] - 0.6931) < 5e-3, step0
+
+    # (2) the reference must be FROZEN, not tracking the policy. As the policy LoRA diverges
+    # the margin must move off 0 and the loss drop below log 2. A ref-tracks-policy bug
+    # (compute_ref_logprobs running the live LoRA-on forward) pins margin == 0 every step
+    # forever — nonzero grad_norm but zero learning — which step-0-only checks cannot catch.
+    margins = [abs(m["dpo_margin"]) for m in metrics]
+    assert max(margins) > 0.05, f"DPO margin never separated from 0 (frozen ref broken?): {margins}"
+    late_loss = min(m["dpo_loss"] for m in metrics if m["step"] >= len(metrics) // 2)
+    assert late_loss < 0.6931, f"DPO loss never dropped below log 2 (no learning signal): {late_loss}"
 
     assert (out / "final_adapter").is_dir()
     # save_checkpoint writes output_dir/step_{:08} (the convention `surogate merge` consumes).
