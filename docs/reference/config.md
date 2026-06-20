@@ -264,7 +264,7 @@ Each dataset in the `datasets` or `validation_datasets` list is configured with 
 | Option    | Type   | Default   | Description                                                                                                          |
 | --------- | ------ | --------- | -------------------------------------------------------------------------------------------------------------------- |
 | `path`    | string | required  | HuggingFace dataset repo, s3:// URL, gs:// URL, or path to local file or directory.                                  |
-| `type`    | string | required  | Dataset type. Options: `"text"`, `"instruction"`, `"conversation"`, `"auto"` (auto-detect format).                   |
+| `type`    | string | required  | Dataset type. Options: `"text"`, `"instruction"`, `"conversation"`, `"preference"` (DPO), `"auto"` (auto-detect format). |
 | `subset`  | string | `null`    | HuggingFace dataset subset/configuration name to load (e.g., `"default"` for datasets with multiple configurations). |
 | `split`   | string | `"train"` | Dataset split to load. Common values: `"train"`, `"test"`, `"validation"`.                                           |
 | `samples` | int    | `null`    | Limit the number of samples to use from this dataset. If not specified, uses all available samples.                  |
@@ -333,6 +333,55 @@ datasets:
 	messages_field: messages
 	split: train_sft
 ```
+
+#### Preference Dataset Options (`type: "preference"`)
+
+For offline DPO. Each JSONL row has exactly three fields — `prompt` (a string or a
+chat `messages` list), `chosen`, and `rejected` (the two competing assistant
+continuations). Loss is applied only on the response tokens. Used by the
+`surogate dpo` command together with the [DPO loss block](#dpo-settings).
+
+```json
+{"prompt": "...", "chosen": "preferred response", "rejected": "dispreferred response"}
+```
+
+**Example:**
+```yaml
+datasets:
+  - path: ./pairs.jsonl
+	type: preference
+```
+
+## DPO Settings
+
+Direct Preference Optimization (the `surogate dpo` command). Offline: a static set
+of `{prompt, chosen, rejected}` pairs (`type: preference`) with the reference model
+(the start checkpoint) captured once and cached — no reward model, no rollouts. See
+[Training Modes](../getting-started/training-modes.md) and
+[Quickstart: DPO](../getting-started/quickstart-dpo.md).
+
+Configured under a nested `loss:` block:
+
+| Option        | Type   | Default | Description                                                                                          |
+| ------------- | ------ | ------- | ---------------------------------------------------------------------------------------------------- |
+| `type`        | string | `"dpo"` | Loss type. Must be `"dpo"`.                                                                          |
+| `dpo_beta`    | float  | `0.1`   | KL temperature β. The implicit reward is `β · (logπθ − logπref)`; higher β pushes harder from the reference. |
+| `length_norm` | bool   | `false` | Divide each response's log-prob sum by its length (SimPO-style). Leave off for minimal/equal-length pairs. |
+
+**Example:**
+```yaml
+loss:
+  type: dpo
+  dpo_beta: 0.1
+  length_norm: false
+datasets:
+  - path: ./pairs.jsonl
+	type: preference
+```
+
+DPO inherits all LoRA, recipe, optimizer, and training-loop settings from the SFT
+config; `master_dtype`/`gradient_dtype` default to `fp32` (the preference gradient is
+small) and CUDA graphs are disabled (the native DPO step is not graph-captured).
 
 ## Memory Optimization Settings
 

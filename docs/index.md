@@ -100,6 +100,7 @@ Follow these guides to run your first training:
 - [Quickstart: SFT](getting-started/quickstart-sft.md)
 - [Quickstart: Pre-training](getting-started/quickstart-pretraining.md)
 - [Quickstart: GRPO](getting-started/quickstart-grpo.md)
+- [Quickstart: DPO](getting-started/quickstart-dpo.md)
 
 ## Hardware / Requirements
 
