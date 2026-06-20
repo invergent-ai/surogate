@@ -41,6 +41,7 @@ logger = get_logger()
 
 COMMAND_MAPPING: dict[str, str] = {
     "sft": "surogate.cli.sft",
+    "dpo": "surogate.cli.dpo",
     "pt": "surogate.cli.pt",
     "grpo": "surogate.cli.grpo",
     "grpo-colocate": "surogate.cli.grpo_colocate",
@@ -82,6 +83,11 @@ def parse_args():
     from surogate.cli.sft import prepare_command_parser as sft_prepare_command_parser
 
     sft_prepare_command_parser(subparsers.add_parser("sft", help="Supervised Fine-Tuning"))
+
+    # dpo command
+    from surogate.cli.dpo import prepare_command_parser as dpo_prepare_command_parser
+
+    dpo_prepare_command_parser(subparsers.add_parser("dpo", help="Direct Preference Optimization (offline)"))
 
     # pretrain command
     from surogate.cli.pt import prepare_command_parser as pt_prepare_command_parser
@@ -160,16 +166,23 @@ def parse_args():
     # jackalope is intercepted before argparse (see maybe_exec_jackalope); this
     # entry exists only so it shows up in `surogate --help`. add_help=False so its
     # own `--help` passes through to the dashboard binary.
-    subparsers.add_parser(
-        "jackalope", help="Launch the jackalope live-training dashboard (TUI)", add_help=False
-    )
+    subparsers.add_parser("jackalope", help="Launch the jackalope live-training dashboard (TUI)", add_help=False)
 
     args = parser.parse_args(sys.argv[1:])
     if args.command is None:
         parser.print_help()
         sys.exit(1)
 
-    commands_with_config = ["sft", "pt", "grpo_train", "grpo_infer", "grpo_orch", "tokenize", "distill-capture"]
+    commands_with_config = [
+        "sft",
+        "dpo",
+        "pt",
+        "grpo_train",
+        "grpo_infer",
+        "grpo_orch",
+        "tokenize",
+        "distill-capture",
+    ]
     if args.command in commands_with_config and not getattr(args, "config", None):
         parser.print_help()
         sys.exit(1)

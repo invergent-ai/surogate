@@ -41,6 +41,7 @@ class PrefBatch:
     loss_mask: np.ndarray  # uint8 [2*n_pairs, max_len]
     position_ids: np.ndarray  # int32 [2*n_pairs, max_len]
     seq_len: np.ndarray  # int32 [2*n_pairs] real (unpadded) length per row
+    ref: np.ndarray | None = None  # float32 [2*n_pairs, max_len] reference logprobs (filled by precompute)
 
     @property
     def n_seq(self) -> int:
@@ -172,13 +173,16 @@ def sidecar_hash(
 
 
 def precompute_ref_logprobs(trainer, batch: PrefBatch, engine_b: int) -> np.ndarray:
-    """Reference per-token log-probs (LoRA disabled => the start checkpoint) for
-    every sequence, in the shifted layout (ref[k, j] = logprob of token j+1).
+    """Reference per-token log-probs of the frozen start checkpoint, in the shifted
+    layout (ref[k, j] = logprob of token j+1).
 
-    `trainer` is a low-level `_surogate.SurogateTrainer` exposing
-    `compute_logprobs(input_ids, targets, use_lora, position_ids)`. Rows are fed in
-    fixed [engine_b, max_len] chunks (the engine's static batch shape); a short
-    final chunk is padded and its extra rows discarded.
+    Uses `trainer.forward_for_grpo` (the regular training forward, which — unlike
+    `compute_logprobs`'s forward-only path — is correct for the Qwen3.5 gated
+    DeltaNet ops). It must be called BEFORE any optimizer step: LoRA B is
+    zero-initialised, so at init the adapter contributes nothing and the forward
+    equals the start checkpoint = π_ref. Rows are fed in fixed [engine_b, max_len]
+    chunks (the engine's static batch shape); a short final chunk is padded and its
+    extra rows discarded.
     """
     n_seq, max_len = batch.input_ids.shape
     ref = np.zeros((n_seq, max_len), dtype=np.float32)
@@ -191,7 +195,7 @@ def precompute_ref_logprobs(trainer, batch: PrefBatch, engine_b: int) -> np.ndar
         ids[:rows] = batch.input_ids[start:end]
         tgt[:rows] = batch.targets[start:end]
         pos[:rows] = batch.position_ids[start:end]
-        out = trainer.compute_logprobs(ids, tgt, use_lora=False, position_ids=pos)
+        out = trainer.forward_for_grpo(ids, tgt, position_ids=pos)
         ref[start:end] = np.asarray(out, dtype=np.float32)[:rows]
     return ref
 

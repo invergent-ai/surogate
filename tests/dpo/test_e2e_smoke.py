@@ -1,0 +1,87 @@
+"""End-to-end DPO smoke test (Tasks 6+7): `surogate dpo <yaml>` runs a real
+2B-LoRA offline DPO over a handful of minimal pairs and:
+  - exits 0,
+  - logs step-0 dpo_loss ~= log 2 = 0.693 (pi_theta == pi_ref at LoRA init),
+  - writes a step checkpoint + a final adapter.
+
+Needs a GPU and the frontier model on disk, so it is marked slow.
+"""
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+import pytest
+import yaml
+
+SUROGATE = shutil.which("surogate") or os.path.join(os.path.dirname(sys.executable), "surogate")
+
+MODEL = "ro/train/out_opmix_wordform_s50_a010_eval"
+
+
+@pytest.mark.slow
+def test_dpo_end_to_end(tmp_path):
+    data = tmp_path / "pairs.jsonl"
+    with open(data, "w", encoding="utf-8") as f:
+        for _ in range(8):
+            f.write(
+                json.dumps(
+                    {
+                        "prompt": "Scrie corect în limba română.",
+                        "chosen": "Ei mergeau acasă obosiți.",
+                        "rejected": "Ei mergerăm acasă obosiți.",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+    out = tmp_path / "out"
+    cfg = tmp_path / "dpo.yaml"
+    cfg.write_text(
+        yaml.safe_dump(
+            {
+                "model": MODEL,
+                "lora": True,
+                "lora_rank": 8,
+                "lora_alpha": 16,
+                "lora_target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+                "recipe": "bf16",
+                "optimizer": "adamw_8bit",
+                "learning_rate": 5.0e-7,
+                "lr_scheduler_type": "constant",
+                "gpus": 1,
+                "per_device_train_batch_size": 2,
+                "gradient_accumulation_steps": 1,
+                "sequence_len": 256,
+                "max_steps": 3,
+                "save_steps": 2,
+                "logging_steps": 1,
+                "output_dir": str(out),
+                "surogate_metrics_path": str(out / "metrics.jsonl"),
+                "loss": {"type": "dpo", "dpo_beta": 0.1, "length_norm": False},
+                "datasets": [{"path": str(data), "type": "preference"}],
+            }
+        )
+    )
+
+    r = subprocess.run(
+        [SUROGATE, "dpo", str(cfg)],
+        capture_output=True,
+        text=True,
+        timeout=1800,
+    )
+    log = r.stdout + r.stderr
+    assert r.returncode == 0, log[-4000:]
+
+    # step-0 identity: pi_theta == pi_ref => dpo_loss == log 2.
+    metrics = [json.loads(line) for line in (out / "metrics.jsonl").read_text().splitlines() if line.strip()]
+    step0 = next(m for m in metrics if m["step"] == 0)
+    assert abs(step0["dpo_loss"] - 0.6931) < 5e-3, step0
+
+    assert (out / "final_adapter").is_dir()
+    # save_checkpoint writes output_dir/step_{:08} (the convention `surogate merge` consumes).
+    ckpts = list(out.glob("step_*"))
+    assert ckpts, "no step checkpoint written"
+    assert (ckpts[0] / "adapter_model.safetensors").is_file()
