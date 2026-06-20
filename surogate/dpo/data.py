@@ -18,6 +18,8 @@ Engine conventions (must match step_dpo_native / the dpo_dloss kernel):
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -131,3 +133,86 @@ def tokenize_preference_pairs(rows: list[dict], tok, max_len: int, pad_id: int |
         position_ids=position_ids,
         seq_len=seq_len,
     )
+
+
+# --- Reference log-prob precompute + sidecar cache --------------------------
+# DPO needs the frozen start model's per-token log-probs for both chosen and
+# rejected. They depend only on (start model, tokenization layout), so we compute
+# them ONCE and cache to a sidecar. The cache key must change whenever anything
+# upstream changes (model, max_len, prompt rendering, or the rows themselves) so a
+# stale sidecar can never silently feed wrong references into training.
+
+RENDER_VERSION = 1  # bump if _render / _layout_sequence semantics change
+
+
+def rows_digest(rows: list[dict]) -> str:
+    """Stable digest of the preference rows (order-sensitive)."""
+    h = hashlib.sha256()
+    for r in rows:
+        h.update(
+            json.dumps(
+                [r.get("prompt"), r.get("chosen"), r.get("rejected")], ensure_ascii=False, sort_keys=True
+            ).encode("utf-8")
+        )
+    return h.hexdigest()[:16]
+
+
+def sidecar_hash(
+    *, model: str, max_len: int, n_rows: int, rows_digest: str = "", render_version: int = RENDER_VERSION
+) -> str:
+    """Cache key for a reference-logprob sidecar."""
+    payload = {
+        "model": model,
+        "max_len": max_len,
+        "n_rows": n_rows,
+        "rows_digest": rows_digest,
+        "render_version": render_version,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+
+
+def precompute_ref_logprobs(trainer, batch: PrefBatch, engine_b: int) -> np.ndarray:
+    """Reference per-token log-probs (LoRA disabled => the start checkpoint) for
+    every sequence, in the shifted layout (ref[k, j] = logprob of token j+1).
+
+    `trainer` is a low-level `_surogate.SurogateTrainer` exposing
+    `compute_logprobs(input_ids, targets, use_lora, position_ids)`. Rows are fed in
+    fixed [engine_b, max_len] chunks (the engine's static batch shape); a short
+    final chunk is padded and its extra rows discarded.
+    """
+    n_seq, max_len = batch.input_ids.shape
+    ref = np.zeros((n_seq, max_len), dtype=np.float32)
+    for start in range(0, n_seq, engine_b):
+        end = min(start + engine_b, n_seq)
+        rows = end - start
+        ids = np.zeros((engine_b, max_len), dtype=np.int32)
+        tgt = np.zeros((engine_b, max_len), dtype=np.int32)
+        pos = np.zeros((engine_b, max_len), dtype=np.int32)
+        ids[:rows] = batch.input_ids[start:end]
+        tgt[:rows] = batch.targets[start:end]
+        pos[:rows] = batch.position_ids[start:end]
+        out = trainer.compute_logprobs(ids, tgt, use_lora=False, position_ids=pos)
+        ref[start:end] = np.asarray(out, dtype=np.float32)[:rows]
+    return ref
+
+
+def save_ref_sidecar(path: str, key: str, ref: np.ndarray) -> None:
+    np.savez(path, key=np.array(key), ref=ref.astype(np.float32))
+
+
+def load_ref_sidecar(path: str, expected_key: str) -> np.ndarray | None:
+    """Return cached reference logprobs if the sidecar matches `expected_key`,
+    else None (caller recomputes). Returns None on any read error."""
+    import os
+
+    if not os.path.exists(path):
+        return None
+    try:
+        data = np.load(path, allow_pickle=False)
+        if str(data["key"]) != expected_key:
+            logger.warning("DPO ref sidecar key mismatch (%s); recomputing", path)
+            return None
+        return data["ref"]
+    except (OSError, ValueError, KeyError) as exc:
+        logger.warning("DPO ref sidecar unreadable (%s: %s); recomputing", path, exc)
+        return None
