@@ -760,16 +760,28 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         # so the full model never sits resident. Enable the offload path (mirrors
         # cpu_training's mapping) — without it import_weights loads every weight onto
         # the GPU and OOMs on any model large enough to need dispatch-PP.
-        # Bound activation memory: recompute intermediates and offload the per-layer
-        # residuals to pinned CPU, so activation memory is independent of network
-        # depth (both the resident stage-scheduler path and the streaming fallback
-        # need this on deep models).
+        # Bound activation memory: recompute intermediates so the backward replays the
+        # forward per block instead of holding all activations.
         if not self.recompute:
             logger.info("[dispatch_pp]: enabling recompute (activation memory must be bounded).")
             self.recompute = True
-        if not self.offload_residual:
-            logger.info("[dispatch_pp]: enabling offload_residual (depth-independent activation memory).")
-            self.offload_residual = True
+        # offload_residual is INCOMPATIBLE with the resident stage scheduler: the
+        # cross-stage forward handoff reads block hi's residual by name, and offloading
+        # it to pinned CPU asynchronously races that read (non-deterministic stage
+        # inputs -> corrupted gradients). The pipelined per-stage forward already bounds
+        # resident activations to one stage, so offload isn't needed here; use more
+        # (smaller) stages if a single stage doesn't fit. Only the streaming fallback
+        # (offload_master) keeps offload_residual for depth-independent memory.
+        if self.offload_master:
+            if not self.offload_residual:
+                logger.info("[dispatch_pp]: enabling offload_residual (streaming path, depth-independent memory).")
+                self.offload_residual = True
+        elif self.offload_residual:
+            logger.info(
+                "[dispatch_pp]: disabling offload_residual (it races the resident scheduler's "
+                "cross-stage forward boundary handoff; per-stage forward already bounds activations)."
+            )
+            self.offload_residual = False
         # Weight residency is the caller's choice:
         #   - default (offload_master=false): weights stay resident and the multi-GPU
         #     stage scheduler runs (dispatch_pp_train_step_multigpu) — for models

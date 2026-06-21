@@ -643,14 +643,39 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
     const bool recompute_enabled = mRecomputeEnabled;
     const bool forward_replay_active = recompute_enabled && static_cast<bool>(mRecomputeFn);
     // dispatch-PP forwards a contiguous op sub-range [mFwdOpLo, mFwdOpHi) per stage,
-    // so tensors owned by ops outside that range were never computed. Their entries
-    // in the whole-graph save_list are legitimately absent -- the bounded backward
-    // for this stage never references them -- so skip them rather than fail. A full
+    // so tensors owned by ops OUTSIDE that range were never computed. Their entries in
+    // the whole-graph save_list are legitimately absent -- the bounded backward for
+    // this stage never references them -- so skip those rather than fail. A full
     // forward (the default 0 / SIZE_MAX range) keeps the hard failure to catch
-    // genuinely missing activations. Boundary residuals injected for the cross-stage
-    // handoff ARE live and are still saved via block_activation_ptr below.
+    // genuinely missing activations. The out-of-range test must be PRECISE: skipping
+    // an in-range-but-momentarily-not-live tensor would leave the backward reading a
+    // stale buffer (non-deterministic drift), so only ops/blocks provably outside the
+    // forwarded range are skipped; in-range misses still throw. Boundary residuals
+    // injected for the cross-stage handoff ARE live and are saved via
+    // block_activation_ptr below.
     const bool sub_range_forward =
         mCurrentGraph && (mFwdOpLo > 0 || mFwdOpHi < mCurrentGraph->ops.size());
+    // A block is forwarded iff its first op falls inside [mFwdOpLo, mFwdOpHi).
+    auto block_out_of_range = [&](int layer_idx) -> bool {
+        if (!sub_range_forward || !mCurrentGraph || layer_idx < 0 ||
+            layer_idx >= static_cast<int>(mCurrentGraph->layer_start_indices.size())) {
+            return false;
+        }
+        const std::size_t ls = mCurrentGraph->layer_start_indices[static_cast<std::size_t>(layer_idx)];
+        return ls < mFwdOpLo || ls >= mFwdOpHi;
+    };
+    // Op-id-keyed saves (e.g. mamba_gated_rmsnorm "<op_id>.normed"/".rstd") carry the
+    // producing op index as the name prefix; out-of-range if that op wasn't run.
+    auto opkeyed_out_of_range = [&](const std::string& nm) -> bool {
+        if (!sub_range_forward) return false;
+        const std::size_t dot = nm.find('.');
+        if (dot == 0 || dot == std::string::npos) return false;
+        for (std::size_t i = 0; i < dot; ++i) {
+            if (nm[i] < '0' || nm[i] > '9') return false;
+        }
+        const std::size_t op = static_cast<std::size_t>(std::stoul(nm.substr(0, dot)));
+        return op < mFwdOpLo || op >= mFwdOpHi;
+    };
     auto contains_ci = [](std::string_view haystack, std::string_view needle) {
         std::string h(haystack);
         std::string n(needle);
@@ -896,7 +921,9 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
                 (*mSaved)[name] = mWeights.get(name);
                 continue;
             }
-            if (sub_range_forward) continue;  // block outside this stage's forwarded op range
+            if (block_out_of_range(layer_idx) || opkeyed_out_of_range(name)) {
+                continue;  // block belongs to a stage not forwarded here
+            }
             throw std::runtime_error("CompiledExecutor: cannot save tensor " + name);
         }
 
@@ -904,7 +931,9 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
             (*mSaved)[name] = mWeights.get(name);
             continue;
         }
-        if (sub_range_forward) continue;  // op outside this stage's forwarded op range
+        if (opkeyed_out_of_range(name)) {
+            continue;  // op-keyed save produced by an op not in this stage's range
+        }
         throw std::runtime_error("CompiledExecutor: cannot save tensor " + name);
     }
 
