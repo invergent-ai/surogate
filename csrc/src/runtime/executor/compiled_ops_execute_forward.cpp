@@ -572,6 +572,32 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     if (!mDbgFwdSkipInit) {
         initialize_forward_execution(graph, comm, full);
     }
+    // dispatch-PP debug: cross-GPU activation handoff. A resumed stage [lo..] on a
+    // fresh GPU reads get_residual(lo-1) as its first block's input; inject the
+    // boundary residual handed over from the previous stage's GPU through host
+    // memory, after init (which does not touch the managed residual buffer).
+    if (mDbgInjectResidualLayer >= 0 && !mDbgInjectResidualHost.empty()) {
+        Tensor& r = mRunState.get_residual(mDbgInjectResidualLayer, mRunState.MainStream);
+        if (r.Data && r.bytes() == mDbgInjectResidualHost.size()) {
+            CUDA_CHECK(cudaMemcpyAsync(r.Data, mDbgInjectResidualHost.data(), r.bytes(),
+                                       cudaMemcpyHostToDevice, mRunState.MainStream));
+            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+        } else {
+            throw std::runtime_error("dispatch-PP debug: residual inject size/buffer mismatch");
+        }
+    }
+    // Best-effort: the carried ``x`` (block output) lives in a transient slot
+    // that is not resident on a fresh executor, so this inject is a no-op there.
+    // Completing the two-tensor boundary handoff needs a materialization hook
+    // (tracked as remaining multi-GPU work); the residual inject above always lands.
+    if (mDbgInjectHoutLayer >= 0 && !mDbgInjectHoutHost.empty()) {
+        Tensor* h = block_activation_ptr(mRunState, mDbgInjectHoutLayer, TensorSlot::BlockHOut);
+        if (h && h->Data && h->bytes() == mDbgInjectHoutHost.size()) {
+            CUDA_CHECK(cudaMemcpyAsync(h->Data, mDbgInjectHoutHost.data(), h->bytes(),
+                                       cudaMemcpyHostToDevice, mRunState.MainStream));
+            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+        }
+    }
     const int num_layers = static_cast<int>(mConfig.NumLayers);
     // Reuse member vectors to avoid per-forward heap allocations.
     auto& layer_checkpoints = mLayerCheckpoints;

@@ -208,6 +208,26 @@ public:
         mDbgBwdSkipFinalize = false;
         mDbgForceLinear = false;
     }
+    // Inject a host residual into get_residual(layer) after forward init, before
+    // the op loop — the cross-GPU activation handoff for the dispatch-PP pool. A
+    // resumed stage [lo..] reads get_residual(lo-1) as its first block's input.
+    void set_debug_inject_residual(int layer, std::vector<std::byte> host_bytes) {
+        mDbgInjectResidualLayer = layer;
+        mDbgInjectResidualHost = std::move(host_bytes);
+    }
+    // The fused-residual block carries two tensors block->block: the accumulator
+    // (get_residual) and ``x`` = the previous block's output (BlockHOut). The
+    // cross-GPU handoff injects both. Layer is the producing block (lo-1).
+    void set_debug_inject_hout(int layer, std::vector<std::byte> host_bytes) {
+        mDbgInjectHoutLayer = layer;
+        mDbgInjectHoutHost = std::move(host_bytes);
+    }
+    void clear_debug_inject_residual() {
+        mDbgInjectResidualLayer = -1;
+        mDbgInjectResidualHost.clear();
+        mDbgInjectHoutLayer = -1;
+        mDbgInjectHoutHost.clear();
+    }
 
     std::size_t mDbgFwdOpLo = 0;
     std::size_t mDbgFwdOpHi = SIZE_MAX;
@@ -218,6 +238,10 @@ public:
     bool mDbgBwdSkipInit = false;
     bool mDbgBwdSkipFinalize = false;
     bool mDbgForceLinear = false;
+    int mDbgInjectResidualLayer = -1;
+    std::vector<std::byte> mDbgInjectResidualHost;
+    int mDbgInjectHoutLayer = -1;
+    std::vector<std::byte> mDbgInjectHoutHost;
     void set_debug_dump_fn(std::function<void(const std::vector<std::string>&, int)> fn) {
         mDebugDumpFn = std::move(fn);
     }

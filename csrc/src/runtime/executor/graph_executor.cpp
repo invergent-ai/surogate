@@ -1999,6 +1999,42 @@ void GraphExecutor::debug_clear_backward_op_range() {
     if (mCompiledExecutor) mCompiledExecutor->clear_debug_backward_op_range();
 }
 
+std::vector<std::byte> GraphExecutor::debug_read_residual_bytes(int layer) {
+    Tensor& r = mRunState.get_residual(layer, mRunState.MainStream);
+    std::vector<std::byte> host;
+    if (!r.Data || r.bytes() == 0) {
+        return host;
+    }
+    host.resize(r.bytes());
+    CUDA_CHECK(cudaMemcpyAsync(host.data(), r.Data, r.bytes(), cudaMemcpyDeviceToHost, mRunState.MainStream));
+    CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+    return host;
+}
+
+std::vector<std::byte> GraphExecutor::debug_read_block_hout_bytes(int layer) {
+    std::vector<std::byte> host;
+    Tensor* h = block_activation_ptr(mRunState, layer, TensorSlot::BlockHOut);
+    if (!h || !h->Data || h->bytes() == 0) {
+        return host;
+    }
+    host.resize(h->bytes());
+    CUDA_CHECK(cudaMemcpyAsync(host.data(), h->Data, h->bytes(), cudaMemcpyDeviceToHost, mRunState.MainStream));
+    CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+    return host;
+}
+
+void GraphExecutor::debug_set_inject_residual(int layer, std::vector<std::byte> host_bytes) {
+    if (mCompiledExecutor) mCompiledExecutor->set_debug_inject_residual(layer, std::move(host_bytes));
+}
+
+void GraphExecutor::debug_set_inject_hout(int layer, std::vector<std::byte> host_bytes) {
+    if (mCompiledExecutor) mCompiledExecutor->set_debug_inject_hout(layer, std::move(host_bytes));
+}
+
+void GraphExecutor::debug_clear_inject_residual() {
+    if (mCompiledExecutor) mCompiledExecutor->clear_debug_inject_residual();
+}
+
 std::vector<float> GraphExecutor::debug_last_block_hidden_f32() {
     // The last block's output residual is the dispatch-PP boundary hidden. It is
     // a resident block slot while execution state is live (read before finalize),

@@ -112,6 +112,18 @@ public:
                                                            Tensor position_ids,
                                                            NCCLCommunicator& comm,
                                                            int split_after_block);
+    // Run one forward stage (blocks [lo..hi]) eagerly, leaving state resident.
+    // When inject_layer >= 0, inject ``inject_host`` into get_residual(inject_layer)
+    // first (the cross-GPU activation handoff). Read the result via the executor's
+    // debug readers (debug_read_residual_bytes / debug_last_block_hidden_f32).
+    void dispatch_pp_debug_forward_stage(Tensor inputs,
+                                         Tensor position_ids,
+                                         NCCLCommunicator& comm,
+                                         int lo,
+                                         int hi,
+                                         int inject_layer,
+                                         std::vector<std::byte> inject_residual,
+                                         std::vector<std::byte> inject_hout);
     // Whole-graph backward; returns per-block weight-grad L2 norms (block order).
     std::vector<float> dispatch_pp_debug_grad_norms_whole(Tensor inputs,
                                                           Tensor targets,

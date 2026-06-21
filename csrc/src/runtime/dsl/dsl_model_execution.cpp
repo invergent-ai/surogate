@@ -1093,6 +1093,55 @@ std::vector<float> DslModel::dispatch_pp_debug_forward_subranges(Tensor inputs,
     return out;
 }
 
+void DslModel::dispatch_pp_debug_forward_stage(Tensor inputs,
+                                               Tensor position_ids,
+                                               NCCLCommunicator& comm,
+                                               int lo,
+                                               int hi,
+                                               int inject_layer,
+                                               std::vector<std::byte> inject_residual,
+                                               std::vector<std::byte> inject_hout) {
+    if (lora_enabled()) {
+        throw std::runtime_error("dispatch_pp_debug_forward_stage: BF16 full-FT only (no LoRA)");
+    }
+    GraphExecutor* ge = graph_executor();
+    if (!ge) {
+        throw std::runtime_error("dispatch_pp_debug_forward_stage: requires the DSL GraphExecutor");
+    }
+    const long B = inputs.Sizes[0];
+    const long T = inputs.Sizes[1];
+    ge->ensure_graphs_compiled(B, T);
+    const CompiledGraph* fwd = ge->compiled_forward();
+    if (!fwd) {
+        throw std::runtime_error("dispatch_pp_debug_forward_stage: forward graph not compiled");
+    }
+    const int num_layers = static_cast<int>(mModelConfig.NumLayers);
+    if (lo < 0 || hi < lo || hi >= num_layers) {
+        throw std::runtime_error("dispatch_pp_debug_forward_stage: invalid block range");
+    }
+    // Stage [0..] starts at the embedding; a resumed stage [lo>0..] starts at the
+    // first op of block lo and consumes the injected boundary residual.
+    const std::size_t op_lo = (lo == 0) ? 0 : fwd->layer_start_indices[static_cast<std::size_t>(lo)];
+    const std::size_t op_hi = (hi == num_layers - 1) ? fwd->ops.size()
+                                                     : fwd->layer_end_indices[static_cast<std::size_t>(hi)];
+
+    if (inject_layer >= 0) {
+        ge->debug_set_inject_residual(inject_layer, std::move(inject_residual));
+        ge->debug_set_inject_hout(inject_layer, std::move(inject_hout));
+    }
+    // skip_finalize keeps the stage's outputs (residual / final hidden) resident
+    // for the caller's debug readers and the next stage's boundary read.
+    ge->debug_set_forward_op_range(op_lo, op_hi, /*skip_init=*/false, /*skip_finalize=*/true,
+                                   /*force_linear=*/true);
+    {
+        auto request =
+            causal_lm_profile().make_forward_request(*mRunState, mModelConfig, mOptions, inputs, position_ids, 0);
+        mExecutor->execute_forward(request, comm);
+    }
+    ge->debug_clear_forward_op_range();
+    ge->debug_clear_inject_residual();
+}
+
 std::vector<float> DslModel::dispatch_pp_debug_grad_norms_whole(Tensor inputs,
                                                                Tensor targets,
                                                                Tensor position_ids,

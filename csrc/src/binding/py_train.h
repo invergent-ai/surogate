@@ -188,6 +188,12 @@ public:
     std::vector<float> dispatch_pp_debug_grad_norms_subranges(const std::int32_t* inputs,
                                                               const std::int32_t* targets,
                                                               int split_after_block);
+    // Round-robin forward dispatch of contiguous block stages [los[i]..his[i]]
+    // across the GPU pool (stage i -> GPU i % ngpu), handing the boundary residual
+    // GPU->host->GPU between stages. Returns the final hidden state as flat f32.
+    std::vector<float> dispatch_pp_debug_forward_hidden_multigpu(const std::int32_t* inputs,
+                                                                 const std::vector<int>& los,
+                                                                 const std::vector<int>& his);
     std::vector<std::pair<std::string, Tensor>> get_lora_gradients(int gpu_id);
     std::vector<std::pair<std::string, Tensor>> get_lora_weights(int gpu_id);
     int get_valid_token_count(int gpu_id);

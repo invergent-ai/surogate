@@ -1965,6 +1965,66 @@ std::vector<float> MultiGPUPyTrainer::dispatch_pp_debug_grad_norms_subranges(con
         0);
     return result;
 }
+
+std::vector<float> MultiGPUPyTrainer::dispatch_pp_debug_forward_hidden_multigpu(
+    const std::int32_t* inputs, const std::vector<int>& los, const std::vector<int>& his) {
+    if (los.size() != his.size() || los.empty()) {
+        throw std::runtime_error("dispatch_pp_debug_forward_hidden_multigpu: bad stage ranges");
+    }
+    const int ngpu = static_cast<int>(mContexts.size());
+    const int num_stages = static_cast<int>(los.size());
+    std::vector<float> result;
+    // The fused-residual block carries two tensors across the boundary: the
+    // residual accumulator and ``x`` (the previous block's output). Hand both over.
+    std::vector<std::byte> boundary_residual;
+    std::vector<std::byte> boundary_hout;
+
+    for (int si = 0; si < num_stages; ++si) {
+        const int gpu = si % ngpu;
+        const int lo = los[static_cast<std::size_t>(si)];
+        const int hi = his[static_cast<std::size_t>(si)];
+        const bool is_first = (si == 0);
+        const bool is_last = (si == num_stages - 1);
+        const int inject_layer = is_first ? -1 : lo - 1;
+        std::vector<std::byte> residual_in = boundary_residual;  // captured by value
+        std::vector<std::byte> hout_in = boundary_hout;
+        std::vector<std::byte> next_residual;
+        std::vector<std::byte> next_hout;
+        std::vector<float> final_hidden;
+
+        run_work(
+            [&](sThreadContext& ctx) {
+                auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+                if (!model)
+                    throw std::runtime_error("dispatch_pp_debug_forward_hidden_multigpu: DSL model required");
+                DISPATCH_PP_DBG_STAGE(ctx, inputs, nullptr);
+                model->dispatch_pp_debug_forward_stage(ctx.Model->get_input_buffer(),
+                                                       ctx.Model->get_position_ids_buffer(),
+                                                       *ctx.Communicator,
+                                                       lo,
+                                                       hi,
+                                                       inject_layer,
+                                                       std::move(residual_in),
+                                                       std::move(hout_in));
+                auto* ge = model->graph_executor();
+                if (is_last) {
+                    final_hidden = ge->debug_last_block_hidden_f32();
+                } else {
+                    next_residual = ge->debug_read_residual_bytes(hi);
+                    next_hout = ge->debug_read_block_hout_bytes(hi);
+                }
+            },
+            gpu);
+
+        if (is_last) {
+            result = std::move(final_hidden);
+        } else {
+            boundary_residual = std::move(next_residual);
+            boundary_hout = std::move(next_hout);
+        }
+    }
+    return result;
+}
 #undef DISPATCH_PP_DBG_STAGE
 
 std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_gradients(int gpu_id) {

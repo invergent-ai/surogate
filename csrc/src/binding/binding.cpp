@@ -1389,6 +1389,18 @@ NB_MODULE(_surogate, m) {
             "Debug-only dispatch-PP: backward as two contiguous block sub-ranges with a CPU-boundary "
             "grad handoff; returns per-block weight-grad L2 norms.")
         .def(
+            "dispatch_pp_debug_forward_hidden_multigpu",
+            [](MultiGPUPyTrainer* trainer, TokenArray inputs, std::vector<int> los, std::vector<int> his) {
+                CHECK_SHAPE(inputs, trainer->batch_size(), trainer->seq_length());
+                return trainer->dispatch_pp_debug_forward_hidden_multigpu(inputs.data(), los, his);
+            },
+            nb::arg("inputs"),
+            nb::arg("los"),
+            nb::arg("his"),
+            "Debug-only dispatch-PP: round-robin forward dispatch of contiguous block stages "
+            "[los[i]..his[i]] across the GPU pool with a CPU-boundary residual handoff between stages; "
+            "returns the final hidden state as a flat f32 list.")
+        .def(
             "step",
             [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets, TokenArray3 position_ids) {
                 const int local_gpus = trainer->local_world_size();
