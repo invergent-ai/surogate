@@ -1,7 +1,11 @@
 """Unit tests for the dispatch-PP planner (pure Python, GPU-free)."""
 
 from surogate.train.dispatch_pp.types import BlockProfile, StageRange, StagePlan
-from surogate.train.dispatch_pp.planner import pack_stages, candidate_budgets
+from surogate.train.dispatch_pp.planner import pack_stages, candidate_budgets, plan_stages
+
+
+def _uniform_profiles(n, fwd, bwd, wbytes=1, abytes=0, needs_grad=True):
+    return [BlockProfile(fwd, bwd, wbytes, abytes, needs_grad) for _ in range(n)]
 
 
 def test_stage_range_to_dict_roundtrips():
@@ -85,3 +89,63 @@ def test_candidates_include_multiblock_sums_within_threshold():
 
 def test_candidates_single_block_returns_that_block():
     assert candidate_budgets([5], upper_threshold=1.1) == [5.0]
+
+
+def test_plan_covers_every_block_exactly_once():
+    profiles = _uniform_profiles(8, fwd=1.0, bwd=3.0)
+    plan = plan_stages(profiles, min_stages=4, upper_threshold=1.1,
+                       vram_budget_bytes=10**18)
+    # forward path (fwd_stages + fused_tail) covers all blocks ascending:
+    fwd_cover = []
+    for s in plan.fwd_stages:
+        fwd_cover.extend(range(s.lo, s.hi + 1))
+    fwd_cover.extend(range(plan.fused_tail.lo, plan.fused_tail.hi + 1))
+    assert fwd_cover == list(range(8))
+    # backward path (fused_tail + bwd_stages) also covers all blocks:
+    bwd_cover = list(range(plan.fused_tail.lo, plan.fused_tail.hi + 1))
+    for s in plan.bwd_stages:
+        bwd_cover.extend(range(s.lo, s.hi + 1))
+    assert sorted(bwd_cover) == list(range(8))
+
+
+def test_plan_bwd_stages_are_descending():
+    profiles = _uniform_profiles(8, fwd=1.0, bwd=3.0)
+    plan = plan_stages(profiles, min_stages=4, upper_threshold=1.1,
+                       vram_budget_bytes=10**18)
+    los = [s.lo for s in plan.bwd_stages]
+    assert los == sorted(los, reverse=True)
+
+
+def test_plan_under_memory_pressure_packs_multiblock_stages():
+    # When memory binds, stages hold >1 block (the regime where asymmetry shows).
+    # 6 blocks, weight 8 bytes; backward stage memory = weight+grad = 16/block, so
+    # vram_budget 96 -> ceiling 48 -> up to 3 blocks per backward/fused stage.
+    profiles = _uniform_profiles(6, fwd=1.0, bwd=1.0, wbytes=8)
+    plan = plan_stages(profiles, min_stages=2, upper_threshold=3.0,
+                       vram_budget_bytes=96)
+    widths = [s.hi - s.lo + 1 for s in plan.fwd_stages] + [
+        plan.fused_tail.hi - plan.fused_tail.lo + 1
+    ]
+    assert max(widths) >= 2  # at least one multi-block stage
+
+
+def test_plan_single_block_is_all_fused_tail():
+    profiles = _uniform_profiles(1, fwd=1.0, bwd=3.0)
+    plan = plan_stages(profiles, min_stages=1, upper_threshold=1.1,
+                       vram_budget_bytes=10**18)
+    assert plan.fwd_stages == []
+    assert plan.bwd_stages == []
+    assert (plan.fused_tail.lo, plan.fused_tail.hi) == (0, 0)
+
+
+def test_plan_fused_tail_sized_by_backward_not_forward():
+    # The fused tail runs fwd+loss+bwd, so it must be budgeted/sized by backward
+    # cost. Its est_time therefore reflects bwd_time (3.0/block), never fwd_time
+    # (1.0/block). Sizing it by forward time would over-pack and make it the
+    # makespan straggler.
+    profiles = _uniform_profiles(6, fwd=1.0, bwd=3.0)
+    plan = plan_stages(profiles, min_stages=1, upper_threshold=1.1,
+                       vram_budget_bytes=10**18)
+    tail = plan.fused_tail
+    n_tail = tail.hi - tail.lo + 1
+    assert tail.est_time == 3.0 * n_tail   # bwd_time per block, not fwd (=1.0)
