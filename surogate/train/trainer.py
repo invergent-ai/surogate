@@ -1253,14 +1253,13 @@ class SurogateTrainerWrapper:
             if self._dispatch_pp:
                 # Round-robin stage dispatch: forward+backward across the GPU pool,
                 # collect grads to the master, optimize, broadcast. One fused call.
-                # The C++ step supports M microbatches per step (grad-accumulated) to
-                # amortize the per-step weight stream, but real amortization needs the
-                # stage's weights to stay resident across the microbatch loop. surogate's
-                # weight streaming is per-block (2-slot prefetch), so a multi-block stage
-                # is re-streamed each microbatch and M>1 gives almost no gain. Keep M=1
-                # until stage-resident weight gathering lands (the next piece).
+                # Run M=gpus microbatches per step through the wavefront scheduler: stage
+                # s runs on GPU s%N, and in each diagonal wave the stages run on distinct
+                # GPUs concurrently (N parallel PCIe links + N-way compute overlap). The
+                # chunk holds gpus*bsz rows = gpus microbatches of bsz each. LoRA only for
+                # now (FFT cross-microbatch grad accumulation not wired -> M=1).
                 bsz = self._dpp_bsz
-                M = 1
+                M = self.config.gpus if self.config.lora else 1
                 rows = M * bsz
                 loss = self.trainer.dispatch_pp_train_step_multigpu(
                     in_tokens[:rows], out_tokens[:rows], self._dpp_los, self._dpp_his,

@@ -167,6 +167,10 @@ public:
         int lo, int hi, bool include_head, bool include_embed);
     // Write gradients from host into the grad store by name (host -> device).
     void dispatch_pp_write_grads(const std::vector<std::pair<std::string, std::vector<std::byte>>>& items);
+    // Zero the grad accumulators before a backward wavefront. The diagonal schedule
+    // hits a stage's microbatches out of order, so grads are pre-zeroed once and every
+    // backward_stage accumulates (rather than per-task zeroing).
+    void dispatch_pp_zero_grads();
     // Read / write every parameter weight to / from host (the master broadcast).
     std::vector<std::pair<std::string, std::vector<std::byte>>> dispatch_pp_read_weights();
     void dispatch_pp_write_weights(const std::vector<std::pair<std::string, std::vector<std::byte>>>& items);

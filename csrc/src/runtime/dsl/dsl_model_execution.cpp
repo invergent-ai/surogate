@@ -1552,6 +1552,11 @@ void DslModel::dispatch_pp_write_weights(
     CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
+void DslModel::dispatch_pp_zero_grads() {
+    zero_grads(mRunState->MainStream);
+    CUDA_CHECK(cudaStreamSynchronize(mRunState->MainStream));
+}
+
 float DslModel::dispatch_pp_raw_loss() const {
     return mDispatchPpLastLoss;
 }
