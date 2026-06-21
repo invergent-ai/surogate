@@ -15,8 +15,8 @@
 Updated before each commit. Status: ☐ not started · ◐ in progress · ☑ done.
 
 - ☑ Task 1 — Scaffold package + data types
-- ◐ Task 2 — Stage packing under workload + memory ceilings
-- ☐ Task 3 — Candidate budget enumeration
+- ☑ Task 2 — Stage packing under workload + memory ceilings
+- ◐ Task 3 — Candidate budget enumeration
 - ☐ Task 4 — Cost search + plan assembly (fwd / fused tail / bwd)
 - ☐ Task 5 — Oversized-block warning
 - ☐ Task 6 — PCIe token-threshold / microbatch envelope warnings
