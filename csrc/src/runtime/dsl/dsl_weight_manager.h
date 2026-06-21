@@ -212,10 +212,12 @@ private:
     bool mStreamWeights = false;
     int mVersion = 0;  ///< Incremented on invalidate()
 
-    // Double-buffered prefetch (for streaming mode)
-    static constexpr int kNumPrefetchBuffers = 2;
-    std::array<WeightGatherStatus, kNumPrefetchBuffers> mPrefetchStatus;
-    std::array<std::unordered_map<std::string, Tensor>, kNumPrefetchBuffers> mPrefetchBuffers;
+    // Prefetch slots (streaming mode). Default 2 = classic per-block double-buffer.
+    // dispatch-PP sizes this up (env SUROGATE_DISPATCH_PREFETCH_BLOCKS) so a whole
+    // small stage stays cached across its microbatches (stage-resident dispatch).
+    int mNumPrefetchBuffers = 2;
+    std::vector<WeightGatherStatus> mPrefetchStatus;
+    std::vector<std::unordered_map<std::string, Tensor>> mPrefetchBuffers;
     int mCurrentPrefetchBuffer = 0;
 
     // Non-block weight status
@@ -228,9 +230,9 @@ private:
     std::string mFinalNormName;
     std::string mLmHeadName;
 
-    // CUDA resources
-    cudaEvent_t mGatherEvents[kNumPrefetchBuffers] = {nullptr, nullptr};
-    cudaEvent_t mReleaseEvents[kNumPrefetchBuffers] = {nullptr, nullptr};
+    // CUDA resources (sized to mNumPrefetchBuffers in create_cuda_resources)
+    std::vector<cudaEvent_t> mGatherEvents;
+    std::vector<cudaEvent_t> mReleaseEvents;
     cudaEvent_t mNonBlockEvents[3] = {nullptr, nullptr, nullptr};  // emb, final_norm, lm_head
 };
 

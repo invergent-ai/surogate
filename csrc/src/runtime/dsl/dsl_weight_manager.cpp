@@ -199,6 +199,16 @@ DslWeightManager::DslWeightManager(const Module& module,
     // Enable streaming if sharding weights with multiple GPUs
     mStreamWeights = mConfig.shard_weights && mConfig.num_shards > 1;
 
+    // Prefetch-slot count: 2 (per-block double-buffer) by default; dispatch-PP raises
+    // it (via env) so a whole small stage stays resident across its microbatches.
+    mNumPrefetchBuffers = 2;
+    if (const char* env = std::getenv("SUROGATE_DISPATCH_PREFETCH_BLOCKS")) {
+        const int v = std::atoi(env);
+        if (v >= 2) mNumPrefetchBuffers = v;
+    }
+    mPrefetchStatus.resize(mNumPrefetchBuffers);
+    mPrefetchBuffers.resize(mNumPrefetchBuffers);
+
     // Allocate weights
     allocate_weights(module, graph, lora_config);
 
@@ -452,7 +462,7 @@ void DslWeightManager::allocate_prefetch_buffers() {
     // Allocate double buffers for prefetching.
     // Only one layer occupies each prefetch slot at a time, so we allocate one set
     // of GPU buffers per unique base param name per slot and share across all layers.
-    for (int i = 0; i < kNumPrefetchBuffers; ++i) {
+    for (int i = 0; i < mNumPrefetchBuffers; ++i) {
         mPrefetchStatus[i].layer_idx = -1;
         mPrefetchStatus[i].is_ready = true;
         mPrefetchStatus[i].fetch_pending = false;
@@ -492,7 +502,9 @@ void DslWeightManager::allocate_prefetch_buffers() {
 }
 
 void DslWeightManager::create_cuda_resources() {
-    for (int i = 0; i < kNumPrefetchBuffers; ++i) {
+    mGatherEvents.assign(mNumPrefetchBuffers, nullptr);
+    mReleaseEvents.assign(mNumPrefetchBuffers, nullptr);
+    for (int i = 0; i < mNumPrefetchBuffers; ++i) {
         CUDA_CHECK(cudaEventCreate(&mGatherEvents[i]));
         mPrefetchStatus[i].done_event = mGatherEvents[i];
         CUDA_CHECK(cudaEventRecord(mGatherEvents[i], 0));
@@ -511,7 +523,7 @@ void DslWeightManager::create_cuda_resources() {
 }
 
 void DslWeightManager::release_cuda_resources() noexcept {
-    for (int i = 0; i < kNumPrefetchBuffers; ++i) {
+    for (int i = 0; i < mNumPrefetchBuffers; ++i) {
         if (mGatherEvents[i]) {
             cudaEventDestroy(mGatherEvents[i]);
             mGatherEvents[i] = nullptr;
@@ -633,7 +645,7 @@ void DslWeightManager::gather_block(int layer_idx, NCCLCommunicator& comm, cudaS
 
     // Find available prefetch buffer
     int buf_idx = -1;
-    for (int i = 0; i < kNumPrefetchBuffers; ++i) {
+    for (int i = 0; i < mNumPrefetchBuffers; ++i) {
         auto& status = mPrefetchStatus[i];
         if (status.layer_idx == layer_idx && status.version == mVersion) {
             // Already fetched and up-to-date. But `entry.work` pointers for
@@ -730,7 +742,7 @@ void DslWeightManager::gather_block(int layer_idx, NCCLCommunicator& comm, cudaS
         CUDA_CHECK(cudaEventRecord(status.done_event, stream));
     }
 
-    mCurrentPrefetchBuffer = (buf_idx + 1) % kNumPrefetchBuffers;
+    mCurrentPrefetchBuffer = (buf_idx + 1) % mNumPrefetchBuffers;
 }
 
 void DslWeightManager::release_block(int layer_idx, cudaStream_t stream) {
@@ -739,7 +751,7 @@ void DslWeightManager::release_block(int layer_idx, cudaStream_t stream) {
     }
 
     // Find and release the buffer holding this layer
-    for (int i = 0; i < kNumPrefetchBuffers; ++i) {
+    for (int i = 0; i < mNumPrefetchBuffers; ++i) {
         auto& status = mPrefetchStatus[i];
         if (status.layer_idx == layer_idx) {
             // Wait for any pending operations
@@ -760,7 +772,7 @@ void DslWeightManager::wait_for_gather(int layer_idx, cudaStream_t stream) {
         return;
     }
 
-    for (int i = 0; i < kNumPrefetchBuffers; ++i) {
+    for (int i = 0; i < mNumPrefetchBuffers; ++i) {
         auto& status = mPrefetchStatus[i];
         if (status.layer_idx == layer_idx) {
             if (status.fetch_pending) {
@@ -1024,7 +1036,7 @@ std::size_t DslWeightManager::gpu_prefetch_buffer_bytes() const {
 }
 
 int DslWeightManager::prefetch_slot_count() const {
-    return (mStreamWeights || mConfig.offload_master) ? kNumPrefetchBuffers : 0;
+    return (mStreamWeights || mConfig.offload_master) ? mNumPrefetchBuffers : 0;
 }
 
 std::size_t
