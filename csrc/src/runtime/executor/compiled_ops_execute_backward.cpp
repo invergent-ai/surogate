@@ -592,13 +592,13 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                                         int micro_step,
                                         const modules::BackwardHook* hook,
                                         bool skip_zeroing) {
-    // dispatch-PP debug: a resumed sub-range segment shares the prior segment's
+    // dispatch-PP: a resumed sub-range segment shares the prior segment's
     // backward state. Skip only the steps that would discard it — clearing the
     // live tensors (initialize), overwriting them with the forward snapshot
     // (restore), and re-zeroing already-accumulated gradients. The binding steps
     // are idempotent and MUST re-run so the resumed segment's ops can resolve
     // their grad-output slots.
-    if (!mDbgBwdSkipInit) {
+    if (!mBwdSkipInit) {
         initialize_backward_execution(graph, comm, micro_step);
         restore_forward_snapshot_for_backward(graph);
     }
@@ -609,7 +609,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
 
     bind_runtime_bindings();
     bind_saved_tensors_for_backward();
-    if (!mDbgBwdSkipInit) {
+    if (!mBwdSkipInit) {
         zero_backward_entry_gradients(skip_zeroing);
     }
     gather_backward_non_block_weights(comm);
@@ -657,10 +657,10 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     bind_runtime_bindings();
     bind_param_gradient_tensors_for_backward();
 
-    // dispatch-PP debug: cross-GPU gradient handoff. Bind the incoming boundary
+    // dispatch-PP: cross-GPU gradient handoff. Bind the incoming boundary
     // gradients (d_blocks[hi].res_att / d_blocks[hi].mlp_down) produced by the
     // higher stage's backward on another GPU, into this stage's backward graph.
-    apply_debug_named_inject();
+    apply_named_inject();
 
     auto is_grad_ref = [](const TensorRef& ref) -> bool {
         if (!ref.name.empty() && ref.name.size() > 2 && ref.name[0] == 'd' && ref.name[1] == '_') {
@@ -1044,7 +1044,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     // Minimal: no tiled MLP, no capture, no recompute, no bwd_filter / watch /
     // op_profile — matches the Llama-only scope of the forward stream path.
     const bool bwd_stream_driven = !graph.instruction_stream.empty() && !bwd_stream_capturing &&
-                                   bwd_tile_group_starts.empty() && !mDbgForceLinear;
+                                   bwd_tile_group_starts.empty() && !mForceLinear;
 
     // Per-op layer-end cleanup (shared between SegmentDispatch inline and
     // PhaseExit BwdBlock). Mirrors the flat-ops layer-end handler at lines
@@ -1136,7 +1136,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 offload_payload.sync_event = mRunState.side_stream_event();
                 offload_payload.capturing = capturing;
                 dispatch_schema_layer_hooks(HookEventKind::AfterAllReduce, L, &offload_payload);
-                if (!offload_payload.offloaded && mComm && mComm->world_size() > 1 && !mDbgSkipGradReduce) {
+                if (!offload_payload.offloaded && mComm && mComm->world_size() > 1 && !mSkipGradReduce) {
                     CUDA_CHECK(cudaEventRecord(mRunState.side_stream_event(), mRunState.MainStream));
                     CUDA_CHECK(cudaStreamWaitEvent(mRunState.side_stream(), mRunState.side_stream_event(), 0));
                     mGrads.reduce_layer_grads(L, mRunState.side_stream(), *mComm);
@@ -1144,7 +1144,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 if (!offload_payload.offloaded) {
                     mGrads.offload_layer_grads(L, mRunState.MainStream, mRunState.side_stream());
                 }
-            } else if (mComm && mComm->world_size() > 1 && !mDbgSkipGradReduce) {
+            } else if (mComm && mComm->world_size() > 1 && !mSkipGradReduce) {
                 CUDA_CHECK(cudaEventRecord(mRunState.side_stream_event(), mRunState.MainStream));
                 CUDA_CHECK(cudaStreamWaitEvent(mRunState.side_stream(), mRunState.side_stream_event(), 0));
                 mGrads.notify_block(L, mRunState.side_stream(), *mComm);
@@ -1291,12 +1291,12 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         }
     }
 
-    // dispatch-PP debug: op-index bounds of the transformer-block region, so a
+    // dispatch-PP: op-index bounds of the transformer-block region, so a
     // layer<0 op can be classed as a *leading* loss/lm-head op (before the blocks)
     // or a *trailing* embedding op (after them). Backward visits blocks high->low.
     std::size_t dbg_first_block_op = graph.ops.size();
     std::size_t dbg_last_block_op = 0;
-    if (mDbgBwdLayerFilter) {
+    if (mBwdLayerFilter) {
         for (std::size_t i = 0; i < graph.ops.size(); ++i) {
             if (op_layer_idx_any(graph.ops[i]) >= 0) {
                 dbg_first_block_op = std::min(dbg_first_block_op, i);
@@ -1311,23 +1311,23 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         if (skip_profile_backward_tensors && is_skipped_backward_op(op)) {
             continue;
         }
-        // dispatch-PP debug: restrict this segment to a contiguous op range.
-        if (idx < mDbgBwdOpLo || idx >= mDbgBwdOpHi) {
+        // dispatch-PP: restrict this segment to a contiguous op range.
+        if (idx < mBwdOpLo || idx >= mBwdOpHi) {
             continue;
         }
-        // dispatch-PP debug: restrict this stage to the ops owning blocks
+        // dispatch-PP: restrict this stage to the ops owning blocks
         // [LayerLo..LayerHi] by their layer attribution (boundary view ops sit on
         // their block, so no inter-stage gaps). layer<0 ops are split by position:
         // leading loss/lm-head ops -> the loss-owning stage; the trailing embedding
         // op -> the lowest stage (so the embedding gradient is not dropped).
-        if (mDbgBwdLayerFilter) {
+        if (mBwdLayerFilter) {
             bool in_stage;
             if (op_layer_any >= 0) {
-                in_stage = (op_layer_any >= mDbgBwdLayerLo && op_layer_any <= mDbgBwdLayerHi);
+                in_stage = (op_layer_any >= mBwdLayerLo && op_layer_any <= mBwdLayerHi);
             } else {
                 const bool leading = idx < dbg_first_block_op;
                 const bool trailing = idx > dbg_last_block_op;
-                in_stage = (leading && mDbgBwdLayerLoss) || (trailing && mDbgBwdLayerEmbed);
+                in_stage = (leading && mBwdLayerLoss) || (trailing && mBwdLayerEmbed);
             }
             if (!in_stage) {
                 continue;
@@ -1617,10 +1617,10 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         report_backward_op_profile(op_profile_total_ms, op_profile_counts, op_profile_start, op_profile_end);
     }
 
-    // dispatch-PP debug: a following sub-range segment resumes on this state, so
+    // dispatch-PP: a following sub-range segment resumes on this state, so
     // keep the stack, accumulated gradients, and weights intact until the final
     // segment runs the normal cleanup.
-    if (mDbgBwdSkipFinalize) {
+    if (mBwdSkipFinalize) {
         return;
     }
 

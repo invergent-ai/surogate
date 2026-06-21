@@ -1031,15 +1031,15 @@ std::vector<float> DslModel::dispatch_pp_forward_hidden(Tensor inputs,
     }
     // Run the whole forward eagerly but keep state resident (skip finalize) so the
     // final hidden state can be read before pruning, matching the sub-range path.
-    ge->debug_set_forward_op_range(
+    ge->set_forward_op_range(
         0, fwd->ops.size(), /*skip_init=*/false, /*skip_finalize=*/true, /*force_linear=*/true);
     {
         auto request =
             causal_lm_profile().make_forward_request(*mRunState, mModelConfig, mOptions, inputs, position_ids, 0);
         mExecutor->execute_forward(request, comm);
     }
-    auto out = ge->debug_last_block_hidden_f32();
-    ge->debug_clear_forward_op_range();
+    auto out = ge->last_block_hidden_f32();
+    ge->clear_forward_op_range();
     return out;
 }
 
@@ -1070,7 +1070,7 @@ std::vector<float> DslModel::dispatch_pp_forward_subranges(Tensor inputs,
     const std::size_t start_next = fwd->layer_start_indices[static_cast<std::size_t>(split_after_block + 1)];
 
     // Segment 1: embedding + blocks [0 .. split]. Keep state resident for resume.
-    ge->debug_set_forward_op_range(0, end_split, /*skip_init=*/false, /*skip_finalize=*/true, /*force_linear=*/true);
+    ge->set_forward_op_range(0, end_split, /*skip_init=*/false, /*skip_finalize=*/true, /*force_linear=*/true);
     {
         auto request =
             causal_lm_profile().make_forward_request(*mRunState, mModelConfig, mOptions, inputs, position_ids, 0);
@@ -1078,18 +1078,18 @@ std::vector<float> DslModel::dispatch_pp_forward_subranges(Tensor inputs,
     }
 
     // CPU-boundary handoff: round-trip block ``split``'s output residual.
-    ge->debug_roundtrip_block_residual(split_after_block);
+    ge->roundtrip_block_residual(split_after_block);
 
     // Segment 2: blocks [split+1 .. last] + final norm, resuming on shared state.
     // Keep state resident (skip finalize) so the final hidden is read before pruning.
-    ge->debug_set_forward_op_range(start_next, ops_n, /*skip_init=*/true, /*skip_finalize=*/true, /*force_linear=*/true);
+    ge->set_forward_op_range(start_next, ops_n, /*skip_init=*/true, /*skip_finalize=*/true, /*force_linear=*/true);
     {
         auto request =
             causal_lm_profile().make_forward_request(*mRunState, mModelConfig, mOptions, inputs, position_ids, 0);
         mExecutor->execute_forward(request, comm);
     }
-    auto out = ge->debug_last_block_hidden_f32();
-    ge->debug_clear_forward_op_range();
+    auto out = ge->last_block_hidden_f32();
+    ge->clear_forward_op_range();
     return out;
 }
 
@@ -1126,23 +1126,23 @@ void DslModel::dispatch_pp_forward_stage(Tensor inputs,
                                                      : fwd->layer_end_indices[static_cast<std::size_t>(hi)];
 
     if (!inject_named.empty()) {
-        ge->debug_set_inject_named(std::move(inject_named));
+        ge->set_inject_named(std::move(inject_named));
     }
     // Keep block hi's output (x) live so the next stage's GPU can read it.
     if (preserve_output) {
-        ge->debug_set_preserve_layer(hi);
+        ge->set_preserve_layer(hi);
     }
     // skip_finalize keeps the stage's outputs (residual / final hidden) resident
     // for the caller's debug readers and the next stage's boundary read.
-    ge->debug_set_forward_op_range(op_lo, op_hi, /*skip_init=*/false, /*skip_finalize=*/true,
+    ge->set_forward_op_range(op_lo, op_hi, /*skip_init=*/false, /*skip_finalize=*/true,
                                    /*force_linear=*/true);
     {
         auto request =
             causal_lm_profile().make_forward_request(*mRunState, mModelConfig, mOptions, inputs, position_ids, 0);
         mExecutor->execute_forward(request, comm);
     }
-    ge->debug_clear_forward_op_range();
-    ge->debug_clear_inject_named();
+    ge->clear_forward_op_range();
+    ge->clear_inject_named();
 }
 
 void DslModel::dispatch_pp_backward_stage(
@@ -1175,14 +1175,14 @@ void DslModel::dispatch_pp_backward_stage(
     // simplest correct source (the stream-driven path issues per-rank collectives
     // that deadlock on a single GPU); recompute-only provisioning is a later
     // optimization.
-    ge->debug_set_forward_op_range(0, fwd->ops.size(), /*skip_init=*/false, /*skip_finalize=*/false,
+    ge->set_forward_op_range(0, fwd->ops.size(), /*skip_init=*/false, /*skip_finalize=*/false,
                                    /*force_linear=*/true);
     {
         auto fwd_request =
             causal_lm_profile().make_forward_request(*mRunState, mModelConfig, mOptions, inputs, position_ids, 0);
         mExecutor->execute_forward(fwd_request, comm);
     }
-    ge->debug_clear_forward_op_range();
+    ge->clear_forward_op_range();
     // Stash the (mean) loss now, while the per-token Losses buffer is fresh from the
     // forward. reduce_loss (which normally copies it out) is skipped on the dispatch
     // path, so sum the per-token losses locally — no cross-GPU all-reduce.
@@ -1205,10 +1205,10 @@ void DslModel::dispatch_pp_backward_stage(
     }
 
     if (!inject_named.empty()) {
-        ge->debug_set_inject_named(std::move(inject_named));
+        ge->set_inject_named(std::move(inject_named));
     }
     // One GPU per stage on the full batch; skip the DDP grad all-reduce.
-    ge->debug_set_skip_grad_reduce(true);
+    ge->set_skip_grad_reduce(true);
     // Select this stage's ops by their owning block layer [lo..hi] (the loss-owning
     // stage also runs the lm-head/loss ops). This is robust to boundary view ops
     // (e.g. d_blocks[L].mlp_down -> .mlp_down_flat) whose op index sits between
@@ -1216,11 +1216,11 @@ void DslModel::dispatch_pp_backward_stage(
     // run in block L's stage with no inter-stage gap. The op-index range stays
     // full; skip_finalize keeps the stage's input-boundary gradients
     // (d_blocks[lo-1].*) resident for the next (lower) stage's read.
-    ge->debug_set_backward_op_range(0, bwd->ops.size(), /*skip_init=*/false, /*skip_finalize=*/true,
+    ge->set_backward_op_range(0, bwd->ops.size(), /*skip_init=*/false, /*skip_finalize=*/true,
                                     /*force_linear=*/true);
     // The loss-owning stage runs the leading loss/lm-head ops; the lowest stage
     // (lo == 0) runs the trailing embedding-backward op so its gradient is computed.
-    ge->debug_set_backward_layer_range(lo, hi, /*include_loss=*/is_loss_stage, /*include_embed=*/lo == 0);
+    ge->set_backward_layer_range(lo, hi, /*include_loss=*/is_loss_stage, /*include_embed=*/lo == 0);
     {
         auto request =
             causal_lm_profile().make_backward_request(*mRunState, mModelConfig, mOptions, inputs, targets, 1, 0);
@@ -1229,10 +1229,10 @@ void DslModel::dispatch_pp_backward_stage(
         request.reduce_loss_on_completion = false;
         mExecutor->execute_backward(request, comm);
     }
-    ge->debug_clear_backward_op_range();
-    ge->debug_clear_backward_layer_range();
-    ge->debug_clear_inject_named();
-    ge->debug_set_skip_grad_reduce(false);
+    ge->clear_backward_op_range();
+    ge->clear_backward_layer_range();
+    ge->clear_inject_named();
+    ge->set_skip_grad_reduce(false);
 }
 
 std::vector<float> DslModel::dispatch_pp_grad_norms_whole(Tensor inputs,
@@ -1255,16 +1255,16 @@ std::vector<float> DslModel::dispatch_pp_grad_norms_whole(Tensor inputs,
     // path: the stream-driven schedule issues per-rank weight/grad collectives that
     // would deadlock here (only this GPU participates). Also skip the DDP grad
     // all-reduce for the same reason.
-    ge->debug_set_skip_grad_reduce(true);
-    ge->debug_set_forward_op_range(0, fwd->ops.size(), /*skip_init=*/false, /*skip_finalize=*/false,
+    ge->set_skip_grad_reduce(true);
+    ge->set_forward_op_range(0, fwd->ops.size(), /*skip_init=*/false, /*skip_finalize=*/false,
                                    /*force_linear=*/true);
     {
         auto request =
             causal_lm_profile().make_forward_request(*mRunState, mModelConfig, mOptions, inputs, position_ids, 0);
         mExecutor->execute_forward(request, comm);
     }
-    ge->debug_clear_forward_op_range();
-    ge->debug_set_backward_op_range(0, bwd->ops.size(), /*skip_init=*/false, /*skip_finalize=*/false,
+    ge->clear_forward_op_range();
+    ge->set_backward_op_range(0, bwd->ops.size(), /*skip_init=*/false, /*skip_finalize=*/false,
                                     /*force_linear=*/true);
     {
         auto request =
@@ -1274,9 +1274,9 @@ std::vector<float> DslModel::dispatch_pp_grad_norms_whole(Tensor inputs,
         request.reduce_loss_on_completion = false;
         mExecutor->execute_backward(request, comm);
     }
-    ge->debug_clear_backward_op_range();
-    ge->debug_set_skip_grad_reduce(false);
-    return ge->debug_block_grad_norms();
+    ge->clear_backward_op_range();
+    ge->set_skip_grad_reduce(false);
+    return ge->block_grad_norms();
 }
 
 float DslModel::dispatch_pp_train_step(Tensor inputs,
@@ -1309,16 +1309,16 @@ float DslModel::dispatch_pp_train_step(Tensor inputs,
     // the per-token normalization the grads were produced with (else the scale and
     // the grads disagree and the update diverges).
     mUseTokenScale = true;
-    ge->debug_set_forward_op_range(0, fwd->ops.size(), /*skip_init=*/false, /*skip_finalize=*/false,
+    ge->set_forward_op_range(0, fwd->ops.size(), /*skip_init=*/false, /*skip_finalize=*/false,
                                    /*force_linear=*/true);
     {
         auto request =
             causal_lm_profile().make_forward_request(*mRunState, mModelConfig, mOptions, inputs, position_ids, 0);
         mExecutor->execute_forward(request, comm);
     }
-    ge->debug_clear_forward_op_range();
+    ge->clear_forward_op_range();
 
-    ge->debug_set_backward_op_range(0, bwd->ops.size(), /*skip_init=*/false, /*skip_finalize=*/false,
+    ge->set_backward_op_range(0, bwd->ops.size(), /*skip_init=*/false, /*skip_finalize=*/false,
                                     /*force_linear=*/true);
     {
         auto request =
@@ -1326,7 +1326,7 @@ float DslModel::dispatch_pp_train_step(Tensor inputs,
         request.reduce_loss_on_completion = true;  // populates ValidTokenCount for get_loss()
         mExecutor->execute_backward(request, comm);
     }
-    ge->debug_clear_backward_op_range();
+    ge->clear_backward_op_range();
 
     const float loss = get_loss();  // mean loss (raw / valid tokens), available after reduce_loss
     // The optimizer step index is 1-based (Adam bias correction divides by
@@ -1455,7 +1455,7 @@ std::vector<float> DslModel::dispatch_pp_grad_norms_subranges(Tensor inputs,
         throw std::runtime_error("dispatch_pp_grad_norms_subranges: requires the DSL GraphExecutor");
     }
     // One GPU, full batch; skip the DDP grad all-reduce (deadlocks on multi-GPU).
-    ge->debug_set_skip_grad_reduce(true);
+    ge->set_skip_grad_reduce(true);
 
     const long B = inputs.Sizes[0];
     const long T = inputs.Sizes[1];
@@ -1468,14 +1468,14 @@ std::vector<float> DslModel::dispatch_pp_grad_norms_subranges(Tensor inputs,
     // Whole-graph forward (forced-eager: the stream-driven path issues per-rank
     // collectives that deadlock on a single GPU) saves the activations the backward
     // consumes.
-    ge->debug_set_forward_op_range(0, fwd->ops.size(), /*skip_init=*/false, /*skip_finalize=*/false,
+    ge->set_forward_op_range(0, fwd->ops.size(), /*skip_init=*/false, /*skip_finalize=*/false,
                                    /*force_linear=*/true);
     {
         auto request =
             causal_lm_profile().make_forward_request(*mRunState, mModelConfig, mOptions, inputs, position_ids, 0);
         mExecutor->execute_forward(request, comm);
     }
-    ge->debug_clear_forward_op_range();
+    ge->clear_forward_op_range();
     const int num_layers = static_cast<int>(mModelConfig.NumLayers);
     if (split_after_block < 0 || split_after_block >= num_layers - 1) {
         throw std::runtime_error("dispatch_pp_grad_norms_subranges: split must be in [0, num_layers-2]");
@@ -1493,7 +1493,7 @@ std::vector<float> DslModel::dispatch_pp_grad_norms_subranges(Tensor inputs,
     const std::size_t ops_n = bwd->ops.size();
     (void)split_after_block;
 
-    ge->debug_set_backward_op_range(0, ops_n, /*skip_init=*/false, /*skip_finalize=*/false, /*force_linear=*/true);
+    ge->set_backward_op_range(0, ops_n, /*skip_init=*/false, /*skip_finalize=*/false, /*force_linear=*/true);
     {
         auto request =
             causal_lm_profile().make_backward_request(*mRunState, mModelConfig, mOptions, inputs, targets, 1, 0);
@@ -1502,10 +1502,10 @@ std::vector<float> DslModel::dispatch_pp_grad_norms_subranges(Tensor inputs,
         request.reduce_loss_on_completion = false;
         mExecutor->execute_backward(request, comm);
     }
-    ge->debug_clear_backward_op_range();
-    ge->debug_set_skip_grad_reduce(false);
+    ge->clear_backward_op_range();
+    ge->set_skip_grad_reduce(false);
 
-    return ge->debug_block_grad_norms();
+    return ge->block_grad_norms();
 }
 
 }  // namespace dsl

@@ -1666,7 +1666,7 @@ ExecutionResult GraphExecutor::execute_backward(const ExecutionRequest& request,
     rs.zero_activation_gradients(rs.MainStream);
 
     const bool last_step = request.micro_step == request.grad_accum_steps - 1;
-    if (last_step && request.reduce_loss_on_completion && !mDbgSkipGradReduce) {
+    if (last_step && request.reduce_loss_on_completion && !mSkipGradReduce) {
         reduce_loss(rs, request.batch, request.sequence, comm);
         comm.all_reduce_sum_int(rs.ValidTokenCount.template get<int>(), /*n=*/1, rs.MainStream);
     }
@@ -1696,7 +1696,7 @@ ExecutionResult GraphExecutor::execute_backward(const ExecutionRequest& request,
     mActiveExecutionRequest = nullptr;
 
     grads.end_micro_step(rs.MainStream, comm);
-    if (last_step && comm.world_size() > 1 && !mDbgSkipGradReduce) {
+    if (last_step && comm.world_size() > 1 && !mSkipGradReduce) {
         if (grads.is_overlapped_enabled()) {
             CUDA_CHECK(cudaEventRecord(rs.side_stream_event(), rs.side_stream()));
             CUDA_CHECK(cudaStreamWaitEvent(rs.MainStream, rs.side_stream_event(), 0));
@@ -1961,7 +1961,7 @@ std::vector<float> dbg_tensor_to_host_f32(const Tensor& t, cudaStream_t stream) 
             out[i] = f;
         }
     } else {
-        throw std::runtime_error("dispatch-PP debug: unsupported tensor dtype for host copy");
+        throw std::runtime_error("dispatch-PP: unsupported tensor dtype for host copy");
     }
     return out;
 }
@@ -1971,7 +1971,7 @@ std::vector<float> dbg_tensor_to_host_f32(const Tensor& t, cudaStream_t stream) 
 void dbg_roundtrip_through_host(Tensor& t, cudaStream_t stream) {
     const std::size_t bytes = t.bytes();
     if (bytes == 0 || !t.Data) {
-        throw std::runtime_error("dispatch-PP debug: empty tensor for host round-trip");
+        throw std::runtime_error("dispatch-PP: empty tensor for host round-trip");
     }
     std::vector<std::byte> host(bytes);
     CUDA_CHECK(cudaMemcpyAsync(host.data(), t.Data, bytes, cudaMemcpyDeviceToHost, stream));
@@ -1982,39 +1982,39 @@ void dbg_roundtrip_through_host(Tensor& t, cudaStream_t stream) {
 
 }  // namespace
 
-void GraphExecutor::debug_set_forward_op_range(
+void GraphExecutor::set_forward_op_range(
     std::size_t lo, std::size_t hi, bool skip_init, bool skip_finalize, bool force_linear) {
     if (mCompiledExecutor)
-        mCompiledExecutor->set_debug_forward_op_range(lo, hi, skip_init, skip_finalize, force_linear);
+        mCompiledExecutor->set_forward_op_range(lo, hi, skip_init, skip_finalize, force_linear);
 }
-void GraphExecutor::debug_clear_forward_op_range() {
-    if (mCompiledExecutor) mCompiledExecutor->clear_debug_forward_op_range();
+void GraphExecutor::clear_forward_op_range() {
+    if (mCompiledExecutor) mCompiledExecutor->clear_forward_op_range();
 }
-void GraphExecutor::debug_set_backward_op_range(
+void GraphExecutor::set_backward_op_range(
     std::size_t lo, std::size_t hi, bool skip_init, bool skip_finalize, bool force_linear) {
     if (mCompiledExecutor)
-        mCompiledExecutor->set_debug_backward_op_range(lo, hi, skip_init, skip_finalize, force_linear);
+        mCompiledExecutor->set_backward_op_range(lo, hi, skip_init, skip_finalize, force_linear);
 }
-void GraphExecutor::debug_clear_backward_op_range() {
-    if (mCompiledExecutor) mCompiledExecutor->clear_debug_backward_op_range();
+void GraphExecutor::clear_backward_op_range() {
+    if (mCompiledExecutor) mCompiledExecutor->clear_backward_op_range();
 }
-void GraphExecutor::debug_set_backward_layer_range(int lo, int hi, bool include_loss, bool include_embed) {
-    if (mCompiledExecutor) mCompiledExecutor->set_debug_backward_layer_range(lo, hi, include_loss, include_embed);
+void GraphExecutor::set_backward_layer_range(int lo, int hi, bool include_loss, bool include_embed) {
+    if (mCompiledExecutor) mCompiledExecutor->set_backward_layer_range(lo, hi, include_loss, include_embed);
 }
-void GraphExecutor::debug_clear_backward_layer_range() {
-    if (mCompiledExecutor) mCompiledExecutor->clear_debug_backward_layer_range();
-}
-
-void GraphExecutor::debug_set_preserve_layer(int layer) {
-    if (mCompiledExecutor) mCompiledExecutor->set_debug_preserve_layer(layer);
+void GraphExecutor::clear_backward_layer_range() {
+    if (mCompiledExecutor) mCompiledExecutor->clear_backward_layer_range();
 }
 
-void GraphExecutor::debug_set_skip_grad_reduce(bool skip) {
-    mDbgSkipGradReduce = skip;
-    if (mCompiledExecutor) mCompiledExecutor->set_debug_skip_grad_reduce(skip);
+void GraphExecutor::set_preserve_layer(int layer) {
+    if (mCompiledExecutor) mCompiledExecutor->set_preserve_layer(layer);
 }
 
-std::vector<std::byte> GraphExecutor::debug_read_named_bytes(const std::string& name) {
+void GraphExecutor::set_skip_grad_reduce(bool skip) {
+    mSkipGradReduce = skip;
+    if (mCompiledExecutor) mCompiledExecutor->set_skip_grad_reduce(skip);
+}
+
+std::vector<std::byte> GraphExecutor::read_named_bytes(const std::string& name) {
     std::vector<std::byte> host;
     if (!mCompiledExecutor) return host;
     const Tensor* t = mCompiledExecutor->try_get_tensor(name);
@@ -2027,19 +2027,19 @@ std::vector<std::byte> GraphExecutor::debug_read_named_bytes(const std::string& 
     return host;
 }
 
-void GraphExecutor::debug_set_inject_named(std::vector<std::pair<std::string, std::vector<std::byte>>> items) {
-    if (mCompiledExecutor) mCompiledExecutor->set_debug_inject_named(std::move(items));
+void GraphExecutor::set_inject_named(std::vector<std::pair<std::string, std::vector<std::byte>>> items) {
+    if (mCompiledExecutor) mCompiledExecutor->set_inject_named(std::move(items));
 }
 
-void GraphExecutor::debug_clear_inject_named() {
-    if (mCompiledExecutor) mCompiledExecutor->clear_debug_inject_named();
+void GraphExecutor::clear_inject_named() {
+    if (mCompiledExecutor) mCompiledExecutor->clear_inject_named();
 }
 
-void GraphExecutor::debug_restore_stage_base() {
-    if (mCompiledExecutor) mCompiledExecutor->debug_restore_stage_base();
+void GraphExecutor::restore_stage_base() {
+    if (mCompiledExecutor) mCompiledExecutor->restore_stage_base();
 }
 
-std::vector<float> GraphExecutor::debug_last_block_hidden_f32() {
+std::vector<float> GraphExecutor::last_block_hidden_f32() {
     // The last block's output residual is the dispatch-PP boundary hidden. It is
     // a resident block slot while execution state is live (read before finalize),
     // or a named residual tensor. Try the block slot first, then the names the
@@ -2056,18 +2056,18 @@ std::vector<float> GraphExecutor::debug_last_block_hidden_f32() {
             }
         }
     }
-    throw std::runtime_error("debug_last_block_hidden_f32: could not resolve the final hidden state");
+    throw std::runtime_error("last_block_hidden_f32: could not resolve the final hidden state");
 }
 
-void GraphExecutor::debug_roundtrip_block_residual(int block) {
+void GraphExecutor::roundtrip_block_residual(int block) {
     Tensor* t = dbg_block_residual_out(mRunState, block);
     if (!t) {
-        throw std::runtime_error("debug_roundtrip_block_residual: no resident residual for block");
+        throw std::runtime_error("roundtrip_block_residual: no resident residual for block");
     }
     dbg_roundtrip_through_host(*t, mRunState.MainStream);
 }
 
-std::vector<float> GraphExecutor::debug_block_grad_norms() {
+std::vector<float> GraphExecutor::block_grad_norms() {
     const int num_layers = static_cast<int>(mConfig.NumLayers);
     std::vector<double> sumsq(static_cast<std::size_t>(std::max(0, num_layers)), 0.0);
     const auto& gmap = mGrads.grads();

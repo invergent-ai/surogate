@@ -115,7 +115,7 @@ public:
     // Run one forward stage (blocks [lo..hi]) eagerly, leaving state resident.
     // When inject_layer >= 0, inject ``inject_host`` into get_residual(inject_layer)
     // first (the cross-GPU activation handoff). Read the result via the executor's
-    // debug readers (debug_read_residual_bytes / debug_last_block_hidden_f32).
+    // debug readers (debug_read_residual_bytes / last_block_hidden_f32).
     void dispatch_pp_forward_stage(Tensor inputs,
                                          Tensor position_ids,
                                          NCCLCommunicator& comm,
@@ -127,8 +127,8 @@ public:
     // provide activations, then the bounded backward for [lo..hi]. is_loss_stage
     // (the stage owning the last block) backpropagates from the loss; otherwise
     // inject the incoming boundary gradients (d_blocks[hi].res_att / .mlp_down).
-    // Read results via the executor debug readers (debug_block_grad_norms,
-    // debug_read_named_bytes for d_blocks[lo-1].*).
+    // Read results via the executor debug readers (block_grad_norms,
+    // read_named_bytes for d_blocks[lo-1].*).
     void dispatch_pp_backward_stage(Tensor inputs,
                                           Tensor targets,
                                           Tensor position_ids,

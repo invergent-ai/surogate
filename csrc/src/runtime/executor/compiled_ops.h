@@ -172,115 +172,115 @@ public:
     // share one executor state, and force the flat-ops path (no instruction
     // stream). Defaults reproduce whole-graph behavior exactly. Resident
     // weights only; not capture-safe (eager single-GPU parity check).
-    void set_debug_forward_op_range(std::size_t lo,
+    void set_forward_op_range(std::size_t lo,
                                     std::size_t hi,
                                     bool skip_init,
                                     bool skip_finalize,
                                     bool force_linear) {
-        mDbgFwdOpLo = lo;
-        mDbgFwdOpHi = hi;
-        mDbgFwdSkipInit = skip_init;
-        mDbgFwdSkipFinalize = skip_finalize;
-        mDbgForceLinear = force_linear;
+        mFwdOpLo = lo;
+        mFwdOpHi = hi;
+        mFwdSkipInit = skip_init;
+        mFwdSkipFinalize = skip_finalize;
+        mForceLinear = force_linear;
     }
-    void clear_debug_forward_op_range() {
-        mDbgFwdOpLo = 0;
-        mDbgFwdOpHi = SIZE_MAX;
-        mDbgFwdSkipInit = false;
-        mDbgFwdSkipFinalize = false;
-        mDbgForceLinear = false;
-        mDbgPreserveLayer = -1;
+    void clear_forward_op_range() {
+        mFwdOpLo = 0;
+        mFwdOpHi = SIZE_MAX;
+        mFwdSkipInit = false;
+        mFwdSkipFinalize = false;
+        mForceLinear = false;
+        mPreserveLayer = -1;
     }
-    void set_debug_backward_op_range(std::size_t lo,
+    void set_backward_op_range(std::size_t lo,
                                      std::size_t hi,
                                      bool skip_init,
                                      bool skip_finalize,
                                      bool force_linear) {
-        mDbgBwdOpLo = lo;
-        mDbgBwdOpHi = hi;
-        mDbgBwdSkipInit = skip_init;
-        mDbgBwdSkipFinalize = skip_finalize;
-        mDbgForceLinear = force_linear;
+        mBwdOpLo = lo;
+        mBwdOpHi = hi;
+        mBwdSkipInit = skip_init;
+        mBwdSkipFinalize = skip_finalize;
+        mForceLinear = force_linear;
     }
-    void clear_debug_backward_op_range() {
-        mDbgBwdOpLo = 0;
-        mDbgBwdOpHi = SIZE_MAX;
-        mDbgBwdSkipInit = false;
-        mDbgBwdSkipFinalize = false;
-        mDbgForceLinear = false;
+    void clear_backward_op_range() {
+        mBwdOpLo = 0;
+        mBwdOpHi = SIZE_MAX;
+        mBwdSkipInit = false;
+        mBwdSkipFinalize = false;
+        mForceLinear = false;
     }
     // Restrict the backward pass to the ops owning blocks [lo..hi] by their layer
     // attribution (robust to layer_start/end_indices not aligning with boundary
     // view ops). include_loss also runs the loss/lm-head ops (layer < 0). This is
     // the dispatch-PP stage selector; it composes with the op-index range above.
-    void set_debug_backward_layer_range(int lo, int hi, bool include_loss, bool include_embed) {
-        mDbgBwdLayerLo = lo;
-        mDbgBwdLayerHi = hi;
-        mDbgBwdLayerLoss = include_loss;
-        mDbgBwdLayerEmbed = include_embed;
-        mDbgBwdLayerFilter = true;
+    void set_backward_layer_range(int lo, int hi, bool include_loss, bool include_embed) {
+        mBwdLayerLo = lo;
+        mBwdLayerHi = hi;
+        mBwdLayerLoss = include_loss;
+        mBwdLayerEmbed = include_embed;
+        mBwdLayerFilter = true;
     }
-    void clear_debug_backward_layer_range() {
-        mDbgBwdLayerFilter = false;
-        mDbgBwdLayerLo = -1;
-        mDbgBwdLayerHi = -1;
-        mDbgBwdLayerLoss = false;
-        mDbgBwdLayerEmbed = false;
+    void clear_backward_layer_range() {
+        mBwdLayerFilter = false;
+        mBwdLayerLo = -1;
+        mBwdLayerHi = -1;
+        mBwdLayerLoss = false;
+        mBwdLayerEmbed = false;
     }
     // Inject a host residual into get_residual(layer) after forward init, before
     // the op loop — the cross-GPU activation handoff for the dispatch-PP pool. A
     // resumed stage [lo..] reads get_residual(lo-1) as its first block's input.
     // Keep block ``layer``'s stack tensors (incl. its output = ``x``) live past
     // its layer-end so the cross-GPU boundary can read them. -1 = off.
-    void set_debug_preserve_layer(int layer) {
-        mDbgPreserveLayer = layer;
+    void set_preserve_layer(int layer) {
+        mPreserveLayer = layer;
     }
-    // Skip the per-layer cross-GPU gradient all-reduce. The dispatch-PP debug
+    // Skip the per-layer cross-GPU gradient all-reduce. The dispatch-PP
     // backward runs one GPU at a time on the full batch, so a DDP all-reduce would
     // deadlock waiting for idle GPUs (and is unwanted — each GPU owns its blocks).
-    void set_debug_skip_grad_reduce(bool skip) {
-        mDbgSkipGradReduce = skip;
+    void set_skip_grad_reduce(bool skip) {
+        mSkipGradReduce = skip;
     }
     // Bind named boundary tensors (each [B,T,hidden] bf16) into the executor after
     // forward init, before the op loop — the cross-GPU handoff. Targets the exact
     // graph tids the resumed stage's first block reads (blocks[hi].res_ffn = the
     // residual, blocks[hi].mlp_down = x). Buffers are owned here and freed on the
     // next inject / clear.
-    void set_debug_inject_named(std::vector<std::pair<std::string, std::vector<std::byte>>> items) {
-        mDbgInjectNamed = std::move(items);
+    void set_inject_named(std::vector<std::pair<std::string, std::vector<std::byte>>> items) {
+        mInjectNamed = std::move(items);
     }
-    void clear_debug_inject_named();  // frees the device buffers
-    void apply_debug_named_inject();  // bind staged named tensors (fwd + bwd boundary handoff)
+    void clear_inject_named();  // frees the device buffers
+    void apply_named_inject();  // bind staged named tensors (fwd + bwd boundary handoff)
     // Restore the stack to the stage's post-init base, dropping the (preserved)
     // stage's block allocations after the boundary read — so a GPU reused for a
     // later stage starts clean. No-op if no base was captured.
-    void debug_restore_stage_base() {
-        if (mDbgStageBaseValid) {
-            mRunState.Stack.restore(mDbgStageBase);
-            mDbgStageBaseValid = false;
+    void restore_stage_base() {
+        if (mStageBaseValid) {
+            mRunState.Stack.restore(mStageBase);
+            mStageBaseValid = false;
         }
     }
 
-    std::size_t mDbgFwdOpLo = 0;
-    std::size_t mDbgFwdOpHi = SIZE_MAX;
-    bool mDbgFwdSkipInit = false;
-    bool mDbgFwdSkipFinalize = false;
-    std::size_t mDbgBwdOpLo = 0;
-    std::size_t mDbgBwdOpHi = SIZE_MAX;
-    bool mDbgBwdSkipInit = false;
-    bool mDbgBwdSkipFinalize = false;
-    bool mDbgForceLinear = false;
-    int mDbgPreserveLayer = -1;
-    bool mDbgSkipGradReduce = false;
-    bool mDbgBwdLayerFilter = false;
-    int mDbgBwdLayerLo = -1;
-    int mDbgBwdLayerHi = -1;
-    bool mDbgBwdLayerLoss = false;
-    bool mDbgBwdLayerEmbed = false;
-    std::vector<std::pair<std::string, std::vector<std::byte>>> mDbgInjectNamed;
-    std::vector<void*> mDbgInjectBuffers;  // device buffers backing mDbgInjectNamed binds
-    DeviceMemoryStack::Checkpoint mDbgStageBase{};
-    bool mDbgStageBaseValid = false;
+    std::size_t mFwdOpLo = 0;
+    std::size_t mFwdOpHi = SIZE_MAX;
+    bool mFwdSkipInit = false;
+    bool mFwdSkipFinalize = false;
+    std::size_t mBwdOpLo = 0;
+    std::size_t mBwdOpHi = SIZE_MAX;
+    bool mBwdSkipInit = false;
+    bool mBwdSkipFinalize = false;
+    bool mForceLinear = false;
+    int mPreserveLayer = -1;
+    bool mSkipGradReduce = false;
+    bool mBwdLayerFilter = false;
+    int mBwdLayerLo = -1;
+    int mBwdLayerHi = -1;
+    bool mBwdLayerLoss = false;
+    bool mBwdLayerEmbed = false;
+    std::vector<std::pair<std::string, std::vector<std::byte>>> mInjectNamed;
+    std::vector<void*> mInjectBuffers;  // device buffers backing mInjectNamed binds
+    DeviceMemoryStack::Checkpoint mStageBase{};
+    bool mStageBaseValid = false;
     void set_debug_dump_fn(std::function<void(const std::vector<std::string>&, int)> fn) {
         mDebugDumpFn = std::move(fn);
     }

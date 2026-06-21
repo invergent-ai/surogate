@@ -562,32 +562,32 @@ void CompiledExecutor::snapshot_forward_execution_state() {
     mForwardNamedTensorsSnapshot = mNamedTensors;
 }
 
-void CompiledExecutor::clear_debug_inject_named() {
-    for (void* p : mDbgInjectBuffers) {
+void CompiledExecutor::clear_inject_named() {
+    for (void* p : mInjectBuffers) {
         if (p) cudaFree(p);
     }
-    mDbgInjectBuffers.clear();
-    mDbgInjectNamed.clear();
+    mInjectBuffers.clear();
+    mInjectNamed.clear();
 }
 
 // Bind staged named boundary tensors (each [B,T,hidden] bf16) into the exact graph
 // tids the resumed stage reads — the cross-GPU handoff. Used by both forward (the
 // carried activations blocks[hi].res_att / mlp_down) and backward (the carried
 // gradients d_blocks[hi].res_att / mlp_down). Backs each with an owned device buffer.
-void CompiledExecutor::apply_debug_named_inject() {
-    if (mDbgInjectNamed.empty()) return;
-    for (void* p : mDbgInjectBuffers) {
+void CompiledExecutor::apply_named_inject() {
+    if (mInjectNamed.empty()) return;
+    for (void* p : mInjectBuffers) {
         if (p) cudaFree(p);
     }
-    mDbgInjectBuffers.clear();
+    mInjectBuffers.clear();
     int dev = 0;
     cudaGetDevice(&dev);
     const long H = static_cast<long>(mConfig.HiddenSize);
-    for (auto& [name, bytes] : mDbgInjectNamed) {
+    for (auto& [name, bytes] : mInjectNamed) {
         if (bytes.empty()) continue;
         void* buf = nullptr;
         CUDA_CHECK(cudaMalloc(&buf, bytes.size()));
-        mDbgInjectBuffers.push_back(buf);
+        mInjectBuffers.push_back(buf);
         CUDA_CHECK(cudaMemcpyAsync(buf, bytes.data(), bytes.size(), cudaMemcpyHostToDevice,
                                    mRunState.MainStream));
         Tensor t{};
@@ -607,19 +607,19 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                                        NCCLCommunicator& comm,
                                        bool full,
                                        const modules::ForwardHook* hook) {
-    // dispatch-PP debug: a resumed sub-range segment shares the prior segment's
+    // dispatch-PP: a resumed sub-range segment shares the prior segment's
     // executor state, so skip the (re)initialization that would clear
     // mTensors/mNamedTensors and the cross-block residual.
-    if (!mDbgFwdSkipInit) {
+    if (!mFwdSkipInit) {
         initialize_forward_execution(graph, comm, full);
     }
-    apply_debug_named_inject();
-    // dispatch-PP debug: when preserving a stage's last block (so its boundary
+    apply_named_inject();
+    // dispatch-PP: when preserving a stage's last block (so its boundary
     // tensors survive the read), capture the post-init stack base so the caller
     // can restore it after the read and a reused GPU starts clean.
-    if (mDbgPreserveLayer >= 0) {
-        mDbgStageBase = mRunState.Stack.checkpoint();
-        mDbgStageBaseValid = true;
+    if (mPreserveLayer >= 0) {
+        mStageBase = mRunState.Stack.checkpoint();
+        mStageBaseValid = true;
     }
     const int num_layers = static_cast<int>(mConfig.NumLayers);
     // Reuse member vectors to avoid per-forward heap allocations.
@@ -693,10 +693,10 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                                                 forward_replay_active,
                                                 arena_persists,
                                                 cudaMalloc_persists);
-            // dispatch-PP debug: preserve a stage's last block so its output ``x``
+            // dispatch-PP: preserve a stage's last block so its output ``x``
             // (BlockHOut) stays live for the cross-GPU boundary read — the stack
             // restore/prune below would otherwise free it.
-            if (L != mDbgPreserveLayer) {
+            if (L != mPreserveLayer) {
                 mRunState.Stack.restore(layer_checkpoints[static_cast<std::size_t>(L)]);
                 if (mTemps.size() > layer_temp_marks[static_cast<std::size_t>(L)]) {
                     mTemps.resize(layer_temp_marks[static_cast<std::size_t>(L)]);
@@ -922,7 +922,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     // loop below remains the path when capturing (CUDA graph capture needs
     // the single-pass op walk) or when the compiler did not emit an
     // instruction stream.
-    const bool stream_driven = !graph.instruction_stream.empty() && !mCapturing && !mDbgForceLinear;
+    const bool stream_driven = !graph.instruction_stream.empty() && !mCapturing && !mForceLinear;
     if (stream_driven) {
         if (const char* env = std::getenv("SUROGATE_DEBUG_PHASE_INTERPRETER")) {
             if (std::string(env) == "1") {
@@ -1058,8 +1058,8 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
         if (!full && !graph.required_mask.empty() && !graph.required_mask[idx]) {
             continue;
         }
-        // dispatch-PP debug: restrict this segment to a contiguous op range.
-        if (idx < mDbgFwdOpLo || idx >= mDbgFwdOpHi) {
+        // dispatch-PP: restrict this segment to a contiguous op range.
+        if (idx < mFwdOpLo || idx >= mFwdOpHi) {
             continue;
         }
 
@@ -1338,11 +1338,11 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
         }
     }
 
-    // dispatch-PP debug: when an additional sub-range segment will resume on
+    // dispatch-PP: when an additional sub-range segment will resume on
     // this executor state, keep weights resident, the active-executor binding,
     // and the live tensor table intact (the next segment reads the cross-block
     // residual from it). The final segment runs the normal finalize.
-    if (mDbgFwdSkipFinalize) {
+    if (mFwdSkipFinalize) {
         return;
     }
 

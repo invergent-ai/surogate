@@ -28,7 +28,7 @@
 //   * The eager flat-ops loop (compiled_ops_execute_forward.cpp) dispatches ops by
 //     index and polls op.layer_start / op.layer_end to drive the per-layer
 //     handlers. This harness reuses that exact machinery via debug op-range bounds
-//     (CompiledExecutor::set_debug_forward_op_range / _backward_op_range): two
+//     (CompiledExecutor::set_forward_op_range / _backward_op_range): two
 //     contiguous segments run on one shared executor state, in eager mode (no
 //     CUDA-graph capture, no instruction-stream path).
 //   * The inter-block boundary residual is a stable slot buffer

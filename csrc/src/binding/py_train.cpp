@@ -2005,15 +2005,15 @@ std::vector<float> MultiGPUPyTrainer::dispatch_pp_forward_hidden_multigpu(
                                                        /*preserve_output=*/!is_last);
                 auto* ge = model->graph_executor();
                 if (is_last) {
-                    final_hidden = ge->debug_last_block_hidden_f32();
+                    final_hidden = ge->last_block_hidden_f32();
                 } else {
                     const std::string res_name = "blocks[" + std::to_string(hi) + "].res_att";
                     const std::string x_name = "blocks[" + std::to_string(hi) + "].mlp_down";
-                    next_boundary.emplace_back(res_name, ge->debug_read_named_bytes(res_name));
-                    next_boundary.emplace_back(x_name, ge->debug_read_named_bytes(x_name));
+                    next_boundary.emplace_back(res_name, ge->read_named_bytes(res_name));
+                    next_boundary.emplace_back(x_name, ge->read_named_bytes(x_name));
                     // Drop the preserved stage's stack allocations now that the
                     // boundary is read, so this GPU is clean if reused (round-robin).
-                    ge->debug_restore_stage_base();
+                    ge->restore_stage_base();
                 }
             },
             gpu);
@@ -2067,12 +2067,12 @@ std::vector<float> MultiGPUPyTrainer::dispatch_pp_grad_norms_multigpu(
                                                         is_loss_stage,
                                                         std::move(inject_named));
                 auto* ge = model->graph_executor();
-                stage_norms = ge->debug_block_grad_norms();
+                stage_norms = ge->block_grad_norms();
                 if (lo > 0) {
                     const std::string rn = "d_blocks[" + std::to_string(lo - 1) + "].res_att";
                     const std::string xn = "d_blocks[" + std::to_string(lo - 1) + "].mlp_down";
-                    next_boundary.emplace_back(rn, ge->debug_read_named_bytes(rn));
-                    next_boundary.emplace_back(xn, ge->debug_read_named_bytes(xn));
+                    next_boundary.emplace_back(rn, ge->read_named_bytes(rn));
+                    next_boundary.emplace_back(xn, ge->read_named_bytes(xn));
                 }
             },
             gpu);
@@ -2157,8 +2157,8 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
                 if (lo > 0) {
                     const std::string rn = "d_blocks[" + std::to_string(lo - 1) + "].res_att";
                     const std::string xn = "d_blocks[" + std::to_string(lo - 1) + "].mlp_down";
-                    next_boundary.emplace_back(rn, ge->debug_read_named_bytes(rn));
-                    next_boundary.emplace_back(xn, ge->debug_read_named_bytes(xn));
+                    next_boundary.emplace_back(rn, ge->read_named_bytes(rn));
+                    next_boundary.emplace_back(xn, ge->read_named_bytes(xn));
                 }
             },
             gpu);
