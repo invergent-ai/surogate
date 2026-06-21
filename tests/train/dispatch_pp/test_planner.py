@@ -8,6 +8,7 @@ from surogate.train.dispatch_pp.planner import (
     token_threshold,
     microbatch_warning,
     envelope_warning,
+    assign_numa,
 )
 
 
@@ -197,3 +198,28 @@ def test_envelope_warning_fires_below_token_threshold():
 def test_envelope_warning_silent_above_token_threshold():
     w = envelope_warning(tokens_per_step=8192, gpu_flops=80e12, pcie_bw=20e9)
     assert w is None
+
+
+def test_frozen_lora_base_stage_marked_no_grad():
+    # all base blocks frozen -> every produced stage has needs_grad False.
+    profiles = [BlockProfile(1.0, 3.0, 1, 0, needs_grad=False) for _ in range(6)]
+    plan = plan_stages(profiles, min_stages=2, upper_threshold=1.1,
+                       vram_budget_bytes=10**18)
+    all_stages = plan.fwd_stages + [plan.fused_tail] + plan.bwd_stages
+    assert all(s.needs_grad is False for s in all_stages)
+
+
+def test_assign_numa_round_robin_by_socket():
+    plan = plan_stages(_uniform_profiles(8, 1.0, 3.0), min_stages=2,
+                       upper_threshold=1.1, vram_budget_bytes=10**18)
+    placed = assign_numa(plan, num_numa_nodes=2)
+    nodes = [s.numa_node for s in placed.fwd_stages] + [placed.fused_tail.numa_node]
+    assert set(n for n in nodes if n is not None) <= {0, 1}
+    assert all(n is not None for n in nodes)
+
+
+def test_assign_numa_single_socket_is_none():
+    plan = plan_stages(_uniform_profiles(4, 1.0, 3.0), min_stages=1,
+                       upper_threshold=1.1, vram_budget_bytes=10**18)
+    placed = assign_numa(plan, num_numa_nodes=1)
+    assert placed.fused_tail.numa_node is None

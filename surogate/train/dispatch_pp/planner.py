@@ -9,6 +9,7 @@ proxy under a per-stage VRAM ceiling.
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Sequence
 
 from .types import BlockProfile, StageRange, StagePlan
@@ -251,4 +252,36 @@ def plan_stages(
         bwd_stages=backward,
         num_blocks=n,
         warnings=warnings,
+    )
+
+
+def assign_numa(plan: StagePlan, num_numa_nodes: int) -> StagePlan:
+    """Assign each stage a preferred NUMA node so the scheduler can place pinned
+    weights and bias dispatch. Single-socket (``num_numa_nodes <= 1``) -> None.
+
+    Forward-path stages are spread round-robin by block order so consecutive
+    stages land on alternating sockets, balancing host-memory bandwidth; the
+    matching backward stage inherits its block range's node.
+    """
+    if num_numa_nodes <= 1:
+        return plan  # numa_node already None on every StageRange
+
+    fwd_path = list(plan.fwd_stages) + [plan.fused_tail]
+    node_of_block: dict[int, int] = {}
+    placed_fwd = []
+    for idx, s in enumerate(fwd_path):
+        node = idx % num_numa_nodes
+        placed_fwd.append(dataclasses.replace(s, numa_node=node))
+        for b in range(s.lo, s.hi + 1):
+            node_of_block[b] = node
+
+    placed_back = [
+        dataclasses.replace(s, numa_node=node_of_block.get(s.lo, 0))
+        for s in plan.bwd_stages
+    ]
+    return dataclasses.replace(
+        plan,
+        fwd_stages=placed_fwd[:-1],
+        fused_tail=placed_fwd[-1],
+        bwd_stages=placed_back,
     )
