@@ -1050,14 +1050,15 @@ class SurogateTrainerWrapper:
         # on the master replica, and broadcasts the updated weights.
         # The resident round-robin stage scheduler runs each stage's whole forward,
         # so it needs the model's weights to fit in one GPU (offload_master off).
-        # With offload_master (large models), fall back to the streaming normal-loop;
-        # per-stage weight streaming inside the scheduler is the remaining work.
-        self._dispatch_pp = self.config.parallelism == "dispatch_pp" and not self.config.offload_master
-        if self.config.parallelism == "dispatch_pp" and self.config.offload_master:
-            logger.info(
-                "[dispatch_pp]: offload_master set -> using the streaming training path "
-                "(resident stage scheduler is bypassed)."
-            )
+        # The resident stage scheduler handles BOTH weight-residency modes: with
+        # offload_master the base weights live in pinned CPU and the force-linear
+        # execution streams each block to the GPU on demand (gather_block /
+        # release_block via handle_layer_start/end), bounding resident base weights to
+        # the prefetch double-buffer (~2 blocks) -- so the full model never sits
+        # resident. Without offload_master the base weights stay resident.
+        self._dispatch_pp = self.config.parallelism == "dispatch_pp"
+        if self._dispatch_pp and self.config.offload_master:
+            logger.info("[dispatch_pp]: offload_master set -> base weights stream from CPU per block.")
         if self._dispatch_pp:
             mc = self.config.model_info.config
             n_layers = getattr(mc, "num_hidden_layers", 0) or getattr(

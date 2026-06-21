@@ -765,34 +765,32 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         if not self.recompute:
             logger.info("[dispatch_pp]: enabling recompute (activation memory must be bounded).")
             self.recompute = True
-        # offload_residual is INCOMPATIBLE with the resident stage scheduler: the
-        # cross-stage forward handoff reads block hi's residual by name, and offloading
-        # it to pinned CPU asynchronously races that read (non-deterministic stage
-        # inputs -> corrupted gradients). The pipelined per-stage forward already bounds
-        # resident activations to one stage, so offload isn't needed here; use more
-        # (smaller) stages if a single stage doesn't fit. Only the streaming fallback
-        # (offload_master) keeps offload_residual for depth-independent memory.
-        if self.offload_master:
-            if not self.offload_residual:
-                logger.info("[dispatch_pp]: enabling offload_residual (streaming path, depth-independent memory).")
-                self.offload_residual = True
-        elif self.offload_residual:
+        # offload_residual is INCOMPATIBLE with the stage scheduler (both weight modes):
+        # the cross-stage forward handoff reads block hi's residual by name, and
+        # offloading it to pinned CPU asynchronously races that read (non-deterministic
+        # stage inputs -> corrupted gradients). The pipelined per-stage forward already
+        # bounds resident activations to one stage, so offload isn't needed; use more
+        # (smaller) stages if a single stage's activations don't fit. (Base-weight
+        # streaming via offload_master is orthogonal and stays available.)
+        if self.offload_residual:
             logger.info(
-                "[dispatch_pp]: disabling offload_residual (it races the resident scheduler's "
-                "cross-stage forward boundary handoff; per-stage forward already bounds activations)."
+                "[dispatch_pp]: disabling offload_residual (it races the scheduler's cross-stage "
+                "forward boundary handoff; the per-stage forward already bounds activations)."
             )
             self.offload_residual = False
-        # Weight residency is the caller's choice:
-        #   - default (offload_master=false): weights stay resident and the multi-GPU
-        #     stage scheduler runs (dispatch_pp_train_step_multigpu) — for models
-        #     whose weights fit in one GPU.
-        #   - offload_master=true: weights stream from pinned CPU (fits much larger
-        #     models), and training uses the streaming path; per-stage weight
-        #     streaming inside the round-robin scheduler is the remaining work.
+        # Weight residency is the caller's choice; the round-robin stage scheduler
+        # (dispatch_pp_train_step_multigpu) runs either way:
+        #   - default (offload_master=false): base weights stay resident on each GPU —
+        #     for models whose weights fit in one GPU.
+        #   - offload_master=true: base weights live in pinned CPU and the force-linear
+        #     execution streams each block to the GPU on demand (gather_block /
+        #     release_block), bounding resident base weights to the prefetch
+        #     double-buffer — for models too large to fit resident (e.g. a 27B on
+        #     32 GB cards). LoRA adapters stay resident and small.
         if self.offload_master:
             logger.info(
-                "[dispatch_pp]: offload_master is set -> weights stream from CPU (the streaming path); "
-                "the resident round-robin stage scheduler is used only when offload_master is off."
+                "[dispatch_pp]: offload_master set -> base weights stream from pinned CPU per block "
+                "(resident base bounded to the prefetch buffers)."
             )
         # Note: dispatch-PP does NOT use offload_grads (the dispatch step collects
         # gradients to the master itself; offload_grads would race that and trips the
