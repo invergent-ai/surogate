@@ -86,6 +86,13 @@ public:
     get_block_full(int layer_idx, cudaStream_t stream, NCCLCommunicator& comm, bool& accumulate);
 
     /**
+     * @brief Direct access to a block's full gradient tensors (no stream/comm, no
+     * accumulate bookkeeping). Used by the dispatch-PP step, which collects/writes
+     * gradients by hand on a single GPU.
+     */
+    LoRABlockWeights<Tensor>& block_full(int layer_idx) { return mFullGrads.blocks[layer_idx]; }
+
+    /**
      * @brief Get sharded gradients for optimizer
      */
     LoRABlockWeights<TensorShard>& get_block_shard(int layer_idx, cudaStream_t stream);

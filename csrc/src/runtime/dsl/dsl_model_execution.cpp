@@ -16,11 +16,13 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <stdexcept>
 #include <string_view>
+#include <unordered_map>
 
 #include "kernels/kernels.h"
 #include "runtime/core/forward_hooks.h"
@@ -1101,9 +1103,6 @@ void DslModel::dispatch_pp_forward_stage(Tensor inputs,
                                                std::vector<std::pair<std::string, std::vector<std::byte>>>
                                                    inject_named,
                                                bool preserve_output) {
-    if (lora_enabled()) {
-        throw std::runtime_error("dispatch_pp_forward_stage: BF16 full-FT only (no LoRA)");
-    }
     GraphExecutor* ge = graph_executor();
     if (!ge) {
         throw std::runtime_error("dispatch_pp_forward_stage: requires the DSL GraphExecutor");
@@ -1111,6 +1110,9 @@ void DslModel::dispatch_pp_forward_stage(Tensor inputs,
     const long B = inputs.Sizes[0];
     const long T = inputs.Sizes[1];
     ge->ensure_graphs_compiled(B, T);
+    if (lora_enabled()) {
+        ensure_lora_run_state(comm, static_cast<int>(B), static_cast<int>(T));
+    }
     const CompiledGraph* fwd = ge->compiled_forward();
     if (!fwd) {
         throw std::runtime_error("dispatch_pp_forward_stage: forward graph not compiled");
@@ -1155,9 +1157,6 @@ void DslModel::dispatch_pp_backward_stage(
     bool is_loss_stage,
     std::vector<std::pair<std::string, std::vector<std::byte>>> fwd_inject,
     std::vector<std::pair<std::string, std::vector<std::byte>>> inject_named) {
-    if (lora_enabled()) {
-        throw std::runtime_error("dispatch_pp_backward_stage: BF16 full-FT only (no LoRA)");
-    }
     GraphExecutor* ge = graph_executor();
     if (!ge) {
         throw std::runtime_error("dispatch_pp_backward_stage: requires the DSL GraphExecutor");
@@ -1166,6 +1165,13 @@ void DslModel::dispatch_pp_backward_stage(
     const long T = inputs.Sizes[1];
 
     ge->ensure_graphs_compiled(B, T);
+    if (lora_enabled()) {
+        // Per-block LoRA adapters train on this GPU; set up the run state and zero the
+        // grad accumulators for this stage's single backward (one micro-step, full
+        // batch -- the cross-GPU reduce is skipped, grads are collected by hand).
+        ensure_lora_run_state(comm, static_cast<int>(B), static_cast<int>(T));
+        lora_grads().start_micro_step(mRunState->MainStream, /*micro_step=*/0, /*total_steps=*/1);
+    }
     const CompiledGraph* fwd = ge->compiled_forward();
     const CompiledGraph* bwd = ge->compiled_backward();
     if (!fwd || !bwd) {
@@ -1377,6 +1383,24 @@ std::vector<std::byte> dbg_tensor_bytes_to_host(const Tensor& t, cudaStream_t st
 std::vector<std::pair<std::string, std::vector<std::byte>>>
 DslModel::dispatch_pp_read_block_grads(int lo, int hi, bool include_head, bool include_embed) {
     std::vector<std::pair<std::string, std::vector<std::byte>>> out;
+    // LoRA: only the per-block adapters train (base weights frozen). Collect this
+    // stage's blocks' A/B gradients, keyed by (layer, iteration-ordinal, A|B) -- the
+    // ordinal is stable across replicas (for_each_lora_layer_weight is deterministic),
+    // so write_grads on the master reconstructs the same mapping. head/embed have no
+    // LoRA adapters here, so include_head/include_embed don't apply.
+    if (lora_enabled()) {
+        cudaStream_t stream = mRunState->MainStream;
+        auto& grads = lora_grads();
+        for (int L = lo; L <= hi; ++L) {
+            int ord = 0;
+            modules::for_each_lora_layer_weight(grads.block_full(L), [&](modules::LoRATargetId, auto& layer) {
+                const std::string base = "lora.g.L" + std::to_string(L) + "." + std::to_string(ord++);
+                if (layer.A.Data && layer.A.bytes()) out.emplace_back(base + ".A", dbg_tensor_bytes_to_host(layer.A, stream));
+                if (layer.B.Data && layer.B.bytes()) out.emplace_back(base + ".B", dbg_tensor_bytes_to_host(layer.B, stream));
+            });
+        }
+        return out;
+    }
     if (!mGrads) return out;
     cudaStream_t stream = mRunState->MainStream;
     for (const auto& name : mGrads->param_names()) {
@@ -1399,6 +1423,38 @@ DslModel::dispatch_pp_read_block_grads(int lo, int hi, bool include_head, bool i
 
 void DslModel::dispatch_pp_write_grads(
     const std::vector<std::pair<std::string, std::vector<std::byte>>>& items) {
+    if (lora_enabled()) {
+        cudaStream_t stream = mRunState->MainStream;
+        auto& grads = lora_grads();
+        // Cache each block's ordered A/B grad tensors (same stable order as read).
+        std::unordered_map<int, std::vector<std::pair<Tensor*, Tensor*>>> block_ptrs;
+        auto ptrs_for = [&](int L) -> std::vector<std::pair<Tensor*, Tensor*>>& {
+            auto it = block_ptrs.find(L);
+            if (it != block_ptrs.end()) return it->second;
+            std::vector<std::pair<Tensor*, Tensor*>> v;
+            modules::for_each_lora_layer_weight(grads.block_full(L),
+                                                [&](modules::LoRATargetId, auto& layer) { v.emplace_back(&layer.A, &layer.B); });
+            return block_ptrs.emplace(L, std::move(v)).first->second;
+        };
+        for (const auto& [name, bytes] : items) {
+            int L = -1, ord = -1;
+            char ab = 0;
+            if (std::sscanf(name.c_str(), "lora.g.L%d.%d.%c", &L, &ord, &ab) != 3) {
+                throw std::runtime_error("dispatch_pp_write_grads: bad LoRA grad key '" + name + "'");
+            }
+            auto& v = ptrs_for(L);
+            if (ord < 0 || ord >= static_cast<int>(v.size())) {
+                throw std::runtime_error("dispatch_pp_write_grads: ordinal out of range for '" + name + "'");
+            }
+            Tensor* t = (ab == 'A') ? v[static_cast<std::size_t>(ord)].first : v[static_cast<std::size_t>(ord)].second;
+            if (!t || !t->Data || bytes.size() != t->bytes()) {
+                throw std::runtime_error("dispatch_pp_write_grads: size mismatch for '" + name + "'");
+            }
+            CUDA_CHECK(cudaMemcpyAsync(t->Data, bytes.data(), bytes.size(), cudaMemcpyHostToDevice, stream));
+        }
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        return;
+    }
     if (!mGrads) return;
     cudaStream_t stream = mRunState->MainStream;
     for (const auto& [name, bytes] : items) {
@@ -1417,6 +1473,22 @@ void DslModel::dispatch_pp_write_grads(
 
 std::vector<std::pair<std::string, std::vector<std::byte>>> DslModel::dispatch_pp_read_weights() {
     std::vector<std::pair<std::string, std::vector<std::byte>>> out;
+    // LoRA: only the adapters change (base frozen), so the master-broadcast carries
+    // just the per-block A/B master weights, keyed by (layer, ordinal, A|B).
+    if (lora_enabled()) {
+        cudaStream_t stream = mRunState->MainStream;
+        auto& w = lora_weights();
+        const int n = static_cast<int>(mModelConfig.NumLayers);
+        for (int L = 0; L < n; ++L) {
+            int ord = 0;
+            modules::for_each_lora_layer_weight(w.get_master_block(L, stream), [&](modules::LoRATargetId, auto& layer) {
+                const std::string base = "lora.w.L" + std::to_string(L) + "." + std::to_string(ord++);
+                if (layer.A.Data && layer.A.bytes()) out.emplace_back(base + ".A", dbg_tensor_bytes_to_host(layer.A, stream));
+                if (layer.B.Data && layer.B.bytes()) out.emplace_back(base + ".B", dbg_tensor_bytes_to_host(layer.B, stream));
+            });
+        }
+        return out;
+    }
     if (!mParams) return out;
     cudaStream_t stream = mRunState->MainStream;
     for (const auto& name : mParams->param_names()) {
@@ -1429,6 +1501,39 @@ std::vector<std::pair<std::string, std::vector<std::byte>>> DslModel::dispatch_p
 
 void DslModel::dispatch_pp_write_weights(
     const std::vector<std::pair<std::string, std::vector<std::byte>>>& items) {
+    if (lora_enabled()) {
+        cudaStream_t stream = mRunState->MainStream;
+        auto& w = lora_weights();
+        std::unordered_map<int, std::vector<std::pair<Tensor*, Tensor*>>> block_ptrs;
+        auto ptrs_for = [&](int L) -> std::vector<std::pair<Tensor*, Tensor*>>& {
+            auto it = block_ptrs.find(L);
+            if (it != block_ptrs.end()) return it->second;
+            std::vector<std::pair<Tensor*, Tensor*>> v;
+            modules::for_each_lora_layer_weight(w.get_master_block(L, stream),
+                                                [&](modules::LoRATargetId, auto& layer) { v.emplace_back(&layer.A, &layer.B); });
+            return block_ptrs.emplace(L, std::move(v)).first->second;
+        };
+        for (const auto& [name, bytes] : items) {
+            int L = -1, ord = -1;
+            char ab = 0;
+            if (std::sscanf(name.c_str(), "lora.w.L%d.%d.%c", &L, &ord, &ab) != 3) {
+                throw std::runtime_error("dispatch_pp_write_weights: bad LoRA weight key '" + name + "'");
+            }
+            auto& v = ptrs_for(L);
+            if (ord < 0 || ord >= static_cast<int>(v.size())) {
+                throw std::runtime_error("dispatch_pp_write_weights: ordinal out of range for '" + name + "'");
+            }
+            Tensor* t = (ab == 'A') ? v[static_cast<std::size_t>(ord)].first : v[static_cast<std::size_t>(ord)].second;
+            if (!t || !t->Data || bytes.size() != t->bytes()) {
+                throw std::runtime_error("dispatch_pp_write_weights: size mismatch for '" + name + "'");
+            }
+            CUDA_CHECK(cudaMemcpyAsync(t->Data, bytes.data(), bytes.size(), cudaMemcpyHostToDevice, stream));
+        }
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        // Master weights changed -> next get_block() must re-sync the work copies.
+        w.advance_sync_generation();
+        return;
+    }
     if (!mParams) return;
     cudaStream_t stream = mRunState->MainStream;
     for (const auto& [name, bytes] : items) {
