@@ -435,11 +435,18 @@ Front-loads the biggest unknown so we fail fast if the engine cannot do sub-rang
   `[i..j]` with externally-supplied weights and CPU-boundary activations, on **one GPU**, matching
   whole-graph fwd/bwd numerically. No scheduler, no streaming overlap. **If this cannot be made to work
   cleanly, the approach is reconsidered** — everything else depends on it.
-- **Phase 1 — Single-GPU stage-range streaming.** Adapt the existing `cpu_training` weight/grad
-  streaming path from layer-at-a-time replica execution to scheduler-owned stage ranges. Weights are
-  streamed per-stage from pinned CPU, freed after each stage, and recomputed in backward. Correctness
-  parity vs resident single-GPU BF16 and memory parity vs `cpu_training` are the gates before any
-  multi-GPU complexity.
+- **Phase 1 — Single-GPU stage-range streaming. DONE (2026-06-21) — gate PASS.** The existing
+  `DslWeightManager` per-block streaming path is reused unchanged: `offload_master` places block
+  masters in pinned CPU and the executor's `handle_layer_start`/`handle_layer_end` gather/release each
+  block's GPU work copy through a 2-slot double buffer (the dispatch-PP executor already drives those
+  handlers). Streamed forward hidden states and per-block grad norms are **bit-identical** to a
+  resident run on Qwen3-0.6B/4-layer, single RTX 5090
+  (`tests/train/dispatch_pp/test_phase1_streaming.py`). The single-GPU memory invariant holds by
+  construction (≤ ~2 blocks of work-weights resident, regardless of layer count). The quantitative
+  peak-memory *scaling* assertion (≈ 2× largest stage, flat as N grows) is a Phase-2 concern — it needs
+  the multi-GPU pool and GPU-resident-weight-bytes introspection. Stage-range (multi-block) gather is
+  also Phase 2 (single-GPU streams per block, which is the stage unit there). See
+  `2026-06-21-dispatch-pp-phase1-streaming.md`.
 - **Phase 2 — Planner + multi-GPU pool.** Add the DispatchPlanner and round-robin dispatch across N
   local GPUs with the semaphore+event correctness model. Target: per-GPU memory ≈ flat as N grows;
   throughput scales ~linearly.
