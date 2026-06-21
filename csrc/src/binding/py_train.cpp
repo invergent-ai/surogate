@@ -2084,6 +2084,29 @@ std::vector<float> MultiGPUPyTrainer::dispatch_pp_debug_grad_norms_multigpu(
     }
     return result;
 }
+
+float MultiGPUPyTrainer::dispatch_pp_debug_train_step(const std::int32_t* inputs,
+                                                      const std::int32_t* targets,
+                                                      const optimizers::OptimizerConfig& opt_config,
+                                                      int step_idx) {
+    float loss = 0.0f;
+    run_work(
+        [&](sThreadContext& ctx) {
+            auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+            if (!model)
+                throw std::runtime_error("dispatch_pp_debug_train_step: DSL model required");
+            DISPATCH_PP_DBG_STAGE(ctx, inputs, targets);
+            const float l = model->dispatch_pp_debug_train_step(ctx.Model->get_input_buffer(),
+                                                                ctx.Model->get_target_buffer(),
+                                                                ctx.Model->get_position_ids_buffer(),
+                                                                *ctx.Communicator,
+                                                                opt_config,
+                                                                step_idx);
+            if (ctx.Communicator->local_rank() == 0) loss = l;
+        },
+        0);
+    return loss;
+}
 #undef DISPATCH_PP_DBG_STAGE
 
 std::unordered_map<std::string, std::size_t> MultiGPUPyTrainer::dispatch_pp_debug_weight_residency() {

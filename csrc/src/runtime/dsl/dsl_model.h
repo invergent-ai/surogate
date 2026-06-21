@@ -142,6 +142,16 @@ public:
                                                           Tensor targets,
                                                           Tensor position_ids,
                                                           NCCLCommunicator& comm);
+    // One full dispatch-PP training step through the forced-eager sub-range
+    // executor: forward (computes the loss), backward (grads to the store), then
+    // the optimizer update. Returns the step's mean loss. Single-GPU end-to-end
+    // convergence keystone (the cross-GPU stage handoff is validated separately).
+    float dispatch_pp_debug_train_step(Tensor inputs,
+                                       Tensor targets,
+                                       Tensor position_ids,
+                                       NCCLCommunicator& comm,
+                                       const optimizers::OptimizerConfig& opt_config,
+                                       int step_idx);
     // Backward as two contiguous block sub-ranges (high range first, boundary
     // grad round-tripped through host); returns per-block grad norms.
     std::vector<float> dispatch_pp_debug_grad_norms_subranges(Tensor inputs,

@@ -1452,6 +1452,20 @@ NB_MODULE(_surogate, m) {
             "bytes, streaming block double-buffer footprint, slot count). Proves GPU weight residency is "
             "bounded by the streaming slot count, not the layer count.")
         .def(
+            "dispatch_pp_debug_train_step",
+            [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets,
+               const optimizers::OptimizerConfig& opt_config, int step_idx) {
+                CHECK_SHAPE(inputs, trainer->batch_size(), trainer->seq_length());
+                CHECK_SHAPE(targets, trainer->batch_size(), trainer->seq_length());
+                return trainer->dispatch_pp_debug_train_step(inputs.data(), targets.data(), opt_config, step_idx);
+            },
+            nb::arg("inputs"),
+            nb::arg("targets"),
+            nb::arg("opt_config"),
+            nb::arg("step_idx"),
+            "Debug-only dispatch-PP: one full single-GPU training step (forward -> loss, backward -> "
+            "grads, optimizer update) through the sub-range executor; returns the step loss.")
+        .def(
             "step",
             [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets, TokenArray3 position_ids) {
                 const int local_gpus = trainer->local_world_size();

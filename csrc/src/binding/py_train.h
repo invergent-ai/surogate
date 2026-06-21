@@ -206,6 +206,12 @@ public:
     // and the slot count. Proves the dispatch-PP memory invariant — GPU weight
     // residency is bounded by the slot count, not the layer count.
     std::unordered_map<std::string, std::size_t> dispatch_pp_debug_weight_residency();
+    // One full single-GPU dispatch-PP training step (forward -> loss, backward ->
+    // grads, optimizer update) through the sub-range executor. Returns the loss.
+    float dispatch_pp_debug_train_step(const std::int32_t* inputs,
+                                       const std::int32_t* targets,
+                                       const optimizers::OptimizerConfig& opt_config,
+                                       int step_idx);
     std::vector<std::pair<std::string, Tensor>> get_lora_gradients(int gpu_id);
     std::vector<std::pair<std::string, Tensor>> get_lora_weights(int gpu_id);
     int get_valid_token_count(int gpu_id);

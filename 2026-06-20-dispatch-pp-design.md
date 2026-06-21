@@ -514,10 +514,22 @@ Front-loads the biggest unknown so we fail fast if the engine cannot do sub-rang
     is bitwise-identical to plain in-order AdamW (determinism gate); overlap-on applies the same updates
     in the same order so the final params match the synchronous reference exactly; the just-submitted
     update is still in flight on return (worker exactly one behind, never more); a mismatched grad is
-    rejected at submit time and the optimizer stays usable. Still ahead: wiring the worker into the
-    multi-GPU dispatch training step (per-layer `param_copied`/`grad_copied` release) and the
-    converges-on-a-small-real-run staleness test — both gated on a real dispatch training loop (today's
-    forward/backward dispatch are validated through debug entry points, not yet a fused `step()`).
+    rejected at submit time and the optimizer stays usable.
+  - *Fused dispatch training step converges (2026-06-21) — PASS.* `dispatch_pp_debug_train_step` chains
+    the sub-range executor's forward (computing the loss) -> backward (filling the grad store) ->
+    optimizer update into one real training step, on a single GPU. Repeated on a fixed batch it drives
+    the loss down monotonically (e.g. 19.19 -> 9.73 -> 4.31 -> 2.74 -> ... -> 1.03 over 15 steps), and
+    the first steps match the stream-driven trainer step-for-step — the sub-range (dispatch) executor
+    trains identically. The trainer must pass a **1-based** optimizer step index (Adam bias correction
+    divides by 1 - beta^step; step 0 is a divide-by-zero -> NaN — the cause of an early failure), and the
+    grad-norm/scale must use the same per-token normalization (`mUseTokenScale`) the grads were produced
+    with. Test: `tests/train/dispatch_pp/test_phase3_train_step.py`.
+    Still ahead: a **multi-GPU** fused `step()` that keeps the CPU master consistent across the pool
+    (collect per-stage grads -> async-stale optimizer on the CPU master -> broadcast), wiring the
+    AsyncOptimizer worker in with per-layer `param_copied`/`grad_copied` release, and the
+    converges-with-overlap staleness test. The single-GPU loop above is the end-to-end keystone; the
+    cross-GPU stage handoff (fwd + bwd) is already parity-proven, so the remaining work is the
+    consistency/overlap plumbing.
 - **Deferred (interfaces reserved):** FP8/NVFP4 stage streaming, 2D (× cross-node DDP), MoE/EP
   interplay, synchronous-optimizer user option.
 

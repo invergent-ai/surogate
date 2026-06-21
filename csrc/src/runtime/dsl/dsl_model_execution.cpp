@@ -1261,6 +1261,63 @@ std::vector<float> DslModel::dispatch_pp_debug_grad_norms_whole(Tensor inputs,
     return ge->debug_block_grad_norms();
 }
 
+float DslModel::dispatch_pp_debug_train_step(Tensor inputs,
+                                             Tensor targets,
+                                             Tensor position_ids,
+                                             NCCLCommunicator& comm,
+                                             const optimizers::OptimizerConfig& opt_config,
+                                             int step_idx) {
+    if (lora_enabled()) {
+        throw std::runtime_error("dispatch_pp_debug_train_step: BF16 full-FT only (no LoRA)");
+    }
+    GraphExecutor* ge = graph_executor();
+    if (!ge) {
+        throw std::runtime_error("dispatch_pp_debug_train_step: requires the DSL GraphExecutor");
+    }
+    const long B = inputs.Sizes[0];
+    const long T = inputs.Sizes[1];
+    ge->ensure_graphs_compiled(B, T);
+    const CompiledGraph* fwd = ge->compiled_forward();
+    const CompiledGraph* bwd = ge->compiled_backward();
+    if (!fwd || !bwd) {
+        throw std::runtime_error("dispatch_pp_debug_train_step: graphs not compiled");
+    }
+    // Forced-eager (non-stream-driven) sub-range executor — the single-GPU
+    // dispatch-PP path. Forward computes the loss; backward fills the grad store;
+    // the optimizer updates the weights from it. This is a single-GPU trainer
+    // (world_size==1), so the DP loss/grad reductions are safe local no-ops — keep
+    // them so reduce_loss populates ValidTokenCount and get_loss() is meaningful.
+    // Match DslModel::backward's contract so the optimizer's grad-norm/scale uses
+    // the per-token normalization the grads were produced with (else the scale and
+    // the grads disagree and the update diverges).
+    mUseTokenScale = true;
+    ge->debug_set_forward_op_range(0, fwd->ops.size(), /*skip_init=*/false, /*skip_finalize=*/false,
+                                   /*force_linear=*/true);
+    {
+        auto request =
+            causal_lm_profile().make_forward_request(*mRunState, mModelConfig, mOptions, inputs, position_ids, 0);
+        mExecutor->execute_forward(request, comm);
+    }
+    ge->debug_clear_forward_op_range();
+
+    ge->debug_set_backward_op_range(0, bwd->ops.size(), /*skip_init=*/false, /*skip_finalize=*/false,
+                                    /*force_linear=*/true);
+    {
+        auto request =
+            causal_lm_profile().make_backward_request(*mRunState, mModelConfig, mOptions, inputs, targets, 1, 0);
+        request.reduce_loss_on_completion = true;  // populates ValidTokenCount for get_loss()
+        mExecutor->execute_backward(request, comm);
+    }
+    ge->debug_clear_backward_op_range();
+
+    const float loss = get_loss();  // mean loss (raw / valid tokens), available after reduce_loss
+    // The optimizer step index is 1-based (Adam bias correction divides by
+    // 1 - beta^step; step 0 would be a divide-by-zero -> NaN). Match the trainer's
+    // update_with_config convention, which passes step + 1.
+    update_with_config(comm, opt_config, step_idx + 1);
+    return loss;
+}
+
 std::vector<float> DslModel::dispatch_pp_debug_grad_norms_subranges(Tensor inputs,
                                                                    Tensor targets,
                                                                    Tensor position_ids,
