@@ -48,3 +48,28 @@ def pack_stages(
         acc_size += sizes[i]
     stages.append((start, n - 1))
     return stages
+
+
+def candidate_budgets(costs: Sequence[float], upper_threshold: float) -> list[float]:
+    """Enumerate candidate per-stage time budgets.
+
+    A candidate is any sum of consecutive block costs that lands in
+    ``[max_single_block, max_single_block * upper_threshold]``. A stage can never
+    be smaller than the slowest single block, and never larger than the slack
+    threshold above it. Returned sorted and de-duplicated.
+    """
+    if not costs:
+        return []
+    max_block = max(costs)
+    ceiling = max_block * upper_threshold
+    cands: set[float] = set()
+    n = len(costs)
+    for start in range(n):
+        s = 0.0
+        for end in range(start, n):
+            s += costs[end]
+            if s > ceiling:
+                break
+            if s >= max_block:
+                cands.add(round(s, 9))
+    return sorted(cands)

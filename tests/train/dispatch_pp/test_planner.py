@@ -1,7 +1,7 @@
 """Unit tests for the dispatch-PP planner (pure Python, GPU-free)."""
 
 from surogate.train.dispatch_pp.types import BlockProfile, StageRange, StagePlan
-from surogate.train.dispatch_pp.planner import pack_stages
+from surogate.train.dispatch_pp.planner import pack_stages, candidate_budgets
 
 
 def test_stage_range_to_dict_roundtrips():
@@ -63,3 +63,25 @@ def test_pack_is_asymmetric_forward_holds_more_blocks_than_backward():
     fwd_width = max(hi - lo + 1 for lo, hi in fwd)   # 6 blocks/stage
     bwd_width = max(hi - lo + 1 for lo, hi in bwd)   # 2 blocks/stage
     assert fwd_width > bwd_width
+
+
+def test_candidates_are_prefix_sums_between_maxblock_and_threshold():
+    # max single block = 3. upper_threshold 1.1 -> ceiling 3.3.
+    # prefix sums per start that land in [3.0, 3.3]:
+    #   [3,1,2,2]: start0 ->3(ok); start1 1,1+2=3(ok),3+2=5 stop; start2 2,2+2=4 stop; start3 2 stop
+    # candidates = {3.0}
+    cands = candidate_budgets([3, 1, 2, 2], upper_threshold=1.1)
+    assert cands == [3.0]
+
+
+def test_candidates_include_multiblock_sums_within_threshold():
+    # max block = 2. threshold 1.6 -> ceiling 3.2. prefix sums in [2.0, 3.2]:
+    #   start0: 2(ok), 2+1=3(ok), 3+1=4 stop
+    #   start1: 1, 1+1=2(ok); start2: 1
+    # candidates = {2.0, 3.0}
+    cands = candidate_budgets([2, 1, 1], upper_threshold=1.6)
+    assert cands == [2.0, 3.0]
+
+
+def test_candidates_single_block_returns_that_block():
+    assert candidate_budgets([5], upper_threshold=1.1) == [5.0]
