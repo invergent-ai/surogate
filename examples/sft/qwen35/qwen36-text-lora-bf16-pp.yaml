@@ -62,6 +62,12 @@ dispatch_pp:
 # models that fit resident — the same stage scheduler runs either way.
 offload_master: true
 
+# recompute: false would skip the backward re-forward (faster), but the phase-arena
+# sizer currently sizes the forward stack for the WHOLE model's activations (~19 GB on
+# the 27B) rather than one resident stage, so it OOMs at this size. Leave recompute on
+# until the arena is sized per-stage. (false is correct + ~30% faster on models that fit.)
+recompute: true
+
 lora: true
 lora_rank: 16
 lora_alpha: 32

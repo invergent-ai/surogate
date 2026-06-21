@@ -760,11 +760,11 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         # so the full model never sits resident. Enable the offload path (mirrors
         # cpu_training's mapping) — without it import_weights loads every weight onto
         # the GPU and OOMs on any model large enough to need dispatch-PP.
-        # Bound activation memory: recompute intermediates so the backward replays the
-        # forward per block instead of holding all activations.
+        # recompute bounds activation memory (the backward replays the forward per stage).
+        # It can be disabled (recompute: false) to trade the free VRAM for skipping the
+        # backward re-forward; the stage scheduler honors either setting.
         if not self.recompute:
-            logger.info("[dispatch_pp]: enabling recompute (activation memory must be bounded).")
-            self.recompute = True
+            logger.info("[dispatch_pp]: recompute disabled (caching stage activations for the backward).")
         # offload_residual is INCOMPATIBLE with the stage scheduler (both weight modes):
         # the cross-stage forward handoff reads block hi's residual by name, and
         # offloading it to pinned CPU asynchronously races that read (non-deterministic
