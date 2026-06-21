@@ -760,24 +760,31 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         # so the full model never sits resident. Enable the offload path (mirrors
         # cpu_training's mapping) — without it import_weights loads every weight onto
         # the GPU and OOMs on any model large enough to need dispatch-PP.
-        if not self.offload_master:
-            logger.info("[dispatch_pp]: enabling offload_master (weights stream from pinned CPU per stage).")
-        self.offload_master = True
-        if not self.lora and not self.offload_grads:
-            # Full fine-tune: stream gradients to CPU as well (LoRA grads are small and
-            # stay on the GPU).
-            logger.info("[dispatch_pp]: enabling offload_grads for full fine-tune.")
-            self.offload_grads = True
-        # Bound activation memory the same way: recompute intermediates and offload
-        # the per-layer residuals to pinned CPU. Together these make activation memory
-        # independent of network depth — without them a deep model OOMs on the
-        # save-for-backward arena even after the weights stream.
+        # Bound activation memory: recompute intermediates and offload the per-layer
+        # residuals to pinned CPU, so activation memory is independent of network
+        # depth (both the resident stage-scheduler path and the streaming fallback
+        # need this on deep models).
         if not self.recompute:
             logger.info("[dispatch_pp]: enabling recompute (activation memory must be bounded).")
             self.recompute = True
         if not self.offload_residual:
             logger.info("[dispatch_pp]: enabling offload_residual (depth-independent activation memory).")
             self.offload_residual = True
+        # Weight residency is the caller's choice:
+        #   - default (offload_master=false): weights stay resident and the multi-GPU
+        #     stage scheduler runs (dispatch_pp_train_step_multigpu) — for models
+        #     whose weights fit in one GPU.
+        #   - offload_master=true: weights stream from pinned CPU (fits much larger
+        #     models), and training uses the streaming path; per-stage weight
+        #     streaming inside the round-robin scheduler is the remaining work.
+        if self.offload_master:
+            logger.info(
+                "[dispatch_pp]: offload_master is set -> weights stream from CPU (the streaming path); "
+                "the resident round-robin stage scheduler is used only when offload_master is off."
+            )
+        # Note: dispatch-PP does NOT use offload_grads (the dispatch step collects
+        # gradients to the master itself; offload_grads would race that and trips the
+        # multi-GPU "requires ZeRO-2 / cpu_training" guard).
 
     def _validate_ep_config(self):
         """Validate Expert Parallelism configuration."""

@@ -1044,6 +1044,49 @@ class SurogateTrainerWrapper:
         # Pass those IDs through and let C++ expand planes as needed.
         pos_ids = np.empty((total_rows, self.config.sequence_len), dtype=np.int32)
 
+        # Dispatch-PP: partition the transformer blocks into contiguous stages over
+        # the GPU pool (stage i -> GPU i % gpus). The fused training step dispatches
+        # each stage round-robin, hands activations/grads GPU->host->GPU, optimizes
+        # on the master replica, and broadcasts the updated weights.
+        # The resident round-robin stage scheduler runs each stage's whole forward,
+        # so it needs the model's weights to fit in one GPU (offload_master off).
+        # With offload_master (large models), fall back to the streaming normal-loop;
+        # per-stage weight streaming inside the scheduler is the remaining work.
+        self._dispatch_pp = self.config.parallelism == "dispatch_pp" and not self.config.offload_master
+        if self.config.parallelism == "dispatch_pp" and self.config.offload_master:
+            logger.info(
+                "[dispatch_pp]: offload_master set -> using the streaming training path "
+                "(resident stage scheduler is bypassed)."
+            )
+        if self._dispatch_pp:
+            mc = self.config.model_info.config
+            n_layers = getattr(mc, "num_hidden_layers", 0) or getattr(
+                getattr(mc, "text_config", None), "num_hidden_layers", 0
+            )
+            if not n_layers:
+                raise RuntimeError("dispatch_pp: could not determine num_hidden_layers from model config")
+            nst = max(1, min(self.config.gpus, n_layers))
+            self._dpp_los, self._dpp_his = [], []
+            base, rem, lo = n_layers // nst, n_layers % nst, 0
+            for i in range(nst):
+                sz = base + (1 if i < rem else 0)
+                self._dpp_los.append(lo)
+                self._dpp_his.append(lo + sz - 1)
+                lo += sz
+            self._dpp_bsz = self.config.per_device_train_batch_size
+            if self.config.gradient_accumulation_steps != 1:
+                logger.warning(
+                    "[dispatch_pp]: gradient_accumulation_steps=%d; v1 applies one optimizer step per "
+                    "micro-batch (grad-accum folding is a follow-up).",
+                    self.config.gradient_accumulation_steps,
+                )
+            logger.info(
+                "[dispatch_pp]: %d stages over %d layers -> %s",
+                nst,
+                n_layers,
+                list(zip(self._dpp_los, self._dpp_his)),
+            )
+
         # Preload first batch (eager path only)
         if not use_full_step_graphs:
             self.train_loader.load_batch(in_tokens, out_tokens, pos_ids)
@@ -1162,7 +1205,14 @@ class SurogateTrainerWrapper:
             # Training step
             step_start = time.time()
 
-            if use_full_step_graphs:
+            if self._dispatch_pp:
+                # The loader fills a full data-parallel chunk (gpus*bsz sequences);
+                # the dispatch step is model-parallel and consumes one micro-batch
+                # (the first bsz sequences — same data drives every stage).
+                if not self.train_loader.has_next():
+                    self.train_loader.advance_epoch()
+                self.train_loader.load_batch(in_tokens, out_tokens, pos_ids)
+            elif use_full_step_graphs:
                 chunk = self.config.gpus * self.config.per_device_train_batch_size
                 for micro_step in range(self.config.gradient_accumulation_steps):
                     if not self.train_loader.has_next():
@@ -1199,7 +1249,15 @@ class SurogateTrainerWrapper:
                 normuon_lr=lr,  # Use same LR for NorMuon
                 normuon_cautious_wd=self.config.normuon_cautious_wd,
             )
-            if use_full_step_graphs:
+            if self._dispatch_pp:
+                # Round-robin stage dispatch: forward+backward across the GPU pool,
+                # collect grads to the master, optimize, broadcast. One fused call.
+                bsz = self._dpp_bsz
+                loss = self.trainer.dispatch_pp_train_step_multigpu(
+                    in_tokens[:bsz], out_tokens[:bsz], self._dpp_los, self._dpp_his, opt_config, step, False
+                )
+                result = {"loss": float(loss), "norm": 0.0}
+            elif use_full_step_graphs:
                 result = self.trainer.train_step_graphed(in_tokens, out_tokens, pos_ids, opt_config, step + 1)
                 # Optional LoRA grad debug runs after graph replay (post-update).
                 self._maybe_log_lora_grad_stats(step)
