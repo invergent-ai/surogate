@@ -318,6 +318,10 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
     use_all_to_all_reduce: bool | None = False
     memcpy_all_gather: bool | None = False
     memcpy_send_recv: bool | None = False
+    # Dispatch pipeline parallelism (opt-in, single-node model-parallel mode).
+    # Unset / "ddp" -> existing data-parallel path, byte-for-byte unchanged.
+    parallelism: str | None = None
+    dispatch_pp: dict | None = None
     init_projections_to_zero: bool | None = False
     from_scratch: bool | None = False
     lmhead_chunks: int | None = 1
@@ -449,6 +453,8 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         self.use_all_to_all_reduce = cfg.get("use_all_to_all_reduce", self.use_all_to_all_reduce)
         self.memcpy_all_gather = cfg.get("memcpy_all_gather", self.memcpy_all_gather)
         self.memcpy_send_recv = cfg.get("memcpy_send_recv", self.memcpy_send_recv)
+        self.parallelism = cfg.get("parallelism", self.parallelism)
+        self.dispatch_pp = dict(cfg.get("dispatch_pp", self.dispatch_pp) or {})
         self.init_projections_to_zero = cfg.get("init_projections_to_zero", self.init_projections_to_zero)
         self.from_scratch = cfg.get("from_scratch", self.from_scratch)
         self.lmhead_chunks = cfg.get("lmhead_chunks", self.lmhead_chunks)
@@ -653,6 +659,9 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
             if not shard_gradients:
                 raise ValueError("offload_grads requires cpu_training=true, shard_gradients=true, or zero_level >= 2.")
 
+        # Validate dispatch-PP before EP so its explicit ep_size>1 rejection wins
+        # over the generic "EP requires MoE" check.
+        self._validate_dispatch_pp_config()
         self._validate_ep_config()
         self.create_runtime_config()
         self.create_lora_config()
@@ -694,6 +703,57 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
                 f"per_device_train_batch_size * sequence_len ({batch_size} * {seq_len} = {total_tokens}). "
                 f"Either adjust batch size or sequence length, or reduce lmhead_chunks."
             )
+
+    def _validate_dispatch_pp_config(self):
+        """Normalize and validate parallelism=dispatch_pp (opt-in model-parallel mode).
+
+        Unset / "ddp" leaves the existing data-parallel path untouched. When set to
+        "dispatch_pp", the sub-block is filled with planner defaults and the v1
+        mutual-exclusions (ZeRO sharding, cpu_training, MoE/EP, non-BF16 recipes)
+        are rejected with clear messages. CUDA graphs are disabled (per-stage weight
+        streaming is incompatible with graph capture).
+        """
+        if self.parallelism in (None, "", "ddp"):
+            self.parallelism = None
+            self.dispatch_pp = {}
+            return
+        if self.parallelism != "dispatch_pp":
+            raise ValueError(
+                f"Unknown parallelism={self.parallelism!r}; expected unset, 'ddp', or 'dispatch_pp'."
+            )
+
+        self.dispatch_pp = dict(self.dispatch_pp or {})
+        self.dispatch_pp.setdefault("min_stages", None)       # planner default = num local GPUs
+        self.dispatch_pp.setdefault("upper_threshold", 1.1)
+        self.dispatch_pp.setdefault("vram_budget_gb", None)   # auto = free_vram * 0.9
+        self.dispatch_pp.setdefault("recompute_grain", "stage")
+
+        if self.cpu_training:
+            raise ValueError(
+                "parallelism=dispatch_pp is a separate model-parallel training mode and "
+                "cannot be combined with cpu_training=true in v1."
+            )
+        if (self.zero_level and self.zero_level > 1) or self.shard_weights or self.shard_gradients:
+            raise ValueError(
+                "parallelism=dispatch_pp is mutually exclusive with ZeRO sharding "
+                "(zero_level>1 / shard_weights / shard_gradients) in v1."
+            )
+        if self.ep_size and self.ep_size > 1:
+            raise ValueError(
+                "parallelism=dispatch_pp does not support MoE expert parallelism "
+                "(ep_size>1) in v1; this is a deferred phase."
+            )
+        if self.recipe not in (None, "bf16"):
+            raise ValueError(
+                "parallelism=dispatch_pp is BF16/LoRA-only in v1; FP8/NVFP4 stage "
+                f"streaming is deferred (got recipe={self.recipe!r})."
+            )
+        if self.use_cuda_graphs:
+            logger.warning(
+                "[dispatch_pp]: disabling CUDA graphs (per-stage weight streaming "
+                "is incompatible with graph capture)."
+            )
+            self.use_cuda_graphs = False
 
     def _validate_ep_config(self):
         """Validate Expert Parallelism configuration."""

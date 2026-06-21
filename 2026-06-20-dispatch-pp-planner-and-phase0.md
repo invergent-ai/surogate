@@ -21,8 +21,8 @@ Updated before each commit. Status: ☐ not started · ◐ in progress · ☑ do
 - ☑ Task 5 — Oversized-block warning
 - ☑ Task 6 — PCIe token-threshold / microbatch envelope warnings
 - ☑ Task 7 — LoRA `needs_grad` propagation + NUMA placement
-- ◐ Task 8 — Config plumbing + validation in `SFTConfig`
-- ☐ Task 9 — Phase-0 `GraphExecutor` sub-range execution gate
+- ☑ Task 8 — Config plumbing + validation in `SFTConfig`
+- ◐ Task 9 — Phase-0 `GraphExecutor` sub-range execution gate
 - ☐ Task 10 — Full-suite run + record Phase-0 verdict
 
 ## Review Update — 2026-06-21
@@ -922,9 +922,11 @@ MODEL = "ro/train/out_opmix_wordform_s50_a010_eval"
 
 def _cfg(data):
     cfg = SFTConfig(DictDefault(data))
-    # SFT normally reaches __post_init__ through TokenizeDatasets; config tests
-    # call it directly so validation/runtime_config creation is exercised.
-    cfg.__post_init__()
+    # __init__ parses fields but does not resolve the model; full __post_init__
+    # would download the tokenizer/config. These tests target only the dispatch_pp
+    # config contract, so they call the dedicated validator directly (it is invoked
+    # from __post_init__ before _validate_ep_config in the real path).
+    cfg._validate_dispatch_pp_config()
     return cfg
 
 
@@ -1000,48 +1002,58 @@ set them:
         self.dispatch_pp = dict(cfg.get("dispatch_pp", self.dispatch_pp) or {})
 ```
 
-In `__post_init__`, add this block **before** `self._validate_ep_config()` so dispatch-PP's explicit
-`ep_size>1` rejection wins over the generic "EP requires MoE" validation:
+Add a dedicated `_validate_dispatch_pp_config()` method (mirroring the existing `_validate_ep_config`)
+and call it from `__post_init__` **before** `self._validate_ep_config()` so dispatch-PP's explicit
+`ep_size>1` rejection wins over the generic "EP requires MoE" validation. The method is
+self-contained — it reads only fields set in `__init__` — so it is unit-testable without resolving the
+model. `recipe` is rejected for anything other than `bf16` (covers all current/future non-BF16 recipes):
 
 ```python
+        # in __post_init__, before self._validate_ep_config():
+        self._validate_dispatch_pp_config()
+
+    def _validate_dispatch_pp_config(self):
         if self.parallelism in (None, "", "ddp"):
             self.parallelism = None
             self.dispatch_pp = {}
-        elif self.parallelism == "dispatch_pp":
-            self.dispatch_pp = dict(self.dispatch_pp or {})
-            self.dispatch_pp.setdefault("min_stages", None)        # planner default = num_gpus
-            self.dispatch_pp.setdefault("upper_threshold", 1.1)
-            self.dispatch_pp.setdefault("vram_budget_gb", None)    # auto = free_vram * 0.9
-            self.dispatch_pp.setdefault("recompute_grain", "stage")
+            return
+        if self.parallelism != "dispatch_pp":
+            raise ValueError(
+                f"Unknown parallelism={self.parallelism!r}; expected unset, 'ddp', or 'dispatch_pp'."
+            )
 
-            if self.cpu_training:
-                raise ValueError(
-                    "parallelism=dispatch_pp is a separate model-parallel training mode and "
-                    "cannot be combined with cpu_training=true in v1."
-                )
-            if (self.zero_level and self.zero_level > 1) or self.shard_weights or self.shard_gradients:
-                raise ValueError(
-                    "parallelism=dispatch_pp is mutually exclusive with ZeRO sharding "
-                    "(zero_level>1 / shard_weights / shard_gradients) in v1."
-                )
-            if getattr(self, "ep_size", 1) and self.ep_size > 1:
-                raise ValueError(
-                    "parallelism=dispatch_pp does not support MoE expert parallelism "
-                    "(ep_size>1) in v1; this is a deferred phase."
-                )
-            if self.recipe in ("fp8-hybrid", "fp8_hybrid", "nvfp4", "nvfp4_quartet", "fp4"):
-                raise ValueError(
-                    "parallelism=dispatch_pp is BF16/LoRA-only in v1; FP8/NVFP4 stage "
-                    f"streaming is deferred (got recipe={self.recipe!r})."
-                )
-            if self.use_cuda_graphs:
-                logger.warning(
-                    "[dispatch_pp]: disabling CUDA graphs (per-stage weight streaming "
-                    "is incompatible with graph capture)."
-                )
-                self.use_cuda_graphs = False
-        else:
-            raise ValueError(f"Unknown parallelism={self.parallelism!r}; expected unset, 'ddp', or 'dispatch_pp'.")
+        self.dispatch_pp = dict(self.dispatch_pp or {})
+        self.dispatch_pp.setdefault("min_stages", None)       # planner default = num local GPUs
+        self.dispatch_pp.setdefault("upper_threshold", 1.1)
+        self.dispatch_pp.setdefault("vram_budget_gb", None)   # auto = free_vram * 0.9
+        self.dispatch_pp.setdefault("recompute_grain", "stage")
+
+        if self.cpu_training:
+            raise ValueError(
+                "parallelism=dispatch_pp is a separate model-parallel training mode and "
+                "cannot be combined with cpu_training=true in v1."
+            )
+        if (self.zero_level and self.zero_level > 1) or self.shard_weights or self.shard_gradients:
+            raise ValueError(
+                "parallelism=dispatch_pp is mutually exclusive with ZeRO sharding "
+                "(zero_level>1 / shard_weights / shard_gradients) in v1."
+            )
+        if self.ep_size and self.ep_size > 1:
+            raise ValueError(
+                "parallelism=dispatch_pp does not support MoE expert parallelism "
+                "(ep_size>1) in v1; this is a deferred phase."
+            )
+        if self.recipe not in (None, "bf16"):
+            raise ValueError(
+                "parallelism=dispatch_pp is BF16/LoRA-only in v1; FP8/NVFP4 stage "
+                f"streaming is deferred (got recipe={self.recipe!r})."
+            )
+        if self.use_cuda_graphs:
+            logger.warning(
+                "[dispatch_pp]: disabling CUDA graphs (per-stage weight streaming "
+                "is incompatible with graph capture)."
+            )
+            self.use_cuda_graphs = False
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
