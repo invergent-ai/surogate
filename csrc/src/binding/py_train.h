@@ -182,22 +182,22 @@ public:
     std::vector<std::pair<std::string, Tensor>> get_gradients(int gpu_id);
 
     // ---- Debug-only dispatch-PP sub-range parity (GPU 0, resident weights) -
-    std::vector<float> dispatch_pp_debug_forward_hidden(const std::int32_t* inputs);
-    std::vector<float> dispatch_pp_debug_forward_subranges(const std::int32_t* inputs, int split_after_block);
-    std::vector<float> dispatch_pp_debug_grad_norms_whole(const std::int32_t* inputs, const std::int32_t* targets);
-    std::vector<float> dispatch_pp_debug_grad_norms_subranges(const std::int32_t* inputs,
+    std::vector<float> dispatch_pp_forward_hidden(const std::int32_t* inputs);
+    std::vector<float> dispatch_pp_forward_subranges(const std::int32_t* inputs, int split_after_block);
+    std::vector<float> dispatch_pp_grad_norms_whole(const std::int32_t* inputs, const std::int32_t* targets);
+    std::vector<float> dispatch_pp_grad_norms_subranges(const std::int32_t* inputs,
                                                               const std::int32_t* targets,
                                                               int split_after_block);
     // Round-robin forward dispatch of contiguous block stages [los[i]..his[i]]
     // across the GPU pool (stage i -> GPU i % ngpu), handing the boundary residual
     // GPU->host->GPU between stages. Returns the final hidden state as flat f32.
-    std::vector<float> dispatch_pp_debug_forward_hidden_multigpu(const std::int32_t* inputs,
+    std::vector<float> dispatch_pp_forward_hidden_multigpu(const std::int32_t* inputs,
                                                                  const std::vector<int>& los,
                                                                  const std::vector<int>& his);
     // Round-robin backward dispatch (reverse stage order) across the GPU pool,
     // handing the boundary gradients GPU->host->GPU. Returns per-block weight-grad
     // L2 norms collected from whichever GPU computed each block.
-    std::vector<float> dispatch_pp_debug_grad_norms_multigpu(const std::int32_t* inputs,
+    std::vector<float> dispatch_pp_grad_norms_multigpu(const std::int32_t* inputs,
                                                              const std::int32_t* targets,
                                                              const std::vector<int>& los,
                                                              const std::vector<int>& his);
@@ -205,13 +205,22 @@ public:
     // device-resident weight bytes, the streaming block double-buffer footprint,
     // and the slot count. Proves the dispatch-PP memory invariant — GPU weight
     // residency is bounded by the slot count, not the layer count.
-    std::unordered_map<std::string, std::size_t> dispatch_pp_debug_weight_residency();
+    std::unordered_map<std::string, std::size_t> dispatch_pp_weight_residency();
     // One full single-GPU dispatch-PP training step (forward -> loss, backward ->
     // grads, optimizer update) through the sub-range executor. Returns the loss.
-    float dispatch_pp_debug_train_step(const std::int32_t* inputs,
+    float dispatch_pp_train_step(const std::int32_t* inputs,
                                        const std::int32_t* targets,
                                        const optimizers::OptimizerConfig& opt_config,
                                        int step_idx);
+    // One full multi-GPU dispatch-PP training step: round-robin backward dispatch
+    // with cross-GPU boundary handoff -> collect per-stage grads -> optimizer on the
+    // master replica -> broadcast updated weights to every GPU. Returns the loss.
+    float dispatch_pp_train_step_multigpu(const std::int32_t* inputs,
+                                                const std::int32_t* targets,
+                                                const std::vector<int>& los,
+                                                const std::vector<int>& his,
+                                                const optimizers::OptimizerConfig& opt_config,
+                                                int step_idx);
     std::vector<std::pair<std::string, Tensor>> get_lora_gradients(int gpu_id);
     std::vector<std::pair<std::string, Tensor>> get_lora_weights(int gpu_id);
     int get_valid_token_count(int gpu_id);

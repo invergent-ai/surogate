@@ -1896,14 +1896,14 @@ std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_gradients(int
         fill_sequential_position_ids(_pb, _planes, B, T);                                              \
     } while (0)
 
-std::vector<float> MultiGPUPyTrainer::dispatch_pp_debug_forward_hidden(const std::int32_t* inputs) {
+std::vector<float> MultiGPUPyTrainer::dispatch_pp_forward_hidden(const std::int32_t* inputs) {
     std::vector<float> result;
     run_work(
         [&](sThreadContext& ctx) {
             auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
-            if (!model) throw std::runtime_error("dispatch_pp_debug_forward_hidden: DSL model required");
+            if (!model) throw std::runtime_error("dispatch_pp_forward_hidden: DSL model required");
             DISPATCH_PP_DBG_STAGE(ctx, inputs, nullptr);
-            auto out = model->dispatch_pp_debug_forward_hidden(
+            auto out = model->dispatch_pp_forward_hidden(
                 ctx.Model->get_input_buffer(), ctx.Model->get_position_ids_buffer(), *ctx.Communicator);
             if (ctx.Communicator->local_rank() == 0) result = std::move(out);
         },
@@ -1911,15 +1911,15 @@ std::vector<float> MultiGPUPyTrainer::dispatch_pp_debug_forward_hidden(const std
     return result;
 }
 
-std::vector<float> MultiGPUPyTrainer::dispatch_pp_debug_forward_subranges(const std::int32_t* inputs,
+std::vector<float> MultiGPUPyTrainer::dispatch_pp_forward_subranges(const std::int32_t* inputs,
                                                                          int split_after_block) {
     std::vector<float> result;
     run_work(
         [&](sThreadContext& ctx) {
             auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
-            if (!model) throw std::runtime_error("dispatch_pp_debug_forward_subranges: DSL model required");
+            if (!model) throw std::runtime_error("dispatch_pp_forward_subranges: DSL model required");
             DISPATCH_PP_DBG_STAGE(ctx, inputs, nullptr);
-            auto out = model->dispatch_pp_debug_forward_subranges(ctx.Model->get_input_buffer(),
+            auto out = model->dispatch_pp_forward_subranges(ctx.Model->get_input_buffer(),
                                                                   ctx.Model->get_position_ids_buffer(),
                                                                   *ctx.Communicator,
                                                                   split_after_block);
@@ -1929,15 +1929,15 @@ std::vector<float> MultiGPUPyTrainer::dispatch_pp_debug_forward_subranges(const 
     return result;
 }
 
-std::vector<float> MultiGPUPyTrainer::dispatch_pp_debug_grad_norms_whole(const std::int32_t* inputs,
+std::vector<float> MultiGPUPyTrainer::dispatch_pp_grad_norms_whole(const std::int32_t* inputs,
                                                                         const std::int32_t* targets) {
     std::vector<float> result;
     run_work(
         [&](sThreadContext& ctx) {
             auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
-            if (!model) throw std::runtime_error("dispatch_pp_debug_grad_norms_whole: DSL model required");
+            if (!model) throw std::runtime_error("dispatch_pp_grad_norms_whole: DSL model required");
             DISPATCH_PP_DBG_STAGE(ctx, inputs, targets);
-            auto out = model->dispatch_pp_debug_grad_norms_whole(ctx.Model->get_input_buffer(),
+            auto out = model->dispatch_pp_grad_norms_whole(ctx.Model->get_input_buffer(),
                                                                  ctx.Model->get_target_buffer(),
                                                                  ctx.Model->get_position_ids_buffer(),
                                                                  *ctx.Communicator);
@@ -1947,16 +1947,16 @@ std::vector<float> MultiGPUPyTrainer::dispatch_pp_debug_grad_norms_whole(const s
     return result;
 }
 
-std::vector<float> MultiGPUPyTrainer::dispatch_pp_debug_grad_norms_subranges(const std::int32_t* inputs,
+std::vector<float> MultiGPUPyTrainer::dispatch_pp_grad_norms_subranges(const std::int32_t* inputs,
                                                                             const std::int32_t* targets,
                                                                             int split_after_block) {
     std::vector<float> result;
     run_work(
         [&](sThreadContext& ctx) {
             auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
-            if (!model) throw std::runtime_error("dispatch_pp_debug_grad_norms_subranges: DSL model required");
+            if (!model) throw std::runtime_error("dispatch_pp_grad_norms_subranges: DSL model required");
             DISPATCH_PP_DBG_STAGE(ctx, inputs, targets);
-            auto out = model->dispatch_pp_debug_grad_norms_subranges(ctx.Model->get_input_buffer(),
+            auto out = model->dispatch_pp_grad_norms_subranges(ctx.Model->get_input_buffer(),
                                                                      ctx.Model->get_target_buffer(),
                                                                      ctx.Model->get_position_ids_buffer(),
                                                                      *ctx.Communicator,
@@ -1967,10 +1967,10 @@ std::vector<float> MultiGPUPyTrainer::dispatch_pp_debug_grad_norms_subranges(con
     return result;
 }
 
-std::vector<float> MultiGPUPyTrainer::dispatch_pp_debug_forward_hidden_multigpu(
+std::vector<float> MultiGPUPyTrainer::dispatch_pp_forward_hidden_multigpu(
     const std::int32_t* inputs, const std::vector<int>& los, const std::vector<int>& his) {
     if (los.size() != his.size() || los.empty()) {
-        throw std::runtime_error("dispatch_pp_debug_forward_hidden_multigpu: bad stage ranges");
+        throw std::runtime_error("dispatch_pp_forward_hidden_multigpu: bad stage ranges");
     }
     const int ngpu = static_cast<int>(mContexts.size());
     const int num_stages = static_cast<int>(los.size());
@@ -1994,9 +1994,9 @@ std::vector<float> MultiGPUPyTrainer::dispatch_pp_debug_forward_hidden_multigpu(
             [&](sThreadContext& ctx) {
                 auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
                 if (!model)
-                    throw std::runtime_error("dispatch_pp_debug_forward_hidden_multigpu: DSL model required");
+                    throw std::runtime_error("dispatch_pp_forward_hidden_multigpu: DSL model required");
                 DISPATCH_PP_DBG_STAGE(ctx, inputs, nullptr);
-                model->dispatch_pp_debug_forward_stage(ctx.Model->get_input_buffer(),
+                model->dispatch_pp_forward_stage(ctx.Model->get_input_buffer(),
                                                        ctx.Model->get_position_ids_buffer(),
                                                        *ctx.Communicator,
                                                        lo,
@@ -2027,11 +2027,11 @@ std::vector<float> MultiGPUPyTrainer::dispatch_pp_debug_forward_hidden_multigpu(
     return result;
 }
 
-std::vector<float> MultiGPUPyTrainer::dispatch_pp_debug_grad_norms_multigpu(
+std::vector<float> MultiGPUPyTrainer::dispatch_pp_grad_norms_multigpu(
     const std::int32_t* inputs, const std::int32_t* targets, const std::vector<int>& los,
     const std::vector<int>& his) {
     if (los.size() != his.size() || los.empty()) {
-        throw std::runtime_error("dispatch_pp_debug_grad_norms_multigpu: bad stage ranges");
+        throw std::runtime_error("dispatch_pp_grad_norms_multigpu: bad stage ranges");
     }
     const int ngpu = static_cast<int>(mContexts.size());
     const int num_stages = static_cast<int>(los.size());
@@ -2056,9 +2056,9 @@ std::vector<float> MultiGPUPyTrainer::dispatch_pp_debug_grad_norms_multigpu(
             [&](sThreadContext& ctx) {
                 auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
                 if (!model)
-                    throw std::runtime_error("dispatch_pp_debug_grad_norms_multigpu: DSL model required");
+                    throw std::runtime_error("dispatch_pp_grad_norms_multigpu: DSL model required");
                 DISPATCH_PP_DBG_STAGE(ctx, inputs, targets);
-                model->dispatch_pp_debug_backward_stage(ctx.Model->get_input_buffer(),
+                model->dispatch_pp_backward_stage(ctx.Model->get_input_buffer(),
                                                         ctx.Model->get_target_buffer(),
                                                         ctx.Model->get_position_ids_buffer(),
                                                         *ctx.Communicator,
@@ -2085,7 +2085,7 @@ std::vector<float> MultiGPUPyTrainer::dispatch_pp_debug_grad_norms_multigpu(
     return result;
 }
 
-float MultiGPUPyTrainer::dispatch_pp_debug_train_step(const std::int32_t* inputs,
+float MultiGPUPyTrainer::dispatch_pp_train_step(const std::int32_t* inputs,
                                                       const std::int32_t* targets,
                                                       const optimizers::OptimizerConfig& opt_config,
                                                       int step_idx) {
@@ -2094,9 +2094,9 @@ float MultiGPUPyTrainer::dispatch_pp_debug_train_step(const std::int32_t* inputs
         [&](sThreadContext& ctx) {
             auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
             if (!model)
-                throw std::runtime_error("dispatch_pp_debug_train_step: DSL model required");
+                throw std::runtime_error("dispatch_pp_train_step: DSL model required");
             DISPATCH_PP_DBG_STAGE(ctx, inputs, targets);
-            const float l = model->dispatch_pp_debug_train_step(ctx.Model->get_input_buffer(),
+            const float l = model->dispatch_pp_train_step(ctx.Model->get_input_buffer(),
                                                                 ctx.Model->get_target_buffer(),
                                                                 ctx.Model->get_position_ids_buffer(),
                                                                 *ctx.Communicator,
@@ -2107,15 +2107,105 @@ float MultiGPUPyTrainer::dispatch_pp_debug_train_step(const std::int32_t* inputs
         0);
     return loss;
 }
+
+float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inputs,
+                                                              const std::int32_t* targets,
+                                                              const std::vector<int>& los,
+                                                              const std::vector<int>& his,
+                                                              const optimizers::OptimizerConfig& opt_config,
+                                                              int step_idx) {
+    if (los.size() != his.size() || los.empty()) {
+        throw std::runtime_error("dispatch_pp_train_step_multigpu: bad stage ranges");
+    }
+    const int ngpu = static_cast<int>(mContexts.size());
+    const int num_stages = static_cast<int>(los.size());
+    float loss = 0.0f;
+
+    // 1. Backward-dispatch stages in reverse order with cross-GPU boundary handoff;
+    //    each stage's whole forward computes the loss, its bounded backward fills the
+    //    grad store for its blocks. Collect each stage's grads to host.
+    std::vector<std::pair<std::string, std::vector<std::byte>>> collected;
+    std::vector<std::pair<std::string, std::vector<std::byte>>> boundary;
+    for (int si = num_stages - 1; si >= 0; --si) {
+        const int gpu = si % ngpu;
+        const int lo = los[static_cast<std::size_t>(si)];
+        const int hi = his[static_cast<std::size_t>(si)];
+        const bool is_loss = (si == num_stages - 1);
+        std::vector<std::pair<std::string, std::vector<std::byte>>> inject = boundary;
+        std::vector<std::pair<std::string, std::vector<std::byte>>> next_boundary;
+        std::vector<std::pair<std::string, std::vector<std::byte>>> stage_grads;
+        float stage_loss = 0.0f;
+
+        run_work(
+            [&](sThreadContext& ctx) {
+                auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+                if (!model)
+                    throw std::runtime_error("dispatch_pp_train_step_multigpu: DSL model required");
+                DISPATCH_PP_DBG_STAGE(ctx, inputs, targets);
+                model->dispatch_pp_backward_stage(ctx.Model->get_input_buffer(),
+                                                        ctx.Model->get_target_buffer(),
+                                                        ctx.Model->get_position_ids_buffer(),
+                                                        *ctx.Communicator,
+                                                        lo,
+                                                        hi,
+                                                        is_loss,
+                                                        std::move(inject));
+                if (is_loss) stage_loss = model->dispatch_pp_raw_loss();
+                stage_grads = model->dispatch_pp_read_block_grads(lo, hi, /*include_nonblock=*/is_loss);
+                auto* ge = model->graph_executor();
+                if (lo > 0) {
+                    const std::string rn = "d_blocks[" + std::to_string(lo - 1) + "].res_att";
+                    const std::string xn = "d_blocks[" + std::to_string(lo - 1) + "].mlp_down";
+                    next_boundary.emplace_back(rn, ge->debug_read_named_bytes(rn));
+                    next_boundary.emplace_back(xn, ge->debug_read_named_bytes(xn));
+                }
+            },
+            gpu);
+
+        for (auto& g : stage_grads) collected.push_back(std::move(g));
+        boundary = std::move(next_boundary);
+        if (is_loss) loss = stage_loss;
+    }
+
+    // 2. On GPU 0: write the full collected grad set into the store, run the optimizer
+    //    (updates GPU 0's master replica).
+    run_work(
+        [&](sThreadContext& ctx) {
+            auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+            if (!model)
+                throw std::runtime_error("dispatch_pp_train_step_multigpu: DSL model required");
+            model->dispatch_pp_write_grads(collected);
+            model->dispatch_pp_apply_optimizer(*ctx.Communicator, opt_config, step_idx + 1);
+        },
+        0);
+
+    // 3. Broadcast GPU 0's updated weights to every replica (keeps the pool
+    //    consistent for the next step's stages, which run on any GPU).
+    std::vector<std::pair<std::string, std::vector<std::byte>>> master;
+    run_work(
+        [&](sThreadContext& ctx) {
+            auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+            if (model) master = model->dispatch_pp_read_weights();
+        },
+        0);
+    run_work(
+        [&](sThreadContext& ctx) {
+            auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+            if (model) model->dispatch_pp_write_weights(master);
+        },
+        -1);
+
+    return loss;
+}
 #undef DISPATCH_PP_DBG_STAGE
 
-std::unordered_map<std::string, std::size_t> MultiGPUPyTrainer::dispatch_pp_debug_weight_residency() {
+std::unordered_map<std::string, std::size_t> MultiGPUPyTrainer::dispatch_pp_weight_residency() {
     std::unordered_map<std::string, std::size_t> out;
     run_work(
         [&](sThreadContext& ctx) {
             auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
             if (!model)
-                throw std::runtime_error("dispatch_pp_debug_weight_residency: DSL model required");
+                throw std::runtime_error("dispatch_pp_weight_residency: DSL model required");
             auto* wm = model->weight_manager();
             if (!wm) {
                 // No weight manager => weights are fully resident (not streamed);

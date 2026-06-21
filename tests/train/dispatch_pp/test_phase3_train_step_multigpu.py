@@ -1,13 +1,15 @@
-"""Phase-3 / integration gate: a fused dispatch-PP training step converges.
+"""Phase-3 / integration gate: the multi-GPU fused dispatch-PP step converges.
 
-This is the end-to-end keystone: a single ``dispatch_pp_train_step`` chains the
-sub-range executor's forward (computing the loss) -> backward (filling the grad
-store) -> optimizer update, all on one GPU. Running it repeatedly on a *fixed* batch
-must drive the loss down — proving the dispatch executor + optimizer actually train,
-not just match a reference in isolation.
+This closes the loop across the GPU pool: ``dispatch_pp_train_step_multigpu``
+runs the backward dispatch round-robin (stages on different GPUs, boundary gradients
+handed GPU->host->GPU), collects every stage's gradients onto the master GPU, runs
+the optimizer there, then **broadcasts** the updated weights back to every replica so
+the pool stays consistent for the next step. Repeated on a fixed batch the loss must
+fall — proving multi-GPU dispatch training with cross-GPU weight consistency.
 
-Single GPU: the cross-GPU stage handoff (forward + backward) is validated separately
-in test_phase2_multigpu; this test closes the loop with a real optimizer update.
+(The input embedding is left frozen — the dispatch backward's layer-attribution
+filter doesn't route the trailing embedding-backward op to a stage — which does not
+affect convergence on a fixed batch; the transformer blocks + output head train.)
 """
 
 import json
@@ -23,24 +25,29 @@ from surogate.dsl.ir_builder import build_dsl_ir_for_model
 from surogate.utils.hf import get_model_weights_path
 from tests.test_onboarding_qwen3 import (
     BATCH,
+    NUM_LAYERS,
     SEQ_LEN,
     make_inputs,
     prepare_mini_model,
     resolve_model_path,
 )
 
+_NGPU = 2
 _MIN_FREE_BYTES = 6 * 1024**3
 
 
-def _enough_free_gpu():
-    if torch.cuda.device_count() < 1:
+def _enough_free_gpus():
+    if torch.cuda.device_count() < _NGPU:
         return False
-    free, _ = torch.cuda.mem_get_info(0)
-    return free >= _MIN_FREE_BYTES
+    for i in range(_NGPU):
+        free, _ = torch.cuda.mem_get_info(i)
+        if free < _MIN_FREE_BYTES:
+            return False
+    return True
 
 
 pytestmark = pytest.mark.skipif(
-    not _enough_free_gpu(), reason=f"needs 1 GPU with >= {_MIN_FREE_BYTES // 1024**3} GiB free"
+    not _enough_free_gpus(), reason=f"needs {_NGPU} GPUs each with >= {_MIN_FREE_BYTES // 1024**3} GiB free"
 )
 
 
@@ -61,7 +68,7 @@ def _build_trainer():
     )
     opts.dsl_ir_json = build_dsl_ir_for_model(str(model_dir))
     trainer = sg.SurogateTrainer(
-        ngpu=1,
+        ngpu=_NGPU,
         config=cfg,
         options=opts,
         batch_size=BATCH,
@@ -76,27 +83,36 @@ def _build_trainer():
     return trainer, model_dir
 
 
-def test_dispatch_train_step_converges_on_fixed_batch():
+def _stage_ranges(splits):
+    los, his, lo = [], [], 0
+    for cut in splits:
+        los.append(lo)
+        his.append(cut)
+        lo = cut + 1
+    los.append(lo)
+    his.append(NUM_LAYERS - 1)
+    return los, his
+
+
+def test_multigpu_dispatch_train_step_converges():
     trainer, model_dir = _build_trainer()
     vocab_size = json.loads((Path(model_dir) / "config.json").read_text())["vocab_size"]
     b = make_inputs(vocab_size)
     opt_config = sg.OptimizerConfig.adamw(
         lr=1e-4, beta1=0.9, beta2=0.999, epsilon=1e-8, weight_decay=0.0, grad_clip=1.0
     )
+    los, his = _stage_ranges([NUM_LAYERS // 2 - 1])  # 2 stages -> GPU 0 and GPU 1
 
     n_steps = 15
     losses = [
-        float(trainer.dispatch_pp_train_step(b["inputs"], b["targets"], opt_config, i))
+        float(trainer.dispatch_pp_train_step_multigpu(b["inputs"], b["targets"], los, his, opt_config, i))
         for i in range(n_steps)
     ]
-    print("dispatch train losses:", [round(x, 4) for x in losses], flush=True)
+    print("multigpu dispatch train losses:", [round(x, 3) for x in losses], flush=True)
 
-    # Loss must be a sane positive scalar throughout.
     assert all(np.isfinite(losses)), losses
     assert losses[0] > 0.0
-    # Overfitting one fixed batch should drive the loss well down.
     assert losses[-1] < losses[0], f"loss did not decrease: {losses}"
     assert losses[-1] < 0.9 * losses[0], f"loss barely moved: first={losses[0]:.3f} last={losses[-1]:.3f}"
-    # The trajectory should be predominantly downward (allow minor bf16 wobble).
-    drops = sum(1 for a, b_ in zip(losses, losses[1:]) if b_ <= a + 1e-3)
+    drops = sum(1 for a, c in zip(losses, losses[1:]) if c <= a + 1e-3 * abs(a))
     assert drops >= (n_steps - 1) * 0.7, f"trajectory not monotone enough: {losses}"

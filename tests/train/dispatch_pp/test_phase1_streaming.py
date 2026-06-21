@@ -74,11 +74,11 @@ def test_streamed_forward_matches_resident():
     inputs = make_inputs(vocab_size)["inputs"]
 
     resident = _build_trainer(model_dir, offload_master=False)
-    res_hidden = np.asarray(resident.dispatch_pp_debug_forward_hidden(inputs))
+    res_hidden = np.asarray(resident.dispatch_pp_forward_hidden(inputs))
     del resident
 
     streamed = _build_trainer(model_dir, offload_master=True)
-    str_hidden = np.asarray(streamed.dispatch_pp_debug_forward_hidden(inputs))
+    str_hidden = np.asarray(streamed.dispatch_pp_forward_hidden(inputs))
 
     np.testing.assert_allclose(res_hidden, str_hidden, rtol=1e-3, atol=1e-3)
 
@@ -91,13 +91,13 @@ def test_streamed_grads_match_resident():
 
     resident = _build_trainer(model_dir, offload_master=False)
     res_grads = np.asarray(
-        resident.dispatch_pp_debug_grad_norms_whole(batch["inputs"], batch["targets"])
+        resident.dispatch_pp_grad_norms_whole(batch["inputs"], batch["targets"])
     )
     del resident
 
     streamed = _build_trainer(model_dir, offload_master=True)
     str_grads = np.asarray(
-        streamed.dispatch_pp_debug_grad_norms_whole(batch["inputs"], batch["targets"])
+        streamed.dispatch_pp_grad_norms_whole(batch["inputs"], batch["targets"])
     )
 
     assert res_grads.shape == (NUM_LAYERS,)

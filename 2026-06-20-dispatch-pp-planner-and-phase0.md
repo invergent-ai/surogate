@@ -1192,8 +1192,8 @@ def test_subrange_forward_matches_whole_graph():
     inputs = make_inputs(vocab_size)["inputs"]
     split_after = (NUM_LAYERS // 2) - 1
 
-    whole = trainer.dispatch_pp_debug_forward_hidden(inputs)
-    part = trainer.dispatch_pp_debug_forward_subranges(inputs, split_after)
+    whole = trainer.dispatch_pp_forward_hidden(inputs)
+    part = trainer.dispatch_pp_forward_subranges(inputs, split_after)
     np.testing.assert_allclose(whole, part, rtol=1e-2, atol=1e-2)
 
 
@@ -1205,15 +1205,15 @@ def test_subrange_backward_grad_matches_whole_graph():
     batch = make_inputs(vocab_size)
     split_after = (NUM_LAYERS // 2) - 1
 
-    g_whole = trainer.dispatch_pp_debug_grad_norms_whole(batch["inputs"], batch["targets"])
-    g_part = trainer.dispatch_pp_debug_grad_norms_subranges(batch["inputs"], batch["targets"], split_after)
+    g_whole = trainer.dispatch_pp_grad_norms_whole(batch["inputs"], batch["targets"])
+    g_part = trainer.dispatch_pp_grad_norms_subranges(batch["inputs"], batch["targets"], split_after)
     np.testing.assert_allclose(g_whole, g_part, rtol=2e-2, atol=2e-2)
 ```
 
 - [ ] **Step 3: Run test to verify it fails**
 
 Run: `pytest tests/train/dispatch_pp/test_phase0_subrange.py -v`
-Expected: FAIL with `AttributeError: 'SurogateTrainer' object has no attribute 'dispatch_pp_debug_forward_hidden'`
+Expected: FAIL with `AttributeError: 'SurogateTrainer' object has no attribute 'dispatch_pp_forward_hidden'`
 or the equivalent missing debug binding.
 
 - [ ] **Step 4: Implement the minimal sub-range execution path + debug hooks**
@@ -1249,11 +1249,11 @@ std::vector<float> grad_norms_subranges(MultiGPUPyTrainer& trainer,
 Add matching `MultiGPUPyTrainer` methods in `csrc/src/binding/py_train.h/.cpp`:
 
 ```cpp
-std::vector<float> dispatch_pp_debug_forward_hidden(const std::int32_t* inputs);
-std::vector<float> dispatch_pp_debug_forward_subranges(const std::int32_t* inputs, int split_after_block);
-std::vector<float> dispatch_pp_debug_grad_norms_whole(const std::int32_t* inputs,
+std::vector<float> dispatch_pp_forward_hidden(const std::int32_t* inputs);
+std::vector<float> dispatch_pp_forward_subranges(const std::int32_t* inputs, int split_after_block);
+std::vector<float> dispatch_pp_grad_norms_whole(const std::int32_t* inputs,
                                                       const std::int32_t* targets);
-std::vector<float> dispatch_pp_debug_grad_norms_subranges(const std::int32_t* inputs,
+std::vector<float> dispatch_pp_grad_norms_subranges(const std::int32_t* inputs,
                                                          const std::int32_t* targets,
                                                          int split_after_block);
 ```

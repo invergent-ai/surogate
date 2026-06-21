@@ -3,7 +3,7 @@
 The point of streaming block work-weights from pinned CPU is that a GPU's resident
 weight footprint is bounded by the streaming double-buffer slot count (a small
 constant), NOT by the model's layer count. This test pins that quantitatively via
-``dispatch_pp_debug_weight_residency`` introspection:
+``dispatch_pp_weight_residency`` introspection:
 
   resident  (offload_master=False): masters live on the GPU -> the whole model's
             weight bytes are device-resident; there is no weight manager / no
@@ -78,7 +78,7 @@ def _residency(offload_master: bool):
         qlora_config=None,
     )
     trainer.import_weights(get_model_weights_path(str(model_dir)))
-    res = dict(trainer.dispatch_pp_debug_weight_residency())
+    res = dict(trainer.dispatch_pp_weight_residency())
     del trainer
     gc.collect()
     torch.cuda.empty_cache()

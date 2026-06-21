@@ -30,7 +30,7 @@ Updated before each commit. Status: ☐ not started · ◐ in progress · ☑ do
 - ☑ Task 1 — Streamed-vs-resident correctness parity (forward hidden + grad norms), single GPU
 - ☑ Task 2 — Memory invariant: established by construction for single GPU; quantitative
   scaling test landed in Phase 2 (`tests/train/dispatch_pp/test_phase2_memory.py`, via
-  `dispatch_pp_debug_weight_residency` introspection — streaming holds `slot_count` blocks
+  `dispatch_pp_weight_residency` introspection — streaming holds `slot_count` blocks
   resident, `< NUM_LAYERS`)
 - ☑ Task 3 — Phase-1 verdict recorded in the design spec §7 (streamed-vs-resident parity PASS)
 
@@ -56,8 +56,8 @@ flat-as-N-grows scaling is the real, testable property.
 
 The gate: a model trained with weights streamed from pinned CPU must produce the same forward
 hidden state and the same per-block weight-grad norms as the resident-weights run, on one GPU.
-Reuses the Phase-0 debug entry points (`dispatch_pp_debug_forward_hidden`,
-`dispatch_pp_debug_grad_norms_whole`) — they run through the executor's per-block gather/release,
+Reuses the Phase-0 debug entry points (`dispatch_pp_forward_hidden`,
+`dispatch_pp_grad_norms_whole`) — they run through the executor's per-block gather/release,
 so enabling `offload_master` exercises the streaming path with no new C++.
 
 - [ ] **Step 1:** Build two trainers from the same weights — one resident (`offload_master=False`),

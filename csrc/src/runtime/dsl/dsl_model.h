@@ -105,10 +105,10 @@ public:
 
     // ---- Debug-only dispatch-PP sub-range parity (BF16 full-FT, resident) --
     // Whole-graph forward; returns the final hidden state flattened to host f32.
-    std::vector<float> dispatch_pp_debug_forward_hidden(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm);
+    std::vector<float> dispatch_pp_forward_hidden(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm);
     // Forward as two contiguous block sub-ranges [0..split] then [split+1..last],
     // the boundary residual round-tripped through host; returns final hidden f32.
-    std::vector<float> dispatch_pp_debug_forward_subranges(Tensor inputs,
+    std::vector<float> dispatch_pp_forward_subranges(Tensor inputs,
                                                            Tensor position_ids,
                                                            NCCLCommunicator& comm,
                                                            int split_after_block);
@@ -116,7 +116,7 @@ public:
     // When inject_layer >= 0, inject ``inject_host`` into get_residual(inject_layer)
     // first (the cross-GPU activation handoff). Read the result via the executor's
     // debug readers (debug_read_residual_bytes / debug_last_block_hidden_f32).
-    void dispatch_pp_debug_forward_stage(Tensor inputs,
+    void dispatch_pp_forward_stage(Tensor inputs,
                                          Tensor position_ids,
                                          NCCLCommunicator& comm,
                                          int lo,
@@ -129,7 +129,7 @@ public:
     // inject the incoming boundary gradients (d_blocks[hi].res_att / .mlp_down).
     // Read results via the executor debug readers (debug_block_grad_norms,
     // debug_read_named_bytes for d_blocks[lo-1].*).
-    void dispatch_pp_debug_backward_stage(Tensor inputs,
+    void dispatch_pp_backward_stage(Tensor inputs,
                                           Tensor targets,
                                           Tensor position_ids,
                                           NCCLCommunicator& comm,
@@ -138,7 +138,7 @@ public:
                                           bool is_loss_stage,
                                           std::vector<std::pair<std::string, std::vector<std::byte>>> inject_named);
     // Whole-graph backward; returns per-block weight-grad L2 norms (block order).
-    std::vector<float> dispatch_pp_debug_grad_norms_whole(Tensor inputs,
+    std::vector<float> dispatch_pp_grad_norms_whole(Tensor inputs,
                                                           Tensor targets,
                                                           Tensor position_ids,
                                                           NCCLCommunicator& comm);
@@ -146,15 +146,36 @@ public:
     // executor: forward (computes the loss), backward (grads to the store), then
     // the optimizer update. Returns the step's mean loss. Single-GPU end-to-end
     // convergence keystone (the cross-GPU stage handoff is validated separately).
-    float dispatch_pp_debug_train_step(Tensor inputs,
+    float dispatch_pp_train_step(Tensor inputs,
                                        Tensor targets,
                                        Tensor position_ids,
                                        NCCLCommunicator& comm,
                                        const optimizers::OptimizerConfig& opt_config,
                                        int step_idx);
+    // --- Multi-GPU dispatch training-step host-transfer primitives ---
+    // Read the weight gradients for the parameters of blocks [lo..hi] (and, when
+    // include_nonblock, the non-block params: lm_head / final norm) to host,
+    // keyed by parameter name. The cross-GPU grad collection for the fused step.
+    std::vector<std::pair<std::string, std::vector<std::byte>>> dispatch_pp_read_block_grads(
+        int lo, int hi, bool include_nonblock);
+    // Write gradients from host into the grad store by name (host -> device).
+    void dispatch_pp_write_grads(const std::vector<std::pair<std::string, std::vector<std::byte>>>& items);
+    // Read / write every parameter weight to / from host (the master broadcast).
+    std::vector<std::pair<std::string, std::vector<std::byte>>> dispatch_pp_read_weights();
+    void dispatch_pp_write_weights(const std::vector<std::pair<std::string, std::vector<std::byte>>>& items);
+    // Run the optimizer over the (collected) grad store on this GPU. Uses
+    // total-token normalization (ValidTokenCount is not populated on the collecting
+    // GPU since the dispatch backward skips the DP loss reduce). step_idx is 1-based.
+    float dispatch_pp_apply_optimizer(NCCLCommunicator& comm,
+                                            const optimizers::OptimizerConfig& opt_config,
+                                            int step_idx);
+    // Raw (summed) loss from the last forward — readable without ValidTokenCount,
+    // which the dispatch backward leaves unset. Monotone with the mean loss, so it
+    // tracks convergence.
+    [[nodiscard]] float dispatch_pp_raw_loss() const;
     // Backward as two contiguous block sub-ranges (high range first, boundary
     // grad round-tripped through host); returns per-block grad norms.
-    std::vector<float> dispatch_pp_debug_grad_norms_subranges(Tensor inputs,
+    std::vector<float> dispatch_pp_grad_norms_subranges(Tensor inputs,
                                                               Tensor targets,
                                                               Tensor position_ids,
                                                               NCCLCommunicator& comm,
@@ -461,6 +482,11 @@ private:
     std::unique_ptr<modules::LoRANorMuonState> mLoRANorMuonState;
     bool mIsMoEModel = false;
     bool mUseTokenScale = true;               // apply 1/valid_token_count in global_norm_sqrt
+    // dispatch-PP: grads are collected complete onto this GPU by hand (not via DDP),
+    // so the optimizer must skip the cross-GPU grad/norm all-reduce that would
+    // deadlock waiting for the idle pool.
+    bool mDispatchPpLocalGrads = false;
+    float mDispatchPpLastLoss = 0.0f;         // mean loss stashed by the dispatch backward's forward
     bool mDocMaskingActive = false;           // set by forward(), cleared by backward()
     float* mGrpoInvTemperatureGpu = nullptr;  // persists from forward_for_grpo() to backward_grpo()
 

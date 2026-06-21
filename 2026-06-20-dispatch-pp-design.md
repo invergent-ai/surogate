@@ -463,7 +463,7 @@ Front-loads the biggest unknown so we fail fast if the engine cannot do sub-rang
   - *Multi-GPU round-robin forward dispatch landed (2026-06-21) — PASS.* The C++ runtime dispatches
     contiguous block stages round-robin across the stateless GPU pool (stage i -> GPU i % ngpu) via
     `run_work`, handing the full block boundary GPU -> host -> GPU with **no NCCL**
-    (`MultiGPUPyTrainer::dispatch_pp_debug_forward_hidden_multigpu`). The fused-residual block carries
+    (`MultiGPUPyTrainer::dispatch_pp_forward_hidden_multigpu`). The fused-residual block carries
     two tensors across a boundary — `blocks[hi].res_att` (residual after attention) and
     `blocks[hi].mlp_down` (`x`, the previous block's MLP output, folded in by block hi+1's first op).
     Both are read **by name** on the sending GPU (kept live by `set_debug_preserve_layer`, which keeps
@@ -475,7 +475,7 @@ Front-loads the biggest unknown so we fail fast if the engine cannot do sub-rang
     (`tests/train/dispatch_pp/test_phase2_multigpu.py`: runs-end-to-end + 2-stage parity + wrap parity,
     all passing).
   - *Multi-GPU round-robin backward dispatch landed (2026-06-21) — PASS.* Stages run in reverse forward
-    order (the loss-owning stage first) via `MultiGPUPyTrainer::dispatch_pp_debug_grad_norms_multigpu`.
+    order (the loss-owning stage first) via `MultiGPUPyTrainer::dispatch_pp_grad_norms_multigpu`.
     Each stage runs one GPU on the full batch: a forced-eager whole forward provides activations, then a
     bounded backward selects the stage's ops **by their owning block layer** [lo..hi]
     (`set_debug_backward_layer_range`) — robust to boundary view ops (e.g.
@@ -491,7 +491,7 @@ Front-loads the biggest unknown so we fail fast if the engine cannot do sub-rang
     within bf16 tolerance for 2 stages and round-robin wrap
     (`tests/train/dispatch_pp/test_phase2_multigpu.py`: 3 backward tests passing).
   - *Memory-scaling invariant — quantitative test (2026-06-21) — PASS.* GPU weight residency is
-    introspectable via `dispatch_pp_debug_weight_residency` (total device-resident weight bytes, the
+    introspectable via `dispatch_pp_weight_residency` (total device-resident weight bytes, the
     streaming block double-buffer footprint, the slot count), backed by
     `DslWeightManager::gpu_prefetch_buffer_bytes` / `prefetch_slot_count`. With streaming
     (`offload_master`), masters are pinned on the CPU and blocks stream through `kNumPrefetchBuffers`
@@ -515,7 +515,7 @@ Front-loads the biggest unknown so we fail fast if the engine cannot do sub-rang
     in the same order so the final params match the synchronous reference exactly; the just-submitted
     update is still in flight on return (worker exactly one behind, never more); a mismatched grad is
     rejected at submit time and the optimizer stays usable.
-  - *Fused dispatch training step converges (2026-06-21) — PASS.* `dispatch_pp_debug_train_step` chains
+  - *Fused dispatch training step converges (2026-06-21) — PASS.* `dispatch_pp_train_step` chains
     the sub-range executor's forward (computing the loss) -> backward (filling the grad store) ->
     optimizer update into one real training step, on a single GPU. Repeated on a fixed batch it drives
     the loss down monotonically (e.g. 19.19 -> 9.73 -> 4.31 -> 2.74 -> ... -> 1.03 over 15 steps), and
@@ -524,12 +524,22 @@ Front-loads the biggest unknown so we fail fast if the engine cannot do sub-rang
     divides by 1 - beta^step; step 0 is a divide-by-zero -> NaN — the cause of an early failure), and the
     grad-norm/scale must use the same per-token normalization (`mUseTokenScale`) the grads were produced
     with. Test: `tests/train/dispatch_pp/test_phase3_train_step.py`.
-    Still ahead: a **multi-GPU** fused `step()` that keeps the CPU master consistent across the pool
-    (collect per-stage grads -> async-stale optimizer on the CPU master -> broadcast), wiring the
-    AsyncOptimizer worker in with per-layer `param_copied`/`grad_copied` release, and the
-    converges-with-overlap staleness test. The single-GPU loop above is the end-to-end keystone; the
-    cross-GPU stage handoff (fwd + bwd) is already parity-proven, so the remaining work is the
-    consistency/overlap plumbing.
+  - *Multi-GPU fused dispatch training step converges (2026-06-21) — PASS.*
+    `dispatch_pp_train_step_multigpu` runs the backward dispatch round-robin across the pool (stages on
+    different GPUs, boundary gradients handed GPU->host->GPU), collects every stage's grads onto the
+    master GPU by name, runs the optimizer there, then **broadcasts** the updated weights to every
+    replica so the pool is consistent for the next step. On 2× RTX 5090 it drives the loss down
+    (17.99 -> 9.19 -> 3.70 -> ... -> 0.96 over 15 steps). Two more consistency rules surfaced (both
+    deadlocked otherwise): the collecting GPU's optimizer must skip the DDP grad/norm all-reduce
+    (`mDispatchPpLocalGrads` — grads are already complete locally), and the loss is read by summing the
+    per-token `Losses` buffer locally (the dispatch backward skips `reduce_loss`, so `LossHost`/
+    `ValidTokenCount` are unset). The input embedding is left frozen (the layer-attribution filter
+    doesn't route the trailing embedding-backward op to a stage), which doesn't affect convergence on a
+    fixed batch. Test: `tests/train/dispatch_pp/test_phase3_train_step_multigpu.py`.
+    Still ahead: route the embedding-backward op to the lowest stage (unfreeze embedding); replace the
+    GPU-0-collect + broadcast with the **CPU-master async-stale** path (wire the `AsyncOptimizer` worker
+    in, per-layer `param_copied`/`grad_copied` release) and the converges-with-overlap staleness test;
+    fold streaming into the dispatch step so it is memory-scaling as well as consistent.
 - **Deferred (interfaces reserved):** FP8/NVFP4 stage streaming, 2D (× cross-node DDP), MoE/EP
   interplay, synchronous-optimizer user option.
 

@@ -72,8 +72,8 @@ def test_subrange_forward_matches_whole_graph():
     inputs = make_inputs(vocab_size)["inputs"]
     split_after = (NUM_LAYERS // 2) - 1
 
-    whole = np.asarray(trainer.dispatch_pp_debug_forward_hidden(inputs))
-    part = np.asarray(trainer.dispatch_pp_debug_forward_subranges(inputs, split_after))
+    whole = np.asarray(trainer.dispatch_pp_forward_hidden(inputs))
+    part = np.asarray(trainer.dispatch_pp_forward_subranges(inputs, split_after))
     np.testing.assert_allclose(whole, part, rtol=1e-2, atol=1e-2)
 
 
@@ -89,9 +89,9 @@ def test_subrange_backward_grad_matches_whole_graph():
     split_after = (NUM_LAYERS // 2) - 1
 
     g_whole = np.asarray(
-        trainer.dispatch_pp_debug_grad_norms_whole(batch["inputs"], batch["targets"])
+        trainer.dispatch_pp_grad_norms_whole(batch["inputs"], batch["targets"])
     )
     g_part = np.asarray(
-        trainer.dispatch_pp_debug_grad_norms_subranges(batch["inputs"], batch["targets"], split_after)
+        trainer.dispatch_pp_grad_norms_subranges(batch["inputs"], batch["targets"], split_after)
     )
     np.testing.assert_allclose(g_whole, g_part, rtol=2e-2, atol=2e-2)

@@ -1379,7 +1379,7 @@ NB_MODULE(_surogate, m) {
             "- targets: int32 token ids shaped [batch_size * local_gpus, seq_length].\n"
             "- position_ids: int32 position ids shaped [batch_size * local_gpus, seq_length].")
         .def(
-            "dispatch_pp_debug_forward_hidden",
+            "dispatch_pp_forward_hidden",
             [](MultiGPUPyTrainer* trainer, TokenArray inputs) {
                 CHECK_SHAPE(inputs, trainer->batch_size(), trainer->seq_length());
                 return dsl::dispatch_pp_phase0::forward_hidden_whole(*trainer, inputs.data());
@@ -1387,7 +1387,7 @@ NB_MODULE(_surogate, m) {
             nb::arg("inputs"),
             "Debug-only dispatch-PP: whole-graph forward; returns the final hidden state as a flat f32 list.")
         .def(
-            "dispatch_pp_debug_forward_subranges",
+            "dispatch_pp_forward_subranges",
             [](MultiGPUPyTrainer* trainer, TokenArray inputs, int split_after_block) {
                 CHECK_SHAPE(inputs, trainer->batch_size(), trainer->seq_length());
                 return dsl::dispatch_pp_phase0::forward_hidden_subranges(*trainer, inputs.data(), split_after_block);
@@ -1397,7 +1397,7 @@ NB_MODULE(_surogate, m) {
             "Debug-only dispatch-PP: forward as two contiguous block sub-ranges with a CPU-boundary "
             "handoff; returns the final hidden state as a flat f32 list.")
         .def(
-            "dispatch_pp_debug_grad_norms_whole",
+            "dispatch_pp_grad_norms_whole",
             [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets) {
                 CHECK_SHAPE(inputs, trainer->batch_size(), trainer->seq_length());
                 CHECK_SHAPE(targets, trainer->batch_size(), trainer->seq_length());
@@ -1407,7 +1407,7 @@ NB_MODULE(_surogate, m) {
             nb::arg("targets"),
             "Debug-only dispatch-PP: whole-graph backward; returns per-block weight-grad L2 norms.")
         .def(
-            "dispatch_pp_debug_grad_norms_subranges",
+            "dispatch_pp_grad_norms_subranges",
             [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets, int split_after_block) {
                 CHECK_SHAPE(inputs, trainer->batch_size(), trainer->seq_length());
                 CHECK_SHAPE(targets, trainer->batch_size(), trainer->seq_length());
@@ -1420,10 +1420,10 @@ NB_MODULE(_surogate, m) {
             "Debug-only dispatch-PP: backward as two contiguous block sub-ranges with a CPU-boundary "
             "grad handoff; returns per-block weight-grad L2 norms.")
         .def(
-            "dispatch_pp_debug_forward_hidden_multigpu",
+            "dispatch_pp_forward_hidden_multigpu",
             [](MultiGPUPyTrainer* trainer, TokenArray inputs, std::vector<int> los, std::vector<int> his) {
                 CHECK_SHAPE(inputs, trainer->batch_size(), trainer->seq_length());
-                return trainer->dispatch_pp_debug_forward_hidden_multigpu(inputs.data(), los, his);
+                return trainer->dispatch_pp_forward_hidden_multigpu(inputs.data(), los, his);
             },
             nb::arg("inputs"),
             nb::arg("los"),
@@ -1432,12 +1432,12 @@ NB_MODULE(_surogate, m) {
             "[los[i]..his[i]] across the GPU pool with a CPU-boundary residual handoff between stages; "
             "returns the final hidden state as a flat f32 list.")
         .def(
-            "dispatch_pp_debug_grad_norms_multigpu",
+            "dispatch_pp_grad_norms_multigpu",
             [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets, std::vector<int> los,
                std::vector<int> his) {
                 CHECK_SHAPE(inputs, trainer->batch_size(), trainer->seq_length());
                 CHECK_SHAPE(targets, trainer->batch_size(), trainer->seq_length());
-                return trainer->dispatch_pp_debug_grad_norms_multigpu(inputs.data(), targets.data(), los, his);
+                return trainer->dispatch_pp_grad_norms_multigpu(inputs.data(), targets.data(), los, his);
             },
             nb::arg("inputs"),
             nb::arg("targets"),
@@ -1446,18 +1446,18 @@ NB_MODULE(_surogate, m) {
             "Debug-only dispatch-PP: round-robin backward dispatch of contiguous block stages across "
             "the GPU pool with a CPU-boundary gradient handoff; returns per-block weight-grad L2 norms.")
         .def(
-            "dispatch_pp_debug_weight_residency",
-            [](MultiGPUPyTrainer* trainer) { return trainer->dispatch_pp_debug_weight_residency(); },
+            "dispatch_pp_weight_residency",
+            [](MultiGPUPyTrainer* trainer) { return trainer->dispatch_pp_weight_residency(); },
             "Debug-only dispatch-PP: per-GPU weight-residency snapshot (total device-resident weight "
             "bytes, streaming block double-buffer footprint, slot count). Proves GPU weight residency is "
             "bounded by the streaming slot count, not the layer count.")
         .def(
-            "dispatch_pp_debug_train_step",
+            "dispatch_pp_train_step",
             [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets,
                const optimizers::OptimizerConfig& opt_config, int step_idx) {
                 CHECK_SHAPE(inputs, trainer->batch_size(), trainer->seq_length());
                 CHECK_SHAPE(targets, trainer->batch_size(), trainer->seq_length());
-                return trainer->dispatch_pp_debug_train_step(inputs.data(), targets.data(), opt_config, step_idx);
+                return trainer->dispatch_pp_train_step(inputs.data(), targets.data(), opt_config, step_idx);
             },
             nb::arg("inputs"),
             nb::arg("targets"),
@@ -1465,6 +1465,24 @@ NB_MODULE(_surogate, m) {
             nb::arg("step_idx"),
             "Debug-only dispatch-PP: one full single-GPU training step (forward -> loss, backward -> "
             "grads, optimizer update) through the sub-range executor; returns the step loss.")
+        .def(
+            "dispatch_pp_train_step_multigpu",
+            [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets, std::vector<int> los,
+               std::vector<int> his, const optimizers::OptimizerConfig& opt_config, int step_idx) {
+                CHECK_SHAPE(inputs, trainer->batch_size(), trainer->seq_length());
+                CHECK_SHAPE(targets, trainer->batch_size(), trainer->seq_length());
+                return trainer->dispatch_pp_train_step_multigpu(
+                    inputs.data(), targets.data(), los, his, opt_config, step_idx);
+            },
+            nb::arg("inputs"),
+            nb::arg("targets"),
+            nb::arg("los"),
+            nb::arg("his"),
+            nb::arg("opt_config"),
+            nb::arg("step_idx"),
+            "Debug-only dispatch-PP: one full multi-GPU training step (round-robin backward dispatch + "
+            "cross-GPU grad handoff -> collect grads -> optimizer on the master -> broadcast weights to "
+            "all GPUs); returns the (raw) step loss.")
         .def(
             "step",
             [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets, TokenArray3 position_ids) {

@@ -12,26 +12,26 @@
 namespace dsl::dispatch_pp_phase0 {
 
 std::vector<float> forward_hidden_whole(MultiGPUPyTrainer& trainer, const std::int32_t* inputs) {
-    return trainer.dispatch_pp_debug_forward_hidden(inputs);
+    return trainer.dispatch_pp_forward_hidden(inputs);
 }
 
 std::vector<float> forward_hidden_subranges(MultiGPUPyTrainer& trainer,
                                             const std::int32_t* inputs,
                                             int split_after_block) {
-    return trainer.dispatch_pp_debug_forward_subranges(inputs, split_after_block);
+    return trainer.dispatch_pp_forward_subranges(inputs, split_after_block);
 }
 
 std::vector<float> grad_norms_whole(MultiGPUPyTrainer& trainer,
                                     const std::int32_t* inputs,
                                     const std::int32_t* targets) {
-    return trainer.dispatch_pp_debug_grad_norms_whole(inputs, targets);
+    return trainer.dispatch_pp_grad_norms_whole(inputs, targets);
 }
 
 std::vector<float> grad_norms_subranges(MultiGPUPyTrainer& trainer,
                                         const std::int32_t* inputs,
                                         const std::int32_t* targets,
                                         int split_after_block) {
-    return trainer.dispatch_pp_debug_grad_norms_subranges(inputs, targets, split_after_block);
+    return trainer.dispatch_pp_grad_norms_subranges(inputs, targets, split_after_block);
 }
 
 }  // namespace dsl::dispatch_pp_phase0
