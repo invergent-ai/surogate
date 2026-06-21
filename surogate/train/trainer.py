@@ -401,6 +401,12 @@ class SurogateTrainerWrapper:
             # stack auto-sizer doesn't model them). Plenty of free VRAM since the base
             # weights are bounded to the prefetch buffers.
             os.environ.setdefault("SUROGATE_DISPATCH_STACK_HEADROOM_MB", "2048")
+            # Microbatches per step = gpus * chunks. The per-step weight stream is fixed
+            # (each stage streams once and all microbatches reuse it), so running more
+            # microbatches amortizes it over more tokens AND keeps the pipeline fuller
+            # (fewer bubbles). Peak memory is unchanged (microbatches run sequentially on
+            # the resident stage). chunks>1 raises the effective batch to gpus*bsz*chunks.
+            self._dpp_chunks = max(1, int(os.environ.get("SUROGATE_DISPATCH_MICROBATCH_CHUNKS", "1")))
             logger.info(
                 "[dispatch_pp]: %d stages over %d layers (max %d blocks/stage), prefetch=%d slots",
                 _nst,
@@ -1083,7 +1089,12 @@ class SurogateTrainerWrapper:
             logger.info("CUDA graphs disabled")
 
         # Allocate token buffers
-        micro_steps = self.config.gradient_accumulation_steps if use_full_step_graphs else 1
+        if self.config.parallelism == "dispatch_pp":
+            micro_steps = self._dpp_chunks  # M = gpus * chunks microbatches per step
+        elif use_full_step_graphs:
+            micro_steps = self.config.gradient_accumulation_steps
+        else:
+            micro_steps = 1
         total_rows = self.config.gpus * self.config.per_device_train_batch_size * micro_steps
         in_tokens = np.empty((total_rows, self.config.sequence_len), dtype=np.int32)
         out_tokens = np.empty((total_rows, self.config.sequence_len), dtype=np.int32)
@@ -1242,12 +1253,15 @@ class SurogateTrainerWrapper:
             step_start = time.time()
 
             if self._dispatch_pp:
-                # The loader fills a full data-parallel chunk (gpus*bsz sequences);
-                # the dispatch step is model-parallel and consumes one micro-batch
-                # (the first bsz sequences — same data drives every stage).
-                if not self.train_loader.has_next():
-                    self.train_loader.advance_epoch()
-                self.train_loader.load_batch(in_tokens, out_tokens, pos_ids)
+                # Fill all gpus*bsz*chunks rows = M microbatches. The loader yields one
+                # gpus*bsz chunk per call, so load `chunks` of them into the buffer.
+                chunk = self.config.gpus * self.config.per_device_train_batch_size
+                for c in range(self._dpp_chunks):
+                    if not self.train_loader.has_next():
+                        self.train_loader.advance_epoch()
+                    start = c * chunk
+                    end = start + chunk
+                    self.train_loader.load_batch(in_tokens[start:end], out_tokens[start:end], pos_ids[start:end])
             elif use_full_step_graphs:
                 chunk = self.config.gpus * self.config.per_device_train_batch_size
                 for micro_step in range(self.config.gradient_accumulation_steps):
@@ -1293,7 +1307,7 @@ class SurogateTrainerWrapper:
                 # links). M=gpus microbatches of bsz each fill the chunk (gpus*bsz rows).
                 # LoRA only for now (FFT cross-microbatch grad accumulation not wired -> M=1).
                 bsz = self._dpp_bsz
-                M = self.config.gpus if self.config.lora else 1
+                M = self.config.gpus * self._dpp_chunks if self.config.lora else 1
                 rows = M * bsz
                 loss = self.trainer.dispatch_pp_train_step_multigpu(
                     in_tokens[:rows], out_tokens[:rows], self._dpp_los, self._dpp_his,
@@ -1318,12 +1332,21 @@ class SurogateTrainerWrapper:
 
             # Build structured metrics for this step
             step_time = time.time() - step_start
-            tokens_processed = (
-                self.config.per_device_train_batch_size
-                * self.config.sequence_len
-                * self.config.gradient_accumulation_steps
-                * self.config.gpus
-            )
+            if self._dispatch_pp:
+                # M = gpus * chunks microbatches per optimizer step (grad-accum is 1).
+                tokens_processed = (
+                    self.config.per_device_train_batch_size
+                    * self.config.sequence_len
+                    * self.config.gpus
+                    * self._dpp_chunks
+                )
+            else:
+                tokens_processed = (
+                    self.config.per_device_train_batch_size
+                    * self.config.sequence_len
+                    * self.config.gradient_accumulation_steps
+                    * self.config.gpus
+                )
 
             # Check for loss spikes / gradient explosions
             if loss_guard is not None:

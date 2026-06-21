@@ -30,6 +30,13 @@ per_device_train_batch_size: 1
 # so keep this at 1 for now — a higher value just runs that many optimizer steps.
 gradient_accumulation_steps: 1
 
+# Throughput knob: microbatches per step = gpus * SUROGATE_DISPATCH_MICROBATCH_CHUNKS
+# (default 1 -> M=gpus). The per-step weight stream is fixed (each stage streams once and
+# all microbatches reuse it), so raising this amortizes the stream over more tokens and
+# fills the pipeline (fewer bubbles) at no extra peak memory. It also raises the effective
+# batch to gpus*bsz*chunks, so treat it as a batch-size knob. On the 27B: chunks=2 was
+# ~+23% tok/s over chunks=1. Set via env, e.g. SUROGATE_DISPATCH_MICROBATCH_CHUNKS=2.
+
 sample_packing: true
 sequence_len: 1024
 
