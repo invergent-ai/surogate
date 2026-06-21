@@ -1,0 +1,49 @@
+# Dispatch Pipeline Parallelism (dispatch-PP) — single-node, model-parallel LoRA.
+#
+# Treats the node's GPUs as a stateless round-robin compute pool: the model's
+# transformer blocks are grouped into stages, each uploaded to whichever GPU is
+# next, computed, and freed. Per-GPU peak memory is bounded by ~2x the largest
+# stage (independent of model size / GPU count), so a model that OOMs under DDP can
+# train on PCIe-only multi-GPU boxes. v1 is BF16 full-FT + LoRA, no NCCL.
+model: Qwen/Qwen3.6-27B
+output_dir: ./output_q36
+
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 4
+
+sample_packing: true
+sequence_len: 2048
+
+max_steps: 5
+eval_steps: 25
+
+learning_rate: 2e-4
+warmup_ratio: 0.15
+
+recipe: bf16  # dispatch-PP is BF16/LoRA-only in v1 (FP8/NVFP4 streaming is deferred)
+
+# Opt-in model-parallel mode. Mutually exclusive with ZeRO sharding / cpu_training /
+# MoE-EP; CUDA graphs are auto-disabled (per-stage weight streaming can't be captured).
+parallelism: dispatch_pp
+dispatch_pp:
+  min_stages: null         # default = number of local GPUs; raise to cut per-GPU peak further
+  upper_threshold: 1.1     # PCIe operating-envelope warning threshold (tokens/step vs bandwidth)
+  vram_budget_gb: null     # per-GPU stage memory ceiling; null = auto (free VRAM * 0.9)
+  recompute_grain: stage   # activation recompute granularity for the backward pass
+
+lora: true
+lora_rank: 16
+lora_alpha: 32
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+
+dataloader_num_workers: 4
+datasets:
+  - path: "OpenLLM-Ro/ro_gsm8k"
+    type: auto
