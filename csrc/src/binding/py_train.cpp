@@ -2065,6 +2065,7 @@ std::vector<float> MultiGPUPyTrainer::dispatch_pp_grad_norms_multigpu(
                                                         lo,
                                                         hi,
                                                         is_loss_stage,
+                                                        /*fwd_inject=*/{},  // harness: whole-from-start forward fallback
                                                         std::move(inject_named));
                 auto* ge = model->graph_executor();
                 stage_norms = ge->block_grad_norms();
@@ -2122,9 +2123,52 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
     const int num_stages = static_cast<int>(los.size());
     float loss = 0.0f;
 
-    // 1. Backward-dispatch stages in reverse order with cross-GPU boundary handoff;
-    //    each stage's whole forward computes the loss, its bounded backward fills the
-    //    grad store for its blocks. Collect each stage's grads to host.
+    using Boundary = std::vector<std::pair<std::string, std::vector<std::byte>>>;
+
+    // 1. Forward-dispatch stages in order with cross-GPU boundary handoff. Capture
+    //    each stage's INPUT boundary (block lo-1's residual) so the backward pass can
+    //    re-forward just that one stage instead of the whole model -- this bounds
+    //    resident activations to a single stage. The last stage runs the loss ops.
+    std::vector<Boundary> stage_inputs(static_cast<std::size_t>(num_stages));
+    {
+        Boundary fboundary;  // block hi's residual, fed as the next stage's input
+        for (int si = 0; si < num_stages; ++si) {
+            const int gpu = si % ngpu;
+            const int lo = los[static_cast<std::size_t>(si)];
+            const int hi = his[static_cast<std::size_t>(si)];
+            const bool is_loss = (si == num_stages - 1);
+            stage_inputs[static_cast<std::size_t>(si)] = fboundary;  // empty for stage 0 (forwards from embedding)
+            Boundary inject = fboundary;
+            Boundary next_boundary;
+            run_work(
+                [&](sThreadContext& ctx) {
+                    auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+                    if (!model)
+                        throw std::runtime_error("dispatch_pp_train_step_multigpu: DSL model required");
+                    DISPATCH_PP_DBG_STAGE(ctx, inputs, targets);
+                    model->dispatch_pp_forward_stage(ctx.Model->get_input_buffer(),
+                                                           ctx.Model->get_position_ids_buffer(),
+                                                           *ctx.Communicator,
+                                                           lo,
+                                                           hi,
+                                                           std::move(inject),
+                                                           /*preserve_output=*/!is_loss);
+                    if (!is_loss) {
+                        auto* ge = model->graph_executor();
+                        const std::string rn = "blocks[" + std::to_string(hi) + "].res_att";
+                        const std::string xn = "blocks[" + std::to_string(hi) + "].mlp_down";
+                        next_boundary.emplace_back(rn, ge->read_named_bytes(rn));
+                        next_boundary.emplace_back(xn, ge->read_named_bytes(xn));
+                    }
+                },
+                gpu);
+            fboundary = std::move(next_boundary);
+        }
+    }
+
+    // 2. Backward-dispatch stages in reverse order with cross-GPU boundary handoff;
+    //    each stage re-forwards only its blocks (from stage_inputs[si]) then runs the
+    //    bounded backward to fill the grad store. Collect each stage's grads to host.
     std::vector<std::pair<std::string, std::vector<std::byte>>> collected;
     std::vector<std::pair<std::string, std::vector<std::byte>>> boundary;
     for (int si = num_stages - 1; si >= 0; --si) {
@@ -2133,6 +2177,8 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
         const int hi = his[static_cast<std::size_t>(si)];
         const bool is_loss = (si == num_stages - 1);
         std::vector<std::pair<std::string, std::vector<std::byte>>> inject = boundary;
+        std::vector<std::pair<std::string, std::vector<std::byte>>> fwd_inject =
+            stage_inputs[static_cast<std::size_t>(si)];
         std::vector<std::pair<std::string, std::vector<std::byte>>> next_boundary;
         std::vector<std::pair<std::string, std::vector<std::byte>>> stage_grads;
         float stage_loss = 0.0f;
@@ -2150,6 +2196,7 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
                                                         lo,
                                                         hi,
                                                         is_loss,
+                                                        std::move(fwd_inject),
                                                         std::move(inject));
                 if (is_loss) stage_loss = model->dispatch_pp_raw_loss();
                 stage_grads = model->dispatch_pp_read_block_grads(lo, hi, /*include_head=*/is_loss,

@@ -1153,6 +1153,7 @@ void DslModel::dispatch_pp_backward_stage(
     int lo,
     int hi,
     bool is_loss_stage,
+    std::vector<std::pair<std::string, std::vector<std::byte>>> fwd_inject,
     std::vector<std::pair<std::string, std::vector<std::byte>>> inject_named) {
     if (lora_enabled()) {
         throw std::runtime_error("dispatch_pp_backward_stage: BF16 full-FT only (no LoRA)");
@@ -1170,12 +1171,29 @@ void DslModel::dispatch_pp_backward_stage(
     if (!fwd || !bwd) {
         throw std::runtime_error("dispatch_pp_backward_stage: graphs not compiled");
     }
-    // Provide this GPU's forward activations (and saved inputs for recompute) for
-    // the blocks this stage will backprop. A whole forced-eager forward is the
-    // simplest correct source (the stream-driven path issues per-rank collectives
-    // that deadlock on a single GPU); recompute-only provisioning is a later
-    // optimization.
-    ge->set_forward_op_range(0, fwd->ops.size(), /*skip_init=*/false, /*skip_finalize=*/false,
+    const int num_layers = static_cast<int>(mModelConfig.NumLayers);
+    if (lo < 0 || hi < lo || hi >= num_layers) {
+        throw std::runtime_error("dispatch_pp_backward_stage: invalid block range");
+    }
+    // Provide this stage's forward activations (and saved inputs for recompute) by
+    // forwarding ONLY this stage's blocks [lo..hi] from the captured input boundary
+    // (fwd_inject = block lo-1's residual). A resumed stage (lo>0) starts at block
+    // lo's first op and consumes the injected boundary; stage 0 starts at the
+    // embedding. This bounds resident activations to one stage instead of the whole
+    // model (the whole-model forward overflowed the compute stack at longer seq).
+    // Fallback: a caller that doesn't capture the input boundary (lo>0, empty
+    // fwd_inject -- e.g. the grad-norms parity harness) gets a whole-from-start
+    // forward, the original behaviour. The stream-driven schedule is avoided
+    // (force_linear) -- its per-rank collectives would deadlock on this single GPU.
+    const bool stage_bounded = (lo == 0) || !fwd_inject.empty();
+    const std::size_t fwd_op_lo =
+        (stage_bounded && lo > 0) ? fwd->layer_start_indices[static_cast<std::size_t>(lo)] : 0;
+    const std::size_t fwd_op_hi = (hi == num_layers - 1) ? fwd->ops.size()
+                                                         : fwd->layer_end_indices[static_cast<std::size_t>(hi)];
+    if (!fwd_inject.empty()) {
+        ge->set_inject_named(fwd_inject);  // copy: re-injected below so the backward recompute of block lo finds its input
+    }
+    ge->set_forward_op_range(fwd_op_lo, fwd_op_hi, /*skip_init=*/false, /*skip_finalize=*/false,
                                    /*force_linear=*/true);
     {
         auto fwd_request =
@@ -1183,10 +1201,11 @@ void DslModel::dispatch_pp_backward_stage(
         mExecutor->execute_forward(fwd_request, comm);
     }
     ge->clear_forward_op_range();
-    // Stash the (mean) loss now, while the per-token Losses buffer is fresh from the
-    // forward. reduce_loss (which normally copies it out) is skipped on the dispatch
-    // path, so sum the per-token losses locally — no cross-GPU all-reduce.
-    {
+    ge->clear_inject_named();
+    // Stash the (mean) loss while the per-token Losses buffer is fresh. Only the
+    // loss-owning stage's forward ran the loss ops; other stages leave Losses stale.
+    // reduce_loss is skipped on the dispatch path, so sum locally (no all-reduce).
+    if (is_loss_stage) {
         auto& rs = *mRunState;
         const std::size_t n = static_cast<std::size_t>(rs.B) * static_cast<std::size_t>(rs.T);
         if (rs.Losses.Data && rs.Losses.nelem() >= n && n > 0) {
@@ -1199,11 +1218,11 @@ void DslModel::dispatch_pp_backward_stage(
             mDispatchPpLastLoss = static_cast<float>(s / static_cast<double>(n));
         }
     }
-    const int num_layers = static_cast<int>(mModelConfig.NumLayers);
-    if (lo < 0 || hi < lo || hi >= num_layers) {
-        throw std::runtime_error("dispatch_pp_backward_stage: invalid block range");
-    }
 
+    // Inject the incoming boundary gradients (d_blocks[hi].*) and re-inject the
+    // forward input boundary (blocks[lo-1].*) so the backward's per-block recompute
+    // of block lo can rebuild it from its true input.
+    for (auto& kv : fwd_inject) inject_named.push_back(std::move(kv));
     if (!inject_named.empty()) {
         ge->set_inject_named(std::move(inject_named));
     }

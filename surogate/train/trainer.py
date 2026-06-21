@@ -1358,6 +1358,13 @@ class SurogateTrainerWrapper:
         if self._stack_shrunk:
             return
         self._stack_shrunk = True
+        if getattr(self, "_dispatch_pp", False):
+            # The dispatch-PP per-stage gated-delta backward peaks right at the
+            # measured high-water mark; trimming the stack to it leaves no arena
+            # alignment headroom and the next step's identical peak OOMs. The
+            # upfront (safe) sizing is fine for the resident dispatch pool, so
+            # keep it.
+            return
         try:
             results = self.trainer.shrink_stack_after_warmup()
         except Exception as exc:  # pragma: no cover - best-effort optimization

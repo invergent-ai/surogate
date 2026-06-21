@@ -123,12 +123,16 @@ public:
                                          int hi,
                                          std::vector<std::pair<std::string, std::vector<std::byte>>> inject_named,
                                          bool preserve_output);
-    // Run one backward stage (blocks [lo..hi]) on this GPU: a whole forward to
-    // provide activations, then the bounded backward for [lo..hi]. is_loss_stage
-    // (the stage owning the last block) backpropagates from the loss; otherwise
-    // inject the incoming boundary gradients (d_blocks[hi].res_att / .mlp_down).
-    // Read results via the executor debug readers (block_grad_norms,
-    // read_named_bytes for d_blocks[lo-1].*).
+    // Run one backward stage (blocks [lo..hi]) on this GPU. Forward only this
+    // stage's blocks from fwd_inject (block lo-1's residual, captured in the
+    // forward pass; empty for lo==0, which forwards from the embedding), then run
+    // the bounded backward for [lo..hi]. Forwarding just the stage -- instead of
+    // the whole model -- bounds resident activations to one stage, so deep
+    // linear-attention models don't overflow the compute stack at longer seq.
+    // is_loss_stage (the stage owning the last block) backpropagates from the
+    // loss; otherwise inject the incoming boundary gradients (inject_named:
+    // d_blocks[hi].res_att / .mlp_down). Read results via the executor readers
+    // (block_grad_norms, read_named_bytes for d_blocks[lo-1].*).
     void dispatch_pp_backward_stage(Tensor inputs,
                                           Tensor targets,
                                           Tensor position_ids,
@@ -136,6 +140,7 @@ public:
                                           int lo,
                                           int hi,
                                           bool is_loss_stage,
+                                          std::vector<std::pair<std::string, std::vector<std::byte>>> fwd_inject,
                                           std::vector<std::pair<std::string, std::vector<std::byte>>> inject_named);
     // Whole-graph backward; returns per-block weight-grad L2 norms (block order).
     std::vector<float> dispatch_pp_grad_norms_whole(Tensor inputs,

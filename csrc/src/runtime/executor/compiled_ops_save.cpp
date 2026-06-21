@@ -642,6 +642,15 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
     // This gate is set by GraphExecutor after validating runtime options + plan.
     const bool recompute_enabled = mRecomputeEnabled;
     const bool forward_replay_active = recompute_enabled && static_cast<bool>(mRecomputeFn);
+    // dispatch-PP forwards a contiguous op sub-range [mFwdOpLo, mFwdOpHi) per stage,
+    // so tensors owned by ops outside that range were never computed. Their entries
+    // in the whole-graph save_list are legitimately absent -- the bounded backward
+    // for this stage never references them -- so skip them rather than fail. A full
+    // forward (the default 0 / SIZE_MAX range) keeps the hard failure to catch
+    // genuinely missing activations. Boundary residuals injected for the cross-stage
+    // handoff ARE live and are still saved via block_activation_ptr below.
+    const bool sub_range_forward =
+        mCurrentGraph && (mFwdOpLo > 0 || mFwdOpHi < mCurrentGraph->ops.size());
     auto contains_ci = [](std::string_view haystack, std::string_view needle) {
         std::string h(haystack);
         std::string n(needle);
@@ -887,6 +896,7 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
                 (*mSaved)[name] = mWeights.get(name);
                 continue;
             }
+            if (sub_range_forward) continue;  // block outside this stage's forwarded op range
             throw std::runtime_error("CompiledExecutor: cannot save tensor " + name);
         }
 
@@ -894,6 +904,7 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
             (*mSaved)[name] = mWeights.get(name);
             continue;
         }
+        if (sub_range_forward) continue;  // op outside this stage's forwarded op range
         throw std::runtime_error("CompiledExecutor: cannot save tensor " + name);
     }
 
