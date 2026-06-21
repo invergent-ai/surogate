@@ -18,6 +18,7 @@
 #include <fmt/format.h>
 
 #include "py_train.h"
+#include "runtime/optimizers/async_optimizer.h"
 #include "runtime/executor/dispatch_pp_phase0.h"
 #include "runtime/training/dataloader.h"
 #include "runtime/training/checkpoint.h"
@@ -1079,6 +1080,36 @@ NB_MODULE(_surogate, m) {
                                    cfg.grad_clip);
             },
             "Return a debug string representation.");
+
+    nb::class_<optimizers::AsyncStaleAdamW>(
+        m,
+        "AsyncStaleAdamW",
+        "Dispatch-PP async 1-step-stale AdamW over FP32 CPU master params. A worker "
+        "thread drains a depth-1 queue of cpu_adamw_step updates, overlapping the "
+        "optimizer with the caller. overlap=False runs updates inline (the determinism "
+        "gate). Debug/validation surface for the Phase-3 async optimizer.")
+        .def(nb::init<std::vector<float>, float, float, float, float, float, bool>(),
+             nb::arg("master"),
+             nb::arg("lr"),
+             nb::arg("beta1"),
+             nb::arg("beta2"),
+             nb::arg("eps"),
+             nb::arg("weight_decay"),
+             nb::arg("overlap"))
+        .def(
+            "step",
+            [](optimizers::AsyncStaleAdamW* opt, std::vector<float> grad, int delay_us) {
+                opt->step(std::move(grad), delay_us);
+            },
+            nb::arg("grad"),
+            nb::arg("delay_us") = 0,
+            "Queue one AdamW update (FP32 grad). delay_us stalls the worker so the "
+            "caller can observe the in-flight stale state.")
+        .def("applied_count", &optimizers::AsyncStaleAdamW::applied_count,
+             "Number of updates the worker has finished applying (lock-free probe).")
+        .def("drain", &optimizers::AsyncStaleAdamW::drain, "Block until all queued updates complete.")
+        .def("master", &optimizers::AsyncStaleAdamW::master, "Drain, then return the FP32 master params.")
+        .def("overlap_enabled", &optimizers::AsyncStaleAdamW::overlap_enabled);
 
     nb::class_<MultiGPUPyTrainer>(m,
                                   "SurogateTrainer",

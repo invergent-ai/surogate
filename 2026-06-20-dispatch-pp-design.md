@@ -504,6 +504,20 @@ Front-loads the biggest unknown so we fail fast if the engine cannot do sub-rang
 - **Phase 3 — Async 1-step-stale optimizer.** Overlap the optimizer thread on the CPU-master path;
   verify the controlled staleness test. Sequenced last because it is the hardest to debug — Phases 1–2
   run with a synchronous optimizer internally as scaffolding (sync is not a shipped v1 option).
+  - *Async optimizer core landed (2026-06-21) — PASS.* `optimizers::AsyncOptimizer` is a worker thread
+    draining a **depth-1** queue of update closures: `submit(u_N)` fences on `u_{N-1}` completing, then
+    enqueues `u_N` and returns immediately — so `u_N` overlaps the caller and at most one update is ever
+    in flight (the one-step-stale bound). Worker exceptions are captured and re-thrown on the next
+    `submit`/`drain` (no partial commit). `optimizers::AsyncStaleAdamW` drives `cpu_adamw_step` over FP32
+    CPU master params through it (the dispatch-PP CPU-master path), exposed as `AsyncStaleAdamW` for
+    validation. Tests (`tests/train/dispatch_pp/test_phase3_async_optimizer.py`, CPU-only): overlap-off
+    is bitwise-identical to plain in-order AdamW (determinism gate); overlap-on applies the same updates
+    in the same order so the final params match the synchronous reference exactly; the just-submitted
+    update is still in flight on return (worker exactly one behind, never more); a mismatched grad is
+    rejected at submit time and the optimizer stays usable. Still ahead: wiring the worker into the
+    multi-GPU dispatch training step (per-layer `param_copied`/`grad_copied` release) and the
+    converges-on-a-small-real-run staleness test — both gated on a real dispatch training loop (today's
+    forward/backward dispatch are validated through debug entry points, not yet a fused `step()`).
 - **Deferred (interfaces reserved):** FP8/NVFP4 stage streaming, 2D (× cross-node DDP), MoE/EP
   interplay, synchronous-optimizer user option.
 
