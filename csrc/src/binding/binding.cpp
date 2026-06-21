@@ -1468,11 +1468,11 @@ NB_MODULE(_surogate, m) {
         .def(
             "dispatch_pp_train_step_multigpu",
             [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets, std::vector<int> los,
-               std::vector<int> his, const optimizers::OptimizerConfig& opt_config, int step_idx) {
+               std::vector<int> his, const optimizers::OptimizerConfig& opt_config, int step_idx, bool stale) {
                 CHECK_SHAPE(inputs, trainer->batch_size(), trainer->seq_length());
                 CHECK_SHAPE(targets, trainer->batch_size(), trainer->seq_length());
                 return trainer->dispatch_pp_train_step_multigpu(
-                    inputs.data(), targets.data(), los, his, opt_config, step_idx);
+                    inputs.data(), targets.data(), los, his, opt_config, step_idx, stale);
             },
             nb::arg("inputs"),
             nb::arg("targets"),
@@ -1480,9 +1480,18 @@ NB_MODULE(_surogate, m) {
             nb::arg("his"),
             nb::arg("opt_config"),
             nb::arg("step_idx"),
+            nb::arg("stale") = false,
             "Debug-only dispatch-PP: one full multi-GPU training step (round-robin backward dispatch + "
             "cross-GPU grad handoff -> collect grads -> optimizer on the master -> broadcast weights to "
-            "all GPUs); returns the (raw) step loss.")
+            "all GPUs); returns the (raw) step loss. stale=true defers the optimizer update by one step "
+            "(RoundPipe one-step staleness); call dispatch_pp_flush_pending at the end.")
+        .def(
+            "dispatch_pp_flush_pending",
+            [](MultiGPUPyTrainer* trainer, const optimizers::OptimizerConfig& opt_config) {
+                trainer->dispatch_pp_flush_pending(opt_config);
+            },
+            nb::arg("opt_config"),
+            "Apply the last deferred (stale) dispatch-PP gradients, if any.")
         .def(
             "step",
             [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets, TokenArray3 position_ids) {

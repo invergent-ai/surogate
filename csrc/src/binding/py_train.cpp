@@ -2113,7 +2113,8 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
                                                               const std::vector<int>& los,
                                                               const std::vector<int>& his,
                                                               const optimizers::OptimizerConfig& opt_config,
-                                                              int step_idx) {
+                                                              int step_idx,
+                                                              bool stale) {
     if (los.size() != his.size() || los.empty()) {
         throw std::runtime_error("dispatch_pp_train_step_multigpu: bad stage ranges");
     }
@@ -2168,20 +2169,43 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
         if (is_loss) loss = stage_loss;
     }
 
-    // 2. On GPU 0: write the full collected grad set into the store, run the optimizer
-    //    (updates GPU 0's master replica).
+    // 2. Optimizer + broadcast. In synchronous mode, apply this step's grads now.
+    //    In one-step-stale mode, defer: apply the *previous* step's grads (so the
+    //    weights this step just trained on are one update behind — the RoundPipe v1
+    //    staleness), then stash this step's grads for the next call.
+    if (stale) {
+        if (!mDispatchPpPendingGrads.empty()) {
+            dispatch_pp_apply_grads_(mDispatchPpPendingGrads, opt_config, ++mDispatchPpAppliedStep);
+        }
+        mDispatchPpPendingGrads = std::move(collected);
+    } else {
+        dispatch_pp_apply_grads_(collected, opt_config, step_idx + 1);
+    }
+    return loss;
+}
+
+void MultiGPUPyTrainer::dispatch_pp_flush_pending(const optimizers::OptimizerConfig& opt_config) {
+    if (mDispatchPpPendingGrads.empty()) return;
+    dispatch_pp_apply_grads_(mDispatchPpPendingGrads, opt_config, ++mDispatchPpAppliedStep);
+    mDispatchPpPendingGrads.clear();
+}
+
+void MultiGPUPyTrainer::dispatch_pp_apply_grads_(
+    const std::vector<std::pair<std::string, std::vector<std::byte>>>& collected,
+    const optimizers::OptimizerConfig& opt_config, int opt_step_1based) {
+    // GPU 0 holds the master replica: write the collected grads into its store and
+    // run the optimizer there.
     run_work(
         [&](sThreadContext& ctx) {
             auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
             if (!model)
-                throw std::runtime_error("dispatch_pp_train_step_multigpu: DSL model required");
+                throw std::runtime_error("dispatch_pp_apply_grads_: DSL model required");
             model->dispatch_pp_write_grads(collected);
-            model->dispatch_pp_apply_optimizer(*ctx.Communicator, opt_config, step_idx + 1);
+            model->dispatch_pp_apply_optimizer(*ctx.Communicator, opt_config, opt_step_1based);
         },
         0);
-
-    // 3. Broadcast GPU 0's updated weights to every replica (keeps the pool
-    //    consistent for the next step's stages, which run on any GPU).
+    // Broadcast GPU 0's updated weights to every replica so the pool is consistent
+    // for the next step's stages (which run on any GPU).
     std::vector<std::pair<std::string, std::vector<std::byte>>> master;
     run_work(
         [&](sThreadContext& ctx) {
@@ -2195,8 +2219,6 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
             if (model) model->dispatch_pp_write_weights(master);
         },
         -1);
-
-    return loss;
 }
 #undef DISPATCH_PP_DBG_STAGE
 

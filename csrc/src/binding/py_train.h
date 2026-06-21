@@ -215,12 +215,19 @@ public:
     // One full multi-GPU dispatch-PP training step: round-robin backward dispatch
     // with cross-GPU boundary handoff -> collect per-stage grads -> optimizer on the
     // master replica -> broadcast updated weights to every GPU. Returns the loss.
+    // stale=true defers the optimizer update by one step (the previous step's grads
+    // are applied while this step trains on weights one update behind) — the
+    // RoundPipe one-step staleness. Call dispatch_pp_flush_pending at the end to
+    // apply the last deferred grads.
     float dispatch_pp_train_step_multigpu(const std::int32_t* inputs,
                                                 const std::int32_t* targets,
                                                 const std::vector<int>& los,
                                                 const std::vector<int>& his,
                                                 const optimizers::OptimizerConfig& opt_config,
-                                                int step_idx);
+                                                int step_idx,
+                                                bool stale);
+    // Apply the last deferred (stale) gradients, if any.
+    void dispatch_pp_flush_pending(const optimizers::OptimizerConfig& opt_config);
     std::vector<std::pair<std::string, Tensor>> get_lora_gradients(int gpu_id);
     std::vector<std::pair<std::string, Tensor>> get_lora_weights(int gpu_id);
     int get_valid_token_count(int gpu_id);
@@ -343,6 +350,16 @@ private:
     void run_work(std::function<void(sThreadContext& ctx)> work, int idx = -1);
     void main_loop(NCCLCommunicator& comm);
     void print_timing_breakdown(int step, int micro_steps);
+
+    // dispatch-PP: apply collected grads on the master GPU (optimizer) and broadcast
+    // the updated weights to every replica. opt_step_1based is the Adam step index.
+    void dispatch_pp_apply_grads_(const std::vector<std::pair<std::string, std::vector<std::byte>>>& collected,
+                                  const optimizers::OptimizerConfig& opt_config,
+                                  int opt_step_1based);
+    // dispatch-PP one-step-stale state: gradients deferred from the previous step,
+    // and the count of optimizer updates applied so far (1-based Adam step).
+    std::vector<std::pair<std::string, std::vector<std::byte>>> mDispatchPpPendingGrads;
+    int mDispatchPpAppliedStep = 0;
 };
 
 #endif  //SUROGATE_SRC_BINDING_PY_TRAIN_H

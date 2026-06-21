@@ -538,10 +538,19 @@ Front-loads the biggest unknown so we fail fast if the engine cannot do sub-rang
     loss/lm-head ops to the loss-owning stage; grad collection routes `embedding` from the lowest stage,
     `lm_head`/`final_norm` from the loss stage. Test:
     `tests/train/dispatch_pp/test_phase3_train_step_multigpu.py`.
-    Still ahead: replace the
-    GPU-0-collect + broadcast with the **CPU-master async-stale** path (wire the `AsyncOptimizer` worker
-    in, per-layer `param_copied`/`grad_copied` release) and the converges-with-overlap staleness test;
-    fold streaming into the dispatch step so it is memory-scaling as well as consistent.
+  - *One-step staleness landed (2026-06-21) — PASS.* `dispatch_pp_train_step_multigpu(..., stale=True)`
+    defers each step's optimizer update by one: this step's grads are collected and stashed, and the
+    *previous* step's grads are applied — so every step trains on weights one update behind (the
+    RoundPipe v1 default); `dispatch_pp_flush_pending` applies the last deferred grads. On 2 GPUs it
+    converges with the expected one-step lag (the first two steps share a loss — step 1 trains on the
+    same weights as step 0 — then 17.99 -> 9.13 -> ... -> 1.14). This is the staleness *semantics*,
+    verified to still train; it does not yet overlap the optimizer with compute. Test:
+    `test_phase3_train_step_multigpu.py::...stale_converges`.
+    Still ahead — the perf/overlap form: run the deferred update on the `AsyncOptimizer` worker
+    concurrently with the next step's stage compute. True overlap needs the **CPU-master** optimizer
+    (CPU work overlaps GPU stages) folded together with **streaming** (each stage uploads the current
+    master, so there is no separate broadcast to serialize against the dispatch) — i.e. CPU-master +
+    streaming + worker are one integrated change. Also: per-layer `param_copied`/`grad_copied` release.
 - **Deferred (interfaces reserved):** FP8/NVFP4 stage streaming, 2D (× cross-node DDP), MoE/EP
   interplay, synchronous-optimizer user option.
 

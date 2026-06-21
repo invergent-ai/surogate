@@ -116,3 +116,31 @@ def test_multigpu_dispatch_train_step_converges():
     assert losses[-1] < 0.9 * losses[0], f"loss barely moved: first={losses[0]:.3f} last={losses[-1]:.3f}"
     drops = sum(1 for a, c in zip(losses, losses[1:]) if c <= a + 1e-3 * abs(a))
     assert drops >= (n_steps - 1) * 0.7, f"trajectory not monotone enough: {losses}"
+
+
+def test_multigpu_dispatch_train_step_stale_converges():
+    """One-step-stale mode (stale=True) defers each step's optimizer update by one
+    step — every step trains on weights one update behind, the RoundPipe v1 default.
+    It must still converge on a fixed batch (controlled staleness does not break
+    training). dispatch_pp_flush_pending applies the final deferred grads."""
+    trainer, model_dir = _build_trainer()
+    vocab_size = json.loads((Path(model_dir) / "config.json").read_text())["vocab_size"]
+    b = make_inputs(vocab_size)
+    opt_config = sg.OptimizerConfig.adamw(
+        lr=1e-4, beta1=0.9, beta2=0.999, epsilon=1e-8, weight_decay=0.0, grad_clip=1.0
+    )
+    los, his = _stage_ranges([NUM_LAYERS // 2 - 1])
+
+    n_steps = 16
+    losses = [
+        float(trainer.dispatch_pp_train_step_multigpu(b["inputs"], b["targets"], los, his, opt_config, i, True))
+        for i in range(n_steps)
+    ]
+    trainer.dispatch_pp_flush_pending(opt_config)
+    print("multigpu stale dispatch train losses:", [round(x, 3) for x in losses], flush=True)
+
+    assert all(np.isfinite(losses)), losses
+    assert losses[0] > 0.0
+    # Controlled one-step staleness still drives the loss down (allowing the one-step
+    # lag: the first two steps see the same pre-update weights).
+    assert losses[-1] < 0.9 * losses[0], f"stale loss barely moved: first={losses[0]:.3f} last={losses[-1]:.3f}"
