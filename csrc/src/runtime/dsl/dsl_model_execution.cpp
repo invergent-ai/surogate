@@ -1098,9 +1098,8 @@ void DslModel::dispatch_pp_debug_forward_stage(Tensor inputs,
                                                NCCLCommunicator& comm,
                                                int lo,
                                                int hi,
-                                               int inject_layer,
-                                               std::vector<std::byte> inject_residual,
-                                               std::vector<std::byte> inject_hout,
+                                               std::vector<std::pair<std::string, std::vector<std::byte>>>
+                                                   inject_named,
                                                bool preserve_output) {
     if (lora_enabled()) {
         throw std::runtime_error("dispatch_pp_debug_forward_stage: BF16 full-FT only (no LoRA)");
@@ -1126,9 +1125,8 @@ void DslModel::dispatch_pp_debug_forward_stage(Tensor inputs,
     const std::size_t op_hi = (hi == num_layers - 1) ? fwd->ops.size()
                                                      : fwd->layer_end_indices[static_cast<std::size_t>(hi)];
 
-    if (inject_layer >= 0) {
-        ge->debug_set_inject_residual(inject_layer, std::move(inject_residual));
-        ge->debug_set_inject_hout(inject_layer, std::move(inject_hout));
+    if (!inject_named.empty()) {
+        ge->debug_set_inject_named(std::move(inject_named));
     }
     // Keep block hi's output (x) live so the next stage's GPU can read it.
     if (preserve_output) {
@@ -1144,7 +1142,7 @@ void DslModel::dispatch_pp_debug_forward_stage(Tensor inputs,
         mExecutor->execute_forward(request, comm);
     }
     ge->debug_clear_forward_op_range();
-    ge->debug_clear_inject_residual();
+    ge->debug_clear_inject_named();
 }
 
 std::vector<float> DslModel::dispatch_pp_debug_grad_norms_whole(Tensor inputs,

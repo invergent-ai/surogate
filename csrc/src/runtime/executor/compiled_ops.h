@@ -212,27 +212,28 @@ public:
     // Inject a host residual into get_residual(layer) after forward init, before
     // the op loop — the cross-GPU activation handoff for the dispatch-PP pool. A
     // resumed stage [lo..] reads get_residual(lo-1) as its first block's input.
-    void set_debug_inject_residual(int layer, std::vector<std::byte> host_bytes) {
-        mDbgInjectResidualLayer = layer;
-        mDbgInjectResidualHost = std::move(host_bytes);
-    }
-    // The fused-residual block carries two tensors block->block: the accumulator
-    // (get_residual) and ``x`` = the previous block's output (BlockHOut). The
-    // cross-GPU handoff injects both. Layer is the producing block (lo-1).
-    void set_debug_inject_hout(int layer, std::vector<std::byte> host_bytes) {
-        mDbgInjectHoutLayer = layer;
-        mDbgInjectHoutHost = std::move(host_bytes);
-    }
-    void clear_debug_inject_residual() {
-        mDbgInjectResidualLayer = -1;
-        mDbgInjectResidualHost.clear();
-        mDbgInjectHoutLayer = -1;
-        mDbgInjectHoutHost.clear();
-    }
-    // Keep block ``layer``'s stack tensors (incl. its output BlockHOut = ``x``)
-    // live past its layer-end so the cross-GPU boundary can read them. -1 = off.
+    // Keep block ``layer``'s stack tensors (incl. its output = ``x``) live past
+    // its layer-end so the cross-GPU boundary can read them. -1 = off.
     void set_debug_preserve_layer(int layer) {
         mDbgPreserveLayer = layer;
+    }
+    // Bind named boundary tensors (each [B,T,hidden] bf16) into the executor after
+    // forward init, before the op loop — the cross-GPU handoff. Targets the exact
+    // graph tids the resumed stage's first block reads (blocks[hi].res_ffn = the
+    // residual, blocks[hi].mlp_down = x). Buffers are owned here and freed on the
+    // next inject / clear.
+    void set_debug_inject_named(std::vector<std::pair<std::string, std::vector<std::byte>>> items) {
+        mDbgInjectNamed = std::move(items);
+    }
+    void clear_debug_inject_named();  // frees the device buffers
+    // Restore the stack to the stage's post-init base, dropping the (preserved)
+    // stage's block allocations after the boundary read — so a GPU reused for a
+    // later stage starts clean. No-op if no base was captured.
+    void debug_restore_stage_base() {
+        if (mDbgStageBaseValid) {
+            mRunState.Stack.restore(mDbgStageBase);
+            mDbgStageBaseValid = false;
+        }
     }
 
     std::size_t mDbgFwdOpLo = 0;
@@ -244,11 +245,11 @@ public:
     bool mDbgBwdSkipInit = false;
     bool mDbgBwdSkipFinalize = false;
     bool mDbgForceLinear = false;
-    int mDbgInjectResidualLayer = -1;
-    std::vector<std::byte> mDbgInjectResidualHost;
-    int mDbgInjectHoutLayer = -1;
-    std::vector<std::byte> mDbgInjectHoutHost;
     int mDbgPreserveLayer = -1;
+    std::vector<std::pair<std::string, std::vector<std::byte>>> mDbgInjectNamed;
+    std::vector<void*> mDbgInjectBuffers;  // device buffers backing mDbgInjectNamed binds
+    DeviceMemoryStack::Checkpoint mDbgStageBase{};
+    bool mDbgStageBaseValid = false;
     void set_debug_dump_fn(std::function<void(const std::vector<std::string>&, int)> fn) {
         mDebugDumpFn = std::move(fn);
     }

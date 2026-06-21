@@ -1974,22 +1974,19 @@ std::vector<float> MultiGPUPyTrainer::dispatch_pp_debug_forward_hidden_multigpu(
     const int ngpu = static_cast<int>(mContexts.size());
     const int num_stages = static_cast<int>(los.size());
     std::vector<float> result;
-    // The fused-residual block carries two tensors across the boundary: the
-    // residual accumulator and ``x`` (the previous block's output). Hand both over.
-    std::vector<std::byte> boundary_residual;
-    std::vector<std::byte> boundary_hout;
+    // The fused-residual block returns (mlp_out, residual_after_attn): block hi+1's
+    // first op reads blocks[hi].res_att (the residual accumulator after attention)
+    // and blocks[hi].mlp_down (x = the previous block's MLP output), folding x in.
+    // Hand both over by name through host memory between stage GPUs.
+    std::vector<std::pair<std::string, std::vector<std::byte>>> boundary;
 
     for (int si = 0; si < num_stages; ++si) {
         const int gpu = si % ngpu;
         const int lo = los[static_cast<std::size_t>(si)];
         const int hi = his[static_cast<std::size_t>(si)];
-        const bool is_first = (si == 0);
         const bool is_last = (si == num_stages - 1);
-        const int inject_layer = is_first ? -1 : lo - 1;
-        std::vector<std::byte> residual_in = boundary_residual;  // captured by value
-        std::vector<std::byte> hout_in = boundary_hout;
-        std::vector<std::byte> next_residual;
-        std::vector<std::byte> next_hout;
+        std::vector<std::pair<std::string, std::vector<std::byte>>> inject_named = boundary;
+        std::vector<std::pair<std::string, std::vector<std::byte>>> next_boundary;
         std::vector<float> final_hidden;
 
         run_work(
@@ -2003,16 +2000,19 @@ std::vector<float> MultiGPUPyTrainer::dispatch_pp_debug_forward_hidden_multigpu(
                                                        *ctx.Communicator,
                                                        lo,
                                                        hi,
-                                                       inject_layer,
-                                                       std::move(residual_in),
-                                                       std::move(hout_in),
+                                                       std::move(inject_named),
                                                        /*preserve_output=*/!is_last);
                 auto* ge = model->graph_executor();
                 if (is_last) {
                     final_hidden = ge->debug_last_block_hidden_f32();
                 } else {
-                    next_residual = ge->debug_read_residual_bytes(hi);
-                    next_hout = ge->debug_read_block_hout_bytes(hi);
+                    const std::string res_name = "blocks[" + std::to_string(hi) + "].res_att";
+                    const std::string x_name = "blocks[" + std::to_string(hi) + "].mlp_down";
+                    next_boundary.emplace_back(res_name, ge->debug_read_named_bytes(res_name));
+                    next_boundary.emplace_back(x_name, ge->debug_read_named_bytes(x_name));
+                    // Drop the preserved stage's stack allocations now that the
+                    // boundary is read, so this GPU is clean if reused (round-robin).
+                    ge->debug_restore_stage_base();
                 }
             },
             gpu);
@@ -2020,8 +2020,7 @@ std::vector<float> MultiGPUPyTrainer::dispatch_pp_debug_forward_hidden_multigpu(
         if (is_last) {
             result = std::move(final_hidden);
         } else {
-            boundary_residual = std::move(next_residual);
-            boundary_hout = std::move(next_hout);
+            boundary = std::move(next_boundary);
         }
     }
     return result;

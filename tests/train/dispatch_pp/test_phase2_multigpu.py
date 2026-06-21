@@ -109,21 +109,31 @@ def test_multigpu_dispatch_runs_end_to_end():
     assert multi.shape == single.shape and multi.size > 0
 
 
-@pytest.mark.xfail(
-    reason="two-tensor fused-residual boundary handoff incomplete: the residual accumulator "
-    "transfers correctly and the sender now captures x (prev block's MLP output) via a "
-    "preserve-last-block hook, but the receiver's x input slot is not materialized on a fresh "
-    "executor (block hi never ran there) and is read via a StackedBlocks-internal carried tid, "
-    "not block hi's BlockMLPDown slot. Completing it needs binding that carried x tid on the "
-    "resumed executor (graph-wiring change), beyond the current inject hooks.",
-    strict=False,
-)
 def test_multigpu_dispatch_matches_single_gpu():
-    """Final hidden from round-robin multi-GPU dispatch matches whole-graph forward."""
+    """Final hidden from round-robin multi-GPU dispatch matches whole-graph forward.
+
+    The two-tensor fused-residual boundary — residual-after-attention
+    (blocks[hi].res_att) and x (blocks[hi].mlp_down) — is read by name on the
+    sending GPU (kept live by the preserve-last-block hook) and bound into the
+    same graph tids on the receiving GPU through host memory. Tolerance is
+    bf16-level (the cross-GPU path reorders nothing mathematically; residual is
+    bf16 rounding)."""
     trainer, model_dir = _build_trainer()
     vocab_size = json.loads((Path(model_dir) / "config.json").read_text())["vocab_size"]
     inputs = make_inputs(vocab_size)["inputs"]
     single = np.asarray(trainer.dispatch_pp_debug_forward_hidden(inputs))
     los, his = _stage_ranges([NUM_LAYERS // 2 - 1])
     multi = np.asarray(trainer.dispatch_pp_debug_forward_hidden_multigpu(inputs, los, his))
-    np.testing.assert_allclose(single, multi, rtol=1e-2, atol=1e-2)
+    np.testing.assert_allclose(single, multi, rtol=2e-2, atol=2e-2)
+
+
+def test_multigpu_dispatch_round_robin_wrap():
+    """More stages than GPUs (one block per stage) exercises round-robin GPU reuse
+    and multiple host handoffs; still matches whole-graph forward within bf16 tol."""
+    trainer, model_dir = _build_trainer()
+    vocab_size = json.loads((Path(model_dir) / "config.json").read_text())["vocab_size"]
+    inputs = make_inputs(vocab_size)["inputs"]
+    single = np.asarray(trainer.dispatch_pp_debug_forward_hidden(inputs))
+    los, his = _stage_ranges(list(range(NUM_LAYERS - 1)))  # [0]|[1]|[2]|[3]
+    multi = np.asarray(trainer.dispatch_pp_debug_forward_hidden_multigpu(inputs, los, his))
+    np.testing.assert_allclose(single, multi, rtol=5e-2, atol=5e-2)

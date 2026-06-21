@@ -460,24 +460,23 @@ Front-loads the biggest unknown so we fail fast if the engine cannot do sub-rang
     Remaining Phase-2 work is the C++ multi-GPU stateless pool (round-robin/NUMA dispatch, stage
     dependency edges + CUDA-event handoff, stage-range gather, GPU-resident-weight-bytes introspection,
     and the quantitative memory-scaling test).
-  - *Multi-GPU round-robin forward dispatch landed (2026-06-21, partial):* the C++ runtime that
-    dispatches contiguous block stages round-robin across the stateless GPU pool (stage i -> GPU
-    i % ngpu) via `run_work`, handing the boundary state GPU -> host -> GPU, is in place
-    (`MultiGPUPyTrainer::dispatch_pp_debug_forward_hidden_multigpu`, with `CompiledExecutor` residual/
-    block-output inject hooks and `GraphExecutor` read/inject helpers). It runs end-to-end across GPUs
-    and the **residual accumulator** handoff lands correctly. Full numerical parity vs single-GPU is
-    **xfail pending the two-tensor boundary**: the fused-residual block carries both the residual
-    accumulator (pre-allocated, injectable via `get_residual` — transfers correctly) AND `x` = the
-    previous block's MLP output. The sender now captures `x` via a preserve-last-block hook
-    (`set_debug_preserve_layer` keeps the stage's final block's stack live past its layer-end so
-    `BlockMLPDown` survives the read). The remaining gap is the **receiver side**: block hi+1 reads `x`
-    via a StackedBlocks-internal carried tid that is not materialized on a fresh executor (block hi
-    never ran there), so injecting into block hi's `BlockMLPDown` slot does not reach it. Completing it
-    needs binding that carried `x` tid on the resumed executor (a graph-wiring change) or folding `x`
-    into the residual at the boundary so a single pre-allocated buffer crosses.
-    Test: `tests/train/dispatch_pp/test_phase2_multigpu.py` (runs-end-to-end passes; parity xfail).
-    Still ahead: the `x` receiver-side materialization, stage dependency edges + CUDA-event handoff for
-    overlap, NUMA-biased dispatch, stage-range (multi-block) gather, and the memory-scaling test.
+  - *Multi-GPU round-robin forward dispatch landed (2026-06-21) — PASS.* The C++ runtime dispatches
+    contiguous block stages round-robin across the stateless GPU pool (stage i -> GPU i % ngpu) via
+    `run_work`, handing the full block boundary GPU -> host -> GPU with **no NCCL**
+    (`MultiGPUPyTrainer::dispatch_pp_debug_forward_hidden_multigpu`). The fused-residual block carries
+    two tensors across a boundary — `blocks[hi].res_att` (residual after attention) and
+    `blocks[hi].mlp_down` (`x`, the previous block's MLP output, folded in by block hi+1's first op).
+    Both are read **by name** on the sending GPU (kept live by `set_debug_preserve_layer`, which keeps
+    the stage's last block's stack past its layer-end) and **bound by name** into the exact graph tids
+    on the receiving GPU (allocate + `bind_tensor` via `set_debug_inject_named`), after which
+    `debug_restore_stage_base` drops the preserved allocations so a reused GPU starts clean. Final
+    hidden matches single-GPU within bf16 tolerance for 2 stages and for the round-robin-wrap case
+    (more stages than GPUs), on Qwen3-0.6B/4-layer across 2 RTX 5090s
+    (`tests/train/dispatch_pp/test_phase2_multigpu.py`: runs-end-to-end + 2-stage parity + wrap parity,
+    all passing).
+    Still ahead: stage dependency edges + CUDA-event handoff for compute/transfer overlap, NUMA-biased
+    dispatch, stage-range (multi-block) gather, the backward cross-GPU grad path, and the
+    quantitative memory-scaling test.
 - **Phase 3 — Async 1-step-stale optimizer.** Overlap the optimizer thread on the CPU-master path;
   verify the controlled staleness test. Sequenced last because it is the hardest to debug — Phases 1–2
   run with a synchronous optimizer internally as scaffolding (sync is not a shipped v1 option).

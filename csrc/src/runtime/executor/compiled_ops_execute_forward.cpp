@@ -562,6 +562,14 @@ void CompiledExecutor::snapshot_forward_execution_state() {
     mForwardNamedTensorsSnapshot = mNamedTensors;
 }
 
+void CompiledExecutor::clear_debug_inject_named() {
+    for (void* p : mDbgInjectBuffers) {
+        if (p) cudaFree(p);
+    }
+    mDbgInjectBuffers.clear();
+    mDbgInjectNamed.clear();
+}
+
 void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                                        NCCLCommunicator& comm,
                                        bool full,
@@ -572,39 +580,42 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     if (!mDbgFwdSkipInit) {
         initialize_forward_execution(graph, comm, full);
     }
-    // dispatch-PP debug: cross-GPU activation handoff. A resumed stage [lo..] on a
-    // fresh GPU reads get_residual(lo-1) as its first block's input; inject the
-    // boundary residual handed over from the previous stage's GPU through host
-    // memory, after init (which does not touch the managed residual buffer).
-    if (mDbgInjectResidualLayer >= 0 && !mDbgInjectResidualHost.empty()) {
-        Tensor& r = mRunState.get_residual(mDbgInjectResidualLayer, mRunState.MainStream);
-        if (r.Data && r.bytes() == mDbgInjectResidualHost.size()) {
-            CUDA_CHECK(cudaMemcpyAsync(r.Data, mDbgInjectResidualHost.data(), r.bytes(),
-                                       cudaMemcpyHostToDevice, mRunState.MainStream));
-            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-        } else {
-            throw std::runtime_error("dispatch-PP debug: residual inject size/buffer mismatch");
+    // Named boundary inject (cross-GPU handoff): bind each carried tensor into the
+    // exact graph tid the resumed stage's first block reads. Each is [B,T,hidden]
+    // bf16; back it with an owned device buffer.
+    if (!mDbgInjectNamed.empty()) {
+        for (void* p : mDbgInjectBuffers) {
+            if (p) cudaFree(p);
         }
+        mDbgInjectBuffers.clear();
+        int dev = 0;
+        cudaGetDevice(&dev);
+        const long H = static_cast<long>(mConfig.HiddenSize);
+        for (auto& [name, bytes] : mDbgInjectNamed) {
+            if (bytes.empty()) continue;
+            void* buf = nullptr;
+            CUDA_CHECK(cudaMalloc(&buf, bytes.size()));
+            mDbgInjectBuffers.push_back(buf);
+            CUDA_CHECK(cudaMemcpyAsync(buf, bytes.data(), bytes.size(), cudaMemcpyHostToDevice,
+                                       mRunState.MainStream));
+            Tensor t{};
+            t.DType = ETensorDType::BF16;
+            t.Rank = 3;
+            t.Sizes[0] = mB;
+            t.Sizes[1] = mT;
+            t.Sizes[2] = H;
+            t.Device = dev;
+            t.Data = static_cast<std::byte*>(buf);
+            bind_tensor(name, t);
+        }
+        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
     }
-    // Best-effort: the carried ``x`` (block output) lives in a transient slot
-    // that is not resident on a fresh executor, so this inject is a no-op there.
-    // Completing the two-tensor boundary handoff needs a materialization hook
-    // (tracked as remaining multi-GPU work); the residual inject above always lands.
-    if (mDbgInjectHoutLayer >= 0 && !mDbgInjectHoutHost.empty()) {
-        // ``x`` is the block output h: BlockHOut when a layer-scalar applies, else
-        // the raw MLP output (BlockMLPDown). Inject into the same slot the sender
-        // read it from (matched via the fallback chain).
-        const TensorSlot slots[] = {
-            TensorSlot::BlockHOut, TensorSlot::BlockMLPDown, TensorSlot::BlockResidualAtt};
-        for (TensorSlot s : slots) {
-            Tensor* h = block_activation_ptr(mRunState, mDbgInjectHoutLayer, s);
-            if (h && h->Data && h->bytes() == mDbgInjectHoutHost.size()) {
-                CUDA_CHECK(cudaMemcpyAsync(h->Data, mDbgInjectHoutHost.data(), h->bytes(),
-                                           cudaMemcpyHostToDevice, mRunState.MainStream));
-                CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-                break;
-            }
-        }
+    // dispatch-PP debug: when preserving a stage's last block (so its boundary
+    // tensors survive the read), capture the post-init stack base so the caller
+    // can restore it after the read and a reused GPU starts clean.
+    if (mDbgPreserveLayer >= 0) {
+        mDbgStageBase = mRunState.Stack.checkpoint();
+        mDbgStageBaseValid = true;
     }
     const int num_layers = static_cast<int>(mConfig.NumLayers);
     // Reuse member vectors to avoid per-forward heap allocations.

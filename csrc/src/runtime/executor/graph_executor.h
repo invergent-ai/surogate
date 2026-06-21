@@ -283,18 +283,15 @@ public:
     void debug_roundtrip_block_residual(int block);
     // Per-block weight-grad L2 norms in ascending block order.
     std::vector<float> debug_block_grad_norms();
-    // Read get_residual(layer)'s raw device bytes to host (the inter-block residual
-    // handed GPU->GPU in the dispatch pool). Empty if absent.
-    std::vector<std::byte> debug_read_residual_bytes(int layer);
-    // Read block ``layer``'s output (BlockHOut, the ``x`` carried to the next
-    // block) raw device bytes to host. Empty if not resident.
-    std::vector<std::byte> debug_read_block_hout_bytes(int layer);
-    // Stage / clear host buffers to inject on the next forward (cross-GPU handoff):
-    // the accumulator into get_residual(layer) and ``x`` into BlockHOut(layer).
-    void debug_set_inject_residual(int layer, std::vector<std::byte> host_bytes);
-    void debug_set_inject_hout(int layer, std::vector<std::byte> host_bytes);
+    // Keep a stage's last block live so the cross-GPU boundary can be read.
     void debug_set_preserve_layer(int layer);
-    void debug_clear_inject_residual();
+    // Read a named graph tensor's raw device bytes to host (empty if absent), and
+    // stage/clear named boundary tensors to bind on the next forward (cross-GPU
+    // handoff). debug_restore_stage_base drops a preserved stage's allocations.
+    std::vector<std::byte> debug_read_named_bytes(const std::string& name);
+    void debug_set_inject_named(std::vector<std::pair<std::string, std::vector<std::byte>>> items);
+    void debug_clear_inject_named();
+    void debug_restore_stage_base();
 
     /// Set document masking context for Flash Attention varlen dispatch.
     /// cu_seqlens_cpu: (num_docs + 1,) int32 cumulative token offsets on CPU.
