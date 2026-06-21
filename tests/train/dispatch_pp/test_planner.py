@@ -1,7 +1,14 @@
 """Unit tests for the dispatch-PP planner (pure Python, GPU-free)."""
 
 from surogate.train.dispatch_pp.types import BlockProfile, StageRange, StagePlan
-from surogate.train.dispatch_pp.planner import pack_stages, candidate_budgets, plan_stages
+from surogate.train.dispatch_pp.planner import (
+    pack_stages,
+    candidate_budgets,
+    plan_stages,
+    token_threshold,
+    microbatch_warning,
+    envelope_warning,
+)
 
 
 def _uniform_profiles(n, fwd, bwd, wbytes=1, abytes=0, needs_grad=True):
@@ -164,3 +171,29 @@ def test_plan_no_oversize_warning_when_blocks_fit():
     plan = plan_stages(profiles, min_stages=2, upper_threshold=1.1,
                        vram_budget_bytes=40)
     assert not any("VRAM" in w for w in plan.warnings)
+
+
+def test_token_threshold_matches_formula():
+    # threshold = 0.75 * flops / pcie_bw
+    thr = token_threshold(gpu_flops=80e12, pcie_bw=20e9)
+    assert abs(thr - 0.75 * 80e12 / 20e9) < 1e-6  # == 3000.0
+
+
+def test_microbatch_warning_dense_threshold_is_8():
+    assert microbatch_warning(num_microbatches=4, is_moe=False) is not None
+    assert microbatch_warning(num_microbatches=8, is_moe=False) is None
+
+
+def test_microbatch_warning_moe_threshold_is_80():
+    assert microbatch_warning(num_microbatches=16, is_moe=True) is not None
+    assert microbatch_warning(num_microbatches=80, is_moe=True) is None
+
+
+def test_envelope_warning_fires_below_token_threshold():
+    w = envelope_warning(tokens_per_step=500, gpu_flops=80e12, pcie_bw=20e9)
+    assert w is not None and "transfer-bound" in w
+
+
+def test_envelope_warning_silent_above_token_threshold():
+    w = envelope_warning(tokens_per_step=8192, gpu_flops=80e12, pcie_bw=20e9)
+    assert w is None

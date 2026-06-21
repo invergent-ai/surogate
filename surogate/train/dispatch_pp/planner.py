@@ -75,6 +75,44 @@ def candidate_budgets(costs: Sequence[float], upper_threshold: float) -> list[fl
     return sorted(cands)
 
 
+def token_threshold(gpu_flops: float, pcie_bw: float) -> float:
+    """Min tokens-per-optimizer-step to stay compute-bound (full-FT, ~6 B/param/step).
+
+    Hardware cross-check derived from the transfer/compute roofline: full-FT moves
+    ~6 bytes/param/step over PCIe (2 fwd-up + 2 bwd-up + 2 grad-down, bf16) while
+    computing ~8 FLOPs/param/token, so transfer is hidden once
+    ``tokens_per_step >= (6/8) * gpu_flops / pcie_bw``.
+    """
+    return 0.75 * gpu_flops / pcie_bw
+
+
+def microbatch_warning(num_microbatches: int, is_moe: bool) -> str | None:
+    """Primary roofline check (RoundPipe paper): PCIe hidden once B>=8 dense / B>=80 MoE."""
+    floor = 80 if is_moe else 8
+    if num_microbatches < floor:
+        kind = "MoE" if is_moe else "dense"
+        return (
+            f"microbatches={num_microbatches} is below the RoundPipe roofline "
+            f"(B>={floor} for {kind}); dispatch-PP will be transfer-bound. "
+            f"Increase gradient_accumulation_steps."
+        )
+    return None
+
+
+def envelope_warning(
+    tokens_per_step: int, gpu_flops: float, pcie_bw: float
+) -> str | None:
+    """Hardware cross-check: warn if tokens-per-step can't amortize weight uploads."""
+    thr = token_threshold(gpu_flops, pcie_bw)
+    if tokens_per_step < thr:
+        return (
+            f"tokens_per_step={tokens_per_step} is below the ~{thr:.0f}-token "
+            f"compute-bound threshold for this GPU/PCIe; dispatch-PP will be "
+            f"transfer-bound. Increase gradient_accumulation_steps or batch/seq_len."
+        )
+    return None
+
+
 def _stage_range(
     lo: int, hi: int, profiles: Sequence[BlockProfile], time_attr: str
 ) -> StageRange:

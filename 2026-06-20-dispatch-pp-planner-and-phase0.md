@@ -19,8 +19,8 @@ Updated before each commit. Status: ☐ not started · ◐ in progress · ☑ do
 - ☑ Task 3 — Candidate budget enumeration
 - ☑ Task 4 — Cost search + plan assembly (fwd / fused tail / bwd)
 - ☑ Task 5 — Oversized-block warning
-- ◐ Task 6 — PCIe token-threshold / microbatch envelope warnings
-- ☐ Task 7 — LoRA `needs_grad` propagation + NUMA placement
+- ☑ Task 6 — PCIe token-threshold / microbatch envelope warnings
+- ◐ Task 7 — LoRA `needs_grad` propagation + NUMA placement
 - ☐ Task 8 — Config plumbing + validation in `SFTConfig`
 - ☐ Task 9 — Phase-0 `GraphExecutor` sub-range execution gate
 - ☐ Task 10 — Full-suite run + record Phase-0 verdict
