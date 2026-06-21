@@ -768,6 +768,16 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
             # stay on the GPU).
             logger.info("[dispatch_pp]: enabling offload_grads for full fine-tune.")
             self.offload_grads = True
+        # Bound activation memory the same way: recompute intermediates and offload
+        # the per-layer residuals to pinned CPU. Together these make activation memory
+        # independent of network depth — without them a deep model OOMs on the
+        # save-for-backward arena even after the weights stream.
+        if not self.recompute:
+            logger.info("[dispatch_pp]: enabling recompute (activation memory must be bounded).")
+            self.recompute = True
+        if not self.offload_residual:
+            logger.info("[dispatch_pp]: enabling offload_residual (depth-independent activation memory).")
+            self.offload_residual = True
 
     def _validate_ep_config(self):
         """Validate Expert Parallelism configuration."""
