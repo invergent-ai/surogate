@@ -175,6 +175,7 @@ MultiGPUPyTrainer::MultiGPUPyTrainer(int ngpus,
         throw std::runtime_error(fmt::format("Requested {} GPUs, only {} available", ngpus, gpus_available));
     }
     mContexts.resize(ngpus);
+    init_async_slots(ngpus);
     mThreads =
         NCCLCommunicator::launch_communicators(ngpus, memcpy_all_gather, memcpy_send_recv, [&](NCCLCommunicator& comm) {
             try {
@@ -247,6 +248,7 @@ MultiGPUPyTrainer::MultiGPUPyTrainer(int ngpus,
     std::memcpy(nccl_id_owned.data(), nccl_id, 128);
 
     mContexts.resize(ngpus);
+    init_async_slots(ngpus);
     mThreads = NCCLCommunicator::launch_communicators_multinode(ngpus,
                                                                 node_rank,
                                                                 num_nodes,
@@ -1414,6 +1416,40 @@ auto MultiGPUPyTrainer::fetch_work(sThreadContext& ctx) -> std::function<void(sT
     }
 }
 
+void MultiGPUPyTrainer::init_async_slots(std::size_t n) {
+    mCtxPending = std::make_unique<std::atomic<int>[]>(n);
+    mCtxDone = std::make_unique<std::atomic<int>[]>(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        mCtxPending[i].store(0, std::memory_order_relaxed);
+        mCtxDone[i].store(0, std::memory_order_relaxed);
+    }
+}
+
+// Launch `work` on GPU `gpu` without blocking the caller; the worker thread for that
+// GPU picks it up via fetch_work and bumps mCtxDone when finished. Blocks only if that
+// GPU still has an outstanding async item (the natural is_idle backpressure).
+void MultiGPUPyTrainer::dispatch_async(std::function<void(sThreadContext& ctx)> work, int gpu) {
+    wait_gpu(gpu);  // ensure the previous async item on this GPU has completed
+    {
+        std::lock_guard<std::mutex> lock(mGlobalMutex);
+        mContexts.at(static_cast<std::size_t>(gpu)).Work = std::move(work);
+    }
+    mCtxPending[static_cast<std::size_t>(gpu)].fetch_add(1, std::memory_order_release);
+}
+
+// Block until GPU `gpu`'s outstanding async work has finished (Done caught up to
+// Pending). Propagates worker exceptions like run_work.
+void MultiGPUPyTrainer::wait_gpu(int gpu) {
+    const auto g = static_cast<std::size_t>(gpu);
+    while (mCtxDone[g].load(std::memory_order_acquire) < mCtxPending[g].load(std::memory_order_acquire)) {
+        if (mThreads->has_exception()) {
+            stop();
+            mThreads->join();  // will throw, ending the loop
+        }
+        std::this_thread::yield();
+    }
+}
+
 /**
  * @brief Schedule a work item to run on one rank or all ranks, and wait for completion.
  *
@@ -1437,10 +1473,14 @@ void MultiGPUPyTrainer::run_work(std::function<void(sThreadContext& ctx)> work, 
         if (idx >= 0) {
             mWorkDone = mContexts.size() - 1;
             mContexts.at(idx).Work = work;
+            // Keep the async per-GPU counters consistent: the worker bumps Done for
+            // every work item (sync or async), so the sync path must bump Pending too.
+            if (mCtxPending) mCtxPending[static_cast<std::size_t>(idx)].fetch_add(1, std::memory_order_release);
         } else {
             mWorkDone = 0;
-            for (auto& ctx : mContexts) {
-                ctx.Work = work;
+            for (std::size_t i = 0; i < mContexts.size(); ++i) {
+                mContexts[i].Work = work;
+                if (mCtxPending) mCtxPending[i].fetch_add(1, std::memory_order_release);
             }
         }
     }
@@ -1588,6 +1628,8 @@ void MultiGPUPyTrainer::main_loop(NCCLCommunicator& comm) {
                 throw;
             }
             mWorkDone.fetch_add(1);
+            // Per-GPU async completion: mark this GPU's outstanding item done.
+            if (mCtxDone) mCtxDone[static_cast<std::size_t>(comm.local_rank())].fetch_add(1, std::memory_order_release);
         } else {
             std::this_thread::yield();
         }

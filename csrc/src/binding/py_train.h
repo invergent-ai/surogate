@@ -346,6 +346,18 @@ private:
     std::atomic<int> mIsReady = 0;
     std::atomic<int> mWorkDone = 0;
 
+    // dispatch-PP async per-GPU dispatch: launch work on a single GPU without the
+    // global barrier of run_work, and wait per-GPU later. This lets the stage
+    // scheduler run different stages/microbatches on different GPUs concurrently.
+    // Per-GPU monotonic counters: dispatch bumps Pending, the worker bumps Done after
+    // it finishes a work item; the GPU is free when Done==Pending. The synchronous
+    // run_work path (and mWorkDone) is unchanged.
+    std::unique_ptr<std::atomic<int>[]> mCtxPending;
+    std::unique_ptr<std::atomic<int>[]> mCtxDone;
+    void init_async_slots(std::size_t n);
+    void dispatch_async(std::function<void(sThreadContext& ctx)> work, int gpu);
+    void wait_gpu(int gpu);
+
     std::function<void(sThreadContext& ctx)> fetch_work(sThreadContext& ctx);
     void run_work(std::function<void(sThreadContext& ctx)> work, int idx = -1);
     void main_loop(NCCLCommunicator& comm);
