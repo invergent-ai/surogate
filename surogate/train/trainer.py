@@ -266,6 +266,35 @@ def _summarize_block_schemas(ir_json: str | None) -> dict[str, int]:
 
 
 class SurogateTrainerWrapper:
+    def _dispatch_pp_plan(self):
+        """Partition layers into SMALL stages for dispatch-PP.
+
+        Unlike the old one-stage-per-GPU split (big stages that can't be held resident),
+        aim for ~SUROGATE_DISPATCH_STAGE_BLOCKS layers per stage (default 4) so 2x a stage
+        fits the VRAM budget and a stage stays cached across its microbatches. Always make
+        at least `gpus` stages so every device is used. Returns (los, his, n_layers,
+        num_stages, max_stage_blocks).
+        """
+        mc = self.config.model_info.config
+        n_layers = getattr(mc, "num_hidden_layers", 0) or getattr(
+            getattr(mc, "text_config", None), "num_hidden_layers", 0
+        )
+        if not n_layers:
+            raise RuntimeError("dispatch_pp: could not determine num_hidden_layers from model config")
+        gpus = self.config.gpus
+        target = max(1, int(os.environ.get("SUROGATE_DISPATCH_STAGE_BLOCKS", "4")))
+        nst = max(gpus, (n_layers + target - 1) // target)
+        nst = min(nst, n_layers)
+        los, his = [], []
+        base, rem, lo = n_layers // nst, n_layers % nst, 0
+        for i in range(nst):
+            sz = base + (1 if i < rem else 0)
+            los.append(lo)
+            his.append(lo + sz - 1)
+            lo += sz
+        max_stage = max(h - l + 1 for l, h in zip(los, his))
+        return los, his, n_layers, nst, max_stage
+
     def __init__(self, config: SFTConfig, train_files: list[str], eval_files: list[str] | None = None):
         self.config = config
         self._block_types = None
@@ -359,6 +388,26 @@ class SurogateTrainerWrapper:
         # `_maybe_shrink_stack_after_warmup`. Gated here so resumed-from-
         # checkpoint runs still measure the first *executed* step.
         self._stack_shrunk = False
+
+        # dispatch_pp: plan small stages and size the weight-streaming prefetch so a whole
+        # stage stays resident across its microbatches. Must run BEFORE the native trainer
+        # (and its weight manager) is constructed, since the prefetch-slot count is read
+        # from the env at construction time.
+        if config.parallelism == "dispatch_pp":
+            self._dpp_los, self._dpp_his, _nl, _nst, _max_stage = self._dispatch_pp_plan()
+            prefetch = _max_stage + 2  # whole stage resident + double-buffer margin
+            os.environ["SUROGATE_DISPATCH_PREFETCH_BLOCKS"] = str(prefetch)
+            # Headroom for the boundary saves kept live by sub-range skip_finalize (the
+            # stack auto-sizer doesn't model them). Plenty of free VRAM since the base
+            # weights are bounded to the prefetch buffers.
+            os.environ.setdefault("SUROGATE_DISPATCH_STACK_HEADROOM_MB", "2048")
+            logger.info(
+                "[dispatch_pp]: %d stages over %d layers (max %d blocks/stage), prefetch=%d slots",
+                _nst,
+                _nl,
+                _max_stage,
+                prefetch,
+            )
 
         # Create trainer
         self.start_step = 0
@@ -1060,20 +1109,8 @@ class SurogateTrainerWrapper:
         if self._dispatch_pp and self.config.offload_master:
             logger.info("[dispatch_pp]: offload_master set -> base weights stream from CPU per block.")
         if self._dispatch_pp:
-            mc = self.config.model_info.config
-            n_layers = getattr(mc, "num_hidden_layers", 0) or getattr(
-                getattr(mc, "text_config", None), "num_hidden_layers", 0
-            )
-            if not n_layers:
-                raise RuntimeError("dispatch_pp: could not determine num_hidden_layers from model config")
-            nst = max(1, min(self.config.gpus, n_layers))
-            self._dpp_los, self._dpp_his = [], []
-            base, rem, lo = n_layers // nst, n_layers % nst, 0
-            for i in range(nst):
-                sz = base + (1 if i < rem else 0)
-                self._dpp_los.append(lo)
-                self._dpp_his.append(lo + sz - 1)
-                lo += sz
+            # Stage plan (_dpp_los/_dpp_his) was computed in __init__ (it also sized the
+            # weight-streaming prefetch before the native trainer was built).
             self._dpp_bsz = self.config.per_device_train_batch_size
             if self.config.gradient_accumulation_steps != 1:
                 logger.warning(
@@ -1082,9 +1119,7 @@ class SurogateTrainerWrapper:
                     self.config.gradient_accumulation_steps,
                 )
             logger.info(
-                "[dispatch_pp]: %d stages over %d layers -> %s",
-                nst,
-                n_layers,
+                "[dispatch_pp]: stages -> %s",
                 list(zip(self._dpp_los, self._dpp_his)),
             )
 
@@ -1251,13 +1286,12 @@ class SurogateTrainerWrapper:
                 normuon_cautious_wd=self.config.normuon_cautious_wd,
             )
             if self._dispatch_pp:
-                # Round-robin stage dispatch: forward+backward across the GPU pool,
-                # collect grads to the master, optimize, broadcast. One fused call.
-                # Run M=gpus microbatches per step through the wavefront scheduler: stage
-                # s runs on GPU s%N, and in each diagonal wave the stages run on distinct
-                # GPUs concurrently (N parallel PCIe links + N-way compute overlap). The
-                # chunk holds gpus*bsz rows = gpus microbatches of bsz each. LoRA only for
-                # now (FFT cross-microbatch grad accumulation not wired -> M=1).
+                # Stage-level dispatch: forward+backward across the GPU pool, collect grads
+                # to the master, optimize, broadcast. One fused call. Each small stage runs
+                # on GPU s%N with its weights held resident across all M microbatches
+                # (streamed once/step), and stages pipeline across GPUs (N parallel PCIe
+                # links). M=gpus microbatches of bsz each fill the chunk (gpus*bsz rows).
+                # LoRA only for now (FFT cross-microbatch grad accumulation not wired -> M=1).
                 bsz = self._dpp_bsz
                 M = self.config.gpus if self.config.lora else 1
                 rows = M * bsz

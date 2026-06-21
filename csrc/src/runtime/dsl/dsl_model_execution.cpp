@@ -430,8 +430,16 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
     }
     if (auto* exec = dynamic_cast<GraphExecutor*>(mExecutor.get())) {
         exec->ensure_graphs_compiled(B, T);
-        const long needed =
+        long needed =
             required_stack_bytes(mRunState->buffer_plan(), exec->compiled_backward(), mModelConfig, mOptions);
+        // dispatch-PP runs sub-range stages with skip_finalize, which keeps the boundary
+        // saves (res_att/mlp_down) live on the stack on top of the normal backward peak --
+        // the auto-sizer doesn't model that, so add headroom (env, MB). There is ample free
+        // VRAM here since the base weights are bounded to the streaming prefetch.
+        if (const char* env = std::getenv("SUROGATE_DISPATCH_STACK_HEADROOM_MB")) {
+            const long mb = std::atol(env);
+            if (mb > 0) needed += mb * 1024L * 1024L;
+        }
         if (options.DebugMemoryBreakdown && comm.rank() == 0) {
             const long graph_peak = graph_backward_stack_peak(exec->compiled_backward(), mRunState->buffer_plan());
             std::cerr << "[DEBUG-STACK] graph_peak=" << graph_peak / (1024 * 1024) << " MiB"

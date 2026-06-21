@@ -1,23 +1,42 @@
 # Dispatch Pipeline Parallelism (dispatch-PP) — single-node, model-parallel LoRA.
 #
 # Treats the node's GPUs as a stateless round-robin compute pool: the model's
-# transformer blocks are grouped into stages, each uploaded to whichever GPU is
-# next, computed, and freed. Per-GPU peak memory is bounded by ~2x the largest
-# stage (independent of model size / GPU count), so a model that OOMs under DDP can
-# train on PCIe-only multi-GPU boxes. v1 is BF16 full-FT + LoRA, no NCCL.
+# transformer blocks are grouped into contiguous stages, each run on whichever GPU
+# is next, with activations/gradients handed between stages through host memory (no
+# NCCL on the hot path). So a model that OOMs under DDP can train on PCIe-only
+# multi-GPU boxes.
+#
+# Memory is bounded two ways, independent of model size / GPU count:
+#   - activations: the per-stage forward only materializes one stage's blocks;
+#   - base weights (with offload_master): they live in pinned CPU and stream to the
+#     GPU one block at a time, so resident base weight memory is ~2 blocks.
+# Only the (small, frozen-base) LoRA adapters stay resident and get optimized.
+#
+# Validated: this config trains Qwen3.6-27B (~54 GB bf16, can't fit on a 32 GB card)
+# across 4x 32 GB GPUs. v1 is BF16 + LoRA (FP8/NVFP4 streaming is deferred).
 model: Qwen/Qwen3.6-27B
 output_dir: ./output_q36
 
+# Size of the round-robin GPU pool. Set to your box's GPU count. The layers are split
+# into many SMALL stages (~4 blocks each, more than the GPU count) so a stage stays
+# resident across its microbatches and 2x a stage fits the VRAM budget; stages then
+# pipeline across the GPUs (N parallel PCIe links). With offload_master streaming the
+# base, even gpus: 1 works — more GPUs pipeline more stages concurrently for throughput.
+# (Stage size is tunable via SUROGATE_DISPATCH_STAGE_BLOCKS, default 4.)
+gpus: 4
+
 per_device_train_batch_size: 1
-gradient_accumulation_steps: 8
+# v1 applies one optimizer step per micro-batch (grad-accum folding is a follow-up),
+# so keep this at 1 for now — a higher value just runs that many optimizer steps.
+gradient_accumulation_steps: 1
 
 sample_packing: true
-sequence_len: 2048
+sequence_len: 1024
 
-max_steps: 5
+max_steps: 50
 eval_steps: 25
 
-learning_rate: 2e-4
+learning_rate: 1e-4
 warmup_ratio: 0.15
 
 recipe: bf16  # dispatch-PP is BF16/LoRA-only in v1 (FP8/NVFP4 streaming is deferred)
@@ -30,6 +49,11 @@ dispatch_pp:
   upper_threshold: 1.1     # PCIe operating-envelope warning threshold (tokens/step vs bandwidth)
   vram_budget_gb: null     # per-GPU stage memory ceiling; null = auto (free VRAM * 0.9)
   recompute_grain: stage   # activation recompute granularity for the backward pass
+
+# Stream the frozen base weights from pinned CPU per block. Required when the base
+# model can't fit resident on a single GPU (e.g. a 27B on 32 GB cards). Drop it for
+# models that fit resident — the same stage scheduler runs either way.
+offload_master: true
 
 lora: true
 lora_rank: 16

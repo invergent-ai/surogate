@@ -1,6 +1,14 @@
 # Dispatch-PP — Stage-Level Dispatch Rewrite (next dedicated pass)
 
-**Status:** planned. Grounded in a full read of `study/RoundPipe/roundpipe/` (run.py, device.py,
+**Status:** IMPLEMENTED (pieces 1-4 + stack fix). The microbatch-diagonal wavefront has been replaced
+by stage-level dispatch: small-stage planner (`_dispatch_pp_plan`, ~4 blocks/stage), stage-resident
+gather (configurable prefetch), and the cross-stage per-microbatch pipeline (atomic ready-flags +
+`dispatch_async` backpressure). **Verified:** loss parity on 0.8B LoRA; Qwen3.6-27B LoRA trains
+end-to-end and converges on 4x32 GB with 16 stages of 4 blocks (the memory objection is resolved —
+each GPU holds one small stage, not its whole layer share). Remaining: speed tuning (host boundary
+handoff is the next bottleneck) + async stale optimizer + FFT grad-accum. Original plan below.
+
+Grounded in a full read of `study/RoundPipe/roundpipe/` (run.py, device.py,
 transfer.py, scheduler.py, roundpipe.py), not inference. The current `dispatch_pp_train_step_multigpu`
 (microbatch-diagonal wavefront) must be **replaced** by this model — it cannot be extended into it.
 
