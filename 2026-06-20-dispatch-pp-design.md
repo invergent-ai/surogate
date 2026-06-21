@@ -450,6 +450,16 @@ Front-loads the biggest unknown so we fail fast if the engine cannot do sub-rang
 - **Phase 2 — Planner + multi-GPU pool.** Add the DispatchPlanner and round-robin dispatch across N
   local GPUs with the semaphore+event correctness model. Target: per-GPU memory ≈ flat as N grows;
   throughput scales ~linearly.
+  - *Planner→model integration landed (2026-06-21):* `surogate/train/dispatch_pp/profile.py` derives
+    real `BlockProfile`s from a checkpoint (per-block work-weight bytes read from the safetensors
+    header, activation working-set from model dims + runtime shape, size-proportional fwd/bwd times),
+    and `plan_for_model(...)` produces a NUMA-placed `StagePlan` with operating-envelope warnings.
+    Validated end-to-end against Qwen3-0.6B (28 blocks): coverage, descending backward, NUMA
+    round-robin, microbatch roofline warning (`tests/train/dispatch_pp/test_profile.py`).
+    `resolve_vram_budget_bytes()` implements the `vram_budget_gb` / auto=free_vram×0.9 resolution.
+    Remaining Phase-2 work is the C++ multi-GPU stateless pool (round-robin/NUMA dispatch, stage
+    dependency edges + CUDA-event handoff, stage-range gather, GPU-resident-weight-bytes introspection,
+    and the quantitative memory-scaling test).
 - **Phase 3 — Async 1-step-stale optimizer.** Overlap the optimizer thread on the CPU-master path;
   verify the controlled staleness test. Sequenced last because it is the hardest to debug — Phases 1–2
   run with a synchronous optimizer internally as scaffolding (sync is not a shipped v1 option).
