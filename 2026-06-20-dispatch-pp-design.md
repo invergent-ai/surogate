@@ -474,9 +474,24 @@ Front-loads the biggest unknown so we fail fast if the engine cannot do sub-rang
     (more stages than GPUs), on Qwen3-0.6B/4-layer across 2 RTX 5090s
     (`tests/train/dispatch_pp/test_phase2_multigpu.py`: runs-end-to-end + 2-stage parity + wrap parity,
     all passing).
+  - *Multi-GPU round-robin backward dispatch landed (2026-06-21) — PASS.* Stages run in reverse forward
+    order (the loss-owning stage first) via `MultiGPUPyTrainer::dispatch_pp_debug_grad_norms_multigpu`.
+    Each stage runs one GPU on the full batch: a forced-eager whole forward provides activations, then a
+    bounded backward selects the stage's ops **by their owning block layer** [lo..hi]
+    (`set_debug_backward_layer_range`) — robust to boundary view ops (e.g.
+    `d_blocks[L].mlp_down -> .mlp_down_flat`) whose op index falls between `layer_end[L+1]` and
+    `layer_start[L]`; by layer they belong to block L, so an op-index range would drop them into an
+    inter-stage gap. The incoming boundary gradients (`d_blocks[hi].res_att` / `.mlp_down`, produced by
+    the higher stage) are bound by name into the backward graph (`apply_debug_named_inject`), and the
+    outgoing boundary (`d_blocks[lo-1].*`) is read by name and handed to the next lower stage's GPU
+    through host memory. Running one GPU at a time required skipping the DP collectives that would
+    deadlock waiting for idle GPUs: the per-layer grad all-reduce (`CompiledExecutor` skip flag), the
+    wrapper-level `reduce_loss` + `reduce_all_async` (`GraphExecutor` skip flag), and
+    `reduce_loss_on_completion` on the request. Per-block weight-grad L2 norms match whole-graph backward
+    within bf16 tolerance for 2 stages and round-robin wrap
+    (`tests/train/dispatch_pp/test_phase2_multigpu.py`: 3 backward tests passing).
     Still ahead: stage dependency edges + CUDA-event handoff for compute/transfer overlap, NUMA-biased
-    dispatch, stage-range (multi-block) gather, the backward cross-GPU grad path, and the
-    quantitative memory-scaling test.
+    dispatch, stage-range (multi-block) gather, and the quantitative memory-scaling test.
 - **Phase 3 — Async 1-step-stale optimizer.** Overlap the optimizer thread on the CPU-master path;
   verify the controlled staleness test. Sequenced last because it is the hardest to debug — Phases 1–2
   run with a synchronous optimizer internally as scaffolding (sync is not a shipped v1 option).

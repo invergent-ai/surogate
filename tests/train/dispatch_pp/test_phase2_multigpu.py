@@ -1,17 +1,20 @@
-"""Phase-2 gate: multi-GPU round-robin forward dispatch.
+"""Phase-2 gate: multi-GPU round-robin forward AND backward dispatch.
 
 Partition the model into contiguous block stages and dispatch them round-robin
 across the GPU pool (stage i -> GPU i % ngpu), handing the boundary state from one
 GPU to the next *through host memory* (no NCCL). This exercises the dispatch-PP
 stateless pool: any stage runs on any GPU, rendezvous through CPU.
 
-Status: the round-robin dispatch + per-stage execution + residual handoff plumbing
-is in place and runs end-to-end. Full numerical parity is xfail pending the
-two-tensor boundary handoff — the fused-residual block carries both the residual
-accumulator (pre-allocated, injectable via get_residual) AND ``x`` (the previous
-block's output, a transient slot that is not resident on a fresh executor). The
-residual lands; completing the ``x`` handoff needs a boundary-materialization hook
-in the executor (tracked as remaining multi-GPU work).
+Forward: the two-tensor fused-residual boundary (blocks[hi].res_att and
+blocks[hi].mlp_down = x) is read by name on the sending GPU and bound into the same
+graph tids on the receiving GPU; the final hidden matches whole-graph forward.
+
+Backward: stages run in reverse order (loss-owning stage first). Each stage's ops
+are selected by their owning block layer (robust to boundary view ops), runs one
+GPU on the full batch with the DP grad/loss all-reduce skipped, and hands the
+boundary gradients (d_blocks[hi].res_att / .mlp_down) to the next lower stage's GPU
+through host memory. Per-block weight-grad norms match whole-graph backward within
+bf16 tolerance.
 """
 
 import json
@@ -137,3 +140,43 @@ def test_multigpu_dispatch_round_robin_wrap():
     los, his = _stage_ranges(list(range(NUM_LAYERS - 1)))  # [0]|[1]|[2]|[3]
     multi = np.asarray(trainer.dispatch_pp_debug_forward_hidden_multigpu(inputs, los, his))
     np.testing.assert_allclose(single, multi, rtol=5e-2, atol=5e-2)
+
+
+def test_multigpu_backward_runs_end_to_end():
+    """Round-robin backward dispatch across GPUs runs and returns per-block grad
+    norms — proves the reverse-order stage scheduling + cross-GPU gradient handoff
+    plumbing (no missing boundary tensors)."""
+    trainer, model_dir = _build_trainer()
+    vocab_size = json.loads((Path(model_dir) / "config.json").read_text())["vocab_size"]
+    b = make_inputs(vocab_size)
+    los, his = _stage_ranges([NUM_LAYERS // 2 - 1])
+    norms = np.asarray(trainer.dispatch_pp_debug_grad_norms_multigpu(b["inputs"], b["targets"], los, his))
+    assert norms.shape == (NUM_LAYERS,)
+    assert np.all(norms > 0.0)
+
+
+def test_multigpu_backward_matches_single_gpu():
+    """Per-block weight-grad norms from two-stage multi-GPU backward match whole-graph
+    backward. The boundary gradients (d_blocks[hi].res_att / .mlp_down) cross GPUs
+    through host memory; tolerance is bf16-level (the separate per-stage forward
+    recompute + bf16 boundary rounding)."""
+    trainer, model_dir = _build_trainer()
+    vocab_size = json.loads((Path(model_dir) / "config.json").read_text())["vocab_size"]
+    b = make_inputs(vocab_size)
+    whole = np.asarray(trainer.dispatch_pp_debug_grad_norms_whole(b["inputs"], b["targets"]))
+    los, his = _stage_ranges([NUM_LAYERS // 2 - 1])
+    multi = np.asarray(trainer.dispatch_pp_debug_grad_norms_multigpu(b["inputs"], b["targets"], los, his))
+    np.testing.assert_allclose(multi, whole, rtol=1e-1, atol=1e-1)
+
+
+def test_multigpu_backward_round_robin_wrap():
+    """One block per backward stage (more stages than GPUs) exercises round-robin GPU
+    reuse and multiple gradient handoffs; per-block grad norms still match whole-graph
+    backward within bf16 tolerance."""
+    trainer, model_dir = _build_trainer()
+    vocab_size = json.loads((Path(model_dir) / "config.json").read_text())["vocab_size"]
+    b = make_inputs(vocab_size)
+    whole = np.asarray(trainer.dispatch_pp_debug_grad_norms_whole(b["inputs"], b["targets"]))
+    los, his = _stage_ranges(list(range(NUM_LAYERS - 1)))  # [0]|[1]|[2]|[3]
+    multi = np.asarray(trainer.dispatch_pp_debug_grad_norms_multigpu(b["inputs"], b["targets"], los, his))
+    np.testing.assert_allclose(multi, whole, rtol=1e-1, atol=1e-1)

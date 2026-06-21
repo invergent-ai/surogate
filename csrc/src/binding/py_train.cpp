@@ -2025,6 +2025,64 @@ std::vector<float> MultiGPUPyTrainer::dispatch_pp_debug_forward_hidden_multigpu(
     }
     return result;
 }
+
+std::vector<float> MultiGPUPyTrainer::dispatch_pp_debug_grad_norms_multigpu(
+    const std::int32_t* inputs, const std::int32_t* targets, const std::vector<int>& los,
+    const std::vector<int>& his) {
+    if (los.size() != his.size() || los.empty()) {
+        throw std::runtime_error("dispatch_pp_debug_grad_norms_multigpu: bad stage ranges");
+    }
+    const int ngpu = static_cast<int>(mContexts.size());
+    const int num_stages = static_cast<int>(los.size());
+    const int num_layers = his.back() + 1;
+    std::vector<float> result(static_cast<std::size_t>(num_layers), 0.0f);
+    // Backward boundary gradients (d_blocks[lo-1].res_att / .mlp_down) handed from
+    // a higher stage's GPU to the next lower stage's GPU through host memory.
+    std::vector<std::pair<std::string, std::vector<std::byte>>> boundary;
+
+    // Backward visits stages in reverse forward order: the stage owning the last
+    // block (and the loss) runs first.
+    for (int si = num_stages - 1; si >= 0; --si) {
+        const int gpu = si % ngpu;
+        const int lo = los[static_cast<std::size_t>(si)];
+        const int hi = his[static_cast<std::size_t>(si)];
+        const bool is_loss_stage = (si == num_stages - 1);
+        std::vector<std::pair<std::string, std::vector<std::byte>>> inject_named = boundary;
+        std::vector<std::pair<std::string, std::vector<std::byte>>> next_boundary;
+        std::vector<float> stage_norms;
+
+        run_work(
+            [&](sThreadContext& ctx) {
+                auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+                if (!model)
+                    throw std::runtime_error("dispatch_pp_debug_grad_norms_multigpu: DSL model required");
+                DISPATCH_PP_DBG_STAGE(ctx, inputs, targets);
+                model->dispatch_pp_debug_backward_stage(ctx.Model->get_input_buffer(),
+                                                        ctx.Model->get_target_buffer(),
+                                                        ctx.Model->get_position_ids_buffer(),
+                                                        *ctx.Communicator,
+                                                        lo,
+                                                        hi,
+                                                        is_loss_stage,
+                                                        std::move(inject_named));
+                auto* ge = model->graph_executor();
+                stage_norms = ge->debug_block_grad_norms();
+                if (lo > 0) {
+                    const std::string rn = "d_blocks[" + std::to_string(lo - 1) + "].res_att";
+                    const std::string xn = "d_blocks[" + std::to_string(lo - 1) + "].mlp_down";
+                    next_boundary.emplace_back(rn, ge->debug_read_named_bytes(rn));
+                    next_boundary.emplace_back(xn, ge->debug_read_named_bytes(xn));
+                }
+            },
+            gpu);
+
+        for (int L = lo; L <= hi; ++L) {
+            result[static_cast<std::size_t>(L)] = stage_norms[static_cast<std::size_t>(L)];
+        }
+        boundary = std::move(next_boundary);
+    }
+    return result;
+}
 #undef DISPATCH_PP_DBG_STAGE
 
 std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_gradients(int gpu_id) {

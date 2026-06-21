@@ -570,6 +570,39 @@ void CompiledExecutor::clear_debug_inject_named() {
     mDbgInjectNamed.clear();
 }
 
+// Bind staged named boundary tensors (each [B,T,hidden] bf16) into the exact graph
+// tids the resumed stage reads — the cross-GPU handoff. Used by both forward (the
+// carried activations blocks[hi].res_att / mlp_down) and backward (the carried
+// gradients d_blocks[hi].res_att / mlp_down). Backs each with an owned device buffer.
+void CompiledExecutor::apply_debug_named_inject() {
+    if (mDbgInjectNamed.empty()) return;
+    for (void* p : mDbgInjectBuffers) {
+        if (p) cudaFree(p);
+    }
+    mDbgInjectBuffers.clear();
+    int dev = 0;
+    cudaGetDevice(&dev);
+    const long H = static_cast<long>(mConfig.HiddenSize);
+    for (auto& [name, bytes] : mDbgInjectNamed) {
+        if (bytes.empty()) continue;
+        void* buf = nullptr;
+        CUDA_CHECK(cudaMalloc(&buf, bytes.size()));
+        mDbgInjectBuffers.push_back(buf);
+        CUDA_CHECK(cudaMemcpyAsync(buf, bytes.data(), bytes.size(), cudaMemcpyHostToDevice,
+                                   mRunState.MainStream));
+        Tensor t{};
+        t.DType = ETensorDType::BF16;
+        t.Rank = 3;
+        t.Sizes[0] = mB;
+        t.Sizes[1] = mT;
+        t.Sizes[2] = H;
+        t.Device = dev;
+        t.Data = static_cast<std::byte*>(buf);
+        bind_tensor(name, t);
+    }
+    CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+}
+
 void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                                        NCCLCommunicator& comm,
                                        bool full,
@@ -580,36 +613,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     if (!mDbgFwdSkipInit) {
         initialize_forward_execution(graph, comm, full);
     }
-    // Named boundary inject (cross-GPU handoff): bind each carried tensor into the
-    // exact graph tid the resumed stage's first block reads. Each is [B,T,hidden]
-    // bf16; back it with an owned device buffer.
-    if (!mDbgInjectNamed.empty()) {
-        for (void* p : mDbgInjectBuffers) {
-            if (p) cudaFree(p);
-        }
-        mDbgInjectBuffers.clear();
-        int dev = 0;
-        cudaGetDevice(&dev);
-        const long H = static_cast<long>(mConfig.HiddenSize);
-        for (auto& [name, bytes] : mDbgInjectNamed) {
-            if (bytes.empty()) continue;
-            void* buf = nullptr;
-            CUDA_CHECK(cudaMalloc(&buf, bytes.size()));
-            mDbgInjectBuffers.push_back(buf);
-            CUDA_CHECK(cudaMemcpyAsync(buf, bytes.data(), bytes.size(), cudaMemcpyHostToDevice,
-                                       mRunState.MainStream));
-            Tensor t{};
-            t.DType = ETensorDType::BF16;
-            t.Rank = 3;
-            t.Sizes[0] = mB;
-            t.Sizes[1] = mT;
-            t.Sizes[2] = H;
-            t.Device = dev;
-            t.Data = static_cast<std::byte*>(buf);
-            bind_tensor(name, t);
-        }
-        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
-    }
+    apply_debug_named_inject();
     // dispatch-PP debug: when preserving a stage's last block (so its boundary
     // tensors survive the read), capture the post-init stack base so the caller
     // can restore it after the read and a reused GPU starts clean.

@@ -1666,7 +1666,7 @@ ExecutionResult GraphExecutor::execute_backward(const ExecutionRequest& request,
     rs.zero_activation_gradients(rs.MainStream);
 
     const bool last_step = request.micro_step == request.grad_accum_steps - 1;
-    if (last_step && request.reduce_loss_on_completion) {
+    if (last_step && request.reduce_loss_on_completion && !mDbgSkipGradReduce) {
         reduce_loss(rs, request.batch, request.sequence, comm);
         comm.all_reduce_sum_int(rs.ValidTokenCount.template get<int>(), /*n=*/1, rs.MainStream);
     }
@@ -1696,7 +1696,7 @@ ExecutionResult GraphExecutor::execute_backward(const ExecutionRequest& request,
     mActiveExecutionRequest = nullptr;
 
     grads.end_micro_step(rs.MainStream, comm);
-    if (last_step && comm.world_size() > 1) {
+    if (last_step && comm.world_size() > 1 && !mDbgSkipGradReduce) {
         if (grads.is_overlapped_enabled()) {
             CUDA_CHECK(cudaEventRecord(rs.side_stream_event(), rs.side_stream()));
             CUDA_CHECK(cudaStreamWaitEvent(rs.MainStream, rs.side_stream_event(), 0));
@@ -1998,9 +1998,20 @@ void GraphExecutor::debug_set_backward_op_range(
 void GraphExecutor::debug_clear_backward_op_range() {
     if (mCompiledExecutor) mCompiledExecutor->clear_debug_backward_op_range();
 }
+void GraphExecutor::debug_set_backward_layer_range(int lo, int hi, bool include_loss) {
+    if (mCompiledExecutor) mCompiledExecutor->set_debug_backward_layer_range(lo, hi, include_loss);
+}
+void GraphExecutor::debug_clear_backward_layer_range() {
+    if (mCompiledExecutor) mCompiledExecutor->clear_debug_backward_layer_range();
+}
 
 void GraphExecutor::debug_set_preserve_layer(int layer) {
     if (mCompiledExecutor) mCompiledExecutor->set_debug_preserve_layer(layer);
+}
+
+void GraphExecutor::debug_set_skip_grad_reduce(bool skip) {
+    mDbgSkipGradReduce = skip;
+    if (mCompiledExecutor) mCompiledExecutor->set_debug_skip_grad_reduce(skip);
 }
 
 std::vector<std::byte> GraphExecutor::debug_read_named_bytes(const std::string& name) {

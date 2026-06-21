@@ -209,6 +209,22 @@ public:
         mDbgBwdSkipFinalize = false;
         mDbgForceLinear = false;
     }
+    // Restrict the backward pass to the ops owning blocks [lo..hi] by their layer
+    // attribution (robust to layer_start/end_indices not aligning with boundary
+    // view ops). include_loss also runs the loss/lm-head ops (layer < 0). This is
+    // the dispatch-PP stage selector; it composes with the op-index range above.
+    void set_debug_backward_layer_range(int lo, int hi, bool include_loss) {
+        mDbgBwdLayerLo = lo;
+        mDbgBwdLayerHi = hi;
+        mDbgBwdLayerLoss = include_loss;
+        mDbgBwdLayerFilter = true;
+    }
+    void clear_debug_backward_layer_range() {
+        mDbgBwdLayerFilter = false;
+        mDbgBwdLayerLo = -1;
+        mDbgBwdLayerHi = -1;
+        mDbgBwdLayerLoss = false;
+    }
     // Inject a host residual into get_residual(layer) after forward init, before
     // the op loop — the cross-GPU activation handoff for the dispatch-PP pool. A
     // resumed stage [lo..] reads get_residual(lo-1) as its first block's input.
@@ -216,6 +232,12 @@ public:
     // its layer-end so the cross-GPU boundary can read them. -1 = off.
     void set_debug_preserve_layer(int layer) {
         mDbgPreserveLayer = layer;
+    }
+    // Skip the per-layer cross-GPU gradient all-reduce. The dispatch-PP debug
+    // backward runs one GPU at a time on the full batch, so a DDP all-reduce would
+    // deadlock waiting for idle GPUs (and is unwanted — each GPU owns its blocks).
+    void set_debug_skip_grad_reduce(bool skip) {
+        mDbgSkipGradReduce = skip;
     }
     // Bind named boundary tensors (each [B,T,hidden] bf16) into the executor after
     // forward init, before the op loop — the cross-GPU handoff. Targets the exact
@@ -226,6 +248,7 @@ public:
         mDbgInjectNamed = std::move(items);
     }
     void clear_debug_inject_named();  // frees the device buffers
+    void apply_debug_named_inject();  // bind staged named tensors (fwd + bwd boundary handoff)
     // Restore the stack to the stage's post-init base, dropping the (preserved)
     // stage's block allocations after the boundary read — so a GPU reused for a
     // later stage starts clean. No-op if no base was captured.
@@ -246,6 +269,11 @@ public:
     bool mDbgBwdSkipFinalize = false;
     bool mDbgForceLinear = false;
     int mDbgPreserveLayer = -1;
+    bool mDbgSkipGradReduce = false;
+    bool mDbgBwdLayerFilter = false;
+    int mDbgBwdLayerLo = -1;
+    int mDbgBwdLayerHi = -1;
+    bool mDbgBwdLayerLoss = false;
     std::vector<std::pair<std::string, std::vector<std::byte>>> mDbgInjectNamed;
     std::vector<void*> mDbgInjectBuffers;  // device buffers backing mDbgInjectNamed binds
     DeviceMemoryStack::Checkpoint mDbgStageBase{};

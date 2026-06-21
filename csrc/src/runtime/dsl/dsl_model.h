@@ -123,6 +123,20 @@ public:
                                          int hi,
                                          std::vector<std::pair<std::string, std::vector<std::byte>>> inject_named,
                                          bool preserve_output);
+    // Run one backward stage (blocks [lo..hi]) on this GPU: a whole forward to
+    // provide activations, then the bounded backward for [lo..hi]. is_loss_stage
+    // (the stage owning the last block) backpropagates from the loss; otherwise
+    // inject the incoming boundary gradients (d_blocks[hi].res_att / .mlp_down).
+    // Read results via the executor debug readers (debug_block_grad_norms,
+    // debug_read_named_bytes for d_blocks[lo-1].*).
+    void dispatch_pp_debug_backward_stage(Tensor inputs,
+                                          Tensor targets,
+                                          Tensor position_ids,
+                                          NCCLCommunicator& comm,
+                                          int lo,
+                                          int hi,
+                                          bool is_loss_stage,
+                                          std::vector<std::pair<std::string, std::vector<std::byte>>> inject_named);
     // Whole-graph backward; returns per-block weight-grad L2 norms (block order).
     std::vector<float> dispatch_pp_debug_grad_norms_whole(Tensor inputs,
                                                           Tensor targets,

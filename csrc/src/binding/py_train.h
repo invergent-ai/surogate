@@ -194,6 +194,13 @@ public:
     std::vector<float> dispatch_pp_debug_forward_hidden_multigpu(const std::int32_t* inputs,
                                                                  const std::vector<int>& los,
                                                                  const std::vector<int>& his);
+    // Round-robin backward dispatch (reverse stage order) across the GPU pool,
+    // handing the boundary gradients GPU->host->GPU. Returns per-block weight-grad
+    // L2 norms collected from whichever GPU computed each block.
+    std::vector<float> dispatch_pp_debug_grad_norms_multigpu(const std::int32_t* inputs,
+                                                             const std::int32_t* targets,
+                                                             const std::vector<int>& los,
+                                                             const std::vector<int>& his);
     std::vector<std::pair<std::string, Tensor>> get_lora_gradients(int gpu_id);
     std::vector<std::pair<std::string, Tensor>> get_lora_weights(int gpu_id);
     int get_valid_token_count(int gpu_id);

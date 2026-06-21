@@ -276,6 +276,8 @@ public:
     void debug_clear_forward_op_range();
     void debug_set_backward_op_range(std::size_t lo, std::size_t hi, bool skip_init, bool skip_finalize, bool force_linear);
     void debug_clear_backward_op_range();
+    void debug_set_backward_layer_range(int lo, int hi, bool include_loss);
+    void debug_clear_backward_layer_range();
     // Final hidden state (last block output residual) flattened to host f32.
     std::vector<float> debug_last_block_hidden_f32();
     // Round-trip block ``block``'s output residual through host memory (proves a
@@ -285,6 +287,9 @@ public:
     std::vector<float> debug_block_grad_norms();
     // Keep a stage's last block live so the cross-GPU boundary can be read.
     void debug_set_preserve_layer(int layer);
+    // Skip the per-layer cross-GPU gradient all-reduce (debug backward runs one GPU
+    // at a time on the full batch; an all-reduce would deadlock).
+    void debug_set_skip_grad_reduce(bool skip);
     // Read a named graph tensor's raw device bytes to host (empty if absent), and
     // stage/clear named boundary tensors to bind on the next forward (cross-GPU
     // handoff). debug_restore_stage_base drops a preserved stage's allocations.
@@ -451,6 +456,9 @@ private:
     // Compiled execution (operations pre-compiled into direct function calls)
     // ========================================================================
     std::unique_ptr<GraphCompiler> mCompiler;
+    // dispatch-PP debug: skip the wrapper-level cross-GPU grad/loss all-reduce when
+    // running one GPU on the full batch (it would deadlock waiting for idle GPUs).
+    bool mDbgSkipGradReduce = false;
     std::unique_ptr<CompiledExecutor> mCompiledExecutor;
     std::unique_ptr<CompiledGraph> mCompiledForward;
     std::unique_ptr<CompiledGraph> mCompiledBackward;

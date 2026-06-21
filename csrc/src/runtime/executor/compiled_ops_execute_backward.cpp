@@ -657,6 +657,11 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     bind_runtime_bindings();
     bind_param_gradient_tensors_for_backward();
 
+    // dispatch-PP debug: cross-GPU gradient handoff. Bind the incoming boundary
+    // gradients (d_blocks[hi].res_att / d_blocks[hi].mlp_down) produced by the
+    // higher stage's backward on another GPU, into this stage's backward graph.
+    apply_debug_named_inject();
+
     auto is_grad_ref = [](const TensorRef& ref) -> bool {
         if (!ref.name.empty() && ref.name.size() > 2 && ref.name[0] == 'd' && ref.name[1] == '_') {
             return true;
@@ -1131,7 +1136,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 offload_payload.sync_event = mRunState.side_stream_event();
                 offload_payload.capturing = capturing;
                 dispatch_schema_layer_hooks(HookEventKind::AfterAllReduce, L, &offload_payload);
-                if (!offload_payload.offloaded && mComm && mComm->world_size() > 1) {
+                if (!offload_payload.offloaded && mComm && mComm->world_size() > 1 && !mDbgSkipGradReduce) {
                     CUDA_CHECK(cudaEventRecord(mRunState.side_stream_event(), mRunState.MainStream));
                     CUDA_CHECK(cudaStreamWaitEvent(mRunState.side_stream(), mRunState.side_stream_event(), 0));
                     mGrads.reduce_layer_grads(L, mRunState.side_stream(), *mComm);
@@ -1139,7 +1144,7 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                 if (!offload_payload.offloaded) {
                     mGrads.offload_layer_grads(L, mRunState.MainStream, mRunState.side_stream());
                 }
-            } else if (mComm && mComm->world_size() > 1) {
+            } else if (mComm && mComm->world_size() > 1 && !mDbgSkipGradReduce) {
                 CUDA_CHECK(cudaEventRecord(mRunState.side_stream_event(), mRunState.MainStream));
                 CUDA_CHECK(cudaStreamWaitEvent(mRunState.side_stream(), mRunState.side_stream_event(), 0));
                 mGrads.notify_block(L, mRunState.side_stream(), *mComm);
@@ -1295,6 +1300,18 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         // dispatch-PP debug: restrict this segment to a contiguous op range.
         if (idx < mDbgBwdOpLo || idx >= mDbgBwdOpHi) {
             continue;
+        }
+        // dispatch-PP debug: restrict this stage to the ops owning blocks
+        // [LayerLo..LayerHi] by their layer attribution (the boundary view ops sit
+        // exactly on their block, so this has no inter-stage gaps). Loss/lm-head
+        // ops (layer < 0) run only in the loss-owning stage.
+        if (mDbgBwdLayerFilter) {
+            const bool in_stage = (op_layer_any < 0)
+                                      ? mDbgBwdLayerLoss
+                                      : (op_layer_any >= mDbgBwdLayerLo && op_layer_any <= mDbgBwdLayerHi);
+            if (!in_stage) {
+                continue;
+            }
         }
 
         bool bwd_filter_matched = false;

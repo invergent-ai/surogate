@@ -1145,16 +1145,119 @@ void DslModel::dispatch_pp_debug_forward_stage(Tensor inputs,
     ge->debug_clear_inject_named();
 }
 
+void DslModel::dispatch_pp_debug_backward_stage(
+    Tensor inputs,
+    Tensor targets,
+    Tensor position_ids,
+    NCCLCommunicator& comm,
+    int lo,
+    int hi,
+    bool is_loss_stage,
+    std::vector<std::pair<std::string, std::vector<std::byte>>> inject_named) {
+    if (lora_enabled()) {
+        throw std::runtime_error("dispatch_pp_debug_backward_stage: BF16 full-FT only (no LoRA)");
+    }
+    GraphExecutor* ge = graph_executor();
+    if (!ge) {
+        throw std::runtime_error("dispatch_pp_debug_backward_stage: requires the DSL GraphExecutor");
+    }
+    const long B = inputs.Sizes[0];
+    const long T = inputs.Sizes[1];
+
+    ge->ensure_graphs_compiled(B, T);
+    const CompiledGraph* fwd = ge->compiled_forward();
+    const CompiledGraph* bwd = ge->compiled_backward();
+    if (!fwd || !bwd) {
+        throw std::runtime_error("dispatch_pp_debug_backward_stage: graphs not compiled");
+    }
+    // Provide this GPU's forward activations (and saved inputs for recompute) for
+    // the blocks this stage will backprop. A whole forced-eager forward is the
+    // simplest correct source (the stream-driven path issues per-rank collectives
+    // that deadlock on a single GPU); recompute-only provisioning is a later
+    // optimization.
+    ge->debug_set_forward_op_range(0, fwd->ops.size(), /*skip_init=*/false, /*skip_finalize=*/false,
+                                   /*force_linear=*/true);
+    {
+        auto fwd_request =
+            causal_lm_profile().make_forward_request(*mRunState, mModelConfig, mOptions, inputs, position_ids, 0);
+        mExecutor->execute_forward(fwd_request, comm);
+    }
+    ge->debug_clear_forward_op_range();
+    const int num_layers = static_cast<int>(mModelConfig.NumLayers);
+    if (lo < 0 || hi < lo || hi >= num_layers) {
+        throw std::runtime_error("dispatch_pp_debug_backward_stage: invalid block range");
+    }
+
+    if (!inject_named.empty()) {
+        ge->debug_set_inject_named(std::move(inject_named));
+    }
+    // One GPU per stage on the full batch; skip the DDP grad all-reduce.
+    ge->debug_set_skip_grad_reduce(true);
+    // Select this stage's ops by their owning block layer [lo..hi] (the loss-owning
+    // stage also runs the lm-head/loss ops). This is robust to boundary view ops
+    // (e.g. d_blocks[L].mlp_down -> .mlp_down_flat) whose op index sits between
+    // layer_end[L+1] and layer_start[L]: by layer they belong to block L and so
+    // run in block L's stage with no inter-stage gap. The op-index range stays
+    // full; skip_finalize keeps the stage's input-boundary gradients
+    // (d_blocks[lo-1].*) resident for the next (lower) stage's read.
+    ge->debug_set_backward_op_range(0, bwd->ops.size(), /*skip_init=*/false, /*skip_finalize=*/true,
+                                    /*force_linear=*/true);
+    ge->debug_set_backward_layer_range(lo, hi, is_loss_stage);
+    {
+        auto request =
+            causal_lm_profile().make_backward_request(*mRunState, mModelConfig, mOptions, inputs, targets, 1, 0);
+        // One GPU holds the full batch; skip the DP loss/valid-token all-reduce
+        // (it would deadlock waiting for idle GPUs).
+        request.reduce_loss_on_completion = false;
+        mExecutor->execute_backward(request, comm);
+    }
+    ge->debug_clear_backward_op_range();
+    ge->debug_clear_backward_layer_range();
+    ge->debug_clear_inject_named();
+    ge->debug_set_skip_grad_reduce(false);
+}
+
 std::vector<float> DslModel::dispatch_pp_debug_grad_norms_whole(Tensor inputs,
                                                                Tensor targets,
                                                                Tensor position_ids,
                                                                NCCLCommunicator& comm) {
-    forward(inputs, position_ids, comm, /*micro_step=*/0);
-    backward(inputs, targets, comm, /*grad_accum_steps=*/1, /*micro_step=*/0);
     GraphExecutor* ge = graph_executor();
     if (!ge) {
         throw std::runtime_error("dispatch_pp_debug_grad_norms_whole: requires the DSL GraphExecutor");
     }
+    const long B = inputs.Sizes[0];
+    const long T = inputs.Sizes[1];
+    ge->ensure_graphs_compiled(B, T);
+    const CompiledGraph* fwd = ge->compiled_forward();
+    const CompiledGraph* bwd = ge->compiled_backward();
+    if (!fwd || !bwd) {
+        throw std::runtime_error("dispatch_pp_debug_grad_norms_whole: graphs not compiled");
+    }
+    // Run on one GPU over the full batch through the forced-eager (non-stream-driven)
+    // path: the stream-driven schedule issues per-rank weight/grad collectives that
+    // would deadlock here (only this GPU participates). Also skip the DDP grad
+    // all-reduce for the same reason.
+    ge->debug_set_skip_grad_reduce(true);
+    ge->debug_set_forward_op_range(0, fwd->ops.size(), /*skip_init=*/false, /*skip_finalize=*/false,
+                                   /*force_linear=*/true);
+    {
+        auto request =
+            causal_lm_profile().make_forward_request(*mRunState, mModelConfig, mOptions, inputs, position_ids, 0);
+        mExecutor->execute_forward(request, comm);
+    }
+    ge->debug_clear_forward_op_range();
+    ge->debug_set_backward_op_range(0, bwd->ops.size(), /*skip_init=*/false, /*skip_finalize=*/false,
+                                    /*force_linear=*/true);
+    {
+        auto request =
+            causal_lm_profile().make_backward_request(*mRunState, mModelConfig, mOptions, inputs, targets, 1, 0);
+        // One GPU holds the full batch; skip the DP loss/valid-token all-reduce
+        // (it would deadlock waiting for idle GPUs).
+        request.reduce_loss_on_completion = false;
+        mExecutor->execute_backward(request, comm);
+    }
+    ge->debug_clear_backward_op_range();
+    ge->debug_set_skip_grad_reduce(false);
     return ge->debug_block_grad_norms();
 }
 
@@ -1170,16 +1273,28 @@ std::vector<float> DslModel::dispatch_pp_debug_grad_norms_subranges(Tensor input
     if (!ge) {
         throw std::runtime_error("dispatch_pp_debug_grad_norms_subranges: requires the DSL GraphExecutor");
     }
-    // Whole-graph forward saves the activations the backward pass consumes.
-    forward(inputs, position_ids, comm, /*micro_step=*/0);
+    // One GPU, full batch; skip the DDP grad all-reduce (deadlocks on multi-GPU).
+    ge->debug_set_skip_grad_reduce(true);
 
     const long B = inputs.Sizes[0];
     const long T = inputs.Sizes[1];
     ge->ensure_graphs_compiled(B, T);
+    const CompiledGraph* fwd = ge->compiled_forward();
     const CompiledGraph* bwd = ge->compiled_backward();
-    if (!bwd) {
-        throw std::runtime_error("dispatch_pp_debug_grad_norms_subranges: backward graph not compiled");
+    if (!fwd || !bwd) {
+        throw std::runtime_error("dispatch_pp_debug_grad_norms_subranges: graphs not compiled");
     }
+    // Whole-graph forward (forced-eager: the stream-driven path issues per-rank
+    // collectives that deadlock on a single GPU) saves the activations the backward
+    // consumes.
+    ge->debug_set_forward_op_range(0, fwd->ops.size(), /*skip_init=*/false, /*skip_finalize=*/false,
+                                   /*force_linear=*/true);
+    {
+        auto request =
+            causal_lm_profile().make_forward_request(*mRunState, mModelConfig, mOptions, inputs, position_ids, 0);
+        mExecutor->execute_forward(request, comm);
+    }
+    ge->debug_clear_forward_op_range();
     const int num_layers = static_cast<int>(mModelConfig.NumLayers);
     if (split_after_block < 0 || split_after_block >= num_layers - 1) {
         throw std::runtime_error("dispatch_pp_debug_grad_norms_subranges: split must be in [0, num_layers-2]");
@@ -1201,9 +1316,13 @@ std::vector<float> DslModel::dispatch_pp_debug_grad_norms_subranges(Tensor input
     {
         auto request =
             causal_lm_profile().make_backward_request(*mRunState, mModelConfig, mOptions, inputs, targets, 1, 0);
+        // One GPU holds the full batch; skip the DP loss/valid-token all-reduce
+        // (it would deadlock waiting for idle GPUs).
+        request.reduce_loss_on_completion = false;
         mExecutor->execute_backward(request, comm);
     }
     ge->debug_clear_backward_op_range();
+    ge->debug_set_skip_grad_reduce(false);
 
     return ge->debug_block_grad_norms();
 }
