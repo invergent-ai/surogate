@@ -755,6 +755,20 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
             )
             self.use_cuda_graphs = False
 
+        # Dispatch-PP is CPU-resident-masters + per-stage weight streaming: the
+        # work-weights live in pinned CPU RAM and are gathered to the GPU per block,
+        # so the full model never sits resident. Enable the offload path (mirrors
+        # cpu_training's mapping) — without it import_weights loads every weight onto
+        # the GPU and OOMs on any model large enough to need dispatch-PP.
+        if not self.offload_master:
+            logger.info("[dispatch_pp]: enabling offload_master (weights stream from pinned CPU per stage).")
+        self.offload_master = True
+        if not self.lora and not self.offload_grads:
+            # Full fine-tune: stream gradients to CPU as well (LoRA grads are small and
+            # stay on the GPU).
+            logger.info("[dispatch_pp]: enabling offload_grads for full fine-tune.")
+            self.offload_grads = True
+
     def _validate_ep_config(self):
         """Validate Expert Parallelism configuration."""
         if self.ep_size is None or self.ep_size <= 1:
