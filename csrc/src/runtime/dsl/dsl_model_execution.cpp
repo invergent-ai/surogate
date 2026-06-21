@@ -1218,7 +1218,9 @@ void DslModel::dispatch_pp_backward_stage(
     // (d_blocks[lo-1].*) resident for the next (lower) stage's read.
     ge->debug_set_backward_op_range(0, bwd->ops.size(), /*skip_init=*/false, /*skip_finalize=*/true,
                                     /*force_linear=*/true);
-    ge->debug_set_backward_layer_range(lo, hi, is_loss_stage);
+    // The loss-owning stage runs the leading loss/lm-head ops; the lowest stage
+    // (lo == 0) runs the trailing embedding-backward op so its gradient is computed.
+    ge->debug_set_backward_layer_range(lo, hi, /*include_loss=*/is_loss_stage, /*include_embed=*/lo == 0);
     {
         auto request =
             causal_lm_profile().make_backward_request(*mRunState, mModelConfig, mOptions, inputs, targets, 1, 0);
@@ -1354,7 +1356,7 @@ std::vector<std::byte> dbg_tensor_bytes_to_host(const Tensor& t, cudaStream_t st
 }  // namespace
 
 std::vector<std::pair<std::string, std::vector<std::byte>>>
-DslModel::dispatch_pp_read_block_grads(int lo, int hi, bool include_nonblock) {
+DslModel::dispatch_pp_read_block_grads(int lo, int hi, bool include_head, bool include_embed) {
     std::vector<std::pair<std::string, std::vector<std::byte>>> out;
     if (!mGrads) return out;
     cudaStream_t stream = mRunState->MainStream;
@@ -1362,8 +1364,10 @@ DslModel::dispatch_pp_read_block_grads(int lo, int hi, bool include_nonblock) {
         bool wanted = false;
         if (param_is_any_block(name)) {
             for (int L = lo; L <= hi && !wanted; ++L) wanted = param_is_block(name, L);
+        } else if (name.find("embed") != std::string::npos) {
+            wanted = include_embed;  // computed by the lowest stage's embedding backward
         } else {
-            wanted = include_nonblock;  // lm_head / final norm (embedding stays frozen)
+            wanted = include_head;  // lm_head / final norm, computed by the loss stage
         }
         if (!wanted) continue;
         bool accumulate = false;

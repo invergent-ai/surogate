@@ -1291,6 +1291,20 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         }
     }
 
+    // dispatch-PP debug: op-index bounds of the transformer-block region, so a
+    // layer<0 op can be classed as a *leading* loss/lm-head op (before the blocks)
+    // or a *trailing* embedding op (after them). Backward visits blocks high->low.
+    std::size_t dbg_first_block_op = graph.ops.size();
+    std::size_t dbg_last_block_op = 0;
+    if (mDbgBwdLayerFilter) {
+        for (std::size_t i = 0; i < graph.ops.size(); ++i) {
+            if (op_layer_idx_any(graph.ops[i]) >= 0) {
+                dbg_first_block_op = std::min(dbg_first_block_op, i);
+                dbg_last_block_op = std::max(dbg_last_block_op, i);
+            }
+        }
+    }
+
     for (std::size_t idx = 0; !bwd_stream_driven && idx < graph.ops.size(); ++idx) {
         const auto& op = graph.ops[idx];
         const int op_layer_any = op_layer_idx_any(op);
@@ -1302,13 +1316,19 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
             continue;
         }
         // dispatch-PP debug: restrict this stage to the ops owning blocks
-        // [LayerLo..LayerHi] by their layer attribution (the boundary view ops sit
-        // exactly on their block, so this has no inter-stage gaps). Loss/lm-head
-        // ops (layer < 0) run only in the loss-owning stage.
+        // [LayerLo..LayerHi] by their layer attribution (boundary view ops sit on
+        // their block, so no inter-stage gaps). layer<0 ops are split by position:
+        // leading loss/lm-head ops -> the loss-owning stage; the trailing embedding
+        // op -> the lowest stage (so the embedding gradient is not dropped).
         if (mDbgBwdLayerFilter) {
-            const bool in_stage = (op_layer_any < 0)
-                                      ? mDbgBwdLayerLoss
-                                      : (op_layer_any >= mDbgBwdLayerLo && op_layer_any <= mDbgBwdLayerHi);
+            bool in_stage;
+            if (op_layer_any >= 0) {
+                in_stage = (op_layer_any >= mDbgBwdLayerLo && op_layer_any <= mDbgBwdLayerHi);
+            } else {
+                const bool leading = idx < dbg_first_block_op;
+                const bool trailing = idx > dbg_last_block_op;
+                in_stage = (leading && mDbgBwdLayerLoss) || (trailing && mDbgBwdLayerEmbed);
+            }
             if (!in_stage) {
                 continue;
             }

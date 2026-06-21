@@ -157,7 +157,7 @@ public:
     // include_nonblock, the non-block params: lm_head / final norm) to host,
     // keyed by parameter name. The cross-GPU grad collection for the fused step.
     std::vector<std::pair<std::string, std::vector<std::byte>>> dispatch_pp_read_block_grads(
-        int lo, int hi, bool include_nonblock);
+        int lo, int hi, bool include_head, bool include_embed);
     // Write gradients from host into the grad store by name (host -> device).
     void dispatch_pp_write_grads(const std::vector<std::pair<std::string, std::vector<std::byte>>>& items);
     // Read / write every parameter weight to / from host (the master broadcast).

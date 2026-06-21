@@ -533,10 +533,12 @@ Front-loads the biggest unknown so we fail fast if the engine cannot do sub-rang
     deadlocked otherwise): the collecting GPU's optimizer must skip the DDP grad/norm all-reduce
     (`mDispatchPpLocalGrads` — grads are already complete locally), and the loss is read by summing the
     per-token `Losses` buffer locally (the dispatch backward skips `reduce_loss`, so `LossHost`/
-    `ValidTokenCount` are unset). The input embedding is left frozen (the layer-attribution filter
-    doesn't route the trailing embedding-backward op to a stage), which doesn't affect convergence on a
-    fixed batch. Test: `tests/train/dispatch_pp/test_phase3_train_step_multigpu.py`.
-    Still ahead: route the embedding-backward op to the lowest stage (unfreeze embedding); replace the
+    `ValidTokenCount` are unset). Every parameter trains: the layer-attribution filter routes the
+    *trailing* embedding-backward op (layer < 0, after the blocks) to the lowest stage and the *leading*
+    loss/lm-head ops to the loss-owning stage; grad collection routes `embedding` from the lowest stage,
+    `lm_head`/`final_norm` from the loss stage. Test:
+    `tests/train/dispatch_pp/test_phase3_train_step_multigpu.py`.
+    Still ahead: replace the
     GPU-0-collect + broadcast with the **CPU-master async-stale** path (wire the `AsyncOptimizer` worker
     in, per-layer `param_copied`/`grad_copied` release) and the converges-with-overlap staleness test;
     fold streaming into the dispatch step so it is memory-scaling as well as consistent.

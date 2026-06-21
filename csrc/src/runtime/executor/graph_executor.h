@@ -276,7 +276,7 @@ public:
     void debug_clear_forward_op_range();
     void debug_set_backward_op_range(std::size_t lo, std::size_t hi, bool skip_init, bool skip_finalize, bool force_linear);
     void debug_clear_backward_op_range();
-    void debug_set_backward_layer_range(int lo, int hi, bool include_loss);
+    void debug_set_backward_layer_range(int lo, int hi, bool include_loss, bool include_embed);
     void debug_clear_backward_layer_range();
     // Final hidden state (last block output residual) flattened to host f32.
     std::vector<float> debug_last_block_hidden_f32();

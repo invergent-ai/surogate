@@ -7,9 +7,9 @@ the optimizer there, then **broadcasts** the updated weights back to every repli
 the pool stays consistent for the next step. Repeated on a fixed batch the loss must
 fall — proving multi-GPU dispatch training with cross-GPU weight consistency.
 
-(The input embedding is left frozen — the dispatch backward's layer-attribution
-filter doesn't route the trailing embedding-backward op to a stage — which does not
-affect convergence on a fixed batch; the transformer blocks + output head train.)
+(Every parameter trains: the lowest stage runs the trailing embedding-backward op and
+collects its gradient, the loss-owning stage collects lm_head / final_norm, and each
+block's gradients come from its own stage.)
 """
 
 import json

@@ -1998,8 +1998,8 @@ void GraphExecutor::debug_set_backward_op_range(
 void GraphExecutor::debug_clear_backward_op_range() {
     if (mCompiledExecutor) mCompiledExecutor->clear_debug_backward_op_range();
 }
-void GraphExecutor::debug_set_backward_layer_range(int lo, int hi, bool include_loss) {
-    if (mCompiledExecutor) mCompiledExecutor->set_debug_backward_layer_range(lo, hi, include_loss);
+void GraphExecutor::debug_set_backward_layer_range(int lo, int hi, bool include_loss, bool include_embed) {
+    if (mCompiledExecutor) mCompiledExecutor->set_debug_backward_layer_range(lo, hi, include_loss, include_embed);
 }
 void GraphExecutor::debug_clear_backward_layer_range() {
     if (mCompiledExecutor) mCompiledExecutor->clear_debug_backward_layer_range();

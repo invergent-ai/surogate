@@ -2151,7 +2151,8 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
                                                         is_loss,
                                                         std::move(inject));
                 if (is_loss) stage_loss = model->dispatch_pp_raw_loss();
-                stage_grads = model->dispatch_pp_read_block_grads(lo, hi, /*include_nonblock=*/is_loss);
+                stage_grads = model->dispatch_pp_read_block_grads(lo, hi, /*include_head=*/is_loss,
+                                                                  /*include_embed=*/lo == 0);
                 auto* ge = model->graph_executor();
                 if (lo > 0) {
                     const std::string rn = "d_blocks[" + std::to_string(lo - 1) + "].res_att";

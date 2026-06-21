@@ -213,10 +213,11 @@ public:
     // attribution (robust to layer_start/end_indices not aligning with boundary
     // view ops). include_loss also runs the loss/lm-head ops (layer < 0). This is
     // the dispatch-PP stage selector; it composes with the op-index range above.
-    void set_debug_backward_layer_range(int lo, int hi, bool include_loss) {
+    void set_debug_backward_layer_range(int lo, int hi, bool include_loss, bool include_embed) {
         mDbgBwdLayerLo = lo;
         mDbgBwdLayerHi = hi;
         mDbgBwdLayerLoss = include_loss;
+        mDbgBwdLayerEmbed = include_embed;
         mDbgBwdLayerFilter = true;
     }
     void clear_debug_backward_layer_range() {
@@ -224,6 +225,7 @@ public:
         mDbgBwdLayerLo = -1;
         mDbgBwdLayerHi = -1;
         mDbgBwdLayerLoss = false;
+        mDbgBwdLayerEmbed = false;
     }
     // Inject a host residual into get_residual(layer) after forward init, before
     // the op loop — the cross-GPU activation handoff for the dispatch-PP pool. A
@@ -274,6 +276,7 @@ public:
     int mDbgBwdLayerLo = -1;
     int mDbgBwdLayerHi = -1;
     bool mDbgBwdLayerLoss = false;
+    bool mDbgBwdLayerEmbed = false;
     std::vector<std::pair<std::string, std::vector<std::byte>>> mDbgInjectNamed;
     std::vector<void*> mDbgInjectBuffers;  // device buffers backing mDbgInjectNamed binds
     DeviceMemoryStack::Checkpoint mDbgStageBase{};
