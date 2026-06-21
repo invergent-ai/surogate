@@ -271,6 +271,16 @@ void DslWeightManager::allocate_weights(const Module& module,
             // For legacy offload_master: only block weights go to pinned CPU.
             if (entry.is_block || mConfig.cpu_training) {
                 master_alloc = EAllocationType::PINNED;
+            } else if (freeze_base) {
+                // LoRA + offload_master (dispatch-PP): the non-block base
+                // (embedding / lm_head / final_norm) is FROZEN -- its master is read
+                // once to populate the bf16 work copy, then never again (no optimizer
+                // state). Keep it in pinned CPU so it doesn't occupy GPU memory; the
+                // resident work copy is what compute uses. This frees ~the non-block
+                // master bytes (several GB for a large-vocab model), making room for a
+                // resident stage so the dispatch scheduler can amortize its weight
+                // stream across microbatches.
+                master_alloc = EAllocationType::PINNED;
             }
         }
 
