@@ -23,7 +23,7 @@ Updated before each commit. Status: ☐ not started · ◐ in progress · ☑ do
 - ☑ Task 7 — LoRA `needs_grad` propagation + NUMA placement
 - ☑ Task 8 — Config plumbing + validation in `SFTConfig`
 - ☑ Task 9 — Phase-0 `GraphExecutor` sub-range execution gate (verdict: PASS)
-- ◐ Task 10 — Full-suite run + record Phase-0 verdict
+- ☑ Task 10 — Full-suite run + record Phase-0 verdict
 
 ## Review Update — 2026-06-21
 
