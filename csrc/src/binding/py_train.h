@@ -180,6 +180,14 @@ public:
     /// the rank did not resize (either not worth it or stack unused).
     std::vector<std::pair<long, long>> shrink_stack_after_warmup(long safety_bytes, long min_savings_bytes);
     std::vector<std::pair<std::string, Tensor>> get_gradients(int gpu_id);
+
+    // ---- Debug-only dispatch-PP sub-range parity (GPU 0, resident weights) -
+    std::vector<float> dispatch_pp_debug_forward_hidden(const std::int32_t* inputs);
+    std::vector<float> dispatch_pp_debug_forward_subranges(const std::int32_t* inputs, int split_after_block);
+    std::vector<float> dispatch_pp_debug_grad_norms_whole(const std::int32_t* inputs, const std::int32_t* targets);
+    std::vector<float> dispatch_pp_debug_grad_norms_subranges(const std::int32_t* inputs,
+                                                              const std::int32_t* targets,
+                                                              int split_after_block);
     std::vector<std::pair<std::string, Tensor>> get_lora_gradients(int gpu_id);
     std::vector<std::pair<std::string, Tensor>> get_lora_weights(int gpu_id);
     int get_valid_token_count(int gpu_id);

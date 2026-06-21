@@ -18,6 +18,7 @@
 #include <fmt/format.h>
 
 #include "py_train.h"
+#include "runtime/executor/dispatch_pp_phase0.h"
 #include "runtime/training/dataloader.h"
 #include "runtime/training/checkpoint.h"
 #include "runtime/training/logging.h"
@@ -1346,6 +1347,47 @@ NB_MODULE(_surogate, m) {
             "- inputs: int32 token ids shaped [batch_size * local_gpus, seq_length].\n"
             "- targets: int32 token ids shaped [batch_size * local_gpus, seq_length].\n"
             "- position_ids: int32 position ids shaped [batch_size * local_gpus, seq_length].")
+        .def(
+            "dispatch_pp_debug_forward_hidden",
+            [](MultiGPUPyTrainer* trainer, TokenArray inputs) {
+                CHECK_SHAPE(inputs, trainer->batch_size(), trainer->seq_length());
+                return dsl::dispatch_pp_phase0::forward_hidden_whole(*trainer, inputs.data());
+            },
+            nb::arg("inputs"),
+            "Debug-only dispatch-PP: whole-graph forward; returns the final hidden state as a flat f32 list.")
+        .def(
+            "dispatch_pp_debug_forward_subranges",
+            [](MultiGPUPyTrainer* trainer, TokenArray inputs, int split_after_block) {
+                CHECK_SHAPE(inputs, trainer->batch_size(), trainer->seq_length());
+                return dsl::dispatch_pp_phase0::forward_hidden_subranges(*trainer, inputs.data(), split_after_block);
+            },
+            nb::arg("inputs"),
+            nb::arg("split_after_block"),
+            "Debug-only dispatch-PP: forward as two contiguous block sub-ranges with a CPU-boundary "
+            "handoff; returns the final hidden state as a flat f32 list.")
+        .def(
+            "dispatch_pp_debug_grad_norms_whole",
+            [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets) {
+                CHECK_SHAPE(inputs, trainer->batch_size(), trainer->seq_length());
+                CHECK_SHAPE(targets, trainer->batch_size(), trainer->seq_length());
+                return dsl::dispatch_pp_phase0::grad_norms_whole(*trainer, inputs.data(), targets.data());
+            },
+            nb::arg("inputs"),
+            nb::arg("targets"),
+            "Debug-only dispatch-PP: whole-graph backward; returns per-block weight-grad L2 norms.")
+        .def(
+            "dispatch_pp_debug_grad_norms_subranges",
+            [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets, int split_after_block) {
+                CHECK_SHAPE(inputs, trainer->batch_size(), trainer->seq_length());
+                CHECK_SHAPE(targets, trainer->batch_size(), trainer->seq_length());
+                return dsl::dispatch_pp_phase0::grad_norms_subranges(
+                    *trainer, inputs.data(), targets.data(), split_after_block);
+            },
+            nb::arg("inputs"),
+            nb::arg("targets"),
+            nb::arg("split_after_block"),
+            "Debug-only dispatch-PP: backward as two contiguous block sub-ranges with a CPU-boundary "
+            "grad handoff; returns per-block weight-grad L2 norms.")
         .def(
             "step",
             [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets, TokenArray3 position_ids) {

@@ -268,6 +268,22 @@ public:
         compile_graphs(B, T);
     }
 
+    // ---- Debug-only dispatch-PP sub-range parity helpers ------------------
+    // Drive bounded forward/backward op-range segments on the compiled
+    // executor, read the resident hidden state, and round-trip the inter-block
+    // residual/gradient through host memory. Resident weights, eager mode only.
+    void debug_set_forward_op_range(std::size_t lo, std::size_t hi, bool skip_init, bool skip_finalize, bool force_linear);
+    void debug_clear_forward_op_range();
+    void debug_set_backward_op_range(std::size_t lo, std::size_t hi, bool skip_init, bool skip_finalize, bool force_linear);
+    void debug_clear_backward_op_range();
+    // Final hidden state (last block output residual) flattened to host f32.
+    std::vector<float> debug_last_block_hidden_f32();
+    // Round-trip block ``block``'s output residual through host memory (proves a
+    // CPU-boundary activation handoff between contiguous sub-range segments).
+    void debug_roundtrip_block_residual(int block);
+    // Per-block weight-grad L2 norms in ascending block order.
+    std::vector<float> debug_block_grad_norms();
+
     /// Set document masking context for Flash Attention varlen dispatch.
     /// cu_seqlens_cpu: (num_docs + 1,) int32 cumulative token offsets on CPU.
     /// Copies to GPU and propagates to CompiledExecutor. The micro_step

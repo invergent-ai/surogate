@@ -592,16 +592,26 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                                         int micro_step,
                                         const modules::BackwardHook* hook,
                                         bool skip_zeroing) {
-    initialize_backward_execution(graph, comm, micro_step);
-    restore_forward_snapshot_for_backward(graph);
+    // dispatch-PP debug: a resumed sub-range segment shares the prior segment's
+    // backward state. Skip only the steps that would discard it — clearing the
+    // live tensors (initialize), overwriting them with the forward snapshot
+    // (restore), and re-zeroing already-accumulated gradients. The binding steps
+    // are idempotent and MUST re-run so the resumed segment's ops can resolve
+    // their grad-output slots.
+    if (!mDbgBwdSkipInit) {
+        initialize_backward_execution(graph, comm, micro_step);
+        restore_forward_snapshot_for_backward(graph);
+    }
 
-    // Seed mTensors[tid] with arena pointers for every block-scope
-    // gradient slot (and build the zero-list on first compile).
+    // Seed mTensors[tid] with arena pointers for every block-scope gradient slot
+    // (and build the zero-list on first compile).
     populate_bwd_stack_bindings(graph);
 
     bind_runtime_bindings();
     bind_saved_tensors_for_backward();
-    zero_backward_entry_gradients(skip_zeroing);
+    if (!mDbgBwdSkipInit) {
+        zero_backward_entry_gradients(skip_zeroing);
+    }
     gather_backward_non_block_weights(comm);
     prefetch_backward_last_layer(comm);
 
@@ -1028,8 +1038,8 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     // Stream-driven backward execution (flag-gated pass-through mode).
     // Minimal: no tiled MLP, no capture, no recompute, no bwd_filter / watch /
     // op_profile — matches the Llama-only scope of the forward stream path.
-    const bool bwd_stream_driven =
-        !graph.instruction_stream.empty() && !bwd_stream_capturing && bwd_tile_group_starts.empty();
+    const bool bwd_stream_driven = !graph.instruction_stream.empty() && !bwd_stream_capturing &&
+                                   bwd_tile_group_starts.empty() && !mDbgForceLinear;
 
     // Per-op layer-end cleanup (shared between SegmentDispatch inline and
     // PhaseExit BwdBlock). Mirrors the flat-ops layer-end handler at lines
@@ -1280,6 +1290,10 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         const auto& op = graph.ops[idx];
         const int op_layer_any = op_layer_idx_any(op);
         if (skip_profile_backward_tensors && is_skipped_backward_op(op)) {
+            continue;
+        }
+        // dispatch-PP debug: restrict this segment to a contiguous op range.
+        if (idx < mDbgBwdOpLo || idx >= mDbgBwdOpHi) {
             continue;
         }
 
@@ -1564,6 +1578,13 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
 
     if (op_profile) {
         report_backward_op_profile(op_profile_total_ms, op_profile_counts, op_profile_start, op_profile_end);
+    }
+
+    // dispatch-PP debug: a following sub-range segment resumes on this state, so
+    // keep the stack, accumulated gradients, and weights intact until the final
+    // segment runs the normal cleanup.
+    if (mDbgBwdSkipFinalize) {
+        return;
     }
 
     cleanup_backward_replay_buffers();

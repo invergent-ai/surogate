@@ -7,6 +7,7 @@
 #include "runtime/dsl/autodiff.h"
 #include "runtime/dsl/buffer_plan.h"
 #include "runtime/executor/compiled_ops.h"
+#include "runtime/dsl/dsl_grad_store.h"
 #include "runtime/dsl/dsl_runtime.h"
 #include "runtime/dsl/tensor_role.h"
 #include "runtime/dsl/tensor_slot_dispatch.h"
@@ -17,6 +18,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1925,6 +1927,135 @@ void GraphExecutor::clear_doc_masking() {
     mDocMaskingMaxSeqlen = 0;
     mDocMaskingTotalQ = 0;
     // Keep GPU buffer allocated for reuse (freed in destructor)
+}
+
+// ---- Debug-only dispatch-PP sub-range parity helpers ----------------------
+namespace {
+
+// Resident output-residual buffer of a transformer block, mirroring the
+// fallback chain in resolve_last_block_output (BlockHOut, then MLPDown, then
+// ResidualAtt). This is the hidden state handed block -> block.
+Tensor* dbg_block_residual_out(DslRunState& rs, int layer) {
+    if (Tensor* t = block_activation_ptr(rs, layer, TensorSlot::BlockHOut); t && t->Data) return t;
+    if (Tensor* t = block_activation_ptr(rs, layer, TensorSlot::BlockMLPDown); t && t->Data) return t;
+    if (Tensor* t = block_activation_ptr(rs, layer, TensorSlot::BlockResidualAtt); t && t->Data) return t;
+    return nullptr;
+}
+
+// Copy a device tensor (BF16 or FP32) to a host float32 vector.
+std::vector<float> dbg_tensor_to_host_f32(const Tensor& t, cudaStream_t stream) {
+    const std::size_t n = t.nelem();
+    std::vector<float> out(n, 0.0f);
+    if (n == 0 || !t.Data) return out;
+    if (t.DType == ETensorDType::FP32) {
+        CUDA_CHECK(cudaMemcpyAsync(out.data(), t.Data, n * sizeof(float), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    } else if (t.DType == ETensorDType::BF16) {
+        std::vector<std::uint16_t> tmp(n);
+        CUDA_CHECK(cudaMemcpyAsync(tmp.data(), t.Data, n * sizeof(std::uint16_t), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        for (std::size_t i = 0; i < n; ++i) {
+            std::uint32_t bits = static_cast<std::uint32_t>(tmp[i]) << 16;
+            float f;
+            std::memcpy(&f, &bits, sizeof(f));
+            out[i] = f;
+        }
+    } else {
+        throw std::runtime_error("dispatch-PP debug: unsupported tensor dtype for host copy");
+    }
+    return out;
+}
+
+// Round-trip a tensor's raw device bytes through host memory (D2H then H2D into
+// the same buffer) — proves the value survives a CPU-boundary handoff.
+void dbg_roundtrip_through_host(Tensor& t, cudaStream_t stream) {
+    const std::size_t bytes = t.bytes();
+    if (bytes == 0 || !t.Data) {
+        throw std::runtime_error("dispatch-PP debug: empty tensor for host round-trip");
+    }
+    std::vector<std::byte> host(bytes);
+    CUDA_CHECK(cudaMemcpyAsync(host.data(), t.Data, bytes, cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaMemcpyAsync(t.Data, host.data(), bytes, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
+}  // namespace
+
+void GraphExecutor::debug_set_forward_op_range(
+    std::size_t lo, std::size_t hi, bool skip_init, bool skip_finalize, bool force_linear) {
+    if (mCompiledExecutor)
+        mCompiledExecutor->set_debug_forward_op_range(lo, hi, skip_init, skip_finalize, force_linear);
+}
+void GraphExecutor::debug_clear_forward_op_range() {
+    if (mCompiledExecutor) mCompiledExecutor->clear_debug_forward_op_range();
+}
+void GraphExecutor::debug_set_backward_op_range(
+    std::size_t lo, std::size_t hi, bool skip_init, bool skip_finalize, bool force_linear) {
+    if (mCompiledExecutor)
+        mCompiledExecutor->set_debug_backward_op_range(lo, hi, skip_init, skip_finalize, force_linear);
+}
+void GraphExecutor::debug_clear_backward_op_range() {
+    if (mCompiledExecutor) mCompiledExecutor->clear_debug_backward_op_range();
+}
+
+std::vector<float> GraphExecutor::debug_last_block_hidden_f32() {
+    // The last block's output residual is the dispatch-PP boundary hidden. It is
+    // a resident block slot while execution state is live (read before finalize),
+    // or a named residual tensor. Try the block slot first, then the names the
+    // debug-dump path resolves.
+    const int last = static_cast<int>(mConfig.NumLayers) - 1;
+    if (Tensor* t = dbg_block_residual_out(mRunState, last); t && t->Data) {
+        return dbg_tensor_to_host_f32(*t, mRunState.MainStream);
+    }
+    if (mCompiledExecutor) {
+        static const char* kNames[] = {"residual_final", "final_residual", "xF", "ln_final", "xN", "residualN"};
+        for (const char* nm : kNames) {
+            if (const Tensor* t = mCompiledExecutor->try_get_tensor_fuzzy(nm); t && t->Data) {
+                return dbg_tensor_to_host_f32(*t, mRunState.MainStream);
+            }
+        }
+    }
+    throw std::runtime_error("debug_last_block_hidden_f32: could not resolve the final hidden state");
+}
+
+void GraphExecutor::debug_roundtrip_block_residual(int block) {
+    Tensor* t = dbg_block_residual_out(mRunState, block);
+    if (!t) {
+        throw std::runtime_error("debug_roundtrip_block_residual: no resident residual for block");
+    }
+    dbg_roundtrip_through_host(*t, mRunState.MainStream);
+}
+
+std::vector<float> GraphExecutor::debug_block_grad_norms() {
+    const int num_layers = static_cast<int>(mConfig.NumLayers);
+    std::vector<double> sumsq(static_cast<std::size_t>(std::max(0, num_layers)), 0.0);
+    const auto& gmap = mGrads.grads();
+    for (const auto& name : mGrads.param_names()) {
+        int layer_idx = -1;
+        std::string field;
+        if (!parse_block_param(name, layer_idx, field)) {
+            continue;  // non-block params (embedding, lm_head, final norm) excluded
+        }
+        if (layer_idx < 0 || layer_idx >= num_layers) {
+            continue;
+        }
+        auto it = gmap.find(name);
+        if (it == gmap.end() || !it->second.Data) {
+            continue;
+        }
+        const std::vector<float> g = dbg_tensor_to_host_f32(it->second, mRunState.MainStream);
+        double s = 0.0;
+        for (float v : g) {
+            s += static_cast<double>(v) * static_cast<double>(v);
+        }
+        sumsq[static_cast<std::size_t>(layer_idx)] += s;
+    }
+    std::vector<float> norms(static_cast<std::size_t>(std::max(0, num_layers)), 0.0f);
+    for (int L = 0; L < num_layers; ++L) {
+        norms[static_cast<std::size_t>(L)] = static_cast<float>(std::sqrt(sumsq[static_cast<std::size_t>(L)]));
+    }
+    return norms;
 }
 
 }  // namespace dsl

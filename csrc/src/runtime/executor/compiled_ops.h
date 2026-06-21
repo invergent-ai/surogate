@@ -165,6 +165,59 @@ public:
     void set_current_micro_step(int micro_step) {
         mMicroStep = micro_step;
     }
+
+    // ---- Debug-only dispatch-PP sub-range execution -----------------------
+    // Bound the eager flat-ops forward/backward loop to [lo, hi), optionally
+    // skip (re)initialization / finalization so multiple contiguous segments
+    // share one executor state, and force the flat-ops path (no instruction
+    // stream). Defaults reproduce whole-graph behavior exactly. Resident
+    // weights only; not capture-safe (eager single-GPU parity check).
+    void set_debug_forward_op_range(std::size_t lo,
+                                    std::size_t hi,
+                                    bool skip_init,
+                                    bool skip_finalize,
+                                    bool force_linear) {
+        mDbgFwdOpLo = lo;
+        mDbgFwdOpHi = hi;
+        mDbgFwdSkipInit = skip_init;
+        mDbgFwdSkipFinalize = skip_finalize;
+        mDbgForceLinear = force_linear;
+    }
+    void clear_debug_forward_op_range() {
+        mDbgFwdOpLo = 0;
+        mDbgFwdOpHi = SIZE_MAX;
+        mDbgFwdSkipInit = false;
+        mDbgFwdSkipFinalize = false;
+        mDbgForceLinear = false;
+    }
+    void set_debug_backward_op_range(std::size_t lo,
+                                     std::size_t hi,
+                                     bool skip_init,
+                                     bool skip_finalize,
+                                     bool force_linear) {
+        mDbgBwdOpLo = lo;
+        mDbgBwdOpHi = hi;
+        mDbgBwdSkipInit = skip_init;
+        mDbgBwdSkipFinalize = skip_finalize;
+        mDbgForceLinear = force_linear;
+    }
+    void clear_debug_backward_op_range() {
+        mDbgBwdOpLo = 0;
+        mDbgBwdOpHi = SIZE_MAX;
+        mDbgBwdSkipInit = false;
+        mDbgBwdSkipFinalize = false;
+        mDbgForceLinear = false;
+    }
+
+    std::size_t mDbgFwdOpLo = 0;
+    std::size_t mDbgFwdOpHi = SIZE_MAX;
+    bool mDbgFwdSkipInit = false;
+    bool mDbgFwdSkipFinalize = false;
+    std::size_t mDbgBwdOpLo = 0;
+    std::size_t mDbgBwdOpHi = SIZE_MAX;
+    bool mDbgBwdSkipInit = false;
+    bool mDbgBwdSkipFinalize = false;
+    bool mDbgForceLinear = false;
     void set_debug_dump_fn(std::function<void(const std::vector<std::string>&, int)> fn) {
         mDebugDumpFn = std::move(fn);
     }

@@ -102,6 +102,28 @@ public:
     void forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm, int micro_step) override;
     float validate(Tensor inputs, Tensor position_ids, Tensor targets, NCCLCommunicator& comm, int micro_step) override;
     void backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, int grad_accum_steps, int micro_step) override;
+
+    // ---- Debug-only dispatch-PP sub-range parity (BF16 full-FT, resident) --
+    // Whole-graph forward; returns the final hidden state flattened to host f32.
+    std::vector<float> dispatch_pp_debug_forward_hidden(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm);
+    // Forward as two contiguous block sub-ranges [0..split] then [split+1..last],
+    // the boundary residual round-tripped through host; returns final hidden f32.
+    std::vector<float> dispatch_pp_debug_forward_subranges(Tensor inputs,
+                                                           Tensor position_ids,
+                                                           NCCLCommunicator& comm,
+                                                           int split_after_block);
+    // Whole-graph backward; returns per-block weight-grad L2 norms (block order).
+    std::vector<float> dispatch_pp_debug_grad_norms_whole(Tensor inputs,
+                                                          Tensor targets,
+                                                          Tensor position_ids,
+                                                          NCCLCommunicator& comm);
+    // Backward as two contiguous block sub-ranges (high range first, boundary
+    // grad round-tripped through host); returns per-block grad norms.
+    std::vector<float> dispatch_pp_debug_grad_norms_subranges(Tensor inputs,
+                                                              Tensor targets,
+                                                              Tensor position_ids,
+                                                              NCCLCommunicator& comm,
+                                                              int split_after_block);
     void update(NCCLCommunicator& comm,
                 float learning_rate,
                 float beta_1,

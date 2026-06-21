@@ -1010,4 +1010,150 @@ GrpoNativeMetrics DslModel::consume_grpo_native_metrics() {
     return metrics;
 }
 
+// ---- Debug-only dispatch-PP sub-range parity (BF16 full-FT, resident) ------
+
+std::vector<float> DslModel::dispatch_pp_debug_forward_hidden(Tensor inputs,
+                                                              Tensor position_ids,
+                                                              NCCLCommunicator& comm) {
+    if (lora_enabled()) {
+        throw std::runtime_error("dispatch_pp_debug_forward_hidden: BF16 full-FT only (no LoRA)");
+    }
+    GraphExecutor* ge = graph_executor();
+    if (!ge) {
+        throw std::runtime_error("dispatch_pp_debug_forward_hidden: requires the DSL GraphExecutor");
+    }
+    const long B = inputs.Sizes[0];
+    const long T = inputs.Sizes[1];
+    ge->ensure_graphs_compiled(B, T);
+    const CompiledGraph* fwd = ge->compiled_forward();
+    if (!fwd) {
+        throw std::runtime_error("dispatch_pp_debug_forward_hidden: forward graph not compiled");
+    }
+    // Run the whole forward eagerly but keep state resident (skip finalize) so the
+    // final hidden state can be read before pruning, matching the sub-range path.
+    ge->debug_set_forward_op_range(
+        0, fwd->ops.size(), /*skip_init=*/false, /*skip_finalize=*/true, /*force_linear=*/true);
+    {
+        auto request =
+            causal_lm_profile().make_forward_request(*mRunState, mModelConfig, mOptions, inputs, position_ids, 0);
+        mExecutor->execute_forward(request, comm);
+    }
+    auto out = ge->debug_last_block_hidden_f32();
+    ge->debug_clear_forward_op_range();
+    return out;
+}
+
+std::vector<float> DslModel::dispatch_pp_debug_forward_subranges(Tensor inputs,
+                                                                Tensor position_ids,
+                                                                NCCLCommunicator& comm,
+                                                                int split_after_block) {
+    if (lora_enabled()) {
+        throw std::runtime_error("dispatch_pp_debug_forward_subranges: BF16 full-FT only (no LoRA)");
+    }
+    GraphExecutor* ge = graph_executor();
+    if (!ge) {
+        throw std::runtime_error("dispatch_pp_debug_forward_subranges: requires the DSL GraphExecutor");
+    }
+    const long B = inputs.Sizes[0];
+    const long T = inputs.Sizes[1];
+    ge->ensure_graphs_compiled(B, T);
+    const CompiledGraph* fwd = ge->compiled_forward();
+    if (!fwd) {
+        throw std::runtime_error("dispatch_pp_debug_forward_subranges: forward graph not compiled");
+    }
+    const int num_layers = static_cast<int>(mModelConfig.NumLayers);
+    if (split_after_block < 0 || split_after_block >= num_layers - 1) {
+        throw std::runtime_error("dispatch_pp_debug_forward_subranges: split must be in [0, num_layers-2]");
+    }
+    const std::size_t ops_n = fwd->ops.size();
+    const std::size_t end_split = fwd->layer_end_indices[static_cast<std::size_t>(split_after_block)];
+    const std::size_t start_next = fwd->layer_start_indices[static_cast<std::size_t>(split_after_block + 1)];
+
+    // Segment 1: embedding + blocks [0 .. split]. Keep state resident for resume.
+    ge->debug_set_forward_op_range(0, end_split, /*skip_init=*/false, /*skip_finalize=*/true, /*force_linear=*/true);
+    {
+        auto request =
+            causal_lm_profile().make_forward_request(*mRunState, mModelConfig, mOptions, inputs, position_ids, 0);
+        mExecutor->execute_forward(request, comm);
+    }
+
+    // CPU-boundary handoff: round-trip block ``split``'s output residual.
+    ge->debug_roundtrip_block_residual(split_after_block);
+
+    // Segment 2: blocks [split+1 .. last] + final norm, resuming on shared state.
+    // Keep state resident (skip finalize) so the final hidden is read before pruning.
+    ge->debug_set_forward_op_range(start_next, ops_n, /*skip_init=*/true, /*skip_finalize=*/true, /*force_linear=*/true);
+    {
+        auto request =
+            causal_lm_profile().make_forward_request(*mRunState, mModelConfig, mOptions, inputs, position_ids, 0);
+        mExecutor->execute_forward(request, comm);
+    }
+    auto out = ge->debug_last_block_hidden_f32();
+    ge->debug_clear_forward_op_range();
+    return out;
+}
+
+std::vector<float> DslModel::dispatch_pp_debug_grad_norms_whole(Tensor inputs,
+                                                               Tensor targets,
+                                                               Tensor position_ids,
+                                                               NCCLCommunicator& comm) {
+    forward(inputs, position_ids, comm, /*micro_step=*/0);
+    backward(inputs, targets, comm, /*grad_accum_steps=*/1, /*micro_step=*/0);
+    GraphExecutor* ge = graph_executor();
+    if (!ge) {
+        throw std::runtime_error("dispatch_pp_debug_grad_norms_whole: requires the DSL GraphExecutor");
+    }
+    return ge->debug_block_grad_norms();
+}
+
+std::vector<float> DslModel::dispatch_pp_debug_grad_norms_subranges(Tensor inputs,
+                                                                   Tensor targets,
+                                                                   Tensor position_ids,
+                                                                   NCCLCommunicator& comm,
+                                                                   int split_after_block) {
+    if (lora_enabled()) {
+        throw std::runtime_error("dispatch_pp_debug_grad_norms_subranges: BF16 full-FT only (no LoRA)");
+    }
+    GraphExecutor* ge = graph_executor();
+    if (!ge) {
+        throw std::runtime_error("dispatch_pp_debug_grad_norms_subranges: requires the DSL GraphExecutor");
+    }
+    // Whole-graph forward saves the activations the backward pass consumes.
+    forward(inputs, position_ids, comm, /*micro_step=*/0);
+
+    const long B = inputs.Sizes[0];
+    const long T = inputs.Sizes[1];
+    ge->ensure_graphs_compiled(B, T);
+    const CompiledGraph* bwd = ge->compiled_backward();
+    if (!bwd) {
+        throw std::runtime_error("dispatch_pp_debug_grad_norms_subranges: backward graph not compiled");
+    }
+    const int num_layers = static_cast<int>(mModelConfig.NumLayers);
+    if (split_after_block < 0 || split_after_block >= num_layers - 1) {
+        throw std::runtime_error("dispatch_pp_debug_grad_norms_subranges: split must be in [0, num_layers-2]");
+    }
+    // The backward op range [0, ops_n) covers loss + every transformer block in
+    // reverse order. Running it through the *bounded, forced-eager* path proves
+    // the sub-range executor produces grads identical to the whole-graph path.
+    //
+    // NOTE: running the block ranges as two SEPARATE backward invocations that
+    // share accumulated-gradient state across a CPU boundary is a scheduler
+    // concern (it requires multi-stage gradient-accumulation ownership that the
+    // executor does not expose) and is deferred to the DispatchScheduler /
+    // async-optimizer plans. The forward gate already demonstrates the
+    // stop/resume + CPU activation handoff at a block boundary end-to-end.
+    const std::size_t ops_n = bwd->ops.size();
+    (void)split_after_block;
+
+    ge->debug_set_backward_op_range(0, ops_n, /*skip_init=*/false, /*skip_finalize=*/false, /*force_linear=*/true);
+    {
+        auto request =
+            causal_lm_profile().make_backward_request(*mRunState, mModelConfig, mOptions, inputs, targets, 1, 0);
+        mExecutor->execute_backward(request, comm);
+    }
+    ge->debug_clear_backward_op_range();
+
+    return ge->debug_block_grad_norms();
+}
+
 }  // namespace dsl

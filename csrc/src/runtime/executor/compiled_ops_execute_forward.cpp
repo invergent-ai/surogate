@@ -566,7 +566,12 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                                        NCCLCommunicator& comm,
                                        bool full,
                                        const modules::ForwardHook* hook) {
-    initialize_forward_execution(graph, comm, full);
+    // dispatch-PP debug: a resumed sub-range segment shares the prior segment's
+    // executor state, so skip the (re)initialization that would clear
+    // mTensors/mNamedTensors and the cross-block residual.
+    if (!mDbgFwdSkipInit) {
+        initialize_forward_execution(graph, comm, full);
+    }
     const int num_layers = static_cast<int>(mConfig.NumLayers);
     // Reuse member vectors to avoid per-forward heap allocations.
     auto& layer_checkpoints = mLayerCheckpoints;
@@ -863,7 +868,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     // loop below remains the path when capturing (CUDA graph capture needs
     // the single-pass op walk) or when the compiler did not emit an
     // instruction stream.
-    const bool stream_driven = !graph.instruction_stream.empty() && !mCapturing;
+    const bool stream_driven = !graph.instruction_stream.empty() && !mCapturing && !mDbgForceLinear;
     if (stream_driven) {
         if (const char* env = std::getenv("SUROGATE_DEBUG_PHASE_INTERPRETER")) {
             if (std::string(env) == "1") {
@@ -997,6 +1002,10 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
 
     for (std::size_t idx = 0; !stream_driven && idx < graph.ops.size(); ++idx) {
         if (!full && !graph.required_mask.empty() && !graph.required_mask[idx]) {
+            continue;
+        }
+        // dispatch-PP debug: restrict this segment to a contiguous op range.
+        if (idx < mDbgFwdOpLo || idx >= mDbgFwdOpHi) {
             continue;
         }
 
@@ -1273,6 +1282,14 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
         if (std::string(env) == "1") {
             std::cerr << "[arena-persist] arena=" << arena_persists << " cudaMalloc=" << cudaMalloc_persists << "\n";
         }
+    }
+
+    // dispatch-PP debug: when an additional sub-range segment will resume on
+    // this executor state, keep weights resident, the active-executor binding,
+    // and the live tensor table intact (the next segment reads the cross-block
+    // residual from it). The final segment runs the normal finalize.
+    if (mDbgFwdSkipFinalize) {
+        return;
     }
 
     dump_forward_debug_tensors();
