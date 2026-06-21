@@ -149,3 +149,18 @@ def test_plan_fused_tail_sized_by_backward_not_forward():
     tail = plan.fused_tail
     n_tail = tail.hi - tail.lo + 1
     assert tail.est_time == 3.0 * n_tail   # bwd_time per block, not fwd (=1.0)
+
+
+def test_plan_warns_when_block_exceeds_half_vram_budget():
+    # one block needs 30 bytes; vram_budget 40 -> ceiling (budget/2)=20 -> block overflows.
+    profiles = [BlockProfile(1.0, 3.0, weight_bytes=30, act_bytes=0) for _ in range(3)]
+    plan = plan_stages(profiles, min_stages=2, upper_threshold=1.1,
+                       vram_budget_bytes=40)
+    assert any("exceeds" in w and "VRAM" in w for w in plan.warnings)
+
+
+def test_plan_no_oversize_warning_when_blocks_fit():
+    profiles = [BlockProfile(1.0, 3.0, weight_bytes=5, act_bytes=0) for _ in range(3)]
+    plan = plan_stages(profiles, min_stages=2, upper_threshold=1.1,
+                       vram_budget_bytes=40)
+    assert not any("VRAM" in w for w in plan.warnings)

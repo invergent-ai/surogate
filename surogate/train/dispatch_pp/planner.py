@@ -178,6 +178,15 @@ def plan_stages(
     ]
     mem_ceiling = vram_budget_bytes // 2  # reserve half for double-buffering
 
+    warnings: list[str] = []
+    max_block_bytes = max(bwd_sizes)  # backward is the binding (largest) footprint
+    if max_block_bytes > mem_ceiling:
+        warnings.append(
+            f"Largest block needs {max_block_bytes} bytes (weight+act+grad) but the "
+            f"per-stage VRAM ceiling (vram_budget/2) is {mem_ceiling}; a single block "
+            f"exceeds it. Reduce seq_len/micro_batch or raise vram_budget_gb, else OOM."
+        )
+
     cands = sorted(
         set(candidate_budgets(fwd, upper_threshold))
         | set(candidate_budgets(bwd, upper_threshold))
@@ -203,5 +212,5 @@ def plan_stages(
         fused_tail=fused,
         bwd_stages=backward,
         num_blocks=n,
-        warnings=[],
+        warnings=warnings,
     )
