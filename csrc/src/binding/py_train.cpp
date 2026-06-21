@@ -2005,7 +2005,8 @@ std::vector<float> MultiGPUPyTrainer::dispatch_pp_debug_forward_hidden_multigpu(
                                                        hi,
                                                        inject_layer,
                                                        std::move(residual_in),
-                                                       std::move(hout_in));
+                                                       std::move(hout_in),
+                                                       /*preserve_output=*/!is_last);
                 auto* ge = model->graph_executor();
                 if (is_last) {
                     final_hidden = ge->debug_last_block_hidden_f32();

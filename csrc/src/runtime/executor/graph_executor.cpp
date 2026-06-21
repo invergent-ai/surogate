@@ -2013,13 +2013,20 @@ std::vector<std::byte> GraphExecutor::debug_read_residual_bytes(int layer) {
 
 std::vector<std::byte> GraphExecutor::debug_read_block_hout_bytes(int layer) {
     std::vector<std::byte> host;
-    Tensor* h = block_activation_ptr(mRunState, layer, TensorSlot::BlockHOut);
-    if (!h || !h->Data || h->bytes() == 0) {
-        return host;
+    // The carried ``x`` (block output h) is BlockHOut when a layer-scalar is
+    // applied, else the raw MLP output (BlockMLPDown); fall through like
+    // resolve_last_block_output.
+    const TensorSlot slots[] = {TensorSlot::BlockHOut, TensorSlot::BlockMLPDown, TensorSlot::BlockResidualAtt};
+    for (TensorSlot s : slots) {
+        Tensor* h = block_activation_ptr(mRunState, layer, s);
+        if (h && h->Data && h->bytes() > 0) {
+            host.resize(h->bytes());
+            CUDA_CHECK(cudaMemcpyAsync(host.data(), h->Data, h->bytes(), cudaMemcpyDeviceToHost,
+                                       mRunState.MainStream));
+            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+            return host;
+        }
     }
-    host.resize(h->bytes());
-    CUDA_CHECK(cudaMemcpyAsync(host.data(), h->Data, h->bytes(), cudaMemcpyDeviceToHost, mRunState.MainStream));
-    CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
     return host;
 }
 
@@ -2029,6 +2036,10 @@ void GraphExecutor::debug_set_inject_residual(int layer, std::vector<std::byte> 
 
 void GraphExecutor::debug_set_inject_hout(int layer, std::vector<std::byte> host_bytes) {
     if (mCompiledExecutor) mCompiledExecutor->set_debug_inject_hout(layer, std::move(host_bytes));
+}
+
+void GraphExecutor::debug_set_preserve_layer(int layer) {
+    if (mCompiledExecutor) mCompiledExecutor->set_debug_preserve_layer(layer);
 }
 
 void GraphExecutor::debug_clear_inject_residual() {

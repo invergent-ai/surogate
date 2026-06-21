@@ -293,6 +293,7 @@ public:
     // the accumulator into get_residual(layer) and ``x`` into BlockHOut(layer).
     void debug_set_inject_residual(int layer, std::vector<std::byte> host_bytes);
     void debug_set_inject_hout(int layer, std::vector<std::byte> host_bytes);
+    void debug_set_preserve_layer(int layer);
     void debug_clear_inject_residual();
 
     /// Set document masking context for Flash Attention varlen dispatch.

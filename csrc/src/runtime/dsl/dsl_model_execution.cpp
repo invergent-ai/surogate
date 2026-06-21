@@ -1100,7 +1100,8 @@ void DslModel::dispatch_pp_debug_forward_stage(Tensor inputs,
                                                int hi,
                                                int inject_layer,
                                                std::vector<std::byte> inject_residual,
-                                               std::vector<std::byte> inject_hout) {
+                                               std::vector<std::byte> inject_hout,
+                                               bool preserve_output) {
     if (lora_enabled()) {
         throw std::runtime_error("dispatch_pp_debug_forward_stage: BF16 full-FT only (no LoRA)");
     }
@@ -1128,6 +1129,10 @@ void DslModel::dispatch_pp_debug_forward_stage(Tensor inputs,
     if (inject_layer >= 0) {
         ge->debug_set_inject_residual(inject_layer, std::move(inject_residual));
         ge->debug_set_inject_hout(inject_layer, std::move(inject_hout));
+    }
+    // Keep block hi's output (x) live so the next stage's GPU can read it.
+    if (preserve_output) {
+        ge->debug_set_preserve_layer(hi);
     }
     // skip_finalize keeps the stage's outputs (residual / final hidden) resident
     // for the caller's debug readers and the next stage's boundary read.

@@ -110,8 +110,12 @@ def test_multigpu_dispatch_runs_end_to_end():
 
 
 @pytest.mark.xfail(
-    reason="two-tensor fused-residual boundary handoff incomplete: x (prev block output) "
-    "is a transient slot, not injectable on a fresh executor; needs a materialization hook",
+    reason="two-tensor fused-residual boundary handoff incomplete: the residual accumulator "
+    "transfers correctly and the sender now captures x (prev block's MLP output) via a "
+    "preserve-last-block hook, but the receiver's x input slot is not materialized on a fresh "
+    "executor (block hi never ran there) and is read via a StackedBlocks-internal carried tid, "
+    "not block hi's BlockMLPDown slot. Completing it needs binding that carried x tid on the "
+    "resumed executor (graph-wiring change), beyond the current inject hooks.",
     strict=False,
 )
 def test_multigpu_dispatch_matches_single_gpu():

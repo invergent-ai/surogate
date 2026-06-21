@@ -123,7 +123,8 @@ public:
                                          int hi,
                                          int inject_layer,
                                          std::vector<std::byte> inject_residual,
-                                         std::vector<std::byte> inject_hout);
+                                         std::vector<std::byte> inject_hout,
+                                         bool preserve_output);
     // Whole-graph backward; returns per-block weight-grad L2 norms (block order).
     std::vector<float> dispatch_pp_debug_grad_norms_whole(Tensor inputs,
                                                           Tensor targets,

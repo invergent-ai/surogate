@@ -189,6 +189,7 @@ public:
         mDbgFwdSkipInit = false;
         mDbgFwdSkipFinalize = false;
         mDbgForceLinear = false;
+        mDbgPreserveLayer = -1;
     }
     void set_debug_backward_op_range(std::size_t lo,
                                      std::size_t hi,
@@ -228,6 +229,11 @@ public:
         mDbgInjectHoutLayer = -1;
         mDbgInjectHoutHost.clear();
     }
+    // Keep block ``layer``'s stack tensors (incl. its output BlockHOut = ``x``)
+    // live past its layer-end so the cross-GPU boundary can read them. -1 = off.
+    void set_debug_preserve_layer(int layer) {
+        mDbgPreserveLayer = layer;
+    }
 
     std::size_t mDbgFwdOpLo = 0;
     std::size_t mDbgFwdOpHi = SIZE_MAX;
@@ -242,6 +248,7 @@ public:
     std::vector<std::byte> mDbgInjectResidualHost;
     int mDbgInjectHoutLayer = -1;
     std::vector<std::byte> mDbgInjectHoutHost;
+    int mDbgPreserveLayer = -1;
     void set_debug_dump_fn(std::function<void(const std::vector<std::string>&, int)> fn) {
         mDebugDumpFn = std::move(fn);
     }

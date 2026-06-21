@@ -467,13 +467,17 @@ Front-loads the biggest unknown so we fail fast if the engine cannot do sub-rang
     block-output inject hooks and `GraphExecutor` read/inject helpers). It runs end-to-end across GPUs
     and the **residual accumulator** handoff lands correctly. Full numerical parity vs single-GPU is
     **xfail pending the two-tensor boundary**: the fused-residual block carries both the residual
-    accumulator (pre-allocated, injectable via `get_residual`) AND `x` = the previous block's output,
-    which lives in a **transient** activation slot not resident on a fresh executor. Completing the `x`
-    handoff needs a boundary-materialization hook in the executor (e.g. fold `x` into the residual at
-    the stage boundary so a single pre-allocated buffer crosses, or expose a stable boundary buffer).
+    accumulator (pre-allocated, injectable via `get_residual` — transfers correctly) AND `x` = the
+    previous block's MLP output. The sender now captures `x` via a preserve-last-block hook
+    (`set_debug_preserve_layer` keeps the stage's final block's stack live past its layer-end so
+    `BlockMLPDown` survives the read). The remaining gap is the **receiver side**: block hi+1 reads `x`
+    via a StackedBlocks-internal carried tid that is not materialized on a fresh executor (block hi
+    never ran there), so injecting into block hi's `BlockMLPDown` slot does not reach it. Completing it
+    needs binding that carried `x` tid on the resumed executor (a graph-wiring change) or folding `x`
+    into the residual at the boundary so a single pre-allocated buffer crosses.
     Test: `tests/train/dispatch_pp/test_phase2_multigpu.py` (runs-end-to-end passes; parity xfail).
-    Still ahead: the `x` materialization, stage dependency edges + CUDA-event handoff for overlap,
-    NUMA-biased dispatch, stage-range (multi-block) gather, and the memory-scaling test.
+    Still ahead: the `x` receiver-side materialization, stage dependency edges + CUDA-event handoff for
+    overlap, NUMA-biased dispatch, stage-range (multi-block) gather, and the memory-scaling test.
 - **Phase 3 — Async 1-step-stale optimizer.** Overlap the optimizer thread on the CPU-master path;
   verify the controlled staleness test. Sequenced last because it is the hardest to debug — Phases 1–2
   run with a synchronous optimizer internally as scaffolding (sync is not a shipped v1 option).

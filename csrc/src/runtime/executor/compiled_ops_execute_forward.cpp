@@ -591,11 +591,19 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     // Completing the two-tensor boundary handoff needs a materialization hook
     // (tracked as remaining multi-GPU work); the residual inject above always lands.
     if (mDbgInjectHoutLayer >= 0 && !mDbgInjectHoutHost.empty()) {
-        Tensor* h = block_activation_ptr(mRunState, mDbgInjectHoutLayer, TensorSlot::BlockHOut);
-        if (h && h->Data && h->bytes() == mDbgInjectHoutHost.size()) {
-            CUDA_CHECK(cudaMemcpyAsync(h->Data, mDbgInjectHoutHost.data(), h->bytes(),
-                                       cudaMemcpyHostToDevice, mRunState.MainStream));
-            CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+        // ``x`` is the block output h: BlockHOut when a layer-scalar applies, else
+        // the raw MLP output (BlockMLPDown). Inject into the same slot the sender
+        // read it from (matched via the fallback chain).
+        const TensorSlot slots[] = {
+            TensorSlot::BlockHOut, TensorSlot::BlockMLPDown, TensorSlot::BlockResidualAtt};
+        for (TensorSlot s : slots) {
+            Tensor* h = block_activation_ptr(mRunState, mDbgInjectHoutLayer, s);
+            if (h && h->Data && h->bytes() == mDbgInjectHoutHost.size()) {
+                CUDA_CHECK(cudaMemcpyAsync(h->Data, mDbgInjectHoutHost.data(), h->bytes(),
+                                           cudaMemcpyHostToDevice, mRunState.MainStream));
+                CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+                break;
+            }
         }
     }
     const int num_layers = static_cast<int>(mConfig.NumLayers);
@@ -670,11 +678,16 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                                                 forward_replay_active,
                                                 arena_persists,
                                                 cudaMalloc_persists);
-            mRunState.Stack.restore(layer_checkpoints[static_cast<std::size_t>(L)]);
-            if (mTemps.size() > layer_temp_marks[static_cast<std::size_t>(L)]) {
-                mTemps.resize(layer_temp_marks[static_cast<std::size_t>(L)]);
+            // dispatch-PP debug: preserve a stage's last block so its output ``x``
+            // (BlockHOut) stays live for the cross-GPU boundary read — the stack
+            // restore/prune below would otherwise free it.
+            if (L != mDbgPreserveLayer) {
+                mRunState.Stack.restore(layer_checkpoints[static_cast<std::size_t>(L)]);
+                if (mTemps.size() > layer_temp_marks[static_cast<std::size_t>(L)]) {
+                    mTemps.resize(layer_temp_marks[static_cast<std::size_t>(L)]);
+                }
+                prune_stack_tensors();
             }
-            prune_stack_tensors();
             layer_active[static_cast<std::size_t>(L)] = 0;
         }
         if (L >= 0) handle_layer_end(L);
