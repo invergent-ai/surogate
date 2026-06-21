@@ -2125,19 +2125,36 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
 
     using Boundary = std::vector<std::pair<std::string, std::vector<std::byte>>>;
 
+    // 0. Reset each GPU's compute stack to its clean per-step base. The dispatch
+    //    sub-range forwards/backwards run with skip_finalize (so boundary tensors and
+    //    saves survive the cross-GPU reads), which leaves residue on the bump-allocated
+    //    stack; without this reset it accumulates step over step and overflows.
+    run_work(
+        [&](sThreadContext& ctx) {
+            auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+            if (model && model->graph_executor()) model->graph_executor()->dispatch_reset_stack();
+        },
+        -1);
+
     // 1. Forward-dispatch stages in order with cross-GPU boundary handoff. Capture
     //    each stage's INPUT boundary (block lo-1's residual) so the backward pass can
     //    re-forward just that one stage instead of the whole model -- this bounds
-    //    resident activations to a single stage. The last stage runs the loss ops.
+    //    resident activations to a single stage. Only stages [0..N-2] need to run:
+    //    each produces the input boundary for the next stage. The last stage's output
+    //    is consumed by nothing here (its loss is recomputed in the backward pass), so
+    //    running it would just leak resident state. After reading a stage's boundary,
+    //    restore the stage base so the preserved activations are reclaimed and the
+    //    (reused) GPU starts the next step clean -- otherwise saves accumulate on the
+    //    compute stack step over step and eventually overflow it.
     std::vector<Boundary> stage_inputs(static_cast<std::size_t>(num_stages));
     {
         Boundary fboundary;  // block hi's residual, fed as the next stage's input
         for (int si = 0; si < num_stages; ++si) {
+            stage_inputs[static_cast<std::size_t>(si)] = fboundary;  // empty for stage 0 (forwards from embedding)
+            if (si == num_stages - 1) break;  // last stage's input captured; its forward isn't needed
             const int gpu = si % ngpu;
             const int lo = los[static_cast<std::size_t>(si)];
             const int hi = his[static_cast<std::size_t>(si)];
-            const bool is_loss = (si == num_stages - 1);
-            stage_inputs[static_cast<std::size_t>(si)] = fboundary;  // empty for stage 0 (forwards from embedding)
             Boundary inject = fboundary;
             Boundary next_boundary;
             run_work(
@@ -2152,14 +2169,13 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
                                                            lo,
                                                            hi,
                                                            std::move(inject),
-                                                           /*preserve_output=*/!is_loss);
-                    if (!is_loss) {
-                        auto* ge = model->graph_executor();
-                        const std::string rn = "blocks[" + std::to_string(hi) + "].res_att";
-                        const std::string xn = "blocks[" + std::to_string(hi) + "].mlp_down";
-                        next_boundary.emplace_back(rn, ge->read_named_bytes(rn));
-                        next_boundary.emplace_back(xn, ge->read_named_bytes(xn));
-                    }
+                                                           /*preserve_output=*/true);
+                    auto* ge = model->graph_executor();
+                    const std::string rn = "blocks[" + std::to_string(hi) + "].res_att";
+                    const std::string xn = "blocks[" + std::to_string(hi) + "].mlp_down";
+                    next_boundary.emplace_back(rn, ge->read_named_bytes(rn));
+                    next_boundary.emplace_back(xn, ge->read_named_bytes(xn));
+                    ge->restore_stage_base();  // reclaim the preserved-stage activations
                 },
                 gpu);
             fboundary = std::move(next_boundary);

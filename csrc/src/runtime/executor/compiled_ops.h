@@ -261,6 +261,21 @@ public:
         }
     }
 
+    // dispatch-PP: reset the compute stack to a clean per-step base. The dispatch
+    // step's sub-range forwards/backwards run with skip_finalize, so they leave saves
+    // and boundary tensors resident on the bump-allocated stack; without a reset they
+    // accumulate step over step and overflow it. Call at the start of every dispatch
+    // step: the first call captures the (clean, post-init) base; later calls restore
+    // to it, reclaiming the previous step's residue. The base stays valid (reusable).
+    void dispatch_reset_stack() {
+        if (mDispatchStepBaseValid) {
+            mRunState.Stack.restore(mDispatchStepBase);
+        } else {
+            mDispatchStepBase = mRunState.Stack.checkpoint();
+            mDispatchStepBaseValid = true;
+        }
+    }
+
     std::size_t mFwdOpLo = 0;
     std::size_t mFwdOpHi = SIZE_MAX;
     bool mFwdSkipInit = false;
@@ -281,6 +296,8 @@ public:
     std::vector<void*> mInjectBuffers;  // device buffers backing mInjectNamed binds
     DeviceMemoryStack::Checkpoint mStageBase{};
     bool mStageBaseValid = false;
+    DeviceMemoryStack::Checkpoint mDispatchStepBase{};
+    bool mDispatchStepBaseValid = false;
     void set_debug_dump_fn(std::function<void(const std::vector<std::string>&, int)> fn) {
         mDebugDumpFn = std::move(fn);
     }

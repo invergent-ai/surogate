@@ -2039,6 +2039,10 @@ void GraphExecutor::restore_stage_base() {
     if (mCompiledExecutor) mCompiledExecutor->restore_stage_base();
 }
 
+void GraphExecutor::dispatch_reset_stack() {
+    if (mCompiledExecutor) mCompiledExecutor->dispatch_reset_stack();
+}
+
 std::vector<float> GraphExecutor::last_block_hidden_f32() {
     // The last block's output residual is the dispatch-PP boundary hidden. It is
     // a resident block slot while execution state is live (read before finalize),
