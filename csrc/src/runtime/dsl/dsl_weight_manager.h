@@ -164,6 +164,16 @@ public:
     /// pointers. Returns 0 when no eligible tensor exists.
     [[nodiscard]] std::size_t total_persistent_bytes() const;
 
+    /// GPU bytes held by the streaming block double-buffer (the bounded
+    /// dispatch-PP weight footprint). Sums the distinct device buffers across
+    /// all kNumPrefetchBuffers slots — independent of the layer count, since a
+    /// slot holds exactly one block's work-weights. 0 when not streaming.
+    [[nodiscard]] std::size_t gpu_prefetch_buffer_bytes() const;
+
+    /// Number of streaming double-buffer slots (kNumPrefetchBuffers when
+    /// streaming, else 0). The dispatch-PP resident-block ceiling.
+    [[nodiscard]] int prefetch_slot_count() const;
+
     /// Route eligible master/work/prefetch tensors through a slab of the
     /// Persistent arena. Walks `mWeights` + `mPrefetchBuffers`, bump-
     /// allocates each eligible tensor's bytes inside

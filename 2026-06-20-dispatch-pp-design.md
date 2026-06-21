@@ -490,8 +490,17 @@ Front-loads the biggest unknown so we fail fast if the engine cannot do sub-rang
     `reduce_loss_on_completion` on the request. Per-block weight-grad L2 norms match whole-graph backward
     within bf16 tolerance for 2 stages and round-robin wrap
     (`tests/train/dispatch_pp/test_phase2_multigpu.py`: 3 backward tests passing).
+  - *Memory-scaling invariant — quantitative test (2026-06-21) — PASS.* GPU weight residency is
+    introspectable via `dispatch_pp_debug_weight_residency` (total device-resident weight bytes, the
+    streaming block double-buffer footprint, the slot count), backed by
+    `DslWeightManager::gpu_prefetch_buffer_bytes` / `prefetch_slot_count`. With streaming
+    (`offload_master`), masters are pinned on the CPU and blocks stream through `kNumPrefetchBuffers`
+    double-buffer slots, so the device holds exactly `slot_count` blocks' work-weights — a small
+    constant, independent of the layer count — versus the whole model resident otherwise. Test:
+    `tests/train/dispatch_pp/test_phase2_memory.py` (resident => no slots; streaming => `slot_count`
+    blocks resident, `< NUM_LAYERS`).
     Still ahead: stage dependency edges + CUDA-event handoff for compute/transfer overlap, NUMA-biased
-    dispatch, stage-range (multi-block) gather, and the quantitative memory-scaling test.
+    dispatch, and stage-range (multi-block) gather.
 - **Phase 3 — Async 1-step-stale optimizer.** Overlap the optimizer thread on the CPU-master path;
   verify the controlled staleness test. Sequenced last because it is the hardest to debug — Phases 1–2
   run with a synchronous optimizer internally as scaffolding (sync is not a shipped v1 option).

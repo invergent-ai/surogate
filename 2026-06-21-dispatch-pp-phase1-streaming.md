@@ -29,8 +29,10 @@ Updated before each commit. Status: ☐ not started · ◐ in progress · ☑ do
 
 - ☑ Task 1 — Streamed-vs-resident correctness parity (forward hidden + grad norms), single GPU
 - ☑ Task 2 — Memory invariant: established by construction for single GPU; quantitative
-  scaling test deferred to Phase 2 (see rationale below)
-- ◐ Task 3 — Record Phase-1 verdict in the design spec §7
+  scaling test landed in Phase 2 (`tests/train/dispatch_pp/test_phase2_memory.py`, via
+  `dispatch_pp_debug_weight_residency` introspection — streaming holds `slot_count` blocks
+  resident, `< NUM_LAYERS`)
+- ☑ Task 3 — Phase-1 verdict recorded in the design spec §7 (streamed-vs-resident parity PASS)
 
 **Memory invariant — single GPU (Task 2 resolution).** The bounded-footprint invariant holds by
 construction and is confirmed active: `offload_master=true` places every block's master weight in

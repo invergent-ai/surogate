@@ -30,6 +30,7 @@
 #include "runtime/core/model_factory.h"
 #include "runtime/lora/lora_config.h"
 #include "runtime/dsl/dsl_model.h"
+#include "runtime/dsl/dsl_weight_manager.h"
 #include "runtime/dsl/dsl_grad_store.h"
 #include "runtime/dsl/dsl_runtime.h"
 #include "runtime/executor/graph_executor.h"
@@ -2084,6 +2085,30 @@ std::vector<float> MultiGPUPyTrainer::dispatch_pp_debug_grad_norms_multigpu(
     return result;
 }
 #undef DISPATCH_PP_DBG_STAGE
+
+std::unordered_map<std::string, std::size_t> MultiGPUPyTrainer::dispatch_pp_debug_weight_residency() {
+    std::unordered_map<std::string, std::size_t> out;
+    run_work(
+        [&](sThreadContext& ctx) {
+            auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+            if (!model)
+                throw std::runtime_error("dispatch_pp_debug_weight_residency: DSL model required");
+            auto* wm = model->weight_manager();
+            if (!wm) {
+                // No weight manager => weights are fully resident (not streamed);
+                // there are no streaming slots to report.
+                out["total_persistent_bytes"] = 0;
+                out["gpu_prefetch_buffer_bytes"] = 0;
+                out["prefetch_slot_count"] = 0;
+                return;
+            }
+            out["total_persistent_bytes"] = wm->total_persistent_bytes();
+            out["gpu_prefetch_buffer_bytes"] = wm->gpu_prefetch_buffer_bytes();
+            out["prefetch_slot_count"] = static_cast<std::size_t>(wm->prefetch_slot_count());
+        },
+        0);
+    return out;
+}
 
 std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_gradients(int gpu_id) {
     std::vector<std::pair<std::string, Tensor>> result;

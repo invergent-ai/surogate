@@ -999,6 +999,24 @@ std::size_t DslWeightManager::total_persistent_bytes() const {
     return total;
 }
 
+std::size_t DslWeightManager::gpu_prefetch_buffer_bytes() const {
+    std::size_t total = 0;
+    std::unordered_set<const std::byte*> seen;  // entries within/across slots alias shared buffers
+    for (const auto& slot_map : mPrefetchBuffers) {
+        for (const auto& kv : slot_map) {
+            const Tensor& t = kv.second;
+            if (!is_device_resident(t)) continue;
+            if (!seen.insert(t.Data).second) continue;
+            total += t.bytes();
+        }
+    }
+    return total;
+}
+
+int DslWeightManager::prefetch_slot_count() const {
+    return (mStreamWeights || mConfig.offload_master) ? kNumPrefetchBuffers : 0;
+}
+
 std::size_t
 DslWeightManager::rebind_to_persistent_arena(std::byte* arena_base, std::size_t max_bytes, cudaStream_t stream) {
     if (arena_base == nullptr || max_bytes == 0) return 0;

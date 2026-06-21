@@ -1415,6 +1415,12 @@ NB_MODULE(_surogate, m) {
             "Debug-only dispatch-PP: round-robin backward dispatch of contiguous block stages across "
             "the GPU pool with a CPU-boundary gradient handoff; returns per-block weight-grad L2 norms.")
         .def(
+            "dispatch_pp_debug_weight_residency",
+            [](MultiGPUPyTrainer* trainer) { return trainer->dispatch_pp_debug_weight_residency(); },
+            "Debug-only dispatch-PP: per-GPU weight-residency snapshot (total device-resident weight "
+            "bytes, streaming block double-buffer footprint, slot count). Proves GPU weight residency is "
+            "bounded by the streaming slot count, not the layer count.")
+        .def(
             "step",
             [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets, TokenArray3 position_ids) {
                 const int local_gpus = trainer->local_world_size();

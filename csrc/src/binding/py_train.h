@@ -201,6 +201,11 @@ public:
                                                              const std::int32_t* targets,
                                                              const std::vector<int>& los,
                                                              const std::vector<int>& his);
+    // Per-GPU weight-residency snapshot (GPU 0; the pool is homogeneous): total
+    // device-resident weight bytes, the streaming block double-buffer footprint,
+    // and the slot count. Proves the dispatch-PP memory invariant — GPU weight
+    // residency is bounded by the slot count, not the layer count.
+    std::unordered_map<std::string, std::size_t> dispatch_pp_debug_weight_residency();
     std::vector<std::pair<std::string, Tensor>> get_lora_gradients(int gpu_id);
     std::vector<std::pair<std::string, Tensor>> get_lora_weights(int gpu_id);
     int get_valid_token_count(int gpu_id);
