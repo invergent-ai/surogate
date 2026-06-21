@@ -1156,7 +1156,9 @@ void DslModel::dispatch_pp_backward_stage(
     int hi,
     bool is_loss_stage,
     std::vector<std::pair<std::string, std::vector<std::byte>>> fwd_inject,
-    std::vector<std::pair<std::string, std::vector<std::byte>>> inject_named) {
+    std::vector<std::pair<std::string, std::vector<std::byte>>> inject_named,
+    int micro_step,
+    int total_micro) {
     GraphExecutor* ge = graph_executor();
     if (!ge) {
         throw std::runtime_error("dispatch_pp_backward_stage: requires the DSL GraphExecutor");
@@ -1166,11 +1168,14 @@ void DslModel::dispatch_pp_backward_stage(
 
     ge->ensure_graphs_compiled(B, T);
     if (lora_enabled()) {
-        // Per-block LoRA adapters train on this GPU; set up the run state and zero the
-        // grad accumulators for this stage's single backward (one micro-step, full
-        // batch -- the cross-GPU reduce is skipped, grads are collected by hand).
+        // Per-block LoRA adapters train on this GPU. The pipeline runs total_micro
+        // microbatches through this stage; start_micro_step zeros the grad accumulators
+        // on micro 0 and accumulates thereafter, so a stage's grads sum over all its
+        // microbatches before the optimizer reads them. GradAccumSteps drives the
+        // optimizer's per-token normalization (effective batch = total_micro x B).
         ensure_lora_run_state(comm, static_cast<int>(B), static_cast<int>(T));
-        lora_grads().start_micro_step(mRunState->MainStream, /*micro_step=*/0, /*total_steps=*/1);
+        lora_grads().start_micro_step(mRunState->MainStream, micro_step, total_micro);
+        mRunState->GradAccumSteps = total_micro;
     }
     const CompiledGraph* fwd = ge->compiled_forward();
     const CompiledGraph* bwd = ge->compiled_backward();

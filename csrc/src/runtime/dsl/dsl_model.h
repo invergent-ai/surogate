@@ -141,7 +141,9 @@ public:
                                           int hi,
                                           bool is_loss_stage,
                                           std::vector<std::pair<std::string, std::vector<std::byte>>> fwd_inject,
-                                          std::vector<std::pair<std::string, std::vector<std::byte>>> inject_named);
+                                          std::vector<std::pair<std::string, std::vector<std::byte>>> inject_named,
+                                          int micro_step = 0,
+                                          int total_micro = 1);
     // Whole-graph backward; returns per-block weight-grad L2 norms (block order).
     std::vector<float> dispatch_pp_grad_norms_whole(Tensor inputs,
                                                           Tensor targets,

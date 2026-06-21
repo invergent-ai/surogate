@@ -225,7 +225,8 @@ public:
                                                 const std::vector<int>& his,
                                                 const optimizers::OptimizerConfig& opt_config,
                                                 int step_idx,
-                                                bool stale);
+                                                bool stale,
+                                                int num_microbatches = 1);
     // Apply the last deferred (stale) gradients, if any.
     void dispatch_pp_flush_pending(const optimizers::OptimizerConfig& opt_config);
     std::vector<std::pair<std::string, Tensor>> get_lora_gradients(int gpu_id);

@@ -1253,9 +1253,18 @@ class SurogateTrainerWrapper:
             if self._dispatch_pp:
                 # Round-robin stage dispatch: forward+backward across the GPU pool,
                 # collect grads to the master, optimize, broadcast. One fused call.
+                # The C++ step supports M microbatches per step (grad-accumulated) to
+                # amortize the per-step weight stream, but real amortization needs the
+                # stage's weights to stay resident across the microbatch loop. surogate's
+                # weight streaming is per-block (2-slot prefetch), so a multi-block stage
+                # is re-streamed each microbatch and M>1 gives almost no gain. Keep M=1
+                # until stage-resident weight gathering lands (the next piece).
                 bsz = self._dpp_bsz
+                M = 1
+                rows = M * bsz
                 loss = self.trainer.dispatch_pp_train_step_multigpu(
-                    in_tokens[:bsz], out_tokens[:bsz], self._dpp_los, self._dpp_his, opt_config, step, False
+                    in_tokens[:rows], out_tokens[:rows], self._dpp_los, self._dpp_his,
+                    opt_config, step, False, M
                 )
                 result = {"loss": float(loss), "norm": 0.0}
             elif use_full_step_graphs:

@@ -2157,12 +2157,15 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
                                                               const std::vector<int>& his,
                                                               const optimizers::OptimizerConfig& opt_config,
                                                               int step_idx,
-                                                              bool stale) {
+                                                              bool stale,
+                                                              int num_microbatches) {
     if (los.size() != his.size() || los.empty()) {
         throw std::runtime_error("dispatch_pp_train_step_multigpu: bad stage ranges");
     }
     const int ngpu = static_cast<int>(mContexts.size());
     const int num_stages = static_cast<int>(los.size());
+    const int M = std::max(1, num_microbatches);
+    const long mb_stride = static_cast<long>(B) * static_cast<long>(T);  // tokens per microbatch
     float loss = 0.0f;
 
     using Boundary = std::vector<std::pair<std::string, std::vector<std::byte>>>;
@@ -2188,90 +2191,109 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
     //    restore the stage base so the preserved activations are reclaimed and the
     //    (reused) GPU starts the next step clean -- otherwise saves accumulate on the
     //    compute stack step over step and eventually overflow it.
-    std::vector<Boundary> stage_inputs(static_cast<std::size_t>(num_stages));
+    // Each stage runs all M microbatches before the next stage: the stage's weights
+    // are gathered once (cached across the microbatch loop) and reused M times, so the
+    // per-step weight stream is amortized over M microbatches' compute. stage_inputs
+    // [si][m] is the input boundary for stage si, microbatch m -- the backward pass
+    // re-forwards each (stage, microbatch) from it.
+    std::vector<std::vector<Boundary>> stage_inputs(static_cast<std::size_t>(num_stages),
+                                                    std::vector<Boundary>(static_cast<std::size_t>(M)));
     {
-        Boundary fboundary;  // block hi's residual, fed as the next stage's input
+        std::vector<Boundary> fboundary(static_cast<std::size_t>(M));  // per-microbatch running input boundary
         for (int si = 0; si < num_stages; ++si) {
-            stage_inputs[static_cast<std::size_t>(si)] = fboundary;  // empty for stage 0 (forwards from embedding)
-            if (si == num_stages - 1) break;  // last stage's input captured; its forward isn't needed
+            for (int m = 0; m < M; ++m) stage_inputs[static_cast<std::size_t>(si)][static_cast<std::size_t>(m)] = fboundary[static_cast<std::size_t>(m)];
+            if (si == num_stages - 1) break;  // last stage's inputs captured; its forward isn't needed
             const int gpu = si % ngpu;
             const int lo = los[static_cast<std::size_t>(si)];
             const int hi = his[static_cast<std::size_t>(si)];
-            Boundary inject = fboundary;
-            Boundary next_boundary;
+            std::vector<Boundary> next_boundary(static_cast<std::size_t>(M));
             run_work(
-                [&](sThreadContext& ctx) {
+                [&, si, lo, hi](sThreadContext& ctx) {
                     auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
                     if (!model)
                         throw std::runtime_error("dispatch_pp_train_step_multigpu: DSL model required");
-                    DISPATCH_PP_DBG_STAGE(ctx, inputs, targets);
-                    model->dispatch_pp_forward_stage(ctx.Model->get_input_buffer(),
-                                                           ctx.Model->get_position_ids_buffer(),
-                                                           *ctx.Communicator,
-                                                           lo,
-                                                           hi,
-                                                           std::move(inject),
-                                                           /*preserve_output=*/true);
                     auto* ge = model->graph_executor();
                     const std::string rn = "blocks[" + std::to_string(hi) + "].res_att";
                     const std::string xn = "blocks[" + std::to_string(hi) + "].mlp_down";
-                    next_boundary.emplace_back(rn, ge->read_named_bytes(rn));
-                    next_boundary.emplace_back(xn, ge->read_named_bytes(xn));
-                    ge->restore_stage_base();  // reclaim the preserved-stage activations
+                    for (int m = 0; m < M; ++m) {
+                        DISPATCH_PP_DBG_STAGE(ctx, inputs + static_cast<std::size_t>(m) * mb_stride, nullptr);
+                        Boundary inject = fboundary[static_cast<std::size_t>(m)];
+                        model->dispatch_pp_forward_stage(ctx.Model->get_input_buffer(),
+                                                               ctx.Model->get_position_ids_buffer(),
+                                                               *ctx.Communicator,
+                                                               lo,
+                                                               hi,
+                                                               std::move(inject),
+                                                               /*preserve_output=*/true);
+                        Boundary out;
+                        out.emplace_back(rn, ge->read_named_bytes(rn));
+                        out.emplace_back(xn, ge->read_named_bytes(xn));
+                        ge->restore_stage_base();  // reclaim this microbatch's preserved activations
+                        next_boundary[static_cast<std::size_t>(m)] = std::move(out);
+                    }
                 },
                 gpu);
             fboundary = std::move(next_boundary);
         }
     }
 
-    // 2. Backward-dispatch stages in reverse order with cross-GPU boundary handoff;
-    //    each stage re-forwards only its blocks (from stage_inputs[si]) then runs the
-    //    bounded backward to fill the grad store. Collect each stage's grads to host.
+    // 2. Backward-dispatch stages in reverse order. Each stage runs all M microbatches
+    //    (weights gathered once, reused), re-forwarding each (stage, microbatch) from
+    //    stage_inputs[si][m] then backward; grads accumulate across the microbatches
+    //    (start_micro_step(m, M)) and are collected once per stage. The grad boundary
+    //    d_blocks[lo-1].* is handed down per microbatch.
     std::vector<std::pair<std::string, std::vector<std::byte>>> collected;
-    std::vector<std::pair<std::string, std::vector<std::byte>>> boundary;
+    std::vector<Boundary> gboundary(static_cast<std::size_t>(M));  // per-microbatch running grad boundary
     for (int si = num_stages - 1; si >= 0; --si) {
         const int gpu = si % ngpu;
         const int lo = los[static_cast<std::size_t>(si)];
         const int hi = his[static_cast<std::size_t>(si)];
         const bool is_loss = (si == num_stages - 1);
-        std::vector<std::pair<std::string, std::vector<std::byte>>> inject = boundary;
-        std::vector<std::pair<std::string, std::vector<std::byte>>> fwd_inject =
-            stage_inputs[static_cast<std::size_t>(si)];
-        std::vector<std::pair<std::string, std::vector<std::byte>>> next_boundary;
+        std::vector<Boundary> next_boundary(static_cast<std::size_t>(M));
         std::vector<std::pair<std::string, std::vector<std::byte>>> stage_grads;
-        float stage_loss = 0.0f;
+        double stage_loss = 0.0;
 
         run_work(
-            [&](sThreadContext& ctx) {
+            [&, si, lo, hi, is_loss](sThreadContext& ctx) {
                 auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
                 if (!model)
                     throw std::runtime_error("dispatch_pp_train_step_multigpu: DSL model required");
-                DISPATCH_PP_DBG_STAGE(ctx, inputs, targets);
-                model->dispatch_pp_backward_stage(ctx.Model->get_input_buffer(),
-                                                        ctx.Model->get_target_buffer(),
-                                                        ctx.Model->get_position_ids_buffer(),
-                                                        *ctx.Communicator,
-                                                        lo,
-                                                        hi,
-                                                        is_loss,
-                                                        std::move(fwd_inject),
-                                                        std::move(inject));
-                if (is_loss) stage_loss = model->dispatch_pp_raw_loss();
+                auto* ge = model->graph_executor();
+                const std::string rn = "d_blocks[" + std::to_string(lo - 1) + "].res_att";
+                const std::string xn = "d_blocks[" + std::to_string(lo - 1) + "].mlp_down";
+                for (int m = 0; m < M; ++m) {
+                    DISPATCH_PP_DBG_STAGE(ctx, inputs + static_cast<std::size_t>(m) * mb_stride,
+                                          targets + static_cast<std::size_t>(m) * mb_stride);
+                    Boundary fwd_inject = stage_inputs[static_cast<std::size_t>(si)][static_cast<std::size_t>(m)];
+                    Boundary ginject = gboundary[static_cast<std::size_t>(m)];
+                    model->dispatch_pp_backward_stage(ctx.Model->get_input_buffer(),
+                                                            ctx.Model->get_target_buffer(),
+                                                            ctx.Model->get_position_ids_buffer(),
+                                                            *ctx.Communicator,
+                                                            lo,
+                                                            hi,
+                                                            is_loss,
+                                                            std::move(fwd_inject),
+                                                            std::move(ginject),
+                                                            m,
+                                                            M);
+                    if (is_loss) stage_loss += static_cast<double>(model->dispatch_pp_raw_loss());
+                    if (lo > 0) {
+                        Boundary g;
+                        g.emplace_back(rn, ge->read_named_bytes(rn));
+                        g.emplace_back(xn, ge->read_named_bytes(xn));
+                        next_boundary[static_cast<std::size_t>(m)] = std::move(g);
+                    }
+                }
+                // Grads for [lo..hi] are now summed over all M microbatches; collect once.
                 stage_grads = model->dispatch_pp_read_block_grads(lo, hi, /*include_head=*/is_loss,
                                                                   /*include_embed=*/lo == 0);
-                auto* ge = model->graph_executor();
-                if (lo > 0) {
-                    const std::string rn = "d_blocks[" + std::to_string(lo - 1) + "].res_att";
-                    const std::string xn = "d_blocks[" + std::to_string(lo - 1) + "].mlp_down";
-                    next_boundary.emplace_back(rn, ge->read_named_bytes(rn));
-                    next_boundary.emplace_back(xn, ge->read_named_bytes(xn));
-                }
             },
             gpu);
 
         for (auto& g : stage_grads) collected.push_back(std::move(g));
-        boundary = std::move(next_boundary);
-        if (is_loss) loss = stage_loss;
+        gboundary = std::move(next_boundary);
+        if (is_loss) loss = static_cast<float>(stage_loss / static_cast<double>(M));
     }
 
     // 2. Optimizer + broadcast. In synchronous mode, apply this step's grads now.
