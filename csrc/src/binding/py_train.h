@@ -227,6 +227,10 @@ public:
                                                 int step_idx,
                                                 bool stale,
                                                 int num_microbatches = 1);
+    // Grad norm computed by the last dispatch_pp optimizer apply (for the loss display).
+    float dispatch_pp_last_grad_norm() const {
+        return mDispatchPpLastGradNorm;
+    }
     // Apply the last deferred (stale) gradients, if any.
     void dispatch_pp_flush_pending(const optimizers::OptimizerConfig& opt_config);
     std::vector<std::pair<std::string, Tensor>> get_lora_gradients(int gpu_id);
@@ -373,6 +377,7 @@ private:
     // and the count of optimizer updates applied so far (1-based Adam step).
     std::vector<std::pair<std::string, std::vector<std::byte>>> mDispatchPpPendingGrads;
     int mDispatchPpAppliedStep = 0;
+    float mDispatchPpLastGradNorm = 0.0f;
 };
 
 #endif  //SUROGATE_SRC_BINDING_PY_TRAIN_H

@@ -2405,7 +2405,7 @@ void MultiGPUPyTrainer::dispatch_pp_apply_grads_(
             if (!model)
                 throw std::runtime_error("dispatch_pp_apply_grads_: DSL model required");
             model->dispatch_pp_write_grads(collected);
-            model->dispatch_pp_apply_optimizer(*ctx.Communicator, opt_config, opt_step_1based);
+            mDispatchPpLastGradNorm = model->dispatch_pp_apply_optimizer(*ctx.Communicator, opt_config, opt_step_1based);
         },
         0);
     // Broadcast GPU 0's updated weights to every replica so the pool is consistent
