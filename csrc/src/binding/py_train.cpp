@@ -33,6 +33,7 @@
 #include "runtime/core/model_factory.h"
 #include "runtime/lora/lora_config.h"
 #include "runtime/dsl/dsl_model.h"
+#include "runtime/dsl/shared_master_store.h"
 #include "runtime/dsl/dsl_weight_manager.h"
 #include "runtime/dsl/dsl_grad_store.h"
 #include "runtime/dsl/dsl_runtime.h"
@@ -295,6 +296,9 @@ MultiGPUPyTrainer::~MultiGPUPyTrainer() {
 
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     mThreads->join();
+
+    // Free the cross-GPU shared base masters (after all streaming work has finished).
+    dsl::shared_master_store().clear();
 }
 
 /**

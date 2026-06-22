@@ -14,6 +14,7 @@
 
 #include "runtime/dsl/dsl_model_internal.h"
 #include "runtime/dsl/dsl_runtime.h"
+#include "runtime/dsl/shared_master_store.h"
 #include "runtime/dsl/dsl_weight_manager.h"
 #include "runtime/executor/graph_executor.h"
 #include "runtime/lora/lora_model_utils.h"
@@ -206,6 +207,25 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
             continue;
         }
         Tensor& param = mWeightManager ? mWeightManager->get_master(name) : mParams->get(name);
+
+        // Cross-GPU shared frozen base master: populate (read + page-lock) exactly once.
+        // The first GPU manager to reach `name` claims it and reads/registers below; the
+        // others wait for it and skip the redundant read (they share the same buffer).
+        // The scope guard runs register_and_finish at iteration end for the claimer, no
+        // matter which mapping branch does the read.
+        const bool shared_master = mWeightManager && mWeightManager->is_shared_master(name);
+        if (shared_master && !dsl::shared_master_store().try_claim(name)) {
+            dsl::shared_master_store().wait_populated(name);
+            continue;
+        }
+        struct FinishGuard {
+            const std::string& n;
+            bool active;
+            ~FinishGuard() {
+                if (active) dsl::shared_master_store().register_and_finish(n);
+            }
+        } finish_guard{name, shared_master};
+
         const bool param_sharded = sharded_weights && mWeightManager->is_sharded(name);
         int layer_idx = -1;
         const MappingSpec* spec = internal::find_mapping_spec(mHfMapping, name, layer_idx);

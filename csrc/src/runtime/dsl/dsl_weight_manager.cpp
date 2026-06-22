@@ -15,6 +15,7 @@
 
 #include "config/pretrained_config.h"
 #include "kernels/kernels.h"
+#include "runtime/dsl/shared_master_store.h"
 #include "runtime/dsl/tensor_role.h"
 #include "runtime/lora/lora_config.h"
 #include "runtime/training/runtime_options.h"
@@ -299,8 +300,21 @@ void DslWeightManager::allocate_weights(const Module& module,
         const bool replicate_non_block = sharded_master && (is_embedding_name(name) || is_lm_head_name(name));
         const bool entry_sharded = sharded_master && !replicate_non_block;
 
+        // Share FROZEN offloaded base masters across the per-GPU weight managers: the
+        // base is read-only, so all GPUs can DMA-stream from one pinned host copy instead
+        // of each pinning its own (N x the pin time AND N x the RAM). The store hands out
+        // one buffer per tensor name; it is read + page-locked once (see import_weights).
+        const bool shared_master = mConfig.offload_master && freeze_base && !entry.trainable &&
+                                   !entry_sharded && master_alloc == EAllocationType::PINNED;
         // Allocate master weight (sharded if enabled)
-        if (entry_sharded) {
+        if (shared_master) {
+            std::size_t nelem = 1;
+            for (long d : shape) nelem *= static_cast<std::size_t>(d);
+            const std::size_t bytes = nelem * get_dtype_size(master_dtype);
+            void* buf = shared_master_store().reserve(name, bytes);
+            entry.master = Tensor::from_pointer(static_cast<std::byte*>(buf), /*device=*/-1, master_dtype, shape);
+            mSharedMasterNames.insert(name);
+        } else if (entry_sharded) {
             TensorShard shard = mAllocator->allocate_shard(master_dtype,
                                                            mConfig.shard_idx,
                                                            mConfig.num_shards,

@@ -11,6 +11,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -153,6 +154,12 @@ public:
     }
     bool is_sharded(const std::string& name) const;
 
+    /// True if `name`'s master lives in the cross-GPU SharedMasterStore (frozen base,
+    /// offload_master + LoRA). Such masters are read + page-locked once by import_weights.
+    bool is_shared_master(const std::string& name) const {
+        return mSharedMasterNames.find(name) != mSharedMasterNames.end();
+    }
+
     // ITensorContainer interface (for checkpointing)
     void iterate_tensors(const std::function<void(std::string, const TensorShard&)>& callback) override;
 
@@ -184,6 +191,9 @@ public:
     std::size_t rebind_to_persistent_arena(std::byte* arena_base, std::size_t max_bytes, cudaStream_t stream);
 
 private:
+    // Names of masters backed by the cross-GPU SharedMasterStore (frozen offloaded base).
+    std::unordered_set<std::string> mSharedMasterNames;
+
     void allocate_weights(const Module& module, const Graph& graph, const modules::ModularLoRAConfig* lora_config);
     void allocate_prefetch_buffers();
     void create_cuda_resources();
