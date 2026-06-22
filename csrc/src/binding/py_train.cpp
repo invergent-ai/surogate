@@ -2277,6 +2277,9 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
         -1);
 
     std::vector<double> loss_per_mb(static_cast<std::size_t>(M), 0.0);
+    // Valid (non-pad) tokens per microbatch, counted by the loss stage on its GPU. Summed
+    // after the wavefront and published to the optimizer GPU for valid-token grad-norm scaling.
+    std::vector<int> valid_per_mb(static_cast<std::size_t>(M), 0);
     {
         // grad_out[s][m] = stage s's grad-input boundary (d_blocks[lo-1].*) for microbatch
         // m, consumed by stage s-1. Each backward stage runs on GPU s%N, all M microbatches
@@ -2289,6 +2292,7 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
         for (int i = 0; i < nflags; ++i) ready[i].store(0, std::memory_order_relaxed);
         std::atomic<int>* readyp = ready.get();
         std::vector<double>* lpm = &loss_per_mb;
+        std::vector<int>* vtpm = &valid_per_mb;
         for (int s = num_stages - 1; s >= 0; --s) {
             const int lo = los[static_cast<std::size_t>(s)];
             const int hi = his[static_cast<std::size_t>(s)];
@@ -2297,7 +2301,7 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
             std::vector<Boundary>* up_g = (s < num_stages - 1) ? &grad_out[static_cast<std::size_t>(s + 1)] : nullptr;
             std::vector<Boundary>* sin = &stage_inputs[static_cast<std::size_t>(s)];
             dispatch_async(
-                [this, inputs, targets, mb_stride, M, s, lo, hi, is_loss, my_g, up_g, sin, readyp, lpm](
+                [this, inputs, targets, mb_stride, M, s, lo, hi, is_loss, my_g, up_g, sin, readyp, lpm, vtpm](
                     sThreadContext& ctx) {
                     auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
                     if (!model)
@@ -2326,7 +2330,10 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
                                                                 std::move(ginj),
                                                                 /*micro_step=*/1,  // pre-zeroed -> always accumulate
                                                                 /*total_micro=*/M);
-                        if (is_loss) (*lpm)[static_cast<std::size_t>(m)] = static_cast<double>(model->dispatch_pp_raw_loss());
+                        if (is_loss) {
+                            (*lpm)[static_cast<std::size_t>(m)] = static_cast<double>(model->dispatch_pp_raw_loss());
+                            (*vtpm)[static_cast<std::size_t>(m)] = model->dispatch_pp_loss_valid_tokens();
+                        }
                         if (lo > 0) {
                             Boundary g;
                             g.emplace_back(rn, ge->read_named_bytes(rn));
@@ -2352,6 +2359,8 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
         for (double x : loss_per_mb) ls += x;
         loss = static_cast<float>(ls / static_cast<double>(M));
     }
+    int step_valid_tokens = 0;
+    for (int v : valid_per_mb) step_valid_tokens += v;
 
     // Collect each stage's accumulated grads from its GPU (grads stay resident on the
     // stage's GPU until read here, after the whole backward wavefront).
@@ -2379,24 +2388,28 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
     //    staleness), then stash this step's grads for the next call.
     if (stale) {
         if (!mDispatchPpPendingGrads.empty()) {
-            dispatch_pp_apply_grads_(mDispatchPpPendingGrads, opt_config, ++mDispatchPpAppliedStep);
+            // The deferred grads belong to the previous step — scale by its valid-token count.
+            dispatch_pp_apply_grads_(mDispatchPpPendingGrads, opt_config, ++mDispatchPpAppliedStep,
+                                     mDispatchPpPendingValidTokens);
         }
         mDispatchPpPendingGrads = std::move(collected);
+        mDispatchPpPendingValidTokens = step_valid_tokens;
     } else {
-        dispatch_pp_apply_grads_(collected, opt_config, step_idx + 1);
+        dispatch_pp_apply_grads_(collected, opt_config, step_idx + 1, step_valid_tokens);
     }
     return loss;
 }
 
 void MultiGPUPyTrainer::dispatch_pp_flush_pending(const optimizers::OptimizerConfig& opt_config) {
     if (mDispatchPpPendingGrads.empty()) return;
-    dispatch_pp_apply_grads_(mDispatchPpPendingGrads, opt_config, ++mDispatchPpAppliedStep);
+    dispatch_pp_apply_grads_(mDispatchPpPendingGrads, opt_config, ++mDispatchPpAppliedStep,
+                             mDispatchPpPendingValidTokens);
     mDispatchPpPendingGrads.clear();
 }
 
 void MultiGPUPyTrainer::dispatch_pp_apply_grads_(
     const std::vector<std::pair<std::string, std::vector<std::byte>>>& collected,
-    const optimizers::OptimizerConfig& opt_config, int opt_step_1based) {
+    const optimizers::OptimizerConfig& opt_config, int opt_step_1based, int valid_tokens) {
     // GPU 0 holds the master replica: write the collected grads into its store and
     // run the optimizer there.
     run_work(
@@ -2404,8 +2417,11 @@ void MultiGPUPyTrainer::dispatch_pp_apply_grads_(
             auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
             if (!model)
                 throw std::runtime_error("dispatch_pp_apply_grads_: DSL model required");
+            // The loss GPU counted valid tokens; publish the step total here so the optimizer
+            // (on this master GPU) scales the grad norm per valid token, not per padded token.
+            model->set_dispatch_pp_valid_tokens(valid_tokens);
             model->dispatch_pp_write_grads(collected);
-            model->dispatch_pp_apply_optimizer(*ctx.Communicator, opt_config, opt_step_1based);
+            mDispatchPpLastGradNorm = model->dispatch_pp_apply_optimizer(*ctx.Communicator, opt_config, opt_step_1based);
         },
         0);
     // Broadcast GPU 0's updated weights to every replica so the pool is consistent

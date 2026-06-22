@@ -1322,7 +1322,7 @@ class SurogateTrainerWrapper:
                     in_tokens[:rows], out_tokens[:rows], self._dpp_los, self._dpp_his,
                     opt_config, step, False, M
                 )
-                result = {"loss": float(loss), "norm": 0.0}
+                result = {"loss": float(loss), "norm": float(self.trainer.dispatch_pp_last_grad_norm())}
             elif use_full_step_graphs:
                 result = self.trainer.train_step_graphed(in_tokens, out_tokens, pos_ids, opt_config, step + 1)
                 # Optional LoRA grad debug runs after graph replay (post-update).

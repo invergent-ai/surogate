@@ -1232,9 +1232,19 @@ void DslModel::dispatch_pp_backward_stage(
             CUDA_CHECK(cudaMemcpyAsync(h.data(), rs.Losses.template get<float>(), n * sizeof(float),
                                        cudaMemcpyDeviceToHost, rs.MainStream));
             CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
+            // Per-token CE is exactly 0 for masked/padding positions and strictly > 0 for
+            // valid targets, so count(>0) is the local valid-token count. Normalize the loss
+            // by valid (not total B*T) tokens to match the standard per-valid-token loss, and
+            // accumulate the count across the step's microbatches for the grad-norm scale.
             double s = 0.0;
-            for (float x : h) s += x;
-            mDispatchPpLastLoss = static_cast<float>(s / static_cast<double>(n));
+            std::size_t valid = 0;
+            for (float x : h) {
+                s += x;
+                if (x > 0.0f) ++valid;
+            }
+            const std::size_t vc = std::max<std::size_t>(1, valid);
+            mDispatchPpLastLoss = static_cast<float>(s / static_cast<double>(vc));
+            mDispatchPpLossValidTokens = static_cast<int>(vc);
         }
     }
 
@@ -1572,16 +1582,27 @@ float DslModel::dispatch_pp_raw_loss() const {
 float DslModel::dispatch_pp_apply_optimizer(NCCLCommunicator& comm,
                                                   const optimizers::OptimizerConfig& opt_config,
                                                   int step_idx) {
-    // The collecting GPU never ran reduce_loss (the dispatch backward skips the DP
-    // loss reduce), so ValidTokenCount is unset — use total-token normalization
-    // instead of per-valid-token. step_idx is already 1-based.
-    mUseTokenScale = false;
+    // The dispatch backward skips the DP loss all-reduce (would deadlock), but the loss
+    // stage counted valid (non-pad) tokens locally over the step's microbatches. Publish
+    // that into ValidTokenCount and use per-valid-token normalization so the grad norm (and
+    // the optimizer's grad scale) match the standard path -- not the inflated total-token
+    // (incl padding x world_size) fallback. step_idx is already 1-based.
+    auto& rs = *mRunState;
+    const int vc = std::max(1, mDispatchPpValidTokens);
+    if (rs.ValidTokenCount.Data) {
+        CUDA_CHECK(cudaMemcpyAsync(rs.ValidTokenCount.Data, &vc, sizeof(int), cudaMemcpyHostToDevice, rs.MainStream));
+        CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
+        mUseTokenScale = true;
+    } else {
+        mUseTokenScale = false;
+    }
     // Grads are already complete on this GPU (collected by hand, not via DDP) — tell
     // the optimizer to skip the cross-GPU grad/norm all-reduce (would deadlock).
     mDispatchPpLocalGrads = true;
     update_with_config(comm, opt_config, step_idx);
     mDispatchPpLocalGrads = false;
-    return 0.0f;
+    mDispatchPpValidTokens = 0;  // reset for the next step
+    return get_norm();
 }
 
 std::vector<float> DslModel::dispatch_pp_grad_norms_subranges(Tensor inputs,

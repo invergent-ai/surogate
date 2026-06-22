@@ -1496,6 +1496,10 @@ NB_MODULE(_surogate, m) {
             nb::arg("opt_config"),
             "Apply the last deferred (stale) dispatch-PP gradients, if any.")
         .def(
+            "dispatch_pp_last_grad_norm",
+            [](MultiGPUPyTrainer* trainer) { return trainer->dispatch_pp_last_grad_norm(); },
+            "Grad norm from the last dispatch-PP optimizer apply (for the loss display).")
+        .def(
             "step",
             [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets, TokenArray3 position_ids) {
                 const int local_gpus = trainer->local_world_size();

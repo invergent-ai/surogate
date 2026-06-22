@@ -184,6 +184,12 @@ public:
     // which the dispatch backward leaves unset. Monotone with the mean loss, so it
     // tracks convergence.
     [[nodiscard]] float dispatch_pp_raw_loss() const;
+    // Valid (non-pad) tokens the loss stage counted for the last microbatch; the multi-GPU
+    // trainer sums these across microbatches and publishes the total via the setter below so
+    // dispatch_pp_apply_optimizer (which runs on the master GPU, not the loss GPU) can scale
+    // the grad norm per valid token instead of per total (padded) token.
+    [[nodiscard]] int dispatch_pp_loss_valid_tokens() const { return mDispatchPpLossValidTokens; }
+    void set_dispatch_pp_valid_tokens(int n) { mDispatchPpValidTokens = n; }
     // Backward as two contiguous block sub-ranges (high range first, boundary
     // grad round-tripped through host); returns per-block grad norms.
     std::vector<float> dispatch_pp_grad_norms_subranges(Tensor inputs,
@@ -498,6 +504,11 @@ private:
     // deadlock waiting for the idle pool.
     bool mDispatchPpLocalGrads = false;
     float mDispatchPpLastLoss = 0.0f;         // mean loss stashed by the dispatch backward's forward
+    int mDispatchPpLossValidTokens = 0;       // valid (non-pad) target tokens the loss stage counted
+                                              // for the current microbatch (read back per microbatch)
+    int mDispatchPpValidTokens = 0;           // valid tokens summed over the step's microbatches,
+                                              // published onto the optimizer GPU for valid-token
+                                              // grad-norm scaling (the dispatch path skips reduce_loss)
     bool mDocMaskingActive = false;           // set by forward(), cleared by backward()
     float* mGrpoInvTemperatureGpu = nullptr;  // persists from forward_for_grpo() to backward_grpo()
 
