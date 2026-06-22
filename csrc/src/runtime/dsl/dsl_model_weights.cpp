@@ -96,6 +96,12 @@ void DslModel::init_weights(NCCLCommunicator& comm) {
         cudaStream_t stream = mRunState ? mRunState->MainStream : cudaStreamDefault;
         mWeightManager->sync_work_from_master(stream);
         CUDA_CHECK(cudaStreamSynchronize(stream));
+        // Quantize frozen matmul block masters to FP8 in place so per-stage streaming ships
+        // FP8 bytes (no-op unless dispatch-PP + fp8_hybrid). Must run after the masters are
+        // populated and before the first gather.
+        if (mRunState) {
+            mWeightManager->finalize_fp8_block_masters(mRunState->DeviceProp, stream);
+        }
     }
 
     comm.barrier();
@@ -729,6 +735,12 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
         cudaStream_t stream = mRunState ? mRunState->MainStream : cudaStreamDefault;
         mWeightManager->sync_work_from_master(stream);
         CUDA_CHECK(cudaStreamSynchronize(stream));
+        // Quantize frozen matmul block masters to FP8 in place so per-stage streaming ships
+        // FP8 bytes (no-op unless dispatch-PP + fp8_hybrid). Must run after the masters are
+        // populated and before the first gather.
+        if (mRunState) {
+            mWeightManager->finalize_fp8_block_masters(mRunState->DeviceProp, stream);
+        }
     }
 
     comm.barrier();

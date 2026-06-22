@@ -743,7 +743,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
                 "parallelism=dispatch_pp does not support MoE expert parallelism "
                 "(ep_size>1) in v1; this is a deferred phase."
             )
-        if self.recipe not in (None, "bf16", "fp8_hybrid"):
+        if self.recipe not in (None, "bf16", "fp8_hybrid", "fp8-hybrid"):
             raise ValueError(
                 "parallelism=dispatch_pp supports recipe bf16 or fp8_hybrid; NVFP4 stage "
                 f"streaming is deferred (got recipe={self.recipe!r})."

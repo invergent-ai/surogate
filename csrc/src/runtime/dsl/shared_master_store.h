@@ -47,6 +47,15 @@ public:
     /// Block until `name` has been populated by its claimer.
     void wait_populated(const std::string& name);
 
+    /// In-place FP8 quantization latch (dispatch-PP + fp8_hybrid): the shared buffer is
+    /// quantized BF16->FP8 exactly once, the FP8 bytes + inline scale written into its front.
+    /// try_claim_fp8 returns true for exactly one caller (which quantizes, then finish_fp8);
+    /// all others wait_fp8 then reuse the now-FP8 buffer. Distinct from the populate latch
+    /// above (that one governed the file read; this one governs the FP8 conversion).
+    bool try_claim_fp8(const std::string& name);
+    void finish_fp8(const std::string& name);
+    void wait_fp8(const std::string& name);
+
     /// True if `name` has a reserved shared buffer.
     bool has(const std::string& name) const;
 
@@ -60,6 +69,8 @@ private:
         std::size_t bytes = 0;
         bool claimed = false;
         bool populated = false;
+        bool fp8_claimed = false;
+        bool fp8_populated = false;
     };
     mutable std::mutex mMutex;
     std::condition_variable mCond;

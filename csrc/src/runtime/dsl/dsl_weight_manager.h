@@ -68,6 +68,14 @@ struct DslWeightManagerConfig {
 
     // FP8 caching
     bool enable_fp8_forward = false;
+
+    // FP8 weight streaming (dispatch-PP + fp8_hybrid): store frozen matmul block masters as
+    // FP8-E4M3 in pinned host and stream the FP8 bytes (half the PCIe traffic), feeding the
+    // FP8 GEMM directly. Only the matmul-weight fields (qkv/out/mlp_*) are quantized; conv /
+    // norm / A_log etc. stay BF16. Skipped layers match the recipe's skip_quant_* options.
+    bool stream_fp8 = false;
+    int fp8_skip_first_layers = 0;
+    int fp8_skip_last_layers = 0;
 };
 
 /**
@@ -128,6 +136,11 @@ public:
     // Synchronization helpers
     void wait_for_gather(int layer_idx, cudaStream_t stream);
     void invalidate();  ///< Invalidate all cached weights (call on optimizer update)
+
+    /// Quantize the frozen matmul block masters to FP8-E4M3 in place (once, shared-master
+    /// safe) so per-stage streaming ships FP8 bytes. No-op unless mConfig.stream_fp8. Call
+    /// after import_weights has populated the BF16 masters.
+    void finalize_fp8_block_masters(const cudaDeviceProp& dp, cudaStream_t stream);
 
     // Master weight access for optimizer
     Tensor& get_master(const std::string& name);
@@ -201,6 +214,11 @@ private:
 
     // Helper to convert master -> work (dtype conversion, H2D, etc.)
     void convert_to_work(const Tensor& master, Tensor& work, cudaStream_t stream);
+
+    /// True if `name` is a frozen matmul block weight eligible for FP8 streaming
+    /// (mConfig.stream_fp8 + a recognized matmul field + a non-skipped layer). Conv / norm /
+    /// A_log / router-gate weights return false so they keep their BF16 streaming.
+    bool is_fp8_stream_weight(const std::string& name) const;
 
     // Helper to parse layer index from weight name
     static bool parse_layer_index(const std::string& name, int& layer_idx);

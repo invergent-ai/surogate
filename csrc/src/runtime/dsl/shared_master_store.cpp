@@ -59,6 +59,27 @@ void SharedMasterStore::wait_populated(const std::string& name) {
     mCond.wait(lk, [&] { return mEntries.at(name).populated; });
 }
 
+bool SharedMasterStore::try_claim_fp8(const std::string& name) {
+    std::lock_guard<std::mutex> lk(mMutex);
+    auto& e = mEntries.at(name);
+    if (e.fp8_claimed || e.fp8_populated) return false;
+    e.fp8_claimed = true;
+    return true;
+}
+
+void SharedMasterStore::finish_fp8(const std::string& name) {
+    {
+        std::lock_guard<std::mutex> lk(mMutex);
+        mEntries.at(name).fp8_populated = true;
+    }
+    mCond.notify_all();
+}
+
+void SharedMasterStore::wait_fp8(const std::string& name) {
+    std::unique_lock<std::mutex> lk(mMutex);
+    mCond.wait(lk, [&] { return mEntries.at(name).fp8_populated; });
+}
+
 bool SharedMasterStore::has(const std::string& name) const {
     std::lock_guard<std::mutex> lk(mMutex);
     return mEntries.find(name) != mEntries.end();
