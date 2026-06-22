@@ -410,17 +410,8 @@ CompiledExecutor::~CompiledExecutor() {
         mMemEffScratchOffset = 0;
     }
 
-    // Free persistent MoE saved tensor buffers. Arena-backed entries are
-    // skipped — their storage is owned by mPhaseArenas.
-    for (auto& [name, buffer] : mMoeSavedBuffers) {
-        if (!buffer) continue;
-        auto ab_it = mMoeSavedArenaBacked.find(name);
-        const bool arena_backed = ab_it != mMoeSavedArenaBacked.end() && ab_it->second;
-        if (!arena_backed) cudaFree(buffer);
-    }
-    mMoeSavedBuffers.clear();
-    mMoeSavedSizes.clear();
-    mMoeSavedArenaBacked.clear();
+    // Free persistent saved-tensor buffers (the one arena-aware release point).
+    mSavedCache.free_all();
 
     // EP per-layer state, LLEP state, shared buffers, buffer pool, and
     // the weight-transfer stream are all owned by mEpStrategy and released
@@ -575,10 +566,10 @@ CompiledExecutor::MoeSavedAlloc CompiledExecutor::allocate_moe_saved(std::size_t
     MoeSavedAlloc result;
     if (nbytes == 0) return result;
     if (mPhaseArenas && mPhaseArenas->allocated && mPhaseArenas->moe_saved_ptr &&
-        mMoeSavedBumpOffset + nbytes <= mPhaseArenas->moe_saved_bytes) {
-        result.ptr = mPhaseArenas->moe_saved_ptr + mMoeSavedBumpOffset;
+        mSavedCache.bump_offset() + nbytes <= mPhaseArenas->moe_saved_bytes) {
+        result.ptr = mPhaseArenas->moe_saved_ptr + mSavedCache.bump_offset();
         result.arena_backed = true;
-        mMoeSavedBumpOffset += nbytes;
+        mSavedCache.bump_offset() += nbytes;
         return result;
     }
     void* raw = nullptr;

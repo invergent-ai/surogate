@@ -28,6 +28,7 @@
 #include "runtime/executor/execution_request.h"
 #include "runtime/ep/ep_state.h"
 #include "runtime/executor/graph_executor_internal.h"
+#include "runtime/executor/saved_tensor_cache.h"
 #include "runtime/dsl/ir.h"
 #include "runtime/dsl/tensor_slot.h"
 #include "runtime/dsl/tensor_slot_registry.h"
@@ -810,11 +811,6 @@ private:
     std::size_t mBwdCrossLayerCurrentLiveBytes = 0;
 
     // Cross-step monotonic bump cursor into the moe_saved arena. Never
-    // reset — MoE save buffers are keyed by name and persist for the
-    // executor's lifetime. Size growth re-bumps (same semantics as the
-    // cudaFree+cudaMalloc cycle, which also wastes the old buffer).
-    std::size_t mMoeSavedBumpOffset = 0;
-    std::unordered_map<std::string, bool> mMoeSavedArenaBacked;
 
     /// Allocate `nbytes` in `mPhaseArenas.bwd_cross_layer_ptr`. The arena
     /// is sized at 64 MiB (see graph_executor.cpp) and reset per step.
@@ -992,10 +988,10 @@ private:
     // Avoids redundant D2H synchronization in grouped GEMM ops within the same layer.
     std::unordered_map<int, std::vector<int>> mMoEHostOffsetsCache;
 
-    // Persistent storage for MoE saved tensors (per-layer copies to prevent buffer reuse corruption)
-    // Maps tensor name to persistent GPU buffer (cudaMalloc'd, NOT from stack allocator)
-    std::unordered_map<std::string, void*> mMoeSavedBuffers;
-    std::unordered_map<std::string, size_t> mMoeSavedSizes;
+    // Persistent saved-tensor cache: gated-delta states, rope/qk-norm caches, MoE expert
+    // bookkeeping, and the SaveForBwd persist fallback. Single owner of the buffers +
+    // arena-backed flags + arena bump; free_all() is the only (arena-aware) release point.
+    SavedTensorCache mSavedCache;
 
     void clear_replay_copied_refs();
 
@@ -1047,17 +1043,17 @@ public:
     /// Total bytes of persistent saved buffers (untracked by TensorAllocator).
     size_t saved_buffers_total_bytes() const {
         size_t total = 0;
-        for (const auto& [name, sz] : mMoeSavedSizes)
+        for (const auto& [name, sz] : mSavedCache.sizes())
             total += sz;
         return total;
     }
     /// Number of persistent saved buffers.
     int saved_buffers_count() const {
-        return static_cast<int>(mMoeSavedSizes.size());
+        return static_cast<int>(mSavedCache.sizes().size());
     }
     /// Per-buffer sizes for diagnostics.
     const std::unordered_map<std::string, size_t>& saved_buffers_sizes() const {
-        return mMoeSavedSizes;
+        return mSavedCache.sizes();
     }
 };
 

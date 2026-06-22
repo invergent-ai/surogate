@@ -126,8 +126,8 @@ void CompiledExecutor::dispatch_mamba_gated_rmsnorm(const CompiledOp& op) {
         // Hybrid EP paths can trigger shape/layout fallback more often. Avoid stack-backed
         // temporaries for graph outputs: they can be recycled before downstream consumers run.
         out_t = make_persistent_tensor(mRunState,
-                                       mMoeSavedBuffers,
-                                       mMoeSavedSizes,
+                                       mSavedCache.buffers(),
+                                       mSavedCache.sizes(),
                                        op.op_id + ".out_fallback",
                                        x.DType,
                                        x_shape);
@@ -184,21 +184,21 @@ void CompiledExecutor::dispatch_mamba_gated_rmsnorm(const CompiledOp& op) {
         auto persist_save = [&](const std::string& name, const Tensor& src) {
             const size_t bytes = src.bytes();
             if (bytes == 0) return;
-            auto buf_it = mMoeSavedBuffers.find(name);
-            if (buf_it == mMoeSavedBuffers.end() || mMoeSavedSizes[name] < bytes) {
+            auto buf_it = mSavedCache.buffers().find(name);
+            if (buf_it == mSavedCache.buffers().end() || mSavedCache.sizes()[name] < bytes) {
                 if (capturing) {
                     throw std::runtime_error("mamba_gated_rmsnorm: missing preallocated save buffer for '" + name +
                                              "' during CUDA graph capture");
                 }
-                if (buf_it != mMoeSavedBuffers.end() && buf_it->second != nullptr) {
+                if (buf_it != mSavedCache.buffers().end() && buf_it->second != nullptr) {
                     CUDA_CHECK(cudaFree(buf_it->second));
                 }
                 void* new_buffer = nullptr;
                 CUDA_CHECK(cudaMalloc(&new_buffer, bytes));
-                mMoeSavedBuffers[name] = new_buffer;
-                mMoeSavedSizes[name] = bytes;
+                mSavedCache.buffers()[name] = new_buffer;
+                mSavedCache.sizes()[name] = bytes;
             }
-            CUDA_CHECK(cudaMemcpyAsync(mMoeSavedBuffers[name],
+            CUDA_CHECK(cudaMemcpyAsync(mSavedCache.buffers()[name],
                                        src.Data,
                                        bytes,
                                        cudaMemcpyDeviceToDevice,
@@ -208,7 +208,7 @@ void CompiledExecutor::dispatch_mamba_gated_rmsnorm(const CompiledOp& op) {
             saved.Rank = src.Rank;
             for (int d = 0; d < src.Rank; ++d)
                 saved.Sizes[d] = src.Sizes[d];
-            saved.Data = static_cast<std::byte*>(mMoeSavedBuffers[name]);
+            saved.Data = static_cast<std::byte*>(mSavedCache.buffers()[name]);
             (*mSaved)[name] = saved;
         };
 
@@ -455,8 +455,8 @@ void CompiledExecutor::dispatch_mamba_gated_rmsnorm_backward(const CompiledOp& o
             // Use persistent storage rather than temp_alloc to avoid dangling output pointers.
             std::vector<long> shape(src.Sizes.begin(), src.Sizes.begin() + src.Rank);
             dst = make_persistent_tensor(mRunState,
-                                         mMoeSavedBuffers,
-                                         mMoeSavedSizes,
+                                         mSavedCache.buffers(),
+                                         mSavedCache.sizes(),
                                          op.op_id + "." + out_ref.name + ".realloc",
                                          src.DType,
                                          shape);

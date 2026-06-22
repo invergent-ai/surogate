@@ -142,17 +142,17 @@ void CompiledExecutor::dispatch_moe_permute(const CompiledOp& op) {
                 if (bytes == 0) {
                     return;
                 }
-                auto buf_it = mMoeSavedBuffers.find(key);
-                if (buf_it == mMoeSavedBuffers.end() || mMoeSavedSizes[key] < bytes) {
-                    if (buf_it != mMoeSavedBuffers.end() && buf_it->second != nullptr) {
+                auto buf_it = mSavedCache.buffers().find(key);
+                if (buf_it == mSavedCache.buffers().end() || mSavedCache.sizes()[key] < bytes) {
+                    if (buf_it != mSavedCache.buffers().end() && buf_it->second != nullptr) {
                         CUDA_CHECK(cudaFree(buf_it->second));
                     }
                     void* new_buffer = nullptr;
                     CUDA_CHECK(cudaMalloc(&new_buffer, bytes));
-                    mMoeSavedBuffers[key] = new_buffer;
-                    mMoeSavedSizes[key] = bytes;
+                    mSavedCache.buffers()[key] = new_buffer;
+                    mSavedCache.sizes()[key] = bytes;
                 }
-                void* dst_buffer = mMoeSavedBuffers[key];
+                void* dst_buffer = mSavedCache.buffers()[key];
                 CUDA_CHECK(
                     cudaMemcpyAsync(dst_buffer, src.Data, bytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
             };
@@ -207,13 +207,13 @@ void CompiledExecutor::dispatch_moe_permute_backward(const CompiledOp& op) {
     }
     if (layer_idx >= 0) {
         const std::string key = moe_saved_key(layer_idx, "moe_gather_indices");
-        auto it = mMoeSavedBuffers.find(key);
-        if (it == mMoeSavedBuffers.end()) {
+        auto it = mSavedCache.buffers().find(key);
+        if (it == mSavedCache.buffers().end()) {
             // Backward-compatible fallback for unsuffixed key.
             const std::string compat_key = "blocks[" + std::to_string(layer_idx) + "].moe_gather_indices";
-            it = mMoeSavedBuffers.find(compat_key);
+            it = mSavedCache.buffers().find(compat_key);
         }
-        if (it != mMoeSavedBuffers.end() && it->second != nullptr) {
+        if (it != mSavedCache.buffers().end() && it->second != nullptr) {
             const int top_k = op.attrs.top_k > 0 ? op.attrs.top_k : 1;
             const int num_tokens = static_cast<int>(d_input.Sizes[0]);
             const int total_tokens = num_tokens * top_k;

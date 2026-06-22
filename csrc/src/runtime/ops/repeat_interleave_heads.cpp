@@ -36,8 +36,8 @@ void CompiledExecutor::dispatch_repeat_interleave_heads(const CompiledOp& op) {
     const std::vector<long> out_shape{B, T, H * repeats, D};
     Tensor out = ensure_output_tensor_or_persistent(ensure_output_tensor(op.outputs[0]),
                                                     mRunState,
-                                                    mMoeSavedBuffers,
-                                                    mMoeSavedSizes,
+                                                    mSavedCache.buffers(),
+                                                    mSavedCache.sizes(),
                                                     op.op_id + "." + op.outputs[0].name + ".out",
                                                     x.DType,
                                                     out_shape,

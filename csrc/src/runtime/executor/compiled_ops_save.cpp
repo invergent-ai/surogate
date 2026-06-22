@@ -195,21 +195,21 @@ void CompiledExecutor::save_moe_layer_tensors(int layer_idx) {
 
         // Allocate or resize persistent buffer if needed (arena bump with
         // cudaMalloc fallback).
-        auto buf_it = mMoeSavedBuffers.find(name);
-        if (buf_it == mMoeSavedBuffers.end() || mMoeSavedSizes[name] < bytes) {
-            if (buf_it != mMoeSavedBuffers.end() && buf_it->second != nullptr) {
-                auto ab_it = mMoeSavedArenaBacked.find(name);
-                const bool old_was_arena = ab_it != mMoeSavedArenaBacked.end() && ab_it->second;
+        auto buf_it = mSavedCache.buffers().find(name);
+        if (buf_it == mSavedCache.buffers().end() || mSavedCache.sizes()[name] < bytes) {
+            if (buf_it != mSavedCache.buffers().end() && buf_it->second != nullptr) {
+                auto ab_it = mSavedCache.arena_backed().find(name);
+                const bool old_was_arena = ab_it != mSavedCache.arena_backed().end() && ab_it->second;
                 if (!old_was_arena) CUDA_CHECK(cudaFree(buf_it->second));
             }
             auto a = allocate_moe_saved(bytes);
-            mMoeSavedBuffers[name] = a.ptr;
-            mMoeSavedSizes[name] = bytes;
-            mMoeSavedArenaBacked[name] = a.arena_backed;
+            mSavedCache.buffers()[name] = a.ptr;
+            mSavedCache.sizes()[name] = bytes;
+            mSavedCache.arena_backed()[name] = a.arena_backed;
         }
 
         // Copy data to persistent buffer
-        void* dst_buffer = mMoeSavedBuffers[name];
+        void* dst_buffer = mSavedCache.buffers()[name];
         CUDA_CHECK(cudaMemcpyAsync(dst_buffer, tensor.Data, bytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
 
         // Update all authoritative tables to point at the persistent buffer.
@@ -307,22 +307,22 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
         if (bytes == 0) {
             return;
         }
-        auto buf_it = mMoeSavedBuffers.find(name);
-        if (buf_it == mMoeSavedBuffers.end() || mMoeSavedSizes[name] < bytes) {
+        auto buf_it = mSavedCache.buffers().find(name);
+        if (buf_it == mSavedCache.buffers().end() || mSavedCache.sizes()[name] < bytes) {
             if (debug_save_buffers) {
                 std::cerr << "[SAVE-BUF] alloc name=" << name << " bytes=" << bytes
-                          << " old_bytes=" << (buf_it == mMoeSavedBuffers.end() ? 0 : mMoeSavedSizes[name])
+                          << " old_bytes=" << (buf_it == mSavedCache.buffers().end() ? 0 : mSavedCache.sizes()[name])
                           << std::endl;
             }
-            if (buf_it != mMoeSavedBuffers.end() && buf_it->second != nullptr) {
-                auto ab_it = mMoeSavedArenaBacked.find(name);
-                const bool old_was_arena = ab_it != mMoeSavedArenaBacked.end() && ab_it->second;
+            if (buf_it != mSavedCache.buffers().end() && buf_it->second != nullptr) {
+                auto ab_it = mSavedCache.arena_backed().find(name);
+                const bool old_was_arena = ab_it != mSavedCache.arena_backed().end() && ab_it->second;
                 if (!old_was_arena) CUDA_CHECK(cudaFree(buf_it->second));
             }
             auto a = allocate_moe_saved(bytes);
-            mMoeSavedBuffers[name] = a.ptr;
-            mMoeSavedSizes[name] = bytes;
-            mMoeSavedArenaBacked[name] = a.arena_backed;
+            mSavedCache.buffers()[name] = a.ptr;
+            mSavedCache.sizes()[name] = bytes;
+            mSavedCache.arena_backed()[name] = a.arena_backed;
         }
     };
 
@@ -763,8 +763,8 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
             (should_persist(name, prefer_live, force_persist_name) || src_stack_backed) && src.Data != nullptr;
         if (need_persist && src.Data != nullptr) {
             const size_t bytes = src.bytes();
-            auto buf_it = mMoeSavedBuffers.find(name);
-            if (buf_it == mMoeSavedBuffers.end() || mMoeSavedSizes[name] < bytes) {
+            auto buf_it = mSavedCache.buffers().find(name);
+            if (buf_it == mSavedCache.buffers().end() || mSavedCache.sizes()[name] < bytes) {
                 if (capturing) {
                     // During CUDA graph capture we cannot allocate new buffers.
                     // Fall back to metadata-only save so backward can resolve
@@ -774,17 +774,17 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
                     (*mSaved)[name] = meta;
                     return;
                 }
-                if (buf_it != mMoeSavedBuffers.end() && buf_it->second != nullptr) {
-                    auto ab_it = mMoeSavedArenaBacked.find(name);
-                    const bool old_was_arena = ab_it != mMoeSavedArenaBacked.end() && ab_it->second;
+                if (buf_it != mSavedCache.buffers().end() && buf_it->second != nullptr) {
+                    auto ab_it = mSavedCache.arena_backed().find(name);
+                    const bool old_was_arena = ab_it != mSavedCache.arena_backed().end() && ab_it->second;
                     if (!old_was_arena) CUDA_CHECK(cudaFree(buf_it->second));
                 }
                 auto a = allocate_moe_saved(bytes);
-                mMoeSavedBuffers[name] = a.ptr;
-                mMoeSavedSizes[name] = bytes;
-                mMoeSavedArenaBacked[name] = a.arena_backed;
+                mSavedCache.buffers()[name] = a.ptr;
+                mSavedCache.sizes()[name] = bytes;
+                mSavedCache.arena_backed()[name] = a.arena_backed;
             }
-            void* dst_buffer = mMoeSavedBuffers[name];
+            void* dst_buffer = mSavedCache.buffers()[name];
             CUDA_CHECK(cudaMemcpyAsync(dst_buffer, src.Data, bytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
             Tensor saved_tensor;
             saved_tensor.DType = src.DType;

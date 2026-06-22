@@ -93,8 +93,8 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down(const CompiledOp& op) {
 
         void* saved_ptr = nullptr;
         for (const auto& key : candidate_keys) {
-            auto it_saved = mMoeSavedBuffers.find(key);
-            if (it_saved != mMoeSavedBuffers.end() && it_saved->second != nullptr) {
+            auto it_saved = mSavedCache.buffers().find(key);
+            if (it_saved != mSavedCache.buffers().end() && it_saved->second != nullptr) {
                 saved_ptr = it_saved->second;
                 break;
             }
@@ -545,8 +545,8 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
         candidate_keys.push_back("blocks[" + std::to_string(layer_idx) + "].moe_expert_offsets");
         void* saved_ptr = nullptr;
         for (const auto& key : candidate_keys) {
-            auto it = mMoeSavedBuffers.find(key);
-            if (it != mMoeSavedBuffers.end() && it->second != nullptr) {
+            auto it = mSavedCache.buffers().find(key);
+            if (it != mSavedCache.buffers().end() && it->second != nullptr) {
                 saved_ptr = it->second;
                 break;
             }
