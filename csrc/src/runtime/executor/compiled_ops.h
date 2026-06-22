@@ -28,6 +28,7 @@
 #include "runtime/executor/execution_request.h"
 #include "runtime/ep/ep_state.h"
 #include "runtime/executor/graph_executor_internal.h"
+#include "runtime/executor/saved_tensor_cache.h"
 #include "runtime/dsl/ir.h"
 #include "runtime/dsl/tensor_slot.h"
 #include "runtime/dsl/tensor_slot_registry.h"
@@ -165,6 +166,159 @@ public:
     void set_current_micro_step(int micro_step) {
         mMicroStep = micro_step;
     }
+
+    // ---- Debug-only dispatch-PP sub-range execution -----------------------
+    // Bound the eager flat-ops forward/backward loop to [lo, hi), optionally
+    // skip (re)initialization / finalization so multiple contiguous segments
+    // share one executor state, and force the flat-ops path (no instruction
+    // stream). Defaults reproduce whole-graph behavior exactly. Resident
+    // weights only; not capture-safe (eager single-GPU parity check).
+    void set_forward_op_range(std::size_t lo,
+                                    std::size_t hi,
+                                    bool skip_init,
+                                    bool skip_finalize,
+                                    bool force_linear) {
+        mFwdOpLo = lo;
+        mFwdOpHi = hi;
+        mFwdSkipInit = skip_init;
+        mFwdSkipFinalize = skip_finalize;
+        mForceLinear = force_linear;
+    }
+    void clear_forward_op_range() {
+        mFwdOpLo = 0;
+        mFwdOpHi = SIZE_MAX;
+        mFwdSkipInit = false;
+        mFwdSkipFinalize = false;
+        mForceLinear = false;
+        mPreserveLayer = -1;
+    }
+    // True while executing a dispatch-PP sub-range (force-linear flat-ops). Used to skip
+    // whole-graph prep (e.g. prepare_saved_buffers_for_capture) that assumes full-model.
+    bool force_linear() const {
+        return mForceLinear;
+    }
+    void set_backward_op_range(std::size_t lo,
+                                     std::size_t hi,
+                                     bool skip_init,
+                                     bool skip_finalize,
+                                     bool force_linear) {
+        mBwdOpLo = lo;
+        mBwdOpHi = hi;
+        mBwdSkipInit = skip_init;
+        mBwdSkipFinalize = skip_finalize;
+        mForceLinear = force_linear;
+    }
+    void clear_backward_op_range() {
+        mBwdOpLo = 0;
+        mBwdOpHi = SIZE_MAX;
+        mBwdSkipInit = false;
+        mBwdSkipFinalize = false;
+        mForceLinear = false;
+    }
+    // Restrict the backward pass to the ops owning blocks [lo..hi] by their layer
+    // attribution (robust to layer_start/end_indices not aligning with boundary
+    // view ops). include_loss also runs the loss/lm-head ops (layer < 0). This is
+    // the dispatch-PP stage selector; it composes with the op-index range above.
+    void set_backward_layer_range(int lo, int hi, bool include_loss, bool include_embed) {
+        mBwdLayerLo = lo;
+        mBwdLayerHi = hi;
+        mBwdLayerLoss = include_loss;
+        mBwdLayerEmbed = include_embed;
+        mBwdLayerFilter = true;
+    }
+    void clear_backward_layer_range() {
+        mBwdLayerFilter = false;
+        mBwdLayerLo = -1;
+        mBwdLayerHi = -1;
+        mBwdLayerLoss = false;
+        mBwdLayerEmbed = false;
+    }
+    // Inject a host residual into get_residual(layer) after forward init, before
+    // the op loop — the cross-GPU activation handoff for the dispatch-PP pool. A
+    // resumed stage [lo..] reads get_residual(lo-1) as its first block's input.
+    // Keep block ``layer``'s stack tensors (incl. its output = ``x``) live past
+    // its layer-end so the cross-GPU boundary can read them. -1 = off.
+    void set_preserve_layer(int layer) {
+        mPreserveLayer = layer;
+    }
+    // Skip the per-layer cross-GPU gradient all-reduce. The dispatch-PP
+    // backward runs one GPU at a time on the full batch, so a DDP all-reduce would
+    // deadlock waiting for idle GPUs (and is unwanted — each GPU owns its blocks).
+    void set_skip_grad_reduce(bool skip) {
+        mSkipGradReduce = skip;
+    }
+    // Bind named boundary tensors (each [B,T,hidden] bf16) into the executor after
+    // forward init, before the op loop — the cross-GPU handoff. Targets the exact
+    // graph tids the resumed stage's first block reads (blocks[hi].res_ffn = the
+    // residual, blocks[hi].mlp_down = x). Buffers are owned here and freed on the
+    // next inject / clear.
+    void set_inject_named(std::vector<std::pair<std::string, std::vector<std::byte>>> items) {
+        mInjectNamed = std::move(items);
+    }
+    void clear_inject_named();  // frees the device buffers
+    void apply_named_inject();  // bind staged named tensors (fwd + bwd boundary handoff)
+    // Restore the stack to the stage's post-init base, dropping the (preserved)
+    // stage's block allocations after the boundary read — so a GPU reused for a
+    // later stage starts clean. No-op if no base was captured.
+    void restore_stage_base() {
+        if (mStageBaseValid) {
+            mRunState.Stack.restore(mStageBase);
+            mStageBaseValid = false;
+        }
+    }
+
+    // dispatch-PP: reset the compute stack to a clean per-step base. The dispatch
+    // step's sub-range forwards/backwards run with skip_finalize, so they leave saves
+    // and boundary tensors resident on the bump-allocated stack; without a reset they
+    // accumulate step over step and overflow it. Call at the start of every dispatch
+    // step: the first call captures the (clean, post-init) base; later calls restore
+    // to it, reclaiming the previous step's residue. The base stays valid (reusable).
+    void dispatch_reset_stack() {
+        if (mDispatchStepBaseValid) {
+            mRunState.Stack.restore(mDispatchStepBase);
+        } else {
+            mDispatchStepBase = mRunState.Stack.checkpoint();
+            mDispatchStepBaseValid = true;
+        }
+    }
+
+    // dispatch-PP recompute:false: recycle the persistent saved-tensor cache between
+    // resident stages so it doesn't accumulate all num_layers worth (which OOMs the 27B).
+    //
+    // NOT YET WIRED -- it is NOT gated-delta-safe. Recycling a buffer that mSaved still
+    // references corrupts the backward (gated-delta saved states / SaveForBwd persist are
+    // read after the reset), which regressed BOTH recompute modes on gated-delta models.
+    // A correct per-stage reset needs the backward to fully release its mSaved references
+    // for the stage first. Deferred: the win is marginal anyway -- on the transfer-bound
+    // 27B, recompute:false's compute saving is masked by weight streaming (~same step time).
+    void reset_saved_cache() {
+        mSavedCache.reset_to_pool();
+    }
+
+    std::size_t mFwdOpLo = 0;
+    std::size_t mFwdOpHi = SIZE_MAX;
+    bool mFwdSkipInit = false;
+    bool mFwdSkipFinalize = false;
+    std::size_t mBwdOpLo = 0;
+    std::size_t mBwdOpHi = SIZE_MAX;
+    bool mBwdSkipInit = false;
+    bool mBwdSkipFinalize = false;
+    bool mForceLinear = false;
+    int mPreserveLayer = -1;
+    bool mSkipGradReduce = false;
+    bool mBwdLayerFilter = false;
+    int mBwdLayerLo = -1;
+    int mBwdLayerHi = -1;
+    bool mBwdLayerLoss = false;
+    bool mBwdLayerEmbed = false;
+    std::vector<std::pair<std::string, std::vector<std::byte>>> mInjectNamed;
+    std::vector<void*> mInjectBuffers;  // device buffers backing mInjectNamed binds (active)
+    std::vector<void*> mInjectPool;     // recycled inject buffers -> no per-call cudaMalloc/cudaFree
+    std::size_t mInjectBufBytes = 0;    // size of the pooled inject buffers (all boundaries are equal)
+    DeviceMemoryStack::Checkpoint mStageBase{};
+    bool mStageBaseValid = false;
+    DeviceMemoryStack::Checkpoint mDispatchStepBase{};
+    bool mDispatchStepBaseValid = false;
     void set_debug_dump_fn(std::function<void(const std::vector<std::string>&, int)> fn) {
         mDebugDumpFn = std::move(fn);
     }
@@ -677,11 +831,6 @@ private:
     std::size_t mBwdCrossLayerCurrentLiveBytes = 0;
 
     // Cross-step monotonic bump cursor into the moe_saved arena. Never
-    // reset — MoE save buffers are keyed by name and persist for the
-    // executor's lifetime. Size growth re-bumps (same semantics as the
-    // cudaFree+cudaMalloc cycle, which also wastes the old buffer).
-    std::size_t mMoeSavedBumpOffset = 0;
-    std::unordered_map<std::string, bool> mMoeSavedArenaBacked;
 
     /// Allocate `nbytes` in `mPhaseArenas.bwd_cross_layer_ptr`. The arena
     /// is sized at 64 MiB (see graph_executor.cpp) and reset per step.
@@ -859,10 +1008,10 @@ private:
     // Avoids redundant D2H synchronization in grouped GEMM ops within the same layer.
     std::unordered_map<int, std::vector<int>> mMoEHostOffsetsCache;
 
-    // Persistent storage for MoE saved tensors (per-layer copies to prevent buffer reuse corruption)
-    // Maps tensor name to persistent GPU buffer (cudaMalloc'd, NOT from stack allocator)
-    std::unordered_map<std::string, void*> mMoeSavedBuffers;
-    std::unordered_map<std::string, size_t> mMoeSavedSizes;
+    // Persistent saved-tensor cache: gated-delta states, rope/qk-norm caches, MoE expert
+    // bookkeeping, and the SaveForBwd persist fallback. Single owner of the buffers +
+    // arena-backed flags + arena bump; free_all() is the only (arena-aware) release point.
+    SavedTensorCache mSavedCache;
 
     void clear_replay_copied_refs();
 
@@ -914,17 +1063,17 @@ public:
     /// Total bytes of persistent saved buffers (untracked by TensorAllocator).
     size_t saved_buffers_total_bytes() const {
         size_t total = 0;
-        for (const auto& [name, sz] : mMoeSavedSizes)
+        for (const auto& [name, sz] : mSavedCache.sizes())
             total += sz;
         return total;
     }
     /// Number of persistent saved buffers.
     int saved_buffers_count() const {
-        return static_cast<int>(mMoeSavedSizes.size());
+        return static_cast<int>(mSavedCache.sizes().size());
     }
     /// Per-buffer sizes for diagnostics.
     const std::unordered_map<std::string, size_t>& saved_buffers_sizes() const {
-        return mMoeSavedSizes;
+        return mSavedCache.sizes();
     }
 };
 

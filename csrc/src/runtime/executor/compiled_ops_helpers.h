@@ -6,6 +6,7 @@
 #ifndef SUROGATE_SRC_DSL_COMPILED_OPS_HELPERS_H
 #define SUROGATE_SRC_DSL_COMPILED_OPS_HELPERS_H
 
+#include "runtime/executor/saved_tensor_cache.h"
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -74,12 +75,11 @@ inline std::size_t tensor_shape_nelem(const std::vector<long>& shape) {
 }
 
 inline Tensor make_persistent_tensor(DslRunState& run_state,
-                                     std::unordered_map<std::string, void*>& buffers,
-                                     std::unordered_map<std::string, size_t>& sizes,
+                                     SavedTensorCache& cache,
                                      const std::string& key,
                                      ETensorDType dtype,
                                      const std::vector<long>& shape,
-                                     const char* op_name) {
+                                     const char* op_name = nullptr) {
     const size_t elem_sz = get_dtype_size(dtype);
     const size_t nelem = tensor_shape_nelem(shape);
     const size_t bytes = nelem * elem_sz;
@@ -91,35 +91,22 @@ inline Tensor make_persistent_tensor(DslRunState& run_state,
     const bool capturing = (cudaStreamIsCapturing(run_state.MainStream, &capture_status) == cudaSuccess &&
                             capture_status != cudaStreamCaptureStatusNone);
 
-    auto it = buffers.find(key);
-    if (it == buffers.end() || sizes[key] < bytes) {
-        if (capturing) {
-            throw std::runtime_error(std::string(op_name ? op_name : "compiled_op") +
-                                     ": missing preallocated persistent buffer for '" + key +
-                                     "' during CUDA graph capture");
-        }
-        if (it != buffers.end() && it->second != nullptr) {
-            CUDA_CHECK(cudaFree(it->second));
-        }
-        void* buf = nullptr;
-        CUDA_CHECK(cudaMalloc(&buf, bytes));
-        buffers[key] = buf;
-        sizes[key] = bytes;
-    }
+    // Routed through the cache so dispatch-PP's per-stage reset_to_pool() recycles the
+    // buffer (no cudaFree churn). Plain fallback path (no arena) for op-managed keys.
+    void* buf = cache.acquire(key, bytes, capturing, op_name);
 
     int device = -1;
     CUDA_CHECK(cudaGetDevice(&device));
-    return make_raw_tensor(buffers[key], dtype, shape, device);
+    return make_raw_tensor(buf, dtype, shape, device);
 }
 
 inline Tensor ensure_output_tensor_or_persistent(const Tensor& candidate,
                                                  DslRunState& run_state,
-                                                 std::unordered_map<std::string, void*>& buffers,
-                                                 std::unordered_map<std::string, size_t>& sizes,
+                                                 SavedTensorCache& cache,
                                                  const std::string& key,
                                                  ETensorDType dtype,
                                                  const std::vector<long>& shape,
-                                                 const char* op_name) {
+                                                 const char* op_name = nullptr) {
     // Backward ops: never reuse candidate.Data. Activation slots can carry
     // stale pointers from earlier ops (view metadata sharing, freed temps),
     // which propagate through view_backward → concat_backward → split and
@@ -132,7 +119,7 @@ inline Tensor ensure_output_tensor_or_persistent(const Tensor& candidate,
         static_cast<std::size_t>(candidate.nelem()) == tensor_shape_nelem(shape)) {
         return make_raw_tensor(candidate.Data, dtype, shape, candidate.Device);
     }
-    return make_persistent_tensor(run_state, buffers, sizes, key, dtype, shape, op_name);
+    return make_persistent_tensor(run_state, cache, key, dtype, shape, op_name);
 }
 
 bool refresh_moe_experts_if_needed(int layer_idx,

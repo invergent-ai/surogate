@@ -11,6 +11,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -67,6 +68,14 @@ struct DslWeightManagerConfig {
 
     // FP8 caching
     bool enable_fp8_forward = false;
+
+    // FP8 weight streaming (dispatch-PP + fp8_hybrid): store frozen matmul block masters as
+    // FP8-E4M3 in pinned host and stream the FP8 bytes (half the PCIe traffic), feeding the
+    // FP8 GEMM directly. Only the matmul-weight fields (qkv/out/mlp_*) are quantized; conv /
+    // norm / A_log etc. stay BF16. Skipped layers match the recipe's skip_quant_* options.
+    bool stream_fp8 = false;
+    int fp8_skip_first_layers = 0;
+    int fp8_skip_last_layers = 0;
 };
 
 /**
@@ -128,6 +137,11 @@ public:
     void wait_for_gather(int layer_idx, cudaStream_t stream);
     void invalidate();  ///< Invalidate all cached weights (call on optimizer update)
 
+    /// Quantize the frozen matmul block masters to FP8-E4M3 in place (once, shared-master
+    /// safe) so per-stage streaming ships FP8 bytes. No-op unless mConfig.stream_fp8. Call
+    /// after import_weights has populated the BF16 masters.
+    void finalize_fp8_block_masters(const cudaDeviceProp& dp, cudaStream_t stream);
+
     // Master weight access for optimizer
     Tensor& get_master(const std::string& name);
     void synchronize_master(const std::string& name, cudaStream_t stream);
@@ -153,6 +167,12 @@ public:
     }
     bool is_sharded(const std::string& name) const;
 
+    /// True if `name`'s master lives in the cross-GPU SharedMasterStore (frozen base,
+    /// offload_master + LoRA). Such masters are read + page-locked once by import_weights.
+    bool is_shared_master(const std::string& name) const {
+        return mSharedMasterNames.find(name) != mSharedMasterNames.end();
+    }
+
     // ITensorContainer interface (for checkpointing)
     void iterate_tensors(const std::function<void(std::string, const TensorShard&)>& callback) override;
 
@@ -164,6 +184,16 @@ public:
     /// pointers. Returns 0 when no eligible tensor exists.
     [[nodiscard]] std::size_t total_persistent_bytes() const;
 
+    /// GPU bytes held by the streaming block double-buffer (the bounded
+    /// dispatch-PP weight footprint). Sums the distinct device buffers across
+    /// all kNumPrefetchBuffers slots — independent of the layer count, since a
+    /// slot holds exactly one block's work-weights. 0 when not streaming.
+    [[nodiscard]] std::size_t gpu_prefetch_buffer_bytes() const;
+
+    /// Number of streaming double-buffer slots (kNumPrefetchBuffers when
+    /// streaming, else 0). The dispatch-PP resident-block ceiling.
+    [[nodiscard]] int prefetch_slot_count() const;
+
     /// Route eligible master/work/prefetch tensors through a slab of the
     /// Persistent arena. Walks `mWeights` + `mPrefetchBuffers`, bump-
     /// allocates each eligible tensor's bytes inside
@@ -174,6 +204,9 @@ public:
     std::size_t rebind_to_persistent_arena(std::byte* arena_base, std::size_t max_bytes, cudaStream_t stream);
 
 private:
+    // Names of masters backed by the cross-GPU SharedMasterStore (frozen offloaded base).
+    std::unordered_set<std::string> mSharedMasterNames;
+
     void allocate_weights(const Module& module, const Graph& graph, const modules::ModularLoRAConfig* lora_config);
     void allocate_prefetch_buffers();
     void create_cuda_resources();
@@ -181,6 +214,11 @@ private:
 
     // Helper to convert master -> work (dtype conversion, H2D, etc.)
     void convert_to_work(const Tensor& master, Tensor& work, cudaStream_t stream);
+
+    /// True if `name` is a frozen matmul block weight eligible for FP8 streaming
+    /// (mConfig.stream_fp8 + a recognized matmul field + a non-skipped layer). Conv / norm /
+    /// A_log / router-gate weights return false so they keep their BF16 streaming.
+    bool is_fp8_stream_weight(const std::string& name) const;
 
     // Helper to parse layer index from weight name
     static bool parse_layer_index(const std::string& name, int& layer_idx);
@@ -202,10 +240,12 @@ private:
     bool mStreamWeights = false;
     int mVersion = 0;  ///< Incremented on invalidate()
 
-    // Double-buffered prefetch (for streaming mode)
-    static constexpr int kNumPrefetchBuffers = 2;
-    std::array<WeightGatherStatus, kNumPrefetchBuffers> mPrefetchStatus;
-    std::array<std::unordered_map<std::string, Tensor>, kNumPrefetchBuffers> mPrefetchBuffers;
+    // Prefetch slots (streaming mode). Default 2 = classic per-block double-buffer.
+    // dispatch-PP sizes this up (env SUROGATE_DISPATCH_PREFETCH_BLOCKS) so a whole
+    // small stage stays cached across its microbatches (stage-resident dispatch).
+    int mNumPrefetchBuffers = 2;
+    std::vector<WeightGatherStatus> mPrefetchStatus;
+    std::vector<std::unordered_map<std::string, Tensor>> mPrefetchBuffers;
     int mCurrentPrefetchBuffer = 0;
 
     // Non-block weight status
@@ -218,9 +258,9 @@ private:
     std::string mFinalNormName;
     std::string mLmHeadName;
 
-    // CUDA resources
-    cudaEvent_t mGatherEvents[kNumPrefetchBuffers] = {nullptr, nullptr};
-    cudaEvent_t mReleaseEvents[kNumPrefetchBuffers] = {nullptr, nullptr};
+    // CUDA resources (sized to mNumPrefetchBuffers in create_cuda_resources)
+    std::vector<cudaEvent_t> mGatherEvents;
+    std::vector<cudaEvent_t> mReleaseEvents;
     cudaEvent_t mNonBlockEvents[3] = {nullptr, nullptr, nullptr};  // emb, final_norm, lm_head
 };
 

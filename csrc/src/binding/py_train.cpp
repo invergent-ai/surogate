@@ -6,10 +6,13 @@
 #include "py_train.h"
 
 #include <array>
+#include <atomic>
 #include <filesystem>
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <memory>
+#include <thread>
 #include <tuple>
 #include <vector>
 #include <iostream>
@@ -30,6 +33,8 @@
 #include "runtime/core/model_factory.h"
 #include "runtime/lora/lora_config.h"
 #include "runtime/dsl/dsl_model.h"
+#include "runtime/dsl/shared_master_store.h"
+#include "runtime/dsl/dsl_weight_manager.h"
 #include "runtime/dsl/dsl_grad_store.h"
 #include "runtime/dsl/dsl_runtime.h"
 #include "runtime/executor/graph_executor.h"
@@ -174,6 +179,7 @@ MultiGPUPyTrainer::MultiGPUPyTrainer(int ngpus,
         throw std::runtime_error(fmt::format("Requested {} GPUs, only {} available", ngpus, gpus_available));
     }
     mContexts.resize(ngpus);
+    init_async_slots(ngpus);
     mThreads =
         NCCLCommunicator::launch_communicators(ngpus, memcpy_all_gather, memcpy_send_recv, [&](NCCLCommunicator& comm) {
             try {
@@ -246,6 +252,7 @@ MultiGPUPyTrainer::MultiGPUPyTrainer(int ngpus,
     std::memcpy(nccl_id_owned.data(), nccl_id, 128);
 
     mContexts.resize(ngpus);
+    init_async_slots(ngpus);
     mThreads = NCCLCommunicator::launch_communicators_multinode(ngpus,
                                                                 node_rank,
                                                                 num_nodes,
@@ -289,6 +296,9 @@ MultiGPUPyTrainer::~MultiGPUPyTrainer() {
 
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     mThreads->join();
+
+    // Free the cross-GPU shared base masters (after all streaming work has finished).
+    dsl::shared_master_store().clear();
 }
 
 /**
@@ -1413,6 +1423,40 @@ auto MultiGPUPyTrainer::fetch_work(sThreadContext& ctx) -> std::function<void(sT
     }
 }
 
+void MultiGPUPyTrainer::init_async_slots(std::size_t n) {
+    mCtxPending = std::make_unique<std::atomic<int>[]>(n);
+    mCtxDone = std::make_unique<std::atomic<int>[]>(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        mCtxPending[i].store(0, std::memory_order_relaxed);
+        mCtxDone[i].store(0, std::memory_order_relaxed);
+    }
+}
+
+// Launch `work` on GPU `gpu` without blocking the caller; the worker thread for that
+// GPU picks it up via fetch_work and bumps mCtxDone when finished. Blocks only if that
+// GPU still has an outstanding async item (the natural is_idle backpressure).
+void MultiGPUPyTrainer::dispatch_async(std::function<void(sThreadContext& ctx)> work, int gpu) {
+    wait_gpu(gpu);  // ensure the previous async item on this GPU has completed
+    {
+        std::lock_guard<std::mutex> lock(mGlobalMutex);
+        mContexts.at(static_cast<std::size_t>(gpu)).Work = std::move(work);
+    }
+    mCtxPending[static_cast<std::size_t>(gpu)].fetch_add(1, std::memory_order_release);
+}
+
+// Block until GPU `gpu`'s outstanding async work has finished (Done caught up to
+// Pending). Propagates worker exceptions like run_work.
+void MultiGPUPyTrainer::wait_gpu(int gpu) {
+    const auto g = static_cast<std::size_t>(gpu);
+    while (mCtxDone[g].load(std::memory_order_acquire) < mCtxPending[g].load(std::memory_order_acquire)) {
+        if (mThreads->has_exception()) {
+            stop();
+            mThreads->join();  // will throw, ending the loop
+        }
+        std::this_thread::yield();
+    }
+}
+
 /**
  * @brief Schedule a work item to run on one rank or all ranks, and wait for completion.
  *
@@ -1436,10 +1480,14 @@ void MultiGPUPyTrainer::run_work(std::function<void(sThreadContext& ctx)> work, 
         if (idx >= 0) {
             mWorkDone = mContexts.size() - 1;
             mContexts.at(idx).Work = work;
+            // Keep the async per-GPU counters consistent: the worker bumps Done for
+            // every work item (sync or async), so the sync path must bump Pending too.
+            if (mCtxPending) mCtxPending[static_cast<std::size_t>(idx)].fetch_add(1, std::memory_order_release);
         } else {
             mWorkDone = 0;
-            for (auto& ctx : mContexts) {
-                ctx.Work = work;
+            for (std::size_t i = 0; i < mContexts.size(); ++i) {
+                mContexts[i].Work = work;
+                if (mCtxPending) mCtxPending[i].fetch_add(1, std::memory_order_release);
             }
         }
     }
@@ -1587,6 +1635,8 @@ void MultiGPUPyTrainer::main_loop(NCCLCommunicator& comm) {
                 throw;
             }
             mWorkDone.fetch_add(1);
+            // Per-GPU async completion: mark this GPU's outstanding item done.
+            if (mCtxDone) mCtxDone[static_cast<std::size_t>(comm.local_rank())].fetch_add(1, std::memory_order_release);
         } else {
             std::this_thread::yield();
         }
@@ -1876,6 +1926,544 @@ std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_gradients(int
         },
         gpu_id);
     return result;
+}
+
+// ---- Debug-only dispatch-PP sub-range parity ------------------------------
+// Stage host token ids into GPU 0's device input buffer and fill sequential
+// position ids, mirroring step()'s single-GPU staging.
+#define DISPATCH_PP_DBG_STAGE(ctx, inputs_ptr, targets_ptr)                                            \
+    do {                                                                                               \
+        auto* _ib = (ctx).Model->get_input_buffer().get<std::int32_t>();                               \
+        std::memcpy(_ib, (inputs_ptr), static_cast<std::size_t>(B) * T * sizeof(std::int32_t));        \
+        if ((targets_ptr) != nullptr) {                                                                \
+            auto* _tb = (ctx).Model->get_target_buffer().get<std::int32_t>();                          \
+            std::memcpy(_tb, (targets_ptr), static_cast<std::size_t>(B) * T * sizeof(std::int32_t));   \
+        }                                                                                              \
+        Tensor _pos = (ctx).Model->get_position_ids_buffer();                                          \
+        auto* _pb = _pos.get<std::int32_t>();                                                          \
+        const int _planes = (_pos.Rank == 3) ? static_cast<int>(_pos.Sizes[0]) : 1;                    \
+        fill_sequential_position_ids(_pb, _planes, B, T);                                              \
+    } while (0)
+
+std::vector<float> MultiGPUPyTrainer::dispatch_pp_forward_hidden(const std::int32_t* inputs) {
+    std::vector<float> result;
+    run_work(
+        [&](sThreadContext& ctx) {
+            auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+            if (!model) throw std::runtime_error("dispatch_pp_forward_hidden: DSL model required");
+            DISPATCH_PP_DBG_STAGE(ctx, inputs, nullptr);
+            auto out = model->dispatch_pp_forward_hidden(
+                ctx.Model->get_input_buffer(), ctx.Model->get_position_ids_buffer(), *ctx.Communicator);
+            if (ctx.Communicator->local_rank() == 0) result = std::move(out);
+        },
+        0);
+    return result;
+}
+
+std::vector<float> MultiGPUPyTrainer::dispatch_pp_forward_subranges(const std::int32_t* inputs,
+                                                                         int split_after_block) {
+    std::vector<float> result;
+    run_work(
+        [&](sThreadContext& ctx) {
+            auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+            if (!model) throw std::runtime_error("dispatch_pp_forward_subranges: DSL model required");
+            DISPATCH_PP_DBG_STAGE(ctx, inputs, nullptr);
+            auto out = model->dispatch_pp_forward_subranges(ctx.Model->get_input_buffer(),
+                                                                  ctx.Model->get_position_ids_buffer(),
+                                                                  *ctx.Communicator,
+                                                                  split_after_block);
+            if (ctx.Communicator->local_rank() == 0) result = std::move(out);
+        },
+        0);
+    return result;
+}
+
+std::vector<float> MultiGPUPyTrainer::dispatch_pp_grad_norms_whole(const std::int32_t* inputs,
+                                                                        const std::int32_t* targets) {
+    std::vector<float> result;
+    run_work(
+        [&](sThreadContext& ctx) {
+            auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+            if (!model) throw std::runtime_error("dispatch_pp_grad_norms_whole: DSL model required");
+            DISPATCH_PP_DBG_STAGE(ctx, inputs, targets);
+            auto out = model->dispatch_pp_grad_norms_whole(ctx.Model->get_input_buffer(),
+                                                                 ctx.Model->get_target_buffer(),
+                                                                 ctx.Model->get_position_ids_buffer(),
+                                                                 *ctx.Communicator);
+            if (ctx.Communicator->local_rank() == 0) result = std::move(out);
+        },
+        0);
+    return result;
+}
+
+std::vector<float> MultiGPUPyTrainer::dispatch_pp_grad_norms_subranges(const std::int32_t* inputs,
+                                                                            const std::int32_t* targets,
+                                                                            int split_after_block) {
+    std::vector<float> result;
+    run_work(
+        [&](sThreadContext& ctx) {
+            auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+            if (!model) throw std::runtime_error("dispatch_pp_grad_norms_subranges: DSL model required");
+            DISPATCH_PP_DBG_STAGE(ctx, inputs, targets);
+            auto out = model->dispatch_pp_grad_norms_subranges(ctx.Model->get_input_buffer(),
+                                                                     ctx.Model->get_target_buffer(),
+                                                                     ctx.Model->get_position_ids_buffer(),
+                                                                     *ctx.Communicator,
+                                                                     split_after_block);
+            if (ctx.Communicator->local_rank() == 0) result = std::move(out);
+        },
+        0);
+    return result;
+}
+
+std::vector<float> MultiGPUPyTrainer::dispatch_pp_forward_hidden_multigpu(
+    const std::int32_t* inputs, const std::vector<int>& los, const std::vector<int>& his) {
+    if (los.size() != his.size() || los.empty()) {
+        throw std::runtime_error("dispatch_pp_forward_hidden_multigpu: bad stage ranges");
+    }
+    const int ngpu = static_cast<int>(mContexts.size());
+    const int num_stages = static_cast<int>(los.size());
+    std::vector<float> result;
+    // The fused-residual block returns (mlp_out, residual_after_attn): block hi+1's
+    // first op reads blocks[hi].res_att (the residual accumulator after attention)
+    // and blocks[hi].mlp_down (x = the previous block's MLP output), folding x in.
+    // Hand both over by name through host memory between stage GPUs.
+    std::vector<std::pair<std::string, std::vector<std::byte>>> boundary;
+
+    for (int si = 0; si < num_stages; ++si) {
+        const int gpu = si % ngpu;
+        const int lo = los[static_cast<std::size_t>(si)];
+        const int hi = his[static_cast<std::size_t>(si)];
+        const bool is_last = (si == num_stages - 1);
+        std::vector<std::pair<std::string, std::vector<std::byte>>> inject_named = boundary;
+        std::vector<std::pair<std::string, std::vector<std::byte>>> next_boundary;
+        std::vector<float> final_hidden;
+
+        run_work(
+            [&](sThreadContext& ctx) {
+                auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+                if (!model)
+                    throw std::runtime_error("dispatch_pp_forward_hidden_multigpu: DSL model required");
+                DISPATCH_PP_DBG_STAGE(ctx, inputs, nullptr);
+                model->dispatch_pp_forward_stage(ctx.Model->get_input_buffer(),
+                                                       ctx.Model->get_position_ids_buffer(),
+                                                       *ctx.Communicator,
+                                                       lo,
+                                                       hi,
+                                                       std::move(inject_named),
+                                                       /*preserve_output=*/!is_last);
+                auto* ge = model->graph_executor();
+                if (is_last) {
+                    final_hidden = ge->last_block_hidden_f32();
+                } else {
+                    const std::string res_name = "blocks[" + std::to_string(hi) + "].res_att";
+                    const std::string x_name = "blocks[" + std::to_string(hi) + "].mlp_down";
+                    next_boundary.emplace_back(res_name, ge->read_named_bytes(res_name));
+                    next_boundary.emplace_back(x_name, ge->read_named_bytes(x_name));
+                    // Drop the preserved stage's stack allocations now that the
+                    // boundary is read, so this GPU is clean if reused (round-robin).
+                    ge->restore_stage_base();
+                }
+            },
+            gpu);
+
+        if (is_last) {
+            result = std::move(final_hidden);
+        } else {
+            boundary = std::move(next_boundary);
+        }
+    }
+    return result;
+}
+
+std::vector<float> MultiGPUPyTrainer::dispatch_pp_grad_norms_multigpu(
+    const std::int32_t* inputs, const std::int32_t* targets, const std::vector<int>& los,
+    const std::vector<int>& his) {
+    if (los.size() != his.size() || los.empty()) {
+        throw std::runtime_error("dispatch_pp_grad_norms_multigpu: bad stage ranges");
+    }
+    const int ngpu = static_cast<int>(mContexts.size());
+    const int num_stages = static_cast<int>(los.size());
+    const int num_layers = his.back() + 1;
+    std::vector<float> result(static_cast<std::size_t>(num_layers), 0.0f);
+    // Backward boundary gradients (d_blocks[lo-1].res_att / .mlp_down) handed from
+    // a higher stage's GPU to the next lower stage's GPU through host memory.
+    std::vector<std::pair<std::string, std::vector<std::byte>>> boundary;
+
+    // Backward visits stages in reverse forward order: the stage owning the last
+    // block (and the loss) runs first.
+    for (int si = num_stages - 1; si >= 0; --si) {
+        const int gpu = si % ngpu;
+        const int lo = los[static_cast<std::size_t>(si)];
+        const int hi = his[static_cast<std::size_t>(si)];
+        const bool is_loss_stage = (si == num_stages - 1);
+        std::vector<std::pair<std::string, std::vector<std::byte>>> inject_named = boundary;
+        std::vector<std::pair<std::string, std::vector<std::byte>>> next_boundary;
+        std::vector<float> stage_norms;
+
+        run_work(
+            [&](sThreadContext& ctx) {
+                auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+                if (!model)
+                    throw std::runtime_error("dispatch_pp_grad_norms_multigpu: DSL model required");
+                DISPATCH_PP_DBG_STAGE(ctx, inputs, targets);
+                model->dispatch_pp_backward_stage(ctx.Model->get_input_buffer(),
+                                                        ctx.Model->get_target_buffer(),
+                                                        ctx.Model->get_position_ids_buffer(),
+                                                        *ctx.Communicator,
+                                                        lo,
+                                                        hi,
+                                                        is_loss_stage,
+                                                        /*fwd_inject=*/{},  // harness: whole-from-start forward fallback
+                                                        std::move(inject_named));
+                auto* ge = model->graph_executor();
+                stage_norms = ge->block_grad_norms();
+                if (lo > 0) {
+                    const std::string rn = "d_blocks[" + std::to_string(lo - 1) + "].res_att";
+                    const std::string xn = "d_blocks[" + std::to_string(lo - 1) + "].mlp_down";
+                    next_boundary.emplace_back(rn, ge->read_named_bytes(rn));
+                    next_boundary.emplace_back(xn, ge->read_named_bytes(xn));
+                }
+            },
+            gpu);
+
+        for (int L = lo; L <= hi; ++L) {
+            result[static_cast<std::size_t>(L)] = stage_norms[static_cast<std::size_t>(L)];
+        }
+        boundary = std::move(next_boundary);
+    }
+    return result;
+}
+
+float MultiGPUPyTrainer::dispatch_pp_train_step(const std::int32_t* inputs,
+                                                      const std::int32_t* targets,
+                                                      const optimizers::OptimizerConfig& opt_config,
+                                                      int step_idx) {
+    float loss = 0.0f;
+    run_work(
+        [&](sThreadContext& ctx) {
+            auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+            if (!model)
+                throw std::runtime_error("dispatch_pp_train_step: DSL model required");
+            DISPATCH_PP_DBG_STAGE(ctx, inputs, targets);
+            const float l = model->dispatch_pp_train_step(ctx.Model->get_input_buffer(),
+                                                                ctx.Model->get_target_buffer(),
+                                                                ctx.Model->get_position_ids_buffer(),
+                                                                *ctx.Communicator,
+                                                                opt_config,
+                                                                step_idx);
+            if (ctx.Communicator->local_rank() == 0) loss = l;
+        },
+        0);
+    return loss;
+}
+
+float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inputs,
+                                                              const std::int32_t* targets,
+                                                              const std::vector<int>& los,
+                                                              const std::vector<int>& his,
+                                                              const optimizers::OptimizerConfig& opt_config,
+                                                              int step_idx,
+                                                              bool stale,
+                                                              int num_microbatches) {
+    if (los.size() != his.size() || los.empty()) {
+        throw std::runtime_error("dispatch_pp_train_step_multigpu: bad stage ranges");
+    }
+    const int ngpu = static_cast<int>(mContexts.size());
+    const int num_stages = static_cast<int>(los.size());
+    const int M = std::max(1, num_microbatches);
+    const long mb_stride = static_cast<long>(B) * static_cast<long>(T);  // tokens per microbatch
+    float loss = 0.0f;
+
+    using Boundary = std::vector<std::pair<std::string, std::vector<std::byte>>>;
+
+    // 0. Reset each GPU's compute stack to its clean per-step base. The dispatch
+    //    sub-range forwards/backwards run with skip_finalize (so boundary tensors and
+    //    saves survive the cross-GPU reads), which leaves residue on the bump-allocated
+    //    stack; without this reset it accumulates step over step and overflows.
+    run_work(
+        [&](sThreadContext& ctx) {
+            auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+            if (model && model->graph_executor()) model->graph_executor()->dispatch_reset_stack();
+        },
+        -1);
+
+    // 1. Forward-dispatch stages in order with cross-GPU boundary handoff. Capture
+    //    each stage's INPUT boundary (block lo-1's residual) so the backward pass can
+    //    re-forward just that one stage instead of the whole model -- this bounds
+    //    resident activations to a single stage. Only stages [0..N-2] need to run:
+    //    each produces the input boundary for the next stage. The last stage's output
+    //    is consumed by nothing here (its loss is recomputed in the backward pass), so
+    //    running it would just leak resident state. After reading a stage's boundary,
+    //    restore the stage base so the preserved activations are reclaimed and the
+    //    (reused) GPU starts the next step clean -- otherwise saves accumulate on the
+    //    compute stack step over step and eventually overflow it.
+    // Forward STAGE-LEVEL PIPELINE: each forward stage [0..N-2] is dispatched to GPU s%N
+    // and runs ALL M microbatches there with the stage's weights held RESIDENT (gathered
+    // once via the enlarged prefetch, reused for every microbatch) -> the stage streams
+    // once per step. Stages run concurrently across GPUs, pipelined by per-(stage,
+    // microbatch) ready flags: stage s microbatch m waits for stage s-1 microbatch m's
+    // boundary. dispatch_async's is_idle backpressure bounds the in-flight depth to N
+    // stages. stage_inputs[s][m] (input to stage s, microbatch m) is captured for the
+    // backward; the last stage's forward is recomputed in the backward pass.
+    std::vector<std::vector<Boundary>> stage_inputs(static_cast<std::size_t>(num_stages),
+                                                    std::vector<Boundary>(static_cast<std::size_t>(M)));
+    {
+        const int last_fwd = num_stages - 2;
+        std::vector<std::vector<Boundary>> fwd_out(static_cast<std::size_t>(num_stages),
+                                                   std::vector<Boundary>(static_cast<std::size_t>(M)));
+        const int nflags = std::max(1, num_stages * M);
+        std::unique_ptr<std::atomic<int>[]> ready(new std::atomic<int>[nflags]);
+        for (int i = 0; i < nflags; ++i) ready[i].store(0, std::memory_order_relaxed);
+        std::atomic<int>* readyp = ready.get();
+        for (int s = 0; s <= last_fwd; ++s) {
+            const int lo = los[static_cast<std::size_t>(s)];
+            const int hi = his[static_cast<std::size_t>(s)];
+            std::vector<Boundary>* my_out = &fwd_out[static_cast<std::size_t>(s)];
+            std::vector<Boundary>* up_out = (s > 0) ? &fwd_out[static_cast<std::size_t>(s - 1)] : nullptr;
+            std::vector<Boundary>* sin = &stage_inputs[static_cast<std::size_t>(s)];
+            dispatch_async(
+                [this, inputs, mb_stride, M, s, lo, hi, my_out, up_out, sin, readyp](sThreadContext& ctx) {
+                    auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+                    if (!model)
+                        throw std::runtime_error("dispatch_pp_train_step_multigpu: DSL model required");
+                    auto* ge = model->graph_executor();
+                    const std::string rn = "blocks[" + std::to_string(hi) + "].res_att";
+                    const std::string xn = "blocks[" + std::to_string(hi) + "].mlp_down";
+                    for (int m = 0; m < M; ++m) {
+                        Boundary inj;
+                        if (up_out) {
+                            while (readyp[(s - 1) * M + m].load(std::memory_order_acquire) == 0)
+                                std::this_thread::yield();
+                            inj = (*up_out)[static_cast<std::size_t>(m)];
+                        }
+                        (*sin)[static_cast<std::size_t>(m)] = inj;
+                        DISPATCH_PP_DBG_STAGE(ctx, inputs + static_cast<std::size_t>(m) * mb_stride, nullptr);
+                        model->dispatch_pp_forward_stage(ctx.Model->get_input_buffer(),
+                                                               ctx.Model->get_position_ids_buffer(),
+                                                               *ctx.Communicator,
+                                                               lo,
+                                                               hi,
+                                                               std::move(inj),
+                                                               /*preserve_output=*/true);
+                        Boundary o;
+                        o.emplace_back(rn, ge->read_named_bytes(rn));
+                        o.emplace_back(xn, ge->read_named_bytes(xn));
+                        ge->restore_stage_base();  // reclaim this microbatch's preserved activations
+                        (*my_out)[static_cast<std::size_t>(m)] = std::move(o);
+                        readyp[s * M + m].store(1, std::memory_order_release);
+                    }
+                },
+                s % ngpu);
+        }
+        for (int g = 0; g < ngpu; ++g) wait_gpu(g);
+        for (int m = 0; m < M; ++m)
+            stage_inputs[static_cast<std::size_t>(num_stages - 1)][static_cast<std::size_t>(m)] =
+                (last_fwd >= 0) ? fwd_out[static_cast<std::size_t>(last_fwd)][static_cast<std::size_t>(m)] : Boundary{};
+    }
+
+    // 2. Backward WAVEFRONT (mirror of the forward). Grads are pre-zeroed on every GPU,
+    //    then each backward_stage accumulates (micro_step=1, no per-task zero) -- the
+    //    diagonal hits a stage's microbatches out of m-order, so order-independent
+    //    accumulation is required. In diagonal wave w, microbatch m runs backward step
+    //    t=w-m -> stage s=num_stages-1-t on GPU s%N; the grad boundary d_blocks[lo-1].*
+    //    is handed down per microbatch. After the wavefront, each stage's accumulated
+    //    grads are collected once from its GPU.
+    run_work(
+        [&](sThreadContext& ctx) {
+            auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+            if (model) model->dispatch_pp_zero_grads();
+        },
+        -1);
+
+    std::vector<double> loss_per_mb(static_cast<std::size_t>(M), 0.0);
+    // Valid (non-pad) tokens per microbatch, counted by the loss stage on its GPU. Summed
+    // after the wavefront and published to the optimizer GPU for valid-token grad-norm scaling.
+    std::vector<int> valid_per_mb(static_cast<std::size_t>(M), 0);
+    {
+        // grad_out[s][m] = stage s's grad-input boundary (d_blocks[lo-1].*) for microbatch
+        // m, consumed by stage s-1. Each backward stage runs on GPU s%N, all M microbatches
+        // resident (grads accumulated, micro_step=1 since pre-zeroed). Pipelined: stage s
+        // microbatch m waits for stage s+1 microbatch m's grad boundary.
+        std::vector<std::vector<Boundary>> grad_out(static_cast<std::size_t>(num_stages),
+                                                    std::vector<Boundary>(static_cast<std::size_t>(M)));
+        const int nflags = std::max(1, num_stages * M);
+        std::unique_ptr<std::atomic<int>[]> ready(new std::atomic<int>[nflags]);
+        for (int i = 0; i < nflags; ++i) ready[i].store(0, std::memory_order_relaxed);
+        std::atomic<int>* readyp = ready.get();
+        std::vector<double>* lpm = &loss_per_mb;
+        std::vector<int>* vtpm = &valid_per_mb;
+        for (int s = num_stages - 1; s >= 0; --s) {
+            const int lo = los[static_cast<std::size_t>(s)];
+            const int hi = his[static_cast<std::size_t>(s)];
+            const bool is_loss = (s == num_stages - 1);
+            std::vector<Boundary>* my_g = &grad_out[static_cast<std::size_t>(s)];
+            std::vector<Boundary>* up_g = (s < num_stages - 1) ? &grad_out[static_cast<std::size_t>(s + 1)] : nullptr;
+            std::vector<Boundary>* sin = &stage_inputs[static_cast<std::size_t>(s)];
+            dispatch_async(
+                [this, inputs, targets, mb_stride, M, s, lo, hi, is_loss, my_g, up_g, sin, readyp, lpm, vtpm](
+                    sThreadContext& ctx) {
+                    auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+                    if (!model)
+                        throw std::runtime_error("dispatch_pp_train_step_multigpu: DSL model required");
+                    auto* ge = model->graph_executor();
+                    const std::string rn = "d_blocks[" + std::to_string(lo - 1) + "].res_att";
+                    const std::string xn = "d_blocks[" + std::to_string(lo - 1) + "].mlp_down";
+                    for (int m = 0; m < M; ++m) {
+                        Boundary ginj;
+                        if (up_g) {
+                            while (readyp[(s + 1) * M + m].load(std::memory_order_acquire) == 0)
+                                std::this_thread::yield();
+                            ginj = (*up_g)[static_cast<std::size_t>(m)];
+                        }
+                        Boundary finj = (*sin)[static_cast<std::size_t>(m)];
+                        DISPATCH_PP_DBG_STAGE(ctx, inputs + static_cast<std::size_t>(m) * mb_stride,
+                                              targets + static_cast<std::size_t>(m) * mb_stride);
+                        model->dispatch_pp_backward_stage(ctx.Model->get_input_buffer(),
+                                                                ctx.Model->get_target_buffer(),
+                                                                ctx.Model->get_position_ids_buffer(),
+                                                                *ctx.Communicator,
+                                                                lo,
+                                                                hi,
+                                                                is_loss,
+                                                                std::move(finj),
+                                                                std::move(ginj),
+                                                                /*micro_step=*/1,  // pre-zeroed -> always accumulate
+                                                                /*total_micro=*/M);
+                        if (is_loss) {
+                            (*lpm)[static_cast<std::size_t>(m)] = static_cast<double>(model->dispatch_pp_raw_loss());
+                            (*vtpm)[static_cast<std::size_t>(m)] = model->dispatch_pp_loss_valid_tokens();
+                        }
+                        if (lo > 0) {
+                            Boundary g;
+                            g.emplace_back(rn, ge->read_named_bytes(rn));
+                            g.emplace_back(xn, ge->read_named_bytes(xn));
+                            (*my_g)[static_cast<std::size_t>(m)] = std::move(g);
+                        }
+                        // Reclaim this microbatch's backward activations before the next.
+                        // Grads persist in the grad store and the grad boundary is already
+                        // read out above; one GPU runs all M microbatches of this stage, so
+                        // without this the compute stack accumulates M x stage activations.
+                        // restore_stage_base is a no-op here (the stage base is only
+                        // checkpointed in the forward), so reset to the per-step base.
+                        ge->dispatch_reset_stack();
+                        readyp[s * M + m].store(1, std::memory_order_release);
+                    }
+                },
+                s % ngpu);
+        }
+        for (int g = 0; g < ngpu; ++g) wait_gpu(g);
+    }
+    {
+        double ls = 0.0;
+        for (double x : loss_per_mb) ls += x;
+        loss = static_cast<float>(ls / static_cast<double>(M));
+    }
+    int step_valid_tokens = 0;
+    for (int v : valid_per_mb) step_valid_tokens += v;
+
+    // Collect each stage's accumulated grads from its GPU (grads stay resident on the
+    // stage's GPU until read here, after the whole backward wavefront).
+    std::vector<std::pair<std::string, std::vector<std::byte>>> collected;
+    for (int si = 0; si < num_stages; ++si) {
+        const int gpu = si % ngpu;
+        const int lo = los[static_cast<std::size_t>(si)];
+        const int hi = his[static_cast<std::size_t>(si)];
+        const bool is_loss = (si == num_stages - 1);
+        std::vector<std::pair<std::string, std::vector<std::byte>>> stage_grads;
+        run_work(
+            [&, lo, hi, is_loss](sThreadContext& ctx) {
+                auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+                if (model)
+                    stage_grads = model->dispatch_pp_read_block_grads(lo, hi, /*include_head=*/is_loss,
+                                                                      /*include_embed=*/lo == 0);
+            },
+            gpu);
+        for (auto& g : stage_grads) collected.push_back(std::move(g));
+    }
+
+    // 2. Optimizer + broadcast. In synchronous mode, apply this step's grads now.
+    //    In one-step-stale mode, defer: apply the *previous* step's grads (so the
+    //    weights this step just trained on are one update behind — the RoundPipe v1
+    //    staleness), then stash this step's grads for the next call.
+    if (stale) {
+        if (!mDispatchPpPendingGrads.empty()) {
+            // The deferred grads belong to the previous step — scale by its valid-token count.
+            dispatch_pp_apply_grads_(mDispatchPpPendingGrads, opt_config, ++mDispatchPpAppliedStep,
+                                     mDispatchPpPendingValidTokens);
+        }
+        mDispatchPpPendingGrads = std::move(collected);
+        mDispatchPpPendingValidTokens = step_valid_tokens;
+    } else {
+        dispatch_pp_apply_grads_(collected, opt_config, step_idx + 1, step_valid_tokens);
+    }
+    return loss;
+}
+
+void MultiGPUPyTrainer::dispatch_pp_flush_pending(const optimizers::OptimizerConfig& opt_config) {
+    if (mDispatchPpPendingGrads.empty()) return;
+    dispatch_pp_apply_grads_(mDispatchPpPendingGrads, opt_config, ++mDispatchPpAppliedStep,
+                             mDispatchPpPendingValidTokens);
+    mDispatchPpPendingGrads.clear();
+}
+
+void MultiGPUPyTrainer::dispatch_pp_apply_grads_(
+    const std::vector<std::pair<std::string, std::vector<std::byte>>>& collected,
+    const optimizers::OptimizerConfig& opt_config, int opt_step_1based, int valid_tokens) {
+    // GPU 0 holds the master replica: write the collected grads into its store and
+    // run the optimizer there.
+    run_work(
+        [&](sThreadContext& ctx) {
+            auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+            if (!model)
+                throw std::runtime_error("dispatch_pp_apply_grads_: DSL model required");
+            // The loss GPU counted valid tokens; publish the step total here so the optimizer
+            // (on this master GPU) scales the grad norm per valid token, not per padded token.
+            model->set_dispatch_pp_valid_tokens(valid_tokens);
+            model->dispatch_pp_write_grads(collected);
+            mDispatchPpLastGradNorm = model->dispatch_pp_apply_optimizer(*ctx.Communicator, opt_config, opt_step_1based);
+        },
+        0);
+    // Broadcast GPU 0's updated weights to every replica so the pool is consistent
+    // for the next step's stages (which run on any GPU).
+    std::vector<std::pair<std::string, std::vector<std::byte>>> master;
+    run_work(
+        [&](sThreadContext& ctx) {
+            auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+            if (model) master = model->dispatch_pp_read_weights();
+        },
+        0);
+    run_work(
+        [&](sThreadContext& ctx) {
+            auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+            if (model) model->dispatch_pp_write_weights(master);
+        },
+        -1);
+}
+#undef DISPATCH_PP_DBG_STAGE
+
+std::unordered_map<std::string, std::size_t> MultiGPUPyTrainer::dispatch_pp_weight_residency() {
+    std::unordered_map<std::string, std::size_t> out;
+    run_work(
+        [&](sThreadContext& ctx) {
+            auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+            if (!model)
+                throw std::runtime_error("dispatch_pp_weight_residency: DSL model required");
+            auto* wm = model->weight_manager();
+            if (!wm) {
+                // No weight manager => weights are fully resident (not streamed);
+                // there are no streaming slots to report.
+                out["total_persistent_bytes"] = 0;
+                out["gpu_prefetch_buffer_bytes"] = 0;
+                out["prefetch_slot_count"] = 0;
+                return;
+            }
+            out["total_persistent_bytes"] = wm->total_persistent_bytes();
+            out["gpu_prefetch_buffer_bytes"] = wm->gpu_prefetch_buffer_bytes();
+            out["prefetch_slot_count"] = static_cast<std::size_t>(wm->prefetch_slot_count());
+        },
+        0);
+    return out;
 }
 
 std::vector<std::pair<std::string, Tensor>> MultiGPUPyTrainer::get_lora_gradients(int gpu_id) {

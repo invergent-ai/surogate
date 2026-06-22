@@ -123,7 +123,7 @@ surogate sft examples/sft/qwen3/qwen3-lora-bf16.yaml
 ```
 
 #### Option C: Build from source (dev / contributors)
-You need CUDA 12.8/12.9/13.x installed on your machine and NCCL development libraries libnccl-dev for your CUDA version
+You need CUDA 12.8/12.9/13.x installed on your machine and NCCL development libraries libnccl-dev for your CUDA version (https://developer.nvidia.com/nccl/nccl-download)
 
 ```bash
 # ...clone repo...

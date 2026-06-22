@@ -306,6 +306,7 @@ target_sources(surogate-common PRIVATE
     src/runtime/dsl/dsl_debug.cpp
     src/runtime/dsl/buffer_plan.cpp
     src/runtime/dsl/dsl_weight_manager.cpp
+    src/runtime/dsl/shared_master_store.cpp
     src/runtime/executor/causal_lm_execution_profile.cpp
     src/runtime/executor/graph_executor.cpp
     src/runtime/executor/graph_executor_utils.cpp
@@ -478,6 +479,7 @@ target_sources(surogate-common PRIVATE
     src/runtime/optimizers/flash_adamw_8bit.cu
     src/runtime/optimizers/adamw.cu
     src/runtime/optimizers/cpu_adamw.cpp
+    src/runtime/optimizers/async_optimizer.cpp
     src/runtime/optimizers/polar_express.cu
     src/runtime/optimizers/normuon.cu
     src/runtime/optimizers/optimizer.cpp
@@ -658,7 +660,8 @@ endif ()
 if (PYTHON_BINDING)
     find_package(Python COMPONENTS Interpreter Development.Module OPTIONAL_COMPONENTS Development.SABIModule)
     FetchContent_MakeAvailable(nanobind)
-    nanobind_add_module(_surogate STABLE_ABI NOSTRIP src/binding/binding.cpp src/binding/py_train.cpp)
+    nanobind_add_module(_surogate STABLE_ABI NOSTRIP src/binding/binding.cpp src/binding/py_train.cpp
+                        src/runtime/executor/dispatch_pp_phase0.cpp)
     target_link_libraries(_surogate PUBLIC surogate-common Python::Module fmt::fmt-header-only)
     # mem_eff is a static archive; binding.cpp directly references
     # surogate::mem_eff::forward_bf16_sm80, so the module itself must

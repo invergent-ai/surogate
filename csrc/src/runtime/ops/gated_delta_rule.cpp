@@ -150,8 +150,7 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op, co
     }
     if (!out_is_ref) {
         out_val = make_persistent_tensor(mRunState,
-                                         mMoeSavedBuffers,
-                                         mMoeSavedSizes,
+                                         mSavedCache,
                                          op.op_id + ".out_fallback",
                                          v.DType,
                                          {B, T, H, V});
@@ -168,8 +167,7 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op, co
     }
     if (!state_is_ref) {
         state_val = make_persistent_tensor(mRunState,
-                                           mMoeSavedBuffers,
-                                           mMoeSavedSizes,
+                                           mSavedCache,
                                            op.op_id + ".state_fallback",
                                            ETensorDType::FP32,
                                            {B, H, K, V});

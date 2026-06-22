@@ -312,23 +312,12 @@ void CompiledExecutor::persist_forward_saved_layer_tensors(const CompiledGraph& 
         if (bytes == 0) {
             return false;
         }
-        auto buf_it = mMoeSavedBuffers.find(name);
-        if (buf_it == mMoeSavedBuffers.end() || mMoeSavedSizes[name] < bytes) {
-            if (fwd_stream_capturing) {
-                // Capture can record the D2D copy below, but it cannot
-                // allocate the persistent destination. The graph executor
-                // must preallocate these buffers before capture.
-                return false;
-            }
-            if (buf_it != mMoeSavedBuffers.end() && buf_it->second != nullptr) {
-                CUDA_CHECK(cudaFree(buf_it->second));
-            }
-            void* new_buffer = nullptr;
-            CUDA_CHECK(cudaMalloc(&new_buffer, bytes));
-            mMoeSavedBuffers[name] = new_buffer;
-            mMoeSavedSizes[name] = bytes;
+        if (fwd_stream_capturing && (mSavedCache.find(name) == nullptr || mSavedCache.size_of(name) < bytes)) {
+            // Capture can record the D2D copy below but cannot allocate the destination;
+            // the graph executor must preallocate these buffers before capture.
+            return false;
         }
-        void* dst_buffer = mMoeSavedBuffers[name];
+        void* dst_buffer = mSavedCache.acquire(name, bytes, fwd_stream_capturing, name.c_str());
         CUDA_CHECK(cudaMemcpyAsync(dst_buffer, src.Data, bytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
         Tensor saved_tensor = src;
         saved_tensor.Data = static_cast<std::byte*>(dst_buffer);
@@ -468,23 +457,12 @@ void CompiledExecutor::persist_forward_saved_layer_tensors(const CompiledGraph& 
         }
 
         if (!used_arena) {
-            auto buf_it = mMoeSavedBuffers.find(name);
-            if (buf_it == mMoeSavedBuffers.end() || mMoeSavedSizes[name] < bytes) {
-                if (fwd_stream_capturing) {
-                    // Cannot cudaMalloc during any CUDA graph capture (internal or outer).
-                    // Skip this tensor — the outer capture warmup or
-                    // prepare_saved_buffers_for_capture should have pre-allocated it.
-                    continue;
-                }
-                if (buf_it != mMoeSavedBuffers.end() && buf_it->second != nullptr) {
-                    CUDA_CHECK(cudaFree(buf_it->second));
-                }
-                void* new_buffer = nullptr;
-                CUDA_CHECK(cudaMalloc(&new_buffer, bytes));
-                mMoeSavedBuffers[name] = new_buffer;
-                mMoeSavedSizes[name] = bytes;
+            if (fwd_stream_capturing && (mSavedCache.find(name) == nullptr || mSavedCache.size_of(name) < bytes)) {
+                // Cannot cudaMalloc during CUDA graph capture; skip -- the outer capture
+                // warmup / prepare_saved_buffers_for_capture should have pre-allocated it.
+                continue;
             }
-            dst_buffer = mMoeSavedBuffers[name];
+            dst_buffer = mSavedCache.acquire(name, bytes, fwd_stream_capturing, name.c_str());
         }
 
         CUDA_CHECK(cudaMemcpyAsync(dst_buffer, src.Data, bytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
@@ -562,11 +540,83 @@ void CompiledExecutor::snapshot_forward_execution_state() {
     mForwardNamedTensorsSnapshot = mNamedTensors;
 }
 
+void CompiledExecutor::clear_inject_named() {
+    // Recycle the active inject buffers instead of cudaFree -- cudaFree is a device-wide sync
+    // point, and this is called once per dispatch stage (~hundreds of times per step).
+    for (void* p : mInjectBuffers) {
+        if (p) mInjectPool.push_back(p);
+    }
+    mInjectBuffers.clear();
+    mInjectNamed.clear();
+}
+
+// Bind staged named boundary tensors (each [B,T,hidden] bf16) into the exact graph
+// tids the resumed stage reads — the cross-GPU handoff. Used by both forward (the
+// carried activations blocks[hi].res_att / mlp_down) and backward (the carried
+// gradients d_blocks[hi].res_att / mlp_down). Backs each with an owned device buffer.
+void CompiledExecutor::apply_named_inject() {
+    if (mInjectNamed.empty()) return;
+    // Recycle any still-active buffers (defensive; clear_inject_named normally drains them).
+    for (void* p : mInjectBuffers) {
+        if (p) mInjectPool.push_back(p);
+    }
+    mInjectBuffers.clear();
+    int dev = 0;
+    cudaGetDevice(&dev);
+    const long H = static_cast<long>(mConfig.HiddenSize);
+    for (auto& [name, bytes] : mInjectNamed) {
+        if (bytes.empty()) continue;
+        // Boundary tensors are all [B,T,H] bf16 -> identical size. Reuse a pooled device buffer;
+        // only (re)allocate when the pool is empty or the size changed. This removes a per-call
+        // cudaMalloc/cudaFree pair -- each a device-wide sync that serialized the pipeline.
+        if (mInjectBufBytes != bytes.size()) {
+            for (void* p : mInjectPool) {
+                if (p) cudaFree(p);
+            }
+            mInjectPool.clear();
+            mInjectBufBytes = bytes.size();
+        }
+        void* buf = nullptr;
+        if (!mInjectPool.empty()) {
+            buf = mInjectPool.back();
+            mInjectPool.pop_back();
+        } else {
+            CUDA_CHECK(cudaMalloc(&buf, bytes.size()));
+        }
+        mInjectBuffers.push_back(buf);
+        CUDA_CHECK(cudaMemcpyAsync(buf, bytes.data(), bytes.size(), cudaMemcpyHostToDevice,
+                                   mRunState.MainStream));
+        Tensor t{};
+        t.DType = ETensorDType::BF16;
+        t.Rank = 3;
+        t.Sizes[0] = mB;
+        t.Sizes[1] = mT;
+        t.Sizes[2] = H;
+        t.Device = dev;
+        t.Data = static_cast<std::byte*>(buf);
+        bind_tensor(name, t);
+    }
+    CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+}
+
 void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                                        NCCLCommunicator& comm,
                                        bool full,
                                        const modules::ForwardHook* hook) {
-    initialize_forward_execution(graph, comm, full);
+    // dispatch-PP: a resumed sub-range segment shares the prior segment's
+    // executor state, so skip the (re)initialization that would clear
+    // mTensors/mNamedTensors and the cross-block residual.
+    if (!mFwdSkipInit) {
+        initialize_forward_execution(graph, comm, full);
+    }
+    apply_named_inject();
+    // dispatch-PP: when preserving a stage's last block (so its boundary
+    // tensors survive the read), capture the post-init stack base so the caller
+    // can restore it after the read and a reused GPU starts clean.
+    if (mPreserveLayer >= 0) {
+        mStageBase = mRunState.Stack.checkpoint();
+        mStageBaseValid = true;
+    }
     const int num_layers = static_cast<int>(mConfig.NumLayers);
     // Reuse member vectors to avoid per-forward heap allocations.
     auto& layer_checkpoints = mLayerCheckpoints;
@@ -639,11 +689,16 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
                                                 forward_replay_active,
                                                 arena_persists,
                                                 cudaMalloc_persists);
-            mRunState.Stack.restore(layer_checkpoints[static_cast<std::size_t>(L)]);
-            if (mTemps.size() > layer_temp_marks[static_cast<std::size_t>(L)]) {
-                mTemps.resize(layer_temp_marks[static_cast<std::size_t>(L)]);
+            // dispatch-PP: preserve a stage's last block so its output ``x``
+            // (BlockHOut) stays live for the cross-GPU boundary read — the stack
+            // restore/prune below would otherwise free it.
+            if (L != mPreserveLayer) {
+                mRunState.Stack.restore(layer_checkpoints[static_cast<std::size_t>(L)]);
+                if (mTemps.size() > layer_temp_marks[static_cast<std::size_t>(L)]) {
+                    mTemps.resize(layer_temp_marks[static_cast<std::size_t>(L)]);
+                }
+                prune_stack_tensors();
             }
-            prune_stack_tensors();
             layer_active[static_cast<std::size_t>(L)] = 0;
         }
         if (L >= 0) handle_layer_end(L);
@@ -863,7 +918,7 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     // loop below remains the path when capturing (CUDA graph capture needs
     // the single-pass op walk) or when the compiler did not emit an
     // instruction stream.
-    const bool stream_driven = !graph.instruction_stream.empty() && !mCapturing;
+    const bool stream_driven = !graph.instruction_stream.empty() && !mCapturing && !mForceLinear;
     if (stream_driven) {
         if (const char* env = std::getenv("SUROGATE_DEBUG_PHASE_INTERPRETER")) {
             if (std::string(env) == "1") {
@@ -997,6 +1052,10 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
 
     for (std::size_t idx = 0; !stream_driven && idx < graph.ops.size(); ++idx) {
         if (!full && !graph.required_mask.empty() && !graph.required_mask[idx]) {
+            continue;
+        }
+        // dispatch-PP: restrict this segment to a contiguous op range.
+        if (idx < mFwdOpLo || idx >= mFwdOpHi) {
             continue;
         }
 
@@ -1273,6 +1332,14 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
         if (std::string(env) == "1") {
             std::cerr << "[arena-persist] arena=" << arena_persists << " cudaMalloc=" << cudaMalloc_persists << "\n";
         }
+    }
+
+    // dispatch-PP: when an additional sub-range segment will resume on
+    // this executor state, keep weights resident, the active-executor binding,
+    // and the live tensor table intact (the next segment reads the cross-block
+    // residual from it). The final segment runs the normal finalize.
+    if (mFwdSkipFinalize) {
+        return;
     }
 
     dump_forward_debug_tensors();
