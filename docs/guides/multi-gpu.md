@@ -19,7 +19,7 @@ Surogate's ZeRO implementation (stages 1-3) combined with CPU offloading enables
 **💡 Extending Capacity with CPU Offloading:**
 Combine ZeRO with CPU offloading (`offload_optimizer`, `offload_master`, `offload_grads`, `offload_residual`) to train even larger models by using CPU RAM as overflow storage. This can extend capacity by 2-3x depending on your CPU RAM and PCIe bandwidth.
 
-**Note:** For models exceeding these limits (e.g., 70B+ parameter models), tensor parallelism would be required, which splits model weights across GPUs during computation rather than just for storage.
+**Note:** For models whose **base weights alone** exceed single-GPU memory, use [Dispatch Pipeline Parallelism (dispatch-PP)](dispatch-pp.md) — a model-parallel mode that streams the base weights from pinned CPU per stage and hands activations between GPUs through host memory, so it works on PCIe-only boxes without NVLink/P2P. (Classic tensor parallelism, which splits weights across GPUs during computation, would instead require fast GPU-to-GPU interconnect.)
 
 ## Multi-Threading vs Multiprocessing
 
@@ -168,6 +168,7 @@ For fine-grained control over multi-GPU communication and memory:
 
 ## See also
 
+- [Dispatch Pipeline Parallelism](dispatch-pp.md) — for models whose base weights don't fit on one GPU (PCIe-only boxes)
 - [Offloading](offloading.md)
 - [Config reference](../reference/config.md)
 - [Back to docs index](../index.mdx)

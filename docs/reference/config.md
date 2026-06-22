@@ -105,6 +105,18 @@ These options apply to single-node multi-GPU training. For multi-node distribute
 | `memcpy_all_gather`     | bool | `false` | Use memcpy for all-gather operations (threads backend only). Generally gets better bandwidth utilization on PCIe and does not consume SM resources.                             |
 | `memcpy_send_recv`      | bool | `false` | Use memcpy for send/receive operations (threads backend only).                                                                                                                  |
 
+## Pipeline Parallelism (dispatch-PP) Options
+
+Model-parallel mode for models whose base weights don't fit on a single GPU, on PCIe-only boxes. See [Dispatch Pipeline Parallelism](../guides/dispatch-pp.md). Mutually exclusive with the ZeRO options above, `cpu_training`, and MoE expert parallelism (`ep_size > 1`); CUDA graphs are auto-disabled.
+
+| Option              | Type | Default | Description                                                                                                                                                  |
+| ------------------- | ---- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `parallelism`       | str  | unset   | Set to `dispatch_pp` to enable Dispatch Pipeline Parallelism (or `ddp`/unset for the default data-parallel path).                                           |
+| `offload_master`    | bool | `false` | Required for dispatch-PP on models that can't sit resident: streams the frozen base weights from pinned CPU per block.                                       |
+| `recipe`            | str  | `bf16`  | `bf16` or `fp8_hybrid`. `fp8_hybrid` quantizes the frozen matmul base weights to FP8-E4M3 once at load and streams them as FP8 (~half the PCIe bytes).       |
+
+Microbatches per step are `gpus × gradient_accumulation_steps` (accumulated into one optimizer step). Stage size is set via the `SUROGATE_DISPATCH_STAGE_BLOCKS` environment variable (default `4`).
+
 ## Multi-Node Distributed Training
 
 Configuration for training across multiple machines using Ray and NCCL. See the [Multi-Node Training Guide](guides/multi-node.md) for detailed setup instructions.

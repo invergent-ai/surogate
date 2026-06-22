@@ -223,5 +223,6 @@ When `offload_quants` is enabled (requires `persistent_quants`):
 
 - [Memory](memory.md)
 - [Multi-GPU](multi-gpu.md)
+- [Dispatch Pipeline Parallelism](dispatch-pp.md) — uses `offload_master` to stream the base weights per stage
 - [Config reference](../reference/config.md)
 - [Back to docs index](../index.mdx)
