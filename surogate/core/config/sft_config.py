@@ -743,9 +743,9 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
                 "parallelism=dispatch_pp does not support MoE expert parallelism "
                 "(ep_size>1) in v1; this is a deferred phase."
             )
-        if self.recipe not in (None, "bf16"):
+        if self.recipe not in (None, "bf16", "fp8_hybrid"):
             raise ValueError(
-                "parallelism=dispatch_pp is BF16/LoRA-only in v1; FP8/NVFP4 stage "
+                "parallelism=dispatch_pp supports recipe bf16 or fp8_hybrid; NVFP4 stage "
                 f"streaming is deferred (got recipe={self.recipe!r})."
             )
         if self.use_cuda_graphs:
