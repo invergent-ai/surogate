@@ -416,6 +416,17 @@ class SurogateTrainerWrapper:
             # (fewer bubbles). Peak memory is unchanged (microbatches run sequentially on
             # the resident stage). chunks>1 raises the effective batch to gpus*bsz*chunks.
             self._dpp_chunks = max(1, int(os.environ.get("SUROGATE_DISPATCH_MICROBATCH_CHUNKS", "1")))
+            # Fold gradient_accumulation_steps into the microbatch count: the step runs
+            # M = gpus * chunks * GA microbatches, accumulating grads into ONE optimizer step.
+            # (LoRA only; FFT keeps M=1 until cross-microbatch accumulation is wired -> M=1.)
+            _ga = max(1, config.gradient_accumulation_steps)
+            if config.lora and _ga > 1:
+                self._dpp_chunks *= _ga
+            # The loader advances gpus*bsz*chunks tokens per step; reflect that in the epoch
+            # math (the earlier total_batch_size counted GA but not the microbatch chunks).
+            self.total_batch_size = self.chunk_size * self._dpp_chunks
+            if self.train_loader is not None:
+                self.steps_per_epoch = self.train_loader.num_tokens // max(1, self.total_batch_size)
             logger.info(
                 "[dispatch_pp]: %d stages over %d layers (max %d blocks/stage), prefetch=%d slots",
                 _nst,
@@ -1132,11 +1143,21 @@ class SurogateTrainerWrapper:
             # Stage plan (_dpp_los/_dpp_his) was computed in __init__ (it also sized the
             # weight-streaming prefetch before the native trainer was built).
             self._dpp_bsz = self.config.per_device_train_batch_size
-            if self.config.gradient_accumulation_steps != 1:
+            _ga = self.config.gradient_accumulation_steps
+            if _ga > 1 and not self.config.lora:
                 logger.warning(
-                    "[dispatch_pp]: gradient_accumulation_steps=%d; v1 applies one optimizer step per "
-                    "micro-batch (grad-accum folding is a follow-up).",
-                    self.config.gradient_accumulation_steps,
+                    "[dispatch_pp]: gradient_accumulation_steps=%d is ignored for non-LoRA dispatch "
+                    "(M=1; cross-microbatch accumulation for FFT is not wired yet).",
+                    _ga,
+                )
+            elif _ga > 1:
+                logger.info(
+                    "[dispatch_pp]: gradient_accumulation_steps=%d folded into the microbatch count "
+                    "-> M = gpus*chunks*GA = %d microbatches per optimizer step (effective batch "
+                    "%d seqs).",
+                    _ga,
+                    self.config.gpus * self._dpp_chunks,
+                    self.config.gpus * self._dpp_chunks * self._dpp_bsz,
                 )
             logger.info(
                 "[dispatch_pp]: stages -> %s",
@@ -1187,8 +1208,11 @@ class SurogateTrainerWrapper:
         # Training loop
         logger.info(f"Starting training loop: steps {self.start_step} to {self.max_steps - 1}")
         for step in range(self.start_step, self.max_steps):
-            # Check if we need to advance epoch
-            if not self.train_loader.has_next(self.config.gradient_accumulation_steps):
+            # Check if we need to advance epoch. Dispatch consumes _dpp_chunks loader batches
+            # per step (gpus*bsz each, chunks already folds in grad-accum); other paths consume
+            # gradient_accumulation_steps.
+            _batches_per_step = self._dpp_chunks if self._dispatch_pp else self.config.gradient_accumulation_steps
+            if not self.train_loader.has_next(_batches_per_step):
                 self.train_loader.advance_epoch()
                 if not use_full_step_graphs:
                     self.train_loader.load_batch(in_tokens, out_tokens, pos_ids)
