@@ -26,8 +26,6 @@ recipe: fp8_hybrid
 # Opt-in model-parallel mode. Mutually exclusive with ZeRO sharding / cpu_training /
 # MoE-EP; CUDA graphs are auto-disabled (per-stage weight streaming can't be captured).
 parallelism: dispatch_pp
-# Stage size (blocks per stage) is set via SUROGATE_DISPATCH_STAGE_BLOCKS (default 4); the
-# other dispatch knobs are top-level: offload_master, recompute, gradient_accumulation_steps.
 
 # Stream the frozen base weights from pinned CPU per block. Required when the base
 # model can't fit resident on a single GPU (e.g. a 27B on 32 GB cards). Drop it for
