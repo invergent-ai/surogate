@@ -193,23 +193,16 @@ void CompiledExecutor::save_moe_layer_tensors(int layer_idx) {
             continue;
         }
 
-        // Allocate or resize persistent buffer if needed (arena bump with
-        // cudaMalloc fallback).
-        auto buf_it = mSavedCache.buffers().find(name);
-        if (buf_it == mSavedCache.buffers().end() || mSavedCache.sizes()[name] < bytes) {
-            if (buf_it != mSavedCache.buffers().end() && buf_it->second != nullptr) {
-                auto ab_it = mSavedCache.arena_backed().find(name);
-                const bool old_was_arena = ab_it != mSavedCache.arena_backed().end() && ab_it->second;
-                if (!old_was_arena) CUDA_CHECK(cudaFree(buf_it->second));
-            }
-            auto a = allocate_moe_saved(bytes);
-            mSavedCache.buffers()[name] = a.ptr;
-            mSavedCache.sizes()[name] = bytes;
-            mSavedCache.arena_backed()[name] = a.arena_backed;
-        }
-
-        // Copy data to persistent buffer
-        void* dst_buffer = mSavedCache.buffers()[name];
+        // Persist into the saved-tensor cache: arena slot when available, else its free-list
+        // pool, else cudaMalloc. Recycle-on-resize and the dispatch per-stage reset are
+        // centralized in the cache (no scattered cudaFree).
+        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+        const bool capturing =
+            (cudaStreamIsCapturing(mRunState.MainStream, &cap) == cudaSuccess && cap != cudaStreamCaptureStatusNone);
+        void* dst_buffer = mSavedCache.acquire(name, bytes, capturing, name.c_str(), [this](std::size_t b) {
+            auto a = allocate_moe_saved(b);
+            return SavedTensorCache::ArenaAlloc{a.ptr, a.arena_backed};
+        });
         CUDA_CHECK(cudaMemcpyAsync(dst_buffer, tensor.Data, bytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
 
         // Update all authoritative tables to point at the persistent buffer.
@@ -307,23 +300,13 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
         if (bytes == 0) {
             return;
         }
-        auto buf_it = mSavedCache.buffers().find(name);
-        if (buf_it == mSavedCache.buffers().end() || mSavedCache.sizes()[name] < bytes) {
-            if (debug_save_buffers) {
-                std::cerr << "[SAVE-BUF] alloc name=" << name << " bytes=" << bytes
-                          << " old_bytes=" << (buf_it == mSavedCache.buffers().end() ? 0 : mSavedCache.sizes()[name])
-                          << std::endl;
-            }
-            if (buf_it != mSavedCache.buffers().end() && buf_it->second != nullptr) {
-                auto ab_it = mSavedCache.arena_backed().find(name);
-                const bool old_was_arena = ab_it != mSavedCache.arena_backed().end() && ab_it->second;
-                if (!old_was_arena) CUDA_CHECK(cudaFree(buf_it->second));
-            }
-            auto a = allocate_moe_saved(bytes);
-            mSavedCache.buffers()[name] = a.ptr;
-            mSavedCache.sizes()[name] = bytes;
-            mSavedCache.arena_backed()[name] = a.arena_backed;
-        }
+        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+        const bool capturing =
+            (cudaStreamIsCapturing(mRunState.MainStream, &cap) == cudaSuccess && cap != cudaStreamCaptureStatusNone);
+        mSavedCache.acquire(name, bytes, capturing, name.c_str(), [this](std::size_t b) {
+            auto a = allocate_moe_saved(b);
+            return SavedTensorCache::ArenaAlloc{a.ptr, a.arena_backed};
+        });
     };
 
     // A `_flat` suffix on a block-level field means "view the tensor as 2D by
@@ -763,28 +746,20 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
             (should_persist(name, prefer_live, force_persist_name) || src_stack_backed) && src.Data != nullptr;
         if (need_persist && src.Data != nullptr) {
             const size_t bytes = src.bytes();
-            auto buf_it = mSavedCache.buffers().find(name);
-            if (buf_it == mSavedCache.buffers().end() || mSavedCache.sizes()[name] < bytes) {
-                if (capturing) {
-                    // During CUDA graph capture we cannot allocate new buffers.
-                    // Fall back to metadata-only save so backward can resolve
-                    // from live/recomputed tensors instead of aborting capture.
-                    Tensor meta = src;
-                    meta.Data = nullptr;
-                    (*mSaved)[name] = meta;
-                    return;
-                }
-                if (buf_it != mSavedCache.buffers().end() && buf_it->second != nullptr) {
-                    auto ab_it = mSavedCache.arena_backed().find(name);
-                    const bool old_was_arena = ab_it != mSavedCache.arena_backed().end() && ab_it->second;
-                    if (!old_was_arena) CUDA_CHECK(cudaFree(buf_it->second));
-                }
-                auto a = allocate_moe_saved(bytes);
-                mSavedCache.buffers()[name] = a.ptr;
-                mSavedCache.sizes()[name] = bytes;
-                mSavedCache.arena_backed()[name] = a.arena_backed;
+            const bool need_alloc = (mSavedCache.find(name) == nullptr || mSavedCache.size_of(name) < bytes);
+            if (capturing && need_alloc) {
+                // During CUDA graph capture we cannot allocate new buffers. Fall back to a
+                // metadata-only save so backward resolves from live/recomputed tensors
+                // instead of aborting capture.
+                Tensor meta = src;
+                meta.Data = nullptr;
+                (*mSaved)[name] = meta;
+                return;
             }
-            void* dst_buffer = mSavedCache.buffers()[name];
+            void* dst_buffer = mSavedCache.acquire(name, bytes, capturing, name.c_str(), [this](std::size_t b) {
+                auto a = allocate_moe_saved(b);
+                return SavedTensorCache::ArenaAlloc{a.ptr, a.arena_backed};
+            });
             CUDA_CHECK(cudaMemcpyAsync(dst_buffer, src.Data, bytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
             Tensor saved_tensor;
             saved_tensor.DType = src.DType;

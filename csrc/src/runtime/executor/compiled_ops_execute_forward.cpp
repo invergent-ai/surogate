@@ -312,23 +312,12 @@ void CompiledExecutor::persist_forward_saved_layer_tensors(const CompiledGraph& 
         if (bytes == 0) {
             return false;
         }
-        auto buf_it = mSavedCache.buffers().find(name);
-        if (buf_it == mSavedCache.buffers().end() || mSavedCache.sizes()[name] < bytes) {
-            if (fwd_stream_capturing) {
-                // Capture can record the D2D copy below, but it cannot
-                // allocate the persistent destination. The graph executor
-                // must preallocate these buffers before capture.
-                return false;
-            }
-            if (buf_it != mSavedCache.buffers().end() && buf_it->second != nullptr) {
-                CUDA_CHECK(cudaFree(buf_it->second));
-            }
-            void* new_buffer = nullptr;
-            CUDA_CHECK(cudaMalloc(&new_buffer, bytes));
-            mSavedCache.buffers()[name] = new_buffer;
-            mSavedCache.sizes()[name] = bytes;
+        if (fwd_stream_capturing && (mSavedCache.find(name) == nullptr || mSavedCache.size_of(name) < bytes)) {
+            // Capture can record the D2D copy below but cannot allocate the destination;
+            // the graph executor must preallocate these buffers before capture.
+            return false;
         }
-        void* dst_buffer = mSavedCache.buffers()[name];
+        void* dst_buffer = mSavedCache.acquire(name, bytes, fwd_stream_capturing, name.c_str());
         CUDA_CHECK(cudaMemcpyAsync(dst_buffer, src.Data, bytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
         Tensor saved_tensor = src;
         saved_tensor.Data = static_cast<std::byte*>(dst_buffer);
@@ -468,23 +457,12 @@ void CompiledExecutor::persist_forward_saved_layer_tensors(const CompiledGraph& 
         }
 
         if (!used_arena) {
-            auto buf_it = mSavedCache.buffers().find(name);
-            if (buf_it == mSavedCache.buffers().end() || mSavedCache.sizes()[name] < bytes) {
-                if (fwd_stream_capturing) {
-                    // Cannot cudaMalloc during any CUDA graph capture (internal or outer).
-                    // Skip this tensor — the outer capture warmup or
-                    // prepare_saved_buffers_for_capture should have pre-allocated it.
-                    continue;
-                }
-                if (buf_it != mSavedCache.buffers().end() && buf_it->second != nullptr) {
-                    CUDA_CHECK(cudaFree(buf_it->second));
-                }
-                void* new_buffer = nullptr;
-                CUDA_CHECK(cudaMalloc(&new_buffer, bytes));
-                mSavedCache.buffers()[name] = new_buffer;
-                mSavedCache.sizes()[name] = bytes;
+            if (fwd_stream_capturing && (mSavedCache.find(name) == nullptr || mSavedCache.size_of(name) < bytes)) {
+                // Cannot cudaMalloc during CUDA graph capture; skip -- the outer capture
+                // warmup / prepare_saved_buffers_for_capture should have pre-allocated it.
+                continue;
             }
-            dst_buffer = mSavedCache.buffers()[name];
+            dst_buffer = mSavedCache.acquire(name, bytes, fwd_stream_capturing, name.c_str());
         }
 
         CUDA_CHECK(cudaMemcpyAsync(dst_buffer, src.Data, bytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));

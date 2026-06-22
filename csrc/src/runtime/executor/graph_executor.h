@@ -300,6 +300,8 @@ public:
     // dispatch-PP: reset the compute stack to a clean per-step base (reclaims the
     // previous dispatch step's skip_finalize residue). Call once per step.
     void dispatch_reset_stack();
+    // dispatch-PP recompute:false: release the saved-tensor cache between resident stages.
+    void reset_saved_cache();
 
     /// Set document masking context for Flash Attention varlen dispatch.
     /// cu_seqlens_cpu: (num_docs + 1,) int32 cumulative token offsets on CPU.

@@ -192,6 +192,11 @@ public:
         mForceLinear = false;
         mPreserveLayer = -1;
     }
+    // True while executing a dispatch-PP sub-range (force-linear flat-ops). Used to skip
+    // whole-graph prep (e.g. prepare_saved_buffers_for_capture) that assumes full-model.
+    bool force_linear() const {
+        return mForceLinear;
+    }
     void set_backward_op_range(std::size_t lo,
                                      std::size_t hi,
                                      bool skip_init,
@@ -275,6 +280,19 @@ public:
             mDispatchStepBase = mRunState.Stack.checkpoint();
             mDispatchStepBaseValid = true;
         }
+    }
+
+    // dispatch-PP recompute:false: recycle the persistent saved-tensor cache between
+    // resident stages so it doesn't accumulate all num_layers worth (which OOMs the 27B).
+    //
+    // NOT YET WIRED -- it is NOT gated-delta-safe. Recycling a buffer that mSaved still
+    // references corrupts the backward (gated-delta saved states / SaveForBwd persist are
+    // read after the reset), which regressed BOTH recompute modes on gated-delta models.
+    // A correct per-stage reset needs the backward to fully release its mSaved references
+    // for the stage first. Deferred: the win is marginal anyway -- on the transfer-bound
+    // 27B, recompute:false's compute saving is masked by weight streaming (~same step time).
+    void reset_saved_cache() {
+        mSavedCache.reset_to_pool();
     }
 
     std::size_t mFwdOpLo = 0;

@@ -572,10 +572,8 @@ CompiledExecutor::MoeSavedAlloc CompiledExecutor::allocate_moe_saved(std::size_t
         mSavedCache.bump_offset() += nbytes;
         return result;
     }
-    void* raw = nullptr;
-    CUDA_CHECK(cudaMalloc(&raw, nbytes));
-    result.ptr = static_cast<std::byte*>(raw);
-    result.arena_backed = false;
+    // Arena miss: return null so SavedTensorCache::acquire owns the fallback (its free-list
+    // pool, then cudaMalloc). Keeps all alloc/recycle policy in one place.
     return result;
 }
 

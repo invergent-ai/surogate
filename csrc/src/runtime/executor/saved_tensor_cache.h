@@ -26,6 +26,8 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include <cuda_runtime.h>
 
@@ -62,12 +64,17 @@ public:
                                      ": missing preallocated saved buffer for '" + key +
                                      "' during CUDA graph capture");
         }
-        // Free the prior buffer only if it is a plain cudaMalloc allocation; arena-backed
-        // pointers are owned by PhaseArenas and must never be cudaFree'd.
+        // Recycle the prior plain buffer into the free-list (cudaFree is a device-sync
+        // point -- pooling avoids that churn when stages reset and re-acquire). Arena
+        // pointers are owned by PhaseArenas; just drop the key.
         if (it != mBuffers.end() && it->second != nullptr && !is_arena_backed(key)) {
-            CUDA_CHECK(cudaFree(it->second));
+            mPool.push_back({it->second, mSizes[key]});
         }
         ArenaAlloc a = arena_alloc ? arena_alloc(bytes) : ArenaAlloc{};
+        if (a.ptr == nullptr) {
+            a.ptr = take_from_pool(bytes);  // reuse a pooled buffer before cudaMalloc
+            if (a.ptr != nullptr) bytes = pool_take_bytes_;
+        }
         if (a.ptr == nullptr) {
             CUDA_CHECK(cudaMalloc(&a.ptr, bytes));
             a.arena_backed = false;
@@ -110,17 +117,39 @@ public:
         return it != mArenaBacked.end() && it->second;
     }
 
-    /// Free every plain (non-arena) buffer, clear all keys, and reset the bump. The single
-    /// place these buffers are released -- always arena-aware. Safe in a destructor.
+    /// Recycle all active plain buffers into the free-list and clear the keys + bump,
+    /// WITHOUT cudaFree. dispatch-PP calls this per resident stage: the next stage's
+    /// re-acquire pops these buffers back (uniform layers -> same sizes -> exact reuse), so
+    /// memory is bounded to one stage's worth and there is no cudaFree/cudaMalloc churn.
+    /// Arena-backed entries are owned by PhaseArenas (just dropped; the bump reset reuses
+    /// the slab).
+    void reset_to_pool() noexcept {
+        for (auto& [key, buffer] : mBuffers) {
+            if (buffer != nullptr && !is_arena_backed(key)) {
+                mPool.push_back({buffer, mSizes[key]});
+            }
+        }
+        mBuffers.clear();
+        mSizes.clear();
+        mArenaBacked.clear();
+        mBumpOffset = 0;
+    }
+
+    /// Free every plain (non-arena) buffer, the free-list, and clear all keys + bump. The
+    /// single place these buffers are released -- always arena-aware. Safe in a destructor.
     void free_all() noexcept {
         for (auto& [key, buffer] : mBuffers) {
             if (buffer != nullptr && !is_arena_backed(key)) {
                 cudaFree(buffer);
             }
         }
+        for (auto& [buffer, sz] : mPool) {
+            if (buffer != nullptr) cudaFree(buffer);
+        }
         mBuffers.clear();
         mSizes.clear();
         mArenaBacked.clear();
+        mPool.clear();
         mBumpOffset = 0;
     }
 
@@ -159,9 +188,28 @@ public:
     }
 
 private:
+    // Pop a recycled buffer of at least `bytes` (best fit) from the free-list. Returns
+    // nullptr if none; on success sets pool_take_bytes_ to the popped buffer's real size.
+    void* take_from_pool(std::size_t bytes) {
+        std::size_t best = mPool.size();
+        for (std::size_t i = 0; i < mPool.size(); ++i) {
+            if (mPool[i].second >= bytes && (best == mPool.size() || mPool[i].second < mPool[best].second)) {
+                best = i;
+            }
+        }
+        if (best == mPool.size()) return nullptr;
+        void* ptr = mPool[best].first;
+        pool_take_bytes_ = mPool[best].second;
+        mPool[best] = mPool.back();
+        mPool.pop_back();
+        return ptr;
+    }
+
     std::unordered_map<std::string, void*> mBuffers;
     std::unordered_map<std::string, std::size_t> mSizes;
     std::unordered_map<std::string, bool> mArenaBacked;
+    std::vector<std::pair<void*, std::size_t>> mPool;  // recycled buffers (dispatch per-stage)
+    std::size_t pool_take_bytes_ = 0;
     std::size_t mBumpOffset = 0;
 };
 

@@ -142,17 +142,7 @@ void CompiledExecutor::dispatch_moe_permute(const CompiledOp& op) {
                 if (bytes == 0) {
                     return;
                 }
-                auto buf_it = mSavedCache.buffers().find(key);
-                if (buf_it == mSavedCache.buffers().end() || mSavedCache.sizes()[key] < bytes) {
-                    if (buf_it != mSavedCache.buffers().end() && buf_it->second != nullptr) {
-                        CUDA_CHECK(cudaFree(buf_it->second));
-                    }
-                    void* new_buffer = nullptr;
-                    CUDA_CHECK(cudaMalloc(&new_buffer, bytes));
-                    mSavedCache.buffers()[key] = new_buffer;
-                    mSavedCache.sizes()[key] = bytes;
-                }
-                void* dst_buffer = mSavedCache.buffers()[key];
+                void* dst_buffer = mSavedCache.acquire(key, bytes, /*capturing=*/false, "moe_permute_save");
                 CUDA_CHECK(
                     cudaMemcpyAsync(dst_buffer, src.Data, bytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
             };

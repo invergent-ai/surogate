@@ -1319,11 +1319,14 @@ void GraphExecutor::execute_forward(long B,
         prime_fp8_weight_cache({});
         prime_profile_fp8_weight_caches(/*backward=*/false, /*transposed=*/false);
         prime_fp4_weight_cache({});
-    } else if (!use_graphs && !in_capture) {
+    } else if (!use_graphs && !in_capture && !mCompiledExecutor->force_linear()) {
         // External/full-step CUDA graph capture paths (outside GraphExecutor) can still
         // call save_tensors() while the stream is captured. Preallocate persistent save
         // buffers during regular eager execution so later captured passes don't need
         // cudaMalloc (which is forbidden during capture).
+        // Skip for dispatch-PP sub-range execution (force_linear): it never does full-step
+        // capture, and pre-allocating the WHOLE graph's saves here would defeat the
+        // per-stage residency (it allocated all num_layers worth -> OOM under recompute:false).
         mCompiledExecutor->set_dimensions(B, T);
         mCompiledExecutor->prepare_saved_buffers_for_capture(mSaveList, mCompiledForward.get());
 
@@ -2041,6 +2044,10 @@ void GraphExecutor::restore_stage_base() {
 
 void GraphExecutor::dispatch_reset_stack() {
     if (mCompiledExecutor) mCompiledExecutor->dispatch_reset_stack();
+}
+
+void GraphExecutor::reset_saved_cache() {
+    if (mCompiledExecutor) mCompiledExecutor->reset_saved_cache();
 }
 
 std::vector<float> GraphExecutor::last_block_hidden_f32() {

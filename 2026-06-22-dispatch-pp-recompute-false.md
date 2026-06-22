@@ -1,5 +1,27 @@
 # Dispatch-PP — recompute:false (cyclic activation sectioning)
 
+## STATUS 2 (per-stage reset attempt — recompute:false on the 27B NOT viable)
+
+Made the saved-tensor cache pool-recycle (SavedTensorCache::reset_to_pool) and skip the
+whole-graph prepare_saved_buffers_for_capture on the dispatch path (force_linear) — together
+these let the 27B (gated-delta) **fit** with recompute:false (no OOM). But two findings killed
+it:
+1. **Correctness:** the per-stage cache reset recycles buffers that `mSaved` still references,
+   corrupting the gated-delta backward — it regressed BOTH recompute modes on the 27B (loss
+   2.7 -> 6+). A correct reset needs the backward to release its `mSaved` refs per stage first.
+2. **Benefit is marginal:** on the transfer-bound 27B, recompute:false's compute saving is
+   masked by weight streaming (~4.8s/step either way; the ~1.5x estimate was wrong — dispatch
+   re-forwards once per stage regardless of recompute). The ~25% win only shows on the
+   compute-bound 0.8B.
+
+So the per-stage reset is left **unwired** (documented in `reset_saved_cache`); the 27B example
+stays recompute:true. Kept from this attempt (behavior-preserving, verified): the make_persistent_tensor
+-> SavedTensorCache::acquire migration (cleaner, pool-ready) and the dispatch prep skip.
+
+Verified final: 27B recompute:true loss 2.7 (no regression); 0.8B recompute on/off both parity
+(false ~20% faster). recompute:false on a DENSE dispatch model works; on gated-delta it OOMs
+(no reset) and the reset that would fix it isn't gated-delta-safe yet.
+
 ## STATUS (implementation revealed broader scope)
 
 recompute:false sizes **multiple, non-uniform** per-layer arenas whole-model — not just
