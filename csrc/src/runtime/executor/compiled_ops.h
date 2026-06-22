@@ -312,7 +312,9 @@ public:
     bool mBwdLayerLoss = false;
     bool mBwdLayerEmbed = false;
     std::vector<std::pair<std::string, std::vector<std::byte>>> mInjectNamed;
-    std::vector<void*> mInjectBuffers;  // device buffers backing mInjectNamed binds
+    std::vector<void*> mInjectBuffers;  // device buffers backing mInjectNamed binds (active)
+    std::vector<void*> mInjectPool;     // recycled inject buffers -> no per-call cudaMalloc/cudaFree
+    std::size_t mInjectBufBytes = 0;    // size of the pooled inject buffers (all boundaries are equal)
     DeviceMemoryStack::Checkpoint mStageBase{};
     bool mStageBaseValid = false;
     DeviceMemoryStack::Checkpoint mDispatchStepBase{};

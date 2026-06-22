@@ -413,6 +413,16 @@ CompiledExecutor::~CompiledExecutor() {
     // Free persistent saved-tensor buffers (the one arena-aware release point).
     mSavedCache.free_all();
 
+    // Free the recycled cross-stage inject buffers (active + pooled).
+    for (void* p : mInjectBuffers) {
+        if (p) cudaFree(p);
+    }
+    mInjectBuffers.clear();
+    for (void* p : mInjectPool) {
+        if (p) cudaFree(p);
+    }
+    mInjectPool.clear();
+
     // EP per-layer state, LLEP state, shared buffers, buffer pool, and
     // the weight-transfer stream are all owned by mEpStrategy and released
     // by its destructor automatically via unique_ptr cleanup.

@@ -541,8 +541,10 @@ void CompiledExecutor::snapshot_forward_execution_state() {
 }
 
 void CompiledExecutor::clear_inject_named() {
+    // Recycle the active inject buffers instead of cudaFree -- cudaFree is a device-wide sync
+    // point, and this is called once per dispatch stage (~hundreds of times per step).
     for (void* p : mInjectBuffers) {
-        if (p) cudaFree(p);
+        if (p) mInjectPool.push_back(p);
     }
     mInjectBuffers.clear();
     mInjectNamed.clear();
@@ -554,8 +556,9 @@ void CompiledExecutor::clear_inject_named() {
 // gradients d_blocks[hi].res_att / mlp_down). Backs each with an owned device buffer.
 void CompiledExecutor::apply_named_inject() {
     if (mInjectNamed.empty()) return;
+    // Recycle any still-active buffers (defensive; clear_inject_named normally drains them).
     for (void* p : mInjectBuffers) {
-        if (p) cudaFree(p);
+        if (p) mInjectPool.push_back(p);
     }
     mInjectBuffers.clear();
     int dev = 0;
@@ -563,8 +566,23 @@ void CompiledExecutor::apply_named_inject() {
     const long H = static_cast<long>(mConfig.HiddenSize);
     for (auto& [name, bytes] : mInjectNamed) {
         if (bytes.empty()) continue;
+        // Boundary tensors are all [B,T,H] bf16 -> identical size. Reuse a pooled device buffer;
+        // only (re)allocate when the pool is empty or the size changed. This removes a per-call
+        // cudaMalloc/cudaFree pair -- each a device-wide sync that serialized the pipeline.
+        if (mInjectBufBytes != bytes.size()) {
+            for (void* p : mInjectPool) {
+                if (p) cudaFree(p);
+            }
+            mInjectPool.clear();
+            mInjectBufBytes = bytes.size();
+        }
         void* buf = nullptr;
-        CUDA_CHECK(cudaMalloc(&buf, bytes.size()));
+        if (!mInjectPool.empty()) {
+            buf = mInjectPool.back();
+            mInjectPool.pop_back();
+        } else {
+            CUDA_CHECK(cudaMalloc(&buf, bytes.size()));
+        }
         mInjectBuffers.push_back(buf);
         CUDA_CHECK(cudaMemcpyAsync(buf, bytes.data(), bytes.size(), cudaMemcpyHostToDevice,
                                    mRunState.MainStream));
