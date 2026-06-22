@@ -26,19 +26,13 @@ output_dir: ./output_q36
 gpus: 4
 
 per_device_train_batch_size: 1
-# Grad-accum is folded into the dispatch microbatch count (LoRA): a step runs
-# M = gpus * SUROGATE_DISPATCH_MICROBATCH_CHUNKS * gradient_accumulation_steps microbatches,
-# accumulated into one optimizer step. So GA and the chunks env multiply the same way; the
-# effective batch is gpus * per_device_train_batch_size * chunks * GA. (Non-LoRA/FFT keeps M=1
-# and ignores GA until cross-microbatch accumulation is wired.)
+# The microbatch count for dispatch-PP (LoRA): a step runs M = gpus * gradient_accumulation_steps
+# microbatches, all accumulated into ONE optimizer step (effective batch gpus*bsz*GA). Because
+# the per-stage weight stream is fixed per step, more microbatches amortize it over more tokens
+# and keep the pipeline fuller (fewer bubbles) at no extra peak memory — so treat GA as both the
+# effective-batch and the throughput knob. (Non-LoRA/FFT keeps M=1 and ignores GA until
+# cross-microbatch accumulation is wired.)
 gradient_accumulation_steps: 4
-
-# Throughput knob: microbatches per step = gpus * SUROGATE_DISPATCH_MICROBATCH_CHUNKS
-# (default 1 -> M=gpus). The per-step weight stream is fixed (each stage streams once and
-# all microbatches reuse it), so raising this amortizes the stream over more tokens and
-# fills the pipeline (fewer bubbles) at no extra peak memory. It also raises the effective
-# batch to gpus*bsz*chunks, so treat it as a batch-size knob. On the 27B: chunks=2 was
-# ~+23% tok/s over chunks=1. Set via env, e.g. SUROGATE_DISPATCH_MICROBATCH_CHUNKS=2.
 
 sample_packing: true
 sequence_len: 2048

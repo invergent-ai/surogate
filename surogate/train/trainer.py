@@ -410,20 +410,20 @@ class SurogateTrainerWrapper:
             # stack auto-sizer doesn't model them). Plenty of free VRAM since the base
             # weights are bounded to the prefetch buffers.
             os.environ.setdefault("SUROGATE_DISPATCH_STACK_HEADROOM_MB", "2048")
-            # Microbatches per step = gpus * chunks. The per-step weight stream is fixed
-            # (each stage streams once and all microbatches reuse it), so running more
-            # microbatches amortizes it over more tokens AND keeps the pipeline fuller
-            # (fewer bubbles). Peak memory is unchanged (microbatches run sequentially on
-            # the resident stage). chunks>1 raises the effective batch to gpus*bsz*chunks.
-            self._dpp_chunks = max(1, int(os.environ.get("SUROGATE_DISPATCH_MICROBATCH_CHUNKS", "1")))
-            # Fold gradient_accumulation_steps into the microbatch count: the step runs
-            # M = gpus * chunks * GA microbatches, accumulating grads into ONE optimizer step.
-            # (LoRA only; FFT keeps M=1 until cross-microbatch accumulation is wired -> M=1.)
-            _ga = max(1, config.gradient_accumulation_steps)
-            if config.lora and _ga > 1:
-                self._dpp_chunks *= _ga
-            # The loader advances gpus*bsz*chunks tokens per step; reflect that in the epoch
-            # math (the earlier total_batch_size counted GA but not the microbatch chunks).
+            # Microbatches per step: M = gpus * _dpp_chunks, all accumulated into ONE optimizer
+            # step. gradient_accumulation_steps sets the per-GPU count for LoRA (M = gpus*GA,
+            # effective batch gpus*bsz*GA). The per-step weight stream is fixed, so more
+            # microbatches amortize it over more tokens and keep the pipeline fuller at no extra
+            # peak memory (they run sequentially on the resident stage). FFT keeps M=1 until
+            # cross-microbatch accumulation is wired.
+            self._dpp_chunks = max(1, config.gradient_accumulation_steps) if config.lora else 1
+            if os.environ.get("SUROGATE_DISPATCH_MICROBATCH_CHUNKS"):
+                logger.warning(
+                    "[dispatch_pp]: SUROGATE_DISPATCH_MICROBATCH_CHUNKS is removed and ignored; "
+                    "use gradient_accumulation_steps (it now sets the microbatch count)."
+                )
+            # Reflect the real per-step loader consumption (gpus*bsz*_dpp_chunks tokens) in the
+            # epoch math.
             self.total_batch_size = self.chunk_size * self._dpp_chunks
             if self.train_loader is not None:
                 self.steps_per_epoch = self.train_loader.num_tokens // max(1, self.total_batch_size)
@@ -1110,7 +1110,7 @@ class SurogateTrainerWrapper:
 
         # Allocate token buffers
         if self.config.parallelism == "dispatch_pp":
-            micro_steps = self._dpp_chunks  # M = gpus * chunks microbatches per step
+            micro_steps = self._dpp_chunks  # M = gpus * _dpp_chunks (= GA for LoRA) microbatches/step
         elif use_full_step_graphs:
             micro_steps = self.config.gradient_accumulation_steps
         else:
@@ -1152,9 +1152,8 @@ class SurogateTrainerWrapper:
                 )
             elif _ga > 1:
                 logger.info(
-                    "[dispatch_pp]: gradient_accumulation_steps=%d folded into the microbatch count "
-                    "-> M = gpus*chunks*GA = %d microbatches per optimizer step (effective batch "
-                    "%d seqs).",
+                    "[dispatch_pp]: gradient_accumulation_steps=%d -> M = gpus*GA = %d microbatches "
+                    "per optimizer step (effective batch %d seqs).",
                     _ga,
                     self.config.gpus * self._dpp_chunks,
                     self.config.gpus * self._dpp_chunks * self._dpp_bsz,
@@ -1286,8 +1285,8 @@ class SurogateTrainerWrapper:
             step_start = time.time()
 
             if self._dispatch_pp:
-                # Fill all gpus*bsz*chunks rows = M microbatches. The loader yields one
-                # gpus*bsz chunk per call, so load `chunks` of them into the buffer.
+                # Fill all gpus*bsz*_dpp_chunks rows = M microbatches. The loader yields one
+                # gpus*bsz chunk per call, so load _dpp_chunks of them into the buffer.
                 chunk = self.config.gpus * self.config.per_device_train_batch_size
                 for c in range(self._dpp_chunks):
                     if not self.train_loader.has_next():
@@ -1366,7 +1365,7 @@ class SurogateTrainerWrapper:
             # Build structured metrics for this step
             step_time = time.time() - step_start
             if self._dispatch_pp:
-                # M = gpus * chunks microbatches per optimizer step (grad-accum is 1).
+                # M = gpus * _dpp_chunks (= GA for LoRA) microbatches per optimizer step.
                 tokens_processed = (
                     self.config.per_device_train_batch_size
                     * self.config.sequence_len
