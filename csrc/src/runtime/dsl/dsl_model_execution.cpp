@@ -1581,9 +1581,7 @@ float DslModel::dispatch_pp_apply_optimizer(NCCLCommunicator& comm,
     mDispatchPpLocalGrads = true;
     update_with_config(comm, opt_config, step_idx);
     mDispatchPpLocalGrads = false;
-    // The optimizer computed the grad norm for clipping; return it for the loss display
-    // (same value the non-dispatch path surfaces via get_norm()).
-    return get_norm();
+    return 0.0f;
 }
 
 std::vector<float> DslModel::dispatch_pp_grad_norms_subranges(Tensor inputs,
