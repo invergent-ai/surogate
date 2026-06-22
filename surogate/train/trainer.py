@@ -273,7 +273,7 @@ class SurogateTrainerWrapper:
         aim for ~SUROGATE_DISPATCH_STAGE_BLOCKS layers per stage (default 4) so 2x a stage
         fits the VRAM budget and a stage stays cached across its microbatches. Always make
         at least `gpus` stages so every device is used. Returns (los, his, n_layers,
-        num_stages, max_stage_blocks).
+        num_stages, max_stage_blocks, stage_blocks).
         """
         mc = self.config.model_info.config
         n_layers = getattr(mc, "num_hidden_layers", 0) or getattr(
@@ -282,18 +282,24 @@ class SurogateTrainerWrapper:
         if not n_layers:
             raise RuntimeError("dispatch_pp: could not determine num_hidden_layers from model config")
         gpus = self.config.gpus
-        target = max(1, int(os.environ.get("SUROGATE_DISPATCH_STAGE_BLOCKS", "4")))
-        nst = max(gpus, (n_layers + target - 1) // target)
-        nst = min(nst, n_layers)
+        sb = max(1, int(os.environ.get("SUROGATE_DISPATCH_STAGE_BLOCKS", "4")))
+        # Stages must be ALIGNED uniform blocks of `sb` ([0..sb-1], [sb..2sb-1], ...): the
+        # recompute:false activation arena is colored cyclically (layer L -> section L % sb),
+        # which is only correct if every stage starts at a multiple of sb (so L % sb == L - lo
+        # within a stage). The last stage may be shorter. Shrink sb if needed so there are at
+        # least `gpus` stages (every device used).
+        if (n_layers + sb - 1) // sb < gpus:
+            sb = max(1, n_layers // gpus)
         los, his = [], []
-        base, rem, lo = n_layers // nst, n_layers % nst, 0
-        for i in range(nst):
-            sz = base + (1 if i < rem else 0)
+        lo = 0
+        while lo < n_layers:
+            hi = min(lo + sb, n_layers) - 1
             los.append(lo)
-            his.append(lo + sz - 1)
-            lo += sz
+            his.append(hi)
+            lo = hi + 1
+        nst = len(los)
         max_stage = max(h - l + 1 for l, h in zip(los, his))
-        return los, his, n_layers, nst, max_stage
+        return los, his, n_layers, nst, max_stage, sb
 
     def __init__(self, config: SFTConfig, train_files: list[str], eval_files: list[str] | None = None):
         self.config = config
@@ -394,7 +400,10 @@ class SurogateTrainerWrapper:
         # (and its weight manager) is constructed, since the prefetch-slot count is read
         # from the env at construction time.
         if config.parallelism == "dispatch_pp":
-            self._dpp_los, self._dpp_his, _nl, _nst, _max_stage = self._dispatch_pp_plan()
+            self._dpp_los, self._dpp_his, _nl, _nst, _max_stage, _sb = self._dispatch_pp_plan()
+            # Pin the section count to the actual stage size so the recompute:false cyclic
+            # activation coloring (graph compiler) matches the planner's aligned stages.
+            os.environ["SUROGATE_DISPATCH_STAGE_BLOCKS"] = str(_sb)
             prefetch = _max_stage + 2  # whole stage resident + double-buffer margin
             os.environ["SUROGATE_DISPATCH_PREFETCH_BLOCKS"] = str(prefetch)
             # Headroom for the boundary saves kept live by sub-range skip_finalize (the

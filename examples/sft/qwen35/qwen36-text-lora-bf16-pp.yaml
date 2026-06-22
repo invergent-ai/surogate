@@ -40,7 +40,7 @@ gradient_accumulation_steps: 1
 sample_packing: true
 sequence_len: 1024
 
-max_steps: 50
+max_steps: 10
 eval_steps: 25
 
 learning_rate: 1e-4
@@ -62,10 +62,11 @@ dispatch_pp:
 # models that fit resident — the same stage scheduler runs either way.
 offload_master: true
 
-# recompute: false would skip the backward re-forward (faster), but the phase-arena
-# sizer currently sizes the forward stack for the WHOLE model's activations (~19 GB on
-# the 27B) rather than one resident stage, so it OOMs at this size. Leave recompute on
-# until the arena is sized per-stage. (false is correct + ~30% faster on models that fit.)
+# recompute: false skips the backward re-forward (~1.5x faster step). It now works for
+# DENSE dispatch models (the FwdStack + SaveForBwd arenas are cyclic per resident stage),
+# but this 27B is MoE: its expert-state save arena (moe_saved) still sizes whole-model and
+# OOMs. Left on until moe_saved is made dispatch-aware. (recompute:false verified correct +
+# ~30% faster on the dense 0.8B.)
 recompute: true
 
 lora: true
