@@ -1,38 +1,16 @@
 # Dispatch Pipeline Parallelism (dispatch-PP) — single-node, model-parallel LoRA.
 #
-# Treats the node's GPUs as a stateless round-robin compute pool: the model's
-# transformer blocks are grouped into contiguous stages, each run on whichever GPU
-# is next, with activations/gradients handed between stages through host memory (no
-# NCCL on the hot path). So a model that OOMs under DDP can train on PCIe-only
-# multi-GPU boxes.
-#
-# Memory is bounded two ways, independent of model size / GPU count:
-#   - activations: the per-stage forward only materializes one stage's blocks;
-#   - base weights (with offload_master): they live in pinned CPU and stream to the
-#     GPU one block at a time, so resident base weight memory is ~2 blocks.
-# Only the (small, frozen-base) LoRA adapters stay resident and get optimized.
-#
-# Validated: this config trains Qwen3.6-27B (~54 GB bf16, can't fit on a 32 GB card)
-# across 4x 32 GB GPUs, LoRA + FP8 weight streaming (see the recipe note below).
 model: Qwen/Qwen3.6-27B
 output_dir: ./output_q36
 
 # Size of the round-robin GPU pool. Set to your box's GPU count. The layers are split
-# into many SMALL stages (~4 blocks each, more than the GPU count) so a stage stays
-# resident across its microbatches and 2x a stage fits the VRAM budget; stages then
-# pipeline across the GPUs (N parallel PCIe links). With offload_master streaming the
-# base, even gpus: 1 works — more GPUs pipeline more stages concurrently for throughput.
-# (Stage size is tunable via SUROGATE_DISPATCH_STAGE_BLOCKS, default 4.)
+# into many SMALL stages
 gpus: 4
 
 per_device_train_batch_size: 1
 # The microbatch count for dispatch-PP (LoRA): a step runs M = gpus * gradient_accumulation_steps
-# microbatches, all accumulated into ONE optimizer step (effective batch gpus*bsz*GA). Because
-# the per-stage weight stream is fixed per step, more microbatches amortize it over more tokens
-# and keep the pipeline fuller (fewer bubbles) at no extra peak memory — so treat GA as both the
-# effective-batch and the throughput knob. (Non-LoRA/FFT keeps M=1 and ignores GA until
-# cross-microbatch accumulation is wired.)
-gradient_accumulation_steps: 4
+# microbatches, all accumulated into ONE optimizer step (effective batch gpus*bsz*GA).
+gradient_accumulation_steps: 8
 
 sample_packing: true
 sequence_len: 2048
@@ -43,33 +21,18 @@ eval_steps: 25
 learning_rate: 1e-4
 warmup_ratio: 0.15
 
-# FP8 weight streaming: the frozen matmul base weights are quantized to FP8-E4M3 once at
-# load and streamed per stage as FP8 (~half the PCIe bytes, the transfer-bound lever) and
-# fed straight to the FP8 GEMM. Only the matmul weights are quantized; conv / norm / A_log
-# stay BF16. ~1.45x faster step on this 27B with loss parity. Use bf16 to disable. (NVFP4
-# stage streaming is still deferred.)
 recipe: fp8_hybrid
 
 # Opt-in model-parallel mode. Mutually exclusive with ZeRO sharding / cpu_training /
 # MoE-EP; CUDA graphs are auto-disabled (per-stage weight streaming can't be captured).
 parallelism: dispatch_pp
-dispatch_pp:
-  min_stages: null         # default = number of local GPUs; raise to cut per-GPU peak further
-  upper_threshold: 1.1     # PCIe operating-envelope warning threshold (tokens/step vs bandwidth)
-  vram_budget_gb: null     # per-GPU stage memory ceiling; null = auto (free VRAM * 0.9)
-  recompute_grain: stage   # activation recompute granularity for the backward pass
+# Stage size (blocks per stage) is set via SUROGATE_DISPATCH_STAGE_BLOCKS (default 4); the
+# other dispatch knobs are top-level: offload_master, recompute, gradient_accumulation_steps.
 
 # Stream the frozen base weights from pinned CPU per block. Required when the base
 # model can't fit resident on a single GPU (e.g. a 27B on 32 GB cards). Drop it for
 # models that fit resident — the same stage scheduler runs either way.
 offload_master: true
-
-# recompute: false skips the backward re-forward (~1.5x faster step). It now works for
-# DENSE dispatch models (the FwdStack + SaveForBwd arenas are cyclic per resident stage),
-# but this 27B is MoE: its expert-state save arena (moe_saved) still sizes whole-model and
-# OOMs. Left on until moe_saved is made dispatch-aware. (recompute:false verified correct +
-# ~30% faster on the dense 0.8B.)
-recompute: true
 
 lora: true
 lora_rank: 16

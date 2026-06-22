@@ -708,10 +708,10 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         """Normalize and validate parallelism=dispatch_pp (opt-in model-parallel mode).
 
         Unset / "ddp" leaves the existing data-parallel path untouched. When set to
-        "dispatch_pp", the sub-block is filled with planner defaults and the v1
-        mutual-exclusions (ZeRO sharding, cpu_training, MoE/EP, non-BF16 recipes)
-        are rejected with clear messages. CUDA graphs are disabled (per-stage weight
-        streaming is incompatible with graph capture).
+        "dispatch_pp", the v1 mutual-exclusions (ZeRO sharding, cpu_training, MoE/EP,
+        non-BF16/FP8 recipes) are rejected with clear messages, and CUDA graphs are
+        disabled (per-stage weight streaming is incompatible with graph capture). Any
+        dispatch_pp sub-block is ignored (see the warning below).
         """
         if self.parallelism in (None, "", "ddp"):
             self.parallelism = None
@@ -722,11 +722,19 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
                 f"Unknown parallelism={self.parallelism!r}; expected unset, 'ddp', or 'dispatch_pp'."
             )
 
+        # The dispatch_pp sub-block is vestigial: the live planner uses uniform stages sized by
+        # SUROGATE_DISPATCH_STAGE_BLOCKS, and the dispatch knobs are top-level (offload_master,
+        # recompute, gradient_accumulation_steps). Accept a sub-block for back-compat but ignore
+        # it with a migration warning.
         self.dispatch_pp = dict(self.dispatch_pp or {})
-        self.dispatch_pp.setdefault("min_stages", None)       # planner default = num local GPUs
-        self.dispatch_pp.setdefault("upper_threshold", 1.1)
-        self.dispatch_pp.setdefault("vram_budget_gb", None)   # auto = free_vram * 0.9
-        self.dispatch_pp.setdefault("recompute_grain", "stage")
+        if self.dispatch_pp:
+            logger.warning(
+                "[dispatch_pp]: the dispatch_pp sub-block (%s) is ignored; stage size is set via "
+                "SUROGATE_DISPATCH_STAGE_BLOCKS (default 4) and the other knobs are top-level "
+                "(offload_master, recompute, gradient_accumulation_steps).",
+                ", ".join(sorted(self.dispatch_pp)),
+            )
+            self.dispatch_pp = {}
 
         if self.cpu_training:
             raise ValueError(
