@@ -102,6 +102,10 @@ inline bool is_growth_mlp_up_or_gate(std::string_view name) {
             contains_ci(name, "mlp_up_weight") || contains_ci(name, "gate_weight") || contains_ci(name, "up_weight"));
 }
 
+inline bool is_fused_mlp_up_gate(std::string_view name) {
+    return contains_ci(name, "mlp_up_weight");
+}
+
 inline bool is_growth_mlp_down(std::string_view name) {
     return (contains_ci(name, "mlp") || contains_ci(name, "mixer")) &&
            (contains_ci(name, "down_proj") || contains_ci(name, "mlp_down_weight") || contains_ci(name, "down_weight"));
@@ -147,6 +151,18 @@ inline void apply_partial_mask(std::string_view name, Tensor& grad, cudaStream_t
         throw std::runtime_error("mlp_growth_new_half mask got empty gradient for " + std::string(name));
     }
     if (is_growth_mlp_up_or_gate(name)) {
+        if (is_fused_mlp_up_gate(name)) {
+            if ((rows % 4) != 0) {
+                throw std::runtime_error("mlp_growth_new_half expected fused 2M row count for " + std::string(name));
+            }
+            const long quarter_rows = rows / 4;
+            const long half_rows = rows / 2;
+            const std::size_t row_bytes = static_cast<std::size_t>(cols) * get_dtype_size(grad.DType);
+            CUDA_CHECK(cudaMemsetAsync(grad.Data, 0, static_cast<std::size_t>(quarter_rows) * row_bytes, stream));
+            char* second_old = reinterpret_cast<char*>(grad.Data) + static_cast<std::size_t>(half_rows) * row_bytes;
+            CUDA_CHECK(cudaMemsetAsync(second_old, 0, static_cast<std::size_t>(quarter_rows) * row_bytes, stream));
+            return;
+        }
         if ((rows % 2) != 0) {
             throw std::runtime_error("mlp_growth_new_half expected even row count for " + std::string(name));
         }
