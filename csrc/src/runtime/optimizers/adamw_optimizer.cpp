@@ -8,6 +8,7 @@
 #include <cmath>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 
 #include <cuda_bf16.h>
@@ -22,6 +23,7 @@
 #include "runtime/executor/graph_executor_utils.h"
 #include "runtime/optimizers/adamw.h"
 #include "runtime/optimizers/adamw_8bit.h"
+#include "runtime/optimizers/gradient_mask.h"
 #include "utilities/comm.h"
 #include "utilities/tensor.h"
 
@@ -150,6 +152,48 @@ void AdamWOptimizer::step(dsl::DslModel& model, NCCLCommunicator& comm, const Op
         }
     }
 
+    const bool grad_mask_enabled = gradient_mask::enabled();
+    std::unordered_map<void*, bool> trainable_grad_ptrs;
+    if (grad_mask_enabled) {
+        for (const auto& name : model.mGrads->param_names()) {
+            bool accumulate = false;
+            Tensor* grad = model.mGrads->get_param_grad(name, accumulate);
+            (void)accumulate;
+            if (!grad || !grad->Data) continue;
+            auto [it, inserted] =
+                trainable_grad_ptrs.emplace(static_cast<void*>(grad->Data), gradient_mask::whole_param_trainable(name));
+            if (!inserted) {
+                it->second = it->second || gradient_mask::whole_param_trainable(name);
+            }
+        }
+
+        std::unordered_set<void*> seen_mask_ptrs;
+        for (const auto& name : model.mGrads->param_names()) {
+            Tensor& val = use_weight_manager ? model.mWeightManager->get_master(name) : model.mParams->get(name);
+            bool accumulate = false;
+            Tensor* grad = model.mGrads->get_param_grad(name, accumulate);
+            (void)accumulate;
+            if (!grad || !grad->Data) continue;
+
+            const bool param_sharded = param_is_sharded(name);
+            Tensor grad_view =
+                param_sharded ? static_cast<Tensor>(shard_view(*grad, model.mShardIdx, model.mNumShards)) : *grad;
+            if (param_sharded && grad_view.nelem() != val.nelem()) {
+                throw std::runtime_error("AdamWOptimizer::step: sharded grad size mismatch for " + name);
+            }
+
+            auto it = trainable_grad_ptrs.find(static_cast<void*>(grad->Data));
+            const bool trainable = (it != trainable_grad_ptrs.end()) && it->second;
+            if (!trainable) {
+                if (seen_mask_ptrs.insert(static_cast<void*>(grad->Data)).second) {
+                    fill_zero(grad_view, stream);
+                }
+                continue;
+            }
+            gradient_mask::apply_partial_mask(name, grad_view, stream);
+        }
+    }
+
     model.calculate_gradient_norm(comm, config.grad_clip, stream, grads_reduced || dispatch_local);
     const float* grad_scale = rs.scratch().norm_buffer.template get<float>() + 1;
 
@@ -195,9 +239,17 @@ void AdamWOptimizer::step(dsl::DslModel& model, NCCLCommunicator& comm, const Op
             state_offset += n;
             continue;
         }
+        if (grad_mask_enabled) {
+            auto it = trainable_grad_ptrs.find(static_cast<void*>(grad->Data));
+            if (it != trainable_grad_ptrs.end() && !it->second) {
+                state_offset += n;
+                continue;
+            }
+        }
 
         float* m = state.state1.template get<float>() + state_offset;
         float* v = state.state2.template get<float>() + state_offset;
+        const float wd = gradient_mask::weight_decay_for(name, config.weight_decay);
 
         if (val.DType == ETensorDType::FP32) {
             if (grad_view.DType == ETensorDType::FP32) {
@@ -211,7 +263,7 @@ void AdamWOptimizer::step(dsl::DslModel& model, NCCLCommunicator& comm, const Op
                              config.adamw_beta2,
                              step_idx,
                              config.adamw_epsilon,
-                             config.weight_decay,
+                             wd,
                              grad_scale,
                              nullptr,
                              nullptr,
@@ -227,7 +279,7 @@ void AdamWOptimizer::step(dsl::DslModel& model, NCCLCommunicator& comm, const Op
                              config.adamw_beta2,
                              step_idx,
                              config.adamw_epsilon,
-                             config.weight_decay,
+                             wd,
                              grad_scale,
                              nullptr,
                              nullptr,
@@ -247,7 +299,7 @@ void AdamWOptimizer::step(dsl::DslModel& model, NCCLCommunicator& comm, const Op
                              config.adamw_beta2,
                              step_idx,
                              config.adamw_epsilon,
-                             config.weight_decay,
+                             wd,
                              grad_scale,
                              nullptr,
                              nullptr,
@@ -263,7 +315,7 @@ void AdamWOptimizer::step(dsl::DslModel& model, NCCLCommunicator& comm, const Op
                              config.adamw_beta2,
                              step_idx,
                              config.adamw_epsilon,
-                             config.weight_decay,
+                             wd,
                              grad_scale,
                              nullptr,
                              nullptr,
@@ -334,6 +386,48 @@ void AdamWOptimizer::step_graph(dsl::DslModel& model,
         }
     }
 
+    const bool grad_mask_enabled = gradient_mask::enabled();
+    std::unordered_map<void*, bool> trainable_grad_ptrs;
+    if (grad_mask_enabled) {
+        for (const auto& name : model.mGrads->param_names()) {
+            bool accumulate = false;
+            Tensor* grad = model.mGrads->get_param_grad(name, accumulate);
+            (void)accumulate;
+            if (!grad || !grad->Data) continue;
+            auto [it, inserted] =
+                trainable_grad_ptrs.emplace(static_cast<void*>(grad->Data), gradient_mask::whole_param_trainable(name));
+            if (!inserted) {
+                it->second = it->second || gradient_mask::whole_param_trainable(name);
+            }
+        }
+
+        std::unordered_set<void*> seen_mask_ptrs;
+        for (const auto& name : model.mGrads->param_names()) {
+            Tensor& val = use_weight_manager ? model.mWeightManager->get_master(name) : model.mParams->get(name);
+            bool accumulate = false;
+            Tensor* grad = model.mGrads->get_param_grad(name, accumulate);
+            (void)accumulate;
+            if (!grad || !grad->Data) continue;
+
+            const bool param_sharded = param_is_sharded(name);
+            Tensor grad_view =
+                param_sharded ? static_cast<Tensor>(shard_view(*grad, model.mShardIdx, model.mNumShards)) : *grad;
+            if (param_sharded && grad_view.nelem() != val.nelem()) {
+                throw std::runtime_error("AdamWOptimizer::step_graph: sharded grad size mismatch for " + name);
+            }
+
+            auto it = trainable_grad_ptrs.find(static_cast<void*>(grad->Data));
+            const bool trainable = (it != trainable_grad_ptrs.end()) && it->second;
+            if (!trainable) {
+                if (seen_mask_ptrs.insert(static_cast<void*>(grad->Data)).second) {
+                    fill_zero(grad_view, stream);
+                }
+                continue;
+            }
+            gradient_mask::apply_partial_mask(name, grad_view, stream);
+        }
+    }
+
     model.calculate_gradient_norm(comm, config.grad_clip, stream, grads_reduced || dispatch_local);
     const float* grad_scale = rs.scratch().norm_buffer.template get<float>() + 1;
 
@@ -379,11 +473,18 @@ void AdamWOptimizer::step_graph(dsl::DslModel& model,
             state_offset += n;
             continue;
         }
+        if (grad_mask_enabled) {
+            auto it = trainable_grad_ptrs.find(static_cast<void*>(grad->Data));
+            if (it != trainable_grad_ptrs.end() && !it->second) {
+                state_offset += n;
+                continue;
+            }
+        }
 
         float* m = state.state1.template get<float>() + state_offset;
         float* v = state.state2.template get<float>() + state_offset;
 
-        const float wd_scale = 1.f;
+        const float wd_scale = gradient_mask::weight_decay_for(name, 1.f);
 
         if (val.DType == ETensorDType::FP32) {
             if (grad_view.DType == ETensorDType::FP32) {
