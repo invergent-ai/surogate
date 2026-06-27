@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "director"
+version = "0.0.1"
+description = "A faithful replica of the Sakana Fugu learned LLM orchestrator (agentic per-step router)."
+requires-python = ">=3.12"
+dependencies = [
+    # --- core: router architecture, training, worker pool ---
+    "torch>=2.4",
+    "transformers>=4.51",
+    "datasets>=2.0",
+    "openai>=2",
+    "diskcache>=5",
+    "tenacity>=8",
+    "cma>=3.3",            # sep-CMA-ES (CMA_diagonal)
+    "numpy>=1.26",
+    "pydantic>=2",
+    "pyyaml>=6",
+    "tqdm>=4",
+    "sympy>=1.12",         # math_equal grader
+    "aiolimiter>=1.1",     # worker-pool RPM limiting
+]
+
+[project.optional-dependencies]
+# Agentic harnesses (heavy; install per modality)
+swebench = ["swebench>=4", "docker>=6"]               # SWE-Bench Verified + Pro grading
+terminalbench = ["terminal-bench>=0.2"]               # Terminal-Bench (Harbor/Terminus)
+taubench = ["tau_bench @ git+https://github.com/sierra-research/tau-bench"]  # tau-bench tool-use
+agentic = ["director[swebench,terminalbench,taubench]"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+all = ["director[agentic,dev]"]
+
+[project.scripts]
+director = "director.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["director*"]
+
+[tool.uv]
+# tau-bench is a git dependency; allow it.
+[tool.uv.sources]
+tau_bench = { git = "https://github.com/sierra-research/tau-bench" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "network: test makes real outbound API calls (skipped by default)",
+    "gpu: test needs a GPU / large model download (skipped by default)",
+]
+addopts = "-m 'not network and not gpu'"

@@ -1,0 +1,48 @@
+{
+  "tasks": 40,
+  "domains": {
+    "math": 10,
+    "general": 10,
+    "science": 10,
+    "code": 10
+  },
+  "arms": [
+    "direct__opus",
+    "direct__gemini",
+    "direct__gpt",
+    "direct__glm",
+    "direct__flash",
+    "direct__mimo",
+    "direct__kimi-code",
+    "direct__minimax",
+    "direct__deepseek-pro",
+    "scr__opus",
+    "scr__gemini",
+    "scr__gpt",
+    "scr__glm",
+    "scr__flash",
+    "plan__gemini__solve__opus",
+    "debate__opus__gpt__synth__gemini",
+    "debate__flash__glm__synth__opus",
+    "solve__opus__critic__gpt__revise__opus",
+    "solve__glm__critic__mimo__revise__glm",
+    "scr__kimi_code__code_only",
+    "scr__deepseek_pro__reasoning_only",
+    "solve__glm__critic__minimax__revise__glm"
+  ],
+  "rollouts": 810,
+  "worker_calls": 1670,
+  "workers": {
+    "opus": "anthropic/claude-opus-4.8",
+    "gemini": "google/gemini-3.1-pro-preview",
+    "gpt": "openai/gpt-5.5",
+    "glm": "z-ai/glm-5.2",
+    "flash": "deepseek/deepseek-v4-flash",
+    "mimo": "xiaomi/mimo-v2.5-pro",
+    "kimi-code": "moonshotai/kimi-k2.7-code",
+    "minimax": "minimax/minimax-m3",
+    "deepseek-pro": "deepseek/deepseek-v4-pro"
+  },
+  "budget_usd": 200.0,
+  "spend_stop_usd": 160.0
+}

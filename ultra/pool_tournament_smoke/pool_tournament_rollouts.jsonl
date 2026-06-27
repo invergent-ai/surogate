@@ -1,0 +1,36 @@
+{"arm": "direct__opus", "task_id": "existing_bank__mmlupro-319", "domain": "general", "success": true, "reward": 1.0, "cost_usd": 0.00696, "valid": true, "failure_class": null}
+{"arm": "direct__gemini", "task_id": "existing_bank__mmlupro-319", "domain": "general", "success": true, "reward": 1.0, "cost_usd": 0.011844, "valid": true, "failure_class": null}
+{"arm": "direct__gpt", "task_id": "existing_bank__mmlupro-319", "domain": "general", "success": true, "reward": 1.0, "cost_usd": 0.007595, "valid": true, "failure_class": null}
+{"arm": "direct__glm", "task_id": "existing_bank__mmlupro-319", "domain": "general", "success": true, "reward": 1.0, "cost_usd": 0.0008882, "valid": true, "failure_class": null}
+{"arm": "direct__flash", "task_id": "existing_bank__mmlupro-319", "domain": "general", "success": true, "reward": 1.0, "cost_usd": 8.0556e-05, "valid": true, "failure_class": null}
+{"arm": "direct__mimo", "task_id": "existing_bank__mmlupro-319", "domain": "general", "success": true, "reward": 1.0, "cost_usd": 0.00061683, "valid": true, "failure_class": null}
+{"arm": "direct__kimi-code", "task_id": "existing_bank__mmlupro-319", "domain": "general", "success": true, "reward": 1.0, "cost_usd": 0.00118576, "valid": true, "failure_class": null}
+{"arm": "direct__minimax", "task_id": "existing_bank__mmlupro-319", "domain": "general", "success": true, "reward": 1.0, "cost_usd": 0.00073368, "valid": true, "failure_class": null}
+{"arm": "direct__deepseek-pro", "task_id": "existing_bank__mmlupro-319", "domain": "general", "success": true, "reward": 1.0, "cost_usd": 0.000804609, "valid": true, "failure_class": null}
+{"arm": "direct__opus", "task_id": "existing_bank__numina-1010", "domain": "math", "success": false, "reward": 0.5, "cost_usd": 0.0065, "valid": true, "failure_class": null}
+{"arm": "direct__gemini", "task_id": "existing_bank__numina-1010", "domain": "math", "success": true, "reward": 1.0, "cost_usd": 0.005934, "valid": true, "failure_class": null}
+{"arm": "direct__gpt", "task_id": "existing_bank__numina-1010", "domain": "math", "success": false, "reward": 0.5, "cost_usd": 0.00247, "valid": true, "failure_class": null}
+{"arm": "direct__glm", "task_id": "existing_bank__numina-1010", "domain": "math", "success": true, "reward": 1.0, "cost_usd": 0.00144115, "valid": true, "failure_class": null}
+{"arm": "direct__flash", "task_id": "existing_bank__numina-1010", "domain": "math", "success": true, "reward": 1.0, "cost_usd": 4.9588e-05, "valid": true, "failure_class": null}
+{"arm": "direct__mimo", "task_id": "existing_bank__numina-1010", "domain": "math", "success": true, "reward": 1.0, "cost_usd": 0.000295365, "valid": true, "failure_class": null}
+{"arm": "direct__kimi-code", "task_id": "existing_bank__numina-1010", "domain": "math", "success": false, "reward": 0.5, "cost_usd": 0.00071084, "valid": true, "failure_class": null}
+{"arm": "direct__minimax", "task_id": "existing_bank__numina-1010", "domain": "math", "success": false, "reward": 0.5, "cost_usd": 0.00036708, "valid": true, "failure_class": null}
+{"arm": "direct__deepseek-pro", "task_id": "existing_bank__numina-1010", "domain": "math", "success": false, "reward": 0.5, "cost_usd": 0.000445653, "valid": true, "failure_class": null}
+{"arm": "direct__opus", "task_id": "existing_bank__codecontests-748_C. Santa Claus and Robot", "domain": "code", "success": true, "reward": 1.0, "cost_usd": 0.01226, "valid": true, "failure_class": null}
+{"arm": "direct__gemini", "task_id": "existing_bank__codecontests-748_C. Santa Claus and Robot", "domain": "code", "success": false, "reward": 0.5, "cost_usd": 0.013246, "valid": true, "failure_class": null}
+{"arm": "direct__gpt", "task_id": "existing_bank__codecontests-748_C. Santa Claus and Robot", "domain": "code", "success": false, "reward": 0.5, "cost_usd": 0.03323, "valid": true, "failure_class": null}
+{"arm": "direct__glm", "task_id": "existing_bank__codecontests-748_C. Santa Claus and Robot", "domain": "code", "success": false, "reward": 0.5, "cost_usd": 0.0052126, "valid": true, "failure_class": null}
+{"arm": "direct__flash", "task_id": "existing_bank__codecontests-748_C. Santa Claus and Robot", "domain": "code", "success": false, "reward": 0.5, "cost_usd": 0.000249312, "valid": true, "failure_class": null}
+{"arm": "direct__mimo", "task_id": "existing_bank__codecontests-748_C. Santa Claus and Robot", "domain": "code", "success": false, "reward": 0.5, "cost_usd": 0.001112295, "valid": true, "failure_class": null}
+{"arm": "direct__kimi-code", "task_id": "existing_bank__codecontests-748_C. Santa Claus and Robot", "domain": "code", "success": false, "reward": 0.5, "cost_usd": 0.00391772, "valid": true, "failure_class": null}
+{"arm": "direct__minimax", "task_id": "existing_bank__codecontests-748_C. Santa Claus and Robot", "domain": "code", "success": false, "reward": 0.5, "cost_usd": 0.00139758, "valid": true, "failure_class": null}
+{"arm": "direct__deepseek-pro", "task_id": "existing_bank__codecontests-748_C. Santa Claus and Robot", "domain": "code", "success": false, "reward": 0.5, "cost_usd": 0.001934712, "valid": true, "failure_class": null}
+{"arm": "direct__opus", "task_id": "existing_bank__mmlupro-9173", "domain": "science", "success": true, "reward": 1.0, "cost_usd": 0.007825, "valid": true, "failure_class": null}
+{"arm": "direct__gemini", "task_id": "existing_bank__mmlupro-9173", "domain": "science", "success": true, "reward": 1.0, "cost_usd": 0.009676, "valid": true, "failure_class": null}
+{"arm": "direct__gpt", "task_id": "existing_bank__mmlupro-9173", "domain": "science", "success": true, "reward": 1.0, "cost_usd": 0.009395, "valid": true, "failure_class": null}
+{"arm": "direct__glm", "task_id": "existing_bank__mmlupro-9173", "domain": "science", "success": true, "reward": 1.0, "cost_usd": 0.0031904, "valid": true, "failure_class": null}
+{"arm": "direct__flash", "task_id": "existing_bank__mmlupro-9173", "domain": "science", "success": true, "reward": 1.0, "cost_usd": 0.000136612, "valid": true, "failure_class": null}
+{"arm": "direct__mimo", "task_id": "existing_bank__mmlupro-9173", "domain": "science", "success": true, "reward": 1.0, "cost_usd": 0.0020304, "valid": true, "failure_class": null}
+{"arm": "direct__kimi-code", "task_id": "existing_bank__mmlupro-9173", "domain": "science", "success": true, "reward": 1.0, "cost_usd": 0.00123132, "valid": true, "failure_class": null}
+{"arm": "direct__minimax", "task_id": "existing_bank__mmlupro-9173", "domain": "science", "success": true, "reward": 1.0, "cost_usd": 0.00066618, "valid": true, "failure_class": null}
+{"arm": "direct__deepseek-pro", "task_id": "existing_bank__mmlupro-9173", "domain": "science", "success": true, "reward": 1.0, "cost_usd": 0.000971919, "valid": true, "failure_class": null}

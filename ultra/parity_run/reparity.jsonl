@@ -1,0 +1,2 @@
+{"provider": "yunwu", "model": "glm", "task_id": "pydicom__pydicom.7d361b3d.func_pm_remove_cond__nh9m18q5", "solved": 1, "diff_len": 805, "valid": true}
+{"provider": "openrouter", "model": "glm", "task_id": "pydicom__pydicom.7d361b3d.func_pm_remove_cond__nh9m18q5", "solved": 1, "diff_len": 805, "valid": true}

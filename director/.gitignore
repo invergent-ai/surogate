@@ -1,0 +1,17 @@
+.director_cache/
+.director/
+*.pt
+labels*.jsonl
+smoke.yaml
+__pycache__/
+*.egg-info/
+.pytest_cache/
+
+# smoke/run artifacts
+gold*.json*
+manifests/
+gpqa.yaml
+.director_tb/
+logs/
+tb_out/
+.venv/

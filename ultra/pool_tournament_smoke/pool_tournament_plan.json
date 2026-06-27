@@ -1,0 +1,35 @@
+{
+  "tasks": 4,
+  "domains": {
+    "general": 1,
+    "math": 1,
+    "code": 1,
+    "science": 1
+  },
+  "arms": [
+    "direct__opus",
+    "direct__gemini",
+    "direct__gpt",
+    "direct__glm",
+    "direct__flash",
+    "direct__mimo",
+    "direct__kimi-code",
+    "direct__minimax",
+    "direct__deepseek-pro"
+  ],
+  "rollouts": 36,
+  "worker_calls": 36,
+  "workers": {
+    "opus": "anthropic/claude-opus-4.8",
+    "gemini": "google/gemini-3.1-pro-preview",
+    "gpt": "openai/gpt-5.5",
+    "glm": "z-ai/glm-5.2",
+    "flash": "deepseek/deepseek-v4-flash",
+    "mimo": "xiaomi/mimo-v2.5-pro",
+    "kimi-code": "moonshotai/kimi-k2.7-code",
+    "minimax": "minimax/minimax-m3",
+    "deepseek-pro": "deepseek/deepseek-v4-pro"
+  },
+  "budget_usd": 5.0,
+  "spend_stop_usd": 4.0
+}

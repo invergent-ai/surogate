@@ -1,0 +1,12 @@
+backbone: Qwen/Qwen3-0.6B
+featurizer:
+  context_window: 4096   # single-step SFT prompts are short; keeps activation memory sane
+pool:
+  budget_usd: 120.0   # safety net only (not the working cap); ~250-item run ≈ $60-90
+  cache_dir: ./.director_cache/completions
+  max_concurrency: 48
+sampling:
+  temperature: 0.7
+  max_tokens: 32768       # high cap so max-reasoning outputs aren't truncated (Fugu report §4.1.1)
+  reasoning_effort: high  # Fugu runs workers at MAXIMUM reasoning effort
+  seed: 0                 # pin so probe calls == sample #0 of the prod n-sample run (cache reuse)

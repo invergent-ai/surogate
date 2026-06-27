@@ -1,0 +1,7 @@
+backbone: Qwen/Qwen3-0.6B
+pool:
+  budget_usd: 20.0
+  cache_dir: ./.director_cache/completions
+  max_concurrency: 8
+sampling:
+  max_tokens: 4096

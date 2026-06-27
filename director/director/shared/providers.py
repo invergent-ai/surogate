@@ -1,0 +1,339 @@
+"""Worker providers and the WorkerPool.
+
+All frontier workers (GPT / Claude / Gemini) are reached through OpenRouter's single
+OpenAI-compatible endpoint, so there is exactly one network client. ``WorkerPool``
+adds caching, budgeting, concurrency control and an n-sample helper on top.
+
+A ``FakeProvider`` lets the whole pipeline run offline and for free in tests.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Callable
+from typing import Protocol, runtime_checkable
+
+from ..config import PoolConfig, WorkerSpec
+from .budget import BudgetTracker
+from .cache import CompletionCache, completion_key, tool_completion_key
+from .pool import RateGate, call_with_retry
+from .prompt_cache import with_cache_control
+from .types import Completion, Message, Sampling, ToolCall, ToolCompletion
+
+# OpenRouter app-attribution (shown in OpenRouter's logs/rankings). Sent on every call.
+OPENROUTER_REFERER = "https://surogate.ai"
+OPENROUTER_TITLE = "Surogate"
+OPENROUTER_CATEGORIES = "cloud-agent,personal-agent"
+
+
+def openrouter_attribution_headers() -> dict[str, str]:
+    return {
+        "HTTP-Referer": OPENROUTER_REFERER,
+        "X-OpenRouter-Title": OPENROUTER_TITLE,
+        "X-OpenRouter-Categories": OPENROUTER_CATEGORIES,
+    }
+
+
+@runtime_checkable
+class Provider(Protocol):
+    async def complete(
+        self, model: str, messages: list[Message], sampling: Sampling
+    ) -> Completion: ...
+
+    async def complete_tools(
+        self, model: str, messages: list, tools: list, sampling: Sampling
+    ) -> ToolCompletion: ...
+
+
+class OpenRouterProvider:
+    """OpenAI-compatible client pointed at OpenRouter."""
+
+    def __init__(
+        self,
+        base_url: str = "https://openrouter.ai/api/v1",
+        api_key: str | None = None,
+        timeout_s: float = 120.0,
+        sort_by_model: dict[str, str | None] | None = None,
+    ):
+        from openai import AsyncOpenAI
+
+        self._client = AsyncOpenAI(
+            base_url=base_url, api_key=api_key, timeout=timeout_s,
+            default_headers=openrouter_attribution_headers(),
+        )
+        # per-model provider routing: model slug -> "price" | None (default). Missing => "price".
+        self._sort_by_model = sort_by_model or {}
+
+    def _provider_routing(self, model: str) -> dict | None:
+        sort = self._sort_by_model.get(model, "price")
+        return {"sort": sort} if sort else None  # None => omit, use OpenRouter default routing
+
+    async def complete(
+        self, model: str, messages: list[Message], sampling: Sampling
+    ) -> Completion:
+        extra = {"usage": {"include": True}}
+        routing = self._provider_routing(model)
+        if routing is not None:
+            extra["provider"] = routing
+        if sampling.reasoning_effort is not None:
+            extra["reasoning"] = {"effort": sampling.reasoning_effort}
+        resp = await self._client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=sampling.temperature,
+            top_p=sampling.top_p,
+            max_tokens=sampling.max_tokens,
+            seed=sampling.seed,
+            extra_body=extra,
+        )
+        choice = resp.choices[0]
+        text = choice.message.content or ""
+        usage = getattr(resp, "usage", None)
+        prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
+        completion_tokens = getattr(usage, "completion_tokens", 0) or 0
+        cost = float(getattr(usage, "cost", 0.0) or 0.0)
+        if cost <= 0.0 and usage is not None:
+            # cheapest-provider routing often reports top-level cost=0 with the real cost in
+            # cost_details.upstream_inference_cost — use it so budget + cost-tiebreak have signal.
+            cd = getattr(usage, "cost_details", None)
+            if isinstance(cd, dict):
+                cost = float(cd.get("upstream_inference_cost", 0.0) or 0.0)
+            elif cd is not None:
+                cost = float(getattr(cd, "upstream_inference_cost", 0.0) or 0.0)
+        return Completion(
+            text=text,
+            model=model,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            cost_usd=cost,
+            finish_reason=getattr(choice, "finish_reason", None),
+        )
+
+    async def complete_tools(
+        self, model: str, messages: list, tools: list, sampling: Sampling
+    ) -> ToolCompletion:
+        extra = {"usage": {"include": True}}
+        routing = self._provider_routing(model)
+        if routing is not None:
+            extra["provider"] = routing
+        if sampling.reasoning_effort is not None:
+            extra["reasoning"] = {"effort": sampling.reasoning_effort}
+        resp = await self._client.chat.completions.create(
+            model=model,
+            messages=messages,
+            tools=tools,
+            tool_choice="auto",
+            temperature=sampling.temperature,
+            max_tokens=sampling.max_tokens,
+            extra_body=extra,
+        )
+        msg = resp.choices[0].message
+        calls = []
+        for tc in getattr(msg, "tool_calls", None) or []:
+            import json as _json
+
+            try:
+                args = _json.loads(tc.function.arguments or "{}")
+            except (ValueError, TypeError):
+                args = {}
+            calls.append(ToolCall(id=tc.id, name=tc.function.name, arguments=args))
+        usage = getattr(resp, "usage", None)
+        return ToolCompletion(
+            content=msg.content,
+            tool_calls=calls,
+            model=model,
+            prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
+            completion_tokens=getattr(usage, "completion_tokens", 0) or 0,
+            cost_usd=float(getattr(usage, "cost", 0.0) or 0.0),
+        )
+
+
+class FakeProvider:
+    """Deterministic, free provider for tests and offline development.
+
+    ``answer_fn(model, messages, sampling) -> str`` controls the response. The
+    default echoes the model + last user message.
+    """
+
+    def __init__(
+        self,
+        answer_fn: Callable[[str, list[Message], Sampling], str] | None = None,
+        tool_fn: Callable[[str, list, list, Sampling], ToolCompletion] | None = None,
+    ):
+        self._fn = answer_fn or self._default
+        self._tool_fn = tool_fn
+        self.calls: int = 0
+
+    @staticmethod
+    def _default(model: str, messages: list[Message], sampling: Sampling) -> str:
+        last = messages[-1]["content"] if messages else ""
+        return f"[{model}] {last}"
+
+    async def complete(
+        self, model: str, messages: list[Message], sampling: Sampling
+    ) -> Completion:
+        self.calls += 1
+        return Completion(text=self._fn(model, messages, sampling), model=model)
+
+    async def complete_tools(
+        self, model: str, messages: list, tools: list, sampling: Sampling
+    ) -> ToolCompletion:
+        self.calls += 1
+        if self._tool_fn is not None:
+            return self._tool_fn(model, messages, tools, sampling)
+        return ToolCompletion(content=self._fn(model, messages, sampling), tool_calls=[], model=model)
+
+
+class WorkerPool:
+    """Routes ``worker_id -> model slug`` and calls the provider with caching,
+    budgeting and concurrency control."""
+
+    def __init__(
+        self,
+        workers: list[WorkerSpec],
+        provider: Provider,
+        cache: CompletionCache | None = None,
+        budget: BudgetTracker | None = None,
+        gate: RateGate | None = None,
+        max_retries: int = 4,
+        prompt_caching: bool = True,
+        call_timeout: float = 300.0,
+    ):
+        if not workers:
+            raise ValueError("WorkerPool requires at least one worker")
+        self._workers = list(workers)
+        self._by_id = {w.worker_id: w for w in self._workers}
+        self._provider = provider
+        self._cache = cache or CompletionCache(None)
+        self._budget = budget or BudgetTracker(None)
+        self._gate = gate or RateGate(max_concurrency=8)
+        self._max_retries = max_retries
+        self._prompt_caching = prompt_caching
+        self._call_timeout = call_timeout  # hard backstop over the client's own timeout
+
+    @property
+    def worker_ids(self) -> list[str]:
+        """Ordered worker ids; index j is the router's class for worker M_j."""
+        return [w.worker_id for w in self._workers]
+
+    @property
+    def budget(self) -> BudgetTracker:
+        return self._budget
+
+    def model_for(self, worker_id: str) -> str:
+        return self._by_id[worker_id].model
+
+    async def call(
+        self, worker_id: str, messages: list[Message], sampling: Sampling
+    ) -> Completion:
+        model = self.model_for(worker_id)
+        key = completion_key(model, messages, sampling)
+        hit = self._cache.get(key)
+        if hit is not None:
+            hit.cached = True
+            return hit
+        self._budget.check()
+        spec = self._by_id[worker_id]
+        send_msgs = (
+            with_cache_control(messages, model=model)[0] if self._prompt_caching else messages
+        )
+
+        async def _do() -> Completion:
+            async with self._gate.slot():
+                return await asyncio.wait_for(
+                    self._provider.complete(model, send_msgs, sampling), self._call_timeout
+                )
+
+        comp = await call_with_retry(_do, max_retries=self._max_retries)
+        if comp.cost_usd == 0.0:
+            comp.cost_usd = _estimate_cost(spec, comp)
+        self._budget.add(comp.cost_usd)
+        self._cache.set(key, comp)
+        return comp
+
+    async def call_tools(
+        self, worker_id: str, messages: list, tools: list, sampling: Sampling
+    ) -> ToolCompletion:
+        """Function-calling worker call (for tool-use agentic tasks). Cached like call()."""
+        model = self.model_for(worker_id)
+        key = tool_completion_key(model, messages, sampling, tools)
+        hit = self._cache.get_tool(key)
+        if hit is not None:
+            hit.cached = True
+            return hit
+        self._budget.check()
+        spec = self._by_id[worker_id]
+        send_msgs, send_tools = (
+            with_cache_control(messages, tools, model=model) if self._prompt_caching else (messages, tools)
+        )
+
+        async def _do() -> ToolCompletion:
+            async with self._gate.slot():
+                return await asyncio.wait_for(
+                    self._provider.complete_tools(model, send_msgs, send_tools, sampling), self._call_timeout
+                )
+
+        comp = await call_with_retry(_do, max_retries=self._max_retries)
+        if comp.cost_usd == 0.0:
+            comp.cost_usd = _estimate_cost_tool(spec, comp)
+        self._budget.add(comp.cost_usd)
+        self._cache.set_tool(key, comp)
+        return comp
+
+    async def sample(
+        self, worker_id: str, messages: list[Message], n: int, sampling: Sampling
+    ) -> list[Completion]:
+        """n independent samples. Seeds are varied per sample so each is cached
+        distinctly and reproducibly."""
+        import asyncio
+
+        base_seed = sampling.seed or 0
+        tasks = [
+            self.call(
+                worker_id,
+                messages,
+                Sampling(
+                    temperature=sampling.temperature,
+                    top_p=sampling.top_p,
+                    max_tokens=sampling.max_tokens,
+                    seed=base_seed + i,
+                ),
+            )
+            for i in range(n)
+        ]
+        return await asyncio.gather(*tasks)
+
+
+def _estimate_cost(spec: WorkerSpec, comp: Completion) -> float:
+    if spec.cost_in_per_mtok is None or spec.cost_out_per_mtok is None:
+        return 0.0
+    return (
+        comp.prompt_tokens * spec.cost_in_per_mtok
+        + comp.completion_tokens * spec.cost_out_per_mtok
+    ) / 1_000_000.0
+
+
+def _estimate_cost_tool(spec: WorkerSpec, comp: ToolCompletion) -> float:
+    if spec.cost_in_per_mtok is None or spec.cost_out_per_mtok is None:
+        return 0.0
+    return (
+        comp.prompt_tokens * spec.cost_in_per_mtok
+        + comp.completion_tokens * spec.cost_out_per_mtok
+    ) / 1_000_000.0
+
+
+def build_pool(cfg: PoolConfig, workers: list[WorkerSpec]) -> WorkerPool:
+    """Construct a live OpenRouter-backed pool from config."""
+    provider = OpenRouterProvider(
+        base_url=cfg.base_url, api_key=cfg.api_key(), timeout_s=cfg.timeout_s,
+        sort_by_model={w.model: w.provider_sort for w in workers},
+    )
+    return WorkerPool(
+        workers=workers,
+        provider=provider,
+        cache=CompletionCache(cfg.cache_dir),
+        budget=BudgetTracker(cfg.budget_usd),
+        gate=RateGate(cfg.max_concurrency, cfg.requests_per_minute),
+        max_retries=cfg.max_retries,
+        prompt_caching=cfg.prompt_caching,
+    )

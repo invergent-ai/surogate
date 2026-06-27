@@ -1,0 +1,519 @@
+{
+  "n_rollouts": 36,
+  "total_cost_usd": 0.156605361,
+  "arms": {
+    "direct__deepseek-pro": {
+      "n": 4,
+      "valid": 4,
+      "success_rate": 0.5,
+      "cost_usd": 0.004156893,
+      "domains": {
+        "general": 1,
+        "math": 1,
+        "code": 1,
+        "science": 1
+      }
+    },
+    "direct__flash": {
+      "n": 4,
+      "valid": 4,
+      "success_rate": 0.75,
+      "cost_usd": 0.0005160680000000001,
+      "domains": {
+        "general": 1,
+        "math": 1,
+        "code": 1,
+        "science": 1
+      }
+    },
+    "direct__gemini": {
+      "n": 4,
+      "valid": 4,
+      "success_rate": 0.75,
+      "cost_usd": 0.0407,
+      "domains": {
+        "general": 1,
+        "math": 1,
+        "code": 1,
+        "science": 1
+      }
+    },
+    "direct__glm": {
+      "n": 4,
+      "valid": 4,
+      "success_rate": 0.75,
+      "cost_usd": 0.01073235,
+      "domains": {
+        "general": 1,
+        "math": 1,
+        "code": 1,
+        "science": 1
+      }
+    },
+    "direct__gpt": {
+      "n": 4,
+      "valid": 4,
+      "success_rate": 0.5,
+      "cost_usd": 0.05269,
+      "domains": {
+        "general": 1,
+        "math": 1,
+        "code": 1,
+        "science": 1
+      }
+    },
+    "direct__kimi-code": {
+      "n": 4,
+      "valid": 4,
+      "success_rate": 0.5,
+      "cost_usd": 0.007045640000000001,
+      "domains": {
+        "general": 1,
+        "math": 1,
+        "code": 1,
+        "science": 1
+      }
+    },
+    "direct__mimo": {
+      "n": 4,
+      "valid": 4,
+      "success_rate": 0.75,
+      "cost_usd": 0.00405489,
+      "domains": {
+        "general": 1,
+        "math": 1,
+        "code": 1,
+        "science": 1
+      }
+    },
+    "direct__minimax": {
+      "n": 4,
+      "valid": 4,
+      "success_rate": 0.5,
+      "cost_usd": 0.00316452,
+      "domains": {
+        "general": 1,
+        "math": 1,
+        "code": 1,
+        "science": 1
+      }
+    },
+    "direct__opus": {
+      "n": 4,
+      "valid": 4,
+      "success_rate": 0.75,
+      "cost_usd": 0.033545,
+      "domains": {
+        "general": 1,
+        "math": 1,
+        "code": 1,
+        "science": 1
+      }
+    }
+  },
+  "task_oracle": 1.0,
+  "subset_selection": {
+    "n_tasks": 4,
+    "max_size": 6,
+    "best_by_size": {
+      "1": {
+        "score": 0.75,
+        "subsets": [
+          [
+            "opus"
+          ],
+          [
+            "gemini"
+          ],
+          [
+            "glm"
+          ],
+          [
+            "flash"
+          ],
+          [
+            "mimo"
+          ]
+        ],
+        "n_tied": 5
+      },
+      "2": {
+        "score": 1.0,
+        "subsets": [
+          [
+            "opus",
+            "gemini"
+          ],
+          [
+            "opus",
+            "glm"
+          ],
+          [
+            "opus",
+            "flash"
+          ],
+          [
+            "opus",
+            "mimo"
+          ]
+        ],
+        "n_tied": 4
+      },
+      "3": {
+        "score": 1.0,
+        "subsets": [
+          [
+            "opus",
+            "gemini",
+            "gpt"
+          ],
+          [
+            "opus",
+            "gemini",
+            "glm"
+          ],
+          [
+            "opus",
+            "gemini",
+            "flash"
+          ],
+          [
+            "opus",
+            "gemini",
+            "mimo"
+          ],
+          [
+            "opus",
+            "gemini",
+            "kimi-code"
+          ],
+          [
+            "opus",
+            "gemini",
+            "minimax"
+          ],
+          [
+            "opus",
+            "gemini",
+            "deepseek-pro"
+          ],
+          [
+            "opus",
+            "gpt",
+            "glm"
+          ],
+          [
+            "opus",
+            "gpt",
+            "flash"
+          ],
+          [
+            "opus",
+            "gpt",
+            "mimo"
+          ]
+        ],
+        "n_tied": 22
+      },
+      "4": {
+        "score": 1.0,
+        "subsets": [
+          [
+            "opus",
+            "gemini",
+            "gpt",
+            "glm"
+          ],
+          [
+            "opus",
+            "gemini",
+            "gpt",
+            "flash"
+          ],
+          [
+            "opus",
+            "gemini",
+            "gpt",
+            "mimo"
+          ],
+          [
+            "opus",
+            "gemini",
+            "gpt",
+            "kimi-code"
+          ],
+          [
+            "opus",
+            "gemini",
+            "gpt",
+            "minimax"
+          ],
+          [
+            "opus",
+            "gemini",
+            "gpt",
+            "deepseek-pro"
+          ],
+          [
+            "opus",
+            "gemini",
+            "glm",
+            "flash"
+          ],
+          [
+            "opus",
+            "gemini",
+            "glm",
+            "mimo"
+          ],
+          [
+            "opus",
+            "gemini",
+            "glm",
+            "kimi-code"
+          ],
+          [
+            "opus",
+            "gemini",
+            "glm",
+            "minimax"
+          ]
+        ],
+        "n_tied": 52
+      },
+      "5": {
+        "score": 1.0,
+        "subsets": [
+          [
+            "opus",
+            "gemini",
+            "gpt",
+            "glm",
+            "flash"
+          ],
+          [
+            "opus",
+            "gemini",
+            "gpt",
+            "glm",
+            "mimo"
+          ],
+          [
+            "opus",
+            "gemini",
+            "gpt",
+            "glm",
+            "kimi-code"
+          ],
+          [
+            "opus",
+            "gemini",
+            "gpt",
+            "glm",
+            "minimax"
+          ],
+          [
+            "opus",
+            "gemini",
+            "gpt",
+            "glm",
+            "deepseek-pro"
+          ],
+          [
+            "opus",
+            "gemini",
+            "gpt",
+            "flash",
+            "mimo"
+          ],
+          [
+            "opus",
+            "gemini",
+            "gpt",
+            "flash",
+            "kimi-code"
+          ],
+          [
+            "opus",
+            "gemini",
+            "gpt",
+            "flash",
+            "minimax"
+          ],
+          [
+            "opus",
+            "gemini",
+            "gpt",
+            "flash",
+            "deepseek-pro"
+          ],
+          [
+            "opus",
+            "gemini",
+            "gpt",
+            "mimo",
+            "kimi-code"
+          ]
+        ],
+        "n_tied": 69
+      },
+      "6": {
+        "score": 1.0,
+        "subsets": [
+          [
+            "opus",
+            "gemini",
+            "gpt",
+            "glm",
+            "flash",
+            "mimo"
+          ],
+          [
+            "opus",
+            "gemini",
+            "gpt",
+            "glm",
+            "flash",
+            "kimi-code"
+          ],
+          [
+            "opus",
+            "gemini",
+            "gpt",
+            "glm",
+            "flash",
+            "minimax"
+          ],
+          [
+            "opus",
+            "gemini",
+            "gpt",
+            "glm",
+            "flash",
+            "deepseek-pro"
+          ],
+          [
+            "opus",
+            "gemini",
+            "gpt",
+            "glm",
+            "mimo",
+            "kimi-code"
+          ],
+          [
+            "opus",
+            "gemini",
+            "gpt",
+            "glm",
+            "mimo",
+            "minimax"
+          ],
+          [
+            "opus",
+            "gemini",
+            "gpt",
+            "glm",
+            "mimo",
+            "deepseek-pro"
+          ],
+          [
+            "opus",
+            "gemini",
+            "gpt",
+            "glm",
+            "kimi-code",
+            "minimax"
+          ],
+          [
+            "opus",
+            "gemini",
+            "gpt",
+            "glm",
+            "kimi-code",
+            "deepseek-pro"
+          ],
+          [
+            "opus",
+            "gemini",
+            "gpt",
+            "glm",
+            "minimax",
+            "deepseek-pro"
+          ]
+        ],
+        "n_tied": 56
+      }
+    },
+    "proposed_pool": [
+      "opus",
+      "gemini",
+      "gpt",
+      "glm",
+      "flash",
+      "mimo"
+    ],
+    "proposed_score": 1.0,
+    "proposed_leave_one_out": {
+      "opus": {
+        "score_without": 0.75,
+        "delta_kept": 0.25
+      },
+      "gemini": {
+        "score_without": 1.0,
+        "delta_kept": 0.0
+      },
+      "gpt": {
+        "score_without": 1.0,
+        "delta_kept": 0.0
+      },
+      "glm": {
+        "score_without": 1.0,
+        "delta_kept": 0.0
+      },
+      "flash": {
+        "score_without": 1.0,
+        "delta_kept": 0.0
+      },
+      "mimo": {
+        "score_without": 1.0,
+        "delta_kept": 0.0
+      }
+    }
+  },
+  "stopped": null,
+  "plan": {
+    "tasks": 4,
+    "domains": {
+      "general": 1,
+      "math": 1,
+      "code": 1,
+      "science": 1
+    },
+    "arms": [
+      "direct__opus",
+      "direct__gemini",
+      "direct__gpt",
+      "direct__glm",
+      "direct__flash",
+      "direct__mimo",
+      "direct__kimi-code",
+      "direct__minimax",
+      "direct__deepseek-pro"
+    ],
+    "rollouts": 36,
+    "worker_calls": 36,
+    "workers": {
+      "opus": "anthropic/claude-opus-4.8",
+      "gemini": "google/gemini-3.1-pro-preview",
+      "gpt": "openai/gpt-5.5",
+      "glm": "z-ai/glm-5.2",
+      "flash": "deepseek/deepseek-v4-flash",
+      "mimo": "xiaomi/mimo-v2.5-pro",
+      "kimi-code": "moonshotai/kimi-k2.7-code",
+      "minimax": "minimax/minimax-m3",
+      "deepseek-pro": "deepseek/deepseek-v4-pro"
+    },
+    "budget_usd": 5.0,
+    "spend_stop_usd": 4.0
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "n_tasks": 200,
+  "n_reps": 3,
+  "best_single": 0.6116666666666667,
+  "single_acc": {
+    "0": 0.5916666666666667,
+    "1": 0.6116666666666667
+  },
+  "scaffold_acc": {
+    "A_direct": 0.5916666666666667,
+    "B_plan_execute": 0.645,
+    "C_solve_critique_revise": 0.6183333333333333,
+    "D_debate_synthesize": 0.665,
+    "E_specialist_plan_execute": 0.6366666666666666,
+    "F_execute_critic_revise": 0.645
+  },
+  "best_scaffold": [
+    "D_debate_synthesize",
+    0.665
+  ],
+  "delta_fixed_cv": 0.055,
+  "delta_fixed_ci": [
+    0.000244605445391774,
+    0.10975539455460823
+  ],
+  "oracle_obs": 0.8216666666666667,
+  "oracle_null": 0.9881916666666667,
+  "oracle_signal": -0.16652500000000003,
+  "total_cost_usd": 14.941908636936002
+}

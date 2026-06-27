@@ -1,0 +1,12 @@
+{"provider": "yunwu", "model": "kimi", "task_id": "pydicom__pydicom.7d361b3d.func_pm_remove_cond__nh9m18q5", "solved": 0, "diff_len": 0, "valid": true}
+{"provider": "yunwu", "model": "glm", "task_id": "getnikola__nikola.0f4c230e.func_pm_remove_loop__dt3xvmca", "solved": 0, "diff_len": 0, "valid": true}
+{"provider": "yunwu", "model": "kimi", "task_id": "pygments__pygments.27649ebb.func_pm_ctrl_invert_if__x2f92u9g", "solved": 0, "diff_len": 0, "valid": true}
+{"provider": "yunwu", "model": "kimi", "task_id": "getnikola__nikola.0f4c230e.func_pm_remove_loop__dt3xvmca", "solved": 0, "diff_len": 0, "valid": true}
+{"provider": "yunwu", "model": "glm", "task_id": "pydicom__pydicom.7d361b3d.func_pm_remove_cond__nh9m18q5", "solved": 0, "diff_len": 0, "valid": true}
+{"provider": "yunwu", "model": "glm", "task_id": "pygments__pygments.27649ebb.func_pm_ctrl_invert_if__x2f92u9g", "solved": 0, "diff_len": 0, "valid": true}
+{"provider": "openrouter", "model": "kimi", "task_id": "pydicom__pydicom.7d361b3d.func_pm_remove_cond__nh9m18q5", "solved": 0, "diff_len": 0, "valid": true}
+{"provider": "openrouter", "model": "glm", "task_id": "pygments__pygments.27649ebb.func_pm_ctrl_invert_if__x2f92u9g", "solved": 0, "diff_len": 0, "valid": true}
+{"provider": "openrouter", "model": "kimi", "task_id": "pygments__pygments.27649ebb.func_pm_ctrl_invert_if__x2f92u9g", "solved": 0, "diff_len": 0, "valid": true}
+{"provider": "openrouter", "model": "glm", "task_id": "getnikola__nikola.0f4c230e.func_pm_remove_loop__dt3xvmca", "solved": 0, "diff_len": 0, "valid": true}
+{"provider": "openrouter", "model": "kimi", "task_id": "getnikola__nikola.0f4c230e.func_pm_remove_loop__dt3xvmca", "solved": 0, "diff_len": 0, "valid": true}
+{"provider": "openrouter", "model": "glm", "task_id": "pydicom__pydicom.7d361b3d.func_pm_remove_cond__nh9m18q5", "solved": 0, "diff_len": 0, "valid": true}

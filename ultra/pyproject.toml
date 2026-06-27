@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ultra"
+version = "0.0.1"
+description = "Fugu-Ultra: a generative workflow Conductor (parallel track to the Director router)."
+requires-python = ">=3.12"
+dependencies = [
+    # Standalone worker-pool + grading stack (vendored from the router's shared infra).
+    "pydantic>=2",
+    "openai>=2",        # OpenRouter (OpenAI-compatible) worker calls
+    "diskcache>=5",     # content-addressed completion cache
+    "aiolimiter>=1.1",  # worker-pool RPM limiting
+    "sympy>=1.12",      # math_equal grader
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+ultra = "ultra.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ultra*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "network: test makes real outbound API calls (skipped by default)",
+    "gpu: test needs a GPU / large model download (skipped by default)",
+]
+addopts = "-m 'not network and not gpu'"
