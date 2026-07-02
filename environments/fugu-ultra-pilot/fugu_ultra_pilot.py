@@ -14,6 +14,7 @@ returns the faithful Ultra reward.
 from __future__ import annotations
 
 import asyncio
+import ast
 import json
 import os
 import random
@@ -59,24 +60,51 @@ DEFAULT_ARTIFACT_DIR = (
     _REPO_ROOT / "director" / "manifests" / "fugu_clean_v1" / "grpo_pilot_train" / "rollout_artifacts"
 )
 
+# Few-shot examples in the paper's exact output shape (prose plan -> three Python lists).
+# Taken from the Conductor OOD few-shots (ICLR Fig 17; B.2/Table 4 finds OOD examples train
+# best), with model ids remapped into our 4-worker pool [0..3].
+_FEWSHOT_EXAMPLES = '''EXAMPLE 1:
+Question: Does brain-derived neurotrophic factor enhance the contraction of intestinal muscle strips induced by SP and CGRP in mice? Answer Choices: A. Yes B. No
+Assistant Response: This is a factual-recall question rather than one needing algorithmic collaboration, so the best approach is to ask two models independently and have a third reconcile them and format the answer.
+model_id = [1, 0, 2]
+subtasks = ["Does brain-derived neurotrophic factor enhance the contraction of intestinal muscle strips induced by SP and CGRP in mice? Answer with A for Yes or B for No.", "Does brain-derived neurotrophic factor enhance the contraction of intestinal muscle strips induced by SP and CGRP in mice? Answer with A for Yes or B for No.", "Check the two previous answers and provide the correct answer according to the question's formatting instructions if necessary."]
+access_list = [[], [], ["all"]]
+
+EXAMPLE 2:
+Question: Evaluate the limit of ( 1/ln(1+t) + 1/ln(1-t) ) as t tends to 0. Provide the final answer in <answer> </answer> tags and use LaTeX notation.
+Assistant Response: Given the difficulty of the question, let us try four models. The first two work independently to approximate the limit, potentially via a Taylor expansion; the third verifies their work, optionally using L'Hopital's rule; the final model checks everything and returns the correctly formatted answer.
+model_id = [1, 0, 3, 2]
+subtasks = ["Understand the question and provide an initial solution to approximate the limit as t tends to 0, potentially by using a Taylor expansion. Show your work in <idea> </idea> tags.", "Understand the question and provide an initial solution to approximate the limit as t tends to 0, potentially by using a Taylor expansion. Show your work in <idea> </idea> tags.", "Verify the work done by the first two models and optionally use L'Hopital's rule or numerical methods to confirm the result. Show your work in <idea> </idea> tags.", "Check the work of the previous models, refine where necessary and obtain the correct final answer. Provide the final answer according to the question's formatting instructions."]
+access_list = [[], [], ["all"], ["all"]]
+
+EXAMPLE 3:
+Question: A heartbroken dog whose owner died two months ago attends services every day at the church where her funeral was held. [passage continues] The dog Tommy still goes to the church every day to _. Options: A. attend his owner's funeral B. wait for Lochi to come back C. stay together with Lochi D. celebrate Mass with Father Panna
+Assistant Response: This is a straightforward comprehension and recall task from the given text, so we only need one model to do that: comprehend the story, deduce Tommy's reason for going to the church, and output the most accurate answer.
+model_id = [3]
+subtasks = ["Deduce from the story provided in the user question why Tommy still goes to the church every day, choosing the most appropriate option among the given choices A, B, C, and D. Provide the option letter in <answer> tags, for example <answer>B</answer>."]
+access_list = [[]]
+
+EXAMPLE 4:
+Question: You are given a weighted simple connected undirected graph with N vertices and M edges, and a positive integer K. For a spanning tree T, the cost of T is the sum, modulo K, of the weights of its edges. Find the minimum cost of a spanning tree of this graph. The input is given from Standard Input. Print the answer.
+Assistant Response: This is a hard problem, so let us use all five workflow steps: the first model understands the problem and defines the objectives, the second analyzes the graph structure, the third determines the strategy for the minimum-cost spanning tree, the fourth implements it in Python, and the final model validates the implementation.
+model_id = [1, 2, 0, 3, 2]
+subtasks = ["Understand the problem statement and goals. Define what needs to be done to solve the given problem.", "Analyze the graph structure and the constraints to identify key steps in the algorithm for solving the given problem.", "Develop a strategy to find the minimum cost of a spanning tree with costs computed modulo K. Ensure the strategy can handle the input constraints.", "Implement the strategy in a Python function to solve the problem as defined, ensuring all constraints are met.", "Validate and test the Python implementation to ensure the solution is accurate and meets all requirements."]
+access_list = [[], ["all"], ["all"], ["all"], ["all"]]'''
+
+
 def _system_prompt(max_workflow_steps: int) -> str:
-    return f"""You are the Fugu-Ultra Conductor. You solve a task INDIRECTLY by designing an agentic workflow over a team of powerful worker models, each with a different skillset. You do NOT answer the task yourself -- you orchestrate the workers.
-
-Design a workflow of up to {max_workflow_steps} steps. Each step specifies:
-- worker_id: an integer from the allowed worker table below.
-- subtask: a natural-language instruction for that worker. It may ask the worker to solve from scratch, PLAN an approach, IMPLEMENT a plan, REFINE the previous step's output, or VERIFY/critique it. Tailor each subtask to that worker's strengths.
-- access: the list of earlier step indexes whose subtask+response are given to this worker as context ([] for none).
-- budget: one of "short","medium","long","max".
-
-The final step's output is returned as the answer. DECOMPOSE the task -- a single worker rarely beats a good multi-step workflow. Common strong topologies: plan -> implement -> verify -> refine (sequential); several independent attempts -> aggregate (tree); draft -> debug. Exploit the workers' complementary strengths.
-
-Return ONLY JSON: {{"steps":[{{"worker_id":I,"subtask":"...","access":[...],"budget":"..."}}, ...]}}
-
-Examples (worker_ids illustrative -- use the actual allowed workers):
-{{"steps":[{{"worker_id":2,"subtask":"Develop an efficient algorithm for the problem; explain the approach step by step.","access":[],"budget":"medium"}},{{"worker_id":0,"subtask":"Implement the algorithm from the previous step in Python; return the final code.","access":[0],"budget":"long"}}]}}
-{{"steps":[{{"worker_id":3,"subtask":"Write a complete first solution to the task.","access":[],"budget":"medium"}},{{"worker_id":2,"subtask":"Verify the previous solution against the requirements; find bugs or gaps and explain them.","access":[0],"budget":"short"}},{{"worker_id":0,"subtask":"Using the draft and the verification, produce the final corrected solution.","access":[0,1],"budget":"long"}}]}}
-
-Rules: worker_id from the allowed table; up to {max_workflow_steps} steps; access lists only earlier indexes; do NOT solve the task yourself -- route through workers."""
+    return f"""Your role as an assistant involves obtaining answers to questions by an iterative process of querying powerful language models, each with a different skillset.
+You are given a user-provided question and a list of available numbered language models with their metadata. Your objective is to output a sequence of up to {max_workflow_steps} workflow steps.
+Each routing is made of three elements: A language model, its assigned subtask to accomplish, and an "access list" of past workflow steps it will see in its context when trying to accomplish the subtask.
+A subtask could directly ask the language model to solve the given question from scratch, refine the solution of the previous subtask in the sequence, or perform any other completely different task that would facilitate later language models in the sequence to answer the original question with their expertise.
+Based on your answer, the first model selected will be prompted with the user question and the first subtask you define. Each following model in the sequence will be prompted with the history of the previous subtask and response messages specified in its access list, and will be asked to accomplish its relative subtask. The answer of the final model and subtask will be provided back as the final solution to the user.
+Your response should be provided as three Python lists.
+The first list should be called model_id, and contain the integers corresponding to the numbered language models in the sequence you want to prompt.
+The second list should be called subtasks, and contain the strings that will be used to prompt the corresponding language model specified in model_id.
+The third list should be called access_list, and contain the lists of past routing messages (subtasks and assistant responses) from the previous routing steps to include in the context in the current routing step.
+You can pass the string all for any of the routing steps in access_list to provide all the previous routing messages in the language model's context. Alternatively, if you want an agent to attempt its subtask without any access to previous routing steps, you can pass an empty list.
+For instance:
+{_FEWSHOT_EXAMPLES}"""
 
 
 BACKEND_HARNESS_OVERRIDES = {
@@ -131,22 +159,81 @@ def _completion_text(completion: Any) -> str:
     return str(completion or "")
 
 
+def _balanced_list(s: str, i: int) -> str | None:
+    """Return the balanced ``[...]`` span of s starting at s[i]=='[', respecting string
+    literals so brackets inside subtask strings don't throw off the bracket depth."""
+    depth = 0
+    quote: str | None = None
+    esc = False
+    for j in range(i, len(s)):
+        c = s[j]
+        if esc:
+            esc = False
+            continue
+        if c == "\\":
+            esc = True
+            continue
+        if quote is not None:
+            if c == quote:
+                quote = None
+            continue
+        if c in "\"'":
+            quote = c
+        elif c == "[":
+            depth += 1
+        elif c == "]":
+            depth -= 1
+            if depth == 0:
+                return s[i : j + 1]
+    return None
+
+
 def _extract_workflow_payload(raw: str) -> str:
+    """Translate the Conductor's paper-format response into internal Workflow JSON.
+
+    The Conductor deliberates (a prose plan, or a <think> block) and then emits three
+    Python lists -- model_id, subtasks, access_list (Conductor prompt, ICLR Fig 13). We
+    discard the preamble, read the three lists (taking the last occurrence of each, after
+    any reasoning), and map them to {"steps":[{worker_id,subtask,access}]}. An access entry
+    of "all" expands to every earlier step; [] means no prior context. Anything that
+    doesn't yield three parseable lists is returned as-is so parse_workflow fails it (r=0)."""
     text = raw.strip()
-    # Discard the thinking scratchpad: JSON drafted inside <think> must never be
-    # mistaken for the payload (the first-{/last-} fallback would span draft + answer).
     if "</think>" in text:
-        text = text.rsplit("</think>", 1)[1].strip()
-    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL | re.IGNORECASE)
-    if fenced:
-        return fenced.group(1).strip()
-    if text.startswith("{") and text.endswith("}"):
+        text = text.rsplit("</think>", 1)[1]
+
+    def _grab(name: str) -> str | None:
+        last = None
+        for m in re.finditer(name + r"\s*=\s*(?=\[)", text):
+            cand = _balanced_list(text, m.end())
+            if cand is not None:
+                last = cand
+        return last
+
+    raw_ids = _grab(r"model[_ ]?id")
+    raw_subs = _grab(r"subtasks")
+    raw_acc = _grab(r"access[_ ]?list")
+    if not (raw_ids and raw_subs and raw_acc):
         return text
-    start = text.find("{")
-    end = text.rfind("}")
-    if start >= 0 and end > start:
-        return text[start : end + 1].strip()
-    return text
+    try:
+        ids = ast.literal_eval(raw_ids)
+        subs = ast.literal_eval(raw_subs)
+        acc = ast.literal_eval(raw_acc)
+    except (ValueError, SyntaxError):
+        return text
+    if not (isinstance(ids, list) and isinstance(subs, list) and isinstance(acc, list)):
+        return text
+    steps = []
+    for i in range(min(len(ids), len(subs), len(acc))):
+        entry = acc[i]
+        if isinstance(entry, str):
+            entry = [entry]
+        entry = entry or []
+        if any(isinstance(e, str) and e.strip().lower() == "all" for e in entry):
+            access = list(range(i))  # "all" == every earlier step
+        else:
+            access = [int(e) for e in entry if not isinstance(e, str)]
+        steps.append({"worker_id": int(ids[i]), "subtask": str(subs[i]), "access": access})
+    return json.dumps({"steps": steps})
 
 
 def _task_lane_map(pilot_config: dict[str, Any]) -> dict[str, str]:
@@ -207,21 +294,13 @@ def _messages_text(task: TaskSpec, *, max_chars: int) -> str:
 def _prompt_for_task(task: TaskSpec, pilot_config: dict[str, Any], lane: str, *, max_task_chars: int) -> list[dict[str, str]]:
     workers = _worker_rows_for_lane(pilot_config, lane)
     max_workflow_steps = int(pilot_config["workflow_policy"]["max_workflow_steps"])
-    worker_lines = [
-        (
-            f"{row['worker_id']}: {row['name']} | backend={row['backend']} | "
-            f"model={row['model']} | roles={row['role_prior']}"
-        )
-        for row in workers
-    ]
+    # Models are passed as ordinal numbers with capability metadata only -- no brand names,
+    # so the Conductor learns worker strengths from reward, not priors (ICLR App. E).
+    worker_lines = [f"Model {row['worker_id']}: roles={row['role_prior']}" for row in workers]
     user = "\n\n".join(
         [
-            f"Task ID: {task.task_id}",
-            f"Lane: {lane}",
-            f"Capability: {task.capability}",
-            f"Task harness: {task.environment.harness}",
-            "Allowed workers:\n" + "\n".join(worker_lines),
-            "Task prompt:\n" + _messages_text(task, max_chars=max_task_chars),
+            "USER QUESTION:\n" + _messages_text(task, max_chars=max_task_chars),
+            "AVAILABLE LANGUAGE MODELS:\n" + "\n".join(worker_lines),
         ]
     )
     return [{"role": "system", "content": _system_prompt(max_workflow_steps)}, {"role": "user", "content": user}]

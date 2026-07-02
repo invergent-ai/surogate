@@ -160,22 +160,14 @@ Final objective:
 
 ## Current Status & Next Steps
 
-**LIVE: paper-exact group-64 GRPO — resumed 2026-07-02 from `step_00000040` (the 0.867 parity peak), now running from step 41.**
+**CURRENT TRACK (2026-07-02): PAPER-EXACT CONDUCTOR — raw Qwen3-8B + the verbatim ICLR Fig-13 prompt, no-think, no SFT.** Supersedes both the SFT-conductor lineage and the thinking-mode variant (probes below). Setup, all built + verified:
+- **Prompt = the paper's, verbatim** (`fugu_ultra_pilot.py::_system_prompt`): free CoT then THREE PYTHON LISTS (`model_id`/`subtasks`/`access_list`, binary `"all"`/`[]`), **anonymized ordinal workers** ("Model N: roles=…" — no brand names, per App. E), 4 few-shots incl. the paper's 1-step (Fig 18) and 5-step (Fig 20) real completions, no budget field, no decompose-nudge. Parser handles prose/`<think>` preambles, brackets-in-subtasks, `"all"`-expansion; garbage → r=0.
+- **Mode = no-think** (probe verdict): parse **1.00**, zero truncation, completions ≤ ~263 tokens → conductor cap **1024 (paper-exact)**, seq_len 8192 everywhere. Thinking mode truncates 40% even at 8192 (think p50 ~3.3k) — rejected. Base-model head-to-head: **Qwen3-8B over Qwen3.5-9B** (3.5 thinks ~70% longer, 50-68% truncation — intrinsically budget-hungry).
+- **Init grade 0.29** (n=24, handicapped workers: math 0.12 / reasoning 0.38 / code 0.38) — deliberately WEAK init, the paper's own starting condition (Fig 3 starts below every worker; the old engineered-prompt SFT conductor started at ~0.5-0.6 and plateaued at parity). The climb is the experiment. Watch-item: init `steps_dist` is frozen at 3 (template cloning; unchanged by few-shot span) — expect RL to diversify (paper Fig 8); still frozen by ~step 40 = exploration failure.
+- **Configs ready**: `orch_paper.yaml` / `train_paper.yaml` / `infer_paper.yaml` (prefix caching on — all prompts share the long few-shot prefix) → `output/fugu_ultra_paper/`; fresh-run launcher `scratch_launch_paper.sh` (refuses to clobber checkpoints); eval scripts honor `EVAL_TREND_LOG`. Recipe carried: batch 256 = 4×64, advantage `(r−mean)/std`, temp 1.0, lr 1e-6, no KL, ≤5 steps, difficulty filtering, #2 penalty.
+- The thinking-mode option stays viable later (tokenization fix `cfd60620` merged + rebuilt makes a think-SFT safe), but is NOT this run.
 
-What changed vs the plateaued group-16 run (config audit vs Conductor App. A.1 — full findings in the Run Log, 2026-07-02):
-- **batch 256 = 4 questions × 64 rollouts** (was 4 × 16 — off-recipe)
-- **advantage `(r−mean)/std`** (was mean-only — ~2-4× under-scaled gradients)
-- **#2 redundancy penalty kept** (deliberate deviation; targets over-decomposition our no-CoT conductor won't self-fix)
-- unchanged: temp 1.0, lr 1e-6, no KL, ≤5 steps, `online_difficulty_filtering: true`
-
-Run facts:
-- ~700–900 worker calls/step (4× old), ~40–70 min/step
-- checkpoints every 10 → `output/fugu_ultra_lcb/step_NNNNNNNN`
-- live held-out eval WITHOUT stopping training (conc-3 vs the `default` adapter) → `output/fugu_ultra_lcb/heldout_trend.log`
-- group-16 branch (steps 41–126) archived → `output/fugu_ultra_lcb_group16_archive/`
-- stop+resume: `scratch_resume_lcb.sh` (self-healing broadcast + stale-rollout prune)
-
-### The bar (held-out, n=30; rows ≤120 = superseded group-16 branch; group-64 rows append below)
+### The bar (SFT-track table, superseded — kept as the record to beat; paper-track rows go to `output/fugu_ultra_paper/heldout_trend.log`, base row measuring now)
 
 | checkpoint | conductor | code / math | best worker | oracle | wf steps | gap |
 |---|--:|--:|--:|--:|--:|--:|
@@ -192,20 +184,19 @@ Run facts:
 Group-16 summary: early dip (s10) → **parity at iter 40 (0.867)** → 0.70–0.80 oscillation through 120; the win (>0.867) never came. Oracle 0.967 ≈ 0.10 headroom uncaptured. Interventions/decisions along the way: Run Log.
 
 Eval rules (standing):
-- **Eval workers run FULL-STRENGTH** — the 4096/minimal handicap is a training-only gradient device.
+- **Trend evals run the paper's CONSTRAINED setting** (workers at 4096/minimal — identical to training, per §4.3; the whole historical series was measured this way). The FULL-STRENGTH (unconstrained) comparison is reserved for the endgame verdict.
 - **Judge the trajectory, not single points** (n=30 SE ≈ ±0.08; n=60 ≈ ±0.06).
-- Under the fixed recipe the **training curve should now climb too** (paper Fig-3: 57→78); a flat train curve is no longer excusable noise.
+- Under the fixed recipe the **training curve should climb** (paper Fig-3: 57→78); a flat train curve is no longer excusable noise.
 
 ### Next steps
-1. **Health gate** (first fresh trainer step): grad_norm ~2-4× above the old ~0.001 (std scaling), clean kl/masked% — else abort and diagnose.
-2. **Eval every 10 steps**, live conc-3, no stop: `EVAL_MANIFEST=heldout_trend60_taskspecs.jsonl ... scratch_eval_live_throttled.py --label stepN_g64 --conc 3`.
-3. **Success** = training grade_success climbing AND held-out >0.867. **Still flat by ~step 70–80** → next lever: reasoning preamble (CoT-before-workflow, needs prompt/SFT work), then the learnability sampler — one change at a time.
-4. **Watch**: `metrics/ultra_redundancy_penalty` declining; verify/refine-loop prevalence (#2's false-positive class); code-vs-math split.
-5. **Endgame**: select the best checkpoint on the 60-set; confirm ONCE on the sealed `heldout_confirmation_taskspecs.jsonl` — never evaluate it earlier (max-selection bias).
-6. **Final verdict**: best checkpoint vs the FULL baseline set (single workers, best-of-N, self-reflection, fixed workflows), then transfer evals (SWE-Bench Pro / TerminalBench / SWE-Together — need harness shims).
+1. **Base row landing** (`output/fugu_ultra_paper/eval_base_row.log`): raw Qwen3-8B, paper prompt, n=60 held-out — the new trend anchor.
+2. **Launch**: `bash scratch_launch_paper.sh` → 200-step GRPO. Health gate at step 1: parse-rate ~1.0 holds, grad_norm sane under std advantage, kl/masked% clean.
+3. **Eval every 10 steps**, live conc-3, no stop: `EVAL_TREND_LOG=output/fugu_ultra_paper/heldout_trend.log EVAL_MANIFEST=heldout_trend60_taskspecs.jsonl … scratch_eval_live_throttled.py --label stepN_paper --conc 3`. Success = training grade_success climbing AND held-out beating the 0.867 bar. Watch: `steps_dist` diversifying off 3 (frozen at ~step 40 = exploration failure), worker-selection redistribution (paper Fig 7), `ultra_redundancy_penalty` ↓, code-vs-math split.
+5. **Endgame** (unchanged): select best checkpoint on the 60-set; confirm ONCE on the sealed `heldout_confirmation_taskspecs.jsonl` — never evaluate it earlier (max-selection bias).
+6. **Final verdict** (unchanged): best checkpoint vs the FULL baseline set (single workers, best-of-N, self-reflection, fixed workflows), then transfer evals (SWE-Bench Pro / TerminalBench / SWE-Together — need harness shims).
 
 ### Reference (paths & sets)
-- **Base**: `output/fugu_ultra_workflow_sft_qwen3_8b/` (workflow-SFT warm start; repair-SFT / solo bases FORBIDDEN — they give GRPO nothing to grow).
+- **Base (current track)**: raw `Qwen/Qwen3-8B` (mesh HF cache snapshot `b968826d…`) — paper-style cold start from few-shots + format reward, NO SFT. The workflow-SFT base (`output/fugu_ultra_workflow_sft_qwen3_8b/`) is the superseded prior track; its instruction-blindness (0/90 CoT compliance) is documented in the Run Log.
 - **Data**: 461-task mix ≈ 55% hard math/reasoning + 39% code — authoritative table + rationale in DATASETS. Agentic benches are EVAL-ONLY.
 - **LCB**: `/var/lib/mesh/flavius/huggingface/hub/datasets--livecodebench--code_generation_lite/` (`test.jsonl`=V1 train, `test6.jsonl`=V6 held-out; graded on public + decoded-private tests).
 - **Decision sets**: `heldout_trend60_taskspecs.jsonl` (n=60 = original 30 + 15 LCB-V6 + 15 AIME) for every decision; `heldout_confirmation_taskspecs.jsonl` (n=30, SEALED) for the final verdict only.
@@ -247,3 +238,20 @@ Trigger: paper re-read + full config audit against Conductor App. A.1 after the 
 2. **Advantage std normalization was MISSING**: the recipe says `A=(r−mean)/std` but the `surogate` default is mean-only — silently ~2-4× smaller gradients than lr 1e-6 was tuned for (consistent with the run-long tiny grad_norms). Fixed: new `std_normalized_advantage` in `surogate/grpo/orchestrator/advantage.py`, wired via `advantage: {type: custom}` in `orch_lcb.yaml`, unit-tested through the exact yaml→config→orch path.
 3. **#2 kept** (deliberate paper-deviation, user-ratified): it targets a real defect the paper's conductor self-corrects via CoT-before-workflow — ours emits workflows with no reasoning preamble (the known remaining gap; next lever if group-64+std stalls).
 Protocol fixes en route: `max_concurrent` must be ≥ rollouts_per_example (→64, orch crash caught it); `max_inflight_rollouts` 96→384 (1.5× batch); **resume off-by-one fixed in `scratch_resume_lcb.sh`** — on resume at checkpoint N the trainer instantly re-consumed the stale `rollouts/step_N` (double-applying one ~zero-size update) then ignored the orch's regenerated step-N batch entirely (one full generation step wasted; also explains "first step after restart is slow/expensive") — the script now prunes `rollouts/step_≥N` at launch. Restart executed as: archive step>40 artifacts → resume from `step_00000040` (the 0.867 peak; under-powered-gradient hypothesis says its weights are good, just under-trained) → orch relaunched at step 41 against the trainer's step-41 broadcast. Known remaining deviations (assessed, accepted): IPO-mask loss vs PPO-clip (equivalent trust region; one optimizer step per orch step confirmed in `trainer.py`), constant lr vs cosine (≈9e-7 vs 1e-6 in the relevant window; warmup moot on resume), LoRA r16 vs presumed full-FT, 4-worker pool + hard-mix data + difficulty filtering (deliberate track decisions), AdamW β/eps standard (0.9/0.999/1e-8; paper's "eps 0.2" is a typo'd clip-ε), weight_decay 0.01 (paper unstated).
+
+### 2026-07-02 — Group-64 run STOPPED pre-verdict; pivot to the THINKING-CONDUCTOR track (user decision)
+The group-64 restart was stopped during step-41 generation, before any fresh gradient step landed — the recipe-fix hypothesis (group size + std advantage ⇒ climb) is **untested**, not refuted. State intact for a possible resume: checkpoints ≤40 + `run_default/broadcasts/step_40|41` in `output/fugu_ultra_lcb/`, group-16 archive unchanged. Motivation for the pivot: the paper's conductor deliberates before emitting workflows; our SFT base cannot (thinking trained away) — root-cause fix over another recipe tweak. En route: branch work committed (`fb5dcca5`, 189 files; `.env`/caches kept OUT of history), `origin/main` merged twice (dispatch-PP batch, then PR #58).
+
+### 2026-07-02 — Thinking-track probes + the tokenization fix
+- **Probe 1** (raw Qwen3-8B + few-shot, thinking ON, budget 4096, temp 1.0, 90 samples over 45 train tasks): parse 0.32 / truncation 0.68 — but **every completion that finished parsed** (format needs no SFT; length is the only constraint). Think p50 2,629 / p90 3,713. Executed workflows (n=16, handicapped workers): grade 0.56 (reasoning 0.67 / code 0.50 / math 0.00 — olympiad-math tasks are the designed-to-fail headroom band); SFT conductor reference ≈0.65. Steps dist {3:17, 4:9, 5:3}.
+- **Probe 2** (budget 8192, two arms): plain arm parse 0.63 / trunc 0.38, think p50 4,006 / p90 6,790 — **thinks expand with the budget** (temp-1.0 budget-filling), deeper workflows ({3:22, 4:23, 5:10}). Brevity-hint arm: pending at log time.
+- **Thinking-mode tokenization fix** (`cfd60620`, PR #58; cherry-pick of 53218813/f1a62366): `encode_for_training()` never set `enable_thinking`, so `<think>`-bearing assistant targets got a misaligned trainable span (doubled `</think>`, corrupted reasoning bytes — teaches reasoning after a closed think block). Would have silently poisoned the cold-start SFT. Merged, native lib rebuilt (`make build`), regression test `csrc/src/testing/tokenizer/test-chat-template.cpp` available via `BUILD_TESTS=ON`.
+- **Parser hardening**: `_extract_workflow_payload` now strips through the last `</think>` before JSON extraction (draft JSON inside the scratchpad can no longer corrupt rewards); tested on draft-in-think / empty-think / no-think / fenced shapes.
+
+### 2026-07-02 — PAPER PROMPT ADOPTED; mode = no-think; base = Qwen3-8B; track dir `output/fugu_ultra_paper/`
+- **Prompt audit vs ICLR Fig 13 / App. E found six material divergences** in our engineered prompt: "Return ONLY JSON" (an anti-CoT instruction — the paper parses lists *after* free CoT), synthetic bare-JSON few-shots (paper: 4 real OOD completions; ablation −9.4 LCB without them), full model-name + role leak (paper: anonymous ordinals; name-priors shown harmful, Table 11), fine-grained access indexes (their *underperforming* ablation arm, Table 9), an extra `budget` field, and a pro-decomposition nudge (plausible co-cause of the redundant-ensemble defect #2 targets). **Replaced with the verbatim Fig-13 prompt** + three-list parser (quote-aware balanced-bracket capture, `"all"`-expansion, preamble-stripping; unit-tested incl. the Fig-2 example). En route, repaired a concurrent-edit corruption (an unterminated `_PAPER_FEW_SHOTS` block that had eaten the `_task_lane_map` def).
+- **Base head-to-head (old prompt, budget 8192, identical tasks)**: Qwen3.5-9B thinks ~70% longer than Qwen3-8B (p50 6,728 vs 4,006), truncates 50-68%, grade edge (0.58 vs 0.49, n≤33) is survivorship-biased → **Qwen3-8B**.
+- **Mode probes under the paper prompt (24 tasks × 2, temp 1.0)**: no-think parse **1.00** / trunc 0 / completions ≤~263 tok; think parse 0.58 / trunc 0.40 (think p50 3,344) → **no-think**, conductor cap 1024 (paper-exact), seq_len 8192. Prompt-enforced-CoT vs direct probes on the old prompt (C 0.91 / D 0.93 parse; grades ~0.47-0.58 band regardless of mode) became moot post-switch; grading stopped mid-run by user.
+- **Raw model emits NO prose plan at init (0/48)** — bare lists; the paper's plan-prose is a *trained* behavior, free to emerge (format reward doesn't forbid it). **Init grade 0.29** (math 0.12 / reasoning 0.38 / code 0.38) vs old-prompt ~0.5 — the deliberate weak-init of the paper (no name-routing crutch, no engineered steering); Fig-3 starts below every worker too. `steps_dist` frozen at 3 even with 1/3/4/5-step few-shots (48/48) — logged as the exploration watch-item.
+- **SFT-base instruction-blindness measured**: the step-40 SFT conductor ignores an explicit plan-first instruction in 90/90 samples (0.98 parse, bare JSON) — resume-from-40 was formally incompatible with any CoT/prompt change; new track starts at step 0 by necessity, not preference.
+- Infra: `infer/orch/train_paper.yaml` + `scratch_launch_paper.sh` (fresh-run guard) + `EVAL_TREND_LOG` support in both eval scripts; vLLM spawn gotcha documented (heredoc-stdin scripts can't host an engine — probes must be real files with a `__main__` guard).

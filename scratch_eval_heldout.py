@@ -134,8 +134,8 @@ for w in WORKERS:
     wk_percap[w] = {cap: round(sum(v) / len(v), 3) for cap, v in bycap.items()}
 print(f"conductor per-cap: {cond_percap}", flush=True)
 print(f"workers per-cap:   {wk_percap}", flush=True)
-# append trend record
-with open("output/fugu_ultra_lcb/heldout_trend.log", "a") as _tf:
+# append trend record (EVAL_TREND_LOG redirects for non-default tracks)
+with open(_os.environ.get("EVAL_TREND_LOG", "output/fugu_ultra_lcb/heldout_trend.log"), "a") as _tf:
     _tf.write(json.dumps({
         "adapter": args.adapter or "BASE", "conductor": round(cond_rate, 3),
         "conductor_percap": cond_percap, "best_worker": bw,
