@@ -152,10 +152,22 @@ def _info_dict(info: Any) -> dict[str, Any]:
 
 
 def _completion_text(completion: Any) -> str:
+    # Verifiers may deliver messages as dicts OR as pydantic/OpenAI message objects
+    # (attribute access). Falling through to str(...) would hand the parser the object
+    # REPR, whose escape sequences (\n, \') corrupt the three-list payload.
     if isinstance(completion, list) and completion:
         last = completion[-1]
         if isinstance(last, dict):
-            return str(last.get("content") or "")
+            content = last.get("content")
+        else:
+            content = getattr(last, "content", None)
+        if isinstance(content, list):  # content-parts form
+            content = "".join(
+                str(p.get("text", "") if isinstance(p, dict) else getattr(p, "text", "")) for p in content
+            )
+        if content is not None:
+            return str(content)
+        return ""
     return str(completion or "")
 
 
