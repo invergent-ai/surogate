@@ -152,6 +152,16 @@ JitKernel JitKernel::load_manifest(const std::string& manifest_path) {
     meta.shared_mem_bytes = j.value("shared_mem", 0);
     meta.extra_null_params = j.value("extra_null_params", 0);
 
+    // Integer compile-time constants (autotuned tile sizes etc.). Launch sites use
+    // these for grid math; non-integer entries (e.g. DOT_PRECISION, EPS) are skipped.
+    if (auto it = j.find("constants"); it != j.end() && it->is_object()) {
+        for (const auto& [key, val] : it->items()) {
+            if (val.is_number_integer()) {
+                meta.constants[key] = val.get<int>();
+            }
+        }
+    }
+
     // Resolve cubin/ptx path relative to the manifest directory
     auto dir = std::filesystem::path(manifest_path).parent_path();
 
