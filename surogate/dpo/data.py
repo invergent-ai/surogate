@@ -72,11 +72,40 @@ def _layout_sequence(prompt_ids: list[int], response_ids: list[int], max_len: in
     return ids, prompt_len
 
 
-def tokenize_preference_pairs(rows: list[dict], tok, max_len: int, pad_id: int | None = None) -> PrefBatch:
+def _diff_span(chosen_ids: list[int], rejected_ids: list[int]) -> tuple[int, int, int, int] | None:
+    """Longest-common-prefix/suffix diff of two token lists.
+
+    Returns (c_start, c_end, r_start, r_end) — the half-open differing spans in
+    each list — or None if the lists are identical. The common suffix is bounded
+    so the spans never underrun the prefix (all-diff worst case keeps full spans).
+    """
+    if chosen_ids == rejected_ids:
+        return None
+    lcp = 0
+    for a, b in zip(chosen_ids, rejected_ids):
+        if a != b:
+            break
+        lcp += 1
+    lcs = 0
+    max_lcs = min(len(chosen_ids), len(rejected_ids)) - lcp
+    while lcs < max_lcs and chosen_ids[-1 - lcs] == rejected_ids[-1 - lcs]:
+        lcs += 1
+    return lcp, len(chosen_ids) - lcs, lcp, len(rejected_ids) - lcs
+
+
+def tokenize_preference_pairs(
+    rows: list[dict], tok, max_len: int, pad_id: int | None = None, span_mask: bool = False
+) -> PrefBatch:
     """Tokenize {prompt, chosen, rejected} rows into a one-sequence-per-row PrefBatch.
 
     Rows whose prompt+response cannot fit a single response token in `max_len`
     are dropped (logged). Raises ValueError if no pair survives.
+
+    span_mask=True confines loss_mask to the tokens where chosen and rejected
+    DIFFER (common prefix and suffix excluded). For minimal word-substitution
+    pairs this makes the DPO gradient structurally unable to shift style,
+    length, or language of the surrounding text — only the substituted form is
+    scored. Identical-tokenization rows are dropped (no contrastive signal).
     """
     if pad_id is None:
         pad_id = tok.pad_token_id
@@ -86,10 +115,13 @@ def tokenize_preference_pairs(rows: list[dict], tok, max_len: int, pad_id: int |
             raise ValueError("tokenizer has neither pad_token_id nor eos_token_id; pass pad_id explicitly")
 
     seqs: list[tuple[list[int], int]] = []  # (ids, prompt_len), chosen then rejected per kept pair
+    spans: list[tuple[int, int] | None] = []  # per-sequence (start, end) into the RESPONSE, or None = all
     dropped = 0
+    dropped_identical = 0
     for row in rows:
         prompt = row["prompt"]
         laid = []
+        resp_ids = []
         for key in ("chosen", "rejected"):
             p_ids, r_ids = _render(tok, prompt, row[key])
             res = _layout_sequence(p_ids, r_ids, max_len, pad_id)
@@ -97,9 +129,30 @@ def tokenize_preference_pairs(rows: list[dict], tok, max_len: int, pad_id: int |
                 laid = []
                 break
             laid.append(res)
+            resp_ids.append(r_ids)
         if len(laid) != 2:
             dropped += 1
             continue
+        if span_mask:
+            d = _diff_span(resp_ids[0], resp_ids[1])
+            if d is None:
+                dropped_identical += 1
+                continue
+            # Adjust spans for any response-head tokens lost to left-truncation.
+            adj = []
+            for (ids, p_len), r_full, (s, e) in zip(laid, resp_ids, [d[:2], d[2:]]):
+                head_dropped = len(r_full) - (len(ids) - p_len)
+                s2, e2 = max(0, s - head_dropped), e - head_dropped
+                if e2 <= s2:  # differing span truncated away — no contrastive signal
+                    adj = []
+                    break
+                adj.append((s2, e2))
+            if len(adj) != 2:
+                dropped += 1
+                continue
+            spans.extend(adj)
+        else:
+            spans.extend([None, None])
         seqs.extend(laid)
 
     n_pairs = len(seqs) // 2
@@ -107,6 +160,12 @@ def tokenize_preference_pairs(rows: list[dict], tok, max_len: int, pad_id: int |
         raise ValueError("tokenize_preference_pairs: no preference pair fit in max_len")
     if dropped:
         logger.warning("tokenize_preference_pairs: dropped %d row(s) that did not fit max_len=%d", dropped, max_len)
+    if dropped_identical:
+        logger.warning(
+            "tokenize_preference_pairs: dropped %d row(s) with identical chosen/rejected tokenization "
+            "(span_mask needs a differing span)",
+            dropped_identical,
+        )
 
     n_seq = 2 * n_pairs
     input_ids = np.full((n_seq, max_len), pad_id, dtype=np.int32)
@@ -121,7 +180,13 @@ def tokenize_preference_pairs(rows: list[dict], tok, max_len: int, pad_id: int |
         # targets[j] = ids[j+1]; targets[L-1..] stay 0 (unused / masked).
         if L >= 2:
             targets[k, : L - 1] = ids[1:L]
-        loss_mask[k, prompt_len:L] = 1  # response tokens (incl. the last) are scored
+        span = spans[k]
+        if span is None:
+            loss_mask[k, prompt_len:L] = 1  # response tokens (incl. the last) are scored
+        else:
+            a = min(prompt_len + span[0], L - 1)
+            b = min(prompt_len + span[1], L)
+            loss_mask[k, a : max(b, a + 1)] = 1  # only the differing span is scored
         position_ids[k, :L] = np.arange(L, dtype=np.int32)
         seq_len[k] = L
 

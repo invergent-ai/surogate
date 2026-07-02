@@ -126,7 +126,7 @@ def dpo_main(config: DPOTrainConfig, args=None) -> None:
 
     # --- tokenize preference pairs -----------------------------------------
     rows = _load_pref_rows(config.datasets[0].path)
-    batch = tokenize_preference_pairs(rows, config.tokenizer, max_len=T)
+    batch = tokenize_preference_pairs(rows, config.tokenizer, max_len=T, span_mask=config.loss.span_mask)
     logger.info(f"Tokenized {batch.n_pairs} preference pairs (from {len(rows)} rows)")
     Path(config.output_dir).mkdir(parents=True, exist_ok=True)
     # Reference log-probs are computed INLINE per micro-step (see module docstring):

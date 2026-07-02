@@ -26,6 +26,10 @@ class DPOLossConfig:
     # Divide each sequence's response-token logprob sum by its response length
     # (SimPO-style). Off for minimal pairs where chosen/rejected lengths match.
     length_norm: bool = False
+    # Confine the loss to the tokens where chosen and rejected differ (common
+    # prefix/suffix excluded). For minimal word-substitution pairs the gradient
+    # then cannot shift style/length/language — only the substituted form.
+    span_mask: bool = False
 
     @classmethod
     def from_dict(cls, d: dict) -> "DPOLossConfig":
