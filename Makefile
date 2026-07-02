@@ -35,7 +35,7 @@ define build_wheel
 	cp pyproject.toml pyproject.toml.bak && \
 	trap 'mv -f pyproject.toml.bak pyproject.toml' EXIT INT TERM; \
 	uv run --no-project --with tomlkit python3 .github/scripts/set_cuda_version_tag.py $(1) && \
-	CMAKE_ARGS="$(CCACHE_FLAGS) --parallel $(PARALLEL_JOBS)" uv build --wheel --out-dir dist && \
+	CMAKE_ARGS="$(CCACHE_FLAGS)" CMAKE_BUILD_PARALLEL_LEVEL=$(PARALLEL_JOBS) uv build --wheel --out-dir dist && \
 	uv run --no-project --with auditwheel --with patchelf auditwheel repair dist/*.whl \
 		-w dist/repaired/ \
 		--exclude libcuda.so.1 \

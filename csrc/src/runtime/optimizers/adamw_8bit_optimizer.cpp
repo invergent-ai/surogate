@@ -27,6 +27,7 @@
 #include "runtime/executor/graph_executor_utils.h"
 #include "runtime/optimizers/cpu_adamw.h"
 #include "runtime/optimizers/flash_adamw_8bit.h"
+#include "runtime/optimizers/gradient_mask.h"
 #include "utilities/comm.h"
 #include "utilities/tensor.h"
 #include "utilities/tensor_container.h"
@@ -221,6 +222,9 @@ void AdamW8BitOptimizer::step(dsl::DslModel& model,
 
     // CPU-RAM centric streaming path
     if (model.mGrads->is_streaming_grads()) {
+        if (gradient_mask::enabled()) {
+            throw std::runtime_error("AdamW8BitOptimizer::step: gradient masks are not supported with streaming grads");
+        }
         step_cpu_streaming(model,
                            comm,
                            config.learning_rate,
@@ -255,6 +259,48 @@ void AdamW8BitOptimizer::step(dsl::DslModel& model,
             model.mGrads->clear_reduce_pending();
         } else {
             model.mGrads->reduce_all(comm, stream);
+        }
+    }
+
+    const bool grad_mask_enabled = gradient_mask::enabled();
+    std::unordered_map<void*, bool> trainable_grad_ptrs;
+    if (grad_mask_enabled) {
+        for (const auto& name : model.mGrads->param_names()) {
+            bool accumulate = false;
+            Tensor* grad = model.mGrads->get_param_grad(name, accumulate);
+            (void)accumulate;
+            if (!grad || !grad->Data) continue;
+            auto [it, inserted] =
+                trainable_grad_ptrs.emplace(static_cast<void*>(grad->Data), gradient_mask::whole_param_trainable(name));
+            if (!inserted) {
+                it->second = it->second || gradient_mask::whole_param_trainable(name);
+            }
+        }
+
+        std::unordered_set<void*> seen_mask_ptrs;
+        for (const auto& name : model.mGrads->param_names()) {
+            Tensor& val = use_weight_manager ? model.mWeightManager->get_master(name) : model.mParams->get(name);
+            bool accumulate = false;
+            Tensor* grad = model.mGrads->get_param_grad(name, accumulate);
+            (void)accumulate;
+            if (!grad || !grad->Data) continue;
+
+            const bool param_sharded = param_is_sharded(name);
+            Tensor grad_view =
+                param_sharded ? static_cast<Tensor>(shard_view(*grad, model.mShardIdx, model.mNumShards)) : *grad;
+            if (param_sharded && grad_view.nelem() != val.nelem()) {
+                throw std::runtime_error("AdamW8BitOptimizer::step: sharded grad size mismatch for " + name);
+            }
+
+            auto it = trainable_grad_ptrs.find(static_cast<void*>(grad->Data));
+            const bool trainable = (it != trainable_grad_ptrs.end()) && it->second;
+            if (!trainable) {
+                if (seen_mask_ptrs.insert(static_cast<void*>(grad->Data)).second) {
+                    fill_zero(grad_view, stream);
+                }
+                continue;
+            }
+            gradient_mask::apply_partial_mask(name, grad_view, stream);
         }
     }
 
@@ -297,13 +343,20 @@ void AdamW8BitOptimizer::step(dsl::DslModel& model,
             throw std::runtime_error("AdamW8BitOptimizer::step: sharded grad size mismatch for " + name);
         }
 
-        float wd = config.weight_decay;
+        float wd = gradient_mask::weight_decay_for(name, config.weight_decay);
 
         state_offset = (state_offset + GROUP_SIZE - 1) / GROUP_SIZE * GROUP_SIZE;
         const size_t n = val.nelem();
         if (!val.Data || !grad_view.Data) {
             state_offset += n;
             continue;
+        }
+        if (grad_mask_enabled) {
+            auto it = trainable_grad_ptrs.find(static_cast<void*>(grad->Data));
+            if (it != trainable_grad_ptrs.end() && !it->second) {
+                state_offset += n;
+                continue;
+            }
         }
         const size_t group_offset = state_offset / GROUP_SIZE;
 
@@ -428,6 +481,48 @@ void AdamW8BitOptimizer::step_graph(dsl::DslModel& model,
         }
     }
 
+    const bool grad_mask_enabled = gradient_mask::enabled();
+    std::unordered_map<void*, bool> trainable_grad_ptrs;
+    if (grad_mask_enabled) {
+        for (const auto& name : model.mGrads->param_names()) {
+            bool accumulate = false;
+            Tensor* grad = model.mGrads->get_param_grad(name, accumulate);
+            (void)accumulate;
+            if (!grad || !grad->Data) continue;
+            auto [it, inserted] =
+                trainable_grad_ptrs.emplace(static_cast<void*>(grad->Data), gradient_mask::whole_param_trainable(name));
+            if (!inserted) {
+                it->second = it->second || gradient_mask::whole_param_trainable(name);
+            }
+        }
+
+        std::unordered_set<void*> seen_mask_ptrs;
+        for (const auto& name : model.mGrads->param_names()) {
+            Tensor& val = use_weight_manager ? model.mWeightManager->get_master(name) : model.mParams->get(name);
+            bool accumulate = false;
+            Tensor* grad = model.mGrads->get_param_grad(name, accumulate);
+            (void)accumulate;
+            if (!grad || !grad->Data) continue;
+
+            const bool param_sharded = param_is_sharded(name);
+            Tensor grad_view =
+                param_sharded ? static_cast<Tensor>(shard_view(*grad, model.mShardIdx, model.mNumShards)) : *grad;
+            if (param_sharded && grad_view.nelem() != val.nelem()) {
+                throw std::runtime_error("AdamW8BitOptimizer::step_graph: sharded grad size mismatch for " + name);
+            }
+
+            auto it = trainable_grad_ptrs.find(static_cast<void*>(grad->Data));
+            const bool trainable = (it != trainable_grad_ptrs.end()) && it->second;
+            if (!trainable) {
+                if (seen_mask_ptrs.insert(static_cast<void*>(grad->Data)).second) {
+                    fill_zero(grad_view, stream);
+                }
+                continue;
+            }
+            gradient_mask::apply_partial_mask(name, grad_view, stream);
+        }
+    }
+
     model.calculate_gradient_norm(comm, config.grad_clip, stream, grads_reduced || dispatch_local);
     const float* grad_scale = rs.scratch().norm_buffer.template get<float>() + 1;
 
@@ -464,13 +559,20 @@ void AdamW8BitOptimizer::step_graph(dsl::DslModel& model,
             throw std::runtime_error("AdamW8BitOptimizer::step_graph: sharded grad size mismatch for " + name);
         }
 
-        const float wd_scale = 1.f;
+        const float wd_scale = gradient_mask::weight_decay_for(name, 1.f);
 
         state_offset = (state_offset + GROUP_SIZE - 1) / GROUP_SIZE * GROUP_SIZE;
         const size_t n = val.nelem();
         if (!val.Data || !grad_view.Data) {
             state_offset += n;
             continue;
+        }
+        if (grad_mask_enabled) {
+            auto it = trainable_grad_ptrs.find(static_cast<void*>(grad->Data));
+            if (it != trainable_grad_ptrs.end() && !it->second) {
+                state_offset += n;
+                continue;
+            }
         }
         const size_t group_offset = state_offset / GROUP_SIZE;
 

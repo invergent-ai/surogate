@@ -319,12 +319,13 @@ void DslWeightManager::allocate_weights(const Module& module,
         // base is read-only, so all GPUs can DMA-stream from one pinned host copy instead
         // of each pinning its own (N x the pin time AND N x the RAM). The store hands out
         // one buffer per tensor name; it is read + page-locked once (see import_weights).
-        const bool shared_master = mConfig.offload_master && freeze_base && !entry.trainable &&
-                                   !entry_sharded && master_alloc == EAllocationType::PINNED;
+        const bool shared_master = mConfig.offload_master && freeze_base && !entry.trainable && !entry_sharded &&
+                                   master_alloc == EAllocationType::PINNED;
         // Allocate master weight (sharded if enabled)
         if (shared_master) {
             std::size_t nelem = 1;
-            for (long d : shape) nelem *= static_cast<std::size_t>(d);
+            for (long d : shape)
+                nelem *= static_cast<std::size_t>(d);
             const std::size_t bytes = nelem * get_dtype_size(master_dtype);
             void* buf = shared_master_store().reserve(name, bytes);
             entry.master = Tensor::from_pointer(static_cast<std::byte*>(buf), /*device=*/-1, master_dtype, shape);
@@ -522,13 +523,13 @@ void DslWeightManager::allocate_prefetch_buffers() {
 
                 if (bit == base_buffers.end()) {
                     // First time seeing this base param — allocate GPU buffer
-                    std::string buf_name =
-                        "prefetch_" + std::to_string(i) + "_" + bname + (fp8 ? "_f8" : "");
-                    Tensor buf =
-                        mAllocator->allocate(buf_dtype, buf_name.c_str(), EAllocationType::ON_DEVICE, shape);
+                    std::string buf_name = "prefetch_" + std::to_string(i) + "_" + bname + (fp8 ? "_f8" : "");
+                    Tensor buf = mAllocator->allocate(buf_dtype, buf_name.c_str(), EAllocationType::ON_DEVICE, shape);
                     if (fp8) {
-                        Tensor stats = mAllocator->allocate(ETensorDType::FP32, (buf_name + "_stats").c_str(),
-                                                            EAllocationType::ON_DEVICE, {2L});
+                        Tensor stats = mAllocator->allocate(ETensorDType::FP32,
+                                                            (buf_name + "_stats").c_str(),
+                                                            EAllocationType::ON_DEVICE,
+                                                            {2L});
                         buf.Stats = stats.get<float>();
                     }
                     base_buffers.emplace(pkey, buf);
@@ -1220,6 +1221,10 @@ bool DslWeightManager::is_fp8_stream_weight(const std::string& name) const {
     // nullopt for them, so they keep their BF16 streaming.
     if (!matmul_op_from_weight(name, layer_idx).has_value()) return false;
     if (is_mlp_gate_weight(name)) return false;  // MoE router gate stays BF16 (matches FP8 cache)
+    // Shared-expert weights map to MLPUp/MLPDown via matmul_op_from_weight, but their matmuls are
+    // forced down the BF16 fallback (is_shared_expert_weight_name in matmul.cpp). Keep the weights
+    // BF16 too — otherwise the BF16 GEMM receives an FP8 weight it cannot scale (DType mismatch).
+    if (tensor_role_is_shared_expert_name(name)) return false;
     if (layer_idx < 0) return false;
     // Match the recipe's per-layer skip selection (allow_quant_layer): layers the recipe keeps
     // in BF16 must also stream BF16, else the GEMM would get an FP8 weight it won't scale.
@@ -1263,20 +1268,27 @@ void DslWeightManager::finalize_fp8_block_masters(const cudaDeviceProp& dp, cuda
         const bool shared = is_shared_master(name);
         const bool do_quant = !shared || shared_master_store().try_claim_fp8(name);
         if (do_quant) {
-            CUDA_CHECK(cudaMemcpyAsync(d_bf16, e.master.Data,
+            CUDA_CHECK(cudaMemcpyAsync(d_bf16,
+                                       e.master.Data,
                                        static_cast<std::size_t>(N) * get_dtype_size(ETensorDType::BF16),
-                                       cudaMemcpyDefault, stream));
+                                       cudaMemcpyDefault,
+                                       stream));
             Tensor in =
                 Tensor::from_pointer(static_cast<std::byte*>(d_bf16), device, ETensorDType::BF16, std::vector<long>{N});
-            Tensor out = Tensor::from_pointer(static_cast<std::byte*>(d_fp8), device, ETensorDType::FP8_E4M3,
+            Tensor out = Tensor::from_pointer(static_cast<std::byte*>(d_fp8),
+                                              device,
+                                              ETensorDType::FP8_E4M3,
                                               std::vector<long>{N});
             out.Stats = d_stats;
             abs_max(out.abs_max(), in, N, dp, stream);
             quantize_with_abs_max(out, out.scale(), in, out.abs_max(), N, dp, stream);
             // FP8 bytes + the 2-float scale back into the host buffer's front.
             CUDA_CHECK(cudaMemcpyAsync(e.master.Data, d_fp8, stats_off, cudaMemcpyDefault, stream));
-            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(e.master.Data) + stats_off, d_stats,
-                                       2 * sizeof(float), cudaMemcpyDefault, stream));
+            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(e.master.Data) + stats_off,
+                                       d_stats,
+                                       2 * sizeof(float),
+                                       cudaMemcpyDefault,
+                                       stream));
             CUDA_CHECK(cudaStreamSynchronize(stream));
             if (shared) shared_master_store().finish_fp8(name);
         } else {

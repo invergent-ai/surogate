@@ -11,10 +11,15 @@
  */
 
 #include <cassert>
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
 
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+#include "utilities/tensor.h"
 #include "utilities/utils.h"
 #include "utilities/vec.cuh"
 
@@ -149,4 +154,57 @@ void zero_device_segments(const std::uint64_t* ptrs, const std::uint64_t* sizes,
     // One block per segment; segments are large enough that per-block looping is fine.
     zero_segments_kernel<<<n, 256, 0, stream>>>(ptrs, sizes, n);
     CUDA_CHECK(cudaGetLastError());
+}
+
+namespace {
+
+template <typename T>
+__global__ void zero_matrix_columns_kernel(T* data, long rows, long cols, long col_start, long col_end) {
+    const long width = col_end - col_start;
+    const long total = rows * width;
+    for (long id = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x; id < total;
+         id += static_cast<long>(blockDim.x) * gridDim.x) {
+        const long row = id / width;
+        const long col = col_start + (id - row * width);
+        data[row * cols + col] = T{};
+    }
+}
+
+template <typename T>
+void zero_matrix_columns_impl(T* data, long rows, long cols, long col_start, long col_end, cudaStream_t stream) {
+    const long width = col_end - col_start;
+    if (rows <= 0 || width <= 0) return;
+    constexpr int block = 256;
+    const long total = rows * width;
+    const int grid = static_cast<int>(
+        std::min<long>(div_ceil(static_cast<std::size_t>(total), static_cast<std::size_t>(block)), 65535));
+    zero_matrix_columns_kernel<<<grid, block, 0, stream>>>(data, rows, cols, col_start, col_end);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+}  // namespace
+
+void zero_matrix_columns(Tensor& dest, long col_start, long col_end, cudaStream_t stream) {
+    if (!dest.Data) return;
+    if (dest.Rank != 2) {
+        throw std::invalid_argument("zero_matrix_columns: expected rank-2 tensor");
+    }
+    const long rows = dest.Sizes[0];
+    const long cols = dest.Sizes[1];
+    if (col_start < 0 || col_end < col_start || col_end > cols) {
+        throw std::invalid_argument("zero_matrix_columns: invalid column range");
+    }
+    if (col_start == col_end || rows <= 0) {
+        return;
+    }
+
+    if (dest.DType == ETensorDType::FP32) {
+        zero_matrix_columns_impl(dest.get<float>(), rows, cols, col_start, col_end, stream);
+    } else if (dest.DType == ETensorDType::BF16) {
+        zero_matrix_columns_impl(dest.get<nv_bfloat16>(), rows, cols, col_start, col_end, stream);
+    } else if (dest.DType == ETensorDType::FP16) {
+        zero_matrix_columns_impl(dest.get<half>(), rows, cols, col_start, col_end, stream);
+    } else {
+        throw std::invalid_argument("zero_matrix_columns: unsupported tensor dtype");
+    }
 }

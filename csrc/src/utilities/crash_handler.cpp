@@ -430,6 +430,18 @@ void install_crash_handler() {
         return;
     }
 
+    // Disable debuginfod symbol downloads. libdw — used both by the backward
+    // stack-trace printer (capture_stacktrace/print_stacktrace) and by our dwfl
+    // resolver — otherwise blocks on network fetches from DEBUGINFOD_URLS while
+    // resolving each frame. On a slow/unreachable server that turns *any* C++
+    // exception's stack-trace capture into a multi-minute hang (one ~1s poll per
+    // frame). Local symbols are sufficient for our traces. overwrite=1 so a
+    // system/user DEBUGINFOD_URLS can't reintroduce the stall; set
+    // SUROGATE_KEEP_DEBUGINFOD=1 to opt back in.
+    if (::getenv("SUROGATE_KEEP_DEBUGINFOD") == nullptr) {
+        ::setenv("DEBUGINFOD_URLS", "", 1);
+    }
+
     // Install handlers for common crash signals using SA_SIGINFO for more context
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));

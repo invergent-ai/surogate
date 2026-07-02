@@ -532,19 +532,27 @@ class MoESharedExpert(Module):
         _shared = self.shared_expert_intermediate
         _hidden = self.d_model
 
+        # Shared-expert matmuls are forced down the BF16 path by the runtime
+        # dispatcher (matmul.cpp, is_shared_expert_weight_name), so their weights
+        # must stay full precision — otherwise fp8-hybrid/nvfp4 import quantizes
+        # them and the BF16 fallback kernel gets a quantized weight (DType
+        # mismatch crash). Mirrors router weights being kept full precision.
         tracer.register_param(
             "gate",
             ("SharedM", "C"),
+            quantizable=False,
             lora_targets=[LoRATarget(name="shared_gate", size=_shared)],
         )
         tracer.register_param(
             "up",
             ("SharedM", "C"),
+            quantizable=False,
             lora_targets=[LoRATarget(name="shared_up", size=_shared)],
         )
         tracer.register_param(
             "down",
             ("C", "SharedM"),
+            quantizable=False,
             lora_targets=[LoRATarget(name="shared_down", size=_hidden)],
         )
 
@@ -1194,14 +1202,19 @@ class NemotronSharedExpert(Module):
         _shared = self.shared_expert_intermediate
         _hidden = self.d_model
 
+        # Shared-expert matmuls are forced to BF16 by the runtime dispatcher
+        # (matmul.cpp, is_shared_expert_weight_name matches "shared_expert"), so
+        # their weights must stay full precision — see MoESharedExpert.
         tracer.register_param(
             "up",
             ("SharedM", "C"),
+            quantizable=False,
             lora_targets=[LoRATarget(name="shared_up", size=_shared)],
         )
         tracer.register_param(
             "down",
             ("C", "SharedM"),
+            quantizable=False,
             lora_targets=[LoRATarget(name="shared_down", size=_hidden)],
         )
 
