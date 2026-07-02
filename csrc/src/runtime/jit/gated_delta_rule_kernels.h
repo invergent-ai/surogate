@@ -99,6 +99,36 @@ public:
     /// Backward through WY representation. Grid: (NT, B*H).
     void bwd_wy(dim3 grid, void** args, int num_args, cudaStream_t stream) const;
 
+    // ======================================================================
+    // Autotuned tile sizes (from the loaded manifests' compile-time constants).
+    //
+    // Grid math MUST use these instead of re-deriving tile sizes: the autotuner
+    // legally picks different tilings per (H,K,V) — e.g. fwd_o chose BV=64 at
+    // H=16 but BV=32 at H=32 — and a mismatched hardcoded grid under-launches,
+    // silently leaving part of the output buffer uninitialized (garbage model).
+    // The fallback is only used for legacy manifests without "constants".
+    // ======================================================================
+
+    /// fwd_h V-tile: grid_x = cdiv(V, fwd_h_bv(fallback)).
+    [[nodiscard]] int fwd_h_bv(int fallback) const {
+        return fwd_h_ ? fwd_h_->meta().const_int("BV", fallback) : fallback;
+    }
+
+    /// fwd_o V-tile: grid_x = cdiv(V, fwd_o_bv(fallback)).
+    [[nodiscard]] int fwd_o_bv(int fallback) const {
+        return fwd_o_ ? fwd_o_->meta().const_int("BV", fallback) : fallback;
+    }
+
+    /// bwd_dhu V-tile: grid_x = cdiv(V, bwd_dhu_bv(fallback)).
+    [[nodiscard]] int bwd_dhu_bv(int fallback) const {
+        return bwd_dhu_ ? bwd_dhu_->meta().const_int("BV", fallback) : fallback;
+    }
+
+    /// bwd_dqkwg K-tile: NK = cdiv(K, bwd_dqkwg_bk(fallback)) (also sizes dg_nk).
+    [[nodiscard]] int bwd_dqkwg_bk(int fallback) const {
+        return bwd_dqkwg_ ? bwd_dqkwg_->meta().const_int("BK", fallback) : fallback;
+    }
+
 private:
     /// Load a single kernel from manifests, if present.
     void load_kernel(const std::unordered_map<std::string, std::string>& manifests,

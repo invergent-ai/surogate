@@ -521,6 +521,11 @@ def run_surogate_step(
         use_zero_copy=False,
     )
     opts.dsl_ir_json = build_dsl_ir_for_model(str(model_dir))
+    from surogate.kernels.jit_compile import compile_jit_kernels
+
+    _manifests = compile_jit_kernels(opts.dsl_ir_json)
+    if _manifests:
+        opts.jit_kernel_manifests = _manifests
 
     trainer = _surogate.SurogateTrainer(
         ngpu=1,
@@ -588,6 +593,11 @@ def run_surogate_forward(model_dir: Path, inputs: np.ndarray, targets: np.ndarra
         use_zero_copy=False,
     )
     opts.dsl_ir_json = build_dsl_ir_for_model(str(model_dir))
+    from surogate.kernels.jit_compile import compile_jit_kernels
+
+    _manifests = compile_jit_kernels(opts.dsl_ir_json)
+    if _manifests:
+        opts.jit_kernel_manifests = _manifests
 
     trainer = _surogate.SurogateTrainer(
         ngpu=1,

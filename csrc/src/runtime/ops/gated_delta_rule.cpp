@@ -149,11 +149,7 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op, co
         }
     }
     if (!out_is_ref) {
-        out_val = make_persistent_tensor(mRunState,
-                                         mSavedCache,
-                                         op.op_id + ".out_fallback",
-                                         v.DType,
-                                         {B, T, H, V});
+        out_val = make_persistent_tensor(mRunState, mSavedCache, op.op_id + ".out_fallback", v.DType, {B, T, H, V});
     }
 
     Tensor state_val;
@@ -182,10 +178,13 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op, co
 
     const int BT = 64;
     const int NT = cdiv(static_cast<int>(T), BT);
-    const int BK_kkt = std::min(std::max(next_power_of_2(static_cast<int>(K)), 16), 64);
-    const int BV_h = (K > 64) ? 32 : std::min(std::max(next_power_of_2(static_cast<int>(V)), 16), 64);
-    const int BK_o = std::min(std::max(next_power_of_2(static_cast<int>(K)), 16), 64);
-    const int BV_o = std::min(std::max(next_power_of_2(static_cast<int>(V)), 16), 64);
+    // V-tile sizes for grid math come from the loaded manifests: the autotuner picks
+    // them per (H,K,V) (e.g. fwd_o BV=64 at H=16 but BV=32 at H=32), so re-deriving
+    // them here under-launches and leaves output columns uninitialized. The second
+    // argument is only a fallback for legacy manifests without recorded constants.
+    const int BV_h =
+        mGdrKernels.fwd_h_bv((K > 64) ? 32 : std::min(std::max(next_power_of_2(static_cast<int>(V)), 16), 64));
+    const int BV_o = mGdrKernels.fwd_o_bv(std::min(std::max(next_power_of_2(static_cast<int>(V)), 16), 64));
     const int BH = static_cast<int>(B * H);
     cudaStream_t stream = mRunState.MainStream;
 
@@ -448,9 +447,12 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
 
     const int BT = 64;
     const int NT = cdiv(static_cast<int>(T), BT);
-    const int BV_h = (K > 64) ? 32 : std::min(std::max(next_power_of_2(static_cast<int>(V)), 16), 64);
-    const int BK_bwd = std::min(std::max(next_power_of_2(static_cast<int>(K)), 16), 64);
-    const int BV_bwd = std::min(std::max(next_power_of_2(static_cast<int>(V)), 16), 64);
+    // Tile sizes for grid math come from the loaded manifests (autotuned per H,K,V);
+    // the formulas are only fallbacks for legacy manifests. See the forward dispatch.
+    const int bv_default = std::min(std::max(next_power_of_2(static_cast<int>(V)), 16), 64);
+    const int BV_h = mGdrKernels.fwd_h_bv((K > 64) ? 32 : bv_default);
+    const int BV_dhu = mGdrKernels.bwd_dhu_bv((K > 64) ? 32 : bv_default);
+    const int BK_bwd = mGdrKernels.bwd_dqkwg_bk(std::min(std::max(next_power_of_2(static_cast<int>(K)), 16), 64));
     const int NK = cdiv(static_cast<int>(K), BK_bwd);
     const int BH = static_cast<int>(B * H);
     cudaStream_t stream = mRunState.MainStream;
@@ -638,7 +640,7 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
         float sv = scale;
         int32_t Tv = static_cast<int32_t>(T);
         void* args[] = {&q_eff, &k_eff, &wp, &gp, &dhtp, &dh0p, &dop, &dhp, &dvp, &dv2p, &sv, &Tv};
-        mGdrKernels.bwd_dhu({static_cast<unsigned>(cdiv(static_cast<int>(V), BV_h)), static_cast<unsigned>(BH), 1},
+        mGdrKernels.bwd_dhu({static_cast<unsigned>(cdiv(static_cast<int>(V), BV_dhu)), static_cast<unsigned>(BH), 1},
                             args,
                             12,
                             stream);
@@ -887,7 +889,9 @@ long cgr_backward_stack_bound(const CompiledOp& op, const BufferPlan& plan) {
     bytes += align_stack_bytes(B * T * H * K * BF16);       // dw
     bytes += align_stack_bytes(B * T * H * FP32);           // dg_wy
     bytes += align_stack_bytes(B * T * H * FP32);           // dg_out
-    const long NK = std::max(1L, K / chunk_size);
+    // NK depends on the autotuned bwd_dqkwg BK (not known at planning time);
+    // bound with the smallest tile the autotuner may pick (BK=32 -> NK=cdiv(K,32)).
+    const long NK = std::max(1L, (K + 31) / 32);
     bytes += align_stack_bytes(NK * B * T * H * FP32);  // dg_nk
     return bytes;
 }

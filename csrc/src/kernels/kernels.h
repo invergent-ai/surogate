@@ -2110,6 +2110,7 @@ void fill_dense_cu_seqlens(int32_t* cu_seqlens, int num_docs, int max_doc_seqlen
 // Efficiently zero multiple non-contiguous device buffers in a single kernel launch.
 // `ptrs[i]` is a device pointer (encoded as uint64_t) and `sizes[i]` is the size in bytes.
 void zero_device_segments(const std::uint64_t* ptrs, const std::uint64_t* sizes, int n, cudaStream_t stream);
+void zero_matrix_columns(Tensor& dest, long col_start, long col_end, cudaStream_t stream);
 
 void convert_dtype(float* target, const nv_bfloat16* source, std::size_t size);
 void convert_dtype(nv_bfloat16* target, const float* source, std::size_t size);

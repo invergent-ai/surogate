@@ -9,6 +9,7 @@
 #define SUROGATE_SRC_RUNTIME_JIT_JIT_KERNEL_H
 
 #include <string>
+#include <unordered_map>
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -22,6 +23,19 @@ struct JitKernelMeta {
     /// Number of extra null-pointer parameters the compiler appends after user params.
     /// Triton 3.x adds 2 (global_scratch, profile_scratch); plain CUDA kernels use 0.
     int extra_null_params = 0;
+
+    /// Integer compile-time constants baked into the cubin (parsed from the manifest's
+    /// "constants" object, e.g. autotuned tile sizes BV/BK). Launch-site grid math MUST
+    /// use these — the autotuner may legally pick a different tiling per dims (e.g.
+    /// H=32 picks fwd_o BV=32 where H=16 picked BV=64), and a hardcoded grid then
+    /// under-launches, silently leaving part of the output uninitialized.
+    std::unordered_map<std::string, int> constants;
+
+    /// Constant lookup with fallback for manifests that predate constants parsing.
+    [[nodiscard]] int const_int(const std::string& key, int fallback) const {
+        auto it = constants.find(key);
+        return it == constants.end() ? fallback : it->second;
+    }
 };
 
 /// RAII wrapper around a CUDA module + function loaded from an external cubin/PTX.
