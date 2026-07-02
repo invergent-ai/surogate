@@ -6,19 +6,22 @@ from .. import nn
 from ..modules import Embedding, LMHead, RMSNormPlus1
 from ..modules.attention import _resolve_rotary_dim
 from ..blocks.qwen3_5_moe import Qwen3_5MoEAttentionBlock, Qwen3_5MoELinearBlock
-from ..hf import build_norm_mappings, expand_module_mapping, stack_experts
+from ..hf import build_norm_mappings, expand_module_mapping
 from ..models.qwen3_5 import _parse_qwen3_5_layer_types
 from ..blocks.qwen3_5 import QWEN3_5_MODEL_NAME_REMAP, QWEN3_5_VL_MODEL_NAME_REMAP
 from ..specs import ActivationScope
 
 
 def _build_qwen3_5_moe_expert_mappings(layer_prefix: str) -> dict[str, object]:
-    """HF mappings for Qwen3.5 / Qwen3.6 MoE experts (per-expert HF layout).
+    """HF mappings for Qwen3.5 / Qwen3.6 MoE experts (batched HF layout).
 
-    Experts are stored as individual tensors per expert:
-      - experts.{e}.gate_proj.weight / up_proj.weight / down_proj.weight
-    `stack_experts` batches them into the [E, ...] tensors the runtime expects,
-    fusing gate+up into a single [E, 2*M, C] tensor on the forward path.
+    The Qwen3.5/3.6 MoE family (Qwen3-Next-style) ships experts pre-stacked and
+    pre-fused — one batched tensor per layer, matching the [E, ...] layout the
+    runtime expects directly (no stacking, no transpose):
+      - experts.gate_up_proj : [E, 2*M, C]  (gate-first concat, as HF chunk(2))
+      - experts.down_proj    : [E, C,   M]
+    So both map straight through. (Contrast GPT-OSS, stored [E, C, 2*M], which
+    needs a transpose.)
     """
     from ..modules.moe import MoESharedExpert
 
@@ -26,14 +29,9 @@ def _build_qwen3_5_moe_expert_mappings(layer_prefix: str) -> dict[str, object]:
     return {
         # Router
         "router_weight": f"{moe_prefix}.gate.weight",
-        # Per-expert weights — stacked into batched format on load.
-        "experts_gate_up": stack_experts(
-            f"{moe_prefix}.experts.{{expert}}.gate_proj.weight",
-            fuse_gate_up=True,
-        ),
-        "experts_down": stack_experts(
-            f"{moe_prefix}.experts.{{expert}}.down_proj.weight",
-        ),
+        # Batched experts — passthrough (already stacked + gate/up fused on disk).
+        "experts_gate_up": f"{moe_prefix}.experts.gate_up_proj",
+        "experts_down": f"{moe_prefix}.experts.down_proj",
         # Shared expert (SwiGLU MLP). `self.shared_expert = MoESharedExpert(...)`
         # on the block compiles params to `shared_expert_{gate,up,down}`, so the
         # mapping keys need the same prefix to match.
