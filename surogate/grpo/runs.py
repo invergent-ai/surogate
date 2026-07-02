@@ -17,6 +17,19 @@ if TYPE_CHECKING:
 logger = get_logger()
 
 
+def _start_step_override() -> int | None:
+    raw = os.environ.get("SUROGATE_GRPO_START_STEP")
+    if raw is None or raw == "":
+        return None
+    try:
+        step = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"Invalid SUROGATE_GRPO_START_STEP={raw!r}; expected an integer") from exc
+    if step < 0:
+        raise ValueError(f"Invalid SUROGATE_GRPO_START_STEP={raw!r}; expected a non-negative integer")
+    return step
+
+
 # ---------------------------------------------------------------------------
 # Local replacements for prime_rl.trainer utilities
 # ---------------------------------------------------------------------------
@@ -329,7 +342,7 @@ class MultiRunManager:
         # Set progress based on resume_step config (match orchestrator behavior)
         self.progress[new_id] = Progress()
         if config.ckpt is None or config.ckpt.resume_step is None:
-            self.progress[new_id].step = 0
+            self.progress[new_id].step = _start_step_override() or 0
         elif config.ckpt.resume_step == -1:
             stable_steps = get_stable_ckpt_steps(self.get_run_dir(new_id) / "checkpoints")
             self.progress[new_id].step = max(stable_steps) if stable_steps else 0

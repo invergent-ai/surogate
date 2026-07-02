@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from collections import Counter, defaultdict
 from dataclasses import field
@@ -43,6 +44,7 @@ class GroupState:
     rollouts_to_schedule: int
     completed_rollouts: list[vf.RolloutOutput] = field(default_factory=list)
     pinned_client: vf.ClientConfig | None = None
+    failed_rollouts: int = 0
 
 
 class Scheduler:
@@ -126,6 +128,7 @@ class Scheduler:
         self.errored_rollouts_by_task: dict[str, int] = defaultdict(int)
         self.total_rollouts_by_task: dict[str, int] = defaultdict(int)
         self.last_batch_generation_time = 0.0
+        self.max_group_rollout_failures = int(os.environ.get("SUROGATE_GRPO_MAX_GROUP_ROLLOUT_FAILURES", "8"))
 
     @property
     def uses_token_batching(self) -> bool:
@@ -469,7 +472,16 @@ class Scheduler:
                             f"{rollout['error']['error_chain_repr']}"
                         )
                     if should_reschedule:
-                        group.rollouts_to_schedule += 1
+                        group.failed_rollouts += 1
+                        if group.failed_rollouts >= self.max_group_rollout_failures:
+                            removed = await self.drop_group(group_id)
+                            self.cancelled_rollouts_count += removed
+                            self.logger.warning(
+                                f"Dropped group {group_id} ({task}) after "
+                                f"{group.failed_rollouts} empty/error rollout(s)"
+                            )
+                        else:
+                            group.rollouts_to_schedule += 1
                         continue
 
                     group.completed_rollouts.append(rollout)

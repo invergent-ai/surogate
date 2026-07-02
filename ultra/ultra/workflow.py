@@ -55,7 +55,13 @@ def parse_workflow(raw: str) -> Workflow:
     try:
         data = json.loads(raw)
     except (json.JSONDecodeError, TypeError) as e:
-        raise WorkflowValidationError(f"workflow JSON did not parse: {e}") from e
+        if isinstance(raw, str) and "\\'" in raw:
+            try:
+                data = json.loads(raw.replace("\\'", "'"))
+            except (json.JSONDecodeError, TypeError):
+                raise WorkflowValidationError(f"workflow JSON did not parse: {e}") from e
+        else:
+            raise WorkflowValidationError(f"workflow JSON did not parse: {e}") from e
     try:
         return Workflow(**data)
     except Exception as e:  # pydantic ValidationError, missing keys, wrong types, ...

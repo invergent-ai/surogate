@@ -14,7 +14,8 @@ from pydantic import BaseModel
 
 class WorkerSpec(BaseModel):
     """One worker in the pool. ``worker_id`` is the stable, ordered class index the
-    Conductor addresses; ``model`` is the OpenRouter slug actually called."""
+    Conductor addresses; ``model`` is a logical name or provider slug resolved by
+    the live provider router."""
 
     worker_id: str
     model: str
@@ -22,7 +23,7 @@ class WorkerSpec(BaseModel):
     # per-call cost. None => trust the provider's reported cost.
     cost_in_per_mtok: float | None = None
     cost_out_per_mtok: float | None = None
-    # OpenRouter provider routing: "price" = cheapest-first; None = OpenRouter default.
+    # Provider routing: "price" = cheapest-first where supported; None = provider default.
     provider_sort: str | None = "price"
 
 
@@ -39,6 +40,7 @@ class SamplingConfig(BaseModel):
 class PoolConfig(BaseModel):
     base_url: str = "https://openrouter.ai/api/v1"
     api_key_env: str = "OPENROUTER_API_KEY"
+    split_provider_routing: bool = True
     max_concurrency: int = 8
     requests_per_minute: float | None = None
     max_retries: int = 4

@@ -80,7 +80,7 @@ def deep_swe_task_to_spec(task: dict[str, Any]) -> TaskSpec | None:
         source=SourceRef(
             name="deep_swe_local",
             version=str(meta.get("schema_version") or "local"),
-            policy="pool_only",
+            policy="final_eval_only",
             url_or_ref=str(task_dir),
         ),
         input=TaskInput(
@@ -103,7 +103,7 @@ def deep_swe_task_to_spec(task: dict[str, Any]) -> TaskSpec | None:
         ),
         splitting=SplittingSpec(
             group_id=repo_url,
-            split="pool_validation",
+            split="final_eval",
             contamination_group=repo_url,
         ),
         metadata=TaskMetadata(

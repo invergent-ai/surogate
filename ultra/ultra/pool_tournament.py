@@ -22,6 +22,7 @@ from typing import Callable
 
 from .config import PoolConfig, WorkerSpec
 from .executor import execute_workflow
+from .providers import load_dotenv, required_key_envs
 from .scaffolds import debate_synthesize, direct, plan_execute, solve_critique_revise
 from .schemas import TaskSpec, Workflow
 from .sources.existing_bank import ExistingBankAdapter
@@ -427,8 +428,10 @@ async def run_tournament(args) -> dict:
             (out_dir / "pool_tournament_plan.json").write_text(json.dumps(plan, indent=2))
         return {"plan": plan, "summary": None}
 
-    if not os.environ.get("OPENROUTER_API_KEY"):
-        raise SystemExit("OPENROUTER_API_KEY is not set; export it in your shell before live runs")
+    load_dotenv()
+    missing = [key_env for key_env in required_key_envs([worker.model for worker in workers]) if not os.environ.get(key_env)]
+    if missing:
+        raise SystemExit(f"missing provider key env vars before live runs: {', '.join(missing)}")
 
     records: list[RolloutSummary] = []
     out_dir = Path(args.out_dir)

@@ -45,6 +45,19 @@ def default_advantage_fn(inputs: AdvantageInputs, length_weighted_mean: bool = F
     return AdvantageOutputs(advantages=inputs.rewards - baseline)
 
 
+def std_normalized_advantage(inputs: AdvantageInputs, eps: float = 1e-4) -> AdvantageOutputs:
+    """GRPO advantage with per-group std normalization: A = (r - mean) / (std + eps).
+
+    Matches Shao et al. (2024) eq. 4 as used by the Conductor (Nielsen et al., 2025, eq. 2):
+    the group baseline is the mean and the residual is scaled by the group's reward std,
+    so nearly-uniform groups still yield unit-scale advantages. Zero-variance groups get
+    zero advantage from the mean subtraction; eps only guards the division.
+    """
+    mean = inputs.rewards.mean(dim=1, keepdim=True)
+    std = inputs.rewards.std(dim=1, keepdim=True)
+    return AdvantageOutputs(advantages=(inputs.rewards - mean) / (std + eps))
+
+
 def setup_advantage_fn(config: AdvantageConfigType) -> AdvantageFn:
     """Setup advantage function from config."""
     if isinstance(config, GRPOCustomAdvantageConfig):

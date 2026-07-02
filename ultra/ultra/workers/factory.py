@@ -7,7 +7,7 @@ from ..config import PoolConfig, WorkerSpec
 from .budget import BudgetTracker
 from .cache import CompletionCache
 from .pool import RateGate
-from .providers import OpenRouterProvider, Provider, WorkerPool
+from .providers import OpenRouterProvider, Provider, RoutedOpenAIProvider, WorkerPool
 
 
 def build_pool(
@@ -17,12 +17,18 @@ def build_pool(
 ) -> WorkerPool:
     config = config or PoolConfig()
     if provider is None:
-        provider = OpenRouterProvider(
-            base_url=config.base_url,
-            api_key=config.api_key(),
-            timeout_s=config.timeout_s,
-            sort_by_model={w.model: w.provider_sort for w in workers},
-        )
+        if config.split_provider_routing:
+            provider = RoutedOpenAIProvider(
+                timeout_s=config.timeout_s,
+                sort_by_model={w.model: w.provider_sort for w in workers},
+            )
+        else:
+            provider = OpenRouterProvider(
+                base_url=config.base_url,
+                api_key=config.api_key(),
+                timeout_s=config.timeout_s,
+                sort_by_model={w.model: w.provider_sort for w in workers},
+            )
     return WorkerPool(
         workers,
         provider,

@@ -55,7 +55,15 @@ def test_rollout_record_minimal():
         reward=1.0,
     )
     assert rec.workflow.steps[0].access == []
+    assert rec.workflow.steps[0].budget == "medium"
+    assert rec.execution.steps == []
     assert rec.valid_for_training is True
+
+
+def test_workflow_step_budget_validation():
+    assert WorkflowStep(worker_id=0, subtask="probe", budget="short").budget == "short"
+    with pytest.raises(ValidationError):
+        WorkflowStep(worker_id=0, subtask="probe", budget="forever")
 
 
 def test_agent_trace_and_worker_identity_roundtrip():
@@ -63,7 +71,7 @@ def test_agent_trace_and_worker_identity_roundtrip():
         trace_id="trace_1",
         origin_harness="codex",
         harness_version="1.0",
-        worker_model="gpt-5-codex",
+        worker_model="gpt-5.5",
         task_id="swe__1",
         prompt={"user_task": "Fix the bug"},
         events=[{"type": "command", "agent_turn": 1, "content_ref": "artifact://cmd"}],
@@ -78,7 +86,7 @@ def test_agent_trace_and_worker_identity_roundtrip():
         worker_id=0,
         name="codex_gpt_coding_agent",
         backend="codex",
-        model="gpt-5-codex",
+        model="gpt-5.5",
         role_prior=["builder", "repair"],
         tool_permissions={"read_files": True, "edit_files": True, "run_tests": True},
     )

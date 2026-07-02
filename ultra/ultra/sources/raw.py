@@ -6,8 +6,8 @@ simulator scenarios are produced upstream and handed to the adapter as raw recor
 
 These adapters are MATERIALIZE-COMPLETE but EXECUTION-PENDING: they emit valid TaskSpecs,
 but the harnesses they target (opencode_repo, terminal_sandbox, tool_dialog, long_context,
-vision_qa, sequential_sim, research_loop) are not built yet, so their tasks cannot be run
-or graded until those land.
+sequential_sim, research_loop) are not built yet, so their tasks cannot be run or graded
+until those land.
 """
 
 from __future__ import annotations

@@ -824,6 +824,9 @@ Key orchestrator settings:
 | `buffer.hard_threshold`              | `null`               | Reward threshold below which a problem is "hard"        |
 | `buffer.easy_fraction`               | `0.0`                | Fraction of easy problems to promote to normal on start |
 | `buffer.hard_fraction`               | `0.0`                | Fraction of hard problems to promote to normal on start |
+| `buffer.normal_pool_min_examples`    | `0`                  | Recycle easy/hard examples when normal pool is this low |
+| `buffer.recycle_easy_fraction`       | `0.0`                | Fraction of easy examples recycled when normal is low   |
+| `buffer.recycle_hard_fraction`       | `0.0`                | Fraction of hard examples recycled when normal is low   |
 | `buffer.hash_keys`                   | `["task", "prompt"]` | Keys used for example deduplication                     |
 | `buffer.skip_verification`           | `false`              | If true, disable reward scoring (rewards always 0)      |
 | `buffer.env_ratios`                  | `null`               | Per-environment sampling ratios (list, must sum to >0)  |

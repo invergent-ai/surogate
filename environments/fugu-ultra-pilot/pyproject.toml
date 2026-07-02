@@ -1,0 +1,21 @@
+[project]
+name = "fugu-ultra-pilot"
+description = "Fugu-Ultra Conductor GRPO pilot environment backed by the frozen Ultra task manifest."
+tags = ["fugu-ultra", "conductor", "grpo", "train"]
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "datasets>=4.3.0",
+    "verifiers>=0.1.11",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+include = ["fugu_ultra_pilot.py", "pyproject.toml", "README.md"]
+
+[tool.verifiers.eval]
+num_examples = 8
+rollouts_per_example = 4

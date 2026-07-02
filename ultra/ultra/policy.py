@@ -44,8 +44,17 @@ SOURCE_POLICY: dict[str, SourcePolicy] = {
     # agentic / coding
     "existing_bank": "train_allowed",  # router bank: eval families already excluded upstream
     "swe_smith": "train_allowed",
+    "generated_repo_tasks": "train_allowed",
+    "trace_state_branches": "train_allowed",
     "swe_bench_verified": "final_eval_only",
+    "acrouter_swebench_verified": "pool_only",
+    "deep_swe_local": "final_eval_only",
     "terminal_bench_official": "final_eval_only",
+    "tasktrove_harbor": "pool_only",
+    "tasktrove_inferredbugs": "train_allowed",
+    "tasktrove_pymethods2test": "train_allowed",
+    "agenttrove_traces": "diagnostic_only",
+    "training_repo_canary": "train_allowed",
     "livecodebench_old": "train_allowed",
     "livecodebench_latest": "final_eval_only",
     "bigcodebench": "train_allowed",
@@ -59,7 +68,6 @@ SOURCE_POLICY: dict[str, SourcePolicy] = {
     "mmlu_pro": "train_allowed",
     "gpqa_diamond": "final_eval_only",
     "hle": "final_eval_only",
-    "charxiv": "final_eval_only",
     # tool / long-context
     "tau_custom": "train_allowed",
     "tau3_banking": "final_eval_only",

@@ -13,7 +13,8 @@ eval_steps: 25
 learning_rate: 2e-4
 warmup_ratio: 0.15
 
-recipe: fp8-hybrid
+recipe: bf16
+cpu_training: true
 
 lora: true
 lora_rank: 16

@@ -50,8 +50,8 @@ def test_deep_swe_task_to_spec_materializes_opencode_payload(tmp_path):
     assert spec.input.assets[0]["opencode_instance"]["image_name"] == "public.ecr.aws/example/local-task:v1"
     assert spec.input.assets[0]["opencode_instance"]["testbed"] == "/app"
     assert spec.input.assets[0]["opencode_instance"]["activate"] == ""
-    assert spec.source.policy == "pool_only"
-    assert spec.splitting.split == "pool_validation"
+    assert spec.source.policy == "final_eval_only"
+    assert spec.splitting.split == "final_eval"
 
 
 def test_materialize_repo_tasks_writes_specs_and_unresolved_report(tmp_path):

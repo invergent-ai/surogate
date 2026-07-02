@@ -1,6 +1,7 @@
 import asyncio
 import dataclasses
 import multiprocessing as mp
+import os
 import random
 import sys
 import time
@@ -37,6 +38,7 @@ from surogate.grpo.orchestrator.ckpt import Progress, setup_ckpt_manager
 from surogate.grpo.orchestrator.eval_utils import evaluate_env
 from surogate.grpo.orchestrator.filters import apply_filters, setup_filters
 from surogate.grpo.orchestrator.scheduler import Scheduler
+from surogate.grpo.orchestrator.trainability import exclude_non_trainable_rollouts
 from surogate.grpo.orchestrator.utils import (
     compute_teacher_logprobs,
     get_sampling_args,
@@ -424,6 +426,29 @@ async def orchestrate(config: GRPOOrchestratorConfig):
             await inference_pool.update_weights(weights_path, lora_name=lora_name, step=scheduler.ckpt_step)
         else:
             logger.info("Training from scratch")
+            start_step_override = os.environ.get("SUROGATE_GRPO_START_STEP")
+            if start_step_override:
+                progress.step = int(start_step_override)
+                logger.info(f"Starting orchestrator from override step {progress.step}")
+                scheduler.step = progress.step
+                scheduler.ckpt_step = progress.step
+                prev_ckpt_step = progress.step - 1
+                if config.model.lora_adapter is not None:
+                    check_exists = config.weight_broadcast.type != "nccl"
+                    wait_timeout = int(os.environ.get("SUROGATE_GRPO_RESUME_WAIT_FOR_WEIGHTS_TIMEOUT", "600"))
+                    weights_path = get_weight_dir(
+                        Path(config.output_dir),
+                        progress.step,
+                        check_exists=check_exists,
+                        wait_timeout=wait_timeout,
+                    )
+                    await inference_pool.update_weights(
+                        weights_path,
+                        lora_name=config.model.lora_adapter,
+                        step=progress.step,
+                    )
+                    scheduler.model_name = config.model.lora_adapter
+                    logger.info(f"Loaded override policy weights for step {progress.step}")
 
         # Iterate over dataset in batches
         max_steps = config.max_steps or int(1e9)
@@ -569,6 +594,13 @@ async def orchestrate(config: GRPOOrchestratorConfig):
             generate_completions_time = scheduler.last_batch_generation_time
             train_rollouts = train_task.result()
 
+            # Group rollouts by example so compute_advantages' positional
+            # (num_problems, rollouts_per_example) reshape aligns with GRPO groups.
+            # Async generation / buffer batching can return rollouts out of example
+            # order, which otherwise mixes examples across advantage groups and cancels
+            # the gradient to ~0. Stable sort preserves intra-example order.
+            train_rollouts.sort(key=lambda r: str(r["example_id"]))
+
             # Apply rollout filters (zeros reward/mask for degenerate generations)
             filter_metrics = apply_filters(rollout_filters, train_rollouts)
 
@@ -578,8 +610,20 @@ async def orchestrate(config: GRPOOrchestratorConfig):
             num_unique_examples = len(set(example_ids))
             rewards = [r["reward"] for r in train_rollouts]
             completion_lens = [get_completion_len(r) for r in train_rollouts]
+            # Exclude non-trainable rollouts (e.g. provider/harness/grader failures the
+            # env flags via `trainable_metric`) from both the loss mask and the per-group
+            # advantage baseline, so infrastructure failures are not learned as negatives.
+            if config.trainable_metric:
+                advantage_rewards, trainability_metrics = exclude_non_trainable_rollouts(
+                    train_rollouts,
+                    rewards,
+                    config.rollouts_per_example,
+                    config.trainable_metric,
+                )
+            else:
+                advantage_rewards, trainability_metrics = rewards, {}
             advantages = compute_advantages(
-                rewards,
+                advantage_rewards,
                 completion_lens,
                 config.rollouts_per_example,
                 config.advantage,
@@ -814,6 +858,8 @@ async def orchestrate(config: GRPOOrchestratorConfig):
                 **event_loop_lag_monitor.get_metrics(),
                 # Rollout filter metrics
                 **filter_metrics,
+                # Non-trainable rollout exclusion metrics
+                **trainability_metrics,
                 # W&B axis
                 "step": progress.step,
             }

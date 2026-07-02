@@ -36,3 +36,11 @@ jackalope/dist/
 .superpowers/
 watch-out/
 watch-run.yaml*
+ultra/.ultra*/**
+.ultra*/**
+
+# secrets + local caches (never commit)
+.env
+.director_cache/
+*.egg-info/
+.ultra_cache/

@@ -19,6 +19,8 @@ Grader = Callable[[str, Any], float]
 # ---------------------------------------------------------------------------
 
 _NUM_RE = re.compile(r"-?\d[\d,]*\.?\d*")
+_SIMPLE_FRAC_RE = re.compile(r"-?\d+\s*/\s*-?\d+")
+_LATEX_FRAC_RE = re.compile(r"\\(?:d|t)?frac\{([^{}]+)\}\{([^{}]+)\}")
 
 
 def _last_number(text: str) -> str | None:
@@ -30,6 +32,15 @@ def _last_number(text: str) -> str | None:
             return m[0].replace(",", "")
     m = _NUM_RE.findall(text)
     return m[-1].replace(",", "") if m else None
+
+
+def _last_fraction(text: str) -> str | None:
+    latex = _LATEX_FRAC_RE.findall(text)
+    if latex:
+        num, den = latex[-1]
+        return f"\\frac{{{num}}}{{{den}}}"
+    simple = _SIMPLE_FRAC_RE.findall(text)
+    return simple[-1].replace(" ", "") if simple else None
 
 
 def extract_boxed(text: str) -> str | None:
@@ -84,11 +95,30 @@ def gsm8k_exact(output: str, solution: Any) -> float:
         return 1.0 if pred == gold else 0.0
 
 
+def _math_verify_equal(output: str, gold: str, timeout: float = 5.0) -> bool:
+    """OFFICIAL grader: HuggingFace math_verify (the Qwen2.5-Math/SymPy path used by MATH-500,
+    NuminaMath, and Omni-MATH rule-based eval). The gold is wrapped in ``$...$`` so math_verify's
+    LaTeX extractor parses it (bare strings extract empty); ``verify(gold, pred)`` is
+    order-sensitive (gold first). Runs in a daemon thread with a hard timeout so a pathological
+    sympy parse can never freeze the grader -- using math_verify's OWN ``timeout_seconds`` (a
+    nested daemon thread breaks math_verify, so we rely on its built-in timeout)."""
+    try:
+        from math_verify import parse as mv_parse, verify as mv_verify
+        return bool(mv_verify(mv_parse(f"${gold}$"), mv_parse(output)))
+    except Exception:
+        return False
+
+
 def math_equal(output: str, solution: Any) -> float:
-    pred = extract_boxed(output) or (output.strip().splitlines()[-1] if output.strip() else "")
     gold = str(solution)
-    gold = extract_boxed(gold) or gold
-    pred_n, gold_n = _normalize_math(pred), _normalize_math(gold)
+    # Primary: official math_verify (handles tuples/intervals/sets/matrices/sci-notation/percent/...).
+    if _math_verify_equal(output, gold):
+        return 1.0
+    # Fallback: hand-rolled normalizer -- covers plain text answers (e.g. "Evelyn") that
+    # math_verify (a math parser) does not, plus a sympy equality check.
+    pred = extract_boxed(output) or _last_fraction(output) or (output.strip().splitlines()[-1] if output.strip() else "")
+    gold_x = extract_boxed(gold) or gold
+    pred_n, gold_n = _normalize_math(pred), _normalize_math(gold_x)
     if pred_n == gold_n:
         return 1.0
     return 1.0 if _sympy_equal_timed(pred_n, gold_n, timeout=5.0) else 0.0
@@ -115,9 +145,12 @@ def _sympy_equal_timed(pred_n: str, gold_n: str, timeout: float = 5.0) -> bool:
 
 
 def _normalize_math(s: str) -> str:
-    s = s.strip().strip("$").replace(" ", "")
+    s = s.strip().strip("`").strip("$").replace(" ", "")
     s = s.replace("\\left", "").replace("\\right", "")
     s = s.replace("\\dfrac", "\\frac").replace("\\tfrac", "\\frac")
+    s = re.sub(r"\\text\{([^{}]*)\}", r"\1", s)  # \text{Evelyn} -> Evelyn
+    s = re.sub(r"\^\{?\\circ\}?", "", s)          # 90^\circ / 90^{\circ} -> 90 (strip degree unit)
+    s = re.sub(r"\\frac\{([^{}]+)\}\{([^{}]+)\}", r"(\1)/(\2)", s)
     s = s.rstrip(".")
     return s
 
@@ -255,6 +288,40 @@ def grid_exact(output: str, solution: Any) -> float:
     return 1.0 if pred == [[int(x) for x in r] for r in gold] else 0.0
 
 
+def contains(output: str, solution: Any) -> float:
+    """Reward when the expected string appears in the worker output."""
+    gold = str(solution).strip().lower()
+    if not gold:
+        return 0.0
+    return 1.0 if gold in output.lower() else 0.0
+
+
+def contains_all_absent(output: str, solution: Any) -> float:
+    """Reward when all required substrings appear and forbidden stale values do not.
+
+    ``solution`` = ``{"must_contain": [...], "must_not_contain": [...]}``.
+    This is useful for long-context revision tasks where verbose answers that include
+    obsolete values in the final answer should fail instead of receiving partial
+    credit. If a single output line contains all required fields, forbidden checks
+    are applied to that line so reviewer explanations do not create false negatives.
+    """
+    if not isinstance(solution, dict):
+        return 0.0
+    out = output.lower()
+    required = [str(x).strip().lower() for x in solution.get("must_contain", []) if str(x).strip()]
+    forbidden = [str(x).strip().lower() for x in solution.get("must_not_contain", []) if str(x).strip()]
+    if not required:
+        return 0.0
+    lines = [line.strip().lower() for line in output.splitlines() if line.strip()]
+    matching_lines = [line for line in lines if all(item in line for item in required)]
+    judged = matching_lines[-1] if matching_lines else out
+    if any(item not in judged for item in required):
+        return 0.0
+    if any(item in judged for item in forbidden):
+        return 0.0
+    return 1.0
+
+
 REGISTRY: dict[str, Grader] = {
     "gsm8k_exact": gsm8k_exact,
     "math_equal": math_equal,
@@ -262,6 +329,8 @@ REGISTRY: dict[str, Grader] = {
     "code_exec": code_exec,
     "code_exec_stdio": code_exec_stdio,
     "grid_exact": grid_exact,
+    "contains": contains,
+    "contains_all_absent": contains_all_absent,
 }
 
 

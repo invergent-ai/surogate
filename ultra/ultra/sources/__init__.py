@@ -4,8 +4,8 @@
 
 Runnable now (route to the existing ``direct_qa`` / ``code_exec`` harnesses): the math,
 multiple-choice and code families. EXECUTION-PENDING (emit valid TaskSpecs, but their
-harness is not built yet): repo/terminal, tool-dialogue, long-context, vision, simulator,
-and the derived role probes.
+harness is not built yet): repo/terminal, tool-dialogue, long-context, simulator, and
+the derived role probes.
 """
 
 from .base import RawTaskRef, SourceAdapter, ValidationReport
@@ -34,8 +34,11 @@ from .existing_bank import ExistingBankAdapter
 from .harbor import (
     HarborTaskBundleAdapter,
     discover_harbor_task_dirs,
+    download_tasktrove_parquet,
+    extract_tasktrove_parquet_bundles,
     harbor_task_to_spec,
     materialize_harbor_tasks,
+    materialize_tasktrove_parquet,
 )
 from .longcontext import LongContextDocPackAdapter, MRCRStyleAdapter
 from .raw import RawRecordAdapter
@@ -43,7 +46,6 @@ from .repo import GitHubIssueAdapter, SWEbenchAdapter, SWEsmithAdapter, Terminal
 from .roleprobe import RoleProbeAdapter
 from .simulator import AutoResearchAdapter, SequentialSimAdapter
 from .tool import TauBenchAdapter
-from .vision import CharXivAdapter
 
 SOURCE_ADAPTERS: dict[str, type] = {
     # router bank
@@ -73,11 +75,10 @@ SOURCE_ADAPTERS: dict[str, type] = {
     "github_issue": GitHubIssueAdapter,
     "terminal_custom": TerminalBenchAdapter,
     "tasktrove_harbor": HarborTaskBundleAdapter,
-    # --- execution-pending: tool / long-context / vision ---
+    # --- execution-pending: tool / long-context ---
     "tau_custom": TauBenchAdapter,
     "longctx_generated": LongContextDocPackAdapter,
     "mrcr": MRCRStyleAdapter,
-    "charxiv": CharXivAdapter,
     # --- execution-pending: simulators ---
     "sequential_sim": SequentialSimAdapter,
     "autoresearch": AutoResearchAdapter,
@@ -115,12 +116,14 @@ __all__ = [
     "TerminalBenchAdapter",
     "HarborTaskBundleAdapter",
     "discover_harbor_task_dirs",
+    "download_tasktrove_parquet",
+    "extract_tasktrove_parquet_bundles",
     "harbor_task_to_spec",
     "materialize_harbor_tasks",
+    "materialize_tasktrove_parquet",
     "TauBenchAdapter",
     "LongContextDocPackAdapter",
     "MRCRStyleAdapter",
-    "CharXivAdapter",
     "SequentialSimAdapter",
     "AutoResearchAdapter",
     "RoleProbeAdapter",

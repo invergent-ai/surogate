@@ -50,7 +50,7 @@ QUALITY_FIRST_CORE = ["opus", "gemini", "gpt", "kimi-code", "mimo", "glm", "flas
 QUALITY_FIRST_EXPANDED = QUALITY_FIRST_CORE + ["minimax", "deepseek-pro"]
 
 SCAFFOLD_AWARE_CORE = [
-    "codex:gpt-5-codex",
+    "codex:gpt-5.5",
     "claude-code:opus-4.8",
     "opencode:kimi-code",
     "opencode:mimo",

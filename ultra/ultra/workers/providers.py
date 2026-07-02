@@ -1,8 +1,10 @@
 """Worker providers and the WorkerPool.
 
-All frontier workers (GPT / Claude / Gemini) are reached through OpenRouter's single
-OpenAI-compatible endpoint, so there is exactly one network client. ``WorkerPool``
-adds caching, budgeting, concurrency control and an n-sample helper on top.
+Ultra workers use OpenAI-compatible provider endpoints. ``RoutedOpenAIProvider``
+lets one ``WorkerPool`` route commercial frontier workers through Yunwu and
+open/specialist workers through OpenRouter while preserving the same completion
+interface. ``WorkerPool`` adds caching, budgeting, concurrency control and an
+n-sample helper on top.
 
 A ``FakeProvider`` lets the whole pipeline run offline and for free in tests.
 """
@@ -14,6 +16,9 @@ from collections.abc import Callable
 from typing import Protocol, runtime_checkable
 
 from ..config import PoolConfig, WorkerSpec
+from ..providers import provider as registry_provider
+from ..providers import assert_live_provider_allowed
+from ..providers import routed_provider_name, routed_slug
 from .budget import BudgetTracker
 from .cache import CompletionCache, completion_key, tool_completion_key
 from .pool import RateGate, call_with_retry
@@ -146,6 +151,61 @@ class OpenRouterProvider:
             completion_tokens=getattr(usage, "completion_tokens", 0) or 0,
             cost_usd=float(getattr(usage, "cost", 0.0) or 0.0),
         )
+
+
+class RoutedOpenAIProvider:
+    """OpenAI-compatible router keyed by logical model/known provider slug."""
+
+    def __init__(
+        self,
+        timeout_s: float = 120.0,
+        sort_by_model: dict[str, str | None] | None = None,
+    ):
+        self._timeout_s = timeout_s
+        self._clients: dict[str, OpenRouterProvider] = {}
+        self._sort_by_provider_model: dict[str, dict[str, str | None]] = {}
+        for model, sort in (sort_by_model or {}).items():
+            provider_name = routed_provider_name(model)
+            provider_model = routed_slug(model, provider_name)
+            self._sort_by_provider_model.setdefault(provider_name, {})[provider_model] = sort
+
+    def _client_for(self, model: str) -> tuple[OpenRouterProvider, str]:
+        provider_name = routed_provider_name(model)
+        provider_model = routed_slug(model, provider_name)
+        assert_live_provider_allowed(provider_name, model=model, context="direct worker call")
+        client = self._clients.get(provider_name)
+        if client is None:
+            cfg = registry_provider(provider_name)
+            key_env = str(cfg.get("key_env") or "")
+            api_key = None
+            if key_env:
+                import os
+
+                api_key = os.environ.get(key_env)
+                if not api_key:
+                    raise RuntimeError(
+                        f"{key_env} is not set; model {model!r} routes to provider {provider_name!r}"
+                    )
+            client = OpenRouterProvider(
+                base_url=str(cfg["base_url"]),
+                api_key=api_key,
+                timeout_s=self._timeout_s,
+                sort_by_model=self._sort_by_provider_model.get(provider_name, {}),
+            )
+            self._clients[provider_name] = client
+        return client, provider_model
+
+    async def complete(
+        self, model: str, messages: list[Message], sampling: Sampling
+    ) -> Completion:
+        client, provider_model = self._client_for(model)
+        return await client.complete(provider_model, messages, sampling)
+
+    async def complete_tools(
+        self, model: str, messages: list, tools: list, sampling: Sampling
+    ) -> ToolCompletion:
+        client, provider_model = self._client_for(model)
+        return await client.complete_tools(provider_model, messages, tools, sampling)
 
 
 class FakeProvider:
@@ -323,11 +383,17 @@ def _estimate_cost_tool(spec: WorkerSpec, comp: ToolCompletion) -> float:
 
 
 def build_pool(cfg: PoolConfig, workers: list[WorkerSpec]) -> WorkerPool:
-    """Construct a live OpenRouter-backed pool from config."""
-    provider = OpenRouterProvider(
-        base_url=cfg.base_url, api_key=cfg.api_key(), timeout_s=cfg.timeout_s,
-        sort_by_model={w.model: w.provider_sort for w in workers},
-    )
+    """Construct a live provider-backed pool from config."""
+    if cfg.split_provider_routing:
+        provider: Provider = RoutedOpenAIProvider(
+            timeout_s=cfg.timeout_s,
+            sort_by_model={w.model: w.provider_sort for w in workers},
+        )
+    else:
+        provider = OpenRouterProvider(
+            base_url=cfg.base_url, api_key=cfg.api_key(), timeout_s=cfg.timeout_s,
+            sort_by_model={w.model: w.provider_sort for w in workers},
+        )
     return WorkerPool(
         workers=workers,
         provider=provider,

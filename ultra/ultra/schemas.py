@@ -25,8 +25,8 @@ HarnessName = Literal[
     "codex",
     "terminal_sandbox",
     "tool_dialog",
+    "tau_bench",
     "long_context",
-    "vision_qa",
     "sequential_sim",
     "research_loop",
 ]
@@ -40,6 +40,8 @@ Split = Literal[
     "final_eval",
     "diagnostic",
 ]
+
+StepBudget = Literal["short", "medium", "long", "max"]
 
 # Source-policy classes (ultra-data2 §3).
 SourcePolicy = Literal[
@@ -75,7 +77,6 @@ class TaskInput(BaseModel):
     repo: RepoRef | None = None
     context_documents: list[Any] = Field(default_factory=list)
     tools: list[Any] = Field(default_factory=list)
-    multimodal_assets: list[Any] = Field(default_factory=list)
 
 
 class EnvironmentSpec(BaseModel):
@@ -110,7 +111,6 @@ class TaskMetadata(BaseModel):
     subdomain: str | None = None
     difficulty_estimate: float | None = None
     tags: list[str] = Field(default_factory=list)
-    requires_vision: bool = False
     requires_tools: bool = False
     requires_long_context: bool = False
     estimated_worker_calls: int | None = None
@@ -135,6 +135,7 @@ class WorkflowStep(BaseModel):
     worker_id: int
     subtask: str
     access: list[int] = Field(default_factory=list)
+    budget: StepBudget = "medium"
 
 
 class Workflow(BaseModel):
@@ -179,6 +180,7 @@ class ConductorRecord(BaseModel):
 class ExecStep(BaseModel):
     worker_id: int
     harness: HarnessName
+    budget: StepBudget = "medium"
     session_ref: str | None = None
     patch_ref: str | None = None
     messages_ref: str | None = None
@@ -213,6 +215,7 @@ class RolloutRecord(BaseModel):
     grade: Grade | None = None
     # Faithful reward (ultra-intro §6): 0 malformed workflow · 0.5 valid+incorrect · 1.0 valid+correct.
     reward: float | None = None
+    outcome_class: str | None = None
     valid_for_training: bool = True
     failure_class: str | None = None
 
@@ -297,5 +300,4 @@ class WorkerIdentity(BaseModel):
     model: str
     role_prior: list[str] = Field(default_factory=list)
     max_turns: int | None = None
-    max_reported_cost_usd: float | None = None
     tool_permissions: ToolPermissions = Field(default_factory=ToolPermissions)

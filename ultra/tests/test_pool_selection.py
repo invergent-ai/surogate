@@ -225,7 +225,7 @@ def test_report_renders_scientific_sections(tmp_path):
     assert "Saved-rollout audit for commercial failures versus Kimi-Code" in report
     assert "Quality-First Ultra Decision" in report
     assert "Scaffold-Aware Coding Layer" in report
-    assert "codex:gpt-5-codex" in report
+    assert "codex:gpt-5.5" in report
     assert "claude-code:opus-4.8" in report
     assert "Diagnostic Role-Weighted Table" in report
     assert "Diagnostic Equal-Stratum Table" in report

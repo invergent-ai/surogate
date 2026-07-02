@@ -294,6 +294,9 @@ class GRPOBufferConfig:
         easy_fraction: Fraction of easy problems to convert to normal when resuming or starting training. Only problems with difficulty 'normal' are sampled.
         hard_fraction: Fraction of hard problems to convert to normal when resuming or starting training. Only problems with difficulty 'normal' are sampled.
         online_difficulty_filtering: Whether to filter rollouts based on difficulty. If True, rollouts with average reward 0.0 or 1.0 are not added to the buffer.
+        normal_pool_min_examples: Recycle examples from easy/hard pools when the normal pool has this many examples or fewer.
+        recycle_easy_fraction: Fraction of easy examples to recycle to normal when the normal pool is low.
+        recycle_hard_fraction: Fraction of hard examples to recycle to normal when the normal pool is low.
         hash_keys: Keys to use for computing example hashes. Will be used to match examples from buffer checkpoints and determine buffer resume behavior.
     """
 
@@ -304,6 +307,9 @@ class GRPOBufferConfig:
     easy_fraction: float | None = 0.0
     hard_fraction: float | None = 0.0
     online_difficulty_filtering: bool | None = False
+    normal_pool_min_examples: int | None = 0
+    recycle_easy_fraction: float | None = 0.0
+    recycle_hard_fraction: float | None = 0.0
     hash_keys: list[str] | None = field(default_factory=lambda: ["task", "prompt"])
 
     def __init__(self, cfg: DictDefault):
@@ -314,6 +320,9 @@ class GRPOBufferConfig:
         self.easy_fraction = cfg.get("easy_fraction", self.easy_fraction)
         self.hard_fraction = cfg.get("hard_fraction", self.hard_fraction)
         self.online_difficulty_filtering = cfg.get("online_difficulty_filtering", self.online_difficulty_filtering)
+        self.normal_pool_min_examples = cfg.get("normal_pool_min_examples", self.normal_pool_min_examples)
+        self.recycle_easy_fraction = cfg.get("recycle_easy_fraction", self.recycle_easy_fraction)
+        self.recycle_hard_fraction = cfg.get("recycle_hard_fraction", self.recycle_hard_fraction)
         self.hash_keys = cfg.get("hash_keys", ["task", "prompt"])
         self.__post_init__()
 
@@ -323,6 +332,18 @@ class GRPOBufferConfig:
 
         if self.env_ratios is not None:
             assert all(ratio > 0 for ratio in self.env_ratios), "All env_ratios must be positive."
+
+        for name, value in [
+            ("easy_fraction", self.easy_fraction),
+            ("hard_fraction", self.hard_fraction),
+            ("recycle_easy_fraction", self.recycle_easy_fraction),
+            ("recycle_hard_fraction", self.recycle_hard_fraction),
+        ]:
+            assert value is not None and 0.0 <= value <= 1.0, f"{name} must be in [0.0, 1.0]."
+
+        assert self.normal_pool_min_examples is not None and self.normal_pool_min_examples >= 0, (
+            "normal_pool_min_examples must be non-negative."
+        )
 
 
 @dataclass
@@ -819,6 +840,7 @@ class GRPOOrchestratorConfig:
     token_batch_size: int | None = None
     max_inflight_rollouts: int | None = None
     dump_metrics: bool | None = False
+    trainable_metric: str | None = None
 
     def __init__(self, cfg: DictDefault):
         self.client = GRPOClientConfig(cfg.get("client", {}))
@@ -867,6 +889,8 @@ class GRPOOrchestratorConfig:
                 self.filters.append(filter_config)
         else:
             self.filters = [GRPOGibberishFilterConfig({}), GRPORepetitionFilterConfig({})]
+
+        self.trainable_metric = cfg.get("trainable_metric", self.trainable_metric)
 
         self.log = GRPOLogConfig(cfg.get("log", {}))
 

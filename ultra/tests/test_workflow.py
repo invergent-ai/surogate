@@ -1,6 +1,7 @@
 import pytest
 
 from ultra.schemas import Workflow, WorkflowStep
+from ultra.harness.base import wall_time_cap_seconds
 from ultra.workflow import WorkflowValidationError, parse_workflow, validate_workflow
 
 
@@ -58,6 +59,20 @@ def test_rejects_duplicate_access():
 def test_parse_valid_and_invalid_json():
     wf = parse_workflow('{"steps":[{"worker_id":0,"subtask":"go","access":[]}]}')
     assert len(wf.steps) == 1
+    assert wf.steps[0].budget == "medium"
     validate_workflow(wf, worker_count=1)
     with pytest.raises(WorkflowValidationError):
         parse_workflow("{not json")
+
+
+def test_parse_tolerates_escaped_apostrophe_only():
+    wf = parse_workflow('{"steps":[{"worker_id":0,"subtask":"worker\\\'s fix","access":[]}]}')
+
+    assert wf.steps[0].subtask == "worker's fix"
+
+
+def test_budget_wall_time_caps_take_strictest_finite_limit():
+    assert wall_time_cap_seconds("short", task_cap=1800, harness_cap=900) == 900
+    assert wall_time_cap_seconds("short", task_cap=1800, harness_cap=2000) == 1200
+    assert wall_time_cap_seconds("max", task_cap=1800, harness_cap=None) == 1800
+    assert wall_time_cap_seconds("max", task_cap=None, harness_cap=None) is None

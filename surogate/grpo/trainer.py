@@ -31,6 +31,28 @@ from surogate.utils.tensor import to_surogate_dtype
 logger = get_logger()
 
 
+def _latest_checkpoint_step(config: GRPOTrainConfig) -> int:
+    """Return the latest trainer checkpoint step, or 0 when resume is disabled/unavailable."""
+
+    if not config.resume_from_checkpoint:
+        return 0
+    step = _surogate.find_latest_checkpoint(config.checkpoint_dir)
+    if step >= 0:
+        logger.info(f"Found GRPO trainer checkpoint at step {step}")
+        return int(step)
+    logger.warning(f"No GRPO trainer checkpoint found in {config.checkpoint_dir}; starting from base weights")
+    return 0
+
+
+def _weights_path_for_start_step(config: GRPOTrainConfig, model_weights_path: str, start_step: int) -> str:
+    """Choose the weight file to import before optional checkpoint restore."""
+
+    if start_step <= 0 or config.lora:
+        return model_weights_path
+    checkpoint_weights = Path(config.checkpoint_dir) / f"step_{start_step:08d}" / "model.safetensors"
+    return str(checkpoint_weights) if checkpoint_weights.exists() else model_weights_path
+
+
 def _filtered_config_for_logging(config: GRPOTrainConfig) -> dict:
     """Flatten config into JSON-serializable scalars for metrics_writer.log_config()."""
     raw = dict(vars(config))
@@ -72,6 +94,7 @@ class GRPOTrainer:
 
     def __init__(self, config: GRPOTrainConfig, external_weights: list[list[dict]] | None = None):
         self.config = config
+        self.start_step = _latest_checkpoint_step(config)
 
         # Build DSL IR for the model (same pattern as SurogateTrainerWrapper)
         from surogate.dsl.ir_builder import build_dsl_ir_for_model
@@ -117,13 +140,18 @@ class GRPOTrainer:
 
         # Import pretrained weights
         model_weights_path = get_model_weights_path(config.model_dir)
+        weights_path = _weights_path_for_start_step(config, model_weights_path, self.start_step)
         if external_weights is not None:
             # Zero-copy import from external GPU pointers (colocate mode with vLLM)
-            logger.info(f"Importing weights from external GPU pointers (non-quantized from {model_weights_path})")
-            self.trainer.import_weights_from_external(model_weights_path, external_weights)
+            logger.info(f"Importing weights from external GPU pointers (non-quantized from {weights_path})")
+            self.trainer.import_weights_from_external(weights_path, external_weights)
         else:
-            logger.info(f"Importing weights from {model_weights_path}")
-            self.trainer.import_weights(model_weights_path)
+            logger.info(f"Importing weights from {weights_path}")
+            self.trainer.import_weights(weights_path)
+        if self.start_step > 0:
+            logger.info(f"Loading GRPO trainer checkpoint from step {self.start_step}")
+            self.trainer.load_checkpoint(str(config.checkpoint_dir), self.start_step)
+            logger.info("GRPO trainer checkpoint loaded successfully")
 
         # loss_scale is computed dynamically per pack — see train() loop
 
@@ -246,7 +274,7 @@ class GRPOTrainer:
         config = self.config
         max_steps = config.max_steps
 
-        self._setup_data(start_step=0)
+        self._setup_data(start_step=self.start_step)
 
         # Get MultiRunManager — packer auto-increments progress[0].step after
         # each pack() call.
@@ -276,9 +304,9 @@ class GRPOTrainer:
         else:
             logger.info("  Running indefinitely (waiting for orchestrator)")
 
-        step = 0  # Internal trainer step (one per grad_accum chunk, for LR schedule + logging)
+        step = self.start_step  # Internal trainer step (one per grad_accum chunk, for LR schedule + logging)
         while True:
-            orch_step = mrm.progress[0].step if 0 in mrm.progress else 0
+            orch_step = mrm.progress[0].step if 0 in mrm.progress else self.start_step
 
             # 1. Broadcast weights (after first orchestrator step)
             if orch_step > 0:

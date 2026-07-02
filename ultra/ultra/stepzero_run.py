@@ -12,6 +12,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from .config import PoolConfig, WorkerSpec
+from .providers import load_dotenv, required_key_envs
 from .scaffolds import SCAFFOLDS
 from .sources.existing_bank import ExistingBankAdapter
 from .stepzero import HeadroomReport, run_stepzero
@@ -105,10 +106,11 @@ def format_report(report: HeadroomReport, worker_ids: list[str], harness: str) -
 
 
 async def run_cli(args) -> None:
-    if not os.environ.get("OPENROUTER_API_KEY"):
-        raise SystemExit("OPENROUTER_API_KEY is not set")
-
     workers = parse_workers(args.workers)
+    load_dotenv()
+    missing = [key_env for key_env in required_key_envs([worker.model for worker in workers]) if not os.environ.get(key_env)]
+    if missing:
+        raise SystemExit(f"missing provider key env vars: {', '.join(missing)}")
     pool = build_pool(
         workers,
         PoolConfig(max_concurrency=args.concurrency, budget_usd=args.budget),

@@ -21,13 +21,17 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from pathlib import Path
 import subprocess
+from typing import Any
 
+from ..providers import assert_live_provider_allowed
 from ..providers import provider as _provider_cfg
-from ..providers import slug as _provider_slug
+from ..providers import routed_provider_name, routed_slug
 from ..schemas import Grade, TaskSpec
 from ..workers import Sampling, WorkerPool
-from .base import StepInput, StepResult, register_harness
+from .base import StepInput, StepResult, register_harness, wall_time_cap_seconds
+from .repo_artifacts import artifact_ref, write_json, write_repo_state, write_text
 
 OC_BIN = os.environ.get("ULTRA_OC_BIN", os.path.expanduser("~/.opencode/bin/opencode"))
 CONDA_ACTIVATE = os.environ.get(
@@ -37,13 +41,8 @@ CONDA_ACTIVATE = os.environ.get(
 TESTBED = os.environ.get("ULTRA_TESTBED", "/testbed")
 OC_TIMEOUT = int(os.environ.get("ULTRA_OC_TIMEOUT", "600"))
 
-# Active inference provider (ULTRA_PROVIDER, default yunwu). OpenRouter is built into oc and
-# needs no config; a custom provider (yunwu) mounts a config whose apiKey reads {env:KEY_ENV},
-# so the secret travels via the container env, never the file.
-_P = _provider_cfg()
-OC_PROVIDER = os.environ.get("ULTRA_OC_PROVIDER", _P["oc_provider"])
-KEY_ENV = os.environ.get("ULTRA_OC_KEY_ENV", _P["key_env"])
-OC_CONFIG = os.environ.get("ULTRA_OC_CONFIG", _P["oc_config"] or "")
+# Default key env retained for tests/backward imports. Runtime routing is per worker.
+KEY_ENV = "OPENROUTER_API_KEY"
 
 _SCAFFOLD_WORKER_LOGICAL = {
     "opencode_kimi_builder": "kimi",
@@ -67,11 +66,50 @@ def _sh(*a: str) -> subprocess.CompletedProcess:
     return subprocess.run(a, capture_output=True, text=True)
 
 
+def _opencode_target(worker_id: str, model: str | None = None) -> str:
+    return _SCAFFOLD_WORKER_LOGICAL.get(worker_id) or model or worker_id
+
+
+def _opencode_route(worker_id: str, model: str | None = None) -> dict[str, str]:
+    target = _opencode_target(worker_id, model)
+    provider_name = routed_provider_name(target, os.environ.get("ULTRA_OC_PROVIDER"))
+    assert_live_provider_allowed(provider_name, model=target, context="OpenCode call")
+    cfg = _provider_cfg(provider_name)
+    return {
+        "provider_name": provider_name,
+        "oc_provider": str(cfg["oc_provider"]),
+        "key_env": os.environ.get("ULTRA_OC_KEY_ENV", str(cfg.get("key_env") or "")),
+        "oc_config": os.environ.get("ULTRA_OC_CONFIG", str(cfg.get("oc_config") or "")),
+        "slug": routed_slug(target, provider_name),
+    }
+
+
 def _opencode_slug(worker_id: str) -> str:
-    logical = _SCAFFOLD_WORKER_LOGICAL.get(worker_id)
-    if logical:
-        return _provider_slug(logical)
-    return worker_id
+    return _opencode_route(worker_id)["slug"]
+
+
+def _text(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    return value
+
+
+def _read_initial_patch(instance: dict[str, Any]) -> tuple[str | None, str | None]:
+    ref = str(instance.get("initial_patch_ref") or "").strip()
+    if not ref:
+        return None, None
+    path = Path(ref)
+    if not path.exists() or not path.is_file():
+        return None, f"initial_patch_ref not found: {ref}"
+    try:
+        text = path.read_text()
+    except OSError as exc:
+        return None, f"initial_patch_ref read failed: {type(exc).__name__}: {exc}"
+    if not text.strip():
+        return None, f"initial_patch_ref is empty: {ref}"
+    return text, None
 
 
 class OpenCodeContainer:
@@ -85,12 +123,14 @@ class OpenCodeContainer:
         testbed: str = TESTBED,
         tests_dir: str | None = None,
         activate: str | None = CONDA_ACTIVATE,
+        oc_config: str = "",
     ):
         self.image = image
         self.instance_id = instance_id
         self.testbed = testbed
         self.tests_dir = tests_dir
         self.activate = activate or ""
+        self.oc_config = oc_config
         self.cid = ""
 
     def start(self) -> bool:
@@ -99,8 +139,8 @@ class OpenCodeContainer:
         run_args = ["docker", "run", "-d", "--rm", "-v", f"{OC_BIN}:/usr/local/bin/oc:ro"]
         if self.tests_dir:
             run_args += ["-v", f"{self.tests_dir}:/tests:ro"]
-        if OC_CONFIG:  # custom provider (yunwu): mount its OpenCode config read-only
-            run_args += ["-v", f"{OC_CONFIG}:/root/opencode.json:ro"]
+        if self.oc_config:  # custom provider (yunwu): mount its OpenCode config read-only
+            run_args += ["-v", f"{self.oc_config}:/root/opencode.json:ro"]
         run_args += [self.image, "sleep", "9000"]
         cid = _sh(*run_args).stdout.strip()
         if not cid:
@@ -116,7 +156,16 @@ class OpenCodeContainer:
         self.cid = cid
         return True
 
-    def run_worker(self, slug: str, prompt: str, key: str) -> dict:
+    def run_worker(
+        self,
+        slug: str,
+        prompt: str,
+        *,
+        key_env: str,
+        oc_provider: str,
+        oc_config: str = "",
+        timeout: int | None = None,
+    ) -> dict:
         """Drive OpenCode with the worker model on the current workspace.
 
         Returns ``{"status": "ok"|"timeout", "cost": float}``.
@@ -127,27 +176,67 @@ class OpenCodeContainer:
         activate = f"{self.activate} && " if self.activate else ""
         inner = (
             f"{activate}exec /usr/local/bin/oc run --format json "
-            f'-m {OC_PROVIDER}/{slug} --dangerously-skip-permissions "$1"'
+            f'-m {oc_provider}/{slug} --dangerously-skip-permissions "$1"'
         )
         # Pass only the env var name. Docker inherits the value from this process
         # without putting the secret in the local process argv.
-        envs = ["-e", KEY_ENV, "-e", "HOME=/root"]
-        if OC_CONFIG:  # custom provider config mounted at /root/opencode.json
+        envs = ["-e", key_env, "-e", "HOME=/root"]
+        if oc_config:  # custom provider config mounted at /root/opencode.json
             envs += ["-e", "OPENCODE_CONFIG=/root/opencode.json"]
         try:
             proc = subprocess.run(
                 ["docker", "exec", *envs, "-w", self.testbed, self.cid, "bash", "-lc", inner, "_", prompt],
-                capture_output=True, text=True, timeout=OC_TIMEOUT,
+                capture_output=True, text=True, timeout=timeout or OC_TIMEOUT,
             )
-            return {"status": "ok", "cost": _opencode_cost(proc.stdout)}
-        except subprocess.TimeoutExpired:
-            return {"status": "timeout", "cost": 0.0}
+            return {
+                "status": "ok" if proc.returncode == 0 else "nonzero",
+                "returncode": proc.returncode,
+                "stdout": proc.stdout,
+                "stderr": proc.stderr,
+                "cost": _opencode_cost(proc.stdout),
+            }
+        except subprocess.TimeoutExpired as exc:
+            return {
+                "status": "timeout",
+                "returncode": None,
+                "stdout": _text(exc.stdout),
+                "stderr": _text(exc.stderr),
+                "cost": 0.0,
+            }
 
     def diff(self) -> str:
         _sh("docker", "exec", self.cid, "bash", "-c", f"cd {self.testbed} && git add -A")
-        return _sh("docker", "exec", self.cid, "bash", "-c", f"cd {self.testbed} && git diff --cached").stdout
+        diff = _sh("docker", "exec", self.cid, "bash", "-c", f"cd {self.testbed} && git diff --cached").stdout
+        return _strip_ignored_diff_entries(diff)
 
-    def grade_deep_swe(self, diff: str) -> float:
+    def export_workspace(self, destination: Path) -> tuple[bool, str]:
+        destination.mkdir(parents=True, exist_ok=True)
+        proc = _sh("docker", "cp", f"{self.cid}:{self.testbed}/.", str(destination))
+        if proc.returncode != 0:
+            return False, (proc.stderr or proc.stdout).strip()
+        return True, ""
+
+    def apply_initial_patch(self, patch: str) -> tuple[bool, str]:
+        proc = subprocess.run(
+            [
+                "docker",
+                "exec",
+                "-i",
+                self.cid,
+                "bash",
+                "-lc",
+                f"cd {self.testbed} && git apply --whitespace=nowarn -",
+            ],
+            input=patch,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return False, (proc.stderr or proc.stdout).strip()
+        return True, ""
+
+    def grade_deep_swe(self, diff: str, artifact_dir: Path | None = None) -> float:
         subprocess.run(
             [
                 "docker",
@@ -163,7 +252,7 @@ class OpenCodeContainer:
             text=True,
             check=False,
         )
-        subprocess.run(
+        proc = subprocess.run(
             ["docker", "exec", self.cid, "bash", "-lc", "bash /tests/test.sh"],
             capture_output=True,
             text=True,
@@ -178,6 +267,13 @@ class OpenCodeContainer:
             "-lc",
             "cat /logs/verifier/reward.json 2>/dev/null || cat /logs/verifier/reward.txt 2>/dev/null || true",
         ).stdout
+        if artifact_dir is not None:
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            write_text(
+                artifact_dir / "test_command.log",
+                f"returncode={proc.returncode}\n\nSTDOUT:\n{proc.stdout}\n\nSTDERR:\n{proc.stderr}",
+            )
+            write_text(artifact_dir / "reward_raw.txt", reward)
         return _deep_swe_reward_from_text(reward)
 
     def close(self) -> None:
@@ -254,6 +350,29 @@ def _deep_swe_reward_from_text(text: str) -> float:
     return 0.0
 
 
+def _strip_ignored_diff_entries(diff: str) -> str:
+    """Drop generated bytecode/cache files from source patches."""
+
+    kept: list[str] = []
+    block: list[str] = []
+
+    def ignored(header: str) -> bool:
+        return "__pycache__/" in header or ".pyc " in header or header.rstrip().endswith(".pyc")
+
+    for line in diff.splitlines(keepends=True):
+        if line.startswith("diff --git "):
+            if block and not ignored(block[0]):
+                kept.extend(block)
+            block = [line]
+        elif block:
+            block.append(line)
+        else:
+            kept.append(line)
+    if block and not ignored(block[0]):
+        kept.extend(block)
+    return "".join(kept)
+
+
 def _user_problem(task: TaskSpec) -> str:
     for message in reversed(task.input.messages):
         if message.get("role") == "user":
@@ -308,17 +427,19 @@ class OpenCodeRepoHarness:
         self.instance: dict | None = None
         self.final_container: OpenCodeContainer | None = None
         self.total_cost = 0.0
+        self.step_artifact_dirs: dict[int, Path] = {}
 
     async def run_step(
         self, step: StepInput, pool: WorkerPool, sampling: Sampling
     ) -> StepResult:
-        del pool, sampling  # OpenCode owns the agent loop once the model slug is selected.
+        del sampling  # OpenCode owns the agent loop once the model slug is selected.
 
-        key = os.environ.get(KEY_ENV)
-        if not key:
+        route = _opencode_route(step.worker_id, pool.model_for(step.worker_id))
+        key_env = route["key_env"]
+        if key_env and not os.environ.get(key_env):
             return StepResult(
                 text="",
-                error=f"{KEY_ENV} is not set",
+                error=f"{key_env} is not set",
                 termination="missing_provider_key",
             )
 
@@ -343,6 +464,7 @@ class OpenCodeRepoHarness:
                 testbed=str(instance.get("testbed") or TESTBED),
                 tests_dir=str(instance["tests_dir"]) if instance.get("tests_dir") else None,
                 activate=str(instance.get("activate")) if "activate" in instance else CONDA_ACTIVATE,
+                oc_config=route["oc_config"],
             )
             if not await asyncio.to_thread(container.start):
                 return StepResult(
@@ -351,6 +473,21 @@ class OpenCodeRepoHarness:
                     termination="container_start_failed",
                 )
             self.owned.append(container)
+            initial_patch, initial_patch_error = _read_initial_patch(instance)
+            if initial_patch_error:
+                return StepResult(
+                    text="",
+                    error=initial_patch_error,
+                    termination="initial_patch_failed",
+                )
+            if initial_patch:
+                applied, apply_error = await asyncio.to_thread(container.apply_initial_patch, initial_patch)
+                if not applied:
+                    return StepResult(
+                        text="",
+                        error=apply_error,
+                        termination="initial_patch_failed",
+                    )
             artifacts = {a.get("step_index"): a for a in step.prior_artifacts}
             prior_diffs = []
             for j in access:
@@ -358,7 +495,7 @@ class OpenCodeRepoHarness:
                     prior_diffs.append(self.diffs[j])
                 elif j in artifacts:
                     prior_diffs.append(str(artifacts[j].get("response", "")))
-            continuing = bool(prior_diffs)
+            continuing = bool(prior_diffs or instance.get("initial_patch_ref"))
 
         prompt = _step_prompt(
             str(instance["problem_statement"]),
@@ -367,13 +504,62 @@ class OpenCodeRepoHarness:
             continuing,
             testbed=container.testbed,
         )
-        run = await asyncio.to_thread(container.run_worker, _opencode_slug(step.worker_id), prompt, key)
+        timeout = wall_time_cap_seconds(
+            step.budget,
+            task_cap=step.task.environment.wall_time_seconds,
+            harness_cap=OC_TIMEOUT,
+        )
+        run = await asyncio.to_thread(
+            container.run_worker,
+            route["slug"],
+            prompt,
+            key_env=key_env,
+            oc_provider=route["oc_provider"],
+            oc_config=route["oc_config"],
+            timeout=timeout,
+        )
         diff = await asyncio.to_thread(container.diff)
         cost = float(run.get("cost", 0.0) or 0.0)
         self.total_cost += cost
         self.diffs[step.step_index] = diff
         self.containers[step.step_index] = container
         self.final_container = container
+        refs: dict[str, str | None] = {
+            "messages_ref": None,
+            "patch_ref": None,
+            "tool_events_ref": None,
+            "workspace_snapshot_ref": None,
+        }
+        step_artifact_dir = Path(step.artifact_dir) if step.artifact_dir else None
+        if step_artifact_dir is not None:
+            self.step_artifact_dirs[step.step_index] = step_artifact_dir
+            refs["messages_ref"] = write_text(step_artifact_dir / "prompt.txt", prompt)
+            if instance.get("initial_patch_ref"):
+                write_json(
+                    step_artifact_dir / "initial_patch.json",
+                    {"initial_patch_ref": str(instance.get("initial_patch_ref"))},
+                )
+            refs["patch_ref"] = write_text(step_artifact_dir / "patch.diff", diff)
+            refs["tool_events_ref"] = write_json(
+                step_artifact_dir / "command.json",
+                {
+                    "harness": self.name,
+                    "worker_id": step.worker_id,
+                    "status": run.get("status"),
+                    "returncode": run.get("returncode"),
+                    "stdout": run.get("stdout", ""),
+                    "stderr": run.get("stderr", ""),
+                    "cost": cost,
+                    "timeout_seconds": timeout,
+                },
+            )
+            write_repo_state(step_artifact_dir / "repo_state.json", step.task, instance)
+            workspace_dir = step_artifact_dir / "workspace_snapshot"
+            exported, export_error = await asyncio.to_thread(container.export_workspace, workspace_dir)
+            if exported:
+                refs["workspace_snapshot_ref"] = artifact_ref(workspace_dir)
+            else:
+                write_json(step_artifact_dir / "workspace_export_error.json", {"error": export_error})
 
         status = str(run.get("status", "ok"))
         return StepResult(
@@ -381,13 +567,21 @@ class OpenCodeRepoHarness:
             cost_usd=cost,
             error=None if status == "ok" else status,
             termination="completed" if status == "ok" else status,
+            session_ref=refs["workspace_snapshot_ref"],
+            workspace_snapshot_ref=refs["workspace_snapshot_ref"],
+            patch_ref=refs["patch_ref"],
+            messages_ref=refs["messages_ref"],
+            tool_events_ref=refs["tool_events_ref"],
+            command_log_ref=refs["tool_events_ref"],
+            artifact_dir=str(step_artifact_dir) if step_artifact_dir is not None else None,
         )
 
     def grade(self, task: TaskSpec, final: StepResult) -> Grade:
         try:
-            if final.error:
+            if final.error and not final.text.strip():
                 return Grade(score=0.0, success=False, details={"error": final.error})
-            if not final.text.strip():
+            patch = _strip_ignored_diff_entries(final.text)
+            if not patch.strip():
                 return Grade(score=0.0, success=False, details={"error": "empty patch"})
             instance = self.instance or _normalize_instance(task)
             if not instance:
@@ -397,6 +591,42 @@ class OpenCodeRepoHarness:
                     details={"error": "opencode_repo task is missing an opencode_instance payload"},
                 )
             if task.grader.type != "hidden_tests" and task.grader.type != "swesmith_hidden_tests":
+                if task.grader.type == "swebench_verified_hidden_tests":
+                    from ..acrouter_swebench import grade_swebench_verified_patch
+
+                    instance_id = str(instance.get("swebench_instance_id") or instance.get("instance_id") or "")
+                    if not instance_id:
+                        return Grade(
+                            score=0.0,
+                            success=False,
+                            details={"error": "missing swebench_instance_id"},
+                        )
+                    grade_dir = (
+                        Path(final.artifact_dir) / "grade"
+                        if final.artifact_dir
+                        else Path(".ultra_swebench_grades") / task.task_id
+                    )
+                    result = grade_swebench_verified_patch(
+                        instance_id=instance_id,
+                        patch=patch,
+                        image=str(instance["image_name"]),
+                        log_dir=grade_dir,
+                        eval_timeout=task.environment.wall_time_seconds or OC_TIMEOUT,
+                        network="none",
+                    )
+                    reward = 1.0 if result.get("resolved") else 0.0
+                    details = {"step_error": final.error} if final.error else {}
+                    details.update(
+                        {
+                            "swebench_instance_id": instance_id,
+                            "apply_ok": result.get("apply_ok"),
+                            "resolved": result.get("resolved"),
+                            "error": result.get("error"),
+                            "redacted_log_path": result.get("redacted_log_path"),
+                            "raw_log_retained": result.get("raw_log_retained"),
+                        }
+                    )
+                    return Grade(score=reward, success=reward >= task.grader.success_threshold, details=details)
                 if task.grader.type == "deep_swe_hidden_tests":
                     if self.final_container is None:
                         return Grade(
@@ -404,8 +634,20 @@ class OpenCodeRepoHarness:
                             success=False,
                             details={"error": "deep_swe_hidden_tests has no final container"},
                         )
-                    reward = float(self.final_container.grade_deep_swe(final.text))
-                    return Grade(score=reward, success=reward >= task.grader.success_threshold)
+                    grade_dir = Path(final.artifact_dir) / "grade" if final.artifact_dir else None
+                    try:
+                        reward = float(self.final_container.grade_deep_swe(patch, grade_dir))
+                    except TypeError:
+                        reward = float(self.final_container.grade_deep_swe(patch))
+                    details = {"step_error": final.error} if final.error else {}
+                    if grade_dir is not None:
+                        details.update(
+                            {
+                                "public_test_log_ref": artifact_ref(grade_dir / "test_command.log"),
+                                "hidden_grade_ref": artifact_ref(grade_dir / "reward_raw.txt"),
+                            }
+                        )
+                    return Grade(score=reward, success=reward >= task.grader.success_threshold, details=details)
                 return Grade(
                     score=0.0,
                     success=False,
@@ -413,8 +655,9 @@ class OpenCodeRepoHarness:
                 )
             from director.agentic.swebench_mini import grade_swesmith  # lazy: heavy agentic dep
 
-            reward = float(grade_swesmith(instance, final.text))
-            return Grade(score=reward, success=reward >= task.grader.success_threshold)
+            reward = float(grade_swesmith(instance, patch))
+            details = {"step_error": final.error} if final.error else {}
+            return Grade(score=reward, success=reward >= task.grader.success_threshold, details=details)
         except Exception as exc:  # noqa: BLE001 - live graders fail heterogeneously
             return Grade(score=0.0, success=False, details={"error": f"{type(exc).__name__}: {exc}"})
         finally:
@@ -455,12 +698,13 @@ async def run_agentic_workflow(instance: dict, workflow, worker_slugs: list[str]
 
     try:
         for i, step in enumerate(workflow.steps):
+            route = _opencode_route(worker_slugs[step.worker_id])
             access = list(step.access)
             if len(access) == 1:  # Rule B: continue in the predecessor's workspace
                 container = containers[access[0]]
                 prior_diffs, continuing = [], True
             else:  # Rule A (fresh) or Rule C (fresh + predecessor patches as artifacts)
-                container = OpenCodeContainer(image, iid)
+                container = OpenCodeContainer(image, iid, oc_config=route["oc_config"])
                 if not await asyncio.to_thread(container.start):
                     return {"reward": 0.0, "final_diff": "", "valid": False,
                             "steps": step_logs, "error": "container start/checkout failed"}
@@ -468,9 +712,12 @@ async def run_agentic_workflow(instance: dict, workflow, worker_slugs: list[str]
                 prior_diffs = [diffs[j] for j in access]
                 continuing = bool(prior_diffs)
 
-            slug = worker_slugs[step.worker_id]
+            slug = route["slug"]
             prompt = _step_prompt(problem, step.subtask, prior_diffs, continuing)
-            run = await asyncio.to_thread(container.run_worker, slug, prompt, key)
+            run = await asyncio.to_thread(
+                container.run_worker, slug, prompt,
+                key_env=route["key_env"], oc_provider=route["oc_provider"], oc_config=route["oc_config"],
+            )
             total_cost += float(run["cost"])
             diffs[i] = await asyncio.to_thread(container.diff)
             containers[i] = container
