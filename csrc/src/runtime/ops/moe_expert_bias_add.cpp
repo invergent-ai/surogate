@@ -52,24 +52,24 @@ Tensor CompiledExecutor::resolve_moe_expert_offsets(const CompiledOp& op) {
             }
         }
         const std::string key = moe_saved_key(layer_idx_any, "moe_expert_offsets");
-        auto it_saved = mMoeSavedBuffers.find(key);
+        auto it_saved = mSavedCache.buffers().find(key);
         std::string size_key = key;
-        if (it_saved == mMoeSavedBuffers.end()) {
+        if (it_saved == mSavedCache.buffers().end()) {
             const std::string compat_key = "blocks[" + std::to_string(layer_idx_any) + "].moe_expert_offsets";
-            it_saved = mMoeSavedBuffers.find(compat_key);
-            if (it_saved != mMoeSavedBuffers.end()) {
+            it_saved = mSavedCache.buffers().find(compat_key);
+            if (it_saved != mSavedCache.buffers().end()) {
                 size_key = compat_key;
             }
         }
-        if (it_saved != mMoeSavedBuffers.end() && it_saved->second != nullptr) {
+        if (it_saved != mSavedCache.buffers().end() && it_saved->second != nullptr) {
             cudaPointerAttributes attr{};
             cudaError_t err = cudaPointerGetAttributes(&attr, it_saved->second);
             if (err == cudaSuccess && attr.type == cudaMemoryTypeDevice) {
                 expert_offsets_view.DType = ETensorDType::INT32;
                 expert_offsets_view.Rank = 1;
                 // Use actual stored size (may be num_merged+1 when LLEP is active, not num_local+1)
-                auto size_it = mMoeSavedSizes.find(size_key);
-                if (size_it != mMoeSavedSizes.end()) {
+                auto size_it = mSavedCache.sizes().find(size_key);
+                if (size_it != mSavedCache.sizes().end()) {
                     expert_offsets_view.Sizes[0] = static_cast<long>(size_it->second / sizeof(int));
                 } else {
                     expert_offsets_view.Sizes[0] = static_cast<long>(mConfig.NumLocalExperts + 1);

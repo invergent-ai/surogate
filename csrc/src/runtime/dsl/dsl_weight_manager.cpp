@@ -13,8 +13,12 @@
 #include <string_view>
 #include <unordered_set>
 
+#include <optional>
+
 #include "config/pretrained_config.h"
 #include "kernels/kernels.h"
+#include "runtime/core/matmul_context.h"
+#include "runtime/dsl/shared_master_store.h"
 #include "runtime/dsl/tensor_role.h"
 #include "runtime/lora/lora_config.h"
 #include "runtime/training/runtime_options.h"
@@ -26,6 +30,12 @@
 #include <cuda_runtime.h>
 
 namespace dsl {
+
+// Defined in graph_executor_utils.cpp (name-based matmul-weight classifier). Forward-declared
+// here to avoid pulling graph_executor_internal.h (which clashes with augment_shape_env).
+std::optional<::modules::MatmulOp> matmul_op_from_weight(std::string_view name, int& layer_idx);
+bool is_mlp_gate_weight(std::string_view name);
+
 namespace {
 
 bool is_rope_param(const std::string& name) {
@@ -195,9 +205,25 @@ DslWeightManager::DslWeightManager(const Module& module,
     mConfig.use_zero_copy = options.UseZeroCopy;
     mConfig.cpu_training = options.CpuTraining;
     mConfig.enable_fp8_forward = options.fp8_forward_enabled();
+    // FP8 weight streaming: only when the FP8 forward recipe is active AND masters are
+    // offloaded (dispatch-PP). Then frozen matmul block masters are stored + streamed as
+    // FP8 (half the PCIe bytes), matching the recipe's per-layer skip_quant_* selection.
+    mConfig.stream_fp8 = mConfig.enable_fp8_forward && mConfig.offload_master;
+    mConfig.fp8_skip_first_layers = options.RecipeOptions.skip_quant_first_layers;
+    mConfig.fp8_skip_last_layers = options.RecipeOptions.skip_quant_last_layers;
 
     // Enable streaming if sharding weights with multiple GPUs
     mStreamWeights = mConfig.shard_weights && mConfig.num_shards > 1;
+
+    // Prefetch-slot count: 2 (per-block double-buffer) by default; dispatch-PP raises
+    // it (via env) so a whole small stage stays resident across its microbatches.
+    mNumPrefetchBuffers = 2;
+    if (const char* env = std::getenv("SUROGATE_DISPATCH_PREFETCH_BLOCKS")) {
+        const int v = std::atoi(env);
+        if (v >= 2) mNumPrefetchBuffers = v;
+    }
+    mPrefetchStatus.resize(mNumPrefetchBuffers);
+    mPrefetchBuffers.resize(mNumPrefetchBuffers);
 
     // Allocate weights
     allocate_weights(module, graph, lora_config);
@@ -271,6 +297,16 @@ void DslWeightManager::allocate_weights(const Module& module,
             // For legacy offload_master: only block weights go to pinned CPU.
             if (entry.is_block || mConfig.cpu_training) {
                 master_alloc = EAllocationType::PINNED;
+            } else if (freeze_base) {
+                // LoRA + offload_master (dispatch-PP): the non-block base
+                // (embedding / lm_head / final_norm) is FROZEN -- its master is read
+                // once to populate the bf16 work copy, then never again (no optimizer
+                // state). Keep it in pinned CPU so it doesn't occupy GPU memory; the
+                // resident work copy is what compute uses. This frees ~the non-block
+                // master bytes (several GB for a large-vocab model), making room for a
+                // resident stage so the dispatch scheduler can amortize its weight
+                // stream across microbatches.
+                master_alloc = EAllocationType::PINNED;
             }
         }
 
@@ -279,8 +315,21 @@ void DslWeightManager::allocate_weights(const Module& module,
         const bool replicate_non_block = sharded_master && (is_embedding_name(name) || is_lm_head_name(name));
         const bool entry_sharded = sharded_master && !replicate_non_block;
 
+        // Share FROZEN offloaded base masters across the per-GPU weight managers: the
+        // base is read-only, so all GPUs can DMA-stream from one pinned host copy instead
+        // of each pinning its own (N x the pin time AND N x the RAM). The store hands out
+        // one buffer per tensor name; it is read + page-locked once (see import_weights).
+        const bool shared_master = mConfig.offload_master && freeze_base && !entry.trainable &&
+                                   !entry_sharded && master_alloc == EAllocationType::PINNED;
         // Allocate master weight (sharded if enabled)
-        if (entry_sharded) {
+        if (shared_master) {
+            std::size_t nelem = 1;
+            for (long d : shape) nelem *= static_cast<std::size_t>(d);
+            const std::size_t bytes = nelem * get_dtype_size(master_dtype);
+            void* buf = shared_master_store().reserve(name, bytes);
+            entry.master = Tensor::from_pointer(static_cast<std::byte*>(buf), /*device=*/-1, master_dtype, shape);
+            mSharedMasterNames.insert(name);
+        } else if (entry_sharded) {
             TensorShard shard = mAllocator->allocate_shard(master_dtype,
                                                            mConfig.shard_idx,
                                                            mConfig.num_shards,
@@ -442,7 +491,7 @@ void DslWeightManager::allocate_prefetch_buffers() {
     // Allocate double buffers for prefetching.
     // Only one layer occupies each prefetch slot at a time, so we allocate one set
     // of GPU buffers per unique base param name per slot and share across all layers.
-    for (int i = 0; i < kNumPrefetchBuffers; ++i) {
+    for (int i = 0; i < mNumPrefetchBuffers; ++i) {
         mPrefetchStatus[i].layer_idx = -1;
         mPrefetchStatus[i].is_ready = true;
         mPrefetchStatus[i].fetch_pending = false;
@@ -462,18 +511,30 @@ void DslWeightManager::allocate_prefetch_buffers() {
                 if (shape.empty()) {
                     shape.assign(entry.master.Sizes.begin(), entry.master.Sizes.begin() + entry.master.Rank);
                 }
-                const std::string pkey = prefetch_key(bname, shape);
+                // FP8-streamed matmul weights get an FP8 prefetch buffer (half the device
+                // footprint, fed straight to the FP8 GEMM) plus a 2-float device scale slot.
+                // Keyed separately so a base whose layers split FP8/BF16 (skip_quant_* set)
+                // never shares one buffer across dtypes.
+                const bool fp8 = is_fp8_stream_weight(name) && !entry.trainable;
+                const ETensorDType buf_dtype = fp8 ? ETensorDType::FP8_E4M3 : mConfig.work_dtype;
+                const std::string pkey = prefetch_key(bname, shape) + (fp8 ? "|f8" : "");
                 auto bit = base_buffers.find(pkey);
 
                 if (bit == base_buffers.end()) {
                     // First time seeing this base param — allocate GPU buffer
-                    std::string buf_name = "prefetch_" + std::to_string(i) + "_" + bname;
+                    std::string buf_name =
+                        "prefetch_" + std::to_string(i) + "_" + bname + (fp8 ? "_f8" : "");
                     Tensor buf =
-                        mAllocator->allocate(mConfig.work_dtype, buf_name.c_str(), EAllocationType::ON_DEVICE, shape);
+                        mAllocator->allocate(buf_dtype, buf_name.c_str(), EAllocationType::ON_DEVICE, shape);
+                    if (fp8) {
+                        Tensor stats = mAllocator->allocate(ETensorDType::FP32, (buf_name + "_stats").c_str(),
+                                                            EAllocationType::ON_DEVICE, {2L});
+                        buf.Stats = stats.get<float>();
+                    }
                     base_buffers.emplace(pkey, buf);
                     mPrefetchBuffers[i].emplace(name, buf);
                 } else {
-                    // Reuse existing buffer — alias same GPU memory
+                    // Reuse existing buffer — alias same GPU memory (and its scale slot)
                     mPrefetchBuffers[i].emplace(name, bit->second);
                 }
             }
@@ -482,7 +543,9 @@ void DslWeightManager::allocate_prefetch_buffers() {
 }
 
 void DslWeightManager::create_cuda_resources() {
-    for (int i = 0; i < kNumPrefetchBuffers; ++i) {
+    mGatherEvents.assign(mNumPrefetchBuffers, nullptr);
+    mReleaseEvents.assign(mNumPrefetchBuffers, nullptr);
+    for (int i = 0; i < mNumPrefetchBuffers; ++i) {
         CUDA_CHECK(cudaEventCreate(&mGatherEvents[i]));
         mPrefetchStatus[i].done_event = mGatherEvents[i];
         CUDA_CHECK(cudaEventRecord(mGatherEvents[i], 0));
@@ -501,7 +564,7 @@ void DslWeightManager::create_cuda_resources() {
 }
 
 void DslWeightManager::release_cuda_resources() noexcept {
-    for (int i = 0; i < kNumPrefetchBuffers; ++i) {
+    for (int i = 0; i < mNumPrefetchBuffers; ++i) {
         if (mGatherEvents[i]) {
             cudaEventDestroy(mGatherEvents[i]);
             mGatherEvents[i] = nullptr;
@@ -623,7 +686,7 @@ void DslWeightManager::gather_block(int layer_idx, NCCLCommunicator& comm, cudaS
 
     // Find available prefetch buffer
     int buf_idx = -1;
-    for (int i = 0; i < kNumPrefetchBuffers; ++i) {
+    for (int i = 0; i < mNumPrefetchBuffers; ++i) {
         auto& status = mPrefetchStatus[i];
         if (status.layer_idx == layer_idx && status.version == mVersion) {
             // Already fetched and up-to-date. But `entry.work` pointers for
@@ -720,7 +783,7 @@ void DslWeightManager::gather_block(int layer_idx, NCCLCommunicator& comm, cudaS
         CUDA_CHECK(cudaEventRecord(status.done_event, stream));
     }
 
-    mCurrentPrefetchBuffer = (buf_idx + 1) % kNumPrefetchBuffers;
+    mCurrentPrefetchBuffer = (buf_idx + 1) % mNumPrefetchBuffers;
 }
 
 void DslWeightManager::release_block(int layer_idx, cudaStream_t stream) {
@@ -729,7 +792,7 @@ void DslWeightManager::release_block(int layer_idx, cudaStream_t stream) {
     }
 
     // Find and release the buffer holding this layer
-    for (int i = 0; i < kNumPrefetchBuffers; ++i) {
+    for (int i = 0; i < mNumPrefetchBuffers; ++i) {
         auto& status = mPrefetchStatus[i];
         if (status.layer_idx == layer_idx) {
             // Wait for any pending operations
@@ -750,7 +813,7 @@ void DslWeightManager::wait_for_gather(int layer_idx, cudaStream_t stream) {
         return;
     }
 
-    for (int i = 0; i < kNumPrefetchBuffers; ++i) {
+    for (int i = 0; i < mNumPrefetchBuffers; ++i) {
         auto& status = mPrefetchStatus[i];
         if (status.layer_idx == layer_idx) {
             if (status.fetch_pending) {
@@ -999,6 +1062,24 @@ std::size_t DslWeightManager::total_persistent_bytes() const {
     return total;
 }
 
+std::size_t DslWeightManager::gpu_prefetch_buffer_bytes() const {
+    std::size_t total = 0;
+    std::unordered_set<const std::byte*> seen;  // entries within/across slots alias shared buffers
+    for (const auto& slot_map : mPrefetchBuffers) {
+        for (const auto& kv : slot_map) {
+            const Tensor& t = kv.second;
+            if (!is_device_resident(t)) continue;
+            if (!seen.insert(t.Data).second) continue;
+            total += t.bytes();
+        }
+    }
+    return total;
+}
+
+int DslWeightManager::prefetch_slot_count() const {
+    return (mStreamWeights || mConfig.offload_master) ? mNumPrefetchBuffers : 0;
+}
+
 std::size_t
 DslWeightManager::rebind_to_persistent_arena(std::byte* arena_base, std::size_t max_bytes, cudaStream_t stream) {
     if (arena_base == nullptr || max_bytes == 0) return 0;
@@ -1109,6 +1190,12 @@ void DslWeightManager::convert_to_work(const Tensor& master, Tensor& work, cudaS
     // Same dtype - direct copy
     if (master.DType == work.DType) {
         CUDA_CHECK(cudaMemcpyAsync(work.Data, master.Data, work.bytes(), cudaMemcpyDefault, stream));
+        // FP8-streamed weights carry a per-tensor [abs_max, scale] alongside the data; copy it
+        // into the work buffer's device stats so the FP8 GEMM reads the right scale this stage.
+        if (master.Stats && work.Stats &&
+            (work.DType == ETensorDType::FP8_E4M3 || work.DType == ETensorDType::FP8_E5M2)) {
+            CUDA_CHECK(cudaMemcpyAsync(work.Stats, master.Stats, 2 * sizeof(float), cudaMemcpyDefault, stream));
+        }
         return;
     }
 
@@ -1122,18 +1209,89 @@ void DslWeightManager::convert_to_work(const Tensor& master, Tensor& work, cudaS
         return;
     }
 
-    // FP8 quantization
-    if (work.DType == ETensorDType::FP8_E4M3 || work.DType == ETensorDType::FP8_E5M2) {
-        if (!master.Stats) {
-            throw std::runtime_error("DslWeightManager: FP8 conversion requires Stats pointer");
+    throw std::runtime_error("DslWeightManager: unsupported dtype conversion");
+}
+
+bool DslWeightManager::is_fp8_stream_weight(const std::string& name) const {
+    if (!mConfig.stream_fp8) return false;
+    int layer_idx = -1;
+    // Only the explicit matmul-weight fields (qkv/out/mlp_up/down/...) are FP8-quantizable;
+    // conv / norm / A_log / bias fields are not matmul weights -> matmul_op_from_weight is
+    // nullopt for them, so they keep their BF16 streaming.
+    if (!matmul_op_from_weight(name, layer_idx).has_value()) return false;
+    if (is_mlp_gate_weight(name)) return false;  // MoE router gate stays BF16 (matches FP8 cache)
+    if (layer_idx < 0) return false;
+    // Match the recipe's per-layer skip selection (allow_quant_layer): layers the recipe keeps
+    // in BF16 must also stream BF16, else the GEMM would get an FP8 weight it won't scale.
+    if (mConfig.fp8_skip_first_layers > 0 && layer_idx < mConfig.fp8_skip_first_layers) return false;
+    if (mConfig.fp8_skip_last_layers > 0 && layer_idx >= mConfig.num_layers - mConfig.fp8_skip_last_layers)
+        return false;
+    return true;
+}
+
+void DslWeightManager::finalize_fp8_block_masters(const cudaDeviceProp& dp, cudaStream_t stream) {
+    if (!mConfig.stream_fp8) return;
+
+    // Largest FP8-streamable master decides the reusable device scratch size.
+    std::size_t max_nelem = 0;
+    for (auto& [name, e] : mWeights) {
+        if (!e.is_block || e.trainable || e.master.DType == ETensorDType::FP8_E4M3) continue;
+        if (!is_fp8_stream_weight(name)) continue;
+        max_nelem = std::max(max_nelem, e.master.nelem());
+    }
+    if (max_nelem == 0) return;
+
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    void* d_bf16 = nullptr;
+    void* d_fp8 = nullptr;
+    float* d_stats = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_bf16, max_nelem * get_dtype_size(ETensorDType::BF16)));
+    CUDA_CHECK(cudaMalloc(&d_fp8, max_nelem * get_dtype_size(ETensorDType::FP8_E4M3)));
+    CUDA_CHECK(cudaMalloc(&d_stats, 2 * sizeof(float)));
+
+    for (auto& [name, e] : mWeights) {
+        if (!e.is_block || e.trainable || e.master.DType == ETensorDType::FP8_E4M3) continue;
+        if (!is_fp8_stream_weight(name)) continue;
+        const long N = static_cast<long>(e.master.nelem());
+        if (N <= 0) continue;
+        // The host master buffer was sized for BF16 (2*N bytes); FP8 (N) + the inline
+        // [abs_max, scale] (8 bytes) fit in its front, so quantize in place with no realloc.
+        const std::size_t stats_off = static_cast<std::size_t>(N) * get_dtype_size(ETensorDType::FP8_E4M3);
+
+        // Shared masters (the frozen base shared across GPUs) are quantized exactly once.
+        const bool shared = is_shared_master(name);
+        const bool do_quant = !shared || shared_master_store().try_claim_fp8(name);
+        if (do_quant) {
+            CUDA_CHECK(cudaMemcpyAsync(d_bf16, e.master.Data,
+                                       static_cast<std::size_t>(N) * get_dtype_size(ETensorDType::BF16),
+                                       cudaMemcpyDefault, stream));
+            Tensor in =
+                Tensor::from_pointer(static_cast<std::byte*>(d_bf16), device, ETensorDType::BF16, std::vector<long>{N});
+            Tensor out = Tensor::from_pointer(static_cast<std::byte*>(d_fp8), device, ETensorDType::FP8_E4M3,
+                                              std::vector<long>{N});
+            out.Stats = d_stats;
+            abs_max(out.abs_max(), in, N, dp, stream);
+            quantize_with_abs_max(out, out.scale(), in, out.abs_max(), N, dp, stream);
+            // FP8 bytes + the 2-float scale back into the host buffer's front.
+            CUDA_CHECK(cudaMemcpyAsync(e.master.Data, d_fp8, stats_off, cudaMemcpyDefault, stream));
+            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(e.master.Data) + stats_off, d_stats,
+                                       2 * sizeof(float), cudaMemcpyDefault, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            if (shared) shared_master_store().finish_fp8(name);
+        } else {
+            shared_master_store().wait_fp8(name);
         }
-        // Note: This assumes Stats contains [abs_max, scale] at Stats[0] and Stats[1]
-        // The actual implementation would need proper abs_max computation
-        CUDA_CHECK(cudaMemcpyAsync(work.Data, master.Data, work.bytes(), cudaMemcpyDefault, stream));
-        return;
+
+        // Re-describe the master as FP8 with its scale inline after the data (every GPU).
+        // Keep Sizes (shape) so nelem is unchanged; bytes() now reports the FP8 size.
+        e.master.DType = ETensorDType::FP8_E4M3;
+        e.master.Stats = reinterpret_cast<float*>(static_cast<std::byte*>(e.master.Data) + stats_off);
     }
 
-    throw std::runtime_error("DslWeightManager: unsupported dtype conversion");
+    CUDA_CHECK(cudaFree(d_bf16));
+    CUDA_CHECK(cudaFree(d_fp8));
+    CUDA_CHECK(cudaFree(d_stats));
 }
 
 bool DslWeightManager::parse_layer_index(const std::string& name, int& layer_idx) {

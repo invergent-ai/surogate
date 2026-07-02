@@ -245,8 +245,11 @@ void AdamW8BitOptimizer::step(dsl::DslModel& model,
         return sharded_weights && model.mWeightManager->is_sharded(name);
     };
 
+    // dispatch-PP collects complete grads onto this GPU by hand (no DDP), so skip
+    // the cross-GPU grad/norm reductions that would deadlock against the idle pool.
+    const bool dispatch_local = model.mDispatchPpLocalGrads;
     const bool grads_reduced = comm.world_size() > 1;
-    if (grads_reduced) {
+    if (grads_reduced && !dispatch_local) {
         if (model.mGrads->is_reduce_pending()) {
             wait_event_if_not_capturing(stream, rs.all_reduce_done_event());
             model.mGrads->clear_reduce_pending();
@@ -255,7 +258,7 @@ void AdamW8BitOptimizer::step(dsl::DslModel& model,
         }
     }
 
-    model.calculate_gradient_norm(comm, config.grad_clip, stream, grads_reduced);
+    model.calculate_gradient_norm(comm, config.grad_clip, stream, grads_reduced || dispatch_local);
     const float* grad_scale = rs.scratch().norm_buffer.template get<float>() + 1;
 
     if (!mImpl->state->initialized) {
@@ -412,8 +415,11 @@ void AdamW8BitOptimizer::step_graph(dsl::DslModel& model,
         return sharded_weights && model.mWeightManager->is_sharded(name);
     };
 
+    // dispatch-PP collects complete grads onto this GPU by hand (no DDP), so skip
+    // the cross-GPU grad/norm reductions that would deadlock against the idle pool.
+    const bool dispatch_local = model.mDispatchPpLocalGrads;
     const bool grads_reduced = comm.world_size() > 1;
-    if (grads_reduced) {
+    if (grads_reduced && !dispatch_local) {
         if (model.mGrads->is_reduce_pending()) {
             wait_event_if_not_capturing(stream, rs.all_reduce_done_event());
             model.mGrads->clear_reduce_pending();
@@ -422,7 +428,7 @@ void AdamW8BitOptimizer::step_graph(dsl::DslModel& model,
         }
     }
 
-    model.calculate_gradient_norm(comm, config.grad_clip, stream, grads_reduced);
+    model.calculate_gradient_norm(comm, config.grad_clip, stream, grads_reduced || dispatch_local);
     const float* grad_scale = rs.scratch().norm_buffer.template get<float>() + 1;
 
     if (!mImpl->state->initialized) {

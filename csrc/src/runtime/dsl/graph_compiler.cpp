@@ -3107,6 +3107,16 @@ void compute_layout(CompiledGraph& graph, bool is_backward, bool fwd_per_layer_s
     const std::size_t num_tids = static_cast<std::size_t>(graph.num_tensors);
     std::vector<LayoutInfo> info(num_tids);
 
+    // dispatch-PP: the FwdStack arena (per-layer sectioned under recompute:false) is only
+    // ever populated one resident stage at a time per GPU (stages on a GPU run sequentially;
+    // concurrent stages are on separate GPUs/arenas). So color cyclically -- layer L uses
+    // section (L % stage_blocks) -- bounding the arena to stage_blocks sections instead of
+    // num_layers. Correct only because the planner emits stages ALIGNED to stage_blocks, so
+    // L % stage_blocks == L - stage_lo within a stage. Env is set only by the dispatch
+    // trainer; 0 (unset) keeps the standard per-layer (L * stride) coloring unchanged.
+    int dispatch_sections = 0;
+    if (const char* e = std::getenv("SUROGATE_DISPATCH_STAGE_BLOCKS")) dispatch_sections = std::atoi(e);
+
     for (std::size_t i = 0; i < graph.ops.size(); ++i) {
         const auto& op = graph.ops[i];
         auto visit = [&](const TensorRef& ref) {
@@ -3382,7 +3392,13 @@ void compute_layout(CompiledGraph& graph, bool is_backward, bool fwd_per_layer_s
         std::size_t total_bytes = section_per_layer ? 0 : coloring_per_frame_peak;
         for (std::size_t L = 0; L < frames.size(); ++L) {
             const auto& tids = frames[L];
-            const std::size_t base = section_per_layer ? L * stride : 0;
+            // Cyclic sectioning for dispatch-PP (see compute_layout top): layer L -> section
+            // (L % dispatch_sections), so the arena bounds to stage_blocks sections. Falls
+            // back to per-layer (L) when dispatch_sections == 0.
+            const std::size_t sect = (dispatch_sections > 0)
+                                         ? (L % static_cast<std::size_t>(dispatch_sections))
+                                         : L;
+            const std::size_t base = section_per_layer ? sect * stride : 0;
             for (std::size_t i = 0; i < tids.size(); ++i) {
                 graph.tensor_meta[static_cast<std::size_t>(tids[i])].offset = base + per_layer_offsets[L][i];
             }
@@ -3745,13 +3761,32 @@ void compute_arena_sizes(PhaseArenas& arenas,
     // boundary. finalize_save_for_bwd populates the same tids in both
     // compiles, so per-block sizes should match; take max as a safety.
     arenas.save_for_bwd_block_bases.assign(static_cast<std::size_t>(num_layers), 0);
-    std::size_t total = 0;
-    for (int L = 0; L < num_layers; ++L) {
+    // dispatch-PP: cyclic block bases (block L -> section L % stage_blocks) bound the
+    // SaveForBwd arena to stage_blocks blocks instead of num_layers -- same reasoning as
+    // the FwdStack cyclic coloring (one resident stage per GPU at a time; planner emits
+    // stages aligned to stage_blocks). 0 (env unset) keeps the cumulative whole-model layout.
+    int dispatch_sections = 0;
+    if (const char* e = std::getenv("SUROGATE_DISPATCH_STAGE_BLOCKS")) dispatch_sections = std::atoi(e);
+    auto block_bytes_at = [&](int L) -> std::size_t {
         const auto idx = static_cast<std::size_t>(L);
         const std::size_t fwd_bytes = idx < fwd.save_for_bwd_block_bytes.size() ? fwd.save_for_bwd_block_bytes[idx] : 0;
         const std::size_t bwd_bytes = idx < bwd.save_for_bwd_block_bytes.size() ? bwd.save_for_bwd_block_bytes[idx] : 0;
-        arenas.save_for_bwd_block_bases[idx] = total;
-        total += std::max(fwd_bytes, bwd_bytes);
+        return std::max(fwd_bytes, bwd_bytes);
+    };
+    std::size_t total = 0;
+    if (dispatch_sections > 0) {
+        std::size_t stride = 0;
+        for (int L = 0; L < num_layers; ++L) stride = std::max(stride, block_bytes_at(L));
+        for (int L = 0; L < num_layers; ++L) {
+            const std::size_t base = static_cast<std::size_t>(L % dispatch_sections) * stride;
+            arenas.save_for_bwd_block_bases[static_cast<std::size_t>(L)] = base;
+            total = std::max(total, base + block_bytes_at(L));
+        }
+    } else {
+        for (int L = 0; L < num_layers; ++L) {
+            arenas.save_for_bwd_block_bases[static_cast<std::size_t>(L)] = total;
+            total += block_bytes_at(L);
+        }
     }
     arenas.compiled_save_for_bwd_bytes = total;
     arenas.save_for_bwd_bytes = arenas.compiled_save_for_bwd_bytes;

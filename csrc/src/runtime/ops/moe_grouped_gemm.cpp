@@ -92,8 +92,8 @@ void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
 
         void* saved_ptr = nullptr;
         for (const auto& key : candidate_keys) {
-            auto it_saved = mMoeSavedBuffers.find(key);
-            if (it_saved != mMoeSavedBuffers.end() && it_saved->second != nullptr) {
+            auto it_saved = mSavedCache.buffers().find(key);
+            if (it_saved != mSavedCache.buffers().end() && it_saved->second != nullptr) {
                 saved_ptr = it_saved->second;
                 break;
             }
@@ -574,8 +574,8 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
 
         void* saved_ptr = nullptr;
         for (const auto& key : candidate_keys) {
-            auto it_saved = mMoeSavedBuffers.find(key);
-            if (it_saved != mMoeSavedBuffers.end() && it_saved->second != nullptr) {
+            auto it_saved = mSavedCache.buffers().find(key);
+            if (it_saved != mSavedCache.buffers().end() && it_saved->second != nullptr) {
                 saved_ptr = it_saved->second;
                 break;
             }

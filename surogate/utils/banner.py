@@ -45,7 +45,7 @@ _WORDMARK = [
     "████   ███  ██ ██  ███   ███  ██ ██   ██  ████ ",
 ]
 
-_TAGLINE = "FP8/FP4 · Training · Fine-tuning · RL"
+_TAGLINE = "BF16/FP8/FP4 · Training · Fine-tuning · RL"
 _GAP = "   "  # space between wordmark column and rabbit column
 
 # Brand gold, top->bottom gradient (bright gold -> deep amber).

@@ -842,14 +842,14 @@ void EPStrategy::persist_dispatch_state(CompiledExecutor& exec,
                                         const Tensor& merged_offsets_t,
                                         Tensor& merged_offsets_persisted_out) {
     ctx.saved_offsets_key = exec.moe_saved_key(ctx.layer_idx, "moe_expert_offsets");
-    save_persistent_buffer(exec.mMoeSavedBuffers,
-                           exec.mMoeSavedSizes,
+    save_persistent_buffer(exec.mSavedCache.buffers(),
+                           exec.mSavedCache.sizes(),
                            ctx.saved_offsets_key,
                            merged_offsets_t,
                            exec.mRunState.MainStream);
 
     merged_offsets_persisted_out = merged_offsets_t;
-    merged_offsets_persisted_out.Data = static_cast<std::byte*>(exec.mMoeSavedBuffers[ctx.saved_offsets_key]);
+    merged_offsets_persisted_out.Data = static_cast<std::byte*>(exec.mSavedCache.buffers()[ctx.saved_offsets_key]);
     exec.bind_tensor("moe_expert_offsets", merged_offsets_persisted_out);
 }
 
@@ -981,8 +981,8 @@ void EPStrategy::finalize_llep_state(CompiledExecutor& exec,
     }
 
     llep.merged_offsets_host = exec.mMoEHostOffsetsCache[ctx.ep_key];
-    llep.merged_offsets_gpu = exec.mMoeSavedBuffers[ctx.saved_offsets_key];
-    llep.merged_offsets_gpu_bytes = exec.mMoeSavedSizes[ctx.saved_offsets_key];
+    llep.merged_offsets_gpu = exec.mSavedCache.buffers()[ctx.saved_offsets_key];
+    llep.merged_offsets_gpu_bytes = exec.mSavedCache.sizes()[ctx.saved_offsets_key];
 
     // Transfer foreign-weight buffer ownership to LLEP state. Pointers in
     // gate_up_weight_ptrs / down_weight_ptrs reference these buffers, so
@@ -1107,8 +1107,8 @@ void EPStrategy::finalize_native_only_state(CompiledExecutor& exec, DispatchForw
     auto& llep = mLLEPStates[ctx.ep_key];
     populate_llep_weight_pointers(llep, ctx, native_gate_up, native_down, /*foreign_weights=*/nullptr);
     llep.merged_offsets_host = exec.mMoEHostOffsetsCache[ctx.ep_key];
-    llep.merged_offsets_gpu = exec.mMoeSavedBuffers[ctx.saved_offsets_key];
-    llep.merged_offsets_gpu_bytes = exec.mMoeSavedSizes[ctx.saved_offsets_key];
+    llep.merged_offsets_gpu = exec.mSavedCache.buffers()[ctx.saved_offsets_key];
+    llep.merged_offsets_gpu_bytes = exec.mSavedCache.sizes()[ctx.saved_offsets_key];
 }
 
 // ============================================================================

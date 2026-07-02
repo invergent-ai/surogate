@@ -266,6 +266,41 @@ def _summarize_block_schemas(ir_json: str | None) -> dict[str, int]:
 
 
 class SurogateTrainerWrapper:
+    def _dispatch_pp_plan(self):
+        """Partition layers into SMALL stages for dispatch-PP.
+
+        Unlike the old one-stage-per-GPU split (big stages that can't be held resident),
+        aim for ~SUROGATE_DISPATCH_STAGE_BLOCKS layers per stage (default 4) so 2x a stage
+        fits the VRAM budget and a stage stays cached across its microbatches. Always make
+        at least `gpus` stages so every device is used. Returns (los, his, n_layers,
+        num_stages, max_stage_blocks, stage_blocks).
+        """
+        mc = self.config.model_info.config
+        n_layers = getattr(mc, "num_hidden_layers", 0) or getattr(
+            getattr(mc, "text_config", None), "num_hidden_layers", 0
+        )
+        if not n_layers:
+            raise RuntimeError("dispatch_pp: could not determine num_hidden_layers from model config")
+        gpus = self.config.gpus
+        sb = max(1, int(os.environ.get("SUROGATE_DISPATCH_STAGE_BLOCKS", "4")))
+        # Stages must be ALIGNED uniform blocks of `sb` ([0..sb-1], [sb..2sb-1], ...): the
+        # recompute:false activation arena is colored cyclically (layer L -> section L % sb),
+        # which is only correct if every stage starts at a multiple of sb (so L % sb == L - lo
+        # within a stage). The last stage may be shorter. Shrink sb if needed so there are at
+        # least `gpus` stages (every device used).
+        if (n_layers + sb - 1) // sb < gpus:
+            sb = max(1, n_layers // gpus)
+        los, his = [], []
+        lo = 0
+        while lo < n_layers:
+            hi = min(lo + sb, n_layers) - 1
+            los.append(lo)
+            his.append(hi)
+            lo = hi + 1
+        nst = len(los)
+        max_stage = max(h - l + 1 for l, h in zip(los, his))
+        return los, his, n_layers, nst, max_stage, sb
+
     def __init__(self, config: SFTConfig, train_files: list[str], eval_files: list[str] | None = None):
         self.config = config
         self._block_types = None
@@ -359,6 +394,46 @@ class SurogateTrainerWrapper:
         # `_maybe_shrink_stack_after_warmup`. Gated here so resumed-from-
         # checkpoint runs still measure the first *executed* step.
         self._stack_shrunk = False
+
+        # dispatch_pp: plan small stages and size the weight-streaming prefetch so a whole
+        # stage stays resident across its microbatches. Must run BEFORE the native trainer
+        # (and its weight manager) is constructed, since the prefetch-slot count is read
+        # from the env at construction time.
+        if config.parallelism == "dispatch_pp":
+            self._dpp_los, self._dpp_his, _nl, _nst, _max_stage, _sb = self._dispatch_pp_plan()
+            # Pin the section count to the actual stage size so the recompute:false cyclic
+            # activation coloring (graph compiler) matches the planner's aligned stages.
+            os.environ["SUROGATE_DISPATCH_STAGE_BLOCKS"] = str(_sb)
+            prefetch = _max_stage + 2  # whole stage resident + double-buffer margin
+            os.environ["SUROGATE_DISPATCH_PREFETCH_BLOCKS"] = str(prefetch)
+            # Headroom for the boundary saves kept live by sub-range skip_finalize (the
+            # stack auto-sizer doesn't model them). Plenty of free VRAM since the base
+            # weights are bounded to the prefetch buffers.
+            os.environ.setdefault("SUROGATE_DISPATCH_STACK_HEADROOM_MB", "2048")
+            # Microbatches per step: M = gpus * _dpp_chunks, all accumulated into ONE optimizer
+            # step. gradient_accumulation_steps sets the per-GPU count for LoRA (M = gpus*GA,
+            # effective batch gpus*bsz*GA). The per-step weight stream is fixed, so more
+            # microbatches amortize it over more tokens and keep the pipeline fuller at no extra
+            # peak memory (they run sequentially on the resident stage). FFT keeps M=1 until
+            # cross-microbatch accumulation is wired.
+            self._dpp_chunks = max(1, config.gradient_accumulation_steps) if config.lora else 1
+            if os.environ.get("SUROGATE_DISPATCH_MICROBATCH_CHUNKS"):
+                logger.warning(
+                    "[dispatch_pp]: SUROGATE_DISPATCH_MICROBATCH_CHUNKS is removed and ignored; "
+                    "use gradient_accumulation_steps (it now sets the microbatch count)."
+                )
+            # Reflect the real per-step loader consumption (gpus*bsz*_dpp_chunks tokens) in the
+            # epoch math.
+            self.total_batch_size = self.chunk_size * self._dpp_chunks
+            if self.train_loader is not None:
+                self.steps_per_epoch = self.train_loader.num_tokens // max(1, self.total_batch_size)
+            logger.info(
+                "[dispatch_pp]: %d stages over %d layers (max %d blocks/stage), prefetch=%d slots",
+                _nst,
+                _nl,
+                _max_stage,
+                prefetch,
+            )
 
         # Create trainer
         self.start_step = 0
@@ -1034,7 +1109,12 @@ class SurogateTrainerWrapper:
             logger.info("CUDA graphs disabled")
 
         # Allocate token buffers
-        micro_steps = self.config.gradient_accumulation_steps if use_full_step_graphs else 1
+        if self.config.parallelism == "dispatch_pp":
+            micro_steps = self._dpp_chunks  # M = gpus * _dpp_chunks (= GA for LoRA) microbatches/step
+        elif use_full_step_graphs:
+            micro_steps = self.config.gradient_accumulation_steps
+        else:
+            micro_steps = 1
         total_rows = self.config.gpus * self.config.per_device_train_batch_size * micro_steps
         in_tokens = np.empty((total_rows, self.config.sequence_len), dtype=np.int32)
         out_tokens = np.empty((total_rows, self.config.sequence_len), dtype=np.int32)
@@ -1043,6 +1123,45 @@ class SurogateTrainerWrapper:
         # provides the canonical 1-plane packed IDs with doc-boundary resets.
         # Pass those IDs through and let C++ expand planes as needed.
         pos_ids = np.empty((total_rows, self.config.sequence_len), dtype=np.int32)
+
+        # Dispatch-PP: partition the transformer blocks into contiguous stages over
+        # the GPU pool (stage i -> GPU i % gpus). The fused training step dispatches
+        # each stage round-robin, hands activations/grads GPU->host->GPU, optimizes
+        # on the master replica, and broadcasts the updated weights.
+        # The resident round-robin stage scheduler runs each stage's whole forward,
+        # so it needs the model's weights to fit in one GPU (offload_master off).
+        # The resident stage scheduler handles BOTH weight-residency modes: with
+        # offload_master the base weights live in pinned CPU and the force-linear
+        # execution streams each block to the GPU on demand (gather_block /
+        # release_block via handle_layer_start/end), bounding resident base weights to
+        # the prefetch double-buffer (~2 blocks) -- so the full model never sits
+        # resident. Without offload_master the base weights stay resident.
+        self._dispatch_pp = self.config.parallelism == "dispatch_pp"
+        if self._dispatch_pp and self.config.offload_master:
+            logger.info("[dispatch_pp]: offload_master set -> base weights stream from CPU per block.")
+        if self._dispatch_pp:
+            # Stage plan (_dpp_los/_dpp_his) was computed in __init__ (it also sized the
+            # weight-streaming prefetch before the native trainer was built).
+            self._dpp_bsz = self.config.per_device_train_batch_size
+            _ga = self.config.gradient_accumulation_steps
+            if _ga > 1 and not self.config.lora:
+                logger.warning(
+                    "[dispatch_pp]: gradient_accumulation_steps=%d is ignored for non-LoRA dispatch "
+                    "(M=1; cross-microbatch accumulation for FFT is not wired yet).",
+                    _ga,
+                )
+            elif _ga > 1:
+                logger.info(
+                    "[dispatch_pp]: gradient_accumulation_steps=%d -> M = gpus*GA = %d microbatches "
+                    "per optimizer step (effective batch %d seqs).",
+                    _ga,
+                    self.config.gpus * self._dpp_chunks,
+                    self.config.gpus * self._dpp_chunks * self._dpp_bsz,
+                )
+            logger.info(
+                "[dispatch_pp]: stages -> %s",
+                list(zip(self._dpp_los, self._dpp_his)),
+            )
 
         # Preload first batch (eager path only)
         if not use_full_step_graphs:
@@ -1088,8 +1207,11 @@ class SurogateTrainerWrapper:
         # Training loop
         logger.info(f"Starting training loop: steps {self.start_step} to {self.max_steps - 1}")
         for step in range(self.start_step, self.max_steps):
-            # Check if we need to advance epoch
-            if not self.train_loader.has_next(self.config.gradient_accumulation_steps):
+            # Check if we need to advance epoch. Dispatch consumes _dpp_chunks loader batches
+            # per step (gpus*bsz each, chunks already folds in grad-accum); other paths consume
+            # gradient_accumulation_steps.
+            _batches_per_step = self._dpp_chunks if self._dispatch_pp else self.config.gradient_accumulation_steps
+            if not self.train_loader.has_next(_batches_per_step):
                 self.train_loader.advance_epoch()
                 if not use_full_step_graphs:
                     self.train_loader.load_batch(in_tokens, out_tokens, pos_ids)
@@ -1162,7 +1284,17 @@ class SurogateTrainerWrapper:
             # Training step
             step_start = time.time()
 
-            if use_full_step_graphs:
+            if self._dispatch_pp:
+                # Fill all gpus*bsz*_dpp_chunks rows = M microbatches. The loader yields one
+                # gpus*bsz chunk per call, so load _dpp_chunks of them into the buffer.
+                chunk = self.config.gpus * self.config.per_device_train_batch_size
+                for c in range(self._dpp_chunks):
+                    if not self.train_loader.has_next():
+                        self.train_loader.advance_epoch()
+                    start = c * chunk
+                    end = start + chunk
+                    self.train_loader.load_batch(in_tokens[start:end], out_tokens[start:end], pos_ids[start:end])
+            elif use_full_step_graphs:
                 chunk = self.config.gpus * self.config.per_device_train_batch_size
                 for micro_step in range(self.config.gradient_accumulation_steps):
                     if not self.train_loader.has_next():
@@ -1199,7 +1331,22 @@ class SurogateTrainerWrapper:
                 normuon_lr=lr,  # Use same LR for NorMuon
                 normuon_cautious_wd=self.config.normuon_cautious_wd,
             )
-            if use_full_step_graphs:
+            if self._dispatch_pp:
+                # Stage-level dispatch: forward+backward across the GPU pool, collect grads
+                # to the master, optimize, broadcast. One fused call. Each small stage runs
+                # on GPU s%N with its weights held resident across all M microbatches
+                # (streamed once/step), and stages pipeline across GPUs (N parallel PCIe
+                # links). M=gpus microbatches of bsz each fill the chunk (gpus*bsz rows).
+                # LoRA only for now (FFT cross-microbatch grad accumulation not wired -> M=1).
+                bsz = self._dpp_bsz
+                M = self.config.gpus * self._dpp_chunks if self.config.lora else 1
+                rows = M * bsz
+                loss = self.trainer.dispatch_pp_train_step_multigpu(
+                    in_tokens[:rows], out_tokens[:rows], self._dpp_los, self._dpp_his,
+                    opt_config, step, False, M
+                )
+                result = {"loss": float(loss), "norm": float(self.trainer.dispatch_pp_last_grad_norm())}
+            elif use_full_step_graphs:
                 result = self.trainer.train_step_graphed(in_tokens, out_tokens, pos_ids, opt_config, step + 1)
                 # Optional LoRA grad debug runs after graph replay (post-update).
                 self._maybe_log_lora_grad_stats(step)
@@ -1217,12 +1364,21 @@ class SurogateTrainerWrapper:
 
             # Build structured metrics for this step
             step_time = time.time() - step_start
-            tokens_processed = (
-                self.config.per_device_train_batch_size
-                * self.config.sequence_len
-                * self.config.gradient_accumulation_steps
-                * self.config.gpus
-            )
+            if self._dispatch_pp:
+                # M = gpus * _dpp_chunks (= GA for LoRA) microbatches per optimizer step.
+                tokens_processed = (
+                    self.config.per_device_train_batch_size
+                    * self.config.sequence_len
+                    * self.config.gpus
+                    * self._dpp_chunks
+                )
+            else:
+                tokens_processed = (
+                    self.config.per_device_train_batch_size
+                    * self.config.sequence_len
+                    * self.config.gradient_accumulation_steps
+                    * self.config.gpus
+                )
 
             # Check for loss spikes / gradient explosions
             if loss_guard is not None:
@@ -1300,6 +1456,13 @@ class SurogateTrainerWrapper:
         if self._stack_shrunk:
             return
         self._stack_shrunk = True
+        if getattr(self, "_dispatch_pp", False):
+            # The dispatch-PP per-stage gated-delta backward peaks right at the
+            # measured high-water mark; trimming the stack to it leaves no arena
+            # alignment headroom and the next step's identical peak OOMs. The
+            # upfront (safe) sizing is fine for the resident dispatch pool, so
+            # keep it.
+            return
         try:
             results = self.trainer.shrink_stack_after_warmup()
         except Exception as exc:  # pragma: no cover - best-effort optimization

@@ -410,17 +410,18 @@ CompiledExecutor::~CompiledExecutor() {
         mMemEffScratchOffset = 0;
     }
 
-    // Free persistent MoE saved tensor buffers. Arena-backed entries are
-    // skipped — their storage is owned by mPhaseArenas.
-    for (auto& [name, buffer] : mMoeSavedBuffers) {
-        if (!buffer) continue;
-        auto ab_it = mMoeSavedArenaBacked.find(name);
-        const bool arena_backed = ab_it != mMoeSavedArenaBacked.end() && ab_it->second;
-        if (!arena_backed) cudaFree(buffer);
+    // Free persistent saved-tensor buffers (the one arena-aware release point).
+    mSavedCache.free_all();
+
+    // Free the recycled cross-stage inject buffers (active + pooled).
+    for (void* p : mInjectBuffers) {
+        if (p) cudaFree(p);
     }
-    mMoeSavedBuffers.clear();
-    mMoeSavedSizes.clear();
-    mMoeSavedArenaBacked.clear();
+    mInjectBuffers.clear();
+    for (void* p : mInjectPool) {
+        if (p) cudaFree(p);
+    }
+    mInjectPool.clear();
 
     // EP per-layer state, LLEP state, shared buffers, buffer pool, and
     // the weight-transfer stream are all owned by mEpStrategy and released
@@ -575,16 +576,14 @@ CompiledExecutor::MoeSavedAlloc CompiledExecutor::allocate_moe_saved(std::size_t
     MoeSavedAlloc result;
     if (nbytes == 0) return result;
     if (mPhaseArenas && mPhaseArenas->allocated && mPhaseArenas->moe_saved_ptr &&
-        mMoeSavedBumpOffset + nbytes <= mPhaseArenas->moe_saved_bytes) {
-        result.ptr = mPhaseArenas->moe_saved_ptr + mMoeSavedBumpOffset;
+        mSavedCache.bump_offset() + nbytes <= mPhaseArenas->moe_saved_bytes) {
+        result.ptr = mPhaseArenas->moe_saved_ptr + mSavedCache.bump_offset();
         result.arena_backed = true;
-        mMoeSavedBumpOffset += nbytes;
+        mSavedCache.bump_offset() += nbytes;
         return result;
     }
-    void* raw = nullptr;
-    CUDA_CHECK(cudaMalloc(&raw, nbytes));
-    result.ptr = static_cast<std::byte*>(raw);
-    result.arena_backed = false;
+    // Arena miss: return null so SavedTensorCache::acquire owns the fallback (its free-list
+    // pool, then cudaMalloc). Keeps all alloc/recycle policy in one place.
     return result;
 }
 

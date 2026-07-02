@@ -318,6 +318,10 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
     use_all_to_all_reduce: bool | None = False
     memcpy_all_gather: bool | None = False
     memcpy_send_recv: bool | None = False
+    # Dispatch pipeline parallelism (opt-in, single-node model-parallel mode).
+    # Unset / "ddp" -> existing data-parallel path, byte-for-byte unchanged.
+    parallelism: str | None = None
+    dispatch_pp: dict | None = None
     init_projections_to_zero: bool | None = False
     from_scratch: bool | None = False
     lmhead_chunks: int | None = 1
@@ -449,6 +453,8 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         self.use_all_to_all_reduce = cfg.get("use_all_to_all_reduce", self.use_all_to_all_reduce)
         self.memcpy_all_gather = cfg.get("memcpy_all_gather", self.memcpy_all_gather)
         self.memcpy_send_recv = cfg.get("memcpy_send_recv", self.memcpy_send_recv)
+        self.parallelism = cfg.get("parallelism", self.parallelism)
+        self.dispatch_pp = dict(cfg.get("dispatch_pp", self.dispatch_pp) or {})
         self.init_projections_to_zero = cfg.get("init_projections_to_zero", self.init_projections_to_zero)
         self.from_scratch = cfg.get("from_scratch", self.from_scratch)
         self.lmhead_chunks = cfg.get("lmhead_chunks", self.lmhead_chunks)
@@ -653,6 +659,9 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
             if not shard_gradients:
                 raise ValueError("offload_grads requires cpu_training=true, shard_gradients=true, or zero_level >= 2.")
 
+        # Validate dispatch-PP before EP so its explicit ep_size>1 rejection wins
+        # over the generic "EP requires MoE" check.
+        self._validate_dispatch_pp_config()
         self._validate_ep_config()
         self.create_runtime_config()
         self.create_lora_config()
@@ -694,6 +703,106 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
                 f"per_device_train_batch_size * sequence_len ({batch_size} * {seq_len} = {total_tokens}). "
                 f"Either adjust batch size or sequence length, or reduce lmhead_chunks."
             )
+
+    def _validate_dispatch_pp_config(self):
+        """Normalize and validate parallelism=dispatch_pp (opt-in model-parallel mode).
+
+        Unset / "ddp" leaves the existing data-parallel path untouched. When set to
+        "dispatch_pp", the v1 mutual-exclusions (ZeRO sharding, cpu_training, MoE/EP,
+        non-BF16/FP8 recipes) are rejected with clear messages, and CUDA graphs are
+        disabled (per-stage weight streaming is incompatible with graph capture). Any
+        dispatch_pp sub-block is ignored (see the warning below).
+        """
+        if self.parallelism in (None, "", "ddp"):
+            self.parallelism = None
+            self.dispatch_pp = {}
+            return
+        if self.parallelism != "dispatch_pp":
+            raise ValueError(
+                f"Unknown parallelism={self.parallelism!r}; expected unset, 'ddp', or 'dispatch_pp'."
+            )
+
+        # The dispatch_pp sub-block is vestigial: the live planner uses uniform stages sized by
+        # SUROGATE_DISPATCH_STAGE_BLOCKS, and the dispatch knobs are top-level (offload_master,
+        # recompute, gradient_accumulation_steps). Accept a sub-block for back-compat but ignore
+        # it with a migration warning.
+        self.dispatch_pp = dict(self.dispatch_pp or {})
+        if self.dispatch_pp:
+            logger.warning(
+                "[dispatch_pp]: the dispatch_pp sub-block (%s) is ignored; stage size is set via "
+                "SUROGATE_DISPATCH_STAGE_BLOCKS (default 4) and the other knobs are top-level "
+                "(offload_master, recompute, gradient_accumulation_steps).",
+                ", ".join(sorted(self.dispatch_pp)),
+            )
+            self.dispatch_pp = {}
+
+        if self.cpu_training:
+            raise ValueError(
+                "parallelism=dispatch_pp is a separate model-parallel training mode and "
+                "cannot be combined with cpu_training=true in v1."
+            )
+        if (self.zero_level and self.zero_level > 1) or self.shard_weights or self.shard_gradients:
+            raise ValueError(
+                "parallelism=dispatch_pp is mutually exclusive with ZeRO sharding "
+                "(zero_level>1 / shard_weights / shard_gradients) in v1."
+            )
+        if self.ep_size and self.ep_size > 1:
+            raise ValueError(
+                "parallelism=dispatch_pp does not support MoE expert parallelism "
+                "(ep_size>1) in v1; this is a deferred phase."
+            )
+        if self.recipe not in (None, "bf16", "fp8_hybrid", "fp8-hybrid"):
+            raise ValueError(
+                "parallelism=dispatch_pp supports recipe bf16 or fp8_hybrid; NVFP4 stage "
+                f"streaming is deferred (got recipe={self.recipe!r})."
+            )
+        if self.use_cuda_graphs:
+            logger.warning(
+                "[dispatch_pp]: disabling CUDA graphs (per-stage weight streaming "
+                "is incompatible with graph capture)."
+            )
+            self.use_cuda_graphs = False
+
+        # Dispatch-PP is CPU-resident-masters + per-stage weight streaming: the
+        # work-weights live in pinned CPU RAM and are gathered to the GPU per block,
+        # so the full model never sits resident. Enable the offload path (mirrors
+        # cpu_training's mapping) — without it import_weights loads every weight onto
+        # the GPU and OOMs on any model large enough to need dispatch-PP.
+        # recompute bounds activation memory (the backward replays the forward per stage).
+        # It can be disabled (recompute: false) to trade the free VRAM for skipping the
+        # backward re-forward; the stage scheduler honors either setting.
+        if not self.recompute:
+            logger.info("[dispatch_pp]: recompute disabled (caching stage activations for the backward).")
+        # offload_residual is INCOMPATIBLE with the stage scheduler (both weight modes):
+        # the cross-stage forward handoff reads block hi's residual by name, and
+        # offloading it to pinned CPU asynchronously races that read (non-deterministic
+        # stage inputs -> corrupted gradients). The pipelined per-stage forward already
+        # bounds resident activations to one stage, so offload isn't needed; use more
+        # (smaller) stages if a single stage's activations don't fit. (Base-weight
+        # streaming via offload_master is orthogonal and stays available.)
+        if self.offload_residual:
+            logger.info(
+                "[dispatch_pp]: disabling offload_residual (it races the scheduler's cross-stage "
+                "forward boundary handoff; the per-stage forward already bounds activations)."
+            )
+            self.offload_residual = False
+        # Weight residency is the caller's choice; the round-robin stage scheduler
+        # (dispatch_pp_train_step_multigpu) runs either way:
+        #   - default (offload_master=false): base weights stay resident on each GPU —
+        #     for models whose weights fit in one GPU.
+        #   - offload_master=true: base weights live in pinned CPU and the force-linear
+        #     execution streams each block to the GPU on demand (gather_block /
+        #     release_block), bounding resident base weights to the prefetch
+        #     double-buffer — for models too large to fit resident (e.g. a 27B on
+        #     32 GB cards). LoRA adapters stay resident and small.
+        if self.offload_master:
+            logger.info(
+                "[dispatch_pp]: offload_master set -> base weights stream from pinned CPU per block "
+                "(resident base bounded to the prefetch buffers)."
+            )
+        # Note: dispatch-PP does NOT use offload_grads (the dispatch step collects
+        # gradients to the master itself; offload_grads would race that and trips the
+        # multi-GPU "requires ZeRO-2 / cpu_training" guard).
 
     def _validate_ep_config(self):
         """Validate Expert Parallelism configuration."""

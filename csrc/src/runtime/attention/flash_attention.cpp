@@ -297,16 +297,14 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
             : std::vector<long>(lse_candidate.Sizes.begin(), lse_candidate.Sizes.begin() + lse_candidate.Rank);
     Tensor out = ensure_output_tensor_or_persistent(out_candidate,
                                                     mRunState,
-                                                    mMoeSavedBuffers,
-                                                    mMoeSavedSizes,
+                                                    mSavedCache,
                                                     op.op_id + "." + op.outputs[0].name + ".out",
                                                     qkv.DType,
                                                     out_shape,
                                                     "flash_attention");
     Tensor lse = ensure_output_tensor_or_persistent(lse_candidate,
                                                     mRunState,
-                                                    mMoeSavedBuffers,
-                                                    mMoeSavedSizes,
+                                                    mSavedCache,
                                                     op.op_id + "." + op.outputs[1].name + ".lse",
                                                     ETensorDType::FP32,
                                                     lse_shape,
@@ -417,8 +415,7 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
     const std::vector<long> d_qkv_shape(qkv.Sizes.begin(), qkv.Sizes.begin() + qkv.Rank);
     Tensor d_qkv = ensure_output_tensor_or_persistent(ensure_output_tensor(op.outputs[0]),
                                                       mRunState,
-                                                      mMoeSavedBuffers,
-                                                      mMoeSavedSizes,
+                                                      mSavedCache,
                                                       op.op_id + "." + op.outputs[0].name + ".d_qkv",
                                                       d_out.DType,
                                                       d_qkv_shape,
@@ -542,8 +539,7 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
             !op.outputs[1].shape.empty() ? op.outputs[1].shape : std::vector<long>{static_cast<long>(Hq)};
         Tensor d_sinks_out = ensure_output_tensor_or_persistent(ensure_output_tensor(op.outputs[1]),
                                                                 mRunState,
-                                                                mMoeSavedBuffers,
-                                                                mMoeSavedSizes,
+                                                                mSavedCache,
                                                                 op.op_id + "." + op.outputs[1].name + ".d_sinks",
                                                                 op.outputs[1].dtype,
                                                                 d_sinks_shape,

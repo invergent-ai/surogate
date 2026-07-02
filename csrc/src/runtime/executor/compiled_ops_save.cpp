@@ -193,23 +193,16 @@ void CompiledExecutor::save_moe_layer_tensors(int layer_idx) {
             continue;
         }
 
-        // Allocate or resize persistent buffer if needed (arena bump with
-        // cudaMalloc fallback).
-        auto buf_it = mMoeSavedBuffers.find(name);
-        if (buf_it == mMoeSavedBuffers.end() || mMoeSavedSizes[name] < bytes) {
-            if (buf_it != mMoeSavedBuffers.end() && buf_it->second != nullptr) {
-                auto ab_it = mMoeSavedArenaBacked.find(name);
-                const bool old_was_arena = ab_it != mMoeSavedArenaBacked.end() && ab_it->second;
-                if (!old_was_arena) CUDA_CHECK(cudaFree(buf_it->second));
-            }
-            auto a = allocate_moe_saved(bytes);
-            mMoeSavedBuffers[name] = a.ptr;
-            mMoeSavedSizes[name] = bytes;
-            mMoeSavedArenaBacked[name] = a.arena_backed;
-        }
-
-        // Copy data to persistent buffer
-        void* dst_buffer = mMoeSavedBuffers[name];
+        // Persist into the saved-tensor cache: arena slot when available, else its free-list
+        // pool, else cudaMalloc. Recycle-on-resize and the dispatch per-stage reset are
+        // centralized in the cache (no scattered cudaFree).
+        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+        const bool capturing =
+            (cudaStreamIsCapturing(mRunState.MainStream, &cap) == cudaSuccess && cap != cudaStreamCaptureStatusNone);
+        void* dst_buffer = mSavedCache.acquire(name, bytes, capturing, name.c_str(), [this](std::size_t b) {
+            auto a = allocate_moe_saved(b);
+            return SavedTensorCache::ArenaAlloc{a.ptr, a.arena_backed};
+        });
         CUDA_CHECK(cudaMemcpyAsync(dst_buffer, tensor.Data, bytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
 
         // Update all authoritative tables to point at the persistent buffer.
@@ -307,23 +300,13 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
         if (bytes == 0) {
             return;
         }
-        auto buf_it = mMoeSavedBuffers.find(name);
-        if (buf_it == mMoeSavedBuffers.end() || mMoeSavedSizes[name] < bytes) {
-            if (debug_save_buffers) {
-                std::cerr << "[SAVE-BUF] alloc name=" << name << " bytes=" << bytes
-                          << " old_bytes=" << (buf_it == mMoeSavedBuffers.end() ? 0 : mMoeSavedSizes[name])
-                          << std::endl;
-            }
-            if (buf_it != mMoeSavedBuffers.end() && buf_it->second != nullptr) {
-                auto ab_it = mMoeSavedArenaBacked.find(name);
-                const bool old_was_arena = ab_it != mMoeSavedArenaBacked.end() && ab_it->second;
-                if (!old_was_arena) CUDA_CHECK(cudaFree(buf_it->second));
-            }
-            auto a = allocate_moe_saved(bytes);
-            mMoeSavedBuffers[name] = a.ptr;
-            mMoeSavedSizes[name] = bytes;
-            mMoeSavedArenaBacked[name] = a.arena_backed;
-        }
+        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+        const bool capturing =
+            (cudaStreamIsCapturing(mRunState.MainStream, &cap) == cudaSuccess && cap != cudaStreamCaptureStatusNone);
+        mSavedCache.acquire(name, bytes, capturing, name.c_str(), [this](std::size_t b) {
+            auto a = allocate_moe_saved(b);
+            return SavedTensorCache::ArenaAlloc{a.ptr, a.arena_backed};
+        });
     };
 
     // A `_flat` suffix on a block-level field means "view the tensor as 2D by
@@ -642,6 +625,40 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
     // This gate is set by GraphExecutor after validating runtime options + plan.
     const bool recompute_enabled = mRecomputeEnabled;
     const bool forward_replay_active = recompute_enabled && static_cast<bool>(mRecomputeFn);
+    // dispatch-PP forwards a contiguous op sub-range [mFwdOpLo, mFwdOpHi) per stage,
+    // so tensors owned by ops OUTSIDE that range were never computed. Their entries in
+    // the whole-graph save_list are legitimately absent -- the bounded backward for
+    // this stage never references them -- so skip those rather than fail. A full
+    // forward (the default 0 / SIZE_MAX range) keeps the hard failure to catch
+    // genuinely missing activations. The out-of-range test must be PRECISE: skipping
+    // an in-range-but-momentarily-not-live tensor would leave the backward reading a
+    // stale buffer (non-deterministic drift), so only ops/blocks provably outside the
+    // forwarded range are skipped; in-range misses still throw. Boundary residuals
+    // injected for the cross-stage handoff ARE live and are saved via
+    // block_activation_ptr below.
+    const bool sub_range_forward =
+        mCurrentGraph && (mFwdOpLo > 0 || mFwdOpHi < mCurrentGraph->ops.size());
+    // A block is forwarded iff its first op falls inside [mFwdOpLo, mFwdOpHi).
+    auto block_out_of_range = [&](int layer_idx) -> bool {
+        if (!sub_range_forward || !mCurrentGraph || layer_idx < 0 ||
+            layer_idx >= static_cast<int>(mCurrentGraph->layer_start_indices.size())) {
+            return false;
+        }
+        const std::size_t ls = mCurrentGraph->layer_start_indices[static_cast<std::size_t>(layer_idx)];
+        return ls < mFwdOpLo || ls >= mFwdOpHi;
+    };
+    // Op-id-keyed saves (e.g. mamba_gated_rmsnorm "<op_id>.normed"/".rstd") carry the
+    // producing op index as the name prefix; out-of-range if that op wasn't run.
+    auto opkeyed_out_of_range = [&](const std::string& nm) -> bool {
+        if (!sub_range_forward) return false;
+        const std::size_t dot = nm.find('.');
+        if (dot == 0 || dot == std::string::npos) return false;
+        for (std::size_t i = 0; i < dot; ++i) {
+            if (nm[i] < '0' || nm[i] > '9') return false;
+        }
+        const std::size_t op = static_cast<std::size_t>(std::stoul(nm.substr(0, dot)));
+        return op < mFwdOpLo || op >= mFwdOpHi;
+    };
     auto contains_ci = [](std::string_view haystack, std::string_view needle) {
         std::string h(haystack);
         std::string n(needle);
@@ -729,28 +746,20 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
             (should_persist(name, prefer_live, force_persist_name) || src_stack_backed) && src.Data != nullptr;
         if (need_persist && src.Data != nullptr) {
             const size_t bytes = src.bytes();
-            auto buf_it = mMoeSavedBuffers.find(name);
-            if (buf_it == mMoeSavedBuffers.end() || mMoeSavedSizes[name] < bytes) {
-                if (capturing) {
-                    // During CUDA graph capture we cannot allocate new buffers.
-                    // Fall back to metadata-only save so backward can resolve
-                    // from live/recomputed tensors instead of aborting capture.
-                    Tensor meta = src;
-                    meta.Data = nullptr;
-                    (*mSaved)[name] = meta;
-                    return;
-                }
-                if (buf_it != mMoeSavedBuffers.end() && buf_it->second != nullptr) {
-                    auto ab_it = mMoeSavedArenaBacked.find(name);
-                    const bool old_was_arena = ab_it != mMoeSavedArenaBacked.end() && ab_it->second;
-                    if (!old_was_arena) CUDA_CHECK(cudaFree(buf_it->second));
-                }
-                auto a = allocate_moe_saved(bytes);
-                mMoeSavedBuffers[name] = a.ptr;
-                mMoeSavedSizes[name] = bytes;
-                mMoeSavedArenaBacked[name] = a.arena_backed;
+            const bool need_alloc = (mSavedCache.find(name) == nullptr || mSavedCache.size_of(name) < bytes);
+            if (capturing && need_alloc) {
+                // During CUDA graph capture we cannot allocate new buffers. Fall back to a
+                // metadata-only save so backward resolves from live/recomputed tensors
+                // instead of aborting capture.
+                Tensor meta = src;
+                meta.Data = nullptr;
+                (*mSaved)[name] = meta;
+                return;
             }
-            void* dst_buffer = mMoeSavedBuffers[name];
+            void* dst_buffer = mSavedCache.acquire(name, bytes, capturing, name.c_str(), [this](std::size_t b) {
+                auto a = allocate_moe_saved(b);
+                return SavedTensorCache::ArenaAlloc{a.ptr, a.arena_backed};
+            });
             CUDA_CHECK(cudaMemcpyAsync(dst_buffer, src.Data, bytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
             Tensor saved_tensor;
             saved_tensor.DType = src.DType;
@@ -887,12 +896,18 @@ void CompiledExecutor::save_tensors(const std::vector<std::string>& save_list, b
                 (*mSaved)[name] = mWeights.get(name);
                 continue;
             }
+            if (block_out_of_range(layer_idx) || opkeyed_out_of_range(name)) {
+                continue;  // block belongs to a stage not forwarded here
+            }
             throw std::runtime_error("CompiledExecutor: cannot save tensor " + name);
         }
 
         if (mWeights.has(name)) {
             (*mSaved)[name] = mWeights.get(name);
             continue;
+        }
+        if (opkeyed_out_of_range(name)) {
+            continue;  // op-keyed save produced by an op not in this stage's range
         }
         throw std::runtime_error("CompiledExecutor: cannot save tensor " + name);
     }

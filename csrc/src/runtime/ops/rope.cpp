@@ -30,8 +30,7 @@ void CompiledExecutor::dispatch_rope(const CompiledOp& op) {
     const std::vector<long> out_shape(qkv.Sizes.begin(), qkv.Sizes.begin() + qkv.Rank);
     Tensor out = ensure_output_tensor_or_persistent(ensure_output_tensor(op.outputs[0]),
                                                     mRunState,
-                                                    mMoeSavedBuffers,
-                                                    mMoeSavedSizes,
+                                                    mSavedCache,
                                                     op.op_id + "." + op.outputs[0].name + ".out",
                                                     qkv.DType,
                                                     out_shape,
@@ -88,8 +87,7 @@ void CompiledExecutor::dispatch_rope_backward(const CompiledOp& op) {
     const std::vector<long> d_qkv_shape(d_out.Sizes.begin(), d_out.Sizes.begin() + d_out.Rank);
     Tensor d_qkv = ensure_output_tensor_or_persistent(ensure_output_tensor(op.outputs[0]),
                                                       mRunState,
-                                                      mMoeSavedBuffers,
-                                                      mMoeSavedSizes,
+                                                      mSavedCache,
                                                       op.op_id + "." + op.outputs[0].name + ".d_qkv",
                                                       d_out.DType,
                                                       d_qkv_shape,

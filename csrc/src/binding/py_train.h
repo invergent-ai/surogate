@@ -180,6 +180,59 @@ public:
     /// the rank did not resize (either not worth it or stack unused).
     std::vector<std::pair<long, long>> shrink_stack_after_warmup(long safety_bytes, long min_savings_bytes);
     std::vector<std::pair<std::string, Tensor>> get_gradients(int gpu_id);
+
+    // ---- Debug-only dispatch-PP sub-range parity (GPU 0, resident weights) -
+    std::vector<float> dispatch_pp_forward_hidden(const std::int32_t* inputs);
+    std::vector<float> dispatch_pp_forward_subranges(const std::int32_t* inputs, int split_after_block);
+    std::vector<float> dispatch_pp_grad_norms_whole(const std::int32_t* inputs, const std::int32_t* targets);
+    std::vector<float> dispatch_pp_grad_norms_subranges(const std::int32_t* inputs,
+                                                              const std::int32_t* targets,
+                                                              int split_after_block);
+    // Round-robin forward dispatch of contiguous block stages [los[i]..his[i]]
+    // across the GPU pool (stage i -> GPU i % ngpu), handing the boundary residual
+    // GPU->host->GPU between stages. Returns the final hidden state as flat f32.
+    std::vector<float> dispatch_pp_forward_hidden_multigpu(const std::int32_t* inputs,
+                                                                 const std::vector<int>& los,
+                                                                 const std::vector<int>& his);
+    // Round-robin backward dispatch (reverse stage order) across the GPU pool,
+    // handing the boundary gradients GPU->host->GPU. Returns per-block weight-grad
+    // L2 norms collected from whichever GPU computed each block.
+    std::vector<float> dispatch_pp_grad_norms_multigpu(const std::int32_t* inputs,
+                                                             const std::int32_t* targets,
+                                                             const std::vector<int>& los,
+                                                             const std::vector<int>& his);
+    // Per-GPU weight-residency snapshot (GPU 0; the pool is homogeneous): total
+    // device-resident weight bytes, the streaming block double-buffer footprint,
+    // and the slot count. Proves the dispatch-PP memory invariant — GPU weight
+    // residency is bounded by the slot count, not the layer count.
+    std::unordered_map<std::string, std::size_t> dispatch_pp_weight_residency();
+    // One full single-GPU dispatch-PP training step (forward -> loss, backward ->
+    // grads, optimizer update) through the sub-range executor. Returns the loss.
+    float dispatch_pp_train_step(const std::int32_t* inputs,
+                                       const std::int32_t* targets,
+                                       const optimizers::OptimizerConfig& opt_config,
+                                       int step_idx);
+    // One full multi-GPU dispatch-PP training step: round-robin backward dispatch
+    // with cross-GPU boundary handoff -> collect per-stage grads -> optimizer on the
+    // master replica -> broadcast updated weights to every GPU. Returns the loss.
+    // stale=true defers the optimizer update by one step (the previous step's grads
+    // are applied while this step trains on weights one update behind) — the
+    // RoundPipe one-step staleness. Call dispatch_pp_flush_pending at the end to
+    // apply the last deferred grads.
+    float dispatch_pp_train_step_multigpu(const std::int32_t* inputs,
+                                                const std::int32_t* targets,
+                                                const std::vector<int>& los,
+                                                const std::vector<int>& his,
+                                                const optimizers::OptimizerConfig& opt_config,
+                                                int step_idx,
+                                                bool stale,
+                                                int num_microbatches = 1);
+    // Grad norm computed by the last dispatch_pp optimizer apply (for the loss display).
+    float dispatch_pp_last_grad_norm() const {
+        return mDispatchPpLastGradNorm;
+    }
+    // Apply the last deferred (stale) gradients, if any.
+    void dispatch_pp_flush_pending(const optimizers::OptimizerConfig& opt_config);
     std::vector<std::pair<std::string, Tensor>> get_lora_gradients(int gpu_id);
     std::vector<std::pair<std::string, Tensor>> get_lora_weights(int gpu_id);
     int get_valid_token_count(int gpu_id);
@@ -298,10 +351,34 @@ private:
     std::atomic<int> mIsReady = 0;
     std::atomic<int> mWorkDone = 0;
 
+    // dispatch-PP async per-GPU dispatch: launch work on a single GPU without the
+    // global barrier of run_work, and wait per-GPU later. This lets the stage
+    // scheduler run different stages/microbatches on different GPUs concurrently.
+    // Per-GPU monotonic counters: dispatch bumps Pending, the worker bumps Done after
+    // it finishes a work item; the GPU is free when Done==Pending. The synchronous
+    // run_work path (and mWorkDone) is unchanged.
+    std::unique_ptr<std::atomic<int>[]> mCtxPending;
+    std::unique_ptr<std::atomic<int>[]> mCtxDone;
+    void init_async_slots(std::size_t n);
+    void dispatch_async(std::function<void(sThreadContext& ctx)> work, int gpu);
+    void wait_gpu(int gpu);
+
     std::function<void(sThreadContext& ctx)> fetch_work(sThreadContext& ctx);
     void run_work(std::function<void(sThreadContext& ctx)> work, int idx = -1);
     void main_loop(NCCLCommunicator& comm);
     void print_timing_breakdown(int step, int micro_steps);
+
+    // dispatch-PP: apply collected grads on the master GPU (optimizer) and broadcast
+    // the updated weights to every replica. opt_step_1based is the Adam step index.
+    void dispatch_pp_apply_grads_(const std::vector<std::pair<std::string, std::vector<std::byte>>>& collected,
+                                  const optimizers::OptimizerConfig& opt_config,
+                                  int opt_step_1based, int valid_tokens);
+    // dispatch-PP one-step-stale state: gradients deferred from the previous step,
+    // and the count of optimizer updates applied so far (1-based Adam step).
+    std::vector<std::pair<std::string, std::vector<std::byte>>> mDispatchPpPendingGrads;
+    int mDispatchPpAppliedStep = 0;
+    int mDispatchPpPendingValidTokens = 0;  // valid-token count for the deferred (stale) grads
+    float mDispatchPpLastGradNorm = 0.0f;
 };
 
 #endif  //SUROGATE_SRC_BINDING_PY_TRAIN_H

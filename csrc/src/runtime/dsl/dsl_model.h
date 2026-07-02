@@ -102,6 +102,101 @@ public:
     void forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm, int micro_step) override;
     float validate(Tensor inputs, Tensor position_ids, Tensor targets, NCCLCommunicator& comm, int micro_step) override;
     void backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, int grad_accum_steps, int micro_step) override;
+
+    // ---- Debug-only dispatch-PP sub-range parity (BF16 full-FT, resident) --
+    // Whole-graph forward; returns the final hidden state flattened to host f32.
+    std::vector<float> dispatch_pp_forward_hidden(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm);
+    // Forward as two contiguous block sub-ranges [0..split] then [split+1..last],
+    // the boundary residual round-tripped through host; returns final hidden f32.
+    std::vector<float> dispatch_pp_forward_subranges(Tensor inputs,
+                                                           Tensor position_ids,
+                                                           NCCLCommunicator& comm,
+                                                           int split_after_block);
+    // Run one forward stage (blocks [lo..hi]) eagerly, leaving state resident.
+    // When inject_layer >= 0, inject ``inject_host`` into get_residual(inject_layer)
+    // first (the cross-GPU activation handoff). Read the result via the executor's
+    // debug readers (debug_read_residual_bytes / last_block_hidden_f32).
+    void dispatch_pp_forward_stage(Tensor inputs,
+                                         Tensor position_ids,
+                                         NCCLCommunicator& comm,
+                                         int lo,
+                                         int hi,
+                                         std::vector<std::pair<std::string, std::vector<std::byte>>> inject_named,
+                                         bool preserve_output);
+    // Run one backward stage (blocks [lo..hi]) on this GPU. Forward only this
+    // stage's blocks from fwd_inject (block lo-1's residual, captured in the
+    // forward pass; empty for lo==0, which forwards from the embedding), then run
+    // the bounded backward for [lo..hi]. Forwarding just the stage -- instead of
+    // the whole model -- bounds resident activations to one stage, so deep
+    // linear-attention models don't overflow the compute stack at longer seq.
+    // is_loss_stage (the stage owning the last block) backpropagates from the
+    // loss; otherwise inject the incoming boundary gradients (inject_named:
+    // d_blocks[hi].res_att / .mlp_down). Read results via the executor readers
+    // (block_grad_norms, read_named_bytes for d_blocks[lo-1].*).
+    void dispatch_pp_backward_stage(Tensor inputs,
+                                          Tensor targets,
+                                          Tensor position_ids,
+                                          NCCLCommunicator& comm,
+                                          int lo,
+                                          int hi,
+                                          bool is_loss_stage,
+                                          std::vector<std::pair<std::string, std::vector<std::byte>>> fwd_inject,
+                                          std::vector<std::pair<std::string, std::vector<std::byte>>> inject_named,
+                                          int micro_step = 0,
+                                          int total_micro = 1);
+    // Whole-graph backward; returns per-block weight-grad L2 norms (block order).
+    std::vector<float> dispatch_pp_grad_norms_whole(Tensor inputs,
+                                                          Tensor targets,
+                                                          Tensor position_ids,
+                                                          NCCLCommunicator& comm);
+    // One full dispatch-PP training step through the forced-eager sub-range
+    // executor: forward (computes the loss), backward (grads to the store), then
+    // the optimizer update. Returns the step's mean loss. Single-GPU end-to-end
+    // convergence keystone (the cross-GPU stage handoff is validated separately).
+    float dispatch_pp_train_step(Tensor inputs,
+                                       Tensor targets,
+                                       Tensor position_ids,
+                                       NCCLCommunicator& comm,
+                                       const optimizers::OptimizerConfig& opt_config,
+                                       int step_idx);
+    // --- Multi-GPU dispatch training-step host-transfer primitives ---
+    // Read the weight gradients for the parameters of blocks [lo..hi] (and, when
+    // include_nonblock, the non-block params: lm_head / final norm) to host,
+    // keyed by parameter name. The cross-GPU grad collection for the fused step.
+    std::vector<std::pair<std::string, std::vector<std::byte>>> dispatch_pp_read_block_grads(
+        int lo, int hi, bool include_head, bool include_embed);
+    // Write gradients from host into the grad store by name (host -> device).
+    void dispatch_pp_write_grads(const std::vector<std::pair<std::string, std::vector<std::byte>>>& items);
+    // Zero the grad accumulators before a backward wavefront. The diagonal schedule
+    // hits a stage's microbatches out of order, so grads are pre-zeroed once and every
+    // backward_stage accumulates (rather than per-task zeroing).
+    void dispatch_pp_zero_grads();
+    // Read / write every parameter weight to / from host (the master broadcast).
+    std::vector<std::pair<std::string, std::vector<std::byte>>> dispatch_pp_read_weights();
+    void dispatch_pp_write_weights(const std::vector<std::pair<std::string, std::vector<std::byte>>>& items);
+    // Run the optimizer over the (collected) grad store on this GPU. Uses
+    // total-token normalization (ValidTokenCount is not populated on the collecting
+    // GPU since the dispatch backward skips the DP loss reduce). step_idx is 1-based.
+    float dispatch_pp_apply_optimizer(NCCLCommunicator& comm,
+                                            const optimizers::OptimizerConfig& opt_config,
+                                            int step_idx);
+    // Raw (summed) loss from the last forward — readable without ValidTokenCount,
+    // which the dispatch backward leaves unset. Monotone with the mean loss, so it
+    // tracks convergence.
+    [[nodiscard]] float dispatch_pp_raw_loss() const;
+    // Valid (non-pad) tokens the loss stage counted for the last microbatch; the multi-GPU
+    // trainer sums these across microbatches and publishes the total via the setter below so
+    // dispatch_pp_apply_optimizer (which runs on the master GPU, not the loss GPU) can scale
+    // the grad norm per valid token instead of per total (padded) token.
+    [[nodiscard]] int dispatch_pp_loss_valid_tokens() const { return mDispatchPpLossValidTokens; }
+    void set_dispatch_pp_valid_tokens(int n) { mDispatchPpValidTokens = n; }
+    // Backward as two contiguous block sub-ranges (high range first, boundary
+    // grad round-tripped through host); returns per-block grad norms.
+    std::vector<float> dispatch_pp_grad_norms_subranges(Tensor inputs,
+                                                              Tensor targets,
+                                                              Tensor position_ids,
+                                                              NCCLCommunicator& comm,
+                                                              int split_after_block);
     void update(NCCLCommunicator& comm,
                 float learning_rate,
                 float beta_1,
@@ -404,6 +499,16 @@ private:
     std::unique_ptr<modules::LoRANorMuonState> mLoRANorMuonState;
     bool mIsMoEModel = false;
     bool mUseTokenScale = true;               // apply 1/valid_token_count in global_norm_sqrt
+    // dispatch-PP: grads are collected complete onto this GPU by hand (not via DDP),
+    // so the optimizer must skip the cross-GPU grad/norm all-reduce that would
+    // deadlock waiting for the idle pool.
+    bool mDispatchPpLocalGrads = false;
+    float mDispatchPpLastLoss = 0.0f;         // mean loss stashed by the dispatch backward's forward
+    int mDispatchPpLossValidTokens = 0;       // valid (non-pad) target tokens the loss stage counted
+                                              // for the current microbatch (read back per microbatch)
+    int mDispatchPpValidTokens = 0;           // valid tokens summed over the step's microbatches,
+                                              // published onto the optimizer GPU for valid-token
+                                              // grad-norm scaling (the dispatch path skips reduce_loss)
     bool mDocMaskingActive = false;           // set by forward(), cleared by backward()
     float* mGrpoInvTemperatureGpu = nullptr;  // persists from forward_for_grpo() to backward_grpo()
 

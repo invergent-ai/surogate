@@ -36,6 +36,7 @@ Surogate is built for developers and enterprises that need fast experimentation 
 - [**🔧 RL Environments**](./guides/rl-environments.md): predictable environments for RL training
 - [**🖥️...🖥️ Native multi-GPU**](./guides/multi-gpu.md) training with the multi-threaded backend
 - [**🖥️...🖥️ Native multi-Node**](./guides/multi-node.md) DDP training with Ray
+- [**🧩 Dispatch Pipeline Parallelism**](./guides/dispatch-pp.md): train models whose weights don't fit on a single GPU on PCIe-only boxes (no NVLink/P2P) — streams the frozen base from CPU per stage, with FP8 weight streaming
 - **⚡ Native C++/CUDA engine** for near–Speed-Of-Light (SOL) throughput
 - [**🔥 Python DSL**](./about/dsl.md) with AOT auto-differentiation for adding new model architectures
 - [**⚖️ Smart CPU Offloading**](./guides/offloading.md) for weights, gradients, activations, quants
