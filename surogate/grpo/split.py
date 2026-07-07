@@ -28,6 +28,7 @@ import multiprocessing as mp
 import multiprocessing.connection
 import os
 import signal
+import sys
 import threading
 from threading import Thread
 
@@ -366,8 +367,10 @@ def _set_child_subreaper() -> None:
     walk and a ``killpg`` on the vLLM session group. ``PR_SET_CHILD_SUBREAPER``
     makes such orphans reparent to *us* instead, so a single
     ``children(recursive=True)`` walk at shutdown still finds them and they can
-    be reaped by PID. Best-effort: logs and continues if unavailable (non-Linux
-    or a restricted sandbox), leaving only the graceful ``killpg`` teardown.
+    be reaped by PID. ``prctl``/``PR_SET_CHILD_SUBREAPER`` is Linux-only, so on
+    any other platform this is a no-op (the graceful ``killpg`` teardown still
+    runs); on Linux it is best-effort, logging and continuing if the call fails
+    in a restricted sandbox.
 
     Adopted descendants that die mid-run become zombies under us until the
     shutdown reap (or ``init`` when we exit) clears them. We deliberately do NOT
@@ -375,10 +378,16 @@ def _set_child_subreaper() -> None:
     ``multiprocessing`` for its own children and corrupt its bookkeeping — and
     the accumulation is bounded by mid-run subprocess churn.
     """
+    if sys.platform != "linux":
+        return
     try:
         # CDLL(None) resolves against the already-loaded libc, so we don't hardcode
         # a SONAME (``libc.so.6`` is glibc-only; musl uses a different name).
         libc = ctypes.CDLL(None, use_errno=True)
+        # prctl(2) takes int + four unsigned longs; declare them so ctypes doesn't
+        # pass 32-bit c_int (undefined on LP64 arches like AArch64).
+        libc.prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+        libc.prctl.restype = ctypes.c_int
         if libc.prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
             errno = ctypes.get_errno()
             logger.warning(f"PR_SET_CHILD_SUBREAPER failed (errno={errno}); reparented workers may survive shutdown")
@@ -441,6 +450,24 @@ def _terminate_vllm_trees_in_parallel(watched: list[tuple["mp.Process", str]]) -
         t.join()
 
 
+def _signal_vllm(pid: int, sig: int) -> None:
+    """Signal the vLLM subprocess group, falling back to the bare PID.
+
+    After the child ``setsid()``s, ``pid == pgid`` so ``killpg`` reaches the whole
+    session. But if teardown races startup and fires before the child ran
+    ``setsid()``, no group with that id exists yet and ``killpg`` raises
+    ``ProcessLookupError`` — the child is then still a lone process in our group,
+    so signal it directly by PID (it has no workers yet). No-op if already gone.
+    """
+    try:
+        os.killpg(pid, sig)
+    except ProcessLookupError:
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            pass
+
+
 def _terminate_vllm_tree(vllm_proc: "mp.Process", *, label: str = "vLLM", grace: float = 10.0) -> None:
     """Graceful teardown of a vLLM subprocess and its session group.
 
@@ -457,17 +484,11 @@ def _terminate_vllm_tree(vllm_proc: "mp.Process", *, label: str = "vLLM", grace:
     """
     if not vllm_proc.is_alive() or vllm_proc.pid is None:
         return
-    pgid = vllm_proc.pid  # pid == pgid (the subprocess setsid'd)
+    pid = vllm_proc.pid  # pid == pgid once the subprocess has setsid'd
     logger.info(f"Terminating {label} subprocess group")
-    try:
-        os.killpg(pgid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
+    _signal_vllm(pid, signal.SIGTERM)
     vllm_proc.join(timeout=grace)
     if vllm_proc.is_alive():
         logger.warning(f"{label} did not exit in {grace:.0f}s; sending SIGKILL to process group")
-        try:
-            os.killpg(pgid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        _signal_vllm(pid, signal.SIGKILL)
         vllm_proc.join(timeout=5.0)

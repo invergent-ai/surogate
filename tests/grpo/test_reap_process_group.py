@@ -15,6 +15,7 @@ shows up in a recursive `children()` walk at shutdown, where it is reaped by PID
 import multiprocessing as mp
 import os
 import signal
+import sys
 import time
 from unittest import mock
 
@@ -25,6 +26,13 @@ from surogate.grpo.split import (
     _set_child_subreaper,
     _terminate_vllm_tree,
 )
+
+if sys.platform != "linux":
+    import pytest
+
+    # PR_SET_CHILD_SUBREAPER is Linux-only and these tests use the fork start
+    # method (unsupported on Windows), so the whole module is Linux-only.
+    pytest.skip("Linux-only tests", allow_module_level=True)
 
 
 def _signal_ready(ready) -> None:
