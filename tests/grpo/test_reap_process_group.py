@@ -2,52 +2,69 @@
 
 The vLLM subprocess `setsid()`s so its immediate tree shares one process group,
 but some workers (the vLLM `EngineCore`, the `multiprocessing.resource_tracker`)
-end up in the *main* process's group / reparented to PID 1, so a `killpg` on the
-vLLM group misses them. Shutdown must still leave nothing behind, else those
+end up outside that group, and when their parent dies mid-run they reparent to
+PID 1 — so a `killpg` on the vLLM group misses them and a plain child-tree walk
+can no longer find them. Shutdown must still leave nothing behind, else those
 workers linger orphaned and strand the run.
 
-The robust catch is a monitor thread that unions the descendant tree over the
-whole run: a worker whose parent dies mid-run reparents to PID 1 and vanishes
-from a one-shot teardown snapshot, but the monitor already recorded it while it
-was still a descendant, so it can be reaped by PID at shutdown.
+The catch is `PR_SET_CHILD_SUBREAPER`: the pipeline marks itself a subreaper at
+startup, so an orphaned descendant reparents to *it* instead of PID 1 and still
+shows up in a recursive `children()` walk at shutdown, where it is reaped by PID.
 """
 
 import multiprocessing as mp
 import os
 import signal
-import threading
 import time
-from threading import Thread
+from unittest import mock
 
 import psutil
 
 from surogate.grpo.split import (
-    _monitor_descendants,
     _reap_survivors,
-    _snapshot_descendants,
+    _set_child_subreaper,
     _terminate_vllm_tree,
 )
 
 
-def _escaped_stubborn():
-    """A worker that `setsid`s into its OWN group and ignores SIGTERM.
+def _signal_ready(ready) -> None:
+    if ready is not None:
+        ready.send(b"1")
+        ready.close()
 
-    Models the real orphans, which escape the vLLM session group so `killpg`
-    cannot reach them.
+
+def _escaped_stubborn(ready=None):
+    """A session leader that ignores SIGTERM, signalling once its handler is set.
+
+    Models both a real escaped orphan (own group, so `killpg` can't reach it)
+    and a hung vLLM leader that only SIGKILL can end. The readiness signal fires
+    *after* the SIG_IGN handler is installed, so a test never races SIGTERM
+    against an un-armed handler (which would let the process die on the default
+    disposition and pass without exercising the SIGKILL escalation).
     """
     os.setsid()
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    _signal_ready(ready)
     time.sleep(30)
 
 
-def _leader_with_ingroup_worker():
-    """A session leader whose forked worker stays in the group and ignores SIGTERM."""
+def _responsive_leader(ready=None):
+    """A vLLM-leader stand-in that exits on the default SIGTERM (the clean case)."""
     os.setsid()
-    if os.fork() == 0:
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        time.sleep(30)
-        os._exit(0)
+    _signal_ready(ready)
     time.sleep(30)
+
+
+def _start_ready(target):
+    """Fork-start ``target`` and block until it signals its setup is complete."""
+    ours, theirs = mp.Pipe()
+    proc = mp.get_context("fork").Process(target=target, args=(theirs,))
+    proc.start()
+    theirs.close()
+    assert ours.poll(timeout=5), "child never signalled ready"
+    ours.recv()
+    ours.close()
+    return proc
 
 
 def _group_alive(pgid: int) -> bool:
@@ -67,36 +84,66 @@ def _wait_group_gone(pgid: int, timeout: float = 5.0) -> bool:
     return False
 
 
+def _kill_tree(pid: int) -> None:
+    """Best-effort cleanup: SIGKILL a process and every descendant."""
+    try:
+        root = psutil.Process(pid)
+        procs = [root, *root.children(recursive=True)]
+    except psutil.NoSuchProcess:
+        return
+    for p in procs:
+        try:
+            p.kill()
+        except psutil.NoSuchProcess:
+            pass
+
+
 def test_reap_survivors_kills_processes_that_escaped_the_group():
-    procs = [mp.get_context("fork").Process(target=_escaped_stubborn) for _ in range(2)]
-    for p in procs:
-        p.start()
-    time.sleep(0.4)  # let them setsid + install the SIGTERM handler
-    snapshot = [psutil.Process(p.pid) for p in procs]
-    assert all(s.is_running() for s in snapshot), "precondition: workers should be alive"
+    procs = [_start_ready(_escaped_stubborn) for _ in range(2)]
+    try:
+        snapshot = [psutil.Process(p.pid) for p in procs]
+        assert all(s.is_running() for s in snapshot), "precondition: workers should be alive"
 
-    _reap_survivors(snapshot, grace=0.5)
+        _reap_survivors(snapshot, grace=0.5)
 
-    for p in procs:
-        p.join(timeout=5)
-        assert not p.is_alive(), "an escaped SIGTERM-ignoring worker must be reaped by PID"
+        for p in procs:
+            p.join(timeout=5)
+            assert not p.is_alive(), "an escaped SIGTERM-ignoring worker must be reaped by PID"
+    finally:
+        for p in procs:
+            _kill_tree(p.pid)
 
 
 def test_reap_survivors_is_a_noop_when_nothing_survives():
     _reap_survivors([], grace=0.5)  # must not raise
 
 
-def test_terminate_vllm_tree_reaps_a_worker_in_the_group():
-    proc = mp.get_context("fork").Process(target=_leader_with_ingroup_worker)
-    proc.start()
-    time.sleep(0.5)
-    pgid = proc.pid
-    assert _group_alive(pgid), "precondition: the group should be alive"
+def test_terminate_vllm_tree_sigterms_a_responsive_leader():
+    proc = _start_ready(_responsive_leader)
+    try:
+        pgid = proc.pid
+        assert _group_alive(pgid), "precondition: the group should be alive"
 
-    _terminate_vllm_tree(proc, grace=0.5)
+        _terminate_vllm_tree(proc, grace=0.5)  # SIGTERM alone should end a responsive leader
 
-    assert not proc.is_alive()
-    assert _wait_group_gone(pgid), "the in-group worker must be reaped; group must empty"
+        assert not proc.is_alive()
+        assert _wait_group_gone(pgid), "the group must empty on a clean SIGTERM exit"
+    finally:
+        _kill_tree(proc.pid)
+
+
+def test_terminate_vllm_tree_sigkills_a_stubborn_leader():
+    proc = _start_ready(_escaped_stubborn)  # ignores SIGTERM
+    try:
+        pgid = proc.pid
+        assert _group_alive(pgid), "precondition: the group should be alive"
+
+        _terminate_vllm_tree(proc, grace=0.5)  # SIGTERM ignored -> escalate to SIGKILL
+
+        assert not proc.is_alive(), "a leader that ignores SIGTERM must be SIGKILLed after the grace"
+        assert _wait_group_gone(pgid)
+    finally:
+        _kill_tree(proc.pid)
 
 
 def test_terminate_vllm_tree_is_a_noop_for_an_unstarted_process():
@@ -104,70 +151,57 @@ def test_terminate_vllm_tree_is_a_noop_for_an_unstarted_process():
     _terminate_vllm_tree(proc, grace=0.5)  # never started: pid is None -> early return
 
 
-def _forks_a_grandchild_then_exits(pipe):
-    """Child: fork a stubborn grandchild, report its pid, then exit.
+def test_set_child_subreaper_is_best_effort_when_prctl_unavailable():
+    # A platform without a usable libc (CDLL raises) must degrade, not crash.
+    with mock.patch("surogate.grpo.split.ctypes.CDLL", side_effect=OSError("no libc")):
+        _set_child_subreaper()  # must not raise
 
-    After this child exits the grandchild reparents to PID 1 and leaves the test
-    process's live descendant tree — the exact shape of the real vLLM spawn
-    worker (a multiprocessing spawn child of an EngineCore) that a one-shot
-    teardown snapshot misses because its parent has already died.
+
+def _subreaper_parent(pipe):
+    """Become a subreaper, then orphan a grandchild by exiting its parent.
+
+    Mirrors ``grpo_split``: after ``PR_SET_CHILD_SUBREAPER`` a grandchild whose
+    intermediate parent exits reparents to *this* process (the subreaper), not
+    PID 1 — so a recursive ``children()`` walk from here still finds it. Runs in
+    a forked subprocess so the prctl never touches the test runner itself.
     """
-    gpid = os.fork()
-    if gpid == 0:  # grandchild
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        time.sleep(30)
-        os._exit(0)
-    pipe.send(gpid)
+    _set_child_subreaper()
+    if os.fork() == 0:  # intermediate
+        gpid = os.fork()
+        if gpid == 0:  # grandchild
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            time.sleep(30)
+            os._exit(0)
+        pipe.send(gpid)
+        pipe.close()
+        os._exit(0)  # exit -> grandchild reparents to the subreaper (us)
     pipe.close()
-    time.sleep(0.6)  # stay alive long enough for the monitor to snapshot us
-    os._exit(0)  # exit -> grandchild reparents to PID 1
+    time.sleep(30)  # stay alive as the reaper
 
 
-def _alive_and_not_zombie(pid: int) -> bool:
+def _ppid_of(pid: int):
     try:
-        return psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+        return psutil.Process(pid).ppid()
     except psutil.NoSuchProcess:
-        return False
+        return None
 
 
-def test_snapshot_records_a_descendant_still_in_the_tree():
-    proc = mp.get_context("fork").Process(target=_escaped_stubborn)
-    proc.start()
-    time.sleep(0.3)
-    registry: dict = {}
-
-    _snapshot_descendants(registry)
-
-    assert any(k[0] == proc.pid for k in registry), "a live descendant must be recorded"
-    _reap_survivors([registry[k] for k in registry if k[0] == proc.pid], grace=0.5)
-    proc.join(timeout=5)
-    assert not proc.is_alive()
-
-
-def test_monitor_reaps_a_descendant_that_reparents_before_teardown():
+def test_child_subreaper_recaptures_a_reparented_grandchild():
     parent_conn, child_conn = mp.Pipe()
-    registry: dict = {}
-    stop = threading.Event()
-    monitor = Thread(target=_monitor_descendants, args=(registry, stop), kwargs={"interval": 0.1})
-    monitor.start()
+    parent = mp.get_context("fork").Process(target=_subreaper_parent, args=(child_conn,))
+    parent.start()
+    child_conn.close()  # only the subreaper subtree keeps the write end now
+    try:
+        assert parent_conn.poll(timeout=5), "subreaper child never reported the grandchild pid"
+        gpid = parent_conn.recv()  # grandchild pid, still under its intermediate
+        # once the intermediate exits, the orphan reparents to the subreaper
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and _ppid_of(gpid) not in (parent.pid, None):
+            time.sleep(0.05)
 
-    child = mp.get_context("fork").Process(target=_forks_a_grandchild_then_exits, args=(child_conn,))
-    child.start()
-    gpid = parent_conn.recv()  # grandchild pid, while both are still our descendants
-    child.join(timeout=5)  # child exits -> grandchild reparents to PID 1
-    time.sleep(0.2)
-    stop.set()
-    monitor.join(timeout=2)
-
-    # The grandchild left the live tree when its parent died, but the monitor
-    # recorded it earlier, so the union still holds it.
-    key = next((k for k in registry if k[0] == gpid), None)
-    assert key is not None, "monitor must record a descendant before it reparents to PID 1"
-    assert _alive_and_not_zombie(gpid), "precondition: grandchild should still be alive"
-
-    _reap_survivors([registry[key]], grace=0.5)
-
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline and _alive_and_not_zombie(gpid):
-        time.sleep(0.1)
-    assert not _alive_and_not_zombie(gpid), "a reparented descendant must still be reaped"
+        assert _ppid_of(gpid) == parent.pid, "orphan must reparent to the subreaper, not PID 1"
+        found = {p.pid for p in psutil.Process(parent.pid).children(recursive=True)}
+        assert gpid in found, "recursive children() walk must find the reparented orphan"
+    finally:
+        _kill_tree(parent.pid)
+        parent.join(timeout=5)
