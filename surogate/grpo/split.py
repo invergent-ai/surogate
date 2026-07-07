@@ -30,6 +30,8 @@ import signal
 import threading
 from threading import Thread
 
+import psutil
+
 from surogate.core.config.grpo_inference_config import GRPOInferenceConfig
 from surogate.core.config.grpo_orch_config import GRPOOrchestratorConfig
 from surogate.grpo.config import GRPOTrainConfig
@@ -215,6 +217,21 @@ def grpo_split(
     )
     watchdog_thread.start()
 
+    # Record every subprocess descendant over the whole run. vLLM's spawn workers
+    # can reparent to PID 1 when their parent dies mid-run, escaping both a
+    # teardown-time tree walk and a killpg on the vLLM session group; the union
+    # gathered here lets the finally block reap them by PID. Only genuine
+    # descendants are recorded, so the reap never touches the launching shell.
+    descendants: dict[tuple[int, float], psutil.Process] = {}
+    monitor_stop = threading.Event()
+    monitor_thread = Thread(
+        target=_monitor_descendants,
+        args=(descendants, monitor_stop),
+        daemon=True,
+        name="grpo-descendant-monitor",
+    )
+    monitor_thread.start()
+
     try:
         from surogate.grpo.orchestrator.grpo_orch import orchestrate
 
@@ -236,8 +253,15 @@ def grpo_split(
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
+        # Stop tracking and take the accumulated union of everything we ever
+        # spawned. The monitor's final snapshot already ran; this is just the
+        # handoff of the recorded set to the reaper below.
+        monitor_stop.set()
+        monitor_thread.join(timeout=2.0)
+
         # Reap vLLMs in parallel — each can take up to 15s on SIGTERM→SIGKILL escalation.
-        # Sequential teardown would double that on a typical RULER topology.
+        # Sequential teardown would double that on a typical RULER topology. This is the
+        # graceful path: killpg lets each vLLM session release its GPU cleanly.
         _terminate_vllm_trees_in_parallel(watched_vllms)
 
         # Trainer runs as a daemon thread; a brief join lets it flush logs, after
@@ -247,6 +271,13 @@ def grpo_split(
             logger.warning("Trainer thread still running; will exit with the process")
 
         watchdog_thread.join(timeout=2.0)
+
+        # Reap anything the graceful teardown left behind. The monitored union
+        # holds every worker we ever spawned — including spawn workers that
+        # reparented to PID 1 (so a tree walk can't find them) and workers outside
+        # the vLLM session group (so killpg can't reach them) — which would
+        # otherwise linger orphaned and strand the run.
+        _reap_survivors(list(descendants.values()))
 
 
 def _spawn_vllm(
@@ -328,6 +359,73 @@ def _validate_judge_args(
         )
 
 
+def _snapshot_descendants(registry: dict[tuple[int, float], "psutil.Process"]) -> None:
+    """Union the current subprocess tree into ``registry``.
+
+    Keyed by ``(pid, create_time)`` so a recycled PID is a distinct entry and a
+    dead worker's snapshot is never confused with a new process reusing its PID
+    (``psutil.Process`` compares identity on the same pair, so ``is_running``
+    later stays honest). Called repeatedly by the monitor so a worker that dies
+    out of the *live* tree — its parent exits mid-run and it reparents to PID 1 —
+    is still remembered for reaping.
+    """
+    try:
+        children = psutil.Process().children(recursive=True)
+    except psutil.NoSuchProcess:
+        return
+    for child in children:
+        try:
+            registry[(child.pid, child.create_time())] = child
+        except psutil.NoSuchProcess:
+            pass
+
+
+def _monitor_descendants(
+    registry: dict[tuple[int, float], "psutil.Process"],
+    stop_event: "threading.Event",
+    *,
+    interval: float = 1.0,
+) -> None:
+    """Continuously record every subprocess descendant until ``stop_event``.
+
+    A single teardown-time snapshot misses workers that already reparented to
+    PID 1 (their parent died mid-run) and so left the live descendant tree — the
+    vLLM spawn workers that strand a run. Accumulating the tree over the whole
+    run and reaping the union on shutdown catches them where a one-shot snapshot
+    or a ``killpg`` on the vLLM session group cannot. Only ever records genuine
+    descendants, so the reap can never touch the launching shell or a sibling.
+    """
+    while not stop_event.is_set():
+        _snapshot_descendants(registry)
+        stop_event.wait(interval)
+    _snapshot_descendants(registry)  # final catch just before teardown
+
+
+def _reap_survivors(procs: list["psutil.Process"], *, grace: float = 5.0) -> None:
+    """SIGTERM then SIGKILL any of ``procs`` still alive, addressing them by PID.
+
+    ``procs`` is a snapshot of the subprocess tree taken while it was intact.
+    Killing by PID reaches workers that escaped the vLLM session group (so
+    ``killpg`` missed them) and have since reparented to PID 1 — which a process
+    group or live tree walk can no longer find.
+    """
+    alive = [p for p in procs if p.is_running()]
+    if not alive:
+        return
+    for p in alive:
+        try:
+            p.terminate()
+        except psutil.NoSuchProcess:
+            pass
+    _, still_alive = psutil.wait_procs(alive, timeout=grace)
+    for p in still_alive:
+        logger.warning(f"Force-killing leftover subprocess pid={p.pid} ({p.name()})")
+        try:
+            p.kill()
+        except psutil.NoSuchProcess:
+            pass
+
+
 def _terminate_vllm_trees_in_parallel(watched: list[tuple["mp.Process", str]]) -> None:
     """SIGTERM all vLLM subprocesses concurrently and wait for them in parallel.
 
@@ -350,21 +448,29 @@ def _terminate_vllm_trees_in_parallel(watched: list[tuple["mp.Process", str]]) -
         t.join()
 
 
-def _terminate_vllm_tree(vllm_proc: "mp.Process", *, label: str = "vLLM") -> None:
-    """SIGTERM the vLLM process group, escalate to SIGKILL if it doesn't exit."""
+def _terminate_vllm_tree(vllm_proc: "mp.Process", *, label: str = "vLLM", grace: float = 10.0) -> None:
+    """Tear down a vLLM subprocess and its whole session group.
+
+    The subprocess ``setsid()``s so its engine workers share its process group.
+    We SIGTERM the group, wait ``grace`` for a clean exit (``join`` returns early
+    once the leader dies and reaps its zombie), then SIGKILL the *whole group*
+    unconditionally. The leader can exit on SIGTERM while its ``EngineCore`` /
+    ``multiprocessing`` ``resource_tracker`` workers linger in the group; the old
+    code only escalated to SIGKILL when the *leader* was still alive, leaving
+    those workers orphaned to strand the run. The final SIGKILL is a no-op when
+    the group is already empty.
+    """
     if not vllm_proc.is_alive() or vllm_proc.pid is None:
         return
-    pgid = vllm_proc.pid  # vllm_proc called setsid() so its pid == its pgid
+    pgid = vllm_proc.pid  # pid == pgid (the subprocess setsid'd)
     logger.info(f"Terminating {label} subprocess group")
     try:
         os.killpg(pgid, signal.SIGTERM)
     except ProcessLookupError:
         pass
-    vllm_proc.join(timeout=10.0)
-    if vllm_proc.is_alive():
-        logger.warning(f"{label} did not exit in 10s; sending SIGKILL to process group")
-        try:
-            os.killpg(pgid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        vllm_proc.join(timeout=5.0)
+    vllm_proc.join(timeout=grace)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    vllm_proc.join(timeout=5.0)
