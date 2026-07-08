@@ -78,18 +78,18 @@ subtasks = ["Understand the question and provide an initial solution to approxim
 access_list = [[], [], ["all"], ["all"]]
 
 EXAMPLE 3:
-Question: A heartbroken dog whose owner died two months ago attends services every day at the church where her funeral was held. [passage continues] The dog Tommy still goes to the church every day to _. Options: A. attend his owner's funeral B. wait for Lochi to come back C. stay together with Lochi D. celebrate Mass with Father Panna
-Assistant Response: This is a straightforward comprehension and recall task from the given text, so we only need one model to do that: comprehend the story, deduce Tommy's reason for going to the church, and output the most accurate answer.
-model_id = [3]
-subtasks = ["Deduce from the story provided in the user question why Tommy still goes to the church every day, choosing the most appropriate option among the given choices A, B, C, and D. Provide the option letter in <answer> tags, for example <answer>B</answer>."]
-access_list = [[]]
+Question: Using the numbers [3, 7, 25, 50] and the operations +, -, *, / with each number used at most once, write an arithmetic expression that evaluates exactly to 475. Provide the final expression in <answer> </answer> tags.
+Assistant Response: This is a search problem over a small space, so a long pipeline adds little. One strong model can search for a valid expression, and a second model can independently verify the arithmetic and the number-usage constraint before formatting the answer.
+model_id = [0, 3]
+subtasks = ["Find an arithmetic expression that uses each of the numbers 3, 7, 25 and 50 at most once and evaluates exactly to 475. Search systematically, for example by building large products first and adjusting with the remaining numbers. Show your search in <idea> </idea> tags.", "Verify that the proposed expression evaluates exactly to 475 and uses each allowed number at most once. Fix it if it is wrong, then provide the final expression in <answer> </answer> tags."]
+access_list = [[], ["all"]]
 
 EXAMPLE 4:
-Question: You are given a weighted simple connected undirected graph with N vertices and M edges, and a positive integer K. For a spanning tree T, the cost of T is the sum, modulo K, of the weights of its edges. Find the minimum cost of a spanning tree of this graph. The input is given from Standard Input. Print the answer.
-Assistant Response: This is a hard problem, so let us use all five workflow steps: the first model understands the problem and defines the objectives, the second analyzes the graph structure, the third determines the strategy for the minimum-cost spanning tree, the fourth implements it in Python, and the final model validates the implementation.
-model_id = [1, 2, 0, 3, 2]
-subtasks = ["Understand the problem statement and goals. Define what needs to be done to solve the given problem.", "Analyze the graph structure and the constraints to identify key steps in the algorithm for solving the given problem.", "Develop a strategy to find the minimum cost of a spanning tree with costs computed modulo K. Ensure the strategy can handle the input constraints.", "Implement the strategy in a Python function to solve the problem as defined, ensuring all constraints are met.", "Validate and test the Python implementation to ensure the solution is accurate and meets all requirements."]
-access_list = [[], ["all"], ["all"], ["all"], ["all"]]'''
+Question: Using the numbers [2, 5, 8, 9, 75] and the operations +, -, *, / with each number used at most once, write an arithmetic expression that evaluates exactly to 632. Provide the final expression in <answer> </answer> tags.
+Assistant Response: The target is far from any single product, so I will run two searchers independently so they cannot anchor on each other's partial attempts, have a third model compare their candidates, a fourth model re-check only the chosen expression's arithmetic in isolation, and a final model format the result.
+model_id = [2, 0, 1, 3, 2]
+subtasks = ["Search for an arithmetic expression using each of the numbers 2, 5, 8, 9, 75 at most once that evaluates exactly to 632. Consider anchoring on multiples of 75 or 8 and adjusting with the smaller numbers. Show your search in <idea> </idea> tags.", "Search for an arithmetic expression using each of the numbers 2, 5, 8, 9, 75 at most once that evaluates exactly to 632. Consider anchoring on multiples of 75 or 8 and adjusting with the smaller numbers. Show your search in <idea> </idea> tags.", "Compare the two candidate expressions, check which ones satisfy the target and the usage constraint, and choose the best verified candidate.", "Re-compute the chosen expression step by step in isolation and confirm it equals exactly 632 and respects the usage constraint.", "Provide the final expression in <answer> </answer> tags according to the question's formatting instructions."]
+access_list = [[], [], ["all"], [3], ["all"]]'''
 
 
 def _system_prompt(max_workflow_steps: int) -> str:
@@ -604,6 +604,101 @@ def ultra_redundancy_penalty(state: dict[str, Any]) -> float:
     return float(state.get("_ultra_redundancy_penalty", 0.0))
 
 
+# --- Stage-2 multi-turn (recursion-lite, report 3.2.2): plan -> execute+feedback -> repair-plan ---
+# Validated at inference 2026-07-08: the UNTRAINED turn-2 loop converted fu1 failures on both
+# fshard runs (fu2 0.923 vs best premium solo 0.846). This env trains exactly that behavior.
+
+_MT_REVISE_INSTRUCTION = (
+    "The workflow above was executed and its final answer was evaluated as INCORRECT.\n"
+    "Outcome of the previous attempt:\n{outcome}\n\n"
+    "Using what the previous attempt revealed, design a NEW workflow that diagnoses the error and "
+    "produces a correct solution to the original question. Output the three lists as before."
+)
+
+
+async def _mt_score_last_turn(runtime: UltraPilotRuntime, state: dict[str, Any]) -> dict[str, Any]:
+    """Score the most recent conductor turn via the SAME runtime.score path as single-turn
+    training (identical reward semantics: execution, cache, penalties, validity flags).
+    Appends a turn record + inter-workflow shared memory (report 3.2.2)."""
+    turn_state: dict[str, Any] = {}
+    raw = _completion_text(state["trajectory"][-1]["completion"])
+    reward = await runtime.score(raw, _info_dict(state.get("info")), turn_state)
+    record = turn_state.get("_ultra_record") or {}
+    steps = (record.get("execution") or {}).get("steps") or []
+    if steps:
+        outcome = str(steps[-1].get("text", ""))[:1500]
+    else:
+        outcome = f"(no executed steps: {turn_state.get('_ultra_failure_class') or 'unparseable workflow'})"
+    rec = {
+        "reward": float(reward),
+        "success": bool(turn_state.get("_ultra_grade_success", False)),
+        "turn_state": turn_state,
+        "outcome_text": outcome,
+    }
+    state.setdefault("turn_records", []).append(rec)
+    state.setdefault("shared_memory", []).append(outcome)
+    return rec
+
+
+async def ultra_mt_reward(
+    completion: Any, info: Any, state: dict[str, Any], ultra_runtime: UltraPilotRuntime
+) -> float:
+    """Terminal reward = the LAST executed turn's reward. env_response scores every turn
+    except the final generated one (unless the rollout early-exited on success) — score it
+    here. Also surfaces the terminal turn's flags at rollout level so the 0-weight metric
+    funcs (ultra_valid_for_training etc.) read the same keys as in the single-turn env."""
+    del completion, info
+    records = state.get("turn_records") or []
+    if len(records) < len(state.get("trajectory") or []):
+        await _mt_score_last_turn(ultra_runtime, state)
+        records = state["turn_records"]
+    if not records:
+        return 0.0
+    last = records[-1]["turn_state"]
+    for key in (
+        "_ultra_record", "_ultra_outcome_class", "_ultra_valid_for_training",
+        "_ultra_workflow_parse_valid", "_ultra_grade_success", "_ultra_failure_class",
+        "_ultra_workflow_cache_hit", "_ultra_redundancy_penalty",
+    ):
+        if key in last:
+            state[key] = last[key]
+    return float(records[-1]["reward"])
+
+
+def ultra_mt_turns(state: dict[str, Any]) -> float:
+    return float(len(state.get("turn_records") or []))
+
+
+def ultra_mt_converted(state: dict[str, Any]) -> float:
+    """1.0 when turn-1 failed and a later repair turn succeeded — the trained behavior."""
+    records = state.get("turn_records") or []
+    return 1.0 if len(records) >= 2 and not records[0]["success"] and records[-1]["success"] else 0.0
+
+
+class FuguUltraMultiTurnEnv(vf.MultiTurnEnv):
+    """Recursion-lite conductor env: turn 0 plans; env_response executes + grades it; on failure
+    the outcome comes back as a revise turn (intra-workflow isolation stays inside
+    execute_workflow via access lists; inter-workflow memory = state["shared_memory"]).
+    Early-terminates on success via final_env_response; max_turns bounds the loop."""
+
+    def __init__(self, *, ultra_runtime: UltraPilotRuntime, **kwargs):
+        super().__init__(**kwargs)
+        self.ultra_runtime = ultra_runtime
+
+    async def setup_state(self, state: dict[str, Any]) -> dict[str, Any]:
+        state.setdefault("turn_records", [])
+        state.setdefault("shared_memory", [])
+        return state
+
+    async def env_response(self, messages: Any, state: dict[str, Any], **kwargs) -> Any:
+        del messages, kwargs
+        rec = await _mt_score_last_turn(self.ultra_runtime, state)
+        if rec["success"]:
+            state["final_env_response"] = [{"role": "user", "content": "Solved."}]
+            return [{"role": "user", "content": "Solved."}]
+        return [{"role": "user", "content": _MT_REVISE_INSTRUCTION.format(outcome=rec["outcome_text"])}]
+
+
 def _build_pool(
     *,
     pilot_config: dict[str, Any],
@@ -749,8 +844,12 @@ def load_environment(
     score_rollouts: bool = True,
     max_seq_len: int | None = None,
     replay_seed_manifest: str | None = None,
+    max_turns: int = 1,
 ) -> vf.Environment:
-    """Load the frozen Ultra pilot as a Verifiers SingleTurnEnv."""
+    """Load the frozen Ultra pilot as a Verifiers SingleTurnEnv.
+
+    ``max_turns > 1`` loads the Stage-2 multi-turn variant instead (plan -> execute+feedback ->
+    repair-plan; terminal reward = last executed turn). Single-turn lanes are untouched."""
 
     pilot_path = Path(pilot_config_path).expanduser().resolve()
     task_path = Path(task_manifest_path).expanduser().resolve()
@@ -815,6 +914,40 @@ def load_environment(
         force_step_budget=force_step_budget,
         replay_outcomes=replay_outcomes,
     )
+    env_args = {
+        "pilot_config_path": str(pilot_path),
+        "task_manifest_path": str(task_path),
+        "task_name": task_name,
+        "lane": lane,
+        "max_examples": max_examples,
+        "provider_mode": provider_mode,
+        "allow_yunwu_live": allow_yunwu_live,
+        "live_safety_path": live_safety_path,
+        "live_safety": safety_report,
+    }
+    if max_turns > 1:
+        mt_rubric = vf.Rubric(
+            funcs=[
+                ultra_mt_reward,
+                ultra_valid_for_training,
+                ultra_workflow_parse_valid,
+                ultra_grade_success,
+                ultra_mt_turns,
+                ultra_mt_converted,
+            ],
+            weights=[1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        )
+        mt_rubric.add_class_object("ultra_runtime", runtime)
+        return FuguUltraMultiTurnEnv(
+            ultra_runtime=runtime,
+            max_turns=max_turns,
+            dataset=dataset,
+            rubric=mt_rubric,
+            score_rollouts=score_rollouts,
+            max_seq_len=max_seq_len,
+            env_args={**env_args, "max_turns": max_turns},
+        )
+
     rubric = vf.Rubric(
         funcs=[
             ultra_workflow_reward,
@@ -833,17 +966,7 @@ def load_environment(
         rubric=rubric,
         score_rollouts=score_rollouts,
         max_seq_len=max_seq_len,
-        env_args={
-            "pilot_config_path": str(pilot_path),
-            "task_manifest_path": str(task_path),
-            "task_name": task_name,
-            "lane": lane,
-            "max_examples": max_examples,
-            "provider_mode": provider_mode,
-            "allow_yunwu_live": allow_yunwu_live,
-            "live_safety_path": live_safety_path,
-            "live_safety": safety_report,
-        },
+        env_args=env_args,
     )
     env.ultra_runtime = runtime
     return env

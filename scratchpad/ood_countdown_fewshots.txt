@@ -1,0 +1,27 @@
+PAPER-EXACT FEW-SHOT SET (Medreason x1 + DeepMath x1 + Countdown x2): keep our EXAMPLE 1
+and EXAMPLE 2 unchanged; replace EXAMPLE 3 (story) and EXAMPLE 4 (spanning-tree code) with
+the two Countdown examples below. Diversity engineered deliberately (the 24/24 [1,2,3]
+monoculture proves the current set collapsed exploration): openers are models 0 and 2 (three
+of four current examples open with 1), one SHORT chain + one LONG chain, an independent
+no-access duo, and a selective (non-"all") access demo. Targets verified solvable:
+475 = 50*(7+3)-25 ; 632 = (75+9-5)*8.
+
+EXAMPLE 3:
+
+Question: Using the numbers [3, 7, 25, 50] and the operations +, -, *, / with each number used at most once, write an arithmetic expression that evaluates exactly to 475. Provide the final expression in <answer> </answer> tags.
+
+Assistant Response: This is a search problem over a small space, so a long pipeline adds little. One strong model can search for a valid expression, and a second model can independently verify the arithmetic and the number-usage constraint before formatting the answer.
+
+model_id = [0, 3]
+subtasks = ["Find an arithmetic expression that uses each of the numbers 3, 7, 25 and 50 at most once and evaluates exactly to 475. Search systematically, for example by building large products first and adjusting with the remaining numbers. Show your search in <idea> </idea> tags.", "Verify that the proposed expression evaluates exactly to 475 and uses each allowed number at most once. Fix it if it is wrong, then provide the final expression in <answer> </answer> tags."]
+access_list = [[], ["all"]]
+
+EXAMPLE 4:
+
+Question: Using the numbers [2, 5, 8, 9, 75] and the operations +, -, *, / with each number used at most once, write an arithmetic expression that evaluates exactly to 632. Provide the final expression in <answer> </answer> tags.
+
+Assistant Response: The target is far from any single product, so I will run two searchers independently so they cannot anchor on each other's partial attempts, have a third model compare their candidates, a fourth model re-check only the chosen expression's arithmetic in isolation, and a final model format the result.
+
+model_id = [2, 0, 1, 3, 2]
+subtasks = ["Search for an arithmetic expression using each of the numbers 2, 5, 8, 9, 75 at most once that evaluates exactly to 632. Consider anchoring on multiples of 75 or 8 and adjusting with the smaller numbers. Show your search in <idea> </idea> tags.", "Search for an arithmetic expression using each of the numbers 2, 5, 8, 9, 75 at most once that evaluates exactly to 632. Consider anchoring on multiples of 75 or 8 and adjusting with the smaller numbers. Show your search in <idea> </idea> tags.", "Compare the two candidate expressions, check which ones satisfy the target and the usage constraint, and choose the best verified candidate.", "Re-compute the chosen expression step by step in isolation and confirm it equals exactly 632 and respects the usage constraint.", "Provide the final expression in <answer> </answer> tags according to the question's formatting instructions."]
+access_list = [[], [], ["all"], [3], ["all"]]

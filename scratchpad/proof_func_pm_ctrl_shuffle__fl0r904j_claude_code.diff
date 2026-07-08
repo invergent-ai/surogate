@@ -1,0 +1,19 @@
+diff --git a/autograd/numpy/numpy_vjps.py b/autograd/numpy/numpy_vjps.py
+index 1b3c809..5c786fb 100644
+--- a/autograd/numpy/numpy_vjps.py
++++ b/autograd/numpy/numpy_vjps.py
+@@ -566,13 +566,13 @@ def matmul_adjoint_0(B, G, A_meta, B_ndim):
+         G = anp.expand_dims(G, anp.ndim(G) - 1)
+     if anp.ndim(G) == 0:  # A_ndim == B_ndim == 1
+         return unbroadcast(G * B, A_meta)
+-    return unbroadcast(result, A_meta)
+     if B_ndim == 1:  # The result we need is an outer product
+         B = anp.expand_dims(B, 0)
+         G = anp.expand_dims(G, anp.ndim(G))
+     else:  # We need to swap the last two axes of B
+         B = anp.swapaxes(B, B_ndim - 2, B_ndim - 1)
+     result = anp.matmul(G, B)
++    return unbroadcast(result, A_meta)
+ 
+ def matmul_adjoint_1(A, G, A_ndim, B_meta):
+     if anp.ndim(G) == 0:  # A_ndim == B_ndim == 1

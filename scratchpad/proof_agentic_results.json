@@ -1,0 +1,62 @@
+[
+ {
+  "task": "tkrajina__gpxpy.09fc46b3.func_basic__nbj15me4",
+  "arm": "opencode_glm",
+  "resolved": 0.0,
+  "agent_s": 600,
+  "grade_s": 0,
+  "files": 0,
+  "plus": 0,
+  "minus": 0,
+  "meta": {
+   "status": "timeout"
+  }
+ },
+ {
+  "task": "tkrajina__gpxpy.09fc46b3.func_basic__nbj15me4",
+  "arm": "claude_code",
+  "resolved": 0.0,
+  "agent_s": 341,
+  "grade_s": 0,
+  "files": 0,
+  "plus": 0,
+  "minus": 0,
+  "meta": {
+   "status": "ok",
+   "rc": 1,
+   "turns": 31,
+   "cost_usd": 2.22246725,
+   "is_error": true
+  }
+ },
+ {
+  "task": "HIPS__autograd.ac044f0d.func_pm_ctrl_shuffle__fl0r904j",
+  "arm": "opencode_glm",
+  "resolved": 0.0,
+  "agent_s": 69,
+  "grade_s": 28,
+  "files": 1,
+  "plus": 1,
+  "minus": 1,
+  "meta": {
+   "status": "ok"
+  }
+ },
+ {
+  "task": "HIPS__autograd.ac044f0d.func_pm_ctrl_shuffle__fl0r904j",
+  "arm": "claude_code",
+  "resolved": 0.0,
+  "agent_s": 38,
+  "grade_s": 29,
+  "files": 1,
+  "plus": 1,
+  "minus": 1,
+  "meta": {
+   "status": "ok",
+   "rc": 0,
+   "turns": 7,
+   "cost_usd": 0.370114,
+   "is_error": false
+  }
+ }
+]

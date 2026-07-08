@@ -76,18 +76,38 @@ class OpenRouterProvider:
     async def complete(
         self, model: str, messages: list[Message], sampling: Sampling
     ) -> Completion:
+        from openai import NOT_GIVEN
+
         extra = {"usage": {"include": True}}
         routing = self._provider_routing(model)
         if routing is not None:
             extra["provider"] = routing
-        if sampling.reasoning_effort is not None:
+        # OpenAI-native reasoning models (gpt-5.x, reached via Yunwu -- GPT never routes
+        # through OpenRouter) ignore max_tokens AND the OpenRouter-style reasoning object,
+        # reasoning unbounded to a ~20k internal ceiling (observed 2026-07-06: 6.7M excess
+        # tokens billed invisibly). They require max_completion_tokens + top-level
+        # reasoning_effort instead.
+        openai_native_reasoning = model.startswith("gpt-")
+        if openai_native_reasoning:
+            # effort flag ONLY -- no token-cap param: Yunwu doesn't enforce caps for these
+            # models anyway (probe 2026-07-06: mct=1024 -> 4559 tok), and sending
+            # max_completion_tokens ALONGSIDE reasoning_effort can make the API ignore the
+            # effort flag entirely (documented gpt-5.x interaction bug).
+            if sampling.reasoning_effort is not None:
+                extra["reasoning_effort"] = sampling.reasoning_effort
+            # Streaming with a client-side wall-clock budget is the ONLY enforceable cap:
+            # these models reason ADAPTIVELY (per Yunwu docs) BEFORE the first visible token,
+            # to ~20k tokens on brutal prompts regardless of parameters. Disconnecting stops
+            # server-side generation and billing at that point.
+            return await self._complete_streaming_budget(model, messages, sampling, extra)
+        elif sampling.reasoning_effort is not None:
             extra["reasoning"] = {"effort": sampling.reasoning_effort}
         resp = await self._client.chat.completions.create(
             model=model,
             messages=messages,
             temperature=sampling.temperature,
             top_p=sampling.top_p,
-            max_tokens=sampling.max_tokens,
+            max_tokens=NOT_GIVEN if openai_native_reasoning else sampling.max_tokens,
             seed=sampling.seed,
             extra_body=extra,
         )
@@ -114,14 +134,104 @@ class OpenRouterProvider:
             finish_reason=getattr(choice, "finish_reason", None),
         )
 
+    async def _complete_streaming_budget(
+        self, model: str, messages: list[Message], sampling: Sampling, extra: dict
+    ) -> Completion:
+        """Streamed completion with wall-clock budgets (adaptive-reasoning models only).
+
+        first-token deadline bounds the silent reasoning phase (probe: healthy minimal
+        calls reach first token in ~25-30 s; blowouts sit silent for minutes); the total
+        ceiling bounds pathological streams. An abort returns a normal truncated
+        Completion (finish_reason='abort_budget') so the retry ladder does NOT re-burn it.
+        Budgets are env-tunable: ULTRA_GPT_FIRST_TOKEN_S / ULTRA_GPT_TOTAL_S."""
+        import os
+        import time
+
+        import asyncio
+
+        first_token_s = float(os.environ.get("ULTRA_GPT_FIRST_TOKEN_S", "120"))
+        total_s = float(os.environ.get("ULTRA_GPT_TOTAL_S", "240"))
+        t0 = time.monotonic()
+        text_parts: list[str] = []
+        finish_reason = None
+        prompt_tokens = completion_tokens = 0
+        got_first = False
+        stream = None
+        try:
+            # HARD outer deadline: the per-chunk budget checks below only run when chunks
+            # ARRIVE — a completely silent stream (observed 2026-07-06: zombie gpt calls
+            # froze the whole 12-wide lane for ~1 h) would otherwise hang forever, dodging
+            # both the chunk checks and the client read-timeout.
+            async with asyncio.timeout(total_s + 30):
+                stream = await self._client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=sampling.temperature,
+                    top_p=sampling.top_p,
+                    seed=sampling.seed,
+                    stream=True,
+                    stream_options={"include_usage": True},
+                    extra_body=extra,
+                )
+                async for chunk in stream:
+                    now = time.monotonic() - t0
+                    if chunk.choices:
+                        delta = chunk.choices[0].delta
+                        if delta is not None and delta.content:
+                            got_first = True
+                            text_parts.append(delta.content)
+                        fr = getattr(chunk.choices[0], "finish_reason", None)
+                        if fr:
+                            finish_reason = fr
+                    usage = getattr(chunk, "usage", None)
+                    if usage is not None:
+                        prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
+                        completion_tokens = getattr(usage, "completion_tokens", 0) or 0
+                    if (not got_first and now > first_token_s) or now > total_s:
+                        finish_reason = "abort_budget"
+                        break
+        except (TimeoutError, asyncio.TimeoutError):
+            finish_reason = "abort_budget"
+        except Exception:
+            # a broken stream with partial text is still a valid (truncated) completion;
+            # with none it degrades to an empty wrong answer rather than a retry-burn
+            if finish_reason is None:
+                finish_reason = "stream_error"
+        finally:
+            if stream is not None:
+                try:
+                    async with asyncio.timeout(5):
+                        await stream.close()
+                except Exception:
+                    pass
+        return Completion(
+            text="".join(text_parts),
+            model=model,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            cost_usd=0.0,
+            finish_reason=finish_reason,
+        )
+
     async def complete_tools(
         self, model: str, messages: list, tools: list, sampling: Sampling
     ) -> ToolCompletion:
+        from openai import NOT_GIVEN
+
         extra = {"usage": {"include": True}}
         routing = self._provider_routing(model)
         if routing is not None:
             extra["provider"] = routing
-        if sampling.reasoning_effort is not None:
+        # same OpenAI-native reasoning-model handling as complete() (see comment there)
+        openai_native_reasoning = model.startswith("gpt-")
+        if openai_native_reasoning:
+            # effort flag ONLY -- no token-cap param: Yunwu doesn't enforce caps for these
+            # models anyway (probe 2026-07-06: mct=1024 -> 4559 tok), and sending
+            # max_completion_tokens ALONGSIDE reasoning_effort can make the API ignore the
+            # effort flag entirely (documented gpt-5.x interaction bug).
+            if sampling.reasoning_effort is not None:
+                extra["reasoning_effort"] = sampling.reasoning_effort
+        elif sampling.reasoning_effort is not None:
             extra["reasoning"] = {"effort": sampling.reasoning_effort}
         resp = await self._client.chat.completions.create(
             model=model,
@@ -129,7 +239,7 @@ class OpenRouterProvider:
             tools=tools,
             tool_choice="auto",
             temperature=sampling.temperature,
-            max_tokens=sampling.max_tokens,
+            max_tokens=NOT_GIVEN if openai_native_reasoning else sampling.max_tokens,
             extra_body=extra,
         )
         msg = resp.choices[0].message

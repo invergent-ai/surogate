@@ -322,6 +322,49 @@ def contains_all_absent(output: str, solution: Any) -> float:
     return 1.0
 
 
+def _rlpr_norm(s: str) -> str:
+    """Lenient normalization for RLPR/WebInstruct short answers: strips boxes, LaTeX
+    wrappers, units, currency and thousands separators; canonicalizes scientific
+    notation so '2.97e5 N/m^2' == '2.97 \\times 10^5 \\text{ N/m}^2' == '297000'."""
+    s = str(s)
+    boxed = re.findall(r"\\boxed\{(.*?)\}(?!\})", s, re.S)
+    if boxed:
+        s = boxed[-1]
+    s = s.replace("\\times", " x ").replace("×", " x ")
+    s = re.sub(r"\\text\{[^}]*\}", " ", s)
+    s = re.sub(r"\\[a-zA-Z]+", " ", s)
+    s = s.replace("\\", " ").replace("$", " ").replace(",", "")
+    s = s.replace("{", " ").replace("}", " ")
+    s = re.sub(
+        r"(?i)\b(g/mol|n/m\^?2?|days?|dollars?|usd|m/s\^?2?|kg|mol|atm|joules?|percent)\b",
+        " ", s)
+    s = s.replace("%", "")
+    s = re.sub(r"\s\^-?\d+", " ", s)  # orphan unit exponents left behind (e.g. 'N/m}^2')
+    s = re.sub(r"\s+", "", s).lower().rstrip(".")
+    t = s.replace("x10^", "e").replace("*10^", "e")
+    try:
+        return f"{float(t):.6g}"
+    except (ValueError, OverflowError):
+        return s
+
+
+def rlpr_lenient(output: str, solution: Any) -> float:
+    """Numeric-tolerant (2%) lenient match for RLPR reference answers. Tries the strict
+    math grader first so anything it already accepts stays accepted."""
+    if math_equal(output, solution) >= 1.0:
+        return 1.0
+    a, g = _rlpr_norm(output), _rlpr_norm(str(solution))
+    if not a or not g:
+        return 0.0
+    if a == g:
+        return 1.0
+    try:
+        fa, fg = float(a), float(g)
+        return 1.0 if abs(fa - fg) <= 0.02 * max(abs(fg), 1e-9) else 0.0
+    except ValueError:
+        return 1.0 if (g in a or a in g) else 0.0
+
+
 REGISTRY: dict[str, Grader] = {
     "gsm8k_exact": gsm8k_exact,
     "math_equal": math_equal,
@@ -331,6 +374,7 @@ REGISTRY: dict[str, Grader] = {
     "grid_exact": grid_exact,
     "contains": contains,
     "contains_all_absent": contains_all_absent,
+    "rlpr_lenient": rlpr_lenient,
 }
 
 

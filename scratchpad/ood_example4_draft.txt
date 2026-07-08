@@ -1,0 +1,15 @@
+REPLACEMENT FOR _FEWSHOT_EXAMPLES "EXAMPLE 4" (the in-distribution spanning-tree/Python one).
+Domain: physical geography / science explanation (multiple choice) — absent from all four
+training datasets (Omni-MATH, reasoning-gym, TACO, LiveCodeBench). Preserves the 5-step
+long-chain demo, the independent-start, the verify step, and the dedicated formatting tail.
+Ordinals follow our pool: 0=opus-class, 1=gemini-class, 2=gpt-class, 3=glm-class.
+
+EXAMPLE 4:
+
+Question: Which of the following best explains why the Bay of Fundy experiences the highest tides in the world? A. Its latitude places it closest to the Moon's orbital plane B. The natural oscillation period of the basin nearly matches the period of the Atlantic tide, producing resonance C. Melting glaciers periodically add large volumes of water to the bay D. Strong prevailing westerlies pile surface water into the bay twice a day. Provide the option letter in <answer> </answer> tags, for example <answer>C</answer>.
+
+Assistant Response: This is a conceptual explanation question where several options sound plausible, so the risk is a confidently wrong elimination. I will have one model lay out the physical mechanism behind each option, a second model independently rank the options without seeing the first analysis, a third model reconcile the two analyses and resolve disagreements, a fourth model stress-test the leading answer by arguing against it, and a final model confirm and format the answer.
+
+model_id = [1, 2, 0, 2, 3]
+subtasks = ["Explain the physical mechanism that each option A, B, C and D proposes for the Bay of Fundy's extreme tides, without yet choosing an answer.", "Independently of any other analysis, rank the four options from most to least physically plausible and briefly justify the ranking.", "Compare the mechanism analysis and the independent ranking, resolve any disagreement between them, and state which option is best supported.", "Argue the strongest possible case AGAINST the currently preferred option; if the case is convincing, name the option that should replace it, otherwise confirm it.", "State the final choice and provide the option letter in <answer> </answer> tags according to the question's formatting instructions."]
+access_list = [[], [], ["all"], ["all"], ["all"]]

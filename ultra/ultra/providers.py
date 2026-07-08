@@ -26,6 +26,9 @@ MODELS: dict[str, dict[str, str]] = {
     "minimax":      {"openrouter": "minimax/minimax-m3",            "yunwu": "MiniMax-M3"},
     "opus":         {"openrouter": "anthropic/claude-opus-4.8",     "yunwu": "claude-opus-4-8"},
     "gemini":       {"openrouter": "google/gemini-3.5-flash",       "yunwu": "gemini-3.5-flash"},
+    # the report's premium Gemini (pool-upgrade evals only); OpenRouter-only like flash
+    # (Yunwu ignores gemini max_tokens -> reasoning blowups).
+    "gemini-pro":   {"openrouter": "google/gemini-3.1-pro-preview"},
     "gpt":          {"yunwu": "gpt-5.5"},
 }
 
@@ -47,7 +50,7 @@ PROVIDERS: dict[str, dict] = {
     },
 }
 
-COMMERCIAL_MODELS = frozenset({"opus", "gemini", "gpt"})
+COMMERCIAL_MODELS = frozenset({"opus", "gemini", "gemini-pro", "gpt"})
 DISALLOWED_MODEL_PROVIDERS = {
     "gpt": frozenset({"openrouter"}),
 }
@@ -55,7 +58,7 @@ DEFAULT_COMMERCIAL_PROVIDER = "yunwu"
 DEFAULT_SPECIALIST_PROVIDER = "openrouter"
 # Per-model provider override: gemini-3.5-flash's tokens are uncapped via yunwu (it ignores
 # max_tokens -> 13-19k tokens); OpenRouter honors max_tokens. Force gemini onto OpenRouter.
-FORCE_PROVIDER = {"gemini": "openrouter"}
+FORCE_PROVIDER = {"gemini": "openrouter", "gemini-pro": "openrouter"}
 DEFAULT_PROVIDER = "yunwu"
 YUNWU_LIVE_ALLOW_ENV = "ULTRA_ALLOW_YUNWU"
 

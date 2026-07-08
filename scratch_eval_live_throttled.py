@@ -76,11 +76,18 @@ async def gen_workflow(task):
 async def exec_wf(task, raw, pool, i):
     try:
         wf = parse_workflow(env._extract_workflow_payload(raw))
+    except Exception:
+        # status distinguishes policy vs infra failures in the row diagnostics;
+        # scoring is unchanged (any failure counts 0.0, as always)
+        return (0.0, 0, "parse_fail" if raw.strip() else "empty_gen")
+    try:
         rec = await execute_workflow(task, wf, pool, samp, rollout_id=f"live_{args.label}_{i}",
                                      worker_harnesses={}, max_steps=5)
-        return (1.0 if (rec.grade and rec.grade.success) else 0.0, len(wf.steps))
+        return (1.0 if (rec.grade and rec.grade.success) else 0.0, len(wf.steps), "ok")
     except Exception:
-        return (0.0, 0)
+        return (0.0, len(wf.steps), "exec_error")
+
+SOLO_ERRORS = []
 
 async def worker_solo(task, w, pool):
     try:
@@ -89,6 +96,7 @@ async def worker_solo(task, w, pool):
             asyncio.to_thread(get_grader(task.grader.type), c.text or "", task.grader.expected_answer), timeout=90.0)
         return float(score >= task.grader.success_threshold)
     except Exception:
+        SOLO_ERRORS.append(f"{task.task_id}/{w}")
         return 0.0
 
 async def smoke():
@@ -116,7 +124,10 @@ if args.smoke:
 
 cond_res, solo = asyncio.run(full())
 N = len(sample)
-cond_scores = [c for c, _ in cond_res]; steps = [s for _, s in cond_res]
+cond_scores = [c for c, _, _ in cond_res]; steps = [s for _, s, _ in cond_res]
+statuses = defaultdict(int)
+for _, _, st in cond_res:
+    statuses[st] += 1
 cond_rate = sum(cond_scores) / N
 sp = defaultdict(dict); k = 0
 for t in sample:
@@ -136,9 +147,13 @@ print(f"best single worker ({bw}):        {single[bw]:.3f}   all: {dict((w, roun
 print(f"oracle (best-per-task):           {oracle:.3f}", flush=True)
 print(f">>> conductor {'BEATS' if cond_rate > single[bw] else 'does NOT beat'} best worker: {cond_rate - single[bw]:+.3f}", flush=True)
 print(f"workflow steps: mean={sum(ms) / len(ms):.2f} max={max(ms) if ms else 0}  (n={N})", flush=True)
+diag = {k: v for k, v in statuses.items() if k != "ok"}
+print(f"diagnostics: conductor non-ok {dict(diag) or 'none'}; solo errors {len(SOLO_ERRORS)}"
+      + (f" ({SOLO_ERRORS[:4]})" if SOLO_ERRORS else ""), flush=True)
 with open(os.environ.get("EVAL_TREND_LOG", "output/fugu_ultra_lcb/heldout_trend.log"), "a") as f:
     f.write(json.dumps({"label": args.label, "mode": "live", "conductor": round(cond_rate, 3),
         "conductor_percap": cond_percap, "best_worker": bw, "best_worker_rate": round(single[bw], 3),
         "workers": {w: round(single[w], 3) for w in WORKERS}, "oracle": round(oracle, 3),
-        "gap_vs_best": round(cond_rate - single[bw], 3)}) + "\n")
+        "gap_vs_best": round(cond_rate - single[bw], 3),
+        "diag": dict(diag), "solo_errors": len(SOLO_ERRORS)}) + "\n")
 print("DONE", flush=True)
