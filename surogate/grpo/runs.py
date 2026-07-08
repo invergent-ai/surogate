@@ -345,7 +345,11 @@ class MultiRunManager:
             self.progress[new_id].step = _start_step_override() or 0
         elif config.ckpt.resume_step == -1:
             stable_steps = get_stable_ckpt_steps(self.get_run_dir(new_id) / "checkpoints")
-            self.progress[new_id].step = max(stable_steps) if stable_steps else 0
+            # No orchestrator checkpoint yet (resume_step=-1 configured but the orch is still
+            # mid-first-batch): fall back to the explicit start-step override, NOT 0 — a 0
+            # pointer makes the receiver replay the run's entire rollout history as fresh
+            # batches (observed 2026-07-05: 8 phantom trainer steps on years-old bins).
+            self.progress[new_id].step = max(stable_steps) if stable_steps else (_start_step_override() or 0)
         else:
             self.progress[new_id].step = config.ckpt.resume_step
 

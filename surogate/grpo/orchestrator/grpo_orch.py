@@ -17,7 +17,7 @@ from surogate.grpo.orchestrator.patches import monkey_patch_chat_completion_logp
 from surogate.grpo.orchestrator.trajectories import interleave_rollout
 from surogate.grpo.transport import TrainingBatch, TrainingSample, setup_training_batch_sender
 from surogate.grpo.utils.asynyc_utils import safe_cancel
-from surogate.grpo.utils.pathing import get_log_dir
+from surogate.grpo.utils.pathing import get_ckpt_dir, get_log_dir
 
 # This monkey patch is necessary to avoid Pydantic validating fields using typing.Iterable (e.g. in multimodal or tool call messages) lazily which leads to tokenization errors, for more info see https://github.com/PrimeIntellect-ai/prime-rl/pull/1249
 monkey_patch_oai_iterable_types()
@@ -38,6 +38,7 @@ from surogate.grpo.orchestrator.ckpt import Progress, setup_ckpt_manager
 from surogate.grpo.orchestrator.eval_utils import evaluate_env
 from surogate.grpo.orchestrator.filters import apply_filters, setup_filters
 from surogate.grpo.orchestrator.scheduler import Scheduler
+from surogate.grpo.orchestrator.spool import InflightSpool
 from surogate.grpo.orchestrator.trainability import exclude_non_trainable_rollouts
 from surogate.grpo.orchestrator.utils import (
     compute_teacher_logprobs,
@@ -347,6 +348,11 @@ async def orchestrate(config: GRPOOrchestratorConfig):
             else:
                 checkpoint_step = config.ckpt.resume_step
 
+        inflight_spool = None
+        if config.ckpt and config.ckpt.spool_inflight:
+            inflight_spool = InflightSpool(get_ckpt_dir(Path(config.output_dir)) / "inflight_spool.jsonl")
+            logger.info(f"In-flight rollout spool enabled at {inflight_spool.path}")
+
         scheduler = Scheduler(
             env=train_env_group,
             buffer=buffer,
@@ -359,6 +365,7 @@ async def orchestrate(config: GRPOOrchestratorConfig):
             lora_name=config.model.lora_adapter,
             deferred_group_scoring_tasks=train_env_deferred_group_scoring_tasks,
             config=config,
+            spool=inflight_spool,
         )
 
         if checkpoint_step is not None and config.model.lora_adapter is not None:
@@ -449,6 +456,11 @@ async def orchestrate(config: GRPOOrchestratorConfig):
                     )
                     scheduler.model_name = config.model.lora_adapter
                     logger.info(f"Loaded override policy weights for step {progress.step}")
+
+        # Restore in-flight groups persisted by the previous process (no-op when the
+        # spool is disabled or empty). Runs after progress.step is final so the
+        # off-policy staleness window is anchored correctly.
+        scheduler.restore_from_spool(progress.step)
 
         # Iterate over dataset in batches
         max_steps = config.max_steps or int(1e9)

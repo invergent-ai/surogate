@@ -658,6 +658,7 @@ class GRPOCheckpointConfig:
         keep_interval: Keep checkpoints at every N steps permanently (e.g., keep_interval=100 keeps step 100, 200, ...). If None, no interval-based keeping.
         skip_progress: Whether to skip loading the progress from checkpoint.
         skip_buffer: Whether to skip loading the buffer from checkpoint.
+        spool_inflight: Persist in-flight rollout groups to an append-only spool so a restart resumes partially generated groups instead of regenerating them. Restored rollouts respect max_off_policy_steps.
     """
 
     interval: int | None = None
@@ -667,6 +668,7 @@ class GRPOCheckpointConfig:
     keep_interval: int | None = None
     skip_progress: bool | None = False
     skip_buffer: bool | None = False
+    spool_inflight: bool | None = False
 
     def __init__(self, cfg: DictDefault):
         self.interval = cfg.get("interval", self.interval)
@@ -676,6 +678,7 @@ class GRPOCheckpointConfig:
         self.keep_interval = cfg.get("keep_interval", self.keep_interval)
         self.skip_progress = cfg.get("skip_progress", self.skip_progress)
         self.skip_buffer = cfg.get("skip_buffer", self.skip_buffer)
+        self.spool_inflight = cfg.get("spool_inflight", self.spool_inflight)
 
 
 @dataclass
