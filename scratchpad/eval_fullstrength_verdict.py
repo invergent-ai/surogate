@@ -45,9 +45,19 @@ ap.add_argument("--adapter", default="default")       # step-145 policy (trainer
 ap.add_argument("--out", default="scratchpad/fs_verdict_rows.jsonl")
 ap.add_argument("--budget-usd", type=float, default=120.0)  # hard stop on provider-REPORTED spend
 ap.add_argument("--timeout-s", type=float, default=900.0)   # per worker call (hardest tasks need more)
-ap.add_argument("--pool-upgrade", action="store_true")      # st_gemini flash -> gemini-3.1-pro (report pool)
+ap.add_argument("--pool-upgrade", action="store_true")      # retired no-op (kept so old commands don't error)
+ap.add_argument("--pool-swaps", default="")                  # slot swaps, e.g. "st_glm=grok"
+ap.add_argument("--handicap", action="store_true")           # TREND protocol: workers 4096/minimal (historical series)
 ap.add_argument("--smoke", action="store_true")
 args = ap.parse_args()
+
+# HARD RULE (2026-07-09, the 3h57m batch-157 incident): while a training orchestrator is
+# live, evals must not exceed conc 3 — training runs 12-wide against Yunwu's ~16 ceiling.
+import subprocess as _sp
+if _sp.run(["pgrep", "-f", "surogate grpo-orch"], capture_output=True).stdout.strip():
+    if args.conc > 3:
+        print(f"TRAINING LIVE: clamping eval concurrency {args.conc} -> 3 (see MISSION invariants)", flush=True)
+        args.conc = 3
 
 spec = importlib.util.spec_from_file_location("fpe", "environments/fugu-ultra-pilot/fugu_ultra_pilot.py")
 env = importlib.util.module_from_spec(spec); spec.loader.exec_module(env)
@@ -60,12 +70,11 @@ from ultra.schemas import TaskSpec
 
 D = "director/manifests/fugu_clean_v1/grpo_pilot_train"
 cfg = json.load(open(f"{D}/pilot_config_singleturn.json"))
-if args.pool_upgrade:
-    # Report-pool upgrade: ONLY the gemini slot changes model (flash -> 3.1-pro). The 4-slot
-    # structure and the conductor's anonymized-ordinal prompt are untouched, so the trained
-    # routing distribution is preserved; the slot just got stronger.
-    cfg["worker_pool"]["st_gemini"]["model"] = "gemini-pro"
-    print("POOL UPGRADE: st_gemini -> gemini-3.1-pro (report premium slot)", flush=True)
+# (--pool-upgrade retired 2026-07-09: user directive — no gemini-3.1-pro anywhere.)
+for swap in filter(None, args.pool_swaps.split(",")):
+    slot, model = swap.split("=")
+    cfg["worker_pool"][slot.strip()]["model"] = model.strip()
+    print(f"POOL SWAP: {slot.strip()} -> {model.strip()}", flush=True)
 MANIFEST = os.environ.get("EVAL_MANIFEST", "heldout_trend60_taskspecs.jsonl")
 tasks = [TaskSpec.model_validate(json.loads(l)) for l in open(f"{D}/{MANIFEST}")]
 import random
@@ -76,16 +85,20 @@ sample = []
 for cap, ts in by.items():
     rng.shuffle(ts); sample += ts[: args.n]
 WORKERS = cfg["worker_pool_names"]
-RETRY_WORKERS = WORKERS  # solo2 control for every worker (retries fire only on failures)
+# solo2 (retry) arms only for workers that can plausibly BE the bar — retry rows for weak
+# workers are spend with no decision value (user directive 2026-07-09: eval only what we need).
+RETRY_WORKERS = [w for w in WORKERS if w in ("st_opus", "st_gpt")]
 
-FS_SAMP = Sampling(temperature=0.2, top_p=1.0, max_tokens=16384, reasoning_effort="high")
-# Per-worker full-strength output caps. 16384 truncated gemini/glm on hard tasks (smoke:
-# finish=length) — raise them to their OpenRouter top-provider ceilings' safe zone.
-# Opus never truncates at 16384; GPT ignores caps (wall-clock streaming budget instead).
-WORKER_MAX_TOKENS = {"st_gemini": 32768, "st_glm": 32768}
-if args.pool_upgrade:
-    # gemini-3.1-pro truncated 3/15 probe calls at 32k; its OpenRouter ceiling is 65536.
-    WORKER_MAX_TOKENS["st_gemini"] = 65536
+if args.handicap:
+    # the historical trend protocol (identical to training + every trend row ever)
+    FS_SAMP = Sampling(temperature=0.2, top_p=1.0, max_tokens=4096, reasoning_effort="minimal")
+    WORKER_MAX_TOKENS = {}
+else:
+    FS_SAMP = Sampling(temperature=0.2, top_p=1.0, max_tokens=16384, reasoning_effort="high")
+    # Per-worker full-strength output caps. 16384 truncated gemini/glm on hard tasks (smoke:
+    # finish=length) — raise them to their OpenRouter top-provider ceilings' safe zone.
+    # Opus never truncates at 16384; GPT ignores caps (wall-clock streaming budget instead).
+    WORKER_MAX_TOKENS = {"st_gemini": 32768, "st_glm": 32768}
 
 REVISE_INSTRUCTION = (
     "The workflow above was executed and its final answer was evaluated as INCORRECT.\n"
@@ -262,8 +275,9 @@ async def arm_fu2(task, pool, i):
 
 # ---------- driver
 async def main():
+    cache = ".ultra_cache/eval" if args.handicap else ".ultra_cache/eval_fullstrength"
     pool = _instrument(env._build_pool(
-        pilot_config=cfg, provider_mode="live", cache_dir=".ultra_cache/eval_fullstrength",
+        pilot_config=cfg, provider_mode="live", cache_dir=cache,
         max_concurrency=args.conc, requests_per_minute=None, timeout_s=args.timeout_s, max_retries=3))
     t0 = time.time()
     # phase 1: solos (the bar) + fu1, concurrently — independent work

@@ -87,7 +87,11 @@ class OpenRouterProvider:
         # reasoning unbounded to a ~20k internal ceiling (observed 2026-07-06: 6.7M excess
         # tokens billed invisibly). They require max_completion_tokens + top-level
         # reasoning_effort instead.
-        openai_native_reasoning = model.startswith("gpt-")
+        # gpt-*/grok-*/gemini-* BARE slugs (all yunwu; OpenRouter slugs are prefixed "x-ai/"/"google/" and
+        # honors caps, so it self-selects out): unenforced caps + unbounded server-side
+        # reasoning (grok-4.5 probe 2026-07-09: max_tokens=400 ground >2 min) -> the
+        # streaming wall-clock budget is the only real cap.
+        openai_native_reasoning = model.startswith(("gpt-", "grok-", "gemini-"))
         if openai_native_reasoning:
             # effort flag ONLY -- no token-cap param: Yunwu doesn't enforce caps for these
             # models anyway (probe 2026-07-06: mct=1024 -> 4559 tok), and sending
@@ -223,7 +227,11 @@ class OpenRouterProvider:
         if routing is not None:
             extra["provider"] = routing
         # same OpenAI-native reasoning-model handling as complete() (see comment there)
-        openai_native_reasoning = model.startswith("gpt-")
+        # gpt-*/grok-*/gemini-* BARE slugs (all yunwu; OpenRouter slugs are prefixed "x-ai/"/"google/" and
+        # honors caps, so it self-selects out): unenforced caps + unbounded server-side
+        # reasoning (grok-4.5 probe 2026-07-09: max_tokens=400 ground >2 min) -> the
+        # streaming wall-clock budget is the only real cap.
+        openai_native_reasoning = model.startswith(("gpt-", "grok-", "gemini-"))
         if openai_native_reasoning:
             # effort flag ONLY -- no token-cap param: Yunwu doesn't enforce caps for these
             # models anyway (probe 2026-07-06: mct=1024 -> 4559 tok), and sending

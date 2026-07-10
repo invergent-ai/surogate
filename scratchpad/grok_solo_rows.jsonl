@@ -1,0 +1,26 @@
+{"task_id": "lcbv6__abc390_f", "arm": "solo__grok", "cap": "unit_code", "score": 1.0, "status": "ok", "finish": "stop", "completion_tokens": 482, "cost": 0.0}
+{"task_id": "lcbv6__abc396_g", "arm": "solo__grok", "cap": "unit_code", "score": 1.0, "status": "ok", "finish": "stop", "completion_tokens": 326, "cost": 0.0}
+{"task_id": "lcbv6__abc398_d", "arm": "solo__grok", "cap": "unit_code", "score": 1.0, "status": "ok", "finish": "stop", "completion_tokens": 210, "cost": 0.0}
+{"task_id": "lcbv6__abc397_f", "arm": "solo__grok", "cap": "unit_code", "score": 1.0, "status": "ok", "finish": "stop", "completion_tokens": 1123, "cost": 0.0}
+{"task_id": "lcbv6__abc389_e", "arm": "solo__grok", "cap": "unit_code", "score": 1.0, "status": "ok", "finish": "stop", "completion_tokens": 359, "cost": 0.0}
+{"task_id": "lcbv6__arc195_e", "arm": "solo__grok", "cap": "unit_code", "score": 1.0, "status": "ok", "finish": "stop", "completion_tokens": 21298, "cost": 0.0}
+{"task_id": "lcbv6__arc193_a", "arm": "solo__grok", "cap": "unit_code", "score": 1.0, "status": "ok", "finish": "stop", "completion_tokens": 770, "cost": 0.0}
+{"task_id": "lcbv6__abc398_g", "arm": "solo__grok", "cap": "unit_code", "score": 0.0, "status": "ok", "finish": null, "completion_tokens": 1314, "cost": 0.0}
+{"task_id": "lcbv6__abc389_f", "arm": "solo__grok", "cap": "unit_code", "score": 1.0, "status": "ok", "finish": "stop", "completion_tokens": 1081, "cost": 0.0}
+{"task_id": "lcbv6__abc394_e", "arm": "solo__grok", "cap": "unit_code", "score": 1.0, "status": "ok", "finish": "stop", "completion_tokens": 413, "cost": 0.0}
+{"task_id": "lcbv6__arc190_d", "arm": "solo__grok", "cap": "unit_code", "score": 1.0, "status": "ok", "finish": "stop", "completion_tokens": 705, "cost": 0.0}
+{"task_id": "lcbv6__abc392_g", "arm": "solo__grok", "cap": "unit_code", "score": 1.0, "status": "ok", "finish": "stop", "completion_tokens": 226, "cost": 0.0}
+{"task_id": "lcbv6__abc392_f", "arm": "solo__grok", "cap": "unit_code", "score": 1.0, "status": "ok", "finish": "stop", "completion_tokens": 3987, "cost": 0.0}
+{"task_id": "lcbv6__arc194_b", "arm": "solo__grok", "cap": "unit_code", "score": 1.0, "status": "ok", "finish": "stop", "completion_tokens": 257, "cost": 0.0}
+{"task_id": "lcbv6__abc396_e", "arm": "solo__grok", "cap": "unit_code", "score": 0.0, "status": "ok", "finish": "stop", "completion_tokens": 499, "cost": 0.0}
+{"task_id": "lcbv6__arc194_d", "arm": "solo__grok", "cap": "unit_code", "score": 1.0, "status": "ok", "finish": "stop", "completion_tokens": 683, "cost": 0.0}
+{"task_id": "lcbv6__abc388_e", "arm": "solo__grok", "cap": "unit_code", "score": 1.0, "status": "ok", "finish": "stop", "completion_tokens": 194, "cost": 0.0}
+{"task_id": "lcbv6__abc397_g", "arm": "solo__grok", "cap": "unit_code", "score": 1.0, "status": "ok", "finish": "stop", "completion_tokens": 871, "cost": 0.0}
+{"task_id": "lcbv6__abc394_f", "arm": "solo__grok", "cap": "unit_code", "score": 1.0, "status": "ok", "finish": "stop", "completion_tokens": 821, "cost": 0.0}
+{"task_id": "lcbv6__arc192_b", "arm": "solo__grok", "cap": "unit_code", "score": 1.0, "status": "ok", "finish": "stop", "completion_tokens": 107, "cost": 0.0}
+{"task_id": "lcbv6__arc192_e", "arm": "solo__grok", "cap": "unit_code", "score": 0.0, "status": "ok", "finish": "stop", "completion_tokens": 805, "cost": 0.0}
+{"task_id": "lcbv6__abc389_g", "arm": "solo__grok", "cap": "unit_code", "score": 0.0, "status": "ok", "finish": null, "completion_tokens": 1045, "cost": 0.0}
+{"task_id": "lcbv6__abc388_f", "arm": "solo__grok", "cap": "unit_code", "score": 1.0, "status": "ok", "finish": "stop", "completion_tokens": 1098, "cost": 0.0}
+{"task_id": "lcbv6__arc192_d", "arm": "solo__grok", "cap": "unit_code", "score": 1.0, "status": "ok", "finish": "stop", "completion_tokens": 641, "cost": 0.0}
+{"task_id": "lcbv6__arc194_c", "arm": "solo__grok", "cap": "unit_code", "score": 0.0, "status": "error:TimeoutError"}
+{"task_id": "lcbv6__arc196_c", "arm": "solo__grok", "cap": "unit_code", "score": 0.0, "status": "ok", "finish": null, "completion_tokens": 1987, "cost": 0.0}

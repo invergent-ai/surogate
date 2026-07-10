@@ -1,0 +1,26 @@
+{"task_id": "lcbv6__abc396_g", "arm": "solo__gpt-sol", "cap": "unit_code", "score": 1.0, "status": "ok", "finish": "stop", "completion_tokens": 528, "cost": 0.0}
+{"task_id": "lcbv6__abc389_e", "arm": "solo__gpt-sol", "cap": "unit_code", "score": 1.0, "status": "ok", "finish": "stop", "completion_tokens": 1462, "cost": 0.0}
+{"task_id": "lcbv6__abc390_f", "arm": "solo__gpt-sol", "cap": "unit_code", "score": 1.0, "status": "ok", "finish": "stop", "completion_tokens": 1117, "cost": 0.0}
+{"task_id": "lcbv6__abc398_d", "arm": "solo__gpt-sol", "cap": "unit_code", "score": 1.0, "status": "ok", "finish": "stop", "completion_tokens": 501, "cost": 0.0}
+{"task_id": "lcbv6__arc195_e", "arm": "solo__gpt-sol", "cap": "unit_code", "score": 1.0, "status": "ok", "finish": "stop", "completion_tokens": 1910, "cost": 0.0}
+{"task_id": "lcbv6__abc397_f", "arm": "solo__gpt-sol", "cap": "unit_code", "score": 1.0, "status": "ok", "finish": "stop", "completion_tokens": 2510, "cost": 0.0}
+{"task_id": "lcbv6__abc389_g", "arm": "solo__gpt-sol", "cap": "unit_code", "score": 1.0, "status": "ok", "finish": "stop", "completion_tokens": 6879, "cost": 0.0}
+{"task_id": "lcbv6__arc193_a", "arm": "solo__gpt-sol", "cap": "unit_code", "score": 1.0, "status": "ok", "finish": "stop", "completion_tokens": 10771, "cost": 0.0}
+{"task_id": "lcbv6__arc194_c", "arm": "solo__gpt-sol", "cap": "unit_code", "score": 1.0, "status": "ok", "finish": "stop", "completion_tokens": 10143, "cost": 0.0}
+{"task_id": "lcbv6__abc394_e", "arm": "solo__gpt-sol", "cap": "unit_code", "score": 1.0, "status": "ok", "finish": "stop", "completion_tokens": 1507, "cost": 0.0}
+{"task_id": "lcbv6__arc190_d", "arm": "solo__gpt-sol", "cap": "unit_code", "score": 1.0, "status": "ok", "finish": "stop", "completion_tokens": 3822, "cost": 0.0}
+{"task_id": "lcbv6__abc389_f", "arm": "solo__gpt-sol", "cap": "unit_code", "score": 1.0, "status": "ok", "finish": "stop", "completion_tokens": 4864, "cost": 0.0}
+{"task_id": "lcbv6__abc392_f", "arm": "solo__gpt-sol", "cap": "unit_code", "score": 1.0, "status": "ok", "finish": "stop", "completion_tokens": 359, "cost": 0.0}
+{"task_id": "lcbv6__arc194_b", "arm": "solo__gpt-sol", "cap": "unit_code", "score": 1.0, "status": "ok", "finish": "stop", "completion_tokens": 4092, "cost": 0.0}
+{"task_id": "lcbv6__abc388_f", "arm": "solo__gpt-sol", "cap": "unit_code", "score": 1.0, "status": "ok", "finish": "stop", "completion_tokens": 2061, "cost": 0.0}
+{"task_id": "lcbv6__arc192_d", "arm": "solo__gpt-sol", "cap": "unit_code", "score": 1.0, "status": "ok", "finish": "stop", "completion_tokens": 5067, "cost": 0.0}
+{"task_id": "lcbv6__abc392_g", "arm": "solo__gpt-sol", "cap": "unit_code", "score": 0.0, "status": "ok", "finish": "stop", "completion_tokens": 4183, "cost": 0.0}
+{"task_id": "lcbv6__abc396_e", "arm": "solo__gpt-sol", "cap": "unit_code", "score": 0.0, "status": "ok", "finish": "stop", "completion_tokens": 511, "cost": 0.0}
+{"task_id": "lcbv6__abc394_f", "arm": "solo__gpt-sol", "cap": "unit_code", "score": 1.0, "status": "ok", "finish": "stop", "completion_tokens": 1286, "cost": 0.0}
+{"task_id": "lcbv6__arc194_d", "arm": "solo__gpt-sol", "cap": "unit_code", "score": 1.0, "status": "ok", "finish": "stop", "completion_tokens": 1260, "cost": 0.0}
+{"task_id": "lcbv6__arc192_b", "arm": "solo__gpt-sol", "cap": "unit_code", "score": 1.0, "status": "ok", "finish": "stop", "completion_tokens": 4271, "cost": 0.0}
+{"task_id": "lcbv6__abc388_e", "arm": "solo__gpt-sol", "cap": "unit_code", "score": 1.0, "status": "ok", "finish": "stop", "completion_tokens": 206, "cost": 0.0}
+{"task_id": "lcbv6__abc397_g", "arm": "solo__gpt-sol", "cap": "unit_code", "score": 1.0, "status": "ok", "finish": "stop", "completion_tokens": 6593, "cost": 0.0}
+{"task_id": "lcbv6__arc192_e", "arm": "solo__gpt-sol", "cap": "unit_code", "score": 1.0, "status": "ok", "finish": "stop", "completion_tokens": 6350, "cost": 0.0}
+{"task_id": "lcbv6__arc196_c", "arm": "solo__gpt-sol", "cap": "unit_code", "score": 1.0, "status": "ok", "finish": "stop", "completion_tokens": 8430, "cost": 0.0}
+{"task_id": "lcbv6__abc398_g", "arm": "solo__gpt-sol", "cap": "unit_code", "score": 0.0, "status": "error:TimeoutError"}

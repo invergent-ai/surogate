@@ -26,10 +26,14 @@ MODELS: dict[str, dict[str, str]] = {
     "minimax":      {"openrouter": "minimax/minimax-m3",            "yunwu": "MiniMax-M3"},
     "opus":         {"openrouter": "anthropic/claude-opus-4.8",     "yunwu": "claude-opus-4-8"},
     "gemini":       {"openrouter": "google/gemini-3.5-flash",       "yunwu": "gemini-3.5-flash"},
-    # the report's premium Gemini (pool-upgrade evals only); OpenRouter-only like flash
-    # (Yunwu ignores gemini max_tokens -> reasoning blowups).
-    "gemini-pro":   {"openrouter": "google/gemini-3.1-pro-preview"},
+    # pool-candidate (released ~2026-07-09, claims > gpt-5.5/glm-5.2; $2/$6 per M)
+    "grok":         {"openrouter": "x-ai/grok-4.5", "yunwu": "grok-4.5"},
     "gpt":          {"yunwu": "gpt-5.5"},
+    # gpt-5.6 family (landed 2026-07-10, yunwu; playbook [[gpt56-release-playbook]]):
+    # terra = 5.5-parity at half price (training-slot economy candidate);
+    # sol = opus-price, claims > opus (premium candidate, dominant-worker risk — measure first).
+    "gpt-terra":    {"yunwu": "gpt-5.6-terra"},
+    "gpt-sol":      {"yunwu": "gpt-5.6-sol"},
 }
 
 _CONFIG_DIR = Path(__file__).resolve().parent / "configs"
@@ -50,15 +54,21 @@ PROVIDERS: dict[str, dict] = {
     },
 }
 
-COMMERCIAL_MODELS = frozenset({"opus", "gemini", "gemini-pro", "gpt"})
+COMMERCIAL_MODELS = frozenset({"opus", "gemini", "gpt", "gpt-terra", "gpt-sol"})
 DISALLOWED_MODEL_PROVIDERS = {
     "gpt": frozenset({"openrouter"}),
+    "gpt-terra": frozenset({"openrouter"}),
+    "gpt-sol": frozenset({"openrouter"}),
 }
 DEFAULT_COMMERCIAL_PROVIDER = "yunwu"
 DEFAULT_SPECIALIST_PROVIDER = "openrouter"
-# Per-model provider override: gemini-3.5-flash's tokens are uncapped via yunwu (it ignores
-# max_tokens -> 13-19k tokens); OpenRouter honors max_tokens. Force gemini onto OpenRouter.
-FORCE_PROVIDER = {"gemini": "openrouter", "gemini-pro": "openrouter"}
+# gemini via yunwu is 90% cheaper (user 2026-07-10). Yunwu still ignores max_tokens for it
+# (re-probed same day: 3.1k tokens on a 400 cap, much milder than the old 13-19k mode), so the
+# streaming wall-clock guard covers bare "gemini-*" slugs the same as gpt-*/grok-*.
+FORCE_PROVIDER = {"gemini": "yunwu",
+                  # grok-4.5: OpenRouter region-blocked (xAI 403) as of 2026-07-09; Yunwu carries it
+                  # (unlisted but callable). Flip back to openrouter when the region opens.
+                  "grok": "yunwu"}
 DEFAULT_PROVIDER = "yunwu"
 YUNWU_LIVE_ALLOW_ENV = "ULTRA_ALLOW_YUNWU"
 
