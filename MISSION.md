@@ -1,560 +1,589 @@
 # Mission: Fugu-Ultra
 
-Objective: create a highly performant Fugu-Ultra model that outperforms any individual model or individual model+scaffold worker.
+Last updated: 2026-07-20 11:56 UTC.
 
-## HEADROOM MAP — benchmark-confirmed (2026-06-30): TRAIN ON VERIFIABLE CODE, NOT REASONING
+## Product Objective
 
-**This is the load-bearing strategic fact. Read it before choosing any task, probe, or training run.**
+Ship a trained conductor for long-horizon agentic work that outperforms every
+individual worker in its bound pool. It must coordinate multi-step tool use,
+subagents, artifact creation, debugging, handoffs, recovery, and independent
+final verification. One-shot routing to a nominally strongest model is not the
+product.
 
-The official Fugu-Ultra benchmark (the TRAINED conductor vs FULL-STRENGTH workers Opus-4.8 / Gemini-3.1-Pro / GPT-5.5) pins down exactly where the conductor beats the best single worker. Δ = Fugu-Ultra − best individual worker:
+Success requires verified superiority on TerminalBench 2.1 and credible
+SWE-Pro-class evidence. Sol's reported TerminalBench 2.1 score is 88%, so strict
+superiority requires at least 79 passes on the 89-task suite. Published
+comparator results are reused; comparator models are not rerun.
 
-| Tier | Benchmark | Fugu-Ultra | best worker | Δ | nature |
-|---|---|---:|---:|---:|---|
-| **1 — REAL HEADROOM (all verifiable code)** | LiveCodeBench | 93.2 | 88.5 | **+4.7** | single-turn code-gen, test-graded — **FEASIBLE to train** |
-| | SWE Bench Pro | 73.7 | 69.2 | **+4.5** | agentic — eval-only |
-| | TerminalBench 2.1 | 82.1 | 78.2 | **+3.9** | agentic — eval-only |
-| | LiveCodeBench Pro | 90.8 | 88.4 | **+2.4** | code-gen — feasible |
-| **2 — ~ZERO HEADROOM (all single-turn reasoning)** | HLE | 50.0 | 49.8 | +0.2 | reasoning, no cheap verifier |
-| | GPQA-D | 95.5 | 94.3 | +1.2 | reasoning (MC) |
-| | SciCode | 58.7 | 58.9 | **−0.2** | reasoning |
-| **3 — conductor LOSES** | MRCRv2 | 93.6 | 94.8 | −1.2 | long-context |
-| | Long Context | 73.3 | 74.3 | −1.0 | long-context |
+No superiority claim is currently authorized.
 
-**MECHANISM** — why this is true, not just an observation: the conductor's only edge is DECOMPOSE→VERIFY→REFINE, which adds value ONLY when (a) the task is decomposable and (b) there is a cheap EXTERNAL verifier to catch a draft's errors. **Code has unit tests; math/knowledge reasoning does not.** Decomposing one limited worker with another equally-limited worker flips nothing without an external check. This is a VERIFIABILITY axis, NOT a hard-vs-easy axis — HLE is the single *hardest* benchmark here and the single *worst* place to look (+0.2 even for the fully-trained model).
+## Model-Agnostic Hard Rule
 
-**WHERE TO LOOK** (the feasible × headroom intersection): **LiveCodeBench / LiveCodeBench-Pro** — single-turn code generation, hidden-test graded. It has the headroom (+4.7) AND is feasible to train (4096-tok single-call workers, no Docker/agent-loops → no call explosion). This is the proven beat-the-workers training core. The decomposition skill learned here TRANSFERS to the agentic eval-only targets (SWE Bench Pro / TerminalBench). Escalate difficulty toward harder **CODE** (LCB-Pro, BigCodeBench-hard, SWE-smith code-gen) — never toward harder reasoning.
+The runtime and learned decision surface must remain replaceable-pool
+architecture:
 
-**WHAT NOT TO DO**:
-1. Do NOT probe or train on single-turn **REASONING** (MATH500, MMLU, HLE, GPQA-Diamond, AIME, FrontierMath). The benchmark proves ~0 conductor headroom there; it is the FLAT part of the curve, not a difficulty problem. CONFIRMED empirically 2026-06-30: a full session built a "harder" HLE-MC(50)+GPQA-D(40)+AIME(30) set and re-measured — headroom **+0.04** (within MC-guessing noise), exactly as this table predicts. The old "if too easy, escalate to HLE/FrontierMath/GPQA" guidance ([[frontier-pool-makes-paper-tasks-easy]], DATASETS note below) was HALF WRONG — only its LCB-Pro (code) half had headroom.
-2. Do NOT TRAIN on live-agentic SWE-Bench / TerminalBench (containers, 20-turn workers). Call explosion → infeasible (recorded: 0 rollouts / 11 min, $100s wasted). These are EVAL-ONLY; the skill transfers from LCB code-gen training.
-3. Do NOT gate on ROUTING headroom (oracle-of-N-workers vs best-single). The conductor DECOMPOSES, it does not route — per-task routing is NULL (cross-fit p=0.90, [[swesmith-per-task-routing-null]]). The real gate = within-group reward VARIANCE from decomposition on verifiable code (some workflows pass tests, some don't), difficulty-filtered to the learnable band.
-4. Beware MC GUESSING inflation: four guessers on a 4-choice MC have oracle 0.68 by luck. Never read a multiple-choice oracle as headroom.
+- The conductor reasons over anonymous capability profiles, roles, workflow
+  topology, access edges, and live agentic state.
+- Concrete provider model identities exist only in a versioned pool binding and
+  provenance. They never appear in learned prompts or actions.
+- There is no globally preferred, default, or fallback worker.
+- Worker IDs have no meaning without the capability profiles supplied for that
+  request.
+- Training data must permute capability profiles across worker IDs so a fixed
+  slot cannot acquire semantic meaning.
+- Replacing any or all workers requires a new binding, capability calibration,
+  and possibly bounded continued/fine-tuning. It must not require orchestrator
+  code changes or runtime special cases.
+- Checkpoints remain pool-specific and hash-bound. A checkpoint/pool mismatch
+  fails closed.
 
-**UPDATE (user-directed 2026-07-01) — verifiable reasoning ADDED to the mix as an experiment**: hard EXACT-ANSWER reasoning (NOT multiple-choice) — Omni-MATH olympiad (120) + Reasoning-Gym-Hard (30) — is added to the training mix alongside the code core (TACO+LCB, 181), a deliberate exception to WHAT-NOT-TO-DO #1. Rationale: (a) the paper trained a MATH+code mix (Fig 3 bottom = a physics decomposition); (b) my "reasoning≈0 headroom" was measured with ROUTING oracle only — never the DECOMPOSITION test that flipped code from +0.00 routing to +0.05; (c) exact-answer math avoids the MC-guessing confound. Code-dominant (55%); `online_difficulty_filtering` evicts no-variance reasoning tasks; held-out eval (LCB-V6 + reasoning) is the verdict. This does NOT reverse the verifiability conclusion — MC reasoning (GPQA/HLE-MC) stays excluded.
+This rule applies to initial planning, live control, function-call routing,
+replacement workflows, aggregation, debugging, and recovery.
 
-## NON-NEGOTIABLE OBJECTIVE (hard-enforced 2026-06-30)
+## Current Pool
 
-The Fugu-Ultra model MUST be a **task-specific DECOMPOSITION conductor**, faithful to the Conductor paper. No deviation is accepted.
+The current product round uses this fixed pool:
 
-REQUIRED (what "done" means):
-- The conductor READS a task and GENERATES a **task-specific decomposition** — real subtasks for *this* problem (with dependencies/access), NOT generic role labels, NOT a choice among fixed templates.
-- Subtasks are dispatched to workers; their results COMPOSE into the final solution.
-- Trained via **RL (GRPO)** on **LIVE execution**; reward = did the composed solution solve a task the best single worker FAILS whole.
-- The conductor must DISCOVER good decompositions through reward — generalizing to held-out tasks.
+| Anonymous worker | Bound runtime model | Capability prior |
+|---:|---|---|
+| 0 | `gpt-5.6-sol` | reasoner, verifier, debugger |
+| 1 | `gemini-3.5-flash` | scientist, planner, aggregator |
+| 2 | `gpt-5.6-terra` | mathematician, coder, reasoner |
+| 3 | `grok-4.5` | drafter, implementer, fast pass |
 
-FORBIDDEN (do NOT pursue; these do not count as the model):
-- Pure routing (pick one model per task) — proven NULL (per-task routability cross-fit p=0.90).
-- Fixed coordination templates (draft->debug, ladder) — shallow, not task-specific.
-- SFT / behavioral-cloning shortcuts — imitation, not decomposition discovery.
-- Replay over a fixed arm-set — structurally cannot represent novel decompositions.
+Binding:
+`director/manifests/fugu_clean_v1/grpo_pilot_train/current_pool_binding_v11.json`
 
-WHY (evidence this is the only lever): a crude 2-3 step decomposition already recovered **9 of 16 tasks Opus fails whole** (Opus-solo 9/25 -> decomposition 19/25). Routing and templates underwhelmed exactly because they are not decomposition. Task-specific, RL-learned decomposition is the sole mechanism that beats a frontier model.
+- Binding SHA-256:
+  `4c0bd95fa62189e3d3bf31a807bc600ec98c74d39444ce760d737f4b3ea5568a`
+- Pool fingerprint:
+  `6ace6d4fdc84b56f8991af8a2cbc42d125f26f8bd682c3119a657eb56c1925c0`
 
-## NON-NEGOTIABLE GRPO RECIPE (hard-enforced 2026-06-30)
+## Current Product
 
-GRPO params MUST match the Conductor paper (A.1). Every prior collapse came from deviating. No deviation is accepted.
+The current trained product is reproducible but not proven superior.
 
-| param | REQUIRED (paper) | rationale |
+| Component | Authoritative artifact | SHA-256 |
 |---|---|---|
-| temperature | **1.0** | exploration -> within-group reward variance |
-| rollouts_per_example | **>=16 (paper: 64)** | THE variance source; rpe 2-4 = grad->0 collapse (every failed run) |
-| learning_rate | **1e-6** | paper; lr 1e-4 (100x) caused instability |
-| KL penalty | **NONE (kl_tau = 0)** | Conductor A.1: "set the reference model KL divergence penalty to 0"; Fugu 3.2.3: "without any KL divergence penalty". The beta*D_KL in eq6/eq1 has beta=0. (I wrongly added a KL anchor from the formula -- reverted.) |
-| max_workflow_steps | **<=5 (avg ~3)** | paper: "agentic workflows of up to 5 steps"; Conductor learns avg 3. A 2-step gate FORCED solos = DEGENERATE. |
-| TASK TYPE (core) | **single-turn CODE generation** (LiveCodeBench-style, test-graded) | Conductor A.1 trained on MATH/MMLU/RLPR/LCB-V1 — but only the CODE half carries conductor headroom (see HEADROOM MAP); math/MMLU/reasoning are ~0-headroom filler. FAST + feasible (200 iters, 2 H100s). |
-| worker call (single-turn) | **single 4096-tok call, temp 0.2, MINIMAL reasoning** | Conductor A.1 exact training setting. No containers/apt-get/multi-turn loops -> cheap rollouts. |
-| worker turns (multi-turn EXT) | **UNLIMITED** | Fugu 3.2.3 extension ONLY ("any agent permitted unlimited interaction"). Expensive (call explosion); layer on AFTER the single-turn core works. |
-| advantage | **A_i = (r_i - mean)/std** (eq 7) | grouped Monte-Carlo over G rollouts/question |
-| reward | **0 / 0.5 / 1** (format / correctness) | r=0 unparseable; r=1 final output matches solution; r=0.5 well-formatted but wrong |
-| few-shot prompt | **REQUIRED (coldstart)** | Conductor uses pretrained LM + few-shot examples in system prompt as the coldstart (B.7: removing few-shot drops LCB 64->55). No separate distillation-SFT needed. |
-
-ANTI-DEGENERACY (the 3 things that ARE the value -- none may be stripped):
-1. **Multi-step <=5** workflows (plan->code->verify, build->debug, debate). NOT solo. The repair-SFT base (solos) is the MOST degenerate base -- FORBIDDEN.
-2. **Targeted per-worker subtasks** + topologies (best-of-N, chain, tree). These EMERGE FROM GRPO -- the paper: "we observe the emergence of problem decompositions and prompt-engineered subtasks... alongside communication topologies." NOT pre-distilled, NOT generic "Solve the task" (Table 9: stripping subtasks drops LCB 64.3->58.6).
-3. **Complementary FRONTIER pool** (Opus/Gemini/GPT/GLM) + **data diversity**. NOT the tight 3-terminal pool (not complementary -> random route = 0.5, zero generalization).
-
-REAL EXECUTION REQUIRED: the reward MUST come from LIVE worker execution of the multi-step+subtask workflow (for single-turn = a real single worker call per step, graded vs ground truth). Replay / `routed-arm in successful_arms` is BLIND to subtasks+multi-step -> can only learn pure routing -> degenerate.
-
-PROPER BASE = pretrained LM + **few-shot Conductor prompt** (the paper's coldstart). We use the **workflow-SFT base** (`output/fugu_ultra_workflow_sft_qwen3_8b`) as a stronger coldstart -- it reliably EMITS multi-step (<=5) workflows under the few-shot prompt (verified: 5-step plan->implement->critique->revise). Decomposition + targeted subtasks then EMERGE from GRPO (no separate distillation-SFT). The repair-SFT (solos) is FORBIDDEN -- solos give GRPO nothing to grow. FORBIDDEN params: rpe<16, temp<1.0, lr>1e-6, **any KL (kl_tau>0)**, max_workflow_steps<=2, the repair-SFT/solo base, replay reward -- the exact causes of every prior collapse + the degenerate conductor.
-
-Fugu-Ultra = Conductor + long-horizon function-calling + multi-agent workflows via adaptive agent memory (the report's extensions over the base Conductor).
-
-### SYSTEM PROMPT (Conductor prompt -- ICLR Fig 13 + B.2/B.7)
-- Output = three Python lists after CoT: `model id`, `subtasks`, `access list` (same length). Our env uses an info-equivalent JSON `{"steps":[{worker_id,subtask,access,budget}]}` -- same content.
-- The prompt instructs: solve INDIRECTLY by querying numbered models; up to 5 steps; each step = (worker id, natural-language subtask, access list of prior steps; "all" or []); a subtask may solve-from-scratch / refine / plan / verify.
-- **Few-shot examples are REQUIRED** (the coldstart) -- removing them drops LCB 64->55 (B.7). We rewrote `_system_prompt` paper-faithful: decomposition guidance + 2 few-shot examples (plan->implement; draft->verify->refine), removed the "short" bias. VERIFIED: workflow-SFT base now emits 5-step decompositions.
-- Paper nuances to adopt: (a) workers presented as ORDINAL numbers ("Model 0,1,...") to avoid brand bias; (b) few-shot examples drawn from OOD tasks generalize BEST (B.2 -- prevents reward-hackable repetition). Our examples are generic (not from the train set) -- good.
-
-### DATASETS — FINAL CALIBRATED MIX (measured at the handicap, 2026-07-01)
-
-The paper's dataset LIST (MATH500 / MMLU / RLPR / LCB-V1) is **superseded by measurement**. Every candidate source was probed with the 4 workers **at the actual training handicap (4096 tokens / minimal reasoning)** — NOT the full-strength benchmark. A source earns a slot only if the handicapped workers land in the **learnable band** (not saturated, not all-fail). The load-bearing variable is the 2026 pool's difficulty at the handicap, not the paper's dataset names.
-
-**KEPT — the 461-task mix** (`grpo_pilot_train/hard_mix_all_taskspecs.jsonl`), all gold-validated (each source's gold solutions pass its grader ≥98%), all exact/test-graded, **no multiple-choice**:
-
-| source | tasks | grader | handicap probe (workers) | role |
-|---|---:|---|---|---|
-| **Omni-MATH** (olympiad) | 250 | math_equal | opus 0.27–0.40, others ~0 | headroom-rich (in-band, workers fail) |
-| **Reasoning-Gym-Hard** | 30 | math_equal | opus 0.40 / oracle 0.60 | headroom-rich (+0.20 routing) |
-| **TACO-hard** (codeforces) | 120 | code_exec_stdio | opus 1.0, glm 0.2 (band 9/10) | code: gradient + eval-relevance |
-| **LiveCodeBench-hard V1** | 61 | code_exec_stdio | gemini/gpt ~1.0 (band 8/10) | code: gradient + eval-relevance |
-
-Code-share 39%; the headroom core is the math/reasoning half (that's where handicapped workers actually fail). Held-out EVAL (never train): **LiveCodeBench-V6** (code) + a disjoint hard-math set (Omni-MATH held-out / AIME).
-
-**DROPPED — with measured reasons (all at 4096/minimal):**
-- **MMLU-Pro** — SATURATED: every worker ~1.0 even at the handicap (MC is answerable in 4096 tok), learnable-band 1/10 → zero gradient. (">90%" is the full-strength number; it holds at the handicap too.)
-- **RLPR** (WebInstruct-verified) — ALL-FAIL: oracle 0.10; and a **decomposition** probe (plan→exec + draft→verify→refine) also scored 0.00, recovering 0/15 — the physics/chem is beyond the handicapped workers even decomposed.
-- **BBEH** (BIG-Bench Extra Hard) — opus/gemini 0.90, near-saturated → thin headroom.
-- **SciCode** — un-validatable grading (scipy harness, per-step functions, `general_solution` often None) + the **one benchmark the conductor LOSES** (−0.2). Grading-risk, skip.
-- **ARC-AGI-3** — interactive/agentic (no static dataset), multi-turn → not single-turn-trainable.
-- **Candidate, not currently in the mix:** ARC-AGI-2 (`arc-agi-community/arc-agi-2`, large 30×30 puzzles, `grid_exact`) — opus 0.60, learnable/moderate; keep-able if we want a 3rd reasoning source.
-
-**KEY FINDING (valid):** at the 4096/minimal handicap the 2026 pool is strong enough that the only headroom-rich sources (best-worker ≤0.4) are hard **olympiad math + puzzle reasoning**; code is Opus-dominant (thin handicap-headroom, kept for eval-relevance). This partially inverts the full-strength HEADROOM MAP (code +4.7 was measured with full-strength workers; training uses handicapped ones).
-
-**EPISTEMIC CAVEAT (user-established 2026-07-01):** the single-worker saturation table above is VALID (it's about data difficulty). But **hand-crafted decomposition probes prove NOTHING** about the trainable decomposition space — they only show Fig-3's *starting point* (untrained conductor ≈ workers). Only GRPO training tests whether the conductor beats the best worker; do not use fixed-workflow probes to argue feasibility for/against.
-
-### FULL TRAINING PARAMS (ICLR A.1 -- exact)
-- Base: Qwen2.5-7B (we use the stronger workflow-SFT coldstart of Qwen3-8B). max completion 1024.
-- **200 GRPO iterations**, **4 questions/iter x 64 rollouts/question = batch 256**, temperature **1.0**.
-- AdamW, lr **1e-6**, cosine schedule, warmup ratio 0.03, b1=0.9 b2=0.999 eps=0.2.
-- **NO KL** (ref sync disabled, KL penalty = 0). Reward 0/0.5/1. Grouped advantage A=(r-mean)/std.
-- Workers (single-turn): **4096 max tokens, temp 0.2, MINIMAL reasoning** (single call per step). Compute: 2x H100 80GB.
-- Recursion + adaptive-pool are LATER finetune extensions (half-batch recursion instantiation; k-subset sampling) -- not the base run.
-
-### EXPECTED TRAINING DYNAMICS (Figure 3) -- MIN 200 STEPS, don't stop early
-
-Run for a **MINIMUM of 200 GRPO steps**. The Conductor does NOT beat the workers until near the end -- stopping at 150 catches it right at the crossing point, not with a banked win. Figure 3 (paper pool: Gemini-2.5-Pro 75.5 / GPT-5 72 / Sonnet-4 68.8):
-
-- **Starts BELOW every worker** (~59% acc / low reward). This is EXPECTED, not failure -- do not kill an early run that looks worse than the workers.
-- **Non-monotonic climb**: crosses the weakest worker ~iter 30, briefly passes the mid worker ~iter 48 then DIPS back (iter 50-75, 73->69.5), recovers. **Do not kill on a mid-run dip.**
-- **Crosses the BEST worker only ~iter 150-160**, keeps climbing to ~78 by iter 200 -- the margin is banked in the last ~50 steps.
-- **Decomposition strategy EMERGES late**: early workflows are sound subtasks but NO verification (just plan->solve); near convergence the Conductor learns planners + targeted instructions + **verify/refine** (`<idea>`/`<answer>` tags: "verify the strategy, find gaps" -> "refine then implement"). Reward climbing without verify/refine in the emitted workflows = not yet converged.
-
-**Our caveat (stronger 2026 pool)**: our best worker (GPT-5.5 ~0.90 on LCB) sits far above the Conductor's ~0.66 start -- a ~24-pt climb vs the paper's ~16. So **200 is the FLOOR, not a guarantee**; if reward is still climbing at 200, extend (resume from the latest checkpoint). Track the per-step reward trajectory + watch for verify/refine to appear in emitted workflows before declaring convergence. Checkpoint every 10 steps (outage-resilient + trajectory eval); eval the BEST checkpoint on held-out, not blindly the last.
-
-Last updated: 2026-07-01 (added Figure-3 expected dynamics + MIN-200-step floor; code-gen (LCB) core per HEADROOM MAP; KL=0).
-
-## EXTERNAL BENCHMARK — SWE-Together (eval-only transfer target, recorded 2026-07-01)
-
-`study/SWE-Together` (arXiv 2606.29957) — 109 **multi-turn interactive** agentic coding tasks. Each replays a real user–agent session with a reactive **user simulator** (progressive reveal: `instruction.md` turn 0, then follow-ups / course-corrections) in a Dockerized repo pinned to a base commit + `tests/` gate + reference patch + frozen judge rubric. Harnesses: opencode / claude-code / codex / mini-swe-agent. Axes: **Correctness** (agentic judge; pass@1 / pass²) + **User Correction** (#correction + 0.2·nudge).
-
-Leaderboard (opencode harness, k=2, sorted pass@1):
-
-| model | pass@1 | pass² | judge↑ | corr↓ | tok | min |
-|---|--:|--:|--:|--:|--:|--:|
-| *Oracle (ref ceiling)* | *~78%* | — | *0.904* | — | — | — |
-| claude-opus-4.8 | 63% | 52% | 0.801 | 1.38 | 74.0k | 23.3 |
-| gpt-5.5 | 58% | 48% | 0.763 | 1.59 | 29.9k | 10.7 |
-| claude-opus-4.6 | 58% | 46% | 0.755 | 1.59 | 42.0k | 23.2 |
-| glm-5.2 | 55% | 42% | 0.735 | 1.53 | 41.7k | 24.5 |
-| glm-5.1 | 52% | 34% | 0.729 | 1.54 | 41.6k | 38.8 |
-| deepseek-v4-pro | 48% | 29% | 0.679 | 1.76 | 49.8k | 21.0 |
-| minimax-2.7 | 39% | 24% | 0.630 | 2.17 | 43.4k | 36.2 |
-
-**Verdict: eval-only transfer target, NOT a training source.** Multi-turn interactive agentic = the infeasible-to-train category ([[fugu-ultra-single-turn-rl]]); tasks carry `reference_patch` + tests but need a repo-sandbox grader and would land all-fail at the 4096/minimal handicap. The aggregate board is **Opus-4.8-dominant on every quality axis** (single-call pattern; no per-task routing signal is recoverable from aggregates) — but it confirms our pool ordering (opus-4.8 > gpt-5.5 > glm-5.2; 3/4 of the training pool present, no Gemini). Novel axis: **User Correction** (multi-turn steerability), unused by the current objective. Post-training, run the conductor through the 109 as a real-world multi-turn transfer eval (needs a conductor→agent shim).
-
-## Global Milestone Checklist
-
-Final objective:
-- [ ] Train a Fugu-Ultra Conductor/model that outperforms the strongest individual model+scaffold worker.
-- [ ] Evaluate against individual models, scaffolded workers, fixed workflows, best-of-N, self-reflection baselines, and final held-out targets.
-
-## Current Status & Next Steps
-
-**STATUS 2026-07-10 (read this first):**
-
-- **STAGE-2 (2-turn feedback GRPO) is LIVE on POOL v2, resumed from step 166** — first new-pool batch (167) banked clean, orch on 168. Pool v2 (user-decided, every slot measured): **slot0 gpt-5.6-sol · slot1 gemini-3.5-flash (Yunwu, −90%) · slot2 gpt-5.6-terra · slot3 grok-4.5** — all Yunwu, all wall-clock-guarded, ONE premium slot, ~60-70% cheaper per workflow, fshard oracle 0.846→0.923. Opus + GPT-5.5 left the pool (stay in the endgame BASELINE set). Expect the re-anchoring wobble (~5-15 steps; 3/4 slots changed) then the climb; run to step 200, cadence rows (fu1+fu2 pairs, conc≤3) at 175/185/195.
-- **STAGE-2 WAS WORKING at the pause**: full-product fu2 0.867→**0.933** and fu1 0.800→0.867 in ten steps (rows ~157→~166); gap to the fair bar (opus+retry 0.950) closed to **−0.017**, paired +0/−1. The conversion metric (`ultra_mt_converted`) runs 3-15%/batch — the loop's rescues are real and rewarded.
-- **The week the frontier moved twice**: GPT-5.6 (terra 0.833@handicap — parity-with-5.5 FAILS by −0.05 but half price; sol fshard **0.885** = strongest worker ever measured here, trend60-fs 0.917, handicap 0.867) and grok-4.5 (fshard 0.769, handicap 0.867, cheapest) both probed, measured, and slotted within a day of release — zero retraining, because ordinals. Sol personally solved 2 of our 3 conductor-only trophy tasks: any fixed margin over "the best model" has a one-release shelf life; the durable product claims are structural (below).
-- **THE PRODUCT (crystallized 2026-07-10)**: an 8B self-hostable CONDUCTOR + orchestration runtime (executor, feedback loop, provider guards) over an anonymous, swappable worker pool. Four measured properties: (1) never below the best worker in any tested regime; (2) reaches the pool ORACLE frontier on contested tasks (+4-8 pts over best solo incl. tasks NO individual model solves); (3) frontier-quality output at cheap-tier average cost (premium spent only where needed); (4) survives model churn — 3 slots + a provider route swapped in ONE day with a config edit + $15 eval. NOT a router (routing is null), NOT a prompt scaffold (orchestration is TRAINED). Roadmap: step-200 ckpt → endgame verdict vs sol-era bars → transfer benches (SWE-Pro/TB/SWE-Together via agent shim) → optional adaptive-pool finetune for zero-shot bring-your-own-pool.
-- Operational deltas this week: gemini→Yunwu (−90%, wall-clock-guarded like all bare Yunwu reasoning slugs); Opus params (temp/top_p) deprecated → Opus rows no longer deterministic constants; eval-concurrency hard rule (conc≤3 while training, enforced in code) after the 3h57m batch-157 incident; live-safety gate caught the grok→Yunwu swap exactly as designed.
-
-**STATUS 2026-07-08 (superseded by the 2026-07-10 block above; kept as history):**
-
-- **PRODUCT FRAMING CORRECTED (user, forceful): the product is FUGU-ULTRA — the trained decomposition conductor that must BEAT the strongest individual model+scaffold worker.** It is NOT a cost-escalation router (that is the separate locked product-track). The step-144 pivot line "SHIP the single-call cost-escalation router. Done." is retracted as a product statement: flat-at-bar (−0.033) is NOT done — Fugu-Ultra must get OVER the bar. Training remains stopped @144 (adapter step_145 preserved, vLLM :8007 serving `default` = step-145); the question is what pushes Fugu-Ultra over the bar, at the paper's true setting.
-- **Two studies absorbed (user-supplied) as improvement sources for Fugu-Ultra:**
-  1. **Zenith** (`study/zenith` + tech report "From RALPH to Zenith"): on long-horizon tasks at FULL strength, the winning mechanism is repeated GAP-FINDING against the original requirement + independent verification + stopping discipline (RALPH = strongest simple baseline 3/8 wins; Zenith best mean rank 1.38 at 43% of RALPH's cost; GPT-5.5+Zenith #1 on FrontierSWE, beating the same model under its native harness). **Borrowed into Fugu-Ultra**: the execute→check→re-plan feedback loop — which is exactly the 2-turn MultiTurnEnv we already built (scratchpad/fugu_ultra_multiturn.py, 5/5 tests) + the trained repair-lane skill. Deployable at INFERENCE time, no retraining.
-  2. **SWE-Together** (`study/SWE-Together`, code-level): turn-key full-strength multi-turn harness (Harbor + Docker, effort=high, frozen judge rubrics, contested at full strength: best pass@1 0.63/oracle ~78). Custom agents plug in via `UserEnabled*` wrappers = the conductor→agent shim MISSION already wanted. Stays the TRANSFER benchmark for Fugu-Ultra (~$2-5/task-trial, separate GO).
-- **FULL-STRENGTH CAMPAIGN RESULTS (all runs 2026-07-08; full details in the Run Log entries below):**
-  1. **trend60 (COMPLETE)**: fu1 0.950 vs opus 0.933 — statistical TIE at the bar (clean discordants +1/−1) on a SATURATED set (oracle 0.933). Fugu-Ultra transfers zero-shot from handicapped training to full-strength workers.
-  2. **fshard, 26 hard LCB-V6 (COMPLETE)**: **fu2 0.846 = POOL ORACLE, +0.077 over best solo** (gemini-flash 0.769); the feedback loop's first 2 real conversions; 2 conductor-only single-shot wins across the sets. Conductor ceiling = the pool, not the conductor.
-  3. **Premium-pool probe, 6 tasks (COMPLETE, $4.71)**: gemini slot flash→**gemini-3.1-pro** (new `gemini-pro` logical model, OpenRouter; conductor/prompt untouched — anonymized ordinals): fu2 6/6 vs best premium solo 5/6; gemini-pro truncated 3/15 calls at 32k → cap raised to its 65536 ceiling for the full run.
-  4. **RUNNING NOW: premium-pool fshard (26 tasks, `--pool-upgrade`, pid 1479148, rows `scratchpad/fshard_pro_rows.jsonl`)** — THE report-class win test: does Fugu-Ultra with the report's own pool beat the best premium solo? Progress in the live block below.
-- **The original verdict-eval design** (`scratchpad/eval_fullstrength_verdict.py`, protocol `scratchpad/fullstrength_headroom_design.md` REV3), for reference:
-  - Workers UNCONSTRAINED for the first time: **max_tokens 16384 + reasoning_effort high** (Fugu report §4.1.1); temp 0.2/top_p 1.0 unchanged so only effort+cap move vs the historical series. Conductor generation unchanged (temp 1.0/1024/no-think, trained distribution).
-  - Arms: `solo__{opus,gpt,gemini,glm}` (the bar) · `solo2__W` (oracle-retry control, fires only on failures) · `fu1` (Fugu-Ultra one-shot) · `fu2` (Fugu-Ultra + the borrowed feedback loop; turn-1 ≡ fu1's sample → exactly paired). Fairness: fu2 and solo2 get the SAME binary incorrect signal — the honest pairing is fu2 vs best solo2.
-  - Verdict reads: **fu1 − best_solo** (does trained Fugu-Ultra beat the bar unhandicapped?) and **fu2 − best_solo2** (does the feedback loop add conductor-specific value beyond generic retry?). If fu2 wins its pairing → the loop ships as part of Fugu-Ultra AND the next training run is the 2-turn feedback env (Stage-2 with evidence).
-  - Guardrails: every pool.call metered (tokens/model, truncation, reported $), hard budget stop ($120 reported), resumable rows (`scratchpad/fs_verdict_rows.jsonl`), GPT streaming budgets raised for high effort (first-token 300s / total 600s). Smoke (n=2/capability, all arms) in flight as of this writing — rows flowing, all `ok`; full 60-task run follows on a clean smoke + cost projection.
-- Housekeeping: prior-session /tmp scratchpad artifacts (proof_agentic_demo, multiturn env+tests, probes, bounce scripts — everything MISSION references as "scratchpad/") were rescued into the persistent repo `scratchpad/` (41 files; /tmp is volatile across reboots).
-
-### Live progress — full-strength verdict eval (auto-updated by scratchpad/fs_progress_watch.py)
-
-<!-- FS_VERDICT_PROGRESS_START -->
-(Stage-2 training live on pool v2 — cadence rows land in the trend table above; the one-off verdict-eval progress this block used to track is complete.)
-<!-- FS_VERDICT_PROGRESS_END -->
-
-The paragraphs below describe the now-stopped training run and stand as history.
-
-**RUN LIVE (launched 2026-07-02 12:32, relaunch #3): 200-step paper-exact GRPO on the FULL 461-task mix.** Raw Qwen3-8B, verbatim ICLR Fig-13 prompt (three-list output, anonymized ordinal workers, 4 few-shots), no-think, no SFT, batch 256 = 4×64, advantage `(r−mean)/std`, temp 1.0, lr 1e-6 cosine + 6-step warmup **(→ 1e-5 constant from step 64 — the 10×-LoRA correction, see intervention block below)**, no KL, ≤5 steps, #2 penalty. Output: `output/fugu_ultra_paper/`. Two launch-killers were caught by the step-0 health gates and fixed same-day (full forensics in the Run Log): the **vf message-object repr bug** (52% of good workflows falsely zeroed) and the **stale lane map** that had silently trained EVERY prior run — including all 126 group-16 steps — on the 61 LCB code tasks only (400/461 tasks excluded; the old "plateau" was this data bug).
-
-**INTERVENTION @ STEP 64 (2026-07-05, user GO) — two changes live, applied together (outcome over attribution, per user):**
-1. **Fortress eviction ON** (`buffer.hard_threshold: 0.5` in orch_paper.yaml): a group averaging ≤0.5 (= all-fail exactly; one win in 64 averages 0.508 and SURVIVES) retires its task from the draw pool after one encounter. This completes the DESIGNED mechanism DATASETS assumed ("online_difficulty_filtering evicts no-variance tasks") that was silently unset since launch — zero evictions ever; bug-fix class, like the lane map. All-fail fortresses were 18–28% of groups (advantage exactly 0 = pure spend) AND the slowest batches (every worker call runs to the 4096 cap) ≈ 30–40% of wall-clock/cost. Expected: signal density +25–35% within ~20 steps as fortresses get drawn once and retired. Verify: orch `evicted_examples/hard` > 0, uniform-fail rate declining in `uniform_trend.log`.
-2. **LoRA LR corrected 1e-6 → 1e-5, constant** (train_paper.yaml): the 10×-LoRA rule (thinkingmachines.ai/blog/lora, user-supplied 2026-07-05) — optimal LoRA LR ≈ 10× the full-FT optimum, SFT and RL alike. The paper's 1e-6 was a FULL-FT rate ⇒ we ran 64 steps at ~1/10 the proper step size, a clean explanation for "healthy signatures, glacial pace". **The same article FALSIFIES the capacity hypothesis** (rank-1 LoRA matches full-FT in RL; policy gradients absorb ~O(1) bit/episode — r16 has ~1000× this run's information content) ⇒ **merge-and-regrow / rank-64 DROPPED from the fallback ladder**; our target coverage (attn+MLP) already matches the article's requirement. Pre-agreed revert rule: sustained grad_norm > 0.05, kl blowout, or parse collapse → back to 1e-6. Healthy signature (corrected on re-analysis): grad_norm stays in its old 0.0002–0.005 band INITIALLY — LR scales the weight UPDATE, not the reported gradient, so a 10× grad jump is NOT expected and its absence does NOT mean the change failed; over subsequent steps kl (old band 0.14–0.27) and grads may drift up as the policy moves faster — that drift is the thing to watch against the revert thresholds.
-- Restart mechanics: orch+trainer restarted (vLLM stayed up); trainer resumed from `step_00000064` manufactured from the atomic `broadcasts/step_64` (the proven outage pattern — zero steps lost, adapter CONTINUES, no reset); orch from override step 64. Live-log verified: `hard_threshold=0.5`, `online_difficulty_filtering=True`, "Found GRPO trainer checkpoint at step 64", "Learning rate: 1e-05".
-
-Run health (through step 140 — row 140 = 0.850 (−0.033; code 0.767 one-task wobble inside its ±0.08 band, math 0.933, parse_fail 2 — the 0–2 oscillation, not growth). Last four rows 0.850/0.900/0.867/0.850: net ZERO over 30 steps; the 0.900 increasingly reads as the high tail of an at-bar policy (~0.86–0.87 center). NO confirmation (needed ≥0.883 at 140). FLAT-CLOCK NOTE: if row 150 also lands ~0.85 with no confirmation, three post-peak rows are flat → the "cut to endgame early vs ride the last 50 steps" conversation becomes legitimate (spend-aware); until then, ride. Prior header (through 130) below stands as written. **AT THE BAR — the last three rows straddle it: 0.850 → 0.900 (+0.017, first positive) → 0.867 (−0.017). The 130 confirmation row came in ONE QUESTION short, so the +0.017 is NOT confirmed as steady-state; equally this is nothing like a collapse — the recent-5 band (0.850/0.833/0.850/0.900/0.867, avg 0.860) sits far above the pre-swap ~0.78, and a one-task difference is inside binomial noise on n=60 (sd ≈ 0.043). Statistically the policy's center is ≈ the bar itself. CODE STABILIZED AT ITS HIGH: 0.800 × three consecutive rows (110/120/130) — the below-bar axis is now a stable at-bar axis. Math 0.933 in-band; parse_fail 1 (fine). Known un-cashed headroom: repair-lane routing is still UNIFORM (the conductor hasn't learned who repairs best — that gradient is still accumulating) and repair parse-friction only finished cleaning ~129. DECISION: RIDE to 200 — the confirmation standard now needs two consecutive ≥0.883 rows (140+150 …); the endgame protocol (sealed 30-set, full baselines, FULL-STRENGTH workers, report harnesses) fires either on that confirmation or at run end, whichever first. 14B remains dead — rows are not flat and levers are still cashing. Repair-lane census through 129: draws on-rate, win ~22% contested, parse0 77%→8% self-corrected, one fortress auto-evicted; repair plans are 84% 4-step diagnose→derive→verify→implement pipelines (verbatim wins recorded) — the trained build-then-debug behavior is REAL. Rows 120/130 both measured under heavy provider congestion (eval 50-77 min vs usual 25-45) — grades unaffected (same graders; solos cached constants), only latency**):
-- **Honest recalibration @40**: the series 0.767 → ~0.77 → 0.717 → 0.850 → 0.783 oscillates around ~0.78 (base 0.767); the step-30 "climb gate PASSED" call was one row and did NOT confirm — 0.850 may be the high tail. By the same standard as the step-20 dip: no confirmed held-out movement yet. Math per-cap leans up (series mean ~0.89 vs base 0.867).
-- **The load-bearing evidence is the SAME-TASK probe** (with-replacement redraws = noise-free learning measurements): **math 5 UP / 0 DOWN** wherever there's a foothold — headline: the irrational-number task **CONVERTED 3/64 → 19/64** (steps 24→36), the full substrate mechanism (rare win → +3.5σ reinforcement → multiplied) completing on a NAMED task. Also 7→15, 19→32, 25→40. **Code churns at its handicap ceiling** (5 up / 5 down) — which is why aggregate train win-rate looks flat (math 0.185→0.168, code 0.615→0.626 across windows): real math gains cancelled by code noise. Fortress tasks (all-0.5, incl. `1cc8afd2f3` at 0/64 ×3) unmoved — the frontier hasn't reached them.
-- Pace-vs-paper context: their Fig-3 train curve is visibly up by iter 40 (full-FT); ours is LoRA-r16 @ lr 1e-6 — a plausible pace divisor. Verdict window: steps 50–70 (conversions must keep accumulating; held-out follows arithmetically). Same-task probe is now a standing cadence instrument.
-- **Learning signatures, all live**: task-conditional routing (all-math batches: opus in ~250/256 workflow slots, GLM ~20; code batches: exact mirror — learned from anonymized ordinals, no name priors); rare-win conversions observed repeatedly (3/64-win olympiad groups at +3.5σ per winner; a 13/64 partitions group converting); `steps_dist` unfrozen (4-step 8–37%/batch); LaTeX quote-drop parse noise being punished (−2.9 adv) = format self-polishing. **Prose-plan variant** (paper-style CoT before the lists): rare (~1%), lost at init, **won 2/3 at step 28** — the emergence seed; prevalence is the metric to watch.
-- Trainer clean throughout: grads 0.0002–0.005, kl 0.14–0.27, masked 16–21%, cosine on schedule; parse 0.96–1.00; redundancy penalty **0.0000 since launch** (the old prompt's ensemble defect doesn't exist under the paper prompt; #2 = pure insurance). Pace 20–110 min/step (hard-math batches run every worker call to the 4096 cap — slowness IS the headroom; batch-size cuts rejected as false economy, per-provider concurrency split queued as the pause-time lever).
-- **Power outage (2026-07-03, during step-20 generation): recovered with ZERO lost steps** — trainer's atomic `broadcasts/step_20` (STABLE) held the post-step-19 fp32 adapter; manufactured `step_00000020` checkpoint from it (integrity-verified), `scratch_resume_paper.sh` written (rollout-prune + broadcast self-heal); optimizer moments reset by design (not persisted; negligible at lr 1e-6 — post-resume metrics showed no transient, cosine resumed at the correct point).
-- Watch-items: `steps_dist` frozen at 3.07 (paper Fig-8 says diversity EMERGES; still frozen ~step 40 = exploration failure), GLM selection share (must stay low/decline), parse noise (fine unless it grows), Yunwu billing shows worker outputs slightly >4096 on some GPT/Opus calls (reasoning-token accounting on their gateway — correctness unaffected, visible text is capped; quantify at the next natural pause, never a mid-run stop).
-- **Uniform-group rate** (`uniform_trend.log`, scanner `scratch_scan_uniform.py`; measured 18% of groups zero-variance, ALL all-fail/all-0.5 = valid workflows on currently-unsolvable tasks — the emergence substrate, do NOT evict): **all-win watch (CORRECTED 2026-07-05)**: the scanner is structurally BLIND to all-win groups — online filtering drops them before rollouts.bin is written; watch `filtered_rollouts/easy` in the orch metrics instead. The baseline in fact broke at step 58 (all-win groups at 58/59/60/62, one per step, dropped untrained). **The pre-registered trigger FIRED EARLY (2026-07-05, step 64, user direction — "the biggest problem is the zero-signal fortresses"): `hard_threshold: 0.5` is LIVE** — see the intervention block above. Post-eviction the rate should DECLINE as fortresses get drawn once and retired; watch `evicted_examples/hard`. Sampling is WITH replacement (paper-consistent), so the aggregate rate is sampling-weighted — the load-bearing evidence is **named-task conversion** (e.g. `1cc8afd2f3`, all-fail at steps 12/14/19, seeded its first win 0→1 @49), not the aggregate curve; a lucky easy-task stretch can fake the rate, a named hard task converting can't be faked. Note the trade accepted: an evicted fortress can no longer convert (it's never redrawn unless the hard pool is recycled) — the 0.5-exact threshold preserves every task with ≥1 win ever, which is where all observed conversions started.
-
-### New-track trend (n=60 live, no-stop protocol; bar = Opus 0.883, oracle 0.983)
-
-Worker solo scores are constants of the eval set (temp-0.2 workers ≈ deterministic; re-measured every pass, always identical): **Opus 0.883, GPT 0.883, Gemini 0.800, GLM 0.383** — so all gap columns move only with the conductor. Success = the "vs opus" column turning positive.
-
-| checkpoint | conductor | code / math | vs opus | vs gpt | vs gemini | vs glm |
-|---|--:|--:|--:|--:|--:|--:|
-| base (raw, untrained) | 0.767 | 0.667 / 0.867 | −0.117 | −0.117 | −0.033 | +0.383 |
-| step 10 (live ×2) | 0.783 / 0.750 | 0.63–0.67 / 0.83–0.93 | −0.100 / −0.133 | −0.100 / −0.133 | −0.017 / −0.050 | +0.400 / +0.367 |
-| step 20 (live) | 0.717 | 0.633 / 0.800 | −0.167 | −0.167 | −0.083 | +0.333 |
-| step 30 (live) | 0.850 | 0.733 / 0.967 | −0.033 | −0.033 | +0.050 | +0.467 |
-| step 40 (live) | 0.783 | 0.667 / 0.900 | −0.100 | −0.100 | −0.017 | +0.400 |
-| step 50 (live) | 0.817 | 0.733 / 0.900 | −0.067 | −0.067 | +0.017 | +0.433 |
-| step 60 (live) | 0.717 | 0.633 / 0.800 | −0.167 | −0.167 | −0.083 | +0.333 |
-| step 70 (live, 6 steps post-intervention) | 0.783 | 0.667 / 0.900 | −0.100 | −0.100 | −0.017 | +0.400 |
-| step 80 (live; 16 LR-fix steps, 8 mix steps) | 0.750 | 0.733 / 0.767 | −0.133 | −0.133 | −0.050 | +0.367 |
-| step 90 (live; FIRST row under OOD few-shots + all fixes) | **0.850** | **0.767** / **0.933** | −0.033 | −0.033 | +0.050 | +0.467 |
-| step 100 (live; CONFIRMATION row) | **0.833** | 0.700 / **0.967** | −0.050 | −0.050 | +0.033 | +0.450 |
-| step 110 (live; regime row 3 — RLPR mix steps 101+) | **0.850** | **0.800** / 0.900 | −0.033 | −0.033 | +0.050 | +0.467 |
-| **step 120 (live; 7 repair-mix steps) — FIRST POSITIVE GAP** | **0.900** | **0.800** / **1.000** | **+0.017** | **+0.017** | +0.100 | +0.517 |
-| step 130 (live; confirmation row) | 0.867 | **0.800** / 0.933 | −0.017 | −0.017 | +0.067 | +0.483 |
-| step 140 (live) | 0.850 | 0.767 / 0.933 | −0.033 | −0.033 | +0.050 | +0.467 |
-| **RUN STOPPED @ step 144/145 (2026-07-08)** | — | — | converged flat-at-bar; adapter step_145 preserved; see decision block below | | | |
-| **STAGE-2 (2-turn feedback GRPO) resumed from 145 (2026-07-09)** | | | one-shot trend rows below measure ONLY turn-1 of the now-2-turn policy | | | |
-| stage2 step 155 (live; 10 feedback steps) | 0.800 | 0.767 / 0.833 | −0.083 | −0.083 | +0.000 | +0.417 |
-| **stage2 ~s157 FULL PRODUCT (fu2, first measurement @handicap)** | **0.867** | 0.800 / 0.933 | −0.017 vs best solo | **−0.067 vs FAIR BAR (opus+retry 0.933), paired +1/−5** | | |
-| **stage2 ~s166 FULL PRODUCT (paused here)** | **0.933** | 0.900 / 0.967 | **+0.050 vs best solo** | **−0.017 vs fair bar (opus+retry 0.950), paired +0/−1 — gap 75% closed in 10 steps** | | |
-
-Eval rules (standing):
-- **Trend evals run the paper's CONSTRAINED setting** (workers at 4096/minimal — identical to training, per §4.3; the whole historical series was measured this way). The FULL-STRENGTH (unconstrained) comparison is reserved for the endgame verdict.
-- **Judge the trajectory, not single points** (n=30 SE ≈ ±0.08; n=60 ≈ ±0.06).
-- Under the fixed recipe the **training curve should climb** (paper Fig-3: 57→78); a flat train curve is no longer excusable noise.
-
-### Next steps
-1. **Cadence (running)**: eval every 10 steps, live conc-3 against the training vLLM's `default` adapter, **training NEVER stopped** (user-mandated; the no-stop protocol). **Single pass per checkpoint (user preference 2026-07-04: protocol uniformity across the series; the doubled-gate idea was reverted before use)** — every-5 evals also rejected (doubles noise-reading temptation, not knowledge). Decision precision at gates comes from the free instruments instead: same-task probe + uniform scanner at every checkup. Watcher armed for step 50 (single pass). Command: `EVAL_TREND_LOG=output/fugu_ultra_paper/heldout_trend.log EVAL_MANIFEST=heldout_trend60_taskspecs.jsonl ULTRA_ALLOW_YUNWU=1 PYTHONPATH=ultra .venv/bin/python scratch_eval_live_throttled.py --label stepN_fullmix --conc 3 --n 60`.
-2. **Gates (recalibrated post-intervention)**: step-30 "climbing?" — **provisional, then walked back at 40** (0.850 unconfirmed; series flat ~0.78). Step-40 exploration gates: PASSED long ago (`steps_dist` unfrozen, routing task-conditional). **The live gate moves to ~75–90: the LR fix needs ~10–15 steps at proper step size to show** — same-task conversions must ACCELERATE (they were already 5-up-0-down at 1/10 LR; 10× step size should compound them) and held-out must leave the 0.78 band. If still flat there → stop + fallback ladder: **(1) mix rebalance / code-starvation test** (code is the axis below the bar — held-out code 0.633–0.733 vs best worker; check whether eviction shifted the diet too math-light and whether code needs more weight), **(2) conductor-scale** (winner-distill to 14B + short GRPO polish; **SFT is fully LOCAL** — the trainer LoRA+cpu_training handles ≤35B, user-confirmed 2026-07-04; the polish's vLLM serving fits locally via FP8-on-one-GPU or TP=2, rented 80GB only as the comfort option; distillation corpus = the winning rollouts already on disk). **Merge-and-regrow / rank increases are OFF the ladder** — the capacity hypothesis was falsified by the ThinkingMachines LoRA result (rank-1 matches full-FT in RL); LR, not rank, was the bottleneck, and it is now fixed. **Thinking-mode is TESTED-AND-REJECTED as a fallback** (probes 2026-07-02: think p50 ~3.3k tok, 40% truncation @8192, parse 0.58 vs 1.00 no-think, no quality edge) — the run is instead growing its own cheap deliberation (prose-plan variant, ~150 tok, winning since s28) inside the paper format; track its prevalence, don't force it. Fig-3 mid-run dip window (~50–75) still ahead; crossing 0.883 budgeted LATE (~150+).
-3. **Success** = held-out > **0.883** (bar; oracle 0.983 ⇒ +0.10 real headroom) with training grade climbing from the 0.55-avg band toward the paper's ~0.78.
-4. **Endgame** (unchanged): select best checkpoint on the 60-set; confirm ONCE on the sealed `heldout_confirmation_taskspecs.jsonl` — never evaluate it earlier (max-selection bias).
-5. **Final verdict** (unchanged): best checkpoint vs the FULL baseline set (single workers, best-of-N, self-reflection, fixed workflows), then transfer evals (SWE-Bench Pro / TerminalBench / SWE-Together — need harness shims).
-6. Queued for the next natural pause (not a stop): quantify Yunwu reasoning-token overhead (our completion cache visible-text lengths vs their billed output); if Claude is thinking despite `minimal`, add an explicit thinking-off param.
-
-### Reference (paths & sets)
-- **Base (current track)**: raw `Qwen/Qwen3-8B` (mesh HF cache snapshot `b968826d…`) — paper-style cold start from few-shots + format reward, NO SFT. The workflow-SFT base (`output/fugu_ultra_workflow_sft_qwen3_8b/`) is the superseded prior track; its instruction-blindness (0/90 CoT compliance) is documented in the Run Log.
-- **Data**: 461-task mix ≈ 55% hard math/reasoning + 39% code — authoritative table + rationale in DATASETS. Agentic benches are EVAL-ONLY.
-- **LCB**: `/var/lib/mesh/flavius/huggingface/hub/datasets--livecodebench--code_generation_lite/` (`test.jsonl`=V1 train, `test6.jsonl`=V6 held-out; graded on public + decoded-private tests).
-- **Decision sets**: `heldout_trend60_taskspecs.jsonl` (n=60 = original 30 + 15 LCB-V6 + 15 AIME) for every decision; `heldout_confirmation_taskspecs.jsonl` (n=30, SEALED) for the final verdict only.
-
-## Operational Invariants (do not relitigate)
-
-- **Eval concurrency during a live training run: conc ≤ 3.** Training runs 12-wide against Yunwu's ~16-concurrent ceiling; a conc-8 eval in the same window stretched batch-157 generation to 3h57m (2026-07-09, self-inflicted). The historical live-eval script was named "throttled" for exactly this reason. Enforced in code: `eval_fullstrength_verdict.py` clamps conc to 3 when grpo-orch is running.
-- **Opus sampling params DEPRECATED (user-flagged 2026-07-10)**: Opus no longer accepts `temperature`/`top_k`/`top_p` — Yunwu silently filters them. Consequences: (1) fresh Opus calls run at the model's default sampling, NOT our temp 0.2 → **the "solos are deterministic constants" assumption no longer holds for Opus** — expect mild run-to-run variance in fresh Opus rows (cached rows stay fixed); (2) provider code still sends the params (harmless while Yunwu filters; revisit if their gateway starts erroring instead); (3) at Stage-2 resume, Opus-step reward noise may tick up — worker-stochasticity, not policy signal (the wording-noise lesson applies).
-- **Provider routing (REVISED 2026-07-10)**: GPT-family / Gemini / grok → **Yunwu** (gemini flipped to Yunwu — 90% cheaper per user; grok because OpenRouter region-blocks it); open/specialist (GLM, Kimi, MiMo) → **OpenRouter**. **GPT must NEVER route through OpenRouter.** Live Yunwu calls fail closed unless `ULTRA_ALLOW_YUNWU=1`. **Yunwu ignores `max_tokens` for ALL reasoning models** (gemini re-probed 2026-07-10: 3.1k on a 400 cap — milder than the old 13–19k mode but still unenforced) → the STREAMING WALL-CLOCK GUARD is the real cap, covering bare `gpt-*`/`grok-*`/`gemini-*` slugs (OpenRouter's prefixed slugs self-select out). Cost accounting: Yunwu reports $0 — token metering is authoritative; the OpenRouter dashboard goes quiet for gemini from 2026-07-10 (expected, not an outage).
-- **Live-worker safety gate**: live mode requires a reviewed safety manifest matching the run's lanes / workers / providers / budget.
-- **Harness families available** (`ultra/ultra/harness/`): OpenCode, Codex, Claude-Code, direct QA, code_exec, tool-dialogue, terminal/Harbor, long-context. The single-turn training core uses `single_call` (one `pool.call` + grade) — no containers.
-- **Graders (audited, trustworthy)**: math → HuggingFace `math_verify` ($-wrapped gold, gold-first) + normalizer fallback; code → LiveCodeBench public + decoded-private tests; MC → `mc_letter`.
-- **Eval baselines** (the objective's comparison set): best individual model+scaffold worker; best commercial worker; best open worker; best fixed workflow; best-of-N single-worker; single-worker self-reflection; prompt-only vs SFT vs GRPO conductor. Always name exact model+scaffold+settings.
-- **Frozen manifests**: `director/manifests/fugu_clean_v1/frozen_manifests/freeze_report.json` (online / pool / final / deep_swe eval, hashed). DeepSWE is target/final eval ONLY — never train.
-
-## Condensed Lessons (durable conclusions; the day-by-day handover log was removed — recoverable from git, and the facts live in memory)
-
-- **Verifiability, not difficulty, is the headroom axis** — the load-bearing correction. HEADROOM MAP; [[fugu-ultra-headroom-is-agentic]].
-- **Per-task routing within a domain is NULL** (cross-fit p=0.90) → the conductor must DECOMPOSE, not route. [[swesmith-per-task-routing-null]]
-- **Coordination/decomposition is the beat-the-best-worker lever** — GLM-draft→Opus-debug 44% vs Opus-solo 36% on SWE (oracle 0.68→0.76). [[coordination-beats-opus-swe]]
-- **Live-agentic GRPO is infeasible to train** (Docker + 20-turn workers = call explosion; 0 rollouts / 11 min). Train single-turn test-graded code; agentic is eval-only. [[fugu-ultra-single-turn-rl]]
-- **Replay-over-fixed-arms does NOT learn** — free-form conductor outputs miss the arm set → uniform 0.5 reward → zero gradient. Decomposition must be live-graded, not replay-matched. [[replay-grpo-coverage-blocker]]
-- **GRPO learns only from within-group reward VARIANCE** — solve-all and fail-all both give zero gradient; difficulty-filter to the learnable band. [[frontier-pool-makes-paper-tasks-easy]]
-- **Every prior collapse came from deviating from the recipe** — rpe<16, temp<1.0, lr>1e-6, any KL, a ≤2-step gate, or a solo/repair-SFT base. The recipe table above is non-negotiable.
-- **Ultra-track TRAINING pool = Opus-4.8 / GPT-5.5 / Gemini-3.5-Flash / GLM-5.2** (user-confirmed 2026-07-01; per [[pool-complementarity-map]]). Do NOT swap in Gemini-3.1-Pro — that is the PRODUCT-track/benchmark worker; [[keep-gemini-31-pro-not-flash]] is product-track guidance and does NOT govern this training pool. (Flash "dominating" the reasoning probes was a symptom of reasoning having no headroom, not grounds to drop it from the CODE pool.)
-
-## Run Log (chronological — history lives here, not in Current Status)
-
-### 2026-07-01 — group-16 run (steps 0–126): loop, resume crash, early findings
-200-step GRPO on the 461-task mix at `batch_size 64 = 4 × 16` (later found to be off-recipe — see 2026-07-02 branch cut). Loop: training continuous (checkpoint every 10), **live held-out eval without stopping** (`scratch_eval_live_throttled.py`, conc-3 against the moving `default` adapter; validated zero disruption) — replaced the pause→eval→resume loop and its ~30-min restart penalty (empty generation pipeline + cold worker cache). Resume-crash fixed: the orch loads step-N weights from `run_default/broadcasts/step_N`, which broadcast cleanup prunes — `scratch_resume_lcb.sh` got a self-healing broadcast rebuild from the checkpoint. Proven end-to-end: conductor emits valid multi-step workflows, `direct_qa` + `code_exec` harnesses grade, GRPO trains cleanly (clean groups, non-zero advantage, no collapse). Refuted two worries: held-out climbed while training reward stayed flat/noisy ~0.58–0.75, and the model is trainable (not a Qwen3-non-thinking ceiling). Steps 20–60 evals were LIVE (moving adapter); base + step-10 frozen-ckpt, same config, comparable. Reward-trajectory chart of this branch: `output/fugu_ultra_lcb/reward_trajectory.png` (mean 0.648, slope ≈ +0.02/run — flat). The `--think` probe is DEAD for this base (workflow-SFT baked in non-thinking; `enable_thinking=True` is a no-op → empty `<think></think>`; a real thinking test needs raw Qwen3-8B).
-
-### 2026-07-01 — Intervention #2 @ step 80: redundancy penalty (reward-side)
-Persistent defect in rollouts (steps 14/35/41/63): **N×-near-identical-subtask → aggregate** ensembles — penalized by GRPO but not ground out (weak gradient). Fix in `fugu_ultra_pilot.py`: `_redundancy_penalty(workflow)` — token-Jaccard ≥ 0.75 over stopword-stripped subtasks, −0.1 per redundant step capped at −0.3, preserving reward ordering (correct-redundant ≥ 0.7 > valid-wrong-clean 0.5 > valid-wrong-redundant ≥ 0.2 > unparseable 0.0). Validated on real rollouts: winners/diverse 0.00, 4×-identical loser 0.30, reworded pair 0.10. Observable as `metrics/ultra_redundancy_penalty` (zero-weight rubric metric). Step-80 frozen eval (0.800) = pre-intervention baseline. Post-#2 status through iter 122: firing on 11–17% of workflows, rate softly declining (0.035–0.045 @ s92–95 → 0.003–0.022 @ s113–120), fine-grained gradient visible (s122 reward dist `{1.0:19, 0.8:2, 0.7:1, 0.5:37, 0.4:1, 0.3:2, 0.0:2}`). Training mechanics clean throughout (grad 0.0001–0.003, kl 0.5–0.6, std 0.26–0.30). Known false-positive class: verify/refine loops repeating iteration wording verbatim (≤0.3 capped) — add an iteration-aware exemption if verify-loop prevalence declines.
-
-### 2026-07-02 — Step-120 decision: #2 kept
-s120 (n=30) = 0.800, recovered from s100's 0.700 → cleared the ≥0.80 keep-threshold → s100 judged noise (code-only dip, 0.533 on n=15, ~1.2 SE; no damaging mechanism in rollouts — parse ~97%, wf-steps unchanged). The planned n=60 confirmation on the ~s125 policy was stopped mid-flight by the branch cut below and never completed. (The old rollback path — resume `step_00000100` sans penalty — is moot: that checkpoint now lives in the group-16 archive.)
-
-### 2026-07-02 — BRANCH CUT: restart from step 40 on the paper-exact recipe
-Trigger: paper re-read + full config audit against Conductor App. A.1 after the 60–120 parity plateau. Findings — the group-16 run was NOT the paper's recipe:
-1. **Group size 16 → 64** (`batch_size` 64→256 = 4 × 64, paper-exact). Rare good decompositions need ~64 samples/group to appear and get reinforced; 16 starves the emergence Fig-3 depends on. Prime suspect for the plateau.
-2. **Advantage std normalization was MISSING**: the recipe says `A=(r−mean)/std` but the `surogate` default is mean-only — silently ~2-4× smaller gradients than lr 1e-6 was tuned for (consistent with the run-long tiny grad_norms). Fixed: new `std_normalized_advantage` in `surogate/grpo/orchestrator/advantage.py`, wired via `advantage: {type: custom}` in `orch_lcb.yaml`, unit-tested through the exact yaml→config→orch path.
-3. **#2 kept** (deliberate paper-deviation, user-ratified): it targets a real defect the paper's conductor self-corrects via CoT-before-workflow — ours emits workflows with no reasoning preamble (the known remaining gap; next lever if group-64+std stalls).
-Protocol fixes en route: `max_concurrent` must be ≥ rollouts_per_example (→64, orch crash caught it); `max_inflight_rollouts` 96→384 (1.5× batch); **resume off-by-one fixed in `scratch_resume_lcb.sh`** — on resume at checkpoint N the trainer instantly re-consumed the stale `rollouts/step_N` (double-applying one ~zero-size update) then ignored the orch's regenerated step-N batch entirely (one full generation step wasted; also explains "first step after restart is slow/expensive") — the script now prunes `rollouts/step_≥N` at launch. Restart executed as: archive step>40 artifacts → resume from `step_00000040` (the 0.867 peak; under-powered-gradient hypothesis says its weights are good, just under-trained) → orch relaunched at step 41 against the trainer's step-41 broadcast. Known remaining deviations (assessed, accepted): IPO-mask loss vs PPO-clip (equivalent trust region; one optimizer step per orch step confirmed in `trainer.py`), constant lr vs cosine (≈9e-7 vs 1e-6 in the relevant window; warmup moot on resume), LoRA r16 vs presumed full-FT, 4-worker pool + hard-mix data + difficulty filtering (deliberate track decisions), AdamW β/eps standard (0.9/0.999/1e-8; paper's "eps 0.2" is a typo'd clip-ε), weight_decay 0.01 (paper unstated).
-
-### 2026-07-02 — Group-64 run STOPPED pre-verdict; pivot to the THINKING-CONDUCTOR track (user decision)
-The group-64 restart was stopped during step-41 generation, before any fresh gradient step landed — the recipe-fix hypothesis (group size + std advantage ⇒ climb) is **untested**, not refuted. State intact for a possible resume: checkpoints ≤40 + `run_default/broadcasts/step_40|41` in `output/fugu_ultra_lcb/`, group-16 archive unchanged. Motivation for the pivot: the paper's conductor deliberates before emitting workflows; our SFT base cannot (thinking trained away) — root-cause fix over another recipe tweak. En route: branch work committed (`fb5dcca5`, 189 files; `.env`/caches kept OUT of history), `origin/main` merged twice (dispatch-PP batch, then PR #58).
-
-### 2026-07-02 — Thinking-track probes + the tokenization fix
-- **Probe 1** (raw Qwen3-8B + few-shot, thinking ON, budget 4096, temp 1.0, 90 samples over 45 train tasks): parse 0.32 / truncation 0.68 — but **every completion that finished parsed** (format needs no SFT; length is the only constraint). Think p50 2,629 / p90 3,713. Executed workflows (n=16, handicapped workers): grade 0.56 (reasoning 0.67 / code 0.50 / math 0.00 — olympiad-math tasks are the designed-to-fail headroom band); SFT conductor reference ≈0.65. Steps dist {3:17, 4:9, 5:3}.
-- **Probe 2** (budget 8192, two arms): plain arm parse 0.63 / trunc 0.38, think p50 4,006 / p90 6,790 — **thinks expand with the budget** (temp-1.0 budget-filling), deeper workflows ({3:22, 4:23, 5:10}). Brevity-hint arm: pending at log time.
-- **Thinking-mode tokenization fix** (`cfd60620`, PR #58; cherry-pick of 53218813/f1a62366): `encode_for_training()` never set `enable_thinking`, so `<think>`-bearing assistant targets got a misaligned trainable span (doubled `</think>`, corrupted reasoning bytes — teaches reasoning after a closed think block). Would have silently poisoned the cold-start SFT. Merged, native lib rebuilt (`make build`), regression test `csrc/src/testing/tokenizer/test-chat-template.cpp` available via `BUILD_TESTS=ON`.
-- **Parser hardening**: `_extract_workflow_payload` now strips through the last `</think>` before JSON extraction (draft JSON inside the scratchpad can no longer corrupt rewards); tested on draft-in-think / empty-think / no-think / fenced shapes.
-
-### 2026-07-02 — PAPER PROMPT ADOPTED; mode = no-think; base = Qwen3-8B; track dir `output/fugu_ultra_paper/`
-- **Prompt audit vs ICLR Fig 13 / App. E found six material divergences** in our engineered prompt: "Return ONLY JSON" (an anti-CoT instruction — the paper parses lists *after* free CoT), synthetic bare-JSON few-shots (paper: 4 real OOD completions; ablation −9.4 LCB without them), full model-name + role leak (paper: anonymous ordinals; name-priors shown harmful, Table 11), fine-grained access indexes (their *underperforming* ablation arm, Table 9), an extra `budget` field, and a pro-decomposition nudge (plausible co-cause of the redundant-ensemble defect #2 targets). **Replaced with the verbatim Fig-13 prompt** + three-list parser (quote-aware balanced-bracket capture, `"all"`-expansion, preamble-stripping; unit-tested incl. the Fig-2 example). En route, repaired a concurrent-edit corruption (an unterminated `_PAPER_FEW_SHOTS` block that had eaten the `_task_lane_map` def).
-- **Base head-to-head (old prompt, budget 8192, identical tasks)**: Qwen3.5-9B thinks ~70% longer than Qwen3-8B (p50 6,728 vs 4,006), truncates 50-68%, grade edge (0.58 vs 0.49, n≤33) is survivorship-biased → **Qwen3-8B**.
-- **Mode probes under the paper prompt (24 tasks × 2, temp 1.0)**: no-think parse **1.00** / trunc 0 / completions ≤~263 tok; think parse 0.58 / trunc 0.40 (think p50 3,344) → **no-think**, conductor cap 1024 (paper-exact), seq_len 8192. Prompt-enforced-CoT vs direct probes on the old prompt (C 0.91 / D 0.93 parse; grades ~0.47-0.58 band regardless of mode) became moot post-switch; grading stopped mid-run by user.
-- **Raw model emits NO prose plan at init (0/48)** — bare lists; the paper's plan-prose is a *trained* behavior, free to emerge (format reward doesn't forbid it). **Init grade 0.29** (math 0.12 / reasoning 0.38 / code 0.38) vs old-prompt ~0.5 — the deliberate weak-init of the paper (no name-routing crutch, no engineered steering); Fig-3 starts below every worker too. `steps_dist` frozen at 3 even with 1/3/4/5-step few-shots (48/48) — logged as the exploration watch-item.
-- **SFT-base instruction-blindness measured**: the step-40 SFT conductor ignores an explicit plan-first instruction in 90/90 samples (0.98 parse, bare JSON) — resume-from-40 was formally incompatible with any CoT/prompt change; new track starts at step 0 by necessity, not preference.
-- Infra: `infer/orch/train_paper.yaml` + `scratch_launch_paper.sh` (fresh-run guard) + `EVAL_TREND_LOG` support in both eval scripts; vLLM spawn gotcha documented (heredoc-stdin scripts can't host an engine — probes must be real files with a `__main__` guard).
-
-### 2026-07-02 — LAUNCH; health gate catches a false-zero reward bug; fix + relaunch
-- **Pre-launch audit** (user-demanded, second time it paid): LR schedule was still `constant` (a resume-era leftover) → fixed to **cosine + 6-step warmup (paper A.1 exact)**; prompt-token census 0/521 over budget (max 4,434 + 1,024 ≤ 8192); server pre-flight proved `chat_template_kwargs.enable_thinking=false` is load-bearing end-to-end (without it the raw base thinks → truncates → r=0 everywhere). Base row anchored first: **0.767** (n=60; code 0.667 / math 0.867) vs best worker 0.883 (Opus; GPT 0.883, Gemini 0.800, GLM 0.383), oracle 0.983, gap −0.117 — healthier than the old SFT base's 0.733. Pool audit (base-row solos + 7,860 archived old-run rollouts): frontier trio complementary (Gemini owns code), GLM dominated at the handicap but its old-run 89%-usage was a name-prior artifact — the anonymized prompt already cut it to ~10% at init → **pool kept**, watch-item: GLM share must not rise.
-- **First launch (07:56) caught by the step-1 health gate**: 132/256 rollouts scored 0 while their stored completions were pristine. Forensics (reward↔record join by workflow content, length correlation, verifiers source): **`_completion_text` only handled dict messages, but this verifiers version passes pydantic message OBJECTS** → the parser received `str(object)` — the REPR — whose `\n`/`\'` escapes corrupt multi-line three-list payloads (single-line lists survived → the 48%/52% split). The old JSON track had silently tolerated the same bug via the first-`{`/last-`}` span + `parse_workflow`'s `\\'` fallback (which this explains). Damage nil: stopped at step 3, LR still in warmup (0→3.3e-7). Fixed (duck-typed message + content-parts extraction; killer-case tested), run dir wiped (base row preserved), relaunched.
-- **Relaunch (09:44) — gate PASSED**: `parse_valid` 0.69→**1.00**, grade 0.848, reward 0.924±0.180, 4×64, zero truncation, penalty silent; trainer step 0: grad 0.0007, kl 0.19, masked 18.4%, lr 0 (warmup).
-
-### 2026-07-02 — ROOT CAUSE: stale lane map trained BOTH runs on CODE ONLY (the real plateau cause)
-User challenged the "batch looks easy" framing ("we validated the dataset — why easy now?"). Investigation: **every training batch was 100% LiveCodeBench.** Cause — the env dataset builder filters tasks through `pilot_config_singleturn.json::task_ids_by_lane` and **drops any task not in it** (`task_lane is None → continue`, [fugu_ultra_pilot.py:652]). That lane map still held the **old 482-task `paper_train_taskspecs.jsonl` ids**; against the current 461-task `hard_mix_all_taskspecs.jsonl` only the **61 shared LiveCodeBench ids overlapped** — so **400/461 tasks (all 250 Omni-MATH + 30 Reasoning-Gym + 120 TACO) were silently excluded.** Verified the **old group-16 run was ALSO code-only** (archived rollouts steps 41-44 = 100% `unit_code`). **This reframes the entire group-16 plateau**: it was trained on the thin-headroom, Opus-dominant *code* slice — the exact slice DATASETS flags as "kept for eval-relevance, thin handicap-headroom" — and NEVER saw the math/reasoning headroom core. The group-size restart, base-model swap, and paper-prompt pivot were all chasing a plateau whose real cause was this data-exclusion bug. (The paper-track changes stay — they're genuinely more faithful — but the lane fix is the load-bearing one.) **Fix**: regenerated `task_ids_by_lane → {single_turn: [all 461 ids]}` (backup `.bak_lanemap`; config is gitignored/disk-only). Verified env now selects 461/461, mix `{omni_math:250, reasoning_gym:30, taco:120, livecodebench:61}`. Wiped the 8-step code-only run (base row 0.767 preserved — eval doesn't use the lane filter, stays valid), **relaunched on the full mix**. New gate adds: batches must be MIXED-source and reward must DROP below the code-only ~0.81 (headroom from math where handicapped workers fail — the whole point). **Lesson reinforced ([[read-source-trust-benchmarks]]): when a metric looks off, read what the run is ACTUALLY consuming, not what the config claims.**
-
-### 2026-07-03 — Outage recovery (zero loss); reviewer exchange → uniform-group instrumentation; STEP-30 GATE PASSED
-- **Power outage during step-20 generation.** Recovery: the trainer's atomic broadcast (`broadcasts/step_20` + STABLE) held the post-step-19 fp32 adapter → integrity-verified (504 tensors, finite) → manufactured `step_00000020` checkpoint from it → `scratch_resume_paper.sh` (hardened: stale-rollout prune + broadcast self-heal) → resumed at step 20, zero steps lost. Optimizer moments aren't persisted by design; reset was invisible in post-resume metrics (cosine LR resumed at the exact step-20 value). A second machine restart mid-recovery handled by the same script.
-- **External review exchange** (saturated-groups claim): measured advantages refuted the mechanism — std-normalization gives 56–60/64 groups sharp signal (losers −2.6…−3.8σ); the REAL waste is **all-fail-uniform groups (all-0.5): 18% of groups, zero gradient** — valid workflows on currently-unsolvable tasks = the emergence substrate, deliberately NOT evicted (filter thresholds unset = accidentally paper-faithful). Built `scratch_scan_uniform.py` → `uniform_trend.log`: per-step uniform rate (fail/win split), named-task identity ledger. Pre-registered trigger + all-win tripwire written into watch-items. Sampler confirmed WITH-replacement (task `1cc8afd2f3` drawn 3× in 8 steps) — aggregate rate is sampling-weighted; named-task conversions are the load-bearing evidence.
-- **Step-30 gate: PASSED.** Held-out 0.850 (code 0.733 / math 0.967 = 29/30), above every prior row; gap to Opus −0.033; gemini crossed. Observed en route: task-conditional worker routing under anonymized ordinals (opus↔math ~250/256 slots, GLM↔code mirror), rare-win conversions (+3.5σ on 3/64-win olympiad groups), steps_dist unfrozen, prose-plan variant's first wins (2/3 at step 28 vs 0/2 at init — emergence seed, prevalence tracked). Discipline: not banked until >0.883 and sealed-set confirmed; Fig-3 mid-run dip (~50–75) still expected.
-
-### 2026-07-04 — Step-40: honest recalibration; same-task probe becomes the primary instrument; first NAMED conversion
-- **Step-40 row 0.783** (code 0.667 / math 0.900). Series 0.767 → ~0.77 → 0.717 → 0.850 → 0.783 = **flat ~0.78±0.05**; the step-30 "gate passed" was over-credited on one row (same standard as the step-20 dip) — corrected in Current Status.
-- **Three instruments run at 40**: (a) held-out aggregate — flat; (b) composition-controlled train win-rate — flat (math 0.185→0.168, code 0.615→0.626, windows 0-19 vs 20-40; wide task-draw error bars); (c) **same-task redraws (with-replacement = noise-free probes): UP 8 / flat 7 / DOWN 5**, and by capability: **math 5-up-0-down** wherever a foothold exists — the irrational-number task **converted 3/64 → 19/64** (steps 24→36; the same group showcased at step 24 with +3.5σ winners) — first completed named conversion; code churns at handicap ceiling (masks math gains in aggregates); fortresses (`1cc8afd2f3` 0×3, σ(S), primes) unmoved.
-- Interpretation on record: learning is REAL but math-concentrated and slower than the paper's curve (full-FT vs our LoRA-r16 @ 1e-6). Live gate moved to **steps 50–70: conversions must accumulate**; 70–80 stop-gate unchanged. Same-task probe added to the standing cadence report.
-
-### 2026-07-04 — Step-50 gate: single-pass row 0.817; window leaning up; conversions continue
-- **Protocol note**: the doubled-gate eval was reverted BEFORE first use (user preference: series uniformity) — all rows remain single-pass n=60; decision precision comes from the free instruments.
-- **Row**: 0.817 (code 0.733 / math 0.900), gap −0.067. **Windowed read: rows ≥30 average 0.817 vs 0.754 before (~1.8σ pooled) — leaning real, below the confirmation bar.** Code shows 0.733 in 2 of the last 3 rows (floor was 0.63–0.67).
-- **Same-task ledger (31 repeated tasks): UP 8 / flat 17 / DOWN 6.** New since 40: the named task's third rise (7→15→18), a +17 conversion (24→41), and a **fortress first-win** (0/64 @6 → 1/64 @49 — the seed shape that preceded 3→19). Debits: one foothold lost (4→0), code churns at ceiling. All-win tripwire intact; uniform rate last-10 0.23 (fortress-heavy draws 42–50).
-- **Step-42 low-reward (0.529) investigated on request**: 3 of 4 groups were all-0.5 fortresses (incl. a "prove by induction" task), 1 live group = the named ledger task at 18/64 — composition, not regression; zeros were the known LaTeX quote-drop typo mode.
-- Gate verdict: **CONTINUE** — no trigger in either direction. Decision pressure on steps 60–70; 70–80 stop-gate unchanged (flat AND conversions stalled). Fallback ladder standing: (1) merge-and-regrow, (2) conductor-scale (SFT local ≤35B per user; polish serving FP8/TP-2 or rented); thinking-mode remains tested-and-rejected.
-
-### 2026-07-05 — Step-60 row 0.717 (weak reading); wording-noise diagnosis from step-63 rollouts
-- **Row**: 0.717 (code 0.633 / math 0.800) — matches the step-20 low; post-30 window mean drops 0.817→0.792 vs pre-30 0.754 (~1.1σ — the up-lean weakened; symmetric standard applied: neither confirmed climb nor collapse). Inside Fig-3's dip window (50–75) but NOT excused by it — step 70 (single-pass) + the same-task ledger carry the stop-gate decision. Uniform-rate last-10 rose to 0.28 (fortress-heavy draws 52–63). Watcher for 70 armed in advance this time (the step-60 eval fired ~1 step late — a forgotten watcher, measurement unaffected).
-- **Step-63 deep-dive (user-directed) — WHY plan-writing learns slowly**: in a 12/64 contested olympiad group, winners' and losers' plans were near-identical paraphrases; the best-WRITTEN plan (named the upper-bound+construction strategy) LOST. Diagnosis: on single-answer olympiad tasks, outcome ≈ worker luck, so wording-level credit assignment there is mostly noise; genuine plan-content learning comes from tasks where instructions are CAUSAL (algorithmic code — the "sliding window + frequency map" class — and multi-part problems). Micro-level confirmation of the HEADROOM-MAP verifiability thesis. Implication recorded: capacity levers (merge-and-regrow, 14B) amplify the causal signal but cannot clean worker-luck noise; the code half of the mix is where remaining plan-quality gains live.
-- Behavior census (25–40 vs 53–63): policy HALVED its worst chain (solve-first, 13–17% win), grew the 4-step verify+format chain (14%→22%, glm-as-formatter = the paper's weak-model niche), 2-step plans vanished; prose-plan variant dormant (2/2560) — downgraded from "emergence seed" to counted-only.
-
-### 2026-07-05 — INTERVENTION @ step 64 (user GO): fortress eviction ON + LoRA LR 1e-6→1e-5; capacity hypothesis falsified
-- **Trigger**: user pushed past the pre-registered 70–80 window on both fronts — "the biggest problem is the zero-signal fortresses" and "i really don't care about decision structures, I care about what we can do to improve the outcome" — then supplied thinkingmachines.ai/blog/lora, which changed the plan itself.
-- **Change 1 — eviction** (`orch_paper.yaml buffer.hard_threshold: 0.5`): source-verified in `surogate/grpo/orchestrator/buffer.py` (L244–254): post-scoring, group avg ≤ threshold → example moves to the "hard" pool and is POPPED from the sampling buffer (never redrawn unless recycled at pool exhaustion). All-fail groups average exactly 0.500; one win in 64 averages 0.508 and survives — so 0.5-exact retires only proven-dead tasks and preserves the entire conversion frontier. This was a silent no-op since launch (thresholds default None; `evicted_examples` 0 forever) even though DATASETS explicitly assumed it. Fortresses were 18–28% of groups and, being cap-runners (every worker call burns to 4096 tok), ~30–40% of wall-clock/spend — all at advantage exactly 0.
-- **Change 2 — LR** (`train_paper.yaml`: 1e-5 constant, warmup 0): the ThinkingMachines LoRA study (user-supplied): (a) optimal LoRA LR ≈ **10× the full-FT optimum**, SFT and RL alike → the paper's 1e-6 (a full-FT recipe) meant our first 64 steps ran at ~1/10 proper step size — a mechanism-level explanation for "all signatures healthy, pace glacial"; (b) **rank-1 LoRA matches full-FT on RL** (policy gradients absorb ~O(1) bit/episode; r16 carries ~1000× this run's total information) → the capacity/rank hypothesis is FALSIFIED → **merge-and-regrow + rank-64 removed from the fallback ladder** (replaced by mix-rebalance → conductor-scale); (c) our adapter already covers attn+MLP as the article requires. Cosine dropped for constant (remaining decay is second-order vs the 10× correction). **Revert rule (pre-agreed): sustained grad_norm > 0.05, kl blowout, or parse collapse → back to 1e-6.**
-- **Mechanics**: orch+trainer killed (vLLM kept serving); `step_00000064` checkpoint manufactured from the atomic `broadcasts/step_64` (the proven outage pattern — 504 fp32 tensors verified finite; optimizer moments reset, negligible); relaunched with `SUROGATE_GRPO_START_STEP=64`. Live logs confirmed all three: `hard_threshold=0.5` + `online_difficulty_filtering=True`, "Found GRPO trainer checkpoint at step 64", "Learning rate: 1e-05". Zero steps lost; adapter continues (no reset). Attribution note (accepted): two levers moved at once — if 65–90 improves we don't know the split, and that trade was chosen deliberately (outcome over attribution).
-- **What to watch**: first trainer step at 1e-5 (grads should stay IN the old 0.0002–0.005 band — LR scales the update, not the reported gradient; watch kl drift over subsequent steps instead; health gate armed), `evicted_examples/hard` climbing as fortresses get drawn and retired, uniform-fail rate declining, same-task conversions accelerating, held-out leaving the 0.78 band by ~75–90.
-- **Health gate @64 PASSED (05:30)**: `loss=0.0142 grad_norm=0.0018 lr=1.00e-05 kl=0.1618` — LR confirmed in the live step line, grad and kl both inside their old bands, no revert trigger. Eviction counters 0 at step 64 — CORRECT, not a miss: the batch drew easy tasks (reward mean 0.908, median 1.0; ledger confirms no group averaged ≤0.5). First real eviction still pending a fortress draw; kl-drift watcher armed for step 66.
-- **INTERVENTION VERIFIED END-TO-END @66 (06:51)**: (a) trainer stable through three 1e-5 steps — grads 0.0018/0.0024/0.0005, kl 0.162/0.159/0.140 (declining, in band), no drift toward any revert threshold; (b) **eviction FIRING: 5 fortresses retired in steps 65–66** (`evicted_examples/hard` 0.4 then 0.75; ledger avgs 0.4844–0.5000), **0 WRONGFUL — every evicted group had zero wins**; the parse-noise edge case measured at 0/5 in its first live test; (c) `pool/hard` tracks exactly (2/461=0.0043 → 5/461=0.0108). Also: a 5th all-win group at step 65 (`filtered_rollouts/easy` 0.2 — occurrences now 58/59/60/62/65, ~every other step, 64 worker calls each for zero gradient) — the queued `easy_threshold: 1.0` lever keeps gaining evidence.
-- **Status through step 70 (12:17)**: trainer clean (step-70: grad 0.0003, kl 0.143). **9 evicted total; the edge case BIT ONCE — 1/9 wrongful**: step-70 retired `d4ea72833d` at avg exactly 0.500 with 1 win (its first-ever win + one parse-zero in the same group — the predicted collision). The winner still trained (+σ); only the redraw-multiplication is lost. **Materially softened by an operational fact verified from source: buffer pools are IN-MEMORY only (no serialization in buffer.py) — evictions RESET on every orch restart**, so `d4ea72833d` returns at the next bounce (and dead fortresses re-evict on first draw at the cost of one group each; eviction's benefit is per-orch-lifetime, not cumulative across restarts). Ledger stays the instrument: if wrongful rate grows past ~1-in-5, revisit (options: accept, or orch-bounce to re-seed the pool).
-
-### 2026-07-05 — Post-GO verification of the step-64 intervention (user-requested re-analysis): mechanics CONFIRMED, one bounded edge case, one standing blind spot exposed
-- **Eviction mechanics confirmed from source** (`buffer.py`): comparison is `avg_reward <= hard_threshold` (L246) over the RAW rewards of all 64 rollouts (L241, parse-zeros included) → all-fail (0.500) evicted, 1-win (0.508) survives, exactly as designed. Recycling is effectively OFF (`normal_pool_min_examples=0` → hard pool returns only if the normal pool empties entirely, which 461−~140 fortresses never does) → **evictions are permanent for this run**. Live orch config line confirms `hard_threshold=0.5` loaded. `evicted_examples/hard` metric = per-step FRACTION of scored examples (one eviction among 4–5 examples reads ~0.2–0.25, not a count).
-- **The one real edge case, bounded**: a group with wins ≤ parse-zeros also averages ≤ 0.5 (1 win + 1 zero = exactly 0.500) → a FRESH conversion can be wrongfully evicted, permanently. No avg-threshold can separate this from a pure fortress (identical averages) — only a different criterion (max-reward) could, which the buffer doesn't support. **At current parse health it's negligible**: 13 of the last 15 steps had ZERO invalid rollouts (1 zero in ~3,840) → ~2% risk per fresh 1-win group, ~0 for 2+ wins; the win itself still trains (+3.5σ) either way — only the redraw-multiplication is lost. Not modeled but MEASURED from here: the scanner now emits a per-step **eviction ledger** (every avg≤0.5 group with its win count; wins>0 = wrongful) — if parse noise ever spikes back, wrongful evictions become visible the same day.
-- **Standing blind spot exposed (belief corrected)**: online filtering drops all-win groups from the batch BEFORE `rollouts.bin` is written (buffer.py L261) → the uniform scanner could NEVER see an all-win group; "all-win ever: 0" was measured on a filtered stream. The metrics stream shows the truth: **all-win groups occurred at steps 58, 59, 60, 62** (one full group each = 20% of those steps' generated rollouts, dropped untrained) — the pre-registered "all-win baseline breaks" event actually fired at 58. Watch `filtered_rollouts/easy` in the orch metrics, not the scanner, for this signal. Consequence: solved tasks are NOT evicted (easy_threshold unset), stay in the pool, and will be redrawn MORE often as hard-eviction shrinks the pool — each redraw burns 64 full worker generations for zero gradient. **Symmetric lever identified but NOT enabled** (two changes already live): `easy_threshold: 1.0` (retire perfectly-solved tasks). Queued for user GO at the next natural orch bounce if `filtered_rollouts/easy` grows.
-- Also noted: partial-credit code groups can sit uniform at e.g. all-0.75 (zero variance, zero gradient) yet are NOT evicted at threshold 0.5 — unavoidable with an avg-only rule (threshold must stay below 0.508 to protect 1-win groups); the ledger will show their frequency.
-
-### 2026-07-05 — Orch state persistence STAGED (user request: don't lose evictions/rollout cache on resume): config-only, activates at next orch bounce
-- **Discovery: the machinery already exists** — `Buffer.save()/load()` (buffer.py) persists exactly the two things at risk (eviction pools + surplus rollout cache) with content-hash matching (`hash_keys=['task','prompt']`, robust to example renumbering, warns if the manifest changed), driven by a `CheckpointManager` (ckpt.py) we had simply never enabled. Our env-var resume (`SUROGATE_GRPO_START_STEP`) bypasses it entirely (it lives in the "training from scratch" branch).
-- **Staged (no effect on the live process — code/config are read at orch start)**: (1) `orch_paper.yaml` + `ckpt: {interval: 1, resume_step: -1, wait_for_weights_timeout: 600, keep_last: 15}` — pools+cache saved to `run_default/checkpoints/step_N/orchestrator/` at the top of every step (few MB, sub-second; keep_last bounds disk); (2) `scratch_resume_paper.sh` now prunes orch checkpoints AHEAD of the trainer's resume step — the alignment contract that makes `-1` resolve to exactly the trainer's step (orch saves at top-of-step BEFORE the batch is generated, so the ckpt at step T always exists when trainer ckpt T does). First restart after deploy: no orch ckpt exists → env-var fallback behaves exactly as today, and saving begins from then on. Both files validated (yaml parse + bash -n).
-- **What it covers / doesn't**: covers eviction-pool state (the 9-and-counting retirements survive restarts; the `d4ea72833d` wrongful-eviction quirk also persists once saved — an orch bounce BEFORE deploy would still reset it) and the boundary surplus cache (up to ~2 groups over batch size from max_inflight overshoot). Does NOT cover mid-step in-flight generation (the ~1 batch lost on a mid-step kill, e.g. the intervention restart) — that would need a continuous group-spool patch in the orch collection path; deliberately not built (rare event, deeper change, off the critical path).
-- Deploy moment: next natural orch bounce, together with the queued `easy_threshold: 1.0` decision (both need the same restart).
-
-### 2026-07-05 — In-flight rollout spool DESIGNED + IMPLEMENTED (user: "design it properly"): closes the mid-step loss; staged OFF pending the bounce GO
-- **Problem**: a mid-step orch kill loses every completed-but-unbatched rollout (the intervention restart burned ~1 batch ≈ 100 min + worker spend). The interval checkpoint (entry above) only covers step boundaries.
-- **Key insight from scheduler.py (read before designing)**: generation is per-rollout with incremental group assembly — `Scheduler.groups` already holds partial groups ACROSS steps in RAM, and rollouts up to `max_off_policy_steps=8` policies old are already legal training input. So recovery = persist/restore `Scheduler.groups`, exactly like `buffer.load` restores pools. **No new training semantics**: no batch surgery, no example re-pinning (the example dict rides inside the group event, so even a meanwhile-evicted task correctly finishes its paid-for group), staleness = the scheduler's own off-policy rule applied at load.
-- **Mechanism**: append-only event log `run_default/checkpoints/inflight_spool.jsonl` (`group_start`/`rollout`/`group_done`/`group_dropped`); `group_done` written only AFTER the group reaches the buffer (a kill in between resurrects, never loses); every write fail-open (spool disables itself, generation never blocks); flushed not fsynced (kill ⇒ zero loss via page cache; power-cut ⇒ lose seconds of tail); compaction at each step start regenerates the file from live groups (atomic tmp+rename, bounds size ~1 step). Restore: rebuild GroupStates with fresh ids, `rollouts_to_schedule = 64 − restored`, normal scheduling tops up; groups restored complete drain through the same `_accept` path at the next `generate_batch` (deferred re-scoring is CPU-only + idempotent).
-- **Recovers** ~70–90% of in-flight spend at a typical kill (2–3 of 4–5 groups fully done + the completed majority of the slow cap-runner group) vs 0% today. Non-goals: rollouts mid-HTTP-call (unfinishable), cross-manifest migration.
-- **Files**: NEW `surogate/grpo/orchestrator/spool.py` (InflightSpool, torn-tail-tolerant loader); `scheduler.py` (4 hook lines, `_accept` closure unifying the two acceptance branches + done-marker, `restore_from_spool`, compact+drain at batch start, scoring_tasks now carries group ids); `grpo_orch.py` (construct+restore); config field `ckpt.spool_inflight` (default false). **Tests: 7/7** (round-trip, done/dropped exclusion, torn tail, staleness discard, compaction, fail-open, restore top-up math) + import smoke + real-yaml config parse + py_compile.
-- **Deploy**: `spool_inflight: false` in orch_paper.yaml until the reviewed bounce — an unplanned crash tonight runs only proven code. Flip at the bounce (same GO as easy_threshold + interval-ckpt activation); acceptance check on the FOLLOWING restart: "Restored N in-flight group(s)" in orch.log.
-
-### 2026-07-05 — Step-70 row 0.783 (single pass, 6 steps post-intervention): back to series center; too early for the LR verdict
-- **Row**: 0.783 (code 0.667 / math 0.900), gap vs Opus −0.100 — bounces back from step-60's 0.717 to exactly the series center (post-30 mean 0.790). By the standing symmetric standard: still no confirmed climb, no collapse. This row carries only ~6 steps of the corrected LR — the intervention verdict reads at rows 80/90 (steps ~75–90).
-- Post-intervention run state at eval time: 9 fortresses evicted (1 wrongful, see entry above), trainer grads 0.0003–0.0024 / kl 0.140–0.162 across steps 64–70, parse ≥0.988, no all-win groups since 65. Cadence 64→70 ≈ 68 min/step (eviction's wall-clock payoff needs more fortress mass retired before it shows).
-
-### 2026-07-05 — Rollout census 65–70 (first post-LR-fix window): ROUTING REORGANIZED from domain-dispatch to a role-pipeline
-- **Headline**: in ~7 steps at 1e-5 the routing distribution transformed. Baseline (25–40, 53–63): domain dispatch — math ≈ all-opus (~250/256 slots), code ≈ glm-mirror. Now (n=1536): math slots opus/gemini/gpt ≈ 32% each (glm 5%); code gemini 31 / gpt 32 / glm 27 / opus 10. **First slot: gemini 68–90%, gpt the rest — opus and glm NEVER open.** The policy now assigns models to ROLES in a fixed pipeline — gemini opens (understand), gpt derives, opus verifies/deep-reasons, glm formats when a 4th step exists (the winner exemplar: `[1,2,0,3]` gemini→gpt→opus→glm). Position-conditional routing is qualitatively closer to the decomposition objective than the old domain dispatch. This is the first clear policy-level movement at the corrected LR — 25 pre-fix steps produced drift, 7 post-fix steps produced reorganization. NOT yet evidence of quality (step-70 held-out 0.783 = unchanged); verdict still at rows 80/90.
-- Shape census: steps mean 3.02→3.15, 3-step 85% / 4-step 15% / first 5-steps (0.3%); 1–2-step extinct; prose-plan still dormant (2/1536); unparsed 1.0% (win 0/15 — format still self-polishing). 4-step plans win 41/143 (29%) vs 3-step 41%... but composition-confounded; the cleaner signal is the verbatim pair below. (Classifier here is a reconstruction — chain-class SHARES aren't strictly comparable to the 53–63 census; the routing numbers and steps_dist are.)
-- **Verbatim pair (step-70 math 1/64 group = `d4ea72833d`, the wrongfully-evicted task)**: winner vs 0.5-loser plans are near-identical prose (wording-noise thesis holds); the difference is STRUCTURAL — winner adds a dedicated verify step AND a glm format+box step (4-step) where the loser folds both into its last step (3-step). Same group also contained the malformed-list parse-zero that dragged the average to exactly 0.500 and evicted the task at its moment of first conversion — the ledger's 1-wrongful, illustrated live.
-- Window rewards: 65: 0.709, 66: 0.594, 67: 0.711, 68: 0.933, 69: 0.670, 70: 0.568; rich mid-band conversions at 67/69 (10–28/64 groups). Step 71 in progress is a fortress-heavy draw (64/256 after 2h17m, ~128 s/rollout) — these tasks get retired after this encounter, but step-80 eval ETA slips to ~1.5–2 days out.
-
-### 2026-07-05 — MIX REBALANCE measured and STAGED (user push: "shouldn't we do this now?"): 60% code / 40% math, deploys at the bounce
-- **Measurement (bins 45–70, read-only)**: code = 39% of draws but **~60% of all learnable signal** — 87–100% of code draws land contested (1–63 wins) vs 39–47% for math (the rest are fortresses); code had 0 fortress draws and 0 near-saturated draws post-fix (entirely in the learnable band); gradient-mass share code 61% / math 39%. Combined with the wording-noise finding (math credit is part worker-luck, code credit is causal) and the objective gap (held-out code 0.63–0.73 vs the 0.883 bar; math ~0.90 ≈ worker level): **a code draw teaches ≥2× per dollar and is the axis that must move**. The fallback-ladder item is pulled forward, same pattern as eviction.
-- **Mechanism (staged in orch_paper.yaml, zero effect until restart)**: the single env split into `fugu_ultra_math` (280 omni+reasoning-gym) / `fugu_ultra_code` (181 TACO+LCB) over the SAME lane map (461/461 coverage verified — the stale-lane-map lesson); `buffer.env_ratios: [0.4, 0.6]`; per-env `max_concurrency` 4+8 keeps aggregate provider load at the proven 12. Manifests: `hard_mix_math_taskspecs.jsonl` / `hard_mix_code_taskspecs.jsonl`. Expected: learnable groups per batch +~16% mechanically, more via credit quality; held-out comparability unaffected (fixed 60-task set).
-- **Pre-deploy audit (user-requested, 2026-07-05) — full source re-verification of the staged bundle**: (1) `example_id` collision across the two envs is DESIGNED AWAY — `vf.EnvGroup.get_dataset` strips per-env ids and re-numbers globally, and it also normalizes the `task` column to env names (double insurance on the buffer assertions); (2) `resolved_name` = the `name:` field → matches both `task_name` args and the `env_ratios` order; (3) the live-safety manifest has NO env/task-name field (gates lanes/providers/workers/budgets only) → the rename cannot trip the boot gate; each env validates its args independently; (4) our env scores rollouts INLINE (zero "Deferred group scoring" lines all run) → spooled rollouts always carry rewards; (5) **found + fixed: `keep_last`/`keep_interval` were documented config but enforced NOWHERE** — implemented `_cleanup_old_ckpts` in ckpt.py (prunes step_N dirs only, spool file untouched — test-verified); (6) **two restore guards added**: spooled groups from a FUTURE step (stale spool + fresh/rewound start) and from renamed/removed envs are discarded at load (mirrors buffer.load's own env filter, and prevents a KeyError in per-env metrics); (7) ckpt-step scanner globs `step_*` → `inflight_spool.jsonl` in the same dir is invisible to it; resume-script prunes match unpadded orch dirs and padded trainer dirs correctly. **Tests 8/8** (added: future-step discard, unknown-env discard, keep_last cleanup), py_compile over all six touched files, bash -n, and yaml/manifest/ckpt-config assertions all green.
-- **The bounce now deploys FOUR levers in one restart**: mix 60/40 + `easy_threshold: 1.0` + orch state persistence (interval ckpt) + in-flight spool (`spool_inflight: true` — flipped from false at staging, per the same review). Procedure (the proven step-64 pattern): wait for trainer `step=71` to land (do NOT kill the 3h+ in-flight batch — the spool isn't live in the RUNNING orch), manufacture `step_00000071` from `broadcasts/step_71`, kill orch+trainer, `scratch_resume_paper.sh`. Post-bounce verification: two envs + ratios + easy_threshold in the buffer config line, "In-flight rollout spool enabled", lr 1e-05, and decode bin 72 to confirm ~60% code draws (verify what the run consumes). Known resets at this bounce: the 9 in-memory evictions (re-evict on draw; `d4ea72833d` returns) — the LAST time eviction state is lost (persistence live from then on). **USER GO 2026-07-05 — bounce ARMED**: automated at the step-71 boundary (trigger = `step=71 loss` in train.log AND `broadcasts/step_72/STABLE`); manufactures checkpoint-72 from the post-71 broadcast (size-checked vs step-70's adapter), stops orch+trainer (vLLM stays), prunes rollouts ≥72, relaunches with the audited config, prints the acceptance snapshot. Timing decision (user-ratified): bounce at 71, NOT after the step-80 eval — 9 old-mix steps would cost 12–20h at half the useful signal with zero crash protection, while the single-row attribution purity it would buy is below the ±0.06 noise floor anyway. Verdict window shifts to ~85–95 (step 80 carries 16 LR-fix steps but only ~8 mix steps).
-
-### 2026-07-05 — BOUNCE EXECUTED @ 16:16 (step-71 boundary): bundle LIVE; snapshot caught one spool bug, fix staged into an orch-only micro-bounce
-- Boundary clean: step 71 applied → broadcast-72 STABLE → checkpoint-72 manufactured (adapter byte-identical to step-70's reference, 174,655,550 B) → orch+trainer restarted (vLLM untouched). **Verified live**: "Loading 2 training environment(s) (fugu_ultra_math, fugu_ultra_code)"; buffer `env_ratios=[0.4, 0.6], easy_threshold=1.0, hard_threshold=0.5`; ckpt manager `interval=1, resume_step=-1, keep_last=15, spool_inflight=True`; both env servers spawned; orch at override step 72; trainer loaded ckpt-72, `Learning rate: 1e-05`.
-- **Snapshot caught a real bug (the reason it exists): the spool disabled itself on first compaction** — `compact()` wrote its tmp file before `checkpoints/` existed (only the append path made parent dirs). Fail-open behaved exactly as designed: generation unaffected, spool off for this orch cycle. **Fix (one line, mkdir in compact) staged + tests re-run**; deploys via an **armed orch-only micro-bounce** that fires when the orch writes its first interval checkpoint (`checkpoints/step_73`) — restarts ONLY the orch (seconds of loss, trainer+vLLM untouched) and doubles as the end-to-end validation of `resume_step: -1` (progress+pools from a real orch checkpoint, env-var override exported only as a fail-safe).
-- Watchers re-armed for the new processes: step-80 single-pass eval (new trainer pid), micro-bounce trigger. Old watchers self-terminated on the old pids as designed. Remaining acceptance item: decode bin-72 when it lands → confirm ~60% code draws (verify what the run consumes).
-
-### 2026-07-05 — INCIDENT (user-caught): trainer free-ran 8 phantom steps (72–79) on replayed history; ZERO on-disk damage; root-caused + fixed
-- **Detection**: user noticed "trainer shows step 78 while orchestrator shows step 71/72" — impossible skew (trainer can only consume what the orch generates). Trainer lines 72–79 landed at ~5-min intervals (pure compute cadence, no generation wait) while the orch was 64/256 into batch 72 with NO bins ≥72 on disk. Trainer killed at step 79, ~2 minutes before its step-80 checkpoint save.
-- **Root cause (trainer-side coupling the pre-deploy audit missed)**: `runs.py::_create_run_data` initializes the trainer's batch-consumption pointer FROM THE ORCHESTRATOR'S ckpt config. All prior resumes had no `ckpt:` block → pointer = `SUROGATE_GRPO_START_STEP` (always correct). Today's new `resume_step: -1` routed it to "max STABLE orch checkpoint" — but the orch saves its first checkpoint only at step 73 (first-step saves are skipped), so the lookup found nothing and **fell back to 0** → the receiver began replaying the run's entire rollout history from bin 0 as fresh batches (8 consumed in 40 min ≈ 5 min/step; it would have replayed all 72).
-- **Why nothing was damaged**: the phantom steps produced NO broadcast (broadcasts dir stayed {71, 72} — the orch generated batch 72 against clean step-72 weights throughout) and NO checkpoint (first save due at 80; killed at 79). The corrupted adapter lived only in the killed process's RAM. Total cost: ~40 min trainer-GPU. The manufactured `step_00000072` on disk = clean post-71 weights.
-- **Fixes**: (1) `runs.py` -1 branch now falls back to the start-step override (not 0) when no stable orch checkpoint exists; (2) all consumed bins (0–71) moved to `run_default/rollouts_archive/` — replay is now impossible regardless of pointer value (scanner/ledger captured bin 71 first; historical analysis reads the archive); (3) trainer relaunched clean: found ckpt-72, lr 1e-05, and correctly WAITING for bin 72 (no step lines since relaunch — the exact behavior the phantom run lacked).
-- **Standing cautions**: train.log now contains phantom `step=72..79` lines (16:23–16:58) — any grep over trainer steps must take lines AFTER the 17:05 relaunch marker; real 72+ lines will duplicate those step numbers. Lesson recorded: config changes must be audited on BOTH processes that read them — the orch yaml's ckpt block is also consumed by the trainer's run registry. Known quirk (benign with the fix): the trainer-side -1 branch requires a STABLE marker that orch checkpoints never write → in practice it always uses the env-override fallback.
-- **RECOVERY VERIFIED COMPLETE (17:42)**: real `step=72 loss=-0.0024 grad_norm=0.0012 lr=1.00e-05 kl=0.1183` — trainer consumed the actual new-mix bin 72, metrics in-band. Micro-bounce @17:37 validated `resume_step: -1` end-to-end ("Resuming training from checkpoint step 73", pools restored — pool/hard exactly 2/461 from step-72's two hard evictions). **Spool LIVE and writing** (542KB / 16 events by 17:41 — batch-73 groups persisting as they complete; the earlier "still disabled" scare was an awk-pattern artifact matching the OLD 16:17 warning). Full protection stack now operational: per-step orch checkpoints + in-flight spool + progress lines. Bin-72 banked mix was 3 math / 1 code — NOT the draw ratio: the perfect code groups carried over live into batch 73 where the easy filter retires them; watch banked-code share rise over 73–75 as the solved backlog drains before judging the mix lever.
-
-### 2026-07-05 — Concurrency regression found by the user's heartbeat question, fixed at a bounce that doubled as the SPOOL'S FIRST LIVE RESTORE
-- **Regression (mine)**: the env split gave math/code STATIC per-server concurrency 4/8 (aggregate 12). In math-only phases — like batch 73 at 18:10, math holding all 384 slots, code at 0 — math ground 4-wide vs the old shared 12: ~3× slower, and observed even worse (near-zero math completions 17:48→18:13; failing math rollouts at the 4096-cap + 300s retries can each take tens of minutes at 4-wide). Fix: **max_concurrency 12+12** (idle side costs nothing; aggregate 24 only when both saturated — within the range already considered for provider load). Deployed via orch-only bounce @18:13 (user GO).
-- **Spool live test at that bounce: RESTORE WORKED** — "Restored 7 in-flight group(s) with 9 completed rollout(s) from the spool" (first-ever mid-batch recovery; 4.1MB spool at kill). The test also exposed a COVERAGE HOLE: the banked code group (64 accepted rollouts) did NOT return — group_done was written at buffer-accept, but accepted rollouts live only in generate_batch's local list until the bin is written → mid-step kill lost them. **Fixed (staged, next restart)**: the scheduler no longer writes group_done at accept; banked groups stay restorable until the step-boundary compaction erases them after the bin is safely on disk (re-accepting on restore is idempotent — pool-move re-checks membership; counters cosmetic). Tests 9/9.
-- Known residual from this bounce: batch-73's in-memory easy-retirements (perfect code groups filtered 17:38–18:13) were lost with the old orch — those tasks get redrawn and re-retired later; pool state otherwise continuous via ckpt-73.
-
-### 2026-07-05→06 — Step-80 row 0.750: total flat, but the FIRST composition shift (code ties high, math hits low); new regime fully bedded in
-- **Row** (23:40, single pass): 0.750 — code **0.733 (ties series high)** / math **0.767 (series LOW; prior band 0.80–0.97)**. Total inside the noise band around 0.78 for the 9th consecutive row → 16 steps of 1e-5 alone have NOT moved held-out. The composition move matches the diet change directionally (code up-weighted 60%, math thinned + fortress-evicted). Single row, ±0.08 per side: row 90 (~04:00, mix will have ~18 steps) is the pre-registered read; **if math keeps sliding there, first knob = ratio touch (0.45/0.55), before any fallback-ladder step**.
-- **New regime metrics (bins 73–79)**: banked mix **14 math / 14 code** (the 60/40 draw nets ~50/50 banked after easy-filtering); **code contested 14/14 (100%) vs math 5/14** → code delivers 74% of the learning groups — the mix lever is doing exactly what the measurement predicted. Evictions accelerating: ~11 tasks in the hard pool by step 79 (ledger through 82: all wins=0; `3b6ffad7a8` re-evicted post-reset as expected; still only the 1 wrongful ever). pool/easy still 0 (the lost perfect-code retirements haven't been redrawn to completion yet).
-- **Pace transformed**: steps 75→80 took 20–33 min each (one 11-min); orch already at ~82 while the eval ran. The 4-hour fortress marathons are gone (mix + eviction + 12-wide). Step-90 ETA ~03:30–04:30.
-- Trainer health 75–80: grads 0.0001–0.0018, kl mostly in-band with one settled blip (0.296 @76 → 0.129 @79); lr 1e-05 constant. No revert trigger.
-
-### 2026-07-06 — USER FOUND the paper's OOD few-shot result: our Example 4 is the paper-condemned configuration; replacement drafted, deploy gated on the step-90 row
-- **The paper's finding (Fig 9 / Tables 4+9, user-surfaced)**: conductor performance INCREASES with the share of few-shot examples from datasets OUTSIDE the training mix — best = all-OOD; in-domain examples get "lazily repeated" (reward-hackable template) and suppress exploration of the strategy space. Removing examples entirely is also bad (Table 9) — they must exist, just from elsewhere. OOD is defined at DATASET level (Fig-17 calls DeepMath OOD relative to MATH500 — both math).
-- **Our compliance re-audited under that definition**: Examples 1+2 (Medreason, DeepMath) = literally the paper's canonical OOD pair ✓ (earlier subject-level indictment of the DeepMath example RETRACTED); Example 3 (story comprehension) OOD for our sets ✓; **Example 4 (spanning-tree Python, the 5-step demo) = LCB-family code while we train 60% on LCB+TACO — the measured-inferior configuration — and our pool contains 4 spanning-tree tasks; our code plans demonstrably echo its understand→analyze→develop→implement→validate skeleton** ✗.
-- **Replacement drafted** (`scratchpad/ood_example4_draft.txt`): Bay-of-Fundy tides MC (physical geography — absent from all four training datasets); preserves the 5-step long-chain demo and adds two agent-combination patterns our examples never demonstrated (a truly-independent second opinion via empty access_list, and an adversarial argue-against-the-leader step) — pure "compatible combinations" info, zero code/math strategy to copy.
-- **SUPERSEDED same day by further paper text (user-supplied)**: the paper's actual set = **Medreason ×1 + DeepMath ×1 + Countdown ×2** ("real Conductor completions from coldstart runs", selected for "a range of workflow steps and selected agents"); our Examples 3+4 were never in it (Figs 18/20 are appendix illustrations). Plan upgraded to paper-exact: keep 1+2, replace 3+4 with two Countdown examples.
-- **Fig 9 / Table 9 calibration (user-supplied)**: the paper's in-dist config still CLIMBS (0.58→0.74; OOD 0.78) → the swap is worth a few points, NOT a rescue — and our 24/24 collapse is MORE extreme than their worst config (something in our exact setup amplified it). Their gains are BACK-LOADED (half arrive iters 100–200; separation decisive only after ~100) → **conductor-scale decision moved to ~step 130**; rows 100/110/120 judge the corrected setup. Table 9's subtask ablation hurts most on LCB → external validation of the code-mix pivot and causal-code-credit. **Deployment accelerated (user challenge: waiting for row 90 buys nothing — decisions pre-committed): swap fires at the NEXT BATCH BOUNDARY, not after the eval**; the step-90 watcher stays and now measures the new prompt ~2 steps post-swap = the immediate-shift cost, companion to the probe. The bounce also deploys the staged spool accepted-group fix; expected warnings at restore: "Could not move N example(s)" (pool reset, prompt in the content hash).
-- **SMOKING GUN from the harvest attempt**: generating Countdown plans from the live vLLM produced **24/24 structurally identical outputs (3-step, models [1,2,3]) at temp 1.0 — from the ADAPTER AND THE UNTRAINED BASE ALIKE**. The exploration collapse is PROMPT-INDUCED, present since step 0: three of four current examples open with Model 1 → the "learned" gemini-first routing is substantially a conditioned prior, not discovered knowledge (routing-census claims recalibrated accordingly). Harvesting real diverse completions is impossible from a collapsed sampler → the two Countdown examples were hand-composed with diversity engineered in (`scratchpad/ood_countdown_fewshots.txt`): openers 0 and 2 (breaking the model-1 lock), one 2-step + one 5-step chain, an independent no-access searcher duo, a selective `[3]` access demo; targets verified solvable (475 = 50*(7+3)−25; 632 = (75+9−5)*8). Bay-of-Fundy demoted to fallback. Recursion prompt (Fig 12/14) noted as an EVAL-TIME lever for the endgame only.
-- **Deploy rules**: NOT before the step-90 row (the eval imports the env file live — an early edit would make row 90 measure a prompt the policy never trained on). If 90 is flat/down → swap at a bounce as rung 1, optionally bundled with the ratio touch (user GO). If 90 is up → hold; deploy at the next natural pause. If the 14B route ever fires → bake the OOD set from its step 0. Known one-time costs at the swap bounce: a transient re-anchoring dip (~5–15 steps at 1e-5, by the routing-reorg precedent) and an eviction-pool reset (prompt is part of the buffer's content hash → saved pools won't match; the ~11 retired tasks re-evict at one wasted group each).
-
-### 2026-07-06 — EMERGENCY STOP (user order, ~03:20): GPT-5.5 reasoning blowout on Yunwu; run PAUSED cleanly, leak quantified, fix identified
-- **User caught it in the provider logs** (huge GPT completions). Local ledger confirms: GPT-5.5 via Yunwu ignores BOTH our `max_tokens` cap and the OpenRouter-style `reasoning: {effort}` object → on hard subtasks it reasons unbounded to a ~20k internal ceiling, returning a few hundred visible chars. 330 over-cap calls in the final 6h alone; these calls were ALSO the 45-minute batch stragglers (~20k tok ≈ 6–8 min each × retry ladder). Opus/Gemini/GLM all honor their caps — this is GPT-on-Yunwu only (same gateway-bug class that exiled Gemini to OpenRouter).
-- **Damage, quantified from the completion cache**: excess-above-cap reasoning tokens total **6.7M ≈ $67–100** across the run — zero before 07-01, escalating with hard-math exposure (07-05 alone: 878 blowups / 3.7M tokens = over half the total; invisible in our cost ledger because Yunwu-billed models log cost=0 locally). Bounded, but the trajectory (accelerating with the math-heavy draws + retries) justified the stop. My 07-03 note ("outputs slightly >4096, not many, quantify at next pause") badly underestimated the escalation — recorded as such.
-- **Stopped**: orchestrator, trainer, env servers (all worker-API paths dead); swap-bounce watcher cancelled pre-fire; step-90 eval watcher self-terminates on the dead trainer pid. vLLM left up (local, zero API cost). **State fully preserved and resumable**: trainer ckpt-80 + STABLE broadcasts through the latest applied step (manufactured-checkpoint pattern), orch interval ckpts + pools, spool with in-flight groups, all bins.
-- **Fix ready to implement while stopped**: in `OpenRouterProvider.complete/complete_tools`, branch for `gpt-*` models → send `max_completion_tokens` + top-level `reasoning_effort` via extra_body and OMIT `max_tokens` (OpenAI-native reasoning API shape); verify with 2–3 probe calls (<$0.50) before restart. **Restart bundle now = GPT param fix + Countdown few-shots + spool accepted-group fix, all in one launch. Awaiting user GO for probe + restart.**
-
-### 2026-07-06 — RECOVERY COMPLETE (user GO, ~03:12): probes decided the fix, full bundle live, and the DIVERSITY PROBE says CONTINUE (no restart-from-zero)
-- **Probe verdict on Yunwu GPT-5.5**: server-side hard cap is UNENFORCEABLE (`max_completion_tokens=1024` → 4,559 tokens, finish=stop) but **top-level `reasoning_effort=minimal` WORKS** — same hard prompt: 84 s / ~4.5k tokens at minimal vs 8+ minutes still grinding at default (probe-2 killed mid-flight; its runtime was the demonstration). Patch (both call paths, gpt-* branch, `max_tokens`→NOT_GIVEN) ships the correct dialect: expected ~80% leak reduction (20k tail → ~4–5k worst case), stragglers 45 min → ~90 s. GPT stays on Yunwu (invariant reaffirmed by user).
-- **Restart (03:11, resume step 86)**: few-shot swap applied+validated on the live env (4 examples: Medreason, DeepMath, Countdown ×2; backup `.pre_ood_swap`); ckpt-86 manufactured from broadcast-86 (adapter byte-identical); orch resumed from its own ckpt-86; **spool restored 11 groups / 315 completed rollouts of batch 86** (~$30–50 saved; the accepted-group fix is live from this process on); expected pool-reset warnings fired (2 easy + 16 hard retirements reset by the prompt-hash change; note: the easy pool had gained its first 2 entries pre-stop). Trainer at ckpt-86, lr 1e-05. A "19k post-patch call" scare was window-mixing: all >10k calls timestamp BEFORE the stop.
-- **DIVERSITY PROBE (the continue-vs-restart decider): CONTINUE.** Under the new prompt, base diversifies (opener flipped to model 2; 3- and 4-step shapes) and **the adapter diversifies MORE** (dominant [2,1,0,3] 4-step plus permutations [1,2,0,3], [1,2,3,0] and two distinct 5-step variants) — vs 24/24 identical pre-swap. The template lock was PROMPT-carried, not weight-burned; the 90 steps of content learning are preserved and training continues from 86 under the corrected conditioning.
-- **User idea adopted as enforcement layer 2 (planned)**: STREAMING GPT calls with client-side abort. Physics caveat: reasoning burns BEFORE tokens stream, so the enforceable form is TIME-based (first-token deadline + total-duration ceiling; disconnect stops server-side generation and billing at that point) — converts "unbounded" into "bounded by wall-clock". Sequence: cheap streaming probe (does Yunwu stream gpt-5.5; TTFT at minimal effort) → implement stream-for-gpt in the provider (abort ⇒ finish=length, never retried) → deploy at a natural boundary. Gate: only if the patched steady-state tail still exceeds ~6–8k, else optional insurance.
-
-### 2026-07-06 — GPT endgame: Yunwu docs (user-pasted) reveal ADAPTIVE reasoning is the tail; streaming budget IMPLEMENTED (user's idea = the only real cap)
-- **Attribution corrected by the Yunwu doc text**: `reasoning.effort` supports none/minimal/low/…/xhigh (naming worry resolved — "minimal" is legit) AND "models reason adaptively across efforts, thinking harder for complex tasks" → the 7–10k post-patch tail (true post-restart scan: n=263, p50 3,073, p90 6,194, max 9,997 — measured after fixing my own epoch-cutoff bug that had swept the whole run's history) is DOCUMENTED BEHAVIOR at minimal effort on brutal prompts, not a dialect bug. Parameter-level control cannot bound it; my "80% cut from the dialect fix" was over-attributed (the 20k class did vanish, but adaptive variance owns the rest).
-- **Both provider changes implemented + live-tested**: (1) effort-only for `gpt-*` (max_completion_tokens dropped — unenforced by Yunwu AND documented to sometimes nullify the effort flag when combined); (2) **`_complete_streaming_budget`**: gpt-* calls now stream with wall-clock budgets — first-token deadline 120 s (bounds the silent reasoning phase; healthy minimal calls reach first token in ~26 s per probe) + total ceiling 240 s; abort ⇒ disconnect (server stops generating + billing) ⇒ truncated Completion `finish_reason=abort_budget`, returned normally so the retry ladder never re-burns it; env-tunable via ULTRA_GPT_FIRST_TOKEN_S / ULTRA_GPT_TOTAL_S. Streaming probe: Yunwu streams gpt-5.5, usage arrives on natural completion; easy-call E2E through the real provider class: finish=stop, ct=18, correct.
-- Deploy: plain orch bounce at the next batch boundary (armed); worst-case GPT spend per call now bounded by wall-clock (~120 s silent ≈ ≤8k tokens billed partial) instead of unbounded. Verify post-bounce: fresh gpt tail ≤8k, `abort_budget` frequency (expect rare), grade impact nil (aborted call = wrong answer = the handicap contract).
-### 2026-07-06 — ZOMBIE-STREAM incident (~04:10–05:17, user-detected twice over): silent streams dodge per-chunk budgets; fixed with a hard outer deadline; spool saved 414 rollouts through the chaos
-- **Freeze**: some Yunwu gpt streams emit NO chunks during long reasoning → my per-chunk budget checks never ran and the client read-timeout didn't fire → zombie calls accumulated in the 12-wide gpt lane until ALL plans stalled at their gpt step. Detection: user's batch-87 line (top groups frozen at 63/64, 0/256 accepted @62m) + user's "opus very slow" report; flow scan confirmed: 15 min with only 9 completions, all Opus (= queue trickle behind the zombies — **Opus itself was fine: post-recovery probe 2.7 s**; the provider-slowness was our own traffic jam).
-- **Fix**: `asyncio.timeout(total+30)` wrapped around stream creation AND consumption (nothing silent can dodge wall-clock) + bounded `stream.close()`; compiled + live-tested.
-- **Recovery own-goals (recorded for the pattern file)**: my pkill matched BOTH its own wrapper and the orch it had launched milliseconds earlier (pattern contained the plain string) → brief two-orch overlap then zero-orch; killed the old by PID, clean single relaunch (3009725). **Spool restored 13 groups / 414 completed rollouts** — third consecutive incident where it converted a would-be total batch loss into seconds of loss. Rule going forward: process ops by PID, never by pattern, when the same script also launches. **Recovery confirmed @05:32**: 280 calls/15 min (18.7/min vs 0.6/min frozen), gpt 187 completions (186 stop / 1 abort_budget — the cap at its designed rarity).
-
-### 2026-07-06 — Row 90 (09:36): **0.850, code 0.767 NEW HIGH + math 0.933 RECOVERED — gap −0.033, tied-best row of the run**
-- First eval under the complete new regime (OOD few-shots + LR + mix + eviction + capped GPT). The expected prompt-transition DIP did not materialize — the opposite. Per-cap composition is the story: code continues its monotone climb (0.633→0.667→0.733→0.767 across rows 60–90); math snapped back from its 0.767 low to 0.933 (top of its historical band). Diagnostics clean (0 empty/parse/exec failures, 0 solo errors). Workflow steps mean 2.95 — the new-prompt short plans visible at eval time.
-- **Discipline (step-30 lesson applied)**: single row, ±0.06 — NOT a confirmed climb until row 100 holds. Attribution: with only ~4 real training steps since row 80, the lift is mostly the prompt swap's EVAL-TIME conditioning effect — which is fine and durable (the prompt is part of the deployed system), and distinguishable from noise at row 100 (armed).
-- Consequences if row 100 confirms (≥ low-0.80s with code ≥0.75): the bar (−0.033 away) is genuinely in reach THIS run — no ladder steps fire; ride the regime. The 14B decision stays parked at ~130 and may become moot. Interference watch continues via the same-task ledger (math contested core redraw trend), not via panic.
-- **DEPLOYED @04:04 (boundary step-87) + VERIFIED**: 30-min streaming-era scan (n=342): p50 4,400 / p90 6,357 / **max 8,778 — BOUNDED**; `abort_budget` fired exactly 2/342 (0.6%) — the would-be blowouts, cut at budget. Elevated median = the re-eviction sweep (the 18 pool-reset tasks re-auditioning; all-fail math groups visible in batch 87's live set) — a one-time tax that retires with them. Trainer applied REAL step 86 (loss 0.0061, grad 0.0010, kl 0.186 — mixed-era batch, mild expected bump). **Bin-86 era A/B (full groups, same policy, same batch)**: OLD-prompt code groups 1–3 shapes incl. a pure [1,2,3]×64 monoculture at 9/64 wins; **NEW-prompt code group: 4 distinct shapes, resurrected 2-step [2,3]×47 dominant, CONTESTED 24/64** — within-group shape variance (the GRPO credit channel for STRUCTURE) exists under the new prompt and not the old. Full new-prompt regime verdict: bins 88+ census + row 90.
-
-### 2026-07-07 — Multi-turn feasibility RETIRED as a blocker + repair lane (recursion-lite) building
-- **Repair lane (data-only, SingleTurnEnv-compatible) — BUILT + VALIDATED**: precompute one failed SOLO builder (st_gpt) attempt per code task offline, embed the broken artifact into the prompt ("this attempt failed — orchestrate a fix"), grader UNCHANGED (original tests). Conductor's single trained generation = a REPAIR workflow → trains the report's BUILD-THEN-DEBUG pattern with ZERO executor/grader/env changes; drops in as a 4th lane exactly like RLPR. Feedback = the broken CODE artifact (graders return bare pass/fail, no test log) → code-only, which is also the axis below the bar. **Build result: 70 code tasks scanned → builder ACED 28 (dropped — nothing to repair) → 40 kept = the genuine repair band**; task_id `repair_<orig>`, capability unit_code, source repair_code; manifest `hard_mix_repair_taskspecs.jsonl` (40, max prompt 5,901 chars — all within the 12,000 cap), lane map 761→801 (backup `.bak_repair`), every TaskSpec validates. `scratchpad/build_repair_lane.py`.
-- **Multi-turn (true recursion / Stage-2 substrate) — FEASIBILITY VERDICT: supported, both documented blockers DODGED**. Empirical findings: (1) verifiers ships `MultiTurnEnv` (env_response / @vf.stop / render_completion); (2) our scheduler drives `env.run_rollout()` GENERICALLY (not SingleTurnEnv-specific); (3) **the whole stack carries a PER-TOKEN `completion_mask`/`loss_mask` — the trainer masks by token, turn-agnostic, so N assistant spans train with ZERO trainer changes**; (4) a 2-turn rollout is still ONE RolloutOutput from the scheduler/spool/advantage view (multi-turn happens INSIDE run_rollout) → eviction/spool/advantage untouched. NOT the "call-explosion" blocker (that was 20-turn WORKER Docker loops; this is 2-turn CONDUCTOR loops, single-call workers, ~2× cost) and NOT the replay-zero-gradient trap (live-graded). Build = subclass MultiTurnEnv + `env_response` (execute workflow via existing execute_workflow, hand outcome back) + `is_completed` (2 turns / on success) + terminal-grade rubric. ~few days, OFFLINE track (new module, tested vs a few tasks, never touches the live run until proven + deployed at a bounce). Open risks to retire offline: 8192 seq-len with a code artifact + 2 turns; this verifiers version's render_completion multi-span mask correctness. **STATUS: module BUILT (`scratchpad/fugu_ultra_multiturn.py` — FuguUltraMultiTurnEnv with BOTH report-3.2.2 memory scopes: intra-workflow isolation inherited from execute_workflow's access-listed prior_artifacts; inter-workflow persistent memory as state["shared_memory"], Stage-2c tool-artifact hook marked). 5/5 offline logic tests PASS (`test_multiturn.py`): fail→revise+memory+no-terminate, success→early-terminate, terminal reward = last-executed grade (0.5→1.0 repair), real parse path, and SEQ-LEN RISK RETIRED — worst-case 2-turn prompt with fat code artifact = 3,753 tokens « 8192. Remaining before deploy: repair-branch live smoke on a genuinely-failing task (see smoke bullet), rubric wiring into this verifiers version's scoring path, multi-span mask verification in a real run_rollout.**
-- **Sequencing**: repair lane ships now (de-risks "does repair-given-feedback learn", reusable manifests); MultiTurnEnv built in parallel offline as the real Stage-2 foundation. Not redundant — the data lane validates the signal cheaply; the env unlocks adaptive both-turns-trained trajectories.
-- **Live 2-turn smoke (2026-07-07, read-only vs :8007, conc-3)**: mechanics VALIDATED end-to-end — real conductor gen + real workers + grade + early-terminate all fire correctly. BUT all 3 sampled code tasks solved round-1 (grade 1.0 → early exit) so the REPAIR branch wasn't exercised; the current policy is too strong on easy code tasks to fail round-1. To exercise repair, drive the smoke on the repair-BAND tasks (the 40 where solo-builder failed) or contested/harder tasks. Partial validation: success path proven, repair path pending a failing task.
-- **TOOL-USING coding harness (Claude Code / OpenCode / Codex) — READINESS: installed + EXERCISED, gap is training-integration not infra.** Verified: `oc` binary v1.17.11 present; Docker 28.4.0; 26 SWE-smith/SWE-bench images; director/.venv imports swesmith+docker; harness `ultra/ultra/harness/opencode.py` complete (container lineage per access list = the paper's intra-workflow isolation in CONTAINERS, run_step, OC_TIMEOUT, cost). PROOF it ran: `agent_router_study/ood176_swebench_pool_validation_report.json` — real SWE-bench-Verified instances (django/astropy), `grader_type: swebench_verified_hidden_tests`, `wall_time_by_task` recorded. **The report's data itself flags the gap: `grpo_ready: 0`** — agentic tasks run for eval/study but are NOT wired into GRPO training (the call-explosion: container spin-up + ~20-turn oc loops + timeout × 64 rollouts/group). So current code tasks use `direct_qa` (single `pool.call` → text code → `code_exec_stdio`), NOT a coding agent. Ladder to real tool-use: conductor-multi-turn (built, text workers) → swap worker harness `direct_qa`→`opencode` on a curated SWE set with SMALL rollout groups (8–16) + hard turn caps = Stage-2c. A live single-task opencode demo is available on request (spins a container, ~minutes, competes with training for worker-API — deliberate opt-in, not fired unprompted during the confirmed-climb phase).
-- **STAGE-2C DESIGN (2026-07-07, user-driven "think hard first"): the call-explosion is broken by FOUR levers, not brute force.** Measured baseline (200-run derisk study): agentic workflow = median ~$0.02–0.03 (GLM/flash; yunwu arms report $0 — blind spot, estimate via tokens), 35–55 min wall under study concurrency; band contested (win 0.20–0.44); coordination edge REAL agentically (builder-GLM→debug-Opus 0.44 vs best solo 0.36). Levers: (1) **steps 200→10–40** — paper converged ≤5 from RAW base, our big moves landed by step 30, Stage-2c starts from a TRAINED conductor (format 100%, priors learned; only the agentic reward-landscape delta to learn); (2) **run-persistent execution cache: pay per unique (task, canonical-plan), not per rollout** — extends the existing within-group workflow_record_cache; hit rate RISES as policy converges; cleaner credit assignment (no gradient from worker stochasticity the conductor can't control); live cost ≈ novel plans explored (~1.5–2.5k executions/run total, not 51,200); (3) **geometry 4×64 → 16×16** — same 256 batch, 4× task diversity, group baselines OK esp. with partial credit (fail-to-pass fraction) densifying reward; (4) **hard caps + token-based spend guard with per-workflow abort budget** (the streaming-budgets lesson applied to agents) — MUST exist before any probe. Conductor language UNCHANGED (ordinals stay; harness behind each ordinal swaps per-lane via existing worker_harnesses override); separate run from best ckpt AFTER this run's verdict, never a mixed lane (cadence). Ladder, each rung GO-gated: proof demo → transfer eval of current conductor on ~40 agentic tasks (~$10–30 — text-learned routing may already transfer; would shrink Stage-2c to calibration) → curate 90 train/24 held-out + spend guard → 10-step probe (~$150–400) → 30–40 step run (~$500–1200). Total ≈ $1–2k + ~a week, vs $25–50k + months naive.
-- **AGENTIC PROOF (2026-07-07, user-ordered "do it"): BOTH harnesses PROVEN live, end-to-end.** 2 contested SWE-smith bugs × {OpenCode+GLM via OpenRouter, Claude Code+Opus via YUNWU-NATIVE /v1/messages (probe-verified `{"content":[{"text":"OK"...}]` — Opus stays on yunwu per policy)} = 4 isolated containers: checkout buggy branch → agent edits source + runs tests in conda testbed → git diff → official SWE-smith grade. Claude Code: ELF mounted into container (like oc), needs IS_SANDBOX=1 + onboarding-bypass `/root/.claude.json`; metered via --output-format json: 7–31 turns, $0.37–$2.22, 38–341s. OpenCode+GLM: ~$0.03, 69–600s. Resolved 0/4 on the two bugs (single attempts on a contested band — study solo rates 0.20–0.44; n=4 says nothing new). **Forensics (grader-integrity check): on autograd func_pm_ctrl_shuffle both agents produced BYTE-IDENTICAL fixes to matmul_adjoint_0; the GOLD patch touches matmul_adjoint_0 AND matmul_adjoint_1 → agents under-fixed the multi-site shuffle; hidden tests RIGHT to fail them ⇒ reward channel sound for training.** Curation gotcha: gpxpy-class repos burn the whole budget on slow test suites (OpenCode hit 600s with zero edits; Claude Code hit max-turns 30, rc=1, empty diff, $2.22) → per-repo test-cost screening required in Stage-2c task curation. Files: scratchpad/proof_agentic_demo.py, proof_*.diff, proof_agentic_results.json.
-- **ACCESS-TOPOLOGY CENSUS (row-110 instrument — closes the 07-06 "gaps to instrument" item; steps 103–110, n=2048): the policy uses ZERO isolation topologies.** No solo, no independent-parallel, no par2+aggregator ANYWHERE; everything sequential-cumulative. Code lane (exact attribution): 67.7% chain3-cumul ([],[0],[0,1]) at 66.8% win, 24.6% 4-step at **85.1% win** (n=268 — verify+format chains are a real learned behavior), 7.6% chain2 at 44.6%. Math+reason block (system-prefix attribution pending, lumped): 89.8% chain3-cumul at 18.6% win — the contested-heavy post-eviction core. Implications: (1) the report's tree/parallel-aggregator advantage is UNUSED headroom — a concrete Stage-2/multi-turn target; (2) the OOD few-shot's independent-no-access duo demo did NOT induce parallel shapes in on-policy rollouts. Tool: scratchpad/topology_census.py.
-
-### 2026-07-08 — RUN STOPPED @ step 144; STRATEGIC PIVOT after an honest cost-critical review (user: "be honest and critical, we are spending real money")
-
-**DECISION: killed the single-step run at step 144, killed the ~$1–2k agentic "Stage-2c ladder", replaced it with ONE ~$50 rigorous test. vLLM (grpo-infer pid 36010) kept UP to serve the test; adapter step_145 preserved; orch+trainer stopped by PID (orch needed SIGKILL, mid-batch — normal).**
-
-- **WHY STOP**: held-out converged FLAT-AT-BAR — rows 90/100/110/120/130/140 = 0.850/0.833/0.850/0.900/0.867/0.850, band ±0.043 on n=60 ⇒ policy is parked at ≈0.86 (the achievable ceiling for THIS pool at THIS 4096/minimal handicap). The 0.900 @120 is the high tail, not a trend. Riding 144→200 spends real (invisible — see below) worker-$ to polish a converged policy. No knobs remained that the evidence justified.
-- **THE PLANS DID GENUINELY IMPROVE (not luck) — measured early(72–80) vs late(136–144), n=2304 each**: code-lane GPT-opener 0%→**79%**; code-lane Opus 4%→26% and GLM (weak worker) 31%→**15%** (learned to use strong workers + drop the cheap one); math-lane GPT-opener 18%→48% (independently rediscovered the paper's math→GPT finding). Shapes diversified (2-step 0%→11%). So the SINGLE-CALL cost-escalation router is a REAL learned artifact, capability-matched routing from scratch — this is the product, and it works. (Caveat: parse-fail crept 2%→7% = repair-lane format friction; training win-rate 45%→40% = eviction confound, not regression.) Tool: the early-vs-late census in this session.
-- **THE HONEST CRITICAL REVIEW (self-corrected motivated reasoning)**: I had been building an expensive agentic-training case on evidence my OWN experiments repeatedly FAILED to confirm. The three nulls, restated bluntly:
-  1. Per-task agentic routability: cross-fit NULL (−0.08, p=0.90) [[swesmith-per-task-routing-null]].
-  2. Parallel-topology probe (2026-07-07): 0/50 cracked, dead negative.
-  3. Coordination edge (GLM-build→Opus-debug 0.44 vs Opus-solo 0.36): re-derived PAIRED = +6/−4 discordant = **net +2 tasks / 25, McNemar p≈0.75 = NOISE**. The 0.76 union-oracle that looks like +0.40 headroom is the in-sample max-selection trap [[headroom-metrics-must-crossfit]], NOT a routable signal.
-  - **Structural contradiction I had papered over**: the paper's +4–5 agentic wins use 3 PREMIUM workers at FULL strength; to AFFORD agentic training we HANDICAP workers to 4096/minimal; but the handicap PROVABLY collapses the complementarity (the 0/50 probe) ⇒ the affordable version trains in the exact regime where there is nothing to orchestrate. Affordable-version and could-win-version are mutually exclusive.
-  - **Cost blind spot**: premium workers bill through Yunwu which reports **$0 locally** ⇒ we do NOT know what the 144-step run actually cost, and the biggest line item in every Stage-2c rung (premium execution) was INVISIBLE. My "$500–1200" had no measured basis.
-  - **Scope**: locked product = single-call cost-escalation router [[fugu-final-pool-and-product]] — which we've BUILT (at the bar). Agentic Stage-2c is a different, unproven objective ⇒ was scope-creep on a finished deliverable.
-- **THE PLAN NOW — ONE test, pre-commit ZERO to training**: **Full-strength headroom test (~$40–60)**. ~40–50 contested agentic-coding tasks; run each solo worker at FULL reasoning effort + the best 2–3 compositions (build-debug, specialist); score **CROSS-FITTED** (pick routing policy on one split, measure on the held-out split) so it is a real out-of-sample advantage, not oracle inflation. Tests the ONE regime never tested (full strength) = the paper's actual setting. This is the endgame full-strength verdict, pulled forward because it's cheap + decisive.
-  - **GO gate**: cross-fitted composition beats best solo worker by **≥+0.08** (above the noise band ≈±0.06 on n≈25/fold). Anything smaller = we were fooled by small-n again (the +2/25 lesson).
-  - **If YES** → THEN there is a real case for agentic training, designed knowing the handicap problem must be solved (likely full-strength workers + tight cost guard). **If NO** (the likely outcome given 3 priors) → **SHIP the single-call cost-escalation router. Done.** Not a failure — a validated product for ~$50 of due diligence instead of ~$2k of hope.
-- **NEXT STEP**: design + run the full-strength cross-fitted test against the preserved step_145 (and ideally step_120=peak if its adapter is recoverable) conductor via the live vLLM. Everything downstream gates on whether it clears +0.08.
-
-### 2026-07-08 — PRODUCT FRAMING CORRECTED + Zenith/SWE-Together absorbed + FULL-STRENGTH VERDICT eval launched
-
-- **User correction (forceful, recorded to memory): the product is FUGU-ULTRA, the decomposition conductor — NOT a cost-escalation router.** The pivot entry above stands as history, but its "ship the router, done" conclusion is retracted as a product statement: the router is the separate locked product-track; Fugu-Ultra must get OVER the bar, and the work continues until it does. En route to this correction I had drifted twice (first toward re-testing generic composition-vs-routing science, then toward benchmarking Zenith itself) — both walked back; the subject of every eval is OUR conductor.
-- **Zenith studied** (user-supplied `study/zenith` + report): the transferable mechanism is execute→gap-find-vs-original-requirement→re-plan→stop-on-evidence. External validation that full-strength orchestration beats native single-model harnesses (GPT-5.5+Zenith #1 on FrontierSWE; ablation: RALPH strongest simple baseline, Zenith best rank at 43% RALPH cost). CAVEAT recorded: their wins are on hours-long tasks; transfer to our minutes-scale tasks is the thing the eval measures, not an assumption. **Borrowing #1 (live today): the feedback loop** — our already-built 2-turn MultiTurnEnv semantics wrapped around the trained conductor at inference time (it was trained on the repair lane; the loop exploits exactly that skill). **Borrowing #2 (queued): verification-gated stopping** inside workflows.
-- **SWE-Together studied at code level** (`study/SWE-Together`): Harbor-based, local-Docker capable, effort=high native, frozen per-task judge rubrics, contested at full strength (leaderboard 0.39–0.63, oracle ~78). Custom agents = `UserEnabled*` wrapper classes by import_path → the conductor→agent shim for the transfer eval is a known, bounded integration. Fresh checkout (no keys/images/trials yet). Stays eval-only transfer target; ~$2–5/task-trial; separate GO.
-- **FULL-STRENGTH VERDICT eval built + smoke in flight** (`scratchpad/eval_fullstrength_verdict.py`; protocol in `scratchpad/fullstrength_headroom_design.md` REV3; details in Current Status above). First smoke rows: full-strength solos solving LCB-V6 tasks, grading clean. Housekeeping: 41 prior-session /tmp scratchpad artifacts rescued into repo `scratchpad/`.
-
-### 2026-07-08 — TREND60 FULL-STRENGTH VERDICT (final, after timeout-fix reruns): Fugu-Ultra TIES the best worker on a SATURATED set; the win test moves to fshard
-
-- **Run**: 60 held-out tasks (30 code / 30 math), workers at 16384-tok (gemini/glm raised to 32k after truncation was caught — user spotted the OpenRouter failures) / effort-high — the first unconstrained measurement of this pool ever. Conductor = step-145 via live vLLM. 198 min + 40 min fix pass; $14.74 OpenRouter-reported (gemini-flash alone $14 — 1.52M completion tokens; it reasons HARD at full effort) + Yunwu-invisible opus/gpt (43k/220k completion tokens).
-- **Table (final)**: fu1 **0.950** (code 0.900 / math 1.000) = fu2 0.950 · solo2_opus 0.967 · solo2_gpt 0.950 · **solo_opus 0.933 (bar)** · gemini 0.883 · gpt 0.817 · glm 0.767 · solo-oracle 0.933.
-- **Honest paired read**: fu1 vs opus-solo discordants +2/−1, of which one + (`arc194_e`) is TIMEOUT-LUCK (opus timed out at BOTH 900s and 1800s, yet solved it on its retry attempt) → clean discordants **+1/−1 = statistical TIE at the bar**. The clean + is real and notable: `arc196_a` — fu1 solved SINGLE-SHOT a hard ARC problem where all four workers answered and failed (opus needed two attempts). fu2 converted 0 of fu1's 3 failures (2 of them — `arc191_d`, `arc196_d` — are pool-unsolvable in every arm).
-- **Full-strength reshuffles the pool** (vs the handicapped picture): GLM 0.383→0.767 (still weakest; 20/28 of all timeouts), GPT 0.883→0.817 (!), opus stays king 0.933, gemini-flash 0.800→0.883 at a 25k-tokens/call reasoning burn. Opus at high effort blows through even a 1800s wall on the 3 hardest ARC tasks — at full strength, "answers eventually" vs "answers in budget" is a real axis.
-- **Structural conclusion (the pre-registered saturation abort fired)**: trend60 at full strength has bar 0.933 / oracle 0.933 / solos+retry 0.967 → max demonstrable gap ≈ +0.05. This set proves Fugu-Ultra **matches the best worker unhandicapped** (necessary, newly established, non-trivial: the conductor was TRAINED against 4096/minimal workers and transfers to full-strength workers zero-shot) — but it cannot show a report-class WIN.
-- **THE WIN TEST (launched, running)**: `heldout_fshard_taskspecs.jsonl` — 26 never-used LCB-V6 **difficulty=hard** problems (benchmark's own label → no worker-failure selection bias; disjoint from train/trend60/sealed-confirmation; builder `scratchpad/build_fshard_manifest.py`; only 26 exist after exclusions + the ≥8-stdin-tests filter). All arms, timeout 1800s, conc 6, watcher → MISSION progress block. Verdict read: fu1 − best_solo where there is real room; fu2 gets its first genuine conversion opportunities. Timeout cells get a sensitivity analysis (bar with timeouts-as-0 vs excluded), given the opus-wall observation.
-
-### 2026-07-08 — FSHARD FULL-STRENGTH VERDICT (26 LCB-V6 hard, the room-to-win test): Fugu-Ultra+loop = the POOL ORACLE, +0.077 over best solo; the loop's first real conversions; remaining ceiling = the pool itself
-
-- **Table** (n=26, all never-used difficulty=hard, 282 min, $12.75 reported + Yunwu tokens): **fu2 0.846 = solo2_gemini 0.846 = ORACLE 0.846** · fu1 0.769 = solo_gemini 0.769 (best solo) · solo2_gpt 0.808 · opus 0.731 · gpt 0.615 · glm 0.154.
-- **The loop works**: fu2 converted 2 of fu1's 6 failures (`abc398_g`, `arc190_d`) — first live proof the Zenith-borrowed execute→feedback→re-plan turn adds solved tasks. fu1 also added a second clean conductor-only single-shot win (`arc193_a`: all four solos failed/timed out; the decomposition cracked it in one shot — with `arc196_a` from trend60 that's 2/86 across both sets).
-- **Honest pairings**: fu2 vs best solo single-shot +3/−1 (p≈0.31, not individually significant); fu2 vs best retry arm (solo2_gemini): +1/−1 = TIE. Pooling both sets, conductor-vs-best-solo clean discordants +4/−2 — consistently non-negative, not yet a significant win.
-- **Timeout sensitivity (pre-registered)**: opus solo timed out on 5/26 (30-min wall each); on its non-timeout subset opus = 0.905 vs fu2 0.905 — a capability-tie; opus's low headline is wall-clock, not skill. But wall-clock is a real resource: the conductor DELIVERS 0.846 within budget by routing around the grinder. GLM collapsed on hard code at full effort (20/26 timeouts, 0.154) — full-strength value is formatter-only, which is how the trained routing already uses it.
-- **CONSOLIDATED FULL-STRENGTH READ (both sets)**: Fugu-Ultra never falls below the best worker (ties the bar on saturated trend60; +0.077 on fshard) and with the feedback loop operates AT ITS POOL'S ORACLE FRONTIER on both sets. The trained artifact extracts ~everything its pool can produce, zero-shot transferred from handicapped to full-strength workers. The binding constraint on a report-class win (+4.7) is now the POOL, not the conductor: the report's pool is 3 PREMIUM workers (Opus-4.8 / **Gemini-3.1-PRO** / GPT-5.5); ours substitutes gemini-FLASH + GLM.
-- **NEXT LEVER (prep started): POOL-UPGRADE eval** — same conductor (anonymized ordinals → no retraining, though slot-conditional routing must be validated under the swap), workers = the report's premium trio, on fshard. If fu-with-premium-pool beats the premium solos there, that is the report-class result. Watch-items: gemini-3.1-pro must route via OpenRouter (Yunwu ignores its caps), slot-capability shift vs learned routing, cost (~$30-60; small probe first).
-- **POOL-UPGRADE EXECUTED same day**: `gemini-pro` logical model added to `ultra/ultra/providers.py` (OpenRouter `google/gemini-3.1-pro-preview`, FORCE_PROVIDER openrouter, commercial set) + `--pool-upgrade` flag in the eval (swaps ONLY `st_gemini`'s model; 4-slot structure + ordinal prompt untouched → trained routing distribution preserved, the slot just got stronger). **Probe (6 fshard tasks, 78 min, $4.71): fu2 6/6 = 1.000 vs best premium solo gemini-pro 0.833; fu1 0.667.** Mechanics clean; gemini-pro truncated 3/15 calls at 32k → cap raised to its 65536 OpenRouter ceiling; probe rows archived (`fshard_pro_rows.probe32k.jsonl`), full 26-task run relaunched clean (`--label fs_hard_propool`). Cached opus/gpt/glm solos replay free. Verdict pending at time of writing.
-
-### 2026-07-10 — POOL v2 DECIDED (user-driven, every slot measured) + STAGE-2 RESUMED from 166 on the new pool
-
-- **The GPT-5.6 release day cascade**: terra (0.833 @handicap — parity with 5.5 FAILS by −0.05, but half price) and sol (fshard **0.885** — strongest worker ever measured on the hard set; trend60-fs 0.917 code 0.933/math 0.900; handicap 0.867 with math 0.933) both landed on Yunwu and probed clean (both honor reasoning_effort — better dialect than 5.5). Grok handicap probe: **0.867** (vs GLM's 0.383).
-- **POOL v2 (user decisions, data-confirmed)**: slot0 **gpt-5.6-sol** (replaces opus — same price, +0.15 on hard code, ZERO unique opus solves lost, oracle identical either way); slot1 **gemini-3.5-flash via YUNWU** (user: 90% cheaper; cap-defect persists but milder — 3.1k on a 400 cap — wall-clock guard extended to bare gemini-* slugs); slot2 **gpt-5.6-terra** (user: 5.5 too expensive — the high-frequency slot wants cheap-good; sol covers the family's top end); slot3 **grok-4.5** (replaces GLM: stronger everywhere, cheapest; family-diversity argument kept terra out of this slot). **fshard oracle 0.846 → 0.923; ~60-70% cheaper per workflow; one premium slot; all four Yunwu, all wall-clock-guarded.** Opus + GPT-5.5 leave the POOL but STAY in the endgame BASELINE set (opus still 0.933 on saturated trend60 — the objective is beating the strongest worker, wherever it lives).
-- **s165 FULL-PRODUCT row (the instrument the user demanded): Stage-2 WAS WORKING** — fu2 0.867→**0.933** and fu1 0.800→0.867 in ten steps; gap to the fair bar (opus+retry 0.950) closed −0.067→**−0.017**, paired +0/−1. The one-shot dip at 155 was the predicted transient.
-- **RESUME executed (user GO)**: pilot config models swapped (worker NAMES kept — hashes/lane-masks intact; backup `.bak_pool_v1`); old-pool spool archived (46.7MB — old-worker rollouts must not restore into the new-pool run); orch ckpt-167 pruned (alignment); trainer ckpt-166 manufactured from broadcast-167. **The live-safety gate FIRED on first launch — `Yunwu workers not explicitly allowed: ['st_glm']` — exactly its job** (grok newly routes yunwu); manifest updated (all four workers yunwu-allowed, purpose annotated, backup kept), orch relaunched. Brief two-orch race resolved by PID. Health gate armed for step-167 (first new-pool batch); expect the re-anchoring wobble (~5-15 steps, 3/4 slots changed) then the climb; cadence rows at 175/185/195 (fu1+fu2 pairs).
-
-### 2026-07-08 — PREMIUM-POOL FSHARD VERDICT (the report-class win test): **FUGU-ULTRA+LOOP 0.923 vs BEST PREMIUM SOLO 0.846 — +7.7 pts on held-out hard code, ABOVE the pool oracle, zero paired losses vs every control. Report-class margin, zero retraining.**
-
-- **Run**: 26 LCB-V6 hard, pool = opus-4.8 / **gemini-3.1-pro** (65k cap, 0 truncations) / gpt-5.5 / glm-5.2, conductor = step-145 unchanged. 220 min, $14.32 reported (+Yunwu: opus 42k / gpt 155k completion tokens).
-- **Table**: **fu2 0.923** · solo2_gemini-pro 0.885 = ORACLE 0.885 · solo2_opus 0.846 · **solo_gemini-pro 0.846 (bar)** · fu1 0.808 = solo2_gpt 0.808 · opus 0.731 · gpt 0.615 · glm 0.154.
-- **Paired (decisive)**: fu2 vs premium bar **+2/−0**; fu2 vs the STRONGEST control (gemini-pro+retry) **+1/−0 — strict dominance; no arm anywhere beats fu2 on a task fu2 loses**. fu2 EXCEEDS the 4-worker oracle: it solved `arc196_c`, which NO solo solved at premium strength (and which was unsolved-by-everything in the flash-pool run). The loop converted 3 of fu1's 5 failures. Only `abc396_e` remains unsolved by anything.
-- **Caveats (recorded before celebrating)**: n=26; +2/−0 alone is sign-test p≈0.25, not p<0.05 by itself. The CAMPAIGN pattern carries the weight: fu2-vs-best-solo discordants across the hard-set runs pool to +5/−1, margins +0.077 (flash) / +0.077 (premium), and fu2 ≥ every control in every run. Conductor arms are single temp-1.0 samples — replicate is cheap (solos are cached constants).
-- **CONSOLIDATED CAMPAIGN VERDICT**: Fugu-Ultra (one 8B conductor, 145 GRPO steps, trained at 4096/minimal) + the Zenith-borrowed feedback loop, given the report's premium gemini slot: matches the best worker on saturated sets, and on hard held-out code **beats the best premium solo by +7.7 pts, above the pool oracle** — the report's +4.7-class margin shape. Mechanism split: part worker-quality routing (the conductor exploits gemini-pro with no retraining — ordinal prompt), part the execute→feedback→re-plan loop (the trained repair-lane skill cashing at inference).
-- **Next**: (1) conductor-arm replicate on the same set (fresh temp-1.0 samples, solos cached) to harden the margin; (2) the SEALED confirmation set stays reserved for the final report-grade verdict; (3) Stage-2 (2-turn training) now has direct evidence — the loop converts failures with an UNTRAINED turn-2; training turn-2 is the obvious next run.
-- **STAGE-2 CONDITIONAL GO (user, 2026-07-08: "consider stage-2 a GO if the conditions are met") — pre-registered conditions**:
-  1. **Replicate holds**: rep2's fu2 ≥ best premium solo on fshard (the margin does not invert on a fresh conductor sample).
-  2. **Sealed confirmation clean**: one-shot eval of the frozen best config (fu2 + premium pool) on `heldout_confirmation_taskspecs.jsonl` lands ≥ best premium solo there (no regression on the never-touched set).
-  Both hold → LAUNCH Stage-2 (2-turn feedback GRPO from step-145). Either fails → report back before any training spend. Wiring work (rubric/mask/orch-config — spend-free) proceeds in parallel regardless.
-- **CONDITION 1 RESULT (rep2, fresh conductor samples, 186 min, $6.36): HOLDS.** fu2 **0.885 vs bar 0.846** (+0.038), again = oracle 0.885, again ties the retry control (+1/−1). Two-sample fu2 margin over best premium solo: +0.077 / +0.038 (mean ≈ +5.8 pts, both positive, never below bar). fu1 sampling variance across draws: 0.667(n=6 probe)/0.808/0.769 — the loop arm is the stable one. Sealed confirmation (condition 2) LAUNCHED.
-- **CONDITION 2 RESULT (sealed one-shot, 204 min, $16.42): HOLDS — with an integrity finding.** fu2 0.500 tops the table vs best solo 0.467 (+0.033; paired +1/−0 vs the retry control). **Integrity finding: the sealed set's 15-task Omni-MATH half is GRADER-INCOMPATIBLE** — proof/characterization golds (e.g. `f(x)=a_0(x²+α²)^n, a_0>0`) that `math_equal` cannot match against differently-parametrized correct answers → ALL arms scored ~0–0.13 there uniformly (opus solo 0/15 with elaborate plausibly-correct answers = the artifact signature). A confirmation-set CURATION bug (the trend60 build gold-validated gradability; this sealed math draw did not), harming all arms equally, so the comparison stands; the clean measurement is the code half: **fu2 0.867 = top of table (no regression)**. Recorded: any future use of the sealed set must regenerate its math half from gradability-validated golds.
-- **BOTH GO CONDITIONS MET → STAGE-2 LAUNCHED** (2-turn feedback GRPO from step-145 via `scratchpad/stage2_launch.sh`; the :8007 vLLM now serves the Stage-2 run).
-- **INCIDENT @ first Stage-2 batch (2026-07-09, user-caught via a trainer warning): orch wrote into the PAPER dir.** `orch_stage2.yaml` was copied from `orch_paper.yaml` with env-args/token-client edited but **`output_dir` (line 4) missed** → the Stage-2 orch wrote its control config, state checkpoints (145/146/147), spool, and the FIRST FULL BATCH into `output/fugu_ultra_paper/run_default`, while the trainer watched the empty stage2 dir → `get_orchestrator_config` returned None → the trainer NEVER REGISTERED the run (the user-reported "No orchestrator config found" warning) → orch deadlocked "waiting for trainer checkpoint 146". **Recovery, zero loss**: orch+trainer stopped by PID (vLLM kept); `output_dir` fixed in the yaml AND the transplanted control file; the full 256-rollout 2-turn batch (`rollouts/step_145/rollouts.bin`, 3.8M ≈ 40 min + worker spend) MOVED into the stage2 dir along with orch ckpt-145 + spool (future-step spool groups discarded by the restore guards, as designed); ahead-of-trainer orch ckpts 146/147 pruned (alignment contract); paper dir de-contaminated (its control/orch.yaml was overwritten at launch — regenerable from orch_paper.yaml if ever needed); relaunched. **Lesson (same class as the phantom-replay incident — a config consumed by TWO processes, audited for one): config copies get a full-field diff against their source, not just the edited fields.**
-- **STAGE-2 FIRST STEP CLEAN (04:57)**: `step=145 loss=0.0081 grad_norm=0.0010 lr=1e-05 kl=0.1660 masked=18.05%` — the first 2-turn batch trained INSIDE every historical healthy band (grads 0.0002–0.005, kl 0.14–0.27, masked 16–21%), confirming the turn-agnostic-masking analysis on live data. Salvaged batch consumed; spool restored 21 groups/902 rollouts. Standing cadence armed: held-out trend60 eval at step 155+ every 10 steps, IDENTICAL protocol to the historical series (constrained workers, single temp-1.0 pass) so Stage-2 rows extend the same table; step-145 reference row ≈ 0.850 band. Watch-items: `ultra_mt_converted` in the orch metrics (the trained conversion rate — THE Stage-2 signal), `ultra_mt_turns` distribution (early-exit share), step pace (~46 min for the first batch; 2-turn only on failures), kl drift vs the revert thresholds.
-- **GPT-5.6 release (imminent, user-flagged): playbook pre-registered** in memory ([[gpt56-release-playbook]]): terra (5.5-parity, half price) → training slot 2 at a checkpoint boundary immediately after an API probe; sol (stronger, same price) → adopt only after the complementary-vs-dominant check (solo overlap on fshard + pool-upgrade eval, ~$25, existing harness). Ordinal design makes either swap a config change; no mid-run pool changes.
-- **GPT-5.6 LANDED on Yunwu (2026-07-10): terra + sol (+max/ultra/luna tiers). PLAYBOOK EXECUTING; TRAINING PAUSED for the verdict (user decision, agreed).** Dialect probes: both honor `reasoning_effort=minimal` cleanly (5-token replies, NO adaptive runaway — better gateway behavior than 5.5). Registered `gpt-terra`/`gpt-sol` (Yunwu-only per invariant; streaming guard auto-covers gpt-* slugs). Measurement chain (behind the s165 eval, conc 3): (1) terra parity — trend60 solos at the training handicap vs gpt-5.5's 0.883 constant → parity ⇒ training slot-2 swap at the resume boundary (halves GPT training spend); (2) sol — fshard-26 full-strength solos + oracle-delta → complementary/dominant/skip. **Stage-2 orch+trainer stop at the next batch boundary (spool+ckpt persistence make this lossless); vLLM stays for evals; resume decision = pool decision, informed by the measurements.** Sol pricing note (user): Opus-price, claims far above Opus — the dominant-worker scenario is live; if sol dominates, the fair bar rises for everything and the pool likely rebuilds around sol + complements.
-- **GROK-4.5 (live 2026-07-09, user-flagged): MEASURED — second-best solo, ZERO oracle add, but the natural GLM-slot economy upgrade; slot-3 eval launched.**
-  - Routing odyssey: OpenRouter lists it but xAI 403s our region; **Yunwu carries it UNLISTED as `grok-4.5`** (user-confirmed) → `grok` logical model routes yunwu (FORCE_PROVIDER; flip to openrouter when the region opens). **Yunwu cap-non-enforcement CONFIRMED for grok too** (max_tokens=400 probe ground >2 min — the gemini/gpt gateway class) → the GPT streaming wall-clock guard extended to `grok-*` slugs (self-selecting: OpenRouter's `x-ai/grok-*` slug stays unguarded, it honors caps).
-  - **fshard-26 solo verdict (`scratchpad/probe_grok_solo.py`)**: **0.769** (20/26) — 2nd best solo (gemini-pro 0.846 > grok > opus 0.731 > gpt 0.615 > glm 0.154); early 17/19 pace faded on the hard tail (easy-task bias, as always). **Coverage: DOMINATED — grok-only solves = ∅, misses 3 tasks others get, oracle unchanged 0.885.** Benchmark-win ≠ our-harness win, third confirmation. **Economy: exceptional** — ~41k completion tokens TOTAL for 26 tasks (~1.6k/task vs gemini-flash's 25k/call), ~$0.25-class.
-  - **Role: GLM-slot replacement** (0.154 → 0.769 in the same cost class): won't raise the ceiling, should strengthen workflow INTERIORS (draft/implement steps run through slot 3). **Slot-3 upgrade eval LAUNCHED** (`--pool-swaps st_glm=grok` + premium gemini slot; fu1/fu2 vs the same bars, solos replay from cache). Adopt-for-deployment if fu2 holds ≥ the 0.885-0.923 band; training-pool swap only at a checkpoint boundary.
-- **GEMINI-3.1-PRO BANNED (user directive 2026-07-09: "I don't want anything to do with gemini 3.1 pro"; the CURRENT pool is gemini-3.5-FLASH).** Actions taken same hour: `gemini-pro` logical model REMOVED from providers.py; `--pool-upgrade` branch removed from the eval runner; the running pro+grok eval KILLED mid-flight and its rows deprecated (`.deprecated_pro`). **Integrity audit first (user reported OpenRouter logs show only flash): the cache holds 218 completions whose API-response model field = `google/gemini-3.1-pro-preview`** — OpenRouter genuinely served pro in those runs, so the measurements were real; this is a POLICY ban, not a data bug. **Consequence for the record: all pro-pool results (fu2 0.923 / rep2 0.885 / sealed run) are ARCHIVE-ONLY — product claims cite the pro-free evidence: current-pool fu2 0.846 = oracle, +0.077 over best solo (flash 0.769).** Stage-2's justification is unaffected (the loop's conversions were demonstrated on the current pool; training never touched pro). **The decisive pool eval is now CURRENT-POOL + grok slot 3** (`fs_hard_grokslot_flash`, auto-chained, running): adopt grok for slot 3 if fu2 ≥ the 0.846 current-pool mark.
-- **STAGE-2 WIRING COMPLETE (all three pending deploy items retired, spend-free)**: `FuguUltraMultiTurnEnv` + MT rubric live in the production env module (`load_environment(max_turns=2)`; terminal reward via the SAME `runtime.score` path — identical reward semantics incl. penalties/flags; single-turn lanes byte-identical at default). **E2E smoke on the real stack PASSED**: live vLLM conductor + fake workers + the trainer's TITO token client → 2-turn rollout, token spans on BOTH assistant turns (prompt 1820/comp 128; prompt 2081/comp 541), rubric scored the final turn, conversion metric wired. Configs validated through the orchestrator's real loader: `orch_stage2.yaml` (4 lanes × max_turns 2, `use_token_client: true` — single-turn ran false; multi-span needs TITO), `train/infer_stage2.yaml` → `output/fugu_ultra_stage2`, launcher `scratchpad/stage2_launch.sh` (manufactures ckpt-145 from the paper broadcast, nested `run.step` format verified; refuses concurrent processes; NOTE: replaces the :8007 vLLM — fire only after the sealed eval). Committed: `2d18c1a5` (orch resilience backlog) + `a840e879` (campaign + Stage-2).
-
-### 2026-07-07 — PARALLEL-TOPOLOGY COUNTERFACTUAL PROBE (user GO "build it"): NEGATIVE — collapse-to-chains is CORRECT for this setup
-- **Question**: the policy samples ZERO parallel/isolation topologies (census above). Lost headroom (the report's tree-strategy advantage) or the right call? **Test**: 25 evicted fortresses (chains ≈ never won, by construction; code 7 / math 6 / reason 6 / repair 6 from the step-134 hard pool) × 2 hand-built parallel+aggregator workflows (P1 gpt+gem→opus-agg, P2 opus+glm→gpt-agg), same handicapped workers / execute_workflow / graders as training. ~$5-8, fully offline.
-- **Result: 0/50 cracked; union 0/25.** Execution sound — 31/50 valid-wrong (well-formed answers, just wrong; repair zeros = the usual code-harness fails), so a genuine negative, not an artifact.
-- **Verdict (pre-registered rules)**: fortresses are WORKER-CAPABILITY-BOUND at the handicap, not plan-shape-bound. The conductor's all-chains style is not a habit to fix — it is CORRECT for this pool + 4096/minimal workers. **Topology interventions for THIS run: DEAD** (no few-shot swap, no temperature, no reward shaping — the if-stalled contingency is retired too). For future runs: parallel coldstart demos drop from "measured value" to "cheap lottery ticket"; the report's tree advantage likely needs full-strength workers and/or their scale — re-test in the endgame's FULL-STRENGTH setting before any Stage-2 design bet. Remaining gap to oracle (0.983 vs ~0.87) = per-task worker stochasticity + hardest residue, NOT missing topology.
-- Files: scratchpad/parallel_counterfactual_probe.py + parallel_probe_results.jsonl (50 rows).
-
-### 2026-07-07 — REPAIR-LANE DEPLOY (user-directed): bounce armed at the 112/113 boundary, regardless-of-row-110 with a veto window
-- **Decision (user)**: "stop the orchestrator once batch 112 is finished and apply the repair fix, regardless of the result of step 110 eval." Endorsed with one amendment: the eval measures the step-110 ckpt, so the bounce cannot contaminate it — row 110 serves as a VETO-ONLY check (catastrophe ⇒ hold and debug), not a gate. Row 110 landed healthy (0.850, code 0.800 run-high) BEFORE the boundary ⇒ veto window passed cleanly; deploy proceeds.
-- **Staged + validated before arming**: 4th env block `fugu_ultra_repair` in orch_paper.yaml (mirror of the RLPR block; manifest hard_mix_repair_taskspecs.jsonl, max_examples 40, max_concurrency 12) + `env_ratios: [0.2, 0.5, 0.2, 0.1]` — the 0.1 repair share is carved OUT of code (0.6→0.5), keeping the code-family total at 0.6 (repair tasks ARE code tasks with a broken artifact in the prompt); at 4 groups/step ≈ one repair group per 2–3 steps ≈ the 40-task band cycles ~once over the remaining run. Config parsed with the orchestrator's REAL loader (`load_config(GRPOOrchestratorConfig, ...)` — the exact entrypoint call): 4 envs in order, ratios correct, spool on, resume −1. Prompt budget: max repair prompt 5,901 chars < 12,000 cap. Lane map: all 40 repair ids present (801 total). Live orch does NOT reload the yaml mid-run — staging was safe by construction.
-- **Boundary-semantics gotcha caught while arming**: orch ckpts are written at the TOP of each step — step_112/orchestrator existed while batch 112 was only 75% accepted. "Batch 112 finished" therefore = **step_113 ckpt present AND rollouts/step_112/rollouts.bin on disk**; the bounce script waits for exactly that compound condition (a naive "step_112 exists" trigger would have fired MID-BATCH).
-- **Bounce mechanics** (`scratchpad/bounce_repair_112.sh`, watcher pid 82934, target orch pid 3741299 — kill BY PID only): at the boundary → SIGTERM (escalate 9 after 20s) → relaunch `surogate grpo-orch orch_paper.yaml` with SUROGATE_GRPO_START_STEP=<boundary step>; resume_step −1 loads the latest orch ckpt; math/code/reason pools carry over (env names unchanged ⇒ content-hash restore matches, the RLPR-bounce-proven path); repair joins fresh; in-flight spool restores partial groups. Trainer untouched throughout (consumes bins; idles briefly at the boundary). **VERIFIED (06:07–06:09)**: fired at the true boundary (step_113 ckpt 06:07:26, step_112 bin present); old orch SIGTERM'd clean; new orch pid 98142. Log evidence: `Env server fugu_ultra_repair ... healthy` (4th lane UP), buffer config echoes `env_ratios=[0.2, 0.5, 0.2, 0.1]` + thresholds intact + hash_keys ['task','prompt'], `Resuming training from checkpoint step 113`, spool enabled at the standing path. **Pool carryover: 43 hard + 9 easy** saved at the boundary (grown from 28+7 at the RLPR bounce — eviction kept retiring through 101–112) and loaded with ZERO mismatch warnings (the only 3 post-06:00 warnings were pre-bounce benign SyntaxWarnings from the reason grader on LaTeX escapes). Trainer (pid 2906828) untouched. Remaining: first repair-group draw in a progress line (watcher armed; 0.1 ratio ⇒ expected within batches 113–115), then the post-deploy repair census (win structure + topology).
-- **Bar calibration (official)**: production Fugu-Ultra does NOT beat best-worker everywhere — ties/loses on SciCode, τ³, MRCRv2, LCR; wins by +2–6 pts on SWE-Pro/TB/LCB/GPQA/CharXiv. Success profile = clear wins on coding/agentic+reasoning, ties elsewhere ⇒ ANY positive gap on our 60-mix = production-class. Our −0.033 is inside their margin structure.
-- **External validation**: production Ultra routes math→GPT (4.2) — our post-swap GPT-opener shift independently converged on the same assignment. Recipe confirmations: no-KL at production scale (β=0 despite eq. 6), identical 0/0.5/1 reward, ≤5 steps, raw pretrained base. Pool note: their Ultra pool = 3 premium (Gemini-3.1-PRO, Opus-4.8, GPT-5.5) — no GLM, no cheap tier; our pool is systematically cheaper.
-- **Gaps to instrument**: production strategies are TREES with task-adaptive aggregators (4.4: Gemini-aggregates-trivia / GPT-aggregates-math; fixed-aggregator systems called out as bottlenecked) — our census tracks models+steps but NOT access-topology; ADD topology tracking (chain vs parallel-leaves vs tree+synthesizer) at next checkup. Unused framework feature: conductor-as-worker (self in pool, free synthesis steps) — 14B/Stage-2 lever, not mid-run.
-- **For the 14B path**: soft-distribution SFT labels (softmax over measured per-worker rewards — eq. 1; our solo caches already hold the data) beat winner-imitation. **For Stage 2**: 3.2.2 is the blueprint — intra-workflow isolation (we already implement via access lists; prevents "orchestration collapse") + persistent inter-workflow shared memory; "unlimited interaction" training confirmed feasible at their scale. **For endgame**: adopt their exact harnesses (Mini-SWE-agent, Terminus 2, EvalScope v1.8.1, LCB v6=1055) for report-comparable transfer numbers.
-
-### 2026-07-06 — Eval-mechanism audit (user-requested, pre-step-90): mechanism CORRECT; contamination ZERO; one blind spot instrumented
-- **Verified correct from source** (`scratch_eval_live_throttled.py`): conductor generated with EXACTLY the training distribution (same `_prompt_for_task`, same parser, temp 1.0 / 1024 tok / no-think, live `default` adapter); workers identically handicapped (4096 / temp 0.2 / minimal) on BOTH sides — workflow calls AND solo baselines → the bar is fair; same grader stack as training; same provider routing; `--n 60` consumes the entire 30+30 manifest every row (zero task-selection noise); oracle/best-worker math correct.
-- **Contamination check: CLEAN** — 0 overlaps between the 60 eval tasks and the 461 training tasks by task_id, exact normalized content, AND fuzzy 120-char prefix (the AIME-inside-Omni-MATH worry ruled out empirically).
-- **Design properties CONFIRMED-AS-INTENDED (not bugs, kept for series comparability)**: each row = ONE temp-1.0 sample per task (measures the sampled-policy mean, not the greedy mode — the same-task probe covers precision needs); constrained-worker setting per §4.3 (full-strength comparison reserved for the endgame verdict); moving-adapter semantics ("policy ~ step N").
-- **Blind spot found + instrumented (additive only, scoring byte-identical)**: empty generations / parse fails / executor exceptions all scored 0 silently, and the exposure is ASYMMETRIC (solo baselines cached after first row; conductor calls live every row → provider flakiness debits only the conductor). From row 90 onward every row prints + logs `diag` (empty_gen / parse_fail / exec_error counts) and `solo_errors`, so an infra-dragged row is identifiable at a glance. Smoke-tested against the live adapter.
+| Product runtime | `director/director/agentic/fugu_ultra_terminal.py` | `8324eeeff127752e0ba31293e7d2fa72e0168afdaa1136e541bb443580058978` |
+| Runtime revision | `20260720-r57-unified-conductor-candidate` | source above |
+| Initial planner config | `output/fugu_ultra_planner_composite_v11_s20/adapter_config.json` | `57095afdb2d1c8f2c8a435afa6b8856f57a3bced5107e85b393fe4100a7575b3` |
+| Initial planner weights | `output/fugu_ultra_planner_composite_v11_s20/adapter_model.safetensors` | `f794ac11c862293ac37fd8ab7c3ba56e2c8ccc39e380ec8efb0f110b50c92fe0` |
+| Live-control config | `output/fugu_ultra_live_control_grpo_v16/final_adapter/adapter_config.json` | `a06c3b34e0076b6cf26bd36bd24e01e0010b3bb5432155a2747a473cd30ae366` |
+| Live-control weights | `output/fugu_ultra_live_control_grpo_v16/final_adapter/adapter_model.safetensors` | `0a987412de57f3afe5d35be2a9ce4c3b03d4ffcd676d2605941ee71f000448b3` |
+
+The runtime supports `continue`, `handoff`, `replan`, and `complete` at live
+terminal boundaries. It preserves function-call ownership and each worker's
+private tool loop. Within a workflow, a worker sees another worker's trajectory
+only through the conductor's access list. Verified state from completed prior
+workflows is available as persistent shared memory. Runtime r57 adds an opt-in
+unified full-action controller that owns both initial/replacement topology and
+live actions. The accepted product still uses the planner-v11/live-v16 split;
+the unified path is a training candidate and is not promoted by source changes.
+
+The accepted checkpoint's current defects are:
+
+- Initial plans are executable but insufficiently adaptive; a nine-task local
+  probe produced 9/9 executable identity-free workflows but used the same
+  `[2,1,0]` topology on 8/9 tasks.
+- Ordinary generative SFT and isolated selector attempts did not change the
+  relevant routing behavior and were rejected before paid evaluation.
+- Earlier V18/V19 GRPO could train only compact live decisions while topology
+  remained frozen, so it could not train the whole conductor. r57 removes that
+  training-architecture limitation without changing the accepted checkpoint.
+- The accepted live-control adapter was trained on the compact action protocol;
+  it does not yet produce valid unified full-action outputs. Stage-1 full-action
+  SFT is required before unified OPD training.
+- No later rejected checkpoint was composed into the product artifacts above.
+
+## Hard Operating Rules
+
+- Every external paid worker request must use `https://yunwu.ai/v1`.
+- Worker request timeout is 600 seconds.
+- Each arm has one global ceiling of 120 paid worker calls.
+- Provider retries and task retries are zero.
+- Run one task attempt at a time. Do not launch broad campaigns.
+- Stop immediately on infrastructure invalidity, protocol invalidity, a closed
+  verdict, or loss of a credible learning signal.
+- Do not retry a closed task or campaign without a genuinely new preregistered
+  version and a causal reason.
+- Never treat infrastructure failures as task or conductor negatives.
+- Protect benchmark-owned tracked tests from agent modification.
+- Do not start the grand evaluation until the candidate passes local,
+  whole-task holdout, identity, and anti-forgetting gates.
+- Update this document after preregistration, every completed arm, every
+  admission decision, every training gate, and every stop verdict.
+
+## Current Evidence
+
+### Benchmark verdict
+
+The last partial TerminalBench campaign, r33, was rejected after 19 passes and
+9 failures in 28 scored tasks. It does not support a superiority claim and must
+not be resumed. Full comparator reruns are prohibited.
+
+### Unified conductor and dense-credit readiness
+
+The zero-cost r57/SEED preflight is complete:
+
+- One policy can now emit the initial topology, replacement topology,
+  `continue`, `handoff`, and `complete` actions inside the same verifier-scored
+  episode. Compact historical rollouts and unified trajectories have distinct,
+  fail-closed protocol attestations.
+- The trainer now carries aligned `hindsight_logprobs` and an explicit
+  `hindsight_mask`. The native CUDA loss implements confidence-gated on-policy
+  distillation independently from outcome GRPO and the existing teacher signal.
+- A tied-reward synthetic group produced nonzero dense credit only on the two
+  selected conductor tokens. Prompt and environment tokens remained zero; a
+  skill-supported action received more credit than an unsupported action.
+- The hindsight contract accepts anonymous capability/role guidance tied to
+  observed decision IDs and rejects concrete model/provider identities, fixed
+  worker slots, oracle data, hidden tests, reference patches, and unobserved
+  evidence.
+- The native extension rebuilt successfully. Focused verification is 147/147
+  runtime/control tests plus 48/48 trainer, audit, rescoring, and
+  hindsight-contract tests.
+- Readiness report:
+  `scratchpad/fugu_seed_opd_v1/readiness_report.json`
+  (`b48c87e395c436f6491ee2fb017c1167435386cc77200b289102aa52d2c79237`).
+
+Verdict: `LOSS_FORMULA_AND_CONTRACT_READY_RESCORE_BACKEND_INVALID`. The native
+loss, transport, masks, and fail-closed skill contract remain verified. The
+later repeatability audit invalidated the vLLM prompt-logprob backend for dense
+credit, so no OPD optimizer result is accepted until deterministic matched-
+branch scores replace it. No training job is running.
+
+### SEED Stage-1 corpus gate
+
+The first fail-closed analyzer-corpus inventory is complete. It reviewed only
+explicitly admitted current-pool evidence rather than globbing historical route
+logs:
+
+- Five authoritative completed trajectories were reviewed. Four are
+  TerminalBench-derived and remain excluded from training.
+- One clean, non-benchmark, train-only success is eligible for analysis. It was
+  sanitized into four capability-profile permutations with no provider/model
+  identity or fixed worker slot in the learned surface.
+- There are zero eligible failures, zero eligible causal train pairs, and only
+  one distinct task. The minimum pilot gate is 12 independent trajectories on
+  six tasks, including at least three successes, three failures, and six causal
+  pairs.
+- The historical validators cannot be replayed byte-for-byte because their
+  frozen manifests hashed a mutable runtime path that changed at r57. The new
+  audit therefore verifies the immutable conversion rows and the complete
+  result/route/trajectory hash chain directly and records the runtime-source
+  drift instead of hiding it.
+
+Verdict: `INSUFFICIENT_ADMITTED_TRAJECTORIES_NO_TRAINING`. Training authorization
+is false. No external calls, paid calls, optimizer steps, or checkpoint were
+created.
+
+Artifacts:
+
+- Inventory spec: `scratchpad/fugu_seed_stage1_v1/inventory_spec.json`
+  (`547ef8e80365d7dc8698a3d162085748848f30c1a774f0e1536756dd0ce91f7a`).
+- Identity-free candidates:
+  `scratchpad/fugu_seed_stage1_v1/analyzer_candidates.jsonl`
+  (`1493bee69b635a93e4639d38b8ee4c000aaf43aa58562b3a2ad7397ac90492e4`).
+- Inventory report: `scratchpad/fugu_seed_stage1_v1/inventory_report.json`
+  (`54bc252e28f8dbf110e05369a2f33cef355dd7d83df654925cf109bb907f96af`).
+
+### Skill-conditioned rescoring
+
+The token-alignment scorer contract is implemented:
+
+- It reconstructs the ordinary chat-template tokens and fails closed on any
+  mismatch before adding privileged context.
+- It appends the validated training-only skill to the final user message, then
+  submits the original sampled conductor token IDs for prefill scoring. It does
+  not generate or substitute a counterfactual action.
+- The real local smoke reconstructed all 843 ordinary prompt tokens exactly,
+  produced a 910-token skill-augmented prompt, and re-scored the same 32 sampled
+  conductor tokens. All 32 action tokens and zero environment tokens were
+  selected by the hindsight mask.
+- The extractor now selects the submitted token ID explicitly when a response
+  also contains top alternatives, and fails closed if that token is absent.
+  Interleaving preserves exact alignment over later environment observations
+  and multiple conductor decisions.
+
+The original numerical readiness verdict is revoked. Ten identical parent
+requests on each of three frozen rows produced mean-token log-probability ranges
+of `0.04625`, `0.01518`, and `0.00500` on the vLLM endpoint. These are much
+larger than the OPD shifts used by v3-v6. Disabling CUDA graphs and prefix
+caching and switching to Triton attention did not make the endpoint repeatable.
+Therefore vLLM prompt logprobs are invalid for dense credit and sub-percent
+rollback measurement on this host.
+
+A direct Transformers/PEFT scorer using deterministic algorithms, math SDPA,
+the same loaded model, and adapter switching reproduced four parent probes
+exactly, including the longest 7,859-token case. Long contexts use chunked KV
+prefill without changing target tokens. The scorer is now integrated into the
+OPD data path. Ordinary rollout probabilities remain separate from a new
+`opd_reference_logprobs` channel; the Python loss and native CUDA loss compute
+the skill shift only from deterministic ordinary and hindsight branches. A
+partial reference/hindsight/mask triple fails closed, and the retired endpoint
+scorer aborts before it can create training data.
+
+The clean v7 train-only audit then used one fresh contract-valid `continue`
+action sampled locally from the accepted parent. The same loaded parent adapter
+scored the ordinary 846-token prompt and the skill-augmented 922-token prompt
+twice each with exact repeats and the same seven submitted action tokens. The
+token shift was nonconstant, ranging from `0.000000` to `0.040357` with mean
+`0.006877`; the resulting mean confidence gate was `0.508572`. The learned
+surface remained identity-free, the parent SHA was unchanged, and no v3-v6
+score value was reused. `make build` completed and all 55 GRPO tests pass.
+
+Verdict: `DETERMINISTIC_MATCHED_BRANCH_BATCH_AUDIT_PASS`. One replay-anchored
+local optimizer preflight is authorized. Product promotion and the held-out
+evaluation remain unauthorized. No external or paid calls were made and no
+optimizer step was taken.
+
+Matched batch:
+`scratchpad/fugu_seed_opd_matched_v7/matched_batch.bin`
+(`98c0e3d3cff63f65f31caf74eb99a01b75607296554e10b2492d23e93a103009`).
+Audit report:
+`scratchpad/fugu_seed_opd_matched_v7/prepared_report.json`
+(`a28f07fc63b0d8add408acdd2b6a87d9fe7269f2a729838e8ca57dea511ce06b`).
+
+The authorized replay-anchored v7 optimizer input is also prepared. It combines
+the two matched OPD examples with 30 train-only replay examples across all nine
+training tasks. Replay action-token mass is 72 `complete`, 72 `continue`, 68
+`handoff`, and 72 `replan`; all replay references reproduced exactly twice
+under the direct parent scorer. The current scorer also reproduced the stored
+ordinary and hindsight OPD branches exactly. Validation labels were excluded.
+The batch used 64 local direct-model score calls, zero external calls, zero
+paid calls, and zero optimizer steps.
+
+Preparation report:
+`scratchpad/fugu_seed_opd_optimizer_v7/prepared_report.json`
+(`a93794530c2acaab6bdc14ef02407a1d0fcec49980ba578c80360dfa6d262a9b`).
+Training batch:
+`output/fugu_seed_opd_optimizer_preflight_v7/run_default/rollouts/step_0/rollouts.bin`
+(`e6dd800b0d73836ac93cd1f1b5c2f57da4d463f36a50f8f63db80c84469bb3d3`).
+
+Historical vLLM smoke (numerically invalid):
+`scratchpad/fugu_seed_opd_v1/rescore_local_report.json`.
+Repeatability audit:
+`scratchpad/fugu_seed_opd_optimizer_v6/vllm_rescore_repeatability.json`
+(`9f8d7ce05e1618a4f4042878cdeb40925457e3cdd8e691fece45eb781040016c`).
+
+### Native optimizer and anti-forgetting gate
+
+The zero-cost v3 preflight exercised one real native optimizer step from the
+accepted live-control parent:
+
+- Commit `d08d50bf` adds exact hindsight transport/rescoring, matched-rollout
+  OPD gating, and trainable parent-adapter initialization. The exported child is
+  a standalone adapter over the original base rather than an incomplete delta
+  over a merged parent.
+- The tied group had two reward-0/advantage-0 trajectories and 14 selected
+  action tokens. Native mean gate `0.50857258` and shift `0.0068776407` matched
+  the precomputed references within `1e-6`; gradient norm was `0.00098309`.
+- The parent SHA remained unchanged. All 504 child tensors preserved the parent
+  schema and changed finitely; the relative update L2 was only `1.34e-4`.
+- Paired replay compared parent and child on all 178 task-isolated v16
+  validation decisions. Both remained 178/178 contract-valid, but six action
+  signatures changed: one improved and five regressed. Frozen-label matches
+  fell from 82 to 78 and false completions increased from one to two.
+
+Verdict: native dense-credit optimization is technically operational, but the
+disposable child fails the anti-forgetting gate and is permanently rejected.
+No accepted checkpoint changed. The operation used zero external or paid
+calls. Future training must mix parent replay/regularization into every update
+and retain a post-update rollback gate.
+
+Artifacts:
+
+- Prepared batch: `scratchpad/fugu_seed_opd_optimizer_v3/prepared_report.json`
+  (`50afb2e24774e5dfcaa0afa5c28ded4087bde5a28a0ccf7cb68670b58c513e5b`).
+- Native optimizer audit: `scratchpad/fugu_seed_opd_optimizer_v3/audit_report.json`
+  (`3b69e63a6b77bdef2ff41fded386d0eb414ced8feea1e9809b966dc0bea8c191`).
+- Paired replay: `scratchpad/fugu_seed_opd_optimizer_v3/replay_report.json`
+  (`5dd8887c5120767e703dd62649397814dee10e2f447605896f4659abee7d0bd7`).
+
+Commit `d4f5279d` adds a first-class replay anchor through the Python transport,
+batcher, reference loss, native CUDA loss, and metrics. The zero-cost v5
+preflight then tested one replay-anchored update from the same accepted parent:
+
+- The batch contained the exact tied reward-0 OPD group (14 selected action
+  tokens) plus 16 train-split replay decisions (168 tokens), four examples per
+  action, six tasks, and four anonymous profile permutations. Validation labels
+  were not used for training.
+- Native gate `0.50955904` and shift `0.0076760696` matched the prepared
+  references within `1e-6`. All 14 OPD and 168 replay tokens were consumed;
+  gradient norm was finite and nonzero. The parent hash stayed unchanged and
+  all 504 child tensors changed finitely.
+- All 178 generated holdout decisions remained contract-valid with no new false
+  completion. Among 175 parent-stable rows, however, the child introduced one
+  regression and one improvement. Three parent rows were decode-unstable.
+- The contemporaneous vLLM fixed-token likelihood comparison is invalidated by
+  the later repeatability audit and must not be used as evidence.
+
+Verdict: `REPLAY_ANCHORED_V5_REJECTED_ANTI_FORGETTING_GATE`. The replay anchor
+substantially reduced forgetting but did not meet the preregistered no-regression
+gate. The child is permanently rejected and no accepted checkpoint changed.
+The experiment used one optimizer step, local inference only, and zero
+external or paid calls. The structural defect is that equal replay-example
+counts were not equal replay gradient mass: the handoff targets contributed 68
+tokens while complete and continue contributed only 32 each.
+
+Artifacts:
+
+- Prepared batch: `scratchpad/fugu_seed_opd_optimizer_v5/prepared_report.json`
+  (`47e4b9b690514924ac3624ed2c60d9d64a814c54ae22f5da3fbb3a629ab6c483`).
+- Native audit: `scratchpad/fugu_seed_opd_optimizer_v5/audit_report.json`
+  (`5a83cdb6db4a0f61a06f27188f74e536235d53bba7c98bf3507b1290eed005c3`).
+- Generation replay: `scratchpad/fugu_seed_opd_optimizer_v5/replay_report.json`
+  (`b2d1bc1369025382fad2403ede1994e8bb15153372b0274eed8bad7edaca72e0`).
+- Fixed-token likelihood: `scratchpad/fugu_seed_opd_optimizer_v5/likelihood_report.json`
+  (`1e27dcf95228d4ba9972d53a58cc9e0cae7929106d4bbc5de9acb868171815ad`).
+- Final decision: `scratchpad/fugu_seed_opd_optimizer_v5/decision_report.json`
+  (`96dbf2a8075d3aa8e647fc12f0788c3987ff043e0b494acaeb7d8dbfe6c42815`).
+
+The causally isolated v6 preflight reused the exact v5 OPD samples and changed
+only train-side replay composition. It used 30 replay examples across all nine
+training tasks, with action-token mass of 72 complete, 72 continue, 68 handoff,
+and 72 replan tokens:
+
+- Native optimization consumed exactly 14 OPD and 284 replay tokens. The parent
+  remained unchanged, all 504 child tensors changed finitely, and the stopped
+  pre-control launch performed zero optimizer steps.
+- Generation remained 178/178 contract-valid. Across 175 parent-stable rows,
+  v6 introduced zero regressions and corrected one parent error; false
+  completion remained one.
+- The repeatable direct-model audit nevertheless found overall target
+  likelihood down `0.000100` per token, handoff down `0.000010`, and replan down
+  `0.003735`. Complete and continue improved.
+- More fundamentally, v6 reused the same nondeterministic vLLM ordinary and
+  hindsight OPD scores as v5. The native step faithfully optimized its inputs,
+  but those inputs do not establish valid dense credit.
+
+Verdict: `V6_REJECTED_INVALID_DENSE_CREDIT_AND_ANTI_FORGETTING_REGRESSION`.
+The candidate is permanently rejected; no accepted checkpoint changed and no
+paid calls were made.
+
+Artifacts:
+
+- Prepared batch: `scratchpad/fugu_seed_opd_optimizer_v6/prepared_report.json`
+  (`5cd10b4d3548181abbfac26fe81cede4743a1142da32d5b41a318983f3d2550e`).
+- Native audit: `scratchpad/fugu_seed_opd_optimizer_v6/audit_report.json`
+  (`2cb98e6849a3987e82d6209812791c62000a18598af22d80e29f8eadfc6edb56`).
+- Generation replay: `scratchpad/fugu_seed_opd_optimizer_v6/replay_report.json`
+  (`bf5923b22560f7d87632a74a66aba6bcacc02484befb10bc374c5a9e45aea820`).
+- Direct likelihood: `scratchpad/fugu_seed_opd_optimizer_v6/direct_likelihood_report.json`
+  (`9c3fafb6106fe861db4bb976a67c6df8f304cc6196110fabed1e71bd1e4fa356`).
+- Final decision: `scratchpad/fugu_seed_opd_optimizer_v6/decision_report.json`
+  (`dc7c37f752e83623eae595a0b4d73cd0efdc2dfd5eab8b3a3608a371caed6f21`).
+
+The v7 preflight is the first optimizer run whose OPD ordinary and hindsight
+branches both came from the integrated deterministic direct scorer. It used the
+matched seven-token `continue` group plus the same action-token-normalized
+30-example train replay:
+
+- One native optimizer step consumed 14 OPD and 284 replay tokens. All 504 child
+  tensors changed finitely, the gradient norm was nonzero, and the accepted
+  parent hash remained unchanged.
+- Direct train-side target likelihood improved overall and for every action.
+- A failed eight-way generation launch was classified as infrastructure-invalid
+  after the local server died; it was not counted against the conductor. The
+  preregistered serial replacement completed 178/178 contract-valid decisions
+  with zero regressions across 175 stable parent rows.
+- The final exact-repeat direct holdout improved overall likelihood by
+  `0.000398` per token. `complete`, `continue`, and `handoff` improved, but
+  `replan` regressed by `0.003700` per token across its 18 frozen cases.
+
+Verdict: `V7_REJECTED_REPLAN_ANTI_FORGETTING_REGRESSION`. The corrected
+matched-reference OPD pipeline is operational, but this one-sample update is
+not a product checkpoint. The child is permanently rejected, the accepted
+planner/live-controller artifacts remain unchanged, and no external or paid
+calls were made.
+
+Artifacts:
+
+- Native audit: `scratchpad/fugu_seed_opd_optimizer_v7/audit_report.json`
+  (`fbac7c20503bc0df42ec4f76ea4f89a853835e302d5306586c0f18936bcad3c7`).
+- Train score gate: `scratchpad/fugu_seed_opd_optimizer_v7/train_score_report.json`
+  (`285f9671dddfb1bf6800ca2d388bb38c915ccf242da0ba9de38bc086da845acb`).
+- Serial generation gate: `scratchpad/fugu_seed_opd_optimizer_v7/generation_report.json`
+  (`d2454d316ffe007971d3635d53e177e030d1fe3d255c97ee415018e1cb54910f`).
+- Direct holdout likelihood:
+  `scratchpad/fugu_seed_opd_optimizer_v7/direct_likelihood_report.json`
+  (`ced16f2ff5f3a225e7e5a074b44df2fc30e9f546ec6d365cef4dec57f0621112`).
+
+### Verified causal coordination
+
+One same-task, same-runtime, same-pool causal pair is independently admitted:
+
+- Task: `configure-git-webserver`, permanently excluded from future evaluation.
+- Solo arm: anonymous builder, 8 Yunwu calls, clean reward 0; final deployed
+  state was removed and the verifier received HTTP 404.
+- Coordinated arm: identical builder plus one anonymous independent final-state
+  auditor, 7 Yunwu calls, reward 1.
+- Both arms used runtime r56, the same pool, fresh environments, zero retries,
+  and had no provider, protocol, harness, or integrity error.
+- The only intervention was the added auditor position with access to the
+  builder.
+
+Artifacts:
+
+- Campaign: `scratchpad/fugu_causal_coordination_v1/campaign_frozen.json`
+  (`4d9636973723956c5f515bf99f1f214ac4adfab9f559625f119a9e8c15e68ed7`)
+- Pair report: `scratchpad/fugu_causal_coordination_v1/pair_report.json`
+  (`6d6f97fa9c6a1448d45453bd394bcd910f14e3ea1f1d98b6270140a6e13eb07d`)
+- Independent admission:
+  `scratchpad/fugu_causal_coordination_v1/admission_v1.json`
+  (`9b6236f4f22d96074f5c1c2473bff5a04337e4e0203156b7caf21ab60852fb9d`)
+
+This proves one observed coordination lift. It does not estimate expected lift
+and does not authorize training.
+
+## Next Operation
+
+1. Keep product promotion and grand evaluation stopped. The v3, v5, v6, and v7
+   children are rejected and must not be used.
+2. Gate every hindsight annotation against observed conductor decision IDs and
+   reject task solutions, concrete model/provider identities, fixed worker
+   slots, and unsupported causal claims.
+3. Preserve the deterministic direct scorer as the only authorized OPD score
+   source. Do not reuse v3-v6 score values or the endpoint prompt-logprob path.
+4. Do not make a v8 replay-tuning attempt from the same single `continue` OPD
+   group. v7 proves that this data is too narrow to preserve all four actions,
+   even when the transport, native step, and replay are correct.
+5. Collect the missing clean train-side current-pool trajectories one task at a
+   time, targeting observed decision points and causal coordination evidence
+   across all four actions. Use Yunwu only, a 600-second worker timeout,
+   120-call global ceiling, zero retries, and stop immediately on invalidity or
+   absent learning value. TerminalBench, holdouts, oracle runs, and the rejected
+   historical outcome corpus remain excluded.
+6. Re-run the frozen Stage-1 gate after every admitted task. At threshold, train
+   full-action Stage-1 SFT with a replay-majority mixture, then continue with
+   replay-anchored OPD. Reject either stage on action validity, replay,
+   profile-equivariance, completion, or causal-lift regression.
+7. Promote nothing until whole-task train/holdout evidence shows coordination
+   lift while preserving anti-forgetting, model-agnostic construction, and pool
+   replacement behavior.
+8. Run the smallest held-out Yunwu product gate only after those conditions;
+   do not restart TerminalBench r33 or rerun published comparators.
+
+## Grand Evaluation
+
+The grand evaluation is the final product gate, not a research exercise.
+
+1. Use official published comparator scores; do not rerun other models.
+2. Start with the smallest preregistered held-out Yunwu promotion slice.
+3. Classify task failures separately from provider, harness, and protocol
+   invalidity.
+4. Stop as soon as superiority is mathematically impossible or the candidate
+   is invalid.
+5. Run remaining TerminalBench 2.1 tasks only while a credible path to at least
+   79/89 passes remains.
+6. Require consistent SWE-Pro-class agentic evidence before a product claim.
+
+## Reproduction
+
+Verify the accepted trained adapters and current runtime without model calls:
+
+```bash
+sha256sum \
+  director/director/agentic/fugu_ultra_terminal.py \
+  output/fugu_ultra_planner_composite_v11_s20/adapter_config.json \
+  output/fugu_ultra_planner_composite_v11_s20/adapter_model.safetensors \
+  output/fugu_ultra_live_control_grpo_v16/final_adapter/adapter_config.json \
+  output/fugu_ultra_live_control_grpo_v16/final_adapter/adapter_model.safetensors
+```
+
+The hashes must match the Current Product table.
+
+Rebuild and verify the unified conductor and dense-credit path without model
+calls:
+
+```bash
+make build PARALLEL_JOBS=8
+
+PYTHONPATH="$PWD:$PWD/director:$PWD/ultra" \
+  director/.venv/bin/pytest -q \
+  ultra/tests/test_live_control.py \
+  director/tests/test_fugu_ultra_terminal.py \
+  director/tests/test_fugu_live_agentic_grpo.py \
+  director/tests/test_fugu_decision_correction.py
+
+PYTHONPATH="$PWD:$PWD/director:$PWD/ultra" \
+  .venv/bin/pytest -q \
+  tests/grpo/test_native_formula.py \
+  tests/grpo/test_inference_config.py \
+  tests/grpo/test_native_runtime_source.py \
+  tests/grpo/test_seed_opd_contract.py \
+  tests/grpo/test_seed_hindsight_rescore.py \
+  tests/grpo/test_live_agentic_v18_audit.py \
+  tests/grpo/test_live_agentic_v19_operation.py \
+  tests/grpo/test_resume_step.py \
+  ultra/tests/test_seed_hindsight.py
+
+PYTHONPATH="$PWD:$PWD/director:$PWD/ultra" \
+  .venv/bin/python scratchpad/audit_fugu_seed_opd_readiness.py
+
+PYTHONPATH="$PWD:$PWD/director:$PWD/ultra" \
+  director/.venv/bin/pytest -q \
+  director/tests/test_fugu_seed_stage1_corpus.py
+
+PYTHONPATH="$PWD:$PWD/director:$PWD/ultra" \
+  director/.venv/bin/python scratchpad/audit_fugu_seed_stage1_inventory.py
+
+PYTHONPATH="$PWD:$PWD/director:$PWD/ultra" \
+  .venv/bin/python scratchpad/audit_fugu_seed_rescore_local.py
+
+PYTHONPATH="$PWD" \
+  .venv/bin/python scratchpad/audit_fugu_seed_opd_optimizer_v3.py
+```
+
+Expected results: native build succeeds; 147/147 runtime/control tests pass;
+48/48 trainer/audit/hindsight/rescorer tests pass; readiness status is
+`LOSS_FORMULA_AND_CONTRACT_READY_RESCORE_BACKEND_INVALID`. The Stage-1 corpus tests pass
+2/2 and its audit returns `INSUFFICIENT_ADMITTED_TRAJECTORIES_NO_TRAINING` with
+one eligible independent trajectory, four identity-free profile permutations,
+and zero calls or optimizer steps. The local rescore audit returns
+`LOCAL_EXACT_RESCORE_READY` with exact ordinary-prompt reconstruction, identical
+sampled action token IDs, zero masked environment tokens, and zero paid calls or
+optimizer steps. The v3 native audit returns
+`NATIVE_OPD_OPTIMIZER_READY_DISPOSABLE_CANDIDATE_NOT_PROMOTABLE`; its paired
+replay report must remain rejected and proves why replay anchoring is the next
+required training change.
+
+
+## Closed Work
+
+The following verdicts are final unless a genuinely new preregistered design
+changes the causal question:
+
+- TerminalBench r33: rejected; do not resume.
+- `video-processing` recovery v4: clean real reward-0 task/product failure; do
+  not retry.
+- Caffe recovery v3: infrastructure-invalid; do not retry.
+- Capability-routing SFT, primary-worker selector, topology selectors/editors,
+  and fixed-length route critic: rejected local gates; not integrated.
+- Local Ornith qualification: one solo win and two ties, zero coordination
+  wins; it did not provide evidence for a superior conductor.
+- V18/V19 live-agentic GRPO attempts: no promotable update; zero optimizer
+  steps. They are historical diagnostics, not current work.
+- Planner-role V2: one real local optimizer step, decisively rejected by the
+  exhaustive parent comparison; not integrated and not eligible for paid work.
+- SEED OPD v3: one disposable local optimizer step passed native correctness but
+  failed anti-forgetting replay; the child is rejected and not integrated.
+- SEED OPD v5: replay-anchored native optimization passed, but one stable
+  generation regression failed the anti-forgetting gate; its vLLM likelihood
+  audit is invalidated. The child is rejected and not integrated.
+- SEED OPD v6: action-token-normalized replay removed stable generation
+  regressions, but repeatable direct scoring found overall and replan likelihood
+  regression. Its OPD score source was also nondeterministic. The child is
+  rejected and not integrated.
+- SEED OPD v7: deterministic matched-reference OPD and normalized replay
+  preserved generated actions and improved overall direct likelihood, but
+  regressed frozen `replan` likelihood. The child is rejected and not
+  integrated; do not tune another child from the same one-sample OPD group.
+- Historical outcome-corpus V2: identity-free and leak-free, but its frozen
+  task-acquisition and workflow-ranker gates failed; it is not training data.
+- Adaptive causal `swesmith-03234` v3: solo arm was invalid after 25 Yunwu
+  calls; the conditional coordinated arm is permanently closed.
+
+Detailed historical evidence remains in the frozen manifests and ledgers under
+`scratchpad/`. It is intentionally not duplicated here.
