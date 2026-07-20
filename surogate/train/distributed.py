@@ -10,6 +10,10 @@ from typing import Any
 import numpy as np
 
 from surogate.core.config.sft_config import SFTConfig
+from surogate.train.adapter_init import (
+    configure_initial_adapter,
+    import_initial_trainable_adapter,
+)
 from surogate.train.vision import OnTheFlyMultimodalBatcher, init_mm_helpers, load_multimodal_datasets
 
 # Lazy import Ray to avoid dependency when not using distributed training
@@ -498,23 +502,17 @@ class NodeTrainer:
                     # Fallback to base model if checkpoint doesn't have model.safetensors
                     weights_path = model_weights_path
             logger.info(f"Node {self.node_rank}: Importing base model weights from {weights_path}...")
-            if self._config.adapter_path:
-                logger.info(
-                    f"Node {self.node_rank}: Merging adapter from {self._config.adapter_path} into base weights..."
-                )
-                self._trainer.set_adapter_path(self._config.adapter_path)
+            initial_adapter = configure_initial_adapter(self._config, self._trainer, fresh_run=False)
             self._trainer.import_weights(weights_path)
+            import_initial_trainable_adapter(self._trainer, initial_adapter)
             logger.info(f"Node {self.node_rank}: Loading checkpoint from step {self.start_step}...")
             self._trainer.load_checkpoint(str(self._config.checkpoint_dir), self.start_step)
             logger.info(f"Node {self.node_rank}: Checkpoint loaded successfully")
         else:
             # Import weights from pretrained model
-            if self._config.adapter_path:
-                logger.info(
-                    f"Node {self.node_rank}: Merging adapter from {self._config.adapter_path} into base weights..."
-                )
-                self._trainer.set_adapter_path(self._config.adapter_path)
+            initial_adapter = configure_initial_adapter(self._config, self._trainer, fresh_run=True)
             self._trainer.import_weights(model_weights_path)
+            import_initial_trainable_adapter(self._trainer, initial_adapter)
 
         if self._train_vision:
             (

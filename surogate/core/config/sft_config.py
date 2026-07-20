@@ -391,7 +391,8 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
     ep_size: int | None = 1  # 1 = no EP (all experts replicated on every GPU)
     ep_load_balance_threshold: float | None = 1.3  # LLEP: LPT activates when max/mean GPU load exceeds this
 
-    adapter_path: str | None = None  # PEFT adapter dir to merge into base weights before training
+    adapter_path: str | None = None  # PEFT adapter used to initialize the training run
+    adapter_init_mode: Literal["merge", "trainable"] = "merge"
     merge_adapter: bool | None = False
 
     debug_time_breakdown: bool | None = False
@@ -533,6 +534,9 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         self.ep_load_balance_threshold = float(cfg.get("ep_load_balance_threshold", self.ep_load_balance_threshold))
 
         self.adapter_path = cfg.get("adapter_path", self.adapter_path)
+        self.adapter_init_mode = cfg.get("adapter_init_mode", self.adapter_init_mode)
+        if self.adapter_init_mode not in {"merge", "trainable"}:
+            raise ValueError("adapter_init_mode must be 'merge' or 'trainable'")
         self.merge_adapter = cfg.get("merge_adapter", self.merge_adapter)
         # use_chat_template removed — native tokenizer always applies chat template
         self.debug_time_breakdown = cfg.get("debug_time_breakdown", self.debug_time_breakdown)
@@ -1022,11 +1026,12 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
             )
 
         # Validate: adapter_path + pre-quantized = error
-        if self.adapter_path and is_prequantized:
+        if self.adapter_path and is_prequantized and self.adapter_init_mode == "merge":
             raise ValueError(
                 f"Cannot merge adapter into a pre-quantized model ({prequant_method}). "
                 "Pre-quantized weights are loaded directly without BF16 intermediate stage, "
-                "so adapter merging is not supported. Merge the adapter offline first."
+                "so adapter merging is not supported. Use adapter_init_mode: trainable "
+                "to continue the adapter without modifying the frozen base."
             )
 
         # Validate: adapter_path requires lora
