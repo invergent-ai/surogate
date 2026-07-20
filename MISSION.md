@@ -1,6 +1,6 @@
 # Mission: Fugu-Ultra
 
-Last updated: 2026-07-20 11:58 UTC.
+Last updated: 2026-07-20 12:00 UTC.
 
 ## Product Objective
 
@@ -223,6 +223,18 @@ Artifacts:
   (`411be3956fcfc9007564d760ae18a178d1e030685b7e7018d491e9a70d5e9aaa`).
 - Pair report: `scratchpad/fugu_causal_analog_v3/pair_report.json`
   (`8b180bbb57942b20e63e14dbb759f09d4d4ce1706105a5f7ad13b47e5c690bea`).
+
+The new r57 `legacy-ember-provenance` arm also stopped infrastructure-invalid
+before agent execution. Harbor could not start the task container's tmux
+session. This repeated the prior zero-call setup failure, so the task is closed
+without another image investigation or retry. It made zero paid calls and
+contributes no training evidence.
+
+Verdict: `LEGACY_EMBER_R57_CLOSED_TMUX_SETUP_INVALID`. Campaign
+`scratchpad/fugu_branchpoint_analog_probe/campaign_v3_frozen.json`
+(`96ffa2229882e2690b5072ee161176d8941d747cf9670c5ed09d3262a29994b5`);
+ledger `scratchpad/fugu_branchpoint_analog_probe/results_v3.jsonl`
+(`ea78a3bce03e2606d723196e245139a68359ceb16e51e0ec4f109d078fa6eb6e`).
 
 ### Skill-conditioned rescoring
 
