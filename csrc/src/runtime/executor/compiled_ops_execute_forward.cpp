@@ -682,13 +682,21 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     auto on_fwd_layer_end = [&](int L) {
         if (L >= 0 && L < num_layers && layer_active[static_cast<std::size_t>(L)]) {
             if (mDebugDumpLayerFn) mDebugDumpLayerFn(L);
-            if (mConfig.NumExperts > 0) save_moe_layer_tensors(L);
+            // Full forward replay regenerates block-scoped MoE activations for
+            // backward. Persisting them here defeats checkpointing and can
+            // exhaust memory before the first layer is released.
+            if (mConfig.NumExperts > 0 && !forward_replay_active) save_moe_layer_tensors(L);
             persist_forward_saved_layer_tensors(graph,
                                                 L,
                                                 fwd_stream_capturing,
                                                 forward_replay_active,
                                                 arena_persists,
                                                 cudaMalloc_persists);
+            // Backward replay creates a separate EP state for this layer, so
+            // the original forward's token-routing buffers are now dead.
+            if (forward_replay_active && !mInReplay && mOptions.EPSize > 1) {
+                release_ep_state(L << 1);
+            }
             // dispatch-PP: preserve a stage's last block so its output ``x``
             // (BlockHOut) stays live for the cross-GPU boundary read — the stack
             // restore/prune below would otherwise free it.

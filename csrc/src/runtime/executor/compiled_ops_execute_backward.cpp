@@ -1155,6 +1155,9 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         mTemps.clear();
         prune_stack_tensors(L);
         if (mRunState.large_bwd_temps_on_stack()) clear_large_bwd_grad_stack_slots(mRunState, L);
+        if (mRecomputeEnabled && mOptions.EPSize > 1) {
+            release_ep_state((L << 1) | 1);
+        }
         last_layer_restored = L;
     };
     if (bwd_stream_driven) {

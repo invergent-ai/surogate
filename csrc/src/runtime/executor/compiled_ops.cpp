@@ -428,6 +428,37 @@ CompiledExecutor::~CompiledExecutor() {
     // by its destructor automatically via unique_ptr cleanup.
 }
 
+void CompiledExecutor::release_ep_state(int ep_key) {
+    auto it = mEpStates.find(ep_key);
+    if (it == mEpStates.end()) {
+        return;
+    }
+    const auto& state = it->second;
+    const std::array<void*, 10> owned = {
+        state.send_order_gpu,
+        state.recv_reorder_gpu,
+        state.llep_send_reorder_gpu,
+        state.local_scatter_gpu,
+        state.sorted_recv_gpu,
+        state.combined_gpu,
+        state.llep_combined_gpu,
+        state.dispatch_bwd_send_gpu,
+        state.dispatch_bwd_out_gpu,
+        state.combine_bwd_sorted_gpu,
+    };
+    auto is_owned = [&](const void* ptr) {
+        return ptr && std::find(owned.begin(), owned.end(), ptr) != owned.end();
+    };
+    it->second.free_gpu();
+    mEpStates.erase(it);
+    for (auto& tensor : mTensors) {
+        if (is_owned(tensor.Data)) tensor.Data = nullptr;
+    }
+    for (auto& [_, tensor] : mNamedTensors) {
+        if (is_owned(tensor.Data)) tensor.Data = nullptr;
+    }
+}
+
 void CompiledExecutor::clear_replay_copied_refs() {
     // Arena-backed replay persists: bump offset reset so the next replay
     // overwrites this layer's persistent copies. The arena pointer stays

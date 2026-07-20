@@ -217,7 +217,8 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down(const CompiledOp& op) {
 
     if (weight_is_compact && compact.active_experts.empty()) {
         fill_zero(out, mRunState.MainStream);
-    } else if (mRecipe && inp.DType == ETensorDType::BF16 && !weight_is_compact && !is_llep_active) {
+    } else if (mRecipe && inp.DType == ETensorDType::BF16 && !weight_is_compact && !is_llep_active &&
+               std::getenv("SUROGATE_MOE_GEMM_LOOP") == nullptr) {
         // Recipe-driven MoE GEMM via cuDNN FE (skip when LLEP active — cuDNN
         // crashes with variable merged expert counts; cuBLAS per-expert is safe)
         // down weight is (E, C, D) → N=C, K=D
