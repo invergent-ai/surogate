@@ -1070,6 +1070,8 @@ void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {
         mAllocator->allocate(ETensorDType::FP32, "grpo_advantages", EAllocationType::ON_DEVICE, {BT});
     mGrpoNativeScratch.teacher_logprobs =
         mAllocator->allocate(ETensorDType::FP32, "grpo_teacher_logprobs", EAllocationType::ON_DEVICE, {BT});
+    mGrpoNativeScratch.opd_reference_logprobs = mAllocator->allocate(
+        ETensorDType::FP32, "grpo_opd_reference_logprobs", EAllocationType::ON_DEVICE, {BT});
     mGrpoNativeScratch.hindsight_logprobs =
         mAllocator->allocate(ETensorDType::FP32, "grpo_hindsight_logprobs", EAllocationType::ON_DEVICE, {BT});
     mGrpoNativeScratch.hindsight_mask =
@@ -1104,6 +1106,11 @@ void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {
         mGrpoNativeScratch.host_teacher_logprobs[slot] =
             mAllocator->allocate(ETensorDType::FP32,
                                  ("grpo_host_teacher_logprobs_" + suffix).c_str(),
+                                 EAllocationType::PINNED,
+                                 {BT});
+        mGrpoNativeScratch.host_opd_reference_logprobs[slot] =
+            mAllocator->allocate(ETensorDType::FP32,
+                                 ("grpo_host_opd_reference_logprobs_" + suffix).c_str(),
                                  EAllocationType::PINNED,
                                  {BT});
         mGrpoNativeScratch.host_hindsight_logprobs[slot] =

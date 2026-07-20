@@ -847,6 +847,7 @@ void DslModel::step_grpo_native(Tensor inputs,
                                 const GrpoNativeLossConfig& loss_config,
                                 const float* temperatures_cpu,
                                 const float* teacher_logprobs_cpu,
+                                const float* opd_reference_logprobs_cpu,
                                 const float* hindsight_logprobs_cpu,
                                 const std::uint8_t* hindsight_mask_cpu,
                                 const std::uint8_t* replay_mask_cpu) {
@@ -922,12 +923,21 @@ void DslModel::step_grpo_native(Tensor inputs,
         copy_float_input(scratch.host_teacher_logprobs[staging_slot], scratch.teacher_logprobs, teacher_logprobs_cpu);
         teacher_logprobs_gpu = scratch.teacher_logprobs.get<float>();
     }
+    const float* opd_reference_logprobs_gpu = nullptr;
     const float* hindsight_logprobs_gpu = nullptr;
     const std::uint8_t* hindsight_mask_gpu = nullptr;
-    if ((hindsight_logprobs_cpu == nullptr) != (hindsight_mask_cpu == nullptr)) {
-        throw std::invalid_argument("hindsight logprobs and mask must be provided together");
+    const bool has_opd_reference = opd_reference_logprobs_cpu != nullptr;
+    const bool has_hindsight = hindsight_logprobs_cpu != nullptr;
+    const bool has_hindsight_mask = hindsight_mask_cpu != nullptr;
+    if ((has_opd_reference != has_hindsight) ||
+        (has_opd_reference != has_hindsight_mask)) {
+        throw std::invalid_argument(
+            "OPD reference logprobs, hindsight logprobs, and mask must be provided together");
     }
-    if (hindsight_logprobs_cpu) {
+    if (has_opd_reference) {
+        copy_float_input(scratch.host_opd_reference_logprobs[staging_slot],
+                         scratch.opd_reference_logprobs,
+                         opd_reference_logprobs_cpu);
         copy_float_input(
             scratch.host_hindsight_logprobs[staging_slot], scratch.hindsight_logprobs, hindsight_logprobs_cpu);
         std::memcpy(
@@ -937,6 +947,7 @@ void DslModel::step_grpo_native(Tensor inputs,
                                    bt * sizeof(std::uint8_t),
                                    cudaMemcpyHostToDevice,
                                    main_stream));
+        opd_reference_logprobs_gpu = scratch.opd_reference_logprobs.get<float>();
         hindsight_logprobs_gpu = scratch.hindsight_logprobs.get<float>();
         hindsight_mask_gpu = scratch.hindsight_mask.get<std::uint8_t>();
     }
@@ -994,6 +1005,7 @@ void DslModel::step_grpo_native(Tensor inputs,
                               scratch.advantages.get<float>(),
                               scratch.loss_mask.get<std::uint8_t>(),
                               teacher_logprobs_gpu,
+                              opd_reference_logprobs_gpu,
                               hindsight_logprobs_gpu,
                               hindsight_mask_gpu,
                               replay_mask_gpu,

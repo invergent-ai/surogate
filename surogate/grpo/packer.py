@@ -154,14 +154,27 @@ class MultiPacker(BasePacker):
                 False,
                 f"teacher logprobs length != sample length ({len(sample.teacher_logprobs)} != {sample_length})",
             )
-        if (sample.hindsight_logprobs is None) != (sample.hindsight_mask is None):
-            return False, "hindsight logprobs and mask must either both be present or both be absent"
+        opd_fields = (
+            sample.opd_reference_logprobs,
+            sample.hindsight_logprobs,
+            sample.hindsight_mask,
+        )
+        if any(value is not None for value in opd_fields) and any(value is None for value in opd_fields):
+            return (
+                False,
+                "OPD reference logprobs, hindsight logprobs, and mask must either all be present or all be absent",
+            )
         if sample.hindsight_logprobs is not None:
+            if len(sample.opd_reference_logprobs) != sample_length:
+                return (
+                    False,
+                    "OPD reference logprobs length != sample length "
+                    f"({len(sample.opd_reference_logprobs)} != {sample_length})",
+                )
             if len(sample.hindsight_logprobs) != sample_length:
                 return (
                     False,
-                    "hindsight logprobs length != sample length "
-                    f"({len(sample.hindsight_logprobs)} != {sample_length})",
+                    f"hindsight logprobs length != sample length ({len(sample.hindsight_logprobs)} != {sample_length})",
                 )
             if len(sample.hindsight_mask) != sample_length:
                 return (

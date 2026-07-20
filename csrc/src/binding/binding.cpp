@@ -1961,6 +1961,7 @@ NB_MODULE(_surogate, m) {
                nb::object position_ids_obj,
                nb::object temperatures_obj,
                nb::object teacher_logprobs_obj,
+               nb::object opd_reference_logprobs_obj,
                nb::object hindsight_logprobs_obj,
                nb::object hindsight_mask_obj,
                nb::object replay_mask_obj,
@@ -1992,16 +1993,25 @@ NB_MODULE(_surogate, m) {
                         nb::cast<nb::ndarray<float, nb::ndim<1>, nb::c_contig>>(teacher_logprobs_obj);
                     teacher_logprobs_ptr = teacher_logprobs.data();
                 }
+                const float* opd_reference_logprobs_ptr = nullptr;
                 const float* hindsight_logprobs_ptr = nullptr;
                 const std::uint8_t* hindsight_mask_ptr = nullptr;
-                if (hindsight_logprobs_obj.is_none() != hindsight_mask_obj.is_none()) {
-                    throw std::invalid_argument("hindsight_logprobs and hindsight_mask must be provided together");
+                const bool has_opd_reference = !opd_reference_logprobs_obj.is_none();
+                const bool has_hindsight = !hindsight_logprobs_obj.is_none();
+                const bool has_hindsight_mask = !hindsight_mask_obj.is_none();
+                if ((has_opd_reference != has_hindsight) ||
+                    (has_opd_reference != has_hindsight_mask)) {
+                    throw std::invalid_argument(
+                        "opd_reference_logprobs, hindsight_logprobs, and hindsight_mask must be provided together");
                 }
-                if (!hindsight_logprobs_obj.is_none()) {
+                if (has_opd_reference) {
+                    auto opd_reference_logprobs =
+                        nb::cast<nb::ndarray<float, nb::ndim<1>, nb::c_contig>>(opd_reference_logprobs_obj);
                     auto hindsight_logprobs =
                         nb::cast<nb::ndarray<float, nb::ndim<1>, nb::c_contig>>(hindsight_logprobs_obj);
                     auto hindsight_mask =
                         nb::cast<nb::ndarray<std::uint8_t, nb::ndim<1>, nb::c_contig>>(hindsight_mask_obj);
+                    opd_reference_logprobs_ptr = opd_reference_logprobs.data();
                     hindsight_logprobs_ptr = hindsight_logprobs.data();
                     hindsight_mask_ptr = hindsight_mask.data();
                 }
@@ -2022,6 +2032,7 @@ NB_MODULE(_surogate, m) {
                                           position_ids_ptr,
                                           temperatures_ptr,
                                           teacher_logprobs_ptr,
+                                          opd_reference_logprobs_ptr,
                                           hindsight_logprobs_ptr,
                                           hindsight_mask_ptr,
                                           replay_mask_ptr,
@@ -2045,6 +2056,7 @@ NB_MODULE(_surogate, m) {
             nb::arg("position_ids") = nb::none(),
             nb::arg("temperatures") = nb::none(),
             nb::arg("teacher_logprobs") = nb::none(),
+            nb::arg("opd_reference_logprobs") = nb::none(),
             nb::arg("hindsight_logprobs") = nb::none(),
             nb::arg("hindsight_mask") = nb::none(),
             nb::arg("replay_mask") = nb::none(),

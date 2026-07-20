@@ -17,6 +17,7 @@ class TrainingSample(msgspec.Struct, array_like=True, gc=False, omit_defaults=Tr
     hindsight_logprobs: list[float] | None = None
     hindsight_mask: list[bool] | None = None
     replay_mask: list[bool] | None = None
+    opd_reference_logprobs: list[float] | None = None
 
 
 class TrainingBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
@@ -37,6 +38,7 @@ class MicroBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
     inference_logprobs: list[float]
     position_ids: list[int]
     temperatures: list[float]  # Per-token temperatures used during generation
+    opd_reference_logprobs: list[float]
     hindsight_logprobs: list[float]
     hindsight_mask: list[bool]
     replay_mask: list[bool]

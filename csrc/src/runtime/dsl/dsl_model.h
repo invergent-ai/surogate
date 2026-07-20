@@ -398,6 +398,7 @@ public:
                           const GrpoNativeLossConfig& loss_config,
                           const float* temperatures_cpu = nullptr,
                           const float* teacher_logprobs_cpu = nullptr,
+                          const float* opd_reference_logprobs_cpu = nullptr,
                           const float* hindsight_logprobs_cpu = nullptr,
                           const std::uint8_t* hindsight_mask_cpu = nullptr,
                           const std::uint8_t* replay_mask_cpu = nullptr);

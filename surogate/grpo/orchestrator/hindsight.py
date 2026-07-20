@@ -2,21 +2,13 @@
 
 from __future__ import annotations
 
-import asyncio
 import copy
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from itertools import cycle
-from typing import Any, Sequence
+from typing import Any
 
-import verifiers as vf
-from openai.types.chat.chat_completion import ChatCompletion
-from verifiers.utils.client_utils import setup_openai_client
-
-from surogate.grpo.orchestrator.utils import get_semaphore
-
-
+OPD_REFERENCE_LOGPROBS_KEY = "seed_opd_reference_completion_logprobs"
 HINDSIGHT_LOGPROBS_KEY = "seed_hindsight_completion_logprobs"
 HINDSIGHT_MASK_KEY = "seed_hindsight_completion_mask"
 TRAINING_CONTEXT_PREFIX = "TRAINING-ONLY HINDSIGHT."
@@ -49,9 +41,8 @@ def _token_list(value: Any, *, label: str) -> list[int]:
         value = value.get("input_ids")
         if hasattr(value, "tolist"):
             value = value.tolist()
-    if (
-        not isinstance(value, (list, tuple))
-        or any(not isinstance(item, int) or isinstance(item, bool) for item in value)
+    if not isinstance(value, (list, tuple)) or any(
+        not isinstance(item, int) or isinstance(item, bool) for item in value
     ):
         raise HindsightRescoreError(f"{label} tokenizer output is not a token-id list")
     return list(value)
@@ -75,9 +66,7 @@ def _render_prompt_ids(
     return _token_list(rendered, label="chat template")
 
 
-def augment_prompt_messages(
-    prompt: Sequence[Any], *, training_context: str
-) -> list[dict[str, Any]]:
+def augment_prompt_messages(prompt: Sequence[Any], *, training_context: str) -> list[dict[str, Any]]:
     """Append privileged guidance to the final user message without changing roles."""
     context = training_context.strip()
     if not context.startswith(TRAINING_CONTEXT_PREFIX):
@@ -85,9 +74,7 @@ def augment_prompt_messages(
     messages = [_message_dict(message) for message in prompt]
     if not messages:
         raise HindsightRescoreError("cannot augment an empty prompt")
-    user_indices = [
-        index for index, message in enumerate(messages) if message.get("role") == "user"
-    ]
+    user_indices = [index for index, message in enumerate(messages) if message.get("role") == "user"]
     if not user_indices:
         raise HindsightRescoreError("prompt has no user message for hindsight augmentation")
     index = user_indices[-1]
@@ -125,9 +112,7 @@ def build_hindsight_prefill_request(
         chat_template_kwargs=chat_template_kwargs,
     )
     if reconstructed != ordinary_prompt_ids:
-        raise HindsightRescoreError(
-            "ordinary prompt token reconstruction does not match rollout tokens"
-        )
+        raise HindsightRescoreError("ordinary prompt token reconstruction does not match rollout tokens")
     augmented_messages = augment_prompt_messages(
         ordinary_messages,
         training_context=training_context,
@@ -153,22 +138,18 @@ def extract_hindsight_completion_logprobs(
 ) -> list[float]:
     """Extract finite logprobs for exactly the fixed completion token span."""
     prompt_logprobs = (
-        response.get("prompt_logprobs")
-        if isinstance(response, dict)
-        else getattr(response, "prompt_logprobs", None)
+        response.get("prompt_logprobs") if isinstance(response, dict) else getattr(response, "prompt_logprobs", None)
     )
-    if not isinstance(prompt_logprobs, list) or len(prompt_logprobs) != len(
-        request.token_ids
-    ):
+    if not isinstance(prompt_logprobs, list) or len(prompt_logprobs) != len(request.token_ids):
         raise HindsightRescoreError("prefill logprobs do not align to submitted tokens")
-    selected = prompt_logprobs[
-        request.completion_start : request.completion_start + len(request.completion_ids)
-    ]
+    selected = prompt_logprobs[request.completion_start : request.completion_start + len(request.completion_ids)]
     values: list[float] = []
-    for entry in selected:
+    for token_id, entry in zip(request.completion_ids, selected, strict=True):
         if not isinstance(entry, dict) or not entry:
             raise HindsightRescoreError("sampled action token lacks a prefill logprob")
-        payload = next(iter(entry.values()))
+        payload = entry.get(str(token_id), entry.get(token_id))
+        if payload is None:
+            raise HindsightRescoreError(f"prefill logprobs omit submitted action token {token_id}")
         value = payload.get("logprob") if isinstance(payload, dict) else None
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise HindsightRescoreError("sampled action logprob is not numeric")
@@ -182,9 +163,12 @@ def extract_hindsight_completion_logprobs(
 
 
 def attach_hindsight_completion_scores(
-    step: dict[str, Any], *, logprobs: Sequence[float]
+    step: dict[str, Any],
+    *,
+    reference_logprobs: Sequence[float],
+    hindsight_logprobs: Sequence[float],
 ) -> None:
-    """Attach an exact scorer result for later trajectory interleaving."""
+    """Attach one deterministic matched-branch result for interleaving."""
     tokens = step.get("tokens")
     if not isinstance(tokens, dict):
         raise HindsightRescoreError("trajectory step lacks token data")
@@ -194,36 +178,35 @@ def attach_hindsight_completion_scores(
         not isinstance(completion_ids, list)
         or not isinstance(completion_mask, list)
         or len(completion_ids) != len(completion_mask)
-        or len(logprobs) != len(completion_ids)
+        or len(reference_logprobs) != len(completion_ids)
+        or len(hindsight_logprobs) != len(completion_ids)
     ):
-        raise HindsightRescoreError("hindsight scores do not align to completion tokens")
-    values = [float(value) for value in logprobs]
-    if any(not math.isfinite(value) or value > 1e-6 for value in values):
-        raise HindsightRescoreError("hindsight scores must be finite logprobs")
+        raise HindsightRescoreError("matched OPD scores do not align to completion tokens")
+    reference_values = [float(value) for value in reference_logprobs]
+    hindsight_values = [float(value) for value in hindsight_logprobs]
+    if any(not math.isfinite(value) or value > 1e-6 for value in [*reference_values, *hindsight_values]):
+        raise HindsightRescoreError("matched OPD scores must be finite logprobs")
     extras = step.setdefault("extras", {})
     if not isinstance(extras, dict):
         raise HindsightRescoreError("trajectory step extras must be an object")
-    extras[HINDSIGHT_LOGPROBS_KEY] = values
+    extras[OPD_REFERENCE_LOGPROBS_KEY] = reference_values
+    extras[HINDSIGHT_LOGPROBS_KEY] = hindsight_values
     extras[HINDSIGHT_MASK_KEY] = [bool(value) for value in completion_mask]
 
 
-async def compute_hindsight_logprobs(
+def compute_matched_hindsight_logprobs(
     *,
-    clients: list[vf.ClientConfig],
-    model_name: str,
+    scorer: Any,
     tokenizer: Any,
     rollouts: Sequence[dict[str, Any]],
     training_contexts: Sequence[str | None],
     chat_template_kwargs: dict[str, Any] | None = None,
 ) -> int:
-    """Re-score rollout actions in place with the same inference-policy endpoint."""
+    """Score ordinary and hindsight branches together using one direct scorer."""
     if len(rollouts) != len(training_contexts):
         raise HindsightRescoreError("rollout and hindsight-context counts differ")
-    if not clients:
-        raise HindsightRescoreError("at least one inference client is required")
 
-    requests: list[tuple[vf.ClientConfig, dict[str, Any], HindsightPrefillRequest]] = []
-    client_cycle = cycle(clients)
+    scored_steps = 0
     for rollout, training_context in zip(rollouts, training_contexts, strict=True):
         if training_context is None:
             continue
@@ -237,36 +220,28 @@ async def compute_hindsight_logprobs(
                 training_context=training_context,
                 chat_template_kwargs=chat_template_kwargs,
             )
-            requests.append((next(client_cycle), step, request))
-
-    async def score_one(
-        client_config: vf.ClientConfig,
-        step: dict[str, Any],
-        request: HindsightPrefillRequest,
-    ) -> None:
-        client = setup_openai_client(client_config)
-        async with await get_semaphore():
-            response = await client.post(
-                "/chat/completions/tokens",
-                body={
-                    "model": model_name,
-                    "messages": [{"role": "user", "content": ""}],
-                    "tokens": list(request.token_ids),
-                    "max_tokens": 1,
-                    "temperature": 1.0,
-                    "top_p": 1.0,
-                    "skip_special_tokens": False,
-                    "prompt_logprobs": True,
-                },
-                cast_to=ChatCompletion,
+            tokens = step.get("tokens")
+            if not isinstance(tokens, dict):
+                raise HindsightRescoreError("trajectory step lacks token data")
+            ordinary_prompt_ids = _token_list(tokens.get("prompt_ids"), label="ordinary prompt")
+            matched = scorer.score_matched(
+                ordinary_prompt_ids=ordinary_prompt_ids,
+                hindsight_prompt_ids=list(request.token_ids[: request.completion_start]),
+                completion_ids=list(request.completion_ids),
             )
-        attach_hindsight_completion_scores(
-            step,
-            logprobs=extract_hindsight_completion_logprobs(
-                response,
-                request=request,
-            ),
-        )
+            attach_hindsight_completion_scores(
+                step,
+                reference_logprobs=matched.reference_logprobs,
+                hindsight_logprobs=matched.hindsight_logprobs,
+            )
+            scored_steps += 1
 
-    await asyncio.gather(*(score_one(*item) for item in requests))
-    return len(requests)
+    return scored_steps
+
+
+async def compute_hindsight_logprobs(**_: Any) -> int:
+    """Reject the retired endpoint scorer before it can create training data."""
+    raise HindsightRescoreError(
+        "endpoint-based hindsight scoring is disabled; use "
+        "compute_matched_hindsight_logprobs with a deterministic direct scorer"
+    )

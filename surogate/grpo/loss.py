@@ -28,6 +28,7 @@ def _compute_sample_grads(
     loss_mask: np.ndarray,
     loss_config: GRPOLossConfig,
     teacher_logprobs: np.ndarray | None = None,
+    opd_reference_logprobs: np.ndarray | None = None,
     hindsight_logprobs: np.ndarray | None = None,
     hindsight_mask: np.ndarray | None = None,
     replay_mask: np.ndarray | None = None,
@@ -45,6 +46,7 @@ def _compute_sample_grads(
         loss_mask: [S] bool mask (True = completion token, False = prompt)
         loss_config: GRPO loss hyperparameters
         teacher_logprobs: [S] optional teacher log-probs for this sample
+        opd_reference_logprobs: [S] ordinary-branch log-probs from the matched deterministic scorer
         hindsight_logprobs: [S] skill-conditioned log-probs aligned to sampled tokens
         hindsight_mask: [S] bool mask selecting conductor tokens with valid hindsight scores
         replay_mask: [S] bool mask selecting train-split parent-action rehearsal tokens
@@ -84,18 +86,18 @@ def _compute_sample_grads(
     per_token_grads[keep_mask] = scaled_advantages[keep_mask] * importance_ratio[keep_mask]
     per_token_grads[loss_mask] -= 2.0 * loss_config.kl_tau * log_importance_ratio[loss_mask]
 
-    if (hindsight_logprobs is None) != (hindsight_mask is None):
-        raise ValueError("hindsight_logprobs and hindsight_mask must be provided together")
+    opd_fields = (opd_reference_logprobs, hindsight_logprobs, hindsight_mask)
+    if any(value is not None for value in opd_fields) and any(value is None for value in opd_fields):
+        raise ValueError("opd_reference_logprobs, hindsight_logprobs, and hindsight_mask must be provided together")
     opd_mask = np.zeros_like(loss_mask, dtype=bool)
     opd_shift = np.zeros_like(trainer_logprobs)
     opd_gate = np.zeros_like(trainer_logprobs)
-    if hindsight_logprobs is not None and hindsight_mask is not None:
+    if opd_reference_logprobs is not None and hindsight_logprobs is not None and hindsight_mask is not None:
         opd_mask = loss_mask & hindsight_mask.astype(bool)
-        # Both detached branches were scored by the rollout snapshot on the
-        # same inference backend. Their difference isolates the skill-induced
-        # context effect and does not fold native/inference numeric drift into
-        # the confidence gate.
-        opd_shift = hindsight_logprobs - inference_logprobs
+        # Both detached branches must come from one deterministic scorer loaded
+        # with the same parent adapter. Rollout logprobs remain independent and
+        # are used only for the on-policy importance ratio above.
+        opd_shift = hindsight_logprobs - opd_reference_logprobs
         opd_gate = _sigmoid(loss_config.opd_beta * opd_shift)
         # The gate and privileged branch are detached. Positive CE seeds increase
         # ordinary-context likelihood only on conductor tokens selected by opd_mask.
@@ -118,12 +120,8 @@ def _compute_sample_grads(
     opd_loss = np.zeros_like(trainer_logprobs)
     opd_loss[opd_mask] = -loss_config.opd_tau * opd_gate[opd_mask] * trainer_logprobs[opd_mask]
     replay_loss = np.zeros_like(trainer_logprobs)
-    replay_loss[replay_token_mask] = (
-        -loss_config.replay_tau * trainer_logprobs[replay_token_mask]
-    )
-    policy_loss = float(
-        (-pg_loss + kl_loss + opd_loss + replay_loss).sum() / loss_mask_count
-    )
+    replay_loss[replay_token_mask] = -loss_config.replay_tau * trainer_logprobs[replay_token_mask]
+    policy_loss = float((-pg_loss + kl_loss + opd_loss + replay_loss).sum() / loss_mask_count)
 
     metrics = {
         "policy_loss": policy_loss,
@@ -157,6 +155,7 @@ def compute_grpo_per_token_grads(
     loss_config: GRPOLossConfig,
     sample_ranges: list[tuple[int, int]],
     teacher_logprobs: np.ndarray | None = None,
+    opd_reference_logprobs: np.ndarray | None = None,
     hindsight_logprobs: np.ndarray | None = None,
     hindsight_mask: np.ndarray | None = None,
     replay_mask: np.ndarray | None = None,
@@ -178,6 +177,7 @@ def compute_grpo_per_token_grads(
         loss_config: GRPO loss hyperparameters
         sample_ranges: list of (start, end) tuples for each sample in the packed sequence
         teacher_logprobs: [T] optional teacher log-probs for KL distillation
+        opd_reference_logprobs: [T] optional ordinary matched-branch log-probs
         hindsight_logprobs: [T] optional skill-conditioned log-probs
         hindsight_mask: [T] optional mask for valid conductor-token OPD targets
         replay_mask: [T] optional mask for train-split parent-action rehearsal
@@ -214,6 +214,7 @@ def compute_grpo_per_token_grads(
             continue
 
         s_teacher = teacher_logprobs[s_start:s_end] if teacher_logprobs is not None else None
+        s_opd_reference = opd_reference_logprobs[s_start:s_end] if opd_reference_logprobs is not None else None
         s_hindsight = hindsight_logprobs[s_start:s_end] if hindsight_logprobs is not None else None
         s_hindsight_mask = hindsight_mask[s_start:s_end] if hindsight_mask is not None else None
         s_replay_mask = replay_mask[s_start:s_end] if replay_mask is not None else None
@@ -225,6 +226,7 @@ def compute_grpo_per_token_grads(
             loss_mask=s_loss_mask,
             loss_config=loss_config,
             teacher_logprobs=s_teacher,
+            opd_reference_logprobs=s_opd_reference,
             hindsight_logprobs=s_hindsight,
             hindsight_mask=s_hindsight_mask,
             replay_mask=s_replay_mask,
@@ -246,9 +248,7 @@ def compute_grpo_per_token_grads(
             agg_metrics[key] += s_metrics[key]
         for key in ("opd_loss", "opd_gate", "opd_shift"):
             agg_metrics[key] += s_metrics[key] * s_metrics["opd_tokens"]
-        agg_metrics["replay_loss"] += (
-            s_metrics["replay_loss"] * s_metrics["replay_tokens"]
-        )
+        agg_metrics["replay_loss"] += s_metrics["replay_loss"] * s_metrics["replay_tokens"]
         agg_metrics["keep_tokens"] += s_metrics["keep_tokens"]
         agg_metrics["total_tokens"] += s_metrics["total_tokens"]
         agg_metrics["opd_tokens"] += s_metrics["opd_tokens"]
@@ -289,6 +289,7 @@ def compute_native_shifted_grpo_dloss_reference(
     loss_config: GRPOLossConfig,
     sample_ranges: list[tuple[int, int]],
     teacher_logprobs: np.ndarray | None = None,
+    opd_reference_logprobs: np.ndarray | None = None,
     hindsight_logprobs: np.ndarray | None = None,
     hindsight_mask: np.ndarray | None = None,
     replay_mask: np.ndarray | None = None,
@@ -309,6 +310,7 @@ def compute_native_shifted_grpo_dloss_reference(
         loss_config=loss_config,
         sample_ranges=sample_ranges,
         teacher_logprobs=teacher_logprobs,
+        opd_reference_logprobs=opd_reference_logprobs,
         hindsight_logprobs=hindsight_logprobs,
         hindsight_mask=hindsight_mask,
         replay_mask=replay_mask,
@@ -330,6 +332,7 @@ def compute_native_grpo_metrics_reference(
     loss_config: GRPOLossConfig,
     sample_ranges: list[tuple[int, int]],
     teacher_logprobs: np.ndarray | None = None,
+    opd_reference_logprobs: np.ndarray | None = None,
     hindsight_logprobs: np.ndarray | None = None,
     hindsight_mask: np.ndarray | None = None,
     replay_mask: np.ndarray | None = None,
@@ -343,6 +346,7 @@ def compute_native_grpo_metrics_reference(
         loss_config=loss_config,
         sample_ranges=sample_ranges,
         teacher_logprobs=teacher_logprobs,
+        opd_reference_logprobs=opd_reference_logprobs,
         hindsight_logprobs=hindsight_logprobs,
         hindsight_mask=hindsight_mask,
         replay_mask=replay_mask,

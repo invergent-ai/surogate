@@ -3,6 +3,7 @@ import verifiers as vf
 from surogate.grpo.orchestrator.hindsight import (
     HINDSIGHT_LOGPROBS_KEY,
     HINDSIGHT_MASK_KEY,
+    OPD_REFERENCE_LOGPROBS_KEY,
 )
 from surogate.grpo.transport import TrainingSample
 from surogate.grpo.utils.logger import get_logger
@@ -55,19 +56,21 @@ def interleave_rollout(output: vf.RolloutOutput) -> list[TrainingSample] | None:
             completion_mask = [bool(i) for i in tokens["completion_mask"]]
         completion_ids = list(tokens["completion_ids"])
         extras = step.get("extras") or {}
+        opd_reference_logprobs = extras.get(OPD_REFERENCE_LOGPROBS_KEY)
         hindsight_logprobs = extras.get(HINDSIGHT_LOGPROBS_KEY)
         hindsight_mask = extras.get(HINDSIGHT_MASK_KEY)
-        if (hindsight_logprobs is None) != (hindsight_mask is None):
-            raise ValueError("hindsight step scores and mask must be provided together")
+        opd_fields = (opd_reference_logprobs, hindsight_logprobs, hindsight_mask)
+        if any(value is not None for value in opd_fields) and any(value is None for value in opd_fields):
+            raise ValueError("OPD reference, hindsight step scores, and mask must be provided together")
         if hindsight_logprobs is not None:
             if (
-                len(hindsight_logprobs) != len(completion_ids)
+                len(opd_reference_logprobs) != len(completion_ids)
+                or len(hindsight_logprobs) != len(completion_ids)
                 or len(hindsight_mask) != len(completion_ids)
             ):
                 raise ValueError("hindsight step scores are not completion-aligned")
-            hindsight_logprobs = [0.0] * len(tokens["prompt_ids"]) + list(
-                hindsight_logprobs
-            )
+            opd_reference_logprobs = [0.0] * len(tokens["prompt_ids"]) + list(opd_reference_logprobs)
+            hindsight_logprobs = [0.0] * len(tokens["prompt_ids"]) + list(hindsight_logprobs)
             hindsight_mask = [False] * len(tokens["prompt_ids"]) + [
                 bool(mask) and bool(trainable)
                 for mask, trainable in zip(
@@ -86,6 +89,7 @@ def interleave_rollout(output: vf.RolloutOutput) -> list[TrainingSample] | None:
             completion_temperatures=[temperature] * len(completion_ids),
             teacher_logprobs=None,
             advantage=None,
+            opd_reference_logprobs=opd_reference_logprobs,
             hindsight_logprobs=hindsight_logprobs,
             hindsight_mask=hindsight_mask,
         )
@@ -103,22 +107,30 @@ def interleave_rollout(output: vf.RolloutOutput) -> list[TrainingSample] | None:
         sample.completion_temperatures.extend([temperature] * len(new_prompt_ids))
 
         extras = step.get("extras") or {}
+        step_opd_reference_logprobs = extras.get(OPD_REFERENCE_LOGPROBS_KEY)
         step_hindsight_logprobs = extras.get(HINDSIGHT_LOGPROBS_KEY)
         step_hindsight_mask = extras.get(HINDSIGHT_MASK_KEY)
-        if (step_hindsight_logprobs is None) != (step_hindsight_mask is None):
-            raise ValueError("hindsight step scores and mask must be provided together")
+        step_opd_fields = (
+            step_opd_reference_logprobs,
+            step_hindsight_logprobs,
+            step_hindsight_mask,
+        )
+        if any(value is not None for value in step_opd_fields) and any(value is None for value in step_opd_fields):
+            raise ValueError("OPD reference, hindsight step scores, and mask must be provided together")
         if step_hindsight_logprobs is not None and (
-            len(step_hindsight_logprobs) != len(tokens["completion_ids"])
+            len(step_opd_reference_logprobs) != len(tokens["completion_ids"])
+            or len(step_hindsight_logprobs) != len(tokens["completion_ids"])
             or len(step_hindsight_mask) != len(tokens["completion_ids"])
         ):
             raise ValueError("hindsight step scores are not completion-aligned")
         if sample.hindsight_logprobs is None and step_hindsight_logprobs is not None:
-            existing_length = len(sample.prompt_ids) + len(sample.completion_ids) - len(
-                new_prompt_ids
-            )
+            existing_length = len(sample.prompt_ids) + len(sample.completion_ids) - len(new_prompt_ids)
+            sample.opd_reference_logprobs = [0.0] * existing_length
             sample.hindsight_logprobs = [0.0] * existing_length
             sample.hindsight_mask = [False] * existing_length
         if sample.hindsight_logprobs is not None:
+            assert sample.opd_reference_logprobs is not None
+            sample.opd_reference_logprobs.extend([0.0] * len(new_prompt_ids))
             sample.hindsight_logprobs.extend([0.0] * len(new_prompt_ids))
             assert sample.hindsight_mask is not None
             sample.hindsight_mask.extend([False] * len(new_prompt_ids))
@@ -135,9 +147,11 @@ def interleave_rollout(output: vf.RolloutOutput) -> list[TrainingSample] | None:
         if sample.hindsight_logprobs is not None:
             assert sample.hindsight_mask is not None
             if step_hindsight_logprobs is None:
+                sample.opd_reference_logprobs.extend([0.0] * len(completion_ids))
                 sample.hindsight_logprobs.extend([0.0] * len(completion_ids))
                 sample.hindsight_mask.extend([False] * len(completion_ids))
             else:
+                sample.opd_reference_logprobs.extend(step_opd_reference_logprobs)
                 sample.hindsight_logprobs.extend(step_hindsight_logprobs)
                 sample.hindsight_mask.extend(
                     bool(mask) and bool(trainable)

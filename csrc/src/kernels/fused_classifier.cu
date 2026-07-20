@@ -1193,6 +1193,7 @@ __global__ void grpo_custom_dloss_kernel(float* custom_dloss,
                                          const float* advantages,
                                          const std::uint8_t* loss_mask,
                                          const float* teacher_logprobs,
+                                         const float* opd_reference_logprobs,
                                          const float* hindsight_logprobs,
                                          const std::uint8_t* hindsight_mask,
                                          const std::uint8_t* replay_mask,
@@ -1277,11 +1278,12 @@ __global__ void grpo_custom_dloss_kernel(float* custom_dloss,
             unmasked_mismatch_sum += importance_ratio - log_importance_ratio - 1.0f;
             unmasked_count += 1.0f;
         }
-        if (hindsight_logprobs && hindsight_mask && hindsight_mask[logical_idx] != 0) {
-            // The detached skill and ordinary branches share the rollout
-            // backend. Use their contextual shift so backend numeric drift
-            // from the native trainer cannot create artificial OPD credit.
-            const float opd_shift = hindsight_logprobs[logical_idx] - inference_logprob;
+        if (opd_reference_logprobs && hindsight_logprobs && hindsight_mask &&
+            hindsight_mask[logical_idx] != 0) {
+            // The detached ordinary and skill branches come from one matched,
+            // deterministic scorer. Rollout logprobs are not part of this gate.
+            const float opd_shift =
+                hindsight_logprobs[logical_idx] - opd_reference_logprobs[logical_idx];
             const float opd_gate = 1.0f / (1.0f + expf(-fminf(fmaxf(opd_beta * opd_shift, -60.0f), 60.0f)));
             const float opd_loss = -opd_tau * opd_gate * trainer_logprob;
             dloss += opd_tau * opd_gate;
@@ -1382,6 +1384,7 @@ void compute_grpo_custom_dloss(float* custom_dloss,
                                const float* advantages,
                                const std::uint8_t* loss_mask,
                                const float* teacher_logprobs,
+                               const float* opd_reference_logprobs,
                                const float* hindsight_logprobs,
                                const std::uint8_t* hindsight_mask,
                                const std::uint8_t* replay_mask,
@@ -1411,6 +1414,7 @@ void compute_grpo_custom_dloss(float* custom_dloss,
                                                                advantages,
                                                                loss_mask,
                                                                teacher_logprobs,
+                                                               opd_reference_logprobs,
                                                                hindsight_logprobs,
                                                                hindsight_mask,
                                                                replay_mask,

@@ -22,6 +22,7 @@ def microbatch_to_numpy(micro_batch) -> dict[str, np.ndarray]:
         loss_mask: bool [1, T]
         temperatures: float32 [1, T]
         teacher_logprobs: float32 [1, T] or None
+        opd_reference_logprobs: float32 [1, T]
         hindsight_logprobs: float32 [1, T]
         hindsight_mask: bool [1, T]
         replay_mask: bool [1, T]
@@ -44,6 +45,7 @@ def microbatch_to_numpy(micro_batch) -> dict[str, np.ndarray]:
     teacher_logprobs = None
     if micro_batch.teacher_logprobs is not None:
         teacher_logprobs = np.array(micro_batch.teacher_logprobs, dtype=np.float32).reshape(1, T)
+    opd_reference_logprobs = np.array(micro_batch.opd_reference_logprobs, dtype=np.float32).reshape(1, T)
     hindsight_logprobs = np.array(micro_batch.hindsight_logprobs, dtype=np.float32).reshape(1, T)
     hindsight_mask = np.array(micro_batch.hindsight_mask, dtype=bool).reshape(1, T)
     replay_mask = np.array(micro_batch.replay_mask, dtype=bool).reshape(1, T)
@@ -57,6 +59,7 @@ def microbatch_to_numpy(micro_batch) -> dict[str, np.ndarray]:
         "loss_mask": loss_mask,
         "temperatures": temperatures,
         "teacher_logprobs": teacher_logprobs,
+        "opd_reference_logprobs": opd_reference_logprobs,
         "hindsight_logprobs": hindsight_logprobs,
         "hindsight_mask": hindsight_mask,
         "replay_mask": replay_mask,

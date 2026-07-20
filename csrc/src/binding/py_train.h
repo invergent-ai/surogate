@@ -285,6 +285,7 @@ public:
                           const std::int32_t* position_ids,
                           const float* temperatures,
                           const float* teacher_logprobs,
+                          const float* opd_reference_logprobs,
                           const float* hindsight_logprobs,
                           const std::uint8_t* hindsight_mask,
                           const std::uint8_t* replay_mask,

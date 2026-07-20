@@ -150,6 +150,7 @@ def test_seed_opd_supplies_dense_credit_when_group_rewards_tie():
         loss_mask=loss_mask,
         loss_config=config,
         sample_ranges=[(0, 4)],
+        opd_reference_logprobs=inference_logprobs,
         hindsight_logprobs=hindsight_logprobs,
         hindsight_mask=hindsight_mask,
     )
@@ -176,6 +177,7 @@ def test_seed_opd_is_inert_when_disabled():
         loss_mask=np.array([False, True, True]),
         loss_config=GRPOLossConfig(kl_tau=0.0, opd_tau=0.0, opd_beta=2.0),
         sample_ranges=[(0, 3)],
+        opd_reference_logprobs=trainer_logprobs.copy(),
         hindsight_logprobs=np.array([-8.0, -1.0, -2.0], dtype=np.float32),
         hindsight_mask=np.array([False, True, True]),
     )
@@ -185,9 +187,10 @@ def test_seed_opd_is_inert_when_disabled():
     assert metrics["opd_loss"] == 0.0
 
 
-def test_seed_opd_gate_uses_matched_rollout_branches_not_native_drift():
+def test_seed_opd_gate_uses_matched_direct_branches_not_rollout_drift():
     trainer_logprobs = np.array([-8.0, -2.5, -0.5], dtype=np.float32)
     inference_logprobs = np.array([-8.0, -1.0, -2.0], dtype=np.float32)
+    opd_reference_logprobs = np.array([-8.0, -1.0, -2.0], dtype=np.float32)
     hindsight_logprobs = np.array([-8.0, -0.5, -2.5], dtype=np.float32)
     loss_mask = np.array([False, True, True])
     config = GRPOLossConfig(adv_tau=0.0, kl_tau=0.0, opd_tau=0.4, opd_beta=2.0)
@@ -199,6 +202,7 @@ def test_seed_opd_gate_uses_matched_rollout_branches_not_native_drift():
         loss_mask=loss_mask,
         loss_config=config,
         sample_ranges=[(0, 3)],
+        opd_reference_logprobs=opd_reference_logprobs,
         hindsight_logprobs=hindsight_logprobs,
         hindsight_mask=loss_mask,
     )
@@ -210,9 +214,21 @@ def test_seed_opd_gate_uses_matched_rollout_branches_not_native_drift():
         [0.0, 0.4 * supported_gate, 0.4 * unsupported_gate],
         rtol=2e-7,
     )
-    assert metrics["opd_gate"] == pytest.approx(
-        np.mean([supported_gate, unsupported_gate])
+    assert metrics["opd_gate"] == pytest.approx(np.mean([supported_gate, unsupported_gate]))
+
+    drifted_grads, drifted_metrics = compute_grpo_per_token_grads(
+        trainer_logprobs=trainer_logprobs,
+        inference_logprobs=np.array([-8.0, -4.0, -0.1], dtype=np.float32),
+        advantages=np.zeros(3, dtype=np.float32),
+        loss_mask=loss_mask,
+        loss_config=config,
+        sample_ranges=[(0, 3)],
+        opd_reference_logprobs=opd_reference_logprobs,
+        hindsight_logprobs=hindsight_logprobs,
+        hindsight_mask=loss_mask,
     )
+    np.testing.assert_allclose(drifted_grads, grads, rtol=2e-7)
+    assert drifted_metrics["opd_gate"] == pytest.approx(metrics["opd_gate"])
 
 
 def test_replay_anchor_supplies_outcome_independent_parent_action_credit():
@@ -262,6 +278,7 @@ def test_sparse_objective_metrics_use_selected_token_denominators():
         loss_mask=loss_mask,
         loss_config=config,
         sample_ranges=[(0, 2), (2, 4)],
+        opd_reference_logprobs=inference_logprobs,
         hindsight_logprobs=hindsight_logprobs,
         hindsight_mask=np.array([False, True, False, False]),
         replay_mask=np.array([False, False, False, True]),

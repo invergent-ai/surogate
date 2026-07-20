@@ -63,9 +63,7 @@ def _set_initial_adapter(config: GRPOTrainConfig, trainer: object, start_step: i
     required = (path / "adapter_config.json", path / "adapter_model.safetensors")
     missing = [item.name for item in required if not item.is_file()]
     if missing:
-        raise FileNotFoundError(
-            f"GRPO initial adapter is incomplete at {path}: missing {', '.join(missing)}"
-        )
+        raise FileNotFoundError(f"GRPO initial adapter is incomplete at {path}: missing {', '.join(missing)}")
     if not config.lora:
         raise ValueError("GRPO adapter_path requires lora: true")
     mode = getattr(config, "adapter_init_mode", "merge")
@@ -418,6 +416,7 @@ class GRPOTrainer:
                 teacher_lp = None
                 if mb["teacher_logprobs"] is not None:
                     teacher_lp = mb["teacher_logprobs"].flatten()
+                opd_reference_lp = mb["opd_reference_logprobs"].flatten()
                 hindsight_lp = mb["hindsight_logprobs"].flatten()
                 hindsight_mask_flat = mb["hindsight_mask"].flatten()
                 replay_mask_flat = mb["replay_mask"].flatten()
@@ -479,6 +478,8 @@ class GRPOTrainer:
                 if teacher_lp is not None:
                     teacher_padded = np.zeros(seq_len, dtype=np.float32)
                     teacher_padded[:T_actual] = teacher_lp[:T_actual]
+                opd_reference_padded = np.zeros(seq_len, dtype=np.float32)
+                opd_reference_padded[:T_actual] = opd_reference_lp[:T_actual]
                 hindsight_padded = np.zeros(seq_len, dtype=np.float32)
                 hindsight_padded[:T_actual] = hindsight_lp[:T_actual]
                 hindsight_mask_padded = np.zeros(seq_len, dtype=np.uint8)
@@ -500,6 +501,7 @@ class GRPOTrainer:
                     position_ids=pos_step,
                     temperatures=temp_step,
                     teacher_logprobs=teacher_padded,
+                    opd_reference_logprobs=opd_reference_padded,
                     hindsight_logprobs=hindsight_padded,
                     hindsight_mask=hindsight_mask_padded,
                     replay_mask=replay_mask_padded,

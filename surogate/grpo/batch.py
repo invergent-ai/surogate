@@ -26,14 +26,17 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
     temperatures = [prompt_temp] * len(training_example.prompt_ids) + training_example.completion_temperatures
 
     teacher_logprobs = training_example.teacher_logprobs
+    opd_reference_logprobs = training_example.opd_reference_logprobs
     hindsight_logprobs = training_example.hindsight_logprobs
     hindsight_mask = training_example.hindsight_mask
     replay_mask = training_example.replay_mask
-    if hindsight_logprobs is None:
+    opd_fields = (opd_reference_logprobs, hindsight_logprobs, hindsight_mask)
+    if all(value is None for value in opd_fields):
+        opd_reference_logprobs = [0.0] * len(input_ids)
         hindsight_logprobs = [0.0] * len(input_ids)
         hindsight_mask = [False] * len(input_ids)
-    elif hindsight_mask is None:
-        raise ValueError("hindsight_mask is required with hindsight_logprobs")
+    elif any(value is None for value in opd_fields):
+        raise ValueError("opd_reference_logprobs, hindsight_logprobs, and hindsight_mask must be provided together")
     if replay_mask is None:
         replay_mask = [False] * len(input_ids)
 
@@ -46,6 +49,7 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         temperatures = temperatures[:seq_len]
         if teacher_logprobs is not None:
             teacher_logprobs = teacher_logprobs[:seq_len]
+        opd_reference_logprobs = opd_reference_logprobs[:seq_len]
         hindsight_logprobs = hindsight_logprobs[:seq_len]
         hindsight_mask = hindsight_mask[:seq_len]
         replay_mask = replay_mask[:seq_len]
@@ -57,6 +61,7 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         == len(position_ids)
         == len(inference_logprobs)
         == len(temperatures)
+        == len(opd_reference_logprobs)
         == len(hindsight_logprobs)
         == len(hindsight_mask)
         == len(replay_mask)
@@ -79,6 +84,7 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         inference_logprobs=inference_logprobs,
         teacher_logprobs=teacher_logprobs,
         temperatures=temperatures,
+        opd_reference_logprobs=opd_reference_logprobs,
         hindsight_logprobs=hindsight_logprobs,
         hindsight_mask=hindsight_mask,
         replay_mask=replay_mask,
@@ -105,6 +111,7 @@ def packed_samples_into_micro_bs(
                 bin_content.advantages.extend(sample.advantages)
                 bin_content.inference_logprobs.extend(sample.inference_logprobs)
                 bin_content.temperatures.extend(sample.temperatures)
+                bin_content.opd_reference_logprobs.extend(sample.opd_reference_logprobs)
                 bin_content.hindsight_logprobs.extend(sample.hindsight_logprobs)
                 bin_content.hindsight_mask.extend(sample.hindsight_mask)
                 bin_content.replay_mask.extend(sample.replay_mask)
@@ -136,6 +143,7 @@ def pad_micro_batch(micro_batch: MicroBatch, pad_to_multiple_of: int) -> MicroBa
     micro_batch.position_ids.extend(list(range(padding_size)))
     micro_batch.inference_logprobs.extend([0.0] * padding_size)
     micro_batch.temperatures.extend([1.0] * padding_size)
+    micro_batch.opd_reference_logprobs.extend([0.0] * padding_size)
     micro_batch.hindsight_logprobs.extend([0.0] * padding_size)
     micro_batch.hindsight_mask.extend([False] * padding_size)
     micro_batch.replay_mask.extend([False] * padding_size)
