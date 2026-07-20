@@ -87,6 +87,8 @@ struct GrpoNativeScratch {
     Tensor inference_logprobs;  ///< Device FP32 [B*T]
     Tensor advantages;          ///< Device FP32 [B*T]
     Tensor teacher_logprobs;    ///< Device FP32 [B*T]
+    Tensor hindsight_logprobs;  ///< Device FP32 [B*T]
+    Tensor hindsight_mask;      ///< Device BYTE [B*T], 0/1
     Tensor loss_mask;           ///< Device BYTE [B*T], 0/1
     Tensor sample_starts;       ///< Device INT32 [max_samples]
     Tensor sample_ends;         ///< Device INT32 [max_samples]
@@ -97,6 +99,8 @@ struct GrpoNativeScratch {
     std::array<Tensor, kHostStagingSlots> host_inference_logprobs;  ///< Pinned FP32 [B*T]
     std::array<Tensor, kHostStagingSlots> host_advantages;          ///< Pinned FP32 [B*T]
     std::array<Tensor, kHostStagingSlots> host_teacher_logprobs;    ///< Pinned FP32 [B*T]
+    std::array<Tensor, kHostStagingSlots> host_hindsight_logprobs;  ///< Pinned FP32 [B*T]
+    std::array<Tensor, kHostStagingSlots> host_hindsight_mask;      ///< Pinned BYTE [B*T]
     std::array<Tensor, kHostStagingSlots> host_temperatures;        ///< Pinned FP32 [B*T]
     std::array<Tensor, kHostStagingSlots> host_loss_mask;           ///< Pinned BYTE [B*T]
     std::array<Tensor, kHostStagingSlots> host_sample_starts;       ///< Pinned INT32 [max_samples]

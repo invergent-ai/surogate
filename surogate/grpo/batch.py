@@ -26,6 +26,13 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
     temperatures = [prompt_temp] * len(training_example.prompt_ids) + training_example.completion_temperatures
 
     teacher_logprobs = training_example.teacher_logprobs
+    hindsight_logprobs = training_example.hindsight_logprobs
+    hindsight_mask = training_example.hindsight_mask
+    if hindsight_logprobs is None:
+        hindsight_logprobs = [0.0] * len(input_ids)
+        hindsight_mask = [False] * len(input_ids)
+    elif hindsight_mask is None:
+        raise ValueError("hindsight_mask is required with hindsight_logprobs")
 
     if len(input_ids) > seq_len:
         input_ids = input_ids[:seq_len]
@@ -36,6 +43,8 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         temperatures = temperatures[:seq_len]
         if teacher_logprobs is not None:
             teacher_logprobs = teacher_logprobs[:seq_len]
+        hindsight_logprobs = hindsight_logprobs[:seq_len]
+        hindsight_mask = hindsight_mask[:seq_len]
 
     assert (
         len(input_ids)
@@ -44,12 +53,16 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         == len(position_ids)
         == len(inference_logprobs)
         == len(temperatures)
+        == len(hindsight_logprobs)
+        == len(hindsight_mask)
     ), (
         f"input_ids: {len(input_ids)}, advantages: {len(advantages)}, loss_mask: {len(loss_mask)}, "
         f"position_ids: {len(position_ids)}, inference_logprobs: {len(inference_logprobs)}, temperatures: {len(temperatures)}"
     )
     if teacher_logprobs is not None:
         assert len(teacher_logprobs) == len(input_ids), f"teacher_logprobs: {len(teacher_logprobs)}"
+    if any(hindsight and not loss for hindsight, loss in zip(hindsight_mask, loss_mask)):
+        raise ValueError("hindsight_mask may select only trainable completion tokens")
 
     return MicroBatch(
         input_ids=input_ids,
@@ -59,6 +72,8 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         inference_logprobs=inference_logprobs,
         teacher_logprobs=teacher_logprobs,
         temperatures=temperatures,
+        hindsight_logprobs=hindsight_logprobs,
+        hindsight_mask=hindsight_mask,
     )
 
 
@@ -82,6 +97,8 @@ def packed_samples_into_micro_bs(
                 bin_content.advantages.extend(sample.advantages)
                 bin_content.inference_logprobs.extend(sample.inference_logprobs)
                 bin_content.temperatures.extend(sample.temperatures)
+                bin_content.hindsight_logprobs.extend(sample.hindsight_logprobs)
+                bin_content.hindsight_mask.extend(sample.hindsight_mask)
                 if sample.teacher_logprobs is not None:
                     if bin_content.teacher_logprobs is None:
                         bin_content.teacher_logprobs = []
@@ -110,6 +127,8 @@ def pad_micro_batch(micro_batch: MicroBatch, pad_to_multiple_of: int) -> MicroBa
     micro_batch.position_ids.extend(list(range(padding_size)))
     micro_batch.inference_logprobs.extend([0.0] * padding_size)
     micro_batch.temperatures.extend([1.0] * padding_size)
+    micro_batch.hindsight_logprobs.extend([0.0] * padding_size)
+    micro_batch.hindsight_mask.extend([False] * padding_size)
     if micro_batch.teacher_logprobs is not None:
         micro_batch.teacher_logprobs.extend([0.0] * padding_size)
     # Send padding to the last lora so tokens have ascending lora idx

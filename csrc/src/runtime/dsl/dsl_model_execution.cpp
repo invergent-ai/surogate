@@ -50,10 +50,14 @@ enum GrpoMetricOffset {
     GRPO_METRIC_IS_MASKED_LOW = 5,
     GRPO_METRIC_IS_MASKED_HIGH = 6,
     GRPO_METRIC_TEACHER_KL = 7,
-    GRPO_METRIC_SAMPLE_COUNT = 8,
-    GRPO_METRIC_KEEP_TOKENS = 9,
-    GRPO_METRIC_TOTAL_TOKENS = 10,
-    GRPO_METRIC_COUNT = 11,
+    GRPO_METRIC_OPD_LOSS = 8,
+    GRPO_METRIC_OPD_GATE = 9,
+    GRPO_METRIC_OPD_SHIFT = 10,
+    GRPO_METRIC_OPD_TOKENS = 11,
+    GRPO_METRIC_SAMPLE_COUNT = 12,
+    GRPO_METRIC_KEEP_TOKENS = 13,
+    GRPO_METRIC_TOTAL_TOKENS = 14,
+    GRPO_METRIC_COUNT = 15,
 };
 
 int acquire_grpo_host_staging_slot(modules::GrpoNativeScratch& scratch) {
@@ -840,7 +844,9 @@ void DslModel::step_grpo_native(Tensor inputs,
                                 NCCLCommunicator& comm,
                                 const GrpoNativeLossConfig& loss_config,
                                 const float* temperatures_cpu,
-                                const float* teacher_logprobs_cpu) {
+                                const float* teacher_logprobs_cpu,
+                                const float* hindsight_logprobs_cpu,
+                                const std::uint8_t* hindsight_mask_cpu) {
     if (!mExecutor) {
         throw std::logic_error("DslModel::step_grpo_native called before allocate_run_state()");
     }
@@ -913,6 +919,24 @@ void DslModel::step_grpo_native(Tensor inputs,
         copy_float_input(scratch.host_teacher_logprobs[staging_slot], scratch.teacher_logprobs, teacher_logprobs_cpu);
         teacher_logprobs_gpu = scratch.teacher_logprobs.get<float>();
     }
+    const float* hindsight_logprobs_gpu = nullptr;
+    const std::uint8_t* hindsight_mask_gpu = nullptr;
+    if ((hindsight_logprobs_cpu == nullptr) != (hindsight_mask_cpu == nullptr)) {
+        throw std::invalid_argument("hindsight logprobs and mask must be provided together");
+    }
+    if (hindsight_logprobs_cpu) {
+        copy_float_input(
+            scratch.host_hindsight_logprobs[staging_slot], scratch.hindsight_logprobs, hindsight_logprobs_cpu);
+        std::memcpy(
+            scratch.host_hindsight_mask[staging_slot].get<std::uint8_t>(), hindsight_mask_cpu, bt * sizeof(std::uint8_t));
+        CUDA_CHECK(cudaMemcpyAsync(scratch.hindsight_mask.Data,
+                                   scratch.host_hindsight_mask[staging_slot].Data,
+                                   bt * sizeof(std::uint8_t),
+                                   cudaMemcpyHostToDevice,
+                                   main_stream));
+        hindsight_logprobs_gpu = scratch.hindsight_logprobs.get<float>();
+        hindsight_mask_gpu = scratch.hindsight_mask.get<std::uint8_t>();
+    }
 
     const float* inv_temperature_gpu = nullptr;
     if (temperatures_cpu) {
@@ -956,6 +980,8 @@ void DslModel::step_grpo_native(Tensor inputs,
                               scratch.advantages.get<float>(),
                               scratch.loss_mask.get<std::uint8_t>(),
                               teacher_logprobs_gpu,
+                              hindsight_logprobs_gpu,
+                              hindsight_mask_gpu,
                               scratch.sample_starts.get<std::int32_t>(),
                               scratch.sample_ends.get<std::int32_t>(),
                               sample_count,
@@ -965,6 +991,8 @@ void DslModel::step_grpo_native(Tensor inputs,
                               loss_config.ipo_mask_high,
                               loss_config.adv_tau,
                               loss_config.teacher_tau,
+                              loss_config.opd_tau,
+                              loss_config.opd_beta,
                               loss_config.kl_tau,
                               main_stream);
 
@@ -1015,6 +1043,10 @@ GrpoNativeMetrics DslModel::consume_grpo_native_metrics() {
     metrics.is_masked_low = values[GRPO_METRIC_IS_MASKED_LOW] / sample_count;
     metrics.is_masked_high = values[GRPO_METRIC_IS_MASKED_HIGH] / sample_count;
     metrics.teacher_kl = values[GRPO_METRIC_TEACHER_KL] / sample_count;
+    metrics.opd_loss = values[GRPO_METRIC_OPD_LOSS] / sample_count;
+    metrics.opd_gate = values[GRPO_METRIC_OPD_GATE] / sample_count;
+    metrics.opd_shift = values[GRPO_METRIC_OPD_SHIFT] / sample_count;
+    metrics.opd_tokens = values[GRPO_METRIC_OPD_TOKENS];
     metrics.keep_tokens = values[GRPO_METRIC_KEEP_TOKENS];
     metrics.total_tokens = values[GRPO_METRIC_TOTAL_TOKENS];
     return metrics;

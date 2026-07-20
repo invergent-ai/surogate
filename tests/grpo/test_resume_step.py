@@ -3,7 +3,12 @@ from types import SimpleNamespace
 import pytest
 
 from surogate.grpo.runs import MultiRunManager, _start_step_override
-from surogate.grpo.trainer import _latest_checkpoint_step, _weights_path_for_start_step
+from surogate.grpo.trainer import (
+    _latest_checkpoint_step,
+    _load_initial_trainable_adapter,
+    _set_initial_adapter,
+    _weights_path_for_start_step,
+)
 
 
 def test_run_manager_uses_start_step_override_without_ckpt(monkeypatch, tmp_path):
@@ -70,3 +75,93 @@ def test_weights_path_for_start_step_keeps_base_for_lora(tmp_path):
     config = SimpleNamespace(checkpoint_dir=str(tmp_path), lora=True)
 
     assert _weights_path_for_start_step(config, "base.safetensors", 25) == "base.safetensors"
+
+
+def test_set_initial_adapter_seeds_fresh_lora_run(tmp_path):
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    (adapter / "adapter_config.json").write_text("{}")
+    (adapter / "adapter_model.safetensors").write_bytes(b"weights")
+    config = SimpleNamespace(adapter_path=str(adapter), lora=True)
+
+    class Trainer:
+        path = None
+
+        def set_adapter_path(self, path):
+            self.path = path
+
+    trainer = Trainer()
+
+    selected = _set_initial_adapter(config, trainer, start_step=0)
+
+    assert selected == str(adapter.resolve())
+    assert trainer.path == selected
+
+
+def test_set_initial_adapter_does_not_override_resumed_checkpoint(tmp_path):
+    config = SimpleNamespace(adapter_path=str(tmp_path / "missing"), lora=True)
+
+    class Trainer:
+        def set_adapter_path(self, path):
+            raise AssertionError(path)
+
+    assert _set_initial_adapter(config, Trainer(), start_step=1) is None
+
+
+def test_trainable_initial_adapter_loads_parent_after_base_import(tmp_path):
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    (adapter / "adapter_config.json").write_text(
+        '{"r": 32, "lora_alpha": 32, "target_modules": ["q_proj"]}'
+    )
+    weights = adapter / "adapter_model.safetensors"
+    weights.write_bytes(b"weights")
+    config = SimpleNamespace(
+        adapter_path=str(adapter),
+        adapter_init_mode="trainable",
+        lora=True,
+        lora_rank=32,
+        lora_alpha=32,
+        lora_target_modules=["q_proj"],
+    )
+
+    class Trainer:
+        imported = None
+
+        def set_adapter_path(self, path):
+            raise AssertionError(path)
+
+        def import_adapter(self, path):
+            self.imported = path
+
+    trainer = Trainer()
+    selected = _set_initial_adapter(config, trainer, start_step=0)
+
+    assert selected == str(adapter.resolve())
+    assert trainer.imported is None
+    _load_initial_trainable_adapter(config, trainer, selected)
+    assert trainer.imported == str(weights.resolve())
+
+
+def test_trainable_initial_adapter_rejects_shape_mismatch(tmp_path):
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    (adapter / "adapter_config.json").write_text(
+        '{"r": 8, "lora_alpha": 16, "target_modules": ["q_proj"]}'
+    )
+    (adapter / "adapter_model.safetensors").write_bytes(b"weights")
+    config = SimpleNamespace(
+        adapter_path=str(adapter),
+        adapter_init_mode="trainable",
+        lora=True,
+        lora_rank=32,
+        lora_alpha=32,
+        lora_target_modules=["q_proj"],
+    )
+
+    class Trainer:
+        def import_adapter(self, path):
+            raise AssertionError(path)
+
+    with pytest.raises(ValueError, match="rank"):
+        _set_initial_adapter(config, Trainer(), start_step=0)

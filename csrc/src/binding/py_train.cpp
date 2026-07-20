@@ -316,6 +316,23 @@ void MultiGPUPyTrainer::set_adapter_path(std::string path) {
 }
 
 /**
+ * @brief Import a PEFT LoRA adapter into the trainable LoRA weights.
+ *
+ * Unlike set_adapter_path(), this does not merge the adapter into the frozen
+ * base. It preserves the parent adapter as the starting trainable state so an
+ * exported child adapter remains directly deployable on the original base.
+ */
+void MultiGPUPyTrainer::import_adapter(std::string file_name) {
+    run_work([file_name](sThreadContext& ctx) {
+        auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+        if (!dsl_model) {
+            throw std::runtime_error("import_adapter requires a DSL model");
+        }
+        dsl_model->import_adapter(file_name, *ctx.Communicator);
+    });
+}
+
+/**
  * @brief Import model weights from disk on all ranks.
  *
  * Runs a synchronized "work item" across all worker threads/ranks.
@@ -2801,11 +2818,15 @@ void MultiGPUPyTrainer::step_grpo_native(const std::int32_t* inputs,
                                          const std::int32_t* position_ids,
                                          const float* temperatures,
                                          const float* teacher_logprobs,
+                                         const float* hindsight_logprobs,
+                                         const std::uint8_t* hindsight_mask,
                                          float loss_scale,
                                          float ipo_mask_low,
                                          float ipo_mask_high,
                                          float adv_tau,
                                          float teacher_tau,
+                                         float opd_tau,
+                                         float opd_beta,
                                          float kl_tau) {
     const int ep_size = std::max(1, mOptions.EPSize);
     for (int i = 0; i < (int)mContexts.size(); ++i) {
@@ -2844,6 +2865,8 @@ void MultiGPUPyTrainer::step_grpo_native(const std::int32_t* inputs,
         .ipo_mask_high = ipo_mask_high,
         .adv_tau = adv_tau,
         .teacher_tau = teacher_tau,
+        .opd_tau = opd_tau,
+        .opd_beta = opd_beta,
         .kl_tau = kl_tau,
     };
 
@@ -2857,6 +2880,8 @@ void MultiGPUPyTrainer::step_grpo_native(const std::int32_t* inputs,
               sample_count,
               temperatures,
               teacher_logprobs,
+              hindsight_logprobs,
+              hindsight_mask,
               loss_config,
               B = this->B,
               T = this->T](sThreadContext& ctx) {
@@ -2891,7 +2916,9 @@ void MultiGPUPyTrainer::step_grpo_native(const std::int32_t* inputs,
                                     *ctx.Communicator,
                                     loss_config,
                                     temps_for_this_gpu,
-                                    teacher_logprobs);
+                                    teacher_logprobs,
+                                    hindsight_logprobs,
+                                    hindsight_mask);
     });
 
     ++mTrainMicroStep;
@@ -2917,6 +2944,10 @@ std::unordered_map<std::string, float> MultiGPUPyTrainer::get_grpo_native_metric
             {"is_masked_low", metrics.is_masked_low},
             {"is_masked_high", metrics.is_masked_high},
             {"teacher_kl", metrics.teacher_kl},
+            {"opd_loss", metrics.opd_loss},
+            {"opd_gate", metrics.opd_gate},
+            {"opd_shift", metrics.opd_shift},
+            {"opd_tokens", metrics.opd_tokens},
             {"keep_tokens", metrics.keep_tokens},
             {"total_tokens", metrics.total_tokens},
         };

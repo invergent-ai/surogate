@@ -1420,6 +1420,8 @@ class SurogateTrainer:
         - path: Output directory path.
         - base_model_path: Optional path/name of base model for adapter_config.json.
         """
+    def import_adapter(self, file_name: str) -> None:
+        """Import PEFT LoRA weights into the trainable adapter state."""
     def compute_logprobs(
         self,
         input_ids: npt.NDArray[np.int32],

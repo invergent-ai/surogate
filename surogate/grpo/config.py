@@ -23,7 +23,15 @@ class GRPOLossConfig:
     ipo_mask_high: float = 0.2  # The high threshold for masking tokens (probability difference)
     adv_tau: float = 1.0
     teacher_tau: float = 0.0
+    opd_tau: float = 0.0
+    opd_beta: float = 1.0
     kl_tau: float = 1e-3  # The tau for KL divergence
+
+    def __post_init__(self) -> None:
+        if self.opd_tau < 0.0:
+            raise ValueError("opd_tau must be non-negative")
+        if self.opd_beta <= 0.0:
+            raise ValueError("opd_beta must be positive")
 
 
 @dataclass
@@ -67,6 +75,10 @@ class GRPOTrainConfig(SFTConfig):
     pad_to_multiple_of: int = 1
     # Document-level attention masking for packed sequences.
     doc_masking: bool = True
+    # ``merge`` retains the legacy stacked-adapter behavior. ``trainable``
+    # loads a same-shape parent into the trainable LoRA so the exported child
+    # remains directly deployable on the original base model.
+    adapter_init_mode: Literal["merge", "trainable"] = "merge"
 
     def __init__(self, cfg: DictDefault):
         # Each token's gradient is advantage * importance_ratio_clip * (softmax - 1{target}) / N_valid.
@@ -114,6 +126,9 @@ class GRPOTrainConfig(SFTConfig):
         self.max_async_level = cfg.get("max_async_level", self.max_async_level)
         self.pad_to_multiple_of = cfg.get("pad_to_multiple_of", self.pad_to_multiple_of)
         self.doc_masking = cfg.get("doc_masking", self.doc_masking)
+        self.adapter_init_mode = cfg.get("adapter_init_mode", self.adapter_init_mode)
+        if self.adapter_init_mode not in {"merge", "trainable"}:
+            raise ValueError("adapter_init_mode must be 'merge' or 'trainable'")
 
         # Initialize inherited config: model_dir, runtime_config, lora_config, etc.
         # In the SFT path this is called by TokenizeDatasets.__init__(), but GRPO

@@ -22,6 +22,8 @@ def microbatch_to_numpy(micro_batch) -> dict[str, np.ndarray]:
         loss_mask: bool [1, T]
         temperatures: float32 [1, T]
         teacher_logprobs: float32 [1, T] or None
+        hindsight_logprobs: float32 [1, T]
+        hindsight_mask: bool [1, T]
     """
     T = len(micro_batch.input_ids)
 
@@ -41,6 +43,8 @@ def microbatch_to_numpy(micro_batch) -> dict[str, np.ndarray]:
     teacher_logprobs = None
     if micro_batch.teacher_logprobs is not None:
         teacher_logprobs = np.array(micro_batch.teacher_logprobs, dtype=np.float32).reshape(1, T)
+    hindsight_logprobs = np.array(micro_batch.hindsight_logprobs, dtype=np.float32).reshape(1, T)
+    hindsight_mask = np.array(micro_batch.hindsight_mask, dtype=bool).reshape(1, T)
 
     return {
         "input_ids": input_ids,
@@ -51,6 +55,8 @@ def microbatch_to_numpy(micro_batch) -> dict[str, np.ndarray]:
         "loss_mask": loss_mask,
         "temperatures": temperatures,
         "teacher_logprobs": teacher_logprobs,
+        "hindsight_logprobs": hindsight_logprobs,
+        "hindsight_mask": hindsight_mask,
     }
 
 

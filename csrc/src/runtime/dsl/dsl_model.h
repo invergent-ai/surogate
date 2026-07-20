@@ -59,6 +59,8 @@ struct GrpoNativeLossConfig {
     float ipo_mask_high = 0.2f;
     float adv_tau = 1.0f;
     float teacher_tau = 0.0f;
+    float opd_tau = 0.0f;
+    float opd_beta = 1.0f;
     float kl_tau = 1.0e-3f;
 };
 
@@ -71,6 +73,10 @@ struct GrpoNativeMetrics {
     float is_masked_low = 0.0f;
     float is_masked_high = 0.0f;
     float teacher_kl = 0.0f;
+    float opd_loss = 0.0f;
+    float opd_gate = 0.0f;
+    float opd_shift = 0.0f;
+    float opd_tokens = 0.0f;
     float keep_tokens = 0.0f;
     float total_tokens = 0.0f;
 };
@@ -388,7 +394,9 @@ public:
                           NCCLCommunicator& comm,
                           const GrpoNativeLossConfig& loss_config,
                           const float* temperatures_cpu = nullptr,
-                          const float* teacher_logprobs_cpu = nullptr);
+                          const float* teacher_logprobs_cpu = nullptr,
+                          const float* hindsight_logprobs_cpu = nullptr,
+                          const std::uint8_t* hindsight_mask_cpu = nullptr);
     GrpoNativeMetrics consume_grpo_native_metrics();
 
     void init_weights(NCCLCommunicator& comm) override;

@@ -154,6 +154,23 @@ class MultiPacker(BasePacker):
                 False,
                 f"teacher logprobs length != sample length ({len(sample.teacher_logprobs)} != {sample_length})",
             )
+        if (sample.hindsight_logprobs is None) != (sample.hindsight_mask is None):
+            return False, "hindsight logprobs and mask must either both be present or both be absent"
+        if sample.hindsight_logprobs is not None:
+            if len(sample.hindsight_logprobs) != sample_length:
+                return (
+                    False,
+                    "hindsight logprobs length != sample length "
+                    f"({len(sample.hindsight_logprobs)} != {sample_length})",
+                )
+            if len(sample.hindsight_mask) != sample_length:
+                return (
+                    False,
+                    f"hindsight mask length != sample length ({len(sample.hindsight_mask)} != {sample_length})",
+                )
+            loss_mask = sample.prompt_mask + sample.completion_mask
+            if any(hindsight and not loss for hindsight, loss in zip(sample.hindsight_mask, loss_mask)):
+                return False, "hindsight mask selects a prompt or environment token"
         return True, None
 
     def _get_batch(self) -> None:

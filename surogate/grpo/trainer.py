@@ -11,6 +11,7 @@ Document-level attention masking (Flash Attention varlen) can be enabled to
 prevent cross-sample attention in packed sequences.
 """
 
+import json
 import shutil
 import time
 from pathlib import Path
@@ -51,6 +52,59 @@ def _weights_path_for_start_step(config: GRPOTrainConfig, model_weights_path: st
         return model_weights_path
     checkpoint_weights = Path(config.checkpoint_dir) / f"step_{start_step:08d}" / "model.safetensors"
     return str(checkpoint_weights) if checkpoint_weights.exists() else model_weights_path
+
+
+def _set_initial_adapter(config: GRPOTrainConfig, trainer: object, start_step: int) -> str | None:
+    """Seed a fresh GRPO LoRA run from the configured PEFT adapter."""
+    adapter_path = getattr(config, "adapter_path", None)
+    if not adapter_path or start_step > 0:
+        return None
+    path = Path(adapter_path).expanduser().resolve()
+    required = (path / "adapter_config.json", path / "adapter_model.safetensors")
+    missing = [item.name for item in required if not item.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            f"GRPO initial adapter is incomplete at {path}: missing {', '.join(missing)}"
+        )
+    if not config.lora:
+        raise ValueError("GRPO adapter_path requires lora: true")
+    mode = getattr(config, "adapter_init_mode", "merge")
+    if mode == "merge":
+        set_adapter_path = getattr(trainer, "set_adapter_path", None)
+        if not callable(set_adapter_path):
+            raise RuntimeError("GRPO trainer does not support merged adapter initialization")
+        set_adapter_path(str(path))
+    elif mode == "trainable":
+        import_adapter = getattr(trainer, "import_adapter", None)
+        if not callable(import_adapter):
+            raise RuntimeError("GRPO trainer does not support trainable adapter initialization")
+        adapter_config = json.loads(required[0].read_text(encoding="utf-8"))
+        expected_rank = int(getattr(config, "lora_rank"))
+        expected_alpha = float(getattr(config, "lora_alpha"))
+        expected_targets = set(getattr(config, "lora_target_modules"))
+        if int(adapter_config.get("r", -1)) != expected_rank:
+            raise ValueError("trainable parent adapter rank does not match trainer LoRA rank")
+        if float(adapter_config.get("lora_alpha", -1.0)) != expected_alpha:
+            raise ValueError("trainable parent adapter alpha does not match trainer LoRA alpha")
+        if set(adapter_config.get("target_modules", ())) != expected_targets:
+            raise ValueError("trainable parent adapter targets do not match trainer LoRA targets")
+    else:
+        raise ValueError("adapter_init_mode must be 'merge' or 'trainable'")
+    return str(path)
+
+
+def _load_initial_trainable_adapter(
+    config: GRPOTrainConfig,
+    trainer: object,
+    adapter_path: str | None,
+) -> None:
+    """Load a validated parent after the frozen base weights are available."""
+    if adapter_path is None or getattr(config, "adapter_init_mode", "merge") != "trainable":
+        return
+    import_adapter = getattr(trainer, "import_adapter", None)
+    if not callable(import_adapter):
+        raise RuntimeError("GRPO trainer does not support trainable adapter initialization")
+    import_adapter(str(Path(adapter_path) / "adapter_model.safetensors"))
 
 
 def _filtered_config_for_logging(config: GRPOTrainConfig) -> dict:
@@ -141,6 +195,9 @@ class GRPOTrainer:
         # Import pretrained weights
         model_weights_path = get_model_weights_path(config.model_dir)
         weights_path = _weights_path_for_start_step(config, model_weights_path, self.start_step)
+        initial_adapter = _set_initial_adapter(config, self.trainer, self.start_step)
+        if initial_adapter is not None:
+            logger.info(f"Initializing GRPO LoRA from {initial_adapter}")
         if external_weights is not None:
             # Zero-copy import from external GPU pointers (colocate mode with vLLM)
             logger.info(f"Importing weights from external GPU pointers (non-quantized from {weights_path})")
@@ -148,6 +205,7 @@ class GRPOTrainer:
         else:
             logger.info(f"Importing weights from {weights_path}")
             self.trainer.import_weights(weights_path)
+        _load_initial_trainable_adapter(config, self.trainer, initial_adapter)
         if self.start_step > 0:
             logger.info(f"Loading GRPO trainer checkpoint from step {self.start_step}")
             self.trainer.load_checkpoint(str(config.checkpoint_dir), self.start_step)
@@ -360,6 +418,8 @@ class GRPOTrainer:
                 teacher_lp = None
                 if mb["teacher_logprobs"] is not None:
                     teacher_lp = mb["teacher_logprobs"].flatten()
+                hindsight_lp = mb["hindsight_logprobs"].flatten()
+                hindsight_mask_flat = mb["hindsight_mask"].flatten()
 
                 T_actual = orig_input_ids.shape[1]
                 ngpu = config.gpus
@@ -418,6 +478,10 @@ class GRPOTrainer:
                 if teacher_lp is not None:
                     teacher_padded = np.zeros(seq_len, dtype=np.float32)
                     teacher_padded[:T_actual] = teacher_lp[:T_actual]
+                hindsight_padded = np.zeros(seq_len, dtype=np.float32)
+                hindsight_padded[:T_actual] = hindsight_lp[:T_actual]
+                hindsight_mask_padded = np.zeros(seq_len, dtype=np.uint8)
+                hindsight_mask_padded[:T_actual] = hindsight_mask_flat[:T_actual].astype(np.uint8)
 
                 sample_starts = np.asarray([start for start, _ in sample_ranges], dtype=np.int32)
                 sample_ends = np.asarray([end for _, end in sample_ranges], dtype=np.int32)
@@ -433,11 +497,15 @@ class GRPOTrainer:
                     position_ids=pos_step,
                     temperatures=temp_step,
                     teacher_logprobs=teacher_padded,
+                    hindsight_logprobs=hindsight_padded,
+                    hindsight_mask=hindsight_mask_padded,
                     loss_scale=float(loss_scale),
                     ipo_mask_low=float(config.loss.ipo_mask_low),
                     ipo_mask_high=float(config.loss.ipo_mask_high),
                     adv_tau=float(config.loss.adv_tau),
                     teacher_tau=float(config.loss.teacher_tau),
+                    opd_tau=float(config.loss.opd_tau),
+                    opd_beta=float(config.loss.opd_beta),
                     kl_tau=float(config.loss.kl_tau),
                 )
 
@@ -489,6 +557,10 @@ class GRPOTrainer:
                             "train/is_masked_low": float(step_metrics.get("is_masked_low", 0.0)),
                             "train/is_masked_high": float(step_metrics.get("is_masked_high", 0.0)),
                             "train/teacher_kl": float(step_metrics.get("teacher_kl", 0.0)),
+                            "train/opd_loss": float(step_metrics.get("opd_loss", 0.0)),
+                            "train/opd_gate": float(step_metrics.get("opd_gate", 0.0)),
+                            "train/opd_shift": float(step_metrics.get("opd_shift", 0.0)),
+                            "train/opd_tokens": float(step_metrics.get("opd_tokens", 0.0)),
                             "train/keep_tokens": float(step_metrics.get("keep_tokens", 0.0)),
                             "train/total_tokens": float(total_tokens),
                             "train/grad_norm": float(result["norm"]),

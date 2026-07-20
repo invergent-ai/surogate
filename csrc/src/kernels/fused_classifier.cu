@@ -1174,10 +1174,14 @@ enum GrpoMetricOffset {
     GRPO_METRIC_IS_MASKED_LOW = 5,
     GRPO_METRIC_IS_MASKED_HIGH = 6,
     GRPO_METRIC_TEACHER_KL = 7,
-    GRPO_METRIC_SAMPLE_COUNT = 8,
-    GRPO_METRIC_KEEP_TOKENS = 9,
-    GRPO_METRIC_TOTAL_TOKENS = 10,
-    GRPO_METRIC_COUNT = 11,
+    GRPO_METRIC_OPD_LOSS = 8,
+    GRPO_METRIC_OPD_GATE = 9,
+    GRPO_METRIC_OPD_SHIFT = 10,
+    GRPO_METRIC_OPD_TOKENS = 11,
+    GRPO_METRIC_SAMPLE_COUNT = 12,
+    GRPO_METRIC_KEEP_TOKENS = 13,
+    GRPO_METRIC_TOTAL_TOKENS = 14,
+    GRPO_METRIC_COUNT = 15,
 };
 
 __global__ void grpo_custom_dloss_kernel(float* custom_dloss,
@@ -1187,6 +1191,8 @@ __global__ void grpo_custom_dloss_kernel(float* custom_dloss,
                                          const float* advantages,
                                          const std::uint8_t* loss_mask,
                                          const float* teacher_logprobs,
+                                         const float* hindsight_logprobs,
+                                         const std::uint8_t* hindsight_mask,
                                          const std::int32_t* sample_starts,
                                          const std::int32_t* sample_ends,
                                          int sample_count,
@@ -1196,6 +1202,8 @@ __global__ void grpo_custom_dloss_kernel(float* custom_dloss,
                                          float ipo_mask_high,
                                          float adv_tau,
                                          float teacher_tau,
+                                         float opd_tau,
+                                         float opd_beta,
                                          float kl_tau) {
     __shared__ float reductions[GRPO_METRIC_COUNT][256];
 
@@ -1218,6 +1226,10 @@ __global__ void grpo_custom_dloss_kernel(float* custom_dloss,
     float is_masked_low_sum = 0.0f;
     float is_masked_high_sum = 0.0f;
     float teacher_kl_sum = 0.0f;
+    float opd_loss_sum = 0.0f;
+    float opd_gate_sum = 0.0f;
+    float opd_shift_sum = 0.0f;
+    float opd_count = 0.0f;
     float keep_count = 0.0f;
     float total_count = 0.0f;
     float masked_count = 0.0f;
@@ -1259,6 +1271,20 @@ __global__ void grpo_custom_dloss_kernel(float* custom_dloss,
             unmasked_mismatch_sum += importance_ratio - log_importance_ratio - 1.0f;
             unmasked_count += 1.0f;
         }
+        if (hindsight_logprobs && hindsight_mask && hindsight_mask[logical_idx] != 0) {
+            // The detached skill and ordinary branches share the rollout
+            // backend. Use their contextual shift so backend numeric drift
+            // from the native trainer cannot create artificial OPD credit.
+            const float opd_shift = hindsight_logprobs[logical_idx] - inference_logprob;
+            const float opd_gate = 1.0f / (1.0f + expf(-fminf(fmaxf(opd_beta * opd_shift, -60.0f), 60.0f)));
+            const float opd_loss = -opd_tau * opd_gate * trainer_logprob;
+            dloss += opd_tau * opd_gate;
+            policy_sum += opd_loss;
+            opd_loss_sum += opd_loss;
+            opd_gate_sum += opd_gate;
+            opd_shift_sum += opd_shift;
+            opd_count += 1.0f;
+        }
         const float mismatch_kl = importance_ratio - log_importance_ratio - 1.0f;
         const float kl_loss = kl_tau * log_importance_ratio * log_importance_ratio;
         policy_sum += kl_loss;
@@ -1280,6 +1306,10 @@ __global__ void grpo_custom_dloss_kernel(float* custom_dloss,
     reductions[GRPO_METRIC_IS_MASKED_LOW][threadIdx.x] = is_masked_low_sum;
     reductions[GRPO_METRIC_IS_MASKED_HIGH][threadIdx.x] = is_masked_high_sum;
     reductions[GRPO_METRIC_TEACHER_KL][threadIdx.x] = teacher_kl_sum;
+    reductions[GRPO_METRIC_OPD_LOSS][threadIdx.x] = opd_loss_sum;
+    reductions[GRPO_METRIC_OPD_GATE][threadIdx.x] = opd_gate_sum;
+    reductions[GRPO_METRIC_OPD_SHIFT][threadIdx.x] = opd_shift_sum;
+    reductions[GRPO_METRIC_OPD_TOKENS][threadIdx.x] = opd_count;
     reductions[GRPO_METRIC_SAMPLE_COUNT][threadIdx.x] = total_count > 0.0f ? 1.0f : 0.0f;
     reductions[GRPO_METRIC_KEEP_TOKENS][threadIdx.x] = keep_count;
     reductions[GRPO_METRIC_TOTAL_TOKENS][threadIdx.x] = total_count;
@@ -1310,6 +1340,13 @@ __global__ void grpo_custom_dloss_kernel(float* custom_dloss,
         if (teacher_logprobs) {
             atomicAdd(metrics + GRPO_METRIC_TEACHER_KL, reductions[GRPO_METRIC_TEACHER_KL][0] / sample_total);
         }
+        const float sample_opd_count = reductions[GRPO_METRIC_OPD_TOKENS][0];
+        if (sample_opd_count > 0.0f) {
+            atomicAdd(metrics + GRPO_METRIC_OPD_LOSS, reductions[GRPO_METRIC_OPD_LOSS][0] / sample_opd_count);
+            atomicAdd(metrics + GRPO_METRIC_OPD_GATE, reductions[GRPO_METRIC_OPD_GATE][0] / sample_opd_count);
+            atomicAdd(metrics + GRPO_METRIC_OPD_SHIFT, reductions[GRPO_METRIC_OPD_SHIFT][0] / sample_opd_count);
+            atomicAdd(metrics + GRPO_METRIC_OPD_TOKENS, sample_opd_count);
+        }
         atomicAdd(metrics + GRPO_METRIC_SAMPLE_COUNT, 1.0f);
         atomicAdd(metrics + GRPO_METRIC_KEEP_TOKENS, reductions[GRPO_METRIC_KEEP_TOKENS][0]);
         atomicAdd(metrics + GRPO_METRIC_TOTAL_TOKENS, sample_total);
@@ -1323,6 +1360,8 @@ void compute_grpo_custom_dloss(float* custom_dloss,
                                const float* advantages,
                                const std::uint8_t* loss_mask,
                                const float* teacher_logprobs,
+                               const float* hindsight_logprobs,
+                               const std::uint8_t* hindsight_mask,
                                const std::int32_t* sample_starts,
                                const std::int32_t* sample_ends,
                                int sample_count,
@@ -1332,6 +1371,8 @@ void compute_grpo_custom_dloss(float* custom_dloss,
                                float ipo_mask_high,
                                float adv_tau,
                                float teacher_tau,
+                               float opd_tau,
+                               float opd_beta,
                                float kl_tau,
                                cudaStream_t stream) {
     if (sample_count <= 0 || BT <= 0) {
@@ -1346,6 +1387,8 @@ void compute_grpo_custom_dloss(float* custom_dloss,
                                                                advantages,
                                                                loss_mask,
                                                                teacher_logprobs,
+                                                               hindsight_logprobs,
+                                                               hindsight_mask,
                                                                sample_starts,
                                                                sample_ends,
                                                                sample_count,
@@ -1355,6 +1398,8 @@ void compute_grpo_custom_dloss(float* custom_dloss,
                                                                ipo_mask_high,
                                                                adv_tau,
                                                                teacher_tau,
+                                                               opd_tau,
+                                                               opd_beta,
                                                                kl_tau);
     CUDA_CHECK(cudaGetLastError());
 }

@@ -1169,6 +1169,12 @@ NB_MODULE(_surogate, m) {
              "Must be called before import_weights(). The adapter's LoRA deltas\n"
              "are applied to BF16 base weights before quantization or storage.\n\n"
              "Parameters:\n- path: Path to PEFT adapter directory (with adapter_config.json).")
+        .def("import_adapter",
+             &MultiGPUPyTrainer::import_adapter,
+             nb::arg("file_name"),
+             "Import PEFT LoRA weights into the trainable adapter state.\n\n"
+             "Call after import_weights(). The adapter rank and target modules must match\n"
+             "the trainer LoRA configuration. Exported children remain standalone PEFT adapters.")
         .def("import_weights",
              &MultiGPUPyTrainer::import_weights,
              nb::arg("path"),
@@ -1955,11 +1961,15 @@ NB_MODULE(_surogate, m) {
                nb::object position_ids_obj,
                nb::object temperatures_obj,
                nb::object teacher_logprobs_obj,
+               nb::object hindsight_logprobs_obj,
+               nb::object hindsight_mask_obj,
                float loss_scale,
                float ipo_mask_low,
                float ipo_mask_high,
                float adv_tau,
                float teacher_tau,
+               float opd_tau,
+               float opd_beta,
                float kl_tau) {
                 if (sample_starts.shape(0) != sample_ends.shape(0)) {
                     throw std::invalid_argument("sample_starts and sample_ends must have the same length");
@@ -1980,6 +1990,19 @@ NB_MODULE(_surogate, m) {
                         nb::cast<nb::ndarray<float, nb::ndim<1>, nb::c_contig>>(teacher_logprobs_obj);
                     teacher_logprobs_ptr = teacher_logprobs.data();
                 }
+                const float* hindsight_logprobs_ptr = nullptr;
+                const std::uint8_t* hindsight_mask_ptr = nullptr;
+                if (hindsight_logprobs_obj.is_none() != hindsight_mask_obj.is_none()) {
+                    throw std::invalid_argument("hindsight_logprobs and hindsight_mask must be provided together");
+                }
+                if (!hindsight_logprobs_obj.is_none()) {
+                    auto hindsight_logprobs =
+                        nb::cast<nb::ndarray<float, nb::ndim<1>, nb::c_contig>>(hindsight_logprobs_obj);
+                    auto hindsight_mask =
+                        nb::cast<nb::ndarray<std::uint8_t, nb::ndim<1>, nb::c_contig>>(hindsight_mask_obj);
+                    hindsight_logprobs_ptr = hindsight_logprobs.data();
+                    hindsight_mask_ptr = hindsight_mask.data();
+                }
                 trainer->step_grpo_native(input_ids.data(),
                                           targets.data(),
                                           inference_logprobs.data(),
@@ -1991,11 +2014,15 @@ NB_MODULE(_surogate, m) {
                                           position_ids_ptr,
                                           temperatures_ptr,
                                           teacher_logprobs_ptr,
+                                          hindsight_logprobs_ptr,
+                                          hindsight_mask_ptr,
                                           loss_scale,
                                           ipo_mask_low,
                                           ipo_mask_high,
                                           adv_tau,
                                           teacher_tau,
+                                          opd_tau,
+                                          opd_beta,
                                           kl_tau);
             },
             nb::arg("input_ids"),
@@ -2008,11 +2035,15 @@ NB_MODULE(_surogate, m) {
             nb::arg("position_ids") = nb::none(),
             nb::arg("temperatures") = nb::none(),
             nb::arg("teacher_logprobs") = nb::none(),
+            nb::arg("hindsight_logprobs") = nb::none(),
+            nb::arg("hindsight_mask") = nb::none(),
             nb::arg("loss_scale") = 1.0f,
             nb::arg("ipo_mask_low") = 0.2f,
             nb::arg("ipo_mask_high") = 0.2f,
             nb::arg("adv_tau") = 1.0f,
             nb::arg("teacher_tau") = 0.0f,
+            nb::arg("opd_tau") = 0.0f,
+            nb::arg("opd_beta") = 1.0f,
             nb::arg("kl_tau") = 1.0e-3f,
             "Run one GRPO training micro-step with native CUDA per-token gradient generation.")
         .def(

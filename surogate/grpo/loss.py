@@ -15,6 +15,12 @@ def _safe_mean(values: np.ndarray, mask: np.ndarray) -> float:
     return float(values[mask].sum() / denom)
 
 
+def _sigmoid(values: np.ndarray) -> np.ndarray:
+    """Numerically stable sigmoid for detached SEED confidence gates."""
+    clipped = np.clip(values, -60.0, 60.0)
+    return 1.0 / (1.0 + np.exp(-clipped))
+
+
 def _compute_sample_grads(
     trainer_logprobs: np.ndarray,
     inference_logprobs: np.ndarray,
@@ -22,6 +28,8 @@ def _compute_sample_grads(
     loss_mask: np.ndarray,
     loss_config: GRPOLossConfig,
     teacher_logprobs: np.ndarray | None = None,
+    hindsight_logprobs: np.ndarray | None = None,
+    hindsight_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict[str, float]]:
     """Compute IPO per-token gradient multipliers for a single sample.
 
@@ -36,6 +44,8 @@ def _compute_sample_grads(
         loss_mask: [S] bool mask (True = completion token, False = prompt)
         loss_config: GRPO loss hyperparameters
         teacher_logprobs: [S] optional teacher log-probs for this sample
+        hindsight_logprobs: [S] skill-conditioned log-probs aligned to sampled tokens
+        hindsight_mask: [S] bool mask selecting conductor tokens with valid hindsight scores
 
     Returns:
         (per_token_grads [S], metrics dict)
@@ -72,13 +82,32 @@ def _compute_sample_grads(
     per_token_grads[keep_mask] = scaled_advantages[keep_mask] * importance_ratio[keep_mask]
     per_token_grads[loss_mask] -= 2.0 * loss_config.kl_tau * log_importance_ratio[loss_mask]
 
+    if (hindsight_logprobs is None) != (hindsight_mask is None):
+        raise ValueError("hindsight_logprobs and hindsight_mask must be provided together")
+    opd_mask = np.zeros_like(loss_mask, dtype=bool)
+    opd_shift = np.zeros_like(trainer_logprobs)
+    opd_gate = np.zeros_like(trainer_logprobs)
+    if hindsight_logprobs is not None and hindsight_mask is not None:
+        opd_mask = loss_mask & hindsight_mask.astype(bool)
+        # Both detached branches were scored by the rollout snapshot on the
+        # same inference backend. Their difference isolates the skill-induced
+        # context effect and does not fold native/inference numeric drift into
+        # the confidence gate.
+        opd_shift = hindsight_logprobs - inference_logprobs
+        opd_gate = _sigmoid(loss_config.opd_beta * opd_shift)
+        # The gate and privileged branch are detached. Positive CE seeds increase
+        # ordinary-context likelihood only on conductor tokens selected by opd_mask.
+        per_token_grads[opd_mask] += loss_config.opd_tau * opd_gate[opd_mask]
+
     # Policy loss metric
     loss_mask_count = max(loss_mask.sum(), 1)
     pg_loss = np.zeros_like(trainer_logprobs)
     pg_loss[keep_mask] = scaled_advantages[keep_mask] * importance_ratio[keep_mask]
     kl_loss = np.zeros_like(trainer_logprobs)
     kl_loss[loss_mask] = loss_config.kl_tau * log_importance_ratio[loss_mask] ** 2
-    policy_loss = float((-pg_loss + kl_loss).sum() / loss_mask_count)
+    opd_loss = np.zeros_like(trainer_logprobs)
+    opd_loss[opd_mask] = -loss_config.opd_tau * opd_gate[opd_mask] * trainer_logprobs[opd_mask]
+    policy_loss = float((-pg_loss + kl_loss + opd_loss).sum() / loss_mask_count)
 
     metrics = {
         "policy_loss": policy_loss,
@@ -90,6 +119,10 @@ def _compute_sample_grads(
         "is_masked_high": float(ipo_mask_high[loss_mask].mean()) if loss_mask.any() else 0.0,
         "keep_tokens": int(keep_mask.sum()),
         "total_tokens": int(loss_mask.sum()),
+        "opd_loss": _safe_mean(opd_loss, opd_mask),
+        "opd_gate": _safe_mean(opd_gate, opd_mask),
+        "opd_shift": _safe_mean(opd_shift, opd_mask),
+        "opd_tokens": int(opd_mask.sum()),
     }
 
     if teacher_logprobs is not None:
@@ -106,6 +139,8 @@ def compute_grpo_per_token_grads(
     loss_config: GRPOLossConfig,
     sample_ranges: list[tuple[int, int]],
     teacher_logprobs: np.ndarray | None = None,
+    hindsight_logprobs: np.ndarray | None = None,
+    hindsight_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict[str, float]]:
     """Compute GRPO per-token gradient multipliers for a packed batch.
 
@@ -124,6 +159,8 @@ def compute_grpo_per_token_grads(
         loss_config: GRPO loss hyperparameters
         sample_ranges: list of (start, end) tuples for each sample in the packed sequence
         teacher_logprobs: [T] optional teacher log-probs for KL distillation
+        hindsight_logprobs: [T] optional skill-conditioned log-probs
+        hindsight_mask: [T] optional mask for valid conductor-token OPD targets
 
     Returns:
         (per_token_grads [T], aggregated metrics dict)
@@ -142,6 +179,10 @@ def compute_grpo_per_token_grads(
         "is_masked_high": 0.0,
         "keep_tokens": 0,
         "total_tokens": 0,
+        "opd_loss": 0.0,
+        "opd_gate": 0.0,
+        "opd_shift": 0.0,
+        "opd_tokens": 0,
     }
     n_samples = 0
 
@@ -151,6 +192,8 @@ def compute_grpo_per_token_grads(
             continue
 
         s_teacher = teacher_logprobs[s_start:s_end] if teacher_logprobs is not None else None
+        s_hindsight = hindsight_logprobs[s_start:s_end] if hindsight_logprobs is not None else None
+        s_hindsight_mask = hindsight_mask[s_start:s_end] if hindsight_mask is not None else None
 
         s_grads, s_metrics = _compute_sample_grads(
             trainer_logprobs=trainer_logprobs[s_start:s_end],
@@ -159,6 +202,8 @@ def compute_grpo_per_token_grads(
             loss_mask=s_loss_mask,
             loss_config=loss_config,
             teacher_logprobs=s_teacher,
+            hindsight_logprobs=s_hindsight,
+            hindsight_mask=s_hindsight_mask,
         )
 
         per_token_grads[s_start:s_end] = s_grads
@@ -173,10 +218,14 @@ def compute_grpo_per_token_grads(
             "is_masked",
             "is_masked_low",
             "is_masked_high",
+            "opd_loss",
+            "opd_gate",
+            "opd_shift",
         ):
             agg_metrics[key] += s_metrics[key]
         agg_metrics["keep_tokens"] += s_metrics["keep_tokens"]
         agg_metrics["total_tokens"] += s_metrics["total_tokens"]
+        agg_metrics["opd_tokens"] += s_metrics["opd_tokens"]
 
         if s_teacher is not None and "teacher_kl" in s_metrics:
             agg_metrics.setdefault("teacher_kl", 0.0)
@@ -192,6 +241,9 @@ def compute_grpo_per_token_grads(
             "is_masked",
             "is_masked_low",
             "is_masked_high",
+            "opd_loss",
+            "opd_gate",
+            "opd_shift",
         ):
             agg_metrics[key] /= n_samples
         if "teacher_kl" in agg_metrics:
@@ -208,6 +260,8 @@ def compute_native_shifted_grpo_dloss_reference(
     loss_config: GRPOLossConfig,
     sample_ranges: list[tuple[int, int]],
     teacher_logprobs: np.ndarray | None = None,
+    hindsight_logprobs: np.ndarray | None = None,
+    hindsight_mask: np.ndarray | None = None,
     loss_scale: float = 1.0,
 ) -> np.ndarray:
     """Reference for the native CUDA GRPO dloss layout.
@@ -225,6 +279,8 @@ def compute_native_shifted_grpo_dloss_reference(
         loss_config=loss_config,
         sample_ranges=sample_ranges,
         teacher_logprobs=teacher_logprobs,
+        hindsight_logprobs=hindsight_logprobs,
+        hindsight_mask=hindsight_mask,
     )
     shifted = np.zeros_like(per_token_grads)
     for start, end in sample_ranges:
@@ -243,6 +299,8 @@ def compute_native_grpo_metrics_reference(
     loss_config: GRPOLossConfig,
     sample_ranges: list[tuple[int, int]],
     teacher_logprobs: np.ndarray | None = None,
+    hindsight_logprobs: np.ndarray | None = None,
+    hindsight_mask: np.ndarray | None = None,
 ) -> dict[str, float]:
     """Reference metrics for the native GRPO CUDA accumulator."""
     _, metrics = compute_grpo_per_token_grads(
@@ -253,5 +311,7 @@ def compute_native_grpo_metrics_reference(
         loss_config=loss_config,
         sample_ranges=sample_ranges,
         teacher_logprobs=teacher_logprobs,
+        hindsight_logprobs=hindsight_logprobs,
+        hindsight_mask=hindsight_mask,
     )
     return metrics

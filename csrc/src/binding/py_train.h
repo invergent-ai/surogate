@@ -84,6 +84,7 @@ public:
     ~MultiGPUPyTrainer();
 
     void set_adapter_path(std::string path);
+    void import_adapter(std::string file_name);
     void import_weights(std::string path);
     void import_weights_from_external(std::string safetensors_path,
                                       std::vector<std::vector<qlora::ExternalWeight>> per_gpu_weights);
@@ -284,11 +285,15 @@ public:
                           const std::int32_t* position_ids,
                           const float* temperatures,
                           const float* teacher_logprobs,
+                          const float* hindsight_logprobs,
+                          const std::uint8_t* hindsight_mask,
                           float loss_scale,
                           float ipo_mask_low,
                           float ipo_mask_high,
                           float adv_tau,
                           float teacher_tau,
+                          float opd_tau,
+                          float opd_beta,
                           float kl_tau);
     std::unordered_map<std::string, float> get_grpo_native_metrics();
 
