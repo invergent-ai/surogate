@@ -420,6 +420,7 @@ class GRPOTrainer:
                     teacher_lp = mb["teacher_logprobs"].flatten()
                 hindsight_lp = mb["hindsight_logprobs"].flatten()
                 hindsight_mask_flat = mb["hindsight_mask"].flatten()
+                replay_mask_flat = mb["replay_mask"].flatten()
 
                 T_actual = orig_input_ids.shape[1]
                 ngpu = config.gpus
@@ -482,6 +483,8 @@ class GRPOTrainer:
                 hindsight_padded[:T_actual] = hindsight_lp[:T_actual]
                 hindsight_mask_padded = np.zeros(seq_len, dtype=np.uint8)
                 hindsight_mask_padded[:T_actual] = hindsight_mask_flat[:T_actual].astype(np.uint8)
+                replay_mask_padded = np.zeros(seq_len, dtype=np.uint8)
+                replay_mask_padded[:T_actual] = replay_mask_flat[:T_actual].astype(np.uint8)
 
                 sample_starts = np.asarray([start for start, _ in sample_ranges], dtype=np.int32)
                 sample_ends = np.asarray([end for _, end in sample_ranges], dtype=np.int32)
@@ -499,6 +502,7 @@ class GRPOTrainer:
                     teacher_logprobs=teacher_padded,
                     hindsight_logprobs=hindsight_padded,
                     hindsight_mask=hindsight_mask_padded,
+                    replay_mask=replay_mask_padded,
                     loss_scale=float(loss_scale),
                     ipo_mask_low=float(config.loss.ipo_mask_low),
                     ipo_mask_high=float(config.loss.ipo_mask_high),
@@ -506,6 +510,7 @@ class GRPOTrainer:
                     teacher_tau=float(config.loss.teacher_tau),
                     opd_tau=float(config.loss.opd_tau),
                     opd_beta=float(config.loss.opd_beta),
+                    replay_tau=float(config.loss.replay_tau),
                     kl_tau=float(config.loss.kl_tau),
                 )
 
@@ -561,6 +566,8 @@ class GRPOTrainer:
                             "train/opd_gate": float(step_metrics.get("opd_gate", 0.0)),
                             "train/opd_shift": float(step_metrics.get("opd_shift", 0.0)),
                             "train/opd_tokens": float(step_metrics.get("opd_tokens", 0.0)),
+                            "train/replay_loss": float(step_metrics.get("replay_loss", 0.0)),
+                            "train/replay_tokens": float(step_metrics.get("replay_tokens", 0.0)),
                             "train/keep_tokens": float(step_metrics.get("keep_tokens", 0.0)),
                             "train/total_tokens": float(total_tokens),
                             "train/grad_norm": float(result["norm"]),

@@ -25,6 +25,7 @@ class GRPOLossConfig:
     teacher_tau: float = 0.0
     opd_tau: float = 0.0
     opd_beta: float = 1.0
+    replay_tau: float = 0.0
     kl_tau: float = 1e-3  # The tau for KL divergence
 
     def __post_init__(self) -> None:
@@ -32,6 +33,8 @@ class GRPOLossConfig:
             raise ValueError("opd_tau must be non-negative")
         if self.opd_beta <= 0.0:
             raise ValueError("opd_beta must be positive")
+        if self.replay_tau < 0.0:
+            raise ValueError("replay_tau must be non-negative")
 
 
 @dataclass

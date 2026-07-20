@@ -54,10 +54,12 @@ enum GrpoMetricOffset {
     GRPO_METRIC_OPD_GATE = 9,
     GRPO_METRIC_OPD_SHIFT = 10,
     GRPO_METRIC_OPD_TOKENS = 11,
-    GRPO_METRIC_SAMPLE_COUNT = 12,
-    GRPO_METRIC_KEEP_TOKENS = 13,
-    GRPO_METRIC_TOTAL_TOKENS = 14,
-    GRPO_METRIC_COUNT = 15,
+    GRPO_METRIC_REPLAY_LOSS = 12,
+    GRPO_METRIC_REPLAY_TOKENS = 13,
+    GRPO_METRIC_SAMPLE_COUNT = 14,
+    GRPO_METRIC_KEEP_TOKENS = 15,
+    GRPO_METRIC_TOTAL_TOKENS = 16,
+    GRPO_METRIC_COUNT = 17,
 };
 
 int acquire_grpo_host_staging_slot(modules::GrpoNativeScratch& scratch) {
@@ -846,7 +848,8 @@ void DslModel::step_grpo_native(Tensor inputs,
                                 const float* temperatures_cpu,
                                 const float* teacher_logprobs_cpu,
                                 const float* hindsight_logprobs_cpu,
-                                const std::uint8_t* hindsight_mask_cpu) {
+                                const std::uint8_t* hindsight_mask_cpu,
+                                const std::uint8_t* replay_mask_cpu) {
     if (!mExecutor) {
         throw std::logic_error("DslModel::step_grpo_native called before allocate_run_state()");
     }
@@ -937,6 +940,17 @@ void DslModel::step_grpo_native(Tensor inputs,
         hindsight_logprobs_gpu = scratch.hindsight_logprobs.get<float>();
         hindsight_mask_gpu = scratch.hindsight_mask.get<std::uint8_t>();
     }
+    const std::uint8_t* replay_mask_gpu = nullptr;
+    if (replay_mask_cpu) {
+        std::memcpy(
+            scratch.host_replay_mask[staging_slot].get<std::uint8_t>(), replay_mask_cpu, bt * sizeof(std::uint8_t));
+        CUDA_CHECK(cudaMemcpyAsync(scratch.replay_mask.Data,
+                                   scratch.host_replay_mask[staging_slot].Data,
+                                   bt * sizeof(std::uint8_t),
+                                   cudaMemcpyHostToDevice,
+                                   main_stream));
+        replay_mask_gpu = scratch.replay_mask.get<std::uint8_t>();
+    }
 
     const float* inv_temperature_gpu = nullptr;
     if (temperatures_cpu) {
@@ -982,6 +996,7 @@ void DslModel::step_grpo_native(Tensor inputs,
                               teacher_logprobs_gpu,
                               hindsight_logprobs_gpu,
                               hindsight_mask_gpu,
+                              replay_mask_gpu,
                               scratch.sample_starts.get<std::int32_t>(),
                               scratch.sample_ends.get<std::int32_t>(),
                               sample_count,
@@ -993,6 +1008,7 @@ void DslModel::step_grpo_native(Tensor inputs,
                               loss_config.teacher_tau,
                               loss_config.opd_tau,
                               loss_config.opd_beta,
+                              loss_config.replay_tau,
                               loss_config.kl_tau,
                               main_stream);
 
@@ -1043,10 +1059,14 @@ GrpoNativeMetrics DslModel::consume_grpo_native_metrics() {
     metrics.is_masked_low = values[GRPO_METRIC_IS_MASKED_LOW] / sample_count;
     metrics.is_masked_high = values[GRPO_METRIC_IS_MASKED_HIGH] / sample_count;
     metrics.teacher_kl = values[GRPO_METRIC_TEACHER_KL] / sample_count;
-    metrics.opd_loss = values[GRPO_METRIC_OPD_LOSS] / sample_count;
-    metrics.opd_gate = values[GRPO_METRIC_OPD_GATE] / sample_count;
-    metrics.opd_shift = values[GRPO_METRIC_OPD_SHIFT] / sample_count;
     metrics.opd_tokens = values[GRPO_METRIC_OPD_TOKENS];
+    metrics.replay_tokens = values[GRPO_METRIC_REPLAY_TOKENS];
+    const float opd_tokens = std::max(metrics.opd_tokens, 1.0f);
+    const float replay_tokens = std::max(metrics.replay_tokens, 1.0f);
+    metrics.opd_loss = values[GRPO_METRIC_OPD_LOSS] / opd_tokens;
+    metrics.opd_gate = values[GRPO_METRIC_OPD_GATE] / opd_tokens;
+    metrics.opd_shift = values[GRPO_METRIC_OPD_SHIFT] / opd_tokens;
+    metrics.replay_loss = values[GRPO_METRIC_REPLAY_LOSS] / replay_tokens;
     metrics.keep_tokens = values[GRPO_METRIC_KEEP_TOKENS];
     metrics.total_tokens = values[GRPO_METRIC_TOTAL_TOKENS];
     return metrics;

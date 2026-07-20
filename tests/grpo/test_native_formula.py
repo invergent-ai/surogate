@@ -213,3 +213,62 @@ def test_seed_opd_gate_uses_matched_rollout_branches_not_native_drift():
     assert metrics["opd_gate"] == pytest.approx(
         np.mean([supported_gate, unsupported_gate])
     )
+
+
+def test_replay_anchor_supplies_outcome_independent_parent_action_credit():
+    trainer_logprobs = np.array([-8.0, -2.0, -1.0, -3.0], dtype=np.float32)
+    loss_mask = np.array([False, True, True, True])
+    replay_mask = np.array([False, True, False, True])
+    config = GRPOLossConfig(
+        adv_tau=0.0,
+        kl_tau=0.0,
+        opd_tau=0.0,
+        replay_tau=0.3,
+    )
+
+    grads, metrics = compute_grpo_per_token_grads(
+        trainer_logprobs=trainer_logprobs,
+        inference_logprobs=trainer_logprobs.copy(),
+        advantages=np.zeros(4, dtype=np.float32),
+        loss_mask=loss_mask,
+        loss_config=config,
+        sample_ranges=[(0, 4)],
+        replay_mask=replay_mask,
+    )
+
+    np.testing.assert_allclose(grads, [0.0, 0.3, 0.0, 0.3])
+    assert metrics["replay_tokens"] == 2
+    assert metrics["replay_loss"] == pytest.approx(0.75)
+    assert metrics["opd_tokens"] == 0
+
+
+def test_sparse_objective_metrics_use_selected_token_denominators():
+    trainer_logprobs = np.array([-8.0, -2.0, -8.0, -3.0], dtype=np.float32)
+    inference_logprobs = trainer_logprobs.copy()
+    hindsight_logprobs = np.array([-8.0, -1.0, -8.0, -3.0], dtype=np.float32)
+    loss_mask = np.array([False, True, False, True])
+    config = GRPOLossConfig(
+        adv_tau=0.0,
+        kl_tau=0.0,
+        opd_tau=0.1,
+        opd_beta=2.0,
+        replay_tau=0.2,
+    )
+
+    _, metrics = compute_grpo_per_token_grads(
+        trainer_logprobs=trainer_logprobs,
+        inference_logprobs=inference_logprobs,
+        advantages=np.zeros(4, dtype=np.float32),
+        loss_mask=loss_mask,
+        loss_config=config,
+        sample_ranges=[(0, 2), (2, 4)],
+        hindsight_logprobs=hindsight_logprobs,
+        hindsight_mask=np.array([False, True, False, False]),
+        replay_mask=np.array([False, False, False, True]),
+    )
+
+    assert metrics["opd_tokens"] == 1
+    assert metrics["opd_gate"] == pytest.approx(1.0 / (1.0 + np.exp(-2.0)))
+    assert metrics["opd_shift"] == pytest.approx(1.0)
+    assert metrics["replay_tokens"] == 1
+    assert metrics["replay_loss"] == pytest.approx(0.6)

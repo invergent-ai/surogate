@@ -287,6 +287,7 @@ public:
                           const float* teacher_logprobs,
                           const float* hindsight_logprobs,
                           const std::uint8_t* hindsight_mask,
+                          const std::uint8_t* replay_mask,
                           float loss_scale,
                           float ipo_mask_low,
                           float ipo_mask_high,
@@ -294,6 +295,7 @@ public:
                           float teacher_tau,
                           float opd_tau,
                           float opd_beta,
+                          float replay_tau,
                           float kl_tau);
     std::unordered_map<std::string, float> get_grpo_native_metrics();
 

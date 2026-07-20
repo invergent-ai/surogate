@@ -30,6 +30,7 @@ def _compute_sample_grads(
     teacher_logprobs: np.ndarray | None = None,
     hindsight_logprobs: np.ndarray | None = None,
     hindsight_mask: np.ndarray | None = None,
+    replay_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict[str, float]]:
     """Compute IPO per-token gradient multipliers for a single sample.
 
@@ -46,6 +47,7 @@ def _compute_sample_grads(
         teacher_logprobs: [S] optional teacher log-probs for this sample
         hindsight_logprobs: [S] skill-conditioned log-probs aligned to sampled tokens
         hindsight_mask: [S] bool mask selecting conductor tokens with valid hindsight scores
+        replay_mask: [S] bool mask selecting train-split parent-action rehearsal tokens
 
     Returns:
         (per_token_grads [S], metrics dict)
@@ -99,6 +101,14 @@ def _compute_sample_grads(
         # ordinary-context likelihood only on conductor tokens selected by opd_mask.
         per_token_grads[opd_mask] += loss_config.opd_tau * opd_gate[opd_mask]
 
+    replay_token_mask = np.zeros_like(loss_mask, dtype=bool)
+    if replay_mask is not None:
+        replay_token_mask = loss_mask & replay_mask.astype(bool)
+        # Replay is explicit behavior rehearsal, independent of outcome
+        # advantages and privileged hindsight. It keeps known-good parent
+        # actions on the ordinary prompt surface during continued training.
+        per_token_grads[replay_token_mask] += loss_config.replay_tau
+
     # Policy loss metric
     loss_mask_count = max(loss_mask.sum(), 1)
     pg_loss = np.zeros_like(trainer_logprobs)
@@ -107,7 +117,13 @@ def _compute_sample_grads(
     kl_loss[loss_mask] = loss_config.kl_tau * log_importance_ratio[loss_mask] ** 2
     opd_loss = np.zeros_like(trainer_logprobs)
     opd_loss[opd_mask] = -loss_config.opd_tau * opd_gate[opd_mask] * trainer_logprobs[opd_mask]
-    policy_loss = float((-pg_loss + kl_loss + opd_loss).sum() / loss_mask_count)
+    replay_loss = np.zeros_like(trainer_logprobs)
+    replay_loss[replay_token_mask] = (
+        -loss_config.replay_tau * trainer_logprobs[replay_token_mask]
+    )
+    policy_loss = float(
+        (-pg_loss + kl_loss + opd_loss + replay_loss).sum() / loss_mask_count
+    )
 
     metrics = {
         "policy_loss": policy_loss,
@@ -123,6 +139,8 @@ def _compute_sample_grads(
         "opd_gate": _safe_mean(opd_gate, opd_mask),
         "opd_shift": _safe_mean(opd_shift, opd_mask),
         "opd_tokens": int(opd_mask.sum()),
+        "replay_loss": _safe_mean(replay_loss, replay_token_mask),
+        "replay_tokens": int(replay_token_mask.sum()),
     }
 
     if teacher_logprobs is not None:
@@ -141,6 +159,7 @@ def compute_grpo_per_token_grads(
     teacher_logprobs: np.ndarray | None = None,
     hindsight_logprobs: np.ndarray | None = None,
     hindsight_mask: np.ndarray | None = None,
+    replay_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict[str, float]]:
     """Compute GRPO per-token gradient multipliers for a packed batch.
 
@@ -161,6 +180,7 @@ def compute_grpo_per_token_grads(
         teacher_logprobs: [T] optional teacher log-probs for KL distillation
         hindsight_logprobs: [T] optional skill-conditioned log-probs
         hindsight_mask: [T] optional mask for valid conductor-token OPD targets
+        replay_mask: [T] optional mask for train-split parent-action rehearsal
 
     Returns:
         (per_token_grads [T], aggregated metrics dict)
@@ -183,6 +203,8 @@ def compute_grpo_per_token_grads(
         "opd_gate": 0.0,
         "opd_shift": 0.0,
         "opd_tokens": 0,
+        "replay_loss": 0.0,
+        "replay_tokens": 0,
     }
     n_samples = 0
 
@@ -194,6 +216,7 @@ def compute_grpo_per_token_grads(
         s_teacher = teacher_logprobs[s_start:s_end] if teacher_logprobs is not None else None
         s_hindsight = hindsight_logprobs[s_start:s_end] if hindsight_logprobs is not None else None
         s_hindsight_mask = hindsight_mask[s_start:s_end] if hindsight_mask is not None else None
+        s_replay_mask = replay_mask[s_start:s_end] if replay_mask is not None else None
 
         s_grads, s_metrics = _compute_sample_grads(
             trainer_logprobs=trainer_logprobs[s_start:s_end],
@@ -204,6 +227,7 @@ def compute_grpo_per_token_grads(
             teacher_logprobs=s_teacher,
             hindsight_logprobs=s_hindsight,
             hindsight_mask=s_hindsight_mask,
+            replay_mask=s_replay_mask,
         )
 
         per_token_grads[s_start:s_end] = s_grads
@@ -218,14 +242,17 @@ def compute_grpo_per_token_grads(
             "is_masked",
             "is_masked_low",
             "is_masked_high",
-            "opd_loss",
-            "opd_gate",
-            "opd_shift",
         ):
             agg_metrics[key] += s_metrics[key]
+        for key in ("opd_loss", "opd_gate", "opd_shift"):
+            agg_metrics[key] += s_metrics[key] * s_metrics["opd_tokens"]
+        agg_metrics["replay_loss"] += (
+            s_metrics["replay_loss"] * s_metrics["replay_tokens"]
+        )
         agg_metrics["keep_tokens"] += s_metrics["keep_tokens"]
         agg_metrics["total_tokens"] += s_metrics["total_tokens"]
         agg_metrics["opd_tokens"] += s_metrics["opd_tokens"]
+        agg_metrics["replay_tokens"] += s_metrics["replay_tokens"]
 
         if s_teacher is not None and "teacher_kl" in s_metrics:
             agg_metrics.setdefault("teacher_kl", 0.0)
@@ -241,11 +268,13 @@ def compute_grpo_per_token_grads(
             "is_masked",
             "is_masked_low",
             "is_masked_high",
-            "opd_loss",
-            "opd_gate",
-            "opd_shift",
         ):
             agg_metrics[key] /= n_samples
+        if agg_metrics["opd_tokens"] > 0:
+            for key in ("opd_loss", "opd_gate", "opd_shift"):
+                agg_metrics[key] /= agg_metrics["opd_tokens"]
+        if agg_metrics["replay_tokens"] > 0:
+            agg_metrics["replay_loss"] /= agg_metrics["replay_tokens"]
         if "teacher_kl" in agg_metrics:
             agg_metrics["teacher_kl"] /= n_samples
 
@@ -262,6 +291,7 @@ def compute_native_shifted_grpo_dloss_reference(
     teacher_logprobs: np.ndarray | None = None,
     hindsight_logprobs: np.ndarray | None = None,
     hindsight_mask: np.ndarray | None = None,
+    replay_mask: np.ndarray | None = None,
     loss_scale: float = 1.0,
 ) -> np.ndarray:
     """Reference for the native CUDA GRPO dloss layout.
@@ -281,6 +311,7 @@ def compute_native_shifted_grpo_dloss_reference(
         teacher_logprobs=teacher_logprobs,
         hindsight_logprobs=hindsight_logprobs,
         hindsight_mask=hindsight_mask,
+        replay_mask=replay_mask,
     )
     shifted = np.zeros_like(per_token_grads)
     for start, end in sample_ranges:
@@ -301,6 +332,7 @@ def compute_native_grpo_metrics_reference(
     teacher_logprobs: np.ndarray | None = None,
     hindsight_logprobs: np.ndarray | None = None,
     hindsight_mask: np.ndarray | None = None,
+    replay_mask: np.ndarray | None = None,
 ) -> dict[str, float]:
     """Reference metrics for the native GRPO CUDA accumulator."""
     _, metrics = compute_grpo_per_token_grads(
@@ -313,5 +345,6 @@ def compute_native_grpo_metrics_reference(
         teacher_logprobs=teacher_logprobs,
         hindsight_logprobs=hindsight_logprobs,
         hindsight_mask=hindsight_mask,
+        replay_mask=replay_mask,
     )
     return metrics

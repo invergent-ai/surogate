@@ -2820,6 +2820,7 @@ void MultiGPUPyTrainer::step_grpo_native(const std::int32_t* inputs,
                                          const float* teacher_logprobs,
                                          const float* hindsight_logprobs,
                                          const std::uint8_t* hindsight_mask,
+                                         const std::uint8_t* replay_mask,
                                          float loss_scale,
                                          float ipo_mask_low,
                                          float ipo_mask_high,
@@ -2827,6 +2828,7 @@ void MultiGPUPyTrainer::step_grpo_native(const std::int32_t* inputs,
                                          float teacher_tau,
                                          float opd_tau,
                                          float opd_beta,
+                                         float replay_tau,
                                          float kl_tau) {
     const int ep_size = std::max(1, mOptions.EPSize);
     for (int i = 0; i < (int)mContexts.size(); ++i) {
@@ -2867,6 +2869,7 @@ void MultiGPUPyTrainer::step_grpo_native(const std::int32_t* inputs,
         .teacher_tau = teacher_tau,
         .opd_tau = opd_tau,
         .opd_beta = opd_beta,
+        .replay_tau = replay_tau,
         .kl_tau = kl_tau,
     };
 
@@ -2882,6 +2885,7 @@ void MultiGPUPyTrainer::step_grpo_native(const std::int32_t* inputs,
               teacher_logprobs,
               hindsight_logprobs,
               hindsight_mask,
+              replay_mask,
               loss_config,
               B = this->B,
               T = this->T](sThreadContext& ctx) {
@@ -2918,7 +2922,8 @@ void MultiGPUPyTrainer::step_grpo_native(const std::int32_t* inputs,
                                     temps_for_this_gpu,
                                     teacher_logprobs,
                                     hindsight_logprobs,
-                                    hindsight_mask);
+                                    hindsight_mask,
+                                    replay_mask);
     });
 
     ++mTrainMicroStep;
@@ -2948,6 +2953,8 @@ std::unordered_map<std::string, float> MultiGPUPyTrainer::get_grpo_native_metric
             {"opd_gate", metrics.opd_gate},
             {"opd_shift", metrics.opd_shift},
             {"opd_tokens", metrics.opd_tokens},
+            {"replay_loss", metrics.replay_loss},
+            {"replay_tokens", metrics.replay_tokens},
             {"keep_tokens", metrics.keep_tokens},
             {"total_tokens", metrics.total_tokens},
         };

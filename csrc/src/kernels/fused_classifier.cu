@@ -1178,10 +1178,12 @@ enum GrpoMetricOffset {
     GRPO_METRIC_OPD_GATE = 9,
     GRPO_METRIC_OPD_SHIFT = 10,
     GRPO_METRIC_OPD_TOKENS = 11,
-    GRPO_METRIC_SAMPLE_COUNT = 12,
-    GRPO_METRIC_KEEP_TOKENS = 13,
-    GRPO_METRIC_TOTAL_TOKENS = 14,
-    GRPO_METRIC_COUNT = 15,
+    GRPO_METRIC_REPLAY_LOSS = 12,
+    GRPO_METRIC_REPLAY_TOKENS = 13,
+    GRPO_METRIC_SAMPLE_COUNT = 14,
+    GRPO_METRIC_KEEP_TOKENS = 15,
+    GRPO_METRIC_TOTAL_TOKENS = 16,
+    GRPO_METRIC_COUNT = 17,
 };
 
 __global__ void grpo_custom_dloss_kernel(float* custom_dloss,
@@ -1193,6 +1195,7 @@ __global__ void grpo_custom_dloss_kernel(float* custom_dloss,
                                          const float* teacher_logprobs,
                                          const float* hindsight_logprobs,
                                          const std::uint8_t* hindsight_mask,
+                                         const std::uint8_t* replay_mask,
                                          const std::int32_t* sample_starts,
                                          const std::int32_t* sample_ends,
                                          int sample_count,
@@ -1204,6 +1207,7 @@ __global__ void grpo_custom_dloss_kernel(float* custom_dloss,
                                          float teacher_tau,
                                          float opd_tau,
                                          float opd_beta,
+                                         float replay_tau,
                                          float kl_tau) {
     __shared__ float reductions[GRPO_METRIC_COUNT][256];
 
@@ -1230,6 +1234,8 @@ __global__ void grpo_custom_dloss_kernel(float* custom_dloss,
     float opd_gate_sum = 0.0f;
     float opd_shift_sum = 0.0f;
     float opd_count = 0.0f;
+    float replay_loss_sum = 0.0f;
+    float replay_count = 0.0f;
     float keep_count = 0.0f;
     float total_count = 0.0f;
     float masked_count = 0.0f;
@@ -1285,6 +1291,13 @@ __global__ void grpo_custom_dloss_kernel(float* custom_dloss,
             opd_shift_sum += opd_shift;
             opd_count += 1.0f;
         }
+        if (replay_mask && replay_mask[logical_idx] != 0) {
+            const float replay_loss = -replay_tau * trainer_logprob;
+            dloss += replay_tau;
+            policy_sum += replay_loss;
+            replay_loss_sum += replay_loss;
+            replay_count += 1.0f;
+        }
         const float mismatch_kl = importance_ratio - log_importance_ratio - 1.0f;
         const float kl_loss = kl_tau * log_importance_ratio * log_importance_ratio;
         policy_sum += kl_loss;
@@ -1310,6 +1323,8 @@ __global__ void grpo_custom_dloss_kernel(float* custom_dloss,
     reductions[GRPO_METRIC_OPD_GATE][threadIdx.x] = opd_gate_sum;
     reductions[GRPO_METRIC_OPD_SHIFT][threadIdx.x] = opd_shift_sum;
     reductions[GRPO_METRIC_OPD_TOKENS][threadIdx.x] = opd_count;
+    reductions[GRPO_METRIC_REPLAY_LOSS][threadIdx.x] = replay_loss_sum;
+    reductions[GRPO_METRIC_REPLAY_TOKENS][threadIdx.x] = replay_count;
     reductions[GRPO_METRIC_SAMPLE_COUNT][threadIdx.x] = total_count > 0.0f ? 1.0f : 0.0f;
     reductions[GRPO_METRIC_KEEP_TOKENS][threadIdx.x] = keep_count;
     reductions[GRPO_METRIC_TOTAL_TOKENS][threadIdx.x] = total_count;
@@ -1342,10 +1357,17 @@ __global__ void grpo_custom_dloss_kernel(float* custom_dloss,
         }
         const float sample_opd_count = reductions[GRPO_METRIC_OPD_TOKENS][0];
         if (sample_opd_count > 0.0f) {
-            atomicAdd(metrics + GRPO_METRIC_OPD_LOSS, reductions[GRPO_METRIC_OPD_LOSS][0] / sample_opd_count);
-            atomicAdd(metrics + GRPO_METRIC_OPD_GATE, reductions[GRPO_METRIC_OPD_GATE][0] / sample_opd_count);
-            atomicAdd(metrics + GRPO_METRIC_OPD_SHIFT, reductions[GRPO_METRIC_OPD_SHIFT][0] / sample_opd_count);
+            atomicAdd(metrics + GRPO_METRIC_OPD_LOSS, reductions[GRPO_METRIC_OPD_LOSS][0]);
+            atomicAdd(metrics + GRPO_METRIC_OPD_GATE, reductions[GRPO_METRIC_OPD_GATE][0]);
+            atomicAdd(metrics + GRPO_METRIC_OPD_SHIFT, reductions[GRPO_METRIC_OPD_SHIFT][0]);
             atomicAdd(metrics + GRPO_METRIC_OPD_TOKENS, sample_opd_count);
+        }
+        const float sample_replay_count = reductions[GRPO_METRIC_REPLAY_TOKENS][0];
+        if (sample_replay_count > 0.0f) {
+            atomicAdd(
+                metrics + GRPO_METRIC_REPLAY_LOSS,
+                reductions[GRPO_METRIC_REPLAY_LOSS][0]);
+            atomicAdd(metrics + GRPO_METRIC_REPLAY_TOKENS, sample_replay_count);
         }
         atomicAdd(metrics + GRPO_METRIC_SAMPLE_COUNT, 1.0f);
         atomicAdd(metrics + GRPO_METRIC_KEEP_TOKENS, reductions[GRPO_METRIC_KEEP_TOKENS][0]);
@@ -1362,6 +1384,7 @@ void compute_grpo_custom_dloss(float* custom_dloss,
                                const float* teacher_logprobs,
                                const float* hindsight_logprobs,
                                const std::uint8_t* hindsight_mask,
+                               const std::uint8_t* replay_mask,
                                const std::int32_t* sample_starts,
                                const std::int32_t* sample_ends,
                                int sample_count,
@@ -1373,6 +1396,7 @@ void compute_grpo_custom_dloss(float* custom_dloss,
                                float teacher_tau,
                                float opd_tau,
                                float opd_beta,
+                               float replay_tau,
                                float kl_tau,
                                cudaStream_t stream) {
     if (sample_count <= 0 || BT <= 0) {
@@ -1389,6 +1413,7 @@ void compute_grpo_custom_dloss(float* custom_dloss,
                                                                teacher_logprobs,
                                                                hindsight_logprobs,
                                                                hindsight_mask,
+                                                               replay_mask,
                                                                sample_starts,
                                                                sample_ends,
                                                                sample_count,
@@ -1400,6 +1425,7 @@ void compute_grpo_custom_dloss(float* custom_dloss,
                                                                teacher_tau,
                                                                opd_tau,
                                                                opd_beta,
+                                                               replay_tau,
                                                                kl_tau);
     CUDA_CHECK(cudaGetLastError());
 }

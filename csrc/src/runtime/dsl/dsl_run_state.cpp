@@ -1074,6 +1074,8 @@ void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {
         mAllocator->allocate(ETensorDType::FP32, "grpo_hindsight_logprobs", EAllocationType::ON_DEVICE, {BT});
     mGrpoNativeScratch.hindsight_mask =
         mAllocator->allocate(ETensorDType::BYTE, "grpo_hindsight_mask", EAllocationType::ON_DEVICE, {BT});
+    mGrpoNativeScratch.replay_mask =
+        mAllocator->allocate(ETensorDType::BYTE, "grpo_replay_mask", EAllocationType::ON_DEVICE, {BT});
     mGrpoNativeScratch.loss_mask =
         mAllocator->allocate(ETensorDType::BYTE, "grpo_loss_mask", EAllocationType::ON_DEVICE, {BT});
     mGrpoNativeScratch.sample_starts =
@@ -1085,9 +1087,9 @@ void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {
     mGrpoNativeScratch.inv_temperature =
         mAllocator->allocate(ETensorDType::FP32, "grpo_inv_temperature", EAllocationType::ON_DEVICE, {BT});
     mGrpoNativeScratch.metrics =
-        mAllocator->allocate(ETensorDType::FP32, "grpo_metrics", EAllocationType::ON_DEVICE, {15});
+        mAllocator->allocate(ETensorDType::FP32, "grpo_metrics", EAllocationType::ON_DEVICE, {17});
     mGrpoNativeScratch.host_metrics =
-        mAllocator->allocate(ETensorDType::FP32, "grpo_host_metrics", EAllocationType::PINNED, {15});
+        mAllocator->allocate(ETensorDType::FP32, "grpo_host_metrics", EAllocationType::PINNED, {17});
     for (int slot = 0; slot < modules::GrpoNativeScratch::kHostStagingSlots; ++slot) {
         const auto suffix = std::to_string(slot);
         mGrpoNativeScratch.host_inference_logprobs[slot] =
@@ -1112,6 +1114,11 @@ void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {
         mGrpoNativeScratch.host_hindsight_mask[slot] =
             mAllocator->allocate(ETensorDType::BYTE,
                                  ("grpo_host_hindsight_mask_" + suffix).c_str(),
+                                 EAllocationType::PINNED,
+                                 {BT});
+        mGrpoNativeScratch.host_replay_mask[slot] =
+            mAllocator->allocate(ETensorDType::BYTE,
+                                 ("grpo_host_replay_mask_" + suffix).c_str(),
                                  EAllocationType::PINNED,
                                  {BT});
         mGrpoNativeScratch.host_temperatures[slot] = mAllocator->allocate(ETensorDType::FP32,

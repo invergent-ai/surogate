@@ -1963,6 +1963,7 @@ NB_MODULE(_surogate, m) {
                nb::object teacher_logprobs_obj,
                nb::object hindsight_logprobs_obj,
                nb::object hindsight_mask_obj,
+               nb::object replay_mask_obj,
                float loss_scale,
                float ipo_mask_low,
                float ipo_mask_high,
@@ -1970,6 +1971,7 @@ NB_MODULE(_surogate, m) {
                float teacher_tau,
                float opd_tau,
                float opd_beta,
+               float replay_tau,
                float kl_tau) {
                 if (sample_starts.shape(0) != sample_ends.shape(0)) {
                     throw std::invalid_argument("sample_starts and sample_ends must have the same length");
@@ -2003,6 +2005,12 @@ NB_MODULE(_surogate, m) {
                     hindsight_logprobs_ptr = hindsight_logprobs.data();
                     hindsight_mask_ptr = hindsight_mask.data();
                 }
+                const std::uint8_t* replay_mask_ptr = nullptr;
+                if (!replay_mask_obj.is_none()) {
+                    auto replay_mask =
+                        nb::cast<nb::ndarray<std::uint8_t, nb::ndim<1>, nb::c_contig>>(replay_mask_obj);
+                    replay_mask_ptr = replay_mask.data();
+                }
                 trainer->step_grpo_native(input_ids.data(),
                                           targets.data(),
                                           inference_logprobs.data(),
@@ -2016,6 +2024,7 @@ NB_MODULE(_surogate, m) {
                                           teacher_logprobs_ptr,
                                           hindsight_logprobs_ptr,
                                           hindsight_mask_ptr,
+                                          replay_mask_ptr,
                                           loss_scale,
                                           ipo_mask_low,
                                           ipo_mask_high,
@@ -2023,6 +2032,7 @@ NB_MODULE(_surogate, m) {
                                           teacher_tau,
                                           opd_tau,
                                           opd_beta,
+                                          replay_tau,
                                           kl_tau);
             },
             nb::arg("input_ids"),
@@ -2037,6 +2047,7 @@ NB_MODULE(_surogate, m) {
             nb::arg("teacher_logprobs") = nb::none(),
             nb::arg("hindsight_logprobs") = nb::none(),
             nb::arg("hindsight_mask") = nb::none(),
+            nb::arg("replay_mask") = nb::none(),
             nb::arg("loss_scale") = 1.0f,
             nb::arg("ipo_mask_low") = 0.2f,
             nb::arg("ipo_mask_high") = 0.2f,
@@ -2044,6 +2055,7 @@ NB_MODULE(_surogate, m) {
             nb::arg("teacher_tau") = 0.0f,
             nb::arg("opd_tau") = 0.0f,
             nb::arg("opd_beta") = 1.0f,
+            nb::arg("replay_tau") = 0.0f,
             nb::arg("kl_tau") = 1.0e-3f,
             "Run one GRPO training micro-step with native CUDA per-token gradient generation.")
         .def(

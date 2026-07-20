@@ -171,6 +171,15 @@ class MultiPacker(BasePacker):
             loss_mask = sample.prompt_mask + sample.completion_mask
             if any(hindsight and not loss for hindsight, loss in zip(sample.hindsight_mask, loss_mask)):
                 return False, "hindsight mask selects a prompt or environment token"
+        if sample.replay_mask is not None:
+            if len(sample.replay_mask) != sample_length:
+                return (
+                    False,
+                    f"replay mask length != sample length ({len(sample.replay_mask)} != {sample_length})",
+                )
+            loss_mask = sample.prompt_mask + sample.completion_mask
+            if any(replay and not loss for replay, loss in zip(sample.replay_mask, loss_mask)):
+                return False, "replay mask selects a prompt or environment token"
         return True, None
 
     def _get_batch(self) -> None:

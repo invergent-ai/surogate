@@ -61,6 +61,7 @@ struct GrpoNativeLossConfig {
     float teacher_tau = 0.0f;
     float opd_tau = 0.0f;
     float opd_beta = 1.0f;
+    float replay_tau = 0.0f;
     float kl_tau = 1.0e-3f;
 };
 
@@ -77,6 +78,8 @@ struct GrpoNativeMetrics {
     float opd_gate = 0.0f;
     float opd_shift = 0.0f;
     float opd_tokens = 0.0f;
+    float replay_loss = 0.0f;
+    float replay_tokens = 0.0f;
     float keep_tokens = 0.0f;
     float total_tokens = 0.0f;
 };
@@ -396,7 +399,8 @@ public:
                           const float* temperatures_cpu = nullptr,
                           const float* teacher_logprobs_cpu = nullptr,
                           const float* hindsight_logprobs_cpu = nullptr,
-                          const std::uint8_t* hindsight_mask_cpu = nullptr);
+                          const std::uint8_t* hindsight_mask_cpu = nullptr,
+                          const std::uint8_t* replay_mask_cpu = nullptr);
     GrpoNativeMetrics consume_grpo_native_metrics();
 
     void init_weights(NCCLCommunicator& comm) override;
