@@ -70,7 +70,7 @@ bool DslWeightLoader::load_param(const std::string& name,
         case MappingSpec::Kind::TiedTo: mTiedParams.emplace_back(name, spec->target); return true;
 
         case MappingSpec::Kind::Direct:
-            return load_direct(*spec, name, target, layer_idx, allow_cast, param_sharded, global_template);
+            return load_direct(*spec, name, target, layer_idx, allow_cast, param_sharded, global_template, stream);
 
         case MappingSpec::Kind::Fuse:
             return load_fused(*spec, name, target, layer_idx, allow_cast, param_sharded, global_template);
@@ -113,7 +113,8 @@ bool DslWeightLoader::try_multiple(const std::vector<std::pair<std::string, Mapp
         bool success = false;
         switch (trial.kind) {
             case MappingSpec::Kind::Direct:
-                success = load_direct(trial, name, target, layer_idx, allow_cast, param_sharded, global_template);
+                success =
+                    load_direct(trial, name, target, layer_idx, allow_cast, param_sharded, global_template, stream);
                 break;
             case MappingSpec::Kind::Fuse:
                 success = load_fused(trial, name, target, layer_idx, allow_cast, param_sharded, global_template);
@@ -159,28 +160,6 @@ bool DslWeightLoader::load_expert(const std::string& name,
     if (!stream) {
         stream = cudaStreamDefault;
     }
-    auto get_expert_scratch = [&](ETensorDType dtype, const std::vector<long>& shape) -> Tensor {
-        std::size_t elems = 1;
-        for (long dim : shape) {
-            elems *= static_cast<std::size_t>(dim);
-        }
-        const std::size_t bytes = elems * get_dtype_size(dtype);
-        if (!mExpertScratch.Data || mExpertScratchBytes < bytes || mExpertScratch.DType != dtype) {
-            mExpertScratch = mAllocator.allocate(dtype, "wl_tmp_expert", EAllocationType::ON_DEVICE, shape);
-            mExpertScratchBytes = mExpertScratch.bytes();
-        }
-        Tensor scratch = mExpertScratch;
-        scratch.DType = dtype;
-        scratch.Rank = static_cast<int>(shape.size());
-        for (int i = 0; i < scratch.Rank; ++i) {
-            scratch.Sizes[i] = shape[i];
-        }
-        for (int i = scratch.Rank; i < MAX_TENSOR_DIM; ++i) {
-            scratch.Sizes[i] = 1;
-        }
-        return scratch;
-    };
-
     if (spec->kind == MappingSpec::Kind::StackExperts && spec->fuse_gate_up) {
         // Fused gate_up: target is [2*D, C], load up_proj into first D rows, gate into next D.
         std::string gate_pattern = spec->source;
@@ -204,6 +183,7 @@ bool DslWeightLoader::load_expert(const std::string& name,
         Tensor up_slice = target;
         up_slice.Sizes[0] = D;
         up_entry.read_tensor(up_slice, allow_cast);
+        apply_row_scale_if_present(up_hf, up_slice, 0, stream);
 
         // Load gate_proj into second D rows.
         std::string gate_hf = format_hf_name(gate_pattern, layer_idx, expert_idx);
@@ -215,6 +195,7 @@ bool DslWeightLoader::load_expert(const std::string& name,
         gate_slice.Sizes[0] = D;
         gate_slice.Data = static_cast<std::byte*>(target.Data) + sub_expert_elems * elem_size;
         gate_entry.read_tensor(gate_slice, allow_cast);
+        apply_row_scale_if_present(gate_hf, gate_slice, 0, stream);
         CUDA_CHECK(cudaStreamSynchronize(stream));
         return true;
     }
@@ -227,6 +208,7 @@ bool DslWeightLoader::load_expert(const std::string& name,
             throw std::runtime_error("DslWeightLoader: load_expert missing '" + hf_name + "'");
         }
         entry.read_tensor(target, allow_cast);
+        apply_row_scale_if_present(hf_name, target, 0, stream);
         CUDA_CHECK(cudaStreamSynchronize(stream));
         return true;
     }
@@ -247,6 +229,9 @@ bool DslWeightLoader::load_expert(const std::string& name,
     try {
         entry_ptr = &mReader.find_entry(hf_name);
     } catch (const std::out_of_range&) {
+        if (load_unbatched_expert_fallback(hf_name, expert_idx, target, allow_cast, stream)) {
+            return true;
+        }
         if (spec->optional) {
             return false;
         }
@@ -265,12 +250,14 @@ bool DslWeightLoader::load_expert(const std::string& name,
     if (has_expert_placeholder) {
         if (spec->kind == MappingSpec::Kind::Direct) {
             entry.read_tensor(target, allow_cast);
+            apply_row_scale_if_present(hf_name, target, 0, stream);
         } else {
             if (shape.size() != 2 || target.Rank != 2) {
                 throw std::runtime_error("DslWeightLoader: load_expert transpose expects 2D tensor for '" + name + "'");
             }
-            Tensor tmp = get_expert_scratch(target.DType, {shape.at(0), shape.at(1)});
+            Tensor tmp = expert_scratch(target.DType, {shape.at(0), shape.at(1)});
             entry.read_tensor(tmp, allow_cast);
+            apply_row_scale_if_present(hf_name, tmp, 0, stream);
             transpose(target, tmp, static_cast<int>(shape.at(0)), static_cast<int>(shape.at(1)), stream);
         }
         CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -296,6 +283,7 @@ bool DslWeightLoader::load_expert(const std::string& name,
 
     if (spec->kind == MappingSpec::Kind::Direct) {
         entry.read_raw(target, offset, per_expert_elems, allow_cast);
+        apply_row_scale_if_present(hf_name, target, static_cast<long>(expert_idx) * target.Sizes[0], stream);
         CUDA_CHECK(cudaStreamSynchronize(stream));
         return true;
     }
@@ -309,8 +297,9 @@ bool DslWeightLoader::load_expert(const std::string& name,
     if (target.Sizes[0] != B || target.Sizes[1] != A) {
         throw std::runtime_error("DslWeightLoader: load_expert transpose shape mismatch for '" + name + "'");
     }
-    Tensor tmp = get_expert_scratch(target.DType, {A, B});
+    Tensor tmp = expert_scratch(target.DType, {A, B});
     entry.read_raw(tmp, offset, per_expert_elems, allow_cast);
+    apply_row_scale_if_present(hf_name, tmp, static_cast<long>(expert_idx) * A, stream);
     transpose(target, tmp, static_cast<int>(A), static_cast<int>(B), stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     return true;
@@ -337,6 +326,146 @@ bool DslWeightLoader::has_entry(const std::string& hf_name) const {
     }
 }
 
+Tensor DslWeightLoader::expert_scratch(ETensorDType dtype, const std::vector<long>& shape) {
+    std::size_t elems = 1;
+    for (long dim : shape) {
+        elems *= static_cast<std::size_t>(dim);
+    }
+    const std::size_t bytes = elems * get_dtype_size(dtype);
+    if (!mExpertScratch.Data || mExpertScratchBytes < bytes || mExpertScratch.DType != dtype) {
+        mExpertScratch = mAllocator.allocate(dtype, "wl_tmp_expert", EAllocationType::ON_DEVICE, shape);
+        mExpertScratchBytes = mExpertScratch.bytes();
+    }
+    Tensor scratch = mExpertScratch;
+    scratch.DType = dtype;
+    scratch.Rank = static_cast<int>(shape.size());
+    for (int i = 0; i < scratch.Rank; ++i) {
+        scratch.Sizes[i] = shape[i];
+    }
+    for (int i = scratch.Rank; i < MAX_TENSOR_DIM; ++i) {
+        scratch.Sizes[i] = 1;
+    }
+    return scratch;
+}
+
+Tensor DslWeightLoader::scale_scratch(ETensorDType dtype, long rows) {
+    const std::size_t bytes = static_cast<std::size_t>(rows) * get_dtype_size(dtype);
+    if (!mScaleScratch.Data || mScaleScratchBytes < bytes || mScaleScratch.DType != dtype) {
+        mScaleScratch = mAllocator.allocate(dtype, "wl_tmp_row_scales", EAllocationType::ON_DEVICE, {rows});
+        mScaleScratchBytes = mScaleScratch.bytes();
+    }
+    Tensor scratch = mScaleScratch;
+    scratch.DType = dtype;
+    scratch.Rank = 1;
+    scratch.Sizes[0] = rows;
+    for (int i = 1; i < MAX_TENSOR_DIM; ++i) {
+        scratch.Sizes[i] = 1;
+    }
+    return scratch;
+}
+
+bool DslWeightLoader::apply_row_scale_if_present(const std::string& hf_name,
+                                                  Tensor& target,
+                                                  long scale_row_offset,
+                                                  cudaStream_t stream) {
+    const SafeTensorEntry* scale_entry = nullptr;
+    try {
+        scale_entry = &mReader.find_entry(hf_name + "_scale");
+    } catch (const std::out_of_range&) {
+        return false;
+    }
+
+    if (target.Rank != 2) {
+        throw std::runtime_error("DslWeightLoader: row-scaled weight must be 2D: '" + hf_name + "'");
+    }
+    if (target.DType != ETensorDType::BF16 && target.DType != ETensorDType::FP16 &&
+        target.DType != ETensorDType::FP32) {
+        throw std::runtime_error("DslWeightLoader: unsupported row-scale target dtype for '" + hf_name + "'");
+    }
+
+    const long rows = target.Sizes[0];
+    const long cols = target.Sizes[1];
+    long scale_elems = 1;
+    for (long dim : scale_entry->shape()) {
+        scale_elems *= dim;
+    }
+    if (scale_row_offset < 0 || scale_row_offset + rows > scale_elems) {
+        throw std::runtime_error("DslWeightLoader: row-scale shape mismatch for '" + hf_name + "'");
+    }
+
+    Tensor scales = scale_scratch(target.DType, rows);
+    scale_entry->read_raw(scales, scale_row_offset, rows, true);
+    if (!stream) {
+        stream = cudaStreamDefault;
+    }
+    switch (target.DType) {
+        case ETensorDType::BF16:
+            scale_rows(target.get<nv_bfloat16>(),
+                       target.get<nv_bfloat16>(),
+                       scales.get<nv_bfloat16>(),
+                       rows,
+                       cols,
+                       stream);
+            break;
+        case ETensorDType::FP16:
+            scale_rows(target.get<half>(), target.get<half>(), scales.get<half>(), rows, cols, stream);
+            break;
+        case ETensorDType::FP32:
+            scale_rows(target.get<float>(), target.get<float>(), scales.get<float>(), rows, cols, stream);
+            break;
+        default: break;
+    }
+    return true;
+}
+
+bool DslWeightLoader::load_unbatched_expert_fallback(const std::string& batched_hf_name,
+                                                      int expert_idx,
+                                                      Tensor& target,
+                                                      bool allow_cast,
+                                                      cudaStream_t stream) {
+    constexpr std::string_view gate_up_suffix = "experts.gate_up_proj";
+    constexpr std::string_view down_suffix = "experts.down_proj";
+    if (batched_hf_name.ends_with(gate_up_suffix)) {
+        if (target.Rank != 2 || target.Sizes[0] % 2 != 0) {
+            throw std::runtime_error("DslWeightLoader: invalid gate-up expert target for '" + batched_hf_name + "'");
+        }
+        const std::string prefix = batched_hf_name.substr(0, batched_hf_name.size() - gate_up_suffix.size()) +
+                                   "experts." + std::to_string(expert_idx) + ".";
+        const std::string gate_hf = prefix + "gate_proj.weight";
+        const std::string up_hf = prefix + "up_proj.weight";
+        if (!has_entry(gate_hf) || !has_entry(up_hf)) {
+            return false;
+        }
+
+        const long rows = target.Sizes[0] / 2;
+        const long cols = target.Sizes[1];
+        const std::size_t half_bytes = static_cast<std::size_t>(rows) * cols * get_dtype_size(target.DType);
+        Tensor gate = target;
+        gate.Sizes[0] = rows;
+        Tensor up = gate;
+        up.Data = static_cast<std::byte*>(target.Data) + half_bytes;
+        mReader.find_entry(gate_hf).read_tensor(gate, allow_cast);
+        apply_row_scale_if_present(gate_hf, gate, 0, stream);
+        mReader.find_entry(up_hf).read_tensor(up, allow_cast);
+        apply_row_scale_if_present(up_hf, up, 0, stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream ? stream : cudaStreamDefault));
+        return true;
+    }
+
+    if (batched_hf_name.ends_with(down_suffix)) {
+        const std::string source = batched_hf_name.substr(0, batched_hf_name.size() - down_suffix.size()) +
+                                   "experts." + std::to_string(expert_idx) + ".down_proj.weight";
+        if (!has_entry(source)) {
+            return false;
+        }
+        mReader.find_entry(source).read_tensor(target, allow_cast);
+        apply_row_scale_if_present(source, target, 0, stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream ? stream : cudaStreamDefault));
+        return true;
+    }
+    return false;
+}
+
 // ============================================================================
 // Direct Loading
 // ============================================================================
@@ -347,7 +476,8 @@ bool DslWeightLoader::load_direct(const MappingSpec& spec,
                                   int layer_idx,
                                   bool allow_cast,
                                   bool param_sharded,
-                                  const Tensor* global_template) {
+                                  const Tensor* global_template,
+                                  cudaStream_t stream) {
     const std::string hf_name = format_hf_name(spec.source.empty() ? name : spec.source, layer_idx);
 
     // Look up the HF tensor entry.
@@ -391,6 +521,7 @@ bool DslWeightLoader::load_direct(const MappingSpec& spec,
     }
     const auto& entry = *entry_ptr;
 
+    long scale_row_offset = 0;
     if (!param_sharded) {
         // Handle squeezable shape mismatch (e.g. HF Conv1d weight [D,1,K] → DSL [D,K]).
         // When the file has extra size-1 dimensions, element counts match and read_raw is safe.
@@ -420,10 +551,12 @@ bool DslWeightLoader::load_direct(const MappingSpec& spec,
         }
         const long global_rows = global_template->Sizes[0];
         auto [start, end] = shard_range(global_rows, true);
+        scale_row_offset = start;
         const long stride = row_stride(entry.shape());
         (void)end;
         entry.read_raw(target, static_cast<std::ptrdiff_t>(start) * stride, target.nelem(), allow_cast);
     }
+    apply_row_scale_if_present(hf_name, target, scale_row_offset, stream);
     return true;
 }
 
@@ -756,6 +889,7 @@ bool DslWeightLoader::load_stack_experts(const MappingSpec& spec,
             up_slice.Sizes[1] = C;
             up_slice.Data = static_cast<std::byte*>(target.Data) + base_offset;
             up_entry.read_tensor(up_slice, allow_cast);
+            apply_row_scale_if_present(up_hf, up_slice, 0, stream);
 
             // Load gate_proj into second D rows.
             std::string gate_hf = format_hf_name(gate_pattern, layer_idx, e);
@@ -769,6 +903,7 @@ bool DslWeightLoader::load_stack_experts(const MappingSpec& spec,
             gate_slice.Sizes[1] = C;
             gate_slice.Data = static_cast<std::byte*>(target.Data) + base_offset + sub_expert_elems * elem_size;
             gate_entry.read_tensor(gate_slice, allow_cast);
+            apply_row_scale_if_present(gate_hf, gate_slice, 0, stream);
         }
     } else {
         // Load single tensor per expert (e.g. down_proj).
@@ -789,6 +924,7 @@ bool DslWeightLoader::load_stack_experts(const MappingSpec& spec,
             slice.Data =
                 static_cast<std::byte*>(target.Data) + static_cast<std::size_t>(local_e) * expert_size * elem_size;
             entry.read_tensor(slice, allow_cast);
+            apply_row_scale_if_present(hf_name, slice, 0, stream);
         }
     }
 
