@@ -1,6 +1,6 @@
 # Mission: Fugu-Ultra
 
-Last updated: 2026-07-20 11:56 UTC.
+Last updated: 2026-07-20 11:58 UTC.
 
 ## Product Objective
 
@@ -113,6 +113,20 @@ The accepted checkpoint's current defects are:
   whole-task holdout, identity, and anti-forgetting gates.
 - Update this document after preregistration, every completed arm, every
   admission decision, every training gate, and every stop verdict.
+- Product velocity is a hard requirement. Implementation, useful trajectory
+  collection, and training must consume more effort than validation scaffolding.
+- Use the minimum validation proportional to the actual risk: by default, one
+  focused smoke and one run of the existing relevant suite. Do not add a new
+  test matrix merely to restate contracts already covered elsewhere.
+- Do not create duplicate frozen manifests, synthetic evidence frameworks, or
+  exhaustive immutability/hash bookkeeping unless it directly protects a
+  checkpoint promotion, benchmark claim, paid-result classification, or a
+  concrete defect observed in the current operation.
+- Do not build infrastructure speculatively. Add or generalize a component only
+  when it blocks the next collection, training, runtime, or promotion step.
+- Once the evidence needed for the current decision is sufficient, stop
+  validating and move forward. Extra confidence without a changed decision is
+  not useful progress.
 
 ## Current Evidence
 
@@ -187,6 +201,28 @@ Artifacts:
   (`1493bee69b635a93e4639d38b8ee4c000aaf43aa58562b3a2ad7397ac90492e4`).
 - Inventory report: `scratchpad/fugu_seed_stage1_v1/inventory_report.json`
   (`54bc252e28f8dbf110e05369a2f33cef355dd7d83df654925cf109bb907f96af`).
+
+The preregistered `release-activation-rollback` acquisition stopped invalid on
+its solo arm. The worker made two successful Yunwu calls, inspected the live
+task, wrote the controller and audit, and compiled the controller. Yunwu then
+rejected the third owner call with `Concurrency limit exceeded for account`.
+With retries disabled and the only registered position unavailable, the runtime
+failed closed. The resulting reward 0 is provider-invalid, not a task or
+conductor failure; it contributes no training trajectory and did not authorize
+the conditional auditor arm. The campaign will not be retried.
+
+Verdict: `CAUSAL_ANALOG_V3_STOPPED_PROVIDER_INVALID`. Three paid calls, zero
+provider retries, zero task retries, no accepted trajectory, no optimizer step,
+and no checkpoint change.
+
+Artifacts:
+
+- Frozen campaign: `scratchpad/fugu_causal_analog_v3/campaign_frozen.json`
+  (`deba2ca1540fcfc159412ae423c381e44fa7bfe5b40e018e16355fa4215cdc8b`).
+- Result ledger: `scratchpad/fugu_causal_analog_v3/results.jsonl`
+  (`411be3956fcfc9007564d760ae18a178d1e030685b7e7018d491e9a70d5e9aaa`).
+- Pair report: `scratchpad/fugu_causal_analog_v3/pair_report.json`
+  (`8b180bbb57942b20e63e14dbb759f09d4d4ce1706105a5f7ad13b47e5c690bea`).
 
 ### Skill-conditioned rescoring
 
