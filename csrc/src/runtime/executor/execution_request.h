@@ -6,6 +6,7 @@
 #ifndef SUROGATE_SRC_RUNTIME_EXECUTOR_EXECUTION_REQUEST_H
 #define SUROGATE_SRC_RUNTIME_EXECUTOR_EXECUTION_REQUEST_H
 
+#include <cstdint>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -80,6 +81,17 @@ struct ExecutionRequest {
     float* logprobs_gpu = nullptr;
     float* custom_dloss_gpu = nullptr;
     const float* inv_temperature_gpu = nullptr;
+
+    // Knowledge distillation: top-K teacher signal, active when
+    // kd_topk_ids_gpu != nullptr. Set on BOTH forward and backward requests
+    // so the lm-head compact-path gate agrees between the two passes.
+    const std::int32_t* kd_topk_ids_gpu = nullptr;       ///< [B*T, K] teacher top-K token ids
+    const float* kd_topk_logprobs_gpu = nullptr;         ///< [B*T, K] raw teacher logprobs (tau = 1)
+    float* kd_loss_accum_gpu = nullptr;                  ///< [1] KD loss metric accumulator
+    int kd_top_k = 0;
+    float kd_temperature = 1.0f;
+    float kd_weight = 0.0f;
+    float kd_ce_weight = 1.0f;
 
     [[nodiscard]] const RuntimeBinding* find_binding(const std::string& name) const {
         for (const auto& binding : bindings) {

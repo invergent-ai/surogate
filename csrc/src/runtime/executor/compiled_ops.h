@@ -132,6 +132,19 @@ public:
         mInvTemperatureGpu = request ? request->inv_temperature_gpu : nullptr;
         mCustomDLossGpu = request ? request->custom_dloss_gpu : nullptr;
         mSkippedBackwardTensors = request ? &request->skipped_backward_tensors : nullptr;
+        mKdTopkIdsGpu = request ? request->kd_topk_ids_gpu : nullptr;
+        mKdTopkLogprobsGpu = request ? request->kd_topk_logprobs_gpu : nullptr;
+        mKdLossAccumGpu = request ? request->kd_loss_accum_gpu : nullptr;
+        mKdTopK = request ? request->kd_top_k : 0;
+        mKdTemperature = request ? request->kd_temperature : 1.0f;
+        mKdWeight = request ? request->kd_weight : 0.0f;
+        mKdCeWeight = request ? request->kd_ce_weight : 1.0f;
+    }
+
+    /// True when a knowledge-distillation teacher signal is attached to the
+    /// current execution request.
+    bool kd_active() const {
+        return mKdTopkIdsGpu != nullptr;
     }
 
     /// Set document masking context for Flash Attention varlen dispatch.
@@ -755,6 +768,17 @@ private:
     // Custom per-token d_loss for GRPO backward (null = standard d_loss=1 seeding)
     float* mCustomDLossGpu = nullptr;
     const float* mInvTemperatureGpu = nullptr;
+
+    // Knowledge-distillation teacher context (null = KD inactive). Consumed by
+    // dispatch_fused_lm_head_loss_backward; also gates off the compact row path
+    // (KD + row compaction is unsupported).
+    const std::int32_t* mKdTopkIdsGpu = nullptr;   // [BT, K] teacher top-K ids
+    const float* mKdTopkLogprobsGpu = nullptr;     // [BT, K] raw teacher logprobs
+    float* mKdLossAccumGpu = nullptr;              // [1] KD loss accumulator
+    int mKdTopK = 0;
+    float mKdTemperature = 1.0f;
+    float mKdWeight = 0.0f;
+    float mKdCeWeight = 1.0f;
 
     // --- LM-head row-compaction state (shared across forward/backward) ---
     // Lazily allocated owned device buffers, shared between dispatch_fused_lm_head_loss_compact

@@ -32,6 +32,7 @@ By combining a native **C++/CUDA execution engine**, a low-overhead [Python DSL]
 Surogate is built for developers and enterprises that need fast experimentation scalability and predictable outcomes — whether running on-premise, in private clouds, or inside turnkey systems such as the [DenseMAX Appliance](https://www.invergent.ai/densemax-appliance).
 
 - **🔧 Pre-training + Fine-tuning**: full fine-tuning, LoRA/QLoRA
+- [**🎓 Knowledge Distillation**](./guides/distillation.md): offline top-K logit distillation — capture teacher logprobs once, then train the student with a fused CE + KL loss
 - [**🔧 BF16, FP8 and NVFP4 Reinforcement Learning**](./guides/rl-training.md): advanced GRPO training and evaluation with custom, deterministic environments
 - [**🔧 RL Environments**](./guides/rl-environments.md): predictable environments for RL training
 - [**🖥️...🖥️ Native multi-GPU**](./guides/multi-gpu.md) training with the multi-threaded backend

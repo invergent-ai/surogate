@@ -75,6 +75,15 @@ struct GrpoNativeMetrics {
     float total_tokens = 0.0f;
 };
 
+/// Configuration for the offline knowledge-distillation step.
+/// Total loss: ce_weight * CE + kd_weight * tau^2 * KL(teacher_topk || student).
+struct KdLossConfig {
+    int top_k = 32;
+    float temperature = 1.0f;
+    float kd_weight = 0.5f;
+    float ce_weight = 0.5f;
+};
+
 class EmptyTensorContainer final : public ITensorContainer {
 public:
     void iterate_tensors(const std::function<void(std::string, const TensorShard&)>&) override {
@@ -390,6 +399,30 @@ public:
                           const float* temperatures_cpu = nullptr,
                           const float* teacher_logprobs_cpu = nullptr);
     GrpoNativeMetrics consume_grpo_native_metrics();
+
+    /// Knowledge-distillation training step: standard SFT forward + backward
+    /// with a top-K teacher signal injected into the fused LM-head loss.
+    /// Unlike the GRPO steps this keeps standard loss semantics: CE losses and
+    /// ValidTokenCount accumulate across micro-steps, gradients are normalized
+    /// by 1/valid_token_count (mUseTokenScale), and get_loss() reports mean CE.
+    ///
+    /// kd_ids_cpu / kd_logprobs_cpu: CPU arrays of shape [B*T*top_k] holding
+    /// the teacher's top-K token ids / raw logprobs, row i aligned with
+    /// targets[i]. The KD loss metric accumulates on device; read it once per
+    /// optimizer step via consume_kd_loss_sum().
+    void step_with_kd(Tensor inputs,
+                      Tensor position_ids,
+                      Tensor targets,
+                      const std::int32_t* kd_ids_cpu,
+                      const float* kd_logprobs_cpu,
+                      int grad_accum_steps,
+                      int micro_step,
+                      NCCLCommunicator& comm,
+                      const KdLossConfig& kd_config);
+
+    /// Rank-local sum of the KD loss over all micro-steps since the last call
+    /// (synchronous D2H read; zeroes the accumulator).
+    float consume_kd_loss_sum();
 
     void init_weights(NCCLCommunicator& comm) override;
     void import_weights(const std::string& file_name, bool allow_cast, NCCLCommunicator& comm) override;

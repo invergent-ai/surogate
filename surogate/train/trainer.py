@@ -345,6 +345,13 @@ class SurogateTrainerWrapper:
         )
         self.chunk_size = config.per_device_train_batch_size * config.sequence_len * config.gpus
 
+        self._kd_enabled = config.distillation is not None
+        if self._kd_enabled and self._train_vision:
+            raise ValueError(
+                "distillation requires tokenized token shards with .kd sidecars; "
+                "on-the-fly vision training (train_vision) is not supported with KD."
+            )
+
         if self._train_vision:
             if config.sample_packing:
                 logger.warning("train_vision disables sample_packing; forcing sample_packing=False.")
@@ -382,10 +389,15 @@ class SurogateTrainerWrapper:
             )
             self.steps_per_epoch = self.mm_batcher.steps_per_epoch
         else:
+            if self._kd_enabled:
+                self._validate_kd_sidecars(train_files)
             self.train_loader = _surogate.DataLoader(train_files, self.chunk_size, seed=config.train_seed)
             self.eval_loader = (
                 _surogate.DataLoader(eval_files, self.chunk_size, seed=config.eval_seed) if eval_files else None
             )
+            if self._kd_enabled:
+                # Eval stays CE-only; only the train loader serves KD sidecars.
+                self.train_loader.enable_kd(config.distillation.top_k)
 
             # Calculate steps
             self.steps_per_epoch = self.train_loader.num_tokens // self.total_batch_size
@@ -580,6 +592,67 @@ class SurogateTrainerWrapper:
             final_lr=config.learning_rate * config.final_lr_fraction,
             schedule_type=config.lr_scheduler_type,
             wsd_decay_steps_fraction=config.wsd_decay_steps_fraction,
+        )
+
+    def _validate_kd_sidecars(self, train_files: list[str]) -> None:
+        """Validate every train shard's .kd sidecar before the native DataLoader opens them.
+
+        Cross-checks the tokenize hash embedded in each sidecar against
+        `{output_dir}/.tokenize_hash` so stale captures (re-tokenized shards)
+        fail with an actionable message instead of feeding misaligned teacher
+        rows to training.
+        """
+        from surogate.distill.sidecar import (
+            read_sidecar_header,
+            read_token_shard_header,
+            sidecar_path_for,
+            validate_sidecar,
+        )
+        from surogate.train.tokenize import read_tokenize_hash
+
+        expected_hash = read_tokenize_hash(self.config.output_dir)
+        if not expected_hash:
+            raise ValueError(
+                f"distillation is enabled but no {self.config.output_dir}/.tokenize_hash was found; "
+                "cannot verify that the .kd sidecars match the token shards. Re-run tokenization "
+                "and `surogate distill-capture`."
+            )
+        kd_dir = self.config.distillation.kd_dir
+        vocab_warned = False
+        for shard in train_files:
+            sidecar = sidecar_path_for(shard, kd_dir)
+            validate_sidecar(
+                sidecar,
+                shard,
+                expect_k=self.config.distillation.top_k,
+                expect_hash=expected_hash,
+            )
+            # The native DataLoader always opens `<shard>.kd`; bridge kd_dir
+            # captures with a symlink so both layers read the validated file.
+            default_path = shard + ".kd"
+            if os.path.abspath(sidecar) != os.path.abspath(default_path):
+                if os.path.islink(default_path) or not os.path.exists(default_path):
+                    if os.path.islink(default_path):
+                        os.unlink(default_path)
+                    os.symlink(os.path.abspath(sidecar), default_path)
+                else:
+                    raise ValueError(
+                        f"distillation.kd_dir points at {sidecar} but a different sidecar already "
+                        f"exists at {default_path}; remove one of them."
+                    )
+            if not vocab_warned:
+                kd_vocab = read_sidecar_header(sidecar).vocab_size
+                student_vocab = read_token_shard_header(shard).vocab_size
+                if kd_vocab > student_vocab:
+                    logger.warning(
+                        f"KD sidecars were captured with teacher vocab {kd_vocab} > student vocab "
+                        f"{student_vocab}; teacher entries outside the student vocab are "
+                        "renormalized away (missing-probability = zero)."
+                    )
+                vocab_warned = True
+        logger.info(
+            f"Validated {len(train_files)} KD sidecar(s) "
+            f"(top_k={self.config.distillation.top_k}, hash={expected_hash})."
         )
 
     def _detect_pos_planes(self) -> int:
@@ -1124,6 +1197,18 @@ class SurogateTrainerWrapper:
         # Pass those IDs through and let C++ expand planes as needed.
         pos_ids = np.empty((total_rows, self.config.sequence_len), dtype=np.int32)
 
+        # KD host staging buffers: one gpus*B chunk per micro-step (KD steps run
+        # eagerly, one micro-step at a time).
+        kd_ids = kd_logprobs = None
+        if self._kd_enabled:
+            kd_chunk_rows = self.config.gpus * self.config.per_device_train_batch_size
+            kd_ids = np.empty(
+                (kd_chunk_rows, self.config.sequence_len, self.config.distillation.top_k), dtype=np.int32
+            )
+            kd_logprobs = np.empty(
+                (kd_chunk_rows, self.config.sequence_len, self.config.distillation.top_k), dtype=np.float32
+            )
+
         # Dispatch-PP: partition the transformer blocks into contiguous stages over
         # the GPU pool (stage i -> GPU i % gpus). The fused training step dispatches
         # each stage round-robin, hands activations/grads GPU->host->GPU, optimizes
@@ -1284,7 +1369,29 @@ class SurogateTrainerWrapper:
             # Training step
             step_start = time.time()
 
-            if self._dispatch_pp:
+            if self._kd_enabled:
+                # KD micro-steps: load one gpus*B chunk plus its teacher top-k rows,
+                # run the forward/backward per micro-step; the optimizer update
+                # happens once below via update_with_config.
+                chunk = self.config.gpus * self.config.per_device_train_batch_size
+                for micro_step in range(self.config.gradient_accumulation_steps):
+                    if not self.train_loader.has_next():
+                        self.train_loader.advance_epoch()
+                    self.train_loader.load_batch(
+                        in_tokens[:chunk], out_tokens[:chunk], pos_ids[:chunk], kd_ids, kd_logprobs
+                    )
+                    self.trainer.step_with_kd(
+                        in_tokens[:chunk],
+                        out_tokens[:chunk],
+                        kd_ids,
+                        kd_logprobs,
+                        position_ids=pos_ids[:chunk],
+                        top_k=self.config.distillation.top_k,
+                        temperature=self.config.distillation.temperature,
+                        kd_weight=self.config.distillation.kd_weight,
+                        ce_weight=self.config.distillation.ce_weight,
+                    )
+            elif self._dispatch_pp:
                 # Fill all gpus*bsz*_dpp_chunks rows = M microbatches. The loader yields one
                 # gpus*bsz chunk per call, so load _dpp_chunks of them into the buffer.
                 chunk = self.config.gpus * self.config.per_device_train_batch_size
@@ -1331,7 +1438,13 @@ class SurogateTrainerWrapper:
                 normuon_lr=lr,  # Use same LR for NorMuon
                 normuon_cautious_wd=self.config.normuon_cautious_wd,
             )
-            if self._dispatch_pp:
+            kd_loss = None
+            if self._kd_enabled:
+                # Optional LoRA gradient debug (before optimizer update)
+                self._maybe_log_lora_grad_stats(step)
+                result = self.trainer.update_with_config(opt_config, step + 1)
+                kd_loss = self.trainer.get_kd_loss()
+            elif self._dispatch_pp:
                 # Stage-level dispatch: forward+backward across the GPU pool, collect grads
                 # to the master, optimize, broadcast. One fused call. Each small stage runs
                 # on GPU s%N with its weights held resident across all M microbatches
@@ -1402,6 +1515,7 @@ class SurogateTrainerWrapper:
                 phase=phase.value,
                 lr_overridden=self.lr_schedule.has_override,
                 moe=MoEMetrics.from_dict(self.trainer.get_moe_stats()),
+                kd_loss=kd_loss,
             )
             moe_monitor.step(metrics.moe, step)
             advisor.step(metrics, step)
@@ -1431,6 +1545,17 @@ class SurogateTrainerWrapper:
                         metrics.moe.load_cv,
                         metrics.moe.router_entropy,
                         metrics.moe.router_confidence,
+                    )
+                elif metrics.kd_loss is not None:
+                    train_logger.log_step_kd(
+                        metrics.step,
+                        metrics.epoch,
+                        metrics.tokens,
+                        metrics.elapsed_ms,
+                        metrics.grad_norm,
+                        metrics.loss,
+                        metrics.lr,
+                        metrics.kd_loss,
                     )
                 else:
                     train_logger.log_step(

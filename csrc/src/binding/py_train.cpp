@@ -2897,6 +2897,113 @@ void MultiGPUPyTrainer::step_grpo_native(const std::int32_t* inputs,
     ++mTrainMicroStep;
 }
 
+void MultiGPUPyTrainer::step_with_kd(const std::int32_t* inputs,
+                                     const std::int32_t* targets,
+                                     const std::int32_t* kd_ids,
+                                     const float* kd_logprobs,
+                                     const std::int32_t* position_ids,
+                                     int top_k,
+                                     float temperature,
+                                     float kd_weight,
+                                     float ce_weight) {
+    const int ep_size = std::max(1, mOptions.EPSize);
+    for (int i = 0; i < (int)mContexts.size(); ++i) {
+        auto& ctx = mContexts.at(i);
+        if (!ctx.Model) {
+            throw std::runtime_error(fmt::format("step_with_kd: ctx[{}].Model is null", i));
+        }
+        auto* ib = ctx.Model->get_input_buffer().get<std::int32_t>();
+        auto* tb = ctx.Model->get_target_buffer().get<std::int32_t>();
+        Tensor pos_buf = ctx.Model->get_position_ids_buffer();
+        auto* pb = pos_buf.get<std::int32_t>();
+        const int pos_planes = (pos_buf.Rank == 3) ? static_cast<int>(pos_buf.Sizes[0]) : 1;
+        const std::size_t bt = static_cast<std::size_t>(B) * static_cast<std::size_t>(T);
+        const int src_row = host_batch_row_for_local_rank(i, ep_size);
+
+        std::memcpy(ib, inputs + src_row * B * T, B * T * sizeof(std::int32_t));
+        std::memcpy(tb, targets + src_row * B * T, B * T * sizeof(std::int32_t));
+        if (position_ids) {
+            const auto* src = position_ids + static_cast<std::ptrdiff_t>(src_row) * static_cast<std::ptrdiff_t>(bt);
+            for (int p = 0; p < pos_planes; ++p) {
+                std::memcpy(pb + p * bt, src, bt * sizeof(std::int32_t));
+            }
+        } else {
+            fill_sequential_position_ids(pb, pos_planes, B, T);
+        }
+    }
+
+    if (mTrainMicroStep >= mGradAccumulation) {
+        throw std::runtime_error(
+            fmt::format("step_with_kd: micro_step {} >= grad_accumulation {}", mTrainMicroStep, mGradAccumulation));
+    }
+
+    const dsl::KdLossConfig kd_config{
+        .top_k = top_k,
+        .temperature = temperature,
+        .kd_weight = kd_weight,
+        .ce_weight = ce_weight,
+    };
+
+    run_work([micro_idx = mTrainMicroStep,
+              micro_batches = mGradAccumulation,
+              kd_ids,
+              kd_logprobs,
+              kd_config,
+              B = this->B,
+              T = this->T](sThreadContext& ctx) {
+        auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+        if (!dsl_model) {
+            throw std::runtime_error("step_with_kd: model is not a DslModel");
+        }
+
+        Tensor inputs_tensor = ctx.Model->get_input_buffer();
+        Tensor position_ids_tensor = ctx.Model->get_position_ids_buffer();
+        Tensor targets_tensor = ctx.Model->get_target_buffer();
+
+        const int gpu_rank = ctx.Communicator->local_rank();
+        const int gpu_ep_size = ctx.Communicator->ep_size();
+        const int src_row = host_batch_row_for_local_rank(gpu_rank, gpu_ep_size);
+        const std::ptrdiff_t kd_stride = static_cast<std::ptrdiff_t>(B) * static_cast<std::ptrdiff_t>(T) *
+                                         static_cast<std::ptrdiff_t>(kd_config.top_k);
+
+        dsl_model->step_with_kd(inputs_tensor,
+                                position_ids_tensor,
+                                targets_tensor,
+                                kd_ids + src_row * kd_stride,
+                                kd_logprobs + src_row * kd_stride,
+                                micro_batches,
+                                micro_idx,
+                                *ctx.Communicator,
+                                kd_config);
+    });
+
+    ++mTrainMicroStep;
+}
+
+float MultiGPUPyTrainer::get_kd_loss() {
+    float result = 0.0f;
+    run_work([&result](sThreadContext& ctx) {
+        auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+        if (!dsl_model) {
+            throw std::runtime_error("get_kd_loss: model is not a DslModel");
+        }
+        // Consume on every rank so accumulators reset; report rank 0 only.
+        const float kd_sum = dsl_model->consume_kd_loss_sum();
+        if (ctx.Communicator->local_rank() != 0) {
+            return;
+        }
+        auto& rs = dsl_model->get_run_state();
+        int valid_tokens = 0;
+        if (rs.ValidTokenCount.Data) {
+            CUDA_CHECK(cudaMemcpy(&valid_tokens, rs.ValidTokenCount.Data, sizeof(int), cudaMemcpyDeviceToHost));
+        }
+        const int world_size = std::max(1, ctx.Communicator->world_size());
+        const float avg_valid = valid_tokens > 0 ? static_cast<float>(valid_tokens) / world_size : 0.0f;
+        result = avg_valid > 0.0f ? kd_sum / avg_valid : 0.0f;
+    });
+    return result;
+}
+
 std::unordered_map<std::string, float> MultiGPUPyTrainer::get_grpo_native_metrics() {
     std::unordered_map<std::string, float> result;
     run_work([&result](sThreadContext& ctx) {

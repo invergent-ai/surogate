@@ -222,6 +222,7 @@ sequence_len: 2048
 ## Notes
 
 - For private Hugging Face models/datasets, pass `--hub_token`.
+- To distill a larger teacher model into the student during SFT, add a `distillation:` block and run `surogate distill-capture` before `surogate sft` — see the [Knowledge Distillation guide](../guides/distillation.md).
 
 ## See also
 

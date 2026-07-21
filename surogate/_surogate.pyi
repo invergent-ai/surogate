@@ -223,6 +223,7 @@ class DataLoader:
         """
         Return True if at least `chunks` more chunks are available in the current epoch.
         """
+    @typing.overload
     def load_batch(self, inputs: npt.NDArray[np.int32], targets: npt.NDArray[np.int32]) -> None:
         """
         Fill `inputs` and `targets` with the next batch.
@@ -230,6 +231,41 @@ class DataLoader:
         Parameters:
         - inputs: Preallocated int32 array [batch, seq_len].
         - targets: Preallocated int32 array [batch, seq_len].
+        """
+    @typing.overload
+    def load_batch(
+        self,
+        inputs: npt.NDArray[np.int32],
+        targets: npt.NDArray[np.int32],
+        position_ids: npt.NDArray[np.int32],
+    ) -> None:
+        """
+        Fill `inputs`, `targets`, and `position_ids` with the next batch.
+        """
+    @typing.overload
+    def load_batch(
+        self,
+        inputs: npt.NDArray[np.int32],
+        targets: npt.NDArray[np.int32],
+        position_ids: npt.NDArray[np.int32],
+        kd_ids: npt.NDArray[np.int32],
+        kd_logprobs: npt.NDArray[np.float32],
+    ) -> None:
+        """
+        Fill token buffers plus the KD teacher top-K arrays with the next batch.
+
+        Requires enable_kd(). kd_ids/kd_logprobs are preallocated
+        [batch, seq_len, top_k] arrays (int32 / float32).
+        """
+    def enable_kd(self, expected_k: int) -> None:
+        """
+        Enable knowledge-distillation sidecar loading. Validates a `<shard>.kd`
+        sidecar for every token file (matching token count and `expected_k`).
+        """
+    @property
+    def has_kd(self) -> bool:
+        """
+        True if KD sidecar loading is enabled.
         """
     def progress(self) -> float:
         """
@@ -1468,6 +1504,40 @@ class SurogateTrainer:
         Equivalent to step() but uses provided per-token gradients instead of d_loss=1.0.
         Call update_with_config() after grad_accum steps to apply gradients.
         """
+    def step_with_kd(
+        self,
+        input_ids: npt.NDArray[np.int32],
+        targets: npt.NDArray[np.int32],
+        kd_ids: npt.NDArray[np.int32],
+        kd_logprobs: npt.NDArray[np.float32],
+        position_ids: npt.NDArray[np.int32] | None = None,
+        top_k: int = 32,
+        temperature: float = 1.0,
+        kd_weight: float = 0.5,
+        ce_weight: float = 0.5,
+    ) -> None:
+        """
+        Run one knowledge-distillation training micro-step.
+
+        Standard SFT forward/backward with a top-K teacher signal injected into
+        the fused LM-head loss:
+        total = ce_weight*CE + kd_weight*tau^2*KL(teacher || student).
+
+        Parameters:
+        - input_ids:   int32 token IDs shaped [ngpu*B, T].
+        - targets:     int32 target IDs shaped [ngpu*B, T]; -100 for masked positions.
+        - kd_ids:      int32 teacher top-K token ids shaped [ngpu*B, T, top_k],
+                       row i aligned with targets[i].
+        - kd_logprobs: float32 raw teacher logprobs shaped [ngpu*B, T, top_k].
+        - position_ids: Optional int32 position IDs shaped [ngpu*B, T].
+        - top_k / temperature / kd_weight / ce_weight: distillation hyperparameters.
+
+        Call update_with_config() after grad_accum micro-steps, then get_kd_loss().
+        """
+    def get_kd_loss(self) -> float:
+        """
+        Mean KD loss per valid token accumulated since the last call (rank-0 local).
+        """
     def export_model(self, path: str) -> None:
         """
         Export model weights and config to a directory.
@@ -1760,6 +1830,20 @@ class TrainingRunLogger:
         - norm: Gradient norm.
         - loss: Training loss.
         - lr: Learning rate.
+        """
+    def log_step_kd(
+        self,
+        step: int,
+        epoch: float,
+        step_tokens: int,
+        duration_ms: int,
+        norm: float,
+        loss: float,
+        lr: float,
+        kd_loss: float,
+    ) -> None:
+        """
+        Log a knowledge-distillation training step (adds kd_loss to the step record).
         """
     def set_expected_time_per_token(self, trainer: SurogateTrainer) -> None:
         """

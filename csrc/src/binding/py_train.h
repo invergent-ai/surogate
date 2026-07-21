@@ -292,6 +292,24 @@ public:
                           float kl_tau);
     std::unordered_map<std::string, float> get_grpo_native_metrics();
 
+    // Knowledge-distillation training micro-step: standard SFT forward/backward
+    // with a top-K teacher signal. kd_ids/kd_logprobs are host arrays of shape
+    // [ngpu*B, T, top_k], sliced per GPU like inputs/targets.
+    void step_with_kd(const std::int32_t* inputs,
+                      const std::int32_t* targets,
+                      const std::int32_t* kd_ids,
+                      const float* kd_logprobs,
+                      const std::int32_t* position_ids,
+                      int top_k,
+                      float temperature,
+                      float kd_weight,
+                      float ce_weight);
+
+    // Mean KD loss per valid token accumulated since the last call (rank-0
+    // local, mirroring get_grpo_native_metrics). Consumes the accumulator on
+    // every rank.
+    float get_kd_loss();
+
 private:
     std::unique_ptr<PretrainedConfig> mConfig;  // unique_ptr to preserve polymorphism
     RuntimeOptions mOptions;

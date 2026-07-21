@@ -21,6 +21,7 @@ They differ in *which parameters are updated*, *how much data you need*, and *ho
 | Fast adaptation, smaller GPU, cheaper runs, easy iteration | **LoRA** |
 | Same as LoRA but you’re VRAM-limited | **QLoRA** |
 | Improve reasoning, math, coding via reward-based training | **GRPO** |
+| Compress a larger model into a smaller one from the same family | **SFT + [Knowledge Distillation](../guides/distillation.md)** |
 
 ---
 
@@ -159,5 +160,6 @@ surogate grpo --train train.yaml --infer infer.yaml --orch orch.yaml
 - [Configuration](../guides/configuration.md)
 - [Precision & recipes](../guides/precision-and-recipes.md)
 - [QLoRA](../guides/qlora.md)
+- [Knowledge Distillation](../guides/distillation.md)
 - [Config reference](../reference/config.md)
 - [Back to docs index](../index.mdx)
