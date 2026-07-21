@@ -575,8 +575,8 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
         }
     }
 
-    // Some ops persist internal saved tensors with op-scoped names that are not
-    // in forward.save (e.g., mamba_gated_rmsnorm saves "<op_id>.rstd"/".normed").
+    // Some ops use op-scoped persistent buffers that are not in forward.save
+    // (e.g., mamba_gated_rmsnorm's "<op_id>.out_fallback" output home).
     // Pre-allocate those buffers before capture to avoid cudaMalloc in dispatch.
     const CompiledGraph* graph = capture_graph ? capture_graph : mCurrentGraph;
     if (graph) {
@@ -593,20 +593,12 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
                 continue;
             }
 
+            // Only the forward-output fallback home is preallocated. The op no
+            // longer persists ".normed"/".rstd": the backward recomputes both
+            // from x/gate/weight, and preallocating one full-activation buffer
+            // per hybrid layer exhausted device memory at model build.
             const std::size_t normed_bytes = x_elems * static_cast<std::size_t>(get_dtype_size(x_ref.dtype));
             ensure_buffer(op.op_id + ".out_fallback", normed_bytes);
-            ensure_buffer(op.op_id + ".normed", normed_bytes);
-
-            const int groups = op.attrs.n_groups > 0 ? op.attrs.n_groups : 1;
-            long rows = x_ref.shape[0];
-            if (x_ref.shape.size() >= 3) {
-                rows *= x_ref.shape[1];
-            }
-            if (rows > 0 && groups > 0) {
-                const std::size_t rstd_bytes =
-                    static_cast<std::size_t>(rows) * static_cast<std::size_t>(groups) * sizeof(float);
-                ensure_buffer(op.op_id + ".rstd", rstd_bytes);
-            }
         }
     }
 }

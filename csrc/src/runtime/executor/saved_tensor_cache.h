@@ -25,6 +25,8 @@
 #include <functional>
 #include <stdexcept>
 #include <string>
+#include <algorithm>
+#include <cstdio>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -76,7 +78,11 @@ public:
             if (a.ptr != nullptr) bytes = pool_take_bytes_;
         }
         if (a.ptr == nullptr) {
-            CUDA_CHECK(cudaMalloc(&a.ptr, bytes));
+            const cudaError_t rc = cudaMalloc(&a.ptr, bytes);
+            if (rc != cudaSuccess) {
+                dump_oom_report(key, bytes, op_name);
+                CUDA_CHECK(rc);
+            }
             a.arena_backed = false;
         }
         mBuffers[key] = a.ptr;
@@ -135,6 +141,29 @@ public:
         mBumpOffset = 0;
     }
 
+    /// Recycle every plain entry whose key satisfies `pred` into the free-list and drop
+    /// the keys (no cudaFree; the next same-size acquire pops the buffer back). Returns
+    /// the recycled device pointers so the caller can null any tensor-table bindings.
+    /// Used at forward layer boundaries for op-scoped output homes whose lifetime ends
+    /// with the layer; without this they accumulate one persistent copy per op per layer.
+    template <typename Pred>
+    std::vector<void*> recycle_matching(Pred&& pred) {
+        std::vector<void*> recycled;
+        for (auto it = mBuffers.begin(); it != mBuffers.end();) {
+            const std::string& key = it->first;
+            if (it->second != nullptr && !is_arena_backed(key) && pred(key)) {
+                mPool.push_back({it->second, mSizes[key]});
+                recycled.push_back(it->second);
+                mSizes.erase(key);
+                mArenaBacked.erase(key);
+                it = mBuffers.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        return recycled;
+    }
+
     /// Free every plain (non-arena) buffer, the free-list, and clear all keys + bump. The
     /// single place these buffers are released -- always arena-aware. Safe in a destructor.
     void free_all() noexcept {
@@ -188,6 +217,29 @@ public:
     }
 
 private:
+    // One-shot allocator accounting on OOM: what was requested, what this cache
+    // holds (largest entries first), and the device's remaining memory.
+    void dump_oom_report(const std::string& key, std::size_t bytes, const char* op_name) const {
+        std::size_t free_b = 0, total_b = 0;
+        cudaMemGetInfo(&free_b, &total_b);
+        std::size_t pool_bytes = 0;
+        for (const auto& [ptr, sz] : mPool) pool_bytes += sz;
+        fprintf(stderr,
+                "[saved-cache OOM] op=%s key=%s request=%.1fMB entries=%d plain_total=%.1fMB "
+                "pool=%.1fMB gpu_free=%.1fMB gpu_total=%.1fMB\n",
+                op_name ? op_name : "?", key.c_str(), bytes / 1048576.0, count(),
+                total_plain_bytes() / 1048576.0, pool_bytes / 1048576.0,
+                free_b / 1048576.0, total_b / 1048576.0);
+        std::vector<std::pair<std::string, std::size_t>> entries(mSizes.begin(), mSizes.end());
+        std::sort(entries.begin(), entries.end(),
+                  [](const auto& x, const auto& y) { return x.second > y.second; });
+        for (std::size_t i = 0; i < entries.size() && i < 8; ++i) {
+            fprintf(stderr, "[saved-cache OOM]   %s = %.1fMB%s\n", entries[i].first.c_str(),
+                    entries[i].second / 1048576.0,
+                    is_arena_backed(entries[i].first) ? " (arena)" : "");
+        }
+    }
+
     // Pop a recycled buffer of at least `bytes` (best fit) from the free-list. Returns
     // nullptr if none; on success sets pool_take_bytes_ to the popped buffer's real size.
     void* take_from_pool(std::size_t bytes) {
