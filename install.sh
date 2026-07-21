@@ -57,6 +57,7 @@ if [ ! -d "$VENV_DIR" ]; then
         echo "Error: Failed to create virtual environment at $VENV_DIR"
         exit 1
     fi
+    uv pip install pip
 else
     echo "Using existing virtual environment: $VENV_DIR"
 fi
@@ -80,28 +81,28 @@ fi
 install_cu128_deps() {
     local version="$1"
     echo "Installing packages for CUDA 12.8..."
-    uv pip install "torch==2.11.0+cu128" "torchvision==0.26.0+cu128" "torchaudio==2.11.0+cu128" --index-url https://download.pytorch.org/whl/cu128
-    uv pip install pip "vllm==0.20.0"
+    pip install "torch==2.11.0+cu128" "torchvision==0.26.0+cu128" "torchaudio==2.11.0+cu128" --index-url https://download.pytorch.org/whl/cu128
+    pip install "vllm==0.25.1"
     install_surogate_wheel "$version" "cu128"
-    uv pip install "nvidia-cuda-runtime-cu12==12.8.90" "nvidia-nccl-cu12==2.29.3" "nvidia-cufile-cu12==1.14.1.1" "nvidia-cuda-nvrtc-cu12==12.8.93" "nvidia-cudnn-cu12==9.19.0.56"
+    pip install "nvidia-cuda-runtime-cu12==12.8.90" "nvidia-nccl-cu12==2.29.3" "nvidia-cufile-cu12==1.14.1.1" "nvidia-cuda-nvrtc-cu12==12.8.93" "nvidia-cudnn-cu12==9.19.0.56"
 }
 
 install_cu129_deps() {
     local version="$1"
     echo "Installing packages for CUDA 12.9..."
-    uv pip install "torch==2.11.0+cu129" "torchvision==0.26.0+cu129" "torchaudio==2.11.0+cu129" --index-url https://download.pytorch.org/whl/cu129
-    uv pip install pip "vllm==0.20.0"
+    pip install "torch==2.11.0+cu129" "torchvision==0.26.0+cu129" "torchaudio==2.11.0+cu129" --index-url https://download.pytorch.org/whl/cu129
+    pip install "vllm==0.25.1"
     install_surogate_wheel "$version" "cu129"
-    uv pip install "nvidia-cuda-runtime-cu12==12.9.79" "nvidia-nccl-cu12==2.29.3" "nvidia-cufile-cu12==1.14.1.1" "nvidia-cuda-nvrtc-cu12==12.9.86" "nvidia-cudnn-cu12==9.19.0.56"
+    pip install "nvidia-cuda-runtime-cu12==12.9.79" "nvidia-nccl-cu12==2.29.3" "nvidia-cufile-cu12==1.14.1.1" "nvidia-cuda-nvrtc-cu12==12.9.86" "nvidia-cudnn-cu12==9.19.0.56"
 }
 
 install_cu130_deps() {
     local version="$1"
     echo "Installing packages for CUDA 13+..."
-    uv pip install "torch==2.11.0+cu130" "torchvision==0.26.0+cu130" "torchaudio==2.11.0+cu130" --index-url https://download.pytorch.org/whl/cu130
-    uv pip install pip "vllm==0.20.0"
+    pip install "torch==2.11.0+cu130" "torchvision==0.26.0+cu130" "torchaudio==2.11.0+cu130" --index-url https://download.pytorch.org/whl/cu130
+    pip install "vllm==0.25.1"
     install_surogate_wheel "$version" "cu130"
-    uv pip install "nvidia-cuda-runtime==13.1.80" "nvidia-cudnn-cu13>=9.10.2.21" "nvidia-nccl-cu13==2.29.3" "nvidia-cufile==1.16.1.26" "nvidia-cuda-nvrtc==13.1.115"
+    pip install "nvidia-cuda-runtime==13.1.80" "nvidia-cudnn-cu13>=9.10.2.21" "nvidia-nccl-cu13==2.29.3" "nvidia-cufile==1.16.1.26" "nvidia-cuda-nvrtc==13.1.115"
 }
 
 # --- Helper: download and install the surogate wheel ---
