@@ -11,6 +11,7 @@ from pathlib import Path
 
 from surogate.grpo.config import NoiseSchedulerConfig
 from surogate.utils.logger import get_logger
+from surogate.utils.lora_compat import ensure_vllm_lora_compat
 
 logger = get_logger()
 
@@ -69,6 +70,7 @@ class SurogateWeightBroadcast:
 
         if self.adapter_only:
             trainer.export_adapter(str(save_dir))
+            ensure_vllm_lora_compat(save_dir, self.base_model_dir)
         else:
             trainer.export_model(str(save_dir))
 
@@ -188,6 +190,7 @@ class ColocateWeightBroadcast:
 
         # Export PEFT adapter files (adapter_config.json + safetensors)
         trainer.export_adapter(str(save_dir))
+        ensure_vllm_lora_compat(save_dir, self.base_model_dir)
 
         # QeRL: inject noise into exported adapter files
         self._maybe_inject_noise_on_disk(save_dir, step)

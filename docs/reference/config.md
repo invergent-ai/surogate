@@ -264,7 +264,7 @@ Each dataset in the `datasets` or `validation_datasets` list is configured with 
 | Option    | Type   | Default   | Description                                                                                                          |
 | --------- | ------ | --------- | -------------------------------------------------------------------------------------------------------------------- |
 | `path`    | string | required  | HuggingFace dataset repo, s3:// URL, gs:// URL, or path to local file or directory.                                  |
-| `type`    | string | required  | Dataset type. Options: `"text"`, `"instruction"`, `"conversation"`, `"auto"` (auto-detect format).                   |
+| `type`    | string | required  | Dataset type. Options: `"text"`, `"instruction"`, `"conversation"`, `"preference"` (DPO), `"auto"` (auto-detect format). |
 | `subset`  | string | `null`    | HuggingFace dataset subset/configuration name to load (e.g., `"default"` for datasets with multiple configurations). |
 | `split`   | string | `"train"` | Dataset split to load. Common values: `"train"`, `"test"`, `"validation"`.                                           |
 | `samples` | int    | `null`    | Limit the number of samples to use from this dataset. If not specified, uses all available samples.                  |
@@ -333,6 +333,63 @@ datasets:
 	messages_field: messages
 	split: train_sft
 ```
+
+#### Preference Dataset Options (`type: "preference"`)
+
+For offline DPO. Each JSONL row has `prompt` (a string or a chat `messages` list),
+`chosen`, and `rejected` (the two competing assistant continuations). Chat rows may
+also set `enable_thinking` to control the generation prefix. Loss is applied only
+on the response tokens. Used by the
+`surogate dpo` command together with the [DPO loss block](#dpo-settings).
+
+```json
+{"prompt": "...", "chosen": "preferred response", "rejected": "dispreferred response"}
+```
+
+**Example:**
+```yaml
+datasets:
+  - path: ./pairs.jsonl
+	type: preference
+```
+
+## DPO Settings
+
+Direct Preference Optimization (the `surogate dpo` command). Offline: a static set
+of `{prompt, chosen, rejected}` pairs (`type: preference`) with the frozen reference
+model evaluated inline — no reward model, no rollouts. See
+[Training Modes](../getting-started/training-modes.md) and
+[Quickstart: DPO](../getting-started/quickstart-dpo.md).
+
+Configured under a nested `loss:` block:
+
+| Option           | Type   | Default | Description                                                                                          |
+| ---------------- | ------ | ------- | ---------------------------------------------------------------------------------------------------- |
+| `type`           | string | `"dpo"` | Loss type. Must be `"dpo"`.                                                                          |
+| `dpo_beta`       | float  | `0.1`   | KL temperature β. The implicit reward is `β · (logπθ − logπref)`; higher β pushes harder from the reference. |
+| `length_norm`    | bool   | `false` | Divide each response's log-prob sum by its length (SimPO-style). Leave off for minimal/equal-length pairs. |
+| `span_mask`      | bool   | `false` | Score only the disjoint token spans that differ; rows without surviving edits on both sides are dropped. |
+| `reference_free` | bool   | `false` | Optimize the chosen/rejected likelihood gap directly and skip the frozen-reference forward. |
+| `target_margin`  | float  | `0.0`   | Non-negative beta-scaled target gap for reference-free training. Requires `reference_free: true`. |
+
+**Example:**
+```yaml
+loss:
+  type: dpo
+  dpo_beta: 0.1
+  length_norm: false
+  span_mask: false
+  reference_free: false
+  target_margin: 0.0
+datasets:
+  - path: ./pairs.jsonl
+	type: preference
+```
+
+DPO inherits all LoRA, recipe, optimizer, checkpoint-resume, retention, and
+training-loop settings from the SFT config. `gradient_dtype` and the LoRA dtype
+default to FP32; the frozen base does not require an FP32 master copy. CUDA graphs
+are disabled because the native DPO step is not graph-captured.
 
 ## Memory Optimization Settings
 

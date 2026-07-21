@@ -90,6 +90,8 @@ struct GrpoNativeScratch {
     Tensor loss_mask;           ///< Device BYTE [B*T], 0/1
     Tensor sample_starts;       ///< Device INT32 [max_samples]
     Tensor sample_ends;         ///< Device INT32 [max_samples]
+    Tensor pair_chosen;         ///< Device INT32 [max_samples], DPO: chosen sample index per pair
+    Tensor pair_rejected;       ///< Device INT32 [max_samples], DPO: rejected sample index per pair
     Tensor custom_dloss;        ///< Device FP32 [B*T], shifted for LM-head backward
     Tensor inv_temperature;     ///< Device FP32 [B*T]
     Tensor metrics;             ///< Device FP32 metric accumulators
@@ -101,6 +103,8 @@ struct GrpoNativeScratch {
     std::array<Tensor, kHostStagingSlots> host_loss_mask;           ///< Pinned BYTE [B*T]
     std::array<Tensor, kHostStagingSlots> host_sample_starts;       ///< Pinned INT32 [max_samples]
     std::array<Tensor, kHostStagingSlots> host_sample_ends;         ///< Pinned INT32 [max_samples]
+    std::array<Tensor, kHostStagingSlots> host_pair_chosen;         ///< Pinned INT32 [max_samples] (DPO)
+    std::array<Tensor, kHostStagingSlots> host_pair_rejected;       ///< Pinned INT32 [max_samples] (DPO)
     Tensor host_metrics;                                            ///< Pinned FP32 metric accumulators
     std::array<cudaEvent_t, kHostStagingSlots> host_copy_done{};
     std::array<bool, kHostStagingSlots> host_copy_recorded{};

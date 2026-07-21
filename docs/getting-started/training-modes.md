@@ -1,11 +1,12 @@
 # Training Modes
 
-Surogate supports four practical ways to adapt a model:
+Surogate supports five practical ways to adapt a model:
 
 1) **Pretraining / Continued Pretraining (PT)**
 2) **Full Fine-Tuning**
 3) **LoRA / QLoRA (Adapter Fine-Tuning)**
 4) **RL Fine-Tuning (GRPO)**
+5) **Preference Fine-Tuning (DPO)**
 
 They differ in *which parameters are updated*, *how much data you need*, and *how much compute/VRAM you’ll spend*.
 
@@ -22,6 +23,7 @@ They differ in *which parameters are updated*, *how much data you need*, and *ho
 | Same as LoRA but you’re VRAM-limited | **QLoRA** |
 | Improve reasoning, math, coding via reward-based training | **GRPO** |
 | Compress a larger model into a smaller one from the same family | **SFT + [Knowledge Distillation](../guides/distillation.md)** |
+| Steer behavior from chosen-vs-rejected preference pairs (offline) | **DPO** |
 
 ---
 
@@ -142,6 +144,50 @@ surogate grpo --train train.yaml --infer infer.yaml --orch orch.yaml
 
 ---
 
+## 5) Preference Fine-Tuning (DPO)
+
+### How it works
+**DPO** (Direct Preference Optimization) teaches a model to prefer a *chosen* response over a *rejected* one for the same prompt, directly — no reward model and no rollouts. It is **offline**: you supply a static dataset of `{prompt, chosen, rejected}` triples, and the loss raises the implicit reward of `chosen` relative to `rejected`:
+
+```
+margin = β · [ (logπθ − logπref)(chosen) − (logπθ − logπref)(rejected) ]
+loss   = −log σ(margin)
+```
+
+- **What updates?** LoRA adapter parameters (base model is frozen)
+- **Reference model:** the frozen start checkpoint, evaluated inline with LoRA disabled
+- **Typical data:** `type: preference` datasets (`{prompt, chosen, rejected}`)
+- **Typical run shape:** a few hundred gradient steps over preference pairs
+
+In Surogate, DPO runs from a single config:
+
+```bash
+surogate dpo path/to/config.yaml
+```
+
+```yaml
+loss:
+  type: dpo
+  dpo_beta: 0.1
+  length_norm: false   # enable when chosen/rejected lengths differ a lot
+  span_mask: false     # optionally score only differing token spans
+datasets:
+  - path: pairs.jsonl
+    type: preference
+```
+
+### When to use it
+- You have **paired preferences** (chosen vs rejected), not a reward function or pure demonstrations.
+- You want to fix a specific behavior with **minimal, targeted contrasts** (e.g. correct vs incorrect word forms) without the cost/instability of RL.
+- You want something simpler than GRPO: no inference server, no orchestrator.
+
+### Tradeoffs
+- Needs preference pairs; quality depends heavily on pair construction.
+- `dpo_beta` controls how hard the policy is pushed from the reference — too high overfits, too low barely moves.
+- Offline only (pairs are fixed; no on-policy regeneration).
+
+---
+
 ## Practical recommendations
 
 - Start with **LoRA (bf16 recipe)** unless you have a strong reason not to.
@@ -149,6 +195,7 @@ surogate grpo --train train.yaml --infer infer.yaml --orch orch.yaml
 - Use **Full fine-tuning** when you want maximum quality and have budget.
 - Use **(Continued) pretraining** for domain adaptation on large raw text.
 - Use **GRPO** when you have a reward signal and want to go beyond imitation learning.
+- Use **DPO** when you have chosen-vs-rejected preference pairs and want offline preference steering without a reward model.
 
 ---
 
@@ -157,6 +204,7 @@ surogate grpo --train train.yaml --infer infer.yaml --orch orch.yaml
 - [Quickstart: Pretraining](quickstart-pretraining.md)
 - [Quickstart: Supervised Fine-Tuning](quickstart-sft.md)
 - [Quickstart: GRPO](quickstart-grpo.md)
+- [Quickstart: DPO](quickstart-dpo.md)
 - [Configuration](../guides/configuration.md)
 - [Precision & recipes](../guides/precision-and-recipes.md)
 - [QLoRA](../guides/qlora.md)

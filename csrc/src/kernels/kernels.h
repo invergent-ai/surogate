@@ -1506,15 +1506,15 @@ constexpr int CROSS_ENTROPY_BACKWARD_CHUNK_SIZE = 4096;
 /// per row (pass the tau=1 logsumexp when tau == 1). `kd_loss_accum` (may be
 /// null) accumulates tau^2 * KL(q || p_tau) over valid tokens via atomicAdd.
 struct KdBackwardArgs {
-    const int* ids = nullptr;       ///< [BT, K] teacher top-K token ids
-    const float* q = nullptr;       ///< [BT, K] renormalized teacher probs at tau
-    const float* lse_tau = nullptr; ///< [BT] logsumexp of logits/tau
-    float inv_tau = 1.0f;           ///< 1/tau
-    float ce_w = 1.0f;              ///< weight of the CE gradient term
-    float kd_scale = 0.0f;          ///< kd_weight * tau (gradient scale of the KD term)
-    float tau_sq = 1.0f;            ///< tau^2 (KD loss metric scale)
-    float* kd_loss_accum = nullptr; ///< [1] scalar accumulator for the KD loss metric
-    int K = 0;                      ///< top-K entries per token
+    const int* ids = nullptr;        ///< [BT, K] teacher top-K token ids
+    const float* q = nullptr;        ///< [BT, K] renormalized teacher probs at tau
+    const float* lse_tau = nullptr;  ///< [BT] logsumexp of logits/tau
+    float inv_tau = 1.0f;            ///< 1/tau
+    float ce_w = 1.0f;               ///< weight of the CE gradient term
+    float kd_scale = 0.0f;           ///< kd_weight * tau (gradient scale of the KD term)
+    float tau_sq = 1.0f;             ///< tau^2 (KD loss metric scale)
+    float* kd_loss_accum = nullptr;  ///< [1] scalar accumulator for the KD loss metric
+    int K = 0;                       ///< top-K entries per token
 };
 
 /// Renormalize per-token teacher top-K logprobs into a probability
@@ -1782,6 +1782,29 @@ void compute_grpo_custom_dloss(float* custom_dloss,
                                float teacher_tau,
                                float kl_tau,
                                cudaStream_t stream);
+
+// DPO (Direct Preference Optimization) preference loss. One logical pair is
+// (chosen sample, rejected sample), identified by pair_chosen[p]/pair_rejected[p]
+// indexing into sample_starts/sample_ends. The per-token custom_dloss is written
+// in the same shifted layout as compute_grpo_custom_dloss: the gradient seed for
+// logical token (out_idx + 1) is stored at custom_dloss[out_idx], read back as
+// trainer_logprob = -losses[out_idx]. metrics is [4]: {loss_sum, correct_sum,
+// margin_sum, pair_count}, accumulated across pairs (the caller averages).
+void compute_dpo_custom_dloss(float* custom_dloss,
+                              float* metrics,
+                              const float* losses,
+                              const float* ref_logprobs,
+                              const std::uint8_t* loss_mask,
+                              const std::int32_t* sample_starts,
+                              const std::int32_t* sample_ends,
+                              const std::int32_t* pair_chosen,
+                              const std::int32_t* pair_rejected,
+                              int pair_count,
+                              int BT,
+                              float loss_scale,
+                              float beta,
+                              int length_norm,
+                              cudaStream_t stream);
 
 /// Scale logits rows by per-token inverse temperature (in-place).
 /// logits is [BT, P], inv_temperature is [BT].

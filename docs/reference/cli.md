@@ -24,6 +24,18 @@ Options:
 
 - `--hub_token <token>`: optional, Hugging Face token for private model access
 
+### `dpo`
+
+Offline Direct Preference Optimization on `{prompt, chosen, rejected}` pairs.
+
+```bash
+surogate dpo path/to/config.yaml
+```
+
+Options:
+
+- `--hub_token <token>`: optional, Hugging Face token for private model access
+
 ### `pt`
 
 Pretraining.

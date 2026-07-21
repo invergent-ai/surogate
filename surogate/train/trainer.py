@@ -25,6 +25,7 @@ from surogate.train.vision import OnTheFlyMultimodalBatcher, init_mm_helpers, lo
 from surogate.utils.adapter_merge import merge_adapter
 from surogate.utils.hf import get_model_weights_path
 from surogate.utils.logger import get_logger
+from surogate.utils.lora_compat import ensure_surogate_lora_compat, ensure_vllm_lora_compat
 from surogate.utils.model import estimate_model_parameters
 from surogate.utils.tensor import to_surogate_dtype
 
@@ -494,6 +495,11 @@ class SurogateTrainerWrapper:
                     self.trainer.set_adapter_path(config.adapter_path)
                 self.trainer.import_weights(base_weights_path)
                 logger.info(f"Loading checkpoint from step {self.start_step}...")
+                if config.lora:
+                    ensure_surogate_lora_compat(
+                        Path(config.checkpoint_dir) / f"step_{self.start_step:08d}",
+                        config.model_dir,
+                    )
                 self.trainer.load_checkpoint(str(config.checkpoint_dir), self.start_step)
             else:
                 logger.warning("No checkpoint found to resume from. Starting training from beginning.")
@@ -814,6 +820,7 @@ class SurogateTrainerWrapper:
                 logger.info(f"Saving LoRA adapter to {adapter_dir}...")
                 adapter_dir.mkdir(parents=True, exist_ok=True)
                 self.trainer.export_adapter(str(adapter_dir))
+                ensure_vllm_lora_compat(adapter_dir, self.config.model_dir)
                 logger.info("done")
                 logger.info(f"LoRA adapter saved to {adapter_dir}")
 
@@ -1202,9 +1209,7 @@ class SurogateTrainerWrapper:
         kd_ids = kd_logprobs = None
         if self._kd_enabled:
             kd_chunk_rows = self.config.gpus * self.config.per_device_train_batch_size
-            kd_ids = np.empty(
-                (kd_chunk_rows, self.config.sequence_len, self.config.distillation.top_k), dtype=np.int32
-            )
+            kd_ids = np.empty((kd_chunk_rows, self.config.sequence_len, self.config.distillation.top_k), dtype=np.int32)
             kd_logprobs = np.empty(
                 (kd_chunk_rows, self.config.sequence_len, self.config.distillation.top_k), dtype=np.float32
             )
@@ -1455,8 +1460,7 @@ class SurogateTrainerWrapper:
                 M = self.config.gpus * self._dpp_chunks if self.config.lora else 1
                 rows = M * bsz
                 loss = self.trainer.dispatch_pp_train_step_multigpu(
-                    in_tokens[:rows], out_tokens[:rows], self._dpp_los, self._dpp_his,
-                    opt_config, step, False, M
+                    in_tokens[:rows], out_tokens[:rows], self._dpp_los, self._dpp_his, opt_config, step, False, M
                 )
                 result = {"loss": float(loss), "norm": float(self.trainer.dispatch_pp_last_grad_norm())}
             elif use_full_step_graphs:

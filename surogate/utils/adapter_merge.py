@@ -46,6 +46,30 @@ def _strip_adapter_key(key: str) -> str:
     return key
 
 
+def _select_prefix_probe(expected_st_key: str, safetensor_keys: list[str]) -> str | None:
+    """Resolve one adapter key without confusing the language model with MTP."""
+    if expected_st_key in safetensor_keys:
+        return expected_st_key
+
+    suffix = expected_st_key.split(".", 1)[1] if "." in expected_st_key else expected_st_key
+    matches = [key for key in safetensor_keys if key.endswith(suffix)]
+    if not matches:
+        return None
+
+    if expected_st_key.startswith("model.layers."):
+        language_model = [key for key in matches if key.startswith("model.language_model.layers.")]
+        if len(language_model) == 1:
+            return language_model[0]
+    if expected_st_key.startswith("mtp.layers."):
+        mtp = [key for key in matches if key.startswith("mtp.layers.")]
+        if len(mtp) == 1:
+            return mtp[0]
+
+    if len(matches) == 1:
+        return matches[0]
+    raise ValueError(f"ambiguous LoRA target for {expected_st_key}: {matches}")
+
+
 def _build_lora_lookup(
     adapter_weights: dict[str, torch.Tensor],
     safetensor_keys: list[str],
@@ -81,15 +105,13 @@ def _build_lora_lookup(
     prefix_remap = ("", "")  # (from_prefix, to_prefix)
 
     if expected_st_key not in safetensor_key_set:
-        # Find the matching safetensor key by suffix
-        suffix = expected_st_key.split(".", 1)[1] if "." in expected_st_key else expected_st_key
-        for st_key in safetensor_keys:
-            if st_key.endswith(suffix):
-                actual_prefix = st_key[: len(st_key) - len(suffix)]
-                expected_prefix = expected_st_key[: len(expected_st_key) - len(suffix)]
-                if actual_prefix != expected_prefix:
-                    prefix_remap = (expected_prefix, actual_prefix)
-                break
+        matched_key = _select_prefix_probe(expected_st_key, safetensor_keys)
+        if matched_key is not None:
+            suffix = expected_st_key.split(".", 1)[1] if "." in expected_st_key else expected_st_key
+            actual_prefix = matched_key[: len(matched_key) - len(suffix)]
+            expected_prefix = expected_st_key[: len(expected_st_key) - len(suffix)]
+            if actual_prefix != expected_prefix:
+                prefix_remap = (expected_prefix, actual_prefix)
 
     # Step 3: build final lookup keyed by safetensor key (with .weight suffix)
     from_pfx, to_pfx = prefix_remap
@@ -204,8 +226,6 @@ def merge_adapter(
 
     # Process each safetensor shard: copy then merge LoRA in-place
     merged_count = 0
-    router_count = 0
-
     for st_file in st_files:
         shard_name = os.path.basename(st_file)
         output_shard = os.path.join(output_path, shard_name)
