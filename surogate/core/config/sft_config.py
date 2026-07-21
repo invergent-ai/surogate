@@ -43,6 +43,51 @@ class DistributedConfig:
 
 
 @dataclass
+class DistillationConfig:
+    """
+    Configuration for offline top-K knowledge distillation.
+
+    Training consumes `.kd` sidecar files produced by `surogate distill-capture`
+    (teacher top-K next-token logprobs aligned with the token shards). The
+    per-token loss is `ce_weight * CE + kd_weight * tau^2 * KL(teacher || student)`
+    with teacher top-K probabilities renormalized at `temperature`.
+
+    Args:
+        teacher_model: Teacher model id or path (capture-time only). With
+            teacher_api_base set, this is the served model name.
+        top_k: Number of teacher logprobs stored per token (1..1024).
+        temperature: Distillation temperature tau (> 0).
+        kd_weight: Weight of the KD (KL) term.
+        ce_weight: Weight of the CE term. Defaults to 1 - kd_weight.
+        teacher_batch_size: Windows per teacher forward during capture (capture-time only).
+        kd_dir: Sidecar output directory override (capture-time only).
+            Default: alongside the token shards, which is where training reads them.
+        teacher_api_base: OpenAI-compatible base URL of a served teacher
+            (e.g. "http://localhost:8000/v1"); when set, capture queries the API
+            instead of loading teacher_model locally. Must be a vLLM-compatible
+            server (prompt_logprobs support); OpenAI-compatible aggregators such
+            as OpenRouter cannot be used. Capture-time only.
+        teacher_api_key_var: Env var holding the API key; empty/unset resolves
+            to "EMPTY" like local vLLM servers accept. Capture-time only.
+        teacher_api_concurrency: Concurrent in-flight capture requests (>= 1).
+            Capture-time only.
+        teacher_api_timeout: Per-request timeout in seconds (>= 1). Capture-time only.
+    """
+
+    teacher_model: str | None = None  # capture-time only
+    top_k: int = 32
+    temperature: float = 1.0
+    kd_weight: float = 0.5
+    ce_weight: float | None = None  # default: 1 - kd_weight
+    teacher_batch_size: int = 4  # capture-time only
+    kd_dir: str | None = None  # sidecar dir override; default: alongside token shards
+    teacher_api_base: str | None = None  # capture-time only
+    teacher_api_key_var: str | None = "VLLM_API_KEY"  # capture-time only
+    teacher_api_concurrency: int = 8  # capture-time only
+    teacher_api_timeout: int = 1200  # capture-time only, seconds
+
+
+@dataclass
 class SFTConfig(ModelConfig, TrainDatasetConfig):
     """
     SFTConfig class is a dataclass that holds configuration parameters for Supervised Fine-Tuning (SFT)
@@ -412,6 +457,9 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
     # Multi-node distributed training config (optional)
     distributed: DistributedConfig | None = None
 
+    # Offline knowledge distillation config (optional)
+    distillation: DistillationConfig | None = None
+
     def __init__(self, cfg: DictDefault):
         super().__init__(cfg)
 
@@ -569,6 +617,29 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         else:
             self.distributed = None
 
+        # Parse distillation config
+        distillation_cfg = cfg.get("distillation", None)
+        if distillation_cfg:
+            if isinstance(distillation_cfg, dict):
+                ce_weight = distillation_cfg.get("ce_weight", None)
+                self.distillation = DistillationConfig(
+                    teacher_model=distillation_cfg.get("teacher_model", None),
+                    top_k=int(distillation_cfg.get("top_k", 32)),
+                    temperature=float(distillation_cfg.get("temperature", 1.0)),
+                    kd_weight=float(distillation_cfg.get("kd_weight", 0.5)),
+                    ce_weight=float(ce_weight) if ce_weight is not None else None,
+                    teacher_batch_size=int(distillation_cfg.get("teacher_batch_size", 4)),
+                    kd_dir=distillation_cfg.get("kd_dir", None),
+                    teacher_api_base=distillation_cfg.get("teacher_api_base", None),
+                    teacher_api_key_var=distillation_cfg.get("teacher_api_key_var", "VLLM_API_KEY"),
+                    teacher_api_concurrency=int(distillation_cfg.get("teacher_api_concurrency", 8)),
+                    teacher_api_timeout=int(distillation_cfg.get("teacher_api_timeout", 1200)),
+                )
+            elif isinstance(distillation_cfg, DistillationConfig):
+                self.distillation = distillation_cfg
+        else:
+            self.distillation = None
+
     def __post_init__(self):
         logger = get_logger()
 
@@ -659,6 +730,10 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
             if not shard_gradients:
                 raise ValueError("offload_grads requires cpu_training=true, shard_gradients=true, or zero_level >= 2.")
 
+        # Validate distillation before create_runtime_config so the forced
+        # lmhead_drop_ignored_rows=False lands in RuntimeOptions.
+        self._validate_distillation_config()
+
         # Validate dispatch-PP before EP so its explicit ep_size>1 rejection wins
         # over the generic "EP requires MoE" check.
         self._validate_dispatch_pp_config()
@@ -703,6 +778,50 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
                 f"per_device_train_batch_size * sequence_len ({batch_size} * {seq_len} = {total_tokens}). "
                 f"Either adjust batch size or sequence length, or reduce lmhead_chunks."
             )
+
+    def _validate_distillation_config(self):
+        """Validate the distillation block and resolve derived defaults."""
+        d = self.distillation
+        if d is None:
+            return
+
+        if not 1 <= d.top_k <= 1024:
+            raise ValueError(f"distillation.top_k must be in [1, 1024], got {d.top_k}.")
+        if d.temperature <= 0:
+            raise ValueError(f"distillation.temperature must be > 0, got {d.temperature}.")
+        if d.kd_weight < 0:
+            raise ValueError(f"distillation.kd_weight must be >= 0, got {d.kd_weight}.")
+        if d.ce_weight is None:
+            d.ce_weight = 1.0 - d.kd_weight
+            if d.ce_weight < 0:
+                raise ValueError(
+                    f"distillation.ce_weight defaults to 1 - kd_weight = {d.ce_weight}, which is "
+                    "negative. Set distillation.ce_weight explicitly when kd_weight > 1."
+                )
+        if d.ce_weight < 0:
+            raise ValueError(f"distillation.ce_weight must be >= 0, got {d.ce_weight}.")
+        if d.teacher_batch_size < 1:
+            raise ValueError(f"distillation.teacher_batch_size must be >= 1, got {d.teacher_batch_size}.")
+        if d.teacher_api_concurrency < 1:
+            raise ValueError(
+                f"distillation.teacher_api_concurrency must be >= 1, got {d.teacher_api_concurrency}."
+            )
+        if d.teacher_api_timeout < 1:
+            raise ValueError(f"distillation.teacher_api_timeout must be >= 1, got {d.teacher_api_timeout}.")
+
+        if self.distributed:
+            raise ValueError(
+                "distillation does not support multi-node distributed training in v1; "
+                "remove the `distributed:` block or the `distillation:` block."
+            )
+        if self.parallelism == "dispatch_pp":
+            raise ValueError("distillation is not supported with parallelism=dispatch_pp in v1.")
+        if self.lmhead_drop_ignored_rows:
+            logger.warning(
+                "[distillation]: forcing lmhead_drop_ignored_rows=False (the compact LM-head "
+                "row path does not support KD in v1)."
+            )
+            self.lmhead_drop_ignored_rows = False
 
     def _validate_dispatch_pp_config(self):
         """Normalize and validate parallelism=dispatch_pp (opt-in model-parallel mode).
@@ -932,6 +1051,10 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
                 "[lmhead_drop_ignored_rows]: disabling CUDA graphs (n_valid varies per step, "
                 "so the captured matmul dimensions can't be replayed)."
             )
+
+        if self.distillation is not None and self.use_cuda_graphs:
+            self.use_cuda_graphs = False
+            logger.info("[distillation]: disabling CUDA graphs (KD micro-steps run eagerly in v1).")
 
         self.runtime_config = _surogate.RuntimeOptions(
             recompute="true" if self.recompute else "false",

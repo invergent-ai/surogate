@@ -1020,6 +1020,141 @@ GrpoNativeMetrics DslModel::consume_grpo_native_metrics() {
     return metrics;
 }
 
+void DslModel::step_with_kd(Tensor inputs,
+                            Tensor position_ids,
+                            Tensor targets,
+                            const std::int32_t* kd_ids_cpu,
+                            const float* kd_logprobs_cpu,
+                            int grad_accum_steps,
+                            int micro_step,
+                            NCCLCommunicator& comm,
+                            const KdLossConfig& kd_config) {
+    if (!mExecutor) {
+        throw std::logic_error("DslModel::step_with_kd called before allocate_run_state()");
+    }
+    if (!kd_ids_cpu || !kd_logprobs_cpu) {
+        throw std::invalid_argument("step_with_kd requires teacher top-K ids and logprobs");
+    }
+    if (kd_config.top_k <= 0 || kd_config.top_k > 1024) {
+        throw std::invalid_argument("step_with_kd: top_k must be in [1, 1024]");
+    }
+    if (!(kd_config.temperature > 0.0f) || !std::isfinite(kd_config.temperature)) {
+        throw std::invalid_argument("step_with_kd: temperature must be finite and positive");
+    }
+    if (kd_config.kd_weight < 0.0f || kd_config.ce_weight < 0.0f) {
+        throw std::invalid_argument("step_with_kd: loss weights must be non-negative");
+    }
+
+    auto& rs = *mRunState;
+    cudaStream_t main_stream = rs.MainStream;
+    const int B_val = static_cast<int>(inputs.Sizes[0]);
+    const int T_val = static_cast<int>(inputs.Sizes[1]);
+    const std::size_t bt = static_cast<std::size_t>(B_val) * static_cast<std::size_t>(T_val);
+
+    rs.set_kd_config(kd_config.top_k, static_cast<long>(bt));
+    auto& kd = rs.kd_scratch();
+    const std::size_t count = bt * static_cast<std::size_t>(kd_config.top_k);
+
+    // Standard SFT loss semantics: CE loss / ValidTokenCount accumulate over
+    // micro-steps and grads get 1/valid_token_count via global_norm_sqrt.
+    mUseTokenScale = true;
+
+    if (micro_step == 0) {
+        CUDA_CHECK(cudaMemsetAsync(kd.loss_accum, 0, sizeof(float), main_stream));
+    }
+
+    const int staging_slot = kd.next_slot;
+    kd.next_slot = (kd.next_slot + 1) % DslRunState::KdNativeScratch::kStagingSlots;
+    if (kd.copy_recorded[staging_slot]) {
+        CUDA_CHECK(cudaEventSynchronize(kd.copy_done[staging_slot]));
+    }
+    std::memcpy(kd.host_ids[staging_slot], kd_ids_cpu, count * sizeof(std::int32_t));
+    std::memcpy(kd.host_logprobs[staging_slot], kd_logprobs_cpu, count * sizeof(float));
+    CUDA_CHECK(cudaMemcpyAsync(kd.topk_ids,
+                               kd.host_ids[staging_slot],
+                               count * sizeof(std::int32_t),
+                               cudaMemcpyHostToDevice,
+                               main_stream));
+    CUDA_CHECK(cudaMemcpyAsync(kd.topk_logprobs,
+                               kd.host_logprobs[staging_slot],
+                               count * sizeof(float),
+                               cudaMemcpyHostToDevice,
+                               main_stream));
+    CUDA_CHECK(cudaEventRecord(kd.copy_done[staging_slot], main_stream));
+    kd.copy_recorded[staging_slot] = true;
+
+    mDocMaskingActive =
+        causal_lm_profile().apply_doc_masking(*mExecutor, mOptions, mModelConfig, inputs, position_ids, micro_step);
+
+    if (lora_enabled()) {
+        ensure_lora_run_state(comm, B_val, T_val);
+        if (qlora_enabled() && micro_step == 0 && mQLoRAProvider) {
+            mQLoRAProvider->invalidate_cache();
+        }
+        mLoRARunState->micro_step = micro_step;
+        mLoRARunState->is_training = true;
+    }
+
+    auto stamp_kd_fields = [&](ExecutionRequest& request) {
+        request.kd_topk_ids_gpu = kd.topk_ids;
+        request.kd_topk_logprobs_gpu = kd.topk_logprobs;
+        request.kd_loss_accum_gpu = kd.loss_accum;
+        request.kd_top_k = kd_config.top_k;
+        request.kd_temperature = kd_config.temperature;
+        request.kd_weight = kd_config.kd_weight;
+        request.kd_ce_weight = kd_config.ce_weight;
+    };
+
+    // make_forward_request keeps initialize_loss_buffers = (micro_step == 0)
+    // and reads targets from rs.Targets_CPU — the standard training forward.
+    rs.Targets_CPU = targets;
+    auto forward_request =
+        causal_lm_profile().make_forward_request(rs, mModelConfig, mOptions, inputs, position_ids, micro_step);
+    stamp_kd_fields(forward_request);
+    mExecutor->execute_forward(forward_request, comm);
+
+    if (!lora_enabled()) {
+        auto backward_request =
+            causal_lm_profile()
+                .make_backward_request(rs, mModelConfig, mOptions, inputs, targets, grad_accum_steps, micro_step);
+        stamp_kd_fields(backward_request);
+        mExecutor->execute_backward(backward_request, comm);
+        if (mDocMaskingActive) {
+            mExecutor->clear_doc_masking();
+            mDocMaskingActive = false;
+        }
+        return;
+    }
+
+    mLoRAGrads->start_micro_step(main_stream, micro_step, grad_accum_steps);
+    auto backward_request =
+        causal_lm_profile()
+            .make_backward_request(rs, mModelConfig, mOptions, inputs, targets, grad_accum_steps, micro_step);
+    stamp_kd_fields(backward_request);
+    mExecutor->execute_backward(backward_request, comm);
+    if (mDocMaskingActive) {
+        mExecutor->clear_doc_masking();
+        mDocMaskingActive = false;
+    }
+    mLoRAGrads->end_micro_step(main_stream, comm);
+    internal::record_event_if_not_capturing(rs.BackwardDone, main_stream);
+}
+
+float DslModel::consume_kd_loss_sum() {
+    if (!mRunState) {
+        throw std::logic_error("DslModel::consume_kd_loss_sum called before allocate_run_state()");
+    }
+    auto& rs = *mRunState;
+    auto& kd = rs.kd_scratch();
+    if (!kd.loss_accum) {
+        return 0.0f;
+    }
+    float value = 0.0f;
+    CUDA_CHECK(cudaMemcpy(&value, kd.loss_accum, sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemset(kd.loss_accum, 0, sizeof(float)));
+    return value;
+}
+
 // ---- Debug-only dispatch-PP sub-range parity (BF16 full-FT, resident) ------
 
 std::vector<float> DslModel::dispatch_pp_forward_hidden(Tensor inputs,

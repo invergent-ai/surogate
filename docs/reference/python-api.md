@@ -36,6 +36,7 @@ Typical usage:
 - `SurogateTrainer.import_weights(path)`: import weights from a Hugging Face safetensors file
 - `SurogateTrainer.export_model(path)`: export full model weights
 - `SurogateTrainer.export_adapter(path, base_model_path=...)`: export LoRA adapters (PEFT-compatible)
+- `SurogateTrainer.step_with_kd(...)` / `SurogateTrainer.get_kd_loss()`: knowledge-distillation micro-step with a teacher top-K signal, and the resulting KD metric (see [Knowledge Distillation](../guides/distillation.md))
 - `SurogateTrainer.get_allocator_info(gpu_id=0)`: allocator stats (useful for memory debugging)
 
 ## Where to look next

@@ -2036,6 +2036,75 @@ NB_MODULE(_surogate, m) {
                 return out;
             },
             "Return native GRPO metrics accumulated since the current grad-accum step started.")
+        .def(
+            "step_with_kd",
+            [](MultiGPUPyTrainer* trainer,
+               nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig> input_ids,
+               nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig> targets,
+               nb::ndarray<int32_t, nb::ndim<3>, nb::c_contig> kd_ids,
+               nb::ndarray<float, nb::ndim<3>, nb::c_contig> kd_logprobs,
+               nb::object position_ids_obj,
+               int top_k,
+               float temperature,
+               float kd_weight,
+               float ce_weight) {
+                // Pin the arrays to the trainer's geometry: py_train slices per
+                // GPU with the trainer's B/T, so self-consistent-but-wrong
+                // shapes would read out of bounds on the host.
+                CHECK_SHAPE(input_ids, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
+                const std::size_t rows = input_ids.shape(0);
+                const std::size_t seq = input_ids.shape(1);
+                if (targets.shape(0) != rows || targets.shape(1) != seq) {
+                    throw std::invalid_argument("step_with_kd: targets shape must match input_ids");
+                }
+                if (top_k <= 0) {
+                    throw std::invalid_argument("step_with_kd: top_k must be positive");
+                }
+                if (kd_ids.shape(0) != rows || kd_ids.shape(1) != seq ||
+                    kd_ids.shape(2) != static_cast<std::size_t>(top_k)) {
+                    throw std::invalid_argument("step_with_kd: kd_ids must have shape [rows, seq_len, top_k]");
+                }
+                if (kd_logprobs.shape(0) != rows || kd_logprobs.shape(1) != seq ||
+                    kd_logprobs.shape(2) != static_cast<std::size_t>(top_k)) {
+                    throw std::invalid_argument("step_with_kd: kd_logprobs must have shape [rows, seq_len, top_k]");
+                }
+                const std::int32_t* pos_ptr = nullptr;
+                if (!position_ids_obj.is_none()) {
+                    auto pos = nb::cast<nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig>>(position_ids_obj);
+                    if (pos.shape(0) != rows || pos.shape(1) != seq) {
+                        throw std::invalid_argument("step_with_kd: position_ids shape must match input_ids");
+                    }
+                    pos_ptr = pos.data();
+                }
+                trainer->step_with_kd(input_ids.data(),
+                                      targets.data(),
+                                      kd_ids.data(),
+                                      kd_logprobs.data(),
+                                      pos_ptr,
+                                      top_k,
+                                      temperature,
+                                      kd_weight,
+                                      ce_weight);
+            },
+            nb::arg("input_ids"),
+            nb::arg("targets"),
+            nb::arg("kd_ids"),
+            nb::arg("kd_logprobs"),
+            nb::arg("position_ids") = nb::none(),
+            nb::arg("top_k") = 32,
+            nb::arg("temperature") = 1.0f,
+            nb::arg("kd_weight") = 0.5f,
+            nb::arg("ce_weight") = 0.5f,
+            "Run one knowledge-distillation training micro-step.\n\n"
+            "Standard SFT forward/backward with a top-K teacher signal injected into the\n"
+            "fused LM-head loss: total = ce_weight*CE + kd_weight*tau^2*KL(teacher||student).\n"
+            "kd_ids/kd_logprobs are [rows, seq_len, top_k] arrays with row i aligned with\n"
+            "targets[i] (the teacher's next-token distribution at input position i).\n"
+            "Call update_with_config() after grad_accum micro-steps, then get_kd_loss().")
+        .def(
+            "get_kd_loss",
+            [](MultiGPUPyTrainer* trainer) { return trainer->get_kd_loss(); },
+            "Mean KD loss per valid token accumulated since the last call (rank-0 local).")
         .def("set_grad_accumulation",
              &MultiGPUPyTrainer::set_grad_accumulation,
              nb::arg("n"),
@@ -2648,8 +2717,8 @@ NB_MODULE(_surogate, m) {
                              inputs.device_id()};
                 d->load_batch(inp_t, tgt_t);
             },
-            nb::arg("inputs"),
-            nb::arg("targets"),
+            nb::arg("inputs").noconvert(),
+            nb::arg("targets").noconvert(),
             "Fill `inputs` and `targets` with the next batch.\n\n"
             "Parameters:\n"
             "- inputs: Preallocated int32 array [batch, seq_len].\n"
@@ -2678,14 +2747,81 @@ NB_MODULE(_surogate, m) {
                              position_ids.device_id()};
                 d->load_batch(inp_t, tgt_t, &pos_t);
             },
-            nb::arg("inputs"),
-            nb::arg("targets"),
-            nb::arg("position_ids"),
+            nb::arg("inputs").noconvert(),
+            nb::arg("targets").noconvert(),
+            nb::arg("position_ids").noconvert(),
             "Fill `inputs`, `targets`, and `position_ids` with the next batch.\n\n"
             "Parameters:\n"
             "- inputs: Preallocated int32 array [batch, seq_len].\n"
             "- targets: Preallocated int32 array [batch, seq_len].\n"
             "- position_ids: Preallocated int32 array [batch, seq_len].")
+        .def(
+            "load_batch",
+            [](DataLoader* d,
+               TokenArray inputs,
+               TokenArray targets,
+               TokenArray position_ids,
+               TokenArray3 kd_ids,
+               nb::ndarray<float, nb::shape<-1, -1, -1>, nb::c_contig, nb::device::cpu> kd_logprobs) {
+                CHECK_SHAPE(position_ids, static_cast<int>(inputs.shape(0)), static_cast<int>(inputs.shape(1)));
+                const int k = d->kd_top_k();
+                if (k <= 0) {
+                    throw std::runtime_error("load_batch: KD arrays passed but enable_kd() was not called");
+                }
+                CHECK_SHAPE(kd_ids, static_cast<int>(inputs.shape(0)), static_cast<int>(inputs.shape(1)), k);
+                CHECK_SHAPE(kd_logprobs, static_cast<int>(inputs.shape(0)), static_cast<int>(inputs.shape(1)), k);
+                Tensor inp_t{ETensorDType::INT32,
+                             {static_cast<long>(inputs.shape(0)), static_cast<long>(inputs.shape(1))},
+                             reinterpret_cast<std::byte*>(inputs.data()),
+                             nullptr,
+                             2,
+                             inputs.device_id()};
+                Tensor tgt_t{ETensorDType::INT32,
+                             {static_cast<long>(targets.shape(0)), static_cast<long>(targets.shape(1))},
+                             reinterpret_cast<std::byte*>(targets.data()),
+                             nullptr,
+                             2,
+                             targets.device_id()};
+                Tensor pos_t{ETensorDType::INT32,
+                             {static_cast<long>(position_ids.shape(0)), static_cast<long>(position_ids.shape(1))},
+                             reinterpret_cast<std::byte*>(position_ids.data()),
+                             nullptr,
+                             2,
+                             position_ids.device_id()};
+                Tensor kd_ids_t{ETensorDType::INT32,
+                                {static_cast<long>(kd_ids.shape(0)),
+                                 static_cast<long>(kd_ids.shape(1)),
+                                 static_cast<long>(kd_ids.shape(2))},
+                                reinterpret_cast<std::byte*>(kd_ids.data()),
+                                nullptr,
+                                3,
+                                kd_ids.device_id()};
+                Tensor kd_lp_t{ETensorDType::FP32,
+                               {static_cast<long>(kd_logprobs.shape(0)),
+                                static_cast<long>(kd_logprobs.shape(1)),
+                                static_cast<long>(kd_logprobs.shape(2))},
+                               reinterpret_cast<std::byte*>(kd_logprobs.data()),
+                               nullptr,
+                               3,
+                               kd_logprobs.device_id()};
+                d->load_batch(inp_t, tgt_t, &pos_t, &kd_ids_t, &kd_lp_t);
+            },
+            nb::arg("inputs").noconvert(),
+            nb::arg("targets").noconvert(),
+            nb::arg("position_ids").noconvert(),
+            nb::arg("kd_ids").noconvert(),
+            nb::arg("kd_logprobs").noconvert(),
+            "Fill token buffers plus the KD teacher top-K arrays with the next batch.\n\n"
+            "Requires enable_kd(). Parameters:\n"
+            "- inputs/targets/position_ids: Preallocated int32 arrays [batch, seq_len].\n"
+            "- kd_ids: Preallocated int32 array [batch, seq_len, top_k].\n"
+            "- kd_logprobs: Preallocated float32 array [batch, seq_len, top_k].")
+        .def("enable_kd",
+             &DataLoader::enable_kd,
+             nb::arg("expected_k"),
+             "Enable knowledge-distillation sidecar loading. Validates a `<shard>.kd` sidecar for\n"
+             "every token file (matching token count and `expected_k`) and raises otherwise.")
+        .def_prop_ro("has_kd", &DataLoader::has_kd, "True if KD sidecar loading is enabled.")
         .def("epoch", &DataLoader::epoch, "Return the current epoch number (0-based).")
         .def("progress", &DataLoader::progress, "Return progress within the current epoch (percent).")
         .def("advance_epoch", &DataLoader::advance_epoch, "Advance to the next epoch and reshuffle chunk order.")
@@ -2847,6 +2983,17 @@ NB_MODULE(_surogate, m) {
              "- norm: Gradient norm.\n"
              "- loss: Training loss.\n"
              "- lr: Learning rate.")
+        .def("log_step_kd",
+             &TrainingRunLogger::log_step_kd,
+             nb::arg("step"),
+             nb::arg("epoch"),
+             nb::arg("step_tokens"),
+             nb::arg("duration_ms"),
+             nb::arg("norm"),
+             nb::arg("loss"),
+             nb::arg("lr"),
+             nb::arg("kd_loss"),
+             "Log a knowledge-distillation training step (adds kd_loss to the step record).")
         .def("log_step_moe",
              nb::overload_cast<int,
                                float,

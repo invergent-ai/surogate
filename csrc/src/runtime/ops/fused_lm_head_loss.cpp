@@ -210,7 +210,10 @@ void CompiledExecutor::dispatch_fused_lm_head_loss(const CompiledOp& op) {
     // on-the-fly quantization for the gathered xF_compact / dlogits_compact
     // slices. NOTE: forward and backward gates MUST stay aligned so backward
     // reads the per-valid-row logsumexp the compact forward saved.
-    if (mOptions.SkipIgnoredLMHeadRows && !mLogprobsGpu && xF_flat.DType == ETensorDType::BF16 &&
+    // KD disables row compaction: the compact backward has no teacher-row
+    // gather path. The kd_* request fields are set on both forward and
+    // backward requests so this gate stays aligned with the backward's.
+    if (mOptions.SkipIgnoredLMHeadRows && !mLogprobsGpu && !kd_active() && xF_flat.DType == ETensorDType::BF16 &&
         weight.DType == ETensorDType::BF16) {
         dispatch_fused_lm_head_loss_compact(op);
         return;
@@ -398,8 +401,8 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_backward(const CompiledOp& op
     // Dispatch to the compact backward only if the matching forward also took
     // that path (signalled by mLmheadCompactNValid >= 0). Forward and backward
     // gates MUST match — otherwise backward reads stale logsumexp scratch.
-    if (mOptions.SkipIgnoredLMHeadRows && mLmheadCompactNValid >= 0 && xF_flat.DType == ETensorDType::BF16 &&
-        weight.DType == ETensorDType::BF16) {
+    if (mOptions.SkipIgnoredLMHeadRows && !kd_active() && mLmheadCompactNValid >= 0 &&
+        xF_flat.DType == ETensorDType::BF16 && weight.DType == ETensorDType::BF16) {
         dispatch_fused_lm_head_loss_backward_compact(op);
         return;
     }
@@ -454,6 +457,31 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_backward(const CompiledOp& op
     const int V = static_cast<int>(weight.Sizes[0]);
     const int C = static_cast<int>(weight.Sizes[1]);
     const int P = V;
+
+    // Knowledge distillation: renormalize the teacher top-K logprobs into a
+    // probability distribution at the distillation temperature, once for the
+    // full BT (nano-chunks below slice into it by token_offset).
+    const bool kd_enabled = kd_active();
+    Tensor kd_q{};
+    if (kd_enabled) {
+        if (mInvTemperatureGpu) {
+            throw std::runtime_error(
+                "fused_lm_head_loss_backward: distillation is not supported with per-token temperatures");
+        }
+        if (mKdTopK <= 0 || mKdTopK > 1024) {
+            throw std::runtime_error("fused_lm_head_loss_backward: kd_top_k must be in [1, 1024]");
+        }
+        kd_q = mRunState.temp_alloc(ETensorDType::FP32, {BT, static_cast<long>(mKdTopK)}, "kd_teacher_q");
+        kd_normalize_teacher_topk(kd_q.get<float>(),
+                                  mKdTopkLogprobsGpu,
+                                  mKdTopkIdsGpu,
+                                  targets.get<int>(),
+                                  static_cast<int>(BT),
+                                  mKdTopK,
+                                  V,
+                                  1.0f / mKdTemperature,
+                                  mRunState.MainStream);
+    }
 
     const int lmhead_chunks = std::max(1, mOptions.LMHeadChunks);
     const long nano_batch_size = BT / static_cast<long>(lmhead_chunks);
@@ -541,6 +569,45 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_backward(const CompiledOp& op
             scale_logits_rows(logits, inv_t, static_cast<int>(nano_batch_size), V, P, mRunState.MainStream);
         }
 
+        KdBackwardArgs kd_args;
+        const KdBackwardArgs* kd_ptr = nullptr;
+        Tensor kd_lse_tau{};
+        Tensor kd_lse_scratch{};
+        bool kd_lse_allocated = false;
+        if (kd_enabled) {
+            kd_args.ids = mKdTopkIdsGpu + token_offset * static_cast<long>(mKdTopK);
+            kd_args.q = kd_q.get<float>() + token_offset * static_cast<long>(mKdTopK);
+            kd_args.inv_tau = 1.0f / mKdTemperature;
+            kd_args.ce_w = mKdCeWeight;
+            kd_args.kd_scale = mKdWeight * mKdTemperature;
+            kd_args.tau_sq = mKdTemperature * mKdTemperature;
+            kd_args.kd_loss_accum = mKdLossAccumGpu;
+            kd_args.K = mKdTopK;
+            const bool tau_is_one = std::fabs(mKdTemperature - 1.0f) < 1e-6f;
+            if (tau_is_one && logsumexp) {
+                kd_args.lse_tau = logsumexp->get<float>();
+            } else {
+                const int lse_chunks = (V + CROSS_ENTROPY_MAX_FUSED_SIZE - 1) / CROSS_ENTROPY_MAX_FUSED_SIZE;
+                kd_lse_tau = mRunState.temp_alloc(ETensorDType::FP32, {nano_batch_size}, "kd_lse_tau");
+                kd_lse_scratch = mRunState.temp_alloc(ETensorDType::FP32,
+                                                      {nano_batch_size, static_cast<long>(lse_chunks)},
+                                                      "kd_lse_scratch");
+                kd_lse_allocated = true;
+                kd_row_logsumexp(kd_lse_tau.get<float>(),
+                                 kd_lse_scratch.get<float>(),
+                                 logits,
+                                 static_cast<int>(nano_batch_size),
+                                 V,
+                                 P,
+                                 lse_chunks,
+                                 kd_args.inv_tau,
+                                 fuse_softcap_backward ? op.attrs.softcap : 0.0f,
+                                 mRunState.MainStream);
+                kd_args.lse_tau = kd_lse_tau.get<float>();
+            }
+            kd_ptr = &kd_args;
+        }
+
         if (V > CROSS_ENTROPY_MAX_FUSED_SIZE) {
             chunked_cross_entropy_backward(logits,
                                            logits,
@@ -551,7 +618,8 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_backward(const CompiledOp& op
                                            V,
                                            P,
                                            fuse_softcap_backward ? op.attrs.softcap : 0.0f,
-                                           mRunState.MainStream);
+                                           mRunState.MainStream,
+                                           kd_ptr);
         } else {
             fused_cross_entropy_backward(logits,
                                          logits,
@@ -562,7 +630,13 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_backward(const CompiledOp& op
                                          V,
                                          P,
                                          fuse_softcap_backward ? op.attrs.softcap : 0.0f,
-                                         mRunState.MainStream);
+                                         mRunState.MainStream,
+                                         kd_ptr);
+        }
+
+        if (kd_lse_allocated) {
+            mRunState.temp_free(kd_lse_scratch);
+            mRunState.temp_free(kd_lse_tau);
         }
 
         if (mInvTemperatureGpu) {
@@ -625,6 +699,10 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_backward(const CompiledOp& op
                        mRunState.MainStream);
             }
         }
+    }
+
+    if (kd_enabled) {
+        mRunState.temp_free(kd_q);
     }
 
     if (need_lm_head) {

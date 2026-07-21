@@ -137,6 +137,33 @@ distributed:
   worker_output_dir: /shared/surogate-data
 ```
 
+## Knowledge Distillation
+
+Offline top-K logit distillation on the SFT path: capture teacher logprobs once with `surogate distill-capture config.yaml`, then train with `surogate sft config.yaml`. The teacher and student must share a tokenizer. See the [Knowledge Distillation Guide](../guides/distillation.md). Single-node only (mutually exclusive with `distributed:` and `parallelism: dispatch_pp`); CUDA graphs and `lmhead_drop_ignored_rows` are auto-disabled.
+
+| Option                            | Type   | Default           | Description                                                                                                                                                  |
+| --------------------------------- | ------ | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `distillation.teacher_model`      | string | `null`            | Teacher model id or path. Required by `distill-capture`; ignored at train time.                                                                              |
+| `distillation.top_k`              | int    | `32`              | Teacher logprobs stored per token. Range `[1, 1024]`; training validates that sidecars were captured with this exact value.                                  |
+| `distillation.temperature`        | float  | `1.0`             | Distillation temperature τ (> 0).                                                                                                                            |
+| `distillation.kd_weight`          | float  | `0.5`             | Weight of the KD (KL) term (≥ 0).                                                                                                                            |
+| `distillation.ce_weight`          | float  | `1 - kd_weight`   | Weight of the CE term (≥ 0). Must be set explicitly when `kd_weight > 1`.                                                                                    |
+| `distillation.teacher_batch_size` | int    | `4`               | Capture-time only (local backend): windows of `sequence_len` tokens per teacher forward pass (≥ 1).                                                          |
+| `distillation.kd_dir`             | string | `null`            | Sidecar directory override. Default: alongside the token shards. The trainer bridges `kd_dir` captures to the native DataLoader via `<shard>.kd` symlinks.   |
+| `distillation.teacher_api_base`   | string | `null`            | Capture-time only: OpenAI-compatible base URL of a served teacher (e.g. `http://localhost:8000/v1`). Switches capture to a vLLM API backend; `teacher_model` is then the served model name. Requires a vLLM server started with `--max-logprobs >= top_k`; aggregators (e.g. OpenRouter) cannot be used. |
+| `distillation.teacher_api_key_var` | string | `"VLLM_API_KEY"` | Capture-time only: env var holding the API key. Empty/unset resolves to `EMPTY` (accepted by local vLLM).                                                    |
+| `distillation.teacher_api_concurrency` | int | `8`             | Capture-time only: concurrent in-flight API capture requests (≥ 1).                                                                                          |
+| `distillation.teacher_api_timeout` | int   | `1200`            | Capture-time only: per-request API timeout in seconds (≥ 1).                                                                                                 |
+
+**Example configuration:**
+```yaml
+distillation:
+  teacher_model: Qwen/Qwen3-1.7B
+  top_k: 64
+  temperature: 1.0
+  kd_weight: 0.5
+```
+
 ## Hardware Settings
 
 | Option            | Type | Default | Description                                                         |

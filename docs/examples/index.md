@@ -16,6 +16,12 @@ Fine-tuning examples for chat and instruction models.
 - **[Qwen 3 QLoRA (FP4/FP8)](examples/sft/qwen3-qlora.md)**: Memory-efficient fine-tuning using quantization on modern GPUs.
 - **[Qwen 3 MoE (QLoRA)](examples/sft/qwen3moe-lora.md)**: Fine-tuning Mixture-of-Experts models.
 
+## Knowledge Distillation (KD)
+
+Offline top-K logit distillation on the SFT path: capture teacher logprobs once, then train the student.
+
+- **Qwen 3 KD (BF16)**: `examples/distillation/qwen3-kd.yaml` — Qwen3-1.7B teacher distilled into a Qwen3-0.6B student (run `surogate distill-capture`, then `surogate sft`). See the [Knowledge Distillation guide](../guides/distillation.md).
+
 ## How to use these examples
 
 All examples are provided as YAML configuration files. You can run them using the Surogate CLI:

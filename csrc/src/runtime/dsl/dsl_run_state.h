@@ -355,6 +355,30 @@ public:
 
     /// @brief Set MoE config and allocate stats buffers (call once after construction)
     void set_moe_config(int num_experts, float aux_loss_coef, float z_loss_coef);
+
+    /// Knowledge-distillation scratch: device buffers for the top-K teacher
+    /// signal plus pinned staging mirrors (event-synced double buffer, GRPO
+    /// idiom). Lazily sized by set_kd_config on the first step_with_kd call;
+    /// raw allocations are freed in the destructor.
+    struct KdNativeScratch {
+        static constexpr int kStagingSlots = 2;
+        std::int32_t* topk_ids = nullptr;  ///< Device INT32 [max_tokens * top_k]
+        float* topk_logprobs = nullptr;    ///< Device FP32 [max_tokens * top_k]
+        float* loss_accum = nullptr;       ///< Device FP32 [1] KD loss metric accumulator
+        std::int32_t* host_ids[kStagingSlots] = {};  ///< Pinned INT32 [max_tokens * top_k]
+        float* host_logprobs[kStagingSlots] = {};    ///< Pinned FP32 [max_tokens * top_k]
+        cudaEvent_t copy_done[kStagingSlots] = {};
+        bool copy_recorded[kStagingSlots] = {};
+        int next_slot = 0;
+        int top_k = 0;
+        long max_tokens = 0;
+    };
+    /// @brief Allocate (or re-shape) the KD scratch for `top_k` entries over `max_tokens` tokens.
+    void set_kd_config(int top_k, long max_tokens);
+    KdNativeScratch& kd_scratch() {
+        return mKdScratch;
+    }
+
     [[nodiscard]] int moe_num_experts() const {
         return mNumMoEExperts;
     }
@@ -460,6 +484,9 @@ private:
     int mNumMoEExperts = 0;            ///< 0 = not MoE
     float mMoEAuxLossCoef = 0.01f;     ///< Auxiliary loss coefficient
     float mMoEZLossCoef = 0.001f;      ///< Router z-loss coefficient
+
+    KdNativeScratch mKdScratch;
+    void free_kd_scratch() noexcept;
 };
 
 }  // namespace dsl

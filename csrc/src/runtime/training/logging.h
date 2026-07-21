@@ -58,6 +58,17 @@ public:
     void log_gpu_model(NCCLCommunicator& comm);
     void log_dataset(const DataLoader& train_loader, const DataLoader& eval_loader);
     void log_step(int step, float epoch, int step_tokens, int duration_ms, float norm, float loss, float lr);
+    /// log_step variant for knowledge-distillation runs: adds a "kd_loss"
+    /// field to the step JSON line (picked up by all reporters) and the
+    /// console progress line.
+    void log_step_kd(int step,
+                     float epoch,
+                     int step_tokens,
+                     int duration_ms,
+                     float norm,
+                     float loss,
+                     float lr,
+                     float kd_loss);
     void log_step(int step,
                   float epoch,
                   int step_tokens,
@@ -120,6 +131,15 @@ public:
 
 private:
     void log_line(std::string_view line);
+    void log_step_impl(int step,
+                       float epoch,
+                       int step_tokens,
+                       int duration_ms,
+                       float norm,
+                       float loss,
+                       float lr,
+                       const std::string& extra_console,
+                       const std::string& extra_json);
     std::string mFileName;
     std::fstream mLogFile;
     bool mFirst = true;

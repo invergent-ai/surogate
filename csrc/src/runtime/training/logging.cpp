@@ -253,6 +253,37 @@ void TrainingRunLogger::log_step(int step,
                                  float norm,
                                  float loss,
                                  float lr) {
+    log_step_impl(step, epoch, step_tokens, duration_ms, norm, loss, lr, "", "");
+}
+
+void TrainingRunLogger::log_step_kd(int step,
+                                    float epoch,
+                                    int step_tokens,
+                                    int duration_ms,
+                                    float norm,
+                                    float loss,
+                                    float lr,
+                                    float kd_loss) {
+    log_step_impl(step,
+                  epoch,
+                  step_tokens,
+                  duration_ms,
+                  norm,
+                  loss,
+                  lr,
+                  fmt::format(" | kd {:6.4f}", kd_loss),
+                  fmt::format(R"(, "kd_loss": {})", sanitize_float_for_json(kd_loss)));
+}
+
+void TrainingRunLogger::log_step_impl(int step,
+                                      float epoch,
+                                      int step_tokens,
+                                      int duration_ms,
+                                      float norm,
+                                      float loss,
+                                      float lr,
+                                      const std::string& extra_console,
+                                      const std::string& extra_json) {
     if (mRank != 0) return;
     mTotalTrainingLoss += loss;
     ++mTotalTrainingSteps;
@@ -318,7 +349,7 @@ void TrainingRunLogger::log_step(int step,
 
         std::string phase_str = mPhase.empty() ? "" : fmt::format(" | {}", mPhase);
 
-        printf(":: step %7d [%5.1f%%] %c loss %6.4f | norm %c%6.4f | %5.1fk tps | %5d ms%s%s%s\n",
+        printf(":: step %7d [%5.1f%%] %c loss %6.4f | norm %c%6.4f | %5.1fk tps | %5d ms%s%s%s%s\n",
                step,
                progress,
                trend,
@@ -327,6 +358,7 @@ void TrainingRunLogger::log_step(int step,
                norm,
                tps / 1000.0f,
                duration_ms,
+               extra_console.c_str(),
                sol_str.c_str(),
                eta_str.c_str(),
                phase_str.c_str());
@@ -335,7 +367,7 @@ void TrainingRunLogger::log_step(int step,
 
     std::string phase_json = mPhase.empty() ? "" : fmt::format(R"(, "phase": "{}")", mPhase);
     log_line(fmt::format(
-        R"(  {{"log": "step", "time": "{}", "step": {}, "epoch": {}, "step_tokens": {}, "duration_ms": {}, "norm": {}, "loss": {}, "lr": {}{}}})",
+        R"(  {{"log": "step", "time": "{}", "step": {}, "epoch": {}, "step_tokens": {}, "duration_ms": {}, "norm": {}, "loss": {}, "lr": {}{}{}}})",
         std::chrono::system_clock::now(),
         step,
         epoch,
@@ -344,6 +376,7 @@ void TrainingRunLogger::log_step(int step,
         sanitize_float_for_json(norm),
         sanitize_float_for_json(loss),
         sanitize_float_for_json(lr),
+        extra_json,
         phase_json));
 }
 

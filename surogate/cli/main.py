@@ -50,6 +50,8 @@ COMMAND_MAPPING: dict[str, str] = {
     "vf-init": "surogate.cli.vf_init",
     "vf-eval": "surogate.cli.vf_eval",
     "tokenize": "surogate.cli.tokenize_cmd",
+    "distill-capture": "surogate.cli.distill_capture",
+    "transplant-tokenizer": "surogate.cli.transplant",
     "merge": "surogate.cli.merge",
     "debug": "surogate.cli.debug",
 }
@@ -128,6 +130,23 @@ def parse_args():
 
     tokenize_prepare_command_parser(subparsers.add_parser("tokenize", help="Tokenize datasets for training"))
 
+    # distill-capture command
+    from surogate.cli.distill_capture import prepare_command_parser as distill_capture_prepare_command_parser
+
+    distill_capture_prepare_command_parser(
+        subparsers.add_parser("distill-capture", help="Capture teacher top-K logprobs for knowledge distillation")
+    )
+
+    # transplant-tokenizer command
+    from surogate.cli.transplant import prepare_command_parser as transplant_prepare_command_parser
+
+    transplant_prepare_command_parser(
+        subparsers.add_parser(
+            "transplant-tokenizer",
+            help="Transplant a teacher's tokenizer onto a student model for cross-tokenizer distillation",
+        )
+    )
+
     # merge command
     from surogate.cli.merge import prepare_command_parser as merge_prepare_command_parser
 
@@ -150,7 +169,7 @@ def parse_args():
         parser.print_help()
         sys.exit(1)
 
-    commands_with_config = ["sft", "pt", "grpo_train", "grpo_infer", "grpo_orch", "tokenize"]
+    commands_with_config = ["sft", "pt", "grpo_train", "grpo_infer", "grpo_orch", "tokenize", "distill-capture"]
     if args.command in commands_with_config and not getattr(args, "config", None):
         parser.print_help()
         sys.exit(1)
