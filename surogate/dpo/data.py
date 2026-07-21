@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from typing import Any
 
 import numpy as np
@@ -48,10 +50,17 @@ class PrefBatch:
         return int(self.input_ids.shape[0])
 
 
-def _render(tok, prompt: Any, response: str) -> tuple[list[int], list[int]]:
+def _render(tok, prompt: Any, response: str, enable_thinking: bool | None = None) -> tuple[list[int], list[int]]:
     """Return (prompt_ids, response_ids). `prompt` is a string or a messages list."""
     if isinstance(prompt, list):
-        prompt_ids = tok.apply_chat_template(prompt, add_generation_prompt=True, tokenize=True)
+        kwargs = {"add_generation_prompt": True, "tokenize": True}
+        if enable_thinking is not None:
+            kwargs["enable_thinking"] = enable_thinking
+        prompt_ids = tok.apply_chat_template(prompt, **kwargs)
+        if isinstance(prompt_ids, Mapping):
+            prompt_ids = prompt_ids["input_ids"]
+        if prompt_ids and isinstance(prompt_ids[0], list):
+            prompt_ids = prompt_ids[0]
     else:
         prompt_ids = tok(prompt, add_special_tokens=True)["input_ids"]
     response_ids = tok(response, add_special_tokens=False)["input_ids"]
@@ -72,25 +81,25 @@ def _layout_sequence(prompt_ids: list[int], response_ids: list[int], max_len: in
     return ids, prompt_len
 
 
-def _diff_span(chosen_ids: list[int], rejected_ids: list[int]) -> tuple[int, int, int, int] | None:
-    """Longest-common-prefix/suffix diff of two token lists.
-
-    Returns (c_start, c_end, r_start, r_end) — the half-open differing spans in
-    each list — or None if the lists are identical. The common suffix is bounded
-    so the spans never underrun the prefix (all-diff worst case keeps full spans).
-    """
+def _diff_segments(
+    chosen_ids: list[int], rejected_ids: list[int]
+) -> tuple[list[tuple[int, int]], list[tuple[int, int]]] | None:
+    """Return disjoint half-open token segments that differ between responses."""
     if chosen_ids == rejected_ids:
         return None
-    lcp = 0
-    for a, b in zip(chosen_ids, rejected_ids):
-        if a != b:
-            break
-        lcp += 1
-    lcs = 0
-    max_lcs = min(len(chosen_ids), len(rejected_ids)) - lcp
-    while lcs < max_lcs and chosen_ids[-1 - lcs] == rejected_ids[-1 - lcs]:
-        lcs += 1
-    return lcp, len(chosen_ids) - lcs, lcp, len(rejected_ids) - lcs
+
+    chosen_segments = []
+    rejected_segments = []
+    for tag, c_start, c_end, r_start, r_end in SequenceMatcher(
+        a=chosen_ids, b=rejected_ids, autojunk=False
+    ).get_opcodes():
+        if tag == "equal":
+            continue
+        if c_start < c_end:
+            chosen_segments.append((c_start, c_end))
+        if r_start < r_end:
+            rejected_segments.append((r_start, r_end))
+    return chosen_segments, rejected_segments
 
 
 def tokenize_preference_pairs(
@@ -101,11 +110,9 @@ def tokenize_preference_pairs(
     Rows whose prompt+response cannot fit a single response token in `max_len`
     are dropped (logged). Raises ValueError if no pair survives.
 
-    span_mask=True confines loss_mask to the tokens where chosen and rejected
-    DIFFER (common prefix and suffix excluded). For minimal word-substitution
-    pairs this makes the DPO gradient structurally unable to shift style,
-    length, or language of the surrounding text — only the substituted form is
-    scored. Identical-tokenization rows are dropped (no contrastive signal).
+    span_mask=True confines loss_mask to the disjoint token blocks where chosen
+    and rejected differ. Identical-tokenization rows, and rows where truncation
+    removes every differing token from either side, are dropped.
     """
     if pad_id is None:
         pad_id = tok.pad_token_id
@@ -115,15 +122,16 @@ def tokenize_preference_pairs(
             raise ValueError("tokenizer has neither pad_token_id nor eos_token_id; pass pad_id explicitly")
 
     seqs: list[tuple[list[int], int]] = []  # (ids, prompt_len), chosen then rejected per kept pair
-    spans: list[tuple[int, int] | None] = []  # per-sequence (start, end) into the RESPONSE, or None = all
+    segments: list[list[tuple[int, int]] | None] = []  # response segments per sequence; None = all
     dropped = 0
     dropped_identical = 0
     for row in rows:
         prompt = row["prompt"]
+        enable_thinking = row.get("enable_thinking")
         laid = []
         resp_ids = []
         for key in ("chosen", "rejected"):
-            p_ids, r_ids = _render(tok, prompt, row[key])
+            p_ids, r_ids = _render(tok, prompt, row[key], enable_thinking)
             res = _layout_sequence(p_ids, r_ids, max_len, pad_id)
             if res is None:
                 laid = []
@@ -134,25 +142,30 @@ def tokenize_preference_pairs(
             dropped += 1
             continue
         if span_mask:
-            d = _diff_span(resp_ids[0], resp_ids[1])
+            d = _diff_segments(resp_ids[0], resp_ids[1])
             if d is None:
                 dropped_identical += 1
                 continue
-            # Adjust spans for any response-head tokens lost to left-truncation.
-            adj = []
-            for (ids, p_len), r_full, (s, e) in zip(laid, resp_ids, [d[:2], d[2:]]):
+            # Adjust edited segments for response-head tokens lost to left-truncation.
+            adjusted_pair = []
+            for (ids, p_len), r_full, diff_segments in zip(laid, resp_ids, d):
                 head_dropped = len(r_full) - (len(ids) - p_len)
-                s2, e2 = max(0, s - head_dropped), e - head_dropped
-                if e2 <= s2:  # differing span truncated away — no contrastive signal
-                    adj = []
-                    break
-                adj.append((s2, e2))
-            if len(adj) != 2:
+                response_len = len(ids) - p_len
+                adjusted = []
+                for start, end in diff_segments:
+                    start = max(0, start - head_dropped)
+                    end = min(response_len, end - head_dropped)
+                    if start < end:
+                        adjusted.append((start, end))
+                adjusted_pair.append(adjusted)
+            # The native objective is two-sided; an insertion/deletion or
+            # truncation must not leave one sequence with an empty mask.
+            if not all(adjusted_pair):
                 dropped += 1
                 continue
-            spans.extend(adj)
+            segments.extend(adjusted_pair)
         else:
-            spans.extend([None, None])
+            segments.extend([None, None])
         seqs.extend(laid)
 
     n_pairs = len(seqs) // 2
@@ -180,13 +193,12 @@ def tokenize_preference_pairs(
         # targets[j] = ids[j+1]; targets[L-1..] stay 0 (unused / masked).
         if L >= 2:
             targets[k, : L - 1] = ids[1:L]
-        span = spans[k]
-        if span is None:
+        diff_segments = segments[k]
+        if diff_segments is None:
             loss_mask[k, prompt_len:L] = 1  # response tokens (incl. the last) are scored
         else:
-            a = min(prompt_len + span[0], L - 1)
-            b = min(prompt_len + span[1], L)
-            loss_mask[k, a : max(b, a + 1)] = 1  # only the differing span is scored
+            for start, end in diff_segments:
+                loss_mask[k, prompt_len + start : prompt_len + end] = 1
         position_ids[k, :L] = np.arange(L, dtype=np.int32)
         seq_len[k] = L
 
@@ -208,7 +220,7 @@ def tokenize_preference_pairs(
 # upstream changes (model, max_len, prompt rendering, or the rows themselves) so a
 # stale sidecar can never silently feed wrong references into training.
 
-RENDER_VERSION = 1  # bump if _render / _layout_sequence semantics change
+RENDER_VERSION = 2  # bump if _render / _layout_sequence semantics change
 
 
 def rows_digest(rows: list[dict]) -> str:
@@ -217,7 +229,9 @@ def rows_digest(rows: list[dict]) -> str:
     for r in rows:
         h.update(
             json.dumps(
-                [r.get("prompt"), r.get("chosen"), r.get("rejected")], ensure_ascii=False, sort_keys=True
+                [r.get("prompt"), r.get("chosen"), r.get("rejected"), r.get("enable_thinking")],
+                ensure_ascii=False,
+                sort_keys=True,
             ).encode("utf-8")
         )
     return h.hexdigest()[:16]

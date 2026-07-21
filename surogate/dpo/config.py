@@ -30,6 +30,12 @@ class DPOLossConfig:
     # prefix/suffix excluded). For minimal word-substitution pairs the gradient
     # then cannot shift style/length/language — only the substituted form.
     span_mask: bool = False
+    # Optimize the chosen/rejected likelihood gap directly instead of its
+    # change from the frozen start policy.
+    reference_free: bool = False
+    # Required beta-scaled likelihood margin for reference-free training
+    # (SimPO-style gamma).
+    target_margin: float = 0.0
 
     @classmethod
     def from_dict(cls, d: dict) -> "DPOLossConfig":
@@ -79,6 +85,13 @@ class DPOTrainConfig(SFTConfig):
             self.loss = DPOLossConfig.from_dict(dict(loss_cfg))
         else:
             self.loss = DPOLossConfig()
+
+        if self.loss.dpo_beta <= 0:
+            raise ValueError("loss.dpo_beta must be positive")
+        if self.loss.target_margin < 0:
+            raise ValueError("loss.target_margin must be non-negative")
+        if self.loss.target_margin and not self.loss.reference_free:
+            raise ValueError("loss.target_margin requires loss.reference_free=true")
 
         # Initialize inherited config (model_dir, runtime_config, lora_config, ...).
         # The SFT path runs this from TokenizeDatasets.__init__(); the DPO trainer

@@ -3057,7 +3057,7 @@ void MultiGPUPyTrainer::step_dpo_native(const std::int32_t* inputs,
                                         float loss_scale,
                                         float beta,
                                         int length_norm,
-                                        GrpoHostLayout layout) {
+                                        DpoHostLayout layout) {
     const int ep_size = std::max(1, mOptions.EPSize);
     const int host_rows = std::max(1, (int)mContexts.size() / ep_size);
     if (layout.token_rows != 1 && layout.token_rows != host_rows) {
@@ -3093,7 +3093,7 @@ void MultiGPUPyTrainer::step_dpo_native(const std::int32_t* inputs,
                         host_rows,
                         static_cast<long>(host_rows) * static_cast<long>(B)));
     }
-    mGrpoShardedRows = (layout.token_rows > 1);
+    mDpoShardedRows = (layout.token_rows > 1);
     for (int i = 0; i < (int)mContexts.size(); ++i) {
         auto& ctx = mContexts.at(i);
         if (!ctx.Model) {
@@ -3223,7 +3223,7 @@ std::unordered_map<std::string, float> MultiGPUPyTrainer::get_dpo_native_metrics
     // rank is identical, take rank 0.
     const int ep_size = std::max(1, mOptions.EPSize);
     dsl::DpoNativeMetrics agg;
-    if (mGrpoShardedRows) {
+    if (mDpoShardedRows) {
         float total_pairs = 0.0f;
         for (int r = 0; r < (int)per_rank.size(); r += ep_size) {
             const auto& m = per_rank[static_cast<std::size_t>(r)];

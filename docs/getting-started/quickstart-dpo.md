@@ -7,9 +7,9 @@ rejected}` triples and run a single command.
 
 ## 1) Prepare preference data
 
-A `type: preference` dataset is JSONL with three fields per row. `prompt` may be a
+A `type: preference` dataset is JSONL with three required fields per row. `prompt` may be a
 string or a chat `messages` list; `chosen`/`rejected` are the two competing assistant
-continuations:
+continuations. Chat rows may also set `enable_thinking`:
 
 ```json
 {"prompt": "Scrie corect în limba română.", "chosen": "Ei mergeau acasă.", "rejected": "Ei mergerăm acasă."}
@@ -46,16 +46,20 @@ loss:
   type: dpo
   dpo_beta: 0.1                           # KL temperature; higher pushes harder from the reference
   length_norm: false                      # enable when chosen/rejected lengths differ a lot
+  span_mask: false                        # score only disjoint differing token spans
+  reference_free: false                  # optimize the absolute chosen/rejected gap
+  target_margin: 0.0                     # requires reference_free; beta-scaled target gap
 
 datasets:
   - path: ./pairs.jsonl
     type: preference
 ```
 
-DPO inherits all SFT settings (LoRA, recipe, optimizer, schedule). The base model is
-frozen; only the LoRA adapter is trained. The **reference** is the start checkpoint,
-captured once at the beginning (with the adapter disabled) and cached to
-`output_dir/ref_logprobs.npz`.
+DPO inherits all SFT settings (LoRA, recipe, optimizer, schedule, checkpoint resume
+and retention). The base model is frozen; only the LoRA adapter is trained. In
+standard DPO, the **reference** is the frozen start checkpoint and is evaluated
+inline on each exact micro-batch. This keeps FP8 activation scaling aligned with
+the policy forward. `reference_free: true` skips that extra reference forward.
 
 ## 3) Run
 
@@ -82,10 +86,9 @@ step=1 dpo_loss=0.6871 acc=1.000 margin=0.0121 ...
 
 ## 5) Outputs
 
-- `output_dir/step_{:08}/adapter_model.safetensors` — LoRA checkpoints at `save_steps`.
+- `output_dir/step_{:08}/adapter_model.safetensors` — LoRA checkpoints at `save_steps`;
+  older checkpoints are removed according to `save_total_limit`.
 - `output_dir/final_adapter/` — the final LoRA adapter.
-- `output_dir/ref_logprobs.npz` — the cached reference (safe to delete; recomputed if
-  the model/data/layout change).
 
 Merge an adapter into a standalone model with:
 
@@ -100,8 +103,9 @@ surogate merge --base-model ./path/to/start_checkpoint \
   general quality); too low barely moves the model. `0.1` is a reasonable start.
 - **Build minimal pairs.** Broad, full-rewrite pairs leak style/length; prefer pairs
   that isolate the exact behavior you want to change.
-- **Small learning rate.** The preference gradient is small; `master_dtype`/
-  `gradient_dtype` default to `fp32` so it isn't lost to BF16 rounding.
+- **Small learning rate.** The preference gradient is small; `gradient_dtype` and
+  the trainable LoRA weights use FP32 so it is not lost to BF16 rounding. The frozen
+  base does not receive a wasteful FP32 master copy.
 
 ## See also
 

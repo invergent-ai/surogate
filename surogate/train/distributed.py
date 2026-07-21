@@ -11,6 +11,7 @@ import numpy as np
 
 from surogate.core.config.sft_config import SFTConfig
 from surogate.train.vision import OnTheFlyMultimodalBatcher, init_mm_helpers, load_multimodal_datasets
+from surogate.utils.lora_compat import ensure_surogate_lora_compat, ensure_vllm_lora_compat
 
 # Lazy import Ray to avoid dependency when not using distributed training
 _ray = None
@@ -505,6 +506,11 @@ class NodeTrainer:
                 self._trainer.set_adapter_path(self._config.adapter_path)
             self._trainer.import_weights(weights_path)
             logger.info(f"Node {self.node_rank}: Loading checkpoint from step {self.start_step}...")
+            if self._config.lora:
+                ensure_surogate_lora_compat(
+                    Path(self._config.checkpoint_dir) / f"step_{self.start_step:08d}",
+                    self._config.model_dir,
+                )
             self._trainer.load_checkpoint(str(self._config.checkpoint_dir), self.start_step)
             logger.info(f"Node {self.node_rank}: Checkpoint loaded successfully")
         else:
@@ -1494,6 +1500,8 @@ class RayDistributedTrainer:
                             logger.warning(
                                 f"Export timed out after 120s. {len(ready)}/{len(export_refs)} nodes completed."
                             )
+
+                    ensure_vllm_lora_compat(adapter_dir, config.model_dir)
 
                     # Merge adapter into base model if requested (only on head node)
                     if config.merge_adapter:

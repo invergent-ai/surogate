@@ -24,6 +24,7 @@ def test_rows_digest_is_content_sensitive():
     b = [{"prompt": "p", "chosen": "c", "rejected": "DIFFERENT"}]
     assert rows_digest(a) != rows_digest(b)
     assert rows_digest(a) == rows_digest(list(a))
+    assert rows_digest(a) != rows_digest([{**a[0], "enable_thinking": True}])
 
 
 def test_sidecar_roundtrip_and_key_mismatch(tmp_path):

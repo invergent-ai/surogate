@@ -18,9 +18,15 @@ share the identical scale, so at init the margin is exactly 0 (loss = log 2) und
 fp8 and bf16 alike. Cost: one extra (no-backward) forward per micro-step.
 
 No rollouts, no inference engine — purely offline.
+
+For local-contrast training, ``reference_free`` skips the frozen-policy
+forward and optimizes the chosen-vs-rejected likelihood gap directly.
+``target_margin`` applies a SimPO-style minimum margin.
 """
 
 import json
+import shutil
+import tempfile
 import time
 from pathlib import Path
 
@@ -32,6 +38,7 @@ from surogate.dpo.data import tokenize_preference_pairs
 from surogate.train.lr_schedule import LRSchedule
 from surogate.utils.hf import get_model_weights_path
 from surogate.utils.logger import get_logger
+from surogate.utils.lora_compat import ensure_surogate_lora_compat, ensure_vllm_lora_compat
 from surogate.utils.tensor import to_surogate_dtype
 
 logger = get_logger()
@@ -46,9 +53,22 @@ def _load_pref_rows(path: str) -> list[dict]:
                 continue
             r = json.loads(line)
             if "prompt" in r and "chosen" in r and "rejected" in r:
-                rows.append({"prompt": r["prompt"], "chosen": r["chosen"], "rejected": r["rejected"]})
+                row = {"prompt": r["prompt"], "chosen": r["chosen"], "rejected": r["rejected"]}
+                if "enable_thinking" in r:
+                    row["enable_thinking"] = r["enable_thinking"]
+                rows.append(row)
     if not rows:
         raise ValueError(f"no {{prompt, chosen, rejected}} rows in {path}")
+    return rows
+
+
+def _load_pref_datasets(paths: list[str]) -> list[dict]:
+    """Load configured preference shards in declaration order."""
+    if not paths:
+        raise ValueError("DPO requires at least one preference dataset")
+    rows = []
+    for path in paths:
+        rows.extend(_load_pref_rows(path))
     return rows
 
 
@@ -83,6 +103,40 @@ def _gpu_batch(pair_idx: list[int], batch, T: int):
     }
 
 
+def _reference_free_logprobs(
+    gpu_batches: list[dict],
+    B: int,
+    T: int,
+    beta: float,
+    target_margin: float,
+    length_norm: bool,
+) -> np.ndarray:
+    """Build synthetic references for direct likelihood-gap optimization.
+
+    The native kernel subtracts the chosen reference sum (or mean) from the
+    beta-scaled policy gap. Distribute the requested offset across chosen
+    tokens in sum mode so the effective target does not grow with edit length.
+    """
+    refs = np.zeros((len(gpu_batches) * B, T), dtype=np.float32)
+    if target_margin == 0:
+        return refs
+    for gpu_index, gpu_batch in enumerate(gpu_batches):
+        mask = gpu_batch["loss_mask"].reshape(B, T)
+        for sample_index in gpu_batch["pair_chosen"]:
+            sample_index = int(sample_index)
+            token_positions = np.flatnonzero(mask[sample_index])
+            # The native loss reads ref_logprobs[t - 1] for loss_mask[t].
+            token_positions = token_positions[token_positions > 0] - 1
+            if not len(token_positions):
+                continue
+            offset = float(target_margin) / float(beta)
+            if not length_norm:
+                offset /= len(token_positions)
+            row = gpu_index * B + sample_index
+            refs[row, token_positions] = offset
+    return refs
+
+
 def dpo_main(config: DPOTrainConfig, args=None) -> None:
     ngpu = max(1, int(config.gpus or 1))
     B = int(config.per_device_train_batch_size)
@@ -90,6 +144,7 @@ def dpo_main(config: DPOTrainConfig, args=None) -> None:
     if B % 2 != 0:
         raise ValueError(f"per_device_train_batch_size must be even (pairs are 2 rows); got {B}")
     pairs_per_gpu = B // 2
+    checkpoint_dir = config.checkpoint_dir or str(Path(config.output_dir))
 
     # --- compile the DSL IR + JIT kernels (mirrors SurogateTrainerWrapper) ---
     from surogate.dsl.ir_builder import build_dsl_ir_for_model
@@ -122,10 +177,35 @@ def dpo_main(config: DPOTrainConfig, args=None) -> None:
     )
     model_weights_path = get_model_weights_path(config.model_dir)
     logger.info(f"Importing start weights from {model_weights_path}")
-    trainer.import_weights(model_weights_path)
+    if config.adapter_path:
+        # Native import expects Surogate key paths, while an adapter previously
+        # prepared for vLLM may use the wrapper's language_model prefix. Work on
+        # a temporary copy so the user's source adapter is never mutated.
+        logger.info(f"Merging inherited adapter from {config.adapter_path} into start weights")
+        with tempfile.TemporaryDirectory(prefix="surogate-dpo-adapter-") as temporary_dir:
+            adapter_copy = Path(temporary_dir) / "adapter"
+            shutil.copytree(config.adapter_path, adapter_copy)
+            ensure_surogate_lora_compat(adapter_copy, config.model_dir)
+            trainer.set_adapter_path(str(adapter_copy))
+            trainer.import_weights(model_weights_path)
+    else:
+        trainer.import_weights(model_weights_path)
+
+    start_step = 0
+    if config.resume_from_checkpoint:
+        latest_step = _surogate.find_latest_checkpoint(checkpoint_dir)
+        if latest_step >= 0:
+            checkpoint_path = Path(checkpoint_dir) / f"step_{latest_step:08d}"
+            if config.lora:
+                ensure_surogate_lora_compat(checkpoint_path, config.model_dir)
+            logger.info(f"Resuming DPO from checkpoint step {latest_step}")
+            trainer.load_checkpoint(checkpoint_dir, latest_step)
+            start_step = latest_step
+        else:
+            logger.info("No DPO checkpoint found; starting from step 0")
 
     # --- tokenize preference pairs -----------------------------------------
-    rows = _load_pref_rows(config.datasets[0].path)
+    rows = _load_pref_datasets([dataset.path for dataset in (config.datasets or [])])
     batch = tokenize_preference_pairs(rows, config.tokenizer, max_len=T, span_mask=config.loss.span_mask)
     logger.info(f"Tokenized {batch.n_pairs} preference pairs (from {len(rows)} rows)")
     Path(config.output_dir).mkdir(parents=True, exist_ok=True)
@@ -150,8 +230,6 @@ def dpo_main(config: DPOTrainConfig, args=None) -> None:
         schedule_type=config.lr_scheduler_type,
         wsd_decay_steps_fraction=config.wsd_decay_steps_fraction,
     )
-    checkpoint_dir = config.checkpoint_dir or str(Path(config.output_dir))
-
     # --- infinite shuffled pair stream -------------------------------------
     rng = np.random.RandomState(config.train_seed if config.train_seed is not None else 0)
 
@@ -163,6 +241,11 @@ def dpo_main(config: DPOTrainConfig, args=None) -> None:
 
     stream = pair_stream()
 
+    # Checkpoints identify the next optimizer step. Replaying the deterministic
+    # pair stream restores the same data order as an uninterrupted run.
+    for _ in range(start_step * pairs_per_step):
+        next(stream)
+
     def next_pairs(n: int) -> list[int]:
         return [next(stream) for _ in range(n)]
 
@@ -170,10 +253,11 @@ def dpo_main(config: DPOTrainConfig, args=None) -> None:
     logger.info(
         f"DPO training: {max_steps} steps x {pairs_per_step} pairs/step "
         f"(grad_accum={config.gradient_accumulation_steps}, beta={config.loss.dpo_beta}, "
-        f"length_norm={config.loss.length_norm})"
+        f"length_norm={config.loss.length_norm}, reference_free={config.loss.reference_free}, "
+        f"target_margin={config.loss.target_margin})"
     )
 
-    for step in range(max_steps):
+    for step in range(start_step, max_steps):
         t0 = time.time()
         trainer.set_grad_accumulation(int(config.gradient_accumulation_steps))
         # one optimizer step normalizes by the mean over its pairs; gradients are
@@ -190,10 +274,20 @@ def dpo_main(config: DPOTrainConfig, args=None) -> None:
             # Frozen reference (LoRA disabled) on the SAME rows/scale as the policy
             # forward below — fp8-correct (see module docstring). [ngpu*B, T] row order
             # matches input_step, so reshaping to [ngpu, B*T] aligns with the per-GPU layout.
-            ref_2d = np.asarray(
-                trainer.compute_ref_logprobs_dpo(input_step, targets_step, position_ids=pos_step),
-                dtype=np.float32,
-            )  # [ngpu*B, T]
+            if config.loss.reference_free:
+                ref_2d = _reference_free_logprobs(
+                    gpu_batches,
+                    B,
+                    T,
+                    beta=float(config.loss.dpo_beta),
+                    target_margin=float(config.loss.target_margin),
+                    length_norm=bool(config.loss.length_norm),
+                )
+            else:
+                ref_2d = np.asarray(
+                    trainer.compute_ref_logprobs_dpo(input_step, targets_step, position_ids=pos_step),
+                    dtype=np.float32,
+                )  # [ngpu*B, T]
 
             if ngpu > 1:
                 ref_step = ref_2d.reshape(ngpu, B * T)  # [ngpu, B*T]
@@ -254,9 +348,14 @@ def dpo_main(config: DPOTrainConfig, args=None) -> None:
                 except OSError as exc:
                     logger.warning("could not write DPO metrics to %s: %s", metrics_path, exc)
 
-        if config.save_steps > 0 and step > 0 and step % config.save_steps == 0:
-            logger.info(f"Saving checkpoint at step {step}...")
-            trainer.save_checkpoint(checkpoint_dir, step)
+        completed_step = step + 1
+        if config.save_steps > 0 and completed_step % config.save_steps == 0:
+            logger.info(f"Saving checkpoint at step {completed_step}...")
+            trainer.save_checkpoint(checkpoint_dir, completed_step)
+            if config.save_total_limit and config.save_total_limit > 0:
+                removed = _surogate.clean_old_checkpoints(checkpoint_dir, config.save_total_limit, -1)
+                if removed:
+                    logger.info(f"Removed {removed} old checkpoints; keeping the newest {config.save_total_limit}")
 
     # --- final adapter ------------------------------------------------------
     out = Path(config.output_dir)
@@ -264,5 +363,6 @@ def dpo_main(config: DPOTrainConfig, args=None) -> None:
         adapter_dir = out / "final_adapter"
         adapter_dir.mkdir(parents=True, exist_ok=True)
         trainer.export_adapter(str(adapter_dir))
+        ensure_vllm_lora_compat(adapter_dir, config.model_dir)
         logger.info(f"Final LoRA adapter saved to {adapter_dir}")
     logger.info("DPO training complete.")

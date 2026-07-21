@@ -75,6 +75,23 @@ struct GrpoNativeMetrics {
     float total_tokens = 0.0f;
 };
 
+struct DpoNativeLossConfig {
+    float loss_scale = 1.0f;
+    float beta = 0.1f;
+    // Divide each sequence's response-token logprob sum by its response length
+    // (SimPO-style); off for minimal pairs where chosen/rejected lengths match.
+    bool length_norm = false;
+};
+
+struct DpoNativeMetrics {
+    float loss = 0.0f;      ///< mean -log sigmoid(beta * margin) over pairs
+    float accuracy = 0.0f;  ///< fraction of pairs with margin > 0
+    float margin = 0.0f;    ///< mean margin
+    /// Raw pair count the means were normalized by (before the max(.,1) clamp);
+    /// lets callers re-weight when combining across data-parallel ranks.
+    float pair_count = 0.0f;
+};
+
 /// Configuration for the offline knowledge-distillation step.
 /// Total loss: ce_weight * CE + kd_weight * tau^2 * KL(teacher_topk || student).
 struct KdLossConfig {

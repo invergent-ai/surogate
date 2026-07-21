@@ -308,10 +308,19 @@ public:
     // local, mirroring get_grpo_native_metrics). Consumes the accumulator on
     // every rank.
     float get_kd_loss();
-    // Offline DPO micro-step. Per-token arrays (ref_logprobs / loss_mask) and the
-    // sample/pair arrays follow the same GrpoHostLayout sharding as
-    // step_grpo_native; pair arrays shard together with the sample arrays
-    // (sample_rows). Each pair row holds `pair_count` entries padded with -1.
+    // Host-array layout for step_dpo_native. Per-token arrays and sample/pair
+    // arrays are either shared by every GPU row (rows == 1) or carry one row
+    // per host batch row. When sample_rows > 1, each sample/pair row is padded
+    // with -1 to its configured capacity.
+    struct DpoHostLayout {
+        int token_rows = 1;
+        int sample_rows = 1;
+        long token_len = 0;
+        long input_rows = 0;
+        long input_cols = 0;
+    };
+
+    // Offline DPO micro-step. Pair arrays shard together with sample arrays.
     void step_dpo_native(const std::int32_t* inputs,
                          const std::int32_t* targets,
                          const float* ref_logprobs,
@@ -326,7 +335,7 @@ public:
                          float loss_scale,
                          float beta,
                          int length_norm,
-                         GrpoHostLayout layout);
+                         DpoHostLayout layout);
     std::unordered_map<std::string, float> get_dpo_native_metrics();
 
     // DPO reference log-probs via the fused-loss forward (fp8/multi-GPU-safe).
@@ -348,6 +357,8 @@ private:
     int mTrainMicroStep = 0;
     int mEvalStep = 0;
     int mGradAccumulation = 1;
+    // Controls metric aggregation after a DPO step with distinct host rows.
+    bool mDpoShardedRows = false;
 
     std::unique_ptr<CommunicatorThreadsPack> mThreads;
     struct sFullStepGraphState {

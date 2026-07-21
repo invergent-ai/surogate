@@ -2163,7 +2163,7 @@ NB_MODULE(_surogate, m) {
                 check_ndim("pair_chosen", pair_chosen.ndim());
                 check_ndim("pair_rejected", pair_rejected.ndim());
 
-                MultiGPUPyTrainer::GrpoHostLayout layout;
+                MultiGPUPyTrainer::DpoHostLayout layout;
                 layout.token_rows = rows_of(ref_logprobs);
                 layout.sample_rows = rows_of(sample_starts);
                 layout.token_len = static_cast<long>(len_of(ref_logprobs));
@@ -3420,11 +3420,16 @@ NB_MODULE(_surogate, m) {
                     strategy = tokenizer::LossStrategy::DEFAULT;
                 else if (strategy_str == "last_round")
                     strategy = tokenizer::LossStrategy::LAST_ROUND;
+                else if (strategy_str == "thinking_only")
+                    strategy = tokenizer::LossStrategy::THINKING_ONLY;
+                else if (strategy_str == "final_only")
+                    strategy = tokenizer::LossStrategy::FINAL_ONLY;
                 else if (strategy_str == "all")
                     strategy = tokenizer::LossStrategy::ALL;
                 else
-                    throw std::invalid_argument("strategy must be 'default', 'last_round', or 'all', got: " +
-                                                strategy_str);
+                    throw std::invalid_argument(
+                        "strategy must be 'default', 'last_round', 'thinking_only', 'final_only', or 'all', got: " +
+                        strategy_str);
 
                 // Convert messages, skipping entries with null content
                 std::vector<tokenizer::ChatMessage> msgs;
@@ -3451,7 +3456,9 @@ NB_MODULE(_surogate, m) {
             "Parameters:\n"
             "- messages: List of dicts with 'role' and 'content' keys.\n"
             "- strategy: 'default' (train on all assistant turns), 'last_round'\n"
-            "            (train only on last assistant turn), or 'all' (train on everything).")
+            "            (train only on last assistant turn), 'thinking_only'\n"
+            "            (train reasoning through </think>), 'final_only'\n"
+            "            (train only after </think>), or 'all' (train on everything).")
         .def(
             "encode_for_training_batch",
             [](const tokenizer::Tokenizer& self, nb::list batch, const std::string& strategy_str) {
@@ -3460,11 +3467,16 @@ NB_MODULE(_surogate, m) {
                     strategy = tokenizer::LossStrategy::DEFAULT;
                 else if (strategy_str == "last_round")
                     strategy = tokenizer::LossStrategy::LAST_ROUND;
+                else if (strategy_str == "thinking_only")
+                    strategy = tokenizer::LossStrategy::THINKING_ONLY;
+                else if (strategy_str == "final_only")
+                    strategy = tokenizer::LossStrategy::FINAL_ONLY;
                 else if (strategy_str == "all")
                     strategy = tokenizer::LossStrategy::ALL;
                 else
-                    throw std::invalid_argument("strategy must be 'default', 'last_round', or 'all', got: " +
-                                                strategy_str);
+                    throw std::invalid_argument(
+                        "strategy must be 'default', 'last_round', 'thinking_only', 'final_only', or 'all', got: " +
+                        strategy_str);
 
                 // Convert batch of conversations, skipping entries with null content
                 std::vector<std::vector<tokenizer::ChatMessage>> cpp_batch;
@@ -3501,7 +3513,7 @@ NB_MODULE(_surogate, m) {
             "Batch encode conversations for training (multi-threaded).\n\n"
             "Parameters:\n"
             "- batch: List of conversations, each a list of message dicts.\n"
-            "- strategy: 'default', 'last_round', or 'all'.");
+            "- strategy: 'default', 'last_round', 'thinking_only', 'final_only', or 'all'.");
 
     // ----------------------------------------------------------------------
     // mem-efficient attention (Phase 4 attempt 1 port, see

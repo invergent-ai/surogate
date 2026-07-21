@@ -155,7 +155,7 @@ loss   = −log σ(margin)
 ```
 
 - **What updates?** LoRA adapter parameters (base model is frozen)
-- **Reference model:** the start checkpoint, captured once (LoRA disabled) and cached
+- **Reference model:** the frozen start checkpoint, evaluated inline with LoRA disabled
 - **Typical data:** `type: preference` datasets (`{prompt, chosen, rejected}`)
 - **Typical run shape:** a few hundred gradient steps over preference pairs
 
@@ -170,6 +170,7 @@ loss:
   type: dpo
   dpo_beta: 0.1
   length_norm: false   # enable when chosen/rejected lengths differ a lot
+  span_mask: false     # optionally score only differing token spans
 datasets:
   - path: pairs.jsonl
     type: preference

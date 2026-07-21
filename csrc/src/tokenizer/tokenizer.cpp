@@ -17,6 +17,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -868,11 +869,28 @@ TrainingEncoded Tokenizer::encode_for_training(const std::vector<ChatMessage>& m
 
         if (render_with_asst.size() > render_with_user.size()) {
             std::string response = render_with_asst.substr(render_with_user.size());
+            if (strategy == LossStrategy::THINKING_ONLY || strategy == LossStrategy::FINAL_ONLY) {
+                constexpr std::string_view close_tag = "</think>";
+                const size_t close_pos = response.find(close_tag);
+                if (close_pos != std::string::npos) {
+                    const size_t close_end = close_pos + close_tag.size();
+                    segments.push_back({response.substr(0, close_end), strategy == LossStrategy::THINKING_ONLY});
+                    if (close_end < response.size()) {
+                        segments.push_back({response.substr(close_end), strategy == LossStrategy::FINAL_ONLY});
+                    }
+                } else {
+                    segments.push_back({std::move(response), false});
+                }
+                prev_render = std::move(render_with_asst);
+                continue;
+            }
             bool trainable = false;
             switch (strategy) {
                 case LossStrategy::ALL:
                 case LossStrategy::DEFAULT: trainable = true; break;
                 case LossStrategy::LAST_ROUND: trainable = is_last_round; break;
+                case LossStrategy::THINKING_ONLY: break;
+                case LossStrategy::FINAL_ONLY: break;
             }
             segments.push_back({std::move(response), trainable});
         }

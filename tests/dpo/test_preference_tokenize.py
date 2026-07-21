@@ -19,6 +19,21 @@ class FakeTok:
         return {"input_ids": ids}
 
 
+class FakeChatTok(FakeTok):
+    def __init__(self):
+        self.rendered_modes = []
+
+    def apply_chat_template(self, messages, add_generation_prompt, tokenize, enable_thinking=None):
+        assert add_generation_prompt and tokenize
+        self.rendered_modes.append(enable_thinking)
+        return [1, 101 if enable_thinking else 102]
+
+
+class FakeMappingChatTok(FakeChatTok):
+    def apply_chat_template(self, messages, add_generation_prompt, tokenize, enable_thinking=None):
+        return {"input_ids": [[1, 101 if enable_thinking else 102]]}
+
+
 def test_masks_and_targets_and_pairing():
     tok = FakeTok()
     rows = [{"prompt": "scrie un cuvant", "chosen": "mergeam acasa", "rejected": "mergeram acasa"}]
@@ -68,3 +83,77 @@ def test_raises_when_response_empty():
     # row dropped, tokenization raises rather than emit a zero-pair batch.
     with pytest.raises(ValueError, match="no preference pair"):
         tokenize_preference_pairs([{"prompt": "hello world", "chosen": "", "rejected": ""}], tok, max_len=32)
+
+
+def test_chat_pair_can_request_thinking_generation_prefix():
+    tok = FakeChatTok()
+    rows = [
+        {
+            "prompt": [{"role": "user", "content": "Calculează."}],
+            "chosen": "corect",
+            "rejected": "greșit",
+            "enable_thinking": True,
+        }
+    ]
+    batch = tokenize_preference_pairs(rows, tok, max_len=16)
+
+    assert batch.n_pairs == 1
+    assert tok.rendered_modes == [True, True]
+
+
+def test_chat_template_mapping_output_is_normalized_to_token_ids():
+    tok = FakeMappingChatTok()
+    rows = [
+        {
+            "prompt": [{"role": "user", "content": "Calculează."}],
+            "chosen": "corect",
+            "rejected": "greșit",
+            "enable_thinking": True,
+        }
+    ]
+    batch = tokenize_preference_pairs(rows, tok, max_len=16)
+
+    assert batch.n_pairs == 1
+    assert batch.input_ids[0, :2].tolist() == [1, 101]
+
+
+def test_span_mask_scores_only_disjoint_edits():
+    tok = FakeTok()
+    rows = [
+        {
+            "prompt": "cerere",
+            "chosen": "text corect între formă bună final",
+            "rejected": "text greșit între formă rea final",
+        }
+    ]
+
+    batch = tokenize_preference_pairs(rows, tok, max_len=32, span_mask=True)
+
+    expected = [3, 6]
+    for row in range(2):
+        assert np.flatnonzero(batch.loss_mask[row]).tolist() == expected
+
+
+def test_span_mask_keeps_surviving_edits_after_left_truncation():
+    tok = FakeTok()
+    rows = [
+        {
+            "prompt": "prompt foarte lung care va dispărea",
+            "chosen": "unu corect trei bun",
+            "rejected": "unu greșit trei rău",
+        }
+    ]
+
+    batch = tokenize_preference_pairs(rows, tok, max_len=4, span_mask=True)
+
+    for row in range(2):
+        assert batch.seq_len[row] == 4
+        assert np.flatnonzero(batch.loss_mask[row]).tolist() == [1, 3]
+
+
+def test_span_mask_drops_pair_when_only_one_side_has_surviving_edit_tokens():
+    tok = FakeTok()
+    rows = [{"prompt": "p", "chosen": "shared", "rejected": "extra shared"}]
+
+    with pytest.raises(ValueError, match="no preference pair"):
+        tokenize_preference_pairs(rows, tok, max_len=8, span_mask=True)

@@ -1,10 +1,10 @@
 """End-to-end DPO smoke test (Tasks 6+7): `surogate dpo <yaml>` runs a real
-2B-LoRA offline DPO over a handful of minimal pairs and:
+lightweight LoRA offline DPO over a handful of minimal pairs and:
   - exits 0,
   - logs step-0 dpo_loss ~= log 2 = 0.693 (pi_theta == pi_ref at LoRA init),
   - writes a step checkpoint + a final adapter.
 
-Needs a GPU and the frontier model on disk, so it is marked slow.
+Needs a GPU and a model checkout/cache, so it is marked slow.
 """
 
 import json
@@ -18,7 +18,7 @@ import yaml
 
 SUROGATE = shutil.which("surogate") or os.path.join(os.path.dirname(sys.executable), "surogate")
 
-MODEL = "ro/train/out_opmix_wordform_s50_a010_eval"
+MODEL = os.environ.get("SUROGATE_DPO_TEST_MODEL", "Qwen/Qwen3.5-0.8B")
 
 
 @pytest.mark.slow
