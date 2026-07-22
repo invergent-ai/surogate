@@ -7,6 +7,7 @@
 #define SUROGATE_SRC_UTILITIES_COMM_H
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -34,6 +35,24 @@ public:
     virtual ~CommunicatorThreadsPack() = default;
     virtual void join() = 0;
     virtual bool has_exception() const = 0;
+    // Abort all ranks' NCCL communicators on a detached helper thread so ranks
+    // stuck in collectives (waiting for a crashed peer) return with an error
+    // instead of spinning forever. Detached because ncclCommAbort itself can
+    // wedge on CUDA driver locks held by a stuck thread — the caller must not
+    // block on it. Idempotent per communicator.
+    virtual void abort_async() = 0;
+    // Wait up to timeout_ms for all worker threads to exit. Returns true if
+    // they all exited (join() is then guaranteed not to block).
+    virtual bool wait_exit_for(int timeout_ms) = 0;
+    // Rethrow the stored root-cause exception (if any) WITHOUT joining the
+    // threads. Used when workers are wedged and join() would hang.
+    virtual void rethrow_exception() = 0;
+    // Deliver a no-op signal (SIGUSR2, SA_RESTART off) to every worker thread.
+    // Interrupts driver/futex waits that missed their wakeup (observed rarely
+    // under heavy multi-threaded CUDA load); the wait retries and sees the
+    // completed condition. Safe: the handler does nothing, EINTR-aware code
+    // (CUDA driver, NCCL, libstdc++ atomic waits) simply re-checks.
+    virtual void poke_workers() = 0;
 };
 
 class NCCLCommunicator {
@@ -262,6 +281,12 @@ public:
      */
     static std::array<std::byte, 128> generate_nccl_id();
 
+    /// Abort all NCCL communicators owned by this rank (global + EP/DP/WT).
+    /// Callable from any thread; used to break ranks out of collectives that
+    /// will never complete because a peer crashed. Idempotent with respect to
+    /// terminate_nccl(): whichever runs first claims the teardown.
+    void abort_comms();
+
 protected:
     void terminate_nccl();
 
@@ -295,6 +320,10 @@ private:
     ncclComm_t mEPComm = nullptr;
     ncclComm_t mDPComm = nullptr;
     ncclComm_t mWeightTransferComm = nullptr;
+
+    // Set once teardown (abort_comms or terminate_nccl) has claimed the comms;
+    // the loser of the race must not touch them again.
+    std::atomic<bool> mNcclTornDown{false};
 
     cudaEvent_t mCommsSync;
     cudaStream_t mCommsStream;

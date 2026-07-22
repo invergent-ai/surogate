@@ -15,6 +15,7 @@
 
 #include <cuda_runtime.h>
 
+#include "runtime/ep/lpt_planner.h"
 #include "runtime/lora/lora_types.h"
 #include "utilities/dtype.h"
 #include "utilities/tensor.h"
@@ -24,6 +25,23 @@ namespace ep {
 /// Per-layer EP state: token splits, reorder mappings, persistent GPU buffers.
 /// One instance per (layer_idx, replay_slot) key; see EPStrategy::ep_state_key().
 struct EpLayerState {
+    // Forward-pass dispatch plan cached for recompute replay. Replay must NOT
+    // re-run the imbalance all-reduce / splits exchanges: those collectives
+    // interleave with backward's combine a2a's in the shared launch queue and
+    // intermittently deadlock the issue order. Routing is deterministic, so the
+    // forward plan is bit-identical — replay restores it instead.
+    bool plan_cached = false;
+    bool cached_use_llep = false;
+    int cached_total_send = 0;
+    int cached_total_recv = 0;
+    std::vector<int> cached_send_splits;
+    std::vector<int> cached_recv_splits;
+    std::vector<int> cached_recv_all_counts;
+    std::vector<int> cached_expert_to_gpu;
+    std::vector<int> cached_merged_experts;
+    std::vector<int> cached_global_to_merged;
+    LPTPlan cached_plan;
+
     std::vector<int> send_splits;      // tokens sent to each EP peer
     std::vector<int> recv_splits;      // tokens received from each EP peer
     int total_send = 0;                // sum of send_splits
@@ -108,6 +126,15 @@ struct LLEPLayerState {
     // Must stay alive as long as weight pointers reference them.
     std::vector<void*> owned_foreign_ptrs;
 
+    /// True when the merged set contains foreign (received) experts. The ops'
+    /// native-refresh heuristic must use THIS, not owned_foreign_ptrs.empty():
+    /// arena-backed foreign buffers leave owned_foreign_ptrs empty.
+    bool has_foreign_experts = false;
+
+    /// Ring-arena slot backing the foreign buffers above (-1 when they were
+    /// cudaMalloc'd instead). Released by EPStrategy, not by free_foreign_gpu.
+    int arena_slot = -1;
+
     void free_lora_gpu() {
         for (void* p : owned_lora_ptrs) {
             if (p) cudaFree(p);
@@ -133,6 +160,10 @@ struct EPLayerMeta {
     int native_start = 0;               // first native expert's global ID
     int num_local = 0;                  // number of native experts
     std::vector<int> merged_to_global;  // merged_idx → global expert ID
+    // Full expert→primary-GPU map for this layer's plan. Needed by the
+    // backward LoRA-wgrad exchange: every rank derives the same symmetric
+    // helper→owner send/recv schedule from it.
+    std::vector<int> expert_to_gpu;
 };
 
 }  // namespace ep

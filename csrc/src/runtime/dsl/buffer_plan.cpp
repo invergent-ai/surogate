@@ -1018,9 +1018,13 @@ qwen3_hybrid_lora_floor(const BufferPlan& plan, const PretrainedConfig& cfg, con
 [[nodiscard]] long moe_op_internal_estimate(const BufferPlan& plan) {
     if (!plan.has_moe()) return 0;
     // Matches `moe_extra` in the pre-refactor heuristic, but in plan units.
+    // With expert parallelism only the local expert shard can appear in any
+    // op-internal temp — sizing this at the global count adds GBs of phantom
+    // stack for large-expert models (Laguna-S: 4.8 GB at E=256, ep=8).
     constexpr long kBytesBF16 = 2;
-    const long expert_gate_up = plan.NumExperts * plan.MoeMUp * plan.C * kBytesBF16;
-    const long expert_down = plan.NumExperts * plan.MoeM * plan.C * kBytesBF16;
+    const long local_experts = std::max(1L, plan.NumExperts / static_cast<long>(std::max(plan.EPSize, 1)));
+    const long expert_gate_up = local_experts * plan.MoeMUp * plan.C * kBytesBF16;
+    const long expert_down = local_experts * plan.MoeM * plan.C * kBytesBF16;
     const long permuted_tokens = 2L * plan.B * plan.T * plan.TopK * plan.C * kBytesBF16;
     const long moe_bwd_act = 2L * plan.B * plan.T * plan.TopK * plan.MoeMUp * kBytesBF16;
     return expert_gate_up + expert_down + permuted_tokens + moe_bwd_act;

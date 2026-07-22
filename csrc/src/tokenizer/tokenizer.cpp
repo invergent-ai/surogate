@@ -546,8 +546,12 @@ Tokenizer Tokenizer::from_pretrained(const std::string& model_dir) {
         impl.add_bos = config.value("add_bos_token", false);
         impl.add_eos = config.value("add_eos_token", false);
 
-        // Load chat template (Jinja2 string) — parse directly, skip capability probing
-        if (config.contains("chat_template") && config["chat_template"].is_string()) {
+        // Load chat template (Jinja2 string) — parse directly, skip capability probing.
+        // A standalone chat_template.jinja takes precedence (HF convention): some
+        // checkpoints set the config field to "{% include 'chat_template.jinja' %}",
+        // which minja cannot resolve.
+        if (!fs::exists(dir / "chat_template.jinja") && config.contains("chat_template") &&
+            config["chat_template"].is_string()) {
             std::string tmpl_str = config["chat_template"].get<std::string>();
             impl.chat_tmpl_root = minja::Parser::parse(tmpl_str,
                                                        {

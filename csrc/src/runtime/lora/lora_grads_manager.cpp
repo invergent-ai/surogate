@@ -49,7 +49,8 @@ void ModularLoRAGradsManager::allocate_gradients() {
     const int global_q_out = mConfig.num_query_heads * mConfig.head_size;
     const int global_kv_out = mConfig.num_kv_heads * mConfig.head_size;
     const int r = mConfig.lora_config.rank;
-    const int E = mConfig.num_experts;
+    // EP: grad buffers mirror the weights manager's local expert shard.
+    const int E = mConfig.effective_grouped_experts();
 
     // For hybrid models, per-layer attention / MLP dims may differ from the
     // global defaults. Resolve Q/K/V/O and MLP sizes per layer to avoid

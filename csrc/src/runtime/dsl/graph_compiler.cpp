@@ -6437,6 +6437,26 @@ CompiledGraph GraphCompiler::compile(const Graph& graph, long B, long T, bool is
                             ref.shape = compiled.inputs[0].shape;
                         }
                     }
+                } else if (compiled.type == CompiledOpType::RepeatInterleaveHeads) {
+                    // output[0] = y [B, T, H*repeats, D] — input x [B, T, H, D] with
+                    // the head dim replicated (GQA head expansion for gated-delta q/k).
+                    // Without this, the output falls into the {B,T,C} default below,
+                    // the runtime candidate never matches, and dispatch needs a
+                    // persistent fallback buffer mid-capture (which throws). It also
+                    // starves ChunkGatedDeltaRule's q-input shape right after this op.
+                    if (!compiled.inputs.empty()) {
+                        ref.dtype = compiled.inputs[0].dtype;
+                        if (ref.shape.empty() && compiled.inputs[0].shape.size() == 4) {
+                            long repeats = 1;
+                            if (auto* attr = find_attr(op.attrs, "repeats")) {
+                                if (auto v = attr_int(*attr)) {
+                                    repeats = std::max<long>(1, *v);
+                                }
+                            }
+                            const auto& x_shape = compiled.inputs[0].shape;
+                            ref.shape = {x_shape[0], x_shape[1], x_shape[2] * repeats, x_shape[3]};
+                        }
+                    }
                 } else if (compiled.type == CompiledOpType::ChunkGatedDeltaRule) {
                     // output[0] = out [B, T, H, V] (match value dtype)
                     // output[1] = final_state [B, H, K, V] (kept in FP32 for cache stability)

@@ -171,8 +171,12 @@ Tensor alloc_foreign_tensor(ForeignExpertWeights& received, ETensorDType dtype, 
         bytes *= static_cast<size_t>(s);
     if (bytes == 0) return Tensor{};
     void* ptr = nullptr;
-    CUDA_CHECK(cudaMalloc(&ptr, bytes));
-    received.owned_gpu_ptrs.push_back(ptr);
+    if (received.arena_alloc) {
+        ptr = received.arena_alloc(bytes);
+    } else {
+        CUDA_CHECK(cudaMalloc(&ptr, bytes));
+        received.owned_gpu_ptrs.push_back(ptr);
+    }
     return make_tensor_from_ptr(ptr, dtype, shape, 0);
 }
 
@@ -230,6 +234,47 @@ void transfer_expert_weights(const LPTPlan& plan,
     }
 
     comm.weight_transfer_group_end();
+}
+
+void fetch_expert_weights_from_host(const LPTPlan& plan,
+                                    cudaStream_t stream,
+                                    ForeignExpertWeights& received,
+                                    const Tensor& master_gate_up,
+                                    const Tensor& master_down) {
+    received.free_gpu();
+    if (plan.weights_to_receive.empty()) {
+        return;
+    }
+
+    // Masters are the GLOBAL [num_experts, rows, cols] pinned host tensors
+    // (shared across ranks under cpu_training) — every helper self-serves its
+    // foreign experts with an H2D copy; no peer communication involved.
+    const long gu_rows = master_gate_up.Sizes[1];
+    const long gu_cols = master_gate_up.Sizes[2];
+    const long dn_rows = master_down.Sizes[1];
+    const long dn_cols = master_down.Sizes[2];
+    const std::size_t gu_expert_bytes =
+        static_cast<std::size_t>(gu_rows * gu_cols) * get_dtype_size(master_gate_up.DType);
+    const std::size_t dn_expert_bytes = static_cast<std::size_t>(dn_rows * dn_cols) * get_dtype_size(master_down.DType);
+
+    for (const auto& [expert_id, src_rank] : plan.weights_to_receive) {
+        (void)src_rank;
+        auto& pair = received.weights[expert_id];
+        pair.gate_up = alloc_foreign_tensor(received, master_gate_up.DType, {gu_rows, gu_cols});
+        pair.down = alloc_foreign_tensor(received, master_down.DType, {dn_rows, dn_cols});
+        CUDA_CHECK(cudaMemcpyAsync(pair.gate_up.Data,
+                                   static_cast<const std::byte*>(master_gate_up.Data) +
+                                       static_cast<std::size_t>(expert_id) * gu_expert_bytes,
+                                   gu_expert_bytes,
+                                   cudaMemcpyHostToDevice,
+                                   stream));
+        CUDA_CHECK(cudaMemcpyAsync(pair.down.Data,
+                                   static_cast<const std::byte*>(master_down.Data) +
+                                       static_cast<std::size_t>(expert_id) * dn_expert_bytes,
+                                   dn_expert_bytes,
+                                   cudaMemcpyHostToDevice,
+                                   stream));
+    }
 }
 
 void transfer_expert_weights_quantized(const LPTPlan& plan,

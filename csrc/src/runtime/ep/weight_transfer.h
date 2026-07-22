@@ -12,6 +12,7 @@
 #ifndef SUROGATE_SRC_RUNTIME_EP_WEIGHT_TRANSFER_H
 #define SUROGATE_SRC_RUNTIME_EP_WEIGHT_TRANSFER_H
 
+#include <functional>
 #include <unordered_map>
 #include <vector>
 
@@ -61,6 +62,11 @@ struct ForeignExpertWeights {
     /// Populated when use_cuda_malloc=true in transfer functions.
     std::vector<void*> owned_gpu_ptrs;
 
+    /// Optional bump allocator (ring-slab arena). When set, receive buffers
+    /// draw from it instead of cudaMalloc and owned_gpu_ptrs stays empty —
+    /// the arena scope owner is responsible for the memory's lifetime.
+    std::function<void*(std::size_t)> arena_alloc;
+
     void clear() {
         weights.clear();
         // Do NOT free GPU memory here — use free_gpu() explicitly
@@ -103,6 +109,21 @@ void transfer_expert_weights(const LPTPlan& plan,
                              const Tensor& native_down,
                              int num_local_experts,
                              int ep_rank);
+
+/// cpu_training variant: helpers copy their foreign experts' rows directly from
+/// the GLOBAL pinned host masters (shared across ranks) via H2D — no peer
+/// communication, no dependence on transient prefetch buffers. Owners do nothing.
+///
+/// @param plan            LPT plan (only weights_to_receive is used)
+/// @param stream          CUDA stream for the H2D copies
+/// @param[out] received   Received foreign expert weights on this GPU
+/// @param master_gate_up  GLOBAL pinned host gate_up master [E, rows, cols]
+/// @param master_down     GLOBAL pinned host down master [E, rows, cols]
+void fetch_expert_weights_from_host(const LPTPlan& plan,
+                                    cudaStream_t stream,
+                                    ForeignExpertWeights& received,
+                                    const Tensor& master_gate_up,
+                                    const Tensor& master_down);
 
 /// Transfer expert weights using quantized format for reduced P2P bandwidth.
 ///

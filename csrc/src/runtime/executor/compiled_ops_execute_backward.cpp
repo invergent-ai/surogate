@@ -592,6 +592,15 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
                                         int micro_step,
                                         const modules::BackwardHook* hook,
                                         bool skip_zeroing) {
+    struct BackwardPassGuard {
+        bool& flag;
+        explicit BackwardPassGuard(bool& f) : flag(f) {
+            flag = true;
+        }
+        ~BackwardPassGuard() {
+            flag = false;
+        }
+    } backward_pass_guard{mInBackwardPass};
     // dispatch-PP: a resumed sub-range segment shares the prior segment's
     // backward state. Skip only the steps that would discard it — clearing the
     // live tensors (initialize), overwriting them with the forward snapshot

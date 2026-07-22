@@ -262,7 +262,9 @@ void ModularLoRAWeightsManager::allocate_grouped_moe_weights(LoRAGroupedExpertWe
     const int C = mConfig.hidden_size;
     const int D = mConfig.effective_moe_intermediate();
     const int gate_up_out = 2 * D;
-    const int num_experts = mConfig.num_experts;
+    // EP: only this rank's expert shard gets adapters (kernels accept
+    // local-sized grouped LoRA tensors; grads reduce is already DP-only).
+    const int num_experts = mConfig.effective_grouped_experts();
     const int r = mConfig.lora_config.rank;
     const ETensorDType master_dtype = mConfig.lora_config.dtype;
     const ETensorDType work_dtype = mConfig.work_dtype;
@@ -418,12 +420,116 @@ void ModularLoRAWeightsManager::import_from_file(const std::string& file_name, N
     comm.barrier();
 }
 
+bool ModularLoRAWeightsManager::has_ep_local_grouped() const {
+    if (mConfig.effective_grouped_experts() >= mConfig.num_experts) {
+        return false;
+    }
+    for (const auto& block : mMaster.blocks) {
+        if (!block.moe.use_grouped) continue;
+        const auto& g = block.moe.grouped;
+        if (g.gate.has_value() || g.gate_up.has_value() || g.up.has_value() || g.down.has_value()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void ModularLoRAWeightsManager::gather_grouped_for_export(NCCLCommunicator& comm) const {
+    const int local_E = mConfig.effective_grouped_experts();
+    const int global_E = mConfig.num_experts;
+    const int num_shards = global_E / local_E;
+    if (num_shards != comm.world_size()) {
+        throw std::runtime_error(
+            fmt::format("EP adapter export: expert shards ({}) must equal world size ({}) in v1 "
+                        "(ep_size == world_size). Save with dp_size == 1 or merge offline.",
+                        num_shards,
+                        comm.world_size()));
+    }
+    const int shard_idx = mConfig.grouped_expert_base / local_E;
+
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    cudaEvent_t done = nullptr;
+    CUDA_CHECK(cudaEventCreateWithFlags(&done, cudaEventDisableTiming));
+
+    for (int l = 0; l < (int)mMaster.blocks.size(); ++l) {
+        const auto& block = mMaster.blocks[l];
+        if (!block.moe.use_grouped) continue;
+
+        // Collect this layer's grouped tensors, then run one A2A transaction.
+        std::vector<std::pair<std::string, const TensorShard*>> locals;
+        auto add = [&](const std::optional<LoRAGroupedLayerWeights<TensorShard>>& layer, const char* proj) {
+            if (!layer.has_value() || !layer->has_value()) return;
+            locals.emplace_back(fmt::format("{}:{}:A", l, proj), &layer->A);
+            locals.emplace_back(fmt::format("{}:{}:B", l, proj), &layer->B);
+        };
+        // Keys must match the proj names used by iterate_tensors' lookup.
+        add(block.moe.grouped.gate, "gate_proj");
+        add(block.moe.grouped.gate_up, "gate_up_proj");
+        add(block.moe.grouped.up, "up_proj");
+        add(block.moe.grouped.down, "down_proj");
+        if (locals.empty()) continue;
+
+        // Gather this layer into device temps, then stage to HOST and free the
+        // device memory: keeping all layers' global tensors device-resident
+        // (~4.7 GB at Laguna-S scale) OOMs a nearly-full GPU. The writer's
+        // copy from the host staging buffer is host-to-host under UVA.
+        cudaEvent_t ready = nullptr;
+        CUDA_CHECK(cudaEventCreateWithFlags(&ready, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventRecord(ready, nullptr));
+        comm.begin_transaction(ready);
+        std::vector<std::pair<std::string, Tensor>> device_temps;
+        device_temps.reserve(locals.size());
+        for (auto& [key, local] : locals) {
+            std::vector<long> gshape(local->Sizes.begin(), local->Sizes.begin() + local->Rank);
+            gshape[0] = global_E;
+            std::size_t bytes = get_dtype_size(local->DType);
+            for (long d : gshape) {
+                bytes *= static_cast<std::size_t>(d);
+            }
+            void* ptr = nullptr;
+            CUDA_CHECK(cudaMalloc(&ptr, bytes));
+            Tensor global_t = Tensor::from_pointer(static_cast<std::byte*>(ptr), local->Device, local->DType, gshape);
+            TensorShard src(static_cast<const Tensor&>(*local), shard_idx, num_shards, gshape);
+            comm.schedule_all_gather(src, global_t);
+            device_temps.emplace_back(key, global_t);
+        }
+        comm.execute_transaction(done);
+        CUDA_CHECK(cudaEventSynchronize(done));
+        CUDA_CHECK(cudaEventDestroy(ready));
+
+        for (auto& [key, dev_t] : device_temps) {
+            const std::size_t bytes = dev_t.bytes();
+            auto host_buf = std::make_unique<std::byte[]>(bytes);
+            CUDA_CHECK(cudaMemcpy(host_buf.get(), dev_t.Data, bytes, cudaMemcpyDeviceToHost));
+            std::vector<long> gshape(dev_t.Sizes.begin(), dev_t.Sizes.begin() + dev_t.Rank);
+            mExportGathered.emplace(key, Tensor::from_pointer(host_buf.get(), dev_t.Device, dev_t.DType, gshape));
+            mExportHostBuffers.push_back(std::move(host_buf));
+            CUDA_CHECK(cudaFree(dev_t.Data));
+        }
+    }
+    CUDA_CHECK(cudaEventDestroy(done));
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+void ModularLoRAWeightsManager::release_export_gathered() const {
+    // Gathered tensors point into mExportHostBuffers (host memory) — no cudaFree.
+    mExportGathered.clear();
+    mExportHostBuffers.clear();
+}
+
 void ModularLoRAWeightsManager::export_to_file(const std::string& file_name, NCCLCommunicator& comm) const {
     if (!enabled()) return;
+    if (has_ep_local_grouped()) {
+        // Each rank owns a shard of the experts; assemble the full adapter on
+        // every rank (all_gather), then rank 0 writes it.
+        gather_grouped_for_export(comm);
+    }
     if (comm.rank() == 0) {
         write_safetensors(file_name, const_cast<ModularLoRAWeightsManager&>(*this));
     }
     comm.barrier();
+    release_export_gathered();
 }
 
 LoRABlockWeights<Tensor>& ModularLoRAWeightsManager::get_block(int layer_idx, cudaStream_t stream) {
@@ -758,22 +864,42 @@ void ModularLoRAWeightsManager::iterate_tensors(const std::function<void(std::st
         // MoE expert LoRA
         if (block.moe.use_grouped) {
             // Export grouped tensors in per-expert format for PEFT compatibility
-            // Grouped tensors have shape [num_experts, ...], slice along dim 0
+            // Grouped tensors have shape [num_grouped_experts, ...], slice along
+            // dim 0. Under EP each rank holds a shard of the experts; names use
+            // GLOBAL expert ids so per-rank iteration (optimizer, import) stays
+            // consistent and export_to_file can assemble the full adapter.
             auto& g = block.moe.grouped;
-            const int num_experts = mConfig.num_experts;
+            // During an EP export, gathered global tensors (all experts) stand in
+            // for the local shard; otherwise iterate the local experts under
+            // their global ids.
+            const bool use_gathered = !mExportGathered.empty();
+            const int num_experts = use_gathered ? mConfig.num_experts : mConfig.effective_grouped_experts();
+            const int expert_base = use_gathered ? 0 : mConfig.grouped_expert_base;
 
             auto export_grouped_layer = [&](const std::optional<LoRAGroupedLayerWeights<TensorShard>>& layer,
                                             const char* proj_name) {
                 if (!layer.has_value() || !layer->has_value()) return;
+                TensorShard A_src = layer->A;
+                TensorShard B_src = layer->B;
+                if (use_gathered) {
+                    auto a_it = mExportGathered.find(fmt::format("{}:{}:A", l, proj_name));
+                    auto b_it = mExportGathered.find(fmt::format("{}:{}:B", l, proj_name));
+                    if (a_it == mExportGathered.end() || b_it == mExportGathered.end()) {
+                        throw std::logic_error(fmt::format(
+                            "EP adapter export: missing gathered tensors for layer {} proj {}", l, proj_name));
+                    }
+                    A_src = TensorShard(a_it->second);
+                    B_src = TensorShard(b_it->second);
+                }
                 for (int e = 0; e < num_experts; ++e) {
-                    std::string expert_prefix = fmt::format("{}.mlp.experts.{}", prefix, e);
+                    std::string expert_prefix = fmt::format("{}.mlp.experts.{}", prefix, expert_base + e);
                     // Slice out expert e from dim 0: A[e,:,:] and B[e,:,:]
-                    TensorShard A_slice = TensorShard(slice(layer->A, 0, e, e + 1));
-                    TensorShard B_slice = TensorShard(slice(layer->B, 0, e, e + 1));
+                    TensorShard A_slice = TensorShard(slice(A_src, 0, e, e + 1));
+                    TensorShard B_slice = TensorShard(slice(B_src, 0, e, e + 1));
                     // Remove the leading dimension of size 1 by adjusting shape
                     // A: [1, rank, in] -> [rank, in], B: [1, out, rank] -> [out, rank]
-                    A_slice.Rank = layer->A.Rank - 1;
-                    B_slice.Rank = layer->B.Rank - 1;
+                    A_slice.Rank = A_src.Rank - 1;
+                    B_slice.Rank = B_src.Rank - 1;
                     for (int d = 0; d < A_slice.Rank; ++d)
                         A_slice.Sizes[d] = A_slice.Sizes[d + 1];
                     for (int d = 0; d < B_slice.Rank; ++d)
