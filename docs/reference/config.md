@@ -336,11 +336,21 @@ datasets:
 
 #### Preference Dataset Options (`type: "preference"`)
 
-For offline DPO. Each JSONL row has `prompt` (a string or a chat `messages` list),
+For offline DPO. Each row has `prompt` (a string or a chat `messages` list),
 `chosen`, and `rejected` (the two competing assistant continuations). Chat rows may
 also set `enable_thinking` to control the generation prefix. Loss is applied only
 on the response tokens. Used by the
 `surogate dpo` command together with the [DPO loss block](#dpo-settings).
+Preference datasets load through the same pipeline as the other types, so `path`
+may be a local JSONL/JSON/parquet/CSV file, a dataset directory, or a HuggingFace
+hub repo, and `subset`/`split`/`samples` apply as usual.
+
+| Option                  | Type   | Default             | Description                                                                     |
+| ----------------------- | ------ | ------------------- | ------------------------------------------------------------------------------- |
+| `prompt_field`          | string | `"prompt"`          | Name of the column containing the prompt (string or chat messages list).        |
+| `chosen_field`          | string | `"chosen"`          | Name of the column containing the preferred response.                           |
+| `rejected_field`        | string | `"rejected"`        | Name of the column containing the dispreferred response.                        |
+| `enable_thinking_field` | string | `"enable_thinking"` | Name of the optional column controlling the chat-template thinking prefix.      |
 
 ```json
 {"prompt": "...", "chosen": "preferred response", "rejected": "dispreferred response"}
@@ -351,6 +361,11 @@ on the response tokens. Used by the
 datasets:
   - path: ./pairs.jsonl
 	type: preference
+  - path: "org/hf-preference-dataset"
+	type: preference
+	split: train
+	chosen_field: preferred
+	rejected_field: dispreferred
 ```
 
 ## DPO Settings

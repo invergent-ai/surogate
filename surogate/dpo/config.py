@@ -9,6 +9,7 @@ GRPO, DPO keeps `datasets` (it reads static preference pairs of the form
 from dataclasses import dataclass, fields
 from typing import Literal
 
+from surogate.core.config.enums import SurogateDatasetType
 from surogate.core.config.sft_config import SFTConfig
 from surogate.utils.dict import DictDefault
 from surogate.utils.logger import get_logger
@@ -76,7 +77,19 @@ class DPOTrainConfig(SFTConfig):
         if "lmhead_drop_ignored_rows" not in cfg:
             cfg["lmhead_drop_ignored_rows"] = True
 
+        # `surogate dpo` consumes {prompt, chosen, rejected} pairs, so a bare
+        # `- path: pairs.jsonl` entry means `type: preference`.
+        for ds_cfg in cfg.get("datasets") or []:
+            if not ds_cfg.get("type"):
+                ds_cfg["type"] = "preference"
+
         super().__init__(cfg)
+
+        for ds_cfg in self.datasets or []:
+            if ds_cfg.type != SurogateDatasetType.preference:
+                raise ValueError(
+                    f"DPO datasets must be 'type: preference'; got type '{ds_cfg.type}' for '{ds_cfg.path}'"
+                )
 
         loss_cfg = cfg.get("loss", {})
         if isinstance(loss_cfg, DPOLossConfig):
