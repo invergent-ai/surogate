@@ -9,6 +9,10 @@ gradient_accumulation_steps: 1
 
 gpus: 8
 ep_size: 8
+# LLEP load balancing (threshold 1.3 to enable): balances the routing-hot rank's
+# VRAM (uniform ~22.5 GB vs 30.5/15.8 skew) but currently costs ~2.4x step time
+# until the LLEP perf pass lands. 999 = static EP (fastest, validated).
+ep_load_balance_threshold: 999
 
 sample_packing: true
 sequence_len: 256
