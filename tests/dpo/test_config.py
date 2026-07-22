@@ -90,3 +90,40 @@ def test_inherits_sft_fields(tmp_path):
     assert cfg.lora_rank == 16
     # DPO bypasses SFT packing and disables CUDA graphs.
     assert cfg.use_cuda_graphs is False
+
+
+def test_dataset_type_defaults_to_preference(tmp_path):
+    from surogate.core.config.dataset_config import PreferenceDatasetConfig
+
+    p = tmp_path / "dpo.yaml"
+    p.write_text(
+        yaml.safe_dump(
+            {
+                "model": MODEL,
+                "lora": True,
+                "recipe": "bf16",
+                "gpus": 1,
+                "datasets": [{"path": "x.jsonl"}],
+            }
+        )
+    )
+    cfg = load_config(DPOTrainConfig, str(p))
+    assert isinstance(cfg.datasets[0], PreferenceDatasetConfig)
+    assert cfg.datasets[0].type == "preference"
+
+
+def test_rejects_non_preference_dataset_type(tmp_path):
+    p = tmp_path / "dpo.yaml"
+    p.write_text(
+        yaml.safe_dump(
+            {
+                "model": MODEL,
+                "lora": True,
+                "recipe": "bf16",
+                "gpus": 1,
+                "datasets": [{"path": "x.jsonl", "type": "conversation"}],
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="must be 'type: preference'"):
+        load_config(DPOTrainConfig, str(p))

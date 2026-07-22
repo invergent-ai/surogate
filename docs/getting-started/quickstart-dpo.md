@@ -7,13 +7,20 @@ rejected}` triples and run a single command.
 
 ## 1) Prepare preference data
 
-A `type: preference` dataset is JSONL with three required fields per row. `prompt` may be a
+A `type: preference` dataset has three required fields per row. `prompt` may be a
 string or a chat `messages` list; `chosen`/`rejected` are the two competing assistant
 continuations. Chat rows may also set `enable_thinking`:
 
 ```json
 {"prompt": "Scrie corect în limba română.", "chosen": "Ei mergeau acasă.", "rejected": "Ei mergerăm acasă."}
 ```
+
+Like the other dataset types (`text`, `instruction`, `conversation`), preference data
+loads through the shared dataset pipeline: `path` may be a local JSONL/JSON/parquet/CSV
+file, a dataset directory, or a HuggingFace hub repo, and `subset`/`split`/`samples`
+work as usual. Datasets with different column names map via `prompt_field`,
+`chosen_field`, and `rejected_field` (see the
+[config reference](../reference/config.md#preference-dataset-options-type-preference)).
 
 Loss is applied only to the response tokens. Minimal pairs — where `chosen` and
 `rejected` differ in as little as a single word — give the cleanest signal, because

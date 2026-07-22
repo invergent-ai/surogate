@@ -19,6 +19,7 @@ from surogate.core.config.enums import SurogateDatasetType
 from surogate.core.datasets.preprocessor.auto import AutoPreprocessor
 from surogate.core.datasets.preprocessor.conversation import ConversationPreprocessor
 from surogate.core.datasets.preprocessor.instruction import InstructionPreprocessor
+from surogate.core.datasets.preprocessor.preference import PreferencePreprocessor
 from surogate.core.datasets.preprocessor.text import TextPreprocessor
 from surogate.core.datasets.utils import DATASET_TYPE, sample_dataset
 from surogate.utils.logger import get_logger
@@ -219,6 +220,8 @@ def pre_process(
         preprocessor = ConversationPreprocessor(ds_config)
     elif ds_config.type == SurogateDatasetType.text:
         preprocessor = TextPreprocessor(ds_config)
+    elif ds_config.type == SurogateDatasetType.preference:
+        preprocessor = PreferencePreprocessor(ds_config)
 
     preprocessor.dataset_sample = ds_config.samples
     return preprocessor(dataset, num_proc=num_proc, load_from_cache_file=load_from_cache_file, strict=strict)

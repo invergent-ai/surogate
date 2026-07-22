@@ -33,6 +33,9 @@ from pathlib import Path
 import numpy as np
 
 from surogate import _surogate
+from surogate.core.config.dataset_config import PreferenceDatasetConfig
+from surogate.core.datasets.datasets import disable_datasets_caching
+from surogate.core.datasets.loader import load_dataset_with_config, pre_process
 from surogate.dpo.config import DPOTrainConfig
 from surogate.dpo.data import tokenize_preference_pairs
 from surogate.train.lr_schedule import LRSchedule
@@ -44,31 +47,32 @@ from surogate.utils.tensor import to_surogate_dtype
 logger = get_logger()
 
 
-def _load_pref_rows(path: str) -> list[dict]:
-    rows = []
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            r = json.loads(line)
-            if "prompt" in r and "chosen" in r and "rejected" in r:
-                row = {"prompt": r["prompt"], "chosen": r["chosen"], "rejected": r["rejected"]}
-                if "enable_thinking" in r:
-                    row["enable_thinking"] = r["enable_thinking"]
-                rows.append(row)
-    if not rows:
-        raise ValueError(f"no {{prompt, chosen, rejected}} rows in {path}")
-    return rows
+def _normalize_pref_row(row: dict) -> dict:
+    """Strip the Arrow round-trip artifacts (all-columns rows with None fills)
+    back to the minimal {prompt, chosen, rejected[, enable_thinking]} dict the
+    tokenizer and the ref-sidecar digest expect."""
+    out = {"prompt": row["prompt"], "chosen": row["chosen"], "rejected": row["rejected"]}
+    if row.get("enable_thinking") is not None:
+        out["enable_thinking"] = bool(row["enable_thinking"])
+    return out
 
 
-def _load_pref_datasets(paths: list[str]) -> list[dict]:
-    """Load configured preference shards in declaration order."""
-    if not paths:
+def _load_pref_datasets(dataset_configs: list[PreferenceDatasetConfig], num_workers: int = 1) -> list[dict]:
+    """Load configured `type: preference` datasets in declaration order through the
+    shared dataset framework (local json/jsonl/parquet/csv files, dataset
+    directories, or HF hub repos; honors subset/split/samples and the
+    prompt/chosen/rejected field mappings)."""
+    if not dataset_configs:
         raise ValueError("DPO requires at least one preference dataset")
-    rows = []
-    for path in paths:
-        rows.extend(_load_pref_rows(path))
+    rows: list[dict] = []
+    with disable_datasets_caching():
+        for ds_cfg in dataset_configs:
+            dataset = load_dataset_with_config(ds_cfg, num_workers=num_workers)
+            ds_cfg.validate_columns(dataset.column_names)
+            dataset = pre_process(dataset, ds_cfg, num_proc=num_workers, load_from_cache_file=False)
+            if len(dataset) == 0:
+                raise ValueError(f"no {{prompt, chosen, rejected}} rows in {ds_cfg.path}")
+            rows.extend(_normalize_pref_row(row) for row in dataset.to_list())
     return rows
 
 
@@ -205,7 +209,7 @@ def dpo_main(config: DPOTrainConfig, args=None) -> None:
             logger.info("No DPO checkpoint found; starting from step 0")
 
     # --- tokenize preference pairs -----------------------------------------
-    rows = _load_pref_datasets([dataset.path for dataset in (config.datasets or [])])
+    rows = _load_pref_datasets(config.datasets or [], num_workers=config.dataloader_num_workers or 1)
     batch = tokenize_preference_pairs(rows, config.tokenizer, max_len=T, span_mask=config.loss.span_mask)
     logger.info(f"Tokenized {batch.n_pairs} preference pairs (from {len(rows)} rows)")
     Path(config.output_dir).mkdir(parents=True, exist_ok=True)

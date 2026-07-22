@@ -15,6 +15,7 @@ from surogate.core.config.dataset_config import (
     ConversationDatasetConfig,
     DatasetConfig,
     InstructionDatasetConfig,
+    PreferenceDatasetConfig,
     TextDatasetConfig,
 )
 from surogate.core.config.enums import SurogateDatasetType
@@ -22,6 +23,7 @@ from surogate.core.datasets.loader import load_dataset_with_config
 from surogate.core.datasets.lock import FileLockLoader
 from surogate.core.datasets.preprocessor.conversation import ConversationPreprocessor
 from surogate.core.datasets.preprocessor.instruction import InstructionPreprocessor
+from surogate.core.datasets.preprocessor.preference import PreferencePreprocessor
 from surogate.core.datasets.preprocessor.text import TextPreprocessor
 from surogate.utils.dict import DictDefault
 from surogate.utils.logger import get_logger
@@ -85,6 +87,9 @@ def wrap_dataset(ds_cfg: DatasetConfig, dataset: Dataset | IterableDataset) -> D
     elif ds_cfg.type == SurogateDatasetType.text:
         ds_cfg = ds_cfg if isinstance(ds_cfg, TextDatasetConfig) else TextDatasetConfig(**ds_cfg.__dict__)
         processor = TextPreprocessor(ds_cfg)
+    elif ds_cfg.type == SurogateDatasetType.preference:
+        ds_cfg = ds_cfg if isinstance(ds_cfg, PreferenceDatasetConfig) else PreferenceDatasetConfig(**ds_cfg.__dict__)
+        processor = PreferencePreprocessor(ds_cfg)
     else:
         raise ValueError(f"Unsupported dataset type: {ds_cfg.type}")
 
