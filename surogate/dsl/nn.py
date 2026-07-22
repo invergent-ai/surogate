@@ -384,6 +384,15 @@ class Module:
         return Proxy(out_name, ref)
 
     @staticmethod
+    def _swiglu(x: Proxy, *, name: str | None = None) -> Proxy:
+        """SwiGLU activation on a fused [up; gate] tensor."""
+        tracer = _current_tracer.get()
+        g = tracer.graph
+        out_name = name or g._fresh_name("swiglu")
+        ref = g.swiglu(x.ref, out_name=out_name)
+        return Proxy(out_name, ref)
+
+    @staticmethod
     def _matmul(x: Proxy, weight_name: str, *, transpose: str = "NT", name: str | None = None) -> Proxy:
         """Matmul with a named weight parameter."""
         tracer = _current_tracer.get()

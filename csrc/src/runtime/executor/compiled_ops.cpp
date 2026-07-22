@@ -271,6 +271,7 @@ const char* op_type_to_string(CompiledOpType type) {
         case CompiledOpType::GeluGlu: return "gelu_glu";
         case CompiledOpType::GptOssMoeAct: return "gpt_oss_moe_act";
         case CompiledOpType::Silu: return "silu";
+        case CompiledOpType::Softplus: return "softplus";
         case CompiledOpType::Gelu: return "gelu";
         case CompiledOpType::Relu2: return "relu2";
         case CompiledOpType::Mul: return "mul";
@@ -307,6 +308,7 @@ const char* op_type_to_string(CompiledOpType type) {
         case CompiledOpType::GeluGluBackward: return "gelu_glu_backward";
         case CompiledOpType::GptOssMoeActBackward: return "gpt_oss_moe_act_backward";
         case CompiledOpType::SiluBackward: return "silu_backward";
+        case CompiledOpType::SoftplusBackward: return "softplus_backward";
         case CompiledOpType::GeluBackward: return "gelu_backward";
         case CompiledOpType::Relu2Backward: return "relu2_backward";
         case CompiledOpType::MulBackward: return "mul_backward";

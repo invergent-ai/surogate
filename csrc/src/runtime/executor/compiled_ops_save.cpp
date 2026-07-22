@@ -379,8 +379,22 @@ void CompiledExecutor::prepare_saved_buffers_for_capture(const std::vector<std::
         }
         const long C = mConfig.HiddenSize;
         const long D = mRunState.buffer_plan().layer_intermediate(layer_idx);
-        const long Hq = mConfig.NumQueryHeads;
-        const long Hkv = mConfig.NumKeyValHeads;
+        long Hq = mConfig.NumQueryHeads;
+        long Hkv = mConfig.NumKeyValHeads;
+        // Per-layer head counts (Laguna: 48 full / 64 sliding) — q_rstd/lse
+        // buffers must follow the layer's head count, not the global config,
+        // or CUDA-graph capture prep undersizes them and the capture-time
+        // persist silently skips.
+        const auto& rc = mRunState.runtime_config();
+        if (layer_idx >= 0 && static_cast<std::size_t>(layer_idx) < rc.per_layer_dims.size()) {
+            const auto& pld = rc.per_layer_dims[static_cast<std::size_t>(layer_idx)];
+            if (pld.head_size > 0 && pld.attn_dim > 0 && (pld.attn_dim % pld.head_size) == 0) {
+                Hq = pld.attn_dim / pld.head_size;
+            }
+            if (pld.head_size > 0 && pld.kv_dim > 0 && (pld.kv_dim % pld.head_size) == 0) {
+                Hkv = pld.kv_dim / pld.head_size;
+            }
+        }
         const long QKV = mRunState.buffer_plan().layer_qkv(layer_idx);
         const long AttnDim = mRunState.buffer_plan().layer_attn_dim(layer_idx);
         const long MUp = mRunState.buffer_plan().layer_mlp_up(layer_idx);

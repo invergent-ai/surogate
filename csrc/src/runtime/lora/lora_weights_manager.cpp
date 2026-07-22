@@ -168,7 +168,7 @@ void ModularLoRAWeightsManager::allocate_block_weights(int layer_idx) {
     // MoE LoRA: enable for MoE block types or Dense blocks in global MoE models.
     // Hybrid MoE blocks are supported via grouped GEMM LoRA hooks.
     const bool has_global_moe = (mConfig.num_experts > 0);
-    const bool layer_is_moe =
+    bool layer_is_moe =
         (bt == BlockType::MoE || bt == BlockType::SwitchMoE) || (bt == BlockType::Dense && has_global_moe);
     // Dense MLP LoRA:
     // - Dense (non-MoE) or MLP block types
@@ -176,8 +176,20 @@ void ModularLoRAWeightsManager::allocate_block_weights(int layer_idx) {
     //   contain standard MLP up/down/gate projections.
     const bool layer_is_qwen3_linear_mlp = (bt == BlockType::Mamba) && is_qwen3_hybrid;
     const bool layer_is_qwen3_attention_mlp = (bt == BlockType::Attention) && is_qwen3_hybrid;
-    const bool layer_is_dense_mlp = (bt == BlockType::MLP) || (bt == BlockType::Dense && !has_global_moe) ||
-                                    layer_is_qwen3_linear_mlp || layer_is_qwen3_attention_mlp;
+    bool layer_is_dense_mlp = (bt == BlockType::MLP) || (bt == BlockType::Dense && !has_global_moe) ||
+                              layer_is_qwen3_linear_mlp || layer_is_qwen3_attention_mlp;
+
+    // Per-layer MLP structure from the DSL graph overrides the block-type
+    // heuristics. Hybrid dense/sparse-MLP models (Laguna: layer 0 dense
+    // SwiGLU, remaining layers MoE) classify every layer as MoE above, which
+    // would silently skip the dense layer's MLP LoRA and allocate dead
+    // grouped expert buffers for it.
+    if (static_cast<std::size_t>(layer_idx) < mConfig.layer_has_moe.size()) {
+        layer_is_moe = mConfig.layer_has_moe[static_cast<std::size_t>(layer_idx)] != 0;
+    }
+    if (static_cast<std::size_t>(layer_idx) < mConfig.layer_has_dense_mlp.size()) {
+        layer_is_dense_mlp = mConfig.layer_has_dense_mlp[static_cast<std::size_t>(layer_idx)] != 0;
+    }
 
     if (layer_is_moe && mConfig.num_experts > 0) {
         master.moe.use_grouped = true;
@@ -221,7 +233,10 @@ void ModularLoRAWeightsManager::allocate_block_weights(int layer_idx) {
                 }
             }
         }
-    } else if (layer_is_dense_mlp) {
+    }
+    // Not else-if: hybrid blocks can carry BOTH a dense MLP and MoE experts
+    // (Gemma4 MoE variants run them in parallel within one block).
+    if (layer_is_dense_mlp) {
         if (mConfig.lora_config.applies_to_gate()) {
             master.mlp.gate.emplace();
             work.mlp.gate.emplace();

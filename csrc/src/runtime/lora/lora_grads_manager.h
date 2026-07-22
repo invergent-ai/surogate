@@ -56,6 +56,11 @@ public:
         /// manager so gradient buffers line up with the LoRA weights.
         std::vector<dsl::BlockTypeDims> per_layer_dims;
 
+        /// Per-layer MLP structure — must mirror the weights manager (see
+        /// ModularLoRAWeightsManager::Config).
+        std::vector<std::uint8_t> layer_has_dense_mlp;
+        std::vector<std::uint8_t> layer_has_moe;
+
         [[nodiscard]] int effective_moe_intermediate() const {
             return moe_intermediate_size > 0 ? moe_intermediate_size : intermediate_size;
         }

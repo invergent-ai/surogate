@@ -19,6 +19,7 @@
 
 #include "runtime/dsl/graph_compiler.h"
 #include "runtime/dsl/ir.h"
+#include "runtime/dsl/per_layer_dims.h"
 #include "runtime/executor/graph_executor_helpers.h"
 #include "runtime/executor/graph_executor_utils.h"
 #include "runtime/executor/op_registry.h"
@@ -397,6 +398,7 @@ CompiledOpType op_type_from_string(const std::string& op_type) {
         {"gelu_glu", CompiledOpType::GeluGlu},
         {"gpt_oss_moe_act", CompiledOpType::GptOssMoeAct},
         {"silu", CompiledOpType::Silu},
+        {"softplus", CompiledOpType::Softplus},
         {"sigmoid", CompiledOpType::MoESigmoid},
         {"gelu", CompiledOpType::Gelu},
         {"relu2", CompiledOpType::Relu2},
@@ -437,6 +439,7 @@ CompiledOpType op_type_from_string(const std::string& op_type) {
         {"gelu_glu_backward", CompiledOpType::GeluGluBackward},
         {"gpt_oss_moe_act_backward", CompiledOpType::GptOssMoeActBackward},
         {"silu_backward", CompiledOpType::SiluBackward},
+        {"softplus_backward", CompiledOpType::SoftplusBackward},
         {"sigmoid_backward", CompiledOpType::MoESigmoidBackward},
         {"gelu_backward", CompiledOpType::GeluBackward},
         {"relu2_backward", CompiledOpType::Relu2Backward},
@@ -543,78 +546,8 @@ GraphCompiler::GraphCompiler(const Module& module,
         const long default_hs = config.head_size();
         const long default_dff = config.IntermediateSize;
 
-        mPerLayerDims.resize(static_cast<std::size_t>(num_layers));
-        for (int i = 0; i < num_layers; ++i) {
-            auto& d = mPerLayerDims[static_cast<std::size_t>(i)];
-            d.head_size = default_hs;
-            d.qkv_channels = default_hs * (hq + 2 * default_hkv);
-            d.attn_dim = hq * default_hs;
-            d.intermediate = default_dff;
-            d.mlp_up = 2 * default_dff;
-        }
-        // out_weight is authoritative for attn_dim/head_size: its columns are
-        // exactly Hq*Hs regardless of how Q/K/V are packed. The qkv_weight
-        // row count is ambiguous (k_eq_v layers pack Hq+Hkv heads, not
-        // Hq+2*Hkv), so derive from it only when no out_weight was seen.
-        std::vector<bool> attn_from_out(static_cast<std::size_t>(num_layers), false);
-        for (const auto& [name, info] : graph.params) {
-            int layer_idx = -1;
-            std::string field;
-            if (!parse_block_param(name, layer_idx, field)) continue;
-            if (layer_idx < 0 || layer_idx >= num_layers || info.shape.size() < 2) continue;
-            long s0 = (info.shape[0].kind == DimKind::Concrete) ? info.shape[0].value : 0;
-            long s1 = (info.shape[1].kind == DimKind::Concrete) ? info.shape[1].value : 0;
-            if (s0 == 0 || s1 == 0) continue;
-            auto& d = mPerLayerDims[static_cast<std::size_t>(layer_idx)];
-            if (field == "out_weight") {
-                d.attn_dim = s1;
-                if (hq > 0) d.head_size = s1 / hq;
-                attn_from_out[static_cast<std::size_t>(layer_idx)] = true;
-            } else if (field == "mlp_down_weight") {
-                d.intermediate = s1;
-                d.mlp_up = s1;
-            } else if (field == "mlp_gate_weight") {
-                d.intermediate = s0;
-                d.mlp_up = s0;
-            }
-        }
-        for (const auto& [name, info] : graph.params) {
-            int layer_idx = -1;
-            std::string field;
-            if (!parse_block_param(name, layer_idx, field)) continue;
-            if (layer_idx < 0 || layer_idx >= num_layers || info.shape.size() < 2) continue;
-            long s0 = (info.shape[0].kind == DimKind::Concrete) ? info.shape[0].value : 0;
-            long s1 = (info.shape[1].kind == DimKind::Concrete) ? info.shape[1].value : 0;
-            if (s0 == 0 || s1 == 0) continue;
-            auto& d = mPerLayerDims[static_cast<std::size_t>(layer_idx)];
-            const bool from_out = attn_from_out[static_cast<std::size_t>(layer_idx)];
-            if (field == "qkv_weight") {
-                d.qkv_channels = s0;
-                if (from_out) {
-                    if (hq > 0) d.head_size = d.attn_dim / hq;
-                } else {
-                    long total_heads = hq + 2 * default_hkv;
-                    if (total_heads > 0) d.head_size = s0 / total_heads;
-                    d.attn_dim = hq * d.head_size;
-                }
-            } else if (field == "self_attn_q_weight") {
-                d.qkv_channels = s0;
-                if (!from_out) {
-                    if (hq > 0) d.head_size = s0 / hq;
-                    d.attn_dim = s0;
-                }
-            }
-        }
-        // Detect hybrid blocks: check if per-layer dims actually differ
-        for (std::size_t pi = 1; pi < mPerLayerDims.size(); ++pi) {
-            if (mPerLayerDims[pi].head_size != mPerLayerDims[0].head_size ||
-                mPerLayerDims[pi].qkv_channels != mPerLayerDims[0].qkv_channels ||
-                mPerLayerDims[pi].attn_dim != mPerLayerDims[0].attn_dim ||
-                mPerLayerDims[pi].intermediate != mPerLayerDims[0].intermediate) {
-                mHasHybridBlocks = true;
-                break;
-            }
-        }
+        derive_per_layer_block_dims(graph, num_layers, hq, default_hkv, default_hs, default_dff, mPerLayerDims);
+        mHasHybridBlocks = per_layer_dims_vary(mPerLayerDims);
         if (!mHasHybridBlocks) {
             // All layers have the same dims — no need for per-layer tracking
             mPerLayerDims.clear();
@@ -681,6 +614,27 @@ void GraphCompiler::apply_per_layer_dim_override(std::vector<long>& shape,
     }
     if (base_field == "att_flat") {
         shape = {B * T, pld.attn_dim};
+        return;
+    }
+    // Per-layer head counts (Laguna): rstd/lse head dims follow attn_dim/head_size.
+    if (pld.head_size > 0 && pld.attn_dim > 0) {
+        const long hq = pld.attn_dim / pld.head_size;
+        if (base_field == "q_rstd") {
+            shape = {B, T, hq};
+            return;
+        }
+        if (base_field == "lse") {
+            shape = {B, hq, T};
+            return;
+        }
+        if (base_field == "k_rstd" && pld.kv_dim > 0) {
+            shape = {B, T, pld.kv_dim / pld.head_size};
+            return;
+        }
+    }
+    // Attention output-gate projection (Laguna softplus gate).
+    if (pld.gate_dim > 0 && (base_field == "gate_proj_out" || base_field == "gate_act")) {
+        shape = {B, T, pld.gate_dim};
         return;
     }
     // MLP intermediate.
@@ -859,37 +813,19 @@ void GraphCompiler::apply_fusion_rewrites(CompiledGraph& graph, bool is_backward
         return true;
     };
 
-    auto can_apply_qkv_qknorm_rope = [&](std::size_t start, std::string& reason) -> bool {
-        if (is_backward) {
-            reason = "forward-only rewrite";
-            return false;
-        }
-        if (start + 1 >= graph.ops.size()) {
-            reason = "truncated candidate";
-            return false;
-        }
-        const CompiledOp& qknorm = graph.ops[start];
-        const CompiledOp& rope = graph.ops[start + 1];
-        if (qknorm.type != CompiledOpType::QKVQKNorm || rope.type != CompiledOpType::RoPE) {
-            reason = "candidate op types changed";
-            return false;
-        }
-        if (qknorm.inputs.size() != 3 || qknorm.outputs.size() != 3 || rope.inputs.size() != 3 ||
-            rope.outputs.size() != 1) {
-            reason = "unsupported operand arity";
-            return false;
-        }
-        const std::string& qknorm_out = qknorm.outputs[0].name;
-        if (qknorm_out.empty() || rope.inputs[0].name != qknorm_out) {
-            reason = "rope does not consume qkv_qk_norm output directly";
-            return false;
-        }
-        if (input_use_count[qknorm_out] != 1) {
-            reason = "qkv_qk_norm output has multiple consumers";
-            return false;
-        }
-        reason.clear();
-        return true;
+    auto can_apply_qkv_qknorm_rope = [&](std::size_t /*start*/, std::string& reason) -> bool {
+        // Disabled: this rewrite fused only the forward pair. The autodiff
+        // backward graph keeps the separate qkv_qk_norm_backward op, which
+        // reads the saved pre-rope norm output — a tensor the fused forward
+        // never materializes (first exercised by Laguna; models that want the
+        // fused kernel emit qkv_qk_norm_rope directly from the DSL, which has
+        // a proper fused backward). Re-implement only together with a
+        // backward rewrite of the rope_backward + qkv_qk_norm_backward pair,
+        // and keep the fused kernel's full-head rotate_half pairing in mind:
+        // GLM-prefix partial rotary (rotary_dim < head_size) must stay
+        // unfused regardless.
+        reason = "disabled: forward-only fusion breaks the unfused backward's saved pre-rope input";
+        return false;
     };
 
     auto can_apply_residual_rmsnorm = [&](std::size_t start, std::string& reason) -> bool {

@@ -898,6 +898,274 @@ class GptOssMoEExperts(Module):
         return Proxy(out_slot, moe_out)
 
 
+class LagunaMoEExperts(Module):
+    """Laguna MoE: sigmoid routing + correction bias, SwiGLU experts, routed scaling.
+
+    Router (HF ``LagunaTopKRouter``): logits → sigmoid → top-k selected on
+    (score + e_score_correction_bias), weighted by the unbiased scores,
+    normalized over the selected experts, then scaled by
+    ``moe_routed_scaling_factor``. Experts are standard SwiGLU (fused gate+up).
+    The shared expert is added separately at the block level.
+    """
+
+    _hf_mapping_defaults_ = {
+        "router_weight": "{prefix}.gate.weight",
+        # Stored under mlp.experts.* on disk (HF renames it onto the gate at load).
+        "e_score_correction_bias": "{prefix}.experts.e_score_correction_bias",
+        "experts_gate_up": stack_experts(
+            "{prefix}.experts.{expert}.gate_proj.weight",
+            fuse_gate_up=True,
+        ),
+        "experts_down": stack_experts(
+            "{prefix}.experts.{expert}.down_proj.weight",
+        ),
+    }
+
+    def __init__(
+        self,
+        d_model: int,
+        d_ff: int,
+        num_experts: int,
+        num_experts_per_tok: int = 8,
+        routed_scaling_factor: float = 1.0,
+        ep_size: int = 1,
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.d_ff = d_ff
+        self.num_experts = num_experts
+        self.num_experts_per_tok = num_experts_per_tok
+        self.routed_scaling_factor = routed_scaling_factor
+        self.ep_size = ep_size
+
+        self.C = Dim("C")
+        self.M = Dim("M")
+        self.E = Dim("E")
+        self.K = Dim("K")
+        self.MUp = 2 * self.M
+
+    def _trace(self, tracer: Tracer, *args: Proxy, **kwargs: Any) -> Proxy:
+        g = tracer.graph
+        (x,) = args  # x is [B*T, C]
+
+        _ff = self.d_ff
+        _hidden = self.d_model
+        _n_experts = self.num_experts
+
+        # -- params ----------------------------------------------------------
+        tracer.register_param(
+            "router_weight",
+            ("E", "C"),
+            quantizable=False,
+            lora_targets=[LoRATarget(name="router", size=_n_experts)],
+        )
+        tracer.register_param("e_score_correction_bias", ("E",), dtype="fp32", quantizable=False)
+        tracer.register_param(
+            "experts_gate_up",
+            ("E", "MUp", "C"),
+            offload_group="moe_experts",
+            lora_targets=[
+                LoRATarget(
+                    name="expert_gate_up",
+                    size=2 * _ff,
+                    grouped=True,
+                )
+            ],
+        )
+        tracer.register_param(
+            "experts_down",
+            ("E", "C", "M"),
+            offload_group="moe_experts",
+            lora_targets=[
+                LoRATarget(
+                    name="expert_down",
+                    size=_hidden,
+                    grouped=True,
+                )
+            ],
+        )
+
+        # -- activation slots ------------------------------------------------
+        tracer.register_activation(
+            "router_logits",
+            ("B * T", "E"),
+            save=True,
+            share_policy="fft_share",
+            description="Router logits before sigmoid",
+        )
+        tracer.register_activation(
+            "router_probs",
+            ("B * T", "E"),
+            save=True,
+            share_policy="fft_share",
+            description="Sigmoid router scores",
+        )
+        tracer.register_activation(
+            "routing_weights",
+            ("B * T", "K"),
+            save=True,
+            share_policy="fft_share",
+        )
+        tracer.register_activation(
+            "routing_indices",
+            ("B * T", "K"),
+            dtype="int32",
+            save=True,
+            share_policy="fft_share",
+        )
+        tracer.register_activation(
+            "permuted_input",
+            ("B * T * K", "C"),
+            save=True,
+            share_policy="fft_share",
+        )
+        tracer.register_activation(
+            "scatter_indices",
+            ("B * T * K",),
+            dtype="int32",
+            save=True,
+            share_policy="fft_share",
+        )
+        if self.ep_size > 1:
+            tracer.register_activation(
+                "ep_recv_input",
+                ("B * T * K", "C"),
+                save=True,
+                share_policy="per_layer",
+                when="ep_size > 1",
+            )
+            tracer.register_activation(
+                "ep_recv_scatter",
+                ("B * T * K",),
+                dtype="int32",
+                save=True,
+                share_policy="per_layer",
+                when="ep_size > 1",
+            )
+        tracer.register_activation(
+            "expert_gate_up",
+            ("B * T * K", "MUp"),
+            save=True,
+            share_policy="fft_share",
+        )
+        tracer.register_activation(
+            "expert_act",
+            ("B * T * K", "M"),
+            save=True,
+            share_policy="fft_share",
+        )
+        tracer.register_activation(
+            "expert_down",
+            ("B * T * K", "C"),
+            save=True,
+            share_policy="fft_share",
+        )
+        if self.ep_size > 1:
+            tracer.register_activation(
+                "ep_combined",
+                ("B * T * K", "C"),
+                save=True,
+                share_policy="per_layer",
+                when="ep_size > 1",
+            )
+        out_slot = tracer.register_activation(
+            "out",
+            ("B * T", "C"),
+            aliases=["out_flat"],
+            save=True,
+            share_policy="fft_share",
+        )
+
+        # -- graph -----------------------------------------------------------
+        router_logits = g.matmul(
+            x.ref,
+            tracer.prefixed("router_weight"),
+            transpose="NT",
+            out_name=tracer.prefixed("router_logits"),
+        )
+
+        # Sigmoid routing scores
+        router_probs = g.moe_sigmoid(
+            router_logits,
+            out_name=tracer.prefixed("router_probs"),
+        )
+
+        # Top-k: select on (score + correction_bias), weight by unbiased score,
+        # normalize over selected, scale by routed_scaling_factor. HF's
+        # LagunaTopKRouter normalizes unconditionally (there is no config
+        # knob), so normalization is not configurable here either.
+        routing_weights, routing_indices = g.moe_topk(
+            router_probs,
+            top_k=self.num_experts_per_tok,
+            normalize=True,
+            scaling_factor=self.routed_scaling_factor,
+            correction_bias=tracer.prefixed("e_score_correction_bias"),
+            weights_name=tracer.prefixed("routing_weights"),
+            indices_name=tracer.prefixed("routing_indices"),
+        )
+
+        permuted_input, scatter_indices = g.moe_permute(
+            x.ref,
+            routing_indices,
+            top_k=self.num_experts_per_tok,
+            out_name=tracer.prefixed("permuted_input"),
+            scatter_name=tracer.prefixed("scatter_indices"),
+        )
+
+        if self.ep_size > 1:
+            ep_recv_input, ep_recv_scatter = g.ep_dispatch(
+                permuted_input,
+                routing_indices,
+                scatter_indices,
+                num_experts=self.num_experts,
+                ep_size=self.ep_size,
+                top_k=self.num_experts_per_tok,
+                out_name=tracer.prefixed("ep_recv_input"),
+                recv_scatter_name=tracer.prefixed("ep_recv_scatter"),
+            )
+            gemm_input = ep_recv_input
+            gemm_scatter = ep_recv_scatter
+        else:
+            gemm_input = permuted_input
+            gemm_scatter = scatter_indices
+
+        expert_gate_up = g.moe_grouped_gemm_gate_up(
+            gemm_input,
+            tracer.prefixed("experts_gate_up"),
+            gemm_scatter,
+            out_name=tracer.prefixed("expert_gate_up"),
+        )
+        expert_act = g.swiglu(
+            expert_gate_up,
+            out_name=tracer.prefixed("expert_act"),
+        )
+        expert_down = g.moe_grouped_gemm_down(
+            expert_act,
+            tracer.prefixed("experts_down"),
+            gemm_scatter,
+            out_name=tracer.prefixed("expert_down"),
+        )
+
+        if self.ep_size > 1:
+            expert_down = g.ep_combine(
+                expert_down,
+                num_experts=self.num_experts,
+                ep_size=self.ep_size,
+                top_k=self.num_experts_per_tok,
+                out_name=tracer.prefixed("ep_combined"),
+            )
+
+        moe_out = g.moe_unpermute(
+            expert_down,
+            routing_weights,
+            scatter_indices,
+            top_k=self.num_experts_per_tok,
+            out_name=out_slot,
+        )
+
+        return Proxy(out_slot, moe_out)
+
+
 class NemotronMoEExperts(Module):
     """Nemotron MoE with sigmoid routing, correction bias, relu2 activation."""
 

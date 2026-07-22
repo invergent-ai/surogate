@@ -61,6 +61,14 @@ public:
         /// apply_lora_contribution read past the end of lora_B (→ NaN/garbage).
         std::vector<dsl::BlockTypeDims> per_layer_dims;
 
+        /// Per-layer MLP structure from the DSL graph (hybrid dense/sparse-MLP
+        /// models like Laguna: layer 0 dense SwiGLU, remaining layers MoE).
+        /// Empty = unknown; fall back to block-type heuristics. When populated,
+        /// these override the block-type-derived layer_is_moe /
+        /// layer_is_dense_mlp classification per layer.
+        std::vector<std::uint8_t> layer_has_dense_mlp;
+        std::vector<std::uint8_t> layer_has_moe;
+
         [[nodiscard]] int effective_moe_intermediate() const {
             return moe_intermediate_size > 0 ? moe_intermediate_size : intermediate_size;
         }

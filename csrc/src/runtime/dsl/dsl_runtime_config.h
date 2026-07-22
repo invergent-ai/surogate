@@ -6,6 +6,7 @@
 #ifndef SUROGATE_SRC_DSL_DSL_RUNTIME_CONFIG_H
 #define SUROGATE_SRC_DSL_DSL_RUNTIME_CONFIG_H
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -19,6 +20,8 @@ struct BlockTypeDims {
     long head_size = 0;
     long qkv_channels = 0;  ///< D * (Hq + 2*Hkv) or D * (Hq + Hkv) for k_eq_v
     long attn_dim = 0;      ///< Hq * D
+    long kv_dim = 0;        ///< Hkv * D (separate-projection attention, e.g. Laguna)
+    long gate_dim = 0;      ///< attention output-gate width (Laguna g_proj rows)
     long intermediate = 0;  ///< M (may be 2x for double-wide MLP)
     long mlp_up = 0;        ///< up_factor * M
 };
@@ -49,6 +52,13 @@ struct DslRuntimeConfig {
 
     /// Per-layer dimensions. Empty for homogeneous models (use global config).
     std::vector<BlockTypeDims> per_layer_dims;
+
+    /// Per-layer MLP structure derived from the IR param names (hybrid
+    /// dense/sparse-MLP models like Laguna: layer 0 dense SwiGLU, remaining
+    /// layers MoE). Empty when the graph is unavailable — consumers must fall
+    /// back to block-type heuristics in that case.
+    std::vector<std::uint8_t> layer_has_dense_mlp;
+    std::vector<std::uint8_t> layer_has_moe;
 
     /// Per-layer RoPE parameters for hybrid models where layer types use
     /// different head sizes or rope formulas (e.g. Gemma4 full vs sliding).

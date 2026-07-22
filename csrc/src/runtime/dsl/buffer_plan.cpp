@@ -149,7 +149,14 @@ namespace {
     } else if (token == "QProjDim") {
         out = 2 * plan.layer_attn_dim(layer.layer);
     } else if (token == "KVDim") {
-        out = plan.Hkv * (plan.Hq > 0 ? plan.layer_attn_dim(layer.layer) / plan.Hq : 0);
+        out = plan.layer_kv_dim(layer.layer);
+    } else if (token == "GateDim") {
+        // Laguna attention output-gate width; 0 (unresolvable) when the
+        // model has no per-layer gate dims.
+        out = plan.layer_gate_dim(layer.layer);
+        if (out <= 0) {
+            return false;
+        }
     } else if (token == "M") {
         out = layer_m;
     } else if (token == "2M" || token == "MUp") {

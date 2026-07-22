@@ -43,18 +43,6 @@ namespace {
 // Helpers shared by forward and backward dispatch.
 // ---------------------------------------------------------------------------
 
-int resolve_layer_idx(const CompiledOp& op, int explicit_idx_input) {
-    int layer_idx = op.attrs.layer_idx;
-    if (layer_idx < 0 && !op.inputs.empty() && op.inputs[0].layer_idx >= 0) {
-        layer_idx = op.inputs[0].layer_idx;
-    }
-    if (layer_idx < 0 && explicit_idx_input >= 0 && static_cast<int>(op.inputs.size()) > explicit_idx_input) {
-        std::string field;
-        parse_block_param(op.inputs[explicit_idx_input].name, layer_idx, field);
-    }
-    return layer_idx;
-}
-
 /// Cast a 1-D sinks tensor to ``target_dtype`` if it doesn't already
 /// match. Returns a reference to either the original sinks tensor or a
 /// newly-allocated temp (tracked via ``temps`` for op-end release).
@@ -272,19 +260,12 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
         sinks = &resolve_tensor(op.inputs[1]);
     }
 
-    const int Hq = static_cast<int>(mConfig.NumQueryHeads);
+    int Hq = static_cast<int>(mConfig.NumQueryHeads);
     int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
-    const int Hs = derive_head_size(qkv, Hq, Hkv, static_cast<int>(mConfig.head_size()));
-
-    // Derive actual Hkv from tensor shape for hybrid models where block types
-    // have fewer KV heads than global config (e.g. Gemma4 full-attention
-    // layers with num_global_key_value_heads < num_key_value_heads).
-    if (qkv.Rank == 4) {
-        const int actual_heads = static_cast<int>(qkv.Sizes[2]);
-        if (actual_heads < Hq + 2 * Hkv) {
-            Hkv = std::max(0, (actual_heads - Hq) / 2);
-        }
-    }
+    int Hs = derive_head_size(qkv, Hq, Hkv, static_cast<int>(mConfig.head_size()));
+    // Hybrid per-layer head dims + tensor-shape reconciliation (Gemma4
+    // k_eq_v fewer-KV layers, Laguna per-layer query head counts).
+    resolve_attn_head_dims(mRunState.runtime_config(), op_layer_idx(op), qkv, Hq, Hkv, Hs);
 
     const Tensor& out_candidate = ensure_output_tensor(op.outputs[0]);
     const Tensor& lse_candidate = ensure_output_tensor(op.outputs[1]);
@@ -310,7 +291,7 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
                                                     lse_shape,
                                                     "flash_attention");
 
-    const int layer_idx = resolve_layer_idx(op, /*explicit_idx_input=*/0);
+    const int layer_idx = op_layer_idx(op);
 
     int window_size = op.attrs.window_size;
     if (window_size <= 0 && mConfig.use_sliding_window && mConfig.is_sliding_layer(layer_idx)) {
@@ -420,20 +401,15 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
                                                       d_out.DType,
                                                       d_qkv_shape,
                                                       "flash_attention_backward");
-    const int Hq = static_cast<int>(mConfig.NumQueryHeads);
+    int Hq = static_cast<int>(mConfig.NumQueryHeads);
     int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
-    const int Hs = derive_head_size(qkv, Hq, Hkv, static_cast<int>(mConfig.head_size()));
+    int Hs = derive_head_size(qkv, Hq, Hkv, static_cast<int>(mConfig.head_size()));
+    // Same Hq/Hkv resolution as forward: per-layer dims plus tensor-shape
+    // reconciliation (Gemma4 k_eq_v fewer-KV layers, Laguna per-layer query
+    // head counts).
+    resolve_attn_head_dims(mRunState.runtime_config(), op_layer_idx(op), qkv, Hq, Hkv, Hs);
 
-    // Same Hkv derivation as forward: hybrid block types may have fewer KV
-    // heads than global config (Gemma4 k_eq_v full-attention layers).
-    if (qkv.Rank == 4) {
-        const int actual_heads = static_cast<int>(qkv.Sizes[2]);
-        if (actual_heads < Hq + 2 * Hkv) {
-            Hkv = std::max(0, (actual_heads - Hq) / 2);
-        }
-    }
-
-    const int layer_idx = resolve_layer_idx(op, /*explicit_idx_input=*/3);
+    const int layer_idx = op_layer_idx(op);
 
     int window_size = op.attrs.window_size;
     if (window_size <= 0 && mConfig.use_sliding_window && mConfig.is_sliding_layer(layer_idx)) {
