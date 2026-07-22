@@ -133,7 +133,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down(const CompiledOp& op) {
             num_experts = llep.num_merged_experts;
             expert_offsets_view.Sizes[0] = static_cast<long>(num_experts + 1);
             const auto meta_it = mEPLayerMeta.find(ep_key_any);
-            const bool refresh_native_only_ptrs = llep.owned_foreign_ptrs.empty() && meta_it != mEPLayerMeta.end() &&
+            const bool refresh_native_only_ptrs = !llep.has_foreign_experts && meta_it != mEPLayerMeta.end() &&
                                                   meta_it->second.num_merged == meta_it->second.num_local &&
                                                   llep.num_merged_experts == meta_it->second.num_local &&
                                                   weights.Rank >= 3;
@@ -589,7 +589,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
             num_experts = llep.num_merged_experts;
             expert_offsets_view.Sizes[0] = static_cast<long>(num_experts + 1);
             const auto meta_it = mEPLayerMeta.find(ep_key);
-            const bool refresh_native_only_ptrs = llep.owned_foreign_ptrs.empty() && meta_it != mEPLayerMeta.end() &&
+            const bool refresh_native_only_ptrs = !llep.has_foreign_experts && meta_it != mEPLayerMeta.end() &&
                                                   meta_it->second.num_merged == meta_it->second.num_local &&
                                                   llep.num_merged_experts == meta_it->second.num_local &&
                                                   weights.Rank >= 3;
@@ -645,9 +645,21 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
                         foreign_slot.emplace_back(e, static_cast<int>(foreign_slot.size()));
                     }
                 }
+                // cpu_training: the replay dispatch for this ep_key fetched this
+                // layer's foreign experts into the ring arena moments ago, and
+                // the arena keeps them alive until the next dispatch. Reuse
+                // those pointers for dgrad instead of re-staging the same rows
+                // from the pinned host master on MainStream (native pointers
+                // are rebuilt from the op's fresh `weights` tensor either way).
+                const std::vector<const void*>* llep_foreign_ptrs = nullptr;
+                if (llep_it != mLLEPStates.end() && llep_it->second.active &&
+                    static_cast<int>(llep_it->second.down_weight_ptrs.size()) == meta.num_merged &&
+                    llep_it->second.merged_to_global == meta.merged_to_global) {
+                    llep_foreign_ptrs = &llep_it->second.down_weight_ptrs;
+                }
                 Tensor foreign_stage;
                 bool have_foreign_stage = false;
-                if (!foreign_slot.empty() && mOptions.CpuTraining) {
+                if (!foreign_slot.empty() && !llep_foreign_ptrs && mOptions.CpuTraining) {
                     Tensor* master = mWeights.master_tensor("blocks[" + std::to_string(layer_idx) + "].experts_down");
                     if (master && master->Rank >= 3 && master->DType == weights.DType) {
                         foreign_stage = mRunState.temp_alloc(weights.DType,
@@ -685,6 +697,8 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
                     if (local_idx >= 0 && local_idx < meta.num_local) {
                         reconstructed_weight_ptrs[m] =
                             static_cast<const std::byte*>(weights.Data) + static_cast<size_t>(local_idx) * expert_bytes;
+                    } else if (llep_foreign_ptrs) {
+                        reconstructed_weight_ptrs[m] = (*llep_foreign_ptrs)[m];
                     } else if (have_foreign_stage) {
                         int slot = 0;
                         for (const auto& [e, s2] : foreign_slot) {

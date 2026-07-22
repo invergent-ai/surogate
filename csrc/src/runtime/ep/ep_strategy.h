@@ -20,12 +20,18 @@
 #define SUROGATE_SRC_RUNTIME_EP_EP_STRATEGY_H
 
 #include <memory>
+#include <optional>
+#include <string>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include <cuda_runtime.h>
 
 #include "runtime/ep/ep_buffer_pool.h"
 #include "runtime/ep/ep_state.h"
+#include "runtime/ep/ring_arena.h"
+#include "runtime/ep/weight_transfer.h"
 
 struct RuntimeOptions;
 
@@ -35,8 +41,6 @@ struct CompiledOp;
 }  // namespace dsl
 
 namespace ep {
-
-struct ForeignExpertWeights;  // defined in runtime/ep/weight_transfer.h
 
 /// Abstract EP strategy. Owns all per-layer EP/LLEP state, the shared GPU
 /// buffer pool, the (lazy) weight-transfer stream, and the cross-layer
@@ -96,6 +100,12 @@ public:
     /// Lazily-created CUDA stream used for P2P expert weight transfer (LLEP).
     /// Returns nullptr for strategies that never transfer weights.
     cudaStream_t weight_transfer_stream();
+
+    /// Lazily-created CUDA stream for the tiny EP control exchanges (imbalance
+    /// all-reduce + token-split A2As). These depend only on host-side routing
+    /// counts, so running them off MainStream keeps their completion waits from
+    /// covering the whole pipeline backlog.
+    cudaStream_t control_stream();
 
     /// Returns the replay-aware cache key used to distinguish forward vs.
     /// replay-forward EP state. Mirrors the historical CompiledExecutor
@@ -165,6 +175,12 @@ private:
                              const Tensor& native_down);
     void finalize_native_only_state(dsl::CompiledExecutor& exec, DispatchForwardCtx& ctx);
 
+    /// Backward-only: prefetch the next replay layer's foreign expert weights
+    /// (its forward plan is cached) on the weight-transfer stream so the H2D
+    /// overlaps this layer's backward compute instead of serializing at the
+    /// next dispatch.
+    void maybe_prefetch_next_replay_layer(dsl::CompiledExecutor& exec, const DispatchForwardCtx& ctx);
+
     /// Invert `ep_state.llep_send_reorder_gpu` and gather `input` rows
     /// through it into a persistent [total_send, hidden] buffer. Caller
     /// supplies the persistent buffer (field on `EpLayerState`) so the
@@ -201,6 +217,21 @@ private:
     std::unordered_map<int, std::pair<void*, std::size_t>> mPinnedScratch;
 
     cudaStream_t mWeightTransferStream = nullptr;
+    cudaStream_t mControlStream = nullptr;
+
+    /// Ring-slab arena backing foreign-expert weight staging (base weights +
+    /// received LoRA slices). Replaces the per-expert cudaMalloc/cudaFree storm
+    /// on the LLEP dispatch path.
+    RingSlabArena mForeignArena;
+
+    /// One in-flight backward prefetch (see maybe_prefetch_next_replay_layer).
+    struct PrefetchedForeign {
+        int layer_idx = -1;
+        int arena_slot = -1;
+        ForeignExpertWeights weights;
+        std::vector<std::pair<int, int>> receive_set;
+    };
+    std::optional<PrefetchedForeign> mPrefetched;
 };
 
 /// Classic 1:1 expert→GPU mapping. No rebalancing, no P2P weight transfer.

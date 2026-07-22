@@ -786,9 +786,21 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up_backward(const Compiled
                         foreign_slot.emplace_back(e, static_cast<int>(foreign_slot.size()));
                     }
                 }
+                // cpu_training: the replay dispatch for this ep_key fetched this
+                // layer's foreign experts into the ring arena moments ago, and
+                // the arena keeps them alive until the next dispatch. Reuse
+                // those pointers for dgrad instead of re-staging the same rows
+                // from the pinned host master on MainStream (native pointers
+                // are rebuilt from the op's fresh `weights` tensor either way).
+                const std::vector<const void*>* llep_foreign_ptrs = nullptr;
+                if (llep_it != mLLEPStates.end() && llep_it->second.active &&
+                    static_cast<int>(llep_it->second.gate_up_weight_ptrs.size()) == meta.num_merged &&
+                    llep_it->second.merged_to_global == meta.merged_to_global) {
+                    llep_foreign_ptrs = &llep_it->second.gate_up_weight_ptrs;
+                }
                 Tensor foreign_stage;
                 bool have_foreign_stage = false;
-                if (!foreign_slot.empty() && mOptions.CpuTraining) {
+                if (!foreign_slot.empty() && !llep_foreign_ptrs && mOptions.CpuTraining) {
                     Tensor* master =
                         mWeights.master_tensor("blocks[" + std::to_string(layer_idx) + "].experts_gate_up");
                     if (master && master->Rank >= 3 && master->DType == weights.DType) {
@@ -824,6 +836,8 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up_backward(const Compiled
                     if (local_idx >= 0 && local_idx < meta.num_local) {
                         reconstructed_weight_ptrs[m] =
                             static_cast<const std::byte*>(weights.Data) + static_cast<size_t>(local_idx) * expert_bytes;
+                    } else if (llep_foreign_ptrs) {
+                        reconstructed_weight_ptrs[m] = (*llep_foreign_ptrs)[m];
                     } else if (have_foreign_stage) {
                         int slot = 0;
                         for (const auto& [e, s] : foreign_slot) {

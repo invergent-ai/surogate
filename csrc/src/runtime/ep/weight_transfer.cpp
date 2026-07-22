@@ -171,8 +171,12 @@ Tensor alloc_foreign_tensor(ForeignExpertWeights& received, ETensorDType dtype, 
         bytes *= static_cast<size_t>(s);
     if (bytes == 0) return Tensor{};
     void* ptr = nullptr;
-    CUDA_CHECK(cudaMalloc(&ptr, bytes));
-    received.owned_gpu_ptrs.push_back(ptr);
+    if (received.arena_alloc) {
+        ptr = received.arena_alloc(bytes);
+    } else {
+        CUDA_CHECK(cudaMalloc(&ptr, bytes));
+        received.owned_gpu_ptrs.push_back(ptr);
+    }
     return make_tensor_from_ptr(ptr, dtype, shape, 0);
 }
 

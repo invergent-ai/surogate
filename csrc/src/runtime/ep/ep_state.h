@@ -126,6 +126,15 @@ struct LLEPLayerState {
     // Must stay alive as long as weight pointers reference them.
     std::vector<void*> owned_foreign_ptrs;
 
+    /// True when the merged set contains foreign (received) experts. The ops'
+    /// native-refresh heuristic must use THIS, not owned_foreign_ptrs.empty():
+    /// arena-backed foreign buffers leave owned_foreign_ptrs empty.
+    bool has_foreign_experts = false;
+
+    /// Ring-arena slot backing the foreign buffers above (-1 when they were
+    /// cudaMalloc'd instead). Released by EPStrategy, not by free_foreign_gpu.
+    int arena_slot = -1;
+
     void free_lora_gpu() {
         for (void* p : owned_lora_ptrs) {
             if (p) cudaFree(p);

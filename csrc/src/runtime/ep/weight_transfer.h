@@ -12,6 +12,7 @@
 #ifndef SUROGATE_SRC_RUNTIME_EP_WEIGHT_TRANSFER_H
 #define SUROGATE_SRC_RUNTIME_EP_WEIGHT_TRANSFER_H
 
+#include <functional>
 #include <unordered_map>
 #include <vector>
 
@@ -60,6 +61,11 @@ struct ForeignExpertWeights {
     /// GPU pointers allocated with cudaMalloc (tracked for cleanup).
     /// Populated when use_cuda_malloc=true in transfer functions.
     std::vector<void*> owned_gpu_ptrs;
+
+    /// Optional bump allocator (ring-slab arena). When set, receive buffers
+    /// draw from it instead of cudaMalloc and owned_gpu_ptrs stays empty —
+    /// the arena scope owner is responsible for the memory's lifetime.
+    std::function<void*(std::size_t)> arena_alloc;
 
     void clear() {
         weights.clear();
