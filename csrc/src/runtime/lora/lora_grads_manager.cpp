@@ -187,14 +187,24 @@ void ModularLoRAGradsManager::allocate_gradients() {
         // MoE LoRA grads: enable for MoE block types or Dense blocks in global MoE models.
         // Hybrid MoE blocks are supported via grouped GEMM LoRA hooks.
         const bool has_global_moe = (mConfig.num_experts > 0);
-        const bool layer_is_moe =
+        bool layer_is_moe =
             (bt == BlockType::MoE || bt == BlockType::SwitchMoE) || (bt == BlockType::Dense && has_global_moe);
         // Qwen3.5 hybrid blocks (both linear-attention and full-attention)
         // contain standard MLP projections that should support LoRA.
         const bool layer_is_qwen3_linear_mlp = (bt == BlockType::Mamba) && is_qwen3_hybrid;
         const bool layer_is_qwen3_attention_mlp = (bt == BlockType::Attention) && is_qwen3_hybrid;
-        const bool layer_is_dense_mlp = (bt == BlockType::MLP) || (bt == BlockType::Dense && !has_global_moe) ||
-                                        layer_is_qwen3_linear_mlp || layer_is_qwen3_attention_mlp;
+        bool layer_is_dense_mlp = (bt == BlockType::MLP) || (bt == BlockType::Dense && !has_global_moe) ||
+                                  layer_is_qwen3_linear_mlp || layer_is_qwen3_attention_mlp;
+
+        // Per-layer MLP structure from the DSL graph overrides the block-type
+        // heuristics — must mirror ModularLoRAWeightsManager exactly so grad
+        // buffers line up with the allocated LoRA weights.
+        if (static_cast<std::size_t>(l) < mConfig.layer_has_moe.size()) {
+            layer_is_moe = mConfig.layer_has_moe[static_cast<std::size_t>(l)] != 0;
+        }
+        if (static_cast<std::size_t>(l) < mConfig.layer_has_dense_mlp.size()) {
+            layer_is_dense_mlp = mConfig.layer_has_dense_mlp[static_cast<std::size_t>(l)] != 0;
+        }
 
         if (layer_is_moe && E > 0) {
             const bool has_mlp_lora = mConfig.lora_config.applies_to_gate() ||
@@ -244,7 +254,10 @@ void ModularLoRAGradsManager::allocate_gradients() {
                 full.router = alloc_full(C, E, prefix + "_router");
                 shard.router = alloc_shard(C, E, prefix + "_router_shard");
             }
-        } else if (layer_is_dense_mlp) {
+        }
+        // Not else-if: hybrid blocks can carry BOTH a dense MLP and MoE
+        // experts (Gemma4 MoE variants run them in parallel within one block).
+        if (layer_is_dense_mlp) {
             if (mConfig.lora_config.applies_to_gate()) {
                 full.mlp.gate = alloc_full(C, layer_d_ff, prefix + "_gate");
                 shard.mlp.gate = alloc_shard(C, layer_d_ff, prefix + "_gate_shard");

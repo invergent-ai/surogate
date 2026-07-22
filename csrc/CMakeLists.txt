@@ -295,6 +295,7 @@ target_sources(surogate-common PRIVATE
     src/runtime/training/model.cpp
 
     src/runtime/dsl/ir.cpp
+    src/runtime/dsl/per_layer_dims.cpp
     src/runtime/dsl/dsl_model.cpp
     src/runtime/dsl/dsl_model_execution.cpp
     src/runtime/dsl/dsl_model_helpers.cpp
@@ -369,6 +370,7 @@ target_sources(surogate-common PRIVATE
     src/runtime/ops/cross_entropy_loss.cpp
     src/runtime/ops/fused_lm_head_loss.cpp
     src/runtime/ops/silu.cpp
+    src/runtime/ops/softplus.cpp
     src/runtime/ops/relu2.cpp
     src/runtime/ops/mul.cpp
     src/runtime/ops/scale.cpp

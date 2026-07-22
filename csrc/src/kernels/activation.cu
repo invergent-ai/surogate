@@ -98,6 +98,28 @@ __device__ __forceinline__ float gelu_tanh_grad(float x) {
 }
 
 template <typename T>
+__global__ void softplus_forward_kernel(T* out, const T* inp, long n) {
+    long idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float x = to_float(inp[idx]);
+    // softplus(x) = log(1 + exp(x)); linear above the threshold like
+    // torch.nn.functional.softplus (beta=1, threshold=20).
+    float y = (x > 20.0f) ? x : log1pf(expf(x));
+    out[idx] = from_float<T>(y);
+}
+
+template <typename T>
+__global__ void softplus_backward_kernel(T* dinp, const T* inp, const T* dout, long n) {
+    long idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float x = to_float(inp[idx]);
+    float dy = to_float(dout[idx]);
+    // d/dx softplus(x) = sigmoid(x); 1 in the linear region.
+    float g = (x > 20.0f) ? 1.0f : sigmoid<T>(x);
+    dinp[idx] = from_float<T>(dy * g);
+}
+
+template <typename T>
 __global__ void silu_forward_kernel(T* out, const T* inp, long n) {
     long idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
@@ -170,6 +192,24 @@ void launch_silu_forward(T* out, const T* inp, long n, cudaStream_t stream) {
 }
 
 template <typename T>
+void launch_softplus_forward(T* out, const T* inp, long n, cudaStream_t stream) {
+    if (n == 0) return;
+    int block = 256;
+    int grid = (int)((n + block - 1) / block);
+    softplus_forward_kernel<T><<<grid, block, 0, stream>>>(out, inp, n);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <typename T>
+void launch_softplus_backward(T* dinp, const T* inp, const T* dout, long n, cudaStream_t stream) {
+    if (n == 0) return;
+    int block = 256;
+    int grid = (int)((n + block - 1) / block);
+    softplus_backward_kernel<T><<<grid, block, 0, stream>>>(dinp, inp, dout, n);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <typename T>
 void launch_gelu_forward(T* out, const T* inp, long n, cudaStream_t stream) {
     if (n == 0) return;
     int block = 256;
@@ -236,6 +276,26 @@ void silu_backward(float* dinp, const float* inp, const float* dout, long n, cud
 
 void silu_backward(nv_bfloat16* dinp, const nv_bfloat16* inp, const nv_bfloat16* dout, long n, cudaStream_t stream) {
     launch_silu_backward(dinp, inp, dout, n, stream);
+}
+
+void softplus_forward(float* out, const float* inp, long n, cudaStream_t stream) {
+    launch_softplus_forward(out, inp, n, stream);
+}
+
+void softplus_forward(nv_bfloat16* out, const nv_bfloat16* inp, long n, cudaStream_t stream) {
+    launch_softplus_forward(out, inp, n, stream);
+}
+
+void softplus_backward(float* dinp, const float* inp, const float* dout, long n, cudaStream_t stream) {
+    launch_softplus_backward(dinp, inp, dout, n, stream);
+}
+
+void softplus_backward(nv_bfloat16* dinp,
+                       const nv_bfloat16* inp,
+                       const nv_bfloat16* dout,
+                       long n,
+                       cudaStream_t stream) {
+    launch_softplus_backward(dinp, inp, dout, n, stream);
 }
 
 void gelu_backward(float* dinp, const float* inp, const float* dout, long n, cudaStream_t stream) {

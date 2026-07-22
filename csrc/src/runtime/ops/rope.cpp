@@ -36,18 +36,12 @@ void CompiledExecutor::dispatch_rope(const CompiledOp& op) {
                                                     out_shape,
                                                     "rope");
 
-    const int Hq = static_cast<int>(mConfig.NumQueryHeads);
+    int Hq = static_cast<int>(mConfig.NumQueryHeads);
     int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
-    const int Hs = derive_head_size(qkv, Hq, Hkv, static_cast<int>(mConfig.head_size()));
-
-    // Derive actual Hkv from tensor shape to handle Q-only inputs (shared-KV)
-    // and other cases where the tensor has fewer heads than global config.
-    if (qkv.Rank == 4) {
-        const int actual_heads = static_cast<int>(qkv.Sizes[2]);
-        if (actual_heads < Hq + 2 * Hkv) {
-            Hkv = std::max(0, (actual_heads - Hq) / 2);
-        }
-    }
+    int Hs = derive_head_size(qkv, Hq, Hkv, static_cast<int>(mConfig.head_size()));
+    // Hybrid per-layer head dims + tensor-shape reconciliation (shared-KV
+    // Q-only inputs, Laguna per-layer query head counts).
+    resolve_attn_head_dims(mRunState.runtime_config(), op_layer_idx(op), qkv, Hq, Hkv, Hs);
 
     if (mForwardPlan) {
         int layer_idx = -1;
@@ -93,21 +87,12 @@ void CompiledExecutor::dispatch_rope_backward(const CompiledOp& op) {
                                                       d_qkv_shape,
                                                       "rope_backward");
 
-    const int Hq = static_cast<int>(mConfig.NumQueryHeads);
+    int Hq = static_cast<int>(mConfig.NumQueryHeads);
     int Hkv = static_cast<int>(mConfig.NumKeyValHeads);
-    const int Hs = derive_head_size(d_out, Hq, Hkv, static_cast<int>(mConfig.head_size()));
-
-    // Derive actual Hkv from tensor shape to handle shared-KV Q-only gradients
-    // and other cases where the gradient has fewer heads than the global config.
-    if (d_out.Rank == 4) {
-        const int actual_heads = static_cast<int>(d_out.Sizes[2]);
-        if (actual_heads < Hq + 2 * Hkv) {
-            // Fewer heads than expected — adjust Hkv to match.
-            // If actual == Hq: Q-only (Hkv=0)
-            // Otherwise: compute Hkv from remaining heads
-            Hkv = std::max(0, (actual_heads - Hq) / 2);
-        }
-    }
+    int Hs = derive_head_size(d_out, Hq, Hkv, static_cast<int>(mConfig.head_size()));
+    // Hybrid per-layer head dims + tensor-shape reconciliation (shared-KV
+    // Q-only gradients, Laguna per-layer query head counts).
+    resolve_attn_head_dims(mRunState.runtime_config(), op_layer_idx(op), d_out, Hq, Hkv, Hs);
 
     // For FP8 hybrid backward, record abs_max of d_qkv for subsequent quantization
     float* abs_max_ptr =

@@ -29,6 +29,7 @@
 #include "runtime/core/qlora_provider.h"
 #include "runtime/dsl/dsl_weight_manager.h"
 #include "runtime/dsl/dsl_model_internal.h"
+#include "runtime/dsl/per_layer_dims.h"
 #include "kernels/kernels.h"
 #include "runtime/core/forward_hooks.h"
 #include "runtime/core/backward_hooks.h"
@@ -156,9 +157,16 @@ struct DslConfigView {
     std::optional<std::string> mlp_activation;
     std::optional<double> sliding_rope_theta;
     std::optional<std::string> sliding_rope_type;
+    std::optional<double> sliding_partial_rotary_factor;
     std::optional<double> full_rope_theta;
     std::optional<std::string> full_rope_type;
     std::optional<double> full_partial_rotary_factor;
+    // Extra scaling params for the full-attention rope (YaRN etc. — Laguna).
+    std::optional<double> full_rope_factor;
+    std::optional<long> full_rope_original_max_position_embeddings;
+    std::optional<double> full_rope_beta_fast;
+    std::optional<double> full_rope_beta_slow;
+    std::optional<double> full_rope_attention_factor;
 };
 
 std::optional<long> get_long_attr(const AttrMap& map, const char* key) {
@@ -304,9 +312,15 @@ DslConfigView parse_dsl_config(const Module& module) {
     if (!view.mlp_activation) view.mlp_activation = get_string_attr(cfg, "activation");
     view.sliding_rope_theta = get_double_attr(cfg, "sliding_rope_theta");
     view.sliding_rope_type = get_string_attr(cfg, "sliding_rope_type");
+    view.sliding_partial_rotary_factor = get_double_attr(cfg, "sliding_partial_rotary_factor");
     view.full_rope_theta = get_double_attr(cfg, "full_rope_theta");
     view.full_rope_type = get_string_attr(cfg, "full_rope_type");
     view.full_partial_rotary_factor = get_double_attr(cfg, "full_partial_rotary_factor");
+    view.full_rope_factor = get_double_attr(cfg, "full_rope_factor");
+    view.full_rope_original_max_position_embeddings = get_long_attr(cfg, "full_rope_original_max_position_embeddings");
+    view.full_rope_beta_fast = get_double_attr(cfg, "full_rope_beta_fast");
+    view.full_rope_beta_slow = get_double_attr(cfg, "full_rope_beta_slow");
+    view.full_rope_attention_factor = get_double_attr(cfg, "full_rope_attention_factor");
     return view;
 }
 
@@ -347,133 +361,51 @@ DslRuntimeConfig build_runtime_config(const Module& module, const PretrainedConf
     }
 
     // Populate per-layer dims from IR param shapes for hybrid models
+    // (different block types with different head/QKV/MLP dims). Shared
+    // derivation with GraphCompiler — see runtime/dsl/per_layer_dims.cpp.
     if (module.forward.has_value()) {
         const auto& graph = module.forward.value();
-        bool has_varying_dims = false;
-        long first_qkv = 0;
-
-        // Probe: check if any block has a different QKV size from block 0
-        for (const auto& [name, info] : graph.params) {
-            int layer_idx = -1;
-            std::string field;
-            if (!parse_block_param(name, layer_idx, field)) continue;
-            if (field != "qkv_weight" || info.shape.size() < 2) continue;
-            long qkv = (info.shape[0].kind == DimKind::Concrete) ? info.shape[0].value : 0;
-            if (qkv == 0) continue;
-            if (first_qkv == 0) {
-                first_qkv = qkv;
-                continue;
-            }
-            if (qkv != first_qkv) {
-                has_varying_dims = true;
-                break;
+        const int num_layers = static_cast<int>(view.n_layers.value_or(0));
+        if (num_layers > 0) {
+            const long hq = view.num_query_heads.value_or(0);
+            const long default_hkv = view.num_kv_heads.value_or(0);
+            const long default_hs = view.head_size.value_or(0);
+            const long default_dff = view.d_ff.value_or(0);
+            std::vector<BlockTypeDims> dims;
+            derive_per_layer_block_dims(graph, num_layers, hq, default_hkv, default_hs, default_dff, dims);
+            if (per_layer_dims_vary(dims)) {
+                runtime.per_layer_dims = std::move(dims);
             }
         }
+    }
 
-        // Also check mlp weights for variation
-        if (!has_varying_dims) {
-            long first_mlp = 0;
-            for (const auto& [name, info] : graph.params) {
-                int layer_idx = -1;
-                std::string field;
-                if (!parse_block_param(name, layer_idx, field)) continue;
-                if (field != "mlp_down_weight" || info.shape.size() < 2) continue;
-                long m = (info.shape[1].kind == DimKind::Concrete) ? info.shape[1].value : 0;
-                if (m == 0) continue;
-                if (first_mlp == 0) {
-                    first_mlp = m;
-                    continue;
-                }
-                if (m != first_mlp) {
-                    has_varying_dims = true;
-                    break;
-                }
-            }
-        }
-
-        if (has_varying_dims) {
-            const auto cfg_view = parse_dsl_config(module);
-            const int num_layers = static_cast<int>(cfg_view.n_layers.value_or(0));
-            const long hq = cfg_view.num_query_heads.value_or(0);
-
-            runtime.per_layer_dims.resize(num_layers);
-            // Set defaults from global config
-            const long default_hs = cfg_view.head_size.value_or(0);
-            const long default_hkv = cfg_view.num_kv_heads.value_or(0);
-            const long default_dff = cfg_view.d_ff.value_or(0);
-            for (int i = 0; i < num_layers; ++i) {
-                auto& d = runtime.per_layer_dims[i];
-                d.head_size = default_hs;
-                d.qkv_channels = default_hs * (hq + 2 * default_hkv);
-                d.attn_dim = hq * default_hs;
-                d.intermediate = default_dff;
-                d.mlp_up = 2 * default_dff;  // gated activation default
-            }
-            // Override from actual IR param shapes. Two passes, mirroring
-            // GraphCompiler's per-layer dims derivation: out_weight is
-            // authoritative for attn_dim/head_size (its columns are exactly
-            // Hq*Hs regardless of QKV packing), while the qkv_weight row
-            // count is ambiguous — Gemma4 k_eq_v full layers pack Hq+Hkv
-            // heads, not Hq+2*Hkv, so deriving head_size from it produced
-            // attn_dim 4352 instead of 8192 and undersized LoRA B buffers
-            // (apply_lora_contribution then read past them).
-            std::vector<bool> attn_from_out(static_cast<std::size_t>(num_layers), false);
+    // Per-layer MLP structure from IR param names — hybrid dense/sparse-MLP
+    // models (Laguna: layer 0 dense SwiGLU, rest MoE) need this so LoRA and
+    // other per-layer consumers don't misclassify layers via block-type
+    // heuristics (all Laguna layers classify as MoE because num_experts > 0).
+    if (module.forward.has_value()) {
+        const auto& graph = module.forward.value();
+        const int num_layers = static_cast<int>(view.n_layers.value_or(0));
+        if (num_layers > 0) {
+            std::vector<std::uint8_t> has_dense(static_cast<std::size_t>(num_layers), 0);
+            std::vector<std::uint8_t> has_moe(static_cast<std::size_t>(num_layers), 0);
+            bool any_marker = false;
             for (const auto& [name, info] : graph.params) {
                 int layer_idx = -1;
                 std::string field;
                 if (!parse_block_param(name, layer_idx, field)) continue;
                 if (layer_idx < 0 || layer_idx >= num_layers) continue;
-                auto& d = runtime.per_layer_dims[layer_idx];
-                if (info.shape.size() < 2) continue;
-                long s0 = (info.shape[0].kind == DimKind::Concrete) ? info.shape[0].value : 0;
-                long s1 = (info.shape[1].kind == DimKind::Concrete) ? info.shape[1].value : 0;
-                if (s0 == 0 || s1 == 0) continue;
-
-                if (field == "out_weight") {
-                    d.attn_dim = s1;
-                    if (hq > 0) d.head_size = s1 / hq;
-                    attn_from_out[static_cast<std::size_t>(layer_idx)] = true;
-                } else if (field == "mlp_down_weight") {
-                    d.intermediate = s1;
-                    d.mlp_up = s1;  // for GatedMLP: down_weight is (C, M)
-                } else if (field == "mlp_gate_weight") {
-                    d.intermediate = s0;
-                    d.mlp_up = s0;  // gate and up each have M rows
-                } else if (field == "mlp_up_weight") {
-                    // SwiGLU: up_weight is (MUp, C) where MUp = 2*M
-                    // GatedMLP: up_weight is (M, C)
-                    // Use mlp_down_weight to disambiguate (set above)
+                if (field == "mlp_up_weight" || field == "mlp_gate_weight" || field == "mlp_down_weight") {
+                    has_dense[static_cast<std::size_t>(layer_idx)] = 1;
+                    any_marker = true;
+                } else if (field == "experts_gate_up" || field == "experts_up" || field == "experts_down") {
+                    has_moe[static_cast<std::size_t>(layer_idx)] = 1;
+                    any_marker = true;
                 }
             }
-            for (const auto& [name, info] : graph.params) {
-                int layer_idx = -1;
-                std::string field;
-                if (!parse_block_param(name, layer_idx, field)) continue;
-                if (layer_idx < 0 || layer_idx >= num_layers) continue;
-                auto& d = runtime.per_layer_dims[layer_idx];
-                if (info.shape.size() < 2) continue;
-                long s0 = (info.shape[0].kind == DimKind::Concrete) ? info.shape[0].value : 0;
-                long s1 = (info.shape[1].kind == DimKind::Concrete) ? info.shape[1].value : 0;
-                if (s0 == 0 || s1 == 0) continue;
-                const bool from_out = attn_from_out[static_cast<std::size_t>(layer_idx)];
-
-                if (field == "qkv_weight") {
-                    d.qkv_channels = s0;
-                    if (from_out) {
-                        if (hq > 0) d.head_size = d.attn_dim / hq;
-                    } else {
-                        long total_heads = hq + 2 * default_hkv;
-                        if (total_heads > 0) d.head_size = s0 / total_heads;
-                        d.attn_dim = hq * d.head_size;
-                    }
-                } else if (field == "self_attn_q_weight") {
-                    // Shared-KV block: Q-only projection
-                    d.qkv_channels = s0;  // Q dim
-                    if (!from_out) {
-                        if (hq > 0) d.head_size = s0 / hq;
-                        d.attn_dim = s0;
-                    }
-                }
+            if (any_marker) {
+                runtime.layer_has_dense_mlp = std::move(has_dense);
+                runtime.layer_has_moe = std::move(has_moe);
             }
         }
     }
@@ -487,6 +419,8 @@ DslRuntimeConfig build_runtime_config(const Module& module, const PretrainedConf
         const float sliding_theta = static_cast<float>(view.sliding_rope_theta.value_or(base.RopeTheta));
         const std::string sliding_type =
             view.sliding_rope_type.value_or(base.Rope.rope_type.empty() ? std::string("default") : base.Rope.rope_type);
+        const float sliding_partial =
+            static_cast<float>(view.sliding_partial_rotary_factor.value_or(base.Rope.partial_factor));
         const float full_theta = static_cast<float>(view.full_rope_theta.value_or(1000000.0));
         const std::string full_type = view.full_rope_type.value_or("proportional");
         const float full_partial = static_cast<float>(view.full_partial_rotary_factor.value_or(0.25));
@@ -499,6 +433,13 @@ DslRuntimeConfig build_runtime_config(const Module& module, const PretrainedConf
             rope_cfg.rope = base.Rope;
             rope_cfg.rope.theta = sliding_theta;
             rope_cfg.rope.rope_type = sliding_type;
+            // Sliding layers can be partial-rotary too (the DSL bakes the
+            // matching rotary_dim into the rope op and freqs shape; the table
+            // built here must agree or the kernel reads misaligned rows).
+            if (sliding_partial > 0.0f && sliding_partial < 1.0f) {
+                rope_cfg.rope.mode = RoPEConfig::Mode::PARTIAL;
+                rope_cfg.rope.partial_factor = sliding_partial;
+            }
 
             const std::string layer_type = internal::to_lower(view.layer_type_names->at(static_cast<std::size_t>(i)));
             const bool full_attention = layer_type.find("full") != std::string::npos;
@@ -508,6 +449,24 @@ DslRuntimeConfig build_runtime_config(const Module& module, const PretrainedConf
                                     ? RoPEConfig::partial(full_partial, full_theta)
                                     : RoPEConfig::full(full_theta);
                 rope_cfg.rope.rope_type = full_type;
+                // YaRN-style scaling params for the full-attention rope (Laguna).
+                // RoPEConfig::partial/full reset these, so re-apply from the view.
+                if (view.full_rope_factor) {
+                    rope_cfg.rope.scaling_factor = static_cast<float>(*view.full_rope_factor);
+                }
+                if (view.full_rope_original_max_position_embeddings) {
+                    rope_cfg.rope.original_max_position_embeddings =
+                        static_cast<int>(*view.full_rope_original_max_position_embeddings);
+                }
+                if (view.full_rope_beta_fast) {
+                    rope_cfg.rope.beta_fast = static_cast<float>(*view.full_rope_beta_fast);
+                }
+                if (view.full_rope_beta_slow) {
+                    rope_cfg.rope.beta_slow = static_cast<float>(*view.full_rope_beta_slow);
+                }
+                if (view.full_rope_attention_factor) {
+                    rope_cfg.rope.attention_factor = static_cast<float>(*view.full_rope_attention_factor);
+                }
             }
 
             if (runtime.has_per_layer_dims() && static_cast<std::size_t>(i) < runtime.per_layer_dims.size() &&
@@ -1404,6 +1363,8 @@ DslModel::DslModel(const PretrainedConfig& config,
         wm.is_moe = mIsMoEModel;
         wm.model_config = &mModelConfig;
         wm.per_layer_dims = mRuntimeConfig.per_layer_dims;
+        wm.layer_has_dense_mlp = mRuntimeConfig.layer_has_dense_mlp;
+        wm.layer_has_moe = mRuntimeConfig.layer_has_moe;
         if (mIsMoEModel && mModelConfig.moe_config.has_value()) {
             wm.num_experts = mModelConfig.moe_config->num_experts;
             wm.moe_intermediate_size = mModelConfig.moe_config->moe_intermediate_size > 0
@@ -1427,6 +1388,8 @@ DslModel::DslModel(const PretrainedConfig& config,
         gm.is_moe = mIsMoEModel;
         gm.model_config = &mModelConfig;
         gm.per_layer_dims = mRuntimeConfig.per_layer_dims;
+        gm.layer_has_dense_mlp = mRuntimeConfig.layer_has_dense_mlp;
+        gm.layer_has_moe = mRuntimeConfig.layer_has_moe;
         if (mIsMoEModel && mModelConfig.moe_config.has_value()) {
             gm.num_experts = mModelConfig.moe_config->num_experts;
             gm.moe_intermediate_size = mModelConfig.moe_config->moe_intermediate_size > 0

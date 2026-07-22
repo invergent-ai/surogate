@@ -1595,6 +1595,11 @@ def compile_model_spec(
         filtered_config = {k: v for k, v in config.items() if k in init_params}
         instance = nn_cls(**filtered_config)
         compiled_spec = instance.compile()
+        # Model.compile() re-registers the compiled (config-baked) spec under
+        # the same name, shadowing this lazy spec. Restore the lazy spec so a
+        # later compile with a different config re-traces instead of reusing a
+        # stale graph (hybrid blocks bake numeric per-config dims at trace time).
+        _model_registry[spec.name] = spec
         # Capture computed attributes from the nn instance into config
         # (e.g., self.D = head_size) so the C++ runtime can resolve dims.
         for attr_name in dir(instance):
@@ -1676,9 +1681,30 @@ def compile_model_spec(
             # needed for shape resolution (e.g., n_mamba_blocks, n_attn_blocks for hybrid models)
             # These are attributes that exist on the instance but not in config.
             # Also capture important string attributes like hybrid_pattern for runtime config.
-            _important_string_attrs = {"hybrid_pattern", "mlp_activation", "activation"}
+            # Per-layer-type rope attrs are included so that constructor
+            # DEFAULTS reach the C++ runtime config even when the HF
+            # config.json omits rope_parameters (HF applies the same defaults
+            # in __post_init__); without this, hybrid models silently lose
+            # their per-layer rope tables on such configs.
+            _important_string_attrs = {
+                "hybrid_pattern",
+                "mlp_activation",
+                "activation",
+                "sliding_rope_type",
+                "full_rope_type",
+            }
             _important_int_attrs = {"d_ff"}
-            _important_float_attrs = {"routed_scaling_factor"}
+            _important_float_attrs = {
+                "routed_scaling_factor",
+                "sliding_rope_theta",
+                "sliding_partial_rotary_factor",
+                "full_rope_theta",
+                "full_partial_rotary_factor",
+                "full_rope_factor",
+                "full_rope_beta_fast",
+                "full_rope_beta_slow",
+                "full_rope_attention_factor",
+            }
             for attr_name in dir(instance):
                 if attr_name.startswith("_"):
                     continue

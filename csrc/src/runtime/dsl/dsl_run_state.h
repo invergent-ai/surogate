@@ -230,6 +230,9 @@ public:
     bool has_hybrid_blocks() const {
         return mRuntimeConfig.has_per_layer_dims();
     }
+    const DslRuntimeConfig& runtime_config() const {
+        return mRuntimeConfig;
+    }
     bool is_prequantized() const {
         return mPrequantized;
     }

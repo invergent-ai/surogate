@@ -509,6 +509,7 @@ public:
     void dispatch_gelu_glu(const CompiledOp& op);
     void dispatch_gpt_oss_moe_act(const CompiledOp& op);
     void dispatch_silu(const CompiledOp& op);
+    void dispatch_softplus(const CompiledOp& op);
     void dispatch_gelu(const CompiledOp& op);
     void dispatch_relu2(const CompiledOp& op);
     void dispatch_mul(const CompiledOp& op);
@@ -547,6 +548,7 @@ public:
     void dispatch_gelu_glu_backward(const CompiledOp& op);
     void dispatch_gpt_oss_moe_act_backward(const CompiledOp& op);
     void dispatch_silu_backward(const CompiledOp& op);
+    void dispatch_softplus_backward(const CompiledOp& op);
     void dispatch_gelu_backward(const CompiledOp& op);
     void dispatch_relu2_backward(const CompiledOp& op);
     void dispatch_mul_backward(const CompiledOp& op);

@@ -1538,6 +1538,264 @@ class NemotronAttention(Module):
         return Proxy(att_out_slot, out)
 
 
+class LagunaAttention(Module):
+    """Laguna (Afmoe-style) attention with softplus output gating.
+
+    Structure (HF ``LagunaAttention``):
+    - Separate Q/K/V projections (per-layer head count, GQA)
+    - Plain QK-Norm on head_dim (no +1 offset)
+    - Partial RoPE (GLM-style contiguous prefix, ``rotary_dim`` of head_dim)
+    - Optional sliding window (sliding_attention layers)
+    - Softplus output gate from a separate ``g_proj`` on the block input:
+      per-head ([Hq] gate broadcast over head_dim) or per-element ([Hq*D])
+    - Output projection
+
+    Uses numeric dims throughout — Laguna is hybrid with a different query
+    head count per layer type (e.g. 48 full / 64 sliding on Laguna-XS-2.1),
+    so symbolic Hq/AttnDim would collide across block types.
+    """
+
+    _hf_mapping_defaults_ = {
+        "q_proj_weight": "{prefix}.q_proj.weight",
+        "k_proj_weight": "{prefix}.k_proj.weight",
+        "v_proj_weight": "{prefix}.v_proj.weight",
+        "g_proj_weight": "{prefix}.g_proj.weight",
+        "out_weight": "{prefix}.o_proj.weight",
+        "q_norm_weight": "{prefix}.q_norm.weight",
+        "k_norm_weight": "{prefix}.k_norm.weight",
+    }
+
+    def __init__(
+        self,
+        d_model: int,
+        num_query_heads: int,
+        num_kv_heads: int,
+        head_size: int,
+        max_seq: int,
+        sliding_window: int | None = None,
+        partial_rotary_factor: float = 1.0,
+        gate_per_head: bool = True,
+        eps: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.num_query_heads = num_query_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_size = head_size
+        self.max_seq = max_seq
+        self.sliding_window = sliding_window
+        self.partial_rotary_factor = partial_rotary_factor
+        self.gate_per_head = gate_per_head
+        self.eps = eps
+
+        self.C = Dim("C")
+        self.RotaryDim = _resolve_rotary_dim(head_size, partial_rotary_factor)
+        self.GateDim = num_query_heads if gate_per_head else num_query_heads * head_size
+
+    def _trace(self, tracer: Tracer, *args: Proxy, **kwargs: Any) -> Proxy:
+        g = tracer.graph
+        x, position_ids = args
+
+        _hq = self.num_query_heads * self.head_size
+        _hkv = self.num_kv_heads * self.head_size
+        _qkv = _hq + 2 * _hkv
+        _hidden = self.d_model
+        _gate = self.GateDim
+
+        # -- params ----------------------------------------------------------
+        q_proj_w = tracer.register_param(
+            "q_proj_weight",
+            (_hq, "C"),
+            lora_targets=[LoRATarget(name="q", size=_hq)],
+        )
+        k_proj_w = tracer.register_param(
+            "k_proj_weight",
+            (_hkv, "C"),
+            lora_targets=[LoRATarget(name="k", size=_hkv)],
+        )
+        v_proj_w = tracer.register_param(
+            "v_proj_weight",
+            (_hkv, "C"),
+            lora_targets=[LoRATarget(name="v", size=_hkv)],
+        )
+        # Softplus gate projection — small ([Hq, C] per-head), no LoRA target.
+        g_proj_w = tracer.register_param("g_proj_weight", (_gate, "C"))
+        out_w = tracer.register_param(
+            "out_weight",
+            ("C", _hq),
+            lora_targets=[LoRATarget(name="o", size=_hidden)],
+        )
+        tracer.register_param("q_norm_weight", (self.head_size,), quantizable=False)
+        tracer.register_param("k_norm_weight", (self.head_size,), quantizable=False)
+        tracer.register_param(
+            "rope_freqs",
+            (self.max_seq, self.RotaryDim // 2, 2),
+            dtype="fp32",
+            frozen=True,
+            quantizable=False,
+        )
+
+        # -- activation slots ------------------------------------------------
+        qkv_slot = tracer.register_activation(
+            "qkv",
+            ("B", "T", _qkv),
+            save=True,
+            share_policy="when_recomputed",
+        )
+        qkv_rope_slot = tracer.register_activation(
+            "qkv_rope",
+            ("B", "T", _qkv),
+            save=True,
+            share_policy="when_recomputed",
+        )
+        tracer.register_activation(
+            "q_rstd",
+            ("B", "T", self.num_query_heads),
+            dtype="fp32",
+            save=True,
+            share_policy="when_recomputed",
+        )
+        tracer.register_activation(
+            "k_rstd",
+            ("B", "T", self.num_kv_heads),
+            dtype="fp32",
+            save=True,
+            share_policy="when_recomputed",
+        )
+        att_slot = tracer.register_activation(
+            "att",
+            ("B", "T", _hq),
+            aliases=["att_flat"],
+            save=True,
+            share_policy="always_recompute",
+        )
+        tracer.register_activation(
+            "lse",
+            ("B", self.num_query_heads, "T"),
+            dtype="fp32",
+            save=True,
+            share_policy="always_recompute",
+        )
+        gate_proj_slot = tracer.register_activation(
+            "gate_proj_out",
+            ("B", "T", _gate),
+            save=True,
+            share_policy="when_recomputed",
+            description="Softplus gate pre-activation",
+        )
+        gate_act_slot = tracer.register_activation(
+            "gate_act",
+            ("B", "T", _gate),
+            save=True,
+            share_policy="when_recomputed",
+            description="Softplus gate activation",
+        )
+        att_out_slot = tracer.register_activation(
+            "att_out",
+            ("B", "T", "C"),
+            aliases=["att_out_flat"],
+            share_policy="when_recomputed",
+        )
+
+        # -- graph -----------------------------------------------------------
+        x_flat = g.view(
+            x.ref,
+            shape=[B * T, self.C],
+            out_name=tracer.prefixed("x_flat"),
+        )
+
+        # Separate Q/K/V projections (no bias in Laguna)
+        q_proj = g.matmul(x_flat, q_proj_w, transpose="NT", out_name=tracer.prefixed("q_proj"))
+        k_proj = g.matmul(x_flat, k_proj_w, transpose="NT", out_name=tracer.prefixed("k_proj"))
+        v_proj = g.matmul(x_flat, v_proj_w, transpose="NT", out_name=tracer.prefixed("v_proj"))
+
+        q = g.view(q_proj, shape=[B, T, self.num_query_heads, self.head_size], out_name=tracer.prefixed("q"))
+        k = g.view(k_proj, shape=[B, T, self.num_kv_heads, self.head_size], out_name=tracer.prefixed("k"))
+        v = g.view(v_proj, shape=[B, T, self.num_kv_heads, self.head_size], out_name=tracer.prefixed("v"))
+        qkv = g.concat(q, k, v, dim=2)
+        qkv = g.view(
+            qkv,
+            shape=[B, T, self.num_query_heads + 2 * self.num_kv_heads, self.head_size],
+            out_name=qkv_slot,
+        )
+
+        # Plain QK-Norm (Laguna weights store the full scale, no +1 offset).
+        # Explicit rstd slots carry the per-block head counts into the IR —
+        # anonymous rstd outputs would get global-config head counts.
+        qkv_norm, _, _ = g.qkv_qk_norm(
+            qkv,
+            tracer.prefixed("q_norm_weight"),
+            tracer.prefixed("k_norm_weight"),
+            eps=self.eps,
+            q_rstd_name=tracer.prefixed("q_rstd"),
+            k_rstd_name=tracer.prefixed("k_rstd"),
+        )
+
+        # Partial RoPE (rotates only the first RotaryDim dims of Q/K heads)
+        qkv_rope = g.rope(
+            qkv_norm,
+            tracer.prefixed("rope_freqs"),
+            position_ids.ref,
+            rotary_dim=self.RotaryDim,
+            out_name=qkv_rope_slot,
+        )
+
+        # Flash attention with optional sliding window
+        fa_kwargs: dict[str, Any] = {"causal": True}
+        if self.sliding_window is not None:
+            fa_kwargs["window_size"] = self.sliding_window
+        attn_out, _lse = g.flash_attention(
+            qkv_rope,
+            out_name=att_slot,
+            lse_name=tracer.prefixed("lse"),
+            **fa_kwargs,
+        )
+
+        # Softplus output gate computed from the block input
+        gate_proj = g.matmul(x_flat, g_proj_w, transpose="NT", out_name=gate_proj_slot)
+        gate_act = g.softplus(gate_proj, out_name=gate_act_slot)
+
+        if self.gate_per_head:
+            # Per-head gate: broadcast one gate value across head_dim via a
+            # (N, D) * (N, 1) row-broadcast multiply.
+            att_2d = g.view(
+                attn_out,
+                shape=[B * T * self.num_query_heads, self.head_size],
+                out_name=tracer.prefixed("att_2d"),
+            )
+            gate_2d = g.view(
+                gate_act,
+                shape=[B * T * self.num_query_heads, 1],
+                out_name=tracer.prefixed("gate_2d"),
+            )
+            gated = g.mul(att_2d, gate_2d)
+        else:
+            att_2d = g.view(attn_out, shape=[B * T, _hq], out_name=tracer.prefixed("att_2d"))
+            gate_2d = g.view(gate_act, shape=[B * T, _hq], out_name=tracer.prefixed("gate_2d"))
+            gated = g.mul(att_2d, gate_2d)
+
+        gated_flat = g.view(
+            gated,
+            shape=[B * T, _hq],
+            out_name=tracer.prefixed("att_flat"),
+        )
+
+        # Output projection
+        out_flat = g.matmul(
+            gated_flat,
+            out_w,
+            transpose="NT",
+            out_name=tracer.prefixed("att_out_flat"),
+        )
+        out = g.view(
+            out_flat,
+            shape=[B, T, self.C],
+            out_name=att_out_slot,
+        )
+
+        return Proxy(att_out_slot, out)
+
+
 # Class-level default mapping so ``hf.py`` can read
 # ``GenericGQAttention._hf_mapping_defaults_`` without instantiating.
 # Instances may override via ``self._hf_mapping_defaults_`` in __init__

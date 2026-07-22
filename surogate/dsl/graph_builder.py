@@ -343,6 +343,18 @@ class GraphBuilder:
         )
         return self._make_output(out)
 
+    def softplus(self, x: str | GraphRef, *, out_name: str | None = None) -> GraphRef:
+        """Softplus activation: log(1 + exp(x))."""
+        out = out_name if out_name else self._fresh_name("softplus")
+        self._add_node(
+            GraphNode(
+                op="softplus",
+                inputs=[self._resolve_input(x)],
+                outputs=[out],
+            )
+        )
+        return self._make_output(out)
+
     def relu(self, x: str | GraphRef, *, out_name: str | None = None) -> GraphRef:
         """ReLU activation."""
         out = out_name if out_name else self._fresh_name("relu")
