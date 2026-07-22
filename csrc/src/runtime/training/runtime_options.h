@@ -46,6 +46,9 @@ struct RuntimeOptions {
     // See RecomputeLevel enum above for level descriptions.
     RecomputeLevel Recompute = RecomputeLevel::None;
     bool OffloadResidual = false;
+    // Offload per-layer saved-for-backward tensors to pinned host at forward
+    // layer end; restored at backward layer start. Requires recompute.
+    bool OffloadSavedTensors = false;
     int LMHeadChunks = 1;
     bool SkipIgnoredLMHeadRows = false;
     int AttBwdChunks = 1;

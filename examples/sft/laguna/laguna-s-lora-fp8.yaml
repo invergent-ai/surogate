@@ -1,0 +1,58 @@
+# Laguna-S-2.1 (~117B total, ~6B active MoE) LoRA SFT on 8 GPUs.
+# Native CPU offloading (cpu_training): BF16 base weights stream per-layer from
+# pinned CPU RAM; experts are sharded 8-way (ep_size). Compute runs fp8-hybrid.
+model: poolside/Laguna-S-2.1
+output_dir: ./output_laguna_s
+
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 1
+
+gpus: 8
+ep_size: 8
+
+sample_packing: true
+sequence_len: 256
+
+max_steps: 20
+eval_steps: 100
+learning_rate: 2e-4
+warmup_ratio: 0.1
+
+recipe: fp8-hybrid
+lmhead_chunks: 8
+
+lora: true
+lora_rank: 16
+lora_alpha: 32
+lora_dtype: bf16
+
+qlora_offload_experts: false
+cpu_training: true
+# recompute (on by default) bounds per-layer activations; offload_residual moves the
+# per-layer residual checkpoints to pinned CPU so total activation memory is independent
+# of depth — needed here, the OOM was a late-layer (op ~1738) backward saved-tensor.
+offload_residual: true
+# Experimental: stream per-layer saved-for-backward tensors to pinned CPU.
+# Correct (XS-validated) but at Laguna scale the v1 restore pattern still adds
+# transient pressure — leave off until the overlap/refinement pass lands.
+offload_saved_tensors: false
+
+# Full targets: grouped expert-LoRA is EP-sharded (each rank adapts its 32
+# experts, ~1.7 GB/GPU); adapter export all-gathers the shards into one file.
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+
+# Temporary: print per-phase GPU memory so we can see what fills the device
+# during the step-1 backward (current OOM point).
+# debug_memory_breakdown: true
+
+dataloader_num_workers: 4
+datasets:
+  - path: "OpenLLM-Ro/ro_gsm8k"
+    type: auto

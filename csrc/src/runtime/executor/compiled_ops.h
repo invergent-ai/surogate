@@ -1027,6 +1027,12 @@ private:
     Tensor mMoEExpertOffsets;              // Views into mMoEExpertOffsetsData
     void* mMoEExpertOffsetsGPU = nullptr;  // Persistent GPU buffer (not stack-allocated)
     size_t mMoEExpertOffsetsGPUSize = 0;   // Size in bytes
+    // Pinned staging for the offsets D2H: pageable async D2H can block inside
+    // the driver's staging pool when all worker threads copy at once, which
+    // convoys with in-stream NCCL kernels into a cross-rank deadlock.
+    bool mInBackwardPass = false;  // true while execute_backward runs (incl. replay)
+    void* mMoEOffsetsPinned = nullptr;
+    size_t mMoEOffsetsPinnedBytes = 0;
 
     // Host-side MoE expert offsets cache.
     // Key is layer_idx for non-EP, ep_state_key(layer_idx) for EP.

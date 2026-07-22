@@ -581,7 +581,9 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
     std::vector<const void*> refreshed_native_weight_ptrs;
     {
         auto llep_it = mLLEPStates.find(ep_key);
-        if (llep_it != mLLEPStates.end() && llep_it->second.active) {
+        // cpu_training: stored native pointers reference a forward-time prefetch
+        // buffer that has been recycled — always reconstruct with fresh pointers.
+        if (llep_it != mLLEPStates.end() && llep_it->second.active && !mOptions.CpuTraining) {
             auto& llep = llep_it->second;
             is_llep_active = true;
             num_experts = llep.num_merged_experts;
@@ -616,7 +618,15 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
             }
         } else if (mOptions.EPSize > 1 && layer_idx >= 0) {
             auto meta_it = mEPLayerMeta.find(ep_key);
-            if (meta_it != mEPLayerMeta.end() && meta_it->second.num_merged != meta_it->second.num_local) {
+            auto merged_set_differs = [](const auto& meta) {
+                if (meta.num_merged != meta.num_local) return true;
+                for (int m = 0; m < meta.num_merged; ++m) {
+                    const int li = meta.merged_to_global[m] - meta.native_start;
+                    if (li < 0 || li >= meta.num_local) return true;
+                }
+                return false;
+            };
+            if (meta_it != mEPLayerMeta.end() && merged_set_differs(meta_it->second)) {
                 const auto& meta = meta_it->second;
                 is_llep_active = true;
                 num_experts = meta.num_merged;
@@ -624,10 +634,49 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
 
                 const size_t elem_sz = get_dtype_size(weights.DType);
                 const size_t expert_bytes = static_cast<size_t>(hidden_size) * intermediate_size * elem_sz;
-                std::vector<long> zw_shape = {1L, static_cast<long>(hidden_size), static_cast<long>(intermediate_size)};
-                Tensor zero_weight = mRunState.temp_alloc(weights.DType, zw_shape, "moe_grouped_gemm_down_zero_weight");
-                fill_zero(zero_weight, mRunState.MainStream);
-                mTemps.push_back(zero_weight);
+
+                // Foreign experts: under cpu_training re-fetch rows from the GLOBAL
+                // pinned host master (exact dgrad); otherwise fall back to zeros.
+                std::vector<std::pair<int, int>> foreign_slot;
+                for (int m = 0; m < meta.num_merged; ++m) {
+                    const int e = meta.merged_to_global[m];
+                    const int li = e - meta.native_start;
+                    if (li < 0 || li >= meta.num_local) {
+                        foreign_slot.emplace_back(e, static_cast<int>(foreign_slot.size()));
+                    }
+                }
+                Tensor foreign_stage;
+                bool have_foreign_stage = false;
+                if (!foreign_slot.empty() && mOptions.CpuTraining) {
+                    Tensor* master = mWeights.master_tensor("blocks[" + std::to_string(layer_idx) + "].experts_down");
+                    if (master && master->Rank >= 3 && master->DType == weights.DType) {
+                        foreign_stage = mRunState.temp_alloc(weights.DType,
+                                                             {static_cast<long>(foreign_slot.size()),
+                                                              static_cast<long>(hidden_size),
+                                                              static_cast<long>(intermediate_size)},
+                                                             "moe_grouped_gemm_down_foreign_stage");
+                        mTemps.push_back(foreign_stage);
+                        for (const auto& [e, slot] : foreign_slot) {
+                            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(foreign_stage.Data) +
+                                                           static_cast<size_t>(slot) * expert_bytes,
+                                                       static_cast<const std::byte*>(master->Data) +
+                                                           static_cast<size_t>(e) * expert_bytes,
+                                                       expert_bytes,
+                                                       cudaMemcpyHostToDevice,
+                                                       mRunState.MainStream));
+                        }
+                        have_foreign_stage = true;
+                    }
+                }
+                Tensor zero_weight;
+                if (!foreign_slot.empty() && !have_foreign_stage) {
+                    std::vector<long> zw_shape = {
+                        1L, static_cast<long>(hidden_size), static_cast<long>(intermediate_size)};
+                    zero_weight =
+                        mRunState.temp_alloc(weights.DType, zw_shape, "moe_grouped_gemm_down_zero_weight");
+                    fill_zero(zero_weight, mRunState.MainStream);
+                    mTemps.push_back(zero_weight);
+                }
 
                 reconstructed_weight_ptrs.resize(meta.num_merged);
                 for (int m = 0; m < meta.num_merged; ++m) {
@@ -636,6 +685,16 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
                     if (local_idx >= 0 && local_idx < meta.num_local) {
                         reconstructed_weight_ptrs[m] =
                             static_cast<const std::byte*>(weights.Data) + static_cast<size_t>(local_idx) * expert_bytes;
+                    } else if (have_foreign_stage) {
+                        int slot = 0;
+                        for (const auto& [e, s2] : foreign_slot) {
+                            if (e == global_e) {
+                                slot = s2;
+                                break;
+                            }
+                        }
+                        reconstructed_weight_ptrs[m] = static_cast<const std::byte*>(foreign_stage.Data) +
+                                                       static_cast<size_t>(slot) * expert_bytes;
                     } else {
                         reconstructed_weight_ptrs[m] = zero_weight.Data;
                     }
@@ -783,8 +842,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
             bool llep_lora_active = false;
             {
                 auto llep_lora_it = mLLEPStates.find(ep_key);
-                if (llep_lora_it != mLLEPStates.end() && llep_lora_it->second.active &&
-                    llep_lora_it->second.has_merged_lora && llep_lora_it->second.merged_lora.down.has_value()) {
+                if (llep_lora_it != mLLEPStates.end() && llep_lora_it->second.has_merged_lora && llep_lora_it->second.merged_lora.down.has_value()) {
                     down_ptr = &(*llep_lora_it->second.merged_lora.down);
                     llep_lora_active = true;
                 }
@@ -1065,12 +1123,96 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
 
                 modules::LoRABlockWeights<Tensor>* lora_grads = nullptr;
                 bool lora_accum = false;
-                if (mLoRAGrads && mComm && !llep_lora_active) {
-                    // Skip LoRA weight grads when LLEP is active — grad storage is
-                    // [num_local, ...] which doesn't match num_merged.
+                // LLEP: stage wgrads in MERGED [num_merged] temps, then scatter-add
+                // native rows locally and exchange foreign rows to their owners
+                // (mirrors moe_grouped_gemm_gate_up.cpp).
+                const ep::EPLayerMeta* wg_meta = nullptr;
+                if (llep_lora_active) {
+                    auto wg_it = mEPLayerMeta.find(ep_key);
+                    if (wg_it != mEPLayerMeta.end() && !wg_it->second.expert_to_gpu.empty()) {
+                        wg_meta = &wg_it->second;
+                    }
+                }
+                const bool llep_wgrad = llep_lora_active && wg_meta != nullptr && mComm != nullptr;
+                if (mLoRAGrads && mComm && (!llep_lora_active || llep_wgrad)) {
                     lora_grads = &mLoRAGrads->get_block_full(layer_idx, mRunState.MainStream, *mComm, lora_accum);
                 }
                 const float grad_beta = lora_accum ? 1.0f : 0.0f;
+
+                auto merged_temp = [&](long rows, long cols) -> Tensor {
+                    Tensor t = mRunState.temp_alloc(
+                        d_input.DType, {static_cast<long>(num_experts), rows, cols}, "llep_merged_wgrad_down");
+                    fill_zero(t, mRunState.MainStream);
+                    mTemps.push_back(t);
+                    return t;
+                };
+                Tensor mg_down_A, mg_down_B;
+                auto row_view = [&](const Tensor& t, int row) -> Tensor {
+                    const long r1 = t.Sizes[1], r2 = t.Sizes[2];
+                    const std::size_t off = static_cast<std::size_t>(row) * r1 * r2 * get_dtype_size(t.DType);
+                    return Tensor::from_pointer(static_cast<std::byte*>(t.Data) + off, t.Device, t.DType,
+                                                std::vector<long>{r1, r2});
+                };
+                auto row_add = [&](Tensor& dst3, int dst_row, const Tensor& src3, int src_row) {
+                    Tensor d = row_view(dst3, dst_row);
+                    Tensor sv = row_view(src3, src_row);
+                    vector_add_sr(d, d, sv, 1.0f, d.nelem(), 0, mRunState.MainStream);
+                };
+                auto scatter_exchange = [&](Tensor& mgA, Tensor& mgB,
+                                            modules::LoRAGroupedLayerWeights<Tensor>& local) {
+                    const auto& meta = *wg_meta;
+                    const int nl = std::max(meta.num_local, 1);
+                    const int my_ep = meta.native_start / nl;
+                    if (!lora_accum) {
+                        fill_zero(local.A, mRunState.MainStream);
+                        fill_zero(local.B, mRunState.MainStream);
+                    }
+                    std::vector<int> g2m(meta.expert_to_gpu.size(), -1);
+                    for (int m = 0; m < meta.num_merged; ++m) g2m[meta.merged_to_global[m]] = m;
+                    for (int m = 0; m < meta.num_merged; ++m) {
+                        const int ln = meta.merged_to_global[m] - meta.native_start;
+                        if (ln >= 0 && ln < meta.num_local) {
+                            row_add(local.A, ln, mgA, m);
+                            row_add(local.B, ln, mgB, m);
+                        }
+                    }
+                    const std::size_t a_bytes =
+                        static_cast<std::size_t>(mgA.Sizes[1]) * mgA.Sizes[2] * get_dtype_size(mgA.DType);
+                    const std::size_t b_bytes =
+                        static_cast<std::size_t>(mgB.Sizes[1]) * mgB.Sizes[2] * get_dtype_size(mgB.DType);
+                    std::vector<std::tuple<int, Tensor, Tensor>> recvs;
+                    mComm->weight_transfer_group_start();
+                    const int E_total = static_cast<int>(meta.expert_to_gpu.size());
+                    for (int e = 0; e < E_total; ++e) {
+                        const int owner = e / nl;
+                        const int helper = meta.expert_to_gpu[e];
+                        if (helper == owner) continue;
+                        if (helper == my_ep && g2m[e] >= 0) {
+                            Tensor sa = row_view(mgA, g2m[e]);
+                            Tensor sb = row_view(mgB, g2m[e]);
+                            mComm->send_wt(sa.Data, a_bytes, owner, mRunState.MainStream);
+                            mComm->send_wt(sb.Data, b_bytes, owner, mRunState.MainStream);
+                        } else if (owner == my_ep) {
+                            Tensor ta =
+                                mRunState.temp_alloc(mgA.DType, {mgA.Sizes[1], mgA.Sizes[2]}, "llep_wgrad_recv");
+                            Tensor tb =
+                                mRunState.temp_alloc(mgB.DType, {mgB.Sizes[1], mgB.Sizes[2]}, "llep_wgrad_recv");
+                            mTemps.push_back(ta);
+                            mTemps.push_back(tb);
+                            mComm->recv_wt(ta.Data, a_bytes, helper, mRunState.MainStream);
+                            mComm->recv_wt(tb.Data, b_bytes, helper, mRunState.MainStream);
+                            recvs.emplace_back(e, ta, tb);
+                        }
+                    }
+                    mComm->weight_transfer_group_end();
+                    for (auto& [e, ta, tb] : recvs) {
+                        const int ln = e - meta.native_start;
+                        Tensor da = row_view(local.A, ln);
+                        Tensor db = row_view(local.B, ln);
+                        vector_add_sr(da, da, ta, 1.0f, da.nelem(), 0, mRunState.MainStream);
+                        vector_add_sr(db, db, tb, 1.0f, db.nelem(), 0, mRunState.MainStream);
+                    }
+                };
 
                 if (total_tokens_i > 0 && rank > 0) {
                     Tensor lora_intermediate =
@@ -1088,7 +1230,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
                                           EMMTranspose::TN);
                     scale_and_dropout(lora_intermediate, seed_down);
                     if (lora_grads && lora_grads->moe.grouped.down.has_value()) {
-                        dispatch_weight_grad(lora_grads->moe.grouped.down->B,
+                        dispatch_weight_grad(llep_wgrad ? (mg_down_B.Data ? mg_down_B : (mg_down_B = merged_temp(hidden_size, rank))) : lora_grads->moe.grouped.down->B,
                                              d_output,
                                              lora_intermediate,
                                              hidden_size,
@@ -1107,7 +1249,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
                                           EMMTranspose::NN);
                     scale_and_dropout(lora_intermediate, seed_down);
                     if (lora_grads && lora_grads->moe.grouped.down.has_value()) {
-                        dispatch_weight_grad(lora_grads->moe.grouped.down->A,
+                        dispatch_weight_grad(llep_wgrad ? (mg_down_A.Data ? mg_down_A : (mg_down_A = merged_temp(rank, intermediate_size))) : lora_grads->moe.grouped.down->A,
                                              lora_intermediate,
                                              inp,
                                              rank,
@@ -1124,6 +1266,11 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
                                           1.0f,
                                           1.0f,
                                           EMMTranspose::NN);
+
+                    if (llep_wgrad && lora_grads && mg_down_A.Data && mg_down_B.Data &&
+                        lora_grads->moe.grouped.down.has_value()) {
+                        scatter_exchange(mg_down_A, mg_down_B, *lora_grads->moe.grouped.down);
+                    }
                 }
             }  // if (down_ptr && down_ptr->has_value())
         }  // if (use_grouped)

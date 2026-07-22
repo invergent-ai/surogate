@@ -517,6 +517,9 @@ NB_MODULE(_surogate, m) {
             },
             "Enable activation recomputation: 'true' or 'false'.")
         .def_rw("offload_residual", &RuntimeOptions::OffloadResidual, "Offload residual stream buffers.")
+        .def_rw("offload_saved_tensors",
+                &RuntimeOptions::OffloadSavedTensors,
+                "Offload per-layer saved-for-backward tensors to pinned host (requires recompute)")
         .def_rw("lmhead_chunks", &RuntimeOptions::LMHeadChunks, "Split LM head computation into this many chunks.")
         .def_rw("skip_ignored_lmhead_rows",
                 &RuntimeOptions::SkipIgnoredLMHeadRows,

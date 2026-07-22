@@ -104,6 +104,21 @@ void transfer_expert_weights(const LPTPlan& plan,
                              int num_local_experts,
                              int ep_rank);
 
+/// cpu_training variant: helpers copy their foreign experts' rows directly from
+/// the GLOBAL pinned host masters (shared across ranks) via H2D — no peer
+/// communication, no dependence on transient prefetch buffers. Owners do nothing.
+///
+/// @param plan            LPT plan (only weights_to_receive is used)
+/// @param stream          CUDA stream for the H2D copies
+/// @param[out] received   Received foreign expert weights on this GPU
+/// @param master_gate_up  GLOBAL pinned host gate_up master [E, rows, cols]
+/// @param master_down     GLOBAL pinned host down master [E, rows, cols]
+void fetch_expert_weights_from_host(const LPTPlan& plan,
+                                    cudaStream_t stream,
+                                    ForeignExpertWeights& received,
+                                    const Tensor& master_gate_up,
+                                    const Tensor& master_down);
+
 /// Transfer expert weights using quantized format for reduced P2P bandwidth.
 ///
 /// Sends raw quantized data + scales instead of dequantized BF16, achieving

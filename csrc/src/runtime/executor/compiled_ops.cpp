@@ -399,6 +399,11 @@ CompiledExecutor::~CompiledExecutor() {
         mMoEExpertOffsetsGPU = nullptr;
         mMoEExpertOffsetsGPUSize = 0;
     }
+    if (mMoEOffsetsPinned) {
+        cudaFreeHost(mMoEOffsetsPinned);
+        mMoEOffsetsPinned = nullptr;
+        mMoEOffsetsPinnedBytes = 0;
+    }
     if (mReplayPersistArena) {
         cudaFree(mReplayPersistArena);
         mReplayPersistArena = nullptr;
@@ -974,6 +979,11 @@ const Tensor* CompiledExecutor::try_get_tensor_fuzzy(const std::string& name) {
 }
 
 void CompiledExecutor::handle_layer_start(int layer_idx) {
+    // Saved-tensor offload: bring this layer's offloaded saves back before any
+    // of its backward/replay ops read them (stream-ordered on MainStream).
+    if (mOptions.OffloadSavedTensors && !mCapturing && mInBackwardPass) {
+        mSavedCache.restore_layer(layer_idx, mRunState.MainStream);
+    }
     BeforeConsumeHookPayload before_consume_payload;
     before_consume_payload.weight_manager = mWeightManager;
     before_consume_payload.comm = mComm;
@@ -1018,6 +1028,11 @@ void CompiledExecutor::handle_layer_start(int layer_idx) {
 }
 
 void CompiledExecutor::handle_layer_end(int layer_idx) {
+    // Saved-tensor offload: after the forward layer completes, its saves are
+    // final — move them to pinned host and recycle the device buffers.
+    if (mOptions.OffloadSavedTensors && !mCapturing && !mInBackwardPass) {
+        mSavedCache.offload_layer(layer_idx, mRunState.MainStream);
+    }
     AfterConsumeHookPayload after_consume_payload;
     after_consume_payload.weight_manager = mWeightManager;
     after_consume_payload.release_stream = mRunState.MainStream;

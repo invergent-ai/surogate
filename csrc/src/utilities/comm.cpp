@@ -7,7 +7,10 @@
 
 #include <algorithm>
 #include <cstring>
+#include <chrono>
+#include <csignal>
 #include <cstdlib>
+#include <mutex>
 #include <stdexcept>
 #include <utility>
 #include <variant>
@@ -112,12 +115,71 @@ NCCLCommunicator::NCCLCommunicator(int rank, int world, const void* nccl_id, int
  *
  * Always destroys the internal CUDA event/stream (best-effort; never throws).
  */
+namespace {
+/// Teardown body for ~NCCLCommunicator's helper thread. Takes raw handles BY
+/// VALUE — the helper may outlive the object (detached on timeout), so it must
+/// never dereference the communicator.
+void terminate_nccl_comms(ncclComm_t main_comm,
+                          ncclComm_t ep_comm,
+                          ncclComm_t dp_comm,
+                          ncclComm_t wt_comm,
+                          cudaStream_t comms_stream,
+                          bool already_torn_down) {
+    if (already_torn_down || !main_comm) {
+        return;
+    }
+    ncclResult_t result;
+    ncclCheck(ncclCommGetAsyncError(main_comm, &result));
+    if (result == ncclSuccess) {
+        CUDA_CHECK(cudaStreamSynchronize(comms_stream));
+        CUDA_CHECK(cudaDeviceSynchronize());
+        if (wt_comm) {
+            ncclCheck(ncclCommFinalize(wt_comm));
+            ncclCheck(ncclCommDestroy(wt_comm));
+        }
+        if (dp_comm) {
+            ncclCheck(ncclCommFinalize(dp_comm));
+            ncclCheck(ncclCommDestroy(dp_comm));
+        }
+        if (ep_comm) {
+            ncclCheck(ncclCommFinalize(ep_comm));
+            ncclCheck(ncclCommDestroy(ep_comm));
+        }
+        ncclCheck(ncclCommFinalize(main_comm));
+        ncclCheck(ncclCommDestroy(main_comm));
+    } else {
+        if (wt_comm) ncclCommAbort(wt_comm);
+        if (dp_comm) ncclCommAbort(dp_comm);
+        if (ep_comm) ncclCommAbort(ep_comm);
+        ncclCommAbort(main_comm);
+    }
+}
+}  // namespace
+
 NCCLCommunicator::~NCCLCommunicator() {
     // When used with the python bindings, ncclCommFinalize() can hang forever;
     // I haven't found a fix, so here we just make sure that the hang gets localized
     // to a helper thread (which we leak, but generally ~NCCLCommunicator is expected
-    // to run at program shutdown anyway)
-    auto terminate_future = std::async(std::launch::async, [this]() { this->terminate_nccl(); });
+    // to run at program shutdown anyway).
+    //
+    // The helper must NOT capture `this`: on timeout the future is detached while
+    // this object is destroyed underneath it (observed SIGSEGV at exit). Claim the
+    // teardown flag here and hand the helper raw handles by value.
+    const bool already_torn_down = mNcclTornDown.exchange(true);
+    auto terminate_future = std::async(std::launch::async,
+                                       [main_comm = mNcclComm,
+                                        ep_comm = mEPComm,
+                                        dp_comm = mDPComm,
+                                        wt_comm = mWeightTransferComm,
+                                        comms_stream = mCommsStream,
+                                        already_torn_down]() {
+                                           terminate_nccl_comms(main_comm,
+                                                                ep_comm,
+                                                                dp_comm,
+                                                                wt_comm,
+                                                                comms_stream,
+                                                                already_torn_down);
+                                       });
 
     if (terminate_future.wait_for(std::chrono::seconds(2)) == std::future_status::timeout) {
         fprintf(stderr, "NCCL termination timed out, detaching\n");
@@ -155,49 +217,34 @@ NCCLCommunicator::~NCCLCommunicator() {
  *
  * @note Intended to be called from a helper thread in the destructor to avoid process-wide hangs.
  */
-void NCCLCommunicator::terminate_nccl() {
-    ncclResult_t result;
-    ncclCheck(ncclCommGetAsyncError(mNcclComm, &result));
-    // do "nice" shutdown if we're in a good state,
-    // just abort if there is something weird going on.
-    if (std::uncaught_exceptions() == 0 && result == ncclSuccess) {
-        CUDA_CHECK(cudaStreamSynchronize(mCommsStream));
-        CUDA_CHECK(cudaDeviceSynchronize());
-
-        // Destroy EP sub-communicators before the global comm
-        if (mWeightTransferComm) {
-            ncclCheck(ncclCommFinalize(mWeightTransferComm));
-            ncclCheck(ncclCommDestroy(mWeightTransferComm));
-            mWeightTransferComm = nullptr;
-        }
-        if (mDPComm) {
-            ncclCheck(ncclCommFinalize(mDPComm));
-            ncclCheck(ncclCommDestroy(mDPComm));
-            mDPComm = nullptr;
-        }
-        if (mEPComm) {
-            ncclCheck(ncclCommFinalize(mEPComm));
-            ncclCheck(ncclCommDestroy(mEPComm));
-            mEPComm = nullptr;
-        }
-
-        ncclCheck(ncclCommFinalize(mNcclComm));
-        ncclCheck(ncclCommDestroy(mNcclComm));
-    } else {
-        if (mWeightTransferComm) {
-            ncclCommAbort(mWeightTransferComm);
-            mWeightTransferComm = nullptr;
-        }
-        if (mDPComm) {
-            ncclCommAbort(mDPComm);
-            mDPComm = nullptr;
-        }
-        if (mEPComm) {
-            ncclCommAbort(mEPComm);
-            mEPComm = nullptr;
-        }
-        ncclCheck(ncclCommAbort(mNcclComm));
+void NCCLCommunicator::abort_comms() {
+    if (mNcclTornDown.exchange(true)) {
+        return;
     }
+    // ncclCommAbort is documented as callable from a different thread to break
+    // ranks out of collectives that will never complete (peer crashed). Pending
+    // operations on these comms return an error instead of spinning forever.
+    // Deliberately do not null the handles: the owning thread may be concurrently
+    // inside a collective reading them; it observes the abort via the NCCL error.
+    if (mWeightTransferComm) {
+        ncclCommAbort(mWeightTransferComm);
+    }
+    if (mDPComm) {
+        ncclCommAbort(mDPComm);
+    }
+    if (mEPComm) {
+        ncclCommAbort(mEPComm);
+    }
+    if (mNcclComm) {
+        ncclCommAbort(mNcclComm);
+    }
+}
+
+void NCCLCommunicator::terminate_nccl() {
+    if (mNcclTornDown.exchange(true)) {
+        return;  // already aborted/claimed elsewhere
+    }
+    terminate_nccl_comms(mNcclComm, mEPComm, mDPComm, mWeightTransferComm, mCommsStream, false);
 }
 
 /**
@@ -884,12 +931,71 @@ void NCCLCommunicator::schedule_destructive_all_to_all(const Tensor& tensor) {
  * Can optionally replace some NCCL ops (all-gather and/or send/recv) with device-to-device
  * memcpy coordinated via barriers.
  */
+/// Yield-spin barrier with std::barrier's arrive_and_wait / arrive_and_drop
+/// surface. Waiters spin on an atomic generation instead of parking on a futex:
+/// under heavy multi-threaded CUDA load we observed rare lost-wakeup stalls
+/// (minutes, resolved by any signal) with the futex-parked std::barrier — a
+/// spinner cannot miss a wakeup. Barrier phases here are short (launch-queue
+/// throttling, memcpy handoffs), so spinning is the right trade.
+class SpinBarrier {
+public:
+    explicit SpinBarrier(int participants) : mParticipants(participants) {}
+
+    void arrive_and_wait() {
+        long gen;
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
+            gen = mGeneration.load(std::memory_order_relaxed);
+            if (++mArrivals >= mParticipants) {
+                mArrivals = 0;
+                mGeneration.store(gen + 1, std::memory_order_release);
+                return;
+            }
+        }
+        while (mGeneration.load(std::memory_order_acquire) == gen) {
+            std::this_thread::yield();
+        }
+    }
+
+    void arrive_and_drop() {
+        std::lock_guard<std::mutex> lock(mMutex);
+        const long gen = mGeneration.load(std::memory_order_relaxed);
+        --mParticipants;
+        if (mParticipants > 0 && mArrivals >= mParticipants) {
+            mArrivals = 0;
+            mGeneration.store(gen + 1, std::memory_order_release);
+        }
+    }
+
+private:
+    std::atomic<long> mGeneration{0};
+    std::mutex mMutex;  ///< guards mArrivals/mParticipants transitions
+    int mParticipants;
+    int mArrivals = 0;
+};
+
 class NCCLCommunicatorImpl : public NCCLCommunicator {
 public:
     struct SharedState {
-        std::unique_ptr<std::barrier<>> Barrier;
+        std::unique_ptr<SpinBarrier> Barrier;
         std::vector<std::byte*> Buffer;  // one pointer per thread
         std::vector<std::exception_ptr> Exceptions;
+        // Live communicators, one slot per local rank (registered in the
+        // NCCLCommunicatorImpl ctor, cleared in its dtor). Guarded by
+        // AbortMutex — NOT Mutex: the abort thread can wedge inside
+        // ncclCommAbort (CUDA driver locks), and it must never starve
+        // has_exception()/check_exceptions() which lock Mutex.
+        std::vector<NCCLCommunicator*> Comms;
+        std::mutex AbortMutex;
+        // Local rank of the first thread that stored an exception (-1 = none).
+        // join() rethrows this one so the root cause (e.g. an OOM) surfaces
+        // instead of a follow-on NCCL-abort error from a surviving rank.
+        int FirstExceptionRank = -1;
+        // Number of worker threads that have not finished their lambda yet.
+        // Set to the launch count up front; each thread decrements on exit
+        // (normal or exceptional). Lets wait_exit_for() poll for teardown
+        // completion without a blocking join.
+        std::atomic<int> ThreadsAlive{0};
         std::mutex Mutex;
         int NumNodes = 1;   // number of nodes (1 = single node)
         int NodeRank = 0;   // this node's rank
@@ -1042,9 +1148,18 @@ NCCLCommunicatorImpl::NCCLCommunicatorImpl(int local_rank,
       mLocalRank(local_rank),
       mAllGatherUseMemcpy(memcpy_allgather),
       mSendRecvUseMemcpy(memcpy_send_recv) {
+    std::lock_guard<std::mutex> lock(mShare->AbortMutex);
+    if (mShare->Comms.size() <= static_cast<std::size_t>(local_rank)) {
+        mShare->Comms.resize(static_cast<std::size_t>(local_rank) + 1, nullptr);
+    }
+    mShare->Comms[static_cast<std::size_t>(local_rank)] = this;
 }
 
 NCCLCommunicatorImpl::~NCCLCommunicatorImpl() {
+    if (mShare) {
+        std::lock_guard<std::mutex> lock(mShare->AbortMutex);
+        mShare->Comms[static_cast<std::size_t>(mLocalRank)] = nullptr;
+    }
     if (mShare && mShare->Barrier) {
         mShare->Barrier->arrive_and_drop();
     }
@@ -1358,6 +1473,61 @@ public:
         return false;
     }
 
+    void abort_async() override {
+        // Run on a detached thread: ncclCommAbort can itself block on CUDA
+        // driver locks held by a wedged thread, and the caller must stay
+        // responsive to escalate (bounded wait -> forced exit). Captures the
+        // shared state (not `this`) so pack lifetime doesn't matter.
+        auto state = mState;
+        std::thread([state]() {
+            // Holding AbortMutex keeps each comm alive for the duration of its
+            // abort: ~NCCLCommunicatorImpl deregisters under the same mutex.
+            // If ncclCommAbort wedges (driver locks), this blocks only comm
+            // destructors — never the exception-query path (Mutex) — so the
+            // caller's bounded wait still times out and escalates.
+            std::lock_guard<std::mutex> lock(state->AbortMutex);
+            for (auto* comm : state->Comms) {
+                if (comm) {
+                    comm->abort_comms();
+                }
+            }
+        }).detach();
+    }
+
+    bool wait_exit_for(int timeout_ms) override {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        while (mState->ThreadsAlive.load(std::memory_order_acquire) > 0) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return true;
+    }
+
+    void rethrow_exception() override {
+        check_exceptions();
+    }
+
+    void poke_workers() override {
+        // One-time: install a no-op SIGUSR2 handler WITHOUT SA_RESTART so a
+        // poked thread's blocking syscall returns EINTR and re-checks its
+        // condition (lost-wakeup recovery).
+        static std::once_flag once;
+        std::call_once(once, [] {
+            struct sigaction sa{};
+            sa.sa_handler = [](int) {};
+            sigemptyset(&sa.sa_mask);
+            sa.sa_flags = 0;  // deliberately no SA_RESTART
+            sigaction(SIGUSR2, &sa, nullptr);
+        });
+        for (auto& t : mThreads) {
+            if (t.joinable()) {
+                pthread_kill(t.native_handle(), SIGUSR2);
+            }
+        }
+    }
+
 private:
     void join_impl() {
         check_exceptions();
@@ -1371,6 +1541,18 @@ private:
 
     void check_exceptions() {
         std::lock_guard<std::mutex> lock(mState->Mutex);
+        // Rethrow the chronologically first exception: after an abort, surviving
+        // ranks store follow-on NCCL errors that would otherwise mask the root
+        // cause (and break OOM detection in the Python recovery path).
+        if (mState->FirstExceptionRank >= 0) {
+            const auto first = static_cast<size_t>(mState->FirstExceptionRank);
+            if (auto error = mState->Exceptions[first]; error) {
+                fprintf(stderr, "Thread %zu exited with uncaught exception\n", first);
+                fflush(stderr);
+                mState->Exceptions[first] = nullptr;
+                std::rethrow_exception(error);
+            }
+        }
         for (size_t t = 0; t < mThreads.size(); ++t) {
             if (auto error = mState->Exceptions[t]; error) {
                 fprintf(stderr, "Thread %zu exited with uncaught exception\n", t);
@@ -1421,9 +1603,10 @@ launch_communicators_impl(int ngpus,
 
     // Create shared state for local threads
     auto shared_state = std::make_shared<NCCLCommunicatorImpl::SharedState>();
-    shared_state->Barrier = std::make_unique<std::barrier<>>(ngpus);
+    shared_state->Barrier = std::make_unique<SpinBarrier>(ngpus);
     shared_state->Buffer.resize(ngpus);
     shared_state->Exceptions.resize(ngpus);
+    shared_state->ThreadsAlive.store(ngpus, std::memory_order_release);
     shared_state->NumNodes = 1;
     shared_state->NodeRank = 0;
     shared_state->LocalGPUs = ngpus;
@@ -1434,6 +1617,12 @@ launch_communicators_impl(int ngpus,
 
     for (int local_rank = 0; local_rank < ngpus; ++local_rank) {
         threads.emplace_back([=]() {
+            struct ExitGuard {
+                std::shared_ptr<NCCLCommunicatorImpl::SharedState> state;
+                ~ExitGuard() {
+                    state->ThreadsAlive.fetch_sub(1, std::memory_order_release);
+                }
+            } exit_guard{shared_state};
             try {
                 if (!set_cpu_affinity()) {
                     fprintf(stderr, "WARNING: Failed to set CPU affinity for local rank %d\n", local_rank);
@@ -1446,6 +1635,9 @@ launch_communicators_impl(int ngpus,
             } catch (...) {
                 std::lock_guard<std::mutex> lock(shared_state->Mutex);
                 shared_state->Exceptions[local_rank] = std::current_exception();
+                if (shared_state->FirstExceptionRank < 0) {
+                    shared_state->FirstExceptionRank = local_rank;
+                }
             }
         });
     }
@@ -1542,9 +1734,10 @@ NCCLCommunicator::launch_communicators_multinode(int ngpus,
 
     // Create shared state for local threads
     auto shared_state = std::make_shared<NCCLCommunicatorImpl::SharedState>();
-    shared_state->Barrier = std::make_unique<std::barrier<>>(ngpus);
+    shared_state->Barrier = std::make_unique<SpinBarrier>(ngpus);
     shared_state->Buffer.resize(ngpus);
     shared_state->Exceptions.resize(ngpus);
+    shared_state->ThreadsAlive.store(ngpus, std::memory_order_release);
     shared_state->NumNodes = num_nodes;
     shared_state->NodeRank = node_rank;
     shared_state->LocalGPUs = ngpus;
@@ -1577,6 +1770,12 @@ NCCLCommunicator::launch_communicators_multinode(int ngpus,
         int global_rank = node_rank * ngpus + local_rank;
 
         threads.emplace_back([=]() {
+            struct ExitGuard {
+                std::shared_ptr<NCCLCommunicatorImpl::SharedState> state;
+                ~ExitGuard() {
+                    state->ThreadsAlive.fetch_sub(1, std::memory_order_release);
+                }
+            } exit_guard{shared_state};
             try {
                 if (!set_cpu_affinity()) {
                     fprintf(stderr, "WARNING: Failed to set CPU affinity for local rank %d\n", local_rank);
@@ -1614,6 +1813,9 @@ NCCLCommunicator::launch_communicators_multinode(int ngpus,
             } catch (...) {
                 std::lock_guard<std::mutex> lock(shared_state->Mutex);
                 shared_state->Exceptions[local_rank] = std::current_exception();
+                if (shared_state->FirstExceptionRank < 0) {
+                    shared_state->FirstExceptionRank = local_rank;
+                }
             }
         });
     }

@@ -192,6 +192,14 @@ private:
     std::unordered_map<int, EPLayerMeta> mEPLayerMeta;
     EPBufferPool mBufferPool;
 
+    /// Reusable PINNED host staging for the small count/split copies in the
+    /// dispatch path. Async copies to/from PAGEABLE memory can block inside the
+    /// driver's staging pool when all worker threads copy at once — with NCCL
+    /// kernels at the stream heads this convoys into a cross-rank deadlock.
+    /// Pinned staging never blocks the enqueue. Grow-only, keyed by call site.
+    void* pinned_scratch(int slot, std::size_t bytes);
+    std::unordered_map<int, std::pair<void*, std::size_t>> mPinnedScratch;
+
     cudaStream_t mWeightTransferStream = nullptr;
 };
 

@@ -7,6 +7,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <cstdlib>
 #include <cstring>
@@ -282,20 +283,47 @@ MultiGPUPyTrainer::MultiGPUPyTrainer(int ngpus,
 MultiGPUPyTrainer::~MultiGPUPyTrainer() {
     mIsRunning = false;
 
-    // make sure all work has finished
-    // Use local_rank() for cudaSetDevice, and don't throw from destructor
-    for (auto& ctx : mContexts) {
-        if (ctx.Communicator) {
-            cudaError_t err = cudaSetDevice(ctx.Communicator->local_rank());
-            if (err == cudaSuccess) {
-                cudaDeviceSynchronize();
+    const bool crashed = mHasCrashed.load() || (mThreads && mThreads->has_exception());
+    if (crashed) {
+        // Workers may be stuck in NCCL collectives waiting for a crashed rank,
+        // and their pending kernels would also make cudaDeviceSynchronize hang.
+        // Abort the comms so everyone can exit, and skip the device syncs. If
+        // they stay wedged (driver-lock deadlocks inside NCCL), force-exit: a
+        // dead process releases its GPUs, a deadlocked one pins them forever.
+        mThreads->abort_async();
+        if (!mThreads->wait_exit_for(15000)) {
+            fprintf(stderr,
+                    "FATAL: MultiGPUPyTrainer workers wedged in NCCL teardown after a crash; "
+                    "forcing process exit to avoid a deadlocked trainer\n");
+            fflush(nullptr);
+            std::_Exit(134);
+        }
+    } else {
+        // make sure all work has finished
+        // Use local_rank() for cudaSetDevice, and don't throw from destructor
+        for (auto& ctx : mContexts) {
+            if (ctx.Communicator) {
+                cudaError_t err = cudaSetDevice(ctx.Communicator->local_rank());
+                if (err == cudaSuccess) {
+                    cudaDeviceSynchronize();
+                }
+                // Ignore errors - we're in destructor, possibly after a crash
             }
-            // Ignore errors - we're in destructor, possibly after a crash
         }
     }
 
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    mThreads->join();
+    try {
+        mThreads->join();
+    } catch (const std::exception& e) {
+        // The exception was already surfaced to the caller via run_work/wait_gpu;
+        // rethrowing from a destructor would terminate the process.
+        fprintf(stderr, "MultiGPUPyTrainer teardown after error: %s\n", e.what());
+        fflush(stderr);
+    } catch (...) {
+        fprintf(stderr, "MultiGPUPyTrainer teardown after unknown error\n");
+        fflush(stderr);
+    }
 
     // Free the cross-GPU shared base masters (after all streaming work has finished).
     dsl::shared_master_store().clear();
@@ -1436,6 +1464,10 @@ void MultiGPUPyTrainer::init_async_slots(std::size_t n) {
 // GPU picks it up via fetch_work and bumps mCtxDone when finished. Blocks only if that
 // GPU still has an outstanding async item (the natural is_idle backpressure).
 void MultiGPUPyTrainer::dispatch_async(std::function<void(sThreadContext& ctx)> work, int gpu) {
+    if (mHasCrashed.load()) {
+        throw std::runtime_error(
+            "MultiGPUPyTrainer: a worker crashed earlier; the trainer is defunct (restart the process)");
+    }
     wait_gpu(gpu);  // ensure the previous async item on this GPU has completed
     {
         std::lock_guard<std::mutex> lock(mGlobalMutex);
@@ -1451,7 +1483,19 @@ void MultiGPUPyTrainer::wait_gpu(int gpu) {
     while (mCtxDone[g].load(std::memory_order_acquire) < mCtxPending[g].load(std::memory_order_acquire)) {
         if (mThreads->has_exception()) {
             stop();
-            mThreads->join();  // will throw, ending the loop
+            // Surviving ranks may be blocked in NCCL collectives waiting for the
+            // crashed rank; abort the comms (detached — ncclCommAbort can wedge on
+            // driver locks) so they can exit, then surface the root-cause error.
+            mThreads->abort_async();
+            if (mThreads->wait_exit_for(15000)) {
+                mThreads->join();  // will throw, ending the loop
+            } else {
+                fprintf(stderr,
+                        "MultiGPUPyTrainer: workers still wedged after NCCL abort; "
+                        "surfacing stored error without join\n");
+                fflush(stderr);
+                mThreads->rethrow_exception();  // will throw, ending the loop
+            }
         }
         std::this_thread::yield();
     }
@@ -1472,6 +1516,13 @@ void MultiGPUPyTrainer::wait_gpu(int gpu) {
  * @throws Rethrows any exception encountered in worker threads.
  */
 void MultiGPUPyTrainer::run_work(std::function<void(sThreadContext& ctx)> work, int idx) {
+    if (mHasCrashed.load()) {
+        // A worker died (its exception was already rethrown to the caller once);
+        // the surviving workers may be wedged in NCCL and will never process new
+        // work — fail fast instead of spinning on mWorkDone forever.
+        throw std::runtime_error(
+            "MultiGPUPyTrainer: a worker crashed earlier; the trainer is defunct (restart the process)");
+    }
     static int work_id = 0;
     int current_work_id = work_id++;
     {
@@ -1492,10 +1543,38 @@ void MultiGPUPyTrainer::run_work(std::function<void(sThreadContext& ctx)> work, 
         }
     }
 
+    auto last_progress = std::chrono::steady_clock::now();
+    std::size_t last_done = mWorkDone.load();
     while (mWorkDone.load() < mContexts.size()) {
         if (mThreads->has_exception()) {
             stop();
-            mThreads->join();  // will throw, ending the loop
+            // Surviving ranks may be blocked in NCCL collectives waiting for the
+            // crashed rank; abort the comms (detached — ncclCommAbort can wedge on
+            // driver locks) so they can exit, then surface the root-cause error.
+            mThreads->abort_async();
+            if (mThreads->wait_exit_for(15000)) {
+                mThreads->join();  // will throw, ending the loop
+            } else {
+                fprintf(stderr,
+                        "MultiGPUPyTrainer: workers still wedged after NCCL abort; "
+                        "surfacing stored error without join\n");
+                fflush(stderr);
+                mThreads->rethrow_exception();  // will throw, ending the loop
+            }
+        }
+        // Lost-wakeup watchdog: a worker occasionally misses a driver/futex wakeup
+        // under heavy multi-threaded CUDA load and waits forever on an already-met
+        // condition. A no-op signal forces EINTR + recheck. 45s is far above any
+        // legitimate op; poking a healthy worker is harmless.
+        const std::size_t done_now = mWorkDone.load();
+        if (done_now != last_done) {
+            last_done = done_now;
+            last_progress = std::chrono::steady_clock::now();
+        } else if (std::chrono::steady_clock::now() - last_progress > std::chrono::seconds(45)) {
+            fprintf(stderr, "MultiGPUPyTrainer: no worker progress for 45s; poking workers (lost-wakeup recovery)\n");
+            fflush(stderr);
+            mThreads->poke_workers();
+            last_progress = std::chrono::steady_clock::now();
         }
         std::this_thread::yield();
     }
@@ -1642,6 +1721,22 @@ void MultiGPUPyTrainer::main_loop(NCCLCommunicator& comm) {
         }
         loop_iteration++;
     }
+    if (mHasCrashed.load()) {
+        // A peer crashed: it will never reach the barrier, and this device may
+        // hold aborted collective kernels — skip the syncs and free best-effort.
+        try {
+            if (ctx.FullStepGraph) {
+                ctx.FullStepGraph->reset_capture();
+                ctx.FullStepGraph.reset();
+            }
+            ctx.Model.reset();
+            ctx.GPUUtil.reset();
+        } catch (...) {
+            // Teardown after a crash; the root cause is already recorded.
+        }
+        return;
+    }
+
     CUDA_CHECK(cudaDeviceSynchronize());
     comm.barrier();
 

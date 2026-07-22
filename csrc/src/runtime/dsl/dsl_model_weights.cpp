@@ -6,7 +6,9 @@
 #include "runtime/dsl/dsl_model.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <iostream>
 #include <stdexcept>
 #include <string_view>
@@ -208,11 +210,43 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
         adapter_merger = std::make_unique<qlora::AdapterMerger>(mAdapterPath, mHfMapping, reader, shard_config);
     }
 
+    // Progress reporting (rank 0 only): importing a 100B+ model pages hundreds of GB
+    // into pinned memory and can take minutes — without output it looks hung. Rank 0
+    // sweeps the same ordered param list as every other rank and waits on the shared
+    // master store for names other ranks claimed, so its loop position tracks global
+    // progress.
+    const bool report_progress = comm.rank() == 0;
+    const std::size_t progress_total = mParams->param_names().size();
+    std::size_t progress_done = 0;
+    std::size_t progress_bytes = 0;
+    const auto progress_start = std::chrono::steady_clock::now();
+    auto progress_last = progress_start;
+
     for (const auto& name : mParams->param_names()) {
+        if (report_progress) {
+            ++progress_done;
+            const auto now = std::chrono::steady_clock::now();
+            if (now - progress_last >= std::chrono::seconds(5)) {
+                progress_last = now;
+                const double gb = static_cast<double>(progress_bytes) / 1e9;
+                const double secs = std::chrono::duration<double>(now - progress_start).count();
+                fprintf(stderr,
+                        "[import] %zu/%zu tensors | %.1f GB | %.0fs elapsed | %.2f GB/s\n",
+                        progress_done,
+                        progress_total,
+                        gb,
+                        secs,
+                        gb / std::max(secs, 1e-9));
+                fflush(stderr);
+            }
+        }
         if (mParams->is_external(name)) {
             continue;
         }
         Tensor& param = mWeightManager ? mWeightManager->get_master(name) : mParams->get(name);
+        if (report_progress) {
+            progress_bytes += param.bytes();
+        }
 
         // Cross-GPU shared frozen base master: populate (read + page-lock) exactly once.
         // The first GPU manager to reach `name` claims it and reads/registers below; the
@@ -221,7 +255,11 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
         // matter which mapping branch does the read.
         const bool shared_master = mWeightManager && mWeightManager->is_shared_master(name);
         if (shared_master && !dsl::shared_master_store().try_claim(name)) {
-            dsl::shared_master_store().wait_populated(name);
+            // Another rank is reading this shared master. Don't wait here — keep
+            // sweeping so the rank threads read + page-lock DIFFERENT tensors in
+            // parallel (pinning is the import bottleneck, ~1.4 GB/s per thread).
+            // A completion pass after the loop waits for stragglers before the
+            // tied-weight copies, which read these buffers.
             continue;
         }
         struct FinishGuard {
@@ -716,6 +754,29 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
         }
 
         throw std::runtime_error("DSL model: unsupported HF mapping for " + name);
+    }
+
+    // Completion pass: shared masters claimed by other ranks may still be mid-read
+    // (the main loop skips instead of waiting so ranks read in parallel). Every
+    // name was claim-attempted above, so each has exactly one reader to wait for.
+    if (mWeightManager) {
+        for (const auto& name : mParams->param_names()) {
+            if (!mParams->is_external(name) && mWeightManager->is_shared_master(name)) {
+                dsl::shared_master_store().wait_populated(name);
+            }
+        }
+    }
+
+    if (report_progress) {
+        const double gb = static_cast<double>(progress_bytes) / 1e9;
+        const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - progress_start).count();
+        fprintf(stderr,
+                "[import] complete: %zu tensors | %.1f GB in %.0fs (%.2f GB/s)\n",
+                progress_done,
+                gb,
+                secs,
+                gb / std::max(secs, 1e-9));
+        fflush(stderr);
     }
 
     for (const auto& tie : tied_params) {

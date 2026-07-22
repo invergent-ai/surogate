@@ -59,6 +59,12 @@ struct DslWeightManagerConfig {
     int num_shards = 1;
     bool shard_weights = false;  ///< Enable weight sharding across GPUs
 
+    // Expert Parallelism: when ep_size > 1, frozen stacked-expert weights stream
+    // only this rank's expert rows (dim0 / ep_size at row block ep_rank) into
+    // local-sized prefetch buffers. The pinned master stays global (and shared).
+    int ep_size = 1;
+    int ep_rank = 0;
+
     // Offloading
     bool offload_master = false;     ///< Offload master weights to CPU
     bool offload_quants = false;     ///< Offload quantized weights to CPU
@@ -88,6 +94,7 @@ struct DslWeightEntry {
     bool master_sharded = false;     ///< Whether master tensor is sharded across ranks
     bool trainable = true;           ///< Whether this weight is trainable
     bool is_block = false;           ///< Whether this is a per-layer block weight
+    bool ep_sliced = false;          ///< Stream only this rank's expert rows (EP-local prefetch)
     int layer_idx = -1;              ///< Layer index for block weights (-1 for non-block)
 };
 
@@ -120,6 +127,11 @@ public:
     const Tensor& get(const std::string& name) const;
     bool has(const std::string& name) const;
     bool is_trainable(const std::string& name) const;
+
+    /// True when this weight's work buffer is refilled between uses (streamed
+    /// block weights, and the shared embedding/lm_head staging buffer under
+    /// cpu_training). Quantize-once caches must not snapshot such buffers.
+    bool work_is_transient(const std::string& name) const;
 
     // Layer-based weight streaming protocol
     void gather_block(int layer_idx, NCCLCommunicator& comm, cudaStream_t stream);

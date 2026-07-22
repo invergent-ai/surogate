@@ -1371,6 +1371,12 @@ DslModel::DslModel(const PretrainedConfig& config,
                                            ? mModelConfig.moe_config->moe_intermediate_size
                                            : mModelConfig.IntermediateSize;
             wm.train_router = mLoRAConfig->train_router;
+            // EP: grouped expert-LoRA holds only this rank's expert shard
+            // (13.6 GB/GPU -> 1.7 GB at Laguna-S scale). Router LoRA stays global.
+            if (mOptions.EPSize > 1 && wm.num_experts % mOptions.EPSize == 0) {
+                wm.num_grouped_experts = wm.num_experts / mOptions.EPSize;
+                wm.grouped_expert_base = (mShardIdx % mOptions.EPSize) * wm.num_grouped_experts;
+            }
         }
         mLoRAWeights = std::make_unique<modules::ModularLoRAWeightsManager>(wm, *mAllocator);
 
@@ -1396,6 +1402,10 @@ DslModel::DslModel(const PretrainedConfig& config,
                                            ? mModelConfig.moe_config->moe_intermediate_size
                                            : mModelConfig.IntermediateSize;
             gm.train_router = mLoRAConfig->train_router;
+            if (mOptions.EPSize > 1 && gm.num_experts % mOptions.EPSize == 0) {
+                gm.num_grouped_experts = gm.num_experts / mOptions.EPSize;
+                gm.grouped_expert_base = (mShardIdx % mOptions.EPSize) * gm.num_grouped_experts;
+            }
         }
         mLoRAGrads = std::make_unique<modules::ModularLoRAGradsManager>(gm, mAllocator);
         std::vector<std::string> lora_grad_hook_schema_ids(

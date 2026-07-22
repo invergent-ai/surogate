@@ -345,6 +345,11 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
 
     offload_residual: bool | None = False
 
+    # Offload per-layer saved-for-backward tensors to pinned CPU at forward layer
+    # end; restored at backward layer start. Cuts step VRAM by the saved-tensor
+    # footprint (linear in tokens) at ~5-15% step-time cost. Requires recompute.
+    offload_saved_tensors: bool | None = False
+
     # CPU-RAM centric training: stream weights & gradients per-layer, run optimizer on CPU.
     # Replaces offload_master/offload_optimizer/offload_grads/use_zero_copy/use_write_combined.
     cpu_training: bool | None = False
@@ -487,6 +492,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
             self.recompute = bool(recompute_raw)
 
         self.offload_residual = cfg.get("offload_residual", self.offload_residual)
+        self.offload_saved_tensors = cfg.get("offload_saved_tensors", self.offload_saved_tensors)
         self.cpu_training = cfg.get("cpu_training", self.cpu_training)
         self.offload_master = cfg.get("offload_master", self.offload_master)
         self.offload_quants = cfg.get("offload_quants", self.offload_quants)
@@ -1059,6 +1065,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         self.runtime_config = _surogate.RuntimeOptions(
             recompute="true" if self.recompute else "false",
             offload_residual=self.offload_residual,
+            
             cpu_training=self.cpu_training,
             offload_master=self.offload_master,
             offload_quants=self.offload_quants,
@@ -1091,6 +1098,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         self.runtime_config.use_write_combined = self.use_write_combined
         self.runtime_config.selective_expert_dequant = self.qlora_selective_expert_dequant
         self.runtime_config.offload_experts = self.qlora_offload_experts
+        self.runtime_config.offload_saved_tensors = bool(self.offload_saved_tensors) and bool(self.recompute)
         # Expert Parallelism
         self.runtime_config.ep_size = self.ep_size
         self.runtime_config.ep_load_balance_threshold = self.ep_load_balance_threshold
