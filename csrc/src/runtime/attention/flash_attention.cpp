@@ -277,15 +277,27 @@ CompiledExecutor::ChunkAttnState& CompiledExecutor::chunk_attn_state(int layer_i
     return st;
 }
 
-void CompiledExecutor::set_sequence_chunk(int idx, int count) {
+void CompiledExecutor::set_sequence_chunk(int idx, int count, const IModel::ChunkPackMeta* pack) {
     mChunkIdx = idx;
     mChunkCount = count;
-    // Allocate the (tiny, fixed-size) cu_seqlens buffers here, outside op
+    if (pack) {
+        mChunkPack = *pack;
+    } else {
+        mChunkPack = IModel::ChunkPackMeta{};
+    }
+    // Allocate the cu_seqlens buffers ONCE at a fixed worst case, outside op
     // dispatch: cudaMalloc/cudaMallocHost take the global driver lock and
-    // convoy against other ranks' pending NCCL kernels when done mid-graph.
+    // convoy against pending NCCL kernels mid-graph — and REALLOCATING here
+    // would free a buffer the previous chunk's in-flight kernels still read.
+    // 16384 entries cover chunks of up to 8191 documents (64 KB).
     if (count > 1 && !mChunkCuDev) {
-        CUDA_CHECK(cudaMalloc(&mChunkCuDev, 4 * sizeof(std::int32_t)));
-        CUDA_CHECK(cudaMallocHost(&mChunkCuPinned, 4 * sizeof(std::int32_t)));
+        mChunkCuCap = 16384;
+        CUDA_CHECK(cudaMalloc(&mChunkCuDev, mChunkCuCap * sizeof(std::int32_t)));
+        CUDA_CHECK(cudaMallocHost(&mChunkCuPinned, mChunkCuCap * sizeof(std::int32_t)));
+    }
+    if (pack && 2 * (static_cast<std::size_t>(pack->num_segs) + 1) > mChunkCuCap) {
+        throw std::runtime_error("chunked-sequence: too many documents in one chunk (" +
+                                 std::to_string(pack->num_segs) + ")");
     }
     // Contents are built lazily at attention-dispatch time: mT is only valid
     // while a graph is executing, not here.
@@ -297,13 +309,24 @@ void CompiledExecutor::ensure_chunk_cu_uploaded() {
     if (!mChunkCuDev) {
         throw std::runtime_error("chunked-sequence: cu buffers not allocated (set_sequence_chunk not called)");
     }
-    // cu_q = [0, T]; cu_k = [0, (idx+1) * T]
-    mChunkCuPinned[0] = 0;
-    mChunkCuPinned[1] = static_cast<std::int32_t>(mT);
-    mChunkCuPinned[2] = 0;
-    mChunkCuPinned[3] = static_cast<std::int32_t>((mChunkIdx + 1) * mT);
-    CUDA_CHECK(cudaMemcpyAsync(
-        mChunkCuDev, mChunkCuPinned, 4 * sizeof(std::int32_t), cudaMemcpyHostToDevice, mRunState.MainStream));
+    if (mChunkPack.kv_len > 0) {
+        // Packed: per-document segments, window-relative (built host-side by
+        // the driver from position ids).
+        const std::size_t nq = mChunkPack.cu_q.size();
+        const std::size_t nk = mChunkPack.cu_k.size();
+        for (std::size_t i = 0; i < nq; ++i) mChunkCuPinned[i] = mChunkPack.cu_q[i];
+        for (std::size_t i = 0; i < nk; ++i) mChunkCuPinned[nq + i] = mChunkPack.cu_k[i];
+        CUDA_CHECK(cudaMemcpyAsync(mChunkCuDev, mChunkCuPinned, (nq + nk) * sizeof(std::int32_t),
+                                   cudaMemcpyHostToDevice, mRunState.MainStream));
+    } else {
+        // Unpacked: one segment spanning the whole prefix.
+        mChunkCuPinned[0] = 0;
+        mChunkCuPinned[1] = static_cast<std::int32_t>(mT);
+        mChunkCuPinned[2] = 0;
+        mChunkCuPinned[3] = static_cast<std::int32_t>((mChunkIdx + 1) * mT);
+        CUDA_CHECK(cudaMemcpyAsync(
+            mChunkCuDev, mChunkCuPinned, 4 * sizeof(std::int32_t), cudaMemcpyHostToDevice, mRunState.MainStream));
+    }
     mChunkCuUploaded = mChunkIdx;
 }
 
@@ -416,12 +439,19 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
     if (sequence_chunk_active()) {
         ensure_chunk_cu_uploaded();
         auto& cst = chunk_attn_state(layer_idx, Hkv, Hs);
-        params.chunk_pos = mChunkIdx * static_cast<int>(mT);
-        params.chunk_kv_len = (mChunkIdx + 1) * static_cast<int>(mT);
-        params.chunk_k_cache = cst.k;
-        params.chunk_v_cache = cst.v;
+        const bool packed = mChunkPack.kv_len > 0;
+        const int win_start = packed ? mChunkPack.win_start : 0;
+        const std::size_t win_off = static_cast<std::size_t>(win_start) * Hkv * Hs;
+        params.chunk_pos = mChunkIdx * static_cast<int>(mT) - win_start;
+        params.chunk_kv_len = packed ? mChunkPack.kv_len : (mChunkIdx + 1) * static_cast<int>(mT);
+        params.chunk_k_cache = cst.k + win_off;
+        params.chunk_v_cache = cst.v + win_off;
         params.chunk_cu_q = mChunkCuDev;
-        params.chunk_cu_k = mChunkCuDev + 2;
+        params.chunk_cu_k = mChunkCuDev + (packed ? (mChunkPack.num_segs + 1) : 2);
+        params.chunk_num_segs = packed ? mChunkPack.num_segs : 1;
+        params.chunk_max_q = packed ? mChunkPack.max_q : static_cast<int>(mT);
+        params.chunk_max_k = packed ? mChunkPack.max_k : params.chunk_kv_len;
+        params.chunk_append_pos = mChunkIdx * static_cast<int>(mT);
     }
 
     AttentionBackend& backend = AttentionBackendRegistry::instance().select(params);
@@ -554,14 +584,21 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
     if (sequence_chunk_active()) {
         ensure_chunk_cu_uploaded();
         auto& cst = chunk_attn_state(layer_idx, Hkv, Hs);
-        params.chunk_pos = mChunkIdx * static_cast<int>(mT);
-        params.chunk_kv_len = (mChunkIdx + 1) * static_cast<int>(mT);
-        params.chunk_k_cache = cst.k;
-        params.chunk_v_cache = cst.v;
-        params.chunk_dk_accum = cst.dk;
-        params.chunk_dv_accum = cst.dv;
+        const bool packed = mChunkPack.kv_len > 0;
+        const int win_start = packed ? mChunkPack.win_start : 0;
+        const std::size_t win_off = static_cast<std::size_t>(win_start) * Hkv * Hs;
+        params.chunk_pos = mChunkIdx * static_cast<int>(mT) - win_start;
+        params.chunk_kv_len = packed ? mChunkPack.kv_len : (mChunkIdx + 1) * static_cast<int>(mT);
+        params.chunk_k_cache = cst.k + win_off;
+        params.chunk_v_cache = cst.v + win_off;
+        params.chunk_dk_accum = cst.dk + win_off;
+        params.chunk_dv_accum = cst.dv + win_off;
         params.chunk_cu_q = mChunkCuDev;
-        params.chunk_cu_k = mChunkCuDev + 2;
+        params.chunk_cu_k = mChunkCuDev + (packed ? (mChunkPack.num_segs + 1) : 2);
+        params.chunk_num_segs = packed ? mChunkPack.num_segs : 1;
+        params.chunk_max_q = packed ? mChunkPack.max_q : static_cast<int>(mT);
+        params.chunk_max_k = packed ? mChunkPack.max_k : params.chunk_kv_len;
+        params.chunk_append_pos = mChunkIdx * static_cast<int>(mT);
     }
 
     AttentionBackend& backend = AttentionBackendRegistry::instance().select(params);

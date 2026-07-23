@@ -2,9 +2,10 @@
 # KV-checkpointed chunked-sequence training: the layer stack runs over
 # 256-token chunks with attention KV carried across chunks, so memory stays
 # at the single-chunk footprint (~22 GB/rank) while gradients remain exact
-# (reverse-order backward with FP32 dK/dV accumulation). Trailing all-padding
-# chunks are skipped automatically. LLEP keeps the routing-hot rank's VRAM
-# balanced; sample packing is not supported with chunking yet.
+# (reverse-order backward with FP32 dK/dV accumulation). Sample packing is
+# supported — per-document attention is preserved across chunk boundaries —
+# and trailing all-padding chunks are skipped automatically. LLEP keeps the
+# routing-hot rank's VRAM balanced.
 model: poolside/Laguna-S-2.1
 output_dir: ./output_laguna_s_2048
 
@@ -16,7 +17,7 @@ ep_size: 8
 ep_load_balance_threshold: 1.3
 offload_residual: true
 
-sample_packing: false
+sample_packing: true
 sequence_len: 2048
 sequence_chunks: 8
 

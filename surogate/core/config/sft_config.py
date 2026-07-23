@@ -1057,8 +1057,6 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         if seq_chunks > 1:
             if self.sequence_len % seq_chunks != 0:
                 raise ValueError(f"sequence_chunks={seq_chunks} must divide sequence_len={self.sequence_len}")
-            if self.sample_packing:
-                raise ValueError("sequence_chunks > 1 requires sample_packing: false (packed doc masking not supported yet)")
             if self.per_device_train_batch_size != 1:
                 raise ValueError("sequence_chunks > 1 requires per_device_train_batch_size: 1")
             if getattr(self, "lora_dropout", 0) not in (0, 0.0, None):

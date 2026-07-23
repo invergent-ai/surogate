@@ -6,6 +6,8 @@
 #ifndef SUROGATE_SRC_TRAINING_MODEL_H
 #define SUROGATE_SRC_TRAINING_MODEL_H
 
+#include <cstdint>
+#include <vector>
 #include <stdexcept>
 #include <cstddef>
 #include <memory>
@@ -60,10 +62,25 @@ public:
     virtual void
     backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, int grad_accum_steps, int micro_step) = 0;
 
+    //! \brief Per-chunk document geometry for chunked-sequence training.
+    //! \details Derived host-side from position ids: one varlen segment per
+    //! document overlapping the chunk; the chunk's KV needs form one
+    //! contiguous cache window [win_start, chunk_end). Identical for the
+    //! unpacked case (one segment, win_start 0).
+    struct ChunkPackMeta {
+        int num_segs = 1;
+        int win_start = 0;
+        int kv_len = 0;
+        int max_q = 0;
+        int max_k = 0;
+        std::vector<std::int32_t> cu_q;
+        std::vector<std::int32_t> cu_k;
+    };
+
     //! \brief Chunked-sequence training hooks (KV-checkpointed chunks).
     //! \details Default implementations reject activation — only models that
     //! implement the chunked schedule (DslModel) override these.
-    virtual void set_sequence_chunk(int /*idx*/, int /*count*/) {
+    virtual void set_sequence_chunk(int /*idx*/, int /*count*/, const ChunkPackMeta* /*pack*/ = nullptr) {
         throw std::logic_error("set_sequence_chunk: model does not support chunked-sequence training");
     }
     virtual void zero_sequence_chunk_dkv() {

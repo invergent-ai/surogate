@@ -55,11 +55,6 @@ public:
         if (p.sinks != nullptr) {
             throw std::runtime_error("chunked sequence training does not support attention sinks");
         }
-        if (p.cu_seqlens != nullptr) {
-            throw std::runtime_error(
-                "chunked sequence training does not support packed sequences (doc masking) yet — "
-                "disable sample_packing");
-        }
         if (p.Hs <= 0 || p.Hs > kFlashMaxHeadDim) {
             throw std::runtime_error("chunked sequence training: head size > 256 not supported");
         }
@@ -75,6 +70,9 @@ public:
     void forward(AttentionParams& p) override {
         // Idempotent append: the re-forward before a chunk's backward
         // overwrites the same rows with identical values.
+        // The cache pointers arrive window-relative; the append position is
+        // global — write via the window-relative offset so the rows land at
+        // their global positions.
         append_kv_to_cache(p.chunk_k_cache,
                            p.chunk_v_cache,
                            p.qkv.get<nv_bfloat16>(),
@@ -98,7 +96,10 @@ public:
                                          p.Hs,
                                          p.stream,
                                          p.softmax_scale,
-                                         p.window_size);
+                                         p.window_size,
+                                         p.chunk_num_segs,
+                                         p.chunk_max_q,
+                                         p.chunk_max_k);
     }
 
     void backward(AttentionParams& p) override {
@@ -109,7 +110,7 @@ public:
         auto& temps = *p.temps;
 
         const int HS_rounded = p.Hs <= 128 ? ((p.Hs + 31) / 32) * 32 : ((p.Hs + 63) / 64) * 64;
-        const long padded_q = static_cast<long>(p.T) + 128;
+        const long padded_q = static_cast<long>(p.T) + 128L * std::max(1, p.chunk_num_segs);
         Tensor dq_accum = rs.temp_alloc(
             ETensorDType::FP32, {padded_q * p.Hq * HS_rounded}, "kvprefix_dq_accum");
         Tensor dsoftmax = rs.temp_alloc(ETensorDType::FP32, {static_cast<long>(p.Hq) * padded_q}, "kvprefix_dsoftmax");
@@ -148,7 +149,10 @@ public:
                                           p.deterministic_bwd,
                                           p.stream,
                                           p.softmax_scale,
-                                          p.window_size);
+                                          p.window_size,
+                                          p.chunk_num_segs,
+                                          p.chunk_max_q,
+                                          p.chunk_max_k);
     }
 };
 

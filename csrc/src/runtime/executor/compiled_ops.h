@@ -28,6 +28,7 @@
 #include "runtime/dsl/hook_registry.h"
 #include "runtime/executor/execution_request.h"
 #include "runtime/ep/ep_state.h"
+#include "runtime/training/model.h"
 #include "runtime/executor/graph_executor_internal.h"
 #include "runtime/executor/saved_tensor_cache.h"
 #include "runtime/dsl/ir.h"
@@ -175,8 +176,10 @@ public:
     // with executor-owned per-layer KV caches and FP32 dKV accumulators.
     // ------------------------------------------------------------------
     /// Activate chunk `idx` of `count` (idx = -1 deactivates). The graph's
-    /// T is the chunk size; the caches cover count * T rows.
-    void set_sequence_chunk(int idx, int count);
+    /// T is the chunk size; the caches cover count * T rows. `pack` carries
+    /// the chunk's document geometry (packed sequences); null = one segment
+    /// spanning the whole prefix.
+    void set_sequence_chunk(int idx, int count, const IModel::ChunkPackMeta* pack = nullptr);
     bool sequence_chunk_active() const {
         return mChunkCount > 1 && mChunkIdx >= 0;
     }
@@ -823,9 +826,11 @@ private:
     std::unordered_map<int, ChunkAttnState> mChunkAttn;  ///< by layer_idx
     int mChunkIdx = -1;
     int mChunkCount = 0;
-    std::int32_t* mChunkCuDev = nullptr;   ///< device [4]: cu_q(2), cu_k(2)
+    std::int32_t* mChunkCuDev = nullptr;   ///< device: cu_q then cu_k
     std::int32_t* mChunkCuPinned = nullptr;
+    std::size_t mChunkCuCap = 0;  ///< capacity in int32 entries (both arrays)
     int mChunkCuUploaded = -1;  ///< chunk idx whose cu arrays are on device
+    IModel::ChunkPackMeta mChunkPack;  ///< active chunk's document geometry
     void ensure_chunk_cu_uploaded();
     ChunkAttnState& chunk_attn_state(int layer_idx, int Hkv, int Hs);
 

@@ -6,6 +6,7 @@
 #ifndef SUROGATE_SRC_EXECUTOR_GRAPH_EXECUTOR_H
 #define SUROGATE_SRC_EXECUTOR_GRAPH_EXECUTOR_H
 
+#include "runtime/training/model.h"
 #include <cstddef>
 #include <memory>
 #include <optional>
@@ -119,9 +120,10 @@ public:
     }
 
     /// Chunked-sequence training pass-throughs (no-op defaults).
-    virtual void set_sequence_chunk(int idx, int count) {
+    virtual void set_sequence_chunk(int idx, int count, const IModel::ChunkPackMeta* pack = nullptr) {
         (void)idx;
         (void)count;
+        (void)pack;
     }
     virtual void zero_sequence_chunk_dkv() {
     }
@@ -182,7 +184,7 @@ public:
 
 class GraphExecutor final : public IGraphExecutor {
 public:
-    void set_sequence_chunk(int idx, int count) override;
+    void set_sequence_chunk(int idx, int count, const IModel::ChunkPackMeta* pack = nullptr) override;
     void zero_sequence_chunk_dkv() override;
 
     GraphExecutor(const Module& module,

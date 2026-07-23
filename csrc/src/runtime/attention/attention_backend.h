@@ -102,8 +102,12 @@ struct AttentionParams {
     nv_bfloat16* chunk_v_cache = nullptr;  ///< [T_total, Hkv, Hs]
     float* chunk_dk_accum = nullptr;       ///< [T_total, Hkv, Hs] fp32, backward
     float* chunk_dv_accum = nullptr;       ///< [T_total, Hkv, Hs] fp32, backward
-    const int32_t* chunk_cu_q = nullptr;   ///< device [0, T]
-    const int32_t* chunk_cu_k = nullptr;   ///< device [0, kv_len]
+    const int32_t* chunk_cu_q = nullptr;   ///< device, num_segs+1 entries
+    const int32_t* chunk_cu_k = nullptr;   ///< device, num_segs+1 entries (window-relative)
+    int chunk_num_segs = 1;                ///< documents overlapping the chunk
+    int chunk_max_q = 0;                   ///< longest q segment (0 = T)
+    int chunk_max_k = 0;                   ///< longest k segment (0 = kv_len)
+    int chunk_append_pos = 0;              ///< GLOBAL cache row for this chunk's KV append
 
     // ---- Execution context --------------------------------------------
     cudaStream_t stream = nullptr;

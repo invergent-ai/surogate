@@ -1121,9 +1121,6 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                 // zero/accumulate, LoRA bookkeeping and loss reduction key
                 // off them exactly as plain grad accumulation would.
                 // ----------------------------------------------------------
-                if (mOptions.DocMasking && has_doc_boundaries) {
-                    throw std::runtime_error("chunked-sequence training does not support packed doc masking yet");
-                }
                 if (pos_planes > 1) {
                     throw std::runtime_error("chunked-sequence training does not support mRoPE position planes");
                 }
@@ -1141,13 +1138,64 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                     return v;
                 };
                 const bool chunk_trace = std::getenv("SUROGATE_CHUNK_TRACE") != nullptr;
+                // Per-chunk document geometry from position ids: packed rows
+                // restart positions at each document, so a chunk's segments
+                // and its contiguous KV window fall out of one linear scan.
+                // Unpacked rows (absolute positions) reduce to one segment
+                // with win_start 0 — the same code path covers both.
+                auto build_chunk_pack = [&](const std::int32_t* pos_row, int c) {
+                    IModel::ChunkPackMeta m;
+                    const int t0 = c * T;
+                    const int t1 = t0 + T;
+                    // Document starts are ROW-RELATIVE: position resets mark
+                    // boundaries, and the row start is always one — packers
+                    // split documents across rows, so a row can begin
+                    // mid-document with continued position values (the
+                    // partial head attends within the row only, matching the
+                    // dense doc-masking semantics).
+                    int win_start = 0;  // last doc start <= t0
+                    for (int t = 1; t <= t0; ++t) {
+                        if (pos_row[t] != pos_row[t - 1] + 1) win_start = t;
+                    }
+                    m.win_start = win_start;
+                    m.cu_q = {0};
+                    m.cu_k = {0};
+                    int seg_start = t0;
+                    int doc_start = win_start;
+                    auto close_seg = [&](int seg_end) {
+                        const int q_len = seg_end - seg_start;
+                        const int k_len = seg_end - doc_start;
+                        m.cu_q.push_back(m.cu_q.back() + q_len);
+                        m.cu_k.push_back(m.cu_k.back() + k_len);
+                        m.max_q = std::max(m.max_q, q_len);
+                        m.max_k = std::max(m.max_k, k_len);
+                    };
+                    for (int t = t0 + 1; t < t1; ++t) {
+                        if (pos_row[t] != pos_row[t - 1] + 1) {
+                            close_seg(t);
+                            seg_start = t;
+                            doc_start = t;
+                        }
+                    }
+                    close_seg(t1);
+                    m.num_segs = static_cast<int>(m.cu_q.size()) - 1;
+                    m.kv_len = t1 - m.win_start;
+                    if (std::getenv("SUROGATE_CHUNK_TRACE") && ctx.Communicator->rank() == 0) {
+                        fprintf(stderr, "[pack] c=%d win=%d kv=%d segs=%d maxq=%d maxk=%d\n", c, m.win_start,
+                                m.kv_len, m.num_segs, m.max_q, m.max_k);
+                        fflush(stderr);
+                    }
+                    return m;
+                };
                 for (int j = 0; j < micro_steps; ++j) {
                     const int eff_chunks = chunk_count_per_micro[static_cast<std::size_t>(j)];
                     for (int c = 0; c < eff_chunks; ++c) {
                         Tensor in_v = chunk_view(gs.inputs[j], c);
                         Tensor pos_v = chunk_view(gs.position_ids[j], c);
                         Tensor tgt_v = chunk_view(gs.targets[j], c);
-                        ctx.Model->set_sequence_chunk(c, seq_chunks);
+                        const auto pack =
+                            build_chunk_pack(reinterpret_cast<const std::int32_t*>(gs.position_ids[j].Data), c);
+                        ctx.Model->set_sequence_chunk(c, seq_chunks, &pack);
                         // The loss op lives in the forward graph — stage the
                         // chunk's real targets so phase A's loss terms are
                         // sane (they are wiped by the micro-0 zeroing before
@@ -1166,7 +1214,9 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                         Tensor pos_v = chunk_view(gs.position_ids[j], c);
                         Tensor tgt_v = chunk_view(gs.targets[j], c);
                         const int micro_eff = micro_base + (eff_chunks - 1 - c);
-                        ctx.Model->set_sequence_chunk(c, seq_chunks);
+                        const auto pack =
+                            build_chunk_pack(reinterpret_cast<const std::int32_t*>(gs.position_ids[j].Data), c);
+                        ctx.Model->set_sequence_chunk(c, seq_chunks, &pack);
                         rs.Targets_CPU = tgt_v;
                         if (chunk_trace && ctx.Communicator->rank() == 0) {
                             fprintf(stderr, "[chunk] phaseB j=%d c=%d micro_eff=%d\n", j, c, micro_eff);

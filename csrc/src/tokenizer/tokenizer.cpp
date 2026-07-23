@@ -149,12 +149,11 @@ struct Tokenizer::Impl {
     std::shared_ptr<minja::TemplateNode> chat_tmpl_root;
     std::string bos_token_str;
     std::string eos_token_str;
-    // Whether the template references strftime_now(); if not, we skip building
-    // the (allocating) callable + capturing the clock on every render.
-    // Conservatively defaults true (behaves exactly as before) until per-load
-    // detection is wired at the template-parse sites — WIP, do not build-ship
-    // the false default without that detection or date templates break.
-    bool template_uses_strftime = true;
+    // Whether the template references strftime_now(); set from the template
+    // source at load. When false we skip building the (allocating) callable +
+    // capturing the clock on every render. Defaults false for templates with no
+    // chat template at all (no render happens); the load sites set it per source.
+    bool template_uses_strftime = false;
 
     ~Impl() {
         delete encoder_lookup;
@@ -206,6 +205,8 @@ struct Tokenizer::Impl {
                               size_t count,
                               bool add_generation_prompt,
                               std::optional<bool> enable_thinking = std::nullopt) const {
+        TokTimer _t(tok_profile().render_ns);
+        if (tok_profile_enabled()) tok_profile().renders.fetch_add(1, std::memory_order_relaxed);
         nlohmann::ordered_json arr = nlohmann::ordered_json::array();
         for (size_t k = 0; k < count && k < messages.size(); ++k) {
             arr.push_back({{"role", messages[k].role}, {"content", messages[k].content}});
@@ -584,6 +585,7 @@ Tokenizer Tokenizer::from_pretrained(const std::string& model_dir) {
         if (!fs::exists(dir / "chat_template.jinja") && config.contains("chat_template") &&
             config["chat_template"].is_string()) {
             std::string tmpl_str = config["chat_template"].get<std::string>();
+            impl.template_uses_strftime = tmpl_str.find("strftime_now") != std::string::npos;
             impl.chat_tmpl_root = minja::Parser::parse(tmpl_str,
                                                        {
                                                            /* .trim_blocks = */ true,
@@ -603,6 +605,7 @@ Tokenizer Tokenizer::from_pretrained(const std::string& model_dir) {
         if (fs::exists(jinja_path)) {
             std::ifstream f(jinja_path);
             std::string tmpl_str((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            impl.template_uses_strftime = tmpl_str.find("strftime_now") != std::string::npos;
             impl.chat_tmpl_root = minja::Parser::parse(tmpl_str,
                                                        {
                                                            /* .trim_blocks = */ true,
@@ -643,6 +646,7 @@ Tokenizer Tokenizer::from_pretrained(const std::string& model_dir) {
         }
 
         if (!fallback_tmpl.empty()) {
+            impl.template_uses_strftime = fallback_tmpl.find("strftime_now") != std::string::npos;
             impl.chat_tmpl_root = minja::Parser::parse(fallback_tmpl,
                                                        {
                                                            /* .trim_blocks = */ true,
@@ -819,15 +823,7 @@ std::string Tokenizer::special_token(const std::string& name) const {
 std::string Tokenizer::apply_chat_template(const std::vector<ChatMessage>& messages,
                                            bool add_generation_prompt,
                                            std::optional<bool> enable_thinking) const {
-    TokTimer _t(tok_profile().render_ns);
-    if (tok_profile_enabled()) tok_profile().renders.fetch_add(1, std::memory_order_relaxed);
-    // Convert ChatMessage to nlohmann::ordered_json array
-    nlohmann::ordered_json json_messages = nlohmann::ordered_json::array();
-    for (const auto& msg : messages) {
-        json_messages.push_back({{"role", msg.role}, {"content", msg.content}});
-    }
-
-    return impl_->render_chat_template(json_messages, add_generation_prompt, enable_thinking);
+    return impl_->render_prefix(messages, messages.size(), add_generation_prompt, enable_thinking);
 }
 
 std::vector<int32_t> Tokenizer::apply_chat_template_and_encode(const std::vector<ChatMessage>& messages,
@@ -893,8 +889,8 @@ TrainingEncoded Tokenizer::encode_for_training(const std::vector<ChatMessage>& m
         std::optional<bool> enable_thinking = (messages[i + 1].content.find("</think>") != std::string::npos);
 
         // 1. Render up to user_i with gen_prompt=true → prefix/chrome segment
-        std::vector<ChatMessage> up_to_user(messages.begin(), messages.begin() + i + 1);
-        std::string render_with_user = apply_chat_template(up_to_user, /*add_generation_prompt=*/true, enable_thinking);
+        std::string render_with_user =
+            impl_->render_prefix(messages, i + 1, /*add_generation_prompt=*/true, enable_thinking);
 
         if (render_with_user.size() > prev_render.size()) {
             std::string chrome = render_with_user.substr(prev_render.size());
@@ -903,9 +899,8 @@ TrainingEncoded Tokenizer::encode_for_training(const std::vector<ChatMessage>& m
         }
 
         // 2. Render up to asst_i with gen_prompt=false → response segment
-        std::vector<ChatMessage> up_to_asst(messages.begin(), messages.begin() + i + 2);
         std::string render_with_asst =
-            apply_chat_template(up_to_asst, /*add_generation_prompt=*/false, enable_thinking);
+            impl_->render_prefix(messages, i + 2, /*add_generation_prompt=*/false, enable_thinking);
 
         if (render_with_asst.size() > render_with_user.size()) {
             std::string response = render_with_asst.substr(render_with_user.size());
