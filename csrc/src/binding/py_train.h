@@ -102,6 +102,13 @@ public:
                       const std::int32_t* position_ids,
                       int seq_chunks);
     float validate(const std::int32_t* inputs, const std::int32_t* targets, const std::int32_t* position_ids = nullptr);
+
+    /// Chunked-sequence eval: forward-only chunk sweep with per-chunk losses
+    /// combined weighted by valid-token counts. Arrays are [rows, B, N*T].
+    float validate_chunked(const std::int32_t* inputs,
+                           const std::int32_t* targets,
+                           const std::int32_t* position_ids,
+                           int seq_chunks);
     std::pair<float, float> update_with_config(const optimizers::OptimizerConfig& config, int step);
     std::pair<float, float> train_step_graphed(const std::int32_t* inputs,
                                                const std::int32_t* targets,

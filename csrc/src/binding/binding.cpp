@@ -1621,8 +1621,8 @@ NB_MODULE(_surogate, m) {
             "validate",
             [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets) {
                 // Use local_world_size (GPUs on this node) not global world_size
-                CHECK_SHAPE(inputs, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
-                CHECK_SHAPE(targets, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
+                CHECK_SHAPE(inputs, trainer->batch_size() * trainer->local_world_size(), trainer->step_seq_length());
+                CHECK_SHAPE(targets, trainer->batch_size() * trainer->local_world_size(), trainer->step_seq_length());
 
                 return trainer->validate(inputs.data(), targets.data());
             },
@@ -1637,9 +1637,9 @@ NB_MODULE(_surogate, m) {
             "validate",
             [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets, TokenArray position_ids) {
                 // Use local_world_size (GPUs on this node) not global world_size
-                CHECK_SHAPE(inputs, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
-                CHECK_SHAPE(targets, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
-                CHECK_SHAPE(position_ids, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
+                CHECK_SHAPE(inputs, trainer->batch_size() * trainer->local_world_size(), trainer->step_seq_length());
+                CHECK_SHAPE(targets, trainer->batch_size() * trainer->local_world_size(), trainer->step_seq_length());
+                CHECK_SHAPE(position_ids, trainer->batch_size() * trainer->local_world_size(), trainer->step_seq_length());
 
                 return trainer->validate(inputs.data(), targets.data(), position_ids.data());
             },

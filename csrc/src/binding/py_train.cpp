@@ -771,6 +771,9 @@ void MultiGPUPyTrainer::set_visual_inputs(const std::int32_t* visual_pos_masks,
 float MultiGPUPyTrainer::validate(const std::int32_t* inputs,
                                   const std::int32_t* targets,
                                   const std::int32_t* position_ids) {
+    if (mOptions.SequenceChunks > 1) {
+        return validate_chunked(inputs, targets, position_ids, mOptions.SequenceChunks);
+    }
     const int ep_size = std::max(1, mOptions.EPSize);
     for (int i = 0; i < mContexts.size(); ++i) {
         auto& ctx = mContexts.at(i);
@@ -811,6 +814,79 @@ float MultiGPUPyTrainer::validate(const std::int32_t* inputs,
     ++mEvalStep;
 
     return loss;
+}
+
+float MultiGPUPyTrainer::validate_chunked(const std::int32_t* inputs,
+                                          const std::int32_t* targets,
+                                          const std::int32_t* position_ids,
+                                          int seq_chunks) {
+    // Forward-only chunk sweep: each chunk's eval fills the attention KV and
+    // GDN state carries exactly like the training sweep, computes its own
+    // token-mean loss, and the chunk losses combine weighted by their global
+    // valid-token counts — identical to the dense full-sequence mean.
+    const int ep_size = std::max(1, mOptions.EPSize);
+    const long T_full = static_cast<long>(T) * seq_chunks;
+    double weighted = 0.0;
+    long total_valid = 0;
+
+    for (int c = 0; c < seq_chunks; ++c) {
+        const long base_pos = static_cast<long>(c) * T;
+        for (int i = 0; i < static_cast<int>(mContexts.size()); ++i) {
+            auto& ctx = mContexts.at(i);
+            const int src_row = host_batch_row_for_local_rank(i, ep_size);
+            copy_chunk_inputs_for_ctx(*ctx.Model, inputs, targets, position_ids, src_row, B, T, T_full, base_pos);
+        }
+        float loss_c = 0.0f;
+        run_work([c, seq_chunks, micro_idx = mEvalStep, base_pos, this, &loss_c](sThreadContext& ctx) {
+            Tensor in = ctx.Model->get_input_buffer();
+            Tensor pos = ctx.Model->get_position_ids_buffer();
+            Tensor tgt = ctx.Model->get_target_buffer();
+            // Chunk-local document geometry from the sliced positions:
+            // win_start = max(0, chunk_start - pos[0]) is exact — in-row doc
+            // starts reset positions to 0, and the clamp covers a row-initial
+            // document continued from a previous row (attends within the row
+            // only, matching dense doc masking).
+            const auto* pr = pos.get<std::int32_t>();
+            IModel::ChunkPackMeta m;
+            const int t0 = static_cast<int>(base_pos);
+            m.win_start = std::max(0, t0 - pr[0]);
+            m.cu_q = {0};
+            m.cu_k = {0};
+            int seg_start = 0;
+            int doc_start_rel = m.win_start - t0;  // relative to chunk start (<= 0 for first doc)
+            auto close_seg = [&](int seg_end) {
+                const int q_len = seg_end - seg_start;
+                const int k_len = seg_end - doc_start_rel;
+                m.cu_q.push_back(m.cu_q.back() + q_len);
+                m.cu_k.push_back(m.cu_k.back() + k_len);
+                m.max_q = std::max(m.max_q, q_len);
+                m.max_k = std::max(m.max_k, k_len);
+            };
+            for (int t = 1; t < T; ++t) {
+                if (pr[t] != pr[t - 1] + 1) {
+                    close_seg(t);
+                    seg_start = t;
+                    doc_start_rel = t;
+                }
+            }
+            close_seg(T);
+            m.num_segs = static_cast<int>(m.cu_q.size()) - 1;
+            m.kv_len = t0 + static_cast<int>(T) - m.win_start;
+            ctx.Model->set_sequence_chunk(c, seq_chunks, &m);
+            const float l = ctx.Model->validate(in, pos, tgt, *ctx.Communicator, micro_idx);
+            if (ctx.Communicator->rank() == 0) {
+                loss_c = l;
+            }
+        });
+        const int valid_c = get_valid_token_count(0);
+        if (valid_c > 0) {
+            weighted += static_cast<double>(loss_c) * valid_c;
+            total_valid += valid_c;
+        }
+    }
+    run_work([](sThreadContext& ctx) { ctx.Model->set_sequence_chunk(-1, 0); });
+    ++mEvalStep;
+    return total_valid > 0 ? static_cast<float>(weighted / total_valid) : 0.0f;
 }
 
 /**
