@@ -72,6 +72,10 @@ public:
         /// plan and exchanged splits captured during this chunk's phase-A
         /// forward — routing is deterministic, so they are identical.
         bool reuse_ep = false;
+        /// Phase A (KV sweep): loss ops are skipped — the backward pairs with
+        /// the phase-B re-forward, and phase-A loss terms would double-count
+        /// Losses/ValidTokenCount for accumulation micros > 0.
+        bool kv_sweep = false;
         int num_segs = 1;
         int win_start = 0;
         int kv_len = 0;

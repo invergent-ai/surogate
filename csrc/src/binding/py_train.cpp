@@ -1209,8 +1209,9 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                         Tensor in_v = chunk_view(gs.inputs[j], c);
                         Tensor pos_v = pos_chunk_view(gs.position_ids[j], c);
                         Tensor tgt_v = chunk_view(gs.targets[j], c);
-                        const auto pack =
+                        auto pack =
                             build_chunk_pack(reinterpret_cast<const std::int32_t*>(gs.position_ids[j].Data), c);
+                        pack.kv_sweep = true;  // loss ops skipped in the KV sweep
                         ctx.Model->set_sequence_chunk(c, seq_chunks, &pack);
                         // The loss op lives in the forward graph — stage the
                         // chunk's real targets so phase A's loss terms are

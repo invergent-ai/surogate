@@ -193,6 +193,15 @@ bool CompiledExecutor::lm_head_dx_matmul(Tensor& d_xF_slice,
 }
 
 void CompiledExecutor::dispatch_fused_lm_head_loss(const CompiledOp& op) {
+    if (sequence_chunk_kv_sweep()) {
+        // KV sweep of the chunked schedule: the loss belongs to the phase-B
+        // re-forward/backward pair; computing it here would double-count
+        // Losses/ValidTokenCount for accumulation micros past the first
+        // (whose buffers the phase-B micro-0 zeroing does not reset) — and
+        // the sweep does not need logits at all.
+        ensure_output_tensor(op.outputs[0]);
+        return;
+    }
     Tensor& xF_flat = resolve_tensor(op.inputs[0]);
     Tensor& weight = resolve_tensor(op.inputs[1]);
     Tensor& targets = resolve_tensor(op.inputs[2]);

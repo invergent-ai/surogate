@@ -189,6 +189,9 @@ public:
     bool sequence_chunk_reuse_ep() const {
         return mChunkPack.reuse_ep;
     }
+    bool sequence_chunk_kv_sweep() const {
+        return sequence_chunk_active() && mChunkPack.kv_sweep;
+    }
     /// Zero all layers' dKV accumulators — call once before each reverse
     /// backward sweep.
     void zero_sequence_chunk_dkv();
