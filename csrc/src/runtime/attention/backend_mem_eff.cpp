@@ -49,6 +49,9 @@ public:
     }
 
     bool supports(const AttentionParams& p) const override {
+        if (p.chunk_kv_len > 0) {
+            return false;  // chunked-sequence mode is kvprefix-only
+        }
         // Opt-out for debugging / A-B tests against flash_varlen/SDPA.
         if (std::getenv("SUROGATE_DISABLE_MEM_EFF")) return false;
         auto reject = [&](const char* reason) {

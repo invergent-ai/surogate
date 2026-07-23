@@ -6,6 +6,9 @@
 #ifndef SUROGATE_SRC_TRAINING_MODEL_H
 #define SUROGATE_SRC_TRAINING_MODEL_H
 
+#include <cstdint>
+#include <vector>
+#include <stdexcept>
 #include <cstddef>
 #include <memory>
 #include <string_view>
@@ -58,6 +61,48 @@ public:
     //! before this function returns.
     virtual void
     backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, int grad_accum_steps, int micro_step) = 0;
+
+    //! \brief Per-chunk document geometry for chunked-sequence training.
+    //! \details Derived host-side from position ids: one varlen segment per
+    //! document overlapping the chunk; the chunk's KV needs form one
+    //! contiguous cache window [win_start, chunk_end). Identical for the
+    //! unpacked case (one segment, win_start 0).
+    struct ChunkPackMeta {
+        /// Phase B (re-forward before backward): EP dispatch may restore the
+        /// plan and exchanged splits captured during this chunk's phase-A
+        /// forward — routing is deterministic, so they are identical.
+        bool reuse_ep = false;
+        /// Phase A (KV sweep): loss ops are skipped — the backward pairs with
+        /// the phase-B re-forward, and phase-A loss terms would double-count
+        /// Losses/ValidTokenCount for accumulation micros > 0.
+        bool kv_sweep = false;
+        int num_segs = 1;
+        int win_start = 0;
+        int kv_len = 0;
+        int max_q = 0;
+        int max_k = 0;
+        std::vector<std::int32_t> cu_q;
+        std::vector<std::int32_t> cu_k;
+    };
+
+    //! \brief Chunked-sequence training hooks (KV-checkpointed chunks).
+    //! \details Default implementations reject activation — only models that
+    //! implement the chunked schedule (DslModel) override these.
+    virtual void set_sequence_chunk(int /*idx*/, int /*count*/, const ChunkPackMeta* /*pack*/ = nullptr) {
+        throw std::logic_error("set_sequence_chunk: model does not support chunked-sequence training");
+    }
+    virtual void zero_sequence_chunk_dkv() {
+        throw std::logic_error("zero_sequence_chunk_dkv: model does not support chunked-sequence training");
+    }
+    //! \brief forward() variant that skips saved-for-backward persistence
+    //! (the KV sweep of the chunked schedule).
+    virtual void forward_no_save(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm, int micro_step) {
+        (void)inputs;
+        (void)position_ids;
+        (void)comm;
+        (void)micro_step;
+        throw std::logic_error("forward_no_save: model does not support chunked-sequence training");
+    }
 
     //! \brief Runs the AdamW update step.
     //! \details Runs asynchronously, signalling completion through the OptimizerDone event.

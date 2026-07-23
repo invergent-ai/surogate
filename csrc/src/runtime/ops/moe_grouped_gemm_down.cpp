@@ -1285,6 +1285,18 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_down_backward(const CompiledOp&
                         lora_grads->moe.grouped.down.has_value()) {
                         scatter_exchange(mg_down_A, mg_down_B, *lora_grads->moe.grouped.down);
                     }
+                } else if (llep_wgrad && lora_grads && rank > 0 && lora_grads->moe.grouped.down.has_value()) {
+                    // Zero tokens received on this rank: still walk the
+                    // plan-driven wgrad exchange (see moe_grouped_gemm_gate_up
+                    // for the full rationale) — peers block on this rank's
+                    // sends/recvs regardless of its local row count.
+                    Tensor ea = mRunState.temp_alloc(d_input.DType, {1L, static_cast<long>(rank),
+                                                     static_cast<long>(intermediate_size)}, "llep_wgrad_empty");
+                    Tensor eb = mRunState.temp_alloc(d_input.DType, {1L, static_cast<long>(hidden_size),
+                                                     static_cast<long>(rank)}, "llep_wgrad_empty");
+                    mTemps.push_back(ea);
+                    mTemps.push_back(eb);
+                    scatter_exchange(ea, eb, *lora_grads->moe.grouped.down);
                 }
             }  // if (down_ptr && down_ptr->has_value())
         }  // if (use_grouped)

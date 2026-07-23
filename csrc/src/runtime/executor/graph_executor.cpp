@@ -1572,6 +1572,14 @@ ExecutionResult GraphExecutor::execute_forward(const ExecutionRequest& request, 
     return {};
 }
 
+void GraphExecutor::set_sequence_chunk(int idx, int count, const IModel::ChunkPackMeta* pack) {
+    if (mCompiledExecutor) mCompiledExecutor->set_sequence_chunk(idx, count, pack);
+}
+
+void GraphExecutor::zero_sequence_chunk_dkv() {
+    if (mCompiledExecutor) mCompiledExecutor->zero_sequence_chunk_dkv();
+}
+
 ExecutionResult GraphExecutor::execute_eval(const ExecutionRequest& request, NCCLCommunicator& comm) {
     ExecutionRequest fwd = request;
     fwd.mode = ExecutionMode::Forward;

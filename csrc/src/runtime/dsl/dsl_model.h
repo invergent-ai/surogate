@@ -129,6 +129,11 @@ public:
     float validate(Tensor inputs, Tensor position_ids, Tensor targets, NCCLCommunicator& comm, int micro_step) override;
     void backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, int grad_accum_steps, int micro_step) override;
 
+    // ---- Chunked-sequence training (KV-checkpointed chunks) ----
+    void set_sequence_chunk(int idx, int count, const ChunkPackMeta* pack = nullptr) override;
+    void zero_sequence_chunk_dkv() override;
+    void forward_no_save(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm, int micro_step) override;
+
     // ---- Debug-only dispatch-PP sub-range parity (BF16 full-FT, resident) --
     // Whole-graph forward; returns the final hidden state flattened to host f32.
     std::vector<float> dispatch_pp_forward_hidden(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm);
@@ -594,6 +599,7 @@ private:
                                               // published onto the optimizer GPU for valid-token
                                               // grad-norm scaling (the dispatch path skips reduce_loss)
     bool mDocMaskingActive = false;           // set by forward(), cleared by backward()
+    bool mSequenceChunkActive = false;        // chunked-sequence mode (doc masking handled per chunk)
     float* mGrpoInvTemperatureGpu = nullptr;  // persists from forward_for_grpo() to backward_grpo()
 
     // Adapter merge state (optional — stacked LoRA)

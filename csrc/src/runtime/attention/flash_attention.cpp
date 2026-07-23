@@ -253,6 +253,171 @@ void dump_flash_arg_line(const char* phase,
 
 }  // namespace
 
+CompiledExecutor::ChunkAttnState& CompiledExecutor::chunk_attn_state(int layer_idx, int Hkv, int Hs) {
+    auto& st = mChunkAttn[layer_idx];
+    const std::size_t need = static_cast<std::size_t>(mChunkCount) * mT * Hkv * Hs;
+    if (st.kv_elems < need) {
+        // Stream-ordered allocation: this runs mid-dispatch on 8 in-process
+        // ranks with NCCL kernels at other ranks' stream heads — plain
+        // cudaMalloc's global driver lock convoys into a cross-rank stall
+        // (the same failure class the EP ring arena eliminated).
+        cudaStream_t stream = mRunState.MainStream;
+        if (st.k) CUDA_CHECK(cudaFreeAsync(st.k, stream));
+        if (st.v) CUDA_CHECK(cudaFreeAsync(st.v, stream));
+        if (st.dk) CUDA_CHECK(cudaFreeAsync(st.dk, stream));
+        if (st.dv) CUDA_CHECK(cudaFreeAsync(st.dv, stream));
+        CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&st.k), need * sizeof(nv_bfloat16), stream));
+        CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&st.v), need * sizeof(nv_bfloat16), stream));
+        CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&st.dk), need * sizeof(float), stream));
+        CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&st.dv), need * sizeof(float), stream));
+        CUDA_CHECK(cudaMemsetAsync(st.dk, 0, need * sizeof(float), stream));
+        CUDA_CHECK(cudaMemsetAsync(st.dv, 0, need * sizeof(float), stream));
+        st.kv_elems = need;
+    }
+    return st;
+}
+
+void CompiledExecutor::set_sequence_chunk(int idx, int count, const IModel::ChunkPackMeta* pack) {
+    mChunkIdx = idx;
+    mChunkCount = count;
+    if (pack) {
+        mChunkPack = *pack;
+    } else {
+        mChunkPack = IModel::ChunkPackMeta{};
+    }
+    // Allocate the cu_seqlens buffers ONCE at a fixed worst case, outside op
+    // dispatch: cudaMalloc/cudaMallocHost take the global driver lock and
+    // convoy against pending NCCL kernels mid-graph — and REALLOCATING here
+    // would free a buffer the previous chunk's in-flight kernels still read.
+    // 16384 entries cover chunks of up to 8191 documents (64 KB).
+    if (count > 1 && !mChunkCuDev) {
+        mChunkCuCap = 16384;
+        CUDA_CHECK(cudaMalloc(&mChunkCuDev, mChunkCuCap * sizeof(std::int32_t)));
+        CUDA_CHECK(cudaMallocHost(&mChunkCuPinned, mChunkCuCap * sizeof(std::int32_t)));
+    }
+    if (pack && 2 * (static_cast<std::size_t>(pack->num_segs) + 1) > mChunkCuCap) {
+        throw std::runtime_error("chunked-sequence: too many documents in one chunk (" +
+                                 std::to_string(pack->num_segs) + ")");
+    }
+    // Contents are built lazily at attention-dispatch time: mT is only valid
+    // while a graph is executing, not here.
+    mChunkCuUploaded = -1;
+}
+
+void CompiledExecutor::ensure_chunk_cu_uploaded() {
+    if (mChunkCuUploaded == mChunkIdx) return;
+    if (!mChunkCuDev) {
+        throw std::runtime_error("chunked-sequence: cu buffers not allocated (set_sequence_chunk not called)");
+    }
+    if (mChunkPack.kv_len > 0) {
+        // Packed: per-document segments, window-relative (built host-side by
+        // the driver from position ids).
+        const std::size_t nq = mChunkPack.cu_q.size();
+        const std::size_t nk = mChunkPack.cu_k.size();
+        for (std::size_t i = 0; i < nq; ++i) mChunkCuPinned[i] = mChunkPack.cu_q[i];
+        for (std::size_t i = 0; i < nk; ++i) mChunkCuPinned[nq + i] = mChunkPack.cu_k[i];
+        CUDA_CHECK(cudaMemcpyAsync(mChunkCuDev, mChunkCuPinned, (nq + nk) * sizeof(std::int32_t),
+                                   cudaMemcpyHostToDevice, mRunState.MainStream));
+    } else {
+        // Unpacked: one segment spanning the whole prefix.
+        mChunkCuPinned[0] = 0;
+        mChunkCuPinned[1] = static_cast<std::int32_t>(mT);
+        mChunkCuPinned[2] = 0;
+        mChunkCuPinned[3] = static_cast<std::int32_t>((mChunkIdx + 1) * mT);
+        CUDA_CHECK(cudaMemcpyAsync(
+            mChunkCuDev, mChunkCuPinned, 4 * sizeof(std::int32_t), cudaMemcpyHostToDevice, mRunState.MainStream));
+    }
+    mChunkCuUploaded = mChunkIdx;
+}
+
+void CompiledExecutor::zero_sequence_chunk_dkv() {
+    for (auto& [layer, st] : mChunkAttn) {
+        if (st.dk) CUDA_CHECK(cudaMemsetAsync(st.dk, 0, st.kv_elems * sizeof(float), mRunState.MainStream));
+        if (st.dv) CUDA_CHECK(cudaMemsetAsync(st.dv, 0, st.kv_elems * sizeof(float), mRunState.MainStream));
+    }
+    for (auto& [layer, st] : mChunkGdn) {
+        if (st.d_state) CUDA_CHECK(cudaMemsetAsync(st.d_state, 0, st.elems * sizeof(float), mRunState.MainStream));
+    }
+    for (auto& [layer, st] : mChunkConv) {
+        if (st.d_tail)
+            CUDA_CHECK(cudaMemsetAsync(st.d_tail, 0, st.elems * get_dtype_size(st.dtype), mRunState.MainStream));
+    }
+}
+
+CompiledExecutor::ChunkGdnState& CompiledExecutor::chunk_gdn_state(long elems, int key) {
+    auto& st = mChunkGdn[key];
+    const std::size_t need = static_cast<std::size_t>(elems);
+    if (st.elems < need) {
+        cudaStream_t stream = mRunState.MainStream;
+        if (st.states) CUDA_CHECK(cudaFreeAsync(st.states, stream));
+        if (st.d_state) CUDA_CHECK(cudaFreeAsync(st.d_state, stream));
+        const std::size_t slots = static_cast<std::size_t>(mChunkCount) + 1;
+        CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&st.states), slots * need * sizeof(nv_bfloat16), stream));
+        CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&st.d_state), need * sizeof(float), stream));
+        // Slot 0 (state before chunk 0) stays zero forever; zero it all once.
+        CUDA_CHECK(cudaMemsetAsync(st.states, 0, slots * need * sizeof(nv_bfloat16), stream));
+        CUDA_CHECK(cudaMemsetAsync(st.d_state, 0, need * sizeof(float), stream));
+        st.elems = need;
+    }
+    return st;
+}
+
+CompiledExecutor::ChunkConvState& CompiledExecutor::chunk_conv_state(long elems, ETensorDType dtype, int key) {
+    auto& st = mChunkConv[key];
+    const std::size_t need = static_cast<std::size_t>(elems);
+    const std::size_t es = get_dtype_size(dtype);
+    if (st.elems < need || st.dtype != dtype) {
+        cudaStream_t stream = mRunState.MainStream;
+        if (st.tails) CUDA_CHECK(cudaFreeAsync(st.tails, stream));
+        if (st.d_tail) CUDA_CHECK(cudaFreeAsync(st.d_tail, stream));
+        const std::size_t slots = static_cast<std::size_t>(mChunkCount) + 1;
+        CUDA_CHECK(cudaMallocAsync(&st.tails, slots * need * es, stream));
+        CUDA_CHECK(cudaMallocAsync(&st.d_tail, need * es, stream));
+        CUDA_CHECK(cudaMemsetAsync(st.tails, 0, slots * need * es, stream));
+        CUDA_CHECK(cudaMemsetAsync(st.d_tail, 0, need * es, stream));
+        st.elems = need;
+        st.dtype = dtype;
+    }
+    return st;
+}
+
+void CompiledExecutor::free_sequence_chunk_state() {
+    // KV/dKV buffers are stream-ordered allocations; free them the same way.
+    // Probe the context first — teardown may run with it already dead.
+    if (cudaFree(nullptr) == cudaSuccess) {
+        for (auto& [layer, st] : mChunkAttn) {
+            if (st.k) cudaFreeAsync(st.k, mRunState.MainStream);
+            if (st.v) cudaFreeAsync(st.v, mRunState.MainStream);
+            if (st.dk) cudaFreeAsync(st.dk, mRunState.MainStream);
+            if (st.dv) cudaFreeAsync(st.dv, mRunState.MainStream);
+        }
+        for (auto& [layer, st] : mChunkGdn) {
+            if (st.states) cudaFreeAsync(st.states, mRunState.MainStream);
+            if (st.d_state) cudaFreeAsync(st.d_state, mRunState.MainStream);
+        }
+        for (auto& [layer, st] : mChunkConv) {
+            if (st.tails) cudaFreeAsync(st.tails, mRunState.MainStream);
+            if (st.d_tail) cudaFreeAsync(st.d_tail, mRunState.MainStream);
+        }
+        cudaStreamSynchronize(mRunState.MainStream);
+    } else {
+        (void)cudaGetLastError();
+    }
+    mChunkAttn.clear();
+    mChunkGdn.clear();
+    mChunkConv.clear();
+    if (mChunkCuDev) {
+        cudaFree(mChunkCuDev);
+        mChunkCuDev = nullptr;
+    }
+    if (mChunkCuPinned) {
+        cudaFreeHost(mChunkCuPinned);
+        mChunkCuPinned = nullptr;
+    }
+    mChunkIdx = -1;
+    mChunkCount = 0;
+}
+
 void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
     Tensor& qkv = resolve_tensor(op.inputs[0]);
     Tensor* sinks = nullptr;
@@ -324,6 +489,24 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
     params.run_state = &mRunState;
     params.temps = &mTemps;
     params.sm_version = mRunState.DeviceProp.major * 10 + mRunState.DeviceProp.minor;
+
+    if (sequence_chunk_active()) {
+        ensure_chunk_cu_uploaded();
+        auto& cst = chunk_attn_state(layer_idx, Hkv, Hs);
+        const bool packed = mChunkPack.kv_len > 0;
+        const int win_start = packed ? mChunkPack.win_start : 0;
+        const std::size_t win_off = static_cast<std::size_t>(win_start) * Hkv * Hs;
+        params.chunk_pos = mChunkIdx * static_cast<int>(mT) - win_start;
+        params.chunk_kv_len = packed ? mChunkPack.kv_len : (mChunkIdx + 1) * static_cast<int>(mT);
+        params.chunk_k_cache = cst.k + win_off;
+        params.chunk_v_cache = cst.v + win_off;
+        params.chunk_cu_q = mChunkCuDev;
+        params.chunk_cu_k = mChunkCuDev + (packed ? (mChunkPack.num_segs + 1) : 2);
+        params.chunk_num_segs = packed ? mChunkPack.num_segs : 1;
+        params.chunk_max_q = packed ? mChunkPack.max_q : static_cast<int>(mT);
+        params.chunk_max_k = packed ? mChunkPack.max_k : params.chunk_kv_len;
+        params.chunk_append_pos = mChunkIdx * static_cast<int>(mT);
+    }
 
     AttentionBackend& backend = AttentionBackendRegistry::instance().select(params);
     if (should_dump_flash_args()) {
@@ -451,6 +634,26 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
                                (mCuSeqlensGpu != nullptr && window_size > 0);
     params.attn_bwd_chunks = mOptions.AttBwdChunks;
     params.sm_version = mRunState.DeviceProp.major * 10 + mRunState.DeviceProp.minor;
+
+    if (sequence_chunk_active()) {
+        ensure_chunk_cu_uploaded();
+        auto& cst = chunk_attn_state(layer_idx, Hkv, Hs);
+        const bool packed = mChunkPack.kv_len > 0;
+        const int win_start = packed ? mChunkPack.win_start : 0;
+        const std::size_t win_off = static_cast<std::size_t>(win_start) * Hkv * Hs;
+        params.chunk_pos = mChunkIdx * static_cast<int>(mT) - win_start;
+        params.chunk_kv_len = packed ? mChunkPack.kv_len : (mChunkIdx + 1) * static_cast<int>(mT);
+        params.chunk_k_cache = cst.k + win_off;
+        params.chunk_v_cache = cst.v + win_off;
+        params.chunk_dk_accum = cst.dk + win_off;
+        params.chunk_dv_accum = cst.dv + win_off;
+        params.chunk_cu_q = mChunkCuDev;
+        params.chunk_cu_k = mChunkCuDev + (packed ? (mChunkPack.num_segs + 1) : 2);
+        params.chunk_num_segs = packed ? mChunkPack.num_segs : 1;
+        params.chunk_max_q = packed ? mChunkPack.max_q : static_cast<int>(mT);
+        params.chunk_max_k = packed ? mChunkPack.max_k : params.chunk_kv_len;
+        params.chunk_append_pos = mChunkIdx * static_cast<int>(mT);
+    }
 
     AttentionBackend& backend = AttentionBackendRegistry::instance().select(params);
     if (should_dump_flash_args()) {

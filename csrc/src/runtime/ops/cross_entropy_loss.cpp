@@ -24,6 +24,10 @@
 namespace dsl {
 
 void CompiledExecutor::dispatch_cross_entropy_loss(const CompiledOp& op) {
+    if (sequence_chunk_kv_sweep()) {
+        ensure_output_tensor(op.outputs[0]);
+        return;
+    }
     Tensor& logits = resolve_tensor(op.inputs[0]);
     Tensor& targets = resolve_tensor(op.inputs[1]);
     Tensor& loss = ensure_output_tensor(op.outputs[0]);

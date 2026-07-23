@@ -737,6 +737,13 @@ class TokenizeDatasets(SurogateCommand):
                     non_overlapping,
                 )
 
+        # Phase breakdown (render vs pretokenize vs BPE). Empty unless the run
+        # set SUROGATE_TOK_PROFILE=1 — see csrc/src/tokenizer/tok_profile.h.
+        report = NativeTokenizer.profile_report(reset=True)
+        if report:
+            for line in report.rstrip("\n").split("\n"):
+                logger.info(line)
+
     def _write_packed_vectorized(
         self,
         all_tokens,

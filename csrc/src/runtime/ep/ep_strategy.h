@@ -225,6 +225,24 @@ private:
     /// on the LLEP dispatch path.
     RingSlabArena mForeignArena;
 
+    /// Chunked-sequence: per-(layer, chunk) snapshot of the plan and the
+    /// exchanged splits from the chunk's phase-A forward. Phase-B re-forwards
+    /// restore from here (routing is deterministic), skipping the imbalance
+    /// all-reduce, LPT and the two count A2As per layer.
+    struct ChunkPlanSnapshot {
+        bool use_llep = false;
+        LPTPlan plan;
+        std::vector<int> expert_to_gpu;
+        std::vector<int> merged_experts;
+        std::vector<int> global_to_merged;
+        std::vector<int> send_splits;
+        std::vector<int> recv_splits;
+        std::vector<int> recv_all_counts;
+        int total_send = 0;
+        int total_recv = 0;
+    };
+    std::unordered_map<long, ChunkPlanSnapshot> mChunkPlanCache;  ///< key: layer*4096 + chunk
+
     /// One in-flight backward prefetch (see maybe_prefetch_next_replay_layer).
     struct PrefetchedForeign {
         int layer_idx = -1;

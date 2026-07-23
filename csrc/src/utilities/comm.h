@@ -21,6 +21,14 @@ namespace std {
 class jthread;
 }  // namespace std
 
+namespace surogate {
+/// Process-wide liveness heartbeat for the trainer's lost-wakeup watchdog.
+/// Long single-work-item operations (weight import, chunked-sequence steps,
+/// checkpoint I/O) tick this so healthy long work is not poked.
+void tick_watchdog_heartbeat();
+std::size_t watchdog_heartbeat();
+}  // namespace surogate
+
 struct Tensor;
 struct TensorShard;
 enum class ETensorDType : int;

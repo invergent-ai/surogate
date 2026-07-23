@@ -455,7 +455,9 @@ class NodeTrainer:
                 config=pretrained_config,
                 options=self._config.runtime_config,
                 batch_size=self._config.per_device_train_batch_size,
-                seq_len=self._config.sequence_len,
+                # Chunked-sequence training compiles the graph at chunk size;
+                # step() still receives full-length [B, sequence_len] batches.
+                seq_len=self._config.trainer_seq_len,
                 grad_accum=self._config.gradient_accumulation_steps,
                 memcpy_all_gather=self._config.memcpy_all_gather,
                 memcpy_send_recv=self._config.memcpy_send_recv,
@@ -470,7 +472,9 @@ class NodeTrainer:
                 config=pretrained_config,
                 options=self._config.runtime_config,
                 batch_size=self._config.per_device_train_batch_size,
-                seq_len=self._config.sequence_len,
+                # Chunked-sequence training compiles the graph at chunk size;
+                # step() still receives full-length [B, sequence_len] batches.
+                seq_len=self._config.trainer_seq_len,
                 grad_accum=self._config.gradient_accumulation_steps,
                 memcpy_all_gather=self._config.memcpy_all_gather,
                 memcpy_send_recv=self._config.memcpy_send_recv,

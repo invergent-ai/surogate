@@ -35,6 +35,14 @@ Recomputation trades compute for memory by recomputing activations during the ba
 | ----------- | ---- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `recompute` | bool | `true`  | Enable activation recomputation. `false` saves all activations (fastest, most memory). `true` recomputes intermediates from checkpoints (saves VRAM, small compute overhead). |
 
+## Chunked-Sequence Training (long sequences)
+
+Train sequences far longer than activation memory would normally allow by processing the layer stack in fixed-size chunks with attention KV carried across chunks. Memory stays at the single-chunk footprint plus a small KV/state budget (KV is `2 * kv_heads * head_dim` bytes per token per attention layer), while gradients remain exact: backward walks chunks in reverse and accumulates dK/dV in FP32. Trailing all-padding chunks are skipped automatically (nothing attends to them). Works with `sample_packing` (per-document attention across chunk boundaries is preserved, including documents split across rows) and with GDN hybrid models (Qwen3.5/3.6 — the delta-rule recurrent state and causal-conv tail are carried across chunks exactly). Requires `per_device_train_batch_size: 1`, BF16 attention, and `lora_dropout: 0`; CUDA graphs are disabled automatically.
+
+| Option            | Type | Default | Description                                                                                                        |
+| ----------------- | ---- | ------- | ------------------------------------------------------------------------------------------------------------------ |
+| `sequence_chunks` | int  | `1`     | Process `sequence_len` as N chunks of `sequence_len / N` tokens (must divide evenly). `1` = normal dense training. |
+
 ## CPU-RAM Centric Training
 
 CPU-RAM centric training keeps model weights and optimizer state on CPU, streaming data to/from GPU per-layer. This allows training models that exceed GPU memory on a single GPU or across multiple GPUs with simple data parallelism (no ZeRO sharding required).

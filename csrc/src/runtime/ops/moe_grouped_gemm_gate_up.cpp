@@ -1474,6 +1474,37 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up_backward(const Compiled
                         scatter_exchange(mg_up_A, mg_up_B, *lora_grads->moe.grouped.up);
                     }
                 }
+            } else if (llep_wgrad && lora_grads && rank > 0) {
+                // Zero tokens received on this rank (routine for all-padding
+                // chunks under chunked-sequence training): still walk the
+                // plan-driven wgrad exchange — every rank derives the same
+                // pairwise WT-comm schedule from the shared plan, and peers
+                // block on this rank's sends/recvs regardless of its local
+                // row count. Merged contributions are zero; row-0 of the
+                // dummies is never read (this rank owns no merged experts).
+                // Pair selection mirrors the LoRA config via the LOCAL grads
+                // (uniform across ranks), not the merged view (null here).
+                auto empty_merged = [&](long rows, long cols) -> Tensor {
+                    Tensor t = mRunState.temp_alloc(d_gate_up.DType, {1L, rows, cols}, "llep_wgrad_empty");
+                    mTemps.push_back(t);
+                    return t;
+                };
+                const int gate_up_dim = 2 * intermediate_size;
+                if (lora_grads->moe.grouped.gate_up.has_value()) {
+                    Tensor ea = empty_merged(rank, hidden_size);
+                    Tensor eb = empty_merged(gate_up_dim, rank);
+                    scatter_exchange(ea, eb, *lora_grads->moe.grouped.gate_up);
+                }
+                if (lora_grads->moe.grouped.gate.has_value()) {
+                    Tensor ea = empty_merged(rank, hidden_size);
+                    Tensor eb = empty_merged(intermediate_size, rank);
+                    scatter_exchange(ea, eb, *lora_grads->moe.grouped.gate);
+                }
+                if (lora_grads->moe.grouped.up.has_value()) {
+                    Tensor ea = empty_merged(rank, hidden_size);
+                    Tensor eb = empty_merged(intermediate_size, rank);
+                    scatter_exchange(ea, eb, *lora_grads->moe.grouped.up);
+                }
             }
         }
     }

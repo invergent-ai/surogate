@@ -900,14 +900,21 @@ void EPStrategy::permute_recv_tokens(CompiledExecutor& exec,
 
     // Per-layer persistent outputs (consumed by GEMM, kept until backward).
     auto& ep_state_out = mEpStates[ctx.ep_key];
-    const std::size_t sorted_need = static_cast<std::size_t>(ctx.total_recv) * ctx.hidden_size * ctx.elem_sz;
+    // Floor the persistent output buffers at a minimal allocation: a rank can
+    // legitimately receive ZERO tokens after rebalancing (routine for
+    // all-padding tail chunks under chunked-sequence training), and the
+    // stored 0-row tensors must still carry a non-null Data pointer for
+    // downstream tensor resolution (notably the recompute replay).
+    const std::size_t sorted_need =
+        std::max<std::size_t>(static_cast<std::size_t>(ctx.total_recv) * ctx.hidden_size * ctx.elem_sz, 256);
     alloc_or_resize(ep_state_out.sorted_recv_gpu, ep_state_out.sorted_recv_bytes, sorted_need);
     sorted_recv_out = make_raw_tensor(ep_state_out.sorted_recv_gpu,
                                       ctx.dtype,
                                       {static_cast<long>(ctx.total_recv), static_cast<long>(ctx.hidden_size)},
                                       ctx.device);
 
-    const std::size_t local_scatter_need = static_cast<std::size_t>(ctx.total_recv) * sizeof(int);
+    const std::size_t local_scatter_need =
+        std::max<std::size_t>(static_cast<std::size_t>(ctx.total_recv) * sizeof(int), 256);
     alloc_or_resize(ep_state_out.local_scatter_gpu, ep_state_out.local_scatter_bytes, local_scatter_need);
     local_scatter_out = make_raw_tensor(ep_state_out.local_scatter_gpu,
                                         ETensorDType::INT32,
@@ -1059,8 +1066,12 @@ void EPStrategy::finalize_llep_state(CompiledExecutor& exec,
                 const long b_cols = local.B.Sizes[2];
                 const std::size_t a_slice = static_cast<std::size_t>(a_rows * a_cols) * get_dtype_size(local.A.DType);
                 const std::size_t b_slice = static_cast<std::size_t>(b_rows * b_cols) * get_dtype_size(local.B.DType);
-                const std::size_t need_A = static_cast<std::size_t>(ctx.num_merged) * a_slice;
-                const std::size_t need_B = static_cast<std::size_t>(ctx.num_merged) * b_slice;
+                // Floored at one row: a rank whose experts were all spilled away
+                // (num_merged == 0 — routine for all-padding chunks) must still
+                // present non-null merged tensors so downstream gates behave
+                // identically on every rank (collective schedules depend on it).
+                const std::size_t need_A = static_cast<std::size_t>(std::max(ctx.num_merged, 1)) * a_slice;
+                const std::size_t need_B = static_cast<std::size_t>(std::max(ctx.num_merged, 1)) * b_slice;
 
                 // Per-layer owned allocations — LoRA is small (~9 MB/layer)
                 // so per-layer storage avoids the shared-buffer aliasing bug.
@@ -1390,6 +1401,57 @@ void EPStrategy::dispatch_forward(CompiledExecutor& exec, const CompiledOp& op) 
             EP_TRACE(exec, ctx, "replay reusing forward plan use_llep=%d", ctx.use_llep ? 1 : 0);
         }
     }
+    // Chunked-sequence phase B: this chunk's phase-A forward already computed
+    // the plan and exchanged the splits — routing is deterministic, so
+    // restore both and skip the per-layer collectives entirely.
+    if (!reused_plan && !exec.mInReplay && exec.sequence_chunk_active() && exec.sequence_chunk_reuse_ep()) {
+        const long ck = static_cast<long>(ctx.layer_idx) * 4096 + exec.sequence_chunk_idx();
+        auto snap_it = mChunkPlanCache.find(ck);
+        if (snap_it != mChunkPlanCache.end()) {
+            const auto& c = snap_it->second;
+            long total_now = 0;
+            for (int v : ctx.local_expert_counts) total_now += v;
+            if (total_now != c.total_send) {
+                throw std::runtime_error("ep_dispatch chunk reuse: routing diverged at layer " +
+                                         std::to_string(ctx.layer_idx) + " chunk " +
+                                         std::to_string(exec.sequence_chunk_idx()));
+            }
+            ctx.use_llep = c.use_llep;
+            ctx.plan = c.plan;
+            ctx.expert_to_gpu = c.expert_to_gpu;
+            ctx.merged_experts = c.merged_experts;
+            ctx.global_to_merged = c.global_to_merged;
+            ctx.num_merged = static_cast<int>(c.merged_experts.size());
+            ctx.send_splits = c.send_splits;
+            ctx.recv_splits = c.recv_splits;
+            ctx.recv_all_counts = c.recv_all_counts;
+            ctx.total_send = c.total_send;
+            ctx.total_recv = c.total_recv;
+            reused_plan = true;
+            auto& rmeta = mEPLayerMeta[ctx.ep_key];
+            rmeta.num_merged = ctx.num_merged;
+            rmeta.native_start = ctx.ep_rank * ctx.num_local;
+            rmeta.num_local = ctx.num_local;
+            rmeta.merged_to_global = ctx.merged_experts;
+            rmeta.expert_to_gpu = ctx.expert_to_gpu;
+            // The backward replay restores from the fwd-key state cache —
+            // refresh it for this chunk exactly as the splits path would.
+            auto& st = mEpStates[ctx.ep_key];
+            st.plan_cached = true;
+            st.cached_use_llep = ctx.use_llep;
+            st.cached_plan = ctx.plan;
+            st.cached_expert_to_gpu = ctx.expert_to_gpu;
+            st.cached_merged_experts = ctx.merged_experts;
+            st.cached_global_to_merged = ctx.global_to_merged;
+            st.cached_send_splits = ctx.send_splits;
+            st.cached_recv_splits = ctx.recv_splits;
+            st.cached_recv_all_counts = ctx.recv_all_counts;
+            st.cached_total_send = ctx.total_send;
+            st.cached_total_recv = ctx.total_recv;
+            EP_TRACE(exec, ctx, "chunk reuse restored (phase B)");
+        }
+    }
+
     // Sticky plans: outside replay, reuse the layer's cached plan for up to
     // ep_plan_refresh_interval forward dispatches. Any expert->GPU mapping is
     // correct (routing counts only affect balance quality), and a stable plan
@@ -1494,6 +1556,21 @@ void EPStrategy::dispatch_forward(CompiledExecutor& exec, const CompiledOp& op) 
         st.cached_recv_all_counts = ctx.recv_all_counts;
         st.cached_total_send = ctx.total_send;
         st.cached_total_recv = ctx.total_recv;
+        // Phase-A snapshot for the chunk's phase-B re-forward.
+        if (exec.sequence_chunk_active()) {
+            const long ck = static_cast<long>(ctx.layer_idx) * 4096 + exec.sequence_chunk_idx();
+            auto& snap = mChunkPlanCache[ck];
+            snap.use_llep = ctx.use_llep;
+            snap.plan = ctx.plan;
+            snap.expert_to_gpu = ctx.expert_to_gpu;
+            snap.merged_experts = ctx.merged_experts;
+            snap.global_to_merged = ctx.global_to_merged;
+            snap.send_splits = ctx.send_splits;
+            snap.recv_splits = ctx.recv_splits;
+            snap.recv_all_counts = ctx.recv_all_counts;
+            snap.total_send = ctx.total_send;
+            snap.total_recv = ctx.total_recv;
+        }
     }
 
     // Launch LLEP base + LoRA transfers on a separate stream (overlaps the
@@ -1613,6 +1690,11 @@ void EPStrategy::maybe_prefetch_next_layer(CompiledExecutor& exec, const Dispatc
 
 void EPStrategy::dispatch_backward(CompiledExecutor& exec, const CompiledOp& op) {
     Tensor& d_recv_sorted = exec.resolve_tensor(op.inputs[0]);
+    if (ep_trace_enabled() && exec.mComm) {
+        fprintf(stderr, "[ep-trace r%d] dispatch_backward enter rows=%ld\n", exec.mComm->rank(),
+                static_cast<long>(d_recv_sorted.Sizes[0]));
+        fflush(stderr);
+    }
 
     const int ep_size = op.attrs.ep_size;
     const int hidden_size = static_cast<int>(d_recv_sorted.Sizes[1]);
@@ -1873,7 +1955,10 @@ void EPStrategy::combine_backward(CompiledExecutor& exec, const CompiledOp& op) 
     if (d_reordered_ptr) mBufferPool.release(d_reordered_ptr, d_reordered_bytes);
 
     // 2. Re-sort by local expert (same permutation as dispatch forward).
-    const std::size_t sorted_need = static_cast<std::size_t>(ep_state.total_recv) * hidden_size * elem_sz;
+    // Floored at a minimal allocation: zero-recv ranks still store a 0-row
+    // gradient whose Data pointer must be non-null (see permute_recv_tokens).
+    const std::size_t sorted_need =
+        std::max<std::size_t>(static_cast<std::size_t>(ep_state.total_recv) * hidden_size * elem_sz, 256);
     alloc_or_resize(ep_state_mut.combine_bwd_sorted_gpu, ep_state_mut.combine_bwd_sorted_bytes, sorted_need);
     Tensor d_expert_sorted = make_raw_tensor(ep_state_mut.combine_bwd_sorted_gpu,
                                              d_combined.DType,

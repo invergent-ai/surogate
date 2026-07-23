@@ -21,12 +21,14 @@
 #include <unordered_set>
 #include <vector>
 
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include "runtime/dsl/forward_plan.h"
 #include "runtime/dsl/hook_registry.h"
 #include "runtime/executor/execution_request.h"
 #include "runtime/ep/ep_state.h"
+#include "runtime/training/model.h"
 #include "runtime/executor/graph_executor_internal.h"
 #include "runtime/executor/saved_tensor_cache.h"
 #include "runtime/dsl/ir.h"
@@ -167,6 +169,34 @@ public:
         mMaxDocSeqlen = 0;
         mTotalDocTokens = 0;
     }
+
+    // ------------------------------------------------------------------
+    // Chunked-sequence training (KV-checkpointed chunks). When active,
+    // dispatch_flash_attention(+backward) routes to the kvprefix backend
+    // with executor-owned per-layer KV caches and FP32 dKV accumulators.
+    // ------------------------------------------------------------------
+    /// Activate chunk `idx` of `count` (idx = -1 deactivates). The graph's
+    /// T is the chunk size; the caches cover count * T rows. `pack` carries
+    /// the chunk's document geometry (packed sequences); null = one segment
+    /// spanning the whole prefix.
+    void set_sequence_chunk(int idx, int count, const IModel::ChunkPackMeta* pack = nullptr);
+    bool sequence_chunk_active() const {
+        return mChunkCount > 1 && mChunkIdx >= 0;
+    }
+    int sequence_chunk_idx() const {
+        return mChunkIdx;
+    }
+    bool sequence_chunk_reuse_ep() const {
+        return mChunkPack.reuse_ep;
+    }
+    bool sequence_chunk_kv_sweep() const {
+        return sequence_chunk_active() && mChunkPack.kv_sweep;
+    }
+    /// Zero all layers' dKV accumulators — call once before each reverse
+    /// backward sweep.
+    void zero_sequence_chunk_dkv();
+    /// Free all chunked-sequence state (KV caches, accumulators, scratch).
+    void free_sequence_chunk_state();
 
     void set_recompute_fn(std::function<void(int, long, long, bool)> fn);
     void set_recompute_enabled(bool enabled);
@@ -795,6 +825,47 @@ private:
     const std::vector<std::string>* mSkippedBackwardTensors = nullptr;
 
     // Document masking context for Flash Attention varlen (null = disabled)
+    /// Chunked-sequence carry for a GDN (gated delta rule) layer: per-chunk
+    /// initial states (slot c = state BEFORE chunk c, BF16 as the kernel
+    /// expects; slot 0 stays zero) and the FP32 reverse d-state carry.
+    struct ChunkGdnState {
+        nv_bfloat16* states = nullptr;  ///< [(num_chunks+1) * elems]
+        float* d_state = nullptr;       ///< [elems] — d_final for the previous chunk
+        std::size_t elems = 0;          ///< B*H*K*V
+    };
+    std::unordered_map<int, ChunkGdnState> mChunkGdn;  ///< by layer_idx
+    ChunkGdnState& chunk_gdn_state(long elems, int key);
+
+    /// Chunked-sequence carry for a causal conv layer: per-chunk input tails
+    /// (slot c = last kernel-1 columns BEFORE chunk c; slot 0 zero) and the
+    /// reverse d-tail carry.
+    struct ChunkConvState {
+        void* tails = nullptr;     ///< [(num_chunks+1) * elems] input dtype
+        void* d_tail = nullptr;    ///< [elems]
+        std::size_t elems = 0;     ///< B*conv_dim*(kernel-1)
+        ETensorDType dtype = ETensorDType::BF16;
+    };
+    std::unordered_map<int, ChunkConvState> mChunkConv;  ///< by layer_idx
+    ChunkConvState& chunk_conv_state(long elems, ETensorDType dtype, int key);
+
+    struct ChunkAttnState {
+        nv_bfloat16* k = nullptr;
+        nv_bfloat16* v = nullptr;
+        float* dk = nullptr;
+        float* dv = nullptr;
+        std::size_t kv_elems = 0;
+    };
+    std::unordered_map<int, ChunkAttnState> mChunkAttn;  ///< by layer_idx
+    int mChunkIdx = -1;
+    int mChunkCount = 0;
+    std::int32_t* mChunkCuDev = nullptr;   ///< device: cu_q then cu_k
+    std::int32_t* mChunkCuPinned = nullptr;
+    std::size_t mChunkCuCap = 0;  ///< capacity in int32 entries (both arrays)
+    int mChunkCuUploaded = -1;  ///< chunk idx whose cu arrays are on device
+    IModel::ChunkPackMeta mChunkPack;  ///< active chunk's document geometry
+    void ensure_chunk_cu_uploaded();
+    ChunkAttnState& chunk_attn_state(int layer_idx, int Hkv, int Hs);
+
     const std::int32_t* mCuSeqlensGpu = nullptr;
     const std::int32_t* mCuSeqlensCpu = nullptr;
     int mNumDocs = 0;

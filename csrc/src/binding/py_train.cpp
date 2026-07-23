@@ -537,6 +537,10 @@ void MultiGPUPyTrainer::save_checkpoint(std::string directory, int step) {
 void MultiGPUPyTrainer::step(const std::int32_t* inputs,
                              const std::int32_t* targets,
                              const std::int32_t* position_ids) {
+    if (mOptions.SequenceChunks > 1) {
+        step_chunked(inputs, targets, position_ids, mOptions.SequenceChunks);
+        return;
+    }
     const int ep_size = std::max(1, mOptions.EPSize);
     for (int i = 0; i < mContexts.size(); ++i) {
         auto& ctx = mContexts.at(i);
@@ -591,6 +595,109 @@ void MultiGPUPyTrainer::step(const std::int32_t* inputs,
         }
         if (do_timing) CUDA_CHECK(cudaEventRecord(rs.TimingBackwardEnd[micro_idx], rs.MainStream));
     });
+    ++mTrainMicroStep;
+}
+
+namespace {
+
+/// Slice one chunk out of [rows, B, N*T] host arrays into the per-model
+/// input/target/position buffers. Position ids get the chunk's global offset
+/// so RoPE sees absolute positions.
+void copy_chunk_inputs_for_ctx(IModel& model,
+                               const std::int32_t* inputs,
+                               const std::int32_t* targets,
+                               const std::int32_t* position_ids,
+                               int src_row,
+                               int B,
+                               int T,
+                               long T_full,
+                               long base_pos) {
+    auto* ib = model.get_input_buffer().get<std::int32_t>();
+    auto* tb = model.get_target_buffer().get<std::int32_t>();
+    Tensor pos_buf = model.get_position_ids_buffer();
+    auto* pb = pos_buf.get<std::int32_t>();
+    const int pos_planes = (pos_buf.Rank == 3) ? static_cast<int>(pos_buf.Sizes[0]) : 1;
+
+    for (int b = 0; b < B; ++b) {
+        const long src_off = (static_cast<long>(src_row) * B + b) * T_full + base_pos;
+        std::memcpy(ib + static_cast<long>(b) * T, inputs + src_off, T * sizeof(std::int32_t));
+        std::memcpy(tb + static_cast<long>(b) * T, targets + src_off, T * sizeof(std::int32_t));
+    }
+    for (int p = 0; p < pos_planes; ++p) {
+        for (int b = 0; b < B; ++b) {
+            std::int32_t* dst = pb + (static_cast<long>(p) * B + b) * T;
+            if (position_ids) {
+                const long src_off = (static_cast<long>(src_row) * B + b) * T_full + base_pos;
+                std::memcpy(dst, position_ids + src_off, T * sizeof(std::int32_t));
+            } else {
+                for (int t = 0; t < T; ++t) {
+                    dst[t] = static_cast<std::int32_t>(base_pos + t);
+                }
+            }
+        }
+    }
+}
+
+}  // namespace
+
+void MultiGPUPyTrainer::step_chunked(const std::int32_t* inputs,
+                                     const std::int32_t* targets,
+                                     const std::int32_t* position_ids,
+                                     int seq_chunks) {
+    if (mTrainMicroStep >= mGradAccumulation) {
+        throw std::runtime_error(
+            fmt::format("step_chunked: micro_step {} >= grad_accumulation {}", mTrainMicroStep, mGradAccumulation));
+    }
+    const int ep_size = std::max(1, mOptions.EPSize);
+    const long T_full = static_cast<long>(T) * seq_chunks;
+    const int accum_eff = mGradAccumulation * seq_chunks;
+
+    auto copy_chunk = [&](int c) {
+        const long base_pos = static_cast<long>(c) * T;
+        for (int i = 0; i < static_cast<int>(mContexts.size()); ++i) {
+            auto& ctx = mContexts.at(i);
+            if (!ctx.Model) {
+                throw std::runtime_error(fmt::format("step_chunked: ctx[{}].Model is null", i));
+            }
+            const int src_row = host_batch_row_for_local_rank(i, ep_size);
+            copy_chunk_inputs_for_ctx(*ctx.Model, inputs, targets, position_ids, src_row, B, T, T_full, base_pos);
+        }
+    };
+
+    // Phase A — KV sweep: forward chunks left-to-right filling the per-layer
+    // attention KV caches. Saved-tensor persistence is skipped; the loss op
+    // lives in backward, so this pass pays layers only.
+    for (int c = 0; c < seq_chunks; ++c) {
+        copy_chunk(c);
+        const int micro_eff = mTrainMicroStep * seq_chunks + c;
+        run_work([c, seq_chunks, micro_eff](sThreadContext& ctx) {
+            ctx.Model->set_sequence_chunk(c, seq_chunks);
+            Tensor in = ctx.Model->get_input_buffer();
+            Tensor pos = ctx.Model->get_position_ids_buffer();
+            ctx.Model->forward_no_save(in, pos, *ctx.Communicator, micro_eff);
+        });
+    }
+
+    // Phase B — reverse re-forward + backward. Each chunk re-forwards against
+    // the frozen KV prefix (regenerating its saved tensors), then runs its
+    // backward; dK/dV accumulate across chunks in the executor's FP32
+    // accumulators, completed exactly because chunks run last-to-first.
+    // Grad zero/accumulate, LoRA micro bookkeeping and loss reduction all key
+    // off the effective micro index, which counts processed chunks.
+    run_work([](sThreadContext& ctx) { ctx.Model->zero_sequence_chunk_dkv(); });
+    for (int c = seq_chunks - 1; c >= 0; --c) {
+        copy_chunk(c);
+        const int micro_eff = mTrainMicroStep * seq_chunks + (seq_chunks - 1 - c);
+        run_work([c, seq_chunks, micro_eff, accum_eff](sThreadContext& ctx) {
+            ctx.Model->set_sequence_chunk(c, seq_chunks);
+            Tensor in = ctx.Model->get_input_buffer();
+            Tensor pos = ctx.Model->get_position_ids_buffer();
+            Tensor tgt = ctx.Model->get_target_buffer();
+            ctx.Model->forward(in, pos, *ctx.Communicator, micro_eff);
+            ctx.Model->backward(in, tgt, *ctx.Communicator, accum_eff, micro_eff);
+        });
+    }
+    run_work([](sThreadContext& ctx) { ctx.Model->set_sequence_chunk(-1, 0); });
     ++mTrainMicroStep;
 }
 
@@ -664,6 +771,9 @@ void MultiGPUPyTrainer::set_visual_inputs(const std::int32_t* visual_pos_masks,
 float MultiGPUPyTrainer::validate(const std::int32_t* inputs,
                                   const std::int32_t* targets,
                                   const std::int32_t* position_ids) {
+    if (mOptions.SequenceChunks > 1) {
+        return validate_chunked(inputs, targets, position_ids, mOptions.SequenceChunks);
+    }
     const int ep_size = std::max(1, mOptions.EPSize);
     for (int i = 0; i < mContexts.size(); ++i) {
         auto& ctx = mContexts.at(i);
@@ -704,6 +814,79 @@ float MultiGPUPyTrainer::validate(const std::int32_t* inputs,
     ++mEvalStep;
 
     return loss;
+}
+
+float MultiGPUPyTrainer::validate_chunked(const std::int32_t* inputs,
+                                          const std::int32_t* targets,
+                                          const std::int32_t* position_ids,
+                                          int seq_chunks) {
+    // Forward-only chunk sweep: each chunk's eval fills the attention KV and
+    // GDN state carries exactly like the training sweep, computes its own
+    // token-mean loss, and the chunk losses combine weighted by their global
+    // valid-token counts — identical to the dense full-sequence mean.
+    const int ep_size = std::max(1, mOptions.EPSize);
+    const long T_full = static_cast<long>(T) * seq_chunks;
+    double weighted = 0.0;
+    long total_valid = 0;
+
+    for (int c = 0; c < seq_chunks; ++c) {
+        const long base_pos = static_cast<long>(c) * T;
+        for (int i = 0; i < static_cast<int>(mContexts.size()); ++i) {
+            auto& ctx = mContexts.at(i);
+            const int src_row = host_batch_row_for_local_rank(i, ep_size);
+            copy_chunk_inputs_for_ctx(*ctx.Model, inputs, targets, position_ids, src_row, B, T, T_full, base_pos);
+        }
+        float loss_c = 0.0f;
+        run_work([c, seq_chunks, micro_idx = mEvalStep, base_pos, this, &loss_c](sThreadContext& ctx) {
+            Tensor in = ctx.Model->get_input_buffer();
+            Tensor pos = ctx.Model->get_position_ids_buffer();
+            Tensor tgt = ctx.Model->get_target_buffer();
+            // Chunk-local document geometry from the sliced positions:
+            // win_start = max(0, chunk_start - pos[0]) is exact — in-row doc
+            // starts reset positions to 0, and the clamp covers a row-initial
+            // document continued from a previous row (attends within the row
+            // only, matching dense doc masking).
+            const auto* pr = pos.get<std::int32_t>();
+            IModel::ChunkPackMeta m;
+            const int t0 = static_cast<int>(base_pos);
+            m.win_start = std::max(0, t0 - pr[0]);
+            m.cu_q = {0};
+            m.cu_k = {0};
+            int seg_start = 0;
+            int doc_start_rel = m.win_start - t0;  // relative to chunk start (<= 0 for first doc)
+            auto close_seg = [&](int seg_end) {
+                const int q_len = seg_end - seg_start;
+                const int k_len = seg_end - doc_start_rel;
+                m.cu_q.push_back(m.cu_q.back() + q_len);
+                m.cu_k.push_back(m.cu_k.back() + k_len);
+                m.max_q = std::max(m.max_q, q_len);
+                m.max_k = std::max(m.max_k, k_len);
+            };
+            for (int t = 1; t < T; ++t) {
+                if (pr[t] != pr[t - 1] + 1) {
+                    close_seg(t);
+                    seg_start = t;
+                    doc_start_rel = t;
+                }
+            }
+            close_seg(T);
+            m.num_segs = static_cast<int>(m.cu_q.size()) - 1;
+            m.kv_len = t0 + static_cast<int>(T) - m.win_start;
+            ctx.Model->set_sequence_chunk(c, seq_chunks, &m);
+            const float l = ctx.Model->validate(in, pos, tgt, *ctx.Communicator, micro_idx);
+            if (ctx.Communicator->rank() == 0) {
+                loss_c = l;
+            }
+        });
+        const int valid_c = get_valid_token_count(0);
+        if (valid_c > 0) {
+            weighted += static_cast<double>(loss_c) * valid_c;
+            total_valid += valid_c;
+        }
+    }
+    run_work([](sThreadContext& ctx) { ctx.Model->set_sequence_chunk(-1, 0); });
+    ++mEvalStep;
+    return total_valid > 0 ? static_cast<float>(weighted / total_valid) : 0.0f;
 }
 
 /**
@@ -754,12 +937,43 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                                                               int step) {
     const int local_gpus = static_cast<int>(mContexts.size());
     const int micro_steps = mGradAccumulation;
-    const std::size_t stride = static_cast<std::size_t>(B) * static_cast<std::size_t>(T);
+    // Chunked-sequence training: step arrays and pinned staging carry the
+    // full sequence (T_step = T * seq_chunks); the graph runs chunk views.
+    const int seq_chunks = std::max(1, mOptions.SequenceChunks);
+    const int T_step = T * seq_chunks;
+    const std::size_t stride = static_cast<std::size_t>(B) * static_cast<std::size_t>(T_step);
     const int pos_planes = (mContexts.empty() || !mContexts.front().Model)
                                ? 1
                                : ((mContexts.front().Model->get_position_ids_buffer().Rank == 3)
                                       ? static_cast<int>(mContexts.front().Model->get_position_ids_buffer().Sizes[0])
                                       : 1);
+
+    // Chunked-sequence: trailing all-padding chunks are skipped exactly —
+    // no valid target lives there and causal attention never looks ahead, so
+    // neither loss nor any gradient depends on them. Computed on the FULL
+    // host batch (all local ranks' rows) so every rank derives the same
+    // count and the collective schedules stay aligned. (Single-node only:
+    // multi-node would need a cross-node reduction of the count.)
+    std::vector<int> chunk_count_per_micro(static_cast<std::size_t>(micro_steps), seq_chunks);
+    if (seq_chunks > 1 && targets) {
+        const int rows_per_micro = local_gpus * B;
+        for (int j = 0; j < micro_steps; ++j) {
+            long last_valid = -1;
+            for (int r = 0; r < rows_per_micro; ++r) {
+                const std::int32_t* row =
+                    targets + (static_cast<std::size_t>(j) * rows_per_micro + r) * static_cast<std::size_t>(T_step);
+                for (long t = static_cast<long>(T_step) - 1; t > last_valid; --t) {
+                    if (row[t] != -100) {
+                        last_valid = t;
+                        break;
+                    }
+                }
+                if (last_valid >= static_cast<long>(T_step) - 1) break;
+            }
+            const int need = static_cast<int>((last_valid + static_cast<long>(T)) / T);
+            chunk_count_per_micro[static_cast<std::size_t>(j)] = std::min(seq_chunks, std::max(1, need));
+        }
+    }
 
     run_work([&](sThreadContext& ctx) {
         auto& rs = ctx.Model->get_run_state();
@@ -773,14 +987,15 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
         auto& gs = *ctx.FullStepGraph;
 
         // Reset graph if shape or accumulation changed.
-        if (gs.captured && (gs.captured_B != B || gs.captured_T != T || gs.captured_grad_accum != micro_steps)) {
+        if (gs.captured && (gs.captured_B != B || gs.captured_T != T_step || gs.captured_grad_accum != micro_steps)) {
             gs.reset_capture();
         }
 
         // Allocate per-micro-step pinned buffers if needed.
         if (gs.inputs.size() != static_cast<size_t>(micro_steps) ||
             gs.targets.size() != static_cast<size_t>(micro_steps) ||
-            gs.position_ids.size() != static_cast<size_t>(micro_steps) || gs.captured_B != B || gs.captured_T != T) {
+            gs.position_ids.size() != static_cast<size_t>(micro_steps) || gs.captured_B != B ||
+            gs.captured_T != T_step) {
             gs.inputs.clear();
             gs.targets.clear();
             gs.position_ids.clear();
@@ -793,23 +1008,23 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                 auto in_name = fmt::format("graph_inputs_cpu_ms{}_rank{}", j, rank);
                 auto tgt_name = fmt::format("graph_targets_cpu_ms{}_rank{}", j, rank);
                 auto pos_name = fmt::format("graph_pos_ids_cpu_ms{}_rank{}", j, rank);
-                gs.inputs.push_back(
-                    rs.Allocator->allocate(ETensorDType::INT32, in_name.c_str(), EAllocationType::PINNED, {B, T}));
-                gs.targets.push_back(
-                    rs.Allocator->allocate(ETensorDType::INT32, tgt_name.c_str(), EAllocationType::PINNED, {B, T}));
+                gs.inputs.push_back(rs.Allocator->allocate(
+                    ETensorDType::INT32, in_name.c_str(), EAllocationType::PINNED, {B, T_step}));
+                gs.targets.push_back(rs.Allocator->allocate(
+                    ETensorDType::INT32, tgt_name.c_str(), EAllocationType::PINNED, {B, T_step}));
                 if (pos_planes > 1) {
                     gs.position_ids.push_back(rs.Allocator->allocate(ETensorDType::INT32,
                                                                      pos_name.c_str(),
                                                                      EAllocationType::PINNED,
-                                                                     {pos_planes, B, T}));
+                                                                     {pos_planes, B, T_step}));
                 } else {
-                    gs.position_ids.push_back(
-                        rs.Allocator->allocate(ETensorDType::INT32, pos_name.c_str(), EAllocationType::PINNED, {B, T}));
+                    gs.position_ids.push_back(rs.Allocator->allocate(
+                        ETensorDType::INT32, pos_name.c_str(), EAllocationType::PINNED, {B, T_step}));
                 }
             }
 
             gs.captured_B = B;
-            gs.captured_T = T;
+            gs.captured_T = T_step;
             gs.captured_grad_accum = micro_steps;
         }
 
@@ -857,7 +1072,7 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                 fill_sequential_position_ids(reinterpret_cast<std::int32_t*>(gs.position_ids[j].Data),
                                              pos_planes,
                                              B,
-                                             T);
+                                             T_step);
             }
         }
 
@@ -921,9 +1136,9 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                 cu.clear();
                 cu.push_back(0);
                 for (int b = 0; b < B; ++b) {
-                    const int row_base = b * T;
+                    const int row_base = b * T_step;
                     int doc_start = row_base;
-                    for (int t = 1; t < T; ++t) {
+                    for (int t = 1; t < T_step; ++t) {
                         const int idx = row_base + t;
                         if (pos[idx] - pos[idx - 1] != 1) {
                             const int doc_len = idx - doc_start;
@@ -932,10 +1147,10 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                             has_doc_boundaries = true;
                         }
                     }
-                    const int last_len = (b + 1) * T - doc_start;
+                    const int last_len = (b + 1) * T_step - doc_start;
                     if (last_len > 0) cu.push_back(cu.back() + last_len);
                 }
-                per_ms_total_q[j] = static_cast<int>(B * T);
+                per_ms_total_q[j] = static_cast<int>(B * T_step);
                 current_max_num_docs = std::max(current_max_num_docs, std::max(0, static_cast<int>(cu.size()) - 1));
             }
         }
@@ -971,6 +1186,145 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
             const std::size_t pos_bytes_per_plane = stride * sizeof(std::int32_t);
             const std::size_t pos_total_bytes =
                 (pos_planes > 1 ? static_cast<std::size_t>(pos_planes) : 1) * pos_bytes_per_plane;
+            if (seq_chunks > 1) {
+                // ----------------------------------------------------------
+                // Chunked-sequence schedule (KV-checkpointed chunks).
+                // Phase A walks chunks left-to-right filling the per-layer
+                // attention KV caches; phase B walks right-to-left,
+                // re-forwarding each chunk against the frozen KV prefix and
+                // running its backward with exact dK/dV accumulation.
+                // Effective micro indices count processed chunks, so grad
+                // zero/accumulate, LoRA bookkeeping and loss reduction key
+                // off them exactly as plain grad accumulation would.
+                // ----------------------------------------------------------
+                if (B != 1) {
+                    throw std::runtime_error("chunked-sequence training requires per-device batch size 1");
+                }
+                int accum_eff = 0;
+                for (int j = 0; j < micro_steps; ++j) accum_eff += chunk_count_per_micro[static_cast<std::size_t>(j)];
+                int micro_base = 0;
+                const std::size_t chunk_bytes_off = static_cast<std::size_t>(T) * sizeof(std::int32_t);
+                auto chunk_view = [&](Tensor& full, int c) {
+                    Tensor v = full;
+                    v.Sizes[v.Rank - 1] = T;
+                    v.Data = static_cast<std::byte*>(full.Data) + static_cast<std::size_t>(c) * chunk_bytes_off;
+                    return v;
+                };
+                // Position ids may carry mRoPE planes ([planes, B, T_step]);
+                // a chunk slice is then non-contiguous — stage it through a
+                // small pinned scratch (planes x B x T).
+                auto pos_chunk_view = [&](Tensor& full, int c) -> Tensor {
+                    if (pos_planes <= 1) return chunk_view(full, c);
+                    if (!gs.chunk_pos_scratch.Data) {
+                        auto name = fmt::format("chunk_pos_scratch_rank{}", ctx.Communicator->local_rank());
+                        gs.chunk_pos_scratch = rs.Allocator->allocate(
+                            ETensorDType::INT32, name.c_str(), EAllocationType::PINNED, {pos_planes, B, T});
+                    }
+                    auto* dst = gs.chunk_pos_scratch.get<std::int32_t>();
+                    const auto* src = reinterpret_cast<const std::int32_t*>(full.Data);
+                    for (int pl = 0; pl < pos_planes; ++pl) {
+                        std::memcpy(dst + static_cast<std::size_t>(pl) * T,
+                                    src + static_cast<std::size_t>(pl) * T_step + static_cast<std::size_t>(c) * T,
+                                    static_cast<std::size_t>(T) * sizeof(std::int32_t));
+                    }
+                    return gs.chunk_pos_scratch;
+                };
+                const bool chunk_trace = std::getenv("SUROGATE_CHUNK_TRACE") != nullptr;
+                // Per-chunk document geometry from position ids: packed rows
+                // restart positions at each document, so a chunk's segments
+                // and its contiguous KV window fall out of one linear scan.
+                // Unpacked rows (absolute positions) reduce to one segment
+                // with win_start 0 — the same code path covers both.
+                auto build_chunk_pack = [&](const std::int32_t* pos_row, int c) {
+                    IModel::ChunkPackMeta m;
+                    const int t0 = c * T;
+                    const int t1 = t0 + T;
+                    // Document starts are ROW-RELATIVE: position resets mark
+                    // boundaries, and the row start is always one — packers
+                    // split documents across rows, so a row can begin
+                    // mid-document with continued position values (the
+                    // partial head attends within the row only, matching the
+                    // dense doc-masking semantics).
+                    int win_start = 0;  // last doc start <= t0
+                    for (int t = 1; t <= t0; ++t) {
+                        if (pos_row[t] != pos_row[t - 1] + 1) win_start = t;
+                    }
+                    m.win_start = win_start;
+                    m.cu_q = {0};
+                    m.cu_k = {0};
+                    int seg_start = t0;
+                    int doc_start = win_start;
+                    auto close_seg = [&](int seg_end) {
+                        const int q_len = seg_end - seg_start;
+                        const int k_len = seg_end - doc_start;
+                        m.cu_q.push_back(m.cu_q.back() + q_len);
+                        m.cu_k.push_back(m.cu_k.back() + k_len);
+                        m.max_q = std::max(m.max_q, q_len);
+                        m.max_k = std::max(m.max_k, k_len);
+                    };
+                    for (int t = t0 + 1; t < t1; ++t) {
+                        if (pos_row[t] != pos_row[t - 1] + 1) {
+                            close_seg(t);
+                            seg_start = t;
+                            doc_start = t;
+                        }
+                    }
+                    close_seg(t1);
+                    m.num_segs = static_cast<int>(m.cu_q.size()) - 1;
+                    m.kv_len = t1 - m.win_start;
+                    if (std::getenv("SUROGATE_CHUNK_TRACE") && ctx.Communicator->rank() == 0) {
+                        fprintf(stderr, "[pack] c=%d win=%d kv=%d segs=%d maxq=%d maxk=%d\n", c, m.win_start,
+                                m.kv_len, m.num_segs, m.max_q, m.max_k);
+                        fflush(stderr);
+                    }
+                    return m;
+                };
+                for (int j = 0; j < micro_steps; ++j) {
+                    const int eff_chunks = chunk_count_per_micro[static_cast<std::size_t>(j)];
+                    for (int c = 0; c < eff_chunks; ++c) {
+                        Tensor in_v = chunk_view(gs.inputs[j], c);
+                        Tensor pos_v = pos_chunk_view(gs.position_ids[j], c);
+                        Tensor tgt_v = chunk_view(gs.targets[j], c);
+                        auto pack =
+                            build_chunk_pack(reinterpret_cast<const std::int32_t*>(gs.position_ids[j].Data), c);
+                        pack.kv_sweep = true;  // loss ops skipped in the KV sweep
+                        ctx.Model->set_sequence_chunk(c, seq_chunks, &pack);
+                        // The loss op lives in the forward graph — stage the
+                        // chunk's real targets so phase A's loss terms are
+                        // sane (they are wiped by the micro-0 zeroing before
+                        // phase B accumulates the reported values).
+                        rs.Targets_CPU = tgt_v;
+                        if (chunk_trace && ctx.Communicator->rank() == 0) {
+                            fprintf(stderr, "[chunk] phaseA j=%d c=%d\n", j, c);
+                            fflush(stderr);
+                        }
+                        ctx.Model->forward(in_v, pos_v, *ctx.Communicator, micro_base + c);
+                        ::surogate::tick_watchdog_heartbeat();
+                    }
+                    ctx.Model->zero_sequence_chunk_dkv();
+                    for (int c = eff_chunks - 1; c >= 0; --c) {
+                        Tensor in_v = chunk_view(gs.inputs[j], c);
+                        Tensor pos_v = pos_chunk_view(gs.position_ids[j], c);
+                        Tensor tgt_v = chunk_view(gs.targets[j], c);
+                        const int micro_eff = micro_base + (eff_chunks - 1 - c);
+                        auto pack =
+                            build_chunk_pack(reinterpret_cast<const std::int32_t*>(gs.position_ids[j].Data), c);
+                        pack.reuse_ep = true;  // phase A cached this chunk's plan+splits
+                        ctx.Model->set_sequence_chunk(c, seq_chunks, &pack);
+                        rs.Targets_CPU = tgt_v;
+                        if (chunk_trace && ctx.Communicator->rank() == 0) {
+                            fprintf(stderr, "[chunk] phaseB j=%d c=%d micro_eff=%d\n", j, c, micro_eff);
+                            fflush(stderr);
+                        }
+                        ctx.Model->forward(in_v, pos_v, *ctx.Communicator, micro_eff);
+                        ::surogate::tick_watchdog_heartbeat();
+                        ctx.Model->backward(in_v, tgt_v, *ctx.Communicator, accum_eff, micro_eff);
+                        ::surogate::tick_watchdog_heartbeat();
+                    }
+                    ctx.Model->set_sequence_chunk(-1, 0);
+                    micro_base += eff_chunks;
+                }
+            } else
             for (int j = 0; j < micro_steps; ++j) {
                 if (stage_through_zero && j > 0) {
                     std::memcpy(gs.inputs[0].Data, gs.inputs[j].Data, stride * sizeof(std::int32_t));
@@ -995,6 +1349,10 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
             return;
         }
 
+        if (seq_chunks > 1) {
+            throw std::runtime_error(
+                "chunked-sequence training requires use_cuda_graphs: false (eager full-step path)");
+        }
         auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
         if (!dsl_model) {
             throw std::runtime_error("train_step_graphed: only supported for DSL models");
@@ -1544,7 +1902,7 @@ void MultiGPUPyTrainer::run_work(std::function<void(sThreadContext& ctx)> work, 
     }
 
     auto last_progress = std::chrono::steady_clock::now();
-    std::size_t last_done = mWorkDone.load();
+    std::size_t last_done = mWorkDone.load() + ::surogate::watchdog_heartbeat();
     while (mWorkDone.load() < mContexts.size()) {
         if (mThreads->has_exception()) {
             stop();
@@ -1566,7 +1924,7 @@ void MultiGPUPyTrainer::run_work(std::function<void(sThreadContext& ctx)> work, 
         // under heavy multi-threaded CUDA load and waits forever on an already-met
         // condition. A no-op signal forces EINTR + recheck. 45s is far above any
         // legitimate op; poking a healthy worker is harmless.
-        const std::size_t done_now = mWorkDone.load();
+        const std::size_t done_now = mWorkDone.load() + ::surogate::watchdog_heartbeat();
         if (done_now != last_done) {
             last_done = done_now;
             last_progress = std::chrono::steady_clock::now();

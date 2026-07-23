@@ -106,8 +106,13 @@ void DslModel::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& com
         throw std::logic_error("DslModel::forward called before allocate_run_state()");
     }
 
+    // Chunked-sequence mode carries per-document geometry in the chunk
+    // metadata (per-chunk cu_seqlens on the kvprefix path) — the dense
+    // doc-masking context must stay clear.
     mDocMaskingActive =
-        causal_lm_profile().apply_doc_masking(*mExecutor, mOptions, mModelConfig, inputs, position_ids, micro_step);
+        mSequenceChunkActive
+            ? false
+            : causal_lm_profile().apply_doc_masking(*mExecutor, mOptions, mModelConfig, inputs, position_ids, micro_step);
 
     if (!lora_enabled()) {
         auto request = causal_lm_profile()
@@ -130,13 +135,65 @@ void DslModel::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& com
     mExecutor->execute_forward(request, comm);
 }
 
+void DslModel::set_sequence_chunk(int idx, int count, const ChunkPackMeta* pack) {
+    if (!mExecutor) {
+        throw std::logic_error("DslModel::set_sequence_chunk called before allocate_run_state()");
+    }
+    mSequenceChunkActive = (idx >= 0 && count > 1);
+    mExecutor->set_sequence_chunk(idx, count, pack);
+}
+
+void DslModel::zero_sequence_chunk_dkv() {
+    if (!mExecutor) {
+        throw std::logic_error("DslModel::zero_sequence_chunk_dkv called before allocate_run_state()");
+    }
+    mExecutor->zero_sequence_chunk_dkv();
+}
+
+void DslModel::forward_no_save(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm, int micro_step) {
+    if (!mExecutor) {
+        throw std::logic_error("DslModel::forward_no_save called before allocate_run_state()");
+    }
+
+    // Chunked-sequence mode carries per-document geometry in the chunk
+    // metadata (per-chunk cu_seqlens on the kvprefix path) — the dense
+    // doc-masking context must stay clear.
+    mDocMaskingActive =
+        mSequenceChunkActive
+            ? false
+            : causal_lm_profile().apply_doc_masking(*mExecutor, mOptions, mModelConfig, inputs, position_ids, micro_step);
+
+    if (lora_enabled()) {
+        ensure_lora_run_state(comm, (int)inputs.Sizes[0], (int)inputs.Sizes[1]);
+        if (qlora_enabled() && micro_step == 0 && mQLoRAProvider) {
+            mQLoRAProvider->invalidate_cache();
+        }
+        mLoRARunState->micro_step = micro_step;
+        mLoRARunState->is_training = true;
+    }
+
+    auto request =
+        causal_lm_profile().make_forward_request(*mRunState, mModelConfig, mOptions, inputs, position_ids, micro_step);
+    // KV sweep of the chunked schedule: this forward exists only to fill the
+    // attention KV caches (the loss op lives in backward). Saved tensors are
+    // written normally — every chunk shares the same saved-cache keys, so
+    // this costs bandwidth, not memory, and disabling saves would diverge
+    // from the compiled buffer plan's persistence layout (EP tensors).
+    mExecutor->execute_forward(request, comm);
+}
+
 float DslModel::validate(Tensor inputs, Tensor position_ids, Tensor targets, NCCLCommunicator& comm, int micro_step) {
     if (!mExecutor) {
         throw std::logic_error("DslModel::validate called before allocate_run_state()");
     }
 
+    // Chunked-sequence mode carries per-document geometry in the chunk
+    // metadata (per-chunk cu_seqlens on the kvprefix path) — the dense
+    // doc-masking context must stay clear.
     mDocMaskingActive =
-        causal_lm_profile().apply_doc_masking(*mExecutor, mOptions, mModelConfig, inputs, position_ids, micro_step);
+        mSequenceChunkActive
+            ? false
+            : causal_lm_profile().apply_doc_masking(*mExecutor, mOptions, mModelConfig, inputs, position_ids, micro_step);
 
     if (!lora_enabled()) {
         auto request =
@@ -714,8 +771,13 @@ std::vector<float> DslModel::forward_for_grpo(Tensor inputs,
     const int B_val = static_cast<int>(inputs.Sizes[0]);
     const int T_val = static_cast<int>(inputs.Sizes[1]);
     const std::size_t BT = static_cast<std::size_t>(B_val) * static_cast<std::size_t>(T_val);
+    // Chunked-sequence mode carries per-document geometry in the chunk
+    // metadata (per-chunk cu_seqlens on the kvprefix path) — the dense
+    // doc-masking context must stay clear.
     mDocMaskingActive =
-        causal_lm_profile().apply_doc_masking(*mExecutor, mOptions, mModelConfig, inputs, position_ids, micro_step);
+        mSequenceChunkActive
+            ? false
+            : causal_lm_profile().apply_doc_masking(*mExecutor, mOptions, mModelConfig, inputs, position_ids, micro_step);
 
     auto& rs = *mRunState;
     cudaStream_t main_stream = rs.MainStream;
@@ -1082,8 +1144,13 @@ void DslModel::step_with_kd(Tensor inputs,
     CUDA_CHECK(cudaEventRecord(kd.copy_done[staging_slot], main_stream));
     kd.copy_recorded[staging_slot] = true;
 
+    // Chunked-sequence mode carries per-document geometry in the chunk
+    // metadata (per-chunk cu_seqlens on the kvprefix path) — the dense
+    // doc-masking context must stay clear.
     mDocMaskingActive =
-        causal_lm_profile().apply_doc_masking(*mExecutor, mOptions, mModelConfig, inputs, position_ids, micro_step);
+        mSequenceChunkActive
+            ? false
+            : causal_lm_profile().apply_doc_masking(*mExecutor, mOptions, mModelConfig, inputs, position_ids, micro_step);
 
     if (lora_enabled()) {
         ensure_lora_run_state(comm, B_val, T_val);

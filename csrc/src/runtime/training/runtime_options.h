@@ -95,6 +95,12 @@ struct RuntimeOptions {
     // prefetch foreign expert weights one layer ahead. 1 = recompute every step.
     int EPPlanRefreshInterval = 16;
 
+    // Chunked-sequence training (KV-checkpointed chunks): the sequence is
+    // processed as N chunks of the graph's T tokens with attention KV carried
+    // across chunks; backward runs chunks in reverse with exact dK/dV
+    // accumulation. 1 = off. Requires B=1, BF16 attention, no sample packing.
+    int SequenceChunks = 1;
+
     // MoE loss coefficients (override model config when >= 0)
     float RouterAuxLossCoef = -1.0f;  ///< Load balancing auxiliary loss coefficient (-1 = use model config)
     float RouterZLossCoef = -1.0f;    ///< Router z-loss (logit regularization) coefficient (-1 = use model config)

@@ -34,6 +34,7 @@
 #include "runtime/qlora/qlora_config.h"
 #include "runtime/qlora/dsl_qlora_pipeline.h"
 #include "utilities/dtype.h"
+#include "tokenizer/tok_profile.h"
 #include "tokenizer/tokenizer.h"
 #include "runtime/attention/mem_eff/mem_eff_dispatch.h"
 
@@ -584,6 +585,9 @@ NB_MODULE(_surogate, m) {
         .def_rw("ep_plan_refresh_interval",
                 &RuntimeOptions::EPPlanRefreshInterval,
                 "LLEP sticky plans: recompute the LPT plan every N forward dispatches per layer (default 16, 1 = every step).")
+        .def_rw("sequence_chunks",
+                &RuntimeOptions::SequenceChunks,
+                "Chunked-sequence training: process the sequence as N KV-checkpointed chunks (1 = off).")
         .def_prop_rw(
             "matmul_type",
             [](const RuntimeOptions* opt) { return opt->matmul_dtype(); },
@@ -1355,8 +1359,8 @@ NB_MODULE(_surogate, m) {
             "step",
             [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets) {
                 // Use local_world_size (GPUs on this node) not global world_size
-                CHECK_SHAPE(inputs, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
-                CHECK_SHAPE(targets, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
+                CHECK_SHAPE(inputs, trainer->batch_size() * trainer->local_world_size(), trainer->step_seq_length());
+                CHECK_SHAPE(targets, trainer->batch_size() * trainer->local_world_size(), trainer->step_seq_length());
 
                 trainer->step(inputs.data(), targets.data());
             },
@@ -1371,9 +1375,9 @@ NB_MODULE(_surogate, m) {
             "step",
             [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets, TokenArray position_ids) {
                 // Use local_world_size (GPUs on this node) not global world_size
-                CHECK_SHAPE(inputs, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
-                CHECK_SHAPE(targets, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
-                CHECK_SHAPE(position_ids, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
+                CHECK_SHAPE(inputs, trainer->batch_size() * trainer->local_world_size(), trainer->step_seq_length());
+                CHECK_SHAPE(targets, trainer->batch_size() * trainer->local_world_size(), trainer->step_seq_length());
+                CHECK_SHAPE(position_ids, trainer->batch_size() * trainer->local_world_size(), trainer->step_seq_length());
 
                 trainer->step(inputs.data(), targets.data(), position_ids.data());
             },
@@ -1617,8 +1621,8 @@ NB_MODULE(_surogate, m) {
             "validate",
             [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets) {
                 // Use local_world_size (GPUs on this node) not global world_size
-                CHECK_SHAPE(inputs, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
-                CHECK_SHAPE(targets, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
+                CHECK_SHAPE(inputs, trainer->batch_size() * trainer->local_world_size(), trainer->step_seq_length());
+                CHECK_SHAPE(targets, trainer->batch_size() * trainer->local_world_size(), trainer->step_seq_length());
 
                 return trainer->validate(inputs.data(), targets.data());
             },
@@ -1633,9 +1637,9 @@ NB_MODULE(_surogate, m) {
             "validate",
             [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets, TokenArray position_ids) {
                 // Use local_world_size (GPUs on this node) not global world_size
-                CHECK_SHAPE(inputs, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
-                CHECK_SHAPE(targets, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
-                CHECK_SHAPE(position_ids, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
+                CHECK_SHAPE(inputs, trainer->batch_size() * trainer->local_world_size(), trainer->step_seq_length());
+                CHECK_SHAPE(targets, trainer->batch_size() * trainer->local_world_size(), trainer->step_seq_length());
+                CHECK_SHAPE(position_ids, trainer->batch_size() * trainer->local_world_size(), trainer->step_seq_length());
 
                 return trainer->validate(inputs.data(), targets.data(), position_ids.data());
             },
@@ -1724,8 +1728,8 @@ NB_MODULE(_surogate, m) {
                const optimizers::OptimizerConfig& config,
                int step) {
                 const int rows = trainer->batch_size() * trainer->local_world_size() * trainer->grad_accumulation();
-                CHECK_SHAPE(inputs, rows, trainer->seq_length());
-                CHECK_SHAPE(targets, rows, trainer->seq_length());
+                CHECK_SHAPE(inputs, rows, trainer->step_seq_length());
+                CHECK_SHAPE(targets, rows, trainer->step_seq_length());
 
                 auto [loss, norm] = trainer->train_step_graphed(inputs.data(), targets.data(), nullptr, config, step);
                 nb::dict ret;
@@ -1753,9 +1757,9 @@ NB_MODULE(_surogate, m) {
                const optimizers::OptimizerConfig& config,
                int step) {
                 const int rows = trainer->batch_size() * trainer->local_world_size() * trainer->grad_accumulation();
-                CHECK_SHAPE(inputs, rows, trainer->seq_length());
-                CHECK_SHAPE(targets, rows, trainer->seq_length());
-                CHECK_SHAPE(position_ids, rows, trainer->seq_length());
+                CHECK_SHAPE(inputs, rows, trainer->step_seq_length());
+                CHECK_SHAPE(targets, rows, trainer->step_seq_length());
+                CHECK_SHAPE(position_ids, rows, trainer->step_seq_length());
 
                 auto [loss, norm] =
                     trainer->train_step_graphed(inputs.data(), targets.data(), position_ids.data(), config, step);
@@ -3341,6 +3345,16 @@ NB_MODULE(_surogate, m) {
                     "The directory must contain tokenizer.json. Optionally reads\n"
                     "tokenizer_config.json for BOS/EOS/PAD token metadata.\n\n"
                     "Parameters:\n- model_dir: Path to model directory.")
+        .def_static(
+            "profile_report",
+            [](bool reset) { return tokenizer::tok_profile_report(reset); },
+            nb::arg("reset") = false,
+            "Return the encode_for_training phase breakdown (render vs pretokenize\n"
+            "vs BPE merge) accumulated since load/last reset. Empty string unless\n"
+            "SUROGATE_TOK_PROFILE=1 and at least one training encode ran. If reset\n"
+            "is True, the counters are zeroed after reading.")
+        .def_static(
+            "profile_reset", [] { tokenizer::tok_profile_report(true); }, "Zero the encode_for_training profile counters.")
         .def("encode",
              &tokenizer::Tokenizer::encode,
              nb::arg("text"),
