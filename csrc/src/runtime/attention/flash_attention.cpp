@@ -253,6 +253,69 @@ void dump_flash_arg_line(const char* phase,
 
 }  // namespace
 
+CompiledExecutor::ChunkAttnState& CompiledExecutor::chunk_attn_state(int layer_idx, int Hkv, int Hs) {
+    auto& st = mChunkAttn[layer_idx];
+    const std::size_t need = static_cast<std::size_t>(mChunkCount) * mT * Hkv * Hs;
+    if (st.kv_elems < need) {
+        if (st.k) cudaFree(st.k);
+        if (st.v) cudaFree(st.v);
+        if (st.dk) cudaFree(st.dk);
+        if (st.dv) cudaFree(st.dv);
+        CUDA_CHECK(cudaMalloc(&st.k, need * sizeof(nv_bfloat16)));
+        CUDA_CHECK(cudaMalloc(&st.v, need * sizeof(nv_bfloat16)));
+        CUDA_CHECK(cudaMalloc(&st.dk, need * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&st.dv, need * sizeof(float)));
+        CUDA_CHECK(cudaMemset(st.dk, 0, need * sizeof(float)));
+        CUDA_CHECK(cudaMemset(st.dv, 0, need * sizeof(float)));
+        st.kv_elems = need;
+    }
+    return st;
+}
+
+void CompiledExecutor::set_sequence_chunk(int idx, int count) {
+    mChunkIdx = idx;
+    mChunkCount = count;
+    if (idx < 0 || count <= 1) return;
+    if (!mChunkCuDev) {
+        CUDA_CHECK(cudaMalloc(&mChunkCuDev, 4 * sizeof(std::int32_t)));
+        CUDA_CHECK(cudaMallocHost(&mChunkCuPinned, 4 * sizeof(std::int32_t)));
+    }
+    // cu_q = [0, T]; cu_k = [0, (idx+1) * T]
+    mChunkCuPinned[0] = 0;
+    mChunkCuPinned[1] = static_cast<std::int32_t>(mT);
+    mChunkCuPinned[2] = 0;
+    mChunkCuPinned[3] = static_cast<std::int32_t>((idx + 1) * mT);
+    CUDA_CHECK(cudaMemcpyAsync(
+        mChunkCuDev, mChunkCuPinned, 4 * sizeof(std::int32_t), cudaMemcpyHostToDevice, mRunState.MainStream));
+}
+
+void CompiledExecutor::zero_sequence_chunk_dkv() {
+    for (auto& [layer, st] : mChunkAttn) {
+        if (st.dk) CUDA_CHECK(cudaMemsetAsync(st.dk, 0, st.kv_elems * sizeof(float), mRunState.MainStream));
+        if (st.dv) CUDA_CHECK(cudaMemsetAsync(st.dv, 0, st.kv_elems * sizeof(float), mRunState.MainStream));
+    }
+}
+
+void CompiledExecutor::free_sequence_chunk_state() {
+    for (auto& [layer, st] : mChunkAttn) {
+        if (st.k) cudaFree(st.k);
+        if (st.v) cudaFree(st.v);
+        if (st.dk) cudaFree(st.dk);
+        if (st.dv) cudaFree(st.dv);
+    }
+    mChunkAttn.clear();
+    if (mChunkCuDev) {
+        cudaFree(mChunkCuDev);
+        mChunkCuDev = nullptr;
+    }
+    if (mChunkCuPinned) {
+        cudaFreeHost(mChunkCuPinned);
+        mChunkCuPinned = nullptr;
+    }
+    mChunkIdx = -1;
+    mChunkCount = 0;
+}
+
 void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
     Tensor& qkv = resolve_tensor(op.inputs[0]);
     Tensor* sinks = nullptr;
@@ -324,6 +387,16 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
     params.run_state = &mRunState;
     params.temps = &mTemps;
     params.sm_version = mRunState.DeviceProp.major * 10 + mRunState.DeviceProp.minor;
+
+    if (sequence_chunk_active()) {
+        auto& cst = chunk_attn_state(layer_idx, Hkv, Hs);
+        params.chunk_pos = mChunkIdx * static_cast<int>(mT);
+        params.chunk_kv_len = (mChunkIdx + 1) * static_cast<int>(mT);
+        params.chunk_k_cache = cst.k;
+        params.chunk_v_cache = cst.v;
+        params.chunk_cu_q = mChunkCuDev;
+        params.chunk_cu_k = mChunkCuDev + 2;
+    }
 
     AttentionBackend& backend = AttentionBackendRegistry::instance().select(params);
     if (should_dump_flash_args()) {
@@ -451,6 +524,18 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
                                (mCuSeqlensGpu != nullptr && window_size > 0);
     params.attn_bwd_chunks = mOptions.AttBwdChunks;
     params.sm_version = mRunState.DeviceProp.major * 10 + mRunState.DeviceProp.minor;
+
+    if (sequence_chunk_active()) {
+        auto& cst = chunk_attn_state(layer_idx, Hkv, Hs);
+        params.chunk_pos = mChunkIdx * static_cast<int>(mT);
+        params.chunk_kv_len = (mChunkIdx + 1) * static_cast<int>(mT);
+        params.chunk_k_cache = cst.k;
+        params.chunk_v_cache = cst.v;
+        params.chunk_dk_accum = cst.dk;
+        params.chunk_dv_accum = cst.dv;
+        params.chunk_cu_q = mChunkCuDev;
+        params.chunk_cu_k = mChunkCuDev + 2;
+    }
 
     AttentionBackend& backend = AttentionBackendRegistry::instance().select(params);
     if (should_dump_flash_args()) {

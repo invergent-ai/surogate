@@ -751,6 +751,16 @@ void CompiledExecutor::dispatch_fused_lm_head_loss_compact(const CompiledOp& op)
     CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
     mLmheadCompactNValid = n_valid;
 
+    if (std::getenv("SUROGATE_CHUNK_TRACE")) {
+        float loss_sum = 0.0f;
+        int vtc = 0;
+        std::vector<float> lbuf(static_cast<std::size_t>(BT));
+        CUDA_CHECK(cudaMemcpy(lbuf.data(), mRunState.Losses.Data, BT * sizeof(float), cudaMemcpyDeviceToHost));
+        for (float v : lbuf) loss_sum += v;
+        CUDA_CHECK(cudaMemcpy(&vtc, mRunState.ValidTokenCount.Data, sizeof(int), cudaMemcpyDeviceToHost));
+        fprintf(stderr, "[lmhead] n_valid=%d loss_sum_pre=%f vtc_pre=%d BT=%ld\n", n_valid, loss_sum, vtc, (long)BT);
+        fflush(stderr);
+    }
     if (n_valid == 0) {
         // Whole micro-batch masked. No work; loss[BT] keeps its accumulated value.
         if (need_lm_head) {

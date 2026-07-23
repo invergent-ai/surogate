@@ -21,6 +21,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include "runtime/dsl/forward_plan.h"
@@ -167,6 +168,23 @@ public:
         mMaxDocSeqlen = 0;
         mTotalDocTokens = 0;
     }
+
+    // ------------------------------------------------------------------
+    // Chunked-sequence training (KV-checkpointed chunks). When active,
+    // dispatch_flash_attention(+backward) routes to the kvprefix backend
+    // with executor-owned per-layer KV caches and FP32 dKV accumulators.
+    // ------------------------------------------------------------------
+    /// Activate chunk `idx` of `count` (idx = -1 deactivates). The graph's
+    /// T is the chunk size; the caches cover count * T rows.
+    void set_sequence_chunk(int idx, int count);
+    bool sequence_chunk_active() const {
+        return mChunkCount > 1 && mChunkIdx >= 0;
+    }
+    /// Zero all layers' dKV accumulators — call once before each reverse
+    /// backward sweep.
+    void zero_sequence_chunk_dkv();
+    /// Free all chunked-sequence state (KV caches, accumulators, scratch).
+    void free_sequence_chunk_state();
 
     void set_recompute_fn(std::function<void(int, long, long, bool)> fn);
     void set_recompute_enabled(bool enabled);
@@ -795,6 +813,20 @@ private:
     const std::vector<std::string>* mSkippedBackwardTensors = nullptr;
 
     // Document masking context for Flash Attention varlen (null = disabled)
+    struct ChunkAttnState {
+        nv_bfloat16* k = nullptr;
+        nv_bfloat16* v = nullptr;
+        float* dk = nullptr;
+        float* dv = nullptr;
+        std::size_t kv_elems = 0;
+    };
+    std::unordered_map<int, ChunkAttnState> mChunkAttn;  ///< by layer_idx
+    int mChunkIdx = -1;
+    int mChunkCount = 0;
+    std::int32_t* mChunkCuDev = nullptr;   ///< device [4]: cu_q(2), cu_k(2)
+    std::int32_t* mChunkCuPinned = nullptr;
+    ChunkAttnState& chunk_attn_state(int layer_idx, int Hkv, int Hs);
+
     const std::int32_t* mCuSeqlensGpu = nullptr;
     const std::int32_t* mCuSeqlensCpu = nullptr;
     int mNumDocs = 0;

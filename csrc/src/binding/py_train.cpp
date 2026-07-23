@@ -537,6 +537,10 @@ void MultiGPUPyTrainer::save_checkpoint(std::string directory, int step) {
 void MultiGPUPyTrainer::step(const std::int32_t* inputs,
                              const std::int32_t* targets,
                              const std::int32_t* position_ids) {
+    if (mOptions.SequenceChunks > 1) {
+        step_chunked(inputs, targets, position_ids, mOptions.SequenceChunks);
+        return;
+    }
     const int ep_size = std::max(1, mOptions.EPSize);
     for (int i = 0; i < mContexts.size(); ++i) {
         auto& ctx = mContexts.at(i);
@@ -591,6 +595,109 @@ void MultiGPUPyTrainer::step(const std::int32_t* inputs,
         }
         if (do_timing) CUDA_CHECK(cudaEventRecord(rs.TimingBackwardEnd[micro_idx], rs.MainStream));
     });
+    ++mTrainMicroStep;
+}
+
+namespace {
+
+/// Slice one chunk out of [rows, B, N*T] host arrays into the per-model
+/// input/target/position buffers. Position ids get the chunk's global offset
+/// so RoPE sees absolute positions.
+void copy_chunk_inputs_for_ctx(IModel& model,
+                               const std::int32_t* inputs,
+                               const std::int32_t* targets,
+                               const std::int32_t* position_ids,
+                               int src_row,
+                               int B,
+                               int T,
+                               long T_full,
+                               long base_pos) {
+    auto* ib = model.get_input_buffer().get<std::int32_t>();
+    auto* tb = model.get_target_buffer().get<std::int32_t>();
+    Tensor pos_buf = model.get_position_ids_buffer();
+    auto* pb = pos_buf.get<std::int32_t>();
+    const int pos_planes = (pos_buf.Rank == 3) ? static_cast<int>(pos_buf.Sizes[0]) : 1;
+
+    for (int b = 0; b < B; ++b) {
+        const long src_off = (static_cast<long>(src_row) * B + b) * T_full + base_pos;
+        std::memcpy(ib + static_cast<long>(b) * T, inputs + src_off, T * sizeof(std::int32_t));
+        std::memcpy(tb + static_cast<long>(b) * T, targets + src_off, T * sizeof(std::int32_t));
+    }
+    for (int p = 0; p < pos_planes; ++p) {
+        for (int b = 0; b < B; ++b) {
+            std::int32_t* dst = pb + (static_cast<long>(p) * B + b) * T;
+            if (position_ids) {
+                const long src_off = (static_cast<long>(src_row) * B + b) * T_full + base_pos;
+                std::memcpy(dst, position_ids + src_off, T * sizeof(std::int32_t));
+            } else {
+                for (int t = 0; t < T; ++t) {
+                    dst[t] = static_cast<std::int32_t>(base_pos + t);
+                }
+            }
+        }
+    }
+}
+
+}  // namespace
+
+void MultiGPUPyTrainer::step_chunked(const std::int32_t* inputs,
+                                     const std::int32_t* targets,
+                                     const std::int32_t* position_ids,
+                                     int seq_chunks) {
+    if (mTrainMicroStep >= mGradAccumulation) {
+        throw std::runtime_error(
+            fmt::format("step_chunked: micro_step {} >= grad_accumulation {}", mTrainMicroStep, mGradAccumulation));
+    }
+    const int ep_size = std::max(1, mOptions.EPSize);
+    const long T_full = static_cast<long>(T) * seq_chunks;
+    const int accum_eff = mGradAccumulation * seq_chunks;
+
+    auto copy_chunk = [&](int c) {
+        const long base_pos = static_cast<long>(c) * T;
+        for (int i = 0; i < static_cast<int>(mContexts.size()); ++i) {
+            auto& ctx = mContexts.at(i);
+            if (!ctx.Model) {
+                throw std::runtime_error(fmt::format("step_chunked: ctx[{}].Model is null", i));
+            }
+            const int src_row = host_batch_row_for_local_rank(i, ep_size);
+            copy_chunk_inputs_for_ctx(*ctx.Model, inputs, targets, position_ids, src_row, B, T, T_full, base_pos);
+        }
+    };
+
+    // Phase A — KV sweep: forward chunks left-to-right filling the per-layer
+    // attention KV caches. Saved-tensor persistence is skipped; the loss op
+    // lives in backward, so this pass pays layers only.
+    for (int c = 0; c < seq_chunks; ++c) {
+        copy_chunk(c);
+        const int micro_eff = mTrainMicroStep * seq_chunks + c;
+        run_work([c, seq_chunks, micro_eff](sThreadContext& ctx) {
+            ctx.Model->set_sequence_chunk(c, seq_chunks);
+            Tensor in = ctx.Model->get_input_buffer();
+            Tensor pos = ctx.Model->get_position_ids_buffer();
+            ctx.Model->forward_no_save(in, pos, *ctx.Communicator, micro_eff);
+        });
+    }
+
+    // Phase B — reverse re-forward + backward. Each chunk re-forwards against
+    // the frozen KV prefix (regenerating its saved tensors), then runs its
+    // backward; dK/dV accumulate across chunks in the executor's FP32
+    // accumulators, completed exactly because chunks run last-to-first.
+    // Grad zero/accumulate, LoRA micro bookkeeping and loss reduction all key
+    // off the effective micro index, which counts processed chunks.
+    run_work([](sThreadContext& ctx) { ctx.Model->zero_sequence_chunk_dkv(); });
+    for (int c = seq_chunks - 1; c >= 0; --c) {
+        copy_chunk(c);
+        const int micro_eff = mTrainMicroStep * seq_chunks + (seq_chunks - 1 - c);
+        run_work([c, seq_chunks, micro_eff, accum_eff](sThreadContext& ctx) {
+            ctx.Model->set_sequence_chunk(c, seq_chunks);
+            Tensor in = ctx.Model->get_input_buffer();
+            Tensor pos = ctx.Model->get_position_ids_buffer();
+            Tensor tgt = ctx.Model->get_target_buffer();
+            ctx.Model->forward(in, pos, *ctx.Communicator, micro_eff);
+            ctx.Model->backward(in, tgt, *ctx.Communicator, accum_eff, micro_eff);
+        });
+    }
+    run_work([](sThreadContext& ctx) { ctx.Model->set_sequence_chunk(-1, 0); });
     ++mTrainMicroStep;
 }
 
@@ -754,7 +861,11 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                                                               int step) {
     const int local_gpus = static_cast<int>(mContexts.size());
     const int micro_steps = mGradAccumulation;
-    const std::size_t stride = static_cast<std::size_t>(B) * static_cast<std::size_t>(T);
+    // Chunked-sequence training: step arrays and pinned staging carry the
+    // full sequence (T_step = T * seq_chunks); the graph runs chunk views.
+    const int seq_chunks = std::max(1, mOptions.SequenceChunks);
+    const int T_step = T * seq_chunks;
+    const std::size_t stride = static_cast<std::size_t>(B) * static_cast<std::size_t>(T_step);
     const int pos_planes = (mContexts.empty() || !mContexts.front().Model)
                                ? 1
                                : ((mContexts.front().Model->get_position_ids_buffer().Rank == 3)
@@ -773,14 +884,15 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
         auto& gs = *ctx.FullStepGraph;
 
         // Reset graph if shape or accumulation changed.
-        if (gs.captured && (gs.captured_B != B || gs.captured_T != T || gs.captured_grad_accum != micro_steps)) {
+        if (gs.captured && (gs.captured_B != B || gs.captured_T != T_step || gs.captured_grad_accum != micro_steps)) {
             gs.reset_capture();
         }
 
         // Allocate per-micro-step pinned buffers if needed.
         if (gs.inputs.size() != static_cast<size_t>(micro_steps) ||
             gs.targets.size() != static_cast<size_t>(micro_steps) ||
-            gs.position_ids.size() != static_cast<size_t>(micro_steps) || gs.captured_B != B || gs.captured_T != T) {
+            gs.position_ids.size() != static_cast<size_t>(micro_steps) || gs.captured_B != B ||
+            gs.captured_T != T_step) {
             gs.inputs.clear();
             gs.targets.clear();
             gs.position_ids.clear();
@@ -793,23 +905,23 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                 auto in_name = fmt::format("graph_inputs_cpu_ms{}_rank{}", j, rank);
                 auto tgt_name = fmt::format("graph_targets_cpu_ms{}_rank{}", j, rank);
                 auto pos_name = fmt::format("graph_pos_ids_cpu_ms{}_rank{}", j, rank);
-                gs.inputs.push_back(
-                    rs.Allocator->allocate(ETensorDType::INT32, in_name.c_str(), EAllocationType::PINNED, {B, T}));
-                gs.targets.push_back(
-                    rs.Allocator->allocate(ETensorDType::INT32, tgt_name.c_str(), EAllocationType::PINNED, {B, T}));
+                gs.inputs.push_back(rs.Allocator->allocate(
+                    ETensorDType::INT32, in_name.c_str(), EAllocationType::PINNED, {B, T_step}));
+                gs.targets.push_back(rs.Allocator->allocate(
+                    ETensorDType::INT32, tgt_name.c_str(), EAllocationType::PINNED, {B, T_step}));
                 if (pos_planes > 1) {
                     gs.position_ids.push_back(rs.Allocator->allocate(ETensorDType::INT32,
                                                                      pos_name.c_str(),
                                                                      EAllocationType::PINNED,
-                                                                     {pos_planes, B, T}));
+                                                                     {pos_planes, B, T_step}));
                 } else {
-                    gs.position_ids.push_back(
-                        rs.Allocator->allocate(ETensorDType::INT32, pos_name.c_str(), EAllocationType::PINNED, {B, T}));
+                    gs.position_ids.push_back(rs.Allocator->allocate(
+                        ETensorDType::INT32, pos_name.c_str(), EAllocationType::PINNED, {B, T_step}));
                 }
             }
 
             gs.captured_B = B;
-            gs.captured_T = T;
+            gs.captured_T = T_step;
             gs.captured_grad_accum = micro_steps;
         }
 
@@ -857,7 +969,7 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                 fill_sequential_position_ids(reinterpret_cast<std::int32_t*>(gs.position_ids[j].Data),
                                              pos_planes,
                                              B,
-                                             T);
+                                             T_step);
             }
         }
 
@@ -921,9 +1033,9 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                 cu.clear();
                 cu.push_back(0);
                 for (int b = 0; b < B; ++b) {
-                    const int row_base = b * T;
+                    const int row_base = b * T_step;
                     int doc_start = row_base;
-                    for (int t = 1; t < T; ++t) {
+                    for (int t = 1; t < T_step; ++t) {
                         const int idx = row_base + t;
                         if (pos[idx] - pos[idx - 1] != 1) {
                             const int doc_len = idx - doc_start;
@@ -932,10 +1044,10 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                             has_doc_boundaries = true;
                         }
                     }
-                    const int last_len = (b + 1) * T - doc_start;
+                    const int last_len = (b + 1) * T_step - doc_start;
                     if (last_len > 0) cu.push_back(cu.back() + last_len);
                 }
-                per_ms_total_q[j] = static_cast<int>(B * T);
+                per_ms_total_q[j] = static_cast<int>(B * T_step);
                 current_max_num_docs = std::max(current_max_num_docs, std::max(0, static_cast<int>(cu.size()) - 1));
             }
         }
@@ -971,6 +1083,64 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
             const std::size_t pos_bytes_per_plane = stride * sizeof(std::int32_t);
             const std::size_t pos_total_bytes =
                 (pos_planes > 1 ? static_cast<std::size_t>(pos_planes) : 1) * pos_bytes_per_plane;
+            if (seq_chunks > 1) {
+                // ----------------------------------------------------------
+                // Chunked-sequence schedule (KV-checkpointed chunks).
+                // Phase A walks chunks left-to-right filling the per-layer
+                // attention KV caches; phase B walks right-to-left,
+                // re-forwarding each chunk against the frozen KV prefix and
+                // running its backward with exact dK/dV accumulation.
+                // Effective micro indices count processed chunks, so grad
+                // zero/accumulate, LoRA bookkeeping and loss reduction key
+                // off them exactly as plain grad accumulation would.
+                // ----------------------------------------------------------
+                if (mOptions.DocMasking && has_doc_boundaries) {
+                    throw std::runtime_error("chunked-sequence training does not support packed doc masking yet");
+                }
+                if (pos_planes > 1) {
+                    throw std::runtime_error("chunked-sequence training does not support mRoPE position planes");
+                }
+                if (B != 1) {
+                    throw std::runtime_error("chunked-sequence training requires per-device batch size 1");
+                }
+                const int accum_eff = micro_steps * seq_chunks;
+                const std::size_t chunk_bytes_off = static_cast<std::size_t>(T) * sizeof(std::int32_t);
+                auto chunk_view = [&](Tensor& full, int c) {
+                    Tensor v = full;
+                    v.Sizes[v.Rank - 1] = T;
+                    v.Data = static_cast<std::byte*>(full.Data) + static_cast<std::size_t>(c) * chunk_bytes_off;
+                    return v;
+                };
+                const bool chunk_trace = std::getenv("SUROGATE_CHUNK_TRACE") != nullptr;
+                for (int j = 0; j < micro_steps; ++j) {
+                    for (int c = 0; c < seq_chunks; ++c) {
+                        Tensor in_v = chunk_view(gs.inputs[j], c);
+                        Tensor pos_v = chunk_view(gs.position_ids[j], c);
+                        ctx.Model->set_sequence_chunk(c, seq_chunks);
+                        if (chunk_trace && ctx.Communicator->rank() == 0) {
+                            fprintf(stderr, "[chunk] phaseA j=%d c=%d\n", j, c);
+                            fflush(stderr);
+                        }
+                        ctx.Model->forward(in_v, pos_v, *ctx.Communicator, j * seq_chunks + c);
+                    }
+                    ctx.Model->zero_sequence_chunk_dkv();
+                    for (int c = seq_chunks - 1; c >= 0; --c) {
+                        Tensor in_v = chunk_view(gs.inputs[j], c);
+                        Tensor pos_v = chunk_view(gs.position_ids[j], c);
+                        Tensor tgt_v = chunk_view(gs.targets[j], c);
+                        const int micro_eff = j * seq_chunks + (seq_chunks - 1 - c);
+                        ctx.Model->set_sequence_chunk(c, seq_chunks);
+                        rs.Targets_CPU = tgt_v;
+                        if (chunk_trace && ctx.Communicator->rank() == 0) {
+                            fprintf(stderr, "[chunk] phaseB j=%d c=%d micro_eff=%d\n", j, c, micro_eff);
+                            fflush(stderr);
+                        }
+                        ctx.Model->forward(in_v, pos_v, *ctx.Communicator, micro_eff);
+                        ctx.Model->backward(in_v, tgt_v, *ctx.Communicator, accum_eff, micro_eff);
+                    }
+                    ctx.Model->set_sequence_chunk(-1, 0);
+                }
+            } else
             for (int j = 0; j < micro_steps; ++j) {
                 if (stage_through_zero && j > 0) {
                     std::memcpy(gs.inputs[0].Data, gs.inputs[j].Data, stride * sizeof(std::int32_t));
@@ -995,6 +1165,10 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
             return;
         }
 
+        if (seq_chunks > 1) {
+            throw std::runtime_error(
+                "chunked-sequence training requires use_cuda_graphs: false (eager full-step path)");
+        }
         auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
         if (!dsl_model) {
             throw std::runtime_error("train_step_graphed: only supported for DSL models");

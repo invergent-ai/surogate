@@ -130,6 +130,47 @@ void DslModel::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& com
     mExecutor->execute_forward(request, comm);
 }
 
+void DslModel::set_sequence_chunk(int idx, int count) {
+    if (!mExecutor) {
+        throw std::logic_error("DslModel::set_sequence_chunk called before allocate_run_state()");
+    }
+    mExecutor->set_sequence_chunk(idx, count);
+}
+
+void DslModel::zero_sequence_chunk_dkv() {
+    if (!mExecutor) {
+        throw std::logic_error("DslModel::zero_sequence_chunk_dkv called before allocate_run_state()");
+    }
+    mExecutor->zero_sequence_chunk_dkv();
+}
+
+void DslModel::forward_no_save(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm, int micro_step) {
+    if (!mExecutor) {
+        throw std::logic_error("DslModel::forward_no_save called before allocate_run_state()");
+    }
+
+    mDocMaskingActive =
+        causal_lm_profile().apply_doc_masking(*mExecutor, mOptions, mModelConfig, inputs, position_ids, micro_step);
+
+    if (lora_enabled()) {
+        ensure_lora_run_state(comm, (int)inputs.Sizes[0], (int)inputs.Sizes[1]);
+        if (qlora_enabled() && micro_step == 0 && mQLoRAProvider) {
+            mQLoRAProvider->invalidate_cache();
+        }
+        mLoRARunState->micro_step = micro_step;
+        mLoRARunState->is_training = true;
+    }
+
+    auto request =
+        causal_lm_profile().make_forward_request(*mRunState, mModelConfig, mOptions, inputs, position_ids, micro_step);
+    // KV sweep of the chunked schedule: this forward exists only to fill the
+    // attention KV caches (the loss op lives in backward). Saved tensors are
+    // written normally — every chunk shares the same saved-cache keys, so
+    // this costs bandwidth, not memory, and disabling saves would diverge
+    // from the compiled buffer plan's persistence layout (EP tensors).
+    mExecutor->execute_forward(request, comm);
+}
+
 float DslModel::validate(Tensor inputs, Tensor position_ids, Tensor targets, NCCLCommunicator& comm, int micro_step) {
     if (!mExecutor) {
         throw std::logic_error("DslModel::validate called before allocate_run_state()");

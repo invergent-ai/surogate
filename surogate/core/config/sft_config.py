@@ -1,3 +1,5 @@
+import os
+
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -441,6 +443,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
     ep_size: int | None = 1  # 1 = no EP (all experts replicated on every GPU)
     ep_load_balance_threshold: float | None = 1.3  # LLEP: LPT activates when max/mean GPU load exceeds this
     ep_plan_refresh_interval: int | None = 16  # LLEP sticky plans: recompute LPT every N steps (1 = every step)
+    sequence_chunks: int | None = 1  # KV-checkpointed chunked training: process sequence_len as N chunks (1 = off)
 
     adapter_path: str | None = None  # PEFT adapter dir to merge into base weights before training
     merge_adapter: bool | None = False
@@ -587,6 +590,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         self.ep_size = cfg.get("ep_size", self.ep_size)
         self.ep_load_balance_threshold = float(cfg.get("ep_load_balance_threshold", self.ep_load_balance_threshold))
         self.ep_plan_refresh_interval = int(cfg.get("ep_plan_refresh_interval", self.ep_plan_refresh_interval))
+        self.sequence_chunks = int(cfg.get("sequence_chunks", self.sequence_chunks or 1))
 
         self.adapter_path = cfg.get("adapter_path", self.adapter_path)
         self.merge_adapter = cfg.get("merge_adapter", self.merge_adapter)
@@ -647,6 +651,11 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
                 self.distillation = distillation_cfg
         else:
             self.distillation = None
+
+    @property
+    def trainer_seq_len(self) -> int:
+        """Graph sequence length: chunk size under chunked-sequence training."""
+        return self.sequence_len // max(1, int(self.sequence_chunks or 1))
 
     def __post_init__(self):
         logger = get_logger()
@@ -1042,6 +1051,26 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
                 "[offload_master]: disabling CUDA graphs (cross-stream weight prefetch is incompatible with graph capture)."
             )
 
+        # Chunked-sequence training (KV-checkpointed chunks): validate and
+        # adjust flags before RuntimeOptions is constructed below.
+        seq_chunks = int(self.sequence_chunks or 1)
+        if seq_chunks > 1:
+            if self.sequence_len % seq_chunks != 0:
+                raise ValueError(f"sequence_chunks={seq_chunks} must divide sequence_len={self.sequence_len}")
+            if self.sample_packing:
+                raise ValueError("sequence_chunks > 1 requires sample_packing: false (packed doc masking not supported yet)")
+            if self.per_device_train_batch_size != 1:
+                raise ValueError("sequence_chunks > 1 requires per_device_train_batch_size: 1")
+            if getattr(self, "lora_dropout", 0) not in (0, 0.0, None):
+                raise ValueError("sequence_chunks > 1 requires lora_dropout: 0 (re-forward must be deterministic)")
+            if self.use_cuda_graphs:
+                logger.info("[sequence_chunks]: disabling CUDA graphs (chunked schedule runs eagerly).")
+                self.use_cuda_graphs = False
+            # RoPE freqs tables are sized from the graph's T (= chunk size);
+            # chunk positions reach sequence_len, so extend via the existing
+            # override the run state honors.
+            os.environ["SUROGATE_ROPE_MAX_SEQ"] = str(self.sequence_len)
+
         if self.long_context and self.use_cuda_graphs:
             # long_context uses split-attention mode: MLP tile groups run eagerly
             # while the rest of each layer (norms, attention, projections) stays graphed.
@@ -1105,6 +1134,9 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         self.runtime_config.ep_size = self.ep_size
         self.runtime_config.ep_load_balance_threshold = self.ep_load_balance_threshold
         self.runtime_config.ep_plan_refresh_interval = self.ep_plan_refresh_interval
+        # Chunked-sequence training (validated + flags adjusted BEFORE the
+        # RuntimeOptions ctor above; see the block ahead of it)
+        self.runtime_config.sequence_chunks = int(self.sequence_chunks or 1)
         # MoE loss coefficients (None means use model config default)
         if self.router_aux_loss_coef is not None:
             self.runtime_config.router_aux_loss_coef = float(self.router_aux_loss_coef)

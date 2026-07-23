@@ -584,6 +584,9 @@ NB_MODULE(_surogate, m) {
         .def_rw("ep_plan_refresh_interval",
                 &RuntimeOptions::EPPlanRefreshInterval,
                 "LLEP sticky plans: recompute the LPT plan every N forward dispatches per layer (default 16, 1 = every step).")
+        .def_rw("sequence_chunks",
+                &RuntimeOptions::SequenceChunks,
+                "Chunked-sequence training: process the sequence as N KV-checkpointed chunks (1 = off).")
         .def_prop_rw(
             "matmul_type",
             [](const RuntimeOptions* opt) { return opt->matmul_dtype(); },
@@ -1355,8 +1358,8 @@ NB_MODULE(_surogate, m) {
             "step",
             [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets) {
                 // Use local_world_size (GPUs on this node) not global world_size
-                CHECK_SHAPE(inputs, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
-                CHECK_SHAPE(targets, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
+                CHECK_SHAPE(inputs, trainer->batch_size() * trainer->local_world_size(), trainer->step_seq_length());
+                CHECK_SHAPE(targets, trainer->batch_size() * trainer->local_world_size(), trainer->step_seq_length());
 
                 trainer->step(inputs.data(), targets.data());
             },
@@ -1371,9 +1374,9 @@ NB_MODULE(_surogate, m) {
             "step",
             [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets, TokenArray position_ids) {
                 // Use local_world_size (GPUs on this node) not global world_size
-                CHECK_SHAPE(inputs, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
-                CHECK_SHAPE(targets, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
-                CHECK_SHAPE(position_ids, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
+                CHECK_SHAPE(inputs, trainer->batch_size() * trainer->local_world_size(), trainer->step_seq_length());
+                CHECK_SHAPE(targets, trainer->batch_size() * trainer->local_world_size(), trainer->step_seq_length());
+                CHECK_SHAPE(position_ids, trainer->batch_size() * trainer->local_world_size(), trainer->step_seq_length());
 
                 trainer->step(inputs.data(), targets.data(), position_ids.data());
             },
@@ -1724,8 +1727,8 @@ NB_MODULE(_surogate, m) {
                const optimizers::OptimizerConfig& config,
                int step) {
                 const int rows = trainer->batch_size() * trainer->local_world_size() * trainer->grad_accumulation();
-                CHECK_SHAPE(inputs, rows, trainer->seq_length());
-                CHECK_SHAPE(targets, rows, trainer->seq_length());
+                CHECK_SHAPE(inputs, rows, trainer->step_seq_length());
+                CHECK_SHAPE(targets, rows, trainer->step_seq_length());
 
                 auto [loss, norm] = trainer->train_step_graphed(inputs.data(), targets.data(), nullptr, config, step);
                 nb::dict ret;
@@ -1753,9 +1756,9 @@ NB_MODULE(_surogate, m) {
                const optimizers::OptimizerConfig& config,
                int step) {
                 const int rows = trainer->batch_size() * trainer->local_world_size() * trainer->grad_accumulation();
-                CHECK_SHAPE(inputs, rows, trainer->seq_length());
-                CHECK_SHAPE(targets, rows, trainer->seq_length());
-                CHECK_SHAPE(position_ids, rows, trainer->seq_length());
+                CHECK_SHAPE(inputs, rows, trainer->step_seq_length());
+                CHECK_SHAPE(targets, rows, trainer->step_seq_length());
+                CHECK_SHAPE(position_ids, rows, trainer->step_seq_length());
 
                 auto [loss, norm] =
                     trainer->train_step_graphed(inputs.data(), targets.data(), position_ids.data(), config, step);

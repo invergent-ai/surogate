@@ -93,6 +93,14 @@ public:
     void load_checkpoint(std::string directory, int step);
     void save_checkpoint(std::string directory, int step);
     void step(const std::int32_t* inputs, const std::int32_t* targets, const std::int32_t* position_ids = nullptr);
+
+    /// Chunked-sequence step (KV-checkpointed chunks): forward KV sweep over
+    /// chunks 0..N-1, then reverse-order re-forward + backward with exact
+    /// dK/dV accumulation. Input arrays are [rows, B, N*T].
+    void step_chunked(const std::int32_t* inputs,
+                      const std::int32_t* targets,
+                      const std::int32_t* position_ids,
+                      int seq_chunks);
     float validate(const std::int32_t* inputs, const std::int32_t* targets, const std::int32_t* position_ids = nullptr);
     std::pair<float, float> update_with_config(const optimizers::OptimizerConfig& config, int step);
     std::pair<float, float> train_step_graphed(const std::int32_t* inputs,
@@ -117,6 +125,12 @@ public:
     }
     int seq_length() const {
         return T;
+    }
+
+    /// Sequence length step() arrays must carry: the graph T times the
+    /// chunked-sequence factor (equal to seq_length() when chunking is off).
+    int step_seq_length() const {
+        return seq_length() * std::max(1, mOptions.SequenceChunks);
     }
     int grad_accumulation() const {
         return mGradAccumulation;

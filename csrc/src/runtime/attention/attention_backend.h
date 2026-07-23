@@ -12,6 +12,7 @@
 
 #include <cuda_runtime.h>
 #include <cudnn.h>
+#include <cuda_bf16.h>
 #include <cublas_v2.h>
 
 #include <memory>
@@ -27,6 +28,7 @@ class DslRunState;  // forward decl — backends go through the params struct
 
 /// Selection priorities for the built-in backends. Higher wins.
 namespace attention_priority {
+constexpr int kKvPrefix = 110;
 constexpr int kCuDNN = 100;
 constexpr int kMemEff = 95;
 constexpr int kFlashVarlen = 90;
@@ -87,6 +89,21 @@ struct AttentionParams {
     int num_docs = 0;
     int max_doc_seqlen = 0;
     int total_doc_tokens = 0;
+
+    // ---- Chunked-sequence (KV prefix) ---------------------------------
+    /// When ``chunk_kv_len > 0`` the op runs in chunked-sequence mode:
+    /// queries are this chunk's T rows; keys/values are the contiguous
+    /// per-layer caches below holding the whole prefix INCLUDING this
+    /// chunk (chunk_kv_len rows). Only the kvprefix backend accepts this
+    /// mode; every other backend must reject it.
+    int chunk_pos = 0;      ///< this chunk's first global row
+    int chunk_kv_len = 0;   ///< prefix length incl. this chunk; 0 = off
+    nv_bfloat16* chunk_k_cache = nullptr;  ///< [T_total, Hkv, Hs]
+    nv_bfloat16* chunk_v_cache = nullptr;  ///< [T_total, Hkv, Hs]
+    float* chunk_dk_accum = nullptr;       ///< [T_total, Hkv, Hs] fp32, backward
+    float* chunk_dv_accum = nullptr;       ///< [T_total, Hkv, Hs] fp32, backward
+    const int32_t* chunk_cu_q = nullptr;   ///< device [0, T]
+    const int32_t* chunk_cu_k = nullptr;   ///< device [0, kv_len]
 
     // ---- Execution context --------------------------------------------
     cudaStream_t stream = nullptr;

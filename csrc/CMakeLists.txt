@@ -361,6 +361,7 @@ target_sources(surogate-common PRIVATE
     src/runtime/attention/backend_registry.cpp
     src/runtime/attention/backend_cudnn.cpp
     src/runtime/attention/backend_flash_varlen.cpp
+    src/runtime/attention/backend_kvprefix.cpp
     src/runtime/attention/backend_custom.cpp
     src/runtime/attention/backend_mem_eff.cpp
     src/runtime/attention/attention_cudnn.cpp
