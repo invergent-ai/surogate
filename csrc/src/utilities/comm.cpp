@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+#include <atomic>
 #include "comm.h"
 
 #include <algorithm>
@@ -1822,3 +1823,15 @@ NCCLCommunicator::launch_communicators_multinode(int ngpus,
 
     return std::make_unique<CommunicatorThreadsPackImpl>(std::move(threads), shared_state);
 }
+
+namespace surogate {
+namespace {
+std::atomic<std::size_t> g_watchdog_heartbeat{0};
+}  // namespace
+void tick_watchdog_heartbeat() {
+    g_watchdog_heartbeat.fetch_add(1, std::memory_order_relaxed);
+}
+std::size_t watchdog_heartbeat() {
+    return g_watchdog_heartbeat.load(std::memory_order_relaxed);
+}
+}  // namespace surogate

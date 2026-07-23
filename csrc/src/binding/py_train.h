@@ -129,15 +129,6 @@ public:
 
     /// Sequence length step() arrays must carry: the graph T times the
     /// chunked-sequence factor (equal to seq_length() when chunking is off).
-    /// Long-running work items (the chunked-sequence step runs a whole
-    /// multi-chunk schedule inside one work unit) tick this so the
-    /// lost-wakeup watchdog sees liveness between work-item completions —
-    /// routine pokes of healthy long steps are noise and have coincided
-    /// with signal-delivery crashes.
-    void tick_work_heartbeat() {
-        mWorkHeartbeat.fetch_add(1, std::memory_order_relaxed);
-    }
-
     int step_seq_length() const {
         return seq_length() * std::max(1, mOptions.SequenceChunks);
     }
@@ -429,7 +420,6 @@ private:
     std::atomic<bool> mHasCrashed = false;
     std::atomic<int> mIsReady = 0;
     std::atomic<int> mWorkDone = 0;
-    std::atomic<std::size_t> mWorkHeartbeat{0};
 
     // dispatch-PP async per-GPU dispatch: launch work on a single GPU without the
     // global barrier of run_work, and wait per-GPU later. This lets the stage

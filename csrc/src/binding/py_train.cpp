@@ -872,6 +872,33 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                                       ? static_cast<int>(mContexts.front().Model->get_position_ids_buffer().Sizes[0])
                                       : 1);
 
+    // Chunked-sequence: trailing all-padding chunks are skipped exactly —
+    // no valid target lives there and causal attention never looks ahead, so
+    // neither loss nor any gradient depends on them. Computed on the FULL
+    // host batch (all local ranks' rows) so every rank derives the same
+    // count and the collective schedules stay aligned. (Single-node only:
+    // multi-node would need a cross-node reduction of the count.)
+    std::vector<int> chunk_count_per_micro(static_cast<std::size_t>(micro_steps), seq_chunks);
+    if (seq_chunks > 1 && targets) {
+        const int rows_per_micro = local_gpus * B;
+        for (int j = 0; j < micro_steps; ++j) {
+            long last_valid = -1;
+            for (int r = 0; r < rows_per_micro; ++r) {
+                const std::int32_t* row =
+                    targets + (static_cast<std::size_t>(j) * rows_per_micro + r) * static_cast<std::size_t>(T_step);
+                for (long t = static_cast<long>(T_step) - 1; t > last_valid; --t) {
+                    if (row[t] != -100) {
+                        last_valid = t;
+                        break;
+                    }
+                }
+                if (last_valid >= static_cast<long>(T_step) - 1) break;
+            }
+            const int need = static_cast<int>((last_valid + static_cast<long>(T)) / T);
+            chunk_count_per_micro[static_cast<std::size_t>(j)] = std::min(seq_chunks, std::max(1, need));
+        }
+    }
+
     run_work([&](sThreadContext& ctx) {
         auto& rs = ctx.Model->get_run_state();
         if (!rs.Allocator) {
@@ -1103,7 +1130,9 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                 if (B != 1) {
                     throw std::runtime_error("chunked-sequence training requires per-device batch size 1");
                 }
-                const int accum_eff = micro_steps * seq_chunks;
+                int accum_eff = 0;
+                for (int j = 0; j < micro_steps; ++j) accum_eff += chunk_count_per_micro[static_cast<std::size_t>(j)];
+                int micro_base = 0;
                 const std::size_t chunk_bytes_off = static_cast<std::size_t>(T) * sizeof(std::int32_t);
                 auto chunk_view = [&](Tensor& full, int c) {
                     Tensor v = full;
@@ -1113,7 +1142,8 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                 };
                 const bool chunk_trace = std::getenv("SUROGATE_CHUNK_TRACE") != nullptr;
                 for (int j = 0; j < micro_steps; ++j) {
-                    for (int c = 0; c < seq_chunks; ++c) {
+                    const int eff_chunks = chunk_count_per_micro[static_cast<std::size_t>(j)];
+                    for (int c = 0; c < eff_chunks; ++c) {
                         Tensor in_v = chunk_view(gs.inputs[j], c);
                         Tensor pos_v = chunk_view(gs.position_ids[j], c);
                         Tensor tgt_v = chunk_view(gs.targets[j], c);
@@ -1127,15 +1157,15 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                             fprintf(stderr, "[chunk] phaseA j=%d c=%d\n", j, c);
                             fflush(stderr);
                         }
-                        ctx.Model->forward(in_v, pos_v, *ctx.Communicator, j * seq_chunks + c);
-                        tick_work_heartbeat();
+                        ctx.Model->forward(in_v, pos_v, *ctx.Communicator, micro_base + c);
+                        ::surogate::tick_watchdog_heartbeat();
                     }
                     ctx.Model->zero_sequence_chunk_dkv();
-                    for (int c = seq_chunks - 1; c >= 0; --c) {
+                    for (int c = eff_chunks - 1; c >= 0; --c) {
                         Tensor in_v = chunk_view(gs.inputs[j], c);
                         Tensor pos_v = chunk_view(gs.position_ids[j], c);
                         Tensor tgt_v = chunk_view(gs.targets[j], c);
-                        const int micro_eff = j * seq_chunks + (seq_chunks - 1 - c);
+                        const int micro_eff = micro_base + (eff_chunks - 1 - c);
                         ctx.Model->set_sequence_chunk(c, seq_chunks);
                         rs.Targets_CPU = tgt_v;
                         if (chunk_trace && ctx.Communicator->rank() == 0) {
@@ -1143,11 +1173,12 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                             fflush(stderr);
                         }
                         ctx.Model->forward(in_v, pos_v, *ctx.Communicator, micro_eff);
-                        tick_work_heartbeat();
+                        ::surogate::tick_watchdog_heartbeat();
                         ctx.Model->backward(in_v, tgt_v, *ctx.Communicator, accum_eff, micro_eff);
-                        tick_work_heartbeat();
+                        ::surogate::tick_watchdog_heartbeat();
                     }
                     ctx.Model->set_sequence_chunk(-1, 0);
+                    micro_base += eff_chunks;
                 }
             } else
             for (int j = 0; j < micro_steps; ++j) {
@@ -1727,7 +1758,7 @@ void MultiGPUPyTrainer::run_work(std::function<void(sThreadContext& ctx)> work, 
     }
 
     auto last_progress = std::chrono::steady_clock::now();
-    std::size_t last_done = mWorkDone.load() + mWorkHeartbeat.load();
+    std::size_t last_done = mWorkDone.load() + ::surogate::watchdog_heartbeat();
     while (mWorkDone.load() < mContexts.size()) {
         if (mThreads->has_exception()) {
             stop();
@@ -1749,7 +1780,7 @@ void MultiGPUPyTrainer::run_work(std::function<void(sThreadContext& ctx)> work, 
         // under heavy multi-threaded CUDA load and waits forever on an already-met
         // condition. A no-op signal forces EINTR + recheck. 45s is far above any
         // legitimate op; poking a healthy worker is harmless.
-        const std::size_t done_now = mWorkDone.load() + mWorkHeartbeat.load();
+        const std::size_t done_now = mWorkDone.load() + ::surogate::watchdog_heartbeat();
         if (done_now != last_done) {
             last_done = done_now;
             last_progress = std::chrono::steady_clock::now();

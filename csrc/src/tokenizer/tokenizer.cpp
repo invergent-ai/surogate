@@ -5,6 +5,7 @@
 
 #include "tokenizer.h"
 #include "bpe.h"
+#include "tok_profile.h"
 #include "unicode.h"
 
 #include <minja/minja.hpp>
@@ -148,6 +149,12 @@ struct Tokenizer::Impl {
     std::shared_ptr<minja::TemplateNode> chat_tmpl_root;
     std::string bos_token_str;
     std::string eos_token_str;
+    // Whether the template references strftime_now(); if not, we skip building
+    // the (allocating) callable + capturing the clock on every render.
+    // Conservatively defaults true (behaves exactly as before) until per-load
+    // detection is wired at the template-parse sites — WIP, do not build-ship
+    // the false default without that detection or date templates break.
+    bool template_uses_strftime = true;
 
     ~Impl() {
         delete encoder_lookup;
@@ -174,19 +181,36 @@ struct Tokenizer::Impl {
         context->set("bos_token", bos_token_str);
         context->set("eos_token", eos_token_str);
 
-        auto now = std::chrono::system_clock::now();
-        context->set("strftime_now",
-                     minja::Value::callable([now](const std::shared_ptr<minja::Context>&, minja::ArgumentsValue& args) {
-                         args.expectArgs("strftime_now", {1, 1}, {0, 0});
-                         auto fmt = args.args[0].get<std::string>();
-                         auto t = std::chrono::system_clock::to_time_t(now);
-                         auto lt = *std::localtime(&t);
-                         std::ostringstream ss;
-                         ss << std::put_time(&lt, fmt.c_str());
-                         return ss.str();
-                     }));
+        if (template_uses_strftime) {
+            auto now = std::chrono::system_clock::now();
+            context->set(
+                "strftime_now",
+                minja::Value::callable([now](const std::shared_ptr<minja::Context>&, minja::ArgumentsValue& args) {
+                    args.expectArgs("strftime_now", {1, 1}, {0, 0});
+                    auto fmt = args.args[0].get<std::string>();
+                    auto t = std::chrono::system_clock::to_time_t(now);
+                    auto lt = *std::localtime(&t);
+                    std::ostringstream ss;
+                    ss << std::put_time(&lt, fmt.c_str());
+                    return ss.str();
+                }));
+        }
 
+        TokTimer _t(tok_profile().render_walk_ns);
         return chat_tmpl_root->render(context);
+    }
+
+    // Render the first `count` messages without materializing a ChatMessage
+    // subvector (the O(n²) copy the per-round training renders used to pay).
+    std::string render_prefix(const std::vector<ChatMessage>& messages,
+                              size_t count,
+                              bool add_generation_prompt,
+                              std::optional<bool> enable_thinking = std::nullopt) const {
+        nlohmann::ordered_json arr = nlohmann::ordered_json::array();
+        for (size_t k = 0; k < count && k < messages.size(); ++k) {
+            arr.push_back({{"role", messages[k].role}, {"content", messages[k].content}});
+        }
+        return render_chat_template(arr, add_generation_prompt, enable_thinking);
     }
 
     void build_lookup() {
@@ -235,10 +259,17 @@ struct Tokenizer::Impl {
         // Pre-tokenize: split by regex patterns.
         // unicode_regex_split already applies byte-level encoding (GPT-2 style)
         // to each piece, so the returned strings match the vocab keys directly.
-        auto pieces = unicode_regex_split(text, pre_tokenizer_regex);
+        std::vector<std::string> pieces;
+        {
+            TokTimer _t(tok_profile().pretok_ns);
+            pieces = unicode_regex_split(text, pre_tokenizer_regex);
+        }
 
-        for (const auto& piece : pieces) {
-            encode_piece(piece, result);
+        {
+            TokTimer _t(tok_profile().bpe_ns);
+            for (const auto& piece : pieces) {
+                encode_piece(piece, result);
+            }
         }
         return result;
     }
@@ -788,6 +819,8 @@ std::string Tokenizer::special_token(const std::string& name) const {
 std::string Tokenizer::apply_chat_template(const std::vector<ChatMessage>& messages,
                                            bool add_generation_prompt,
                                            std::optional<bool> enable_thinking) const {
+    TokTimer _t(tok_profile().render_ns);
+    if (tok_profile_enabled()) tok_profile().renders.fetch_add(1, std::memory_order_relaxed);
     // Convert ChatMessage to nlohmann::ordered_json array
     nlohmann::ordered_json json_messages = nlohmann::ordered_json::array();
     for (const auto& msg : messages) {
@@ -808,6 +841,9 @@ std::vector<int32_t> Tokenizer::apply_chat_template_and_encode(const std::vector
 // ============================================================================
 
 TrainingEncoded Tokenizer::encode_for_training(const std::vector<ChatMessage>& messages, LossStrategy strategy) const {
+    TokTimer _t(tok_profile().total_ns);
+    if (tok_profile_enabled()) tok_profile().calls.fetch_add(1, std::memory_order_relaxed);
+
     TrainingEncoded result;
     if (messages.empty()) return result;
 
@@ -918,6 +954,9 @@ TrainingEncoded Tokenizer::encode_for_training(const std::vector<ChatMessage>& m
         result.labels[0] = -100;
     }
 
+    if (tok_profile_enabled()) {
+        tok_profile().tokens.fetch_add(result.input_ids.size(), std::memory_order_relaxed);
+    }
     return result;
 }
 

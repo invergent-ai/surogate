@@ -3,6 +3,7 @@
 //
 // DSL model weight I/O operations (init, import, export, checkpoint).
 
+#include "utilities/comm.h"
 #include "runtime/dsl/dsl_model.h"
 
 #include <algorithm>
@@ -237,6 +238,7 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
                         gb,
                         secs,
                         gb / std::max(secs, 1e-9));
+                ::surogate::tick_watchdog_heartbeat();
                 fflush(stderr);
             }
         }
