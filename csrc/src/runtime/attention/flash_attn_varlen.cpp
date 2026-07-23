@@ -308,3 +308,234 @@ void attention_backward_flash_varlen(nv_bfloat16* dqkv,
         CUDA_CHECK(cudaGetLastError());
     }
 }
+
+// ============================================================================
+// Chunked-sequence (KV-prefix) attention: q = current chunk (T rows of the
+// interleaved qkv buffer), k/v = contiguous per-layer caches holding the
+// whole prefix INCLUDING this chunk (kv_len rows). Causal alignment is
+// bottom-right (query i is global position kv_len - T + i), which is exactly
+// flash-attn's convention for seqlen_q != seqlen_k; sliding windows count
+// from that aligned diagonal, so window semantics match the dense path.
+// ============================================================================
+
+namespace {
+
+void set_kvprefix_params(surogate_flash::Flash_fwd_params& params,
+                         const nv_bfloat16* qkv,
+                         const nv_bfloat16* k_cache,
+                         const nv_bfloat16* v_cache,
+                         nv_bfloat16* out,
+                         float* lse,
+                         const int32_t* cu_seqlens_q_gpu,
+                         const int32_t* cu_seqlens_k_gpu,
+                         int T,
+                         int kv_len,
+                         int Hq,
+                         int Hkv,
+                         int HS,
+                         float scale_override,
+                         int window_size) {
+    const int H = Hq + 2 * Hkv;
+    std::memset(&params, 0, sizeof(params));
+
+    params.q_ptr = const_cast<void*>(static_cast<const void*>(qkv));
+    params.k_ptr = const_cast<void*>(static_cast<const void*>(k_cache));
+    params.v_ptr = const_cast<void*>(static_cast<const void*>(v_cache));
+    params.o_ptr = out;
+
+    params.q_row_stride = H * HS;
+    params.q_head_stride = HS;
+    params.k_row_stride = Hkv * HS;
+    params.v_row_stride = Hkv * HS;
+    params.k_head_stride = HS;
+    params.v_head_stride = HS;
+    params.q_batch_stride = 0;
+    params.k_batch_stride = 0;
+    params.v_batch_stride = 0;
+
+    params.o_row_stride = Hq * HS;
+    params.o_head_stride = HS;
+    params.o_batch_stride = 0;
+
+    params.h = Hq;
+    params.h_k = Hkv;
+    params.h_h_k_ratio = Hq / Hkv;
+    params.b = 1;
+    params.seqlen_q = T;
+    params.seqlen_k = kv_len;
+    params.d = HS;
+    params.d_rounded = HS <= 128 ? ((HS + 31) / 32) * 32 : ((HS + 63) / 64) * 64;
+    params.seqlen_q_rounded = ((T + 127) / 128) * 128;
+    params.seqlen_k_rounded = ((kv_len + 127) / 128) * 128;
+    params.total_q = T;
+
+    params.scale_softmax = (scale_override != 0.0f) ? scale_override : 1.0f / std::sqrt(static_cast<float>(HS));
+    params.scale_softmax_log2 = params.scale_softmax * static_cast<float>(M_LOG2E);
+
+    params.cu_seqlens_q = const_cast<int*>(reinterpret_cast<const int*>(cu_seqlens_q_gpu));
+    params.cu_seqlens_k = const_cast<int*>(reinterpret_cast<const int*>(cu_seqlens_k_gpu));
+    params.is_seqlens_k_cumulative = true;
+
+    params.softmax_lse_ptr = lse;
+    params.is_bf16 = true;
+    const bool use_window = window_size > 0;
+    params.is_causal = !use_window;
+    params.p_dropout = 1.0f;
+    params.rp_dropout = 1.0f;
+    params.scale_softmax_rp_dropout = params.scale_softmax;
+    params.p_dropout_in_uint8_t = 255;
+    params.window_size_left = use_window ? (window_size - 1) : -1;
+    params.window_size_right = 0;
+    params.softcap = 0.0f;
+    params.unpadded_lse = true;
+    params.num_splits = 0;
+}
+
+template <bool IsCausal>
+void run_fwd_hs(surogate_flash::Flash_fwd_params& params, int HS, cudaStream_t stream) {
+    if (HS <= 64)
+        run_fwd<64, IsCausal>(params, stream);
+    else if (HS <= 96)
+        run_fwd<96, IsCausal>(params, stream);
+    else if (HS <= 128)
+        run_fwd<128, IsCausal>(params, stream);
+    else if (HS <= 256)
+        run_fwd<256, IsCausal>(params, stream);
+    else
+        throw std::runtime_error("Flash Attention kv-prefix: head_size > 256 not supported");
+}
+
+template <bool IsCausal>
+void run_bwd_hs(surogate_flash::Flash_bwd_params& params, int HS, cudaStream_t stream) {
+    if (HS <= 64)
+        run_bwd<64, IsCausal>(params, stream);
+    else if (HS <= 96)
+        run_bwd<96, IsCausal>(params, stream);
+    else if (HS <= 128)
+        run_bwd<128, IsCausal>(params, stream);
+    else if (HS <= 256)
+        run_bwd<256, IsCausal>(params, stream);
+    else
+        throw std::runtime_error("Flash Attention kv-prefix backward: head_size > 256 not supported");
+}
+
+}  // anonymous namespace
+
+void attention_forward_flash_kvprefix(nv_bfloat16* out,
+                                      float* lse,
+                                      const nv_bfloat16* qkv,
+                                      const nv_bfloat16* k_cache,
+                                      const nv_bfloat16* v_cache,
+                                      const int32_t* cu_seqlens_q_gpu,
+                                      const int32_t* cu_seqlens_k_gpu,
+                                      int T,
+                                      int kv_len,
+                                      int Hq,
+                                      int Hkv,
+                                      int HS,
+                                      cudaStream_t stream,
+                                      float scale,
+                                      int window_size) {
+    surogate_flash::Flash_fwd_params params;
+    set_kvprefix_params(
+        params, qkv, k_cache, v_cache, out, lse, cu_seqlens_q_gpu, cu_seqlens_k_gpu, T, kv_len, Hq, Hkv, HS, scale,
+        window_size);
+    if (window_size > 0) {
+        run_fwd_hs<false>(params, HS, stream);
+    } else {
+        run_fwd_hs<true>(params, HS, stream);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void attention_backward_flash_kvprefix(nv_bfloat16* dqkv,
+                                       float* dk_accum,
+                                       float* dv_accum,
+                                       const float* lse,
+                                       const nv_bfloat16* out,
+                                       const nv_bfloat16* dout,
+                                       const nv_bfloat16* qkv,
+                                       const nv_bfloat16* k_cache,
+                                       const nv_bfloat16* v_cache,
+                                       const int32_t* cu_seqlens_q_gpu,
+                                       const int32_t* cu_seqlens_k_gpu,
+                                       float* dq_accum,
+                                       float* dsoftmax_sum,
+                                       nv_bfloat16* dk_expanded,
+                                       nv_bfloat16* dv_expanded,
+                                       int chunk_pos,
+                                       int T,
+                                       int kv_len,
+                                       int Hq,
+                                       int Hkv,
+                                       int HS,
+                                       bool deterministic,
+                                       cudaStream_t stream,
+                                       float scale,
+                                       int window_size) {
+    surogate_flash::Flash_bwd_params params;
+    std::memset(&params, 0, sizeof(params));
+    set_kvprefix_params(params,
+                        qkv,
+                        k_cache,
+                        v_cache,
+                        const_cast<nv_bfloat16*>(out),
+                        const_cast<float*>(lse),
+                        cu_seqlens_q_gpu,
+                        cu_seqlens_k_gpu,
+                        T,
+                        kv_len,
+                        Hq,
+                        Hkv,
+                        HS,
+                        scale,
+                        window_size);
+
+    const int H = Hq + 2 * Hkv;
+
+    params.do_ptr = const_cast<void*>(static_cast<const void*>(dout));
+    params.do_row_stride = Hq * HS;
+    params.do_head_stride = HS;
+    params.do_batch_stride = 0;
+
+    // dQ goes straight into the chunk's interleaved dqkv (Q section).
+    params.dq_ptr = dqkv;
+    params.dq_row_stride = H * HS;
+    params.dq_head_stride = HS;
+    params.dq_batch_stride = 0;
+
+    // dK/dV cover the WHOLE prefix — always via expanded (kv_len, Hq, HS)
+    // temps (uniform for MHA and GQA); reduced+accumulated below.
+    params.dk_ptr = dk_expanded;
+    params.dv_ptr = dv_expanded;
+    params.dk_row_stride = Hq * HS;
+    params.dv_row_stride = Hq * HS;
+    params.dk_head_stride = HS;
+    params.dv_head_stride = HS;
+    params.dk_batch_stride = 0;
+    params.dv_batch_stride = 0;
+
+    params.dq_accum_ptr = dq_accum;
+    params.dsoftmax_sum = dsoftmax_sum;
+    params.deterministic = deterministic;
+
+    const int HS_rounded = HS <= 128 ? ((HS + 31) / 32) * 32 : ((HS + 63) / 64) * 64;
+    if (deterministic) {
+        params.dq_accum_split_stride = static_cast<int64_t>(T + 128) * Hq * HS_rounded;
+    }
+
+    if (window_size > 0) {
+        run_bwd_hs<false>(params, HS, stream);
+    } else {
+        run_bwd_hs<true>(params, HS, stream);
+    }
+    CUDA_CHECK(cudaGetLastError());
+
+    // Accumulate this chunk's prefix gradients, then emit the now-complete
+    // rows for the chunk itself into dqkv. Order matters: backward runs
+    // chunks last-to-first, so by the time a chunk emits, every later
+    // chunk's contribution to its rows is already in the accumulator.
+    accum_add_dkv(dk_accum, dv_accum, dk_expanded, dv_expanded, kv_len, Hq, Hkv, HS, stream);
+    emit_chunk_dkv(dqkv, dk_accum, dv_accum, chunk_pos, T, Hq, Hkv, HS, stream);
+    CUDA_CHECK(cudaGetLastError());
+}

@@ -154,3 +154,135 @@ void reduce_scatter_dkv(nv_bfloat16* dqkv,
         reduce_scatter_dv_kernel<<<blocks, kThreads, 0, stream>>>(dqkv, dv_expanded, total_q, Hq, Hkv, HS);
     }
 }
+
+// ============================================================================
+// Chunked-sequence (KV-prefix) support kernels
+// ============================================================================
+
+namespace {
+
+// Copy the chunk's K/V heads out of the interleaved qkv buffer into the
+// contiguous per-layer KV cache at row offset `pos`.
+// qkv: (T, Hq+2*Hkv, HS) interleaved (post-rope). k/v cache: (kv_max, Hkv, HS).
+__global__ void append_kv_kernel(nv_bfloat16* __restrict__ k_cache,
+                                 nv_bfloat16* __restrict__ v_cache,
+                                 const nv_bfloat16* __restrict__ qkv,
+                                 int pos,
+                                 int T,
+                                 int Hq,
+                                 int Hkv,
+                                 int HS) {
+    const int H = Hq + 2 * Hkv;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = T * Hkv * HS;
+    if (idx >= total) return;
+
+    const int d = idx % HS;
+    const int h = (idx / HS) % Hkv;
+    const int t = idx / (Hkv * HS);
+
+    const std::size_t dst = static_cast<std::size_t>(pos + t) * Hkv * HS + h * HS + d;
+    k_cache[dst] = qkv[t * H * HS + (Hq + h) * HS + d];
+    v_cache[dst] = qkv[t * H * HS + (Hq + Hkv + h) * HS + d];
+}
+
+// Reduce dk/dv_expanded (kv_len rows, Hq heads) to Hkv heads and ADD into the
+// FP32 dKV accumulators (kv_len rows, Hkv heads). Called once per chunk
+// backward; later chunks' contributions to earlier rows accumulate here.
+__global__ void accum_add_dkv_kernel(float* __restrict__ dk_accum,
+                                     float* __restrict__ dv_accum,
+                                     const nv_bfloat16* __restrict__ dk_expanded,
+                                     const nv_bfloat16* __restrict__ dv_expanded,
+                                     int kv_len,
+                                     int Hq,
+                                     int Hkv,
+                                     int HS) {
+    const int h_ratio = Hq / Hkv;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = kv_len * Hkv * HS;
+    if (idx >= total) return;
+
+    const int d = idx % HS;
+    const int hkv = (idx / HS) % Hkv;
+    const int t = idx / (Hkv * HS);
+
+    float ksum = 0.0f, vsum = 0.0f;
+    for (int r = 0; r < h_ratio; ++r) {
+        const int src = t * Hq * HS + (hkv * h_ratio + r) * HS + d;
+        ksum += __bfloat162float(dk_expanded[src]);
+        vsum += __bfloat162float(dv_expanded[src]);
+    }
+    dk_accum[idx] += ksum;
+    dv_accum[idx] += vsum;
+}
+
+// Emit the completed dK/dV rows for this chunk (accumulator rows
+// [pos, pos+T)) into the K/V sections of the chunk's interleaved dqkv.
+__global__ void emit_chunk_dkv_kernel(nv_bfloat16* __restrict__ dqkv,
+                                      const float* __restrict__ dk_accum,
+                                      const float* __restrict__ dv_accum,
+                                      int pos,
+                                      int T,
+                                      int Hq,
+                                      int Hkv,
+                                      int HS) {
+    const int H = Hq + 2 * Hkv;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = T * Hkv * HS;
+    if (idx >= total) return;
+
+    const int d = idx % HS;
+    const int h = (idx / HS) % Hkv;
+    const int t = idx / (Hkv * HS);
+
+    const std::size_t src = static_cast<std::size_t>(pos + t) * Hkv * HS + h * HS + d;
+    dqkv[t * H * HS + (Hq + h) * HS + d] = __float2bfloat16(dk_accum[src]);
+    dqkv[t * H * HS + (Hq + Hkv + h) * HS + d] = __float2bfloat16(dv_accum[src]);
+}
+
+}  // anonymous namespace
+
+void append_kv_to_cache(nv_bfloat16* k_cache,
+                        nv_bfloat16* v_cache,
+                        const nv_bfloat16* qkv,
+                        int pos,
+                        int T,
+                        int Hq,
+                        int Hkv,
+                        int HS,
+                        cudaStream_t stream) {
+    constexpr int kThreads = 256;
+    const int n = T * Hkv * HS;
+    const int blocks = (n + kThreads - 1) / kThreads;
+    append_kv_kernel<<<blocks, kThreads, 0, stream>>>(k_cache, v_cache, qkv, pos, T, Hq, Hkv, HS);
+}
+
+void accum_add_dkv(float* dk_accum,
+                   float* dv_accum,
+                   const nv_bfloat16* dk_expanded,
+                   const nv_bfloat16* dv_expanded,
+                   int kv_len,
+                   int Hq,
+                   int Hkv,
+                   int HS,
+                   cudaStream_t stream) {
+    constexpr int kThreads = 256;
+    const int n = kv_len * Hkv * HS;
+    const int blocks = (n + kThreads - 1) / kThreads;
+    accum_add_dkv_kernel<<<blocks, kThreads, 0, stream>>>(dk_accum, dv_accum, dk_expanded, dv_expanded, kv_len, Hq, Hkv, HS);
+}
+
+void emit_chunk_dkv(nv_bfloat16* dqkv,
+                    const float* dk_accum,
+                    const float* dv_accum,
+                    int pos,
+                    int T,
+                    int Hq,
+                    int Hkv,
+                    int HS,
+                    cudaStream_t stream) {
+    constexpr int kThreads = 256;
+    const int n = T * Hkv * HS;
+    const int blocks = (n + kThreads - 1) / kThreads;
+    emit_chunk_dkv_kernel<<<blocks, kThreads, 0, stream>>>(dqkv, dk_accum, dv_accum, pos, T, Hq, Hkv, HS);
+}

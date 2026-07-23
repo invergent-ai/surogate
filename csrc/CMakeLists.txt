@@ -705,6 +705,7 @@ if (BUILD_TESTS OR BUILD_TESTS_INTEGRATION)
         src/testing/utilities/test_main.cpp
         src/testing/distributed/test-nccl.cpp
         src/testing/kernels/test-dpo-dloss.cu
+        src/testing/kernels/test-chunked-attention.cu
         src/testing/tokenizer/test-chat-template.cpp
     )
     target_link_libraries(integration-tests PRIVATE

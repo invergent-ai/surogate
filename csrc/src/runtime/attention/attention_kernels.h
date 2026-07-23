@@ -203,6 +203,96 @@ void attention_backward_flash_varlen(nv_bfloat16* dqkv,
                                      float scale = 0.0f,
                                      int window_size = 0);
 
+// ---------------------------------------------------------------------------
+// Chunked-sequence (KV-prefix) attention. q = current chunk (T rows of the
+// interleaved qkv buffer), k/v = contiguous caches holding the whole prefix
+// INCLUDING this chunk (kv_len rows, (kv_len, Hkv, HS) each). Causal
+// alignment is bottom-right; sliding windows count from the aligned diagonal.
+// ---------------------------------------------------------------------------
+
+// Copy the chunk's (post-rope) K/V heads from interleaved qkv into the
+// contiguous caches at row offset `pos`.
+void append_kv_to_cache(nv_bfloat16* k_cache,
+                        nv_bfloat16* v_cache,
+                        const nv_bfloat16* qkv,
+                        int pos,
+                        int T,
+                        int Hq,
+                        int Hkv,
+                        int HS,
+                        cudaStream_t stream);
+
+void attention_forward_flash_kvprefix(nv_bfloat16* out,
+                                      float* lse,
+                                      const nv_bfloat16* qkv,
+                                      const nv_bfloat16* k_cache,
+                                      const nv_bfloat16* v_cache,
+                                      const int32_t* cu_seqlens_q_gpu,
+                                      const int32_t* cu_seqlens_k_gpu,
+                                      int T,
+                                      int kv_len,
+                                      int Hq,
+                                      int Hkv,
+                                      int HS,
+                                      cudaStream_t stream,
+                                      float scale = 0.0f,
+                                      int window_size = 0);
+
+// Backward for one chunk against its full prefix. Writes dQ into the chunk's
+// interleaved dqkv; reduces the prefix-wide expanded dK/dV (kv_len, Hq, HS)
+// into the FP32 accumulators (kv_len, Hkv, HS, caller-zeroed at step start),
+// then emits accumulator rows [chunk_pos, chunk_pos+T) — complete once
+// chunks run last-to-first — into dqkv's K/V sections.
+// dq_accum/dsoftmax_sum must be zeroed by the caller (as with the dense
+// varlen backward); dk/dv_expanded are (kv_len, Hq, HS) BF16 temps.
+void attention_backward_flash_kvprefix(nv_bfloat16* dqkv,
+                                       float* dk_accum,
+                                       float* dv_accum,
+                                       const float* lse,
+                                       const nv_bfloat16* out,
+                                       const nv_bfloat16* dout,
+                                       const nv_bfloat16* qkv,
+                                       const nv_bfloat16* k_cache,
+                                       const nv_bfloat16* v_cache,
+                                       const int32_t* cu_seqlens_q_gpu,
+                                       const int32_t* cu_seqlens_k_gpu,
+                                       float* dq_accum,
+                                       float* dsoftmax_sum,
+                                       nv_bfloat16* dk_expanded,
+                                       nv_bfloat16* dv_expanded,
+                                       int chunk_pos,
+                                       int T,
+                                       int kv_len,
+                                       int Hq,
+                                       int Hkv,
+                                       int HS,
+                                       bool deterministic,
+                                       cudaStream_t stream,
+                                       float scale = 0.0f,
+                                       int window_size = 0);
+
+// Reduce Hq-expanded dK/dV over the whole prefix into FP32 Hkv accumulators.
+void accum_add_dkv(float* dk_accum,
+                   float* dv_accum,
+                   const nv_bfloat16* dk_expanded,
+                   const nv_bfloat16* dv_expanded,
+                   int kv_len,
+                   int Hq,
+                   int Hkv,
+                   int HS,
+                   cudaStream_t stream);
+
+// Emit completed accumulator rows [pos, pos+T) into interleaved dqkv (BF16).
+void emit_chunk_dkv(nv_bfloat16* dqkv,
+                    const float* dk_accum,
+                    const float* dv_accum,
+                    int pos,
+                    int T,
+                    int Hq,
+                    int Hkv,
+                    int HS,
+                    cudaStream_t stream);
+
 // Reduce dk_expanded/dv_expanded (Hq heads) to Hkv KV heads and scatter
 // into the K/V sections of interleaved dqkv buffer (total_q, Hq+2*Hkv, HS).
 void reduce_scatter_dkv(nv_bfloat16* dqkv,
