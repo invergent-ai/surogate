@@ -89,6 +89,12 @@ struct RuntimeOptions {
     // Only relevant when EPSize > 1. Values close to 1.0 = aggressive rebalancing, higher = less rebalancing.
     float EPLoadBalanceThreshold = 1.3f;
 
+    // LLEP sticky plans: recompute the LPT plan (and its imbalance all-reduce) every
+    // N forward dispatches per layer instead of every step. Any plan is correct —
+    // routing counts only affect balance quality — and a stable plan lets forward
+    // prefetch foreign expert weights one layer ahead. 1 = recompute every step.
+    int EPPlanRefreshInterval = 16;
+
     // MoE loss coefficients (override model config when >= 0)
     float RouterAuxLossCoef = -1.0f;  ///< Load balancing auxiliary loss coefficient (-1 = use model config)
     float RouterZLossCoef = -1.0f;    ///< Router z-loss (logit regularization) coefficient (-1 = use model config)

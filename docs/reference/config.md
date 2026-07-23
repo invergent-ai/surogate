@@ -105,6 +105,16 @@ These options apply to single-node multi-GPU training. For multi-node distribute
 | `memcpy_all_gather`     | bool | `false` | Use memcpy for all-gather operations (threads backend only). Generally gets better bandwidth utilization on PCIe and does not consume SM resources.                             |
 | `memcpy_send_recv`      | bool | `false` | Use memcpy for send/receive operations (threads backend only).                                                                                                                  |
 
+## Expert Parallelism (MoE) Options
+
+Distribute MoE experts across GPUs so each GPU holds `num_experts / ep_size` local experts. See the [MoE guide](../guides/moe.md#expert-parallelism-ep) and [Adaptive Training](../about/adaptive-training.md) for LLEP details.
+
+| Option                      | Type  | Default | Description                                                                                                                                                                      |
+| --------------------------- | ----- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ep_size`                   | int   | `1`     | Number of GPUs per expert-parallel group. Must divide `gpus` and `num_experts`. `1` disables EP.                                                                                 |
+| `ep_load_balance_threshold` | float | `1.3`   | Imbalance ratio (`max_gpu_load / mean_gpu_load`) above which LLEP dynamic load balancing activates. `1.0` = always active; large values (e.g. `999`) = static EP only.           |
+| `ep_plan_refresh_interval`  | int   | `16`    | LLEP sticky plans: the expert placement plan is recomputed every N forward dispatches per layer. Between refreshes the plan is reused, which skips the per-layer imbalance all-reduce and lets foreign expert weights be prefetched one layer ahead. `1` = recompute every step. |
+
 ## Pipeline Parallelism (dispatch-PP) Options
 
 Model-parallel mode for models whose base weights don't fit on a single GPU, on PCIe-only boxes. See [Dispatch Pipeline Parallelism](../guides/dispatch-pp.md). Mutually exclusive with the ZeRO options above, `cpu_training`, and MoE expert parallelism (`ep_size > 1`); CUDA graphs are auto-disabled.

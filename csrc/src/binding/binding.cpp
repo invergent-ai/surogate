@@ -581,6 +581,9 @@ NB_MODULE(_surogate, m) {
         .def_rw("ep_load_balance_threshold",
                 &RuntimeOptions::EPLoadBalanceThreshold,
                 "LLEP adaptive threshold: LPT activates when max/mean GPU load exceeds this (default 1.3).")
+        .def_rw("ep_plan_refresh_interval",
+                &RuntimeOptions::EPPlanRefreshInterval,
+                "LLEP sticky plans: recompute the LPT plan every N forward dispatches per layer (default 16, 1 = every step).")
         .def_prop_rw(
             "matmul_type",
             [](const RuntimeOptions* opt) { return opt->matmul_dtype(); },

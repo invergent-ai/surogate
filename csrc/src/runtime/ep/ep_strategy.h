@@ -144,7 +144,7 @@ private:
                               const Tensor& permuted_input,
                               DispatchForwardCtx& ctx);
     void detect_llep_imbalance(dsl::CompiledExecutor& exec, DispatchForwardCtx& ctx);
-    void plan_expert_mapping(DispatchForwardCtx& ctx);
+    void plan_expert_mapping(DispatchForwardCtx& ctx, bool sticky);
     Tensor apply_llep_send_reorder(dsl::CompiledExecutor& exec,
                                    DispatchForwardCtx& ctx,
                                    const Tensor& permuted_input,
@@ -175,11 +175,12 @@ private:
                              const Tensor& native_down);
     void finalize_native_only_state(dsl::CompiledExecutor& exec, DispatchForwardCtx& ctx);
 
-    /// Backward-only: prefetch the next replay layer's foreign expert weights
-    /// (its forward plan is cached) on the weight-transfer stream so the H2D
-    /// overlaps this layer's backward compute instead of serializing at the
-    /// next dispatch.
-    void maybe_prefetch_next_replay_layer(dsl::CompiledExecutor& exec, const DispatchForwardCtx& ctx);
+    /// Prefetch the next dispatch layer's foreign expert weights on the
+    /// weight-transfer stream so the H2D overlaps this layer's compute.
+    /// Replay: the next-lower layer, from the step's cached forward plan.
+    /// Forward: the next-higher layer, from its sticky plan (skipped when
+    /// that layer's next dispatch will recompute the plan).
+    void maybe_prefetch_next_layer(dsl::CompiledExecutor& exec, const DispatchForwardCtx& ctx);
 
     /// Invert `ep_state.llep_send_reorder_gpu` and gather `input` rows
     /// through it into a persistent [total_send, hidden] buffer. Caller

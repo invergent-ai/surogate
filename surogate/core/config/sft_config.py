@@ -440,6 +440,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
     # Expert Parallelism (EP): distribute MoE experts across GPUs
     ep_size: int | None = 1  # 1 = no EP (all experts replicated on every GPU)
     ep_load_balance_threshold: float | None = 1.3  # LLEP: LPT activates when max/mean GPU load exceeds this
+    ep_plan_refresh_interval: int | None = 16  # LLEP sticky plans: recompute LPT every N steps (1 = every step)
 
     adapter_path: str | None = None  # PEFT adapter dir to merge into base weights before training
     merge_adapter: bool | None = False
@@ -585,6 +586,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
 
         self.ep_size = cfg.get("ep_size", self.ep_size)
         self.ep_load_balance_threshold = float(cfg.get("ep_load_balance_threshold", self.ep_load_balance_threshold))
+        self.ep_plan_refresh_interval = int(cfg.get("ep_plan_refresh_interval", self.ep_plan_refresh_interval))
 
         self.adapter_path = cfg.get("adapter_path", self.adapter_path)
         self.merge_adapter = cfg.get("merge_adapter", self.merge_adapter)
@@ -1102,6 +1104,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         # Expert Parallelism
         self.runtime_config.ep_size = self.ep_size
         self.runtime_config.ep_load_balance_threshold = self.ep_load_balance_threshold
+        self.runtime_config.ep_plan_refresh_interval = self.ep_plan_refresh_interval
         # MoE loss coefficients (None means use model config default)
         if self.router_aux_loss_coef is not None:
             self.runtime_config.router_aux_loss_coef = float(self.router_aux_loss_coef)

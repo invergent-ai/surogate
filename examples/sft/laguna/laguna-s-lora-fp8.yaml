@@ -10,9 +10,11 @@ gradient_accumulation_steps: 1
 gpus: 8
 ep_size: 8
 # LLEP load balancing (threshold 1.3 to enable): balances the routing-hot rank's
-# VRAM (uniform ~22.5 GB vs 30.5/15.8 skew) at ~1.6x step time after the perf
-# pass (ring arena + backward prefetch + replay LoRA reuse). Use it when static
-# EP's hot rank would OOM (longer sequences); 999 = static EP (fastest at 256).
+# VRAM (uniform ~22.5 GB vs 30.5/15.8 skew) at ~1.1x step time after the perf
+# passes (ring arena, forward+backward prefetch, sticky plans, replay LoRA
+# reuse). Use it when static EP's hot rank would OOM (longer sequences);
+# 999 = static EP. ep_plan_refresh_interval (default 16) sets how often the
+# LPT plan is recomputed; 1 restores per-step planning.
 ep_load_balance_threshold: 999
 
 sample_packing: true

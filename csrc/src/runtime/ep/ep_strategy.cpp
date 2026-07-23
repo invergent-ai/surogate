@@ -502,30 +502,35 @@ void EPStrategy::detect_llep_imbalance(CompiledExecutor& exec, DispatchForwardCt
     ctx.use_llep = (imbalance >= threshold);
 }
 
-void EPStrategy::plan_expert_mapping(DispatchForwardCtx& ctx) {
-    ctx.expert_to_gpu.assign(ctx.num_experts, 0);
-    if (ctx.use_llep) {
-        ctx.plan = ep::compute_lpt_plan(ctx.global_expert_counts.data(),
-                                        ctx.num_experts,
-                                        ctx.ep_size,
-                                        ctx.ep_rank,
-                                        ctx.num_local);
-        ctx.expert_to_gpu = ctx.plan.expert_to_gpu;
-    } else {
-        for (int e = 0; e < ctx.num_experts; ++e) {
-            ctx.expert_to_gpu[e] = e / ctx.num_local;
+void EPStrategy::plan_expert_mapping(DispatchForwardCtx& ctx, bool sticky) {
+    // Sticky reuse: the plan/merged-set fields were restored from the cache by
+    // the caller; only the per-batch derivations below (meta refresh +
+    // send_splits) still run.
+    if (!sticky) {
+        ctx.expert_to_gpu.assign(ctx.num_experts, 0);
+        if (ctx.use_llep) {
+            ctx.plan = ep::compute_lpt_plan(ctx.global_expert_counts.data(),
+                                            ctx.num_experts,
+                                            ctx.ep_size,
+                                            ctx.ep_rank,
+                                            ctx.num_local);
+            ctx.expert_to_gpu = ctx.plan.expert_to_gpu;
+        } else {
+            for (int e = 0; e < ctx.num_experts; ++e) {
+                ctx.expert_to_gpu[e] = e / ctx.num_local;
+            }
         }
-    }
 
-    ctx.merged_experts.clear();
-    for (int e = 0; e < ctx.num_experts; ++e) {
-        if (ctx.expert_to_gpu[e] == ctx.ep_rank) ctx.merged_experts.push_back(e);
-    }
-    ctx.num_merged = static_cast<int>(ctx.merged_experts.size());
+        ctx.merged_experts.clear();
+        for (int e = 0; e < ctx.num_experts; ++e) {
+            if (ctx.expert_to_gpu[e] == ctx.ep_rank) ctx.merged_experts.push_back(e);
+        }
+        ctx.num_merged = static_cast<int>(ctx.merged_experts.size());
 
-    ctx.global_to_merged.assign(ctx.num_experts, -1);
-    for (int m = 0; m < ctx.num_merged; ++m)
-        ctx.global_to_merged[ctx.merged_experts[m]] = m;
+        ctx.global_to_merged.assign(ctx.num_experts, -1);
+        for (int m = 0; m < ctx.num_merged; ++m)
+            ctx.global_to_merged[ctx.merged_experts[m]] = m;
+    }
 
     auto& meta = mEPLayerMeta[ctx.ep_key];
     meta.num_merged = ctx.num_merged;
@@ -1385,17 +1390,44 @@ void EPStrategy::dispatch_forward(CompiledExecutor& exec, const CompiledOp& op) 
             EP_TRACE(exec, ctx, "replay reusing forward plan use_llep=%d", ctx.use_llep ? 1 : 0);
         }
     }
-    if (!reused_plan) {
+    // Sticky plans: outside replay, reuse the layer's cached plan for up to
+    // ep_plan_refresh_interval forward dispatches. Any expert->GPU mapping is
+    // correct (routing counts only affect balance quality), and a stable plan
+    // lets forward prefetch foreign weights one layer ahead. The reuse
+    // condition depends only on lockstep-synchronized state, so every rank
+    // skips (or runs) the imbalance all-reduce together.
+    bool sticky_plan = false;
+    if (!exec.mInReplay && !reused_plan && mOptions.EPPlanRefreshInterval > 1) {
+        auto& st = mEpStates[ctx.ep_key];
+        if (st.plan_cached && st.plan_age + 1 < mOptions.EPPlanRefreshInterval) {
+            st.plan_age++;
+            ctx.use_llep = st.cached_use_llep;
+            ctx.plan = st.cached_plan;
+            ctx.expert_to_gpu = st.cached_expert_to_gpu;
+            ctx.merged_experts = st.cached_merged_experts;
+            ctx.global_to_merged = st.cached_global_to_merged;
+            ctx.num_merged = static_cast<int>(st.cached_merged_experts.size());
+            sticky_plan = true;
+            EP_TRACE(exec, ctx, "sticky plan reuse age=%d use_llep=%d", st.plan_age, ctx.use_llep ? 1 : 0);
+        }
+    }
+
+    if (!reused_plan && !sticky_plan) {
         EpPhaseTimer prof_detect(0);
         detect_llep_imbalance(exec, ctx);
         EP_TRACE(exec, ctx, "detect done use_llep=%d", ctx.use_llep ? 1 : 0);
     }
 
-    // A pending backward prefetch never survives into the next forward pass
-    // (next step's plans may differ). Its only writers ran on the wt stream.
-    if (!exec.mInReplay && mPrefetched) {
-        mForeignArena.release(mPrefetched->arena_slot, mWeightTransferStream);
-        mPrefetched.reset();
+    // Drop a pending prefetch once its target dispatch has been passed without
+    // adoption (forward walks layers ascending, replay descending). Its only
+    // writers ran on the wt stream.
+    if (mPrefetched && mPrefetched->layer_idx != ctx.layer_idx) {
+        const bool still_ahead = exec.mInReplay ? (mPrefetched->layer_idx < ctx.layer_idx)
+                                                : (mPrefetched->layer_idx > ctx.layer_idx);
+        if (!still_ahead) {
+            mForeignArena.release(mPrefetched->arena_slot, mWeightTransferStream);
+            mPrefetched.reset();
+        }
     }
 
     // Drop any stale LLEP state from earlier layers. Foreign expert weight
@@ -1428,7 +1460,7 @@ void EPStrategy::dispatch_forward(CompiledExecutor& exec, const CompiledOp& op) 
 
     if (!reused_plan) {
         EpPhaseTimer prof_plan(1);
-        plan_expert_mapping(ctx);
+        plan_expert_mapping(ctx, /*sticky=*/sticky_plan);
         EP_TRACE(exec, ctx, "plan done merged=%d send=%zu recv=%zu", ctx.num_merged,
                  ctx.plan.weights_to_send.size(), ctx.plan.weights_to_receive.size());
     }
@@ -1446,8 +1478,11 @@ void EPStrategy::dispatch_forward(CompiledExecutor& exec, const CompiledOp& op) 
         EpPhaseTimer prof_splits(3);
         exchange_token_splits(exec, ctx);
         EP_TRACE(exec, ctx, "splits done total_send=%d total_recv=%d", ctx.total_send, ctx.total_recv);
-        // Cache the plan for this layer's recompute replay.
+        // Cache the plan for this layer's recompute replay (and for sticky
+        // cross-step reuse). A freshly computed plan resets its age; a sticky
+        // dispatch just rewrites identical plan values.
         auto& st = mEpStates[ctx.ep_key];
+        if (!sticky_plan) st.plan_age = 0;
         st.plan_cached = true;
         st.cached_use_llep = ctx.use_llep;
         st.cached_plan = ctx.plan;
@@ -1529,23 +1564,30 @@ void EPStrategy::dispatch_forward(CompiledExecutor& exec, const CompiledOp& op) 
 
     // Launched after finalize so its wt_done event does not wait on the
     // prefetch H2D — the prefetch overlaps this layer's backward compute.
-    maybe_prefetch_next_replay_layer(exec, ctx);
+    maybe_prefetch_next_layer(exec, ctx);
 
     exec.store_tensor(op.outputs[0], sorted_recv);
     exec.store_tensor(op.outputs[1], local_scatter);
 }
 
-void EPStrategy::maybe_prefetch_next_replay_layer(CompiledExecutor& exec, const DispatchForwardCtx& ctx) {
-    if (!exec.mInReplay || !mOptions.CpuTraining || mPrefetched.has_value()) return;
-    // The next replay dispatch is the next-lower layer with a cached forward
-    // plan; prefetch only when that plan actually receives foreign experts.
+void EPStrategy::maybe_prefetch_next_layer(CompiledExecutor& exec, const DispatchForwardCtx& ctx) {
+    if (!mOptions.CpuTraining || mPrefetched.has_value()) return;
+    // Replay walks layers descending and always reuses the step's cached
+    // forward plan; forward walks ascending and reuses the sticky plan, so
+    // prefetch only targets layers whose next dispatch will still be sticky
+    // (a refresh dispatch recomputes the plan and refetches anyway).
+    const bool replay = exec.mInReplay;
+    if (!replay && mOptions.EPPlanRefreshInterval <= 1) return;
     int next_layer = -1;
     for (const auto& [key, st] : mEpStates) {
         if (!st.plan_cached || (key & 1)) continue;
         const int layer = key >> 1;
-        if (layer < ctx.layer_idx && layer > next_layer && st.cached_use_llep &&
-            !st.cached_plan.weights_to_receive.empty()) {
-            next_layer = layer;
+        if (!st.cached_use_llep || st.cached_plan.weights_to_receive.empty()) continue;
+        if (replay) {
+            if (layer < ctx.layer_idx && (next_layer < 0 || layer > next_layer)) next_layer = layer;
+        } else {
+            if (st.plan_age + 1 >= mOptions.EPPlanRefreshInterval) continue;
+            if (layer > ctx.layer_idx && (next_layer < 0 || layer < next_layer)) next_layer = layer;
         }
     }
     if (next_layer < 0) return;

@@ -31,6 +31,11 @@ struct EpLayerState {
     // intermittently deadlock the issue order. Routing is deterministic, so the
     // forward plan is bit-identical — replay restores it instead.
     bool plan_cached = false;
+
+    /// Forward dispatches served by the cached plan since it was computed
+    /// (sticky plans). Advances in lockstep on every rank, so the skip-detect
+    /// decision below is symmetric across the EP group.
+    int plan_age = 0;
     bool cached_use_llep = false;
     int cached_total_send = 0;
     int cached_total_recv = 0;
