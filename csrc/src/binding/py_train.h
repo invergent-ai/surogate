@@ -376,6 +376,7 @@ private:
 
     std::unique_ptr<CommunicatorThreadsPack> mThreads;
     struct sFullStepGraphState {
+        Tensor chunk_pos_scratch;  ///< pinned [planes, B, chunk_T] staging for chunked pos ids
         cudaGraphExec_t graph_exec = nullptr;
         bool captured = false;
         int captured_B = 0;

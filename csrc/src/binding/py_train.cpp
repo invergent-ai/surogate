@@ -1121,9 +1121,6 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                 // zero/accumulate, LoRA bookkeeping and loss reduction key
                 // off them exactly as plain grad accumulation would.
                 // ----------------------------------------------------------
-                if (pos_planes > 1) {
-                    throw std::runtime_error("chunked-sequence training does not support mRoPE position planes");
-                }
                 if (B != 1) {
                     throw std::runtime_error("chunked-sequence training requires per-device batch size 1");
                 }
@@ -1136,6 +1133,25 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                     v.Sizes[v.Rank - 1] = T;
                     v.Data = static_cast<std::byte*>(full.Data) + static_cast<std::size_t>(c) * chunk_bytes_off;
                     return v;
+                };
+                // Position ids may carry mRoPE planes ([planes, B, T_step]);
+                // a chunk slice is then non-contiguous — stage it through a
+                // small pinned scratch (planes x B x T).
+                auto pos_chunk_view = [&](Tensor& full, int c) -> Tensor {
+                    if (pos_planes <= 1) return chunk_view(full, c);
+                    if (!gs.chunk_pos_scratch.Data) {
+                        auto name = fmt::format("chunk_pos_scratch_rank{}", ctx.Communicator->local_rank());
+                        gs.chunk_pos_scratch = rs.Allocator->allocate(
+                            ETensorDType::INT32, name.c_str(), EAllocationType::PINNED, {pos_planes, B, T});
+                    }
+                    auto* dst = gs.chunk_pos_scratch.get<std::int32_t>();
+                    const auto* src = reinterpret_cast<const std::int32_t*>(full.Data);
+                    for (int pl = 0; pl < pos_planes; ++pl) {
+                        std::memcpy(dst + static_cast<std::size_t>(pl) * T,
+                                    src + static_cast<std::size_t>(pl) * T_step + static_cast<std::size_t>(c) * T,
+                                    static_cast<std::size_t>(T) * sizeof(std::int32_t));
+                    }
+                    return gs.chunk_pos_scratch;
                 };
                 const bool chunk_trace = std::getenv("SUROGATE_CHUNK_TRACE") != nullptr;
                 // Per-chunk document geometry from position ids: packed rows
@@ -1191,7 +1207,7 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                     const int eff_chunks = chunk_count_per_micro[static_cast<std::size_t>(j)];
                     for (int c = 0; c < eff_chunks; ++c) {
                         Tensor in_v = chunk_view(gs.inputs[j], c);
-                        Tensor pos_v = chunk_view(gs.position_ids[j], c);
+                        Tensor pos_v = pos_chunk_view(gs.position_ids[j], c);
                         Tensor tgt_v = chunk_view(gs.targets[j], c);
                         const auto pack =
                             build_chunk_pack(reinterpret_cast<const std::int32_t*>(gs.position_ids[j].Data), c);
@@ -1211,7 +1227,7 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                     ctx.Model->zero_sequence_chunk_dkv();
                     for (int c = eff_chunks - 1; c >= 0; --c) {
                         Tensor in_v = chunk_view(gs.inputs[j], c);
-                        Tensor pos_v = chunk_view(gs.position_ids[j], c);
+                        Tensor pos_v = pos_chunk_view(gs.position_ids[j], c);
                         Tensor tgt_v = chunk_view(gs.targets[j], c);
                         const int micro_eff = micro_base + (eff_chunks - 1 - c);
                         auto pack =

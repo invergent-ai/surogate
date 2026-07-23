@@ -245,7 +245,15 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op, co
     // Note: the AOT kernel expects h0 as BF16 (see gdr_fwd_h manifest signature).
     Tensor h0_buf;
     void* h0_ptr;
-    if (initial_state) {
+    ChunkGdnState* chunk_gdn = nullptr;
+    if (sequence_chunk_active()) {
+        // Chunked-sequence carry: slot c holds the recurrent state BEFORE
+        // chunk c (slot 0 is permanently zero). The final state is converted
+        // into slot c+1 after fwd_h below — idempotent across the phase-B
+        // re-forward and the backward's recompute of the same chunk.
+        chunk_gdn = &chunk_gdn_state(static_cast<long>(B) * H * K * V, op_layer_idx(op));
+        h0_ptr = chunk_gdn->states + static_cast<std::size_t>(sequence_chunk_idx()) * chunk_gdn->elems;
+    } else if (initial_state) {
         h0_ptr = initial_state->Data;
     } else {
         h0_buf = mRunState.temp_alloc(ETensorDType::BF16, {B, H, K, V}, "gated_delta_rule_h0_buf");
@@ -311,6 +319,13 @@ void CompiledExecutor::dispatch_gated_delta_rule_common(const CompiledOp& op, co
                           args,
                           9,
                           stream);
+    }
+
+    if (chunk_gdn) {
+        convert_dtype(chunk_gdn->states + static_cast<std::size_t>(sequence_chunk_idx() + 1) * chunk_gdn->elems,
+                      reinterpret_cast<const float*>(final_state_ptr->Data),
+                      chunk_gdn->elems,
+                      stream);
     }
 
     // 6. fwd_o: (q, k, v_new, h, g_cum, o, scale, T) grid=(cdiv(V,BV_o), NT, B*H)
@@ -579,7 +594,11 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
 
     void* h0_ptr;
     Tensor h0_buf;
-    if (initial_state) {
+    ChunkGdnState* chunk_gdn = nullptr;
+    if (sequence_chunk_active()) {
+        chunk_gdn = &chunk_gdn_state(static_cast<long>(B) * H * K * V, op_layer_idx(op));
+        h0_ptr = chunk_gdn->states + static_cast<std::size_t>(sequence_chunk_idx()) * chunk_gdn->elems;
+    } else if (initial_state) {
         h0_ptr = initial_state->Data;
     } else {
         h0_buf = mRunState.temp_alloc(ETensorDType::BF16, {B, H, K, V}, "gated_delta_rule_h0_buf");
@@ -625,6 +644,12 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
         void* wp = w.Data;
         void* gp = g_cum.Data;
         void* dhtp = d_final_state ? d_final_state->Data : nullptr;
+        if (chunk_gdn) {
+            // Reverse carry: d(final state of this chunk) = d(initial state)
+            // emitted by the NEXT chunk's backward (zeroed at sweep start for
+            // the last chunk, whose final state is unused).
+            dhtp = chunk_gdn->d_state;
+        }
         Tensor dht_zero;
         if (!dhtp) {
             dht_zero = mRunState.temp_alloc(ETensorDType::FP32, {B, H, K, V}, "gated_delta_rule_dht_zero");
@@ -644,6 +669,17 @@ void CompiledExecutor::dispatch_chunk_gated_delta_rule_backward(const CompiledOp
                             args,
                             12,
                             stream);
+    }
+
+    if (chunk_gdn) {
+        // Hand this chunk's d_initial to the previous chunk's backward. The
+        // kernel above consumed the old carry (dht) before this copy, and
+        // both run on the same stream — no hazard.
+        CUDA_CHECK(cudaMemcpyAsync(chunk_gdn->d_state,
+                                   d_initial->Data,
+                                   chunk_gdn->elems * sizeof(float),
+                                   cudaMemcpyDeviceToDevice,
+                                   stream));
     }
 
     // bwd_dqkwg

@@ -335,6 +335,50 @@ void CompiledExecutor::zero_sequence_chunk_dkv() {
         if (st.dk) CUDA_CHECK(cudaMemsetAsync(st.dk, 0, st.kv_elems * sizeof(float), mRunState.MainStream));
         if (st.dv) CUDA_CHECK(cudaMemsetAsync(st.dv, 0, st.kv_elems * sizeof(float), mRunState.MainStream));
     }
+    for (auto& [layer, st] : mChunkGdn) {
+        if (st.d_state) CUDA_CHECK(cudaMemsetAsync(st.d_state, 0, st.elems * sizeof(float), mRunState.MainStream));
+    }
+    for (auto& [layer, st] : mChunkConv) {
+        if (st.d_tail)
+            CUDA_CHECK(cudaMemsetAsync(st.d_tail, 0, st.elems * get_dtype_size(st.dtype), mRunState.MainStream));
+    }
+}
+
+CompiledExecutor::ChunkGdnState& CompiledExecutor::chunk_gdn_state(long elems, int key) {
+    auto& st = mChunkGdn[key];
+    const std::size_t need = static_cast<std::size_t>(elems);
+    if (st.elems < need) {
+        cudaStream_t stream = mRunState.MainStream;
+        if (st.states) CUDA_CHECK(cudaFreeAsync(st.states, stream));
+        if (st.d_state) CUDA_CHECK(cudaFreeAsync(st.d_state, stream));
+        const std::size_t slots = static_cast<std::size_t>(mChunkCount) + 1;
+        CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&st.states), slots * need * sizeof(nv_bfloat16), stream));
+        CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&st.d_state), need * sizeof(float), stream));
+        // Slot 0 (state before chunk 0) stays zero forever; zero it all once.
+        CUDA_CHECK(cudaMemsetAsync(st.states, 0, slots * need * sizeof(nv_bfloat16), stream));
+        CUDA_CHECK(cudaMemsetAsync(st.d_state, 0, need * sizeof(float), stream));
+        st.elems = need;
+    }
+    return st;
+}
+
+CompiledExecutor::ChunkConvState& CompiledExecutor::chunk_conv_state(long elems, ETensorDType dtype, int key) {
+    auto& st = mChunkConv[key];
+    const std::size_t need = static_cast<std::size_t>(elems);
+    const std::size_t es = get_dtype_size(dtype);
+    if (st.elems < need || st.dtype != dtype) {
+        cudaStream_t stream = mRunState.MainStream;
+        if (st.tails) CUDA_CHECK(cudaFreeAsync(st.tails, stream));
+        if (st.d_tail) CUDA_CHECK(cudaFreeAsync(st.d_tail, stream));
+        const std::size_t slots = static_cast<std::size_t>(mChunkCount) + 1;
+        CUDA_CHECK(cudaMallocAsync(&st.tails, slots * need * es, stream));
+        CUDA_CHECK(cudaMallocAsync(&st.d_tail, need * es, stream));
+        CUDA_CHECK(cudaMemsetAsync(st.tails, 0, slots * need * es, stream));
+        CUDA_CHECK(cudaMemsetAsync(st.d_tail, 0, need * es, stream));
+        st.elems = need;
+        st.dtype = dtype;
+    }
+    return st;
 }
 
 void CompiledExecutor::free_sequence_chunk_state() {
@@ -347,11 +391,21 @@ void CompiledExecutor::free_sequence_chunk_state() {
             if (st.dk) cudaFreeAsync(st.dk, mRunState.MainStream);
             if (st.dv) cudaFreeAsync(st.dv, mRunState.MainStream);
         }
+        for (auto& [layer, st] : mChunkGdn) {
+            if (st.states) cudaFreeAsync(st.states, mRunState.MainStream);
+            if (st.d_state) cudaFreeAsync(st.d_state, mRunState.MainStream);
+        }
+        for (auto& [layer, st] : mChunkConv) {
+            if (st.tails) cudaFreeAsync(st.tails, mRunState.MainStream);
+            if (st.d_tail) cudaFreeAsync(st.d_tail, mRunState.MainStream);
+        }
         cudaStreamSynchronize(mRunState.MainStream);
     } else {
         (void)cudaGetLastError();
     }
     mChunkAttn.clear();
+    mChunkGdn.clear();
+    mChunkConv.clear();
     if (mChunkCuDev) {
         cudaFree(mChunkCuDev);
         mChunkCuDev = nullptr;

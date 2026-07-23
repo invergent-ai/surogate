@@ -822,6 +822,29 @@ private:
     const std::vector<std::string>* mSkippedBackwardTensors = nullptr;
 
     // Document masking context for Flash Attention varlen (null = disabled)
+    /// Chunked-sequence carry for a GDN (gated delta rule) layer: per-chunk
+    /// initial states (slot c = state BEFORE chunk c, BF16 as the kernel
+    /// expects; slot 0 stays zero) and the FP32 reverse d-state carry.
+    struct ChunkGdnState {
+        nv_bfloat16* states = nullptr;  ///< [(num_chunks+1) * elems]
+        float* d_state = nullptr;       ///< [elems] — d_final for the previous chunk
+        std::size_t elems = 0;          ///< B*H*K*V
+    };
+    std::unordered_map<int, ChunkGdnState> mChunkGdn;  ///< by layer_idx
+    ChunkGdnState& chunk_gdn_state(long elems, int key);
+
+    /// Chunked-sequence carry for a causal conv layer: per-chunk input tails
+    /// (slot c = last kernel-1 columns BEFORE chunk c; slot 0 zero) and the
+    /// reverse d-tail carry.
+    struct ChunkConvState {
+        void* tails = nullptr;     ///< [(num_chunks+1) * elems] input dtype
+        void* d_tail = nullptr;    ///< [elems]
+        std::size_t elems = 0;     ///< B*conv_dim*(kernel-1)
+        ETensorDType dtype = ETensorDType::BF16;
+    };
+    std::unordered_map<int, ChunkConvState> mChunkConv;  ///< by layer_idx
+    ChunkConvState& chunk_conv_state(long elems, ETensorDType dtype, int key);
+
     struct ChunkAttnState {
         nv_bfloat16* k = nullptr;
         nv_bfloat16* v = nullptr;
