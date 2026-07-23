@@ -334,7 +334,10 @@ void set_kvprefix_params(surogate_flash::Flash_fwd_params& params,
                          int Hkv,
                          int HS,
                          float scale_override,
-                         int window_size) {
+                         int window_size,
+                         int num_segs,
+                         int max_seqlen_q,
+                         int max_seqlen_k) {
     const int H = Hq + 2 * Hkv;
     std::memset(&params, 0, sizeof(params));
 
@@ -360,13 +363,16 @@ void set_kvprefix_params(surogate_flash::Flash_fwd_params& params,
     params.h = Hq;
     params.h_k = Hkv;
     params.h_h_k_ratio = Hq / Hkv;
-    params.b = 1;
-    params.seqlen_q = T;
-    params.seqlen_k = kv_len;
+    // Packed chunks run one varlen segment per document overlapping the
+    // chunk; the single-document case is num_segs == 1 with max lens == the
+    // full chunk / prefix lengths.
+    params.b = num_segs;
+    params.seqlen_q = max_seqlen_q;
+    params.seqlen_k = max_seqlen_k;
     params.d = HS;
     params.d_rounded = HS <= 128 ? ((HS + 31) / 32) * 32 : ((HS + 63) / 64) * 64;
-    params.seqlen_q_rounded = ((T + 127) / 128) * 128;
-    params.seqlen_k_rounded = ((kv_len + 127) / 128) * 128;
+    params.seqlen_q_rounded = ((max_seqlen_q + 127) / 128) * 128;
+    params.seqlen_k_rounded = ((max_seqlen_k + 127) / 128) * 128;
     params.total_q = T;
 
     params.scale_softmax = (scale_override != 0.0f) ? scale_override : 1.0f / std::sqrt(static_cast<float>(HS));
@@ -435,11 +441,17 @@ void attention_forward_flash_kvprefix(nv_bfloat16* out,
                                       int HS,
                                       cudaStream_t stream,
                                       float scale,
-                                      int window_size) {
+                                      int window_size,
+                                      int num_segs,
+                                      int max_seqlen_q,
+                                      int max_seqlen_k) {
+    if (num_segs <= 0) num_segs = 1;
+    if (max_seqlen_q <= 0) max_seqlen_q = T;
+    if (max_seqlen_k <= 0) max_seqlen_k = kv_len;
     surogate_flash::Flash_fwd_params params;
     set_kvprefix_params(
         params, qkv, k_cache, v_cache, out, lse, cu_seqlens_q_gpu, cu_seqlens_k_gpu, T, kv_len, Hq, Hkv, HS, scale,
-        window_size);
+        window_size, num_segs, max_seqlen_q, max_seqlen_k);
     if (window_size > 0) {
         run_fwd_hs<false>(params, HS, stream);
     } else {
@@ -472,7 +484,13 @@ void attention_backward_flash_kvprefix(nv_bfloat16* dqkv,
                                        bool deterministic,
                                        cudaStream_t stream,
                                        float scale,
-                                       int window_size) {
+                                       int window_size,
+                                       int num_segs,
+                                       int max_seqlen_q,
+                                       int max_seqlen_k) {
+    if (num_segs <= 0) num_segs = 1;
+    if (max_seqlen_q <= 0) max_seqlen_q = T;
+    if (max_seqlen_k <= 0) max_seqlen_k = kv_len;
     surogate_flash::Flash_bwd_params params;
     std::memset(&params, 0, sizeof(params));
     set_kvprefix_params(params,
@@ -489,7 +507,10 @@ void attention_backward_flash_kvprefix(nv_bfloat16* dqkv,
                         Hkv,
                         HS,
                         scale,
-                        window_size);
+                        window_size,
+                        num_segs,
+                        max_seqlen_q,
+                        max_seqlen_k);
 
     const int H = Hq + 2 * Hkv;
 
@@ -521,7 +542,7 @@ void attention_backward_flash_kvprefix(nv_bfloat16* dqkv,
 
     const int HS_rounded = HS <= 128 ? ((HS + 31) / 32) * 32 : ((HS + 63) / 64) * 64;
     if (deterministic) {
-        params.dq_accum_split_stride = static_cast<int64_t>(T + 128) * Hq * HS_rounded;
+        params.dq_accum_split_stride = static_cast<int64_t>(T + 128 * num_segs) * Hq * HS_rounded;
     }
 
     if (window_size > 0) {

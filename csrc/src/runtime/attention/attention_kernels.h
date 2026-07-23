@@ -236,7 +236,10 @@ void attention_forward_flash_kvprefix(nv_bfloat16* out,
                                       int HS,
                                       cudaStream_t stream,
                                       float scale = 0.0f,
-                                      int window_size = 0);
+                                      int window_size = 0,
+                                      int num_segs = 1,
+                                      int max_seqlen_q = 0,
+                                      int max_seqlen_k = 0);
 
 // Backward for one chunk against its full prefix. Writes dQ into the chunk's
 // interleaved dqkv; reduces the prefix-wide expanded dK/dV (kv_len, Hq, HS)
@@ -269,7 +272,10 @@ void attention_backward_flash_kvprefix(nv_bfloat16* dqkv,
                                        bool deterministic,
                                        cudaStream_t stream,
                                        float scale = 0.0f,
-                                       int window_size = 0);
+                                       int window_size = 0,
+                                       int num_segs = 1,
+                                       int max_seqlen_q = 0,
+                                       int max_seqlen_k = 0);
 
 // Reduce Hq-expanded dK/dV over the whole prefix into FP32 Hkv accumulators.
 void accum_add_dkv(float* dk_accum,

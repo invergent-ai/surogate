@@ -283,3 +283,143 @@ TEST_CASE("chunked kv-prefix attention matches dense (Laguna full-attn shape)", 
 TEST_CASE("chunked kv-prefix attention matches dense (Laguna sliding, window >= kv)", "[attention][chunked]") {
     run_parity_case(/*T_total=*/512, /*chunk=*/256, /*Hq=*/64, /*Hkv=*/8, /*HS=*/128, /*window=*/512);
 }
+
+namespace {
+
+// Packed variant: two documents, the first crossing the chunk boundary.
+// doc0 = [0, 320), doc1 = [320, 512), chunks of 256.
+void run_packed_parity_case(int Hq, int Hkv, int HS, int window) {
+    const int T_total = 512, chunk = 256, doc_split = 320;
+    const int H = Hq + 2 * Hkv;
+    const std::size_t qkv_elems = static_cast<std::size_t>(T_total) * H * HS;
+    const std::size_t out_elems = static_cast<std::size_t>(T_total) * Hq * HS;
+    const std::size_t lse_elems = static_cast<std::size_t>(Hq) * T_total;
+    const std::size_t kv_elems = static_cast<std::size_t>(T_total) * Hkv * HS;
+    const int HS_rounded = HS <= 128 ? ((HS + 31) / 32) * 32 : ((HS + 63) / 64) * 64;
+
+    const auto h_qkv = random_bf16(qkv_elems, 99);
+    const auto h_dout = random_bf16(out_elems, 77);
+    cudaStream_t stream = nullptr;
+
+    DeviceBuf qkv(qkv_elems * 2);
+    DeviceBuf dout(out_elems * 2);
+    REQUIRE(cudaMemcpy(qkv.ptr, h_qkv.data(), qkv_elems * 2, cudaMemcpyHostToDevice) == cudaSuccess);
+    REQUIRE(cudaMemcpy(dout.ptr, h_dout.data(), out_elems * 2, cudaMemcpyHostToDevice) == cudaSuccess);
+
+    // ---- Reference: dense packed varlen (2 docs) ------------------------
+    DeviceBuf ref_out(out_elems * 2);
+    DeviceBuf ref_lse(lse_elems * 4);
+    DeviceBuf ref_dqkv(qkv_elems * 2);
+    {
+        const int32_t cu[3] = {0, doc_split, T_total};
+        DeviceBuf cu_gpu(sizeof(cu));
+        REQUIRE(cudaMemcpy(cu_gpu.ptr, cu, sizeof(cu), cudaMemcpyHostToDevice) == cudaSuccess);
+        attention_forward_flash_varlen(ref_out.as<nv_bfloat16>(), ref_lse.as<float>(), qkv.as<nv_bfloat16>(),
+                                       cu_gpu.as<int32_t>(), /*B_ragged=*/2, /*max_seqlen=*/doc_split,
+                                       /*total_q=*/T_total, Hq, Hkv, HS, stream, 0.0f, window);
+        const std::size_t dq_accum_elems = static_cast<std::size_t>(T_total + 256) * Hq * HS_rounded;
+        DeviceBuf dq_accum(dq_accum_elems * 4);
+        DeviceBuf dsoftmax(static_cast<std::size_t>(Hq) * (T_total + 256) * 4);
+        DeviceBuf dk_exp(static_cast<std::size_t>(T_total) * Hq * HS * 2);
+        DeviceBuf dv_exp(static_cast<std::size_t>(T_total) * Hq * HS * 2);
+        attention_backward_flash_varlen(ref_dqkv.as<nv_bfloat16>(), ref_lse.as<float>(), ref_out.as<nv_bfloat16>(),
+                                        dout.as<nv_bfloat16>(), qkv.as<nv_bfloat16>(), cu_gpu.as<int32_t>(),
+                                        dq_accum.as<float>(), dsoftmax.as<float>(), dk_exp.as<nv_bfloat16>(),
+                                        dv_exp.as<nv_bfloat16>(), /*B_ragged=*/2, doc_split, T_total, Hq, Hkv, HS,
+                                        false, stream, 0.0f, window);
+        REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    }
+
+    // ---- Chunked packed -------------------------------------------------
+    DeviceBuf chk_out(out_elems * 2);
+    DeviceBuf chk_lse(lse_elems * 4);
+    DeviceBuf chk_dqkv(qkv_elems * 2);
+    DeviceBuf k_cache(kv_elems * 2);
+    DeviceBuf v_cache(kv_elems * 2);
+    DeviceBuf dk_accum(kv_elems * 4);
+    DeviceBuf dv_accum(kv_elems * 4);
+
+    struct SegMeta {
+        std::vector<int32_t> cu_q, cu_k;
+        int win_start, kv_len, max_q, max_k;
+    };
+    // chunk 0: rows [0,256) all doc0; window [0,256).
+    SegMeta m0{{0, 256}, {0, 256}, 0, 256, 256, 256};
+    // chunk 1: doc0 tail [256,320) len 64 (keys [0,320) len 320) + doc1
+    // [320,512) len 192 (keys len 192); window starts at doc0 start = 0.
+    SegMeta m1{{0, 64, 256}, {0, 320, 512}, 0, 512, 192, 320};
+    const SegMeta* metas[2] = {&m0, &m1};
+
+    for (int c = 0; c < 2; ++c) {
+        const int pos = c * chunk;
+        const SegMeta& m = *metas[c];
+        const nv_bfloat16* qkv_c = qkv.as<nv_bfloat16>() + static_cast<std::size_t>(pos) * H * HS;
+        append_kv_to_cache(k_cache.as<nv_bfloat16>(), v_cache.as<nv_bfloat16>(), qkv_c, pos, chunk, Hq, Hkv, HS,
+                           stream);
+        DeviceBuf cu_q_gpu(m.cu_q.size() * 4);
+        DeviceBuf cu_k_gpu(m.cu_k.size() * 4);
+        REQUIRE(cudaMemcpy(cu_q_gpu.ptr, m.cu_q.data(), m.cu_q.size() * 4, cudaMemcpyHostToDevice) == cudaSuccess);
+        REQUIRE(cudaMemcpy(cu_k_gpu.ptr, m.cu_k.data(), m.cu_k.size() * 4, cudaMemcpyHostToDevice) == cudaSuccess);
+        attention_forward_flash_kvprefix(
+            chk_out.as<nv_bfloat16>() + static_cast<std::size_t>(pos) * Hq * HS,
+            chk_lse.as<float>() + static_cast<std::size_t>(c) * Hq * chunk,
+            qkv_c, k_cache.as<nv_bfloat16>() + static_cast<std::size_t>(m.win_start) * Hkv * HS,
+            v_cache.as<nv_bfloat16>() + static_cast<std::size_t>(m.win_start) * Hkv * HS, cu_q_gpu.as<int32_t>(),
+            cu_k_gpu.as<int32_t>(), chunk, m.kv_len, Hq, Hkv, HS, stream, 0.0f, window,
+            static_cast<int>(m.cu_q.size()) - 1, m.max_q, m.max_k);
+        // per-chunk LSE stored chunk-locally like the executor does:
+        // shift into a per-chunk region of chk_lse (Hq, chunk) at c*Hq*chunk
+        REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    }
+
+    for (int c = 1; c >= 0; --c) {
+        const int pos = c * chunk;
+        const SegMeta& m = *metas[c];
+        const nv_bfloat16* qkv_c = qkv.as<nv_bfloat16>() + static_cast<std::size_t>(pos) * H * HS;
+        DeviceBuf cu_q_gpu(m.cu_q.size() * 4);
+        DeviceBuf cu_k_gpu(m.cu_k.size() * 4);
+        REQUIRE(cudaMemcpy(cu_q_gpu.ptr, m.cu_q.data(), m.cu_q.size() * 4, cudaMemcpyHostToDevice) == cudaSuccess);
+        REQUIRE(cudaMemcpy(cu_k_gpu.ptr, m.cu_k.data(), m.cu_k.size() * 4, cudaMemcpyHostToDevice) == cudaSuccess);
+        const int nsegs = static_cast<int>(m.cu_q.size()) - 1;
+        const std::size_t dq_accum_elems = static_cast<std::size_t>(chunk + 128 * nsegs) * Hq * HS_rounded;
+        DeviceBuf dq_accum(dq_accum_elems * 4);
+        DeviceBuf dsoftmax(static_cast<std::size_t>(Hq) * (chunk + 128 * nsegs) * 4);
+        DeviceBuf dk_exp(static_cast<std::size_t>(m.kv_len) * Hq * HS * 2);
+        DeviceBuf dv_exp(static_cast<std::size_t>(m.kv_len) * Hq * HS * 2);
+        // per-chunk LSE lives at slot c
+        attention_backward_flash_kvprefix(
+            chk_dqkv.as<nv_bfloat16>() + static_cast<std::size_t>(pos) * H * HS, dk_accum.as<float>() +
+                static_cast<std::size_t>(m.win_start) * Hkv * HS,
+            dv_accum.as<float>() + static_cast<std::size_t>(m.win_start) * Hkv * HS,
+            chk_lse.as<float>() + static_cast<std::size_t>(c) * Hq * chunk,
+            chk_out.as<nv_bfloat16>() + static_cast<std::size_t>(pos) * Hq * HS,
+            dout.as<nv_bfloat16>() + static_cast<std::size_t>(pos) * Hq * HS, qkv_c,
+            k_cache.as<nv_bfloat16>() + static_cast<std::size_t>(m.win_start) * Hkv * HS,
+            v_cache.as<nv_bfloat16>() + static_cast<std::size_t>(m.win_start) * Hkv * HS, cu_q_gpu.as<int32_t>(),
+            cu_k_gpu.as<int32_t>(), dq_accum.as<float>(), dsoftmax.as<float>(), dk_exp.as<nv_bfloat16>(),
+            dv_exp.as<nv_bfloat16>(), /*chunk_pos(win-rel)=*/pos - m.win_start, chunk, m.kv_len, Hq, Hkv, HS,
+            false, stream, 0.0f, window, nsegs, m.max_q, m.max_k);
+        REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    }
+
+    std::vector<nv_bfloat16> h_ref_out(out_elems), h_chk_out(out_elems);
+    std::vector<nv_bfloat16> h_ref_dqkv(qkv_elems), h_chk_dqkv(qkv_elems);
+    REQUIRE(cudaMemcpy(h_ref_out.data(), ref_out.ptr, out_elems * 2, cudaMemcpyDeviceToHost) == cudaSuccess);
+    REQUIRE(cudaMemcpy(h_chk_out.data(), chk_out.ptr, out_elems * 2, cudaMemcpyDeviceToHost) == cudaSuccess);
+    REQUIRE(cudaMemcpy(h_ref_dqkv.data(), ref_dqkv.ptr, qkv_elems * 2, cudaMemcpyDeviceToHost) == cudaSuccess);
+    REQUIRE(cudaMemcpy(h_chk_dqkv.data(), chk_dqkv.ptr, qkv_elems * 2, cudaMemcpyDeviceToHost) == cudaSuccess);
+
+    INFO("packed case Hq=" << Hq << " Hkv=" << Hkv << " HS=" << HS << " window=" << window);
+    REQUIRE(max_abs_diff_bf16(h_ref_out, h_chk_out) < 2e-2f);
+    REQUIRE(max_abs_diff_bf16(h_ref_dqkv, h_chk_dqkv) < 5e-2f);
+}
+
+}  // namespace
+
+TEST_CASE("packed chunked kv-prefix matches dense packed (doc across boundary, GQA)", "[attention][chunked]") {
+    run_packed_parity_case(/*Hq=*/8, /*Hkv=*/2, /*HS=*/128, /*window=*/0);
+}
+
+TEST_CASE("packed chunked kv-prefix matches dense packed (sliding window)", "[attention][chunked]") {
+    run_packed_parity_case(/*Hq=*/8, /*Hkv=*/2, /*HS=*/128, /*window=*/128);
+}
