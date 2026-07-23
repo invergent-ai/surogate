@@ -8,7 +8,7 @@ gpus: 4
 ep_size: 4
 
 sample_packing: true
-sequence_len: 2048
+sequence_len: 1024
 
 max_steps: 50
 eval_steps: 25
@@ -29,6 +29,11 @@ router_z_loss_coef: 0.001
 
 qlora_offload_experts: false
 cpu_training: true
+# seq 1024 is the current dense ceiling on 4x32GB (the per-layer EP buffers
+# and saved sets are token-linear; 2048 OOMs in ep_combine_backward).
+# Chunked-sequence training (sequence_chunks) would lift this but is not yet
+# available for GDN hybrid models — the linear-attention layers need
+# recurrent state carried across chunks.
 # recompute (on by default) bounds per-layer activations; offload_residual moves the
 # per-layer residual checkpoints to pinned CPU so total activation memory is independent
 # of depth — needed here, the OOM was a late-layer (op ~1738) backward saved-tensor.

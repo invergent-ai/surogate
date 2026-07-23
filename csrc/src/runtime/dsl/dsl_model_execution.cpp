@@ -139,6 +139,16 @@ void DslModel::set_sequence_chunk(int idx, int count, const ChunkPackMeta* pack)
     if (!mExecutor) {
         throw std::logic_error("DslModel::set_sequence_chunk called before allocate_run_state()");
     }
+    // Linear-attention (GDN) layers are recurrent: chunk c needs chunk c-1's
+    // delta-rule state and conv tail, which the chunked schedule does not
+    // carry yet. Refuse loudly — running would silently truncate context at
+    // every chunk boundary on those layers.
+    if (idx >= 0 && count > 1 && mRuntimeConfig.linear_num_key_heads > 0) {
+        throw std::runtime_error(
+            "sequence_chunks > 1 is not supported for linear-attention (GDN) hybrid models yet: "
+            "recurrent state carry across chunks is not implemented (model has " +
+            std::to_string(mRuntimeConfig.linear_num_key_heads) + " linear key heads)");
+    }
     mSequenceChunkActive = (idx >= 0 && count > 1);
     mExecutor->set_sequence_chunk(idx, count, pack);
 }
