@@ -84,7 +84,6 @@ public:
                            p.Hkv,
                            p.Hs,
                            p.stream);
-        const bool trace = std::getenv("SUROGATE_CHUNK_TRACE") != nullptr;
         attention_forward_flash_kvprefix(p.out.get<nv_bfloat16>(),
                                          p.lse.get<float>(),
                                          p.qkv.get<nv_bfloat16>(),
@@ -100,25 +99,6 @@ public:
                                          p.stream,
                                          p.softmax_scale,
                                          p.window_size);
-        if (trace) {
-            CUDA_CHECK(cudaStreamSynchronize(p.stream));
-            int32_t cu[4] = {-1, -1, -1, -1};
-            CUDA_CHECK(cudaMemcpy(cu, p.chunk_cu_q, 2 * sizeof(int32_t), cudaMemcpyDeviceToHost));
-            CUDA_CHECK(cudaMemcpy(cu + 2, p.chunk_cu_k, 2 * sizeof(int32_t), cudaMemcpyDeviceToHost));
-            fprintf(stderr, "[kvpfx cu] q=[%d,%d] k=[%d,%d] scale=%f\n", cu[0], cu[1], cu[2], cu[3], p.softmax_scale);
-            nv_bfloat16 q0{}, k0{}, o0{}, olast{};
-            CUDA_CHECK(cudaMemcpy(&q0, p.qkv.Data, sizeof(q0), cudaMemcpyDeviceToHost));
-            CUDA_CHECK(cudaMemcpy(&k0, p.chunk_k_cache, sizeof(k0), cudaMemcpyDeviceToHost));
-            CUDA_CHECK(cudaMemcpy(&o0, p.out.Data, sizeof(o0), cudaMemcpyDeviceToHost));
-            const std::size_t last_off =
-                (static_cast<std::size_t>(p.T) * p.Hq * p.Hs - 1) * sizeof(nv_bfloat16);
-            CUDA_CHECK(cudaMemcpy(&olast, static_cast<std::byte*>(p.out.Data) + last_off, sizeof(olast),
-                                  cudaMemcpyDeviceToHost));
-            fprintf(stderr, "[kvpfx] pos=%d kv=%d win=%d Hq=%d q0=%f k0=%f o0=%f olast=%f\n", p.chunk_pos,
-                    p.chunk_kv_len, p.window_size, p.Hq, __bfloat162float(q0), __bfloat162float(k0),
-                    __bfloat162float(o0), __bfloat162float(olast));
-            fflush(stderr);
-        }
     }
 
     void backward(AttentionParams& p) override {

@@ -1128,6 +1128,7 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                             fflush(stderr);
                         }
                         ctx.Model->forward(in_v, pos_v, *ctx.Communicator, j * seq_chunks + c);
+                        tick_work_heartbeat();
                     }
                     ctx.Model->zero_sequence_chunk_dkv();
                     for (int c = seq_chunks - 1; c >= 0; --c) {
@@ -1142,7 +1143,9 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                             fflush(stderr);
                         }
                         ctx.Model->forward(in_v, pos_v, *ctx.Communicator, micro_eff);
+                        tick_work_heartbeat();
                         ctx.Model->backward(in_v, tgt_v, *ctx.Communicator, accum_eff, micro_eff);
+                        tick_work_heartbeat();
                     }
                     ctx.Model->set_sequence_chunk(-1, 0);
                 }
@@ -1724,7 +1727,7 @@ void MultiGPUPyTrainer::run_work(std::function<void(sThreadContext& ctx)> work, 
     }
 
     auto last_progress = std::chrono::steady_clock::now();
-    std::size_t last_done = mWorkDone.load();
+    std::size_t last_done = mWorkDone.load() + mWorkHeartbeat.load();
     while (mWorkDone.load() < mContexts.size()) {
         if (mThreads->has_exception()) {
             stop();
@@ -1746,7 +1749,7 @@ void MultiGPUPyTrainer::run_work(std::function<void(sThreadContext& ctx)> work, 
         // under heavy multi-threaded CUDA load and waits forever on an already-met
         // condition. A no-op signal forces EINTR + recheck. 45s is far above any
         // legitimate op; poking a healthy worker is harmless.
-        const std::size_t done_now = mWorkDone.load();
+        const std::size_t done_now = mWorkDone.load() + mWorkHeartbeat.load();
         if (done_now != last_done) {
             last_done = done_now;
             last_progress = std::chrono::steady_clock::now();

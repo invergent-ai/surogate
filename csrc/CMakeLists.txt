@@ -424,6 +424,7 @@ target_sources(surogate-common PRIVATE
 
     # Tokenizer (native C++ BPE, loads HuggingFace tokenizer.json)
     src/tokenizer/tokenizer.cpp
+    src/tokenizer/tok_profile.cpp
     src/tokenizer/unicode.cpp
     src/tokenizer/unicode_data.cpp
 

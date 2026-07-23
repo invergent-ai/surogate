@@ -34,6 +34,7 @@
 #include "runtime/qlora/qlora_config.h"
 #include "runtime/qlora/dsl_qlora_pipeline.h"
 #include "utilities/dtype.h"
+#include "tokenizer/tok_profile.h"
 #include "tokenizer/tokenizer.h"
 #include "runtime/attention/mem_eff/mem_eff_dispatch.h"
 
@@ -3344,6 +3345,16 @@ NB_MODULE(_surogate, m) {
                     "The directory must contain tokenizer.json. Optionally reads\n"
                     "tokenizer_config.json for BOS/EOS/PAD token metadata.\n\n"
                     "Parameters:\n- model_dir: Path to model directory.")
+        .def_static(
+            "profile_report",
+            [](bool reset) { return tokenizer::tok_profile_report(reset); },
+            nb::arg("reset") = false,
+            "Return the encode_for_training phase breakdown (render vs pretokenize\n"
+            "vs BPE merge) accumulated since load/last reset. Empty string unless\n"
+            "SUROGATE_TOK_PROFILE=1 and at least one training encode ran. If reset\n"
+            "is True, the counters are zeroed after reading.")
+        .def_static(
+            "profile_reset", [] { tokenizer::tok_profile_report(true); }, "Zero the encode_for_training profile counters.")
         .def("encode",
              &tokenizer::Tokenizer::encode,
              nb::arg("text"),

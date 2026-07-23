@@ -1066,8 +1066,12 @@ void EPStrategy::finalize_llep_state(CompiledExecutor& exec,
                 const long b_cols = local.B.Sizes[2];
                 const std::size_t a_slice = static_cast<std::size_t>(a_rows * a_cols) * get_dtype_size(local.A.DType);
                 const std::size_t b_slice = static_cast<std::size_t>(b_rows * b_cols) * get_dtype_size(local.B.DType);
-                const std::size_t need_A = static_cast<std::size_t>(ctx.num_merged) * a_slice;
-                const std::size_t need_B = static_cast<std::size_t>(ctx.num_merged) * b_slice;
+                // Floored at one row: a rank whose experts were all spilled away
+                // (num_merged == 0 — routine for all-padding chunks) must still
+                // present non-null merged tensors so downstream gates behave
+                // identically on every rank (collective schedules depend on it).
+                const std::size_t need_A = static_cast<std::size_t>(std::max(ctx.num_merged, 1)) * a_slice;
+                const std::size_t need_B = static_cast<std::size_t>(std::max(ctx.num_merged, 1)) * b_slice;
 
                 // Per-layer owned allocations — LoRA is small (~9 MB/layer)
                 // so per-layer storage avoids the shared-buffer aliasing bug.
@@ -1620,6 +1624,11 @@ void EPStrategy::maybe_prefetch_next_layer(CompiledExecutor& exec, const Dispatc
 
 void EPStrategy::dispatch_backward(CompiledExecutor& exec, const CompiledOp& op) {
     Tensor& d_recv_sorted = exec.resolve_tensor(op.inputs[0]);
+    if (ep_trace_enabled() && exec.mComm) {
+        fprintf(stderr, "[ep-trace r%d] dispatch_backward enter rows=%ld\n", exec.mComm->rank(),
+                static_cast<long>(d_recv_sorted.Sizes[0]));
+        fflush(stderr);
+    }
 
     const int ep_size = op.attrs.ep_size;
     const int hidden_size = static_cast<int>(d_recv_sorted.Sizes[1]);

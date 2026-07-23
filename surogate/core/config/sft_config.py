@@ -1133,7 +1133,14 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         # Expert Parallelism
         self.runtime_config.ep_size = self.ep_size
         self.runtime_config.ep_load_balance_threshold = self.ep_load_balance_threshold
-        self.runtime_config.ep_plan_refresh_interval = self.ep_plan_refresh_interval
+        # Under chunked-sequence training a layer sees 2*chunks forward
+        # dispatches per step (KV sweep + re-forward); scale the sticky-plan
+        # interval so refreshes stay at step granularity.
+        _plan_iv = int(self.ep_plan_refresh_interval or 16)
+        _sc = int(self.sequence_chunks or 1)
+        if _sc > 1:
+            _plan_iv = _plan_iv * 2 * _sc
+        self.runtime_config.ep_plan_refresh_interval = _plan_iv
         # Chunked-sequence training (validated + flags adjusted BEFORE the
         # RuntimeOptions ctor above; see the block ahead of it)
         self.runtime_config.sequence_chunks = int(self.sequence_chunks or 1)
