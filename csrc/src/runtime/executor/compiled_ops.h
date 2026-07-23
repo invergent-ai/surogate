@@ -825,6 +825,8 @@ private:
     int mChunkCount = 0;
     std::int32_t* mChunkCuDev = nullptr;   ///< device [4]: cu_q(2), cu_k(2)
     std::int32_t* mChunkCuPinned = nullptr;
+    int mChunkCuUploaded = -1;  ///< chunk idx whose cu arrays are on device
+    void ensure_chunk_cu_uploaded();
     ChunkAttnState& chunk_attn_state(int layer_idx, int Hkv, int Hs);
 
     const std::int32_t* mCuSeqlensGpu = nullptr;

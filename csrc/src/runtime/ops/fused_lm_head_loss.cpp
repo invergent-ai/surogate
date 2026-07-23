@@ -199,6 +199,30 @@ void CompiledExecutor::dispatch_fused_lm_head_loss(const CompiledOp& op) {
     Tensor& loss = ensure_output_tensor(op.outputs[0]);
 
     const long BT = xF_flat.Sizes[0];
+    if (std::getenv("SUROGATE_CHUNK_TRACE")) {
+        std::vector<int> tgt(static_cast<std::size_t>(BT));
+        std::vector<float> lbuf(static_cast<std::size_t>(BT));
+        CUDA_CHECK(cudaMemcpy(tgt.data(), targets.Data, BT * sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(lbuf.data(), loss.Data, BT * sizeof(float), cudaMemcpyDeviceToHost));
+        int pad = 0;
+        float lsum = 0.0f;
+        int lnan = 0;
+        for (long i = 0; i < BT; ++i) {
+            if (tgt[static_cast<std::size_t>(i)] == -100) ++pad;
+            const float v = lbuf[static_cast<std::size_t>(i)];
+            if (std::isnan(v)) ++lnan; else lsum += v;
+        }
+        int vtc = 0;
+        CUDA_CHECK(cudaMemcpy(&vtc, mRunState.ValidTokenCount.Data, sizeof(int), cudaMemcpyDeviceToHost));
+        float xf0 = 0.0f;
+        {
+            nv_bfloat16 h{};
+            CUDA_CHECK(cudaMemcpy(&h, xF_flat.Data, sizeof(h), cudaMemcpyDeviceToHost));
+            xf0 = __bfloat162float(h);
+        }
+        fprintf(stderr, "[lmloss pre] BT=%ld pad=%d loss_sum=%f loss_nan=%d vtc=%d xf0=%f\n", BT, pad, lsum, lnan, vtc, xf0);
+        fflush(stderr);
+    }
     const int V = static_cast<int>(weight.Sizes[0]);
     const int C = static_cast<int>(weight.Sizes[1]);
     const int P = V;

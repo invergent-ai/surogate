@@ -275,3 +275,11 @@ TEST_CASE("chunked kv-prefix attention matches dense (sliding window across chun
 TEST_CASE("chunked kv-prefix attention matches dense (MHA)", "[attention][chunked]") {
     run_parity_case(/*T_total=*/512, /*chunk=*/256, /*Hq=*/4, /*Hkv=*/4, /*HS=*/64, /*window=*/0);
 }
+
+TEST_CASE("chunked kv-prefix attention matches dense (Laguna full-attn shape)", "[attention][chunked]") {
+    run_parity_case(/*T_total=*/512, /*chunk=*/256, /*Hq=*/48, /*Hkv=*/8, /*HS=*/128, /*window=*/0);
+}
+
+TEST_CASE("chunked kv-prefix attention matches dense (Laguna sliding, window >= kv)", "[attention][chunked]") {
+    run_parity_case(/*T_total=*/512, /*chunk=*/256, /*Hq=*/64, /*Hkv=*/8, /*HS=*/128, /*window=*/512);
+}

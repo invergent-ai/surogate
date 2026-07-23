@@ -1116,7 +1116,13 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                     for (int c = 0; c < seq_chunks; ++c) {
                         Tensor in_v = chunk_view(gs.inputs[j], c);
                         Tensor pos_v = chunk_view(gs.position_ids[j], c);
+                        Tensor tgt_v = chunk_view(gs.targets[j], c);
                         ctx.Model->set_sequence_chunk(c, seq_chunks);
+                        // The loss op lives in the forward graph — stage the
+                        // chunk's real targets so phase A's loss terms are
+                        // sane (they are wiped by the micro-0 zeroing before
+                        // phase B accumulates the reported values).
+                        rs.Targets_CPU = tgt_v;
                         if (chunk_trace && ctx.Communicator->rank() == 0) {
                             fprintf(stderr, "[chunk] phaseA j=%d c=%d\n", j, c);
                             fflush(stderr);

@@ -17,6 +17,11 @@ EPBufferPool::~EPBufferPool() {
 }
 
 void* EPBufferPool::acquire(std::size_t need) {
+    // Zero-size acquires still return a real buffer: EP ranks can carry
+    // 0-row tensors (a rank receiving no tokens after rebalancing — routine
+    // for all-padding tail chunks under chunked-sequence training) whose
+    // stored Data pointer must be non-null for downstream resolution.
+    if (need == 0) need = 256;
     if (need == 0) return nullptr;
 
     // Best-fit: smallest buffer that satisfies the request.

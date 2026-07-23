@@ -257,16 +257,21 @@ CompiledExecutor::ChunkAttnState& CompiledExecutor::chunk_attn_state(int layer_i
     auto& st = mChunkAttn[layer_idx];
     const std::size_t need = static_cast<std::size_t>(mChunkCount) * mT * Hkv * Hs;
     if (st.kv_elems < need) {
-        if (st.k) cudaFree(st.k);
-        if (st.v) cudaFree(st.v);
-        if (st.dk) cudaFree(st.dk);
-        if (st.dv) cudaFree(st.dv);
-        CUDA_CHECK(cudaMalloc(&st.k, need * sizeof(nv_bfloat16)));
-        CUDA_CHECK(cudaMalloc(&st.v, need * sizeof(nv_bfloat16)));
-        CUDA_CHECK(cudaMalloc(&st.dk, need * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&st.dv, need * sizeof(float)));
-        CUDA_CHECK(cudaMemset(st.dk, 0, need * sizeof(float)));
-        CUDA_CHECK(cudaMemset(st.dv, 0, need * sizeof(float)));
+        // Stream-ordered allocation: this runs mid-dispatch on 8 in-process
+        // ranks with NCCL kernels at other ranks' stream heads — plain
+        // cudaMalloc's global driver lock convoys into a cross-rank stall
+        // (the same failure class the EP ring arena eliminated).
+        cudaStream_t stream = mRunState.MainStream;
+        if (st.k) CUDA_CHECK(cudaFreeAsync(st.k, stream));
+        if (st.v) CUDA_CHECK(cudaFreeAsync(st.v, stream));
+        if (st.dk) CUDA_CHECK(cudaFreeAsync(st.dk, stream));
+        if (st.dv) CUDA_CHECK(cudaFreeAsync(st.dv, stream));
+        CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&st.k), need * sizeof(nv_bfloat16), stream));
+        CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&st.v), need * sizeof(nv_bfloat16), stream));
+        CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&st.dk), need * sizeof(float), stream));
+        CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&st.dv), need * sizeof(float), stream));
+        CUDA_CHECK(cudaMemsetAsync(st.dk, 0, need * sizeof(float), stream));
+        CUDA_CHECK(cudaMemsetAsync(st.dv, 0, need * sizeof(float), stream));
         st.kv_elems = need;
     }
     return st;
@@ -275,18 +280,31 @@ CompiledExecutor::ChunkAttnState& CompiledExecutor::chunk_attn_state(int layer_i
 void CompiledExecutor::set_sequence_chunk(int idx, int count) {
     mChunkIdx = idx;
     mChunkCount = count;
-    if (idx < 0 || count <= 1) return;
-    if (!mChunkCuDev) {
+    // Allocate the (tiny, fixed-size) cu_seqlens buffers here, outside op
+    // dispatch: cudaMalloc/cudaMallocHost take the global driver lock and
+    // convoy against other ranks' pending NCCL kernels when done mid-graph.
+    if (count > 1 && !mChunkCuDev) {
         CUDA_CHECK(cudaMalloc(&mChunkCuDev, 4 * sizeof(std::int32_t)));
         CUDA_CHECK(cudaMallocHost(&mChunkCuPinned, 4 * sizeof(std::int32_t)));
+    }
+    // Contents are built lazily at attention-dispatch time: mT is only valid
+    // while a graph is executing, not here.
+    mChunkCuUploaded = -1;
+}
+
+void CompiledExecutor::ensure_chunk_cu_uploaded() {
+    if (mChunkCuUploaded == mChunkIdx) return;
+    if (!mChunkCuDev) {
+        throw std::runtime_error("chunked-sequence: cu buffers not allocated (set_sequence_chunk not called)");
     }
     // cu_q = [0, T]; cu_k = [0, (idx+1) * T]
     mChunkCuPinned[0] = 0;
     mChunkCuPinned[1] = static_cast<std::int32_t>(mT);
     mChunkCuPinned[2] = 0;
-    mChunkCuPinned[3] = static_cast<std::int32_t>((idx + 1) * mT);
+    mChunkCuPinned[3] = static_cast<std::int32_t>((mChunkIdx + 1) * mT);
     CUDA_CHECK(cudaMemcpyAsync(
         mChunkCuDev, mChunkCuPinned, 4 * sizeof(std::int32_t), cudaMemcpyHostToDevice, mRunState.MainStream));
+    mChunkCuUploaded = mChunkIdx;
 }
 
 void CompiledExecutor::zero_sequence_chunk_dkv() {
@@ -297,11 +315,18 @@ void CompiledExecutor::zero_sequence_chunk_dkv() {
 }
 
 void CompiledExecutor::free_sequence_chunk_state() {
-    for (auto& [layer, st] : mChunkAttn) {
-        if (st.k) cudaFree(st.k);
-        if (st.v) cudaFree(st.v);
-        if (st.dk) cudaFree(st.dk);
-        if (st.dv) cudaFree(st.dv);
+    // KV/dKV buffers are stream-ordered allocations; free them the same way.
+    // Probe the context first — teardown may run with it already dead.
+    if (cudaFree(nullptr) == cudaSuccess) {
+        for (auto& [layer, st] : mChunkAttn) {
+            if (st.k) cudaFreeAsync(st.k, mRunState.MainStream);
+            if (st.v) cudaFreeAsync(st.v, mRunState.MainStream);
+            if (st.dk) cudaFreeAsync(st.dk, mRunState.MainStream);
+            if (st.dv) cudaFreeAsync(st.dv, mRunState.MainStream);
+        }
+        cudaStreamSynchronize(mRunState.MainStream);
+    } else {
+        (void)cudaGetLastError();
     }
     mChunkAttn.clear();
     if (mChunkCuDev) {
@@ -389,6 +414,7 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
     params.sm_version = mRunState.DeviceProp.major * 10 + mRunState.DeviceProp.minor;
 
     if (sequence_chunk_active()) {
+        ensure_chunk_cu_uploaded();
         auto& cst = chunk_attn_state(layer_idx, Hkv, Hs);
         params.chunk_pos = mChunkIdx * static_cast<int>(mT);
         params.chunk_kv_len = (mChunkIdx + 1) * static_cast<int>(mT);
@@ -526,6 +552,7 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
     params.sm_version = mRunState.DeviceProp.major * 10 + mRunState.DeviceProp.minor;
 
     if (sequence_chunk_active()) {
+        ensure_chunk_cu_uploaded();
         auto& cst = chunk_attn_state(layer_idx, Hkv, Hs);
         params.chunk_pos = mChunkIdx * static_cast<int>(mT);
         params.chunk_kv_len = (mChunkIdx + 1) * static_cast<int>(mT);

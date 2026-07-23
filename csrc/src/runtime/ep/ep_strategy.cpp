@@ -900,14 +900,21 @@ void EPStrategy::permute_recv_tokens(CompiledExecutor& exec,
 
     // Per-layer persistent outputs (consumed by GEMM, kept until backward).
     auto& ep_state_out = mEpStates[ctx.ep_key];
-    const std::size_t sorted_need = static_cast<std::size_t>(ctx.total_recv) * ctx.hidden_size * ctx.elem_sz;
+    // Floor the persistent output buffers at a minimal allocation: a rank can
+    // legitimately receive ZERO tokens after rebalancing (routine for
+    // all-padding tail chunks under chunked-sequence training), and the
+    // stored 0-row tensors must still carry a non-null Data pointer for
+    // downstream tensor resolution (notably the recompute replay).
+    const std::size_t sorted_need =
+        std::max<std::size_t>(static_cast<std::size_t>(ctx.total_recv) * ctx.hidden_size * ctx.elem_sz, 256);
     alloc_or_resize(ep_state_out.sorted_recv_gpu, ep_state_out.sorted_recv_bytes, sorted_need);
     sorted_recv_out = make_raw_tensor(ep_state_out.sorted_recv_gpu,
                                       ctx.dtype,
                                       {static_cast<long>(ctx.total_recv), static_cast<long>(ctx.hidden_size)},
                                       ctx.device);
 
-    const std::size_t local_scatter_need = static_cast<std::size_t>(ctx.total_recv) * sizeof(int);
+    const std::size_t local_scatter_need =
+        std::max<std::size_t>(static_cast<std::size_t>(ctx.total_recv) * sizeof(int), 256);
     alloc_or_resize(ep_state_out.local_scatter_gpu, ep_state_out.local_scatter_bytes, local_scatter_need);
     local_scatter_out = make_raw_tensor(ep_state_out.local_scatter_gpu,
                                         ETensorDType::INT32,
@@ -1873,7 +1880,10 @@ void EPStrategy::combine_backward(CompiledExecutor& exec, const CompiledOp& op) 
     if (d_reordered_ptr) mBufferPool.release(d_reordered_ptr, d_reordered_bytes);
 
     // 2. Re-sort by local expert (same permutation as dispatch forward).
-    const std::size_t sorted_need = static_cast<std::size_t>(ep_state.total_recv) * hidden_size * elem_sz;
+    // Floored at a minimal allocation: zero-recv ranks still store a 0-row
+    // gradient whose Data pointer must be non-null (see permute_recv_tokens).
+    const std::size_t sorted_need =
+        std::max<std::size_t>(static_cast<std::size_t>(ep_state.total_recv) * hidden_size * elem_sz, 256);
     alloc_or_resize(ep_state_mut.combine_bwd_sorted_gpu, ep_state_mut.combine_bwd_sorted_bytes, sorted_need);
     Tensor d_expert_sorted = make_raw_tensor(ep_state_mut.combine_bwd_sorted_gpu,
                                              d_combined.DType,
