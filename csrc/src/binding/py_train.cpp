@@ -1214,8 +1214,9 @@ std::pair<float, float> MultiGPUPyTrainer::train_step_graphed(const std::int32_t
                         Tensor pos_v = chunk_view(gs.position_ids[j], c);
                         Tensor tgt_v = chunk_view(gs.targets[j], c);
                         const int micro_eff = micro_base + (eff_chunks - 1 - c);
-                        const auto pack =
+                        auto pack =
                             build_chunk_pack(reinterpret_cast<const std::int32_t*>(gs.position_ids[j].Data), c);
+                        pack.reuse_ep = true;  // phase A cached this chunk's plan+splits
                         ctx.Model->set_sequence_chunk(c, seq_chunks, &pack);
                         rs.Targets_CPU = tgt_v;
                         if (chunk_trace && ctx.Communicator->rank() == 0) {

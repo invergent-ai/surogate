@@ -183,6 +183,12 @@ public:
     bool sequence_chunk_active() const {
         return mChunkCount > 1 && mChunkIdx >= 0;
     }
+    int sequence_chunk_idx() const {
+        return mChunkIdx;
+    }
+    bool sequence_chunk_reuse_ep() const {
+        return mChunkPack.reuse_ep;
+    }
     /// Zero all layers' dKV accumulators — call once before each reverse
     /// backward sweep.
     void zero_sequence_chunk_dkv();

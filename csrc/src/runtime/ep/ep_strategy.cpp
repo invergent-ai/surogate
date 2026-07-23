@@ -1401,6 +1401,57 @@ void EPStrategy::dispatch_forward(CompiledExecutor& exec, const CompiledOp& op) 
             EP_TRACE(exec, ctx, "replay reusing forward plan use_llep=%d", ctx.use_llep ? 1 : 0);
         }
     }
+    // Chunked-sequence phase B: this chunk's phase-A forward already computed
+    // the plan and exchanged the splits — routing is deterministic, so
+    // restore both and skip the per-layer collectives entirely.
+    if (!reused_plan && !exec.mInReplay && exec.sequence_chunk_active() && exec.sequence_chunk_reuse_ep()) {
+        const long ck = static_cast<long>(ctx.layer_idx) * 4096 + exec.sequence_chunk_idx();
+        auto snap_it = mChunkPlanCache.find(ck);
+        if (snap_it != mChunkPlanCache.end()) {
+            const auto& c = snap_it->second;
+            long total_now = 0;
+            for (int v : ctx.local_expert_counts) total_now += v;
+            if (total_now != c.total_send) {
+                throw std::runtime_error("ep_dispatch chunk reuse: routing diverged at layer " +
+                                         std::to_string(ctx.layer_idx) + " chunk " +
+                                         std::to_string(exec.sequence_chunk_idx()));
+            }
+            ctx.use_llep = c.use_llep;
+            ctx.plan = c.plan;
+            ctx.expert_to_gpu = c.expert_to_gpu;
+            ctx.merged_experts = c.merged_experts;
+            ctx.global_to_merged = c.global_to_merged;
+            ctx.num_merged = static_cast<int>(c.merged_experts.size());
+            ctx.send_splits = c.send_splits;
+            ctx.recv_splits = c.recv_splits;
+            ctx.recv_all_counts = c.recv_all_counts;
+            ctx.total_send = c.total_send;
+            ctx.total_recv = c.total_recv;
+            reused_plan = true;
+            auto& rmeta = mEPLayerMeta[ctx.ep_key];
+            rmeta.num_merged = ctx.num_merged;
+            rmeta.native_start = ctx.ep_rank * ctx.num_local;
+            rmeta.num_local = ctx.num_local;
+            rmeta.merged_to_global = ctx.merged_experts;
+            rmeta.expert_to_gpu = ctx.expert_to_gpu;
+            // The backward replay restores from the fwd-key state cache —
+            // refresh it for this chunk exactly as the splits path would.
+            auto& st = mEpStates[ctx.ep_key];
+            st.plan_cached = true;
+            st.cached_use_llep = ctx.use_llep;
+            st.cached_plan = ctx.plan;
+            st.cached_expert_to_gpu = ctx.expert_to_gpu;
+            st.cached_merged_experts = ctx.merged_experts;
+            st.cached_global_to_merged = ctx.global_to_merged;
+            st.cached_send_splits = ctx.send_splits;
+            st.cached_recv_splits = ctx.recv_splits;
+            st.cached_recv_all_counts = ctx.recv_all_counts;
+            st.cached_total_send = ctx.total_send;
+            st.cached_total_recv = ctx.total_recv;
+            EP_TRACE(exec, ctx, "chunk reuse restored (phase B)");
+        }
+    }
+
     // Sticky plans: outside replay, reuse the layer's cached plan for up to
     // ep_plan_refresh_interval forward dispatches. Any expert->GPU mapping is
     // correct (routing counts only affect balance quality), and a stable plan
@@ -1505,6 +1556,21 @@ void EPStrategy::dispatch_forward(CompiledExecutor& exec, const CompiledOp& op) 
         st.cached_recv_all_counts = ctx.recv_all_counts;
         st.cached_total_send = ctx.total_send;
         st.cached_total_recv = ctx.total_recv;
+        // Phase-A snapshot for the chunk's phase-B re-forward.
+        if (exec.sequence_chunk_active()) {
+            const long ck = static_cast<long>(ctx.layer_idx) * 4096 + exec.sequence_chunk_idx();
+            auto& snap = mChunkPlanCache[ck];
+            snap.use_llep = ctx.use_llep;
+            snap.plan = ctx.plan;
+            snap.expert_to_gpu = ctx.expert_to_gpu;
+            snap.merged_experts = ctx.merged_experts;
+            snap.global_to_merged = ctx.global_to_merged;
+            snap.send_splits = ctx.send_splits;
+            snap.recv_splits = ctx.recv_splits;
+            snap.recv_all_counts = ctx.recv_all_counts;
+            snap.total_send = ctx.total_send;
+            snap.total_recv = ctx.total_recv;
+        }
     }
 
     // Launch LLEP base + LoRA transfers on a separate stream (overlaps the

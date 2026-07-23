@@ -68,6 +68,10 @@ public:
     //! contiguous cache window [win_start, chunk_end). Identical for the
     //! unpacked case (one segment, win_start 0).
     struct ChunkPackMeta {
+        /// Phase B (re-forward before backward): EP dispatch may restore the
+        /// plan and exchanged splits captured during this chunk's phase-A
+        /// forward — routing is deterministic, so they are identical.
+        bool reuse_ep = false;
         int num_segs = 1;
         int win_start = 0;
         int kv_len = 0;
