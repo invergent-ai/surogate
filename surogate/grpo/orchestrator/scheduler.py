@@ -12,6 +12,7 @@ from aiolimiter import AsyncLimiter
 from surogate.core.config.grpo_orch_config import GRPOOrchestratorConfig
 from surogate.grpo.orchestrator.advantage import dataclass
 from surogate.grpo.orchestrator.buffer import Buffer
+from surogate.grpo.orchestrator.patches import ROLLOUT_DEPTH_CAP_KEY
 from surogate.grpo.orchestrator.utils import get_sampling_args
 from surogate.grpo.orchestrator.vf_utils import get_seq_len, run_rollout
 from surogate.grpo.utils.asynyc_utils import safe_cancel, safe_cancel_all
@@ -96,6 +97,9 @@ class Scheduler:
 
         self.max_retries_by_task = {env.resolved_name: env.max_retries for env in config.env}
 
+        # Adaptive rollout-depth cap; None until the controller emits one.
+        self.depth_cap: int | None = None
+
         self.deferred_group_scoring_tasks = set(deferred_group_scoring_tasks or ())
         if self.deferred_group_scoring_tasks:
             task_list = ", ".join(sorted(self.deferred_group_scoring_tasks))
@@ -152,6 +156,23 @@ class Scheduler:
     def set_sampling_args(self, sampling_args: dict) -> None:
         """Update sampling args for future rollout requests."""
         self.sampling_args = sampling_args
+
+    def set_depth_cap(self, cap: int | None) -> None:
+        """Cap rollout depth for future rollout requests (None = env's own max_turns)."""
+        self.depth_cap = cap
+
+    def _example_with_depth_cap(self, example: dict) -> dict:
+        """Attach the current depth cap to a copy of `example`.
+
+        The cap rides in `info` so it reaches environments running in a separate
+        server process. Copied rather than mutated: `example` is owned by the
+        buffer and shared across the group's rollouts.
+        """
+        if self.depth_cap is None:
+            return example
+        info = dict(example.get("info") or {})
+        info[ROLLOUT_DEPTH_CAP_KEY] = int(self.depth_cap)
+        return {**example, "info": info}
 
     async def cancel_inflight_rollouts(self):
         """Cancel all in-flight rollout requests.
@@ -221,7 +242,7 @@ class Scheduler:
             run_rollout(
                 env=self.env,
                 client=client_config,
-                example=group.example,
+                example=self._example_with_depth_cap(group.example),
                 model_name=self.model_name,
                 sampling_args=self.sampling_args,
                 max_retries=self.max_retries_by_task.get(group.example["task"], 0),

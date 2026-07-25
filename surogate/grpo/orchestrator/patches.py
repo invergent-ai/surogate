@@ -112,3 +112,50 @@ def monkey_patch_chat_completion_logprobs():
     # Patch OAI types
     openai.types.chat.chat_completion.Choice = ChoiceAny
     openai.types.chat.chat_completion.ChatCompletion = ModdedChatCompletion
+
+
+# Key under which the orchestrator injects a per-rollout depth cap into
+# RolloutInput.info. It travels with the rollout, so this works identically for
+# in-process environments and for environments running in a separate env server
+# (no shared mutable state, no RPC to mutate env.max_turns).
+ROLLOUT_DEPTH_CAP_KEY = "_surogate_max_turns"
+
+
+def monkey_patch_multiturn_env_depth_cap():
+    """Let MultiTurnEnv honor a per-rollout depth cap from `info`.
+
+    Adaptive rollout-depth budgeting needs to shorten rollouts per step without
+    rebuilding environments. Rather than mutate `env.max_turns` (which is not
+    reachable when the env runs in a separate server process, and would race
+    in-flight rollouts), the orchestrator writes the cap into each example's
+    `info` and this patch enforces it.
+
+    Patches the existing `max_turns_reached` stop condition rather than adding a
+    new one: `Environment.__post_init__` snapshots *bound* stop-condition methods
+    at construction time, so a method added to the class afterwards would never
+    be registered. Patching the class before any env is constructed is picked up
+    normally. The `@vf.stop` marker attributes are carried over so the replacement
+    is still discovered as a stop condition.
+    """
+    import verifiers as vf
+
+    original = vf.MultiTurnEnv.max_turns_reached
+    if getattr(original, "_surogate_depth_cap", False):
+        return
+
+    async def max_turns_reached(self, state) -> bool:
+        info = state.get("info")
+        if isinstance(info, dict):
+            cap = info.get(ROLLOUT_DEPTH_CAP_KEY)
+            if isinstance(cap, int) and cap > 0 and len(state["trajectory"]) >= cap:
+                return True
+        return await original(self, state)
+
+    for attr in ("stop", "stop_priority"):
+        if hasattr(original, attr):
+            setattr(max_turns_reached, attr, getattr(original, attr))
+    max_turns_reached.__name__ = getattr(original, "__name__", "max_turns_reached")
+    max_turns_reached.__doc__ = original.__doc__
+    max_turns_reached._surogate_depth_cap = True
+
+    vf.MultiTurnEnv.max_turns_reached = max_turns_reached

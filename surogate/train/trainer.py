@@ -270,37 +270,13 @@ class SurogateTrainerWrapper:
     def _dispatch_pp_plan(self):
         """Partition layers into SMALL stages for dispatch-PP.
 
-        Unlike the old one-stage-per-GPU split (big stages that can't be held resident),
-        aim for ~SUROGATE_DISPATCH_STAGE_BLOCKS layers per stage (default 4) so 2x a stage
-        fits the VRAM budget and a stage stays cached across its microbatches. Always make
-        at least `gpus` stages so every device is used. Returns (los, his, n_layers,
-        num_stages, max_stage_blocks, stage_blocks).
+        Delegates to surogate.train.dispatch_pp.plan_stages so the GRPO trainer
+        gets the identical partition. Returns (los, his, n_layers, num_stages,
+        max_stage_blocks, stage_blocks).
         """
-        mc = self.config.model_info.config
-        n_layers = getattr(mc, "num_hidden_layers", 0) or getattr(
-            getattr(mc, "text_config", None), "num_hidden_layers", 0
-        )
-        if not n_layers:
-            raise RuntimeError("dispatch_pp: could not determine num_hidden_layers from model config")
-        gpus = self.config.gpus
-        sb = max(1, int(os.environ.get("SUROGATE_DISPATCH_STAGE_BLOCKS", "4")))
-        # Stages must be ALIGNED uniform blocks of `sb` ([0..sb-1], [sb..2sb-1], ...): the
-        # recompute:false activation arena is colored cyclically (layer L -> section L % sb),
-        # which is only correct if every stage starts at a multiple of sb (so L % sb == L - lo
-        # within a stage). The last stage may be shorter. Shrink sb if needed so there are at
-        # least `gpus` stages (every device used).
-        if (n_layers + sb - 1) // sb < gpus:
-            sb = max(1, n_layers // gpus)
-        los, his = [], []
-        lo = 0
-        while lo < n_layers:
-            hi = min(lo + sb, n_layers) - 1
-            los.append(lo)
-            his.append(hi)
-            lo = hi + 1
-        nst = len(los)
-        max_stage = max(h - l + 1 for l, h in zip(los, his))
-        return los, his, n_layers, nst, max_stage, sb
+        from surogate.train.dispatch_pp import plan_stages
+
+        return plan_stages(self.config.model_info.config, self.config.gpus)
 
     def __init__(self, config: SFTConfig, train_files: list[str], eval_files: list[str] | None = None):
         self.config = config

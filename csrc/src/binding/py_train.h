@@ -239,6 +239,21 @@ public:
     // are applied while this step trains on weights one update behind) — the
     // RoundPipe one-step staleness. Call dispatch_pp_flush_pending at the end to
     // apply the last deferred grads.
+    // Staged forward that runs THROUGH the loss stage and returns per-token
+    // logprobs [num_microbatches * B * T]. The fused training step stops its
+    // forward pipeline at stage N-2 (the backward recomputes the last stage), so
+    // logprobs are never materialized there. GRPO needs them to form its
+    // per-token gradients, which then come back in via custom_dloss below.
+    std::vector<float> dispatch_pp_forward_logprobs_multigpu(const std::int32_t* inputs,
+                                                             const std::int32_t* targets,
+                                                             const std::vector<int>& los,
+                                                             const std::vector<int>& his,
+                                                             int num_microbatches = 1);
+    // custom_dloss (optional, host [num_microbatches * B * T]): per-token gradient
+    // seeds for the loss stage, replacing the built-in cross-entropy. This is how
+    // GRPO/DPO-style objectives run under dispatch-PP — the caller computes the
+    // per-token gradients from logprobs and hands them in, exactly as the
+    // non-dispatch path does via backward_grpo(). nullptr keeps the CE behaviour.
     float dispatch_pp_train_step_multigpu(const std::int32_t* inputs,
                                           const std::int32_t* targets,
                                           const std::vector<int>& los,
@@ -246,7 +261,8 @@ public:
                                           const optimizers::OptimizerConfig& opt_config,
                                           int step_idx,
                                           bool stale,
-                                          int num_microbatches = 1);
+                                          int num_microbatches = 1,
+                                          const float* custom_dloss = nullptr);
     // Grad norm computed by the last dispatch_pp optimizer apply (for the loss display).
     float dispatch_pp_last_grad_norm() const {
         return mDispatchPpLastGradNorm;

@@ -30,10 +30,13 @@ def _base(tmp_path, **over):
     return cfg
 
 
-def test_dispatch_pp_parses_subblock(tmp_path):
+def test_dispatch_pp_ignores_the_vestigial_subblock(tmp_path):
+    """The dispatch_pp sub-block no longer configures anything: stage size comes
+    from SUROGATE_DISPATCH_STAGE_BLOCKS and the remaining knobs are top-level.
+    The config clears it (with a migration warning) rather than honoring stale keys."""
     cfg = _cfg(_base(tmp_path))
     assert cfg.parallelism == "dispatch_pp"
-    assert cfg.dispatch_pp["min_stages"] == 4
+    assert cfg.dispatch_pp == {}
 
 
 def test_default_parallelism_is_unset_and_path_unchanged(tmp_path):
@@ -56,9 +59,15 @@ def test_dispatch_pp_rejects_moe_ep(tmp_path):
         _cfg(_base(tmp_path, ep_size=2))
 
 
-def test_dispatch_pp_rejects_fp8_recipe_in_v1(tmp_path):
-    with pytest.raises(ValueError, match="dispatch_pp.*BF16|recipe"):
-        _cfg(_base(tmp_path, recipe="fp8_hybrid"))
+def test_dispatch_pp_accepts_fp8_hybrid(tmp_path):
+    """fp8_hybrid stage streaming is supported; only NVFP4 is deferred."""
+    cfg = _cfg(_base(tmp_path, recipe="fp8_hybrid"))
+    assert cfg.parallelism == "dispatch_pp"
+
+
+def test_dispatch_pp_rejects_nvfp4_recipe(tmp_path):
+    with pytest.raises(ValueError, match="dispatch_pp.*recipe|NVFP4"):
+        _cfg(_base(tmp_path, recipe="nvfp4"))
 
 
 def test_dispatch_pp_disables_cuda_graphs(tmp_path):

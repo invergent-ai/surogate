@@ -14,7 +14,10 @@ def transformers_v5_compat():
 
 # Monkeypatch PrometheusStatLogger to avoid NotImplementedError for LoRA in DP mode
 def monkey_patch_prometheus_stat_logger_for_lora_in_dp_mode():
-    from vllm.v1.metrics import loggers as vllm_metrics_loggers
+    # Import the submodule directly: `from vllm.v1.metrics import loggers` only
+    # resolves if something else already imported the submodule, which is not
+    # guaranteed at this point in startup.
+    import vllm.v1.metrics.loggers as vllm_metrics_loggers
 
     _original_prometheus_stat_logger_init = vllm_metrics_loggers.PrometheusStatLogger.__init__
 

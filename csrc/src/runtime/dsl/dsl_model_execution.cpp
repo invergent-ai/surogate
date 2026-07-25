@@ -1365,7 +1365,8 @@ void DslModel::dispatch_pp_backward_stage(Tensor inputs,
                                           std::vector<std::pair<std::string, std::vector<std::byte>>> fwd_inject,
                                           std::vector<std::pair<std::string, std::vector<std::byte>>> inject_named,
                                           int micro_step,
-                                          int total_micro) {
+                                          int total_micro,
+                                          const float* custom_dloss_cpu) {
     GraphExecutor* ge = graph_executor();
     if (!ge) {
         throw std::runtime_error("dispatch_pp_backward_stage: requires the DSL GraphExecutor");
@@ -1485,6 +1486,23 @@ void DslModel::dispatch_pp_backward_stage(Tensor inputs,
         // One GPU holds the full batch; skip the DP loss/valid-token all-reduce
         // (it would deadlock waiting for idle GPUs).
         request.reduce_loss_on_completion = false;
+        // Custom per-token gradients (GRPO/DPO) replace the built-in CE seed. Only
+        // the loss-owning stage runs the lm-head/loss ops, so only it can consume
+        // them; other stages are driven purely by injected boundary gradients.
+        if (is_loss_stage && custom_dloss_cpu) {
+            auto& rs = *mRunState;
+            const std::size_t bt = static_cast<std::size_t>(B) * static_cast<std::size_t>(T);
+            auto& scratch = rs.grpo_native_scratch();
+            const int staging_slot = acquire_grpo_host_staging_slot(scratch);
+            upload_float_scratch(scratch.host_inference_logprobs[staging_slot],
+                                 scratch.custom_dloss,
+                                 custom_dloss_cpu,
+                                 bt,
+                                 rs.MainStream);
+            record_grpo_host_staging_slot(scratch, staging_slot, rs.MainStream);
+            request.custom_dloss_gpu = scratch.custom_dloss.get<float>();
+            request.inv_temperature_gpu = mGrpoInvTemperatureGpu;
+        }
         mExecutor->execute_backward(request, comm);
     }
     ge->clear_backward_op_range();
@@ -1802,6 +1820,88 @@ void DslModel::dispatch_pp_zero_grads() {
 
 float DslModel::dispatch_pp_raw_loss() const {
     return mDispatchPpLastLoss;
+}
+
+std::vector<float> DslModel::dispatch_pp_forward_loss_stage(
+    Tensor inputs,
+    Tensor targets,
+    Tensor position_ids,
+    NCCLCommunicator& comm,
+    int lo,
+    int hi,
+    std::vector<std::pair<std::string, std::vector<std::byte>>> fwd_inject) {
+    // Forward of the loss-owning stage, returning per-token logprobs.
+    //
+    // Deliberately mirrors the forward half of dispatch_pp_backward_stage rather
+    // than calling dispatch_pp_forward_stage: that one runs with
+    // skip_finalize=true and set_preserve_layer(hi) so the NEXT stage can read its
+    // boundary. For the last stage there is no next stage, and running the
+    // lm-head/loss ops under that configuration crashes the launch
+    // (cudaErrorLaunchFailure). The loss stage needs the finalized configuration.
+    GraphExecutor* ge = graph_executor();
+    if (!ge) {
+        throw std::runtime_error("dispatch_pp_forward_loss_stage: requires the DSL GraphExecutor");
+    }
+    const long B_val = inputs.Sizes[0];
+    const long T_val = inputs.Sizes[1];
+    ge->ensure_graphs_compiled(B_val, T_val);
+
+    const CompiledGraph* fwd = ge->compiled_forward();
+    if (!fwd) {
+        throw std::runtime_error("dispatch_pp_forward_loss_stage: graphs not compiled");
+    }
+    const int num_layers = static_cast<int>(mModelConfig.NumLayers);
+    if (lo < 0 || hi < lo || hi >= num_layers) {
+        throw std::runtime_error("dispatch_pp_forward_loss_stage: invalid block range");
+    }
+
+    const bool stage_bounded = (lo == 0) || !fwd_inject.empty();
+    const std::size_t fwd_op_lo =
+        (stage_bounded && lo > 0) ? fwd->layer_start_indices[static_cast<std::size_t>(lo)] : 0;
+    const std::size_t fwd_op_hi =
+        (hi == num_layers - 1) ? fwd->ops.size() : fwd->layer_end_indices[static_cast<std::size_t>(hi)];
+
+    if (!fwd_inject.empty()) {
+        ge->set_inject_named(std::move(fwd_inject));
+    }
+    ge->set_forward_op_range(fwd_op_lo,
+                             fwd_op_hi,
+                             /*skip_init=*/false,
+                             /*skip_finalize=*/false,
+                             /*force_linear=*/true);
+    {
+        auto request =
+            causal_lm_profile().make_forward_request(*mRunState, mModelConfig, mOptions, inputs, position_ids, 0);
+        mExecutor->execute_forward(request, comm);
+    }
+    ge->clear_forward_op_range();
+    ge->clear_inject_named();
+    (void)targets;  // consumed via the model's target buffer, set by the caller
+    return dispatch_pp_read_logprobs();
+}
+
+std::vector<float> DslModel::dispatch_pp_read_logprobs() {
+    // Valid only right after a forward whose op range covered the loss ops, i.e.
+    // the loss-owning stage (dispatch_pp_forward_stage runs to ops.size() when
+    // hi == num_layers-1). cross_entropy_forward writes losses[t] = -logprob[t],
+    // and exactly 0 at masked/padding positions, so negating gives logprobs with
+    // 0 where there is no target -- identical to forward_for_grpo's contract.
+    if (!mRunState) {
+        throw std::logic_error("dispatch_pp_read_logprobs called before allocate_run_state()");
+    }
+    auto& rs = *mRunState;
+    const std::size_t n = static_cast<std::size_t>(rs.B) * static_cast<std::size_t>(rs.T);
+    std::vector<float> out(n, 0.0f);
+    if (!rs.Losses.Data || rs.Losses.nelem() < n || n == 0) {
+        return out;
+    }
+    CUDA_CHECK(
+        cudaMemcpyAsync(out.data(), rs.Losses.template get<float>(), n * sizeof(float), cudaMemcpyDeviceToHost, rs.MainStream));
+    CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
+    for (std::size_t i = 0; i < n; ++i) {
+        out[i] = -out[i];
+    }
+    return out;
 }
 
 float DslModel::dispatch_pp_apply_optimizer(NCCLCommunicator& comm,

@@ -27,6 +27,11 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
 
     teacher_logprobs = training_example.teacher_logprobs
 
+    # Turn ids: prompt tokens are not part of any model turn (-1).
+    turn_ids = None
+    if training_example.completion_turn_ids is not None:
+        turn_ids = [-1] * len(training_example.prompt_ids) + training_example.completion_turn_ids
+
     if len(input_ids) > seq_len:
         input_ids = input_ids[:seq_len]
         loss_mask = loss_mask[:seq_len]
@@ -36,6 +41,8 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         temperatures = temperatures[:seq_len]
         if teacher_logprobs is not None:
             teacher_logprobs = teacher_logprobs[:seq_len]
+        if turn_ids is not None:
+            turn_ids = turn_ids[:seq_len]
 
     assert (
         len(input_ids)
@@ -50,6 +57,8 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
     )
     if teacher_logprobs is not None:
         assert len(teacher_logprobs) == len(input_ids), f"teacher_logprobs: {len(teacher_logprobs)}"
+    if turn_ids is not None:
+        assert len(turn_ids) == len(input_ids), f"turn_ids: {len(turn_ids)}"
 
     return MicroBatch(
         input_ids=input_ids,
@@ -59,6 +68,7 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         inference_logprobs=inference_logprobs,
         teacher_logprobs=teacher_logprobs,
         temperatures=temperatures,
+        turn_ids=turn_ids,
     )
 
 
@@ -77,6 +87,7 @@ def packed_samples_into_micro_bs(
     for idx, sample in samples:
         for bin_content in micro_batches:
             if len(bin_content.input_ids) + len(sample.input_ids) <= max_seq_len:
+                bin_len_before = len(bin_content.input_ids)
                 bin_content.input_ids.extend(sample.input_ids)
                 bin_content.loss_mask.extend(sample.loss_mask)
                 bin_content.advantages.extend(sample.advantages)
@@ -86,6 +97,13 @@ def packed_samples_into_micro_bs(
                     if bin_content.teacher_logprobs is None:
                         bin_content.teacher_logprobs = []
                     bin_content.teacher_logprobs.extend(sample.teacher_logprobs)
+                if bin_content.turn_ids is not None or sample.turn_ids is not None:
+                    # Packing mixes single- and multi-turn samples; whichever side
+                    # lacks turn ids gets its span backfilled with -1 so turn_ids
+                    # stays index-aligned with input_ids.
+                    if bin_content.turn_ids is None:
+                        bin_content.turn_ids = [-1] * bin_len_before
+                    bin_content.turn_ids.extend(sample.turn_ids or [-1] * len(sample.input_ids))
                 bin_content.position_ids.extend(sample.position_ids)
                 bin_content.lora_num_tokens[idx] += len(sample.input_ids)
                 break
@@ -112,6 +130,8 @@ def pad_micro_batch(micro_batch: MicroBatch, pad_to_multiple_of: int) -> MicroBa
     micro_batch.temperatures.extend([1.0] * padding_size)
     if micro_batch.teacher_logprobs is not None:
         micro_batch.teacher_logprobs.extend([0.0] * padding_size)
+    if micro_batch.turn_ids is not None:
+        micro_batch.turn_ids.extend([-1] * padding_size)
     # Send padding to the last lora so tokens have ascending lora idx
     micro_batch.lora_num_tokens[-1] += padding_size
 

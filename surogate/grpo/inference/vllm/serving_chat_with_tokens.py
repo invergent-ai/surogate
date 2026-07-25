@@ -1,17 +1,31 @@
+"""Token-in chat completion endpoint.
+
+`create_chat_completion_with_tokens` mirrors vLLM's own
+`OpenAIServingChat._create_chat_completion`, with exactly one delta: the rendered
+prompt's token ids are replaced by the caller-supplied `tokens` list. GRPO needs
+this so the trainer can score the *exact* token sequence a rollout produced,
+without a detokenize/retokenize round trip that would not be guaranteed to be
+identity.
+
+Because this tracks an upstream private method, it must be re-checked whenever
+vLLM is upgraded. Ported to vLLM 0.25.1: the reasoning parser was replaced by a
+unified `Parser` (tools + reasoning), `engine_prompts` became `engine_inputs`,
+and both chat generators changed their trailing keyword arguments.
+"""
+
 from collections.abc import AsyncGenerator
 from typing import ClassVar
 
 from fastapi import Request
 from pydantic import Field
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest, ChatCompletionResponse
-from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
+from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat, _get_mm_token_counts
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse, RequestResponseMetadata
-from vllm.entrypoints.openai.engine.serving import GenerationError
-from vllm.entrypoints.utils import get_max_tokens
+from vllm.entrypoints.serve.utils.api_utils import get_max_tokens
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
 from vllm.outputs import RequestOutput
-from vllm.reasoning import ReasoningParser
+from vllm.parser.abstract_parser import Parser
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 
 logger = init_logger(__name__)
@@ -30,41 +44,47 @@ class OpenAIServingChatWithTokens(OpenAIServingChat):
         request: ChatCompletionRequestWithTokens,
         raw_request: Request | None = None,
     ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
-        """
-        Chat Completion API similar to OpenAI's API.
+        """Chat Completion API that takes prompt token ids directly.
 
-        See https://platform.openai.com/docs/api-reference/chat/create
-        for the API specification. This API mimics the OpenAI
-        Chat Completion API.
+        See https://platform.openai.com/docs/api-reference/chat/create for the
+        base API specification.
         """
-        # Streaming response
+        return await self._with_kv_transfer_rejection_cleanup(
+            self._create_chat_completion_with_tokens(request, raw_request), request, raw_request
+        )
+
+    async def _create_chat_completion_with_tokens(
+        self,
+        request: ChatCompletionRequestWithTokens,
+        raw_request: Request | None = None,
+    ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
         tokenizer = self.renderer.tokenizer
         assert tokenizer is not None
-        reasoning_parser: ReasoningParser | None = None
+
+        chat_template_kwargs = self._effective_chat_template_kwargs(request)
+        parser: Parser | None = None
         try:
-            if self.reasoning_parser_cls:
-                # Pass the same chat template kwargs as used in tokenization
-                chat_template_kwargs = self._prepare_extra_chat_template_kwargs(
-                    request.chat_template_kwargs,
-                    self.default_chat_template_kwargs,
-                )
-                reasoning_parser = self.reasoning_parser_cls(
+            if self.parser_cls is not None:
+                parser = self.parser_cls(
                     tokenizer,
-                    chat_template_kwargs=chat_template_kwargs,  # type: ignore[call-arg]
+                    request.tools,
+                    chat_template_kwargs=chat_template_kwargs,
+                    model_config=self.model_config,
                 )
         except RuntimeError as e:
-            logger.exception("Error in reasoning parser creation.")
+            logger.exception("Error in parser creation.")
             return self.create_error_response(str(e))
+
         result = await self.render_chat_request(request)
         if isinstance(result, ErrorResponse):
             return result
 
-        conversation, engine_prompts = result
+        conversation, engine_inputs = result
 
-        # We override prompt tokens directly.
+        # THE DELTA: override the rendered prompt with the caller's exact tokens.
         # VLM conversations use MITO (message-based) instead of TITO, so
         # multi_modal_data is not expected here.
-        engine_prompts[0]["prompt_token_ids"] = request.tokens  # type: ignore
+        engine_inputs[0]["prompt_token_ids"] = request.tokens  # type: ignore[index]
 
         request_id = f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
 
@@ -74,7 +94,6 @@ class OpenAIServingChatWithTokens(OpenAIServingChat):
 
         try:
             lora_request = self._maybe_get_adapters(request, supports_default_mm_loras=True)
-
             model_name = self.models.model_name(lora_request)
         except (ValueError, TypeError, RuntimeError) as e:
             logger.exception("Error preparing request components")
@@ -86,15 +105,20 @@ class OpenAIServingChatWithTokens(OpenAIServingChat):
         # Schedule the request and get the result generator.
         max_model_len = self.model_config.max_model_len
         generators: list[AsyncGenerator[RequestOutput, None]] = []
+        mm_token_counts: dict[str, int] | None = None
         try:
-            for i, engine_prompt in enumerate(engine_prompts):
-                prompt_token_ids = self._extract_prompt_components(engine_prompt).token_ids
+            for i, engine_input in enumerate(engine_inputs):
+                prompt_token_ids = self._extract_prompt_components(engine_input).token_ids
+                mm_token_counts = _get_mm_token_counts(engine_input)
 
                 # If we are creating sub requests for multiple prompts, ensure that they
                 # have unique request ids.
-                sub_request_id = request_id if len(engine_prompts) == 1 else f"{request_id}_{i}"
+                sub_request_id = request_id if len(engine_inputs) == 1 else f"{request_id}_{i}"
 
-                prompt_len = self._extract_prompt_len(engine_prompt)
+                # Kept from surogate's original: the token-override path is
+                # exactly where an over-long caller-supplied sequence can arrive,
+                # so check it explicitly rather than relying on the renderer.
+                prompt_len = self._extract_prompt_len(engine_input)
                 if prompt_len >= max_model_len:
                     raise VLLMValidationError(
                         f"This model's maximum context length is "
@@ -108,9 +132,10 @@ class OpenAIServingChatWithTokens(OpenAIServingChat):
                 max_tokens = get_max_tokens(
                     max_model_len,
                     request.max_completion_tokens if request.max_completion_tokens is not None else request.max_tokens,
-                    self._extract_prompt_len(engine_prompt),
+                    prompt_len,
                     self.default_sampling_params,
                     self.override_max_tokens,
+                    truncate_prompt_tokens=request.truncate_prompt_tokens,
                 )
 
                 sampling_params: SamplingParams | BeamSearchParams
@@ -124,7 +149,7 @@ class OpenAIServingChatWithTokens(OpenAIServingChat):
 
                 self._log_inputs(
                     sub_request_id,
-                    engine_prompt,
+                    engine_input,
                     params=sampling_params,
                     lora_request=lora_request,
                 )
@@ -133,19 +158,27 @@ class OpenAIServingChatWithTokens(OpenAIServingChat):
 
                 if isinstance(sampling_params, BeamSearchParams):
                     generator = self.beam_search(
-                        prompt=engine_prompt,
+                        prompt=engine_input,
                         request_id=sub_request_id,
                         params=sampling_params,
                         lora_request=lora_request,
                         trace_headers=trace_headers,
                     )
                 else:
-                    reasoning_ended = (
-                        reasoning_parser.is_reasoning_end(prompt_token_ids or []) if reasoning_parser else None
-                    )
+                    has_reasoning = parser is not None and parser.reasoning_parser is not None
+                    if not request.include_reasoning:
+                        reasoning_ended = True
+                    elif request._grammar_from_tool_parser:
+                        # The Mistral grammar already includes an optional `think?`
+                        # rule that handles both reasoning and non-reasoning outputs.
+                        reasoning_ended = True
+                    elif has_reasoning:
+                        reasoning_ended = parser.is_reasoning_end(prompt_token_ids or [])
+                    else:
+                        reasoning_ended = None
 
                     generator = self.engine_client.generate(
-                        engine_prompt,
+                        engine_input,
                         sampling_params,
                         sub_request_id,
                         lora_request=lora_request,
@@ -153,6 +186,9 @@ class OpenAIServingChatWithTokens(OpenAIServingChat):
                         priority=request.priority,
                         data_parallel_rank=data_parallel_rank,
                         reasoning_ended=reasoning_ended,
+                        reasoning_parser_kwargs={"chat_template_kwargs": chat_template_kwargs}
+                        if has_reasoning
+                        else None,
                     )
 
                 generators.append(generator)
@@ -171,21 +207,18 @@ class OpenAIServingChatWithTokens(OpenAIServingChat):
                 conversation,
                 tokenizer,
                 request_metadata,
-                reasoning_parser,
+                chat_template_kwargs=chat_template_kwargs,
+                mm_token_counts=mm_token_counts,
             )
 
-        try:
-            return await self.chat_completion_full_generator(
-                request,
-                result_generator,
-                request_id,
-                model_name,
-                conversation,
-                tokenizer,
-                request_metadata,
-                reasoning_parser,
-            )
-        except GenerationError as e:
-            return self._convert_generation_error_to_response(e)
-        except ValueError as e:
-            return self.create_error_response(e)
+        return await self.chat_completion_full_generator(
+            request,
+            result_generator,
+            request_id,
+            model_name,
+            conversation,
+            tokenizer,
+            request_metadata,
+            parser=parser,
+            mm_token_counts=mm_token_counts,
+        )

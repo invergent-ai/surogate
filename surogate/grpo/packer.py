@@ -154,6 +154,12 @@ class MultiPacker(BasePacker):
                 False,
                 f"teacher logprobs length != sample length ({len(sample.teacher_logprobs)} != {sample_length})",
             )
+        if sample.completion_turn_ids is not None and len(sample.completion_turn_ids) != len(sample.completion_ids):
+            return (
+                False,
+                f"completion turn ids length != completion ids length "
+                f"({len(sample.completion_turn_ids)} != {len(sample.completion_ids)})",
+            )
         return True, None
 
     def _get_batch(self) -> None:

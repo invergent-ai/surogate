@@ -53,19 +53,28 @@ class GRPOClientConfig:
 
 
 @dataclass
-class TeacherModelConfig(GRPOModelConfig, GRPOClientConfig):
+class TeacherModelConfig:
     """
     Configures the teacher model for computing teacher logprobs (e.g. for distillation).
 
     Args:
         model: The model configuration for the teacher model.
         client: The OAI client configuration for the teacher model.
+
+    NOTE: this deliberately does NOT inherit from GRPOModelConfig/GRPOClientConfig.
+    It used to, which made it *declare* all of their dataclass fields (base_url,
+    timeout, name, ...) while __init__ only ever set `model` and `client`. The
+    orchestrator serializes its config with dataclasses.asdict() at startup, which
+    walks every declared field, so any run configuring a teacher died with
+    AttributeError: 'TeacherModelConfig' object has no attribute 'base_url'.
+    The teacher fields live on the nested `model`/`client` objects, not here.
     """
 
     model: GRPOModelConfig | None = None
     client: GRPOClientConfig | None = None
 
-    def __init__(self, cfg: DictDefault):
+    def __init__(self, cfg: DictDefault | None = None):
+        cfg = cfg or {}
         self.model = GRPOModelConfig(cfg.get("model", {}))
         self.client = GRPOClientConfig(cfg.get("client", {}))
 
@@ -279,6 +288,52 @@ class GRPOEvalConfig:
         self.cancel_inflight_rollouts_on_eval = cfg.get(
             "cancel_inflight_rollouts_on_eval", self.cancel_inflight_rollouts_on_eval
         )
+
+
+@dataclass
+class GRPORolloutDepthConfig:
+    """
+    Adaptive rollout-depth budgeting for multi-turn environments
+    (TurnOPD arXiv:2607.05804 §5.1, coverage arm).
+
+    Caps rollout depth at the turn where trajectories stop yielding new
+    supervision instead of always running to the environment's `max_turns`.
+    No-op for single-turn environments.
+
+    Args:
+        enabled: Turn on adaptive depth capping. Off by default.
+        quantile: Fraction of successful completions the cap must still cover (p).
+            Higher = more conservative (deeper) horizons.
+        min_depth: Never cap below this many turns.
+        max_depth: Never cap above this. Defaults to the env's own max_turns when unset.
+        ema: Smoothing weight on each newly measured horizon.
+        probe_interval: Run one UNCAPPED probe step every N steps. Probes are the
+            only source of depth statistics — a cap estimated from capped
+            trajectories can only ever ratchet downward, since truncated rollouts
+            cannot demonstrate that a deeper horizon was needed.
+        warmup_steps: Leading steps that always run uncapped, to seed the estimate.
+        min_observations: Minimum uncapped rollouts before any cap is applied.
+    """
+
+    enabled: bool | None = False
+    quantile: float | None = 0.80
+    min_depth: int | None = 2
+    max_depth: int | None = None
+    ema: float | None = 0.3
+    probe_interval: int | None = 8
+    warmup_steps: int | None = 2
+    min_observations: int | None = 8
+
+    def __init__(self, cfg: DictDefault | None = None):
+        cfg = cfg or {}
+        self.enabled = cfg.get("enabled", False)
+        self.quantile = cfg.get("quantile", 0.80)
+        self.min_depth = cfg.get("min_depth", 2)
+        self.max_depth = cfg.get("max_depth", None)
+        self.ema = cfg.get("ema", 0.3)
+        self.probe_interval = cfg.get("probe_interval", 8)
+        self.warmup_steps = cfg.get("warmup_steps", 2)
+        self.min_observations = cfg.get("min_observations", 8)
 
 
 @dataclass
@@ -789,6 +844,7 @@ class GRPOOrchestratorConfig:
     env: list[GRPOEnvConfig] | None = None
     eval: GRPOEvalConfig | None = None
     buffer: GRPOBufferConfig | None = None
+    rollout_depth: GRPORolloutDepthConfig | None = None
     verification: GRPOVerificationConfig | None = None
     advantage: GRPOAdvantageConfig | GRPOCustomAdvantageConfig | None = None
     filters: list[GRPOGibberishFilterConfig | GRPORepetitionFilterConfig] | None = None
@@ -837,6 +893,7 @@ class GRPOOrchestratorConfig:
             self.eval = GRPOEvalConfig(cfg.get("eval"))
 
         self.buffer = GRPOBufferConfig(cfg.get("buffer", {}))
+        self.rollout_depth = GRPORolloutDepthConfig(cfg.get("rollout_depth", {}))
 
         if cfg.get("verification") is not None:
             self.verification = GRPOVerificationConfig(cfg.get("verification", {}))
