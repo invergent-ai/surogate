@@ -286,8 +286,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_gate_up(const CompiledOp& op) {
     // Use weights dtype to determine compute precision (QLoRA may return FP32 dequantized weights)
     if (weight_is_compact && compact.active_experts.empty()) {
         fill_zero(out, mRunState.MainStream);
-    } else if (mRecipe && weights.DType == ETensorDType::BF16 && !weight_is_compact && !is_llep_active &&
-               std::getenv("SUROGATE_MOE_GEMM_LOOP") == nullptr) {
+    } else if (mRecipe && weights.DType == ETensorDType::BF16 && !weight_is_compact && !is_llep_active) {
         // Recipe-driven MoE GEMM via cuDNN FE (skip when LLEP active — cuDNN
         // crashes with variable merged expert counts; cuBLAS per-expert is safe)
         // gate_up weight is (E, 2*D, C) → N=2*D, K=C

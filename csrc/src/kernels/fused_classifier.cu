@@ -1510,18 +1510,10 @@ enum GrpoMetricOffset {
     GRPO_METRIC_IS_MASKED_LOW = 5,
     GRPO_METRIC_IS_MASKED_HIGH = 6,
     GRPO_METRIC_TEACHER_KL = 7,
-    GRPO_METRIC_OPD_LOSS = 8,
-    GRPO_METRIC_OPD_GATE = 9,
-    GRPO_METRIC_OPD_SHIFT = 10,
-    GRPO_METRIC_OPD_TOKENS = 11,
-    GRPO_METRIC_REPLAY_LOSS = 12,
-    GRPO_METRIC_REPLAY_TOKENS = 13,
-    GRPO_METRIC_SAMPLE_COUNT = 14,
-    GRPO_METRIC_KEEP_TOKENS = 15,
-    GRPO_METRIC_TOTAL_TOKENS = 16,
-    GRPO_METRIC_REPLAY_WEIGHT_SUM = 17,
-    GRPO_METRIC_POLICY_SAMPLE_COUNT = 18,
-    GRPO_METRIC_COUNT = 19,
+    GRPO_METRIC_SAMPLE_COUNT = 8,
+    GRPO_METRIC_KEEP_TOKENS = 9,
+    GRPO_METRIC_TOTAL_TOKENS = 10,
+    GRPO_METRIC_COUNT = 11,
 };
 
 __global__ void grpo_custom_dloss_kernel(float* custom_dloss,
@@ -1531,11 +1523,6 @@ __global__ void grpo_custom_dloss_kernel(float* custom_dloss,
                                          const float* advantages,
                                          const std::uint8_t* loss_mask,
                                          const float* teacher_logprobs,
-                                         const float* opd_reference_logprobs,
-                                         const float* hindsight_logprobs,
-                                         const std::uint8_t* hindsight_mask,
-                                         const std::uint8_t* replay_mask,
-                                         const float* replay_weights,
                                          const std::int32_t* sample_starts,
                                          const std::int32_t* sample_ends,
                                          int sample_count,
@@ -1545,9 +1532,6 @@ __global__ void grpo_custom_dloss_kernel(float* custom_dloss,
                                          float ipo_mask_high,
                                          float adv_tau,
                                          float teacher_tau,
-                                         float opd_tau,
-                                         float opd_beta,
-                                         float replay_tau,
                                          float kl_tau) {
     __shared__ float reductions[GRPO_METRIC_COUNT][256];
 
@@ -1570,16 +1554,8 @@ __global__ void grpo_custom_dloss_kernel(float* custom_dloss,
     float is_masked_low_sum = 0.0f;
     float is_masked_high_sum = 0.0f;
     float teacher_kl_sum = 0.0f;
-    float opd_loss_sum = 0.0f;
-    float opd_gate_sum = 0.0f;
-    float opd_shift_sum = 0.0f;
-    float opd_count = 0.0f;
-    float replay_loss_sum = 0.0f;
-    float replay_count = 0.0f;
-    float replay_weight_sum = 0.0f;
     float keep_count = 0.0f;
     float total_count = 0.0f;
-    float policy_count = 0.0f;
     float masked_count = 0.0f;
     float unmasked_count = 0.0f;
 
@@ -1596,22 +1572,6 @@ __global__ void grpo_custom_dloss_kernel(float* custom_dloss,
         }
 
         const float trainer_logprob = -losses[out_idx];
-        const bool is_replay = replay_mask && replay_mask[logical_idx] != 0;
-        if (is_replay) {
-            // Replay is explicit CE rehearsal, not an on-policy IPO sample.
-            // Its stored behavior scores may be stale or deliberately absent,
-            // so it must not receive importance-ratio, KL, teacher, or OPD
-            // gradients. KL anchoring remains active on every policy token.
-            const float replay_weight = replay_weights ? replay_weights[logical_idx] : 1.0f;
-            const float replay_loss = -replay_tau * replay_weight * trainer_logprob;
-            custom_dloss[out_idx] = replay_tau * replay_weight * inv_loss_scale;
-            policy_sum += replay_loss;
-            replay_loss_sum += replay_loss;
-            replay_count += 1.0f;
-            replay_weight_sum += replay_weight;
-            total_count += 1.0f;
-            continue;
-        }
         const float inference_logprob = inference_logprobs[logical_idx];
         const float log_importance_ratio = trainer_logprob - inference_logprob;
         const float importance_ratio = expf(log_importance_ratio);
@@ -1635,23 +1595,9 @@ __global__ void grpo_custom_dloss_kernel(float* custom_dloss,
             unmasked_mismatch_sum += importance_ratio - log_importance_ratio - 1.0f;
             unmasked_count += 1.0f;
         }
-        if (opd_reference_logprobs && hindsight_logprobs && hindsight_mask && hindsight_mask[logical_idx] != 0) {
-            // The detached ordinary and skill branches come from one matched,
-            // deterministic scorer. Rollout logprobs are not part of this gate.
-            const float opd_shift = hindsight_logprobs[logical_idx] - opd_reference_logprobs[logical_idx];
-            const float opd_gate = 1.0f / (1.0f + expf(-fminf(fmaxf(opd_beta * opd_shift, -60.0f), 60.0f)));
-            const float opd_loss = -opd_tau * opd_gate * trainer_logprob;
-            dloss += opd_tau * opd_gate;
-            policy_sum += opd_loss;
-            opd_loss_sum += opd_loss;
-            opd_gate_sum += opd_gate;
-            opd_shift_sum += opd_shift;
-            opd_count += 1.0f;
-        }
         const float mismatch_kl = importance_ratio - log_importance_ratio - 1.0f;
         const float kl_loss = kl_tau * log_importance_ratio * log_importance_ratio;
         policy_sum += kl_loss;
-        policy_count += 1.0f;
         mismatch_sum += mismatch_kl;
         masked_mismatch_sum += is_masked ? mismatch_kl : 0.0f;
         masked_count += is_masked ? 1.0f : 0.0f;
@@ -1670,17 +1616,9 @@ __global__ void grpo_custom_dloss_kernel(float* custom_dloss,
     reductions[GRPO_METRIC_IS_MASKED_LOW][threadIdx.x] = is_masked_low_sum;
     reductions[GRPO_METRIC_IS_MASKED_HIGH][threadIdx.x] = is_masked_high_sum;
     reductions[GRPO_METRIC_TEACHER_KL][threadIdx.x] = teacher_kl_sum;
-    reductions[GRPO_METRIC_OPD_LOSS][threadIdx.x] = opd_loss_sum;
-    reductions[GRPO_METRIC_OPD_GATE][threadIdx.x] = opd_gate_sum;
-    reductions[GRPO_METRIC_OPD_SHIFT][threadIdx.x] = opd_shift_sum;
-    reductions[GRPO_METRIC_OPD_TOKENS][threadIdx.x] = opd_count;
-    reductions[GRPO_METRIC_REPLAY_LOSS][threadIdx.x] = replay_loss_sum;
-    reductions[GRPO_METRIC_REPLAY_TOKENS][threadIdx.x] = replay_count;
     reductions[GRPO_METRIC_SAMPLE_COUNT][threadIdx.x] = total_count > 0.0f ? 1.0f : 0.0f;
     reductions[GRPO_METRIC_KEEP_TOKENS][threadIdx.x] = keep_count;
     reductions[GRPO_METRIC_TOTAL_TOKENS][threadIdx.x] = total_count;
-    reductions[GRPO_METRIC_REPLAY_WEIGHT_SUM][threadIdx.x] = replay_weight_sum;
-    reductions[GRPO_METRIC_POLICY_SAMPLE_COUNT][threadIdx.x] = policy_count;
     __syncthreads();
 
     for (int stride = static_cast<int>(blockDim.x) / 2; stride > 0; stride >>= 1) {
@@ -1694,41 +1632,19 @@ __global__ void grpo_custom_dloss_kernel(float* custom_dloss,
 
     if (threadIdx.x == 0 && reductions[GRPO_METRIC_TOTAL_TOKENS][0] > 0.0f) {
         const float sample_total = reductions[GRPO_METRIC_TOTAL_TOKENS][0];
+        const float sample_masked = reductions[GRPO_METRIC_MASKED_MISMATCH_KL][0];
+        const float sample_unmasked = reductions[GRPO_METRIC_UNMASKED_MISMATCH_KL][0];
+        const float masked_denom = fmaxf(reductions[GRPO_METRIC_IS_MASKED][0], 1.0f);
+        const float unmasked_denom = fmaxf(reductions[GRPO_METRIC_KEEP_TOKENS][0], 1.0f);
         atomicAdd(metrics + GRPO_METRIC_POLICY_LOSS, reductions[GRPO_METRIC_POLICY_LOSS][0] / sample_total);
-        const float sample_policy_count = reductions[GRPO_METRIC_POLICY_SAMPLE_COUNT][0];
-        if (sample_policy_count > 0.0f) {
-            const float sample_masked = reductions[GRPO_METRIC_MASKED_MISMATCH_KL][0];
-            const float sample_unmasked = reductions[GRPO_METRIC_UNMASKED_MISMATCH_KL][0];
-            const float masked_denom = fmaxf(reductions[GRPO_METRIC_IS_MASKED][0], 1.0f);
-            const float unmasked_denom = fmaxf(reductions[GRPO_METRIC_KEEP_TOKENS][0], 1.0f);
-            atomicAdd(metrics + GRPO_METRIC_MISMATCH_KL,
-                      reductions[GRPO_METRIC_MISMATCH_KL][0] / sample_policy_count);
-            atomicAdd(metrics + GRPO_METRIC_MASKED_MISMATCH_KL, sample_masked / masked_denom);
-            atomicAdd(metrics + GRPO_METRIC_UNMASKED_MISMATCH_KL, sample_unmasked / unmasked_denom);
-            atomicAdd(metrics + GRPO_METRIC_IS_MASKED,
-                      reductions[GRPO_METRIC_IS_MASKED][0] / sample_policy_count);
-            atomicAdd(metrics + GRPO_METRIC_IS_MASKED_LOW,
-                      reductions[GRPO_METRIC_IS_MASKED_LOW][0] / sample_policy_count);
-            atomicAdd(metrics + GRPO_METRIC_IS_MASKED_HIGH,
-                      reductions[GRPO_METRIC_IS_MASKED_HIGH][0] / sample_policy_count);
-            if (teacher_logprobs) {
-                atomicAdd(metrics + GRPO_METRIC_TEACHER_KL,
-                          reductions[GRPO_METRIC_TEACHER_KL][0] / sample_policy_count);
-            }
-            atomicAdd(metrics + GRPO_METRIC_POLICY_SAMPLE_COUNT, 1.0f);
-        }
-        const float sample_opd_count = reductions[GRPO_METRIC_OPD_TOKENS][0];
-        if (sample_opd_count > 0.0f) {
-            atomicAdd(metrics + GRPO_METRIC_OPD_LOSS, reductions[GRPO_METRIC_OPD_LOSS][0]);
-            atomicAdd(metrics + GRPO_METRIC_OPD_GATE, reductions[GRPO_METRIC_OPD_GATE][0]);
-            atomicAdd(metrics + GRPO_METRIC_OPD_SHIFT, reductions[GRPO_METRIC_OPD_SHIFT][0]);
-            atomicAdd(metrics + GRPO_METRIC_OPD_TOKENS, sample_opd_count);
-        }
-        const float sample_replay_count = reductions[GRPO_METRIC_REPLAY_TOKENS][0];
-        if (sample_replay_count > 0.0f) {
-            atomicAdd(metrics + GRPO_METRIC_REPLAY_LOSS, reductions[GRPO_METRIC_REPLAY_LOSS][0]);
-            atomicAdd(metrics + GRPO_METRIC_REPLAY_TOKENS, sample_replay_count);
-            atomicAdd(metrics + GRPO_METRIC_REPLAY_WEIGHT_SUM, reductions[GRPO_METRIC_REPLAY_WEIGHT_SUM][0]);
+        atomicAdd(metrics + GRPO_METRIC_MISMATCH_KL, reductions[GRPO_METRIC_MISMATCH_KL][0] / sample_total);
+        atomicAdd(metrics + GRPO_METRIC_MASKED_MISMATCH_KL, sample_masked / masked_denom);
+        atomicAdd(metrics + GRPO_METRIC_UNMASKED_MISMATCH_KL, sample_unmasked / unmasked_denom);
+        atomicAdd(metrics + GRPO_METRIC_IS_MASKED, reductions[GRPO_METRIC_IS_MASKED][0] / sample_total);
+        atomicAdd(metrics + GRPO_METRIC_IS_MASKED_LOW, reductions[GRPO_METRIC_IS_MASKED_LOW][0] / sample_total);
+        atomicAdd(metrics + GRPO_METRIC_IS_MASKED_HIGH, reductions[GRPO_METRIC_IS_MASKED_HIGH][0] / sample_total);
+        if (teacher_logprobs) {
+            atomicAdd(metrics + GRPO_METRIC_TEACHER_KL, reductions[GRPO_METRIC_TEACHER_KL][0] / sample_total);
         }
         atomicAdd(metrics + GRPO_METRIC_SAMPLE_COUNT, 1.0f);
         atomicAdd(metrics + GRPO_METRIC_KEEP_TOKENS, reductions[GRPO_METRIC_KEEP_TOKENS][0]);
@@ -1743,11 +1659,6 @@ void compute_grpo_custom_dloss(float* custom_dloss,
                                const float* advantages,
                                const std::uint8_t* loss_mask,
                                const float* teacher_logprobs,
-                               const float* opd_reference_logprobs,
-                               const float* hindsight_logprobs,
-                               const std::uint8_t* hindsight_mask,
-                               const std::uint8_t* replay_mask,
-                               const float* replay_weights,
                                const std::int32_t* sample_starts,
                                const std::int32_t* sample_ends,
                                int sample_count,
@@ -1757,9 +1668,6 @@ void compute_grpo_custom_dloss(float* custom_dloss,
                                float ipo_mask_high,
                                float adv_tau,
                                float teacher_tau,
-                               float opd_tau,
-                               float opd_beta,
-                               float replay_tau,
                                float kl_tau,
                                cudaStream_t stream) {
     if (sample_count <= 0 || BT <= 0) {
@@ -1774,11 +1682,6 @@ void compute_grpo_custom_dloss(float* custom_dloss,
                                                                advantages,
                                                                loss_mask,
                                                                teacher_logprobs,
-                                                               opd_reference_logprobs,
-                                                               hindsight_logprobs,
-                                                               hindsight_mask,
-                                                               replay_mask,
-                                                               replay_weights,
                                                                sample_starts,
                                                                sample_ends,
                                                                sample_count,
@@ -1788,9 +1691,6 @@ void compute_grpo_custom_dloss(float* custom_dloss,
                                                                ipo_mask_high,
                                                                adv_tau,
                                                                teacher_tau,
-                                                               opd_tau,
-                                                               opd_beta,
-                                                               replay_tau,
                                                                kl_tau);
     CUDA_CHECK(cudaGetLastError());
 }

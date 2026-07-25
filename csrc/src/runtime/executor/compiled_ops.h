@@ -763,7 +763,6 @@ private:
                                     cudaEvent_t start_event,
                                     cudaEvent_t end_event);
     void cleanup_backward_replay_buffers();
-    void release_ep_state(int ep_key);
     void stabilize_backward_observable_outputs(const std::unordered_set<std::string>& output_names);
     void clear_large_backward_stack_slots_after_replay();
     void release_backward_non_block_weights();

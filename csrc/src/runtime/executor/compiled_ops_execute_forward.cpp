@@ -272,19 +272,8 @@ void CompiledExecutor::persist_forward_saved_layer_tensors(const CompiledGraph& 
         std::string fld;
         return parse_block_param(name, lyr, fld) && lyr == target_layer;
     };
-    // Under dispatch-PP with recompute, the backward replays each stage's
-    // forward from its boundary input, regenerating every per-layer saved
-    // activation exactly like the full-forward replay path. Persisting them in
-    // the initial stage forward is therefore dead memory; on hybrid models the
-    // non-recomputable-in-LoRA slot policies made that persist set large
-    // enough to exhaust device memory before the first optimizer step.
-    const bool pp_stage_recompute_forward =
-        mRecomputeEnabled && !forward_replay_active && mCurrentGraph &&
-        (mFwdOpLo > 0 || mFwdOpHi < mCurrentGraph->ops.size());
-    const bool replay_regenerates_layer_saves =
-        forward_replay_active || pp_stage_recompute_forward;
     auto q35_forward_replay_needs_persist = [&](const std::string& name) -> bool {
-        if (!replay_regenerates_layer_saves || !is_qwen3_5_forward_replay_model) {
+        if (!forward_replay_active || !is_qwen3_5_forward_replay_model) {
             return false;
         }
         int resolved_layer = -1;
@@ -388,13 +377,11 @@ void CompiledExecutor::persist_forward_saved_layer_tensors(const CompiledGraph& 
         return std::nullopt;
     };
 
-    // When the backward will regenerate this layer's saves (full forward
-    // replay, or a dispatch-PP stage forward whose backward replays the
-    // stage), save metadata only for most block tensors. Qwen3.5-family LN1
-    // is the exception: ln1/ln1_rstd sit in shared activation space, so their
-    // exact forward values must be copied at layer end before later ops
-    // overwrite the slot.
-    if (replay_regenerates_layer_saves) {
+    // When forward replay is active, save metadata only for most block tensors.
+    // Qwen3.5 LN1 replay is the exception: ln1/ln1_rstd sit in shared activation
+    // space, so their exact forward values must be copied at layer end before
+    // later ops overwrite the slot.
+    if (forward_replay_active) {
         for (const auto& name : *mSaveList) {
             if (!name_belongs_to_layer(name, layer_idx)) continue;
             if (mSaved->find(name) != mSaved->end()) continue;
@@ -697,56 +684,13 @@ void CompiledExecutor::execute_forward(const CompiledGraph& graph,
     auto on_fwd_layer_end = [&](int L) {
         if (L >= 0 && L < num_layers && layer_active[static_cast<std::size_t>(L)]) {
             if (mDebugDumpLayerFn) mDebugDumpLayerFn(L);
-            // Full forward replay regenerates block-scoped MoE activations for
-            // backward. Persisting them here defeats checkpointing and can
-            // exhaust memory before the first layer is released.
-            if (mConfig.NumExperts > 0 && !forward_replay_active) save_moe_layer_tensors(L);
+            if (mConfig.NumExperts > 0) save_moe_layer_tensors(L);
             persist_forward_saved_layer_tensors(graph,
                                                 L,
                                                 fwd_stream_capturing,
                                                 forward_replay_active,
                                                 arena_persists,
                                                 cudaMalloc_persists);
-            // Backward replay creates a separate EP state for this layer, so
-            // the original forward's token-routing buffers are now dead.
-            if (forward_replay_active && !mInReplay && mOptions.EPSize > 1) {
-                release_ep_state(L << 1);
-            }
-            // Op-scoped output homes (".out"/".out_fallback") have within-layer
-            // lifetime: their consumers ran inside this layer, and the backward
-            // rules consume gradients and inputs, never the parked output.
-            // Recycle them into the cache pool so the next layer's identical
-            // acquires reuse the buffers instead of accumulating one persistent
-            // copy per op per layer (which exhausted memory on hybrid models).
-            if (!fwd_stream_capturing &&
-                static_cast<std::size_t>(L) < graph.layer_start_indices.size() &&
-                static_cast<std::size_t>(L) < graph.layer_end_indices.size()) {
-                const std::size_t op_lo = graph.layer_start_indices[static_cast<std::size_t>(L)];
-                const std::size_t op_hi = graph.layer_end_indices[static_cast<std::size_t>(L)];
-                auto recycled = mSavedCache.recycle_matching([&](const std::string& key) {
-                    const std::size_t dot = key.find('.');
-                    if (dot == 0 || dot == std::string::npos) return false;
-                    for (std::size_t i = 0; i < dot; ++i) {
-                        if (key[i] < '0' || key[i] > '9') return false;
-                    }
-                    const bool out_home = (key.size() >= 4 && key.rfind(".out") == key.size() - 4) ||
-                                          key.rfind(".out_fallback") != std::string::npos;
-                    if (!out_home) return false;
-                    const std::size_t op_index = static_cast<std::size_t>(std::stoul(key.substr(0, dot)));
-                    return op_index >= op_lo && op_index < op_hi;
-                });
-                if (!recycled.empty()) {
-                    auto recycled_contains = [&](const void* ptr) {
-                        return ptr && std::find(recycled.begin(), recycled.end(), ptr) != recycled.end();
-                    };
-                    for (auto& tensor : mTensors) {
-                        if (recycled_contains(tensor.Data)) tensor.Data = nullptr;
-                    }
-                    for (auto& [_, tensor] : mNamedTensors) {
-                        if (recycled_contains(tensor.Data)) tensor.Data = nullptr;
-                    }
-                }
-            }
             // dispatch-PP: preserve a stage's last block so its output ``x``
             // (BlockHOut) stays live for the cross-GPU boundary read — the stack
             // restore/prune below would otherwise free it.

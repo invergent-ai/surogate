@@ -173,23 +173,43 @@ void CompiledExecutor::dispatch_mamba_gated_rmsnorm(const CompiledOp& op) {
 
     store_tensor(op.outputs[0], out_t);
 
-    // The backward unconditionally recomputes rstd and normed_or_gated from
-    // x/gate/weight (see dispatch_mamba_gated_rmsnorm_backward), so persisting
-    // them here is dead memory: one full-activation cudaMalloc copy per op per
-    // layer that nothing ever reads. On hybrid models every block carries this
-    // op, and the accumulated copies exhausted device memory before the first
-    // optimizer step under dispatch-PP.
+    // Save rstd and gated for backward.
+    // Must persist via cudaMalloc because temp_alloc'd stack memory is freed at
+    // layer boundaries (Stack.restore), leaving dangling pointers in mSaved.
+    if (mSaved) {
+        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+        const bool capturing = (cudaStreamIsCapturing(mRunState.MainStream, &capture_status) == cudaSuccess &&
+                                capture_status != cudaStreamCaptureStatusNone);
+        auto persist_save = [&](const std::string& name, const Tensor& src) {
+            const size_t bytes = src.bytes();
+            if (bytes == 0) return;
+            void* dst = mSavedCache.acquire(name, bytes, capturing, "mamba_gated_rmsnorm");
+            CUDA_CHECK(cudaMemcpyAsync(dst, src.Data, bytes, cudaMemcpyDeviceToDevice, mRunState.MainStream));
+            Tensor saved;
+            saved.DType = src.DType;
+            saved.Rank = src.Rank;
+            for (int d = 0; d < src.Rank; ++d)
+                saved.Sizes[d] = src.Sizes[d];
+            saved.Data = static_cast<std::byte*>(dst);
+            (*mSaved)[name] = saved;
+        };
+
+        persist_save(op.op_id + ".rstd", rstd);
+        persist_save(op.op_id + ".normed", normed_or_gated);
+    }
 }
 
 void CompiledExecutor::dispatch_mamba_gated_rmsnorm_backward(const CompiledOp& op) {
-    // Inputs: d_out [..., D], x [..., D], gate [..., D], weight [D]
+    // Inputs: d_out [..., D], x [..., D], gate [..., D], weight [D], rstd [B*T, G], gated [..., D]
     // Outputs: d_x [..., D], d_gate [..., D], d_weight [D]
     //
-    // The backward recomputes rstd/normed_or_gated from x/gate/weight instead of
-    // consuming saved buffers. This avoids dependence on persisted scratch state
-    // that can be corrupted under certain EP execution paths, and it means the
-    // forward persists nothing op-scoped (one full-activation copy per hybrid
-    // layer previously exhausted device memory under dispatch-PP).
+    // Saved input[5] is:
+    // - norm_before_gate=False: gated = x * silu(gate) (norm input)
+    // - norm_before_gate=True : normed = RMSNorm(x) (pre-gate normalized output)
+    //
+    // For robustness, backward recomputes rstd/normed_or_gated from x/gate/weight instead of
+    // consuming saved buffers directly. This avoids dependence on persisted scratch state that
+    // can be corrupted under certain EP execution paths.
     Tensor& d_out = resolve_tensor(op.inputs[0]);
     Tensor& x = resolve_tensor(op.inputs[1]);
     Tensor& gate = resolve_tensor(op.inputs[2]);
@@ -495,10 +515,9 @@ std::vector<Operation> mamba_gated_rmsnorm_backward(const BackwardRuleContext& c
     std::string gate_ref = ctx.is_param(gate) ? gate : saved_ref(gate);
     std::string weight_ref = ctx.is_param(weight) ? weight : saved_ref(weight);
 
-    // The backward recomputes rstd and normed_or_gated from x/gate/weight, so
-    // no op-scoped saved refs are declared: each such ref would force one
-    // persistent full-activation copy per hybrid layer in the forward, which
-    // exhausted device memory before the first optimizer step on hybrid models.
+    // rstd and normed are saved with op_id prefix
+    std::string rstd_ref = "saved." + fwd.id + ".rstd";
+    std::string normed_ref = "saved." + fwd.id + ".normed";
 
     std::vector<std::string> outputs;
     outputs.push_back(ctx.needs_grad(0) ? ctx.d_inputs[0] : "");  // dx
@@ -510,7 +529,7 @@ std::vector<Operation> mamba_gated_rmsnorm_backward(const BackwardRuleContext& c
     ops.push_back(make_operation("mamba_gated_rmsnorm_backward_" + std::to_string(ctx.op_counter++),
                                  "mamba_gated_rmsnorm_backward",
                                  "mamba_gated_rmsnorm_backward",
-                                 {ctx.d_output, x_ref, gate_ref, weight_ref},
+                                 {ctx.d_output, x_ref, gate_ref, weight_ref, rstd_ref, normed_ref},
                                  outputs,
                                  attrs));
 

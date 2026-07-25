@@ -1164,52 +1164,6 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
         mTemps.clear();
         prune_stack_tensors(L);
         if (mRunState.large_bwd_temps_on_stack()) clear_large_bwd_grad_stack_slots(mRunState, L);
-        if (mRecomputeEnabled && mOptions.EPSize > 1) {
-            release_ep_state((L << 1) | 1);
-        }
-        // Persistent backward staging for this layer (e.g. the d_qkv chain
-        // parked by flash_attention/mrope/qk-norm backward ops) is dead once
-        // the layer's backward completes; recycle it so the next layer's
-        // identical-size acquires reuse the buffers instead of accumulating
-        // one persistent gradient copy per op per layer.
-        {
-            const std::string layer_tag = "d_blocks[" + std::to_string(L) + "]";
-            const CompiledGraph* fwd_graph = mForwardGraph;
-            std::size_t fwd_lo = 0, fwd_hi = 0;
-            if (fwd_graph && static_cast<std::size_t>(L) < fwd_graph->layer_start_indices.size() &&
-                static_cast<std::size_t>(L) < fwd_graph->layer_end_indices.size()) {
-                fwd_lo = fwd_graph->layer_start_indices[static_cast<std::size_t>(L)];
-                fwd_hi = fwd_graph->layer_end_indices[static_cast<std::size_t>(L)];
-            }
-            auto recycled = mSavedCache.recycle_matching([&](const std::string& key) {
-                if (key.find(layer_tag) != std::string::npos) return true;
-                // Replay re-parked op-scoped output homes for this layer are
-                // dead once its backward completes (replay_layer_forward does
-                // not pass through the forward layer-end recycle).
-                if (fwd_hi == 0) return false;
-                const std::size_t dot = key.find('.');
-                if (dot == 0 || dot == std::string::npos) return false;
-                for (std::size_t i = 0; i < dot; ++i) {
-                    if (key[i] < '0' || key[i] > '9') return false;
-                }
-                const bool out_home = (key.size() >= 4 && key.rfind(".out") == key.size() - 4) ||
-                                      key.rfind(".out_fallback") != std::string::npos;
-                if (!out_home) return false;
-                const std::size_t op_index = static_cast<std::size_t>(std::stoul(key.substr(0, dot)));
-                return op_index >= fwd_lo && op_index < fwd_hi;
-            });
-            if (!recycled.empty()) {
-                auto recycled_contains = [&](const void* ptr) {
-                    return ptr && std::find(recycled.begin(), recycled.end(), ptr) != recycled.end();
-                };
-                for (auto& tensor : mTensors) {
-                    if (recycled_contains(tensor.Data)) tensor.Data = nullptr;
-                }
-                for (auto& [_, tensor] : mNamedTensors) {
-                    if (recycled_contains(tensor.Data)) tensor.Data = nullptr;
-                }
-            }
-        }
         last_layer_restored = L;
     };
     if (bwd_stream_driven) {

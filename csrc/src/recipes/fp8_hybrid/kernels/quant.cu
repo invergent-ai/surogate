@@ -68,19 +68,8 @@ __global__ void reduce_abs_max_kernel(float* __restrict__ result, const floatX* 
  */
 template <class floatX>
 void reduce_abs_max_launcher(float* result, const floatX* in, long N, const cudaDeviceProp& dp, cudaStream_t stream) {
-    // Register pressure can lower this kernel's per-function thread limit below
-    // the device-wide maxThreadsPerBlock.  A device-property-only heuristic
-    // selected 768 threads on SM120 even when the compiled kernel could not
-    // launch that configuration.  Ask the runtime for a valid occupancy-aware
-    // launch shape for this exact template specialization instead.
-    int min_grid_size = 0;
-    int block_size = 0;
-    CUDA_CHECK(cudaOccupancyMaxPotentialBlockSize(
-        &min_grid_size, &block_size, reduce_abs_max_kernel<floatX>, 0, 0));
-    int n_blocks = min_grid_size > 0 ? min_grid_size : dp.multiProcessorCount;
-    if (n_blocks <= 0) {
-        n_blocks = 1;
-    }
+    int block_size = dp.maxThreadsPerMultiProcessor == 2048 ? 1024 : 768;
+    int n_blocks = dp.maxThreadsPerMultiProcessor / block_size * dp.multiProcessorCount;
     CUDA_CHECK(cudaMemsetAsync(result, 0, sizeof(float), stream));
     reduce_abs_max_kernel<<<n_blocks, block_size, 0, stream>>>(result, in, N);
     CUDA_CHECK(cudaGetLastError());
@@ -98,7 +87,7 @@ void reduce_abs_max_launcher(float* result, const floatX* in, long N, const cuda
  * @param[in] abs_max Unused (kept for API consistency).
  * @param N Number of elements.
  */
-__global__ void quantize_fp32_to_bf16_kernel(nv_bfloat16* __restrict__ out,
+__global__ void quantize_with_abs_max_kernel(nv_bfloat16* __restrict__ out,
                                              float* __restrict__ scale_ptr,
                                              const float* __restrict__ in,
                                              const float* __restrict__ abs_max,
@@ -135,11 +124,7 @@ __global__ void quantize_fp32_to_bf16_kernel(nv_bfloat16* __restrict__ out,
  */
 template <class floatX>
 __global__ void
-quantize_to_int8_with_abs_max_kernel(std::int8_t* out,
-                                     float* scale_ptr,
-                                     const floatX* in,
-                                     const float* abs_max,
-                                     long N) {
+quantize_with_abs_max_kernel(std::int8_t* out, float* scale_ptr, const floatX* in, const float* abs_max, long N) {
     using vec_t = GenericVector<floatX, 16 / sizeof(floatX)>;
     using i8v_t = GenericVector<std::int8_t, 16 / sizeof(floatX)>;
     float scale = (float)std::numeric_limits<std::int8_t>::max() / *abs_max;
@@ -174,11 +159,11 @@ template <
     typename FloatIn,
     typename _ =
         std::enable_if_t<std::is_same_v<FloatOut, __nv_fp8_e4m3> || std::is_same_v<FloatOut, __nv_fp8_e5m2>, void>>
-__global__ void quantize_to_fp8_with_abs_max_kernel(FloatOut* __restrict__ out,
-                                                    float* __restrict__ scale_ptr,
-                                                    const FloatIn* __restrict__ in,
-                                                    const float* __restrict__ abs_max,
-                                                    long N) {
+__global__ void quantize_with_abs_max_kernel(FloatOut* __restrict__ out,
+                                             float* __restrict__ scale_ptr,
+                                             const FloatIn* __restrict__ in,
+                                             const float* __restrict__ abs_max,
+                                             long N) {
     using vec_t = GenericVector<FloatIn, 16 / sizeof(FloatIn)>;
     using f8v_t = GenericVector<FloatOut, 16 / sizeof(FloatIn)>;
     // Use type-specific max: E4M3=448, E5M2=57344
@@ -224,30 +209,9 @@ void quantize_with_abs_max_launcher(floatY* out,
                                     long N,
                                     const cudaDeviceProp& dp,
                                     cudaStream_t stream) {
-    int min_grid_size = 0;
-    int block_size = 0;
-    if constexpr (std::is_same_v<floatY, nv_bfloat16>) {
-        static_assert(std::is_same_v<floatX, float>);
-        CUDA_CHECK(cudaOccupancyMaxPotentialBlockSize(
-            &min_grid_size, &block_size, quantize_fp32_to_bf16_kernel, 0, 0));
-    } else if constexpr (std::is_same_v<floatY, std::int8_t>) {
-        CUDA_CHECK(cudaOccupancyMaxPotentialBlockSize(
-            &min_grid_size, &block_size, quantize_to_int8_with_abs_max_kernel<floatX>, 0, 0));
-    } else {
-        static_assert(std::is_same_v<floatY, __nv_fp8_e4m3> || std::is_same_v<floatY, __nv_fp8_e5m2>);
-        CUDA_CHECK(cudaOccupancyMaxPotentialBlockSize(
-            &min_grid_size, &block_size, quantize_to_fp8_with_abs_max_kernel<floatY, floatX>, 0, 0));
-    }
-    const int n_blocks = min_grid_size > 0 ? min_grid_size : std::max(dp.multiProcessorCount, 1);
-    if constexpr (std::is_same_v<floatY, nv_bfloat16>) {
-        quantize_fp32_to_bf16_kernel<<<n_blocks, block_size, 0, stream>>>(out, scale_ptr, in, abs_max, N);
-    } else if constexpr (std::is_same_v<floatY, std::int8_t>) {
-        quantize_to_int8_with_abs_max_kernel<floatX>
-            <<<n_blocks, block_size, 0, stream>>>(out, scale_ptr, in, abs_max, N);
-    } else {
-        quantize_to_fp8_with_abs_max_kernel<floatY, floatX>
-            <<<n_blocks, block_size, 0, stream>>>(out, scale_ptr, in, abs_max, N);
-    }
+    int block_size = dp.maxThreadsPerMultiProcessor == 2048 ? 1024 : 768;
+    int n_blocks = dp.maxThreadsPerMultiProcessor / block_size * dp.multiProcessorCount;
+    quantize_with_abs_max_kernel<<<n_blocks, block_size, 0, stream>>>(out, scale_ptr, in, abs_max, N);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -689,11 +653,8 @@ void quantize_with_delayed_scale_launcher(floatY* out,
                                           long N,
                                           const cudaDeviceProp& dp,
                                           cudaStream_t stream) {
-    int min_grid_size = 0;
-    int block_size = 0;
-    CUDA_CHECK(cudaOccupancyMaxPotentialBlockSize(
-        &min_grid_size, &block_size, quantize_with_delayed_scale_kernel<floatY, floatX>, 0, 0));
-    const int n_blocks = min_grid_size > 0 ? min_grid_size : std::max(dp.multiProcessorCount, 1);
+    int block_size = dp.maxThreadsPerMultiProcessor == 2048 ? 1024 : 768;
+    int n_blocks = dp.maxThreadsPerMultiProcessor / block_size * dp.multiProcessorCount;
     // NOTE: recorded_amax is zeroed once at the start of each training step in forward(),
     // not here. Multiple layers share the same quantizer slot and accumulate their max
     // via atomicMax in handle_absmax_reduction().

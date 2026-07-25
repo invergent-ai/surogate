@@ -174,8 +174,7 @@ private:
                      int layer_idx,
                      bool allow_cast,
                      bool param_sharded,
-                     const Tensor* global_template,
-                     cudaStream_t stream);
+                     const Tensor* global_template);
 
     bool load_fused(const MappingSpec& spec,
                     const std::string& name,
@@ -224,20 +223,6 @@ private:
     /// Infer fuse slice sizes from config (QKV, gate_up, etc.).
     [[nodiscard]] std::vector<long> infer_fuse_slices(const std::string& name, int num_sources) const;
 
-    Tensor expert_scratch(ETensorDType dtype, const std::vector<long>& shape);
-    Tensor scale_scratch(ETensorDType dtype, long rows);
-
-    bool apply_row_scale_if_present(const std::string& hf_name,
-                                    Tensor& target,
-                                    long scale_row_offset,
-                                    cudaStream_t stream);
-
-    bool load_unbatched_expert_fallback(const std::string& batched_hf_name,
-                                        int expert_idx,
-                                        Tensor& target,
-                                        bool allow_cast,
-                                        cudaStream_t stream);
-
     /// Find the mapping spec for an internal parameter name.
     /// Sets layer_idx if the name is a block parameter. Returns nullptr if no mapping found.
     [[nodiscard]] const MappingSpec* find_mapping_spec(const std::string& internal_name, int& layer_idx) const;
@@ -267,8 +252,6 @@ public:
     std::vector<std::pair<std::string, std::string>> mTiedParams;
     Tensor mExpertScratch{};
     std::size_t mExpertScratchBytes = 0;
-    Tensor mScaleScratch{};
-    std::size_t mScaleScratchBytes = 0;
 };
 
 }  // namespace dsl
