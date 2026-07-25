@@ -1,0 +1,15 @@
+name: fugu_ale_validation_linux_v13
+
+secret_file: ../../../.env
+agents:
+  - fugu_ultra_27b_validation_v13.yaml
+environment: environment_docker_train.yaml
+tasks: ../../manifests/fugu_clean_v1/ale_derived_v1/validation_linux_cli.txt
+
+output:
+  root: ${env:FUGU_REPO_ROOT}/scratchpad/fugu_ale_validation_runs_v13
+concurrency: 1
+wall_time_s: 14400
+auto_resume: false
+max_attempts: 1
+cleanup_mode: delete

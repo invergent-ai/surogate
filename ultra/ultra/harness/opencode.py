@@ -24,6 +24,7 @@ import os
 from pathlib import Path
 import subprocess
 from typing import Any
+import uuid
 
 from ..providers import assert_live_provider_allowed
 from ..providers import provider as _provider_cfg
@@ -196,6 +197,9 @@ class OpenCodeContainer:
                 "cost": _opencode_cost(proc.stdout),
             }
         except subprocess.TimeoutExpired as exc:
+            # Timing out ``docker exec`` does not stop the process in the container. A
+            # surviving agent can otherwise keep editing while the next workflow step runs.
+            _sh("docker", "exec", self.cid, "pkill", "-KILL", "-x", "oc")
             return {
                 "status": "timeout",
                 "returncode": None,
@@ -734,7 +738,14 @@ async def run_agentic_workflow(instance: dict, workflow, worker_slugs: list[str]
         final_diff = diffs[len(workflow.steps) - 1]
         reward = 0.0
         if final_diff.strip():
-            reward = float(await asyncio.to_thread(grade_swesmith, instance, final_diff))
+            reward = float(
+                await asyncio.to_thread(
+                    grade_swesmith,
+                    instance,
+                    final_diff,
+                    f"gate_oc_{uuid.uuid4().hex}",
+                )
+            )
         return {
             "reward": reward,
             "final_diff": final_diff,

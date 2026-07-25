@@ -1,0 +1,17 @@
+[project]
+name = "fugu-live-agentic-grpo"
+description = "On-policy live-control GRPO over the Fugu product runtime and functional verifiers."
+tags = ["fugu-ultra", "live-control", "agentic", "grpo"]
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "datasets>=4.3.0",
+    "verifiers>=0.1.11",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+include = ["fugu_live_agentic_grpo.py", "pyproject.toml"]

@@ -702,6 +702,8 @@ if (BUILD_TESTS OR BUILD_TESTS_INTEGRATION)
     add_executable(integration-tests
         src/testing/utilities/test_main.cpp
         src/testing/distributed/test-nccl.cpp
+        src/testing/kernels/test-fp8-quant.cpp
+        src/testing/kernels/test-grpo-replay.cpp
         src/testing/tokenizer/test-chat-template.cpp
     )
     target_link_libraries(integration-tests PRIVATE

@@ -44,3 +44,8 @@ ultra/.ultra*/**
 .director_cache/
 *.egg-info/
 .ultra_cache/
+scratchpad/**
+scratch**.py
+csrc/build**/**
+ultra/tests/**
+director/tests/**

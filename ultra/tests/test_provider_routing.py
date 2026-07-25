@@ -19,7 +19,7 @@ def test_commercial_models_route_to_yunwu_by_default(monkeypatch):
     assert routed_provider_name("opus") == "yunwu"
     assert routed_slug("opus") == "claude-opus-4-8"
     assert routed_provider_name("gemini") == "yunwu"
-    assert routed_slug("gemini") == "gemini-3.1-pro-preview"
+    assert routed_slug("gemini") == "gemini-3.5-flash"
     assert routed_provider_name("gpt") == "yunwu"
     assert slug("gpt") == "gpt-5.5"
 

@@ -10,7 +10,6 @@
       },
       "models": {
         "claude-opus-4-8": {},
-        "gemini-3.1-pro-preview": {},
         "gemini-3.5-flash": {},
         "gpt-5.5": {},
         "glm-5.2": {},
@@ -18,7 +17,10 @@
         "deepseek-v4-flash": {},
         "deepseek-v4-pro": {},
         "MiniMax-M3": {},
-        "mimo-v2.5-pro": {}
+        "mimo-v2.5-pro": {},
+        "gpt-5.6-sol": {},
+        "gpt-5.6-terra": {},
+        "grok-4.5": {}
       }
     }
   }

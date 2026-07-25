@@ -392,11 +392,17 @@ def monkey_patch_tokenizer_thread_safety():
 
 
 def _patch_qwen35_lora():
-    """Fix Qwen3.5 LoRA: align packed_modules_mapping with output_sizes.
+    """Fix Qwen3.5 LoRA loading and packed-module alignment.
 
     Qwen3.5's GDN layers use create_qkvz_proj with 4 output_sizes (q, k, v, z)
     but packed_modules_mapping only lists 2 entries, causing an IndexError
     during LoRA initialization.
+
+    PEFT adapters trained through the text-only Qwen3.5 wrapper use
+    ``model.layers.*`` keys.  The full conditional-generation wrapper nests
+    those same modules at ``language_model.model.layers.*``.  Extend its
+    weight mapper so vLLM attaches the canonical adapter tensors to the actual
+    runtime modules instead of silently leaving every LoRA wrapper at zero.
 
     Also generalizes MergedColumnParallelLinearWithLoRA.can_replace_layer
     to accept any number of packed modules (not just 2), and generalizes
@@ -413,11 +419,20 @@ def _patch_qwen35_lora():
         Qwen3_5ForCausalLMBase,
         Qwen3_5ForConditionalGeneration,
     )
+    from vllm.model_executor.models.utils import WeightsMapper
 
     qkvz_fix = ["in_proj_q", "in_proj_k", "in_proj_v", "in_proj_z"]
 
     Qwen3_5ForCausalLMBase.packed_modules_mapping["in_proj_qkvz"] = qkvz_fix
     Qwen3_5ForConditionalGeneration.packed_modules_mapping["in_proj_qkvz"] = qkvz_fix
+    Qwen3_5ForConditionalGeneration.hf_to_vllm_mapper = (
+        Qwen3_5ForConditionalGeneration.hf_to_vllm_mapper
+        | WeightsMapper(
+            orig_to_new_prefix={
+                "model.layers.": "language_model.model.layers.",
+            }
+        )
+    )
 
     from vllm.lora.layers.utils import _not_fully_sharded_can_replace
 

@@ -93,7 +93,7 @@ class GRPOTrainConfig(SFTConfig):
         if "gradient_dtype" not in cfg:
             cfg["gradient_dtype"] = "fp32"
 
-        cfg["sample_packing"] = "false"
+        cfg["sample_packing"] = False
         cfg["datasets"] = []
 
         # GRPO packed batches are heavily masked (prompt + padding tokens are -100,

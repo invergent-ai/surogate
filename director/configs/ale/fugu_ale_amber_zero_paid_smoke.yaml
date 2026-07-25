@@ -1,0 +1,14 @@
+name: fugu_ale_amber_zero_paid_smoke
+
+agents:
+  - amber_zero_paid_smoke.yaml
+environment: environment_docker_train.yaml
+tasks: ../../manifests/fugu_clean_v1/ale_derived_v1/train_linux_cli.txt
+
+output:
+  root: ${env:FUGU_REPO_ROOT}/scratchpad/fugu_ale_amber_zero_paid_smoke_v2/runs
+concurrency: 1
+wall_time_s: 900
+auto_resume: false
+max_attempts: 1
+cleanup_mode: delete

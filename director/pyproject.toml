@@ -28,10 +28,15 @@ dependencies = [
 # Agentic harnesses (heavy; install per modality)
 swebench = ["swebench>=4", "docker>=6"]               # SWE-Bench Verified + Pro grading
 terminalbench = ["terminal-bench>=0.2"]               # Terminal-Bench (Harbor/Terminus)
+ale = [
+    "agent-last-exam @ git+https://github.com/rdi-berkeley/agents-last-exam.git@cb5c1a1bb0680696fb672b07431a0382df8511f2",
+    "harbor @ git+https://github.com/marin-community/harbor.git@4a6e1d9e98c570db4bb1baee42e9bac734cd5d04",
+    "terminal-bench>=0.2",
+]
 taubench = ["tau_bench @ git+https://github.com/sierra-research/tau-bench"]  # tau-bench tool-use
 agentic = ["director[swebench,terminalbench,taubench]"]
 dev = ["pytest>=8", "pytest-asyncio>=0.23"]
-all = ["director[agentic,dev]"]
+all = ["director[agentic,ale,dev]"]
 
 [project.scripts]
 director = "director.cli:main"

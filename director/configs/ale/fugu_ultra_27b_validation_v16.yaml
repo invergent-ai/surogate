@@ -1,0 +1,16 @@
+# Full-validation agent under the robust v13 binding: strong pool members in
+# both production roles (coder, implementer), weak members in support roles.
+# Conductor's anonymous view is byte-identical to v11.
+class: director.agentic.fugu_ale.deployer.FuguAleDeployer
+id: fugu-ultra-27b-validation-v16
+executor: local
+model: fugu-27b-r2-fixed
+
+config:
+  model: fugu-27b-r2-fixed
+  conductor_base_url: http://localhost:8011/v1
+  pool_binding_path: /home/densemax/work/flavius/surogate/director/manifests/fugu_clean_v1/grpo_pilot_train/current_pool_binding_v16.json
+  max_turns: 120
+  task_budget_s: 14400
+  record_terminal_session: false
+  provider_base_url: https://yunwu.ai/v1

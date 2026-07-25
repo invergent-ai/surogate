@@ -40,6 +40,10 @@ def _ensure_repo_imports() -> Path:
 _REPO_ROOT = _ensure_repo_imports()
 
 from ultra.config import PoolConfig, WorkerSpec  # noqa: E402
+from ultra.conductor_prompt import (  # noqa: E402
+    extract_workflow_payload as _shared_extract_workflow_payload,
+    prompt_for_task as _shared_prompt_for_task,
+)
 from ultra.executor import execute_workflow  # noqa: E402
 from ultra.live_worker_safety import validate_live_worker_safety  # noqa: E402
 from ultra.providers import YUNWU_LIVE_ALLOW_ENV, load_dotenv, routed_provider_name, routed_slug  # noqa: E402
@@ -222,6 +226,10 @@ def _extract_workflow_payload(raw: str) -> str:
         return last
 
     raw_ids = _grab(r"model[_ ]?id")
+    selector_field = "worker_id"
+    if raw_ids is None:
+        raw_ids = _grab(r"profile[_ ]?ref")
+        selector_field = "profile_ref"
     raw_subs = _grab(r"subtasks")
     raw_acc = _grab(r"access[_ ]?list")
     if not (raw_ids and raw_subs and raw_acc):
@@ -244,7 +252,12 @@ def _extract_workflow_payload(raw: str) -> str:
             access = list(range(i))  # "all" == every earlier step
         else:
             access = [int(e) for e in entry if not isinstance(e, str)]
-        steps.append({"worker_id": int(ids[i]), "subtask": str(subs[i]), "access": access})
+        selector = (
+            {"worker_id": int(ids[i])}
+            if selector_field == "worker_id"
+            else {"profile_ref": str(ids[i])}
+        )
+        steps.append({**selector, "subtask": str(subs[i]), "access": access})
     return json.dumps({"steps": steps})
 
 
@@ -268,6 +281,7 @@ def _worker_rows_for_lane(pilot_config: dict[str, Any], lane: str) -> list[dict[
         rows.append(
             {
                 "worker_id": idx,
+                "profile_ref": ident.get("profile_ref"),
                 "name": name,
                 "backend": backend,
                 "model": model,
@@ -303,19 +317,39 @@ def _messages_text(task: TaskSpec, *, max_chars: int) -> str:
     return text
 
 
+def _capability_ref_system_prompt(max_workflow_steps: int) -> str:
+    return f"""Your role is to plan a tool-using workflow over an anonymous set of capability profiles.
+Choose up to {max_workflow_steps} positions. Each step has exactly three fields: profile_ref selects one supplied capability profile, subtask assigns concrete work, and access_positions contains only integer indexes of earlier workflow steps whose messages it may observe.
+Choose profiles from their supplied capabilities and the task. No profile is a default or fallback. The first access_positions list must be empty. Profile references are never valid access positions, even when the same profile appears in an earlier step.
+Return exactly one JSON object with a steps array and no prose: {{"steps":[{{"profile_ref":"one supplied reference","subtask":"task-specific tool-using work","access_positions":[]}}]}}"""
+
+
 def _prompt_for_task(task: TaskSpec, pilot_config: dict[str, Any], lane: str, *, max_task_chars: int) -> list[dict[str, str]]:
     workers = _worker_rows_for_lane(pilot_config, lane)
     max_workflow_steps = int(pilot_config["workflow_policy"]["max_workflow_steps"])
-    # Models are passed as ordinal numbers with capability metadata only -- no brand names,
-    # so the Conductor learns worker strengths from reward, not priors (ICLR App. E).
-    worker_lines = [f"Model {row['worker_id']}: roles={row['role_prior']}" for row in workers]
+    capability_refs = pilot_config.get("selector_field") == "profile_ref"
+    if capability_refs:
+        worker_lines = [
+            f"Profile {row['profile_ref']}: roles={row['role_prior']}" for row in workers
+        ]
+        system = _capability_ref_system_prompt(max_workflow_steps)
+    else:
+        # Legacy accepted checkpoints use ordinal selectors with anonymous metadata.
+        worker_lines = [f"Model {row['worker_id']}: roles={row['role_prior']}" for row in workers]
+        system = _system_prompt(max_workflow_steps)
     user = "\n\n".join(
         [
             "USER QUESTION:\n" + _messages_text(task, max_chars=max_task_chars),
             "AVAILABLE LANGUAGE MODELS:\n" + "\n".join(worker_lines),
         ]
     )
-    return [{"role": "system", "content": _system_prompt(max_workflow_steps)}, {"role": "user", "content": user}]
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+# Training and serving must use one byte-identical prompt contract. The local
+# names remain aliases because historical training utilities import them.
+_extract_workflow_payload = _shared_extract_workflow_payload
+_prompt_for_task = _shared_prompt_for_task
 
 
 def _worker_specs(pilot_config: dict[str, Any]) -> list[WorkerSpec]:

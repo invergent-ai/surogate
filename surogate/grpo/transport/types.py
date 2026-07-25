@@ -18,6 +18,8 @@ class TrainingSample(msgspec.Struct, array_like=True, gc=False, omit_defaults=Tr
     hindsight_mask: list[bool] | None = None
     replay_mask: list[bool] | None = None
     opd_reference_logprobs: list[float] | None = None
+    replay_weights: list[float] | None = None
+    advantage_mask: list[bool] | None = None
 
 
 class TrainingBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
@@ -44,3 +46,4 @@ class MicroBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
     replay_mask: list[bool]
     teacher_logprobs: list[float] | None = None
     lora_num_tokens: list[int] | None = None
+    replay_weights: list[float] | None = None

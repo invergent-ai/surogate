@@ -1,0 +1,7 @@
+class: director.agentic.fugu_ale.smoke_deployer.AmberSmokeDeployer
+id: amber-zero-paid-smoke
+executor: local
+model: none
+
+config:
+  connect_timeout_s: 120

@@ -123,6 +123,6 @@ def test_parent_repair_tight_slice_configs_use_fresh_parent_base():
     assert train_cfg["output_dir"] == output_root
     assert orch_cfg["output_dir"] == f"{output_root}/run_default"
     assert {env["args"]["live_safety_path"] for env in orch_cfg["env"]} == {safety_path}
-    assert all(env["extra_env_kwargs"]["force_step_budget"] == "short" for env in orch_cfg["env"])
+    assert all(env["extra_env_kwargs"]["force_step_budget"] == "long" for env in orch_cfg["env"])
     assert pilot_cfg["checks"]["tight_next_slice"]["base_model"] == "output/fugu_ultra_policy_repair_sft_parent_qwen3_8b"
     assert pilot_cfg["checks"]["tight_next_slice"]["status"] == "prepared_parent_repair_sft_fresh"

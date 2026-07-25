@@ -1562,6 +1562,8 @@ class SurogateTrainer:
 
         Returns: dict with keys {loss: float, norm: float}.
         """
+    def preflight_grpo_native_lora_gradient_norms(self, grad_clip: float) -> list[float]:
+        """Compute each replica's LoRA gradient norm without applying an optimizer update."""
     def train_step_graphed(
         self, inputs: npt.NDArray[np.int32], targets: npt.NDArray[np.int32], config: OptimizerConfig, step: int
     ) -> dict:

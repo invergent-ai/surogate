@@ -72,6 +72,7 @@ class Buffer:
         # Initialize buffers for easy/ hard examples
         self.easy_examples: list[dict] = []
         self.hard_examples: list[dict] = []
+        self.consumed_examples: list[dict] = []
 
         # Initialize rollout buffer (flat list of rollouts)
         self.rollout_buffer: list[vf.RolloutOutput] = []
@@ -95,6 +96,7 @@ class Buffer:
 
         write_jsonl(self.easy_examples, path / "easy_examples.jsonl")
         write_jsonl(self.hard_examples, path / "hard_examples.jsonl")
+        write_jsonl(self.consumed_examples, path / "consumed_examples.jsonl")
         write_jsonl(self.rollout_buffer, path / "rollout_buffer.jsonl")
 
     def load(self, path: Path) -> None:
@@ -106,9 +108,22 @@ class Buffer:
 
         saved_easy_examples = read_jsonl(path / "easy_examples.jsonl")
         saved_hard_examples = read_jsonl(path / "hard_examples.jsonl")
+        consumed_path = path / "consumed_examples.jsonl"
+        if self.config.sample_without_replacement and not consumed_path.is_file():
+            raise ValueError(
+                "one-use buffer checkpoint has no consumed_examples.jsonl ledger"
+            )
+        saved_consumed_examples = (
+            read_jsonl(consumed_path) if consumed_path.is_file() else []
+        )
         saved_rollout_buffer = cast(list[vf.RolloutOutput], read_jsonl(path / "rollout_buffer.jsonl"))
 
-        if any(saved_easy_examples) or any(saved_hard_examples) or any(saved_rollout_buffer):
+        if (
+            any(saved_easy_examples)
+            or any(saved_hard_examples)
+            or any(saved_consumed_examples)
+            or any(saved_rollout_buffer)
+        ):
             # Build hash lookup for example buffer (env -> (example_hash -> example_id))
             example_hash_lookup = defaultdict(dict)
             all_hashes = set()
@@ -154,6 +169,19 @@ class Buffer:
                     logger.warning(
                         f"Could not move {num_not_moved} example(s) from checkpoint to hard pool. This usually means you resumed with an env mix that does not contain all previous examples."
                     )
+
+            if any(saved_consumed_examples):
+                num_moved = move_saved_pool(
+                    saved_consumed_examples,
+                    self.consumed_examples,
+                )
+                if num_moved != len(saved_consumed_examples):
+                    raise ValueError(
+                        "one-use buffer checkpoint does not match the current dataset"
+                    )
+                logger.debug(
+                    f"Restored {num_moved} consumed one-use example(s) from checkpoint."
+                )
 
             if any(saved_rollout_buffer):
                 # Extend rollout buffer, but only include rollouts for which the example still exists in the example buffer
@@ -217,6 +245,27 @@ class Buffer:
         """Samples n examples from the buffer, respecting env ratios."""
 
         self._recycle_examples_if_needed()
+        if self.config.sample_without_replacement:
+            sampled_examples = []
+            for _ in range(n):
+                non_empty_envs = [
+                    env for env, examples in self.example_buffer.items() if examples
+                ]
+                if not non_empty_envs:
+                    raise ValueError("No environments left with examples.")
+                sampled_env = random.choices(
+                    non_empty_envs,
+                    weights=[self.env_probs[env] for env in non_empty_envs],
+                    k=1,
+                )[0]
+                sampled_example = random.choice(
+                    list(self.example_buffer[sampled_env].values())
+                )
+                self.example_buffer[sampled_env].pop(sampled_example["example_id"])
+                self.consumed_examples.append(sampled_example)
+                sampled_examples.append(sampled_example)
+            return sampled_examples
+
         non_empty_envs = [env for env, examples in self.example_buffer.items() if examples]
 
         if not non_empty_envs:

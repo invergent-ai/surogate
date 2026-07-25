@@ -1,637 +1,706 @@
 # Mission: Fugu-Ultra
 
-Last updated: 2026-07-20 12:00 UTC.
+Last updated: 2026-07-24 (open-weight orchestration pivot).
 
-## Product Objective
+## Objective
 
-Ship a trained conductor for long-horizon agentic work that outperforms every
-individual worker in its bound pool. It must coordinate multi-step tool use,
-subagents, artifact creation, debugging, handoffs, recovery, and independent
-final verification. One-shot routing to a nominally strongest model is not the
-product.
+Ship a professional, model-agnostic conductor that orchestrates **open-weight
+models** into a single API endpoint delivering **frontier-level performance**.
+The conductor coordinates multi-step tool use, isolated workers, handoffs,
+replanning, debugging, shared memory, artifact creation, recovery, and final
+verification. It is not a one-shot router.
 
-Success requires verified superiority on TerminalBench 2.1 and credible
-SWE-Pro-class evidence. Sol's reported TerminalBench 2.1 score is 88%, so strict
-superiority requires at least 79 passes on the 89-task suite. Published
-comparator results are reused; comparator models are not rerun.
+Success (current goal, set 2026-07-25): the conductor, driving the open-weight
+pool (glm-5.2, kimi-k3, deepseek-v4-pro, minimax-m3 via OpenRouter), **matches
+or beats GPT-5.6-Sol on agentic benchmarks at equal (max) reasoning effort** —
+first on the ALE-derived Linux-CLI tasks, then confirmed on Terminal-Bench 2.1.
+There is NO requirement to beat individual pool members; in-pool solo
+comparisons are diagnostics, not the goal.
 
-No superiority claim is currently authorized.
+This supersedes the earlier objective (a trained conductor beating the best
+solo worker *inside* a proprietary pool). That prior campaign established the
+key mechanism — see Current Status / History — but measured the wrong target:
+with frontier proprietary models (gpt-5.6-sol/terra) *in* the pool, "beating
+Sol" was circular. The open-weight pivot puts frontier models on the *bar*
+side, where they belong.
 
-## Model-Agnostic Hard Rule
+### Current worker pool (open-weight, via OpenRouter)
 
-The runtime and learned decision surface must remain replaceable-pool
-architecture:
+| Position | Runtime model (OpenRouter) | Role | Tier |
+|---:|---|---|---|
+| 1 | `z-ai/glm-5.2` | primary producer | strongest open (68.8 coding / 43.1 agentic) |
+| 2 | `moonshotai/kimi-k3` | coder | frontier-tier open |
+| 0 | `deepseek/deepseek-v4-pro` | verifier (reasoning) | strong open (77.4 SWE) |
+| 3 | `minimax/minimax-m3` | support | strong tool-use |
 
-- The conductor reasons over anonymous capability profiles, roles, workflow
-  topology, access edges, and live agentic state.
-- Concrete provider model identities exist only in a versioned pool binding and
-  provenance. They never appear in learned prompts or actions.
-- There is no globally preferred, default, or fallback worker.
-- Worker IDs have no meaning without the capability profiles supplied for that
-  request.
-- Training data must permute capability profiles across worker IDs so a fixed
-  slot cannot acquire semantic meaning.
-- Replacing any or all workers requires a new binding, capability calibration,
-  and possibly bounded continued/fine-tuning. It must not require orchestrator
-  code changes or runtime special cases.
-- Checkpoints remain pool-specific and hash-bound. A checkpoint/pool mismatch
-  fails closed.
+Bench alternates: `tencent/hy3` (coder, weak-agentic), `thinkingmachines/inkling`,
+`poolside/laguna-s-2.1`. Kimi-k3 is the cost driver; price-priority routing and
+an hy3 swap are the levers if per-run cost bites.
 
-This rule applies to initial planning, live control, function-call routing,
-replacement workflows, aggregation, debugging, and recovery.
+## Hard Rules
 
-## Current Pool
+- **Goal-first discipline: before doing anything, state the goal, the current
+  strategy, and how the intended action moves us closer to the goal. If the
+  chain is unclear, do not act — rethink.** Actions that merely feel like
+  progress (probes, re-runs, side experiments) but do not feed a specific
+  pending decision are not progress.
+- **Never run useless paid tasks. Before every paid launch, think thoroughly:
+  (1) exactly what question does this run answer, (2) is the configuration
+  verified correct (binding, effort, model, task set — checked, not assumed),
+  (3) is there a cheaper or better way to answer the same question, (4) will
+  the result still be usable if plans change (e.g. measured at a comparable
+  effort tier)?** Killing partially-complete paid suites because the plan
+  changed is the canonical failure this rule exists to prevent: it burned
+  ~560 paid calls on 2026-07-25 (a probe testing the wrong effort direction,
+  plus three ~60%-complete solo baselines discarded by an effort-tier switch).
+  Sequence measurements so the cheapest decision-driving run happens first,
+  and later runs cannot invalidate earlier ones.
+- Work only on the main product, its training/runtime path, and the minimum
+  tests needed to make the next product decision.
+- Do not add or maintain freezing, artifact hashing, preregistration,
+  authorization artifacts, attestation artifacts, or verification-only
+  infrastructure. Do not compute or report artifact hashes.
+- Keep the learned interface model-agnostic. Concrete worker/provider names
+  belong only in the versioned pool binding. The conductor requires NO
+  retraining to swap the pool — a new binding suffices (this is the whole
+  point, and the open-weight pivot exercises it).
+- The pool is now **open-weight models served via OpenRouter**
+  (`https://openrouter.ai/api/v1`, key `OPENROUTER_KEY` in `.env`), with
+  **price-priority routing** (`provider: {sort: "price"}`) on every worker
+  call. This supersedes the earlier "workers use only yunwu" rule. The frontier
+  comparator (Sol/Opus) may still be measured via yunwu.
+- Calibrate the binding so the strongest available workers occupy the roles the
+  conductor routes production work to (planner/coder). This binding
+  recalibration — not conductor training — is the dominant performance lever
+  (established this campaign: it moved whole-task score from 0.0 to competitive
+  with Sol).
+- Do not launch external repository training groups. Conductor training, if
+  pursued, targets decision-consistency (the dominant per-task variance source)
+  via zero-paid synthetic rollouts. ALE validation and final-test remain sealed
+  until their recipe stages.
+- Reuse published comparator evidence; do not rerun published comparators.
+- Worker timeout is at least 600 seconds. Reasoning-model workers
+  (glm-5.2, deepseek-v4-pro) need a generous `max_tokens` or the answer is
+  starved by the reasoning trace.
+- Bound parallelism for external runs; fail-closed on provider/infra
+  contamination. Infra failures (tmux/dependency) are re-measurable and are not
+  task failures.
+- Stop immediately on provider/infrastructure contamination, invalid output,
+  absent learning signal, or mathematical hopelessness.
+- Every optimizer update includes both mandatory replay sets and the existing
+  retention gate. Reject any regression immediately.
+- Use `make build`; keep all other testing focused and proportional.
+- Do not start, stop, or otherwise manage the externally owned OCR containers
+  or processes. Use only GPU capacity that is actually free.
 
-The current product round uses this fixed pool:
+## Reporting Rule
 
-| Anonymous worker | Bound runtime model | Capability prior |
+This file is not a chronological diary.
+
+Keep `Current Status` short and update it in place. It should contain only the
+accepted product, the latest product-relevant result, aggregate paid-call and
+optimizer counts, the current blocker, the next action, and the superiority
+verdict. Do not append arm-by-arm logs, rejected experiment narratives,
+artifact inventories, or hashes. Detailed history belongs in Git, ordinary
+run outputs, and the existing ledgers under `scratchpad/`.
+
+The recipe below stays detailed. Change it only when the actual operating
+procedure changes.
+
+## Current Status
+
+| Item | Current state |
+|---|---|
+| Objective | Orchestrate open-weight models (OpenRouter, price-priority) into a conductor delivering max absolute performance; beat GPT-5.6-Sol (0.54 ALE-derived) or ≥ Opus 4.8 on the sealed ALE Linux-CLI eval. Pool: `z-ai/glm-5.2`, `moonshotai/kimi-k3`, `deepseek/deepseek-v4-pro`, `minimax/minimax-m3` |
+| Conductor | `scratchpad/fugu_27b_ale_accepted_r2` (r2 typed conductor, Qwen3.6-27B + LoRA, namespace-mapper fix required). Model-agnostic → the open-weight pool needs a new binding but NO retraining |
+| Key prior finding (proprietary pool) | The dominant performance lever is the POOL BINDING, not conductor training. Recalibrating which model backs each capability role moved the first-ever whole-task score from 0.0 (all work routed to weakest workers) to parity with Sol (~0.52 vs 0.46 over 13 tasks), zero training. 17 optimizer launches (2 accepted/14 rejected/1 stopped) never moved whole-task perf; the 8-token micro-dose line is retired (mathematically incapable) |
+| Second finding | High per-task variance from the conductor's own persistence/completion decisions (same task 0.0/0.25/0.79 across runs) — the decision-consistency gap is the honest training target once the binding is right |
+| Frontier bar | GPT-5.6-Sol ALE-derived Linux-CLI: 0.5313 (@high) / 0.5536 (reasoning-max, 16 final tasks); 0.5404 (xhigh, 15 val). Measured via yunwu; pinned in `scratchpad/ale_published_comparators/`. Opus 4.8 = fallback bar (measure if used) |
+| Paid calls | ~1500 cumulative on the proprietary campaign (now closed). Prior grok/v15 sealed final stopped at 9/16 (user halted — moving off that pool). Open-weight runs use OpenRouter (`OPENROUTER_KEY`), far cheaper |
+| OpenRouter integration | DONE. Five hard-coded yunwu guards relaxed (4 in `fugu_ultra_terminal.py`, 1 in `fugu_ale/deployer.py:571`); per-provider key resolution (`OPENROUTER_KEY`/`YUNWU_API_KEY`); `provider:{sort:"price"}` on every OpenRouter call. Cost analysis: all four models cheapest on OpenRouter (yunwu kimi-k3 = $4.50/$22.50 per 1M after the 1.5× group ratio vs OpenRouter $3.00/$15.00) |
+| Open-weight binding | `current_pool_binding_ow2.json`: glm-5.2 @implementer(pos3, the observed workhorse), kimi-k3 @coder(pos2), deepseek-v4-pro @planner(pos1), minimax-m3 @verifier(pos0). ow1 wasted the strongest model on planning while minimax-m3 (weakest) did 20/23 turns of implementation — the same mis-routing lesson as the proprietary campaign |
+| OPEN-WEIGHT VALIDATION (final, 14 tasks) | **open-weight 0.4534 vs Sol@high 0.4627 (−0.009) — level with proprietary frontier at matched reasoning effort; beats Terra@high 0.3964 (+0.057); short of Sol@xhigh 0.5404 (−0.087)**. Scorecard 3 wins / 6 ties / 5 losses. Wins: **zdock 1.0 where Sol scores 0.0** (coordination capability no pool member has, reproduced from the proprietary campaign), sec_10k 0.805 vs 0.672, k8s_payment 0.923 vs 0.910; k8s_migration 0.910 ties Sol's best. Losses: agora 0.0 vs 0.515 (**conductor failed closed**), spatial 0.0 vs 0.474, nhanes 0.571 vs 0.786, hst 0.805 vs 0.877, clustered_cyclic 0.0 vs 0.0@high. Total cost: **348 open-weight worker calls** |
+| DEAD-END FIX (shipped, validated) | Root cause of the `agora` 0.0: a state with **zero legal control actions** (paid budget exhausted while the owner had not requested completion; also terminal-unstable + completion-requested) makes the decode schema unbuildable. The runtime then spent 2 "corrections" re-asking — but the schema is derived deterministically from state, so every retry failed identically and the task hard-failed, discarding all artifacts. Fix: `enabled_control_actions(state)` helper in `ultra/ultra/live_control.py` (single source of truth for the enable rules) + `_run_live_controller` now detects the dead end **before** the doomed loop and finalizes via `_live_completion_response()` on work already in the workspace. Validated: agora **0.0 → 0.468**. 101 ultra tests pass (2 `director/tests/test_fugu_ale.py` failures are pre-existing: a training-config temperature guard, untouched) |
+| **IN-POOL SUPERIORITY (the mission's literal test)** | **conductor 0.4869 vs glm-5.2-solo 0.3832 → +0.1036 (+27% relative), record 6W / 7T / 1L** over all 14 matched tasks. glm-5.2 is the strongest pool member (68.8 coding / 43.1 agentic vs ~58/~34 for the rest). Solo arm: `director/configs/ale/fugu_ultra_solo_glm52.yaml` (`solo_worker_id: 3`, conductor disabled), ledger `scratchpad/fugu_ale_solo_glm52_ledger.jsonl`, 212 calls. **Decisive evidence — `zdock`: conductor 1.0, glm-5.2-solo 0.0, GPT-5.6-Sol 0.0** — a task solved only by orchestration, by neither the best pool member nor a frontier model alone. Only loss: `nhanes` (conductor 0.571 vs solo 0.848) where orchestration destroyed value the model already had |
+| **VERDICT vs EXTERNAL FRONTIER — stated with statistics** | Conductor **0.5157** over 14 tasks (post dead-end fix, with CORE lessons on nhanes). Per-task SD 0.427 → **SEM of the mean 0.114**, so any difference under ~0.2 is noise and must not be reported as a win. Paired: vs **Sol@xhigh −0.025 (SEM 0.107, \|t\|=0.23, 4W/6T/4L)**; vs Sol@high +0.053 (SEM 0.083, \|t\|=0.64, 4W/7T/3L). **Correct claim: the open-weight conductor MATCHES GPT-5.6-Sol — statistically indistinguishable in both directions.** That is the mission target (frontier-level performance from open weights), achieved at ~350 cheap worker calls. Do NOT claim "beats Sol"; earlier +0.024/+0.053 readings were within noise |
+| **IN-POOL RESULT IS THE SIGNIFICANT ONE** | vs glm-5.2-solo: mean +0.133 (SEM 0.071, \|t\|=1.86) and — the defensible statistic — **paired 7W / 7T / 0L**, i.e. the conductor wins every task where the two differ. Sign test p ≈ 0.008. Orchestration reliably extracts more than its strongest component |
+| Key conclusion | Performance is governed by **conductor decision-consistency, not worker quality**. One runtime bug was worth +0.034 to the mean — more than the entire gap to Sol@high — with zero model or spend changes |
+| CORE lesson memory (implemented) | Non-parametric learning after CORE (arXiv 2605.28742, MIT reference impl). Mines **same-state** contrast pairs (30, from owned probe data — 15 of them parameter-level, the class the GRPO credit scheme was structurally blind to) plus **whole-task strategy** contrasts (8 runs of the same task scoring e.g. 0.0 vs 0.91). Reflection distils natural-language rules; memory ranks by CORE's `cosine × Beta-smoothed utility` with reserved slots so strategy lessons are not crowded out by situation-specific ones. Injected via an optional `guidelines` field in the decision system message — `None` reproduces the unguided prompt byte for byte, gated by `FUGU_LESSON_MEMORY`, fail-soft, and reversible without touching weights (no retention gate needed). Files: `scratchpad/core_*.py`, memory `scratchpad/core_lesson_memory_v2.json` (122 lessons). Model identity never enters lessons (verified) |
+| CORE result + its boundary | **Works where a DECISION was wrong**: `nhanes` **0.571 → 0.975**, beating glm-5.2-solo (0.848), Sol@high (0.786), and matching Sol@xhigh — genuine synthetic→whole-task transfer, zero training, the largest single-task gain of the campaign. **Does NOT work where CAPABILITY is absent**: `spatial` stayed 0.0 across **7 arms** (3 lesson variants, all 4 solo models, every binding). The v2 run measurably changed routing (planner 10→4 turns, work spread to coder+verifier) yet the score did not move — behaviour changed, outcome did not. Treat CORE as a decision-quality lever, never a capability substitute |
+| Reasoning-effort finding | The pool ran the entire campaign **underclocked at `reasoning_effort=high`** while published comparators are measured at max/xhigh. With adequate `max_tokens` all four models honour higher effort (earlier empty responses were a probe-side token cap, not model failure): reasoning tokens rise 4.6× for glm-5.2 and 4.7× for deepseek-v4-pro at `max`; minimax-m3 peaks at `xhigh`. `current_pool_binding_ow3.json` sets each model to its highest honoured effort. Consequence: every number in this file is a FLOOR measured underclocked, and effort must be held constant within any comparison |
+| Ranked next levers | (1) re-validate at `ow3` max effort (all prior results are underclocked floors); (2) pool ranking may be inverted — newer agentic benchmarks put kimi-k3 near-frontier and glm-5.2 last on 5 of 6, contradicting the coding-index used to build `ow2`, so the workhorse slot may hold the weakest agentic model; (3) mine CORE contrasts continuously from new runs so lesson utility gets real feedback (all lessons currently sit at the 0.67 prior, and the corpus contains some contradictory rules); (4) `spatial`/`clustered` need capability, not orchestration |
+
+## Staged Plan to a Defensible Superiority Claim
+
+The current "matches Sol" statement rests on ONE benchmark family (ALE-derived,
+14 Linux-CLI tasks), single runs, with our pool underclocked while the
+comparator's published numbers are measured at max/xhigh. That is too narrow to
+claim frontier parity in general. Multi-benchmark evidence is expensive, so it
+runs only AFTER the primary signal is convincing — not to go looking for one.
+
+**Statistical reality that governs the whole plan.** Per-task SD is 0.427, so
+SEM over 14 tasks is 0.114 (paired vs Sol, 0.083). Detecting a true +0.05
+difference would need roughly 150 paired task-runs. A small win therefore
+cannot be proven on this subset at any effort level. "Matches" is provable
+(already: |t| = 0.23); "beats" requires either a large effect or many more
+tasks. Report accordingly and never dress a sub-SEM delta as a win.
+
+### Stage 1 — Parity of conditions (prerequisite, cheap)
+- Run the pool at `current_pool_binding_ow3.json` (each model at the highest
+  reasoning effort it honours: max for kimi-k3/glm-5.2/deepseek-v4-pro, xhigh
+  for minimax-m3), matching how published comparators are measured.
+- Settle the binding order: newer agentic benchmarks contradict the coding
+  index used to build `ow2`. Decide the workhorse slot from measured evidence
+  (kimi-k3 @max vs glm-5.2 on the same task), not from a published index.
+- Gate: effort held constant within every comparison from here on. Results
+  measured at `high` are not comparable to results measured at max.
+
+### Stage 1–2 RESULT (2026-07-25): ALE-derived stage MET — conductor matches Sol
+
+Three effort configurations measured over the same 13 tasks:
+
+| Configuration | Mean | SEM |
+|---|---:|---:|
+| conductor @high (`ow2`) — **best** | **0.5243** | 0.110 |
+| conductor role-split (`ow4`) | 0.4732 | 0.092 |
+| conductor @max (`ow3`) | 0.4548 | 0.114 |
+| Sol @max (its best) | 0.5494 | 0.116 |
+| Sol @xhigh | 0.5435 | 0.111 |
+| Sol @high | 0.4983 | 0.104 |
+
+**Best conductor config vs Sol's best: −0.025, |t| = 0.21, 4W/6T/3L →
+statistically indistinguishable. The open-weight pool MATCHES GPT-5.6-Sol.**
+
+Supporting findings:
+- **Reasoning effort is not a lever for this pool.** All three configurations
+  sit within one SEM. The "max helps analysis / hurts execution" pattern did
+  not survive: `sec_10k` alone scored 0.10 / 0.163 / 0.805 / 0.875 across runs.
+  Run-to-run variance dominates; do not tune effort on single-run evidence.
+- **`spatial` reached 0.804** under role-split after scoring 0.0 in nine prior
+  arms (every binding, both effort tiers, all CORE variants, all four solos).
+  The earlier "capability ceiling" conclusion recorded here was WRONG —
+  repeated failure across configurations is not proof of a ceiling.
+- The 13-task set is underpowered (SEM ≈ 0.11): it cannot distinguish 0.52
+  from 0.55 or from 0.35. "Matches" is honest; "beats" is not provable here.
+  Terminal-Bench 2.1 (89 tasks) roughly halves the SEM, which is the main
+  reason to run it beyond confirmation.
+
+### Stage 2 — Confidence on the primary benchmark
+- Re-run the 14-task validation subset under Stage 1 conditions.
+- If it moves materially, extend to all 31 Linux-CLI tasks (15 validation + 16
+  final) to tighten SEM to ~0.077.
+- Gate to Stage 3: the conductor must clear the best solo pool member on a
+  paired test (the meaningful statistic — currently 7W/0L, p ≈ 0.008 vs
+  glm-5.2) AND sit at or above Sol on the matched mean. Do not proceed on a
+  sub-SEM difference.
+
+### Stage 3 — Multi-benchmark confirmation (only after Stage 2 passes)
+Published per-model reference numbers already exist for the pool and for Sol,
+so these are directly comparable:
+
+| Benchmark | Sol | Kimi K3 | GLM-5.2 | Opus 4.8 | Harness status |
+|---|---:|---:|---:|---:|---|
+| Terminal-Bench 2.1 | 88.8 | 88.3 | 82.7 | 84.6 | `scratchpad/run_terminalbench21_fugu.py`, 89 tasks, harbor 0.8.0 present, previously exercised |
+| DeepSWE | 73.0 | 67.5 | 46.2 | 59.0 | 117 Harbor tasks vendored at `director/vendor/deep_swe/` |
+| SWE-Bench-Pro | — | — | — | — | vendored `director/vendor/swe_bench_pro_os/`; deps live in the root venv, needs re-assembly |
+
+Order by evidence-per-dollar: Terminal-Bench 2.1 first (proven harness,
+published comparators for every pool model and for Sol), then DeepSWE, then
+SWE-Pro if still warranted. Evaluation only — no benchmark training.
+| GPU/service state | r2 typed conductor served on GPUs 0-1 port 8011 (`fugu-27b-r2-fixed`); GPUs 2-7 free. Workers now run remotely via OpenRouter (no local GPU) |
+| Verdict | Open-weight orchestration not yet measured. On the proprietary pool the conductor reached parity with Sol via binding recalibration alone — the open-weight pivot tests whether that generalizes to a cheap, open pool |
+
+## Product and Pool Contract
+
+### Learned interface
+
+The conductor may reason over:
+
+- anonymous capability profiles and `profile_ref` values;
+- roles and task requirements;
+- workflow positions and access edges;
+- live progress, material changes, failures, artifacts, and verification state;
+- the actions `continue`, `handoff`, `replan`, and `complete`.
+
+The learned prompt and action surface must never contain concrete provider or
+model identity. Numeric worker IDs are request-local positions only; they have
+no semantic meaning. Training rotations must prevent a position from acquiring
+a fixed capability meaning.
+
+### Current bound pool
+
+Concrete identities are recorded only here and in the binding file:
+
+| Position | Runtime model | Capability prior |
 |---:|---|---|
-| 0 | `gpt-5.6-sol` | reasoner, verifier, debugger |
-| 1 | `gemini-3.5-flash` | scientist, planner, aggregator |
+| 0 | `claude-fable-5` | reasoner, verifier, debugger |
+| 1 | `gpt-5.6-sol` | scientist, planner, aggregator |
 | 2 | `gpt-5.6-terra` | mathematician, coder, reasoner |
-| 3 | `grok-4.5` | drafter, implementer, fast pass |
-
-Binding:
-`director/manifests/fugu_clean_v1/grpo_pilot_train/current_pool_binding_v11.json`
-
-- Binding SHA-256:
-  `4c0bd95fa62189e3d3bf31a807bc600ec98c74d39444ce760d737f4b3ea5568a`
-- Pool fingerprint:
-  `6ace6d4fdc84b56f8991af8a2cbc42d125f26f8bd682c3119a657eb56c1925c0`
-
-## Current Product
-
-The current trained product is reproducible but not proven superior.
-
-| Component | Authoritative artifact | SHA-256 |
-|---|---|---|
-| Product runtime | `director/director/agentic/fugu_ultra_terminal.py` | `8324eeeff127752e0ba31293e7d2fa72e0168afdaa1136e541bb443580058978` |
-| Runtime revision | `20260720-r57-unified-conductor-candidate` | source above |
-| Initial planner config | `output/fugu_ultra_planner_composite_v11_s20/adapter_config.json` | `57095afdb2d1c8f2c8a435afa6b8856f57a3bced5107e85b393fe4100a7575b3` |
-| Initial planner weights | `output/fugu_ultra_planner_composite_v11_s20/adapter_model.safetensors` | `f794ac11c862293ac37fd8ab7c3ba56e2c8ccc39e380ec8efb0f110b50c92fe0` |
-| Live-control config | `output/fugu_ultra_live_control_grpo_v16/final_adapter/adapter_config.json` | `a06c3b34e0076b6cf26bd36bd24e01e0010b3bb5432155a2747a473cd30ae366` |
-| Live-control weights | `output/fugu_ultra_live_control_grpo_v16/final_adapter/adapter_model.safetensors` | `0a987412de57f3afe5d35be2a9ce4c3b03d4ffcd676d2605941ee71f000448b3` |
-
-The runtime supports `continue`, `handoff`, `replan`, and `complete` at live
-terminal boundaries. It preserves function-call ownership and each worker's
-private tool loop. Within a workflow, a worker sees another worker's trajectory
-only through the conductor's access list. Verified state from completed prior
-workflows is available as persistent shared memory. Runtime r57 adds an opt-in
-unified full-action controller that owns both initial/replacement topology and
-live actions. The accepted product still uses the planner-v11/live-v16 split;
-the unified path is a training candidate and is not promoted by source changes.
-
-The accepted checkpoint's current defects are:
-
-- Initial plans are executable but insufficiently adaptive; a nine-task local
-  probe produced 9/9 executable identity-free workflows but used the same
-  `[2,1,0]` topology on 8/9 tasks.
-- Ordinary generative SFT and isolated selector attempts did not change the
-  relevant routing behavior and were rejected before paid evaluation.
-- Earlier V18/V19 GRPO could train only compact live decisions while topology
-  remained frozen, so it could not train the whole conductor. r57 removes that
-  training-architecture limitation without changing the accepted checkpoint.
-- The accepted live-control adapter was trained on the compact action protocol;
-  it does not yet produce valid unified full-action outputs. Stage-1 full-action
-  SFT is required before unified OPD training.
-- No later rejected checkpoint was composed into the product artifacts above.
-
-## Hard Operating Rules
-
-- Every external paid worker request must use `https://yunwu.ai/v1`.
-- Worker request timeout is 600 seconds.
-- Each arm has one global ceiling of 120 paid worker calls.
-- Provider retries and task retries are zero.
-- Run one task attempt at a time. Do not launch broad campaigns.
-- Stop immediately on infrastructure invalidity, protocol invalidity, a closed
-  verdict, or loss of a credible learning signal.
-- Do not retry a closed task or campaign without a genuinely new preregistered
-  version and a causal reason.
-- Never treat infrastructure failures as task or conductor negatives.
-- Protect benchmark-owned tracked tests from agent modification.
-- Do not start the grand evaluation until the candidate passes local,
-  whole-task holdout, identity, and anti-forgetting gates.
-- Update this document after preregistration, every completed arm, every
-  admission decision, every training gate, and every stop verdict.
-- Product velocity is a hard requirement. Implementation, useful trajectory
-  collection, and training must consume more effort than validation scaffolding.
-- Use the minimum validation proportional to the actual risk: by default, one
-  focused smoke and one run of the existing relevant suite. Do not add a new
-  test matrix merely to restate contracts already covered elsewhere.
-- Do not create duplicate frozen manifests, synthetic evidence frameworks, or
-  exhaustive immutability/hash bookkeeping unless it directly protects a
-  checkpoint promotion, benchmark claim, paid-result classification, or a
-  concrete defect observed in the current operation.
-- Do not build infrastructure speculatively. Add or generalize a component only
-  when it blocks the next collection, training, runtime, or promotion step.
-- Once the evidence needed for the current decision is sufficient, stop
-  validating and move forward. Extra confidence without a changed decision is
-  not useful progress.
-
-## Current Evidence
-
-### Benchmark verdict
-
-The last partial TerminalBench campaign, r33, was rejected after 19 passes and
-9 failures in 28 scored tasks. It does not support a superiority claim and must
-not be resumed. Full comparator reruns are prohibited.
-
-### Unified conductor and dense-credit readiness
-
-The zero-cost r57/SEED preflight is complete:
-
-- One policy can now emit the initial topology, replacement topology,
-  `continue`, `handoff`, and `complete` actions inside the same verifier-scored
-  episode. Compact historical rollouts and unified trajectories have distinct,
-  fail-closed protocol attestations.
-- The trainer now carries aligned `hindsight_logprobs` and an explicit
-  `hindsight_mask`. The native CUDA loss implements confidence-gated on-policy
-  distillation independently from outcome GRPO and the existing teacher signal.
-- A tied-reward synthetic group produced nonzero dense credit only on the two
-  selected conductor tokens. Prompt and environment tokens remained zero; a
-  skill-supported action received more credit than an unsupported action.
-- The hindsight contract accepts anonymous capability/role guidance tied to
-  observed decision IDs and rejects concrete model/provider identities, fixed
-  worker slots, oracle data, hidden tests, reference patches, and unobserved
-  evidence.
-- The native extension rebuilt successfully. Focused verification is 147/147
-  runtime/control tests plus 48/48 trainer, audit, rescoring, and
-  hindsight-contract tests.
-- Readiness report:
-  `scratchpad/fugu_seed_opd_v1/readiness_report.json`
-  (`b48c87e395c436f6491ee2fb017c1167435386cc77200b289102aa52d2c79237`).
-
-Verdict: `LOSS_FORMULA_AND_CONTRACT_READY_RESCORE_BACKEND_INVALID`. The native
-loss, transport, masks, and fail-closed skill contract remain verified. The
-later repeatability audit invalidated the vLLM prompt-logprob backend for dense
-credit, so no OPD optimizer result is accepted until deterministic matched-
-branch scores replace it. No training job is running.
-
-### SEED Stage-1 corpus gate
-
-The first fail-closed analyzer-corpus inventory is complete. It reviewed only
-explicitly admitted current-pool evidence rather than globbing historical route
-logs:
-
-- Five authoritative completed trajectories were reviewed. Four are
-  TerminalBench-derived and remain excluded from training.
-- One clean, non-benchmark, train-only success is eligible for analysis. It was
-  sanitized into four capability-profile permutations with no provider/model
-  identity or fixed worker slot in the learned surface.
-- There are zero eligible failures, zero eligible causal train pairs, and only
-  one distinct task. The minimum pilot gate is 12 independent trajectories on
-  six tasks, including at least three successes, three failures, and six causal
-  pairs.
-- The historical validators cannot be replayed byte-for-byte because their
-  frozen manifests hashed a mutable runtime path that changed at r57. The new
-  audit therefore verifies the immutable conversion rows and the complete
-  result/route/trajectory hash chain directly and records the runtime-source
-  drift instead of hiding it.
-
-Verdict: `INSUFFICIENT_ADMITTED_TRAJECTORIES_NO_TRAINING`. Training authorization
-is false. No external calls, paid calls, optimizer steps, or checkpoint were
-created.
-
-Artifacts:
-
-- Inventory spec: `scratchpad/fugu_seed_stage1_v1/inventory_spec.json`
-  (`547ef8e80365d7dc8698a3d162085748848f30c1a774f0e1536756dd0ce91f7a`).
-- Identity-free candidates:
-  `scratchpad/fugu_seed_stage1_v1/analyzer_candidates.jsonl`
-  (`1493bee69b635a93e4639d38b8ee4c000aaf43aa58562b3a2ad7397ac90492e4`).
-- Inventory report: `scratchpad/fugu_seed_stage1_v1/inventory_report.json`
-  (`54bc252e28f8dbf110e05369a2f33cef355dd7d83df654925cf109bb907f96af`).
-
-The preregistered `release-activation-rollback` acquisition stopped invalid on
-its solo arm. The worker made two successful Yunwu calls, inspected the live
-task, wrote the controller and audit, and compiled the controller. Yunwu then
-rejected the third owner call with `Concurrency limit exceeded for account`.
-With retries disabled and the only registered position unavailable, the runtime
-failed closed. The resulting reward 0 is provider-invalid, not a task or
-conductor failure; it contributes no training trajectory and did not authorize
-the conditional auditor arm. The campaign will not be retried.
-
-Verdict: `CAUSAL_ANALOG_V3_STOPPED_PROVIDER_INVALID`. Three paid calls, zero
-provider retries, zero task retries, no accepted trajectory, no optimizer step,
-and no checkpoint change.
-
-Artifacts:
-
-- Frozen campaign: `scratchpad/fugu_causal_analog_v3/campaign_frozen.json`
-  (`deba2ca1540fcfc159412ae423c381e44fa7bfe5b40e018e16355fa4215cdc8b`).
-- Result ledger: `scratchpad/fugu_causal_analog_v3/results.jsonl`
-  (`411be3956fcfc9007564d760ae18a178d1e030685b7e7018d491e9a70d5e9aaa`).
-- Pair report: `scratchpad/fugu_causal_analog_v3/pair_report.json`
-  (`8b180bbb57942b20e63e14dbb759f09d4d4ce1706105a5f7ad13b47e5c690bea`).
-
-The new r57 `legacy-ember-provenance` arm also stopped infrastructure-invalid
-before agent execution. Harbor could not start the task container's tmux
-session. This repeated the prior zero-call setup failure, so the task is closed
-without another image investigation or retry. It made zero paid calls and
-contributes no training evidence.
-
-Verdict: `LEGACY_EMBER_R57_CLOSED_TMUX_SETUP_INVALID`. Campaign
-`scratchpad/fugu_branchpoint_analog_probe/campaign_v3_frozen.json`
-(`96ffa2229882e2690b5072ee161176d8941d747cf9670c5ed09d3262a29994b5`);
-ledger `scratchpad/fugu_branchpoint_analog_probe/results_v3.jsonl`
-(`ea78a3bce03e2606d723196e245139a68359ceb16e51e0ec4f109d078fa6eb6e`).
-
-### Skill-conditioned rescoring
-
-The token-alignment scorer contract is implemented:
-
-- It reconstructs the ordinary chat-template tokens and fails closed on any
-  mismatch before adding privileged context.
-- It appends the validated training-only skill to the final user message, then
-  submits the original sampled conductor token IDs for prefill scoring. It does
-  not generate or substitute a counterfactual action.
-- The real local smoke reconstructed all 843 ordinary prompt tokens exactly,
-  produced a 910-token skill-augmented prompt, and re-scored the same 32 sampled
-  conductor tokens. All 32 action tokens and zero environment tokens were
-  selected by the hindsight mask.
-- The extractor now selects the submitted token ID explicitly when a response
-  also contains top alternatives, and fails closed if that token is absent.
-  Interleaving preserves exact alignment over later environment observations
-  and multiple conductor decisions.
-
-The original numerical readiness verdict is revoked. Ten identical parent
-requests on each of three frozen rows produced mean-token log-probability ranges
-of `0.04625`, `0.01518`, and `0.00500` on the vLLM endpoint. These are much
-larger than the OPD shifts used by v3-v6. Disabling CUDA graphs and prefix
-caching and switching to Triton attention did not make the endpoint repeatable.
-Therefore vLLM prompt logprobs are invalid for dense credit and sub-percent
-rollback measurement on this host.
-
-A direct Transformers/PEFT scorer using deterministic algorithms, math SDPA,
-the same loaded model, and adapter switching reproduced four parent probes
-exactly, including the longest 7,859-token case. Long contexts use chunked KV
-prefill without changing target tokens. The scorer is now integrated into the
-OPD data path. Ordinary rollout probabilities remain separate from a new
-`opd_reference_logprobs` channel; the Python loss and native CUDA loss compute
-the skill shift only from deterministic ordinary and hindsight branches. A
-partial reference/hindsight/mask triple fails closed, and the retired endpoint
-scorer aborts before it can create training data.
-
-The clean v7 train-only audit then used one fresh contract-valid `continue`
-action sampled locally from the accepted parent. The same loaded parent adapter
-scored the ordinary 846-token prompt and the skill-augmented 922-token prompt
-twice each with exact repeats and the same seven submitted action tokens. The
-token shift was nonconstant, ranging from `0.000000` to `0.040357` with mean
-`0.006877`; the resulting mean confidence gate was `0.508572`. The learned
-surface remained identity-free, the parent SHA was unchanged, and no v3-v6
-score value was reused. `make build` completed and all 55 GRPO tests pass.
-
-Verdict: `DETERMINISTIC_MATCHED_BRANCH_BATCH_AUDIT_PASS`. One replay-anchored
-local optimizer preflight is authorized. Product promotion and the held-out
-evaluation remain unauthorized. No external or paid calls were made and no
-optimizer step was taken.
-
-Matched batch:
-`scratchpad/fugu_seed_opd_matched_v7/matched_batch.bin`
-(`98c0e3d3cff63f65f31caf74eb99a01b75607296554e10b2492d23e93a103009`).
-Audit report:
-`scratchpad/fugu_seed_opd_matched_v7/prepared_report.json`
-(`a28f07fc63b0d8add408acdd2b6a87d9fe7269f2a729838e8ca57dea511ce06b`).
-
-The authorized replay-anchored v7 optimizer input is also prepared. It combines
-the two matched OPD examples with 30 train-only replay examples across all nine
-training tasks. Replay action-token mass is 72 `complete`, 72 `continue`, 68
-`handoff`, and 72 `replan`; all replay references reproduced exactly twice
-under the direct parent scorer. The current scorer also reproduced the stored
-ordinary and hindsight OPD branches exactly. Validation labels were excluded.
-The batch used 64 local direct-model score calls, zero external calls, zero
-paid calls, and zero optimizer steps.
-
-Preparation report:
-`scratchpad/fugu_seed_opd_optimizer_v7/prepared_report.json`
-(`a93794530c2acaab6bdc14ef02407a1d0fcec49980ba578c80360dfa6d262a9b`).
-Training batch:
-`output/fugu_seed_opd_optimizer_preflight_v7/run_default/rollouts/step_0/rollouts.bin`
-(`e6dd800b0d73836ac93cd1f1b5c2f57da4d463f36a50f8f63db80c84469bb3d3`).
-
-Historical vLLM smoke (numerically invalid):
-`scratchpad/fugu_seed_opd_v1/rescore_local_report.json`.
-Repeatability audit:
-`scratchpad/fugu_seed_opd_optimizer_v6/vllm_rescore_repeatability.json`
-(`9f8d7ce05e1618a4f4042878cdeb40925457e3cdd8e691fece45eb781040016c`).
-
-### Native optimizer and anti-forgetting gate
-
-The zero-cost v3 preflight exercised one real native optimizer step from the
-accepted live-control parent:
-
-- Commit `d08d50bf` adds exact hindsight transport/rescoring, matched-rollout
-  OPD gating, and trainable parent-adapter initialization. The exported child is
-  a standalone adapter over the original base rather than an incomplete delta
-  over a merged parent.
-- The tied group had two reward-0/advantage-0 trajectories and 14 selected
-  action tokens. Native mean gate `0.50857258` and shift `0.0068776407` matched
-  the precomputed references within `1e-6`; gradient norm was `0.00098309`.
-- The parent SHA remained unchanged. All 504 child tensors preserved the parent
-  schema and changed finitely; the relative update L2 was only `1.34e-4`.
-- Paired replay compared parent and child on all 178 task-isolated v16
-  validation decisions. Both remained 178/178 contract-valid, but six action
-  signatures changed: one improved and five regressed. Frozen-label matches
-  fell from 82 to 78 and false completions increased from one to two.
-
-Verdict: native dense-credit optimization is technically operational, but the
-disposable child fails the anti-forgetting gate and is permanently rejected.
-No accepted checkpoint changed. The operation used zero external or paid
-calls. Future training must mix parent replay/regularization into every update
-and retain a post-update rollback gate.
-
-Artifacts:
-
-- Prepared batch: `scratchpad/fugu_seed_opd_optimizer_v3/prepared_report.json`
-  (`50afb2e24774e5dfcaa0afa5c28ded4087bde5a28a0ccf7cb68670b58c513e5b`).
-- Native optimizer audit: `scratchpad/fugu_seed_opd_optimizer_v3/audit_report.json`
-  (`3b69e63a6b77bdef2ff41fded386d0eb414ced8feea1e9809b966dc0bea8c191`).
-- Paired replay: `scratchpad/fugu_seed_opd_optimizer_v3/replay_report.json`
-  (`5dd8887c5120767e703dd62649397814dee10e2f447605896f4659abee7d0bd7`).
-
-Commit `d4f5279d` adds a first-class replay anchor through the Python transport,
-batcher, reference loss, native CUDA loss, and metrics. The zero-cost v5
-preflight then tested one replay-anchored update from the same accepted parent:
-
-- The batch contained the exact tied reward-0 OPD group (14 selected action
-  tokens) plus 16 train-split replay decisions (168 tokens), four examples per
-  action, six tasks, and four anonymous profile permutations. Validation labels
-  were not used for training.
-- Native gate `0.50955904` and shift `0.0076760696` matched the prepared
-  references within `1e-6`. All 14 OPD and 168 replay tokens were consumed;
-  gradient norm was finite and nonzero. The parent hash stayed unchanged and
-  all 504 child tensors changed finitely.
-- All 178 generated holdout decisions remained contract-valid with no new false
-  completion. Among 175 parent-stable rows, however, the child introduced one
-  regression and one improvement. Three parent rows were decode-unstable.
-- The contemporaneous vLLM fixed-token likelihood comparison is invalidated by
-  the later repeatability audit and must not be used as evidence.
-
-Verdict: `REPLAY_ANCHORED_V5_REJECTED_ANTI_FORGETTING_GATE`. The replay anchor
-substantially reduced forgetting but did not meet the preregistered no-regression
-gate. The child is permanently rejected and no accepted checkpoint changed.
-The experiment used one optimizer step, local inference only, and zero
-external or paid calls. The structural defect is that equal replay-example
-counts were not equal replay gradient mass: the handoff targets contributed 68
-tokens while complete and continue contributed only 32 each.
-
-Artifacts:
-
-- Prepared batch: `scratchpad/fugu_seed_opd_optimizer_v5/prepared_report.json`
-  (`47e4b9b690514924ac3624ed2c60d9d64a814c54ae22f5da3fbb3a629ab6c483`).
-- Native audit: `scratchpad/fugu_seed_opd_optimizer_v5/audit_report.json`
-  (`5a83cdb6db4a0f61a06f27188f74e536235d53bba7c98bf3507b1290eed005c3`).
-- Generation replay: `scratchpad/fugu_seed_opd_optimizer_v5/replay_report.json`
-  (`b2d1bc1369025382fad2403ede1994e8bb15153372b0274eed8bad7edaca72e0`).
-- Fixed-token likelihood: `scratchpad/fugu_seed_opd_optimizer_v5/likelihood_report.json`
-  (`1e27dcf95228d4ba9972d53a58cc9e0cae7929106d4bbc5de9acb868171815ad`).
-- Final decision: `scratchpad/fugu_seed_opd_optimizer_v5/decision_report.json`
-  (`96dbf2a8075d3aa8e647fc12f0788c3987ff043e0b494acaeb7d8dbfe6c42815`).
-
-The causally isolated v6 preflight reused the exact v5 OPD samples and changed
-only train-side replay composition. It used 30 replay examples across all nine
-training tasks, with action-token mass of 72 complete, 72 continue, 68 handoff,
-and 72 replan tokens:
-
-- Native optimization consumed exactly 14 OPD and 284 replay tokens. The parent
-  remained unchanged, all 504 child tensors changed finitely, and the stopped
-  pre-control launch performed zero optimizer steps.
-- Generation remained 178/178 contract-valid. Across 175 parent-stable rows,
-  v6 introduced zero regressions and corrected one parent error; false
-  completion remained one.
-- The repeatable direct-model audit nevertheless found overall target
-  likelihood down `0.000100` per token, handoff down `0.000010`, and replan down
-  `0.003735`. Complete and continue improved.
-- More fundamentally, v6 reused the same nondeterministic vLLM ordinary and
-  hindsight OPD scores as v5. The native step faithfully optimized its inputs,
-  but those inputs do not establish valid dense credit.
-
-Verdict: `V6_REJECTED_INVALID_DENSE_CREDIT_AND_ANTI_FORGETTING_REGRESSION`.
-The candidate is permanently rejected; no accepted checkpoint changed and no
-paid calls were made.
-
-Artifacts:
-
-- Prepared batch: `scratchpad/fugu_seed_opd_optimizer_v6/prepared_report.json`
-  (`5cd10b4d3548181abbfac26fe81cede4743a1142da32d5b41a318983f3d2550e`).
-- Native audit: `scratchpad/fugu_seed_opd_optimizer_v6/audit_report.json`
-  (`2cb98e6849a3987e82d6209812791c62000a18598af22d80e29f8eadfc6edb56`).
-- Generation replay: `scratchpad/fugu_seed_opd_optimizer_v6/replay_report.json`
-  (`bf5923b22560f7d87632a74a66aba6bcacc02484befb10bc374c5a9e45aea820`).
-- Direct likelihood: `scratchpad/fugu_seed_opd_optimizer_v6/direct_likelihood_report.json`
-  (`9c3fafb6106fe861db4bb976a67c6df8f304cc6196110fabed1e71bd1e4fa356`).
-- Final decision: `scratchpad/fugu_seed_opd_optimizer_v6/decision_report.json`
-  (`dc7c37f752e83623eae595a0b4d73cd0efdc2dfd5eab8b3a3608a371caed6f21`).
-
-The v7 preflight is the first optimizer run whose OPD ordinary and hindsight
-branches both came from the integrated deterministic direct scorer. It used the
-matched seven-token `continue` group plus the same action-token-normalized
-30-example train replay:
-
-- One native optimizer step consumed 14 OPD and 284 replay tokens. All 504 child
-  tensors changed finitely, the gradient norm was nonzero, and the accepted
-  parent hash remained unchanged.
-- Direct train-side target likelihood improved overall and for every action.
-- A failed eight-way generation launch was classified as infrastructure-invalid
-  after the local server died; it was not counted against the conductor. The
-  preregistered serial replacement completed 178/178 contract-valid decisions
-  with zero regressions across 175 stable parent rows.
-- The final exact-repeat direct holdout improved overall likelihood by
-  `0.000398` per token. `complete`, `continue`, and `handoff` improved, but
-  `replan` regressed by `0.003700` per token across its 18 frozen cases.
-
-Verdict: `V7_REJECTED_REPLAN_ANTI_FORGETTING_REGRESSION`. The corrected
-matched-reference OPD pipeline is operational, but this one-sample update is
-not a product checkpoint. The child is permanently rejected, the accepted
-planner/live-controller artifacts remain unchanged, and no external or paid
-calls were made.
-
-Artifacts:
-
-- Native audit: `scratchpad/fugu_seed_opd_optimizer_v7/audit_report.json`
-  (`fbac7c20503bc0df42ec4f76ea4f89a853835e302d5306586c0f18936bcad3c7`).
-- Train score gate: `scratchpad/fugu_seed_opd_optimizer_v7/train_score_report.json`
-  (`285f9671dddfb1bf6800ca2d388bb38c915ccf242da0ba9de38bc086da845acb`).
-- Serial generation gate: `scratchpad/fugu_seed_opd_optimizer_v7/generation_report.json`
-  (`d2454d316ffe007971d3635d53e177e030d1fe3d255c97ee415018e1cb54910f`).
-- Direct holdout likelihood:
-  `scratchpad/fugu_seed_opd_optimizer_v7/direct_likelihood_report.json`
-  (`ced16f2ff5f3a225e7e5a074b44df2fc30e9f546ec6d365cef4dec57f0621112`).
-
-### Verified causal coordination
-
-One same-task, same-runtime, same-pool causal pair is independently admitted:
-
-- Task: `configure-git-webserver`, permanently excluded from future evaluation.
-- Solo arm: anonymous builder, 8 Yunwu calls, clean reward 0; final deployed
-  state was removed and the verifier received HTTP 404.
-- Coordinated arm: identical builder plus one anonymous independent final-state
-  auditor, 7 Yunwu calls, reward 1.
-- Both arms used runtime r56, the same pool, fresh environments, zero retries,
-  and had no provider, protocol, harness, or integrity error.
-- The only intervention was the added auditor position with access to the
-  builder.
-
-Artifacts:
-
-- Campaign: `scratchpad/fugu_causal_coordination_v1/campaign_frozen.json`
-  (`4d9636973723956c5f515bf99f1f214ac4adfab9f559625f119a9e8c15e68ed7`)
-- Pair report: `scratchpad/fugu_causal_coordination_v1/pair_report.json`
-  (`6d6f97fa9c6a1448d45453bd394bcd910f14e3ea1f1d98b6270140a6e13eb07d`)
-- Independent admission:
-  `scratchpad/fugu_causal_coordination_v1/admission_v1.json`
-  (`9b6236f4f22d96074f5c1c2473bff5a04337e4e0203156b7caf21ab60852fb9d`)
-
-This proves one observed coordination lift. It does not estimate expected lift
-and does not authorize training.
-
-## Next Operation
-
-1. Keep product promotion and grand evaluation stopped. The v3, v5, v6, and v7
-   children are rejected and must not be used.
-2. Gate every hindsight annotation against observed conductor decision IDs and
-   reject task solutions, concrete model/provider identities, fixed worker
-   slots, and unsupported causal claims.
-3. Preserve the deterministic direct scorer as the only authorized OPD score
-   source. Do not reuse v3-v6 score values or the endpoint prompt-logprob path.
-4. Do not make a v8 replay-tuning attempt from the same single `continue` OPD
-   group. v7 proves that this data is too narrow to preserve all four actions,
-   even when the transport, native step, and replay are correct.
-5. Collect the missing clean train-side current-pool trajectories one task at a
-   time, targeting observed decision points and causal coordination evidence
-   across all four actions. Use Yunwu only, a 600-second worker timeout,
-   120-call global ceiling, zero retries, and stop immediately on invalidity or
-   absent learning value. TerminalBench, holdouts, oracle runs, and the rejected
-   historical outcome corpus remain excluded.
-6. Re-run the frozen Stage-1 gate after every admitted task. At threshold, train
-   full-action Stage-1 SFT with a replay-majority mixture, then continue with
-   replay-anchored OPD. Reject either stage on action validity, replay,
-   profile-equivariance, completion, or causal-lift regression.
-7. Promote nothing until whole-task train/holdout evidence shows coordination
-   lift while preserving anti-forgetting, model-agnostic construction, and pool
-   replacement behavior.
-8. Run the smallest held-out Yunwu product gate only after those conditions;
-   do not restart TerminalBench r33 or rerun published comparators.
-
-## Grand Evaluation
-
-The grand evaluation is the final product gate, not a research exercise.
-
-1. Use official published comparator scores; do not rerun other models.
-2. Start with the smallest preregistered held-out Yunwu promotion slice.
-3. Classify task failures separately from provider, harness, and protocol
-   invalidity.
-4. Stop as soon as superiority is mathematically impossible or the candidate
-   is invalid.
-5. Run remaining TerminalBench 2.1 tasks only while a credible path to at least
-   79/89 passes remains.
-6. Require consistent SWE-Pro-class agentic evidence before a product claim.
-
-## Reproduction
-
-Verify the accepted trained adapters and current runtime without model calls:
+| 3 | `gemini-3.6-flash` | drafter, implementer, fast pass |
+
+The active binding is `current_pool_binding_v17.json`
+(`pool_id yunwu-sol-gemini36-terra-fable-v1`, revision
+`yunwu-strong-producers-fable-verifier-v17`): strong models in the production
+roles (sol@planner, terra@coder), gemini-3.6 support, and — on user
+instruction 2026-07-24 — `claude-fable-5` replacing `grok-4.5` in the
+verifier/reasoner slot, giving a no-weak-worker pool. The sealed final that
+produced the current-pool baseline ran under v15 (grok@verifier). Any pool
+change resets the superiority bar to the new pool's strongest solo worker,
+which must be measured before a claim. Historical collections/batches
+reference the v11 identity `yunwu-sol-gemini-terra-grok-v1`. Episode schema 3, group schema 4, exact-batch
+report schema v6, and optimizer-report schema v3 must agree on this identity.
+Policy episodes also require behavior-likelihood contract
+`fugu_full_vocabulary_behavior_likelihood_v2`.
+
+To replace the pool:
+
+1. Write a new versioned binding with the same anonymous capability contract.
+2. Calibrate capability priors and rotate request-local positions.
+3. Collect only the behavior gaps introduced by the new pool.
+4. Continue training with the same transfer and action-balanced retention
+   replay.
+5. Re-run product retention and sealed evaluation. Do not add worker-specific
+   routing code.
+
+## Authoritative Product Paths
+
+| Purpose | Path |
+|---|---|
+| Runtime | `director/director/agentic/fugu_ultra_terminal.py` |
+| Qwen3.5 serving compatibility | `surogate/grpo/inference/patches.py` |
+| Pool binding | `director/manifests/fugu_clean_v1/grpo_pilot_train/current_pool_binding_v11.json` |
+| Synthetic branchpoint curriculum/evaluator | `ultra/ultra/synthetic_branchpoints.py` |
+| Parallel branchpoint collector | `ultra/ultra/synthetic_branchpoint_collection.py` |
+| Collection runner | `scripts/collect_fugu_synthetic_branchpoints.py` |
+| Exact-token branchpoint batch | `surogate/grpo/synthetic_branchpoint_batch.py` |
+| Branchpoint optimizer staging | `surogate/grpo/synthetic_branchpoint_update.py` |
+| Accepted-r2 | `scratchpad/fugu_27b_ale_accepted_r2` |
+| Transfer replay | `scratchpad/fugu_27b_transfer_replay_v1/replay.bin` |
+| Retention replay | `scratchpad/fugu_27b_action_balanced_retention_replay_v2/replay.bin` |
+| Retention report | `scratchpad/fugu_27b_action_balanced_retention_replay_v2/report.json` |
+| Product gate | `scratchpad/gate_fugu_ornith_typed_base_v1.py` |
+| Corrected accepted-r2 gate result | `scratchpad/fugu_27b_r2_corrected_namespace_typed_gate.json` |
+| ALE sealed split/inventory | `director/manifests/fugu_clean_v1/ale_derived_v1/` |
+
+## Training Recipe
+
+### 1. Establish the data boundary
+
+No new external repository task may enter optimizer training. The final
+already-running pre-pivot ALE group may close naturally, but it cannot launch
+a successor.
+
+New optimizer evidence is sampled locally from deterministic conductor-facing
+environments. Their workflow states and failure motifs must be derived from
+already-observed train rollout evidence, then varied across task semantics,
+artifacts, budgets, topology, shared memory, and anonymous capability
+positions. Scripted worker/tool transitions provide the environment outcome;
+the accepted conductor must still sample every learned action itself.
+
+Synthetic data is valid optimizer evidence only when it contains the exact
+accepted-policy prompt IDs, completion IDs, full-vocabulary behavior
+log-probabilities, seed, temperature, raw response, parsed action, realized
+transition, and terminal reward. Never synthesize policy tokens or
+log-probabilities, and never train the oracle action as SFT under the GRPO
+label.
+
+Synthetic success is not benchmark evidence. The family-disjoint ALE
+validation and final subsets remain sealed. Validation selects one checkpoint
+and never trains it; final remains sealed until one checkpoint is selected.
+
+### 2. Resolve model paths
+
+Use the installed Hugging Face selections without copying revision strings into
+this document:
 
 ```bash
-sha256sum \
-  director/director/agentic/fugu_ultra_terminal.py \
-  output/fugu_ultra_planner_composite_v11_s20/adapter_config.json \
-  output/fugu_ultra_planner_composite_v11_s20/adapter_model.safetensors \
-  output/fugu_ultra_live_control_grpo_v16/final_adapter/adapter_config.json \
-  output/fugu_ultra_live_control_grpo_v16/final_adapter/adapter_model.safetensors
+ROOT="$PWD"
+
+FP8_ROOT=/home/densemax2/.cache/huggingface/hub/models--Qwen--Qwen3.6-27B-FP8
+FP8_MODEL="$(find "$FP8_ROOT/snapshots" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+
+BF16_ROOT=/home/densemax/.cache/huggingface/hub/models--Qwen--Qwen3.6-27B
+BF16_MODEL="$(find "$BF16_ROOT/snapshots" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+
+PARENT="$ROOT/scratchpad/fugu_27b_ale_accepted_r2"
+REV=fugu-ale-r2-continue-balanced-20260722
+RUNTIME_REV=20260724-r88-context-8192
+SOURCE_RUNTIME_REV=20260724-r87-replan-access-namespace
 ```
 
-The hashes must match the Current Product table.
+The FP8 model is the currently proven serving and six-GPU optimizer path. The
+original BF16 model is the fallback described in step 8; it is not a license to
+replace the GRPO objective with SFT.
 
-Rebuild and verify the unified conductor and dense-credit path without model
-calls:
+### 3. Focused zero-paid readiness
+
+Do not run this section repeatedly. Run the checks affected by the current
+change, then the project build once.
 
 ```bash
-make build PARALLEL_JOBS=8
-
-PYTHONPATH="$PWD:$PWD/director:$PWD/ultra" \
-  director/.venv/bin/pytest -q \
+PYTHONPATH="$PWD:$PWD/ultra" \
+.venv/bin/pytest -q \
   ultra/tests/test_live_control.py \
-  director/tests/test_fugu_ultra_terminal.py \
-  director/tests/test_fugu_live_agentic_grpo.py \
-  director/tests/test_fugu_decision_correction.py
+  ultra/tests/test_synthetic_branchpoints.py \
+  ultra/tests/test_synthetic_branchpoint_collection.py \
+  tests/grpo/test_synthetic_branchpoint_batch.py \
+  tests/grpo/test_synthetic_branchpoint_update.py \
+  tests/grpo/test_ale_update.py \
+  tests/grpo/test_native_runtime_source.py
 
-PYTHONPATH="$PWD:$PWD/director:$PWD/ultra" \
-  .venv/bin/pytest -q \
-  tests/grpo/test_native_formula.py \
-  tests/grpo/test_inference_config.py \
-  tests/grpo/test_native_runtime_source.py \
-  tests/grpo/test_seed_opd_contract.py \
-  tests/grpo/test_seed_hindsight_rescore.py \
-  tests/grpo/test_live_agentic_v18_audit.py \
-  tests/grpo/test_live_agentic_v19_operation.py \
-  tests/grpo/test_resume_step.py \
-  ultra/tests/test_seed_hindsight.py
-
-PYTHONPATH="$PWD:$PWD/director:$PWD/ultra" \
-  .venv/bin/python scratchpad/audit_fugu_seed_opd_readiness.py
-
-PYTHONPATH="$PWD:$PWD/director:$PWD/ultra" \
-  director/.venv/bin/pytest -q \
-  director/tests/test_fugu_seed_stage1_corpus.py
-
-PYTHONPATH="$PWD:$PWD/director:$PWD/ultra" \
-  director/.venv/bin/python scratchpad/audit_fugu_seed_stage1_inventory.py
-
-PYTHONPATH="$PWD:$PWD/director:$PWD/ultra" \
-  .venv/bin/python scratchpad/audit_fugu_seed_rescore_local.py
-
-PYTHONPATH="$PWD" \
-  .venv/bin/python scratchpad/audit_fugu_seed_opd_optimizer_v3.py
+make build
 ```
 
-Expected results: native build succeeds; 147/147 runtime/control tests pass;
-48/48 trainer/audit/hindsight/rescorer tests pass; readiness status is
-`LOSS_FORMULA_AND_CONTRACT_READY_RESCORE_BACKEND_INVALID`. The Stage-1 corpus tests pass
-2/2 and its audit returns `INSUFFICIENT_ADMITTED_TRAJECTORIES_NO_TRAINING` with
-one eligible independent trajectory, four identity-free profile permutations,
-and zero calls or optimizer steps. The local rescore audit returns
-`LOCAL_EXACT_RESCORE_READY` with exact ordinary-prompt reconstruction, identical
-sampled action token IDs, zero masked environment tokens, and zero paid calls or
-optimizer steps. The v3 native audit returns
-`NATIVE_OPD_OPTIMIZER_READY_DISPOSABLE_CANDIDATE_NOT_PROMOTABLE`; its paired
-replay report must remain rejected and proves why replay anchoring is the next
-required training change.
+For runtime changes, add only the directly affected runtime test file. A
+passing focused suite closes that question until code or evidence changes.
 
+Before local collection, confirm the accepted adapter and base model exist,
+the served model resolves to that exact adapter, the output directory is
+unused, and the chosen GPUs are genuinely available. Local synthetic
+collection makes zero paid calls and does not use Docker.
 
-## Closed Work
+### 4. Serve the accepted behavior policy
 
-The following verdicts are final unless a genuinely new preregistered design
-changes the causal question:
+When two GPUs are free, serve the accepted product over the FP8 base:
 
-- TerminalBench r33: rejected; do not resume.
-- `video-processing` recovery v4: clean real reward-0 task/product failure; do
-  not retry.
-- Caffe recovery v3: infrastructure-invalid; do not retry.
-- Capability-routing SFT, primary-worker selector, topology selectors/editors,
-  and fixed-length route critic: rejected local gates; not integrated.
-- Local Ornith qualification: one solo win and two ties, zero coordination
-  wins; it did not provide evidence for a superior conductor.
-- V18/V19 live-agentic GRPO attempts: no promotable update; zero optimizer
-  steps. They are historical diagnostics, not current work.
-- Planner-role V2: one real local optimizer step, decisively rejected by the
-  exhaustive parent comparison; not integrated and not eligible for paid work.
-- SEED OPD v3: one disposable local optimizer step passed native correctness but
-  failed anti-forgetting replay; the child is rejected and not integrated.
-- SEED OPD v5: replay-anchored native optimization passed, but one stable
-  generation regression failed the anti-forgetting gate; its vLLM likelihood
-  audit is invalidated. The child is rejected and not integrated.
-- SEED OPD v6: action-token-normalized replay removed stable generation
-  regressions, but repeatable direct scoring found overall and replan likelihood
-  regression. Its OPD score source was also nondeterministic. The child is
-  rejected and not integrated.
-- SEED OPD v7: deterministic matched-reference OPD and normalized replay
-  preserved generated actions and improved overall direct likelihood, but
-  regressed frozen `replan` likelihood. The child is rejected and not
-  integrated; do not tune another child from the same one-sample OPD group.
-- Historical outcome-corpus V2: identity-free and leak-free, but its frozen
-  task-acquisition and workflow-ranker gates failed; it is not training data.
-- Adaptive causal `swesmith-03234` v3: solo arm was invalid after 25 Yunwu
-  calls; the conditional coordinated arm is permanently closed.
+```bash
+CUDA_VISIBLE_DEVICES=<two-free-gpu-indices> \
+FUGU_CONDUCTOR_BASE_MODEL_PATH="$FP8_MODEL" \
+FUGU_CONDUCTOR_ADAPTER_PATH="$PARENT" \
+FUGU_CONDUCTOR_CONTEXT=8192 \
+scripts/serve_fugu_conductor.sh
+```
 
-Detailed historical evidence remains in the frozen manifests and ledgers under
-`scratchpad/`. It is intentionally not duplicated here.
+The model list must show `fugu-27b-conductor` rooted at the absolute accepted
+adapter path with `fugu-27b-base` as parent. Do not collect against a relative
+adapter path, a different revision, or a stale service.
+`scripts/serve_fugu_conductor.sh` must serve with
+`--logprobs-mode processed_logprobs`.
+The installed vLLM plugin must map canonical text-adapter names
+`model.layers.*` to the full wrapper's
+`language_model.model.layers.*` modules. Preserve canonical PEFT keys on disk:
+Surogate continuation training consumes those original names, while the
+serving mapper performs the one-way runtime translation.
+Runtime r88 allows 7,680 input tokens and 512 generated tokens inside the
+8,192-token service context. This service window is separate from the
+2,816-token optimizer window.
+
+### 5. Collect exact synthetic policy rollouts
+
+The accepted r2 source collection for this update is the completed zero-paid
+48×19 run below. Do not rerun it. For a later curriculum revision, use a fresh
+output directory and seed while preserving the same collection contract. Each
+sample gets a unique seed and a dedicated controller object; scenarios run
+concurrently against the local accepted policy.
+
+```bash
+COLLECTION_DIR="$PWD/scratchpad/fugu_27b_synthetic_holdout_20261101_parent_r2"
+
+PYTHONPATH="$PWD:$PWD/director:$PWD/ultra" \
+director/.venv/bin/python scripts/collect_fugu_synthetic_branchpoints.py \
+  --output-dir "$COLLECTION_DIR" \
+  --pool-binding \
+    "$PWD/director/manifests/fugu_clean_v1/grpo_pilot_train/current_pool_binding_v11.json" \
+  --scenarios 48 \
+  --samples-per-scenario 19 \
+  --concurrency 64 \
+  --seed 20261101
+```
+
+This materialized source truthfully retains runtime revision
+`20260724-r87-replan-access-namespace`; do not rewrite its provenance. Any
+future collection uses runtime r88, a fresh seed, and a fresh output directory.
+
+Collection invariants:
+
+- the collection contains exactly 48 curriculum-v6 scenarios with 19 local
+  samples per scenario, for 912 zero-paid policy calls;
+- each row contains exactly one real accepted-product action sampled at a
+  conductor decision boundary; no learned action is supplied by the
+  environment;
+- the prompt is anonymous and gets capability topology from the binding;
+- behavior revision, runtime revision, pool identity, and binding revision
+  match the served product;
+- temperature is exactly `1.0`, full-vocabulary processed log-probabilities
+  are recorded, and retries are zero;
+- `response_format` remains omitted and the sampler uses no action constraint,
+  forced prefix, logit bias, rejection-until-action loop, or output repair;
+- no optimizer-bound trace may be truncated: prompt plus completion must fit
+  the 2,816-token optimizer window. Whole-task serving still uses the separate
+  8,192-token runtime window;
+- a deterministic position-grounded continuation executes the selected visible
+  workflow position first, then dependency-ready positions, and emits artifact,
+  check, independent-verification, and budget events;
+- terminal reward is derived only from those emitted events, never from an
+  oracle action label or exact plan wording;
+- variable-length feasible replan DAGs are accepted by capability,
+  dependency, access, verification, and budget semantics;
+- parse/legality failures, ambiguous supported behavior, unmodeled semantics,
+  and truncated output are excluded from optimizer credit;
+- infrastructure errors fail the collection and do not become reward 0;
+- paid-call count is exactly zero.
+
+The present 2,816-token optimizer window has not truncated current data:
+admitted ALE decisions max at 2,594 tokens, the current synthetic source maxes
+at 2,207, retention replay maxes at 2,793, and transfer replay's non-padding
+extent maxes at 2,393. It is nevertheless a tight legacy ceiling. Raise it
+only when richer traces require it and a focused six-GPU memory check proves
+the new window; never silently clip a row.
+
+After collection, measure spontaneous parsed/legal action support before
+materializing a batch. If a desired contrast arm is absent, stop that arm.
+Never manufacture coverage with constrained decoding, forced actions,
+protocol-output sanitization, retries, or relabeling. Use only the smallest
+supported on-policy block that preserves the intended causal balance.
+
+### 6. Admit only same-state causal outcome signal
+
+Reconstruct every branchpoint from its curriculum seed, binding, curriculum
+revision, and fixed-continuation revision. Replay each serialized parsed/legal
+policy action through the deterministic continuation and require reconstructed
+events, evidence, terminal outcome, reward, raw response, tokens, and
+log-probabilities to agree.
+
+For one identical branchpoint prompt:
+
+- a positive decision is an actual sampled action whose fixed continuation
+  reaches artifact-backed, independently verified terminal success;
+- a negative decision is an actual sampled action at that same state whose
+  fixed continuation fails;
+- positive and negative prompt messages and prompt token IDs must be identical;
+- only the initial sampled completion receives credit;
+- oracle/script tokens, corrections, retokenized completions, protocol-only
+  samples, and unmodeled samples receive no credit.
+
+Batch v5 admits exactly four same-state groups and eight balanced policy rows:
+
+- two unfinished-owner private repair-loop groups whose positive action is
+  `continue` and whose negative action is `handoff`;
+- two finished-owner, unverified-artifact groups whose positive action is
+  `handoff` and whose negative action is `complete`.
+
+The two groups in each ownership phase must have the same multiset of artifact
+contexts. This makes the handoff direction an exact signed-mass anchor:
+two positive and two negative handoff action-value tokens, each with the same
+fixed causal row mass, sum to zero. The remaining signal distinguishes
+continuing recoverable private work from handing off finished but unverified
+work.
+
+Both actions in every pair must be parsed, legal, initial-attempt actions
+sampled at the identical state. Stalled-owner, replan-only, protocol-only, and
+handoff-target-only groups do not satisfy this block. If the exact
+context-matched block is unavailable, stop without training; do not relabel
+samples, invent policy tokens, or force an action.
+
+### 7. Materialize the exact-token GRPO batch
+
+The sampled conductor tokens are the training tokens. Never retokenize them.
+Only same-state causal decisions receive standardized signed advantages.
+
+```bash
+BATCH_DIR=<new-batch-directory>
+
+PYTHONPATH="$PWD:$PWD/ultra" \
+.venv/bin/python -m surogate.grpo.synthetic_branchpoint_batch \
+  --collection "$COLLECTION_DIR/collection.json" \
+  --output-dir "$BATCH_DIR" \
+  --behavior-policy-revision "$REV" \
+  --runtime-revision 20260724-r87-replan-access-namespace \
+  --tokenizer-model "$FP8_MODEL" \
+  --pool-binding \
+    "$PWD/director/manifests/fugu_clean_v1/grpo_pilot_train/current_pool_binding_v11.json" \
+  --replay "$PWD/scratchpad/fugu_27b_transfer_replay_v1/replay.bin" \
+  --train-retention-replay \
+    "$PWD/scratchpad/fugu_27b_action_balanced_retention_replay_v2/replay.bin" \
+  --train-retention-report \
+    "$PWD/scratchpad/fugu_27b_action_balanced_retention_replay_v2/report.json"
+```
+
+Append each replay set exactly once:
+
+- transfer replay: 52 samples and 2,448 selected conductor tokens;
+- action-balanced train retention: 76 samples and 17,760 selected completion
+  tokens, with equal effective token mass for `complete`, `continue`,
+  `handoff`, and `replan`.
+
+Replay is CE-only. It receives no outcome advantage, behavior ratio, KL,
+teacher, or OPD gradient. Preserve the trainer correction that includes
+`typed_replay` in replay loss.
+
+The prepared report must be
+`fugu_synthetic_branchpoint_grpo_batch_v5` with credit mode
+`same_state_ownership_phase_action_contrast_v5`. For each policy row,
+signed outcome advantage applies only to the exact original generated token
+overlapping the first divergent character of the canonical JSON `action`
+value. Rationale, target, topology, and all other completion tokens receive no
+signed advantage; full-completion KL remains active. Normalize each row to
+causal credit mass `8.0`.
+
+The report must show exact-token policy data, one semantic pool identity, two
+recoverable-work `continue+ / handoff-` groups, two unverified-work
+`handoff+ / complete-` groups, exact context matching and handoff signed-mass
+cancellation, exactly eight balanced credited rows, maximum sequence length
+at or below 2,816, initial-policy-attempt-only credit, zero paid calls, and
+both replay sets once. The current prepared batch is
+`scratchpad/fugu_27b_synthetic_action_boundary_batch_r2_r6_001`; its maximum
+policy sequence is 1,701.
+Every trace must reproduce its prompt IDs from `messages` using the local
+model chat template and decode its completion IDs exactly to `response`; the
+stager rechecks the same binding against the optimizer model snapshot.
+Set `sample_packing=false`: each independent policy or replay sample occupies
+its own native row so the hybrid model's recurrent state cannot cross sample
+boundaries.
+
+### 8. Stage and run one conservative optimizer step
+
+Bind exactly six genuinely free GPUs. The accepted-product service may remain on
+GPUs 0-1 while training uses free GPUs 2-7. Do not disturb externally managed
+GPU workloads.
+
+```bash
+OPT_DIR=<new-optimizer-directory>
+
+CUDA_VISIBLE_DEVICES=<six-free-gpu-indices> \
+PYTHONPATH="$PWD:$PWD/ultra" \
+.venv/bin/python -m surogate.grpo.synthetic_branchpoint_update \
+  --prepared-report "$BATCH_DIR/prepared_report.json" \
+  --output-dir "$OPT_DIR" \
+  --model "$FP8_MODEL" \
+  --behavior-policy-revision "$REV" \
+  --runtime-revision 20260724-r87-replan-access-namespace \
+  --pool-binding \
+    "$PWD/director/manifests/fugu_clean_v1/grpo_pilot_train/current_pool_binding_v11.json" \
+  --replay "$PWD/scratchpad/fugu_27b_transfer_replay_v1/replay.bin" \
+  --train-retention-replay \
+    "$PWD/scratchpad/fugu_27b_action_balanced_retention_replay_v2/replay.bin" \
+  --train-retention-report \
+    "$PWD/scratchpad/fugu_27b_action_balanced_retention_replay_v2/report.json" \
+  --parent-adapter "$PARENT" \
+  --learning-rate 2.5e-7
+
+CUDA_VISIBLE_DEVICES=<six-free-gpu-indices> \
+PYTHONPATH="$PWD:$PWD/ultra" \
+.venv/bin/python -m surogate.cli.grpo_train "$OPT_DIR/train.yaml"
+```
+
+The staged contract is one atomic step, no resume, sequence length 2,816,
+`sample_packing=false`, `adv_tau=1.0`, `replay_tau=0.05`, `kl_tau=0.001`, LoRA
+rank/alpha 16/16 over q/k/v/o/gate/up/down projections, and learning rate no
+greater than `1e-6`. Start the first synthetic step at `2.5e-7`; raise it only
+after causal evidence shows under-correction without retention loss.
+
+Before any update mutation, reject unless:
+
+- behavior/native mean mismatch KL is finite and at most `0.10`;
+- at least one policy sample contributes to that mismatch metric, and
+  replay-only rows do not dilute it;
+- native policy, KL, and replay metrics are finite;
+- replay token count, replay weight, and replay loss are positive;
+- total trained tokens exactly match the prepared loss scale;
+- VTC is finite and positive as a diagnostic only; and
+- all six LoRA replica gradient norms are finite and positive.
+
+Failure exits before update, broadcast, or export. A completed optimizer
+process produces a candidate only; it never promotes itself.
+
+The FP8 path has completed real six-GPU steps on this host. If it later stalls
+or fails for a reproducible implementation reason, stop instead of waiting or
+retrying blindly. The BF16 fallback must preserve the exact GRPO
+advantage/replay/KL objective through dispatch pipeline parallelism, using
+`examples/sft/qwen35/qwen36-text-lora-bf16-pp.yaml` as the dispatch-PP
+reference. That SFT example is not itself an objective-equivalent trainer.
+
+### 9. Register and serve the candidate
+
+The exported candidate is expected under
+`$OPT_DIR/run_default/broadcasts/step_1`. Copy it to a fresh candidate path;
+never overwrite the accepted parent. Use
+`register_trained_policy_adapter` in `surogate/grpo/ale_update.py` to assign a
+new semantic `fugu-conductor-*` revision with the accepted revision as parent.
+
+Serve the candidate over the same base and vLLM settings used for the accepted
+product.
+Changing the base, prompt contract, structured-output backend, or context
+window invalidates a parent comparison.
+
+### 10. Run the existing retention/capability gate
+
+```bash
+FUGU_GATE_BASE_URL=http://127.0.0.1:8010/v1 \
+FUGU_GATE_MODEL=fugu-27b-conductor \
+FUGU_GATE_REPORT=<candidate-gate-report.json> \
+PYTHONPATH="$PWD:$PWD/director:$PWD/ultra" \
+director/.venv/bin/python scratchpad/gate_fugu_ornith_typed_base_v1.py
+```
+
+The accepted product is the floor:
+
+| Metric | Floor |
+|---|---:|
+| Typed parse | 40/40 |
+| Legal action | 40/40 |
+| Action match | 40/40 |
+| Transition match | 23 |
+| Live action match | 26/26 |
+| Multi-step replans | 17/17 |
+| Complete boundaries | 3/3 |
+| False completes | 0 |
+
+Reject immediately if any parent-correct action, transition, live decision,
+replan, or completion is lost. Passing retention is necessary but insufficient:
+promotion also requires a credible causal whole-task or capability gain. Keep
+the parent as rollback.
+
+After the fixed gate, run one fresh local parent/candidate probe with the same
+48 scenarios, 19 samples per scenario, seed, temperature, and concurrency for
+both arms: 912 zero-paid policy calls per arm. Reject if protocol-only outputs
+increase, overall verified successes decrease, either trained positive action
+loses support, premature actions increase, or any untrained motif loses
+verified successes versus the accepted parent. Statistical insignificance is
+not an exemption from the no-regression rule. Once a probe informs curriculum
+design, it becomes development evidence and cannot be reused for promotion.
+
+When a candidate is accepted, update the product defaults so ordinary
+`FuguUltraTerminalAgent` construction selects the accepted typed conductor.
+Do not leave the accepted model accessible only through ALE-specific override
+arguments.
+
+### 11. Iterate from causal evidence
+
+- Keep the accepted parent unchanged after a rejected child.
+- Diagnose each regression against the credited action and training mix.
+- Add new synthetic motifs only for a specific missing causal direction
+  demonstrated by existing train evidence.
+- Do not sweep hyperparameters, launch external training tasks, or repeat
+  no-signal collections unchanged.
+- Each new optimizer step uses the latest accepted behavior revision and both
+  replay sets.
+- Update `Current Status` in place after a collection or optimizer candidate
+  is accepted/rejected, or the blocker/next action changes.
+
+## Sealed Evaluation and Superiority
+
+The local 40-case gate is not benchmark evidence.
+
+When a candidate has passed product retention and is operationally packaged:
+
+1. Run candidates only on the 23-task validation subset and choose exactly one
+   checkpoint. Validation outcomes never enter training.
+2. Run the selected checkpoint once on the sealed 23-task final subset with
+   zero provider and task retries.
+3. Use mean whole-task outcome as the primary metric and report full-pass rate
+   and task-level outcomes.
+4. Compare those exact tasks against each bound solo worker using published
+   per-task results where available. Never substitute the official 152-task
+   aggregate for a matched comparator.
+5. Separate task failures from provider, harness, and protocol invalidity.
+6. Stop immediately if the candidate is contaminated or if superiority becomes
+   mathematically impossible.
+
+Superiority requires the conductor's uncontaminated matched final mean to
+exceed the maximum matched mean of the four solo workers, which implies it
+outperforms every worker in the bound pool. Report this as an ALE-derived Fugu
+evaluation, never an official ALE-V1 score.
+
+Until that evidence exists, the only honest verdict is: **superiority
+unproven**.

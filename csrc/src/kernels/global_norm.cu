@@ -586,13 +586,26 @@ __global__ void global_amax_multi_tensor_kernel(float* __restrict__ amax_out,
         if (dtype_flags[t] == 1) {
             const auto* data = static_cast<const nv_bfloat16*>(data_ptrs[t]);
             for (size_t i = blockIdx.x * BLOCK_SIZE + threadIdx.x; i < count; i += grid_width) {
-                float val = fabsf((float)data[i]);
+                const float raw = (float)data[i];
+                if (!isfinite(raw)) {
+                    // Quiet-NaN bits sort above every finite non-negative
+                    // float bit pattern. Once set, the normal atomic max
+                    // below cannot overwrite this fail-closed sentinel.
+                    atomicMax(reinterpret_cast<unsigned int*>(amax_out), 0x7fc00000u);
+                    continue;
+                }
+                float val = fabsf(raw);
                 if (val > local_max) local_max = val;
             }
         } else {
             const auto* data = static_cast<const float*>(data_ptrs[t]);
             for (size_t i = blockIdx.x * BLOCK_SIZE + threadIdx.x; i < count; i += grid_width) {
-                float val = fabsf(data[i]);
+                const float raw = data[i];
+                if (!isfinite(raw)) {
+                    atomicMax(reinterpret_cast<unsigned int*>(amax_out), 0x7fc00000u);
+                    continue;
+                }
+                float val = fabsf(raw);
                 if (val > local_max) local_max = val;
             }
         }

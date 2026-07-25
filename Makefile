@@ -6,9 +6,15 @@ BUILD_TYPE ?= Release
 PARALLEL_JOBS ?= $(shell nproc)
 
 CCACHE := $(shell which ccache 2>/dev/null)
+CUDA_HOME ?= $(or $(CUDA_PATH),$(shell dirname $$(dirname $$(which nvcc 2>/dev/null)) 2>/dev/null),/usr/local/cuda)
+# Resolve version-switching symlinks such as /usr/local/cuda before handing the
+# compiler and toolkit root to CMake.  Otherwise an existing CMake cache can
+# retain one toolkit's libraries while the symlink starts compiling objects
+# with another toolkit's cudaDeviceProp ABI.
+CUDA_HOME := $(realpath $(CUDA_HOME))
+CUDA_CMAKE_FLAGS := -DCMAKE_CUDA_COMPILER=$(CUDA_HOME)/bin/nvcc -DCUDAToolkit_ROOT=$(CUDA_HOME)
 ifdef CCACHE
 CCACHE_FLAGS := -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
-CUDA_HOME ?= $(or $(CUDA_PATH),$(shell dirname $$(dirname $$(which nvcc 2>/dev/null)) 2>/dev/null),/usr/local/cuda)
 export CCACHE_CUDA_PATHS := $(CUDA_HOME)
 endif
 
@@ -19,7 +25,7 @@ all: build
 
 # Configure the build
 configure:
-	cmake -S csrc -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) $(CCACHE_FLAGS)
+	cmake -S csrc -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) $(CUDA_CMAKE_FLAGS) $(CCACHE_FLAGS)
 
 # Build all targets
 build: configure
@@ -35,7 +41,7 @@ define build_wheel
 	cp pyproject.toml pyproject.toml.bak && \
 	trap 'mv -f pyproject.toml.bak pyproject.toml' EXIT INT TERM; \
 	uv run --no-project --with tomlkit python3 .github/scripts/set_cuda_version_tag.py $(1) && \
-	CMAKE_ARGS="$(CCACHE_FLAGS)" CMAKE_BUILD_PARALLEL_LEVEL=$(PARALLEL_JOBS) uv build --wheel --out-dir dist && \
+	CMAKE_ARGS="$(CUDA_CMAKE_FLAGS) $(CCACHE_FLAGS)" CMAKE_BUILD_PARALLEL_LEVEL=$(PARALLEL_JOBS) uv build --wheel --out-dir dist && \
 	uv run --no-project --with auditwheel --with patchelf auditwheel repair dist/*.whl \
 		-w dist/repaired/ \
 		--exclude libcuda.so.1 \
@@ -123,7 +129,7 @@ format-check:
 
 # Build test executables without running them
 build-tests:
-	cmake -S csrc -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) -DBUILD_TESTS=ON $(CCACHE_FLAGS)
+	cmake -S csrc -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) -DBUILD_TESTS=ON $(CUDA_CMAKE_FLAGS) $(CCACHE_FLAGS)
 	cmake --build $(BUILD_DIR) --parallel $(PARALLEL_JOBS) --target unit-tests integration-tests
 
 # Build and run unit tests (kernels, modules, components)

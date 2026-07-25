@@ -11,6 +11,7 @@
 #include <nanobind/stl/unordered_map.h>
 #include <nanobind/ndarray.h>
 
+#include <cmath>
 #include <filesystem>
 #include <cstdlib>
 #include <cstring>
@@ -1105,7 +1106,8 @@ NB_MODULE(_surogate, m) {
             nb::arg("delay_us") = 0,
             "Queue one AdamW update (FP32 grad). delay_us stalls the worker so the "
             "caller can observe the in-flight stale state.")
-        .def("applied_count", &optimizers::AsyncStaleAdamW::applied_count,
+        .def("applied_count",
+             &optimizers::AsyncStaleAdamW::applied_count,
              "Number of updates the worker has finished applying (lock-free probe).")
         .def("drain", &optimizers::AsyncStaleAdamW::drain, "Block until all queued updates complete.")
         .def("master", &optimizers::AsyncStaleAdamW::master, "Drain, then return the FP32 master params.")
@@ -1417,8 +1419,10 @@ NB_MODULE(_surogate, m) {
             [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets, int split_after_block) {
                 CHECK_SHAPE(inputs, trainer->batch_size(), trainer->seq_length());
                 CHECK_SHAPE(targets, trainer->batch_size(), trainer->seq_length());
-                return dsl::dispatch_pp_phase0::grad_norms_subranges(
-                    *trainer, inputs.data(), targets.data(), split_after_block);
+                return dsl::dispatch_pp_phase0::grad_norms_subranges(*trainer,
+                                                                     inputs.data(),
+                                                                     targets.data(),
+                                                                     split_after_block);
             },
             nb::arg("inputs"),
             nb::arg("targets"),
@@ -1439,7 +1443,10 @@ NB_MODULE(_surogate, m) {
             "returns the final hidden state as a flat f32 list.")
         .def(
             "dispatch_pp_grad_norms_multigpu",
-            [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets, std::vector<int> los,
+            [](MultiGPUPyTrainer* trainer,
+               TokenArray inputs,
+               TokenArray targets,
+               std::vector<int> los,
                std::vector<int> his) {
                 CHECK_SHAPE(inputs, trainer->batch_size(), trainer->seq_length());
                 CHECK_SHAPE(targets, trainer->batch_size(), trainer->seq_length());
@@ -1459,8 +1466,11 @@ NB_MODULE(_surogate, m) {
             "bounded by the streaming slot count, not the layer count.")
         .def(
             "dispatch_pp_train_step",
-            [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets,
-               const optimizers::OptimizerConfig& opt_config, int step_idx) {
+            [](MultiGPUPyTrainer* trainer,
+               TokenArray inputs,
+               TokenArray targets,
+               const optimizers::OptimizerConfig& opt_config,
+               int step_idx) {
                 CHECK_SHAPE(inputs, trainer->batch_size(), trainer->seq_length());
                 CHECK_SHAPE(targets, trainer->batch_size(), trainer->seq_length());
                 return trainer->dispatch_pp_train_step(inputs.data(), targets.data(), opt_config, step_idx);
@@ -1473,14 +1483,26 @@ NB_MODULE(_surogate, m) {
             "grads, optimizer update) through the sub-range executor; returns the step loss.")
         .def(
             "dispatch_pp_train_step_multigpu",
-            [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets, std::vector<int> los,
-               std::vector<int> his, const optimizers::OptimizerConfig& opt_config, int step_idx, bool stale,
+            [](MultiGPUPyTrainer* trainer,
+               TokenArray inputs,
+               TokenArray targets,
+               std::vector<int> los,
+               std::vector<int> his,
+               const optimizers::OptimizerConfig& opt_config,
+               int step_idx,
+               bool stale,
                int num_microbatches) {
                 // inputs/targets carry num_microbatches microbatches of [batch_size, seq] each.
                 CHECK_SHAPE(inputs, num_microbatches * trainer->batch_size(), trainer->seq_length());
                 CHECK_SHAPE(targets, num_microbatches * trainer->batch_size(), trainer->seq_length());
-                return trainer->dispatch_pp_train_step_multigpu(
-                    inputs.data(), targets.data(), los, his, opt_config, step_idx, stale, num_microbatches);
+                return trainer->dispatch_pp_train_step_multigpu(inputs.data(),
+                                                                targets.data(),
+                                                                los,
+                                                                his,
+                                                                opt_config,
+                                                                step_idx,
+                                                                stale,
+                                                                num_microbatches);
             },
             nb::arg("inputs"),
             nb::arg("targets"),
@@ -1935,11 +1957,16 @@ NB_MODULE(_surogate, m) {
                 auto logprobs =
                     trainer->forward_for_grpo(input_ids.data(), targets.data(), position_ids_ptr, temperatures_ptr);
                 const std::size_t n = logprobs.size();
+                const std::size_t T = input_ids.shape(1);
+                if (n == 0 || T == 0 || n % T != 0) {
+                    throw std::runtime_error(
+                        "forward_for_grpo returned an empty or non-row-aligned logprob buffer");
+                }
+                const std::size_t output_rows = n / T;
                 float* data = new float[n];
                 std::copy(logprobs.begin(), logprobs.end(), data);
                 nb::capsule owner(data, [](void* p) noexcept { delete[] static_cast<float*>(p); });
-                const std::size_t B = input_ids.shape(0), T = input_ids.shape(1);
-                return nb::ndarray<nb::numpy, float, nb::ndim<2>>(data, {B, T}, owner);
+                return nb::ndarray<nb::numpy, float, nb::ndim<2>>(data, {output_rows, T}, owner);
             },
             nb::arg("input_ids"),
             nb::arg("targets"),
@@ -1947,7 +1974,7 @@ NB_MODULE(_surogate, m) {
             nb::arg("temperatures") = nb::none(),
             "GRPO single-pass forward: saves activations AND returns per-token logprobs.\n\n"
             "Call backward_grpo() after computing per-token gradient multipliers.\n"
-            "Returns: float32 logprobs shaped [B, T].")
+            "Returns: float32 logprobs shaped [native output rows, T].")
         .def(
             "step_grpo_native",
             [](MultiGPUPyTrainer* trainer,
@@ -1965,6 +1992,7 @@ NB_MODULE(_surogate, m) {
                nb::object hindsight_logprobs_obj,
                nb::object hindsight_mask_obj,
                nb::object replay_mask_obj,
+               nb::object replay_weights_obj,
                float loss_scale,
                float ipo_mask_low,
                float ipo_mask_high,
@@ -1973,9 +2001,26 @@ NB_MODULE(_surogate, m) {
                float opd_tau,
                float opd_beta,
                float replay_tau,
-               float kl_tau) {
+               float kl_tau,
+               int samples_per_rank) {
+                const std::size_t tokens = input_ids.shape(0) * input_ids.shape(1);
                 if (sample_starts.shape(0) != sample_ends.shape(0)) {
                     throw std::invalid_argument("sample_starts and sample_ends must have the same length");
+                }
+                const bool rank_batched = samples_per_rank > 0;
+                int sample_count = static_cast<int>(sample_starts.shape(0));
+                if (rank_batched) {
+                    const std::size_t rows = input_ids.shape(0);
+                    if (rows == 0 || sample_starts.shape(0) != rows * static_cast<std::size_t>(samples_per_rank)) {
+                        throw std::invalid_argument(
+                            "rank-batched sample ranges must contain input_rows * samples_per_rank entries");
+                    }
+                    if (inference_logprobs.shape(0) != tokens || advantages.shape(0) != tokens ||
+                        loss_mask.shape(0) != tokens) {
+                        throw std::invalid_argument(
+                            "rank-batched GRPO token arrays must contain input_rows * sequence_len entries");
+                    }
+                    sample_count = samples_per_rank;
                 }
                 const std::int32_t* position_ids_ptr = nullptr;
                 if (!position_ids_obj.is_none()) {
@@ -1999,8 +2044,7 @@ NB_MODULE(_surogate, m) {
                 const bool has_opd_reference = !opd_reference_logprobs_obj.is_none();
                 const bool has_hindsight = !hindsight_logprobs_obj.is_none();
                 const bool has_hindsight_mask = !hindsight_mask_obj.is_none();
-                if ((has_opd_reference != has_hindsight) ||
-                    (has_opd_reference != has_hindsight_mask)) {
+                if ((has_opd_reference != has_hindsight) || (has_opd_reference != has_hindsight_mask)) {
                     throw std::invalid_argument(
                         "opd_reference_logprobs, hindsight_logprobs, and hindsight_mask must be provided together");
                 }
@@ -2016,10 +2060,31 @@ NB_MODULE(_surogate, m) {
                     hindsight_mask_ptr = hindsight_mask.data();
                 }
                 const std::uint8_t* replay_mask_ptr = nullptr;
+                const float* replay_weights_ptr = nullptr;
                 if (!replay_mask_obj.is_none()) {
-                    auto replay_mask =
-                        nb::cast<nb::ndarray<std::uint8_t, nb::ndim<1>, nb::c_contig>>(replay_mask_obj);
+                    auto replay_mask = nb::cast<nb::ndarray<std::uint8_t, nb::ndim<1>, nb::c_contig>>(replay_mask_obj);
+                    if (replay_mask.shape(0) != tokens) {
+                        throw std::invalid_argument("replay_mask must match the flattened token count");
+                    }
                     replay_mask_ptr = replay_mask.data();
+                    if (!replay_weights_obj.is_none()) {
+                        auto replay_weights =
+                            nb::cast<nb::ndarray<float, nb::ndim<1>, nb::c_contig>>(replay_weights_obj);
+                        if (replay_weights.shape(0) != tokens) {
+                            throw std::invalid_argument("replay_weights must match the flattened token count");
+                        }
+                        for (std::size_t idx = 0; idx < tokens; ++idx) {
+                            const float weight = replay_weights.data()[idx];
+                            if (!std::isfinite(weight) ||
+                                (replay_mask.data()[idx] != 0 ? weight <= 0.0f : weight != 1.0f)) {
+                                throw std::invalid_argument(
+                                    "replay_weights must be finite and positive on replay tokens, and 1 elsewhere");
+                            }
+                        }
+                        replay_weights_ptr = replay_weights.data();
+                    }
+                } else if (!replay_weights_obj.is_none()) {
+                    throw std::invalid_argument("replay_weights require replay_mask");
                 }
                 trainer->step_grpo_native(input_ids.data(),
                                           targets.data(),
@@ -2028,7 +2093,7 @@ NB_MODULE(_surogate, m) {
                                           loss_mask.data(),
                                           sample_starts.data(),
                                           sample_ends.data(),
-                                          static_cast<int>(sample_starts.shape(0)),
+                                          sample_count,
                                           position_ids_ptr,
                                           temperatures_ptr,
                                           teacher_logprobs_ptr,
@@ -2036,6 +2101,7 @@ NB_MODULE(_surogate, m) {
                                           hindsight_logprobs_ptr,
                                           hindsight_mask_ptr,
                                           replay_mask_ptr,
+                                          replay_weights_ptr,
                                           loss_scale,
                                           ipo_mask_low,
                                           ipo_mask_high,
@@ -2044,7 +2110,8 @@ NB_MODULE(_surogate, m) {
                                           opd_tau,
                                           opd_beta,
                                           replay_tau,
-                                          kl_tau);
+                                          kl_tau,
+                                          rank_batched);
             },
             nb::arg("input_ids"),
             nb::arg("targets"),
@@ -2060,6 +2127,7 @@ NB_MODULE(_surogate, m) {
             nb::arg("hindsight_logprobs") = nb::none(),
             nb::arg("hindsight_mask") = nb::none(),
             nb::arg("replay_mask") = nb::none(),
+            nb::arg("replay_weights") = nb::none(),
             nb::arg("loss_scale") = 1.0f,
             nb::arg("ipo_mask_low") = 0.2f,
             nb::arg("ipo_mask_high") = 0.2f,
@@ -2069,6 +2137,7 @@ NB_MODULE(_surogate, m) {
             nb::arg("opd_beta") = 1.0f,
             nb::arg("replay_tau") = 0.0f,
             nb::arg("kl_tau") = 1.0e-3f,
+            nb::arg("samples_per_rank") = 0,
             "Run one GRPO training micro-step with native CUDA per-token gradient generation.")
         .def(
             "backward_grpo",
@@ -2091,6 +2160,10 @@ NB_MODULE(_surogate, m) {
                 return out;
             },
             "Return native GRPO metrics accumulated since the current grad-accum step started.")
+        .def("preflight_grpo_native_lora_gradient_norms",
+             &MultiGPUPyTrainer::preflight_grpo_native_lora_gradient_norms,
+             nb::arg("grad_clip"),
+             "Compute each replica's LoRA gradient norm without applying an optimizer update.")
         .def("set_grad_accumulation",
              &MultiGPUPyTrainer::set_grad_accumulation,
              nb::arg("n"),

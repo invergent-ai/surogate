@@ -30,7 +30,7 @@ from director.agentic.fugu_live_branchpoint_collection import (
 )
 
 
-COLLECTION_REVISION = "20260721-live-branchpoint-exact-environment-v2-test-namespace-guard-r2"
+COLLECTION_REVISION = "20260721-live-branchpoint-exact-environment-v2-resolved-protocol-capture-v7"
 ENVIRONMENT_ACK_FILENAME = "environment_capture_ack.json"
 ENVIRONMENT_CAPTURE_TIMEOUT_S = 300.0
 

@@ -1,0 +1,698 @@
+{
+  "assertions": {
+    "accumulated_gradients_are_identical": true,
+    "final_vtcs_differ": true,
+    "initial_adapters_are_identical": true,
+    "optimizer_norms_are_identical": true,
+    "post_update_lora_weights_are_identical": true,
+    "requested_final_vtcs_were_observed": true
+  },
+  "claim": "With one identical gradient-bearing native GRPO micro-step and an exactly zero-dloss final micro-step, changing only the final valid-token count from 1 to 8 does not change the accumulated LoRA gradients, full-precision AdamW norm, or post-update LoRA weights.",
+  "comparisons": {
+    "gradient_max_abs_diff": 0.0,
+    "initial_weight_max_abs_diff": 0.0,
+    "optimizer_norm_abs_diff": 0.0,
+    "post_update_weight_max_abs_diff": 0.0
+  },
+  "experiment": {
+    "batch_size": 1,
+    "final_micro_step": "all selected tokens are replay with replay_tau=0 and kl_tau=0",
+    "gpu_count": 1,
+    "gradient_accumulation": 2,
+    "initial_adapter_file": {
+      "sha256": "321ac91d4f9e85d52af1896f1e65aa20fe5fc68abc40ae8d09027ac2859bab43",
+      "size_bytes": 124483
+    },
+    "lora": {
+      "alpha": 2.0,
+      "dropout": 0.0,
+      "dtype": "bf16",
+      "rank": 2,
+      "target_modules": [
+        "q_proj"
+      ]
+    },
+    "optimizer": {
+      "beta1": 0.9,
+      "beta2": 0.999,
+      "epsilon": 1e-08,
+      "grad_clip": 0.0,
+      "learning_rate": 0.001,
+      "type": "adamw_full_precision",
+      "weight_decay": 0.0
+    },
+    "recipe": "bf16",
+    "sequence_length": 16
+  },
+  "gpu_preflight": {
+    "maximum_allowed_used_memory_mib": 1024,
+    "memory_total_mib": 32607,
+    "memory_used_mib_before": 1,
+    "name": "NVIDIA GeForce RTX 5090",
+    "physical_index": "2",
+    "utilization_percent_before": 0,
+    "uuid": "GPU-5176f7b3-4534-87c3-0cb3-86047ef61a7b"
+  },
+  "model": {
+    "config": {
+      "path": "/home/densemax2/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17/config.json",
+      "resolved_path": "/home/densemax2/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/blobs/715f0448b9d38103211f0ad88bbb4d6e4f4be8c9",
+      "sha256": "b90b86f35c8e6925ef74ee04d0e758f0a845c83a42089ad82bbaa948de9b4204",
+      "size_bytes": 2907
+    },
+    "import_path": {
+      "path": "/home/densemax2/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17/model.safetensors.index.json",
+      "resolved_path": "/home/densemax2/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/blobs/f691cefdb79d73270895ebd6d9594ddcecfc1838",
+      "sha256": "d8a08838a613b025eb7952ed9db11696213e57e76a375661ef5c12f9dd5dcf4e",
+      "size_bytes": 50900
+    },
+    "name": "Qwen/Qwen3.5-0.8B",
+    "network_downloads": 0,
+    "snapshot_path": "/home/densemax2/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17",
+    "snapshot_revision": "2fc06364715b967f1860aea9cf38778875588b17",
+    "weight_bytes": 1746942600,
+    "weight_files": [
+      {
+        "path": "/home/densemax2/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/blobs/04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696",
+        "resolved_path": "/home/densemax2/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/blobs/04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696",
+        "sha256": "04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696",
+        "size_bytes": 1746942600
+      }
+    ],
+    "weights_index": {
+      "path": "/home/densemax2/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17/model.safetensors.index.json",
+      "resolved_path": "/home/densemax2/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/blobs/f691cefdb79d73270895ebd6d9594ddcecfc1838",
+      "sha256": "d8a08838a613b025eb7952ed9db11696213e57e76a375661ef5c12f9dd5dcf4e",
+      "size_bytes": 50900
+    }
+  },
+  "proof_source": {
+    "path": "/home/densemax/work/flavius/surogate/scripts/prove_fugu_native_grpo_vtc_invariance_v1.py",
+    "resolved_path": "/home/densemax/work/flavius/surogate/scripts/prove_fugu_native_grpo_vtc_invariance_v1.py",
+    "sha256": "96d7173889c98fceda68eb35fefe4a55878673567410a1143f04396ce15564c0",
+    "size_bytes": 19970
+  },
+  "runtime": {
+    "imported_extension": {
+      "path": "/home/densemax/work/flavius/surogate/.venv/lib/python3.12/site-packages/surogate/_surogate.abi3.so",
+      "resolved_path": "/home/densemax/work/flavius/surogate/.venv/lib/python3.12/site-packages/surogate/_surogate.abi3.so",
+      "sha256": "6ac882778deed57fbedd0199eed3409f1c3682163c4befe091a61c6e6e918209",
+      "size_bytes": 13325856
+    },
+    "imported_extension_matches_rebuilt": true,
+    "loaded_common": {
+      "path": "/home/densemax/work/flavius/surogate/csrc/build-fugu-repair/libsurogate-common.so",
+      "resolved_path": "/home/densemax/work/flavius/surogate/csrc/build-fugu-repair/libsurogate-common.so",
+      "sha256": "e3057c94decd927c9b367a7f1a7407196729b04ea233bd74e256149a8407752e",
+      "size_bytes": 623305824
+    },
+    "loaded_common_is_rebuilt": true,
+    "native_source": {
+      "path": "/home/densemax/work/flavius/surogate/csrc/src/runtime/dsl/dsl_model_execution.cpp",
+      "resolved_path": "/home/densemax/work/flavius/surogate/csrc/src/runtime/dsl/dsl_model_execution.cpp",
+      "sha256": "cd0a5dec1974e125ee404e68187a78703383b47f01cdad36cda018fe9ca65cc3",
+      "size_bytes": 88560
+    },
+    "native_token_scaling_fix_present": true,
+    "rebuilt_common": {
+      "path": "/home/densemax/work/flavius/surogate/csrc/build-fugu-repair/libsurogate-common.so",
+      "resolved_path": "/home/densemax/work/flavius/surogate/csrc/build-fugu-repair/libsurogate-common.so",
+      "sha256": "e3057c94decd927c9b367a7f1a7407196729b04ea233bd74e256149a8407752e",
+      "size_bytes": 623305824
+    },
+    "rebuilt_extension": {
+      "path": "/home/densemax/work/flavius/surogate/csrc/build-fugu-repair/_surogate.abi3.so",
+      "resolved_path": "/home/densemax/work/flavius/surogate/csrc/build-fugu-repair/_surogate.abi3.so",
+      "sha256": "6ac882778deed57fbedd0199eed3409f1c3682163c4befe091a61c6e6e918209",
+      "size_bytes": 13325856
+    }
+  },
+  "schema_version": "fugu.native_grpo.final_vtc_invariance.v1",
+  "scope": {
+    "campaign_27b_checkpoint_touched": false,
+    "campaign_optimizer_steps": 0,
+    "local_small_model_optimizer_updates": 2,
+    "paid_calls": 0,
+    "paid_collection_artifacts_touched": false,
+    "proof_model_only": true
+  },
+  "variants": {
+    "final_vtc_1": {
+      "accumulated_gradients": {
+        "digest_sha256": "cadb075163d4b618f23b99d5056a6e53246591fc1131dd1e7818a7d5ca9a7efc",
+        "element_count": 61440,
+        "tensor_count": 12,
+        "tensors": {
+          "base_model.model.model.layers.11.self_attn.q_proj.lora_A.weight": {
+            "dtype": "float32",
+            "shape": [
+              2,
+              1024
+            ]
+          },
+          "base_model.model.model.layers.11.self_attn.q_proj.lora_B.weight": {
+            "dtype": "float32",
+            "shape": [
+              4096,
+              2
+            ]
+          },
+          "base_model.model.model.layers.15.self_attn.q_proj.lora_A.weight": {
+            "dtype": "float32",
+            "shape": [
+              2,
+              1024
+            ]
+          },
+          "base_model.model.model.layers.15.self_attn.q_proj.lora_B.weight": {
+            "dtype": "float32",
+            "shape": [
+              4096,
+              2
+            ]
+          },
+          "base_model.model.model.layers.19.self_attn.q_proj.lora_A.weight": {
+            "dtype": "float32",
+            "shape": [
+              2,
+              1024
+            ]
+          },
+          "base_model.model.model.layers.19.self_attn.q_proj.lora_B.weight": {
+            "dtype": "float32",
+            "shape": [
+              4096,
+              2
+            ]
+          },
+          "base_model.model.model.layers.23.self_attn.q_proj.lora_A.weight": {
+            "dtype": "float32",
+            "shape": [
+              2,
+              1024
+            ]
+          },
+          "base_model.model.model.layers.23.self_attn.q_proj.lora_B.weight": {
+            "dtype": "float32",
+            "shape": [
+              4096,
+              2
+            ]
+          },
+          "base_model.model.model.layers.3.self_attn.q_proj.lora_A.weight": {
+            "dtype": "float32",
+            "shape": [
+              2,
+              1024
+            ]
+          },
+          "base_model.model.model.layers.3.self_attn.q_proj.lora_B.weight": {
+            "dtype": "float32",
+            "shape": [
+              4096,
+              2
+            ]
+          },
+          "base_model.model.model.layers.7.self_attn.q_proj.lora_A.weight": {
+            "dtype": "float32",
+            "shape": [
+              2,
+              1024
+            ]
+          },
+          "base_model.model.model.layers.7.self_attn.q_proj.lora_B.weight": {
+            "dtype": "float32",
+            "shape": [
+              4096,
+              2
+            ]
+          }
+        }
+      },
+      "initial_weights": {
+        "digest_sha256": "228c36241970dbf4e055eb9b7533616d4122648ac6d320c35bdf1e60e0d97982",
+        "element_count": 61440,
+        "tensor_count": 12,
+        "tensors": {
+          "base_model.model.model.layers.11.self_attn.q_proj.lora_A.weight": {
+            "dtype": "float32",
+            "shape": [
+              2,
+              1024
+            ]
+          },
+          "base_model.model.model.layers.11.self_attn.q_proj.lora_B.weight": {
+            "dtype": "float32",
+            "shape": [
+              4096,
+              2
+            ]
+          },
+          "base_model.model.model.layers.15.self_attn.q_proj.lora_A.weight": {
+            "dtype": "float32",
+            "shape": [
+              2,
+              1024
+            ]
+          },
+          "base_model.model.model.layers.15.self_attn.q_proj.lora_B.weight": {
+            "dtype": "float32",
+            "shape": [
+              4096,
+              2
+            ]
+          },
+          "base_model.model.model.layers.19.self_attn.q_proj.lora_A.weight": {
+            "dtype": "float32",
+            "shape": [
+              2,
+              1024
+            ]
+          },
+          "base_model.model.model.layers.19.self_attn.q_proj.lora_B.weight": {
+            "dtype": "float32",
+            "shape": [
+              4096,
+              2
+            ]
+          },
+          "base_model.model.model.layers.23.self_attn.q_proj.lora_A.weight": {
+            "dtype": "float32",
+            "shape": [
+              2,
+              1024
+            ]
+          },
+          "base_model.model.model.layers.23.self_attn.q_proj.lora_B.weight": {
+            "dtype": "float32",
+            "shape": [
+              4096,
+              2
+            ]
+          },
+          "base_model.model.model.layers.3.self_attn.q_proj.lora_A.weight": {
+            "dtype": "float32",
+            "shape": [
+              2,
+              1024
+            ]
+          },
+          "base_model.model.model.layers.3.self_attn.q_proj.lora_B.weight": {
+            "dtype": "float32",
+            "shape": [
+              4096,
+              2
+            ]
+          },
+          "base_model.model.model.layers.7.self_attn.q_proj.lora_A.weight": {
+            "dtype": "float32",
+            "shape": [
+              2,
+              1024
+            ]
+          },
+          "base_model.model.model.layers.7.self_attn.q_proj.lora_B.weight": {
+            "dtype": "float32",
+            "shape": [
+              4096,
+              2
+            ]
+          }
+        }
+      },
+      "observed_final_vtc": 1,
+      "optimizer_norm": 36.47091293334961,
+      "post_update_weights": {
+        "digest_sha256": "b47f1e1eb51e021156ba82829b29bf872ceeebc87fdc148cd6376c095ce85003",
+        "element_count": 61440,
+        "tensor_count": 12,
+        "tensors": {
+          "base_model.model.model.layers.11.self_attn.q_proj.lora_A.weight": {
+            "dtype": "float32",
+            "shape": [
+              2,
+              1024
+            ]
+          },
+          "base_model.model.model.layers.11.self_attn.q_proj.lora_B.weight": {
+            "dtype": "float32",
+            "shape": [
+              4096,
+              2
+            ]
+          },
+          "base_model.model.model.layers.15.self_attn.q_proj.lora_A.weight": {
+            "dtype": "float32",
+            "shape": [
+              2,
+              1024
+            ]
+          },
+          "base_model.model.model.layers.15.self_attn.q_proj.lora_B.weight": {
+            "dtype": "float32",
+            "shape": [
+              4096,
+              2
+            ]
+          },
+          "base_model.model.model.layers.19.self_attn.q_proj.lora_A.weight": {
+            "dtype": "float32",
+            "shape": [
+              2,
+              1024
+            ]
+          },
+          "base_model.model.model.layers.19.self_attn.q_proj.lora_B.weight": {
+            "dtype": "float32",
+            "shape": [
+              4096,
+              2
+            ]
+          },
+          "base_model.model.model.layers.23.self_attn.q_proj.lora_A.weight": {
+            "dtype": "float32",
+            "shape": [
+              2,
+              1024
+            ]
+          },
+          "base_model.model.model.layers.23.self_attn.q_proj.lora_B.weight": {
+            "dtype": "float32",
+            "shape": [
+              4096,
+              2
+            ]
+          },
+          "base_model.model.model.layers.3.self_attn.q_proj.lora_A.weight": {
+            "dtype": "float32",
+            "shape": [
+              2,
+              1024
+            ]
+          },
+          "base_model.model.model.layers.3.self_attn.q_proj.lora_B.weight": {
+            "dtype": "float32",
+            "shape": [
+              4096,
+              2
+            ]
+          },
+          "base_model.model.model.layers.7.self_attn.q_proj.lora_A.weight": {
+            "dtype": "float32",
+            "shape": [
+              2,
+              1024
+            ]
+          },
+          "base_model.model.model.layers.7.self_attn.q_proj.lora_B.weight": {
+            "dtype": "float32",
+            "shape": [
+              4096,
+              2
+            ]
+          }
+        }
+      },
+      "requested_final_vtc": 1
+    },
+    "final_vtc_8": {
+      "accumulated_gradients": {
+        "digest_sha256": "cadb075163d4b618f23b99d5056a6e53246591fc1131dd1e7818a7d5ca9a7efc",
+        "element_count": 61440,
+        "tensor_count": 12,
+        "tensors": {
+          "base_model.model.model.layers.11.self_attn.q_proj.lora_A.weight": {
+            "dtype": "float32",
+            "shape": [
+              2,
+              1024
+            ]
+          },
+          "base_model.model.model.layers.11.self_attn.q_proj.lora_B.weight": {
+            "dtype": "float32",
+            "shape": [
+              4096,
+              2
+            ]
+          },
+          "base_model.model.model.layers.15.self_attn.q_proj.lora_A.weight": {
+            "dtype": "float32",
+            "shape": [
+              2,
+              1024
+            ]
+          },
+          "base_model.model.model.layers.15.self_attn.q_proj.lora_B.weight": {
+            "dtype": "float32",
+            "shape": [
+              4096,
+              2
+            ]
+          },
+          "base_model.model.model.layers.19.self_attn.q_proj.lora_A.weight": {
+            "dtype": "float32",
+            "shape": [
+              2,
+              1024
+            ]
+          },
+          "base_model.model.model.layers.19.self_attn.q_proj.lora_B.weight": {
+            "dtype": "float32",
+            "shape": [
+              4096,
+              2
+            ]
+          },
+          "base_model.model.model.layers.23.self_attn.q_proj.lora_A.weight": {
+            "dtype": "float32",
+            "shape": [
+              2,
+              1024
+            ]
+          },
+          "base_model.model.model.layers.23.self_attn.q_proj.lora_B.weight": {
+            "dtype": "float32",
+            "shape": [
+              4096,
+              2
+            ]
+          },
+          "base_model.model.model.layers.3.self_attn.q_proj.lora_A.weight": {
+            "dtype": "float32",
+            "shape": [
+              2,
+              1024
+            ]
+          },
+          "base_model.model.model.layers.3.self_attn.q_proj.lora_B.weight": {
+            "dtype": "float32",
+            "shape": [
+              4096,
+              2
+            ]
+          },
+          "base_model.model.model.layers.7.self_attn.q_proj.lora_A.weight": {
+            "dtype": "float32",
+            "shape": [
+              2,
+              1024
+            ]
+          },
+          "base_model.model.model.layers.7.self_attn.q_proj.lora_B.weight": {
+            "dtype": "float32",
+            "shape": [
+              4096,
+              2
+            ]
+          }
+        }
+      },
+      "initial_weights": {
+        "digest_sha256": "228c36241970dbf4e055eb9b7533616d4122648ac6d320c35bdf1e60e0d97982",
+        "element_count": 61440,
+        "tensor_count": 12,
+        "tensors": {
+          "base_model.model.model.layers.11.self_attn.q_proj.lora_A.weight": {
+            "dtype": "float32",
+            "shape": [
+              2,
+              1024
+            ]
+          },
+          "base_model.model.model.layers.11.self_attn.q_proj.lora_B.weight": {
+            "dtype": "float32",
+            "shape": [
+              4096,
+              2
+            ]
+          },
+          "base_model.model.model.layers.15.self_attn.q_proj.lora_A.weight": {
+            "dtype": "float32",
+            "shape": [
+              2,
+              1024
+            ]
+          },
+          "base_model.model.model.layers.15.self_attn.q_proj.lora_B.weight": {
+            "dtype": "float32",
+            "shape": [
+              4096,
+              2
+            ]
+          },
+          "base_model.model.model.layers.19.self_attn.q_proj.lora_A.weight": {
+            "dtype": "float32",
+            "shape": [
+              2,
+              1024
+            ]
+          },
+          "base_model.model.model.layers.19.self_attn.q_proj.lora_B.weight": {
+            "dtype": "float32",
+            "shape": [
+              4096,
+              2
+            ]
+          },
+          "base_model.model.model.layers.23.self_attn.q_proj.lora_A.weight": {
+            "dtype": "float32",
+            "shape": [
+              2,
+              1024
+            ]
+          },
+          "base_model.model.model.layers.23.self_attn.q_proj.lora_B.weight": {
+            "dtype": "float32",
+            "shape": [
+              4096,
+              2
+            ]
+          },
+          "base_model.model.model.layers.3.self_attn.q_proj.lora_A.weight": {
+            "dtype": "float32",
+            "shape": [
+              2,
+              1024
+            ]
+          },
+          "base_model.model.model.layers.3.self_attn.q_proj.lora_B.weight": {
+            "dtype": "float32",
+            "shape": [
+              4096,
+              2
+            ]
+          },
+          "base_model.model.model.layers.7.self_attn.q_proj.lora_A.weight": {
+            "dtype": "float32",
+            "shape": [
+              2,
+              1024
+            ]
+          },
+          "base_model.model.model.layers.7.self_attn.q_proj.lora_B.weight": {
+            "dtype": "float32",
+            "shape": [
+              4096,
+              2
+            ]
+          }
+        }
+      },
+      "observed_final_vtc": 8,
+      "optimizer_norm": 36.47091293334961,
+      "post_update_weights": {
+        "digest_sha256": "b47f1e1eb51e021156ba82829b29bf872ceeebc87fdc148cd6376c095ce85003",
+        "element_count": 61440,
+        "tensor_count": 12,
+        "tensors": {
+          "base_model.model.model.layers.11.self_attn.q_proj.lora_A.weight": {
+            "dtype": "float32",
+            "shape": [
+              2,
+              1024
+            ]
+          },
+          "base_model.model.model.layers.11.self_attn.q_proj.lora_B.weight": {
+            "dtype": "float32",
+            "shape": [
+              4096,
+              2
+            ]
+          },
+          "base_model.model.model.layers.15.self_attn.q_proj.lora_A.weight": {
+            "dtype": "float32",
+            "shape": [
+              2,
+              1024
+            ]
+          },
+          "base_model.model.model.layers.15.self_attn.q_proj.lora_B.weight": {
+            "dtype": "float32",
+            "shape": [
+              4096,
+              2
+            ]
+          },
+          "base_model.model.model.layers.19.self_attn.q_proj.lora_A.weight": {
+            "dtype": "float32",
+            "shape": [
+              2,
+              1024
+            ]
+          },
+          "base_model.model.model.layers.19.self_attn.q_proj.lora_B.weight": {
+            "dtype": "float32",
+            "shape": [
+              4096,
+              2
+            ]
+          },
+          "base_model.model.model.layers.23.self_attn.q_proj.lora_A.weight": {
+            "dtype": "float32",
+            "shape": [
+              2,
+              1024
+            ]
+          },
+          "base_model.model.model.layers.23.self_attn.q_proj.lora_B.weight": {
+            "dtype": "float32",
+            "shape": [
+              4096,
+              2
+            ]
+          },
+          "base_model.model.model.layers.3.self_attn.q_proj.lora_A.weight": {
+            "dtype": "float32",
+            "shape": [
+              2,
+              1024
+            ]
+          },
+          "base_model.model.model.layers.3.self_attn.q_proj.lora_B.weight": {
+            "dtype": "float32",
+            "shape": [
+              4096,
+              2
+            ]
+          },
+          "base_model.model.model.layers.7.self_attn.q_proj.lora_A.weight": {
+            "dtype": "float32",
+            "shape": [
+              2,
+              1024
+            ]
+          },
+          "base_model.model.model.layers.7.self_attn.q_proj.lora_B.weight": {
+            "dtype": "float32",
+            "shape": [
+              4096,
+              2
+            ]
+          }
+        }
+      },
+      "requested_final_vtc": 8
+    }
+  },
+  "verdict": "PASS"
+}

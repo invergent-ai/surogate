@@ -12,6 +12,7 @@ prevent cross-sample attention in packed sequences.
 """
 
 import json
+import math
 import shutil
 import time
 from pathlib import Path
@@ -30,6 +31,90 @@ from surogate.utils.logger import get_logger
 from surogate.utils.tensor import to_surogate_dtype
 
 logger = get_logger()
+
+
+class NativeGRPOUpdateRejected(RuntimeError):
+    """A replay-anchored native update failed its pre-mutation safety gate."""
+
+
+MAX_REPLAY_ANCHORED_MISMATCH_KL = 0.10
+
+
+_NATIVE_FINITE_UPDATE_METRICS = (
+    "policy_loss",
+    "mismatch_kl",
+    "masked_mismatch_kl",
+    "unmasked_mismatch_kl",
+    "teacher_kl",
+    "opd_loss",
+    "replay_loss",
+)
+
+
+def _finite_native_metric(metrics: dict[str, float], name: str) -> float:
+    value = metrics.get(name)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        raise NativeGRPOUpdateRejected(f"native GRPO update rejected: {name} is missing or non-finite")
+    return float(value)
+
+
+def _validate_replay_anchored_native_update(
+    *,
+    metrics: dict[str, float],
+    grad_norms: list[float],
+    valid_token_count: int,
+    expected_loss_scale: int,
+) -> None:
+    """Reject an unsafe replay-bearing update before optimizer state or weights mutate."""
+
+    for name in _NATIVE_FINITE_UPDATE_METRICS:
+        _finite_native_metric(metrics, name)
+
+    replay_tokens = _finite_native_metric(metrics, "replay_tokens")
+    replay_weight_sum = _finite_native_metric(metrics, "replay_weight_sum")
+    total_tokens = _finite_native_metric(metrics, "total_tokens")
+    policy_sample_count = _finite_native_metric(metrics, "policy_sample_count")
+    mismatch_kl = float(metrics["mismatch_kl"])
+    replay_loss = float(metrics["replay_loss"])
+    if mismatch_kl > MAX_REPLAY_ANCHORED_MISMATCH_KL:
+        raise NativeGRPOUpdateRejected(
+            "native GRPO update rejected: "
+            f"mismatch KL {mismatch_kl:.6g} exceeds {MAX_REPLAY_ANCHORED_MISMATCH_KL:.6g}"
+        )
+    if replay_tokens <= 0.0 or replay_weight_sum <= 0.0 or replay_loss <= 0.0:
+        raise NativeGRPOUpdateRejected(
+            "native GRPO update rejected: replay activity, weight sum, and loss must all be positive"
+        )
+    if policy_sample_count <= 0.0:
+        raise NativeGRPOUpdateRejected(
+            "native GRPO update rejected: behavior-likelihood policy sample count must be positive"
+        )
+    if total_tokens != float(expected_loss_scale):
+        raise NativeGRPOUpdateRejected(
+            "native GRPO update rejected: "
+            f"native selected-token count {total_tokens!r} differs from exact loss scale {expected_loss_scale}"
+        )
+
+    if not grad_norms:
+        raise NativeGRPOUpdateRejected("native GRPO update rejected: gradient norm preflight returned no replicas")
+    for rank, norm in enumerate(grad_norms):
+        if isinstance(norm, bool) or not isinstance(norm, (int, float)) or not math.isfinite(float(norm)):
+            raise NativeGRPOUpdateRejected(
+                f"native GRPO update rejected: replica {rank} gradient norm is missing or non-finite"
+            )
+        if float(norm) <= 0.0:
+            raise NativeGRPOUpdateRejected(
+                f"native GRPO update rejected: replica {rank} gradient norm has no usable signal"
+            )
+
+    if (
+        isinstance(valid_token_count, bool)
+        or not isinstance(valid_token_count, int)
+        or valid_token_count <= 0
+    ):
+        raise NativeGRPOUpdateRejected(
+            f"native GRPO update rejected: last native-row valid-token count {valid_token_count!r} is not positive"
+        )
 
 
 def _latest_checkpoint_step(config: GRPOTrainConfig) -> int:
@@ -77,9 +162,9 @@ def _set_initial_adapter(config: GRPOTrainConfig, trainer: object, start_step: i
         if not callable(import_adapter):
             raise RuntimeError("GRPO trainer does not support trainable adapter initialization")
         adapter_config = json.loads(required[0].read_text(encoding="utf-8"))
-        expected_rank = int(getattr(config, "lora_rank"))
-        expected_alpha = float(getattr(config, "lora_alpha"))
-        expected_targets = set(getattr(config, "lora_target_modules"))
+        expected_rank = int(config.lora_rank)
+        expected_alpha = float(config.lora_alpha)
+        expected_targets = set(config.lora_target_modules)
         if int(adapter_config.get("r", -1)) != expected_rank:
             raise ValueError("trainable parent adapter rank does not match trainer LoRA rank")
         if float(adapter_config.get("lora_alpha", -1.0)) != expected_alpha:
@@ -139,6 +224,160 @@ def _find_sample_boundaries(position_ids_flat: np.ndarray) -> list[tuple[int, in
         end = boundaries[i + 1] if i + 1 < len(boundaries) else len(position_ids_flat)
         ranges.append((start, end))
     return ranges
+
+
+def _prepare_grpo_rank_row(micro_batch: dict[str, np.ndarray | None], seq_len: int) -> dict[str, np.ndarray | None]:
+    """Pad one packed GRPO micro-batch into one native data-parallel rank row."""
+
+    orig_input_ids = micro_batch["input_ids"]
+    orig_position_ids = micro_batch["position_ids"]
+    orig_targets = micro_batch["targets"]
+    assert isinstance(orig_input_ids, np.ndarray)
+    assert isinstance(orig_position_ids, np.ndarray)
+    assert isinstance(orig_targets, np.ndarray)
+    actual_tokens = int(orig_input_ids.shape[1])
+    if actual_tokens <= 0 or actual_tokens > seq_len:
+        raise ValueError(f"invalid GRPO micro-batch length {actual_tokens} for sequence_len={seq_len}")
+
+    position_flat = orig_position_ids.flatten()
+    sample_ranges = _find_sample_boundaries(position_flat)
+
+    input_ids = np.zeros((1, seq_len), dtype=np.int32)
+    input_ids[0, :actual_tokens] = orig_input_ids[0, :actual_tokens]
+    position_ids = np.zeros((1, seq_len), dtype=np.int32)
+    position_ids[0, :actual_tokens] = orig_position_ids[0, :actual_tokens]
+    if actual_tokens < seq_len:
+        last_position = int(position_ids[0, actual_tokens - 1])
+        position_ids[0, actual_tokens:] = np.arange(
+            last_position + 1,
+            last_position + 1 + seq_len - actual_tokens,
+            dtype=np.int32,
+        )
+
+    targets = np.full((1, seq_len), -100, dtype=np.int32)
+    targets[0, :actual_tokens] = orig_targets[0, :actual_tokens]
+    loss_mask_flat = np.asarray(micro_batch["loss_mask"]).flatten()
+    shifted_mask = np.zeros(actual_tokens, dtype=bool)
+    if actual_tokens > 1:
+        shifted_mask[:-1] = loss_mask_flat[1:actual_tokens].astype(bool)
+    targets[0, :actual_tokens][~shifted_mask] = -100
+
+    def padded_float(name: str, fill: float = 0.0) -> np.ndarray:
+        result = np.full(seq_len, fill, dtype=np.float32)
+        values = np.asarray(micro_batch[name]).flatten()
+        result[:actual_tokens] = values[:actual_tokens]
+        return result
+
+    def padded_mask(name: str) -> np.ndarray:
+        result = np.zeros(seq_len, dtype=np.uint8)
+        values = np.asarray(micro_batch[name]).flatten()
+        result[:actual_tokens] = values[:actual_tokens].astype(np.uint8)
+        return result
+
+    teacher = micro_batch["teacher_logprobs"]
+    teacher_logprobs = None
+    if teacher is not None:
+        teacher_logprobs = np.zeros(seq_len, dtype=np.float32)
+        teacher_values = np.asarray(teacher).flatten()
+        teacher_logprobs[:actual_tokens] = teacher_values[:actual_tokens]
+
+    return {
+        "input_ids": input_ids,
+        "position_ids": position_ids,
+        "targets": targets,
+        "temperatures": padded_float("temperatures", fill=1.0).reshape(1, seq_len),
+        "inference_logprobs": padded_float("inference_logprobs"),
+        "advantages": padded_float("advantages"),
+        "loss_mask": padded_mask("loss_mask"),
+        "teacher_logprobs": teacher_logprobs,
+        "opd_reference_logprobs": padded_float("opd_reference_logprobs"),
+        "hindsight_logprobs": padded_float("hindsight_logprobs"),
+        "hindsight_mask": padded_mask("hindsight_mask"),
+        "replay_mask": padded_mask("replay_mask"),
+        "replay_weights": padded_float("replay_weights", fill=1.0),
+        "sample_starts": np.asarray([start for start, _ in sample_ranges], dtype=np.int32),
+        "sample_ends": np.asarray([end for _, end in sample_ranges], dtype=np.int32),
+    }
+
+
+def _stack_grpo_rank_rows(
+    micro_batches: list[dict[str, np.ndarray | None]],
+    *,
+    rank_width: int,
+    seq_len: int,
+) -> dict[str, np.ndarray | int | None]:
+    """Build one native call with distinct rows for every data-parallel GPU."""
+
+    if not micro_batches or len(micro_batches) > rank_width:
+        raise ValueError("rank row group must contain between one and rank_width micro-batches")
+    rows = [_prepare_grpo_rank_row(micro_batch, seq_len) for micro_batch in micro_batches]
+    valid_rows = len(rows)
+    while len(rows) < rank_width:
+        rows.append(
+            {
+                "input_ids": np.zeros((1, seq_len), dtype=np.int32),
+                "position_ids": np.arange(seq_len, dtype=np.int32).reshape(1, seq_len),
+                "targets": np.full((1, seq_len), -100, dtype=np.int32),
+                "temperatures": np.ones((1, seq_len), dtype=np.float32),
+                "inference_logprobs": np.zeros(seq_len, dtype=np.float32),
+                "advantages": np.zeros(seq_len, dtype=np.float32),
+                "loss_mask": np.zeros(seq_len, dtype=np.uint8),
+                "teacher_logprobs": None,
+                "opd_reference_logprobs": np.zeros(seq_len, dtype=np.float32),
+                "hindsight_logprobs": np.zeros(seq_len, dtype=np.float32),
+                "hindsight_mask": np.zeros(seq_len, dtype=np.uint8),
+                "replay_mask": np.zeros(seq_len, dtype=np.uint8),
+                "replay_weights": np.ones(seq_len, dtype=np.float32),
+                "sample_starts": np.empty(0, dtype=np.int32),
+                "sample_ends": np.empty(0, dtype=np.int32),
+            }
+        )
+
+    samples_per_rank = max(max(len(np.asarray(row["sample_starts"])) for row in rows), 1)
+    sample_starts = np.full((rank_width, samples_per_rank), -1, dtype=np.int32)
+    sample_ends = np.full((rank_width, samples_per_rank), -1, dtype=np.int32)
+    for rank, row in enumerate(rows):
+        starts = np.asarray(row["sample_starts"])
+        ends = np.asarray(row["sample_ends"])
+        sample_starts[rank, : len(starts)] = starts
+        sample_ends[rank, : len(ends)] = ends
+
+    def concat(name: str) -> np.ndarray:
+        return np.ascontiguousarray(np.concatenate([np.asarray(row[name]) for row in rows], axis=0))
+
+    any_teacher = any(row["teacher_logprobs"] is not None for row in rows)
+    teacher_logprobs = None
+    if any_teacher:
+        teacher_logprobs = np.ascontiguousarray(
+            np.concatenate(
+                [
+                    np.asarray(row["teacher_logprobs"])
+                    if row["teacher_logprobs"] is not None
+                    else np.zeros(seq_len, dtype=np.float32)
+                    for row in rows
+                ]
+            )
+        )
+
+    return {
+        "input_ids": concat("input_ids"),
+        "position_ids": concat("position_ids"),
+        "targets": concat("targets"),
+        "temperatures": concat("temperatures"),
+        "inference_logprobs": concat("inference_logprobs"),
+        "advantages": concat("advantages"),
+        "loss_mask": concat("loss_mask"),
+        "teacher_logprobs": teacher_logprobs,
+        "opd_reference_logprobs": concat("opd_reference_logprobs"),
+        "hindsight_logprobs": concat("hindsight_logprobs"),
+        "hindsight_mask": concat("hindsight_mask"),
+        "replay_mask": concat("replay_mask"),
+        "replay_weights": concat("replay_weights"),
+        "sample_starts": np.ascontiguousarray(sample_starts.reshape(-1)),
+        "sample_ends": np.ascontiguousarray(sample_ends.reshape(-1)),
+        "samples_per_rank": samples_per_rank,
+        "valid_rows": valid_rows,
+    }
 
 
 class GRPOTrainer:
@@ -315,6 +554,7 @@ class GRPOTrainer:
             tokenizer=tokenizer,
             transport_config=transport_config,
             start_step=start_step,
+            sample_packing=config.sample_packing,
         )
 
         # Setup data loader (receives packed MicroBatches)
@@ -389,9 +629,6 @@ class GRPOTrainer:
             seq_len = config.sequence_len
             n_mb = len(micro_batches)
 
-            # Tell the C++ engine how many micro-steps this optimizer step has.
-            self.trainer.set_grad_accumulation(n_mb)
-
             # Divide total loss by the sum of loss_mask
             # across all micro-batches in this optimizer step.
             loss_scale = int(sum(int(mb["loss_mask"].sum()) for mb in micro_batches))
@@ -401,111 +638,44 @@ class GRPOTrainer:
 
             # Note: loss_scale normalization is applied explicitly to per-token grads
             # (loss = total_loss / loss_scale).
+            # Each native trainer rank holds a model replica. Feed it a distinct
+            # packed row instead of tiling the same row across every GPU. LoRA
+            # gradients are averaged across ranks, so divide the global token
+            # denominator by rank_width to recover the exact global-sum/global-token
+            # gradient after that average. The final partial group is padded with
+            # zero-loss rows and follows the same normalization.
+            if getattr(config, "ep_size", 1) != 1:
+                raise RuntimeError("rank-batched native GRPO currently requires ep_size=1")
+            rank_width = int(config.gpus)
+            native_micro_steps = (n_mb + rank_width - 1) // rank_width
+            self.trainer.set_grad_accumulation(native_micro_steps)
+            native_loss_scale = float(loss_scale) / float(rank_width)
+            progress_every = max(1, native_micro_steps // 8)
 
-            # 4. Process each micro-batch (gradients accumulate in C++)
-            for mb in micro_batches:
-                # Original micro-batch data
-                orig_input_ids = mb["input_ids"]  # [1, T_mb]
-                orig_position_ids = mb["position_ids"]  # [1, T_mb]
-                orig_targets = mb["targets"]  # [1, T_mb]
-                advantages_flat = mb["advantages"].flatten()
-                inference_lp = mb["inference_logprobs"].flatten()
-                loss_mask_flat = mb["loss_mask"].flatten()
-                temps_flat = mb["temperatures"].flatten()
-
-                teacher_lp = None
-                if mb["teacher_logprobs"] is not None:
-                    teacher_lp = mb["teacher_logprobs"].flatten()
-                opd_reference_lp = mb["opd_reference_logprobs"].flatten()
-                hindsight_lp = mb["hindsight_logprobs"].flatten()
-                hindsight_mask_flat = mb["hindsight_mask"].flatten()
-                replay_mask_flat = mb["replay_mask"].flatten()
-
-                T_actual = orig_input_ids.shape[1]
-                ngpu = config.gpus
-
-                # Find sample boundaries for per-sample logprob/gradient shifting
-                pos_flat = orig_position_ids.flatten()
-                sample_ranges = _find_sample_boundaries(pos_flat)
-
-                # --- Build logprob targets (global next-token shift across packed sequence) ---
-                # shift_tensor_left on the packed input.
-                logprob_targets = np.full((1, seq_len), -100, dtype=np.int32)
-                logprob_targets[0, :T_actual] = orig_targets[0, :T_actual]
-
-                # Pad inputs to seq_len. Always pad position_ids sequentially
-                # from the last real position so RoPE resets are preserved.
-                input_padded = np.zeros((1, seq_len), dtype=np.int32)
-                input_padded[0, :T_actual] = orig_input_ids[0, :T_actual]
-                pos_padded = np.zeros((1, seq_len), dtype=np.int32)
-                pos_padded[0, :T_actual] = orig_position_ids[0, :T_actual]
-                if T_actual < seq_len:
-                    last_pos = int(pos_padded[0, T_actual - 1])
-                    pos_padded[0, T_actual:] = np.arange(
-                        last_pos + 1, last_pos + 1 + seq_len - T_actual, dtype=np.int32
-                    )
-                temp_padded = np.ones((1, seq_len), dtype=np.float32)
-                temp_padded[0, :T_actual] = temps_flat[:T_actual]
-
-                # --- Build backward targets with loss mask applied ---
-                # Mask out prompt tokens so CE forward produces 0 (= logprob 0) for them.
-                # This target array is used for BOTH forward (logprob extraction) and backward.
-                targets_padded = logprob_targets.copy()
-                tmask = loss_mask_flat[:T_actual].astype(bool)
-                tmask_shifted = np.zeros_like(tmask)
-                if T_actual > 1:
-                    tmask_shifted[:-1] = tmask[1:]
-                targets_padded[0, :T_actual][~tmask_shifted] = -100
-
-                # Tile for multi-GPU before forward (forward_for_grpo uses same layout as step_with_custom_loss)
-                input_step = input_padded
-                pos_step = pos_padded
-                temp_step = temp_padded
-                targets_step = targets_padded
-                if ngpu > 1:
-                    input_step = np.tile(input_padded, (ngpu, 1))
-                    pos_step = np.tile(pos_padded, (ngpu, 1))
-                    targets_step = np.tile(targets_padded, (ngpu, 1))
-                    temp_step = np.tile(temp_padded, (ngpu, 1))
-
-                inference_padded = np.zeros(seq_len, dtype=np.float32)
-                inference_padded[:T_actual] = inference_lp[:T_actual]
-                advantages_padded = np.zeros(seq_len, dtype=np.float32)
-                advantages_padded[:T_actual] = advantages_flat[:T_actual]
-                loss_mask_padded = np.zeros(seq_len, dtype=np.uint8)
-                loss_mask_padded[:T_actual] = loss_mask_flat[:T_actual].astype(np.uint8)
-                teacher_padded = None
-                if teacher_lp is not None:
-                    teacher_padded = np.zeros(seq_len, dtype=np.float32)
-                    teacher_padded[:T_actual] = teacher_lp[:T_actual]
-                opd_reference_padded = np.zeros(seq_len, dtype=np.float32)
-                opd_reference_padded[:T_actual] = opd_reference_lp[:T_actual]
-                hindsight_padded = np.zeros(seq_len, dtype=np.float32)
-                hindsight_padded[:T_actual] = hindsight_lp[:T_actual]
-                hindsight_mask_padded = np.zeros(seq_len, dtype=np.uint8)
-                hindsight_mask_padded[:T_actual] = hindsight_mask_flat[:T_actual].astype(np.uint8)
-                replay_mask_padded = np.zeros(seq_len, dtype=np.uint8)
-                replay_mask_padded[:T_actual] = replay_mask_flat[:T_actual].astype(np.uint8)
-
-                sample_starts = np.asarray([start for start, _ in sample_ranges], dtype=np.int32)
-                sample_ends = np.asarray([end for _, end in sample_ranges], dtype=np.int32)
-
+            # 4. Process up to one distinct micro-batch per GPU per native call.
+            for native_idx, start in enumerate(range(0, n_mb, rank_width)):
+                rank_batch = _stack_grpo_rank_rows(
+                    micro_batches[start : start + rank_width],
+                    rank_width=rank_width,
+                    seq_len=seq_len,
+                )
                 self.trainer.step_grpo_native(
-                    input_step,
-                    targets_step,
-                    inference_padded,
-                    advantages_padded,
-                    loss_mask_padded,
-                    sample_starts,
-                    sample_ends,
-                    position_ids=pos_step,
-                    temperatures=temp_step,
-                    teacher_logprobs=teacher_padded,
-                    opd_reference_logprobs=opd_reference_padded,
-                    hindsight_logprobs=hindsight_padded,
-                    hindsight_mask=hindsight_mask_padded,
-                    replay_mask=replay_mask_padded,
-                    loss_scale=float(loss_scale),
+                    rank_batch["input_ids"],
+                    rank_batch["targets"],
+                    rank_batch["inference_logprobs"],
+                    rank_batch["advantages"],
+                    rank_batch["loss_mask"],
+                    rank_batch["sample_starts"],
+                    rank_batch["sample_ends"],
+                    position_ids=rank_batch["position_ids"],
+                    temperatures=rank_batch["temperatures"],
+                    teacher_logprobs=rank_batch["teacher_logprobs"],
+                    opd_reference_logprobs=rank_batch["opd_reference_logprobs"],
+                    hindsight_logprobs=rank_batch["hindsight_logprobs"],
+                    hindsight_mask=rank_batch["hindsight_mask"],
+                    replay_mask=rank_batch["replay_mask"],
+                    replay_weights=rank_batch["replay_weights"],
+                    loss_scale=native_loss_scale,
                     ipo_mask_low=float(config.loss.ipo_mask_low),
                     ipo_mask_high=float(config.loss.ipo_mask_high),
                     adv_tau=float(config.loss.adv_tau),
@@ -514,7 +684,17 @@ class GRPOTrainer:
                     opd_beta=float(config.loss.opd_beta),
                     replay_tau=float(config.loss.replay_tau),
                     kl_tau=float(config.loss.kl_tau),
+                    samples_per_rank=int(rank_batch["samples_per_rank"]),
                 )
+                completed = native_idx + 1
+                if completed == native_micro_steps or completed % progress_every == 0:
+                    logger.info(
+                        "GRPO native progress: %d/%d rank-batched calls (%d/%d micro-batches)",
+                        completed,
+                        native_micro_steps,
+                        min(start + rank_width, n_mb),
+                        n_mb,
+                    )
 
             # 5. Optimizer step — one per orchestrator step
             lr = self.lr_schedule.get_lr(orch_step)
@@ -527,12 +707,32 @@ class GRPOTrainer:
                 adamw_beta2=config.adamw_beta2,
                 adamw_epsilon=config.adamw_epsilon,
             )
-            # Read VTC before optimizer step for diagnostics
+            # VTC is the last native row's diagnostic count, not the global
+            # denominator. The global exact-token check uses native
+            # metrics["total_tokens"] below.
             vtc = self.trainer.get_valid_token_count(0)
             expected_loss_scale = loss_scale
 
-            result = self.trainer.update_with_config(opt_config, step + 1)
-            step_metrics = dict(self.trainer.get_grpo_native_metrics())
+            # Replay-bearing updates are the ALE product path. Native metrics
+            # and every replica's LoRA gradient norm are readable after
+            # backward and before update_with_config() mutates optimizer state
+            # or weights. Any rejection propagates out of train(), so neither
+            # the candidate broadcast nor final export can run.
+            if float(config.loss.replay_tau) > 0.0:
+                step_metrics = dict(self.trainer.get_grpo_native_metrics())
+                preflight_grad_norms = list(
+                    self.trainer.preflight_grpo_native_lora_gradient_norms(float(config.max_grad_norm))
+                )
+                _validate_replay_anchored_native_update(
+                    metrics=step_metrics,
+                    grad_norms=preflight_grad_norms,
+                    valid_token_count=vtc,
+                    expected_loss_scale=expected_loss_scale,
+                )
+                result = self.trainer.update_with_config(opt_config, step)
+            else:
+                result = self.trainer.update_with_config(opt_config, step)
+                step_metrics = dict(self.trainer.get_grpo_native_metrics())
 
             step_time = time.time() - step_start
 
@@ -544,7 +744,7 @@ class GRPOTrainer:
                     f"kl={step_metrics.get('mismatch_kl', 0):.4f} "
                     f"masked={step_metrics.get('is_masked', 0):.2%} "
                     f"tokens={step_metrics.get('total_tokens', 0)} "
-                    f"micro_batches={n_mb} "
+                    f"micro_batches={n_mb} native_micro_steps={native_micro_steps} "
                     f"vtc={vtc} expected={expected_loss_scale} "
                     f"time={step_time:.2f}s"
                 )
@@ -570,11 +770,14 @@ class GRPOTrainer:
                             "train/opd_tokens": float(step_metrics.get("opd_tokens", 0.0)),
                             "train/replay_loss": float(step_metrics.get("replay_loss", 0.0)),
                             "train/replay_tokens": float(step_metrics.get("replay_tokens", 0.0)),
+                            "train/replay_weight_sum": float(step_metrics.get("replay_weight_sum", 0.0)),
                             "train/keep_tokens": float(step_metrics.get("keep_tokens", 0.0)),
                             "train/total_tokens": float(total_tokens),
                             "train/grad_norm": float(result["norm"]),
                             "train/lr": float(lr),
                             "train/micro_batches": float(n_mb),
+                            "train/native_micro_steps": float(native_micro_steps),
+                            "train/sample_count": float(step_metrics.get("sample_count", 0.0)),
                             "train/vtc": float(vtc),
                             "train/expected_loss_scale": float(expected_loss_scale),
                             "train/duration_ms": duration_ms,

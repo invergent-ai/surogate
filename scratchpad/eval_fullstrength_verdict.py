@@ -48,6 +48,9 @@ ap.add_argument("--timeout-s", type=float, default=900.0)   # per worker call (h
 ap.add_argument("--pool-upgrade", action="store_true")      # retired no-op (kept so old commands don't error)
 ap.add_argument("--pool-swaps", default="")                  # slot swaps, e.g. "st_glm=grok"
 ap.add_argument("--handicap", action="store_true")           # TREND protocol: workers 4096/minimal (historical series)
+ap.add_argument("--extra-solos", default="")                 # extra baseline workers, e.g. "legacy_opus=opus,legacy_gpt=gpt" (solo arms only — NEVER in the conductor's 4-slot pool)
+ap.add_argument("--conductor-model", default=None)           # vLLM model id override for the conductor (base-model ablation)
+ap.add_argument("--retry-workers", default="st_opus,st_gpt")  # solo2 arms (bar-plausible workers only)
 ap.add_argument("--smoke", action="store_true")
 args = ap.parse_args()
 
@@ -75,6 +78,16 @@ for swap in filter(None, args.pool_swaps.split(",")):
     slot, model = swap.split("=")
     cfg["worker_pool"][slot.strip()]["model"] = model.strip()
     print(f"POOL SWAP: {slot.strip()} -> {model.strip()}", flush=True)
+EXTRA_SOLOS = {}
+for pair in filter(None, args.extra_solos.split(",")):
+    wname, model = pair.split("=")
+    EXTRA_SOLOS[wname.strip()] = model.strip()
+for wname, model in EXTRA_SOLOS.items():
+    tmpl = dict(cfg["worker_pool"][cfg["worker_pool_names"][0]])
+    tmpl.update({"name": wname, "model": model, "worker_id": len(cfg["worker_pool_names"])})
+    cfg["worker_pool"][wname] = tmpl
+    cfg["worker_pool_names"] = cfg["worker_pool_names"] + [wname]
+    print(f"EXTRA SOLO BASELINE: {wname} -> {model}", flush=True)
 MANIFEST = os.environ.get("EVAL_MANIFEST", "heldout_trend60_taskspecs.jsonl")
 tasks = [TaskSpec.model_validate(json.loads(l)) for l in open(f"{D}/{MANIFEST}")]
 import random
@@ -84,10 +97,11 @@ for t in tasks:
 sample = []
 for cap, ts in by.items():
     rng.shuffle(ts); sample += ts[: args.n]
-WORKERS = cfg["worker_pool_names"]
+ALL_WORKERS = cfg["worker_pool_names"]
+WORKERS = [w for w in ALL_WORKERS if w not in EXTRA_SOLOS]  # the conductor's 4 ordinal slots
 # solo2 (retry) arms only for workers that can plausibly BE the bar — retry rows for weak
 # workers are spend with no decision value (user directive 2026-07-09: eval only what we need).
-RETRY_WORKERS = [w for w in WORKERS if w in ("st_opus", "st_gpt")]
+RETRY_WORKERS = [w for w in ALL_WORKERS if w in {x.strip() for x in args.retry_workers.split(",")}]
 
 if args.handicap:
     # the historical trend protocol (identical to training + every trend row ever)
@@ -168,7 +182,7 @@ async def gen_plan(msgs):
         for _ in range(3):
             try:
                 r = await vllm.chat.completions.create(
-                    model=args.adapter, messages=[dict(m) for m in msgs],
+                    model=args.conductor_model or args.adapter, messages=[dict(m) for m in msgs],
                     temperature=1.0, top_p=1.0, max_tokens=1024,
                     extra_body={"chat_template_kwargs": {"enable_thinking": False}})
                 txt = r.choices[0].message.content or ""
@@ -187,7 +201,7 @@ async def run_workflow(task, raw, pool, rid):
         return 0.0, 0, ("parse_fail" if raw.strip() else "empty_gen"), "(unparseable workflow)"
     try:
         rec = await execute_workflow(task, wf, pool, FS_SAMP, rollout_id=rid,
-                                     worker_harnesses={}, max_steps=5)
+                                     worker_ids=WORKERS, worker_harnesses={}, max_steps=5)
         ok = 1.0 if (rec.grade and rec.grade.success) else 0.0
         outcome = rec.execution.steps[-1].text[:1500] if rec.execution.steps else ""
         return ok, len(wf.steps), "ok", outcome
@@ -282,7 +296,7 @@ async def main():
     t0 = time.time()
     # phase 1: solos (the bar) + fu1, concurrently — independent work
     await asyncio.gather(*(
-        [arm_solo(t, w, pool) for t in sample for w in WORKERS]
+        [arm_solo(t, w, pool) for t in sample for w in ALL_WORKERS]
         + [arm_fu1(t, pool, i) for i, t in enumerate(sample)]))
     # phase 2: retry arms (need phase-1 rows)
     await asyncio.gather(*(

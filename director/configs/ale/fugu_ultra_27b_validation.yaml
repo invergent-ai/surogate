@@ -1,0 +1,17 @@
+# Validation-measurement variant of fugu_ultra_27b.yaml.
+# Same product deployer and product decoding settings; the only difference is
+# the conductor service endpoint (the corrected-r2 service is on port 8011).
+# Linux CLI surface only.
+class: director.agentic.fugu_ale.deployer.FuguAleDeployer
+id: fugu-ultra-27b-validation
+executor: local
+model: fugu-27b-r2-fixed
+
+config:
+  model: fugu-27b-r2-fixed
+  conductor_base_url: http://localhost:8011/v1
+  pool_binding_path: null
+  max_turns: 120
+  task_budget_s: 14400
+  record_terminal_session: false
+  provider_base_url: https://yunwu.ai/v1

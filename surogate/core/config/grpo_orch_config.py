@@ -53,7 +53,7 @@ class GRPOClientConfig:
 
 
 @dataclass
-class TeacherModelConfig(GRPOModelConfig, GRPOClientConfig):
+class TeacherModelConfig:
     """
     Configures the teacher model for computing teacher logprobs (e.g. for distillation).
 
@@ -68,6 +68,38 @@ class TeacherModelConfig(GRPOModelConfig, GRPOClientConfig):
     def __init__(self, cfg: DictDefault):
         self.model = GRPOModelConfig(cfg.get("model", {}))
         self.client = GRPOClientConfig(cfg.get("client", {}))
+
+
+@dataclass
+class GRPOReplayConfig:
+    """Frozen replay samples appended to every on-policy optimizer update."""
+
+    path: str | None = None
+    sha256: str | None = None
+    samples_per_step: int | None = None
+    seed: int = 0
+
+    def __init__(self, cfg: DictDefault):
+        self.path = cfg.get("path", self.path)
+        self.sha256 = cfg.get("sha256", self.sha256)
+        self.samples_per_step = cfg.get("samples_per_step", self.samples_per_step)
+        self.seed = cfg.get("seed", self.seed)
+        if not isinstance(self.path, str) or not self.path.strip():
+            raise ValueError("replay.path must be a non-empty file path")
+        if (
+            not isinstance(self.sha256, str)
+            or len(self.sha256) != 64
+            or any(character not in "0123456789abcdef" for character in self.sha256)
+        ):
+            raise ValueError("replay.sha256 must be a lowercase SHA-256 digest")
+        if self.samples_per_step is not None and (
+            isinstance(self.samples_per_step, bool)
+            or not isinstance(self.samples_per_step, int)
+            or self.samples_per_step <= 0
+        ):
+            raise ValueError("replay.samples_per_step must be a positive integer")
+        if isinstance(self.seed, bool) or not isinstance(self.seed, int):
+            raise ValueError("replay.seed must be an integer")
 
 
 @dataclass
@@ -298,6 +330,8 @@ class GRPOBufferConfig:
         recycle_easy_fraction: Fraction of easy examples to recycle to normal when the normal pool is low.
         recycle_hard_fraction: Fraction of hard examples to recycle to normal when the normal pool is low.
         hash_keys: Keys to use for computing example hashes. Will be used to match examples from buffer checkpoints and determine buffer resume behavior.
+        sample_without_replacement: Permanently consume an example when its rollout
+            group is scheduled. Intended for one-attempt agentic training tasks.
     """
 
     seed: int | None = None
@@ -311,6 +345,7 @@ class GRPOBufferConfig:
     recycle_easy_fraction: float | None = 0.0
     recycle_hard_fraction: float | None = 0.0
     hash_keys: list[str] | None = field(default_factory=lambda: ["task", "prompt"])
+    sample_without_replacement: bool = False
 
     def __init__(self, cfg: DictDefault):
         self.seed = cfg.get("seed", self.seed)
@@ -324,6 +359,9 @@ class GRPOBufferConfig:
         self.recycle_easy_fraction = cfg.get("recycle_easy_fraction", self.recycle_easy_fraction)
         self.recycle_hard_fraction = cfg.get("recycle_hard_fraction", self.recycle_hard_fraction)
         self.hash_keys = cfg.get("hash_keys", ["task", "prompt"])
+        self.sample_without_replacement = cfg.get(
+            "sample_without_replacement", self.sample_without_replacement
+        )
         self.__post_init__()
 
     def __post_init__(self):
@@ -344,6 +382,18 @@ class GRPOBufferConfig:
         assert self.normal_pool_min_examples is not None and self.normal_pool_min_examples >= 0, (
             "normal_pool_min_examples must be non-negative."
         )
+        if not isinstance(self.sample_without_replacement, bool):
+            raise ValueError("sample_without_replacement must be boolean")
+        if self.sample_without_replacement and any(
+            value > 0.0
+            for value in (
+                self.recycle_easy_fraction,
+                self.recycle_hard_fraction,
+            )
+        ):
+            raise ValueError(
+                "sample_without_replacement cannot recycle consumed examples"
+            )
 
 
 @dataclass
@@ -808,6 +858,7 @@ class GRPOOrchestratorConfig:
     client: GRPOClientConfig | None = None
     model: GRPOModelConfig | None = None
     teacher_model: TeacherModelConfig | None = None
+    replay: GRPOReplayConfig | None = None
     learning_rate: float | None = 1e-4
     sampling: GRPOSamplingConfig | None = None
     env: list[GRPOEnvConfig] | None = None
@@ -851,6 +902,9 @@ class GRPOOrchestratorConfig:
 
         if cfg.get("teacher_model") is not None:
             self.teacher_model = TeacherModelConfig(cfg.get("teacher_model"))
+
+        if cfg.get("replay") is not None:
+            self.replay = GRPOReplayConfig(cfg.get("replay"))
 
         self.learning_rate = cfg.get("learning_rate", self.learning_rate)
         self.sampling = GRPOSamplingConfig(cfg.get("sampling", {}))

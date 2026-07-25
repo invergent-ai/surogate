@@ -38,6 +38,7 @@ from surogate.grpo.orchestrator.ckpt import Progress, setup_ckpt_manager
 from surogate.grpo.orchestrator.eval_utils import evaluate_env
 from surogate.grpo.orchestrator.filters import apply_filters, setup_filters
 from surogate.grpo.orchestrator.scheduler import Scheduler
+from surogate.grpo.orchestrator.replay import ReplayBatchSource
 from surogate.grpo.orchestrator.spool import InflightSpool
 from surogate.grpo.orchestrator.trainability import exclude_non_trainable_rollouts
 from surogate.grpo.orchestrator.utils import (
@@ -402,6 +403,16 @@ async def orchestrate(config: GRPOOrchestratorConfig):
         # Setup training batch sender for sending training examples to trainer
         logger.info(f"Initializing training batch sender ({config.rollout_transport})")
         training_batch_sender = setup_training_batch_sender(Path(config.output_dir), config.rollout_transport)
+        replay_source = (
+            ReplayBatchSource.load(config.replay)
+            if config.replay is not None
+            else None
+        )
+        if replay_source is not None:
+            logger.info(
+                f"Loaded {len(replay_source.samples)} frozen replay samples; "
+                f"{replay_source.samples_per_step} will be appended to every update"
+            )
 
         # Track last online eval checkpoint step for this process
         last_eval_step = -1
@@ -701,6 +712,14 @@ async def orchestrate(config: GRPOOrchestratorConfig):
                     train_example.teacher_logprobs = teacher_logprobs
                 teacher_logprobs_time = time.perf_counter() - teacher_logprobs_start_time
                 logger.debug(f"Computed teacher logprobs in {teacher_logprobs_time:.2f}s")
+
+            if replay_source is not None:
+                replay_examples = replay_source.examples_for_step(progress.step)
+                train_examples.extend(replay_examples)
+                logger.info(
+                    f"Appended {len(replay_examples)} accepted replay samples to "
+                    f"optimizer step {progress.step}"
+                )
 
             training_batch = TrainingBatch(
                 examples=train_examples,

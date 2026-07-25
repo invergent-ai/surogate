@@ -1,0 +1,18 @@
+# A/B variant of the validation agent: identical product decoding, but the pool
+# binding is recalibrated (v12) so the strongest pool members occupy the slots
+# the conductor routes primary work to. The conductor's anonymous view
+# (role_priors, worker_ids) is byte-identical to v11 — only the hidden
+# runtime_model behind each position changes.
+class: director.agentic.fugu_ale.deployer.FuguAleDeployer
+id: fugu-ultra-27b-validation-v12
+executor: local
+model: fugu-27b-r2-fixed
+
+config:
+  model: fugu-27b-r2-fixed
+  conductor_base_url: http://localhost:8011/v1
+  pool_binding_path: /home/densemax/work/flavius/surogate/director/manifests/fugu_clean_v1/grpo_pilot_train/current_pool_binding_v12_recal.json
+  max_turns: 120
+  task_budget_s: 14400
+  record_terminal_session: false
+  provider_base_url: https://yunwu.ai/v1

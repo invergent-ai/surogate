@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <limits>
+#include <stdexcept>
 #include <string_view>
 #include <utility>
 
@@ -871,7 +873,17 @@ namespace {
     if (shape.empty()) return 0;
     long total = static_cast<long>(get_dtype_size(dtype));
     for (long d : shape) {
+        if (d < 0) {
+            throw std::overflow_error("negative dimension in compiled stack tensor shape");
+        }
+        if (d == 0) return 0;
+        if (total > std::numeric_limits<long>::max() / d) {
+            throw std::overflow_error("compiled stack tensor byte size overflow");
+        }
         total *= d;
+    }
+    if (total > std::numeric_limits<long>::max() - 255L) {
+        throw std::overflow_error("compiled stack tensor alignment overflow");
     }
     return align_stack_bytes(total);
 }
@@ -943,7 +955,11 @@ long graph_backward_stack_peak(const CompiledGraph* bwd_graph, const BufferPlan&
                 default: break;
             }
             if (on_stack) {
-                current += tensor_stack_bytes(ref.dtype, ref.shape);
+                const long bytes = tensor_stack_bytes(ref.dtype, ref.shape);
+                if (bytes > std::numeric_limits<long>::max() - current) {
+                    throw std::overflow_error("compiled graph stack peak overflow");
+                }
+                current += bytes;
             }
         }
 
@@ -954,7 +970,11 @@ long graph_backward_stack_peak(const CompiledGraph* bwd_graph, const BufferPlan&
         //     `REGISTER_STACK_BOUND`). Ops without a bound contribute 0; the
         //     outer safety margin in `required_stack_bytes` covers them.
         if (const auto* desc = OpRegistry::instance().find(op.type); desc && desc->stack_bound_fn) {
-            current += desc->stack_bound_fn(op, plan);
+            const long bytes = desc->stack_bound_fn(op, plan);
+            if (bytes < 0 || bytes > std::numeric_limits<long>::max() - current) {
+                throw std::overflow_error("compiled op stack bound overflow");
+            }
+            current += bytes;
         }
 
         peak = std::max(peak, current);

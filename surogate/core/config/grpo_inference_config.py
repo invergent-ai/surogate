@@ -39,6 +39,7 @@ class GRPOInferenceConfig:
         dtype: Data type for model weights and activations. Passed to vLLM as `--dtype`.
         max_model_len: Maximum model context length. Passed to vLLM as `--max-model-len`.
         enforce_eager: Whether to enforce eager mode. Passed to vLLM as `--enforce-eager`.
+        attention_backend: Optional vLLM attention backend override.
         trust_remote_code: Whether to trust remote code. Passed to vLLM engine init.
         enable_auto_tool_choice: Whether to enable auto tool choice. Passed to vLLM as `--enable-auto-tool-choice`.
         tool_call_parser: The tool call parser to use. Passed to vLLM as `--tool-call-parser`.
@@ -69,6 +70,7 @@ class GRPOInferenceConfig:
     dtype: Literal["auto", "float16", "bfloat16", "float32"] | None = "auto"
     max_model_len: int | None = None
     enforce_eager: bool | None = False
+    attention_backend: str | None = None
     trust_remote_code: bool | None = False
     enable_auto_tool_choice: bool | None = False
     tool_call_parser: str | None = "hermes"
@@ -102,6 +104,7 @@ class GRPOInferenceConfig:
         self.dtype = cfg.get("dtype", self.dtype)
         self.max_model_len = cfg.get("max_model_len", self.max_model_len)
         self.enforce_eager = cfg.get("enforce_eager", self.enforce_eager)
+        self.attention_backend = cfg.get("attention_backend", self.attention_backend)
         self.trust_remote_code = cfg.get("trust_remote_code", self.trust_remote_code)
         self.enable_auto_tool_choice = cfg.get("enable_auto_tool_choice", self.enable_auto_tool_choice)
         self.tool_call_parser = cfg.get("tool_call_parser", self.tool_call_parser)
@@ -146,6 +149,7 @@ class GRPOInferenceConfig:
             "dtype": "dtype",
             "max_model_len": "max_model_len",
             "enforce_eager": "enforce_eager",
+            "attention_backend": "attention_backend",
             "trust_remote_code": "trust_remote_code",
             "enable_auto_tool_choice": "enable_auto_tool_choice",
             "tool_call_parser": "tool_call_parser",

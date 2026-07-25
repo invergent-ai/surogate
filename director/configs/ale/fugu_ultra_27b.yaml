@@ -1,0 +1,14 @@
+# Fugu runs in the ALE host process and drives the isolated task VM remotely.
+# This first integration supports ALE's Linux CLI surface only.
+class: director.agentic.fugu_ale.deployer.FuguAleDeployer
+id: fugu-ultra-27b
+executor: local
+model: fugu-27b-conductor
+
+config:
+  conductor_base_url: http://localhost:8010/v1
+  pool_binding_path: null
+  max_turns: 120
+  task_budget_s: 14400
+  record_terminal_session: false
+  provider_base_url: https://yunwu.ai/v1

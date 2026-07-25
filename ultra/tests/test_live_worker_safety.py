@@ -39,7 +39,7 @@ def test_parent_repair_live_safety_allows_prepared_repo_lane():
         allow_yunwu_live=True,
         live_safety_path=SAFETY,
         max_examples=12,
-        force_step_budget="short",
+        force_step_budget="long",
     )
 
     assert report["enforced"] is True
@@ -55,7 +55,7 @@ def test_parent_repair_live_safety_allows_prepared_tool_lane_with_opus():
         allow_yunwu_live=True,
         live_safety_path=SAFETY,
         max_examples=16,
-        force_step_budget="short",
+        force_step_budget="long",
     )
 
     assert report["enforced"] is True
@@ -83,7 +83,7 @@ def test_live_safety_rejects_unapproved_lane():
             allow_yunwu_live=True,
             live_safety_path=SAFETY,
             max_examples=1,
-            force_step_budget="short",
+            force_step_budget="long",
         )
 
 
@@ -112,7 +112,7 @@ def test_live_safety_rejects_forbidden_worker_drift():
             allow_yunwu_live=True,
             live_safety_path=SAFETY,
             max_examples=12,
-            force_step_budget="short",
+            force_step_budget="long",
         )
 
 
@@ -125,5 +125,5 @@ def test_live_safety_rejects_yunwu_worker_without_yunwu_opt_in():
             allow_yunwu_live=False,
             live_safety_path=SAFETY,
             max_examples=16,
-            force_step_budget="short",
+            force_step_budget="long",
         )

@@ -1,0 +1,19 @@
+# IN-POOL SOLO BASELINE: glm-5.2 alone (no conductor), the strongest member of
+# the ow2 open-weight pool (position 3). This is the arm the conductor must beat
+# to claim it outperforms every solo worker in its own bound pool.
+# `model` stays the served conductor id only so the deployer's service check
+# passes; solo_worker_id disables the typed conductor entirely.
+class: director.agentic.fugu_ale.deployer.FuguAleDeployer
+id: fugu-solo-kimi_k3
+executor: local
+model: fugu-27b-r2-fixed
+
+config:
+  model: fugu-27b-r2-fixed
+  conductor_base_url: http://localhost:8011/v1
+  pool_binding_path: /home/densemax/work/flavius/surogate/director/manifests/fugu_clean_v1/grpo_pilot_train/current_pool_binding_ow2.json
+  solo_worker_id: 2
+  max_turns: 120
+  task_budget_s: 14400
+  record_terminal_session: false
+  provider_base_url: https://openrouter.ai/api/v1

@@ -134,6 +134,46 @@ def test_native_metrics_reference_matches_existing_grpo_metrics():
         assert actual[key] == expected_value
 
 
+def test_sparse_outcome_advantage_preserves_full_completion_kl() -> None:
+    trainer_logprobs = np.array(
+        [-8.0, -1.8, -1.7, -1.6],
+        dtype=np.float32,
+    )
+    inference_logprobs = np.array(
+        [-8.0, -2.0, -2.0, -2.0],
+        dtype=np.float32,
+    )
+    advantages = np.array(
+        [0.0, 0.0, 5.0, 0.0],
+        dtype=np.float32,
+    )
+    loss_mask = np.array([False, True, True, True])
+    config = GRPOLossConfig(
+        ipo_mask_low=1.0,
+        ipo_mask_high=1.0,
+        adv_tau=1.0,
+        kl_tau=0.1,
+    )
+
+    grads, _ = compute_grpo_per_token_grads(
+        trainer_logprobs=trainer_logprobs,
+        inference_logprobs=inference_logprobs,
+        advantages=advantages,
+        loss_mask=loss_mask,
+        loss_config=config,
+        sample_ranges=[(0, 4)],
+    )
+
+    log_ratio = trainer_logprobs - inference_logprobs
+    expected_kl = -2.0 * config.kl_tau * log_ratio
+    assert grads[0] == 0.0
+    assert grads[1] == pytest.approx(expected_kl[1])
+    assert grads[3] == pytest.approx(expected_kl[3])
+    assert grads[2] == pytest.approx(
+        5.0 * np.exp(log_ratio[2]) + expected_kl[2]
+    )
+
+
 def test_seed_opd_supplies_dense_credit_when_group_rewards_tie():
     trainer_logprobs = np.array([-8.0, -2.0, -1.0, -3.0], dtype=np.float32)
     inference_logprobs = trainer_logprobs.copy()
@@ -256,6 +296,94 @@ def test_replay_anchor_supplies_outcome_independent_parent_action_credit():
     assert metrics["replay_tokens"] == 2
     assert metrics["replay_loss"] == pytest.approx(0.75)
     assert metrics["opd_tokens"] == 0
+
+
+def test_replay_is_ce_only_and_ignores_behavior_ratio_advantage_and_kl():
+    trainer_logprobs = np.array([-8.0, -2.0, -1.0, -3.0], dtype=np.float32)
+    loss_mask = np.array([False, True, True, True])
+    replay_mask = np.array([False, True, True, True])
+    config = GRPOLossConfig(
+        adv_tau=1.0,
+        kl_tau=0.7,
+        opd_tau=0.0,
+        replay_tau=0.3,
+    )
+
+    grads, metrics = compute_grpo_per_token_grads(
+        trainer_logprobs=trainer_logprobs,
+        inference_logprobs=np.zeros(4, dtype=np.float32),
+        advantages=np.full(4, 50.0, dtype=np.float32),
+        loss_mask=loss_mask,
+        loss_config=config,
+        sample_ranges=[(0, 4)],
+        replay_mask=replay_mask,
+    )
+
+    np.testing.assert_allclose(grads, [0.0, 0.3, 0.3, 0.3])
+    assert metrics["replay_tokens"] == 3
+    assert metrics["replay_weight_sum"] == 3.0
+    assert metrics["replay_loss"] == pytest.approx(0.6)
+    assert metrics["mismatch_kl"] == 0.0
+    assert metrics["keep_tokens"] == 0
+    assert metrics["total_tokens"] == 3
+
+
+def test_replay_only_sample_does_not_dilute_behavior_mismatch_metric():
+    trainer_logprobs = np.array([-8.0, -1.0, -8.0, -1.0], dtype=np.float32)
+    inference_logprobs = np.array([-8.0, -2.0, -8.0, 50.0], dtype=np.float32)
+    loss_mask = np.array([False, True, False, True])
+
+    _, metrics = compute_grpo_per_token_grads(
+        trainer_logprobs=trainer_logprobs,
+        inference_logprobs=inference_logprobs,
+        advantages=np.zeros(4, dtype=np.float32),
+        loss_mask=loss_mask,
+        loss_config=GRPOLossConfig(adv_tau=0.0, kl_tau=0.0, replay_tau=0.3),
+        sample_ranges=[(0, 2), (2, 4)],
+        replay_mask=np.array([False, False, False, True]),
+    )
+
+    assert metrics["policy_sample_count"] == 1
+    assert metrics["mismatch_kl"] == pytest.approx(np.e - 2.0)
+
+
+def test_replay_weights_balance_ce_without_entering_policy_objective():
+    trainer_logprobs = np.array([-8.0, -2.0, -1.0, -3.0], dtype=np.float32)
+    loss_mask = np.array([False, True, True, True])
+    replay_mask = np.array([False, True, True, True])
+    replay_weights = np.array([1.0, 2.0, 0.5, 3.0], dtype=np.float32)
+    config = GRPOLossConfig(adv_tau=1.0, kl_tau=0.7, replay_tau=0.3)
+
+    grads, metrics = compute_grpo_per_token_grads(
+        trainer_logprobs=trainer_logprobs,
+        inference_logprobs=np.zeros(4, dtype=np.float32),
+        advantages=np.full(4, 50.0, dtype=np.float32),
+        loss_mask=loss_mask,
+        loss_config=config,
+        sample_ranges=[(0, 4)],
+        replay_mask=replay_mask,
+        replay_weights=replay_weights,
+    )
+
+    np.testing.assert_allclose(grads, [0.0, 0.6, 0.15, 0.9])
+    assert metrics["replay_tokens"] == 3
+    assert metrics["replay_weight_sum"] == pytest.approx(5.5)
+    assert metrics["replay_loss"] == pytest.approx(1.35)
+    assert metrics["mismatch_kl"] == 0.0
+
+
+def test_replay_weights_reject_policy_token_weighting():
+    with pytest.raises(ValueError, match="only on replay tokens"):
+        compute_grpo_per_token_grads(
+            trainer_logprobs=np.array([-1.0, -1.0], dtype=np.float32),
+            inference_logprobs=np.array([-1.0, -1.0], dtype=np.float32),
+            advantages=np.zeros(2, dtype=np.float32),
+            loss_mask=np.array([False, True]),
+            loss_config=GRPOLossConfig(replay_tau=0.3),
+            sample_ranges=[(0, 2)],
+            replay_mask=np.array([False, False]),
+            replay_weights=np.array([1.0, 2.0], dtype=np.float32),
+        )
 
 
 def test_sparse_objective_metrics_use_selected_token_denominators():

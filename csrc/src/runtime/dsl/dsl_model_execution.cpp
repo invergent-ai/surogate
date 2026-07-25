@@ -59,7 +59,9 @@ enum GrpoMetricOffset {
     GRPO_METRIC_SAMPLE_COUNT = 14,
     GRPO_METRIC_KEEP_TOKENS = 15,
     GRPO_METRIC_TOTAL_TOKENS = 16,
-    GRPO_METRIC_COUNT = 17,
+    GRPO_METRIC_REPLAY_WEIGHT_SUM = 17,
+    GRPO_METRIC_POLICY_SAMPLE_COUNT = 18,
+    GRPO_METRIC_COUNT = 19,
 };
 
 int acquire_grpo_host_staging_slot(modules::GrpoNativeScratch& scratch) {
@@ -436,8 +438,7 @@ void DslModel::allocate_run_state(const RuntimeOptions& options,
     }
     if (auto* exec = dynamic_cast<GraphExecutor*>(mExecutor.get())) {
         exec->ensure_graphs_compiled(B, T);
-        long needed =
-            required_stack_bytes(mRunState->buffer_plan(), exec->compiled_backward(), mModelConfig, mOptions);
+        long needed = required_stack_bytes(mRunState->buffer_plan(), exec->compiled_backward(), mModelConfig, mOptions);
         // dispatch-PP runs sub-range stages with skip_finalize, which keeps the boundary
         // saves (res_att/mlp_down) live on the stack on top of the normal backward peak --
         // the auto-sizer doesn't model that, so add headroom (env, MB). There is ample free
@@ -850,10 +851,17 @@ void DslModel::step_grpo_native(Tensor inputs,
                                 const float* opd_reference_logprobs_cpu,
                                 const float* hindsight_logprobs_cpu,
                                 const std::uint8_t* hindsight_mask_cpu,
-                                const std::uint8_t* replay_mask_cpu) {
+                                const std::uint8_t* replay_mask_cpu,
+                                const float* replay_weights_cpu) {
     if (!mExecutor) {
         throw std::logic_error("DslModel::step_grpo_native called before allocate_run_state()");
     }
+    // Native GRPO seeds custom_dloss with its explicit global selected-token
+    // denominator.  The generic optimizer's legacy ValidTokenCount scaling
+    // must therefore be disabled, just as it is for step_with_custom_loss and
+    // forward_for_grpo.  Leaving it enabled makes the update depend on the
+    // selected-token count of the final (possibly partial) rank batch.
+    mUseTokenScale = false;
     if (!inference_logprobs_cpu || !advantages_cpu || !loss_mask_cpu || !sample_starts_cpu || !sample_ends_cpu) {
         throw std::invalid_argument(
             "step_grpo_native requires inference_logprobs, advantages, loss_mask, sample ranges");
@@ -929,19 +937,19 @@ void DslModel::step_grpo_native(Tensor inputs,
     const bool has_opd_reference = opd_reference_logprobs_cpu != nullptr;
     const bool has_hindsight = hindsight_logprobs_cpu != nullptr;
     const bool has_hindsight_mask = hindsight_mask_cpu != nullptr;
-    if ((has_opd_reference != has_hindsight) ||
-        (has_opd_reference != has_hindsight_mask)) {
-        throw std::invalid_argument(
-            "OPD reference logprobs, hindsight logprobs, and mask must be provided together");
+    if ((has_opd_reference != has_hindsight) || (has_opd_reference != has_hindsight_mask)) {
+        throw std::invalid_argument("OPD reference logprobs, hindsight logprobs, and mask must be provided together");
     }
     if (has_opd_reference) {
         copy_float_input(scratch.host_opd_reference_logprobs[staging_slot],
                          scratch.opd_reference_logprobs,
                          opd_reference_logprobs_cpu);
-        copy_float_input(
-            scratch.host_hindsight_logprobs[staging_slot], scratch.hindsight_logprobs, hindsight_logprobs_cpu);
-        std::memcpy(
-            scratch.host_hindsight_mask[staging_slot].get<std::uint8_t>(), hindsight_mask_cpu, bt * sizeof(std::uint8_t));
+        copy_float_input(scratch.host_hindsight_logprobs[staging_slot],
+                         scratch.hindsight_logprobs,
+                         hindsight_logprobs_cpu);
+        std::memcpy(scratch.host_hindsight_mask[staging_slot].get<std::uint8_t>(),
+                    hindsight_mask_cpu,
+                    bt * sizeof(std::uint8_t));
         CUDA_CHECK(cudaMemcpyAsync(scratch.hindsight_mask.Data,
                                    scratch.host_hindsight_mask[staging_slot].Data,
                                    bt * sizeof(std::uint8_t),
@@ -952,15 +960,23 @@ void DslModel::step_grpo_native(Tensor inputs,
         hindsight_mask_gpu = scratch.hindsight_mask.get<std::uint8_t>();
     }
     const std::uint8_t* replay_mask_gpu = nullptr;
+    const float* replay_weights_gpu = nullptr;
     if (replay_mask_cpu) {
-        std::memcpy(
-            scratch.host_replay_mask[staging_slot].get<std::uint8_t>(), replay_mask_cpu, bt * sizeof(std::uint8_t));
+        std::memcpy(scratch.host_replay_mask[staging_slot].get<std::uint8_t>(),
+                    replay_mask_cpu,
+                    bt * sizeof(std::uint8_t));
         CUDA_CHECK(cudaMemcpyAsync(scratch.replay_mask.Data,
                                    scratch.host_replay_mask[staging_slot].Data,
                                    bt * sizeof(std::uint8_t),
                                    cudaMemcpyHostToDevice,
                                    main_stream));
         replay_mask_gpu = scratch.replay_mask.get<std::uint8_t>();
+        if (replay_weights_cpu) {
+            copy_float_input(scratch.host_replay_weights[staging_slot], scratch.replay_weights, replay_weights_cpu);
+            replay_weights_gpu = scratch.replay_weights.get<float>();
+        }
+    } else if (replay_weights_cpu) {
+        throw std::invalid_argument("replay weights require a replay mask");
     }
 
     const float* inv_temperature_gpu = nullptr;
@@ -1009,6 +1025,7 @@ void DslModel::step_grpo_native(Tensor inputs,
                               hindsight_logprobs_gpu,
                               hindsight_mask_gpu,
                               replay_mask_gpu,
+                              replay_weights_gpu,
                               scratch.sample_starts.get<std::int32_t>(),
                               scratch.sample_ends.get<std::int32_t>(),
                               sample_count,
@@ -1062,17 +1079,21 @@ GrpoNativeMetrics DslModel::consume_grpo_native_metrics() {
 
     const auto* values = scratch.host_metrics.get<float>();
     const float sample_count = std::max(values[GRPO_METRIC_SAMPLE_COUNT], 1.0f);
+    const float policy_sample_count = std::max(values[GRPO_METRIC_POLICY_SAMPLE_COUNT], 1.0f);
     GrpoNativeMetrics metrics;
+    metrics.sample_count = values[GRPO_METRIC_SAMPLE_COUNT];
+    metrics.policy_sample_count = values[GRPO_METRIC_POLICY_SAMPLE_COUNT];
     metrics.policy_loss = values[GRPO_METRIC_POLICY_LOSS] / sample_count;
-    metrics.mismatch_kl = values[GRPO_METRIC_MISMATCH_KL] / sample_count;
-    metrics.masked_mismatch_kl = values[GRPO_METRIC_MASKED_MISMATCH_KL] / sample_count;
-    metrics.unmasked_mismatch_kl = values[GRPO_METRIC_UNMASKED_MISMATCH_KL] / sample_count;
-    metrics.is_masked = values[GRPO_METRIC_IS_MASKED] / sample_count;
-    metrics.is_masked_low = values[GRPO_METRIC_IS_MASKED_LOW] / sample_count;
-    metrics.is_masked_high = values[GRPO_METRIC_IS_MASKED_HIGH] / sample_count;
-    metrics.teacher_kl = values[GRPO_METRIC_TEACHER_KL] / sample_count;
+    metrics.mismatch_kl = values[GRPO_METRIC_MISMATCH_KL] / policy_sample_count;
+    metrics.masked_mismatch_kl = values[GRPO_METRIC_MASKED_MISMATCH_KL] / policy_sample_count;
+    metrics.unmasked_mismatch_kl = values[GRPO_METRIC_UNMASKED_MISMATCH_KL] / policy_sample_count;
+    metrics.is_masked = values[GRPO_METRIC_IS_MASKED] / policy_sample_count;
+    metrics.is_masked_low = values[GRPO_METRIC_IS_MASKED_LOW] / policy_sample_count;
+    metrics.is_masked_high = values[GRPO_METRIC_IS_MASKED_HIGH] / policy_sample_count;
+    metrics.teacher_kl = values[GRPO_METRIC_TEACHER_KL] / policy_sample_count;
     metrics.opd_tokens = values[GRPO_METRIC_OPD_TOKENS];
     metrics.replay_tokens = values[GRPO_METRIC_REPLAY_TOKENS];
+    metrics.replay_weight_sum = values[GRPO_METRIC_REPLAY_WEIGHT_SUM];
     const float opd_tokens = std::max(metrics.opd_tokens, 1.0f);
     const float replay_tokens = std::max(metrics.replay_tokens, 1.0f);
     metrics.opd_loss = values[GRPO_METRIC_OPD_LOSS] / opd_tokens;
@@ -1084,11 +1105,28 @@ GrpoNativeMetrics DslModel::consume_grpo_native_metrics() {
     return metrics;
 }
 
+float DslModel::preflight_grpo_native_lora_gradient_norm(NCCLCommunicator& comm, float grad_clip) {
+    if (!std::isfinite(grad_clip) || grad_clip < 0.0f) {
+        throw std::invalid_argument("GRPO native gradient preflight requires a finite non-negative grad_clip");
+    }
+    if (!lora_enabled()) {
+        throw std::logic_error("GRPO native gradient preflight currently requires LoRA");
+    }
+    if (!mRunState || !mLoRARunState || !mLoRAGrads) {
+        throw std::logic_error("GRPO native gradient preflight called before backward completed");
+    }
+
+    auto& rs = *mRunState;
+    if (!mLoRARunState->norm_ptrs_initialized) {
+        populate_lora_norm_pointers(comm, rs.MainStream);
+    }
+    calculate_lora_gradient_norm(comm, grad_clip);
+    return rs.get_norm();
+}
+
 // ---- Debug-only dispatch-PP sub-range parity (BF16 full-FT, resident) ------
 
-std::vector<float> DslModel::dispatch_pp_forward_hidden(Tensor inputs,
-                                                              Tensor position_ids,
-                                                              NCCLCommunicator& comm) {
+std::vector<float> DslModel::dispatch_pp_forward_hidden(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm) {
     if (lora_enabled()) {
         throw std::runtime_error("dispatch_pp_forward_hidden: BF16 full-FT only (no LoRA)");
     }
@@ -1105,8 +1143,7 @@ std::vector<float> DslModel::dispatch_pp_forward_hidden(Tensor inputs,
     }
     // Run the whole forward eagerly but keep state resident (skip finalize) so the
     // final hidden state can be read before pruning, matching the sub-range path.
-    ge->set_forward_op_range(
-        0, fwd->ops.size(), /*skip_init=*/false, /*skip_finalize=*/true, /*force_linear=*/true);
+    ge->set_forward_op_range(0, fwd->ops.size(), /*skip_init=*/false, /*skip_finalize=*/true, /*force_linear=*/true);
     {
         auto request =
             causal_lm_profile().make_forward_request(*mRunState, mModelConfig, mOptions, inputs, position_ids, 0);
@@ -1118,9 +1155,9 @@ std::vector<float> DslModel::dispatch_pp_forward_hidden(Tensor inputs,
 }
 
 std::vector<float> DslModel::dispatch_pp_forward_subranges(Tensor inputs,
-                                                                Tensor position_ids,
-                                                                NCCLCommunicator& comm,
-                                                                int split_after_block) {
+                                                           Tensor position_ids,
+                                                           NCCLCommunicator& comm,
+                                                           int split_after_block) {
     if (lora_enabled()) {
         throw std::runtime_error("dispatch_pp_forward_subranges: BF16 full-FT only (no LoRA)");
     }
@@ -1168,13 +1205,12 @@ std::vector<float> DslModel::dispatch_pp_forward_subranges(Tensor inputs,
 }
 
 void DslModel::dispatch_pp_forward_stage(Tensor inputs,
-                                               Tensor position_ids,
-                                               NCCLCommunicator& comm,
-                                               int lo,
-                                               int hi,
-                                               std::vector<std::pair<std::string, std::vector<std::byte>>>
-                                                   inject_named,
-                                               bool preserve_output) {
+                                         Tensor position_ids,
+                                         NCCLCommunicator& comm,
+                                         int lo,
+                                         int hi,
+                                         std::vector<std::pair<std::string, std::vector<std::byte>>> inject_named,
+                                         bool preserve_output) {
     GraphExecutor* ge = graph_executor();
     if (!ge) {
         throw std::runtime_error("dispatch_pp_forward_stage: requires the DSL GraphExecutor");
@@ -1196,8 +1232,8 @@ void DslModel::dispatch_pp_forward_stage(Tensor inputs,
     // Stage [0..] starts at the embedding; a resumed stage [lo>0..] starts at the
     // first op of block lo and consumes the injected boundary residual.
     const std::size_t op_lo = (lo == 0) ? 0 : fwd->layer_start_indices[static_cast<std::size_t>(lo)];
-    const std::size_t op_hi = (hi == num_layers - 1) ? fwd->ops.size()
-                                                     : fwd->layer_end_indices[static_cast<std::size_t>(hi)];
+    const std::size_t op_hi =
+        (hi == num_layers - 1) ? fwd->ops.size() : fwd->layer_end_indices[static_cast<std::size_t>(hi)];
 
     if (!inject_named.empty()) {
         ge->set_inject_named(std::move(inject_named));
@@ -1208,8 +1244,11 @@ void DslModel::dispatch_pp_forward_stage(Tensor inputs,
     }
     // skip_finalize keeps the stage's outputs (residual / final hidden) resident
     // for the caller's debug readers and the next stage's boundary read.
-    ge->set_forward_op_range(op_lo, op_hi, /*skip_init=*/false, /*skip_finalize=*/true,
-                                   /*force_linear=*/true);
+    ge->set_forward_op_range(op_lo,
+                             op_hi,
+                             /*skip_init=*/false,
+                             /*skip_finalize=*/true,
+                             /*force_linear=*/true);
     {
         auto request =
             causal_lm_profile().make_forward_request(*mRunState, mModelConfig, mOptions, inputs, position_ids, 0);
@@ -1219,18 +1258,17 @@ void DslModel::dispatch_pp_forward_stage(Tensor inputs,
     ge->clear_inject_named();
 }
 
-void DslModel::dispatch_pp_backward_stage(
-    Tensor inputs,
-    Tensor targets,
-    Tensor position_ids,
-    NCCLCommunicator& comm,
-    int lo,
-    int hi,
-    bool is_loss_stage,
-    std::vector<std::pair<std::string, std::vector<std::byte>>> fwd_inject,
-    std::vector<std::pair<std::string, std::vector<std::byte>>> inject_named,
-    int micro_step,
-    int total_micro) {
+void DslModel::dispatch_pp_backward_stage(Tensor inputs,
+                                          Tensor targets,
+                                          Tensor position_ids,
+                                          NCCLCommunicator& comm,
+                                          int lo,
+                                          int hi,
+                                          bool is_loss_stage,
+                                          std::vector<std::pair<std::string, std::vector<std::byte>>> fwd_inject,
+                                          std::vector<std::pair<std::string, std::vector<std::byte>>> inject_named,
+                                          int micro_step,
+                                          int total_micro) {
     GraphExecutor* ge = graph_executor();
     if (!ge) {
         throw std::runtime_error("dispatch_pp_backward_stage: requires the DSL GraphExecutor");
@@ -1271,13 +1309,17 @@ void DslModel::dispatch_pp_backward_stage(
     const bool stage_bounded = (lo == 0) || !fwd_inject.empty();
     const std::size_t fwd_op_lo =
         (stage_bounded && lo > 0) ? fwd->layer_start_indices[static_cast<std::size_t>(lo)] : 0;
-    const std::size_t fwd_op_hi = (hi == num_layers - 1) ? fwd->ops.size()
-                                                         : fwd->layer_end_indices[static_cast<std::size_t>(hi)];
+    const std::size_t fwd_op_hi =
+        (hi == num_layers - 1) ? fwd->ops.size() : fwd->layer_end_indices[static_cast<std::size_t>(hi)];
     if (!fwd_inject.empty()) {
-        ge->set_inject_named(fwd_inject);  // copy: re-injected below so the backward recompute of block lo finds its input
+        ge->set_inject_named(
+            fwd_inject);  // copy: re-injected below so the backward recompute of block lo finds its input
     }
-    ge->set_forward_op_range(fwd_op_lo, fwd_op_hi, /*skip_init=*/false, /*skip_finalize=*/false,
-                                   /*force_linear=*/true);
+    ge->set_forward_op_range(fwd_op_lo,
+                             fwd_op_hi,
+                             /*skip_init=*/false,
+                             /*skip_finalize=*/false,
+                             /*force_linear=*/true);
     {
         auto fwd_request =
             causal_lm_profile().make_forward_request(*mRunState, mModelConfig, mOptions, inputs, position_ids, 0);
@@ -1293,8 +1335,11 @@ void DslModel::dispatch_pp_backward_stage(
         const std::size_t n = static_cast<std::size_t>(rs.B) * static_cast<std::size_t>(rs.T);
         if (rs.Losses.Data && rs.Losses.nelem() >= n && n > 0) {
             std::vector<float> h(n);
-            CUDA_CHECK(cudaMemcpyAsync(h.data(), rs.Losses.template get<float>(), n * sizeof(float),
-                                       cudaMemcpyDeviceToHost, rs.MainStream));
+            CUDA_CHECK(cudaMemcpyAsync(h.data(),
+                                       rs.Losses.template get<float>(),
+                                       n * sizeof(float),
+                                       cudaMemcpyDeviceToHost,
+                                       rs.MainStream));
             CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
             // Per-token CE is exactly 0 for masked/padding positions and strictly > 0 for
             // valid targets, so count(>0) is the local valid-token count. Normalize the loss
@@ -1315,7 +1360,8 @@ void DslModel::dispatch_pp_backward_stage(
     // Inject the incoming boundary gradients (d_blocks[hi].*) and re-inject the
     // forward input boundary (blocks[lo-1].*) so the backward's per-block recompute
     // of block lo can rebuild it from its true input.
-    for (auto& kv : fwd_inject) inject_named.push_back(std::move(kv));
+    for (auto& kv : fwd_inject)
+        inject_named.push_back(std::move(kv));
     if (!inject_named.empty()) {
         ge->set_inject_named(std::move(inject_named));
     }
@@ -1328,8 +1374,11 @@ void DslModel::dispatch_pp_backward_stage(
     // run in block L's stage with no inter-stage gap. The op-index range stays
     // full; skip_finalize keeps the stage's input-boundary gradients
     // (d_blocks[lo-1].*) resident for the next (lower) stage's read.
-    ge->set_backward_op_range(0, bwd->ops.size(), /*skip_init=*/false, /*skip_finalize=*/true,
-                                    /*force_linear=*/true);
+    ge->set_backward_op_range(0,
+                              bwd->ops.size(),
+                              /*skip_init=*/false,
+                              /*skip_finalize=*/true,
+                              /*force_linear=*/true);
     // The loss-owning stage runs the leading loss/lm-head ops; the lowest stage
     // (lo == 0) runs the trailing embedding-backward op so its gradient is computed.
     ge->set_backward_layer_range(lo, hi, /*include_loss=*/is_loss_stage, /*include_embed=*/lo == 0);
@@ -1347,10 +1396,8 @@ void DslModel::dispatch_pp_backward_stage(
     ge->set_skip_grad_reduce(false);
 }
 
-std::vector<float> DslModel::dispatch_pp_grad_norms_whole(Tensor inputs,
-                                                               Tensor targets,
-                                                               Tensor position_ids,
-                                                               NCCLCommunicator& comm) {
+std::vector<float>
+DslModel::dispatch_pp_grad_norms_whole(Tensor inputs, Tensor targets, Tensor position_ids, NCCLCommunicator& comm) {
     GraphExecutor* ge = graph_executor();
     if (!ge) {
         throw std::runtime_error("dispatch_pp_grad_norms_whole: requires the DSL GraphExecutor");
@@ -1368,16 +1415,22 @@ std::vector<float> DslModel::dispatch_pp_grad_norms_whole(Tensor inputs,
     // would deadlock here (only this GPU participates). Also skip the DDP grad
     // all-reduce for the same reason.
     ge->set_skip_grad_reduce(true);
-    ge->set_forward_op_range(0, fwd->ops.size(), /*skip_init=*/false, /*skip_finalize=*/false,
-                                   /*force_linear=*/true);
+    ge->set_forward_op_range(0,
+                             fwd->ops.size(),
+                             /*skip_init=*/false,
+                             /*skip_finalize=*/false,
+                             /*force_linear=*/true);
     {
         auto request =
             causal_lm_profile().make_forward_request(*mRunState, mModelConfig, mOptions, inputs, position_ids, 0);
         mExecutor->execute_forward(request, comm);
     }
     ge->clear_forward_op_range();
-    ge->set_backward_op_range(0, bwd->ops.size(), /*skip_init=*/false, /*skip_finalize=*/false,
-                                    /*force_linear=*/true);
+    ge->set_backward_op_range(0,
+                              bwd->ops.size(),
+                              /*skip_init=*/false,
+                              /*skip_finalize=*/false,
+                              /*force_linear=*/true);
     {
         auto request =
             causal_lm_profile().make_backward_request(*mRunState, mModelConfig, mOptions, inputs, targets, 1, 0);
@@ -1392,11 +1445,11 @@ std::vector<float> DslModel::dispatch_pp_grad_norms_whole(Tensor inputs,
 }
 
 float DslModel::dispatch_pp_train_step(Tensor inputs,
-                                             Tensor targets,
-                                             Tensor position_ids,
-                                             NCCLCommunicator& comm,
-                                             const optimizers::OptimizerConfig& opt_config,
-                                             int step_idx) {
+                                       Tensor targets,
+                                       Tensor position_ids,
+                                       NCCLCommunicator& comm,
+                                       const optimizers::OptimizerConfig& opt_config,
+                                       int step_idx) {
     if (lora_enabled()) {
         throw std::runtime_error("dispatch_pp_train_step: BF16 full-FT only (no LoRA)");
     }
@@ -1421,8 +1474,11 @@ float DslModel::dispatch_pp_train_step(Tensor inputs,
     // the per-token normalization the grads were produced with (else the scale and
     // the grads disagree and the update diverges).
     mUseTokenScale = true;
-    ge->set_forward_op_range(0, fwd->ops.size(), /*skip_init=*/false, /*skip_finalize=*/false,
-                                   /*force_linear=*/true);
+    ge->set_forward_op_range(0,
+                             fwd->ops.size(),
+                             /*skip_init=*/false,
+                             /*skip_finalize=*/false,
+                             /*force_linear=*/true);
     {
         auto request =
             causal_lm_profile().make_forward_request(*mRunState, mModelConfig, mOptions, inputs, position_ids, 0);
@@ -1430,8 +1486,11 @@ float DslModel::dispatch_pp_train_step(Tensor inputs,
     }
     ge->clear_forward_op_range();
 
-    ge->set_backward_op_range(0, bwd->ops.size(), /*skip_init=*/false, /*skip_finalize=*/false,
-                                    /*force_linear=*/true);
+    ge->set_backward_op_range(0,
+                              bwd->ops.size(),
+                              /*skip_init=*/false,
+                              /*skip_finalize=*/false,
+                              /*force_linear=*/true);
     {
         auto request =
             causal_lm_profile().make_backward_request(*mRunState, mModelConfig, mOptions, inputs, targets, 1, 0);
@@ -1482,8 +1541,10 @@ DslModel::dispatch_pp_read_block_grads(int lo, int hi, bool include_head, bool i
             int ord = 0;
             modules::for_each_lora_layer_weight(grads.block_full(L), [&](modules::LoRATargetId, auto& layer) {
                 const std::string base = "lora.g.L" + std::to_string(L) + "." + std::to_string(ord++);
-                if (layer.A.Data && layer.A.bytes()) out.emplace_back(base + ".A", dbg_tensor_bytes_to_host(layer.A, stream));
-                if (layer.B.Data && layer.B.bytes()) out.emplace_back(base + ".B", dbg_tensor_bytes_to_host(layer.B, stream));
+                if (layer.A.Data && layer.A.bytes())
+                    out.emplace_back(base + ".A", dbg_tensor_bytes_to_host(layer.A, stream));
+                if (layer.B.Data && layer.B.bytes())
+                    out.emplace_back(base + ".B", dbg_tensor_bytes_to_host(layer.B, stream));
             });
         }
         return out;
@@ -1493,7 +1554,8 @@ DslModel::dispatch_pp_read_block_grads(int lo, int hi, bool include_head, bool i
     for (const auto& name : mGrads->param_names()) {
         bool wanted = false;
         if (param_is_any_block(name)) {
-            for (int L = lo; L <= hi && !wanted; ++L) wanted = param_is_block(name, L);
+            for (int L = lo; L <= hi && !wanted; ++L)
+                wanted = param_is_block(name, L);
         } else if (name.find("embed") != std::string::npos) {
             wanted = include_embed;  // computed by the lowest stage's embedding backward
         } else {
@@ -1508,8 +1570,7 @@ DslModel::dispatch_pp_read_block_grads(int lo, int hi, bool include_head, bool i
     return out;
 }
 
-void DslModel::dispatch_pp_write_grads(
-    const std::vector<std::pair<std::string, std::vector<std::byte>>>& items) {
+void DslModel::dispatch_pp_write_grads(const std::vector<std::pair<std::string, std::vector<std::byte>>>& items) {
     if (lora_enabled()) {
         cudaStream_t stream = mRunState->MainStream;
         auto& grads = lora_grads();
@@ -1519,8 +1580,9 @@ void DslModel::dispatch_pp_write_grads(
             auto it = block_ptrs.find(L);
             if (it != block_ptrs.end()) return it->second;
             std::vector<std::pair<Tensor*, Tensor*>> v;
-            modules::for_each_lora_layer_weight(grads.block_full(L),
-                                                [&](modules::LoRATargetId, auto& layer) { v.emplace_back(&layer.A, &layer.B); });
+            modules::for_each_lora_layer_weight(grads.block_full(L), [&](modules::LoRATargetId, auto& layer) {
+                v.emplace_back(&layer.A, &layer.B);
+            });
             return block_ptrs.emplace(L, std::move(v)).first->second;
         };
         for (const auto& [name, bytes] : items) {
@@ -1570,8 +1632,10 @@ std::vector<std::pair<std::string, std::vector<std::byte>>> DslModel::dispatch_p
             int ord = 0;
             modules::for_each_lora_layer_weight(w.get_master_block(L, stream), [&](modules::LoRATargetId, auto& layer) {
                 const std::string base = "lora.w.L" + std::to_string(L) + "." + std::to_string(ord++);
-                if (layer.A.Data && layer.A.bytes()) out.emplace_back(base + ".A", dbg_tensor_bytes_to_host(layer.A, stream));
-                if (layer.B.Data && layer.B.bytes()) out.emplace_back(base + ".B", dbg_tensor_bytes_to_host(layer.B, stream));
+                if (layer.A.Data && layer.A.bytes())
+                    out.emplace_back(base + ".A", dbg_tensor_bytes_to_host(layer.A, stream));
+                if (layer.B.Data && layer.B.bytes())
+                    out.emplace_back(base + ".B", dbg_tensor_bytes_to_host(layer.B, stream));
             });
         }
         return out;
@@ -1586,8 +1650,7 @@ std::vector<std::pair<std::string, std::vector<std::byte>>> DslModel::dispatch_p
     return out;
 }
 
-void DslModel::dispatch_pp_write_weights(
-    const std::vector<std::pair<std::string, std::vector<std::byte>>>& items) {
+void DslModel::dispatch_pp_write_weights(const std::vector<std::pair<std::string, std::vector<std::byte>>>& items) {
     if (lora_enabled()) {
         cudaStream_t stream = mRunState->MainStream;
         auto& w = lora_weights();
@@ -1596,8 +1659,9 @@ void DslModel::dispatch_pp_write_weights(
             auto it = block_ptrs.find(L);
             if (it != block_ptrs.end()) return it->second;
             std::vector<std::pair<Tensor*, Tensor*>> v;
-            modules::for_each_lora_layer_weight(w.get_master_block(L, stream),
-                                                [&](modules::LoRATargetId, auto& layer) { v.emplace_back(&layer.A, &layer.B); });
+            modules::for_each_lora_layer_weight(w.get_master_block(L, stream), [&](modules::LoRATargetId, auto& layer) {
+                v.emplace_back(&layer.A, &layer.B);
+            });
             return block_ptrs.emplace(L, std::move(v)).first->second;
         };
         for (const auto& [name, bytes] : items) {
@@ -1644,8 +1708,8 @@ float DslModel::dispatch_pp_raw_loss() const {
 }
 
 float DslModel::dispatch_pp_apply_optimizer(NCCLCommunicator& comm,
-                                                  const optimizers::OptimizerConfig& opt_config,
-                                                  int step_idx) {
+                                            const optimizers::OptimizerConfig& opt_config,
+                                            int step_idx) {
     // The dispatch backward skips the DP loss all-reduce (would deadlock), but the loss
     // stage counted valid (non-pad) tokens locally over the step's microbatches. Publish
     // that into ValidTokenCount and use per-valid-token normalization so the grad norm (and
@@ -1670,10 +1734,10 @@ float DslModel::dispatch_pp_apply_optimizer(NCCLCommunicator& comm,
 }
 
 std::vector<float> DslModel::dispatch_pp_grad_norms_subranges(Tensor inputs,
-                                                                   Tensor targets,
-                                                                   Tensor position_ids,
-                                                                   NCCLCommunicator& comm,
-                                                                   int split_after_block) {
+                                                              Tensor targets,
+                                                              Tensor position_ids,
+                                                              NCCLCommunicator& comm,
+                                                              int split_after_block) {
     if (lora_enabled()) {
         throw std::runtime_error("dispatch_pp_grad_norms_subranges: BF16 full-FT only (no LoRA)");
     }
@@ -1695,8 +1759,11 @@ std::vector<float> DslModel::dispatch_pp_grad_norms_subranges(Tensor inputs,
     // Whole-graph forward (forced-eager: the stream-driven path issues per-rank
     // collectives that deadlock on a single GPU) saves the activations the backward
     // consumes.
-    ge->set_forward_op_range(0, fwd->ops.size(), /*skip_init=*/false, /*skip_finalize=*/false,
-                                   /*force_linear=*/true);
+    ge->set_forward_op_range(0,
+                             fwd->ops.size(),
+                             /*skip_init=*/false,
+                             /*skip_finalize=*/false,
+                             /*force_linear=*/true);
     {
         auto request =
             causal_lm_profile().make_forward_request(*mRunState, mModelConfig, mOptions, inputs, position_ids, 0);

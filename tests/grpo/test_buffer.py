@@ -74,3 +74,24 @@ def test_sampling_recycles_easy_and_hard_examples_when_normal_pool_is_empty():
     metrics = buffer.get_metrics()
     assert metrics["recycled_examples/easy"] == 1
     assert metrics["recycled_examples/hard"] == 1
+
+
+def test_one_use_sampling_never_returns_a_task_twice_and_persists_consumption(
+    tmp_path,
+):
+    buffer = _buffer(sample_without_replacement=True)
+
+    sampled = buffer.sample_examples(n=2)
+
+    assert {row["example_id"] for row in sampled} == {0, 1}
+    assert len(buffer.consumed_examples) == 2
+    with pytest.raises(ValueError, match="No environments left with examples"):
+        buffer.sample_examples(n=1)
+
+    checkpoint = tmp_path / "buffer"
+    buffer.save(checkpoint)
+    restored = _buffer(sample_without_replacement=True)
+    restored.load(checkpoint)
+    assert {row["example_id"] for row in restored.consumed_examples} == {0, 1}
+    with pytest.raises(ValueError, match="No environments left with examples"):
+        restored.sample_examples(n=1)

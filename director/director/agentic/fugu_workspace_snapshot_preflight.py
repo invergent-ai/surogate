@@ -71,6 +71,7 @@ class FuguWorkspaceSnapshotPreflightAgent(
         self._workspace_snapshot_ready = False
         self._workspace_root = WORKSPACE_ROOT
         self._workspace_snapshot_token = ""
+        self._workspace_root_identity = ""
         self._workspace_snapshot_summary = {}
         self._workspace_integrity_checks = 0
         self._workspace_recoveries = 0

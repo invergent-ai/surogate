@@ -5,6 +5,7 @@ across data-parallel workers.
 """
 
 import copy
+import math
 
 from surogate.grpo.transport.types import MicroBatch, TrainingSample
 
@@ -18,7 +19,36 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
     input_ids = training_example.prompt_ids + training_example.completion_ids
     loss_mask = training_example.prompt_mask + training_example.completion_mask
     inference_logprobs = [0.0] * len(training_example.prompt_ids) + training_example.completion_logprobs
-    advantages = [training_example.advantage] * len(input_ids)
+    advantage_mask = training_example.advantage_mask
+    if advantage_mask is None:
+        advantages = [training_example.advantage] * len(input_ids)
+    else:
+        advantage_mask = list(advantage_mask)
+        if (
+            len(advantage_mask) != len(input_ids)
+            or any(not isinstance(selected, bool) for selected in advantage_mask)
+            or not any(advantage_mask)
+            or any(
+                selected and not trainable
+                for selected, trainable in zip(
+                    advantage_mask,
+                    loss_mask,
+                    strict=True,
+                )
+            )
+        ):
+            raise ValueError(
+                "advantage_mask must select at least one trainable token "
+                "and align with the full sample"
+            )
+        if training_example.advantage is None:
+            raise ValueError(
+                "advantage_mask requires a scalar outcome advantage"
+            )
+        advantages = [
+            training_example.advantage if selected else 0.0
+            for selected in advantage_mask
+        ]
     position_ids = list(range(len(input_ids)))
 
     # Per-token temperatures: prompt tokens use first completion temp (masked out anyway)
@@ -30,6 +60,7 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
     hindsight_logprobs = training_example.hindsight_logprobs
     hindsight_mask = training_example.hindsight_mask
     replay_mask = training_example.replay_mask
+    replay_weights = training_example.replay_weights
     opd_fields = (opd_reference_logprobs, hindsight_logprobs, hindsight_mask)
     if all(value is None for value in opd_fields):
         opd_reference_logprobs = [0.0] * len(input_ids)
@@ -39,6 +70,17 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         raise ValueError("opd_reference_logprobs, hindsight_logprobs, and hindsight_mask must be provided together")
     if replay_mask is None:
         replay_mask = [False] * len(input_ids)
+    if replay_weights is None:
+        replay_weights = [1.0] * len(input_ids)
+    if advantage_mask is not None and any(
+        replay and outcome
+        for replay, outcome in zip(
+            replay_mask,
+            advantage_mask,
+            strict=True,
+        )
+    ):
+        raise ValueError("advantage_mask may not overlap replay_mask")
 
     if len(input_ids) > seq_len:
         input_ids = input_ids[:seq_len]
@@ -53,6 +95,9 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         hindsight_logprobs = hindsight_logprobs[:seq_len]
         hindsight_mask = hindsight_mask[:seq_len]
         replay_mask = replay_mask[:seq_len]
+        replay_weights = replay_weights[:seq_len]
+        if advantage_mask is not None:
+            advantage_mask = advantage_mask[:seq_len]
 
     assert (
         len(input_ids)
@@ -65,6 +110,7 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         == len(hindsight_logprobs)
         == len(hindsight_mask)
         == len(replay_mask)
+        == len(replay_weights)
     ), (
         f"input_ids: {len(input_ids)}, advantages: {len(advantages)}, loss_mask: {len(loss_mask)}, "
         f"position_ids: {len(position_ids)}, inference_logprobs: {len(inference_logprobs)}, temperatures: {len(temperatures)}"
@@ -75,6 +121,12 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         raise ValueError("hindsight_mask may select only trainable completion tokens")
     if any(replay and not loss for replay, loss in zip(replay_mask, loss_mask)):
         raise ValueError("replay_mask may select only trainable completion tokens")
+    if any(not isinstance(weight, (int, float)) or not math.isfinite(weight) for weight in replay_weights):
+        raise ValueError("replay_weights must be finite numbers")
+    if any(replay and weight <= 0.0 for replay, weight in zip(replay_mask, replay_weights)):
+        raise ValueError("replay_weights must be positive on replay tokens")
+    if any(not replay and weight != 1.0 for replay, weight in zip(replay_mask, replay_weights)):
+        raise ValueError("replay_weights may differ from 1 only on replay tokens")
 
     return MicroBatch(
         input_ids=input_ids,
@@ -88,6 +140,7 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         hindsight_logprobs=hindsight_logprobs,
         hindsight_mask=hindsight_mask,
         replay_mask=replay_mask,
+        replay_weights=[float(weight) for weight in replay_weights],
     )
 
 
@@ -115,6 +168,7 @@ def packed_samples_into_micro_bs(
                 bin_content.hindsight_logprobs.extend(sample.hindsight_logprobs)
                 bin_content.hindsight_mask.extend(sample.hindsight_mask)
                 bin_content.replay_mask.extend(sample.replay_mask)
+                bin_content.replay_weights.extend(sample.replay_weights)
                 if sample.teacher_logprobs is not None:
                     if bin_content.teacher_logprobs is None:
                         bin_content.teacher_logprobs = []
@@ -147,6 +201,7 @@ def pad_micro_batch(micro_batch: MicroBatch, pad_to_multiple_of: int) -> MicroBa
     micro_batch.hindsight_logprobs.extend([0.0] * padding_size)
     micro_batch.hindsight_mask.extend([False] * padding_size)
     micro_batch.replay_mask.extend([False] * padding_size)
+    micro_batch.replay_weights.extend([1.0] * padding_size)
     if micro_batch.teacher_logprobs is not None:
         micro_batch.teacher_logprobs.extend([0.0] * padding_size)
     # Send padding to the last lora so tokens have ascending lora idx
@@ -162,15 +217,24 @@ def prepare_batch(
     idxs: list[int],
     num_loras: int,
     pad_to_multiple_of: int = 1,
+    sample_packing: bool = True,
 ) -> list[list[MicroBatch]]:
     """Prepare a batch of samples for each data-parallel worker.
 
     Each worker gets a list of micro-batches (shape [1, seq_len] each).
-    The number of samples per micro-batch is variable (sample packing).
+    When sample packing is disabled, every real micro-batch contains exactly
+    one TrainingSample. Rank-padding micro-batches remain fully loss-masked.
     """
     all_samples = [(idx, prepare_sample(rollout, seq_len)) for idx, rollout in zip(idxs, rollouts)]
 
-    micro_batches = packed_samples_into_micro_bs(all_samples, seq_len, num_loras)
+    if sample_packing:
+        micro_batches = packed_samples_into_micro_bs(all_samples, seq_len, num_loras)
+    else:
+        micro_batches = []
+        for idx, sample in all_samples:
+            sample.lora_num_tokens = [0] * num_loras
+            sample.lora_num_tokens[idx] = len(sample.input_ids)
+            micro_batches.append(sample)
     micro_batches = [pad_micro_batch(micro_batch, pad_to_multiple_of) for micro_batch in micro_batches]
 
     num_padding_batch = -len(micro_batches) % num_train_workers
@@ -181,6 +245,9 @@ def prepare_batch(
         padded_batch = copy.deepcopy(micro_batches[0])
         padded_batch.advantages = [0.0] * len(padded_batch.input_ids)
         padded_batch.loss_mask = [False] * len(padded_batch.input_ids)
+        padded_batch.hindsight_mask = [False] * len(padded_batch.input_ids)
+        padded_batch.replay_mask = [False] * len(padded_batch.input_ids)
+        padded_batch.replay_weights = [1.0] * len(padded_batch.input_ids)
         micro_batches.extend([padded_batch for _ in range(num_padding_batch)])
 
     assert len(micro_batches) % num_train_workers == 0, (

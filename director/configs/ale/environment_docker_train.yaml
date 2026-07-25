@@ -1,0 +1,15 @@
+# Linux ALE train tasks run in the official local Docker image. Task inputs
+# and hidden references are host-side and staged at different lifecycle phases.
+snapshots:
+  cpu-free-ubuntu:
+    provider: docker
+    image: ale-ubuntu22-docker
+    docker:
+      image_ref: fugu/ale-ubuntu22-docker:20260722-domainstage-v5
+      privileged: true
+      enable_dind: true
+      shm_size: 2g
+      resolution: [1024, 768]
+
+task_data_source: local:${env:FUGU_ALE_TASK_DATA_ROOT}
+output_path: local

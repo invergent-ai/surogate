@@ -110,8 +110,15 @@ def serialize_branchpoint(
     active = workflow.active
     if not active.completion_requested or state.terminal_status != "ready":
         raise RuntimeError("branchpoint must be a stable owner completion request")
-    if engine.provider_failure_events or engine.worker_protocol_errors:
-        raise RuntimeError("invalid provider or worker protocol state cannot be forked")
+    if engine.provider_failure_events:
+        raise RuntimeError("invalid provider state cannot be forked")
+    # Transient worker protocol slips that the runtime already recovered from
+    # do not contaminate the fork; only UNRESOLVED protocol state at the
+    # capture boundary does. Two consecutive campaigns were ended by the
+    # previous zero-errors-ever precondition while the product runtime itself
+    # tolerated the same recovered slips.
+    if any(agent.consecutive_protocol_errors for agent in workflow.agents):
+        raise RuntimeError("unresolved worker protocol state cannot be forked")
 
     agents = []
     for agent in workflow.agents:
@@ -377,6 +384,11 @@ class FuguLiveBranchpointCollectionAgent(
 
     _sanitize_prepared_git_history = True
 
+    @staticmethod
+    def _allow_registered_natural_action() -> bool:
+        """Keep ordinary natural arms policy-sampled unless a subclass opts in."""
+        return False
+
     def __init__(
         self,
         logs_dir: Path,
@@ -436,18 +448,44 @@ class FuguLiveBranchpointCollectionAgent(
             self._capture_controller = controller
         elif mode == "natural":
             # The counterfactual arm: restore the exact branchpoint and let the
-            # unmodified product live controller choose every action. Forcing a
-            # first action is not allowed here; registered `continue` is
-            # contract-invalid at owner completion boundaries.
-            if os.environ.get(BRANCH_ACTION_ENV):
+            # unmodified product live controller choose every action. A
+            # specialized collector may instead replay an action captured
+            # before the fork; generic natural arms must remain policy-sampled.
+            raw_action = os.environ.get(BRANCH_ACTION_ENV)
+            if raw_action and not self._allow_registered_natural_action():
                 raise RuntimeError("natural mode must not register a first action")
             if not self._branchpoint_path.is_file():
                 raise RuntimeError("natural mode requires a branchpoint snapshot")
             self._branchpoint_payload = json.loads(
                 self._branchpoint_path.read_text(encoding="utf-8")
             )
-            if self._fugu_llm._live_controller is None:
+            product_controller = self._fugu_llm._live_controller
+            if product_controller is None:
                 raise RuntimeError("product live controller is unavailable")
+            if raw_action:
+                replay_payload = json.loads(raw_action)
+                if replay_payload.get("steps") == []:
+                    replay_payload.pop("steps")
+                action = parse_control_action(
+                    json.dumps(replay_payload, ensure_ascii=True)
+                )
+                if action.action not in {"handoff", "replan"}:
+                    raise RuntimeError(
+                        "captured natural action must be handoff or replan"
+                    )
+                self._registered_action = action
+                forced_action = action
+                if action.action == "replan":
+                    planner = FirstReplacementPlanner(action, self._planner)
+                    self._planner = planner
+                    self._fugu_llm._planner = planner
+                    forced_action = ControlAction(
+                        action="replan", reason=action.reason
+                    )
+                self._fugu_llm._live_controller = ForcedFirstDecisionController(
+                    forced_action,
+                    product_controller,
+                )
         else:
             raw_action = os.environ.get(BRANCH_ACTION_ENV)
             if not raw_action or not self._branchpoint_path.is_file():
