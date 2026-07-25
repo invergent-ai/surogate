@@ -2610,6 +2610,116 @@ float MultiGPUPyTrainer::dispatch_pp_train_step(const std::int32_t* inputs,
     return loss;
 }
 
+std::vector<float> MultiGPUPyTrainer::dispatch_pp_forward_logprobs_multigpu(const std::int32_t* inputs,
+                                                                           const std::int32_t* targets,
+                                                                           const std::vector<int>& los,
+                                                                           const std::vector<int>& his,
+                                                                           int num_microbatches) {
+    if (los.size() != his.size() || los.empty()) {
+        throw std::runtime_error("dispatch_pp_forward_logprobs_multigpu: bad stage ranges");
+    }
+    const int ngpu = static_cast<int>(mContexts.size());
+    const int num_stages = static_cast<int>(los.size());
+    const int M = std::max(1, num_microbatches);
+    const long mb_stride = static_cast<long>(B) * static_cast<long>(T);
+
+    using Boundary = std::vector<std::pair<std::string, std::vector<std::byte>>>;
+
+    // Same stage pipeline as the fused training step, with one difference: it runs
+    // through the LAST stage too. The training step deliberately stops at N-2 (the
+    // backward recomputes the final stage), but GRPO needs the logprobs the loss
+    // ops produce *before* it can form its per-token gradients.
+    run_work([](sThreadContext& ctx) {
+        if (auto* m = dynamic_cast<dsl::DslModel*>(ctx.Model.get())) {
+            if (auto* ge = m->graph_executor()) ge->dispatch_reset_stack();
+        }
+    });
+
+    std::vector<float> logprobs(static_cast<std::size_t>(M) * static_cast<std::size_t>(mb_stride), 0.0f);
+    std::vector<std::vector<Boundary>> fwd_out(static_cast<std::size_t>(num_stages),
+                                               std::vector<Boundary>(static_cast<std::size_t>(M)));
+    const int nflags = std::max(1, num_stages * M);
+    std::unique_ptr<std::atomic<int>[]> ready(new std::atomic<int>[nflags]);
+    for (int i = 0; i < nflags; ++i)
+        ready[i].store(0, std::memory_order_relaxed);
+    std::atomic<int>* readyp = ready.get();
+
+    for (int s = 0; s < num_stages; ++s) {
+        const int lo = los[static_cast<std::size_t>(s)];
+        const int hi = his[static_cast<std::size_t>(s)];
+        const bool is_loss = (s == num_stages - 1);
+        std::vector<Boundary>* my_out = &fwd_out[static_cast<std::size_t>(s)];
+        std::vector<Boundary>* up_out = (s > 0) ? &fwd_out[static_cast<std::size_t>(s - 1)] : nullptr;
+        float* lp_out = logprobs.data();
+        dispatch_async(
+            [this, inputs, targets, mb_stride, M, s, lo, hi, is_loss, my_out, up_out, readyp, lp_out](
+                sThreadContext& ctx) {
+                auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+                if (!model) throw std::runtime_error("dispatch_pp_forward_logprobs_multigpu: DSL model required");
+                auto* ge = model->graph_executor();
+                const std::string rn = "blocks[" + std::to_string(hi) + "].res_att";
+                const std::string xn = "blocks[" + std::to_string(hi) + "].mlp_down";
+                for (int m = 0; m < M; ++m) {
+                    Boundary inj;
+                    if (up_out) {
+                        while (readyp[(s - 1) * M + m].load(std::memory_order_acquire) == 0)
+                            std::this_thread::yield();
+                        inj = (*up_out)[static_cast<std::size_t>(m)];
+                    }
+                    // The loss stage needs targets in the model's target buffer for
+                    // cross_entropy_forward to write the per-token losses.
+                    DISPATCH_PP_DBG_STAGE(ctx,
+                                          inputs + static_cast<std::size_t>(m) * mb_stride,
+                                          is_loss ? targets + static_cast<std::size_t>(m) * mb_stride : nullptr);
+                    if (is_loss) {
+                        auto lp = model->dispatch_pp_forward_loss_stage(ctx.Model->get_input_buffer(),
+                                                                       ctx.Model->get_target_buffer(),
+                                                                       ctx.Model->get_position_ids_buffer(),
+                                                                       *ctx.Communicator,
+                                                                       lo,
+                                                                       hi,
+                                                                       std::move(inj));
+                        std::copy(lp.begin(),
+                                  lp.begin() + std::min<std::size_t>(lp.size(), static_cast<std::size_t>(mb_stride)),
+                                  lp_out + static_cast<std::size_t>(m) * mb_stride);
+                    } else {
+                        model->dispatch_pp_forward_stage(ctx.Model->get_input_buffer(),
+                                                         ctx.Model->get_position_ids_buffer(),
+                                                         *ctx.Communicator,
+                                                         lo,
+                                                         hi,
+                                                         std::move(inj),
+                                                         /*preserve_output=*/true);
+                        Boundary o;
+                        o.emplace_back(rn, ge->read_named_bytes(rn));
+                        o.emplace_back(xn, ge->read_named_bytes(xn));
+                        (*my_out)[static_cast<std::size_t>(m)] = std::move(o);
+                    }
+                    ge->restore_stage_base();
+                    readyp[s * M + m].store(1, std::memory_order_release);
+                }
+            },
+            s % ngpu);
+    }
+    for (int g = 0; g < ngpu; ++g)
+        wait_gpu(g);
+
+    // Leave the executor clean. Intermediate stages ran with set_preserve_layer(hi)
+    // and skip_finalize, which is per-step dispatch state; the fused training step
+    // clears it on entry, but a caller may follow this with a NON-dispatch call
+    // (e.g. forward_for_grpo, export) and would otherwise hit an async launch
+    // failure from the stale preserved stage.
+    run_work([](sThreadContext& ctx) {
+        if (auto* m = dynamic_cast<dsl::DslModel*>(ctx.Model.get())) {
+            if (auto* ge = m->graph_executor()) {
+                ge->set_preserve_layer(-1);
+                ge->dispatch_reset_stack();
+            }
+        }
+    });
+    return logprobs;
+}
+
 float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inputs,
                                                          const std::int32_t* targets,
                                                          const std::vector<int>& los,
@@ -2617,7 +2727,8 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
                                                          const optimizers::OptimizerConfig& opt_config,
                                                          int step_idx,
                                                          bool stale,
-                                                         int num_microbatches) {
+                                                         int num_microbatches,
+                                                         const float* custom_dloss) {
     if (los.size() != his.size() || los.empty()) {
         throw std::runtime_error("dispatch_pp_train_step_multigpu: bad stage ranges");
     }
@@ -2755,7 +2866,7 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
             std::vector<Boundary>* up_g = (s < num_stages - 1) ? &grad_out[static_cast<std::size_t>(s + 1)] : nullptr;
             std::vector<Boundary>* sin = &stage_inputs[static_cast<std::size_t>(s)];
             dispatch_async(
-                [this, inputs, targets, mb_stride, M, s, lo, hi, is_loss, my_g, up_g, sin, readyp, lpm, vtpm](
+                [this, inputs, targets, custom_dloss, mb_stride, M, s, lo, hi, is_loss, my_g, up_g, sin, readyp, lpm, vtpm](
                     sThreadContext& ctx) {
                     auto* model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
                     if (!model) throw std::runtime_error("dispatch_pp_train_step_multigpu: DSL model required");
@@ -2783,7 +2894,12 @@ float MultiGPUPyTrainer::dispatch_pp_train_step_multigpu(const std::int32_t* inp
                                                           std::move(finj),
                                                           std::move(ginj),
                                                           /*micro_step=*/1,  // pre-zeroed -> always accumulate
-                                                          /*total_micro=*/M);
+                                                          /*total_micro=*/M,
+                                                          // Per-microbatch slice of the custom per-token
+                                                          // gradients (GRPO/DPO); nullptr => built-in CE.
+                                                          custom_dloss ? custom_dloss +
+                                                                             static_cast<std::size_t>(m) * mb_stride
+                                                                       : nullptr);
                         if (is_loss) {
                             (*lpm)[static_cast<std::size_t>(m)] = static_cast<double>(model->dispatch_pp_raw_loss());
                             (*vtpm)[static_cast<std::size_t>(m)] = model->dispatch_pp_loss_valid_tokens();

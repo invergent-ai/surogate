@@ -10,7 +10,6 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-import wandb
 
 from surogate.core.config.grpo_orch_config import GRPOEnvConfig, GRPOEvalEnvConfig
 
@@ -33,6 +32,24 @@ from surogate.grpo.utils.pathing import (
 from surogate.utils.logger import get_logger
 
 logger = get_logger()
+
+
+def _wandb_finish(exit_code: int | None = None) -> None:
+    """Finalize a wandb run if wandb is usable, otherwise do nothing.
+
+    wandb is an optional reporting backend, so importing it must never be able
+    to take down a run that does not use it — a version-skewed install (e.g. a
+    protobuf major ahead of wandb's generated stubs) raises ImportError deep
+    inside the package at import time.
+    """
+    try:
+        import wandb
+    except Exception:
+        return
+    try:
+        wandb.finish() if exit_code is None else wandb.finish(exit_code=exit_code)
+    except Exception:
+        logger.debug("wandb.finish() failed", exc_info=True)
 
 
 def import_object(dotted_path: str) -> Any:
@@ -129,11 +146,11 @@ def clean_exit(func: Callable) -> Callable:
         async def async_wrapper(*args, **kwargs):
             try:
                 ret = await func(*args, **kwargs)
-                wandb.finish()
+                _wandb_finish()
                 return ret
             except Exception as e:
                 logger.error(f"Fatal error in {func.__name__}\n{traceback.format_exc()}")
-                wandb.finish(exit_code=1)
+                _wandb_finish(exit_code=1)
                 raise e
 
         return async_wrapper
@@ -143,11 +160,11 @@ def clean_exit(func: Callable) -> Callable:
         def sync_wrapper(*args, **kwargs):
             try:
                 ret = func(*args, **kwargs)
-                wandb.finish()
+                _wandb_finish()
                 return ret
             except Exception as e:
                 logger.error(f"Fatal error in {func.__name__}\n{traceback.format_exc()}")
-                wandb.finish(exit_code=1)
+                _wandb_finish(exit_code=1)
                 raise e
 
         return sync_wrapper

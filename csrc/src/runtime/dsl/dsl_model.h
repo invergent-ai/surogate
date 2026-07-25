@@ -162,6 +162,11 @@ public:
     // loss; otherwise inject the incoming boundary gradients (inject_named:
     // d_blocks[hi].res_att / .mlp_down). Read results via the executor readers
     // (block_grad_norms, read_named_bytes for d_blocks[lo-1].*).
+    // custom_dloss_cpu (optional, host [B*T]): when set AND this is the loss stage,
+    // the backward is seeded from these per-token gradients instead of the built-in
+    // cross-entropy. This is what lets GRPO/DPO-style objectives run under
+    // dispatch-PP; it mirrors backward_grpo()'s custom_dloss_gpu injection. Ignored
+    // on non-loss stages (they only propagate incoming boundary gradients).
     void dispatch_pp_backward_stage(Tensor inputs,
                                     Tensor targets,
                                     Tensor position_ids,
@@ -172,7 +177,8 @@ public:
                                     std::vector<std::pair<std::string, std::vector<std::byte>>> fwd_inject,
                                     std::vector<std::pair<std::string, std::vector<std::byte>>> inject_named,
                                     int micro_step = 0,
-                                    int total_micro = 1);
+                                    int total_micro = 1,
+                                    const float* custom_dloss_cpu = nullptr);
     // Whole-graph backward; returns per-block weight-grad L2 norms (block order).
     std::vector<float>
     dispatch_pp_grad_norms_whole(Tensor inputs, Tensor targets, Tensor position_ids, NCCLCommunicator& comm);
@@ -210,6 +216,22 @@ public:
     // which the dispatch backward leaves unset. Monotone with the mean loss, so it
     // tracks convergence.
     [[nodiscard]] float dispatch_pp_raw_loss() const;
+    // Forward of the loss-owning stage, returning per-token logprobs. Use this
+    // instead of dispatch_pp_forward_stage for the last stage: that one preserves
+    // its output boundary for the next stage and skips finalize, which is wrong
+    // (and crashes the launch) once the lm-head/loss ops are in range.
+    std::vector<float> dispatch_pp_forward_loss_stage(
+        Tensor inputs,
+        Tensor targets,
+        Tensor position_ids,
+        NCCLCommunicator& comm,
+        int lo,
+        int hi,
+        std::vector<std::pair<std::string, std::vector<std::byte>>> fwd_inject);
+    // Per-token logprobs (B*T, = -losses) from the last forward that ran the loss
+    // ops. GRPO computes its per-token gradients from these, then feeds them back
+    // through dispatch_pp_backward_stage's custom_dloss_cpu.
+    std::vector<float> dispatch_pp_read_logprobs();
     // Valid (non-pad) tokens the loss stage counted for the last microbatch; the multi-GPU
     // trainer sums these across microbatches and publishes the total via the setter below so
     // dispatch_pp_apply_optimizer (which runs on the master GPU, not the loss GPU) can scale

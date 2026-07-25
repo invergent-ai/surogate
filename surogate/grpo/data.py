@@ -22,6 +22,8 @@ def microbatch_to_numpy(micro_batch) -> dict[str, np.ndarray]:
         loss_mask: bool [1, T]
         temperatures: float32 [1, T]
         teacher_logprobs: float32 [1, T] or None
+        turn_ids: int32 [1, T] or None  (-1 = initial prompt or padding; env
+            observation tokens carry the index of the turn they precede)
     """
     T = len(micro_batch.input_ids)
 
@@ -42,6 +44,10 @@ def microbatch_to_numpy(micro_batch) -> dict[str, np.ndarray]:
     if micro_batch.teacher_logprobs is not None:
         teacher_logprobs = np.array(micro_batch.teacher_logprobs, dtype=np.float32).reshape(1, T)
 
+    turn_ids = None
+    if micro_batch.turn_ids is not None:
+        turn_ids = np.array(micro_batch.turn_ids, dtype=np.int32).reshape(1, T)
+
     return {
         "input_ids": input_ids,
         "targets": targets,
@@ -51,6 +57,7 @@ def microbatch_to_numpy(micro_batch) -> dict[str, np.ndarray]:
         "loss_mask": loss_mask,
         "temperatures": temperatures,
         "teacher_logprobs": teacher_logprobs,
+        "turn_ids": turn_ids,
     }
 
 

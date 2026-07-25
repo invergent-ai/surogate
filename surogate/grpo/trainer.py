@@ -11,6 +11,7 @@ Document-level attention masking (Flash Attention varlen) can be enabled to
 prevent cross-sample attention in packed sequences.
 """
 
+import json
 import shutil
 import time
 from pathlib import Path
@@ -20,7 +21,9 @@ import numpy as np
 from surogate import _surogate
 from surogate.grpo.config import GRPOTrainConfig
 from surogate.grpo.data import GRPODataLoader
+from surogate.grpo.loss import compute_grpo_per_token_grads
 from surogate.grpo.runs import get_multi_run_manager
+from surogate.grpo.turn_stats import TurnAccumulator
 from surogate.grpo.weight_broadcast import SurogateWeightBroadcast
 from surogate.train.lr_schedule import LRSchedule
 from surogate.train.metrics_writer import MetricsWriter
@@ -170,6 +173,29 @@ class GRPOTrainer:
         self.data_loader: GRPODataLoader | None = None
         self.packer = None
 
+        # Metrics from the Python loss path (turn_diagnostics mode only)
+        self._diag_metrics: dict[str, float] | None = None
+        self._turn_rows_path = Path(config.output_dir) / "turn_stats.jsonl"
+
+        # dispatch-PP: stage the forward/backward across the GPU pool so a model
+        # whose fp32 master does not fit resident can still train. GRPO drives the
+        # two halves itself (staged forward -> Python per-token grads -> staged
+        # backward seeded with them), because its gradients do not come from
+        # cross-entropy.
+        self._dispatch_pp = getattr(config, "parallelism", None) == "dispatch_pp"
+        self._dpp_los: list[int] | None = None
+        self._dpp_his: list[int] | None = None
+        if self._dispatch_pp:
+            from surogate.train.dispatch_pp import plan_stages
+
+            self._dpp_los, self._dpp_his, n_layers, n_stages, max_stage, sb = plan_stages(
+                config.model_info.config, config.gpus
+            )
+            logger.info(
+                f"[dispatch_pp] GRPO: {n_stages} stages over {n_layers} layers "
+                f"(max {max_stage} blocks/stage, stage_blocks={sb})"
+            )
+
         # Optional metrics writers (driven by config.report_to)
         self.metrics_writer: MetricsWriter | None = None
         backends = config.report_to or []
@@ -199,6 +225,309 @@ class GRPOTrainer:
             src = src_path / filename
             if src.exists():
                 shutil.copy(src, dst_path / filename)
+
+    def _log_step(self, *, step, orch_step, step_metrics, result, lr, n_mb, vtc,
+                  expected_loss_scale, step_time, turn_acc) -> None:
+        """Turn diagnostics + step logging + metrics; shared by the native,
+        diagnostic and dispatch-PP micro-step paths so all three report identically."""
+        config = self.config
+        # 5b. Turn-resolved diagnostics
+        turn_summary: dict[str, float] = {}
+        if turn_acc is not None:
+            turn_summary = turn_acc.summary()
+            self._write_turn_rows(step, orch_step, turn_acc)
+            if turn_summary:
+                logger.info(
+                    f"  turns={turn_summary['turn/num_turns_observed']:.0f} "
+                    f"deep/shallow_kl={turn_summary['turn/deep_shallow_kl_ratio']:.0%} "
+                    f"deep_support={turn_summary['turn/deep_support']:.1%} "
+                    f"deep_kl_budget={turn_summary['turn/deep_kl_budget']:.1%} "
+                    f"deep_loss_budget={turn_summary['turn/deep_loss_budget']:.1%} "
+                    f"turn0_budget={turn_summary['turn/turn0_loss_budget']:.1%}"
+                )
+            else:
+                logger.warning(
+                    "turn_diagnostics enabled but no turn ids reached the trainer "
+                    "(single-turn env, or orchestrator predates the turn_ids plumbing)"
+                )
+
+        # 6. Logging
+        if step % config.logging_steps == 0:
+            logger.info(
+                f"step={step} loss={step_metrics.get('policy_loss', 0):.4f} "
+                f"grad_norm={result['norm']:.4f} lr={lr:.2e} "
+                f"kl={step_metrics.get('mismatch_kl', 0):.4f} "
+                f"masked={step_metrics.get('is_masked', 0):.2%} "
+                f"tokens={step_metrics.get('total_tokens', 0)} "
+                f"micro_batches={n_mb} "
+                f"vtc={vtc} expected={expected_loss_scale} "
+                f"time={step_time:.2f}s"
+            )
+
+            if self.metrics_writer is not None:
+                duration_ms = step_time * 1000.0
+                total_tokens = int(step_metrics.get("total_tokens", 0))
+                tps = total_tokens / step_time if step_time > 0 else 0.0
+                self.metrics_writer.track(
+                    step,
+                    **{
+                        "train/policy_loss": float(step_metrics.get("policy_loss", 0.0)),
+                        "train/mismatch_kl": float(step_metrics.get("mismatch_kl", 0.0)),
+                        "train/masked_mismatch_kl": float(step_metrics.get("masked_mismatch_kl", 0.0)),
+                        "train/unmasked_mismatch_kl": float(step_metrics.get("unmasked_mismatch_kl", 0.0)),
+                        "train/is_masked": float(step_metrics.get("is_masked", 0.0)),
+                        "train/is_masked_low": float(step_metrics.get("is_masked_low", 0.0)),
+                        "train/is_masked_high": float(step_metrics.get("is_masked_high", 0.0)),
+                        "train/teacher_kl": float(step_metrics.get("teacher_kl", 0.0)),
+                        "train/keep_tokens": float(step_metrics.get("keep_tokens", 0.0)),
+                        "train/total_tokens": float(total_tokens),
+                        "train/grad_norm": float(result["norm"]),
+                        "train/lr": float(lr),
+                        "train/micro_batches": float(n_mb),
+                        "train/vtc": float(vtc),
+                        "train/expected_loss_scale": float(expected_loss_scale),
+                        "train/duration_ms": duration_ms,
+                        "train/tokens_per_second": tps,
+                        "train/orch_step": float(orch_step),
+                        **turn_summary,
+                    },
+                )
+
+    def _prepare_micro_batch(self, mb, seq_len: int) -> dict:
+        """Pad one micro-batch's per-token arrays to seq_len.
+
+        Shared by the native, diagnostic and dispatch-PP paths so all three see
+        identical inputs; the only difference between them is how the gradients
+        are produced and applied.
+        """
+        orig_input_ids = mb["input_ids"]
+        orig_position_ids = mb["position_ids"]
+        orig_targets = mb["targets"]
+        T_actual = orig_input_ids.shape[1]
+        loss_mask_flat = mb["loss_mask"].flatten()
+
+        sample_ranges = _find_sample_boundaries(orig_position_ids.flatten())
+
+        input_padded = np.zeros((1, seq_len), dtype=np.int32)
+        input_padded[0, :T_actual] = orig_input_ids[0, :T_actual]
+
+        pos_padded = np.zeros((1, seq_len), dtype=np.int32)
+        pos_padded[0, :T_actual] = orig_position_ids[0, :T_actual]
+        if T_actual < seq_len:
+            last_pos = int(pos_padded[0, T_actual - 1])
+            pos_padded[0, T_actual:] = np.arange(last_pos + 1, last_pos + 1 + seq_len - T_actual, dtype=np.int32)
+
+        temp_padded = np.ones((1, seq_len), dtype=np.float32)
+        temp_padded[0, :T_actual] = mb["temperatures"].flatten()[:T_actual]
+
+        targets_padded = np.full((1, seq_len), -100, dtype=np.int32)
+        targets_padded[0, :T_actual] = orig_targets[0, :T_actual]
+        tmask = loss_mask_flat[:T_actual].astype(bool)
+        tmask_shifted = np.zeros_like(tmask)
+        if T_actual > 1:
+            tmask_shifted[:-1] = tmask[1:]
+        targets_padded[0, :T_actual][~tmask_shifted] = -100
+
+        inference_padded = np.zeros(seq_len, dtype=np.float32)
+        inference_padded[:T_actual] = mb["inference_logprobs"].flatten()[:T_actual]
+        advantages_padded = np.zeros(seq_len, dtype=np.float32)
+        advantages_padded[:T_actual] = mb["advantages"].flatten()[:T_actual]
+        loss_mask_padded = np.zeros(seq_len, dtype=np.uint8)
+        loss_mask_padded[:T_actual] = loss_mask_flat[:T_actual].astype(np.uint8)
+
+        teacher_padded = None
+        if mb["teacher_logprobs"] is not None:
+            teacher_padded = np.zeros(seq_len, dtype=np.float32)
+            teacher_padded[:T_actual] = mb["teacher_logprobs"].flatten()[:T_actual]
+
+        turn_ids_padded = None
+        if mb.get("turn_ids") is not None:
+            turn_ids_padded = np.full(seq_len, -1, dtype=np.int32)
+            turn_ids_padded[:T_actual] = mb["turn_ids"].flatten()[:T_actual]
+
+        return {
+            "input": input_padded,
+            "position_ids": pos_padded,
+            "temperatures": temp_padded,
+            "targets": targets_padded,
+            "inference": inference_padded,
+            "advantages": advantages_padded,
+            "loss_mask": loss_mask_padded,
+            "teacher": teacher_padded,
+            "turn_ids": turn_ids_padded,
+            "sample_ranges": sample_ranges,
+            "T_actual": T_actual,
+        }
+
+    def _dispatch_pp_step(self, micro_batches, loss_scale: float, opt_config, step: int, turn_acc) -> dict:
+        """One optimizer step under dispatch-PP.
+
+        GRPO's gradients do not come from cross-entropy, so the fused dispatch step
+        cannot be used as-is. Instead the two halves are driven explicitly:
+
+          1. staged forward through the loss stage -> per-token logprobs
+          2. Python forms the GRPO per-token gradients from them
+          3. staged backward seeded with those gradients (custom_dloss), then the
+             existing collect + optimizer + broadcast
+
+        GRPO's micro-batches map onto dispatch-PP's M microbatches directly: each is
+        already [1, seq_len], and GRPO takes exactly one optimizer step per
+        orchestrator step, which is what the fused call does.
+        """
+        seq_len = self.config.sequence_len
+        M = len(micro_batches)
+
+        prepared = [self._prepare_micro_batch(mb, seq_len) for mb in micro_batches]
+        inputs = np.ascontiguousarray(np.concatenate([p["input"] for p in prepared], axis=0))
+        targets = np.ascontiguousarray(np.concatenate([p["targets"] for p in prepared], axis=0))
+
+        logprob_rows = self.trainer.dispatch_pp_forward_logprobs_multigpu(
+            inputs, targets, self._dpp_los, self._dpp_his, M
+        )
+
+        custom_dloss = np.zeros((M, seq_len), dtype=np.float32)
+        metrics: dict = {}
+        for i, p in enumerate(prepared):
+            # Un-shift from target-slot layout to logical layout (see
+            # _diagnostic_micro_step for why this is required).
+            buf = np.asarray(logprob_rows[i, :seq_len], dtype=np.float32)
+            trainer_lp = np.zeros(seq_len, dtype=np.float32)
+            for start, end in p["sample_ranges"]:
+                if end - start > 1:
+                    trainer_lp[start + 1 : end] = buf[start : end - 1]
+
+            grads, metrics = compute_grpo_per_token_grads(
+                trainer_logprobs=trainer_lp,
+                inference_logprobs=p["inference"],
+                advantages=p["advantages"],
+                loss_mask=p["loss_mask"].astype(bool),
+                loss_config=self.config.loss,
+                sample_ranges=p["sample_ranges"],
+                teacher_logprobs=p["teacher"],
+            )
+
+            if turn_acc is not None and p["turn_ids"] is not None:
+                reference_lp = p["teacher"] if p["teacher"] is not None else p["inference"]
+                turn_acc.update(
+                    turn_ids=p["turn_ids"],
+                    loss_mask=p["loss_mask"].astype(bool),
+                    per_token_kl=trainer_lp - reference_lp,
+                    per_token_loss=grads,
+                    sample_ranges=p["sample_ranges"],
+                )
+
+            for start, end in p["sample_ranges"]:
+                if end - start > 1:
+                    custom_dloss[i, start : end - 1] = grads[start + 1 : end]
+        custom_dloss /= loss_scale
+
+        loss = float(
+            self.trainer.dispatch_pp_train_step_multigpu(
+                inputs, targets, self._dpp_los, self._dpp_his, opt_config, step, False, M, custom_dloss
+            )
+        )
+        self._diag_metrics = metrics
+        return {"loss": loss, "norm": float(self.trainer.dispatch_pp_last_grad_norm())}
+
+    def _write_turn_rows(self, step: int, orch_step: int, turn_acc) -> None:
+        """Append per-turn detail for this step to turn_stats.jsonl (for plotting)."""
+        rows = turn_acc.as_rows()
+        if not rows:
+            return
+        self._turn_rows_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._turn_rows_path.open("a") as fh:
+            for row in rows:
+                fh.write(json.dumps({"step": step, "orch_step": orch_step, **row}) + "\n")
+
+    def _diagnostic_micro_step(
+        self,
+        *,
+        turn_acc,
+        turn_ids,
+        input_step,
+        targets_step,
+        pos_step,
+        temp_step,
+        inference_padded,
+        advantages_padded,
+        loss_mask_padded,
+        teacher_padded,
+        sample_ranges,
+        loss_scale: float,
+        seq_len: int,
+    ) -> None:
+        """Micro-step that also records turn-resolved statistics.
+
+        Decomposes the fused native step into forward -> Python loss -> backward
+        so per-token trainer logprobs become visible. The gradients are identical
+        to ``step_grpo_native`` (same reference implementation, asserted by
+        tests/grpo/test_native_formula.py); the only cost is the Python round
+        trip on the [1, T] logprob buffer.
+        """
+        logprobs = self.trainer.forward_for_grpo(input_step, targets_step, pos_step, temp_step)
+
+        # forward_for_grpo returns the CE loss buffer negated, so it is in TARGET
+        # slot layout: buffer[t] = log p(input_ids[t+1]). The Python loss works in
+        # logical token layout (aligned with loss_mask / inference_logprobs), so
+        # un-shift within each packed sample. This is the exact inverse of the
+        # shift applied to the gradients below, and mirrors how the native kernel
+        # reads losses[out_idx] as the logprob of logical token out_idx+1.
+        buf = np.asarray(logprobs[0, :seq_len], dtype=np.float32)
+        trainer_lp = np.zeros(seq_len, dtype=np.float32)
+        for start, end in sample_ranges:
+            if end - start > 1:
+                trainer_lp[start + 1 : end] = buf[start : end - 1]
+
+        loss_mask_bool = loss_mask_padded.astype(bool)
+        per_token_grads, metrics = compute_grpo_per_token_grads(
+            trainer_logprobs=trainer_lp,
+            inference_logprobs=inference_padded,
+            advantages=advantages_padded,
+            loss_mask=loss_mask_bool,
+            loss_config=self.config.loss,
+            sample_ranges=sample_ranges,
+            teacher_logprobs=teacher_padded,
+        )
+
+        # Per-token reverse-KL contribution, k1 estimator: log pi_S - log pi_T.
+        #
+        # Rollouts are sampled on-policy from pi_S, so E[k1] = KL(pi_S || pi_T)
+        # exactly — this is the quantity TurnOPD's per-turn diagnostics are
+        # defined on, and the same log-ratio this stack already uses as the OPD
+        # reward (teacher_tau * (teacher_lp - trainer_lp)).
+        #
+        # Do NOT use the k3 estimator exp(r)-r-1 here. It is also unbiased, but
+        # its variance explodes: an undertrained student against a much larger
+        # teacher produces occasional 10-15 nat gaps, and exp() lets a handful of
+        # tokens dominate every per-turn mean (observed: "mean KL" of 2.4e6).
+        reference_lp = teacher_padded if teacher_padded is not None else inference_padded
+        per_token_kl = trainer_lp - reference_lp
+
+        if turn_ids is not None:
+            assert turn_ids.shape == loss_mask_bool.shape, (
+                f"turn_ids {turn_ids.shape} must be padded to seq_len like loss_mask {loss_mask_bool.shape}"
+            )
+            turn_acc.update(
+                turn_ids=turn_ids,
+                loss_mask=loss_mask_bool,
+                per_token_kl=per_token_kl,
+                per_token_loss=per_token_grads,
+                sample_ranges=sample_ranges,
+            )
+
+        # Shift into the target layout the LM-head backward expects: the gradient
+        # for logical token t is written at slot t-1 within its own sample.
+        shifted = np.zeros((1, seq_len), dtype=np.float32)
+        for start, end in sample_ranges:
+            if end - start > 1:
+                shifted[0, start : end - 1] = per_token_grads[start + 1 : end]
+        shifted /= loss_scale
+
+        ngpu = self.config.gpus
+        grads_step = np.ascontiguousarray(np.tile(shifted, (ngpu, 1)) if ngpu > 1 else shifted)
+        self.trainer.backward_grpo(grads_step)
+
+        self._diag_metrics = metrics
 
     def _setup_data(self, start_step: int = 0):
         """Set up data loader and optionally packer (master only)."""
@@ -319,6 +648,46 @@ class GRPOTrainer:
             # Note: loss_scale normalization is applied explicitly to per-token grads
             # (loss = total_loss / loss_scale).
 
+            turn_acc = TurnAccumulator() if config.turn_diagnostics else None
+
+            lr = self.lr_schedule.get_lr(orch_step)
+            opt_config = _surogate.OptimizerConfig(
+                optimizer=config.optimizer,
+                learning_rate=lr,
+                weight_decay=config.weight_decay,
+                grad_clip=config.max_grad_norm,
+                adamw_beta1=config.adamw_beta1,
+                adamw_beta2=config.adamw_beta2,
+                adamw_epsilon=config.adamw_epsilon,
+            )
+
+            if self._dispatch_pp:
+                # dispatch-PP folds forward+backward+optimizer into one staged pass
+                # over all micro-batches, so it replaces both the loop below and the
+                # update_with_config call further down.
+                vtc = 0
+                expected_loss_scale = loss_scale
+                result = self._dispatch_pp_step(micro_batches, float(loss_scale), opt_config, step, turn_acc)
+                step_metrics = dict(self._diag_metrics or {})
+                step_time = time.time() - step_start
+                self._log_step(
+                    step=step,
+                    orch_step=orch_step,
+                    step_metrics=step_metrics,
+                    result=result,
+                    lr=lr,
+                    n_mb=n_mb,
+                    vtc=vtc,
+                    expected_loss_scale=expected_loss_scale,
+                    step_time=step_time,
+                    turn_acc=turn_acc,
+                )
+                if config.save_steps > 0 and step > 0 and step % config.save_steps == 0 and config.checkpoint_dir:
+                    logger.info(f"Saving checkpoint at step {step}...")
+                    self.trainer.save_checkpoint(config.checkpoint_dir, step)
+                step += 1
+                continue
+
             # 4. Process each micro-batch (gradients accumulate in C++)
             for mb in micro_batches:
                 # Original micro-batch data
@@ -387,6 +756,13 @@ class GRPOTrainer:
                 advantages_padded[:T_actual] = advantages_flat[:T_actual]
                 loss_mask_padded = np.zeros(seq_len, dtype=np.uint8)
                 loss_mask_padded[:T_actual] = loss_mask_flat[:T_actual].astype(np.uint8)
+                # Turn ids must be padded to seq_len like every other per-token
+                # array; padding belongs to no turn.
+                turn_ids_padded = None
+                if mb.get("turn_ids") is not None:
+                    turn_ids_padded = np.full(seq_len, -1, dtype=np.int32)
+                    turn_ids_flat = mb["turn_ids"].flatten()
+                    turn_ids_padded[:T_actual] = turn_ids_flat[:T_actual]
                 teacher_padded = None
                 if teacher_lp is not None:
                     teacher_padded = np.zeros(seq_len, dtype=np.float32)
@@ -394,6 +770,24 @@ class GRPOTrainer:
 
                 sample_starts = np.asarray([start for start, _ in sample_ranges], dtype=np.int32)
                 sample_ends = np.asarray([end for _, end in sample_ranges], dtype=np.int32)
+
+                if turn_acc is not None:
+                    self._diagnostic_micro_step(
+                        turn_acc=turn_acc,
+                        turn_ids=turn_ids_padded,
+                        input_step=input_step,
+                        targets_step=targets_step,
+                        pos_step=pos_step,
+                        temp_step=temp_step,
+                        inference_padded=inference_padded,
+                        advantages_padded=advantages_padded,
+                        loss_mask_padded=loss_mask_padded,
+                        teacher_padded=teacher_padded,
+                        sample_ranges=sample_ranges,
+                        loss_scale=float(loss_scale),
+                        seq_len=seq_len,
+                    )
+                    continue
 
                 self.trainer.step_grpo_native(
                     input_step,
@@ -414,66 +808,27 @@ class GRPOTrainer:
                     kl_tau=float(config.loss.kl_tau),
                 )
 
-            # 5. Optimizer step — one per orchestrator step
-            lr = self.lr_schedule.get_lr(orch_step)
-            opt_config = _surogate.OptimizerConfig(
-                optimizer=config.optimizer,
-                learning_rate=lr,
-                weight_decay=config.weight_decay,
-                grad_clip=config.max_grad_norm,
-                adamw_beta1=config.adamw_beta1,
-                adamw_beta2=config.adamw_beta2,
-                adamw_epsilon=config.adamw_epsilon,
-            )
+            # 5. Optimizer step — one per orchestrator step (lr/opt_config built above)
             # Read VTC before optimizer step for diagnostics
             vtc = self.trainer.get_valid_token_count(0)
             expected_loss_scale = loss_scale
 
             result = self.trainer.update_with_config(opt_config, step + 1)
-            step_metrics = dict(self.trainer.get_grpo_native_metrics())
+            # The diagnostic path computes the loss in Python, so the native
+            # accumulator is empty — use the Python metrics from the last
+            # micro-batch instead.
+            if turn_acc is not None:
+                step_metrics = dict(self._diag_metrics or {})
+            else:
+                step_metrics = dict(self.trainer.get_grpo_native_metrics())
 
             step_time = time.time() - step_start
 
-            # 6. Logging
-            if step % config.logging_steps == 0:
-                logger.info(
-                    f"step={step} loss={step_metrics.get('policy_loss', 0):.4f} "
-                    f"grad_norm={result['norm']:.4f} lr={lr:.2e} "
-                    f"kl={step_metrics.get('mismatch_kl', 0):.4f} "
-                    f"masked={step_metrics.get('is_masked', 0):.2%} "
-                    f"tokens={step_metrics.get('total_tokens', 0)} "
-                    f"micro_batches={n_mb} "
-                    f"vtc={vtc} expected={expected_loss_scale} "
-                    f"time={step_time:.2f}s"
-                )
-
-                if self.metrics_writer is not None:
-                    duration_ms = step_time * 1000.0
-                    total_tokens = int(step_metrics.get("total_tokens", 0))
-                    tps = total_tokens / step_time if step_time > 0 else 0.0
-                    self.metrics_writer.track(
-                        step,
-                        **{
-                            "train/policy_loss": float(step_metrics.get("policy_loss", 0.0)),
-                            "train/mismatch_kl": float(step_metrics.get("mismatch_kl", 0.0)),
-                            "train/masked_mismatch_kl": float(step_metrics.get("masked_mismatch_kl", 0.0)),
-                            "train/unmasked_mismatch_kl": float(step_metrics.get("unmasked_mismatch_kl", 0.0)),
-                            "train/is_masked": float(step_metrics.get("is_masked", 0.0)),
-                            "train/is_masked_low": float(step_metrics.get("is_masked_low", 0.0)),
-                            "train/is_masked_high": float(step_metrics.get("is_masked_high", 0.0)),
-                            "train/teacher_kl": float(step_metrics.get("teacher_kl", 0.0)),
-                            "train/keep_tokens": float(step_metrics.get("keep_tokens", 0.0)),
-                            "train/total_tokens": float(total_tokens),
-                            "train/grad_norm": float(result["norm"]),
-                            "train/lr": float(lr),
-                            "train/micro_batches": float(n_mb),
-                            "train/vtc": float(vtc),
-                            "train/expected_loss_scale": float(expected_loss_scale),
-                            "train/duration_ms": duration_ms,
-                            "train/tokens_per_second": tps,
-                            "train/orch_step": float(orch_step),
-                        },
-                    )
+            self._log_step(
+                step=step, orch_step=orch_step, step_metrics=step_metrics, result=result, lr=lr,
+                n_mb=n_mb, vtc=vtc, expected_loss_scale=expected_loss_scale,
+                step_time=step_time, turn_acc=turn_acc,
+            )
 
             # 7. Checkpointing
             if config.save_steps > 0 and step > 0 and step % config.save_steps == 0 and config.checkpoint_dir:

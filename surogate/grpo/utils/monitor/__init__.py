@@ -5,7 +5,6 @@ from transformers.tokenization_utils import PreTrainedTokenizer
 from surogate.core.config.grpo_orch_config import GRPOReportingConfig
 from surogate.grpo.utils.monitor.base import Monitor, NoOpMonitor
 from surogate.grpo.utils.monitor.multi import MultiMonitor
-from surogate.grpo.utils.monitor.wandb import WandbMonitor
 
 __all__ = [
     "Monitor",
@@ -15,6 +14,21 @@ __all__ = [
     "setup_monitor",
     "get_monitor",
 ]
+
+
+def __getattr__(name: str):
+    """Expose WandbMonitor lazily.
+
+    `import wandb` is only paid when the wandb backend is actually selected.
+    Importing it eagerly here meant a broken or version-skewed wandb install
+    (e.g. protobuf ahead of wandb's generated stubs) took down the orchestrator
+    and inference servers, neither of which needs wandb at all.
+    """
+    if name == "WandbMonitor":
+        from surogate.grpo.utils.monitor.wandb import WandbMonitor
+
+        return WandbMonitor
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 _MONITOR: Monitor | None = None
 
@@ -43,6 +57,8 @@ def setup_monitor(
     monitors: list[Monitor] = []
 
     if wandb_config is not None:
+        from surogate.grpo.utils.monitor.wandb import WandbMonitor
+
         monitors.append(
             WandbMonitor(
                 config=wandb_config,

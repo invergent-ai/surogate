@@ -1,0 +1,58 @@
+# TurnOPD diagnostic, run B: 4B student.
+#
+# Run A (Qwen3.5-0.8B) produced reward == 0.0 at every step: the student never
+# solved a multi-hop lookup, degenerated into looping tool calls, and every
+# trajectory hit the turn cap. That leaves the rollout-depth half of TurnOPD
+# unmeasurable (H_cov is success-conditioned) and puts the loss-budget half in a
+# regime driven by degenerate looping rather than real depth.
+#
+# This run keeps the task identical and changes only the student, to test
+# whether the zero reward is capacity rather than task design.
+
+model:
+  name: "Qwen/Qwen3.5-2B"
+  lora_adapter: "default"
+  lora_rank: 16
+  lora_alpha: 32
+
+# Same 9B teacher as run A, shared over HTTP (no extra GPU).
+teacher_model:
+  model:
+    name: "Qwen/Qwen3.5-9B"
+  client:
+    base_url:
+      - http://localhost:8008/v1
+
+env:
+  - id: multihop-tools
+    path: ./environments/multihop-tools
+    args:
+      num_examples: 2000
+      n_chains: 120
+      min_hops: 2
+      max_hops: 4
+      max_turns: 12
+
+batch_size: 32
+rollouts_per_example: 8
+seq_len: 2048
+max_steps: 30
+use_token_client: false
+
+sampling:
+  max_tokens: 256
+  temperature: 1.0
+
+client:
+  base_url:
+    - http://localhost:8009/v1
+
+# Adaptive rollout-depth budgeting (TurnOPD §5.1, coverage arm).
+rollout_depth:
+  enabled: true
+  quantile: 0.80
+  probe_interval: 6
+  warmup_steps: 2
+
+dump_metrics: true
+output_dir: ./outputs/turnopd_2b_capped/run_default

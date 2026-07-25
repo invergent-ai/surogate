@@ -12,7 +12,12 @@ import yaml
 from surogate.grpo.orchestrator.advantage import compute_advantages
 from surogate.grpo.orchestrator.eval_utils import compute_eval_ckpt_step, get_eval_sampling_args
 from surogate.grpo.orchestrator.event_loop_lag import EventLoopLagMonitor
-from surogate.grpo.orchestrator.patches import monkey_patch_chat_completion_logprobs, monkey_patch_oai_iterable_types
+from surogate.grpo.orchestrator.depth_controller import DepthObservation, RolloutDepthController
+from surogate.grpo.orchestrator.patches import (
+    monkey_patch_chat_completion_logprobs,
+    monkey_patch_multiturn_env_depth_cap,
+    monkey_patch_oai_iterable_types,
+)
 from surogate.grpo.orchestrator.trajectories import interleave_rollout
 from surogate.grpo.transport import TrainingBatch, TrainingSample, setup_training_batch_sender
 from surogate.grpo.utils.asynyc_utils import safe_cancel
@@ -23,6 +28,11 @@ monkey_patch_oai_iterable_types()
 
 # This monkey patch is necessary to avoid heavy CPU overhead from constructing the OAI ChatCompletion Pydantic model with logprobs, for more info see https://github.com/PrimeIntellect-ai/prime-rl/pull/1189
 monkey_patch_chat_completion_logprobs()
+
+# Let MultiTurnEnv honor a per-rollout depth cap from `info`. Must run before any
+# environment is constructed: Environment.__post_init__ snapshots bound stop-condition
+# methods, so a later patch would never be registered.
+monkey_patch_multiturn_env_depth_cap()
 
 # Import environment before any other imports
 
@@ -359,6 +369,31 @@ async def orchestrate(config: GRPOOrchestratorConfig):
             config=config,
         )
 
+        # Adaptive rollout-depth budgeting. max_depth defaults to the largest
+        # max_turns configured across training envs, so the cap can never exceed
+        # what the environments would have run anyway.
+        depth_cfg = config.rollout_depth
+        env_max_turns = [
+            int(env.args["max_turns"])
+            for env in (config.env or [])
+            if isinstance(env.args, dict) and isinstance(env.args.get("max_turns"), int)
+        ]
+        depth_controller = RolloutDepthController(
+            enabled=bool(depth_cfg.enabled),
+            max_depth=int(depth_cfg.max_depth or (max(env_max_turns) if env_max_turns else 32)),
+            min_depth=int(depth_cfg.min_depth),
+            quantile=float(depth_cfg.quantile),
+            ema=float(depth_cfg.ema),
+            probe_interval=int(depth_cfg.probe_interval),
+            warmup_steps=int(depth_cfg.warmup_steps),
+            min_observations=int(depth_cfg.min_observations),
+        )
+        if depth_controller.enabled:
+            logger.info(
+                f"Adaptive rollout depth enabled (quantile={depth_controller.quantile}, "
+                f"max_depth={depth_controller.max_depth}, probe every {depth_controller.probe_interval} steps)"
+            )
+
         if checkpoint_step is not None and config.model.lora_adapter is not None:
             assert config.model.lora_adapter is not None
             scheduler.model_name = config.model.lora_adapter
@@ -544,6 +579,9 @@ async def orchestrate(config: GRPOOrchestratorConfig):
             temperature = compute_temperature(progress.step, config.sampling, config.max_steps)
             sampling_args = get_sampling_args(config.sampling, temperature=temperature)
             scheduler.set_sampling_args(sampling_args)
+            # Cap rollout depth for this step (None on probe/warmup steps, which run
+            # to the env's own max_turns and are the only source of depth statistics).
+            scheduler.set_depth_cap(depth_controller.cap_for_step(progress.step))
             train_task = asyncio.create_task(scheduler.generate_batch(step=progress.step))
 
             # Schedule running validation at the specified interval
@@ -568,6 +606,19 @@ async def orchestrate(config: GRPOOrchestratorConfig):
             await train_task
             generate_completions_time = scheduler.last_batch_generation_time
             train_rollouts = train_task.result()
+
+            # Feed observed completion depths back to the depth controller. Only
+            # probe steps are folded in (see RolloutDepthController.observe).
+            depth_controller.observe(
+                progress.step,
+                [
+                    DepthObservation(
+                        depth=len(r.get("trajectory") or []),
+                        success=float(r.get("reward") or 0.0) > 0.0,
+                    )
+                    for r in train_rollouts
+                ],
+            )
 
             # Apply rollout filters (zeros reward/mask for degenerate generations)
             filter_metrics = apply_filters(rollout_filters, train_rollouts)
@@ -808,6 +859,8 @@ async def orchestrate(config: GRPOOrchestratorConfig):
                 "time/parallel_preprocess": parallel_preprocess_time,
                 # Scheduler metrics
                 **scheduler.get_metrics(),
+                # Adaptive rollout-depth controller
+                **depth_controller.metrics(),
                 # Buffer metrics
                 **buffer.get_metrics(),
                 # Event loop lag metrics

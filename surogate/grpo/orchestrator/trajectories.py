@@ -60,6 +60,7 @@ def interleave_rollout(output: vf.RolloutOutput) -> list[TrainingSample] | None:
             completion_temperatures=[temperature] * len(completion_ids),
             teacher_logprobs=None,
             advantage=None,
+            completion_turn_ids=[step_idx] * len(completion_ids),
         )
 
     def extend_sample(sample: TrainingSample, step: vf.TrajectoryStep, prefix_len: int, step_idx: int) -> None:
@@ -67,16 +68,20 @@ def interleave_rollout(output: vf.RolloutOutput) -> list[TrainingSample] | None:
         tokens = step["tokens"]
         assert tokens is not None
 
-        # Extend with new prompt tokens (mask=False, no gradient)
+        # Extend with new prompt tokens (mask=False, no gradient). These are the
+        # env observation for this turn, so they carry this turn's index.
         new_prompt_ids = tokens["prompt_ids"][prefix_len:]
         sample.completion_ids.extend(new_prompt_ids)
         sample.completion_mask.extend([False] * len(new_prompt_ids))
         sample.completion_logprobs.extend([0.0] * len(new_prompt_ids))
         sample.completion_temperatures.extend([temperature] * len(new_prompt_ids))
+        assert sample.completion_turn_ids is not None
+        sample.completion_turn_ids.extend([step_idx] * len(new_prompt_ids))
 
         # Extend with new completion tokens
         completion_ids = tokens["completion_ids"]
         sample.completion_ids.extend(completion_ids)
+        sample.completion_turn_ids.extend([step_idx] * len(completion_ids))
         if has_error:
             sample.completion_mask.extend([False] * len(tokens["completion_mask"]))
         else:
@@ -118,4 +123,17 @@ def interleave_rollout(output: vf.RolloutOutput) -> list[TrainingSample] | None:
             new_prefix = tokens["prompt_ids"] + tokens["completion_ids"]
             active_samples.append([new_prefix, make_sample(step, step_idx=step_idx)])
 
-    return [sample for _, sample in active_samples]
+    samples = [sample for _, sample in active_samples]
+
+    # Turn ids stay the trajectory step index and are deliberately NOT re-based
+    # per sample. A trajectory frequently splits into several samples — chat
+    # templates that re-render earlier turns (e.g. Qwen strips <think> blocks
+    # from all but the latest assistant message) break the extension property,
+    # so each turn can land in its own sample. Re-basing would relabel every
+    # such sample as turn 0 and erase the depth signal the turn diagnostics
+    # exist to measure.
+    for sample in samples:
+        assert sample.completion_turn_ids is not None
+        sample.num_turns = len(trajectory)
+
+    return samples

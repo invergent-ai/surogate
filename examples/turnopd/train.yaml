@@ -1,0 +1,49 @@
+# TurnOPD diagnostic: trainer side.
+# Vanilla OPD — no turn-level reweighting. The point of this run is to MEASURE
+# the turn-level supervision skew (arXiv:2607.05804 §4, Table 1) on our own
+# stack before deciding whether the reweighting is worth implementing.
+
+model: "Qwen/Qwen3.5-0.8B"
+output_dir: ./outputs/turnopd_diag
+
+per_device_train_batch_size: 1
+sequence_len: 4096
+
+max_steps: 30
+logging_steps: 1
+
+learning_rate: 1e-4
+lr_scheduler_type: constant
+warmup_steps: 0
+max_grad_norm: 1.0
+weight_decay: 0.01
+optimizer: adamw
+
+recipe: bf16
+
+lora: true
+lora_rank: 16
+lora_alpha: 32
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+
+# On-policy distillation: teacher log-ratio enters as a token-level reward.
+loss:
+  adv_tau: 1.0
+  teacher_tau: 1.0
+  kl_tau: 1.0e-3
+
+# Route micro-steps through forward -> Python loss -> backward so per-token
+# logprobs are visible for the turn-resolved diagnostics. Same gradients.
+turn_diagnostics: true
+
+save_steps: 0
+
+report_to:
+  - surogate
