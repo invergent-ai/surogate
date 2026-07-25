@@ -488,7 +488,9 @@ void CompiledExecutor::dump_forward_debug_tensors() {
     if (!mDebugDumpFn) {
         return;
     }
-    static const char* dump_tensors_env = std::getenv("SUROGATE_DEBUG_DUMP_TENSORS");
+    // Not `static`: caching the pointer froze the dump set for the whole
+    // process, so a second dump configuration was silently ignored.
+    const char* dump_tensors_env = std::getenv("SUROGATE_DEBUG_DUMP_TENSORS");
     if (!dump_tensors_env || !*dump_tensors_env) {
         return;
     }

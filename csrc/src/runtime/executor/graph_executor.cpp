@@ -262,6 +262,34 @@ std::vector<std::string> debug_dump_parse_tensor_list(const char* env_val) {
     return names;
 }
 
+const std::vector<std::string>& debug_dump_tensor_list() {
+    // SUROGATE_DEBUG_DUMP_TENSORS, parsed, cached, and re-parsed only when the env
+    // value actually changes.
+    //
+    // The parse must be cached: the layer hook fires 70-700x per multi-step run and
+    // re-splitting the comma-separated list every call would be ~500k tiny
+    // allocations. But caching it in a plain function-local `static` froze the list
+    // for the whole PROCESS -- so a second configuration in the same process (a
+    // second test module, or any caller that re-points the dump set) silently kept
+    // the first one's tensors, and if the variable was unset at first call dumping
+    // never worked again. That made the onboarding tests order-dependent.
+    //
+    // thread_local, not static: the dump hooks run on one worker thread per GPU,
+    // which would otherwise race on the cache.
+    thread_local std::string cached_env;
+    thread_local std::vector<std::string> cached_names;
+    thread_local bool primed = false;
+
+    const char* env_val = std::getenv("SUROGATE_DEBUG_DUMP_TENSORS");
+    const std::string current = env_val ? env_val : "";
+    if (!primed || current != cached_env) {
+        cached_env = current;
+        cached_names = debug_dump_parse_tensor_list(env_val);
+        primed = true;
+    }
+    return cached_names;
+}
+
 }  // namespace
 
 GraphExecutor::GraphExecutor(const Module& module,
@@ -778,7 +806,10 @@ void GraphExecutor::init_compiled_execution() {
     // Wire up debug dump callback (used by ops for non-finite diagnostics).
     mCompiledExecutor->set_debug_dump_fn(
         [this, resolve_debug_dump_tensor](const std::vector<std::string>& names, int /*layer_idx*/) {
-            static const char* dir_env = std::getenv("SUROGATE_DEBUG_DUMP_DIR");
+            // Not `static`: caching it froze the destination for the process, so a
+            // second dump configuration wrote nothing (the final-stage tensors were
+            // silently missing while per-layer dumps still appeared).
+            const char* dir_env = std::getenv("SUROGATE_DEBUG_DUMP_DIR");
             if (!dir_env || !*dir_env) {
                 return;
             }
@@ -792,11 +823,12 @@ void GraphExecutor::init_compiled_execution() {
     // Per-layer forward dump callback: dump block-prefixed tensors at layer boundaries
     // (before shared activation buffers are overwritten by the next layer).
     mCompiledExecutor->set_debug_dump_layer_fn([this, resolve_debug_dump_tensor](int layer_idx) {
-        static const char* dump_tensors_env = std::getenv("SUROGATE_DEBUG_DUMP_TENSORS");
-        // Parse the (static, immutable) tensor list once — the layer hook fires
-        // 70–700× per multi-step run and re-splitting the comma-separated env on
-        // every call would be ~500k tiny allocations for a typical run.
-        static const std::vector<std::string> tensor_names = debug_dump_parse_tensor_list(dump_tensors_env);
+        const char* dump_tensors_env = std::getenv("SUROGATE_DEBUG_DUMP_TENSORS");
+        // Cached parse that re-parses when the env value changes (see
+        // debug_dump_tensor_list): the layer hook fires 70–700× per run, so the
+        // split must be cached, but caching it for the whole process froze the
+        // dump set at whatever the first caller configured.
+        const std::vector<std::string>& tensor_names = debug_dump_tensor_list();
         // Non-static so the Python-side gradient subcommand can rotate per-step
         // dump directories between trainer.step() calls.
         const char* dump_dir_env = std::getenv("SUROGATE_DEBUG_DUMP_DIR");
@@ -830,8 +862,8 @@ void GraphExecutor::init_compiled_execution() {
     // Backward layer dumps are separate so forward files don't get overwritten
     // during trainer.step().
     mCompiledExecutor->set_debug_dump_backward_layer_fn([this, resolve_debug_dump_tensor](int layer_idx) {
-        static const char* dump_tensors_env = std::getenv("SUROGATE_DEBUG_DUMP_TENSORS");
-        static const std::vector<std::string> tensor_names = debug_dump_parse_tensor_list(dump_tensors_env);
+        const char* dump_tensors_env = std::getenv("SUROGATE_DEBUG_DUMP_TENSORS");
+        const std::vector<std::string>& tensor_names = debug_dump_tensor_list();
         const char* dump_dir_env = std::getenv("SUROGATE_DEBUG_DUMP_DIR");
         if (!dump_tensors_env || !dump_dir_env || !*dump_tensors_env || !*dump_dir_env) {
             return;
