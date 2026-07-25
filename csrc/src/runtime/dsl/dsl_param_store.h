@@ -61,6 +61,14 @@ public:
     bool has(const std::string& name) const;
     bool is_trainable(const std::string& name) const;
     bool is_external(const std::string& name) const;
+    /// True when the weight's GPU buffer is refilled between uses (streamed /
+    /// gathered-on-demand weights). See DslWeightManager::work_is_transient.
+    bool work_is_transient(const std::string& name) const;
+    /// The (possibly host-pinned) master tensor for a weight-manager-managed
+    /// param, or nullptr when the param has no weight-manager master. Used by
+    /// LLEP under cpu_training to fetch foreign expert rows from the shared
+    /// global pinned masters.
+    Tensor* master_tensor(const std::string& name) const;
     /// Return a template tensor (shape + dtype) without forcing provider resolution.
     const Tensor& template_tensor(const std::string& name) const;
 

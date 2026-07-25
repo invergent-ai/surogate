@@ -271,6 +271,7 @@ const char* op_type_to_string(CompiledOpType type) {
         case CompiledOpType::GeluGlu: return "gelu_glu";
         case CompiledOpType::GptOssMoeAct: return "gpt_oss_moe_act";
         case CompiledOpType::Silu: return "silu";
+        case CompiledOpType::Softplus: return "softplus";
         case CompiledOpType::Gelu: return "gelu";
         case CompiledOpType::Relu2: return "relu2";
         case CompiledOpType::Mul: return "mul";
@@ -307,6 +308,7 @@ const char* op_type_to_string(CompiledOpType type) {
         case CompiledOpType::GeluGluBackward: return "gelu_glu_backward";
         case CompiledOpType::GptOssMoeActBackward: return "gpt_oss_moe_act_backward";
         case CompiledOpType::SiluBackward: return "silu_backward";
+        case CompiledOpType::SoftplusBackward: return "softplus_backward";
         case CompiledOpType::GeluBackward: return "gelu_backward";
         case CompiledOpType::Relu2Backward: return "relu2_backward";
         case CompiledOpType::MulBackward: return "mul_backward";
@@ -391,11 +393,17 @@ CompiledExecutor::CompiledExecutor(DslRunState& run_state,
 }
 
 CompiledExecutor::~CompiledExecutor() {
+    free_sequence_chunk_state();
     // Free persistent GPU buffers
     if (mMoEExpertOffsetsGPU) {
         cudaFree(mMoEExpertOffsetsGPU);
         mMoEExpertOffsetsGPU = nullptr;
         mMoEExpertOffsetsGPUSize = 0;
+    }
+    if (mMoEOffsetsPinned) {
+        cudaFreeHost(mMoEOffsetsPinned);
+        mMoEOffsetsPinned = nullptr;
+        mMoEOffsetsPinnedBytes = 0;
     }
     if (mReplayPersistArena) {
         cudaFree(mReplayPersistArena);
@@ -1003,6 +1011,11 @@ const Tensor* CompiledExecutor::try_get_tensor_fuzzy(const std::string& name) {
 }
 
 void CompiledExecutor::handle_layer_start(int layer_idx) {
+    // Saved-tensor offload: bring this layer's offloaded saves back before any
+    // of its backward/replay ops read them (stream-ordered on MainStream).
+    if (mOptions.OffloadSavedTensors && !mCapturing && mInBackwardPass) {
+        mSavedCache.restore_layer(layer_idx, mRunState.MainStream);
+    }
     BeforeConsumeHookPayload before_consume_payload;
     before_consume_payload.weight_manager = mWeightManager;
     before_consume_payload.comm = mComm;
@@ -1047,6 +1060,11 @@ void CompiledExecutor::handle_layer_start(int layer_idx) {
 }
 
 void CompiledExecutor::handle_layer_end(int layer_idx) {
+    // Saved-tensor offload: after the forward layer completes, its saves are
+    // final — move them to pinned host and recycle the device buffers.
+    if (mOptions.OffloadSavedTensors && !mCapturing && !mInBackwardPass) {
+        mSavedCache.offload_layer(layer_idx, mRunState.MainStream);
+    }
     AfterConsumeHookPayload after_consume_payload;
     after_consume_payload.weight_manager = mWeightManager;
     after_consume_payload.release_stream = mRunState.MainStream;

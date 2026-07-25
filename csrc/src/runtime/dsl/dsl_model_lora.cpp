@@ -124,6 +124,18 @@ void DslModel::load_lora_checkpoint(const std::string& checkpoint_dir, NCCLCommu
         import_adapter(adapter_file.string(), comm);
     }
 
+    if (mLoRAWeights && mLoRAWeights->has_ep_local_grouped()) {
+        // Expert adapters (and their optimizer moments) are EP-sharded per rank,
+        // but the optimizer state file holds only rank 0's flat blob — loading it
+        // would corrupt the other ranks' moments. Restart the optimizer instead.
+        if (comm.rank() == 0) {
+            fprintf(stderr,
+                    "[lora] EP-sharded expert adapters: skipping optimizer state restore "
+                    "(optimizer restarts fresh)\n");
+        }
+        return;
+    }
+
     fs::path opt_file = fs::path(checkpoint_dir) / "lora_optimizer.safetensors";
     fs::path opt_meta_file = fs::path(checkpoint_dir) / "lora_optimizer.json";
     if (!fs::exists(opt_file) || !fs::exists(opt_meta_file)) {

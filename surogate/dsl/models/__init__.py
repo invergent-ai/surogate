@@ -2,6 +2,7 @@
 
 from .gemma4 import Gemma4CausalModel, Gemma4ConditionalModel, Gemma4UnifiedModel
 from .gpt_oss import GptOssModel
+from .laguna import LagunaModel
 from .llama import LlamaModel
 from .lfm2 import Lfm2Model
 from .nemotron_h import NemotronHModel, from_hf_config, parse_hybrid_pattern, to_standard_hybrid_pattern
@@ -20,6 +21,7 @@ __all__ = [
     "Qwen3VLModel",
     "Qwen3MoEModel",
     "GptOssModel",
+    "LagunaModel",
     "LlamaModel",
     "Lfm2Model",
     "Gemma4CausalModel",

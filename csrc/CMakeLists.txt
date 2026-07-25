@@ -295,6 +295,7 @@ target_sources(surogate-common PRIVATE
     src/runtime/training/model.cpp
 
     src/runtime/dsl/ir.cpp
+    src/runtime/dsl/per_layer_dims.cpp
     src/runtime/dsl/dsl_model.cpp
     src/runtime/dsl/dsl_model_execution.cpp
     src/runtime/dsl/dsl_model_helpers.cpp
@@ -360,6 +361,7 @@ target_sources(surogate-common PRIVATE
     src/runtime/attention/backend_registry.cpp
     src/runtime/attention/backend_cudnn.cpp
     src/runtime/attention/backend_flash_varlen.cpp
+    src/runtime/attention/backend_kvprefix.cpp
     src/runtime/attention/backend_custom.cpp
     src/runtime/attention/backend_mem_eff.cpp
     src/runtime/attention/attention_cudnn.cpp
@@ -369,6 +371,7 @@ target_sources(surogate-common PRIVATE
     src/runtime/ops/cross_entropy_loss.cpp
     src/runtime/ops/fused_lm_head_loss.cpp
     src/runtime/ops/silu.cpp
+    src/runtime/ops/softplus.cpp
     src/runtime/ops/relu2.cpp
     src/runtime/ops/mul.cpp
     src/runtime/ops/scale.cpp
@@ -421,6 +424,7 @@ target_sources(surogate-common PRIVATE
 
     # Tokenizer (native C++ BPE, loads HuggingFace tokenizer.json)
     src/tokenizer/tokenizer.cpp
+    src/tokenizer/tok_profile.cpp
     src/tokenizer/unicode.cpp
     src/tokenizer/unicode_data.cpp
 
@@ -702,8 +706,8 @@ if (BUILD_TESTS OR BUILD_TESTS_INTEGRATION)
     add_executable(integration-tests
         src/testing/utilities/test_main.cpp
         src/testing/distributed/test-nccl.cpp
-        src/testing/kernels/test-fp8-quant.cpp
-        src/testing/kernels/test-grpo-replay.cpp
+        src/testing/kernels/test-dpo-dloss.cu
+        src/testing/kernels/test-chunked-attention.cu
         src/testing/tokenizer/test-chat-template.cpp
     )
     target_link_libraries(integration-tests PRIVATE

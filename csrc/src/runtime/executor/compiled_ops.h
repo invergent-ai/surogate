@@ -21,12 +21,14 @@
 #include <unordered_set>
 #include <vector>
 
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include "runtime/dsl/forward_plan.h"
 #include "runtime/dsl/hook_registry.h"
 #include "runtime/executor/execution_request.h"
 #include "runtime/ep/ep_state.h"
+#include "runtime/training/model.h"
 #include "runtime/executor/graph_executor_internal.h"
 #include "runtime/executor/saved_tensor_cache.h"
 #include "runtime/dsl/ir.h"
@@ -132,6 +134,19 @@ public:
         mInvTemperatureGpu = request ? request->inv_temperature_gpu : nullptr;
         mCustomDLossGpu = request ? request->custom_dloss_gpu : nullptr;
         mSkippedBackwardTensors = request ? &request->skipped_backward_tensors : nullptr;
+        mKdTopkIdsGpu = request ? request->kd_topk_ids_gpu : nullptr;
+        mKdTopkLogprobsGpu = request ? request->kd_topk_logprobs_gpu : nullptr;
+        mKdLossAccumGpu = request ? request->kd_loss_accum_gpu : nullptr;
+        mKdTopK = request ? request->kd_top_k : 0;
+        mKdTemperature = request ? request->kd_temperature : 1.0f;
+        mKdWeight = request ? request->kd_weight : 0.0f;
+        mKdCeWeight = request ? request->kd_ce_weight : 1.0f;
+    }
+
+    /// True when a knowledge-distillation teacher signal is attached to the
+    /// current execution request.
+    bool kd_active() const {
+        return mKdTopkIdsGpu != nullptr;
     }
 
     /// Set document masking context for Flash Attention varlen dispatch.
@@ -154,6 +169,34 @@ public:
         mMaxDocSeqlen = 0;
         mTotalDocTokens = 0;
     }
+
+    // ------------------------------------------------------------------
+    // Chunked-sequence training (KV-checkpointed chunks). When active,
+    // dispatch_flash_attention(+backward) routes to the kvprefix backend
+    // with executor-owned per-layer KV caches and FP32 dKV accumulators.
+    // ------------------------------------------------------------------
+    /// Activate chunk `idx` of `count` (idx = -1 deactivates). The graph's
+    /// T is the chunk size; the caches cover count * T rows. `pack` carries
+    /// the chunk's document geometry (packed sequences); null = one segment
+    /// spanning the whole prefix.
+    void set_sequence_chunk(int idx, int count, const IModel::ChunkPackMeta* pack = nullptr);
+    bool sequence_chunk_active() const {
+        return mChunkCount > 1 && mChunkIdx >= 0;
+    }
+    int sequence_chunk_idx() const {
+        return mChunkIdx;
+    }
+    bool sequence_chunk_reuse_ep() const {
+        return mChunkPack.reuse_ep;
+    }
+    bool sequence_chunk_kv_sweep() const {
+        return sequence_chunk_active() && mChunkPack.kv_sweep;
+    }
+    /// Zero all layers' dKV accumulators — call once before each reverse
+    /// backward sweep.
+    void zero_sequence_chunk_dkv();
+    /// Free all chunked-sequence state (KV caches, accumulators, scratch).
+    void free_sequence_chunk_state();
 
     void set_recompute_fn(std::function<void(int, long, long, bool)> fn);
     void set_recompute_enabled(bool enabled);
@@ -496,6 +539,7 @@ public:
     void dispatch_gelu_glu(const CompiledOp& op);
     void dispatch_gpt_oss_moe_act(const CompiledOp& op);
     void dispatch_silu(const CompiledOp& op);
+    void dispatch_softplus(const CompiledOp& op);
     void dispatch_gelu(const CompiledOp& op);
     void dispatch_relu2(const CompiledOp& op);
     void dispatch_mul(const CompiledOp& op);
@@ -534,6 +578,7 @@ public:
     void dispatch_gelu_glu_backward(const CompiledOp& op);
     void dispatch_gpt_oss_moe_act_backward(const CompiledOp& op);
     void dispatch_silu_backward(const CompiledOp& op);
+    void dispatch_softplus_backward(const CompiledOp& op);
     void dispatch_gelu_backward(const CompiledOp& op);
     void dispatch_relu2_backward(const CompiledOp& op);
     void dispatch_mul_backward(const CompiledOp& op);
@@ -757,6 +802,17 @@ private:
     float* mCustomDLossGpu = nullptr;
     const float* mInvTemperatureGpu = nullptr;
 
+    // Knowledge-distillation teacher context (null = KD inactive). Consumed by
+    // dispatch_fused_lm_head_loss_backward; also gates off the compact row path
+    // (KD + row compaction is unsupported).
+    const std::int32_t* mKdTopkIdsGpu = nullptr;   // [BT, K] teacher top-K ids
+    const float* mKdTopkLogprobsGpu = nullptr;     // [BT, K] raw teacher logprobs
+    float* mKdLossAccumGpu = nullptr;              // [1] KD loss accumulator
+    int mKdTopK = 0;
+    float mKdTemperature = 1.0f;
+    float mKdWeight = 0.0f;
+    float mKdCeWeight = 1.0f;
+
     // --- LM-head row-compaction state (shared across forward/backward) ---
     // Lazily allocated owned device buffers, shared between dispatch_fused_lm_head_loss_compact
     // and its matching backward inside one micro-step. Sized to the current BT. Only used when
@@ -770,6 +826,47 @@ private:
     const std::vector<std::string>* mSkippedBackwardTensors = nullptr;
 
     // Document masking context for Flash Attention varlen (null = disabled)
+    /// Chunked-sequence carry for a GDN (gated delta rule) layer: per-chunk
+    /// initial states (slot c = state BEFORE chunk c, BF16 as the kernel
+    /// expects; slot 0 stays zero) and the FP32 reverse d-state carry.
+    struct ChunkGdnState {
+        nv_bfloat16* states = nullptr;  ///< [(num_chunks+1) * elems]
+        float* d_state = nullptr;       ///< [elems] — d_final for the previous chunk
+        std::size_t elems = 0;          ///< B*H*K*V
+    };
+    std::unordered_map<int, ChunkGdnState> mChunkGdn;  ///< by layer_idx
+    ChunkGdnState& chunk_gdn_state(long elems, int key);
+
+    /// Chunked-sequence carry for a causal conv layer: per-chunk input tails
+    /// (slot c = last kernel-1 columns BEFORE chunk c; slot 0 zero) and the
+    /// reverse d-tail carry.
+    struct ChunkConvState {
+        void* tails = nullptr;     ///< [(num_chunks+1) * elems] input dtype
+        void* d_tail = nullptr;    ///< [elems]
+        std::size_t elems = 0;     ///< B*conv_dim*(kernel-1)
+        ETensorDType dtype = ETensorDType::BF16;
+    };
+    std::unordered_map<int, ChunkConvState> mChunkConv;  ///< by layer_idx
+    ChunkConvState& chunk_conv_state(long elems, ETensorDType dtype, int key);
+
+    struct ChunkAttnState {
+        nv_bfloat16* k = nullptr;
+        nv_bfloat16* v = nullptr;
+        float* dk = nullptr;
+        float* dv = nullptr;
+        std::size_t kv_elems = 0;
+    };
+    std::unordered_map<int, ChunkAttnState> mChunkAttn;  ///< by layer_idx
+    int mChunkIdx = -1;
+    int mChunkCount = 0;
+    std::int32_t* mChunkCuDev = nullptr;   ///< device: cu_q then cu_k
+    std::int32_t* mChunkCuPinned = nullptr;
+    std::size_t mChunkCuCap = 0;  ///< capacity in int32 entries (both arrays)
+    int mChunkCuUploaded = -1;  ///< chunk idx whose cu arrays are on device
+    IModel::ChunkPackMeta mChunkPack;  ///< active chunk's document geometry
+    void ensure_chunk_cu_uploaded();
+    ChunkAttnState& chunk_attn_state(int layer_idx, int Hkv, int Hs);
+
     const std::int32_t* mCuSeqlensGpu = nullptr;
     const std::int32_t* mCuSeqlensCpu = nullptr;
     int mNumDocs = 0;
@@ -1002,6 +1099,12 @@ private:
     Tensor mMoEExpertOffsets;              // Views into mMoEExpertOffsetsData
     void* mMoEExpertOffsetsGPU = nullptr;  // Persistent GPU buffer (not stack-allocated)
     size_t mMoEExpertOffsetsGPUSize = 0;   // Size in bytes
+    // Pinned staging for the offsets D2H: pageable async D2H can block inside
+    // the driver's staging pool when all worker threads copy at once, which
+    // convoys with in-stream NCCL kernels into a cross-rank deadlock.
+    bool mInBackwardPass = false;  // true while execute_backward runs (incl. replay)
+    void* mMoEOffsetsPinned = nullptr;
+    size_t mMoEOffsetsPinnedBytes = 0;
 
     // Host-side MoE expert offsets cache.
     // Key is layer_idx for non-EP, ep_state_key(layer_idx) for EP.

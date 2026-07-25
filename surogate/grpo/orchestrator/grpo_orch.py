@@ -1,7 +1,6 @@
 import asyncio
 import dataclasses
 import multiprocessing as mp
-import os
 import random
 import sys
 import time
@@ -13,17 +12,27 @@ import yaml
 from surogate.grpo.orchestrator.advantage import compute_advantages
 from surogate.grpo.orchestrator.eval_utils import compute_eval_ckpt_step, get_eval_sampling_args
 from surogate.grpo.orchestrator.event_loop_lag import EventLoopLagMonitor
-from surogate.grpo.orchestrator.patches import monkey_patch_chat_completion_logprobs, monkey_patch_oai_iterable_types
+from surogate.grpo.orchestrator.depth_controller import DepthObservation, RolloutDepthController
+from surogate.grpo.orchestrator.patches import (
+    monkey_patch_chat_completion_logprobs,
+    monkey_patch_multiturn_env_depth_cap,
+    monkey_patch_oai_iterable_types,
+)
 from surogate.grpo.orchestrator.trajectories import interleave_rollout
 from surogate.grpo.transport import TrainingBatch, TrainingSample, setup_training_batch_sender
 from surogate.grpo.utils.asynyc_utils import safe_cancel
-from surogate.grpo.utils.pathing import get_ckpt_dir, get_log_dir
+from surogate.grpo.utils.pathing import get_log_dir
 
 # This monkey patch is necessary to avoid Pydantic validating fields using typing.Iterable (e.g. in multimodal or tool call messages) lazily which leads to tokenization errors, for more info see https://github.com/PrimeIntellect-ai/prime-rl/pull/1249
 monkey_patch_oai_iterable_types()
 
 # This monkey patch is necessary to avoid heavy CPU overhead from constructing the OAI ChatCompletion Pydantic model with logprobs, for more info see https://github.com/PrimeIntellect-ai/prime-rl/pull/1189
 monkey_patch_chat_completion_logprobs()
+
+# Let MultiTurnEnv honor a per-rollout depth cap from `info`. Must run before any
+# environment is constructed: Environment.__post_init__ snapshots bound stop-condition
+# methods, so a later patch would never be registered.
+monkey_patch_multiturn_env_depth_cap()
 
 # Import environment before any other imports
 
@@ -38,9 +47,6 @@ from surogate.grpo.orchestrator.ckpt import Progress, setup_ckpt_manager
 from surogate.grpo.orchestrator.eval_utils import evaluate_env
 from surogate.grpo.orchestrator.filters import apply_filters, setup_filters
 from surogate.grpo.orchestrator.scheduler import Scheduler
-from surogate.grpo.orchestrator.replay import ReplayBatchSource
-from surogate.grpo.orchestrator.spool import InflightSpool
-from surogate.grpo.orchestrator.trainability import exclude_non_trainable_rollouts
 from surogate.grpo.orchestrator.utils import (
     compute_teacher_logprobs,
     get_sampling_args,
@@ -349,11 +355,6 @@ async def orchestrate(config: GRPOOrchestratorConfig):
             else:
                 checkpoint_step = config.ckpt.resume_step
 
-        inflight_spool = None
-        if config.ckpt and config.ckpt.spool_inflight:
-            inflight_spool = InflightSpool(get_ckpt_dir(Path(config.output_dir)) / "inflight_spool.jsonl")
-            logger.info(f"In-flight rollout spool enabled at {inflight_spool.path}")
-
         scheduler = Scheduler(
             env=train_env_group,
             buffer=buffer,
@@ -366,8 +367,32 @@ async def orchestrate(config: GRPOOrchestratorConfig):
             lora_name=config.model.lora_adapter,
             deferred_group_scoring_tasks=train_env_deferred_group_scoring_tasks,
             config=config,
-            spool=inflight_spool,
         )
+
+        # Adaptive rollout-depth budgeting. max_depth defaults to the largest
+        # max_turns configured across training envs, so the cap can never exceed
+        # what the environments would have run anyway.
+        depth_cfg = config.rollout_depth
+        env_max_turns = [
+            int(env.args["max_turns"])
+            for env in (config.env or [])
+            if isinstance(env.args, dict) and isinstance(env.args.get("max_turns"), int)
+        ]
+        depth_controller = RolloutDepthController(
+            enabled=bool(depth_cfg.enabled),
+            max_depth=int(depth_cfg.max_depth or (max(env_max_turns) if env_max_turns else 32)),
+            min_depth=int(depth_cfg.min_depth),
+            quantile=float(depth_cfg.quantile),
+            ema=float(depth_cfg.ema),
+            probe_interval=int(depth_cfg.probe_interval),
+            warmup_steps=int(depth_cfg.warmup_steps),
+            min_observations=int(depth_cfg.min_observations),
+        )
+        if depth_controller.enabled:
+            logger.info(
+                f"Adaptive rollout depth enabled (quantile={depth_controller.quantile}, "
+                f"max_depth={depth_controller.max_depth}, probe every {depth_controller.probe_interval} steps)"
+            )
 
         if checkpoint_step is not None and config.model.lora_adapter is not None:
             assert config.model.lora_adapter is not None
@@ -403,16 +428,6 @@ async def orchestrate(config: GRPOOrchestratorConfig):
         # Setup training batch sender for sending training examples to trainer
         logger.info(f"Initializing training batch sender ({config.rollout_transport})")
         training_batch_sender = setup_training_batch_sender(Path(config.output_dir), config.rollout_transport)
-        replay_source = (
-            ReplayBatchSource.load(config.replay)
-            if config.replay is not None
-            else None
-        )
-        if replay_source is not None:
-            logger.info(
-                f"Loaded {len(replay_source.samples)} frozen replay samples; "
-                f"{replay_source.samples_per_step} will be appended to every update"
-            )
 
         # Track last online eval checkpoint step for this process
         last_eval_step = -1
@@ -444,34 +459,6 @@ async def orchestrate(config: GRPOOrchestratorConfig):
             await inference_pool.update_weights(weights_path, lora_name=lora_name, step=scheduler.ckpt_step)
         else:
             logger.info("Training from scratch")
-            start_step_override = os.environ.get("SUROGATE_GRPO_START_STEP")
-            if start_step_override:
-                progress.step = int(start_step_override)
-                logger.info(f"Starting orchestrator from override step {progress.step}")
-                scheduler.step = progress.step
-                scheduler.ckpt_step = progress.step
-                prev_ckpt_step = progress.step - 1
-                if config.model.lora_adapter is not None:
-                    check_exists = config.weight_broadcast.type != "nccl"
-                    wait_timeout = int(os.environ.get("SUROGATE_GRPO_RESUME_WAIT_FOR_WEIGHTS_TIMEOUT", "600"))
-                    weights_path = get_weight_dir(
-                        Path(config.output_dir),
-                        progress.step,
-                        check_exists=check_exists,
-                        wait_timeout=wait_timeout,
-                    )
-                    await inference_pool.update_weights(
-                        weights_path,
-                        lora_name=config.model.lora_adapter,
-                        step=progress.step,
-                    )
-                    scheduler.model_name = config.model.lora_adapter
-                    logger.info(f"Loaded override policy weights for step {progress.step}")
-
-        # Restore in-flight groups persisted by the previous process (no-op when the
-        # spool is disabled or empty). Runs after progress.step is final so the
-        # off-policy staleness window is anchored correctly.
-        scheduler.restore_from_spool(progress.step)
 
         # Iterate over dataset in batches
         max_steps = config.max_steps or int(1e9)
@@ -592,6 +579,9 @@ async def orchestrate(config: GRPOOrchestratorConfig):
             temperature = compute_temperature(progress.step, config.sampling, config.max_steps)
             sampling_args = get_sampling_args(config.sampling, temperature=temperature)
             scheduler.set_sampling_args(sampling_args)
+            # Cap rollout depth for this step (None on probe/warmup steps, which run
+            # to the env's own max_turns and are the only source of depth statistics).
+            scheduler.set_depth_cap(depth_controller.cap_for_step(progress.step))
             train_task = asyncio.create_task(scheduler.generate_batch(step=progress.step))
 
             # Schedule running validation at the specified interval
@@ -617,12 +607,18 @@ async def orchestrate(config: GRPOOrchestratorConfig):
             generate_completions_time = scheduler.last_batch_generation_time
             train_rollouts = train_task.result()
 
-            # Group rollouts by example so compute_advantages' positional
-            # (num_problems, rollouts_per_example) reshape aligns with GRPO groups.
-            # Async generation / buffer batching can return rollouts out of example
-            # order, which otherwise mixes examples across advantage groups and cancels
-            # the gradient to ~0. Stable sort preserves intra-example order.
-            train_rollouts.sort(key=lambda r: str(r["example_id"]))
+            # Feed observed completion depths back to the depth controller. Only
+            # probe steps are folded in (see RolloutDepthController.observe).
+            depth_controller.observe(
+                progress.step,
+                [
+                    DepthObservation(
+                        depth=len(r.get("trajectory") or []),
+                        success=float(r.get("reward") or 0.0) > 0.0,
+                    )
+                    for r in train_rollouts
+                ],
+            )
 
             # Apply rollout filters (zeros reward/mask for degenerate generations)
             filter_metrics = apply_filters(rollout_filters, train_rollouts)
@@ -633,20 +629,8 @@ async def orchestrate(config: GRPOOrchestratorConfig):
             num_unique_examples = len(set(example_ids))
             rewards = [r["reward"] for r in train_rollouts]
             completion_lens = [get_completion_len(r) for r in train_rollouts]
-            # Exclude non-trainable rollouts (e.g. provider/harness/grader failures the
-            # env flags via `trainable_metric`) from both the loss mask and the per-group
-            # advantage baseline, so infrastructure failures are not learned as negatives.
-            if config.trainable_metric:
-                advantage_rewards, trainability_metrics = exclude_non_trainable_rollouts(
-                    train_rollouts,
-                    rewards,
-                    config.rollouts_per_example,
-                    config.trainable_metric,
-                )
-            else:
-                advantage_rewards, trainability_metrics = rewards, {}
             advantages = compute_advantages(
-                advantage_rewards,
+                rewards,
                 completion_lens,
                 config.rollouts_per_example,
                 config.advantage,
@@ -712,14 +696,6 @@ async def orchestrate(config: GRPOOrchestratorConfig):
                     train_example.teacher_logprobs = teacher_logprobs
                 teacher_logprobs_time = time.perf_counter() - teacher_logprobs_start_time
                 logger.debug(f"Computed teacher logprobs in {teacher_logprobs_time:.2f}s")
-
-            if replay_source is not None:
-                replay_examples = replay_source.examples_for_step(progress.step)
-                train_examples.extend(replay_examples)
-                logger.info(
-                    f"Appended {len(replay_examples)} accepted replay samples to "
-                    f"optimizer step {progress.step}"
-                )
 
             training_batch = TrainingBatch(
                 examples=train_examples,
@@ -883,14 +859,14 @@ async def orchestrate(config: GRPOOrchestratorConfig):
                 "time/parallel_preprocess": parallel_preprocess_time,
                 # Scheduler metrics
                 **scheduler.get_metrics(),
+                # Adaptive rollout-depth controller
+                **depth_controller.metrics(),
                 # Buffer metrics
                 **buffer.get_metrics(),
                 # Event loop lag metrics
                 **event_loop_lag_monitor.get_metrics(),
                 # Rollout filter metrics
                 **filter_metrics,
-                # Non-trainable rollout exclusion metrics
-                **trainability_metrics,
                 # W&B axis
                 "step": progress.step,
             }

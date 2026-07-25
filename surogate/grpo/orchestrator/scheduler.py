@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import time
 from collections import Counter, defaultdict
 from dataclasses import field
@@ -13,7 +12,7 @@ from aiolimiter import AsyncLimiter
 from surogate.core.config.grpo_orch_config import GRPOOrchestratorConfig
 from surogate.grpo.orchestrator.advantage import dataclass
 from surogate.grpo.orchestrator.buffer import Buffer
-from surogate.grpo.orchestrator.spool import InflightSpool
+from surogate.grpo.orchestrator.patches import ROLLOUT_DEPTH_CAP_KEY
 from surogate.grpo.orchestrator.utils import get_sampling_args
 from surogate.grpo.orchestrator.vf_utils import get_seq_len, run_rollout
 from surogate.grpo.utils.asynyc_utils import safe_cancel, safe_cancel_all
@@ -45,7 +44,6 @@ class GroupState:
     rollouts_to_schedule: int
     completed_rollouts: list[vf.RolloutOutput] = field(default_factory=list)
     pinned_client: vf.ClientConfig | None = None
-    failed_rollouts: int = 0
 
 
 class Scheduler:
@@ -72,7 +70,6 @@ class Scheduler:
         tasks_per_minute: int | None,
         lora_name: str | None = None,
         deferred_group_scoring_tasks: set[str] | None = None,
-        spool: InflightSpool | None = None,
     ):
         self.logger = get_logger()
         if tasks_per_minute is not None:
@@ -100,6 +97,9 @@ class Scheduler:
 
         self.max_retries_by_task = {env.resolved_name: env.max_retries for env in config.env}
 
+        # Adaptive rollout-depth cap; None until the controller emits one.
+        self.depth_cap: int | None = None
+
         self.deferred_group_scoring_tasks = set(deferred_group_scoring_tasks or ())
         if self.deferred_group_scoring_tasks:
             task_list = ", ".join(sorted(self.deferred_group_scoring_tasks))
@@ -111,19 +111,12 @@ class Scheduler:
         # Track in-flight group-scoring tasks (one per completed group, awaits the
         # rubric's score_group call). Persisted across generate_batch calls so a
         # scoring task that finishes after batch_progress hits its target is still
-        # consumed on the next step rather than discarded. Values: (task_name, group_id).
-        self.scoring_tasks: dict[asyncio.Task, tuple[str, int]] = {}
+        # consumed on the next step rather than discarded.
+        self.scoring_tasks: dict[asyncio.Task, str] = {}
 
         # Track in-progress groups while rollouts are generated independently.
         self.next_group_id = 0
         self.groups: dict[int, GroupState] = {}
-
-        # Optional persistence of in-flight groups across restarts. Restored groups
-        # re-enter self.groups; complete ones (killed after their last rollout but
-        # before reaching the buffer) are drained through the normal acceptance path
-        # at the start of the next generate_batch.
-        self.spool = spool
-        self._group_ckpt_step: dict[int, int] = {}
 
         self.step, self.ckpt_step = 0, 0
         self.checkpoint_ready = asyncio.Event()
@@ -137,8 +130,6 @@ class Scheduler:
         self.errored_rollouts_by_task: dict[str, int] = defaultdict(int)
         self.total_rollouts_by_task: dict[str, int] = defaultdict(int)
         self.last_batch_generation_time = 0.0
-        self.max_group_rollout_failures = int(os.environ.get("SUROGATE_GRPO_MAX_GROUP_ROLLOUT_FAILURES", "8"))
-        self.progress_log_interval = float(os.environ.get("SUROGATE_GRPO_PROGRESS_LOG_INTERVAL", "60"))
 
     @property
     def uses_token_batching(self) -> bool:
@@ -165,6 +156,23 @@ class Scheduler:
     def set_sampling_args(self, sampling_args: dict) -> None:
         """Update sampling args for future rollout requests."""
         self.sampling_args = sampling_args
+
+    def set_depth_cap(self, cap: int | None) -> None:
+        """Cap rollout depth for future rollout requests (None = env's own max_turns)."""
+        self.depth_cap = cap
+
+    def _example_with_depth_cap(self, example: dict) -> dict:
+        """Attach the current depth cap to a copy of `example`.
+
+        The cap rides in `info` so it reaches environments running in a separate
+        server process. Copied rather than mutated: `example` is owned by the
+        buffer and shared across the group's rollouts.
+        """
+        if self.depth_cap is None:
+            return example
+        info = dict(example.get("info") or {})
+        info[ROLLOUT_DEPTH_CAP_KEY] = int(self.depth_cap)
+        return {**example, "info": info}
 
     async def cancel_inflight_rollouts(self):
         """Cancel all in-flight rollout requests.
@@ -211,10 +219,7 @@ class Scheduler:
                 continue
             self.inflight_requests.pop(task, None)
             tasks_to_cancel.append(task)
-        dropped = self.groups.pop(group_id, None)
-        if self.spool and dropped is not None:
-            self._group_ckpt_step.pop(group_id, None)
-            self.spool.group_dropped(group_id)
+        self.groups.pop(group_id, None)
         await safe_cancel_all(tasks_to_cancel)
         return len(tasks_to_cancel)
 
@@ -237,7 +242,7 @@ class Scheduler:
             run_rollout(
                 env=self.env,
                 client=client_config,
-                example=group.example,
+                example=self._example_with_depth_cap(group.example),
                 model_name=self.model_name,
                 sampling_args=self.sampling_args,
                 max_retries=self.max_retries_by_task.get(group.example["task"], 0),
@@ -270,9 +275,6 @@ class Scheduler:
         group_id = self.next_group_id
         self.next_group_id += 1
         self.groups[group_id] = GroupState(example=example, rollouts_to_schedule=self.rollouts_per_example)
-        if self.spool:
-            self._group_ckpt_step[group_id] = self.ckpt_step
-            self.spool.group_start(group_id, self.ckpt_step, example)
         await self.schedule_rollout(group_id=group_id)
         return True
 
@@ -392,41 +394,6 @@ class Scheduler:
         await env_for_task.rubric.score_group(cast(list[vf.State], completed_rollouts))
         return completed_rollouts
 
-    def restore_from_spool(self, current_step: int) -> None:
-        """Rebuilds in-flight groups persisted by a previous process.
-
-        Restored groups re-enter self.groups with fresh ids; missing rollouts are
-        topped up by normal scheduling, and already-complete groups are drained at
-        the start of the next generate_batch. Groups whose generation weights fall
-        outside the max_off_policy_steps window were discarded at load."""
-        if self.spool is None:
-            return
-        restored = self.spool.load(current_step, self.max_off_policy_steps)
-        # Same env filter buffer.load applies to its rollout cache: a group whose env was
-        # renamed/removed since it was spooled has nowhere to report its metrics — drop it.
-        known_envs = set(self.buffer.env_names)
-        dropped = [g for g in restored if g.example.get("task") not in known_envs]
-        if dropped:
-            self.logger.warning(f"Discarded {len(dropped)} spooled group(s) from unknown env(s)")
-            restored = [g for g in restored if g not in dropped]
-        if not restored:
-            return
-        num_rollouts = 0
-        for saved in restored:
-            group_id = self.next_group_id
-            self.next_group_id += 1
-            self.groups[group_id] = GroupState(
-                example=saved.example,
-                rollouts_to_schedule=max(self.rollouts_per_example - len(saved.completed_rollouts), 0),
-                completed_rollouts=list(saved.completed_rollouts),
-                failed_rollouts=saved.failed_rollouts,
-            )
-            self._group_ckpt_step[group_id] = saved.ckpt_step
-            num_rollouts += len(saved.completed_rollouts)
-        self.logger.info(
-            f"Restored {len(restored)} in-flight group(s) with {num_rollouts} completed rollout(s) from the spool"
-        )
-
     async def generate_batch(self, step: int) -> list[vf.RolloutOutput]:
         """Continuously generates a batch of rollouts."""
         self.step = step
@@ -441,7 +408,6 @@ class Scheduler:
         self.update_policy_task = asyncio.create_task(self.update_policy_loop())
 
         batch_start_time = time.perf_counter()
-        last_progress_log = batch_start_time
 
         self.logger.debug("Starting to generate batch rollouts")
 
@@ -450,38 +416,6 @@ class Scheduler:
         pbar = ProgressTracker(
             total=self.batch_target, desc="Generating rollouts (train)", json_logging=self.json_logging, step=step
         )
-
-        def _accept(completed: list[vf.RolloutOutput], done_group_id: int | None) -> None:
-            """Route a scored group into the buffer and the batch. Deliberately NOT marked
-            done in the spool: accepted rollouts live only in the local batch list until the
-            bin is written, so a mid-step kill must resurrect the group (re-accepting is
-            idempotent — the pool move re-checks membership, counters are cosmetic). The
-            step-boundary compaction erases banked groups once the batch is safely on disk."""
-            nonlocal batch_progress
-            self.buffer.update(completed)
-            accepted_rollouts = self.buffer.sample_rollouts(n=self.rollouts_per_example)
-            batch_rollouts.extend(accepted_rollouts)
-            progress_increment = self.get_batch_progress_increment(accepted_rollouts)
-            batch_progress += progress_increment
-            pbar.update(progress_increment)
-            if self.spool and done_group_id is not None:
-                self._group_ckpt_step.pop(done_group_id, None)
-
-        if self.spool:
-            # Bound the spool to live groups, then drain groups restored complete
-            # (all rollouts present; killed between completion and the buffer).
-            self.spool.compact(self.groups, self._group_ckpt_step)
-            complete_gids = [
-                gid for gid, g in self.groups.items() if len(g.completed_rollouts) >= self.rollouts_per_example
-            ]
-            for gid in complete_gids:
-                completed = self.groups.pop(gid).completed_rollouts
-                task_name = completed[0]["task"]
-                if self._should_defer_group_scoring(task_name):
-                    scoring_task = asyncio.create_task(self._score_group_if_deferred(completed))
-                    self.scoring_tasks[scoring_task] = (task_name, gid)
-                else:
-                    _accept(completed, gid)
 
         while batch_progress < self.batch_target:
             await self._fill_inflight_requests()
@@ -502,33 +436,13 @@ class Scheduler:
             )
             await self.checkpoint_ready.wait()
 
-            # Periodic human-readable progress: accepted rollouts vs target, elapsed, and
-            # each live group's completion + wins (the env server's "Pending tasks" line
-            # only knows its queue depth; this is the real step state).
-            now = time.perf_counter()
-            if now - last_progress_log >= self.progress_log_interval:
-                last_progress_log = now
-                parts = []
-                for g in sorted(self.groups.values(), key=lambda g: -len(g.completed_rollouts))[:6]:
-                    kind = str(g.example.get("task", "?")).rsplit("_", 1)[-1]
-                    rewards = [r.get("reward") for r in g.completed_rollouts]
-                    wins = sum(1 for r in rewards if r is not None and r >= 0.99)
-                    parts.append(f"{kind} {len(g.completed_rollouts)}/{self.rollouts_per_example} w{wins}")
-                more = len(self.groups) - 6
-                self.logger.info(
-                    f"Batch {step}: {batch_progress}/{self.batch_target} accepted "
-                    f"({batch_progress / max(self.batch_target, 1):.0%}) in {(now - batch_start_time) / 60:.0f}m"
-                    f" | live groups: {', '.join(parts) or 'none'}{f' +{more} more' if more > 0 else ''}"
-                    f" | in-flight {self.inflight_rollout_count}, scoring {len(self.scoring_tasks)}"
-                )
-
             for finished_task in finished_tasks:
                 if batch_progress >= self.batch_target:
                     break
 
                 # Branch 1: a group-scoring task has completed.
                 if finished_task in self.scoring_tasks:
-                    task_name, scored_group_id = self.scoring_tasks.pop(finished_task)
+                    task_name = self.scoring_tasks.pop(finished_task)
                     try:
                         completed_rollouts = finished_task.result()
                     except asyncio.CancelledError:
@@ -536,7 +450,12 @@ class Scheduler:
                     except Exception as e:
                         self.logger.warning(f"Group scoring failed for task {task_name!r}: {e}")
                         continue
-                    _accept(completed_rollouts, scored_group_id)
+                    self.buffer.update(completed_rollouts)
+                    accepted_rollouts = self.buffer.sample_rollouts(n=self.rollouts_per_example)
+                    batch_rollouts.extend(accepted_rollouts)
+                    progress_increment = self.get_batch_progress_increment(accepted_rollouts)
+                    batch_progress += progress_increment
+                    pbar.update(progress_increment)
                     continue
 
                 # Branch 2: a rollout has completed.
@@ -571,26 +490,14 @@ class Scheduler:
                             f"{rollout['error']['error_chain_repr']}"
                         )
                     if should_reschedule:
-                        group.failed_rollouts += 1
-                        if group.failed_rollouts >= self.max_group_rollout_failures:
-                            removed = await self.drop_group(group_id)
-                            self.cancelled_rollouts_count += removed
-                            self.logger.warning(
-                                f"Dropped group {group_id} ({task}) after "
-                                f"{group.failed_rollouts} empty/error rollout(s)"
-                            )
-                        else:
-                            group.rollouts_to_schedule += 1
+                        group.rollouts_to_schedule += 1
                         continue
 
                     group.completed_rollouts.append(rollout)
-                    if self.spool:
-                        self.spool.rollout(group_id, rollout)
                     if len(group.completed_rollouts) < self.rollouts_per_example:
                         continue
 
                     completed_rollouts = self.groups.pop(group_id).completed_rollouts
-                    completed_group_id = group_id
                 except asyncio.CancelledError:
                     if group_id is not None:
                         await self.drop_group(group_id)
@@ -605,9 +512,14 @@ class Scheduler:
                 # ongoing rollouts/scoring) or accept the rollouts directly.
                 if self._should_defer_group_scoring(rollout_info.task):
                     scoring_task = asyncio.create_task(self._score_group_if_deferred(completed_rollouts))
-                    self.scoring_tasks[scoring_task] = (rollout_info.task, completed_group_id)
+                    self.scoring_tasks[scoring_task] = rollout_info.task
                 else:
-                    _accept(completed_rollouts, completed_group_id)
+                    self.buffer.update(completed_rollouts)
+                    accepted_rollouts = self.buffer.sample_rollouts(n=self.rollouts_per_example)
+                    batch_rollouts.extend(accepted_rollouts)
+                    progress_increment = self.get_batch_progress_increment(accepted_rollouts)
+                    batch_progress += progress_increment
+                    pbar.update(progress_increment)
 
         await self._fill_inflight_requests()
 
@@ -625,8 +537,6 @@ class Scheduler:
         if self.inflight_policy_update_task is not None:
             await safe_cancel(self.inflight_policy_update_task)
             self.inflight_policy_update_task = None
-        if self.spool is not None:
-            self.spool.close()
 
     @property
     def max_off_policy_level(self) -> int:

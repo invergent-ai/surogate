@@ -22,12 +22,14 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <numeric>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -89,10 +91,37 @@ void permute_tokens_dtyped(Tensor& dst,
 /// Ensure a cudaMalloc'd buffer is at least `need` bytes. Reallocates
 /// (cudaFree → cudaMalloc) when the current capacity is insufficient.
 /// Returns true when the buffer grew.
+/// Poll-wait for a stream instead of cudaStreamSynchronize. The blocking driver
+/// wait showed rare lost-wakeup stalls (minutes; any signal resolved them) under
+/// this process's 8-worker-thread CUDA load; a query loop cannot miss completion.
+void stream_wait_spin(cudaStream_t stream) {
+    while (true) {
+        const cudaError_t st = cudaStreamQuery(stream);
+        if (st == cudaSuccess) {
+            return;
+        }
+        if (st != cudaErrorNotReady) {
+            CUDA_CHECK(st);
+        }
+        (void)cudaGetLastError();  // clear the sticky NotReady
+        std::this_thread::yield();
+    }
+}
+
 bool alloc_or_resize(void*& ptr, std::size_t& cur_bytes, std::size_t need) {
     if (cur_bytes >= need) return false;
     if (ptr) CUDA_CHECK(cudaFree(ptr));
-    CUDA_CHECK(cudaMalloc(&ptr, need));
+    const cudaError_t err = cudaMalloc(&ptr, need);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        ptr = nullptr;
+        cur_bytes = 0;
+        std::size_t free_b = 0, total_b = 0;
+        cudaMemGetInfo(&free_b, &total_b);
+        throw std::runtime_error("EP alloc_or_resize: cudaMalloc(" + std::to_string(need) +
+                                 ") failed: " + cudaGetErrorString(err) + " (device free " + std::to_string(free_b) +
+                                 "/" + std::to_string(total_b) + ")");
+    }
     cur_bytes = need;
     return true;
 }
@@ -204,6 +233,31 @@ EPStrategy::EPStrategy(const RuntimeOptions& options)
 
 EPStrategy::~EPStrategy() {
     cleanup_all();
+    for (auto& [slot, buf] : mPinnedScratch) {
+        if (buf.first) {
+            cudaFreeHost(buf.first);
+        }
+    }
+    mPinnedScratch.clear();
+}
+
+void* EPStrategy::pinned_scratch(int slot, std::size_t bytes) {
+    auto& buf = mPinnedScratch[slot];
+    if (buf.second < bytes) {
+        if (buf.first) {
+            CUDA_CHECK(cudaFreeHost(buf.first));
+        }
+        CUDA_CHECK(cudaHostAlloc(&buf.first, bytes, cudaHostAllocDefault));
+        buf.second = bytes;
+    }
+    return buf.first;
+}
+
+cudaStream_t EPStrategy::control_stream() {
+    if (!mControlStream) {
+        CUDA_CHECK(cudaStreamCreateWithFlags(&mControlStream, cudaStreamNonBlocking));
+    }
+    return mControlStream;
 }
 
 cudaStream_t EPStrategy::weight_transfer_stream() {
@@ -220,7 +274,13 @@ int EPStrategy::ep_state_key(int layer_idx, bool in_replay) const {
 }
 
 void EPStrategy::free_all_llep_layers() {
+    if (mPrefetched) {
+        mForeignArena.release(mPrefetched->arena_slot, nullptr);
+        mPrefetched.reset();
+    }
     for (auto& [_, state] : mLLEPStates) {
+        mForeignArena.release(state.arena_slot, nullptr);
+        state.arena_slot = -1;
         state.free_lora_gpu();
         state.free_foreign_gpu();
     }
@@ -228,6 +288,18 @@ void EPStrategy::free_all_llep_layers() {
 }
 
 void EPStrategy::cleanup_all() {
+    // During process teardown the CUDA context may already be unusable (the
+    // NCCL-termination helper can be detached mid-shutdown); freeing then
+    // segfaults. Probe once — leaking at exit is harmless.
+    if (cudaFree(nullptr) != cudaSuccess) {
+        (void)cudaGetLastError();
+        mEpStates.clear();
+        mLLEPStates.clear();
+        mEPLayerMeta.clear();
+        mWeightTransferStream = nullptr;
+        mControlStream = nullptr;
+        return;
+    }
     for (auto& [layer, state] : mEpStates) {
         state.free_gpu();
     }
@@ -235,9 +307,14 @@ void EPStrategy::cleanup_all() {
     free_all_llep_layers();
     mEPLayerMeta.clear();
     mBufferPool.clear_all();
+    mForeignArena.free_all();
     if (mWeightTransferStream) {
         cudaStreamDestroy(mWeightTransferStream);
         mWeightTransferStream = nullptr;
+    }
+    if (mControlStream) {
+        cudaStreamDestroy(mControlStream);
+        mControlStream = nullptr;
     }
 }
 
@@ -246,12 +323,11 @@ void EPStrategy::cleanup_all() {
 // ============================================================================
 
 bool LLEP::enable_llep_for_layer(bool separate_up_projection) const {
-    // LLEP transfers expert weights between EP peers and keeps merged
-    // per-expert device pointers for the MoE kernels. CPU-training /
-    // offload-master mode streams base weights through transient buffers, so
-    // those pointers are not stable enough for the LLEP transfer path. Static
-    // EP remains valid because it resolves only local experts at use time.
-    if (mOptions.CpuTraining || mOptions.OffloadMaster) {
+    // cpu_training: foreign expert weights are fetched straight from the shared
+    // GLOBAL pinned host masters (fetch_expert_weights_from_host) — always-valid
+    // pointers, no dependence on transient prefetch buffers. Bare offload_master
+    // (dispatch-PP) has no such shared global master and stays on static EP.
+    if (mOptions.OffloadMaster && !mOptions.CpuTraining) {
         return false;
     }
 
@@ -278,6 +354,8 @@ std::unique_ptr<EPStrategy> create_strategy(const RuntimeOptions& options) {
 
 struct EPStrategy::DispatchForwardCtx {
     int layer_idx = -1;
+    int arena_slot = -1;
+    bool reuse_fwd_merged_lora = false;
     int ep_size = 1;
     int ep_rank = 0;
     int ep_key = -1;
@@ -355,10 +433,10 @@ void EPStrategy::parse_forward_layout(CompiledExecutor& exec,
             printed_marker = true;
         }
     }
-    if ((mOptions.CpuTraining || mOptions.OffloadMaster) && supports_llep() && !ctx.llep_supported_for_layer) {
+    if ((mOptions.OffloadMaster && !mOptions.CpuTraining) && supports_llep() && !ctx.llep_supported_for_layer) {
         static bool warned = false;
         if (!warned && exec.mComm && exec.mComm->rank() == 0) {
-            fprintf(stderr, "[EP] LLEP disabled by cpu_training / offload_master.\n");
+            fprintf(stderr, "[EP] LLEP disabled by offload_master (dispatch-PP).\n");
             warned = true;
         }
     } else if (ctx.separate_up_projection && supports_llep() && !ctx.llep_supported_for_layer) {
@@ -392,22 +470,31 @@ void EPStrategy::detect_llep_imbalance(CompiledExecutor& exec, DispatchForwardCt
     const float threshold = mOptions.EPLoadBalanceThreshold;
     if (!ctx.llep_supported_for_layer || threshold >= 100.0f) return;
 
+    // The imbalance detection depends ONLY on host-side routing counts — run
+    // it on the dedicated EP control stream so its completion wait covers four
+    // tiny ops instead of the whole MainStream pipeline backlog (profiled as a
+    // dominant cost: full-stream waits per layer).
+    cudaStream_t cstream = control_stream();
     Tensor counts_gpu =
         exec.mRunState.temp_alloc(ETensorDType::INT32, {static_cast<long>(ctx.num_experts)}, "ep_expert_counts");
+    int* pin_counts = static_cast<int*>(pinned_scratch(1, static_cast<std::size_t>(ctx.num_experts) * sizeof(int)));
+    std::memcpy(pin_counts, ctx.local_expert_counts.data(), ctx.num_experts * sizeof(int));
     CUDA_CHECK(cudaMemcpyAsync(counts_gpu.Data,
-                               ctx.local_expert_counts.data(),
+                               pin_counts,
                                ctx.num_experts * sizeof(int),
                                cudaMemcpyHostToDevice,
-                               exec.mRunState.MainStream));
-    exec.mComm->all_reduce_sum_int_ep(counts_gpu.get<int>(), ctx.num_experts, exec.mRunState.MainStream);
+                               cstream));
+    exec.mComm->all_reduce_sum_int_ep(counts_gpu.get<int>(), ctx.num_experts, cstream);
 
     ctx.global_expert_counts.assign(ctx.num_experts, 0);
-    CUDA_CHECK(cudaMemcpyAsync(ctx.global_expert_counts.data(),
+    int* pin_gcounts = static_cast<int*>(pinned_scratch(2, static_cast<std::size_t>(ctx.num_experts) * sizeof(int)));
+    CUDA_CHECK(cudaMemcpyAsync(pin_gcounts,
                                counts_gpu.Data,
                                ctx.num_experts * sizeof(int),
                                cudaMemcpyDeviceToHost,
-                               exec.mRunState.MainStream));
-    CUDA_CHECK(cudaStreamSynchronize(exec.mRunState.MainStream));
+                               cstream));
+    stream_wait_spin(cstream);
+    std::memcpy(ctx.global_expert_counts.data(), pin_gcounts, ctx.num_experts * sizeof(int));
     exec.mTemps.push_back(counts_gpu);
 
     const float imbalance =
@@ -415,36 +502,42 @@ void EPStrategy::detect_llep_imbalance(CompiledExecutor& exec, DispatchForwardCt
     ctx.use_llep = (imbalance >= threshold);
 }
 
-void EPStrategy::plan_expert_mapping(DispatchForwardCtx& ctx) {
-    ctx.expert_to_gpu.assign(ctx.num_experts, 0);
-    if (ctx.use_llep) {
-        ctx.plan = ep::compute_lpt_plan(ctx.global_expert_counts.data(),
-                                        ctx.num_experts,
-                                        ctx.ep_size,
-                                        ctx.ep_rank,
-                                        ctx.num_local);
-        ctx.expert_to_gpu = ctx.plan.expert_to_gpu;
-    } else {
-        for (int e = 0; e < ctx.num_experts; ++e) {
-            ctx.expert_to_gpu[e] = e / ctx.num_local;
+void EPStrategy::plan_expert_mapping(DispatchForwardCtx& ctx, bool sticky) {
+    // Sticky reuse: the plan/merged-set fields were restored from the cache by
+    // the caller; only the per-batch derivations below (meta refresh +
+    // send_splits) still run.
+    if (!sticky) {
+        ctx.expert_to_gpu.assign(ctx.num_experts, 0);
+        if (ctx.use_llep) {
+            ctx.plan = ep::compute_lpt_plan(ctx.global_expert_counts.data(),
+                                            ctx.num_experts,
+                                            ctx.ep_size,
+                                            ctx.ep_rank,
+                                            ctx.num_local);
+            ctx.expert_to_gpu = ctx.plan.expert_to_gpu;
+        } else {
+            for (int e = 0; e < ctx.num_experts; ++e) {
+                ctx.expert_to_gpu[e] = e / ctx.num_local;
+            }
         }
-    }
 
-    ctx.merged_experts.clear();
-    for (int e = 0; e < ctx.num_experts; ++e) {
-        if (ctx.expert_to_gpu[e] == ctx.ep_rank) ctx.merged_experts.push_back(e);
-    }
-    ctx.num_merged = static_cast<int>(ctx.merged_experts.size());
+        ctx.merged_experts.clear();
+        for (int e = 0; e < ctx.num_experts; ++e) {
+            if (ctx.expert_to_gpu[e] == ctx.ep_rank) ctx.merged_experts.push_back(e);
+        }
+        ctx.num_merged = static_cast<int>(ctx.merged_experts.size());
 
-    ctx.global_to_merged.assign(ctx.num_experts, -1);
-    for (int m = 0; m < ctx.num_merged; ++m)
-        ctx.global_to_merged[ctx.merged_experts[m]] = m;
+        ctx.global_to_merged.assign(ctx.num_experts, -1);
+        for (int m = 0; m < ctx.num_merged; ++m)
+            ctx.global_to_merged[ctx.merged_experts[m]] = m;
+    }
 
     auto& meta = mEPLayerMeta[ctx.ep_key];
     meta.num_merged = ctx.num_merged;
     meta.native_start = ctx.ep_rank * ctx.num_local;
     meta.num_local = ctx.num_local;
     meta.merged_to_global = ctx.merged_experts;
+    meta.expert_to_gpu = ctx.expert_to_gpu;
 
     ctx.send_splits.assign(ctx.ep_size, 0);
     for (int e = 0; e < ctx.num_experts; ++e) {
@@ -459,15 +552,20 @@ Tensor EPStrategy::apply_llep_send_reorder(CompiledExecutor& exec,
     // H2D uploads for the fused kernel.
     Tensor offsets_gpu =
         exec.mRunState.temp_alloc(ETensorDType::INT32, {static_cast<long>(ctx.num_experts + 1)}, "ep_offsets_gpu");
+    int* pin_offsets =
+        static_cast<int*>(pinned_scratch(7, static_cast<std::size_t>(ctx.num_experts + 1) * sizeof(int)));
+    std::memcpy(pin_offsets, ctx.expert_offsets.data(), (ctx.num_experts + 1) * sizeof(int));
     CUDA_CHECK(cudaMemcpyAsync(offsets_gpu.Data,
-                               ctx.expert_offsets.data(),
+                               pin_offsets,
                                (ctx.num_experts + 1) * sizeof(int),
                                cudaMemcpyHostToDevice,
                                exec.mRunState.MainStream));
 
     Tensor e2g_gpu = exec.mRunState.temp_alloc(ETensorDType::INT32, {static_cast<long>(ctx.num_experts)}, "ep_e2g_gpu");
+    int* pin_e2g = static_cast<int*>(pinned_scratch(8, static_cast<std::size_t>(ctx.num_experts) * sizeof(int)));
+    std::memcpy(pin_e2g, ctx.expert_to_gpu.data(), ctx.num_experts * sizeof(int));
     CUDA_CHECK(cudaMemcpyAsync(e2g_gpu.Data,
-                               ctx.expert_to_gpu.data(),
+                               pin_e2g,
                                ctx.num_experts * sizeof(int),
                                cudaMemcpyHostToDevice,
                                exec.mRunState.MainStream));
@@ -521,23 +619,32 @@ Tensor EPStrategy::apply_llep_send_reorder(CompiledExecutor& exec,
 }
 
 void EPStrategy::exchange_token_splits(CompiledExecutor& exec, DispatchForwardCtx& ctx) {
+    // Count exchanges depend only on host-side routing counts — run them on
+    // the dedicated EP control stream so the completion wait below covers a
+    // few tiny ops instead of the whole MainStream pipeline backlog.
+    cudaStream_t cstream = control_stream();
     // A2A #1: per-GPU token splits (1 int per peer).
     Tensor send_splits_gpu =
         exec.mRunState.temp_alloc(ETensorDType::INT32, {static_cast<long>(ctx.ep_size)}, "ep_send_splits_gpu");
     Tensor recv_splits_gpu =
         exec.mRunState.temp_alloc(ETensorDType::INT32, {static_cast<long>(ctx.ep_size)}, "ep_recv_splits_gpu");
+    // All small host<->device count copies below go through PINNED staging:
+    // pageable async copies can block in the driver's staging pool and convoy
+    // across worker threads into a cross-rank deadlock (observed under LLEP).
+    int* pin_send_splits = static_cast<int*>(pinned_scratch(3, static_cast<std::size_t>(ctx.ep_size) * sizeof(int)));
+    std::memcpy(pin_send_splits, ctx.send_splits.data(), ctx.ep_size * sizeof(int));
     CUDA_CHECK(cudaMemcpyAsync(send_splits_gpu.Data,
-                               ctx.send_splits.data(),
+                               pin_send_splits,
                                ctx.ep_size * sizeof(int),
                                cudaMemcpyHostToDevice,
-                               exec.mRunState.MainStream));
+                               cstream));
     std::vector<int> ones(ctx.ep_size, 1);
     exec.mComm->all_to_all_single(reinterpret_cast<const std::byte*>(send_splits_gpu.Data),
                                   reinterpret_cast<std::byte*>(recv_splits_gpu.Data),
                                   ones.data(),
                                   ones.data(),
                                   sizeof(int),
-                                  exec.mRunState.MainStream);
+                                  cstream);
 
     // A2A #2: per-expert counts (num_experts ints per peer).
     Tensor send_ec_gpu = exec.mRunState.temp_alloc(ETensorDType::INT32,
@@ -546,13 +653,15 @@ void EPStrategy::exchange_token_splits(CompiledExecutor& exec, DispatchForwardCt
     Tensor recv_ec_gpu = exec.mRunState.temp_alloc(ETensorDType::INT32,
                                                    {static_cast<long>(ctx.num_experts * ctx.ep_size)},
                                                    "ep_recv_ec_gpu");
+    int* pin_ec = static_cast<int*>(pinned_scratch(4, static_cast<std::size_t>(ctx.num_experts) * sizeof(int)));
+    std::memcpy(pin_ec, ctx.local_expert_counts.data(), ctx.num_experts * sizeof(int));
     for (int p = 0; p < ctx.ep_size; ++p) {
         CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(send_ec_gpu.Data) +
                                        static_cast<std::size_t>(p) * ctx.num_experts * sizeof(int),
-                                   ctx.local_expert_counts.data(),
+                                   pin_ec,
                                    ctx.num_experts * sizeof(int),
                                    cudaMemcpyHostToDevice,
-                                   exec.mRunState.MainStream));
+                                   cstream));
     }
     std::vector<int> ec_send_splits(ctx.ep_size, ctx.num_experts);
     std::vector<int> ec_recv_splits(ctx.ep_size, ctx.num_experts);
@@ -561,21 +670,26 @@ void EPStrategy::exchange_token_splits(CompiledExecutor& exec, DispatchForwardCt
                                   ec_send_splits.data(),
                                   ec_recv_splits.data(),
                                   sizeof(int),
-                                  exec.mRunState.MainStream);
+                                  cstream);
 
     ctx.recv_splits.assign(ctx.ep_size, 0);
-    CUDA_CHECK(cudaMemcpyAsync(ctx.recv_splits.data(),
+    int* pin_recv_splits = static_cast<int*>(pinned_scratch(5, static_cast<std::size_t>(ctx.ep_size) * sizeof(int)));
+    CUDA_CHECK(cudaMemcpyAsync(pin_recv_splits,
                                recv_splits_gpu.Data,
                                ctx.ep_size * sizeof(int),
                                cudaMemcpyDeviceToHost,
-                               exec.mRunState.MainStream));
+                               cstream));
     ctx.recv_all_counts.assign(ctx.num_experts * ctx.ep_size, 0);
-    CUDA_CHECK(cudaMemcpyAsync(ctx.recv_all_counts.data(),
+    int* pin_recv_ec = static_cast<int*>(
+        pinned_scratch(6, static_cast<std::size_t>(ctx.num_experts) * ctx.ep_size * sizeof(int)));
+    CUDA_CHECK(cudaMemcpyAsync(pin_recv_ec,
                                recv_ec_gpu.Data,
                                ctx.num_experts * ctx.ep_size * sizeof(int),
                                cudaMemcpyDeviceToHost,
-                               exec.mRunState.MainStream));
-    CUDA_CHECK(cudaStreamSynchronize(exec.mRunState.MainStream));
+                               cstream));
+    stream_wait_spin(cstream);
+    std::memcpy(ctx.recv_splits.data(), pin_recv_splits, ctx.ep_size * sizeof(int));
+    std::memcpy(ctx.recv_all_counts.data(), pin_recv_ec, ctx.num_experts * ctx.ep_size * sizeof(int));
     exec.mTemps.push_back(send_splits_gpu);
     exec.mTemps.push_back(recv_splits_gpu);
     exec.mTemps.push_back(send_ec_gpu);
@@ -597,6 +711,28 @@ bool EPStrategy::launch_llep_transfers(CompiledExecutor& exec,
     native_gate_up_out = &exec.mWeights.get(ctx.layer_prefix + ctx.up_weight_name);
     native_down_out = &exec.mWeights.get(ctx.layer_prefix + "experts_down");
 
+    // Foreign receive buffers come from the ring arena (opened here, released
+    // at the next dispatch's cleanup). The wt stream inherits the slot's
+    // reuse guard transitively through the wt_start wait on MainStream below.
+    // Backward: adopt the buffers prefetched during the previous replay layer
+    // when they cover exactly this plan's receive set.
+    bool adopted_prefetch = false;
+    if (mPrefetched && mPrefetched->layer_idx == ctx.layer_idx) {
+        if (mPrefetched->receive_set == ctx.plan.weights_to_receive) {
+            ctx.foreign_weights = std::move(mPrefetched->weights);
+            ctx.arena_slot = mPrefetched->arena_slot;
+            mForeignArena.reopen(ctx.arena_slot);
+            adopted_prefetch = true;
+        } else {
+            mForeignArena.release(mPrefetched->arena_slot, mWeightTransferStream);
+        }
+        mPrefetched.reset();
+    }
+    if (!adopted_prefetch) {
+        ctx.arena_slot = mForeignArena.begin(exec.mRunState.MainStream);
+    }
+    ctx.foreign_weights.arena_alloc = [this](std::size_t bytes) { return mForeignArena.alloc(bytes); };
+
     cudaStream_t wt_stream = weight_transfer_stream();
     // Make the weight-transfer stream wait for MainStream (native dequant
     // pointers must be resolved first).
@@ -606,6 +742,12 @@ bool EPStrategy::launch_llep_transfers(CompiledExecutor& exec,
     CUDA_CHECK(cudaStreamWaitEvent(wt_stream, wt_start));
     CUDA_CHECK(cudaEventDestroy(wt_start));
 
+    // cpu_training: helpers self-serve foreign experts from the shared GLOBAL
+    // pinned host masters — no peer transfer for base weights at all.
+    Tensor* master_gu =
+        mOptions.CpuTraining ? exec.mWeights.master_tensor(ctx.layer_prefix + ctx.up_weight_name) : nullptr;
+    Tensor* master_dn = mOptions.CpuTraining ? exec.mWeights.master_tensor(ctx.layer_prefix + "experts_down") : nullptr;
+
     // Prefer quantized transfer (2-8× less P2P bandwidth) when available.
     auto* provider = exec.mWeights.qlora_provider();
     const qlora::QuantizedTensor* qt_gu =
@@ -614,7 +756,12 @@ bool EPStrategy::launch_llep_transfers(CompiledExecutor& exec,
         provider ? provider->try_get_quantized(ctx.layer_prefix + "experts_down") : nullptr;
     qlora::IQuantizer* quantizer = provider ? provider->get_quantizer() : nullptr;
 
-    if (qt_gu && qt_dn && qt_gu->is_quantized() && qt_dn->is_quantized() && quantizer && !qt_gu->is_on_host()) {
+    if (adopted_prefetch) {
+        // Base weights already resident (prefetched during the previous replay
+        // layer's backward compute) — nothing to fetch.
+    } else if (master_gu && master_dn && master_gu->Rank >= 3 && master_dn->Rank >= 3) {
+        ep::fetch_expert_weights_from_host(ctx.plan, wt_stream, ctx.foreign_weights, *master_gu, *master_dn);
+    } else if (qt_gu && qt_dn && qt_gu->is_quantized() && qt_dn->is_quantized() && quantizer && !qt_gu->is_on_host()) {
         ep::transfer_expert_weights_quantized(ctx.plan,
                                               *exec.mComm,
                                               exec.mRunState,
@@ -639,8 +786,21 @@ bool EPStrategy::launch_llep_transfers(CompiledExecutor& exec,
                                     ctx.ep_rank);
     }
 
+    // Replay: forward's merged LoRA tensors are still alive (kept for the
+    // backward pass) and the adapters can't have changed within the step —
+    // skip the per-layer NCCL LoRA exchange and reuse them in finalize.
+    // Uniform across ranks: every rank derives both merged sets from the same
+    // cached forward plan, so all ranks skip (or run) the exchange together.
+    if (exec.mInReplay) {
+        auto fwd_it = mLLEPStates.find(ep_state_key(ctx.layer_idx, /*in_replay=*/false));
+        if (fwd_it != mLLEPStates.end() && fwd_it->second.has_merged_lora &&
+            fwd_it->second.merged_to_global == ctx.merged_experts) {
+            ctx.reuse_fwd_merged_lora = true;
+        }
+    }
+
     // Transfer per-expert LoRA adapters alongside base weights.
-    if (exec.mLoRAConfig && exec.mLoRAWeights && exec.mLoRAConfig->enabled() && exec.mLoRAWeights->enabled()) {
+    if (!ctx.reuse_fwd_merged_lora && exec.mLoRAConfig && exec.mLoRAWeights && exec.mLoRAConfig->enabled() && exec.mLoRAWeights->enabled()) {
         auto& lora_block = exec.mLoRAWeights->get_block(ctx.layer_idx, wt_stream);
         if (lora_block.moe.use_grouped) {
             const auto& g = lora_block.moe.grouped;
@@ -740,14 +900,21 @@ void EPStrategy::permute_recv_tokens(CompiledExecutor& exec,
 
     // Per-layer persistent outputs (consumed by GEMM, kept until backward).
     auto& ep_state_out = mEpStates[ctx.ep_key];
-    const std::size_t sorted_need = static_cast<std::size_t>(ctx.total_recv) * ctx.hidden_size * ctx.elem_sz;
+    // Floor the persistent output buffers at a minimal allocation: a rank can
+    // legitimately receive ZERO tokens after rebalancing (routine for
+    // all-padding tail chunks under chunked-sequence training), and the
+    // stored 0-row tensors must still carry a non-null Data pointer for
+    // downstream tensor resolution (notably the recompute replay).
+    const std::size_t sorted_need =
+        std::max<std::size_t>(static_cast<std::size_t>(ctx.total_recv) * ctx.hidden_size * ctx.elem_sz, 256);
     alloc_or_resize(ep_state_out.sorted_recv_gpu, ep_state_out.sorted_recv_bytes, sorted_need);
     sorted_recv_out = make_raw_tensor(ep_state_out.sorted_recv_gpu,
                                       ctx.dtype,
                                       {static_cast<long>(ctx.total_recv), static_cast<long>(ctx.hidden_size)},
                                       ctx.device);
 
-    const std::size_t local_scatter_need = static_cast<std::size_t>(ctx.total_recv) * sizeof(int);
+    const std::size_t local_scatter_need =
+        std::max<std::size_t>(static_cast<std::size_t>(ctx.total_recv) * sizeof(int), 256);
     alloc_or_resize(ep_state_out.local_scatter_gpu, ep_state_out.local_scatter_bytes, local_scatter_need);
     local_scatter_out = make_raw_tensor(ep_state_out.local_scatter_gpu,
                                         ETensorDType::INT32,
@@ -808,12 +975,14 @@ void EPStrategy::permute_recv_tokens(CompiledExecutor& exec,
 
     // Cache host offsets for grouped GEMM fast-path lookup.
     std::vector<int> merged_offsets_host(ctx.num_merged + 1);
-    CUDA_CHECK(cudaMemcpyAsync(merged_offsets_host.data(),
+    int* pin_moff = static_cast<int*>(pinned_scratch(9, static_cast<std::size_t>(ctx.num_merged + 1) * sizeof(int)));
+    CUDA_CHECK(cudaMemcpyAsync(pin_moff,
                                merged_offsets_t.get<int>(),
                                (ctx.num_merged + 1) * sizeof(int),
                                cudaMemcpyDeviceToHost,
                                exec.mRunState.MainStream));
-    CUDA_CHECK(cudaStreamSynchronize(exec.mRunState.MainStream));
+    stream_wait_spin(exec.mRunState.MainStream);
+    std::memcpy(merged_offsets_host.data(), pin_moff, (ctx.num_merged + 1) * sizeof(int));
     exec.mMoEHostOffsetsCache[ctx.ep_key] = std::move(merged_offsets_host);
 
     // Persist send_order (local_gather) and recv_reorder (local_scatter)
@@ -868,11 +1037,17 @@ void EPStrategy::finalize_llep_state(CompiledExecutor& exec,
     }
 
     auto& llep = mLLEPStates[ctx.ep_key];
+    llep.has_foreign_experts = !ctx.foreign_weights.weights.empty();
     populate_llep_weight_pointers(llep, ctx, native_gate_up, native_down, &ctx.foreign_weights);
     const int native_start = ctx.ep_rank * ctx.num_local;
 
     // Build merged LoRA tensors (native + foreign adapters concatenated).
-    if (exec.mLoRAConfig && exec.mLoRAWeights && exec.mLoRAConfig->enabled() && exec.mLoRAWeights->enabled()) {
+    if (ctx.reuse_fwd_merged_lora) {
+        const auto& fwd = mLLEPStates.at(ep_state_key(ctx.layer_idx, /*in_replay=*/false));
+        llep.merged_lora = fwd.merged_lora;
+        llep.has_merged_lora = true;
+        // owned_lora_ptrs stays empty — the forward state owns the buffers.
+    } else if (exec.mLoRAConfig && exec.mLoRAWeights && exec.mLoRAConfig->enabled() && exec.mLoRAWeights->enabled()) {
         auto& lora_block = exec.mLoRAWeights->get_block(ctx.layer_idx, exec.mRunState.MainStream);
         if (lora_block.moe.use_grouped && lora_block.moe.grouped.has_any()) {
             const auto& g = lora_block.moe.grouped;
@@ -891,8 +1066,12 @@ void EPStrategy::finalize_llep_state(CompiledExecutor& exec,
                 const long b_cols = local.B.Sizes[2];
                 const std::size_t a_slice = static_cast<std::size_t>(a_rows * a_cols) * get_dtype_size(local.A.DType);
                 const std::size_t b_slice = static_cast<std::size_t>(b_rows * b_cols) * get_dtype_size(local.B.DType);
-                const std::size_t need_A = static_cast<std::size_t>(ctx.num_merged) * a_slice;
-                const std::size_t need_B = static_cast<std::size_t>(ctx.num_merged) * b_slice;
+                // Floored at one row: a rank whose experts were all spilled away
+                // (num_merged == 0 — routine for all-padding chunks) must still
+                // present non-null merged tensors so downstream gates behave
+                // identically on every rank (collective schedules depend on it).
+                const std::size_t need_A = static_cast<std::size_t>(std::max(ctx.num_merged, 1)) * a_slice;
+                const std::size_t need_B = static_cast<std::size_t>(std::max(ctx.num_merged, 1)) * b_slice;
 
                 // Per-layer owned allocations — LoRA is small (~9 MB/layer)
                 // so per-layer storage avoids the shared-buffer aliasing bug.
@@ -989,6 +1168,7 @@ void EPStrategy::finalize_llep_state(CompiledExecutor& exec,
     // they must stay alive until the LLEP state is cleared.
     llep.owned_foreign_ptrs = std::move(ctx.foreign_weights.owned_gpu_ptrs);
     ctx.foreign_weights.owned_gpu_ptrs.clear();  // prevent double-free
+    llep.arena_slot = ctx.arena_slot;
 }
 
 void EPStrategy::populate_llep_weight_pointers(LLEPLayerState& llep,
@@ -1050,12 +1230,14 @@ Tensor EPStrategy::apply_llep_inverse_reorder(CompiledExecutor& exec,
                                               std::size_t& out_bytes) {
     const int N = ep_state.total_send;
     std::vector<int> send_order_host(N);
-    CUDA_CHECK(cudaMemcpyAsync(send_order_host.data(),
+    int* pin_order = static_cast<int*>(pinned_scratch(10, static_cast<std::size_t>(N) * sizeof(int)));
+    CUDA_CHECK(cudaMemcpyAsync(pin_order,
                                ep_state.llep_send_reorder_gpu,
                                N * sizeof(int),
                                cudaMemcpyDeviceToHost,
                                exec.mRunState.MainStream));
-    CUDA_CHECK(cudaStreamSynchronize(exec.mRunState.MainStream));
+    stream_wait_spin(exec.mRunState.MainStream);
+    std::memcpy(send_order_host.data(), pin_order, static_cast<std::size_t>(N) * sizeof(int));
 
     std::vector<int> inverse_order(N);
     for (int i = 0; i < N; ++i)
@@ -1063,8 +1245,10 @@ Tensor EPStrategy::apply_llep_inverse_reorder(CompiledExecutor& exec,
 
     const std::size_t inv_gpu_bytes = static_cast<std::size_t>(N) * sizeof(int);
     void* inv_gpu_ptr = mBufferPool.acquire(inv_gpu_bytes);
+    int* pin_inv = static_cast<int*>(pinned_scratch(11, static_cast<std::size_t>(N) * sizeof(int)));
+    std::memcpy(pin_inv, inverse_order.data(), static_cast<std::size_t>(N) * sizeof(int));
     CUDA_CHECK(cudaMemcpyAsync(inv_gpu_ptr,
-                               inverse_order.data(),
+                               pin_inv,
                                N * sizeof(int),
                                cudaMemcpyHostToDevice,
                                exec.mRunState.MainStream));
@@ -1115,6 +1299,51 @@ void EPStrategy::finalize_native_only_state(CompiledExecutor& exec, DispatchForw
 // dispatch_forward — orchestrator
 // ============================================================================
 
+namespace {
+bool ep_trace_enabled() {
+    static const bool on = [] {
+        const char* env = std::getenv("SUROGATE_EP_TRACE");
+        return env && std::string(env) == "1";
+    }();
+    return on;
+}
+}  // namespace
+
+bool ep_prof_enabled() {
+    static const bool on = [] {
+        const char* env = std::getenv("SUROGATE_EP_PROF");
+        return env && std::string(env) == "1";
+    }();
+    return on;
+}
+
+/// Host-side phase timing for the EP dispatch path (launch + host-sync cost).
+struct EpPhaseProf {
+    double ms[8] = {0};
+    long count = 0;
+    static constexpr const char* names[8] =
+        {"detect", "plan", "reorder", "splits", "transfers", "a2a", "permute", "finalize"};
+};
+EpPhaseProf g_ep_prof;
+
+struct EpPhaseTimer {
+    int slot;
+    std::chrono::steady_clock::time_point t0;
+    explicit EpPhaseTimer(int s) : slot(s), t0(std::chrono::steady_clock::now()) {}
+    ~EpPhaseTimer() {
+        g_ep_prof.ms[slot] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    }
+};
+
+#define EP_TRACE(exec_, ctx_, fmt_, ...)                                                                     \
+    do {                                                                                                     \
+        if (ep_trace_enabled()) {                                                                            \
+            fprintf(stderr, "[ep-trace r%d L%d] " fmt_ "\n", (exec_).mComm ? (exec_).mComm->rank() : -1,     \
+                    (ctx_).layer_idx, ##__VA_ARGS__);                                                        \
+            fflush(stderr);                                                                                  \
+        }                                                                                                    \
+    } while (0)
+
 void EPStrategy::dispatch_forward(CompiledExecutor& exec, const CompiledOp& op) {
     Tensor& permuted_input = exec.resolve_tensor(op.inputs[0]);
     Tensor& routing_indices = exec.resolve_tensor(op.inputs[1]);
@@ -1131,7 +1360,137 @@ void EPStrategy::dispatch_forward(CompiledExecutor& exec, const CompiledOp& op) 
 
     DispatchForwardCtx ctx;
     parse_forward_layout(exec, op, permuted_input, ctx);
-    detect_llep_imbalance(exec, ctx);
+
+    // Recompute replay: restore the forward pass's dispatch plan instead of
+    // re-running the imbalance all-reduce + splits exchanges (collectives in
+    // backward intermittently deadlock the shared launch queue's issue order,
+    // and the results are identical — routing is deterministic).
+    bool reused_plan = false;
+    if (exec.mInReplay) {
+        auto fwd_it = mEpStates.find(ep_state_key(ctx.layer_idx, /*in_replay=*/false));
+        if (fwd_it != mEpStates.end() && fwd_it->second.plan_cached) {
+            const auto& c = fwd_it->second;
+            long total_now = 0;
+            for (int v : ctx.local_expert_counts) total_now += v;
+            if (total_now != c.cached_total_send) {
+                throw std::runtime_error("ep_dispatch replay: routing diverged from forward at layer " +
+                                         std::to_string(ctx.layer_idx) + " (fwd total_send " +
+                                         std::to_string(c.cached_total_send) + ", replay " +
+                                         std::to_string(total_now) + ")");
+            }
+            ctx.use_llep = c.cached_use_llep;
+            ctx.plan = c.cached_plan;
+            ctx.expert_to_gpu = c.cached_expert_to_gpu;
+            ctx.merged_experts = c.cached_merged_experts;
+            ctx.global_to_merged = c.cached_global_to_merged;
+            ctx.num_merged = static_cast<int>(c.cached_merged_experts.size());
+            ctx.send_splits = c.cached_send_splits;
+            ctx.recv_splits = c.cached_recv_splits;
+            ctx.recv_all_counts = c.cached_recv_all_counts;
+            ctx.total_send = c.cached_total_send;
+            ctx.total_recv = c.cached_total_recv;
+            reused_plan = true;
+            // Backward ops resolve EPLayerMeta by key — mirror what
+            // plan_expert_mapping would have written for this (replay) key.
+            auto& rmeta = mEPLayerMeta[ctx.ep_key];
+            rmeta.num_merged = ctx.num_merged;
+            rmeta.native_start = ctx.ep_rank * ctx.num_local;
+            rmeta.num_local = ctx.num_local;
+            rmeta.merged_to_global = ctx.merged_experts;
+            rmeta.expert_to_gpu = ctx.expert_to_gpu;
+            EP_TRACE(exec, ctx, "replay reusing forward plan use_llep=%d", ctx.use_llep ? 1 : 0);
+        }
+    }
+    // Chunked-sequence phase B: this chunk's phase-A forward already computed
+    // the plan and exchanged the splits — routing is deterministic, so
+    // restore both and skip the per-layer collectives entirely.
+    if (!reused_plan && !exec.mInReplay && exec.sequence_chunk_active() && exec.sequence_chunk_reuse_ep()) {
+        const long ck = static_cast<long>(ctx.layer_idx) * 4096 + exec.sequence_chunk_idx();
+        auto snap_it = mChunkPlanCache.find(ck);
+        if (snap_it != mChunkPlanCache.end()) {
+            const auto& c = snap_it->second;
+            long total_now = 0;
+            for (int v : ctx.local_expert_counts) total_now += v;
+            if (total_now != c.total_send) {
+                throw std::runtime_error("ep_dispatch chunk reuse: routing diverged at layer " +
+                                         std::to_string(ctx.layer_idx) + " chunk " +
+                                         std::to_string(exec.sequence_chunk_idx()));
+            }
+            ctx.use_llep = c.use_llep;
+            ctx.plan = c.plan;
+            ctx.expert_to_gpu = c.expert_to_gpu;
+            ctx.merged_experts = c.merged_experts;
+            ctx.global_to_merged = c.global_to_merged;
+            ctx.num_merged = static_cast<int>(c.merged_experts.size());
+            ctx.send_splits = c.send_splits;
+            ctx.recv_splits = c.recv_splits;
+            ctx.recv_all_counts = c.recv_all_counts;
+            ctx.total_send = c.total_send;
+            ctx.total_recv = c.total_recv;
+            reused_plan = true;
+            auto& rmeta = mEPLayerMeta[ctx.ep_key];
+            rmeta.num_merged = ctx.num_merged;
+            rmeta.native_start = ctx.ep_rank * ctx.num_local;
+            rmeta.num_local = ctx.num_local;
+            rmeta.merged_to_global = ctx.merged_experts;
+            rmeta.expert_to_gpu = ctx.expert_to_gpu;
+            // The backward replay restores from the fwd-key state cache —
+            // refresh it for this chunk exactly as the splits path would.
+            auto& st = mEpStates[ctx.ep_key];
+            st.plan_cached = true;
+            st.cached_use_llep = ctx.use_llep;
+            st.cached_plan = ctx.plan;
+            st.cached_expert_to_gpu = ctx.expert_to_gpu;
+            st.cached_merged_experts = ctx.merged_experts;
+            st.cached_global_to_merged = ctx.global_to_merged;
+            st.cached_send_splits = ctx.send_splits;
+            st.cached_recv_splits = ctx.recv_splits;
+            st.cached_recv_all_counts = ctx.recv_all_counts;
+            st.cached_total_send = ctx.total_send;
+            st.cached_total_recv = ctx.total_recv;
+            EP_TRACE(exec, ctx, "chunk reuse restored (phase B)");
+        }
+    }
+
+    // Sticky plans: outside replay, reuse the layer's cached plan for up to
+    // ep_plan_refresh_interval forward dispatches. Any expert->GPU mapping is
+    // correct (routing counts only affect balance quality), and a stable plan
+    // lets forward prefetch foreign weights one layer ahead. The reuse
+    // condition depends only on lockstep-synchronized state, so every rank
+    // skips (or runs) the imbalance all-reduce together.
+    bool sticky_plan = false;
+    if (!exec.mInReplay && !reused_plan && mOptions.EPPlanRefreshInterval > 1) {
+        auto& st = mEpStates[ctx.ep_key];
+        if (st.plan_cached && st.plan_age + 1 < mOptions.EPPlanRefreshInterval) {
+            st.plan_age++;
+            ctx.use_llep = st.cached_use_llep;
+            ctx.plan = st.cached_plan;
+            ctx.expert_to_gpu = st.cached_expert_to_gpu;
+            ctx.merged_experts = st.cached_merged_experts;
+            ctx.global_to_merged = st.cached_global_to_merged;
+            ctx.num_merged = static_cast<int>(st.cached_merged_experts.size());
+            sticky_plan = true;
+            EP_TRACE(exec, ctx, "sticky plan reuse age=%d use_llep=%d", st.plan_age, ctx.use_llep ? 1 : 0);
+        }
+    }
+
+    if (!reused_plan && !sticky_plan) {
+        EpPhaseTimer prof_detect(0);
+        detect_llep_imbalance(exec, ctx);
+        EP_TRACE(exec, ctx, "detect done use_llep=%d", ctx.use_llep ? 1 : 0);
+    }
+
+    // Drop a pending prefetch once its target dispatch has been passed without
+    // adoption (forward walks layers ascending, replay descending). Its only
+    // writers ran on the wt stream.
+    if (mPrefetched && mPrefetched->layer_idx != ctx.layer_idx) {
+        const bool still_ahead = exec.mInReplay ? (mPrefetched->layer_idx < ctx.layer_idx)
+                                                : (mPrefetched->layer_idx > ctx.layer_idx);
+        if (!still_ahead) {
+            mForeignArena.release(mPrefetched->arena_slot, mWeightTransferStream);
+            mPrefetched.reset();
+        }
+    }
 
     // Drop any stale LLEP state from earlier layers. Foreign expert weight
     // buffers are ~20 MB each and accumulate across MoE layers, causing OOM
@@ -1143,31 +1502,96 @@ void EPStrategy::dispatch_forward(CompiledExecutor& exec, const CompiledOp& op) 
         ep_state.llep_send_reorder_gpu = nullptr;
         ep_state.llep_send_reorder_bytes = 0;
     }
-    free_all_llep_layers();
+    // Keep earlier layers' merged LoRA for this step's backward (the LoRA dx/wgrad
+    // paths need it on EVERY rebalanced layer, not just the last). Free their large
+    // FOREIGN BASE buffers (backward re-fetches from host masters under cpu_training;
+    // resident mode falls back to the case-2 reconstruct) and drop their stale
+    // weight pointers. This layer's own previous state is recycled in full.
+    for (auto& [k_st, st] : mLLEPStates) {
+        mForeignArena.release(st.arena_slot, exec.mRunState.MainStream);
+        st.arena_slot = -1;
+        st.free_foreign_gpu();
+        st.gate_up_weight_ptrs.clear();
+        st.down_weight_ptrs.clear();
+        st.active = false;
+    }
+    if (auto self_it = mLLEPStates.find(ctx.ep_key); self_it != mLLEPStates.end()) {
+        self_it->second.free_lora_gpu();
+        mLLEPStates.erase(self_it);
+    }
 
-    plan_expert_mapping(ctx);
+    if (!reused_plan) {
+        EpPhaseTimer prof_plan(1);
+        plan_expert_mapping(ctx, /*sticky=*/sticky_plan);
+        EP_TRACE(exec, ctx, "plan done merged=%d send=%zu recv=%zu", ctx.num_merged,
+                 ctx.plan.weights_to_send.size(), ctx.plan.weights_to_receive.size());
+    }
 
     // Token buffer — either the caller's permuted input, or a LLEP-reordered copy.
     Tensor llep_send_buf;
     const Tensor* send_ptr = &permuted_input;
     if (ctx.use_llep) {
+        EpPhaseTimer prof_reorder(2);
         llep_send_buf = apply_llep_send_reorder(exec, ctx, permuted_input, ep_state);
         send_ptr = &llep_send_buf;
     }
 
-    exchange_token_splits(exec, ctx);
+    if (!reused_plan) {
+        EpPhaseTimer prof_splits(3);
+        exchange_token_splits(exec, ctx);
+        EP_TRACE(exec, ctx, "splits done total_send=%d total_recv=%d", ctx.total_send, ctx.total_recv);
+        // Cache the plan for this layer's recompute replay (and for sticky
+        // cross-step reuse). A freshly computed plan resets its age; a sticky
+        // dispatch just rewrites identical plan values.
+        auto& st = mEpStates[ctx.ep_key];
+        if (!sticky_plan) st.plan_age = 0;
+        st.plan_cached = true;
+        st.cached_use_llep = ctx.use_llep;
+        st.cached_plan = ctx.plan;
+        st.cached_expert_to_gpu = ctx.expert_to_gpu;
+        st.cached_merged_experts = ctx.merged_experts;
+        st.cached_global_to_merged = ctx.global_to_merged;
+        st.cached_send_splits = ctx.send_splits;
+        st.cached_recv_splits = ctx.recv_splits;
+        st.cached_recv_all_counts = ctx.recv_all_counts;
+        st.cached_total_send = ctx.total_send;
+        st.cached_total_recv = ctx.total_recv;
+        // Phase-A snapshot for the chunk's phase-B re-forward.
+        if (exec.sequence_chunk_active()) {
+            const long ck = static_cast<long>(ctx.layer_idx) * 4096 + exec.sequence_chunk_idx();
+            auto& snap = mChunkPlanCache[ck];
+            snap.use_llep = ctx.use_llep;
+            snap.plan = ctx.plan;
+            snap.expert_to_gpu = ctx.expert_to_gpu;
+            snap.merged_experts = ctx.merged_experts;
+            snap.global_to_merged = ctx.global_to_merged;
+            snap.send_splits = ctx.send_splits;
+            snap.recv_splits = ctx.recv_splits;
+            snap.recv_all_counts = ctx.recv_all_counts;
+            snap.total_send = ctx.total_send;
+            snap.total_recv = ctx.total_recv;
+        }
+    }
 
     // Launch LLEP base + LoRA transfers on a separate stream (overlaps the
     // token A2A below). Returns pointers to the native weights (needed later
     // for merged-pointer bookkeeping).
     Tensor* native_gate_up_ptr = nullptr;
     Tensor* native_down_ptr = nullptr;
-    launch_llep_transfers(exec, ctx, native_gate_up_ptr, native_down_ptr);
+    {
+        EpPhaseTimer prof_transfers(4);
+        launch_llep_transfers(exec, ctx, native_gate_up_ptr, native_down_ptr);
+    }
+    EP_TRACE(exec, ctx, "transfers launched");
 
     // Token A2A.
     void* recv_hidden_ptr = nullptr;
     std::size_t recv_hidden_bytes = 0;
-    Tensor recv_hidden = run_token_a2a(exec, ctx, *send_ptr, recv_hidden_ptr, recv_hidden_bytes);
+    Tensor recv_hidden = [&] {
+        EpPhaseTimer prof_a2a(5);
+        return run_token_a2a(exec, ctx, *send_ptr, recv_hidden_ptr, recv_hidden_bytes);
+    }();
+    EP_TRACE(exec, ctx, "token a2a done");
     dsl::CommunicationHookPayload comm_payload;
     comm_payload.send_tensor = send_ptr;
     comm_payload.recv_tensor = &recv_hidden;
@@ -1182,7 +1606,10 @@ void EPStrategy::dispatch_forward(CompiledExecutor& exec, const CompiledOp& op) 
     Tensor sorted_recv;
     Tensor local_scatter;
     Tensor merged_offsets_t;
-    permute_recv_tokens(exec, ctx, recv_hidden, sorted_recv, local_scatter, merged_offsets_t);
+    {
+        EpPhaseTimer prof_permute(6);
+        permute_recv_tokens(exec, ctx, recv_hidden, sorted_recv, local_scatter, merged_offsets_t);
+    }
     mBufferPool.release(recv_hidden_ptr, recv_hidden_bytes);
 
     // Persist merged_offsets to the MoE saved-buffers map and bind as
@@ -1200,13 +1627,61 @@ void EPStrategy::dispatch_forward(CompiledExecutor& exec, const CompiledOp& op) 
     // Build the LLEP merged-weight view, or fall back to native-only pointers
     // when no foreign weights were transferred.
     if (ctx.wt_started) {
+        EpPhaseTimer prof_finalize(7);
         finalize_llep_state(exec, ctx, *native_gate_up_ptr, *native_down_ptr);
     } else {
         finalize_native_only_state(exec, ctx);
     }
+    if (ep_prof_enabled() && ++g_ep_prof.count % 200 == 0 && exec.mComm && exec.mComm->rank() == 0) {
+        fprintf(stderr, "[ep-prof %ld]", g_ep_prof.count);
+        for (int i = 0; i < 8; ++i) fprintf(stderr, " %s=%.0fms", EpPhaseProf::names[i], g_ep_prof.ms[i]);
+        fprintf(stderr, "\n");
+        fflush(stderr);
+    }
+
+    // Launched after finalize so its wt_done event does not wait on the
+    // prefetch H2D — the prefetch overlaps this layer's backward compute.
+    maybe_prefetch_next_layer(exec, ctx);
 
     exec.store_tensor(op.outputs[0], sorted_recv);
     exec.store_tensor(op.outputs[1], local_scatter);
+}
+
+void EPStrategy::maybe_prefetch_next_layer(CompiledExecutor& exec, const DispatchForwardCtx& ctx) {
+    if (!mOptions.CpuTraining || mPrefetched.has_value()) return;
+    // Replay walks layers descending and always reuses the step's cached
+    // forward plan; forward walks ascending and reuses the sticky plan, so
+    // prefetch only targets layers whose next dispatch will still be sticky
+    // (a refresh dispatch recomputes the plan and refetches anyway).
+    const bool replay = exec.mInReplay;
+    if (!replay && mOptions.EPPlanRefreshInterval <= 1) return;
+    int next_layer = -1;
+    for (const auto& [key, st] : mEpStates) {
+        if (!st.plan_cached || (key & 1)) continue;
+        const int layer = key >> 1;
+        if (!st.cached_use_llep || st.cached_plan.weights_to_receive.empty()) continue;
+        if (replay) {
+            if (layer < ctx.layer_idx && (next_layer < 0 || layer > next_layer)) next_layer = layer;
+        } else {
+            if (st.plan_age + 1 >= mOptions.EPPlanRefreshInterval) continue;
+            if (layer > ctx.layer_idx && (next_layer < 0 || layer < next_layer)) next_layer = layer;
+        }
+    }
+    if (next_layer < 0) return;
+    const auto& st = mEpStates.at(ep_state_key(next_layer, /*in_replay=*/false));
+    const std::string prefix = "blocks[" + std::to_string(next_layer) + "].";
+    Tensor* mgu = exec.mWeights.master_tensor(prefix + ctx.up_weight_name);
+    Tensor* mdn = exec.mWeights.master_tensor(prefix + "experts_down");
+    if (!mgu || !mdn || mgu->Rank < 3 || mdn->Rank < 3) return;
+
+    cudaStream_t wt = weight_transfer_stream();
+    PrefetchedForeign pf;
+    pf.layer_idx = next_layer;
+    pf.arena_slot = mForeignArena.begin(wt);
+    pf.weights.arena_alloc = [this](std::size_t bytes) { return mForeignArena.alloc(bytes); };
+    ep::fetch_expert_weights_from_host(st.cached_plan, wt, pf.weights, *mgu, *mdn);
+    pf.receive_set = st.cached_plan.weights_to_receive;
+    mPrefetched.emplace(std::move(pf));
 }
 
 // ============================================================================
@@ -1215,6 +1690,11 @@ void EPStrategy::dispatch_forward(CompiledExecutor& exec, const CompiledOp& op) 
 
 void EPStrategy::dispatch_backward(CompiledExecutor& exec, const CompiledOp& op) {
     Tensor& d_recv_sorted = exec.resolve_tensor(op.inputs[0]);
+    if (ep_trace_enabled() && exec.mComm) {
+        fprintf(stderr, "[ep-trace r%d] dispatch_backward enter rows=%ld\n", exec.mComm->rank(),
+                static_cast<long>(d_recv_sorted.Sizes[0]));
+        fflush(stderr);
+    }
 
     const int ep_size = op.attrs.ep_size;
     const int hidden_size = static_cast<int>(d_recv_sorted.Sizes[1]);
@@ -1475,7 +1955,10 @@ void EPStrategy::combine_backward(CompiledExecutor& exec, const CompiledOp& op) 
     if (d_reordered_ptr) mBufferPool.release(d_reordered_ptr, d_reordered_bytes);
 
     // 2. Re-sort by local expert (same permutation as dispatch forward).
-    const std::size_t sorted_need = static_cast<std::size_t>(ep_state.total_recv) * hidden_size * elem_sz;
+    // Floored at a minimal allocation: zero-recv ranks still store a 0-row
+    // gradient whose Data pointer must be non-null (see permute_recv_tokens).
+    const std::size_t sorted_need =
+        std::max<std::size_t>(static_cast<std::size_t>(ep_state.total_recv) * hidden_size * elem_sz, 256);
     alloc_or_resize(ep_state_mut.combine_bwd_sorted_gpu, ep_state_mut.combine_bwd_sorted_bytes, sorted_need);
     Tensor d_expert_sorted = make_raw_tensor(ep_state_mut.combine_bwd_sorted_gpu,
                                              d_combined.DType,

@@ -50,18 +50,10 @@ enum GrpoMetricOffset {
     GRPO_METRIC_IS_MASKED_LOW = 5,
     GRPO_METRIC_IS_MASKED_HIGH = 6,
     GRPO_METRIC_TEACHER_KL = 7,
-    GRPO_METRIC_OPD_LOSS = 8,
-    GRPO_METRIC_OPD_GATE = 9,
-    GRPO_METRIC_OPD_SHIFT = 10,
-    GRPO_METRIC_OPD_TOKENS = 11,
-    GRPO_METRIC_REPLAY_LOSS = 12,
-    GRPO_METRIC_REPLAY_TOKENS = 13,
-    GRPO_METRIC_SAMPLE_COUNT = 14,
-    GRPO_METRIC_KEEP_TOKENS = 15,
-    GRPO_METRIC_TOTAL_TOKENS = 16,
-    GRPO_METRIC_REPLAY_WEIGHT_SUM = 17,
-    GRPO_METRIC_POLICY_SAMPLE_COUNT = 18,
-    GRPO_METRIC_COUNT = 19,
+    GRPO_METRIC_SAMPLE_COUNT = 8,
+    GRPO_METRIC_KEEP_TOKENS = 9,
+    GRPO_METRIC_TOTAL_TOKENS = 10,
+    GRPO_METRIC_COUNT = 11,
 };
 
 int acquire_grpo_host_staging_slot(modules::GrpoNativeScratch& scratch) {
@@ -114,8 +106,13 @@ void DslModel::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& com
         throw std::logic_error("DslModel::forward called before allocate_run_state()");
     }
 
+    // Chunked-sequence mode carries per-document geometry in the chunk
+    // metadata (per-chunk cu_seqlens on the kvprefix path) — the dense
+    // doc-masking context must stay clear.
     mDocMaskingActive =
-        causal_lm_profile().apply_doc_masking(*mExecutor, mOptions, mModelConfig, inputs, position_ids, micro_step);
+        mSequenceChunkActive
+            ? false
+            : causal_lm_profile().apply_doc_masking(*mExecutor, mOptions, mModelConfig, inputs, position_ids, micro_step);
 
     if (!lora_enabled()) {
         auto request = causal_lm_profile()
@@ -138,13 +135,65 @@ void DslModel::forward(Tensor inputs, Tensor position_ids, NCCLCommunicator& com
     mExecutor->execute_forward(request, comm);
 }
 
+void DslModel::set_sequence_chunk(int idx, int count, const ChunkPackMeta* pack) {
+    if (!mExecutor) {
+        throw std::logic_error("DslModel::set_sequence_chunk called before allocate_run_state()");
+    }
+    mSequenceChunkActive = (idx >= 0 && count > 1);
+    mExecutor->set_sequence_chunk(idx, count, pack);
+}
+
+void DslModel::zero_sequence_chunk_dkv() {
+    if (!mExecutor) {
+        throw std::logic_error("DslModel::zero_sequence_chunk_dkv called before allocate_run_state()");
+    }
+    mExecutor->zero_sequence_chunk_dkv();
+}
+
+void DslModel::forward_no_save(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm, int micro_step) {
+    if (!mExecutor) {
+        throw std::logic_error("DslModel::forward_no_save called before allocate_run_state()");
+    }
+
+    // Chunked-sequence mode carries per-document geometry in the chunk
+    // metadata (per-chunk cu_seqlens on the kvprefix path) — the dense
+    // doc-masking context must stay clear.
+    mDocMaskingActive =
+        mSequenceChunkActive
+            ? false
+            : causal_lm_profile().apply_doc_masking(*mExecutor, mOptions, mModelConfig, inputs, position_ids, micro_step);
+
+    if (lora_enabled()) {
+        ensure_lora_run_state(comm, (int)inputs.Sizes[0], (int)inputs.Sizes[1]);
+        if (qlora_enabled() && micro_step == 0 && mQLoRAProvider) {
+            mQLoRAProvider->invalidate_cache();
+        }
+        mLoRARunState->micro_step = micro_step;
+        mLoRARunState->is_training = true;
+    }
+
+    auto request =
+        causal_lm_profile().make_forward_request(*mRunState, mModelConfig, mOptions, inputs, position_ids, micro_step);
+    // KV sweep of the chunked schedule: this forward exists only to fill the
+    // attention KV caches (the loss op lives in backward). Saved tensors are
+    // written normally — every chunk shares the same saved-cache keys, so
+    // this costs bandwidth, not memory, and disabling saves would diverge
+    // from the compiled buffer plan's persistence layout (EP tensors).
+    mExecutor->execute_forward(request, comm);
+}
+
 float DslModel::validate(Tensor inputs, Tensor position_ids, Tensor targets, NCCLCommunicator& comm, int micro_step) {
     if (!mExecutor) {
         throw std::logic_error("DslModel::validate called before allocate_run_state()");
     }
 
+    // Chunked-sequence mode carries per-document geometry in the chunk
+    // metadata (per-chunk cu_seqlens on the kvprefix path) — the dense
+    // doc-masking context must stay clear.
     mDocMaskingActive =
-        causal_lm_profile().apply_doc_masking(*mExecutor, mOptions, mModelConfig, inputs, position_ids, micro_step);
+        mSequenceChunkActive
+            ? false
+            : causal_lm_profile().apply_doc_masking(*mExecutor, mOptions, mModelConfig, inputs, position_ids, micro_step);
 
     if (!lora_enabled()) {
         auto request =
@@ -722,8 +771,13 @@ std::vector<float> DslModel::forward_for_grpo(Tensor inputs,
     const int B_val = static_cast<int>(inputs.Sizes[0]);
     const int T_val = static_cast<int>(inputs.Sizes[1]);
     const std::size_t BT = static_cast<std::size_t>(B_val) * static_cast<std::size_t>(T_val);
+    // Chunked-sequence mode carries per-document geometry in the chunk
+    // metadata (per-chunk cu_seqlens on the kvprefix path) — the dense
+    // doc-masking context must stay clear.
     mDocMaskingActive =
-        causal_lm_profile().apply_doc_masking(*mExecutor, mOptions, mModelConfig, inputs, position_ids, micro_step);
+        mSequenceChunkActive
+            ? false
+            : causal_lm_profile().apply_doc_masking(*mExecutor, mOptions, mModelConfig, inputs, position_ids, micro_step);
 
     auto& rs = *mRunState;
     cudaStream_t main_stream = rs.MainStream;
@@ -847,21 +901,10 @@ void DslModel::step_grpo_native(Tensor inputs,
                                 NCCLCommunicator& comm,
                                 const GrpoNativeLossConfig& loss_config,
                                 const float* temperatures_cpu,
-                                const float* teacher_logprobs_cpu,
-                                const float* opd_reference_logprobs_cpu,
-                                const float* hindsight_logprobs_cpu,
-                                const std::uint8_t* hindsight_mask_cpu,
-                                const std::uint8_t* replay_mask_cpu,
-                                const float* replay_weights_cpu) {
+                                const float* teacher_logprobs_cpu) {
     if (!mExecutor) {
         throw std::logic_error("DslModel::step_grpo_native called before allocate_run_state()");
     }
-    // Native GRPO seeds custom_dloss with its explicit global selected-token
-    // denominator.  The generic optimizer's legacy ValidTokenCount scaling
-    // must therefore be disabled, just as it is for step_with_custom_loss and
-    // forward_for_grpo.  Leaving it enabled makes the update depend on the
-    // selected-token count of the final (possibly partial) rank batch.
-    mUseTokenScale = false;
     if (!inference_logprobs_cpu || !advantages_cpu || !loss_mask_cpu || !sample_starts_cpu || !sample_ends_cpu) {
         throw std::invalid_argument(
             "step_grpo_native requires inference_logprobs, advantages, loss_mask, sample ranges");
@@ -931,53 +974,6 @@ void DslModel::step_grpo_native(Tensor inputs,
         copy_float_input(scratch.host_teacher_logprobs[staging_slot], scratch.teacher_logprobs, teacher_logprobs_cpu);
         teacher_logprobs_gpu = scratch.teacher_logprobs.get<float>();
     }
-    const float* opd_reference_logprobs_gpu = nullptr;
-    const float* hindsight_logprobs_gpu = nullptr;
-    const std::uint8_t* hindsight_mask_gpu = nullptr;
-    const bool has_opd_reference = opd_reference_logprobs_cpu != nullptr;
-    const bool has_hindsight = hindsight_logprobs_cpu != nullptr;
-    const bool has_hindsight_mask = hindsight_mask_cpu != nullptr;
-    if ((has_opd_reference != has_hindsight) || (has_opd_reference != has_hindsight_mask)) {
-        throw std::invalid_argument("OPD reference logprobs, hindsight logprobs, and mask must be provided together");
-    }
-    if (has_opd_reference) {
-        copy_float_input(scratch.host_opd_reference_logprobs[staging_slot],
-                         scratch.opd_reference_logprobs,
-                         opd_reference_logprobs_cpu);
-        copy_float_input(scratch.host_hindsight_logprobs[staging_slot],
-                         scratch.hindsight_logprobs,
-                         hindsight_logprobs_cpu);
-        std::memcpy(scratch.host_hindsight_mask[staging_slot].get<std::uint8_t>(),
-                    hindsight_mask_cpu,
-                    bt * sizeof(std::uint8_t));
-        CUDA_CHECK(cudaMemcpyAsync(scratch.hindsight_mask.Data,
-                                   scratch.host_hindsight_mask[staging_slot].Data,
-                                   bt * sizeof(std::uint8_t),
-                                   cudaMemcpyHostToDevice,
-                                   main_stream));
-        opd_reference_logprobs_gpu = scratch.opd_reference_logprobs.get<float>();
-        hindsight_logprobs_gpu = scratch.hindsight_logprobs.get<float>();
-        hindsight_mask_gpu = scratch.hindsight_mask.get<std::uint8_t>();
-    }
-    const std::uint8_t* replay_mask_gpu = nullptr;
-    const float* replay_weights_gpu = nullptr;
-    if (replay_mask_cpu) {
-        std::memcpy(scratch.host_replay_mask[staging_slot].get<std::uint8_t>(),
-                    replay_mask_cpu,
-                    bt * sizeof(std::uint8_t));
-        CUDA_CHECK(cudaMemcpyAsync(scratch.replay_mask.Data,
-                                   scratch.host_replay_mask[staging_slot].Data,
-                                   bt * sizeof(std::uint8_t),
-                                   cudaMemcpyHostToDevice,
-                                   main_stream));
-        replay_mask_gpu = scratch.replay_mask.get<std::uint8_t>();
-        if (replay_weights_cpu) {
-            copy_float_input(scratch.host_replay_weights[staging_slot], scratch.replay_weights, replay_weights_cpu);
-            replay_weights_gpu = scratch.replay_weights.get<float>();
-        }
-    } else if (replay_weights_cpu) {
-        throw std::invalid_argument("replay weights require a replay mask");
-    }
 
     const float* inv_temperature_gpu = nullptr;
     if (temperatures_cpu) {
@@ -1021,11 +1017,6 @@ void DslModel::step_grpo_native(Tensor inputs,
                               scratch.advantages.get<float>(),
                               scratch.loss_mask.get<std::uint8_t>(),
                               teacher_logprobs_gpu,
-                              opd_reference_logprobs_gpu,
-                              hindsight_logprobs_gpu,
-                              hindsight_mask_gpu,
-                              replay_mask_gpu,
-                              replay_weights_gpu,
                               scratch.sample_starts.get<std::int32_t>(),
                               scratch.sample_ends.get<std::int32_t>(),
                               sample_count,
@@ -1035,9 +1026,6 @@ void DslModel::step_grpo_native(Tensor inputs,
                               loss_config.ipo_mask_high,
                               loss_config.adv_tau,
                               loss_config.teacher_tau,
-                              loss_config.opd_tau,
-                              loss_config.opd_beta,
-                              loss_config.replay_tau,
                               loss_config.kl_tau,
                               main_stream);
 
@@ -1079,49 +1067,158 @@ GrpoNativeMetrics DslModel::consume_grpo_native_metrics() {
 
     const auto* values = scratch.host_metrics.get<float>();
     const float sample_count = std::max(values[GRPO_METRIC_SAMPLE_COUNT], 1.0f);
-    const float policy_sample_count = std::max(values[GRPO_METRIC_POLICY_SAMPLE_COUNT], 1.0f);
     GrpoNativeMetrics metrics;
-    metrics.sample_count = values[GRPO_METRIC_SAMPLE_COUNT];
-    metrics.policy_sample_count = values[GRPO_METRIC_POLICY_SAMPLE_COUNT];
     metrics.policy_loss = values[GRPO_METRIC_POLICY_LOSS] / sample_count;
-    metrics.mismatch_kl = values[GRPO_METRIC_MISMATCH_KL] / policy_sample_count;
-    metrics.masked_mismatch_kl = values[GRPO_METRIC_MASKED_MISMATCH_KL] / policy_sample_count;
-    metrics.unmasked_mismatch_kl = values[GRPO_METRIC_UNMASKED_MISMATCH_KL] / policy_sample_count;
-    metrics.is_masked = values[GRPO_METRIC_IS_MASKED] / policy_sample_count;
-    metrics.is_masked_low = values[GRPO_METRIC_IS_MASKED_LOW] / policy_sample_count;
-    metrics.is_masked_high = values[GRPO_METRIC_IS_MASKED_HIGH] / policy_sample_count;
-    metrics.teacher_kl = values[GRPO_METRIC_TEACHER_KL] / policy_sample_count;
-    metrics.opd_tokens = values[GRPO_METRIC_OPD_TOKENS];
-    metrics.replay_tokens = values[GRPO_METRIC_REPLAY_TOKENS];
-    metrics.replay_weight_sum = values[GRPO_METRIC_REPLAY_WEIGHT_SUM];
-    const float opd_tokens = std::max(metrics.opd_tokens, 1.0f);
-    const float replay_tokens = std::max(metrics.replay_tokens, 1.0f);
-    metrics.opd_loss = values[GRPO_METRIC_OPD_LOSS] / opd_tokens;
-    metrics.opd_gate = values[GRPO_METRIC_OPD_GATE] / opd_tokens;
-    metrics.opd_shift = values[GRPO_METRIC_OPD_SHIFT] / opd_tokens;
-    metrics.replay_loss = values[GRPO_METRIC_REPLAY_LOSS] / replay_tokens;
+    metrics.mismatch_kl = values[GRPO_METRIC_MISMATCH_KL] / sample_count;
+    metrics.masked_mismatch_kl = values[GRPO_METRIC_MASKED_MISMATCH_KL] / sample_count;
+    metrics.unmasked_mismatch_kl = values[GRPO_METRIC_UNMASKED_MISMATCH_KL] / sample_count;
+    metrics.is_masked = values[GRPO_METRIC_IS_MASKED] / sample_count;
+    metrics.is_masked_low = values[GRPO_METRIC_IS_MASKED_LOW] / sample_count;
+    metrics.is_masked_high = values[GRPO_METRIC_IS_MASKED_HIGH] / sample_count;
+    metrics.teacher_kl = values[GRPO_METRIC_TEACHER_KL] / sample_count;
     metrics.keep_tokens = values[GRPO_METRIC_KEEP_TOKENS];
     metrics.total_tokens = values[GRPO_METRIC_TOTAL_TOKENS];
     return metrics;
 }
 
-float DslModel::preflight_grpo_native_lora_gradient_norm(NCCLCommunicator& comm, float grad_clip) {
-    if (!std::isfinite(grad_clip) || grad_clip < 0.0f) {
-        throw std::invalid_argument("GRPO native gradient preflight requires a finite non-negative grad_clip");
+void DslModel::step_with_kd(Tensor inputs,
+                            Tensor position_ids,
+                            Tensor targets,
+                            const std::int32_t* kd_ids_cpu,
+                            const float* kd_logprobs_cpu,
+                            int grad_accum_steps,
+                            int micro_step,
+                            NCCLCommunicator& comm,
+                            const KdLossConfig& kd_config) {
+    if (!mExecutor) {
+        throw std::logic_error("DslModel::step_with_kd called before allocate_run_state()");
     }
-    if (!lora_enabled()) {
-        throw std::logic_error("GRPO native gradient preflight currently requires LoRA");
+    if (!kd_ids_cpu || !kd_logprobs_cpu) {
+        throw std::invalid_argument("step_with_kd requires teacher top-K ids and logprobs");
     }
-    if (!mRunState || !mLoRARunState || !mLoRAGrads) {
-        throw std::logic_error("GRPO native gradient preflight called before backward completed");
+    if (kd_config.top_k <= 0 || kd_config.top_k > 1024) {
+        throw std::invalid_argument("step_with_kd: top_k must be in [1, 1024]");
+    }
+    if (!(kd_config.temperature > 0.0f) || !std::isfinite(kd_config.temperature)) {
+        throw std::invalid_argument("step_with_kd: temperature must be finite and positive");
+    }
+    if (kd_config.kd_weight < 0.0f || kd_config.ce_weight < 0.0f) {
+        throw std::invalid_argument("step_with_kd: loss weights must be non-negative");
     }
 
     auto& rs = *mRunState;
-    if (!mLoRARunState->norm_ptrs_initialized) {
-        populate_lora_norm_pointers(comm, rs.MainStream);
+    cudaStream_t main_stream = rs.MainStream;
+    const int B_val = static_cast<int>(inputs.Sizes[0]);
+    const int T_val = static_cast<int>(inputs.Sizes[1]);
+    const std::size_t bt = static_cast<std::size_t>(B_val) * static_cast<std::size_t>(T_val);
+
+    rs.set_kd_config(kd_config.top_k, static_cast<long>(bt));
+    auto& kd = rs.kd_scratch();
+    const std::size_t count = bt * static_cast<std::size_t>(kd_config.top_k);
+
+    // Standard SFT loss semantics: CE loss / ValidTokenCount accumulate over
+    // micro-steps and grads get 1/valid_token_count via global_norm_sqrt.
+    mUseTokenScale = true;
+
+    if (micro_step == 0) {
+        CUDA_CHECK(cudaMemsetAsync(kd.loss_accum, 0, sizeof(float), main_stream));
     }
-    calculate_lora_gradient_norm(comm, grad_clip);
-    return rs.get_norm();
+
+    const int staging_slot = kd.next_slot;
+    kd.next_slot = (kd.next_slot + 1) % DslRunState::KdNativeScratch::kStagingSlots;
+    if (kd.copy_recorded[staging_slot]) {
+        CUDA_CHECK(cudaEventSynchronize(kd.copy_done[staging_slot]));
+    }
+    std::memcpy(kd.host_ids[staging_slot], kd_ids_cpu, count * sizeof(std::int32_t));
+    std::memcpy(kd.host_logprobs[staging_slot], kd_logprobs_cpu, count * sizeof(float));
+    CUDA_CHECK(cudaMemcpyAsync(kd.topk_ids,
+                               kd.host_ids[staging_slot],
+                               count * sizeof(std::int32_t),
+                               cudaMemcpyHostToDevice,
+                               main_stream));
+    CUDA_CHECK(cudaMemcpyAsync(kd.topk_logprobs,
+                               kd.host_logprobs[staging_slot],
+                               count * sizeof(float),
+                               cudaMemcpyHostToDevice,
+                               main_stream));
+    CUDA_CHECK(cudaEventRecord(kd.copy_done[staging_slot], main_stream));
+    kd.copy_recorded[staging_slot] = true;
+
+    // Chunked-sequence mode carries per-document geometry in the chunk
+    // metadata (per-chunk cu_seqlens on the kvprefix path) — the dense
+    // doc-masking context must stay clear.
+    mDocMaskingActive =
+        mSequenceChunkActive
+            ? false
+            : causal_lm_profile().apply_doc_masking(*mExecutor, mOptions, mModelConfig, inputs, position_ids, micro_step);
+
+    if (lora_enabled()) {
+        ensure_lora_run_state(comm, B_val, T_val);
+        if (qlora_enabled() && micro_step == 0 && mQLoRAProvider) {
+            mQLoRAProvider->invalidate_cache();
+        }
+        mLoRARunState->micro_step = micro_step;
+        mLoRARunState->is_training = true;
+    }
+
+    auto stamp_kd_fields = [&](ExecutionRequest& request) {
+        request.kd_topk_ids_gpu = kd.topk_ids;
+        request.kd_topk_logprobs_gpu = kd.topk_logprobs;
+        request.kd_loss_accum_gpu = kd.loss_accum;
+        request.kd_top_k = kd_config.top_k;
+        request.kd_temperature = kd_config.temperature;
+        request.kd_weight = kd_config.kd_weight;
+        request.kd_ce_weight = kd_config.ce_weight;
+    };
+
+    // make_forward_request keeps initialize_loss_buffers = (micro_step == 0)
+    // and reads targets from rs.Targets_CPU — the standard training forward.
+    rs.Targets_CPU = targets;
+    auto forward_request =
+        causal_lm_profile().make_forward_request(rs, mModelConfig, mOptions, inputs, position_ids, micro_step);
+    stamp_kd_fields(forward_request);
+    mExecutor->execute_forward(forward_request, comm);
+
+    if (!lora_enabled()) {
+        auto backward_request =
+            causal_lm_profile()
+                .make_backward_request(rs, mModelConfig, mOptions, inputs, targets, grad_accum_steps, micro_step);
+        stamp_kd_fields(backward_request);
+        mExecutor->execute_backward(backward_request, comm);
+        if (mDocMaskingActive) {
+            mExecutor->clear_doc_masking();
+            mDocMaskingActive = false;
+        }
+        return;
+    }
+
+    mLoRAGrads->start_micro_step(main_stream, micro_step, grad_accum_steps);
+    auto backward_request =
+        causal_lm_profile()
+            .make_backward_request(rs, mModelConfig, mOptions, inputs, targets, grad_accum_steps, micro_step);
+    stamp_kd_fields(backward_request);
+    mExecutor->execute_backward(backward_request, comm);
+    if (mDocMaskingActive) {
+        mExecutor->clear_doc_masking();
+        mDocMaskingActive = false;
+    }
+    mLoRAGrads->end_micro_step(main_stream, comm);
+    internal::record_event_if_not_capturing(rs.BackwardDone, main_stream);
+}
+
+float DslModel::consume_kd_loss_sum() {
+    if (!mRunState) {
+        throw std::logic_error("DslModel::consume_kd_loss_sum called before allocate_run_state()");
+    }
+    auto& rs = *mRunState;
+    auto& kd = rs.kd_scratch();
+    if (!kd.loss_accum) {
+        return 0.0f;
+    }
+    float value = 0.0f;
+    CUDA_CHECK(cudaMemcpy(&value, kd.loss_accum, sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemset(kd.loss_accum, 0, sizeof(float)));
+    return value;
 }
 
 // ---- Debug-only dispatch-PP sub-range parity (BF16 full-FT, resident) ------
@@ -1268,7 +1365,8 @@ void DslModel::dispatch_pp_backward_stage(Tensor inputs,
                                           std::vector<std::pair<std::string, std::vector<std::byte>>> fwd_inject,
                                           std::vector<std::pair<std::string, std::vector<std::byte>>> inject_named,
                                           int micro_step,
-                                          int total_micro) {
+                                          int total_micro,
+                                          const float* custom_dloss_cpu) {
     GraphExecutor* ge = graph_executor();
     if (!ge) {
         throw std::runtime_error("dispatch_pp_backward_stage: requires the DSL GraphExecutor");
@@ -1388,6 +1486,23 @@ void DslModel::dispatch_pp_backward_stage(Tensor inputs,
         // One GPU holds the full batch; skip the DP loss/valid-token all-reduce
         // (it would deadlock waiting for idle GPUs).
         request.reduce_loss_on_completion = false;
+        // Custom per-token gradients (GRPO/DPO) replace the built-in CE seed. Only
+        // the loss-owning stage runs the lm-head/loss ops, so only it can consume
+        // them; other stages are driven purely by injected boundary gradients.
+        if (is_loss_stage && custom_dloss_cpu) {
+            auto& rs = *mRunState;
+            const std::size_t bt = static_cast<std::size_t>(B) * static_cast<std::size_t>(T);
+            auto& scratch = rs.grpo_native_scratch();
+            const int staging_slot = acquire_grpo_host_staging_slot(scratch);
+            upload_float_scratch(scratch.host_inference_logprobs[staging_slot],
+                                 scratch.custom_dloss,
+                                 custom_dloss_cpu,
+                                 bt,
+                                 rs.MainStream);
+            record_grpo_host_staging_slot(scratch, staging_slot, rs.MainStream);
+            request.custom_dloss_gpu = scratch.custom_dloss.get<float>();
+            request.inv_temperature_gpu = mGrpoInvTemperatureGpu;
+        }
         mExecutor->execute_backward(request, comm);
     }
     ge->clear_backward_op_range();
@@ -1707,6 +1822,88 @@ float DslModel::dispatch_pp_raw_loss() const {
     return mDispatchPpLastLoss;
 }
 
+std::vector<float> DslModel::dispatch_pp_forward_loss_stage(
+    Tensor inputs,
+    Tensor targets,
+    Tensor position_ids,
+    NCCLCommunicator& comm,
+    int lo,
+    int hi,
+    std::vector<std::pair<std::string, std::vector<std::byte>>> fwd_inject) {
+    // Forward of the loss-owning stage, returning per-token logprobs.
+    //
+    // Deliberately mirrors the forward half of dispatch_pp_backward_stage rather
+    // than calling dispatch_pp_forward_stage: that one runs with
+    // skip_finalize=true and set_preserve_layer(hi) so the NEXT stage can read its
+    // boundary. For the last stage there is no next stage, and running the
+    // lm-head/loss ops under that configuration crashes the launch
+    // (cudaErrorLaunchFailure). The loss stage needs the finalized configuration.
+    GraphExecutor* ge = graph_executor();
+    if (!ge) {
+        throw std::runtime_error("dispatch_pp_forward_loss_stage: requires the DSL GraphExecutor");
+    }
+    const long B_val = inputs.Sizes[0];
+    const long T_val = inputs.Sizes[1];
+    ge->ensure_graphs_compiled(B_val, T_val);
+
+    const CompiledGraph* fwd = ge->compiled_forward();
+    if (!fwd) {
+        throw std::runtime_error("dispatch_pp_forward_loss_stage: graphs not compiled");
+    }
+    const int num_layers = static_cast<int>(mModelConfig.NumLayers);
+    if (lo < 0 || hi < lo || hi >= num_layers) {
+        throw std::runtime_error("dispatch_pp_forward_loss_stage: invalid block range");
+    }
+
+    const bool stage_bounded = (lo == 0) || !fwd_inject.empty();
+    const std::size_t fwd_op_lo =
+        (stage_bounded && lo > 0) ? fwd->layer_start_indices[static_cast<std::size_t>(lo)] : 0;
+    const std::size_t fwd_op_hi =
+        (hi == num_layers - 1) ? fwd->ops.size() : fwd->layer_end_indices[static_cast<std::size_t>(hi)];
+
+    if (!fwd_inject.empty()) {
+        ge->set_inject_named(std::move(fwd_inject));
+    }
+    ge->set_forward_op_range(fwd_op_lo,
+                             fwd_op_hi,
+                             /*skip_init=*/false,
+                             /*skip_finalize=*/false,
+                             /*force_linear=*/true);
+    {
+        auto request =
+            causal_lm_profile().make_forward_request(*mRunState, mModelConfig, mOptions, inputs, position_ids, 0);
+        mExecutor->execute_forward(request, comm);
+    }
+    ge->clear_forward_op_range();
+    ge->clear_inject_named();
+    (void)targets;  // consumed via the model's target buffer, set by the caller
+    return dispatch_pp_read_logprobs();
+}
+
+std::vector<float> DslModel::dispatch_pp_read_logprobs() {
+    // Valid only right after a forward whose op range covered the loss ops, i.e.
+    // the loss-owning stage (dispatch_pp_forward_stage runs to ops.size() when
+    // hi == num_layers-1). cross_entropy_forward writes losses[t] = -logprob[t],
+    // and exactly 0 at masked/padding positions, so negating gives logprobs with
+    // 0 where there is no target -- identical to forward_for_grpo's contract.
+    if (!mRunState) {
+        throw std::logic_error("dispatch_pp_read_logprobs called before allocate_run_state()");
+    }
+    auto& rs = *mRunState;
+    const std::size_t n = static_cast<std::size_t>(rs.B) * static_cast<std::size_t>(rs.T);
+    std::vector<float> out(n, 0.0f);
+    if (!rs.Losses.Data || rs.Losses.nelem() < n || n == 0) {
+        return out;
+    }
+    CUDA_CHECK(
+        cudaMemcpyAsync(out.data(), rs.Losses.template get<float>(), n * sizeof(float), cudaMemcpyDeviceToHost, rs.MainStream));
+    CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
+    for (std::size_t i = 0; i < n; ++i) {
+        out[i] = -out[i];
+    }
+    return out;
+}
+
 float DslModel::dispatch_pp_apply_optimizer(NCCLCommunicator& comm,
                                             const optimizers::OptimizerConfig& opt_config,
                                             int step_idx) {
@@ -1800,6 +1997,258 @@ std::vector<float> DslModel::dispatch_pp_grad_norms_subranges(Tensor inputs,
     ge->set_skip_grad_reduce(false);
 
     return ge->block_grad_norms();
+}
+void DslModel::step_dpo_native(Tensor inputs,
+                               Tensor position_ids,
+                               Tensor targets,
+                               const float* ref_logprobs_cpu,
+                               const std::uint8_t* loss_mask_cpu,
+                               const std::int32_t* sample_starts_cpu,
+                               const std::int32_t* sample_ends_cpu,
+                               int sample_count,
+                               const std::int32_t* pair_chosen_cpu,
+                               const std::int32_t* pair_rejected_cpu,
+                               int pair_count,
+                               int grad_accum_steps,
+                               int micro_step,
+                               NCCLCommunicator& comm,
+                               const DpoNativeLossConfig& loss_config) {
+    if (!mExecutor) {
+        throw std::logic_error("DslModel::step_dpo_native called before allocate_run_state()");
+    }
+    if (!ref_logprobs_cpu || !loss_mask_cpu || !sample_starts_cpu || !sample_ends_cpu) {
+        throw std::invalid_argument("step_dpo_native requires ref_logprobs, loss_mask, sample ranges");
+    }
+    // pair_count == 0 is a valid degenerate micro-batch (an all-padding row in a
+    // sharded layout): the dloss buffer is zeroed and forward/backward still run
+    // so NCCL collectives stay matched across ranks.
+    if (sample_count < 0 || pair_count < 0) {
+        throw std::invalid_argument("step_dpo_native requires non-negative sample and pair counts");
+    }
+    if (pair_count > 0 && (!pair_chosen_cpu || !pair_rejected_cpu)) {
+        throw std::invalid_argument("step_dpo_native requires pair indices when pair_count > 0");
+    }
+    if (!(loss_config.loss_scale > 0.0f) || !std::isfinite(loss_config.loss_scale)) {
+        throw std::invalid_argument("step_dpo_native loss_scale must be finite and positive");
+    }
+    // Disable the optimizer's implicit divide-by-ValidTokenCount, matching the
+    // GRPO native path: DPO normalizes explicitly via loss_scale.
+    mUseTokenScale = false;
+
+    auto& rs = *mRunState;
+    auto& scratch = rs.grpo_native_scratch();
+    cudaStream_t main_stream = rs.MainStream;
+    const int B_val = static_cast<int>(inputs.Sizes[0]);
+    const int T_val = static_cast<int>(inputs.Sizes[1]);
+    const std::size_t bt = static_cast<std::size_t>(B_val) * static_cast<std::size_t>(T_val);
+    if (bt > static_cast<std::size_t>(scratch.max_tokens) ||
+        static_cast<std::size_t>(sample_count) > static_cast<std::size_t>(scratch.max_samples) ||
+        static_cast<std::size_t>(pair_count) > static_cast<std::size_t>(scratch.max_samples)) {
+        throw std::runtime_error("step_dpo_native inputs exceed allocated GRPO scratch capacity");
+    }
+    // Reset the (shared) metric accumulators once per optimizer step; the kernel
+    // atomicAdds across micro-steps. DPO uses the first 4 slots of the buffer.
+    if (micro_step == 0) {
+        CUDA_CHECK(cudaMemsetAsync(scratch.metrics.Data, 0, 4 * sizeof(float), main_stream));
+    }
+
+    const int staging_slot = scratch.next_host_slot;
+    scratch.next_host_slot = (scratch.next_host_slot + 1) % modules::GrpoNativeScratch::kHostStagingSlots;
+    if (scratch.host_copy_recorded[staging_slot]) {
+        CUDA_CHECK(cudaEventSynchronize(scratch.host_copy_done[staging_slot]));
+    }
+
+    // Reference per-token logprobs ride the GRPO inference_logprobs buffer.
+    std::memcpy(scratch.host_inference_logprobs[staging_slot].get<float>(), ref_logprobs_cpu, bt * sizeof(float));
+    CUDA_CHECK(cudaMemcpyAsync(scratch.inference_logprobs.Data,
+                               scratch.host_inference_logprobs[staging_slot].Data,
+                               bt * sizeof(float),
+                               cudaMemcpyHostToDevice,
+                               main_stream));
+    std::memcpy(scratch.host_loss_mask[staging_slot].get<std::uint8_t>(), loss_mask_cpu, bt * sizeof(std::uint8_t));
+    CUDA_CHECK(cudaMemcpyAsync(scratch.loss_mask.Data,
+                               scratch.host_loss_mask[staging_slot].Data,
+                               bt * sizeof(std::uint8_t),
+                               cudaMemcpyHostToDevice,
+                               main_stream));
+    if (sample_count > 0) {
+        std::memcpy(scratch.host_sample_starts[staging_slot].get<std::int32_t>(),
+                    sample_starts_cpu,
+                    static_cast<std::size_t>(sample_count) * sizeof(std::int32_t));
+        std::memcpy(scratch.host_sample_ends[staging_slot].get<std::int32_t>(),
+                    sample_ends_cpu,
+                    static_cast<std::size_t>(sample_count) * sizeof(std::int32_t));
+        CUDA_CHECK(cudaMemcpyAsync(scratch.sample_starts.Data,
+                                   scratch.host_sample_starts[staging_slot].Data,
+                                   static_cast<std::size_t>(sample_count) * sizeof(std::int32_t),
+                                   cudaMemcpyHostToDevice,
+                                   main_stream));
+        CUDA_CHECK(cudaMemcpyAsync(scratch.sample_ends.Data,
+                                   scratch.host_sample_ends[staging_slot].Data,
+                                   static_cast<std::size_t>(sample_count) * sizeof(std::int32_t),
+                                   cudaMemcpyHostToDevice,
+                                   main_stream));
+    }
+    if (pair_count > 0) {
+        std::memcpy(scratch.host_pair_chosen[staging_slot].get<std::int32_t>(),
+                    pair_chosen_cpu,
+                    static_cast<std::size_t>(pair_count) * sizeof(std::int32_t));
+        std::memcpy(scratch.host_pair_rejected[staging_slot].get<std::int32_t>(),
+                    pair_rejected_cpu,
+                    static_cast<std::size_t>(pair_count) * sizeof(std::int32_t));
+        CUDA_CHECK(cudaMemcpyAsync(scratch.pair_chosen.Data,
+                                   scratch.host_pair_chosen[staging_slot].Data,
+                                   static_cast<std::size_t>(pair_count) * sizeof(std::int32_t),
+                                   cudaMemcpyHostToDevice,
+                                   main_stream));
+        CUDA_CHECK(cudaMemcpyAsync(scratch.pair_rejected.Data,
+                                   scratch.host_pair_rejected[staging_slot].Data,
+                                   static_cast<std::size_t>(pair_count) * sizeof(std::int32_t),
+                                   cudaMemcpyHostToDevice,
+                                   main_stream));
+    }
+    CUDA_CHECK(cudaEventRecord(scratch.host_copy_done[staging_slot], main_stream));
+    scratch.host_copy_recorded[staging_slot] = true;
+
+    const bool doc_masking_active =
+        causal_lm_profile().apply_doc_masking(*mExecutor, mOptions, mModelConfig, inputs, position_ids, micro_step);
+
+    if (lora_enabled()) {
+        ensure_lora_run_state(comm, B_val, T_val);
+        if (qlora_enabled() && micro_step == 0 && mQLoRAProvider) {
+            mQLoRAProvider->invalidate_cache();
+        }
+        mLoRARunState->micro_step = micro_step;
+        mLoRARunState->is_training = true;
+    }
+
+    auto forward_request =
+        causal_lm_profile().make_eval_request(rs, mModelConfig, mOptions, inputs, position_ids, targets, micro_step);
+    forward_request.mode = ExecutionMode::Forward;
+    forward_request.reduce_loss_on_completion = false;
+    mExecutor->execute_forward(forward_request, comm);
+
+    compute_dpo_custom_dloss(scratch.custom_dloss.get<float>(),
+                             scratch.metrics.get<float>(),
+                             rs.Losses.get<float>(),
+                             scratch.inference_logprobs.get<float>(),
+                             scratch.loss_mask.get<std::uint8_t>(),
+                             scratch.sample_starts.get<std::int32_t>(),
+                             scratch.sample_ends.get<std::int32_t>(),
+                             scratch.pair_chosen.get<std::int32_t>(),
+                             scratch.pair_rejected.get<std::int32_t>(),
+                             pair_count,
+                             static_cast<int>(bt),
+                             loss_config.loss_scale,
+                             loss_config.beta,
+                             loss_config.length_norm ? 1 : 0,
+                             main_stream);
+
+    if (!lora_enabled()) {
+        auto backward_request =
+            causal_lm_profile()
+                .make_backward_request(rs, mModelConfig, mOptions, inputs, targets, grad_accum_steps, micro_step);
+        backward_request.custom_dloss_gpu = scratch.custom_dloss.get<float>();
+        mExecutor->execute_backward(backward_request, comm);
+        if (doc_masking_active) mExecutor->clear_doc_masking();
+        return;
+    }
+
+    mLoRAGrads->start_micro_step(main_stream, micro_step, grad_accum_steps);
+    auto backward_request =
+        causal_lm_profile()
+            .make_backward_request(rs, mModelConfig, mOptions, inputs, targets, grad_accum_steps, micro_step);
+    backward_request.custom_dloss_gpu = scratch.custom_dloss.get<float>();
+    mExecutor->execute_backward(backward_request, comm);
+    if (doc_masking_active) mExecutor->clear_doc_masking();
+    mLoRAGrads->end_micro_step(main_stream, comm);
+    internal::record_event_if_not_capturing(rs.BackwardDone, main_stream);
+}
+
+DpoNativeMetrics DslModel::consume_dpo_native_metrics() {
+    if (!mRunState) {
+        throw std::logic_error("DslModel::consume_dpo_native_metrics called before allocate_run_state()");
+    }
+    auto& rs = *mRunState;
+    auto& scratch = rs.grpo_native_scratch();
+    CUDA_CHECK(cudaMemcpyAsync(scratch.host_metrics.Data,
+                               scratch.metrics.Data,
+                               4 * sizeof(float),
+                               cudaMemcpyDeviceToHost,
+                               rs.MainStream));
+    CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
+
+    const auto* values = scratch.host_metrics.get<float>();
+    const float pair_count = values[3];
+    const float denom = std::max(pair_count, 1.0f);
+    DpoNativeMetrics metrics;
+    metrics.loss = values[0] / denom;
+    metrics.accuracy = values[1] / denom;
+    metrics.margin = values[2] / denom;
+    metrics.pair_count = pair_count;
+    return metrics;
+}
+
+std::vector<float>
+DslModel::compute_ref_logprobs(Tensor inputs, Tensor position_ids, Tensor targets, NCCLCommunicator& comm) {
+    if (!mExecutor) {
+        throw std::logic_error("DslModel::compute_ref_logprobs called before allocate_run_state()");
+    }
+    auto& rs = *mRunState;
+    const int B_val = static_cast<int>(inputs.Sizes[0]);
+    const int T_val = static_cast<int>(inputs.Sizes[1]);
+    const std::size_t bt = static_cast<std::size_t>(B_val) * static_cast<std::size_t>(T_val);
+
+    const bool doc_masking_active =
+        causal_lm_profile().apply_doc_masking(*mExecutor, mOptions, mModelConfig, inputs, position_ids, 0);
+
+    // BASE-ONLY reference: the DPO reference is the FROZEN start checkpoint, so the LoRA
+    // adapter must NOT be applied here — this runs inline per training step, AFTER the
+    // policy adapter has diverged (nonzero). (Previously this ran the LoRA-on training
+    // forward and only equalled the reference at init where the delta is zero; called
+    // mid-training it returned the live policy, making the DPO margin identically 0.)
+    // Disable LoRA for this one forward by nulling the executor's run_state
+    // (apply_lora_slices_forward early-returns on a null run_state). fp8 activation scaling
+    // lives in DslRunState, not the LoRA state, so this still shares the policy forward's
+    // per-batch scale: margin == 0 at init (identical base activations) and an exact frozen
+    // reference once the policy diverges. Restore the live state afterwards.
+    if (lora_enabled()) {
+        mExecutor->set_lora_state(mLoRAConfig ? &*mLoRAConfig : nullptr,
+                                  mLoRAWeights.get(),
+                                  mLoRAGrads.get(),
+                                  /*run_state=*/nullptr);
+    }
+
+    auto forward_request =
+        causal_lm_profile().make_eval_request(rs, mModelConfig, mOptions, inputs, position_ids, targets, 0);
+    forward_request.mode = ExecutionMode::Forward;
+    forward_request.reduce_loss_on_completion = false;
+    mExecutor->execute_forward(forward_request, comm);
+
+    if (lora_enabled()) {
+        ensure_lora_run_state(comm, B_val, T_val);
+        mExecutor->set_lora_state(mLoRAConfig ? &*mLoRAConfig : nullptr,
+                                  mLoRAWeights.get(),
+                                  mLoRAGrads.get(),
+                                  mLoRARunState.get());
+    }
+
+    if (doc_masking_active) {
+        mExecutor->clear_doc_masking();
+    }
+
+    // rs.Losses holds per-token CE = -logprob(target). Return logprob = -CE.
+    std::vector<float> logprobs(bt, 0.0f);
+    CUDA_CHECK(cudaMemcpyAsync(logprobs.data(),
+                               rs.Losses.get<float>(),
+                               bt * sizeof(float),
+                               cudaMemcpyDeviceToHost,
+                               rs.MainStream));
+    CUDA_CHECK(cudaStreamSynchronize(rs.MainStream));
+    for (auto& v : logprobs) {
+        v = -v;
+    }
+    return logprobs;
 }
 
 }  // namespace dsl

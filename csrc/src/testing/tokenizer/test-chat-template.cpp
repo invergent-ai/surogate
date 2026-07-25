@@ -117,3 +117,65 @@ TEST_CASE("apply_chat_template honors enable_thinking generation prompt", "[toke
     REQUIRE(count_substr(thinking, "</think>") == 0);
     REQUIRE(count_substr(no_think, "</think>") == 1);
 }
+
+TEST_CASE("thinking-only loss masks final answers and direct turns", "[tokenizer][chat-template]") {
+    const char* model_dir = std::getenv("SUROGATE_TEST_MODEL");
+    if (!model_dir) {
+        SUCCEED("SUROGATE_TEST_MODEL not set; skipping chat-template regression test");
+        return;
+    }
+    Tokenizer tok = Tokenizer::from_pretrained(model_dir);
+
+    SECTION("thinking turn trains reasoning and close marker only") {
+        std::vector<ChatMessage> msgs = {
+            {"user", "Cat fac 2+2?"},
+            {"assistant", "<think>\nAdun doi si doi.\n</think>\n\nPatru."},
+        };
+        auto enc = tok.encode_for_training(msgs, LossStrategy::THINKING_ONLY);
+        std::string trained = decode_trained(tok, enc);
+
+        REQUIRE(trained.find("Adun doi si doi.") != std::string::npos);
+        REQUIRE(trained.find("</think>") != std::string::npos);
+        REQUIRE(trained.find("Patru.") == std::string::npos);
+    }
+
+    SECTION("direct turn has no trained tokens") {
+        std::vector<ChatMessage> msgs = {
+            {"user", "Cat fac 2+2?"},
+            {"assistant", "Patru."},
+        };
+        auto enc = tok.encode_for_training(msgs, LossStrategy::THINKING_ONLY);
+        REQUIRE(decode_trained(tok, enc).empty());
+    }
+}
+
+TEST_CASE("final-only loss masks reasoning and direct turns", "[tokenizer][chat-template]") {
+    const char* model_dir = std::getenv("SUROGATE_TEST_MODEL");
+    if (!model_dir) {
+        SUCCEED("SUROGATE_TEST_MODEL not set; skipping chat-template regression test");
+        return;
+    }
+    Tokenizer tok = Tokenizer::from_pretrained(model_dir);
+
+    SECTION("thinking turn trains only the final answer") {
+        std::vector<ChatMessage> msgs = {
+            {"user", "Cat fac 2+2?"},
+            {"assistant", "<think>\nAdun doi si doi.\n</think>\n\n#### 4"},
+        };
+        auto enc = tok.encode_for_training(msgs, LossStrategy::FINAL_ONLY);
+        std::string trained = decode_trained(tok, enc);
+
+        REQUIRE(trained.find("Adun doi si doi.") == std::string::npos);
+        REQUIRE(trained.find("</think>") == std::string::npos);
+        REQUIRE(trained.find("#### 4") != std::string::npos);
+    }
+
+    SECTION("direct turn has no trained tokens") {
+        std::vector<ChatMessage> msgs = {
+            {"user", "Cat fac 2+2?"},
+            {"assistant", "#### 4"},
+        };
+        auto enc = tok.encode_for_training(msgs, LossStrategy::FINAL_ONLY);
+        REQUIRE(decode_trained(tok, enc).empty());
+    }
+}

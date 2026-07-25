@@ -1,10 +1,5 @@
 import verifiers as vf
 
-from surogate.grpo.orchestrator.hindsight import (
-    HINDSIGHT_LOGPROBS_KEY,
-    HINDSIGHT_MASK_KEY,
-    OPD_REFERENCE_LOGPROBS_KEY,
-)
 from surogate.grpo.transport import TrainingSample
 from surogate.grpo.utils.logger import get_logger
 
@@ -55,30 +50,6 @@ def interleave_rollout(output: vf.RolloutOutput) -> list[TrainingSample] | None:
         else:
             completion_mask = [bool(i) for i in tokens["completion_mask"]]
         completion_ids = list(tokens["completion_ids"])
-        extras = step.get("extras") or {}
-        opd_reference_logprobs = extras.get(OPD_REFERENCE_LOGPROBS_KEY)
-        hindsight_logprobs = extras.get(HINDSIGHT_LOGPROBS_KEY)
-        hindsight_mask = extras.get(HINDSIGHT_MASK_KEY)
-        opd_fields = (opd_reference_logprobs, hindsight_logprobs, hindsight_mask)
-        if any(value is not None for value in opd_fields) and any(value is None for value in opd_fields):
-            raise ValueError("OPD reference, hindsight step scores, and mask must be provided together")
-        if hindsight_logprobs is not None:
-            if (
-                len(opd_reference_logprobs) != len(completion_ids)
-                or len(hindsight_logprobs) != len(completion_ids)
-                or len(hindsight_mask) != len(completion_ids)
-            ):
-                raise ValueError("hindsight step scores are not completion-aligned")
-            opd_reference_logprobs = [0.0] * len(tokens["prompt_ids"]) + list(opd_reference_logprobs)
-            hindsight_logprobs = [0.0] * len(tokens["prompt_ids"]) + list(hindsight_logprobs)
-            hindsight_mask = [False] * len(tokens["prompt_ids"]) + [
-                bool(mask) and bool(trainable)
-                for mask, trainable in zip(
-                    hindsight_mask,
-                    completion_mask,
-                    strict=True,
-                )
-            ]
 
         return TrainingSample(
             prompt_ids=list(tokens["prompt_ids"]),
@@ -89,9 +60,7 @@ def interleave_rollout(output: vf.RolloutOutput) -> list[TrainingSample] | None:
             completion_temperatures=[temperature] * len(completion_ids),
             teacher_logprobs=None,
             advantage=None,
-            opd_reference_logprobs=opd_reference_logprobs,
-            hindsight_logprobs=hindsight_logprobs,
-            hindsight_mask=hindsight_mask,
+            completion_turn_ids=[step_idx] * len(completion_ids),
         )
 
     def extend_sample(sample: TrainingSample, step: vf.TrajectoryStep, prefix_len: int, step_idx: int) -> None:
@@ -99,68 +68,26 @@ def interleave_rollout(output: vf.RolloutOutput) -> list[TrainingSample] | None:
         tokens = step["tokens"]
         assert tokens is not None
 
-        # Extend with new prompt tokens (mask=False, no gradient)
+        # Extend with new prompt tokens (mask=False, no gradient). These are the
+        # env observation for this turn, so they carry this turn's index.
         new_prompt_ids = tokens["prompt_ids"][prefix_len:]
         sample.completion_ids.extend(new_prompt_ids)
         sample.completion_mask.extend([False] * len(new_prompt_ids))
         sample.completion_logprobs.extend([0.0] * len(new_prompt_ids))
         sample.completion_temperatures.extend([temperature] * len(new_prompt_ids))
-
-        extras = step.get("extras") or {}
-        step_opd_reference_logprobs = extras.get(OPD_REFERENCE_LOGPROBS_KEY)
-        step_hindsight_logprobs = extras.get(HINDSIGHT_LOGPROBS_KEY)
-        step_hindsight_mask = extras.get(HINDSIGHT_MASK_KEY)
-        step_opd_fields = (
-            step_opd_reference_logprobs,
-            step_hindsight_logprobs,
-            step_hindsight_mask,
-        )
-        if any(value is not None for value in step_opd_fields) and any(value is None for value in step_opd_fields):
-            raise ValueError("OPD reference, hindsight step scores, and mask must be provided together")
-        if step_hindsight_logprobs is not None and (
-            len(step_opd_reference_logprobs) != len(tokens["completion_ids"])
-            or len(step_hindsight_logprobs) != len(tokens["completion_ids"])
-            or len(step_hindsight_mask) != len(tokens["completion_ids"])
-        ):
-            raise ValueError("hindsight step scores are not completion-aligned")
-        if sample.hindsight_logprobs is None and step_hindsight_logprobs is not None:
-            existing_length = len(sample.prompt_ids) + len(sample.completion_ids) - len(new_prompt_ids)
-            sample.opd_reference_logprobs = [0.0] * existing_length
-            sample.hindsight_logprobs = [0.0] * existing_length
-            sample.hindsight_mask = [False] * existing_length
-        if sample.hindsight_logprobs is not None:
-            assert sample.opd_reference_logprobs is not None
-            sample.opd_reference_logprobs.extend([0.0] * len(new_prompt_ids))
-            sample.hindsight_logprobs.extend([0.0] * len(new_prompt_ids))
-            assert sample.hindsight_mask is not None
-            sample.hindsight_mask.extend([False] * len(new_prompt_ids))
+        assert sample.completion_turn_ids is not None
+        sample.completion_turn_ids.extend([step_idx] * len(new_prompt_ids))
 
         # Extend with new completion tokens
         completion_ids = tokens["completion_ids"]
         sample.completion_ids.extend(completion_ids)
+        sample.completion_turn_ids.extend([step_idx] * len(completion_ids))
         if has_error:
             sample.completion_mask.extend([False] * len(tokens["completion_mask"]))
         else:
             sample.completion_mask.extend(bool(i) for i in tokens["completion_mask"])
         sample.completion_logprobs.extend(tokens["completion_logprobs"])
         sample.completion_temperatures.extend([temperature] * len(completion_ids))
-        if sample.hindsight_logprobs is not None:
-            assert sample.hindsight_mask is not None
-            if step_hindsight_logprobs is None:
-                sample.opd_reference_logprobs.extend([0.0] * len(completion_ids))
-                sample.hindsight_logprobs.extend([0.0] * len(completion_ids))
-                sample.hindsight_mask.extend([False] * len(completion_ids))
-            else:
-                sample.opd_reference_logprobs.extend(step_opd_reference_logprobs)
-                sample.hindsight_logprobs.extend(step_hindsight_logprobs)
-                sample.hindsight_mask.extend(
-                    bool(mask) and bool(trainable)
-                    for mask, trainable in zip(
-                        step_hindsight_mask,
-                        sample.completion_mask[-len(completion_ids) :],
-                        strict=True,
-                    )
-                )
 
     # Track multiple active (prefix, sample) pairs to handle interleaved agents
     # Each entry is [prefix_tokens, sample] where prefix_tokens is the accumulated token sequence
@@ -196,4 +123,17 @@ def interleave_rollout(output: vf.RolloutOutput) -> list[TrainingSample] | None:
             new_prefix = tokens["prompt_ids"] + tokens["completion_ids"]
             active_samples.append([new_prefix, make_sample(step, step_idx=step_idx)])
 
-    return [sample for _, sample in active_samples]
+    samples = [sample for _, sample in active_samples]
+
+    # Turn ids stay the trajectory step index and are deliberately NOT re-based
+    # per sample. A trajectory frequently splits into several samples — chat
+    # templates that re-render earlier turns (e.g. Qwen strips <think> blocks
+    # from all but the latest assistant message) break the extension property,
+    # so each turn can land in its own sample. Re-basing would relabel every
+    # such sample as turn 0 and erase the depth signal the turn diagnostics
+    # exist to measure.
+    for sample in samples:
+        assert sample.completion_turn_ids is not None
+        sample.num_turns = len(trajectory)
+
+    return samples

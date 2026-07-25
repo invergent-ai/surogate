@@ -5,6 +5,7 @@ class SurogateDatasetType(str, Enum):
     text = "text"
     instruction = "instruction"
     conversation = "conversation"
+    preference = "preference"  # {prompt, chosen, rejected} pairs for offline DPO
     auto = "auto"
 
 

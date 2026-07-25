@@ -12,6 +12,7 @@ from .attention import (
     GenericGQAttention,
     GptOssAttention,
     GQAAttention,
+    LagunaAttention,
     NemotronAttention,
     Qwen3_5Attention,
     Qwen3Attention,
@@ -26,6 +27,7 @@ from .mlp import GatedMLP, GenericMLP, SimpleMLP, SwiGLUMLP
 from .moe import (
     Gemma4MoEExperts,
     GptOssMoEExperts,
+    LagunaMoEExperts,
     MoEExpertsGated,
     MoESharedExpert,
     NemotronMoEExperts,
@@ -53,6 +55,7 @@ __all__ = [
     # Attention
     "GenericGQAttention",
     "GQAAttention",
+    "LagunaAttention",
     "Qwen3Attention",
     "Qwen3VLAttention",
     "Qwen3_5Attention",
@@ -65,6 +68,7 @@ __all__ = [
     "GatedDeltaNetMixer",
     "ChunkGatedDeltaRule",
     # MoE
+    "LagunaMoEExperts",
     "MoEExpertsGated",
     "MoESharedExpert",
     "GptOssMoEExperts",

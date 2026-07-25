@@ -358,6 +358,17 @@ struct BufferPlan {
         return (has_per_layer_dims() && i < static_cast<int>(per_layer_dims.size())) ? per_layer_dims[i].intermediate
                                                                                      : M;
     }
+    [[nodiscard]] long layer_kv_dim(int i) const {
+        // Separate-projection attention (Laguna) records kv_dim directly;
+        // fall back to global Hkv * per-layer head size otherwise.
+        if (has_per_layer_dims() && i < static_cast<int>(per_layer_dims.size()) && per_layer_dims[i].kv_dim > 0) {
+            return per_layer_dims[i].kv_dim;
+        }
+        return Hkv * (Hq > 0 ? layer_attn_dim(i) / Hq : 0);
+    }
+    [[nodiscard]] long layer_gate_dim(int i) const {
+        return (has_per_layer_dims() && i < static_cast<int>(per_layer_dims.size())) ? per_layer_dims[i].gate_dim : 0;
+    }
 
     // ---------------- Stack sizing ----------------
 

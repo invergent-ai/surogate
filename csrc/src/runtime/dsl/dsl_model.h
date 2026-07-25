@@ -59,15 +59,10 @@ struct GrpoNativeLossConfig {
     float ipo_mask_high = 0.2f;
     float adv_tau = 1.0f;
     float teacher_tau = 0.0f;
-    float opd_tau = 0.0f;
-    float opd_beta = 1.0f;
-    float replay_tau = 0.0f;
     float kl_tau = 1.0e-3f;
 };
 
 struct GrpoNativeMetrics {
-    float sample_count = 0.0f;
-    float policy_sample_count = 0.0f;
     float policy_loss = 0.0f;
     float mismatch_kl = 0.0f;
     float masked_mismatch_kl = 0.0f;
@@ -76,15 +71,34 @@ struct GrpoNativeMetrics {
     float is_masked_low = 0.0f;
     float is_masked_high = 0.0f;
     float teacher_kl = 0.0f;
-    float opd_loss = 0.0f;
-    float opd_gate = 0.0f;
-    float opd_shift = 0.0f;
-    float opd_tokens = 0.0f;
-    float replay_loss = 0.0f;
-    float replay_tokens = 0.0f;
-    float replay_weight_sum = 0.0f;
     float keep_tokens = 0.0f;
     float total_tokens = 0.0f;
+};
+
+struct DpoNativeLossConfig {
+    float loss_scale = 1.0f;
+    float beta = 0.1f;
+    // Divide each sequence's response-token logprob sum by its response length
+    // (SimPO-style); off for minimal pairs where chosen/rejected lengths match.
+    bool length_norm = false;
+};
+
+struct DpoNativeMetrics {
+    float loss = 0.0f;      ///< mean -log sigmoid(beta * margin) over pairs
+    float accuracy = 0.0f;  ///< fraction of pairs with margin > 0
+    float margin = 0.0f;    ///< mean margin
+    /// Raw pair count the means were normalized by (before the max(.,1) clamp);
+    /// lets callers re-weight when combining across data-parallel ranks.
+    float pair_count = 0.0f;
+};
+
+/// Configuration for the offline knowledge-distillation step.
+/// Total loss: ce_weight * CE + kd_weight * tau^2 * KL(teacher_topk || student).
+struct KdLossConfig {
+    int top_k = 32;
+    float temperature = 1.0f;
+    float kd_weight = 0.5f;
+    float ce_weight = 0.5f;
 };
 
 class EmptyTensorContainer final : public ITensorContainer {
@@ -115,6 +129,11 @@ public:
     float validate(Tensor inputs, Tensor position_ids, Tensor targets, NCCLCommunicator& comm, int micro_step) override;
     void backward(Tensor inputs, Tensor targets, NCCLCommunicator& comm, int grad_accum_steps, int micro_step) override;
 
+    // ---- Chunked-sequence training (KV-checkpointed chunks) ----
+    void set_sequence_chunk(int idx, int count, const ChunkPackMeta* pack = nullptr) override;
+    void zero_sequence_chunk_dkv() override;
+    void forward_no_save(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm, int micro_step) override;
+
     // ---- Debug-only dispatch-PP sub-range parity (BF16 full-FT, resident) --
     // Whole-graph forward; returns the final hidden state flattened to host f32.
     std::vector<float> dispatch_pp_forward_hidden(Tensor inputs, Tensor position_ids, NCCLCommunicator& comm);
@@ -143,6 +162,11 @@ public:
     // loss; otherwise inject the incoming boundary gradients (inject_named:
     // d_blocks[hi].res_att / .mlp_down). Read results via the executor readers
     // (block_grad_norms, read_named_bytes for d_blocks[lo-1].*).
+    // custom_dloss_cpu (optional, host [B*T]): when set AND this is the loss stage,
+    // the backward is seeded from these per-token gradients instead of the built-in
+    // cross-entropy. This is what lets GRPO/DPO-style objectives run under
+    // dispatch-PP; it mirrors backward_grpo()'s custom_dloss_gpu injection. Ignored
+    // on non-loss stages (they only propagate incoming boundary gradients).
     void dispatch_pp_backward_stage(Tensor inputs,
                                     Tensor targets,
                                     Tensor position_ids,
@@ -153,7 +177,8 @@ public:
                                     std::vector<std::pair<std::string, std::vector<std::byte>>> fwd_inject,
                                     std::vector<std::pair<std::string, std::vector<std::byte>>> inject_named,
                                     int micro_step = 0,
-                                    int total_micro = 1);
+                                    int total_micro = 1,
+                                    const float* custom_dloss_cpu = nullptr);
     // Whole-graph backward; returns per-block weight-grad L2 norms (block order).
     std::vector<float>
     dispatch_pp_grad_norms_whole(Tensor inputs, Tensor targets, Tensor position_ids, NCCLCommunicator& comm);
@@ -191,6 +216,22 @@ public:
     // which the dispatch backward leaves unset. Monotone with the mean loss, so it
     // tracks convergence.
     [[nodiscard]] float dispatch_pp_raw_loss() const;
+    // Forward of the loss-owning stage, returning per-token logprobs. Use this
+    // instead of dispatch_pp_forward_stage for the last stage: that one preserves
+    // its output boundary for the next stage and skips finalize, which is wrong
+    // (and crashes the launch) once the lm-head/loss ops are in range.
+    std::vector<float> dispatch_pp_forward_loss_stage(
+        Tensor inputs,
+        Tensor targets,
+        Tensor position_ids,
+        NCCLCommunicator& comm,
+        int lo,
+        int hi,
+        std::vector<std::pair<std::string, std::vector<std::byte>>> fwd_inject);
+    // Per-token logprobs (B*T, = -losses) from the last forward that ran the loss
+    // ops. GRPO computes its per-token gradients from these, then feeds them back
+    // through dispatch_pp_backward_stage's custom_dloss_cpu.
+    std::vector<float> dispatch_pp_read_logprobs();
     // Valid (non-pad) tokens the loss stage counted for the last microbatch; the multi-GPU
     // trainer sums these across microbatches and publishes the total via the setter below so
     // dispatch_pp_apply_optimizer (which runs on the master GPU, not the loss GPU) can scale
@@ -399,14 +440,67 @@ public:
                           NCCLCommunicator& comm,
                           const GrpoNativeLossConfig& loss_config,
                           const float* temperatures_cpu = nullptr,
-                          const float* teacher_logprobs_cpu = nullptr,
-                          const float* opd_reference_logprobs_cpu = nullptr,
-                          const float* hindsight_logprobs_cpu = nullptr,
-                          const std::uint8_t* hindsight_mask_cpu = nullptr,
-                          const std::uint8_t* replay_mask_cpu = nullptr,
-                          const float* replay_weights_cpu = nullptr);
+                          const float* teacher_logprobs_cpu = nullptr);
     GrpoNativeMetrics consume_grpo_native_metrics();
-    float preflight_grpo_native_lora_gradient_norm(NCCLCommunicator& comm, float grad_clip);
+
+    /// Knowledge-distillation training step: standard SFT forward + backward
+    /// with a top-K teacher signal injected into the fused LM-head loss.
+    /// Unlike the GRPO steps this keeps standard loss semantics: CE losses and
+    /// ValidTokenCount accumulate across micro-steps, gradients are normalized
+    /// by 1/valid_token_count (mUseTokenScale), and get_loss() reports mean CE.
+    ///
+    /// kd_ids_cpu / kd_logprobs_cpu: CPU arrays of shape [B*T*top_k] holding
+    /// the teacher's top-K token ids / raw logprobs, row i aligned with
+    /// targets[i]. The KD loss metric accumulates on device; read it once per
+    /// optimizer step via consume_kd_loss_sum().
+    void step_with_kd(Tensor inputs,
+                      Tensor position_ids,
+                      Tensor targets,
+                      const std::int32_t* kd_ids_cpu,
+                      const float* kd_logprobs_cpu,
+                      int grad_accum_steps,
+                      int micro_step,
+                      NCCLCommunicator& comm,
+                      const KdLossConfig& kd_config);
+
+    /// Rank-local sum of the KD loss over all micro-steps since the last call
+    /// (synchronous D2H read; zeroes the accumulator).
+    float consume_kd_loss_sum();
+
+    /// Offline DPO micro-step: forward over a packed batch of (chosen, rejected)
+    /// sequences, compute the per-pair sigmoid-DPO gradient against precomputed
+    /// reference log-probs, and backward through the LM head. Reuses the GRPO
+    /// native scratch (the inference_logprobs buffer carries ref_logprobs).
+    ///
+    /// ref_logprobs_cpu: CPU FP32 [B*T] reference per-token logprob in the shifted
+    ///   layout (ref[out_idx] = logprob of logical token out_idx+1; masked = any).
+    /// sample_starts/ends_cpu: token ranges [start,end) of each packed sequence.
+    /// pair_chosen/pair_rejected_cpu: per pair, the chosen/rejected SAMPLE index.
+    void step_dpo_native(Tensor inputs,
+                         Tensor position_ids,
+                         Tensor targets,
+                         const float* ref_logprobs_cpu,
+                         const std::uint8_t* loss_mask_cpu,
+                         const std::int32_t* sample_starts_cpu,
+                         const std::int32_t* sample_ends_cpu,
+                         int sample_count,
+                         const std::int32_t* pair_chosen_cpu,
+                         const std::int32_t* pair_rejected_cpu,
+                         int pair_count,
+                         int grad_accum_steps,
+                         int micro_step,
+                         NCCLCommunicator& comm,
+                         const DpoNativeLossConfig& loss_config);
+    DpoNativeMetrics consume_dpo_native_metrics();
+
+    /// Per-token reference log-probs for DPO, via the SAME fused-loss forward
+    /// step_dpo_native uses (fp8- and multi-GPU-safe), with NO backward. Returns
+    /// logprob[i] = -loss[i] in the shifted layout (logprob of logical token i+1),
+    /// matching the ref_logprobs the dpo_dloss kernel expects. Call at init: LoRA B
+    /// is zero so the forward equals the start checkpoint = π_ref. Unlike
+    /// compute_logprobs (forward-only + full logits) this neither trips the GDN
+    /// forward-save path nor the fp8 full-logits lm-head GEMM.
+    std::vector<float> compute_ref_logprobs(Tensor inputs, Tensor position_ids, Tensor targets, NCCLCommunicator& comm);
 
     void init_weights(NCCLCommunicator& comm) override;
     void import_weights(const std::string& file_name, bool allow_cast, NCCLCommunicator& comm) override;
@@ -527,6 +621,7 @@ private:
                                               // published onto the optimizer GPU for valid-token
                                               // grad-norm scaling (the dispatch path skips reduce_loss)
     bool mDocMaskingActive = false;           // set by forward(), cleared by backward()
+    bool mSequenceChunkActive = false;        // chunked-sequence mode (doc masking handled per chunk)
     float* mGrpoInvTemperatureGpu = nullptr;  // persists from forward_for_grpo() to backward_grpo()
 
     // Adapter merge state (optional — stacked LoRA)

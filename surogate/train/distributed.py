@@ -15,6 +15,7 @@ from surogate.train.adapter_init import (
     import_initial_trainable_adapter,
 )
 from surogate.train.vision import OnTheFlyMultimodalBatcher, init_mm_helpers, load_multimodal_datasets
+from surogate.utils.lora_compat import ensure_surogate_lora_compat, ensure_vllm_lora_compat
 
 # Lazy import Ray to avoid dependency when not using distributed training
 _ray = None
@@ -458,7 +459,9 @@ class NodeTrainer:
                 config=pretrained_config,
                 options=self._config.runtime_config,
                 batch_size=self._config.per_device_train_batch_size,
-                seq_len=self._config.sequence_len,
+                # Chunked-sequence training compiles the graph at chunk size;
+                # step() still receives full-length [B, sequence_len] batches.
+                seq_len=self._config.trainer_seq_len,
                 grad_accum=self._config.gradient_accumulation_steps,
                 memcpy_all_gather=self._config.memcpy_all_gather,
                 memcpy_send_recv=self._config.memcpy_send_recv,
@@ -473,7 +476,9 @@ class NodeTrainer:
                 config=pretrained_config,
                 options=self._config.runtime_config,
                 batch_size=self._config.per_device_train_batch_size,
-                seq_len=self._config.sequence_len,
+                # Chunked-sequence training compiles the graph at chunk size;
+                # step() still receives full-length [B, sequence_len] batches.
+                seq_len=self._config.trainer_seq_len,
                 grad_accum=self._config.gradient_accumulation_steps,
                 memcpy_all_gather=self._config.memcpy_all_gather,
                 memcpy_send_recv=self._config.memcpy_send_recv,
@@ -506,6 +511,11 @@ class NodeTrainer:
             self._trainer.import_weights(weights_path)
             import_initial_trainable_adapter(self._trainer, initial_adapter)
             logger.info(f"Node {self.node_rank}: Loading checkpoint from step {self.start_step}...")
+            if self._config.lora:
+                ensure_surogate_lora_compat(
+                    Path(self._config.checkpoint_dir) / f"step_{self.start_step:08d}",
+                    self._config.model_dir,
+                )
             self._trainer.load_checkpoint(str(self._config.checkpoint_dir), self.start_step)
             logger.info(f"Node {self.node_rank}: Checkpoint loaded successfully")
         else:
@@ -1492,6 +1502,8 @@ class RayDistributedTrainer:
                             logger.warning(
                                 f"Export timed out after 120s. {len(ready)}/{len(export_refs)} nodes completed."
                             )
+
+                    ensure_vllm_lora_compat(adapter_dir, config.model_dir)
 
                     # Merge adapter into base model if requested (only on head node)
                     if config.merge_adapter:

@@ -789,6 +789,291 @@ __global__ void chunked_cross_entropy_backward_kernel(floatX* dlogits,
     }
 }
 
+// ----------------------------------------------------------------------------
+// Knowledge-distillation variants of the cross-entropy backward.
+//
+// dlogit = dloss[t] * (ce_w*(p - onehot) + kd_scale*(p_tau - q_scatter))
+// where p_tau = softmax(capped_logits / tau) and q is the renormalized
+// teacher top-K distribution. Kept as separate kernels so the standard CE
+// backward's inner loop stays untouched.
+//
+// dlogits aliases logits (in-place), so the capped logit values at the
+// teacher's top-K ids are preloaded into shared memory before the dense
+// pass overwrites them.
+
+constexpr int KD_MAX_TOPK_SMEM = 1024;
+
+template <class floatX>
+__global__ void kd_cross_entropy_backward_kernel(floatX* dlogits,
+                                                 const floatX* logits,
+                                                 const float* logsumexp,
+                                                 const float* dloss,
+                                                 const int* targets,
+                                                 int BT,
+                                                 int V,
+                                                 int P,
+                                                 float softcap,
+                                                 KdBackwardArgs kd) {
+    __shared__ float kd_capped[KD_MAX_TOPK_SMEM];
+
+    int idx = static_cast<int>(blockIdx.x);
+    if (idx >= BT) {
+        return;
+    }
+    int ix = targets[idx];
+    if (ix == -100) {
+        for (int i = threadIdx.x; i < V; i += blockDim.x) {
+            dlogits[static_cast<int64_t>(idx) * P + i] = (floatX)0.0f;
+        }
+        return;
+    }
+
+    float lse = 0.0f;
+    if (logsumexp) {
+        lse = logsumexp[idx];
+    } else {
+        SoftmaxParams sp = prepare_softmax_blockwide3(idx, logits, V, P);
+        lse = sp.Offset + logf(1.0f / sp.Scale);
+    }
+    const float lse_tau = kd.lse_tau[idx];
+    const float dloss_val = dloss ? dloss[idx] : 1.0f;
+    const floatX* logits_vec = logits + static_cast<int64_t>(idx) * P;
+    const float inv_softcap = softcap > 0.0f ? 1.0f / softcap : 0.0f;
+    const int64_t kd_base = static_cast<int64_t>(idx) * kd.K;
+
+    // Preserve the capped logit at each teacher id before the dense pass
+    // overwrites the (aliased) logits buffer with gradients.
+    for (int k = threadIdx.x; k < kd.K; k += blockDim.x) {
+        int id = kd.ids[kd_base + k];
+        if (id >= 0 && id < V) {
+            kd_capped[k] = maybe_softcap_value((float)logits_vec[id], softcap);
+        }
+    }
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < V; i += blockDim.x) {
+        float raw = (float)logits_vec[i];
+        float capped = maybe_softcap_value(raw, softcap);
+        float prob = expf(capped - lse);
+        float prob_tau = expf(capped * kd.inv_tau - lse_tau);
+        float indicator = (i == ix) ? 1.0f : 0.0f;
+        float dlogit = (kd.ce_w * (prob - indicator) + kd.kd_scale * prob_tau) * dloss_val;
+        if (softcap > 0.0f) {
+            float y = capped * inv_softcap;
+            dlogit *= 1.0f - y * y;
+        }
+        dlogits[static_cast<int64_t>(idx) * P + i] = (floatX)dlogit;
+    }
+    __syncthreads();
+
+    float kl_partial = 0.0f;
+    for (int k = threadIdx.x; k < kd.K; k += blockDim.x) {
+        int id = kd.ids[kd_base + k];
+        if (id < 0 || id >= V) {
+            continue;
+        }
+        float qk = kd.q[kd_base + k];
+        float capped = kd_capped[k];
+        float sub = kd.kd_scale * qk * dloss_val;
+        if (softcap > 0.0f) {
+            float y = capped * inv_softcap;
+            sub *= 1.0f - y * y;
+        }
+        int64_t out_idx = static_cast<int64_t>(idx) * P + id;
+        dlogits[out_idx] = (floatX)((float)dlogits[out_idx] - sub);
+        kl_partial += qk * (logf(fmaxf(qk, 1e-30f)) - (capped * kd.inv_tau - lse_tau));
+    }
+    if (kd.kd_loss_accum) {
+        float row_kl = blockReduce<warpReduceSum>(kl_partial);
+        if (threadIdx.x == 0) {
+            atomicAdd(kd.kd_loss_accum, kd.tau_sq * row_kl);
+        }
+    }
+}
+
+template <class floatX>
+__global__ void kd_chunked_cross_entropy_backward_kernel(floatX* dlogits,
+                                                         const floatX* logits,
+                                                         const float* logsumexp,
+                                                         const float* dloss,
+                                                         const int* targets,
+                                                         int BT,
+                                                         int V,
+                                                         int P,
+                                                         int chunk_size,
+                                                         float softcap,
+                                                         KdBackwardArgs kd) {
+    __shared__ float kd_capped[KD_MAX_TOPK_SMEM];
+
+    int row_idx = static_cast<int>(blockIdx.x);
+    int block_idx = static_cast<int>(blockIdx.y);
+    int start = block_idx * chunk_size;
+    if (row_idx >= BT || start >= V) {
+        return;
+    }
+    int end = (start + chunk_size < V) ? (start + chunk_size) : V;
+
+    int ix = targets[row_idx];
+    if (ix == -100) {
+        for (int i = start + threadIdx.x; i < end; i += blockDim.x) {
+            dlogits[static_cast<int64_t>(row_idx) * P + i] = (floatX)0.0f;
+        }
+        return;
+    }
+
+    float lse = logsumexp ? logsumexp[row_idx] : 0.0f;
+    const float lse_tau = kd.lse_tau[row_idx];
+    const float dloss_val = dloss ? dloss[row_idx] : 1.0f;
+    const floatX* logits_vec = logits + static_cast<int64_t>(row_idx) * P;
+    const float inv_softcap = softcap > 0.0f ? 1.0f / softcap : 0.0f;
+    const int64_t kd_base = static_cast<int64_t>(row_idx) * kd.K;
+
+    // Each (row, chunk) block owns [start, end) exclusively, so preloading
+    // only the in-range teacher ids is race-free against other chunks.
+    for (int k = threadIdx.x; k < kd.K; k += blockDim.x) {
+        int id = kd.ids[kd_base + k];
+        if (id >= start && id < end) {
+            kd_capped[k] = maybe_softcap_value((float)logits_vec[id], softcap);
+        }
+    }
+    __syncthreads();
+
+    for (int i = start + threadIdx.x; i < end; i += blockDim.x) {
+        float raw = (float)logits_vec[i];
+        float capped = maybe_softcap_value(raw, softcap);
+        float prob = expf(capped - lse);
+        float prob_tau = expf(capped * kd.inv_tau - lse_tau);
+        float indicator = (i == ix) ? 1.0f : 0.0f;
+        float dlogit = (kd.ce_w * (prob - indicator) + kd.kd_scale * prob_tau) * dloss_val;
+        if (softcap > 0.0f) {
+            float y = capped * inv_softcap;
+            dlogit *= 1.0f - y * y;
+        }
+        dlogits[static_cast<int64_t>(row_idx) * P + i] = (floatX)dlogit;
+    }
+    __syncthreads();
+
+    float kl_partial = 0.0f;
+    for (int k = threadIdx.x; k < kd.K; k += blockDim.x) {
+        int id = kd.ids[kd_base + k];
+        if (id < start || id >= end) {
+            continue;
+        }
+        float qk = kd.q[kd_base + k];
+        float capped = kd_capped[k];
+        float sub = kd.kd_scale * qk * dloss_val;
+        if (softcap > 0.0f) {
+            float y = capped * inv_softcap;
+            sub *= 1.0f - y * y;
+        }
+        int64_t out_idx = static_cast<int64_t>(row_idx) * P + id;
+        dlogits[out_idx] = (floatX)((float)dlogits[out_idx] - sub);
+        kl_partial += qk * (logf(fmaxf(qk, 1e-30f)) - (capped * kd.inv_tau - lse_tau));
+    }
+    if (kd.kd_loss_accum) {
+        float row_kl = blockReduce<warpReduceSum>(kl_partial);
+        if (threadIdx.x == 0) {
+            atomicAdd(kd.kd_loss_accum, kd.tau_sq * row_kl);
+        }
+    }
+}
+
+// Renormalize teacher top-K logprobs into probabilities at temperature tau.
+// Entries whose id falls outside the student vocab [0, V) are excluded from
+// the normalization and receive q = 0 — otherwise their probability mass would
+// be counted in the normalizer but never scattered, leaving the KD gradient's
+// vocab-sum non-zero (a uniform drift on every logit of that token).
+__global__ void kd_normalize_teacher_topk_kernel(float* q_out,
+                                                 const float* teacher_logprobs,
+                                                 const int* ids,
+                                                 const int* targets,
+                                                 int BT,
+                                                 int K,
+                                                 int V,
+                                                 float inv_tau) {
+    int row = static_cast<int>(blockIdx.x);
+    if (row >= BT) {
+        return;
+    }
+    const int64_t base = static_cast<int64_t>(row) * K;
+    if (targets[row] == -100) {
+        for (int k = threadIdx.x; k < K; k += blockDim.x) {
+            q_out[base + k] = 0.0f;
+        }
+        return;
+    }
+
+    float thread_max = -INFINITY;
+    for (int k = threadIdx.x; k < K; k += blockDim.x) {
+        int id = ids[base + k];
+        if (id >= 0 && id < V) {
+            thread_max = fmaxf(thread_max, teacher_logprobs[base + k] * inv_tau);
+        }
+    }
+    float block_max = blockReduce<warpReduceMax>(thread_max, true, -INFINITY);
+    if (block_max == -INFINITY) {
+        // No usable teacher entries (all out of range or -inf) — no KD signal.
+        for (int k = threadIdx.x; k < K; k += blockDim.x) {
+            q_out[base + k] = 0.0f;
+        }
+        return;
+    }
+
+    float thread_sum = 0.0f;
+    for (int k = threadIdx.x; k < K; k += blockDim.x) {
+        int id = ids[base + k];
+        if (id >= 0 && id < V) {
+            thread_sum += expf(teacher_logprobs[base + k] * inv_tau - block_max);
+        }
+    }
+    float block_sum = blockReduce<warpReduceSum>(thread_sum, true);
+
+    const float inv_sum = 1.0f / block_sum;
+    for (int k = threadIdx.x; k < K; k += blockDim.x) {
+        int id = ids[base + k];
+        q_out[base + k] = (id >= 0 && id < V) ? expf(teacher_logprobs[base + k] * inv_tau - block_max) * inv_sum : 0.0f;
+    }
+}
+
+// Per-(row, chunk) partial logsumexp of softcapped logits scaled by inv_tau.
+// Final per-row reduction is done by logsumexp_reduce_kernel.
+template <class floatX>
+__global__ void kd_row_chunk_logsumexp_kernel(float* chunk_lse,
+                                              const floatX* logits,
+                                              int BT,
+                                              int V,
+                                              int P,
+                                              int n_chunks,
+                                              int chunk_size,
+                                              float inv_tau,
+                                              float softcap) {
+    int row_idx = static_cast<int>(blockIdx.x);
+    int chunk_idx = static_cast<int>(blockIdx.y);
+    int start = chunk_idx * chunk_size;
+    if (row_idx >= BT || start >= V) {
+        return;
+    }
+    int end = (start + chunk_size < V) ? (start + chunk_size) : V;
+
+    float thread_maxval = -INFINITY;
+    float thread_sumval = 0.0f;
+    for (int i = start + threadIdx.x; i < end; i += blockDim.x) {
+        float v = maybe_softcap_value((float)logits[static_cast<int64_t>(row_idx) * P + i], softcap) * inv_tau;
+        float old_max = thread_maxval;
+        thread_maxval = fmaxf(thread_maxval, v);
+        thread_sumval *= expf(old_max - thread_maxval);
+        thread_sumval += expf(v - thread_maxval);
+    }
+
+    float block_maxval = blockReduce<warpReduceMax>(thread_maxval, false, -INFINITY);
+    thread_sumval *= expf(thread_maxval - block_maxval);
+    float block_sumval = blockReduce<warpReduceSum>(thread_sumval);
+
+    if (threadIdx.x == 0) {
+        chunk_lse[static_cast<int64_t>(row_idx) * n_chunks + chunk_idx] = block_maxval + logf(block_sumval);
+    }
+}
+
 template <class floatX>
 __global__ void
 argmax_correct_kernel(const floatX* logits, const int* targets, int* correct_count, int BT, int V, int P) {
@@ -909,6 +1194,58 @@ void fused_cross_entropy_forward(nv_bfloat16* logits,
     CUDA_CHECK(cudaGetLastError());
 }
 
+namespace {
+
+void validate_kd_args(const KdBackwardArgs* kd) {
+    if (!kd) {
+        return;
+    }
+    assert(kd->ids != nullptr && kd->q != nullptr && kd->lse_tau != nullptr);
+    assert(kd->K > 0 && kd->K <= 1024);
+}
+
+}  // namespace
+
+template <typename Type>
+static void fused_cross_entropy_backward_imp(Type* dlogits,
+                                             const Type* logits,
+                                             const float* logsumexp,
+                                             const float* dloss,
+                                             const int* targets,
+                                             int BT,
+                                             int V,
+                                             int P,
+                                             float softcap,
+                                             cudaStream_t stream,
+                                             const KdBackwardArgs* kd) {
+    const int block_size = 256;
+    const int grid_size = BT;
+    if (kd && kd->ids) {
+        validate_kd_args(kd);
+        kd_cross_entropy_backward_kernel<<<grid_size, block_size, 0, stream>>>(dlogits,
+                                                                               logits,
+                                                                               logsumexp,
+                                                                               dloss,
+                                                                               targets,
+                                                                               BT,
+                                                                               V,
+                                                                               P,
+                                                                               softcap,
+                                                                               *kd);
+    } else {
+        cross_entropy_backward_kernel<<<grid_size, block_size, 0, stream>>>(dlogits,
+                                                                            logits,
+                                                                            logsumexp,
+                                                                            dloss,
+                                                                            targets,
+                                                                            BT,
+                                                                            V,
+                                                                            P,
+                                                                            softcap);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void fused_cross_entropy_backward(float* dlogits,
                                   const float* logits,
                                   const float* logsumexp,
@@ -918,19 +1255,9 @@ void fused_cross_entropy_backward(float* dlogits,
                                   int V,
                                   int P,
                                   float softcap,
-                                  cudaStream_t stream) {
-    const int block_size = 256;
-    const int grid_size = BT;
-    cross_entropy_backward_kernel<<<grid_size, block_size, 0, stream>>>(dlogits,
-                                                                        logits,
-                                                                        logsumexp,
-                                                                        dloss,
-                                                                        targets,
-                                                                        BT,
-                                                                        V,
-                                                                        P,
-                                                                        softcap);
-    CUDA_CHECK(cudaGetLastError());
+                                  cudaStream_t stream,
+                                  const KdBackwardArgs* kd) {
+    fused_cross_entropy_backward_imp(dlogits, logits, logsumexp, dloss, targets, BT, V, P, softcap, stream, kd);
 }
 
 void fused_cross_entropy_backward(nv_bfloat16* dlogits,
@@ -942,19 +1269,9 @@ void fused_cross_entropy_backward(nv_bfloat16* dlogits,
                                   int V,
                                   int P,
                                   float softcap,
-                                  cudaStream_t stream) {
-    const int block_size = 256;
-    const int grid_size = BT;
-    cross_entropy_backward_kernel<<<grid_size, block_size, 0, stream>>>(dlogits,
-                                                                        logits,
-                                                                        logsumexp,
-                                                                        dloss,
-                                                                        targets,
-                                                                        BT,
-                                                                        V,
-                                                                        P,
-                                                                        softcap);
-    CUDA_CHECK(cudaGetLastError());
+                                  cudaStream_t stream,
+                                  const KdBackwardArgs* kd) {
+    fused_cross_entropy_backward_imp(dlogits, logits, logsumexp, dloss, targets, BT, V, P, softcap, stream, kd);
 }
 
 void chunked_cross_entropy_forward(float* logits,
@@ -1041,6 +1358,49 @@ void chunked_cross_entropy_forward(nv_bfloat16* logits,
     }
 }
 
+template <typename Type>
+static void chunked_cross_entropy_backward_imp(Type* dlogits,
+                                               const Type* logits,
+                                               const float* logsumexp,
+                                               const float* dloss,
+                                               const int* targets,
+                                               int BT,
+                                               int V,
+                                               int P,
+                                               float softcap,
+                                               cudaStream_t stream,
+                                               const KdBackwardArgs* kd) {
+    const int block_size = 256;
+    const int n_blocks = (V + CROSS_ENTROPY_BACKWARD_CHUNK_SIZE - 1) / CROSS_ENTROPY_BACKWARD_CHUNK_SIZE;
+    dim3 grid(BT, n_blocks);
+    if (kd && kd->ids) {
+        validate_kd_args(kd);
+        kd_chunked_cross_entropy_backward_kernel<<<grid, block_size, 0, stream>>>(dlogits,
+                                                                                  logits,
+                                                                                  logsumexp,
+                                                                                  dloss,
+                                                                                  targets,
+                                                                                  BT,
+                                                                                  V,
+                                                                                  P,
+                                                                                  CROSS_ENTROPY_BACKWARD_CHUNK_SIZE,
+                                                                                  softcap,
+                                                                                  *kd);
+    } else {
+        chunked_cross_entropy_backward_kernel<<<grid, block_size, 0, stream>>>(dlogits,
+                                                                               logits,
+                                                                               logsumexp,
+                                                                               dloss,
+                                                                               targets,
+                                                                               BT,
+                                                                               V,
+                                                                               P,
+                                                                               CROSS_ENTROPY_BACKWARD_CHUNK_SIZE,
+                                                                               softcap);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void chunked_cross_entropy_backward(float* dlogits,
                                     const float* logits,
                                     const float* logsumexp,
@@ -1050,21 +1410,9 @@ void chunked_cross_entropy_backward(float* dlogits,
                                     int V,
                                     int P,
                                     float softcap,
-                                    cudaStream_t stream) {
-    const int block_size = 256;
-    const int n_blocks = (V + CROSS_ENTROPY_BACKWARD_CHUNK_SIZE - 1) / CROSS_ENTROPY_BACKWARD_CHUNK_SIZE;
-    dim3 grid(BT, n_blocks);
-    chunked_cross_entropy_backward_kernel<<<grid, block_size, 0, stream>>>(dlogits,
-                                                                           logits,
-                                                                           logsumexp,
-                                                                           dloss,
-                                                                           targets,
-                                                                           BT,
-                                                                           V,
-                                                                           P,
-                                                                           CROSS_ENTROPY_BACKWARD_CHUNK_SIZE,
-                                                                           softcap);
-    CUDA_CHECK(cudaGetLastError());
+                                    cudaStream_t stream,
+                                    const KdBackwardArgs* kd) {
+    chunked_cross_entropy_backward_imp(dlogits, logits, logsumexp, dloss, targets, BT, V, P, softcap, stream, kd);
 }
 
 void chunked_cross_entropy_backward(nv_bfloat16* dlogits,
@@ -1076,21 +1424,9 @@ void chunked_cross_entropy_backward(nv_bfloat16* dlogits,
                                     int V,
                                     int P,
                                     float softcap,
-                                    cudaStream_t stream) {
-    const int block_size = 256;
-    const int n_blocks = (V + CROSS_ENTROPY_BACKWARD_CHUNK_SIZE - 1) / CROSS_ENTROPY_BACKWARD_CHUNK_SIZE;
-    dim3 grid(BT, n_blocks);
-    chunked_cross_entropy_backward_kernel<<<grid, block_size, 0, stream>>>(dlogits,
-                                                                           logits,
-                                                                           logsumexp,
-                                                                           dloss,
-                                                                           targets,
-                                                                           BT,
-                                                                           V,
-                                                                           P,
-                                                                           CROSS_ENTROPY_BACKWARD_CHUNK_SIZE,
-                                                                           softcap);
-    CUDA_CHECK(cudaGetLastError());
+                                    cudaStream_t stream,
+                                    const KdBackwardArgs* kd) {
+    chunked_cross_entropy_backward_imp(dlogits, logits, logsumexp, dloss, targets, BT, V, P, softcap, stream, kd);
 }
 
 // ----------------------------------------------------------------------------
@@ -1459,6 +1795,159 @@ void compute_grpo_custom_dloss(float* custom_dloss,
     CUDA_CHECK(cudaGetLastError());
 }
 
+// --- DPO custom dloss -------------------------------------------------------
+// Reduce one sample's response-token log-prob sums (policy and reference) plus
+// the response-token count. All 256 block threads must call this in lock-step;
+// it is invoked twice per block (chosen then rejected) and reuses the same
+// shared buffers, so a trailing __syncthreads() guards the next invocation.
+__device__ void dpo_reduce_sample(const float* losses,
+                                  const float* ref_logprobs,
+                                  const std::uint8_t* loss_mask,
+                                  int start,
+                                  int end,
+                                  double& s_pol,
+                                  double& s_ref,
+                                  int& len) {
+    __shared__ double sh_pol[256];
+    __shared__ double sh_ref[256];
+    __shared__ int sh_len[256];
+
+    double lp = 0.0;
+    double lr = 0.0;
+    int n = 0;
+    for (int t = start + 1 + static_cast<int>(threadIdx.x); t < end; t += static_cast<int>(blockDim.x)) {
+        if (loss_mask[t] == 0) {
+            continue;
+        }
+        const int out_idx = t - 1;  // shifted layout: trainer_logprob = -losses[out_idx]
+        lp += -static_cast<double>(losses[out_idx]);
+        lr += static_cast<double>(ref_logprobs[out_idx]);
+        n += 1;
+    }
+
+    sh_pol[threadIdx.x] = lp;
+    sh_ref[threadIdx.x] = lr;
+    sh_len[threadIdx.x] = n;
+    __syncthreads();
+
+    for (int stride = static_cast<int>(blockDim.x) / 2; stride > 0; stride >>= 1) {
+        if (static_cast<int>(threadIdx.x) < stride) {
+            sh_pol[threadIdx.x] += sh_pol[threadIdx.x + stride];
+            sh_ref[threadIdx.x] += sh_ref[threadIdx.x + stride];
+            sh_len[threadIdx.x] += sh_len[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    s_pol = sh_pol[0];
+    s_ref = sh_ref[0];
+    len = sh_len[0];
+    __syncthreads();  // all threads finished reading before the next call rewrites shared
+}
+
+__global__ void dpo_custom_dloss_kernel(float* custom_dloss,
+                                        float* metrics,
+                                        const float* losses,
+                                        const float* ref_logprobs,
+                                        const std::uint8_t* loss_mask,
+                                        const std::int32_t* sample_starts,
+                                        const std::int32_t* sample_ends,
+                                        const std::int32_t* pair_chosen,
+                                        const std::int32_t* pair_rejected,
+                                        int pair_count,
+                                        int BT,
+                                        float inv_loss_scale,
+                                        float beta,
+                                        int length_norm) {
+    const int pair = static_cast<int>(blockIdx.x);
+    if (pair >= pair_count) {
+        return;
+    }
+    const int ci = pair_chosen[pair];
+    const int ri = pair_rejected[pair];
+    const int c_start = sample_starts[ci];
+    const int c_end = sample_ends[ci];
+    const int r_start = sample_starts[ri];
+    const int r_end = sample_ends[ri];
+    if (c_start < 0 || c_end > BT || c_start >= c_end || r_start < 0 || r_end > BT || r_start >= r_end) {
+        return;
+    }
+
+    double sc_pol, sc_ref, sr_pol, sr_ref;
+    int len_c, len_r;
+    dpo_reduce_sample(losses, ref_logprobs, loss_mask, c_start, c_end, sc_pol, sc_ref, len_c);
+    dpo_reduce_sample(losses, ref_logprobs, loss_mask, r_start, r_end, sr_pol, sr_ref, len_r);
+
+    const double wc = (length_norm && len_c > 0) ? 1.0 / static_cast<double>(len_c) : 1.0;
+    const double wr = (length_norm && len_r > 0) ? 1.0 / static_cast<double>(len_r) : 1.0;
+    const double margin = static_cast<double>(beta) * ((sc_pol - sc_ref) * wc - (sr_pol - sr_ref) * wr);
+    // g = beta * sigmoid(-margin); custom_dloss = -dL/dlogp_theta = +g*w (chosen) / -g*w (rejected).
+    const double g = static_cast<double>(beta) * (1.0 / (1.0 + exp(margin)));
+
+    for (int t = c_start + 1 + static_cast<int>(threadIdx.x); t < c_end; t += static_cast<int>(blockDim.x)) {
+        if (loss_mask[t] != 0) {
+            custom_dloss[t - 1] = static_cast<float>((g * wc) * static_cast<double>(inv_loss_scale));
+        }
+    }
+    for (int t = r_start + 1 + static_cast<int>(threadIdx.x); t < r_end; t += static_cast<int>(blockDim.x)) {
+        if (loss_mask[t] != 0) {
+            custom_dloss[t - 1] = static_cast<float>((-g * wr) * static_cast<double>(inv_loss_scale));
+        }
+    }
+
+    if (threadIdx.x == 0) {
+        const double loss = -log(1.0 / (1.0 + exp(-margin)));  // -log sigmoid(margin)
+        atomicAdd(metrics + 0, static_cast<float>(loss));
+        atomicAdd(metrics + 1, margin > 0.0 ? 1.0f : 0.0f);
+        atomicAdd(metrics + 2, static_cast<float>(margin));
+        atomicAdd(metrics + 3, 1.0f);
+    }
+}
+
+void compute_dpo_custom_dloss(float* custom_dloss,
+                              float* metrics,
+                              const float* losses,
+                              const float* ref_logprobs,
+                              const std::uint8_t* loss_mask,
+                              const std::int32_t* sample_starts,
+                              const std::int32_t* sample_ends,
+                              const std::int32_t* pair_chosen,
+                              const std::int32_t* pair_rejected,
+                              int pair_count,
+                              int BT,
+                              float loss_scale,
+                              float beta,
+                              int length_norm,
+                              cudaStream_t stream) {
+    if (BT <= 0) {
+        return;
+    }
+    // Zero the full dloss buffer so backward never consumes stale values for the
+    // prompt / padding / final-no-next-token slots the kernel does not write.
+    // metrics is NOT reset here: the kernel atomicAdds across micro-steps and the
+    // caller resets it once per optimizer step (step_dpo_native, micro_step 0).
+    CUDA_CHECK(cudaMemsetAsync(custom_dloss, 0, static_cast<std::size_t>(BT) * sizeof(float), stream));
+    if (pair_count <= 0) {
+        return;
+    }
+    const float inv_loss_scale = (loss_scale == 0.0f) ? 1.0f : (1.0f / loss_scale);
+    dpo_custom_dloss_kernel<<<pair_count, 256, 0, stream>>>(custom_dloss,
+                                                            metrics,
+                                                            losses,
+                                                            ref_logprobs,
+                                                            loss_mask,
+                                                            sample_starts,
+                                                            sample_ends,
+                                                            pair_chosen,
+                                                            pair_rejected,
+                                                            pair_count,
+                                                            BT,
+                                                            inv_loss_scale,
+                                                            beta,
+                                                            length_norm);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 // ----------------------------------------------------------------------------
 // Per-token temperature scaling (in-place): logits[idx, :] *= inv_temperature[idx]
 
@@ -1558,4 +2047,81 @@ void launch_softcap_logits_backward_fp32(float* d_logits,
     int grid = static_cast<int>((n + block_size - 1) / block_size);
     softcap_logits_backward_kernel<<<grid, block_size, 0, stream>>>(d_logits, capped, 1.0f / softcap, n);
     CUDA_CHECK(cudaGetLastError());
+}
+
+// ----------------------------------------------------------------------------
+// Knowledge-distillation helper launchers
+
+void kd_normalize_teacher_topk(float* q_out,
+                               const float* teacher_logprobs,
+                               const int* ids,
+                               const int* targets,
+                               int BT,
+                               int K,
+                               int V,
+                               float inv_tau,
+                               cudaStream_t stream) {
+    const int block_size = 128;
+    kd_normalize_teacher_topk_kernel<<<BT, block_size, 0, stream>>>(q_out,
+                                                                    teacher_logprobs,
+                                                                    ids,
+                                                                    targets,
+                                                                    BT,
+                                                                    K,
+                                                                    V,
+                                                                    inv_tau);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <typename Type>
+static void kd_row_logsumexp_imp(float* lse_out,
+                                 float* chunk_scratch,
+                                 const Type* logits,
+                                 int BT,
+                                 int V,
+                                 int P,
+                                 int n_chunks,
+                                 float inv_tau,
+                                 float softcap,
+                                 cudaStream_t stream) {
+    const int block_size = 256;
+    dim3 grid(BT, n_chunks);
+    kd_row_chunk_logsumexp_kernel<<<grid, block_size, 0, stream>>>(chunk_scratch,
+                                                                   logits,
+                                                                   BT,
+                                                                   V,
+                                                                   P,
+                                                                   n_chunks,
+                                                                   (V + n_chunks - 1) / n_chunks,
+                                                                   inv_tau,
+                                                                   softcap);
+    CUDA_CHECK(cudaGetLastError());
+    logsumexp_reduce_kernel<<<BT, block_size, 0, stream>>>(lse_out, chunk_scratch, BT, n_chunks);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void kd_row_logsumexp(float* lse_out,
+                      float* chunk_scratch,
+                      const float* logits,
+                      int BT,
+                      int V,
+                      int P,
+                      int n_chunks,
+                      float inv_tau,
+                      float softcap,
+                      cudaStream_t stream) {
+    kd_row_logsumexp_imp(lse_out, chunk_scratch, logits, BT, V, P, n_chunks, inv_tau, softcap, stream);
+}
+
+void kd_row_logsumexp(float* lse_out,
+                      float* chunk_scratch,
+                      const nv_bfloat16* logits,
+                      int BT,
+                      int V,
+                      int P,
+                      int n_chunks,
+                      float inv_tau,
+                      float softcap,
+                      cudaStream_t stream) {
+    kd_row_logsumexp_imp(lse_out, chunk_scratch, logits, BT, V, P, n_chunks, inv_tau, softcap, stream);
 }

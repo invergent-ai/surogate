@@ -28,7 +28,17 @@ void CompiledExecutor::dispatch_moe_topk(const CompiledOp& op) {
     const float* correction_bias = nullptr;
     if (op.inputs.size() > 1 && !op.inputs[1].name.empty()) {
         Tensor& bias = resolve_tensor(op.inputs[1]);
-        correction_bias = bias.get<float>();
+        if (bias.DType == ETensorDType::BF16) {
+            // Some checkpoints (Laguna) store the correction bias in BF16;
+            // the top-k kernel reads it as FP32, so convert on the fly.
+            Tensor bias_f32 =
+                mRunState.temp_alloc(ETensorDType::FP32, {static_cast<long>(bias.nelem())}, "moe_topk_bias_f32");
+            mTemps.push_back(bias_f32);
+            convert_dtype(bias_f32.get<float>(), bias.get<nv_bfloat16>(), bias.nelem(), mRunState.MainStream);
+            correction_bias = bias_f32.get<float>();
+        } else {
+            correction_bias = bias.get<float>();
+        }
     }
 
     const int num_tokens = static_cast<int>(probs.Sizes[0]);

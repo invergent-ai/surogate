@@ -12,10 +12,13 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 #include <cuda_runtime.h>
 #include "runtime/dsl/dsl_runtime.h"
+#include "runtime/dsl/dsl_runtime_config.h"
+#include "runtime/executor/graph_executor_utils.h"
 #include "utilities/tensor.h"
 
 namespace dsl {
@@ -131,6 +134,70 @@ bool refresh_moe_experts_if_needed(int layer_idx,
 /// Derive head_size from a QKV tensor's actual shape for hybrid models
 /// where different block types have different head dimensions.
 /// Falls back to config_hs if the tensor shape is ambiguous.
+// Resolve the physical layer index of an op: explicit attr, tensor-ref
+// layer_idx, or a "blocks[N]." prefix on any input/output name (also behind
+// "saved." / "d_" prefixes for backward ops).
+inline int op_layer_idx(const CompiledOp& op) {
+    int layer_idx = op.attrs.layer_idx;
+    for (const auto& t : op.inputs) {
+        if (layer_idx >= 0) break;
+        if (t.layer_idx >= 0) layer_idx = t.layer_idx;
+    }
+    auto try_name = [&](const std::string& name) {
+        if (layer_idx >= 0 || name.empty()) return;
+        std::string_view v(name);
+        if (v.rfind("saved.", 0) == 0) v.remove_prefix(6);
+        if (v.rfind("d_", 0) == 0) v.remove_prefix(2);
+        int idx = -1;
+        std::string field;
+        if (parse_block_param(v, idx, field) && idx >= 0) layer_idx = idx;
+    };
+    for (const auto& t : op.inputs) try_name(t.name);
+    for (const auto& t : op.outputs) try_name(t.name);
+    return layer_idx;
+}
+
+// Resolve per-layer attention head dims for a dispatch site: override the
+// global-config values with the runtime config's per-layer dims (hybrid
+// models with per-layer query head counts, e.g. Laguna: 48 query heads on
+// full-attention layers, 64 on sliding ones), then reconcile against the
+// actual tensor shape. Rank-4 [B, T, H, D] tensors are authoritative for the
+// head size (the derived per-layer head_size can be wrong when a layer
+// overrides the query head count and exposes no rank-1 q_norm_weight to
+// correct the out_weight-cols / global-head-count derivation) and for the
+// total head count (fewer heads than expected: shared-KV / Gemma4 k_eq_v
+// layers; more: Laguna-style per-layer query heads).
+inline void resolve_attn_head_dims(const DslRuntimeConfig& rc,
+                                   int layer_idx,
+                                   const Tensor& qkv,
+                                   int& Hq,
+                                   int& Hkv,
+                                   int& Hs) {
+    const int tensor_hs = (qkv.Rank == 4) ? static_cast<int>(qkv.Sizes[3]) : 0;
+    if (layer_idx >= 0 && static_cast<std::size_t>(layer_idx) < rc.per_layer_dims.size()) {
+        const BlockTypeDims& d = rc.per_layer_dims[static_cast<std::size_t>(layer_idx)];
+        const long hs = (tensor_hs > 0) ? tensor_hs : d.head_size;
+        if (hs > 0) {
+            if (d.attn_dim > 0 && (d.attn_dim % hs) == 0) {
+                Hq = static_cast<int>(d.attn_dim / hs);
+            }
+            if (d.kv_dim > 0 && (d.kv_dim % hs) == 0) {
+                Hkv = static_cast<int>(d.kv_dim / hs);
+            }
+            Hs = static_cast<int>(hs);
+        }
+    }
+    if (qkv.Rank == 4) {
+        const int actual_heads = static_cast<int>(qkv.Sizes[2]);
+        if (actual_heads < Hq + 2 * Hkv) {
+            Hkv = (actual_heads - Hq) / 2;
+            if (Hkv < 0) Hkv = 0;
+        } else if (actual_heads > Hq + 2 * Hkv) {
+            Hq = actual_heads - 2 * Hkv;
+        }
+    }
+}
+
 inline int derive_head_size(const Tensor& qkv, int Hq, int Hkv, int config_hs) {
     if (qkv.Rank == 4) {
         return static_cast<int>(qkv.Sizes[3]);

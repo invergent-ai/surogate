@@ -46,6 +46,9 @@ struct RuntimeOptions {
     // See RecomputeLevel enum above for level descriptions.
     RecomputeLevel Recompute = RecomputeLevel::None;
     bool OffloadResidual = false;
+    // Offload per-layer saved-for-backward tensors to pinned host at forward
+    // layer end; restored at backward layer start. Requires recompute.
+    bool OffloadSavedTensors = false;
     int LMHeadChunks = 1;
     bool SkipIgnoredLMHeadRows = false;
     int AttBwdChunks = 1;
@@ -85,6 +88,18 @@ struct RuntimeOptions {
     // LLEP adaptive threshold: when max_gpu_load / mean_gpu_load exceeds this, LPT load balancing activates.
     // Only relevant when EPSize > 1. Values close to 1.0 = aggressive rebalancing, higher = less rebalancing.
     float EPLoadBalanceThreshold = 1.3f;
+
+    // LLEP sticky plans: recompute the LPT plan (and its imbalance all-reduce) every
+    // N forward dispatches per layer instead of every step. Any plan is correct —
+    // routing counts only affect balance quality — and a stable plan lets forward
+    // prefetch foreign expert weights one layer ahead. 1 = recompute every step.
+    int EPPlanRefreshInterval = 16;
+
+    // Chunked-sequence training (KV-checkpointed chunks): the sequence is
+    // processed as N chunks of the graph's T tokens with attention KV carried
+    // across chunks; backward runs chunks in reverse with exact dK/dV
+    // accumulation. 1 = off. Requires B=1, BF16 attention, no sample packing.
+    int SequenceChunks = 1;
 
     // MoE loss coefficients (override model config when >= 0)
     float RouterAuxLossCoef = -1.0f;  ///< Load balancing auxiliary loss coefficient (-1 = use model config)

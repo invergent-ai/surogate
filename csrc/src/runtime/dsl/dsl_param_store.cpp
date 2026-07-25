@@ -281,6 +281,21 @@ bool DslParamStore::is_external(const std::string& name) const {
     return it->second.external;
 }
 
+bool DslParamStore::work_is_transient(const std::string& name) const {
+    auto it = mParams.find(name);
+    if (it == mParams.end()) return false;
+    if (!it->second.managed_by_weight_manager || !mWeightManager) return false;
+    return mWeightManager->work_is_transient(name);
+}
+
+Tensor* DslParamStore::master_tensor(const std::string& name) const {
+    auto it = mParams.find(name);
+    if (it == mParams.end()) return nullptr;
+    if (!it->second.managed_by_weight_manager || !mWeightManager || !mWeightManager->has(name)) return nullptr;
+    Tensor& master = mWeightManager->get_master(name);
+    return master.Data ? &master : nullptr;
+}
+
 const Tensor& DslParamStore::template_tensor(const std::string& name) const {
     auto it = mParams.find(name);
     if (it == mParams.end()) {

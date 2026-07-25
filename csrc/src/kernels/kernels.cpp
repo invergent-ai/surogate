@@ -420,6 +420,26 @@ void silu_backward(Tensor& dinp, const Tensor& inp, const Tensor& dout, long n, 
     }
 }
 
+void softplus_forward(Tensor& out, const Tensor& inp, long n, cudaStream_t stream) {
+    if (out.DType == ETensorDType::FP32) {
+        softplus_forward(out.get<float>(), inp.get<float>(), n, stream);
+    } else if (out.DType == ETensorDType::BF16) {
+        softplus_forward(out.get<nv_bfloat16>(), inp.get<nv_bfloat16>(), n, stream);
+    } else {
+        throw std::logic_error("softplus_forward: unsupported dtype");
+    }
+}
+
+void softplus_backward(Tensor& dinp, const Tensor& inp, const Tensor& dout, long n, cudaStream_t stream) {
+    if (dinp.DType == ETensorDType::FP32) {
+        softplus_backward(dinp.get<float>(), inp.get<float>(), dout.get<float>(), n, stream);
+    } else if (dinp.DType == ETensorDType::BF16) {
+        softplus_backward(dinp.get<nv_bfloat16>(), inp.get<nv_bfloat16>(), dout.get<nv_bfloat16>(), n, stream);
+    } else {
+        throw std::logic_error("softplus_backward: unsupported dtype");
+    }
+}
+
 void gelu_forward(Tensor& out, const Tensor& inp, long n, cudaStream_t stream) {
     if (out.DType == ETensorDType::FP32) {
         gelu_forward(out.get<float>(), inp.get<float>(), n, stream);
@@ -977,7 +997,8 @@ void fused_cross_entropy_backward(Tensor& dlogits,
                                   int V,
                                   int P,
                                   float softcap,
-                                  cudaStream_t stream) {
+                                  cudaStream_t stream,
+                                  const KdBackwardArgs* kd) {
     const float* lse_ptr = logsumexp ? logsumexp->get<float>() : nullptr;
     const float* dloss_ptr = dloss.get<float>();
     if (dlogits.DType == ETensorDType::FP32) {
@@ -990,7 +1011,8 @@ void fused_cross_entropy_backward(Tensor& dlogits,
                                      V,
                                      P,
                                      softcap,
-                                     stream);
+                                     stream,
+                                     kd);
     } else if (dlogits.DType == ETensorDType::BF16) {
         fused_cross_entropy_backward(dlogits.get<nv_bfloat16>(),
                                      logits.get<nv_bfloat16>(),
@@ -1001,7 +1023,8 @@ void fused_cross_entropy_backward(Tensor& dlogits,
                                      V,
                                      P,
                                      softcap,
-                                     stream);
+                                     stream,
+                                     kd);
     } else {
         throw std::runtime_error("fused_cross_entropy_backward: unsupported dtype");
     }
@@ -1068,7 +1091,8 @@ void chunked_cross_entropy_backward(Tensor& dlogits,
                                     int V,
                                     int P,
                                     float softcap,
-                                    cudaStream_t stream) {
+                                    cudaStream_t stream,
+                                    const KdBackwardArgs* kd) {
     const float* lse_ptr = logsumexp ? logsumexp->get<float>() : nullptr;
     if (!lse_ptr) {
         throw std::runtime_error("chunked_cross_entropy_backward: logsumexp buffer is required");
@@ -1084,7 +1108,8 @@ void chunked_cross_entropy_backward(Tensor& dlogits,
                                        V,
                                        P,
                                        softcap,
-                                       stream);
+                                       stream,
+                                       kd);
     } else if (dlogits.DType == ETensorDType::BF16) {
         chunked_cross_entropy_backward(dlogits.get<nv_bfloat16>(),
                                        logits.get<nv_bfloat16>(),
@@ -1095,9 +1120,38 @@ void chunked_cross_entropy_backward(Tensor& dlogits,
                                        V,
                                        P,
                                        softcap,
-                                       stream);
+                                       stream,
+                                       kd);
     } else {
         throw std::runtime_error("chunked_cross_entropy_backward: unsupported dtype");
+    }
+}
+
+void kd_row_logsumexp(float* lse_out,
+                      float* chunk_scratch,
+                      const Tensor& logits,
+                      int BT,
+                      int V,
+                      int P,
+                      int n_chunks,
+                      float inv_tau,
+                      float softcap,
+                      cudaStream_t stream) {
+    if (logits.DType == ETensorDType::FP32) {
+        kd_row_logsumexp(lse_out, chunk_scratch, logits.get<float>(), BT, V, P, n_chunks, inv_tau, softcap, stream);
+    } else if (logits.DType == ETensorDType::BF16) {
+        kd_row_logsumexp(lse_out,
+                         chunk_scratch,
+                         logits.get<nv_bfloat16>(),
+                         BT,
+                         V,
+                         P,
+                         n_chunks,
+                         inv_tau,
+                         softcap,
+                         stream);
+    } else {
+        throw std::runtime_error("kd_row_logsumexp: unsupported dtype");
     }
 }
 

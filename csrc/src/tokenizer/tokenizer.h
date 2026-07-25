@@ -17,9 +17,11 @@ namespace tokenizer {
 
 // Loss masking strategy for encode_for_training().
 enum class LossStrategy {
-    DEFAULT,     // Train on all assistant responses + suffix tokens
-    LAST_ROUND,  // Train only on the last assistant response + suffix
-    ALL          // Train on all tokens (including system/user)
+    DEFAULT,        // Train on all assistant responses + suffix tokens
+    LAST_ROUND,     // Train only on the last assistant response + suffix
+    THINKING_ONLY,  // Train reasoning through </think>; mask final answers
+    FINAL_ONLY,     // Train final answers after </think>; mask reasoning/direct turns
+    ALL             // Train on all tokens (including system/user)
 };
 
 // Result of encode_for_training().
@@ -102,6 +104,8 @@ public:
     // The strategy controls which tokens are trainable:
     //   DEFAULT    — all assistant response + suffix tokens
     //   LAST_ROUND — only the last assistant response + suffix
+    //   THINKING_ONLY — reasoning tokens through </think>; direct/final tokens masked
+    //   FINAL_ONLY — final tokens after </think>; reasoning/direct tokens masked
     //   ALL        — all tokens (system, user, assistant, template)
     //
     // labels[0] is always -100.

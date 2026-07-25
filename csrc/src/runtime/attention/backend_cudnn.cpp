@@ -33,6 +33,9 @@ public:
     }
 
     bool supports(const AttentionParams& p) const override {
+        if (p.chunk_kv_len > 0) {
+            return false;  // chunked-sequence mode is kvprefix-only
+        }
         if (p.Hs <= 0 || p.Hs > kCuDNNMaxHeadDim || (p.Hs % 8) != 0) {
             return false;
         }

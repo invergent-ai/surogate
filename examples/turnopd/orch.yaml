@@ -1,0 +1,49 @@
+# TurnOPD diagnostic: multi-turn on-policy distillation orchestrator.
+# Student Qwen3.5-0.8B distilled from Qwen3.5-9B on a multi-hop lookup env.
+
+model:
+  name: "Qwen/Qwen3.5-0.8B"
+  lora_adapter: "default"
+  lora_rank: 16
+  lora_alpha: 32
+
+# Teacher logprobs are prefilled over the full student trajectory.
+teacher_model:
+  model:
+    name: "Qwen/Qwen3.5-9B"
+  client:
+    base_url:
+      - http://localhost:8008/v1
+
+env:
+  - id: multihop-tools
+    # Env is checked out locally, not pip-installed.
+    path: ./environments/multihop-tools
+    args:
+      num_examples: 2000
+      n_chains: 120
+      min_hops: 2
+      max_hops: 4
+      max_turns: 12
+
+batch_size: 32
+rollouts_per_example: 8
+seq_len: 4096
+max_steps: 30
+# TITO is NOT safe here: the Qwen3.5 chat template re-renders earlier assistant
+# turns without their <think> blocks, so tokens are removed from the prefix as
+# the conversation grows and the extension property fails.
+use_token_client: false
+
+sampling:
+  max_tokens: 256
+  temperature: 1.0
+
+client:
+  base_url:
+    - http://localhost:8007/v1
+
+dump_metrics: true
+# The orchestrator writes into the RUN subdirectory; the trainer's output_dir is
+# the parent root and discovers runs as <root>/<run_id>/control/orch.yaml.
+output_dir: ./outputs/turnopd_diag/run_default

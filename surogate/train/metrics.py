@@ -65,6 +65,7 @@ class StepMetrics:
     phase: str = ""
     lr_overridden: bool = False
     moe: MoEMetrics | None = None
+    kd_loss: float | None = None
 
     # -- derived helpers --
 
@@ -102,4 +103,6 @@ class StepMetrics:
             d["moe_load_cv"] = self.moe.load_cv
             d["moe_router_entropy"] = self.moe.router_entropy
             d["moe_router_confidence"] = self.moe.router_confidence
+        if self.kd_loss is not None:
+            d["kd_loss"] = self.kd_loss
         return d

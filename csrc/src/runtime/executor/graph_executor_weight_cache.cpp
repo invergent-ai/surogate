@@ -147,6 +147,13 @@ const Tensor* GraphExecutor::get_fp8_cached_weight(const std::string& name, Tens
     if (!mWeights.has(name) || mWeights.is_trainable(name)) {
         return nullptr;
     }
+    if (mWeights.work_is_transient(name)) {
+        // Streamed weights are re-gathered into shared/rotating buffers between
+        // uses; a quantize-once cache freezes whatever the buffer held at first
+        // touch (e.g. a not-yet-gathered lm_head → all-zero logits). Let the
+        // recipe quantize on the fly instead.
+        return nullptr;
+    }
     auto it = mFP8WeightCache.find(name);
     if (it == mFP8WeightCache.end()) {
         FP8WeightCacheEntry entry{};
@@ -238,6 +245,10 @@ GraphExecutor::get_fp8_cached_weight_transposed(const std::string& name, Tensor&
         return nullptr;
     }
     if (!mWeights.has(name) || mWeights.is_trainable(name)) {
+        return nullptr;
+    }
+    if (mWeights.work_is_transient(name)) {
+        // Same rule as the forward cache: never snapshot a streamed buffer.
         return nullptr;
     }
 

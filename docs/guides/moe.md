@@ -345,6 +345,7 @@ ep_load_balance_threshold: 1.3   # LLEP activation threshold (default)
 | --------------------------- | ----- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `ep_size`                   | int   | 1       | Number of GPUs in each expert-parallel group. Must divide `gpus`. Each GPU holds `num_experts / ep_size` local experts.                              |
 | `ep_load_balance_threshold` | float | 1.3     | Imbalance ratio (`max_gpu_load / mean_gpu_load`) above which dynamic load balancing (LLEP) activates. Set to `1.0` for always-active load balancing. |
+| `ep_plan_refresh_interval`  | int   | 16      | LLEP sticky plans: recompute the expert placement every N forward dispatches per layer. `1` = recompute every step.                                  |
 
 **Constraints:**
 
@@ -372,6 +373,10 @@ MoE routing is inherently imbalanced — some experts receive more tokens than o
 2. If `max_gpu_load / mean_gpu_load` exceeds `ep_load_balance_threshold`, the LPT (Longest Processing Time) scheduler activates
 3. Overloaded experts are temporarily transferred to underloaded GPUs along with their weights
 4. After computation, results and gradients are routed back to the native GPU
+
+The expert placement plan is **sticky**: it is recomputed every `ep_plan_refresh_interval` forward dispatches per layer (default 16) rather than every step. Any placement is mathematically exact — routing counts only affect balance quality — and a stable plan lets the runtime prefetch foreign expert weights one layer ahead in both the forward and backward pass, hiding the weight transfers behind compute. Routing drift is picked up at the next refresh; set the interval to `1` to restore per-step planning.
+
+LLEP works under `cpu_training` (foreign expert weights are fetched directly from the shared pinned host masters — no peer transfers for base weights) and balances VRAM as well as compute: the routing-hot rank no longer accumulates the largest working set.
 
 LLEP is automatic when `ep_size > 1`. The `ep_load_balance_threshold` controls sensitivity:
 

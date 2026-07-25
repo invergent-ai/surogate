@@ -35,6 +35,14 @@ Recomputation trades compute for memory by recomputing activations during the ba
 | ----------- | ---- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `recompute` | bool | `true`  | Enable activation recomputation. `false` saves all activations (fastest, most memory). `true` recomputes intermediates from checkpoints (saves VRAM, small compute overhead). |
 
+## Chunked-Sequence Training (long sequences)
+
+Train sequences far longer than activation memory would normally allow by processing the layer stack in fixed-size chunks with attention KV carried across chunks. Memory stays at the single-chunk footprint plus a small KV/state budget (KV is `2 * kv_heads * head_dim` bytes per token per attention layer), while gradients remain exact: backward walks chunks in reverse and accumulates dK/dV in FP32. Trailing all-padding chunks are skipped automatically (nothing attends to them). Works with `sample_packing` (per-document attention across chunk boundaries is preserved, including documents split across rows) and with GDN hybrid models (Qwen3.5/3.6 — the delta-rule recurrent state and causal-conv tail are carried across chunks exactly). Requires `per_device_train_batch_size: 1`, BF16 attention, and `lora_dropout: 0`; CUDA graphs are disabled automatically.
+
+| Option            | Type | Default | Description                                                                                                        |
+| ----------------- | ---- | ------- | ------------------------------------------------------------------------------------------------------------------ |
+| `sequence_chunks` | int  | `1`     | Process `sequence_len` as N chunks of `sequence_len / N` tokens (must divide evenly). `1` = normal dense training. |
+
 ## CPU-RAM Centric Training
 
 CPU-RAM centric training keeps model weights and optimizer state on CPU, streaming data to/from GPU per-layer. This allows training models that exceed GPU memory on a single GPU or across multiple GPUs with simple data parallelism (no ZeRO sharding required).
@@ -105,6 +113,16 @@ These options apply to single-node multi-GPU training. For multi-node distribute
 | `memcpy_all_gather`     | bool | `false` | Use memcpy for all-gather operations (threads backend only). Generally gets better bandwidth utilization on PCIe and does not consume SM resources.                             |
 | `memcpy_send_recv`      | bool | `false` | Use memcpy for send/receive operations (threads backend only).                                                                                                                  |
 
+## Expert Parallelism (MoE) Options
+
+Distribute MoE experts across GPUs so each GPU holds `num_experts / ep_size` local experts. See the [MoE guide](../guides/moe.md#expert-parallelism-ep) and [Adaptive Training](../about/adaptive-training.md) for LLEP details.
+
+| Option                      | Type  | Default | Description                                                                                                                                                                      |
+| --------------------------- | ----- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ep_size`                   | int   | `1`     | Number of GPUs per expert-parallel group. Must divide `gpus` and `num_experts`. `1` disables EP.                                                                                 |
+| `ep_load_balance_threshold` | float | `1.3`   | Imbalance ratio (`max_gpu_load / mean_gpu_load`) above which LLEP dynamic load balancing activates. `1.0` = always active; large values (e.g. `999`) = static EP only.           |
+| `ep_plan_refresh_interval`  | int   | `16`    | LLEP sticky plans: the expert placement plan is recomputed every N forward dispatches per layer. Between refreshes the plan is reused, which skips the per-layer imbalance all-reduce and lets foreign expert weights be prefetched one layer ahead. `1` = recompute every step. |
+
 ## Pipeline Parallelism (dispatch-PP) Options
 
 Model-parallel mode for models whose base weights don't fit on a single GPU, on PCIe-only boxes. See [Dispatch Pipeline Parallelism](../guides/dispatch-pp.md). Mutually exclusive with the ZeRO options above, `cpu_training`, and MoE expert parallelism (`ep_size > 1`); CUDA graphs are auto-disabled.
@@ -135,6 +153,33 @@ distributed:
   num_nodes: 2
   gpus_per_node: 8
   worker_output_dir: /shared/surogate-data
+```
+
+## Knowledge Distillation
+
+Offline top-K logit distillation on the SFT path: capture teacher logprobs once with `surogate distill-capture config.yaml`, then train with `surogate sft config.yaml`. The teacher and student must share a tokenizer. See the [Knowledge Distillation Guide](../guides/distillation.md). Single-node only (mutually exclusive with `distributed:` and `parallelism: dispatch_pp`); CUDA graphs and `lmhead_drop_ignored_rows` are auto-disabled.
+
+| Option                            | Type   | Default           | Description                                                                                                                                                  |
+| --------------------------------- | ------ | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `distillation.teacher_model`      | string | `null`            | Teacher model id or path. Required by `distill-capture`; ignored at train time.                                                                              |
+| `distillation.top_k`              | int    | `32`              | Teacher logprobs stored per token. Range `[1, 1024]`; training validates that sidecars were captured with this exact value.                                  |
+| `distillation.temperature`        | float  | `1.0`             | Distillation temperature τ (> 0).                                                                                                                            |
+| `distillation.kd_weight`          | float  | `0.5`             | Weight of the KD (KL) term (≥ 0).                                                                                                                            |
+| `distillation.ce_weight`          | float  | `1 - kd_weight`   | Weight of the CE term (≥ 0). Must be set explicitly when `kd_weight > 1`.                                                                                    |
+| `distillation.teacher_batch_size` | int    | `4`               | Capture-time only (local backend): windows of `sequence_len` tokens per teacher forward pass (≥ 1).                                                          |
+| `distillation.kd_dir`             | string | `null`            | Sidecar directory override. Default: alongside the token shards. The trainer bridges `kd_dir` captures to the native DataLoader via `<shard>.kd` symlinks.   |
+| `distillation.teacher_api_base`   | string | `null`            | Capture-time only: OpenAI-compatible base URL of a served teacher (e.g. `http://localhost:8000/v1`). Switches capture to a vLLM API backend; `teacher_model` is then the served model name. Requires a vLLM server started with `--max-logprobs >= top_k`; aggregators (e.g. OpenRouter) cannot be used. |
+| `distillation.teacher_api_key_var` | string | `"VLLM_API_KEY"` | Capture-time only: env var holding the API key. Empty/unset resolves to `EMPTY` (accepted by local vLLM).                                                    |
+| `distillation.teacher_api_concurrency` | int | `8`             | Capture-time only: concurrent in-flight API capture requests (≥ 1).                                                                                          |
+| `distillation.teacher_api_timeout` | int   | `1200`            | Capture-time only: per-request API timeout in seconds (≥ 1).                                                                                                 |
+
+**Example configuration:**
+```yaml
+distillation:
+  teacher_model: Qwen/Qwen3-1.7B
+  top_k: 64
+  temperature: 1.0
+  kd_weight: 0.5
 ```
 
 ## Hardware Settings
@@ -237,7 +282,7 @@ Each dataset in the `datasets` or `validation_datasets` list is configured with 
 | Option    | Type   | Default   | Description                                                                                                          |
 | --------- | ------ | --------- | -------------------------------------------------------------------------------------------------------------------- |
 | `path`    | string | required  | HuggingFace dataset repo, s3:// URL, gs:// URL, or path to local file or directory.                                  |
-| `type`    | string | required  | Dataset type. Options: `"text"`, `"instruction"`, `"conversation"`, `"auto"` (auto-detect format).                   |
+| `type`    | string | required  | Dataset type. Options: `"text"`, `"instruction"`, `"conversation"`, `"preference"` (DPO), `"auto"` (auto-detect format). |
 | `subset`  | string | `null`    | HuggingFace dataset subset/configuration name to load (e.g., `"default"` for datasets with multiple configurations). |
 | `split`   | string | `"train"` | Dataset split to load. Common values: `"train"`, `"test"`, `"validation"`.                                           |
 | `samples` | int    | `null`    | Limit the number of samples to use from this dataset. If not specified, uses all available samples.                  |
@@ -306,6 +351,78 @@ datasets:
 	messages_field: messages
 	split: train_sft
 ```
+
+#### Preference Dataset Options (`type: "preference"`)
+
+For offline DPO. Each row has `prompt` (a string or a chat `messages` list),
+`chosen`, and `rejected` (the two competing assistant continuations). Chat rows may
+also set `enable_thinking` to control the generation prefix. Loss is applied only
+on the response tokens. Used by the
+`surogate dpo` command together with the [DPO loss block](#dpo-settings).
+Preference datasets load through the same pipeline as the other types, so `path`
+may be a local JSONL/JSON/parquet/CSV file, a dataset directory, or a HuggingFace
+hub repo, and `subset`/`split`/`samples` apply as usual.
+
+| Option                  | Type   | Default             | Description                                                                     |
+| ----------------------- | ------ | ------------------- | ------------------------------------------------------------------------------- |
+| `prompt_field`          | string | `"prompt"`          | Name of the column containing the prompt (string or chat messages list).        |
+| `chosen_field`          | string | `"chosen"`          | Name of the column containing the preferred response.                           |
+| `rejected_field`        | string | `"rejected"`        | Name of the column containing the dispreferred response.                        |
+| `enable_thinking_field` | string | `"enable_thinking"` | Name of the optional column controlling the chat-template thinking prefix.      |
+
+```json
+{"prompt": "...", "chosen": "preferred response", "rejected": "dispreferred response"}
+```
+
+**Example:**
+```yaml
+datasets:
+  - path: ./pairs.jsonl
+	type: preference
+  - path: "org/hf-preference-dataset"
+	type: preference
+	split: train
+	chosen_field: preferred
+	rejected_field: dispreferred
+```
+
+## DPO Settings
+
+Direct Preference Optimization (the `surogate dpo` command). Offline: a static set
+of `{prompt, chosen, rejected}` pairs (`type: preference`) with the frozen reference
+model evaluated inline — no reward model, no rollouts. See
+[Training Modes](../getting-started/training-modes.md) and
+[Quickstart: DPO](../getting-started/quickstart-dpo.md).
+
+Configured under a nested `loss:` block:
+
+| Option           | Type   | Default | Description                                                                                          |
+| ---------------- | ------ | ------- | ---------------------------------------------------------------------------------------------------- |
+| `type`           | string | `"dpo"` | Loss type. Must be `"dpo"`.                                                                          |
+| `dpo_beta`       | float  | `0.1`   | KL temperature β. The implicit reward is `β · (logπθ − logπref)`; higher β pushes harder from the reference. |
+| `length_norm`    | bool   | `false` | Divide each response's log-prob sum by its length (SimPO-style). Leave off for minimal/equal-length pairs. |
+| `span_mask`      | bool   | `false` | Score only the disjoint token spans that differ; rows without surviving edits on both sides are dropped. |
+| `reference_free` | bool   | `false` | Optimize the chosen/rejected likelihood gap directly and skip the frozen-reference forward. |
+| `target_margin`  | float  | `0.0`   | Non-negative beta-scaled target gap for reference-free training. Requires `reference_free: true`. |
+
+**Example:**
+```yaml
+loss:
+  type: dpo
+  dpo_beta: 0.1
+  length_norm: false
+  span_mask: false
+  reference_free: false
+  target_margin: 0.0
+datasets:
+  - path: ./pairs.jsonl
+	type: preference
+```
+
+DPO inherits all LoRA, recipe, optimizer, checkpoint-resume, retention, and
+training-loop settings from the SFT config. `gradient_dtype` and the LoRA dtype
+default to FP32; the frozen base does not require an FP32 master copy. CUDA graphs
+are disabled because the native DPO step is not graph-captured.
 
 ## Memory Optimization Settings
 

@@ -6,17 +6,15 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.datastructures import State
 from vllm.engine.protocol import EngineClient
-from vllm.entrypoints.chat_utils import load_chat_template
-from vllm.entrypoints.logger import RequestLogger
+from vllm.entrypoints.generate.base.serving import BaseServing
 from vllm.entrypoints.openai.api_server import init_app_state
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionResponse
+from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
 from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse
-from vllm.entrypoints.openai.engine.serving import OpenAIServing
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
-from vllm.entrypoints.openai.utils import validate_json_request
 from vllm.entrypoints.serve.lora.protocol import LoadLoRAAdapterRequest
-from vllm.entrypoints.utils import load_aware_call, with_cancellation
+from vllm.entrypoints.serve.utils.api_utils import load_aware_call, validate_json_request, with_cancellation
 from vllm.logger import init_logger
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.v1.utils import run_api_server_worker_proc
@@ -56,8 +54,9 @@ def engine_client(request: Request) -> EngineClient:
     return request.app.state.engine_client
 
 
-def base(request: Request) -> OpenAIServing:
-    return request.app.state.openai_serving_tokenization
+def base(request: Request) -> BaseServing:
+    # Renamed from `openai_serving_tokenization` in vLLM 0.25.1.
+    return request.app.state.serving_tokenization
 
 
 def models(request: Request) -> OpenAIServingModels:
@@ -149,52 +148,33 @@ async def custom_init_app_state(
     engine_client: EngineClient,
     state: State,
     args: Namespace,
-    supported_tasks: tuple,
+    supported_tasks: tuple | None = None,
 ):
     """
     Modifies init_app_state:
     1. Set up the custom OpenAIServingChatWithTokens state.
     2. Monkey-patch to allow updating lora adapters in-place.
     """
-    # Setup the regular app state first (in-place)
+    # Setup the regular app state first (in-place). Since vLLM 0.25.1 this also
+    # runs init_generate_state(), which constructs state.openai_serving_chat.
     await init_app_state(engine_client, state, args, supported_tasks)
 
-    # NOTE: Initialize the custom OpenAIServingChatWithTokens state here
-    # TODO: Here, we repeat some calls done in init_app_state to be able to
-    # correctly set up the OpenAIServingChatWithTokens state, which is a bit
-    # brittle, and could probably be made nicer
-    if args.enable_log_requests:
-        request_logger = RequestLogger(max_log_len=args.max_log_len)
-    else:
-        request_logger = None
+    # Promote the chat handler vLLM just built to our subclass, rather than
+    # constructing a second one from a hand-copied kwargs list. That list lived
+    # here previously and had to track init_generate_state() exactly — it silently
+    # rotted when vLLM renamed `openai_serving_render` to `online_renderer`.
+    # OpenAIServingChatWithTokens adds only a method (no __init__, no new state,
+    # no __slots__), so re-classing is well-defined and inherits upstream's
+    # construction verbatim, including any arguments added in future releases.
+    serving_chat = getattr(state, "openai_serving_chat", None)
+    if serving_chat is not None:
+        assert type(serving_chat) is OpenAIServingChat, (
+            f"expected vLLM to build a plain OpenAIServingChat, got {type(serving_chat).__name__}; "
+            "re-classing would discard behaviour from that subclass"
+        )
+        serving_chat.__class__ = OpenAIServingChatWithTokens
 
-    resolved_chat_template = load_chat_template(args.chat_template)
-
-    chat_kwargs = dict(
-        openai_serving_render=state.openai_serving_render,
-        request_logger=request_logger,
-        chat_template=resolved_chat_template,
-        chat_template_content_format=args.chat_template_content_format,
-        trust_request_chat_template=args.trust_request_chat_template,
-        return_tokens_as_token_ids=args.return_tokens_as_token_ids,
-        enable_auto_tools=args.enable_auto_tool_choice,
-        exclude_tools_when_tool_choice_none=args.exclude_tools_when_tool_choice_none,
-        tool_parser=args.tool_call_parser,
-        reasoning_parser=args.structured_outputs_config.reasoning_parser,
-        enable_prompt_tokens_details=args.enable_prompt_tokens_details,
-        enable_force_include_usage=args.enable_force_include_usage,
-        enable_log_outputs=args.enable_log_outputs,
-    )
-
-    serving_chat = OpenAIServingChatWithTokens(
-        engine_client,
-        state.openai_serving_models,
-        args.response_role,
-        **chat_kwargs,
-    )
-
-    state.openai_serving_chat = serving_chat if "generate" in supported_tasks else None
-    state.openai_serving_chat_with_tokens = serving_chat if "generate" in supported_tasks else None
+    state.openai_serving_chat_with_tokens = serving_chat
 
 
 def custom_run_api_server_worker_proc(listen_address, sock, args, client_config=None, **uvicorn_kwargs) -> None:

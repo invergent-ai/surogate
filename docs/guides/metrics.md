@@ -10,6 +10,7 @@ Surogate provides comprehensive training metrics that can be logged to file (JSO
 | Evaluation  | loss, tps                                     | Validation performance          |
 | GPU         | power, temperature, utilization, memory, PCIe | Hardware monitoring             |
 | MoE         | aux_loss, z_loss, utilization, imbalance      | Router health (MoE models only) |
+| Distillation | kd_loss                                      | Teacher-student KL ([KD training](distillation.md) only) |
 | Performance | SOL, FLOPs                                    | Speed-of-Light estimates        |
 | Memory      | allocations by segment                        | Memory usage breakdown          |
 
@@ -39,11 +40,17 @@ Logged every training step via `log_step()`:
 :: step     100 [ 12.5%] \ loss 2.3456 | norm  0.1234 | 125.3k tps |   156 ms | aux 0.0234 | imbal 1.45 | sol 78.2 | eta 02h15m
 ```
 
+**Knowledge distillation (includes kd_loss inline):**
+```
+:: step     100 [ 12.5%] \ loss 2.3456 | norm  0.1234 | 125.3k tps |   156 ms | kd 0.5678 | sol 78.2 | eta 02h15m
+```
+
 Legend:
 - `\ / ` - Loss trend indicator (decreasing/increasing)
 - `!` before norm - Gradient spike detected (>5x moving average)
 - `aux` - MoE auxiliary load balancing loss (MoE models only)
 - `imbal` - MoE load imbalance ratio (MoE models only)
+- `kd` - Distillation KL term (KD training only, see below)
 - `sol` - Speed-of-light percentage (actual vs theoretical peak)
 - `eta` - Estimated time remaining
 
@@ -81,6 +88,19 @@ Legend:
   "moe_load_imbalance": 1.4500
 }
 ```
+
+**Knowledge distillation (adds `kd_loss` to the step line):**
+```json
+{
+  "log": "step",
+  "step": 100,
+  "loss": 2.3456,
+  "lr": 0.0002,
+  "kd_loss": 0.5678
+}
+```
+
+`kd_loss` is the mean τ²-scaled KL divergence `τ² · KL(teacher_topk ‖ student)` per valid token, accumulated over the micro-steps of the optimizer step and reported rank-0 local. `loss` remains the plain (unweighted) cross-entropy; the optimized objective is `ce_weight · loss + kd_weight · kd_loss`. See the [Knowledge Distillation guide](distillation.md). For MoE models the step line carries the MoE metrics instead.
 
 ## Evaluation Metrics
 

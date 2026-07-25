@@ -20,6 +20,7 @@
 #include <cuda_bf16.h>
 
 #include <cassert>
+#include <stdexcept>
 
 #include "kernel_utils.cuh"
 #include "utilities/utils.h"
@@ -162,8 +163,46 @@ __global__ void rope_kernel(floatX* out,
         x64 o_real;
         x64 o_imag;
 
+        if (rotary_dim < head_dim) {
+            // GLM-style contiguous-prefix partial rotary (GLM4 / Qwen3-Next /
+            // Laguna): dims [0, rotary_dim) rotate in pairs (i, i + rotary_dim/2)
+            // and dims [rotary_dim, head_dim) pass through unchanged. The
+            // vectorized path below pairs (i, i + head_dim/2) — the full-head
+            // rotate_half layout — which only coincides when rotary_dim ==
+            // head_dim, so partial rotary takes this scalar path.
+            const floatX* head_in = inp + idx_bth;
+            const floatX* freqs_row = freqs_cis + t_pos * rotary_dim;
+            const int js[2] = {d, d + head_dim_half};
+            for (int k = 0; k < x64::size; k++) {
+                for (int e = 0; e < 2; e++) {
+                    const int j = js[e] + k;
+                    float v;
+                    if (j >= rotary_dim) {
+                        v = (float)head_in[j];
+                    } else {
+                        const int i = (j < rotary_dim_half) ? j : (j - rotary_dim_half);
+                        float cos = (float)freqs_row[2 * i];
+                        float sin = (float)freqs_row[2 * i + 1];
+                        if constexpr (Backward) {
+                            sin = -sin;
+                        }
+                        const float real = (float)head_in[i];
+                        const float imag = (float)head_in[i + rotary_dim_half];
+                        v = (j < rotary_dim_half) ? (real * cos - imag * sin) : (imag * cos + real * sin);
+                    }
+                    if (e == 0) {
+                        o_real[k] = v;
+                    } else {
+                        o_imag[k] = v;
+                    }
+                    if (abs_max_ptr) {
+                        thread_abs_max = fmaxf(thread_abs_max, fabsf(v));
+                    }
+                }
+            }
+        }
         // Check if this dimension block is within rotary_dim (partial RoPE support)
-        if (d + x64::size <= rotary_dim_half) {
+        else if (d + x64::size <= rotary_dim_half) {
             // All dimensions in this vector are within rotary range - apply rotation
             x128 freqs_vec = x128::load_ldg(freqs_cis + t_pos * rotary_dim + 2 * d);
             for (int k = 0; k < x64::size; k++) {
@@ -261,6 +300,16 @@ void rope_imp(floatX* out,
               cudaStream_t stream,
               std::bool_constant<Backward> bw = {}) {
     if (abs_max_ptr) CUDA_CHECK(cudaMemsetAsync(abs_max_ptr, 0, sizeof(float), stream));
+
+    // The GLM-prefix partial-rotary path reads head positions written by
+    // OTHER threads (pairs (i, i + rotary_dim/2) within the head), so it is
+    // not in-place safe — unlike the full-rotary path, where each thread only
+    // touches its own (d, d + head_dim/2) pair. Guard loudly rather than
+    // racing silently; callers must use distinct in/out buffers for partial
+    // rotary.
+    if (rotary_dim < head_dim && out == in) {
+        throw std::logic_error("rope: partial rotary (GLM prefix) does not support in-place operation");
+    }
 
     const int block_size = 128;
     using x64 = GenericVector<floatX, 8 / sizeof(floatX)>;

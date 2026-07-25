@@ -25,8 +25,6 @@
 #include <functional>
 #include <stdexcept>
 #include <string>
-#include <algorithm>
-#include <cstdio>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -72,16 +70,27 @@ public:
         if (it != mBuffers.end() && it->second != nullptr && !is_arena_backed(key)) {
             mPool.push_back({it->second, mSizes[key]});
         }
+        if (auto hit = mHostMirror.find(key); hit != mHostMirror.end()) {
+            hit->second.valid = false;  // being rewritten
+        }
         ArenaAlloc a = arena_alloc ? arena_alloc(bytes) : ArenaAlloc{};
         if (a.ptr == nullptr) {
             a.ptr = take_from_pool(bytes);  // reuse a pooled buffer before cudaMalloc
             if (a.ptr != nullptr) bytes = pool_take_bytes_;
         }
         if (a.ptr == nullptr) {
-            const cudaError_t rc = cudaMalloc(&a.ptr, bytes);
-            if (rc != cudaSuccess) {
-                dump_oom_report(key, bytes, op_name);
-                CUDA_CHECK(rc);
+            const cudaError_t err = cudaMalloc(&a.ptr, bytes);
+            if (err != cudaSuccess) {
+                (void)cudaGetLastError();
+                std::size_t free_b = 0, total_b = 0;
+                cudaMemGetInfo(&free_b, &total_b);
+                throw std::runtime_error(std::string(op_name ? op_name : "compiled_op") + ": cudaMalloc(" +
+                                         std::to_string(bytes) + ") for saved tensor '" + key +
+                                         "' failed: " + cudaGetErrorString(err) +
+                                         " (saved-tensor cache already holds " + std::to_string(count()) +
+                                         " buffers / " + std::to_string(total_plain_bytes()) +
+                                         " plain bytes; device free " + std::to_string(free_b) + "/" +
+                                         std::to_string(total_b) + ")");
             }
             a.arena_backed = false;
         }
@@ -94,6 +103,9 @@ public:
     /// Record an externally-produced buffer for `key` (e.g. a slot the caller resolved in
     /// an arena). Frees a prior plain allocation under the same key first.
     void put(const std::string& key, void* ptr, std::size_t bytes, bool arena_backed) {
+        if (auto hit = mHostMirror.find(key); hit != mHostMirror.end()) {
+            hit->second.valid = false;
+        }
         auto it = mBuffers.find(key);
         if (it != mBuffers.end() && it->second != nullptr && it->second != ptr && !is_arena_backed(key)) {
             CUDA_CHECK(cudaFree(it->second));
@@ -141,29 +153,6 @@ public:
         mBumpOffset = 0;
     }
 
-    /// Recycle every plain entry whose key satisfies `pred` into the free-list and drop
-    /// the keys (no cudaFree; the next same-size acquire pops the buffer back). Returns
-    /// the recycled device pointers so the caller can null any tensor-table bindings.
-    /// Used at forward layer boundaries for op-scoped output homes whose lifetime ends
-    /// with the layer; without this they accumulate one persistent copy per op per layer.
-    template <typename Pred>
-    std::vector<void*> recycle_matching(Pred&& pred) {
-        std::vector<void*> recycled;
-        for (auto it = mBuffers.begin(); it != mBuffers.end();) {
-            const std::string& key = it->first;
-            if (it->second != nullptr && !is_arena_backed(key) && pred(key)) {
-                mPool.push_back({it->second, mSizes[key]});
-                recycled.push_back(it->second);
-                mSizes.erase(key);
-                mArenaBacked.erase(key);
-                it = mBuffers.erase(it);
-            } else {
-                ++it;
-            }
-        }
-        return recycled;
-    }
-
     /// Free every plain (non-arena) buffer, the free-list, and clear all keys + bump. The
     /// single place these buffers are released -- always arena-aware. Safe in a destructor.
     void free_all() noexcept {
@@ -175,11 +164,65 @@ public:
         for (auto& [buffer, sz] : mPool) {
             if (buffer != nullptr) cudaFree(buffer);
         }
+        for (auto& [key, hm] : mHostMirror) {
+            if (hm.ptr) cudaFreeHost(hm.ptr);
+        }
+        mHostMirror.clear();
         mBuffers.clear();
         mSizes.clear();
         mArenaBacked.clear();
         mPool.clear();
         mBumpOffset = 0;
+    }
+
+    /// Offload all of layer `layer_idx`'s plain (non-arena) buffers to pinned
+    /// host mirrors and recycle the device buffers into the pool. Stream-ordered
+    /// on `stream`: pool reuse happens via acquire() on the same stream, so the
+    /// D2H completes before any overwrite. Enables seq scaling: saved tensors
+    /// dominate step VRAM (~6.8 GB at seq 256 on Laguna-S, linear in tokens).
+    void offload_layer(int layer_idx, cudaStream_t stream) {
+        const std::string prefix = "blocks[" + std::to_string(layer_idx) + "].";
+        for (auto& [key, buf] : mBuffers) {
+            if (buf == nullptr || is_arena_backed(key) || key.rfind(prefix, 0) != 0) continue;
+            auto& hm = mHostMirror[key];
+            const std::size_t bytes = mSizes[key];
+            if (hm.capacity < bytes) {
+                if (hm.ptr) CUDA_CHECK(cudaFreeHost(hm.ptr));
+                CUDA_CHECK(cudaHostAlloc(&hm.ptr, bytes, cudaHostAllocDefault));
+                hm.capacity = bytes;
+            }
+            CUDA_CHECK(cudaMemcpyAsync(hm.ptr, buf, bytes, cudaMemcpyDeviceToHost, stream));
+            hm.bytes = bytes;
+            hm.valid = true;
+            mPool.push_back({buf, bytes});
+            buf = nullptr;
+        }
+    }
+
+    /// Restore layer `layer_idx`'s offloaded buffers to the device (called at
+    /// backward layer start, before any of the layer's ops read them).
+    void restore_layer(int layer_idx, cudaStream_t stream) {
+        const std::string prefix = "blocks[" + std::to_string(layer_idx) + "].";
+        for (auto& [key, hm] : mHostMirror) {
+            if (!hm.valid || key.rfind(prefix, 0) != 0) continue;
+            auto bit = mBuffers.find(key);
+            if (bit != mBuffers.end() && bit->second != nullptr) {
+                hm.valid = false;  // device copy exists (e.g. replay re-acquired)
+                continue;
+            }
+            std::size_t bytes = hm.bytes;
+            void* dev = take_from_pool(bytes);
+            if (dev != nullptr) {
+                bytes = pool_take_bytes_;
+            } else {
+                CUDA_CHECK(cudaMalloc(&dev, bytes));
+            }
+            CUDA_CHECK(cudaMemcpyAsync(dev, hm.ptr, hm.bytes, cudaMemcpyHostToDevice, stream));
+            mBuffers[key] = dev;
+            mSizes[key] = bytes;
+            mArenaBacked[key] = false;
+            hm.valid = false;
+        }
     }
 
     /// Bump offset into the (caller-owned) arena, for arena allocators that pack many
@@ -217,29 +260,6 @@ public:
     }
 
 private:
-    // One-shot allocator accounting on OOM: what was requested, what this cache
-    // holds (largest entries first), and the device's remaining memory.
-    void dump_oom_report(const std::string& key, std::size_t bytes, const char* op_name) const {
-        std::size_t free_b = 0, total_b = 0;
-        cudaMemGetInfo(&free_b, &total_b);
-        std::size_t pool_bytes = 0;
-        for (const auto& [ptr, sz] : mPool) pool_bytes += sz;
-        fprintf(stderr,
-                "[saved-cache OOM] op=%s key=%s request=%.1fMB entries=%d plain_total=%.1fMB "
-                "pool=%.1fMB gpu_free=%.1fMB gpu_total=%.1fMB\n",
-                op_name ? op_name : "?", key.c_str(), bytes / 1048576.0, count(),
-                total_plain_bytes() / 1048576.0, pool_bytes / 1048576.0,
-                free_b / 1048576.0, total_b / 1048576.0);
-        std::vector<std::pair<std::string, std::size_t>> entries(mSizes.begin(), mSizes.end());
-        std::sort(entries.begin(), entries.end(),
-                  [](const auto& x, const auto& y) { return x.second > y.second; });
-        for (std::size_t i = 0; i < entries.size() && i < 8; ++i) {
-            fprintf(stderr, "[saved-cache OOM]   %s = %.1fMB%s\n", entries[i].first.c_str(),
-                    entries[i].second / 1048576.0,
-                    is_arena_backed(entries[i].first) ? " (arena)" : "");
-        }
-    }
-
     // Pop a recycled buffer of at least `bytes` (best fit) from the free-list. Returns
     // nullptr if none; on success sets pool_take_bytes_ to the popped buffer's real size.
     void* take_from_pool(std::size_t bytes) {
@@ -260,6 +280,13 @@ private:
     std::unordered_map<std::string, void*> mBuffers;
     std::unordered_map<std::string, std::size_t> mSizes;
     std::unordered_map<std::string, bool> mArenaBacked;
+    struct HostMirror {
+        void* ptr = nullptr;
+        std::size_t bytes = 0;
+        std::size_t capacity = 0;
+        bool valid = false;
+    };
+    std::unordered_map<std::string, HostMirror> mHostMirror;  // pinned offload copies
     std::vector<std::pair<void*, std::size_t>> mPool;  // recycled buffers (dispatch per-stage)
     std::size_t pool_take_bytes_ = 0;
     std::size_t mBumpOffset = 0;

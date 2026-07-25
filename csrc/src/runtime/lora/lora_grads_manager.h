@@ -46,9 +46,13 @@ public:
         bool is_moe = false;  ///< True for MoE models
 
         // MoE-specific configuration (only used when is_moe = true)
-        int num_experts = 0;            ///< Number of experts per layer
+        int num_experts = 0;            ///< Number of experts per layer (global)
         int moe_intermediate_size = 0;  ///< Per-expert intermediate size (0 = use intermediate_size)
         bool train_router = false;      ///< Train MoE router gate during LoRA fine-tuning
+        // Expert Parallelism: grouped expert-LoRA holds only this rank's expert
+        // shard. 0 -> num_experts (no EP). Router LoRA stays global-sized.
+        int num_grouped_experts = 0;    ///< Local experts for grouped LoRA buffers
+        int grouped_expert_base = 0;    ///< Global id of this rank's first expert
 
         const ModelConfig* model_config = nullptr;  ///< Per-layer block type (hybrid models)
 
@@ -56,8 +60,17 @@ public:
         /// manager so gradient buffers line up with the LoRA weights.
         std::vector<dsl::BlockTypeDims> per_layer_dims;
 
+        /// Per-layer MLP structure — must mirror the weights manager (see
+        /// ModularLoRAWeightsManager::Config).
+        std::vector<std::uint8_t> layer_has_dense_mlp;
+        std::vector<std::uint8_t> layer_has_moe;
+
         [[nodiscard]] int effective_moe_intermediate() const {
             return moe_intermediate_size > 0 ? moe_intermediate_size : intermediate_size;
+        }
+
+        [[nodiscard]] int effective_grouped_experts() const {
+            return num_grouped_experts > 0 ? num_grouped_experts : num_experts;
         }
     };
 

@@ -1,3 +1,5 @@
+import os
+
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -40,6 +42,51 @@ class DistributedConfig:
     num_nodes: int = 1
     gpus_per_node: int = 0  # 0 = use config.gpus
     worker_output_dir: str | None = None  # None = use /tmp/surogate-{run_name}/
+
+
+@dataclass
+class DistillationConfig:
+    """
+    Configuration for offline top-K knowledge distillation.
+
+    Training consumes `.kd` sidecar files produced by `surogate distill-capture`
+    (teacher top-K next-token logprobs aligned with the token shards). The
+    per-token loss is `ce_weight * CE + kd_weight * tau^2 * KL(teacher || student)`
+    with teacher top-K probabilities renormalized at `temperature`.
+
+    Args:
+        teacher_model: Teacher model id or path (capture-time only). With
+            teacher_api_base set, this is the served model name.
+        top_k: Number of teacher logprobs stored per token (1..1024).
+        temperature: Distillation temperature tau (> 0).
+        kd_weight: Weight of the KD (KL) term.
+        ce_weight: Weight of the CE term. Defaults to 1 - kd_weight.
+        teacher_batch_size: Windows per teacher forward during capture (capture-time only).
+        kd_dir: Sidecar output directory override (capture-time only).
+            Default: alongside the token shards, which is where training reads them.
+        teacher_api_base: OpenAI-compatible base URL of a served teacher
+            (e.g. "http://localhost:8000/v1"); when set, capture queries the API
+            instead of loading teacher_model locally. Must be a vLLM-compatible
+            server (prompt_logprobs support); OpenAI-compatible aggregators such
+            as OpenRouter cannot be used. Capture-time only.
+        teacher_api_key_var: Env var holding the API key; empty/unset resolves
+            to "EMPTY" like local vLLM servers accept. Capture-time only.
+        teacher_api_concurrency: Concurrent in-flight capture requests (>= 1).
+            Capture-time only.
+        teacher_api_timeout: Per-request timeout in seconds (>= 1). Capture-time only.
+    """
+
+    teacher_model: str | None = None  # capture-time only
+    top_k: int = 32
+    temperature: float = 1.0
+    kd_weight: float = 0.5
+    ce_weight: float | None = None  # default: 1 - kd_weight
+    teacher_batch_size: int = 4  # capture-time only
+    kd_dir: str | None = None  # sidecar dir override; default: alongside token shards
+    teacher_api_base: str | None = None  # capture-time only
+    teacher_api_key_var: str | None = "VLLM_API_KEY"  # capture-time only
+    teacher_api_concurrency: int = 8  # capture-time only
+    teacher_api_timeout: int = 1200  # capture-time only, seconds
 
 
 @dataclass
@@ -300,6 +347,11 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
 
     offload_residual: bool | None = False
 
+    # Offload per-layer saved-for-backward tensors to pinned CPU at forward layer
+    # end; restored at backward layer start. Cuts step VRAM by the saved-tensor
+    # footprint (linear in tokens) at ~5-15% step-time cost. Requires recompute.
+    offload_saved_tensors: bool | None = False
+
     # CPU-RAM centric training: stream weights & gradients per-layer, run optimizer on CPU.
     # Replaces offload_master/offload_optimizer/offload_grads/use_zero_copy/use_write_combined.
     cpu_training: bool | None = False
@@ -390,6 +442,8 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
     # Expert Parallelism (EP): distribute MoE experts across GPUs
     ep_size: int | None = 1  # 1 = no EP (all experts replicated on every GPU)
     ep_load_balance_threshold: float | None = 1.3  # LLEP: LPT activates when max/mean GPU load exceeds this
+    ep_plan_refresh_interval: int | None = 16  # LLEP sticky plans: recompute LPT every N steps (1 = every step)
+    sequence_chunks: int | None = 1  # KV-checkpointed chunked training: process sequence_len as N chunks (1 = off)
 
     adapter_path: str | None = None  # PEFT adapter used to initialize the training run
     adapter_init_mode: Literal["merge", "trainable"] = "merge"
@@ -412,6 +466,9 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
 
     # Multi-node distributed training config (optional)
     distributed: DistributedConfig | None = None
+
+    # Offline knowledge distillation config (optional)
+    distillation: DistillationConfig | None = None
 
     def __init__(self, cfg: DictDefault):
         super().__init__(cfg)
@@ -440,6 +497,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
             self.recompute = bool(recompute_raw)
 
         self.offload_residual = cfg.get("offload_residual", self.offload_residual)
+        self.offload_saved_tensors = cfg.get("offload_saved_tensors", self.offload_saved_tensors)
         self.cpu_training = cfg.get("cpu_training", self.cpu_training)
         self.offload_master = cfg.get("offload_master", self.offload_master)
         self.offload_quants = cfg.get("offload_quants", self.offload_quants)
@@ -532,6 +590,8 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
 
         self.ep_size = cfg.get("ep_size", self.ep_size)
         self.ep_load_balance_threshold = float(cfg.get("ep_load_balance_threshold", self.ep_load_balance_threshold))
+        self.ep_plan_refresh_interval = int(cfg.get("ep_plan_refresh_interval", self.ep_plan_refresh_interval))
+        self.sequence_chunks = int(cfg.get("sequence_chunks", self.sequence_chunks or 1))
 
         self.adapter_path = cfg.get("adapter_path", self.adapter_path)
         self.adapter_init_mode = cfg.get("adapter_init_mode", self.adapter_init_mode)
@@ -572,6 +632,34 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
                 self.distributed = distributed_cfg
         else:
             self.distributed = None
+
+        # Parse distillation config
+        distillation_cfg = cfg.get("distillation", None)
+        if distillation_cfg:
+            if isinstance(distillation_cfg, dict):
+                ce_weight = distillation_cfg.get("ce_weight", None)
+                self.distillation = DistillationConfig(
+                    teacher_model=distillation_cfg.get("teacher_model", None),
+                    top_k=int(distillation_cfg.get("top_k", 32)),
+                    temperature=float(distillation_cfg.get("temperature", 1.0)),
+                    kd_weight=float(distillation_cfg.get("kd_weight", 0.5)),
+                    ce_weight=float(ce_weight) if ce_weight is not None else None,
+                    teacher_batch_size=int(distillation_cfg.get("teacher_batch_size", 4)),
+                    kd_dir=distillation_cfg.get("kd_dir", None),
+                    teacher_api_base=distillation_cfg.get("teacher_api_base", None),
+                    teacher_api_key_var=distillation_cfg.get("teacher_api_key_var", "VLLM_API_KEY"),
+                    teacher_api_concurrency=int(distillation_cfg.get("teacher_api_concurrency", 8)),
+                    teacher_api_timeout=int(distillation_cfg.get("teacher_api_timeout", 1200)),
+                )
+            elif isinstance(distillation_cfg, DistillationConfig):
+                self.distillation = distillation_cfg
+        else:
+            self.distillation = None
+
+    @property
+    def trainer_seq_len(self) -> int:
+        """Graph sequence length: chunk size under chunked-sequence training."""
+        return self.sequence_len // max(1, int(self.sequence_chunks or 1))
 
     def __post_init__(self):
         logger = get_logger()
@@ -663,6 +751,10 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
             if not shard_gradients:
                 raise ValueError("offload_grads requires cpu_training=true, shard_gradients=true, or zero_level >= 2.")
 
+        # Validate distillation before create_runtime_config so the forced
+        # lmhead_drop_ignored_rows=False lands in RuntimeOptions.
+        self._validate_distillation_config()
+
         # Validate dispatch-PP before EP so its explicit ep_size>1 rejection wins
         # over the generic "EP requires MoE" check.
         self._validate_dispatch_pp_config()
@@ -707,6 +799,50 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
                 f"per_device_train_batch_size * sequence_len ({batch_size} * {seq_len} = {total_tokens}). "
                 f"Either adjust batch size or sequence length, or reduce lmhead_chunks."
             )
+
+    def _validate_distillation_config(self):
+        """Validate the distillation block and resolve derived defaults."""
+        d = self.distillation
+        if d is None:
+            return
+
+        if not 1 <= d.top_k <= 1024:
+            raise ValueError(f"distillation.top_k must be in [1, 1024], got {d.top_k}.")
+        if d.temperature <= 0:
+            raise ValueError(f"distillation.temperature must be > 0, got {d.temperature}.")
+        if d.kd_weight < 0:
+            raise ValueError(f"distillation.kd_weight must be >= 0, got {d.kd_weight}.")
+        if d.ce_weight is None:
+            d.ce_weight = 1.0 - d.kd_weight
+            if d.ce_weight < 0:
+                raise ValueError(
+                    f"distillation.ce_weight defaults to 1 - kd_weight = {d.ce_weight}, which is "
+                    "negative. Set distillation.ce_weight explicitly when kd_weight > 1."
+                )
+        if d.ce_weight < 0:
+            raise ValueError(f"distillation.ce_weight must be >= 0, got {d.ce_weight}.")
+        if d.teacher_batch_size < 1:
+            raise ValueError(f"distillation.teacher_batch_size must be >= 1, got {d.teacher_batch_size}.")
+        if d.teacher_api_concurrency < 1:
+            raise ValueError(
+                f"distillation.teacher_api_concurrency must be >= 1, got {d.teacher_api_concurrency}."
+            )
+        if d.teacher_api_timeout < 1:
+            raise ValueError(f"distillation.teacher_api_timeout must be >= 1, got {d.teacher_api_timeout}.")
+
+        if self.distributed:
+            raise ValueError(
+                "distillation does not support multi-node distributed training in v1; "
+                "remove the `distributed:` block or the `distillation:` block."
+            )
+        if self.parallelism == "dispatch_pp":
+            raise ValueError("distillation is not supported with parallelism=dispatch_pp in v1.")
+        if self.lmhead_drop_ignored_rows:
+            logger.warning(
+                "[distillation]: forcing lmhead_drop_ignored_rows=False (the compact LM-head "
+                "row path does not support KD in v1)."
+            )
+            self.lmhead_drop_ignored_rows = False
 
     def _validate_dispatch_pp_config(self):
         """Normalize and validate parallelism=dispatch_pp (opt-in model-parallel mode).
@@ -919,6 +1055,24 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
                 "[offload_master]: disabling CUDA graphs (cross-stream weight prefetch is incompatible with graph capture)."
             )
 
+        # Chunked-sequence training (KV-checkpointed chunks): validate and
+        # adjust flags before RuntimeOptions is constructed below.
+        seq_chunks = int(self.sequence_chunks or 1)
+        if seq_chunks > 1:
+            if self.sequence_len % seq_chunks != 0:
+                raise ValueError(f"sequence_chunks={seq_chunks} must divide sequence_len={self.sequence_len}")
+            if self.per_device_train_batch_size != 1:
+                raise ValueError("sequence_chunks > 1 requires per_device_train_batch_size: 1")
+            if getattr(self, "lora_dropout", 0) not in (0, 0.0, None):
+                raise ValueError("sequence_chunks > 1 requires lora_dropout: 0 (re-forward must be deterministic)")
+            if self.use_cuda_graphs:
+                logger.info("[sequence_chunks]: disabling CUDA graphs (chunked schedule runs eagerly).")
+                self.use_cuda_graphs = False
+            # RoPE freqs tables are sized from the graph's T (= chunk size);
+            # chunk positions reach sequence_len, so extend via the existing
+            # override the run state honors.
+            os.environ["SUROGATE_ROPE_MAX_SEQ"] = str(self.sequence_len)
+
         if self.long_context and self.use_cuda_graphs:
             # long_context uses split-attention mode: MLP tile groups run eagerly
             # while the rest of each layer (norms, attention, projections) stays graphed.
@@ -937,9 +1091,14 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
                 "so the captured matmul dimensions can't be replayed)."
             )
 
+        if self.distillation is not None and self.use_cuda_graphs:
+            self.use_cuda_graphs = False
+            logger.info("[distillation]: disabling CUDA graphs (KD micro-steps run eagerly in v1).")
+
         self.runtime_config = _surogate.RuntimeOptions(
             recompute="true" if self.recompute else "false",
             offload_residual=self.offload_residual,
+            
             cpu_training=self.cpu_training,
             offload_master=self.offload_master,
             offload_quants=self.offload_quants,
@@ -972,9 +1131,21 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
         self.runtime_config.use_write_combined = self.use_write_combined
         self.runtime_config.selective_expert_dequant = self.qlora_selective_expert_dequant
         self.runtime_config.offload_experts = self.qlora_offload_experts
+        self.runtime_config.offload_saved_tensors = bool(self.offload_saved_tensors) and bool(self.recompute)
         # Expert Parallelism
         self.runtime_config.ep_size = self.ep_size
         self.runtime_config.ep_load_balance_threshold = self.ep_load_balance_threshold
+        # Under chunked-sequence training a layer sees 2*chunks forward
+        # dispatches per step (KV sweep + re-forward); scale the sticky-plan
+        # interval so refreshes stay at step granularity.
+        _plan_iv = int(self.ep_plan_refresh_interval or 16)
+        _sc = int(self.sequence_chunks or 1)
+        if _sc > 1:
+            _plan_iv = _plan_iv * 2 * _sc
+        self.runtime_config.ep_plan_refresh_interval = _plan_iv
+        # Chunked-sequence training (validated + flags adjusted BEFORE the
+        # RuntimeOptions ctor above; see the block ahead of it)
+        self.runtime_config.sequence_chunks = int(self.sequence_chunks or 1)
         # MoE loss coefficients (None means use model config default)
         if self.router_aux_loss_coef is not None:
             self.runtime_config.router_aux_loss_coef = float(self.router_aux_loss_coef)

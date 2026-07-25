@@ -430,6 +430,7 @@ DslRunState::DslRunState(const PretrainedConfig& config,
 DslRunState::~DslRunState() {
     destroy_cuda_graphs();
     release_cuda_resources();
+    free_kd_scratch();
     if (mMoEStatsDevice) {
         (void)cudaFree(mMoEStatsDevice);
         mMoEStatsDevice = nullptr;
@@ -1092,6 +1093,10 @@ void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {
         mAllocator->allocate(ETensorDType::INT32, "grpo_sample_starts", EAllocationType::ON_DEVICE, {BT});
     mGrpoNativeScratch.sample_ends =
         mAllocator->allocate(ETensorDType::INT32, "grpo_sample_ends", EAllocationType::ON_DEVICE, {BT});
+    mGrpoNativeScratch.pair_chosen =
+        mAllocator->allocate(ETensorDType::INT32, "grpo_pair_chosen", EAllocationType::ON_DEVICE, {BT});
+    mGrpoNativeScratch.pair_rejected =
+        mAllocator->allocate(ETensorDType::INT32, "grpo_pair_rejected", EAllocationType::ON_DEVICE, {BT});
     mGrpoNativeScratch.custom_dloss =
         mAllocator->allocate(ETensorDType::FP32, "grpo_custom_dloss", EAllocationType::ON_DEVICE, {BT});
     mGrpoNativeScratch.inv_temperature =
@@ -1157,6 +1162,15 @@ void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {
                                                                          ("grpo_host_sample_ends_" + suffix).c_str(),
                                                                          EAllocationType::PINNED,
                                                                          {BT});
+        mGrpoNativeScratch.host_pair_chosen[slot] = mAllocator->allocate(ETensorDType::INT32,
+                                                                         ("grpo_host_pair_chosen_" + suffix).c_str(),
+                                                                         EAllocationType::PINNED,
+                                                                         {BT});
+        mGrpoNativeScratch.host_pair_rejected[slot] =
+            mAllocator->allocate(ETensorDType::INT32,
+                                 ("grpo_host_pair_rejected_" + suffix).c_str(),
+                                 EAllocationType::PINNED,
+                                 {BT});
     }
 
     // Encoder backward scratch buffers - skip in LoRA-only mode since embedding backward is skipped entirely
@@ -1380,6 +1394,63 @@ void DslRunState::configure_backward_graphs(bool hooked) {
         }
     }
     mBackwardGraphsHooked = hooked;
+}
+
+void DslRunState::set_kd_config(int top_k, long max_tokens) {
+    if (top_k <= 0 || max_tokens <= 0) {
+        throw std::runtime_error("set_kd_config: top_k and max_tokens must be positive");
+    }
+    if (mKdScratch.topk_ids && mKdScratch.top_k == top_k && mKdScratch.max_tokens >= max_tokens) {
+        return;
+    }
+    free_kd_scratch();
+    const std::size_t count = static_cast<std::size_t>(max_tokens) * static_cast<std::size_t>(top_k);
+    CUDA_CHECK(cudaMalloc(&mKdScratch.topk_ids, count * sizeof(std::int32_t)));
+    CUDA_CHECK(cudaMalloc(&mKdScratch.topk_logprobs, count * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&mKdScratch.loss_accum, sizeof(float)));
+    CUDA_CHECK(cudaMemset(mKdScratch.loss_accum, 0, sizeof(float)));
+    for (int slot = 0; slot < KdNativeScratch::kStagingSlots; ++slot) {
+        CUDA_CHECK(cudaMallocHost(&mKdScratch.host_ids[slot], count * sizeof(std::int32_t)));
+        CUDA_CHECK(cudaMallocHost(&mKdScratch.host_logprobs[slot], count * sizeof(float)));
+        CUDA_CHECK(cudaEventCreateWithFlags(&mKdScratch.copy_done[slot], cudaEventDisableTiming));
+        mKdScratch.copy_recorded[slot] = false;
+    }
+    mKdScratch.next_slot = 0;
+    mKdScratch.top_k = top_k;
+    mKdScratch.max_tokens = max_tokens;
+}
+
+void DslRunState::free_kd_scratch() noexcept {
+    if (mKdScratch.topk_ids) {
+        (void)cudaFree(mKdScratch.topk_ids);
+        mKdScratch.topk_ids = nullptr;
+    }
+    if (mKdScratch.topk_logprobs) {
+        (void)cudaFree(mKdScratch.topk_logprobs);
+        mKdScratch.topk_logprobs = nullptr;
+    }
+    if (mKdScratch.loss_accum) {
+        (void)cudaFree(mKdScratch.loss_accum);
+        mKdScratch.loss_accum = nullptr;
+    }
+    for (int slot = 0; slot < KdNativeScratch::kStagingSlots; ++slot) {
+        if (mKdScratch.host_ids[slot]) {
+            (void)cudaFreeHost(mKdScratch.host_ids[slot]);
+            mKdScratch.host_ids[slot] = nullptr;
+        }
+        if (mKdScratch.host_logprobs[slot]) {
+            (void)cudaFreeHost(mKdScratch.host_logprobs[slot]);
+            mKdScratch.host_logprobs[slot] = nullptr;
+        }
+        if (mKdScratch.copy_done[slot]) {
+            (void)cudaEventDestroy(mKdScratch.copy_done[slot]);
+            mKdScratch.copy_done[slot] = nullptr;
+        }
+        mKdScratch.copy_recorded[slot] = false;
+    }
+    mKdScratch.top_k = 0;
+    mKdScratch.max_tokens = 0;
+    mKdScratch.next_slot = 0;
 }
 
 void DslRunState::set_moe_config(int num_experts, float aux_loss_coef, float z_loss_coef) {

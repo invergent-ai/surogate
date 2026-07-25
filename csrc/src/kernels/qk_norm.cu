@@ -1151,7 +1151,10 @@ void qkv_head_rmsnorm_backward_dweight(Tensor& d_weight,
                                        bool accumulate,
                                        cudaStream_t stream) {
     if (d_weight.DType != d_qkv.DType || d_weight.DType != qkv_out.DType || d_weight.DType != weight.DType) {
-        throw std::logic_error("qkv_head_rmsnorm_backward_dweight: dtype mismatch");
+        throw std::logic_error(std::string("qkv_head_rmsnorm_backward_dweight: dtype mismatch (d_weight=") +
+                               dtype_to_str(d_weight.DType) + ", d_qkv=" + dtype_to_str(d_qkv.DType) +
+                               ", qkv_out=" + dtype_to_str(qkv_out.DType) + ", weight=" + dtype_to_str(weight.DType) +
+                               ")");
     }
     if (d_weight.Rank != 1 || d_weight.Sizes[0] != head_size) {
         throw std::logic_error("qkv_head_rmsnorm_backward_dweight: unexpected d_weight shape");

@@ -257,7 +257,7 @@ LLEP activates automatically when `ep_size > 1` and routing imbalance crosses a 
 
 At each MoE layer, LLEP measures the per-GPU token load across the EP group:
 
-1. **Measure**: global expert token counts are collected across all EP ranks.
+1. **Measure**: global expert token counts are collected across all EP ranks (on plan-refresh steps; see sticky plans below).
 2. **Check threshold**: if `max_gpu_load / mean_gpu_load` is below `ep_load_balance_threshold`, standard EP runs unchanged (no overhead).
 3. **Assign**: the Least-Loaded Assignment (LLA) algorithm redistributes excess tokens from overloaded GPUs to underloaded ones, subject to a per-GPU capacity limit (the `α` factor).
 4. **Transfer**: both the token batches and the corresponding expert weight slices are transferred peer-to-peer to the receiving GPU.
@@ -280,6 +280,7 @@ ep_load_balance_threshold: 1.3   # activate LLEP when max/mean > 1.3 (default)
 | --- | --- | --- | --- |
 | `ep_size` | int | 1 | Number of GPUs per EP group. Must divide `gpus` and `num_experts`. |
 | `ep_load_balance_threshold` | float | 1.3 | Imbalance ratio above which LLEP activates. Lower = more aggressive rebalancing. |
+| `ep_plan_refresh_interval` | int | 16 | Sticky plans: recompute the expert placement every N forward dispatches per layer. `1` = plan every step. |
 
 **Threshold guidance:**
 
@@ -300,6 +301,8 @@ LLEP is most effective when:
 - **Model hidden size is large**: larger GEMMs are more compute-efficient, so the cost of weight transfers is more easily amortised.
 
 Under perfectly balanced routing, LLEP adds minimal overhead and falls back to standard EP automatically when the threshold is not exceeded.
+
+**Sticky plans and prefetch.** The expert placement is recomputed every `ep_plan_refresh_interval` forward dispatches per layer (default 16), not every step. A placement is exact for any batch — routing counts only affect balance quality — so between refreshes LLEP skips the per-layer imbalance all-reduce and LPT computation entirely, and prefetches the next layer's foreign expert weights while the current layer computes (in both forward and backward). Hot-expert routing is stable across adjacent steps in practice, so the stale-plan balance penalty is negligible; drift is corrected at the next refresh. Under `cpu_training`, foreign expert weights are fetched directly from the shared pinned host masters and expert LoRA gradients are exchanged back to their owner ranks — training remains mathematically exact.
 
 ### Relationship to MoEMonitor Warnings
 

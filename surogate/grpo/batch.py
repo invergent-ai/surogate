@@ -5,7 +5,6 @@ across data-parallel workers.
 """
 
 import copy
-import math
 
 from surogate.grpo.transport.types import MicroBatch, TrainingSample
 
@@ -19,36 +18,7 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
     input_ids = training_example.prompt_ids + training_example.completion_ids
     loss_mask = training_example.prompt_mask + training_example.completion_mask
     inference_logprobs = [0.0] * len(training_example.prompt_ids) + training_example.completion_logprobs
-    advantage_mask = training_example.advantage_mask
-    if advantage_mask is None:
-        advantages = [training_example.advantage] * len(input_ids)
-    else:
-        advantage_mask = list(advantage_mask)
-        if (
-            len(advantage_mask) != len(input_ids)
-            or any(not isinstance(selected, bool) for selected in advantage_mask)
-            or not any(advantage_mask)
-            or any(
-                selected and not trainable
-                for selected, trainable in zip(
-                    advantage_mask,
-                    loss_mask,
-                    strict=True,
-                )
-            )
-        ):
-            raise ValueError(
-                "advantage_mask must select at least one trainable token "
-                "and align with the full sample"
-            )
-        if training_example.advantage is None:
-            raise ValueError(
-                "advantage_mask requires a scalar outcome advantage"
-            )
-        advantages = [
-            training_example.advantage if selected else 0.0
-            for selected in advantage_mask
-        ]
+    advantages = [training_example.advantage] * len(input_ids)
     position_ids = list(range(len(input_ids)))
 
     # Per-token temperatures: prompt tokens use first completion temp (masked out anyway)
@@ -56,31 +26,11 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
     temperatures = [prompt_temp] * len(training_example.prompt_ids) + training_example.completion_temperatures
 
     teacher_logprobs = training_example.teacher_logprobs
-    opd_reference_logprobs = training_example.opd_reference_logprobs
-    hindsight_logprobs = training_example.hindsight_logprobs
-    hindsight_mask = training_example.hindsight_mask
-    replay_mask = training_example.replay_mask
-    replay_weights = training_example.replay_weights
-    opd_fields = (opd_reference_logprobs, hindsight_logprobs, hindsight_mask)
-    if all(value is None for value in opd_fields):
-        opd_reference_logprobs = [0.0] * len(input_ids)
-        hindsight_logprobs = [0.0] * len(input_ids)
-        hindsight_mask = [False] * len(input_ids)
-    elif any(value is None for value in opd_fields):
-        raise ValueError("opd_reference_logprobs, hindsight_logprobs, and hindsight_mask must be provided together")
-    if replay_mask is None:
-        replay_mask = [False] * len(input_ids)
-    if replay_weights is None:
-        replay_weights = [1.0] * len(input_ids)
-    if advantage_mask is not None and any(
-        replay and outcome
-        for replay, outcome in zip(
-            replay_mask,
-            advantage_mask,
-            strict=True,
-        )
-    ):
-        raise ValueError("advantage_mask may not overlap replay_mask")
+
+    # Turn ids: prompt tokens are not part of any model turn (-1).
+    turn_ids = None
+    if training_example.completion_turn_ids is not None:
+        turn_ids = [-1] * len(training_example.prompt_ids) + training_example.completion_turn_ids
 
     if len(input_ids) > seq_len:
         input_ids = input_ids[:seq_len]
@@ -91,13 +41,8 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         temperatures = temperatures[:seq_len]
         if teacher_logprobs is not None:
             teacher_logprobs = teacher_logprobs[:seq_len]
-        opd_reference_logprobs = opd_reference_logprobs[:seq_len]
-        hindsight_logprobs = hindsight_logprobs[:seq_len]
-        hindsight_mask = hindsight_mask[:seq_len]
-        replay_mask = replay_mask[:seq_len]
-        replay_weights = replay_weights[:seq_len]
-        if advantage_mask is not None:
-            advantage_mask = advantage_mask[:seq_len]
+        if turn_ids is not None:
+            turn_ids = turn_ids[:seq_len]
 
     assert (
         len(input_ids)
@@ -106,27 +51,14 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         == len(position_ids)
         == len(inference_logprobs)
         == len(temperatures)
-        == len(opd_reference_logprobs)
-        == len(hindsight_logprobs)
-        == len(hindsight_mask)
-        == len(replay_mask)
-        == len(replay_weights)
     ), (
         f"input_ids: {len(input_ids)}, advantages: {len(advantages)}, loss_mask: {len(loss_mask)}, "
         f"position_ids: {len(position_ids)}, inference_logprobs: {len(inference_logprobs)}, temperatures: {len(temperatures)}"
     )
     if teacher_logprobs is not None:
         assert len(teacher_logprobs) == len(input_ids), f"teacher_logprobs: {len(teacher_logprobs)}"
-    if any(hindsight and not loss for hindsight, loss in zip(hindsight_mask, loss_mask)):
-        raise ValueError("hindsight_mask may select only trainable completion tokens")
-    if any(replay and not loss for replay, loss in zip(replay_mask, loss_mask)):
-        raise ValueError("replay_mask may select only trainable completion tokens")
-    if any(not isinstance(weight, (int, float)) or not math.isfinite(weight) for weight in replay_weights):
-        raise ValueError("replay_weights must be finite numbers")
-    if any(replay and weight <= 0.0 for replay, weight in zip(replay_mask, replay_weights)):
-        raise ValueError("replay_weights must be positive on replay tokens")
-    if any(not replay and weight != 1.0 for replay, weight in zip(replay_mask, replay_weights)):
-        raise ValueError("replay_weights may differ from 1 only on replay tokens")
+    if turn_ids is not None:
+        assert len(turn_ids) == len(input_ids), f"turn_ids: {len(turn_ids)}"
 
     return MicroBatch(
         input_ids=input_ids,
@@ -136,11 +68,7 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         inference_logprobs=inference_logprobs,
         teacher_logprobs=teacher_logprobs,
         temperatures=temperatures,
-        opd_reference_logprobs=opd_reference_logprobs,
-        hindsight_logprobs=hindsight_logprobs,
-        hindsight_mask=hindsight_mask,
-        replay_mask=replay_mask,
-        replay_weights=[float(weight) for weight in replay_weights],
+        turn_ids=turn_ids,
     )
 
 
@@ -159,20 +87,23 @@ def packed_samples_into_micro_bs(
     for idx, sample in samples:
         for bin_content in micro_batches:
             if len(bin_content.input_ids) + len(sample.input_ids) <= max_seq_len:
+                bin_len_before = len(bin_content.input_ids)
                 bin_content.input_ids.extend(sample.input_ids)
                 bin_content.loss_mask.extend(sample.loss_mask)
                 bin_content.advantages.extend(sample.advantages)
                 bin_content.inference_logprobs.extend(sample.inference_logprobs)
                 bin_content.temperatures.extend(sample.temperatures)
-                bin_content.opd_reference_logprobs.extend(sample.opd_reference_logprobs)
-                bin_content.hindsight_logprobs.extend(sample.hindsight_logprobs)
-                bin_content.hindsight_mask.extend(sample.hindsight_mask)
-                bin_content.replay_mask.extend(sample.replay_mask)
-                bin_content.replay_weights.extend(sample.replay_weights)
                 if sample.teacher_logprobs is not None:
                     if bin_content.teacher_logprobs is None:
                         bin_content.teacher_logprobs = []
                     bin_content.teacher_logprobs.extend(sample.teacher_logprobs)
+                if bin_content.turn_ids is not None or sample.turn_ids is not None:
+                    # Packing mixes single- and multi-turn samples; whichever side
+                    # lacks turn ids gets its span backfilled with -1 so turn_ids
+                    # stays index-aligned with input_ids.
+                    if bin_content.turn_ids is None:
+                        bin_content.turn_ids = [-1] * bin_len_before
+                    bin_content.turn_ids.extend(sample.turn_ids or [-1] * len(sample.input_ids))
                 bin_content.position_ids.extend(sample.position_ids)
                 bin_content.lora_num_tokens[idx] += len(sample.input_ids)
                 break
@@ -197,13 +128,10 @@ def pad_micro_batch(micro_batch: MicroBatch, pad_to_multiple_of: int) -> MicroBa
     micro_batch.position_ids.extend(list(range(padding_size)))
     micro_batch.inference_logprobs.extend([0.0] * padding_size)
     micro_batch.temperatures.extend([1.0] * padding_size)
-    micro_batch.opd_reference_logprobs.extend([0.0] * padding_size)
-    micro_batch.hindsight_logprobs.extend([0.0] * padding_size)
-    micro_batch.hindsight_mask.extend([False] * padding_size)
-    micro_batch.replay_mask.extend([False] * padding_size)
-    micro_batch.replay_weights.extend([1.0] * padding_size)
     if micro_batch.teacher_logprobs is not None:
         micro_batch.teacher_logprobs.extend([0.0] * padding_size)
+    if micro_batch.turn_ids is not None:
+        micro_batch.turn_ids.extend([-1] * padding_size)
     # Send padding to the last lora so tokens have ascending lora idx
     micro_batch.lora_num_tokens[-1] += padding_size
 
@@ -217,24 +145,15 @@ def prepare_batch(
     idxs: list[int],
     num_loras: int,
     pad_to_multiple_of: int = 1,
-    sample_packing: bool = True,
 ) -> list[list[MicroBatch]]:
     """Prepare a batch of samples for each data-parallel worker.
 
     Each worker gets a list of micro-batches (shape [1, seq_len] each).
-    When sample packing is disabled, every real micro-batch contains exactly
-    one TrainingSample. Rank-padding micro-batches remain fully loss-masked.
+    The number of samples per micro-batch is variable (sample packing).
     """
     all_samples = [(idx, prepare_sample(rollout, seq_len)) for idx, rollout in zip(idxs, rollouts)]
 
-    if sample_packing:
-        micro_batches = packed_samples_into_micro_bs(all_samples, seq_len, num_loras)
-    else:
-        micro_batches = []
-        for idx, sample in all_samples:
-            sample.lora_num_tokens = [0] * num_loras
-            sample.lora_num_tokens[idx] = len(sample.input_ids)
-            micro_batches.append(sample)
+    micro_batches = packed_samples_into_micro_bs(all_samples, seq_len, num_loras)
     micro_batches = [pad_micro_batch(micro_batch, pad_to_multiple_of) for micro_batch in micro_batches]
 
     num_padding_batch = -len(micro_batches) % num_train_workers
@@ -245,9 +164,6 @@ def prepare_batch(
         padded_batch = copy.deepcopy(micro_batches[0])
         padded_batch.advantages = [0.0] * len(padded_batch.input_ids)
         padded_batch.loss_mask = [False] * len(padded_batch.input_ids)
-        padded_batch.hindsight_mask = [False] * len(padded_batch.input_ids)
-        padded_batch.replay_mask = [False] * len(padded_batch.input_ids)
-        padded_batch.replay_weights = [1.0] * len(padded_batch.input_ids)
         micro_batches.extend([padded_batch for _ in range(num_padding_batch)])
 
     assert len(micro_batches) % num_train_workers == 0, (

@@ -11,7 +11,6 @@
 #include <nanobind/stl/unordered_map.h>
 #include <nanobind/ndarray.h>
 
-#include <cmath>
 #include <filesystem>
 #include <cstdlib>
 #include <cstring>
@@ -35,6 +34,7 @@
 #include "runtime/qlora/qlora_config.h"
 #include "runtime/qlora/dsl_qlora_pipeline.h"
 #include "utilities/dtype.h"
+#include "tokenizer/tok_profile.h"
 #include "tokenizer/tokenizer.h"
 #include "runtime/attention/mem_eff/mem_eff_dispatch.h"
 
@@ -518,6 +518,9 @@ NB_MODULE(_surogate, m) {
             },
             "Enable activation recomputation: 'true' or 'false'.")
         .def_rw("offload_residual", &RuntimeOptions::OffloadResidual, "Offload residual stream buffers.")
+        .def_rw("offload_saved_tensors",
+                &RuntimeOptions::OffloadSavedTensors,
+                "Offload per-layer saved-for-backward tensors to pinned host (requires recompute)")
         .def_rw("lmhead_chunks", &RuntimeOptions::LMHeadChunks, "Split LM head computation into this many chunks.")
         .def_rw("skip_ignored_lmhead_rows",
                 &RuntimeOptions::SkipIgnoredLMHeadRows,
@@ -579,6 +582,12 @@ NB_MODULE(_surogate, m) {
         .def_rw("ep_load_balance_threshold",
                 &RuntimeOptions::EPLoadBalanceThreshold,
                 "LLEP adaptive threshold: LPT activates when max/mean GPU load exceeds this (default 1.3).")
+        .def_rw("ep_plan_refresh_interval",
+                &RuntimeOptions::EPPlanRefreshInterval,
+                "LLEP sticky plans: recompute the LPT plan every N forward dispatches per layer (default 16, 1 = every step).")
+        .def_rw("sequence_chunks",
+                &RuntimeOptions::SequenceChunks,
+                "Chunked-sequence training: process the sequence as N KV-checkpointed chunks (1 = off).")
         .def_prop_rw(
             "matmul_type",
             [](const RuntimeOptions* opt) { return opt->matmul_dtype(); },
@@ -1171,12 +1180,6 @@ NB_MODULE(_surogate, m) {
              "Must be called before import_weights(). The adapter's LoRA deltas\n"
              "are applied to BF16 base weights before quantization or storage.\n\n"
              "Parameters:\n- path: Path to PEFT adapter directory (with adapter_config.json).")
-        .def("import_adapter",
-             &MultiGPUPyTrainer::import_adapter,
-             nb::arg("file_name"),
-             "Import PEFT LoRA weights into the trainable adapter state.\n\n"
-             "Call after import_weights(). The adapter rank and target modules must match\n"
-             "the trainer LoRA configuration. Exported children remain standalone PEFT adapters.")
         .def("import_weights",
              &MultiGPUPyTrainer::import_weights,
              nb::arg("path"),
@@ -1356,8 +1359,8 @@ NB_MODULE(_surogate, m) {
             "step",
             [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets) {
                 // Use local_world_size (GPUs on this node) not global world_size
-                CHECK_SHAPE(inputs, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
-                CHECK_SHAPE(targets, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
+                CHECK_SHAPE(inputs, trainer->batch_size() * trainer->local_world_size(), trainer->step_seq_length());
+                CHECK_SHAPE(targets, trainer->batch_size() * trainer->local_world_size(), trainer->step_seq_length());
 
                 trainer->step(inputs.data(), targets.data());
             },
@@ -1372,9 +1375,9 @@ NB_MODULE(_surogate, m) {
             "step",
             [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets, TokenArray position_ids) {
                 // Use local_world_size (GPUs on this node) not global world_size
-                CHECK_SHAPE(inputs, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
-                CHECK_SHAPE(targets, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
-                CHECK_SHAPE(position_ids, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
+                CHECK_SHAPE(inputs, trainer->batch_size() * trainer->local_world_size(), trainer->step_seq_length());
+                CHECK_SHAPE(targets, trainer->batch_size() * trainer->local_world_size(), trainer->step_seq_length());
+                CHECK_SHAPE(position_ids, trainer->batch_size() * trainer->local_world_size(), trainer->step_seq_length());
 
                 trainer->step(inputs.data(), targets.data(), position_ids.data());
             },
@@ -1482,6 +1485,38 @@ NB_MODULE(_surogate, m) {
             "Debug-only dispatch-PP: one full single-GPU training step (forward -> loss, backward -> "
             "grads, optimizer update) through the sub-range executor; returns the step loss.")
         .def(
+            "dispatch_pp_forward_logprobs_multigpu",
+            [](MultiGPUPyTrainer* trainer,
+               TokenArray inputs,
+               TokenArray targets,
+               std::vector<int> los,
+               std::vector<int> his,
+               int num_microbatches) {
+                CHECK_SHAPE(inputs, num_microbatches * trainer->batch_size(), trainer->seq_length());
+                CHECK_SHAPE(targets, num_microbatches * trainer->batch_size(), trainer->seq_length());
+                auto lp = trainer->dispatch_pp_forward_logprobs_multigpu(inputs.data(),
+                                                                        targets.data(),
+                                                                        los,
+                                                                        his,
+                                                                        num_microbatches);
+                const std::size_t n = lp.size();
+                float* data = new float[n];
+                std::copy(lp.begin(), lp.end(), data);
+                nb::capsule owner(data, [](void* p) noexcept { delete[] static_cast<float*>(p); });
+                const std::size_t rows = static_cast<std::size_t>(num_microbatches) *
+                                         static_cast<std::size_t>(trainer->batch_size());
+                return nb::ndarray<nb::numpy, float, nb::ndim<2>>(
+                    data, {rows, static_cast<std::size_t>(trainer->seq_length())}, owner);
+            },
+            nb::arg("inputs"),
+            nb::arg("targets"),
+            nb::arg("los"),
+            nb::arg("his"),
+            nb::arg("num_microbatches") = 1,
+            "dispatch-PP staged forward through the loss stage; returns per-token logprobs "
+            "[num_microbatches*batch_size, seq]. Pair with dispatch_pp_train_step_multigpu(custom_dloss=...) "
+            "to run GRPO-style objectives under dispatch-PP.")
+        .def(
             "dispatch_pp_train_step_multigpu",
             [](MultiGPUPyTrainer* trainer,
                TokenArray inputs,
@@ -1491,10 +1526,18 @@ NB_MODULE(_surogate, m) {
                const optimizers::OptimizerConfig& opt_config,
                int step_idx,
                bool stale,
-               int num_microbatches) {
+               int num_microbatches,
+               nb::object custom_dloss_obj) {
                 // inputs/targets carry num_microbatches microbatches of [batch_size, seq] each.
                 CHECK_SHAPE(inputs, num_microbatches * trainer->batch_size(), trainer->seq_length());
                 CHECK_SHAPE(targets, num_microbatches * trainer->batch_size(), trainer->seq_length());
+                const float* custom_dloss_ptr = nullptr;
+                if (!custom_dloss_obj.is_none()) {
+                    auto custom_dloss =
+                        nb::cast<nb::ndarray<float, nb::ndim<2>, nb::c_contig>>(custom_dloss_obj);
+                    CHECK_SHAPE(custom_dloss, num_microbatches * trainer->batch_size(), trainer->seq_length());
+                    custom_dloss_ptr = custom_dloss.data();
+                }
                 return trainer->dispatch_pp_train_step_multigpu(inputs.data(),
                                                                 targets.data(),
                                                                 los,
@@ -1502,7 +1545,8 @@ NB_MODULE(_surogate, m) {
                                                                 opt_config,
                                                                 step_idx,
                                                                 stale,
-                                                                num_microbatches);
+                                                                num_microbatches,
+                                                                custom_dloss_ptr);
             },
             nb::arg("inputs"),
             nb::arg("targets"),
@@ -1512,6 +1556,7 @@ NB_MODULE(_surogate, m) {
             nb::arg("step_idx"),
             nb::arg("stale") = false,
             nb::arg("num_microbatches") = 1,
+            nb::arg("custom_dloss") = nb::none(),
             "Debug-only dispatch-PP: one full multi-GPU training step (round-robin backward dispatch + "
             "cross-GPU grad handoff -> collect grads -> optimizer on the master -> broadcast weights to "
             "all GPUs); returns the (raw) step loss. stale=true defers the optimizer update by one step "
@@ -1618,8 +1663,8 @@ NB_MODULE(_surogate, m) {
             "validate",
             [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets) {
                 // Use local_world_size (GPUs on this node) not global world_size
-                CHECK_SHAPE(inputs, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
-                CHECK_SHAPE(targets, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
+                CHECK_SHAPE(inputs, trainer->batch_size() * trainer->local_world_size(), trainer->step_seq_length());
+                CHECK_SHAPE(targets, trainer->batch_size() * trainer->local_world_size(), trainer->step_seq_length());
 
                 return trainer->validate(inputs.data(), targets.data());
             },
@@ -1634,9 +1679,9 @@ NB_MODULE(_surogate, m) {
             "validate",
             [](MultiGPUPyTrainer* trainer, TokenArray inputs, TokenArray targets, TokenArray position_ids) {
                 // Use local_world_size (GPUs on this node) not global world_size
-                CHECK_SHAPE(inputs, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
-                CHECK_SHAPE(targets, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
-                CHECK_SHAPE(position_ids, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
+                CHECK_SHAPE(inputs, trainer->batch_size() * trainer->local_world_size(), trainer->step_seq_length());
+                CHECK_SHAPE(targets, trainer->batch_size() * trainer->local_world_size(), trainer->step_seq_length());
+                CHECK_SHAPE(position_ids, trainer->batch_size() * trainer->local_world_size(), trainer->step_seq_length());
 
                 return trainer->validate(inputs.data(), targets.data(), position_ids.data());
             },
@@ -1725,8 +1770,8 @@ NB_MODULE(_surogate, m) {
                const optimizers::OptimizerConfig& config,
                int step) {
                 const int rows = trainer->batch_size() * trainer->local_world_size() * trainer->grad_accumulation();
-                CHECK_SHAPE(inputs, rows, trainer->seq_length());
-                CHECK_SHAPE(targets, rows, trainer->seq_length());
+                CHECK_SHAPE(inputs, rows, trainer->step_seq_length());
+                CHECK_SHAPE(targets, rows, trainer->step_seq_length());
 
                 auto [loss, norm] = trainer->train_step_graphed(inputs.data(), targets.data(), nullptr, config, step);
                 nb::dict ret;
@@ -1754,9 +1799,9 @@ NB_MODULE(_surogate, m) {
                const optimizers::OptimizerConfig& config,
                int step) {
                 const int rows = trainer->batch_size() * trainer->local_world_size() * trainer->grad_accumulation();
-                CHECK_SHAPE(inputs, rows, trainer->seq_length());
-                CHECK_SHAPE(targets, rows, trainer->seq_length());
-                CHECK_SHAPE(position_ids, rows, trainer->seq_length());
+                CHECK_SHAPE(inputs, rows, trainer->step_seq_length());
+                CHECK_SHAPE(targets, rows, trainer->step_seq_length());
+                CHECK_SHAPE(position_ids, rows, trainer->step_seq_length());
 
                 auto [loss, norm] =
                     trainer->train_step_graphed(inputs.data(), targets.data(), position_ids.data(), config, step);
@@ -1957,16 +2002,11 @@ NB_MODULE(_surogate, m) {
                 auto logprobs =
                     trainer->forward_for_grpo(input_ids.data(), targets.data(), position_ids_ptr, temperatures_ptr);
                 const std::size_t n = logprobs.size();
-                const std::size_t T = input_ids.shape(1);
-                if (n == 0 || T == 0 || n % T != 0) {
-                    throw std::runtime_error(
-                        "forward_for_grpo returned an empty or non-row-aligned logprob buffer");
-                }
-                const std::size_t output_rows = n / T;
                 float* data = new float[n];
                 std::copy(logprobs.begin(), logprobs.end(), data);
                 nb::capsule owner(data, [](void* p) noexcept { delete[] static_cast<float*>(p); });
-                return nb::ndarray<nb::numpy, float, nb::ndim<2>>(data, {output_rows, T}, owner);
+                const std::size_t B = input_ids.shape(0), T = input_ids.shape(1);
+                return nb::ndarray<nb::numpy, float, nb::ndim<2>>(data, {B, T}, owner);
             },
             nb::arg("input_ids"),
             nb::arg("targets"),
@@ -1974,7 +2014,7 @@ NB_MODULE(_surogate, m) {
             nb::arg("temperatures") = nb::none(),
             "GRPO single-pass forward: saves activations AND returns per-token logprobs.\n\n"
             "Call backward_grpo() after computing per-token gradient multipliers.\n"
-            "Returns: float32 logprobs shaped [native output rows, T].")
+            "Returns: float32 logprobs shaped [B, T].")
         .def(
             "step_grpo_native",
             [](MultiGPUPyTrainer* trainer,
@@ -1988,39 +2028,14 @@ NB_MODULE(_surogate, m) {
                nb::object position_ids_obj,
                nb::object temperatures_obj,
                nb::object teacher_logprobs_obj,
-               nb::object opd_reference_logprobs_obj,
-               nb::object hindsight_logprobs_obj,
-               nb::object hindsight_mask_obj,
-               nb::object replay_mask_obj,
-               nb::object replay_weights_obj,
                float loss_scale,
                float ipo_mask_low,
                float ipo_mask_high,
                float adv_tau,
                float teacher_tau,
-               float opd_tau,
-               float opd_beta,
-               float replay_tau,
-               float kl_tau,
-               int samples_per_rank) {
-                const std::size_t tokens = input_ids.shape(0) * input_ids.shape(1);
+               float kl_tau) {
                 if (sample_starts.shape(0) != sample_ends.shape(0)) {
                     throw std::invalid_argument("sample_starts and sample_ends must have the same length");
-                }
-                const bool rank_batched = samples_per_rank > 0;
-                int sample_count = static_cast<int>(sample_starts.shape(0));
-                if (rank_batched) {
-                    const std::size_t rows = input_ids.shape(0);
-                    if (rows == 0 || sample_starts.shape(0) != rows * static_cast<std::size_t>(samples_per_rank)) {
-                        throw std::invalid_argument(
-                            "rank-batched sample ranges must contain input_rows * samples_per_rank entries");
-                    }
-                    if (inference_logprobs.shape(0) != tokens || advantages.shape(0) != tokens ||
-                        loss_mask.shape(0) != tokens) {
-                        throw std::invalid_argument(
-                            "rank-batched GRPO token arrays must contain input_rows * sequence_len entries");
-                    }
-                    sample_count = samples_per_rank;
                 }
                 const std::int32_t* position_ids_ptr = nullptr;
                 if (!position_ids_obj.is_none()) {
@@ -2038,54 +2053,6 @@ NB_MODULE(_surogate, m) {
                         nb::cast<nb::ndarray<float, nb::ndim<1>, nb::c_contig>>(teacher_logprobs_obj);
                     teacher_logprobs_ptr = teacher_logprobs.data();
                 }
-                const float* opd_reference_logprobs_ptr = nullptr;
-                const float* hindsight_logprobs_ptr = nullptr;
-                const std::uint8_t* hindsight_mask_ptr = nullptr;
-                const bool has_opd_reference = !opd_reference_logprobs_obj.is_none();
-                const bool has_hindsight = !hindsight_logprobs_obj.is_none();
-                const bool has_hindsight_mask = !hindsight_mask_obj.is_none();
-                if ((has_opd_reference != has_hindsight) || (has_opd_reference != has_hindsight_mask)) {
-                    throw std::invalid_argument(
-                        "opd_reference_logprobs, hindsight_logprobs, and hindsight_mask must be provided together");
-                }
-                if (has_opd_reference) {
-                    auto opd_reference_logprobs =
-                        nb::cast<nb::ndarray<float, nb::ndim<1>, nb::c_contig>>(opd_reference_logprobs_obj);
-                    auto hindsight_logprobs =
-                        nb::cast<nb::ndarray<float, nb::ndim<1>, nb::c_contig>>(hindsight_logprobs_obj);
-                    auto hindsight_mask =
-                        nb::cast<nb::ndarray<std::uint8_t, nb::ndim<1>, nb::c_contig>>(hindsight_mask_obj);
-                    opd_reference_logprobs_ptr = opd_reference_logprobs.data();
-                    hindsight_logprobs_ptr = hindsight_logprobs.data();
-                    hindsight_mask_ptr = hindsight_mask.data();
-                }
-                const std::uint8_t* replay_mask_ptr = nullptr;
-                const float* replay_weights_ptr = nullptr;
-                if (!replay_mask_obj.is_none()) {
-                    auto replay_mask = nb::cast<nb::ndarray<std::uint8_t, nb::ndim<1>, nb::c_contig>>(replay_mask_obj);
-                    if (replay_mask.shape(0) != tokens) {
-                        throw std::invalid_argument("replay_mask must match the flattened token count");
-                    }
-                    replay_mask_ptr = replay_mask.data();
-                    if (!replay_weights_obj.is_none()) {
-                        auto replay_weights =
-                            nb::cast<nb::ndarray<float, nb::ndim<1>, nb::c_contig>>(replay_weights_obj);
-                        if (replay_weights.shape(0) != tokens) {
-                            throw std::invalid_argument("replay_weights must match the flattened token count");
-                        }
-                        for (std::size_t idx = 0; idx < tokens; ++idx) {
-                            const float weight = replay_weights.data()[idx];
-                            if (!std::isfinite(weight) ||
-                                (replay_mask.data()[idx] != 0 ? weight <= 0.0f : weight != 1.0f)) {
-                                throw std::invalid_argument(
-                                    "replay_weights must be finite and positive on replay tokens, and 1 elsewhere");
-                            }
-                        }
-                        replay_weights_ptr = replay_weights.data();
-                    }
-                } else if (!replay_weights_obj.is_none()) {
-                    throw std::invalid_argument("replay_weights require replay_mask");
-                }
                 trainer->step_grpo_native(input_ids.data(),
                                           targets.data(),
                                           inference_logprobs.data(),
@@ -2093,25 +2060,16 @@ NB_MODULE(_surogate, m) {
                                           loss_mask.data(),
                                           sample_starts.data(),
                                           sample_ends.data(),
-                                          sample_count,
+                                          static_cast<int>(sample_starts.shape(0)),
                                           position_ids_ptr,
                                           temperatures_ptr,
                                           teacher_logprobs_ptr,
-                                          opd_reference_logprobs_ptr,
-                                          hindsight_logprobs_ptr,
-                                          hindsight_mask_ptr,
-                                          replay_mask_ptr,
-                                          replay_weights_ptr,
                                           loss_scale,
                                           ipo_mask_low,
                                           ipo_mask_high,
                                           adv_tau,
                                           teacher_tau,
-                                          opd_tau,
-                                          opd_beta,
-                                          replay_tau,
-                                          kl_tau,
-                                          rank_batched);
+                                          kl_tau);
             },
             nb::arg("input_ids"),
             nb::arg("targets"),
@@ -2123,21 +2081,12 @@ NB_MODULE(_surogate, m) {
             nb::arg("position_ids") = nb::none(),
             nb::arg("temperatures") = nb::none(),
             nb::arg("teacher_logprobs") = nb::none(),
-            nb::arg("opd_reference_logprobs") = nb::none(),
-            nb::arg("hindsight_logprobs") = nb::none(),
-            nb::arg("hindsight_mask") = nb::none(),
-            nb::arg("replay_mask") = nb::none(),
-            nb::arg("replay_weights") = nb::none(),
             nb::arg("loss_scale") = 1.0f,
             nb::arg("ipo_mask_low") = 0.2f,
             nb::arg("ipo_mask_high") = 0.2f,
             nb::arg("adv_tau") = 1.0f,
             nb::arg("teacher_tau") = 0.0f,
-            nb::arg("opd_tau") = 0.0f,
-            nb::arg("opd_beta") = 1.0f,
-            nb::arg("replay_tau") = 0.0f,
             nb::arg("kl_tau") = 1.0e-3f,
-            nb::arg("samples_per_rank") = 0,
             "Run one GRPO training micro-step with native CUDA per-token gradient generation.")
         .def(
             "backward_grpo",
@@ -2160,10 +2109,212 @@ NB_MODULE(_surogate, m) {
                 return out;
             },
             "Return native GRPO metrics accumulated since the current grad-accum step started.")
-        .def("preflight_grpo_native_lora_gradient_norms",
-             &MultiGPUPyTrainer::preflight_grpo_native_lora_gradient_norms,
-             nb::arg("grad_clip"),
-             "Compute each replica's LoRA gradient norm without applying an optimizer update.")
+        .def(
+            "step_with_kd",
+            [](MultiGPUPyTrainer* trainer,
+               nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig> input_ids,
+               nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig> targets,
+               nb::ndarray<int32_t, nb::ndim<3>, nb::c_contig> kd_ids,
+               nb::ndarray<float, nb::ndim<3>, nb::c_contig> kd_logprobs,
+               nb::object position_ids_obj,
+               int top_k,
+               float temperature,
+               float kd_weight,
+               float ce_weight) {
+                // Pin the arrays to the trainer's geometry: py_train slices per
+                // GPU with the trainer's B/T, so self-consistent-but-wrong
+                // shapes would read out of bounds on the host.
+                CHECK_SHAPE(input_ids, trainer->batch_size() * trainer->local_world_size(), trainer->seq_length());
+                const std::size_t rows = input_ids.shape(0);
+                const std::size_t seq = input_ids.shape(1);
+                if (targets.shape(0) != rows || targets.shape(1) != seq) {
+                    throw std::invalid_argument("step_with_kd: targets shape must match input_ids");
+                }
+                if (top_k <= 0) {
+                    throw std::invalid_argument("step_with_kd: top_k must be positive");
+                }
+                if (kd_ids.shape(0) != rows || kd_ids.shape(1) != seq ||
+                    kd_ids.shape(2) != static_cast<std::size_t>(top_k)) {
+                    throw std::invalid_argument("step_with_kd: kd_ids must have shape [rows, seq_len, top_k]");
+                }
+                if (kd_logprobs.shape(0) != rows || kd_logprobs.shape(1) != seq ||
+                    kd_logprobs.shape(2) != static_cast<std::size_t>(top_k)) {
+                    throw std::invalid_argument("step_with_kd: kd_logprobs must have shape [rows, seq_len, top_k]");
+                }
+                const std::int32_t* pos_ptr = nullptr;
+                if (!position_ids_obj.is_none()) {
+                    auto pos = nb::cast<nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig>>(position_ids_obj);
+                    if (pos.shape(0) != rows || pos.shape(1) != seq) {
+                        throw std::invalid_argument("step_with_kd: position_ids shape must match input_ids");
+                    }
+                    pos_ptr = pos.data();
+                }
+                trainer->step_with_kd(input_ids.data(),
+                                      targets.data(),
+                                      kd_ids.data(),
+                                      kd_logprobs.data(),
+                                      pos_ptr,
+                                      top_k,
+                                      temperature,
+                                      kd_weight,
+                                      ce_weight);
+            },
+            nb::arg("input_ids"),
+            nb::arg("targets"),
+            nb::arg("kd_ids"),
+            nb::arg("kd_logprobs"),
+            nb::arg("position_ids") = nb::none(),
+            nb::arg("top_k") = 32,
+            nb::arg("temperature") = 1.0f,
+            nb::arg("kd_weight") = 0.5f,
+            nb::arg("ce_weight") = 0.5f,
+            "Run one knowledge-distillation training micro-step.\n\n"
+            "Standard SFT forward/backward with a top-K teacher signal injected into the\n"
+            "fused LM-head loss: total = ce_weight*CE + kd_weight*tau^2*KL(teacher||student).\n"
+            "kd_ids/kd_logprobs are [rows, seq_len, top_k] arrays with row i aligned with\n"
+            "targets[i] (the teacher's next-token distribution at input position i).\n"
+            "Call update_with_config() after grad_accum micro-steps, then get_kd_loss().")
+        .def(
+            "get_kd_loss",
+            [](MultiGPUPyTrainer* trainer) { return trainer->get_kd_loss(); },
+            "Mean KD loss per valid token accumulated since the last call (rank-0 local).")
+        .def(
+            "step_dpo_native",
+            [](MultiGPUPyTrainer* trainer,
+               nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig> input_ids,
+               nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig> targets,
+               nb::ndarray<float, nb::c_contig> ref_logprobs,
+               nb::ndarray<std::uint8_t, nb::c_contig> loss_mask,
+               nb::ndarray<std::int32_t, nb::c_contig> sample_starts,
+               nb::ndarray<std::int32_t, nb::c_contig> sample_ends,
+               nb::ndarray<std::int32_t, nb::c_contig> pair_chosen,
+               nb::ndarray<std::int32_t, nb::c_contig> pair_rejected,
+               nb::object position_ids_obj,
+               float loss_scale,
+               float beta,
+               int length_norm) {
+                // Per-token (ref_logprobs/loss_mask) and sample/pair arrays are
+                // either 1-D (shared by every GPU) or 2-D (one row per host batch
+                // row; sample/pair rows padded with -1). Pairs shard with samples.
+                auto check_ndim = [](const char* name, std::size_t ndim) {
+                    if (ndim != 1 && ndim != 2) {
+                        throw std::invalid_argument(std::string(name) +
+                                                    " must be 1-D (shared) or 2-D (one row per GPU)");
+                    }
+                };
+                auto rows_of = [](const auto& arr) {
+                    return arr.ndim() == 2 ? static_cast<int>(arr.shape(0)) : 1;
+                };
+                auto len_of = [](const auto& arr) {
+                    return static_cast<std::size_t>(arr.ndim() == 2 ? arr.shape(1) : arr.shape(0));
+                };
+                check_ndim("ref_logprobs", ref_logprobs.ndim());
+                check_ndim("loss_mask", loss_mask.ndim());
+                check_ndim("sample_starts", sample_starts.ndim());
+                check_ndim("sample_ends", sample_ends.ndim());
+                check_ndim("pair_chosen", pair_chosen.ndim());
+                check_ndim("pair_rejected", pair_rejected.ndim());
+
+                MultiGPUPyTrainer::DpoHostLayout layout;
+                layout.token_rows = rows_of(ref_logprobs);
+                layout.sample_rows = rows_of(sample_starts);
+                layout.token_len = static_cast<long>(len_of(ref_logprobs));
+                layout.input_rows = static_cast<long>(input_ids.shape(0));
+                layout.input_cols = static_cast<long>(input_ids.shape(1));
+                if (rows_of(loss_mask) != layout.token_rows || len_of(loss_mask) != len_of(ref_logprobs)) {
+                    throw std::invalid_argument("ref_logprobs and loss_mask must share the same shape");
+                }
+                if (rows_of(sample_ends) != layout.sample_rows || len_of(sample_ends) != len_of(sample_starts)) {
+                    throw std::invalid_argument("sample_starts and sample_ends must have the same shape");
+                }
+                if (rows_of(pair_chosen) != layout.sample_rows || rows_of(pair_rejected) != layout.sample_rows ||
+                    len_of(pair_rejected) != len_of(pair_chosen)) {
+                    throw std::invalid_argument(
+                        "pair_chosen/pair_rejected must share a shape and row count with the sample arrays");
+                }
+                if (targets.shape(0) != input_ids.shape(0) || targets.shape(1) != input_ids.shape(1)) {
+                    throw std::invalid_argument("targets must match input_ids' shape");
+                }
+                const std::int32_t* position_ids_ptr = nullptr;
+                if (!position_ids_obj.is_none()) {
+                    auto position_ids = nb::cast<nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig>>(position_ids_obj);
+                    if (position_ids.shape(0) != input_ids.shape(0) || position_ids.shape(1) != input_ids.shape(1)) {
+                        throw std::invalid_argument("position_ids must match input_ids' shape");
+                    }
+                    position_ids_ptr = position_ids.data();
+                }
+                trainer->step_dpo_native(input_ids.data(),
+                                         targets.data(),
+                                         ref_logprobs.data(),
+                                         loss_mask.data(),
+                                         sample_starts.data(),
+                                         sample_ends.data(),
+                                         static_cast<int>(len_of(sample_starts)),
+                                         pair_chosen.data(),
+                                         pair_rejected.data(),
+                                         static_cast<int>(len_of(pair_chosen)),
+                                         position_ids_ptr,
+                                         loss_scale,
+                                         beta,
+                                         length_norm,
+                                         layout);
+            },
+            nb::arg("input_ids"),
+            nb::arg("targets"),
+            nb::arg("ref_logprobs"),
+            nb::arg("loss_mask"),
+            nb::arg("sample_starts"),
+            nb::arg("sample_ends"),
+            nb::arg("pair_chosen"),
+            nb::arg("pair_rejected"),
+            nb::arg("position_ids") = nb::none(),
+            nb::arg("loss_scale") = 1.0f,
+            nb::arg("beta") = 0.1f,
+            nb::arg("length_norm") = 0,
+            "Run one offline DPO training micro-step with native CUDA per-pair gradient generation.")
+        .def(
+            "get_dpo_native_metrics",
+            [](MultiGPUPyTrainer* trainer) {
+                nb::dict out;
+                for (const auto& [key, value] : trainer->get_dpo_native_metrics()) {
+                    out[key.c_str()] = value;
+                }
+                return out;
+            },
+            "Return native DPO metrics accumulated since the current grad-accum step started.")
+        .def(
+            "compute_ref_logprobs_dpo",
+            [](MultiGPUPyTrainer* trainer,
+               nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig> input_ids,
+               nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig> targets,
+               nb::object position_ids_obj) {
+                if (targets.shape(0) != input_ids.shape(0) || targets.shape(1) != input_ids.shape(1)) {
+                    throw std::invalid_argument("targets must match input_ids' shape");
+                }
+                const std::int32_t* position_ids_ptr = nullptr;
+                if (!position_ids_obj.is_none()) {
+                    auto position_ids = nb::cast<nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig>>(position_ids_obj);
+                    if (position_ids.shape(0) != input_ids.shape(0) || position_ids.shape(1) != input_ids.shape(1)) {
+                        throw std::invalid_argument("position_ids must match input_ids' shape");
+                    }
+                    position_ids_ptr = position_ids.data();
+                }
+                const int input_rows = static_cast<int>(input_ids.shape(0));
+                auto logprobs =
+                    trainer->compute_ref_logprobs_dpo(input_ids.data(), targets.data(), position_ids_ptr, input_rows);
+                const std::size_t n = logprobs.size();
+                float* data = new float[n];
+                std::copy(logprobs.begin(), logprobs.end(), data);
+                nb::capsule owner(data, [](void* p) noexcept { delete[] static_cast<float*>(p); });
+                return nb::ndarray<nb::numpy, float, nb::ndim<2>>(
+                    data,
+                    {static_cast<std::size_t>(input_ids.shape(0)), static_cast<std::size_t>(input_ids.shape(1))},
+                    owner);
+            },
+            nb::arg("input_ids"),
+            nb::arg("targets"),
+            nb::arg("position_ids") = nb::none(),
+            "DPO reference per-token log-probs via the fused-loss forward (fp8/multi-GPU-safe).")
         .def("set_grad_accumulation",
              &MultiGPUPyTrainer::set_grad_accumulation,
              nb::arg("n"),
@@ -2776,8 +2927,8 @@ NB_MODULE(_surogate, m) {
                              inputs.device_id()};
                 d->load_batch(inp_t, tgt_t);
             },
-            nb::arg("inputs"),
-            nb::arg("targets"),
+            nb::arg("inputs").noconvert(),
+            nb::arg("targets").noconvert(),
             "Fill `inputs` and `targets` with the next batch.\n\n"
             "Parameters:\n"
             "- inputs: Preallocated int32 array [batch, seq_len].\n"
@@ -2806,14 +2957,81 @@ NB_MODULE(_surogate, m) {
                              position_ids.device_id()};
                 d->load_batch(inp_t, tgt_t, &pos_t);
             },
-            nb::arg("inputs"),
-            nb::arg("targets"),
-            nb::arg("position_ids"),
+            nb::arg("inputs").noconvert(),
+            nb::arg("targets").noconvert(),
+            nb::arg("position_ids").noconvert(),
             "Fill `inputs`, `targets`, and `position_ids` with the next batch.\n\n"
             "Parameters:\n"
             "- inputs: Preallocated int32 array [batch, seq_len].\n"
             "- targets: Preallocated int32 array [batch, seq_len].\n"
             "- position_ids: Preallocated int32 array [batch, seq_len].")
+        .def(
+            "load_batch",
+            [](DataLoader* d,
+               TokenArray inputs,
+               TokenArray targets,
+               TokenArray position_ids,
+               TokenArray3 kd_ids,
+               nb::ndarray<float, nb::shape<-1, -1, -1>, nb::c_contig, nb::device::cpu> kd_logprobs) {
+                CHECK_SHAPE(position_ids, static_cast<int>(inputs.shape(0)), static_cast<int>(inputs.shape(1)));
+                const int k = d->kd_top_k();
+                if (k <= 0) {
+                    throw std::runtime_error("load_batch: KD arrays passed but enable_kd() was not called");
+                }
+                CHECK_SHAPE(kd_ids, static_cast<int>(inputs.shape(0)), static_cast<int>(inputs.shape(1)), k);
+                CHECK_SHAPE(kd_logprobs, static_cast<int>(inputs.shape(0)), static_cast<int>(inputs.shape(1)), k);
+                Tensor inp_t{ETensorDType::INT32,
+                             {static_cast<long>(inputs.shape(0)), static_cast<long>(inputs.shape(1))},
+                             reinterpret_cast<std::byte*>(inputs.data()),
+                             nullptr,
+                             2,
+                             inputs.device_id()};
+                Tensor tgt_t{ETensorDType::INT32,
+                             {static_cast<long>(targets.shape(0)), static_cast<long>(targets.shape(1))},
+                             reinterpret_cast<std::byte*>(targets.data()),
+                             nullptr,
+                             2,
+                             targets.device_id()};
+                Tensor pos_t{ETensorDType::INT32,
+                             {static_cast<long>(position_ids.shape(0)), static_cast<long>(position_ids.shape(1))},
+                             reinterpret_cast<std::byte*>(position_ids.data()),
+                             nullptr,
+                             2,
+                             position_ids.device_id()};
+                Tensor kd_ids_t{ETensorDType::INT32,
+                                {static_cast<long>(kd_ids.shape(0)),
+                                 static_cast<long>(kd_ids.shape(1)),
+                                 static_cast<long>(kd_ids.shape(2))},
+                                reinterpret_cast<std::byte*>(kd_ids.data()),
+                                nullptr,
+                                3,
+                                kd_ids.device_id()};
+                Tensor kd_lp_t{ETensorDType::FP32,
+                               {static_cast<long>(kd_logprobs.shape(0)),
+                                static_cast<long>(kd_logprobs.shape(1)),
+                                static_cast<long>(kd_logprobs.shape(2))},
+                               reinterpret_cast<std::byte*>(kd_logprobs.data()),
+                               nullptr,
+                               3,
+                               kd_logprobs.device_id()};
+                d->load_batch(inp_t, tgt_t, &pos_t, &kd_ids_t, &kd_lp_t);
+            },
+            nb::arg("inputs").noconvert(),
+            nb::arg("targets").noconvert(),
+            nb::arg("position_ids").noconvert(),
+            nb::arg("kd_ids").noconvert(),
+            nb::arg("kd_logprobs").noconvert(),
+            "Fill token buffers plus the KD teacher top-K arrays with the next batch.\n\n"
+            "Requires enable_kd(). Parameters:\n"
+            "- inputs/targets/position_ids: Preallocated int32 arrays [batch, seq_len].\n"
+            "- kd_ids: Preallocated int32 array [batch, seq_len, top_k].\n"
+            "- kd_logprobs: Preallocated float32 array [batch, seq_len, top_k].")
+        .def("enable_kd",
+             &DataLoader::enable_kd,
+             nb::arg("expected_k"),
+             "Enable knowledge-distillation sidecar loading. Validates a `<shard>.kd` sidecar for\n"
+             "every token file (matching token count and `expected_k`) and raises otherwise.")
+        .def_prop_ro("has_kd", &DataLoader::has_kd, "True if KD sidecar loading is enabled.")
         .def("epoch", &DataLoader::epoch, "Return the current epoch number (0-based).")
         .def("progress", &DataLoader::progress, "Return progress within the current epoch (percent).")
         .def("advance_epoch", &DataLoader::advance_epoch, "Advance to the next epoch and reshuffle chunk order.")
@@ -2975,6 +3193,17 @@ NB_MODULE(_surogate, m) {
              "- norm: Gradient norm.\n"
              "- loss: Training loss.\n"
              "- lr: Learning rate.")
+        .def("log_step_kd",
+             &TrainingRunLogger::log_step_kd,
+             nb::arg("step"),
+             nb::arg("epoch"),
+             nb::arg("step_tokens"),
+             nb::arg("duration_ms"),
+             nb::arg("norm"),
+             nb::arg("loss"),
+             nb::arg("lr"),
+             nb::arg("kd_loss"),
+             "Log a knowledge-distillation training step (adds kd_loss to the step record).")
         .def("log_step_moe",
              nb::overload_cast<int,
                                float,
@@ -3158,6 +3387,16 @@ NB_MODULE(_surogate, m) {
                     "The directory must contain tokenizer.json. Optionally reads\n"
                     "tokenizer_config.json for BOS/EOS/PAD token metadata.\n\n"
                     "Parameters:\n- model_dir: Path to model directory.")
+        .def_static(
+            "profile_report",
+            [](bool reset) { return tokenizer::tok_profile_report(reset); },
+            nb::arg("reset") = false,
+            "Return the encode_for_training phase breakdown (render vs pretokenize\n"
+            "vs BPE merge) accumulated since load/last reset. Empty string unless\n"
+            "SUROGATE_TOK_PROFILE=1 and at least one training encode ran. If reset\n"
+            "is True, the counters are zeroed after reading.")
+        .def_static(
+            "profile_reset", [] { tokenizer::tok_profile_report(true); }, "Zero the encode_for_training profile counters.")
         .def("encode",
              &tokenizer::Tokenizer::encode,
              nb::arg("text"),
@@ -3243,11 +3482,16 @@ NB_MODULE(_surogate, m) {
                     strategy = tokenizer::LossStrategy::DEFAULT;
                 else if (strategy_str == "last_round")
                     strategy = tokenizer::LossStrategy::LAST_ROUND;
+                else if (strategy_str == "thinking_only")
+                    strategy = tokenizer::LossStrategy::THINKING_ONLY;
+                else if (strategy_str == "final_only")
+                    strategy = tokenizer::LossStrategy::FINAL_ONLY;
                 else if (strategy_str == "all")
                     strategy = tokenizer::LossStrategy::ALL;
                 else
-                    throw std::invalid_argument("strategy must be 'default', 'last_round', or 'all', got: " +
-                                                strategy_str);
+                    throw std::invalid_argument(
+                        "strategy must be 'default', 'last_round', 'thinking_only', 'final_only', or 'all', got: " +
+                        strategy_str);
 
                 // Convert messages, skipping entries with null content
                 std::vector<tokenizer::ChatMessage> msgs;
@@ -3274,7 +3518,9 @@ NB_MODULE(_surogate, m) {
             "Parameters:\n"
             "- messages: List of dicts with 'role' and 'content' keys.\n"
             "- strategy: 'default' (train on all assistant turns), 'last_round'\n"
-            "            (train only on last assistant turn), or 'all' (train on everything).")
+            "            (train only on last assistant turn), 'thinking_only'\n"
+            "            (train reasoning through </think>), 'final_only'\n"
+            "            (train only after </think>), or 'all' (train on everything).")
         .def(
             "encode_for_training_batch",
             [](const tokenizer::Tokenizer& self, nb::list batch, const std::string& strategy_str) {
@@ -3283,11 +3529,16 @@ NB_MODULE(_surogate, m) {
                     strategy = tokenizer::LossStrategy::DEFAULT;
                 else if (strategy_str == "last_round")
                     strategy = tokenizer::LossStrategy::LAST_ROUND;
+                else if (strategy_str == "thinking_only")
+                    strategy = tokenizer::LossStrategy::THINKING_ONLY;
+                else if (strategy_str == "final_only")
+                    strategy = tokenizer::LossStrategy::FINAL_ONLY;
                 else if (strategy_str == "all")
                     strategy = tokenizer::LossStrategy::ALL;
                 else
-                    throw std::invalid_argument("strategy must be 'default', 'last_round', or 'all', got: " +
-                                                strategy_str);
+                    throw std::invalid_argument(
+                        "strategy must be 'default', 'last_round', 'thinking_only', 'final_only', or 'all', got: " +
+                        strategy_str);
 
                 // Convert batch of conversations, skipping entries with null content
                 std::vector<std::vector<tokenizer::ChatMessage>> cpp_batch;
@@ -3324,7 +3575,7 @@ NB_MODULE(_surogate, m) {
             "Batch encode conversations for training (multi-threaded).\n\n"
             "Parameters:\n"
             "- batch: List of conversations, each a list of message dicts.\n"
-            "- strategy: 'default', 'last_round', or 'all'.");
+            "- strategy: 'default', 'last_round', 'thinking_only', 'final_only', or 'all'.");
 
     // ----------------------------------------------------------------------
     // mem-efficient attention (Phase 4 attempt 1 port, see

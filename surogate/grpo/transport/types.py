@@ -14,12 +14,12 @@ class TrainingSample(msgspec.Struct, array_like=True, gc=False, omit_defaults=Tr
     teacher_logprobs: list[float] | None = None
     advantage: float | None = None
     reward: float | None = None
-    hindsight_logprobs: list[float] | None = None
-    hindsight_mask: list[bool] | None = None
-    replay_mask: list[bool] | None = None
-    opd_reference_logprobs: list[float] | None = None
-    replay_weights: list[float] | None = None
-    advantage_mask: list[bool] | None = None
+    # 0-based model-turn index per completion token; None for single-turn envs.
+    # Env-observation tokens injected between turns carry the index of the turn
+    # they precede, so a turn spans [its observation .. its completion].
+    completion_turn_ids: list[int] | None = None
+    # Total model turns in the source trajectory (before any truncation).
+    num_turns: int | None = None
 
 
 class TrainingBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
@@ -40,10 +40,8 @@ class MicroBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
     inference_logprobs: list[float]
     position_ids: list[int]
     temperatures: list[float]  # Per-token temperatures used during generation
-    opd_reference_logprobs: list[float]
-    hindsight_logprobs: list[float]
-    hindsight_mask: list[bool]
-    replay_mask: list[bool]
     teacher_logprobs: list[float] | None = None
     lora_num_tokens: list[int] | None = None
-    replay_weights: list[float] | None = None
+    # Per-token 0-based turn index; -1 for prompt/padding tokens. None when the
+    # source env is single-turn (turn structure carries no information there).
+    turn_ids: list[int] | None = None

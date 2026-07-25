@@ -132,7 +132,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
             is_llep_active = true;
             std::string_view wname = op.inputs[1].name;
             const auto meta_it = mEPLayerMeta.find(ep_key_any);
-            const bool refresh_native_only_ptrs = llep.owned_foreign_ptrs.empty() && meta_it != mEPLayerMeta.end() &&
+            const bool refresh_native_only_ptrs = !llep.has_foreign_experts && meta_it != mEPLayerMeta.end() &&
                                                   meta_it->second.num_merged == meta_it->second.num_local &&
                                                   llep.num_merged_experts == meta_it->second.num_local &&
                                                   weights.Rank >= 3;
@@ -618,7 +618,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
             auto& llep = llep_it->second;
             std::string_view wname = op.inputs[2].name;
             const auto meta_it = mEPLayerMeta.find(ep_key_any);
-            const bool refresh_native_only_ptrs = llep.owned_foreign_ptrs.empty() && meta_it != mEPLayerMeta.end() &&
+            const bool refresh_native_only_ptrs = !llep.has_foreign_experts && meta_it != mEPLayerMeta.end() &&
                                                   meta_it->second.num_merged == meta_it->second.num_local &&
                                                   llep.num_merged_experts == meta_it->second.num_local &&
                                                   weights.Rank >= 3;

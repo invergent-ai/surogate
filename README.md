@@ -45,7 +45,7 @@ Surogate Trainer is built for developers and enterprises that need fast experime
 ### Highlights
 
 - **🔧 Pre-training + Fine-tuning**: full fine-tuning, LoRA
-- [**🔧 BF16, FP8 and NVFP4 Reinforcement Learning**](https://docs.surogate.ai/guides/rl-training): advanced GRPO training and evaluation with custom, deterministic environments
+- [**🔧 BF16, FP8 and NVFP4 Reinforcement Learning (GRPO and DPO)**](https://docs.surogate.ai/guides/rl-training): advanced GRPO training and evaluation with custom, deterministic environments
 - [**🔧 RL Environments***](https://docs.surogate.ai/guides/rl-environments): predictable environments for RL training
 - [**🖥️...🖥️ Native multi-GPU**](https://docs.surogate.ai/guides/multi-gpu) training with multi-threaded backend
 - [**🖥️...🖥️ Native multi-Node**](https://docs.surogate.ai/guides/multi-node) DDP training with Ray
@@ -77,10 +77,14 @@ We support the following models. Please create a PR if you need a specific model
 | Qwen3 MoE          | Qwen3MoeForCausalLM                                     | 30B-A3B, 235B-A22B            |
 | Qwen3.5            | Qwen3_5ForCausalLM, Qwen3_5ForConditionalGeneration     | 0.8B, 2B 4B, 9B, 27B          |
 | Qwen3.5 Moe        | Qwen3MoeForCausalLM, Qwen3_5MoeForConditionalGeneration | 35B-A3B, 122B-A10B, 397B-A17B |
+| Qwen3.6            | Qwen3_5ForCausalLM, Qwen3_5ForConditionalGeneration     | 27B                           |
+| Gemma 4            | Gemma4ForCausalLM, Gemma4ForConditionalGeneration       | 12B, 26B-A4B                  |
 | Nemotron Nano v3   | NemotronHForCausalLM                                    | 30B-A3B                       |
 | Nemotron Super v3  | NemotronHForCausalLM                                    | 120B-A12B                     |
 | Nemotron Cascade 2 | NemotronHForCausalLM                                    | 30B-A3B                       |
 | GPT-OSS            | GptOssForCausalLM                                       | 20B, 120B                     |
+| Laguna             | LagunaForCausalLM                                       | XS-2.1                        |
+| LFM2               | Lfm2ForCausalLM                                         | 350M, 700M, 1.2B, 2.6B        |
 | Llama 3.1          | LlamaForCausalLM                                        | 8B, 70B, 405B                     |
 | Llama 3.2          | LlamaForCausalLM                                        | 1B, 3B                      |
 

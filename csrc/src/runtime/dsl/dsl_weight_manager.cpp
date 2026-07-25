@@ -199,6 +199,8 @@ DslWeightManager::DslWeightManager(const Module& module,
     mConfig.shard_idx = shard_idx;
     mConfig.num_shards = num_shards;
     mConfig.shard_weights = options.ShardWeights;
+    mConfig.ep_size = std::max(options.EPSize, 1);
+    mConfig.ep_rank = (mConfig.ep_size > 1) ? (shard_idx % mConfig.ep_size) : 0;
     mConfig.offload_master = options.OffloadMaster;
     mConfig.offload_quants = options.OffloadQuants;
     mConfig.persistent_quants = options.PersistentQuants;
@@ -288,6 +290,17 @@ void DslWeightManager::allocate_weights(const Module& module,
 
         // Cache global (unsharded) shape
         entry.global_shape = shape;
+
+        // Expert Parallelism: a frozen stacked-expert weight only feeds this rank's
+        // local experts (the grouped GEMMs run post-dispatch on local expert ids), so
+        // its prefetch buffer + H2D copy can carry just the ep_rank row block. The
+        // pinned master stays global. Rank>=3 excludes shared-expert weights (2-D)
+        // and matches the QLoRA pipeline's spec-slicing rule.
+        if (mConfig.ep_size > 1 && !sharded_master && entry.is_block && !entry.trainable && shape.size() >= 3 &&
+            shape[0] % mConfig.ep_size == 0 && tensor_role_is_expert_weight_name(name) &&
+            !tensor_role_is_shared_expert_name(name)) {
+            entry.ep_sliced = true;
+        }
 
         // Determine allocation location for master weights
         EAllocationType master_alloc = EAllocationType::ON_DEVICE;
@@ -429,6 +442,23 @@ void DslWeightManager::allocate_weights(const Module& module,
     }
 }
 
+bool DslWeightManager::work_is_transient(const std::string& name) const {
+    auto it = mWeights.find(name);
+    if (it == mWeights.end()) {
+        return false;
+    }
+    const auto& entry = it->second;
+    if (entry.is_block) {
+        return mStreamWeights || mConfig.offload_master;
+    }
+    if (mConfig.cpu_training) {
+        // Embedding and lm_head share one GPU staging buffer; each gather
+        // overwrites it with the tensor about to be consumed.
+        return is_primary_embedding_name(name) || is_lm_head_name(name);
+    }
+    return false;
+}
+
 const DslWeightEntry* DslWeightManager::find_entry_by_name(const std::string& name) const {
     auto it = mWeights.find(name);
     if (it == mWeights.end()) {
@@ -511,6 +541,10 @@ void DslWeightManager::allocate_prefetch_buffers() {
                 std::vector<long> shape = entry.global_shape;
                 if (shape.empty()) {
                     shape.assign(entry.master.Sizes.begin(), entry.master.Sizes.begin() + entry.master.Rank);
+                }
+                // EP-local streaming: the buffer only holds this rank's expert rows.
+                if (entry.ep_sliced) {
+                    shape[0] /= mConfig.ep_size;
                 }
                 // FP8-streamed matmul weights get an FP8 prefetch buffer (half the device
                 // footprint, fed straight to the FP8 GEMM) plus a 2-float device scale slot.
@@ -764,6 +798,20 @@ void DslWeightManager::gather_block(int layer_idx, NCCLCommunicator& comm, cudaS
             }
             TensorShard local(staging, mConfig.shard_idx, mConfig.num_shards, global_shape);
             comm.schedule_all_gather(local, work);
+        } else if (entry.ep_sliced) {
+            // EP-local streaming: copy only this rank's expert row block out of the
+            // global pinned master (dim0 is outermost, so the block is contiguous).
+            std::vector<long> local_shape(entry.master.Sizes.begin(), entry.master.Sizes.begin() + entry.master.Rank);
+            const long local_rows = local_shape[0] / mConfig.ep_size;
+            local_shape[0] = local_rows;
+            std::size_t row_bytes = get_dtype_size(entry.master.DType);
+            for (std::size_t d = 1; d < local_shape.size(); ++d) {
+                row_bytes *= static_cast<std::size_t>(local_shape[d]);
+            }
+            std::byte* src = static_cast<std::byte*>(entry.master.Data) +
+                             static_cast<std::size_t>(mConfig.ep_rank) * static_cast<std::size_t>(local_rows) * row_bytes;
+            Tensor local_master = Tensor::from_pointer(src, entry.master.Device, entry.master.DType, local_shape);
+            convert_to_work(local_master, work, stream);
         } else {
             // Not sharded or single GPU: just copy/convert
             convert_to_work(entry.master, work, stream);

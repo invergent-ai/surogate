@@ -84,7 +84,6 @@ public:
     ~MultiGPUPyTrainer();
 
     void set_adapter_path(std::string path);
-    void import_adapter(std::string file_name);
     void import_weights(std::string path);
     void import_weights_from_external(std::string safetensors_path,
                                       std::vector<std::vector<qlora::ExternalWeight>> per_gpu_weights);
@@ -94,7 +93,22 @@ public:
     void load_checkpoint(std::string directory, int step);
     void save_checkpoint(std::string directory, int step);
     void step(const std::int32_t* inputs, const std::int32_t* targets, const std::int32_t* position_ids = nullptr);
+
+    /// Chunked-sequence step (KV-checkpointed chunks): forward KV sweep over
+    /// chunks 0..N-1, then reverse-order re-forward + backward with exact
+    /// dK/dV accumulation. Input arrays are [rows, B, N*T].
+    void step_chunked(const std::int32_t* inputs,
+                      const std::int32_t* targets,
+                      const std::int32_t* position_ids,
+                      int seq_chunks);
     float validate(const std::int32_t* inputs, const std::int32_t* targets, const std::int32_t* position_ids = nullptr);
+
+    /// Chunked-sequence eval: forward-only chunk sweep with per-chunk losses
+    /// combined weighted by valid-token counts. Arrays are [rows, B, N*T].
+    float validate_chunked(const std::int32_t* inputs,
+                           const std::int32_t* targets,
+                           const std::int32_t* position_ids,
+                           int seq_chunks);
     std::pair<float, float> update_with_config(const optimizers::OptimizerConfig& config, int step);
     std::pair<float, float> train_step_graphed(const std::int32_t* inputs,
                                                const std::int32_t* targets,
@@ -118,6 +132,12 @@ public:
     }
     int seq_length() const {
         return T;
+    }
+
+    /// Sequence length step() arrays must carry: the graph T times the
+    /// chunked-sequence factor (equal to seq_length() when chunking is off).
+    int step_seq_length() const {
+        return seq_length() * std::max(1, mOptions.SequenceChunks);
     }
     int grad_accumulation() const {
         return mGradAccumulation;
@@ -219,6 +239,21 @@ public:
     // are applied while this step trains on weights one update behind) — the
     // RoundPipe one-step staleness. Call dispatch_pp_flush_pending at the end to
     // apply the last deferred grads.
+    // Staged forward that runs THROUGH the loss stage and returns per-token
+    // logprobs [num_microbatches * B * T]. The fused training step stops its
+    // forward pipeline at stage N-2 (the backward recomputes the last stage), so
+    // logprobs are never materialized there. GRPO needs them to form its
+    // per-token gradients, which then come back in via custom_dloss below.
+    std::vector<float> dispatch_pp_forward_logprobs_multigpu(const std::int32_t* inputs,
+                                                             const std::int32_t* targets,
+                                                             const std::vector<int>& los,
+                                                             const std::vector<int>& his,
+                                                             int num_microbatches = 1);
+    // custom_dloss (optional, host [num_microbatches * B * T]): per-token gradient
+    // seeds for the loss stage, replacing the built-in cross-entropy. This is how
+    // GRPO/DPO-style objectives run under dispatch-PP — the caller computes the
+    // per-token gradients from logprobs and hands them in, exactly as the
+    // non-dispatch path does via backward_grpo(). nullptr keeps the CE behaviour.
     float dispatch_pp_train_step_multigpu(const std::int32_t* inputs,
                                           const std::int32_t* targets,
                                           const std::vector<int>& los,
@@ -226,7 +261,8 @@ public:
                                           const optimizers::OptimizerConfig& opt_config,
                                           int step_idx,
                                           bool stale,
-                                          int num_microbatches = 1);
+                                          int num_microbatches = 1,
+                                          const float* custom_dloss = nullptr);
     // Grad norm computed by the last dispatch_pp optimizer apply (for the loss display).
     float dispatch_pp_last_grad_norm() const {
         return mDispatchPpLastGradNorm;
@@ -284,23 +320,68 @@ public:
                           const std::int32_t* position_ids,
                           const float* temperatures,
                           const float* teacher_logprobs,
-                          const float* opd_reference_logprobs,
-                          const float* hindsight_logprobs,
-                          const std::uint8_t* hindsight_mask,
-                          const std::uint8_t* replay_mask,
-                          const float* replay_weights,
                           float loss_scale,
                           float ipo_mask_low,
                           float ipo_mask_high,
                           float adv_tau,
                           float teacher_tau,
-                          float opd_tau,
-                          float opd_beta,
-                          float replay_tau,
-                          float kl_tau,
-                          bool rank_batched = false);
+                          float kl_tau);
     std::unordered_map<std::string, float> get_grpo_native_metrics();
-    std::vector<float> preflight_grpo_native_lora_gradient_norms(float grad_clip);
+
+    // Knowledge-distillation training micro-step: standard SFT forward/backward
+    // with a top-K teacher signal. kd_ids/kd_logprobs are host arrays of shape
+    // [ngpu*B, T, top_k], sliced per GPU like inputs/targets.
+    void step_with_kd(const std::int32_t* inputs,
+                      const std::int32_t* targets,
+                      const std::int32_t* kd_ids,
+                      const float* kd_logprobs,
+                      const std::int32_t* position_ids,
+                      int top_k,
+                      float temperature,
+                      float kd_weight,
+                      float ce_weight);
+
+    // Mean KD loss per valid token accumulated since the last call (rank-0
+    // local, mirroring get_grpo_native_metrics). Consumes the accumulator on
+    // every rank.
+    float get_kd_loss();
+    // Host-array layout for step_dpo_native. Per-token arrays and sample/pair
+    // arrays are either shared by every GPU row (rows == 1) or carry one row
+    // per host batch row. When sample_rows > 1, each sample/pair row is padded
+    // with -1 to its configured capacity.
+    struct DpoHostLayout {
+        int token_rows = 1;
+        int sample_rows = 1;
+        long token_len = 0;
+        long input_rows = 0;
+        long input_cols = 0;
+    };
+
+    // Offline DPO micro-step. Pair arrays shard together with sample arrays.
+    void step_dpo_native(const std::int32_t* inputs,
+                         const std::int32_t* targets,
+                         const float* ref_logprobs,
+                         const std::uint8_t* loss_mask,
+                         const std::int32_t* sample_starts,
+                         const std::int32_t* sample_ends,
+                         int sample_count,
+                         const std::int32_t* pair_chosen,
+                         const std::int32_t* pair_rejected,
+                         int pair_count,
+                         const std::int32_t* position_ids,
+                         float loss_scale,
+                         float beta,
+                         int length_norm,
+                         DpoHostLayout layout);
+    std::unordered_map<std::string, float> get_dpo_native_metrics();
+
+    // DPO reference log-probs via the fused-loss forward (fp8/multi-GPU-safe).
+    // `inputs`/`targets`/`position_ids` are [host_rows*B, T] (one B-block per host
+    // batch row). Returns logprobs for ALL host rows, [host_rows*B*T] in row order.
+    std::vector<float> compute_ref_logprobs_dpo(const std::int32_t* inputs,
+                                                const std::int32_t* targets,
+                                                const std::int32_t* position_ids,
+                                                int input_rows);
 
 private:
     std::unique_ptr<PretrainedConfig> mConfig;  // unique_ptr to preserve polymorphism
@@ -313,10 +394,12 @@ private:
     int mTrainMicroStep = 0;
     int mEvalStep = 0;
     int mGradAccumulation = 1;
-    bool mGrpoRankBatched = false;
+    // Controls metric aggregation after a DPO step with distinct host rows.
+    bool mDpoShardedRows = false;
 
     std::unique_ptr<CommunicatorThreadsPack> mThreads;
     struct sFullStepGraphState {
+        Tensor chunk_pos_scratch;  ///< pinned [planes, B, chunk_T] staging for chunked pos ids
         cudaGraphExec_t graph_exec = nullptr;
         bool captured = false;
         int captured_B = 0;

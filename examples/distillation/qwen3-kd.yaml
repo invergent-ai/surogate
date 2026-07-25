@@ -1,0 +1,56 @@
+# Offline knowledge distillation: Qwen3-1.7B (teacher) -> Qwen3-0.6B (student).
+#
+# Two-step workflow, same config file for both:
+#   1. surogate distill-capture examples/distillation/qwen3-kd.yaml
+#   2. surogate sft examples/distillation/qwen3-kd.yaml
+#
+# Step 1 tokenizes the datasets (if needed), runs the teacher once over the
+# token shards and writes train-NNN.bin.kd sidecars into output_dir.
+# Step 2 trains the student with loss = ce_weight*CE + kd_weight*tau^2*KL.
+#
+# The teacher and student MUST share a tokenizer. Qwen3-0.6B and Qwen3-1.7B
+# are both Qwen3 dense models and use the identical Qwen3 tokenizer.
+# Capture requires flash-attention-2 for packed data (or pass
+# --allow-cross-doc-attention to accept the sdpa approximation).
+
+model: Qwen/Qwen3-0.6B
+output_dir: ./output
+
+distillation:
+  teacher_model: Qwen/Qwen3-1.7B # capture-time only
+  top_k: 64
+  temperature: 1.0
+  kd_weight: 0.5 # ce_weight defaults to 1 - kd_weight = 0.5
+  teacher_batch_size: 4 # capture-time only: sequence_len windows per teacher forward
+
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 4
+
+sample_packing: true
+sequence_len: 2048
+
+max_steps: 100
+eval_steps: 25
+
+learning_rate: 2e-4
+
+recipe: bf16
+warmup_ratio: 0.15
+
+lora: true
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+
+dataloader_num_workers: 4
+datasets:
+  - path: "OpenLLM-Ro/ro_gsm8k"
+    type: auto

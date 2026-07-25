@@ -8,7 +8,6 @@ Only the master rank (rank 0) runs the packer. Other ranks just receive
 the packed micro-batches from the transport layer.
 """
 
-import math
 import shutil
 import time
 from abc import ABC, abstractmethod
@@ -47,13 +46,11 @@ class BasePacker(ABC):
         tokenizer,
         config,
         start_step: int = 0,
-        sample_packing: bool = True,
     ):
         self.multi_run_manager = get_multi_run_manager()
         self.dp_world_size = dp_world_size
         self.seq_len = seq_len
         self.pad_to_multiple_of = pad_to_multiple_of
-        self.sample_packing = sample_packing
         self.tokenizer = tokenizer
         self.receiver = setup_training_batch_receiver(config)
         shutil.rmtree(get_rollout_dir(self.multi_run_manager.output_dir), ignore_errors=True)
@@ -76,17 +73,8 @@ class SinglePacker(BasePacker):
         tokenizer,
         config,
         start_step: int = 0,
-        sample_packing: bool = True,
     ):
-        super().__init__(
-            dp_world_size,
-            seq_len,
-            pad_to_multiple_of,
-            tokenizer,
-            config,
-            start_step,
-            sample_packing,
-        )
+        super().__init__(dp_world_size, seq_len, pad_to_multiple_of, tokenizer, config, start_step)
         assert self.multi_run_manager.max_runs == 1, "SinglePacker only supports one run"
 
     def pack(self):
@@ -108,7 +96,6 @@ class SinglePacker(BasePacker):
             num_train_workers=self.dp_world_size,
             idxs=[0] * len(batch.examples),
             num_loras=self.multi_run_manager.max_runs,
-            sample_packing=self.sample_packing,
         )
 
         self.sender.send(micro_batch_grid)
@@ -123,17 +110,8 @@ class MultiPacker(BasePacker):
         tokenizer,
         config,
         start_step: int = 0,
-        sample_packing: bool = True,
     ):
-        super().__init__(
-            dp_world_size,
-            seq_len,
-            pad_to_multiple_of,
-            tokenizer,
-            config,
-            start_step,
-            sample_packing,
-        )
+        super().__init__(dp_world_size, seq_len, pad_to_multiple_of, tokenizer, config, start_step)
         self.buffers: list[deque[tuple[TrainingSample, int]]] = [
             deque() for _ in range(self.multi_run_manager.max_runs)
         ]
@@ -176,104 +154,12 @@ class MultiPacker(BasePacker):
                 False,
                 f"teacher logprobs length != sample length ({len(sample.teacher_logprobs)} != {sample_length})",
             )
-        opd_fields = (
-            sample.opd_reference_logprobs,
-            sample.hindsight_logprobs,
-            sample.hindsight_mask,
-        )
-        if any(value is not None for value in opd_fields) and any(value is None for value in opd_fields):
+        if sample.completion_turn_ids is not None and len(sample.completion_turn_ids) != len(sample.completion_ids):
             return (
                 False,
-                "OPD reference logprobs, hindsight logprobs, and mask must either all be present or all be absent",
+                f"completion turn ids length != completion ids length "
+                f"({len(sample.completion_turn_ids)} != {len(sample.completion_ids)})",
             )
-        if sample.hindsight_logprobs is not None:
-            if len(sample.opd_reference_logprobs) != sample_length:
-                return (
-                    False,
-                    "OPD reference logprobs length != sample length "
-                    f"({len(sample.opd_reference_logprobs)} != {sample_length})",
-                )
-            if len(sample.hindsight_logprobs) != sample_length:
-                return (
-                    False,
-                    f"hindsight logprobs length != sample length ({len(sample.hindsight_logprobs)} != {sample_length})",
-                )
-            if len(sample.hindsight_mask) != sample_length:
-                return (
-                    False,
-                    f"hindsight mask length != sample length ({len(sample.hindsight_mask)} != {sample_length})",
-                )
-            loss_mask = sample.prompt_mask + sample.completion_mask
-            if any(hindsight and not loss for hindsight, loss in zip(sample.hindsight_mask, loss_mask)):
-                return False, "hindsight mask selects a prompt or environment token"
-        if sample.replay_mask is not None:
-            if len(sample.replay_mask) != sample_length:
-                return (
-                    False,
-                    f"replay mask length != sample length ({len(sample.replay_mask)} != {sample_length})",
-                )
-            loss_mask = sample.prompt_mask + sample.completion_mask
-            if any(replay and not loss for replay, loss in zip(sample.replay_mask, loss_mask)):
-                return False, "replay mask selects a prompt or environment token"
-        if sample.advantage_mask is not None:
-            if len(sample.advantage_mask) != sample_length:
-                return (
-                    False,
-                    "advantage mask length != sample length "
-                    f"({len(sample.advantage_mask)} != {sample_length})",
-                )
-            if (
-                any(
-                    not isinstance(selected, bool)
-                    for selected in sample.advantage_mask
-                )
-                or not any(sample.advantage_mask)
-            ):
-                return (
-                    False,
-                    "advantage mask must contain booleans and select at "
-                    "least one token",
-                )
-            loss_mask = sample.prompt_mask + sample.completion_mask
-            if any(
-                outcome and not loss
-                for outcome, loss in zip(
-                    sample.advantage_mask,
-                    loss_mask,
-                    strict=True,
-                )
-            ):
-                return (
-                    False,
-                    "advantage mask selects a prompt or environment token",
-                )
-            if sample.advantage is None:
-                return False, "advantage mask requires an outcome advantage"
-            replay_mask = sample.replay_mask or [False] * sample_length
-            if any(
-                outcome and replay
-                for outcome, replay in zip(
-                    sample.advantage_mask,
-                    replay_mask,
-                    strict=True,
-                )
-            ):
-                return False, "advantage mask overlaps replay mask"
-        if sample.replay_weights is not None:
-            if sample.replay_mask is None:
-                return False, "replay weights require a replay mask"
-            if len(sample.replay_weights) != sample_length:
-                return (
-                    False,
-                    f"replay weights length != sample length ({len(sample.replay_weights)} != {sample_length})",
-                )
-            for replay, weight in zip(sample.replay_mask, sample.replay_weights):
-                if not isinstance(weight, (int, float)) or not math.isfinite(weight):
-                    return False, "replay weights must be finite numbers"
-                if replay and weight <= 0.0:
-                    return False, "replay weights must be positive on replay tokens"
-                if not replay and weight != 1.0:
-                    return False, "replay weights may differ from 1 only on replay tokens"
         return True, None
 
     def _get_batch(self) -> None:
@@ -377,7 +263,7 @@ class MultiPacker(BasePacker):
         # Group by run_idx — each micro-batch must contain samples from only ONE run
         samples_by_run: dict[int, list[TrainingSample]] = {}
         per_run_stats: dict[int, tuple[int, int]] = {}
-        for run_idx, sample, _step in selected_samples:
+        for run_idx, sample, step in selected_samples:
             if run_idx not in samples_by_run:
                 samples_by_run[run_idx] = []
             samples_by_run[run_idx].append(sample)
@@ -402,7 +288,6 @@ class MultiPacker(BasePacker):
                 num_train_workers=self.dp_world_size,
                 idxs=[run_idx] * len(run_samples),
                 num_loras=self.multi_run_manager.max_runs,
-                sample_packing=self.sample_packing,
             )
             for worker_idx, worker_batches in enumerate(run_micro_batch_grid):
                 all_micro_batches[worker_idx].extend(worker_batches)
@@ -436,7 +321,6 @@ def setup_grpo_packer(
     tokenizer,
     transport_config,
     start_step: int = 0,
-    sample_packing: bool = True,
 ) -> BasePacker:
     """Create a packer for GRPO training.
 
@@ -447,25 +331,9 @@ def setup_grpo_packer(
     """
     multi_run_manager = get_multi_run_manager()
     if multi_run_manager.max_runs == 1:
-        packer = SinglePacker(
-            dp_world_size,
-            seq_len,
-            pad_to_multiple_of,
-            tokenizer,
-            transport_config,
-            start_step,
-            sample_packing,
-        )
+        packer = SinglePacker(dp_world_size, seq_len, pad_to_multiple_of, tokenizer, transport_config, start_step)
     else:
-        packer = MultiPacker(
-            dp_world_size,
-            seq_len,
-            pad_to_multiple_of,
-            tokenizer,
-            transport_config,
-            start_step,
-            sample_packing,
-        )
+        packer = MultiPacker(dp_world_size, seq_len, pad_to_multiple_of, tokenizer, transport_config, start_step)
 
     logger.info(f"GRPO packer initialized (dp_world_size={dp_world_size}, seq_len={seq_len})")
     return packer

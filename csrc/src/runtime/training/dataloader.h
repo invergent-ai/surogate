@@ -48,9 +48,30 @@ public:
     static std::vector<std::string> match_files(const std::string& pattern);
 
     //! Fills `inputs` and `targets` with the next chunk of token indices, where targets is shifted left by one position.
-    void load_seq(Tensor& inputs, Tensor& targets, Tensor* position_ids = nullptr);
+    //! When KD is enabled (enable_kd), `kd_ids`/`kd_logprobs` (shape [seq_len * k], INT32/FP32) receive the
+    //! teacher top-K signal for the chunk; sidecar row i is aligned with targets[i].
+    void load_seq(Tensor& inputs,
+                  Tensor& targets,
+                  Tensor* position_ids = nullptr,
+                  Tensor* kd_ids = nullptr,
+                  Tensor* kd_logprobs = nullptr);
     //! Fills `inputs` and `targets` with a batch of sequences
-    void load_batch(Tensor& inputs, Tensor& targets, Tensor* position_ids = nullptr);
+    void load_batch(Tensor& inputs,
+                    Tensor& targets,
+                    Tensor* position_ids = nullptr,
+                    Tensor* kd_ids = nullptr,
+                    Tensor* kd_logprobs = nullptr);
+
+    //! Enable knowledge-distillation sidecar loading. For every token file `<name>` a sidecar
+    //! `<name>.kd` must exist with matching token count and `expected_k` top-K entries per token.
+    //! Throws with an actionable message listing missing or mismatched sidecars.
+    void enable_kd(int expected_k);
+    bool has_kd() const {
+        return mKdTopK > 0;
+    }
+    int kd_top_k() const {
+        return mKdTopK;
+    }
 
     //! Increment the epoch counter, reset the iterators, and re-shuffle the files and chunks.
     void advance_epoch();
@@ -117,6 +138,9 @@ private:
 
     static TokenFileInfo parse_token_file_header(const std::string& file_name);
 
+    void open_kd_sidecar_for_current_file();
+    static void validate_kd_sidecar(const TokenFileInfo& token_info, int expected_k);
+
     // immutable config
     std::int32_t mVocabSize = -1;
     std::int32_t mSeqLen;
@@ -140,6 +164,11 @@ private:
 
     // buffers
     std::vector<std::uint8_t> mMaskBuffer;
+
+    // Knowledge-distillation sidecar state (inactive unless enable_kd was called)
+    int mKdTopK = 0;
+    std::ifstream mKdFile;
+    std::vector<std::uint16_t> mKdHalfBuffer;
 };
 
 #endif  //SUROGATE_TRAINING_DATALOADER_H

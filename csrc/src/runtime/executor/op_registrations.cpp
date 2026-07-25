@@ -74,6 +74,7 @@ FWD_WRAP(fwd_swiglu, dispatch_swiglu)
 FWD_WRAP(fwd_gelu_glu, dispatch_gelu_glu)
 FWD_WRAP(fwd_gpt_oss_moe_act, dispatch_gpt_oss_moe_act)
 FWD_WRAP(fwd_silu, dispatch_silu)
+FWD_WRAP(fwd_softplus, dispatch_softplus)
 FWD_WRAP(fwd_gelu, dispatch_gelu)
 FWD_WRAP(fwd_relu2, dispatch_relu2)
 FWD_WRAP(fwd_mul, dispatch_mul)
@@ -121,6 +122,7 @@ BWD_WRAP(bwd_swiglu, dispatch_swiglu_backward)
 BWD_WRAP(bwd_gelu_glu, dispatch_gelu_glu_backward)
 BWD_WRAP(bwd_gpt_oss_moe_act, dispatch_gpt_oss_moe_act_backward)
 BWD_WRAP(bwd_silu, dispatch_silu_backward)
+BWD_WRAP(bwd_softplus, dispatch_softplus_backward)
 BWD_WRAP(bwd_gelu, dispatch_gelu_backward)
 BWD_WRAP(bwd_relu2, dispatch_relu2_backward)
 BWD_WRAP(bwd_mul, dispatch_mul_backward)
@@ -307,6 +309,8 @@ REGISTER_COMPILED_OP_NO_COMM("gpt_oss_moe_act_backward",
                              Elementwise);
 REGISTER_COMPILED_OP_NO_COMM("silu", Silu, ::dsl::fwd_silu, nullptr, Elementwise);
 REGISTER_COMPILED_OP_NO_COMM("silu_backward", SiluBackward, nullptr, ::dsl::bwd_silu, Elementwise);
+REGISTER_COMPILED_OP_NO_COMM("softplus", Softplus, ::dsl::fwd_softplus, nullptr, Elementwise);
+REGISTER_COMPILED_OP_NO_COMM("softplus_backward", SoftplusBackward, nullptr, ::dsl::bwd_softplus, Elementwise);
 REGISTER_COMPILED_OP_NO_COMM("gelu", Gelu, ::dsl::fwd_gelu, nullptr, Elementwise);
 REGISTER_COMPILED_OP_NO_COMM("gelu_backward", GeluBackward, nullptr, ::dsl::bwd_gelu, Elementwise);
 REGISTER_COMPILED_OP_NO_COMM("relu2", Relu2, ::dsl::fwd_relu2, nullptr, Elementwise);

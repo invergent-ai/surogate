@@ -1,8 +1,10 @@
 #include "runtime/executor/compiled_ops.h"
 
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "runtime/executor/compiled_ops_helpers.h"
@@ -84,15 +86,35 @@ void CompiledExecutor::dispatch_moe_permute(const CompiledOp& op) {
                       num_experts,
                       mRunState.MainStream);
 
-    // Cache expert offsets on host for grouped GEMM fast path.
+    // Cache expert offsets on host for grouped GEMM fast path. Stage through
+    // PINNED memory + a poll wait: a pageable async D2H can block inside the
+    // driver's staging pool when all worker threads copy at once, convoying
+    // with in-stream NCCL kernels into a cross-rank deadlock.
     if (num_experts > 0) {
+        const std::size_t off_bytes = static_cast<std::size_t>(num_experts + 1) * sizeof(int);
+        if (mMoEOffsetsPinnedBytes < off_bytes) {
+            if (mMoEOffsetsPinned) {
+                CUDA_CHECK(cudaFreeHost(mMoEOffsetsPinned));
+            }
+            CUDA_CHECK(cudaHostAlloc(&mMoEOffsetsPinned, off_bytes, cudaHostAllocDefault));
+            mMoEOffsetsPinnedBytes = off_bytes;
+        }
         mMoEExpertOffsetsData.resize(static_cast<std::size_t>(num_experts + 1));
-        CUDA_CHECK(cudaMemcpyAsync(mMoEExpertOffsetsData.data(),
+        CUDA_CHECK(cudaMemcpyAsync(mMoEOffsetsPinned,
                                    expert_offsets.get<int>(),
-                                   static_cast<std::size_t>(num_experts + 1) * sizeof(int),
+                                   off_bytes,
                                    cudaMemcpyDeviceToHost,
                                    mRunState.MainStream));
-        CUDA_CHECK(cudaStreamSynchronize(mRunState.MainStream));
+        while (true) {
+            const cudaError_t st = cudaStreamQuery(mRunState.MainStream);
+            if (st == cudaSuccess) break;
+            if (st != cudaErrorNotReady) {
+                CUDA_CHECK(st);
+            }
+            (void)cudaGetLastError();
+            std::this_thread::yield();
+        }
+        std::memcpy(mMoEExpertOffsetsData.data(), mMoEOffsetsPinned, off_bytes);
 
         // Populate per-layer cache so downstream gate_up/down ops skip redundant D2H syncs.
         if (layer_idx_any >= 0) {

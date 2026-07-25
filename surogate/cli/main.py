@@ -41,6 +41,7 @@ logger = get_logger()
 
 COMMAND_MAPPING: dict[str, str] = {
     "sft": "surogate.cli.sft",
+    "dpo": "surogate.cli.dpo",
     "pt": "surogate.cli.pt",
     "grpo": "surogate.cli.grpo",
     "grpo-colocate": "surogate.cli.grpo_colocate",
@@ -50,6 +51,8 @@ COMMAND_MAPPING: dict[str, str] = {
     "vf-init": "surogate.cli.vf_init",
     "vf-eval": "surogate.cli.vf_eval",
     "tokenize": "surogate.cli.tokenize_cmd",
+    "distill-capture": "surogate.cli.distill_capture",
+    "transplant-tokenizer": "surogate.cli.transplant",
     "merge": "surogate.cli.merge",
     "debug": "surogate.cli.debug",
 }
@@ -80,6 +83,11 @@ def parse_args():
     from surogate.cli.sft import prepare_command_parser as sft_prepare_command_parser
 
     sft_prepare_command_parser(subparsers.add_parser("sft", help="Supervised Fine-Tuning"))
+
+    # dpo command
+    from surogate.cli.dpo import prepare_command_parser as dpo_prepare_command_parser
+
+    dpo_prepare_command_parser(subparsers.add_parser("dpo", help="Direct Preference Optimization (offline)"))
 
     # pretrain command
     from surogate.cli.pt import prepare_command_parser as pt_prepare_command_parser
@@ -128,6 +136,23 @@ def parse_args():
 
     tokenize_prepare_command_parser(subparsers.add_parser("tokenize", help="Tokenize datasets for training"))
 
+    # distill-capture command
+    from surogate.cli.distill_capture import prepare_command_parser as distill_capture_prepare_command_parser
+
+    distill_capture_prepare_command_parser(
+        subparsers.add_parser("distill-capture", help="Capture teacher top-K logprobs for knowledge distillation")
+    )
+
+    # transplant-tokenizer command
+    from surogate.cli.transplant import prepare_command_parser as transplant_prepare_command_parser
+
+    transplant_prepare_command_parser(
+        subparsers.add_parser(
+            "transplant-tokenizer",
+            help="Transplant a teacher's tokenizer onto a student model for cross-tokenizer distillation",
+        )
+    )
+
     # merge command
     from surogate.cli.merge import prepare_command_parser as merge_prepare_command_parser
 
@@ -141,16 +166,23 @@ def parse_args():
     # jackalope is intercepted before argparse (see maybe_exec_jackalope); this
     # entry exists only so it shows up in `surogate --help`. add_help=False so its
     # own `--help` passes through to the dashboard binary.
-    subparsers.add_parser(
-        "jackalope", help="Launch the jackalope live-training dashboard (TUI)", add_help=False
-    )
+    subparsers.add_parser("jackalope", help="Launch the jackalope live-training dashboard (TUI)", add_help=False)
 
     args = parser.parse_args(sys.argv[1:])
     if args.command is None:
         parser.print_help()
         sys.exit(1)
 
-    commands_with_config = ["sft", "pt", "grpo_train", "grpo_infer", "grpo_orch", "tokenize"]
+    commands_with_config = [
+        "sft",
+        "dpo",
+        "pt",
+        "grpo_train",
+        "grpo_infer",
+        "grpo_orch",
+        "tokenize",
+        "distill-capture",
+    ]
     if args.command in commands_with_config and not getattr(args, "config", None):
         parser.print_help()
         sys.exit(1)

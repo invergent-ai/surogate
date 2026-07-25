@@ -1,0 +1,8 @@
+# Teacher server for on-policy distillation — GPU 2.
+# Must be served via grpo-infer: teacher logprobs are fetched through the
+# /chat/completions/tokens endpoint, which plain vLLM does not expose.
+model: "Qwen/Qwen3.5-9B"
+enable_lora: false
+max_model_len: 4096
+gpu_memory_utilization: 0.85
+port: 8008

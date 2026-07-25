@@ -1293,6 +1293,12 @@ void silu_forward(Tensor& out, const Tensor& inp, long n, cudaStream_t stream);
 void silu_backward(nv_bfloat16* dinp, const nv_bfloat16* inp, const nv_bfloat16* dout, long n, cudaStream_t stream);
 void silu_backward(float* dinp, const float* inp, const float* dout, long n, cudaStream_t stream);
 void silu_backward(Tensor& dinp, const Tensor& inp, const Tensor& dout, long n, cudaStream_t stream);
+void softplus_forward(nv_bfloat16* out, const nv_bfloat16* inp, long n, cudaStream_t stream);
+void softplus_forward(float* out, const float* inp, long n, cudaStream_t stream);
+void softplus_forward(Tensor& out, const Tensor& inp, long n, cudaStream_t stream);
+void softplus_backward(nv_bfloat16* dinp, const nv_bfloat16* inp, const nv_bfloat16* dout, long n, cudaStream_t stream);
+void softplus_backward(float* dinp, const float* inp, const float* dout, long n, cudaStream_t stream);
+void softplus_backward(Tensor& dinp, const Tensor& inp, const Tensor& dout, long n, cudaStream_t stream);
 void gelu_forward(nv_bfloat16* out, const nv_bfloat16* inp, long n, cudaStream_t stream);
 void gelu_forward(float* out, const float* inp, long n, cudaStream_t stream);
 void gelu_forward(Tensor& out, const Tensor& inp, long n, cudaStream_t stream);
@@ -1497,6 +1503,75 @@ void fused_classifier(Tensor& logits,
 constexpr int CROSS_ENTROPY_MAX_FUSED_SIZE = 65536;
 constexpr int CROSS_ENTROPY_BACKWARD_CHUNK_SIZE = 4096;
 
+/// Optional knowledge-distillation extension for the cross-entropy backward.
+/// When passed (non-null), the backward computes
+///   dlogit = dloss[t] * (ce_w*(p - onehot) + kd_scale*(p_tau - q_topk_scatter))
+/// where p_tau = softmax(logits/tau) and q is the renormalized teacher top-K
+/// distribution at tau. Pointers are per-token indexed: row t uses
+/// ids[t*K .. t*K+K) / q[t*K ..). `lse_tau` must hold logsumexp(logits/tau)
+/// per row (pass the tau=1 logsumexp when tau == 1). `kd_loss_accum` (may be
+/// null) accumulates tau^2 * KL(q || p_tau) over valid tokens via atomicAdd.
+struct KdBackwardArgs {
+    const int* ids = nullptr;        ///< [BT, K] teacher top-K token ids
+    const float* q = nullptr;        ///< [BT, K] renormalized teacher probs at tau
+    const float* lse_tau = nullptr;  ///< [BT] logsumexp of logits/tau
+    float inv_tau = 1.0f;            ///< 1/tau
+    float ce_w = 1.0f;               ///< weight of the CE gradient term
+    float kd_scale = 0.0f;           ///< kd_weight * tau (gradient scale of the KD term)
+    float tau_sq = 1.0f;             ///< tau^2 (KD loss metric scale)
+    float* kd_loss_accum = nullptr;  ///< [1] scalar accumulator for the KD loss metric
+    int K = 0;                       ///< top-K entries per token
+};
+
+/// Renormalize per-token teacher top-K logprobs into a probability
+/// distribution at temperature tau: q_k = softmax(logprobs_k * inv_tau).
+/// Entries with ids outside [0, V) are excluded from the normalization and
+/// receive q = 0. Rows with targets[row] == -100 are zero-filled.
+void kd_normalize_teacher_topk(float* q_out,
+                               const float* teacher_logprobs,
+                               const int* ids,
+                               const int* targets,
+                               int BT,
+                               int K,
+                               int V,
+                               float inv_tau,
+                               cudaStream_t stream);
+
+/// Per-row logsumexp of (softcapped) logits scaled by inv_tau.
+/// `chunk_scratch` must hold [BT, n_chunks] floats (scratch); the final
+/// reduction writes lse_out[BT]. Softcap is applied before temperature
+/// scaling, matching the KD backward's p_tau computation.
+void kd_row_logsumexp(float* lse_out,
+                      float* chunk_scratch,
+                      const float* logits,
+                      int BT,
+                      int V,
+                      int P,
+                      int n_chunks,
+                      float inv_tau,
+                      float softcap,
+                      cudaStream_t stream);
+void kd_row_logsumexp(float* lse_out,
+                      float* chunk_scratch,
+                      const nv_bfloat16* logits,
+                      int BT,
+                      int V,
+                      int P,
+                      int n_chunks,
+                      float inv_tau,
+                      float softcap,
+                      cudaStream_t stream);
+void kd_row_logsumexp(float* lse_out,
+                      float* chunk_scratch,
+                      const Tensor& logits,
+                      int BT,
+                      int V,
+                      int P,
+                      int n_chunks,
+                      float inv_tau,
+                      float softcap,
+                      cudaStream_t stream);
+
 void fused_cross_entropy_forward(float* logits,
                                  float* losses,
                                  float* logsumexp,
@@ -1528,7 +1603,8 @@ void fused_cross_entropy_backward(float* dlogits,
                                   int V,
                                   int P,
                                   float softcap,
-                                  cudaStream_t stream);
+                                  cudaStream_t stream,
+                                  const KdBackwardArgs* kd = nullptr);
 void fused_cross_entropy_backward(nv_bfloat16* dlogits,
                                   const nv_bfloat16* logits,
                                   const float* logsumexp,
@@ -1538,7 +1614,8 @@ void fused_cross_entropy_backward(nv_bfloat16* dlogits,
                                   int V,
                                   int P,
                                   float softcap,
-                                  cudaStream_t stream);
+                                  cudaStream_t stream,
+                                  const KdBackwardArgs* kd = nullptr);
 void chunked_cross_entropy_forward(float* logits,
                                    float* losses,
                                    float* logsumexp,
@@ -1574,7 +1651,8 @@ void chunked_cross_entropy_backward(float* dlogits,
                                     int V,
                                     int P,
                                     float softcap,
-                                    cudaStream_t stream);
+                                    cudaStream_t stream,
+                                    const KdBackwardArgs* kd = nullptr);
 void chunked_cross_entropy_backward(nv_bfloat16* dlogits,
                                     const nv_bfloat16* logits,
                                     const float* logsumexp,
@@ -1584,7 +1662,8 @@ void chunked_cross_entropy_backward(nv_bfloat16* dlogits,
                                     int V,
                                     int P,
                                     float softcap,
-                                    cudaStream_t stream);
+                                    cudaStream_t stream,
+                                    const KdBackwardArgs* kd = nullptr);
 void fused_cross_entropy_forward(Tensor& logits,
                                  Tensor& losses,
                                  Tensor* logsumexp,
@@ -1605,7 +1684,8 @@ void fused_cross_entropy_backward(Tensor& dlogits,
                                   int V,
                                   int P,
                                   float softcap,
-                                  cudaStream_t stream);
+                                  cudaStream_t stream,
+                                  const KdBackwardArgs* kd = nullptr);
 void chunked_cross_entropy_forward(Tensor& logits,
                                    Tensor& losses,
                                    Tensor* logsumexp,
@@ -1628,7 +1708,8 @@ void chunked_cross_entropy_backward(Tensor& dlogits,
                                     int V,
                                     int P,
                                     float softcap,
-                                    cudaStream_t stream);
+                                    cudaStream_t stream,
+                                    const KdBackwardArgs* kd = nullptr);
 
 // --- lmhead_compact: token-row compaction for the lm_head loss path -------
 // Compute valid_idx[n_valid] from targets[BT] in-place; n_valid is written to
@@ -1715,6 +1796,29 @@ void compute_grpo_custom_dloss(float* custom_dloss,
                                float replay_tau,
                                float kl_tau,
                                cudaStream_t stream);
+
+// DPO (Direct Preference Optimization) preference loss. One logical pair is
+// (chosen sample, rejected sample), identified by pair_chosen[p]/pair_rejected[p]
+// indexing into sample_starts/sample_ends. The per-token custom_dloss is written
+// in the same shifted layout as compute_grpo_custom_dloss: the gradient seed for
+// logical token (out_idx + 1) is stored at custom_dloss[out_idx], read back as
+// trainer_logprob = -losses[out_idx]. metrics is [4]: {loss_sum, correct_sum,
+// margin_sum, pair_count}, accumulated across pairs (the caller averages).
+void compute_dpo_custom_dloss(float* custom_dloss,
+                              float* metrics,
+                              const float* losses,
+                              const float* ref_logprobs,
+                              const std::uint8_t* loss_mask,
+                              const std::int32_t* sample_starts,
+                              const std::int32_t* sample_ends,
+                              const std::int32_t* pair_chosen,
+                              const std::int32_t* pair_rejected,
+                              int pair_count,
+                              int BT,
+                              float loss_scale,
+                              float beta,
+                              int length_norm,
+                              cudaStream_t stream);
 
 /// Scale logits rows by per-token inverse temperature (in-place).
 /// logits is [BT, P], inv_temperature is [BT].

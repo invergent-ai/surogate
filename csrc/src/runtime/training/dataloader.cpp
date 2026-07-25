@@ -19,6 +19,42 @@
 #include "utilities/tensor.h"
 #include "utilities/philox.h"
 
+namespace {
+
+constexpr char KD_MAGIC[] = {'K', 'D', '.', 'L', 'O', 'G', 'P', '\n'};
+constexpr long KD_HEADER_BYTES = 1024;
+
+// IEEE fp16 -> fp32 (CPU, no CUDA dependency).
+inline float half_bits_to_float(std::uint16_t h) {
+    const std::uint32_t sign = static_cast<std::uint32_t>(h & 0x8000u) << 16;
+    std::uint32_t exponent = (h >> 10) & 0x1Fu;
+    std::uint32_t mantissa = h & 0x3FFu;
+    std::uint32_t bits;
+    if (exponent == 0) {
+        if (mantissa == 0) {
+            bits = sign;
+        } else {
+            // subnormal: normalize
+            exponent = 127 - 15 + 1;
+            while ((mantissa & 0x400u) == 0) {
+                mantissa <<= 1;
+                --exponent;
+            }
+            mantissa &= 0x3FFu;
+            bits = sign | (exponent << 23) | (mantissa << 13);
+        }
+    } else if (exponent == 0x1Fu) {
+        bits = sign | 0x7F800000u | (mantissa << 13);
+    } else {
+        bits = sign | ((exponent + 127 - 15) << 23) | (mantissa << 13);
+    }
+    float out;
+    std::memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+
+}  // namespace
+
 /**
  * @brief Construct a DataLoader from a glob pattern.
  *
@@ -183,6 +219,84 @@ DataLoader::TokenFileInfo DataLoader::parse_token_file_header(const std::string&
 }
 
 /**
+ * @brief Validate the KD sidecar header for one token file.
+ *
+ * The sidecar `<token_file>.kd` layout: 1024-byte header (magic "KD.LOGP\n",
+ * int32 fields: [2] version, [3] k, [4] n_tokens, [5] vocab_size,
+ * [6] logprob_dtype 0=fp16), then n_tokens*k uint32 ids and n_tokens*k fp16
+ * logprobs as two contiguous blocks. Row i holds the teacher's next-token
+ * distribution at input position i (aligned with targets[i]).
+ */
+void DataLoader::validate_kd_sidecar(const TokenFileInfo& token_info, int expected_k) {
+    const std::string kd_name = token_info.FileName + ".kd";
+    std::ifstream kd_file(kd_name, std::ios::binary);
+    if (!kd_file.is_open() || !kd_file.good()) {
+        throw std::runtime_error(
+            fmt::format("Missing KD sidecar '{}'. Run `surogate distill-capture <config>` to create teacher "
+                        "logit sidecars for the tokenized dataset.",
+                        kd_name));
+    }
+    int header[256];
+    kd_file.read(reinterpret_cast<char*>(header), sizeof(header));
+    if (kd_file.gcount() != static_cast<std::streamsize>(sizeof(header)) ||
+        std::memcmp(header, KD_MAGIC, sizeof(KD_MAGIC)) != 0) {
+        throw std::runtime_error(fmt::format("Invalid KD sidecar header in '{}'", kd_name));
+    }
+    if (header[2] != 1) {
+        throw std::runtime_error(fmt::format("Unsupported KD sidecar version {} in '{}'", header[2], kd_name));
+    }
+    if (header[3] != expected_k) {
+        throw std::runtime_error(fmt::format(
+            "KD sidecar '{}' was captured with top_k={} but the run is configured with top_k={}. Re-run "
+            "distill-capture or adjust distillation.top_k.",
+            kd_name,
+            header[3],
+            expected_k));
+    }
+    if (header[4] != token_info.NumTokens) {
+        throw std::runtime_error(fmt::format(
+            "KD sidecar '{}' holds {} tokens but token shard has {}. The dataset was re-tokenized after "
+            "capture; re-run distill-capture.",
+            kd_name,
+            header[4],
+            token_info.NumTokens));
+    }
+    if (header[6] != 0) {
+        throw std::runtime_error(fmt::format("Unsupported KD logprob dtype {} in '{}'", header[6], kd_name));
+    }
+    if (header[5] <= 0) {
+        throw std::runtime_error(fmt::format("KD sidecar '{}' has invalid vocab_size {}", kd_name, header[5]));
+    }
+}
+
+/**
+ * @brief Enable KD sidecar loading: validate a sidecar for every token file and
+ * open the one belonging to the currently active file.
+ */
+void DataLoader::enable_kd(int expected_k) {
+    if (expected_k <= 0 || expected_k > 1024) {
+        throw std::runtime_error("enable_kd: expected_k must be in [1, 1024]");
+    }
+    for (const auto& info : mFileInfos) {
+        validate_kd_sidecar(info, expected_k);
+    }
+    mKdTopK = expected_k;
+    open_kd_sidecar_for_current_file();
+}
+
+void DataLoader::open_kd_sidecar_for_current_file() {
+    if (mKdTopK <= 0 || mFileIndex < 0 || mFileIndex >= static_cast<std::int32_t>(mShuffledFiles.size())) {
+        return;
+    }
+    const std::string kd_name = mShuffledFiles.at(mFileIndex)->FileName + ".kd";
+    mKdFile = std::ifstream(kd_name, std::ios::binary);
+    if (!mKdFile.is_open() || !mKdFile.good()) {
+        throw std::runtime_error("Could not open KD sidecar: " + kd_name);
+    }
+    mKdFile.exceptions(std::ifstream::failbit);
+}
+
+/**
  * @brief Compute loader progress through the current epoch as a percentage.
  *
  * Progress is measured as (tokens consumed so far in the epoch) / (total tokens across all files).
@@ -255,6 +369,7 @@ bool DataLoader::advance_file() {
         throw std::runtime_error("Could not open token file: " + file_name);
     }
     mTokenFile.exceptions(std::ifstream::failbit);
+    open_kd_sidecar_for_current_file();
 
     shuffle_chunks();
 
@@ -313,7 +428,7 @@ std::int32_t DataLoader::chunk_index() const {
  *
  * @throws std::runtime_error On size/device mismatch, end-of-data, incomplete reads, or underlying I/O errors.
  */
-void DataLoader::load_seq(Tensor& inputs, Tensor& targets, Tensor* position_ids) {
+void DataLoader::load_seq(Tensor& inputs, Tensor& targets, Tensor* position_ids, Tensor* kd_ids, Tensor* kd_logprobs) {
     assert(inputs.Device == -1);
     assert(targets.Device == -1);
     if (inputs.nelem() != mSeqLen) {
@@ -386,6 +501,44 @@ void DataLoader::load_seq(Tensor& inputs, Tensor& targets, Tensor* position_ids)
             }
         }
 
+        if (kd_ids != nullptr || kd_logprobs != nullptr) {
+            if (mKdTopK <= 0) {
+                throw std::runtime_error("load_seq: KD buffers passed but enable_kd() was not called");
+            }
+            if (kd_ids == nullptr || kd_logprobs == nullptr) {
+                throw std::runtime_error("load_seq: kd_ids and kd_logprobs must be passed together");
+            }
+            assert(kd_ids->Device == -1);
+            assert(kd_logprobs->Device == -1);
+            const long k = mKdTopK;
+            const long n = static_cast<long>(mSeqLen) * k;
+            if (kd_ids->nelem() != n || kd_logprobs->nelem() != n) {
+                throw std::runtime_error(fmt::format(
+                    "load_seq: expected KD tensors of {} elements, got {} / {}", n, kd_ids->nelem(), kd_logprobs->nelem()));
+            }
+
+            // Sidecar row i is aligned with input position i (targets[i]), so
+            // the chunk's rows are exactly [chunk_pos, chunk_pos + seq_len).
+            const long ids_offset = KD_HEADER_BYTES + 4L * k * chunk_pos;
+            mKdFile.seekg(ids_offset, std::ios::beg);
+            mKdFile.read(reinterpret_cast<char*>(kd_ids->Data), n * 4);
+            if (mKdFile.gcount() != static_cast<std::streamsize>(n * 4)) {
+                throw std::runtime_error("Incomplete read of KD sidecar ids");
+            }
+
+            const long lp_offset = KD_HEADER_BYTES + 4L * k * file_info->NumTokens + 2L * k * chunk_pos;
+            mKdHalfBuffer.resize(n);
+            mKdFile.seekg(lp_offset, std::ios::beg);
+            mKdFile.read(reinterpret_cast<char*>(mKdHalfBuffer.data()), n * 2);
+            if (mKdFile.gcount() != static_cast<std::streamsize>(n * 2)) {
+                throw std::runtime_error("Incomplete read of KD sidecar logprobs");
+            }
+            float* lp_out = kd_logprobs->get<float>();
+            for (long i = 0; i < n; ++i) {
+                lp_out[i] = half_bits_to_float(mKdHalfBuffer[i]);
+            }
+        }
+
         if (file_info->HasMasks) {
             long masks_start = element_size * file_info->NumTokens + header_offset;
             if (file_info->Version >= 3) {
@@ -428,17 +581,28 @@ void DataLoader::load_seq(Tensor& inputs, Tensor& targets, Tensor* position_ids)
  *
  * @throws std::runtime_error If sharding or underlying sequence loading fails.
  */
-void DataLoader::load_batch(Tensor& inputs, Tensor& targets, Tensor* position_ids) {
+void DataLoader::load_batch(Tensor& inputs, Tensor& targets, Tensor* position_ids, Tensor* kd_ids, Tensor* kd_logprobs) {
     int batch_size = div_exact((int)inputs.nelem(), mSeqLen);
     for (int i = 0; i < batch_size; ++i) {
         Tensor bi = shard_view(inputs, i, batch_size);
         Tensor bt = shard_view(targets, i, batch_size);
+        Tensor bp{};
+        Tensor bki{};
+        Tensor bkl{};
+        Tensor* bp_ptr = nullptr;
+        Tensor* bki_ptr = nullptr;
+        Tensor* bkl_ptr = nullptr;
         if (position_ids) {
-            Tensor bp = shard_view(*position_ids, i, batch_size);
-            load_seq(bi, bt, &bp);
-        } else {
-            load_seq(bi, bt, nullptr);
+            bp = shard_view(*position_ids, i, batch_size);
+            bp_ptr = &bp;
         }
+        if (kd_ids && kd_logprobs) {
+            bki = shard_view(*kd_ids, i, batch_size);
+            bkl = shard_view(*kd_logprobs, i, batch_size);
+            bki_ptr = &bki;
+            bkl_ptr = &bkl;
+        }
+        load_seq(bi, bt, bp_ptr, bki_ptr, bkl_ptr);
     }
 }
 
@@ -456,6 +620,24 @@ void DataLoader::load_batch(Tensor& inputs, Tensor& targets, Tensor* position_id
 void DataLoader::set_state(std::uint64_t seed, std::int32_t epoch, std::int32_t file_index, std::int32_t chunk_index) {
     mSeed = seed;
     mEpoch = epoch;
+    // Recompute all derived state exactly as advance_epoch/advance_file do:
+    // the shuffled file order depends on (seed, epoch), and the token/sidecar
+    // streams plus the chunk shuffle must follow the restored file index —
+    // otherwise reads use the previously-open file's bytes with the restored
+    // file's metadata.
+    shuffle_files();
+    if (file_index < 0 || file_index >= static_cast<std::int32_t>(mShuffledFiles.size())) {
+        throw std::runtime_error(
+            fmt::format("set_state: file_index {} out of range [0, {})", file_index, mShuffledFiles.size()));
+    }
     mFileIndex = file_index;
+    const std::string& file_name = mShuffledFiles.at(mFileIndex)->FileName;
+    mTokenFile = std::ifstream(file_name, std::ios::binary);
+    if (!mTokenFile.is_open() || !mTokenFile.good()) {
+        throw std::runtime_error("Could not open token file: " + file_name);
+    }
+    mTokenFile.exceptions(std::ifstream::failbit);
+    open_kd_sidecar_for_current_file();
+    shuffle_chunks();
     mChunkIndex = chunk_index + mRank;
 }

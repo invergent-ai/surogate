@@ -14,7 +14,7 @@ class DatasetConfig:
         path (Optional[str]): HuggingFace dataset repo | s3:// | gs:// | path to local file or directory.
         subset (Optional[str]): HuggingFace subset of dataset to load
         split (Optional[str]): Name of dataset split to load from. Defaults to 'train'.
-        type (Optional[Literal['text', 'instruction', 'conversation']]): The type of dataset.
+        type (Optional[Literal['text', 'instruction', 'conversation', 'preference']]): The type of dataset.
         samples (Optional[int]): Number of samples to use.
     """
 
@@ -26,6 +26,7 @@ class DatasetConfig:
             SurogateDatasetType.text,
             SurogateDatasetType.instruction,
             SurogateDatasetType.conversation,
+            SurogateDatasetType.preference,
             SurogateDatasetType.auto,
         ]
         | None
@@ -198,7 +199,49 @@ class ConversationDatasetConfig(DatasetConfig):
             )
 
 
-SurogateDatasetConfig = TextDatasetConfig | InstructionDatasetConfig | ConversationDatasetConfig
+class PreferenceDatasetConfig(DatasetConfig):
+    """
+    PreferenceDatasetConfig class is a dataclass that holds configuration parameters for a preference-pair
+    dataset ({prompt, chosen, rejected} rows) used by offline DPO.
+
+    Args:
+        prompt_field (str): The name of the column that contains the prompt (a string or a chat messages list). Defaults to "prompt".
+        chosen_field (str): The name of the column that contains the preferred response. Defaults to "chosen".
+        rejected_field (str): The name of the column that contains the dispreferred response. Defaults to "rejected".
+        enable_thinking_field (str): The name of the optional column that controls the chat-template thinking prefix. Defaults to "enable_thinking".
+    """
+
+    prompt_field: str | None = None
+    chosen_field: str | None = None
+    rejected_field: str | None = None
+    enable_thinking_field: str | None = None
+
+    def __init__(self, cfg: DictDefault):
+        super().__init__(cfg)
+        self.prompt_field = cfg["prompt_field"] or "prompt"
+        self.chosen_field = cfg["chosen_field"] or "chosen"
+        self.rejected_field = cfg["rejected_field"] or "rejected"
+        # Only require the enable_thinking column when the user explicitly asked for it.
+        self._enable_thinking_field_explicit = cfg["enable_thinking_field"] is not None
+        self.enable_thinking_field = cfg["enable_thinking_field"] or "enable_thinking"
+        self.__post_init__()
+
+    def validate_columns(self, columns: list[str]):
+        for name, field in [
+            ("Prompt", self.prompt_field),
+            ("Chosen", self.chosen_field),
+            ("Rejected", self.rejected_field),
+        ]:
+            if field not in columns:
+                raise ValueError(f"{name} field '{field}' is missing from the dataset. Dataset columns: {columns}.")
+        if self._enable_thinking_field_explicit and self.enable_thinking_field not in columns:
+            raise ValueError(
+                f"Enable-thinking field '{self.enable_thinking_field}' is missing from the dataset. "
+                f"Dataset columns: {columns}."
+            )
+
+
+SurogateDatasetConfig = TextDatasetConfig | InstructionDatasetConfig | ConversationDatasetConfig | PreferenceDatasetConfig
 
 
 def create_dataset_config(ds_cfg: DictDefault):
@@ -209,5 +252,7 @@ def create_dataset_config(ds_cfg: DictDefault):
         return InstructionDatasetConfig(ds_cfg)
     elif ds_type == "conversation":
         return ConversationDatasetConfig(ds_cfg)
+    elif ds_type == "preference":
+        return PreferenceDatasetConfig(ds_cfg)
     else:
         return DatasetConfig(ds_cfg)
