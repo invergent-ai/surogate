@@ -134,20 +134,54 @@ private:
      */
     void setup_tracking_thread();
 
-    long long mLastTimestamp;  // µs
-    std::size_t mLastPCIeRX;
-    std::size_t mLastPCIeTX;
-    unsigned long long mLastEnergy;
+    /**
+     * @brief Body of the sampling thread; runs until stop is requested or NVML fails.
+     */
+    void sampling_loop(std::stop_token stop_token);
+
+    long long mLastTimestamp = 0;  // µs
+    std::size_t mLastPCIeRX = 0;
+    std::size_t mLastPCIeTX = 0;
+    unsigned long long mLastEnergy = 0;
 
     std::atomic<std::size_t> mIntervalPCIeRX{0};
     std::atomic<std::size_t> mIntervalPCIeTX{0};
     std::atomic<std::size_t> mIntervalEnergy{0};
 
-    std::size_t mTotalPCIeRX;
-    std::size_t mTotalPCIeTX;
-    std::size_t mTotalEnergy;
+    std::size_t mTotalPCIeRX = 0;
+    std::size_t mTotalPCIeTX = 0;
+    std::size_t mTotalEnergy = 0;
+
+    // Cleared if the sampling thread gives up (a driver that stops answering
+    // mid-run must degrade the metrics, not the training run).
+    std::atomic<bool> mSamplingOk{false};
 
     std::jthread mThread;
+};
+
+/**
+ * @brief Tracker used when NVML is present but unusable (containers, restricted VMs).
+ *
+ * Reports memory from CUDA and leaves everything else at its not-supported default,
+ * so monitoring degrades instead of taking the process down.
+ */
+class GPUUtilTrackerNull : public IGPUUtilTracker {
+public:
+    const GPUUtilInfo& update() override {
+        mInfo = GPUUtilInfo{};
+        mInfo.gpu_utilization = -1.f;
+        mInfo.mem_utilization = -1.f;
+        mInfo.throttle_reason = "not supported";
+        std::size_t free = 0, total = 0;
+        if (cudaMemGetInfo(&free, &total) == cudaSuccess) {
+            mInfo.mem_free = free;
+            mInfo.mem_total = total;
+        }
+        return mInfo;
+    }
+
+private:
+    GPUUtilInfo mInfo;
 };
 
 /**
@@ -156,7 +190,14 @@ private:
  * @return A new tracker instance as a polymorphic IGPUUtilTracker.
  */
 std::unique_ptr<IGPUUtilTracker> IGPUUtilTracker::create() {
-    return std::make_unique<GPUUtilTrackerNVML>();
+    // Monitoring is never worth a dead training run: a driver that refuses to
+    // talk (containers, restricted VMs, MIG) degrades the metrics instead.
+    try {
+        return std::make_unique<GPUUtilTrackerNVML>();
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[NVML WARNING] GPU monitoring unavailable (%s); continuing without it\n", e.what());
+        return std::make_unique<GPUUtilTrackerNull>();
+    }
 }
 
 GPUUtilTrackerNVML::GPUUtilTrackerNVML()
@@ -164,14 +205,10 @@ GPUUtilTrackerNVML::GPUUtilTrackerNVML()
     nvmlFieldValue_t fields[] = {{NVML_FI_DEV_PCIE_COUNT_RX_BYTES},
                                  {NVML_FI_DEV_PCIE_COUNT_TX_BYTES},
                                  {NVML_FI_DEV_TOTAL_ENERGY_CONSUMPTION, 0}};
-    NVML_CHECK(nvmlDeviceGetFieldValues(mDevice, 3, fields));
-    if (fields[0].nvmlReturn == NVML_ERROR_NOT_SUPPORTED || fields[1].nvmlReturn == NVML_ERROR_NOT_SUPPORTED ||
-        fields[2].nvmlReturn == NVML_ERROR_NOT_SUPPORTED) {
-        fprintf(stderr, "[NVML WARNING] PCIe counters not supported\n");
+    if (nvmlDeviceGetFieldValues(mDevice, 3, fields) != NVML_SUCCESS || fields[0].nvmlReturn != NVML_SUCCESS ||
+        fields[1].nvmlReturn != NVML_SUCCESS || fields[2].nvmlReturn != NVML_SUCCESS) {
+        fprintf(stderr, "[NVML WARNING] PCIe/energy counters not available\n");
     } else {
-        NVML_CHECK(fields[0].nvmlReturn);
-        NVML_CHECK(fields[1].nvmlReturn);
-        NVML_CHECK(fields[2].nvmlReturn);
         mLastPCIeRX = fields[0].value.uiVal;
         mLastPCIeTX = fields[1].value.uiVal;
         mLastEnergy = fields[2].value.ullVal;
@@ -187,14 +224,38 @@ GPUUtilTrackerNVML::~GPUUtilTrackerNVML() {
         mThread.request_stop();
         mThread.join();
     }
-    NVML_CHECK(nvmlShutdown());
+    // Destructors must not throw — a failing shutdown would abort the process.
+    nvmlShutdown();
 }
 
 void GPUUtilTrackerNVML::setup_tracking_thread() {
     // TODO should this be one thread for all devices?
+    mSamplingOk = true;
     mThread = std::jthread([this](std::stop_token stop_token) {
-        NVML_CHECK(nvmlDeviceSetCpuAffinity(mDevice));
+        try {
+            sampling_loop(stop_token);
+        } catch (const std::exception& e) {
+            // Nothing catches an escaping exception on this thread, and
+            // std::terminate over a PCIe counter is never the right trade.
+            fprintf(stderr, "[NVML WARNING] GPU sampling stopped (%s)\n", e.what());
+        }
+        mSamplingOk = false;
+    });
+}
 
+void GPUUtilTrackerNVML::sampling_loop(std::stop_token stop_token) {
+    // Best-effort: containers hand us a restricted cpuset and NVML answers
+    // with a hard error rather than NOT_SUPPORTED. set_cpu_affinity() treats
+    // the same call as advisory; so must we.
+    if (nvmlDeviceSetCpuAffinity(mDevice) != NVML_SUCCESS) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            fprintf(stderr, "[NVML WARNING] could not pin sampling thread to the device's CPUs\n");
+        }
+    }
+
+    {
         nvmlFieldValue_t fields[] = {{NVML_FI_DEV_PCIE_COUNT_RX_BYTES},
                                      {NVML_FI_DEV_PCIE_COUNT_TX_BYTES},
                                      {NVML_FI_DEV_TOTAL_ENERGY_CONSUMPTION, 0}};
@@ -235,7 +296,7 @@ void GPUUtilTrackerNVML::setup_tracking_thread() {
                 break;
             }
         }
-    });
+    }
 }
 
 /**
@@ -261,72 +322,85 @@ const GPUUtilInfo& GPUUtilTrackerNVML::update() {
     mInfo.mem_utilization = -1.f;
     mInfo.throttle_reason = "not supported";
 
-    // query different infos directly
-    NVML_CHECK_U(nvmlDeviceGetClockInfo(mDevice, NVML_CLOCK_SM, &mInfo.clock));
-    NVML_CHECK_U(nvmlDeviceGetMaxClockInfo(mDevice, NVML_CLOCK_SM, &mInfo.max_clock));
-    NVML_CHECK_U(nvmlDeviceGetPowerManagementLimit(mDevice, &mInfo.power_limit));
-    NVML_CHECK_U(nvmlDeviceGetTemperature(mDevice, NVML_TEMPERATURE_GPU, &mInfo.temperature));
-    NVML_CHECK_U(nvmlDeviceGetTemperatureThreshold(mDevice, NVML_TEMPERATURE_THRESHOLD_SLOWDOWN, &mInfo.temp_slowdown));
-    unsigned long long throttle;
-    if (NVML_CHECK_U(nvmlDeviceGetCurrentClocksThrottleReasons(mDevice, &throttle)) == NVML_SUCCESS) {
-        mInfo.throttle_reason = get_throttle_reason(throttle);
-    }
-    NVML_CHECK_U(nvmlDeviceGetFanSpeed(mDevice, &mInfo.fan));
-
-    // For "utilization", we look at recorded samples. In principle, we could query the driver for how many samples
-    // to request, but then we'd need to dynamically allocate sufficient space. Let's just hard-code a limit of 128,
-    // and have no memory management required
-    constexpr const int BUFFER_LIMIT = 128;
-    nvmlSample_t buffer[BUFFER_LIMIT];
-    nvmlValueType_t v_type;
-    unsigned int sample_count = BUFFER_LIMIT;
-    if (NVML_CHECK_U(nvmlDeviceGetSamples(mDevice, NVML_GPU_UTILIZATION_SAMPLES, 0, &v_type, &sample_count, buffer)) ==
-        NVML_SUCCESS) {
-        float gpu_utilization = 0.f;
-        for (unsigned i = 0; i < sample_count; ++i) {
-            gpu_utilization += (float)buffer[i].sampleValue.uiVal;
+    try {
+        // query different infos directly
+        NVML_CHECK_U(nvmlDeviceGetClockInfo(mDevice, NVML_CLOCK_SM, &mInfo.clock));
+        NVML_CHECK_U(nvmlDeviceGetMaxClockInfo(mDevice, NVML_CLOCK_SM, &mInfo.max_clock));
+        NVML_CHECK_U(nvmlDeviceGetPowerManagementLimit(mDevice, &mInfo.power_limit));
+        NVML_CHECK_U(nvmlDeviceGetTemperature(mDevice, NVML_TEMPERATURE_GPU, &mInfo.temperature));
+        NVML_CHECK_U(
+            nvmlDeviceGetTemperatureThreshold(mDevice, NVML_TEMPERATURE_THRESHOLD_SLOWDOWN, &mInfo.temp_slowdown));
+        unsigned long long throttle;
+        if (NVML_CHECK_U(nvmlDeviceGetCurrentClocksThrottleReasons(mDevice, &throttle)) == NVML_SUCCESS) {
+            mInfo.throttle_reason = get_throttle_reason(throttle);
         }
-        mInfo.gpu_utilization = gpu_utilization / (float)sample_count;
-    }
+        NVML_CHECK_U(nvmlDeviceGetFanSpeed(mDevice, &mInfo.fan));
 
-    // sample count may have been modified by the query above; reset back to buffer size
-    sample_count = BUFFER_LIMIT;
-    if (NVML_CHECK_U(
-            nvmlDeviceGetSamples(mDevice, NVML_MEMORY_UTILIZATION_SAMPLES, 0, &v_type, &sample_count, buffer)) ==
-        NVML_SUCCESS) {
-        float mem_utilization = 0.f;
-        for (unsigned i = 0; i < sample_count; ++i) {
-            mem_utilization += (float)buffer[i].sampleValue.uiVal;
+        // For "utilization", we look at recorded samples. In principle, we could query the driver for how many samples
+        // to request, but then we'd need to dynamically allocate sufficient space. Let's just hard-code a limit of 128,
+        // and have no memory management required
+        constexpr const int BUFFER_LIMIT = 128;
+        nvmlSample_t buffer[BUFFER_LIMIT];
+        nvmlValueType_t v_type;
+        unsigned int sample_count = BUFFER_LIMIT;
+        if (NVML_CHECK_U(
+                nvmlDeviceGetSamples(mDevice, NVML_GPU_UTILIZATION_SAMPLES, 0, &v_type, &sample_count, buffer)) ==
+            NVML_SUCCESS) {
+            float gpu_utilization = 0.f;
+            for (unsigned i = 0; i < sample_count; ++i) {
+                gpu_utilization += (float)buffer[i].sampleValue.uiVal;
+            }
+            mInfo.gpu_utilization = gpu_utilization / (float)sample_count;
         }
-        mInfo.mem_utilization = mem_utilization / (float)sample_count;
-    }
 
-    nvmlMemory_v2_t mem_info = get_mem_info(mDevice);
-    mInfo.mem_free = mem_info.free;
-    mInfo.mem_total = mem_info.total;
-    mInfo.mem_reserved = mem_info.reserved;
-    mInfo.mem_used = mem_info.used;
+        // sample count may have been modified by the query above; reset back to buffer size
+        sample_count = BUFFER_LIMIT;
+        if (NVML_CHECK_U(
+                nvmlDeviceGetSamples(mDevice, NVML_MEMORY_UTILIZATION_SAMPLES, 0, &v_type, &sample_count, buffer)) ==
+            NVML_SUCCESS) {
+            float mem_utilization = 0.f;
+            for (unsigned i = 0; i < sample_count; ++i) {
+                mem_utilization += (float)buffer[i].sampleValue.uiVal;
+            }
+            mInfo.mem_utilization = mem_utilization / (float)sample_count;
+        }
 
-    // query PCIe info, if available
-    if (mThread.joinable()) {
-        auto now = std::chrono::steady_clock::now().time_since_epoch();
-        auto interval = std::chrono::duration_cast<std::chrono::microseconds>(
-                            now - std::chrono::steady_clock::duration{mLastTimestamp})
-                            .count();
+        nvmlMemory_v2_t mem_info = get_mem_info(mDevice);
+        mInfo.mem_free = mem_info.free;
+        mInfo.mem_total = mem_info.total;
+        mInfo.mem_reserved = mem_info.reserved;
+        mInfo.mem_used = mem_info.used;
 
-        std::size_t int_rx = mIntervalPCIeRX.exchange(0);
-        std::size_t int_tx = mIntervalPCIeTX.exchange(0);
-        std::size_t int_eg = mIntervalEnergy.exchange(0);
+        // query PCIe info, if available
+        if (mSamplingOk) {
+            auto now = std::chrono::steady_clock::now().time_since_epoch();
+            auto interval = std::chrono::duration_cast<std::chrono::microseconds>(
+                                now - std::chrono::steady_clock::duration{mLastTimestamp})
+                                .count();
 
-        mInfo.pcie_rx = (1'000'000ull * int_rx) / interval;
-        mInfo.pcie_tx = (1'000'000ull * int_tx) / interval;
-        // not using nvmlDeviceGetPowerUsage, because that is the past 1sec average, so it might not be representative
-        mInfo.power = (1'000'000ull * int_eg) / interval;
+            std::size_t int_rx = mIntervalPCIeRX.exchange(0);
+            std::size_t int_tx = mIntervalPCIeTX.exchange(0);
+            std::size_t int_eg = mIntervalEnergy.exchange(0);
 
-        mTotalPCIeRX += int_rx;
-        mTotalPCIeTX += int_tx;
-        mTotalEnergy += int_eg;
-        mLastTimestamp = now.count();
+            if (interval <= 0) {
+                interval = 1;  // two updates inside the same microsecond
+            }
+            mInfo.pcie_rx = (1'000'000ull * int_rx) / interval;
+            mInfo.pcie_tx = (1'000'000ull * int_tx) / interval;
+            // not using nvmlDeviceGetPowerUsage, because that is the past 1sec average, so it might not be representative
+            mInfo.power = (1'000'000ull * int_eg) / interval;
+
+            mTotalPCIeRX += int_rx;
+            mTotalPCIeTX += int_tx;
+            mTotalEnergy += int_eg;
+            mLastTimestamp = now.count();
+        }
+    } catch (const std::exception& e) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            fprintf(stderr, "[NVML WARNING] GPU telemetry query failed (%s); stats will be partial\n", e.what());
+        }
     }
 
     return mInfo;
@@ -336,19 +410,20 @@ nvmlMemory_v2_t get_mem_info(nvmlDevice_t device) {
     static bool has_printed_warning = false;
     nvmlMemory_v2_t mem_info;
     mem_info.version = nvmlMemory_v2;
-    auto status = nvmlDeviceGetMemoryInfo_v2(device, &mem_info);
-    if (status == NVML_ERROR_NOT_SUPPORTED) {
-        fprintf(stderr, "[NVML WARNING] nvmlDeviceGetMemoryInfo not supported.");
-        has_printed_warning = true;
+    // Any failure, not just NOT_SUPPORTED: virtualized drivers reject this
+    // query outright, and CUDA's totals are good enough for accounting.
+    if (nvmlDeviceGetMemoryInfo_v2(device, &mem_info) != NVML_SUCCESS) {
+        if (!has_printed_warning) {
+            has_printed_warning = true;
+            fprintf(stderr, "[NVML WARNING] nvmlDeviceGetMemoryInfo not available; using cudaMemGetInfo\n");
+        }
         std::size_t free, total;
         // hail mary -- use cuda's basic interface instead
         CUDA_CHECK(cudaMemGetInfo(&free, &total));
         mem_info.reserved = 0;
         mem_info.free = free;
         mem_info.total = total;
-        mem_info.used = 0;
-    } else {
-        NVML_CHECK(status);
+        mem_info.used = total - free;
     }
     return mem_info;
 }
@@ -359,7 +434,11 @@ nvmlMemory_v2_t get_mem_info(nvmlDevice_t device) {
  * @return Reserved memory in bytes, or 0 if not supported/available via fallback.
  */
 std::size_t get_mem_reserved() {
-    return get_mem_info(nvml_get_device()).reserved;
+    try {
+        return get_mem_info(nvml_get_device()).reserved;
+    } catch (const std::exception&) {
+        return 0;  // accounting detail; not worth failing a step over
+    }
 }
 
 /**
@@ -370,7 +449,16 @@ std::size_t get_mem_reserved() {
  */
 std::string get_gpu_name() {
     char name[256];
-    NVML_CHECK(nvmlDeviceGetName(nvml_get_device(), name, 256));
+    try {
+        NVML_CHECK(nvmlDeviceGetName(nvml_get_device(), name, 256));
+    } catch (const std::exception&) {
+        cudaDeviceProp props{};
+        int did = 0;
+        if (cudaGetDevice(&did) == cudaSuccess && cudaGetDeviceProperties(&props, did) == cudaSuccess) {
+            return props.name;
+        }
+        return "Unknown GPU";
+    }
     return name;
 }
 
