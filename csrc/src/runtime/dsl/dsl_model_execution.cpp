@@ -887,46 +887,36 @@ void DslModel::backward_grpo(Tensor inputs,
     mGrpoInvTemperatureGpu = nullptr;
 }
 
-void DslModel::step_grpo_native(Tensor inputs,
-                                Tensor position_ids,
-                                Tensor targets,
-                                const float* inference_logprobs_cpu,
-                                const float* advantages_cpu,
-                                const std::uint8_t* loss_mask_cpu,
-                                const std::int32_t* sample_starts_cpu,
-                                const std::int32_t* sample_ends_cpu,
-                                int sample_count,
-                                int grad_accum_steps,
-                                int micro_step,
-                                NCCLCommunicator& comm,
-                                const GrpoNativeLossConfig& loss_config,
-                                const float* temperatures_cpu,
-                                const float* teacher_logprobs_cpu) {
+void DslModel::grpo_native_upload_full(const float* inference_logprobs_cpu,
+                                       const float* advantages_cpu,
+                                       const std::uint8_t* loss_mask_cpu,
+                                       const std::int32_t* sample_starts_cpu,
+                                       const std::int32_t* sample_ends_cpu,
+                                       int sample_count,
+                                       long total_tokens,
+                                       bool zero_metrics,
+                                       const float* temperatures_cpu,
+                                       const float* teacher_logprobs_cpu) {
     if (!mExecutor) {
-        throw std::logic_error("DslModel::step_grpo_native called before allocate_run_state()");
+        throw std::logic_error("DslModel::grpo_native_upload_full called before allocate_run_state()");
     }
     if (!inference_logprobs_cpu || !advantages_cpu || !loss_mask_cpu || !sample_starts_cpu || !sample_ends_cpu) {
         throw std::invalid_argument(
-            "step_grpo_native requires inference_logprobs, advantages, loss_mask, sample ranges");
+            "grpo_native_upload_full requires inference_logprobs, advantages, loss_mask, sample ranges");
     }
     if (sample_count <= 0) {
-        throw std::invalid_argument("step_grpo_native requires at least one sample range");
-    }
-    if (!(loss_config.loss_scale > 0.0f) || !std::isfinite(loss_config.loss_scale)) {
-        throw std::invalid_argument("step_grpo_native loss_scale must be finite and positive");
+        throw std::invalid_argument("grpo_native_upload_full requires at least one sample range");
     }
 
     auto& rs = *mRunState;
     auto& scratch = rs.grpo_native_scratch();
     cudaStream_t main_stream = rs.MainStream;
-    const int B_val = static_cast<int>(inputs.Sizes[0]);
-    const int T_val = static_cast<int>(inputs.Sizes[1]);
-    const std::size_t bt = static_cast<std::size_t>(B_val) * static_cast<std::size_t>(T_val);
+    const std::size_t bt = static_cast<std::size_t>(total_tokens);
     if (bt > static_cast<std::size_t>(scratch.max_tokens) ||
         static_cast<std::size_t>(sample_count) > static_cast<std::size_t>(scratch.max_samples)) {
-        throw std::runtime_error("step_grpo_native inputs exceed allocated GRPO scratch capacity");
+        throw std::runtime_error("grpo_native_upload_full inputs exceed allocated GRPO scratch capacity");
     }
-    if (micro_step == 0) {
+    if (zero_metrics) {
         CUDA_CHECK(cudaMemsetAsync(scratch.metrics.Data,
                                    0,
                                    static_cast<std::size_t>(GRPO_METRIC_COUNT) * sizeof(float),
@@ -969,13 +959,10 @@ void DslModel::step_grpo_native(Tensor inputs,
                                cudaMemcpyHostToDevice,
                                main_stream));
 
-    const float* teacher_logprobs_gpu = nullptr;
     if (teacher_logprobs_cpu) {
         copy_float_input(scratch.host_teacher_logprobs[staging_slot], scratch.teacher_logprobs, teacher_logprobs_cpu);
-        teacher_logprobs_gpu = scratch.teacher_logprobs.get<float>();
     }
 
-    const float* inv_temperature_gpu = nullptr;
     if (temperatures_cpu) {
         auto* inv_temp = scratch.host_temperatures[staging_slot].get<float>();
         for (std::size_t i = 0; i < bt; ++i) {
@@ -986,13 +973,51 @@ void DslModel::step_grpo_native(Tensor inputs,
                                    bt * sizeof(float),
                                    cudaMemcpyHostToDevice,
                                    main_stream));
-        inv_temperature_gpu = scratch.inv_temperature.get<float>();
     }
     CUDA_CHECK(cudaEventRecord(scratch.host_copy_done[staging_slot], main_stream));
     scratch.host_copy_recorded[staging_slot] = true;
+}
 
+void DslModel::step_grpo_native_window(Tensor inputs,
+                                       Tensor position_ids,
+                                       Tensor targets,
+                                       long window_start,
+                                       int sample_count,
+                                       int grad_accum_steps,
+                                       int micro_step,
+                                       NCCLCommunicator& comm,
+                                       const GrpoNativeLossConfig& loss_config,
+                                       bool has_temperatures,
+                                       bool has_teacher_logprobs) {
+    if (!mExecutor) {
+        throw std::logic_error("DslModel::step_grpo_native_window called before allocate_run_state()");
+    }
+    if (!(loss_config.loss_scale > 0.0f) || !std::isfinite(loss_config.loss_scale)) {
+        throw std::invalid_argument("step_grpo_native_window loss_scale must be finite and positive");
+    }
+
+    auto& rs = *mRunState;
+    auto& scratch = rs.grpo_native_scratch();
+    cudaStream_t main_stream = rs.MainStream;
+    const int B_val = static_cast<int>(inputs.Sizes[0]);
+    const int T_val = static_cast<int>(inputs.Sizes[1]);
+    const std::size_t bt = static_cast<std::size_t>(B_val) * static_cast<std::size_t>(T_val);
+    if (static_cast<long>(window_start + static_cast<long>(bt)) > scratch.max_tokens) {
+        throw std::runtime_error("step_grpo_native_window window exceeds uploaded GRPO scratch");
+    }
+
+    const float* teacher_logprobs_gpu =
+        has_teacher_logprobs ? scratch.teacher_logprobs.get<float>() : nullptr;
+    const float* inv_temperature_gpu =
+        has_temperatures ? scratch.inv_temperature.get<float>() + window_start : nullptr;
+
+    // Chunked-sequence mode carries per-document geometry in the chunk
+    // metadata (ChunkPackMeta on the kvprefix path) — the dense doc-masking
+    // context must stay clear, exactly as in DslModel::forward().
     const bool doc_masking_active =
-        causal_lm_profile().apply_doc_masking(*mExecutor, mOptions, mModelConfig, inputs, position_ids, micro_step);
+        mSequenceChunkActive
+            ? false
+            : causal_lm_profile().apply_doc_masking(*mExecutor, mOptions, mModelConfig, inputs, position_ids, micro_step);
 
     if (lora_enabled()) {
         ensure_lora_run_state(comm, B_val, T_val);
@@ -1027,6 +1052,8 @@ void DslModel::step_grpo_native(Tensor inputs,
                               loss_config.adv_tau,
                               loss_config.teacher_tau,
                               loss_config.kl_tau,
+                              loss_config.ratio_clip,
+                              window_start,
                               main_stream);
 
     if (!lora_enabled()) {
@@ -1050,6 +1077,45 @@ void DslModel::step_grpo_native(Tensor inputs,
     if (doc_masking_active) mExecutor->clear_doc_masking();
     mLoRAGrads->end_micro_step(main_stream, comm);
     internal::record_event_if_not_capturing(rs.BackwardDone, main_stream);
+}
+
+void DslModel::step_grpo_native(Tensor inputs,
+                                Tensor position_ids,
+                                Tensor targets,
+                                const float* inference_logprobs_cpu,
+                                const float* advantages_cpu,
+                                const std::uint8_t* loss_mask_cpu,
+                                const std::int32_t* sample_starts_cpu,
+                                const std::int32_t* sample_ends_cpu,
+                                int sample_count,
+                                int grad_accum_steps,
+                                int micro_step,
+                                NCCLCommunicator& comm,
+                                const GrpoNativeLossConfig& loss_config,
+                                const float* temperatures_cpu,
+                                const float* teacher_logprobs_cpu) {
+    const long bt = static_cast<long>(inputs.Sizes[0]) * static_cast<long>(inputs.Sizes[1]);
+    grpo_native_upload_full(inference_logprobs_cpu,
+                            advantages_cpu,
+                            loss_mask_cpu,
+                            sample_starts_cpu,
+                            sample_ends_cpu,
+                            sample_count,
+                            bt,
+                            /*zero_metrics=*/micro_step == 0,
+                            temperatures_cpu,
+                            teacher_logprobs_cpu);
+    step_grpo_native_window(inputs,
+                            position_ids,
+                            targets,
+                            /*window_start=*/0,
+                            sample_count,
+                            grad_accum_steps,
+                            micro_step,
+                            comm,
+                            loss_config,
+                            temperatures_cpu != nullptr,
+                            teacher_logprobs_cpu != nullptr);
 }
 
 GrpoNativeMetrics DslModel::consume_grpo_native_metrics() {

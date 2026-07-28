@@ -22,6 +22,11 @@ MODELS: dict[str, dict[str, str]] = {
     "deepseek-pro": {"openrouter": "deepseek/deepseek-v4-pro",      "yunwu": "deepseek-v4-pro"},
     "glm":          {"openrouter": "z-ai/glm-5.2",                  "yunwu": "glm-5.2"},
     "kimi":         {"openrouter": "moonshotai/kimi-k2.7-code",     "yunwu": "kimi-k2.7-code"},
+    # r5 pool members (registered 2026-07-28 — unregistered models fall to
+    # the yunwu DEFAULT_PROVIDER, which the r5 safety manifests forbid; both
+    # are open-weight and have served via openrouter throughout r5 work):
+    "kimi-k3":      {"openrouter": "moonshotai/kimi-k3"},
+    "inkling":      {"openrouter": "thinkingmachines/inkling"},
     "mimo":         {"openrouter": "xiaomi/mimo-v2.5-pro",          "yunwu": "mimo-v2.5-pro"},
     "minimax":      {"openrouter": "minimax/minimax-m3",            "yunwu": "MiniMax-M3"},
     "opus":         {"openrouter": "anthropic/claude-opus-4.8",     "yunwu": "claude-opus-4-8"},
@@ -75,6 +80,29 @@ YUNWU_LIVE_ALLOW_ENV = "ULTRA_ALLOW_YUNWU"
 ALIASES = {
     "kimi-code": "kimi",
 }
+
+
+# Accepted aliases per canonical key env var. The repo's .env has shipped
+# OPENROUTER_KEY since the first pool work while the provider registry reads
+# OPENROUTER_API_KEY; without this mapping every worker call is made with NO
+# credentials — it fails instantly, so no provider traffic and no cost are
+# ever recorded (the r5 launch spent hours in that state).
+KEY_ENV_ALIASES: dict[str, tuple[str, ...]] = {
+    "OPENROUTER_API_KEY": ("OPENROUTER_KEY",),
+    "YUNWU_API_KEY": ("YUNWU_KEY",),
+}
+
+
+def resolve_api_key(key_env: str) -> str | None:
+    """The credential for ``key_env``, honouring known aliases."""
+    value = os.environ.get(key_env)
+    if value:
+        return value
+    for alias in KEY_ENV_ALIASES.get(key_env, ()):
+        value = os.environ.get(alias)
+        if value:
+            return value
+    return None
 
 
 def active() -> str:

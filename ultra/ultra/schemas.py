@@ -26,6 +26,8 @@ HarnessName = Literal[
     "terminal_sandbox",
     "tool_dialog",
     "tau_bench",
+    "tau2_solo",
+    "crm_query",
     "long_context",
     "sequential_sim",
     "research_loop",

@@ -96,6 +96,7 @@ class SinglePacker(BasePacker):
             num_train_workers=self.dp_world_size,
             idxs=[0] * len(batch.examples),
             num_loras=self.multi_run_manager.max_runs,
+            single_sample_bins=getattr(self, 'single_sample_bins', False),
         )
 
         self.sender.send(micro_batch_grid)
@@ -288,6 +289,7 @@ class MultiPacker(BasePacker):
                 num_train_workers=self.dp_world_size,
                 idxs=[run_idx] * len(run_samples),
                 num_loras=self.multi_run_manager.max_runs,
+                single_sample_bins=getattr(self, 'single_sample_bins', False),
             )
             for worker_idx, worker_batches in enumerate(run_micro_batch_grid):
                 all_micro_batches[worker_idx].extend(worker_batches)

@@ -100,7 +100,13 @@ class GRPOTrainer:
             config=_surogate.PretrainedConfig.from_pretrained(config.model_dir, to_surogate_dtype(config.torch_dtype)),
             options=config.runtime_config,
             batch_size=config.per_device_train_batch_size,
-            seq_len=config.sequence_len,
+            # Graph sequence length is the CHUNK size under chunked-sequence
+            # training (trainer_seq_len = sequence_len // sequence_chunks),
+            # exactly as the SFT wrapper passes it. Passing the full
+            # sequence_len here built an unchunked graph whose saved-tensor
+            # cache cannot fit long sequences (found 2026-07-27 bringing up
+            # the first chunked GRPO run, on the 27B hybrid).
+            seq_len=config.trainer_seq_len,
             grad_accum=1,  # Set dynamically per step via set_grad_accumulation()
             memcpy_all_gather=config.memcpy_all_gather,
             memcpy_send_recv=config.memcpy_send_recv,
@@ -119,7 +125,22 @@ class GRPOTrainer:
         if vocab_size:
             self._pad_logprob = float(np.log(1.0 / float(vocab_size)))
 
-        # Import pretrained weights
+        # Import pretrained weights.
+        #
+        # Adapter-init protocol (2026-07-27): the SFT wrapper calls
+        # configure_initial_adapter BEFORE import (adapter_init_mode=merge
+        # registers the adapter via set_adapter_path so the native import
+        # merges it in-stream) and import_initial_trainable_adapter after.
+        # GRPOTrainer skipped both, silently IGNORING adapter_path — a run
+        # configured to start from base+adapter would have trained from the
+        # raw base.
+        from surogate.train.adapter_init import (
+            configure_initial_adapter,
+            import_initial_trainable_adapter,
+        )
+
+        initial_adapter = configure_initial_adapter(
+            config, self.trainer, fresh_run=True)
         model_weights_path = get_model_weights_path(config.model_dir)
         if external_weights is not None:
             # Zero-copy import from external GPU pointers (colocate mode with vLLM)
@@ -128,6 +149,7 @@ class GRPOTrainer:
         else:
             logger.info(f"Importing weights from {model_weights_path}")
             self.trainer.import_weights(model_weights_path)
+        import_initial_trainable_adapter(self.trainer, initial_adapter)
 
         # loss_scale is computed dynamically per pack — see train() loop
 
@@ -562,6 +584,8 @@ class GRPOTrainer:
             transport_config=transport_config,
             start_step=start_step,
         )
+        # chunked GRPO: no packed-doc isolation in chunked training attention
+        self.packer.single_sample_bins = bool(getattr(config, 'single_sample_bins', False))
 
         # Setup data loader (receives packed MicroBatches)
         self.data_loader = GRPODataLoader(
@@ -806,6 +830,7 @@ class GRPOTrainer:
                     adv_tau=float(config.loss.adv_tau),
                     teacher_tau=float(config.loss.teacher_tau),
                     kl_tau=float(config.loss.kl_tau),
+                    ratio_clip=float(config.loss.ratio_clip),
                 )
 
             # 5. Optimizer step — one per orchestrator step (lr/opt_config built above)

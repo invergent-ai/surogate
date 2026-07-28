@@ -1215,7 +1215,15 @@ def render_capability_control_prompt(
         "and target_position_id refer to live workflow positions and are integers. "
         "In replan steps, access_positions contains zero-based indexes of earlier "
         "replacement steps; it never contains live position IDs. Profile references "
-        "are never position indexes. Return exactly one "
+        "are never position indexes. "
+        # The two dominant contract violations measured on 1,696 live plans
+        # (2026-07-28): 41 plans exceeded the step ceiling and 194 steps
+        # omitted access_positions on steps with no dependency. Both are
+        # rejected outright, so the ceiling and the "always present, [] when
+        # empty" rule are stated explicitly rather than implied by the schema.
+        f"A replan carries AT MOST {MAX_CONTROL_STEPS} steps; never emit more. "
+        "EVERY step must include access_positions — use [] when the step "
+        "depends on nothing. Return exactly one "
         "JSON object and no prose. Keep the reason and each subtask concise and "
         f"operational; one or two sentences is sufficient.{bounded_instruction}\n\n"
         f"ACTION SCHEMA:\n{json.dumps(schema, ensure_ascii=True, indent=2)}\n\n"

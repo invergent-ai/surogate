@@ -23,8 +23,14 @@ class WorkerSpec(BaseModel):
     # per-call cost. None => trust the provider's reported cost.
     cost_in_per_mtok: float | None = None
     cost_out_per_mtok: float | None = None
-    # Provider routing: "price" = cheapest-first where supported; None = provider default.
-    provider_sort: str | None = "price"
+    # Provider routing: None = OpenRouter default (balances price and uptime).
+    # "price" (cheapest-first) is BANNED for EVAL runs since 2026-07-26 (a
+    # hung cheapest provider stalled GPQA tree leaves indefinitely). For the
+    # GRPO CAMPAIGN it is the recipe (user-decided 2026-07-28): per-call
+    # timeouts bound hangs, and non-trainable rollouts are excluded from
+    # loss and advantage baseline, so bad-provider losses cost rollouts,
+    # not training signal.
+    provider_sort: str | None = None
 
 
 class SamplingConfig(BaseModel):
@@ -50,4 +56,6 @@ class PoolConfig(BaseModel):
     prompt_caching: bool = True
 
     def api_key(self) -> str | None:
-        return os.environ.get(self.api_key_env)
+        from ultra.providers import resolve_api_key
+
+        return resolve_api_key(self.api_key_env)

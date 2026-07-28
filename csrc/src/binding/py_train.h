@@ -325,7 +325,31 @@ public:
                           float ipo_mask_high,
                           float adv_tau,
                           float teacher_tau,
-                          float kl_tau);
+                          float kl_tau,
+                          float ratio_clip);
+    /// Chunked-sequence GRPO micro-step (mirrors step_chunked): KV sweep over
+    /// chunks, then reverse re-forward + windowed GRPO dloss + backward.
+    /// Taken automatically by step_grpo_native when SequenceChunks > 1;
+    /// per-token arrays and sample ranges are GLOBAL over [rows, B, N*T].
+    void step_grpo_native_chunked(const std::int32_t* inputs,
+                                  const std::int32_t* targets,
+                                  const float* inference_logprobs,
+                                  const float* advantages,
+                                  const std::uint8_t* loss_mask,
+                                  const std::int32_t* sample_starts,
+                                  const std::int32_t* sample_ends,
+                                  int sample_count,
+                                  const std::int32_t* position_ids,
+                                  const float* temperatures,
+                                  const float* teacher_logprobs,
+                                  float loss_scale,
+                                  float ipo_mask_low,
+                                  float ipo_mask_high,
+                                  float adv_tau,
+                                  float teacher_tau,
+                                  float kl_tau,
+                                  float ratio_clip,
+                                  int seq_chunks);
     std::unordered_map<std::string, float> get_grpo_native_metrics();
 
     // Knowledge-distillation training micro-step: standard SFT forward/backward

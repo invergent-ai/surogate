@@ -417,3 +417,52 @@ def test_sparse_objective_metrics_use_selected_token_denominators():
     assert metrics["opd_shift"] == pytest.approx(1.0)
     assert metrics["replay_tokens"] == 1
     assert metrics["replay_loss"] == pytest.approx(0.6)
+
+
+def test_ratio_clip_bounds_rare_token_gradient_but_not_metrics():
+    """Pre-flight review item 7: a rare token (both probs tiny) passes the
+    |dp| IPO mask with an importance ratio of ~1e5 and would dominate the
+    batch gradient. The clip bounds the GRADIENT at ratio_clip while the
+    mismatch metrics keep the uncapped ratio (staleness monitoring must see
+    real drift)."""
+    # trainer p=1e-3, inference p=1e-8: ratio e^11.5 ~ 1e5, probs_diff ~1e-3
+    trainer_logprobs = np.array([0.0, np.log(1e-3), -1.0], dtype=np.float32)
+    inference_logprobs = np.array([0.0, np.log(1e-8), -1.0], dtype=np.float32)
+    advantages = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    loss_mask = np.array([False, True, True])
+    config = GRPOLossConfig(adv_tau=1.0, kl_tau=0.0)
+
+    grads, metrics = compute_grpo_per_token_grads(
+        trainer_logprobs=trainer_logprobs,
+        inference_logprobs=inference_logprobs,
+        advantages=advantages,
+        loss_mask=loss_mask,
+        loss_config=config,
+        sample_ranges=[(0, 3)],
+    )
+    raw_ratio = np.exp(trainer_logprobs[1] - inference_logprobs[1])
+    assert raw_ratio > 1e4                       # the hazard is real
+    assert grads[1] == pytest.approx(config.ratio_clip)   # capped at e^2
+    assert metrics["ratio_clipped"] == pytest.approx(0.5)  # 1 of 2 kept
+    # uncapped ratio still visible to monitoring
+    assert metrics["mismatch_kl"] > 1e3
+
+
+def test_ratio_clip_leaves_honest_off_policy_correction_alone():
+    trainer_logprobs = np.array([-1.2, -0.8], dtype=np.float32)
+    inference_logprobs = np.array([-1.4, -0.7], dtype=np.float32)
+    advantages = np.array([1.5, -0.2], dtype=np.float32)
+    loss_mask = np.array([True, True])
+    config = GRPOLossConfig(adv_tau=1.0, kl_tau=0.0)
+
+    grads, metrics = compute_grpo_per_token_grads(
+        trainer_logprobs=trainer_logprobs,
+        inference_logprobs=inference_logprobs,
+        advantages=advantages,
+        loss_mask=loss_mask,
+        loss_config=config,
+        sample_ranges=[(0, 2)],
+    )
+    expected = advantages * np.exp(trainer_logprobs - inference_logprobs)
+    np.testing.assert_allclose(grads, expected, rtol=1e-6)
+    assert metrics["ratio_clipped"] == 0.0

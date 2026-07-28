@@ -8,6 +8,8 @@ from . import opencode  # noqa: F401  (registers concrete opencode + opencode_re
 from . import harbor  # noqa: F401  (registers terminal_sandbox harness)
 from . import tool_dialog  # noqa: F401  (registers tool_dialog harness)
 from . import tau_bench  # noqa: F401  (registers tau_bench harness)
+from . import tau2_solo  # noqa: F401  (registers tau2_solo harness)
+from . import crm_query  # noqa: F401  (registers crm_query harness)
 from . import long_context  # noqa: F401  (registers long_context harness)
 
 __all__ = [

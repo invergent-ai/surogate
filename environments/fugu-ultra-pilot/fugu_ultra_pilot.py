@@ -47,7 +47,12 @@ from ultra.conductor_prompt import (  # noqa: E402
 from ultra.executor import execute_workflow  # noqa: E402
 from ultra.live_worker_safety import validate_live_worker_safety  # noqa: E402
 from ultra.providers import YUNWU_LIVE_ALLOW_ENV, load_dotenv, routed_provider_name, routed_slug  # noqa: E402
-from ultra.schemas import StepBudget, TaskSpec, Workflow  # noqa: E402
+from ultra.schemas import StepBudget, TaskSpec, Workflow, WorkflowStep  # noqa: E402
+from ultra.typed_contract import (  # noqa: E402
+    TypedContractParseError,
+    parse_typed_workflow,
+    typed_control_messages,
+)
 from ultra.workflow import WorkflowValidationError, parse_workflow  # noqa: E402
 from ultra.workflow_record_cache import WorkflowRecordCache, workflow_record_cache_key  # noqa: E402
 from ultra.workers import FakeProvider, Sampling, WorkerPool  # noqa: E402
@@ -352,11 +357,31 @@ _extract_workflow_payload = _shared_extract_workflow_payload
 _prompt_for_task = _shared_prompt_for_task
 
 
+def _lane_role_priors(pilot_config: dict[str, Any], lane: str) -> list[list[str]]:
+    """Role-prior lists for a lane's workers, in lane-mask order — the SAME
+    order score() uses to map worker ids back to worker names."""
+    pool = pilot_config["worker_pool"]
+    return [list(pool[name].get("role_prior", []))
+            for name in pilot_config["lane_worker_masks"][lane]]
+
+
+def _typed_contract_enabled(pilot_config: dict[str, Any]) -> bool:
+    return pilot_config.get("conductor_contract") == "typed_control"
+
+
 def _worker_specs(pilot_config: dict[str, Any]) -> list[WorkerSpec]:
     specs = []
     for name in pilot_config["worker_pool_names"]:
         ident = pilot_config["worker_pool"][name]
-        specs.append(WorkerSpec(worker_id=name, model=str(ident["model"])))
+        specs.append(WorkerSpec(
+            worker_id=name,
+            model=str(ident["model"]),
+            # "price" = OpenRouter cheapest-first (campaign recipe,
+            # user-decided 2026-07-28): occasional bad-provider timeouts are
+            # acceptable because non-trainable rollouts are excluded from
+            # loss AND advantage baseline. None = provider default ordering.
+            provider_sort=ident.get("provider_sort"),
+        ))
     return specs
 
 
@@ -426,6 +451,11 @@ class UltraPilotRuntime:
             for lane, workers in pilot_config["lane_worker_masks"].items()
         }
         self.max_workflow_steps = int(pilot_config["workflow_policy"]["max_workflow_steps"])
+        self.typed_contract = _typed_contract_enabled(pilot_config)
+        self.lane_role_priors = {
+            str(lane): _lane_role_priors(pilot_config, str(lane))
+            for lane in pilot_config["lane_worker_masks"]
+        }
 
     async def score(self, raw_completion: str, info: dict[str, Any], state: dict[str, Any]) -> float:
         task_id = str(info["task_id"])
@@ -435,8 +465,20 @@ class UltraPilotRuntime:
         rollout_id = f"vf-{_safe_slug(task_id)}-{uuid.uuid4().hex[:12]}"
 
         try:
-            workflow = parse_workflow(_extract_workflow_payload(raw_completion))
-        except WorkflowValidationError as exc:
+            if self.typed_contract:
+                steps = parse_typed_workflow(
+                    raw_completion, self.lane_role_priors[lane])
+                workflow = Workflow(steps=[WorkflowStep(**s) for s in steps])
+            else:
+                workflow = parse_workflow(_extract_workflow_payload(raw_completion))
+        except (WorkflowValidationError, TypedContractParseError) as exc:
+            # TEMP DIAGNOSTIC (zero-reward hunt 2026-07-28): surface what the
+            # live env actually received and why it rejected it.
+            import logging as _logging
+            _logging.getLogger("verifiers.utils.env_utils").info(
+                "SCORE-REJECT lane=%s exc=%s | raw head=%r | raw tail=%r",
+                lane, str(exc)[:160], str(raw_completion)[:180],
+                str(raw_completion)[-80:])
             state["_ultra_outcome_class"] = "invalid_workflow_trainable"
             state["_ultra_valid_for_training"] = True
             state["_ultra_workflow_parse_valid"] = False
@@ -797,7 +839,14 @@ def _build_dataset(
             {
                 "example_id": idx,
                 "task": task_name,
-                "prompt": _prompt_for_task(task, pilot_config, task_lane, max_task_chars=max_task_chars),
+                "prompt": (
+                    typed_control_messages(
+                        _messages_text(task, max_chars=max_task_chars),
+                        _lane_role_priors(pilot_config, task_lane),
+                    )
+                    if _typed_contract_enabled(pilot_config)
+                    else _prompt_for_task(task, pilot_config, task_lane, max_task_chars=max_task_chars)
+                ),
                 "answer": task.task_id,
                 "info": json.dumps(
                     {

@@ -74,6 +74,9 @@ def _compute_sample_grads(
 
     log_importance_ratio = trainer_logprobs - inference_logprobs
     importance_ratio = np.exp(log_importance_ratio)
+    # Gradient-side ratio cap (see GRPOLossConfig.ratio_clip). Metrics below
+    # (mismatch_kl) keep the UNCAPPED ratio: monitoring must see real drift.
+    capped_ratio = np.minimum(importance_ratio, loss_config.ratio_clip)
 
     # IPO masking based on probability difference (DPPO-Binary TV)
     trainer_probs = np.exp(trainer_logprobs)
@@ -101,7 +104,7 @@ def _compute_sample_grads(
     # We need dloss = -d(loss)/d(trainer_logprob_t), giving:
     #   dloss = keep_mask_t * adv_t * ratio_t - 2 * kl_tau * loss_mask_t * log_ratio_t
     per_token_grads = np.zeros_like(trainer_logprobs)
-    per_token_grads[keep_mask] = scaled_advantages[keep_mask] * importance_ratio[keep_mask]
+    per_token_grads[keep_mask] = scaled_advantages[keep_mask] * capped_ratio[keep_mask]
     per_token_grads[policy_token_mask] -= 2.0 * loss_config.kl_tau * log_importance_ratio[policy_token_mask]
 
     opd_fields = (opd_reference_logprobs, hindsight_logprobs, hindsight_mask)
@@ -131,7 +134,7 @@ def _compute_sample_grads(
     # Policy loss metric
     loss_mask_count = max(loss_mask.sum(), 1)
     pg_loss = np.zeros_like(trainer_logprobs)
-    pg_loss[keep_mask] = scaled_advantages[keep_mask] * importance_ratio[keep_mask]
+    pg_loss[keep_mask] = scaled_advantages[keep_mask] * capped_ratio[keep_mask]
     kl_loss = np.zeros_like(trainer_logprobs)
     kl_loss[policy_token_mask] = loss_config.kl_tau * log_importance_ratio[policy_token_mask] ** 2
     opd_loss = np.zeros_like(trainer_logprobs)
@@ -152,6 +155,10 @@ def _compute_sample_grads(
         "is_masked_high": (float(ipo_mask_high[policy_token_mask].mean()) if policy_token_mask.any() else 0.0),
         "keep_tokens": int(keep_mask.sum()),
         "total_tokens": int(loss_mask.sum()),
+        "ratio_clipped": (
+            float((importance_ratio[keep_mask]
+                   > loss_config.ratio_clip).mean())
+            if keep_mask.any() else 0.0),
         "opd_loss": _safe_mean(opd_loss, opd_mask),
         "opd_gate": _safe_mean(opd_gate, opd_mask),
         "opd_shift": _safe_mean(opd_shift, opd_mask),
@@ -219,6 +226,7 @@ def compute_grpo_per_token_grads(
         "is_masked": 0.0,
         "is_masked_low": 0.0,
         "is_masked_high": 0.0,
+        "ratio_clipped": 0.0,
         "keep_tokens": 0,
         "total_tokens": 0,
         "opd_loss": 0.0,
@@ -273,6 +281,7 @@ def compute_grpo_per_token_grads(
                 "is_masked",
                 "is_masked_low",
                 "is_masked_high",
+                "ratio_clipped",
             ):
                 agg_metrics[key] += s_metrics[key]
         for key in ("opd_loss", "opd_gate", "opd_shift"):
@@ -301,6 +310,7 @@ def compute_grpo_per_token_grads(
             "is_masked",
             "is_masked_low",
             "is_masked_high",
+            "ratio_clipped",
         ):
             agg_metrics[key] /= policy_samples
         if "teacher_kl" in agg_metrics:

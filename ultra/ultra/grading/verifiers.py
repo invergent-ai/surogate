@@ -6,6 +6,7 @@ lets tasks reference a grader by name (and keeps datasets decoupled from grading
 
 from __future__ import annotations
 
+import json
 import re
 import threading
 from collections.abc import Callable
@@ -162,7 +163,7 @@ def mc_letter(output: str, solution: Any) -> float:
     return 1.0 if pred == gold else 0.0
 
 
-def _run_capped(cmd, *, stdin_data=None, timeout=10):
+def _run_capped(cmd, *, stdin_data=None, timeout=10, cwd=None):
     """Run ``cmd`` under a hard wall-clock cap. The child gets its own session, so on
     timeout we SIGKILL the whole process group — otherwise grandchildren spawned by
     untrusted model code keep the stdout pipe open and ``communicate`` hangs forever
@@ -180,6 +181,7 @@ def _run_capped(cmd, *, stdin_data=None, timeout=10):
             stderr=subprocess.DEVNULL,
             text=True,
             start_new_session=True,
+            cwd=cwd,
         )
     except Exception:
         return None, ""
@@ -250,6 +252,162 @@ def code_exec_stdio(output: str, solution: Any) -> float:
             if out.strip() != str(t.get("output", "")).strip():
                 return 0.0
     return 1.0
+
+
+def extract_sql(text: str) -> str:
+    """Pull the last fenced SQL block, else the last SELECT statement."""
+    blocks = re.findall(r"```(?:sql)?\s*\n(.*?)```", text, re.DOTALL | re.IGNORECASE)
+    if blocks:
+        return blocks[-1].strip().rstrip(";").strip()
+    idx = text.upper().rfind("SELECT")
+    if idx < 0:
+        return text.strip().rstrip(";").strip()
+    return text[idx:].strip().rstrip(";").strip()
+
+
+def _sql_digest(db_path: str, sql: str, timeout: float) -> dict[str, Any] | None:
+    """Execute one query in an isolated child; None if it failed or timed out."""
+    import sys
+    from pathlib import Path
+
+    runner = str(Path(__file__).with_name("sql_exec_runner.py"))
+    rc, out = _run_capped([sys.executable, runner, db_path, sql], timeout=timeout)
+    if rc != 0 or not out.strip():
+        return None
+    try:
+        payload = json.loads(out.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return None
+    return payload if payload.get("ok") else None
+
+
+def sql_exec(output: str, solution: Any) -> float:
+    """BIRD-style execution accuracy: 1.0 iff the candidate's result set matches gold.
+
+    ``solution`` = ``{"db_path": str, "gold_sql": str, "timeout": float}``.
+    Both queries run read-only in isolated processes and are compared by a
+    digest of their sorted row SETS (BIRD's official comparison). A gold query
+    that cannot execute scores 0.0 rather than passing a broken task through.
+    """
+    if not isinstance(solution, dict):
+        return 0.0
+    db_path = str(solution.get("db_path") or "")
+    gold_sql = str(solution.get("gold_sql") or "")
+    if not db_path or not gold_sql:
+        return 0.0
+    timeout = float(solution.get("timeout", 30.0))
+
+    candidate = extract_sql(output)
+    if not candidate:
+        return 0.0
+    predicted = _sql_digest(db_path, candidate, timeout)
+    if predicted is None:
+        return 0.0
+    # A constant query (``SELECT 1``) matches any gold whose answer happens to
+    # be that constant; require the candidate to have actually read the DB.
+    if not predicted.get("reads_table"):
+        return 0.0
+    gold = _sql_digest(db_path, gold_sql, timeout)
+    if gold is None:
+        return 0.0
+    return 1.0 if (predicted["hash"] == gold["hash"] and predicted["n"] == gold["n"]) else 0.0
+
+
+def _dabstep_answers_match(candidate: str, accepted: str) -> bool:
+    """One accepted variant vs the candidate's final line.
+
+    Numeric variants compare with small tolerance after stripping currency,
+    percent and thousands separators; everything else is a case-insensitive
+    exact match. Mirrors the leaderboard scorer's observed behavior (it
+    accepts several formats per task — the accepted SET carries that)."""
+    cand = candidate.strip().rstrip(".")
+    gold = accepted.strip().rstrip(".")
+    if cand.casefold() == gold.casefold():
+        return True
+
+    def as_float(s: str) -> float | None:
+        cleaned = s.replace(",", "").replace("$", "").replace("€", "").rstrip("%").strip()
+        try:
+            return float(cleaned)
+        except ValueError:
+            return None
+
+    a, b = as_float(cand), as_float(gold)
+    if a is None or b is None:
+        return False
+    return abs(a - b) <= max(1e-2, 5e-3 * abs(b))
+
+
+def dabstep_exec(output: str, solution: Any) -> float:
+    """DABstep data-analysis: run the candidate's script, match its answer.
+
+    ``solution`` = ``{"accepted": [variants], "context_dir": str, "timeout": s}``.
+    The worker's fenced python script runs in an isolated process with CWD =
+    the DABstep context directory (it reads payments.csv etc. itself); the
+    LAST non-empty stdout line is the answer, matched against the accepted
+    variants reconstructed from correct public leaderboard submissions.
+    """
+    import sys
+    import tempfile
+    from pathlib import Path
+
+    if not isinstance(solution, dict):
+        return 0.0
+    accepted = [str(v) for v in solution.get("accepted") or [] if str(v).strip()]
+    context_dir = str(solution.get("context_dir") or "")
+    if not accepted or not Path(context_dir).is_dir():
+        return 0.0
+    code = extract_code(output)
+    if not code.strip():
+        return 0.0
+    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=True,
+                                     dir=context_dir) as f:
+        f.write(code)
+        f.flush()
+        rc, out = _run_capped(
+            [sys.executable, f.name],
+            timeout=float(solution.get("timeout", 120.0)),
+            cwd=context_dir,
+        )
+    if rc != 0 or not out.strip():
+        return 0.0
+    final = out.strip().splitlines()[-1]
+    return 1.0 if any(_dabstep_answers_match(final, v) for v in accepted) else 0.0
+
+
+def finance_numeric(output: str, solution: Any) -> float:
+    """Financial-QA numeric match (FinQA / TAT-QA style).
+
+    ``solution`` = ``{"answer": <number>, "scale": ""|"percent"|"thousand"|...}``.
+    The candidate's LAST number is compared with relative tolerance 5e-3
+    (absolute 1e-3 near zero). Percent-form normalization is driven by
+    NUMERIC properties and dataset metadata only — never by words in the
+    question: a/100 is accepted when |gold| < 1 (decimal-ratio golds answered
+    in percent form), and a*100 when the dataset marks the answer percent.
+    """
+    if not isinstance(solution, dict):
+        return 0.0
+    try:
+        gold = float(solution.get("answer"))
+    except (TypeError, ValueError):
+        return 0.0
+    raw = _last_number(output)
+    if raw is None:
+        return 0.0
+    try:
+        answer = float(raw.replace(",", ""))
+    except ValueError:
+        return 0.0
+
+    def close(a: float, b: float) -> bool:
+        return abs(a - b) <= max(1e-3, 5e-3 * abs(b))
+
+    candidates = [answer]
+    if abs(gold) < 1.0:
+        candidates.append(answer / 100.0)
+    if str(solution.get("scale") or "") == "percent":
+        candidates.append(answer * 100.0)
+    return 1.0 if any(close(c, gold) for c in candidates) else 0.0
 
 
 def parse_grid(text: str) -> list[list[int]] | None:
@@ -348,21 +506,46 @@ def _rlpr_norm(s: str) -> str:
         return s
 
 
+def _final_answer_span(output: str) -> str:
+    """The part of the output that plausibly IS the answer.
+
+    Grading the whole output let gold '2.7' match inside '12.7' or any
+    intermediate value anywhere in a derivation (pre-flight review,
+    2026-07-27: false 1.0s flip informative groups to uniform and corrupt
+    reward sign). Span priority: last \\boxed{}, else the text after the
+    last 'answer is/:/=' marker, else the last non-empty line.
+    """
+    s = str(output)
+    boxed = re.findall(r"\\boxed\{(.*?)\}(?!\})", s, re.S)
+    if boxed:
+        return boxed[-1]
+    markers = list(re.finditer(r"(?i)answer\s*(?:is|:|=)\s*", s))
+    if markers:
+        return s[markers[-1].end():].strip().split("\n", 1)[0]
+    lines = [line.strip() for line in s.split("\n") if line.strip()]
+    return lines[-1] if lines else ""
+
+
 def rlpr_lenient(output: str, solution: Any) -> float:
-    """Numeric-tolerant (2%) lenient match for RLPR reference answers. Tries the strict
-    math grader first so anything it already accepts stays accepted."""
+    """Numeric-tolerant (2%) match for RLPR reference answers, over the
+    FINAL-ANSWER SPAN only. Tries the strict math grader first so anything
+    it already accepts stays accepted. Non-numeric answers require an exact
+    normalized match — there is deliberately NO substring fallback: 'g in a
+    or a in g' awarded 1.0 to wrong answers ('2' vs gold '2x+1') and to any
+    output that merely mentioned the gold value in passing."""
     if math_equal(output, solution) >= 1.0:
         return 1.0
-    a, g = _rlpr_norm(output), _rlpr_norm(str(solution))
+    a = _rlpr_norm(_final_answer_span(output))
+    g = _rlpr_norm(str(solution))
     if not a or not g:
         return 0.0
     if a == g:
         return 1.0
     try:
         fa, fg = float(a), float(g)
-        return 1.0 if abs(fa - fg) <= 0.02 * max(abs(fg), 1e-9) else 0.0
     except ValueError:
-        return 1.0 if (g in a or a in g) else 0.0
+        return 0.0  # non-numeric: exact normalized equality only
+    return 1.0 if abs(fa - fg) <= 0.02 * max(abs(fg), 1e-9) else 0.0
 
 
 REGISTRY: dict[str, Grader] = {
@@ -375,6 +558,9 @@ REGISTRY: dict[str, Grader] = {
     "contains": contains,
     "contains_all_absent": contains_all_absent,
     "rlpr_lenient": rlpr_lenient,
+    "sql_exec": sql_exec,
+    "finance_numeric": finance_numeric,
+    "dabstep_exec": dabstep_exec,
 }
 
 

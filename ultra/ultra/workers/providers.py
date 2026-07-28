@@ -297,9 +297,9 @@ class RoutedOpenAIProvider:
             key_env = str(cfg.get("key_env") or "")
             api_key = None
             if key_env:
-                import os
+                from ultra.providers import resolve_api_key
 
-                api_key = os.environ.get(key_env)
+                api_key = resolve_api_key(key_env)
                 if not api_key:
                     raise RuntimeError(
                         f"{key_env} is not set; model {model!r} routes to provider {provider_name!r}"
