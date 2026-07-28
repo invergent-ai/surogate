@@ -77,10 +77,19 @@ class GRPOTrainConfig(SFTConfig):
     def __init__(self, cfg: DictDefault):
         # Each token's gradient is advantage * importance_ratio_clip * (softmax - 1{target}) / N_valid.
         # The advantage is often < 0.1, the clipped ratio is near 1.0 ± epsilon, and the loss mask removes prompt tokens.
-        # The effective gradient per parameter ends up 10-100x smaller than SFT.
-        # At that scale, BF16 rounding kills the signal.
-        if "master_dtype" not in cfg:
-            cfg["master_dtype"] = "fp32"
+        # The effective gradient per parameter ends up 10-100x smaller than SFT, so the *gradients* stay fp32.
+        #
+        # The master weights do not: measured GRPO runs show a BF16 master is enough.
+        # Masters are allocated for every param, frozen ones included, and a master
+        # dtype that differs from the param dtype also forces a separate work copy
+        # (dsl_weight_manager.cpp) — so fp32 cost 6 bytes/param (fp32 master + bf16
+        # work) against 2 when they alias, e.g. 12 GB vs 4 GB of arena on a 2B, most
+        # of it for a frozen base a LoRA run never trains. Precision where it matters
+        # comes from the adapter instead: lora_dtype defaults to "fp32", so the
+        # trainable LoRA weights and their optimizer state stay full precision.
+        #
+        # Leaving master_dtype unset falls back to the model dtype (BF16). A full
+        # fine-tune that wants the old behaviour can set master_dtype: fp32 in its yaml.
         if "gradient_dtype" not in cfg:
             cfg["gradient_dtype"] = "fp32"
 

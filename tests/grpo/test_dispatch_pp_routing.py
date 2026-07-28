@@ -1,7 +1,6 @@
 """GRPO routes through dispatch-PP when parallelism=dispatch_pp.
 
-dispatch-PP exists so a model whose fp32 master does not fit resident can still
-train (bf16 master is not an option for GRPO — it starves the gradient signal).
+dispatch-PP exists so a model whose weights do not fit resident can still train.
 GRPO cannot use the fused dispatch step directly because its gradients do not
 come from cross-entropy, so it drives the two halves itself:
 

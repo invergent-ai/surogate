@@ -178,7 +178,7 @@ class GRPOTrainer:
         self._turn_rows_path = Path(config.output_dir) / "turn_stats.jsonl"
 
         # dispatch-PP: stage the forward/backward across the GPU pool so a model
-        # whose fp32 master does not fit resident can still train. GRPO drives the
+        # whose weights do not fit resident can still train. GRPO drives the
         # two halves itself (staged forward -> Python per-token grads -> staged
         # backward seeded with them), because its gradients do not come from
         # cross-entropy.
