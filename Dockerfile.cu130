@@ -26,6 +26,9 @@ ARG DSTACK_RUNNER_VERSION=0.20.18
 ENV DEBIAN_FRONTEND=noninteractive
 ENV CUDA_LIB_ROOT="/root/.venv/lib/python3.12/site-packages/nvidia"
 ENV UV_NO_CACHE=1
+# torch 2.11 pulls the full CUDA wheel set (cudnn/cublas are 350-400MB each);
+# uv's 30s default request timeout loses that race on a slow link.
+ENV UV_HTTP_TIMEOUT=600
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends --allow-change-held-packages ca-certificates curl libdw-dev python3-dev build-essential rsync wget netcat-openbsd gcc patch pciutils fuse3 openssh-server sudo openssh-server git \
@@ -48,11 +51,14 @@ RUN ~/.local/bin/uv venv /root/.venv --python=3.12
 ENV PATH="/root/.venv/bin:$PATH" \
     VIRTUAL_ENV="/root/.venv"
 
-# Install wheel from URL (single RUN so nvidia version overrides don't leave duplicates in lower layers)
-RUN ~/.local/bin/uv pip install "torch==2.10.0+${CUDA_TAG}" "torchvision==0.25.0+${CUDA_TAG}" "torchaudio==2.10.0+${CUDA_TAG}" --index-url https://download.pytorch.org/whl/${CUDA_TAG} \
- && ~/.local/bin/uv pip install "vllm==0.19.1" \
+# Install wheel from URL (single RUN so nvidia version overrides don't leave duplicates in lower layers).
+# ldconfig runs last: the cache built above was made before these libs existed, so without
+# refreshing it the loader cannot find libcudart and the entrypoint fails to import _surogate.
+RUN ~/.local/bin/uv pip install "torch==2.11.0+${CUDA_TAG}" "torchvision==0.26.0+${CUDA_TAG}" "torchaudio==2.11.0+${CUDA_TAG}" --index-url https://download.pytorch.org/whl/${CUDA_TAG} \
+ && ~/.local/bin/uv pip install "vllm==0.25.1" \
  && ~/.local/bin/uv pip install ${WHEEL_URL} \
- && ~/.local/bin/uv pip install "nvidia-cuda-runtime==13.1.80" "nvidia-cudnn-cu13>=9.10.2.21" "nvidia-nccl-cu13==2.29.3" "nvidia-cufile==1.16.1.26" "nvidia-cuda-nvrtc==13.1.115"
+ && ~/.local/bin/uv pip install "nvidia-cuda-runtime==13.1.80" "nvidia-cudnn-cu13>=9.10.2.21" "nvidia-nccl-cu13==2.29.3" "nvidia-cufile==1.16.1.26" "nvidia-cuda-nvrtc==13.1.115" \
+ && ldconfig
 
 # Add dstack launcher
 RUN curl --connect-timeout 60 --max-time 240 --retry 1 --output /usr/local/bin/dstack-runner https://dstack-runner-downloads.s3.eu-west-1.amazonaws.com/${DSTACK_RUNNER_VERSION}/binaries/dstack-runner-linux-amd64 \
