@@ -18,11 +18,11 @@ optimizer: adamw
 
 recipe: bf16
 
-# master_dtype/gradient_dtype are deliberately left at the GRPO fp32 default.
-# bf16 master has been tried for GRPO before and fails: it does not preserve
-# enough gradient signal. A 4B student + fp32 master exceeds a single 32GB card
-# (29.3GB arena), so the student is sized to the constraint rather than the
-# precision being lowered. 2B is also the paper's own Multi-Hop Search student.
+# gradient_dtype is left at the GRPO fp32 default; master_dtype follows the model
+# dtype (bf16), which measured runs show is enough — the fp32 master this config
+# used to assume was what made a 4B student overflow a single 32GB card (29.3GB
+# arena). Precision on the trainable side comes from lora_dtype (fp32 by default).
+# 2B is also the paper's own Multi-Hop Search student.
 
 lora: true
 lora_rank: 16
