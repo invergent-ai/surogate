@@ -217,6 +217,17 @@ class ProgressTracker:
         self.current = 0
         self._last_logged_percent = -log_every_percent
         self._postfix: dict[str, Any] = {}
+        # Plain-log progress cadence (2026-07-29): tqdm renders \r to a TTY,
+        # so under nohup/file logging batch progress was INVISIBLE — the log
+        # showed per-env stats but never how far the current step was. Emit
+        # an INFO line with rate + ETA every log_every_percent OR every
+        # `heartbeat_s`, whichever comes first.
+        import time as _time
+
+        self._time = _time
+        self._start_time = _time.time()
+        self._last_line_time = 0.0
+        self._heartbeat_s = 60.0
 
         if self.json_logging:
             self._pbar = None
@@ -230,8 +241,58 @@ class ProgressTracker:
         self.current += n
         if self._pbar is not None:
             self._pbar.update(n)
+            self._maybe_log_line()
         else:
             self._log_progress()
+
+    def _maybe_log_line(self):
+        """Plain INFO progress line for file/nohup logs (non-JSON mode)."""
+        percent = int(100 * self.current / self.total) if self.total > 0 else 0
+        now = self._time.time()
+        due_percent = percent >= self._last_logged_percent + self.log_every_percent
+        due_time = now - self._last_line_time >= self._heartbeat_s
+        if not (due_percent or due_time or self.current >= self.total):
+            return
+        elapsed = max(now - self._start_time, 1e-6)
+        rate = self.current / elapsed  # units/s
+        remaining = max(self.total - self.current, 0)
+        eta_s = remaining / rate if rate > 0 else float("inf")
+
+        def _fmt(seconds: float) -> str:
+            if seconds == float("inf"):
+                return "?"
+            seconds = int(seconds)
+            return (f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+                    if seconds >= 3600 else f"{seconds // 60}m{seconds % 60:02d}s")
+
+        step_txt = f" step {self.step}" if self.step is not None else ""
+        get_logger().info(
+            f"[progress]{step_txt} {self.desc}: {self.current}/{self.total} "
+            f"({percent}%) | {rate * 60:.1f}/min | elapsed {_fmt(elapsed)} | "
+            f"eta {_fmt(eta_s)}")
+        self._last_logged_percent = percent
+        self._last_line_time = now
+
+    def stall_tick(self, inflight: int = 0, scoring: int = 0):
+        """Heartbeat when NO work completed in the wait window (2026-07-29).
+
+        update() only logs on completions, so a stalled tail was silent
+        exactly when visibility mattered most. Rate-limited to one line per
+        heartbeat window.
+        """
+        now = self._time.time() if hasattr(self, "_time") else None
+        if now is None:
+            return
+        if now - self._last_line_time < self._heartbeat_s:
+            return
+        elapsed = max(now - self._start_time, 1e-6)
+        step_txt = f" step {self.step}" if self.step is not None else ""
+        get_logger().info(
+            f"[progress]{step_txt} {self.desc}: {self.current}/{self.total} "
+            f"— NO completions in the last {int(self._heartbeat_s)}s "
+            f"(inflight {inflight}, scoring {scoring}, "
+            f"elapsed {int(elapsed) // 60}m{int(elapsed) % 60:02d}s)")
+        self._last_line_time = now
 
     def set_postfix(self, postfix: dict[str, Any]):
         self._postfix = postfix

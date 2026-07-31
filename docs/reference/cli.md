@@ -36,6 +36,69 @@ Options:
 
 - `--hub_token <token>`: optional, Hugging Face token for private model access
 
+### `grpo`
+
+GRPO RL training with vLLM and the trainer on **disjoint** GPU sets, communicating
+over the filesystem.
+
+```bash
+surogate grpo --train examples/grpo/train.yaml --infer examples/grpo/infer.yaml --orch examples/grpo/orch.yaml \
+    --vllm-gpus 0,1 --trainer-gpus 2,3
+```
+
+Options:
+
+- `--train <path>`: required, trainer config YAML
+- `--infer <path>`: required, vLLM inference config YAML
+- `--orch <path>`: required, orchestrator config YAML
+- `--vllm-gpus <ids>`: required, comma-separated GPU ids for vLLM. Count must equal `infer.dp * infer.tp`
+- `--trainer-gpus <ids>`: required, comma-separated GPU ids for the trainer. Count must equal `train.gpus`, which
+  therefore becomes optional in the YAML
+- `--judge-infer <path>`: optional, inference config for a RULER judge server. With `--judge-gpus` and
+  `ruler.enabled: true` in `orch.yaml`, a second vLLM subprocess is spawned for the judge
+- `--judge-gpus <ids>`: optional, GPU ids for the judge. Must be disjoint from `--vllm-gpus` and `--trainer-gpus`
+
+### `grpo-colocate`
+
+Same three configs, but vLLM and the trainer **share** GPUs and exchange base weights
+via zero-copy CUDA IPC. `gpu_memory_utilization` is computed automatically.
+
+```bash
+surogate grpo-colocate --train examples/grpo/train.yaml --infer examples/grpo/infer.yaml --orch examples/grpo/orch.yaml
+```
+
+Options: `--train`, `--infer`, `--orch` (all required). No GPU-assignment flags — the
+components share every visible GPU.
+
+### `grpo-infer`
+
+Runs only the inference server. Use it for multi-node setups, or any case where each
+component should own its process. This is the server that exposes the weight-update and
+LoRA hot-load admin routes the trainer broadcasts into — a stock `vllm serve` does not.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 surogate grpo-infer infer.yaml
+```
+
+### `grpo-orch`
+
+Runs only the orchestrator: samples rollouts against the environments, scores them, and
+writes batches to the transport.
+
+```bash
+surogate grpo-orch orch.yaml
+```
+
+### `grpo-train`
+
+Runs only the trainer: consumes batches, applies GRPO updates, and broadcasts weights.
+Resumes from the latest checkpoint in `checkpoint_dir` automatically — see
+[GRPO (RL) Settings](config.md#grpo-rl-settings).
+
+```bash
+CUDA_VISIBLE_DEVICES=1 surogate grpo-train train.yaml
+```
+
 ### `pt`
 
 Pretraining.
