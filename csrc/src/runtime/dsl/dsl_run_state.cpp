@@ -323,6 +323,8 @@ DslRunState::DslRunState(const PretrainedConfig& config,
       mCpuTraining(options.CpuTraining),
       mNumLayers(config.NumLayers),
       mPerLayerGraphsEnabled(options.UseCudaGraphs) {
+    mGrpoTokenCapacity =
+        static_cast<long>(B) * static_cast<long>(T) * std::max(1, options.SequenceChunks);
     if (!mAllocator) {
         throw std::runtime_error("DslRunState: allocator is null");
     }
@@ -1063,28 +1065,31 @@ void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {
         }
     }
 
-    mGrpoNativeScratch.max_tokens = BT;
-    mGrpoNativeScratch.max_samples = BT;
+    // Chunked GRPO holds the FULL packed sequence's arrays on device while
+    // the graph executes chunk windows (B*T is the CHUNK size then).
+    const long BT_grpo = mGrpoTokenCapacity > 0 ? mGrpoTokenCapacity : BT;
+    mGrpoNativeScratch.max_tokens = BT_grpo;
+    mGrpoNativeScratch.max_samples = BT_grpo;
     mGrpoNativeScratch.inference_logprobs =
-        mAllocator->allocate(ETensorDType::FP32, "grpo_inference_logprobs", EAllocationType::ON_DEVICE, {BT});
+        mAllocator->allocate(ETensorDType::FP32, "grpo_inference_logprobs", EAllocationType::ON_DEVICE, {BT_grpo});
     mGrpoNativeScratch.advantages =
-        mAllocator->allocate(ETensorDType::FP32, "grpo_advantages", EAllocationType::ON_DEVICE, {BT});
+        mAllocator->allocate(ETensorDType::FP32, "grpo_advantages", EAllocationType::ON_DEVICE, {BT_grpo});
     mGrpoNativeScratch.teacher_logprobs =
-        mAllocator->allocate(ETensorDType::FP32, "grpo_teacher_logprobs", EAllocationType::ON_DEVICE, {BT});
+        mAllocator->allocate(ETensorDType::FP32, "grpo_teacher_logprobs", EAllocationType::ON_DEVICE, {BT_grpo});
     mGrpoNativeScratch.loss_mask =
-        mAllocator->allocate(ETensorDType::BYTE, "grpo_loss_mask", EAllocationType::ON_DEVICE, {BT});
+        mAllocator->allocate(ETensorDType::BYTE, "grpo_loss_mask", EAllocationType::ON_DEVICE, {BT_grpo});
     mGrpoNativeScratch.sample_starts =
-        mAllocator->allocate(ETensorDType::INT32, "grpo_sample_starts", EAllocationType::ON_DEVICE, {BT});
+        mAllocator->allocate(ETensorDType::INT32, "grpo_sample_starts", EAllocationType::ON_DEVICE, {BT_grpo});
     mGrpoNativeScratch.sample_ends =
-        mAllocator->allocate(ETensorDType::INT32, "grpo_sample_ends", EAllocationType::ON_DEVICE, {BT});
+        mAllocator->allocate(ETensorDType::INT32, "grpo_sample_ends", EAllocationType::ON_DEVICE, {BT_grpo});
     mGrpoNativeScratch.pair_chosen =
-        mAllocator->allocate(ETensorDType::INT32, "grpo_pair_chosen", EAllocationType::ON_DEVICE, {BT});
+        mAllocator->allocate(ETensorDType::INT32, "grpo_pair_chosen", EAllocationType::ON_DEVICE, {BT_grpo});
     mGrpoNativeScratch.pair_rejected =
-        mAllocator->allocate(ETensorDType::INT32, "grpo_pair_rejected", EAllocationType::ON_DEVICE, {BT});
+        mAllocator->allocate(ETensorDType::INT32, "grpo_pair_rejected", EAllocationType::ON_DEVICE, {BT_grpo});
     mGrpoNativeScratch.custom_dloss =
         mAllocator->allocate(ETensorDType::FP32, "grpo_custom_dloss", EAllocationType::ON_DEVICE, {BT});
     mGrpoNativeScratch.inv_temperature =
-        mAllocator->allocate(ETensorDType::FP32, "grpo_inv_temperature", EAllocationType::ON_DEVICE, {BT});
+        mAllocator->allocate(ETensorDType::FP32, "grpo_inv_temperature", EAllocationType::ON_DEVICE, {BT_grpo});
     mGrpoNativeScratch.metrics =
         mAllocator->allocate(ETensorDType::FP32, "grpo_metrics", EAllocationType::ON_DEVICE, {11});
     mGrpoNativeScratch.host_metrics =
@@ -1095,42 +1100,42 @@ void DslRunState::allocate_scratch_buffers(const PretrainedConfig& cfg) {
             mAllocator->allocate(ETensorDType::FP32,
                                  ("grpo_host_inference_logprobs_" + suffix).c_str(),
                                  EAllocationType::PINNED,
-                                 {BT});
+                                 {BT_grpo});
         mGrpoNativeScratch.host_advantages[slot] = mAllocator->allocate(ETensorDType::FP32,
                                                                         ("grpo_host_advantages_" + suffix).c_str(),
                                                                         EAllocationType::PINNED,
-                                                                        {BT});
+                                                                        {BT_grpo});
         mGrpoNativeScratch.host_teacher_logprobs[slot] =
             mAllocator->allocate(ETensorDType::FP32,
                                  ("grpo_host_teacher_logprobs_" + suffix).c_str(),
                                  EAllocationType::PINNED,
-                                 {BT});
+                                 {BT_grpo});
         mGrpoNativeScratch.host_temperatures[slot] = mAllocator->allocate(ETensorDType::FP32,
                                                                           ("grpo_host_temperatures_" + suffix).c_str(),
                                                                           EAllocationType::PINNED,
-                                                                          {BT});
+                                                                          {BT_grpo});
         mGrpoNativeScratch.host_loss_mask[slot] = mAllocator->allocate(ETensorDType::BYTE,
                                                                        ("grpo_host_loss_mask_" + suffix).c_str(),
                                                                        EAllocationType::PINNED,
-                                                                       {BT});
+                                                                       {BT_grpo});
         mGrpoNativeScratch.host_sample_starts[slot] =
             mAllocator->allocate(ETensorDType::INT32,
                                  ("grpo_host_sample_starts_" + suffix).c_str(),
                                  EAllocationType::PINNED,
-                                 {BT});
+                                 {BT_grpo});
         mGrpoNativeScratch.host_sample_ends[slot] = mAllocator->allocate(ETensorDType::INT32,
                                                                          ("grpo_host_sample_ends_" + suffix).c_str(),
                                                                          EAllocationType::PINNED,
-                                                                         {BT});
+                                                                         {BT_grpo});
         mGrpoNativeScratch.host_pair_chosen[slot] = mAllocator->allocate(ETensorDType::INT32,
                                                                          ("grpo_host_pair_chosen_" + suffix).c_str(),
                                                                          EAllocationType::PINNED,
-                                                                         {BT});
+                                                                         {BT_grpo});
         mGrpoNativeScratch.host_pair_rejected[slot] =
             mAllocator->allocate(ETensorDType::INT32,
                                  ("grpo_host_pair_rejected_" + suffix).c_str(),
                                  EAllocationType::PINNED,
-                                 {BT});
+                                 {BT_grpo});
     }
 
     // Encoder backward scratch buffers - skip in LoRA-only mode since embedding backward is skipped entirely

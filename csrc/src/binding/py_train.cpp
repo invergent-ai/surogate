@@ -638,6 +638,12 @@ void copy_chunk_inputs_for_ctx(IModel& model,
     }
 }
 
+/// Defined further down beside the GRPO chunked step; declared here — inside
+/// the SAME anonymous namespace as that definition, so this is a declaration
+/// of it rather than a second overload — because the SFT chunked path needs
+/// the same packed-doc window metadata.
+IModel::ChunkPackMeta chunk_pack_meta_from_positions(const std::int32_t* pr, int T, long base_pos);
+
 }  // namespace
 
 void MultiGPUPyTrainer::step_chunked(const std::int32_t* inputs,
@@ -667,13 +673,19 @@ void MultiGPUPyTrainer::step_chunked(const std::int32_t* inputs,
     // Phase A — KV sweep: forward chunks left-to-right filling the per-layer
     // attention KV caches. Saved-tensor persistence is skipped; the loss op
     // lives in backward, so this pass pays layers only.
+    // Every chunk is swept: unlike the GRPO path there are no per-sample end
+    // offsets here to prove a tail chunk is all padding, and Phase B below
+    // walks the full range — the two passes must cover the same chunks.
     for (int c = 0; c < seq_chunks; ++c) {
         copy_chunk(c);
         const int micro_eff = mTrainMicroStep * seq_chunks + c;
-        run_work([c, seq_chunks, micro_eff](sThreadContext& ctx) {
-            ctx.Model->set_sequence_chunk(c, seq_chunks);
+        const long base_pos_a = static_cast<long>(c) * T;
+        run_work([c, seq_chunks, micro_eff, base_pos_a, this](sThreadContext& ctx) {
             Tensor in = ctx.Model->get_input_buffer();
             Tensor pos = ctx.Model->get_position_ids_buffer();
+            const auto meta = chunk_pack_meta_from_positions(pos.get<std::int32_t>(),
+                                                            static_cast<int>(this->T), base_pos_a);
+            ctx.Model->set_sequence_chunk(c, seq_chunks, &meta);
             ctx.Model->forward_no_save(in, pos, *ctx.Communicator, micro_eff);
         });
     }
@@ -3387,7 +3399,16 @@ void MultiGPUPyTrainer::step_grpo_native(const std::int32_t* inputs,
                                          float ipo_mask_high,
                                          float adv_tau,
                                          float teacher_tau,
-                                         float kl_tau) {
+                                         float kl_tau,
+                                         float ratio_clip) {
+    if (mOptions.SequenceChunks > 1) {
+        step_grpo_native_chunked(inputs, targets, inference_logprobs, advantages, loss_mask,
+                                 sample_starts, sample_ends, sample_count, position_ids,
+                                 temperatures, teacher_logprobs, loss_scale, ipo_mask_low,
+                                 ipo_mask_high, adv_tau, teacher_tau, kl_tau, ratio_clip,
+                                 mOptions.SequenceChunks);
+        return;
+    }
     const int ep_size = std::max(1, mOptions.EPSize);
     for (int i = 0; i < (int)mContexts.size(); ++i) {
         auto& ctx = mContexts.at(i);
@@ -3426,6 +3447,7 @@ void MultiGPUPyTrainer::step_grpo_native(const std::int32_t* inputs,
         .adv_tau = adv_tau,
         .teacher_tau = teacher_tau,
         .kl_tau = kl_tau,
+        .ratio_clip = ratio_clip,
     };
 
     run_work([micro_idx = mTrainMicroStep,
@@ -3475,6 +3497,197 @@ void MultiGPUPyTrainer::step_grpo_native(const std::int32_t* inputs,
                                     teacher_logprobs);
     });
 
+    ++mTrainMicroStep;
+}
+
+
+namespace {
+/// Chunk-local document geometry from sliced positions (identical logic to
+/// validate_chunked): position resets mark packed-sample starts; win_start
+/// clamps a row-initial document continued from a previous row.
+IModel::ChunkPackMeta chunk_pack_meta_from_positions(const std::int32_t* pr, int T, long base_pos) {
+    IModel::ChunkPackMeta m;
+    const int t0 = static_cast<int>(base_pos);
+    m.win_start = std::max(0, t0 - pr[0]);
+    m.cu_q = {0};
+    m.cu_k = {0};
+    int seg_start = 0;
+    int doc_start_rel = m.win_start - t0;
+    auto close_seg = [&](int seg_end) {
+        const int q_len = seg_end - seg_start;
+        const int k_len = seg_end - doc_start_rel;
+        m.cu_q.push_back(m.cu_q.back() + q_len);
+        m.cu_k.push_back(m.cu_k.back() + k_len);
+        m.max_q = std::max(m.max_q, q_len);
+        m.max_k = std::max(m.max_k, k_len);
+    };
+    for (int t = 1; t < T; ++t) {
+        if (pr[t] != pr[t - 1] + 1) {
+            close_seg(t);
+            seg_start = t;
+            doc_start_rel = t;
+        }
+    }
+    close_seg(T);
+    m.num_segs = static_cast<int>(m.cu_q.size()) - 1;
+    m.kv_len = t0 + static_cast<int>(T) - m.win_start;
+    return m;
+}
+}  // namespace
+
+void MultiGPUPyTrainer::step_grpo_native_chunked(const std::int32_t* inputs,
+                                                 const std::int32_t* targets,
+                                                 const float* inference_logprobs,
+                                                 const float* advantages,
+                                                 const std::uint8_t* loss_mask,
+                                                 const std::int32_t* sample_starts,
+                                                 const std::int32_t* sample_ends,
+                                                 int sample_count,
+                                                 const std::int32_t* position_ids,
+                                                 const float* temperatures,
+                                                 const float* teacher_logprobs,
+                                                 float loss_scale,
+                                                 float ipo_mask_low,
+                                                 float ipo_mask_high,
+                                                 float adv_tau,
+                                                 float teacher_tau,
+                                                 float kl_tau,
+                                                 float ratio_clip,
+                                                 int seq_chunks) {
+    if (mTrainMicroStep >= mGradAccumulation) {
+        throw std::runtime_error(fmt::format(
+            "step_grpo_native_chunked: micro_step {} >= grad_accumulation {}", mTrainMicroStep, mGradAccumulation));
+    }
+    const int ep_size = std::max(1, mOptions.EPSize);
+    const long T_full = static_cast<long>(T) * seq_chunks;
+    const int accum_eff = mGradAccumulation * seq_chunks;
+
+    // Skip all-padding tail chunks: with single-sample bins the real tokens
+    // end at max(sample_ends); chunks past that contribute nothing (their
+    // dloss is all zero) and cost a full re-forward+backward each.
+    long max_end = 0;
+    for (int s = 0; s < sample_count; ++s) {
+        max_end = std::max(max_end, static_cast<long>(sample_ends[s]));
+    }
+    const int chunks_occupied =
+        std::max(1, std::min(seq_chunks, static_cast<int>((max_end + T - 1) / T)));
+
+    const dsl::GrpoNativeLossConfig loss_config{
+        .loss_scale = loss_scale,
+        .ipo_mask_low = ipo_mask_low,
+        .ipo_mask_high = ipo_mask_high,
+        .adv_tau = adv_tau,
+        .teacher_tau = teacher_tau,
+        .kl_tau = kl_tau,
+        .ratio_clip = ratio_clip,
+    };
+
+    auto copy_chunk = [&](int c) {
+        const long base_pos = static_cast<long>(c) * T;
+        for (int i = 0; i < static_cast<int>(mContexts.size()); ++i) {
+            auto& ctx = mContexts.at(i);
+            if (!ctx.Model) {
+                throw std::runtime_error(fmt::format("step_grpo_native_chunked: ctx[{}].Model is null", i));
+            }
+            const int src_row = host_batch_row_for_local_rank(i, ep_size);
+            copy_chunk_inputs_for_ctx(*ctx.Model, inputs, targets, position_ids, src_row, B, T, T_full, base_pos);
+        }
+    };
+
+    // Upload the FULL sequence's GRPO arrays once per micro-batch. Sample
+    // ranges are global; the per-chunk kernel windows into them.
+    run_work([inference_logprobs,
+              advantages,
+              loss_mask,
+              sample_starts,
+              sample_ends,
+              sample_count,
+              temperatures,
+              teacher_logprobs,
+              T_full,
+              zero_metrics = (mTrainMicroStep == 0),
+              B = this->B](sThreadContext& ctx) {
+        auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+        if (!dsl_model) {
+            throw std::runtime_error("step_grpo_native_chunked: model is not a DslModel");
+        }
+        const int gpu_rank = ctx.Communicator->local_rank();
+        const int gpu_ep_size = ctx.Communicator->ep_size();
+        const int src_row = host_batch_row_for_local_rank(gpu_rank, gpu_ep_size);
+        const float* temps_for_this_gpu = nullptr;
+        if (temperatures) {
+            temps_for_this_gpu = temperatures + static_cast<std::ptrdiff_t>(src_row) * B * T_full;
+        }
+        dsl_model->grpo_native_upload_full(inference_logprobs,
+                                           advantages,
+                                           loss_mask,
+                                           sample_starts,
+                                           sample_ends,
+                                           sample_count,
+                                           static_cast<long>(B) * T_full,
+                                           zero_metrics,
+                                           temps_for_this_gpu,
+                                           teacher_logprobs);
+    });
+
+    // Phase A — KV sweep: forward chunks left-to-right filling the per-layer
+    // attention KV caches (saved-tensor persistence skipped).
+    for (int c = 0; c < chunks_occupied; ++c) {
+        copy_chunk(c);
+        const int micro_eff = mTrainMicroStep * seq_chunks + c;
+        const long base_pos_a = static_cast<long>(c) * T;
+        run_work([c, seq_chunks, micro_eff, base_pos_a, this](sThreadContext& ctx) {
+            Tensor in = ctx.Model->get_input_buffer();
+            Tensor pos = ctx.Model->get_position_ids_buffer();
+            const auto meta = chunk_pack_meta_from_positions(pos.get<std::int32_t>(),
+                                                            static_cast<int>(this->T), base_pos_a);
+            ctx.Model->set_sequence_chunk(c, seq_chunks, &meta);
+            ctx.Model->forward_no_save(in, pos, *ctx.Communicator, micro_eff);
+        });
+    }
+
+    // Phase B — reverse re-forward + windowed GRPO dloss + backward. dK/dV
+    // accumulate across chunks exactly as in step_chunked.
+    run_work([](sThreadContext& ctx) { ctx.Model->zero_sequence_chunk_dkv(); });
+    const bool has_temps = temperatures != nullptr;
+    const bool has_teacher = teacher_logprobs != nullptr;
+    for (int c = chunks_occupied - 1; c >= 0; --c) {
+        copy_chunk(c);
+        const int micro_eff = mTrainMicroStep * seq_chunks + (seq_chunks - 1 - c);
+        const long window_start = static_cast<long>(c) * T;
+        run_work([c,
+                  seq_chunks,
+                  micro_eff,
+                  accum_eff,
+                  window_start,
+                  sample_count,
+                  loss_config,
+                  has_temps,
+                  has_teacher](sThreadContext& ctx) {
+            auto* dsl_model = dynamic_cast<dsl::DslModel*>(ctx.Model.get());
+            if (!dsl_model) {
+                throw std::runtime_error("step_grpo_native_chunked: model is not a DslModel");
+            }
+            Tensor in = ctx.Model->get_input_buffer();
+            Tensor pos = ctx.Model->get_position_ids_buffer();
+            Tensor tgt = ctx.Model->get_target_buffer();
+            const auto meta = chunk_pack_meta_from_positions(pos.get<std::int32_t>(),
+                                                            static_cast<int>(in.Sizes[1]), window_start);
+            ctx.Model->set_sequence_chunk(c, seq_chunks, &meta);
+            dsl_model->step_grpo_native_window(in,
+                                               pos,
+                                               tgt,
+                                               window_start,
+                                               sample_count,
+                                               accum_eff,
+                                               micro_eff,
+                                               *ctx.Communicator,
+                                               loss_config,
+                                               has_temps,
+                                               has_teacher);
+        });
+    }
+    run_work([](sThreadContext& ctx) { ctx.Model->set_sequence_chunk(-1, 0); });
     ++mTrainMicroStep;
 }
 

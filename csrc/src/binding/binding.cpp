@@ -2033,7 +2033,8 @@ NB_MODULE(_surogate, m) {
                float ipo_mask_high,
                float adv_tau,
                float teacher_tau,
-               float kl_tau) {
+               float kl_tau,
+               float ratio_clip) {
                 if (sample_starts.shape(0) != sample_ends.shape(0)) {
                     throw std::invalid_argument("sample_starts and sample_ends must have the same length");
                 }
@@ -2069,7 +2070,8 @@ NB_MODULE(_surogate, m) {
                                           ipo_mask_high,
                                           adv_tau,
                                           teacher_tau,
-                                          kl_tau);
+                                          kl_tau,
+                                          ratio_clip);
             },
             nb::arg("input_ids"),
             nb::arg("targets"),
@@ -2087,6 +2089,7 @@ NB_MODULE(_surogate, m) {
             nb::arg("adv_tau") = 1.0f,
             nb::arg("teacher_tau") = 0.0f,
             nb::arg("kl_tau") = 1.0e-3f,
+            nb::arg("ratio_clip") = 7.389056f,
             "Run one GRPO training micro-step with native CUDA per-token gradient generation.")
         .def(
             "backward_grpo",

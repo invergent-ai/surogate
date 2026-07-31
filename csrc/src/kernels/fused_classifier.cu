@@ -1532,7 +1532,14 @@ __global__ void grpo_custom_dloss_kernel(float* custom_dloss,
                                          float ipo_mask_high,
                                          float adv_tau,
                                          float teacher_tau,
-                                         float kl_tau) {
+                                         float kl_tau,
+                                         float ratio_clip,
+                                         long window_start) {
+    // Chunked-sequence GRPO: `losses`/`custom_dloss` are CHUNK-local buffers
+    // covering global slots [window_start, window_start + BT); the per-token
+    // arrays (inference_logprobs/advantages/loss_mask) and sample ranges are
+    // GLOBAL over the full packed sequence. window_start == 0 with BT = full
+    // sequence reproduces the unchunked behavior exactly.
     __shared__ float reductions[GRPO_METRIC_COUNT][256];
 
     const int sample_idx = static_cast<int>(blockIdx.x);
@@ -1542,7 +1549,14 @@ __global__ void grpo_custom_dloss_kernel(float* custom_dloss,
 
     const int start = sample_starts[sample_idx];
     const int end = sample_ends[sample_idx];
-    if (start < 0 || end > BT || start >= end) {
+    const long window_end = window_start + static_cast<long>(BT);
+    if (start < 0 || start >= end) {
+        return;
+    }
+    // Intersect this sample with the chunk window; empty slices exit early.
+    const long lo = start > window_start ? start : window_start;
+    const long hi = static_cast<long>(end) < window_end ? static_cast<long>(end) : window_end;
+    if (lo >= hi) {
         return;
     }
 
@@ -1559,19 +1573,20 @@ __global__ void grpo_custom_dloss_kernel(float* custom_dloss,
     float masked_count = 0.0f;
     float unmasked_count = 0.0f;
 
-    for (int out_idx = start + static_cast<int>(threadIdx.x); out_idx < end; out_idx += static_cast<int>(blockDim.x)) {
+    for (long out_idx = lo + static_cast<long>(threadIdx.x); out_idx < hi; out_idx += static_cast<long>(blockDim.x)) {
+        const long local_idx = out_idx - window_start;  // chunk-local slot
         if (out_idx + 1 >= end) {
-            custom_dloss[out_idx] = 0.0f;
+            custom_dloss[local_idx] = 0.0f;
             continue;
         }
 
-        const int logical_idx = out_idx + 1;
+        const long logical_idx = out_idx + 1;
         if (loss_mask[logical_idx] == 0) {
-            custom_dloss[out_idx] = 0.0f;
+            custom_dloss[local_idx] = 0.0f;
             continue;
         }
 
-        const float trainer_logprob = -losses[out_idx];
+        const float trainer_logprob = -losses[local_idx];
         const float inference_logprob = inference_logprobs[logical_idx];
         const float log_importance_ratio = trainer_logprob - inference_logprob;
         const float importance_ratio = expf(log_importance_ratio);
@@ -1589,8 +1604,12 @@ __global__ void grpo_custom_dloss_kernel(float* custom_dloss,
             teacher_kl_sum += teacher_kl;
         }
         if (keep) {
-            dloss += scaled_advantage * importance_ratio;
-            policy_sum -= scaled_advantage * importance_ratio;
+            // Gradient uses the CAPPED ratio (GRPOLossConfig.ratio_clip);
+            // mismatch metrics below keep the uncapped value so staleness
+            // monitoring sees real drift.
+            const float capped_ratio = fminf(importance_ratio, ratio_clip);
+            dloss += scaled_advantage * capped_ratio;
+            policy_sum -= scaled_advantage * capped_ratio;
             keep_count += 1.0f;
             unmasked_mismatch_sum += importance_ratio - log_importance_ratio - 1.0f;
             unmasked_count += 1.0f;
@@ -1605,7 +1624,7 @@ __global__ void grpo_custom_dloss_kernel(float* custom_dloss,
         is_masked_low_sum += is_masked_low ? 1.0f : 0.0f;
         is_masked_high_sum += is_masked_high ? 1.0f : 0.0f;
         total_count += 1.0f;
-        custom_dloss[out_idx] = dloss * inv_loss_scale;
+        custom_dloss[local_idx] = dloss * inv_loss_scale;
     }
 
     reductions[GRPO_METRIC_POLICY_LOSS][threadIdx.x] = policy_sum;
@@ -1616,7 +1635,8 @@ __global__ void grpo_custom_dloss_kernel(float* custom_dloss,
     reductions[GRPO_METRIC_IS_MASKED_LOW][threadIdx.x] = is_masked_low_sum;
     reductions[GRPO_METRIC_IS_MASKED_HIGH][threadIdx.x] = is_masked_high_sum;
     reductions[GRPO_METRIC_TEACHER_KL][threadIdx.x] = teacher_kl_sum;
-    reductions[GRPO_METRIC_SAMPLE_COUNT][threadIdx.x] = total_count > 0.0f ? 1.0f : 0.0f;
+    reductions[GRPO_METRIC_SAMPLE_COUNT][threadIdx.x] =
+        (total_count > 0.0f && static_cast<long>(start) >= window_start) ? 1.0f : 0.0f;
     reductions[GRPO_METRIC_KEEP_TOKENS][threadIdx.x] = keep_count;
     reductions[GRPO_METRIC_TOTAL_TOKENS][threadIdx.x] = total_count;
     __syncthreads();
@@ -1646,7 +1666,9 @@ __global__ void grpo_custom_dloss_kernel(float* custom_dloss,
         if (teacher_logprobs) {
             atomicAdd(metrics + GRPO_METRIC_TEACHER_KL, reductions[GRPO_METRIC_TEACHER_KL][0] / sample_total);
         }
-        atomicAdd(metrics + GRPO_METRIC_SAMPLE_COUNT, 1.0f);
+        if (static_cast<long>(start) >= window_start) {
+            atomicAdd(metrics + GRPO_METRIC_SAMPLE_COUNT, 1.0f);
+        }
         atomicAdd(metrics + GRPO_METRIC_KEEP_TOKENS, reductions[GRPO_METRIC_KEEP_TOKENS][0]);
         atomicAdd(metrics + GRPO_METRIC_TOTAL_TOKENS, sample_total);
     }
@@ -1669,6 +1691,8 @@ void compute_grpo_custom_dloss(float* custom_dloss,
                                float adv_tau,
                                float teacher_tau,
                                float kl_tau,
+                               float ratio_clip,
+                               long window_start,
                                cudaStream_t stream) {
     if (sample_count <= 0 || BT <= 0) {
         return;
@@ -1691,7 +1715,9 @@ void compute_grpo_custom_dloss(float* custom_dloss,
                                                                ipo_mask_high,
                                                                adv_tau,
                                                                teacher_tau,
-                                                               kl_tau);
+                                                               kl_tau,
+                                                               ratio_clip,
+                                                               window_start);
     CUDA_CHECK(cudaGetLastError());
 }
 

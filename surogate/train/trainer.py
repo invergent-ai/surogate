@@ -10,6 +10,10 @@ import numpy as np
 
 from surogate import _surogate
 from surogate.core.config.sft_config import SFTConfig
+from surogate.train.adapter_init import (
+    configure_initial_adapter,
+    import_initial_trainable_adapter,
+)
 from surogate.train.early_stopping import EarlyStopping
 from surogate.train.gradient_tracker import GradientTracker
 from surogate.train.loss_guard import LossGuard
@@ -466,10 +470,9 @@ class SurogateTrainerWrapper:
                         if not Path(base_weights_path).exists():
                             base_weights_path = config.model_dir
                 logger.info(f"Importing base model weights from {base_weights_path}...")
-                if config.adapter_path:
-                    logger.info(f"Merging adapter from {config.adapter_path} into base weights...")
-                    self.trainer.set_adapter_path(config.adapter_path)
+                initial_adapter = configure_initial_adapter(config, self.trainer, fresh_run=False)
                 self.trainer.import_weights(base_weights_path)
+                import_initial_trainable_adapter(self.trainer, initial_adapter)
                 logger.info(f"Loading checkpoint from step {self.start_step}...")
                 if config.lora:
                     ensure_surogate_lora_compat(
@@ -497,10 +500,9 @@ class SurogateTrainerWrapper:
                     lora_config=config.lora_config,
                     qlora_config=config.qlora_config,
                 )
-                if config.adapter_path:
-                    logger.info(f"Merging adapter from {config.adapter_path} into base weights...")
-                    self.trainer.set_adapter_path(config.adapter_path)
+                initial_adapter = configure_initial_adapter(config, self.trainer, fresh_run=True)
                 self.trainer.import_weights(model_weights_path)
+                import_initial_trainable_adapter(self.trainer, initial_adapter)
 
             elif config.from_scratch:
                 self.trainer = _surogate.SurogateTrainer(

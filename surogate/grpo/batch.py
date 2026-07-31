@@ -73,19 +73,31 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
 
 
 def packed_samples_into_micro_bs(
-    samples: list[tuple[int, MicroBatch]], max_seq_len: int, num_loras: int
+    samples: list[tuple[int, MicroBatch]],
+    max_seq_len: int,
+    num_loras: int,
+    single_sample_bins: bool = False,
 ) -> list[MicroBatch]:
     """Pack samples into micro-batches using First Fit Decreasing.
 
     Minimizes padding while never truncating. Multimodal samples are
     NOT packed together (variable-sized vision data).
+
+    `single_sample_bins` disables packing entirely — one sample per
+    micro-batch. Required for chunked-sequence GRPO: packed-document
+    isolation does not exist in the chunked TRAINING attention path
+    (kvprefix doc metadata is eval-only), so multi-sample rows would
+    attend across sample boundaries (measured 2026-07-27: B-grad cosine
+    0.5 vs unchunked). Tail padding chunks are skipped natively, so the
+    cost is bounded by pad_to_multiple_of, not seq_len.
     """
     samples.sort(key=lambda x: (x[0], -len(x[1].input_ids)))
 
     micro_batches: list[MicroBatch] = []
 
     for idx, sample in samples:
-        for bin_content in micro_batches:
+        bins = [] if single_sample_bins else micro_batches
+        for bin_content in bins:
             if len(bin_content.input_ids) + len(sample.input_ids) <= max_seq_len:
                 bin_len_before = len(bin_content.input_ids)
                 bin_content.input_ids.extend(sample.input_ids)
@@ -145,6 +157,7 @@ def prepare_batch(
     idxs: list[int],
     num_loras: int,
     pad_to_multiple_of: int = 1,
+    single_sample_bins: bool = False,
 ) -> list[list[MicroBatch]]:
     """Prepare a batch of samples for each data-parallel worker.
 
@@ -153,7 +166,8 @@ def prepare_batch(
     """
     all_samples = [(idx, prepare_sample(rollout, seq_len)) for idx, rollout in zip(idxs, rollouts)]
 
-    micro_batches = packed_samples_into_micro_bs(all_samples, seq_len, num_loras)
+    micro_batches = packed_samples_into_micro_bs(
+        all_samples, seq_len, num_loras, single_sample_bins=single_sample_bins)
     micro_batches = [pad_micro_batch(micro_batch, pad_to_multiple_of) for micro_batch in micro_batches]
 
     num_padding_batch = -len(micro_batches) % num_train_workers

@@ -20,3 +20,22 @@ def test_unset_scalars_are_dropped_so_vllm_defaults_apply():
     ns = cfg.to_vllm()
     assert not hasattr(ns, "max_num_seqs")
     assert not hasattr(ns, "kv_cache_dtype")
+
+
+def test_attention_backend_is_forwarded_to_vllm() -> None:
+    cfg = GRPOInferenceConfig(
+        DictDefault(
+            {
+                "model": "local-model",
+                "attention_backend": "TORCH_SDPA",
+                "enforce_eager": True,
+                "enable_prefix_caching": False,
+            }
+        )
+    )
+
+    args = cfg.to_vllm()
+
+    assert args.attention_backend == "TORCH_SDPA"
+    assert args.enforce_eager is True
+    assert args.enable_prefix_caching is False

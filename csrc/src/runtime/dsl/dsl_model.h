@@ -60,6 +60,7 @@ struct GrpoNativeLossConfig {
     float adv_tau = 1.0f;
     float teacher_tau = 0.0f;
     float kl_tau = 1.0e-3f;
+    float ratio_clip = 7.389056f;  // e^2 cap on the PG importance ratio
 };
 
 struct GrpoNativeMetrics {
@@ -441,6 +442,35 @@ public:
                           const GrpoNativeLossConfig& loss_config,
                           const float* temperatures_cpu = nullptr,
                           const float* teacher_logprobs_cpu = nullptr);
+
+    /// Chunked-sequence GRPO (mirrors MultiGPUPyTrainer::step_chunked).
+    /// Upload the FULL packed sequence's per-token arrays and sample ranges
+    /// once per micro-batch, then execute per-chunk windows: re-forward the
+    /// chunk, seed its backward with the GRPO custom dloss computed over the
+    /// window (kernel reads the full arrays at global coordinates), backward.
+    /// Caller manages set_sequence_chunk()/forward_no_save() phases exactly
+    /// like the SFT chunked step.
+    void grpo_native_upload_full(const float* inference_logprobs_cpu,
+                                 const float* advantages_cpu,
+                                 const std::uint8_t* loss_mask_cpu,
+                                 const std::int32_t* sample_starts_cpu,
+                                 const std::int32_t* sample_ends_cpu,
+                                 int sample_count,
+                                 long total_tokens,
+                                 bool zero_metrics,
+                                 const float* temperatures_cpu = nullptr,
+                                 const float* teacher_logprobs_cpu = nullptr);
+    void step_grpo_native_window(Tensor inputs,
+                                 Tensor position_ids,
+                                 Tensor targets,
+                                 long window_start,
+                                 int sample_count,
+                                 int grad_accum_steps,
+                                 int micro_step,
+                                 NCCLCommunicator& comm,
+                                 const GrpoNativeLossConfig& loss_config,
+                                 bool has_temperatures,
+                                 bool has_teacher_logprobs);
     GrpoNativeMetrics consume_grpo_native_metrics();
 
     /// Knowledge-distillation training step: standard SFT forward + backward

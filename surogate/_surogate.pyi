@@ -1456,6 +1456,8 @@ class SurogateTrainer:
         - path: Output directory path.
         - base_model_path: Optional path/name of base model for adapter_config.json.
         """
+    def import_adapter(self, file_name: str) -> None:
+        """Import PEFT LoRA weights into the trainable adapter state."""
     def compute_logprobs(
         self,
         input_ids: npt.NDArray[np.int32],
@@ -1630,6 +1632,8 @@ class SurogateTrainer:
 
         Returns: dict with keys {loss: float, norm: float}.
         """
+    def preflight_grpo_native_lora_gradient_norms(self, grad_clip: float) -> list[float]:
+        """Compute each replica's LoRA gradient norm without applying an optimizer update."""
     def train_step_graphed(
         self, inputs: npt.NDArray[np.int32], targets: npt.NDArray[np.int32], config: OptimizerConfig, step: int
     ) -> dict:
