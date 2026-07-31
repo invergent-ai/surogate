@@ -69,7 +69,9 @@ cmake.build-type = "Release"
 
 [tool.scikit-build.cmake.define]
 PYTHON_BINDING = "ON"
-USE_CUFILE = "OFF"
+# USE_CUFILE / REQUIRE_CUFILE are deliberately not set here: they default to ON in
+# csrc/CMakeLists.txt. An explicit USE_CUFILE = "OFF" here is what silently shipped
+# every released wheel without GPUDirect Storage.
 CMAKE_CUDA_ARCHITECTURES = {env="CUDAARCHS"}
 
 [tool.uv]

@@ -80,9 +80,13 @@ set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# As cuFile might not be supported everywhere (WSL; AMD), make it an optional dependency
-# with a fallback implementation
+# cuFile (GPUDirect Storage) is on by default and a missing cuFile is a build error:
+# hosts where GDS does not work (WSL, AMD, FUSE/network checkpoint storage, no nvidia-fs)
+# are handled at *runtime* by falling back to buffered reads, so they are not a reason to
+# build without it. Turn USE_CUFILE off only for a toolchain that has no cuFile headers
+# or library at all.
 option(USE_CUFILE "Enable cuFile support for optimized file I/O" ON)
+option(REQUIRE_CUFILE "Fail the build if USE_CUFILE is on but cuFile is not found" ON)
 option(USE_NVML "Enable nvml support for detailed GPU stats reporting" ON)
 option(PYTHON_BINDING "Build python bindings" ON)
 option(ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
@@ -223,6 +227,11 @@ if(USE_CUFILE)
     if(TARGET CUDA::cuFile)
         set(CUFILE_SOURCE src/utilities/cu_file.cpp)
         set(CUFILE_LIBS CUDA::cuFile)
+    elseif(REQUIRE_CUFILE)
+        message(FATAL_ERROR
+            "cuFile required but not found. Install the cuFile development package "
+            "(e.g. libcufile-dev-13-1) or configure with -DREQUIRE_CUFILE=OFF to build "
+            "without GPUDirect Storage.")
     else()
         set(USE_CUFILE 0)
         message(WARNING "cuFile requested but not found, disabling cuFile support")
