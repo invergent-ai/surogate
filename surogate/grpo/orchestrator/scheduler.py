@@ -433,7 +433,19 @@ class Scheduler:
             finished_tasks, _ = await asyncio.wait(
                 pending,
                 return_when=asyncio.FIRST_COMPLETED,
+                # Heartbeat timeout (2026-07-29): with no completions the
+                # progress tracker never ticks and the log goes silent for
+                # the exact stalls it should surface (observed: 14+ quiet
+                # minutes while the conductor queue was 60 deep). A timed
+                # wakeup emits a stall line instead.
+                timeout=60.0,
             )
+            if not finished_tasks:
+                pbar.stall_tick(
+                    inflight=self.inflight_rollout_count,
+                    scoring=len(self.scoring_tasks),
+                )
+                continue
             await self.checkpoint_ready.wait()
 
             for finished_task in finished_tasks:

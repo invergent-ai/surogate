@@ -41,6 +41,25 @@ If you use `uv`, prefix any of the above with `uv run`.
 
 Outputs (checkpoints, LoRA adapters, logs) are written under the trainer's `output_dir`.
 
+### Resuming an interrupted run
+
+The trainer resumes from its latest checkpoint automatically —
+`resume_from_checkpoint` defaults to `true`, and `checkpoint_dir` is where it
+looks. Re-run the same command and it picks up where it stopped:
+
+```
+Resuming from checkpoint step 5 (next batch: 6)
+```
+
+A checkpoint at step `S` means "trained through batch `S`", so the resumed run
+starts at `S + 1`. That one number drives everything downstream — which batch
+is packed, which batch is read from the transport, the LR schedule position,
+the save cadence, and the step number the broadcast weights are published
+under — so the orchestrator, which may already be waiting on the broadcast for
+step `S`, is unblocked rather than desynchronized.
+
+Set `resume_from_checkpoint: false` in `train.yaml` to force a fresh run.
+
 ## 4) Example Configuration
 
 A minimal setup using the **reverse-text** environment. With co-locate (`grpo-colocate`) this runs on a single GPU; with split (`grpo`) it runs on two GPUs (one for vLLM, one for the trainer):
@@ -82,6 +101,10 @@ noise_scheduler:
 model: Qwen/Qwen3-0.6B
 enable_lora: true
 max_lora_rank: 32
+
+# Optional; omit to use vLLM's own defaults.
+# max_num_seqs: 16      # concurrency cap — see "Serving memory" below
+# kv_cache_dtype: fp8   # halves KV bytes/token
 ```
 
 **`orch.yaml`**:
@@ -150,6 +173,20 @@ All precision options from SFT are available:
 - **BF16** (`recipe: bf16`): Maximum accuracy
 - **QLoRA**: Add `qlora_fp8: true`, `qlora_bnb: true`, or `qlora_fp4: true` for quantized base weights
 
+### Serving Memory
+
+Two `infer.yaml` keys decide whether a large policy plus LoRA fits:
+
+- **`max_num_seqs`** caps concurrent sequences and so sizes the CUDA-graph and
+  activation buffers. A 27B model served TP2 with `enable_lora: true` OOMs at
+  the vLLM default and fits at `16`. Lowering `gpu_memory_utilization` does
+  **not** help — it shrinks the budget those buffers draw from.
+- **`kv_cache_dtype: fp8`** halves KV bytes per token, raising sustainable
+  concurrency on a KV-bound server. It also perturbs sampled logprobs, which
+  feed GRPO's importance ratio, so check `mismatch_kl` after enabling it.
+
+Both default to unset, in which case vLLM's own defaults apply.
+
 ## 6) Advanced: Three-Process Mode
 
 For multi-node setups (or any case where you want each component in its own process), run three commands separately:
@@ -170,6 +207,25 @@ For single-host runs, prefer `surogate grpo` (split GPUs) or `surogate grpo-colo
 ## Notes
 
 - GRPO requires `vllm` to be installed for the inference server.
+- **Reading progress from a log file.** The orchestrator's rollout progress bar
+  is rendered by `tqdm`, which needs a TTY — under `nohup` or any redirect it
+  writes nothing useful. Alongside it, the orchestrator emits plain `[progress]`
+  lines carrying the same information, so a redirected log stays readable:
+
+  ```
+  [progress] step 11 Generating rollouts (train): 128/256 (50%) | 42.7/min | elapsed 3m00s | eta 3m00s
+  ```
+
+  A step that stops completing rollouts is reported explicitly instead of
+  falling silent:
+
+  ```
+  [progress] step 11 Generating rollouts (train): 128/256 — NO completions in the last 60s (inflight 64, scoring 3, elapsed 14m22s)
+  ```
+
+  That line is the signal to check the inference server: a deep queue, an
+  unresponsive engine, or rollouts erroring out all look identical from a
+  frozen progress bar.
 - The `model` field must match across all three config files.
 - `max_steps` in `train.yaml` and `orch.yaml` should match.
 

@@ -126,10 +126,18 @@ Surogate supports:
 - **Typical data:** Prompts + reward environments (math, code, custom verifiers)
 - **Typical run shape:** Iterative rollout → reward → gradient loop
 
-GRPO coordinates three components in a single command:
+GRPO coordinates three components — inference server, orchestrator, and trainer —
+in a single command. On two or more GPUs, assign each side its own:
 
 ```bash
-surogate grpo --train train.yaml --infer infer.yaml --orch orch.yaml
+surogate grpo --train train.yaml --infer infer.yaml --orch orch.yaml \
+    --vllm-gpus 0 --trainer-gpus 1
+```
+
+On a single GPU, co-locate them instead (they share base weights via CUDA IPC):
+
+```bash
+surogate grpo-colocate --train train.yaml --infer infer.yaml --orch orch.yaml
 ```
 
 ### When to use it

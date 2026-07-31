@@ -424,6 +424,77 @@ training-loop settings from the SFT config. `gradient_dtype` and the LoRA dtype
 default to FP32; the frozen base does not require an FP32 master copy. CUDA graphs
 are disabled because the native DPO step is not graph-captured.
 
+## GRPO (RL) Settings
+
+Online reinforcement learning (the `surogate grpo`, `grpo-colocate`, and
+`grpo-train` commands). `GRPOTrainConfig` extends the SFT config, so every
+model, LoRA, QLoRA, recipe, optimizer, checkpoint, and runtime option above
+applies unchanged. Data comes from the orchestrator over the transport rather
+than from `datasets`, which is forced empty. See the
+[RL Training guide](../guides/rl-training.md) and
+[Quickstart: GRPO](../getting-started/quickstart-grpo.md).
+
+### Trainer config (`train.yaml`)
+
+| Option                  | Type   | Default        | Description                                                                                     |
+| ----------------------- | ------ | -------------- | ----------------------------------------------------------------------------------------------- |
+| `transport_type`        | string | `"filesystem"` | How training batches arrive from the orchestrator: `filesystem` or `zmq`.                        |
+| `weight_broadcast_type` | string | `"filesystem"` | How updated weights reach the inference server: `filesystem` (disk), `nccl` (GPU broadcast), or `colocate` (zero-copy shared memory). |
+| `max_async_level`       | int    | `1`            | How many steps the orchestrator may run ahead of the trainer. `1` is one step of off-policy staleness. |
+| `pad_to_multiple_of`    | int    | `1`            | Padding multiple for packed micro-batches.                                                       |
+| `doc_masking`           | bool   | `true`         | Document-level attention masking so packed samples cannot attend across each other.              |
+| `turn_diagnostics`      | bool   | `false`        | Route the micro-step through the Python loss instead of the fused native step so per-token logprobs are visible. Same gradients, slower — measurement only. |
+
+`gradient_dtype` defaults to `fp32` for GRPO (the per-token gradient is 10-100x
+smaller than in SFT), while master weights follow the model dtype; precision
+where it matters comes from `lora_dtype`, which stays `fp32`.
+
+### GRPO loss (`loss:` block in `train.yaml`)
+
+| Option          | Type  | Default | Description                                                                     |
+| --------------- | ----- | ------- | --------------------------------------------------------------------------------- |
+| `ipo_mask_low`  | float | `0.2`   | Low threshold for masking tokens by probability difference.                       |
+| `ipo_mask_high` | float | `0.2`   | High threshold for masking tokens by probability difference.                      |
+| `adv_tau`       | float | `1.0`   | Advantage scaling.                                                                |
+| `teacher_tau`   | float | `0.0`   | Weight on the teacher term for on-policy distillation. `0.0` disables it.         |
+| `kl_tau`        | float | `1e-3`  | KL penalty coefficient. Raise if the policy diverges from the reference too fast. |
+
+### QeRL noise scheduler (`noise_scheduler:` block)
+
+| Option        | Type  | Default | Description                                                     |
+| ------------- | ----- | ------- | ----------------------------------------------------------------- |
+| `enabled`     | bool  | `false` | Add Gaussian noise to inference-model RMSNorm weights before rollouts. |
+| `sigma_start` | float | `5e-2`  | Initial noise standard deviation.                                 |
+| `sigma_end`   | float | `5e-4`  | Final noise standard deviation.                                   |
+| `num_stages`  | int   | `10`    | Number of geometric decay intervals between the two.              |
+
+### Inference server config (`infer.yaml`)
+
+Keys most often set; see the [RL Training guide](../guides/rl-training.md) for the full table.
+
+| Option                   | Type   | Default        | Description                                                                             |
+| ------------------------ | ------ | -------------- | ----------------------------------------------------------------------------------------- |
+| `model`                  | string | (required)     | HuggingFace model ID or local path. Must match `train.yaml` and `orch.yaml`.              |
+| `tp` / `dp`              | int    | `1` / `1`      | Tensor and data parallelism degrees.                                                      |
+| `max_model_len`          | int    | `null`         | Maximum context length.                                                                   |
+| `max_num_seqs`           | int    | `null`         | Cap on concurrent sequences. Sizes the CUDA-graph and activation buffers, so it — not `gpu_memory_utilization` — is the knob that decides whether a large model plus LoRA fits. `null` uses vLLM's default. |
+| `kv_cache_dtype`         | string | `null`         | KV cache dtype. `fp8` halves KV bytes per token and raises sustainable concurrency, at the cost of perturbing sampled logprobs — watch `mismatch_kl`. `null` uses vLLM's default. |
+| `enable_lora`            | bool   | `true`         | Enable LoRA hot-reload, which is how the trainer's adapter reaches the server.             |
+| `max_lora_rank`          | int    | `null`         | Maximum LoRA rank, auto-rounded up to a vLLM-valid value.                                 |
+| `gpu_memory_utilization` | float  | `0.9`          | Fraction of GPU memory for the KV cache. Computed automatically in co-locate mode.         |
+| `weight_broadcast_type`  | string | `"filesystem"` | Must match the trainer's setting.                                                          |
+
+### Checkpoint resume
+
+`resume_from_checkpoint` (default `true`) and `checkpoint_dir` behave as they do
+for SFT: re-running `grpo-train` picks up the latest checkpoint instead of
+starting over. A checkpoint at step `S` means "trained through batch `S`", so the
+resumed run starts at `S + 1`. That single resume point drives which batch is
+packed, which batch is read from the transport, the LR schedule position, the
+save cadence, and the step number weights are broadcast under — so an
+orchestrator already waiting on the step-`S` broadcast is unblocked rather than
+desynchronized. Set `resume_from_checkpoint: false` to force a fresh run.
+
 ## Memory Optimization Settings
 
 | Option                     | Type | Default | Description                                                                                               |

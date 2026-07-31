@@ -38,7 +38,7 @@ class FileSystemTrainingBatchSender(TrainingBatchSender):
 class FileSystemTrainingBatchReceiver(TrainingBatchReceiver):
     """Filesystem-based training batch receiver that reads batches from multiple run directories."""
 
-    def __init__(self) -> None:
+    def __init__(self, start_step: int | None = None) -> None:
         super().__init__()
         self.multi_run_manager = get_multi_run_manager()
         self._last_logged_paths: list[Path] | None = None
@@ -47,12 +47,22 @@ class FileSystemTrainingBatchReceiver(TrainingBatchReceiver):
         # Track received steps per run independently of multi_run_manager.progress[idx].step
         # This prevents duplicate reads when trainer step != orchestrator step
         self._received_steps: dict[int, int] = {}
+        # Trainer resume point (2026-07-29): when set, the TRAINER governs
+        # which raw batch is consumed next. progress[idx].step comes from
+        # the ORCHESTRATOR's checkpoints (its next batch to COLLECT), which
+        # runs ahead of the trainer by max_async_level — initializing from
+        # it after a trainer restart SKIPS the unconsumed batches between
+        # the trainer checkpoint and the orch checkpoint.
+        self._start_step = start_step
 
     def _get_received_step(self, idx: int) -> int:
         """Get the next step to receive for a run, initializing from progress if needed."""
         if idx not in self._received_steps:
-            # Initialize from multi_run_manager.progress on first access (for checkpoint resume)
-            self._received_steps[idx] = self.multi_run_manager.progress[idx].step
+            if self._start_step is not None:
+                self._received_steps[idx] = self._start_step
+            else:
+                # Initialize from multi_run_manager.progress on first access (for checkpoint resume)
+                self._received_steps[idx] = self.multi_run_manager.progress[idx].step
         return self._received_steps[idx]
 
     def _get_batch_path(self, idx: int) -> Path:

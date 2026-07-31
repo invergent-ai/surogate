@@ -23,7 +23,7 @@ Also, we will use the [Co-locate mode](../../guides/rl-training.md#co-locate-mod
 Run the following command:
 
 ```shell
-surogate grpo --train examples/grpo/train.yaml --infer examples/grpo/infer.yaml --orch examples/grpo/orch.yaml
+surogate grpo-colocate --train examples/grpo/train.yaml --infer examples/grpo/infer.yaml --orch examples/grpo/orch.yaml
 ```
 
 After training is complete, the LoRA adapter will be saved in the `./outputs/final_adapter` folder. 
