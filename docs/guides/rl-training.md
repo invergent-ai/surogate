@@ -267,6 +267,23 @@ Surogate uses a global step counter $n = 1, 2, 3, \ldots$ to tag all artifacts:
 
 The off-policy gap is at most $k$ steps. Rollouts whose gap exceeds `max_off_policy_steps` are discarded by the orchestrator.
 
+### Resuming a run
+
+The trainer resumes from the latest checkpoint in `checkpoint_dir` automatically
+(`resume_from_checkpoint` defaults to `true`). A checkpoint at step $S$ means
+"trained through batch $S$", so the resumed run starts at $S + 1$ and logs:
+
+```
+Resuming from checkpoint step 5 (next batch: 6)
+```
+
+The resume point is trainer-owned, deliberately: the orchestrator's own progress
+counter is *ahead* by up to $k$ steps, so seeding from it would skip the
+unconsumed batches in between and publish broadcasts under step numbers the
+orchestrator has already read. Instead, the resumed trainer re-emits the
+checkpoint's weights under step $S$, which unblocks an orchestrator already
+waiting on that broadcast.
+
 ### Loss Objective
 
 The loss is a token-level variant of the [AIPO objective](https://arxiv.org/abs/2505.24034) (introduced in Llama-RL), without the entropy and KL terms. For $N$ prompts, each with a group of $G$ rollouts:
@@ -300,6 +317,57 @@ The CLI applies `CUDA_VISIBLE_DEVICES=<trainer ids>` to the parent process **bef
 ### Weight broadcast
 
 In split mode, weight broadcasts use the filesystem backend regardless of what is configured in the YAML. Each broadcast writes the LoRA adapter (~10 MB) to `{output_dir}/broadcasts/step_N/`; vLLM polls for the `STABLE` marker file and hot-reloads the adapter.
+
+### Long sequences: chunked GRPO
+
+Agentic rollouts run far longer than a dense activation budget allows. Setting
+`sequence_chunks: N` in `train.yaml` routes the native GRPO step through the
+chunked path: chunks are forwarded left-to-right to fill the attention KV
+caches, then walked in reverse for the GRPO dloss and backward, accumulating
+dK/dV across chunks. Gradients are exact; memory stays at the single-chunk
+footprint. All-padding tail chunks are detected from the per-sample end offsets
+and skipped.
+
+Pair it with `single_sample_bins: true`. Chunked-training attention carries no
+packed-document isolation, so a row holding several samples would let them
+attend across each other.
+
+```yaml
+# train.yaml
+sequence_len: 6144
+sequence_chunks: 4        # 1536-token chunks
+single_sample_bins: true
+per_device_train_batch_size: 1
+```
+
+### Bounding the importance ratio
+
+`loss.ratio_clip` (default `7.389056`, i.e. e²) caps the importance ratio. The
+IPO mask drops tokens whose probability moved too far, but under periodic
+merged-weight reloads the sampling policy and the trainer policy can diverge
+enough that surviving tokens still carry an extreme ratio. `ratio_clip` bounds
+what any single token can contribute.
+
+### Reading progress from a log file
+
+The orchestrator's rollout progress bar is `tqdm`, which needs a TTY. Under
+`nohup` or any redirect it writes nothing readable, so the orchestrator also
+emits plain `[progress]` INFO lines carrying rate and ETA:
+
+```
+[progress] step 11 Generating rollouts (train): 128/256 (50%) | 42.7/min | elapsed 3m00s | eta 3m00s
+```
+
+A step that stops completing rollouts says so rather than falling silent:
+
+```
+[progress] step 11 Generating rollouts (train): 128/256 — NO completions in the last 60s (inflight 64, scoring 3, elapsed 14m22s)
+```
+
+Treat that line as the cue to inspect the inference server. A deep queue, an
+unresponsive engine, and rollouts erroring out are indistinguishable from a
+frozen progress bar, and errored rollouts in particular are logged per-rollout —
+easy to scroll past in volume.
 
 ### Lifecycle
 
@@ -385,6 +453,27 @@ zero_level: 1  # Default: shard optimizer states
 ```
 
 Each micro-batch is replicated across all GPUs. The per-token gradient computation happens on the first GPU's logprobs, and the resulting gradients are replicated for the backward pass.
+
+### Fitting a large policy on the inference side
+
+Two `infer.yaml` keys decide whether a large model plus LoRA fits, and they are
+often reached for in the wrong order:
+
+- **`max_num_seqs`** caps concurrent sequences and therefore sizes the
+  CUDA-graph and activation buffers. On a 27B model served TP2 with
+  `enable_lora: true`, the vLLM default OOMs at startup and a small value
+  (e.g. `16`) fits. Lowering `gpu_memory_utilization` does **not** help here —
+  it shrinks the very budget those buffers are allocated from.
+- **`kv_cache_dtype: fp8`** halves KV bytes per token, which raises the
+  concurrency a KV-bound server can sustain. It also perturbs sampled
+  logprobs, and those feed GRPO's importance ratio — watch `mismatch_kl` for a
+  step or two after enabling it.
+
+```yaml
+# infer.yaml
+max_num_seqs: 16
+kv_cache_dtype: fp8
+```
 
 ## Tuning Tips
 
@@ -748,6 +837,8 @@ Key inference options:
 | `port`                    | `8000`         | Bind port                                              |
 | `dtype`                   | `"auto"`       | Data type (`float16`, `bfloat16`, `auto`)              |
 | `max_model_len`           | `null`         | Maximum context length                                 |
+| `max_num_seqs`            | `null`         | Max concurrent sequences (null = vLLM default)         |
+| `kv_cache_dtype`          | `null`         | KV cache dtype, e.g. `fp8` (null = vLLM default)       |
 | `enforce_eager`           | `false`        | Disable CUDA graphs (useful for debugging)             |
 | `trust_remote_code`       | `false`        | Allow custom HF model code                             |
 | `tp`                      | `1`            | Tensor parallelism degree                              |
@@ -827,6 +918,7 @@ Key orchestrator settings:
 | `buffer.normal_pool_min_examples`    | `0`                  | Recycle easy/hard examples when normal pool is this low |
 | `buffer.recycle_easy_fraction`       | `0.0`                | Fraction of easy examples recycled when normal is low   |
 | `buffer.recycle_hard_fraction`       | `0.0`                | Fraction of hard examples recycled when normal is low   |
+| `buffer.sample_without_replacement`  | `false`              | Permanently consume an example when its rollout group is scheduled (one-attempt agentic tasks). Cannot be combined with recycling. |
 | `buffer.hash_keys`                   | `["task", "prompt"]` | Keys used for example deduplication                     |
 | `buffer.skip_verification`           | `false`              | If true, disable reward scoring (rewards always 0)      |
 | `buffer.env_ratios`                  | `null`               | Per-environment sampling ratios (list, must sum to >0)  |

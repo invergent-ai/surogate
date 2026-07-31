@@ -116,7 +116,7 @@ inline void forward_matmul(Tensor& out,
     } else if (weight.DType == ETensorDType::BF16) {
         // Weight is BF16 and no cache - quantize to FP8 on-the-fly for forward pass.
         Tensor weight_fp8 = rs.temp_alloc(ETensorDType::FP8_E4M3, {OC, C}, "weight_fp8");
-        Tensor weight_stats = rs.temp_alloc(ETensorDType::FP32, {2}, "weight_stats");  // [abs_max, scale]
+        Tensor weight_stats = rs.temp_alloc(ETensorDType::FP32, {Tensor::STATS_FLOATS}, "weight_stats");  // [abs_max, scale]
         weight_fp8.Stats = reinterpret_cast<float*>(weight_stats.Data);
 
         // Compute abs_max and quantize weight to FP8
@@ -244,7 +244,7 @@ inline void backward_matmul(Tensor& dinp,
     } else {
         // Quantize BF16 weight to E4M3 on-the-fly
         weight_e4m3 = rs.temp_alloc(ETensorDType::FP8_E4M3, {OC, C}, "weight_e4m3");
-        weight_stats = rs.temp_alloc(ETensorDType::FP32, {2}, "weight_stats");
+        weight_stats = rs.temp_alloc(ETensorDType::FP32, {Tensor::STATS_FLOATS}, "weight_stats");
         weight_e4m3.Stats = weight_stats.template get<float>();
 
         abs_max(weight_e4m3.abs_max(), weight, (long)OC * C, rs.DeviceProp, stream);
@@ -260,7 +260,7 @@ inline void backward_matmul(Tensor& dinp,
 
     // Compute dinp: dinp = W^T @ dout
     auto weight_tp = rs.temp_alloc(ETensorDType::FP8_E4M3, {C, OC}, "weight_tp");
-    Tensor weight_tp_stats = rs.temp_alloc(ETensorDType::FP32, {2}, "weight_tp_stats");
+    Tensor weight_tp_stats = rs.temp_alloc(ETensorDType::FP32, {Tensor::STATS_FLOATS}, "weight_tp_stats");
     weight_tp.Stats = weight_tp_stats.template get<float>();
 
     transpose(weight_tp, weight_e4m3, OC, C, stream);
@@ -291,7 +291,7 @@ inline void backward_matmul(Tensor& dinp,
     // Compute dweight: dW += inp^T @ dout
     if (!skip_weight_grad) {
         auto activation_tp = rs.temp_alloc(ETensorDType::FP8_E4M3, {C, B * T}, "activation_tp");
-        Tensor act_stats = rs.temp_alloc(ETensorDType::FP32, {2}, "act_stats");
+        Tensor act_stats = rs.temp_alloc(ETensorDType::FP32, {Tensor::STATS_FLOATS}, "act_stats");
         activation_tp.Stats = act_stats.template get<float>();
 
         if (inp_fp8.abs_max()) {
@@ -316,7 +316,7 @@ inline void backward_matmul(Tensor& dinp,
         }
 
         auto grad_tp = rs.temp_alloc(ETensorDType::FP8_E5M2, {OC, B * T}, "grad_tp");
-        Tensor grad_stats = rs.temp_alloc(ETensorDType::FP32, {2}, "grad_stats");
+        Tensor grad_stats = rs.temp_alloc(ETensorDType::FP32, {Tensor::STATS_FLOATS}, "grad_stats");
         grad_tp.Stats = grad_stats.template get<float>();
         transpose(grad_tp, dout_e5m2, B * T, OC, stream);
         cudaMemcpyAsync(grad_tp.scale(), dout_e5m2.scale(), sizeof(float), cudaMemcpyDeviceToDevice, stream);

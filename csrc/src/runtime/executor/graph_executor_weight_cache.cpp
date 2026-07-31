@@ -92,7 +92,7 @@ std::size_t fp8_weight_cache_bytes(const Tensor& weight) {
     }
     return static_cast<std::size_t>(weight.Sizes[0]) * static_cast<std::size_t>(weight.Sizes[1]) *
                get_dtype_size(ETensorDType::FP8_E4M3) +
-           2 * sizeof(float);
+           Tensor::STATS_FLOATS * sizeof(float);
 }
 
 }  // namespace
@@ -165,7 +165,7 @@ const Tensor* GraphExecutor::get_fp8_cached_weight(const std::string& name, Tens
         entry.stats = mRunState.Allocator->allocate(ETensorDType::FP32,
                                                     ("fp8_cache_" + name + "_stats").c_str(),
                                                     EAllocationType::ON_DEVICE,
-                                                    {2L});
+                                                    {Tensor::STATS_FLOATS});
         entry.weight.Stats = entry.stats.get<float>();
         auto [insert_it, _] = mFP8WeightCache.emplace(name, std::move(entry));
         it = insert_it;
@@ -274,7 +274,7 @@ GraphExecutor::get_fp8_cached_weight_transposed(const std::string& name, Tensor&
         entry.stats = mRunState.Allocator->allocate(ETensorDType::FP32,
                                                     ("fp8_cacheT_" + name + "_stats").c_str(),
                                                     EAllocationType::ON_DEVICE,
-                                                    {2L});
+                                                    {Tensor::STATS_FLOATS});
         entry.weight.Stats = entry.stats.get<float>();
         auto [insert_it, _] = mFP8WeightCacheT.emplace(name, std::move(entry));
         it = insert_it;

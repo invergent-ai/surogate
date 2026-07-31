@@ -16,6 +16,7 @@ typedef void* CUfileHandle_t;
 class cuFileRef {
 public:
     explicit cuFileRef(std::string file_name);
+    //! \param h Registered cuFile handle, or `nullptr` when this ref reads via buffered POSIX I/O.
     cuFileRef(CUfileHandle_t h, int fd, std::string name)
         : mHandle(h),
           mFileDescriptor(fd),
@@ -24,6 +25,11 @@ public:
     ~cuFileRef() noexcept;
     CUfileHandle_t& handle() {
         return mHandle;
+    }
+
+    //! \brief Whether reads go through GPUDirect Storage (as opposed to the POSIX fallback).
+    bool uses_gds() const {
+        return mHandle != nullptr;
     }
 
     //! \brief Read raw bytes from the range `[begin, end)`
@@ -44,9 +50,19 @@ public:
                           std::size_t buffer_size);
 
 private:
+    //! \brief Drop this ref off the GDS path: deregister, then reopen the file buffered.
+    //! \note Only defined in the cuFile build; the POSIX-only build never reaches it.
+    //! \throws std::runtime_error If the file cannot be reopened.
+    void degrade_to_buffered();
+
     CUfileHandle_t mHandle;
     int mFileDescriptor;
     std::string mFileName;
 };
+
+//! \brief Open \p file_name for tensor reads, preferring GPUDirect Storage where it works.
+//! \return A ref whose uses_gds() reports which path was selected.
+//! \throws std::runtime_error If the file cannot be opened at all.
+cuFileRef open_cufile(std::string file_name);
 
 #endif  //SUROGATE_SRC_MODELS_CUFILE_H

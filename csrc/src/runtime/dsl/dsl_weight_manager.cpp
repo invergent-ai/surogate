@@ -206,6 +206,11 @@ DslWeightManager::DslWeightManager(const Module& module,
     mConfig.persistent_quants = options.PersistentQuants;
     mConfig.use_zero_copy = options.UseZeroCopy;
     mConfig.cpu_training = options.CpuTraining;
+    // Frozen-base cpu_training keeps embedding/lm_head resident on device (see
+    // DslWeightManagerConfig::resident_nonblock). The frozen base never changes,
+    // so the per-version gather skip makes each buffer stream exactly once.
+    mConfig.resident_nonblock = mConfig.cpu_training && lora_config && lora_config->enabled() &&
+                                std::getenv("SUROGATE_SHARED_NONBLOCK_STAGING") == nullptr;
     mConfig.enable_fp8_forward = options.fp8_forward_enabled();
     // FP8 weight streaming: only when the FP8 forward recipe is active AND masters are
     // offloaded (dispatch-PP). Then frozen matmul block masters are stored + streamed as
@@ -377,7 +382,14 @@ void DslWeightManager::allocate_weights(const Module& module,
                 // full GPU copy for a sparse lookup.
                 entry.work = Tensor{};
             } else if (is_primary_embedding_name(name) || is_lm_head_name(name)) {
-                entry.work = Tensor{};  // Will be set to the shared buffer below
+                if (mConfig.resident_nonblock) {
+                    // Frozen base: dedicated resident work buffer, streamed once
+                    // (gather_* skips on matching version) instead of per sweep.
+                    entry.work = mAllocator->allocate(
+                        param_dtype, (name + "_work").c_str(), EAllocationType::ON_DEVICE, shape);
+                } else {
+                    entry.work = Tensor{};  // Will be set to the shared buffer below
+                }
             } else {
                 entry.work =
                     mAllocator->allocate(param_dtype, (name + "_work").c_str(), EAllocationType::ON_DEVICE, shape);
@@ -401,7 +413,8 @@ void DslWeightManager::allocate_weights(const Module& module,
     // These are never live simultaneously. final_norm must keep its own buffer because
     // the executor gathers embedding+final_norm in forward and final_norm+lm_head in
     // backward before either pair is consumed.
-    if (mConfig.cpu_training) {
+    // (Skipped under resident_nonblock: both already own dedicated buffers.)
+    if (mConfig.cpu_training && !mConfig.resident_nonblock) {
         const ETensorDType work_dtype = mConfig.work_dtype;
         std::size_t max_shared_non_block_bytes = 0;
         std::vector<long> max_shared_non_block_shape;
@@ -453,7 +466,13 @@ bool DslWeightManager::work_is_transient(const std::string& name) const {
     }
     if (mConfig.cpu_training) {
         // Embedding and lm_head share one GPU staging buffer; each gather
-        // overwrites it with the tensor about to be consumed.
+        // overwrites it with the tensor about to be consumed. Keep them
+        // "transient" even under resident_nonblock: the buffers are stable
+        // there, but reporting them cacheable flips the lm_head matmul onto
+        // the FP8 quantize-once cache, which the GRPO compact-row lm_head
+        // path does not support (BF16-only) — measured as a mismatch_kl
+        // blowup. The residency win comes from the gather version-skip, not
+        // from cacheability.
         return is_primary_embedding_name(name) || is_lm_head_name(name);
     }
     return false;
@@ -563,7 +582,7 @@ void DslWeightManager::allocate_prefetch_buffers() {
                         Tensor stats = mAllocator->allocate(ETensorDType::FP32,
                                                             (buf_name + "_stats").c_str(),
                                                             EAllocationType::ON_DEVICE,
-                                                            {2L});
+                                                            {Tensor::STATS_FLOATS});
                         buf.Stats = stats.get<float>();
                     }
                     base_buffers.emplace(pkey, buf);
@@ -880,8 +899,10 @@ void DslWeightManager::gather_embeddings(NCCLCommunicator& comm, cudaStream_t st
     if ((!mStreamWeights && !mConfig.offload_master) || mEmbeddingName.empty()) {
         return;
     }
-    // Skip cache check when cpu_training — shared buffer may have been overwritten by lm_head
-    if (!mConfig.cpu_training && mEmbeddingsStatus.version == mVersion) {
+    // Skip cache check when cpu_training with the SHARED staging buffer — it may
+    // have been overwritten by lm_head. With resident_nonblock each tensor owns
+    // its buffer, so a matching version means the content is already on device.
+    if ((!mConfig.cpu_training || mConfig.resident_nonblock) && mEmbeddingsStatus.version == mVersion) {
         return;
     }
 
@@ -929,7 +950,7 @@ void DslWeightManager::gather_final_norm(NCCLCommunicator& comm, cudaStream_t st
     if ((!mStreamWeights && !mConfig.offload_master) || mFinalNormName.empty()) {
         return;
     }
-    if (!mConfig.cpu_training && mFinalNormStatus.version == mVersion) {
+    if ((!mConfig.cpu_training || mConfig.resident_nonblock) && mFinalNormStatus.version == mVersion) {
         return;
     }
 
@@ -977,7 +998,7 @@ void DslWeightManager::gather_lm_head(NCCLCommunicator& comm, cudaStream_t strea
     if ((!mStreamWeights && !mConfig.offload_master) || mLmHeadName.empty()) {
         return;
     }
-    if (!mConfig.cpu_training && mLmHeadStatus.version == mVersion) {
+    if ((!mConfig.cpu_training || mConfig.resident_nonblock) && mLmHeadStatus.version == mVersion) {
         return;
     }
 
@@ -1239,11 +1260,19 @@ void DslWeightManager::convert_to_work(const Tensor& master, Tensor& work, cudaS
     // Same dtype - direct copy
     if (master.DType == work.DType) {
         CUDA_CHECK(cudaMemcpyAsync(work.Data, master.Data, work.bytes(), cudaMemcpyDefault, stream));
-        // FP8-streamed weights carry a per-tensor [abs_max, scale] alongside the data; copy it
-        // into the work buffer's device stats so the FP8 GEMM reads the right scale this stage.
+        // FP8-streamed weights carry a per-tensor [abs_max, .., scale] alongside the data; copy
+        // it into the work buffer's device stats so the FP8 GEMM reads the right scale this
+        // stage. scale() lives at a 16-byte-aligned offset that depends on each block's base
+        // address (Tensor::aligned_scale), so copy abs_max and scale individually rather than
+        // assuming both blocks share one layout.
         if (master.Stats && work.Stats &&
             (work.DType == ETensorDType::FP8_E4M3 || work.DType == ETensorDType::FP8_E5M2)) {
-            CUDA_CHECK(cudaMemcpyAsync(work.Stats, master.Stats, 2 * sizeof(float), cudaMemcpyDefault, stream));
+            CUDA_CHECK(cudaMemcpyAsync(work.abs_max(), master.Stats, sizeof(float), cudaMemcpyDefault, stream));
+            CUDA_CHECK(cudaMemcpyAsync(work.scale(),
+                                       Tensor::aligned_scale(master.Stats),
+                                       sizeof(float),
+                                       cudaMemcpyDefault,
+                                       stream));
         }
         return;
     }
@@ -1301,7 +1330,7 @@ void DslWeightManager::finalize_fp8_block_masters(const cudaDeviceProp& dp, cuda
     float* d_stats = nullptr;
     CUDA_CHECK(cudaMalloc(&d_bf16, max_nelem * get_dtype_size(ETensorDType::BF16)));
     CUDA_CHECK(cudaMalloc(&d_fp8, max_nelem * get_dtype_size(ETensorDType::FP8_E4M3)));
-    CUDA_CHECK(cudaMalloc(&d_stats, 2 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_stats, Tensor::STATS_FLOATS * sizeof(float)));
 
     for (auto& [name, e] : mWeights) {
         if (!e.is_block || e.trainable || e.master.DType == ETensorDType::FP8_E4M3) continue;
@@ -1309,7 +1338,8 @@ void DslWeightManager::finalize_fp8_block_masters(const cudaDeviceProp& dp, cuda
         const long N = static_cast<long>(e.master.nelem());
         if (N <= 0) continue;
         // The host master buffer was sized for BF16 (2*N bytes); FP8 (N) + the inline
-        // [abs_max, scale] (8 bytes) fit in its front, so quantize in place with no realloc.
+        // STATS_FLOATS stats block (32 bytes, scale at its 16B-aligned slot) fit in its
+        // front for any real weight, so quantize in place with no realloc.
         const std::size_t stats_off = static_cast<std::size_t>(N) * get_dtype_size(ETensorDType::FP8_E4M3);
 
         // Shared masters (the frozen base shared across GPUs) are quantized exactly once.
@@ -1330,11 +1360,15 @@ void DslWeightManager::finalize_fp8_block_masters(const cudaDeviceProp& dp, cuda
             out.Stats = d_stats;
             abs_max(out.abs_max(), in, N, dp, stream);
             quantize_with_abs_max(out, out.scale(), in, out.abs_max(), N, dp, stream);
-            // FP8 bytes + the 2-float scale back into the host buffer's front.
+            // FP8 bytes + the stats back into the host buffer's front. abs_max and scale go
+            // to the HOST block's own layout (scale() is 16B-aligned relative to each base),
+            // so copy them individually instead of assuming both blocks line up.
+            float* host_stats = reinterpret_cast<float*>(static_cast<std::byte*>(e.master.Data) + stats_off);
             CUDA_CHECK(cudaMemcpyAsync(e.master.Data, d_fp8, stats_off, cudaMemcpyDefault, stream));
-            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(e.master.Data) + stats_off,
-                                       d_stats,
-                                       2 * sizeof(float),
+            CUDA_CHECK(cudaMemcpyAsync(host_stats, out.abs_max(), sizeof(float), cudaMemcpyDefault, stream));
+            CUDA_CHECK(cudaMemcpyAsync(Tensor::aligned_scale(host_stats),
+                                       out.scale(),
+                                       sizeof(float),
                                        cudaMemcpyDefault,
                                        stream));
             CUDA_CHECK(cudaStreamSynchronize(stream));

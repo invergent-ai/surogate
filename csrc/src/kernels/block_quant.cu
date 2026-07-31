@@ -521,16 +521,18 @@ void fused_dequant_requant_per_block_to_tensor(__nv_fp8_e4m3* out,
     }
     CUDA_CHECK(cudaGetLastError());
 
-    // Store both absmax and dequant scale in the output buffer
-    // out_scale is expected to point to [absmax, scale] where:
-    // - absmax = h_scale (the computed tensor absmax)
-    // - scale = h_scale / 448.0f (the dequant scale for matmul)
+    // Store both absmax and dequant scale in the output buffer:
+    // - absmax = h_scale (the computed tensor absmax)  -> Tensor::abs_max()
+    // - scale  = h_scale / 448.0f (dequant scale)      -> Tensor::scale()
     //
-    // This layout matches Tensor::scale() which returns Stats + 1
-    float stats[2];
-    stats[0] = h_scale;           // absmax
-    stats[1] = h_scale / 448.0f;  // dequant scale
-    CUDA_CHECK(cudaMemcpyAsync(out_scale, stats, 2 * sizeof(float), cudaMemcpyHostToDevice, stream));
+    // Written as two copies rather than one contiguous pair: scale() is padded to a
+    // 16-byte boundary past abs_max(), because cuBLASLt's FP8 kernels reject an
+    // unaligned scale pointer. Use the accessor so this stays in step with it.
+    const float absmax_val = h_scale;
+    const float scale_val = h_scale / 448.0f;
+    CUDA_CHECK(cudaMemcpyAsync(out_scale, &absmax_val, sizeof(float), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(
+        Tensor::aligned_scale(out_scale), &scale_val, sizeof(float), cudaMemcpyHostToDevice, stream));
 }
 
 // ============================================================================

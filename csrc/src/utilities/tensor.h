@@ -114,18 +114,37 @@ struct Tensor {
         return Tensor{dtype, sizes, ptr, nullptr, rank, device};
     }
 
+    //! \brief Floats to reserve for a Stats block: abs_max, then padding, then scale.
+    //!
+    //! Enough that scale() can always be pushed to the next 16-byte boundary past
+    //! abs_max(), whatever alignment the allocator happened to give the block.
+    static constexpr long STATS_FLOATS = 8;
+
     float* abs_max() {
         return Stats;
     }
 
+    //! \brief Pointer to the dequant scale, guaranteed 16-byte aligned.
+    //!
+    //! cuBLASLt's FP8 kernels reject a scale pointer that is not 16-byte aligned:
+    //! cublasLtMatmul returns CUBLAS_STATUS_NOT_SUPPORTED for every algorithm the
+    //! heuristic offered. This used to be `Stats + 1`, i.e. abs_max's address plus 4
+    //! bytes, which made every FP8 matmul fail on sm90 (Hopper) while sm120 tolerated
+    //! it. Align up rather than using a fixed offset -- the allocator does not
+    //! guarantee 16-byte alignment for a block this small.
+    static float* aligned_scale(float* stats) {
+        if (stats == nullptr) return nullptr;
+        auto addr = reinterpret_cast<std::uintptr_t>(stats) + sizeof(float);
+        addr = (addr + 15u) & ~static_cast<std::uintptr_t>(15u);
+        return reinterpret_cast<float*>(addr);
+    }
+
     float* scale() {
-        if (Stats == nullptr) return nullptr;
-        return Stats + 1;
+        return aligned_scale(Stats);
     }
 
     const float* scale() const {
-        if (Stats == nullptr) return nullptr;
-        return Stats + 1;
+        return aligned_scale(const_cast<float*>(Stats));
     }
 };
 

@@ -52,7 +52,7 @@ class BasePacker(ABC):
         self.seq_len = seq_len
         self.pad_to_multiple_of = pad_to_multiple_of
         self.tokenizer = tokenizer
-        self.receiver = setup_training_batch_receiver(config)
+        self.receiver = setup_training_batch_receiver(config, start_step=start_step)
         shutil.rmtree(get_rollout_dir(self.multi_run_manager.output_dir), ignore_errors=True)
         self.sender: MicroBatchSender = setup_micro_batch_sender(
             self.multi_run_manager.output_dir, dp_world_size, start_step, config

@@ -1055,6 +1055,41 @@ void CompiledExecutor::execute_backward(const CompiledGraph& graph,
     const bool bwd_stream_driven = !graph.instruction_stream.empty() && !bwd_stream_capturing &&
                                    bwd_tile_group_starts.empty() && !mForceLinear;
 
+    // Derive the ACTUAL backward layer visit order from the compiled graph so
+    // handle_layer_start prefetches the layer that really runs next (see
+    // mBwdNextLayer). Scan cost is trivial (< #ops) and rebuilding per call
+    // keeps it correct across graphs (chunked schedules, shape rebinds).
+    if (mWeightManager && mWeightManager->needs_block_gather()) {
+        std::vector<int> visit_order;
+        visit_order.reserve(static_cast<std::size_t>(mConfig.NumLayers));
+        auto push_layer = [&](int L) {
+            if (L >= 0 && (visit_order.empty() || visit_order.back() != L)) {
+                visit_order.push_back(L);
+            }
+        };
+        if (bwd_stream_driven) {
+            for (const auto& inst : graph.instruction_stream) {
+                if (inst.kind == dsl::InstKind::PhaseEnter && inst.phase_kind == dsl::PhaseKind::BwdBlock) {
+                    push_layer(inst.block_index);
+                }
+            }
+        } else {
+            for (const auto& op : graph.ops) {
+                push_layer(op.layer_start);
+            }
+        }
+        const long num_layers = static_cast<long>(mConfig.NumLayers);
+        mBwdNextLayer.assign(static_cast<std::size_t>(num_layers > 0 ? num_layers : 0), -1);
+        for (std::size_t i = 0; i + 1 < visit_order.size(); ++i) {
+            const int cur = visit_order[i];
+            if (cur >= 0 && cur < static_cast<int>(mBwdNextLayer.size())) {
+                mBwdNextLayer[static_cast<std::size_t>(cur)] = visit_order[i + 1];
+            }
+        }
+    } else {
+        mBwdNextLayer.clear();
+    }
+
     // Per-op layer-end cleanup (shared between SegmentDispatch inline and
     // PhaseExit BwdBlock). Mirrors the flat-ops layer-end handler at lines
     // 2767-2895. Idempotent via last_layer_restored - safe to call multiple

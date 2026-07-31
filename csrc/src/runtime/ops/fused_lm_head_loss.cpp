@@ -28,9 +28,15 @@ namespace dsl {
 
 namespace {
 
+//! Set once cuBLASLt has refused an FP8 LM-head matmul; see warn_fp8_lm_head_fallback().
+bool& fp8_lm_head_unsupported() {
+    static bool unsupported = false;
+    return unsupported;
+}
+
 bool fp8_lm_head_enabled(const recipes::Recipe* recipe) {
     static const bool enabled = (std::getenv("SUROGATE_DISABLE_FP8_LMHEAD") == nullptr);
-    return enabled && recipe && recipe->is_fp8_hybrid();
+    return enabled && !fp8_lm_head_unsupported() && recipe && recipe->is_fp8_hybrid();
 }
 
 const Tensor* find_cached_lm_head(std::unordered_map<std::string, FP8WeightCacheEntry>* cache,
@@ -59,6 +65,29 @@ const Tensor* find_cached_lm_head(std::unordered_map<std::string, FP8WeightCache
         }
     }
     return nullptr;
+}
+
+//! \brief Record that cuBLASLt could not serve an FP8 LM-head matmul, and say so once.
+//!
+//! cuBLASLt does not have an FP8 algorithm for every shape: a large vocabulary makes the
+//! logits GEMM's M dimension far larger than a typical projection, and on some GPUs the
+//! heuristic returns nothing (CUBLAS_STATUS_NOT_SUPPORTED). matmul() cannot recover on
+//! its own -- its cublasGemmEx fallback is compiled out for 1-byte types -- so the caller
+//! reruns the operation in BF16, exactly as FP8HybridRecipe::forward_matmul does.
+//!
+//! The failure is a property of the shape and the GPU, not of a particular step, so latch
+//! it: without that, every step would pay the quantize plus the doomed heuristic again
+//! before falling back. The vocabulary is fixed for a run, so once one LM-head GEMM is
+//! unsupported the FP8 LM head is unusable for that run.
+void warn_fp8_lm_head_fallback(const char* phase, const std::exception& e) {
+    const bool first = !fp8_lm_head_unsupported();
+    fp8_lm_head_unsupported() = true;
+    if (!first) return;
+    fprintf(stderr,
+            "[WARNING] FP8 LM-head %s unsupported for this shape, using BF16 LM head for the "
+            "rest of the run: %s\n",
+            phase,
+            e.what());
 }
 
 }  // namespace
@@ -98,7 +127,7 @@ void CompiledExecutor::lm_head_logits_matmul(Tensor& logits,
     if (cached_weight) {
         Tensor xF_fp8 =
             mRunState.temp_alloc(ETensorDType::FP8_E4M3, {static_cast<long>(M), static_cast<long>(C)}, "lm_head_x_fp8");
-        Tensor xF_stats = mRunState.temp_alloc(ETensorDType::FP32, {2}, "lm_head_x_fp8_stats");
+        Tensor xF_stats = mRunState.temp_alloc(ETensorDType::FP32, {Tensor::STATS_FLOATS}, "lm_head_x_fp8_stats");
         xF_fp8.Stats = xF_stats.get<float>();
         const long numel = static_cast<long>(M) * static_cast<long>(C);
         abs_max(xF_fp8.abs_max(), xF_slice, numel, mRunState.DeviceProp, mRunState.MainStream);
@@ -109,23 +138,31 @@ void CompiledExecutor::lm_head_logits_matmul(Tensor& logits,
                               numel,
                               mRunState.DeviceProp,
                               mRunState.MainStream);
-        matmul(logits,
-               *cached_weight,
-               xF_fp8,
-               std::nullopt,
-               const_cast<Tensor*>(cached_weight)->scale(),
-               xF_fp8.scale(),
-               mRunState.CublasLtHandle,
-               mRunState.CuBlasWorkspace,
-               V,
-               M,
-               C,
-               swap_transpose(EMMTranspose::NT),
-               false,
-               mRunState.MainStream);
-        mRunState.temp_free(xF_stats);
-        mRunState.temp_free(xF_fp8);
-        return;
+        try {
+            matmul(logits,
+                   *cached_weight,
+                   xF_fp8,
+                   std::nullopt,
+                   const_cast<Tensor*>(cached_weight)->scale(),
+                   xF_fp8.scale(),
+                   mRunState.CublasLtHandle,
+                   mRunState.CuBlasWorkspace,
+                   V,
+                   M,
+                   C,
+                   swap_transpose(EMMTranspose::NT),
+                   false,
+                   mRunState.MainStream);
+            mRunState.temp_free(xF_stats);
+            mRunState.temp_free(xF_fp8);
+            return;
+        } catch (const std::runtime_error& e) {
+            // Free before falling through: the temp allocator is a stack, and the BF16
+            // matmul below must not see these still on it.
+            mRunState.temp_free(xF_stats);
+            mRunState.temp_free(xF_fp8);
+            warn_fp8_lm_head_fallback("logits matmul", e);
+        }
     }
 
     matmul(logits,
@@ -162,7 +199,7 @@ bool CompiledExecutor::lm_head_dx_matmul(Tensor& d_xF_slice,
     Tensor dlogits_fp8 = mRunState.temp_alloc(ETensorDType::FP8_E5M2,
                                               {static_cast<long>(M), static_cast<long>(V)},
                                               "lm_head_dlogits_e5m2");
-    Tensor dlogits_stats = mRunState.temp_alloc(ETensorDType::FP32, {2}, "lm_head_dlogits_e5m2_stats");
+    Tensor dlogits_stats = mRunState.temp_alloc(ETensorDType::FP32, {Tensor::STATS_FLOATS}, "lm_head_dlogits_e5m2_stats");
     dlogits_fp8.Stats = dlogits_stats.get<float>();
     const long numel = static_cast<long>(M) * static_cast<long>(V);
     abs_max(dlogits_fp8.abs_max(), dlogits, numel, mRunState.DeviceProp, mRunState.MainStream);
@@ -173,20 +210,29 @@ bool CompiledExecutor::lm_head_dx_matmul(Tensor& d_xF_slice,
                           numel,
                           mRunState.DeviceProp,
                           mRunState.MainStream);
-    matmul(d_xF_slice,
-           *cached_weight_t,
-           dlogits_fp8,
-           std::nullopt,
-           const_cast<Tensor*>(cached_weight_t)->scale(),
-           dlogits_fp8.scale(),
-           mRunState.CublasLtHandle,
-           mRunState.CuBlasWorkspace,
-           C,
-           M,
-           V,
-           EMMTranspose::TN,
-           false,
-           mRunState.MainStream);
+    try {
+        matmul(d_xF_slice,
+               *cached_weight_t,
+               dlogits_fp8,
+               std::nullopt,
+               const_cast<Tensor*>(cached_weight_t)->scale(),
+               dlogits_fp8.scale(),
+               mRunState.CublasLtHandle,
+               mRunState.CuBlasWorkspace,
+               C,
+               M,
+               V,
+               EMMTranspose::TN,
+               false,
+               mRunState.MainStream);
+    } catch (const std::runtime_error& e) {
+        // Returning false is this function's "not done" contract; callers then run the
+        // same product in BF16.
+        mRunState.temp_free(dlogits_stats);
+        mRunState.temp_free(dlogits_fp8);
+        warn_fp8_lm_head_fallback("dx matmul", e);
+        return false;
+    }
     mRunState.temp_free(dlogits_stats);
     mRunState.temp_free(dlogits_fp8);
     return true;

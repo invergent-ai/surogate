@@ -638,6 +638,12 @@ void copy_chunk_inputs_for_ctx(IModel& model,
     }
 }
 
+/// Defined further down beside the GRPO chunked step; declared here — inside
+/// the SAME anonymous namespace as that definition, so this is a declaration
+/// of it rather than a second overload — because the SFT chunked path needs
+/// the same packed-doc window metadata.
+IModel::ChunkPackMeta chunk_pack_meta_from_positions(const std::int32_t* pr, int T, long base_pos);
+
 }  // namespace
 
 void MultiGPUPyTrainer::step_chunked(const std::int32_t* inputs,
@@ -667,7 +673,10 @@ void MultiGPUPyTrainer::step_chunked(const std::int32_t* inputs,
     // Phase A — KV sweep: forward chunks left-to-right filling the per-layer
     // attention KV caches. Saved-tensor persistence is skipped; the loss op
     // lives in backward, so this pass pays layers only.
-    for (int c = 0; c < chunks_occupied; ++c) {
+    // Every chunk is swept: unlike the GRPO path there are no per-sample end
+    // offsets here to prove a tail chunk is all padding, and Phase B below
+    // walks the full range — the two passes must cover the same chunks.
+    for (int c = 0; c < seq_chunks; ++c) {
         copy_chunk(c);
         const int micro_eff = mTrainMicroStep * seq_chunks + c;
         const long base_pos_a = static_cast<long>(c) * T;
@@ -3623,7 +3632,19 @@ void MultiGPUPyTrainer::step_grpo_native_chunked(const std::int32_t* inputs,
 
     // Phase A — KV sweep: forward chunks left-to-right filling the per-layer
     // attention KV caches (saved-tensor persistence skipped).
-    for (int c = 0; c < chunks_occupied; ++c) {
+    //
+    // The LAST occupied chunk is excluded: its forward writes only state nobody
+    // reads. Chunk-carry slots are keyed "state BEFORE chunk c" (ChunkGdnState /
+    // ChunkConvState: chunk c-1 writes slot c; attention KV rows are per-chunk),
+    // so chunk L's Phase-A outputs (KV rows L, states[L+1], tails[L+1]) have no
+    // consumer — Phase B starts at L and re-forwards each chunk, rewriting its
+    // own KV rows and saved tensors before its backward reads them. Skipping it
+    // saves one full model pass (and under cpu_training one full weight stream)
+    // per micro-batch: 1 of 3 sweeps for single-chunk bins.
+    // SUROGATE_GRPO_FULL_KV_SWEEP=1 restores the full sweep (bisection escape).
+    static const bool full_kv_sweep = std::getenv("SUROGATE_GRPO_FULL_KV_SWEEP") != nullptr;
+    const int phase_a_chunks = full_kv_sweep ? chunks_occupied : chunks_occupied - 1;
+    for (int c = 0; c < phase_a_chunks; ++c) {
         copy_chunk(c);
         const int micro_eff = mTrainMicroStep * seq_chunks + c;
         const long base_pos_a = static_cast<long>(c) * T;

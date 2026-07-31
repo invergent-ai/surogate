@@ -1009,12 +1009,31 @@ void CompiledExecutor::handle_layer_start(int layer_idx) {
         mWeightManager->wait_for_gather(layer_idx, mRunState.MainStream);
     }
 
-    // Prefetch next layer in the current traversal direction.
-    const int next_layer = layer_idx + mPrefetchDirection;
+    // Prefetch next layer in the actual traversal order. In backward the
+    // compiled visit order is authoritative (mBwdNextLayer) — hybrid models
+    // run attention-pass-then-linear-pass, where layer_idx - 1 guesses wrong
+    // for most layers and every miss becomes a synchronous gather stall.
+    int next_layer = layer_idx + mPrefetchDirection;
+    if (mInBackwardPass && layer_idx >= 0 && layer_idx < static_cast<int>(mBwdNextLayer.size())) {
+        next_layer = mBwdNextLayer[static_cast<std::size_t>(layer_idx)];
+    }
     if (next_layer >= 0 && next_layer < static_cast<int>(mConfig.NumLayers) && !mCapturing) {
         if (mWeightManager && mWeightManager->needs_block_gather()) {
             if (mComm) {
                 mWeightManager->gather_block(next_layer, *mComm, mRunState.side_stream());
+                // With more than 2 prefetch slots, queue one further layer so
+                // the H2D pipe stays busy across short layers (the extra slot
+                // is only taken when free — gather_block never blocks compute
+                // for a prefetch, only for the layer being consumed).
+                if (mWeightManager->prefetch_slot_count() > 2) {
+                    int next2 = next_layer + mPrefetchDirection;
+                    if (mInBackwardPass && next_layer < static_cast<int>(mBwdNextLayer.size())) {
+                        next2 = mBwdNextLayer[static_cast<std::size_t>(next_layer)];
+                    }
+                    if (next2 >= 0 && next2 < static_cast<int>(mConfig.NumLayers)) {
+                        mWeightManager->gather_block(next2, *mComm, mRunState.side_stream());
+                    }
+                }
             }
         }
         // QLoRA offload: prefetch quantized weights for the next layer

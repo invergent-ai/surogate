@@ -8,7 +8,7 @@ on:
         required: false
         type: string
       cuda_versions:
-        description: 'CUDA versions to build (comma-separated: cu128,cu129,cu130, or "all")'
+        description: 'CUDA versions to build (comma-separated: cu130, or "all")'
         required: true
         default: 'all'
         type: string
@@ -29,10 +29,8 @@ jobs:
     strategy:
       matrix:
         include:
-          - wheel_tag: "cu128"
-            dockerfile: "Dockerfile.cu128"
-          - wheel_tag: "cu129"
-            dockerfile: "Dockerfile.cu129"
+          # NOTE: cu128 / cu129 images are temporarily disabled to match the
+          # wheel matrix in wheel.yml; only the CUDA 13 image is published for now.
           - wheel_tag: "cu130"
             dockerfile: "Dockerfile.cu130"
 
