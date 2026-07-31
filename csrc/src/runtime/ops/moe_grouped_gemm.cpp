@@ -277,7 +277,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm(const CompiledOp& op) {
                                                  {total_tokens, static_cast<long>(in_features)},
                                                  "moe_grouped_gemm_inp_quant_buf");
             inp_stats_buf =
-                mRunState.temp_alloc(ETensorDType::FP32, {2}, "moe_grouped_gemm_inp_stats_buf");  // abs_max, scale
+                mRunState.temp_alloc(ETensorDType::FP32, {Tensor::STATS_FLOATS}, "moe_grouped_gemm_inp_stats_buf");  // abs_max, scale
             inp_quant_buf.Stats = inp_stats_buf.get<float>();
             ctx.inp_quant = &inp_quant_buf;
             mTemps.push_back(inp_quant_buf);
@@ -799,7 +799,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
                                                   {total_tokens, static_cast<long>(out_features)},
                                                   "moe_grouped_gemm_dout_quant_buf");
             dout_stats_buf =
-                mRunState.temp_alloc(ETensorDType::FP32, {2}, "moe_grouped_gemm_dout_stats_buf");  // abs_max, scale
+                mRunState.temp_alloc(ETensorDType::FP32, {Tensor::STATS_FLOATS}, "moe_grouped_gemm_dout_stats_buf");  // abs_max, scale
             dout_quant_buf.Stats = dout_stats_buf.get<float>();
             ctx.dout_quant = &dout_quant_buf;
             mTemps.push_back(dout_quant_buf);
@@ -808,7 +808,7 @@ void CompiledExecutor::dispatch_moe_grouped_gemm_backward(const CompiledOp& op) 
             inp_quant_buf = mRunState.temp_alloc(ETensorDType::FP8_E4M3,
                                                  {total_tokens, static_cast<long>(in_features)},
                                                  "moe_grouped_gemm_bwd_inp_quant_buf");
-            inp_stats_buf = mRunState.temp_alloc(ETensorDType::FP32, {2}, "moe_grouped_gemm_bwd_inp_stats_buf");
+            inp_stats_buf = mRunState.temp_alloc(ETensorDType::FP32, {Tensor::STATS_FLOATS}, "moe_grouped_gemm_bwd_inp_stats_buf");
             inp_quant_buf.Stats = inp_stats_buf.get<float>();
             ctx.inp_quant = &inp_quant_buf;
             mTemps.push_back(inp_quant_buf);

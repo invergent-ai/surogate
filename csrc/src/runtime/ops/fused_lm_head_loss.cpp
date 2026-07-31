@@ -127,7 +127,7 @@ void CompiledExecutor::lm_head_logits_matmul(Tensor& logits,
     if (cached_weight) {
         Tensor xF_fp8 =
             mRunState.temp_alloc(ETensorDType::FP8_E4M3, {static_cast<long>(M), static_cast<long>(C)}, "lm_head_x_fp8");
-        Tensor xF_stats = mRunState.temp_alloc(ETensorDType::FP32, {2}, "lm_head_x_fp8_stats");
+        Tensor xF_stats = mRunState.temp_alloc(ETensorDType::FP32, {Tensor::STATS_FLOATS}, "lm_head_x_fp8_stats");
         xF_fp8.Stats = xF_stats.get<float>();
         const long numel = static_cast<long>(M) * static_cast<long>(C);
         abs_max(xF_fp8.abs_max(), xF_slice, numel, mRunState.DeviceProp, mRunState.MainStream);
@@ -199,7 +199,7 @@ bool CompiledExecutor::lm_head_dx_matmul(Tensor& d_xF_slice,
     Tensor dlogits_fp8 = mRunState.temp_alloc(ETensorDType::FP8_E5M2,
                                               {static_cast<long>(M), static_cast<long>(V)},
                                               "lm_head_dlogits_e5m2");
-    Tensor dlogits_stats = mRunState.temp_alloc(ETensorDType::FP32, {2}, "lm_head_dlogits_e5m2_stats");
+    Tensor dlogits_stats = mRunState.temp_alloc(ETensorDType::FP32, {Tensor::STATS_FLOATS}, "lm_head_dlogits_e5m2_stats");
     dlogits_fp8.Stats = dlogits_stats.get<float>();
     const long numel = static_cast<long>(M) * static_cast<long>(V);
     abs_max(dlogits_fp8.abs_max(), dlogits, numel, mRunState.DeviceProp, mRunState.MainStream);
