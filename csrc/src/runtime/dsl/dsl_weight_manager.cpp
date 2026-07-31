@@ -563,7 +563,7 @@ void DslWeightManager::allocate_prefetch_buffers() {
                         Tensor stats = mAllocator->allocate(ETensorDType::FP32,
                                                             (buf_name + "_stats").c_str(),
                                                             EAllocationType::ON_DEVICE,
-                                                            {2L});
+                                                            {Tensor::STATS_FLOATS});
                         buf.Stats = stats.get<float>();
                     }
                     base_buffers.emplace(pkey, buf);
@@ -1239,11 +1239,19 @@ void DslWeightManager::convert_to_work(const Tensor& master, Tensor& work, cudaS
     // Same dtype - direct copy
     if (master.DType == work.DType) {
         CUDA_CHECK(cudaMemcpyAsync(work.Data, master.Data, work.bytes(), cudaMemcpyDefault, stream));
-        // FP8-streamed weights carry a per-tensor [abs_max, scale] alongside the data; copy it
-        // into the work buffer's device stats so the FP8 GEMM reads the right scale this stage.
+        // FP8-streamed weights carry a per-tensor [abs_max, .., scale] alongside the data; copy
+        // it into the work buffer's device stats so the FP8 GEMM reads the right scale this
+        // stage. scale() lives at a 16-byte-aligned offset that depends on each block's base
+        // address (Tensor::aligned_scale), so copy abs_max and scale individually rather than
+        // assuming both blocks share one layout.
         if (master.Stats && work.Stats &&
             (work.DType == ETensorDType::FP8_E4M3 || work.DType == ETensorDType::FP8_E5M2)) {
-            CUDA_CHECK(cudaMemcpyAsync(work.Stats, master.Stats, 2 * sizeof(float), cudaMemcpyDefault, stream));
+            CUDA_CHECK(cudaMemcpyAsync(work.abs_max(), master.Stats, sizeof(float), cudaMemcpyDefault, stream));
+            CUDA_CHECK(cudaMemcpyAsync(work.scale(),
+                                       Tensor::aligned_scale(master.Stats),
+                                       sizeof(float),
+                                       cudaMemcpyDefault,
+                                       stream));
         }
         return;
     }
@@ -1301,7 +1309,7 @@ void DslWeightManager::finalize_fp8_block_masters(const cudaDeviceProp& dp, cuda
     float* d_stats = nullptr;
     CUDA_CHECK(cudaMalloc(&d_bf16, max_nelem * get_dtype_size(ETensorDType::BF16)));
     CUDA_CHECK(cudaMalloc(&d_fp8, max_nelem * get_dtype_size(ETensorDType::FP8_E4M3)));
-    CUDA_CHECK(cudaMalloc(&d_stats, 2 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_stats, Tensor::STATS_FLOATS * sizeof(float)));
 
     for (auto& [name, e] : mWeights) {
         if (!e.is_block || e.trainable || e.master.DType == ETensorDType::FP8_E4M3) continue;
@@ -1309,7 +1317,8 @@ void DslWeightManager::finalize_fp8_block_masters(const cudaDeviceProp& dp, cuda
         const long N = static_cast<long>(e.master.nelem());
         if (N <= 0) continue;
         // The host master buffer was sized for BF16 (2*N bytes); FP8 (N) + the inline
-        // [abs_max, scale] (8 bytes) fit in its front, so quantize in place with no realloc.
+        // STATS_FLOATS stats block (32 bytes, scale at its 16B-aligned slot) fit in its
+        // front for any real weight, so quantize in place with no realloc.
         const std::size_t stats_off = static_cast<std::size_t>(N) * get_dtype_size(ETensorDType::FP8_E4M3);
 
         // Shared masters (the frozen base shared across GPUs) are quantized exactly once.
@@ -1330,11 +1339,15 @@ void DslWeightManager::finalize_fp8_block_masters(const cudaDeviceProp& dp, cuda
             out.Stats = d_stats;
             abs_max(out.abs_max(), in, N, dp, stream);
             quantize_with_abs_max(out, out.scale(), in, out.abs_max(), N, dp, stream);
-            // FP8 bytes + the 2-float scale back into the host buffer's front.
+            // FP8 bytes + the stats back into the host buffer's front. abs_max and scale go
+            // to the HOST block's own layout (scale() is 16B-aligned relative to each base),
+            // so copy them individually instead of assuming both blocks line up.
+            float* host_stats = reinterpret_cast<float*>(static_cast<std::byte*>(e.master.Data) + stats_off);
             CUDA_CHECK(cudaMemcpyAsync(e.master.Data, d_fp8, stats_off, cudaMemcpyDefault, stream));
-            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(e.master.Data) + stats_off,
-                                       d_stats,
-                                       2 * sizeof(float),
+            CUDA_CHECK(cudaMemcpyAsync(host_stats, out.abs_max(), sizeof(float), cudaMemcpyDefault, stream));
+            CUDA_CHECK(cudaMemcpyAsync(Tensor::aligned_scale(host_stats),
+                                       out.scale(),
+                                       sizeof(float),
                                        cudaMemcpyDefault,
                                        stream));
             CUDA_CHECK(cudaStreamSynchronize(stream));
