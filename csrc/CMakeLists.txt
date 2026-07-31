@@ -234,6 +234,10 @@ if(NOT USE_CUFILE)
     set(CUFILE_LIBS "")
 endif ()
 
+# The buffered read path is compiled either way: the cuFile build falls back to it at
+# runtime when GPUDirect Storage is unusable (network/FUSE-backed checkpoint storage).
+list(APPEND CUFILE_SOURCE src/utilities/cu_file_common.cpp)
+
 if(USE_NVML)
     find_package(CUDAToolkit COMPONENTS nvml)
     set(NVML_SOURCE src/utilities/gpu_info_nvml.cpp)

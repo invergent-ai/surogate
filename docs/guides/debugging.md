@@ -116,6 +116,26 @@ surogate tokenize config.yaml --debug
 
 This prints tokens alongside their labels so you can confirm that the right spans are being ignored.
 
+### Checkpoint loading on network or FUSE storage
+
+Weights are read with GPUDirect Storage (cuFile) when it is available, which requires the
+`nvidia-fs` kernel module and a filesystem that supports it. Neither is present on
+network- or FUSE-backed storage — Modal volumes, WSL, and most container storage drivers —
+so the loader detects this at startup and falls back to buffered reads, printing one of:
+
+```
+cuFile: GPUDirect Storage unavailable (...); falling back to buffered reads
+cuFile: handle registration failed (...) for <file>; falling back to buffered reads ...
+```
+
+This is informational: the run continues and loads correctly, just without the
+DMA-straight-to-GPU fast path. To force buffered reads regardless — useful to rule cuFile
+out when diagnosing a load failure — set:
+
+```bash
+SUROGATE_DISABLE_CUFILE=1 surogate sft config.yaml
+```
+
 ---
 
 ## See also
