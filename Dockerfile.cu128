@@ -38,6 +38,8 @@ RUN echo "${CUDA_LIB_ROOT}/cuda_runtime/lib" >> /etc/ld.so.conf.d/cuda-12.conf \
     && echo "${CUDA_LIB_ROOT}/cuda_nvrtc/lib" >> /etc/ld.so.conf.d/cuda-12.conf \
     && echo "${CUDA_LIB_ROOT}/cublas/lib" >> /etc/ld.so.conf.d/cuda-12.conf \
     && echo "${CUDA_LIB_ROOT}/cufile/lib" >> /etc/ld.so.conf.d/cuda-12.conf \
+    && echo "${CUDA_LIB_ROOT}/cudnn/lib" >> /etc/ld.so.conf.d/cuda-12.conf \
+    && echo "${CUDA_LIB_ROOT}/nccl/lib" >> /etc/ld.so.conf.d/cuda-12.conf \
     && ldconfig
 
 # Install uv
