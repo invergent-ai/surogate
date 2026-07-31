@@ -1787,6 +1787,8 @@ void compute_grpo_custom_dloss(float* custom_dloss,
                                float adv_tau,
                                float teacher_tau,
                                float kl_tau,
+                               float ratio_clip,
+                               long window_start,
                                cudaStream_t stream);
 
 // DPO (Direct Preference Optimization) preference loss. One logical pair is

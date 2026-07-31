@@ -37,7 +37,7 @@ Recomputation trades compute for memory by recomputing activations during the ba
 
 ## Chunked-Sequence Training (long sequences)
 
-Train sequences far longer than activation memory would normally allow by processing the layer stack in fixed-size chunks with attention KV carried across chunks. Memory stays at the single-chunk footprint plus a small KV/state budget (KV is `2 * kv_heads * head_dim` bytes per token per attention layer), while gradients remain exact: backward walks chunks in reverse and accumulates dK/dV in FP32. Trailing all-padding chunks are skipped automatically (nothing attends to them). Works with `sample_packing` (per-document attention across chunk boundaries is preserved, including documents split across rows) and with GDN hybrid models (Qwen3.5/3.6 — the delta-rule recurrent state and causal-conv tail are carried across chunks exactly). Requires `per_device_train_batch_size: 1`, BF16 attention, and `lora_dropout: 0`; CUDA graphs are disabled automatically.
+Train sequences far longer than activation memory would normally allow by processing the layer stack in fixed-size chunks with attention KV carried across chunks. Memory stays at the single-chunk footprint plus a small KV/state budget (KV is `2 * kv_heads * head_dim` bytes per token per attention layer), while gradients remain exact: backward walks chunks in reverse and accumulates dK/dV in FP32. Trailing all-padding chunks are skipped automatically (nothing attends to them). Works with `sample_packing` (per-document attention across chunk boundaries is preserved, including documents split across rows) and with GDN hybrid models (Qwen3.5/3.6 — the delta-rule recurrent state and causal-conv tail are carried across chunks exactly). Requires `per_device_train_batch_size: 1`, BF16 attention, and `lora_dropout: 0`; CUDA graphs are disabled automatically. Applies to GRPO as well as SFT: when `sequence_chunks > 1`, the native GRPO step dispatches to the chunked path, which windows the GRPO dloss per chunk and skips all-padding tail chunks.
 
 | Option            | Type | Default | Description                                                                                                        |
 | ----------------- | ---- | ------- | ------------------------------------------------------------------------------------------------------------------ |
@@ -443,6 +443,7 @@ than from `datasets`, which is forced empty. See the
 | `max_async_level`       | int    | `1`            | How many steps the orchestrator may run ahead of the trainer. `1` is one step of off-policy staleness. |
 | `pad_to_multiple_of`    | int    | `1`            | Padding multiple for packed micro-batches.                                                       |
 | `doc_masking`           | bool   | `true`         | Document-level attention masking so packed samples cannot attend across each other.              |
+| `single_sample_bins`    | bool   | `false`        | Pack one sample per row instead of filling each row. Chunked-training attention has no packed-doc isolation, so multi-sample rows would let samples attend across each other. |
 | `turn_diagnostics`      | bool   | `false`        | Route the micro-step through the Python loss instead of the fused native step so per-token logprobs are visible. Same gradients, slower — measurement only. |
 
 `gradient_dtype` defaults to `fp32` for GRPO (the per-token gradient is 10-100x
@@ -458,6 +459,7 @@ where it matters comes from `lora_dtype`, which stays `fp32`.
 | `adv_tau`       | float | `1.0`   | Advantage scaling.                                                                |
 | `teacher_tau`   | float | `0.0`   | Weight on the teacher term for on-policy distillation. `0.0` disables it.         |
 | `kl_tau`        | float | `1e-3`  | KL penalty coefficient. Raise if the policy diverges from the reference too fast. |
+| `ratio_clip`    | float | `7.389056` | Hard ceiling on the importance ratio (default e²). Bounds the update when the sampling policy and the trainer policy drift apart — e.g. under periodic merged-weight reloads, where the baseline mismatch is larger than the IPO mask alone can absorb. |
 
 ### QeRL noise scheduler (`noise_scheduler:` block)
 
@@ -495,6 +497,8 @@ save cadence, and the step number weights are broadcast under — so an
 orchestrator already waiting on the step-`S` broadcast is unblocked rather than
 desynchronized. Set `resume_from_checkpoint: false` to force a fresh run.
 
+`adapter_path` is honored by GRPO: the adapter is applied before weight import (`adapter_init_mode: merge`) or loaded as the initial trainable adapter (`adapter_init_mode: trainable`), matching the SFT trainer.
+
 ## Memory Optimization Settings
 
 | Option                     | Type | Default | Description                                                                                               |
@@ -516,6 +520,7 @@ desynchronized. Set `resume_from_checkpoint: false` to force a fresh run.
 | `lora_target_modules` | list   | `["all"]` | List of module names to apply LoRA adapters to.                            |
 | `train_router`        | bool   | `false`   | Train MoE router gate during LoRA fine-tuning. Only applies to MoE models. |
 | `adapter_path`        | string | `null`    | Path to a PEFT adapter directory to merge into base weights before training. Requires `lora: true`. Not supported with pre-quantized models. |
+| `adapter_init_mode`   | string | `"merge"`  | How `adapter_path` is applied: `merge` folds it into the base weights and trains a fresh adapter; `trainable` loads it as the initial trainable adapter and continues training it. Honored by SFT, DPO, and GRPO. |
 | `merge_adapter`       | bool   | `false`   | Whether to merge LoRA adapters into the base model after training.         |
 
 ## MoE Settings

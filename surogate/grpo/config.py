@@ -24,6 +24,20 @@ class GRPOLossConfig:
     adv_tau: float = 1.0
     teacher_tau: float = 0.0
     kl_tau: float = 1e-3  # The tau for KL divergence
+    # OPD / replay knobs used by the reference loss (surogate/grpo/loss.py);
+    # off by default. These fields were referenced by loss.py and its tests
+    # but never added here (pre-existing gap, fixed 2026-07-27).
+    opd_tau: float = 0.0
+    opd_beta: float = 1.0
+    replay_tau: float = 0.0
+    # Hard cap on exp(trainer - inference) in the policy-gradient seed. The
+    # IPO probability-difference mask does NOT bound the ratio: a rare token
+    # (both probs tiny, trainer >> inference in ratio terms) passes the mask
+    # with a ratio of 1e3-1e5 and dominates the batch gradient. e^2 keeps
+    # ~all honest off-policy correction (periodic-reload staleness) while
+    # bounding single-token influence. Uncapped values still feed the
+    # mismatch_kl metric so staleness monitoring sees the truth.
+    ratio_clip: float = 7.389056  # e^2
 
 
 @dataclass
@@ -65,6 +79,11 @@ class GRPOTrainConfig(SFTConfig):
     max_async_level: int = 1
     # Padding multiple for packed micro-batches.
     pad_to_multiple_of: int = 1
+    # One sample per micro-batch (disables FFD packing). REQUIRED with
+    # sequence_chunks > 1: chunked training attention has no packed-doc
+    # isolation. Pair with pad_to_multiple_of = chunk size; all-padding
+    # tail chunks are skipped natively.
+    single_sample_bins: bool = False
     # Document-level attention masking for packed sequences.
     doc_masking: bool = True
     # Turn-resolved supervision diagnostics (TurnOPD arXiv:2607.05804 §4).
@@ -125,6 +144,7 @@ class GRPOTrainConfig(SFTConfig):
             self.noise_scheduler = NoiseSchedulerConfig()
 
         self.transport_type = cfg.get("transport_type", self.transport_type)
+        self.single_sample_bins = bool(cfg.get("single_sample_bins", self.single_sample_bins))
         self.weight_broadcast_type = cfg.get("weight_broadcast_type", self.weight_broadcast_type)
         self.max_async_level = cfg.get("max_async_level", self.max_async_level)
         self.pad_to_multiple_of = cfg.get("pad_to_multiple_of", self.pad_to_multiple_of)

@@ -1,3 +1,4 @@
+import shutil
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -7,6 +8,7 @@ import torch
 from surogate.core.config.grpo_orch_config import GRPOCheckpointConfig
 from surogate.grpo.orchestrator.buffer import Buffer
 from surogate.grpo.utils.logger import get_logger
+from surogate.grpo.utils.pathing import get_all_ckpt_steps
 from surogate.grpo.utils.utils import get_ckpt_dir, get_step_path
 
 
@@ -90,6 +92,28 @@ class CheckpointManager:
         ckpt_path = self.get_ckpt_path(step)
         ckpt_path.mkdir(parents=True, exist_ok=True)
         self._save_to_path(ckpt_path, progress, buffer)
+        self._cleanup_old_ckpts()
+
+    def _cleanup_old_ckpts(self) -> None:
+        """Enforces keep_last/keep_interval: removes old step_N checkpoint dirs, keeping the
+        newest keep_last and any step that is a keep_interval multiple. No-op when keep_last
+        is unset. Only step_N directories are touched (other files in the dir are left alone)."""
+        keep_last = self.config.keep_last
+        if keep_last is None:
+            return
+        steps = get_all_ckpt_steps(self.ckpt_dir)
+        protected = set(steps[-keep_last:]) if keep_last > 0 else set()
+        keep_interval = self.config.keep_interval
+        for s in steps:
+            if s in protected or (keep_interval and s % keep_interval == 0):
+                continue
+            step_dir = get_step_path(self.ckpt_dir, s)
+            if not (step_dir.is_dir() and step_dir.name.startswith("step_")):
+                continue
+            try:
+                shutil.rmtree(step_dir)
+            except Exception as e:
+                logger.warning(f"Failed to clean old orchestrator checkpoint {step_dir}: {e}")
 
 
 def setup_ckpt_manager(output_dir: Path, config: GRPOCheckpointConfig | None) -> CheckpointManager | None:

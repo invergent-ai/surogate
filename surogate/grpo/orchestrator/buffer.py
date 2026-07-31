@@ -72,6 +72,7 @@ class Buffer:
         # Initialize buffers for easy/ hard examples
         self.easy_examples: list[dict] = []
         self.hard_examples: list[dict] = []
+        self.consumed_examples: list[dict] = []
 
         # Initialize rollout buffer (flat list of rollouts)
         self.rollout_buffer: list[vf.RolloutOutput] = []
@@ -95,6 +96,7 @@ class Buffer:
 
         write_jsonl(self.easy_examples, path / "easy_examples.jsonl")
         write_jsonl(self.hard_examples, path / "hard_examples.jsonl")
+        write_jsonl(self.consumed_examples, path / "consumed_examples.jsonl")
         write_jsonl(self.rollout_buffer, path / "rollout_buffer.jsonl")
 
     def load(self, path: Path) -> None:
@@ -106,9 +108,22 @@ class Buffer:
 
         saved_easy_examples = read_jsonl(path / "easy_examples.jsonl")
         saved_hard_examples = read_jsonl(path / "hard_examples.jsonl")
+        consumed_path = path / "consumed_examples.jsonl"
+        if self.config.sample_without_replacement and not consumed_path.is_file():
+            raise ValueError(
+                "one-use buffer checkpoint has no consumed_examples.jsonl ledger"
+            )
+        saved_consumed_examples = (
+            read_jsonl(consumed_path) if consumed_path.is_file() else []
+        )
         saved_rollout_buffer = cast(list[vf.RolloutOutput], read_jsonl(path / "rollout_buffer.jsonl"))
 
-        if any(saved_easy_examples) or any(saved_hard_examples) or any(saved_rollout_buffer):
+        if (
+            any(saved_easy_examples)
+            or any(saved_hard_examples)
+            or any(saved_consumed_examples)
+            or any(saved_rollout_buffer)
+        ):
             # Build hash lookup for example buffer (env -> (example_hash -> example_id))
             example_hash_lookup = defaultdict(dict)
             all_hashes = set()
@@ -155,6 +170,19 @@ class Buffer:
                         f"Could not move {num_not_moved} example(s) from checkpoint to hard pool. This usually means you resumed with an env mix that does not contain all previous examples."
                     )
 
+            if any(saved_consumed_examples):
+                num_moved = move_saved_pool(
+                    saved_consumed_examples,
+                    self.consumed_examples,
+                )
+                if num_moved != len(saved_consumed_examples):
+                    raise ValueError(
+                        "one-use buffer checkpoint does not match the current dataset"
+                    )
+                logger.debug(
+                    f"Restored {num_moved} consumed one-use example(s) from checkpoint."
+                )
+
             if any(saved_rollout_buffer):
                 # Extend rollout buffer, but only include rollouts for which the example still exists in the example buffer
                 valid_saved_rollouts = [
@@ -164,32 +192,79 @@ class Buffer:
                 logger.debug(f"Loaded {len(valid_saved_rollouts)} rollout(s) from checkpoint.")
 
             # Load rollouts, filtering out removed environments and problems
-            def convert_examples_to_normal(examples: list[dict], fraction: float) -> int:
-                """Moves a fraction of examples from the given pool back to normal."""
-                if fraction <= 0.0 or not examples:
-                    return 0
-                num_moved = round(len(examples) * fraction)
-                if num_moved <= 0:
-                    return 0
-                for _ in range(num_moved):
-                    example = random.choice(examples)
-                    env_name = example["task"]
-                    example_id = example["example_id"]
-                    examples.remove(example)
-                    self.example_buffer[env_name][example_id] = example
-                return num_moved
-
             num_easy_examples = len(self.easy_examples)
-            num_moved = convert_examples_to_normal(self.easy_examples, self.config.easy_fraction)
+            num_moved = self._move_examples_to_normal(self.easy_examples, self.config.easy_fraction)
             logger.debug(f"Converted {num_moved}/{num_easy_examples} example(s) back to normal from easy pool.")
             num_hard_examples = len(self.hard_examples)
-            num_moved = convert_examples_to_normal(self.hard_examples, self.config.hard_fraction)
+            num_moved = self._move_examples_to_normal(self.hard_examples, self.config.hard_fraction)
             logger.debug(f"Converted {num_moved}/{num_hard_examples} example(s) back to normal from hard pool.")
         else:
             logger.debug("No easy/ hard examples or rollouts found in checkpoint")
 
+    def _normal_example_count(self) -> int:
+        return sum(len(examples) for examples in self.example_buffer.values())
+
+    def _move_examples_to_normal(self, examples: list[dict], fraction: float | None) -> int:
+        """Moves a fraction of examples from an easy/hard pool back to normal."""
+        if fraction is None or fraction <= 0.0 or not examples:
+            return 0
+        num_moved = round(len(examples) * fraction)
+        if num_moved <= 0:
+            num_moved = 1
+        num_moved = min(num_moved, len(examples))
+        for _ in range(num_moved):
+            example = random.choice(examples)
+            env_name = example["task"]
+            example_id = example["example_id"]
+            examples.remove(example)
+            self.example_buffer[env_name][example_id] = example
+        return num_moved
+
+    def _recycle_examples_if_needed(self) -> None:
+        min_normal = self.config.normal_pool_min_examples or 0
+        if self._normal_example_count() > min_normal:
+            return
+
+        moved_easy = self._move_examples_to_normal(self.easy_examples, self.config.recycle_easy_fraction)
+        moved_hard = self._move_examples_to_normal(self.hard_examples, self.config.recycle_hard_fraction)
+        self.recycled_examples_per_step["easy"] += moved_easy
+        self.recycled_examples_per_step["hard"] += moved_hard
+
+        if moved_easy or moved_hard:
+            logger.info(
+                "Recycled %d easy and %d hard example(s) into the normal pool "
+                "(normal=%d, easy=%d, hard=%d)",
+                moved_easy,
+                moved_hard,
+                self._normal_example_count(),
+                len(self.easy_examples),
+                len(self.hard_examples),
+            )
+
     def sample_examples(self, n: int) -> list[dict]:
         """Samples n examples from the buffer, respecting env ratios."""
+
+        self._recycle_examples_if_needed()
+        if self.config.sample_without_replacement:
+            sampled_examples = []
+            for _ in range(n):
+                non_empty_envs = [
+                    env for env, examples in self.example_buffer.items() if examples
+                ]
+                if not non_empty_envs:
+                    raise ValueError("No environments left with examples.")
+                sampled_env = random.choices(
+                    non_empty_envs,
+                    weights=[self.env_probs[env] for env in non_empty_envs],
+                    k=1,
+                )[0]
+                sampled_example = random.choice(
+                    list(self.example_buffer[sampled_env].values())
+                )
+                self.example_buffer[sampled_env].pop(sampled_example["example_id"])
+                self.consumed_examples.append(sampled_example)
+                sampled_examples.append(sampled_example)
+            return sampled_examples
 
         non_empty_envs = [env for env, examples in self.example_buffer.items() if examples]
 
@@ -253,6 +328,7 @@ class Buffer:
         self.num_examples_per_step = {env: zero_per_pool() for env in self.env_names}
         # num rollouts per env per step per pool (env_name -> (pool -> num_rollouts))
         self.num_rollouts_per_step = {env: zero_per_pool() for env in self.env_names}
+        self.recycled_examples_per_step = {"easy": 0, "hard": 0}
 
     def get_metrics(self) -> dict[str, float]:
         """Returns the buffer metrics for the current step."""
@@ -280,6 +356,9 @@ class Buffer:
         pool_ratios = mean_normalize(pool_counts)
         for pool, pool_ratio in zip(self.POOLS, pool_ratios):
             metrics[f"pool/{pool}"] = pool_ratio
+
+        for pool in ["easy", "hard"]:
+            metrics[f"recycled_examples/{pool}"] = self.recycled_examples_per_step[pool]
 
         self.reset_step_metrics()
 

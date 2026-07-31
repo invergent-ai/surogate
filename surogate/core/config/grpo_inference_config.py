@@ -41,6 +41,7 @@ class GRPOInferenceConfig:
         max_num_seqs: Maximum number of concurrent sequences. Passed to vLLM as `--max-num-seqs`.
         kv_cache_dtype: KV cache data type, e.g. `fp8`. Passed to vLLM as `--kv-cache-dtype`.
         enforce_eager: Whether to enforce eager mode. Passed to vLLM as `--enforce-eager`.
+        attention_backend: Optional vLLM attention backend override.
         trust_remote_code: Whether to trust remote code. Passed to vLLM engine init.
         enable_auto_tool_choice: Whether to enable auto tool choice. Passed to vLLM as `--enable-auto-tool-choice`.
         tool_call_parser: The tool call parser to use. Passed to vLLM as `--tool-call-parser`.
@@ -71,16 +72,17 @@ class GRPOInferenceConfig:
     dtype: Literal["auto", "float16", "bfloat16", "float32"] | None = "auto"
     max_model_len: int | None = None
     # Concurrency cap. Sizes the CUDA-graph/activation buffers, so it is the
-    # knob that decides whether a big model + LoRA fits: enabling LoRA on a
+    # knob that decides whether a big model + LoRA fits: enabling LoRA on the
     # 27B TP2 server OOMs at the vLLM default and fits at a small value
     # (measured 2026-07-31). Lowering gpu_memory_utilization does NOT help --
     # it shrinks the very budget the allocation draws from.
     max_num_seqs: int | None = None
-    # fp8 KV halves cache bytes/token, raising concurrency on a KV-bound
-    # server. It also perturbs sampled logprobs, which feed GRPO's importance
-    # ratio -- watch mismatch_kl before adopting.
+    # fp8 KV halves cache bytes/token, ~doubling concurrency on a
+    # KV-bound server. It also perturbs sampled logprobs, which feed
+    # GRPO's importance ratio — measure mismatch_kl before adopting.
     kv_cache_dtype: str | None = None
     enforce_eager: bool | None = False
+    attention_backend: str | None = None
     trust_remote_code: bool | None = False
     enable_auto_tool_choice: bool | None = False
     tool_call_parser: str | None = "hermes"
@@ -116,6 +118,7 @@ class GRPOInferenceConfig:
         self.max_num_seqs = cfg.get("max_num_seqs", self.max_num_seqs)
         self.kv_cache_dtype = cfg.get("kv_cache_dtype", self.kv_cache_dtype)
         self.enforce_eager = cfg.get("enforce_eager", self.enforce_eager)
+        self.attention_backend = cfg.get("attention_backend", self.attention_backend)
         self.trust_remote_code = cfg.get("trust_remote_code", self.trust_remote_code)
         self.enable_auto_tool_choice = cfg.get("enable_auto_tool_choice", self.enable_auto_tool_choice)
         self.tool_call_parser = cfg.get("tool_call_parser", self.tool_call_parser)
@@ -162,6 +165,7 @@ class GRPOInferenceConfig:
             "max_num_seqs": "max_num_seqs",
             "kv_cache_dtype": "kv_cache_dtype",
             "enforce_eager": "enforce_eager",
+            "attention_backend": "attention_backend",
             "trust_remote_code": "trust_remote_code",
             "enable_auto_tool_choice": "enable_auto_tool_choice",
             "tool_call_parser": "tool_call_parser",
@@ -191,7 +195,7 @@ class GRPOInferenceConfig:
         # Leave vLLM's own default in place when unset (None is not a valid
         # value for these scalars).
         for _scalar in ("max_num_seqs", "kv_cache_dtype"):
-            if hasattr(namespace, _scalar) and getattr(namespace, _scalar) is None:
+            if getattr(namespace, _scalar, None) is None and hasattr(namespace, _scalar):
                 delattr(namespace, _scalar)
 
         # Remove reasoning_parser if not set (vLLM doesn't accept None)

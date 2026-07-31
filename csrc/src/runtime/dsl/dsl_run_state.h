@@ -411,6 +411,9 @@ private:
     std::byte* mOwnedExternalStack = nullptr;
     std::size_t mOwnedExternalStackBytes = 0;
     RecomputeLevel mRecomputeLevel = RecomputeLevel::Enabled;
+    /// Token capacity for GRPO native scratch: B*T*SequenceChunks — chunked
+    /// GRPO uploads FULL-sequence arrays once and executes per chunk window.
+    long mGrpoTokenCapacity = 0;
     bool mLoraOnlyMode = false;
     bool mPrequantized = false;
     bool mCpuTraining = false;

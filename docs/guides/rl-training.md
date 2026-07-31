@@ -318,6 +318,36 @@ The CLI applies `CUDA_VISIBLE_DEVICES=<trainer ids>` to the parent process **bef
 
 In split mode, weight broadcasts use the filesystem backend regardless of what is configured in the YAML. Each broadcast writes the LoRA adapter (~10 MB) to `{output_dir}/broadcasts/step_N/`; vLLM polls for the `STABLE` marker file and hot-reloads the adapter.
 
+### Long sequences: chunked GRPO
+
+Agentic rollouts run far longer than a dense activation budget allows. Setting
+`sequence_chunks: N` in `train.yaml` routes the native GRPO step through the
+chunked path: chunks are forwarded left-to-right to fill the attention KV
+caches, then walked in reverse for the GRPO dloss and backward, accumulating
+dK/dV across chunks. Gradients are exact; memory stays at the single-chunk
+footprint. All-padding tail chunks are detected from the per-sample end offsets
+and skipped.
+
+Pair it with `single_sample_bins: true`. Chunked-training attention carries no
+packed-document isolation, so a row holding several samples would let them
+attend across each other.
+
+```yaml
+# train.yaml
+sequence_len: 6144
+sequence_chunks: 4        # 1536-token chunks
+single_sample_bins: true
+per_device_train_batch_size: 1
+```
+
+### Bounding the importance ratio
+
+`loss.ratio_clip` (default `7.389056`, i.e. e²) caps the importance ratio. The
+IPO mask drops tokens whose probability moved too far, but under periodic
+merged-weight reloads the sampling policy and the trainer policy can diverge
+enough that surviving tokens still carry an extreme ratio. `ratio_clip` bounds
+what any single token can contribute.
+
 ### Reading progress from a log file
 
 The orchestrator's rollout progress bar is `tqdm`, which needs a TTY. Under
@@ -885,6 +915,10 @@ Key orchestrator settings:
 | `buffer.hard_threshold`              | `null`               | Reward threshold below which a problem is "hard"        |
 | `buffer.easy_fraction`               | `0.0`                | Fraction of easy problems to promote to normal on start |
 | `buffer.hard_fraction`               | `0.0`                | Fraction of hard problems to promote to normal on start |
+| `buffer.normal_pool_min_examples`    | `0`                  | Recycle easy/hard examples when normal pool is this low |
+| `buffer.recycle_easy_fraction`       | `0.0`                | Fraction of easy examples recycled when normal is low   |
+| `buffer.recycle_hard_fraction`       | `0.0`                | Fraction of hard examples recycled when normal is low   |
+| `buffer.sample_without_replacement`  | `false`              | Permanently consume an example when its rollout group is scheduled (one-attempt agentic tasks). Cannot be combined with recycling. |
 | `buffer.hash_keys`                   | `["task", "prompt"]` | Keys used for example deduplication                     |
 | `buffer.skip_verification`           | `false`              | If true, disable reward scoring (rewards always 0)      |
 | `buffer.env_ratios`                  | `null`               | Per-environment sampling ratios (list, must sum to >0)  |

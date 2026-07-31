@@ -28,7 +28,7 @@ from surogate.train.lr_schedule import LRSchedule
 from surogate.train.metrics_writer import MetricsWriter
 from surogate.utils.hf import get_model_weights_path
 from surogate.utils.logger import get_logger
-from surogate.utils.lora_compat import ensure_surogate_lora_compat, ensure_vllm_lora_compat
+from surogate.utils.lora_compat import ensure_vllm_lora_compat
 from surogate.utils.tensor import to_surogate_dtype
 
 logger = get_logger()
@@ -99,7 +99,13 @@ class GRPOTrainer:
             config=_surogate.PretrainedConfig.from_pretrained(config.model_dir, to_surogate_dtype(config.torch_dtype)),
             options=config.runtime_config,
             batch_size=config.per_device_train_batch_size,
-            seq_len=config.sequence_len,
+            # Graph sequence length is the CHUNK size under chunked-sequence
+            # training (trainer_seq_len = sequence_len // sequence_chunks),
+            # exactly as the SFT wrapper passes it. Passing the full
+            # sequence_len here built an unchunked graph whose saved-tensor
+            # cache cannot fit long sequences (found 2026-07-27 bringing up
+            # the first chunked GRPO run, on the 27B hybrid).
+            seq_len=config.trainer_seq_len,
             grad_accum=1,  # Set dynamically per step via set_grad_accumulation()
             memcpy_all_gather=config.memcpy_all_gather,
             memcpy_send_recv=config.memcpy_send_recv,
@@ -118,7 +124,35 @@ class GRPOTrainer:
         if vocab_size:
             self._pad_logprob = float(np.log(1.0 / float(vocab_size)))
 
-        # Import pretrained weights
+        # Import pretrained weights.
+        #
+        # Adapter-init protocol (2026-07-27): the SFT wrapper calls
+        # configure_initial_adapter BEFORE import (adapter_init_mode=merge
+        # registers the adapter via set_adapter_path so the native import
+        # merges it in-stream) and import_initial_trainable_adapter after.
+        # GRPOTrainer skipped both, silently IGNORING adapter_path — a run
+        # configured to start from base+adapter would have trained from the
+        # raw base.
+        from surogate.train.adapter_init import (
+            configure_initial_adapter,
+            import_initial_trainable_adapter,
+        )
+
+        # Resume protocol (2026-07-29, mirrors the SFT wrapper): before this,
+        # resume_from_checkpoint was silently IGNORED — every restart began
+        # at step 0 with a fresh adapter and re-trained all on-disk batches
+        # (2h of redundant GPU on the r5b relaunch), and the re-run's
+        # broadcast sequence desynced the orchestrator's get_weight_dir.
+        # ``self.start_step`` is the NEXT batch to train: checkpoint at step
+        # S = trained through batch S, so resume trains S+1.
+        resume_step = -1
+        if getattr(config, "resume_from_checkpoint", False) and config.checkpoint_dir:
+            resume_step = _surogate.find_latest_checkpoint(str(config.checkpoint_dir))
+        self.start_step = 0
+        fresh_run = resume_step < 0
+
+        initial_adapter = configure_initial_adapter(
+            config, self.trainer, fresh_run=fresh_run)
         model_weights_path = get_model_weights_path(config.model_dir)
         if external_weights is not None:
             # Zero-copy import from external GPU pointers (colocate mode with vLLM)
@@ -127,26 +161,18 @@ class GRPOTrainer:
         else:
             logger.info(f"Importing weights from {model_weights_path}")
             self.trainer.import_weights(model_weights_path)
+        if fresh_run:
+            import_initial_trainable_adapter(self.trainer, initial_adapter)
+        else:
+            from surogate.utils.lora_compat import ensure_surogate_lora_compat
 
-        # Checkpoint resume. `resume_from_checkpoint` is inherited from
-        # SFTConfig and defaults to True, but GRPOTrainer never acted on it:
-        # every restart began at step 0 with a fresh adapter, re-trained the
-        # batches already on disk, and re-emitted weight broadcasts under step
-        # numbers the orchestrator had already consumed.
-        #
-        # `self.start_step` is the NEXT batch to train: a checkpoint at step S
-        # means "trained through batch S", so a resumed run starts at S + 1.
-        self.start_step = 0
-        resume_step = -1
-        if config.resume_from_checkpoint and config.checkpoint_dir:
-            resume_step = _surogate.find_latest_checkpoint(str(config.checkpoint_dir))
-        if resume_step >= 0:
             if config.lora:
                 ensure_surogate_lora_compat(
                     Path(config.checkpoint_dir) / f"step_{resume_step:08d}",
                     config.model_dir,
                 )
-            logger.info(f"Resuming from checkpoint step {resume_step} (next batch: {resume_step + 1})")
+            logger.info(f"Resuming from checkpoint step {resume_step} "
+                        f"(next batch: {resume_step + 1})")
             self.trainer.load_checkpoint(str(config.checkpoint_dir), resume_step)
             self.start_step = resume_step + 1
 
@@ -583,6 +609,8 @@ class GRPOTrainer:
             transport_config=transport_config,
             start_step=start_step,
         )
+        # chunked GRPO: no packed-doc isolation in chunked training attention
+        self.packer.single_sample_bins = bool(getattr(config, 'single_sample_bins', False))
 
         # Setup data loader (receives packed MicroBatches)
         self.data_loader = GRPODataLoader(
@@ -597,10 +625,10 @@ class GRPOTrainer:
         config = self.config
         max_steps = config.max_steps
 
-        # start_step comes from checkpoint resume (the next batch to train).
-        # It drives the packer (which batch to pack next), the data loader
+        # start_step comes from checkpoint resume (next batch to train);
+        # it drives the packer (which batch to pack next), the data loader
         # (which batch to read), and the internal step counter (save cadence
-        # and LR). All three must agree or a restart re-trains from batch 0.
+        # + LR). All three must agree or a restart re-trains from batch 0.
         self._setup_data(start_step=self.start_step)
 
         logger.info("Starting GRPO training loop")
@@ -627,18 +655,19 @@ class GRPOTrainer:
         else:
             logger.info("  Running indefinitely (waiting for orchestrator)")
 
-        # Internal trainer step (one per grad_accum chunk, for LR schedule and
+        # Internal trainer step (one per grad_accum chunk, for LR schedule +
         # logging). Starts at the resume point so save cadence and metrics
         # continue the same sequence instead of restarting at 0.
         step = self.start_step
-        # Trainer-owned batch counter. mrm.progress[0].step is initialized from
-        # the ORCHESTRATOR's checkpoints on run discovery, and the orchestrator
-        # runs ahead of a resumed trainer by up to max_async_level — reading it
-        # here misnames weight broadcasts after a restart (e.g. checkpoint-5
-        # weights emitted as step_9). `start_step + packs_done` is identical to
-        # the old value on a fresh run (0 + N) and correct on resume: the first
-        # iteration re-emits the checkpoint weights under the resume step,
-        # unblocking an orchestrator already waiting on that broadcast.
+        # Trainer-owned batch counter (2026-07-29). mrm.progress[0].step is
+        # initialized from the ORCHESTRATOR's checkpoints on run discovery,
+        # which runs ahead of a resumed trainer by up to max_async_level —
+        # reading it here misnames weight broadcasts after a restart (e.g.
+        # ckpt-5 weights emitted as step_9). start_step + packs_done is
+        # byte-identical to the old value on fresh runs (0 + N) and correct
+        # on resume: the first iteration re-emits the checkpoint weights
+        # under the resume step, unblocking an orchestrator already waiting
+        # on that broadcast.
         packs_done = 0
         while True:
             orch_step = self.start_step + packs_done
@@ -840,6 +869,7 @@ class GRPOTrainer:
                     adv_tau=float(config.loss.adv_tau),
                     teacher_tau=float(config.loss.teacher_tau),
                     kl_tau=float(config.loss.kl_tau),
+                    ratio_clip=float(config.loss.ratio_clip),
                 )
 
             # 5. Optimizer step — one per orchestrator step (lr/opt_config built above)
@@ -871,8 +901,9 @@ class GRPOTrainer:
 
             step += 1
 
-        # Final weight broadcast — same trainer-owned counter as the loop, so a
-        # resumed run does not publish under an orchestrator step number.
+        # Final weight broadcast
+        # Same trainer-owned counter as the loop, so a resumed run does not
+        # publish the final weights under an orchestrator step number.
         self.broadcast.broadcast(self.trainer, self.start_step + packs_done)
 
         # Save final adapter/model
