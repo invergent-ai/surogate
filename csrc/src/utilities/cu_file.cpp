@@ -33,15 +33,24 @@ std::string cufile_error_str(CUfileError_t status) {
  *
  * cuFile needs the nvidia-fs kernel module and a filesystem that supports it. Neither
  * holds on network- or FUSE-backed storage (Modal volumes, WSL, many container storage
- * drivers). Note that cuFileDriverOpen() does not necessarily report this: without
- * nvidia-fs it succeeds and quietly enters compatibility mode, so the properties check
- * below is what actually decides. Any of these is a reason to read the checkpoint
- * differently, not to fail the run, so we latch the answer and let open_cufile() adapt.
+ * drivers). Any of these is a reason to read the checkpoint differently, not to fail the
+ * run, so we latch the answer and let open_cufile() adapt.
+ *
+ * The nvidia-fs probe below must happen before any libcufile entry point. Without the
+ * module libcufile does not fail: it logs "running in compatible mode" and, on container
+ * filesystems, then spins inside the driver-open path instead of returning — hanging the
+ * load with no error. Checking the same file it checks keeps us out of that path
+ * entirely. The driver-open and properties checks that follow are belt-and-braces for
+ * hosts where nvidia-fs is present but GDS still is not usable.
  */
 bool gds_available() {
     static const bool available = [] {
         if (cufile_disabled_by_env()) {
             fprintf(stderr, "cuFile: disabled via SUROGATE_DISABLE_CUFILE, using buffered reads\n");
+            return false;
+        }
+        if (::access("/proc/driver/nvidia-fs/devcount", F_OK) != 0) {
+            fprintf(stderr, "cuFile: nvidia-fs kernel module not loaded; using buffered reads\n");
             return false;
         }
         CUfileError_t status = cuFileDriverOpen();

@@ -124,9 +124,15 @@ network- or FUSE-backed storage — Modal volumes, WSL, and most container stora
 so the loader detects this at startup and falls back to buffered reads, printing one of:
 
 ```
+cuFile: nvidia-fs kernel module not loaded; using buffered reads
 cuFile: GPUDirect Storage unavailable (...); falling back to buffered reads
 cuFile: handle registration failed (...) for <file>; falling back to buffered reads ...
 ```
+
+The nvidia-fs check happens before any libcufile call on purpose. Without the module
+libcufile does not report an error — it logs `running in compatible mode` to `cufile.log`
+and, on container filesystems, then spins inside driver-open instead of returning, which
+hangs the load with no message at all.
 
 This is informational: the run continues and loads correctly, just without the
 DMA-straight-to-GPU fast path. To force buffered reads regardless — useful to rule cuFile
