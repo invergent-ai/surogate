@@ -964,6 +964,14 @@ private:
     int mMicroStep = 0;
     int mCurrentLayer = -1;
     int mPrefetchDirection = 1;  // +1 for forward, -1 for backward
+    // Backward layer successor map derived from the compiled graph's actual
+    // visit order. Hybrid models (Q3.5/Q3.6) run a NON-monotonic backward
+    // (all attention layers first, then the linear/GDN pass), so the naive
+    // `layer_idx - 1` prefetch guesses wrong for most layers and every
+    // mispredicted gather_block degrades to a synchronous weight stream on
+    // the critical path. handle_layer_start consults this map when in the
+    // backward pass; empty/-1 falls back to layer_idx + mPrefetchDirection.
+    std::vector<int> mBwdNextLayer;
     bool mCapturing = false;
     bool mInReplay = false;    ///< True during replay_layer_forward
     int mReplayLayerIdx = -1;  ///< Layer being replayed

@@ -206,6 +206,11 @@ DslWeightManager::DslWeightManager(const Module& module,
     mConfig.persistent_quants = options.PersistentQuants;
     mConfig.use_zero_copy = options.UseZeroCopy;
     mConfig.cpu_training = options.CpuTraining;
+    // Frozen-base cpu_training keeps embedding/lm_head resident on device (see
+    // DslWeightManagerConfig::resident_nonblock). The frozen base never changes,
+    // so the per-version gather skip makes each buffer stream exactly once.
+    mConfig.resident_nonblock = mConfig.cpu_training && lora_config && lora_config->enabled() &&
+                                std::getenv("SUROGATE_SHARED_NONBLOCK_STAGING") == nullptr;
     mConfig.enable_fp8_forward = options.fp8_forward_enabled();
     // FP8 weight streaming: only when the FP8 forward recipe is active AND masters are
     // offloaded (dispatch-PP). Then frozen matmul block masters are stored + streamed as
@@ -377,7 +382,14 @@ void DslWeightManager::allocate_weights(const Module& module,
                 // full GPU copy for a sparse lookup.
                 entry.work = Tensor{};
             } else if (is_primary_embedding_name(name) || is_lm_head_name(name)) {
-                entry.work = Tensor{};  // Will be set to the shared buffer below
+                if (mConfig.resident_nonblock) {
+                    // Frozen base: dedicated resident work buffer, streamed once
+                    // (gather_* skips on matching version) instead of per sweep.
+                    entry.work = mAllocator->allocate(
+                        param_dtype, (name + "_work").c_str(), EAllocationType::ON_DEVICE, shape);
+                } else {
+                    entry.work = Tensor{};  // Will be set to the shared buffer below
+                }
             } else {
                 entry.work =
                     mAllocator->allocate(param_dtype, (name + "_work").c_str(), EAllocationType::ON_DEVICE, shape);
@@ -401,7 +413,8 @@ void DslWeightManager::allocate_weights(const Module& module,
     // These are never live simultaneously. final_norm must keep its own buffer because
     // the executor gathers embedding+final_norm in forward and final_norm+lm_head in
     // backward before either pair is consumed.
-    if (mConfig.cpu_training) {
+    // (Skipped under resident_nonblock: both already own dedicated buffers.)
+    if (mConfig.cpu_training && !mConfig.resident_nonblock) {
         const ETensorDType work_dtype = mConfig.work_dtype;
         std::size_t max_shared_non_block_bytes = 0;
         std::vector<long> max_shared_non_block_shape;
@@ -453,7 +466,13 @@ bool DslWeightManager::work_is_transient(const std::string& name) const {
     }
     if (mConfig.cpu_training) {
         // Embedding and lm_head share one GPU staging buffer; each gather
-        // overwrites it with the tensor about to be consumed.
+        // overwrites it with the tensor about to be consumed. Keep them
+        // "transient" even under resident_nonblock: the buffers are stable
+        // there, but reporting them cacheable flips the lm_head matmul onto
+        // the FP8 quantize-once cache, which the GRPO compact-row lm_head
+        // path does not support (BF16-only) — measured as a mismatch_kl
+        // blowup. The residency win comes from the gather version-skip, not
+        // from cacheability.
         return is_primary_embedding_name(name) || is_lm_head_name(name);
     }
     return false;
@@ -880,8 +899,10 @@ void DslWeightManager::gather_embeddings(NCCLCommunicator& comm, cudaStream_t st
     if ((!mStreamWeights && !mConfig.offload_master) || mEmbeddingName.empty()) {
         return;
     }
-    // Skip cache check when cpu_training — shared buffer may have been overwritten by lm_head
-    if (!mConfig.cpu_training && mEmbeddingsStatus.version == mVersion) {
+    // Skip cache check when cpu_training with the SHARED staging buffer — it may
+    // have been overwritten by lm_head. With resident_nonblock each tensor owns
+    // its buffer, so a matching version means the content is already on device.
+    if ((!mConfig.cpu_training || mConfig.resident_nonblock) && mEmbeddingsStatus.version == mVersion) {
         return;
     }
 
@@ -929,7 +950,7 @@ void DslWeightManager::gather_final_norm(NCCLCommunicator& comm, cudaStream_t st
     if ((!mStreamWeights && !mConfig.offload_master) || mFinalNormName.empty()) {
         return;
     }
-    if (!mConfig.cpu_training && mFinalNormStatus.version == mVersion) {
+    if ((!mConfig.cpu_training || mConfig.resident_nonblock) && mFinalNormStatus.version == mVersion) {
         return;
     }
 
@@ -977,7 +998,7 @@ void DslWeightManager::gather_lm_head(NCCLCommunicator& comm, cudaStream_t strea
     if ((!mStreamWeights && !mConfig.offload_master) || mLmHeadName.empty()) {
         return;
     }
-    if (!mConfig.cpu_training && mLmHeadStatus.version == mVersion) {
+    if ((!mConfig.cpu_training || mConfig.resident_nonblock) && mLmHeadStatus.version == mVersion) {
         return;
     }
 

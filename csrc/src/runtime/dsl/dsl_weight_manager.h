@@ -72,6 +72,13 @@ struct DslWeightManagerConfig {
     bool use_zero_copy = false;      ///< Use zero-copy for CPU-GPU transfers
     bool cpu_training = false;       ///< CPU-RAM centric mode (offload ALL weights, not just blocks)
 
+    // cpu_training + frozen base (LoRA): give embedding and lm_head their own
+    // resident device work buffers instead of one shared staging buffer that
+    // every gather re-streams from pinned host. Costs max(emb, lm_head) extra
+    // VRAM (~2.5 GB on a 250k-vocab model) and removes ~5 GB of PCIe traffic
+    // per forward+backward sweep. Opt out: SUROGATE_SHARED_NONBLOCK_STAGING=1.
+    bool resident_nonblock = false;
+
     // FP8 caching
     bool enable_fp8_forward = false;
 
