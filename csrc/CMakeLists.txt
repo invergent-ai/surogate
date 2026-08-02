@@ -167,7 +167,7 @@ set(CUTLASS_NVCC_ARCHS_SUPPORTED "89;90;90a;100a;103a;120a;121a" CACHE STRING "N
 FetchContent_Declare(
         cutlass
         GIT_REPOSITORY https://github.com/NVIDIA/cutlass.git
-        GIT_TAG v4.4.1
+        GIT_TAG v4.6.1
         EXCLUDE_FROM_ALL
 )
 
