@@ -2128,6 +2128,34 @@ void compute_fp4_alpha_4o6(float* alpha_out,
     CUDA_CHECK(cudaGetLastError());
 }
 
+/**
+ * @brief Undo the global encode scale left in a re-quantized dequantized tensor.
+ *
+ * Dequantizing NVFP4 with decode_scale = 1 reconstructs the SCALED domain, because the
+ * two-level scheme bakes global_encode_scale = tensor_scale / amax_src into the block
+ * scales. Re-quantizing that output gives correct block scales -- the per-block
+ * normalization is scale-invariant -- but a global amax inflated by exactly that factor.
+ * Left uncorrected it multiplies every dgrad by tensor_scale / amax_src.
+ *
+ *     amax_true = amax_scaled * amax_src / tensor_scale
+ */
+__global__ void nvfp4_unscale_amax_kernel(float* __restrict__ amax_out,
+                                          const float* __restrict__ amax_scaled,
+                                          const float* __restrict__ amax_src,
+                                          float inv_tensor_scale) {
+    *amax_out = (*amax_scaled) * (*amax_src) * inv_tensor_scale;
+}
+
+void nvfp4_unscale_amax(float* amax_out,
+                        const float* amax_scaled,
+                        const float* amax_src,
+                        float tensor_scale,
+                        cudaStream_t stream) {
+    nvfp4_unscale_amax_kernel<<<1, 1, 0, stream>>>(amax_out, amax_scaled, amax_src, 1.0f / tensor_scale);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+
 // ============================================================================
 // Quartet-II style tensor-scale helpers
 // ============================================================================

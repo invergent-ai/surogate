@@ -16,6 +16,8 @@
 
 #include "runtime/executor/graph_executor_internal.h"
 #include "runtime/dsl/ir.h"
+
+struct RuntimeOptions;
 #include "runtime/lora/lora_types.h"
 #include "kernels/kernels.h"
 #include "utilities/stack.h"
@@ -82,6 +84,17 @@ inline Tensor flatten_bt(const Tensor& t, long B, long T) {
 // Matmul utilities
 std::optional<::modules::MatmulOp> matmul_op_from_weight(std::string_view name, int& layer_idx);
 bool is_mlp_gate_weight(std::string_view name);
+
+/// True for the Qwen3.5/3.6 hybrid attention projections (full_q/k/v/out,
+/// lin_in_proj_qkv/z, lin_out). These are ordinary matmuls that older recipes never
+/// quantized simply because they were unnamed; whether to quantize them now depends on
+/// the recipe -- see hybrid_attn_proj_quant_allowed.
+bool is_hybrid_attn_proj_weight(std::string_view name);
+
+/// Whether the active recipe should quantize those projections. True for FP8 (measured
+/// +0.36% loss for -6.5% step time), false for FP4 (+3.01% loss). SUROGATE_QUANT_ATTN_PROJ
+/// overrides.
+bool hybrid_attn_proj_quant_allowed(const RuntimeOptions& options);
 EMMTranspose parse_transpose(const AttrMap& attrs);
 EMMTranspose swap_transpose(EMMTranspose mode);
 void matmul_dims(const Tensor& a, const Tensor& b, EMMTranspose mode, int& M, int& N, int& K);

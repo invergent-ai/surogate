@@ -1348,8 +1348,34 @@ void DslWeightManager::convert_to_work(const Tensor& master, Tensor& work, cudaS
     throw std::runtime_error("DslWeightManager: unsupported dtype conversion");
 }
 
+namespace {
+/// Weight fields whose MASTER may be stored quantized and streamed as such.
+///
+/// Narrower than "has a MatmulOp" on purpose. Quantizing the master removes the BF16 copy
+/// entirely, so every consumer must go through the recipe -- and the backward gate is
+/// stricter than the forward one (it additionally requires mode == NT and a flat
+/// [B*T, C] input), so the hybrid attention projections can fall through to the plain
+/// BF16 GEMM and would receive packed FP4/FP8 bytes. Those ops may still be quantized
+/// per-op by the recipe (SUROGATE_QUANT_ATTN_PROJ); they just keep a BF16 master, which
+/// makes any fallback correct instead of fatal.
+bool is_stream_eligible_field(const std::string& name) {
+    static constexpr std::string_view kFields[] = {
+        "qkv_weight", "out_weight", "mlp_up_weight", "mlp_gate_weight", "mlp_down_weight",
+        "up_weight",  "gate_weight", "down_weight",
+    };
+    for (std::string_view f : kFields) {
+        if (name.size() >= f.size() && name.compare(name.size() - f.size(), f.size(), f) == 0) {
+            // Guard against "lin_out_weight" matching the "out_weight" suffix.
+            if (name.size() == f.size() || name[name.size() - f.size() - 1] == '.') return true;
+        }
+    }
+    return false;
+}
+}  // namespace
+
 bool DslWeightManager::is_fp8_stream_weight(const std::string& name) const {
     if (!mConfig.stream_fp8) return false;
+    if (!is_stream_eligible_field(name)) return false;
     int layer_idx = -1;
     // Only the explicit matmul-weight fields (qkv/out/mlp_up/down/...) are FP8-quantizable;
     // conv / norm / A_log / bias fields are not matmul weights -> matmul_op_from_weight is
@@ -1371,6 +1397,7 @@ bool DslWeightManager::is_fp8_stream_weight(const std::string& name) const {
 
 bool DslWeightManager::is_fp4_stream_weight(const std::string& name, const std::vector<long>& shape) const {
     if (!mConfig.stream_fp4) return false;
+    if (!is_stream_eligible_field(name)) return false;
     int layer_idx = -1;
     // Same field selection as the FP8 predicate: only real matmul weights are quantized;
     // conv / norm / A_log / bias keep BF16 streaming.
@@ -1468,14 +1495,19 @@ void DslWeightManager::finalize_fp4_block_masters(const cudaDeviceProp& dp, cuda
 
             // dgrad W^T (K, N). dgrad always uses standard (2688) scaling for both dout and
             // W^T -- there is no 4/6 transpose variant -- exactly as the fallback path does.
-            quantize_nvfp4_weight_cutlass_transpose_auto_scale(reinterpret_cast<uint8_t*>(blob + layout.bwd_data),
-                                                               reinterpret_cast<uint8_t*>(blob + layout.bwd_scales),
-                                                               reinterpret_cast<float*>(blob + layout.bwd_amax),
-                                                               in,
-                                                               static_cast<int>(N),
-                                                               static_cast<int>(K),
-                                                               dp,
-                                                               stream);
+            // Skipped under derive_wt(): dgrad rebuilds W^T from the forward section, so
+            // the blob -- and therefore the PCIe traffic -- is the forward part only.
+            if (!Nvfp4StreamLayout::derive_wt()) {
+                quantize_nvfp4_weight_cutlass_transpose_auto_scale(
+                    reinterpret_cast<uint8_t*>(blob + layout.bwd_data),
+                    reinterpret_cast<uint8_t*>(blob + layout.bwd_scales),
+                    reinterpret_cast<float*>(blob + layout.bwd_amax),
+                    in,
+                    static_cast<int>(N),
+                    static_cast<int>(K),
+                    dp,
+                    stream);
+            }
 
             // Optional self-check: repeat the same quantization into freshly allocated,
             // allocator-aligned buffers (exactly how the per-weight FP4 cache lays them

@@ -1713,7 +1713,13 @@ GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType type, const Sha
             const bool is_gate_projection = is_mlp_gate_weight(op.inputs[1]);
             attrs.matmul_op = matmul_op;
             attrs.layer_idx = layer_idx;
-            attrs.allow_quant = matmul_op.has_value() && allow_quant_layer(mOptions, mConfig, layer_idx);
+            // Hybrid attention projections are quantized only when the recipe can afford
+            // it (FP8 yes, FP4 no -- see hybrid_attn_proj_quant_allowed). Clearing
+            // allow_quant routes them back to the plain BF16 GEMM, since dispatch_matmul
+            // requires allow_quant && matmul_op.
+            attrs.allow_quant = matmul_op.has_value() && allow_quant_layer(mOptions, mConfig, layer_idx) &&
+                                (!is_hybrid_attn_proj_weight(op.inputs[1]) ||
+                                 hybrid_attn_proj_quant_allowed(mOptions));
             if (!matmul_op.has_value()) {
                 std::string field;
                 if (parse_block_param(op.inputs[1], layer_idx, field) && tensor_role_is_router_name(field)) {
@@ -1758,7 +1764,13 @@ GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType type, const Sha
             auto matmul_op = matmul_op_from_weight(op.inputs[1], layer_idx);
             attrs.matmul_op = matmul_op;
             attrs.layer_idx = layer_idx;
-            attrs.allow_quant = matmul_op.has_value() && allow_quant_layer(mOptions, mConfig, layer_idx);
+            // Hybrid attention projections are quantized only when the recipe can afford
+            // it (FP8 yes, FP4 no -- see hybrid_attn_proj_quant_allowed). Clearing
+            // allow_quant routes them back to the plain BF16 GEMM, since dispatch_matmul
+            // requires allow_quant && matmul_op.
+            attrs.allow_quant = matmul_op.has_value() && allow_quant_layer(mOptions, mConfig, layer_idx) &&
+                                (!is_hybrid_attn_proj_weight(op.inputs[1]) ||
+                                 hybrid_attn_proj_quant_allowed(mOptions));
             if (matmul_op.has_value() && *matmul_op == modules::MatmulOp::MLPUp) {
                 set_forward_hook_schema_slot(attrs, modules::ForwardHookPoint::AfterMLPUpProjection, "mlp_up");
             }

@@ -7,6 +7,7 @@
 #define SUROGATE_SRC_DSL_NVFP4_STREAM_LAYOUT_H
 
 #include <cstddef>
+#include <cstdlib>
 
 #include "kernels/kernels.h"
 
@@ -42,8 +43,6 @@ struct Nvfp4StreamLayout {
     std::size_t bwd_amax = 0;
     std::size_t total = 0;
 
-    /// @param N Weight rows (C_out), @param K weight cols (C_in), both from the
-    /// ORIGINAL row-major BF16 shape.
     /// Section alignment. CUTLASS block-scaled GEMMs read the scale tensor through a
     /// swizzled (F8_128x4) atom layout and the FP4 operand through wide vector loads;
     /// both assume the strong alignment a device allocator hands out, which is what the
@@ -52,6 +51,18 @@ struct Nvfp4StreamLayout {
     /// analogue of the FP8 scale-pointer bug: the GEMM does not fail, it returns NaN.)
     static constexpr std::size_t kAlign = 256;
 
+    /// True when the blob carries ONLY the forward section and dgrad rebuilds W^T on
+    /// device (SUROGATE_FP4_DERIVE_WT=1). Halves the streamed bytes -- 1.125 -> 0.5625
+    /// B/param, below FP8's 1.0 -- paying a dequant + quantize-transpose per weight per
+    /// backward instead. Under cpu_training that trade is lopsided in our favour: host
+    /// bandwidth is ~5 GB/s against ~1.7 TB/s on device.
+    static bool derive_wt() {
+        static const bool v = std::getenv("SUROGATE_FP4_DERIVE_WT") != nullptr;
+        return v;
+    }
+
+    /// @param N Weight rows (C_out), @param K weight cols (C_in), both from the
+    /// ORIGINAL row-major BF16 shape.
     static Nvfp4StreamLayout make(long N, long K) {
         auto align_up = [](std::size_t v) { return (v + (kAlign - 1)) & ~(kAlign - 1); };
         const auto n = static_cast<std::size_t>(N);
@@ -68,14 +79,18 @@ struct Nvfp4StreamLayout {
         l.fwd_amax = off;
         off = align_up(off + sizeof(float));
 
-        // dgrad consumes W^T: (K, N) row-major, so rows=K, cols=N.
+        // dgrad consumes W^T: (K, N) row-major, so rows=K, cols=N. Under derive_wt() the
+        // section is still SIZED (callers use bwd_scales_bytes for scratch) but not stored,
+        // so `total` -- and therefore the streamed bytes -- covers the forward part only.
         l.bwd_data = off;
-        off = align_up(off + k * (n / 2));
-        l.bwd_scales = off;
         l.bwd_scales_bytes = compute_nvfp4_cutlass_scale_size(static_cast<int>(K), static_cast<int>(N));
-        off = align_up(off + l.bwd_scales_bytes);
-        l.bwd_amax = off;
-        off = align_up(off + sizeof(float));
+        if (!derive_wt()) {
+            off = align_up(off + k * (n / 2));
+            l.bwd_scales = off;
+            off = align_up(off + l.bwd_scales_bytes);
+            l.bwd_amax = off;
+            off = align_up(off + sizeof(float));
+        }
 
         l.total = off;
         return l;
