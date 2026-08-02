@@ -193,7 +193,7 @@ distillation:
 
 | Option           | Type   | Default  | Description                                                                                                                   |
 | ---------------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `recipe`         | string | `"bf16"` | Mixed precision training recipe. Options: `"bf16"` (default), `"fp8_hybrid"`, `"nvfp4"`, `"nvfp4_quartet"`.                   |
+| `recipe`         | string | `"bf16"` | Mixed precision training recipe. Options: `"bf16"` (default), `"fp8_hybrid"`, `"nvfp4"`.                   |
 | `gradient_dtype` | string | `null`   | Dtype for activation gradients / backward matmul policy. Defaults to matmul-dtype. Note: recipes may override backward dtype. |
 | `master_dtype`   | string | `null`   | Master weight dtype for optimizer updates (e.g., FP32 for stable full fine-tuning). Defaults to model-dtype.                  |
 | `use_fused_rope` | bool   | `false`  | Use fused RoPE kernel with on-the-fly cos/sin computation (saves memory, reduces bandwidth).                                  |
@@ -624,7 +624,6 @@ These options control automatic training monitoring, early stopping, and compute
 | `bf16`          | BF16 forward/backward       | Any CUDA GPU                   | Baseline, maximum compatibility      |
 | `fp8_hybrid`    | FP8 E4M3 fwd / E5M2 bwd     | SM89+ (Ada, Hopper, Blackwell) | 2x throughput, minimal accuracy loss |
 | `nvfp4`         | FP4 E2M1 with block scaling | SM100+ (Blackwell only)        | Maximum memory efficiency            |
-| `nvfp4_quartet` | FP4 E2M1 quartet scaling    | SM100+ (Blackwell only)        | Higher accuracy FP4 training         |
 
 ## Example Configuration
 

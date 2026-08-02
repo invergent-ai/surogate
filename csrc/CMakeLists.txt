@@ -452,12 +452,6 @@ target_sources(surogate-common PRIVATE
     src/recipes/nvfp4/nvfp4_recipe.cpp
 
     # NVFP4-Quartet recipe (Quartet-II EDEN quantization)
-    src/recipes/nvfp4_quartet/nvfp4_quartet_recipe.cpp
-    src/recipes/nvfp4_quartet/kernels/hadamard_init.cu
-    src/recipes/nvfp4_quartet/kernels/group_transform_128.cu
-    src/recipes/nvfp4_quartet/kernels/group_transform_eden.cu
-    src/recipes/nvfp4_quartet/kernels/eden_fp4.cu
-    src/recipes/nvfp4_quartet/kernels/dequant_transform_quant.cu
 
     # Shared kernels (used by all recipes)
     src/kernels/kernels.cpp

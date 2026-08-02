@@ -3059,6 +3059,23 @@ void quantize_nvfp4_4o6_cutlass_auto_scale(uint8_t* out_fp4,
                                            const cudaDeviceProp& dp,
                                            cudaStream_t stream);
 
+/// @brief Four Over Six NVFP4 quantization using a pre-computed global amax.
+///
+/// Same result as quantize_nvfp4_4o6_cutlass_auto_scale, minus its abs_max reduction:
+/// 4/6 consumes the global amax as an input (the per-block amax driving the 4-vs-6
+/// selection is computed inside the kernel), so a caller that already has the amax --
+/// e.g. a fused RMSNorm/SwiGLU that produced this activation -- can skip a full pass
+/// over [M, K]. Mirrors quantize_nvfp4_weight_cutlass_from_amax for the standard path.
+void quantize_nvfp4_4o6_cutlass_from_amax(uint8_t* out_fp4,
+                                          uint8_t* block_scales,
+                                          const float* global_amax,
+                                          const nv_bfloat16* in,
+                                          int M,
+                                          int K,
+                                          recipes::FourOverSixErrorMetric error_metric,
+                                          const cudaDeviceProp& dp,
+                                          cudaStream_t stream);
+
 /// @brief Four Over Six NVFP4 stochastic quantization with CUTLASS layout (for gradients).
 void quantize_nvfp4_4o6_stochastic_cutlass_auto_scale(uint8_t* out_fp4,
                                                       uint8_t* block_scales,

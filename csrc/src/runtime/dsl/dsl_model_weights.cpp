@@ -104,6 +104,7 @@ void DslModel::init_weights(NCCLCommunicator& comm) {
         // populated and before the first gather.
         if (mRunState) {
             mWeightManager->finalize_fp8_block_masters(mRunState->DeviceProp, stream);
+            mWeightManager->finalize_fp4_block_masters(mRunState->DeviceProp, stream);
         }
     }
 
@@ -803,6 +804,7 @@ void DslModel::import_weights(const std::string& file_name, bool allow_cast, NCC
         // populated and before the first gather.
         if (mRunState) {
             mWeightManager->finalize_fp8_block_masters(mRunState->DeviceProp, stream);
+            mWeightManager->finalize_fp4_block_masters(mRunState->DeviceProp, stream);
         }
     }
 

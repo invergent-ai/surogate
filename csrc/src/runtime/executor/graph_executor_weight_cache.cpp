@@ -507,6 +507,17 @@ GraphExecutor::get_fp4_cached_weight(const std::string& name, Tensor& weight, cu
         return nullptr;
     }
 
+    if (mWeights.work_is_transient(name)) {
+        // Same rule as the FP8 caches: never snapshot a streamed buffer. Block
+        // weights under cpu_training/offload_master live in rotating prefetch
+        // slots, so a quantize-once cache would freeze whatever the slot held
+        // at first touch. It is also unaffordable: one FP4 entry per block
+        // weight is a second full copy of the model on device (the streaming
+        // mode exists precisely because it does not fit) -- an unguarded cache
+        // OOM'd a 27B hybrid partway through the first backward.
+        return nullptr;
+    }
+
     // Return early if already cached
     auto it = mFP4WeightCache.find(name);
     if (it != mFP4WeightCache.end() && it->second.initialized) {
@@ -723,6 +734,12 @@ GraphExecutor::get_fp4_cached_weight_transposed(const std::string& name, Tensor&
 
     // Only cache static (non-trainable) weights
     if (!mWeights.has(name) || mWeights.is_trainable(name)) {
+        return nullptr;
+    }
+
+    if (mWeights.work_is_transient(name)) {
+        // See get_fp4_cached_weight: streamed weights must not be snapshotted,
+        // and a per-weight transposed FP4 cache does not fit next to the model.
         return nullptr;
     }
 
