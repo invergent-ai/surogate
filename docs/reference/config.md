@@ -101,7 +101,7 @@ safe amount depends on your model, sequence length and free VRAM.
 | Variable | Default | Effect |
 | -------- | ------- | ------ |
 | `SUROGATE_DISPATCH_PREFETCH_BLOCKS` | `2` | Number of layer prefetch slots. `3` is the measured knee (`4` and `6` were no better); costs one extra layer of weights in VRAM. |
-| `SUROGATE_RESIDENT_LAYERS` | `0` | Keep the first N layers' FP8 masters in **device** memory, so their per-traversal gather is a D2D copy instead of PCIe traffic. Promoted after quantization, so each costs its FP8 size (~N/64 of the quantized model), not the BF16 size the import needed. Raise it until it OOMs at startup, then back off. |
+| `SUROGATE_RESIDENT_LAYERS` | `0` | Keep the first N layers' quantized masters in **device** memory, so their per-traversal gather is a D2D copy instead of PCIe traffic. Works for both FP8 and NVFP4; promoted after quantization, so each costs its quantized size rather than the BF16 size the import needed. Raise it until it OOMs at startup, then back off. NVFP4 fits roughly twice as many layers (0.5625 B/param with `SUROGATE_FP4_DERIVE_WT` vs FP8's 1.0). |
 | `SUROGATE_SHARED_NONBLOCK_STAGING` | unset | Reverts the resident embedding/lm_head buffers to one shared staging buffer (saves ~max(emb, lm_head) VRAM, costs ~5 GB of PCIe traffic per sweep). |
 | `SUROGATE_GRPO_FULL_KV_SWEEP` | unset | Restores the Phase-A KV sweep for the last occupied chunk in chunked GRPO. Slower, but bit-exact against the pre-optimization engine. |
 | `SUROGATE_QUANT_ATTN_PROJ` | recipe-dependent | Force attention/GDN projection quantization on (`1`) or off (`0`). Defaults on for FP8 (+0.36% loss for −6.5% step time) and off for NVFP4 (+3.01% loss — not worth it). |
@@ -116,6 +116,22 @@ Measured on a 27B hybrid, fp8, single RTX 5090, 20 identical micro-batches:
 | `PREFETCH_BLOCKS=3` + `RESIDENT_LAYERS=16` | 6.832 (−4.8%) |
 | `PREFETCH_BLOCKS=3` + `RESIDENT_LAYERS=20` | 6.748 (−6.0%) |
 | `RESIDENT_LAYERS=24` and above | out of memory on 32 GB |
+
+The same knobs applied to NVFP4 on the same workload, where the smaller blob allows far more
+residency (`SUROGATE_FP4_DERIVE_WT=1 SUROGATE_DISPATCH_PREFETCH_BLOCKS=3`):
+
+| Configuration | s/micro-batch |
+| ------------- | ------------- |
+| `nvfp4` before this work | 9.338 (and OOM'd under `cpu_training` at all) |
+| `stream_fp4` | 7.151 (−23.4%) |
+| + `FP4_DERIVE_WT` | 6.834 (−26.8%) |
+| + `RESIDENT_LAYERS=40` | 6.420 (−31.2%) |
+| `RESIDENT_LAYERS=52` and above | out of memory on 32 GB |
+
+Fully tuned, NVFP4 ends up ~5% faster than fully tuned FP8 on a transfer-bound step, because
+it converts VRAM into avoided PCIe traffic about twice as efficiently. It still costs more
+accuracy (≈+3.4% loss against BF16 over 120 training steps, versus ≈+0.3% for FP8-hybrid),
+so FP8-hybrid remains the better default and NVFP4 the choice when memory is the constraint.
 
 Residency scales with how much of the model stops crossing the bus, so the useful ceiling is
 whatever VRAM allows — on a 32 GB card with this 27B model that was 20 layers. Only the

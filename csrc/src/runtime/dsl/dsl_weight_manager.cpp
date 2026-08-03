@@ -1458,6 +1458,7 @@ void DslWeightManager::finalize_fp4_block_masters(const cudaDeviceProp& dp, cuda
     std::size_t converted = 0;
     const bool verify = std::getenv("SUROGATE_DEBUG_FP4_STREAM_VERIFY") != nullptr;
     int verify_count = 0;
+    std::size_t promoted_resident = 0;
 
     for (auto& [name, e] : mWeights) {
         if (!e.is_block || e.trainable || e.master.DType != mConfig.master_dtype) continue;
@@ -1587,6 +1588,29 @@ void DslWeightManager::finalize_fp4_block_masters(const cudaDeviceProp& dp, cuda
             shared_master_store().wait_fp8(name);
         }
 
+        // Partial residency, same contract as the FP8 path: promote the first N layers'
+        // blobs from pinned host to device once they are quantized, so their per-traversal
+        // gather is a D2D copy instead of PCIe traffic. The FP4 blob is smaller than the FP8
+        // master (0.5625 B/param with SUROGATE_FP4_DERIVE_WT, 1.125 without, against FP8's
+        // 1.0), so a given VRAM budget buys proportionally more resident layers here.
+        // Shared masters are promoted too -- under LoRA + cpu_training every frozen base
+        // master is shared -- but the host buffer is left to the SharedMasterStore.
+        if (mConfig.resident_layers > 0 && e.layer_idx >= 0 && e.layer_idx < mConfig.resident_layers &&
+            !is_device_resident(e.master)) {
+            Tensor dev = mAllocator->allocate(ETensorDType::BYTE,
+                                              (name + "_resident").c_str(),
+                                              EAllocationType::ON_DEVICE,
+                                              {static_cast<long>(layout.total)});
+            CUDA_CHECK(cudaMemcpyAsync(dev.Data, e.master.Data, layout.total, cudaMemcpyDefault, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            if (!is_shared_master(name)) {
+                mAllocator->free(e.master);  // clears .Data
+            }
+            e.master.Data = dev.Data;
+            e.master.Device = dev.Device;
+            ++promoted_resident;
+        }
+
         // Re-describe the master as an FP4 blob. Sizes stay (N, K) so the streaming copy and
         // the matmul can both recompute the section offsets; bytes() is NOT meaningful for
         // these entries (same contract as the FP8 streaming masters).
@@ -1599,6 +1623,10 @@ void DslWeightManager::finalize_fp4_block_masters(const cudaDeviceProp& dp, cuda
 
     if (converted > 0 && std::getenv("SUROGATE_DEBUG_FP4_STREAM") != nullptr) {
         std::cerr << "[fp4-stream] quantized " << converted << " frozen matmul masters to NVFP4 blobs\n";
+    }
+    if (promoted_resident > 0) {
+        std::cerr << "[resident] promoted " << promoted_resident << " NVFP4 block masters to device ("
+                  << mConfig.resident_layers << " layers)\n";
     }
 }
 
