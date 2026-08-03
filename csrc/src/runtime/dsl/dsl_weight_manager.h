@@ -95,6 +95,14 @@ struct DslWeightManagerConfig {
     // and a global amax) and stream those bytes. 1.125 B/param against BF16's 2.0, and the
     // per-matmul weight quantization -- which for 4/6 adaptive scaling evaluates two
     // scalings per block, every op, every sweep -- collapses to once at import.
+    // Partial weight residency: keep the first N transformer layers' masters in DEVICE
+    // memory instead of pinned host, so their per-traversal gather is a device-to-device
+    // copy rather than PCIe traffic. Under cpu_training the run is PCIe-bound -- profiling
+    // a 27B fp8 step showed the GPU idle 26% of wall time with a transfer in flight, at a
+    // saturated 53.5 GB/s -- so the only remaining lever is moving fewer bytes across the
+    // bus. Costs one BF16-sized master per resident layer. SUROGATE_RESIDENT_LAYERS=N.
+    int resident_layers = 0;
+
     bool stream_fp4 = false;
     bool fp4_four_over_six = false;
     int fp4_four_over_six_metric = 0;  ///< recipes::FourOverSixErrorMetric as int (avoids the include)

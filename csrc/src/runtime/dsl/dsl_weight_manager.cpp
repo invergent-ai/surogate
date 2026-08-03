@@ -208,6 +208,9 @@ DslWeightManager::DslWeightManager(const Module& module,
     mConfig.persistent_quants = options.PersistentQuants;
     mConfig.use_zero_copy = options.UseZeroCopy;
     mConfig.cpu_training = options.CpuTraining;
+    if (const char* env = std::getenv("SUROGATE_RESIDENT_LAYERS")) {
+        mConfig.resident_layers = std::max(0, std::atoi(env));
+    }
     // Frozen-base cpu_training keeps embedding/lm_head resident on device (see
     // DslWeightManagerConfig::resident_nonblock). The frozen base never changes,
     // so the per-version gather skip makes each buffer stream exactly once.
@@ -337,7 +340,15 @@ void DslWeightManager::allocate_weights(const Module& module,
             // PINNED gives cudaHostAlloc with mapped flag, enabling zero-copy access from GPU.
             // For cpu_training: ALL weights (block + non-block) go to pinned CPU.
             // For legacy offload_master: only block weights go to pinned CPU.
-            if (entry.is_block || mConfig.cpu_training) {
+            // Partial residency: the first N layers keep DEVICE masters, so their gather is
+            // a D2D copy (~TB/s) instead of PCIe (~53 GB/s, and saturated). Everything else
+            // -- prefetch slots, gather/release, FP8 finalize -- is unchanged; only where
+            // the bytes come from differs.
+            const bool resident_layer =
+                entry.is_block && layer_idx >= 0 && layer_idx < mConfig.resident_layers;
+            if (resident_layer) {
+                master_alloc = EAllocationType::ON_DEVICE;
+            } else if (entry.is_block || mConfig.cpu_training) {
                 master_alloc = EAllocationType::PINNED;
             } else if (freeze_base) {
                 // LoRA + offload_master (dispatch-PP): the non-block base
