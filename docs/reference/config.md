@@ -63,7 +63,7 @@ CPU-RAM centric training keeps model weights and optimizer state on CPU, streami
 
 | Component        | Without `cpu_training`      | With `cpu_training`                   |
 | ---------------- | --------------------------- | ------------------------------------- |
-| Model weights    | All layers on GPU           | ~2 layers (double-buffered prefetch)  |
+| Model weights    | All layers on GPU           | ~2 layers (double-buffered prefetch; see the tuning knobs below to raise the slot count or pin the first N layers on device) |
 | Gradients (FFT)  | All layers on GPU           | ~2 layers (double-buffered D2H)       |
 | Optimizer state   | On GPU (8-bit quantized)    | On CPU (FP32, unlimited RAM)          |
 | Activations      | Per recompute settings      | Same                                  |
@@ -84,6 +84,43 @@ lora_rank: 16
 per_device_train_batch_size: 2
 sequence_len: 2048
 ```
+
+### Tuning knobs (environment variables)
+
+`cpu_training` is normally **PCIe-bound**: the GPU spends much of the step waiting for the
+next layer's weights to arrive. Profiling a 27B fp8 step (Nsight Systems, RTX 5090) found
+the GPU idle 29.4% of wall time — 26.1% of it with an H2D transfer in flight and only 3.3%
+launch-bound — while H2D ran at 53.5 GB/s, i.e. PCIe 5.0 line rate with 97% of bytes in
+transfers larger than 16 MB. There is no bandwidth or batching left to recover there, so
+the knobs below either overlap the transfers better or remove bytes from the bus.
+
+All of them are **numerically neutral** — they change where bytes live and when they move,
+not what is computed. They are off by default because each one spends GPU memory, and the
+safe amount depends on your model, sequence length and free VRAM.
+
+| Variable | Default | Effect |
+| -------- | ------- | ------ |
+| `SUROGATE_DISPATCH_PREFETCH_BLOCKS` | `2` | Number of layer prefetch slots. `3` is the measured knee (`4` and `6` were no better); costs one extra layer of weights in VRAM. |
+| `SUROGATE_RESIDENT_LAYERS` | `0` | Keep the first N layers' masters in **device** memory, so their per-traversal gather is a D2D copy instead of PCIe traffic. Costs one BF16-sized master per layer. |
+| `SUROGATE_SHARED_NONBLOCK_STAGING` | unset | Reverts the resident embedding/lm_head buffers to one shared staging buffer (saves ~max(emb, lm_head) VRAM, costs ~5 GB of PCIe traffic per sweep). |
+| `SUROGATE_GRPO_FULL_KV_SWEEP` | unset | Restores the Phase-A KV sweep for the last occupied chunk in chunked GRPO. Slower, but bit-exact against the pre-optimization engine. |
+| `SUROGATE_QUANT_ATTN_PROJ` | recipe-dependent | Force attention/GDN projection quantization on (`1`) or off (`0`). Defaults on for FP8 (+0.36% loss for −6.5% step time) and off for NVFP4 (+3.01% loss — not worth it). |
+| `SUROGATE_FP4_DERIVE_WT` | unset | NVFP4 only: stream just the forward weight blob (0.5625 B/param instead of 1.125) and rebuild the dgrad transpose on device. Wins when PCIe-bound (27B: −4.5%), loses when compute-bound (2B: +2.4%). |
+
+Measured on a 27B hybrid, fp8, single RTX 5090, 20 identical micro-batches:
+
+| Configuration | s/micro-batch |
+| ------------- | ------------- |
+| defaults | 7.175 |
+| `PREFETCH_BLOCKS=3` | 7.117 (−0.8%) |
+| `PREFETCH_BLOCKS=3` + `RESIDENT_LAYERS=4` | 7.068 (−1.5%) |
+| `RESIDENT_LAYERS=8` or `12` | out of memory on 32 GB |
+
+Start with `SUROGATE_DISPATCH_PREFETCH_BLOCKS=3`, then raise `SUROGATE_RESIDENT_LAYERS`
+until it OOMs at startup and back off one. Both fail fast and loudly rather than degrading
+silently. Note resident masters are currently allocated at BF16 size even when the FP8
+recipe quantizes them immediately afterwards, so each costs roughly twice what the streamed
+bytes suggest.
 
 ## Offloading Options (Legacy)
 

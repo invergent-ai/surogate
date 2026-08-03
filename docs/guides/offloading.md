@@ -219,6 +219,24 @@ When `offload_quants` is enabled (requires `persistent_quants`):
 
 ---
 
+## Tuning a PCIe-bound step
+
+Any configuration that streams weights (`cpu_training`, `offload_master`) tends to end up
+limited by the PCIe link rather than by compute. Before optimizing kernels, check which one
+you are actually waiting on:
+
+```bash
+nsys profile -o prof --trace=cuda -y 50 -d 45 python -m surogate.cli.sft config.yaml
+nsys stats --report cuda_gpu_mem_time_sum prof.nsys-rep
+```
+
+If `[CUDA memcpy Host-to-Device]` dominates and its achieved bandwidth is close to your
+link's ceiling (~53 GB/s measured on PCIe 5.0 x16), the step is transfer-bound: making
+kernels faster will convert busy time into idle time rather than shortening the step. The
+levers that help are the ones that move fewer bytes or overlap them better — see
+[Tuning knobs](../reference/config.md#tuning-knobs-environment-variables) for
+`SUROGATE_DISPATCH_PREFETCH_BLOCKS` and `SUROGATE_RESIDENT_LAYERS`.
+
 ## See also
 
 - [Memory](memory.md)
