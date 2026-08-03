@@ -877,6 +877,30 @@ class GRPOTrainer:
             vtc = self.trainer.get_valid_token_count(0)
             expected_loss_scale = loss_scale
 
+            # vtc==0 with work done means the step's loss accounting is
+            # corrupt (observed 2026-08-03 on a chunked-GRPO run: the loss op
+            # skipped all step, so ValidTokenCount — which is ALSO the
+            # gradient normalization denominator — stayed 0 and gradients
+            # came out ~1e5x too large; only max_grad_norm bounded the
+            # damage; the step also reported masked=2198% because the metric
+            # denominators share the same accounting). Never apply such a
+            # step: flush the poisoned accumulation through the normal
+            # optimizer path at lr=0 so state resets without moving the
+            # policy.
+            if vtc == 0 and n_mb > 0:
+                logger.error(
+                    f"vtc=0 with {n_mb} micro-batches — corrupt step accounting; "
+                    f"applying ZERO-LR update to flush gradients without moving the policy")
+                opt_config = _surogate.OptimizerConfig(
+                    optimizer=config.optimizer,
+                    learning_rate=0.0,
+                    weight_decay=0.0,
+                    grad_clip=config.max_grad_norm,
+                    adamw_beta1=config.adamw_beta1,
+                    adamw_beta2=config.adamw_beta2,
+                    adamw_epsilon=config.adamw_epsilon,
+                )
+
             result = self.trainer.update_with_config(opt_config, step + 1)
             # The diagnostic path computes the loss in Python, so the native
             # accumulator is empty — use the Python metrics from the last
