@@ -340,15 +340,13 @@ void DslWeightManager::allocate_weights(const Module& module,
             // PINNED gives cudaHostAlloc with mapped flag, enabling zero-copy access from GPU.
             // For cpu_training: ALL weights (block + non-block) go to pinned CPU.
             // For legacy offload_master: only block weights go to pinned CPU.
-            // Partial residency: the first N layers keep DEVICE masters, so their gather is
-            // a D2D copy (~TB/s) instead of PCIe (~53 GB/s, and saturated). Everything else
-            // -- prefetch slots, gather/release, FP8 finalize -- is unchanged; only where
-            // the bytes come from differs.
-            const bool resident_layer =
-                entry.is_block && layer_idx >= 0 && layer_idx < mConfig.resident_layers;
-            if (resident_layer) {
-                master_alloc = EAllocationType::ON_DEVICE;
-            } else if (entry.is_block || mConfig.cpu_training) {
+            // NOTE: residency (SUROGATE_RESIDENT_LAYERS) does NOT allocate on device here.
+            // Import writes BF16, so a device master would have to be BF16-sized -- 2x what
+            // the quantized weight actually needs -- and that peak lands during import,
+            // before anything can shrink it. The promotion happens in
+            // finalize_fp8_block_masters instead, once the master is FP8 and its real size
+            // is known.
+            if (entry.is_block || mConfig.cpu_training) {
                 master_alloc = EAllocationType::PINNED;
             } else if (freeze_base) {
                 // LoRA + offload_master (dispatch-PP): the non-block base
@@ -1616,6 +1614,7 @@ void DslWeightManager::finalize_fp8_block_masters(const cudaDeviceProp& dp, cuda
     }
     if (max_nelem == 0) return;
 
+    std::size_t promoted = 0;
     int device = 0;
     CUDA_CHECK(cudaGetDevice(&device));
     void* d_bf16 = nullptr;
@@ -1670,6 +1669,35 @@ void DslWeightManager::finalize_fp8_block_masters(const cudaDeviceProp& dp, cuda
             shared_master_store().wait_fp8(name);
         }
 
+        // Partial residency (SUROGATE_RESIDENT_LAYERS): promote the first N layers' masters
+        // from pinned host to device NOW, at their FP8 size rather than the BF16 size the
+        // import needed. Their per-traversal gather then becomes a D2D copy (~TB/s) instead
+        // of PCIe traffic (~53 GB/s, and saturated under cpu_training) -- everything else
+        // (prefetch slots, gather/release) is unchanged, only where the bytes come from.
+        // Doing it here rather than at allocation matters: a device master sized for BF16
+        // would double the cost and would peak during import, before anything could shrink
+        // it. Shared masters are skipped -- they are one host buffer shared across ranks.
+        if (mConfig.resident_layers > 0 && e.layer_idx >= 0 && e.layer_idx < mConfig.resident_layers &&
+            !is_device_resident(e.master)) {
+            const std::size_t live = stats_off + Tensor::STATS_FLOATS * sizeof(float);
+            Tensor dev = mAllocator->allocate(ETensorDType::BYTE,
+                                              (name + "_resident").c_str(),
+                                              EAllocationType::ON_DEVICE,
+                                              {static_cast<long>(live)});
+            CUDA_CHECK(cudaMemcpyAsync(dev.Data, e.master.Data, live, cudaMemcpyDefault, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            // A shared master is owned by the SharedMasterStore, not the allocator, and may
+            // back other ranks -- repoint this entry at the device copy and leave the host
+            // buffer alone. Under LoRA + cpu_training EVERY frozen base master is shared, so
+            // excluding them (as an earlier version of this did) disables residency entirely.
+            if (!is_shared_master(name)) {
+                mAllocator->free(e.master);  // releases the pinned host buffer; clears .Data
+            }
+            e.master.Data = dev.Data;
+            e.master.Device = dev.Device;
+            ++promoted;
+        }
+
         // Re-describe the master as FP8 with its scale inline after the data (every GPU).
         // Keep Sizes (shape) so nelem is unchanged; bytes() now reports the FP8 size.
         e.master.DType = ETensorDType::FP8_E4M3;
@@ -1679,6 +1707,11 @@ void DslWeightManager::finalize_fp8_block_masters(const cudaDeviceProp& dp, cuda
     CUDA_CHECK(cudaFree(d_bf16));
     CUDA_CHECK(cudaFree(d_fp8));
     CUDA_CHECK(cudaFree(d_stats));
+
+    if (promoted > 0) {
+        std::cerr << "[resident] promoted " << promoted << " FP8 block masters to device ("
+                  << mConfig.resident_layers << " layers)\n";
+    }
 }
 
 bool DslWeightManager::parse_layer_index(const std::string& name, int& layer_idx) {

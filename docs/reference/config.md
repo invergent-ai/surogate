@@ -101,7 +101,7 @@ safe amount depends on your model, sequence length and free VRAM.
 | Variable | Default | Effect |
 | -------- | ------- | ------ |
 | `SUROGATE_DISPATCH_PREFETCH_BLOCKS` | `2` | Number of layer prefetch slots. `3` is the measured knee (`4` and `6` were no better); costs one extra layer of weights in VRAM. |
-| `SUROGATE_RESIDENT_LAYERS` | `0` | Keep the first N layers' masters in **device** memory, so their per-traversal gather is a D2D copy instead of PCIe traffic. Costs one BF16-sized master per layer. |
+| `SUROGATE_RESIDENT_LAYERS` | `0` | Keep the first N layers' FP8 masters in **device** memory, so their per-traversal gather is a D2D copy instead of PCIe traffic. Promoted after quantization, so each costs its FP8 size (~N/64 of the quantized model), not the BF16 size the import needed. Raise it until it OOMs at startup, then back off. |
 | `SUROGATE_SHARED_NONBLOCK_STAGING` | unset | Reverts the resident embedding/lm_head buffers to one shared staging buffer (saves ~max(emb, lm_head) VRAM, costs ~5 GB of PCIe traffic per sweep). |
 | `SUROGATE_GRPO_FULL_KV_SWEEP` | unset | Restores the Phase-A KV sweep for the last occupied chunk in chunked GRPO. Slower, but bit-exact against the pre-optimization engine. |
 | `SUROGATE_QUANT_ATTN_PROJ` | recipe-dependent | Force attention/GDN projection quantization on (`1`) or off (`0`). Defaults on for FP8 (+0.36% loss for −6.5% step time) and off for NVFP4 (+3.01% loss — not worth it). |
@@ -113,14 +113,19 @@ Measured on a 27B hybrid, fp8, single RTX 5090, 20 identical micro-batches:
 | ------------- | ------------- |
 | defaults | 7.175 |
 | `PREFETCH_BLOCKS=3` | 7.117 (−0.8%) |
-| `PREFETCH_BLOCKS=3` + `RESIDENT_LAYERS=4` | 7.068 (−1.5%) |
-| `RESIDENT_LAYERS=8` or `12` | out of memory on 32 GB |
+| `PREFETCH_BLOCKS=3` + `RESIDENT_LAYERS=16` | 6.832 (−4.8%) |
+| `PREFETCH_BLOCKS=3` + `RESIDENT_LAYERS=20` | 6.748 (−6.0%) |
+| `RESIDENT_LAYERS=24` and above | out of memory on 32 GB |
+
+Residency scales with how much of the model stops crossing the bus, so the useful ceiling is
+whatever VRAM allows — on a 32 GB card with this 27B model that was 20 layers. Only the
+FP8-streamed weights are promoted (the fields in the stream-eligible set, i.e. `mlp_up` and
+`mlp_down` on a Qwen3.5/3.6 hybrid), so the log line `promoted N FP8 block masters to device`
+tells you how many actually moved.
 
 Start with `SUROGATE_DISPATCH_PREFETCH_BLOCKS=3`, then raise `SUROGATE_RESIDENT_LAYERS`
 until it OOMs at startup and back off one. Both fail fast and loudly rather than degrading
-silently. Note resident masters are currently allocated at BF16 size even when the FP8
-recipe quantizes them immediately afterwards, so each costs roughly twice what the streamed
-bytes suggest.
+silently.
 
 ## Offloading Options (Legacy)
 
