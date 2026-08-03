@@ -164,6 +164,12 @@ set(CUTLASS_ENABLE_PROFILER OFF CACHE BOOL "Enable CUTLASS profiler")
 set(CUTLASS_NVCC_ARCHS "89;90;90a;100a;103a;120a;121a" CACHE STRING "CUDA architectures for CUTLASS")
 set(CUTLASS_NVCC_ARCHS_SUPPORTED "89;90;90a;100a;103a;120a;121a" CACHE STRING "NVCC archs to build library kernels")
 
+# CUTLASS is used by the NVFP4 (block-scaled) GEMMs and MoE grouped GEMMs. The FP8-hybrid
+# recipe does NOT use it -- those matmuls go through cuBLASLt -- so a CUTLASS bump cannot
+# move FP8 numbers. Measured on the pool-D 27B replay, fp8 with attention-projection
+# quantization held OFF: 4.4.1 = 7.413 s/mb, 4.6.1 = 7.382 s/mb, i.e. -0.4% = noise.
+# 4.6.1 is kept for correctness, not speed: 4.5.1 "added missing MXFP8MMAOP and
+# MXF8F6F4MMAOP for sm120" plus further SM120 block-scaled fixes.
 FetchContent_Declare(
         cutlass
         GIT_REPOSITORY https://github.com/NVIDIA/cutlass.git
