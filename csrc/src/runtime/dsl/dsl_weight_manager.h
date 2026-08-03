@@ -89,6 +89,23 @@ struct DslWeightManagerConfig {
     bool stream_fp8 = false;
     int fp8_skip_first_layers = 0;
     int fp8_skip_last_layers = 0;
+
+    // NVFP4 weight streaming (cpu_training/offload_master + an nvfp4 recipe): store frozen
+    // matmul block masters as an NVFP4 blob (forward W + dgrad W^T, each with block scales
+    // and a global amax) and stream those bytes. 1.125 B/param against BF16's 2.0, and the
+    // per-matmul weight quantization -- which for 4/6 adaptive scaling evaluates two
+    // scalings per block, every op, every sweep -- collapses to once at import.
+    // Partial weight residency: keep the first N transformer layers' masters in DEVICE
+    // memory instead of pinned host, so their per-traversal gather is a device-to-device
+    // copy rather than PCIe traffic. Under cpu_training the run is PCIe-bound -- profiling
+    // a 27B fp8 step showed the GPU idle 26% of wall time with a transfer in flight, at a
+    // saturated 53.5 GB/s -- so the only remaining lever is moving fewer bytes across the
+    // bus. Costs one BF16-sized master per resident layer. SUROGATE_RESIDENT_LAYERS=N.
+    int resident_layers = 0;
+
+    bool stream_fp4 = false;
+    bool fp4_four_over_six = false;
+    int fp4_four_over_six_metric = 0;  ///< recipes::FourOverSixErrorMetric as int (avoids the include)
 };
 
 /**
@@ -160,6 +177,11 @@ public:
     /// safe) so per-stage streaming ships FP8 bytes. No-op unless mConfig.stream_fp8. Call
     /// after import_weights has populated the BF16 masters.
     void finalize_fp8_block_masters(const cudaDeviceProp& dp, cudaStream_t stream);
+
+    /// NVFP4 counterpart of finalize_fp8_block_masters: rewrite each frozen matmul block
+    /// master in place as an Nvfp4StreamLayout blob (forward W + dgrad W^T). No-op unless
+    /// mConfig.stream_fp4. Same call site and the same shared-master claim protocol.
+    void finalize_fp4_block_masters(const cudaDeviceProp& dp, cudaStream_t stream);
 
     // Master weight access for optimizer
     Tensor& get_master(const std::string& name);
@@ -239,8 +261,16 @@ private:
     /// A_log / router-gate weights return false so they keep their BF16 streaming.
     bool is_fp8_stream_weight(const std::string& name) const;
 
+    /// FP4 counterpart of is_fp8_stream_weight. Adds the NVFP4 packing constraints (rank 2,
+    /// even N and K) since both W and W^T are packed two values per byte.
+    bool is_fp4_stream_weight(const std::string& name, const std::vector<long>& shape) const;
+
     // Helper to parse layer index from weight name
     static bool parse_layer_index(const std::string& name, int& layer_idx);
+
+    /// Bytes actually backing `t`. Equals Tensor::bytes() except for streamed NVFP4
+    /// blobs, whose scales/amaxes live past the packed data (see Nvfp4StreamLayout).
+    static std::size_t tensor_storage_bytes(const Tensor& t);
 
     // Resolve non-block parameter names (embedding/final_norm/lm_head)
     void resolve_non_block_names();

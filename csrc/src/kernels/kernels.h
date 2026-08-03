@@ -3059,6 +3059,35 @@ void quantize_nvfp4_4o6_cutlass_auto_scale(uint8_t* out_fp4,
                                            const cudaDeviceProp& dp,
                                            cudaStream_t stream);
 
+/// @brief Undo the global encode scale left in a re-quantized dequantized NVFP4 tensor.
+///
+/// Dequantizing with decode_scale = 1 returns the scaled domain (global_encode_scale =
+/// tensor_scale / amax_src is baked into the block scales). Re-quantizing that yields
+/// correct block scales but an amax inflated by that factor; this restores
+/// amax_true = amax_scaled * amax_src / tensor_scale. Pass 1536 for 4/6, 2688 otherwise.
+void nvfp4_unscale_amax(float* amax_out,
+                        const float* amax_scaled,
+                        const float* amax_src,
+                        float tensor_scale,
+                        cudaStream_t stream);
+
+/// @brief Four Over Six NVFP4 quantization using a pre-computed global amax.
+///
+/// Same result as quantize_nvfp4_4o6_cutlass_auto_scale, minus its abs_max reduction:
+/// 4/6 consumes the global amax as an input (the per-block amax driving the 4-vs-6
+/// selection is computed inside the kernel), so a caller that already has the amax --
+/// e.g. a fused RMSNorm/SwiGLU that produced this activation -- can skip a full pass
+/// over [M, K]. Mirrors quantize_nvfp4_weight_cutlass_from_amax for the standard path.
+void quantize_nvfp4_4o6_cutlass_from_amax(uint8_t* out_fp4,
+                                          uint8_t* block_scales,
+                                          const float* global_amax,
+                                          const nv_bfloat16* in,
+                                          int M,
+                                          int K,
+                                          recipes::FourOverSixErrorMetric error_metric,
+                                          const cudaDeviceProp& dp,
+                                          cudaStream_t stream);
+
 /// @brief Four Over Six NVFP4 stochastic quantization with CUTLASS layout (for gradients).
 void quantize_nvfp4_4o6_stochastic_cutlass_auto_scale(uint8_t* out_fp4,
                                                       uint8_t* block_scales,

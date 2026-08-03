@@ -495,11 +495,8 @@ void CompiledExecutor::dispatch_matmul_swiglu_backward(const CompiledOp& op, con
             }
         }
         if (ctx.allow_fp4 && mRecipe) {
-            // NVFP4QuartetRecipe uses the forward-layout FP4 cache and performs an explicit
-            // dequant->transpose->Hadamard->requant pipeline for per-step re-randomization.
-            // Standard NVFP4 uses the transposed cache (W^T) directly for dgrad.
-            const bool is_quartet = (mRecipe->name() == std::string_view{"nvfp4-quartet"});
-            auto* cache = is_quartet ? mFP4Cache : mFP4CacheT;
+            // dgrad consumes W^T directly from the transposed FP4 cache.
+            auto* cache = mFP4CacheT;
             if (cache) {
                 auto it = cache->find(weight_name);
                 if (it != cache->end() && it->second.initialized && it->second.data.Data && it->second.scales.Data &&

@@ -30,6 +30,12 @@ void NVFP4Recipe::forward_matmul(modules::MatmulContext& ctx) const {
     // Fall back to BF16 matmul if FP4 is not allowed for this layer or descriptor.
     if (!ctx.allow_fp4 || !descriptor_allows_fp4(ctx.op_caps, "NVFP4Recipe::forward_matmul") ||
         !descriptor_allows_matmul_fp4_forward(ctx.matmul_caps, "NVFP4Recipe::forward_matmul")) {
+        if (ctx.weight->DType == ETensorDType::FP4_E2M1) {
+            throw std::runtime_error(
+                "NVFP4Recipe::forward_matmul: BF16 fallback requested for an FP4-streamed weight "
+                "(no BF16 copy exists); exclude this weight from is_fp4_stream_weight or set "
+                "SUROGATE_DISABLE_FP4_WEIGHT_STREAM=1");
+        }
         IRunState& rs = *ctx.run_state;
         const int M = ctx.B * ctx.T;
         const int N = ctx.C_out;
@@ -236,14 +242,26 @@ void NVFP4Recipe::backward_matmul(modules::MatmulContext& ctx) const {
     if (!ctx.dinp || !ctx.dout || !ctx.inp || !ctx.weight) {
         throw std::runtime_error("NVFP4Recipe::backward_matmul: required tensors are null");
     }
-    if (ctx.inp->DType != ETensorDType::BF16 || ctx.weight->DType != ETensorDType::BF16 ||
-        ctx.dout->DType != ETensorDType::BF16) {
+    // A streamed NVFP4 weight arrives already quantized (dsl::Nvfp4StreamLayout) and is
+    // consumed through ctx.cached_fp4_* -- dgrad reads the W^T section and never touches
+    // ctx.weight's bytes, so BF16 is not required for it in that case.
+    const bool weight_is_streamed_fp4 = (ctx.weight->DType == ETensorDType::FP4_E2M1);
+    const bool has_cached_fp4_weight =
+        (ctx.cached_fp4_data != nullptr && ctx.cached_fp4_scales != nullptr && ctx.cached_fp4_amax != nullptr);
+    if (ctx.inp->DType != ETensorDType::BF16 || ctx.dout->DType != ETensorDType::BF16 ||
+        (ctx.weight->DType != ETensorDType::BF16 && !(weight_is_streamed_fp4 && has_cached_fp4_weight))) {
         throw std::runtime_error("NVFP4Recipe::backward_matmul: inp/weight/dout must be BF16");
     }
 
     // Fall back to BF16 matmul if FP4 is not allowed for this layer or descriptor.
     if (!ctx.allow_fp4 || !descriptor_allows_fp4(ctx.op_caps, "NVFP4Recipe::backward_matmul") ||
         !descriptor_allows_matmul_fp4_backward(ctx.matmul_caps, "NVFP4Recipe::backward_matmul")) {
+        if (weight_is_streamed_fp4) {
+            throw std::runtime_error(
+                "NVFP4Recipe::backward_matmul: BF16 fallback requested for an FP4-streamed weight "
+                "(no BF16 copy exists); exclude this weight from is_fp4_stream_weight or set "
+                "SUROGATE_DISABLE_FP4_WEIGHT_STREAM=1");
+        }
         IRunState& rs = *ctx.run_state;
         const int B = ctx.B;
         const int T = ctx.T;
@@ -662,21 +680,21 @@ void NVFP4Recipe::forward_matmul_cutlass(modules::MatmulContext& ctx) const {
 
         if (precomputed_amax) {
             inp_global_amax_ptr = precomputed_amax;
-            // Note: 4/6 quantization requires computing amax internally, so we can't use the from_amax path
             if (mConfig.enable_four_over_six) {
-                // 4/6 doesn't support from_amax, fall back to auto_scale (will recompute amax)
-                inp_global_amax = rs.temp_alloc(ETensorDType::FP32, {1}, "inp_global_amax");
-                inp_global_amax_ptr = inp_global_amax.get<float>();
-                inp_amax_is_temp = true;
-                quantize_nvfp4_4o6_cutlass_auto_scale(inp_fp4_data.get<uint8_t>(),
-                                                      inp_fp4_scales.get<uint8_t>(),
-                                                      inp_global_amax_ptr,
-                                                      ctx.inp->get<nv_bfloat16>(),
-                                                      BT,
-                                                      C_in,
-                                                      mConfig.four_over_six_metric,
-                                                      rs.DeviceProp,
-                                                      ctx.stream);
+                // 4/6 takes the global amax as an INPUT (only the per-block amax that picks
+                // 4-vs-6 is computed in-kernel), so the precomputed amax is usable here just
+                // as it is on the standard path. This used to re-run abs_max over the whole
+                // activation for every 4/6 quantization -- a full [BT, C_in] pass per matmul,
+                // per sweep -- purely because the from_amax launcher did not exist.
+                quantize_nvfp4_4o6_cutlass_from_amax(inp_fp4_data.get<uint8_t>(),
+                                                     inp_fp4_scales.get<uint8_t>(),
+                                                     inp_global_amax_ptr,
+                                                     ctx.inp->get<nv_bfloat16>(),
+                                                     BT,
+                                                     C_in,
+                                                     mConfig.four_over_six_metric,
+                                                     rs.DeviceProp,
+                                                     ctx.stream);
             } else {
                 quantize_nvfp4_cutlass_from_amax(inp_fp4_data.get<uint8_t>(),
                                                  inp_fp4_scales.get<uint8_t>(),

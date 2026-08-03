@@ -17,7 +17,9 @@
 
 #include "config/pretrained_config.h"
 #include "kernels/kernels.h"
+#include "recipes/nvfp4/nvfp4_recipe.h"
 #include "runtime/core/matmul_context.h"
+#include "runtime/dsl/nvfp4_stream_layout.h"
 #include "runtime/dsl/shared_master_store.h"
 #include "runtime/dsl/tensor_role.h"
 #include "runtime/lora/lora_config.h"
@@ -206,6 +208,9 @@ DslWeightManager::DslWeightManager(const Module& module,
     mConfig.persistent_quants = options.PersistentQuants;
     mConfig.use_zero_copy = options.UseZeroCopy;
     mConfig.cpu_training = options.CpuTraining;
+    if (const char* env = std::getenv("SUROGATE_RESIDENT_LAYERS")) {
+        mConfig.resident_layers = std::max(0, std::atoi(env));
+    }
     // Frozen-base cpu_training keeps embedding/lm_head resident on device (see
     // DslWeightManagerConfig::resident_nonblock). The frozen base never changes,
     // so the per-version gather skip makes each buffer stream exactly once.
@@ -218,6 +223,28 @@ DslWeightManager::DslWeightManager(const Module& module,
     mConfig.stream_fp8 = mConfig.enable_fp8_forward && mConfig.offload_master;
     mConfig.fp8_skip_first_layers = options.RecipeOptions.skip_quant_first_layers;
     mConfig.fp8_skip_last_layers = options.RecipeOptions.skip_quant_last_layers;
+    // NVFP4 weight streaming. CUTLASS backend only: the blob is written in the CUTLASS
+    // scale layout and consumed through ctx.cached_fp4_*, which the cuDNN path neither
+    // produces nor reads (it quantizes into its own F8_128x4 layout every call).
+    // NVFP4 on the CUTLASS backend ONLY. Deliberately a dynamic_cast rather than a bare
+    // is_nvfp4_cutlass(): that flag only says "a CUTLASS FP4 recipe", and a recipe that
+    // reads the BF16 weight itself (rather than consuming ctx.cached_fp4_*) would be
+    // handed FP4 masters it cannot decode. The cuDNN backend is excluded for the same
+    // reason -- it quantizes into its own F8_128x4 layout per call and never reads
+    // ctx.cached_fp4_*.
+    if (mConfig.offload_master && options.TrainingRecipe &&
+        std::getenv("SUROGATE_DISABLE_FP4_WEIGHT_STREAM") == nullptr) {
+        if (const auto* nvfp4 = dynamic_cast<const recipes::NVFP4Recipe*>(options.TrainingRecipe.get())) {
+            if (nvfp4->is_nvfp4_cutlass()) {
+                mConfig.stream_fp4 = true;
+                // The blob must be quantized exactly as the on-the-fly path would have been,
+                // or the recipe's alpha correction (which differs between 4/6 and standard
+                // scaling) no longer matches the block scales.
+                mConfig.fp4_four_over_six = nvfp4->uses_four_over_six();
+                mConfig.fp4_four_over_six_metric = static_cast<int>(nvfp4->four_over_six_metric());
+            }
+        }
+    }
 
     // Enable streaming if sharding weights with multiple GPUs
     mStreamWeights = mConfig.shard_weights && mConfig.num_shards > 1;
@@ -313,6 +340,12 @@ void DslWeightManager::allocate_weights(const Module& module,
             // PINNED gives cudaHostAlloc with mapped flag, enabling zero-copy access from GPU.
             // For cpu_training: ALL weights (block + non-block) go to pinned CPU.
             // For legacy offload_master: only block weights go to pinned CPU.
+            // NOTE: residency (SUROGATE_RESIDENT_LAYERS) does NOT allocate on device here.
+            // Import writes BF16, so a device master would have to be BF16-sized -- 2x what
+            // the quantized weight actually needs -- and that peak lands during import,
+            // before anything can shrink it. The promotion happens in
+            // finalize_fp8_block_masters instead, once the master is FP8 and its real size
+            // is known.
             if (entry.is_block || mConfig.cpu_training) {
                 master_alloc = EAllocationType::PINNED;
             } else if (freeze_base) {
@@ -570,14 +603,29 @@ void DslWeightManager::allocate_prefetch_buffers() {
                 // Keyed separately so a base whose layers split FP8/BF16 (skip_quant_* set)
                 // never shares one buffer across dtypes.
                 const bool fp8 = is_fp8_stream_weight(name) && !entry.trainable;
+                // NVFP4-streamed weights hold one blob (W + W^T + scales + amaxes), so the
+                // slot is a raw byte buffer sized by Nvfp4StreamLayout; the entry keeps the
+                // logical (N, K) shape so the matmul can address the sections.
+                const bool fp4 = !fp8 && is_fp4_stream_weight(name, shape) && !entry.trainable;
                 const ETensorDType buf_dtype = fp8 ? ETensorDType::FP8_E4M3 : mConfig.work_dtype;
-                const std::string pkey = prefetch_key(bname, shape) + (fp8 ? "|f8" : "");
+                const std::string pkey = prefetch_key(bname, shape) + (fp8 ? "|f8" : (fp4 ? "|f4" : ""));
                 auto bit = base_buffers.find(pkey);
 
                 if (bit == base_buffers.end()) {
                     // First time seeing this base param — allocate GPU buffer
-                    std::string buf_name = "prefetch_" + std::to_string(i) + "_" + bname + (fp8 ? "_f8" : "");
-                    Tensor buf = mAllocator->allocate(buf_dtype, buf_name.c_str(), EAllocationType::ON_DEVICE, shape);
+                    std::string buf_name =
+                        "prefetch_" + std::to_string(i) + "_" + bname + (fp8 ? "_f8" : (fp4 ? "_f4" : ""));
+                    Tensor buf;
+                    if (fp4) {
+                        const auto layout = Nvfp4StreamLayout::make(shape[0], shape[1]);
+                        Tensor raw = mAllocator->allocate(ETensorDType::BYTE,
+                                                          buf_name.c_str(),
+                                                          EAllocationType::ON_DEVICE,
+                                                          {static_cast<long>(layout.total)});
+                        buf = Tensor::from_pointer(raw.Data, raw.Device, ETensorDType::FP4_E2M1, shape);
+                    } else {
+                        buf = mAllocator->allocate(buf_dtype, buf_name.c_str(), EAllocationType::ON_DEVICE, shape);
+                    }
                     if (fp8) {
                         Tensor stats = mAllocator->allocate(ETensorDType::FP32,
                                                             (buf_name + "_stats").c_str(),
@@ -1107,6 +1155,17 @@ bool is_device_resident(const Tensor& t) {
 
 }  // namespace
 
+std::size_t DslWeightManager::tensor_storage_bytes(const Tensor& t) {
+    // A streamed NVFP4 weight is a blob (W + W^T + block scales + amaxes), not a plain
+    // tensor: Tensor::bytes() reports get_dtype_size(FP4_E2M1) * nelem == N*K, which is
+    // 12.5% SHORT of the blob and would silently truncate the W^T scales at the tail.
+    // Every place that measures or moves these buffers must ask the layout instead.
+    if (t.DType == ETensorDType::FP4_E2M1 && t.Rank == 2 && t.Sizes[0] > 0 && t.Sizes[1] > 0) {
+        return Nvfp4StreamLayout::make(t.Sizes[0], t.Sizes[1]).total;
+    }
+    return t.bytes();
+}
+
 std::size_t DslWeightManager::total_persistent_bytes() const {
     std::size_t total = 0;
     std::unordered_set<const std::byte*> seen;  // dedupe master/work/prefetch aliases
@@ -1114,7 +1173,7 @@ std::size_t DslWeightManager::total_persistent_bytes() const {
         if (!is_device_resident(t)) return;
         if (!seen.insert(t.Data).second) return;
         total = align_up_bytes(total, 256);
-        total += t.bytes();
+        total += tensor_storage_bytes(t);
     };
     for (const auto& kv : mWeights) {
         const auto& entry = kv.second;
@@ -1140,7 +1199,7 @@ std::size_t DslWeightManager::gpu_prefetch_buffer_bytes() const {
             const Tensor& t = kv.second;
             if (!is_device_resident(t)) continue;
             if (!seen.insert(t.Data).second) continue;
-            total += t.bytes();
+            total += tensor_storage_bytes(t);
         }
     }
     return total;
@@ -1175,7 +1234,7 @@ DslWeightManager::rebind_to_persistent_arena(std::byte* arena_base, std::size_t 
             t.Data = cached->second;
             return true;
         }
-        const std::size_t bytes = t.bytes();
+        const std::size_t bytes = tensor_storage_bytes(t);
         if (bytes == 0) return false;
         cursor = align_up_bytes(cursor, 256);
         if (cursor + bytes > max_bytes) {
@@ -1257,6 +1316,14 @@ void DslWeightManager::convert_to_work(const Tensor& master, Tensor& work, cudaS
     // Same pointer - no copy needed
     if (master.Data == work.Data) return;
 
+    // NVFP4 streaming: the master is a blob (W + W^T + scales + amaxes), not a plain
+    // tensor, so its byte count comes from the layout rather than dtype * nelem.
+    if (master.DType == ETensorDType::FP4_E2M1 && work.DType == ETensorDType::FP4_E2M1) {
+        const auto layout = Nvfp4StreamLayout::make(master.Sizes[0], master.Sizes[1]);
+        CUDA_CHECK(cudaMemcpyAsync(work.Data, master.Data, layout.total, cudaMemcpyDefault, stream));
+        return;
+    }
+
     // Same dtype - direct copy
     if (master.DType == work.DType) {
         CUDA_CHECK(cudaMemcpyAsync(work.Data, master.Data, work.bytes(), cudaMemcpyDefault, stream));
@@ -1290,8 +1357,34 @@ void DslWeightManager::convert_to_work(const Tensor& master, Tensor& work, cudaS
     throw std::runtime_error("DslWeightManager: unsupported dtype conversion");
 }
 
+namespace {
+/// Weight fields whose MASTER may be stored quantized and streamed as such.
+///
+/// Narrower than "has a MatmulOp" on purpose. Quantizing the master removes the BF16 copy
+/// entirely, so every consumer must go through the recipe -- and the backward gate is
+/// stricter than the forward one (it additionally requires mode == NT and a flat
+/// [B*T, C] input), so the hybrid attention projections can fall through to the plain
+/// BF16 GEMM and would receive packed FP4/FP8 bytes. Those ops may still be quantized
+/// per-op by the recipe (SUROGATE_QUANT_ATTN_PROJ); they just keep a BF16 master, which
+/// makes any fallback correct instead of fatal.
+bool is_stream_eligible_field(const std::string& name) {
+    static constexpr std::string_view kFields[] = {
+        "qkv_weight", "out_weight", "mlp_up_weight", "mlp_gate_weight", "mlp_down_weight",
+        "up_weight",  "gate_weight", "down_weight",
+    };
+    for (std::string_view f : kFields) {
+        if (name.size() >= f.size() && name.compare(name.size() - f.size(), f.size(), f) == 0) {
+            // Guard against "lin_out_weight" matching the "out_weight" suffix.
+            if (name.size() == f.size() || name[name.size() - f.size() - 1] == '.') return true;
+        }
+    }
+    return false;
+}
+}  // namespace
+
 bool DslWeightManager::is_fp8_stream_weight(const std::string& name) const {
     if (!mConfig.stream_fp8) return false;
+    if (!is_stream_eligible_field(name)) return false;
     int layer_idx = -1;
     // Only the explicit matmul-weight fields (qkv/out/mlp_up/down/...) are FP8-quantizable;
     // conv / norm / A_log / bias fields are not matmul weights -> matmul_op_from_weight is
@@ -1311,6 +1404,204 @@ bool DslWeightManager::is_fp8_stream_weight(const std::string& name) const {
     return true;
 }
 
+bool DslWeightManager::is_fp4_stream_weight(const std::string& name, const std::vector<long>& shape) const {
+    if (!mConfig.stream_fp4) return false;
+    if (!is_stream_eligible_field(name)) return false;
+    int layer_idx = -1;
+    // Same field selection as the FP8 predicate: only real matmul weights are quantized;
+    // conv / norm / A_log / bias keep BF16 streaming.
+    //
+    // This deliberately does NOT reach beyond matmul_op_from_weight's field table. On the
+    // Qwen3.5/3.6 hybrids that table matches only mlp_up + mlp_down, and it is tempting to
+    // add the attention projections (full_q/k/v/out, lin_in_proj_*, lin_out) since they are
+    // plain matmuls -- but measurement showed every one of them reports used_recipe=0 in
+    // dispatch_matmul, i.e. the FP4 recipe declines them and they run the BF16 GEMM. A
+    // weight the recipe never quantizes must keep its BF16 master. Making those ops
+    // FP4-eligible is a recipe-capability change, not a streaming one.
+    if (!matmul_op_from_weight(name, layer_idx).has_value()) return false;
+    if (is_mlp_gate_weight(name)) return false;
+    if (tensor_role_is_shared_expert_name(name)) return false;
+    if (layer_idx < 0) return false;
+    if (mConfig.fp8_skip_first_layers > 0 && layer_idx < mConfig.fp8_skip_first_layers) return false;
+    if (mConfig.fp8_skip_last_layers > 0 && layer_idx >= mConfig.num_layers - mConfig.fp8_skip_last_layers) {
+        return false;
+    }
+    // NVFP4 packs two values per byte in BOTH orientations (W is (N, K), W^T is (K, N)),
+    // so both dimensions must be even; rank must be 2 for the CUTLASS weight kernels.
+    if (shape.size() != 2) return false;
+    if (shape[0] <= 0 || shape[1] <= 0) return false;
+    if (shape[0] % 2 != 0 || shape[1] % 2 != 0) return false;
+    return Nvfp4StreamLayout::make(shape[0], shape[1]).fits_in_bf16_master(shape[0], shape[1]);
+}
+
+void DslWeightManager::finalize_fp4_block_masters(const cudaDeviceProp& dp, cudaStream_t stream) {
+    if (!mConfig.stream_fp4) return;
+
+    // Device scratch: the largest master (BF16 in) and the largest blob (FP4 out).
+    std::size_t max_nelem = 0;
+    std::size_t max_blob = 0;
+    for (auto& [name, e] : mWeights) {
+        if (!e.is_block || e.trainable || e.master.DType != mConfig.master_dtype) continue;
+        std::vector<long> shape(e.master.Sizes.begin(), e.master.Sizes.begin() + e.master.Rank);
+        if (!is_fp4_stream_weight(name, shape)) continue;
+        max_nelem = std::max(max_nelem, e.master.nelem());
+        max_blob = std::max(max_blob, Nvfp4StreamLayout::make(shape[0], shape[1]).total);
+    }
+    if (max_nelem == 0) return;
+
+    void* d_bf16 = nullptr;
+    void* d_blob = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_bf16, max_nelem * get_dtype_size(ETensorDType::BF16)));
+    CUDA_CHECK(cudaMalloc(&d_blob, max_blob));
+
+    const auto metric = static_cast<recipes::FourOverSixErrorMetric>(mConfig.fp4_four_over_six_metric);
+    std::size_t converted = 0;
+    const bool verify = std::getenv("SUROGATE_DEBUG_FP4_STREAM_VERIFY") != nullptr;
+    int verify_count = 0;
+
+    for (auto& [name, e] : mWeights) {
+        if (!e.is_block || e.trainable || e.master.DType != mConfig.master_dtype) continue;
+        std::vector<long> shape(e.master.Sizes.begin(), e.master.Sizes.begin() + e.master.Rank);
+        if (!is_fp4_stream_weight(name, shape)) continue;
+
+        const long N = shape[0];
+        const long K = shape[1];
+        const auto layout = Nvfp4StreamLayout::make(N, K);
+
+        // Shared masters (frozen base shared across GPUs) are quantized exactly once.
+        const bool shared = is_shared_master(name);
+        const bool do_quant = !shared || shared_master_store().try_claim_fp8(name);
+        if (do_quant) {
+            CUDA_CHECK(cudaMemcpyAsync(d_bf16,
+                                       e.master.Data,
+                                       e.master.nelem() * get_dtype_size(ETensorDType::BF16),
+                                       cudaMemcpyDefault,
+                                       stream));
+            const auto* in = static_cast<const nv_bfloat16*>(d_bf16);
+            auto* blob = static_cast<std::byte*>(d_blob);
+
+            // Forward W (N, K) -- 4/6 when the recipe uses it, matching the weight cache.
+            if (mConfig.fp4_four_over_six) {
+                quantize_nvfp4_4o6_cutlass_auto_scale(reinterpret_cast<uint8_t*>(blob + layout.fwd_data),
+                                                      reinterpret_cast<uint8_t*>(blob + layout.fwd_scales),
+                                                      reinterpret_cast<float*>(blob + layout.fwd_amax),
+                                                      in,
+                                                      static_cast<int>(N),
+                                                      static_cast<int>(K),
+                                                      metric,
+                                                      dp,
+                                                      stream);
+            } else {
+                quantize_nvfp4_weight_cutlass_auto_scale(reinterpret_cast<uint8_t*>(blob + layout.fwd_data),
+                                                         reinterpret_cast<uint8_t*>(blob + layout.fwd_scales),
+                                                         reinterpret_cast<float*>(blob + layout.fwd_amax),
+                                                         in,
+                                                         static_cast<int>(N),
+                                                         static_cast<int>(K),
+                                                         dp,
+                                                         stream);
+            }
+
+            // dgrad W^T (K, N). dgrad always uses standard (2688) scaling for both dout and
+            // W^T -- there is no 4/6 transpose variant -- exactly as the fallback path does.
+            // Skipped under derive_wt(): dgrad rebuilds W^T from the forward section, so
+            // the blob -- and therefore the PCIe traffic -- is the forward part only.
+            if (!Nvfp4StreamLayout::derive_wt()) {
+                quantize_nvfp4_weight_cutlass_transpose_auto_scale(
+                    reinterpret_cast<uint8_t*>(blob + layout.bwd_data),
+                    reinterpret_cast<uint8_t*>(blob + layout.bwd_scales),
+                    reinterpret_cast<float*>(blob + layout.bwd_amax),
+                    in,
+                    static_cast<int>(N),
+                    static_cast<int>(K),
+                    dp,
+                    stream);
+            }
+
+            // Optional self-check: repeat the same quantization into freshly allocated,
+            // allocator-aligned buffers (exactly how the per-weight FP4 cache lays them
+            // out) and byte-compare. Distinguishes "blob is quantized wrong" from "blob is
+            // quantized right but consumed wrong", which a training-loss NaN cannot.
+            if (verify) {
+                const std::size_t fwd_data_bytes = static_cast<std::size_t>(N) * (K / 2);
+                void* r_data = nullptr;
+                void* r_scales = nullptr;
+                float* r_amax = nullptr;
+                CUDA_CHECK(cudaMalloc(&r_data, fwd_data_bytes));
+                CUDA_CHECK(cudaMalloc(&r_scales, layout.fwd_scales_bytes));
+                CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&r_amax), sizeof(float)));
+                if (mConfig.fp4_four_over_six) {
+                    quantize_nvfp4_4o6_cutlass_auto_scale(static_cast<uint8_t*>(r_data),
+                                                          static_cast<uint8_t*>(r_scales),
+                                                          r_amax,
+                                                          in,
+                                                          static_cast<int>(N),
+                                                          static_cast<int>(K),
+                                                          metric,
+                                                          dp,
+                                                          stream);
+                } else {
+                    quantize_nvfp4_weight_cutlass_auto_scale(static_cast<uint8_t*>(r_data),
+                                                             static_cast<uint8_t*>(r_scales),
+                                                             r_amax,
+                                                             in,
+                                                             static_cast<int>(N),
+                                                             static_cast<int>(K),
+                                                             dp,
+                                                             stream);
+                }
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                std::vector<std::byte> h_ref(fwd_data_bytes), h_blob(fwd_data_bytes);
+                std::vector<std::byte> h_ref_s(layout.fwd_scales_bytes), h_blob_s(layout.fwd_scales_bytes);
+                float h_ref_a = 0.0f, h_blob_a = 0.0f;
+                CUDA_CHECK(cudaMemcpy(h_ref.data(), r_data, fwd_data_bytes, cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(h_blob.data(), blob + layout.fwd_data, fwd_data_bytes, cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(h_ref_s.data(), r_scales, layout.fwd_scales_bytes, cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(
+                    h_blob_s.data(), blob + layout.fwd_scales, layout.fwd_scales_bytes, cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(&h_ref_a, r_amax, sizeof(float), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(
+                    &h_blob_a, blob + layout.fwd_amax, sizeof(float), cudaMemcpyDeviceToHost));
+                const bool data_eq = (h_ref == h_blob);
+                const bool scales_eq = (h_ref_s == h_blob_s);
+                const bool amax_eq = (h_ref_a == h_blob_a);
+                if (!data_eq || !scales_eq || !amax_eq) {
+                    std::cerr << "[fp4-stream][VERIFY-FAIL] " << name << " data_eq=" << data_eq
+                              << " scales_eq=" << scales_eq << " amax_eq=" << amax_eq << " (ref_amax=" << h_ref_a
+                              << " blob_amax=" << h_blob_a << ")\n";
+                } else if (verify_count < 3) {
+                    std::cerr << "[fp4-stream][VERIFY-OK] " << name << " N=" << N << " K=" << K
+                              << " amax=" << h_blob_a << " scale_bytes=" << layout.fwd_scales_bytes << "\n";
+                }
+                ++verify_count;
+                CUDA_CHECK(cudaFree(r_data));
+                CUDA_CHECK(cudaFree(r_scales));
+                CUDA_CHECK(cudaFree(r_amax));
+            }
+
+            // Blob back into the host master's front (it is 2*N*K bytes; the blob is ~1.125).
+            CUDA_CHECK(cudaMemcpyAsync(e.master.Data, d_blob, layout.total, cudaMemcpyDefault, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            if (shared) shared_master_store().finish_fp8(name);
+        } else {
+            shared_master_store().wait_fp8(name);
+        }
+
+        // Re-describe the master as an FP4 blob. Sizes stay (N, K) so the streaming copy and
+        // the matmul can both recompute the section offsets; bytes() is NOT meaningful for
+        // these entries (same contract as the FP8 streaming masters).
+        e.master.DType = ETensorDType::FP4_E2M1;
+        ++converted;
+    }
+
+    CUDA_CHECK(cudaFree(d_bf16));
+    CUDA_CHECK(cudaFree(d_blob));
+
+    if (converted > 0 && std::getenv("SUROGATE_DEBUG_FP4_STREAM") != nullptr) {
+        std::cerr << "[fp4-stream] quantized " << converted << " frozen matmul masters to NVFP4 blobs\n";
+    }
+}
+
 void DslWeightManager::finalize_fp8_block_masters(const cudaDeviceProp& dp, cudaStream_t stream) {
     if (!mConfig.stream_fp8) return;
 
@@ -1323,6 +1614,7 @@ void DslWeightManager::finalize_fp8_block_masters(const cudaDeviceProp& dp, cuda
     }
     if (max_nelem == 0) return;
 
+    std::size_t promoted = 0;
     int device = 0;
     CUDA_CHECK(cudaGetDevice(&device));
     void* d_bf16 = nullptr;
@@ -1377,6 +1669,35 @@ void DslWeightManager::finalize_fp8_block_masters(const cudaDeviceProp& dp, cuda
             shared_master_store().wait_fp8(name);
         }
 
+        // Partial residency (SUROGATE_RESIDENT_LAYERS): promote the first N layers' masters
+        // from pinned host to device NOW, at their FP8 size rather than the BF16 size the
+        // import needed. Their per-traversal gather then becomes a D2D copy (~TB/s) instead
+        // of PCIe traffic (~53 GB/s, and saturated under cpu_training) -- everything else
+        // (prefetch slots, gather/release) is unchanged, only where the bytes come from.
+        // Doing it here rather than at allocation matters: a device master sized for BF16
+        // would double the cost and would peak during import, before anything could shrink
+        // it. Shared masters are skipped -- they are one host buffer shared across ranks.
+        if (mConfig.resident_layers > 0 && e.layer_idx >= 0 && e.layer_idx < mConfig.resident_layers &&
+            !is_device_resident(e.master)) {
+            const std::size_t live = stats_off + Tensor::STATS_FLOATS * sizeof(float);
+            Tensor dev = mAllocator->allocate(ETensorDType::BYTE,
+                                              (name + "_resident").c_str(),
+                                              EAllocationType::ON_DEVICE,
+                                              {static_cast<long>(live)});
+            CUDA_CHECK(cudaMemcpyAsync(dev.Data, e.master.Data, live, cudaMemcpyDefault, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            // A shared master is owned by the SharedMasterStore, not the allocator, and may
+            // back other ranks -- repoint this entry at the device copy and leave the host
+            // buffer alone. Under LoRA + cpu_training EVERY frozen base master is shared, so
+            // excluding them (as an earlier version of this did) disables residency entirely.
+            if (!is_shared_master(name)) {
+                mAllocator->free(e.master);  // releases the pinned host buffer; clears .Data
+            }
+            e.master.Data = dev.Data;
+            e.master.Device = dev.Device;
+            ++promoted;
+        }
+
         // Re-describe the master as FP8 with its scale inline after the data (every GPU).
         // Keep Sizes (shape) so nelem is unchanged; bytes() now reports the FP8 size.
         e.master.DType = ETensorDType::FP8_E4M3;
@@ -1386,6 +1707,11 @@ void DslWeightManager::finalize_fp8_block_masters(const cudaDeviceProp& dp, cuda
     CUDA_CHECK(cudaFree(d_bf16));
     CUDA_CHECK(cudaFree(d_fp8));
     CUDA_CHECK(cudaFree(d_stats));
+
+    if (promoted > 0) {
+        std::cerr << "[resident] promoted " << promoted << " FP8 block masters to device ("
+                  << mConfig.resident_layers << " layers)\n";
+    }
 }
 
 bool DslWeightManager::parse_layer_index(const std::string& name, int& layer_idx) {

@@ -181,8 +181,8 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
             Which dtype to use for (activation) gradients / backward matmul policy. Defaults to matmul-dtype. Note: recipes may override backward dtype.
         master_dtype (Optional[str], defaults to None):
             Master weight dtype used for optimizer updates (e.g. FP32 for more stable full fine-tuning). Defaults to model-dtype.
-        recipe (Optional[Literal['bf16', 'fp8_hybrid', 'nvfp4', 'nvfp4_quartet']], defaults to 'bf16'):
-            Mixed precision training recipe to use: bf16 (default), fp8-hybrid, nvfp4, nvfp4-quartet
+        recipe (Optional[Literal['bf16', 'fp8_hybrid', 'nvfp4']], defaults to 'bf16'):
+            Mixed precision training recipe to use: bf16 (default), fp8-hybrid, nvfp4
         use_fused_rope (Optional[bool], defaults to False):
             Use fused RoPE kernel with on-the-fly cos/sin computation (saves memory, reduces bandwidth)
         fp8_amax_history (Optional[int], defaults to 16):
@@ -382,7 +382,7 @@ class SFTConfig(ModelConfig, TrainDatasetConfig):
     attn_bwd_chunks: int | None = 1
     gradient_dtype: str | None = None
     master_dtype: str | None = None
-    recipe: Literal["bf16", "fp8_hybrid", "nvfp4", "nvfp4_quartet"] | None = "bf16"
+    recipe: Literal["bf16", "fp8_hybrid", "nvfp4"] | None = "bf16"
     use_fused_rope: bool | None = False
     fp8_amax_history: int | None = 16
     fp4_four_over_six: bool | None = True

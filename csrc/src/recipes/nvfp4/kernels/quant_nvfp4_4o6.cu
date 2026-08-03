@@ -151,6 +151,62 @@ void quantize_nvfp4_4o6_cutlass_auto_scale(uint8_t* out_fp4,
     CUDA_CHECK(cudaGetLastError());
 }
 
+void quantize_nvfp4_4o6_cutlass_from_amax(uint8_t* out_fp4,
+                                          uint8_t* block_scales,
+                                          const float* global_amax,
+                                          const nv_bfloat16* in,
+                                          int M,
+                                          int K,
+                                          recipes::FourOverSixErrorMetric error_metric,
+                                          const cudaDeviceProp& dp,
+                                          cudaStream_t stream) {
+    if (!nvfp4_4o6_sm100::is_supported()) {
+        throw std::runtime_error("Four Over Six quantization requires Blackwell GPU (SM100+)");
+    }
+    (void)dp;
+
+    // Identical to the auto_scale launcher minus the abs_max reduction: the caller already
+    // has this tensor's global amax (a preceding fused op computed it). 4/6 only needs the
+    // GLOBAL amax as an input -- the per-block amax that drives the 4-vs-6 choice is
+    // computed inside the kernel either way -- so skipping the reduction changes nothing
+    // numerically and saves a full pass over [M, K] per quantized activation.
+    const int num_scale_cols = div_ceil(K, kBlockSize);
+
+    switch (error_metric) {
+        case recipes::FourOverSixErrorMetric::MSE:
+            nvfp4_4o6_sm100::quantize_4o6_cutlass_mse(out_fp4,
+                                                      block_scales,
+                                                      global_amax,
+                                                      in,
+                                                      M,
+                                                      K,
+                                                      num_scale_cols,
+                                                      stream);
+            break;
+        case recipes::FourOverSixErrorMetric::L1:
+            nvfp4_4o6_sm100::quantize_4o6_cutlass_l1(out_fp4,
+                                                     block_scales,
+                                                     global_amax,
+                                                     in,
+                                                     M,
+                                                     K,
+                                                     num_scale_cols,
+                                                     stream);
+            break;
+        case recipes::FourOverSixErrorMetric::AbsMax:
+            nvfp4_4o6_sm100::quantize_4o6_cutlass_absmax(out_fp4,
+                                                         block_scales,
+                                                         global_amax,
+                                                         in,
+                                                         M,
+                                                         K,
+                                                         num_scale_cols,
+                                                         stream);
+            break;
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void quantize_nvfp4_4o6_stochastic_cutlass_auto_scale(uint8_t* out_fp4,
                                                       uint8_t* block_scales,
                                                       float* global_amax,

@@ -15,6 +15,8 @@
 
 #include "runtime/executor/compiled_ops_helpers.h"
 #include "runtime/dsl/autodiff.h"
+#include "runtime/dsl/nvfp4_stream_layout.h"
+#include "recipes/nvfp4/nvfp4_recipe.h"
 #include "runtime/dsl/op_shape_signatures.h"
 #include "runtime/dsl/tensor_role.h"
 #include "runtime/executor/op_registry.h"
@@ -94,6 +96,130 @@ bool attach_resident_qlora_fp4_cache(modules::MatmulContext& ctx,
     temps.push_back(amax);
     ctx.cached_fp4_amax = amax.get<float>();
     return true;
+}
+
+/// Point ctx.cached_fp4_* at the sections of a STREAMED NVFP4 weight blob.
+///
+/// Under cpu_training/offload_master with an nvfp4-cutlass recipe, frozen matmul weights
+/// arrive already quantized (see Nvfp4StreamLayout): the prefetch slot holds W and W^T
+/// with their block scales and global amaxes. Binding views into it gives the recipe the
+/// same pointers the quantize-once weight cache would have -- which streaming has to
+/// refuse -- so no matmul re-quantizes its weight. Views are rebuilt per call because the
+/// blob moves between prefetch slots; that is pointer arithmetic, not a copy.
+///
+/// `transposed` selects the dgrad W^T section.
+bool attach_streamed_nvfp4_weight(modules::MatmulContext& ctx,
+                                  const Tensor& b,
+                                  Tensor& data_view,
+                                  Tensor& scales_view,
+                                  bool transposed) {
+    if (b.DType != ETensorDType::FP4_E2M1 || b.Data == nullptr || b.Rank != 2) {
+        return false;
+    }
+    const long N = b.Sizes[0];
+    const long K = b.Sizes[1];
+    const auto layout = dsl::Nvfp4StreamLayout::make(N, K);
+    auto* base = static_cast<std::byte*>(b.Data);
+
+    const std::size_t data_off = transposed ? layout.bwd_data : layout.fwd_data;
+    const std::size_t scales_off = transposed ? layout.bwd_scales : layout.fwd_scales;
+    const std::size_t scales_bytes = transposed ? layout.bwd_scales_bytes : layout.fwd_scales_bytes;
+    const std::size_t amax_off = transposed ? layout.bwd_amax : layout.fwd_amax;
+    const long rows = transposed ? K : N;
+    const long cols = transposed ? N : K;
+
+    data_view = Tensor::from_pointer(base + data_off,
+                                     b.Device,
+                                     ETensorDType::BYTE,
+                                     std::vector<long>{rows, cols / 2});
+    scales_view = Tensor::from_pointer(base + scales_off,
+                                       b.Device,
+                                       ETensorDType::BYTE,
+                                       std::vector<long>{static_cast<long>(scales_bytes)});
+    ctx.cached_fp4_data = &data_view;
+    ctx.cached_fp4_scales = &scales_view;
+    ctx.cached_fp4_amax = reinterpret_cast<float*>(base + amax_off);
+    return true;
+}
+
+/// 4/6 changes the tensor-scale constant (1536 vs 2688), which the amax un-scaling needs.
+bool nvfp4_uses_4o6(const recipes::Recipe* recipe) {
+    if (const auto* nvfp4 = dynamic_cast<const recipes::NVFP4Recipe*>(recipe)) {
+        return nvfp4->uses_four_over_six();
+    }
+    return false;
+}
+
+/// Rebuild the dgrad W^T operand from a forward-only streamed NVFP4 blob.
+///
+/// Under SUROGATE_FP4_DERIVE_WT the blob holds just [W | scales | amax] -- 0.5625 B/param,
+/// below FP8's 1.0 -- so dgrad reconstructs its operand here instead of streaming it:
+///   1. dequantize the forward FP4 back to BF16 (decode_scale = 1)
+///   2. quantize-transpose that to FP4 (K, N), the kernel the cache path uses
+///   3. undo the global encode scale step (1) left in the values
+///
+/// Step 3 is not optional: dequantizing with decode_scale = 1 returns the SCALED domain,
+/// so the re-quantized block scales are right (per-block normalization is scale-invariant)
+/// but the amax comes back inflated by tensor_scale / amax_fwd, which would scale every
+/// dgrad. Using decode_scale = amax/tensor_scale instead would need the amax on the host,
+/// i.e. a device sync per weight per backward -- this keeps it all on device.
+///
+/// Costs ~5*N*K bytes of device traffic to avoid 0.5625*N*K bytes over PCIe; at ~1.7 TB/s
+/// against ~5 GB/s that is roughly a 40x win.
+void derive_streamed_nvfp4_wt(modules::MatmulContext& ctx,
+                              const Tensor& b,
+                              DslRunState& run_state,
+                              std::vector<Tensor>& temps,
+                              Tensor& data_view,
+                              Tensor& scales_view,
+                              bool uses_four_over_six) {
+    const long N = b.Sizes[0];
+    const long K = b.Sizes[1];
+    const auto layout = dsl::Nvfp4StreamLayout::make(N, K);
+    auto* base = static_cast<std::byte*>(b.Data);
+
+    Tensor w_bf16 = run_state.temp_alloc(ETensorDType::BF16, {N, K}, "fp4_wt_dequant");
+    dequantize_fp4_block(w_bf16.get<nv_bfloat16>(),
+                         reinterpret_cast<const uint8_t*>(base + layout.fwd_data),
+                         reinterpret_cast<const __nv_fp8_e4m3*>(base + layout.fwd_scales),
+                         /*global_decode_scale=*/1.0f,
+                         static_cast<int>(N),
+                         static_cast<int>(K),
+                         run_state.DeviceProp,
+                         ctx.stream);
+
+    Tensor wt = run_state.temp_alloc(ETensorDType::BYTE, {K, N / 2}, "fp4_wt_data");
+    Tensor wt_scales =
+        run_state.temp_alloc(ETensorDType::BYTE, {static_cast<long>(layout.bwd_scales_bytes)}, "fp4_wt_scales");
+    Tensor wt_amax_scaled = run_state.temp_alloc(ETensorDType::FP32, {1}, "fp4_wt_amax_scaled");
+    Tensor wt_amax = run_state.temp_alloc(ETensorDType::FP32, {1}, "fp4_wt_amax");
+
+    quantize_nvfp4_weight_cutlass_transpose_auto_scale(wt.get<uint8_t>(),
+                                                       wt_scales.get<uint8_t>(),
+                                                       wt_amax_scaled.get<float>(),
+                                                       w_bf16.get<nv_bfloat16>(),
+                                                       static_cast<int>(N),
+                                                       static_cast<int>(K),
+                                                       run_state.DeviceProp,
+                                                       ctx.stream);
+
+    nvfp4_unscale_amax(wt_amax.get<float>(),
+                       wt_amax_scaled.get<float>(),
+                       reinterpret_cast<const float*>(base + layout.fwd_amax),
+                       uses_four_over_six ? 1536.0f : 2688.0f,
+                       ctx.stream);
+
+    data_view = wt;
+    scales_view = wt_scales;
+    ctx.cached_fp4_data = &data_view;
+    ctx.cached_fp4_scales = &scales_view;
+    ctx.cached_fp4_amax = wt_amax.get<float>();
+
+    temps.push_back(w_bf16);
+    temps.push_back(wt);
+    temps.push_back(wt_scales);
+    temps.push_back(wt_amax_scaled);
+    temps.push_back(wt_amax);
 }
 
 struct LoRAForwardApplyContext {
@@ -318,6 +444,13 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
                                                           weight_name,
                                                           mCapturing);
                 }
+                if (ctx.allow_fp4 && !ctx.cached_fp4_data) {
+                    (void)attach_streamed_nvfp4_weight(ctx,
+                                                       resolve_weight(),
+                                                       resident_fp4_data_view,
+                                                       resident_fp4_scales_view,
+                                                       /*transposed=*/false);
+                }
                 if (!ctx.cached_fp4_data && !ctx.cached_weight) {
                     ctx.weight = &resolve_weight();
                 }
@@ -330,6 +463,16 @@ void CompiledExecutor::dispatch_matmul(const CompiledOp& op, const modules::Forw
 
         if (!used_recipe) {
             Tensor& b = resolve_weight();
+            if (b.DType == ETensorDType::FP4_E2M1) {
+                // A streamed NVFP4 blob reached the plain BF16 GEMM: the recipe declined
+                // the FP4 path for this op (capability flags / allow_quant), but the weight
+                // no longer exists in BF16. Fail loudly instead of multiplying by packed
+                // FP4 bytes -- and exclude the op's weight field from is_fp4_stream_weight.
+                throw std::runtime_error(
+                    "matmul fallback received a streamed NVFP4 weight '" + weight_name +
+                    "'; this weight must not be FP4-streamed (set SUROGATE_DISABLE_FP4_WEIGHT_STREAM=1 "
+                    "to stream BF16 masters instead)");
+            }
             EMMTranspose mode_col = swap_transpose(op.attrs.transpose);
             matmul(out,
                    b,
@@ -640,6 +783,8 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
             dB_use = &dB_tmp;
         }
 
+        Tensor streamed_fp4_data_view{};
+        Tensor streamed_fp4_scales_view{};
         modules::MatmulContext ctx;
         ctx.dinp = dA_use;
         ctx.dweight = dB_use;
@@ -679,11 +824,8 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
             }
         }
         if (ctx.allow_fp4 && mRecipe) {
-            // NVFP4QuartetRecipe uses the forward-layout FP4 cache and performs an explicit
-            // dequant->transpose->Hadamard->requant pipeline for per-step re-randomization.
-            // Standard NVFP4 uses the transposed cache (W^T) directly for dgrad.
-            const bool is_quartet = (mRecipe->name() == std::string_view{"nvfp4-quartet"});
-            auto* cache = is_quartet ? mFP4Cache : mFP4CacheT;
+            // dgrad consumes W^T directly from the transposed FP4 cache.
+            auto* cache = mFP4CacheT;
             if (cache) {
                 auto it = cache->find(weight_name);
                 if (it != cache->end() && it->second.initialized && it->second.data.Data && it->second.scales.Data &&
@@ -691,6 +833,25 @@ void CompiledExecutor::dispatch_matmul_backward(const CompiledOp& op, const modu
                     ctx.cached_fp4_data = &it->second.data;
                     ctx.cached_fp4_scales = &it->second.scales;
                     ctx.cached_fp4_amax = it->second.amax.get<float>();
+                }
+            }
+            if (!ctx.cached_fp4_data && b.DType == ETensorDType::FP4_E2M1 && b.Rank == 2) {
+                if (dsl::Nvfp4StreamLayout::derive_wt()) {
+                    // Only the forward section was streamed -- rebuild W^T here.
+                    derive_streamed_nvfp4_wt(ctx,
+                                             b,
+                                             mRunState,
+                                             mTemps,
+                                             streamed_fp4_data_view,
+                                             streamed_fp4_scales_view,
+                                             nvfp4_uses_4o6(mRecipe));
+                } else {
+                    // Streamed NVFP4 blob: dgrad reads its W^T section.
+                    (void)attach_streamed_nvfp4_weight(ctx,
+                                                       b,
+                                                       streamed_fp4_data_view,
+                                                       streamed_fp4_scales_view,
+                                                       /*transposed=*/true);
                 }
             }
         }

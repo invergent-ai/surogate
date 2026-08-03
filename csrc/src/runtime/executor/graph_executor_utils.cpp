@@ -523,7 +523,60 @@ std::optional<modules::MatmulOp> matmul_op_from_weight(std::string_view name, in
     if (field == "down_weight") return modules::MatmulOp::MLPDown;
     if (field == "shared_expert_up") return modules::MatmulOp::MLPUp;
     if (field == "shared_expert_down") return modules::MatmulOp::MLPDown;
+
+    // Hybrid (Qwen3.5/3.6) attention projections. Naming them here is what makes them
+    // quantizable at all: graph_compiler sets attrs.allow_quant = matmul_op.has_value(),
+    // and dispatch_matmul only enters the recipe when both are set -- so without an entry
+    // these run the plain BF16 GEMM and are invisible to FP8/FP4 weight streaming. On a
+    // 3:1 hybrid that is roughly 40% of the block matmul parameters.
+    //
+    // The MatmulOp also selects the FP8 delayed-scaling quantizer, which tracks the amax
+    // of the matmul's INPUT: q/k/v and lin_in_proj_{qkv,z} all consume the post-ln1 hidden
+    // state, so sharing QKV's quantizer is correct, and a layer is either full- or
+    // linear-attention so the two families never collide.
+    //
+    // Deliberately absent: lin_in_proj_a/b (shape [num_heads, C] -- the per-head decay and
+    // gate scalars of the recurrent delta rule; negligible parameter mass, and quantizing
+    // the state-decay term is a poor risk) and lin_conv (not a matmul).
+    //
+    // Whether these are actually quantized is decided per-recipe by the caller
+    // (see hybrid_attn_proj_quant_allowed) -- the mapping itself is just naming.
+    if (field == "full_q_proj_weight" || field == "full_k_proj_weight" ||
+        field == "full_v_proj_weight" || field == "lin_in_proj_qkv_weight" ||
+        field == "lin_in_proj_z_weight") {
+        return modules::MatmulOp::QKV;
+    }
+    if (field == "full_out_weight" || field == "lin_out_weight") {
+        return modules::MatmulOp::AttnOut;
+    }
     return std::nullopt;
+}
+
+bool is_hybrid_attn_proj_weight(std::string_view name) {
+    int layer_idx = -1;
+    std::string field;
+    if (!parse_block_param(name, layer_idx, field)) {
+        return false;
+    }
+    return field == "full_q_proj_weight" || field == "full_k_proj_weight" ||
+           field == "full_v_proj_weight" || field == "full_out_weight" ||
+           field == "lin_in_proj_qkv_weight" || field == "lin_in_proj_z_weight" ||
+           field == "lin_out_weight";
+}
+
+bool hybrid_attn_proj_quant_allowed(const RuntimeOptions& options) {
+    // Measured on Qwen3.5-2B reverse-text SFT, 120 steps, identical data (last-10 loss):
+    //
+    //   fp8-hybrid  2.0091 -> 2.0163  (+0.36%, curves interleave)  at -6.5% step time
+    //   nvfp4       2.0788 -> 2.1415  (+3.01%, systematic)         at -8.2% step time
+    //
+    // So it is worth it in FP8 and not in FP4: E2M1 has far less headroom, and these
+    // projections feed the gated-delta-rule recurrence where the error compounds along
+    // the sequence. Override either way with SUROGATE_QUANT_ATTN_PROJ=1/0.
+    if (const char* env = std::getenv("SUROGATE_QUANT_ATTN_PROJ")) {
+        return env[0] != '0';
+    }
+    return options.fp8_forward_enabled();
 }
 
 bool is_mlp_gate_weight(std::string_view name) {

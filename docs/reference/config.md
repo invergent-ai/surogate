@@ -63,7 +63,7 @@ CPU-RAM centric training keeps model weights and optimizer state on CPU, streami
 
 | Component        | Without `cpu_training`      | With `cpu_training`                   |
 | ---------------- | --------------------------- | ------------------------------------- |
-| Model weights    | All layers on GPU           | ~2 layers (double-buffered prefetch)  |
+| Model weights    | All layers on GPU           | ~2 layers (double-buffered prefetch; see the tuning knobs below to raise the slot count or pin the first N layers on device) |
 | Gradients (FFT)  | All layers on GPU           | ~2 layers (double-buffered D2H)       |
 | Optimizer state   | On GPU (8-bit quantized)    | On CPU (FP32, unlimited RAM)          |
 | Activations      | Per recompute settings      | Same                                  |
@@ -84,6 +84,48 @@ lora_rank: 16
 per_device_train_batch_size: 2
 sequence_len: 2048
 ```
+
+### Tuning knobs (environment variables)
+
+`cpu_training` is normally **PCIe-bound**: the GPU spends much of the step waiting for the
+next layer's weights to arrive. Profiling a 27B fp8 step (Nsight Systems, RTX 5090) found
+the GPU idle 29.4% of wall time — 26.1% of it with an H2D transfer in flight and only 3.3%
+launch-bound — while H2D ran at 53.5 GB/s, i.e. PCIe 5.0 line rate with 97% of bytes in
+transfers larger than 16 MB. There is no bandwidth or batching left to recover there, so
+the knobs below either overlap the transfers better or remove bytes from the bus.
+
+All of them are **numerically neutral** — they change where bytes live and when they move,
+not what is computed. They are off by default because each one spends GPU memory, and the
+safe amount depends on your model, sequence length and free VRAM.
+
+| Variable | Default | Effect |
+| -------- | ------- | ------ |
+| `SUROGATE_DISPATCH_PREFETCH_BLOCKS` | `2` | Number of layer prefetch slots. `3` is the measured knee (`4` and `6` were no better); costs one extra layer of weights in VRAM. |
+| `SUROGATE_RESIDENT_LAYERS` | `0` | Keep the first N layers' FP8 masters in **device** memory, so their per-traversal gather is a D2D copy instead of PCIe traffic. Promoted after quantization, so each costs its FP8 size (~N/64 of the quantized model), not the BF16 size the import needed. Raise it until it OOMs at startup, then back off. |
+| `SUROGATE_SHARED_NONBLOCK_STAGING` | unset | Reverts the resident embedding/lm_head buffers to one shared staging buffer (saves ~max(emb, lm_head) VRAM, costs ~5 GB of PCIe traffic per sweep). |
+| `SUROGATE_GRPO_FULL_KV_SWEEP` | unset | Restores the Phase-A KV sweep for the last occupied chunk in chunked GRPO. Slower, but bit-exact against the pre-optimization engine. |
+| `SUROGATE_QUANT_ATTN_PROJ` | recipe-dependent | Force attention/GDN projection quantization on (`1`) or off (`0`). Defaults on for FP8 (+0.36% loss for −6.5% step time) and off for NVFP4 (+3.01% loss — not worth it). |
+| `SUROGATE_FP4_DERIVE_WT` | unset | NVFP4 only: stream just the forward weight blob (0.5625 B/param instead of 1.125) and rebuild the dgrad transpose on device. Wins when PCIe-bound (27B: −4.5%), loses when compute-bound (2B: +2.4%). |
+
+Measured on a 27B hybrid, fp8, single RTX 5090, 20 identical micro-batches:
+
+| Configuration | s/micro-batch |
+| ------------- | ------------- |
+| defaults | 7.175 |
+| `PREFETCH_BLOCKS=3` | 7.117 (−0.8%) |
+| `PREFETCH_BLOCKS=3` + `RESIDENT_LAYERS=16` | 6.832 (−4.8%) |
+| `PREFETCH_BLOCKS=3` + `RESIDENT_LAYERS=20` | 6.748 (−6.0%) |
+| `RESIDENT_LAYERS=24` and above | out of memory on 32 GB |
+
+Residency scales with how much of the model stops crossing the bus, so the useful ceiling is
+whatever VRAM allows — on a 32 GB card with this 27B model that was 20 layers. Only the
+FP8-streamed weights are promoted (the fields in the stream-eligible set, i.e. `mlp_up` and
+`mlp_down` on a Qwen3.5/3.6 hybrid), so the log line `promoted N FP8 block masters to device`
+tells you how many actually moved.
+
+Start with `SUROGATE_DISPATCH_PREFETCH_BLOCKS=3`, then raise `SUROGATE_RESIDENT_LAYERS`
+until it OOMs at startup and back off one. Both fail fast and loudly rather than degrading
+silently.
 
 ## Offloading Options (Legacy)
 
@@ -193,7 +235,7 @@ distillation:
 
 | Option           | Type   | Default  | Description                                                                                                                   |
 | ---------------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `recipe`         | string | `"bf16"` | Mixed precision training recipe. Options: `"bf16"` (default), `"fp8_hybrid"`, `"nvfp4"`, `"nvfp4_quartet"`.                   |
+| `recipe`         | string | `"bf16"` | Mixed precision training recipe. Options: `"bf16"` (default), `"fp8_hybrid"`, `"nvfp4"`.                   |
 | `gradient_dtype` | string | `null`   | Dtype for activation gradients / backward matmul policy. Defaults to matmul-dtype. Note: recipes may override backward dtype. |
 | `master_dtype`   | string | `null`   | Master weight dtype for optimizer updates (e.g., FP32 for stable full fine-tuning). Defaults to model-dtype.                  |
 | `use_fused_rope` | bool   | `false`  | Use fused RoPE kernel with on-the-fly cos/sin computation (saves memory, reduces bandwidth).                                  |
@@ -624,7 +666,6 @@ These options control automatic training monitoring, early stopping, and compute
 | `bf16`          | BF16 forward/backward       | Any CUDA GPU                   | Baseline, maximum compatibility      |
 | `fp8_hybrid`    | FP8 E4M3 fwd / E5M2 bwd     | SM89+ (Ada, Hopper, Blackwell) | 2x throughput, minimal accuracy loss |
 | `nvfp4`         | FP4 E2M1 with block scaling | SM100+ (Blackwell only)        | Maximum memory efficiency            |
-| `nvfp4_quartet` | FP4 E2M1 quartet scaling    | SM100+ (Blackwell only)        | Higher accuracy FP4 training         |
 
 ## Example Configuration
 
