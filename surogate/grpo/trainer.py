@@ -72,7 +72,12 @@ def reorder_micros_for_vtc_guard(micro_batches: list, chunk_tokens: int) -> int 
         return None
 
     def _chunk0_valid(mb) -> int:
-        return int(mb["loss_mask"][:chunk_tokens].sum())
+        # loss_mask arrives (1, T) from the packer — flatten before slicing or
+        # [:chunk_tokens] slices ROWS and sums the WHOLE sample, which selects
+        # multi-chunk long-completion micros whose chunk 0 is empty — i.e. it
+        # manufactures the exact vtc=0 corruption this guard exists to prevent
+        # (observed live: chunk0_valid=1536 logged, engine vtc=0, norm 7.9).
+        return int(np.asarray(mb["loss_mask"]).reshape(-1)[:chunk_tokens].sum())
 
     best = max(range(len(micro_batches)), key=lambda i: _chunk0_valid(micro_batches[i]))
     if best == len(micro_batches) - 1:
