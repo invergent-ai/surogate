@@ -51,6 +51,47 @@ def _filtered_config_for_logging(config: GRPOTrainConfig) -> dict:
     return out
 
 
+def reorder_micros_for_vtc_guard(micro_batches: list, chunk_tokens: int) -> int | None:
+    """Move the micro with the largest chunk-0 valid-token count to the last slot.
+
+    In chunked GRPO the engine's step-end ValidTokenCount is the LAST micro's
+    CHUNK-0 count (per-invocation loss-buffer zeroing x reverse phase-B chunk
+    order — see upstream issue #74):
+      * a multi-chunk sample whose prompt fills chunk 0 packed last makes vtc
+        read 0 and corrupts the step (metrics garbage + exploded norm), and
+      * any small last micro shrinks the grad token-scale denominator, so the
+        reported grad norm is packing noise (measured corr(grad_norm, 1/vtc)
+        = 0.83 over 76 steps) and a grad clip suppresses real updates.
+    Batch order within an optimizer step is gradient-neutral (per-token grads
+    are computed python-side and summed), so pinning the max-count micro last
+    stabilizes the denominator without touching the update.
+
+    Returns the index swapped from, or None if no reorder was needed.
+    """
+    if chunk_tokens <= 0 or not micro_batches:
+        return None
+
+    def _chunk0_valid(mb) -> int:
+        # loss_mask arrives (1, T) from the packer — flatten before slicing or
+        # [:chunk_tokens] slices ROWS and sums the WHOLE sample, which selects
+        # multi-chunk long-completion micros whose chunk 0 is empty — i.e. it
+        # manufactures the exact vtc=0 corruption this guard exists to prevent.
+        return int(np.asarray(mb["loss_mask"]).reshape(-1)[:chunk_tokens].sum())
+
+    best = max(range(len(micro_batches)), key=lambda i: _chunk0_valid(micro_batches[i]))
+    if best == len(micro_batches) - 1:
+        return None
+    last_valid = _chunk0_valid(micro_batches[-1])
+    micro_batches[best], micro_batches[-1] = micro_batches[-1], micro_batches[best]
+    logger.info(
+        "vtc guard: moved micro %d (chunk0_valid=%d) to last slot (previous last had %d)",
+        best,
+        _chunk0_valid(micro_batches[-1]),
+        last_valid,
+    )
+    return best
+
+
 def _find_sample_boundaries(position_ids_flat: np.ndarray) -> list[tuple[int, int]]:
     """Find sample boundaries in packed position_ids.
 
@@ -696,6 +737,10 @@ class GRPOTrainer:
             # Accumulate ALL micro-batches from one pack into a single optimizer step.
             # No fixed gradient_accumulation_steps — the count is determined dynamically by the packer each step.
             seq_len = config.sequence_len
+
+
+            chunk_tokens = seq_len // max(1, int(getattr(config, "sequence_chunks", 1) or 1))
+            reorder_micros_for_vtc_guard(micro_batches, chunk_tokens)
             n_mb = len(micro_batches)
 
             # Tell the C++ engine how many micro-steps this optimizer step has.
