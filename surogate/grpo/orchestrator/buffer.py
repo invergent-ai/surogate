@@ -381,27 +381,32 @@ class Buffer:
         # Per-env starvation guard: sample_examples() deals only envs whose
         # NORMAL pool is non-empty, and the global floor above cannot trip
         # while other envs stay full — so an env whose every example was
-        # classified easy/hard is silently never dealt again (an env can get
-        # there through an outage that scores its whole registry under
-        # hard_threshold). Return ALL of that env's easy/hard examples to
+        # classified easy/hard/flat is silently never dealt again (an env can
+        # get there through an outage that scores its whole registry under
+        # hard_threshold). Return ALL of that env's sidelined examples to
         # normal; difficulty re-classifies as fresh results arrive.
+        # flat_examples is included deliberately: the carpet filter added a
+        # THIRD sideline pool after this guard was written, and a lane whose
+        # grader emits one partial-credit value for everything (measured: a
+        # terminal grader returning exactly 0.50 for every rollout) sends its
+        # whole registry to flat, not to easy/hard. Draining only easy+hard
+        # would leave precisely that lane starved.
         for env_name, prob in self.env_probs.items():
             if prob <= 0 or self.example_buffer.get(env_name):
                 continue
-            starved = [e for e in self.easy_examples if e["task"] == env_name] + [
-                e for e in self.hard_examples if e["task"] == env_name
-            ]
+            pools = (self.easy_examples, self.hard_examples, self.flat_examples)
+            starved = [e for pool in pools for e in pool if e["task"] == env_name]
             for example in starved:
-                if example in self.easy_examples:
-                    self.easy_examples.remove(example)
-                else:
-                    self.hard_examples.remove(example)
+                for pool in pools:
+                    if example in pool:
+                        pool.remove(example)
+                        break
                 self.example_buffer.setdefault(env_name, {})[example["example_id"]] = example
                 self.recycled_examples_per_step["hard"] += 1
             if starved:
                 logger.info(
                     "Env %s normal pool was empty while weighted %.3f — recycled "
-                    "%d of its easy/hard example(s) back to normal.",
+                    "%d of its easy/hard/flat example(s) back to normal.",
                     env_name,
                     prob,
                     len(starved),
