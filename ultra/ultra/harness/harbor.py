@@ -474,6 +474,7 @@ class TerminalSandboxHarborHarness:
                 }
             )
             telemetry_ref = _write_harbor_telemetry(telemetry_path, telemetry)
+            _teardown_harbor_projects(self.last_job_dir)
             payload = {
                 "job_dir": str(self.last_job_dir),
                 "task_dir": str(task_copy),
@@ -505,6 +506,11 @@ class TerminalSandboxHarborHarness:
             }
         )
         telemetry_ref = _write_harbor_telemetry(telemetry_path, telemetry)
+        # Per-step teardown: this job is over (verifier included — harbor runs
+        # it before returning); its compose project must not outlive the step
+        # or a 64-rollout group exhausts the docker network pool mid-group.
+        # Grading needs only job_dir FILES, which survive container removal.
+        _teardown_harbor_projects(self.last_job_dir)
         payload = {
             "job_dir": str(self.last_job_dir),
             "task_dir": str(task_copy),
@@ -544,34 +550,45 @@ class TerminalSandboxHarborHarness:
         Docker network. Without teardown the ~31-network address pool is exhausted after
         a few dozen rollouts, after which `docker compose up` fails and the verifier
         never runs ("no Harbor verifier rewards found"). The compose project name is the
-        trial directory's basename (Docker-lowercased); we remove only this rollout's
-        resources (matched by the compose project label), so it is safe under
-        concurrency.
+        trial directory's basename (Docker-lowercased); harbor >= 0.20 appends `__env`
+        to it, so both forms are removed — an unmatched form is a no-op, and the label
+        filter keeps this scoped to this rollout's resources under concurrency.
         """
-        job_dir = self.last_job_dir
-        if job_dir is None or not job_dir.exists():
-            return
+        _teardown_harbor_projects(self.last_job_dir)
+
+
+def _teardown_harbor_projects(job_dir: Path | None) -> None:
+    """Remove the compose containers + networks of every trial under job_dir.
+
+    Called after EACH step's Harbor job completes (a multi-step workflow runs
+    one job per step, and only the last one is reachable from close() — the
+    per-step call is what keeps concurrent 64-rollout groups under the docker
+    network pool), and again from close() as the crash-path catch.
+    """
+    if job_dir is None or not job_dir.exists():
+        return
+    try:
+        trial_names = {t.name.lower() for t in job_dir.iterdir() if t.is_dir()}
+        projects = trial_names | {f"{name}__env" for name in trial_names}
+    except OSError:
+        return
+    for project in projects:
+        flt = f"label=com.docker.compose.project={project}"
         try:
-            projects = {t.name.lower() for t in job_dir.iterdir() if t.is_dir()}
-        except OSError:
-            return
-        for project in projects:
-            flt = f"label=com.docker.compose.project={project}"
-            try:
-                cids = subprocess.run(
-                    ["docker", "ps", "-aq", "--filter", flt],
-                    capture_output=True, text=True, timeout=30, check=False,
-                ).stdout.split()
-                if cids:
-                    subprocess.run(["docker", "rm", "-f", *cids], capture_output=True, timeout=120, check=False)
-                nids = subprocess.run(
-                    ["docker", "network", "ls", "-q", "--filter", flt],
-                    capture_output=True, text=True, timeout=30, check=False,
-                ).stdout.split()
-                if nids:
-                    subprocess.run(["docker", "network", "rm", *nids], capture_output=True, timeout=60, check=False)
-            except Exception:  # noqa: BLE001 - cleanup is best-effort, never fail the rollout
-                pass
+            cids = subprocess.run(
+                ["docker", "ps", "-aq", "--filter", flt],
+                capture_output=True, text=True, timeout=30, check=False,
+            ).stdout.split()
+            if cids:
+                subprocess.run(["docker", "rm", "-f", *cids], capture_output=True, timeout=120, check=False)
+            nids = subprocess.run(
+                ["docker", "network", "ls", "-q", "--filter", flt],
+                capture_output=True, text=True, timeout=30, check=False,
+            ).stdout.split()
+            if nids:
+                subprocess.run(["docker", "network", "rm", *nids], capture_output=True, timeout=60, check=False)
+        except Exception:  # noqa: BLE001 - cleanup is best-effort, never fail the rollout
+            pass
 
 
 def _load_json_from_text(text: str) -> dict[str, Any] | None:
