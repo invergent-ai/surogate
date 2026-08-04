@@ -222,24 +222,50 @@ class Buffer:
 
     def _recycle_examples_if_needed(self) -> None:
         min_normal = self.config.normal_pool_min_examples or 0
-        if self._normal_example_count() > min_normal:
-            return
+        if self._normal_example_count() <= min_normal:
+            moved_easy = self._move_examples_to_normal(self.easy_examples, self.config.recycle_easy_fraction)
+            moved_hard = self._move_examples_to_normal(self.hard_examples, self.config.recycle_hard_fraction)
+            self.recycled_examples_per_step["easy"] += moved_easy
+            self.recycled_examples_per_step["hard"] += moved_hard
 
-        moved_easy = self._move_examples_to_normal(self.easy_examples, self.config.recycle_easy_fraction)
-        moved_hard = self._move_examples_to_normal(self.hard_examples, self.config.recycle_hard_fraction)
-        self.recycled_examples_per_step["easy"] += moved_easy
-        self.recycled_examples_per_step["hard"] += moved_hard
-
-        if moved_easy or moved_hard:
-            logger.info(
-                "Recycled %d easy and %d hard example(s) into the normal pool "
-                "(normal=%d, easy=%d, hard=%d)",
-                moved_easy,
-                moved_hard,
-                self._normal_example_count(),
-                len(self.easy_examples),
-                len(self.hard_examples),
-            )
+            if moved_easy or moved_hard:
+                logger.info(
+                    "Recycled %d easy and %d hard example(s) into the normal pool "
+                    "(normal=%d, easy=%d, hard=%d)",
+                    moved_easy,
+                    moved_hard,
+                    self._normal_example_count(),
+                    len(self.easy_examples),
+                    len(self.hard_examples),
+                )
+        # Per-env starvation guard: sample_examples() deals only envs whose
+        # NORMAL pool is non-empty, and the global floor above cannot trip
+        # while other envs stay full — so an env whose every example was
+        # classified easy/hard is silently never dealt again (an env can get
+        # there through an outage that scores its whole registry under
+        # hard_threshold). Return ALL of that env's easy/hard examples to
+        # normal; difficulty re-classifies as fresh results arrive.
+        for env_name, prob in self.env_probs.items():
+            if prob <= 0 or self.example_buffer.get(env_name):
+                continue
+            starved = [e for e in self.easy_examples if e["task"] == env_name] + [
+                e for e in self.hard_examples if e["task"] == env_name
+            ]
+            for example in starved:
+                if example in self.easy_examples:
+                    self.easy_examples.remove(example)
+                else:
+                    self.hard_examples.remove(example)
+                self.example_buffer.setdefault(env_name, {})[example["example_id"]] = example
+                self.recycled_examples_per_step["hard"] += 1
+            if starved:
+                logger.info(
+                    "Env %s normal pool was empty while weighted %.3f — recycled "
+                    "%d of its easy/hard example(s) back to normal.",
+                    env_name,
+                    prob,
+                    len(starved),
+                )
 
     def sample_examples(self, n: int) -> list[dict]:
         """Samples n examples from the buffer, respecting env ratios."""
