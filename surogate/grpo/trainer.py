@@ -797,6 +797,44 @@ class GRPOTrainer:
                 step += 1
                 continue
 
+            # vtc skip-fast (issue #74 boundary case): a batch where NO micro
+            # has a valid token in chunk 0 (pure long-prompt lane composition,
+            # e.g. an all-office batch — every prompt >= chunk size) will
+            # necessarily read engine vtc=0 and be discarded by the zero-lr
+            # guard below AFTER paying the full forward/backward (~35 min
+            # measured). The reorder guard above already pinned the batch max
+            # to the last slot, so checking that one micro decides the whole
+            # batch: skip the compute and apply the same zero-lr flush
+            # contract (optimizer counters, logging, checkpoint cadence and
+            # step numbering all advance exactly as the guard path does).
+            if chunk_tokens > 0 and micro_batches and int(
+                np.asarray(micro_batches[-1]["loss_mask"]).reshape(-1)[:chunk_tokens].sum()
+            ) == 0:
+                logger.error(
+                    f"vtc skip-fast: no micro in this {n_mb}-micro batch has a valid chunk 0 "
+                    f"(pure long-prompt composition) — engine vtc would read 0; skipping "
+                    f"compute and applying the ZERO-LR flush without paying the step")
+                opt_config = _surogate.OptimizerConfig(
+                    optimizer=config.optimizer,
+                    learning_rate=0.0,
+                    weight_decay=0.0,
+                    grad_clip=config.max_grad_norm,
+                    adamw_beta1=config.adamw_beta1,
+                    adamw_beta2=config.adamw_beta2,
+                    adamw_epsilon=config.adamw_epsilon,
+                )
+                result = self.trainer.update_with_config(opt_config, step + 1)
+                self._log_step(
+                    step=step, orch_step=orch_step, step_metrics={}, result=result, lr=0.0,
+                    n_mb=n_mb, vtc=0, expected_loss_scale=loss_scale,
+                    step_time=time.time() - step_start, turn_acc=turn_acc,
+                )
+                if config.save_steps > 0 and step > 0 and step % config.save_steps == 0 and config.checkpoint_dir:
+                    logger.info(f"Saving checkpoint at step {step}...")
+                    self.trainer.save_checkpoint(config.checkpoint_dir, step)
+                step += 1
+                continue
+
             # 4. Process each micro-batch (gradients accumulate in C++)
             for mb in micro_batches:
                 # Original micro-batch data
