@@ -1,3 +1,4 @@
+import asyncio
 from argparse import Namespace
 from http import HTTPStatus
 
@@ -74,13 +75,34 @@ def chat_with_tokens(request: Request) -> OpenAIServingChatWithTokens | None:
     return request.app.state.openai_serving_chat_with_tokens
 
 
+async def _reset_prefix_cache_drained(client, deadline_s: float = 120.0) -> bool:
+    """Reset the prefix cache, retrying until in-flight requests release their blocks.
+
+    vLLM refuses the reset while any KV block is still allocated to a running
+    request and returns False (engine log: "Failed to reset prefix cache because
+    some blocks (N) are not freed yet"). A single fire-and-forget call therefore
+    silently leaves KV computed under the OLD weights cached across a policy
+    update whenever the reload races an in-flight generation — off-policy
+    contamination for every later request sharing those prefixes. Requests
+    in flight here are conductor plan calls (seconds long), so draining is
+    cheap; we retry within a deadline rather than pass reset_running_requests,
+    which would abort live generations instead of letting them finish.
+    """
+    waited = 0.0
+    while not await client.reset_prefix_cache():
+        if waited >= deadline_s:
+            return False
+        await asyncio.sleep(2.0)
+        waited += 2.0
+    return True
+
+
 @router.post("/update_weights")
 async def update_weights(request: Request):
     data = await request.json()
     await engine_client(request).collective_rpc("update_weights_from_path", args=(data.get("weight_dir"),))
-    # Reset prefix cache to invalidate KV states computed with old weights
-    await engine_client(request).reset_prefix_cache()
-    return {"status": "ok"}
+    cache_reset = await _reset_prefix_cache_drained(engine_client(request))
+    return {"status": "ok", "cache_reset": cache_reset}
 
 
 @router.post("/load_lora_adapter")
@@ -94,9 +116,8 @@ async def load_lora_adapter(lora_request: LoadLoRAAdapterRequest, raw_request: R
     response = await handler.load_lora_adapter(lora_request)
     if isinstance(response, ErrorResponse):
         return JSONResponse(content=response.model_dump(), status_code=response.error.code)
-    # Reset prefix cache to invalidate KV states computed with old weights
-    await engine_client(raw_request).reset_prefix_cache()
-    return {"status": "ok"}
+    cache_reset = await _reset_prefix_cache_drained(engine_client(raw_request))
+    return {"status": "ok", "cache_reset": cache_reset}
 
 
 @router.post("/init_broadcaster")
