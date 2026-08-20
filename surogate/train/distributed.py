@@ -1158,6 +1158,7 @@ class RayDistributedTrainer:
         from surogate.train.gradient_tracker import GradientTracker
         from surogate.train.loss_guard import LossGuard
         from surogate.train.lr_schedule import LRSchedule
+        from surogate.train.step_budget import check_step_budget
         from surogate.train.metrics import MoEMetrics, StepMetrics
         from surogate.train.moe_monitor import MoEMonitor
         from surogate.train.phase_detector import PhaseDetector
@@ -1216,6 +1217,18 @@ class RayDistributedTrainer:
         else:
             max_steps = steps_per_epoch * config.num_epochs
             logger.info(f"Calculated {steps_per_epoch} steps per epoch from {num_tokens} tokens")
+
+        # Same guard as the single-node path: 0 steps must fail loudly
+        # rather than complete with an untrained model.
+        check_step_budget(
+            max_steps,
+            dataset_tokens=num_tokens,
+            tokens_per_step=total_tokens_per_step,
+            batch_size=config.per_device_train_batch_size,
+            sequence_len=config.sequence_len,
+            gpus=config.gpus,
+            gradient_accumulation_steps=config.gradient_accumulation_steps,
+        )
 
         # Apply warmup_ratio if warmup_steps is 0
         warmup_steps = config.warmup_steps

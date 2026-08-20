@@ -17,6 +17,7 @@ from surogate.train.adapter_init import (
 from surogate.train.early_stopping import EarlyStopping
 from surogate.train.gradient_tracker import GradientTracker
 from surogate.train.loss_guard import LossGuard
+from surogate.train.step_budget import check_step_budget
 from surogate.train.lr_schedule import LRSchedule
 from surogate.train.metrics import MoEMetrics, StepMetrics
 from surogate.train.moe_monitor import MoEMonitor
@@ -560,6 +561,18 @@ class SurogateTrainerWrapper:
         else:
             self.max_steps = self.steps_per_epoch * self.config.num_epochs
             logger.info(f"Derived {self.max_steps} steps from {self.config.num_epochs} epoch(s)")
+
+        # A budget of 0 steps must fail here, not sail through the loop and
+        # save an untrained adapter as a "successful" run.
+        check_step_budget(
+            self.max_steps,
+            dataset_tokens=getattr(self.train_loader, "num_tokens", None),
+            tokens_per_step=self.total_batch_size,
+            batch_size=config.per_device_train_batch_size,
+            sequence_len=config.sequence_len,
+            gpus=config.gpus,
+            gradient_accumulation_steps=config.gradient_accumulation_steps,
+        )
 
         # Apply warmup_ratio if warmup_steps is 0
         self.warmup_steps = config.warmup_steps
