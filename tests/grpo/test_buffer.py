@@ -95,3 +95,47 @@ def test_one_use_sampling_never_returns_a_task_twice_and_persists_consumption(
     assert {row["example_id"] for row in restored.consumed_examples} == {0, 1}
     with pytest.raises(ValueError, match="No environments left with examples"):
         restored.sample_examples(n=1)
+
+
+def test_wal_persists_completed_rollouts_across_restart(tmp_path):
+    """A mid-step orchestrator bounce must not lose delivered groups: update()
+    appends to the WAL, and a fresh buffer replays it after checkpoint load."""
+    spool = tmp_path / "live_spool"
+    ckpt = tmp_path / "ckpt"
+
+    first = _buffer()
+    first.attach_wal(spool)
+    first.update([_rollout(0, 1.0), _rollout(0, 0.0)])
+    first.save(ckpt)  # checkpoint boundary: WAL truncated, ckpt owns rollouts
+    assert not (spool / "rollout_wal.jsonl").exists()
+    first.update([_rollout(1, 1.0), _rollout(1, 0.0)])  # post-ckpt delta
+    # crash here: `first` dies with 2 undelivered rollouts in memory + WAL
+
+    resumed = _buffer()
+    resumed.attach_wal(spool)
+    resumed.load(ckpt)
+    n_ckpt = len(resumed.rollout_buffer)
+    restored = resumed.replay_wal()
+    assert restored == 2
+    assert len(resumed.rollout_buffer) == n_ckpt + 2
+
+
+def test_wal_replay_is_idempotent(tmp_path):
+    """Double replay (or replay overlapping checkpoint contents) must not
+    duplicate rollouts — dedupe is by full-record hash."""
+    spool = tmp_path / "live_spool"
+    buffer = _buffer()
+    buffer.attach_wal(spool)
+    buffer.update([_rollout(0, 1.0), _rollout(0, 0.0)])
+    n = len(buffer.rollout_buffer)
+    assert buffer.replay_wal() == 0  # already in memory
+    assert buffer.replay_wal() == 0
+    assert len(buffer.rollout_buffer) == n
+
+
+def test_wal_unarmed_is_a_noop(tmp_path):
+    """Without attach_wal (e.g. the val buffer) nothing is written or replayed."""
+    buffer = _buffer()
+    buffer.update([_rollout(0, 1.0), _rollout(0, 0.0)])
+    assert buffer.replay_wal() == 0
+    assert not list(tmp_path.iterdir())

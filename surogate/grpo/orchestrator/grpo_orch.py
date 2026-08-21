@@ -337,6 +337,10 @@ async def orchestrate(config: GRPOOrchestratorConfig):
         logger.info(f"Setting up buffer ({config.buffer})")
         train_dataset = train_env_group.get_dataset(seed=config.buffer.seed)
         buffer = Buffer(train_dataset, train_env_group.env_names, config.buffer)
+        # Durable completed-rollouts log (train buffer only — the val buffer
+        # must never replay training rollouts). Restart-safety: a mid-step
+        # bounce now loses only in-flight episodes, never delivered groups.
+        buffer.attach_wal(Path(config.output_dir) / "live_spool")
         if config.val is not None:
             val_buffer_config = GRPOBufferConfig(DictDefault({"env_ratios": config.buffer.env_ratios}))
             val_dataset = train_env_group.get_eval_dataset(seed=val_buffer_config.seed)
@@ -439,6 +443,7 @@ async def orchestrate(config: GRPOOrchestratorConfig):
 
         if checkpoint_step is not None and ckpt_manager is not None:
             ckpt_manager.load(progress, buffer, step=checkpoint_step)
+            buffer.replay_wal()
             logger.info(f"Resuming training from checkpoint step {checkpoint_step}")
             scheduler.ckpt_step = progress.step  # Always resume from the latest checkpoint
             if config.eval and config.eval.skip_eval_on_resume:

@@ -77,7 +77,67 @@ class Buffer:
         # Initialize rollout buffer (flat list of rollouts)
         self.rollout_buffer: list[vf.RolloutOutput] = []
 
+        # Rollout write-ahead log: completed rollouts become durable the
+        # moment update() ingests them, so an orchestrator restart replays
+        # them instead of regenerating. Lifecycle: attach_wal() arms it;
+        # update() appends delivered rollouts; save() truncates (the
+        # checkpoint owns them from then on); replay_wal() restores the
+        # post-checkpoint delta after load(). NOTE for step purges: deleting
+        # a poisoned step's rollouts must also delete the live_spool dir,
+        # or replay resurrects them.
+        self._wal_path: Path | None = None
+
         self.reset_step_metrics()
+
+    def attach_wal(self, spool_dir: Path) -> None:
+        """Arms the rollout write-ahead log under the given directory."""
+        spool_dir.mkdir(parents=True, exist_ok=True)
+        self._wal_path = spool_dir / "rollout_wal.jsonl"
+
+    def _wal_append(self, rollouts: list[vf.RolloutOutput]) -> None:
+        if self._wal_path is None:
+            return
+        with open(self._wal_path, "a") as f:
+            for r in rollouts:
+                f.write(json.dumps(r, default=make_serializable) + "\n")
+            f.flush()
+
+    def _wal_truncate(self) -> None:
+        if self._wal_path is not None and self._wal_path.exists():
+            self._wal_path.unlink()
+
+    def replay_wal(self) -> int:
+        """Restores post-checkpoint completed rollouts after a restart.
+
+        Idempotent: entries already present in rollout_buffer (full-record
+        hash) are skipped, so replay-after-clean-checkpoint is a no-op.
+        Returns the number of rollouts restored.
+        """
+        if self._wal_path is None or not self._wal_path.exists():
+            return 0
+        seen = {
+            hashlib.sha256(json.dumps(r, sort_keys=True, default=make_serializable).encode()).hexdigest()
+            for r in self.rollout_buffer
+        }
+        restored = 0
+        with open(self._wal_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                r = json.loads(line)
+                key = hashlib.sha256(json.dumps(r, sort_keys=True, default=make_serializable).encode()).hexdigest()
+                if key in seen:
+                    continue
+                seen.add(key)
+                self.rollout_buffer.append(cast(vf.RolloutOutput, r))
+                restored += 1
+        if restored:
+            logger.info(
+                f"WAL replay: restored {restored} completed rollout(s) generated after the "
+                f"last checkpoint — they will not be regenerated"
+            )
+        return restored
 
     def get_example_hash(self, example: dict) -> str:
         """Returns a hash of the example based on hash keys."""
@@ -98,6 +158,8 @@ class Buffer:
         write_jsonl(self.hard_examples, path / "hard_examples.jsonl")
         write_jsonl(self.consumed_examples, path / "consumed_examples.jsonl")
         write_jsonl(self.rollout_buffer, path / "rollout_buffer.jsonl")
+        # The checkpoint now owns every delivered rollout; the WAL restarts empty.
+        self._wal_truncate()
 
     def load(self, path: Path) -> None:
         """Loads pool assignments and rollouts."""
@@ -313,6 +375,7 @@ class Buffer:
 
             self.num_rollouts_per_step[env_name]["normal"] += len(example_rollouts)
             self.rollout_buffer.extend(example_rollouts)
+            self._wal_append(example_rollouts)
 
     def sample_rollouts(self, n: int) -> list[vf.RolloutOutput]:
         """Samples the latest n rollouts from the buffer."""
