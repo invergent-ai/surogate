@@ -90,3 +90,27 @@ Harness (`harness/main.cu`): packs random N(0,1) weights per the spec above into
 4. **Route-table resweep** — one `bench/ops`-harness-derived resweep on the 4090 to price the per-card sweep obligation (losing candidates were deleted in-tree; C9b confirmed). The sm_89/sm_120a register-allocation divergence measured here says the 5090 tables will NOT transfer.
 5. **FreeToken leg of E2** — AOT the NVFP4 W4A16 GEMV through `compiler.py`→JitKernel (unstarted here).
 6. **First real guard work** — port the FP8 row-scale family, where the `kind::f8f6f4`→`e4m3` respell behind `__CUDA_ARCH__` actually fires; this spike shows the q4 family needed none, so the guard budget shifts entirely to FP8/NVFP4/attention.
+
+---
+
+## Addendum (same day): full-tree sm_89 compile inventory + GPU test pass
+
+**Full-tree sm_89 compile** (`csrc/build-serve-sm89`, `-DCMAKE_CUDA_ARCHITECTURES=89
+-DNINFER_ALLOW_PORT_ARCH=ON`, ninja `-k 0`): **262/278 TUs compile verbatim; 16 fail
+in exactly 4 error classes**, all MECHANICAL or compile-out-by-physics — zero
+STRUCTURAL failures. This closes the guard-list question the q4 spike left open:
+
+| Class | ptxas error | TUs | Fix |
+|---|---|---|---|
+| FP8 MMA spelling | `.kind::f8f6f4 not supported on sm_89` | fp8_a8, fp8_{linear_add,linear_swiglu,attn_input_proj,gdn_input_proj} | respell to plain `mma...e4m3` behind `__CUDA_ARCH__` (sm_89 HAS FP8 tensor cores) |
+| PDL | `.launch_dependents requires sm_90+` | sparse_moe_{decode,small_t}, q4_q5_gdn_input_{independent,conv_snapshot} | guard `cudaTriggerProgrammaticLaunchCompletion`/PDL launch attrs OFF for sm_89 |
+| TMA/cluster | `.op_restrict/.mbarrier_init/cluster/setmaxnreg require sm_90+` | nvfp4_w4a4_tma (swiglu + linear) | compile out on sm_89 — W4A4 is 50-series-bound by hardware (no FP4 tensor cores on Ada) |
+| FP4 cvt | `cvt.e2m1x2.f32 not supported on sm_89` | nvfp4_w4a4, nvfp4 A16 family members | software E2M1 decode fallback (`cuda_fp4.h`-equivalent) for the A16 decode path; W4A4 users compile out |
+
+**GPU test pass** (RTX 5090, GPU 5, idle window, sequential): **86/89 PASS (97%)**,
+including all four `linear_swiglu_{q4,w8,nvfp4,fp8}` kernels that the CPU pass
+could not run. The 3 non-passes are environmental: media-decode (pre-patch stale
+registration; gone after reconfigure), qwen3_6_frontend (upstream hardcoded
+tokenizer path), gdn_replay_fold (`cudaMalloc` OOM — wants more than the ~2.8 GiB
+free on the shared card; rerun on an empty GPU). **Zero engine defects found in
+the vendored tree.**
