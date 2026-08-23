@@ -20,3 +20,16 @@
 3. `src/media/decode/decode_stub.cpp` — NEW FILE (surogate). FFmpeg-free stub
    implementing `media/decode/decode.h`: any image/video input raises a clear
    runtime error; text serving is unaffected.
+4. `tests/CMakeLists.txt` — `ninfer_media_decode_test` registered only when
+   `NINFER_ENABLE_FFMPEG=ON` (it exercises real decoding; cannot pass on the
+   stub).
+
+### Known-environmental test results (no patch; documented)
+
+CPU pass on this host (`CUDA_VISIBLE_DEVICES="" ctest`): 83/89 after patch 4.
+- `ninfer_qwen3_6_frontend_test` aborts: upstream hardcodes the test resource
+  `/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer.json`.
+  Provide that tokenizer locally (or patch the fixture path) to enable it.
+- `ninfer_linear_swiglu_{q4,w8,nvfp4,fp8}_test` report FAIL instead of SKIP
+  when no CUDA device is visible (upstream skip-handling quirk); they belong
+  to the GPU pass.
