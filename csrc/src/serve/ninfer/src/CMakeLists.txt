@@ -48,9 +48,17 @@ target_link_libraries(ninfer_artifact PUBLIC ninfer_core)
 # producer warpgroup to its consumer warpgroups. Relocatable device code makes ptxas
 # discard that contract, so this self-contained kernel is intentionally compiled in a
 # non-RDC archive and called through a host launcher from ninfer_ops.
-add_library(ninfer_nvfp4_tma STATIC
-  ops/linear/nvfp4/nvfp4_w4a4_tma.cu
-  ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cu)
+# surogate vendor patch (csrc/src/serve/PATCHES.md): the W4A4 TMA kernels are
+# sm_120-only hardware (TMA + cluster + block-scaled FP4 MMA). Port builds for
+# other architectures link a loud-failure stub instead.
+if("120a" IN_LIST CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
+  add_library(ninfer_nvfp4_tma STATIC
+    ops/linear/nvfp4/nvfp4_w4a4_tma.cu
+    ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cu)
+else()
+  add_library(ninfer_nvfp4_tma STATIC
+    ops/linear/nvfp4/nvfp4_w4a4_tma_stub.cpp)
+endif()
 ninfer_internal_includes(ninfer_nvfp4_tma)
 set_target_properties(ninfer_nvfp4_tma PROPERTIES
   CUDA_SEPARABLE_COMPILATION OFF

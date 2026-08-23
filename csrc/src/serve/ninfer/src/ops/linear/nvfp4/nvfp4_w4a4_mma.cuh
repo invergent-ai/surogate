@@ -213,7 +213,18 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
     static_assert(!PairRows || (Schedule::kBlockN % 2) == 0);
     static_assert(!PairRows || ((Geometry::kOutputRows / 2) % (Schedule::kBlockN / 2)) == 0);
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1200
+    // surogate vendor patch (csrc/src/serve/PATCHES.md): W4A4 requires sm_120
+    // block-scaled FP4 MMA (the mma_nvfp4_e4m3 wrapper traps below 1200), and
+    // several schedules exceed the pre-sm_90 48 KiB static-smem link limit.
+    // Declare 1-byte storage and trap so the TU links; W4A4 routes are never
+    // admitted below sm_120.
+    __trap();
+    __shared__ __align__(16) std::uint8_t shared_raw[1];
+    auto& shared = *reinterpret_cast<Nvfp4W4a4SharedStorage<Schedule>*>(shared_raw);
+#else
     __shared__ Nvfp4W4a4SharedStorage<Schedule> shared;
+#endif
     const int token_begin       = static_cast<int>(blockIdx.y) * Schedule::kBlockM;
     constexpr int kRowsPerBlock = PairRows ? Schedule::kBlockN / 2 : Schedule::kBlockN;
     const int row_begin         = static_cast<int>(blockIdx.x) * kRowsPerBlock;

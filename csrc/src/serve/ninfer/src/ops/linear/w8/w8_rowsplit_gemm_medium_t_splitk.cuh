@@ -10,6 +10,7 @@
 #include <cuda_fp16.h>
 
 #include <cstdint>
+#include <type_traits>
 
 namespace ninfer::ops::detail {
 
@@ -32,8 +33,27 @@ __launch_bounds__(KSplits* NGroups * 32, MinBlocks) void w8_rowsplit_medium_t_sp
     static_assert(TileCols % NGroups == 0 && kWarpCols % 8 == 0);
     static_assert(Hidden % kGroupK == 0 && kKernelWarps <= 32);
 
-    __shared__ __align__(16) std::uint8_t code_shared[kMmaRows][kGroupK];
-    __shared__ __align__(16) __nv_bfloat16 b_shared[kKernelWarps][kWarpCols * kTileK];
+    struct SharedStorage {
+        alignas(16) std::uint8_t codes[kMmaRows][kGroupK];
+        alignas(16) __nv_bfloat16 activations[kKernelWarps][kWarpCols * kTileK];
+    };
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+    // surogate vendor patch (csrc/src/serve/PATCHES.md): large split-K
+    // schedules exceed the pre-sm_90 48 KiB static-smem link limit. Those
+    // variants trap on sm_89; the per-card route resweep must not select
+    // them. Proper dynamic-smem port is tracked.
+    if constexpr (sizeof(SharedStorage) > 48u * 1024u) {
+        __trap();
+    }
+    using DeclaredStorage =
+        std::conditional_t<(sizeof(SharedStorage) <= 48u * 1024u), SharedStorage, std::uint8_t>;
+    __shared__ __align__(16) DeclaredStorage shared_decl;
+    auto& shared_storage = reinterpret_cast<SharedStorage&>(shared_decl);
+#else
+    __shared__ __align__(16) SharedStorage shared_storage;
+#endif
+    auto& code_shared = shared_storage.codes;
+    auto& b_shared    = shared_storage.activations;
 
     const int tid        = static_cast<int>(threadIdx.x);
     const int warp       = tid >> 5;

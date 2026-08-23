@@ -86,7 +86,21 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
         float partial[kWarps * kNt * 32 * 4];
     };
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+    // surogate vendor patch (csrc/src/serve/PATCHES.md): a few large schedules
+    // exceed the pre-sm_90 48 KiB static-smem link limit. Those variants trap
+    // on sm_89 (1-byte storage keeps the TU linkable); the per-card route
+    // resweep must not select them. Proper dynamic-smem port is tracked.
+    if constexpr (sizeof(SharedStorage) > 48u * 1024u) {
+        __trap();
+    }
+    using DeclaredStorage =
+        std::conditional_t<(sizeof(SharedStorage) <= 48u * 1024u), SharedStorage, std::uint8_t>;
+    __shared__ __align__(16) DeclaredStorage shared_decl;
+    auto& shared = reinterpret_cast<SharedStorage&>(shared_decl);
+#else
     __shared__ __align__(16) SharedStorage shared;
+#endif
     auto& code_shared  = shared.staging.codes;
     auto& b_shared     = shared.staging.activations;
     auto& scale_shared = shared.staging.scales;

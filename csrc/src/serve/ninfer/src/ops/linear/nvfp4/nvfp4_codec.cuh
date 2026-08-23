@@ -31,6 +31,52 @@ struct alignas(8) Nvfp4QuantizedK16 {
 
 static_assert(alignof(Nvfp4QuantizedK16) == 8);
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1200
+// surogate vendor patch (csrc/src/serve/PATCHES.md): `cvt.rn.satfinite.e2m1x2`
+// is sm_120+. Software round-to-nearest-even E2M1 encoder for the sm_89 port.
+// E2M1 magnitudes: {0, 0.5, 1, 1.5, 2, 3, 4, 6}; code = sign<<3 | index.
+// RN-even at grid midpoints resolves toward the code with an even mantissa bit,
+// matching the hardware cvt's behavior; satfinite clamps |x| > 6 to 6.
+__device__ __forceinline__ std::uint8_t encode_nvfp4_e2m1(float x) {
+    const std::uint8_t sign = (__float_as_uint(x) >> 31) ? 0x8u : 0x0u;
+    const float a = fabsf(x);
+    std::uint8_t idx;
+    if (!(a == a)) {                 // NaN: satfinite maps to max magnitude
+        idx = 7u;
+    } else if (a < 0.25f)  idx = 0u;                      // -> 0
+    else if (a <= 0.75f)   idx = (a == 0.75f) ? 2u : 1u;  // tie 0.75 -> 1.0 (even)
+    else if (a <= 1.25f)   idx = 2u;                      // tie 1.25 -> 1.0 (even)
+    else if (a <= 1.75f)   idx = (a == 1.75f) ? 4u : 3u;  // tie 1.75 -> 2.0 (even)
+    else if (a <= 2.5f)    idx = 4u;                      // tie 2.5  -> 2.0 (even)
+    else if (a <= 3.5f)    idx = (a == 3.5f) ? 6u : 5u;   // tie 3.5  -> 4.0 (even)
+    else if (a <= 5.0f)    idx = 6u;                      // tie 5.0  -> 4.0 (even)
+    else                   idx = 7u;                      // incl. +inf via satfinite
+    return sign | idx;
+}
+
+__device__ __forceinline__ void
+pack_nvfp4_e2m1x16(const float2 (&values)[8], std::uint32_t& codes_lo, std::uint32_t& codes_hi) {
+    std::uint32_t lo = 0u;
+    std::uint32_t hi = 0u;
+    // Match the asm path's byte order: byte i of {lo,hi} holds values[i] with
+    // the .x lane in the LOW nibble (`cvt.e2m1x2 d, hi, lo` packs %hi<<4 | %lo,
+    // and the asm passes {.y, .x}).
+    for (int i = 0; i < 4; ++i) {
+        const std::uint32_t byte =
+            static_cast<std::uint32_t>(encode_nvfp4_e2m1(values[i].x)) |
+            (static_cast<std::uint32_t>(encode_nvfp4_e2m1(values[i].y)) << 4);
+        lo |= byte << (8 * i);
+    }
+    for (int i = 0; i < 4; ++i) {
+        const std::uint32_t byte =
+            static_cast<std::uint32_t>(encode_nvfp4_e2m1(values[i + 4].x)) |
+            (static_cast<std::uint32_t>(encode_nvfp4_e2m1(values[i + 4].y)) << 4);
+        hi |= byte << (8 * i);
+    }
+    codes_lo = lo;
+    codes_hi = hi;
+}
+#else
 __device__ __forceinline__ void
 pack_nvfp4_e2m1x16(const float2 (&values)[8], std::uint32_t& codes_lo, std::uint32_t& codes_hi) {
     asm volatile("{\n"
@@ -59,6 +105,7 @@ pack_nvfp4_e2m1x16(const float2 (&values)[8], std::uint32_t& codes_lo, std::uint
                    "f"(values[4].x), "f"(values[4].y), "f"(values[5].x), "f"(values[5].y),
                    "f"(values[6].x), "f"(values[6].y), "f"(values[7].x), "f"(values[7].y));
 }
+#endif  // __CUDA_ARCH__ < 1200
 
 __device__ __forceinline__ Nvfp4QuantizedK16 quantize_nvfp4_k16(const __nv_bfloat16* source,
                                                                 float input_scale_divisor) {
