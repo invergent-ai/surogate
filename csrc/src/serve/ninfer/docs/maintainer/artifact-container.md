@@ -1,0 +1,449 @@
+# NInfer Artifact Container Version 2
+
+This reference defines the current `.ninfer` version-2 framing, embedded JSON object directory,
+payload geometry, registries, and boundary between the generic reader and a registered model
+binder. Numeric formats are defined in [`tensor-formats.md`](tensor-formats.md), physical layouts
+in [`storage-layouts.md`](storage-layouts.md), and exact object inventories in the two target
+artifact references.
+
+## 1. Format overview
+
+A `.ninfer` artifact is one file:
+
+```text
+16-byte binary prefix
+UTF-8 JSON object directory
+padding to a 4096-byte payload boundary
+tensor and required-resource payloads
+```
+
+The artifact carries the information that a loader cannot recover from compiled model code:
+
+- exact hierarchical `(model_id, weights_id)` identity;
+- persistent object names and kinds;
+- tensor shape, numeric format, and storage layout;
+- required-resource encoding;
+- payload-relative offset and stored byte length.
+
+The JSON is a closed directory schema. It is not a manifest for arbitrary metadata. In particular,
+it contains no source tensor name, conversion recipe, fusion/view table, model graph, execution
+schedule, kernel choice, GPU profile, runtime state, or provenance report.
+
+The ownership boundary is:
+
+```text
+.ninfer directory
+    which model/weight contract is stored, what persistent objects exist, and where their bytes are
+
+registered storage layout
+    how one tensor payload maps to persistent logical words
+
+compiled model contract
+    what the named objects mean, their logical views, and how they are consumed
+
+conversion specification
+    how a source checkpoint is transformed into those objects
+```
+
+The directory removes the need to compile tensor names, file offsets, physical order, and stored
+lengths into C++. It does not make an unknown model executable.
+
+## 2. Version-2 framing
+
+### 2.1 File prefix
+
+The prefix occupies exactly 16 bytes at file offset zero:
+
+| Offset | Size | Type | Field | Required value |
+|---:|---:|---|---|---|
+| 0 | 8 | bytes | `magic` | `4e 49 4e 46 45 52 00 02` |
+| 8 | 8 | little-endian `u64` | `json_bytes` | positive JSON byte length |
+
+The magic is ASCII `NINFER`, one zero byte, and framing revision `2`. A reader compares all eight
+bytes exactly.
+
+`json_bytes` counts only the JSON text. It excludes the prefix and following padding. A reader uses
+checked integer arithmetic and requires the complete declared JSON range to exist in the file.
+
+### 2.2 Derived ranges
+
+```text
+json_offset    = 16
+metadata_end   = json_offset + json_bytes
+payload_offset = align_up(metadata_end, 4096)
+```
+
+The file must extend through `payload_offset`. Bytes in `[metadata_end, payload_offset)` are padding
+with no loading semantics. A writer naturally emits them as zero; a reader need not inspect them.
+
+All object offsets in JSON are relative to `payload_offset`. The prefix contains no file size,
+flags, checksum, object count, identity fields, directory offset, or extension area.
+
+## 3. JSON directory
+
+### 3.1 Root
+
+The complete JSON value is one object with exactly two members:
+
+| Member | Type | Meaning |
+|---|---|---|
+| `identity` | object | exact hierarchical model and weights identity |
+| `objects` | nonempty array | tensor and required-resource objects in physical-offset order |
+
+No additional root member is valid. The framing revision already determines the directory schema,
+so JSON does not repeat a schema or version number.
+
+`identity` has exactly two members:
+
+```json
+{
+  "model_id": "qwen3.6-27b",
+  "weights_id": "groupwise-int"
+}
+```
+
+| Member | Type | Meaning |
+|---|---|---|
+| `model_id` | nonempty string | exact checkpoint-native model identity |
+| `weights_id` | nonempty string | complete weight-storage contract within that model |
+
+`weights_id` is scoped by `model_id`; it is not globally unique. The common reader exposes the
+complete pair. The compiled target registry selects a candidate package from `model_id`, and that
+package resolves the complete pair to a closed target-private weights profile before sequence
+planning, load planning, or device materialization. Unknown `weights_id` values are rejected
+directly; a package does not infer them from filenames, object counts, formats, or representative
+descriptors. A generic inspector may display a structurally valid artifact for an unknown identity
+but cannot declare it executable.
+
+### 3.2 Tensor object
+
+A tensor object has all and only these seven members:
+
+```json
+{
+  "name": "text/layers/3/attention/query_key",
+  "kind": "tensor",
+  "shape": [7168, 5120],
+  "format": "Q4G64_F16S",
+  "layout": "row-split-k128-v1",
+  "offset": 12582912,
+  "bytes": 19496960
+}
+```
+
+| Member | Type | Meaning |
+|---|---|---|
+| `name` | nonempty string | canonical model binding name, unique across all objects |
+| `kind` | string | exactly `"tensor"` |
+| `shape` | array of positive integers | logical stored tensor shape; `[]` is a scalar |
+| `format` | string | registered persistent numeric format |
+| `layout` | string | registered persistent tensor layout |
+| `offset` | nonnegative integer | byte offset relative to `payload_offset` |
+| `bytes` | positive integer | exact stored payload length |
+
+The shape is the NInfer stored shape, not the Hugging Face source shape and not a padded physical
+extent. Legal rank and format/layout combinations come from the selected layout. The layout's exact
+encoded-size function for `(format, shape)` must equal `bytes`.
+
+### 3.3 Required-resource object
+
+A resource object has all and only these five members:
+
+```json
+{
+  "name": "frontend/tokenizer.json",
+  "kind": "resource",
+  "encoding": "raw-bytes-v1",
+  "offset": 0,
+  "bytes": 19989343
+}
+```
+
+| Member | Type | Meaning |
+|---|---|---|
+| `name` | nonempty string | canonical model resource name, unique across all objects |
+| `kind` | string | exactly `"resource"` |
+| `encoding` | string | registered required-resource encoding |
+| `offset` | nonnegative integer | byte offset relative to `payload_offset` |
+| `bytes` | positive integer | exact enclosing payload length |
+
+`raw-bytes-v1` makes the complete span the resource value. The common reader does not infer a
+filename, tokenizer, template, or processor role from it; the model-specific frontend owns that
+mapping.
+
+### 3.4 Closed member sets and values
+
+The root, identity, and both object kinds use closed member sets. Missing members, extra members,
+JSON `null`, wrong JSON types, and fields from another scope or object kind are invalid. This rule
+keeps source recipes and execution facts out of the common artifact contract.
+
+The implementation uses a standard JSON library, then validates the decoded value against this
+schema. Integers must be represented by the library as integers rather than booleans or floating
+values. Shape dimensions are positive; offsets are nonnegative; lengths are positive. All sums,
+products, alignment operations, and conversions to file-offset or memory-size types use checked
+arithmetic.
+
+Object names are case-sensitive binding identities, not display labels or source-checkpoint names.
+The model binder compares its exact expected names. Format, layout, and encoding strings are exact
+closed-registry identities rather than parseable mini-languages.
+
+JSON whitespace, member order, and ordinary equivalent string escaping have no runtime meaning. The
+writer uses compact JSON and a stable field order for readable tooling, but that spelling is not an
+artifact identity, validity condition, or reproducibility requirement.
+
+## 4. Registered identities
+
+The version-2 registry contains:
+
+| Namespace | Registered identities | Authority |
+|---|---|---|
+| tensor numeric format | `BF16`, `FP32`, `I32`, `Q4G64_F16S`, `Q5G64_F16S`, `Q6G64_F16S`, `W8G32_F16S`, `NVFP4`, `FP8_E4M3FN_ROW_BF16S` | [`tensor-formats.md`](tensor-formats.md) |
+| `model_id` | `qwen3.6-27b`, `qwen3.6-35b-a3b`, `qwen3.8-27b` | respective [Qwen3.6-27B](qwen3.6-27b-artifact.md), [Qwen3.6-35B-A3B](qwen3.6-35b-a3b-artifact.md), or [Qwen3.8-27B](qwen3.8-27b-artifact.md) artifact reference |
+| `(model_id, weights_id)` | `qwen3.6-27b/groupwise-int`, `qwen3.6-27b/nvfp4`, `qwen3.6-35b-a3b/groupwise-int`, `qwen3.8-27b/groupwise-int`, `qwen3.8-27b/nvfp4` | respective [Qwen3.6-27B](qwen3.6-27b-artifact.md), [Qwen3.6-35B-A3B](qwen3.6-35b-a3b-artifact.md), or [Qwen3.8-27B](qwen3.8-27b-artifact.md) artifact reference |
+| tensor layout | `contiguous-le-v1`, `row-split-k128-v1`, `blockscale-k16-m128x4-v1`, `row-scale-v1` | [`storage-layouts.md`](storage-layouts.md) |
+| resource encoding | `raw-bytes-v1` | [`storage-layouts.md`](storage-layouts.md) |
+
+There are no retired tombstones at this revision.
+
+A registered identity has one documented meaning. The common reader does not synthesize unknown
+formats or layouts from names, bit widths, shapes, group sizes, or payload lengths.
+
+The layout identity owns byte order, code/scale placement, physical padding, file alignment, and
+encoded size. It is not a GPU or kernel name. The model contract owns which registered combination
+is accepted for each role and which actual device implementation can consume it.
+
+`model_id` identifies exact checkpoint-native semantics, not a GPU, converter revision, one
+quantization run, physical object order, or artifact instance.
+
+`weights_id` identifies one complete target-owned weight-storage contract under that model:
+inventory, names, fusion, format assignment, layout assignment, and associated persistent scalar
+objects. It is not a dominant tensor format, an average BPW, a converter recipe, an execution
+policy, or an artifact-instance digest. `groupwise-int` therefore covers the existing mixed
+groupwise-integer contracts of both registered models without naming either artifact after one
+internal format; `nvfp4` identifies the model-scoped 27B low-precision contract, including the
+Qwen3.6 mixed NVFP4/BF16 allocation and the Qwen3.8 mixed NVFP4/row-scaled-FP8/BF16 allocation.
+
+## 5. Payload geometry
+
+Let:
+
+```text
+payload_bytes = actual_file_size - payload_offset
+cursor = 0
+```
+
+For each object in array order, derive its registered file alignment and validate with checked
+arithmetic:
+
+```text
+object.offset >= cursor
+object.offset % alignment == 0
+object.offset + object.bytes <= payload_bytes
+
+cursor = object.offset + object.bytes
+```
+
+For tensors, the selected layout must accept `(format, shape)` and its encoded-size result must equal
+`object.bytes`. For resources, the selected encoding supplies alignment and length semantics.
+
+These rules make object spans ordered, aligned, non-overlapping, and inside the file. Gaps before or
+between objects and unreferenced trailing file bytes have no loading semantics. A normal writer
+starts at the first permitted offset, pads only for alignment, and truncates the file at the final
+object end.
+
+An object's absolute file span is:
+
+```text
+[payload_offset + object.offset,
+ payload_offset + object.offset + object.bytes)
+```
+
+The container does not express overlapping aliases or views. Compiled model code may bind multiple
+logical roles or checked row views to one stored object.
+
+File placement is not device placement. The artifact contains persistent bytes; a runtime may copy,
+map, group, or stream their validated spans according to its target-private memory plan. The JSON
+contains no device address or runtime repack instruction.
+
+## 6. Common reader and model binder boundary
+
+### 6.1 Generic reader
+
+The generic reader performs only common file work:
+
+1. read and validate the 16-byte prefix;
+2. derive the JSON and payload positions;
+3. parse the UTF-8 JSON with a standard library;
+4. validate the closed root/identity/tensor/resource schema and integer domains;
+5. build a unique `name -> object` index;
+6. resolve numeric-format, layout, and encoding identities;
+7. validate layout compatibility, encoded sizes, alignment, ordering, overlap, and file bounds;
+8. expose object descriptors and payload spans.
+
+It does not know Qwen dimensions, source tensors, layer kinds, component flags, fusion records,
+logical model views, schedules, kernels, GPU support, or runtime residency.
+
+The JSON and name index are cold-load data. A model binder resolves them once; inference does not
+reparse JSON or perform per-layer/per-token directory lookups.
+
+### 6.2 Registered model binder
+
+The binder selected for an executable target validates:
+
+- exact `(model_id, weights_id)`;
+- the complete required tensor and resource inventory;
+- every canonical name and object kind;
+- required shape relationships and exact per-role format/layout/encoding assignments;
+- fused row partitions, tied bindings, and all model-visible logical views;
+- absence of missing and unexpected objects;
+- availability of the exact target consumer on the actual selected device.
+
+The binder owns semantic completeness. It may generate repeated layer names and expected shapes
+with model-private loops rather than duplicating a flat JSON table in C++.
+
+Completeness validation and device residency are separate. A registered target always consumes and
+validates its complete artifact inventory, then its frozen Engine startup features select which
+validated tensor groups enter the compact device materialization plan. An omitted group has no
+device address and cannot become resident later; this does not define a partial or alternate
+artifact.
+
+When one target accepts multiple `weights_id` values, the package resolver produces one typed
+profile and passes that same value to both the exact binder and the sequence/workspace planner. The
+loaded model and sequence plan retain it, and Program construction rejects a mismatch. Family
+scheduling remains identity-free after startup; request execution neither re-reads the directory
+nor branches on artifact strings.
+
+### 6.3 Payload-content validation
+
+Persistent numeric and layout contracts still apply to the bytes produced by the project-owned
+converter. Responsibility is deliberately split across the local pipeline:
+
+- the converter and quantizer establish code, scale, direct-word, and padding invariants while the
+  layout codec preserves the already selected words in the registered byte layout;
+- the offline target verifier checks directory geometry, exact target assignments, and representative
+  source-to-artifact values;
+- the C++ reader and binder check directory geometry and the exact target storage signature, plus
+  cheap target-specific value invariants that are needed during binding.
+
+The runtime does not rescan every scale, code, direct word, or padding byte before upload. Such a scan
+would duplicate work in a trusted, project-owned conversion path without improving the model binding
+contract. The common directory parser therefore owns structural decoding only.
+
+How the Engine allocates, uploads, owns, or publishes a loaded product is outside the container ABI.
+A Python reference may keep an mmap open and stream rows; a C++ target may materialize packed device
+spans. Both consume the same directory and registered layout bytes.
+
+## 7. Writing an artifact
+
+A writer:
+
+1. obtains the registered `(model_id, weights_id)` and its complete object inventory;
+2. obtains already transformed direct words or quantized codes/scales from the conversion recipe;
+3. encodes each tensor with its registered layout and each resource with its encoding;
+4. computes exact lengths and aligned payload-relative offsets;
+5. serializes the closed JSON directory;
+6. writes the prefix, JSON, metadata padding, and each payload at its declared offset;
+7. truncates the output at the final object end.
+
+Payload-relative offsets avoid any fixed-point dependency on the final JSON length. Physical object
+order is a converter decision and is never a model binding key.
+
+Source paths, source tensor names, transforms, quantization assignment rationale, converter
+revision, command line, timings, and environment belong to the model-specific conversion
+specification or an external descriptive conversion report. A sidecar does not participate in
+loading and is not required for artifact validity.
+
+The project does not require fixed source/artifact hashes, a clean worktree, byte-identical output
+across reruns or machines, an atomic publication protocol, or special interrupted-write cleanup.
+Rerunning the local converter replaces an incomplete output.
+
+## 8. Integrity and provenance boundary
+
+Version 2 requires no checksum, digest, signature, publisher identity, or sidecar. Schema, range,
+inventory, layout, and source-value verification catch the classes of mistakes relevant to the
+project's own conversion workflow; they are not an identity system for externally supplied files.
+
+A descriptive conversion report remains useful. It may record source path, command, recipe and
+converter revisions, source-config summary, environment, object/byte summaries, elapsed time, and
+final size. These records explain how an artifact was produced without becoming runtime validity or
+strict reproducibility requirements.
+
+## 9. Evolution
+
+Adding a model, layout, encoding, or numeric format updates the corresponding registry and one
+authoritative semantic document in the same change.
+
+Changing the byte interpretation or encoded-size rule of an existing layout/encoding requires a new
+layout/encoding identity. Changing exact checkpoint-native semantics requires a new `model_id`.
+Changing the complete inventory, fusion contract, or incompatible per-role storage assignment under
+one model requires a new `weights_id`. Converter implementation, object order, aligned offsets,
+artifact values, device placement, and a conforming kernel may change without renaming an otherwise
+unchanged weight contract.
+
+A new framing revision is required when the common accepted-file language changes: prefix, JSON
+root/object schema, payload-start calculation, offset meaning, or common range interpretation. It
+uses a different complete magic value. There are no ignored extension members or reserved JSON
+dictionaries in version 2.
+
+Project-owned formats have no compatibility obligation. A runtime may remove an obsolete framing,
+model, layout, or encoding directly. A `.ninfer` reader never treats `.qus` as a fallback or alias.
+
+## 10. Explicit exclusions
+
+The prefix and JSON contain none of the following:
+
+- source tensor names, files, revisions, hashes, or transformation rules;
+- quantization encoder recipe, calibration data, clipping policy, or quality evidence;
+- dominant-format or BPW summaries beyond the registered `weights_id`;
+- model dimensions beyond each stored tensor's logical shape;
+- model graph, operators, schedules, layer/module enums, fusion records, or logical-view tables;
+- arbitrary strides, plane offsets, padded shapes, group settings, or layout parameters;
+- runtime component flags, residency plans, device offsets, or cache/state data;
+- GPU/profile identity, kernel selector, launch geometry, or fallback representation;
+- converter command, environment, timestamps, benchmarks, or provenance report;
+- optional extension maps, vendor fields, remote URLs, or required sidecars.
+
+A field enters the common schema only when the finished artifact cannot be located and decoded
+correctly without carrying it.
+
+## 11. Required implementation evidence
+
+The native implementation in `tools/artifact/`, `tools/convert/qwen3_6_27b/`,
+`tools/convert/qwen3_8_27b/`, `tools/reference/qwen3_6_27b/`, and `src/artifact/` satisfies this
+layer. The compact evidence retained for later changes is:
+
+- Python version-2 round trips for all nine numeric formats and a raw resource;
+- representative framing, schema, offset/alignment, overlap, bounds, and encoded-size failures;
+- exact representative direct-word, Q4/Q5/Q6/W8 code/scale, NVFP4 block-scale, and row-scaled FP8
+  layout round trips;
+- an independently constructed C++ version-2 fixture covering hierarchical identity, payload spans,
+  encoded sizes, and alignment;
+- the complete registered target inventories, including both 1124-object 27B groupwise contracts,
+  the 1307-object Qwen3.6 NVFP4 contract with 247 validation-only input divisors, and the
+  1124-object Qwen3.8 NVFP4 contract with 112 input divisors;
+- inspection, representative source probes, Python reference inference, and public Engine loading
+  of the real converter-generated Qwen3.6-27B, Qwen3.8-27B, and 35B-A3B artifacts.
+
+This contract does not require canonical-JSON spelling tests, arbitrary malformed-input matrices,
+fuzz/resource-exhaustion campaigns, failure injection, interrupted-publication tests, full-file
+hash gates, clean-worktree gates, or exact probabilistic-output comparison.
+
+## 12. Implementation summary
+
+The reusable container mechanism remains intentionally small:
+
+```text
+converter
+    writes hierarchical identity, names, storage identities, offsets, lengths, and payloads
+
+generic reader
+    parses prefix/JSON and validates identity syntax and directory geometry
+
+registered model binder
+    validates the exact inventory and constructs target-private logical views
+
+reference/runtime
+    owns memory policy and executes one explicitly supported model target
+```
+
+JSON replaces a compiled file-address table. It does not replace compiled model semantics.

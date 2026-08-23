@@ -1,0 +1,27 @@
+[
+  {
+    "role": "user",
+    "content": [
+      {
+        "type": "text",
+        "text": "先从静态图标题中读取第一个单词。"
+      },
+      {
+        "type": "image",
+        "image": "examples/cli/media/visual_chart.png"
+      },
+      {
+        "type": "text",
+        "text": "再观察视频末尾 END 标记中的数字。"
+      },
+      {
+        "type": "video",
+        "video": "examples/cli/media/temporal_events.mp4"
+      },
+      {
+        "type": "text",
+        "text": "将第一个单词与末尾数字用连字符拼接，只输出拼接结果。"
+      }
+    ]
+  }
+]

@@ -36,3 +36,4 @@ jackalope/dist/
 .superpowers/
 watch-out/
 watch-run.yaml*
+csrc/build-serve/

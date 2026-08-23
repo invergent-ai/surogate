@@ -1,0 +1,36 @@
+[
+  {
+    "role": "system",
+    "content": "准确保留不同轮次媒体中的可见事实。"
+  },
+  {
+    "role": "user",
+    "content": [
+      {
+        "type": "image",
+        "image": "examples/cli/media/natural_scene.png"
+      },
+      {
+        "type": "text",
+        "text": "请查看这幅场景，记住邮箱上的数字，暂时不要回答。"
+      }
+    ]
+  },
+  {
+    "role": "assistant",
+    "content": "好的，我会保留图像中的邮箱数字。"
+  },
+  {
+    "role": "user",
+    "content": [
+      {
+        "type": "video",
+        "video": "examples/cli/media/temporal_events.mp4"
+      },
+      {
+        "type": "text",
+        "text": "把上一轮邮箱数字和视频末尾 END 数字用连字符连接。只输出连接结果。"
+      }
+    ]
+  }
+]

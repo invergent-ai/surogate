@@ -1,0 +1,15 @@
+[
+  {
+    "role": "user",
+    "content": [
+      {
+        "type": "image",
+        "image": "examples/cli/media/visual_chart.png"
+      },
+      {
+        "type": "text",
+        "text": "读取图中的标题，数出红色圆形，并判断蓝色方块在绿色三角形的哪一侧。只输出：标题；数量；左侧或右侧。"
+      }
+    ]
+  }
+]

@@ -1,0 +1,10 @@
+[
+  {
+    "role": "system",
+    "content": "你是一名严谨的约束求解者。先推理并自行检查所有约束，再给出简洁的最终答案。reasoning 只写关键排除步骤，不要逐条复述题目，并控制在 800 个 token 以内。"
+  },
+  {
+    "role": "user",
+    "content": "有五个从左到右编号 1 到 5 的部署槽位。每个槽位恰好对应一个服务（Cedar、Atlas、Ember、Beacon、Delta）、一种颜色（violet、amber、green、red、blue）和一个端口（4101、4202、4303、4404、4505），三类属性各自不重复。已知：\n\n1. Atlas 紧挨在 Ember 左边。\n2. Beacon 紧挨在 Delta 左边。\n3. Cedar 位于 Atlas 左边，但不保证相邻。\n4. Ember 位于正中央的 3 号槽位。\n5. amber 紧挨在 green 左边。\n6. red 紧挨在 blue 左边。\n7. violet 位于 amber 左边，但不保证相邻。\n8. Atlas 对应 amber。\n9. Beacon 对应 red。\n10. 端口 4505 紧挨在端口 4101 左边。\n11. 端口 4404 紧挨在端口 4202 左边。\n12. 端口 4303 位于端口 4505 左边，但不保证相邻。\n13. Cedar 使用端口 4303。\n14. green 槽位使用端口 4101。\n15. Delta 使用端口 4202。\n\n求出五个槽位的完整映射，并计算 CHECK = Atlas端口 + Beacon端口 - Cedar端口。最终答案的最后一行必须严格为：CHECK=<整数>。"
+  }
+]

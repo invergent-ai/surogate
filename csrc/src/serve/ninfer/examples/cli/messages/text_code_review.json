@@ -1,0 +1,6 @@
+[
+  {
+    "role": "user",
+    "content": "审查下面的 C++ 函数。用不超过三句话指出空输入时的具体错误，并给出一个保持返回类型不变的简洁修复。\n\n```cpp\ndouble mean(const std::vector<int>& values) {\n    return std::accumulate(values.begin(), values.end(), 0.0) / values.size();\n}\n```"
+  }
+]

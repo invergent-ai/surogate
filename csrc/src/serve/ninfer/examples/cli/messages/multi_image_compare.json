@@ -1,0 +1,19 @@
+[
+  {
+    "role": "user",
+    "content": [
+      {
+        "type": "image",
+        "image": "examples/cli/media/compare_left.png"
+      },
+      {
+        "type": "image",
+        "image": "examples/cli/media/compare_right.png"
+      },
+      {
+        "type": "text",
+        "text": "比较左右两张图：左图和右图各有几个红色圆形？右图新增了什么黄色形状？只输出：左图数量；右图数量；新增形状。"
+      }
+    ]
+  }
+]

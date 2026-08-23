@@ -1,0 +1,39 @@
+[
+  {
+    "role": "system",
+    "content": "你需要综合多个媒体中的独立事实，先推理和复核，再给出可核查的最终答案。"
+  },
+  {
+    "role": "user",
+    "content": [
+      {
+        "type": "text",
+        "text": "材料一是一张视觉测试图。读取标题末尾的三位编号，并数出红色圆形。"
+      },
+      {
+        "type": "image",
+        "image": "examples/cli/media/visual_chart.png"
+      },
+      {
+        "type": "text",
+        "text": "材料二是一幅场景图。读取邮箱上的数字。"
+      },
+      {
+        "type": "image",
+        "image": "examples/cli/media/natural_scene.png"
+      },
+      {
+        "type": "text",
+        "text": "材料三是一段视频。读取绿色数字和末尾 END 标记中的数字。"
+      },
+      {
+        "type": "video",
+        "video": "examples/cli/media/temporal_events.mp4"
+      },
+      {
+        "type": "text",
+        "text": "设 V=标题编号，C=红色圆形数量，M=邮箱数字，G=视频绿色数字，E=视频末尾数字。计算 (V + M) × C - G × E。先列出 V、C、M、G、E 和代入过程；最终答案的最后一行必须严格为：CHECKSUM=<整数>。"
+      }
+    ]
+  }
+]

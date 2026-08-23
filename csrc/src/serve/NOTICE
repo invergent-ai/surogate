@@ -1,0 +1,10 @@
+This directory contains third-party code vendored into surogate.
+
+ninfer/
+  NInfer — a C++/CUDA inference engine for RTX 5090.
+  Copyright (c) NInfer contributors (https://github.com/Neroued/ninfer)
+  Licensed under the Apache License, Version 2.0 (ninfer/LICENSE).
+  Local modifications are enumerated in PATCHES.md.
+
+  NInfer itself vendors (under ninfer/third_party/, each with its own license):
+    cpp-httplib (MIT), nlohmann/json (MIT), utf8proc (MIT-style).

@@ -1,0 +1,15 @@
+[
+  {
+    "role": "user",
+    "content": [
+      {
+        "type": "image",
+        "image": "examples/cli/media/natural_scene.png"
+      },
+      {
+        "type": "text",
+        "text": "用一句话描述场景，然后回答：邮箱上的数字是什么，太阳位于画面的哪一侧？"
+      }
+    ]
+  }
+]

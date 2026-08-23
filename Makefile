@@ -35,6 +35,28 @@ build: configure
 	cp -f $(BUILD_DIR)/libsurogate-common.so surogate/
 	cp -f $(BUILD_DIR)/libsurogate-common.so .venv/lib/python3.12/site-packages/surogate/
 
+# ---------------------------------------------------------------------------
+# Serving engine (vendored NInfer; design/serve-engine-plan.md)
+# Builds standalone in its own tree — never touches the training build.
+SERVE_BUILD_DIR ?= csrc/build-serve
+
+serve-configure:
+	cmake -S csrc/src/serve/ninfer -B $(SERVE_BUILD_DIR) -G Ninja \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DCMAKE_CUDA_ARCHITECTURES=120a
+
+serve-build: serve-configure
+	cmake --build $(SERVE_BUILD_DIR) --parallel $(PARALLEL_JOBS)
+
+serve-test-build:
+	cmake -S csrc/src/serve/ninfer -B $(SERVE_BUILD_DIR) -G Ninja \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DCMAKE_CUDA_ARCHITECTURES=120a \
+		-DBUILD_TESTING=ON
+	cmake --build $(SERVE_BUILD_DIR) --parallel $(PARALLEL_JOBS)
+
+.PHONY: serve-configure serve-build serve-test-build
+
 # Internal helper: build + repair wheel for a given CUDA tag
 # Usage: $(call build_wheel,cu128)
 define build_wheel

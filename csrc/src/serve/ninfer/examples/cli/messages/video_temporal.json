@@ -1,0 +1,15 @@
+[
+  {
+    "role": "user",
+    "content": [
+      {
+        "type": "video",
+        "video": "examples/cli/media/temporal_events.mp4"
+      },
+      {
+        "type": "text",
+        "text": "观察事件顺序：哪个物体发生移动，绿色数字是什么，数字首次出现时蓝色方块是否仍然可见，末尾标记中的数字是什么？只输出四项并用分号分隔。"
+      }
+    ]
+  }
+]

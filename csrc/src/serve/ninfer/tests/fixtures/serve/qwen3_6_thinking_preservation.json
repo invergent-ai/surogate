@@ -1,0 +1,139 @@
+{
+  "schema_version": 1,
+  "chat": {
+    "request": {
+      "max_completion_tokens": 16,
+      "temperature": 0,
+      "enable_thinking": true,
+      "chat_template_kwargs": {
+        "preserve_thinking": false
+      },
+      "tool_choice": "auto",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "lookup",
+            "description": "Look up one deterministic fixture value.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "key": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "key"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "first_messages": [
+      {
+        "role": "system",
+        "content": "Work through the lookup task before giving a final answer."
+      },
+      {
+        "role": "user",
+        "content": "Use the lookup results to determine the fixture value."
+      }
+    ],
+    "first_tool_messages": [
+      {
+        "role": "system",
+        "content": "Work through the lookup task before giving a final answer."
+      },
+      {
+        "role": "user",
+        "content": "Use the lookup results to determine the fixture value."
+      },
+      {
+        "role": "assistant",
+        "content": null,
+        "reasoning_content": "I need the first lookup result before I can answer.",
+        "tool_calls": [
+          {
+            "id": "call_fixture_1",
+            "type": "function",
+            "function": {
+              "name": "lookup",
+              "arguments": "{\"key\":\"alpha\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_fixture_1",
+        "content": "{\"value\":17,\"next\":\"beta\"}"
+      }
+    ],
+    "second_tool_messages": [
+      {
+        "role": "system",
+        "content": "Work through the lookup task before giving a final answer."
+      },
+      {
+        "role": "user",
+        "content": "Use the lookup results to determine the fixture value."
+      },
+      {
+        "role": "assistant",
+        "content": null,
+        "reasoning_content": "I need the first lookup result before I can answer.",
+        "tool_calls": [
+          {
+            "id": "call_fixture_1",
+            "type": "function",
+            "function": {
+              "name": "lookup",
+              "arguments": "{\"key\":\"alpha\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_fixture_1",
+        "content": "{\"value\":17,\"next\":\"beta\"}"
+      },
+      {
+        "role": "assistant",
+        "content": null,
+        "reasoning_content": "The first result points to one more lookup.",
+        "tool_calls": [
+          {
+            "id": "call_fixture_2",
+            "type": "function",
+            "function": {
+              "name": "lookup",
+              "arguments": "{\"key\":\"beta\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_fixture_2",
+        "content": "{\"value\":25}"
+      }
+    ],
+    "reset_messages": [
+      {
+        "role": "user",
+        "content": "This is an unrelated cache reset probe. Reply briefly."
+      }
+    ],
+    "next_user_message": {
+      "role": "user",
+      "content": "Now combine the two lookup values and reply briefly."
+    }
+  },
+  "responses": {
+    "parent_input": "Remember that the fixture label is ORCHID and reply briefly.",
+    "inherited_child_input": "Repeat the fixture label.",
+    "changed_child_input": "Repeat the fixture label once more."
+  }
+}
