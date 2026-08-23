@@ -33,6 +33,13 @@ from surogate.cli._jackalope import maybe_exec_jackalope
 
 maybe_exec_jackalope()
 
+# `surogate serve ...` execs the native serving engine (vendored NInfer; see
+# design/serve-engine-plan.md). Intercepted here, before CUDA-touching imports,
+# so the serving process carries no Python CUDA context. Never returns for serve.
+from surogate.cli.serve import maybe_exec_serve
+
+maybe_exec_serve()
+
 from surogate.utils.banner import print_banner
 from surogate.utils.logger import get_logger
 from surogate.utils.system_info import get_system_info, print_system_diagnostics
@@ -167,6 +174,12 @@ def parse_args():
     # entry exists only so it shows up in `surogate --help`. add_help=False so its
     # own `--help` passes through to the dashboard binary.
     subparsers.add_parser("jackalope", help="Launch the jackalope live-training dashboard (TUI)", add_help=False)
+
+    # serve is intercepted before argparse (see maybe_exec_serve); this entry
+    # exists only so it shows up in `surogate --help`.
+    subparsers.add_parser(
+        "serve", help="Serve a model over OpenAI-/Anthropic-compatible HTTP (native engine)", add_help=False
+    )
 
     args = parser.parse_args(sys.argv[1:])
     if args.command is None:

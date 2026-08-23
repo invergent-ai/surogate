@@ -6,10 +6,16 @@ cmake_minimum_required(VERSION 3.28)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 120a CACHE STRING "CUDA architectures to build")
 endif()
-if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
+# surogate vendor patch (csrc/src/serve/PATCHES.md): sm_89 (RTX 40-series) is a
+# port target per design/serve-engine-plan.md. Upstream supports 120a only; the
+# explicit opt-in below is for the porting effort and CI compile checks, not a
+# statement of support.
+option(NINFER_ALLOW_PORT_ARCH "Allow CUDA architectures beyond upstream's 120a (porting)" OFF)
+if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "120a" AND NOT NINFER_ALLOW_PORT_ARCH)
   message(FATAL_ERROR
     "NInfer supports only CMAKE_CUDA_ARCHITECTURES=120a; got "
-    "'${CMAKE_CUDA_ARCHITECTURES}'")
+    "'${CMAKE_CUDA_ARCHITECTURES}'. Set NINFER_ALLOW_PORT_ARCH=ON to attempt "
+    "a port build (surogate serve-engine work).")
 endif()
 
 project(ninfer LANGUAGES C CXX CUDA)

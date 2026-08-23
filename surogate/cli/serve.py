@@ -1,0 +1,93 @@
+# Copyright (c) 2026, Invergent SA, developed by Flavius Burca
+# SPDX-License-Identifier: Apache-2.0
+#
+# `surogate serve ...` — the native serving engine (design/serve-engine-plan.md).
+#
+# The engine is the vendored C++ NInfer server (csrc/src/serve/ninfer), built by
+# `make serve-build`. This wrapper resolves the binary and os.execv's it, so no
+# Python (and no Python CUDA context) stays in the serving process. It must run
+# BEFORE any CUDA-touching import in surogate.cli.main, mirroring jackalope.
+
+import os
+import shutil
+import sys
+from pathlib import Path
+
+_USAGE = """\
+usage: surogate serve <model.ninfer> [engine options...]
+       surogate serve --generate <model.ninfer> --prompt "..." [options...]
+
+Serve a model over OpenAI-/Anthropic-compatible HTTP (default), or run a
+one-shot generation with --generate (streams the answer to stdout).
+
+Common engine options (full list: surogate serve --engine-help):
+  --host 0.0.0.0 --port 8080     bind address (server mode)
+  --max-context N                per-sequence context ceiling
+  --kv-capacity N|auto           KV pool size ('auto' = free VRAM minus 1 GiB)
+  --max-concurrency N            concurrent requests (server mode, 1-8)
+  --spec mtp --draft-tokens 3    speculative decoding
+  --kv-dtype bf16|int8           KV cache precision
+
+The engine binary is resolved from, in order:
+  1. $SUROGATE_SERVE_BIN / $SUROGATE_NINFER_BIN (explicit paths)
+  2. the repo build tree (csrc/build-serve/apps/) when running from a checkout
+  3. $PATH (ninfer-serve / ninfer)
+Build it from a checkout with: make serve-build
+"""
+
+
+def _repo_root() -> Path | None:
+    # surogate/cli/serve.py -> surogate/cli -> surogate -> repo root
+    root = Path(__file__).resolve().parent.parent.parent
+    return root if (root / "csrc" / "src" / "serve" / "ninfer").is_dir() else None
+
+
+def _resolve_binary(server_mode: bool) -> str | None:
+    name = "ninfer-serve" if server_mode else "ninfer"
+    env = os.environ.get("SUROGATE_SERVE_BIN" if server_mode else "SUROGATE_NINFER_BIN")
+    if env and Path(env).is_file():
+        return env
+    root = _repo_root()
+    if root is not None:
+        cand = root / "csrc" / "build-serve" / "apps" / name
+        if cand.is_file():
+            return str(cand)
+    return shutil.which(name)
+
+
+def maybe_exec_serve() -> None:
+    """If invoked as `surogate serve ...`, exec the engine binary (never returns)."""
+    argv = sys.argv
+    if len(argv) < 2 or argv[1] != "serve":
+        return
+
+    rest = argv[2:]
+    if not rest or rest[0] in ("-h", "--help"):
+        sys.stderr.write(_USAGE)
+        sys.exit(0 if rest else 1)
+
+    # --generate switches to the one-shot CLI binary; --engine-help passes
+    # --help through to the engine so its full option surface stays canonical.
+    server_mode = True
+    if "--generate" in rest:
+        rest = [a for a in rest if a != "--generate"]
+        server_mode = False
+    if "--engine-help" in rest:
+        rest = ["--help" if a == "--engine-help" else a for a in rest]
+
+    binary = _resolve_binary(server_mode)
+    if binary is None:
+        name = "ninfer-serve" if server_mode else "ninfer"
+        sys.stderr.write(
+            f"surogate serve: engine binary '{name}' not found.\n"
+            "Build it first:  make serve-build   (from the surogate repo root)\n"
+            "or point SUROGATE_SERVE_BIN at an existing binary.\n"
+        )
+        sys.exit(127)
+
+    os.execv(binary, [binary] + rest)
+
+
+if __name__ == "__main__":
+    sys.argv = [sys.argv[0], "serve"] + sys.argv[1:]
+    maybe_exec_serve()
