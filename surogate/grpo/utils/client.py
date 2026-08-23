@@ -124,6 +124,25 @@ def setup_clients(
             api_base_url=base_url,
             api_key_var=client_config.api_key_var,
             timeout=client_config.timeout,
+            # verifiers defaults connect_timeout to 5.0s. Under a completion
+            # wave (hundreds of rollouts firing conductor calls as their harbor
+            # steps finish together) the orchestrator's own event loop delays
+            # the TCP handshake past 5s CLIENT-side, and the call dies as
+            # ConnectTimeout while the conductor sits idle — measured
+            # 2026-08-14: abort bursts of ~70/min against a server showing
+            # 0-9 running requests, 0 waiting, 0.3ms accept latency. Aborted
+            # rollouts empty their group and zero its GRPO advantage, so the
+            # 5s default was silently deleting training signal.
+            # 60 -> 1200 (2026-08-15, second bite of the same class): the swe
+            # lane runs episodes in asyncio.to_thread INSIDE the env process,
+            # and thread/GIL pressure during busy phases stalls the event loop
+            # long enough that pending conductor connects miss a 60s window —
+            # plan calls die as ConnectTimeout while the conductor idles at
+            # ~12ms (swebench group 7: 42 reschedules at 0/64, zero artifacts,
+            # terminal lane unaffected because harbor episodes are
+            # SUBPROCESSES). On localhost a separate connect timer only
+            # false-kills; equal to the total budget it can never fire first.
+            connect_timeout=1200.0,
             max_connections=8192,
             max_keepalive_connections=8192,
             max_retries=10,
@@ -152,7 +171,16 @@ def setup_admin_clients(client_config: GRPOClientConfig) -> list[AsyncClient]:
             base_url=base_url,
             headers=headers,
             limits=httpx.Limits(max_connections=1, max_keepalive_connections=0),
-            timeout=httpx.Timeout(None),
+            # A finite deadline, not Timeout(None): the weight-update POST runs
+            # inside the scheduler's _apply_policy_update, which gates all new
+            # rollout scheduling. With no deadline, a server that accepts the
+            # request but never finishes the reload wedges the orchestrator
+            # silently and indefinitely (observed 2026-08-14: conductor reload
+            # at 20:47 -> zero accepted rollouts for ~6h, no error anywhere).
+            # 600s covers the slowest legitimate reload (LoRA load + prefix
+            # cache drain, or a full filesystem weight update) with margin;
+            # on expiry the update_policy_loop retries within 1s.
+            timeout=httpx.Timeout(600.0, connect=60.0),
         )
 
     return [_setup_admin_client(base_url) for base_url in client_config.base_url]
