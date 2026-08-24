@@ -244,3 +244,25 @@ point and at 2B 232 (tied)/962; the two residual 2B points (472 -16%,
 levers if full 2B closure matters: the fractional-ms queue (swiglu pair
 fusion ~1.1ms, conv-snapshot A8 branch ~1.5ms, quantizing-rmsnorm ~1ms,
 GDN chunk tuning) or the native 4-bit small-target profile.
+
+
+# Qwen3.5-4B — vLLM reference board (engine target does not exist yet)
+
+Same method, idle 5090, batch 1. This is the sheet the 4B engine target
+(asymmetric ratio-2 GDN, hidden 2560, 32 layers) has to beat.
+
+| point | vLLM bf16 | vLLM FP8 | vLLM NVFP4 (AxionML) |
+|---|---:|---:|---:|
+| prefill @472 | 9,855 | **11,838** | 8,469 |
+| prefill @962 | 11,475 | 15,985 | **17,351** |
+| prefill @1912 | 12,679 | 19,743 | **35,169** |
+| decode | 100 | 115 | **162** |
+
+Reading: at 4B the bandwidth hierarchy shows cleanly (decode 100 -> 115
+-> 162 as weight bytes halve twice); NVFP4's prefill is fixed-overhead
+bound to ~55ms until large T. Engine projections from measured scaling:
+W8 decode extrapolates to ~200 tok/s (weight-traffic scaling from
+0.8B/2B), which would beat NVFP4's 162 at twice the weight bits; the
+IMMA prefill path at K=2560 shapes should land in its usual 150-200 TF/s
+band. The 4B target build (the deferred asymmetric-GDN lift) has a
+concrete scoreboard to hit.
