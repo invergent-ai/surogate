@@ -180,7 +180,9 @@
    the 0.8b — the FP8-MMA path fixes both). linear_add {2048,2048} carries
    a measured route table (r32c96/r48c128/r32c128 bands); qkgv/qkvz 2B
    candidates measured within ~4% of the current routes (kept). Full GPU
-   ctest re-run after the shared-wrapper generalizations: see log.
+   ctest re-run after the shared-wrapper generalizations: 87/88 (the known
+   hardcoded-path frontend test) — the parent-row keying is regression-clean
+   across the 27B/35B/0.8b/2b families.
 
 ### sm_89 port status
 
