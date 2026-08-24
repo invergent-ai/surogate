@@ -187,3 +187,33 @@ At the 2B, 4-bit FP4 tensor cores take the mid/long prefill points
 dips); matching that in-class would mean an NVFP4 profile for the small
 targets (the engine already carries NVFP4 kernels for the 27B family) —
 a quality-tradeoff option, not a correction.
+
+
+# In-class 4-bit: Q4_K_M (engine) vs NVFP4 (vLLM)
+
+Both columns serve 4-bit-quality weights (community Q4_K_M GGUFs via the
+engine's W8 container; modelopt NVFP4 via vLLM). The engine's speed is
+format-determined (identical to its W8 numbers — Q4_K's quality damage
+lives in the weights, not the container); its weight VRAM is ~2x NVFP4's
+(8-bit container vs 4-bit). Exactness re-verified on both artifacts.
+
+| point | engine + Q4_K_M | vLLM + NVFP4 |
+|---|---:|---:|
+| 0.8B prefill @472 | **25,771** | 25,428 |
+| 0.8B prefill @962 | **46,576** | 22,344 |
+| 0.8B prefill @1912 | **63,150** | 38,685 |
+| 0.8B decode | **462-467** | 386-390 |
+| 2B prefill @472 | 15,506 | **24,057** |
+| 2B prefill @962 | **29,127** | 22,660 |
+| 2B prefill @1912 | 37,062 | **44,754** |
+| 2B decode | **326-328** | 256-258 |
+
+Reading: at the 0.8B the engine sweeps NVFP4 in-class (prefill up to
+2.1x, decode +19%). At the 2B the engine wins decode (+27%) and 962;
+NVFP4's halved weight traffic and FP4 tensor cores take 472/1912. The
+remaining levers for the 2B prefill points: a native 4-bit small-target
+profile (Q4G64 kernels exist for the 27B family), or pushing the IMMA
+rate further. Quality between Q4_K_M and NVFP4 at 4 bits is a separate
+(unmeasured here) dimension; the engine additionally offers the 8-bit
+bit-exact tier (Q8_0/Q4_0/Q5_0/IQ4_NL repack) that vLLM has no GGUF
+answer to.
