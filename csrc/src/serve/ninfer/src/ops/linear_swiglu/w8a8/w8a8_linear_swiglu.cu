@@ -70,15 +70,26 @@ void w8a8_linear_swiglu_dispatch(const Tensor& x, const Weight& gate_up_weight, 
     const W8A8QuantizedActivations quantized = w8a8_act_quant(x, base, stream);
     auto* gemm_out = reinterpret_cast<__nv_bfloat16*>(base + quant_bytes);
 
-    using Cfg = W8A8ImmaConfig;
-    const dim3 grid(static_cast<unsigned>(div_up(gate_up_rows, Cfg::BM)),
-                    static_cast<unsigned>(div_up(tokens, Cfg::BN)), 1u);
-    w8a8_imma_gemm_kernel<W8A8IdentityRowMap, StoreColumnMajor>
-        <<<grid, Cfg::THREADS, 0, stream>>>(
-            static_cast<const std::int8_t*>(gate_up_weight.qdata),
-            static_cast<const std::uint8_t*>(gate_up_weight.scales), quantized.codes,
-            quantized.scales, gate_up_rows, k, tokens, W8A8IdentityRowMap{},
-            StoreColumnMajor{gemm_out, gate_up_rows});
+    const StoreColumnMajor epilogue{gemm_out, gate_up_rows};
+    if (tokens >= kW8A8WideMinTokens && gate_up_rows >= 4096) {
+        using Cfg = W8A8ImmaWideConfig;
+        const dim3 grid(static_cast<unsigned>(div_up(gate_up_rows, Cfg::BM)),
+                        static_cast<unsigned>(div_up(tokens, Cfg::BN)), 1u);
+        w8a8_imma_gemm_kernel<W8A8IdentityRowMap, StoreColumnMajor, Cfg>
+            <<<grid, Cfg::THREADS, 0, stream>>>(
+                static_cast<const std::int8_t*>(gate_up_weight.qdata),
+                static_cast<const std::uint8_t*>(gate_up_weight.scales), quantized.codes,
+                quantized.scales, gate_up_rows, k, tokens, W8A8IdentityRowMap{}, epilogue);
+    } else {
+        using Cfg = W8A8ImmaConfig;
+        const dim3 grid(static_cast<unsigned>(div_up(gate_up_rows, Cfg::BM)),
+                        static_cast<unsigned>(div_up(tokens, Cfg::BN)), 1u);
+        w8a8_imma_gemm_kernel<W8A8IdentityRowMap, StoreColumnMajor, Cfg>
+            <<<grid, Cfg::THREADS, 0, stream>>>(
+                static_cast<const std::int8_t*>(gate_up_weight.qdata),
+                static_cast<const std::uint8_t*>(gate_up_weight.scales), quantized.codes,
+                quantized.scales, gate_up_rows, k, tokens, W8A8IdentityRowMap{}, epilogue);
+    }
     CUDA_CHECK(cudaGetLastError());
 
     const dim3 pair_grid(static_cast<unsigned>(div_up(intermediate, 256)),

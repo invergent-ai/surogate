@@ -217,3 +217,30 @@ rate further. Quality between Q4_K_M and NVFP4 at 4 bits is a separate
 (unmeasured here) dimension; the engine additionally offers the 8-bit
 bit-exact tier (Q8_0/Q4_0/Q5_0/IQ4_NL repack) that vLLM has no GGUF
 answer to.
+
+
+# Gap-closing round: threshold 224 + wide config (rows-aware)
+
+Three measured changes: kW8A8MinTokens 512 -> 224 (the IMMA path beats the
+A16 routes from T=232 on every shape, still ahead at 128); a BM128 x BN128
+wide config for T >= 1024 (200 TF/s at 1912-class, +10%); and rows-aware
+selection (wide tiles underfill the GPU at 2048 output rows — the same
+lesson as the A16 route tables, re-learned at the IMMA tier).
+
+| point | engine before | engine after | vLLM NVFP4 (4-bit) |
+|---|---:|---:|---:|
+| 0.8B @232 | 14,897 | **15,794** | ~12,650 |
+| 0.8B @472 | 25,782 | **28,983** | 25,428 |
+| 0.8B @962 | 46,476 | **47,779** | 22,344 |
+| 0.8B @1912 | 63,843 | **65,218** | 38,685 |
+| 2B @232 | 9,921 | **12,053** | 12,337 |
+| 2B @472 | 15,362 | **20,298** | 24,057 |
+| 2B @962 | 28,642 | **30,091** | 22,660 |
+| 2B @1912 | 37,765 | **38,609** | 44,754 |
+
+Standing: the 8-bit engine beats every vLLM configuration at every 0.8B
+point and at 2B 232 (tied)/962; the two residual 2B points (472 -16%,
+1912 -14%) are against a format carrying HALF the weight bits. Remaining
+levers if full 2B closure matters: the fractional-ms queue (swiglu pair
+fusion ~1.1ms, conv-snapshot A8 branch ~1.5ms, quantizing-rmsnorm ~1ms,
+GDN chunk tuning) or the native 4-bit small-target profile.

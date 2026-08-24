@@ -74,13 +74,27 @@ void launch(const Tensor& x, const Weight& weight, Epilogue epilogue, WorkspaceA
     auto* quant_base = workspace.alloc_bytes(w8a8_act_quant_bytes(k, tokens), 16).data;
     const W8A8QuantizedActivations quantized = w8a8_act_quant(x, quant_base, stream);
 
-    using Cfg = W8A8ImmaConfig;
-    const dim3 grid(static_cast<unsigned>(div_up(weight.n, Cfg::BM)),
-                    static_cast<unsigned>(div_up(tokens, Cfg::BN)), 1u);
-    w8a8_imma_gemm_kernel<W8A8IdentityRowMap, Epilogue><<<grid, Cfg::THREADS, 0, stream>>>(
-        static_cast<const std::int8_t*>(weight.qdata),
-        static_cast<const std::uint8_t*>(weight.scales), quantized.codes, quantized.scales,
-        weight.n, k, tokens, W8A8IdentityRowMap{}, epilogue);
+    // Wide tiles need grid volume: at 2048 output rows BM128 leaves the GPU
+    // underfilled (measured: the residual projections ran at half rate).
+    if (tokens >= kW8A8WideMinTokens && weight.n >= 4096) {
+        using Cfg = W8A8ImmaWideConfig;
+        const dim3 grid(static_cast<unsigned>(div_up(weight.n, Cfg::BM)),
+                        static_cast<unsigned>(div_up(tokens, Cfg::BN)), 1u);
+        w8a8_imma_gemm_kernel<W8A8IdentityRowMap, Epilogue, Cfg>
+            <<<grid, Cfg::THREADS, 0, stream>>>(
+                static_cast<const std::int8_t*>(weight.qdata),
+                static_cast<const std::uint8_t*>(weight.scales), quantized.codes,
+                quantized.scales, weight.n, k, tokens, W8A8IdentityRowMap{}, epilogue);
+    } else {
+        using Cfg = W8A8ImmaConfig;
+        const dim3 grid(static_cast<unsigned>(div_up(weight.n, Cfg::BM)),
+                        static_cast<unsigned>(div_up(tokens, Cfg::BN)), 1u);
+        w8a8_imma_gemm_kernel<W8A8IdentityRowMap, Epilogue, Cfg>
+            <<<grid, Cfg::THREADS, 0, stream>>>(
+                static_cast<const std::int8_t*>(weight.qdata),
+                static_cast<const std::uint8_t*>(weight.scales), quantized.codes,
+                quantized.scales, weight.n, k, tokens, W8A8IdentityRowMap{}, epilogue);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

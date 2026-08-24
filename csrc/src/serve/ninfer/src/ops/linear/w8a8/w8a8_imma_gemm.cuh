@@ -40,6 +40,20 @@ struct W8A8ImmaConfig {
     static constexpr int THREADS = WARPS_M * WARPS_N * 32;
 };
 
+// Wide-row configuration: +10% at T >= ~1024 (200 TF/s at 1912-class on the
+// K=2048 shapes); BM64 stays better below. Same warp tile (32x16).
+struct W8A8ImmaWideConfig {
+    static constexpr int BM      = 128;
+    static constexpr int BN      = 128;
+    static constexpr int BK      = 64;
+    static constexpr int BK_PAD  = 80;
+    static constexpr int WARPS_M = 4;
+    static constexpr int WARPS_N = 8;
+    static constexpr int THREADS = WARPS_M * WARPS_N * 32;
+};
+
+inline constexpr std::int32_t kW8A8WideMinTokens = 1024;
+
 struct W8A8IdentityRowMap {
     __device__ __forceinline__ int weight_row(int logical_row) const { return logical_row; }
 };
@@ -73,12 +87,11 @@ __device__ __forceinline__ void w8a8_ldmatrix_x2(unsigned& r0, unsigned& r1, con
 // scales: [weight_rows, k/32] fp16 row-major (the W8 scale plane).
 // x_codes: [tokens, k] int8 (w8a8_act_quant layout); x_scales: [tokens] fp32.
 // `rows` counts LOGICAL output rows (grid.x covers ceil(rows / BM)).
-template <class RowMap, class Epilogue>
-__global__ __launch_bounds__(W8A8ImmaConfig::THREADS, 2) void w8a8_imma_gemm_kernel(
+template <class RowMap, class Epilogue, class Cfg = W8A8ImmaConfig>
+__global__ __launch_bounds__(Cfg::THREADS, 2) void w8a8_imma_gemm_kernel(
     const std::int8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
     const std::int8_t* __restrict__ x_codes, const float* __restrict__ x_scales, int rows, int k,
     int tokens, RowMap row_map, Epilogue epilogue) {
-    using Cfg = W8A8ImmaConfig;
     __shared__ std::int8_t Ws[2][Cfg::BM * Cfg::BK_PAD];
     __shared__ std::int8_t Xs[2][Cfg::BN * Cfg::BK_PAD];
     __shared__ __half Ss[2][Cfg::BM * 2];

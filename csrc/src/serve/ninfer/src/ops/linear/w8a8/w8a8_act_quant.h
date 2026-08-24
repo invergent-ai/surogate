@@ -16,10 +16,11 @@
 
 namespace ninfer::ops::detail {
 
-// A8 engages at and above this token count: below it the activation-quant
-// pre-pass and the IMMA tile shape do not pay for themselves (measured in
-// bench/ops/w8a8_imma_probe_bench), and decode must stay A16 regardless.
-inline constexpr std::int32_t kW8A8MinTokens = 512;
+// A8 engages at and above this token count. The IMMA path measured faster
+// than the A16 routes from T=232 up on every shape (and still ahead at 128;
+// bench/ops/w8a8_imma_probe_bench) — 224 keeps a proven-win margin, and
+// decode/short prompts stay A16.
+inline constexpr std::int32_t kW8A8MinTokens = 224;
 
 // Workspace bytes for the quantized activation planes of one call:
 // T x hidden int8 codes (16-byte aligned) followed by T fp32 scales.

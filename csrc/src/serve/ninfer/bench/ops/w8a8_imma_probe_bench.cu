@@ -367,6 +367,16 @@ __global__ __launch_bounds__(THREADS, 2) void w8a8_imma_ldmatrix_kernel(
     }
 }
 
+struct ProbeCfg128 {
+    static constexpr int BM      = 128;
+    static constexpr int BN      = 128;
+    static constexpr int BK      = 64;
+    static constexpr int BK_PAD  = 80;
+    static constexpr int WARPS_M = 4;
+    static constexpr int WARPS_N = 8;
+    static constexpr int THREADS = WARPS_M * WARPS_N * 32;
+};
+
 struct ProbeStore {
     __nv_bfloat16* out;
     int rows;
@@ -425,7 +435,7 @@ int main(int argc, char** argv) {
         cudaMemcpy(d_x.p, host_x.data(), host_x.size(), cudaMemcpyHostToDevice);
         cudaMemcpy(d_xs.p, host_xs.data(), host_xs.size() * 4, cudaMemcpyHostToDevice);
 
-        for (const int tokens : {960, 1024}) {
+        for (const int tokens : {232, 472, 960, 1912}) {
             const dim3 grid(c.rows / BM, (tokens + BN - 1) / BN);
             const auto launchP = [&](cudaStream_t s) {
                 const dim3 pgrid(c.rows / ops::detail::W8A8ImmaConfig::BM,
@@ -455,6 +465,19 @@ int main(int argc, char** argv) {
                     static_cast<__nv_bfloat16*>(d_out.p), c.rows, c.k, tokens);
             };
             const auto launch = [&](cudaStream_t s) {
+                const dim3 g128((c.rows + 127) / 128,
+                                (tokens + ProbeCfg128::BN - 1) / ProbeCfg128::BN);
+                ops::detail::w8a8_imma_gemm_kernel<ops::detail::W8A8IdentityRowMap, ProbeStore,
+                                                   ProbeCfg128>
+                    <<<g128, ProbeCfg128::THREADS, 0, s>>>(
+                        static_cast<const std::int8_t*>(d_codes.p),
+                        static_cast<const std::uint8_t*>(d_scales.p),
+                        static_cast<const std::int8_t*>(d_x.p),
+                        static_cast<const float*>(d_xs.p), c.rows, c.k, tokens,
+                        ops::detail::W8A8IdentityRowMap{},
+                        ProbeStore{static_cast<__nv_bfloat16*>(d_out.p), c.rows});
+            };
+            const auto launch_unused = [&](cudaStream_t s) {
                 w8a8_imma_kernel<2><<<grid, THREADS, 0, s>>>(
                     static_cast<const std::int8_t*>(d_codes.p),
                     static_cast<const __half*>(d_scales.p),
@@ -517,7 +540,7 @@ int main(int argc, char** argv) {
             // oracle-known planes for the next token count's spot check.
             cudaMemcpy(d_x.p, host_x.data(), host_x.size(), cudaMemcpyHostToDevice);
             cudaMemcpy(d_xs.p, host_xs.data(), host_xs.size() * 4, cudaMemcpyHostToDevice);
-            std::printf("%-22s %6d s2 %7.1f/%3.0f  pr %7.1f/%3.0f  +q %7.1f/%3.0f %9.2e\n",
+            std::printf("%-22s %6d c128 %5.1f/%3.0f  pr %7.1f/%3.0f  +q %7.1f/%3.0f %9.2e\n",
                         c.name, tokens, timing.median_us,
                         gflop / (timing.median_us * 1e-6) / 1e3, timing4.median_us,
                         gflop / (timing4.median_us * 1e-6) / 1e3, combined.median_us,
