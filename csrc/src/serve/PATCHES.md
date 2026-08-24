@@ -147,10 +147,14 @@ CPU pass on this host (`CUDA_VISIBLE_DEVICES="" ctest`): 83/89 after patch 4.
      for (3584, 1024).
 
    Op-test coverage added for every 0.8B geometry (all green on sm_120):
-   attn_input_proj q08 x8 T-cases, gdn_input_proj q08 (one KNOWN-MARGINAL
-   sample: T=2 qkv row 6143 token 1 misses the reduction criterion by ~1 bf16
-   ULP under high cancellation — route/tolerance to revisit in the perf pass),
-   gdn_gating_proj kQwen08 routes + norm cases, linear W8 head shapes,
+   attn_input_proj q08 x8 T-cases, gdn_input_proj q08 (its W8 comparisons use
+   a documented one-output-ULP criterion, kGdnInputProjW8UlpTolerance: the
+   T=2 sample at row 6143 was root-caused to the op's defined
+   dequant-to-BF16 weight semantics under 34:1 cancellation — the
+   kernel-semantics oracle reproduces the GPU value exactly, 8.03449 ->
+   8.0625, vs exact-weight oracle 8.00212 — so the family criterion was
+   miscalibrated for a flip that dominates a small batch's norm, not the
+   kernel wrong), gdn_gating_proj kQwen08 routes + norm cases, linear W8 head shapes,
    linear_add both q08 shapes, linear_swiglu q08 profile (registered in the
    harness), embedding d=1024, gqa_attention {8,2}, causal_conv1d_silu 6144ch,
    gated_delta_net 16/16 identity head-map, gated_rmsnorm 16-head.

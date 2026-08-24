@@ -18,6 +18,18 @@ namespace {
 
 // This criterion belongs to the complete A16 GDN-input-projection Op.
 constexpr ReductionCriterion kGdnInputProjA16Tolerance{3.0e-3, 4.0e-3, 3.5e-3};
+// surogate vendor patch (PATCHES.md #13): the qwen3.5-0.8b W8 comparisons admit
+// exactly one BF16 output ULP at the batch maximum (gross_relative 2^-7). The
+// op's defined semantics dequantize W8 weights to BF16 before the MMA; under
+// heavy cancellation (measured T=2 sample: sum|terms| 275.6 -> value 8.0) that
+// weight rounding legitimately moves the FP32 sum across an output rounding
+// boundary (kernel-semantics oracle 8.03449 -> 8.0625 == GPU, exact-weight
+// oracle 8.00212 -> 8.0), which the family criterion (3.5e-3 < 2^-7) only
+// covers when the flipped sample is far below the batch maximum. The
+// relative_l2 bound must also admit the flip when the flipped sample
+// dominates a small batch's norm (T=2 is 14 samples): worst case
+// ||err||/||ref|| -> ULP/value = 2^-7, plus family quantization noise.
+constexpr ReductionCriterion kGdnInputProjW8UlpTolerance{1.0e-2, 4.0e-3, 7.8125e-3};
 constexpr ReductionCriterion kFp8GdnInputProjA16Tolerance{1.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0};
 constexpr ReductionCriterion kFp8GdnInputProjA8Tolerance{0.04, 1.0 / 256.0, 0.06};
 constexpr ReductionCriterion kGdnInputProjA4Tolerance{0.16, 4.0e-3, 0.16};
@@ -27,12 +39,13 @@ int verify_output_range(std::string_view label, const GuardedBf16Tensor& output,
                         std::int32_t full_rows, std::int32_t output_row_offset,
                         std::int32_t output_rows, const quantized_weight::PackedWeight& weight,
                         std::int32_t weight_row_offset, const std::vector<float>& activation,
-                        std::int32_t hidden, std::int32_t tokens) {
+                        std::int32_t hidden, std::int32_t tokens,
+                        const ReductionCriterion& criterion = kGdnInputProjA16Tolerance) {
     const std::vector<double> actual =
         gather_rows(output.values(), full_rows, output_row_offset, output_rows, tokens);
     const std::vector<double> expected =
         projection_oracle(weight, weight_row_offset, output_rows, activation, hidden, tokens);
-    return compare(label, actual, expected, kGdnInputProjA16Tolerance);
+    return compare(label, actual, expected, criterion);
 }
 
 int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_weight,
@@ -143,9 +156,9 @@ int run_w8_q08_case(DevicePackedWeight& parent, std::int32_t tokens) {
     failures += qkv.verify_fully_written("gdn qkv" + suffix);
     failures += z.verify_fully_written("gdn z" + suffix);
     failures += verify_output_range("gdn qkv" + suffix, qkv, kQkvRows, 0, kQkvRows, parent.host, 0,
-                                    activation, kHidden, tokens);
+                                    activation, kHidden, tokens, kGdnInputProjW8UlpTolerance);
     failures += verify_output_range("gdn z" + suffix, z, kZRows, 0, kZRows, parent.host, kQkvRows,
-                                    activation, kHidden, tokens);
+                                    activation, kHidden, tokens, kGdnInputProjW8UlpTolerance);
     failures += verify_preserved("gdn x" + suffix, device_activation, activation_bits);
     failures += parent.verify_preserved("gdn parent weight" + suffix);
     return failures;
