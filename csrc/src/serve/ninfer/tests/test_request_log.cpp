@@ -342,7 +342,8 @@ int main() {
     const std::string console_prefix =
         format_console_log_prefix(std::chrono::system_clock::time_point{}, ConsoleLogLevel::Info);
     failures += check(console_prefix.starts_with('[') &&
-                          console_prefix.ends_with("] [info] ninfer-serve: "),
+                          // surogate vendor patch (PATCHES.md #11): renamed prefix.
+                          console_prefix.ends_with("] [info] surogate-engine: "),
                       "console log prefix mismatch");
 
     const std::filesystem::path log_path =

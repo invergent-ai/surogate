@@ -54,6 +54,8 @@
    Output names `surogate-engine` (HTTP server) and `surogate-engine-cli`
    (one-shot CLI); the console log prefix follows. Upstream attribution stays
    in NOTICE — process names and logs carry the product's name.
+    The console-prefix expectation in `tests/test_request_log.cpp` is
+    updated to the renamed `surogate-engine: ` prefix.
 12. `tools/convert/qwen3_6/common/official_resources.py` — GGUF-sourced
    conversions reconstruct tokenizer.json/tokenizer_config.json/
    chat_template.jinja from the GGUF's own KV metadata (semantically
