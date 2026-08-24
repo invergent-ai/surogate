@@ -4,15 +4,18 @@
 # GGUF ingest for `surogate serve` (design/serve-engine-plan.md §5.1, §5.2b).
 #
 # Strategy (v0): bridge GGUF to the exact input the vendored converter already
-# accepts — a temporary HF-layout directory with BF16 safetensors shards, a
-# config.json synthesized from GGUF KV metadata, and the pinned official
-# frontend resources (tokenizer/chat template) fetched from the canonical repo
-# (the converter SHA-256-verifies them). The unpatched converter then runs with
-# all of its own preflight checks. Costs one temporary BF16 materialization on
-# disk (~2 bytes/param, deleted after conversion); a reader-injection path that
-# avoids the temp copy is a tracked follow-up. K-quant sources are dequantized
-# to BF16 and re-encoded by the recipe (double quantization vs the original
-# BF16 checkpoint — documented; native K-quant repack is the plan's §5.2 path).
+# accepts — a temporary HF-layout directory with BF16 safetensors shards. Fully
+# offline: the tokenizer and chat template are reconstructed from the GGUF's
+# own KV metadata (frontend.py), the checkpoint-invariant config files come
+# from vendored per-target resources (surogate/serve/resources/), and family
+# modules (qwen35.py) invert llama.cpp's export transforms. The converter then
+# runs with its own preflight checks (NINFER_ALLOW_DERIVED_FRONTEND downgrades
+# the tokenizer pinned-hash check to a recorded warning — the reconstruction is
+# semantically equivalent, not byte-identical). Costs one temporary BF16
+# materialization on disk (~2 bytes/param, deleted after conversion); a
+# reader-injection path that avoids the temp copy is a tracked follow-up.
+# K-quant sources are dequantized to BF16 and re-encoded by the recipe (one
+# documented double quantization; native K-quant repack is the plan's §5.2 path).
 
 from __future__ import annotations
 
@@ -20,21 +23,17 @@ import json
 import shutil
 from pathlib import Path
 
-# Canonical repos for the pinned frontend resources per registered target key.
-_OFFICIAL_REPO = {
-    "qwen3_6_27b": "Qwen/Qwen3.6-27B",
-    "qwen3_8_27b": "Qwen/Qwen3.8-27B",
-    "qwen3_6_35b_a3b": "Qwen/Qwen3.6-35B-A3B",
-}
+# Checkpoint-invariant static resources per registered target, vendored under
+# surogate/serve/resources/<target_key>/ (see its README for provenance). The
+# tokenizer and chat template are NOT static files — they are reconstructed
+# from the GGUF itself (frontend.py) so local GGUF serving stays fully offline.
+_RESOURCES_DIR = Path(__file__).resolve().parent.parent / "resources"
 
-_RESOURCE_FILES = [
-    "tokenizer.json",
-    "tokenizer_config.json",
-    "chat_template.jinja",
+_STATIC_RESOURCE_FILES = [
+    "config.json",
     "generation_config.json",
     "preprocessor_config.json",
     "video_preprocessor_config.json",
-    "config.json",  # official config: authoritative geometry, overrides KV synth
 ]
 
 _SHARD_BYTES = 8 << 30
@@ -51,7 +50,10 @@ def read_gguf_summary(gguf_path: Path) -> dict:
     """Cheap metadata pass: architecture + geometry from GGUF KV, no tensor data."""
     from gguf import GGUFReader
 
-    reader = GGUFReader(str(gguf_path), "r")
+    try:
+        reader = GGUFReader(str(gguf_path), "r")
+    except Exception as exc:
+        raise SystemExit(f"surogate serve: '{gguf_path}' is not a readable GGUF file ({exc}).")
     arch_field = reader.get_field("general.architecture")
     arch = arch_field.contents() if arch_field is not None else ""
     summary = {
@@ -111,27 +113,53 @@ def build_hf_dir_from_gguf(gguf_path: Path, target_key: str, work_dir: Path, *, 
     import torch
     from gguf import GGUFReader
     from gguf.quants import dequantize
-    from huggingface_hub import hf_hub_download
     from safetensors.torch import save_file
 
     work_dir.mkdir(parents=True, exist_ok=True)
-
-    # 1. Pinned official frontend resources (converter hash-verifies these).
-    repo = _OFFICIAL_REPO[target_key]
-    echo(f"surogate serve: fetching pinned frontend resources from {repo}")
-    for fname in _RESOURCE_FILES:
-        try:
-            src = hf_hub_download(repo, fname)
-        except Exception:
-            continue  # optional files (e.g. video preprocessor) may not exist
-        shutil.copy(src, work_dir / fname)
-    if not (work_dir / "config.json").is_file():
-        raise SystemExit(f"surogate serve: could not fetch config.json from {repo}.")
-
-    # 2. Dequantize tensors to BF16 and write sharded safetensors with HF names.
     reader = GGUFReader(str(gguf_path), "r")
     arch = reader.get_field("general.architecture").contents()
+
+    # 1. Frontend: tokenizer + chat template reconstructed from the GGUF
+    #    itself (fully offline); checkpoint-invariant config files from the
+    #    vendored per-target resources.
+    from surogate.serve.gguf.frontend import write_frontend
+
+    write_frontend(reader, arch, work_dir, echo=echo)
+    static_dir = _RESOURCES_DIR / target_key
+    for fname in _STATIC_RESOURCE_FILES:
+        src = static_dir / fname
+        if src.is_file():
+            shutil.copy(src, work_dir / fname)
+    if not (work_dir / "config.json").is_file():
+        raise SystemExit(
+            f"surogate serve: missing vendored config.json for target '{target_key}' "
+            f"(expected at {static_dir})."
+        )
+
+    # 2. Dequantize tensors to BF16 and write sharded safetensors with HF names.
     n_layers = int(_arch_kv(reader, arch, "block_count", 0))
+
+    # Family-specific handling: llama.cpp does NOT store HF-layout tensors for
+    # the qwen35 family — it folds norms (+1), stores -exp(A_log), renames
+    # dt_bias, squeezes conv1d, reorders V heads, and remaps mtp.* into extra
+    # layers. surogate/serve/gguf/qwen35.py inverts all of that; skipping it
+    # would produce silently damaged weights.
+    qwen35_family = arch in ("qwen35", "qwen35moe")
+    if qwen35_family:
+        from surogate.serve.gguf import qwen35 as fam
+
+        n_mtp = int(_arch_kv(reader, arch, "nextn_predict_layers", 0) or 0)
+        n_main = n_layers - n_mtp
+        num_v = int(_arch_kv(reader, arch, "ssm.time_step_rank", 0) or 0)
+        inner = int(_arch_kv(reader, arch, "ssm.inner_size", 0) or 0)
+        geom = fam.GdnGeometry(
+            num_k_heads=int(_arch_kv(reader, arch, "ssm.group_count", 0) or 0),
+            num_v_heads=num_v,
+            head_k_dim=int(_arch_kv(reader, arch, "ssm.state_size", 0) or 0),
+            head_v_dim=(inner // num_v) if num_v else 0,
+        )
+        echo(f"surogate serve: qwen35 inverse transforms active "
+             f"(layers {n_main}+{n_mtp} mtp, GDN {geom.num_k_heads}k/{geom.num_v_heads}v)")
     name_map = _hf_name_map(arch, n_layers)
 
     weight_map: dict[str, str] = {}
@@ -154,7 +182,10 @@ def build_hf_dir_from_gguf(gguf_path: Path, target_key: str, work_dir: Path, *, 
         shard_bytes = 0
 
     for i, tensor in enumerate(reader.tensors):
-        hf_name = name_map.get(tensor.name)
+        if qwen35_family:
+            hf_name = fam.hf_name_for(tensor.name, n_main)
+        else:
+            hf_name = name_map.get(tensor.name)
         if hf_name is None:
             raise SystemExit(
                 f"surogate serve: GGUF tensor '{tensor.name}' has no HF mapping for "
@@ -163,7 +194,11 @@ def build_hf_dir_from_gguf(gguf_path: Path, target_key: str, work_dir: Path, *, 
         data = dequantize(tensor.data, tensor.tensor_type)
         # GGUF stores dims innermost-first; HF convention is the reverse.
         array = np.ascontiguousarray(data.reshape(tuple(reversed(tensor.shape.tolist()))))
-        t = torch.from_numpy(array).to(torch.bfloat16)
+        t = torch.from_numpy(array)
+        if qwen35_family:
+            # Undo llama.cpp's export transforms (fp32 math, then narrow).
+            t = fam.invert_tensor(hf_name, t, geom)
+        t = t.to(torch.bfloat16)
         shard[hf_name] = t
         shard_bytes += t.numel() * 2
         total_bytes += t.numel() * 2

@@ -14,11 +14,19 @@ import sys
 from pathlib import Path
 
 _USAGE = """\
-usage: surogate serve <model.ninfer> [engine options...]
-       surogate serve --generate <model.ninfer> --prompt "..." [options...]
+usage: surogate serve <model> [engine options...]
+       surogate serve --generate <model> --prompt "..." [options...]
 
-Serve a model over OpenAI-/Anthropic-compatible HTTP (default), or run a
-one-shot generation with --generate (streams the answer to stdout).
+<model> is a Hugging Face repo id, a local safetensors model directory, or a
+GGUF file. First use converts transparently into a local cache; after that,
+loads are instant.
+
+  surogate serve Qwen/Qwen3.6-27B
+  surogate serve ~/models/qwen3.6-27b-hf/
+  surogate serve ~/models/qwen3.6-27b-Q4_K_M.gguf
+
+Serves OpenAI-/Anthropic-compatible HTTP (default), or runs a one-shot
+generation with --generate (streams the answer to stdout).
 
 Common engine options (full list: surogate serve --engine-help):
   --host 0.0.0.0 --port 8080     bind address (server mode)
@@ -29,9 +37,9 @@ Common engine options (full list: surogate serve --engine-help):
   --kv-dtype bf16|int8           KV cache precision
 
 The engine binary is resolved from, in order:
-  1. $SUROGATE_SERVE_BIN / $SUROGATE_NINFER_BIN (explicit paths)
+  1. $SUROGATE_SERVE_BIN / $SUROGATE_ENGINE_CLI_BIN (explicit paths)
   2. the repo build tree (csrc/build-serve/apps/) when running from a checkout
-  3. $PATH (ninfer-serve / ninfer)
+  3. $PATH (surogate-engine / surogate-engine-cli)
 Build it from a checkout with: make serve-build
 """
 
@@ -43,8 +51,8 @@ def _repo_root() -> Path | None:
 
 
 def _resolve_binary(server_mode: bool) -> str | None:
-    name = "ninfer-serve" if server_mode else "ninfer"
-    env = os.environ.get("SUROGATE_SERVE_BIN" if server_mode else "SUROGATE_NINFER_BIN")
+    name = "surogate-engine" if server_mode else "surogate-engine-cli"
+    env = os.environ.get("SUROGATE_SERVE_BIN" if server_mode else "SUROGATE_ENGINE_CLI_BIN")
     if env and Path(env).is_file():
         return env
     root = _repo_root()
@@ -77,7 +85,7 @@ def maybe_exec_serve() -> None:
 
     binary = _resolve_binary(server_mode)
     if binary is None:
-        name = "ninfer-serve" if server_mode else "ninfer"
+        name = "surogate-engine" if server_mode else "surogate-engine-cli"
         sys.stderr.write(
             f"surogate serve: engine binary '{name}' not found.\n"
             "Build it first:  make serve-build   (from the surogate repo root)\n"
@@ -98,7 +106,7 @@ def maybe_exec_serve() -> None:
         None,
     )
     if model_index is not None:
-        from surogate.cli.serve_ingest import ensure_engine_weights
+        from surogate.serve.ingest import ensure_engine_weights
 
         resolved = ensure_engine_weights(rest[model_index],
                                          echo=lambda m: print(m, file=sys.stderr))

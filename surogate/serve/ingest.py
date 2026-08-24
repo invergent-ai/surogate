@@ -124,12 +124,12 @@ def _gguf_fingerprint(path: Path) -> str:
 def _ensure_from_gguf(gguf_path: Path, *, echo=print) -> Path:
     """GGUF → temp HF dir (dequant BF16) → vendored converter → cached weights.
 
-    v0 bridge (surogate/cli/serve_gguf.py): correctness inherits the converter's
+    v0 bridge (surogate/serve/gguf/bridge.py): correctness inherits the converter's
     own preflight/hash checks; K-quant sources pay one documented
     double-quantization vs the original BF16 checkpoint. Temp BF16 shards
     (~2 bytes/param) are deleted after conversion.
     """
-    from surogate.cli import serve_gguf
+    from surogate.serve.gguf import bridge as serve_gguf
 
     root = _ninfer_root()
     if root is None:
@@ -154,12 +154,13 @@ def _ensure_from_gguf(gguf_path: Path, *, echo=print) -> Path:
     work = cache_dir() / f"gguf-bridge-{fp}"
     try:
         model_dir = serve_gguf.build_hf_dir_from_gguf(gguf_path, target_key, work, echo=echo)
-        return _run_converter_cached(model_dir, out, echo=echo)
+        return _run_converter_cached(model_dir, out, echo=echo, derived_frontend=True)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
 
-def _run_converter_cached(model_dir: Path, out: Path, *, echo=print) -> Path:
+def _run_converter_cached(model_dir: Path, out: Path, *, echo=print,
+                          derived_frontend: bool = False) -> Path:
     """Shared converter driver: model_dir (HF layout) → atomic-published `out`."""
     root = _ninfer_root()
     config = _flatten_text_config(json.loads((model_dir / "config.json").read_text()))
@@ -177,6 +178,9 @@ def _run_converter_cached(model_dir: Path, out: Path, *, echo=print) -> Path:
         echo("DRY: " + " ".join(cmd))
         raise SystemExit(0)
     env = {**os.environ, "PYTHONPATH": str(root) + os.pathsep + os.environ.get("PYTHONPATH", "")}
+    if derived_frontend:
+        # GGUF-sourced: tokenizer reconstructed from KV (PATCHES.md #12).
+        env["NINFER_ALLOW_DERIVED_FRONTEND"] = "1"
     result = subprocess.run(cmd, cwd=root, env=env)
     if result.returncode != 0 or not tmp.is_file():
         tmp.unlink(missing_ok=True)

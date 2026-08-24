@@ -37,6 +37,23 @@ OFFICIAL_RESOURCE_SHA256 = {
 }
 
 
+def _derived_frontend_allowed() -> bool:
+    # surogate vendor patch (csrc/src/serve/PATCHES.md #12): GGUF-sourced
+    # conversions reconstruct the tokenizer from the GGUF's own KV metadata
+    # (semantically equivalent, not byte-identical), so the pinned-hash check
+    # downgrades to a recorded warning for the derived files when this
+    # environment variable is set by the ingest layer. Safetensors-sourced
+    # conversions never set it and keep the strict check.
+    import os
+
+    return os.environ.get("NINFER_ALLOW_DERIVED_FRONTEND", "") == "1"
+
+
+_DERIVABLE_RESOURCES = frozenset(
+    {"frontend/tokenizer.json", "frontend/tokenizer_config.json", "frontend/chat_template.jinja"}
+)
+
+
 def validate_official_resource_hashes(
     actual_hashes: Mapping[str, str],
 ) -> None:
@@ -49,10 +66,21 @@ def validate_official_resource_hashes(
             "Qwen3.6 frontend resource set mismatch: "
             f"expected {expected_names!r}, got {actual_names!r}"
         )
+    derived_ok = _derived_frontend_allowed()
     for name, expected in OFFICIAL_RESOURCE_SHA256.items():
         actual = actual_hashes[name]
         if actual != expected:
             filename = name.removeprefix("frontend/")
+            if derived_ok and name in _DERIVABLE_RESOURCES:
+                import sys
+
+                print(
+                    f"warning: derived frontend resource {filename}: "
+                    f"sha256 {actual} differs from pinned official {expected} "
+                    "(NINFER_ALLOW_DERIVED_FRONTEND=1)",
+                    file=sys.stderr,
+                )
+                continue
             raise ValueError(
                 f"official Qwen3.6 resource hash mismatch for {filename}: "
                 f"expected {expected}, got {actual}"

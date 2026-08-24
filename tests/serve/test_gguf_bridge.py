@@ -1,7 +1,7 @@
 # Copyright (c) 2026, Invergent SA, developed by Flavius Burca
 # SPDX-License-Identifier: Apache-2.0
 #
-# Structural tests for the GGUF ingest bridge (surogate/cli/serve_gguf.py):
+# Structural tests for the GGUF ingest bridge (surogate/serve/gguf/bridge.py):
 # a synthetic GGUF written with gguf-py round-trips through the bridge's
 # primitives — KV summary, gguf->HF tensor-name inversion, reversed-dims
 # shape restore, and dequantization against gguf-py's own reference.
@@ -15,7 +15,7 @@ gguf = pytest.importorskip("gguf")
 from gguf import GGUFReader, GGUFWriter
 from gguf.quants import dequantize, quantize
 
-from surogate.cli.serve_gguf import _hf_name_map, gguf_target_key, read_gguf_summary
+from surogate.serve.gguf.bridge import _hf_name_map, gguf_target_key, read_gguf_summary
 
 
 ARCH = "qwen3"  # canonical small dense arch present in gguf-py's mapping table

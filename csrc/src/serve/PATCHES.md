@@ -50,6 +50,19 @@
    tracked follow-up (W4A4 is permanently sm_120-only by hardware).
 10. `CMakeLists.txt` — `NINFER_ALLOW_PORT_ARCH` opt-in allows configuring
    architectures beyond upstream's hard 120a gate, for the port effort.
+11. `apps/CMakeLists.txt` + `src/serve/console_log.cpp` — product binary names.
+   Output names `surogate-engine` (HTTP server) and `surogate-engine-cli`
+   (one-shot CLI); the console log prefix follows. Upstream attribution stays
+   in NOTICE — process names and logs carry the product's name.
+12. `tools/convert/qwen3_6/common/official_resources.py` — GGUF-sourced
+   conversions reconstruct tokenizer.json/tokenizer_config.json/
+   chat_template.jinja from the GGUF's own KV metadata (semantically
+   equivalent — encode-identical, tests/serve/test_gguf_frontend.py — but not
+   byte-identical to the pinned official files). With
+   `NINFER_ALLOW_DERIVED_FRONTEND=1` (set only by the GGUF ingest path in
+   surogate/serve/ingest.py) the pinned-hash mismatch for those three files
+   downgrades to a recorded stderr warning; safetensors-sourced conversions
+   keep the strict check.
 
 ### sm_89 port status
 

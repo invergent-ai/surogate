@@ -42,7 +42,7 @@ std::string format_console_log_prefix(std::chrono::system_clock::time_point time
 
     std::ostringstream out;
     out << '[' << std::put_time(&local, "%Y-%m-%d %H:%M:%S") << '.' << std::setfill('0')
-        << std::setw(3) << milliseconds << "] [" << level_name(level) << "] ninfer-serve: ";
+        << std::setw(3) << milliseconds << "] [" << level_name(level) << "] surogate-engine: ";
     return out.str();
 }
 

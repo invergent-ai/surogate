@@ -18,3 +18,9 @@ def pytest_collection_modifyitems(config, items):
 
 def pytest_addoption(parser):
     parser.addoption("--no-gpu", action="store_true", default=False, help="Skip tests that require GPU")
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers", "network: test needs internet access (skipped/failing offline is expected)"
+    )
