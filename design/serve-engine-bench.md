@@ -159,3 +159,31 @@ Long-prompt exactness verified with A8 fully active on both models.
 | 2B decode | **320-330** | 196-197 | — |
 
 **The engine now leads vLLM at every measured point on both models.**
+
+
+# vLLM NVFP4 column (4-bit — a different accuracy class)
+
+`surogate/Qwen3.5-{0.8B,2B}-NVFP4` (modelopt) on the same vLLM build.
+NVFP4 weighs HALF the engine's W8 (4-bit vs 8-bit weights) and runs
+sm_120's FP4 tensor cores at ~2x the int8 rate — it buys that speed with
+real quantization loss, so this is a speed-vs-quality tradeoff column,
+not an equal-quality comparison.
+
+| point | engine (W8, 8-bit) | vLLM NVFP4 (4-bit) |
+|---|---:|---:|
+| 0.8B prefill @472 | **25,782** | 25,428 |
+| 0.8B prefill @962 | **46,476** | 22,344 |
+| 0.8B prefill @1912 | **63,843** | 38,685 |
+| 0.8B decode | **450-470** | 386-390 |
+| 2B prefill @232 | 9,921 | **12,337** |
+| 2B prefill @472 | 15,362 | **24,057** |
+| 2B prefill @962 | **28,642** | 22,660 |
+| 2B prefill @1912 | 37,765 | **44,754** |
+| 2B decode | **320-330** | 256-258 |
+
+Reading: the 0.8B sweep holds against every vLLM config including NVFP4.
+At the 2B, 4-bit FP4 tensor cores take the mid/long prefill points
+(engine holds decode +25% and the 962 point where their FP4 graph path
+dips); matching that in-class would mean an NVFP4 profile for the small
+targets (the engine already carries NVFP4 kernels for the 27B family) —
+a quality-tradeoff option, not a correction.
