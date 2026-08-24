@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -114,6 +115,76 @@ def resolve_hf_repo(repo_id: str) -> Path:
     return Path(path)
 
 
+def _gguf_fingerprint(path: Path) -> str:
+    st = path.stat()
+    h = hashlib.sha256(f"{path.name}:{st.st_size}:{st.st_mtime_ns}".encode())
+    return h.hexdigest()[:24]
+
+
+def _ensure_from_gguf(gguf_path: Path, *, echo=print) -> Path:
+    """GGUF → temp HF dir (dequant BF16) → vendored converter → cached weights.
+
+    v0 bridge (surogate/cli/serve_gguf.py): correctness inherits the converter's
+    own preflight/hash checks; K-quant sources pay one documented
+    double-quantization vs the original BF16 checkpoint. Temp BF16 shards
+    (~2 bytes/param) are deleted after conversion.
+    """
+    from surogate.cli import serve_gguf
+
+    root = _ninfer_root()
+    if root is None:
+        raise SystemExit("surogate serve: vendored engine tree not found (run from a checkout).")
+
+    target_key = serve_gguf.gguf_target_key(gguf_path)
+    if target_key is None:
+        s = serve_gguf.read_gguf_summary(gguf_path)
+        raise SystemExit(
+            "surogate serve: this GGUF is not yet supported by the native engine.\n"
+            f"  architecture={s['architecture']!r} hidden={s['hidden_size']} "
+            f"layers={s['num_hidden_layers']} quants={s['quant_types']}\n"
+            "  Registered today: Qwen3.6-27B, Qwen3.8-27B, Qwen3.6-35B-A3B."
+        )
+
+    fp = _gguf_fingerprint(gguf_path)
+    out = cache_dir() / f"{target_key}-gguf-{fp}.ninfer"
+    if out.is_file() and out.stat().st_size > 0:
+        echo(f"surogate serve: using cached engine weights ({out.name})")
+        return out
+
+    work = cache_dir() / f"gguf-bridge-{fp}"
+    try:
+        model_dir = serve_gguf.build_hf_dir_from_gguf(gguf_path, target_key, work, echo=echo)
+        return _run_converter_cached(model_dir, out, echo=echo)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _run_converter_cached(model_dir: Path, out: Path, *, echo=print) -> Path:
+    """Shared converter driver: model_dir (HF layout) → atomic-published `out`."""
+    root = _ninfer_root()
+    config = _flatten_text_config(json.loads((model_dir / "config.json").read_text()))
+    target = converter_for_config(config)
+    if target is None:
+        raise SystemExit("surogate serve: internal error — bridged model dir maps to no converter.")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_suffix(".ninfer.partial")
+    tmp.unlink(missing_ok=True)
+    echo(f"surogate serve: preparing engine weights for {target.display} "
+         f"(one-time conversion; cached at {out})")
+    cmd = [sys.executable, "-m", target.module, "--model", str(model_dir), "--out", str(tmp)]
+    if os.environ.get("SUROGATE_SERVE_DRY"):
+        echo("DRY: cwd=" + str(root))
+        echo("DRY: " + " ".join(cmd))
+        raise SystemExit(0)
+    env = {**os.environ, "PYTHONPATH": str(root) + os.pathsep + os.environ.get("PYTHONPATH", "")}
+    result = subprocess.run(cmd, cwd=root, env=env)
+    if result.returncode != 0 or not tmp.is_file():
+        tmp.unlink(missing_ok=True)
+        raise SystemExit(f"surogate serve: conversion failed (exit {result.returncode}).")
+    tmp.replace(out)
+    return out
+
+
 def ensure_engine_weights(spec: str, *, echo=print) -> Path:
     """Resolve `spec` (safetensors dir | HF repo id | GGUF | internal artifact)
     to an engine-loadable weights file, converting through the transparent
@@ -125,10 +196,7 @@ def ensure_engine_weights(spec: str, *, echo=print) -> Path:
         return Path(spec)
 
     if kind == "gguf":
-        raise SystemExit(
-            "surogate serve: GGUF ingest is not wired yet (next increment; "
-            "design/serve-engine-plan.md §5.1). Use a safetensors repo for now."
-        )
+        return _ensure_from_gguf(Path(spec).resolve(), echo=echo)
 
     if kind == "hf_repo_id":
         echo(f"surogate serve: resolving Hugging Face repo '{spec}'...")
@@ -161,21 +229,4 @@ def ensure_engine_weights(spec: str, *, echo=print) -> Path:
     if out.is_file() and out.stat().st_size > 0:
         echo(f"surogate serve: using cached engine weights ({out.name})")
         return out
-
-    out.parent.mkdir(parents=True, exist_ok=True)
-    tmp = out.with_suffix(".ninfer.partial")
-    tmp.unlink(missing_ok=True)
-    echo(f"surogate serve: preparing engine weights for {target.display} "
-         f"(one-time conversion; cached at {out})")
-    cmd = [sys.executable, "-m", target.module, "--model", str(model_dir), "--out", str(tmp)]
-    if os.environ.get("SUROGATE_SERVE_DRY"):
-        echo("DRY: cwd=" + str(root))
-        echo("DRY: " + " ".join(cmd))
-        raise SystemExit(0)
-    env = {**os.environ, "PYTHONPATH": str(root) + os.pathsep + os.environ.get("PYTHONPATH", "")}
-    result = subprocess.run(cmd, cwd=root, env=env)
-    if result.returncode != 0 or not tmp.is_file():
-        tmp.unlink(missing_ok=True)
-        raise SystemExit(f"surogate serve: conversion failed (exit {result.returncode}).")
-    tmp.replace(out)  # atomic publish: a crashed conversion never poisons the cache
-    return out
+    return _run_converter_cached(model_dir, out, echo=echo)
