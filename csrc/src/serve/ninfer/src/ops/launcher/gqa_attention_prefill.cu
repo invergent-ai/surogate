@@ -130,6 +130,11 @@ void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positi
                                                                  metadata, out, stream);
         return;
     }
+    if (q.ne[1] == Gqa08Geometry::QHeads) {
+        gqa_attention_prompt_attention_launch_for<Gqa08Geometry>(q, positions, scale, cache,
+                                                                 metadata, out, stream);
+        return;
+    }
     gqa_attention_prompt_attention_launch_for<Gqa35Geometry>(q, positions, scale, cache, metadata,
                                                              out, stream);
 }
@@ -160,6 +165,13 @@ void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor&
         if (q.ne[1] == Gqa27Geometry::QHeads) {
             gqa_kv_append_launch_for<Gqa27Geometry>(k, v, positions, cache, metadata, stream);
             gqa_attention_prompt_attention_launch_for<Gqa27Geometry>(q, positions, scale, cache,
+                                                                     metadata, out, stream);
+            return;
+        }
+        if (q.ne[1] == Gqa08Geometry::QHeads) {
+            // KV append is GroupSize-independent; Gqa08's KVHeads matches.
+            gqa_kv_append_launch_for<Gqa08Geometry>(k, v, positions, cache, metadata, stream);
+            gqa_attention_prompt_attention_launch_for<Gqa08Geometry>(q, positions, scale, cache,
                                                                      metadata, out, stream);
             return;
         }

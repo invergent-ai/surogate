@@ -85,3 +85,15 @@ CPU pass on this host (`CUDA_VISIBLE_DEVICES="" ctest`): 83/89 after patch 4.
 - `ninfer_linear_swiglu_{q4,w8,nvfp4,fp8}_test` report FAIL instead of SKIP
   when no CUDA device is visible (upstream skip-handling quirk); they belong
   to the GPU pass.
+13. **qwen3.5-0.8b shape admissions (IN PROGRESS).** Runtime whitelist
+   extensions for the first new geometry, found by the E2E worklist protocol
+   (run `surogate-engine-cli <0.8b artifact>` on an idle GPU; each failure
+   names the next family). DONE: gqa_attention wrapper 8q/2kv; Gqa08Geometry
+   <8,2,2> + Q-keyed dispatch branches (decode capacity/small_t/cached,
+   prefill prompt/combined — KV-append reuses Gqa35, GroupSize-independent);
+   GroupSize==4 launch-tuple tables (Wc/RowTiles must divide 32 into
+   {2,4,8,16}); q5 linear_add {1024,2048},{1024,3584} on the 6144 route
+   thresholds. NEXT (in error order): bf16 gdn_gating (needs Bf16Gdn08Geometry
+   {16,1024,64} + twins of the nine *_35_* launchers keyed on a_weight.n==16),
+   then whatever the protocol surfaces (expected: q4 linear_swiglu, q4_q5
+   gdn/attn input, w8 mtp, q6 embedding/head).

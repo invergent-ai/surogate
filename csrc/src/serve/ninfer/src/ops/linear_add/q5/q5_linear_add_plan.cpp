@@ -31,9 +31,12 @@ struct RouteSpec {
     Q5LinearAddScheduleId schedule;
 };
 
-constexpr std::array<SupportSpec, 2> kSupports{{
+constexpr std::array<SupportSpec, 4> kSupports{{
     {5120, 6144, 6144},
     {5120, 17408, 17408},
+    // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b shapes.
+    {1024, 2048, 2048},
+    {1024, 3584, 3584},
 }};
 
 constexpr std::array<RouteSpec, 6> kK6144Routes{{
@@ -113,7 +116,10 @@ Q5LinearAddPlan q5_linear_add_resolve_plan(const Q5LinearAddProblem& problem) {
         }
         throw std::logic_error("q5 linear_add: admitted problem has no covering route");
     };
-    return problem.k == 6144 ? resolve_from(kK6144Routes) : resolve_from(kK17408Routes);
+    // 0.8b Ks reuse the 6144 route thresholds (schedules are shape-generic).
+    return (problem.k == 6144 || problem.k == 2048 || problem.k == 3584)
+               ? resolve_from(kK6144Routes)
+               : resolve_from(kK17408Routes);
 }
 
 std::size_t q5_linear_add_capacity_workspace_bytes(std::int32_t rows, std::int32_t k,

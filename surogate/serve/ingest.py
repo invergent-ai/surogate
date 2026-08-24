@@ -64,6 +64,9 @@ def converter_for_config(config: dict) -> ConverterTarget | None:
 
     # Registered geometries (vendored targets). Text-config nesting (VL-style
     # configs) is flattened by callers before this point.
+    if model_type == "qwen3_5" and hidden == 1024 and layers == 24:
+        return ConverterTarget("qwen3_5_0_8b", "tools.convert.qwen3_5_0_8b.convert",
+                               "Qwen3.5-0.8B")
     if model_type in ("qwen3_5", "qwen3_6") and hidden == 5120 and layers >= 60:
         if nvfp4:
             return ConverterTarget("qwen3_6_27b_nvfp4", "tools.convert.qwen3_6_27b.convert_nvfp4",
@@ -81,7 +84,13 @@ def converter_for_config(config: dict) -> ConverterTarget | None:
 
 
 def _flatten_text_config(config: dict) -> dict:
-    return {**config, **config["text_config"]} if isinstance(config.get("text_config"), dict) else config
+    if not isinstance(config.get("text_config"), dict):
+        return config
+    # Geometry comes from text_config, but the ROOT model_type is the family
+    # identity ("qwen3_5"); the nested one is the "_text" variant. Keep root's.
+    merged = {**config, **config["text_config"]}
+    merged["model_type"] = config.get("model_type", merged.get("model_type"))
+    return merged
 
 
 def source_fingerprint(model_dir: Path) -> str:
@@ -173,6 +182,8 @@ def _run_converter_cached(model_dir: Path, out: Path, *, echo=print,
     echo(f"surogate serve: preparing engine weights for {target.display} "
          f"(one-time conversion; cached at {out})")
     cmd = [sys.executable, "-m", target.module, "--model", str(model_dir), "--out", str(tmp)]
+    if os.environ.get("SUROGATE_CONVERT_DEVICE"):
+        cmd += ["--device", os.environ["SUROGATE_CONVERT_DEVICE"]]
     if os.environ.get("SUROGATE_SERVE_DRY"):
         echo("DRY: cwd=" + str(root))
         echo("DRY: " + " ".join(cmd))

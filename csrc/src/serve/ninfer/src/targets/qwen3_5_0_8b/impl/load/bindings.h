@@ -18,9 +18,9 @@
 
 namespace ninfer::targets::qwen3_5_0_8b::detail {
 
-inline constexpr std::size_t kTextLayers          = 64;
-inline constexpr std::size_t kFullAttentionLayers = 16;
-inline constexpr std::size_t kGdnLayers           = 48;
+inline constexpr std::size_t kTextLayers          = 24;
+inline constexpr std::size_t kFullAttentionLayers = 6;
+inline constexpr std::size_t kGdnLayers           = 18;
 
 struct WeightPlan {
     artifact::ObjectHandle object;

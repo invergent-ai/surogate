@@ -154,7 +154,19 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
     if constexpr (TokenTile == 6) {
         // Small grids need more warps per CTA. From 2K to 8K, Bc=64 halves key
         // loop iterations; dynamic smem avoids penalizing the long-context path.
-        if (implementation_window > 128 && implementation_window <= 160) {
+        if constexpr (Geometry::GroupSize == 4) {
+            // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b. RowTiles=2
+            // here, so Wc must keep Wc/RowTiles in {2,4,8,16}.
+            if (implementation_window > 128 && implementation_window <= 160) {
+                launch.template operator()<32, 1, 32, false>();
+            } else if (implementation_window <= 2054) {
+                launch.template operator()<16, 1, 32, false>();
+            } else if (implementation_window <= 8198) {
+                launch.template operator()<16, 1, 64, true>();
+            } else {
+                launch.template operator()<8, 2, 32, false>();
+            }
+        } else if (implementation_window > 128 && implementation_window <= 160) {
             launch.template operator()<24, 1, 32, false>();
         } else if (implementation_window <= 2054) {
             launch.template operator()<12, 1, 32, false>();
@@ -164,7 +176,16 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
             launch.template operator()<6, 2, 32, false>();
         }
     } else if constexpr (TokenTile == 5) {
-        if constexpr (Geometry::GroupSize == 6) {
+        if constexpr (Geometry::GroupSize == 4) {
+            // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b (RowTiles=2).
+            if (implementation_window > 128 && implementation_window <= 512) {
+                launch.template operator()<32, 1, 32, false>();
+            } else if (implementation_window <= 1029) {
+                launch.template operator()<16, 1, 32, false>();
+            } else {
+                launch.template operator()<8, 2, 32, false>();
+            }
+        } else if constexpr (Geometry::GroupSize == 6) {
             // Two Q row tiles for the 27B group of six.
             if (implementation_window > 128 && implementation_window <= 512) {
                 launch.template operator()<32, 1, 32, false>();
@@ -228,6 +249,9 @@ std::int32_t gqa_attention_split_capacity(std::int32_t q_heads, std::int32_t tok
     }
     if (q_heads == Gqa35Geometry::QHeads) {
         return gqa_small_t_launch_capacity<Gqa35Geometry>(envelope, tokens, cache_dtype);
+    }
+    if (q_heads == Gqa08Geometry::QHeads) {
+        return gqa_small_t_launch_capacity<Gqa08Geometry>(envelope, tokens, cache_dtype);
     }
     throw std::invalid_argument("gqa_attention split capacity: unsupported head geometry");
 }
@@ -367,6 +391,12 @@ void gqa_attention_small_t_launch(const Tensor& q, const Tensor& k, const Tensor
                                                         out, stream);
         return;
     }
+    if (q.ne[1] == Gqa08Geometry::QHeads) {
+        gqa_attention_small_t_launch_for<Gqa08Geometry>(q, input, pos, scale, cache, invocation,
+                                                        envelope, partial_acc, partial_m, partial_l,
+                                                        out, stream);
+        return;
+    }
     gqa_attention_small_t_launch_for<Gqa35Geometry>(q, input, pos, scale, cache, invocation,
                                                     envelope, partial_acc, partial_m, partial_l,
                                                     out, stream);
@@ -389,6 +419,12 @@ void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, flo
     const PagedKVBatchLayerView batch_cache = single_row_batch_view(cache);
     if (q.ne[1] == Gqa27Geometry::QHeads) {
         gqa_attention_small_t_launch_for<Gqa27Geometry>(q, input, pos, scale, batch_cache,
+                                                        invocation, envelope, partial_acc,
+                                                        partial_m, partial_l, out, stream);
+        return;
+    }
+    if (q.ne[1] == Gqa08Geometry::QHeads) {
+        gqa_attention_small_t_launch_for<Gqa08Geometry>(q, input, pos, scale, batch_cache,
                                                         invocation, envelope, partial_acc,
                                                         partial_m, partial_l, out, stream);
         return;

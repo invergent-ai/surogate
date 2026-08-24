@@ -347,10 +347,10 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
         return 0;
     case WeightsProfile::Qwen36Nvfp4:
         return ops::attn_input_proj_workspace_capacity_bytes(
-            QType::NVFP4, 14336, TextConfig::hidden, kNvfp4TextPolicy, first, last);
+            QType::NVFP4, 5120, TextConfig::hidden, kNvfp4TextPolicy, first, last);
     case WeightsProfile::Qwen38Nvfp4:
         return ops::attn_input_proj_workspace_capacity_bytes(
-            QType::FP8_E4M3FN_ROW_BF16S, 14336, TextConfig::hidden, kFp8TextPolicy, first, last);
+            QType::FP8_E4M3FN_ROW_BF16S, 5120, TextConfig::hidden, kFp8TextPolicy, first, last);
     }
     throw std::logic_error("invalid 27B weights profile");
 }
@@ -386,11 +386,11 @@ std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfil
     case WeightsProfile::Qwen38GroupwiseInt:
         return 0;
     case WeightsProfile::Qwen36Nvfp4:
-        return ops::gdn_input_proj_workspace_capacity_bytes(QType::NVFP4, 16384, TextConfig::hidden,
+        return ops::gdn_input_proj_workspace_capacity_bytes(QType::NVFP4, 8192, TextConfig::hidden,
                                                             kNvfp4TextPolicy, first, last);
     case WeightsProfile::Qwen38Nvfp4:
         return ops::gdn_input_proj_workspace_capacity_bytes(
-            QType::FP8_E4M3FN_ROW_BF16S, 16384, TextConfig::hidden, kFp8TextPolicy, first, last);
+            QType::FP8_E4M3FN_ROW_BF16S, 8192, TextConfig::hidden, kFp8TextPolicy, first, last);
     }
     throw std::logic_error("invalid 27B weights profile");
 }
@@ -409,12 +409,12 @@ std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(
     case WeightsProfile::Qwen36Nvfp4:
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-                            QType::NVFP4, 16384, TextConfig::hidden, kNvfp4TextPolicy, batch_size,
+                            QType::NVFP4, 8192, TextConfig::hidden, kNvfp4TextPolicy, batch_size,
                             first, last));
     case WeightsProfile::Qwen38Nvfp4:
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-                            QType::FP8_E4M3FN_ROW_BF16S, 16384, TextConfig::hidden, kFp8TextPolicy,
+                            QType::FP8_E4M3FN_ROW_BF16S, 8192, TextConfig::hidden, kFp8TextPolicy,
                             batch_size, first, last));
     }
     throw std::logic_error("invalid 27B weights profile");
@@ -434,12 +434,12 @@ std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(
     case WeightsProfile::Qwen36Nvfp4:
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
-                            QType::NVFP4, 16384, TextConfig::hidden, kNvfp4TextPolicy, batch_size,
+                            QType::NVFP4, 8192, TextConfig::hidden, kNvfp4TextPolicy, batch_size,
                             first, last));
     case WeightsProfile::Qwen38Nvfp4:
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
-                            QType::FP8_E4M3FN_ROW_BF16S, 16384, TextConfig::hidden, kFp8TextPolicy,
+                            QType::FP8_E4M3FN_ROW_BF16S, 8192, TextConfig::hidden, kFp8TextPolicy,
                             batch_size, first, last));
     }
     throw std::logic_error("invalid 27B weights profile");

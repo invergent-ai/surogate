@@ -21,5 +21,7 @@ struct GqaGeometry {
 
 using Gqa27Geometry = GqaGeometry<24, 4, 1>;
 using Gqa35Geometry = GqaGeometry<16, 2, 2>;
+// surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b (8 query / 2 KV heads).
+using Gqa08Geometry = GqaGeometry<8, 2, 2>;
 
 } // namespace ninfer::ops
