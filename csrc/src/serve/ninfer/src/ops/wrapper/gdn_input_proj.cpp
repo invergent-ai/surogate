@@ -909,6 +909,17 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
         return detail::fp8_gdn_record_workspace_capacity_bytes(policy, batch_size, min_width,
                                                                max_width);
     }
+    // surogate vendor patch (PATCHES.md #13/#15): W8 fused parents (35B
+    // 12288/2048, qwen3.5-0.8b 8192/1024) size through the split-dimension
+    // record path, mirroring the snapshot overload above.
+    if (parent_qtype == QType::W8G32_F16S && policy == LinearPolicy::A16Only &&
+        ((parent_rows == 12288 && input_rows == 2048) ||
+         (parent_rows == 8192 && input_rows == 1024))) {
+        const std::int32_t value_rows = parent_rows == 12288 ? 4096 : 2048;
+        return gdn_input_proj_conv_record_workspace_capacity_bytes(2048, 2048, value_rows,
+                                                                   batch_size, min_width,
+                                                                   max_width);
+    }
     if (parent_qtype != QType::NVFP4 || parent_rows != detail::Nvfp4GdnInputGeometry::kOutputRows ||
         input_rows != detail::Nvfp4GdnInputGeometry::kInputRows ||
         (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4)) {

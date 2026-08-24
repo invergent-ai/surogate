@@ -55,14 +55,21 @@ output rows, linear_add's r64c128 tile underfills the GPU. Measured
 winners applied (linear_add {129-1024: r32c128, 1025+: r48c128}; swiglu
 449-512: r128c80 for the q08 shape):
 
+Second pass: default prefill chunk 1024 -> 2048 (measured +16% on the
+0.8B at ~1.9k-token prompts — K=1024 GEMM tiles amortize the main loop
+better at larger T — and neutral on the 27B: 1832 vs 1834 tok/s).
+
 | prompt | engine before | engine after | vLLM bf16 | vLLM FP8 |
 |-------:|--------------:|-------------:|----------:|---------:|
-|    472 |        21,649 |   **26,319** |    22,309 |   20,164 |
-|    962 |        35,420 |   **37,303** |    36,654 |   32,819 |
-|   1912 |        41,128 |       42,626 |    52,381 | **60,667** |
+|     52 |         4,368 |        4,043 |     2,250 |    2,425 |
+|    232 |        13,548 |   **14,897** |    10,426 |   10,890 |
+|    472 |        21,649 |   **25,782** |    22,309 |   20,164 |
+|    962 |        35,420 |   **37,327** |    36,654 |   32,819 |
+|   1912 |        41,128 |   **52,005** |    52,381 | **60,667** |
 
-Engine now leads BOTH vLLM columns on prefill through ~1000 tokens and on
-decode everywhere. The remaining 1912-class gap is structural: the W8
+Scoreboard after both passes: the engine beats or matches vLLM bf16 at
+EVERY point (prefill and decode), and beats vLLM FP8 everywhere except
+1912-class prefill (52.0k vs 60.7k, -14%). The remaining 1912-class gap is structural: the W8
 kernels dequantize to BF16 MMA (~90 TF/s achieved, candidates within 10%
 of each other) while vLLM FP8 runs FP8 tensor cores at ~2x the mma rate —
 closing it means a W8->FP8-MMA kernel path, a future project.

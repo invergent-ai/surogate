@@ -18,6 +18,8 @@
 
 #include "core/device.h"
 #include "ninfer_bench_common.h"
+#include "ops/linear/bf16/bf16_config.h"
+#include "ops/linear/bf16/bf16_gemm_mma_config.h"
 #include "ops/linear/w8/w8_rowsplit_gemm_mma.cuh"
 #include "quantized_weight.cuh"
 
@@ -97,6 +99,39 @@ const Candidate kCandidates[] = {
 
 } // namespace
 
+// Materialized-path probe: dequant W8 -> BF16 once (bandwidth-trivial), then
+// the engine's BF16 MMA production schedule at full rate. If bf16-mma
+// dominates the fused W8 tiles at large T, a materialize route wins.
+template <class Geometry>
+void launch_bf16(const __nv_bfloat16* x, const __nv_bfloat16* w, __nv_bfloat16* out,
+                 std::int32_t tokens, cudaStream_t stream) {
+    using Schedule        = Bf16MmaProductionSchedule<Geometry>;
+    constexpr int tiles_m = Geometry::kOutputRows / Schedule::kBlockRows;
+    const int tiles_n     = ninfer::ops::div_up(tokens, Schedule::kBlockCols);
+    const Bf16MmaContiguousOutput output{out, Geometry::kOutputRows};
+    if constexpr (Schedule::kSharedBytes > 48 * 1024) {
+        static const cudaError_t attr = cudaFuncSetAttribute(
+            bf16_gemm_mma_kernel<Geometry, Schedule, false, Bf16MmaContiguousOutput>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, Schedule::kSharedBytes);
+        (void)attr;
+    }
+    bf16_gemm_mma_kernel<Geometry, Schedule, false>
+        <<<tiles_m * tiles_n, Schedule::kThreads, Schedule::kSharedBytes, stream>>>(x, w, output,
+                                                                                   tokens);
+}
+
+using Bf16Fn = void (*)(const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, std::int32_t,
+                        cudaStream_t);
+
+Bf16Fn bf16_launcher(std::int32_t rows, std::int32_t k) {
+    if (rows == 7168 && k == 1024) return &launch_bf16<Bf16GemvGeometry<7168, 1024>>;
+    if (rows == 8192 && k == 1024) return &launch_bf16<Bf16GemvGeometry<8192, 1024>>;
+    if (rows == 1024 && k == 3584) return &launch_bf16<Bf16GemvGeometry<1024, 3584>>;
+    if (rows == 1024 && k == 2048) return &launch_bf16<Bf16GemvGeometry<1024, 2048>>;
+    if (rows == 5120 && k == 1024) return &launch_bf16<Bf16GemvGeometry<5120, 1024>>;
+    return nullptr;
+}
+
 int main(int argc, char** argv) {
     int warmup = 20, repeat = 100;
     if (argc > 1) warmup = std::atoi(argv[1]);
@@ -118,6 +153,8 @@ int main(int argc, char** argv) {
         const auto* codes  = static_cast<const std::uint8_t*>(weight.weight.qdata);
         const auto* scales = static_cast<const std::uint8_t*>(weight.weight.scales);
 
+        DeviceBuffer wbf16 = bench::make_bf16(static_cast<std::size_t>(c.rows) * c.k);
+        const Bf16Fn bf16   = bf16_launcher(c.rows, c.k);
         for (const std::int32_t tokens : kTokenCounts) {
             std::printf("%-20s %6d", c.name, tokens);
             const double gflop = 2.0 * c.rows * c.k * static_cast<double>(tokens) / 1e9;
@@ -129,6 +166,16 @@ int main(int argc, char** argv) {
                 const auto timing = bench::measure_launch(launch, stream, warmup, repeat);
                 const double us   = timing.median_us;
                 std::printf(" %7.1f/%2.0f", us, gflop / (us * 1e-6) / 1e3);
+            }
+            if (bf16 != nullptr) {
+                const auto launch = [&](cudaStream_t s) {
+                    bf16(static_cast<const __nv_bfloat16*>(x.p),
+                         static_cast<const __nv_bfloat16*>(wbf16.p),
+                         static_cast<__nv_bfloat16*>(out.p), tokens, s);
+                };
+                const auto timing = bench::measure_launch(launch, stream, warmup, repeat);
+                std::printf(" | bf16 %7.1f/%2.0f", timing.median_us,
+                            gflop / (timing.median_us * 1e-6) / 1e3);
             }
             std::printf("\n");
             std::fflush(stdout);

@@ -31,7 +31,10 @@ struct ServeOptions {
     std::uint32_t max_concurrency          = 1;
     std::uint32_t max_pending_requests     = 16;
     std::uint32_t pending_timeout_ms       = 30000;
-    std::uint32_t prefill_chunk            = 1024;
+    // surogate vendor patch (PATCHES.md #13): 2048 measured +16% prefill on
+    // qwen3.5-0.8b (K=1024 tiles amortize) and neutral on qwen3.6-27b
+    // (1832 vs 1834 tok/s) on RTX 5090.
+    std::uint32_t prefill_chunk            = 2048;
     std::uint32_t log_stats_interval_ms    = 5000; // 0 disables periodic Engine throughput logs
     std::size_t max_request_bytes          = kDefaultMaxRequestBytes;
     std::size_t media_cache_bytes          = kDefaultMediaCacheBytes;
