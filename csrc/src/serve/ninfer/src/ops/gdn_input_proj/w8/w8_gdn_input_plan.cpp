@@ -35,8 +35,14 @@ constexpr bool catalog_is_closed() {
 static_assert(catalog_is_closed(), "W8 GDN input routes must be exact and closed");
 
 bool supported_shape(const W8GdnInputProblem& problem) noexcept {
-    return problem.input_rows == 2048 && problem.qkv_rows == 8192 && problem.z_rows == 4096 &&
-           problem.parent_rows == 12288 && problem.padded_k == 2048;
+    // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b fused parent.
+    const bool base = problem.input_rows == 2048 && problem.qkv_rows == 8192 &&
+                      problem.z_rows == 4096 && problem.parent_rows == 12288 &&
+                      problem.padded_k == 2048;
+    const bool q08 = problem.input_rows == 1024 && problem.qkv_rows == 6144 &&
+                     problem.z_rows == 2048 && problem.parent_rows == 8192 &&
+                     problem.padded_k == 1024;
+    return base || q08;
 }
 
 } // namespace

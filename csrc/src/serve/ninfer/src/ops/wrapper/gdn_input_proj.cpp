@@ -266,11 +266,13 @@ void require_rowsplit(const Weight& weight, QType qtype, std::int32_t rows, cons
 }
 
 void require_w8_rowsplit(const Weight& weight, std::int32_t rows, const char* label) {
+    // surogate vendor patch (PATCHES.md #13): K 2048 (35B) or 1024 (qwen3.5-0.8b).
+    const std::int32_t k = weight.k;
     if (weight.qtype != QType::W8G32_F16S || weight.layout != QuantLayout::RowSplit ||
         weight.scale_dtype != DType::FP16 || weight.group_size != 32 || weight.group != 32 ||
-        weight.ndim != 2 || weight.n != rows || weight.k != 2048 || weight.shape[0] != rows ||
-        weight.shape[1] != 2048 || weight.padded_shape[0] != rows ||
-        weight.padded_shape[1] != 2048 || weight.qhigh != nullptr || weight.high_plane_bytes != 0 ||
+        weight.ndim != 2 || weight.n != rows || (k != 2048 && k != 1024) ||
+        weight.shape[0] != rows || weight.shape[1] != k || weight.padded_shape[0] != rows ||
+        weight.padded_shape[1] != k || weight.qhigh != nullptr || weight.high_plane_bytes != 0 ||
         !aligned_to(weight.qdata, 16) || !aligned_to(weight.scales, 16)) {
         throw std::invalid_argument(std::string("gdn_input_proj: invalid ") + label);
     }
@@ -332,10 +334,12 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
         return;
     }
 
-    constexpr std::int32_t kHidden  = 2048;
-    constexpr std::int32_t kQkvRows = 8192;
-    constexpr std::int32_t kZRows   = 4096;
-    constexpr std::int32_t kRows    = kQkvRows + kZRows;
+    // surogate vendor patch (PATCHES.md #13): geometry keyed on hidden.
+    const bool q08                 = weight.k == 1024;
+    const std::int32_t kHidden  = q08 ? 1024 : 2048;
+    const std::int32_t kQkvRows = q08 ? 6144 : 8192;
+    const std::int32_t kZRows   = q08 ? 2048 : 4096;
+    const std::int32_t kRows    = kQkvRows + kZRows;
     if (policy != LinearPolicy::A16Only) {
         throw std::invalid_argument("W8 gdn_input_proj admits only A16");
     }
@@ -514,12 +518,15 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
         return;
     }
 
-    constexpr std::int32_t kHidden    = 2048;
-    constexpr std::int32_t kQueryRows = 2048;
-    constexpr std::int32_t kKeyRows   = 2048;
-    constexpr std::int32_t kValueRows = 4096;
-    constexpr std::int32_t kZRows     = 4096;
-    constexpr std::int32_t kChannels  = kQueryRows + kKeyRows + kValueRows;
+    // surogate vendor patch (PATCHES.md #13): geometry keyed on hidden
+    // (35B 2048; qwen3.5-0.8b 1024 with 16 symmetric V heads).
+    const bool q08                 = weight.k == 1024;
+    const std::int32_t kHidden    = q08 ? 1024 : 2048;
+    const std::int32_t kQueryRows = 2048;
+    const std::int32_t kKeyRows   = 2048;
+    const std::int32_t kValueRows = q08 ? 2048 : 4096;
+    const std::int32_t kZRows     = q08 ? 2048 : 4096;
+    const std::int32_t kChannels  = kQueryRows + kKeyRows + kValueRows;
     const ConvGeometry geometry       = require_snapshot_input(x, kHidden);
     if (policy != LinearPolicy::A16Only) {
         throw std::invalid_argument("W8 gdn_input_proj_conv_snapshot admits only A16");
@@ -836,6 +843,16 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
         (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8)) {
         return detail::fp8_gdn_snapshot_workspace_capacity_bytes(policy, batch_size, min_width,
                                                                  max_width);
+    }
+    // surogate vendor patch (PATCHES.md #13): W8 fused parents (35B 12288/2048,
+    // qwen3.5-0.8b 8192/1024) size through the split-dimension path.
+    if (parent_qtype == QType::W8G32_F16S && policy == LinearPolicy::A16Only &&
+        ((parent_rows == 12288 && input_rows == 2048) ||
+         (parent_rows == 8192 && input_rows == 1024))) {
+        const std::int32_t value_rows = parent_rows == 12288 ? 4096 : 2048;
+        return gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, value_rows,
+                                                                     batch_size, min_width,
+                                                                     max_width);
     }
     if (parent_qtype != QType::NVFP4 || parent_rows != detail::Nvfp4GdnInputGeometry::kOutputRows ||
         input_rows != detail::Nvfp4GdnInputGeometry::kInputRows) {

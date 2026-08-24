@@ -43,9 +43,8 @@ DIRECT_PROBE_OBJECTS = (
     "text/layers/0/gdn/convolution",
 )
 QUANT_PROBE_OBJECTS = (
-    "text/layers/3/attention/query_key",
-    "text/layers/0/gdn/value_z",
-    "vision/patch_embedding",
+    "text/layers/3/attention/query_key_gate_value",
+    "text/layers/0/gdn/query_key_value_z",
     "mtp/layer/attention/query_key_gate_value",
     "text/draft_head",
 )
@@ -208,9 +207,11 @@ def validate_structure(artifact: Artifact) -> StructureSummary:
 
         cursor = actual.offset + actual.bytes
 
-    if dict(formats) != inventory.FORMAT_COUNTS:
+    expected_formats = {k: v for k, v in inventory.FORMAT_COUNTS.items() if v}
+    if dict(formats) != expected_formats:
         _contract_error(f"numeric-format counts are {dict(formats)}")
-    if dict(layouts) != inventory.LAYOUT_COUNTS:
+    expected_layouts = {k: v for k, v in inventory.LAYOUT_COUNTS.items() if v}
+    if dict(layouts) != expected_layouts:
         _contract_error(f"layout counts are {dict(layouts)}")
 
     payload_bytes = artifact.file_bytes - artifact.payload_offset
@@ -577,8 +578,8 @@ def verify_payloads(
             if not isinstance(obj, TensorObject) or len(obj.shape) != 2:
                 _contract_error(f"quantized probe is not a matrix: {object_name}")
             rows = (
-                (0, 6143, 6144, 12287)
-                if object_name == "text/layers/0/gdn/value_z"
+                (0, 4095, 4096, 8191)
+                if object_name == "text/layers/0/gdn/query_key_value_z"
                 else _three_indices(obj.shape[0])
             )
             source_rows = _materialize_rows(

@@ -60,6 +60,15 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
             return launch_w8_mma_r64_c128;
         }
         break;
+    case 1024:
+        // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b heads
+        // (lm head 248320, draft head 131072; hidden 1024).
+        if (n == 248320 || n == 131072) {
+            if (t <= 13) { return launch_w8_simt_r8_c4; }
+            if (t <= 128) { return launch_w8_mma_r32_c128; }
+            return launch_w8_mma_r64_c128;
+        }
+        break;
     case 2048:
         switch (n) {
         case 1024:

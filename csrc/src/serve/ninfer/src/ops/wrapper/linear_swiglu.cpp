@@ -83,8 +83,12 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     const bool w8_shape = x.ne[0] == 2048 && out.ne[0] == 6144 && gate_up_weight.n == 12288 &&
                           gate_up_weight.k == 2048 && gate_up_weight.padded_shape[0] == 12288 &&
                           gate_up_weight.padded_shape[1] == 2048;
+    // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b mlp (1024 -> 2x3584).
+    const bool q08_shape = x.ne[0] == 1024 && out.ne[0] == 3584 && gate_up_weight.n == 7168 &&
+                           gate_up_weight.k == 1024 && gate_up_weight.padded_shape[0] == 7168 &&
+                           gate_up_weight.padded_shape[1] == 1024;
     if (t <= 0 || x.ne[2] != 1 || x.ne[3] != 1 || out.ne[1] != t || out.ne[2] != 1 ||
-        out.ne[3] != 1 || (!large_shape && !w8_shape)) {
+        out.ne[3] != 1 || (!large_shape && !w8_shape && !q08_shape)) {
         throw std::invalid_argument("linear_swiglu: invalid tensor shape");
     }
     if (!x.is_contiguous() || !out.is_contiguous()) {
@@ -103,7 +107,7 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     const bool q4_weight = large_shape && gate_up_weight.qtype == QType::Q4G64_F16S &&
                            gate_up_weight.group_size == 64 && gate_up_weight.group == 64 &&
                            common_row_split;
-    const bool w8_weight = w8_shape && gate_up_weight.qtype == QType::W8G32_F16S &&
+    const bool w8_weight = (w8_shape || q08_shape) && gate_up_weight.qtype == QType::W8G32_F16S &&
                            gate_up_weight.group_size == 32 && gate_up_weight.group == 32 &&
                            gate_up_weight.qhigh == nullptr &&
                            gate_up_weight.high_plane_bytes == 0 && common_row_split;

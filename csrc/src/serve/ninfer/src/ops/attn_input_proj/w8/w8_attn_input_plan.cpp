@@ -59,6 +59,11 @@ bool is_companion_shape(const W8AttnInputProblem& problem) noexcept {
 bool supported_shape(const W8AttnInputProblem& problem) noexcept {
     const bool target_qkgv =
         problem.query_rows == 4096 && problem.kv_rows == 512 && problem.parent_rows == 9216;
+    // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b fused qkgv.
+    const bool q08_qkgv = problem.query_rows == 2048 && problem.kv_rows == 512 &&
+                          problem.parent_rows == 5120 && problem.input_rows == 1024 &&
+                          problem.padded_k == 1024;
+    if (q08_qkgv) { return true; }
     return problem.input_rows == 2048 && problem.padded_k == 2048 &&
            (target_qkgv || is_companion_shape(problem));
 }
@@ -118,8 +123,8 @@ void w8_attn_input_execute_plan(const W8AttnInputPlan& plan, const Tensor& x, co
     const W8AttnInputProblem problem{x.ne[0], q.ne[0], k.ne[0], weight.n, weight.padded_shape[1],
                                      x.ne[1]};
     const W8AttnInputPlan resolved = w8_attn_input_resolve_plan(problem);
-    if (problem.parent_rows != 9216 || problem.kv_rows != 512 ||
-        resolved.schedule != plan.schedule) {
+    if (!(problem.parent_rows == 9216 || problem.parent_rows == 5120) ||
+        problem.kv_rows != 512 || resolved.schedule != plan.schedule) {
         throw std::invalid_argument(
             "W8 attention input: plan does not match exact four-output problem");
     }

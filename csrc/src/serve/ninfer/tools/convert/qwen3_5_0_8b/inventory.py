@@ -55,8 +55,7 @@ def _build_text_core_specs() -> tuple[TensorSpec, ...]:
         if layer in FULL_ATTENTION_LAYERS:
             specs.extend(
                 (
-                    _tensor(prefix + "attention/query_key", (2560, 1024), W8),
-                    _tensor(prefix + "attention/gate_value", (2560, 1024), W8),
+                    _tensor(prefix + "attention/query_key_gate_value", (5120, 1024), W8),
                     _tensor(prefix + "attention/query_norm", (256,), BF16),
                     _tensor(prefix + "attention/key_norm", (256,), BF16),
                     _tensor(prefix + "attention/output", (1024, 2048), W8),
@@ -70,8 +69,7 @@ def _build_text_core_specs() -> tuple[TensorSpec, ...]:
                     _tensor(prefix + "gdn/convolution", (4, 6144), BF16),
                     _tensor(prefix + "gdn/a_projection", (16, 1024), BF16),
                     _tensor(prefix + "gdn/b_projection", (16, 1024), BF16),
-                    _tensor(prefix + "gdn/query_key", (4096, 1024), W8),
-                    _tensor(prefix + "gdn/value_z", (4096, 1024), W8),
+                    _tensor(prefix + "gdn/query_key_value_z", (8192, 1024), W8),
                     _tensor(prefix + "gdn/norm", (128,), BF16),
                     _tensor(prefix + "gdn/output", (1024, 2048), W8),
                 )
@@ -148,7 +146,7 @@ LAYOUT_COUNTS = {
 LOGICAL_ROW_VIEW_SPECS = (
     LogicalRowViewSpec(
         "text/layers/{l}/attention/query",
-        "text/layers/{l}/attention/query_key",
+        "text/layers/{l}/attention/query_key_gate_value",
         0,
         2048,
         (2048, 1024),
@@ -156,7 +154,7 @@ LOGICAL_ROW_VIEW_SPECS = (
     ),
     LogicalRowViewSpec(
         "text/layers/{l}/attention/key",
-        "text/layers/{l}/attention/query_key",
+        "text/layers/{l}/attention/query_key_gate_value",
         2048,
         2560,
         (512, 1024),
@@ -164,23 +162,23 @@ LOGICAL_ROW_VIEW_SPECS = (
     ),
     LogicalRowViewSpec(
         "text/layers/{l}/attention/output_gate",
-        "text/layers/{l}/attention/gate_value",
-        0,
-        2048,
+        "text/layers/{l}/attention/query_key_gate_value",
+        2560,
+        4608,
         (2048, 1024),
         FULL_ATTENTION_LAYERS,
     ),
     LogicalRowViewSpec(
         "text/layers/{l}/attention/value",
-        "text/layers/{l}/attention/gate_value",
-        2048,
-        2560,
+        "text/layers/{l}/attention/query_key_gate_value",
+        4608,
+        5120,
         (512, 1024),
         FULL_ATTENTION_LAYERS,
     ),
     LogicalRowViewSpec(
         "text/layers/{l}/gdn/query",
-        "text/layers/{l}/gdn/query_key",
+        "text/layers/{l}/gdn/query_key_value_z",
         0,
         2048,
         (2048, 1024),
@@ -188,7 +186,7 @@ LOGICAL_ROW_VIEW_SPECS = (
     ),
     LogicalRowViewSpec(
         "text/layers/{l}/gdn/key",
-        "text/layers/{l}/gdn/query_key",
+        "text/layers/{l}/gdn/query_key_value_z",
         2048,
         4096,
         (2048, 1024),
@@ -196,17 +194,17 @@ LOGICAL_ROW_VIEW_SPECS = (
     ),
     LogicalRowViewSpec(
         "text/layers/{l}/gdn/value",
-        "text/layers/{l}/gdn/value_z",
-        0,
-        2048,
+        "text/layers/{l}/gdn/query_key_value_z",
+        4096,
+        6144,
         (2048, 1024),
         GDN_LAYERS,
     ),
     LogicalRowViewSpec(
         "text/layers/{l}/gdn/z",
-        "text/layers/{l}/gdn/value_z",
-        2048,
-        4096,
+        "text/layers/{l}/gdn/query_key_value_z",
+        6144,
+        8192,
         (2048, 1024),
         GDN_LAYERS,
     ),

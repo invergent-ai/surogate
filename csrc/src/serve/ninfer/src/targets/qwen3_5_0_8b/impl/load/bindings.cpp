@@ -221,11 +221,10 @@ void bind_groupwise_text_layers(artifact::Binder& binder, BindingPlan& out) {
                                                                 NumericFormat::BF16, {1024});
         target.is_full_attention = is_full_layer(layer);
         if (target.is_full_attention) {
-            target.attention.projection = SplitAttentionProjectionPlan{
-                .query_key  = bind_weight(binder, prefix + "attention/query_key",
-                                          NumericFormat::W8G32_F16S, {2560, 1024}),
-                .gate_value = bind_weight(binder, prefix + "attention/gate_value",
-                                          NumericFormat::W8G32_F16S, {2560, 1024}),
+            target.attention.projection = FusedAttentionProjectionPlan{
+                .query_key_gate_value =
+                    bind_weight(binder, prefix + "attention/query_key_gate_value",
+                                NumericFormat::W8G32_F16S, {5120, 1024}),
             };
             target.attention.query_norm = artifact::bind_device_tensor(
                 binder, prefix + "attention/query_norm", NumericFormat::BF16, {256});
@@ -246,11 +245,10 @@ void bind_groupwise_text_layers(artifact::Binder& binder, BindingPlan& out) {
                 .b_projection = bind_weight(binder, prefix + "gdn/b_projection",
                                             NumericFormat::BF16, {16, 1024}),
             };
-            target.gdn.input_projection = SplitGdnInputProjectionPlan{
-                .query_key = bind_weight(binder, prefix + "gdn/query_key",
-                                         NumericFormat::W8G32_F16S, {4096, 1024}),
-                .value_z   = bind_weight(binder, prefix + "gdn/value_z", NumericFormat::W8G32_F16S,
-                                         {4096, 1024}),
+            target.gdn.input_projection = FusedGdnInputProjectionPlan{
+                .query_key_value_z =
+                    bind_weight(binder, prefix + "gdn/query_key_value_z",
+                                NumericFormat::W8G32_F16S, {8192, 1024}),
             };
             target.gdn.norm = artifact::bind_device_tensor(binder, prefix + "gdn/norm",
                                                            NumericFormat::BF16, {128});

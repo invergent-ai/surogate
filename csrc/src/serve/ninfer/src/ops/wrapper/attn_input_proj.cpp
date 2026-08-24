@@ -49,10 +49,11 @@ void require_rowsplit(const Weight& weight, QType qtype, std::int32_t rows, cons
 void require_w8_rowsplit(const Weight& weight, std::int32_t rows, const char* label) {
     if (weight.qtype != QType::W8G32_F16S || weight.layout != QuantLayout::RowSplit ||
         weight.scale_dtype != DType::FP16 || weight.group_size != 32 || weight.group != 32 ||
-        weight.ndim != 2 || weight.n != rows || weight.k != 2048 || weight.shape[0] != rows ||
-        weight.shape[1] != 2048 || weight.padded_shape[0] != rows ||
-        weight.padded_shape[1] != 2048 || weight.qhigh != nullptr || weight.high_plane_bytes != 0 ||
-        !aligned_to(weight.qdata, 16) || !aligned_to(weight.scales, 16)) {
+        weight.ndim != 2 || weight.n != rows || (weight.k != 2048 && weight.k != 1024) ||
+        weight.shape[0] != rows || weight.shape[1] != weight.k || weight.padded_shape[0] != rows ||
+        weight.padded_shape[1] != weight.k || weight.qhigh != nullptr ||
+        weight.high_plane_bytes != 0 || !aligned_to(weight.qdata, 16) ||
+        !aligned_to(weight.scales, 16)) {
         throw std::invalid_argument(std::string("attn_input_proj: invalid ") + label);
     }
 }
@@ -151,10 +152,12 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
         return;
     }
 
-    constexpr std::int32_t kHidden = 2048;
-    constexpr std::int32_t kQRows  = 4096;
-    constexpr std::int32_t kKvRows = 512;
-    constexpr std::int32_t kRows   = 9216;
+    // surogate vendor patch (PATCHES.md #13): 35B (2048 hidden) or 0.8b (1024).
+    const bool q08                 = weight.k == 1024;
+    const std::int32_t kHidden = q08 ? 1024 : 2048;
+    const std::int32_t kQRows  = q08 ? 2048 : 4096;
+    const std::int32_t kKvRows = 512;
+    const std::int32_t kRows   = q08 ? 5120 : 9216;
     const std::int32_t cols        = x.ne[1];
     if (cols <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
     if (policy != LinearPolicy::A16Only) {
@@ -200,13 +203,18 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
         }
         return detail::fp8_attn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
     case QType::W8G32_F16S:
-        if (parent_rows != 9216 || input_rows != 2048 || policy != LinearPolicy::A16Only) {
+        if (!((parent_rows == 9216 && input_rows == 2048) ||
+              (parent_rows == 5120 && input_rows == 1024)) ||
+            policy != LinearPolicy::A16Only) {
             throw std::invalid_argument("attn_input_proj workspace: unsupported W8 profile");
         }
-        (void)detail::w8_attn_input_resolve_plan(
-            {input_rows, 4096, 512, parent_rows, input_rows, min_tokens});
-        (void)detail::w8_attn_input_resolve_plan(
-            {input_rows, 4096, 512, parent_rows, input_rows, max_tokens});
+        {
+            const std::int32_t q_rows = parent_rows == 9216 ? 4096 : 2048;
+            (void)detail::w8_attn_input_resolve_plan(
+                {input_rows, q_rows, 512, parent_rows, input_rows, min_tokens});
+            (void)detail::w8_attn_input_resolve_plan(
+                {input_rows, q_rows, 512, parent_rows, input_rows, max_tokens});
+        }
         return 0;
     case QType::Q4G64_F16S:
     case QType::Q5G64_F16S:

@@ -74,19 +74,11 @@ def _build_text_recipes() -> tuple[TensorRecipe, ...]:
             recipes.extend(
                 (
                     TensorRecipe(
-                        object_prefix + "attention/query_key",
+                        object_prefix + "attention/query_key_gate_value",
                         Concat(
                             (
                                 query,
                                 _source(source_prefix + "self_attn.k_proj.weight", (512, 1024)),
-                            ),
-                            0,
-                        ),
-                    ),
-                    TensorRecipe(
-                        object_prefix + "attention/gate_value",
-                        Concat(
-                            (
                                 gate,
                                 _source(source_prefix + "self_attn.v_proj.weight", (512, 1024)),
                             ),
@@ -142,14 +134,10 @@ def _build_text_recipes() -> tuple[TensorRecipe, ...]:
                         _source(source_prefix + "linear_attn.in_proj_b.weight", (16, 1024)),
                     ),
                     TensorRecipe(
-                        object_prefix + "gdn/query_key",
-                        Slice(qkv_source, 0, 0, 4096),
-                    ),
-                    TensorRecipe(
-                        object_prefix + "gdn/value_z",
+                        object_prefix + "gdn/query_key_value_z",
                         Concat(
                             (
-                                Slice(qkv_source, 0, 4096, 6144),
+                                qkv_source,
                                 _source(
                                     source_prefix + "linear_attn.in_proj_z.weight",
                                     (2048, 1024),
