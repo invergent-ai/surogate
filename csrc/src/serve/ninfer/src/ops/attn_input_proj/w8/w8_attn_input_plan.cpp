@@ -76,6 +76,11 @@ bool supported_shape(const W8AttnInputProblem& problem) noexcept {
                             ((problem.input_rows == 1024 && problem.padded_k == 1024) ||
                              (problem.input_rows == 2048 && problem.padded_k == 2048));
     if (small_qkgv) { return true; }
+    // surogate vendor patch (PATCHES.md #18): qwen3.5-4b fused qkgv.
+    const bool q4b_qkgv = problem.query_rows == 4096 && problem.kv_rows == 1024 &&
+                          problem.parent_rows == 10240 && problem.input_rows == 2560 &&
+                          problem.padded_k == 2560;
+    if (q4b_qkgv) { return true; }
     return problem.input_rows == 2048 && problem.padded_k == 2048 &&
            (target_qkgv || is_companion_shape(problem));
 }
@@ -129,6 +134,7 @@ W8AttnInputPlan w8_attn_input_resolve_plan(const W8AttnInputProblem& problem) {
     if (problem.parent_rows == 5120 && problem.input_rows == 2048) {
         return resolve_from(kTarget2BRoutes);
     }
+    if (problem.parent_rows == 10240) { return resolve_from(kTarget2BRoutes); }
     return resolve_from(kTargetRoutes);
 }
 
@@ -138,8 +144,10 @@ void w8_attn_input_execute_plan(const W8AttnInputPlan& plan, const Tensor& x, co
     const W8AttnInputProblem problem{x.ne[0], q.ne[0], k.ne[0], weight.n, weight.padded_shape[1],
                                      x.ne[1]};
     const W8AttnInputPlan resolved = w8_attn_input_resolve_plan(problem);
-    if (!(problem.parent_rows == 9216 || problem.parent_rows == 5120) ||
-        problem.kv_rows != 512 || resolved.schedule != plan.schedule) {
+    if (!(problem.parent_rows == 9216 || problem.parent_rows == 5120 ||
+          problem.parent_rows == 10240) ||
+        (problem.kv_rows != 512 && problem.kv_rows != 1024) ||
+        resolved.schedule != plan.schedule) {
         throw std::invalid_argument(
             "W8 attention input: plan does not match exact four-output problem");
     }

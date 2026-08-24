@@ -30,6 +30,15 @@ std::int32_t kv_heads_for_q_heads(std::int32_t q_heads, const char* op) {
     throw std::invalid_argument(std::string(op) + ": unsupported Q/KV head geometry");
 }
 
+// surogate vendor patch (PATCHES.md #18): qwen3.5-4b (16 query / 4 KV heads)
+// shares QHeads with the 35B (16 / 2); when a KV source is present its head
+// count resolves the pair.
+std::int32_t kv_heads_for_pair(std::int32_t q_heads, std::int32_t source_kv_heads,
+                               const char* op) {
+    if (q_heads == 16 && source_kv_heads == 4) { return 4; }
+    return kv_heads_for_q_heads(q_heads, op);
+}
+
 void require_kv_heads(std::int32_t kv_heads, const char* op) {
     if (kv_heads != 4 && kv_heads != 2) {
         throw std::invalid_argument(std::string(op) + ": unsupported KV head geometry");
@@ -192,7 +201,7 @@ void validate_attention_tensors(const Tensor& q, const Tensor& positions, const 
         throw std::invalid_argument(std::string(op) + ": scale must be 1/sqrt(256)");
     }
     const std::int32_t q_heads  = q.ne[1];
-    const std::int32_t kv_heads = kv_heads_for_q_heads(q_heads, op);
+    const std::int32_t kv_heads = kv_heads_for_pair(q_heads, cache.num_kv_heads, op);
     const std::int32_t tokens   = q.ne[2];
     if (tokens <= 0) { throw std::invalid_argument(std::string(op) + ": T must be positive"); }
     require_shape(q, kHeadDim, q_heads, tokens, 1, op, "q");
@@ -224,7 +233,7 @@ void validate_batched_attention_tensors(const Tensor& q, const Tensor& positions
         throw std::invalid_argument(std::string(op) + ": scale must be 1/sqrt(256)");
     }
     const std::int32_t q_heads  = q.ne[1];
-    const std::int32_t kv_heads = kv_heads_for_q_heads(q_heads, op);
+    const std::int32_t kv_heads = kv_heads_for_pair(q_heads, cache.num_kv_heads, op);
     const std::int32_t width    = q.ne[2];
     const std::int32_t batch    = q.ne[3];
     if (width <= 0 || batch <= 0 || batch > kMaximumBatchSize ||
@@ -407,7 +416,7 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
     }
     const std::int32_t width    = q.ne[2];
     const std::int32_t batch    = q.ne[3];
-    const std::int32_t kv_heads = kv_heads_for_q_heads(q.ne[1], op);
+    const std::int32_t kv_heads = kv_heads_for_pair(q.ne[1], k.ne[1], op);
     require_shape(k, kHeadDim, kv_heads, width, batch, op, "k");
     require_shape(v, kHeadDim, kv_heads, width, batch, op, "v");
     require_contiguous_nonnull(k, op, "k");

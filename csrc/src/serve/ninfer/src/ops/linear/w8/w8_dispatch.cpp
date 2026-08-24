@@ -16,6 +16,11 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         break;
     case 5120:
         switch (n) {
+        // surogate vendor patch (PATCHES.md #18): qwen3.5-4b mtp fc.
+        case 2560:
+            if (t <= 13) { return launch_w8_simt_r8_c4; }
+            if (t <= 128) { return launch_w8_mma_r32_c128; }
+            return launch_w8_mma_r64_c128;
         case 1024:
             if (t <= 4) { return launch_w8_simt_r8_c4; }
             if (t <= 16) { return launch_w8_simt_r8_c8; }
@@ -57,6 +62,14 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
             if (t <= 48) { return launch_w8_small_t; }
             if (t <= 56) { return launch_w8_simt_r8_c4; }
             if (t <= 895) { return launch_w8_mma_r32_c128; }
+            return launch_w8_mma_r64_c128;
+        }
+        break;
+    case 2560:
+        // surogate vendor patch (PATCHES.md #18): qwen3.5-4b heads.
+        if (n == 248320 || n == 131072) {
+            if (t <= 13) { return launch_w8_simt_r8_c4; }
+            if (t <= 128) { return launch_w8_mma_r32_c128; }
             return launch_w8_mma_r64_c128;
         }
         break;

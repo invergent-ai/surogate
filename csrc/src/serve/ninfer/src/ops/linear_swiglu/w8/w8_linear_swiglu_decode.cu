@@ -120,9 +120,13 @@ void w8_linear_swiglu_decode_pair_r4_launch(const Tensor& x, const Weight& w, Te
 
 void w8_linear_swiglu_decode_pair_r16_launch(const Tensor& x, const Weight& w, Tensor& out,
                                              cudaStream_t stream) {
-    // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b mlp decode.
+    // surogate vendor patches (PATCHES.md #13/#18): per-geometry decode.
     if (w.k == 1024) {
         launch_decode<16, 3584, 1024>(x, w, out, stream);
+        return;
+    }
+    if (w.k == 2560) {
+        launch_decode<16, 9216, 2560>(x, w, out, stream);
         return;
     }
     launch_decode<16>(x, w, out, stream);

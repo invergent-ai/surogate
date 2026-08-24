@@ -56,7 +56,12 @@ bool supported_shape(const W8GdnInputProblem& problem) noexcept {
     const bool q2b = problem.input_rows == 2048 && problem.qkv_rows == 6144 &&
                      problem.z_rows == 2048 && problem.parent_rows == 8192 &&
                      problem.padded_k == 2048;
-    return base || q08 || q2b;
+    // surogate vendor patch (PATCHES.md #18): qwen3.5-4b — the 35B fused row
+    // structure (12288 parent, 8192/4096 split) at hidden 2560.
+    const bool q4b = problem.input_rows == 2560 && problem.qkv_rows == 8192 &&
+                     problem.z_rows == 4096 && problem.parent_rows == 12288 &&
+                     problem.padded_k == 2560;
+    return base || q08 || q2b || q4b;
 }
 
 } // namespace
@@ -93,7 +98,8 @@ W8GdnInputPlan w8_gdn_input_resolve_plan(const W8GdnInputProblem& problem) {
     if (!w8_gdn_input_admits(problem)) {
         throw std::invalid_argument("W8 GDN input: exact problem or column count is not admitted");
     }
-    if (problem.input_rows == 1024 || problem.qkv_rows == 6144) {
+    if (problem.input_rows == 1024 || problem.qkv_rows == 6144 ||
+        problem.padded_k == 2560) {
         for (const RouteSpec& route : kRoutes08) {
             if (problem.cols >= route.first && problem.cols <= route.last) {
                 return {route.schedule};

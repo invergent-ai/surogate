@@ -58,15 +58,36 @@ constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes,
     return routes.back().cols.last == last && expected == static_cast<std::int64_t>(last) + 1;
 }
 
+// surogate vendor patch (PATCHES.md #18): qwen3.5-4b gating rides the 35 kernels
+// at k 2560 = 40 K-tiles, so split-32/16 are not divisible; the short-cols route
+// drops to split-8 (grid stays resident: 2 row tiles x <=2 column tiles x 8).
+constexpr std::array<RouteSpec, 5> k4BRoutes{{
+    {{1, 127}, Bf16GdnGatingScheduleId::MmaCooperativeSplit8},
+    {{128, 1024}, Bf16GdnGatingScheduleId::MmaCooperativeSplit8},
+    {{1025, 2048}, Bf16GdnGatingScheduleId::MmaCooperativeSplit4},
+    {{2049, 4096}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
+    {{4097, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
+}};
+
 static_assert(catalog_is_closed(k27Routes, kAnyCols));
 static_assert(catalog_is_closed(k35Routes, kAnyCols));
+static_assert(catalog_is_closed(k4BRoutes, kAnyCols));
 
 bool is_27(const Bf16GdnGatingProblem& problem) noexcept {
     return problem.heads == 48 && problem.input_rows == 5120;
 }
 
+// surogate vendor patch (PATCHES.md #18): qwen3.5-4b needs its own route table
+// (split-16 is illegal at k 2560).
+bool is_4b(const Bf16GdnGatingProblem& problem) noexcept {
+    return problem.heads == 32 && problem.input_rows == 2560;
+}
+
 bool is_35(const Bf16GdnGatingProblem& problem) noexcept {
-    return problem.heads == 32 && problem.input_rows == 2048;
+    // surogate vendor patch (PATCHES.md #18): qwen3.5-4b (32 heads, 2560)
+    // rides the 35 routes.
+    return problem.heads == 32 &&
+           (problem.input_rows == 2048 || problem.input_rows == 2560);
 }
 
 // surogate vendor patches (PATCHES.md #13/#16): qwen3.5-0.8b and -2b ride
@@ -365,7 +386,8 @@ Bf16GdnGatingPlan bf16_gdn_gating_resolve_plan(const Bf16GdnGatingProblem& probl
             }
         }
     } else {
-        for (const RouteSpec& route : k35Routes) {
+        const auto& routes = is_4b(problem) ? k4BRoutes : k35Routes;
+        for (const RouteSpec& route : routes) {
             if (route.cols.contains(problem.cols)) {
                 return bf16_gdn_gating_resolve_candidate(route.schedule, problem);
             }
@@ -382,7 +404,8 @@ std::size_t bf16_gdn_gating_capacity_workspace_bytes(std::int32_t heads, std::in
     const Bf16GdnGatingProblem base{heads, input_rows, 1};
     (void)bf16_gdn_gating_resolve_plan({heads, input_rows, min_cols});
     (void)bf16_gdn_gating_resolve_plan({heads, input_rows, max_cols});
-    return is_27(base) ? route_capacity(k27Routes, base, min_cols, max_cols)
+    if (is_27(base)) { return route_capacity(k27Routes, base, min_cols, max_cols); }
+    return is_4b(base) ? route_capacity(k4BRoutes, base, min_cols, max_cols)
                        : route_capacity(k35Routes, base, min_cols, max_cols);
 }
 
@@ -391,10 +414,14 @@ Bf16GdnNormGatingPlan bf16_gdn_norm_gating_resolve_plan(const Bf16GdnGatingProbl
     Bf16GdnNormGatingScheduleId schedule = Bf16GdnNormGatingScheduleId::Composed;
     std::int32_t norm_splits             = 0;
     if (is_35(problem) && problem.cols <= 16) {
-        control  = bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId::MmaCooperativeSplit32,
-                                                     problem);
-        schedule = Bf16GdnNormGatingScheduleId::MmaCooperativeSplit32;
-        norm_splits = 32;
+        // surogate vendor patch (PATCHES.md #18): 4b fuses at split-8 (k 2560 has
+        // 40 K-tiles); the executor branches on weight.k.
+        const Bf16GdnGatingScheduleId control_schedule =
+            is_4b(problem) ? Bf16GdnGatingScheduleId::MmaCooperativeSplit8
+                           : Bf16GdnGatingScheduleId::MmaCooperativeSplit32;
+        control     = bf16_gdn_gating_resolve_candidate(control_schedule, problem);
+        schedule    = Bf16GdnNormGatingScheduleId::MmaCooperativeSplit32;
+        norm_splits = is_4b(problem) ? 8 : 32;
     }
     const std::size_t norm_partial_bytes =
         static_cast<std::size_t>(norm_splits) * problem.cols * sizeof(float);
@@ -407,7 +434,8 @@ std::size_t bf16_gdn_norm_gating_capacity_workspace_bytes(std::int32_t heads,
                                                           std::int32_t max_cols) {
     std::size_t maximum =
         bf16_gdn_gating_capacity_workspace_bytes(heads, input_rows, min_cols, max_cols);
-    if (heads == 32 && input_rows == 2048 && min_cols <= 16) {
+    // surogate vendor patch (PATCHES.md #18): qwen3.5-4b (rows 2560) fuses too.
+    if (heads == 32 && (input_rows == 2048 || input_rows == 2560) && min_cols <= 16) {
         const std::int32_t fused_cols = std::min<std::int32_t>(max_cols, 16);
         maximum                       = std::max(
             maximum,

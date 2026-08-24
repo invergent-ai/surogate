@@ -23,5 +23,9 @@ using Gqa27Geometry = GqaGeometry<24, 4, 1>;
 using Gqa35Geometry = GqaGeometry<16, 2, 2>;
 // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b (8 query / 2 KV heads).
 using Gqa08Geometry = GqaGeometry<8, 2, 2>;
+// surogate vendor patch (PATCHES.md #18): qwen3.5-4b (16 query / 4 KV heads).
+// Shares QHeads with the 35B geometry: dispatchers resolve the pair through
+// the KV cache head count.
+using Gqa4BGeometry = GqaGeometry<16, 4, 2>;
 
 } // namespace ninfer::ops

@@ -327,6 +327,7 @@ target_include_directories(ninfer_engine PUBLIC ${PROJECT_SOURCE_DIR}/include)
 add_subdirectory(targets/qwen3_6)
 add_subdirectory(targets/qwen3_5_0_8b)
 add_subdirectory(targets/qwen3_5_2b)
+add_subdirectory(targets/qwen3_5_4b)
 add_subdirectory(targets/qwen3_6_27b)
 add_subdirectory(targets/qwen3_6_35b_a3b)
 

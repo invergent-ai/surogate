@@ -50,7 +50,9 @@ void require_rowsplit(const Weight& weight, QType qtype, std::int32_t rows, cons
 void require_w8_rowsplit(const Weight& weight, std::int32_t rows, const char* label) {
     if (weight.qtype != QType::W8G32_F16S || weight.layout != QuantLayout::RowSplit ||
         weight.scale_dtype != DType::FP16 || weight.group_size != 32 || weight.group != 32 ||
-        weight.ndim != 2 || weight.n != rows || (weight.k != 2048 && weight.k != 1024) ||
+        // surogate vendor patch (PATCHES.md #18): K 2560 = qwen3.5-4b.
+        weight.ndim != 2 || weight.n != rows ||
+        (weight.k != 2048 && weight.k != 1024 && weight.k != 2560) ||
         weight.shape[0] != rows || weight.shape[1] != weight.k || weight.padded_shape[0] != rows ||
         weight.padded_shape[1] != weight.k || weight.qhigh != nullptr ||
         weight.high_plane_bytes != 0 || !aligned_to(weight.qdata, 16) ||
@@ -157,10 +159,11 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
     // (5120 rows) covers the 0.8b (hidden 1024) and 2b (hidden 2048); the 35B
     // parent has 9216 rows. Keyed on parent rows, not hidden.
     const bool small_fused     = weight.n == 5120;
+    const bool q4b             = weight.n == 10240;
     const std::int32_t kHidden = weight.k;
     const std::int32_t kQRows  = small_fused ? 2048 : 4096;
-    const std::int32_t kKvRows = 512;
-    const std::int32_t kRows   = small_fused ? 5120 : 9216;
+    const std::int32_t kKvRows = q4b ? 1024 : 512;
+    const std::int32_t kRows   = weight.n;
     const std::int32_t cols        = x.ne[1];
     if (cols <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
     if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8) {
@@ -217,16 +220,20 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
     case QType::W8G32_F16S:
         if (!((parent_rows == 9216 && input_rows == 2048) ||
               (parent_rows == 5120 &&
-               (input_rows == 1024 || input_rows == 2048))) ||
+               (input_rows == 1024 || input_rows == 2048)) ||
+              (parent_rows == 10240 && input_rows == 2560)) ||
             (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8)) {
             throw std::invalid_argument("attn_input_proj workspace: unsupported W8 profile");
         }
         {
-            const std::int32_t q_rows = parent_rows == 9216 ? 4096 : 2048;
+            // surogate vendor patch (PATCHES.md #18): qwen3.5-4b qkgv is
+            // 10240 rows (q4096 | k1024 | gate4096 | v1024) at hidden 2560.
+            const std::int32_t q_rows  = parent_rows == 5120 ? 2048 : 4096;
+            const std::int32_t kv_rows = parent_rows == 10240 ? 1024 : 512;
             (void)detail::w8_attn_input_resolve_plan(
-                {input_rows, q_rows, 512, parent_rows, input_rows, min_tokens});
+                {input_rows, q_rows, kv_rows, parent_rows, input_rows, min_tokens});
             (void)detail::w8_attn_input_resolve_plan(
-                {input_rows, q_rows, 512, parent_rows, input_rows, max_tokens});
+                {input_rows, q_rows, kv_rows, parent_rows, input_rows, max_tokens});
         }
         // surogate vendor patch (PATCHES.md #17): AllowA8 large-T runs the
         // W8A8-int IMMA path, which needs quantized-activation workspace.

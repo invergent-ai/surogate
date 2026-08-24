@@ -253,6 +253,52 @@
    (swiglu has them; the others are engine-exercised), swiglu fused-pair
    epilogue.
 
+18. **qwen3.5-4b target.** Third breadth target and the first with the 35B's
+   asymmetric GDN (hidden 2560, 32 layers, intermediate 9216, GQA 16q/4kv
+   hd256, GDN 16k/32v heads — the 35B row structure at a smaller K):
+   `src/targets/qwen3_5_4b/` + `tools/convert/qwen3_5_4b/` (369 objects,
+   355 text-core; tied embeddings; optional MTP block) + registry/engine/
+   ingest/resources wiring. Weight parents: attn qkgv {10240,2560}, gdn qkvz
+   {12288,2560} (q2048/k2048/v4096/z4096 — the exact 35B split), ab {64,2560},
+   conv {4,8192}, mlp {18432,2560}, heads {248320|131072,2560}, mtp fc
+   {2560,5120}.
+
+   Because the 12288/8192-row parents match the 35B/2b registries, admission
+   is K-driven this time (weight.k 2560 alongside 2048/1024) rather than
+   row-driven:
+   - w8 rowsplit checkers (attn + gdn) admit K 2560; per-K decode kernel
+     instantiations (w8_k2048_decode trailing-K 2560) for attn 10240-parent,
+     gdn 12288-parent, gdn decode-conv-snapshot (fused conv stays fused at
+     T=1), swiglu launch_decode<16,9216,2560>; runtime-K MMA launchers
+     (gdn/attn 35B branches now pass weight.k).
+   - Route tables: attn 10240->kTarget2BRoutes, linear_add rows-2560
+     k∈{4096,9216} -> kQ2BRoutes, swiglu kQ4BRoutes {1 DecodePairR16 /
+     2-256 MmaR32C64 / 257+ MmaR64C128}, w8_dispatch case 2560 (heads) and
+     case 5120 n==2560 (mtp fc).
+   - GDN gating: k 2560 = 40 K-tiles, so split-32/16 are indivisible —
+     `Bf16Gdn4BGeometry` {32 heads, 2560} + `k4BRoutes` (short-cols drops
+     Split16->Split8), fused-norm decode runs split-8 for 4b (norm producer
+     loop generalized from one-tile-per-split to kTilesPerSplit; the SplitK
+     reduction was already generic), capacity gate widened to rows 2560.
+   - GDN conv snapshot: wrapper split-dimension gates admit 12288/2560 (the
+     value/z split derives from parent rows, already 35B-correct); the
+     35B-baked split-K fused conv kernel is bypassed for k!=2048 (4b takes
+     the generic project-then-conv path like 0.8b/2b; port tracked).
+   - GQA: `Gqa4BGeometry` <16,4,2>. QHeads 16 collides with the 35B (16/2),
+     so dispatchers resolve the pair through the KV-cache head count
+     (`kv_heads_for_pair`); split capacity is scale-keyed and identical to
+     the 35B's; KV append reuses the KVHeads-4 instantiation.
+   - Frontend: the 4B tokenizer chat template is the family template with the
+     default-thinking branch flipped (undefined enable_thinking -> think);
+     the engine always renders with an explicit toggle, so the digest maps to
+     the same ThinkingToggle semantics.
+
+   Artifact converts from the HF checkpoint in 31.8 s (5.39 GB). E2E: full
+   load + engine construction + H2D green on sm_120 (all capacity/admission
+   gates pass); first-tokens verification and the perf pass against the
+   measured vLLM 4B board (decode 100/115/162 tok/s bf16/fp8/nvfp4,
+   prefill@1912 12.7k/19.7k/35.2k) are queued for the next GPU window.
+
 ### sm_89 port status
 
 With patches 5–10 the **entire tree compiles and links for sm_89**

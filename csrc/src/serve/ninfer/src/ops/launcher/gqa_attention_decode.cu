@@ -397,6 +397,14 @@ void gqa_attention_small_t_launch(const Tensor& q, const Tensor& k, const Tensor
                                                         out, stream);
         return;
     }
+    // surogate vendor patch (PATCHES.md #18): qwen3.5-4b shares QHeads 16 with
+    // the 35B; the cache resolves the pair.
+    if (cache.num_kv_heads == Gqa4BGeometry::KVHeads) {
+        gqa_attention_small_t_launch_for<Gqa4BGeometry>(q, input, pos, scale, cache, invocation,
+                                                        envelope, partial_acc, partial_m,
+                                                        partial_l, out, stream);
+        return;
+    }
     gqa_attention_small_t_launch_for<Gqa35Geometry>(q, input, pos, scale, cache, invocation,
                                                     envelope, partial_acc, partial_m, partial_l,
                                                     out, stream);
@@ -425,6 +433,14 @@ void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, flo
     }
     if (q.ne[1] == Gqa08Geometry::QHeads) {
         gqa_attention_small_t_launch_for<Gqa08Geometry>(q, input, pos, scale, batch_cache,
+                                                        invocation, envelope, partial_acc,
+                                                        partial_m, partial_l, out, stream);
+        return;
+    }
+    // surogate vendor patch (PATCHES.md #18): see above — the cache resolves
+    // the 16-query pair.
+    if (batch_cache.num_kv_heads == Gqa4BGeometry::KVHeads) {
+        gqa_attention_small_t_launch_for<Gqa4BGeometry>(q, input, pos, scale, batch_cache,
                                                         invocation, envelope, partial_acc,
                                                         partial_m, partial_l, out, stream);
         return;

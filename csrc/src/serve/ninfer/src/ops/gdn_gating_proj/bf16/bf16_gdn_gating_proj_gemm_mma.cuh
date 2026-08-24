@@ -62,10 +62,18 @@ struct Bf16Gdn2BGeometry {
     static constexpr int kBlockN = 64;
 };
 
+// surogate vendor patch (PATCHES.md #18): qwen3.5-4b (32 GDN heads, 2560 hidden).
+struct Bf16Gdn4BGeometry {
+    static constexpr int kHeads  = 32;
+    static constexpr int kHidden = 2560;
+    static constexpr int kBlockN = 64;
+};
+
 static_assert(Bf16Gdn27Geometry::kHidden % kBf16GdnBlockK == 0);
 static_assert(Bf16Gdn35Geometry::kHidden % kBf16GdnBlockK == 0);
 static_assert(Bf16Gdn08Geometry::kHidden % kBf16GdnBlockK == 0);
 static_assert(Bf16Gdn2BGeometry::kHidden % kBf16GdnBlockK == 0);
+static_assert(Bf16Gdn4BGeometry::kHidden % kBf16GdnBlockK == 0);
 
 __device__ __forceinline__ int bf16_gdn_swizzle(int row, int col) {
     return (col & ~63) + gemm_swz64(row, col & 63);
@@ -111,16 +119,18 @@ __global__ __launch_bounds__(Warps * 32, 1) void bf16_gdn_gating_proj_gemm_mma_k
     const int kt_begin = split * kTilesPerSplit;
 
     if constexpr (NormalizeInput) {
-        static_assert(SplitK == 32, "fused input normalization is tuned for split-32");
         static_assert(NormTokenCapacity > 0 && NormTokenCapacity <= 16);
-        constexpr int kLocalPairs     = kBf16GdnBlockK / 2;
+        // surogate vendor patch (PATCHES.md #18): the slice covers kTilesPerSplit
+        // K tiles, not one — split-32 (35b, one tile each) and split-8 (4b, five
+        // tiles each) share this path.
+        constexpr int kSlicePairs     = kTilesPerSplit * (kBf16GdnBlockK / 2);
         const auto* x2                = reinterpret_cast<const __nv_bfloat162*>(x);
         const int token_count         = min(kBf16GdnBlockN, t - token0);
         float sums[NormTokenCapacity] = {};
-        // One warp from row tile zero contributes a 64-element norm slice. The existing post-MMA
-        // cooperative handoff reduces the 32 slices, so normalization adds no grid-wide barrier.
+        // One warp from row tile zero contributes its split's norm slice. The existing post-MMA
+        // cooperative handoff reduces the SplitK slices, so normalization adds no grid-wide barrier.
         if (blockIdx.y == 0 && warp == 0) {
-            for (int pair = lane; pair < kLocalPairs; pair += kWarpSize) {
+            for (int pair = lane; pair < kSlicePairs; pair += kWarpSize) {
 #pragma unroll
                 for (int token_local = 0; token_local < NormTokenCapacity; ++token_local) {
                     if (token_local >= token_count) { continue; }

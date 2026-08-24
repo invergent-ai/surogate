@@ -225,7 +225,9 @@ bool w8_linear_add_admits(const W8LinearAddProblem& problem) noexcept {
     const bool base = problem.rows == 2048 && (problem.k == 4096 || problem.k == 6144);
     const bool q08  = problem.rows == 1024 && (problem.k == 2048 || problem.k == 3584);
     const bool q2b  = problem.rows == 2048 && problem.k == 2048;
-    return (base || q08 || q2b) && problem.padded_k == problem.k && problem.cols >= 1;
+    // surogate vendor patch (PATCHES.md #18): qwen3.5-4b output/down.
+    const bool q4b  = problem.rows == 2560 && (problem.k == 4096 || problem.k == 9216);
+    return (base || q08 || q2b || q4b) && problem.padded_k == problem.k && problem.cols >= 1;
 }
 
 W8LinearAddPlan w8_linear_add_resolve_plan(const W8LinearAddProblem& problem) {
@@ -245,6 +247,9 @@ W8LinearAddPlan w8_linear_add_resolve_plan(const W8LinearAddProblem& problem) {
     // bench/ops/q08_route_sweep_bench: 472 -> r32c96 63.5us, 888 -> r48c128
     // 102.8us (+26% over r32c128), 1024 -> r32c128, 1912 -> r48c128).
     if (problem.k == 2048) { return resolve_from(kQ2BRoutes); }
+    // qwen3.5-4b (2560 rows): the exact-T bakes don't cover it either;
+    // measured-class runtime schedules (A8 takes T >= 224 anyway).
+    if (problem.rows == 2560) { return resolve_from(kQ2BRoutes); }
     return problem.k == 6144 ? resolve_from(kK6144Routes) : resolve_from(kK4096Routes);
 }
 

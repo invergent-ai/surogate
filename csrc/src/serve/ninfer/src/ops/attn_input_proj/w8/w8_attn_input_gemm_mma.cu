@@ -39,6 +39,15 @@ void w8_attn_input_mma_r32_c128_launch(const Tensor& x, const Weight& weight, Te
                                        Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream) {
     using Schedule = W8RowSplitMmaGemmSchedule<32, 128, 32, 16, 2>;
     static_assert((4096 % Schedule::BM) == 0 && (512 % Schedule::BM) == 0);
+    // surogate vendor patch (PATCHES.md #18): qwen3.5-4b fused qkgv.
+    if (weight.n == 10240) {
+        using Output4B = W8SplitOutput4<4096, 1024, 4096, 1024>;
+        const Output4B output{
+            static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
+            static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(v.data)};
+        launch_route<Schedule, 10240, 2560>(x, weight, output, stream);
+        return;
+    }
     // surogate vendor patches (PATCHES.md #13/#16): qwen3.5-0.8b/-2b qkgv.
     if (weight.n == 5120) {
         using Output08 = W8SplitOutput4<2048, 512, 2048, 512>;
@@ -62,6 +71,15 @@ void w8_attn_input_mma_r64_c128_launch(const Tensor& x, const Weight& weight, Te
                                        Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream) {
     using Schedule = W8RowSplitMmaGemmSchedule<64, 128, 64, 16, 2, 2>;
     static_assert((4096 % Schedule::BM) == 0 && (512 % Schedule::BM) == 0);
+    // surogate vendor patch (PATCHES.md #18): qwen3.5-4b fused qkgv.
+    if (weight.n == 10240) {
+        using Output4B = W8SplitOutput4<4096, 1024, 4096, 1024>;
+        const Output4B output{
+            static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
+            static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(v.data)};
+        launch_route<Schedule, 10240, 2560>(x, weight, output, stream);
+        return;
+    }
     // surogate vendor patches (PATCHES.md #13/#16): qwen3.5-0.8b/-2b qkgv.
     if (weight.n == 5120) {
         using Output08 = W8SplitOutput4<2048, 512, 2048, 512>;

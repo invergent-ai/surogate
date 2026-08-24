@@ -135,6 +135,12 @@ void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positi
                                                                  metadata, out, stream);
         return;
     }
+    // surogate vendor patch (PATCHES.md #18): the cache resolves the 16-query pair.
+    if (cache.num_kv_heads == Gqa4BGeometry::KVHeads) {
+        gqa_attention_prompt_attention_launch_for<Gqa4BGeometry>(q, positions, scale, cache,
+                                                                 metadata, out, stream);
+        return;
+    }
     gqa_attention_prompt_attention_launch_for<Gqa35Geometry>(q, positions, scale, cache, metadata,
                                                              out, stream);
 }
@@ -172,6 +178,14 @@ void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor&
             // KV append is GroupSize-independent; Gqa08's KVHeads matches.
             gqa_kv_append_launch_for<Gqa08Geometry>(k, v, positions, cache, metadata, stream);
             gqa_attention_prompt_attention_launch_for<Gqa08Geometry>(q, positions, scale, cache,
+                                                                     metadata, out, stream);
+            return;
+        }
+        // surogate vendor patch (PATCHES.md #18): the cache resolves the
+        // 16-query pair; KV append only uses KVHeads.
+        if (cache.num_kv_heads == Gqa4BGeometry::KVHeads) {
+            gqa_kv_append_launch_for<Gqa4BGeometry>(k, v, positions, cache, metadata, stream);
+            gqa_attention_prompt_attention_launch_for<Gqa4BGeometry>(q, positions, scale, cache,
                                                                      metadata, out, stream);
             return;
         }

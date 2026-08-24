@@ -315,6 +315,8 @@ def gguf_target_key(gguf_path: Path, reader=None):
         return "qwen3_5_0_8b"
     if arch in ("qwen35", "qwen3_5") and hidden == 2048 and layers in (24, 25):
         return "qwen3_5_2b"
+    if arch in ("qwen35", "qwen3_5") and hidden == 2560 and layers in (32, 33):
+        return "qwen3_5_4b"
     if arch in ("qwen38", "qwen3_8") and hidden == 5120:
         return "qwen3_8_27b"
     if arch in ("qwen35moe", "qwen3moe", "qwen3_6_moe", "qwen3_5_moe") and hidden > 0:

@@ -267,11 +267,12 @@ void require_rowsplit(const Weight& weight, QType qtype, std::int32_t rows, cons
 }
 
 void require_w8_rowsplit(const Weight& weight, std::int32_t rows, const char* label) {
-    // surogate vendor patch (PATCHES.md #13): K 2048 (35B) or 1024 (qwen3.5-0.8b).
+    // surogate vendor patch (PATCHES.md #13/#18): K 2048 (35B), 1024
+    // (qwen3.5-0.8b), or 2560 (qwen3.5-4b).
     const std::int32_t k = weight.k;
     if (weight.qtype != QType::W8G32_F16S || weight.layout != QuantLayout::RowSplit ||
         weight.scale_dtype != DType::FP16 || weight.group_size != 32 || weight.group != 32 ||
-        weight.ndim != 2 || weight.n != rows || (k != 2048 && k != 1024) ||
+        weight.ndim != 2 || weight.n != rows || (k != 2048 && k != 1024 && k != 2560) ||
         weight.shape[0] != rows || weight.shape[1] != k || weight.padded_shape[0] != rows ||
         weight.padded_shape[1] != k || weight.qhigh != nullptr || weight.high_plane_bytes != 0 ||
         !aligned_to(weight.qdata, 16) || !aligned_to(weight.scales, 16)) {
@@ -569,10 +570,11 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
             snapshot_base_slots, query, key, value, z, stream);
         return;
     }
-    if (plan.schedule == detail::W8GdnInputConvScheduleId::SplitKMmaFused && !small_fused) {
-        // surogate vendor patch (PATCHES.md #13/#16): the fused split-K conv
-        // kernel bakes the 35B geometry (port tracked); the 0.8b/2b take the
-        // generic project-then-conv path below instead.
+    if (plan.schedule == detail::W8GdnInputConvScheduleId::SplitKMmaFused && !small_fused &&
+        weight.k == 2048) {
+        // surogate vendor patch (PATCHES.md #13/#16/#18): the fused split-K
+        // conv kernel bakes the 35B geometry (port tracked); the 0.8b/2b/4b
+        // take the generic project-then-conv path below instead.
         detail::w8_gdn_input_splitk_conv_snapshot_launch(
             x, weight, conv_weight, conv_states, valid_columns, initial_state_slots,
             snapshot_base_slots, query, key, value, z, stream);
@@ -785,7 +787,7 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int
     // AllowA8 large-T sizes the quantized-activation workspace.
     if (parent_qtype == QType::W8G32_F16S &&
         (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) &&
-        ((parent_rows == 12288 && input_rows == 2048) ||
+        ((parent_rows == 12288 && (input_rows == 2048 || input_rows == 2560)) ||
          (parent_rows == 8192 && (input_rows == 1024 || input_rows == 2048)))) {
         const std::int32_t qkv_rows = parent_rows == 12288 ? 8192 : 6144;
         const std::int32_t z_rows   = parent_rows == 12288 ? 4096 : 2048;
@@ -871,7 +873,7 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     // qwen3.5-0.8b 8192/1024) size through the split-dimension path.
     if (parent_qtype == QType::W8G32_F16S &&
         (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) &&
-        ((parent_rows == 12288 && input_rows == 2048) ||
+        ((parent_rows == 12288 && (input_rows == 2048 || input_rows == 2560)) ||
          (parent_rows == 8192 && (input_rows == 1024 || input_rows == 2048)))) {
         const std::int32_t value_rows = parent_rows == 12288 ? 4096 : 2048;
         return gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, value_rows,
@@ -935,7 +937,7 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     // record path, mirroring the snapshot overload above.
     if (parent_qtype == QType::W8G32_F16S &&
         (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) &&
-        ((parent_rows == 12288 && input_rows == 2048) ||
+        ((parent_rows == 12288 && (input_rows == 2048 || input_rows == 2560)) ||
          (parent_rows == 8192 && (input_rows == 1024 || input_rows == 2048)))) {
         const std::int32_t value_rows = parent_rows == 12288 ? 4096 : 2048;
         return gdn_input_proj_conv_record_workspace_capacity_bytes(2048, 2048, value_rows,

@@ -80,6 +80,17 @@ void w8_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& q
     constexpr int kRows = 12288;
     static_assert((8192 % kRowsPerCta) == 0 && (4096 % kRowsPerCta) == 0);
     const Output output{static_cast<__nv_bfloat16*>(qkv.data), static_cast<__nv_bfloat16*>(z.data)};
+    // surogate vendor patch (PATCHES.md #18): qwen3.5-4b shares the 35B fused
+    // row structure at hidden 2560.
+    if (weight.k == 2560) {
+        w8_k2048_decode_kernel<kRows, kRowsPerCta, Output, W8DecodeStoreEpilogue, 2560>
+            <<<kRows / kRowsPerCta, kRowsPerCta * 32, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(x.data),
+                static_cast<const std::uint8_t*>(weight.qdata),
+                static_cast<const std::uint8_t*>(weight.scales), output);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     w8_k2048_decode_kernel<kRows, kRowsPerCta>
         <<<kRows / kRowsPerCta, kRowsPerCta * 32, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
@@ -128,6 +139,17 @@ void w8_gdn_input_decode_conv_snapshot_launch(
         static_cast<__nv_bfloat16*>(z.data),
         8192,
     };
+    // surogate vendor patch (PATCHES.md #18): qwen3.5-4b shares the 35B fused
+    // row structure at hidden 2560.
+    if (weight.k == 2560) {
+        w8_k2048_decode_kernel<kRows, kRowsPerCta, Output, W8GdnDecodeConvEpilogue, 2560>
+            <<<kRows / kRowsPerCta, kRowsPerCta * 32, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(x.data),
+                static_cast<const std::uint8_t*>(weight.qdata),
+                static_cast<const std::uint8_t*>(weight.scales), ignored_output, epilogue);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     w8_k2048_decode_kernel<kRows, kRowsPerCta, Output, W8GdnDecodeConvEpilogue>
         <<<kRows / kRowsPerCta, kRowsPerCta * 32, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),

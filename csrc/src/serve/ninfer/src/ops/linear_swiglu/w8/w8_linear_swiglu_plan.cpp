@@ -63,13 +63,36 @@ constexpr std::array<RouteSpec, 18> kQ08Routes = [] {
     return routes;
 }();
 
+// surogate vendor patch (PATCHES.md #18): qwen3.5-4b — no exact-T
+// instantiations at k=2560; decode plus the runtime-shaped MMA bands
+// (the engine's A8 path takes T >= 224 regardless).
+constexpr std::array<RouteSpec, 3> kQ4BRoutes{{
+    {1, 1, W8LinearSwiGluScheduleId::DecodePairR16},
+    {2, 256, W8LinearSwiGluScheduleId::MmaR32C64},
+    {257, kAnyCols, W8LinearSwiGluScheduleId::MmaR64C128},
+}};
+
+static_assert(
+    [] {
+        std::int64_t expected = 1;
+        for (const RouteSpec& route : kQ4BRoutes) {
+            if (route.first != expected || route.first > route.last) { return false; }
+            expected = static_cast<std::int64_t>(route.last) + 1;
+        }
+        return expected == static_cast<std::int64_t>(kAnyCols) + 1;
+    }(),
+    "W8 LinearSwiGLU 4b routes must be exact and closed");
+
 bool supported_shape(const W8LinearSwiGluProblem& problem) noexcept {
     // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b mlp {7168->3584, k=1024}.
     const bool base = problem.gate_up_rows == 12288 && problem.output_rows == 6144 &&
                       problem.k == 2048 && problem.padded_k == 2048;
     const bool q08 = problem.gate_up_rows == 7168 && problem.output_rows == 3584 &&
                      problem.k == 1024 && problem.padded_k == 1024;
-    return base || q08;
+    // surogate vendor patch (PATCHES.md #18): qwen3.5-4b mlp.
+    const bool q4b = problem.gate_up_rows == 18432 && problem.output_rows == 9216 &&
+                     problem.k == 2560 && problem.padded_k == 2560;
+    return base || q08 || q4b;
 }
 
 } // namespace
@@ -114,6 +137,16 @@ W8LinearSwiGluPlan w8_linear_swiglu_resolve_plan(const W8LinearSwiGluProblem& pr
     if (!w8_linear_swiglu_admits(problem)) {
         throw std::invalid_argument(
             "W8 LinearSwiGLU: exact problem or column count is not admitted");
+    }
+    // 4b (k=2560) has no exact-T instantiations: decode + the runtime-shaped
+    // mma bands only (A8 takes T >= 224 in the engine anyway).
+    if (problem.k == 2560) {
+        for (const RouteSpec& route : kQ4BRoutes) {
+            if (problem.cols >= route.first && problem.cols <= route.last) {
+                return {route.schedule};
+            }
+        }
+        throw std::logic_error("W8 LinearSwiGLU: 4b problem has no route");
     }
     const auto& routes = problem.k == 1024 ? kQ08Routes : kRoutes;
     for (const RouteSpec& route : routes) {

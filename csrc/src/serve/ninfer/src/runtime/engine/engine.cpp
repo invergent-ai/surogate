@@ -132,10 +132,12 @@ class Engine::Impl {
 public:
     using Executor08 = runtime::ConcurrentExecutor<targets::Qwen3_5_0_8BInstance>;
     using Executor2B = runtime::ConcurrentExecutor<targets::Qwen3_5_2BInstance>;
+    using Executor4B = runtime::ConcurrentExecutor<targets::Qwen3_5_4BInstance>;
     using Executor27 = runtime::ConcurrentExecutor<targets::Qwen3_6_27BInstance>;
     using Executor35 = runtime::ConcurrentExecutor<targets::Qwen3_6_35BA3BInstance>;
     using Executor   = std::variant<std::monostate, std::unique_ptr<Executor08>,
-                                  std::unique_ptr<Executor2B>, std::unique_ptr<Executor27>,
+                                  std::unique_ptr<Executor2B>, std::unique_ptr<Executor4B>,
+                                  std::unique_ptr<Executor27>,
                                   std::unique_ptr<Executor35>>;
 
     explicit Impl(EngineOptions engine_options)
@@ -152,6 +154,8 @@ public:
                     return std::make_unique<Executor08>(*target_ptr, options);
                 } else if constexpr (std::is_same_v<Instance, targets::Qwen3_5_2BInstance>) {
                     return std::make_unique<Executor2B>(*target_ptr, options);
+                } else if constexpr (std::is_same_v<Instance, targets::Qwen3_5_4BInstance>) {
+                    return std::make_unique<Executor4B>(*target_ptr, options);
                 } else if constexpr (std::is_same_v<Instance, targets::Qwen3_6_27BInstance>) {
                     return std::make_unique<Executor27>(*target_ptr, options);
                 } else {

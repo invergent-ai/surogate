@@ -198,7 +198,8 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         // {1024,2048|3584} and qwen3.5-2b output projections {2048,2048}.
         const bool base = w.n == 2048 && (w.k == 4096 || w.k == 6144 || w.k == 2048);
         const bool q08  = w.n == 1024 && (w.k == 2048 || w.k == 3584);
-        if (!base && !q08) {
+        const bool q4b  = w.n == 2560 && (w.k == 4096 || w.k == 9216);
+        if (!base && !q08 && !q4b) {
             throw std::invalid_argument("linear_add: unsupported W8 shape");
         }
         if (!aligned_to(x.data, 16) || !aligned_to(residual_out.data, 16) ||

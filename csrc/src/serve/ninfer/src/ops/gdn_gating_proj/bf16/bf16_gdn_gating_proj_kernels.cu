@@ -36,6 +36,7 @@ constexpr int k35LogicalRows = 2 * k35N;
 constexpr int k08N           = 16;
 constexpr int k08K           = 1024;
 constexpr int k2BK           = 2048;  // surogate vendor patch (PATCHES.md #16)
+constexpr int k4BK           = 2560;  // surogate vendor patch (PATCHES.md #18)
 constexpr int k08LogicalRows = 2 * k08N;
 
 template <int TokenTile, int KSlice, int RowsPerBlock>
@@ -509,10 +510,24 @@ void bf16_gdn_norm_gating_proj_35_mma_split32_launch(Bf16GdnGatingTokenVariant v
                                                      Tensor& g, Tensor& beta, cudaStream_t stream) {
     // 0.8b: fused-norm split-32 path is 35B-only; the plan never routes
     // is_08 problems here (unfused schedule is selected instead).
-    require_shape35(a_weight, "a_weight");
-    require_shape35(b_weight, "b_weight");
+    // surogate vendor patch (PATCHES.md #18): qwen3.5-4b rides it at k 2560.
+    if (a_weight.k == k4BK) {
+        require_shape_nk<k35N, k4BK>(a_weight, "a_weight");
+        require_shape_nk<k35N, k4BK>(b_weight, "b_weight");
+    } else {
+        require_shape35(a_weight, "a_weight");
+        require_shape35(b_weight, "b_weight");
+    }
+    const bool is_4b  = a_weight.k == k4BK;
     const auto launch = [&](auto token_capacity) {
         constexpr int TokenCapacity = decltype(token_capacity)::value;
+        if (is_4b) {
+            // 2560 has 40 K-tiles: split-32 does not divide, split-8 does.
+            launch_bf16_prefill_mma<Bf16Gdn4BGeometry, 8, 8, true, TokenCapacity>(
+                variant, x, &norm_weight, eps, &h, a_weight, b_weight, A_log, dt_bias, workspace,
+                g, beta, stream);
+            return;
+        }
         launch_bf16_prefill_mma<Bf16Gdn35Geometry, 32, 8, true, TokenCapacity>(
             variant, x, &norm_weight, eps, &h, a_weight, b_weight, A_log, dt_bias, workspace, g,
             beta, stream);
@@ -579,6 +594,15 @@ void bf16_gdn_gating_proj_35_mma_split8_launch(Bf16GdnGatingTokenVariant variant
                                                          stream);
         return;
     }
+    // surogate vendor patch (PATCHES.md #18): qwen3.5-4b (32 heads, k 2560).
+    if (a_weight.k == k4BK) {
+        require_shape_nk<k35N, k4BK>(a_weight, "a_weight");
+        require_shape_nk<k35N, k4BK>(b_weight, "b_weight");
+        launch_bf16_prefill_mma<Bf16Gdn4BGeometry, 8, 8>(variant, x, nullptr, 0.0F, nullptr, a_weight,
+                                                         b_weight, A_log, dt_bias, workspace, g, beta,
+                                                         stream);
+        return;
+    }
     require_shape35(a_weight, "a_weight");
     require_shape35(b_weight, "b_weight");
     launch_bf16_prefill_mma<Bf16Gdn35Geometry, 8, 8>(variant, x, nullptr, 0.0F, nullptr, a_weight,
@@ -603,6 +627,15 @@ void bf16_gdn_gating_proj_35_mma_split4_launch(Bf16GdnGatingTokenVariant variant
         require_shape_nk<k08N, k2BK>(a_weight, "a_weight");
         require_shape_nk<k08N, k2BK>(b_weight, "b_weight");
         launch_bf16_prefill_mma<Bf16Gdn2BGeometry, 4, 8>(variant, x, nullptr, 0.0F, nullptr, a_weight,
+                                                         b_weight, A_log, dt_bias, workspace, g, beta,
+                                                         stream);
+        return;
+    }
+    // surogate vendor patch (PATCHES.md #18): qwen3.5-4b (32 heads, k 2560).
+    if (a_weight.k == k4BK) {
+        require_shape_nk<k35N, k4BK>(a_weight, "a_weight");
+        require_shape_nk<k35N, k4BK>(b_weight, "b_weight");
+        launch_bf16_prefill_mma<Bf16Gdn4BGeometry, 4, 8>(variant, x, nullptr, 0.0F, nullptr, a_weight,
                                                          b_weight, A_log, dt_bias, workspace, g, beta,
                                                          stream);
         return;
@@ -635,6 +668,15 @@ void bf16_gdn_gating_proj_35_mma_split2_launch(Bf16GdnGatingTokenVariant variant
                                                          stream);
         return;
     }
+    // surogate vendor patch (PATCHES.md #18): qwen3.5-4b (32 heads, k 2560).
+    if (a_weight.k == k4BK) {
+        require_shape_nk<k35N, k4BK>(a_weight, "a_weight");
+        require_shape_nk<k35N, k4BK>(b_weight, "b_weight");
+        launch_bf16_prefill_mma<Bf16Gdn4BGeometry, 2, 8>(variant, x, nullptr, 0.0F, nullptr, a_weight,
+                                                         b_weight, A_log, dt_bias, workspace, g, beta,
+                                                         stream);
+        return;
+    }
     require_shape35(a_weight, "a_weight");
     require_shape35(b_weight, "b_weight");
     launch_bf16_prefill_mma<Bf16Gdn35Geometry, 2, 8>(variant, x, nullptr, 0.0F, nullptr, a_weight,
@@ -658,6 +700,15 @@ void bf16_gdn_gating_proj_35_mma_unsplit_launch(Bf16GdnGatingTokenVariant varian
         require_shape_nk<k08N, k2BK>(a_weight, "a_weight");
         require_shape_nk<k08N, k2BK>(b_weight, "b_weight");
         launch_bf16_prefill_mma<Bf16Gdn2BGeometry, 1, 8>(variant, x, nullptr, 0.0F, nullptr, a_weight,
+                                                         b_weight, A_log, dt_bias, nullptr, g, beta,
+                                                         stream);
+        return;
+    }
+    // surogate vendor patch (PATCHES.md #18): qwen3.5-4b (32 heads, k 2560).
+    if (a_weight.k == k4BK) {
+        require_shape_nk<k35N, k4BK>(a_weight, "a_weight");
+        require_shape_nk<k35N, k4BK>(b_weight, "b_weight");
+        launch_bf16_prefill_mma<Bf16Gdn4BGeometry, 1, 8>(variant, x, nullptr, 0.0F, nullptr, a_weight,
                                                          b_weight, A_log, dt_bias, nullptr, g, beta,
                                                          stream);
         return;

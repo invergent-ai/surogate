@@ -27,6 +27,23 @@ void w8_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& 
                                  Tensor& k, Tensor& v, cudaStream_t stream) {
     // surogate vendor patch (PATCHES.md #13/#16): qwen3.5-0.8b/-2b fused qkgv
     // (5120 rows = q2048|k512|gate2048|v512; hidden 1024 or 2048).
+    // surogate vendor patch (PATCHES.md #18): qwen3.5-4b fused qkgv.
+    if (weight.n == 10240) {
+        constexpr int kRows4B       = 10240;
+        constexpr int kRowsPerCta4B = 8;
+        using Output4B              = W8SplitOutput4<4096, 1024, 4096, 1024>;
+        const Output4B output{static_cast<__nv_bfloat16*>(q.data),
+                              static_cast<__nv_bfloat16*>(k.data),
+                              static_cast<__nv_bfloat16*>(gate.data),
+                              static_cast<__nv_bfloat16*>(v.data)};
+        w8_k2048_decode_kernel<kRows4B, kRowsPerCta4B, Output4B, W8DecodeStoreEpilogue, 2560>
+            <<<kRows4B / kRowsPerCta4B, kRowsPerCta4B * 32, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(x.data),
+                static_cast<const std::uint8_t*>(weight.qdata),
+                static_cast<const std::uint8_t*>(weight.scales), output);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     if (weight.n == 5120) {
         constexpr int kRows08       = 5120;
         constexpr int kRowsPerCta08 = 8;

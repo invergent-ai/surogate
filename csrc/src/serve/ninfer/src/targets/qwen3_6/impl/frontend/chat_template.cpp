@@ -43,6 +43,15 @@ constexpr Sha256Digest kQwen35UnslothThinkingToggleTemplateDigest{
     0x77, 0xf4, 0x3b, 0xe7, 0x54, 0xa9, 0x4e, 0x27, 0x25, 0xa5, 0x8c, 0x4e, 0x16, 0xd2, 0xed, 0x67,
 };
 
+// surogate vendor patch (PATCHES.md #18): the Qwen3.5-4B tokenizer template is
+// the family template with the default-thinking branch flipped (undefined
+// enable_thinking renders <think> instead of the empty block). The engine
+// always renders with an explicit toggle, so the semantics are unchanged.
+constexpr Sha256Digest kQwen354BThinkingToggleTemplateDigest{
+    0xa4, 0xae, 0xe8, 0xaf, 0xcf, 0x2e, 0x07, 0x11, 0x94, 0x2c, 0xf8, 0x48, 0x89, 0x9b, 0xe6, 0x60,
+    0x16, 0xf8, 0xd1, 0x4a, 0x88, 0x9f, 0xf9, 0xed, 0xe0, 0x7b, 0xca, 0x09, 0x9c, 0x28, 0xf7, 0x15,
+};
+
 constexpr std::string_view kLowReasoningInstructions =
     "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to "
     "the conclusion without unnecessary elaboration.";
@@ -310,7 +319,8 @@ std::string ChatMessage::rendered_content(bool add_vision_id, int* image_count,
 CompiledChatTemplate CompiledChatTemplate::resolve(std::string_view source) {
     const Sha256Digest digest = sha256(source);
     if (digest == kThinkingToggleTemplateDigest || digest == kQwen35ThinkingToggleTemplateDigest ||
-        digest == kQwen35UnslothThinkingToggleTemplateDigest) {
+        digest == kQwen35UnslothThinkingToggleTemplateDigest ||
+        digest == kQwen354BThinkingToggleTemplateDigest) {
         return CompiledChatTemplate(ChatTemplateSemantics::ThinkingToggle);
     }
     if (digest == kReasoningEffortTemplateDigest) {

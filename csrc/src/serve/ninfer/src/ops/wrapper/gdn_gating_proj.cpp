@@ -66,6 +66,11 @@ GdnControlParentGeometry require_bf16_parent(const Weight& parent) {
         require_bf16_weight(parent, 32, 2048, "ab_weight");
         return {.input_rows = 2048, .heads = 16};
     }
+    // surogate vendor patch (PATCHES.md #18): qwen3.5-4b (32 GDN heads, 2560 hidden).
+    if (parent.n == 64 && parent.k == 2560) {
+        require_bf16_weight(parent, 64, 2560, "ab_weight");
+        return {.input_rows = 2560, .heads = 32};
+    }
     throw std::invalid_argument("gdn_gating_proj: unsupported ab_weight geometry");
 }
 
@@ -112,7 +117,7 @@ void gdn_gating_proj(const Tensor& x, const Weight& a_weight, const Weight& b_we
     const std::int32_t heads = a_weight.n;
     const std::int32_t rows  = a_weight.k;
     if (!((heads == 48 && rows == 5120) || (heads == 16 && rows == 1024) ||
-          (heads == 16 && rows == 2048))) {
+          (heads == 16 && rows == 2048) || (heads == 32 && rows == 2560))) {
         throw std::invalid_argument(std::string(op) + ": unsupported gating geometry");
     }
     require_sequence_tensor(x, DType::BF16, rows, tokens, op, "x");
@@ -154,7 +159,7 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
     const std::int32_t heads = a_weight.n;
     const std::int32_t rows  = a_weight.k;
     if (!((heads == 48 && rows == 5120) || (heads == 16 && rows == 1024) ||
-          (heads == 16 && rows == 2048))) {
+          (heads == 16 && rows == 2048) || (heads == 32 && rows == 2560))) {
         throw std::invalid_argument(std::string(op) + ": unsupported gating geometry");
     }
     if (!(eps > 0.0F) || !std::isfinite(eps)) {
