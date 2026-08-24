@@ -173,6 +173,15 @@
    GDN 16/16, conv 6144, gated rmsnorm, embedding d=2048) were already
    covered.
 
+   E2E (idle 5090): first tokens EXACT on the first run ("SUROGATE SERVE
+   OK", stop-token; both thinking modes coherent). vs vLLM 0.27.1 bf16:
+   decode 320-330 vs ~197 tok/s (+66%); prefill ahead through ~500 tokens,
+   behind by 7-12% at 962+/1912 (same W8->BF16-MMA structural ceiling as
+   the 0.8b — the FP8-MMA path fixes both). linear_add {2048,2048} carries
+   a measured route table (r32c96/r48c128/r32c128 bands); qkgv/qkvz 2B
+   candidates measured within ~4% of the current routes (kept). Full GPU
+   ctest re-run after the shared-wrapper generalizations: see log.
+
 ### sm_89 port status
 
 With patches 5–10 the **entire tree compiles and links for sm_89**

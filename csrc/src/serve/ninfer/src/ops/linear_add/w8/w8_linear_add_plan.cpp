@@ -78,6 +78,16 @@ constexpr std::array<RouteSpec, 4> kQ08Routes{{
     {1025, kAnyCols, W8LinearAddScheduleId::MmaR48C128},
 }};
 
+// qwen3.5-2b {2048,2048}: no exact-T instantiations at k=2048 (those are
+// 2048x{4096,6144} bakes), so measured runtime-shaped schedules throughout.
+constexpr std::array<RouteSpec, 5> kQ2BRoutes{{
+    {1, 4, W8LinearAddScheduleId::SimtR8C4},
+    {5, 512, W8LinearAddScheduleId::MmaR32C96},
+    {513, 900, W8LinearAddScheduleId::MmaR48C128},
+    {901, 1024, W8LinearAddScheduleId::MmaR32C128},
+    {1025, kAnyCols, W8LinearAddScheduleId::MmaR48C128},
+}};
+
 template <std::size_t N>
 constexpr bool routes_are_closed(const std::array<RouteSpec, N>& routes) {
     std::int64_t expected = 1;
@@ -89,7 +99,8 @@ constexpr bool routes_are_closed(const std::array<RouteSpec, N>& routes) {
 }
 
 static_assert(routes_are_closed(kK4096Routes) && routes_are_closed(kK6144Routes) &&
-                  routes_are_closed(kQ08Routes),
+                  routes_are_closed(kQ08Routes) &&
+                  routes_are_closed(kQ2BRoutes),
               "W8 LinearAdd routes must be exact, contiguous, and closed");
 
 std::int32_t schedule_rows(W8LinearAddScheduleId schedule) {
@@ -230,10 +241,10 @@ W8LinearAddPlan w8_linear_add_resolve_plan(const W8LinearAddProblem& problem) {
         throw std::logic_error("w8 linear_add: admitted problem has no covering route");
     };
     if (problem.rows == 1024) { return resolve_from(kQ08Routes); }
-    // qwen3.5-2b output projections: k==2048 has no exact-T instantiations
-    // (SplitKMma/Medium/Decode are 2048x{4096,6144} bakes) — route over the
-    // runtime-shaped schedules, following the measured q08 pattern.
-    if (problem.k == 2048) { return resolve_from(kQ08Routes); }
+    // qwen3.5-2b output projections (measured on an idle RTX 5090,
+    // bench/ops/q08_route_sweep_bench: 472 -> r32c96 63.5us, 888 -> r48c128
+    // 102.8us (+26% over r32c128), 1024 -> r32c128, 1912 -> r48c128).
+    if (problem.k == 2048) { return resolve_from(kQ2BRoutes); }
     return problem.k == 6144 ? resolve_from(kK6144Routes) : resolve_from(kK4096Routes);
 }
 

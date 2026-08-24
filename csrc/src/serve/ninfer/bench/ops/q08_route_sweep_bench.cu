@@ -47,6 +47,11 @@ constexpr Case kCases[] = {
     {"down_1024x3584", 1024, 3584},
     {"output_1024x2048", 1024, 2048},
     {"qkgv_5120x1024", 5120, 1024},
+    // qwen3.5-2b-specific shapes (PATCHES.md #16); its gate_up/down are the
+    // measured 35B shapes already.
+    {"qkgv_5120x2048", 5120, 2048},
+    {"qkvz_8192x2048", 8192, 2048},
+    {"output_2048x2048", 2048, 2048},
 };
 
 constexpr std::int32_t kTokenCounts[] = {472, 888, 1024, 1912};

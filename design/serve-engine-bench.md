@@ -82,3 +82,29 @@ closing it means a W8->FP8-MMA kernel path, a future project.
 3. MTP speculative decode on 0.8B (engine-only advantage; blocked on the
    speculative-replay op family walk, PATCHES #15) — 27B shows 3.45
    tok/round at 81.6% acceptance, which would multiply the decode column.
+
+
+# Qwen3.5-2B (second target, same method)
+
+Engine W8 artifact (official safetensors, converter 19.3s) vs vLLM 0.27.1
+bf16 on the same idle 5090, batch 1, greedy, 128 decode tokens. 2B routes
+are correctness-first except linear_add {2048,2048} (measured table;
+end-to-end neutral — that op is only ~7% of the 2B's layer FLOPs).
+
+| prompt | engine prefill | vLLM bf16 prefill | engine decode | vLLM decode |
+|-------:|---------------:|------------------:|--------------:|------------:|
+|     52 |      **3,341** |             2,149 |       **327** |         197 |
+|    232 |          9,921 |            10,066 |       **330** |         197 |
+|    472 |     **15,362** |            14,680 |       **328** |         196 |
+|    962 |         19,986 |        **21,592** |       **326** |         197 |
+|   1912 |         25,341 |        **28,637** |       **320** |         197 |
+
+- **Decode: engine +66%** — stronger than the 0.8B's +30% because at 2B
+  decode is more weight-bandwidth-bound and W8 halves the traffic.
+- Prefill: ahead through ~500 tokens; behind bf16 by 7-12% at 962+/1912.
+  Same structural ceiling measured twice now (W8 dequant -> BF16 MMA at
+  ~80-93 TF/s across all 13 candidate tiles); the W8->FP8-MMA kernel path
+  fixes both models at once.
+- First 2B tokens: exact instruction following on the FIRST E2E run — the
+  parent-row-keyed kernel sharing meant zero kernel debugging for the
+  second target.
