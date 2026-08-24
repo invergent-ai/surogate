@@ -69,6 +69,11 @@ bool is_35(const Bf16GdnGatingProblem& problem) noexcept {
     return problem.heads == 32 && problem.input_rows == 2048;
 }
 
+// surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b rides the 35 routes.
+bool is_08(const Bf16GdnGatingProblem& problem) noexcept {
+    return problem.heads == 16 && problem.input_rows == 1024;
+}
+
 bool schedule_uses_mma(Bf16GdnGatingScheduleId schedule) noexcept {
     switch (schedule) {
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit32:
@@ -88,7 +93,7 @@ bool schedule_uses_mma(Bf16GdnGatingScheduleId schedule) noexcept {
 }
 
 std::int32_t mma_tile_cols(const Bf16GdnGatingProblem& problem) noexcept {
-    return is_35(problem) ? 64 : 128;
+    return (is_35(problem) || is_08(problem)) ? 64 : 128;
 }
 
 std::int32_t schedule_split_k(Bf16GdnGatingScheduleId schedule) {
@@ -231,7 +236,7 @@ void execute_resolved(const Bf16GdnGatingPlan& plan, const Bf16GdnGatingProblem&
                                                    dt_bias, scratch.data, g, beta, stream);
         return;
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit8:
-        if (is_35(problem)) {
+        if (is_35(problem) || is_08(problem)) {
             bf16_gdn_gating_proj_35_mma_split8_launch(plan.token_variant, x, a_weight, b_weight,
                                                       A_log, dt_bias, scratch.data, g, beta,
                                                       stream);
@@ -241,7 +246,7 @@ void execute_resolved(const Bf16GdnGatingPlan& plan, const Bf16GdnGatingProblem&
         }
         return;
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit4:
-        if (is_35(problem)) {
+        if (is_35(problem) || is_08(problem)) {
             bf16_gdn_gating_proj_35_mma_split4_launch(plan.token_variant, x, a_weight, b_weight,
                                                       A_log, dt_bias, scratch.data, g, beta,
                                                       stream);
@@ -251,7 +256,7 @@ void execute_resolved(const Bf16GdnGatingPlan& plan, const Bf16GdnGatingProblem&
         }
         return;
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit2:
-        if (is_35(problem)) {
+        if (is_35(problem) || is_08(problem)) {
             bf16_gdn_gating_proj_35_mma_split2_launch(plan.token_variant, x, a_weight, b_weight,
                                                       A_log, dt_bias, scratch.data, g, beta,
                                                       stream);
@@ -261,7 +266,7 @@ void execute_resolved(const Bf16GdnGatingPlan& plan, const Bf16GdnGatingProblem&
         }
         return;
     case Bf16GdnGatingScheduleId::MmaUnsplit:
-        if (is_35(problem)) {
+        if (is_35(problem) || is_08(problem)) {
             bf16_gdn_gating_proj_35_mma_unsplit_launch(plan.token_variant, x, a_weight, b_weight,
                                                        A_log, dt_bias, g, beta, stream);
         } else {
@@ -327,7 +332,7 @@ const char* bf16_gdn_norm_gating_schedule_name(Bf16GdnNormGatingScheduleId sched
 
 bool bf16_gdn_gating_admits(const Bf16GdnGatingProblem& problem) noexcept {
     if (problem.cols < 1) { return false; }
-    return is_27(problem) || is_35(problem);
+    return is_27(problem) || is_35(problem) || is_08(problem);
 }
 
 Bf16GdnGatingPlan bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId schedule,

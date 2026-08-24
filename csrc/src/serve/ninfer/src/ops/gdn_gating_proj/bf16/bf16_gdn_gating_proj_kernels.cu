@@ -32,6 +32,10 @@ static_assert(kK % kSmallTKSlice == 0, "small-T K split must divide K");
 constexpr int k35N           = 32;
 constexpr int k35K           = 2048;
 constexpr int k35LogicalRows = 2 * k35N;
+// surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b GDN gating (16 heads, 1024 hidden).
+constexpr int k08N           = 16;
+constexpr int k08K           = 1024;
+constexpr int k08LogicalRows = 2 * k08N;
 
 template <int TokenTile, int KSlice, int RowsPerBlock>
 __global__ void bf16_gdn_gating_proj_small_t_partial_kernel(
@@ -175,7 +179,7 @@ __global__ void bf16_gdn_gating_proj_gemv_kernel(const __nv_bfloat16* x,
     }
 }
 
-template <int ColsPerTile>
+template <int ColsPerTile, int N, int Kdim>
 __global__ void bf16_gdn_gating_proj_35_simt_kernel(const __nv_bfloat16* __restrict__ x,
                                                     const __nv_bfloat16* __restrict__ a_weight,
                                                     const __nv_bfloat16* __restrict__ b_weight,
@@ -186,18 +190,18 @@ __global__ void bf16_gdn_gating_proj_35_simt_kernel(const __nv_bfloat16* __restr
     static_assert(ColsPerTile == 4 || ColsPerTile == 8);
     const int lane        = static_cast<int>(threadIdx.x);
     const int logical_row = static_cast<int>(blockIdx.x);
-    const bool is_b       = logical_row >= k35N;
-    const int row         = is_b ? logical_row - k35N : logical_row;
+    const bool is_b       = logical_row >= N;
+    const int row         = is_b ? logical_row - N : logical_row;
     const int col0        = static_cast<int>(blockIdx.y) * ColsPerTile;
     const int ncols       = min(ColsPerTile, t - col0);
     const auto* weight    = is_b ? b_weight : a_weight;
-    const auto* wrow      = weight + static_cast<std::int64_t>(row) * k35K;
+    const auto* wrow      = weight + static_cast<std::int64_t>(row) * Kdim;
 
     float acc[ColsPerTile];
 #pragma unroll
     for (int col = 0; col < ColsPerTile; ++col) { acc[col] = 0.0f; }
 
-    constexpr int kVecs = k35K / 8;
+    constexpr int kVecs = Kdim / 8;
     for (int vec = lane; vec < kVecs; vec += 32) {
         const uint4 wv   = load_vec<uint4>(wrow + vec * 8);
         const float2 wf0 = bf16x2_bits_to_float2(wv.x);
@@ -208,7 +212,7 @@ __global__ void bf16_gdn_gating_proj_35_simt_kernel(const __nv_bfloat16* __restr
         for (int col = 0; col < ColsPerTile; ++col) {
             if (col < ncols) {
                 const uint4 xv =
-                    load_vec<uint4>(x + static_cast<std::int64_t>(col0 + col) * k35K + vec * 8);
+                    load_vec<uint4>(x + static_cast<std::int64_t>(col0 + col) * Kdim + vec * 8);
                 const float2 xf0 = bf16x2_bits_to_float2(xv.x);
                 const float2 xf1 = bf16x2_bits_to_float2(xv.y);
                 const float2 xf2 = bf16x2_bits_to_float2(xv.z);
@@ -230,7 +234,7 @@ __global__ void bf16_gdn_gating_proj_35_simt_kernel(const __nv_bfloat16* __restr
         if (col < ncols) {
             const float sum = warp_reduce_sum(acc[col]);
             if (lane == 0) {
-                const std::int64_t out_index = static_cast<std::int64_t>(col0 + col) * k35N + row;
+                const std::int64_t out_index = static_cast<std::int64_t>(col0 + col) * N + row;
                 if (is_b) {
                     beta[out_index] = sigmoid(sum);
                 } else {
@@ -245,6 +249,14 @@ void require_shape(const Weight& w, const char* name) {
     if (w.n != kN || w.k != kK || w.shape[0] != kN || w.shape[1] != kK) {
         throw std::invalid_argument(std::string("gdn_gating_proj: ") + name +
                                     " requires contiguous BF16 [48,5120]");
+    }
+}
+
+template <int N, int Kdim>
+void require_shape_nk(const Weight& w, const char* name) {
+    if (w.n != N || w.k != Kdim || w.shape[0] != N || w.shape[1] != Kdim) {
+        throw std::invalid_argument(std::string("gdn_gating_proj: ") + name +
+                                    " has unexpected BF16 shape");
     }
 }
 
@@ -419,15 +431,15 @@ void bf16_gdn_gating_proj_mma_unsplit_launch(Bf16GdnGatingTokenVariant variant, 
                                                      stream);
 }
 
-template <int ColsPerTile>
+template <int ColsPerTile, int N = k35N, int Kdim = k35K, int LogicalRows = k35LogicalRows>
 void launch_35_simt(const Tensor& x, const Weight& a_weight, const Weight& b_weight,
                     const Tensor& A_log, const Tensor& dt_bias, Tensor& g, Tensor& beta,
                     cudaStream_t stream) {
-    require_shape35(a_weight, "a_weight");
-    require_shape35(b_weight, "b_weight");
-    const dim3 grid(static_cast<unsigned>(k35LogicalRows),
+    require_shape_nk<N, Kdim>(a_weight, "a_weight");
+    require_shape_nk<N, Kdim>(b_weight, "b_weight");
+    const dim3 grid(static_cast<unsigned>(LogicalRows),
                     static_cast<unsigned>(div_up(x.ne[1], ColsPerTile)), 1u);
-    bf16_gdn_gating_proj_35_simt_kernel<ColsPerTile><<<grid, 32, 0, stream>>>(
+    bf16_gdn_gating_proj_35_simt_kernel<ColsPerTile, N, Kdim><<<grid, 32, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data),
         static_cast<const __nv_bfloat16*>(a_weight.qdata),
         static_cast<const __nv_bfloat16*>(b_weight.qdata), static_cast<const float*>(A_log.data),
@@ -440,6 +452,11 @@ void bf16_gdn_gating_proj_35_simt_c4_launch(const Tensor& x, const Weight& a_wei
                                             const Weight& b_weight, const Tensor& A_log,
                                             const Tensor& dt_bias, Tensor& g, Tensor& beta,
                                             cudaStream_t stream) {
+    if (a_weight.n == k08N) {
+        launch_35_simt<4, k08N, k08K, k08LogicalRows>(x, a_weight, b_weight, A_log,
+                                                          dt_bias, g, beta, stream);
+        return;
+    }
     launch_35_simt<4>(x, a_weight, b_weight, A_log, dt_bias, g, beta, stream);
 }
 
@@ -447,6 +464,11 @@ void bf16_gdn_gating_proj_35_simt_c8_launch(const Tensor& x, const Weight& a_wei
                                             const Weight& b_weight, const Tensor& A_log,
                                             const Tensor& dt_bias, Tensor& g, Tensor& beta,
                                             cudaStream_t stream) {
+    if (a_weight.n == k08N) {
+        launch_35_simt<8, k08N, k08K, k08LogicalRows>(x, a_weight, b_weight, A_log,
+                                                          dt_bias, g, beta, stream);
+        return;
+    }
     launch_35_simt<8>(x, a_weight, b_weight, A_log, dt_bias, g, beta, stream);
 }
 
@@ -455,6 +477,14 @@ void bf16_gdn_gating_proj_35_mma_split32_launch(Bf16GdnGatingTokenVariant varian
                                                 const Tensor& A_log, const Tensor& dt_bias,
                                                 void* workspace, Tensor& g, Tensor& beta,
                                                 cudaStream_t stream) {
+    if (a_weight.n == k08N) {
+        require_shape_nk<k08N, k08K>(a_weight, "a_weight");
+        require_shape_nk<k08N, k08K>(b_weight, "b_weight");
+        launch_bf16_prefill_mma<Bf16Gdn08Geometry, 16, 8>(variant, x, nullptr, 0.0F, nullptr, a_weight,
+                                                          b_weight, A_log, dt_bias, workspace, g, beta,
+                                                          stream);
+        return;
+    }
     require_shape35(a_weight, "a_weight");
     require_shape35(b_weight, "b_weight");
     launch_bf16_prefill_mma<Bf16Gdn35Geometry, 32, 8>(variant, x, nullptr, 0.0F, nullptr, a_weight,
@@ -468,6 +498,8 @@ void bf16_gdn_norm_gating_proj_35_mma_split32_launch(Bf16GdnGatingTokenVariant v
                                                      const Weight& b_weight, const Tensor& A_log,
                                                      const Tensor& dt_bias, void* workspace,
                                                      Tensor& g, Tensor& beta, cudaStream_t stream) {
+    // 0.8b: fused-norm split-32 path is 35B-only; the plan never routes
+    // is_08 problems here (unfused schedule is selected instead).
     require_shape35(a_weight, "a_weight");
     require_shape35(b_weight, "b_weight");
     const auto launch = [&](auto token_capacity) {
@@ -494,6 +526,14 @@ void bf16_gdn_gating_proj_35_mma_split16_launch(Bf16GdnGatingTokenVariant varian
                                                 const Tensor& A_log, const Tensor& dt_bias,
                                                 void* workspace, Tensor& g, Tensor& beta,
                                                 cudaStream_t stream) {
+    if (a_weight.n == k08N) {
+        require_shape_nk<k08N, k08K>(a_weight, "a_weight");
+        require_shape_nk<k08N, k08K>(b_weight, "b_weight");
+        launch_bf16_prefill_mma<Bf16Gdn08Geometry, 16, 8>(variant, x, nullptr, 0.0F, nullptr, a_weight,
+                                                          b_weight, A_log, dt_bias, workspace, g, beta,
+                                                          stream);
+        return;
+    }
     require_shape35(a_weight, "a_weight");
     require_shape35(b_weight, "b_weight");
     launch_bf16_prefill_mma<Bf16Gdn35Geometry, 16, 8>(variant, x, nullptr, 0.0F, nullptr, a_weight,
@@ -506,6 +546,14 @@ void bf16_gdn_gating_proj_35_mma_split8_launch(Bf16GdnGatingTokenVariant variant
                                                const Tensor& A_log, const Tensor& dt_bias,
                                                void* workspace, Tensor& g, Tensor& beta,
                                                cudaStream_t stream) {
+    if (a_weight.n == k08N) {
+        require_shape_nk<k08N, k08K>(a_weight, "a_weight");
+        require_shape_nk<k08N, k08K>(b_weight, "b_weight");
+        launch_bf16_prefill_mma<Bf16Gdn08Geometry, 8, 8>(variant, x, nullptr, 0.0F, nullptr, a_weight,
+                                                         b_weight, A_log, dt_bias, workspace, g, beta,
+                                                         stream);
+        return;
+    }
     require_shape35(a_weight, "a_weight");
     require_shape35(b_weight, "b_weight");
     launch_bf16_prefill_mma<Bf16Gdn35Geometry, 8, 8>(variant, x, nullptr, 0.0F, nullptr, a_weight,
@@ -518,6 +566,14 @@ void bf16_gdn_gating_proj_35_mma_split4_launch(Bf16GdnGatingTokenVariant variant
                                                const Tensor& A_log, const Tensor& dt_bias,
                                                void* workspace, Tensor& g, Tensor& beta,
                                                cudaStream_t stream) {
+    if (a_weight.n == k08N) {
+        require_shape_nk<k08N, k08K>(a_weight, "a_weight");
+        require_shape_nk<k08N, k08K>(b_weight, "b_weight");
+        launch_bf16_prefill_mma<Bf16Gdn08Geometry, 4, 8>(variant, x, nullptr, 0.0F, nullptr, a_weight,
+                                                         b_weight, A_log, dt_bias, workspace, g, beta,
+                                                         stream);
+        return;
+    }
     require_shape35(a_weight, "a_weight");
     require_shape35(b_weight, "b_weight");
     launch_bf16_prefill_mma<Bf16Gdn35Geometry, 4, 8>(variant, x, nullptr, 0.0F, nullptr, a_weight,
@@ -530,6 +586,14 @@ void bf16_gdn_gating_proj_35_mma_split2_launch(Bf16GdnGatingTokenVariant variant
                                                const Tensor& A_log, const Tensor& dt_bias,
                                                void* workspace, Tensor& g, Tensor& beta,
                                                cudaStream_t stream) {
+    if (a_weight.n == k08N) {
+        require_shape_nk<k08N, k08K>(a_weight, "a_weight");
+        require_shape_nk<k08N, k08K>(b_weight, "b_weight");
+        launch_bf16_prefill_mma<Bf16Gdn08Geometry, 2, 8>(variant, x, nullptr, 0.0F, nullptr, a_weight,
+                                                         b_weight, A_log, dt_bias, workspace, g, beta,
+                                                         stream);
+        return;
+    }
     require_shape35(a_weight, "a_weight");
     require_shape35(b_weight, "b_weight");
     launch_bf16_prefill_mma<Bf16Gdn35Geometry, 2, 8>(variant, x, nullptr, 0.0F, nullptr, a_weight,
@@ -541,6 +605,14 @@ void bf16_gdn_gating_proj_35_mma_unsplit_launch(Bf16GdnGatingTokenVariant varian
                                                 const Weight& a_weight, const Weight& b_weight,
                                                 const Tensor& A_log, const Tensor& dt_bias,
                                                 Tensor& g, Tensor& beta, cudaStream_t stream) {
+    if (a_weight.n == k08N) {
+        require_shape_nk<k08N, k08K>(a_weight, "a_weight");
+        require_shape_nk<k08N, k08K>(b_weight, "b_weight");
+        launch_bf16_prefill_mma<Bf16Gdn08Geometry, 1, 8>(variant, x, nullptr, 0.0F, nullptr, a_weight,
+                                                         b_weight, A_log, dt_bias, nullptr, g, beta,
+                                                         stream);
+        return;
+    }
     require_shape35(a_weight, "a_weight");
     require_shape35(b_weight, "b_weight");
     launch_bf16_prefill_mma<Bf16Gdn35Geometry, 1, 8>(variant, x, nullptr, 0.0F, nullptr, a_weight,

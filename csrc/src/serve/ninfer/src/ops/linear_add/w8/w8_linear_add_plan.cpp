@@ -191,8 +191,11 @@ bool w8_linear_add_schedule_uses_mma(W8LinearAddScheduleId schedule) noexcept {
 }
 
 bool w8_linear_add_admits(const W8LinearAddProblem& problem) noexcept {
-    return problem.rows == 2048 && (problem.k == 4096 || problem.k == 6144) &&
-           problem.padded_k == problem.k && problem.cols >= 1;
+    // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b W8 profile shapes
+    // (attn/gdn output {1024,2048}, mlp down {1024,3584}).
+    const bool base = problem.rows == 2048 && (problem.k == 4096 || problem.k == 6144);
+    const bool q08  = problem.rows == 1024 && (problem.k == 2048 || problem.k == 3584);
+    return (base || q08) && problem.padded_k == problem.k && problem.cols >= 1;
 }
 
 W8LinearAddPlan w8_linear_add_resolve_plan(const W8LinearAddProblem& problem) {

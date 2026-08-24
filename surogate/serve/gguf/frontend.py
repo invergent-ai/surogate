@@ -60,7 +60,22 @@ def extract_tokenizer_json(reader) -> dict:
     types: list[int] = list(_field(reader, "tokenizer.ggml.token_type"))
     merges: list[str] = list(_field(reader, "tokenizer.ggml.merges"))
 
-    vocab = {tok: idx for idx, tok in enumerate(tokens)}
+    # HF convention (and the engine's loader enforces it): added tokens are
+    # NOT part of model.vocab — they overlay it, and the `tokenizers` runtime
+    # re-derives their ids as len(vocab)+position, so they must sit
+    # CONTIGUOUSLY right after the base vocab. The official files obey this;
+    # GGUF appends [PAD...] filler rows after the added block to reach the
+    # embedding row count — those fillers must be dropped, exactly as the
+    # official tokenizer.json omits them (the model config, not the
+    # tokenizer, carries the padded vocab_size).
+    added_ids = sorted(i for i in range(len(tokens)) if types[i] in (_CONTROL, _USER_DEFINED))
+    base = min(added_ids) if added_ids else len(tokens)
+    if added_ids and added_ids != list(range(base, base + len(added_ids))):
+        raise SystemExit(
+            "surogate serve: GGUF added tokens are not contiguous after the base "
+            "vocab; cannot reconstruct an HF tokenizer faithfully."
+        )
+    vocab = {tokens[idx]: idx for idx in range(base)}
     added = [
         {
             "id": idx,
@@ -71,8 +86,7 @@ def extract_tokenizer_json(reader) -> dict:
             "normalized": False,
             "special": types[idx] == _CONTROL,
         }
-        for idx in range(len(tokens))
-        if types[idx] in (_CONTROL, _USER_DEFINED)
+        for idx in added_ids
     ]
 
     return {
@@ -136,6 +150,7 @@ def synthesize_tokenizer_config(reader, arch: str) -> dict:
     cfg: dict = {
         "tokenizer_class": "PreTrainedTokenizerFast",
         "add_bos_token": bool(_field(reader, "tokenizer.ggml.add_bos_token", False)),
+        "add_prefix_space": False,
         "clean_up_tokenization_spaces": False,
     }
     for hf_key, kv_key in (
@@ -147,6 +162,19 @@ def synthesize_tokenizer_config(reader, arch: str) -> dict:
         s = tok_str(kv_key)
         if s is not None:
             cfg[hf_key] = s
+    types = list(_field(reader, "tokenizer.ggml.token_type"))
+    cfg["added_tokens_decoder"] = {
+        str(i): {
+            "content": tokens[i],
+            "single_word": False,
+            "lstrip": False,
+            "rstrip": False,
+            "normalized": False,
+            "special": types[i] == _CONTROL,
+        }
+        for i in range(len(tokens))
+        if types[i] in (_CONTROL, _USER_DEFINED)
+    }
     ctx = _field(reader, f"{arch}.context_length")
     if ctx:
         cfg["model_max_length"] = int(ctx)

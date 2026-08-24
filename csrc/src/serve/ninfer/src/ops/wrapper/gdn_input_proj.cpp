@@ -786,7 +786,9 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows,
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
     const bool q4_q5 = query_rows == 2048 && key_rows == 2048 && value_rows == 6144;
-    const bool w8    = query_rows == 2048 && key_rows == 2048 && value_rows == 4096;
+    // surogate vendor patch (PATCHES.md #13): value_rows 2048 = qwen3.5-0.8b (16 V heads).
+    const bool w8 = query_rows == 2048 && key_rows == 2048 &&
+                    (value_rows == 4096 || value_rows == 2048);
     if (!q4_q5 && !w8) {
         throw std::invalid_argument("gdn_input_proj_conv_snapshot workspace: unregistered shape");
     }
@@ -858,7 +860,9 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows,
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
     const bool q4_q5 = query_rows == 2048 && key_rows == 2048 && value_rows == 6144;
-    const bool w8    = query_rows == 2048 && key_rows == 2048 && value_rows == 4096;
+    // surogate vendor patch (PATCHES.md #13): value_rows 2048 = qwen3.5-0.8b (16 V heads).
+    const bool w8 = query_rows == 2048 && key_rows == 2048 &&
+                    (value_rows == 4096 || value_rows == 2048);
     if (!q4_q5 && !w8) {
         throw std::invalid_argument("gdn_input_proj_conv_record workspace: unregistered shape");
     }

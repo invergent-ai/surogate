@@ -35,7 +35,7 @@ bool is_bf16_gdn_output(std::size_t layer) { return layer == 4; }
 NumericFormat endpoint_format(WeightsProfile weights_profile) {
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
-        return NumericFormat::Q6G64_F16S;
+        return NumericFormat::W8G32_F16S;  // W8 profile (Q8_0-faithful)
     case WeightsProfile::Qwen38GroupwiseInt:
     case WeightsProfile::Qwen36Nvfp4:
         return NumericFormat::W8G32_F16S;
@@ -223,16 +223,16 @@ void bind_groupwise_text_layers(artifact::Binder& binder, BindingPlan& out) {
         if (target.is_full_attention) {
             target.attention.projection = SplitAttentionProjectionPlan{
                 .query_key  = bind_weight(binder, prefix + "attention/query_key",
-                                          NumericFormat::Q4G64_F16S, {2560, 1024}),
+                                          NumericFormat::W8G32_F16S, {2560, 1024}),
                 .gate_value = bind_weight(binder, prefix + "attention/gate_value",
-                                          NumericFormat::Q5G64_F16S, {2560, 1024}),
+                                          NumericFormat::W8G32_F16S, {2560, 1024}),
             };
             target.attention.query_norm = artifact::bind_device_tensor(
                 binder, prefix + "attention/query_norm", NumericFormat::BF16, {256});
             target.attention.key_norm = artifact::bind_device_tensor(
                 binder, prefix + "attention/key_norm", NumericFormat::BF16, {256});
             target.attention.output = bind_weight(binder, prefix + "attention/output",
-                                                  NumericFormat::Q5G64_F16S, {1024, 2048});
+                                                  NumericFormat::W8G32_F16S, {1024, 2048});
         } else {
             target.gdn.a_log       = artifact::bind_device_tensor(binder, prefix + "gdn/a_log",
                                                                   NumericFormat::FP32, {16});
@@ -248,21 +248,21 @@ void bind_groupwise_text_layers(artifact::Binder& binder, BindingPlan& out) {
             };
             target.gdn.input_projection = SplitGdnInputProjectionPlan{
                 .query_key = bind_weight(binder, prefix + "gdn/query_key",
-                                         NumericFormat::Q4G64_F16S, {4096, 1024}),
-                .value_z   = bind_weight(binder, prefix + "gdn/value_z", NumericFormat::Q5G64_F16S,
+                                         NumericFormat::W8G32_F16S, {4096, 1024}),
+                .value_z   = bind_weight(binder, prefix + "gdn/value_z", NumericFormat::W8G32_F16S,
                                          {4096, 1024}),
             };
             target.gdn.norm = artifact::bind_device_tensor(binder, prefix + "gdn/norm",
                                                            NumericFormat::BF16, {128});
             target.gdn.output =
-                bind_weight(binder, prefix + "gdn/output", NumericFormat::Q5G64_F16S, {1024, 2048});
+                bind_weight(binder, prefix + "gdn/output", NumericFormat::W8G32_F16S, {1024, 2048});
         }
         target.post_attention_norm = artifact::bind_device_tensor(
             binder, prefix + "post_attention_norm", NumericFormat::BF16, {1024});
         target.mlp.gate_up =
-            bind_weight(binder, prefix + "mlp/gate_up", NumericFormat::Q4G64_F16S, {7168, 1024});
+            bind_weight(binder, prefix + "mlp/gate_up", NumericFormat::W8G32_F16S, {7168, 1024});
         target.mlp.down =
-            bind_weight(binder, prefix + "mlp/down", NumericFormat::Q5G64_F16S, {1024, 3584});
+            bind_weight(binder, prefix + "mlp/down", NumericFormat::W8G32_F16S, {1024, 3584});
     }
 }
 
@@ -440,7 +440,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     const artifact::TensorPlacement proposal_placement =
         features.optimized_proposal() ? artifact::TensorPlacement::Device
                                       : artifact::TensorPlacement::ValidateOnly;
-    out.draft_head = artifact::bind_tensor(binder, "text/draft_head", NumericFormat::Q4G64_F16S,
+    out.draft_head = artifact::bind_tensor(binder, "text/draft_head", NumericFormat::W8G32_F16S,
                                            {131072, 1024}, proposal_placement);
     out.draft_head_token_ids = artifact::bind_tensor(
         binder, "text/draft_head_token_ids", NumericFormat::I32, {131072}, proposal_placement);
@@ -543,7 +543,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     if (plan.features.optimized_proposal()) {
         auto& proposal     = runtime.optimized_proposal.emplace();
         proposal.head      = artifact::materialized_weight(backing, plan.draft_head,
-                                                           NumericFormat::Q4G64_F16S, 131072, 1024);
+                                                           NumericFormat::W8G32_F16S, 131072, 1024);
         proposal.token_ids = artifact::materialized_tensor(backing, plan.draft_head_token_ids,
                                                            NumericFormat::I32, {131072});
     }

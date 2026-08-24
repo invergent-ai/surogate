@@ -50,8 +50,12 @@ constexpr bool catalog_is_closed() {
 static_assert(catalog_is_closed(), "W8 LinearSwiGLU routes must be exact and closed");
 
 bool supported_shape(const W8LinearSwiGluProblem& problem) noexcept {
-    return problem.gate_up_rows == 12288 && problem.output_rows == 6144 && problem.k == 2048 &&
-           problem.padded_k == 2048;
+    // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b mlp {7168->3584, k=1024}.
+    const bool base = problem.gate_up_rows == 12288 && problem.output_rows == 6144 &&
+                      problem.k == 2048 && problem.padded_k == 2048;
+    const bool q08 = problem.gate_up_rows == 7168 && problem.output_rows == 3584 &&
+                     problem.k == 1024 && problem.padded_k == 1024;
+    return base || q08;
 }
 
 } // namespace

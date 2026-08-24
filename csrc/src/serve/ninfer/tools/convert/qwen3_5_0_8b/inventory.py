@@ -45,7 +45,7 @@ _tensor = tensor_spec
 
 def _build_text_core_specs() -> tuple[TensorSpec, ...]:
     specs: list[TensorSpec] = [
-        _tensor("text/token_embedding", (248320, 1024), Q6),
+        _tensor("text/token_embedding", (248320, 1024), W8),
     ]
 
     for layer in range(24):
@@ -55,11 +55,11 @@ def _build_text_core_specs() -> tuple[TensorSpec, ...]:
         if layer in FULL_ATTENTION_LAYERS:
             specs.extend(
                 (
-                    _tensor(prefix + "attention/query_key", (2560, 1024), Q4),
-                    _tensor(prefix + "attention/gate_value", (2560, 1024), Q5),
+                    _tensor(prefix + "attention/query_key", (2560, 1024), W8),
+                    _tensor(prefix + "attention/gate_value", (2560, 1024), W8),
                     _tensor(prefix + "attention/query_norm", (256,), BF16),
                     _tensor(prefix + "attention/key_norm", (256,), BF16),
-                    _tensor(prefix + "attention/output", (1024, 2048), Q5),
+                    _tensor(prefix + "attention/output", (1024, 2048), W8),
                 )
             )
         else:
@@ -70,25 +70,25 @@ def _build_text_core_specs() -> tuple[TensorSpec, ...]:
                     _tensor(prefix + "gdn/convolution", (4, 6144), BF16),
                     _tensor(prefix + "gdn/a_projection", (16, 1024), BF16),
                     _tensor(prefix + "gdn/b_projection", (16, 1024), BF16),
-                    _tensor(prefix + "gdn/query_key", (4096, 1024), Q4),
-                    _tensor(prefix + "gdn/value_z", (4096, 1024), Q5),
+                    _tensor(prefix + "gdn/query_key", (4096, 1024), W8),
+                    _tensor(prefix + "gdn/value_z", (4096, 1024), W8),
                     _tensor(prefix + "gdn/norm", (128,), BF16),
-                    _tensor(prefix + "gdn/output", (1024, 2048), Q5),
+                    _tensor(prefix + "gdn/output", (1024, 2048), W8),
                 )
             )
 
         specs.extend(
             (
                 _tensor(prefix + "post_attention_norm", (1024,), BF16),
-                _tensor(prefix + "mlp/gate_up", (7168, 1024), Q4),
-                _tensor(prefix + "mlp/down", (1024, 3584), Q5),
+                _tensor(prefix + "mlp/gate_up", (7168, 1024), W8),
+                _tensor(prefix + "mlp/down", (1024, 3584), W8),
             )
         )
 
     specs.extend(
         (
             _tensor("text/final_norm", (1024,), BF16),
-            _tensor("text/output_head", (248320, 1024), Q6),
+            _tensor("text/output_head", (248320, 1024), W8),
         )
     )
     return tuple(specs)
@@ -96,7 +96,7 @@ def _build_text_core_specs() -> tuple[TensorSpec, ...]:
 
 def _build_draft_head_specs() -> tuple[TensorSpec, ...]:
     return (
-        _tensor("text/draft_head", (131072, 1024), Q4),
+        _tensor("text/draft_head", (131072, 1024), W8),
         _tensor("text/draft_head_token_ids", (131072,), I32),
     )
 
