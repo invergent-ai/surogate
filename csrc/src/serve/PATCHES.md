@@ -219,10 +219,24 @@
    ceiling, numerics exact modulo bf16 output rounding. At the measured
    rate the end-to-end arithmetic flips BOTH remaining vLLM leads with
    margin (0.8b 1912-prefill ~52k -> ~66k tok/s vs vLLM-FP8 60.7k; 2b
-   ~25.3k -> ~31k vs bf16 28.6k). Remaining productization: engine kernel
-   header from the winning config, epilogue twins (split2/split4/swiglu/
-   residual), quantizing-rmsnorm fusion (free act-quant), AllowA8 large-T
-   routes, op tests, E2E.
+   ~25.3k -> ~31k vs bf16 28.6k). PRODUCTIZED (first family): the winning config lives in
+   src/ops/linear/w8a8/w8a8_imma_gemm.cuh (RowMap/Epilogue-templated) with
+   the per-token act-quant op (w8a8_act_quant, kW8A8MinTokens = 512);
+   linear_swiglu runs it under LinearPolicy::AllowA8 at T >= 512 (unfused
+   pairing pass in v1), every W8 wrapper accepts AllowA8 (A16 execution
+   where no A8 path exists yet — "allow" semantics), and the 0.8b/2b
+   targets opt W8 into AllowA8 via text_policy. TWO integration findings
+   fixed on the way: (a) a last-tile source-clamp made heavily-partial
+   tiles ~2x slower — out-of-range tokens now cp_async_zfill (no global
+   read); (b) the x staging used .cg, bypassing L1 for data every row-tile
+   CTA re-reads — the zfill path caches it, lifting the kernel to
+   **149-178 TF/s** across the four shapes (~1.8x the BF16 ceiling).
+   E2E with ONE family converted: 0.8b 962-prefill 37.3k -> 40.3k tok/s
+   (now ahead of BOTH vLLM columns), 1912 52.0k -> 54.5k (ahead of bf16;
+   FP8 60.7k falls when the remaining families convert). Correctness: A8
+   swiglu op tests green (A16 fallback at T=511 verified); engine output
+   exact. Remaining: qkvz (split2), qkgv (split4), linear_add (residual)
+   epilogue twins, quantizing-rmsnorm fusion, op tests per family.
 
 ### sm_89 port status
 

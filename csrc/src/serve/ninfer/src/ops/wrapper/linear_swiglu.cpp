@@ -6,6 +6,7 @@
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/w8/w8_linear_swiglu_plan.h"
+#include "ops/linear_swiglu/w8a8/w8a8_linear_swiglu.h"
 
 #include <cstdint>
 #include <stdexcept>
@@ -38,13 +39,20 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
         throw std::invalid_argument("linear_swiglu workspace: invalid profile or token interval");
     }
     if (qtype == QType::W8G32_F16S) {
-        if (policy != LinearPolicy::A16Only) {
-            throw std::invalid_argument("linear_swiglu workspace: W8 admits only A16");
+        if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8) {
+            throw std::invalid_argument("linear_swiglu workspace: W8 admits A16 or A8");
         }
         (void)detail::w8_linear_swiglu_resolve_plan(
             {gate_up_rows, gate_up_rows / 2, input_rows, input_rows, min_tokens});
         (void)detail::w8_linear_swiglu_resolve_plan(
             {gate_up_rows, gate_up_rows / 2, input_rows, input_rows, max_tokens});
+        // surogate vendor patch (PATCHES.md #17): under AllowA8 the large-T
+        // band runs the W8A8-int IMMA path (per-token int8 activations),
+        // which needs quantized-activation and gemm-buffer workspace.
+        if (policy == LinearPolicy::AllowA8 && max_tokens >= detail::kW8A8MinTokens) {
+            return detail::w8a8_linear_swiglu_workspace_bytes(gate_up_rows, input_rows,
+                                                              max_tokens);
+        }
         return 0;
     }
     if (qtype == QType::Q4G64_F16S) {
@@ -129,8 +137,8 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
         return;
     }
 
-    if (policy != LinearPolicy::A16Only) {
-        throw std::invalid_argument("linear_swiglu: Q4/W8 admit only A16");
+    if (policy != LinearPolicy::A16Only && !(w8_weight && policy == LinearPolicy::AllowA8)) {
+        throw std::invalid_argument("linear_swiglu: Q4 admits only A16; W8 admits A16 or A8");
     }
     if (!aligned_to(gate_up_weight.qdata, 16) ||
         !aligned_to(gate_up_weight.scales, w8_weight ? 16 : 4)) {
@@ -138,7 +146,13 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     }
 
     if (w8_weight) {
-        detail::w8_linear_swiglu_dispatch(x, gate_up_weight, out, stream);
+        // surogate vendor patch (PATCHES.md #17): AllowA8 large-T prefill runs
+        // the W8A8-int IMMA path; decode and small T stay on the A16 kernels.
+        if (policy == LinearPolicy::AllowA8 && t >= detail::kW8A8MinTokens) {
+            detail::w8a8_linear_swiglu_dispatch(x, gate_up_weight, out, ws, stream);
+        } else {
+            detail::w8_linear_swiglu_dispatch(x, gate_up_weight, out, stream);
+        }
     } else {
         detail::q4_linear_swiglu_dispatch(x, gate_up_weight, out, ws, stream);
     }

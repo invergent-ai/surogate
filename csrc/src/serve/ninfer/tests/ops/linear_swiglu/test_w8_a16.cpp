@@ -23,6 +23,15 @@ int main() {
         failures += run_profile(
             "LinearSwiGLU W8_A16 q08",
             {QType::W8G32_F16S, 7168, 1024, 3584, 1607U, ActivationCompute::A16}, kQ08TokenCases);
+        // surogate vendor patch (PATCHES.md #17): the W8A8-int IMMA path
+        // engages at T >= 512 under AllowA8; 511 confirms the A16 fallback.
+        constexpr std::array<std::int32_t, 4> kA8TokenCases{511, 512, 1024, 1912};
+        failures += run_profile(
+            "LinearSwiGLU W8_A8 q08",
+            {QType::W8G32_F16S, 7168, 1024, 3584, 1613U, ActivationCompute::A8}, kA8TokenCases);
+        failures += run_profile(
+            "LinearSwiGLU W8_A8 35b",
+            {QType::W8G32_F16S, 12288, 2048, 6144, 1619U, ActivationCompute::A8}, kA8TokenCases);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " LinearSwiGLU W8_A16 correctness\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

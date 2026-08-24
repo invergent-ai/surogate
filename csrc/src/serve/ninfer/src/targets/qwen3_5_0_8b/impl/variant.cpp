@@ -52,6 +52,10 @@ ops::LinearPolicy text_policy(const Weight& weight) {
         return kNvfp4TextPolicy;
     case QType::FP8_E4M3FN_ROW_BF16S:
         return kFp8TextPolicy;
+    // surogate vendor patch (PATCHES.md #17): W8 opts into A8 — wrappers run
+    // the W8A8-int IMMA path at T >= kW8A8MinTokens and A16 otherwise.
+    case QType::W8G32_F16S:
+        return ops::LinearPolicy::AllowA8;
     default:
         return ops::LinearPolicy::A16Only;
     }

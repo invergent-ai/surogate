@@ -19,6 +19,7 @@
 #include "core/device.h"
 #include "ninfer_bench_common.h"
 #include "ops/common/memory.cuh"
+#include "ops/linear/w8a8/w8a8_imma_gemm.cuh"
 #include "quantized_weight.cuh"
 
 #include <cuda_bf16.h>
@@ -366,6 +367,14 @@ __global__ __launch_bounds__(THREADS, 2) void w8a8_imma_ldmatrix_kernel(
     }
 }
 
+struct ProbeStore {
+    __nv_bfloat16* out;
+    int rows;
+    __device__ __forceinline__ void operator()(int row, int token, float value) const {
+        out[static_cast<std::int64_t>(token) * rows + row] = __float2bfloat16_rn(value);
+    }
+};
+
 struct Case {
     const char* name;
     int rows;
@@ -416,8 +425,21 @@ int main(int argc, char** argv) {
         cudaMemcpy(d_x.p, host_x.data(), host_x.size(), cudaMemcpyHostToDevice);
         cudaMemcpy(d_xs.p, host_xs.data(), host_xs.size() * 4, cudaMemcpyHostToDevice);
 
-        for (const int tokens : {472, 1024, 1912}) {
+        for (const int tokens : {960, 1024}) {
             const dim3 grid(c.rows / BM, (tokens + BN - 1) / BN);
+            const auto launchP = [&](cudaStream_t s) {
+                const dim3 pgrid(c.rows / ops::detail::W8A8ImmaConfig::BM,
+                                 (tokens + ops::detail::W8A8ImmaConfig::BN - 1) /
+                                     ops::detail::W8A8ImmaConfig::BN);
+                ops::detail::w8a8_imma_gemm_kernel<ops::detail::W8A8IdentityRowMap, ProbeStore>
+                    <<<pgrid, ops::detail::W8A8ImmaConfig::THREADS, 0, s>>>(
+                        static_cast<const std::int8_t*>(d_codes.p),
+                        static_cast<const std::uint8_t*>(d_scales.p),
+                        static_cast<const std::int8_t*>(d_x.p),
+                        static_cast<const float*>(d_xs.p), c.rows, c.k, tokens,
+                        ops::detail::W8A8IdentityRowMap{},
+                        ProbeStore{static_cast<__nv_bfloat16*>(d_out.p), c.rows});
+            };
             const auto launchL = [&](cudaStream_t s) {
                 w8a8_imma_ldmatrix_kernel<<<grid, THREADS, 0, s>>>(
                     static_cast<const std::int8_t*>(d_codes.p),
@@ -477,7 +499,7 @@ int main(int argc, char** argv) {
             rms = std::sqrt(rms / checked);
 
             const auto timing  = bench::measure_launch(launch, stream, warmup, repeat);
-            const auto timing4 = bench::measure_launch(launchL, stream, warmup, repeat);
+            const auto timing4 = bench::measure_launch(launchP, stream, warmup, repeat);
             const double gflop = 2.0 * c.rows * c.k * static_cast<double>(tokens) / 1e9;
 
             // Combined: per-token act-quant (from bf16) + the IMMA GEMM — the
@@ -495,7 +517,7 @@ int main(int argc, char** argv) {
             // oracle-known planes for the next token count's spot check.
             cudaMemcpy(d_x.p, host_x.data(), host_x.size(), cudaMemcpyHostToDevice);
             cudaMemcpy(d_xs.p, host_xs.data(), host_xs.size() * 4, cudaMemcpyHostToDevice);
-            std::printf("%-22s %6d s2 %7.1f/%3.0f  ld %7.1f/%3.0f  +q %7.1f/%3.0f %9.2e\n",
+            std::printf("%-22s %6d s2 %7.1f/%3.0f  pr %7.1f/%3.0f  +q %7.1f/%3.0f %9.2e\n",
                         c.name, tokens, timing.median_us,
                         gflop / (timing.median_us * 1e-6) / 1e3, timing4.median_us,
                         gflop / (timing4.median_us * 1e-6) / 1e3, combined.median_us,

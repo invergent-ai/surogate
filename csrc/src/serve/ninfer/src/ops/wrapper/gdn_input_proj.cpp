@@ -341,8 +341,8 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
     const std::int32_t kQkvRows = small_fused ? 6144 : 8192;
     const std::int32_t kZRows   = small_fused ? 2048 : 4096;
     const std::int32_t kRows    = kQkvRows + kZRows;
-    if (policy != LinearPolicy::A16Only) {
-        throw std::invalid_argument("W8 gdn_input_proj admits only A16");
+    if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8) {
+        throw std::invalid_argument("W8 gdn_input_proj admits A16 or A8");
     }
     require_matrix(x, kHidden, cols, "x");
     require_matrix(qkv, kQkvRows, cols, "qkv");
@@ -530,8 +530,8 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
     const std::int32_t kZRows     = small_fused ? 2048 : 4096;
     const std::int32_t kChannels  = kQueryRows + kKeyRows + kValueRows;
     const ConvGeometry geometry       = require_snapshot_input(x, kHidden);
-    if (policy != LinearPolicy::A16Only) {
-        throw std::invalid_argument("W8 gdn_input_proj_conv_snapshot admits only A16");
+    if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8) {
+        throw std::invalid_argument("W8 gdn_input_proj_conv_snapshot admits A16 or A8");
     }
     require_w8_rowsplit(weight, kChannels + kZRows, "query/key/value/z weight");
     require_snapshot_operands(conv_weight, conv_states, valid_columns, initial_state_slots,
@@ -691,8 +691,8 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
     constexpr std::int32_t kZRows     = 4096;
     constexpr std::int32_t kChannels  = kQueryRows + kKeyRows + kValueRows;
     const ConvGeometry geometry       = require_record_input(x, kHidden);
-    if (policy != LinearPolicy::A16Only) {
-        throw std::invalid_argument("W8 gdn_input_proj_conv_record admits only A16");
+    if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8) {
+        throw std::invalid_argument("W8 gdn_input_proj_conv_record admits A16 or A8");
     }
     require_w8_rowsplit(weight, kChannels + kZRows, "query/key/value/z weight");
     require_record_operands(conv_weight, conv_states, valid_columns, initial_state_slots, kChannels,
@@ -851,7 +851,8 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     }
     // surogate vendor patch (PATCHES.md #13): W8 fused parents (35B 12288/2048,
     // qwen3.5-0.8b 8192/1024) size through the split-dimension path.
-    if (parent_qtype == QType::W8G32_F16S && policy == LinearPolicy::A16Only &&
+    if (parent_qtype == QType::W8G32_F16S &&
+        (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) &&
         ((parent_rows == 12288 && input_rows == 2048) ||
          (parent_rows == 8192 && (input_rows == 1024 || input_rows == 2048)))) {
         const std::int32_t value_rows = parent_rows == 12288 ? 4096 : 2048;
@@ -914,7 +915,8 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     // surogate vendor patch (PATCHES.md #13/#15): W8 fused parents (35B
     // 12288/2048, qwen3.5-0.8b 8192/1024) size through the split-dimension
     // record path, mirroring the snapshot overload above.
-    if (parent_qtype == QType::W8G32_F16S && policy == LinearPolicy::A16Only &&
+    if (parent_qtype == QType::W8G32_F16S &&
+        (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) &&
         ((parent_rows == 12288 && input_rows == 2048) ||
          (parent_rows == 8192 && (input_rows == 1024 || input_rows == 2048)))) {
         const std::int32_t value_rows = parent_rows == 12288 ? 4096 : 2048;

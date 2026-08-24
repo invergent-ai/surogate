@@ -94,8 +94,8 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
         return 0;
     }
     if (qtype == QType::W8G32_F16S) {
-        if (policy != LinearPolicy::A16Only) {
-            throw std::invalid_argument("linear_add workspace: W8 admits only A16");
+        if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8) {
+            throw std::invalid_argument("linear_add workspace: W8 admits A16 or A8");
         }
         (void)detail::w8_linear_add_resolve_plan({output_rows, input_rows, input_rows, min_tokens});
         (void)detail::w8_linear_add_resolve_plan({output_rows, input_rows, input_rows, max_tokens});
@@ -184,8 +184,8 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
     }
 
     if (w.qtype == QType::W8G32_F16S) {
-        if (policy != LinearPolicy::A16Only) {
-            throw std::invalid_argument("W8 linear_add admits only A16");
+        if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8) {
+            throw std::invalid_argument("W8 linear_add admits A16 or A8");
         }
         require_w8(w);
         // surogate vendor patches (PATCHES.md #13/#16): qwen3.5-0.8b

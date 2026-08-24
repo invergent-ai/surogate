@@ -162,8 +162,10 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
     const std::int32_t kRows   = small_fused ? 5120 : 9216;
     const std::int32_t cols        = x.ne[1];
     if (cols <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
-    if (policy != LinearPolicy::A16Only) {
-        throw std::invalid_argument("W8 attn_input_proj admits only A16");
+    if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8) {
+        // surogate vendor patch (PATCHES.md #17): AllowA8 accepted; this
+        // family executes A16 until its IMMA path lands.
+        throw std::invalid_argument("W8 attn_input_proj admits A16 or A8");
     }
     require_matrix(x, kHidden, cols, "x");
     require_matrix(q, kQRows, cols, "q");
@@ -208,7 +210,7 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
         if (!((parent_rows == 9216 && input_rows == 2048) ||
               (parent_rows == 5120 &&
                (input_rows == 1024 || input_rows == 2048))) ||
-            policy != LinearPolicy::A16Only) {
+            (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8)) {
             throw std::invalid_argument("attn_input_proj workspace: unsupported W8 profile");
         }
         {
