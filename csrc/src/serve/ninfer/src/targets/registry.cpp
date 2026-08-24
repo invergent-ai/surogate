@@ -140,6 +140,23 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
 
 } // namespace
 
+LoadedQwen3_5_0_8B::LoadedQwen3_5_0_8B(std::unique_ptr<Qwen3_5_0_8B::LoadedModel> stable_model,
+                                     const EngineOptions& options)
+    : model(std::move(stable_model)), frontend(Qwen3_5_0_8B::make_frontend(*model, options)) {}
+
+LoadedQwen3_5_0_8B::~LoadedQwen3_5_0_8B() = default;
+
+Qwen3_5_0_8BInstance::Qwen3_5_0_8BInstance(std::unique_ptr<LoadedQwen3_5_0_8B> stable_loaded,
+                                         runtime::KvCapacityResolution resolution,
+                                         Qwen3_5_0_8B::SequencePlan sequence_plan,
+                                         DeviceContext& device)
+    : loaded(std::move(stable_loaded)), kv_capacity_resolution(resolution),
+      request_memory(device, sequence_plan.request_transient_capacity_bytes()),
+      capacity(sequence_plan.capacity()),
+      program(Qwen3_5_0_8B::create_program(*loaded->model, std::move(sequence_plan), device)) {}
+
+Qwen3_5_0_8BInstance::~Qwen3_5_0_8BInstance() = default;
+
 LoadedQwen3_6_27B::LoadedQwen3_6_27B(std::unique_ptr<Qwen3_6_27B::LoadedModel> stable_model,
                                      const EngineOptions& options)
     : model(std::move(stable_model)), frontend(Qwen3_6_27B::make_frontend(*model, options)) {}
@@ -180,6 +197,10 @@ ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& 
 
     artifact::Reader reader(options.artifact_path);
     const auto& identity = reader.identity();
+    if (identity.model_id == Qwen3_5_0_8B::model_id) {
+        return construct_registered<Qwen3_5_0_8B, LoadedQwen3_5_0_8B, Qwen3_5_0_8BInstance>(
+            options, device, reader, load_start, Qwen3_5_0_8B::target_key);
+    }
     if (identity.model_id == Qwen3_6_27B::model_id) {
         return construct_registered<Qwen3_6_27B, LoadedQwen3_6_27B, Qwen3_6_27BInstance>(
             options, device, reader, load_start, Qwen3_6_27B::target_key);
