@@ -11,6 +11,7 @@ import wandb
 from transformers import PreTrainedTokenizer
 
 from surogate.core.config.grpo_orch_config import GRPOReportingConfig
+from surogate.grpo.orchestrator.vf_utils import get_task
 from surogate.grpo.utils.logger import get_logger
 from surogate.grpo.utils.monitor.base import Monitor
 
@@ -109,7 +110,7 @@ class WandbMonitor(Monitor):
             messages_text = self.tokenizer.decode(full_ids)
             sample = {
                 "step": step,
-                "task": rollout.get("task"),
+                "task": get_task(rollout),
                 "example_id": rollout["example_id"],
                 "messages": messages_text,
                 "input_ids": str(full_ids),

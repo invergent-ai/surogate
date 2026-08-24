@@ -367,7 +367,7 @@ class GRPOBufferConfig:
     normal_pool_min_examples: int | None = 0
     recycle_easy_fraction: float | None = 0.0
     recycle_hard_fraction: float | None = 0.0
-    hash_keys: list[str] | None = field(default_factory=lambda: ["task", "prompt"])
+    hash_keys: list[str] | None = field(default_factory=lambda: ["info", "prompt"])
     sample_without_replacement: bool = False
 
     def __init__(self, cfg: DictDefault):
@@ -381,7 +381,7 @@ class GRPOBufferConfig:
         self.normal_pool_min_examples = cfg.get("normal_pool_min_examples", self.normal_pool_min_examples)
         self.recycle_easy_fraction = cfg.get("recycle_easy_fraction", self.recycle_easy_fraction)
         self.recycle_hard_fraction = cfg.get("recycle_hard_fraction", self.recycle_hard_fraction)
-        self.hash_keys = cfg.get("hash_keys", ["task", "prompt"])
+        self.hash_keys = cfg.get("hash_keys", ["info", "prompt"])
         self.sample_without_replacement = cfg.get(
             "sample_without_replacement", self.sample_without_replacement
         )

@@ -331,8 +331,22 @@ class RulerRubric(vf.Rubric):
             self._merge_metrics(state, {f"{self.METRIC_PREFIX}_score": float(scores[i])})
             timing = state.get("timing")
             if isinstance(timing, dict):
-                timing["scoring_ms"] = scoring_ms
-                timing["total_ms"] = float(timing.get("total_ms", 0.0)) + scoring_ms
+                # Serialized RolloutTiming (verifiers >= 0.2): phases are TimeSpan
+                # dicts in seconds. Deferred group scoring runs orchestrator-side
+                # after the env server produced the output with scoring skipped,
+                # so record the judge latency as the scoring span.
+                scoring_s = scoring_ms / 1000.0
+                span = timing.get("scoring")
+                if isinstance(span, dict):
+                    span["duration"] = float(span.get("duration") or 0.0) + scoring_s
+                else:
+                    timing["scoring"] = {"start": 0.0, "end": 0.0, "duration": scoring_s}
+                if "total" in timing:
+                    timing["total"] = float(timing.get("total") or 0.0) + scoring_s
+            elif timing is not None and hasattr(timing, "scoring"):
+                # Live RolloutTiming model (score_rollout path inside an env process).
+                timing.scoring.start = time.time() - scoring_ms / 1000.0
+                timing.scoring.end = time.time()
             for step in state.get("trajectory") or []:
                 if step.get("advantage") is None:
                     step["advantage"] = state["advantage"]

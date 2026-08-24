@@ -57,7 +57,10 @@ from surogate.grpo.orchestrator.utils import (
 from surogate.grpo.orchestrator.vf_utils import (
     generate,
     get_completion_len,
+    get_generation_ms,
+    get_scoring_ms,
     get_seq_len,
+    get_task,
     intercept_vf_logging,
     setup_env_client,
     spawn_env_server,
@@ -92,7 +95,7 @@ async def orchestrate(config: GRPOOrchestratorConfig):
         log_file=Path(config.output_dir) / "logs" / "orchestrator.log" if config.log.file else None,
         json_logging=config.log.json_logging,
     )
-    intercept_vf_logging(logger="verifiers.workers", level=config.log.vf_level)  # show logs from env clients
+    intercept_vf_logging(logger="verifiers.serve", level=config.log.vf_level)  # show logs from env clients
     logger.info("Starting orchestrator")
 
     event_loop_lag_monitor = EventLoopLagMonitor()
@@ -257,9 +260,8 @@ async def orchestrate(config: GRPOOrchestratorConfig):
                     env_path=env.path,
                     log_queue=env_log_queue,
                     log_prefix=env_name,
-                    log_level="CRITICAL",
-                    log_file=(get_log_dir(Path(config.output_dir)) / "train" / f"{env_name}.log").as_posix(),
-                    log_file_level=config.log.vf_level,
+                    log_level=config.log.vf_level,
+                    log_dir=(get_log_dir(Path(config.output_dir)) / "train" / env_name).as_posix(),
                     json_logging=config.log.json_logging,
                 )
                 env_processes.append(process)
@@ -304,9 +306,8 @@ async def orchestrate(config: GRPOOrchestratorConfig):
                         env_path=env.path,
                         log_queue=env_log_queue,
                         log_prefix=eval_env_name,
-                        log_level="CRITICAL",
-                        log_file=(get_log_dir(Path(config.output_dir)) / "eval" / f"{eval_env_name}.log").as_posix(),
-                        log_file_level=config.log.vf_level,
+                        log_level=config.log.vf_level,
+                        log_dir=(get_log_dir(Path(config.output_dir)) / "eval" / eval_env_name).as_posix(),
                         json_logging=config.log.json_logging,
                     )
                     env_processes.append(process)
@@ -717,7 +718,7 @@ async def orchestrate(config: GRPOOrchestratorConfig):
             results_df = pd.DataFrame(
                 {
                     "example_id": [rollout["example_id"] for rollout in train_rollouts],
-                    "task": [rollout["task"] for rollout in train_rollouts],
+                    "task": [get_task(rollout) for rollout in train_rollouts],
                     "reward": [rollout["reward"] for rollout in train_rollouts],
                     "is_truncated": [rollout["is_truncated"] for rollout in train_rollouts],
                     "error": [rollout["error"] for rollout in train_rollouts],
@@ -727,8 +728,8 @@ async def orchestrate(config: GRPOOrchestratorConfig):
                     "decode_len": rollout_decode_lens,
                     "samples_per_rollout": rollout_samples_per_rollout,
                     "num_turns": [len(rollout["trajectory"]) for rollout in train_rollouts],
-                    "generation_ms": [rollout["timing"]["generation_ms"] for rollout in train_rollouts],
-                    "scoring_ms": [rollout["timing"]["scoring_ms"] for rollout in train_rollouts],
+                    "generation_ms": [get_generation_ms(rollout) for rollout in train_rollouts],
+                    "scoring_ms": [get_scoring_ms(rollout) for rollout in train_rollouts],
                 }
             )
 
@@ -760,7 +761,7 @@ async def orchestrate(config: GRPOOrchestratorConfig):
                 pd.DataFrame(
                     {
                         "example_id": [rollout["example_id"] for rollout in val_outputs],
-                        "task": [rollout["task"] for rollout in val_outputs],
+                        "task": [get_task(rollout) for rollout in val_outputs],
                         "reward": [rollout["reward"] for rollout in val_outputs],
                     }
                 )

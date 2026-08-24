@@ -86,5 +86,4 @@ if __name__ == "__main__":
         args.path,
         rewrite_readme=False,
         multi_file=False,
-        openenv=False,
     )

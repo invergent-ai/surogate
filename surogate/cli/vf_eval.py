@@ -234,9 +234,9 @@ if __name__ == "__main__":
     from pathlib import Path
     from typing import cast
 
-    from verifiers.scripts.eval import (
+    from verifiers.scripts.eval import get_env_eval_defaults
+    from verifiers.utils.path_utils import (
         find_latest_incomplete_eval_results_path,
-        get_env_eval_defaults,
         is_valid_eval_results_path,
     )
     from verifiers.types import (

@@ -14,7 +14,7 @@ from surogate.grpo.orchestrator.advantage import dataclass
 from surogate.grpo.orchestrator.buffer import Buffer
 from surogate.grpo.orchestrator.patches import ROLLOUT_DEPTH_CAP_KEY
 from surogate.grpo.orchestrator.utils import get_sampling_args
-from surogate.grpo.orchestrator.vf_utils import get_seq_len, run_rollout
+from surogate.grpo.orchestrator.vf_utils import get_seq_len, get_task, run_rollout
 from surogate.grpo.utils.asynyc_utils import safe_cancel, safe_cancel_all
 from surogate.grpo.utils.client import InferencePool
 from surogate.grpo.utils.logger import ProgressTracker, get_logger
@@ -245,11 +245,11 @@ class Scheduler:
                 example=self._example_with_depth_cap(group.example),
                 model_name=self.model_name,
                 sampling_args=self.sampling_args,
-                max_retries=self.max_retries_by_task.get(group.example["task"], 0),
+                max_retries=self.max_retries_by_task.get(get_task(group.example), 0),
             )
         )
         self.inflight_requests[run_rollout_task] = InflightRolloutInfo(
-            off_policy_steps=0, client_config=client_config, task=group.example["task"], group_id=group_id
+            off_policy_steps=0, client_config=client_config, task=get_task(group.example), group_id=group_id
         )
 
     @property
@@ -387,10 +387,10 @@ class Scheduler:
     async def _score_group_if_deferred(self, completed_rollouts: list[vf.RolloutOutput]) -> list[vf.RolloutOutput]:
         if not completed_rollouts:
             return completed_rollouts
-        task = completed_rollouts[0]["task"]
+        task = get_task(completed_rollouts[0])
         if not self._should_defer_group_scoring(task):
             return completed_rollouts
-        env_for_task = self.env.get_env_for_task(task)
+        env_for_task = self.env.get_env_for_name(task)
         await env_for_task.rubric.score_group(cast(list[vf.State], completed_rollouts))
         return completed_rollouts
 

@@ -1,7 +1,7 @@
 import asyncio
 from pathlib import Path
 
-from verifiers.workers import ZMQEnvServer
+from verifiers.serve import ZMQEnvServer
 
 from surogate.grpo.orchestrator.env_server.config import EnvServerConfig
 from surogate.grpo.utils.logger import setup_logger
@@ -20,15 +20,14 @@ def run_server(config: EnvServerConfig):
         install_env(env_id)
 
     env_name = config.env.name or config.env.id
-    log_file = (get_log_dir(Path(config.output_dir)) / "train" / f"{env_name}.log").as_posix()
+    log_dir = (get_log_dir(Path(config.output_dir)) / "train" / env_name).as_posix()
 
     server = ZMQEnvServer(
         env_id=strip_env_version(config.env.id),
         env_args=config.env.args,
         extra_env_kwargs=config.env.extra_env_kwargs,
-        log_level=config.log.level,
-        log_file_level=config.log.vf_level,
-        log_file=log_file,
+        log_level=config.log.vf_level,
+        log_dir=log_dir,
         json_logging=config.log.json_logging,
         **{"address": config.env.address} if config.env.address is not None else {},
     )
