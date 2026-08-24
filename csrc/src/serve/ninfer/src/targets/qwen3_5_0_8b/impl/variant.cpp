@@ -348,7 +348,10 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
-        return 0;
+        // surogate vendor patch (PATCHES.md #17): the W8 profile opts into
+        // AllowA8; the wrapper sizes the large-T IMMA workspace.
+        return ops::attn_input_proj_workspace_capacity_bytes(
+            QType::W8G32_F16S, 5120, TextConfig::hidden, ops::LinearPolicy::AllowA8, first, last);
     case WeightsProfile::Qwen36Nvfp4:
         return ops::attn_input_proj_workspace_capacity_bytes(
             QType::NVFP4, 5120, TextConfig::hidden, kNvfp4TextPolicy, first, last);
@@ -365,9 +368,10 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
+        // surogate vendor patch (PATCHES.md #17): AllowA8 sizes the IMMA path.
         return ops::linear_add_workspace_capacity_bytes(QType::W8G32_F16S, TextConfig::hidden,
                                                         TextConfig::query_size,
-                                                        ops::LinearPolicy::A16Only, first, last);
+                                                        ops::LinearPolicy::AllowA8, first, last);
     case WeightsProfile::Qwen36Nvfp4:
         return ops::linear_add_workspace_capacity_bytes(QType::NVFP4, TextConfig::hidden,
                                                         TextConfig::query_size, kNvfp4TextPolicy,
@@ -388,7 +392,9 @@ std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfil
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
-        return 0;
+        // surogate vendor patch (PATCHES.md #17): AllowA8 sizes the IMMA path.
+        return ops::gdn_input_proj_workspace_capacity_bytes(
+            QType::W8G32_F16S, 8192, TextConfig::hidden, ops::LinearPolicy::AllowA8, first, last);
     case WeightsProfile::Qwen36Nvfp4:
         return ops::gdn_input_proj_workspace_capacity_bytes(QType::NVFP4, 8192, TextConfig::hidden,
                                                             kNvfp4TextPolicy, first, last);

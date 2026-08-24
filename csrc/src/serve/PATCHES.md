@@ -235,8 +235,23 @@
    (now ahead of BOTH vLLM columns), 1912 52.0k -> 54.5k (ahead of bf16;
    FP8 60.7k falls when the remaining families convert). Correctness: A8
    swiglu op tests green (A16 fallback at T=511 verified); engine output
-   exact. Remaining: qkvz (split2), qkgv (split4), linear_add (residual)
-   epilogue twins, quantizing-rmsnorm fusion, op tests per family.
+   exact. ALL FOUR families now converted: shared dispatchers
+   (w8a8_dispatch.{h,cu}: split2 for qkvz, split4 for qkgv in the fused
+   q|k|gate|v row order, residual for the output/down projections — all
+   direct-write, workspace = act-quant only), wrapper routing at
+   T >= kW8A8MinTokens with A16 below, and the target capacity hooks
+   rewired from hard zeros to the wrapper capacity functions under
+   AllowA8 (the 0-byte hooks would have overflowed the arena).
+
+   RESULT — the completed sweep: with A8 fully active (verified exact on
+   700+-token prompts, both models): 0.8b prefill 962: 46.5k tok/s,
+   1912: **63.8k — ahead of vLLM-FP8's 60.7k**; 2b 962: 28.6k (+43%),
+   1912: 37.8k (+49%, +32% over vLLM bf16). Combined with the decode
+   column, the engine now leads vLLM at EVERY measured point on both
+   models. Remaining refinements: quantizing-rmsnorm fusion (act-quant
+   already only ~2%), A8 test cases for the three direct-write families
+   (swiglu has them; the others are engine-exercised), swiglu fused-pair
+   epilogue.
 
 ### sm_89 port status
 

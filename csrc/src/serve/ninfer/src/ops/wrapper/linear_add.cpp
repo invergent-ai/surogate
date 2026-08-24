@@ -9,6 +9,7 @@
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
 #include "ops/linear_add/q5/q5_linear_add_plan.h"
 #include "ops/linear_add/w8/w8_linear_add_plan.h"
+#include "ops/linear/w8a8/w8a8_dispatch.h"
 
 #include <cstdint>
 #include <stdexcept>
@@ -99,6 +100,11 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
         }
         (void)detail::w8_linear_add_resolve_plan({output_rows, input_rows, input_rows, min_tokens});
         (void)detail::w8_linear_add_resolve_plan({output_rows, input_rows, input_rows, max_tokens});
+        // surogate vendor patch (PATCHES.md #17): AllowA8 large-T runs the
+        // W8A8-int IMMA residual path.
+        if (policy == LinearPolicy::AllowA8 && max_tokens >= detail::kW8A8MinTokens) {
+            return detail::w8a8_act_quant_bytes(input_rows, max_tokens);
+        }
         return 0;
     }
     if (qtype == QType::Q5G64_F16S) {
@@ -199,6 +205,12 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
             !aligned_to(w.qdata, 16) || !aligned_to(w.scales, 16)) {
             throw std::invalid_argument(
                 "linear_add: W8 requires 16-byte x/residual/code/scale alignment");
+        }
+        // surogate vendor patch (PATCHES.md #17): large-T prefill under
+        // AllowA8 runs the W8A8-int IMMA residual path.
+        if (policy == LinearPolicy::AllowA8 && x.ne[1] >= detail::kW8A8MinTokens) {
+            detail::w8a8_gemm_residual(x, w, residual_out, ws, stream);
+            return;
         }
         (void)ws;
         detail::w8_linear_add_dispatch(x, w, residual_out, stream);

@@ -5,6 +5,7 @@
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
 #include "ops/attn_input_proj/w8/w8_attn_input_plan.h"
+#include "ops/linear/w8a8/w8a8_dispatch.h"
 #include "ops/linear/fp8/fp8_config.h"
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
@@ -173,6 +174,13 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
     require_matrix(k, kKvRows, cols, "k");
     require_matrix(v, kKvRows, cols, "v");
     require_w8_rowsplit(weight, kRows, "query/key/gate/value weight");
+    // surogate vendor patch (PATCHES.md #17): large-T prefill under AllowA8
+    // runs the W8A8-int IMMA path (split4 epilogue, fused row order q|k|gate|v).
+    if (policy == LinearPolicy::AllowA8 && cols >= detail::kW8A8MinTokens &&
+        workspace != nullptr) {
+        detail::w8a8_gemm_split4(x, weight, q, k, gate, v, *workspace, stream);
+        return;
+    }
     detail::w8_attn_input_dispatch(x, weight, q, gate, k, v, stream);
 }
 
@@ -219,6 +227,11 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
                 {input_rows, q_rows, 512, parent_rows, input_rows, min_tokens});
             (void)detail::w8_attn_input_resolve_plan(
                 {input_rows, q_rows, 512, parent_rows, input_rows, max_tokens});
+        }
+        // surogate vendor patch (PATCHES.md #17): AllowA8 large-T runs the
+        // W8A8-int IMMA path, which needs quantized-activation workspace.
+        if (policy == LinearPolicy::AllowA8 && max_tokens >= detail::kW8A8MinTokens) {
+            return detail::w8a8_act_quant_bytes(input_rows, max_tokens);
         }
         return 0;
     case QType::Q4G64_F16S:

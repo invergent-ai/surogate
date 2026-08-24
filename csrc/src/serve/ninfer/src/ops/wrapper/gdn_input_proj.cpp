@@ -10,6 +10,7 @@
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.h"
 #include "ops/gdn_input_proj/w8/w8_gdn_input_kernels.h"
 #include "ops/gdn_input_proj/w8/w8_gdn_input_plan.h"
+#include "ops/linear/w8a8/w8a8_dispatch.h"
 #include "ops/linear/fp8/fp8_config.h"
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
@@ -349,6 +350,13 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
     require_matrix(z, kZRows, cols, "z");
     require_single_parent_nonoverlap(x, qkv, z);
     require_w8_rowsplit(weight, kRows, "query/key/value/z weight");
+    // surogate vendor patch (PATCHES.md #17): large-T prefill under AllowA8
+    // runs the W8A8-int IMMA path (split2 epilogue writes qkv/z directly).
+    if (policy == LinearPolicy::AllowA8 && cols >= detail::kW8A8MinTokens &&
+        workspace != nullptr) {
+        detail::w8a8_gemm_split2(x, weight, qkv, z, *workspace, stream);
+        return;
+    }
     detail::w8_gdn_input_dispatch(x, weight, qkv, z, stream);
 }
 
@@ -772,12 +780,22 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int
         }
         return detail::fp8_gdn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
     }
-    if (parent_qtype == QType::W8G32_F16S && parent_rows == 12288 && input_rows == 2048 &&
-        policy == LinearPolicy::A16Only) {
+    // surogate vendor patches (PATCHES.md #13/#16/#17): W8 fused parents
+    // (35B 12288/2048; 0.8b 8192/1024; 2b 8192/2048) at A16 or AllowA8;
+    // AllowA8 large-T sizes the quantized-activation workspace.
+    if (parent_qtype == QType::W8G32_F16S &&
+        (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) &&
+        ((parent_rows == 12288 && input_rows == 2048) ||
+         (parent_rows == 8192 && (input_rows == 1024 || input_rows == 2048)))) {
+        const std::int32_t qkv_rows = parent_rows == 12288 ? 8192 : 6144;
+        const std::int32_t z_rows   = parent_rows == 12288 ? 4096 : 2048;
         (void)detail::w8_gdn_input_resolve_plan(
-            {input_rows, 8192, 4096, parent_rows, input_rows, min_tokens});
+            {input_rows, qkv_rows, z_rows, parent_rows, input_rows, min_tokens});
         (void)detail::w8_gdn_input_resolve_plan(
-            {input_rows, 8192, 4096, parent_rows, input_rows, max_tokens});
+            {input_rows, qkv_rows, z_rows, parent_rows, input_rows, max_tokens});
+        if (policy == LinearPolicy::AllowA8 && max_tokens >= detail::kW8A8MinTokens) {
+            return detail::w8a8_act_quant_bytes(input_rows, max_tokens);
+        }
         return 0;
     }
     throw std::invalid_argument("gdn_input_proj workspace: unsupported parent profile");

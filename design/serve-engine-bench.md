@@ -140,3 +140,22 @@ AND 16 warps compose — winning config **BM64xBN128, 16 warps, 2-stage,
 this measured rate the end-to-end arithmetic flips BOTH remaining vLLM
 leads with margin (0.8B 1912-prefill ~52k -> ~66k vs FP8 60.7k; 2B
 ~25.3k -> ~31k vs bf16 28.6k). Productization queued (PATCHES #17).
+
+
+# W8A8-int IMMA integration — the completed sweep
+
+All four prefill GEMM families (gate_up, qkvz, qkgv, attn/gdn/mlp-down
+residuals) run the IMMA path under AllowA8 at T >= 512 (decode and short
+prefill stay A16). Kernel: 149-178 TF/s after the zfill/L1 staging fixes.
+Long-prompt exactness verified with A8 fully active on both models.
+
+| point | engine | vLLM bf16 | vLLM FP8 |
+|---|---:|---:|---:|
+| 0.8B prefill @962 | **46,476** | 36,654 | 32,819 |
+| 0.8B prefill @1912 | **63,843** | 52,381 | 60,667 |
+| 0.8B decode | **450-470** | 357-363 | 281-289 |
+| 2B prefill @962 | **28,642** | 21,592 | — |
+| 2B prefill @1912 | **37,765** | 28,637 | — |
+| 2B decode | **320-330** | 196-197 | — |
+
+**The engine now leads vLLM at every measured point on both models.**
