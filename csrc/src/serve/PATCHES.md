@@ -143,6 +143,36 @@
    decode 460-470 tok/s stable across context; prefill 4.4k tok/s @ 52
    tokens scaling to 41k tok/s @ 1912 — no route cliffs.
 
+16. **qwen3.5-2b target.** Second breadth target (hidden 2048, intermediate
+   6144; 24 layers, 8q/2kv hd256 attention, symmetric 16/16 GDN, vocab
+   248320, tied embeddings, 1 MTP — the 0.8b's twin scaled in hidden).
+   The geometry lands remarkably cheaply: its mlp gate_up (12288x2048) and
+   down (2048x6144) are EXACTLY the registered 35B W8 shapes; its mtp fc
+   (2048x4096) is the registered W835bMtpProjectionGeometry; the attention
+   qkgv (5120 rows) and gdn qkvz (8192 rows / 6144 conv channels) share the
+   0.8b's fused ROW structure with only K doubled — so the small-target
+   kernel branches are now keyed on PARENT ROWS (weight.n 5120/8192)
+   instead of hidden, with per-K template instantiation where the decode
+   kernel bakes K. New: vendored target tree (config.h derivation-driven —
+   only hidden/intermediate change), registry/engine variant entries,
+   tools/convert/qwen3_5_2b (same 287-object structure), W8 head routes at
+   k=2048 (n in {248320, 131072}), linear_add {2048,2048} admission
+   (routes over the measured q08 pattern), Bf16Gdn2BGeometry{16,2048} with
+   all six launcher guards twinned per K, gdn/attn wrapper gates
+   generalized. Conversion-side: ShardReader folds the official releases'
+   `model.language_model.*` nesting to the recipes' flat dialect (with an
+   ambiguity guard), and F32 control tensors (A_log/dt_bias in official
+   checkpoints) widen in with an explicit BF16 narrow at materialize.
+
+   Validated: converter produces the 2.77GB artifact from the official
+   safetensors in 19.3s (CPU); attn/gdn/linear/linear_add/gating op tests
+   all green with the 2B geometries (the small-target W8 attn comparisons
+   now share the one-ULP criterion — same defined-semantics argument as
+   the GDN one, hit at K=2048's higher cancellation). Engine E2E pending a
+   GPU window (artifact needs ~3.2GB); the shared cores (GQA 8/2 hd256,
+   GDN 16/16, conv 6144, gated rmsnorm, embedding d=2048) were already
+   covered.
+
 ### sm_89 port status
 
 With patches 5–10 the **entire tree compiles and links for sm_89**

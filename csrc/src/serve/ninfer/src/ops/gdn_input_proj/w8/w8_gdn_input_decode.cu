@@ -8,7 +8,8 @@ namespace ninfer::ops::detail {
 namespace {
 
 using Output = W8SplitOutput2<8192, 4096>;
-// surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b fused qkvz.
+// surogate vendor patch (PATCHES.md #13/#16): qwen3.5-0.8b and -2b share the
+// fused qkvz row structure (6144 conv channels + 2048 z rows); only K differs.
 using Output08 = W8SplitOutput2<6144, 2048>;
 
 struct W8GdnDecodeConvEpilogue {
@@ -58,15 +59,21 @@ make_conv_epilogue(const Tensor& conv_weight, Tensor& conv_states, const Tensor&
 void w8_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                 cudaStream_t stream) {
     constexpr int kRowsPerCta = 8;
-    if (weight.k == 1024) {
+    if (weight.n == 8192) {
         constexpr int kRows08 = 8192;
         const Output08 output{static_cast<__nv_bfloat16*>(qkv.data),
                               static_cast<__nv_bfloat16*>(z.data)};
-        w8_k2048_decode_kernel<kRows08, kRowsPerCta, Output08, W8DecodeStoreEpilogue, 1024>
-            <<<kRows08 / kRowsPerCta, kRowsPerCta * 32, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(x.data),
-                static_cast<const std::uint8_t*>(weight.qdata),
-                static_cast<const std::uint8_t*>(weight.scales), output);
+        const auto* xin     = static_cast<const __nv_bfloat16*>(x.data);
+        const auto* codes   = static_cast<const std::uint8_t*>(weight.qdata);
+        const auto* scales  = static_cast<const std::uint8_t*>(weight.scales);
+        const dim3 grid(kRows08 / kRowsPerCta);
+        if (weight.k == 1024) {
+            w8_k2048_decode_kernel<kRows08, kRowsPerCta, Output08, W8DecodeStoreEpilogue, 1024>
+                <<<grid, kRowsPerCta * 32, 0, stream>>>(xin, codes, scales, output);
+        } else {
+            w8_k2048_decode_kernel<kRows08, kRowsPerCta, Output08>
+                <<<grid, kRowsPerCta * 32, 0, stream>>>(xin, codes, scales, output);
+        }
         CUDA_CHECK(cudaGetLastError());
         return;
     }
@@ -86,7 +93,7 @@ void w8_gdn_input_decode_conv_snapshot_launch(
     const Tensor& valid_columns, const Tensor& initial_slot, const Tensor& snapshot_base_slot,
     Tensor& query, Tensor& key, Tensor& value, Tensor& z, cudaStream_t stream) {
     constexpr int kRowsPerCta = 8;
-    if (weight.k == 1024) {
+    if (weight.n == 8192) {
         constexpr int kRows08 = 8192;
         const Output08 ignored_output{static_cast<__nv_bfloat16*>(query.data),
                                       static_cast<__nv_bfloat16*>(z.data)};
@@ -96,11 +103,19 @@ void w8_gdn_input_decode_conv_snapshot_launch(
             static_cast<__nv_bfloat16*>(z.data),
             6144,
         };
-        w8_k2048_decode_kernel<kRows08, kRowsPerCta, Output08, W8GdnDecodeConvEpilogue, 1024>
-            <<<kRows08 / kRowsPerCta, kRowsPerCta * 32, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(x.data),
-                static_cast<const std::uint8_t*>(weight.qdata),
-                static_cast<const std::uint8_t*>(weight.scales), ignored_output, epilogue);
+        const auto* xin    = static_cast<const __nv_bfloat16*>(x.data);
+        const auto* codes  = static_cast<const std::uint8_t*>(weight.qdata);
+        const auto* scales = static_cast<const std::uint8_t*>(weight.scales);
+        const dim3 grid(kRows08 / kRowsPerCta);
+        if (weight.k == 1024) {
+            w8_k2048_decode_kernel<kRows08, kRowsPerCta, Output08, W8GdnDecodeConvEpilogue, 1024>
+                <<<grid, kRowsPerCta * 32, 0, stream>>>(xin, codes, scales, ignored_output,
+                                                        epilogue);
+        } else {
+            w8_k2048_decode_kernel<kRows08, kRowsPerCta, Output08, W8GdnDecodeConvEpilogue>
+                <<<grid, kRowsPerCta * 32, 0, stream>>>(xin, codes, scales, ignored_output,
+                                                        epilogue);
+        }
         CUDA_CHECK(cudaGetLastError());
         return;
     }

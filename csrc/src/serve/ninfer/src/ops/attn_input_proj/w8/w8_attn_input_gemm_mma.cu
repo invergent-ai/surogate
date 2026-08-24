@@ -39,13 +39,17 @@ void w8_attn_input_mma_r32_c128_launch(const Tensor& x, const Weight& weight, Te
                                        Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream) {
     using Schedule = W8RowSplitMmaGemmSchedule<32, 128, 32, 16, 2>;
     static_assert((4096 % Schedule::BM) == 0 && (512 % Schedule::BM) == 0);
-    // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b fused qkgv.
-    if (weight.k == 1024) {
+    // surogate vendor patches (PATCHES.md #13/#16): qwen3.5-0.8b/-2b qkgv.
+    if (weight.n == 5120) {
         using Output08 = W8SplitOutput4<2048, 512, 2048, 512>;
         const Output08 output{
             static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
             static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(v.data)};
-        launch_route<Schedule, 5120, 1024>(x, weight, output, stream);
+        if (weight.k == 1024) {
+            launch_route<Schedule, 5120, 1024>(x, weight, output, stream);
+        } else {
+            launch_route<Schedule, 5120, 2048>(x, weight, output, stream);
+        }
         return;
     }
     const TargetOutput output{
@@ -58,13 +62,17 @@ void w8_attn_input_mma_r64_c128_launch(const Tensor& x, const Weight& weight, Te
                                        Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream) {
     using Schedule = W8RowSplitMmaGemmSchedule<64, 128, 64, 16, 2, 2>;
     static_assert((4096 % Schedule::BM) == 0 && (512 % Schedule::BM) == 0);
-    // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b fused qkgv.
-    if (weight.k == 1024) {
+    // surogate vendor patches (PATCHES.md #13/#16): qwen3.5-0.8b/-2b qkgv.
+    if (weight.n == 5120) {
         using Output08 = W8SplitOutput4<2048, 512, 2048, 512>;
         const Output08 output{
             static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
             static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(v.data)};
-        launch_route<Schedule, 5120, 1024>(x, weight, output, stream);
+        if (weight.k == 1024) {
+            launch_route<Schedule, 5120, 1024>(x, weight, output, stream);
+        } else {
+            launch_route<Schedule, 5120, 2048>(x, weight, output, stream);
+        }
         return;
     }
     const TargetOutput output{

@@ -334,11 +334,12 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
         return;
     }
 
-    // surogate vendor patch (PATCHES.md #13): geometry keyed on hidden.
-    const bool q08                 = weight.k == 1024;
-    const std::int32_t kHidden  = q08 ? 1024 : 2048;
-    const std::int32_t kQkvRows = q08 ? 6144 : 8192;
-    const std::int32_t kZRows   = q08 ? 2048 : 4096;
+    // surogate vendor patch (PATCHES.md #13/#16): the small fused structure
+    // (0.8b k=1024 and 2b k=2048) is keyed on parent rows, not hidden.
+    const bool small_fused      = weight.n == 8192;
+    const std::int32_t kHidden  = weight.k;
+    const std::int32_t kQkvRows = small_fused ? 6144 : 8192;
+    const std::int32_t kZRows   = small_fused ? 2048 : 4096;
     const std::int32_t kRows    = kQkvRows + kZRows;
     if (policy != LinearPolicy::A16Only) {
         throw std::invalid_argument("W8 gdn_input_proj admits only A16");
@@ -518,14 +519,15 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
         return;
     }
 
-    // surogate vendor patch (PATCHES.md #13): geometry keyed on hidden
-    // (35B 2048; qwen3.5-0.8b 1024 with 16 symmetric V heads).
-    const bool q08                 = weight.k == 1024;
-    const std::int32_t kHidden    = q08 ? 1024 : 2048;
+    // surogate vendor patch (PATCHES.md #13/#16): the small fused structure
+    // (0.8b k=1024, 2b k=2048; both 16 symmetric V heads) is keyed on parent
+    // rows — the 35B parent has 12288.
+    const bool small_fused        = weight.n == 8192;
+    const std::int32_t kHidden    = weight.k;
     const std::int32_t kQueryRows = 2048;
     const std::int32_t kKeyRows   = 2048;
-    const std::int32_t kValueRows = q08 ? 2048 : 4096;
-    const std::int32_t kZRows     = q08 ? 2048 : 4096;
+    const std::int32_t kValueRows = small_fused ? 2048 : 4096;
+    const std::int32_t kZRows     = small_fused ? 2048 : 4096;
     const std::int32_t kChannels  = kQueryRows + kKeyRows + kValueRows;
     const ConvGeometry geometry       = require_snapshot_input(x, kHidden);
     if (policy != LinearPolicy::A16Only) {
@@ -559,10 +561,10 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
             snapshot_base_slots, query, key, value, z, stream);
         return;
     }
-    if (plan.schedule == detail::W8GdnInputConvScheduleId::SplitKMmaFused && !q08) {
-        // surogate vendor patch (PATCHES.md #13): the fused split-K conv kernel
-        // bakes the 35B geometry (port tracked); the 0.8b takes the generic
-        // project-then-conv path below instead.
+    if (plan.schedule == detail::W8GdnInputConvScheduleId::SplitKMmaFused && !small_fused) {
+        // surogate vendor patch (PATCHES.md #13/#16): the fused split-K conv
+        // kernel bakes the 35B geometry (port tracked); the 0.8b/2b take the
+        // generic project-then-conv path below instead.
         detail::w8_gdn_input_splitk_conv_snapshot_launch(
             x, weight, conv_weight, conv_states, valid_columns, initial_state_slots,
             snapshot_base_slots, query, key, value, z, stream);
@@ -851,7 +853,7 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     // qwen3.5-0.8b 8192/1024) size through the split-dimension path.
     if (parent_qtype == QType::W8G32_F16S && policy == LinearPolicy::A16Only &&
         ((parent_rows == 12288 && input_rows == 2048) ||
-         (parent_rows == 8192 && input_rows == 1024))) {
+         (parent_rows == 8192 && (input_rows == 1024 || input_rows == 2048)))) {
         const std::int32_t value_rows = parent_rows == 12288 ? 4096 : 2048;
         return gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, value_rows,
                                                                      batch_size, min_width,
@@ -914,7 +916,7 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     // record path, mirroring the snapshot overload above.
     if (parent_qtype == QType::W8G32_F16S && policy == LinearPolicy::A16Only &&
         ((parent_rows == 12288 && input_rows == 2048) ||
-         (parent_rows == 8192 && input_rows == 1024))) {
+         (parent_rows == 8192 && (input_rows == 1024 || input_rows == 2048)))) {
         const std::int32_t value_rows = parent_rows == 12288 ? 4096 : 2048;
         return gdn_input_proj_conv_record_workspace_capacity_bytes(2048, 2048, value_rows,
                                                                    batch_size, min_width,

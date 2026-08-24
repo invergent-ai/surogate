@@ -19,7 +19,9 @@ template <bool Full>
 void launch_variant(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                     cudaStream_t stream) {
     static_assert((8192 % Schedule::BM) == 0 && (4096 % Schedule::BM) == 0);
-    if (weight.k == 1024) {
+    if (weight.n == 8192) {
+        // surogate vendor patch (PATCHES.md #13/#16): 0.8b (k=1024) and 2b
+        // (k=2048) share the fused row structure; the kernel is runtime-K.
         static_assert((6144 % Schedule::BM) == 0 && (2048 % Schedule::BM) == 0);
         const Output08 output{static_cast<__nv_bfloat16*>(qkv.data),
                               static_cast<__nv_bfloat16*>(z.data)};
@@ -29,7 +31,8 @@ void launch_variant(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& 
             <<<grid, Schedule::THREADS, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(x.data),
                 static_cast<const std::uint8_t*>(weight.qdata),
-                static_cast<const std::uint8_t*>(weight.scales), output, 8192, 1024, x.ne[1], 1024);
+                static_cast<const std::uint8_t*>(weight.scales), output, 8192, weight.k, x.ne[1],
+                weight.k);
         return;
     }
     const Output output{static_cast<__nv_bfloat16*>(qkv.data), static_cast<__nv_bfloat16*>(z.data)};

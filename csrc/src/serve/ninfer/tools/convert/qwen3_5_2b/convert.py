@@ -1,10 +1,10 @@
-"""Convert the registered Qwen3.5-0.8B checkpoint into one complete artifact.
+"""Convert the registered Qwen3.5-2B checkpoint into one complete artifact.
 
 Canonical invocation::
 
-    python -m tools.convert.qwen3_5_0_8b.convert \
-      --model /path/to/Qwen3.5-0.8B/base-hf-bf16 \
-      --out out/qwen3_5_0_8b.ninfer
+    python -m tools.convert.qwen3_5_2b.convert \
+      --model /path/to/Qwen3.5-2B/base-hf-bf16 \
+      --out out/qwen3_5_2b.ninfer
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ from tools.convert.qwen3_6.common import official_resources
 from . import draft_head, inventory, recipe
 
 
-RECIPE_ID = "qwen3_5_0_8b-v2"
+RECIPE_ID = "qwen3_5_2b-v2"
 
 _ROOT_CONFIG = {
     "architectures": ["Qwen3_5ForConditionalGeneration"],
@@ -46,8 +46,8 @@ _ROOT_CONFIG = {
 _TEXT_CONFIG = {
     "num_hidden_layers": 24,
     "full_attention_interval": 4,
-    "hidden_size": 1024,
-    "intermediate_size": 3584,
+    "hidden_size": 2048,
+    "intermediate_size": 6144,
     "vocab_size": 248320,
     "num_attention_heads": 8,
     "num_key_value_heads": 2,

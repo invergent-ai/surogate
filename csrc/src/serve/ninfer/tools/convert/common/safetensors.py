@@ -30,6 +30,7 @@ class ShardReader:
         self.model_dir = Path(model_dir)
         index = json.loads((self.model_dir / index_filename).read_text())
         self.weight_map: dict[str, str] = dict(index["weight_map"])
+        self._canonicalize_names()
         self._reset_handle()
 
     @classmethod
@@ -44,8 +45,37 @@ class ShardReader:
         reader.model_dir = path.parent
         with safe_open(str(path), framework="pt", device="cpu") as handle:
             reader.weight_map = {name: path.name for name in handle.keys()}
+        reader._canonicalize_names()
         reader._reset_handle()
         return reader
+
+    def _canonicalize_names(self) -> None:
+        """Fold the VL-style `model.language_model.*` nesting to `model.*`.
+
+        surogate vendor patch (PATCHES.md #16): the family recipes address
+        sources in the flat dialect (`model.layers...`, matching GGUF-bridged
+        checkpoints); official Qwen3.5 releases nest the text tower under
+        `model.language_model.`. When both spellings exist for one tensor the
+        checkpoint is ambiguous and left untouched.
+        """
+        prefix = "model.language_model."
+        folded = {}
+        for name, shard in self.weight_map.items():
+            if name.startswith(prefix):
+                flat = "model." + name[len(prefix):]
+                if flat in self.weight_map:
+                    return  # ambiguous; serve the names as stored
+                folded[flat] = (name, shard)
+        if not folded:
+            return
+        self._aliases: dict[str, str] = {}
+        for flat, (stored, shard) in folded.items():
+            del self.weight_map[stored]
+            self.weight_map[flat] = shard
+            self._aliases[flat] = stored
+
+    def _stored_name(self, name: str) -> str:
+        return getattr(self, "_aliases", {}).get(name, name)
 
     def _reset_handle(self) -> None:
         self._current_shard: str | None = None
@@ -75,7 +105,7 @@ class ShardReader:
     def get(self, name: str) -> torch.Tensor:
         shard = self.weight_map[name]
         handle = self._open_shard(shard)
-        return handle.get_tensor(name)
+        return handle.get_tensor(self._stored_name(name))
 
     def metadata(self, names: Iterable[str]) -> dict[str, TensorMetadata]:
         self.close()
@@ -92,7 +122,7 @@ class ShardReader:
                 device="cpu",
             ) as handle:
                 for name in shard_names:
-                    tensor_slice = handle.get_slice(name)
+                    tensor_slice = handle.get_slice(self._stored_name(name))
                     result[name] = TensorMetadata(
                         name=name,
                         shard=shard,

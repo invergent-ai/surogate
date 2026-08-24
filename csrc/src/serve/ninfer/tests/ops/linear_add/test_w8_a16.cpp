@@ -41,6 +41,10 @@ int w8_a16_conformance() {
     failures += ninfer::test::linear_add::run_shape(
         "W8_A16 LinearAdd", WeightFormat::W8G32F16S,
         ShapeCase{1024, 3584, 433U, kQ08RouteStarts, kQ08RouteInteriors});
+    // surogate vendor patch (PATCHES.md #16): qwen3.5-2b output projections.
+    failures += ninfer::test::linear_add::run_shape(
+        "W8_A16 LinearAdd", WeightFormat::W8G32F16S,
+        ShapeCase{2048, 2048, 439U, kQ08RouteStarts, kQ08RouteInteriors});
     return failures;
 }
 

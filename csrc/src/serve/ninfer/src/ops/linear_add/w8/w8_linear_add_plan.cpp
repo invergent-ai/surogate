@@ -208,11 +208,13 @@ bool w8_linear_add_schedule_uses_mma(W8LinearAddScheduleId schedule) noexcept {
 }
 
 bool w8_linear_add_admits(const W8LinearAddProblem& problem) noexcept {
-    // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b W8 profile shapes
-    // (attn/gdn output {1024,2048}, mlp down {1024,3584}).
+    // surogate vendor patches (PATCHES.md #13/#16): qwen3.5-0.8b
+    // ({1024,2048|3584}) and qwen3.5-2b attn/gdn output ({2048,2048}; its
+    // mlp down {2048,6144} rides the registered base shape).
     const bool base = problem.rows == 2048 && (problem.k == 4096 || problem.k == 6144);
     const bool q08  = problem.rows == 1024 && (problem.k == 2048 || problem.k == 3584);
-    return (base || q08) && problem.padded_k == problem.k && problem.cols >= 1;
+    const bool q2b  = problem.rows == 2048 && problem.k == 2048;
+    return (base || q08 || q2b) && problem.padded_k == problem.k && problem.cols >= 1;
 }
 
 W8LinearAddPlan w8_linear_add_resolve_plan(const W8LinearAddProblem& problem) {
@@ -228,6 +230,10 @@ W8LinearAddPlan w8_linear_add_resolve_plan(const W8LinearAddProblem& problem) {
         throw std::logic_error("w8 linear_add: admitted problem has no covering route");
     };
     if (problem.rows == 1024) { return resolve_from(kQ08Routes); }
+    // qwen3.5-2b output projections: k==2048 has no exact-T instantiations
+    // (SplitKMma/Medium/Decode are 2048x{4096,6144} bakes) — route over the
+    // runtime-shaped schedules, following the measured q08 pattern.
+    if (problem.k == 2048) { return resolve_from(kQ08Routes); }
     return problem.k == 6144 ? resolve_from(kK6144Routes) : resolve_from(kK4096Routes);
 }
 

@@ -28,6 +28,8 @@ constexpr Geometry kQwen38Parent{"qwen3_8_27b_parent", 5120, 48, true};
 constexpr Geometry kQwen35{"qwen3_6_35b_a3b", 2048, 32, true};
 // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b GDN gating geometry.
 constexpr Geometry kQwen08{"qwen3_5_0_8b", 1024, 16, true};
+// surogate vendor patch (PATCHES.md #16): qwen3.5-2b GDN gating geometry.
+constexpr Geometry kQwen2B{"qwen3_5_2b", 2048, 16, true};
 
 constexpr ReductionCriterion kGdnProjectionFp32{/*relative_l2=*/1.4e-6,
                                                 /*gross_absolute=*/5.0e-7,
@@ -463,6 +465,13 @@ int main() {
     }
     failures += run_norm_projection_case(kQwen08, 1, 0x6001u);
     failures += run_norm_projection_case(kQwen08, 64, 0x6040u);
+    failures += verify_workspace_capacity_contract(kQwen2B, {1, 127, 1024, 4097});
+    for (const std::int32_t tokens : {1, 127, 128, 1025, 4097}) {
+        failures +=
+            run_projection_case(kQwen2B, tokens, 0x7000u + static_cast<std::uint32_t>(tokens));
+    }
+    failures += run_norm_projection_case(kQwen2B, 1, 0x8001u);
+    failures += run_norm_projection_case(kQwen2B, 64, 0x8040u);
 
     // 27B uses the composed implementation; 35B also qualifies both sides of its fused boundary.
     failures += run_norm_projection_case(kQwen27, 1, 0x3001u);

@@ -131,10 +131,12 @@ GenerationResult GenerationHandle::wait(OutputSink* sink, const CancellationView
 class Engine::Impl {
 public:
     using Executor08 = runtime::ConcurrentExecutor<targets::Qwen3_5_0_8BInstance>;
+    using Executor2B = runtime::ConcurrentExecutor<targets::Qwen3_5_2BInstance>;
     using Executor27 = runtime::ConcurrentExecutor<targets::Qwen3_6_27BInstance>;
     using Executor35 = runtime::ConcurrentExecutor<targets::Qwen3_6_35BA3BInstance>;
     using Executor   = std::variant<std::monostate, std::unique_ptr<Executor08>,
-                                  std::unique_ptr<Executor27>, std::unique_ptr<Executor35>>;
+                                  std::unique_ptr<Executor2B>, std::unique_ptr<Executor27>,
+                                  std::unique_ptr<Executor35>>;
 
     explicit Impl(EngineOptions engine_options)
         : options(std::move(engine_options)), device(options.device) {
@@ -148,6 +150,8 @@ public:
                     typename std::remove_reference_t<decltype(target_ptr)>::element_type;
                 if constexpr (std::is_same_v<Instance, targets::Qwen3_5_0_8BInstance>) {
                     return std::make_unique<Executor08>(*target_ptr, options);
+                } else if constexpr (std::is_same_v<Instance, targets::Qwen3_5_2BInstance>) {
+                    return std::make_unique<Executor2B>(*target_ptr, options);
                 } else if constexpr (std::is_same_v<Instance, targets::Qwen3_6_27BInstance>) {
                     return std::make_unique<Executor27>(*target_ptr, options);
                 } else {

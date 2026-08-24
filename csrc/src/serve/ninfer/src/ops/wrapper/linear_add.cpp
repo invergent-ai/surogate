@@ -188,8 +188,9 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
             throw std::invalid_argument("W8 linear_add admits only A16");
         }
         require_w8(w);
-        // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b {1024,2048|3584}.
-        const bool base = w.n == 2048 && (w.k == 4096 || w.k == 6144);
+        // surogate vendor patches (PATCHES.md #13/#16): qwen3.5-0.8b
+        // {1024,2048|3584} and qwen3.5-2b output projections {2048,2048}.
+        const bool base = w.n == 2048 && (w.k == 4096 || w.k == 6144 || w.k == 2048);
         const bool q08  = w.n == 1024 && (w.k == 2048 || w.k == 3584);
         if (!base && !q08) {
             throw std::invalid_argument("linear_add: unsupported W8 shape");

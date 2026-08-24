@@ -34,9 +34,10 @@ constexpr bool catalog_is_closed() {
 
 static_assert(catalog_is_closed(), "W8 GDN input routes must be exact and closed");
 
-// surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b routes. The split-K
-// medium-T kernel bakes the 35B geometry (port tracked); route the 0.8b's
-// 2..96 band to the runtime-dim MMA schedule instead.
+// surogate vendor patch (PATCHES.md #13/#16): qwen3.5-0.8b AND -2b routes
+// (both have the 6144-row qkv split). The split-K medium-T kernel bakes the
+// 35B geometry (port tracked); route their 2..96 band to the runtime-dim
+// MMA schedule instead.
 constexpr std::array<RouteSpec, 2> kRoutes08{{
     {1, 1, W8GdnInputScheduleId::DecodeR8Direct},
     {2, kAnyCols, W8GdnInputScheduleId::MmaR64C128},
@@ -50,7 +51,12 @@ bool supported_shape(const W8GdnInputProblem& problem) noexcept {
     const bool q08 = problem.input_rows == 1024 && problem.qkv_rows == 6144 &&
                      problem.z_rows == 2048 && problem.parent_rows == 8192 &&
                      problem.padded_k == 1024;
-    return base || q08;
+    // surogate vendor patch (PATCHES.md #16): qwen3.5-2b — same fused row
+    // structure as the 0.8b at hidden 2048.
+    const bool q2b = problem.input_rows == 2048 && problem.qkv_rows == 6144 &&
+                     problem.z_rows == 2048 && problem.parent_rows == 8192 &&
+                     problem.padded_k == 2048;
+    return base || q08 || q2b;
 }
 
 } // namespace
@@ -87,7 +93,7 @@ W8GdnInputPlan w8_gdn_input_resolve_plan(const W8GdnInputProblem& problem) {
     if (!w8_gdn_input_admits(problem)) {
         throw std::invalid_argument("W8 GDN input: exact problem or column count is not admitted");
     }
-    if (problem.input_rows == 1024) {
+    if (problem.input_rows == 1024 || problem.qkv_rows == 6144) {
         for (const RouteSpec& route : kRoutes08) {
             if (problem.cols >= route.first && problem.cols <= route.last) {
                 return {route.schedule};

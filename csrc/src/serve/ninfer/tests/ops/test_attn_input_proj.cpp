@@ -22,6 +22,13 @@ namespace {
 
 // This criterion belongs to the complete A16 attention-input-projection Op.
 constexpr ReductionCriterion kAttnInputProjA16Tolerance{2.9e-3, 4.0e-3, 4.5e-3};
+// surogate vendor patches (PATCHES.md #13/#16): the small-target W8 fused
+// comparisons admit exactly one BF16 output ULP at the batch maximum, and a
+// relative-L2 that tolerates one flipped sample dominating a small (T<=2)
+// batch's norm — same defined-semantics argument as the GDN W8 criterion
+// (weights dequantize to BF16 before the MMA; under cancellation that
+// rounding legitimately crosses an output rounding boundary).
+constexpr ReductionCriterion kAttnInputProjW8UlpTolerance{1.0e-2, 4.0e-3, 7.8125e-3};
 // FP8 A16 reuses the qualified Linear decode arithmetic profile rather than the other A16
 // attention-input implementations' reduction profile.
 constexpr ReductionCriterion kFp8AttnInputProjA16Tolerance{1.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0};
@@ -467,13 +474,13 @@ int run_w8_q08_case(DevicePackedWeight& parent, std::int32_t tokens) {
     const std::string suffix = " W8 q08 A16 T=" + std::to_string(tokens);
     int failures             = 0;
     failures += verify_output("attn q" + suffix, query, parent.host, 0, kQRows, activation, kHidden,
-                              tokens);
+                              tokens, kAttnInputProjW8UlpTolerance);
     failures += verify_output("attn k" + suffix, key, parent.host, kQRows, kKvRows, activation,
-                              kHidden, tokens);
+                              kHidden, tokens, kAttnInputProjW8UlpTolerance);
     failures += verify_output("attn gate" + suffix, gate, parent.host, kQRows + kKvRows, kQRows,
-                              activation, kHidden, tokens);
+                              activation, kHidden, tokens, kAttnInputProjW8UlpTolerance);
     failures += verify_output("attn value" + suffix, value, parent.host, 2 * kQRows + kKvRows,
-                              kKvRows, activation, kHidden, tokens);
+                              kKvRows, activation, kHidden, tokens, kAttnInputProjW8UlpTolerance);
     failures += verify_preserved("attn x" + suffix, device_activation, activation_bits);
     failures += parent.verify_preserved("attn parent weight" + suffix);
     return failures;
@@ -487,6 +494,54 @@ int run_w8_q08() {
     // One case per 0.8B A16 route region plus boundaries.
     for (const std::int32_t tokens : {1, 2, 17, 48, 64, 65, 128, 129}) {
         failures += run_w8_q08_case(parent, tokens);
+    }
+    return failures;
+}
+
+// surogate vendor patch (PATCHES.md #16): qwen3.5-2b — same fused qkgv row
+// structure at hidden 2048.
+int run_w8_q2b_case(DevicePackedWeight& parent, std::int32_t tokens) {
+    constexpr std::int32_t kHidden      = 2048;
+    constexpr std::int32_t kQRows       = 2048;
+    constexpr std::int32_t kKvRows      = 512;
+    const std::vector<float> activation = make_bf16_activation(kHidden, tokens, 501U + tokens);
+    const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
+    DeviceBuffer device_activation                   = to_device(activation_bits);
+
+    GuardedBf16Tensor query(kQRows, tokens);
+    GuardedBf16Tensor gate(kQRows, tokens);
+    GuardedBf16Tensor key(kKvRows, tokens);
+    GuardedBf16Tensor value(kKvRows, tokens);
+    Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
+    Tensor q = query.tensor();
+    Tensor g = gate.tensor();
+    Tensor k = key.tensor();
+    Tensor v = value.tensor();
+    ops::attn_input_proj(x, parent.view(), q, g, k, v, nullptr);
+    cuda_synchronize();
+
+    const std::string suffix = " W8 q2b A16 T=" + std::to_string(tokens);
+    int failures             = 0;
+    failures += verify_output("attn q" + suffix, query, parent.host, 0, kQRows, activation, kHidden,
+                              tokens, kAttnInputProjW8UlpTolerance);
+    failures += verify_output("attn k" + suffix, key, parent.host, kQRows, kKvRows, activation,
+                              kHidden, tokens, kAttnInputProjW8UlpTolerance);
+    failures += verify_output("attn gate" + suffix, gate, parent.host, kQRows + kKvRows, kQRows,
+                              activation, kHidden, tokens, kAttnInputProjW8UlpTolerance);
+    failures += verify_output("attn value" + suffix, value, parent.host, 2 * kQRows + kKvRows,
+                              kKvRows, activation, kHidden, tokens, kAttnInputProjW8UlpTolerance);
+    failures += verify_preserved("attn x" + suffix, device_activation, activation_bits);
+    failures += parent.verify_preserved("attn parent weight" + suffix);
+    return failures;
+}
+
+int run_w8_q2b() {
+    constexpr std::int32_t kHidden = 2048;
+    DevicePackedWeight parent(
+        quantized_weight::make_patterned_weight(QType::W8G32_F16S, 5120, kHidden, 419U));
+    int failures = 0;
+    for (const std::int32_t tokens : {1, 2, 128, 129}) {
+        failures += run_w8_q2b_case(parent, tokens);
     }
     return failures;
 }
@@ -549,6 +604,7 @@ int main() {
     failures += run_fp8_target();
     failures += run_w8_target();
     failures += run_w8_q08();
+    failures += run_w8_q2b();
     failures += run_w8_companion();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " attn_input_proj\n";
     return failures == 0 ? 0 : 1;

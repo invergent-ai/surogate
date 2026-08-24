@@ -55,9 +55,17 @@ struct Bf16Gdn08Geometry {
     static constexpr int kBlockN = 64;
 };
 
+// surogate vendor patch (PATCHES.md #16): qwen3.5-2b (16 GDN heads, 2048 hidden).
+struct Bf16Gdn2BGeometry {
+    static constexpr int kHeads  = 16;
+    static constexpr int kHidden = 2048;
+    static constexpr int kBlockN = 64;
+};
+
 static_assert(Bf16Gdn27Geometry::kHidden % kBf16GdnBlockK == 0);
 static_assert(Bf16Gdn35Geometry::kHidden % kBf16GdnBlockK == 0);
 static_assert(Bf16Gdn08Geometry::kHidden % kBf16GdnBlockK == 0);
+static_assert(Bf16Gdn2BGeometry::kHidden % kBf16GdnBlockK == 0);
 
 __device__ __forceinline__ int bf16_gdn_swizzle(int row, int col) {
     return (col & ~63) + gemm_swz64(row, col & 63);

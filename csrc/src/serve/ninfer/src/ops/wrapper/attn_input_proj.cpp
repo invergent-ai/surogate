@@ -152,12 +152,14 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
         return;
     }
 
-    // surogate vendor patch (PATCHES.md #13): 35B (2048 hidden) or 0.8b (1024).
-    const bool q08                 = weight.k == 1024;
-    const std::int32_t kHidden = q08 ? 1024 : 2048;
-    const std::int32_t kQRows  = q08 ? 2048 : 4096;
+    // surogate vendor patches (PATCHES.md #13/#16): the small fused parent
+    // (5120 rows) covers the 0.8b (hidden 1024) and 2b (hidden 2048); the 35B
+    // parent has 9216 rows. Keyed on parent rows, not hidden.
+    const bool small_fused     = weight.n == 5120;
+    const std::int32_t kHidden = weight.k;
+    const std::int32_t kQRows  = small_fused ? 2048 : 4096;
     const std::int32_t kKvRows = 512;
-    const std::int32_t kRows   = q08 ? 5120 : 9216;
+    const std::int32_t kRows   = small_fused ? 5120 : 9216;
     const std::int32_t cols        = x.ne[1];
     if (cols <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
     if (policy != LinearPolicy::A16Only) {
@@ -204,7 +206,8 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
         return detail::fp8_attn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
     case QType::W8G32_F16S:
         if (!((parent_rows == 9216 && input_rows == 2048) ||
-              (parent_rows == 5120 && input_rows == 1024)) ||
+              (parent_rows == 5120 &&
+               (input_rows == 1024 || input_rows == 2048))) ||
             policy != LinearPolicy::A16Only) {
             throw std::invalid_argument("attn_input_proj workspace: unsupported W8 profile");
         }

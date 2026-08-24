@@ -151,6 +151,18 @@ int w8_a16_conformance() {
     failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
                           {131072, 1024, 307U, Comparison::Sampled, false, kN131072K1024});
 
+    // surogate vendor patch (PATCHES.md #16): qwen3.5-2b heads at k=2048.
+    constexpr std::array kN248320K2048{
+        a16(1), a16(13), a16(14), a16(128), a16(129),
+    };
+    failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
+                          {248320, 2048, 311U, Comparison::Sampled, false, kN248320K2048});
+    constexpr std::array kN131072K2048{
+        a16(1), a16(14), a16(129),
+    };
+    failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
+                          {131072, 2048, 313U, Comparison::Sampled, false, kN131072K2048});
+
     return failures;
 }
 

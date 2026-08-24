@@ -68,6 +68,9 @@ def converter_for_config(config: dict) -> ConverterTarget | None:
     if model_type == "qwen3_5" and hidden == 1024 and layers == 24:
         return ConverterTarget("qwen3_5_0_8b", "tools.convert.qwen3_5_0_8b.convert",
                                "Qwen3.5-0.8B", gguf_repack=True)
+    if model_type == "qwen3_5" and hidden == 2048 and layers == 24:
+        return ConverterTarget("qwen3_5_2b", "tools.convert.qwen3_5_2b.convert",
+                               "Qwen3.5-2B", gguf_repack=True)
     if model_type in ("qwen3_5", "qwen3_6") and hidden == 5120 and layers >= 60:
         if nvfp4:
             return ConverterTarget("qwen3_6_27b_nvfp4", "tools.convert.qwen3_6_27b.convert_nvfp4",
@@ -170,11 +173,12 @@ def _ensure_from_gguf(gguf_path: Path, *, echo=print) -> Path:
     # Q8_0 repack (PATCHES.md #14): for targets whose converter takes
     # --gguf-repack, plan against the converter's own recipes which candidate
     # tensors it repacks bit-exactly; the bridge dequantizes only the rest.
-    planner = _repack_planner(root) if target_key == "qwen3_5_0_8b" else None
+    repack_targets = {"qwen3_5_0_8b", "qwen3_5_2b"}
+    planner = _repack_planner(root, target_key) if target_key in repack_targets else None
     # No-MTP variant (PATCHES.md #15): community exports may strip nextn.
     arch = serve_gguf.read_gguf_summary(gguf_path, reader)["architecture"]
     nextn = reader.kv(f"{arch}.nextn_predict_layers", 0)
-    no_mtp = target_key == "qwen3_5_0_8b" and int(nextn or 0) == 0
+    no_mtp = target_key in repack_targets and int(nextn or 0) == 0
     work = cache_dir() / f"gguf-bridge-{fp}"
     try:
         model_dir = serve_gguf.build_hf_dir_from_gguf(
@@ -193,9 +197,10 @@ def _ensure_from_gguf(gguf_path: Path, *, echo=print) -> Path:
         shutil.rmtree(work, ignore_errors=True)
 
 
-def _repack_planner(root: Path):
-    """Q8_0 repack plan via the vendored converter's registered recipes."""
+def _repack_planner(root: Path, target_key: str):
+    """Repack plan via the named vendored converter's registered recipes."""
     def plan(gguf_path: Path, candidates: dict[str, str]) -> dict[str, str]:
+        import importlib
         import sys as _sys
         if str(root) not in _sys.path:
             _sys.path.insert(0, str(root))
@@ -203,7 +208,8 @@ def _repack_planner(root: Path):
             REPACKABLE_TYPES,
             GgufRepackSource,
         )
-        from tools.convert.qwen3_5_0_8b import inventory, recipe
+        inventory = importlib.import_module(f"tools.convert.{target_key}.inventory")
+        recipe = importlib.import_module(f"tools.convert.{target_key}.recipe")
 
         candidates = {
             hf: entry

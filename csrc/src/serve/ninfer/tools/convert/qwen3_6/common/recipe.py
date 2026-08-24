@@ -317,7 +317,13 @@ def preflight_source_reader(
         actual = metadata[name]
         if actual.shape != requirement.shape:
             raise ValueError(f"{name}: source shape {actual.shape} != required {requirement.shape}")
-        if actual.dtype != requirement.dtype:
+        if actual.dtype != requirement.dtype and not (
+            requirement.dtype == "BF16" and actual.dtype == "F32"
+        ):
+            # surogate vendor patch (PATCHES.md #16): official Qwen3.5 releases
+            # store some 1D control tensors (A_log, dt_bias) in F32 where the
+            # GGUF-bridged dialect carries BF16; the encode path narrows to the
+            # registered format either way, so F32 sources widen-in cleanly.
             raise ValueError(f"{name}: source dtype {actual.dtype} != required {requirement.dtype}")
         dtype_counts[actual.dtype] = dtype_counts.get(actual.dtype, 0) + 1
         shards.add(actual.shard)

@@ -69,9 +69,11 @@ bool is_35(const Bf16GdnGatingProblem& problem) noexcept {
     return problem.heads == 32 && problem.input_rows == 2048;
 }
 
-// surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b rides the 35 routes.
+// surogate vendor patches (PATCHES.md #13/#16): qwen3.5-0.8b and -2b ride
+// the 35 routes (same head count; hidden 1024 and 2048 respectively).
 bool is_08(const Bf16GdnGatingProblem& problem) noexcept {
-    return problem.heads == 16 && problem.input_rows == 1024;
+    return problem.heads == 16 &&
+           (problem.input_rows == 1024 || problem.input_rows == 2048);
 }
 
 bool schedule_uses_mma(Bf16GdnGatingScheduleId schedule) noexcept {
