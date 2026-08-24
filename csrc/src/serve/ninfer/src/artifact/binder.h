@@ -43,6 +43,9 @@ public:
 
     ObjectHandle require_tensor(std::string_view name, NumericFormat format, StorageLayout layout,
                                 std::span<const std::uint64_t> shape);
+    // surogate vendor patch (PATCHES.md #15): presence probe for optional
+    // object families (e.g. targets whose artifacts may omit the MTP block).
+    [[nodiscard]] bool has(std::string_view name) const noexcept;
     ObjectHandle require_resource(std::string_view name, ResourceEncoding encoding);
 
     const ObjectDescriptor& descriptor(ObjectHandle handle) const;

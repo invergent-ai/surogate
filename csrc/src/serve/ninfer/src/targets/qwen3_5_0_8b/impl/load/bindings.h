@@ -114,6 +114,9 @@ struct BindingPlan {
     WeightPlan output_head;
     artifact::ObjectHandle draft_head;
     artifact::ObjectHandle draft_head_token_ids;
+    // surogate vendor patch (PATCHES.md #15): artifacts from MTP-less GGUF
+    // exports omit the mtp/* objects; speculation requires has_mtp.
+    bool has_mtp = false;
     MtpPlan mtp;
 
     qwen3_6::VisionBackbonePlan vision_backbone;

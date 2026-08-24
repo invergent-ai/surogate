@@ -162,6 +162,13 @@ def synthesize_tokenizer_config(reader, arch: str) -> dict:
         s = tok_str(kv_key)
         if s is not None:
             cfg[hf_key] = s
+    # The pad token is a serving-internal choice with no effect on how real
+    # text tokenizes, and some exporters pick arbitrary specials (unsloth:
+    # <|vision_pad|>). The engine pins the family's official pad, so
+    # normalize to <|endoftext|> whenever the vocabulary carries it.
+    if arch in ("qwen35", "qwen35moe") and "<|endoftext|>" in tokens:
+        if cfg.get("pad_token") not in (None, "<|endoftext|>"):
+            cfg["pad_token"] = "<|endoftext|>"
     types = list(_field(reader, "tokenizer.ggml.token_type"))
     cfg["added_tokens_decoder"] = {
         str(i): {

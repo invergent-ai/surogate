@@ -444,6 +444,18 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         binder, "text/draft_head_token_ids", NumericFormat::I32, {131072}, proposal_placement);
     validate_draft_ids(binder, out.draft_head_token_ids);
 
+    // surogate vendor patch (PATCHES.md #15): community GGUF exports often
+    // strip the MTP (nextn) block; such artifacts omit the mtp/* objects
+    // entirely. The runtime is already optional (materialization and the
+    // speculative executor key off features.mtp()); binding follows the
+    // artifact, and requesting MTP speculation without the block is a clear
+    // startup error instead of a missing-object failure.
+    out.has_mtp = binder.has("mtp/input_projection");
+    if (!out.has_mtp && features.mtp()) {
+        throw std::runtime_error(
+            "qwen3.5-0.8b artifact has no MTP block (the source checkpoint was "
+            "exported without nextn); run without --spec mtp");
+    }
     const artifact::TensorPlacement mtp_placement = features.mtp()
                                                         ? artifact::TensorPlacement::Device
                                                         : artifact::TensorPlacement::ValidateOnly;
@@ -451,6 +463,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
                               std::initializer_list<std::uint64_t> shape) {
         return artifact::bind_tensor(binder, name, format, shape, mtp_placement);
     };
+    if (out.has_mtp) {
     out.mtp.input_projection =
         bind_mtp("mtp/input_projection", NumericFormat::W8G32_F16S, {1024, 2048});
     out.mtp.embedding_norm       = bind_mtp("mtp/embedding_norm", NumericFormat::BF16, {1024});
@@ -471,6 +484,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         .object = bind_mtp("mtp/layer/mlp/down", NumericFormat::W8G32_F16S, {1024, 3584}),
         .format = NumericFormat::W8G32_F16S};
     out.mtp.final_norm = bind_mtp("mtp/final_norm", NumericFormat::BF16, {1024});
+    }
 
     // Text-only target: the qwen3_5_0_8b artifact carries no vision objects
     // (surogate vendor note; --vision is rejected at startup for this target).
@@ -546,7 +560,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
                                                            NumericFormat::I32, {131072});
     }
 
-    if (plan.features.mtp()) {
+    if (plan.features.mtp() && plan.has_mtp) {
         auto& mtp            = runtime.mtp.emplace();
         mtp.input_projection = artifact::materialized_weight(
             backing, plan.mtp.input_projection, NumericFormat::W8G32_F16S, 1024, 2048);
@@ -558,10 +572,12 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
                                                              NumericFormat::BF16, {1024});
         mtp.attention.packed = artifact::materialized_weight(
             backing, plan.mtp.query_key_gate_value, NumericFormat::W8G32_F16S, 5120, 1024);
-        mtp.attention.query       = row_view(mtp.attention.packed, 0, 6144);
-        mtp.attention.key         = row_view(mtp.attention.packed, 6144, 1024);
-        mtp.attention.output_gate = row_view(mtp.attention.packed, 7168, 6144);
-        mtp.attention.value       = row_view(mtp.attention.packed, 13312, 1024);
+        // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b fused qkgv rows
+        // (q 2048 | k 512 | gate 2048 | v 512), not the 27B extents.
+        mtp.attention.query       = row_view(mtp.attention.packed, 0, 2048);
+        mtp.attention.key         = row_view(mtp.attention.packed, 2048, 512);
+        mtp.attention.output_gate = row_view(mtp.attention.packed, 2560, 2048);
+        mtp.attention.value       = row_view(mtp.attention.packed, 4608, 512);
         mtp.query_norm =
             artifact::materialized_tensor(backing, plan.mtp.query_norm, NumericFormat::BF16, {256});
         mtp.key_norm =

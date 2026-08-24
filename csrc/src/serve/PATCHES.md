@@ -109,6 +109,40 @@
    with an actionable error: the artifact inventory is exact and the
    engine's speculative decode requires the block.
 
+15. **Optional MTP block — community GGUF support.** Community exports
+   frequently strip the model's MTP (nextn) tensors (unsloth's Qwen3.5-0.8B
+   Q4_0/Q4_K_M do); the target now has a registered no-MTP artifact
+   variant. Converter: `inventory.active_specs(mtp=...)` /
+   `OBJECT_SPECS_NO_MTP` (269 tensors / 275 objects vs 281/287) and
+   `convert.py --no-mtp` (recipes, source preflight, repack plan, object
+   loop, and report all follow the variant; the draft head stays — it
+   derives from the embedding). Loader: `Binder::has()` presence probe;
+   qwen3_5_0_8b bindings bind mtp/* only when present, and `--spec mtp` on
+   a no-MTP artifact is a clear startup error instead of a missing-object
+   failure (the runtime was already optional: materialization and the
+   speculative executor key off `features.mtp()`). Also fixed here: the
+   0.8B MTP materialization row views still carried 27B extents
+   (6144/7168/13312 on a 5120-row fused qkgv) — corrected to
+   2048/512/2048/512; and the frontend accepts unsloth's chat template
+   (byte-diff is a Jinja-compat rewrite of tool-call argument iteration;
+   same markers and thinking toggle, registered as ThinkingToggle) while
+   the bridge normalizes exporter-arbitrary pad tokens to the family's
+   official <|endoftext|> (serving-internal; no effect on text
+   tokenization).
+
+   Validated on GPU: unsloth Q4_0 (MTP-less, mixed Q4_0/Q4_1/Q5_K/Q6_K/
+   Q8_0) converts (129 tensors bit-exact-repacked, rest dequantized) and
+   serves — exact instruction following, 471 tok/s decode on an idle 5090;
+   `--spec mtp` on it errors as designed. Full GPU ctest: 87/88 (the known
+   hardcoded-path frontend test). Known frontier: `--spec mtp` on the FULL
+   0.8B artifact stops at `gdn_input_proj_conv_record workspace` — the
+   speculative-replay op family has not been walked for the 0.8B geometry
+   yet (tracked; spec-off serving is unaffected).
+
+   Uncontended 5090 baseline for the untuned q08 routes (PATCHES #13):
+   decode 460-470 tok/s stable across context; prefill 4.4k tok/s @ 52
+   tokens scaling to 41k tok/s @ 1912 — no route cliffs.
+
 ### sm_89 port status
 
 With patches 5–10 the **entire tree compiles and links for sm_89**

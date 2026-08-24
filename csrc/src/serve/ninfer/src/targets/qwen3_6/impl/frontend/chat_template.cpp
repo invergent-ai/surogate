@@ -33,6 +33,16 @@ constexpr Sha256Digest kQwen35ThinkingToggleTemplateDigest{
     0xa5, 0xdd, 0xfb, 0x53, 0x09, 0x75, 0x61, 0x81, 0x68, 0x1d, 0xe4, 0xf5, 0xa1, 0x82, 0x2d, 0x80,
 };
 
+// surogate vendor patch (PATCHES.md #15): unsloth's Qwen3.5 exports carry the
+// official template with one Jinja-compat rewrite of tool-call argument
+// iteration ('is defined' + '|items' -> 'is mapping' + index lookup); the
+// markers, thinking toggle, and rendered output are unchanged, so it maps to
+// the same ThinkingToggle semantics.
+constexpr Sha256Digest kQwen35UnslothThinkingToggleTemplateDigest{
+    0x7f, 0x0e, 0x52, 0x90, 0x32, 0xc2, 0x51, 0x83, 0xbc, 0xd6, 0x6c, 0x7f, 0x23, 0x8d, 0xa2, 0xd3,
+    0x77, 0xf4, 0x3b, 0xe7, 0x54, 0xa9, 0x4e, 0x27, 0x25, 0xa5, 0x8c, 0x4e, 0x16, 0xd2, 0xed, 0x67,
+};
+
 constexpr std::string_view kLowReasoningInstructions =
     "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to "
     "the conclusion without unnecessary elaboration.";
@@ -299,7 +309,8 @@ std::string ChatMessage::rendered_content(bool add_vision_id, int* image_count,
 
 CompiledChatTemplate CompiledChatTemplate::resolve(std::string_view source) {
     const Sha256Digest digest = sha256(source);
-    if (digest == kThinkingToggleTemplateDigest || digest == kQwen35ThinkingToggleTemplateDigest) {
+    if (digest == kThinkingToggleTemplateDigest || digest == kQwen35ThinkingToggleTemplateDigest ||
+        digest == kQwen35UnslothThinkingToggleTemplateDigest) {
         return CompiledChatTemplate(ChatTemplateSemantics::ThinkingToggle);
     }
     if (digest == kReasoningEffortTemplateDigest) {

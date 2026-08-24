@@ -26,6 +26,13 @@ Binder::Binder(const Reader& reader)
     materialization_.object_count = reader.objects().size();
 }
 
+bool Binder::has(std::string_view name) const noexcept {
+    for (const ObjectDescriptor& object : reader_.objects()) {
+        if (object_name(object) == name) { return true; }
+    }
+    return false;
+}
+
 ObjectHandle Binder::find_unconsumed(std::string_view name) {
     const auto& objects            = reader_.objects();
     const ObjectDescriptor* object = reader_.find(name);

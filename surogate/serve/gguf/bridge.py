@@ -190,12 +190,13 @@ def build_hf_dir_from_gguf(
         echo(f"surogate serve: qwen35 inverse transforms active "
              f"(layers {n_main}+{n_mtp} mtp, GDN {geom.num_k_heads}k/{geom.num_v_heads}v)")
         if n_mtp == 0:
-            raise SystemExit(
-                "surogate serve: this GGUF was exported WITHOUT the model's MTP "
-                "(nextn) block, which the engine's speculative decode requires "
-                "(the artifact inventory is exact). Use a full export that keeps "
-                "nextn_predict_layers — e.g. the official Q8_0 conversion — or "
-                "re-export with llama.cpp keeping the nextn tensors."
+            # Community exports frequently strip nextn; the converter emits
+            # the no-MTP artifact variant and the engine refuses --spec mtp
+            # with a clear error (PATCHES.md #15).
+            echo(
+                "surogate serve: this GGUF was exported without the MTP (nextn) "
+                "block — converting the no-MTP artifact variant; speculative "
+                "decode (--spec mtp) will be unavailable for it."
             )
     name_map = _hf_name_map(arch, n_layers)
 

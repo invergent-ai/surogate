@@ -173,6 +173,11 @@ def preflight_inventory() -> None:
         len(inventory.OBJECT_SPECS),
     ) != (6, 267, 2, 12, 0, 281, 287):
         raise ValueError("registered inventory is incomplete")
+    if (
+        len(inventory.TENSOR_SPECS_NO_MTP),
+        len(inventory.OBJECT_SPECS_NO_MTP),
+    ) != (269, 275):
+        raise ValueError("registered no-MTP inventory is incomplete")
     recipe.validate_recipe_coverage()
 
 
@@ -183,14 +188,30 @@ def load_resources(model_dir: str | Path) -> tuple[ResourcePayload, ...]:
     return family_conversion.load_resources(model_dir, inventory.RESOURCE_SPECS)
 
 
-def build_object_plan(resources: Mapping[str, bytes]) -> ObjectPlan:
-    """Compute every payload-relative object offset for the full inventory."""
+def build_object_plan(resources: Mapping[str, bytes], *, mtp: bool = True) -> ObjectPlan:
+    """Compute every payload-relative object offset for the selected variant."""
 
     preflight_inventory()
-    return family_conversion.build_object_plan(inventory.OBJECT_SPECS, resources)
+    _, object_specs = inventory.active_specs(mtp=mtp)
+    return family_conversion.build_object_plan(object_specs, resources)
 
 
-def plan_repack(repack: GgufRepackSource | None) -> tuple[str, ...]:
+def active_recipes(*, mtp: bool) -> dict[str, recipe.TensorRecipe]:
+    """Recipes for the requested artifact variant (PATCHES.md #15)."""
+    if mtp:
+        return dict(recipe.RECIPES_BY_NAME)
+    return {
+        name: tensor_recipe
+        for name, tensor_recipe in recipe.RECIPES_BY_NAME.items()
+        if not name.startswith("mtp/")
+    }
+
+
+def plan_repack(
+    repack: GgufRepackSource | None,
+    recipes_by_name: dict[str, recipe.TensorRecipe],
+    tensor_specs,
+) -> tuple[str, ...]:
     """Objects the repack source covers; verifies the map is not over-broad.
 
     surogate vendor patch (PATCHES.md #14): every recipe left on the
@@ -200,11 +221,10 @@ def plan_repack(repack: GgufRepackSource | None) -> tuple[str, ...]:
 
     if repack is None:
         return ()
-    planned = repack.plan(recipe.RECIPES_BY_NAME, inventory.TENSOR_SPECS)
-    covered = repack.covered_sources(recipe.RECIPES_BY_NAME, planned)
+    planned = repack.plan(recipes_by_name, tensor_specs)
     stray = {
         source.name
-        for name, tensor_recipe in recipe.RECIPES_BY_NAME.items()
+        for name, tensor_recipe in recipes_by_name.items()
         if name not in planned
         for source in recipe.expression_sources(tensor_recipe.expression)
         if source.name in repack.sources
@@ -214,7 +234,6 @@ def plan_repack(repack: GgufRepackSource | None) -> tuple[str, ...]:
             "repack map names sources still needed by materialized recipes: "
             + ", ".join(sorted(stray))
         )
-    del covered
     return planned
 
 
@@ -222,18 +241,22 @@ def preflight_conversion(
     model_dir: str | Path,
     repack: GgufRepackSource | None = None,
     planned: tuple[str, ...] = (),
+    *,
+    mtp: bool = True,
 ) -> ConversionPreflight:
     """Finish all checkpoint, inventory, shortlist, and offset work before writing."""
 
     model = Path(model_dir)
     config_summary = validate_config(_load_config(model))
     preflight_inventory()
-    if planned:
-        # surogate vendor patch (PATCHES.md #14): repacked objects read the
-        # GGUF directly; only the remaining recipes need bridged sources.
+    recipes = active_recipes(mtp=mtp)
+    if planned or not mtp:
+        # surogate vendor patches (PATCHES.md #14/#15): repacked objects read
+        # the GGUF directly, and the no-MTP variant has no mtp recipes; only
+        # the remaining recipes need bridged sources.
         remaining = tuple(
             tensor_recipe
-            for name, tensor_recipe in recipe.RECIPES_BY_NAME.items()
+            for name, tensor_recipe in recipes.items()
             if name not in planned
         )
         source = recipe.preflight_sources(model, remaining)
@@ -241,7 +264,7 @@ def preflight_conversion(
         source = recipe.preflight_sources(model)
     resources = load_resources(model)
     resource_map = {resource.name: resource.data for resource in resources}
-    object_plan = build_object_plan(resource_map)
+    object_plan = build_object_plan(resource_map, mtp=mtp)
     ranking = _repo_root() / draft_head.DEFAULT_RANKING
     draft = draft_head.compute_shortlist(ranking, model)
     return ConversionPreflight(
@@ -334,6 +357,7 @@ def convert(
     *,
     device: str | torch.device = "cuda",
     gguf_repack: str | Path | None = None,
+    mtp: bool = True,
 ) -> Path:
     """Run the complete registered conversion and return the report path."""
 
@@ -343,9 +367,11 @@ def convert(
     requested_device = str(device)
     resolved_device = pick_device(device)
     repack = GgufRepackSource(gguf_repack) if gguf_repack else None
-    planned = plan_repack(repack)
+    recipes = active_recipes(mtp=mtp)
+    active_tensor_specs, active_object_specs = inventory.active_specs(mtp=mtp)
+    planned = plan_repack(repack, recipes, active_tensor_specs)
     repacked_names = frozenset(planned)
-    preflight = preflight_conversion(model, repack, planned)
+    preflight = preflight_conversion(model, repack, planned, mtp=mtp)
 
     print(
         f"preflight complete: {len(preflight.object_plan.objects)} objects, "
@@ -362,7 +388,7 @@ def convert(
         ) as writer:
             if writer.objects != preflight.object_plan.objects:
                 raise RuntimeError("writer object plan differs from completed preflight")
-            for index, spec in enumerate(inventory.OBJECT_SPECS, start=1):
+            for index, spec in enumerate(active_object_specs, start=1):
                 repacked = False
                 if isinstance(spec, inventory.ResourceSpec):
                     payload = resources[spec.name]
@@ -374,9 +400,7 @@ def convert(
                         token_ids = draft_head.materialize_draft_head_token_ids(
                             preflight.draft
                         )
-                    payload = repack.payload_for(
-                        spec, recipe.RECIPES_BY_NAME[spec.name], token_ids
-                    )
+                    payload = repack.payload_for(spec, recipes[spec.name], token_ids)
                     repacked = True
                 else:
                     tensor = materialize_tensor(spec, reader, preflight.draft)
@@ -385,7 +409,7 @@ def convert(
                 writer.write(spec.name, payload)
                 del payload
                 print(
-                    f"[{index}/{len(inventory.OBJECT_SPECS)}] {spec.name}"
+                    f"[{index}/{len(active_object_specs)}] {spec.name}"
                     + (" (repacked)" if repacked else ""),
                     flush=True,
                 )
@@ -399,6 +423,7 @@ def convert(
         "device": requested_device,
         "gguf_repack": str(gguf_repack) if gguf_repack else None,
         "repacked_objects": len(repacked_names),
+        "mtp": mtp,
     }
     report = build_conversion_report(
         model_dir=model,
@@ -429,8 +454,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--gguf-repack", type=Path, default=None)
+    parser.add_argument("--no-mtp", action="store_true",
+                        help="source checkpoint has no MTP (nextn) block; "
+                             "emit the artifact variant without mtp/* objects")
     args = parser.parse_args(argv)
-    convert(args.model, args.out, device=args.device, gguf_repack=args.gguf_repack)
+    convert(args.model, args.out, device=args.device, gguf_repack=args.gguf_repack,
+            mtp=not args.no_mtp)
 
 
 if __name__ == "__main__":

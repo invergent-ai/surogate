@@ -171,6 +171,10 @@ def _ensure_from_gguf(gguf_path: Path, *, echo=print) -> Path:
     # --gguf-repack, plan against the converter's own recipes which candidate
     # tensors it repacks bit-exactly; the bridge dequantizes only the rest.
     planner = _repack_planner(root) if target_key == "qwen3_5_0_8b" else None
+    # No-MTP variant (PATCHES.md #15): community exports may strip nextn.
+    arch = serve_gguf.read_gguf_summary(gguf_path, reader)["architecture"]
+    nextn = reader.kv(f"{arch}.nextn_predict_layers", 0)
+    no_mtp = target_key == "qwen3_5_0_8b" and int(nextn or 0) == 0
     work = cache_dir() / f"gguf-bridge-{fp}"
     try:
         model_dir = serve_gguf.build_hf_dir_from_gguf(
@@ -183,6 +187,7 @@ def _ensure_from_gguf(gguf_path: Path, *, echo=print) -> Path:
             echo=echo,
             derived_frontend=True,
             gguf_repack=repack_map if repack_map.is_file() else None,
+            no_mtp=no_mtp,
         )
     finally:
         shutil.rmtree(work, ignore_errors=True)
@@ -217,7 +222,8 @@ def _repack_planner(root: Path):
 
 def _run_converter_cached(model_dir: Path, out: Path, *, echo=print,
                           derived_frontend: bool = False,
-                          gguf_repack: Path | None = None) -> Path:
+                          gguf_repack: Path | None = None,
+                          no_mtp: bool = False) -> Path:
     """Shared converter driver: model_dir (HF layout) → atomic-published `out`."""
     root = _ninfer_root()
     config = _flatten_text_config(json.loads((model_dir / "config.json").read_text()))
@@ -237,6 +243,8 @@ def _run_converter_cached(model_dir: Path, out: Path, *, echo=print,
                 "without --gguf-repack support."
             )
         cmd += ["--gguf-repack", str(gguf_repack)]
+    if no_mtp:
+        cmd += ["--no-mtp"]
     if os.environ.get("SUROGATE_CONVERT_DEVICE"):
         cmd += ["--device", os.environ["SUROGATE_CONVERT_DEVICE"]]
     if os.environ.get("SUROGATE_SERVE_DRY"):

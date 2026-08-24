@@ -133,6 +133,21 @@ TENSOR_SPECS = (
 )
 OBJECT_SPECS: tuple[StoredObjectSpec, ...] = RESOURCE_SPECS + TENSOR_SPECS
 
+# surogate vendor patch (PATCHES.md #15): community GGUF exports frequently
+# strip the MTP (nextn) block; such checkpoints convert to an artifact that
+# omits the mtp/* objects entirely (the loader binds MTP only when present
+# and MTP speculation is refused with a clear error). The draft head stays:
+# it derives from the embedding, which every export carries.
+TENSOR_SPECS_NO_MTP = TEXT_CORE_TENSOR_SPECS + DRAFT_HEAD_TENSOR_SPECS + VISION_TENSOR_SPECS
+OBJECT_SPECS_NO_MTP: tuple[StoredObjectSpec, ...] = RESOURCE_SPECS + TENSOR_SPECS_NO_MTP
+
+
+def active_specs(*, mtp: bool) -> tuple[tuple, tuple]:
+    """(tensor_specs, object_specs) for the requested artifact variant."""
+    if mtp:
+        return TENSOR_SPECS, OBJECT_SPECS
+    return TENSOR_SPECS_NO_MTP, OBJECT_SPECS_NO_MTP
+
 FORMAT_COUNTS = {
     numeric_format: sum(spec.format == numeric_format for spec in TENSOR_SPECS)
     for numeric_format in FORMAT_NAMES
