@@ -206,17 +206,23 @@
    119-124 TF/s at T>=1024 on the four dominant GEMM shapes of both small
    targets — ABOVE the tuned BF16 ceiling — with the int32 group math
    exact against a CPU oracle (2-3e-3 rel = bf16 output rounding).
-   Second probe pass: the per-token act-quant kernel costs 1.5-3% of the
-   combined time at T>=1024 (integration-honest 116-122 TF/s), and a
-   4-stage pipeline measured SLOWER than 2-stage (118 vs 124 — the kernel
-   is not cp.async-latency-bound; ruled out). Next lever: ldmatrix
-   fragment loads to replace the six manual 4B smem gathers per mma (the
-   issue-slot tax), plus swizzled staging. Even at the current probe rate
-   the end-to-end arithmetic takes the lead everywhere (0.8b 1912-prefill
-   ~52k -> ~61k tok/s vs vLLM-FP8 60.7k; 2b ~25.3k -> ~29.6k vs bf16
-   28.6k). Remaining productization: ldmatrix pass, epilogue twins
-   (split2/split4/swiglu/residual), the quantizing-rmsnorm fusion (makes
-   act-quant free), AllowA8 large-T routes, op tests.
+   Probe iterations (each hypothesis measured, three ruled out or
+   confirmed): per-token act-quant = 1.5-3% of combined time (settled);
+   4-stage pipeline SLOWER than 2-stage (not cp.async-latency-bound;
+   ruled out); ldmatrix at 8 warps SLOWER than manual loads (105-112 vs
+   118-124 — at 33% occupancy the compiler-scheduled LDS hide fine); but
+   ldmatrix AND 16 warps COMPOSE: the winning configuration is
+   **BM64 x BN128 x BK64, 16 warps (warp tile 32x16), 2-stage cp.async,
+   80-byte staging stride (bank-conflict-free ldmatrix without XOR
+   swizzles), ldmatrix.x4/x2 fragment loads** at **132-144 TF/s** on the
+   four dominant GEMM shapes at T>=1024 — ~1.5x the tuned BF16 A16
+   ceiling, numerics exact modulo bf16 output rounding. At the measured
+   rate the end-to-end arithmetic flips BOTH remaining vLLM leads with
+   margin (0.8b 1912-prefill ~52k -> ~66k tok/s vs vLLM-FP8 60.7k; 2b
+   ~25.3k -> ~31k vs bf16 28.6k). Remaining productization: engine kernel
+   header from the winning config, epilogue twins (split2/split4/swiglu/
+   residual), quantizing-rmsnorm fusion (free act-quant), AllowA8 large-T
+   routes, op tests, E2E.
 
 ### sm_89 port status
 

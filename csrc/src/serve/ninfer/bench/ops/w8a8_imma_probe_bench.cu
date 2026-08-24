@@ -34,10 +34,10 @@ using namespace ninfer;
 namespace {
 
 constexpr int BM      = 64;
-constexpr int BN      = 64;
+constexpr int BN      = 128;
 constexpr int BK      = 64;  // two 32-value groups per k-tile
 constexpr int WARPS_M = 2;   // warp tile 32 x 16
-constexpr int WARPS_N = 4;
+constexpr int WARPS_N = 8;
 constexpr int THREADS = WARPS_M * WARPS_N * 32;
 
 __device__ __forceinline__ void imma_16n8k32(int& d0, int& d1, int& d2, int& d3, unsigned a0,
@@ -224,6 +224,148 @@ __global__ void act_quant_kernel(const __nv_bfloat16* __restrict__ x,
     }
 }
 
+// ldmatrix variant: fragments load via ldmatrix.m8n8 (x4 for A, x2 for B)
+// from 80-byte-stride staging — 80/4 = 20 banks per row step makes the
+// 8-row address groups conflict-free without XOR swizzles, and replaces the
+// six manual 32-bit gathers per mma with two ldmatrix issues.
+constexpr int BK_PAD = 80;
+
+__device__ __forceinline__ void ldmatrix_x4(unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3,
+                                            const void* smem) {
+    const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(smem));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+                 : "r"(addr));
+}
+
+__device__ __forceinline__ void ldmatrix_x2(unsigned& r0, unsigned& r1, const void* smem) {
+    const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(smem));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+                 : "=r"(r0), "=r"(r1)
+                 : "r"(addr));
+}
+
+__global__ __launch_bounds__(THREADS, 2) void w8a8_imma_ldmatrix_kernel(
+    const std::int8_t* __restrict__ w_codes, const __half* __restrict__ w_scales,
+    const std::int8_t* __restrict__ x_codes, const float* __restrict__ x_scales,
+    __nv_bfloat16* __restrict__ out, int rows, int k, int tokens) {
+    __shared__ std::int8_t Ws[2][BM * BK_PAD];
+    __shared__ std::int8_t Xs[2][BN * BK_PAD];
+    __shared__ __half Ss[2][BM * 2];
+
+    const int m0   = static_cast<int>(blockIdx.x) * BM;
+    const int n0   = static_cast<int>(blockIdx.y) * BN;
+    const int tid  = static_cast<int>(threadIdx.x);
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int wm   = (warp % WARPS_M) * 32;
+    const int wn   = (warp / WARPS_M) * 16;
+    const int kg   = k / 32;
+
+    const auto stage = [&](int kt, int slot) {
+        const int kbase = kt * BK;
+        for (int i = tid; i < BM * (BK / 16); i += THREADS) {
+            const int row = i / (BK / 16);
+            const int col = (i % (BK / 16)) * 16;
+            ninfer::ops::cp_async<16, ninfer::ops::Cache::cg>(
+                &Ws[slot][row * BK_PAD + col],
+                &w_codes[static_cast<std::int64_t>(m0 + row) * k + kbase + col]);
+        }
+        for (int i = tid; i < BN * (BK / 16); i += THREADS) {
+            const int token = i / (BK / 16);
+            const int col   = (i % (BK / 16)) * 16;
+            ninfer::ops::cp_async<16, ninfer::ops::Cache::cg>(
+                &Xs[slot][token * BK_PAD + col],
+                &x_codes[static_cast<std::int64_t>(n0 + token) * k + kbase + col]);
+        }
+        for (int i = tid; i < BM * 2; i += THREADS) {
+            const int row   = i >> 1;
+            const int group = i & 1;
+            Ss[slot][i]     = w_scales[static_cast<std::int64_t>(m0 + row) * kg + kt * 2 + group];
+        }
+    };
+
+    float acc[2][2][4];
+#pragma unroll
+    for (int mi = 0; mi < 2; ++mi)
+#pragma unroll
+        for (int ni = 0; ni < 2; ++ni)
+#pragma unroll
+            for (int q = 0; q < 4; ++q) acc[mi][ni][q] = 0.0f;
+
+    const int nkt = k / BK;
+    stage(0, 0);
+    ninfer::ops::cp_commit();
+
+    for (int kt = 0; kt < nkt; ++kt) {
+        const int slot = kt & 1;
+        ninfer::ops::cp_wait<0>();
+        __syncthreads();
+        if (kt + 1 < nkt) {
+            stage(kt + 1, slot ^ 1);
+            ninfer::ops::cp_commit();
+        }
+
+#pragma unroll
+        for (int group = 0; group < 2; ++group) {
+            const int kb = group * 32;
+#pragma unroll
+            for (int mi = 0; mi < 2; ++mi) {
+                const int arow0 = wm + mi * 16;
+                // A: lanes in groups of 8 address rows {0-7, 8-15} x k-halves
+                // {kb, kb+16}; ldmatrix x4 returns the mma A fragment order.
+                unsigned a[4];
+                {
+                    const int row  = arow0 + (lane & 7) + ((lane >> 3) & 1) * 8;
+                    const int cofs = kb + (lane >> 4) * 16;
+                    ldmatrix_x4(a[0], a[1], a[2], a[3], &Ws[slot][row * BK_PAD + cofs]);
+                }
+                int d[2][4];
+#pragma unroll
+                for (int ni = 0; ni < 2; ++ni) {
+                    const int token0 = wn + ni * 8;
+                    unsigned b[2];
+                    {
+                        // B: lanes 0-7 address tokens at kb, lanes 8-15 at kb+16.
+                        const int token = token0 + (lane & 7);
+                        const int cofs  = kb + ((lane >> 3) & 1) * 16;
+                        ldmatrix_x2(b[0], b[1], &Xs[slot][token * BK_PAD + cofs]);
+                    }
+                    d[ni][0] = d[ni][1] = d[ni][2] = d[ni][3] = 0;
+                    imma_16n8k32(d[ni][0], d[ni][1], d[ni][2], d[ni][3], a[0], a[1], a[2], a[3],
+                                 b[0], b[1]);
+                }
+                const float ws0 = __half2float(Ss[slot][(arow0 + (lane >> 2)) * 2 + group]);
+                const float ws8 = __half2float(Ss[slot][(arow0 + (lane >> 2) + 8) * 2 + group]);
+#pragma unroll
+                for (int ni = 0; ni < 2; ++ni) {
+                    acc[mi][ni][0] += static_cast<float>(d[ni][0]) * ws0;
+                    acc[mi][ni][1] += static_cast<float>(d[ni][1]) * ws0;
+                    acc[mi][ni][2] += static_cast<float>(d[ni][2]) * ws8;
+                    acc[mi][ni][3] += static_cast<float>(d[ni][3]) * ws8;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int mi = 0; mi < 2; ++mi) {
+#pragma unroll
+        for (int ni = 0; ni < 2; ++ni) {
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const int row   = m0 + wm + mi * 16 + (lane >> 2) + (q >= 2 ? 8 : 0);
+                const int token = n0 + wn + ni * 8 + (lane & 3) * 2 + (q & 1);
+                if (row < rows && token < tokens) {
+                    out[static_cast<std::int64_t>(token) * rows + row] =
+                        __float2bfloat16_rn(acc[mi][ni][q] * x_scales[token]);
+                }
+            }
+        }
+    }
+}
+
 struct Case {
     const char* name;
     int rows;
@@ -276,6 +418,13 @@ int main(int argc, char** argv) {
 
         for (const int tokens : {472, 1024, 1912}) {
             const dim3 grid(c.rows / BM, (tokens + BN - 1) / BN);
+            const auto launchL = [&](cudaStream_t s) {
+                w8a8_imma_ldmatrix_kernel<<<grid, THREADS, 0, s>>>(
+                    static_cast<const std::int8_t*>(d_codes.p),
+                    static_cast<const __half*>(d_scales.p),
+                    static_cast<const std::int8_t*>(d_x.p), static_cast<const float*>(d_xs.p),
+                    static_cast<__nv_bfloat16*>(d_out.p), c.rows, c.k, tokens);
+            };
             const auto launch4 = [&](cudaStream_t s) {
                 w8a8_imma_kernel<4><<<grid, THREADS, 0, s>>>(
                     static_cast<const std::int8_t*>(d_codes.p),
@@ -290,7 +439,7 @@ int main(int argc, char** argv) {
                     static_cast<const std::int8_t*>(d_x.p), static_cast<const float*>(d_xs.p),
                     static_cast<__nv_bfloat16*>(d_out.p), c.rows, c.k, tokens);
             };
-            launch(stream);
+            launchL(stream);  // correctness check runs on the ldmatrix variant
             const cudaError_t status = cudaDeviceSynchronize();
             if (status != cudaSuccess) {
                 std::printf("%-22s %6d LAUNCH FAILED: %s\n", c.name, tokens,
@@ -328,7 +477,7 @@ int main(int argc, char** argv) {
             rms = std::sqrt(rms / checked);
 
             const auto timing  = bench::measure_launch(launch, stream, warmup, repeat);
-            const auto timing4 = bench::measure_launch(launch4, stream, warmup, repeat);
+            const auto timing4 = bench::measure_launch(launchL, stream, warmup, repeat);
             const double gflop = 2.0 * c.rows * c.k * static_cast<double>(tokens) / 1e9;
 
             // Combined: per-token act-quant (from bf16) + the IMMA GEMM — the
@@ -346,7 +495,7 @@ int main(int argc, char** argv) {
             // oracle-known planes for the next token count's spot check.
             cudaMemcpy(d_x.p, host_x.data(), host_x.size(), cudaMemcpyHostToDevice);
             cudaMemcpy(d_xs.p, host_xs.data(), host_xs.size() * 4, cudaMemcpyHostToDevice);
-            std::printf("%-22s %6d s2 %7.1f/%3.0f  s4 %7.1f/%3.0f  +q %7.1f/%3.0f %9.2e\n",
+            std::printf("%-22s %6d s2 %7.1f/%3.0f  ld %7.1f/%3.0f  +q %7.1f/%3.0f %9.2e\n",
                         c.name, tokens, timing.median_us,
                         gflop / (timing.median_us * 1e-6) / 1e3, timing4.median_us,
                         gflop / (timing4.median_us * 1e-6) / 1e3, combined.median_us,

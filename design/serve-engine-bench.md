@@ -123,8 +123,20 @@ per-group rescale on the m16n8k32 int32 result):
 | gate_up 7168x1024 | 91 | 113 | **120** |
 | qkvz 8192x1024 | 92 | 112 | **120** |
 
-The tuned BF16 A16 family ceiling is ~90-100 TF/s on the same shapes; the
-naive IMMA probe already clears it, and marlin-class staging has 160-200 in
-reach. Numerics: int32 group math exact vs CPU oracle (2-3e-3 rel = bf16
-output rounding); activation-quant error is the standard per-token-int8
-recipe, applied at prefill T only. Productization queued (PATCHES #17).
+The tuned BF16 A16 family ceiling is ~90-100 TF/s on the same shapes.
+Probe iterations (each measured): act-quant pre-pass 1.5-3% of combined;
+4-stage pipeline slower (ruled out); ldmatrix at 8 warps slower; ldmatrix
+AND 16 warps compose — winning config **BM64xBN128, 16 warps, 2-stage,
+80B stride, ldmatrix.x4/x2** reaches **132-144 TF/s** at T>=1024:
+
+| shape | T=1024 | T=1912 |
+|---|---:|---:|
+| gate_up 12288x2048 | 132 | **141** |
+| qkvz 8192x2048 | 141 | **141** |
+| gate_up 7168x1024 | 133 | **144** |
+| qkvz 8192x1024 | 137 | **140** |
+
+~1.5x the BF16 ceiling; numerics exact modulo bf16 output rounding. At
+this measured rate the end-to-end arithmetic flips BOTH remaining vLLM
+leads with margin (0.8B 1912-prefill ~52k -> ~66k vs FP8 60.7k; 2B
+~25.3k -> ~31k vs bf16 28.6k). Productization queued (PATCHES #17).
