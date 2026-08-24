@@ -303,8 +303,15 @@ def source_requirements() -> dict[str, SourceTensor]:
     return _recipe_source_requirements(RECIPE_SPECS)
 
 
-def preflight_sources(model_dir: str | Path) -> SourcePreflight:
-    return _preflight_recipe_sources(model_dir, RECIPE_SPECS)
+def preflight_sources(
+    model_dir: str | Path,
+    recipes: tuple[TensorRecipe, ...] | None = None,
+) -> SourcePreflight:
+    # surogate vendor patch (PATCHES.md #14): a GGUF repack plan narrows the
+    # bridged-checkpoint requirement to the recipes it does not cover.
+    return _preflight_recipe_sources(
+        model_dir, RECIPE_SPECS if recipes is None else recipes
+    )
 
 
 validate_recipe_coverage()

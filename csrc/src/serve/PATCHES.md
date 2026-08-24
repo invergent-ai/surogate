@@ -64,6 +64,32 @@
    downgrades to a recorded stderr warning; safetensors-sourced conversions
    keep the strict check.
 
+14. **Direct GGUF Q8_0 -> W8G32_F16S repack (`--gguf-repack`).** GGML Q8_0
+   and the artifact's W8G32_F16S are the same numeric format (int8 codes +
+   one binary16 scale per 32-group, value = code * scale), so Q8_0 GGUF
+   tensors move into the artifact bit-exactly — no dequantization, no
+   requantization, no GPU. New `tools/convert/common/gguf_repack.py`
+   evaluates the target's registered TensorRecipe expressions as row algebra
+   (Reshape/Slice/Transpose over row axes, row Concat, GatherRows — all
+   exact on quantized planes since k % 32 == 0) so the recipe remains the
+   single source of layout truth. `convert.py` gains `--gguf-repack
+   <map.json>`: planned objects encode via `encode_row_split` from planes
+   memmapped straight out of the GGUF (the map carries rows/k/absolute
+   offset per source, so the subprocess never runs gguf-py's ~10s KV parse),
+   source preflight narrows to the recipes left on the materialize path, and
+   a loud invariant rejects maps naming sources that materialized recipes
+   still need. The plan is computed against the artifact profile: Q8_0
+   sources of BF16-profile objects (e.g. the 0.8B gdn a/b projections) stay
+   on the dequant path. Bridge side (surogate/serve/gguf/bridge.py, out of
+   tree): candidates = 2D Q8_0 tensors whose llama.cpp inverse transform is
+   a row identity (`qwen35.inverse_is_row_identity`; V-reorder families
+   excluded until composed as row permutations), narrowed by a planner
+   backed by these vendored recipes; one shared GGUFReader across
+   summary/bridge. Qwen3.5-0.8B Q8_0: 159/195 Q8_0 tensors repacked,
+   one-time conversion 17.7s total vs ~36s full-dequant (converter core
+   3.6s), engine output identical. Bit-exactness is pinned by
+   tests/serve/test_gguf_repack.py against gguf-py's own dequantize.
+
 ### sm_89 port status
 
 With patches 5–10 the **entire tree compiles and links for sm_89**

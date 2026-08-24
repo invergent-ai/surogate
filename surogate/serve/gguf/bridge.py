@@ -46,14 +46,21 @@ def _arch_kv(reader, arch: str, key: str, default=None):
     return field.contents()
 
 
-def read_gguf_summary(gguf_path: Path) -> dict:
-    """Cheap metadata pass: architecture + geometry from GGUF KV, no tensor data."""
+def open_gguf(gguf_path: Path):
+    """Open a GGUF once; gguf-py parses ALL KV eagerly (~10s on a 250k-token
+    vocabulary), so callers share one reader across summary/bridge stages."""
     from gguf import GGUFReader
 
     try:
-        reader = GGUFReader(str(gguf_path), "r")
+        return GGUFReader(str(gguf_path), "r")
     except Exception as exc:
         raise SystemExit(f"surogate serve: '{gguf_path}' is not a readable GGUF file ({exc}).")
+
+
+def read_gguf_summary(gguf_path: Path, reader=None) -> dict:
+    """Cheap metadata pass: architecture + geometry from GGUF KV, no tensor data."""
+    if reader is None:
+        reader = open_gguf(gguf_path)
     arch_field = reader.get_field("general.architecture")
     arch = arch_field.contents() if arch_field is not None else ""
     summary = {
@@ -107,8 +114,23 @@ def _hf_name_map(arch: str, n_layers: int) -> dict[str, str]:
     return out
 
 
-def build_hf_dir_from_gguf(gguf_path: Path, target_key: str, work_dir: Path, *, echo=print) -> Path:
-    """Materialize a temporary HF-layout model dir from a GGUF file."""
+def build_hf_dir_from_gguf(
+    gguf_path: Path,
+    target_key: str,
+    work_dir: Path,
+    *,
+    repack_planner=None,
+    reader=None,
+    echo=print,
+) -> Path:
+    """Materialize a temporary HF-layout model dir from a GGUF file.
+
+    With a ``repack_planner`` (PATCHES.md #14), 2D Q8_0 tensors whose
+    inverse transform is a row identity become repack CANDIDATES; the planner
+    (backed by the converter's own recipes) returns the subset its artifact
+    profile actually repacks — e.g. Q8_0 sources of BF16-profile objects stay
+    on the dequant path. Planned tensors are not dequantized; they are
+    recorded in ``gguf_repack.json`` for a bit-exact move into the artifact."""
     import numpy as np
     import torch
     from gguf import GGUFReader
@@ -116,7 +138,8 @@ def build_hf_dir_from_gguf(gguf_path: Path, target_key: str, work_dir: Path, *, 
     from safetensors.torch import save_file
 
     work_dir.mkdir(parents=True, exist_ok=True)
-    reader = GGUFReader(str(gguf_path), "r")
+    if reader is None:
+        reader = GGUFReader(str(gguf_path), "r")
     arch = reader.get_field("general.architecture").contents()
 
     # 1. Frontend: tokenizer + chat template reconstructed from the GGUF
@@ -162,6 +185,31 @@ def build_hf_dir_from_gguf(gguf_path: Path, target_key: str, work_dir: Path, *, 
              f"(layers {n_main}+{n_mtp} mtp, GDN {geom.num_k_heads}k/{geom.num_v_heads}v)")
     name_map = _hf_name_map(arch, n_layers)
 
+    # Pre-walk: collect candidates, let the converter's recipes pick the
+    # subset it will repack; everything else takes the dequant path below.
+    repack_sources: dict[str, str] = {}
+    if repack_planner is not None:
+        candidates: dict[str, dict] = {}
+        for tensor in reader.tensors:
+            hf = (fam.hf_name_for(tensor.name, n_main) if qwen35_family
+                  else name_map.get(tensor.name))
+            if (
+                hf is not None
+                and tensor.tensor_type.name == "Q8_0"
+                and len(tensor.shape) == 2
+                and (not qwen35_family or fam.inverse_is_row_identity(hf, geom))
+            ):
+                # GGUF ne order is innermost-first: shape = (k, rows).
+                candidates[hf] = {
+                    "name": tensor.name,
+                    "rows": int(tensor.shape[1]),
+                    "k": int(tensor.shape[0]),
+                    "offset": int(tensor.data_offset),
+                }
+        repack_sources = repack_planner(gguf_path, candidates)
+        if set(repack_sources) - set(candidates):
+            raise SystemExit("surogate serve: repack planner returned non-candidate sources.")
+
     weight_map: dict[str, str] = {}
     total_bytes = 0
     shard_idx = 0
@@ -191,6 +239,8 @@ def build_hf_dir_from_gguf(gguf_path: Path, target_key: str, work_dir: Path, *, 
                 f"surogate serve: GGUF tensor '{tensor.name}' has no HF mapping for "
                 f"arch '{arch}' — refusing rather than dropping weights."
             )
+        if hf_name in repack_sources:
+            continue
         data = dequantize(tensor.data, tensor.tensor_type)
         # GGUF stores dims innermost-first; HF convention is the reverse.
         array = np.ascontiguousarray(data.reshape(tuple(reversed(tensor.shape.tolist()))))
@@ -212,10 +262,21 @@ def build_hf_dir_from_gguf(gguf_path: Path, target_key: str, work_dir: Path, *, 
 
     index = {"metadata": {"total_size": total_bytes}, "weight_map": weight_map}
     (work_dir / "model.safetensors.index.json").write_text(json.dumps(index, indent=1))
+    if repack_sources:
+        (work_dir / "gguf_repack.json").write_text(
+            json.dumps(
+                {"gguf_path": str(gguf_path.resolve()), "sources": repack_sources},
+                indent=1,
+            )
+        )
+        echo(
+            f"surogate serve: {len(repack_sources)} Q8_0 tensors marked for "
+            f"bit-exact repack (dequantized only {len(weight_map)})"
+        )
     return work_dir
 
 
-def gguf_target_key(gguf_path: Path):
+def gguf_target_key(gguf_path: Path, reader=None):
     """Map a GGUF file to a registered converter target key, or None.
 
     Architecture strings follow llama.cpp/gguf-py naming: the Qwen3.5/3.6
@@ -223,7 +284,7 @@ def gguf_target_key(gguf_path: Path):
     HF-style spellings are accepted defensively. Validated against a real
     Qwen3.6-27B GGUF before this path is called supported.
     """
-    s = read_gguf_summary(gguf_path)
+    s = read_gguf_summary(gguf_path, reader)
     arch = s["architecture"]
     hidden = int(s["hidden_size"] or 0)
     layers = int(s["num_hidden_layers"] or 0)

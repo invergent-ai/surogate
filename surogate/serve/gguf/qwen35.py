@@ -178,6 +178,35 @@ def _is_plus_one_norm(hf_name: str) -> bool:
     return hf_name.endswith("norm.weight") and not hf_name.endswith("linear_attn.norm.weight")
 
 
+def inverse_is_row_identity(hf_name: str, g: GdnGeometry) -> bool:
+    """True when invert_tensor() is an exact no-op for this tensor.
+
+    Drives the Q8_0 repack (design/serve-engine-plan.md, PATCHES.md #14): a
+    quantized tensor may skip the dequant bridge only if its bridge-side
+    inverse transform is the identity. A_log/dt_bias/conv are value or shape
+    transforms regardless of geometry (F32 in real GGUFs, listed for honesty);
+    the V reorders and the out_proj column reorder no-op only for symmetric
+    (non-reordered) GDN geometries like Qwen3.5-0.8B.
+    """
+    if _is_plus_one_norm(hf_name):
+        return False
+    if hf_name.endswith(
+        ("linear_attn.A_log", "linear_attn.dt_bias", "linear_attn.conv1d.weight")
+    ):
+        return False
+    if not g.reordered:
+        return True
+    return not hf_name.endswith(
+        (
+            "linear_attn.in_proj_qkv.weight",
+            "linear_attn.in_proj_z.weight",
+            "linear_attn.in_proj_a.weight",
+            "linear_attn.in_proj_b.weight",
+            "linear_attn.out_proj.weight",
+        )
+    )
+
+
 def invert_tensor(hf_name: str, t: torch.Tensor, g: GdnGeometry) -> torch.Tensor:
     """Undo every llama.cpp numeric/layout transform for one HF-named tensor."""
     t = t.float() if t.dtype not in (torch.float32, torch.float64) else t

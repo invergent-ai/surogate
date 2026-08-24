@@ -29,6 +29,7 @@ class ConverterTarget:
     key: str                 # cache identity component
     module: str              # python -m <module> under the vendored ninfer root
     display: str
+    gguf_repack: bool = False  # converter accepts --gguf-repack (PATCHES.md #14)
 
 
 def _ninfer_root() -> Path | None:
@@ -66,7 +67,7 @@ def converter_for_config(config: dict) -> ConverterTarget | None:
     # configs) is flattened by callers before this point.
     if model_type == "qwen3_5" and hidden == 1024 and layers == 24:
         return ConverterTarget("qwen3_5_0_8b", "tools.convert.qwen3_5_0_8b.convert",
-                               "Qwen3.5-0.8B")
+                               "Qwen3.5-0.8B", gguf_repack=True)
     if model_type in ("qwen3_5", "qwen3_6") and hidden == 5120 and layers >= 60:
         if nvfp4:
             return ConverterTarget("qwen3_6_27b_nvfp4", "tools.convert.qwen3_6_27b.convert_nvfp4",
@@ -144,9 +145,10 @@ def _ensure_from_gguf(gguf_path: Path, *, echo=print) -> Path:
     if root is None:
         raise SystemExit("surogate serve: vendored engine tree not found (run from a checkout).")
 
-    target_key = serve_gguf.gguf_target_key(gguf_path)
+    reader = serve_gguf.open_gguf(gguf_path)
+    target_key = serve_gguf.gguf_target_key(gguf_path, reader)
     if target_key is None:
-        s = serve_gguf.read_gguf_summary(gguf_path)
+        s = serve_gguf.read_gguf_summary(gguf_path, reader)
         raise SystemExit(
             "surogate serve: this GGUF is not yet supported by the native engine.\n"
             f"  architecture={s['architecture']!r} hidden={s['hidden_size']} "
@@ -160,16 +162,49 @@ def _ensure_from_gguf(gguf_path: Path, *, echo=print) -> Path:
         echo(f"surogate serve: using cached engine weights ({out.name})")
         return out
 
+    # Q8_0 repack (PATCHES.md #14): for targets whose converter takes
+    # --gguf-repack, plan against the converter's own recipes which candidate
+    # tensors it repacks bit-exactly; the bridge dequantizes only the rest.
+    planner = _repack_planner(root) if target_key == "qwen3_5_0_8b" else None
     work = cache_dir() / f"gguf-bridge-{fp}"
     try:
-        model_dir = serve_gguf.build_hf_dir_from_gguf(gguf_path, target_key, work, echo=echo)
-        return _run_converter_cached(model_dir, out, echo=echo, derived_frontend=True)
+        model_dir = serve_gguf.build_hf_dir_from_gguf(
+            gguf_path, target_key, work, repack_planner=planner, reader=reader, echo=echo
+        )
+        repack_map = model_dir / "gguf_repack.json"
+        return _run_converter_cached(
+            model_dir,
+            out,
+            echo=echo,
+            derived_frontend=True,
+            gguf_repack=repack_map if repack_map.is_file() else None,
+        )
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
 
+def _repack_planner(root: Path):
+    """Q8_0 repack plan via the vendored converter's registered recipes."""
+    def plan(gguf_path: Path, candidates: dict[str, str]) -> dict[str, str]:
+        import sys as _sys
+        if str(root) not in _sys.path:
+            _sys.path.insert(0, str(root))
+        from tools.convert.common.gguf_repack import GgufRepackSource
+        from tools.convert.qwen3_5_0_8b import inventory, recipe
+
+        source = GgufRepackSource.from_sources(gguf_path, candidates)
+        planned = source.plan(recipe.RECIPES_BY_NAME, inventory.TENSOR_SPECS)
+        keep: set[str] = set()
+        for name in planned:
+            for src in recipe.expression_sources(recipe.RECIPES_BY_NAME[name].expression):
+                keep.add(src.name)
+        return {hf: candidates[hf] for hf in sorted(keep & set(candidates))}
+    return plan
+
+
 def _run_converter_cached(model_dir: Path, out: Path, *, echo=print,
-                          derived_frontend: bool = False) -> Path:
+                          derived_frontend: bool = False,
+                          gguf_repack: Path | None = None) -> Path:
     """Shared converter driver: model_dir (HF layout) → atomic-published `out`."""
     root = _ninfer_root()
     config = _flatten_text_config(json.loads((model_dir / "config.json").read_text()))
@@ -182,6 +217,13 @@ def _run_converter_cached(model_dir: Path, out: Path, *, echo=print,
     echo(f"surogate serve: preparing engine weights for {target.display} "
          f"(one-time conversion; cached at {out})")
     cmd = [sys.executable, "-m", target.module, "--model", str(model_dir), "--out", str(tmp)]
+    if gguf_repack is not None:
+        if not target.gguf_repack:
+            raise SystemExit(
+                "surogate serve: internal error — repack map produced for a converter "
+                "without --gguf-repack support."
+            )
+        cmd += ["--gguf-repack", str(gguf_repack)]
     if os.environ.get("SUROGATE_CONVERT_DEVICE"):
         cmd += ["--device", os.environ["SUROGATE_CONVERT_DEVICE"]]
     if os.environ.get("SUROGATE_SERVE_DRY"):
