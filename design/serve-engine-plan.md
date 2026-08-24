@@ -257,6 +257,17 @@ This is the largest single work item (C7) and `surogate/quant/` is verified gree
 - BSF keeps codes native; the only transforms are scale-plane layout (canonical row-major in the artifact; per-arch swizzle at load: NVIDIA 128×4 interleave — closed formula `(row_tile·K_tiles + scale_tile)·512 + (row_inner%32)·16 + (row_inner/32)·4 + scale_lane` — for the sm_120 W4A4 route; Marlin-permuted for W4A16) and global-scale normalization (divisor/multiplier unified into one canonical multiplier + descriptor).
 - AQT planes are 256 B-aligned and row-addressable **at tile granularity** (16-row tiles) — sufficient for MoE expert row spans, which are tile-aligned by construction; the finer claim of arbitrary row slicing (true of NInfer's non-interleaved row-split layout, not of a Marlin interleave) is *not* made.
 
+### 5.2b Supported input formats (owner directive, 2026-08-24)
+
+**The engine's supported inputs are safetensors (HF repos, incl. GPTQ/AWQ/FP8/NVFP4
+variants) and GGUF. The `.ninfer` container is NOT a supported input format** — no
+user is ever asked to download or produce one. The vendored NInfer artifact reader
+survives only as an internal seam while the native safetensors/GGUF loaders are
+built against it, and is retired from the product surface after that. The on-disk
+cache below (§5.3) is an internal, transparent, regenerable acceleration of the
+load-time repack — never an interchange format, never published, never required
+(`--no-cache` serves without it).
+
 ### 5.3 The artifact cache
 
 `~/.cache/surogate/artifacts/<fingerprint>/` — one logical byte region, every tensor start 4096-aligned and padded, shards cut at 8 GiB on aligned boundaries, JSON index `{tensors[], shards[], meta}`, plus extracted tokenizer/config for GGUF sources. Read path: O_DIRECT + `preadv` loop (short-read-safe) through 4×64 MiB pinned slots, **pin-after-fill**; fallback probe at startup (tmpfs/network-FS/WSL2 without O_DIRECT → buffered mmap + `MADV_SEQUENTIAL`). **Fingerprint = source file hashes + layout version. Never compute capability** — swizzles are load-time. Conversion runs transparently on first `serve`, or explicitly via `surogate convert`; `--no-cache` builds banks in RAM only.

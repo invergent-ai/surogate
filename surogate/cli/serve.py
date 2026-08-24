@@ -85,6 +85,25 @@ def maybe_exec_serve() -> None:
         )
         sys.exit(127)
 
+    # Resolve the model spec (first non-flag argument) through the ingest
+    # layer: safetensors dirs / HF repo ids convert transparently into the
+    # internal cache; GGUF and unsupported models get clear messages.
+    model_index = next(
+        (i for i, a in enumerate(rest) if not a.startswith("-")
+         and (i == 0 or not rest[i - 1].startswith("--") or "=" in rest[i - 1]
+              or rest[i - 1] in ("--vision", "--greedy", "--no-cuda-graph",
+                                 "--no-prefix-reuse", "--lm-head-draft",
+                                 "--no-thinking", "--preserve-thinking", "--cors",
+                                 "--raw-output", "--print-token-ids"))),
+        None,
+    )
+    if model_index is not None:
+        from surogate.cli.serve_ingest import ensure_engine_weights
+
+        resolved = ensure_engine_weights(rest[model_index],
+                                         echo=lambda m: print(m, file=sys.stderr))
+        rest = [*rest[:model_index], str(resolved), *rest[model_index + 1:]]
+
     os.execv(binary, [binary] + rest)
 
 
