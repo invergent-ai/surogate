@@ -53,13 +53,14 @@ __device__ __forceinline__ void imma_16n8k32(int& d0, int& d1, int& d2, int& d3,
 // W: [rows, k] int8 codes row-major + fp16 scales [rows, k/32].
 // X: [k, tokens] column-major int8 (token-major staging) + fp32 scale/token.
 // OUT: [rows, tokens] bf16 (column-major like the W8 family outputs).
+template <int STAGES>
 __global__ __launch_bounds__(THREADS, 2) void w8a8_imma_kernel(
     const std::int8_t* __restrict__ w_codes, const __half* __restrict__ w_scales,
     const std::int8_t* __restrict__ x_codes, const float* __restrict__ x_scales,
     __nv_bfloat16* __restrict__ out, int rows, int k, int tokens) {
-    __shared__ std::int8_t Ws[2][BM * BK];
-    __shared__ std::int8_t Xs[2][BN * BK];
-    __shared__ __half Ss[2][BM * 2];  // per-row scales for the two groups in flight
+    __shared__ std::int8_t Ws[STAGES][BM * BK];
+    __shared__ std::int8_t Xs[STAGES][BN * BK];
+    __shared__ __half Ss[STAGES][BM * 2];  // per-row scales for the groups in flight
 
     const int m0   = static_cast<int>(blockIdx.x) * BM;
     const int n0   = static_cast<int>(blockIdx.y) * BN;
@@ -105,15 +106,17 @@ __global__ __launch_bounds__(THREADS, 2) void w8a8_imma_kernel(
             for (int q = 0; q < 4; ++q) acc[mi][ni][q] = 0.0f;
 
     const int nkt = k / BK;
-    stage(0, 0);
-    ninfer::ops::cp_commit();
+    for (int pre = 0; pre < STAGES - 1 && pre < nkt; ++pre) {
+        stage(pre, pre);
+        ninfer::ops::cp_commit();
+    }
 
     for (int kt = 0; kt < nkt; ++kt) {
-        const int slot = kt & 1;
-        ninfer::ops::cp_wait<0>();
+        const int slot = kt % STAGES;
+        ninfer::ops::cp_wait<STAGES - 2>();
         __syncthreads();
-        if (kt + 1 < nkt) {
-            stage(kt + 1, slot ^ 1);
+        if (kt + STAGES - 1 < nkt) {
+            stage(kt + STAGES - 1, (kt + STAGES - 1) % STAGES);
             ninfer::ops::cp_commit();
         }
 
@@ -188,6 +191,39 @@ __global__ __launch_bounds__(THREADS, 2) void w8a8_imma_kernel(
     }
 }
 
+// Per-token symmetric int8 activation quantization: bf16 x[token][k]
+// (contiguous per token, matching the engine's {hidden, tokens} layout) ->
+// int8 codes + fp32 scale per token. One CTA per token; absmax reduction
+// then quantize — the O(T*K) pre-pass whose cost this bench reports.
+__global__ void act_quant_kernel(const __nv_bfloat16* __restrict__ x,
+                                 std::int8_t* __restrict__ codes,
+                                 float* __restrict__ scales, int k) {
+    __shared__ float red[256];
+    const int token = static_cast<int>(blockIdx.x);
+    const int tid   = static_cast<int>(threadIdx.x);
+    const __nv_bfloat16* row = x + static_cast<std::int64_t>(token) * k;
+
+    float local = 0.0f;
+    for (int i = tid; i < k; i += 256) {
+        local = fmaxf(local, fabsf(__bfloat162float(row[i])));
+    }
+    red[tid] = local;
+    __syncthreads();
+    for (int step = 128; step > 0; step >>= 1) {
+        if (tid < step) red[tid] = fmaxf(red[tid], red[tid + step]);
+        __syncthreads();
+    }
+    const float absmax = red[0];
+    const float scale  = absmax > 0.0f ? absmax / 127.0f : 1.0f;
+    const float inv    = absmax > 0.0f ? 127.0f / absmax : 0.0f;
+    if (tid == 0) scales[token] = scale;
+    std::int8_t* out = codes + static_cast<std::int64_t>(token) * k;
+    for (int i = tid; i < k; i += 256) {
+        const float v = __bfloat162float(row[i]) * inv;
+        out[i] = static_cast<std::int8_t>(__float2int_rn(fminf(fmaxf(v, -127.0f), 127.0f)));
+    }
+}
+
 struct Case {
     const char* name;
     int rows;
@@ -209,7 +245,7 @@ int main(int argc, char** argv) {
     if (argc > 2) repeat = std::atoi(argv[2]);
     cudaStream_t stream = nullptr;
 
-    std::printf("%-22s %6s %12s %10s %10s\n", "case", "tokens", "imma us/TFs", "max_rel", "rms_rel");
+    std::printf("%-22s %6s %12s %14s %9s %9s\n", "case", "tokens", "imma us/TFs", "quant+imma", "max_rel", "rms_rel");
     for (const Case& c : kCases) {
         bench::PackedQuantizedWeight weight =
             bench::make_row_split_weight(QType::W8G32_F16S, c.rows, c.k, c.k);
@@ -240,8 +276,15 @@ int main(int argc, char** argv) {
 
         for (const int tokens : {472, 1024, 1912}) {
             const dim3 grid(c.rows / BM, (tokens + BN - 1) / BN);
+            const auto launch4 = [&](cudaStream_t s) {
+                w8a8_imma_kernel<4><<<grid, THREADS, 0, s>>>(
+                    static_cast<const std::int8_t*>(d_codes.p),
+                    static_cast<const __half*>(d_scales.p),
+                    static_cast<const std::int8_t*>(d_x.p), static_cast<const float*>(d_xs.p),
+                    static_cast<__nv_bfloat16*>(d_out.p), c.rows, c.k, tokens);
+            };
             const auto launch = [&](cudaStream_t s) {
-                w8a8_imma_kernel<<<grid, THREADS, 0, s>>>(
+                w8a8_imma_kernel<2><<<grid, THREADS, 0, s>>>(
                     static_cast<const std::int8_t*>(d_codes.p),
                     static_cast<const __half*>(d_scales.p),
                     static_cast<const std::int8_t*>(d_x.p), static_cast<const float*>(d_xs.p),
@@ -284,10 +327,30 @@ int main(int argc, char** argv) {
             }
             rms = std::sqrt(rms / checked);
 
-            const auto timing = bench::measure_launch(launch, stream, warmup, repeat);
+            const auto timing  = bench::measure_launch(launch, stream, warmup, repeat);
+            const auto timing4 = bench::measure_launch(launch4, stream, warmup, repeat);
             const double gflop = 2.0 * c.rows * c.k * static_cast<double>(tokens) / 1e9;
-            std::printf("%-22s %6d %7.1f/%3.0f %10.2e %10.2e\n", c.name, tokens, timing.median_us,
-                        gflop / (timing.median_us * 1e-6) / 1e3, max_rel, rms);
+
+            // Combined: per-token act-quant (from bf16) + the IMMA GEMM — the
+            // integration-honest cost. bf16 source generated on device.
+            DeviceBuffer d_xbf = bench::make_bf16(static_cast<std::size_t>(tokens) * c.k);
+            const auto launch_combined = [&](cudaStream_t s) {
+                act_quant_kernel<<<tokens, 256, 0, s>>>(
+                    static_cast<const __nv_bfloat16*>(d_xbf.p),
+                    static_cast<std::int8_t*>(d_x.p), static_cast<float*>(d_xs.p), c.k);
+                launch(s);
+            };
+            const auto combined =
+                bench::measure_launch(launch_combined, stream, warmup, repeat);
+            // act_quant overwrote d_x/d_xs from random bf16; restore the
+            // oracle-known planes for the next token count's spot check.
+            cudaMemcpy(d_x.p, host_x.data(), host_x.size(), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_xs.p, host_xs.data(), host_xs.size() * 4, cudaMemcpyHostToDevice);
+            std::printf("%-22s %6d s2 %7.1f/%3.0f  s4 %7.1f/%3.0f  +q %7.1f/%3.0f %9.2e\n",
+                        c.name, tokens, timing.median_us,
+                        gflop / (timing.median_us * 1e-6) / 1e3, timing4.median_us,
+                        gflop / (timing4.median_us * 1e-6) / 1e3, combined.median_us,
+                        gflop / (combined.median_us * 1e-6) / 1e3, max_rel);
             std::fflush(stdout);
         }
         (void)weight;

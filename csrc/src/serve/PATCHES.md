@@ -206,11 +206,17 @@
    119-124 TF/s at T>=1024 on the four dominant GEMM shapes of both small
    targets — ABOVE the tuned BF16 ceiling — with the int32 group math
    exact against a CPU oracle (2-3e-3 rel = bf16 output rounding).
-   Productization queue: marlin-class staging (deeper stages, swizzle,
-   wider tiles; 160-200 TF/s plausible), the per-token act-quant kernel,
-   split-output/swiglu/residual epilogue twins, LinearPolicy::AllowA8
-   routes at T>=~512, and op tests. Rough end-to-end: naive-rate kernels
-   put 0.8b 1912-prefill near vLLM-FP8 parity; tuned-rate wins it.
+   Second probe pass: the per-token act-quant kernel costs 1.5-3% of the
+   combined time at T>=1024 (integration-honest 116-122 TF/s), and a
+   4-stage pipeline measured SLOWER than 2-stage (118 vs 124 — the kernel
+   is not cp.async-latency-bound; ruled out). Next lever: ldmatrix
+   fragment loads to replace the six manual 4B smem gathers per mma (the
+   issue-slot tax), plus swizzled staging. Even at the current probe rate
+   the end-to-end arithmetic takes the lead everywhere (0.8b 1912-prefill
+   ~52k -> ~61k tok/s vs vLLM-FP8 60.7k; 2b ~25.3k -> ~29.6k vs bf16
+   28.6k). Remaining productization: ldmatrix pass, epilogue twins
+   (split2/split4/swiglu/residual), the quantizing-rmsnorm fusion (makes
+   act-quant free), AllowA8 large-T routes, op tests.
 
 ### sm_89 port status
 
