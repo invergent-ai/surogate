@@ -145,6 +145,15 @@ def _ensure_from_gguf(gguf_path: Path, *, echo=print) -> Path:
     if root is None:
         raise SystemExit("surogate serve: vendored engine tree not found (run from a checkout).")
 
+    # Warm start: the cache name embeds the (target-independent) fingerprint,
+    # so a hit returns without touching the GGUF — gguf-py's eager KV parse
+    # costs ~10s on a 250k-token vocabulary and must stay off this path.
+    fp = _gguf_fingerprint(gguf_path)
+    for cached in cache_dir().glob(f"*-gguf-{fp}.ninfer"):
+        if cached.is_file() and cached.stat().st_size > 0:
+            echo(f"surogate serve: using cached engine weights ({cached.name})")
+            return cached
+
     reader = serve_gguf.open_gguf(gguf_path)
     target_key = serve_gguf.gguf_target_key(gguf_path, reader)
     if target_key is None:
@@ -156,11 +165,7 @@ def _ensure_from_gguf(gguf_path: Path, *, echo=print) -> Path:
             "  Registered today: Qwen3.6-27B, Qwen3.8-27B, Qwen3.6-35B-A3B."
         )
 
-    fp = _gguf_fingerprint(gguf_path)
     out = cache_dir() / f"{target_key}-gguf-{fp}.ninfer"
-    if out.is_file() and out.stat().st_size > 0:
-        echo(f"surogate serve: using cached engine weights ({out.name})")
-        return out
 
     # Q8_0 repack (PATCHES.md #14): for targets whose converter takes
     # --gguf-repack, plan against the converter's own recipes which candidate

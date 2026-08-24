@@ -86,10 +86,15 @@
    tree): candidates = 2D Q8_0 tensors whose llama.cpp inverse transform is
    a row identity (`qwen35.inverse_is_row_identity`; V-reorder families
    excluded until composed as row permutations), narrowed by a planner
-   backed by these vendored recipes; one shared GGUFReader across
-   summary/bridge. Qwen3.5-0.8B Q8_0: 159/195 Q8_0 tensors repacked,
-   one-time conversion 17.7s total vs ~36s full-dequant (converter core
-   3.6s), engine output identical. Bit-exactness is pinned by
+   backed by these vendored recipes. The bridge runs on surogate's lean
+   GGUF metadata parser (surogate/serve/gguf/lean.py, ~0.1s span-indexed
+   open vs gguf-py's ~10s eager KV parse; token arrays parse on demand for
+   the frontend; tensor payloads memmap through payload_view into gguf-py's
+   dequantize for the non-repacked remainder), and the artifact cache is
+   checked by fingerprint before the GGUF is opened at all. Qwen3.5-0.8B
+   Q8_0: 159/195 Q8_0 tensors repacked, one-time conversion 8.4s total vs
+   ~36s full-dequant (converter core 3.6s), warm start 0.0s, engine output
+   identical. Bit-exactness is pinned by
    tests/serve/test_gguf_repack.py against gguf-py's own dequantize.
 
 ### sm_89 port status

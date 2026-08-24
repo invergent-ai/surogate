@@ -47,13 +47,18 @@ def _arch_kv(reader, arch: str, key: str, default=None):
 
 
 def open_gguf(gguf_path: Path):
-    """Open a GGUF once; gguf-py parses ALL KV eagerly (~10s on a 250k-token
-    vocabulary), so callers share one reader across summary/bridge stages."""
-    from gguf import GGUFReader
+    """Open a GGUF via the lean metadata parser (surogate/serve/gguf/lean.py).
+
+    gguf-py's GGUFReader parses ALL KV eagerly (~10s on a 250k-token
+    vocabulary); the lean parser indexes spans in ~0.1s and parses arrays on
+    demand, exposing a get_field() facade so KV consumers work unchanged.
+    gguf-py stays only as the dequantizer (and as the parser oracle in tests).
+    """
+    from surogate.serve.gguf.lean import LeanGguf, LeanGgufError
 
     try:
-        return GGUFReader(str(gguf_path), "r")
-    except Exception as exc:
+        return LeanGguf(gguf_path)
+    except (LeanGgufError, OSError) as exc:
         raise SystemExit(f"surogate serve: '{gguf_path}' is not a readable GGUF file ({exc}).")
 
 
@@ -70,7 +75,7 @@ def read_gguf_summary(gguf_path: Path, reader=None) -> dict:
         "num_attention_heads": _arch_kv(reader, arch, "attention.head_count", 0),
         "num_key_value_heads": _arch_kv(reader, arch, "attention.head_count_kv", 0),
         "tensor_count": len(reader.tensors),
-        "quant_types": sorted({t.tensor_type.name for t in reader.tensors}),
+        "quant_types": sorted({t.type_name for t in reader.tensors}),
     }
     del reader
     return summary
@@ -133,13 +138,14 @@ def build_hf_dir_from_gguf(
     recorded in ``gguf_repack.json`` for a bit-exact move into the artifact."""
     import numpy as np
     import torch
-    from gguf import GGUFReader
+    from gguf import GGMLQuantizationType
     from gguf.quants import dequantize
     from safetensors.torch import save_file
 
     work_dir.mkdir(parents=True, exist_ok=True)
     if reader is None:
-        reader = GGUFReader(str(gguf_path), "r")
+        reader = open_gguf(gguf_path)
+    payload_mm = np.memmap(gguf_path, dtype=np.uint8, mode="r")
     arch = reader.get_field("general.architecture").contents()
 
     # 1. Frontend: tokenizer + chat template reconstructed from the GGUF
@@ -195,7 +201,7 @@ def build_hf_dir_from_gguf(
                   else name_map.get(tensor.name))
             if (
                 hf is not None
-                and tensor.tensor_type.name == "Q8_0"
+                and tensor.type_name == "Q8_0"
                 and len(tensor.shape) == 2
                 and (not qwen35_family or fam.inverse_is_row_identity(hf, geom))
             ):
@@ -241,9 +247,10 @@ def build_hf_dir_from_gguf(
             )
         if hf_name in repack_sources:
             continue
-        data = dequantize(tensor.data, tensor.tensor_type)
+        payload = reader.payload_view(tensor, payload_mm)
+        data = dequantize(payload, GGMLQuantizationType(tensor.type_id))
         # GGUF stores dims innermost-first; HF convention is the reverse.
-        array = np.ascontiguousarray(data.reshape(tuple(reversed(tensor.shape.tolist()))))
+        array = np.ascontiguousarray(data.reshape(tuple(reversed(tensor.shape))))
         t = torch.from_numpy(array)
         if qwen35_family:
             # Undo llama.cpp's export transforms (fp32 math, then narrow).
