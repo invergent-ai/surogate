@@ -576,6 +576,13 @@ int main() {
     failures += distinct_state_case({"generic grouped-map chunk-tail", 3, 12, 65, true}, 12365u);
     failures += distinct_state_case({"27b two-chunk fused-qk-norm", 16, 48, 128, true}, 12128u);
     failures += inplace_case({"35b two-chunk raw-qk", 16, 32, 128, false}, 12228u);
+    // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b symmetric 16/16 heads
+    // (identity head map), qualified across decode/small-T/chunk/tail routes.
+    failures += inplace_case({"08b decode fused-qk-norm", 16, 16, 1, true}, 13001u);
+    failures += distinct_state_case({"08b raw-qk small-T", 16, 16, 7, false}, 13007u);
+    failures += distinct_state_case({"08b exact chunk fused-qk-norm", 16, 16, 64, true}, 13064u);
+    failures += inplace_case({"08b chunk-tail fused-qk-norm", 16, 16, 65, true}, 13065u);
+    failures += distinct_state_case({"08b two-chunk raw-qk", 16, 16, 128, false}, 13128u);
 
     // Snapshot is a separate public state transition. Nonzero source slots also prove that the
     // selected initial state, not slot zero, seeds the complete recurrence.

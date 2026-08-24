@@ -12,10 +12,26 @@ constexpr int kHidden = 2048;
 using Output          = W8SplitOutput2<8192, 4096>;
 using Schedule        = W8RowSplitMmaGemmSchedule<64, 128, 64, 16, 2, 2>;
 
+// surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b fused qkvz.
+using Output08 = W8SplitOutput2<6144, 2048>;
+
 template <bool Full>
 void launch_variant(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                     cudaStream_t stream) {
     static_assert((8192 % Schedule::BM) == 0 && (4096 % Schedule::BM) == 0);
+    if (weight.k == 1024) {
+        static_assert((6144 % Schedule::BM) == 0 && (2048 % Schedule::BM) == 0);
+        const Output08 output{static_cast<__nv_bfloat16*>(qkv.data),
+                              static_cast<__nv_bfloat16*>(z.data)};
+        const dim3 grid(8192 / Schedule::BM, static_cast<unsigned>(div_up(x.ne[1], Schedule::BN)),
+                        1u);
+        w8_rowsplit_gemm_mma_kernel<Schedule, Full, W8Epilogue::Store, Output08>
+            <<<grid, Schedule::THREADS, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(x.data),
+                static_cast<const std::uint8_t*>(weight.qdata),
+                static_cast<const std::uint8_t*>(weight.scales), output, 8192, 1024, x.ne[1], 1024);
+        return;
+    }
     const Output output{static_cast<__nv_bfloat16*>(qkv.data), static_cast<__nv_bfloat16*>(z.data)};
     const dim3 grid(kRows / Schedule::BM, static_cast<unsigned>(div_up(x.ne[1], Schedule::BN)), 1u);
     w8_rowsplit_gemm_mma_kernel<Schedule, Full, W8Epilogue::Store, Output>

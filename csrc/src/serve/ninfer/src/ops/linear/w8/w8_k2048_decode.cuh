@@ -21,7 +21,7 @@ struct W8DecodeStoreEpilogue {
 };
 
 template <std::int32_t Rows, std::int32_t RowsPerCta, class Output,
-          class Epilogue = W8DecodeStoreEpilogue>
+          class Epilogue = W8DecodeStoreEpilogue, std::int32_t K = 2048>
 __global__ __launch_bounds__(RowsPerCta * 32,
                              2) void w8_k2048_decode_kernel(const __nv_bfloat16* __restrict__ x,
                                                             const std::uint8_t* __restrict__ codes,
@@ -29,7 +29,7 @@ __global__ __launch_bounds__(RowsPerCta * 32,
                                                             Output output, Epilogue epilogue = {}) {
     static_assert(Rows > 0 && RowsPerCta > 0 && (Rows % RowsPerCta) == 0);
     static_assert(RowsPerCta * 32 <= 1024);
-    constexpr int kK                 = 2048;
+    constexpr int kK                 = K;  // surogate vendor patch (PATCHES.md #13)
     constexpr int kGroup             = 32;
     constexpr int kGroupsPerRow      = kK / kGroup;
     constexpr int kValuesPerLane     = 8;

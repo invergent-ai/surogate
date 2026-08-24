@@ -62,6 +62,16 @@ constexpr std::array<RouteSpec, 33> kK6144Routes{{
     {2049, kAnyCols, W8LinearAddScheduleId::MmaR64C128},
 }};
 
+// surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b residual projections
+// ({1024,2048} and {1024,3584}). The SplitKMmaExactT / MediumSplitK / DecodeR16
+// launchers are compile-time (2048 x {4096,6144}) instantiations, so the 0.8B
+// shapes route exclusively over the runtime-shaped SIMT and MMA schedules.
+constexpr std::array<RouteSpec, 3> kQ08Routes{{
+    {1, 4, W8LinearAddScheduleId::SimtR8C4},
+    {5, 128, W8LinearAddScheduleId::MmaR32C128},
+    {129, kAnyCols, W8LinearAddScheduleId::MmaR64C128},
+}};
+
 template <std::size_t N>
 constexpr bool routes_are_closed(const std::array<RouteSpec, N>& routes) {
     std::int64_t expected = 1;
@@ -72,7 +82,8 @@ constexpr bool routes_are_closed(const std::array<RouteSpec, N>& routes) {
     return routes.back().last == kAnyCols && expected == static_cast<std::int64_t>(kAnyCols) + 1;
 }
 
-static_assert(routes_are_closed(kK4096Routes) && routes_are_closed(kK6144Routes),
+static_assert(routes_are_closed(kK4096Routes) && routes_are_closed(kK6144Routes) &&
+                  routes_are_closed(kQ08Routes),
               "W8 LinearAdd routes must be exact, contiguous, and closed");
 
 std::int32_t schedule_rows(W8LinearAddScheduleId schedule) {
@@ -210,6 +221,7 @@ W8LinearAddPlan w8_linear_add_resolve_plan(const W8LinearAddProblem& problem) {
         }
         throw std::logic_error("w8 linear_add: admitted problem has no covering route");
     };
+    if (problem.rows == 1024) { return resolve_from(kQ08Routes); }
     return problem.k == 6144 ? resolve_from(kK6144Routes) : resolve_from(kK4096Routes);
 }
 

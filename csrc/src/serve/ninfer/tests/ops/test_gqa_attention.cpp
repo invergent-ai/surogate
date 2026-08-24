@@ -51,6 +51,8 @@ struct Geometry {
 constexpr Geometry kGeometries[] = {
     {"qwen3_6_27b", 24, 4},
     {"qwen3_6_35b_a3b", 16, 2},
+    // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b.
+    {"qwen3_5_0_8b", 8, 2},
 };
 
 struct AttentionCase {

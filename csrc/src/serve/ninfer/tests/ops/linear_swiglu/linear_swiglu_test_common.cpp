@@ -217,8 +217,12 @@ int verify_unchanged(std::string_view label, const test::GuardedDeviceBuffer& de
 void validate_profile(const Profile& profile) {
     const bool q4 = profile.qtype == QType::Q4G64_F16S && profile.gate_up_rows == 34816 &&
                     profile.input_rows == 5120 && profile.output_rows == 17408;
-    const bool w8 = profile.qtype == QType::W8G32_F16S && profile.gate_up_rows == 12288 &&
-                    profile.input_rows == 2048 && profile.output_rows == 6144;
+    // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b mlp (1024 -> 2x3584).
+    const bool w8 = profile.qtype == QType::W8G32_F16S &&
+                    ((profile.gate_up_rows == 12288 && profile.input_rows == 2048 &&
+                      profile.output_rows == 6144) ||
+                     (profile.gate_up_rows == 7168 && profile.input_rows == 1024 &&
+                      profile.output_rows == 3584));
     const bool nvfp4 = profile.qtype == QType::NVFP4 && profile.gate_up_rows == 34816 &&
                        profile.input_rows == 5120 && profile.output_rows == 17408;
     const bool fp8 = profile.qtype == QType::FP8_E4M3FN_ROW_BF16S &&

@@ -47,7 +47,9 @@ struct W8SwiGluExactTEpilogue {
     }
 };
 
-template <int ActiveCols>
+// surogate vendor patch (PATCHES.md #13): geometry is templated so the
+// qwen3.5-0.8b mlp (2x3584, k=1024) gets its own exact instantiations.
+template <int ActiveCols, int Intermediate = kIntermediate, int Hidden = kHidden>
 void launch_active_cols(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     constexpr int TileCols = ActiveCols <= 8    ? 8
                              : ActiveCols <= 16 ? 16
@@ -57,16 +59,16 @@ void launch_active_cols(const Tensor& x, const Weight& w, Tensor& out, cudaStrea
                                                 : 48;
     constexpr auto ScaleAccess =
         ActiveCols > 4 ? W8SmallTMmaScaleAccess::Shared : W8SmallTMmaScaleAccess::Direct;
-    using Geometry = W8LinearGeometry<2 * kIntermediate, kHidden>;
+    using Geometry = W8LinearGeometry<2 * Intermediate, Hidden>;
     using Schedule =
         std::conditional_t<(ActiveCols <= 32), W8SmallTMmaDefaultSchedule<TileCols, ActiveCols>,
                            W8SmallTMmaSchedule<4, TileCols, 3, ScaleAccess>>;
-    const W8ContiguousOutput ignored_output{static_cast<__nv_bfloat16*>(out.data), kIntermediate};
-    const W8SwiGluExactTEpilogue epilogue{static_cast<__nv_bfloat16*>(out.data), kIntermediate};
-    const W8SwiGluExactTRows row_policy{kIntermediate};
+    const W8ContiguousOutput ignored_output{static_cast<__nv_bfloat16*>(out.data), Intermediate};
+    const W8SwiGluExactTEpilogue epilogue{static_cast<__nv_bfloat16*>(out.data), Intermediate};
+    const W8SwiGluExactTRows row_policy{Intermediate};
     w8_small_t_mma_kernel<Geometry, ActiveCols, Schedule, W8ContiguousOutput,
                           W8SwiGluExactTEpilogue, W8SwiGluExactTRows, true>
-        <<<kIntermediate / kRowsPerCta, Schedule::kThreads, 0, stream>>>(
+        <<<Intermediate / kRowsPerCta, Schedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
             static_cast<const std::uint8_t*>(w.scales), ignored_output, epilogue, row_policy);
 }
@@ -77,8 +79,16 @@ constexpr auto make_launchers(std::index_sequence<Offsets...>) {
         &launch_active_cols<kFirstExactT + static_cast<int>(Offsets)>...};
 }
 
+template <std::size_t... Offsets>
+constexpr auto make_q08_launchers(std::index_sequence<Offsets...>) {
+    return std::array<ProjectionLauncher, sizeof...(Offsets)>{
+        &launch_active_cols<kFirstExactT + static_cast<int>(Offsets), 3584, 1024>...};
+}
+
 constexpr auto kLaunchers =
     make_launchers(std::make_index_sequence<kLastExactT - kFirstExactT + 1>{});
+constexpr auto kQ08Launchers =
+    make_q08_launchers(std::make_index_sequence<kLastExactT - kFirstExactT + 1>{});
 
 } // namespace
 
@@ -87,7 +97,11 @@ void w8_linear_swiglu_splitk_exact_t_launch(const Tensor& x, const Weight& w, Te
     if (x.ne[1] < kFirstExactT || x.ne[1] > kLastExactT) {
         throw std::invalid_argument("W8 LinearSwiGLU exact split-K requires T=2..48");
     }
-    kLaunchers[x.ne[1] - kFirstExactT](x, w, out, stream);
+    if (w.k == 1024) {
+        kQ08Launchers[x.ne[1] - kFirstExactT](x, w, out, stream);
+    } else {
+        kLaunchers[x.ne[1] - kFirstExactT](x, w, out, stream);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

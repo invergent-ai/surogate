@@ -13,22 +13,22 @@ constexpr int kHidden        = 2048;
 using TargetOutput           = W8SplitOutput4<4096, 512, 4096, 512>;
 using CompanionOutput        = W8SplitOutput3<4096, 1024, 1024>;
 
-template <class Schedule, bool Full, int Rows, class Output>
+template <class Schedule, bool Full, int Rows, int Hidden, class Output>
 void launch_variant(const Tensor& x, const Weight& weight, Output output, cudaStream_t stream) {
     const dim3 grid(Rows / Schedule::BM, static_cast<unsigned>(div_up(x.ne[1], Schedule::BN)), 1u);
     w8_rowsplit_gemm_mma_kernel<Schedule, Full, W8Epilogue::Store, Output>
         <<<grid, Schedule::THREADS, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data),
                                                  static_cast<const std::uint8_t*>(weight.qdata),
                                                  static_cast<const std::uint8_t*>(weight.scales),
-                                                 output, Rows, kHidden, x.ne[1], kHidden);
+                                                 output, Rows, Hidden, x.ne[1], Hidden);
 }
 
-template <class Schedule, int Rows, class Output>
+template <class Schedule, int Rows, int Hidden, class Output>
 void launch_route(const Tensor& x, const Weight& weight, Output output, cudaStream_t stream) {
     if ((x.ne[1] % Schedule::BN) == 0) {
-        launch_variant<Schedule, true, Rows>(x, weight, output, stream);
+        launch_variant<Schedule, true, Rows, Hidden>(x, weight, output, stream);
     } else {
-        launch_variant<Schedule, false, Rows>(x, weight, output, stream);
+        launch_variant<Schedule, false, Rows, Hidden>(x, weight, output, stream);
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -39,20 +39,38 @@ void w8_attn_input_mma_r32_c128_launch(const Tensor& x, const Weight& weight, Te
                                        Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream) {
     using Schedule = W8RowSplitMmaGemmSchedule<32, 128, 32, 16, 2>;
     static_assert((4096 % Schedule::BM) == 0 && (512 % Schedule::BM) == 0);
+    // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b fused qkgv.
+    if (weight.k == 1024) {
+        using Output08 = W8SplitOutput4<2048, 512, 2048, 512>;
+        const Output08 output{
+            static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
+            static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(v.data)};
+        launch_route<Schedule, 5120, 1024>(x, weight, output, stream);
+        return;
+    }
     const TargetOutput output{
         static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
         static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(v.data)};
-    launch_route<Schedule, kTargetRows>(x, weight, output, stream);
+    launch_route<Schedule, kTargetRows, kHidden>(x, weight, output, stream);
 }
 
 void w8_attn_input_mma_r64_c128_launch(const Tensor& x, const Weight& weight, Tensor& q,
                                        Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream) {
     using Schedule = W8RowSplitMmaGemmSchedule<64, 128, 64, 16, 2, 2>;
     static_assert((4096 % Schedule::BM) == 0 && (512 % Schedule::BM) == 0);
+    // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b fused qkgv.
+    if (weight.k == 1024) {
+        using Output08 = W8SplitOutput4<2048, 512, 2048, 512>;
+        const Output08 output{
+            static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
+            static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(v.data)};
+        launch_route<Schedule, 5120, 1024>(x, weight, output, stream);
+        return;
+    }
     const TargetOutput output{
         static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
         static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(v.data)};
-    launch_route<Schedule, kTargetRows>(x, weight, output, stream);
+    launch_route<Schedule, kTargetRows, kHidden>(x, weight, output, stream);
 }
 
 void w8_attn_input_mma_r32_c128_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k,
@@ -62,7 +80,7 @@ void w8_attn_input_mma_r32_c128_launch(const Tensor& x, const Weight& weight, Te
     const CompanionOutput output{static_cast<__nv_bfloat16*>(q.data),
                                  static_cast<__nv_bfloat16*>(k.data),
                                  static_cast<__nv_bfloat16*>(v.data)};
-    launch_route<Schedule, kCompanionRows>(x, weight, output, stream);
+    launch_route<Schedule, kCompanionRows, kHidden>(x, weight, output, stream);
 }
 
 void w8_attn_input_mma_r64_c128_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k,
@@ -72,7 +90,7 @@ void w8_attn_input_mma_r64_c128_launch(const Tensor& x, const Weight& weight, Te
     const CompanionOutput output{static_cast<__nv_bfloat16*>(q.data),
                                  static_cast<__nv_bfloat16*>(k.data),
                                  static_cast<__nv_bfloat16*>(v.data)};
-    launch_route<Schedule, kCompanionRows>(x, weight, output, stream);
+    launch_route<Schedule, kCompanionRows, kHidden>(x, weight, output, stream);
 }
 
 void w8_companion_attn_input_mma_r32_c64_launch(const Tensor& x, const Weight& weight, Tensor& q,
@@ -82,7 +100,7 @@ void w8_companion_attn_input_mma_r32_c64_launch(const Tensor& x, const Weight& w
     const CompanionOutput output{static_cast<__nv_bfloat16*>(q.data),
                                  static_cast<__nv_bfloat16*>(k.data),
                                  static_cast<__nv_bfloat16*>(v.data)};
-    launch_route<Schedule, kCompanionRows>(x, weight, output, stream);
+    launch_route<Schedule, kCompanionRows, kHidden>(x, weight, output, stream);
 }
 
 void w8_companion_attn_input_mma_r64_c64_launch(const Tensor& x, const Weight& weight, Tensor& q,
@@ -92,7 +110,7 @@ void w8_companion_attn_input_mma_r64_c64_launch(const Tensor& x, const Weight& w
     const CompanionOutput output{static_cast<__nv_bfloat16*>(q.data),
                                  static_cast<__nv_bfloat16*>(k.data),
                                  static_cast<__nv_bfloat16*>(v.data)};
-    launch_route<Schedule, kCompanionRows>(x, weight, output, stream);
+    launch_route<Schedule, kCompanionRows, kHidden>(x, weight, output, stream);
 }
 
 void w8_companion_attn_input_mma_r32_c96_launch(const Tensor& x, const Weight& weight, Tensor& q,
@@ -102,7 +120,7 @@ void w8_companion_attn_input_mma_r32_c96_launch(const Tensor& x, const Weight& w
     const CompanionOutput output{static_cast<__nv_bfloat16*>(q.data),
                                  static_cast<__nv_bfloat16*>(k.data),
                                  static_cast<__nv_bfloat16*>(v.data)};
-    launch_route<Schedule, kCompanionRows>(x, weight, output, stream);
+    launch_route<Schedule, kCompanionRows, kHidden>(x, weight, output, stream);
 }
 
 void w8_companion_attn_input_mma_r64_c96_launch(const Tensor& x, const Weight& weight, Tensor& q,
@@ -112,7 +130,7 @@ void w8_companion_attn_input_mma_r64_c96_launch(const Tensor& x, const Weight& w
     const CompanionOutput output{static_cast<__nv_bfloat16*>(q.data),
                                  static_cast<__nv_bfloat16*>(k.data),
                                  static_cast<__nv_bfloat16*>(v.data)};
-    launch_route<Schedule, kCompanionRows>(x, weight, output, stream);
+    launch_route<Schedule, kCompanionRows, kHidden>(x, weight, output, stream);
 }
 
 void w8_companion_attn_input_mma_r128_c64_launch(const Tensor& x, const Weight& weight, Tensor& q,
@@ -122,7 +140,7 @@ void w8_companion_attn_input_mma_r128_c64_launch(const Tensor& x, const Weight& 
     const CompanionOutput output{static_cast<__nv_bfloat16*>(q.data),
                                  static_cast<__nv_bfloat16*>(k.data),
                                  static_cast<__nv_bfloat16*>(v.data)};
-    launch_route<Schedule, kCompanionRows>(x, weight, output, stream);
+    launch_route<Schedule, kCompanionRows, kHidden>(x, weight, output, stream);
 }
 
 void w8_companion_attn_input_mma_r128_c80_launch(const Tensor& x, const Weight& weight, Tensor& q,
@@ -132,7 +150,7 @@ void w8_companion_attn_input_mma_r128_c80_launch(const Tensor& x, const Weight& 
     const CompanionOutput output{static_cast<__nv_bfloat16*>(q.data),
                                  static_cast<__nv_bfloat16*>(k.data),
                                  static_cast<__nv_bfloat16*>(v.data)};
-    launch_route<Schedule, kCompanionRows>(x, weight, output, stream);
+    launch_route<Schedule, kCompanionRows, kHidden>(x, weight, output, stream);
 }
 
 } // namespace ninfer::ops::detail

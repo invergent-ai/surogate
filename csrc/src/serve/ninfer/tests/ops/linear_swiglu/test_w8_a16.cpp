@@ -15,9 +15,14 @@ int main() {
             1,   2,   6,   32,  33,  40,  41,  48,  49,  65,  81,  97,  129,
             193, 241, 256, 257, 265, 289, 321, 385, 449, 513, 560, 561,
         };
-        const int failures = run_profile(
+        int failures = run_profile(
             "LinearSwiGLU W8_A16",
             {QType::W8G32_F16S, 12288, 2048, 6144, 1601U, ActivationCompute::A16}, kTokenCases);
+        // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b mlp (1024 -> 2x3584).
+        constexpr std::array<std::int32_t, 8> kQ08TokenCases{1, 2, 6, 17, 33, 65, 129, 257};
+        failures += run_profile(
+            "LinearSwiGLU W8_A16 q08",
+            {QType::W8G32_F16S, 7168, 1024, 3584, 1607U, ActivationCompute::A16}, kQ08TokenCases);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " LinearSwiGLU W8_A16 correctness\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

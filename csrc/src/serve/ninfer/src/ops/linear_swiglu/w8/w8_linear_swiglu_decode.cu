@@ -13,14 +13,15 @@
 namespace ninfer::ops::detail {
 namespace {
 
-constexpr int kIntermediate = 6144;
-constexpr int kK            = 2048;
-constexpr int kGroupsPerRow = kK / 32;
-
-template <int RowsPerCta>
+// surogate vendor patch (PATCHES.md #13): geometry is templated so the
+// qwen3.5-0.8b mlp (3584 x 2, k=1024) shares this kernel with the 35B shape.
+template <int RowsPerCta, int Intermediate = 6144, int K = 2048>
 __global__ __launch_bounds__(RowsPerCta * 32, 2) void w8_linear_swiglu_decode_pair_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ scales, __nv_bfloat16* __restrict__ out) {
+    constexpr int kIntermediate   = Intermediate;
+    constexpr int kK              = K;
+    constexpr int kGroupsPerRow   = kK / 32;
     constexpr int kValuesPerLane  = 8;
     constexpr int kValuesPerPhase = 32 * kValuesPerLane;
     constexpr int kGroupsPerPhase = kValuesPerPhase / 32;
@@ -87,11 +88,11 @@ __global__ __launch_bounds__(RowsPerCta * 32, 2) void w8_linear_swiglu_decode_pa
     if (lane == 0) { out[row] = __float2bfloat16_rn(silu(gate_acc) * up_acc); }
 }
 
-template <int RowsPerCta>
+template <int RowsPerCta, int Intermediate = 6144, int K = 2048>
 void launch_decode(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
-    static_assert(kIntermediate % RowsPerCta == 0);
-    w8_linear_swiglu_decode_pair_kernel<RowsPerCta>
-        <<<kIntermediate / RowsPerCta, RowsPerCta * 32, 0, stream>>>(
+    static_assert(Intermediate % RowsPerCta == 0);
+    w8_linear_swiglu_decode_pair_kernel<RowsPerCta, Intermediate, K>
+        <<<Intermediate / RowsPerCta, RowsPerCta * 32, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
             static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data));
     CUDA_CHECK(cudaGetLastError());
@@ -101,16 +102,29 @@ void launch_decode(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t s
 
 void w8_linear_swiglu_decode_pair_launch(const Tensor& x, const Weight& w, Tensor& out,
                                          cudaStream_t stream) {
+    if (w.k == 1024) {
+        launch_decode<8, 3584, 1024>(x, w, out, stream);
+        return;
+    }
     launch_decode<8>(x, w, out, stream);
 }
 
 void w8_linear_swiglu_decode_pair_r4_launch(const Tensor& x, const Weight& w, Tensor& out,
                                             cudaStream_t stream) {
+    if (w.k == 1024) {
+        launch_decode<4, 3584, 1024>(x, w, out, stream);
+        return;
+    }
     launch_decode<4>(x, w, out, stream);
 }
 
 void w8_linear_swiglu_decode_pair_r16_launch(const Tensor& x, const Weight& w, Tensor& out,
                                              cudaStream_t stream) {
+    // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b mlp decode.
+    if (w.k == 1024) {
+        launch_decode<16, 3584, 1024>(x, w, out, stream);
+        return;
+    }
     launch_decode<16>(x, w, out, stream);
 }
 

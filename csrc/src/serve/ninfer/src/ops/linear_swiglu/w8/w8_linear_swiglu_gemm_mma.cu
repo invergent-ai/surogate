@@ -9,21 +9,22 @@
 namespace ninfer::ops::detail {
 namespace {
 
-constexpr int kGateUpRows   = 12288;
-constexpr int kIntermediate = 6144;
-constexpr int kHidden       = 2048;
-
 template <class Schedule, bool Full>
 void launch_variant(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
-    static_assert((kIntermediate % (Schedule::BM / 2)) == 0);
-    const W8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), kIntermediate};
-    const dim3 grid(kIntermediate / (Schedule::BM / 2),
+    // surogate vendor patch (PATCHES.md #13): geometry from the admitted weight
+    // (35B 12288x2048 or qwen3.5-0.8b 7168x1024); the kernel is runtime-shaped
+    // and both intermediate extents divide every registered BM/2.
+    const std::int32_t gate_up_rows = w.n;
+    const std::int32_t intermediate = gate_up_rows / 2;
+    const std::int32_t hidden       = w.k;
+    const W8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), intermediate};
+    const dim3 grid(static_cast<unsigned>(intermediate / (Schedule::BM / 2)),
                     static_cast<unsigned>(div_up(x.ne[1], Schedule::BN)), 1u);
     w8_rowsplit_gemm_mma_kernel<Schedule, Full, W8Epilogue::SwiGluSplitHalf>
         <<<grid, Schedule::THREADS, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data),
                                                  static_cast<const std::uint8_t*>(w.qdata),
                                                  static_cast<const std::uint8_t*>(w.scales), output,
-                                                 kGateUpRows, kHidden, x.ne[1], kHidden);
+                                                 gate_up_rows, hidden, x.ne[1], hidden);
 }
 
 template <class Schedule>

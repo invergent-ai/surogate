@@ -92,6 +92,9 @@ int main() {
     failures += run_case("gated_rmsnorm [128,32,128]", {128, 32, 128}, 1403U);
     failures += run_case("gated_rmsnorm near-zero [128,32]", {128, 32}, 1404U, 1.0e-5F);
     failures += run_case("gated_rmsnorm unaligned [128,48]", {128, 48}, 1405U, 4.0F, true);
+    // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b (16 GDN value heads).
+    failures += run_case("gated_rmsnorm [128,16,1]", {128, 16}, 1407U);
+    failures += run_case("gated_rmsnorm [128,16,33]", {128, 16, 33}, 1408U);
     std::cout << (failures ? "FAIL" : "OK") << " gated_rmsnorm\n";
     return failures ? 1 : 0;
 }

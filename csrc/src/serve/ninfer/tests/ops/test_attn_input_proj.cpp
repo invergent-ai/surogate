@@ -443,6 +443,54 @@ int run_w8_target() {
     return failures;
 }
 
+// surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b fused qkgv geometry.
+int run_w8_q08_case(DevicePackedWeight& parent, std::int32_t tokens) {
+    constexpr std::int32_t kHidden      = 1024;
+    constexpr std::int32_t kQRows       = 2048;
+    constexpr std::int32_t kKvRows      = 512;
+    const std::vector<float> activation = make_bf16_activation(kHidden, tokens, 401U + tokens);
+    const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
+    DeviceBuffer device_activation                   = to_device(activation_bits);
+
+    GuardedBf16Tensor query(kQRows, tokens);
+    GuardedBf16Tensor gate(kQRows, tokens);
+    GuardedBf16Tensor key(kKvRows, tokens);
+    GuardedBf16Tensor value(kKvRows, tokens);
+    Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
+    Tensor q = query.tensor();
+    Tensor g = gate.tensor();
+    Tensor k = key.tensor();
+    Tensor v = value.tensor();
+    ops::attn_input_proj(x, parent.view(), q, g, k, v, nullptr);
+    cuda_synchronize();
+
+    const std::string suffix = " W8 q08 A16 T=" + std::to_string(tokens);
+    int failures             = 0;
+    failures += verify_output("attn q" + suffix, query, parent.host, 0, kQRows, activation, kHidden,
+                              tokens);
+    failures += verify_output("attn k" + suffix, key, parent.host, kQRows, kKvRows, activation,
+                              kHidden, tokens);
+    failures += verify_output("attn gate" + suffix, gate, parent.host, kQRows + kKvRows, kQRows,
+                              activation, kHidden, tokens);
+    failures += verify_output("attn value" + suffix, value, parent.host, 2 * kQRows + kKvRows,
+                              kKvRows, activation, kHidden, tokens);
+    failures += verify_preserved("attn x" + suffix, device_activation, activation_bits);
+    failures += parent.verify_preserved("attn parent weight" + suffix);
+    return failures;
+}
+
+int run_w8_q08() {
+    constexpr std::int32_t kHidden = 1024;
+    DevicePackedWeight parent(
+        quantized_weight::make_patterned_weight(QType::W8G32_F16S, 5120, kHidden, 409U));
+    int failures = 0;
+    // One case per 0.8B A16 route region plus boundaries.
+    for (const std::int32_t tokens : {1, 2, 17, 48, 64, 65, 128, 129}) {
+        failures += run_w8_q08_case(parent, tokens);
+    }
+    return failures;
+}
+
 int run_w8_companion_case(DevicePackedWeight& parent, std::int32_t tokens) {
     constexpr std::int32_t kHidden      = 2048;
     constexpr std::int32_t kQRows       = 4096;
@@ -500,6 +548,7 @@ int main() {
     failures += run_nvfp4_target();
     failures += run_fp8_target();
     failures += run_w8_target();
+    failures += run_w8_q08();
     failures += run_w8_companion();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " attn_input_proj\n";
     return failures == 0 ? 0 : 1;

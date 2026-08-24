@@ -493,6 +493,15 @@ int main() {
     constexpr std::int32_t kQwen35Channels = 8192;
     failures += ordinary_case(kQwen35Channels, 257, StateCall::InPlaceEntry, 3257U);
 
+    // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b channel extent.
+    constexpr std::int32_t kQwen08Channels = 6144;
+    for (const std::int32_t T : {1, 2, 17, 257}) {
+        failures += ordinary_case(kQwen08Channels, T, StateCall::InPlaceEntry,
+                                  6000U + static_cast<std::uint32_t>(T));
+    }
+    failures += snapshot_case(kQwen08Channels, 1, 4, 0, 1, 6401U);
+    failures += snapshot_case(kQwen08Channels, 16, 18, 17, 1, 6416U);
+
     // Snapshot decode, small-T boundary/interior, sequence route, slot 0 initialization, and
     // continuation from selected slots. A nonzero destination base proves that snapshots are not
     // hard-wired to physical slots [0,T); selected source slots may overlap the destination range.

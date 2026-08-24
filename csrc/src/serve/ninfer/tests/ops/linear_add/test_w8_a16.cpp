@@ -31,6 +31,16 @@ int w8_a16_conformance() {
     failures += ninfer::test::linear_add::run_shape(
         "W8_A16 LinearAdd", WeightFormat::W8G32F16S,
         ShapeCase{2048, 6144, 421U, kK6144RouteStarts, kK6144RouteInteriors});
+    // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b residual projections
+    // (attn/gdn output 1024x2048, mlp down 1024x3584) over the q08 route table.
+    constexpr std::array<std::int32_t, 2> kQ08RouteStarts{5, 129};
+    constexpr std::array<std::int32_t, 4> kQ08RouteInteriors{1, 4, 64, 256};
+    failures += ninfer::test::linear_add::run_shape(
+        "W8_A16 LinearAdd", WeightFormat::W8G32F16S,
+        ShapeCase{1024, 2048, 431U, kQ08RouteStarts, kQ08RouteInteriors});
+    failures += ninfer::test::linear_add::run_shape(
+        "W8_A16 LinearAdd", WeightFormat::W8G32F16S,
+        ShapeCase{1024, 3584, 433U, kQ08RouteStarts, kQ08RouteInteriors});
     return failures;
 }
 

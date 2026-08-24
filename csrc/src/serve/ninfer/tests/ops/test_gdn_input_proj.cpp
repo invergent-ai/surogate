@@ -121,6 +121,45 @@ int run_w8() {
     return failures;
 }
 
+// surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b fused qkvz geometry.
+int run_w8_q08_case(DevicePackedWeight& parent, std::int32_t tokens) {
+    constexpr std::int32_t kHidden      = 1024;
+    constexpr std::int32_t kQkvRows     = 6144;
+    constexpr std::int32_t kZRows       = 2048;
+    const std::vector<float> activation = make_bf16_activation(kHidden, tokens, 601U + tokens);
+    const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
+    DeviceBuffer device_activation                   = to_device(activation_bits);
+    GuardedBf16Tensor qkv(kQkvRows, tokens);
+    GuardedBf16Tensor z(kZRows, tokens);
+    Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
+    Tensor qkv_output = qkv.tensor();
+    Tensor z_output   = z.tensor();
+    ops::gdn_input_proj(x, parent.view(), qkv_output, z_output, nullptr);
+    cuda_synchronize();
+
+    const std::string suffix = " W8 q08 A16 T=" + std::to_string(tokens);
+    int failures             = qkv.verify_guards("gdn qkv" + suffix);
+    failures += z.verify_guards("gdn z" + suffix);
+    failures += qkv.verify_fully_written("gdn qkv" + suffix);
+    failures += z.verify_fully_written("gdn z" + suffix);
+    failures += verify_output_range("gdn qkv" + suffix, qkv, kQkvRows, 0, kQkvRows, parent.host, 0,
+                                    activation, kHidden, tokens);
+    failures += verify_output_range("gdn z" + suffix, z, kZRows, 0, kZRows, parent.host, kQkvRows,
+                                    activation, kHidden, tokens);
+    failures += verify_preserved("gdn x" + suffix, device_activation, activation_bits);
+    failures += parent.verify_preserved("gdn parent weight" + suffix);
+    return failures;
+}
+
+int run_w8_q08() {
+    constexpr std::int32_t kHidden = 1024;
+    DevicePackedWeight parent(
+        quantized_weight::make_patterned_weight(QType::W8G32_F16S, 8192, kHidden, 607U));
+    int failures = 0;
+    for (const std::int32_t tokens : {1, 2, 17, 97}) { failures += run_w8_q08_case(parent, tokens); }
+    return failures;
+}
+
 int verify_output_range_sampled(std::string_view label, const GuardedBf16Tensor& output,
                                 std::int32_t full_rows, std::int32_t output_row_offset,
                                 std::int32_t output_rows,
@@ -323,6 +362,7 @@ int main() {
     int failures = 0;
     failures += run_q4_q5();
     failures += run_w8();
+    failures += run_w8_q08();
     failures += run_nvfp4();
     failures += run_fp8();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj\n";

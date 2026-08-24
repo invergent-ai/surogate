@@ -557,7 +557,8 @@ int test_q6() {
 
 int test_w8() {
     int failures = 0;
-    for (const std::int32_t d : {kW8VisionD, kW8TextD}) {
+    // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b text width 1024.
+    for (const std::int32_t d : {1024, kW8VisionD, kW8TextD}) {
         W8Table table(d);
         for (const std::size_t t : {1u, 6u, 16u, 1024u}) {
             const std::string label = "embedding W8 [248320," + std::to_string(d) +

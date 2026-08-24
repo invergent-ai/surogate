@@ -85,15 +85,51 @@ CPU pass on this host (`CUDA_VISIBLE_DEVICES="" ctest`): 83/89 after patch 4.
 - `ninfer_linear_swiglu_{q4,w8,nvfp4,fp8}_test` report FAIL instead of SKIP
   when no CUDA device is visible (upstream skip-handling quirk); they belong
   to the GPU pass.
-13. **qwen3.5-0.8b shape admissions (IN PROGRESS).** Runtime whitelist
-   extensions for the first new geometry, found by the E2E worklist protocol
-   (run `surogate-engine-cli <0.8b artifact>` on an idle GPU; each failure
-   names the next family). DONE: gqa_attention wrapper 8q/2kv; Gqa08Geometry
-   <8,2,2> + Q-keyed dispatch branches (decode capacity/small_t/cached,
-   prefill prompt/combined — KV-append reuses Gqa35, GroupSize-independent);
-   GroupSize==4 launch-tuple tables (Wc/RowTiles must divide 32 into
-   {2,4,8,16}); q5 linear_add {1024,2048},{1024,3584} on the 6144 route
-   thresholds. NEXT (in error order): bf16 gdn_gating (needs Bf16Gdn08Geometry
-   {16,1024,64} + twins of the nine *_35_* launchers keyed on a_weight.n==16),
-   then whatever the protocol surfaces (expected: q4 linear_swiglu, q4_q5
-   gdn/attn input, w8 mtp, q6 embedding/head).
+13. **qwen3.5-0.8b shape admissions (COMPLETE — first generated tokens).**
+   Runtime whitelist + kernel-geometry extensions for the first new engine
+   geometry (hidden 1024, 8q/2kv hd256, GDN 16/16x128, mlp 2x3584, vocab
+   248320), found by the E2E worklist protocol and finished by op-level
+   bisection after the artifact was proven correct with the ported Python
+   reference (tools/reference/qwen3_5_0_8b — coherent text on CPU; includes a
+   sequential-recurrence CPU fallback for GDN prefill since FLA is CUDA-only).
+
+   Shape admissions: gqa_attention 8q/2kv (Gqa08Geometry<8,2,2>, Q-keyed
+   dispatch clones; KV-append reuses Gqa35, GroupSize-independent);
+   GroupSize==4 launch-tuple tables; W8 attn qkgv {5120,1024} decode/simt/mma/
+   splitk (Hidden templated, kTarget08Launchers, W8SplitOutput4<2048,512,2048,
+   512>); W8 gdn qkvz {8192,1024} decode/mma (W8SplitOutput2<6144,2048>,
+   runtime z_offset conv epilogue) with kRoutes08 = {1:Decode, 2+:MmaR64C128}
+   bypassing the 35B-baked splitk conv kernel; bf16 gdn_gating
+   Bf16Gdn08Geometry{16,1024,64} + MMA/SplitK twins (SplitK capped 16), ab
+   parent 32x1024; W8 linear k=1024 head routes (n in {248320, 131072});
+   w8_k2048_decode.cuh gains a trailing K template parameter.
+
+   **Root cause of the token-0 garbage run** (engine ran RC=0 but emitted
+   argmax-0 forever while the Python reference was coherent on the same
+   artifact): two W8 op families admitted the 0.8B shapes but routed them into
+   compile-time 35B/27B-baked kernels —
+   - linear_add: q08 {1024,2048|3584} fell into kK4096Routes, whose
+     SplitKMmaExactT/MediumSplitK/DecodeR16 launchers are W8LinearGeometry
+     <2048,{4096,6144}> instantiations with a 2048-row grid: OOB weight reads
+     plus 1024 rows written PAST the residual tensor on every layer. Fixed
+     with kQ08Routes over the runtime-shaped SIMT/MMA schedules
+     ({1-4 SimtR8C4, 5-128 MmaR32C128, 129+ MmaR64C128}).
+   - linear_swiglu: all three W8 families were baked 12288/6144/2048. The
+     decode pair kernel wrote 6144 rows into the 3584-row output every decode
+     step. Fixed by templating the decode kernel (Intermediate, K), passing
+     runtime dims in the MMA launcher, and twinning the splitk exact-T table
+     for (3584, 1024).
+
+   Op-test coverage added for every 0.8B geometry (all green on sm_120):
+   attn_input_proj q08 x8 T-cases, gdn_input_proj q08 (one KNOWN-MARGINAL
+   sample: T=2 qkv row 6143 token 1 misses the reduction criterion by ~1 bf16
+   ULP under high cancellation — route/tolerance to revisit in the perf pass),
+   gdn_gating_proj kQwen08 routes + norm cases, linear W8 head shapes,
+   linear_add both q08 shapes, linear_swiglu q08 profile (registered in the
+   harness), embedding d=1024, gqa_attention {8,2}, causal_conv1d_silu 6144ch,
+   gated_delta_net 16/16 identity head-map, gated_rmsnorm 16-head.
+
+   E2E: `surogate-engine-cli <0.8b artifact> --greedy` answers exactly
+   ("SUROGATE SERVE OK"; thinking + no-thinking modes both coherent),
+   stop-token finish. Perf untuned (q08 routes favor correctness over
+   measured tiles; decode measured only on a contended GPU so far).

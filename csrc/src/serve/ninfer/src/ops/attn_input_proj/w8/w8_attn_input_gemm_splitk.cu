@@ -26,7 +26,7 @@ using TargetLauncher    = void (*)(const Tensor&, const Weight&, Tensor&, Tensor
 using CompanionLauncher = void (*)(const Tensor&, const Weight&, Tensor&, Tensor&, Tensor&,
                                    cudaStream_t);
 
-template <int ActiveCols, int Rows, class Output>
+template <int ActiveCols, int Rows, int Hidden, class Output>
 void launch_output(const Tensor& x, const Weight& weight, Output output, cudaStream_t stream) {
     constexpr int TileCols = ActiveCols <= 8    ? 8
                              : ActiveCols <= 16 ? 16
@@ -34,7 +34,7 @@ void launch_output(const Tensor& x, const Weight& weight, Output output, cudaStr
                              : ActiveCols <= 32 ? 32
                              : ActiveCols <= 40 ? 40
                                                 : 48;
-    using Geometry         = W8LinearGeometry<Rows, kHidden>;
+    using Geometry         = W8LinearGeometry<Rows, Hidden>;
     using Schedule         = W8SmallTMmaDefaultSchedule<TileCols, ActiveCols>;
     w8_small_t_mma_kernel<Geometry, ActiveCols, Schedule>
         <<<Rows / kRowsPerCta, Schedule::kThreads, 0, stream>>>(
@@ -50,7 +50,7 @@ void launch_target_active_cols(const Tensor& x, const Weight& weight, Tensor& q,
     const TargetOutput output{
         static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
         static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(v.data)};
-    launch_output<ActiveCols, kTargetRows>(x, weight, output, stream);
+    launch_output<ActiveCols, kTargetRows, kHidden>(x, weight, output, stream);
 }
 
 template <int ActiveCols>
@@ -60,7 +60,7 @@ void launch_companion_active_cols(const Tensor& x, const Weight& weight, Tensor&
     const CompanionOutput output{static_cast<__nv_bfloat16*>(q.data),
                                  static_cast<__nv_bfloat16*>(k.data),
                                  static_cast<__nv_bfloat16*>(v.data)};
-    launch_output<ActiveCols, kCompanionRows>(x, weight, output, stream);
+    launch_output<ActiveCols, kCompanionRows, kHidden>(x, weight, output, stream);
 }
 
 template <std::size_t... Offsets>
@@ -75,6 +75,26 @@ constexpr auto make_companion_launchers(std::index_sequence<Offsets...>) {
         &launch_companion_active_cols<kFirstExactCols + static_cast<int>(Offsets)>...};
 }
 
+// surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b fused qkgv.
+template <int ActiveCols>
+void launch_target08_active_cols(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
+                                 Tensor& k, Tensor& v, cudaStream_t stream) {
+    using Output08 = W8SplitOutput4<2048, 512, 2048, 512>;
+    const Output08 output{
+        static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
+        static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(v.data)};
+    launch_output<ActiveCols, 5120, 1024>(x, weight, output, stream);
+}
+
+template <std::size_t... Offsets>
+constexpr auto make_target08_launchers(std::index_sequence<Offsets...>) {
+    return std::array<TargetLauncher, sizeof...(Offsets)>{
+        &launch_target08_active_cols<kFirstExactCols + static_cast<int>(Offsets)>...};
+}
+
+constexpr auto kTarget08Launchers = make_target08_launchers(
+    std::make_index_sequence<kLastTargetExactCols - kFirstExactCols + 1>{});
+
 constexpr auto kTargetLaunchers =
     make_target_launchers(std::make_index_sequence<kLastTargetExactCols - kFirstExactCols + 1>{});
 constexpr auto kCompanionLaunchers = make_companion_launchers(
@@ -84,6 +104,19 @@ template <int TileCols, int KSplits, int NGroups, int MinBlocks>
 void launch_target_medium_cols(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                Tensor& k, Tensor& v, cudaStream_t stream) {
     static_assert((4096 % kRowsPerCta) == 0 && (512 % kRowsPerCta) == 0);
+    // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b fused qkgv.
+    if (weight.k == 1024) {
+        using Output08 = W8SplitOutput4<2048, 512, 2048, 512>;
+        const Output08 output{
+            static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
+            static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(v.data)};
+        w8_rowsplit_medium_t_splitk_kernel<1024, TileCols, KSplits, NGroups, MinBlocks>
+            <<<5120 / kRowsPerCta, KSplits * NGroups * 32, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(x.data),
+                static_cast<const std::uint8_t*>(weight.qdata),
+                static_cast<const std::uint8_t*>(weight.scales), output, x.ne[1]);
+        return;
+    }
     const TargetOutput output{
         static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
         static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(v.data)};
@@ -116,7 +149,9 @@ void w8_attn_input_splitk_mma_launch(const Tensor& x, const Weight& weight, Tens
         throw std::invalid_argument("W8 attention input split-K MMA requires T=2..64");
     }
     if (x.ne[1] <= kLastTargetExactCols) {
-        kTargetLaunchers[x.ne[1] - kFirstExactCols](x, weight, q, gate, k, v, stream);
+        (weight.k == 1024 ? kTarget08Launchers
+                          : kTargetLaunchers)[x.ne[1] - kFirstExactCols](x, weight, q, gate, k, v,
+                                                                        stream);
     } else {
         launch_target_medium_cols<64, 4, 2, 2>(x, weight, q, gate, k, v, stream);
     }

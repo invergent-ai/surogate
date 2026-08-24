@@ -136,6 +136,21 @@ int w8_a16_conformance() {
     failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
                           {2048, 16384, 283U, Comparison::Sampled, false, kN2048K16384});
 
+    // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b head projections
+    // (lm head 248320x1024, draft head 131072x1024) across every A16 route
+    // region boundary: simt_r8_c4 (<=13), mma_r32_c128 (<=128), mma_r64_c128.
+    constexpr std::array kN248320K1024{
+        a16(1), a16(2), a16(13), a16(14), a16(33), a16(128), a16(129),
+    };
+    failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
+                          {248320, 1024, 293U, Comparison::Sampled, false, kN248320K1024});
+
+    constexpr std::array kN131072K1024{
+        a16(1), a16(13), a16(14), a16(128), a16(129),
+    };
+    failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
+                          {131072, 1024, 307U, Comparison::Sampled, false, kN131072K1024});
+
     return failures;
 }
 

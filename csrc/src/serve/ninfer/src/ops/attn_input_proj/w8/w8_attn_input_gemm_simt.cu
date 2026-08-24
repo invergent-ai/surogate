@@ -16,22 +16,22 @@ constexpr int kCols          = 4;
 using TargetOutput           = W8SplitOutput4<4096, 512, 4096, 512>;
 using CompanionOutput        = W8SplitOutput3<4096, 1024, 1024>;
 
-template <bool Full, int Rows, class Output>
+template <bool Full, int Rows, int Hidden, class Output>
 void launch_variant(const Tensor& x, const Weight& weight, Output output, cudaStream_t stream) {
     const dim3 grid(Rows / kRowsPerCta, static_cast<unsigned>(div_up(x.ne[1], kCols)), 1u);
     w8_rowsplit_gemm_simt_kernel<W8RowSplitSimtSchedule, kCols, kRowsPerCta, kStages, Full,
                                  W8Epilogue::Store, Output><<<grid, kRowsPerCta * 32, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
-        static_cast<const std::uint8_t*>(weight.scales), output, Rows, kHidden, x.ne[1], kHidden,
-        kHidden / 1024);
+        static_cast<const std::uint8_t*>(weight.scales), output, Rows, Hidden, x.ne[1], Hidden,
+        Hidden / 1024);
 }
 
-template <int Rows, class Output>
+template <int Rows, int Hidden, class Output>
 void launch_route(const Tensor& x, const Weight& weight, Output output, cudaStream_t stream) {
     if ((x.ne[1] % kCols) == 0) {
-        launch_variant<true, Rows>(x, weight, output, stream);
+        launch_variant<true, Rows, Hidden>(x, weight, output, stream);
     } else {
-        launch_variant<false, Rows>(x, weight, output, stream);
+        launch_variant<false, Rows, Hidden>(x, weight, output, stream);
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -41,10 +41,19 @@ void launch_route(const Tensor& x, const Weight& weight, Output output, cudaStre
 void w8_attn_input_simt_r8_c4_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                      Tensor& k, Tensor& v, cudaStream_t stream) {
     static_assert((4096 % kRowsPerCta) == 0 && (512 % kRowsPerCta) == 0);
+    // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b fused qkgv.
+    if (weight.k == 1024) {
+        using Output08 = W8SplitOutput4<2048, 512, 2048, 512>;
+        const Output08 output{
+            static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
+            static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(v.data)};
+        launch_route<5120, 1024>(x, weight, output, stream);
+        return;
+    }
     const TargetOutput output{
         static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
         static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(v.data)};
-    launch_route<kTargetRows>(x, weight, output, stream);
+    launch_route<kTargetRows, kHidden>(x, weight, output, stream);
 }
 
 void w8_attn_input_simt_r8_c4_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k,
@@ -53,7 +62,7 @@ void w8_attn_input_simt_r8_c4_launch(const Tensor& x, const Weight& weight, Tens
     const CompanionOutput output{static_cast<__nv_bfloat16*>(q.data),
                                  static_cast<__nv_bfloat16*>(k.data),
                                  static_cast<__nv_bfloat16*>(v.data)};
-    launch_route<kCompanionRows>(x, weight, output, stream);
+    launch_route<kCompanionRows, kHidden>(x, weight, output, stream);
 }
 
 } // namespace ninfer::ops::detail
