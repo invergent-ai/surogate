@@ -2,9 +2,14 @@
 
 GGML ``Q8_0`` and the artifact's ``W8G32_F16S`` are the same numeric format:
 signed 8-bit codes with one binary16 scale per 32-value group, ``value =
-code * scale``.  A Q8_0 tensor can therefore be moved into the artifact
-bit-exactly by deinterleaving its blocks into code/scale planes -- no
-dequantization, no requantization, no GPU.
+code * scale``.  ``Q4_0`` (codes = nibble - 8), ``Q5_0`` (codes = q5 - 16)
+and ``IQ4_NL`` (codes = an int8 codebook lookup) share exactly that
+semantics with narrower code sets, so all four move into W8G32 bit-exactly
+by deinterleaving blocks into int8 code / binary16 scale planes -- no
+dequantization, no requantization, no GPU.  (``Q4_1``/``Q5_1`` carry a
+per-group additive min and K-quants a 6-bit sub-scale product, neither of
+which is representable as ``int8 * fp16`` exactly; they stay on the
+dequantize path.)
 
 This module evaluates a target's registered ``TensorRecipe`` expressions as
 *row algebra*: every W8 object the recipes build from 2D sources uses only
@@ -55,8 +60,62 @@ from tools.convert.qwen3_6.common.recipe import (
 )
 
 _REPACK_FORMAT = "W8G32_F16S"
-_BLOCK_BYTES = 34  # fp16 scale + 32 int8 codes
 _GROUP = 32
+
+# IQ4_NL codebook (ggml-common.h kvalues_iq4nl): int8 values, so an IQ4_NL
+# group IS a W8 group after the lookup.
+_IQ4NL_VALUES = np.array(
+    [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113],
+    dtype=np.int8,
+)
+
+
+def _planes_q8_0(blocks: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    scales = blocks[:, :, :2].copy().view(np.float16)[..., 0]
+    codes = blocks[:, :, 2:].view(np.int8)
+    return codes, scales
+
+
+def _planes_q4_0(blocks: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    scales = blocks[:, :, :2].copy().view(np.float16)[..., 0]
+    qs = blocks[:, :, 2:]
+    low = (qs & 0x0F).astype(np.int8) - 8
+    high = (qs >> 4).astype(np.int8) - 8
+    return np.concatenate([low, high], axis=-1), scales
+
+
+def _planes_q5_0(blocks: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    scales = blocks[:, :, :2].copy().view(np.float16)[..., 0]
+    qh = blocks[:, :, 2:6].copy().view(np.uint32)[..., 0]
+    qs = blocks[:, :, 6:]
+    j = np.arange(16)
+    low = (qs & 0x0F).astype(np.int16) | (((qh[..., None] >> j) & 1) << 4).astype(np.int16)
+    high = (qs >> 4).astype(np.int16) | (((qh[..., None] >> (j + 16)) & 1) << 4).astype(
+        np.int16
+    )
+    codes = (np.concatenate([low, high], axis=-1) - 16).astype(np.int8)
+    return codes, scales
+
+
+def _planes_iq4_nl(blocks: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    scales = blocks[:, :, :2].copy().view(np.float16)[..., 0]
+    qs = blocks[:, :, 2:]
+    codes = np.concatenate(
+        [_IQ4NL_VALUES[qs & 0x0F], _IQ4NL_VALUES[qs >> 4]], axis=-1
+    )
+    return codes, scales
+
+
+# GGML type -> (bytes per 32-value block, plane decoder). Every decoder
+# returns (codes int8 [n, groups, 32], scales fp16 [n, groups]) with values
+# in logical order; each is pinned bit-exact against gguf-py dequantize in
+# tests/serve/test_gguf_repack.py.
+REPACKABLE_TYPES = {
+    "Q8_0": (34, _planes_q8_0),
+    "Q4_0": (18, _planes_q4_0),
+    "Q5_0": (22, _planes_q5_0),
+    "IQ4_NL": (18, _planes_iq4_nl),
+}
 _SOURCE_STRIDE = 1 << 40  # global row id = source_index * stride + row
 
 
@@ -98,8 +157,12 @@ class GgufRepackSource:
         if not self.gguf_path.is_file():
             raise RepackError(f"repack map points at a missing GGUF: {self.gguf_path}")
         for hf_name, entry in sources.items():
-            if not {"name", "rows", "k", "offset"} <= set(entry):
+            if not {"name", "rows", "k", "offset", "type"} <= set(entry):
                 raise RepackError(f"{hf_name}: repack map entry is missing fields")
+            if entry["type"] not in REPACKABLE_TYPES:
+                raise RepackError(
+                    f"{hf_name}: GGUF type {entry['type']!r} is not exactly repackable"
+                )
         self._file = None
         self._planes: dict[str, tuple[np.ndarray, np.ndarray]] = {}
 
@@ -124,16 +187,18 @@ class GgufRepackSource:
         n, k = self.source_shape(hf_name)
         if k % _GROUP != 0:
             raise RepackError(f"{hf_name}: k={k} is not a multiple of {_GROUP}")
+        block_bytes, decoder = REPACKABLE_TYPES[entry["type"]]
         offset = int(entry["offset"])
-        nbytes = n * (k // _GROUP) * _BLOCK_BYTES
+        nbytes = n * (k // _GROUP) * block_bytes
         data = self._memmap()
         if offset < 0 or offset + nbytes > data.shape[0]:
-            raise RepackError(f"{hf_name}: Q8_0 payload is outside the GGUF file")
+            raise RepackError(f"{hf_name}: quantized payload is outside the GGUF file")
         raw = np.asarray(data[offset : offset + nbytes]).reshape(
-            n, k // _GROUP, _BLOCK_BYTES
+            n, k // _GROUP, block_bytes
         )
-        scales = raw[:, :, :2].copy().view(np.float16).reshape(n, k // _GROUP)
-        codes = raw[:, :, 2:].view(np.int8)
+        codes, scales = decoder(raw)
+        codes = np.ascontiguousarray(codes)
+        scales = np.ascontiguousarray(scales).reshape(n, k // _GROUP)
         self._planes[hf_name] = (codes, scales)
         return codes, scales
 

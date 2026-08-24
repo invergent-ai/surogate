@@ -194,9 +194,17 @@ def _repack_planner(root: Path):
         import sys as _sys
         if str(root) not in _sys.path:
             _sys.path.insert(0, str(root))
-        from tools.convert.common.gguf_repack import GgufRepackSource
+        from tools.convert.common.gguf_repack import (
+            REPACKABLE_TYPES,
+            GgufRepackSource,
+        )
         from tools.convert.qwen3_5_0_8b import inventory, recipe
 
+        candidates = {
+            hf: entry
+            for hf, entry in candidates.items()
+            if entry["type"] in REPACKABLE_TYPES
+        }
         source = GgufRepackSource.from_sources(gguf_path, candidates)
         planned = source.plan(recipe.RECIPES_BY_NAME, inventory.TENSOR_SPECS)
         keep: set[str] = set()

@@ -42,36 +42,78 @@ from tools.convert.qwen3_6.common.inventory import TensorSpec  # noqa: E402
 K = 128  # four 32-value groups per row (k128 layout needs k % 128 == 0)
 
 
+# IQ4_NL codebook (ggml-common.h); gguf-py cannot quantize IQ4_NL, so the
+# fixture packs valid blocks by hand: fp16 d + 16 nibble-index bytes.
+_IQ4NL = np.array(
+    [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113],
+    dtype=np.int8,
+)
+
+
+def _pack_iq4_nl(rows):
+    rng = np.random.default_rng(rows * 7 + 1)
+    groups = K // 32
+    d = rng.uniform(0.001, 0.01, size=(rows, groups)).astype(np.float16)
+    idx = rng.integers(0, 16, size=(rows, groups, 32), dtype=np.uint8)
+    blocks = np.zeros((rows, groups, 18), dtype=np.uint8)
+    blocks[:, :, :2] = d.view(np.uint8).reshape(rows, groups, 2)
+    blocks[:, :, 2:] = idx[:, :, :16] | (idx[:, :, 16:] << 4)
+    reference = (
+        _IQ4NL[idx].astype(np.float32) * d.astype(np.float32)[:, :, None]
+    ).reshape(rows, K)
+    return blocks.reshape(rows, -1), reference
+
+
 def _write_q8_gguf(path, tensors):
     writer = GGUFWriter(str(path), "test-arch")
-    for name, rows in tensors.items():
+    iq4_reference = {}
+    for name, (rows, ttype) in tensors.items():
+        if ttype == GGMLQuantizationType.IQ4_NL:
+            payload, iq4_reference[name] = _pack_iq4_nl(rows)
+            writer.add_tensor(name, payload, raw_dtype=ttype)
+            continue
         rng = np.random.default_rng(hash(name) % (2**32))
         data = rng.standard_normal((rows, K), dtype=np.float32)
-        writer.add_tensor(name, quantize(data, GGMLQuantizationType.Q8_0),
-                          raw_dtype=GGMLQuantizationType.Q8_0)
+        writer.add_tensor(name, quantize(data, ttype), raw_dtype=ttype)
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file()
     writer.close()
+    return iq4_reference
+
+
+_FIXTURE_TENSORS = {
+    "g.a": (8, GGMLQuantizationType.Q8_0),
+    "g.b": (4, GGMLQuantizationType.Q8_0),
+    "g.q40": (6, GGMLQuantizationType.Q4_0),
+    "g.q50": (6, GGMLQuantizationType.Q5_0),
+    "g.iq4": (6, GGMLQuantizationType.IQ4_NL),
+}
+_HF_NAMES = {"g.a": "hf.a", "g.b": "hf.b", "g.q40": "hf.q40",
+             "g.q50": "hf.q50", "g.iq4": "hf.iq4"}
 
 
 @pytest.fixture()
 def q8_source(tmp_path):
     path = tmp_path / "mini.gguf"
-    _write_q8_gguf(path, {"g.a": 8, "g.b": 4})
+    iq4_reference = _write_q8_gguf(path, _FIXTURE_TENSORS)
     reader = GGUFReader(str(path), "r")
     candidates = {}
     reference = {}
     for tensor in reader.tensors:
-        hf = {"g.a": "hf.a", "g.b": "hf.b"}[tensor.name]
+        hf = _HF_NAMES[tensor.name]
         k, rows = (int(d) for d in tensor.shape)
         candidates[hf] = {
             "name": tensor.name,
             "rows": rows,
             "k": k,
             "offset": int(tensor.data_offset),
+            "type": tensor.tensor_type.name,
         }
-        reference[hf] = dequantize(tensor.data, tensor.tensor_type).reshape(rows, k)
+        if tensor.tensor_type == GGMLQuantizationType.IQ4_NL:
+            reference[hf] = iq4_reference[tensor.name]
+        else:
+            reference[hf] = dequantize(tensor.data, tensor.tensor_type).reshape(rows, k)
     del reader
     return path, candidates, reference
 
@@ -138,6 +180,17 @@ def test_plan_excludes_non_w8_and_unmapped(q8_source):
         TensorSpec("obj/stranger", (4, K), "W8G32_F16S", "row-split-k128-v1"),
     )
     assert source.plan(recipes, specs) == ("obj/w8",)
+
+
+def test_narrow_formats_are_bit_exact(q8_source):
+    # Q4_0 / Q5_0 / IQ4_NL codes embed exactly in W8G32 int8 codes.
+    path, candidates, reference = q8_source
+    source = GgufRepackSource.from_sources(path, candidates)
+    for hf in ("hf.q40", "hf.q50", "hf.iq4"):
+        rows = candidates[hf]["rows"]
+        spec = TensorSpec(f"obj/{hf}", (rows, K), "W8G32_F16S", "row-split-k128-v1")
+        recipe = TensorRecipe(f"obj/{hf}", SourceTensor(hf, (rows, K)))
+        assert np.array_equal(_decoded(source, spec, recipe), reference[hf]), hf
 
 
 def test_map_roundtrip_through_json(q8_source, tmp_path):

@@ -97,6 +97,18 @@
    identical. Bit-exactness is pinned by
    tests/serve/test_gguf_repack.py against gguf-py's own dequantize.
 
+   The exact set extends past Q8_0: **Q4_0** (codes = nibble - 8), **Q5_0**
+   (codes = q5 - 16) and **IQ4_NL** (codes = ggml's int8 codebook lookup)
+   all share the ``int8 code x fp16 group-32 scale`` semantics, so their
+   tensors ALSO move into W8G32 bit-exactly (REPACKABLE_TYPES plane
+   decoders; validated against every Q4_0 tensor of a real mixed-type
+   GGUF, 129/129 exact). Q4_1/Q5_1 (additive per-group min) and K-quants
+   (6-bit sub-scale products not representable in fp16) stay on the
+   dequantize path — the per-tensor candidate planner mixes both paths in
+   one file. Community GGUFs that strip the MTP (nextn) block are rejected
+   with an actionable error: the artifact inventory is exact and the
+   engine's speculative decode requires the block.
+
 ### sm_89 port status
 
 With patches 5–10 the **entire tree compiles and links for sm_89**

@@ -189,19 +189,29 @@ def build_hf_dir_from_gguf(
         )
         echo(f"surogate serve: qwen35 inverse transforms active "
              f"(layers {n_main}+{n_mtp} mtp, GDN {geom.num_k_heads}k/{geom.num_v_heads}v)")
+        if n_mtp == 0:
+            raise SystemExit(
+                "surogate serve: this GGUF was exported WITHOUT the model's MTP "
+                "(nextn) block, which the engine's speculative decode requires "
+                "(the artifact inventory is exact). Use a full export that keeps "
+                "nextn_predict_layers — e.g. the official Q8_0 conversion — or "
+                "re-export with llama.cpp keeping the nextn tensors."
+            )
     name_map = _hf_name_map(arch, n_layers)
 
     # Pre-walk: collect candidates, let the converter's recipes pick the
     # subset it will repack; everything else takes the dequant path below.
     repack_sources: dict[str, str] = {}
     if repack_planner is not None:
+        # Candidates carry every 2D row-identity tensor with its GGUF type;
+        # the planner (backed by the converter's repack module) keeps only the
+        # types that move into the artifact profile bit-exactly.
         candidates: dict[str, dict] = {}
         for tensor in reader.tensors:
             hf = (fam.hf_name_for(tensor.name, n_main) if qwen35_family
                   else name_map.get(tensor.name))
             if (
                 hf is not None
-                and tensor.type_name == "Q8_0"
                 and len(tensor.shape) == 2
                 and (not qwen35_family or fam.inverse_is_row_identity(hf, geom))
             ):
@@ -211,6 +221,7 @@ def build_hf_dir_from_gguf(
                     "rows": int(tensor.shape[1]),
                     "k": int(tensor.shape[0]),
                     "offset": int(tensor.data_offset),
+                    "type": tensor.type_name,
                 }
         repack_sources = repack_planner(gguf_path, candidates)
         if set(repack_sources) - set(candidates):
@@ -297,7 +308,9 @@ def gguf_target_key(gguf_path: Path, reader=None):
     layers = int(s["num_hidden_layers"] or 0)
     if arch in ("qwen35", "qwen3_6", "qwen3_5") and hidden == 5120 and layers >= 60:
         return "qwen3_6_27b"
-    if arch in ("qwen35", "qwen3_5") and hidden == 1024 and layers == 25:
+    if arch in ("qwen35", "qwen3_5") and hidden == 1024 and layers in (24, 25):
+        # 24 = MTP (nextn) block stripped by the exporter; detected below with
+        # an actionable error rather than an unregistered-geometry message.
         return "qwen3_5_0_8b"
     if arch in ("qwen38", "qwen3_8") and hidden == 5120:
         return "qwen3_8_27b"
