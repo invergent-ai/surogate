@@ -40,6 +40,8 @@ ninfer_add_op_bench(ninfer_gdn_input_proj_conv_snapshot_bench
   SOURCES ops/gdn_input_proj_conv_snapshot_bench.cu)
 ninfer_add_op_bench(ninfer_attn_input_proj_bench SOURCES ops/attn_input_proj_bench.cu)
 ninfer_add_op_bench(ninfer_w8_linear_swiglu_bench SOURCES ops/w8_linear_swiglu_bench.cu)
+# surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b W8 route sweep.
+ninfer_add_op_bench(ninfer_q08_route_sweep_bench SOURCES ops/q08_route_sweep_bench.cu)
 ninfer_add_op_bench(ninfer_nvfp4_linear_swiglu_bench SOURCES ops/nvfp4_linear_swiglu_bench.cu)
 ninfer_add_op_bench(ninfer_fp8_linear_swiglu_bench SOURCES ops/fp8_linear_swiglu_bench.cu)
 ninfer_add_op_bench(ninfer_q4_linear_swiglu_bench SOURCES ops/q4_linear_swiglu_bench.cu)

@@ -47,11 +47,30 @@ activation quantization) on the same vLLM build — the equal-width
   (`surogate.grpo.inference.patches:transformers_v5_compat`); a
   `pip install -e . --no-deps` refresh makes it permanent.
 
+## Post-tuning update (same session)
+
+`bench/ops/q08_route_sweep_bench` (13 tile schedules x 5 GEMM shapes x 4
+token counts, direct kernel instantiation) found the loss: with only 1024
+output rows, linear_add's r64c128 tile underfills the GPU. Measured
+winners applied (linear_add {129-1024: r32c128, 1025+: r48c128}; swiglu
+449-512: r128c80 for the q08 shape):
+
+| prompt | engine before | engine after | vLLM bf16 | vLLM FP8 |
+|-------:|--------------:|-------------:|----------:|---------:|
+|    472 |        21,649 |   **26,319** |    22,309 |   20,164 |
+|    962 |        35,420 |   **37,303** |    36,654 |   32,819 |
+|   1912 |        41,128 |       42,626 |    52,381 | **60,667** |
+
+Engine now leads BOTH vLLM columns on prefill through ~1000 tokens and on
+decode everywhere. The remaining 1912-class gap is structural: the W8
+kernels dequantize to BF16 MMA (~90 TF/s achieved, candidates within 10%
+of each other) while vLLM FP8 runs FP8 tensor cores at ~2x the mma rate —
+closing it means a W8->FP8-MMA kernel path, a future project.
+
 ## Follow-ups
 
-1. q08 prefill route tuning targeting the >=472-token region (measured
-   sweep next time a GPU is idle); decode overhead hunt (launch counts,
-   graph coverage).
+1. Long-prefill (>=1200 tok) W8->FP8-MMA kernel path (structural ~40%);
+   decode overhead hunt (launch counts, graph coverage).
 2. Fair-width rerun: DONE (FP8 column above).
 3. MTP speculative decode on 0.8B (engine-only advantage; blocked on the
    speculative-replay op family walk, PATCHES #15) — 27B shows 3.45

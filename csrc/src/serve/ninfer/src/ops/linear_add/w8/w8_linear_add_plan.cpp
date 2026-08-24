@@ -66,10 +66,16 @@ constexpr std::array<RouteSpec, 33> kK6144Routes{{
 // ({1024,2048} and {1024,3584}). The SplitKMmaExactT / MediumSplitK / DecodeR16
 // launchers are compile-time (2048 x {4096,6144}) instantiations, so the 0.8B
 // shapes route exclusively over the runtime-shaped SIMT and MMA schedules.
-constexpr std::array<RouteSpec, 3> kQ08Routes{{
+// Measured on an idle RTX 5090 (bench/ops/q08_route_sweep_bench, T in
+// {472, 888, 1024, 1912}): with only 1024 output rows the r64/r128 row
+// tiles underfill the GPU — r32c128 wins through ~1024 tokens (52->84
+// TF/s vs 24->54 on r64c128) and r48c128 takes over at large T
+// (T=1912: 102.7us vs 128.0us on the k=2048 shape).
+constexpr std::array<RouteSpec, 4> kQ08Routes{{
     {1, 4, W8LinearAddScheduleId::SimtR8C4},
     {5, 128, W8LinearAddScheduleId::MmaR32C128},
-    {129, kAnyCols, W8LinearAddScheduleId::MmaR64C128},
+    {129, 1024, W8LinearAddScheduleId::MmaR32C128},
+    {1025, kAnyCols, W8LinearAddScheduleId::MmaR48C128},
 }};
 
 template <std::size_t N>

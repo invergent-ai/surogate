@@ -49,6 +49,20 @@ constexpr bool catalog_is_closed() {
 
 static_assert(catalog_is_closed(), "W8 LinearSwiGLU routes must be exact and closed");
 
+// surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b (7168 x 1024) keeps
+// the 35B catalog except the 449-512 region, where the measured winner on
+// an idle RTX 5090 is MmaR128C80 (92.9us vs 107.1us on MmaR64C128 at
+// T=472; bench/ops/q08_route_sweep_bench).
+constexpr std::array<RouteSpec, 18> kQ08Routes = [] {
+    std::array<RouteSpec, 18> routes = kRoutes;
+    for (RouteSpec& route : routes) {
+        if (route.first == 449 && route.last == 512) {
+            route.schedule = W8LinearSwiGluScheduleId::MmaR128C80;
+        }
+    }
+    return routes;
+}();
+
 bool supported_shape(const W8LinearSwiGluProblem& problem) noexcept {
     // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b mlp {7168->3584, k=1024}.
     const bool base = problem.gate_up_rows == 12288 && problem.output_rows == 6144 &&
@@ -101,7 +115,8 @@ W8LinearSwiGluPlan w8_linear_swiglu_resolve_plan(const W8LinearSwiGluProblem& pr
         throw std::invalid_argument(
             "W8 LinearSwiGLU: exact problem or column count is not admitted");
     }
-    for (const RouteSpec& route : kRoutes) {
+    const auto& routes = problem.k == 1024 ? kQ08Routes : kRoutes;
+    for (const RouteSpec& route : routes) {
         if (problem.cols >= route.first && problem.cols <= route.last) { return {route.schedule}; }
     }
     throw std::logic_error("W8 LinearSwiGLU: admitted problem has no route");
