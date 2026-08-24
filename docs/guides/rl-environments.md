@@ -697,7 +697,7 @@ tags = ["single-turn", "math", "train", "eval"]
 version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = [
-    "verifiers>=0.1.8",
+    "verifiers>=0.3.0",
 ]
 
 [build-system]
@@ -717,7 +717,7 @@ Key `pyproject.toml` sections:
 - **`[project]`** — Package name (used by `surogate vf-eval`), description, version, and dependencies.
 - **`[build-system]`** — Hatchling is used as the build backend for the Environments Hub.
 - **`[tool.hatch.build]`** — Lists files to include in the package. Always include `pyproject.toml` alongside your environment file to ensure that environment metadata is available when the environment is installed. Add any additional source files here.
-- **`[tool.verifiers.eval]`** — Default parameters for `psurogate vf-eval` when flags aren't provided.
+- **`[tool.verifiers.eval]`** — Default parameters for `surogate vf-eval` when flags aren't provided.
 
 ### Managing Dependencies
 
@@ -725,7 +725,7 @@ All packages your environment needs must be declared in the `dependencies` array
 
 ```toml
 dependencies = [
-    "verifiers>=0.1.8",
+    "verifiers>=0.3.0",
     "chromadb",
     "nltk>=3.9.2",
 ]
@@ -767,7 +767,7 @@ combined = vf.EnvGroup(
 )
 ```
 
-The group concatenates all sub-environment datasets, tagging each row with a `task` column that routes rollouts to the appropriate environment for generation and scoring. Metrics from all environments are tracked together. 
+The group concatenates all sub-environment datasets, tagging each row's `info["env_id"]` field with the sub-environment name; this route directs rollouts to the appropriate environment for generation and scoring, and is carried through to each `RolloutOutput`'s `info`. Metrics from all environments are tracked together. 
 
 ## Integrations and Experimental Environments
 

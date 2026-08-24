@@ -13,6 +13,7 @@ from verifiers.utils.save_utils import make_serializable
 from surogate.core.config.grpo_orch_config import GRPOBufferConfig
 from statistics import pstdev
 
+from surogate.grpo.orchestrator.vf_utils import get_task
 from surogate.grpo.utils.utils import format_num, mean, mean_normalize
 from surogate.utils.logger import get_logger
 
@@ -40,16 +41,24 @@ class Buffer:
         # Basic assertions
         assert "example_id" in self.dataset.column_names, "The dataset must contain a `example_id` column."
         assert "prompt" in self.dataset.column_names, "The dataset must contain a `prompt` column."
-        assert "task" in self.dataset.column_names, "The dataset must contain a `task` column."
+        assert "info" in self.dataset.column_names, (
+            "The dataset must contain an `info` column with EnvGroup routing (info['env_id'])."
+        )
         assert len(self.dataset) > 0, "The dataset must contain at least one example."
         assert isinstance(self.dataset["example_id"][0], int), "The `example_id` column must be of type int."
         assert len(set(self.dataset["example_id"])) == len(self.dataset), "The `example_id` column must be unique."
-        assert set(self.dataset["task"]) == set(self.env_names), "The `task` column must contain all environment names."
 
         # Initialize example buffer (env_name -> (example_id -> example))
         self.example_buffer: dict[str, dict[int, dict]] = defaultdict(dict)
+        dataset_tasks = set()
         for example in map(partial(cast, dict), self.dataset):
-            self.example_buffer[example["task"]][example["example_id"]] = example
+            task = get_task(example)
+            assert task is not None, "Every dataset example must carry `info['env_id']` routing."
+            dataset_tasks.add(task)
+            self.example_buffer[task][example["example_id"]] = example
+        assert dataset_tasks == set(self.env_names), (
+            "The dataset's `info['env_id']` routes must match the environment names."
+        )
         assert len(self.example_buffer) == len(self.env_names)
         logger.debug(
             f"Initialized buffer with {format_num(len(self.dataset), precision=0)} example(s) in {len(self.env_names)} environment(s)"
@@ -323,7 +332,7 @@ class Buffer:
             if any(saved_rollout_buffer):
                 # Extend rollout buffer, but only include rollouts for which the example still exists in the example buffer
                 valid_saved_rollouts = [
-                    rollout for rollout in saved_rollout_buffer if rollout["task"] in self.env_names
+                    rollout for rollout in saved_rollout_buffer if get_task(rollout) in self.env_names
                 ]
                 self.rollout_buffer.extend(valid_saved_rollouts)
                 logger.debug(f"Loaded {len(valid_saved_rollouts)} rollout(s) from checkpoint.")
@@ -351,7 +360,7 @@ class Buffer:
         num_moved = min(num_moved, len(examples))
         for _ in range(num_moved):
             example = random.choice(examples)
-            env_name = example["task"]
+            env_name = get_task(example)
             example_id = example["example_id"]
             examples.remove(example)
             self.example_buffer[env_name][example_id] = example
@@ -395,7 +404,7 @@ class Buffer:
             if prob <= 0 or self.example_buffer.get(env_name):
                 continue
             pools = (self.easy_examples, self.hard_examples, self.flat_examples)
-            starved = [e for pool in pools for e in pool if e["task"] == env_name]
+            starved = [e for pool in pools for e in pool if get_task(e) == env_name]
             for example in starved:
                 for pool in pools:
                     if example in pool:
@@ -525,7 +534,7 @@ class Buffer:
         for example_id, example_rollouts in rollouts_by_example.items():
             rewards = [r["reward"] for r in example_rollouts]
             avg_reward = mean(rewards)
-            env_name = example_rollouts[0]["task"]
+            env_name = get_task(example_rollouts[0])
 
             ema_key = f"{env_name}:{example_id}"
             prev_ema = self.example_reward_ema.get(ema_key)

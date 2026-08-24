@@ -5,7 +5,7 @@ tags = ["placeholder-tag", "train", "eval"]
 version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = [
-    "verifiers>=0.1.11",
+    "verifiers>=0.3.0",
 ]
 
 [build-system]

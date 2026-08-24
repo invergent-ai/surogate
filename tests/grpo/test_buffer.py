@@ -9,10 +9,11 @@ from surogate.utils.dict import DictDefault
 
 
 def _dataset() -> Dataset:
+    # verifiers >= 0.2: EnvGroup routes via info["env_id"] instead of a `task` column.
     return Dataset.from_list(
         [
-            {"example_id": 0, "task": "env_a", "prompt": [{"role": "user", "content": "a"}]},
-            {"example_id": 1, "task": "env_a", "prompt": [{"role": "user", "content": "b"}]},
+            {"example_id": 0, "info": {"env_id": "env_a"}, "prompt": [{"role": "user", "content": "a"}]},
+            {"example_id": 1, "info": {"env_id": "env_a"}, "prompt": [{"role": "user", "content": "b"}]},
         ]
     )
 
@@ -20,7 +21,7 @@ def _dataset() -> Dataset:
 def _rollout(example_id: int, reward: float) -> dict:
     return {
         "example_id": example_id,
-        "task": "env_a",
+        "info": {"env_id": "env_a"},
         "reward": reward,
         "trajectory": [{"role": "assistant", "content": "{}"}],
         "error": None,

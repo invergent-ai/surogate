@@ -9,9 +9,8 @@ from threading import Event, Thread
 from typing import Any
 
 import verifiers as vf
-from verifiers.envs.environment import EnvClient
-from verifiers.utils.worker_utils import get_free_port_pair
-from verifiers.workers import ZMQEnvClient, ZMQEnvServer
+from verifiers.serve import EnvClient, ZMQEnvClient, ZMQEnvServer
+from verifiers.utils.serve_utils import get_free_port
 
 from surogate.grpo.utils.logger import InterceptHandler, ProgressTracker
 
@@ -149,16 +148,18 @@ def spawn_env_server(
     log_prefix: str | None = None,
     # logging configs
     log_level: str | None = None,
-    log_file: str | None = None,
-    log_file_level: str | None = None,
+    log_dir: str | None = None,
     json_logging: bool = False,
 ) -> tuple[str, mp.Process]:
     """
     Starts a ZMQEnvServer process in a subprocess.
 
-    Mirrors vf.Environment.start_server().
+    Mirrors vf.Environment.start_server(). The server writes its own file logs
+    under `log_dir` (env_server.log plus one env_worker_N.log per worker);
+    console output is disabled since records are forwarded to the parent via
+    `log_queue` instead.
     """
-    address = address or f"tcp://127.0.0.1:{get_free_port_pair()}"
+    address = address or f"tcp://127.0.0.1:{get_free_port()}"
     # Use spawn to avoid inheriting file descriptors (e.g. sockets) from
     # the parent process, which has caused hangs when multiple env server
     # subprocesses share the same fds.
@@ -171,11 +172,14 @@ def spawn_env_server(
             env_id,
             env_args,
             extra_env_kwargs,
-            log_level,
-            log_file,
-            log_file_level,
         ),
-        kwargs=dict(address=address, json_logging=json_logging),
+        kwargs=dict(
+            address=address,
+            log_level=log_level,
+            log_dir=log_dir,
+            console_logging=False,
+            json_logging=json_logging,
+        ),
         daemon=False,  # cannot run daemon because env server uses subprocesses
     )
     process.start()
@@ -395,9 +399,56 @@ def get_completion_len(output: vf.RolloutOutput) -> int:
     return get_seq_len(output) - get_prompt_len(output)
 
 
+def get_task(example_or_rollout: dict) -> str | None:
+    """Return the environment name a dataset example or RolloutOutput belongs to.
+
+    verifiers >= 0.2 dropped the top-level `task` column; EnvGroup routes via
+    `info["env_id"]` instead (a string, or a list for nested groups — the head
+    names the top-level sub-environment). Falls back to the legacy `task` key so
+    pre-upgrade WAL/checkpoint entries still resolve.
+    """
+    info = example_or_rollout.get("info")
+    if isinstance(info, dict):
+        route = info.get("env_id")
+        if isinstance(route, str):
+            return route
+        if isinstance(route, (list, tuple)) and route:
+            return str(route[0])
+    task = example_or_rollout.get("task")
+    return task if isinstance(task, str) else None
+
+
+def _span_ms(timing: dict | None, span_name: str) -> float:
+    """Extract a phase duration in milliseconds from a serialized RolloutTiming.
+
+    verifiers >= 0.2 replaced the flat `{generation_ms, scoring_ms, total_ms}`
+    timing dict with nested TimeSpans (seconds). Handles both shapes.
+    """
+    if not isinstance(timing, dict):
+        return 0.0
+    legacy = timing.get(f"{span_name}_ms")
+    if isinstance(legacy, (int, float)):
+        return float(legacy)
+    span = timing.get(span_name)
+    if isinstance(span, dict):
+        duration = span.get("duration")
+        if not isinstance(duration, (int, float)):
+            duration = max(float(span.get("end", 0.0)) - float(span.get("start", 0.0)), 0.0)
+        return float(duration) * 1000.0
+    return 0.0
+
+
+def get_generation_ms(output: vf.RolloutOutput) -> float:
+    return _span_ms(output.get("timing"), "generation")
+
+
+def get_scoring_ms(output: vf.RolloutOutput) -> float:
+    return _span_ms(output.get("timing"), "scoring")
+
+
 def task_uses_group_scoring(env: vf.Environment, task_name: str) -> bool:
     """Check if a task's rubric contains any group-level reward functions."""
-    rubric = env.get_env_for_task(task_name).rubric
+    rubric = env.get_env_for_name(task_name).rubric
     return any(rubric._is_group_func(func) for func in rubric._get_reward_funcs())
 
 

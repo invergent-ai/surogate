@@ -41,7 +41,7 @@ dependencies = [
     "matplotlib",
     "qwen-vl-utils==0.0.14",
     "ray>=2.5.0",
-    "verifiers==0.1.11",
+    "verifiers==0.3.0",
     "wandb==0.25.1",
     "jaxtyping",
     "aiolimiter",

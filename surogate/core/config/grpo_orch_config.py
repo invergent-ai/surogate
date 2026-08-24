@@ -412,7 +412,7 @@ class GRPOBufferConfig:
     normal_pool_min_examples: int | None = 0
     recycle_easy_fraction: float | None = 0.0
     recycle_hard_fraction: float | None = 0.0
-    hash_keys: list[str] | None = field(default_factory=lambda: ["task", "prompt"])
+    hash_keys: list[str] | None = field(default_factory=lambda: ["info", "prompt"])
     sample_without_replacement: bool = False
     # Frontier-biased sampling. The frontier signal is the group's reward
     # DISPERSION, not its mean (2026-08-22, measured): GRPO normalizes
@@ -458,7 +458,6 @@ class GRPOBufferConfig:
         self.normal_pool_min_examples = cfg.get("normal_pool_min_examples", self.normal_pool_min_examples)
         self.recycle_easy_fraction = cfg.get("recycle_easy_fraction", self.recycle_easy_fraction)
         self.recycle_hard_fraction = cfg.get("recycle_hard_fraction", self.recycle_hard_fraction)
-        self.hash_keys = cfg.get("hash_keys", ["task", "prompt"])
         self.midband_sampling_boost = cfg.get("midband_sampling_boost", self.midband_sampling_boost)
         self.gradient_std_high = cfg.get("gradient_std_high", self.gradient_std_high)
         self.gradient_std_low = cfg.get("gradient_std_low", self.gradient_std_low)
@@ -468,6 +467,7 @@ class GRPOBufferConfig:
         self.vtc_short_prompt_max_chars = cfg.get(
             "vtc_short_prompt_max_chars", self.vtc_short_prompt_max_chars)
         self.vtc_rescue_window = cfg.get("vtc_rescue_window", self.vtc_rescue_window)
+        self.hash_keys = cfg.get("hash_keys", ["info", "prompt"])
         self.sample_without_replacement = cfg.get(
             "sample_without_replacement", self.sample_without_replacement
         )
