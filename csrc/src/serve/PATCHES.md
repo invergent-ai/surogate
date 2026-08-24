@@ -184,6 +184,34 @@
    hardcoded-path frontend test) — the parent-row keying is regression-clean
    across the 27B/35B/0.8b/2b families.
 
+17. **W8A8-int IMMA prefill path (design proven; productization queued).**
+   The remaining vLLM lead is >=1k-token prefill, and the ceiling is
+   structural: the W8 A16 kernels dequantize int8 codes to BF16 in-kernel
+   and top out at ~90-100 TF/s across all 13 measured tile schedules
+   (bench/ops/q08_route_sweep_bench). Design decision, made against the
+   alternatives: FP8 (e4m3) weights would DEGRADE accuracy (3-bit
+   mantissa cannot hold int8 codes); an FP16-MMA pipeline dies on
+   activation conversion (BN > BM, the x-side convert costs more than the
+   weight dequant saved); **int8 tensor cores** keep W8 codes bit-exact
+   (they ARE int8), run at 2x the BF16 MMA rate, and mma.m16n8k32
+   consumes exactly one 32-value quantization group per instruction — the
+   per-group weight scale applies on the int32 group result before the
+   FP32 accumulate, and the per-token activation scale at the epilogue.
+   Activations quantize to int8 per token (the standard W8A8 recipe); the
+   O(T*K) pre-pass amortizes at prefill token counts, so the route is
+   large-T only — decode stays A16 where the engine already leads.
+
+   Evidence (bench/ops/w8a8_imma_probe_bench, idle 5090): a deliberately
+   naive pipeline (2-stage cp.async, BM64xBN64xBK64, no swizzle) reaches
+   119-124 TF/s at T>=1024 on the four dominant GEMM shapes of both small
+   targets — ABOVE the tuned BF16 ceiling — with the int32 group math
+   exact against a CPU oracle (2-3e-3 rel = bf16 output rounding).
+   Productization queue: marlin-class staging (deeper stages, swizzle,
+   wider tiles; 160-200 TF/s plausible), the per-token act-quant kernel,
+   split-output/swiglu/residual epilogue twins, LinearPolicy::AllowA8
+   routes at T>=~512, and op tests. Rough end-to-end: naive-rate kernels
+   put 0.8b 1912-prefill near vLLM-FP8 parity; tuned-rate wins it.
+
 ### sm_89 port status
 
 With patches 5–10 the **entire tree compiles and links for sm_89**

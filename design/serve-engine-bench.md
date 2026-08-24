@@ -108,3 +108,23 @@ end-to-end neutral — that op is only ~7% of the 2B's layer FLOPs).
 - First 2B tokens: exact instruction following on the FIRST E2E run — the
   parent-row-keyed kernel sharing meant zero kernel debugging for the
   second target.
+
+
+# W8A8-int IMMA probe (the long-prefill fix, design proven)
+
+`bench/ops/w8a8_imma_probe_bench` on the idle 5090 — a naive int8-tensor-core
+pipeline (weights = W8 codes bit-exact, activations int8 per token,
+per-group rescale on the m16n8k32 int32 result):
+
+| shape | T=472 | T=1024 | T=1912 |
+|---|---:|---:|---:|
+| gate_up 12288x2048 | 102 TF/s | 119 | **124** |
+| qkvz 8192x2048 | 95 | 115 | **122** |
+| gate_up 7168x1024 | 91 | 113 | **120** |
+| qkvz 8192x1024 | 92 | 112 | **120** |
+
+The tuned BF16 A16 family ceiling is ~90-100 TF/s on the same shapes; the
+naive IMMA probe already clears it, and marlin-class staging has 160-200 in
+reach. Numerics: int32 group math exact vs CPU oracle (2-3e-3 rel = bf16
+output rounding); activation-quant error is the standard per-token-int8
+recipe, applied at prefill T only. Productization queued (PATCHES #17).
