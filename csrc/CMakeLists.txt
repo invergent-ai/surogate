@@ -99,6 +99,8 @@ option(ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer
 option(SUROGATE_BUILD_SERVE "Expose the serve engine targets" ON)
 option(SUROGATE_SERVE_TESTS "Expose the serve engine test targets" OFF)
 option(SUROGATE_SERVE_BENCH "Expose the serve engine bench targets" OFF)
+set(SUROGATE_SERVE_CUDA_ARCHS "120a" CACHE STRING
+    "CUDA architectures for the serve engine targets (RTX consumer set)")
 
 FetchContent_Declare(
         json
@@ -773,8 +775,12 @@ function(ninfer_internal_includes target)
     ${SUROGATE_VENDOR_DIR}
     ${SUROGATE_VENDOR_DIR}/utf8proc
     ${NINFER_JSON_INCLUDE})
-  # Serve is sm_120a-only regardless of the surrounding project's targets.
-  set_target_properties(${target} PROPERTIES CUDA_ARCHITECTURES "120a")
+  # Serve targets build for the RTX arch set (default 120a; sm_89 compiles
+  # via the upstream port guards, execution pending Ada hardware). Features
+  # above a device's capability gate off at runtime (FP8 plane needs sm_89+,
+  # the fp4 profile needs sm_120a).
+  set_target_properties(${target} PROPERTIES
+      CUDA_ARCHITECTURES "${SUROGATE_SERVE_CUDA_ARCHS}")
 endfunction()
 
 function(ninfer_cuda_archive target)
@@ -822,7 +828,7 @@ target_link_libraries(ninfer_artifact PUBLIC ninfer_core)
 # surogate vendor patch (csrc/src/serve/PATCHES.md): the W4A4 TMA kernels are
 # sm_120-only hardware (TMA + cluster + block-scaled FP4 MMA). Port builds for
 # other architectures link a loud-failure stub instead.
-if("120a" IN_LIST CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
+if("120a" IN_LIST SUROGATE_SERVE_CUDA_ARCHS OR SUROGATE_SERVE_CUDA_ARCHS STREQUAL "120a")
   add_library(ninfer_nvfp4_tma STATIC EXCLUDE_FROM_ALL
     ${SERVE_ROOT}/ops/linear/nvfp4/nvfp4_w4a4_tma.cu
     ${SERVE_ROOT}/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cu)

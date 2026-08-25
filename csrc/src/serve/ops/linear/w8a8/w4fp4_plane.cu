@@ -315,6 +315,9 @@ std::size_t w4fp4_plane_bytes() noexcept {
 }
 
 W4Fp4Plane w4fp4_plane_for(const Weight& weight, cudaStream_t stream) {
+    // The fp4 profile needs the sm_120a block-scale mma (and the W4 decode
+    // path is gated with it): require CC 12.x.
+    if (w8_device_compute_capability() < 120) { return {nullptr, nullptr, nullptr, nullptr}; }
     if (!w8fp8_plane_enabled() || g_mode != PrefillQuantMode::Fp4 ||
         weight.qtype != QType::W8G32_F16S || weight.layout != QuantLayout::RowSplit ||
         weight.scale_dtype != DType::FP16 || weight.group != 32 || weight.qdata == nullptr ||

@@ -111,7 +111,27 @@ bool env_vetoed() {
 
 void w8fp8_plane_set_enabled(bool enabled) noexcept { g_enabled = enabled; }
 
-bool w8fp8_plane_enabled() noexcept { return g_enabled && !env_vetoed(); }
+namespace {
+// Cached compute capability of the current device (e.g. 89, 120).
+int device_cc() noexcept {
+    static const int cc = [] {
+        int dev = 0, major = 0, minor = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess) { return 0; }
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+        return major * 10 + minor;
+    }();
+    return cc;
+}
+} // namespace
+
+// The FP8 plane needs FP8 tensor cores: sm_89 (Ada) and newer. Older RTX
+// parts (sm_80/86) transparently keep the int8 IMMA path.
+bool w8fp8_plane_enabled() noexcept {
+    return g_enabled && !env_vetoed() && device_cc() >= 89;
+}
+
+int w8_device_compute_capability() noexcept { return device_cc(); }
 
 std::size_t w8fp8_plane_bytes() noexcept {
     std::lock_guard<std::mutex> lock(g_mutex);

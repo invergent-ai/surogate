@@ -535,6 +535,30 @@ old ninfer/ paths.)
    re-run the 5-prompt quality panel on the cutlass path, tests for the
    atom-SF encoders, the deferred-rewind fallback test.
 
+26. **Multi-arch scaffolding (owner directive: the serve engine must run on
+   consumer RTX — sm_80/86/89/120/120a — and AMD later).** Capability
+   ladder, gated at RUNTIME by device CC with graceful (and, for explicit
+   requests, loud) degradation:
+   - base W8 + int8 IMMA: sm_80+ in principle (Ampere int8 mma /
+     cp.async / ldmatrix), compile-proven for sm_89;
+   - FP8 derived plane: sm_89+ (w8fp8_plane_enabled now requires CC>=89;
+     Ada f16-acc rate caveat still to price on hardware);
+   - fp4 profile (NVFP4 plane, mxf4nvf4 mma, cutlass blockscaled, W4
+     decode): sm_120a ONLY — w4fp4_plane_for refuses below CC 12.0, the
+     asm is compile-guarded on __CUDA_ARCH_FEAT_SM120_ALL, and an explicit
+     SUROGATE_SERVE_PREFILL_QUANT=fp4 on lesser hardware logs a fallback
+     warning instead of silently serving another profile.
+   Build: SUROGATE_SERVE_CUDA_ARCHS (default 120a) drives the serve
+   targets; the upstream sm_89 port guards (#5-10) carry over, the
+   27B W4A4 TMA archive keys its stub off the serve arch list, and the
+   kt4 fp4 kernels' >48KB-smem bodies are arch-guarded so lesser-arch
+   fatbins link. **The full engine now compiles and links for sm_89 with
+   every post-port kernel (#17-25) in the tree** — sm_89 execution still
+   needs Ada hardware (none on this host): route/occupancy retuning (the
+   gating tables hardcode 170-SM residency counts) and the FP8-accum
+   pricing remain. sm_80/86 and the AMD/HIP port are the next rungs; the
+   plan/launcher dispatch split is the porting seam.
+
 ### sm_89 port status
 
 With patches 5–10 the **entire tree compiles and links for sm_89**

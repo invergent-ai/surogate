@@ -48,6 +48,9 @@ bool w8fp8_plane_enabled() noexcept;
 // own VRAM guard and are not graph memory.
 std::size_t w8_derived_plane_bytes() noexcept;
 
+// Compute capability of the active device (major*10+minor), cached.
+int w8_device_compute_capability() noexcept;
+
 // Returns the derived plane for `weight` (deriving it on first call), or
 // nullptr codes when the plane is disabled, the weight is not an admitted
 // W8G32 row-split parent, or the VRAM guard declined. Derivation runs on

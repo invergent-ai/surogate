@@ -24,11 +24,18 @@ namespace ninfer::ops::detail {
 __device__ __forceinline__ void w8fp8_mma_16n8k32_f16acc(unsigned& d0, unsigned& d1, unsigned a0,
                                                          unsigned a1, unsigned a2, unsigned a3,
                                                          unsigned b0, unsigned b1) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 890
     asm volatile(
         "mma.sync.aligned.m16n8k32.row.col.f16.e4m3.e4m3.f16 "
         "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
         : "+r"(d0), "+r"(d1)
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#else
+    // FP8 tensor cores require sm_89+; hosts gate on runtime CC before
+    // launching (w8fp8_plane_enabled), so this body is unreachable there.
+    (void)d0; (void)d1; (void)a0; (void)a1; (void)a2; (void)a3; (void)b0; (void)b1;
+    __trap();
+#endif
 }
 
 // codes: [weight_rows, k] e4m3 (derived plane); row_scales: [weight_rows] f32.
