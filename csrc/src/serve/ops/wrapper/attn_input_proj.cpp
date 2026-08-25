@@ -241,6 +241,9 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
         if (policy == LinearPolicy::AllowA8 && max_tokens >= detail::kW8A8MinTokens) {
             // surogate patch (PATCHES.md #25): the cutlass fp4 path needs its
             // atom-SF quant buffers plus the [tokens, parent] stage.
+            if (detail::w8_prefill_quant_mode() != detail::PrefillQuantMode::Fp4) {
+                return detail::w8a8_act_quant_bytes(input_rows, max_tokens);
+            }
             const std::size_t a8 = detail::w8a8_act_quant_bytes(input_rows, max_tokens);
             const std::size_t fp4 = detail::w4fp4_cutlass_workspace_bytes(
                 parent_rows, input_rows, max_tokens, true);

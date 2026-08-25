@@ -57,8 +57,13 @@ struct SwigluPairColumnMajor {
 
 std::size_t w8a8_linear_swiglu_workspace_bytes(std::int32_t gate_up_rows, std::int32_t input_rows,
                                                std::int32_t max_tokens) noexcept {
-    // Fused-epilogue paths need only act-quant scratch; the cutlass fp4 path
-    // stages [tokens, gate_up_rows] BF16 plus its atom-SF quant buffers.
+    // Fused-epilogue paths need only act-quant scratch. The cutlass fp4 path
+    // stages [tokens, gate_up_rows] BF16 plus its atom-SF quant buffers —
+    // sized only when the fp4 profile is active so the default profile keeps
+    // its exact query == high-water contract (enforced by the op tests).
+    if (w8_prefill_quant_mode() != PrefillQuantMode::Fp4) {
+        return w8a8_act_quant_bytes(input_rows, max_tokens);
+    }
     const std::size_t fused = w8a8_act_quant_bytes(input_rows, max_tokens);
     const std::size_t cutlass =
         w4fp4_cutlass_workspace_bytes(gate_up_rows, input_rows, max_tokens, true);

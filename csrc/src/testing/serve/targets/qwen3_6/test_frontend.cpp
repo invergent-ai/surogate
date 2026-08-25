@@ -17,6 +17,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <future>
 #include <iostream>
@@ -66,13 +68,13 @@ std::string read_template_fixture(const char* path) {
 
 const std::string& thinking_toggle_template_source() {
     static const std::string source = read_template_fixture(
-        NINFER_SOURCE_DIR "/tests/fixtures/frontend/thinking_toggle_chat_template.jinja");
+        NINFER_SOURCE_DIR "/fixtures/frontend/thinking_toggle_chat_template.jinja");
     return source;
 }
 
 const std::string& reasoning_effort_template_source() {
     static const std::string source = read_template_fixture(
-        NINFER_SOURCE_DIR "/tests/fixtures/frontend/reasoning_effort_chat_template.jinja");
+        NINFER_SOURCE_DIR "/fixtures/frontend/reasoning_effort_chat_template.jinja");
     return source;
 }
 
@@ -89,12 +91,25 @@ const fi::CompiledChatTemplate& reasoning_effort_template() {
 }
 
 const fi::Tokenizer& official_tokenizer() {
-    static const std::string tokenizer_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer.json");
-    static const std::string tokenizer_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer_config.json");
+    // surogate patch: host-environmental fixture (upstream hardcoded the
+    // author's checkout). NINFER_QWEN36_TOKENIZER_DIR overrides; absent
+    // resources SKIP the test (ctest exit 77) instead of aborting.
+    static const std::string base = [] {
+        const char* env = std::getenv("NINFER_QWEN36_TOKENIZER_DIR");
+        const std::string dir =
+            env != nullptr ? env : "/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16";
+        if (!std::ifstream(dir + "/tokenizer.json").good()) {
+            std::fprintf(stderr,
+                         "SKIP: Qwen3.6-27B tokenizer resources not found (set "
+                         "NINFER_QWEN36_TOKENIZER_DIR)\n");
+            std::exit(77);
+        }
+        return dir;
+    }();
+    static const std::string tokenizer_json = read_file((base + "/tokenizer.json").c_str());
+    static const std::string tokenizer_config_json = read_file((base + "/tokenizer_config.json").c_str());
     static const std::string generation_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/generation_config.json");
+        read_file((base + "/generation_config.json").c_str());
     static const fi::Tokenizer tokenizer({.tokenizer_json         = tokenizer_json,
                                           .tokenizer_config_json  = tokenizer_config_json,
                                           .generation_config_json = generation_config_json});

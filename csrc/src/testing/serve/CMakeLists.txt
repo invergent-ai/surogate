@@ -12,8 +12,9 @@ function(ninfer_add_test name)
   target_include_directories(${name} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${SERVE_ROOT}
-    ${SERVE_ROOT}
+    ${NINFER_JSON_INCLUDE}
     ${SUROGATE_VENDOR_DIR}
+    ${SUROGATE_VENDOR_DIR}/cpp-httplib
     ${SUROGATE_VENDOR_DIR}/utf8proc)
   if(arg_LIBRARIES)
     target_link_libraries(${name} PRIVATE ${arg_LIBRARIES})
@@ -22,7 +23,7 @@ function(ninfer_add_test name)
   endif()
   if(arg_NEEDS_SOURCE_DIR)
     target_compile_definitions(${name} PRIVATE
-      NINFER_SOURCE_DIR="${SERVE_ROOT}"
+      NINFER_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
       NINFER_PYTHON_EXECUTABLE="${Python3_EXECUTABLE}")
   endif()
   add_test(NAME ${name} COMMAND ${name})
@@ -171,10 +172,10 @@ target_include_directories(ninfer_http_error_handler_test PRIVATE
   ${SUROGATE_VENDOR_DIR}/cpp-httplib)
 ninfer_add_test(ninfer_bench_support_test
   SOURCES test_ninfer_bench_support.cpp
-          ${SERVE_ROOT}/bench/targets/qwen3_6_27b/ninfer_bench_support.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/bench/targets/qwen3_6_27b/ninfer_bench_support.cpp
   NEEDS_SOURCE_DIR
   LIBRARIES ninfer_engine)
-target_include_directories(ninfer_bench_support_test PRIVATE ${SERVE_ROOT}/bench/targets/qwen3_6_27b)
+target_include_directories(ninfer_bench_support_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/bench/targets/qwen3_6_27b)
 
 # Shared Op numerical tests. Target-composed schedule tests are registered separately below.
 set(ninfer_op_tests
