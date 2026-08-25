@@ -780,6 +780,19 @@ old ninfer/ paths.)
    rejection stands, both sides of that A/B carried the same tax). vLLM
    gaps: 4B 1.95x, 0.8B 1.26x. Suite green.
 
+   Fresh census at the new operating point (C=32, sampler fixed):
+   w8_small_t_mma is now 52% of the decode window — 65,034 calls at
+   72.9us average (~103/round at T=29..32) against a ~16us weighted
+   weight-read floor: 4.5x headroom in the exact-T schedules, which at
+   the 17..32 band are DEFAULTS (W8SmallTMmaDefaultSchedule TileCols
+   24/32, KWarps 8; the vocab band likewise). NEXT ARC: measured
+   schedule sweep for the small-target shapes at T=17..32 (KWarps 4 vs
+   8, MinBlocks, ActivationStage/Cache — the bench harness needs the 4B
+   shapes admitted, or A/B through the server). Also visible: GDN
+   recurrent snapshot 10% (76us x12k), attention small-t 5.6% (128us at
+   batch 32), sampler now healthy (173us/round). Remaining alongside:
+   Phase 2 scheduler, fused-family W4 decision, Phase 4 board rerun.
+
 ### sm_89 port status
 
 With patches 5–10 the **entire tree compiles and links for sm_89**
