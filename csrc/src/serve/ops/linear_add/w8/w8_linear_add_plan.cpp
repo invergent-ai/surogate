@@ -71,11 +71,11 @@ constexpr std::array<RouteSpec, 33> kK6144Routes{{
 // tiles underfill the GPU — r32c128 wins through ~1024 tokens (52->84
 // TF/s vs 24->54 on r64c128) and r48c128 takes over at large T
 // (T=1912: 102.7us vs 128.0us on the k=2048 shape).
-constexpr std::array<RouteSpec, 4> kQ08Routes{{
-    // surogate vendor patch (PATCHES.md #28): the SIMT kernel is
-    // runtime-shaped; carrying it to T=16 keeps batch decode rounds off the
-    // runtime-shaped MMA tiles (141us-class at T=8).
-    {1, 16, W8LinearAddScheduleId::SimtR8C4},
+constexpr std::array<RouteSpec, 5> kQ08Routes{{
+    // surogate vendor patch (PATCHES.md #28/#29): T=1 SIMT; the 2..16
+    // batch-decode band rides the exact-T bakes now.
+    {1, 1, W8LinearAddScheduleId::SimtR8C4},
+    {2, 16, W8LinearAddScheduleId::SplitKMmaExactT},
     {17, 128, W8LinearAddScheduleId::MmaR32C128},
     {129, 1024, W8LinearAddScheduleId::MmaR32C128},
     {1025, kAnyCols, W8LinearAddScheduleId::MmaR48C128},
@@ -83,9 +83,11 @@ constexpr std::array<RouteSpec, 4> kQ08Routes{{
 
 // qwen3.5-2b {2048,2048}: no exact-T instantiations at k=2048 (those are
 // 2048x{4096,6144} bakes), so measured runtime-shaped schedules throughout.
-constexpr std::array<RouteSpec, 5> kQ2BRoutes{{
-    // surogate vendor patch (PATCHES.md #28): batch-decode band, as above.
-    {1, 16, W8LinearAddScheduleId::SimtR8C4},
+constexpr std::array<RouteSpec, 6> kQ2BRoutes{{
+    // surogate vendor patch (PATCHES.md #28/#29): batch-decode band on the
+    // exact-T bakes.
+    {1, 1, W8LinearAddScheduleId::SimtR8C4},
+    {2, 16, W8LinearAddScheduleId::SplitKMmaExactT},
     {17, 512, W8LinearAddScheduleId::MmaR32C96},
     {513, 900, W8LinearAddScheduleId::MmaR48C128},
     {901, 1024, W8LinearAddScheduleId::MmaR32C128},

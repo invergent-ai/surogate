@@ -73,6 +73,20 @@ constexpr auto kQ4bK4096Launchers = make_q4b_launchers<4096>(
 constexpr auto kQ4bK9216Launchers = make_q4b_launchers<9216>(
     std::make_index_sequence<kQ4bLastExactCols - kFirstExactCols + 1>{});
 
+// surogate vendor patch (PATCHES.md #29): qwen3.5-2b o_proj (2048x2048) and
+// qwen3.5-0.8b o_proj (1024x2048) / down (1024x3584), same batch-decode band.
+template <int Hidden, int Rows, std::size_t... Offsets>
+constexpr auto make_small_launchers(std::index_sequence<Offsets...>) {
+    return std::array<ProjectionLauncher, sizeof...(Offsets)>{
+        &launch_active_cols<Hidden, kFirstExactCols + static_cast<int>(Offsets), Rows>...};
+}
+constexpr auto kQ2bK2048Launchers = make_small_launchers<2048, 2048>(
+    std::make_index_sequence<kQ4bLastExactCols - kFirstExactCols + 1>{});
+constexpr auto kQ08K2048Launchers = make_small_launchers<2048, 1024>(
+    std::make_index_sequence<kQ4bLastExactCols - kFirstExactCols + 1>{});
+constexpr auto kQ08K3584Launchers = make_small_launchers<3584, 1024>(
+    std::make_index_sequence<kQ4bLastExactCols - kFirstExactCols + 1>{});
+
 template <int Hidden, int TileCols, int KSplits, int NGroups, int MinBlocks>
 void launch_medium(const Tensor& x, Tensor& residual_out, const Weight& weight,
                    cudaStream_t stream) {
@@ -102,13 +116,17 @@ void w8_linear_add_splitk_mma_launch(const Tensor& x, const Weight& weight, Tens
     if (x.ne[1] < kFirstExactCols || x.ne[1] > kLastExactCols) {
         throw std::invalid_argument("W8 linear_add split-K MMA requires exact T=2..48");
     }
-    if (weight.n == 2560) {
+    if (weight.n == 2560 || weight.n == 1024 || (weight.n == 2048 && weight.k == 2048)) {
         if (x.ne[1] > kQ4bLastExactCols) {
-            throw std::invalid_argument("W8 linear_add: 4b exact tables cover T=2..16");
+            throw std::invalid_argument(
+                "W8 linear_add: small-target exact tables cover T=2..16");
         }
-        (weight.k == 9216 ? kQ4bK9216Launchers
-                          : kQ4bK4096Launchers)[x.ne[1] - kFirstExactCols](x, weight, residual_out,
-                                                                          stream);
+        const auto& launchers = weight.n == 2560
+                                    ? (weight.k == 9216 ? kQ4bK9216Launchers : kQ4bK4096Launchers)
+                                : weight.n == 1024
+                                    ? (weight.k == 3584 ? kQ08K3584Launchers : kQ08K2048Launchers)
+                                    : kQ2bK2048Launchers;
+        launchers[x.ne[1] - kFirstExactCols](x, weight, residual_out, stream);
     } else if (weight.k == 6144) {
         kK6144ProjectionLaunchers[x.ne[1] - kFirstExactCols](x, weight, residual_out, stream);
     } else {

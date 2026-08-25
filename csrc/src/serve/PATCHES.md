@@ -737,6 +737,14 @@ old ninfer/ paths.)
    21.5/round, 2B/0.8B linear_add bakes, W4-at-batch for the fused
    families (measured decision).
 
+   Round 2 (same day): 2B/0.8B linear_add exact-T bakes — 2B o_proj
+   (2048x2048), 0.8B o_proj (1024x2048) and down (1024x3584), the same
+   Rows-parameterized launcher, T=2..16 route bands (the 2B down at
+   k=6144 already rode the 27B-geometry bake). MEASURED at C=16: 0.8B
+   multi100 2,362 -> 3,433 tok/s (TTFT 3.1s, 1,711/0, per-stream 216;
+   solo 503) — 1.7x from vLLM's 5,958 (campaign start: 4.7x). Suite
+   green.
+
 ### sm_89 port status
 
 With patches 5–10 the **entire tree compiles and links for sm_89**
