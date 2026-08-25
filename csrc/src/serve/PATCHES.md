@@ -301,6 +301,33 @@
    structural ~14% behind FP8, NVFP4 ahead at scale on 4-bit compute.
    IMMA scaling verified (2B 37.8k / 2.2x traffic ~= 17k expected).
 
+19. **Prefill campaign increments (4B-led, all targets benefit).** After the
+   4B board landed, an nsys decomposition @1912 showed 77% of prefill is
+   IMMA GEMM time at 155-206 TF/s. Increments shipped:
+   - Wide-config gate relaxed n>=4096 -> n>=2560: the residual family
+     (o_proj 2560x4096, down 2560x9216) was running the base config; probe
+     241->214us / 519->441us. 4B@1912 +3%.
+   - **Fused swiglu epilogue** (replaces #17's unfused pairing pass):
+     `W8A8SwigluPairRowMap` interleaves gate/up (logical row 2i = gate i,
+     2i+1 = up i) so each pair meets 4 lanes apart inside one mma fragment;
+     a full-mask `__shfl_down_sync(4)` in a paired kernel tail joins them
+     and the epilogue writes silu(gate)*up directly. No pair buffer (the
+     18432xT bf16 workspace is gone), no pairing kernel, one fewer bf16
+     round-trip (silu now sees fp32 straight from the int32 accumulators).
+     Op tests pass at T {511,512,1024,1912} on both W8 profiles; greedy
+     E2E answer unchanged. 4B@1912 +2.3%, @472 +4%.
+   - Config-space closure (measured, 12 variants raced): BN256 (two warp
+     layouts), BM32, single-barrier restructure, 3/4-stage pipelines, and
+     4x/8x warp-N widening ALL lose to the shipped 2-stage wide config.
+     The kernel is issue-bound; ~206 TF/s ~= 49% of the sm_120 int8
+     ceiling is this design's local optimum. Further prefill structurally
+     requires the FP8-e4m3 plane (FP16-acc MMA class) or the native 4-bit
+     profile.
+
+   Running 4B board after increments: prefill 10.5k/13.8k/18.0k
+   @472/962/1912 (vLLM bf16 9.9/11.5/12.7, FP8 11.8/16.0/19.7), decode
+   ~160 unchanged.
+
 ### sm_89 port status
 
 With patches 5–10 the **entire tree compiles and links for sm_89**

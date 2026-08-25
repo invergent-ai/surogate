@@ -27,6 +27,7 @@
 #include <cuda_fp16.h>
 
 #include <cstdint>
+#include <type_traits>
 
 namespace ninfer::ops::detail {
 
@@ -57,6 +58,22 @@ inline constexpr std::int32_t kW8A8WideMinTokens = 1024;
 struct W8A8IdentityRowMap {
     __device__ __forceinline__ int weight_row(int logical_row) const { return logical_row; }
 };
+
+// surogate vendor patch (PATCHES.md #19): gate/up interleave for the fused
+// swiglu epilogue. Logical row 2i is gate row i, 2i+1 is up row i, so a pair
+// lands 4 lanes apart in the mma fragment and one shfl joins them.
+struct W8A8SwigluPairRowMap {
+    int intermediate;
+    __device__ __forceinline__ int weight_row(int logical_row) const {
+        return (logical_row & 1) ? intermediate + (logical_row >> 1) : (logical_row >> 1);
+    }
+};
+
+template <class Epilogue, class = void>
+struct W8A8EpilogueIsPaired : std::false_type {};
+template <class Epilogue>
+struct W8A8EpilogueIsPaired<Epilogue, std::void_t<decltype(Epilogue::kPairedRows)>>
+    : std::bool_constant<Epilogue::kPairedRows> {};
 
 __device__ __forceinline__ void w8a8_imma_16n8k32(int& d0, int& d1, int& d2, int& d3, unsigned a0,
                                                   unsigned a1, unsigned a2, unsigned a3,
@@ -199,16 +216,41 @@ __global__ __launch_bounds__(Cfg::THREADS, 2) void w8a8_imma_gemm_kernel(
         __syncthreads();
     }
 
+    if constexpr (W8A8EpilogueIsPaired<Epilogue>::value) {
+        // Paired tail: every thread computes and shuffles before any guard so
+        // the shfl mask stays full. Even fragment rows hold gate, +4 lanes
+        // holds the matching up row (see W8A8SwigluPairRowMap).
 #pragma unroll
-    for (int mi = 0; mi < 2; ++mi) {
+        for (int mi = 0; mi < 2; ++mi) {
 #pragma unroll
-        for (int ni = 0; ni < 2; ++ni) {
+            for (int ni = 0; ni < 2; ++ni) {
 #pragma unroll
-            for (int q = 0; q < 4; ++q) {
-                const int row   = m0 + wm + mi * 16 + (lane >> 2) + (q >= 2 ? 8 : 0);
-                const int token = n0 + wn + ni * 8 + (lane & 3) * 2 + (q & 1);
-                if (row < rows && token < tokens) {
-                    epilogue(row, token, acc[mi][ni][q] * x_scales[token]);
+                for (int q = 0; q < 4; ++q) {
+                    const float value   = acc[mi][ni][q];
+                    const float partner = __shfl_down_sync(0xffffffffu, value, 4);
+                    const int frag_row  = lane >> 2;
+                    if ((frag_row & 1) != 0) { continue; }
+                    const int row   = m0 + wm + mi * 16 + frag_row + (q >= 2 ? 8 : 0);
+                    const int token = n0 + wn + ni * 8 + (lane & 3) * 2 + (q & 1);
+                    if (row < rows && token < tokens) {
+                        const float scale = x_scales[token];
+                        epilogue.store_pair(row >> 1, token, value * scale, partner * scale);
+                    }
+                }
+            }
+        }
+    } else {
+#pragma unroll
+        for (int mi = 0; mi < 2; ++mi) {
+#pragma unroll
+            for (int ni = 0; ni < 2; ++ni) {
+#pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                    const int row   = m0 + wm + mi * 16 + (lane >> 2) + (q >= 2 ? 8 : 0);
+                    const int token = n0 + wn + ni * 8 + (lane & 3) * 2 + (q & 1);
+                    if (row < rows && token < tokens) {
+                        epilogue(row, token, acc[mi][ni][q] * x_scales[token]);
+                    }
                 }
             }
         }
