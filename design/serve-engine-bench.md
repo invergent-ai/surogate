@@ -246,23 +246,34 @@ fusion ~1.1ms, conv-snapshot A8 branch ~1.5ms, quantizing-rmsnorm ~1ms,
 GDN chunk tuning) or the native 4-bit small-target profile.
 
 
-# Qwen3.5-4B — vLLM reference board (engine target does not exist yet)
+# Qwen3.5-4B — engine vs vLLM (target shipped, PATCHES #18)
 
-Same method, idle 5090, batch 1. This is the sheet the 4B engine target
-(asymmetric ratio-2 GDN, hidden 2560, 32 layers) has to beat.
+Same method, idle 5090, batch 1, greedy, 128 decode tokens. Engine =
+first correctness-first pass (measured 2026-08-25, prompt tokens
+463/953/1903; decode averaged over the same runs).
 
-| point | vLLM bf16 | vLLM FP8 | vLLM NVFP4 (AxionML) |
-|---|---:|---:|---:|
-| prefill @472 | 9,855 | **11,838** | 8,469 |
-| prefill @962 | 11,475 | 15,985 | **17,351** |
-| prefill @1912 | 12,679 | 19,743 | **35,169** |
-| decode | 100 | 115 | **162** |
+| point | engine W8 | vLLM bf16 | vLLM FP8 | vLLM NVFP4 (AxionML) |
+|---|---:|---:|---:|---:|
+| prefill @472 | 10,101 | 9,855 | **11,838** | 8,469 |
+| prefill @962 | 13,608 | 11,475 | 15,985 | **17,351** |
+| prefill @1912 | 17,064 | 12,679 | 19,743 | **35,169** |
+| decode | **~160** | 100 | 115 | **162** |
 
-Reading: at 4B the bandwidth hierarchy shows cleanly (decode 100 -> 115
--> 162 as weight bytes halve twice); NVFP4's prefill is fixed-overhead
-bound to ~55ms until large T. Engine projections from measured scaling:
-W8 decode extrapolates to ~200 tok/s (weight-traffic scaling from
-0.8B/2B), which would beat NVFP4's 162 at twice the weight bits; the
-IMMA prefill path at K=2560 shapes should land in its usual 150-200 TF/s
-band. The 4B target build (the deferred asymmetric-GDN lift) has a
-concrete scoreboard to hit.
+Reading:
+- Decode 158-162 tok/s: +60% over vLLM bf16, +39% over FP8, and a tie
+  with NVFP4 (162) at TWICE the weight bits per parameter. The pre-build
+  ~200 extrapolation overshot: 4B decode is already less purely
+  bandwidth-bound than 0.8B/2B (same non-bandwidth overhead pool, more
+  layers), and the GDN gating short-cols route runs split-8 rather than
+  the 35B's split-32 (2560 = 40 K-tiles; split-32/16 indivisible).
+- Prefill beats vLLM bf16 at every point (+2.5% / +19% / +35%); the FP8
+  gap is the same structural ~14-15% as on 0.8B (W8->FP8-MMA long-prefill
+  item), and NVFP4 pulls away at scale on 4-bit tensor-core compute
+  (in-class answer = the Q4_K comparison, measured on 0.8B).
+- Scaling sanity: 2B IMMA prefill @1912 was 37.8k; 4B carries ~2.2x the
+  per-token weight traffic -> expected ~17k, measured 17.1k. The IMMA
+  path is engaged and scaling as designed; no 4B-specific prefill
+  regression.
+
+vLLM reference rows measured 2026-08-24 (see method note above); engine
+rows 2026-08-25 on the same GPU.

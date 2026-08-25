@@ -293,11 +293,13 @@
      the engine always renders with an explicit toggle, so the digest maps to
      the same ThinkingToggle semantics.
 
-   Artifact converts from the HF checkpoint in 31.8 s (5.39 GB). E2E: full
-   load + engine construction + H2D green on sm_120 (all capacity/admission
-   gates pass); first-tokens verification and the perf pass against the
-   measured vLLM 4B board (decode 100/115/162 tok/s bf16/fp8/nvfp4,
-   prefill@1912 12.7k/19.7k/35.2k) are queued for the next GPU window.
+   Artifact converts from the HF checkpoint in 31.8 s (5.39 GB). E2E
+   (sm_120): greedy answers exactly ("SUROGATE SERVE OK", stop-token
+   finish). Bench vs the measured vLLM 4B board: decode ~160 tok/s vs
+   100/115/162 (bf16/FP8/NVFP4) — +60%/+39%/tie-with-4-bit; prefill
+   10.1k/13.6k/17.1k @472/962/1912 — ahead of bf16 everywhere, the usual
+   structural ~14% behind FP8, NVFP4 ahead at scale on 4-bit compute.
+   IMMA scaling verified (2B 37.8k / 2.2x traffic ~= 17k expected).
 
 ### sm_89 port status
 
