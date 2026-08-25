@@ -188,6 +188,25 @@ dips); matching that in-class would mean an NVFP4 profile for the small
 targets (the engine already carries NVFP4 kernels for the 27B family) —
 a quality-tradeoff option, not a correction.
 
+UPDATE 2026-08-26 (after PATCHES #19/#20 — fused swiglu + derived FP8
+plane, which the small targets inherit automatically):
+
+| point | engine (W8+FP8, 8-bit) | vLLM NVFP4 (4-bit) |
+|---|---:|---:|
+| 0.8B prefill @472 | **36,986** | 25,428 |
+| 0.8B prefill @962 | **56,551** | 22,344 |
+| 0.8B prefill @1912 | **74,218** | 38,685 |
+| 0.8B decode | **450-468** | 386-390 |
+| 2B prefill @472 | **24,913** | 24,057 |
+| 2B prefill @962 | **35,042** | 22,660 |
+| 2B prefill @1912 | **44,786** | 44,754 |
+| 2B decode | **320-328** | 256-258 |
+
+The two 2B losing points (@472 -16%, @1912 -14%) are CLOSED: the engine
+at 8-bit quality now matches (@1912, statistical tie) or beats every
+vLLM configuration including 4-bit NVFP4, at every measured point, on
+all three shipped targets. 0.8B @1912 is now 1.9x vLLM-NVFP4.
+
 
 # In-class 4-bit: Q4_K_M (engine) vs NVFP4 (vLLM)
 
