@@ -166,7 +166,7 @@ class ConversionPreflight:
 
 
 def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[3]
+    return Path(__file__).resolve().parents[2]
 
 
 def validate_config(config: Mapping[str, object]) -> dict[str, object]:

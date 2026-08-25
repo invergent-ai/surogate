@@ -53,7 +53,7 @@ class ConversionPreflight:
 
 
 def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[3]
+    return Path(__file__).resolve().parents[2]
 
 
 def _validate_index(model_dir: Path) -> None:

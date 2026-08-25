@@ -35,7 +35,7 @@ from surogate.serve.tools.convert.common.safetensors import ShardReader
 from . import draft_head, inventory, recipe
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 DIRECT_PROBE_OBJECTS = (
     "text/layers/0/input_norm",
