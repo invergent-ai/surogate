@@ -13,6 +13,8 @@
 #include "ops/common/math.h"
 #include "ops/linear/w8a8/w8a8_act_quant.h"
 #include "ops/linear/w8a8/w8a8_imma_gemm.cuh"
+#include "ops/linear/w8a8/w4fp4_gemm.cuh"
+#include "ops/linear/w8a8/w4fp4_plane.h"
 #include "ops/linear/w8a8/w8fp8_gemm.cuh"
 #include "ops/linear/w8a8/w8fp8_plane.h"
 
@@ -54,6 +56,33 @@ void w8a8_linear_swiglu_dispatch(const Tensor& x, const Weight& gate_up_weight, 
 
     const W8A8SwigluPairRowMap row_map{intermediate};
     const SwigluPairColumnMajor epilogue{static_cast<__nv_bfloat16*>(out.data), intermediate};
+
+    // surogate vendor patch (PATCHES.md #21): NVFP4 profile.
+    if (w8_prefill_quant_mode() == PrefillQuantMode::Fp4) {
+        const W4Fp4Plane fp4_plane = w4fp4_plane_for(gate_up_weight, stream);
+        if (fp4_plane.codes != nullptr) {
+            const W4Fp4QuantizedActivations fp4 = w4fp4_act_quant(x, base, stream);
+            if (tokens >= kW8A8WideMinTokens && gate_up_rows >= 4096) {
+                using Cfg = W4Fp4WideConfig;
+                const dim3 grid(static_cast<unsigned>(div_up(gate_up_rows, Cfg::BM)),
+                                static_cast<unsigned>(div_up(tokens, Cfg::BN)), 1u);
+                w4fp4_gemm_kernel<W8A8SwigluPairRowMap, SwigluPairColumnMajor, Cfg>
+                    <<<grid, Cfg::THREADS, 0, stream>>>(
+                        fp4_plane.codes, fp4_plane.sf, fp4_plane.row_scales, fp4.codes, fp4.sf,
+                        fp4.scales, gate_up_rows, k, tokens, row_map, epilogue);
+            } else {
+                using Cfg = W4Fp4Config;
+                const dim3 grid(static_cast<unsigned>(div_up(gate_up_rows, Cfg::BM)),
+                                static_cast<unsigned>(div_up(tokens, Cfg::BN)), 1u);
+                w4fp4_gemm_kernel<W8A8SwigluPairRowMap, SwigluPairColumnMajor, Cfg>
+                    <<<grid, Cfg::THREADS, 0, stream>>>(
+                        fp4_plane.codes, fp4_plane.sf, fp4_plane.row_scales, fp4.codes, fp4.sf,
+                        fp4.scales, gate_up_rows, k, tokens, row_map, epilogue);
+            }
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+    }
 
     // surogate vendor patch (PATCHES.md #20): folded-scale FP8 plane.
     const W8Fp8Plane plane = w8fp8_plane_for(gate_up_weight, stream);

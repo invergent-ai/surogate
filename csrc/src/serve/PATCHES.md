@@ -356,6 +356,36 @@
    dedicated FP8-plane op test + mxf8f6f4 block-scale variant (hardware
    ue8m0 per-32 scales; possibly faster and finer than per-row).
 
+21. **Native 4-bit profile, stage 1: NVFP4 prefill plane (opt-in).**
+   `SUROGATE_SERVE_PREFILL_QUANT=fp4` derives an NVFP4 plane from W8G32
+   (e2m1 nibbles + ue4m3 per-16 block scales + f32 per-row, two-level
+   448*6 scheme) and runs sm_120a's mma.kind::mxf4nvf4.block_scale —
+   hardware scale application, f32 in-core accumulation, W4A4 (acts
+   quantize per token to e2m1 + per-16 ue4m3). Same registry/guard
+   machinery as #20; decode stays int8-exact W8; quality class = NVFP4
+   PTQ (the vLLM-NVFP4 checkpoint class), so the mode is an explicit
+   opt-in, never a default.
+
+   Hard-won kernel facts: the e2m1 m16n8k64 fragment equals the int8
+   m16n8k32 fragment at the byte level (ldmatrix pattern carries over;
+   K-tile = 64 elements = 32 bytes; smem row stride must stay 16B-aligned
+   — 40 faults inside ldmatrix); SF operand mapping validated
+   single-mma-exact vs a CPU reference (sfa = 4 k-group bytes for tile row
+   8*(lane&1)+(lane>>2), sfb for token lane>>2, selectors all-zero); SF
+   staging must ride the same cp.async commit group (a synchronous LDG in
+   the stage cost +16..40%); the 512-thread config spills under a 2-CTA
+   launch-bounds cap (+90% on every base shape) — MINCTA=1.
+
+   Raw-kernel probe: 274-309 TF/s (-22% vs the FP8 folded kernel). Engine
+   today: 10.9k/14.2k/20.4k @472/962/1912 — parity with the FP8 plane at
+   1912, behind it below (heavier per-16 act quant, small-T fixed costs),
+   and well short of vLLM-NVFP4's 35k long-prefill (cutlass-class tiles +
+   TMA). Verdict: prefill-FP4 alone is not yet worth the quality trade —
+   the profile's real payoff is stage 2, W4 DECODE kernels reading this
+   plane (weight traffic 4.8 -> 2.7 GB/step: decode ceiling ~1.7x, past
+   NVFP4's 162), plus a deep-tuned FP4 prefill pass for the 35k class.
+   Greedy E2E answers exactly under fp4 mode.
+
 ### sm_89 port status
 
 With patches 5–10 the **entire tree compiles and links for sm_89**

@@ -8,6 +8,8 @@
 #include "core/device.h"
 #include "ops/common/math.h"
 #include "ops/linear/w8a8/w8a8_imma_gemm.cuh"
+#include "ops/linear/w8a8/w4fp4_gemm.cuh"
+#include "ops/linear/w8a8/w4fp4_plane.h"
 #include "ops/linear/w8a8/w8fp8_gemm.cuh"
 #include "ops/linear/w8a8/w8fp8_plane.h"
 
@@ -74,6 +76,34 @@ void launch(const Tensor& x, const Weight& weight, Epilogue epilogue, WorkspaceA
     const std::int32_t tokens = x.ne[1];
     auto scope                = workspace.scope();
     auto* quant_base = workspace.alloc_bytes(w8a8_act_quant_bytes(k, tokens), 16).data;
+
+    // surogate vendor patch (PATCHES.md #21): NVFP4 profile (opt-in via
+    // SUROGATE_SERVE_PREFILL_QUANT=fp4) — hardware block-scale mma.
+    if (w8_prefill_quant_mode() == PrefillQuantMode::Fp4) {
+        const W4Fp4Plane fp4_plane = w4fp4_plane_for(weight, stream);
+        if (fp4_plane.codes != nullptr) {
+            const W4Fp4QuantizedActivations fp4 = w4fp4_act_quant(x, quant_base, stream);
+            if (tokens >= kW8A8WideMinTokens && weight.n >= 2560) {
+                using Cfg = W4Fp4WideConfig;
+                const dim3 grid(static_cast<unsigned>(div_up(weight.n, Cfg::BM)),
+                                static_cast<unsigned>(div_up(tokens, Cfg::BN)), 1u);
+                w4fp4_gemm_kernel<W8A8IdentityRowMap, Epilogue, Cfg>
+                    <<<grid, Cfg::THREADS, 0, stream>>>(
+                        fp4_plane.codes, fp4_plane.sf, fp4_plane.row_scales, fp4.codes, fp4.sf,
+                        fp4.scales, weight.n, k, tokens, W8A8IdentityRowMap{}, epilogue);
+            } else {
+                using Cfg = W4Fp4Config;
+                const dim3 grid(static_cast<unsigned>(div_up(weight.n, Cfg::BM)),
+                                static_cast<unsigned>(div_up(tokens, Cfg::BN)), 1u);
+                w4fp4_gemm_kernel<W8A8IdentityRowMap, Epilogue, Cfg>
+                    <<<grid, Cfg::THREADS, 0, stream>>>(
+                        fp4_plane.codes, fp4_plane.sf, fp4_plane.row_scales, fp4.codes, fp4.sf,
+                        fp4.scales, weight.n, k, tokens, W8A8IdentityRowMap{}, epilogue);
+            }
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+    }
 
     // surogate vendor patch (PATCHES.md #20): folded-scale FP8 plane, when
     // derived, replaces the IMMA path (same epilogues, same workspace).

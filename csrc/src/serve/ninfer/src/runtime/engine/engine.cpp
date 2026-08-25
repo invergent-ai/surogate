@@ -3,12 +3,15 @@
 #include "core/device.h"
 #include "runtime/contract/sampling.h"
 #include "runtime/contract/types.h"
+#include "ops/linear/w8a8/w4fp4_plane.h"
 #include "ops/linear/w8a8/w8fp8_plane.h"
 #include "runtime/engine/concurrent_executor.h"
 #include "targets/registry.h"
 
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -147,6 +150,12 @@ public:
         // derived FP8 prefill plane (op tests stay int8-exact by default;
         // SUROGATE_SERVE_FP8_PREFILL=0 vetoes).
         ops::detail::w8fp8_plane_set_enabled(true);
+        // surogate vendor patch (PATCHES.md #21): NVFP4 prefill profile is
+        // an explicit opt-in (quality class change).
+        if (const char* mode = std::getenv("SUROGATE_SERVE_PREFILL_QUANT");
+            mode != nullptr && std::string_view(mode) == "fp4") {
+            ops::detail::w8_prefill_quant_set_mode(ops::detail::PrefillQuantMode::Fp4);
+        }
         auto constructed  = targets::construct_target(options, device);
         active            = std::move(constructed.active);
         load              = std::move(constructed.load);
