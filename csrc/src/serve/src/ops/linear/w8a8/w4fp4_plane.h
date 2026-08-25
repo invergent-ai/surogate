@@ -19,6 +19,7 @@
 // quant mode is Fp4; decode always stays int8-exact W8.
 
 #include "core/tensor.h"
+#include "ops/linear/w8a8/w4fp4_cutlass_gemm.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -35,8 +36,11 @@ PrefillQuantMode w8_prefill_quant_mode() noexcept;
 
 struct W4Fp4Plane {
     const std::uint8_t* codes;       // [n, k/2] e2m1 pairs
-    const std::uint8_t* sf;          // [n, k/16] ue4m3
-    const float* row_scales;         // [n]
+    const std::uint8_t* sf;          // [n, k/16] ue4m3 row-major (decode/kt4 path)
+    const float* row_scales;         // [n] (decode/kt4 path)
+    // cutlass path (PATCHES.md #25): ue4m3 block scales in the Sm1xx SF atom
+    // layout with the per-row scale FOLDED in (alpha is 1).
+    const std::uint8_t* sf_atom;
 };
 
 // Derive-on-first-use registry, mirroring w8fp8_plane_for (enabled flag is
@@ -55,5 +59,26 @@ struct W4Fp4QuantizedActivations {
 // sections. Always <= w8a8_act_quant_bytes(hidden, tokens), so A8-sized
 // workspaces are reused as-is.
 W4Fp4QuantizedActivations w4fp4_act_quant(const Tensor& x, void* workspace, cudaStream_t stream);
+
+// cutlass-path activation quantization: e2m1 codes plus ATOM-layout ue4m3
+// scales with the per-token scale folded in. Workspace layout:
+// align16(tokens * hidden/2) codes followed by the padded atom SF plane.
+struct W4Fp4AtomActivations {
+    const std::uint8_t* codes;    // [tokens, hidden/2]
+    const std::uint8_t* sf_atom;  // padded Sm1xx atom layout
+};
+
+W4Fp4AtomActivations w4fp4_act_quant_atom(const Tensor& x, void* workspace, cudaStream_t stream);
+
+// Device-resident 1.0f for the cutlass alpha pointer.
+const float* w4fp4_alpha_one();
+
+// Workspace bytes for the cutlass prefill path of one call: activation codes
+// + atom SF (+ the [tokens, parent_rows] BF16 staging buffer for families
+// whose outputs are split/paired after the GEMM).
+[[nodiscard]] std::size_t w4fp4_cutlass_workspace_bytes(std::int32_t parent_rows,
+                                                        std::int32_t input_rows,
+                                                        std::int32_t max_tokens,
+                                                        bool with_stage_buffer) noexcept;
 
 } // namespace ninfer::ops::detail

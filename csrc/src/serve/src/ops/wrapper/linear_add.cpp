@@ -1,4 +1,5 @@
 #include "ninfer/ops/linear_add.h"
+#include "ops/linear/w8a8/w4fp4_plane.h"
 
 #include "ops/linear_add/bf16/bf16_linear_add_plan.h"
 #include "ops/linear/fp8/fp8_config.h"
@@ -103,7 +104,12 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
         // surogate vendor patch (PATCHES.md #17): AllowA8 large-T runs the
         // W8A8-int IMMA residual path.
         if (policy == LinearPolicy::AllowA8 && max_tokens >= detail::kW8A8MinTokens) {
-            return detail::w8a8_act_quant_bytes(input_rows, max_tokens);
+            // surogate patch (PATCHES.md #25): the cutlass fp4 path needs its
+            // atom-SF quant buffers.
+            const std::size_t a8 = detail::w8a8_act_quant_bytes(input_rows, max_tokens);
+            const std::size_t fp4 = detail::w4fp4_cutlass_workspace_bytes(
+                output_rows, input_rows, max_tokens, false);
+            return a8 > fp4 ? a8 : fp4;
         }
         return 0;
     }

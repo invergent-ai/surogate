@@ -1,4 +1,5 @@
 #include "ninfer/ops/gdn_input_proj.h"
+#include "ops/linear/w8a8/w4fp4_plane.h"
 
 #include "core/layout.h"
 #include "ops/gdn_input_proj/fp8/fp8_gdn_conv_plan.h"
@@ -796,7 +797,12 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int
         (void)detail::w8_gdn_input_resolve_plan(
             {input_rows, qkv_rows, z_rows, parent_rows, input_rows, max_tokens});
         if (policy == LinearPolicy::AllowA8 && max_tokens >= detail::kW8A8MinTokens) {
-            return detail::w8a8_act_quant_bytes(input_rows, max_tokens);
+            // surogate patch (PATCHES.md #25): the cutlass fp4 path needs its
+            // atom-SF quant buffers plus the [tokens, parent] stage.
+            const std::size_t a8 = detail::w8a8_act_quant_bytes(input_rows, max_tokens);
+            const std::size_t fp4 = detail::w4fp4_cutlass_workspace_bytes(
+                parent_rows, input_rows, max_tokens, true);
+            return a8 > fp4 ? a8 : fp4;
         }
         return 0;
     }

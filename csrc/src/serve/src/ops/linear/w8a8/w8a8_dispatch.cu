@@ -8,6 +8,7 @@
 #include "core/device.h"
 #include "ops/common/math.h"
 #include "ops/linear/w8a8/w8a8_imma_gemm.cuh"
+#include "ops/linear/w8a8/w4fp4_cutlass_gemm.h"
 #include "ops/linear/w8a8/w4fp4_gemm.cuh"
 #include "ops/linear/w8a8/w4fp4_plane.h"
 #include "ops/linear/w8a8/w8fp8_gemm.cuh"
@@ -68,6 +69,79 @@ struct ResidualColumnMajor {
             __float2bfloat16_rn(__bfloat162float(residual[index]) + value);
     }
 };
+
+// surogate patch (PATCHES.md #25): post-GEMM splits for the cutlass path.
+// D is [tokens, parent_rows] row-major; consumers want per-tensor
+// column-major [rows, tokens].
+__global__ void w4fp4_split2_kernel(const __nv_bfloat16* __restrict__ d, __nv_bfloat16* first,
+                                    __nv_bfloat16* second, int first_rows, int second_rows,
+                                    int tokens) {
+    const int parent = first_rows + second_rows;
+    const std::int64_t i =
+        static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= static_cast<std::int64_t>(parent) * tokens) { return; }
+    const int row   = static_cast<int>(i % parent);
+    const int token = static_cast<int>(i / parent);
+    const float v   = __bfloat162float(d[static_cast<std::int64_t>(token) * parent + row]);
+    if (row < first_rows) {
+        first[static_cast<std::int64_t>(token) * first_rows + row] = __float2bfloat16_rn(v);
+    } else {
+        second[static_cast<std::int64_t>(token) * second_rows + (row - first_rows)] =
+            __float2bfloat16_rn(v);
+    }
+}
+
+__global__ void w4fp4_split4_kernel(const __nv_bfloat16* __restrict__ d, __nv_bfloat16* q,
+                                    __nv_bfloat16* k, __nv_bfloat16* g, __nv_bfloat16* v,
+                                    int q_rows, int kv_rows, int tokens) {
+    const int parent = 2 * q_rows + 2 * kv_rows;
+    const std::int64_t i =
+        static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= static_cast<std::int64_t>(parent) * tokens) { return; }
+    const int row   = static_cast<int>(i % parent);
+    const int token = static_cast<int>(i / parent);
+    const __nv_bfloat16 value = d[static_cast<std::int64_t>(token) * parent + row];
+    if (row < q_rows) {
+        q[static_cast<std::int64_t>(token) * q_rows + row] = value;
+    } else if (row < q_rows + kv_rows) {
+        k[static_cast<std::int64_t>(token) * kv_rows + (row - q_rows)] = value;
+    } else if (row < 2 * q_rows + kv_rows) {
+        g[static_cast<std::int64_t>(token) * q_rows + (row - q_rows - kv_rows)] = value;
+    } else {
+        v[static_cast<std::int64_t>(token) * kv_rows + (row - 2 * q_rows - kv_rows)] = value;
+    }
+}
+
+struct W4Fp4CutlassEntry {
+    W4Fp4AtomActivations acts;
+    const W4Fp4Plane* plane;
+    __nv_bfloat16* stage;  // null for the residual family
+};
+
+// Quantizes activations and (optionally) claims the stage buffer. Returns
+// false when the cutlass path is unavailable (caller falls back).
+bool w4fp4_cutlass_begin(const Tensor& x, const W4Fp4Plane& plane, bool with_stage,
+                         std::int32_t parent_rows, WorkspaceArena& workspace,
+                         cudaStream_t stream, W4Fp4CutlassEntry& out) {
+    if (plane.sf_atom == nullptr || w4fp4_alpha_one() == nullptr) { return false; }
+    const std::int32_t k      = x.ne[0];
+    const std::int32_t tokens = x.ne[1];
+    const std::size_t quant_bytes =
+        w4fp4_cutlass_workspace_bytes(parent_rows, k, tokens, false);
+    auto* base = workspace.alloc_bytes(quant_bytes, 16).data;
+    out.acts   = w4fp4_act_quant_atom(x, base, stream);
+    out.plane  = &plane;
+    out.stage  = nullptr;
+    if (with_stage) {
+        out.stage = static_cast<__nv_bfloat16*>(
+            workspace
+                .alloc_bytes(static_cast<std::size_t>(parent_rows) * tokens *
+                                 sizeof(__nv_bfloat16),
+                             16)
+                .data);
+    }
+    return true;
+}
 
 template <class Epilogue>
 void launch(const Tensor& x, const Weight& weight, Epilogue epilogue, WorkspaceArena& workspace,
@@ -163,6 +237,24 @@ void launch(const Tensor& x, const Weight& weight, Epilogue epilogue, WorkspaceA
 
 void w8a8_gemm_split2(const Tensor& x, const Weight& weight, Tensor& first, Tensor& second,
                       WorkspaceArena& workspace, cudaStream_t stream) {
+    // surogate patch (PATCHES.md #25): cutlass NVFP4 path (fp4 profile).
+    if (w8_prefill_quant_mode() == PrefillQuantMode::Fp4) {
+        const W4Fp4Plane plane = w4fp4_plane_for(weight, stream);
+        auto scope             = workspace.scope();
+        W4Fp4CutlassEntry entry;
+        if (plane.codes != nullptr &&
+            w4fp4_cutlass_begin(x, plane, true, weight.n, workspace, stream, entry) &&
+            w4fp4_cutlass_gemm_store(entry.acts.codes, entry.acts.sf_atom, plane.codes,
+                                     plane.sf_atom, w4fp4_alpha_one(), entry.stage, x.ne[1],
+                                     weight.n, x.ne[0], stream)) {
+            const std::int64_t total = static_cast<std::int64_t>(weight.n) * x.ne[1];
+            w4fp4_split2_kernel<<<static_cast<unsigned>((total + 255) / 256), 256, 0, stream>>>(
+                entry.stage, static_cast<__nv_bfloat16*>(first.data),
+                static_cast<__nv_bfloat16*>(second.data), first.ne[0], second.ne[0], x.ne[1]);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+    }
     launch(x, weight,
            Split2ColumnMajor{static_cast<__nv_bfloat16*>(first.data),
                              static_cast<__nv_bfloat16*>(second.data), first.ne[0], second.ne[0]},
@@ -172,6 +264,25 @@ void w8a8_gemm_split2(const Tensor& x, const Weight& weight, Tensor& first, Tens
 void w8a8_gemm_split4(const Tensor& x, const Weight& weight, Tensor& query, Tensor& key,
                       Tensor& gate, Tensor& value, WorkspaceArena& workspace,
                       cudaStream_t stream) {
+    // surogate patch (PATCHES.md #25): cutlass NVFP4 path (fp4 profile).
+    if (w8_prefill_quant_mode() == PrefillQuantMode::Fp4) {
+        const W4Fp4Plane plane = w4fp4_plane_for(weight, stream);
+        auto scope             = workspace.scope();
+        W4Fp4CutlassEntry entry;
+        if (plane.codes != nullptr &&
+            w4fp4_cutlass_begin(x, plane, true, weight.n, workspace, stream, entry) &&
+            w4fp4_cutlass_gemm_store(entry.acts.codes, entry.acts.sf_atom, plane.codes,
+                                     plane.sf_atom, w4fp4_alpha_one(), entry.stage, x.ne[1],
+                                     weight.n, x.ne[0], stream)) {
+            const std::int64_t total = static_cast<std::int64_t>(weight.n) * x.ne[1];
+            w4fp4_split4_kernel<<<static_cast<unsigned>((total + 255) / 256), 256, 0, stream>>>(
+                entry.stage, static_cast<__nv_bfloat16*>(query.data),
+                static_cast<__nv_bfloat16*>(key.data), static_cast<__nv_bfloat16*>(gate.data),
+                static_cast<__nv_bfloat16*>(value.data), query.ne[0], key.ne[0], x.ne[1]);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+    }
     launch(x, weight,
            Split4ColumnMajor{static_cast<__nv_bfloat16*>(query.data),
                              static_cast<__nv_bfloat16*>(key.data),
@@ -182,6 +293,20 @@ void w8a8_gemm_split4(const Tensor& x, const Weight& weight, Tensor& query, Tens
 
 void w8a8_gemm_residual(const Tensor& x, const Weight& weight, Tensor& residual_out,
                         WorkspaceArena& workspace, cudaStream_t stream) {
+    // surogate patch (PATCHES.md #25): cutlass NVFP4 path — the residual add
+    // is the epilogue's beta=1 (C = D = the residual tensor).
+    if (w8_prefill_quant_mode() == PrefillQuantMode::Fp4) {
+        const W4Fp4Plane plane = w4fp4_plane_for(weight, stream);
+        auto scope             = workspace.scope();
+        W4Fp4CutlassEntry entry;
+        if (plane.codes != nullptr &&
+            w4fp4_cutlass_begin(x, plane, false, weight.n, workspace, stream, entry) &&
+            w4fp4_cutlass_gemm_residual(entry.acts.codes, entry.acts.sf_atom, plane.codes,
+                                        plane.sf_atom, w4fp4_alpha_one(), residual_out.data,
+                                        x.ne[1], weight.n, x.ne[0], stream)) {
+            return;
+        }
+    }
     launch(x, weight,
            ResidualColumnMajor{static_cast<__nv_bfloat16*>(residual_out.data),
                                residual_out.ne[0]},

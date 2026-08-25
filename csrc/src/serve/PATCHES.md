@@ -504,6 +504,37 @@ old ninfer/ paths.)
    the default 8-bit profile beats every vLLM config at @472/@962; fp4
    closes @1912 to -18% (28.9 vs 35.2k).
 
+25. **cutlass NVFP4 GEMM — the board is complete.** Per the owner's "just
+   copy it from vLLM": the fp4 prefill GEMM is now the cutlass sm_120a
+   blockscaled kernel class (recipe from flashinfer's template, Apache-2.0;
+   cutlass v4.6.1 from the main project's FetchContent). Direct
+   instantiation measures 679-813 TF/s at the engine shapes — 1.8-1.9x the
+   hand-rolled kt4 kernel and faster than vLLM's own binary (gate_up 222 vs
+   244 us); CTA 128x128x128, TmaWarpSpecializedCooperative, persistent
+   scheduler.
+
+   Integration: the derived plane gains a cutlass ATOM-layout ue4m3 SF
+   copy with the per-row scale FOLDED in (alpha = 1; encode_rn of the
+   product; row-major SF + row scales stay for the decode/kt4 paths);
+   activations quantize through w4fp4_act_quant_atom (folded per-token
+   scale, zeroed padding). Dispatch: residual family uses the epilogue's
+   native beta=1 (C = D = residual); split2/split4/swiglu stage
+   [tokens, parent] BF16 and run small split/pair kernels ([T,N] row-major
+   D is exactly the engine's token-major layout). kt4 remains the
+   fallback when the cutlass launch is unavailable. Workspace capacity
+   grows to max(int8-A8, fp4-cutlass) at the four sites. Bench traps
+   recorded: adapter init/run per call costs ~3 ms host unless
+   initialize(args, nullptr, stream) with no workspace; hw_info.sm_count
+   must be set.
+
+   fp4 board (idle 5090, defer flag, greedy exact): prefill
+   25,259 / 31,293 / 38,980 @472/962/1912, decode ~211. vs vLLM-NVFP4
+   8,469 / 17,351 / 35,169, decode 162: 3.0x / +80% / **+11%** / +30%.
+   **The engine now beats every vLLM configuration at every measured
+   point on every shipped target in both quality classes.** Queued:
+   re-run the 5-prompt quality panel on the cutlass path, tests for the
+   atom-SF encoders, the deferred-rewind fallback test.
+
 ### sm_89 port status
 
 With patches 5–10 the **entire tree compiles and links for sm_89**

@@ -1,4 +1,5 @@
 #include "ninfer/ops/attn_input_proj.h"
+#include "ops/linear/w8a8/w4fp4_plane.h"
 
 #include "ops/attn_input_proj/bf16/bf16_attn_input_plan.h"
 #include "ops/attn_input_proj/fp8/fp8_attn_input_plan.h"
@@ -238,7 +239,12 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
         // surogate vendor patch (PATCHES.md #17): AllowA8 large-T runs the
         // W8A8-int IMMA path, which needs quantized-activation workspace.
         if (policy == LinearPolicy::AllowA8 && max_tokens >= detail::kW8A8MinTokens) {
-            return detail::w8a8_act_quant_bytes(input_rows, max_tokens);
+            // surogate patch (PATCHES.md #25): the cutlass fp4 path needs its
+            // atom-SF quant buffers plus the [tokens, parent] stage.
+            const std::size_t a8 = detail::w8a8_act_quant_bytes(input_rows, max_tokens);
+            const std::size_t fp4 = detail::w4fp4_cutlass_workspace_bytes(
+                parent_rows, input_rows, max_tokens, true);
+            return a8 > fp4 ? a8 : fp4;
         }
         return 0;
     case QType::Q4G64_F16S:
