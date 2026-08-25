@@ -819,6 +819,30 @@ old ninfer/ paths.)
    shapes at the same band, then the vocabulary head's last 40%. Same
    playbook as PATCHES #28: census -> band routes -> measured kernels.
 
+30. **Mixed-token rounds (goal arc, owner-framed; IN FLIGHT).** Owner
+   diagnosis: vLLM wins via its scheduler + torch.compile fusion — a
+   gapless, 100%-compute timeline. Our graphs already run 94-96% busy,
+   so the structural difference is that vLLM's scheduler builds MIXED
+   steps: prefill-chunk tokens and decode tokens in one forward, so
+   every GEMM runs at effective T in the hundreds where tiles are
+   efficient — while our standalone decode rounds run T<=32, where even
+   correctly-routed kernels sit 3-6x off per-byte efficiency. The fix:
+   TextContext::mixed_chunk (interface declared) — one forward over
+   concatenated [prefill | decode] columns; GEMM/fused ops once over all
+   columns; mixers split per slice (prefill attention/GDN-scan over the
+   chunk columns, batch small-t attention/GDN-snapshot over the decode
+   columns; a concatenated positions tensor lets rope/norms run once).
+   All four mixer pieces exist as ops today. Remaining build order:
+   run_layers_mixed body (attn_mix/gdn_mix re-authored with the split at
+   the mixer core), program advance_mixed_round (marries PrefillContext
+   + OrdinaryBatchContext), executor worker_loop swap (the ~1119
+   alternation becomes one mixed round when both exist), workspace plan
+   at chunk+C columns, eager first then graphs. Measurement gate: 4B
+   multi100 vs the 1,736 standing number. Also open: verify (via ncu,
+   /usr/local/NVIDIA-Nsight-Compute-2026.1) whether the FP8-A8 32-token
+   tile actually entered the recaptured decode graphs — it measured
+   neutral twice on the 27B, which contradicts the census arithmetic.
+
 ### sm_89 port status
 
 With patches 5–10 the **entire tree compiles and links for sm_89**
