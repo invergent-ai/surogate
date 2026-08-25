@@ -430,8 +430,13 @@
    path). **Decode 208-215 tok/s across the board points — +31% over the
    engine's W8 line and +30% past vLLM-NVFP4's 162.** fp4 board final:
    prefill 11.1k/14.3k/20.5k, decode ~211. Remaining fp4-vs-NVFP4 gap is
-   long prefill only (20.5k vs 35.2k). Quality beyond the exact greedy
-   smoke still unevaled; batch>1 decode and non-4B targets keep W8
+   long prefill only (20.5k vs 35.2k). Quality spot-check (5 diverse
+   greedy prompts, fp8 vs fp4): identical answers on arithmetic/factual/
+   listing, semantically-identical code (x*x vs x**2), same-set color
+   ordering — and the two prompts the model gets wrong it gets wrong
+   IDENTICALLY in both modes (model limitation, not quant-induced). A
+   rigorous eval (GSM8K/IFEval class) remains open before calling the
+   quality class settled. Batch>1 decode and non-4B targets keep W8
    decode paths (patterns established).
 
 ### sm_89 port status
