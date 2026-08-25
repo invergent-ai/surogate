@@ -27,11 +27,13 @@
 namespace ninfer::ops::detail {
 
 __device__ __forceinline__ float w4fp4_e2m1_decode(unsigned nib) {
-    const int m = static_cast<int>(nib) & 7;
-    // m: 0 -> 0, 1 -> 0.5, 2.. -> 2^((m>>1)-1) * (1 + (m&1)/2)
-    float value = (m >= 2) ? ldexpf(1.0f + 0.5f * static_cast<float>(m & 1), (m >> 1) - 1)
-                           : 0.5f * static_cast<float>(m);
-    return (nib & 8u) ? -value : value;
+    // Direct fp32 bit assembly (e2m1 is a float format): m >= 2 -> exponent
+    // 126 + (m >> 1) with mantissa bit (m & 1); m in {0, 1} -> m * 0.5f.
+    const unsigned m    = nib & 7u;
+    const unsigned bits = (m >= 2u ? ((126u + (m >> 1)) << 23) | ((m & 1u) << 22)
+                                   : m * 0x3F000000u) |
+                          ((nib & 8u) << 28);
+    return __uint_as_float(bits);
 }
 
 __device__ __forceinline__ float w4fp4_ue4m3_decode(unsigned byte) {

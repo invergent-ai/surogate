@@ -164,6 +164,7 @@ struct PlaneEntry {
 };
 
 std::mutex g_mutex;
+std::size_t g_allocated_bytes = 0;
 std::unordered_map<const void*, PlaneEntry> g_planes;
 PrefillQuantMode g_mode = PrefillQuantMode::Fp8;
 
@@ -176,6 +177,11 @@ constexpr std::size_t align16(std::size_t bytes) noexcept {
 void w8_prefill_quant_set_mode(PrefillQuantMode mode) noexcept { g_mode = mode; }
 
 PrefillQuantMode w8_prefill_quant_mode() noexcept { return g_mode; }
+
+std::size_t w4fp4_plane_bytes() noexcept {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_allocated_bytes;
+}
 
 W4Fp4Plane w4fp4_plane_for(const Weight& weight, cudaStream_t stream) {
     if (!w8fp8_plane_enabled() || g_mode != PrefillQuantMode::Fp4 ||
@@ -218,6 +224,9 @@ W4Fp4Plane w4fp4_plane_for(const Weight& weight, cudaStream_t stream) {
         return fail(PlaneEntry{});
     }
 
+    std::size_t free_pre_alloc = 0;
+    (void)cudaMemGetInfo(&free_pre_alloc, &total_bytes);
+
     PlaneEntry entry;
     if (cudaMalloc(&entry.codes, code_bytes) != cudaSuccess) { return fail(entry); }
     if (cudaMalloc(&entry.sf, sf_bytes) != cudaSuccess) { return fail(entry); }
@@ -235,6 +244,10 @@ W4Fp4Plane w4fp4_plane_for(const Weight& weight, cudaStream_t stream) {
         return fail(entry);
     }
 
+    std::size_t free_post_alloc = 0;
+    (void)cudaMemGetInfo(&free_post_alloc, &total_bytes);
+    g_allocated_bytes +=
+        free_pre_alloc > free_post_alloc ? free_pre_alloc - free_post_alloc : 0;
     g_planes.emplace(weight.qdata, entry);
     return {entry.codes, entry.sf, entry.row_scales};
 }

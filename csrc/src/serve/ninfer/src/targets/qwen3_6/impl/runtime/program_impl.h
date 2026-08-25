@@ -1,3 +1,4 @@
+#include "ops/linear/w8a8/w8fp8_plane.h"
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/program.h"
 
@@ -1383,8 +1384,13 @@ void ProgramImplCore::prepare_graphs() {
 
     std::size_t free_after = 0;
     CUDA_CHECK(cudaMemGetInfo(&free_after, &total_bytes));
-    const std::size_t consumed = free_before > free_after ? free_before - free_after : 0;
-    graph_observed_bytes       = consumed;
+    std::size_t consumed = free_before > free_after ? free_before - free_after : 0;
+    // surogate vendor patch (PATCHES.md #22): derived quant planes (fp8/fp4
+    // registries) allocate lazily during the pre-capture warmup decode; they
+    // carry their own VRAM guard and are not graph memory, so exclude them.
+    const std::size_t plane_bytes = ops::detail::w8_derived_plane_bytes();
+    consumed                      = consumed > plane_bytes ? consumed - plane_bytes : 0;
+    graph_observed_bytes          = consumed;
     if (consumed > graph_allowance_bytes) {
         throw std::runtime_error("CUDA Graph preparation consumed " + std::to_string(consumed) +
                                  " bytes, exceeding the planned allowance of " +

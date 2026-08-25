@@ -266,6 +266,24 @@ History: first pass 10.1/13.6/17.1k; +wide gate 17.6k; +fused swiglu
 10.5/13.8/18.0k; +FP8 plane as shown. vLLM FP8 is now tied @472/@962 and
 beaten @1912; only 4-bit NVFP4 prefill at 962+ remains ahead.
 
+## fp4 profile (opt-in, PATCHES #21/#22) — the NVFP4-class row
+
+SUROGATE_SERVE_PREFILL_QUANT=fp4: derived NVFP4 plane end to end (W4A4
+mxf4nvf4 prefill + W4A16 bit-assembled decode; quality class = NVFP4 PTQ,
+never a default). Measured 2026-08-26, graphs on:
+
+| point | engine fp4 | vLLM NVFP4 (AxionML) |
+|---|---:|---:|
+| prefill @472 | **10,937** | 8,469 |
+| prefill @962 | 14,165 | **17,351** |
+| prefill @1912 | 20,273 | **35,169** |
+| decode | **~191** | 162 |
+
+Decode beats vLLM-NVFP4 by +18% at the same weight class (W4 covers
+attn/gdn/swiglu = ~2.5 of 4.2 GB/step; stage 2b adds the SIMT + lm_head
+families -> ~230-250 projected). The long-prefill gap is the remaining
+front (cutlass-class FP4 tiles + TMA).
+
 Reading:
 - Decode 158-162 tok/s: +60% over vLLM bf16, +39% over FP8, and a tie
   with NVFP4 (162) at TWICE the weight bits per parameter. The pre-build

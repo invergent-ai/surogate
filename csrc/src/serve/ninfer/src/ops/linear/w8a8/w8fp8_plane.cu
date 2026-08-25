@@ -3,6 +3,8 @@
 
 #include "ops/linear/w8a8/w8fp8_plane.h"
 
+#include "ops/linear/w8a8/w4fp4_plane.h"
+
 #include "core/device.h"
 
 #include <cuda_bf16.h>
@@ -93,6 +95,7 @@ struct PlaneEntry {
 };
 
 std::mutex g_mutex;
+std::size_t g_allocated_bytes = 0;
 std::unordered_map<const void*, PlaneEntry> g_planes;
 bool g_enabled = false;
 
@@ -109,6 +112,15 @@ bool env_vetoed() {
 void w8fp8_plane_set_enabled(bool enabled) noexcept { g_enabled = enabled; }
 
 bool w8fp8_plane_enabled() noexcept { return g_enabled && !env_vetoed(); }
+
+std::size_t w8fp8_plane_bytes() noexcept {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_allocated_bytes;
+}
+
+std::size_t w8_derived_plane_bytes() noexcept {
+    return w8fp8_plane_bytes() + w4fp4_plane_bytes();
+}
 
 W8Fp8Plane w8fp8_plane_for(const Weight& weight, cudaStream_t stream) {
     if (!w8fp8_plane_enabled() || weight.qtype != QType::W8G32_F16S ||
@@ -149,6 +161,9 @@ W8Fp8Plane w8fp8_plane_for(const Weight& weight, cudaStream_t stream) {
         return {nullptr, nullptr};
     }
 
+    std::size_t free_pre_alloc = 0;
+    (void)cudaMemGetInfo(&free_pre_alloc, &total_bytes);
+
     PlaneEntry entry;
     if (cudaMalloc(&entry.codes, code_bytes) != cudaSuccess) {
         g_planes.emplace(weight.qdata, PlaneEntry{});
@@ -181,6 +196,10 @@ W8Fp8Plane w8fp8_plane_for(const Weight& weight, cudaStream_t stream) {
         return {nullptr, nullptr};
     }
 
+    std::size_t free_post_alloc = 0;
+    (void)cudaMemGetInfo(&free_post_alloc, &total_bytes);
+    g_allocated_bytes +=
+        free_pre_alloc > free_post_alloc ? free_pre_alloc - free_post_alloc : 0;
     g_planes.emplace(weight.qdata, entry);
     return {entry.codes, entry.row_scales};
 }

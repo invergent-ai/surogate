@@ -43,6 +43,11 @@ struct W8Fp8Plane {
 void w8fp8_plane_set_enabled(bool enabled) noexcept;
 bool w8fp8_plane_enabled() noexcept;
 
+// Total device bytes held by derived planes (FP8 + FP4 registries). The
+// engine's graph-preparation accounting subtracts this: planes carry their
+// own VRAM guard and are not graph memory.
+std::size_t w8_derived_plane_bytes() noexcept;
+
 // Returns the derived plane for `weight` (deriving it on first call), or
 // nullptr codes when the plane is disabled, the weight is not an admitted
 // W8G32 row-split parent, or the VRAM guard declined. Derivation runs on

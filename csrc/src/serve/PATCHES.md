@@ -405,10 +405,25 @@
    external events.
 
    NOT yet covered: the SIMT decode family (o_proj/down at T<=4), lm_head,
-   and the 0.8b/2b/35B decode K-branches (same pattern). Validation queue
-   (next GPU window): fp4 smoke incl graphs, decode bench vs the ~160
-   tok/s W8 line (expect ~+25-40% from the covered families alone), and
-   the fp4-vs-fp8 quality delta beyond greedy smoke.
+   and the 0.8b/2b/35B decode K-branches (same pattern).
+
+   VALIDATED (idle 5090): three fixes were needed on the way —
+   - the graph-preparation memory check counted lazily-derived planes
+     (1.53 GB) against the 12 MiB graph allowance; the registries now
+     report their measured free-memory impact (cudaMemGetInfo around the
+     mallocs, capturing the ~2 MiB/alloc page rounding a byte-sum missed)
+     and program_impl excludes it;
+   - the ldexpf-chain e2m1 decode ate the entire byte win (W4 kernels
+     measured flat vs W8: 37.8 vs 40.3 us qkvz); replaced with direct
+     fp32 bit assembly (e2m1 is a float format: exponent 126 + (m>>1),
+     mantissa bit m&1, four ops total) —
+   decode went 158-162 (W8) -> 151-155 (ldexpf W4) -> **190-192 tok/s**,
+   +23% over the engine's own W8 line and **+18% past vLLM-NVFP4's 162**
+   at the same weight class, with graphs on and the greedy answer exact.
+   fp4 profile board: prefill 10.9k/14.2k/20.3k @472/962/1912, decode
+   ~191. Remaining fp4-vs-NVFP4 gap is long prefill only (20.3k vs
+   35.2k); stage 2b (SIMT + lm_head W4, the other ~1.7 GB/step) projects
+   decode ~230-250. Quality beyond the exact greedy smoke still unevaled.
 
 ### sm_89 port status
 

@@ -41,6 +41,8 @@ struct W4Fp4Plane {
 
 // Derive-on-first-use registry, mirroring w8fp8_plane_for (enabled flag is
 // shared via w8fp8_plane_set_enabled; the mode above picks the plane).
+std::size_t w4fp4_plane_bytes() noexcept;
+
 W4Fp4Plane w4fp4_plane_for(const Weight& weight, cudaStream_t stream);
 
 struct W4Fp4QuantizedActivations {
