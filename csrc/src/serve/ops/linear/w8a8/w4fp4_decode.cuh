@@ -101,4 +101,82 @@ __global__ __launch_bounds__(RowsPerCta * 32, 2) void w4fp4_decode_kernel(
     if (lane == 0) { epilogue(output, cta_row0, row, accumulator); }
 }
 
+// surogate vendor patch (PATCHES.md #28): batched twin for T=2..16. Weight
+// codes and block scales are loaded and decoded ONCE per phase and fanned
+// across up to MaxTokens resident accumulators, so the round keeps the W4
+// plane's halved weight traffic under batching (activations are tiny and
+// L2-resident across the row warps). `tokens` is the runtime batch
+// (2..MaxTokens); pick the smallest MaxTokens bucket covering it to bound
+// register pressure.
+template <std::int32_t Rows, std::int32_t RowsPerCta, class Output, std::int32_t MaxTokens,
+          std::int32_t K = 2048>
+__global__ __launch_bounds__(RowsPerCta * 32, 2) void w4fp4_decode_batch_kernel(
+    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
+    const std::uint8_t* __restrict__ sf, const float* __restrict__ row_scales, Output output,
+    std::int32_t tokens) {
+    static_assert(Rows > 0 && RowsPerCta > 0 && (Rows % RowsPerCta) == 0);
+    static_assert(MaxTokens >= 2 && MaxTokens <= 16);
+    constexpr int kK                 = K;
+    constexpr int kValuesPerLane     = 8;
+    constexpr int kValuesPerPhase    = 32 * kValuesPerLane;
+    constexpr int kSfPerPhase        = kValuesPerPhase / 16;
+    constexpr int kPhases            = kK / kValuesPerPhase;
+    constexpr unsigned kFullWarpMask = 0xffffffffu;
+    static_assert(kK % kValuesPerPhase == 0);
+
+    const int lane               = static_cast<int>(threadIdx.x) & 31;
+    const int warp               = static_cast<int>(threadIdx.x) >> 5;
+    const int cta_row0           = static_cast<int>(blockIdx.x) * RowsPerCta;
+    const int row                = cta_row0 + warp;
+    const std::uint8_t* code_row = codes + static_cast<std::int64_t>(row) * (kK / 2);
+    const std::uint8_t* sf_row   = sf + static_cast<std::int64_t>(row) * (kK / 16);
+
+    float accumulator[MaxTokens];
+#pragma unroll
+    for (int t = 0; t < MaxTokens; ++t) { accumulator[t] = 0.0f; }
+
+#pragma unroll
+    for (int phase = 0; phase < kPhases; ++phase) {
+        unsigned sf_bits = 0;
+        if (lane < kSfPerPhase) { sf_bits = sf_row[phase * kSfPerPhase + lane]; }
+        sf_bits           = __shfl_sync(kFullWarpMask, sf_bits, lane >> 1);
+        const float scale = w4fp4_ue4m3_decode(sf_bits);
+
+        const int phase_k = phase * kValuesPerPhase + lane * kValuesPerLane;
+        const std::uint32_t packed =
+            *reinterpret_cast<const std::uint32_t*>(code_row + phase_k / 2);
+        float weightv[kValuesPerLane];
+#pragma unroll
+        for (int i = 0; i < kValuesPerLane; ++i) {
+            weightv[i] = w4fp4_e2m1_decode((packed >> (4 * i)) & 0xFu);
+        }
+
+        for (int t = 0; t < tokens; ++t) {
+            const uint4 values = load_vec<uint4>(x + static_cast<std::int64_t>(t) * kK + phase_k);
+            const float2 x0    = bf16x2_bits_to_float2(values.x);
+            const float2 x1    = bf16x2_bits_to_float2(values.y);
+            const float2 x2    = bf16x2_bits_to_float2(values.z);
+            const float2 x3    = bf16x2_bits_to_float2(values.w);
+            float partial      = 0.0f;
+            partial            = fmaf(weightv[0], x0.x, partial);
+            partial            = fmaf(weightv[1], x0.y, partial);
+            partial            = fmaf(weightv[2], x1.x, partial);
+            partial            = fmaf(weightv[3], x1.y, partial);
+            partial            = fmaf(weightv[4], x2.x, partial);
+            partial            = fmaf(weightv[5], x2.y, partial);
+            partial            = fmaf(weightv[6], x3.x, partial);
+            partial            = fmaf(weightv[7], x3.y, partial);
+            accumulator[t]     = fmaf(partial, scale, accumulator[t]);
+        }
+    }
+
+    const float row_scale = row_scales[row];
+    for (int t = 0; t < tokens; ++t) {
+        float value = warp_reduce_sum(accumulator[t] * row_scale);
+        if (lane == 0) {
+            *output.tile(cta_row0).at(row, t) = __float2bfloat16_rn(value);
+        }
+    }
+}
+
 } // namespace ninfer::ops::detail

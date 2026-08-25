@@ -671,8 +671,19 @@ old ninfer/ paths.)
    SplitKMmaDirect (T>=17 keeps the runtime-dim MMA; the medium kernel
    still bakes 35B geometry). linear_pair checked: MTP-only, not in
    ordinary rounds — no change. Phase-1 W8 route work is COMPLETE for
-   every family a batch decode round touches; batch-T w4fp4_decode
-   (T=1-only today) is the remaining Phase-1 kernel item. Then: batch-T w4fp4_decode
+   every family a batch decode round touches; batch-T w4fp4_decode SHIPPED in the
+   fourth pass: w4fp4_decode_batch_kernel<Rows,RowsPerCta,Output,
+   MaxTokens,K> decodes each weight nibble once and fans it across up to
+   MaxTokens resident accumulators (buckets 4/8/16 bound register
+   pressure; runtime `tokens` inside the bucket), wired at the
+   plain-linear W4 site (lm_head 248320x2560 + 2560x{4096,9216}) for
+   T=2..16. The fused families keep the new W8 exact-T tables at batch
+   for now — routing THEM onto W4 batch variants is a measured tuning
+   decision (W4 halves weight bytes but the exact-T MMA kernels may
+   still win on issue shape; bench on GPU return). VALIDATION QUEUE
+   (GPU): ctest parity (GDN conv epilogue geometry + batched W4
+   correctness vs T=1 column-by-column), 8-user pure-decode probe
+   (baseline 350.7 agg), multi100 board rerun. Then: batch-T w4fp4_decode
    (T=1 only today — fp4 profile batch rounds pay 2x weight bytes),
    decode-graph recapture is automatic at load. VALIDATE when GPU
    returns: per-op bench (ninfer_attn_input_proj_bench --tokens 1..8 at

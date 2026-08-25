@@ -62,17 +62,34 @@ void launch_w8_simt_r8_c4(const Tensor& x, const Weight& w, Tensor& out, cudaStr
     // surogate vendor patch (PATCHES.md #22): fp4 profile T=1 decode for the
     // SIMT-routed families (o_proj, down, lm_head). Batch>1 decode keeps the
     // multi-column SIMT path.
-    if (x.ne[1] == 1 && w8_prefill_quant_mode() == PrefillQuantMode::Fp4) {
+    if (x.ne[1] >= 1 && x.ne[1] <= 16 && w8_prefill_quant_mode() == PrefillQuantMode::Fp4) {
         const W4Fp4Plane plane = w4fp4_plane_for(w, stream);
         if (plane.codes != nullptr) {
             const auto* xp = static_cast<const __nv_bfloat16*>(x.data);
             const W8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), out.ne[0]};
+            const std::int32_t tokens = x.ne[1];
             const auto launch = [&](auto rows_c, auto k_c) {
                 constexpr std::int32_t kRows = decltype(rows_c)::value;
                 constexpr std::int32_t kKd   = decltype(k_c)::value;
-                w4fp4_decode_kernel<kRows, 8, W8ContiguousOutput, W8DecodeStoreEpilogue, kKd>
-                    <<<kRows / 8, 8 * 32, 0, stream>>>(xp, plane.codes, plane.sf,
-                                                       plane.row_scales, output);
+                if (tokens == 1) {
+                    w4fp4_decode_kernel<kRows, 8, W8ContiguousOutput, W8DecodeStoreEpilogue, kKd>
+                        <<<kRows / 8, 8 * 32, 0, stream>>>(xp, plane.codes, plane.sf,
+                                                           plane.row_scales, output);
+                } else if (tokens <= 4) {
+                    // surogate vendor patch (PATCHES.md #28): batched W4 decode
+                    // keeps the halved weight traffic under batch rounds.
+                    w4fp4_decode_batch_kernel<kRows, 8, W8ContiguousOutput, 4, kKd>
+                        <<<kRows / 8, 8 * 32, 0, stream>>>(xp, plane.codes, plane.sf,
+                                                           plane.row_scales, output, tokens);
+                } else if (tokens <= 8) {
+                    w4fp4_decode_batch_kernel<kRows, 8, W8ContiguousOutput, 8, kKd>
+                        <<<kRows / 8, 8 * 32, 0, stream>>>(xp, plane.codes, plane.sf,
+                                                           plane.row_scales, output, tokens);
+                } else {
+                    w4fp4_decode_batch_kernel<kRows, 8, W8ContiguousOutput, 16, kKd>
+                        <<<kRows / 8, 8 * 32, 0, stream>>>(xp, plane.codes, plane.sf,
+                                                           plane.row_scales, output, tokens);
+                }
                 CUDA_CHECK(cudaGetLastError());
             };
             using I = std::integral_constant<std::int32_t, 2560>;
