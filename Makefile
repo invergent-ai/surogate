@@ -44,11 +44,14 @@ SERVE_BUILD_DIR ?= csrc/build-serve
 serve-configure:
 	cmake -S csrc -B $(SERVE_BUILD_DIR) -G Ninja \
 		-DCMAKE_BUILD_TYPE=Release \
-		-DCMAKE_CUDA_ARCHITECTURES=120a $(CCACHE_FLAGS)
+		-DCMAKE_CUDA_ARCHITECTURES=120a \
+		-DPYTHON_BINDING=ON $(CCACHE_FLAGS)
 
 serve-build: serve-configure
 	cmake --build $(SERVE_BUILD_DIR) --parallel $(PARALLEL_JOBS) \
-		--target surogate-engine-cli surogate-engine
+		--target surogate-engine-cli surogate-engine _surogate_serve
+	cp -f $(SERVE_BUILD_DIR)/_surogate_serve*.so surogate/ 2>/dev/null || true
+	cp -f $(SERVE_BUILD_DIR)/_surogate_serve*.so .venv/lib/python3.12/site-packages/surogate/ 2>/dev/null || true
 
 serve-test-build:
 	cmake -S csrc -B $(SERVE_BUILD_DIR) -G Ninja \

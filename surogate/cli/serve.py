@@ -3,7 +3,7 @@
 #
 # `surogate serve ...` — the native serving engine (design/serve-engine-plan.md).
 #
-# The engine is the vendored C++ NInfer server (csrc/src/serve/ninfer), built by
+# The engine is the C++ server at csrc/src/serve (NInfer-derived), built by
 # `make serve-build`. This wrapper resolves the binary and os.execv's it, so no
 # Python (and no Python CUDA context) stays in the serving process. It must run
 # BEFORE any CUDA-touching import in surogate.cli.main, mirroring jackalope.
@@ -38,7 +38,7 @@ Common engine options (full list: surogate serve --engine-help):
 
 The engine binary is resolved from, in order:
   1. $SUROGATE_SERVE_BIN / $SUROGATE_ENGINE_CLI_BIN (explicit paths)
-  2. the repo build tree (csrc/build-serve/apps/) when running from a checkout
+  2. the repo build tree (csrc/build-serve/) when running from a checkout
   3. $PATH (surogate-engine / surogate-engine-cli)
 Build it from a checkout with: make serve-build
 """
@@ -47,7 +47,7 @@ Build it from a checkout with: make serve-build
 def _repo_root() -> Path | None:
     # surogate/cli/serve.py -> surogate/cli -> surogate -> repo root
     root = Path(__file__).resolve().parent.parent.parent
-    return root if (root / "csrc" / "src" / "serve" / "ninfer").is_dir() else None
+    return root if (root / "csrc" / "src" / "serve").is_dir() else None
 
 
 def _resolve_binary(server_mode: bool) -> str | None:
@@ -57,7 +57,7 @@ def _resolve_binary(server_mode: bool) -> str | None:
         return env
     root = _repo_root()
     if root is not None:
-        cand = root / "csrc" / "build-serve" / "apps" / name
+        cand = root / "csrc" / "build-serve" / name
         if cand.is_file():
             return str(cand)
     return shutil.which(name)

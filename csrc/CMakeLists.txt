@@ -789,9 +789,11 @@ function(ninfer_internal_includes target)
   # Serve targets build for the RTX arch set (default 120a; sm_89 compiles
   # via the upstream port guards, execution pending Ada hardware). Features
   # above a device's capability gate off at runtime (FP8 plane needs sm_89+,
-  # the fp4 profile needs sm_120a).
+  # the fp4 profile needs sm_120a). PIC everywhere so the archives can link
+  # into the _surogate_serve Python module as well as the executables.
   set_target_properties(${target} PROPERTIES
-      CUDA_ARCHITECTURES "${SUROGATE_SERVE_CUDA_ARCHS}")
+      CUDA_ARCHITECTURES "${SUROGATE_SERVE_CUDA_ARCHS}"
+      POSITION_INDEPENDENT_CODE ON)
 endfunction()
 
 function(ninfer_cuda_archive target)
@@ -1198,6 +1200,18 @@ set_target_properties(ninfer-serve PROPERTIES OUTPUT_NAME surogate-engine)
         if(SUROGATE_SERVE_BENCH)
             add_subdirectory(src/testing/serve/bench serve_bench EXCLUDE_FROM_ALL)
         endif()
+        # Python binding for the serve engine: a SEPARATE extension module
+        # from _surogate (arch gating + payload + lifecycle isolation).
+        if(PYTHON_BINDING)
+            nanobind_add_module(_surogate_serve NOSTRIP
+                ${CMAKE_SOURCE_DIR}/src/binding/py_serve.cpp)
+            target_include_directories(_surogate_serve PRIVATE
+                ${SERVE_ROOT} ${NINFER_JSON_INCLUDE})
+            target_link_libraries(_surogate_serve PRIVATE
+                ninfer_engine ninfer_product_prompt_input)
+            set_target_properties(_surogate_serve PROPERTIES EXCLUDE_FROM_ALL TRUE)
+        endif()
+
         endif()  # LIBCURL_FOUND
     endif()
 endif()
