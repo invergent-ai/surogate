@@ -756,7 +756,10 @@ old ninfer/ paths.)
    (operators choose --max-concurrency; 16 remains the measured
    recommendation and the board's config). The 32-lane unlock is a vocab
    exact-T table (248320 x hidden) or W4 MaxTokens=32 bucket, plus a
-   T=17..32 census pass.
+   T=17..32 census pass. ATTEMPTED same day: a W4
+   MaxTokens=32 bucket measured WORSE everywhere (0.8B 2,625, 4B 1,128 —
+   32 accumulators spill and the extra local traffic loses to the tile);
+   reverted. The vocab exact-T table remains the real unlock.
 
 ### sm_89 port status
 
