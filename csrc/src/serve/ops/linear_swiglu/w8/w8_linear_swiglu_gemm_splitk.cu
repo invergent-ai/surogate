@@ -90,6 +90,18 @@ constexpr auto kLaunchers =
 constexpr auto kQ08Launchers =
     make_q08_launchers(std::make_index_sequence<kLastExactT - kFirstExactT + 1>{});
 
+// surogate vendor patch (PATCHES.md #28): qwen3.5-4b mlp (2x9216, k=2560)
+// exact-T instantiations — batch decode rounds live at T=2..16 and paid the
+// runtime-shaped MMA tiles without this table.
+template <std::size_t... Offsets>
+constexpr auto make_q4b_launchers(std::index_sequence<Offsets...>) {
+    return std::array<ProjectionLauncher, sizeof...(Offsets)>{
+        &launch_active_cols<kFirstExactT + static_cast<int>(Offsets), 9216, 2560>...};
+}
+
+constexpr auto kQ4BLaunchers =
+    make_q4b_launchers(std::make_index_sequence<kLastExactT - kFirstExactT + 1>{});
+
 } // namespace
 
 void w8_linear_swiglu_splitk_exact_t_launch(const Tensor& x, const Weight& w, Tensor& out,
@@ -99,6 +111,8 @@ void w8_linear_swiglu_splitk_exact_t_launch(const Tensor& x, const Weight& w, Te
     }
     if (w.k == 1024) {
         kQ08Launchers[x.ne[1] - kFirstExactT](x, w, out, stream);
+    } else if (w.k == 2560) {
+        kQ4BLaunchers[x.ne[1] - kFirstExactT](x, w, out, stream);
     } else {
         kLaunchers[x.ne[1] - kFirstExactT](x, w, out, stream);
     }

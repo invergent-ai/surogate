@@ -656,12 +656,17 @@ old ninfer/ paths.)
    their routes sent T=2..128 to the MMA tiles (the #16 comment said as
    much). FIXED HERE for attn_input_proj: 2B (5120x2048) and 4B
    (10240x2560, Output4<4096,1024,4096,1096-order q,k,gate,v>) exact-T
-   tables (T=2..48) + kTarget4BRoutes + the 2B band flip. REMAINING
-   (mechanical, same pattern per family): linear_swiglu (mlp gate_up),
-   linear_add (o_proj + mlp down), gdn_input_proj, linear_pair — each has
-   its own plan.cpp route table + splitk instantiation file under
-   ops/<family>/w8/; add the 2B/4B Hidden/Rows instantiations and flip
-   the 2..48 band to the split-K schedule. Then: batch-T w4fp4_decode
+   tables (T=2..48) + kTarget4BRoutes + the 2B band flip. ALSO DONE in this
+   pass: linear_swiglu 4B exact-T table (2x9216, k=2560; the 2B already
+   rode the base band) + route flip, and linear_add SIMT band widened
+   1..4 -> 1..16 for the small-target tables (runtime-shaped SIMT kernel,
+   no new instantiation; exact-T bakes for 2560x{4096,9216} and
+   2048x2048 are the refinement pass). REMAINING: gdn_input_proj — all
+   three small targets route T>=2 to MmaR64C128; its bespoke split-K
+   kernel bakes the 35B geometry (kRows=12288/kHidden=2048 namespace
+   constexprs); template the geometry (the 4B shares 12288 rows — only
+   Hidden varies: 2560/2048/1024 + Output splits 8192/4096 vs 6144/2048)
+   and flip the small-target 2..32 band. Check linear_pair similarly. Then: batch-T w4fp4_decode
    (T=1 only today — fp4 profile batch rounds pay 2x weight bytes),
    decode-graph recapture is automatic at load. VALIDATE when GPU
    returns: per-op bench (ninfer_attn_input_proj_bench --tokens 1..8 at

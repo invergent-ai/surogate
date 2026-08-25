@@ -63,12 +63,13 @@ constexpr std::array<RouteSpec, 18> kQ08Routes = [] {
     return routes;
 }();
 
-// surogate vendor patch (PATCHES.md #18): qwen3.5-4b — no exact-T
-// instantiations at k=2560; decode plus the runtime-shaped MMA bands
-// (the engine's A8 path takes T >= 224 regardless).
-constexpr std::array<RouteSpec, 3> kQ4BRoutes{{
+// surogate vendor patch (PATCHES.md #18/#28): qwen3.5-4b. The k=2560 exact-T
+// table is instantiated now; the 2..48 band rides it (batch decode rounds
+// live at T=2..16; the engine's A8 path takes T >= 224 regardless).
+constexpr std::array<RouteSpec, 4> kQ4BRoutes{{
     {1, 1, W8LinearSwiGluScheduleId::DecodePairR16},
-    {2, 256, W8LinearSwiGluScheduleId::MmaR32C64},
+    {2, 48, W8LinearSwiGluScheduleId::SplitKMmaExactT},
+    {49, 256, W8LinearSwiGluScheduleId::MmaR32C64},
     {257, kAnyCols, W8LinearSwiGluScheduleId::MmaR64C128},
 }};
 
