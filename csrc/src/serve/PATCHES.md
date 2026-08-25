@@ -680,10 +680,19 @@ old ninfer/ paths.)
    T=2..16. The fused families keep the new W8 exact-T tables at batch
    for now — routing THEM onto W4 batch variants is a measured tuning
    decision (W4 halves weight bytes but the exact-T MMA kernels may
-   still win on issue shape; bench on GPU return). VALIDATION QUEUE
-   (GPU): ctest parity (GDN conv epilogue geometry + batched W4
-   correctness vs T=1 column-by-column), 8-user pure-decode probe
-   (baseline 350.7 agg), multi100 board rerun. Then: batch-T w4fp4_decode
+   still win on issue shape; bench on GPU return). VALIDATED (2026-08-25,
+   GPU2): full ctest green (frontend = known environmental skip); 4B
+   8-user pure decode 350.7 -> 908.6 tok/s (+159%, per-stream 44.3 ->
+   116.5); 4B multi100 354 -> 865 (+144%, TTFT 28.9 -> 13.1s, 0 errors);
+   0.8B multi100 1,255 -> 2,362 (+88%, per-stream 158 -> 300); solo
+   decode 215 vs 214 = no single-user regression. Batch-8 rounds now
+   cost ~1.85x solo (was 4.84x; ideal ~1.2x — the tail is the
+   W4-at-batch family routing decision, attention/GDN small-t at batch,
+   and sampling). Greedy C=1 vs C=8 flips one near-tie (EOS vs comma
+   after an obeyed instruction; both valid) — pre-existing, no changed
+   code runs at batch 1; a per-token logit parity harness is the
+   rigorous follow-up. vLLM multi gap: 9.6x -> 3.9x @4B, 4.7x -> 2.5x
+   @0.8B; the rest is scheduling (Phases 2-3). Then: batch-T w4fp4_decode
    (T=1 only today — fp4 profile batch rounds pay 2x weight bytes),
    decode-graph recapture is automatic at load. VALIDATE when GPU
    returns: per-op bench (ninfer_attn_input_proj_bench --tokens 1..8 at

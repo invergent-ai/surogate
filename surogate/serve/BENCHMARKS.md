@@ -40,7 +40,7 @@ unsloth NVFP4 export + base checkpoint by the vendored converter).
 
 | engine | weights | TTFT @1.9k | decode tok/s (1 user) | 100-user agg tok/s | 100-user TTFT p50 | 100-user reqs ok/err |
 |---|---|---:|---:|---:|---:|---:|
-| **surogate serve** | from GGUF Q4_K_M | **48 ms** | **473** | 1,255 | 9.3 s | 984/0 |
+| **surogate serve** | from GGUF Q4_K_M | **48 ms** | **473** | 2,362 † | 4.9 s | 1,215/0 |
 | llama-server (CUDA) | GGUF Q4_K_M | 168 ms | 391 | 772 | 10.9 s | 612/419 |
 | vLLM | NVFP4 (4-bit) | 55 ms | 364 | **5,958** | **0.41 s** | 4,200/0 |
 
@@ -48,7 +48,7 @@ unsloth NVFP4 export + base checkpoint by the vendored converter).
 
 | engine | weights | TTFT @1.9k | decode tok/s (1 user) | 100-user agg tok/s | 100-user TTFT p50 | 100-user reqs ok/err |
 |---|---|---:|---:|---:|---:|---:|
-| **surogate serve** | from GGUF Q4_K_M | **57 ms** | **214** | **354** | 28.9 s | 336/0 |
+| **surogate serve** | from GGUF Q4_K_M | **57 ms** | **214** | **865** † | 13.1 s | 704/0 |
 | llama-server (CUDA) | GGUF Q4_K_M | 445 ms | 190 | 331 | 27.4 s | 306/174 |
 | vLLM | NVFP4 (4-bit) | 71 ms | 166 | **3,390** | **0.24 s** | 2,400/0 |
 
@@ -91,8 +91,17 @@ missing piece.
   Per-stream decode runs +29–30% over vLLM NVFP4 at matched widths.
   Against the llama.cpp user profile (same GGUF in, one box, few users)
   the engine is strictly better at every size that fits.
-- **100-user throughput: vLLM wins everywhere it serves — 4.7×
-  (0.8B) to 9.6× (4B) over the engine, 2.9× at 27B (688 vs 235).** The
+- **100-user throughput: vLLM still wins where it serves, but the gap
+  collapsed** († = after the PATCHES #28 batch-decode route fix, same
+  build for all engine cells): 2.5× at 0.8B (5,958 vs 2,362, was 4.7×)
+  and 3.9× at 4B (3,390 vs 865, was 9.6×), with the engine now 2.6–3.1×
+  ahead of llama-server's tuned multi-user config. The fix: batch
+  T=2..16 layer GEMMs ran prefill-class MMA tiles at ~6% utilization
+  because the small targets' exact-T split-K tables were never
+  instantiated; instantiating them took a batch-8 round from 4.84× to
+  ~1.85× a solo round. The remaining gap is scheduling (the engine still
+  queues whole requests behind 8 lanes; vLLM admits continuously at
+  ~100 deep) — the campaign's next phases. The
   engine's aggregate is its 8 lanes times a per-lane decode that scales
   weakly (4B: 44/stream batched vs 214 solo ≈ 1.65× total; 0.8B: 2.65×);
   vLLM runs ~100-deep continuous batching at lower per-stream speed
