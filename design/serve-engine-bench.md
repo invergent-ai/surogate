@@ -265,6 +265,38 @@ fusion ~1.1ms, conv-snapshot A8 branch ~1.5ms, quantizing-rmsnorm ~1ms,
 GDN chunk tuning) or the native 4-bit small-target profile.
 
 
+# Board of record 2026-08-26 evening (PATCHES #24: deferred rewrite checkpoint)
+
+All engine rows measured with SUROGATE_SERVE_DEFER_REWRITE_CHECKPOINT=1
+(opt-in; see PATCHES #24 for the trade) and --prefill-warmup. Every
+prefill previously paid a hidden ~12 ms (4B) full-model tail pass for the
+thinking-rewind checkpoint; these rows are without it.
+
+## 4B
+
+| point | engine fp8 (default) | engine fp4 (opt-in) | vLLM bf16 | vLLM FP8 | vLLM NVFP4 |
+|---|---:|---:|---:|---:|---:|
+| prefill @472 | 16,606 | **21,176** | 9,855 | 11,838 | 8,469 |
+| prefill @962 | 19,727 | **24,403** | 11,475 | 15,985 | 17,351 |
+| prefill @1912 | 23,196 | 28,899 | 12,679 | 19,743 | **35,169** |
+| decode | 158-162 | **~211** | 100 | 115 | 162 |
+
+Default 8-bit beats every vLLM config at @472/@962 and bf16+FP8 at
+@1912; fp4 closes NVFP4's @1912 lead to -18% and wins everything else.
+
+## 2B / 0.8B (default profile)
+
+| point | 2B engine | 2B vLLM NVFP4 | 0.8B engine | 0.8B vLLM NVFP4 |
+|---|---:|---:|---:|---:|
+| prefill @472 | **33,035** | 24,057 | **48,685** | 25,428 |
+| prefill @962 | **42,701** | 22,660 | **69,947** | 22,344 |
+| prefill @1912 | **49,959** | 44,754 | **85,546** | 38,685 |
+| decode | **320-327** | 256-258 | **450-468** | 386-390 |
+
+2B is now past vLLM-NVFP4 at every point including @1912 (+12%); 0.8B
+@1912 is 2.2x. The 8-bit engine outruns vLLM's 4-bit at every measured
+number on the small targets.
+
 # Qwen3.5-4B — engine vs vLLM (target shipped, PATCHES #18)
 
 Same method, idle 5090, batch 1, greedy, 128 decode tokens. Engine =
