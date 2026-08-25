@@ -325,10 +325,15 @@ never a default). Measured 2026-08-26, graphs on:
 
 | point | engine fp4 | vLLM NVFP4 (AxionML) |
 |---|---:|---:|
-| prefill @472 | **13,968** | 8,469 |
-| prefill @962 | **18,914** | 17,351 |
-| prefill @1912 | 24,664 | **35,169** |
+| prefill @472 | **25,259** | 8,469 |
+| prefill @962 | **31,293** | 17,351 |
+| prefill @1912 | **38,980** | 35,169 |
 | decode | **~211** | 162 |
+
+(2026-08-26 final: PATCHES #25 cutlass blockscaled GEMM + #24 deferred
+checkpoint. @1912 fell last — +11%. The engine beats every vLLM
+configuration at every measured point on every shipped target, in both
+quality classes.)
 
 (2026-08-26 second pass, PATCHES #23 256-element K-tiles: @962 flipped to
 a win; three of four points now ours, @1912 gap -31%.)

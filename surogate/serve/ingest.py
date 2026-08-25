@@ -33,8 +33,10 @@ class ConverterTarget:
 
 
 def _ninfer_root() -> Path | None:
-    root = Path(__file__).resolve().parent.parent.parent / "csrc" / "src" / "serve" / "ninfer"
-    return root if (root / "tools" / "convert").is_dir() else None
+    # Converters are part of the surogate package now; the "root" is the
+    # repository root (kept for subprocess cwd/log context only).
+    root = Path(__file__).resolve().parent.parent.parent
+    return root if (root / "surogate" / "serve" / "tools" / "convert").is_dir() else None
 
 
 def classify_input(spec: str) -> str:
@@ -66,26 +68,26 @@ def converter_for_config(config: dict) -> ConverterTarget | None:
     # Registered geometries (vendored targets). Text-config nesting (VL-style
     # configs) is flattened by callers before this point.
     if model_type == "qwen3_5" and hidden == 1024 and layers == 24:
-        return ConverterTarget("qwen3_5_0_8b", "tools.convert.qwen3_5_0_8b.convert",
+        return ConverterTarget("qwen3_5_0_8b", "surogate.serve.tools.convert.qwen3_5_0_8b.convert",
                                "Qwen3.5-0.8B", gguf_repack=True)
     if model_type == "qwen3_5" and hidden == 2048 and layers == 24:
-        return ConverterTarget("qwen3_5_2b", "tools.convert.qwen3_5_2b.convert",
+        return ConverterTarget("qwen3_5_2b", "surogate.serve.tools.convert.qwen3_5_2b.convert",
                                "Qwen3.5-2B", gguf_repack=True)
     if model_type == "qwen3_5" and hidden == 2560 and layers == 32:
-        return ConverterTarget("qwen3_5_4b", "tools.convert.qwen3_5_4b.convert",
+        return ConverterTarget("qwen3_5_4b", "surogate.serve.tools.convert.qwen3_5_4b.convert",
                                "Qwen3.5-4B", gguf_repack=True)
     if model_type in ("qwen3_5", "qwen3_6") and hidden == 5120 and layers >= 60:
         if nvfp4:
-            return ConverterTarget("qwen3_6_27b_nvfp4", "tools.convert.qwen3_6_27b.convert_nvfp4",
+            return ConverterTarget("qwen3_6_27b_nvfp4", "surogate.serve.tools.convert.qwen3_6_27b.convert_nvfp4",
                                    "Qwen3.6-27B (NVFP4)")
-        return ConverterTarget("qwen3_6_27b", "tools.convert.qwen3_6_27b.convert", "Qwen3.6-27B")
+        return ConverterTarget("qwen3_6_27b", "surogate.serve.tools.convert.qwen3_6_27b.convert", "Qwen3.6-27B")
     if model_type == "qwen3_8" and hidden == 5120:
         if nvfp4:
-            return ConverterTarget("qwen3_8_27b_nvfp4", "tools.convert.qwen3_8_27b.convert_nvfp4",
+            return ConverterTarget("qwen3_8_27b_nvfp4", "surogate.serve.tools.convert.qwen3_8_27b.convert_nvfp4",
                                    "Qwen3.8-27B (NVFP4)")
-        return ConverterTarget("qwen3_8_27b", "tools.convert.qwen3_8_27b.convert", "Qwen3.8-27B")
+        return ConverterTarget("qwen3_8_27b", "surogate.serve.tools.convert.qwen3_8_27b.convert", "Qwen3.8-27B")
     if model_type in ("qwen3_5_moe", "qwen3_6_moe") and int(config.get("num_experts", 0) or 0) > 0:
-        return ConverterTarget("qwen3_6_35b_a3b", "tools.convert.qwen3_6_35b_a3b.convert",
+        return ConverterTarget("qwen3_6_35b_a3b", "surogate.serve.tools.convert.qwen3_6_35b_a3b.convert",
                                "Qwen3.6-35B-A3B")
     return None
 
@@ -207,12 +209,12 @@ def _repack_planner(root: Path, target_key: str):
         import sys as _sys
         if str(root) not in _sys.path:
             _sys.path.insert(0, str(root))
-        from tools.convert.common.gguf_repack import (
+        from surogate.serve.tools.convert.common.gguf_repack import (
             REPACKABLE_TYPES,
             GgufRepackSource,
         )
-        inventory = importlib.import_module(f"tools.convert.{target_key}.inventory")
-        recipe = importlib.import_module(f"tools.convert.{target_key}.recipe")
+        inventory = importlib.import_module(f"surogate.serve.tools.convert.{target_key}.inventory")
+        recipe = importlib.import_module(f"surogate.serve.tools.convert.{target_key}.recipe")
 
         candidates = {
             hf: entry

@@ -764,14 +764,422 @@ if(SUROGATE_BUILD_SERVE)
             endif()
         endif()
         pkg_check_modules(LIBCURL REQUIRED IMPORTED_TARGET libcurl>=7.85)
-        add_subdirectory(src/serve/src serve_src EXCLUDE_FROM_ALL)
-        add_subdirectory(src/serve/apps serve_apps EXCLUDE_FROM_ALL)
+        set(SERVE_ROOT ${CMAKE_SOURCE_DIR}/src/serve)
+
+        # ---- serve engine libraries (formerly src/serve/src/CMakeLists.txt) ----
+function(ninfer_internal_includes target)
+  target_include_directories(${target} PRIVATE
+    ${SERVE_ROOT}
+    ${SUROGATE_VENDOR_DIR}
+    ${SUROGATE_VENDOR_DIR}/utf8proc
+    ${NINFER_JSON_INCLUDE})
+  # Serve is sm_120a-only regardless of the surrounding project's targets.
+  set_target_properties(${target} PROPERTIES CUDA_ARCHITECTURES "120a")
+endfunction()
+
+function(ninfer_cuda_archive target)
+  set_target_properties(${target} PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+  target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+endfunction()
+
+# Device/tensor/layout/graph primitives and the model-independent request runtime.
+add_library(ninfer_core STATIC EXCLUDE_FROM_ALL
+  ${SERVE_ROOT}/core/arena.cu
+  ${SERVE_ROOT}/core/device.cu
+  ${SERVE_ROOT}/core/dtype.cpp
+  ${SERVE_ROOT}/core/host_worker_pool.cpp
+  ${SERVE_ROOT}/core/gdn_replay_records.cpp
+  ${SERVE_ROOT}/core/cyclic_kv_cache.cpp
+  ${SERVE_ROOT}/core/paged_kv_cache.cpp
+  ${SERVE_ROOT}/core/linear_attention_state.cpp
+  ${SERVE_ROOT}/core/layout.cpp
+  ${SERVE_ROOT}/core/tensor.cpp
+  ${SERVE_ROOT}/core/decode_graph.cpp
+  ${SERVE_ROOT}/runtime/engine/admission_policy.cpp
+  ${SERVE_ROOT}/runtime/engine/kv_capacity.cpp
+  ${SERVE_ROOT}/runtime/engine/public_types.cpp
+  ${SERVE_ROOT}/runtime/engine/request_memory.cpp)
+ninfer_internal_includes(ninfer_core)
+ninfer_cuda_archive(ninfer_core)
+target_link_libraries(ninfer_core PUBLIC CUDA::cudart CUDA::nvtx3 Threads::Threads)
+
+# Generic .ninfer framing, binding, and direct final materialization.
+add_library(ninfer_artifact STATIC EXCLUDE_FROM_ALL
+  ${SERVE_ROOT}/artifact/reader.cpp
+  ${SERVE_ROOT}/artifact/storage_layouts.cpp
+  ${SERVE_ROOT}/artifact/binder.cpp
+  ${SERVE_ROOT}/artifact/materializer.cpp
+  ${SERVE_ROOT}/artifact/typed_binding.cpp)
+ninfer_internal_includes(ninfer_artifact)
+target_link_libraries(ninfer_artifact PUBLIC ninfer_core)
+
+# The warp-specialized SM120 kernel uses setmaxnreg to transfer registers from its
+# producer warpgroup to its consumer warpgroups. Relocatable device code makes ptxas
+# discard that contract, so this self-contained kernel is intentionally compiled in a
+# non-RDC archive and called through a host launcher from ninfer_ops.
+# surogate vendor patch (csrc/src/serve/PATCHES.md): the W4A4 TMA kernels are
+# sm_120-only hardware (TMA + cluster + block-scaled FP4 MMA). Port builds for
+# other architectures link a loud-failure stub instead.
+if("120a" IN_LIST CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
+  add_library(ninfer_nvfp4_tma STATIC EXCLUDE_FROM_ALL
+    ${SERVE_ROOT}/ops/linear/nvfp4/nvfp4_w4a4_tma.cu
+    ${SERVE_ROOT}/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cu)
+else()
+  add_library(ninfer_nvfp4_tma STATIC EXCLUDE_FROM_ALL
+    ${SERVE_ROOT}/ops/linear/nvfp4/nvfp4_w4a4_tma_stub.cpp)
+endif()
+ninfer_internal_includes(ninfer_nvfp4_tma)
+set_target_properties(ninfer_nvfp4_tma PROPERTIES
+  CUDA_SEPARABLE_COMPILATION OFF
+  CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
+target_compile_options(ninfer_nvfp4_tma PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+target_link_libraries(ninfer_nvfp4_tma PRIVATE ninfer_core CUDA::cudart CUDA::cuda_driver)
+
+# Shared mathematical Ops. The list is intentionally explicit: adding a
+# source is a build-boundary decision, not an accidental recursive-glob side effect.
+add_library(ninfer_ops STATIC EXCLUDE_FROM_ALL
+  ${SERVE_ROOT}/ops/launcher/add_bias.cu
+  ${SERVE_ROOT}/ops/launcher/argmax.cu
+  ${SERVE_ROOT}/ops/launcher/cast.cu
+  ${SERVE_ROOT}/ops/launcher/causal_conv1d.cu
+  ${SERVE_ROOT}/ops/launcher/embed_gather.cu
+  ${SERVE_ROOT}/ops/launcher/gdn_gating.cu
+  ${SERVE_ROOT}/ops/launcher/gelu.cu
+  ${SERVE_ROOT}/ops/launcher/bidirectional_gqa_attention.cu
+  ${SERVE_ROOT}/ops/launcher/swa.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_prefill.cu
+  ${SERVE_ROOT}/ops/launcher/kv_cache_append_prefix.cu
+  ${SERVE_ROOT}/ops/launcher/l2norm.cu
+  ${SERVE_ROOT}/ops/launcher/layer_norm.cu
+  ${SERVE_ROOT}/ops/launcher/mtp_pack.cu
+  ${SERVE_ROOT}/ops/launcher/mtp_round.cu
+  ${SERVE_ROOT}/ops/launcher/speculative_round.cu
+  ${SERVE_ROOT}/ops/launcher/position.cu
+  ${SERVE_ROOT}/ops/launcher/prepare_ragged_prefix.cu
+  ${SERVE_ROOT}/ops/launcher/prepare_masked_block.cu
+  ${SERVE_ROOT}/ops/launcher/residual_add.cu
+  ${SERVE_ROOT}/ops/launcher/rmsnorm.cu
+  ${SERVE_ROOT}/ops/launcher/rope.cu
+  ${SERVE_ROOT}/ops/launcher/sampling.cu
+  ${SERVE_ROOT}/ops/launcher/scalar.cu
+  ${SERVE_ROOT}/ops/launcher/scatter.cu
+  ${SERVE_ROOT}/ops/launcher/sigmoid_gate_mul.cu
+  ${SERVE_ROOT}/ops/launcher/silu_and_mul.cu
+  ${SERVE_ROOT}/ops/launcher/vision_attention.cu
+  ${SERVE_ROOT}/ops/launcher/vision_pos_embed.cu
+  # Gated DeltaNet Linear Attention core.
+  ${SERVE_ROOT}/ops/linear_attention/gated_delta_net/gated_delta_net.cpp
+  ${SERVE_ROOT}/ops/linear_attention/gated_delta_net/replay.cpp
+  ${SERVE_ROOT}/ops/linear_attention/gated_delta_net/recurrent.cu
+  ${SERVE_ROOT}/ops/linear_attention/gated_delta_net/chunked/launch.cu
+  ${SERVE_ROOT}/ops/linear_attention/gated_delta_net/chunked/prepare_wy_wu.cu
+  ${SERVE_ROOT}/ops/linear_attention/gated_delta_net/chunked/state_passing.cu
+  ${SERVE_ROOT}/ops/linear_attention/gated_delta_net/chunked/output.cu
+  ${SERVE_ROOT}/ops/attn_input_proj/bf16/bf16_attn_input_decode.cu
+  ${SERVE_ROOT}/ops/attn_input_proj/bf16/bf16_attn_input_gemm_mma.cu
+  ${SERVE_ROOT}/ops/attn_input_proj/bf16/bf16_attn_input_small_t.cu
+  ${SERVE_ROOT}/ops/attn_input_proj/bf16/bf16_attn_input_plan.cpp
+  ${SERVE_ROOT}/ops/attn_input_proj/fp8/fp8_attn_input_decode.cu
+  ${SERVE_ROOT}/ops/attn_input_proj/fp8/fp8_attn_input_small_t.cu
+  ${SERVE_ROOT}/ops/attn_input_proj/fp8/fp8_attn_input_a8.cu
+  ${SERVE_ROOT}/ops/attn_input_proj/fp8/fp8_attn_input_plan.cpp
+  ${SERVE_ROOT}/ops/attn_input_proj/nvfp4/nvfp4_attn_input_decode.cu
+  ${SERVE_ROOT}/ops/attn_input_proj/nvfp4/nvfp4_attn_input_small_t.cu
+  ${SERVE_ROOT}/ops/attn_input_proj/nvfp4/nvfp4_attn_input_w4a4.cu
+  ${SERVE_ROOT}/ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.cpp
+  ${SERVE_ROOT}/ops/attn_input_proj/q4_q5/q4_q5_attn_input_gemm_mma.cu
+  ${SERVE_ROOT}/ops/attn_input_proj/q4_q5/q4_q5_attn_input_small_t.cu
+  ${SERVE_ROOT}/ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.cpp
+  ${SERVE_ROOT}/ops/attn_input_proj/w8/w8_attn_input_decode.cu
+  ${SERVE_ROOT}/ops/attn_input_proj/w8/w8_attn_input_gemm_mma.cu
+  ${SERVE_ROOT}/ops/attn_input_proj/w8/w8_attn_input_gemm_simt.cu
+  ${SERVE_ROOT}/ops/attn_input_proj/w8/w8_attn_input_gemm_splitk.cu
+  ${SERVE_ROOT}/ops/attn_input_proj/w8/w8_attn_input_plan.cpp
+  ${SERVE_ROOT}/ops/gdn_input_proj/fp8/fp8_gdn_input_decode.cu
+  ${SERVE_ROOT}/ops/gdn_input_proj/fp8/fp8_gdn_input_small_t.cu
+  ${SERVE_ROOT}/ops/gdn_input_proj/fp8/fp8_gdn_input_a8.cu
+  ${SERVE_ROOT}/ops/gdn_input_proj/fp8/fp8_gdn_input_plan.cpp
+  ${SERVE_ROOT}/ops/gdn_input_proj/fp8/fp8_gdn_conv_fused.cu
+  ${SERVE_ROOT}/ops/gdn_input_proj/fp8/fp8_gdn_conv_plan.cpp
+  ${SERVE_ROOT}/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_decode.cu
+  ${SERVE_ROOT}/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_small_t.cu
+  ${SERVE_ROOT}/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_w4a4.cu
+  ${SERVE_ROOT}/ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.cpp
+  ${SERVE_ROOT}/ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_decode.cu
+  ${SERVE_ROOT}/ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_small_t.cu
+  ${SERVE_ROOT}/ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_post.cu
+  ${SERVE_ROOT}/ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.cpp
+  ${SERVE_ROOT}/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_gemm_mma.cu
+  ${SERVE_ROOT}/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_independent.cu
+  ${SERVE_ROOT}/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_conv_snapshot.cu
+  ${SERVE_ROOT}/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.cpp
+  ${SERVE_ROOT}/ops/gdn_input_proj/gdn_projected_conv.cu
+  ${SERVE_ROOT}/ops/linear/w8a8/w8a8_act_quant.cu
+  ${SERVE_ROOT}/ops/linear/w8a8/w8a8_dispatch.cu
+  ${SERVE_ROOT}/ops/linear/w8a8/w4fp4_cutlass_gemm.cu
+  ${SERVE_ROOT}/ops/linear/w8a8/w4fp4_plane.cu
+  ${SERVE_ROOT}/ops/linear/w8a8/w8fp8_plane.cu
+  ${SERVE_ROOT}/ops/linear_swiglu/w8a8/w8a8_linear_swiglu.cu
+  ${SERVE_ROOT}/ops/gdn_input_proj/w8/w8_gdn_input_decode.cu
+  ${SERVE_ROOT}/ops/gdn_input_proj/w8/w8_gdn_input_gemm_mma.cu
+  ${SERVE_ROOT}/ops/gdn_input_proj/w8/w8_gdn_input_gemm_splitk.cu
+  ${SERVE_ROOT}/ops/gdn_input_proj/w8/w8_gdn_input_plan.cpp
+  ${SERVE_ROOT}/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu
+  ${SERVE_ROOT}/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.cpp
+  ${SERVE_ROOT}/ops/linear/bf16/bf16_gemv.cu
+  ${SERVE_ROOT}/ops/linear/bf16/bf16_gemm_mma.cu
+  ${SERVE_ROOT}/ops/linear/bf16/bf16_small_t.cu
+  ${SERVE_ROOT}/ops/linear/bf16/bf16_dispatch.cpp
+  ${SERVE_ROOT}/ops/linear/fp8/fp8_format.cpp
+  ${SERVE_ROOT}/ops/linear/fp8/fp8_gemv.cu
+  ${SERVE_ROOT}/ops/linear/fp8/fp8_small_t.cu
+  ${SERVE_ROOT}/ops/linear/fp8/fp8_a16_mma.cu
+  ${SERVE_ROOT}/ops/linear/fp8/fp8_a8.cu
+  ${SERVE_ROOT}/ops/linear/fp8/fp8_dispatch.cpp
+  ${SERVE_ROOT}/ops/linear/nvfp4/nvfp4_format.cpp
+  ${SERVE_ROOT}/ops/linear/nvfp4/nvfp4_gemv.cu
+  ${SERVE_ROOT}/ops/linear/nvfp4/nvfp4_small_t.cu
+  ${SERVE_ROOT}/ops/linear/nvfp4/nvfp4_w4a4.cu
+  ${SERVE_ROOT}/ops/linear/nvfp4/nvfp4_dispatch.cpp
+  ${SERVE_ROOT}/ops/linear/q4/q4_small_t_mma.cu
+  ${SERVE_ROOT}/ops/linear/q4/q4_rowsplit_gemm_mma.cu
+  ${SERVE_ROOT}/ops/linear/q4/q4_rowsplit_gemm_simt.cu
+  ${SERVE_ROOT}/ops/linear/q4/q4_rowsplit_gemv.cu
+  ${SERVE_ROOT}/ops/linear/q4/q4_dispatch.cpp
+  ${SERVE_ROOT}/ops/linear/q5/q5_dispatch.cpp
+  ${SERVE_ROOT}/ops/linear/q5/q5_rowsplit_gemm_mma.cu
+  ${SERVE_ROOT}/ops/linear/q5/q5_rowsplit_gemm_simt.cu
+  ${SERVE_ROOT}/ops/linear/q5/q5_rowsplit_gemv.cu
+  ${SERVE_ROOT}/ops/linear_add/bf16/bf16_linear_add_decode.cu
+  ${SERVE_ROOT}/ops/linear_add/bf16/bf16_linear_add_gemm_mma.cu
+  ${SERVE_ROOT}/ops/linear_add/bf16/bf16_linear_add_small_t.cu
+  ${SERVE_ROOT}/ops/linear_add/bf16/bf16_linear_add_plan.cpp
+  ${SERVE_ROOT}/ops/linear_add/nvfp4/nvfp4_linear_add_decode.cu
+  ${SERVE_ROOT}/ops/linear_add/nvfp4/nvfp4_linear_add_small_t.cu
+  ${SERVE_ROOT}/ops/linear_add/nvfp4/nvfp4_linear_add_w4a4.cu
+  ${SERVE_ROOT}/ops/linear_add/nvfp4/nvfp4_linear_add_plan.cpp
+  ${SERVE_ROOT}/ops/linear_add/fp8/fp8_linear_add_decode.cu
+  ${SERVE_ROOT}/ops/linear_add/fp8/fp8_linear_add_small_t.cu
+  ${SERVE_ROOT}/ops/linear_add/fp8/fp8_linear_add_a8.cu
+  ${SERVE_ROOT}/ops/linear_add/fp8/fp8_linear_add_plan.cpp
+  ${SERVE_ROOT}/ops/linear_add/q5/q5_linear_add_gemm_mma.cu
+  ${SERVE_ROOT}/ops/linear_add/q5/q5_linear_add_gemm_simt.cu
+  ${SERVE_ROOT}/ops/linear_add/q5/q5_linear_add_gemv.cu
+  ${SERVE_ROOT}/ops/linear_add/q5/q5_linear_add_plan.cpp
+  ${SERVE_ROOT}/ops/linear_add/w8/w8_linear_add_gemm_mma.cu
+  ${SERVE_ROOT}/ops/linear_add/w8/w8_linear_add_gemm_simt.cu
+  ${SERVE_ROOT}/ops/linear_add/w8/w8_linear_add_gemm_splitk.cu
+  ${SERVE_ROOT}/ops/linear_add/w8/w8_linear_add_plan.cpp
+  ${SERVE_ROOT}/ops/linear_swiglu/q4/q4_linear_swiglu_gemm_mma.cu
+  ${SERVE_ROOT}/ops/linear_swiglu/q4/q4_linear_swiglu_gemv.cu
+  ${SERVE_ROOT}/ops/linear_swiglu/q4/q4_linear_swiglu_plan.cpp
+  ${SERVE_ROOT}/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_decode.cu
+  ${SERVE_ROOT}/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_small_t.cu
+  ${SERVE_ROOT}/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4.cu
+  ${SERVE_ROOT}/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.cpp
+  ${SERVE_ROOT}/ops/linear_swiglu/fp8/fp8_linear_swiglu_decode.cu
+  ${SERVE_ROOT}/ops/linear_swiglu/fp8/fp8_linear_swiglu_small_t.cu
+  ${SERVE_ROOT}/ops/linear_swiglu/fp8/fp8_linear_swiglu_a8.cu
+  ${SERVE_ROOT}/ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.cpp
+  ${SERVE_ROOT}/ops/linear_swiglu/w8/w8_linear_swiglu_decode.cu
+  ${SERVE_ROOT}/ops/linear_swiglu/w8/w8_linear_swiglu_gemm_mma.cu
+  ${SERVE_ROOT}/ops/linear_swiglu/w8/w8_linear_swiglu_gemm_splitk.cu
+  ${SERVE_ROOT}/ops/linear_swiglu/w8/w8_linear_swiglu_plan.cpp
+  ${SERVE_ROOT}/ops/linear/q6/q6_dispatch.cpp
+  ${SERVE_ROOT}/ops/linear/q6/q6_rowsplit_gemm_mma.cu
+  ${SERVE_ROOT}/ops/linear/q6/q6_rowsplit_gemm_simt.cu
+  ${SERVE_ROOT}/ops/linear/w8/w8_rowsplit_gemm_mma.cu
+  ${SERVE_ROOT}/ops/linear/w8/w8_rowsplit_gemm_simt.cu
+  ${SERVE_ROOT}/ops/linear/w8/w8_rowsplit_gemm_decode.cu
+  ${SERVE_ROOT}/ops/linear/w8/w8_small_t.cu
+  ${SERVE_ROOT}/ops/linear/w8/w8_rowsplit_gemm_splitk.cu
+  ${SERVE_ROOT}/ops/linear/w8/w8_dispatch.cpp
+  ${SERVE_ROOT}/ops/linear_pair/w8/w8_pair_decode.cu
+  ${SERVE_ROOT}/ops/linear_pair/w8/w8_pair_gemm_concat.cu
+  ${SERVE_ROOT}/ops/linear_pair/w8/w8_pair_gemm_mma.cu
+  ${SERVE_ROOT}/ops/linear_pair/w8/w8_pair_gemm_splitk.cu
+  ${SERVE_ROOT}/ops/linear_pair/w8/w8_pair_plan.cpp
+  ${SERVE_ROOT}/ops/sparse_moe/decode/sparse_moe_decode_kernels.cu
+  ${SERVE_ROOT}/ops/sparse_moe/decode/sparse_moe_decode_plan.cpp
+  ${SERVE_ROOT}/ops/sparse_moe/prefill/sparse_moe_prefill_kernels.cu
+  ${SERVE_ROOT}/ops/sparse_moe/prefill/sparse_moe_prefill_plan.cpp
+  ${SERVE_ROOT}/ops/sparse_moe/small_t/sparse_moe_small_t_kernels.cu
+  ${SERVE_ROOT}/ops/sparse_moe/small_t/sparse_moe_small_t_plan.cpp
+  ${SERVE_ROOT}/ops/linear/linear.cpp
+  ${SERVE_ROOT}/ops/wrapper/add_bias.cpp
+  ${SERVE_ROOT}/ops/wrapper/argmax.cpp
+  ${SERVE_ROOT}/ops/wrapper/cast.cpp
+  ${SERVE_ROOT}/ops/wrapper/causal_conv1d_silu.cpp
+  ${SERVE_ROOT}/ops/wrapper/embedding.cpp
+  ${SERVE_ROOT}/ops/wrapper/gdn_gating.cpp
+  ${SERVE_ROOT}/ops/wrapper/gdn_gating_proj.cpp
+  ${SERVE_ROOT}/ops/wrapper/gdn_input_proj.cpp
+  ${SERVE_ROOT}/ops/wrapper/gelu.cpp
+  ${SERVE_ROOT}/ops/wrapper/bidirectional_gqa_attention.cpp
+  ${SERVE_ROOT}/ops/wrapper/swa.cpp
+  ${SERVE_ROOT}/ops/wrapper/gqa_attention.cpp
+  ${SERVE_ROOT}/ops/wrapper/kv_cache_append_prefix.cpp
+  ${SERVE_ROOT}/ops/wrapper/attn_input_proj.cpp
+  ${SERVE_ROOT}/ops/wrapper/l2norm.cpp
+  ${SERVE_ROOT}/ops/wrapper/layer_norm.cpp
+  ${SERVE_ROOT}/ops/wrapper/linear_add.cpp
+  ${SERVE_ROOT}/ops/wrapper/linear_pair.cpp
+  ${SERVE_ROOT}/ops/wrapper/linear_swiglu.cpp
+  ${SERVE_ROOT}/ops/wrapper/mtp_pack.cpp
+  ${SERVE_ROOT}/ops/wrapper/mtp_round.cpp
+  ${SERVE_ROOT}/ops/wrapper/speculative_round.cpp
+  ${SERVE_ROOT}/ops/wrapper/position.cpp
+  ${SERVE_ROOT}/ops/wrapper/prepare_ragged_prefix.cpp
+  ${SERVE_ROOT}/ops/wrapper/prepare_masked_block.cpp
+  ${SERVE_ROOT}/ops/wrapper/residual_add.cpp
+  ${SERVE_ROOT}/ops/wrapper/rmsnorm.cpp
+  ${SERVE_ROOT}/ops/wrapper/rope.cpp
+  ${SERVE_ROOT}/ops/wrapper/sampling.cpp
+  ${SERVE_ROOT}/ops/wrapper/scalar.cpp
+  ${SERVE_ROOT}/ops/wrapper/scatter.cpp
+  ${SERVE_ROOT}/ops/wrapper/sigmoid_mul.cpp
+  ${SERVE_ROOT}/ops/wrapper/silu_mul.cpp
+  ${SERVE_ROOT}/ops/wrapper/sparse_moe.cpp
+  ${SERVE_ROOT}/ops/wrapper/vision_attention.cpp
+  ${SERVE_ROOT}/ops/wrapper/vision_pos_embed.cpp)
+ninfer_internal_includes(ninfer_ops)
+# surogate vendor patch (PATCHES.md #25): cutlass headers for the sm_120a
+# blockscaled NVFP4 GEMM TU. Points at the flashinfer-shipped cutlass by
+# default; vendoring a snapshot is tracked.
+# cutlass comes from the main project's FetchContent (v4.6.1).
+set(NINFER_CUTLASS_INCLUDE "${cutlass_SOURCE_DIR}/include")
+set_source_files_properties(${SERVE_ROOT}/ops/linear/w8a8/w4fp4_cutlass_gemm.cu PROPERTIES
+    INCLUDE_DIRECTORIES "${NINFER_CUTLASS_INCLUDE};${cutlass_SOURCE_DIR}/tools/util/include"
+    COMPILE_OPTIONS "--expt-relaxed-constexpr")
+ninfer_cuda_archive(ninfer_ops)
+target_link_libraries(ninfer_ops PUBLIC ninfer_core PRIVATE ninfer_nvfp4_tma)
+
+# Product-independent text and media mechanisms.
+add_library(ninfer_text STATIC EXCLUDE_FROM_ALL
+  ${SERVE_ROOT}/text/unicode.cpp
+  ${SUROGATE_VENDOR_DIR}/utf8proc/utf8proc.c)
+ninfer_internal_includes(ninfer_text)
+
+# surogate vendor patch (csrc/src/serve/PATCHES.md): stub decode without FFmpeg.
+if(NINFER_ENABLE_FFMPEG)
+  add_library(ninfer_media_decode STATIC EXCLUDE_FROM_ALL
+    ${SERVE_ROOT}/media/decode/decode.cpp)
+  ninfer_internal_includes(ninfer_media_decode)
+  target_link_libraries(ninfer_media_decode PRIVATE PkgConfig::FFMPEG)
+else()
+  add_library(ninfer_media_decode STATIC EXCLUDE_FROM_ALL
+    ${SERVE_ROOT}/media/decode/decode_stub.cpp)
+  ninfer_internal_includes(ninfer_media_decode)
+endif()
+
+if(NINFER_BUILD_MEDIA_ACQUIRE)
+  # Product-only path/data/HTTP acquisition. No target package links this library.
+  add_library(ninfer_media_acquire STATIC EXCLUDE_FROM_ALL
+    ${SERVE_ROOT}/product/media_acquire/acquire.cpp)
+  ninfer_internal_includes(ninfer_media_acquire)
+  target_link_libraries(ninfer_media_acquire PRIVATE PkgConfig::LIBCURL)
+endif()
+
+if(NINFER_BUILD_PROMPT_INPUT)
+  # Owning command-line message input shared by product entry points and target diagnostics.
+  add_library(ninfer_product_prompt_input STATIC EXCLUDE_FROM_ALL
+    ${SERVE_ROOT}/product/prompt_input/prompt_input.cpp)
+  ninfer_internal_includes(ninfer_product_prompt_input)
+  target_link_libraries(ninfer_product_prompt_input PRIVATE ninfer_media_acquire)
+endif()
+
+if(NINFER_BUILD_APPS OR BUILD_TESTING)
+  add_library(ninfer_product_load_progress STATIC EXCLUDE_FROM_ALL
+    ${SERVE_ROOT}/product/load_progress/load_progress.cpp)
+  ninfer_internal_includes(ninfer_product_load_progress)
+endif()
+
+# One cold closed registry plus the opaque public product Engine. Family and exact-target
+# directories contribute their sources directly to this single compile owner below.
+add_library(ninfer_engine STATIC EXCLUDE_FROM_ALL
+  ${SERVE_ROOT}/targets/registry.cpp
+  ${SERVE_ROOT}/runtime/contract/sampling.cpp
+  ${SERVE_ROOT}/runtime/engine/engine.cpp)
+ninfer_internal_includes(ninfer_engine)
+target_include_directories(ninfer_engine PUBLIC ${SERVE_ROOT})
+
+add_subdirectory(${SERVE_ROOT}/targets/qwen3_6 serve_t_qwen3_6 EXCLUDE_FROM_ALL)
+add_subdirectory(${SERVE_ROOT}/targets/qwen3_5_0_8b serve_t_qwen3_5_0_8b EXCLUDE_FROM_ALL)
+add_subdirectory(${SERVE_ROOT}/targets/qwen3_5_2b serve_t_qwen3_5_2b EXCLUDE_FROM_ALL)
+add_subdirectory(${SERVE_ROOT}/targets/qwen3_5_4b serve_t_qwen3_5_4b EXCLUDE_FROM_ALL)
+add_subdirectory(${SERVE_ROOT}/targets/qwen3_6_27b serve_t_qwen3_6_27b EXCLUDE_FROM_ALL)
+add_subdirectory(${SERVE_ROOT}/targets/qwen3_6_35b_a3b serve_t_qwen3_6_35b_a3b EXCLUDE_FROM_ALL)
+
+target_link_libraries(ninfer_engine
+  PRIVATE
+    ninfer_artifact
+    ninfer_core
+    ninfer_ops
+    ninfer_text
+    ninfer_media_decode)
+add_library(ninfer::engine ALIAS ninfer_engine)
+
+if(NINFER_BUILD_SERVE)
+  # HTTP protocol/product adapter. No serving header is part of the public API.
+  add_library(ninfer_serve STATIC EXCLUDE_FROM_ALL
+    ${SERVE_ROOT}/serve/openai_schema.cpp
+    ${SERVE_ROOT}/serve/responses_schema.cpp
+    ${SERVE_ROOT}/serve/anthropic_schema.cpp
+    ${SERVE_ROOT}/serve/response_store.cpp
+    ${SERVE_ROOT}/serve/tool_call_parser.cpp
+    ${SERVE_ROOT}/serve/translate.cpp
+    ${SERVE_ROOT}/serve/console_log.cpp
+    ${SERVE_ROOT}/serve/generation_service.cpp
+    ${SERVE_ROOT}/serve/request_log.cpp
+    ${SERVE_ROOT}/serve/http_server.cpp
+    ${SERVE_ROOT}/serve/responses_http.cpp
+    ${SERVE_ROOT}/serve/serve_options.cpp)
+  ninfer_internal_includes(ninfer_serve)
+  target_include_directories(ninfer_serve PRIVATE
+    ${SUROGATE_VENDOR_DIR}/cpp-httplib)
+  target_link_libraries(ninfer_serve
+    PUBLIC ninfer_engine Threads::Threads
+    PRIVATE ninfer_media_acquire CUDA::cudart)
+endif()
+
+
+        # ---- serve executables (formerly src/serve/apps/CMakeLists.txt) ----
+add_executable(ninfer EXCLUDE_FROM_ALL   # surogate vendor patch (csrc/src/serve/PATCHES.md): product binary names.
+  ${SERVE_ROOT}/cli/main.cpp
+  ${SERVE_ROOT}/cli/options.cpp)
+target_include_directories(ninfer PRIVATE
+  ${SERVE_ROOT}
+  ${SERVE_ROOT}
+  ${SUROGATE_VENDOR_DIR})
+target_link_libraries(ninfer PRIVATE
+  ninfer_engine
+  ninfer_product_load_progress
+  ninfer_product_prompt_input)
+
+add_executable(ninfer-serve EXCLUDE_FROM_ALL ${SERVE_ROOT}/server/main.cpp)
+target_include_directories(ninfer-serve PRIVATE
+  ${NINFER_JSON_INCLUDE}
+  ${SERVE_ROOT}
+  ${SERVE_ROOT}
+  ${SUROGATE_VENDOR_DIR}
+  ${SUROGATE_VENDOR_DIR}/cpp-httplib)
+target_link_libraries(ninfer-serve PRIVATE ninfer_serve ninfer_product_load_progress)
+
+# surogate vendor patch (csrc/src/serve/PATCHES.md): the product binaries carry
+# surogate's name; NInfer attribution lives in NOTICE, not in process names.
+set_target_properties(ninfer PROPERTIES OUTPUT_NAME surogate-engine-cli)
+set_target_properties(ninfer-serve PROPERTIES OUTPUT_NAME surogate-engine)
+
+
         if(SUROGATE_SERVE_TESTS)
             enable_testing()
-            add_subdirectory(src/serve/tests serve_tests EXCLUDE_FROM_ALL)
+            add_subdirectory(src/testing/serve serve_tests EXCLUDE_FROM_ALL)
         endif()
         if(SUROGATE_SERVE_BENCH)
-            add_subdirectory(src/serve/bench serve_bench EXCLUDE_FROM_ALL)
+            add_subdirectory(src/testing/serve/bench serve_bench EXCLUDE_FROM_ALL)
         endif()
     endif()
 endif()

@@ -44,7 +44,7 @@ SERVE_BUILD_DIR ?= csrc/build-serve
 serve-configure:
 	cmake -S csrc -B $(SERVE_BUILD_DIR) -G Ninja \
 		-DCMAKE_BUILD_TYPE=Release \
-		-DCMAKE_CUDA_ARCHITECTURES=120a
+		-DCMAKE_CUDA_ARCHITECTURES=120a $(CCACHE_FLAGS)
 
 serve-build: serve-configure
 	cmake --build $(SERVE_BUILD_DIR) --parallel $(PARALLEL_JOBS) \

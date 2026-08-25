@@ -3,9 +3,14 @@ The surogate serve engine in this directory is derived from NInfer
 licensed under the Apache License, Version 2.0 (see LICENSE.ninfer).
 
 As of 2026-08-26 the code lives here directly as first-class surogate
-source (the former vendor layout is dropped); source files retain their
-NInfer lineage and the divergence history is documented in PATCHES.md,
-which continues as the serve engineering log.
+source (the former vendor and sub-project layouts are dropped): engine
+modules sit under csrc/src/serve/<module>, the public API under
+csrc/src/serve/api, executables under cli/ and server/, C++ tests and
+benches under csrc/src/testing/serve, and the Python conversion/parity
+tooling under surogate/serve/tools. Targets are defined by the main
+csrc/CMakeLists.txt. Source files retain their NInfer lineage and the
+divergence history is documented in PATCHES.md, which continues as the
+serve engineering log.
 
 Third-party code under third_party/ (each with its own license):
   cpp-httplib (MIT), nlohmann/json (MIT), utf8proc (MIT-style).
