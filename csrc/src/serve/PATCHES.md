@@ -493,8 +493,11 @@ old ninfer/ paths.)
    prefill; a later rewrite request falls back to prefix recompute (the
    deferral validator is relaxed for the opt-in: the frontier may lie
    ahead of the reuse base). Behavioral trade: rewind-heavy thinking
-   flows pay on rewind instead of every prefill. The rewind fallback
-   path is NOT yet exercised by a test — required before defaulting ON.
+   flows pay on rewind instead of every prefill. GATE PASSED (2026-08-27):
+   ninfer_qwen3_5_4b_prefix_real_test runs in both modes — capture
+   restores the response checkpoint; defer completes the same rewind via
+   recompute fallback. Defaulting the flag ON is now safe engineering-
+   wise; it remains an owner decision (latency profile of rewind flows).
 
    Measured with the flag (idle 5090, all three targets, decode
    unchanged, greedy exact): 4B default 16.6k/19.7k/23.2k @472/962/1912
