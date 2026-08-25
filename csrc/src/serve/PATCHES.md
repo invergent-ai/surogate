@@ -575,6 +575,47 @@ old ninfer/ paths.)
    pricing remain. sm_80/86 and the AMD/HIP port are the next rungs; the
    plan/launcher dispatch split is the porting seam.
 
+27. **Prefill CUDA graphs — bucket-captured chunk bodies (design of
+   record; implementation in flight).** Goal: recover the ~3.7ms of
+   inter-kernel bubbles per prefill chunk (nsys @1912 fp4: 49.4ms
+   window, 45.6 busy — #23 closure) and delete ~4.3ms of host issue
+   work (657 launches/chunk). Expected ~+5-7% @4B, more at 0.8B/2B.
+   Mechanism mirrors the decode-graph idiom: bucket ladder at multiples
+   of 128 up to prefill_chunk (GEMM tiles, GDN 64-chunks and attention
+   row-blocks already round up internally, so 128-granular padding adds
+   ~nothing the engine wasn't already paying); graphs captured per
+   bucket on first use, the prefill_chunk bucket precaptured at load; a
+   pinned PrefillIngress {base, actual_len} memcpy'd into a device
+   mirror INSIDE the captured body (the OrdinaryDecodeIngress trick —
+   src/dst baked, host rewrites fields before replay); ids via fixed
+   pinned staging + in-graph H2D into the arena tensor (arena addresses
+   are replay-stable per bucket: deterministic recipe sequence after
+   work_.reset()). Attention needs NO changes — the prefill kernel
+   derives per-query visibility from positions[0] on device, the
+   envelope never reaches it, pad queries are causally downstream of
+   every real row, and pad KV writes are overwritten by the next chunk
+   or invisible to decode via lane lengths. Pad hygiene: one generic
+   ops::mask_columns_zero(x, valid_dev) zeroes columns >= actual_len —
+   applied to the residual post-embedding (keeps amax scales exact) and
+   to f32 g/beta post-gating, where zero IS the identity state update
+   (g is log-decay: 0 => decay 1; beta gates the rank-1 update: 0 =>
+   none) — so the GDN chunked-scan kernels change NOT AT ALL. The one
+   kernel-arg change: causal_conv1d_silu gains an optional device
+   valid_len rebasing the trailing width-3 state snapshot to the last
+   REAL columns. Lane independence: prefill computes GDN/conv state in
+   a dedicated scratch slot (executor licenses one prefill at a time);
+   lane->scratch once at prompt start (prefix-append), scratch->lane
+   once at prompt end — two small per-PROMPT copies buy lane-agnostic
+   graphs. Outside the graph per chunk: staging fill, ingress rewrite,
+   final-chunk lm_head+sample, checkpoint epilogues, the sync.
+   Eligibility: text-only, no MTP/multimodal/dflash/tap; ineligible
+   modes run the unchanged eager body. SUROGATE_SERVE_PREFILL_GRAPH=0
+   vetoes. Graph execs accounted against graph_allowance_bytes.
+   Workspace contract unchanged (bucket recipe <= prefill_chunk
+   high-water). Numerics: real rows exact vs eager modulo GEMM
+   accumulation order at M=bucket vs M=len; parity gates are greedy
+   token equality + the quality panel, not bitwise activations.
+
 ### sm_89 port status
 
 With patches 5–10 the **entire tree compiles and links for sm_89**
