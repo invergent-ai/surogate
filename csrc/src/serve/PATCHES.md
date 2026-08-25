@@ -452,8 +452,13 @@
    of four points** (@472 +63%, @962 +7%, decode +30%); @1912 remains
    24.1 vs 35.2k. kt4-s3 exceeds the 99KB smem cap (compile-checked);
    deeper K-tiles or TMA are the next rungs. The same tile-amortization
-   likely applies to the FP8/IMMA kernels (their k-tiles are also one
-   barrier per 64 elements) — probe queued.
+   does NOT transfer to the FP8/IMMA kernels (probed: -0..3%) — their
+   64-element tiles are already 64 bytes/row, so the barrier cost per
+   staged byte was pre-amortized 2x; the default profile's kernel stands
+   at its structural optimum. Deeper fp4 tiles (512-element) exceed
+   static smem at every viable BM/BN — the next fp4-prefill rungs are
+   TMA/dynamic-smem staging and the non-GEMM pool (act quant, scan,
+   host span).
 
 ### sm_89 port status
 
