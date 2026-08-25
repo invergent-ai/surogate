@@ -3,8 +3,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from tools.artifact.layouts import decode_row_split_codes, dequantize_row_split
-from tools.convert.common.quantize import quantize_and_encode, quantize_matrix
+from surogate.serve.tools.artifact.layouts import decode_row_split_codes, dequantize_row_split
+from surogate.serve.tools.convert.common.quantize import quantize_and_encode, quantize_matrix
 
 
 def test_quantization_uses_stored_fp16_scale_and_zero_padding() -> None:

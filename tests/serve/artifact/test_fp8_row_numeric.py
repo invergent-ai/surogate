@@ -5,14 +5,14 @@ import struct
 import pytest
 import torch
 
-from tools.artifact.layouts import (
+from surogate.serve.tools.artifact.layouts import (
     decode_fp8_row_scaled_words,
     dequantize_fp8_row_scaled,
     encode_fp8_row_scaled,
     encoded_size,
     row_scale_geometry,
 )
-from tools.artifact.numeric import (
+from surogate.serve.tools.artifact.numeric import (
     valid_fp8_row_scale_word,
     valid_fp8_weight_word,
 )

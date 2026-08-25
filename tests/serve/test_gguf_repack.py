@@ -19,17 +19,9 @@ torch = pytest.importorskip("torch")
 from gguf import GGUFReader, GGUFWriter, GGMLQuantizationType
 from gguf.quants import dequantize, quantize
 
-from surogate.serve.ingest import _ninfer_root
-
-_ROOT = _ninfer_root()
-if _ROOT is None:
-    pytest.skip("vendored ninfer tree not found", allow_module_level=True)
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
-
-from tools.artifact.layouts import dequantize_row_split  # noqa: E402
-from tools.convert.common.gguf_repack import GgufRepackSource  # noqa: E402
-from tools.convert.qwen3_6.common.recipe import (  # noqa: E402
+from surogate.serve.tools.artifact.layouts import dequantize_row_split
+from surogate.serve.tools.convert.common.gguf_repack import GgufRepackSource
+from surogate.serve.tools.convert.qwen3_6.common.recipe import (
     Concat,
     GatherRows,
     Reshape,
@@ -37,7 +29,7 @@ from tools.convert.qwen3_6.common.recipe import (  # noqa: E402
     SourceTensor,
     TensorRecipe,
 )
-from tools.convert.qwen3_6.common.inventory import TensorSpec  # noqa: E402
+from surogate.serve.tools.convert.qwen3_6.common.inventory import TensorSpec  # noqa: E402
 
 K = 128  # four 32-value groups per row (k128 layout needs k % 128 == 0)
 

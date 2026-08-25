@@ -5,7 +5,7 @@ import struct
 
 import pytest
 
-from tools.artifact.container import (
+from surogate.serve.tools.artifact.container import (
     MAGIC,
     PAYLOAD_ALIGNMENT,
     PREFIX,
@@ -16,8 +16,8 @@ from tools.artifact.container import (
     TensorSpec,
     write_artifact,
 )
-from tools.artifact.inspect import artifact_summary
-from tools.artifact.layouts import align_up, encoded_size
+from surogate.serve.tools.artifact.inspect import artifact_summary
+from surogate.serve.tools.artifact.layouts import align_up, encoded_size
 
 
 def _small_specs():
