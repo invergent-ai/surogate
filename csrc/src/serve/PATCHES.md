@@ -641,6 +641,36 @@ old ninfer/ paths.)
    ON for SpeculativeBackend::None targets; SUROGATE_SERVE_PREFILL_GRAPH=0
    vetoes; capture failure poisons the family and eager serves on.
 
+28. **Multi-user campaign, Phase 1: batched small-T decode routes.**
+   DIAGNOSIS (nsys, 8-user pure-decode 4B server): one kernel is 84% of
+   the window — w8_rowsplit_gemm_mma_kernel, 115,107 launches at 141.5us,
+   128 per round (32 layers x 4 GEMMs) — the runtime-shaped MMA tile
+   serving T=8 where T=1 rides ~30us GEMV-class decode kernels. A batch-8
+   round therefore costs 4.84x a solo round and C=8 aggregate saturates
+   at ~354 tok/s @4B (vLLM: 3,390 via ~100-deep continuous batching).
+   Weight-read arithmetic says batched rounds support ~3.3k tok/s at
+   TODAY'S lane count. ROOT CAUSE: the fused-op families' exact-T split-K
+   fast path (w8_small_t_mma_kernel, shape-templated, ~28.7us flat for
+   T=1..8 at the 27B shape) was only INSTANTIATED for the 27B/companion
+   (+ the 0.8b via PATCHES #13); the 2B/4B tables were never built, and
+   their routes sent T=2..128 to the MMA tiles (the #16 comment said as
+   much). FIXED HERE for attn_input_proj: 2B (5120x2048) and 4B
+   (10240x2560, Output4<4096,1024,4096,1096-order q,k,gate,v>) exact-T
+   tables (T=2..48) + kTarget4BRoutes + the 2B band flip. REMAINING
+   (mechanical, same pattern per family): linear_swiglu (mlp gate_up),
+   linear_add (o_proj + mlp down), gdn_input_proj, linear_pair — each has
+   its own plan.cpp route table + splitk instantiation file under
+   ops/<family>/w8/; add the 2B/4B Hidden/Rows instantiations and flip
+   the 2..48 band to the split-K schedule. Then: batch-T w4fp4_decode
+   (T=1 only today — fp4 profile batch rounds pay 2x weight bytes),
+   decode-graph recapture is automatic at load. VALIDATE when GPU
+   returns: per-op bench (ninfer_attn_input_proj_bench --tokens 1..8 at
+   the small shapes), greedy parity C=1 vs C=8, multi100 board rerun —
+   target >=1.3k tok/s @4B C=8 from this phase alone. Phases 2-4 follow:
+   native step-level scheduler (vLLM POLICY: token-budgeted mixed rounds,
+   chunked prefill interleave, admit-on-arrival — not vLLM code),
+   kMaximumConcurrency 8->32+, board revalidation.
+
 ### sm_89 port status
 
 With patches 5–10 the **entire tree compiles and links for sm_89**

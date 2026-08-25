@@ -24,13 +24,23 @@ constexpr std::array<RouteSpec, 4> kTargetRoutes{{
     {129, kAnyCols, W8AttnInputScheduleId::MmaR64C128},
 }};
 
-// surogate vendor patch (PATCHES.md #16): qwen3.5-2b qkgv. The exact-T
-// split-K launchers are Hidden-templated per target (the 0.8b has its own
-// table); until a 2048-hidden table is instantiated the 2..64 band routes to
-// the runtime-shaped MMA schedule.
-constexpr std::array<RouteSpec, 3> kTarget2BRoutes{{
+// surogate vendor patch (PATCHES.md #16/#28): qwen3.5-2b qkgv. The 2048-hidden
+// exact-T split-K table is instantiated now; the 2..48 band rides it (batch
+// decode rounds live at T=2..16 and previously paid the runtime-shaped MMA
+// tiles).
+constexpr std::array<RouteSpec, 4> kTarget2BRoutes{{
     {1, 1, W8AttnInputScheduleId::DecodeR8Direct},
-    {2, 128, W8AttnInputScheduleId::MmaR32C128},
+    {2, 48, W8AttnInputScheduleId::SplitKMmaDirect},
+    {49, 128, W8AttnInputScheduleId::MmaR32C128},
+    {129, kAnyCols, W8AttnInputScheduleId::MmaR64C128},
+}};
+
+// surogate vendor patch (PATCHES.md #28): qwen3.5-4b qkgv (rows 10240,
+// hidden 2560) — same structure with its own exact-T table.
+constexpr std::array<RouteSpec, 4> kTarget4BRoutes{{
+    {1, 1, W8AttnInputScheduleId::DecodeR8Direct},
+    {2, 48, W8AttnInputScheduleId::SplitKMmaDirect},
+    {49, 128, W8AttnInputScheduleId::MmaR32C128},
     {129, kAnyCols, W8AttnInputScheduleId::MmaR64C128},
 }};
 
@@ -56,7 +66,8 @@ constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes) {
     return expected == static_cast<std::int64_t>(kAnyCols) + 1;
 }
 
-static_assert(catalog_is_closed(kTargetRoutes) && catalog_is_closed(kTarget2BRoutes),
+static_assert(catalog_is_closed(kTargetRoutes) && catalog_is_closed(kTarget2BRoutes) &&
+                  catalog_is_closed(kTarget4BRoutes),
               "W8 target attention input routes must be exact and closed");
 static_assert(catalog_is_closed(kCompanionRoutes),
               "W8 companion attention input routes must be exact and closed");
@@ -134,7 +145,7 @@ W8AttnInputPlan w8_attn_input_resolve_plan(const W8AttnInputProblem& problem) {
     if (problem.parent_rows == 5120 && problem.input_rows == 2048) {
         return resolve_from(kTarget2BRoutes);
     }
-    if (problem.parent_rows == 10240) { return resolve_from(kTarget2BRoutes); }
+    if (problem.parent_rows == 10240) { return resolve_from(kTarget4BRoutes); }
     return resolve_from(kTargetRoutes);
 }
 

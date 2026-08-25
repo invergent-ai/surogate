@@ -95,6 +95,51 @@ constexpr auto make_target08_launchers(std::index_sequence<Offsets...>) {
 constexpr auto kTarget08Launchers = make_target08_launchers(
     std::make_index_sequence<kLastTargetExactCols - kFirstExactCols + 1>{});
 
+// surogate vendor patch (PATCHES.md #28): qwen3.5-2b fused qkgv exact-T split
+// path (hidden 2048) — the table whose absence routed the 2..64 band onto the
+// runtime-shaped MMA tiles (141us at T=8 in batch decode).
+template <int ActiveCols>
+void launch_target2b_active_cols(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
+                                 Tensor& k, Tensor& v, cudaStream_t stream) {
+    using Output2B = W8SplitOutput4<2048, 512, 2048, 512>;
+    const Output2B output{
+        static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
+        static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(v.data)};
+    launch_output<ActiveCols, 5120, 2048>(x, weight, output, stream);
+}
+
+template <std::size_t... Offsets>
+constexpr auto make_target2b_launchers(std::index_sequence<Offsets...>) {
+    return std::array<TargetLauncher, sizeof...(Offsets)>{
+        &launch_target2b_active_cols<kFirstExactCols + static_cast<int>(Offsets)>...};
+}
+
+constexpr auto kTarget2BLaunchers = make_target2b_launchers(
+    std::make_index_sequence<kLastTargetExactCols - kFirstExactCols + 1>{});
+
+// surogate vendor patch (PATCHES.md #28): qwen3.5-4b fused qkgv exact-T split
+// path (rows 10240, hidden 2560; segment order q,k,gate,v matches the T=1
+// decode kernel's Output4B).
+template <int ActiveCols>
+void launch_target4b_active_cols(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
+                                 Tensor& k, Tensor& v, cudaStream_t stream) {
+    static_assert((10240 % kRowsPerCta) == 0);
+    using Output4B = W8SplitOutput4<4096, 1024, 4096, 1024>;
+    const Output4B output{
+        static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
+        static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(v.data)};
+    launch_output<ActiveCols, 10240, 2560>(x, weight, output, stream);
+}
+
+template <std::size_t... Offsets>
+constexpr auto make_target4b_launchers(std::index_sequence<Offsets...>) {
+    return std::array<TargetLauncher, sizeof...(Offsets)>{
+        &launch_target4b_active_cols<kFirstExactCols + static_cast<int>(Offsets)>...};
+}
+
+constexpr auto kTarget4BLaunchers = make_target4b_launchers(
+    std::make_index_sequence<kLastTargetExactCols - kFirstExactCols + 1>{});
+
 constexpr auto kTargetLaunchers =
     make_target_launchers(std::make_index_sequence<kLastTargetExactCols - kFirstExactCols + 1>{});
 constexpr auto kCompanionLaunchers = make_companion_launchers(
@@ -149,9 +194,11 @@ void w8_attn_input_splitk_mma_launch(const Tensor& x, const Weight& weight, Tens
         throw std::invalid_argument("W8 attention input split-K MMA requires T=2..64");
     }
     if (x.ne[1] <= kLastTargetExactCols) {
-        (weight.k == 1024 ? kTarget08Launchers
-                          : kTargetLaunchers)[x.ne[1] - kFirstExactCols](x, weight, q, gate, k, v,
-                                                                        stream);
+        const auto& launchers = weight.k == 1024   ? kTarget08Launchers
+                                : weight.n == 10240 ? kTarget4BLaunchers
+                                : weight.n == 5120  ? kTarget2BLaunchers
+                                                    : kTargetLaunchers;
+        launchers[x.ne[1] - kFirstExactCols](x, weight, q, gate, k, v, stream);
     } else {
         launch_target_medium_cols<64, 4, 2, 2>(x, weight, q, gate, k, v, stream);
     }
