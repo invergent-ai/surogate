@@ -722,6 +722,21 @@ old ninfer/ paths.)
    drop at 16 (71.6 vs 109 at 8) says the T=16 kernels lean on the
    tuning tail — measure before going wider.
 
+   TUNING TAIL, round 1 (same day): the batch-16 census showed (a) the
+   lm_head at T=14..16 falling past the T<=13 SIMT band onto the runtime
+   MMA tile at 1.76ms/round (352 GB/s on a 620MB read) — extending the
+   head bands to T<=16 lets the SIMT launcher's fp4 gate serve it with
+   the batched W4 kernel (310MB read); (b) linear_add's widened SIMT
+   band reading weights ceil(T/4)x at T~16 (3.6s of a 12s window) —
+   added the 4B o_proj (2560x4096) and down (2560x9216) exact-T bakes
+   (Rows-parameterized launcher, T=2..16) with a kQ4B29Routes table.
+   MEASURED: decode16 1,214 -> 1,391; multi100 1,141 -> 1,301.5 (TTFT
+   7.9s, 1,012/0); solo 215 unchanged; suite green. Campaign 354 ->
+   1,301 = 3.7x; vLLM gap 2.6x. Census leftovers for round 2: exact-T
+   avg 48.3us at T=14..16 (schedule tuning), GDN snapshot 37.8us x
+   21.5/round, 2B/0.8B linear_add bakes, W4-at-batch for the fused
+   families (measured decision).
+
 ### sm_89 port status
 
 With patches 5–10 the **entire tree compiles and links for sm_89**
