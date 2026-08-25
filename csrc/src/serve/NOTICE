@@ -1,10 +1,13 @@
-This directory contains third-party code vendored into surogate.
+The surogate serve engine in this directory is derived from NInfer
+(https://github.com/Neroued/ninfer), Copyright (c) NInfer contributors,
+licensed under the Apache License, Version 2.0 (see LICENSE.ninfer).
 
-ninfer/
-  NInfer — a C++/CUDA inference engine for RTX 5090.
-  Copyright (c) NInfer contributors (https://github.com/Neroued/ninfer)
-  Licensed under the Apache License, Version 2.0 (ninfer/LICENSE).
-  Local modifications are enumerated in PATCHES.md.
+As of 2026-08-26 the code lives here directly as first-class surogate
+source (the former vendor layout is dropped); source files retain their
+NInfer lineage and the divergence history is documented in PATCHES.md,
+which continues as the serve engineering log.
 
-  NInfer itself vendors (under ninfer/third_party/, each with its own license):
-    cpp-httplib (MIT), nlohmann/json (MIT), utf8proc (MIT-style).
+Third-party code under third_party/ (each with its own license):
+  cpp-httplib (MIT), nlohmann/json (MIT), utf8proc (MIT-style).
+The NVFP4 GEMM instantiation recipe follows flashinfer
+(Apache-2.0) and builds against cutlass (BSD-3-Clause) headers.

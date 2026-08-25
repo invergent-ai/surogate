@@ -1,6 +1,11 @@
 # Vendored code under csrc/src/serve/
 
-## ninfer/  — vendored from https://github.com/Neroued/ninfer
+## serve engine — derived from https://github.com/Neroued/ninfer
+
+(2026-08-26: the vendor directory was flattened into csrc/src/serve as
+first-class surogate source — see NOTICE. This file continues as the
+serve engineering log; entries below #24 predate the flatten and use the
+old ninfer/ paths.)
 
 - License: Apache-2.0 (see `ninfer/LICENSE`). Vendored per the port-first
   kernel/runtime strategy in `design/serve-engine-plan.md` §2.2 / §3.3.

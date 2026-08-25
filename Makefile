@@ -36,24 +36,27 @@ build: configure
 	cp -f $(BUILD_DIR)/libsurogate-common.so .venv/lib/python3.12/site-packages/surogate/
 
 # ---------------------------------------------------------------------------
-# Serving engine (vendored NInfer; design/serve-engine-plan.md)
-# Builds standalone in its own tree — never touches the training build.
+# Serving engine (csrc/src/serve, first-class targets of the main project;
+# design/serve-engine-plan.md). Uses a separate build dir so serve builds
+# never touch the live training build in $(BUILD_DIR).
 SERVE_BUILD_DIR ?= csrc/build-serve
 
 serve-configure:
-	cmake -S csrc/src/serve/ninfer -B $(SERVE_BUILD_DIR) -G Ninja \
+	cmake -S csrc -B $(SERVE_BUILD_DIR) -G Ninja \
 		-DCMAKE_BUILD_TYPE=Release \
 		-DCMAKE_CUDA_ARCHITECTURES=120a
 
 serve-build: serve-configure
-	cmake --build $(SERVE_BUILD_DIR) --parallel $(PARALLEL_JOBS)
+	cmake --build $(SERVE_BUILD_DIR) --parallel $(PARALLEL_JOBS) \
+		--target surogate-engine-cli surogate-engine
 
 serve-test-build:
-	cmake -S csrc/src/serve/ninfer -B $(SERVE_BUILD_DIR) -G Ninja \
+	cmake -S csrc -B $(SERVE_BUILD_DIR) -G Ninja \
 		-DCMAKE_BUILD_TYPE=Release \
 		-DCMAKE_CUDA_ARCHITECTURES=120a \
-		-DBUILD_TESTING=ON
-	cmake --build $(SERVE_BUILD_DIR) --parallel $(PARALLEL_JOBS)
+		-DSUROGATE_SERVE_TESTS=ON
+	cmake --build $(SERVE_BUILD_DIR) --parallel $(PARALLEL_JOBS) \
+		--target surogate-engine-cli surogate-engine
 
 .PHONY: serve-configure serve-build serve-test-build
 

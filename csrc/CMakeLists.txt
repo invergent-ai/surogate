@@ -91,6 +91,15 @@ option(USE_NVML "Enable nvml support for detailed GPU stats reporting" ON)
 option(PYTHON_BINDING "Build python bindings" ON)
 option(ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 
+# Serve engine (csrc/src/serve, derived from NInfer — see src/serve/NOTICE):
+# first-class targets in this project, EXCLUDE_FROM_ALL so `make build` cost
+# is unchanged. Build with e.g. `cmake --build <dir> --target
+# surogate-engine-cli`. Deps (json, cutlass) come from this file's
+# FetchContent; serve targets are pinned to sm_120a.
+option(SUROGATE_BUILD_SERVE "Expose the serve engine targets" ON)
+option(SUROGATE_SERVE_TESTS "Expose the serve engine test targets" OFF)
+option(SUROGATE_SERVE_BENCH "Expose the serve engine bench targets" OFF)
+
 FetchContent_Declare(
         json
         URL https://github.com/nlohmann/json/releases/download/v3.12.0/json.tar.xz
@@ -731,4 +740,38 @@ if (BUILD_TESTS OR BUILD_TESTS_INTEGRATION)
         $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
     )
     add_test(NAME integration-tests COMMAND integration-tests)
+endif()
+
+if(SUROGATE_BUILD_SERVE)
+    if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.1)
+        message(STATUS "serve: requires CUDA >= 13.1; targets disabled")
+    else()
+        enable_language(C)  # utf8proc
+        set(NINFER_ROOT ${CMAKE_SOURCE_DIR}/src/serve)
+        set(SUROGATE_VENDOR_DIR ${CMAKE_SOURCE_DIR}/src/third_party)
+        set(NINFER_JSON_INCLUDE "${json_SOURCE_DIR}/single_include")
+        set(NINFER_BUILD_MEDIA_ACQUIRE ON)
+        set(NINFER_BUILD_PROMPT_INPUT ON)
+        set(NINFER_BUILD_SERVE ON)
+        find_package(PkgConfig REQUIRED)
+        option(NINFER_ENABLE_FFMPEG "Serve: build media decoding against FFmpeg" ON)
+        if(NINFER_ENABLE_FFMPEG)
+            pkg_check_modules(FFMPEG IMPORTED_TARGET
+                libavformat>=60 libavcodec>=60 libavutil>=58 libswscale>=7)
+            if(NOT FFMPEG_FOUND)
+                message(STATUS "serve: FFmpeg dev libraries not found; media-decode stub")
+                set(NINFER_ENABLE_FFMPEG OFF)
+            endif()
+        endif()
+        pkg_check_modules(LIBCURL REQUIRED IMPORTED_TARGET libcurl>=7.85)
+        add_subdirectory(src/serve/src serve_src EXCLUDE_FROM_ALL)
+        add_subdirectory(src/serve/apps serve_apps EXCLUDE_FROM_ALL)
+        if(SUROGATE_SERVE_TESTS)
+            enable_testing()
+            add_subdirectory(src/serve/tests serve_tests EXCLUDE_FROM_ALL)
+        endif()
+        if(SUROGATE_SERVE_BENCH)
+            add_subdirectory(src/serve/bench serve_bench EXCLUDE_FROM_ALL)
+        endif()
+    endif()
 endif()
