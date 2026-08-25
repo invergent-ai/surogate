@@ -101,7 +101,10 @@ struct W8SmallVocabDefaultProduction {
     static_assert(ActiveTokens >= kW8SmallVocabFirstSmallT);
     static_assert(ActiveTokens <= kW8SmallVocabLastSmallT);
     static constexpr int kTileTokens = ActiveTokens <= 24 ? 24 : 32;
-    using Type                       = W8SmallTMmaDefaultSchedule<kTileTokens, ActiveTokens>;
+    // PATCHES.md #29: KWarps 4 / MinBlocks 3 measured as a no-op here
+    // (1,742 vs 1,736 tok/s aggregate) — the default stays; the wide-band
+    // limiter is inside the kernel, not this occupancy knob.
+    using Type = W8SmallTMmaDefaultSchedule<kTileTokens, ActiveTokens>;
 };
 
 template <int ActiveTokens>

@@ -7,6 +7,7 @@
 #include <array>
 #include <cstdint>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 
 namespace ninfer::ops::detail {
