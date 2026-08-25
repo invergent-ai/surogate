@@ -56,20 +56,19 @@ unsloth NVFP4 export + base checkpoint by the vendored converter).
 
 | engine | weights | TTFT @1.9k | decode tok/s (1 user) | 100-user agg tok/s | 100-user TTFT p50 | 100-user reqs ok/err |
 |---|---|---:|---:|---:|---:|---:|
-| **surogate serve** | NVFP4 (4-bit resident) | **352 ms** | 45 | **235** | 30.1 s | 222/0 |
+| surogate serve | NVFP4 (4-bit resident) | 352 ms | 45 | 235 | 30.1 s | 222/0 |
 | llama-server (CUDA) | GGUF Q4_K_M | 1,829 ms | **49** | 82 | 102.4 s | 135/28 |
-| vLLM | — | *no working config* † | — | — | — | — |
+| vLLM | NVFP4 pack (4-bit) | **254 ms** | 45 | **688** | 12.5 s | 580/0 |
 
-† vLLM 0.27.1 has no servable 27B on this card: it cannot load the
-NVFP4 checkpoint (`'MergedColumnParallelLinear' object has no attribute
-'data'`), the official FP8 checkpoint OOMs before KV allocation even
-with `--enforce-eager --max-model-len 2560` (30.3 GB allocated on a
-31.4 GB device), and bf16 is 54 GB. The engine's 20 GB NVFP4-resident
-artifact serves this class with capacity to spare. llama.cpp b8500 could
+vLLM footnote: auto-detection cannot load public Qwen3.8 NVFP4 exports
+(`'MergedColumnParallelLinear' object has no attribute 'data'`) and the
+official FP8 checkpoint OOMs on 32 GB; serving requires the explicit
+config: `--quantization compressed-tensors --language-model-only
+--kv-cache-dtype fp8 --max-num-seqs 32` against a pack-quantized export
+(measured: sakamakismile/Qwen3.8-27B-MTP-NVFP4). llama.cpp b8500 could
 not load the GGUF either (missing `blk.64.ssm_conv1d.weight`); the 0.3.0
-source build serves it, and its single-stream decode edges the engine's
-W4 decode at this size (49 vs 45 tok/s) while everything else — TTFT
-5.2x, 100-user aggregate 2.9x, zero errors — favors the engine.
+source build serves it, and its Q4_K GEMV edges single-stream decode
+(49 vs 45) while TTFT and multi-user strongly favor the engine and vLLM.
 
 ## Qwen3.6-35B-A3B (MoE)
 
@@ -92,7 +91,8 @@ missing piece.
   Per-stream decode runs +29–30% over vLLM NVFP4 at matched widths.
   Against the llama.cpp user profile (same GGUF in, one box, few users)
   the engine is strictly better at every size that fits.
-- **100-user throughput: vLLM wins by 4.7× (0.8B) to 9.6× (4B).** The
+- **100-user throughput: vLLM wins everywhere it serves — 4.7×
+  (0.8B) to 9.6× (4B) over the engine, 2.9× at 27B (688 vs 235).** The
   engine's aggregate is its 8 lanes times a per-lane decode that scales
   weakly (4B: 44/stream batched vs 214 solo ≈ 1.65× total; 0.8B: 2.65×);
   vLLM runs ~100-deep continuous batching at lower per-stream speed
@@ -136,5 +136,11 @@ missing piece.
   bf16 base + the quantized export; the export alone carries every
   tensor. Dropping the base requirement removes a 52 GB download from
   the workflow.
-- 27B W4 decode kernel: llama.cpp's Q4_K GEMV edges it 49 vs 45 tok/s
-  single-stream; worth a look during the multi-user campaign.
+- 27B single-user: llama.cpp's Q4_K GEMV edges the W4 decode 49 vs 45
+  tok/s and vLLM's TTFT beats the engine 254 vs 352 ms — the only model
+  where the engine does not lead single-user. Both belong to the same
+  look during the multi-user campaign.
+- Every engine needed expert configuration to serve the 27B at all
+  (vLLM: explicit quantization/loader flags; llama.cpp: a source build;
+  engine: the NVFP4 conversion). The engine's `surogate serve <input>`
+  one-command story is the differentiator to protect.
