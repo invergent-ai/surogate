@@ -439,6 +439,22 @@
    quality class settled. Batch>1 decode and non-4B targets keep W8
    decode paths (patterns established).
 
+23. **fp4 stage 3a: 256-element K-tiles.** The stage-3 config race (real
+   SF-plane loads, garbage data) found the fp4 GEMM's 64-element K-tiles
+   pay a barrier pair + stage issue per single mma-K; quadrupling the
+   tile (4 mma-K per staged tile, 2 stages, one barrier per tile,
+   BKB_PAD = BKB + 16 = 144 — the 80-byte pad overlapped rows at 128B
+   and faulted ldmatrix alignment at 40) wins at EVERY shape with ONE
+   config: o_proj 214->114us, down 437->231, gate_up 872->543, qkvz
+   585->346 (332-391 TF/s). In-engine fp4 board: prefill
+   13.8k/18.6k/24.1k @472/962/1912 (+24/+30/+18%), decode ~210
+   unchanged; greedy smokes exact. **fp4 now beats vLLM-NVFP4 at three
+   of four points** (@472 +63%, @962 +7%, decode +30%); @1912 remains
+   24.1 vs 35.2k. kt4-s3 exceeds the 99KB smem cap (compile-checked);
+   deeper K-tiles or TMA are the next rungs. The same tile-amortization
+   likely applies to the FP8/IMMA kernels (their k-tiles are also one
+   barrier per 64 elements) — probe queued.
+
 ### sm_89 port status
 
 With patches 5–10 the **entire tree compiles and links for sm_89**

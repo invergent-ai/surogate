@@ -20,25 +20,30 @@
 
 namespace ninfer::ops::detail {
 
+// Stage-3 tiling (PATCHES.md #23): 256-element K-tiles (4 mma-K per staged
+// tile, 2 stages, one barrier per tile) measured -38..47% vs the 64-element
+// tiling at every prefill shape (332-391 TF/s). A 2-CTA residency cap makes
+// the kernel spill (measured 1.9x); MINCTA stays 1.
 struct W4Fp4Config {
     static constexpr int BM      = 64;
     static constexpr int BN      = 128;
-    static constexpr int BKB     = 32;  // bytes per K-tile (64 e2m1)
-    static constexpr int BKB_PAD = 48;  // 16B-aligned rows (ldmatrix requirement)
+    static constexpr int HALVES  = 4;           // 64-element mma-K slices per tile
+    static constexpr int BKB     = 32 * HALVES; // tile bytes per row
+    static constexpr int BKB_PAD = BKB + 16;    // 16B-aligned, bank-staggered
+    static constexpr int STAGES  = 2;
     static constexpr int WARPS_M = 2;
     static constexpr int WARPS_N = 8;
     static constexpr int THREADS = WARPS_M * WARPS_N * 32;
-    // A 2-CTA residency cap forces <=64 registers and this kernel spills
-    // under it (measured 1.9x on every base-config shape); one resident CTA
-    // with full registers is faster.
     static constexpr int MINCTA  = 1;
 };
 
 struct W4Fp4WideConfig {
     static constexpr int BM      = 128;
     static constexpr int BN      = 128;
-    static constexpr int BKB     = 32;
-    static constexpr int BKB_PAD = 48;
+    static constexpr int HALVES  = 4;
+    static constexpr int BKB     = 32 * HALVES;
+    static constexpr int BKB_PAD = BKB + 16;
+    static constexpr int STAGES  = 2;
     static constexpr int WARPS_M = 4;
     static constexpr int WARPS_N = 8;
     static constexpr int THREADS = WARPS_M * WARPS_N * 32;
@@ -69,10 +74,12 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MINCTA) void w4fp4_gemm_kernel(
     const float* __restrict__ row_scales, const std::uint8_t* __restrict__ x_codes,
     const std::uint8_t* __restrict__ x_sf, const float* __restrict__ x_scales, int rows, int k,
     int tokens, RowMap row_map, Epilogue epilogue) {
-    __shared__ std::uint8_t Ws[2][Cfg::BM * Cfg::BKB_PAD];
-    __shared__ std::uint8_t Xs[2][Cfg::BN * Cfg::BKB_PAD];
-    __shared__ std::uint8_t SFWs[2][Cfg::BM * 4];  // 4 ue4m3 k-groups per row
-    __shared__ std::uint8_t SFXs[2][Cfg::BN * 4];
+    constexpr int kHalves = Cfg::HALVES;
+    constexpr int kStages = Cfg::STAGES;
+    __shared__ std::uint8_t Ws[kStages][Cfg::BM * Cfg::BKB_PAD];
+    __shared__ std::uint8_t Xs[kStages][Cfg::BN * Cfg::BKB_PAD];
+    __shared__ std::uint8_t SFWs[kStages][Cfg::BM * 4 * kHalves];
+    __shared__ std::uint8_t SFXs[kStages][Cfg::BN * 4 * kHalves];
 
     const int m0     = static_cast<int>(blockIdx.x) * Cfg::BM;
     const int n0     = static_cast<int>(blockIdx.y) * Cfg::BN;
@@ -103,18 +110,20 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MINCTA) void w4fp4_gemm_kernel(
             ninfer::ops::cp_async_zfill<16>(&Xs[slot][token * Cfg::BKB_PAD + col], &x_codes[src],
                                             valid ? 16 : 0);
         }
-        // Block scales for this K-tile: 4 async bytes per row/token, in the
-        // same commit group as the codes (a synchronous LDG here stalls the
-        // stage and cost +16..40% on the measured shapes).
+        // Block scales for this K-tile: 4 async bytes per row/token per
+        // 64-element slice, in the same commit group as the codes (a
+        // synchronous LDG here stalls the stage; measured +16..40%).
         for (int i = tid; i < Cfg::BM; i += Cfg::THREADS) {
             const int wrow = row_map.weight_row(m0 + i);
-            ninfer::ops::cp_async<4>(&SFWs[slot][i * 4],
-                                     sf + static_cast<std::int64_t>(wrow) * kg_row + kt * 4);
+            ninfer::ops::cp_async<4 * kHalves>(
+                &SFWs[slot][i * 4 * kHalves],
+                sf + static_cast<std::int64_t>(wrow) * kg_row + kt * 4 * kHalves);
         }
         for (int i = tid; i < Cfg::BN; i += Cfg::THREADS) {
             const int token = n0 + i < tokens ? n0 + i : tokens - 1;
-            ninfer::ops::cp_async<4>(&SFXs[slot][i * 4],
-                                     x_sf + static_cast<std::int64_t>(token) * kg_row + kt * 4);
+            ninfer::ops::cp_async<4 * kHalves>(
+                &SFXs[slot][i * 4 * kHalves],
+                x_sf + static_cast<std::int64_t>(token) * kg_row + kt * 4 * kHalves);
         }
     };
 
@@ -126,47 +135,54 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MINCTA) void w4fp4_gemm_kernel(
 #pragma unroll
             for (int q = 0; q < 4; ++q) acc[mi][ni][q] = 0.0f;
 
-    const int nkt = k / 64;
-    stage(0, 0);
-    ninfer::ops::cp_commit();
+    const int nkt = k / (64 * kHalves);
+#pragma unroll
+    for (int st = 0; st < kStages - 1; ++st) {
+        if (st < nkt) { stage(st, st); }
+        ninfer::ops::cp_commit();
+    }
 
     // SF rows for this lane (mapping validated single-mma-exact).
     const int sfa_frag_row = 8 * (lane & 1) + (lane >> 2);
     const int sfb_frag_tok = lane >> 2;
 
     for (int kt = 0; kt < nkt; ++kt) {
-        const int slot = kt & 1;
-        ninfer::ops::cp_wait<0>();
+        const int slot = kt % kStages;
+        ninfer::ops::cp_wait<kStages - 2>();
         __syncthreads();
-        if (kt + 1 < nkt) {
-            stage(kt + 1, slot ^ 1);
-            ninfer::ops::cp_commit();
-        }
+        if (kt + kStages - 1 < nkt) { stage(kt + kStages - 1, (kt + kStages - 1) % kStages); }
+        ninfer::ops::cp_commit();
 
 #pragma unroll
-        for (int mi = 0; mi < 2; ++mi) {
-            const int arow0 = wm + mi * 16;
-            unsigned a[4];
-            {
-                const int local = arow0 + (lane & 7) + ((lane >> 3) & 1) * 8;
-                const int cofs  = (lane >> 4) * 16;
-                w8a8_ldmatrix_x4(a[0], a[1], a[2], a[3], &Ws[slot][local * Cfg::BKB_PAD + cofs]);
-            }
-            const unsigned sfa =
-                reinterpret_cast<const unsigned*>(SFWs[slot])[arow0 + sfa_frag_row];
+        for (int half = 0; half < kHalves; ++half) {
+            const int cofs_base = half * 32;
 #pragma unroll
-            for (int ni = 0; ni < 2; ++ni) {
-                const int token0 = wn + ni * 8;
-                unsigned b[2];
+            for (int mi = 0; mi < 2; ++mi) {
+                const int arow0 = wm + mi * 16;
+                unsigned a[4];
                 {
-                    const int token = token0 + (lane & 7);
-                    const int cofs  = ((lane >> 3) & 1) * 16;
-                    w8a8_ldmatrix_x2(b[0], b[1], &Xs[slot][token * Cfg::BKB_PAD + cofs]);
+                    const int local = arow0 + (lane & 7) + ((lane >> 3) & 1) * 8;
+                    const int cofs  = cofs_base + (lane >> 4) * 16;
+                    w8a8_ldmatrix_x4(a[0], a[1], a[2], a[3],
+                                     &Ws[slot][local * Cfg::BKB_PAD + cofs]);
                 }
-                const unsigned sfb =
-                    reinterpret_cast<const unsigned*>(SFXs[slot])[token0 + sfb_frag_tok];
-                w4fp4_mma_16n8k64(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2], acc[mi][ni][3],
-                                  a[0], a[1], a[2], a[3], b[0], b[1], sfa, sfb);
+                const unsigned sfa = *reinterpret_cast<const unsigned*>(
+                    &SFWs[slot][(arow0 + sfa_frag_row) * 4 * kHalves + half * 4]);
+#pragma unroll
+                for (int ni = 0; ni < 2; ++ni) {
+                    const int token0 = wn + ni * 8;
+                    unsigned b[2];
+                    {
+                        const int token = token0 + (lane & 7);
+                        const int cofs  = cofs_base + ((lane >> 3) & 1) * 16;
+                        w8a8_ldmatrix_x2(b[0], b[1], &Xs[slot][token * Cfg::BKB_PAD + cofs]);
+                    }
+                    const unsigned sfb = *reinterpret_cast<const unsigned*>(
+                        &SFXs[slot][(token0 + sfb_frag_tok) * 4 * kHalves + half * 4]);
+                    w4fp4_mma_16n8k64(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2],
+                                      acc[mi][ni][3], a[0], a[1], a[2], a[3], b[0], b[1], sfa,
+                                      sfb);
+                }
             }
         }
         __syncthreads();

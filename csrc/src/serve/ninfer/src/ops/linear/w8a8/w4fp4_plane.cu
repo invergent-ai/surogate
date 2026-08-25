@@ -187,7 +187,7 @@ W4Fp4Plane w4fp4_plane_for(const Weight& weight, cudaStream_t stream) {
     if (!w8fp8_plane_enabled() || g_mode != PrefillQuantMode::Fp4 ||
         weight.qtype != QType::W8G32_F16S || weight.layout != QuantLayout::RowSplit ||
         weight.scale_dtype != DType::FP16 || weight.group != 32 || weight.qdata == nullptr ||
-        weight.scales == nullptr || (weight.k % 64) != 0) {
+        weight.scales == nullptr || (weight.k % 256) != 0) {
         return {nullptr, nullptr, nullptr};
     }
 
