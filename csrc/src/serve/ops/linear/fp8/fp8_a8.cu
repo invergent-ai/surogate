@@ -103,6 +103,15 @@ void launch_quantize_exact(const Tensor& x, Fp8A8Workspace workspace, cudaStream
 template <class Geometry>
 void launch_problem(const Weight& weight, Tensor& out, Fp8A8Workspace workspace,
                     std::int32_t tokens, cudaStream_t stream) {
+    if (tokens <= 32) {
+        using Batch = Fp8LinearA8BatchSchedule;
+        if ((tokens % Batch::kBlockTokens) == 0) {
+            launch_mma<Geometry, Batch, true>(weight, out, workspace, tokens, stream);
+        } else {
+            launch_mma<Geometry, Batch, false>(weight, out, workspace, tokens, stream);
+        }
+        return;
+    }
     using Schedule = typename Fp8LinearA8ProductionSchedule<Geometry>::Type;
     if ((tokens % Schedule::kBlockTokens) == 0) {
         launch_mma<Geometry, Schedule, true>(weight, out, workspace, tokens, stream);

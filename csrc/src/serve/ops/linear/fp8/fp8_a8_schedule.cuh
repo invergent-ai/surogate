@@ -8,6 +8,10 @@ namespace ninfer::ops::detail {
 template <class Geometry>
 struct Fp8LinearA8ProductionSchedule;
 
+using Fp8LinearA8BatchSchedule = Fp8MmaSchedule<32, 128, 128, 2, 4, 2, 2, Cache::cg, Cache::cg,
+                                                Fp8MmaFragmentPipeline::PingPong,
+                                                Fp8MmaRaster::TokenFast>;
+
 template <>
 struct Fp8LinearA8ProductionSchedule<Fp8AttnInputGeometry> {
     using Type = Fp8MmaSchedule<64, 128, 128, 2, 4, 2, 2, Cache::cg, Cache::cg,

@@ -20,11 +20,11 @@ static_assert((kFp8AttnInputQueryRows % Schedule::kBlockRows) == 0);
 static_assert((kFp8AttnInputKeyRows % Schedule::kBlockRows) == 0);
 static_assert((kFp8AttnInputGateRows % Schedule::kBlockRows) == 0);
 
-template <bool FullTokens>
+template <class Sched, bool FullTokens>
 void launch_mma(const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
                 Fp8A8Workspace workspace, std::int32_t tokens, cudaStream_t stream) {
-    constexpr int kRowTiles = Geometry::kOutputRows / Schedule::kBlockRows;
-    const int token_tiles   = (tokens + Schedule::kBlockTokens - 1) / Schedule::kBlockTokens;
+    constexpr int kRowTiles = Geometry::kOutputRows / Sched::kBlockRows;
+    const int token_tiles   = (tokens + Sched::kBlockTokens - 1) / Sched::kBlockTokens;
     const int blocks        = kRowTiles * token_tiles;
     const Fp8AttentionInputOutput output{
         static_cast<__nv_bfloat16*>(q.data),
@@ -33,15 +33,15 @@ void launch_mma(const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tensor
         static_cast<__nv_bfloat16*>(v.data),
     };
 
-    if constexpr (Schedule::kSharedBytes > 48 * 1024) {
+    if constexpr (Sched::kSharedBytes > 48 * 1024) {
         static const cudaError_t attribute = cudaFuncSetAttribute(
-            fp8_mma_kernel<Geometry, Schedule, FullTokens, Fp8IdentityEpilogue,
+            fp8_mma_kernel<Geometry, Sched, FullTokens, Fp8IdentityEpilogue,
                            Fp8AttentionInputOutput>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, Schedule::kSharedBytes);
+            cudaFuncAttributeMaxDynamicSharedMemorySize, Sched::kSharedBytes);
         CUDA_CHECK(attribute);
     }
-    fp8_mma_kernel<Geometry, Schedule, FullTokens>
-        <<<blocks, Schedule::kThreads, Schedule::kSharedBytes, stream>>>(
+    fp8_mma_kernel<Geometry, Sched, FullTokens>
+        <<<blocks, Sched::kThreads, Sched::kSharedBytes, stream>>>(
             workspace.codes, workspace.scales, static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const __nv_bfloat16*>(weight.scales), tokens, Fp8IdentityEpilogue{},
             output);
@@ -53,10 +53,16 @@ void launch_mma(const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tensor
 void fp8_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                               Tensor& k, Tensor& v, Fp8A8Workspace workspace, cudaStream_t stream) {
     launch_fp8_a8_quantize(x, weight, workspace, stream);
-    if ((x.ne[1] % Schedule::kBlockTokens) == 0) {
-        launch_mma<true>(weight, q, gate, k, v, workspace, x.ne[1], stream);
+    if (x.ne[1] <= 32) {
+        if ((x.ne[1] % Fp8LinearA8BatchSchedule::kBlockTokens) == 0) {
+            launch_mma<Fp8LinearA8BatchSchedule, true>(weight, q, gate, k, v, workspace, x.ne[1], stream);
+        } else {
+            launch_mma<Fp8LinearA8BatchSchedule, false>(weight, q, gate, k, v, workspace, x.ne[1], stream);
+        }
+    } else if ((x.ne[1] % Schedule::kBlockTokens) == 0) {
+        launch_mma<Schedule, true>(weight, q, gate, k, v, workspace, x.ne[1], stream);
     } else {
-        launch_mma<false>(weight, q, gate, k, v, workspace, x.ne[1], stream);
+        launch_mma<Schedule, false>(weight, q, gate, k, v, workspace, x.ne[1], stream);
     }
 }
 

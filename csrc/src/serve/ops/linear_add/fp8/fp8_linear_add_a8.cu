@@ -16,10 +16,9 @@
 namespace ninfer::ops::detail {
 namespace {
 
-template <class Geometry, bool FullTokens>
+template <class Geometry, class Schedule, bool FullTokens>
 void launch_mma(const Weight& weight, Tensor& residual, Fp8A8Workspace workspace,
                 std::int32_t tokens, cudaStream_t stream) {
-    using Schedule          = typename Fp8LinearA8ProductionSchedule<Geometry>::Type;
     constexpr int kRowTiles = Geometry::kOutputRows / Schedule::kBlockRows;
     const int token_tiles   = (tokens + Schedule::kBlockTokens - 1) / Schedule::kBlockTokens;
     const int blocks        = kRowTiles * token_tiles;
@@ -44,11 +43,20 @@ void launch_mma(const Weight& weight, Tensor& residual, Fp8A8Workspace workspace
 template <class Geometry>
 void launch_problem(const Weight& weight, Tensor& residual, Fp8A8Workspace workspace,
                     std::int32_t tokens, cudaStream_t stream) {
+    if (tokens <= 32) {
+        using Batch = Fp8LinearA8BatchSchedule;
+        if ((tokens % Batch::kBlockTokens) == 0) {
+            launch_mma<Geometry, Batch, true>(weight, residual, workspace, tokens, stream);
+        } else {
+            launch_mma<Geometry, Batch, false>(weight, residual, workspace, tokens, stream);
+        }
+        return;
+    }
     using Schedule = typename Fp8LinearA8ProductionSchedule<Geometry>::Type;
     if ((tokens % Schedule::kBlockTokens) == 0) {
-        launch_mma<Geometry, true>(weight, residual, workspace, tokens, stream);
+        launch_mma<Geometry, Schedule, true>(weight, residual, workspace, tokens, stream);
     } else {
-        launch_mma<Geometry, false>(weight, residual, workspace, tokens, stream);
+        launch_mma<Geometry, Schedule, false>(weight, residual, workspace, tokens, stream);
     }
 }
 
