@@ -30,6 +30,16 @@ void causal_conv1d_silu(const Tensor& x, const Tensor& weight, Tensor& conv_stat
 void causal_conv1d_silu(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
                         Tensor& conv_state_out, Tensor& out, cudaStream_t stream);
 
+// Bucket-padded prefill form (PATCHES.md #27): identical to the distinct-state
+// form above except the trailing width-3 snapshot consumes min(*valid_columns, T)
+// input columns, with the count read from a device I32 scalar at execution
+// time. Output columns past the valid count are computed but carry junk (their
+// consumers are masked); columns below it match the unpadded op exactly.
+// Requires T > 64 (the graph-bucket regime; smaller windows never pad).
+void causal_conv1d_silu(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
+                        Tensor& conv_state_out, Tensor& out, const Tensor& valid_columns,
+                        cudaStream_t stream);
+
 /**
  * Snapshot form for B independent sequences. `x` and `out` are contiguous BF16 [C,W,B],
  * `conv_states` is contiguous BF16 [C,3,Slots], and `initial_state_slots` and

@@ -1,5 +1,6 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
+#include "targets/qwen3_6/impl/runtime/prefill_graph.h"
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
 
 #include "core/nvtx.h"
@@ -12,6 +13,7 @@
 #include "api/ops/embedding.h"
 #include "api/ops/gated_delta_net.h"
 #include "api/ops/gated_rmsnorm.h"
+#include "api/ops/mask_columns.h"
 #include "api/ops/gdn_gating.h"
 #include "api/ops/gdn_gating_proj.h"
 #include "api/ops/gdn_input_proj.h"
@@ -860,6 +862,14 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     Tensor beta        = control.beta;
     Variant::gdn_norm_control_projection(x, *w.input_norm, kCfg.rms_eps, *w.projection, h, g, beta,
                                          work_, s);
+    if (graph_pad_valid_ != nullptr) {
+        // Bucket-padded graph body (PATCHES.md #27): zero g/beta past the real
+        // token count. g is the log-decay (0 => decay 1) and beta gates the
+        // rank-1 update (0 => none), so pad columns leave the recurrent state
+        // untouched without any scan-kernel change.
+        ops::mask_columns_zero(g, *graph_pad_valid_, s);
+        ops::mask_columns_zero(beta, *graph_pad_valid_, s);
+    }
 
     const auto projection = workspace_recipe::gdn_projection<TextConfig>(work_, T);
     Tensor z              = projection.output_gate.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
@@ -904,7 +914,12 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         Tensor qkv_c = conv.convolved;
         Tensor conv_state =
             state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_current_slot_);
-        ops::causal_conv1d_silu(qkv, *w.conv1d, conv_state, conv_state, qkv_c, s);
+        if (graph_pad_valid_ != nullptr) {
+            ops::causal_conv1d_silu(qkv, *w.conv1d, conv_state, conv_state, qkv_c,
+                                    *graph_pad_valid_, s);
+        } else {
+            ops::causal_conv1d_silu(qkv, *w.conv1d, conv_state, conv_state, qkv_c, s);
+        }
         ops::extract_bf16_columns(qkv_c, 0, qc, s);
         ops::extract_bf16_columns(qkv_c, kCfg.key_dim, kc, s);
         ops::extract_bf16_columns(qkv_c, 2 * kCfg.key_dim, vc, s);
@@ -1019,6 +1034,127 @@ void TextContext::run_layers(Tensor& x, Phase ph) {
     run_layers(x, ph, tap);
 }
 
+
+// ---- Prefill CUDA graphs (PATCHES.md #27) -----------------------------------
+
+// The capturable chunk body at a padded bucket length. Everything varying per
+// replay flows through the family's pinned staging: the ingress {base, valid}
+// lands in a device mirror via an in-graph H2D copy, token ids land in the
+// arena ids tensor (replay-stable address: deterministic recipe sequence after
+// work_.reset()), positions derive on device as iota + base, and rope
+// positions always derive as positions + io.rope_delta (the eager body skips
+// that op when the delta is zero; here the shape must be static, and a zero
+// delta makes it the identity). The attention envelope is a static bound —
+// the prefill kernels take per-query visibility from positions on device.
+void TextContext::prefill_graph_window(std::int32_t bucket) {
+    cudaStream_t s             = ctx_.stream;
+    PrefillGraphFamily& family = *prefill_graph_family_;
+    work_.reset();
+    const auto roots = workspace_recipe::text_prefill_roots<TextConfig>(work_, bucket, 0, 0);
+
+    Tensor ingress = family.ingress_device();
+    CUDA_CHECK(cudaMemcpyAsync(ingress.data, family.ingress_staging(),
+                               sizeof(PrefillGraphIngress), cudaMemcpyHostToDevice, s));
+    Tensor ids_device = roots.ids;
+    CUDA_CHECK(cudaMemcpyAsync(ids_device.data, family.ids_staging(),
+                               static_cast<std::size_t>(bucket) * sizeof(std::int32_t),
+                               cudaMemcpyHostToDevice, s));
+
+    const Tensor base        = ingress.slice(0, 0, 1);
+    graph_pad_valid_storage_ = ingress.slice(0, 1, 1);
+
+    Tensor positions = roots.positions;
+    ops::offset_i32_positions(family.iota_window(bucket), base, positions, s);
+    Tensor rope_positions = family.rope_positions_window(bucket);
+    ops::offset_i32_positions(positions, io_.rope_delta, rope_positions, s);
+
+    ScopedPositions scoped_cache(active_cache_positions_, positions);
+    ScopedPositions scoped_rope(active_rope_positions_, rope_positions);
+    const ops::GqaExecutionEnvelope envelope{1, family.kv_capacity()};
+    ScopedEnvelope scoped_envelope(active_gqa_envelope_, envelope);
+    ScopedValue<const Tensor*> scoped_pad(graph_pad_valid_, &graph_pad_valid_storage_);
+
+    Tensor x = roots.residual;
+    ops::embedding(ids_device, *embed_, x, s);
+    NullTap tap;
+    run_layers(x, Phase::Prefill, tap);
+
+    if (prefill_hidden_.data == nullptr) {
+        throw std::logic_error("prefill graph body requires the persistent prefill hidden store");
+    }
+    Tensor xf = matrix_window(prefill_hidden_, bucket);
+    ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, xf, s);
+}
+
+void TextContext::precapture_prefill_graphs(std::int32_t effective_chunk) {
+    if (prefill_graph_family_ == nullptr || effective_chunk <= 0) { return; }
+    PrefillGraphFamily& family = *prefill_graph_family_;
+    for (std::int32_t step = 128;; step += 128) {
+        const std::int32_t bucket = step < effective_chunk ? step : effective_chunk;
+        PrefillGraphIngress* ingress = family.ingress_staging();
+        ingress->base                = 0;
+        ingress->valid               = bucket;
+        std::fill_n(family.ids_staging(), bucket, 0);
+        if (family.ensure(bucket, [this, bucket] { prefill_graph_window(bucket); }) == nullptr) {
+            return;
+        }
+        if (bucket == effective_chunk) { return; }
+    }
+}
+
+// Stages one real chunk into the family, captures the bucket on first use, and
+// replays it; then runs the eager epilogues the graph excludes (the final
+// sample and the rewrite-checkpoint hidden copy — both need the real length,
+// which the graph deliberately does not bake). Returns false when the family
+// is dead or capture fails: the caller runs the unchanged eager body.
+bool TextContext::try_prefill_graph_chunk(std::span<const int> ids, int t0, int len, int base_i,
+                                          bool is_last, int checkpoint_rel) {
+    PrefillGraphFamily& family = *prefill_graph_family_;
+    if (family.dead() || len <= 0) { return false; }
+    const std::int32_t bucket = family.bucket_for(len);
+    if (bucket < len) { return false; }
+
+    std::int32_t* staging = family.ids_staging();
+    for (int i = 0; i < len; ++i) { staging[i] = ids[static_cast<std::size_t>(t0 + i)]; }
+    for (std::int32_t i = len; i < bucket; ++i) { staging[i] = 0; }
+    PrefillGraphIngress* ingress = family.ingress_staging();
+    ingress->base                = base_i + t0;
+    ingress->valid               = len;
+
+    DecodeGraphExecutable* executable =
+        family.ensure(bucket, [this, bucket] { prefill_graph_window(bucket); });
+    if (executable == nullptr) { return false; }
+    executable->launch(ctx_.stream);
+
+    cudaStream_t s = ctx_.stream;
+    const int T    = static_cast<int>(ids.size());
+    if (is_last) {
+        Tensor xf      = matrix_window(prefill_hidden_, len);
+        Tensor last_xf = xf.slice(1, len - 1, 1);
+        Tensor logits  = matrix_window(io_.logits, 1);
+        ops::linear(last_xf, *lm_head_, logits, s);
+        ops::set_i32_scalar(io_.pos, base_i + T, s);
+        ops::set_i32_scalar(io_.rope_pos, base_i + T + rope_delta_, s);
+        work_.reset();
+        if (sampling_config_ != nullptr) {
+            ops::sample(logits, io_.token, kCfg.token_domain, sampling_config_, io_.pos,
+                        ops::kSamplePurposePrefill, work_, s);
+        } else {
+            ops::argmax(logits, io_.token, kCfg.token_domain, s);
+        }
+    }
+    if (checkpoint_rel > 0 && t0 + len == checkpoint_rel &&
+        rewrite_checkpoint_hidden_output_ != nullptr) {
+        require_tensor_shape(*rewrite_checkpoint_hidden_output_, DType::BF16, {kCfg.hidden, 1},
+                             "rewrite checkpoint hidden output");
+        Tensor xf                      = matrix_window(prefill_hidden_, len);
+        const Tensor checkpoint_hidden = xf.slice(1, len - 1, 1);
+        CUDA_CHECK(cudaMemcpyAsync(rewrite_checkpoint_hidden_output_->data, checkpoint_hidden.data,
+                                   checkpoint_hidden.bytes(), cudaMemcpyDeviceToDevice, s));
+    }
+    return true;
+}
+
 template <class Tap>
 PrefillChunkResult
 TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_prefill,
@@ -1098,7 +1234,15 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
         nvtx::ScopedRange chunk_range(nvtx::Name::PrefillChunk, nvtx::Category::Prefill,
                                       static_cast<std::uint64_t>(len));
 
-        {
+        bool graph_chunk_ran = false;
+        if constexpr (!Tap::enabled) {
+            if (prefill_graph_family_ != nullptr && multimodal == nullptr &&
+                !prepare_mtp_prompt) {
+                graph_chunk_ran =
+                    try_prefill_graph_chunk(ids, t0, len, base_i, is_last, checkpoint_rel);
+            }
+        }
+        if (!graph_chunk_ran) {
             std::vector<std::int32_t> local_scatter_indices;
             std::int32_t visual_begin = 0;
             if (vision_chunk.control != nullptr) {

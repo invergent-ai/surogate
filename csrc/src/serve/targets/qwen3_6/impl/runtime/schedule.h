@@ -24,6 +24,10 @@
 #include <optional>
 #include <span>
 
+namespace ninfer::targets::qwen3_6::detail {
+class PrefillGraphFamily;
+} // namespace ninfer::targets::qwen3_6::detail
+
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 
 using qwen3_6::PreparedPromptData;
@@ -55,6 +59,7 @@ struct PrefillContext {
     std::int32_t rewrite_checkpoint_state_slot              = 0;
     std::uint32_t mtp_proposal_extent                       = 0;
     const qwen3_6::DFlashDecodeIngress* dflash_host_ingress = nullptr;
+    PrefillGraphFamily* prefill_graphs                      = nullptr;
 };
 
 struct OrdinaryBatchContext {

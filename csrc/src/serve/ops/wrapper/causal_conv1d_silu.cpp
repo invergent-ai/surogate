@@ -169,6 +169,32 @@ void causal_conv1d_silu(const Tensor& x, const Tensor& weight, const Tensor& con
     }
 }
 
+void causal_conv1d_silu(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
+                        Tensor& conv_state_out, Tensor& out, const Tensor& valid_columns,
+                        cudaStream_t stream) {
+    if (valid_columns.dtype != DType::I32 || valid_columns.ne[0] != 1 ||
+        valid_columns.ne[1] != 1 || valid_columns.ne[2] != 1 || valid_columns.ne[3] != 1 ||
+        valid_columns.data == nullptr) {
+        throw std::invalid_argument(
+            "causal_conv1d: valid_columns must be a device I32 scalar");
+    }
+    if (x.ne[1] <= detail::kCausalConvSequenceMaxTokens) {
+        throw std::invalid_argument(
+            "causal_conv1d: the valid_columns form requires the prefill window regime (T > 64)");
+    }
+    const std::int64_t n = validate_common(x, weight, conv_state_in, out);
+    require_state_shape(conv_state_out, x.ne[0]);
+    if (n == 0) { return; }
+    require_non_empty_accessible(x, weight, conv_state_in, out);
+    if (!conv_state_out.is_contiguous() || conv_state_out.data == nullptr) {
+        throw std::invalid_argument(
+            "causal_conv1d: conv_state_out must be contiguous and non-null");
+    }
+    detail::causal_conv1d_prefill_launch(
+        x, weight, conv_state_in, conv_state_out, out, stream,
+        static_cast<const std::int32_t*>(valid_columns.data));
+}
+
 void causal_conv1d_silu(const Tensor& x, const Tensor& weight, Tensor& conv_state, Tensor& out,
                         cudaStream_t stream) {
     const std::int64_t n = validate_common(x, weight, conv_state, out);

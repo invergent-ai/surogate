@@ -92,10 +92,19 @@ __global__ void causal_conv1d_prefill_pairs_kernel(const __nv_bfloat16* x,
 // selected GDN snapshot slot while always publishing the running state to slot 0.
 // The initial values are loaded into registers before any store, so overlapping
 // in/out (in == out) has no read/write hazard.
+// `valid_len` (optional, device I32) rebases the trailing window to the last
+// REAL columns of a bucket-padded window (PATCHES.md #27): the snapshot
+// consumes min(*valid_len, T) columns instead of the padded T. Null keeps the
+// host-T behavior.
 __global__ void causal_conv1d_prefill_state_kernel(const __nv_bfloat16* x,
                                                    const __nv_bfloat16* conv_state_in,
                                                    __nv_bfloat16* conv_state_out, std::int32_t C,
-                                                   std::int32_t T) {
+                                                   std::int32_t T,
+                                                   const std::int32_t* valid_len = nullptr) {
+    if (valid_len != nullptr) {
+        const std::int32_t effective = *valid_len;
+        if (effective >= 0 && effective < T) { T = effective; }
+    }
     const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     const std::int64_t C64    = static_cast<std::int64_t>(C);

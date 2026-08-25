@@ -616,6 +616,31 @@ old ninfer/ paths.)
    accumulation order at M=bucket vs M=len; parity gates are greedy
    token equality + the quality panel, not bitwise activations.
 
+   SHIPPED + MEASURED (2026-08-25, idle 5090, --prefill-warmup, defer ON).
+   Two capture landmines found and fixed on the way: (1) the fp4 cutlass
+   alpha scalar's lazy init does a SYNC cudaMemcpy — invalidated the
+   first capture at any cutlass-routed bucket (>=512); pre-warmed in
+   prepare_graphs. (2) load-time precapture without a prior eager
+   prefill pass baked the INT8 FALLBACK into the graphs: the decode
+   warmup only derives planes for decode-routed weights, and the
+   capture guard (correctly) refuses to derive mid-capture — nsys
+   showed 64 IMMA GEMMs + W4-decode kernels inside the graph. Fix: one
+   eager warmup prefill chunk at the full bucket inside the dummy-row
+   window (deriving every prefill plane), THEN precapture all buckets.
+   Load cost of warmup + 16 captures: ~+0.3s at 4B.
+   Prefill, graph vs eager (same binary, SUROGATE_SERVE_PREFILL_GRAPH):
+     4B  fp4: 26.5k/36.5k/41.1k vs 25.2k/31.2k/39.0k  (+5.1/+16.8/+5.5%)
+     4B  fp8: 16.6k/21.4k/23.8k vs 16.6k/19.7k/23.1k  (+0.1/+8.7/+2.8%)
+     2B  fp4: 46.7k/64.2k/79.7k vs 44.3k/58.8k/75.4k  (+5.3/+9.0/+5.7%)
+     0.8B fp4: 58.5k/84.4k/109.7k vs 55.3k/76.6k/102.9k (+5.8/+10.2/+6.5%)
+   at 472/962/1912; decode unchanged everywhere. Mid-length single-
+   bucket prompts win most (whole bubble set removed, minimal pad);
+   @1912 pays the defer split (two chunks, ~98 pad tokens). Suite: 91
+   ctest green on GPU2 (frontend = pre-existing environmental skip),
+   prefix capture+defer pass under graphs, binding smoke exact. Default
+   ON for SpeculativeBackend::None targets; SUROGATE_SERVE_PREFILL_GRAPH=0
+   vetoes; capture failure poisons the family and eager serves on.
+
 ### sm_89 port status
 
 With patches 5–10 the **entire tree compiles and links for sm_89**

@@ -22,6 +22,10 @@
 #include <span>
 #include <vector>
 
+namespace ninfer::targets::qwen3_6::detail {
+class PrefillGraphFamily;
+} // namespace ninfer::targets::qwen3_6::detail
+
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 
 // Target-private compatibility vocabulary for the mechanically preserved fixed schedule. It is
@@ -184,6 +188,17 @@ public:
     void set_linear_state_slots(std::int32_t current_slot, std::int32_t rewrite_checkpoint_slot);
     void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records);
 
+    // Prefill CUDA graphs (PATCHES.md #27): non-null routes eligible prefill
+    // chunks through bucket-captured graph bodies; null keeps the eager body.
+    void set_prefill_graph_family(PrefillGraphFamily* family) noexcept {
+        prefill_graph_family_ = family;
+    }
+
+    // Captures every bucket up to the effective chunk at load time so first
+    // requests replay instead of paying capture (PATCHES.md #27). Requires a
+    // family; stops early if the family dies.
+    void precapture_prefill_graphs(std::int32_t effective_chunk);
+
     [[nodiscard]] const Weight* proposal_head() const noexcept { return proposal_head_; }
 
     [[nodiscard]] const std::int32_t* proposal_head_ids() const noexcept {
@@ -278,6 +293,11 @@ private:
         std::uint32_t begin = 0;
     };
 
+    // Prefill CUDA graphs (PATCHES.md #27).
+    [[nodiscard]] bool try_prefill_graph_chunk(std::span<const int> ids, int t0, int len,
+                                               int base_i, bool is_last, int checkpoint_rel);
+    void prefill_graph_window(std::int32_t bucket);
+
     template <class Tap>
     [[nodiscard]] PrefillChunkResult
     prefill_impl(std::span<const int> ids, const TextPrefill* text_prefill,
@@ -309,6 +329,9 @@ private:
     GdnStateAction gdn_state_action_                      = GdnStateAction::UpdateInPlace;
     const GdnReplayRecords* replay_records_               = nullptr;
     std::int64_t prefill_rewrite_checkpoint_frontier_     = -1;
+    PrefillGraphFamily* prefill_graph_family_             = nullptr;
+    Tensor graph_pad_valid_storage_;
+    const Tensor* graph_pad_valid_                        = nullptr;
     Tensor* rewrite_checkpoint_hidden_output_             = nullptr;
     std::uint32_t mtp_proposal_extent_                    = 0;
 

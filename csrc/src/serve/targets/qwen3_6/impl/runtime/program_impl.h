@@ -1,3 +1,4 @@
+#include "ops/linear/w8a8/w4fp4_plane.h"
 #include "ops/linear/w8a8/w8fp8_plane.h"
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/program.h"
@@ -577,6 +578,19 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         sequence.rope_delta = prompt.rope_delta;
         set_device_i32(io.rope_delta, sequence.rope_delta);
 
+        // Prefill CUDA graphs (PATCHES.md #27): graph prompts compute their
+        // GDN/conv state in the shared scratch slot so captured bodies stay
+        // lane-independent. Seed it from the lane's current slot (zeros after
+        // a reset, the resident state for prefix-append) once per prompt.
+        const bool prefill_uses_graph = prefill_graphs.has_value() && !request_plan.vision &&
+                                        !request_plan.prepare_mtp && !prompt.has_media() &&
+                                        base < prompt_tokens;
+        if (prefill_uses_graph) {
+            decoder->linear_attention.copy_slot(
+                LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
+                LinearStateSlots::prefill_scratch_state_slot(max_concurrency), device.stream);
+        }
+
         if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::Drop ||
             request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::CaptureNew) {
             sequence.rewrite_checkpoint = {};
@@ -629,6 +643,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             .initial_mtp_extent         = initial_mtp_extent,
             .elapsed_seconds            = 0.0,
             .prepare_mtp                = request_plan.prepare_mtp,
+            .use_graph                  = prefill_uses_graph,
             .reuse                      = request_plan.reuse,
             .mtp_bridge                 = request_plan.mtp_bridge,
         };
@@ -1413,12 +1428,66 @@ void ProgramImplCore::prepare_graphs() {
                                  " bytes, exceeding the planned allowance of " +
                                  std::to_string(graph_allowance_bytes) + " bytes");
     }
+    // surogate vendor patch (PATCHES.md #27): prefill CUDA graphs.
+    static const bool prefill_graph_vetoed = [] {
+        const char* env = std::getenv("SUROGATE_SERVE_PREFILL_GRAPH");
+        return env != nullptr && env[0] == '0';
+    }();
+    if (!prefill_graph_vetoed && speculative_backend == SpeculativeBackend::None) {
+        // The fp4 cutlass epilogue's device alpha scalar initializes lazily
+        // with a synchronous copy; force it now so no captured body ever
+        // triggers that init mid-capture (capture would be invalidated).
+        (void)ops::detail::w4fp4_alpha_one();
+        prefill_graphs.emplace(device, std::min(prefill_chunk, capacity), capacity,
+                               LinearStateSlots::prefill_scratch_state_slot(max_concurrency));
+        const auto effective_chunk =
+            static_cast<std::int32_t>(std::min(prefill_chunk, capacity));
+
+        // One EAGER warmup prefill chunk first: the decode warmup above only
+        // derives quant planes for decode-routed weights, but capture must
+        // find every plane the prefill body looks up already derived (the
+        // registries correctly refuse to derive mid-capture and the dispatch
+        // would bake the int8 fallback into the graph). Runs inside the
+        // dummy-row window on the scratch state slot; the state/page zeroing
+        // below cleans up after it.
+        schedule::TextContext capture_card(device, model, work, {},
+                                           decoder->linear_attention, io, prefill_hidden,
+                                           prefill_chunk, 0, {}, &decoder->text_kv,
+                                           decoder->mtp_cache());
+        capture_card.set_linear_state_slots(
+            prefill_graphs->scratch_state_slot(),
+            LinearStateSlots::rewrite_checkpoint_state_slot(0, max_concurrency));
+        capture_card.set_gdn_state_action(schedule::GdnStateAction::UpdateInPlace, nullptr);
+        prepare_representative(1, 1);
+        set_device_i32(io.text_kv_table_row, 0); // the bound dummy row
+        {
+            const std::vector<int> warm_ids(static_cast<std::size_t>(effective_chunk), 0);
+            const schedule::PrefillChunkResult warm = capture_card.prefill_chunk(
+                std::span<const int>(warm_ids), 0,
+                static_cast<std::uint32_t>(effective_chunk), false);
+            if (warm.processed_tokens == 0) {
+                throw std::logic_error("prefill graph warmup chunk made no progress");
+            }
+            device.synchronize();
+        }
+
+        // Now precapture every bucket so first requests replay instead of
+        // paying capture. The capture card mirrors the decode one — empty KV
+        // view, base 0 — the captured body reaches KV only through the pool
+        // plus device-side table rows.
+        capture_card.set_prefill_graph_family(&*prefill_graphs);
+        capture_card.precapture_prefill_graphs(effective_chunk);
+        device.synchronize();
+        work.reset();
+    }
+
     for (PagedKVAllocation& allocation : dflash_capture_allocations) { allocation.unbind_row(); }
     dflash_capture_allocations.clear();
     for (PagedKVAllocation& allocation : mtp_capture_allocations) { allocation.unbind_row(); }
     mtp_capture_allocations.clear();
     for (PagedKVAllocation& allocation : text_capture_allocations) { allocation.unbind_row(); }
     text_capture_allocations.clear();
+
 }
 
 void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& request,
@@ -1561,10 +1630,15 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             static_cast<const ops::SamplingConfig*>(
                 sampling_config.slice(1, static_cast<std::int32_t>(sequence.lane), 1).data),
             &sequence.rewrite_checkpoint_hidden,
-            LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
+            // Graph prompts run every chunk (graph or eager fallback alike) on
+            // the shared scratch state slot (PATCHES.md #27).
+            staged.use_graph
+                ? LinearStateSlots::prefill_scratch_state_slot(max_concurrency)
+                : LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
             LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane, max_concurrency),
             staged.initial_mtp_extent,
-            dflash_host_ingress};
+            dflash_host_ingress,
+            staged.use_graph && prefill_graphs.has_value() ? &*prefill_graphs : nullptr};
 
         if (staged.mtp_bridge == MtpBridgeMode::BeforeSuffix) {
             if (staged.cursor != staged.base || staged.base == 0 ||
@@ -1653,6 +1727,12 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             }
             if (staged.cursor != staged.prompt_tokens) {
                 throw std::logic_error("staged prefill sampled before the prompt frontier");
+            }
+            if (staged.use_graph) {
+                decoder->linear_attention.copy_slot(
+                    LinearStateSlots::prefill_scratch_state_slot(max_concurrency),
+                    LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
+                    device.stream);
             }
             copy_tail(sequence, prefill_hidden.slice(
                                     1, static_cast<std::int32_t>(result.processed_tokens) - 1, 1));

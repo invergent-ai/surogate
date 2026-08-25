@@ -877,6 +877,7 @@ add_library(ninfer_ops STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/launcher/mtp_round.cu
   ${SERVE_ROOT}/ops/launcher/speculative_round.cu
   ${SERVE_ROOT}/ops/launcher/position.cu
+  ${SERVE_ROOT}/ops/launcher/mask_columns.cu
   ${SERVE_ROOT}/ops/launcher/prepare_ragged_prefix.cu
   ${SERVE_ROOT}/ops/launcher/prepare_masked_block.cu
   ${SERVE_ROOT}/ops/launcher/residual_add.cu
@@ -1051,6 +1052,7 @@ add_library(ninfer_ops STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/wrapper/mtp_round.cpp
   ${SERVE_ROOT}/ops/wrapper/speculative_round.cpp
   ${SERVE_ROOT}/ops/wrapper/position.cpp
+  ${SERVE_ROOT}/ops/wrapper/mask_columns.cpp
   ${SERVE_ROOT}/ops/wrapper/prepare_ragged_prefix.cpp
   ${SERVE_ROOT}/ops/wrapper/prepare_masked_block.cpp
   ${SERVE_ROOT}/ops/wrapper/residual_add.cpp

@@ -9,6 +9,7 @@
 #include <api/targets/qwen3_6/prepared_prompt.h>
 
 #include "targets/qwen3_6/impl/runtime/layouts.h"
+#include "targets/qwen3_6/impl/runtime/prefill_graph.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
@@ -192,6 +193,7 @@ struct RequestControl {
         std::uint32_t initial_mtp_extent = 0;
         double elapsed_seconds           = 0.0;
         bool prepare_mtp                 = false;
+        bool use_graph                   = false;
         ReusePath reuse                  = ReusePath::FullReset;
         MtpBridgeMode mtp_bridge         = MtpBridgeMode::None;
     };
@@ -274,6 +276,9 @@ public:
     std::array<RequestControl, kMaximumConcurrency> requests;
 
     DecodeGraphFamily ordinary_graphs;
+    // Prefill CUDA graphs (PATCHES.md #27); engaged in prepare_graphs when the
+    // backend is plain decode and SUROGATE_SERVE_PREFILL_GRAPH != 0.
+    std::optional<PrefillGraphFamily> prefill_graphs;
     DecodeGraphFamily mtp_graphs;
     DecodeGraphFamily dflash_graphs;
 

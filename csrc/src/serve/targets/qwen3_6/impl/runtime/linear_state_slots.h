@@ -14,6 +14,14 @@ struct LinearStateSlots {
                 static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max() / 2)) {
             throw std::invalid_argument("Qwen3.6 Linear Attention concurrency is invalid");
         }
+        // Two roles per lane plus the shared prefill-graph scratch slot
+        // (PATCHES.md #27): the executor licenses one prefill at a time, so a
+        // single lane-independent slot lets captured prefill bodies bake one
+        // state address for every lane.
+        return static_cast<std::int32_t>(2U * max_concurrency) + 1;
+    }
+
+    [[nodiscard]] static std::int32_t prefill_scratch_state_slot(std::uint32_t max_concurrency) {
         return static_cast<std::int32_t>(2U * max_concurrency);
     }
 

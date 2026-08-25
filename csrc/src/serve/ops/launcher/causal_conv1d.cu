@@ -37,7 +37,7 @@ int prefill_output_grid_for(std::int32_t C, std::int32_t T, int block) {
 
 void causal_conv1d_prefill_launch(const Tensor& x, const Tensor& weight,
                                   const Tensor& conv_state_in, Tensor& conv_state_out, Tensor& out,
-                                  cudaStream_t stream) {
+                                  cudaStream_t stream, const std::int32_t* valid_len) {
     constexpr int kOutputBlock  = 256;
     constexpr int kChannelBlock = 256;
     constexpr int kPairBlock    = 256;
@@ -73,7 +73,7 @@ void causal_conv1d_prefill_launch(const Tensor& x, const Tensor& weight,
                                          0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data),
         static_cast<const __nv_bfloat16*>(conv_state_in.data),
-        static_cast<__nv_bfloat16*>(conv_state_out.data), C, T);
+        static_cast<__nv_bfloat16*>(conv_state_out.data), C, T, valid_len);
     CUDA_CHECK(cudaGetLastError());
 }
 
