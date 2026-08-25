@@ -421,9 +421,18 @@
    +23% over the engine's own W8 line and **+18% past vLLM-NVFP4's 162**
    at the same weight class, with graphs on and the greedy answer exact.
    fp4 profile board: prefill 10.9k/14.2k/20.3k @472/962/1912, decode
-   ~191. Remaining fp4-vs-NVFP4 gap is long prefill only (20.3k vs
-   35.2k); stage 2b (SIMT + lm_head W4, the other ~1.7 GB/step) projects
-   decode ~230-250. Quality beyond the exact greedy smoke still unevaled.
+   ~191.
+
+   Stage 2b (same session): the SIMT-routed families joined at T=1 —
+   o_proj/down and the 636 MB/token lm_head dispatch to the same
+   w4fp4_decode_kernel at their compile-time shapes inside
+   launch_w8_simt_r8_c4 (batch>1 decode keeps the multi-column SIMT
+   path). **Decode 208-215 tok/s across the board points — +31% over the
+   engine's W8 line and +30% past vLLM-NVFP4's 162.** fp4 board final:
+   prefill 11.1k/14.3k/20.5k, decode ~211. Remaining fp4-vs-NVFP4 gap is
+   long prefill only (20.5k vs 35.2k). Quality beyond the exact greedy
+   smoke still unevaled; batch>1 decode and non-4B targets keep W8
+   decode paths (patterns established).
 
 ### sm_89 port status
 

@@ -274,15 +274,15 @@ never a default). Measured 2026-08-26, graphs on:
 
 | point | engine fp4 | vLLM NVFP4 (AxionML) |
 |---|---:|---:|
-| prefill @472 | **10,937** | 8,469 |
-| prefill @962 | 14,165 | **17,351** |
-| prefill @1912 | 20,273 | **35,169** |
-| decode | **~191** | 162 |
+| prefill @472 | **11,099** | 8,469 |
+| prefill @962 | 14,292 | **17,351** |
+| prefill @1912 | 20,510 | **35,169** |
+| decode | **~211** | 162 |
 
-Decode beats vLLM-NVFP4 by +18% at the same weight class (W4 covers
-attn/gdn/swiglu = ~2.5 of 4.2 GB/step; stage 2b adds the SIMT + lm_head
-families -> ~230-250 projected). The long-prefill gap is the remaining
-front (cutlass-class FP4 tiles + TMA).
+Decode beats vLLM-NVFP4 by +30% at the same weight class (stage 2 covered
+attn/gdn/swiglu; stage 2b added the SIMT o/down + lm_head families — at
+batch 1 all ~4.2 GB/step of decode weights now read 4-bit). The
+long-prefill gap is the remaining front (cutlass-class FP4 tiles + TMA).
 
 Reading:
 - Decode 158-162 tok/s: +60% over vLLM bf16, +39% over FP8, and a tie

@@ -4,8 +4,11 @@
 #include "core/device.h"
 #include "ops/common/token_slices.h"
 #include "ops/linear/w8/w8_launch.h"
+#include "ops/linear/w8a8/w4fp4_decode.cuh"
+#include "ops/linear/w8a8/w4fp4_plane.h"
 
 #include <cstdint>
+#include <type_traits>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -56,6 +59,38 @@ void launch_route(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t st
 } // namespace
 
 void launch_w8_simt_r8_c4(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    // surogate vendor patch (PATCHES.md #22): fp4 profile T=1 decode for the
+    // SIMT-routed families (o_proj, down, lm_head). Batch>1 decode keeps the
+    // multi-column SIMT path.
+    if (x.ne[1] == 1 && w8_prefill_quant_mode() == PrefillQuantMode::Fp4) {
+        const W4Fp4Plane plane = w4fp4_plane_for(w, stream);
+        if (plane.codes != nullptr) {
+            const auto* xp = static_cast<const __nv_bfloat16*>(x.data);
+            const W8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), out.ne[0]};
+            const auto launch = [&](auto rows_c, auto k_c) {
+                constexpr std::int32_t kRows = decltype(rows_c)::value;
+                constexpr std::int32_t kKd   = decltype(k_c)::value;
+                w4fp4_decode_kernel<kRows, 8, W8ContiguousOutput, W8DecodeStoreEpilogue, kKd>
+                    <<<kRows / 8, 8 * 32, 0, stream>>>(xp, plane.codes, plane.sf,
+                                                       plane.row_scales, output);
+                CUDA_CHECK(cudaGetLastError());
+            };
+            using I = std::integral_constant<std::int32_t, 2560>;
+            if (out.ne[0] == 2560 && x.ne[0] == 4096) {
+                launch(I{}, std::integral_constant<std::int32_t, 4096>{});
+                return;
+            }
+            if (out.ne[0] == 2560 && x.ne[0] == 9216) {
+                launch(I{}, std::integral_constant<std::int32_t, 9216>{});
+                return;
+            }
+            if (out.ne[0] == 248320 && x.ne[0] == 2560) {
+                launch(std::integral_constant<std::int32_t, 248320>{},
+                       std::integral_constant<std::int32_t, 2560>{});
+                return;
+            }
+        }
+    }
     launch_route<4>(x, w, out, stream);
 }
 
