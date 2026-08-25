@@ -451,7 +451,19 @@
    unchanged; greedy smokes exact. **fp4 now beats vLLM-NVFP4 at three
    of four points** (@472 +63%, @962 +7%, decode +30%); @1912 remains
    24.1 vs 35.2k. kt4-s3 exceeds the 99KB smem cap (compile-checked);
-   deeper K-tiles or TMA are the next rungs. The same tile-amortization
+   deeper K-tiles or TMA are the next rungs.
+
+   Stage 3b increment: the fp4 act-quant kernel read every activation
+   from global twice, scalar, with branchy encodes; vectorized (two uint4
+   loads per 16-group into registers, single read, packed u64 stores) it
+   drops ~3ms/prefill — board 14.0k/18.9k/24.7k, decode unchanged, smoke
+   exact. Fresh @1912 decomposition (79.5ms wall): fp4 GEMMs 42.1ms, GDN
+   scan 10.4, attention 3.7, act quant now ~1.5, norms ~2.4, in-window
+   idle 3.1, and ~9-10ms of wall outside the kernel span (request
+   staging/final-sync structure — engine-level, unattributed by the
+   layer-scoped NVTX ranges; a tiny-T floor probe is confounded by the
+   A16 regime below T=224). Road to NVFP4's 35.2k (54ms): TMA-class
+   GEMM staging (42 -> ~28ms), the scan pool, and that staging residue. The same tile-amortization
    does NOT transfer to the FP8/IMMA kernels (probed: -0..3%) — their
    64-element tiles are already 64 bytes/row, so the barrier cost per
    staged byte was pre-amortized 2x; the default profile's kernel stands

@@ -110,7 +110,10 @@ __global__ void w4fp4_derive_kernel(const std::int8_t* __restrict__ codes,
     }
 }
 
-// One CTA per token, same scheme over BF16 activations.
+// One CTA per token. Vectorized rewrite (PATCHES.md #23): each thread owns
+// one 16-group, loads it ONCE as two uint4 (the old kernel read every value
+// from global twice, scalar), reduces the group max from registers, and
+// encodes register-resident values.
 __global__ void w4fp4_act_quant_kernel(const __nv_bfloat16* __restrict__ x,
                                        std::uint8_t* __restrict__ codes,
                                        std::uint8_t* __restrict__ sf_plane,
@@ -119,10 +122,22 @@ __global__ void w4fp4_act_quant_kernel(const __nv_bfloat16* __restrict__ x,
     const int token = static_cast<int>(blockIdx.x);
     const int tid   = static_cast<int>(threadIdx.x);
     const __nv_bfloat16* row = x + static_cast<std::int64_t>(token) * hidden;
+    const int groups         = hidden / 16;
 
+    // Pass 1: token absmax from vectorized group loads.
     float local = 0.0f;
-    for (int i = tid; i < hidden; i += kThreads) {
-        local = fmaxf(local, fabsf(__bfloat162float(row[i])));
+    for (int g = tid; g < groups; g += kThreads) {
+        const uint4 v0 = *reinterpret_cast<const uint4*>(row + g * 16);
+        const uint4 v1 = *reinterpret_cast<const uint4*>(row + g * 16 + 8);
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            const float2 a = __bfloat1622float2(
+                *reinterpret_cast<const __nv_bfloat162*>(&(&v0.x)[w]));
+            const float2 b = __bfloat1622float2(
+                *reinterpret_cast<const __nv_bfloat162*>(&(&v1.x)[w]));
+            local = fmaxf(local, fmaxf(fmaxf(fabsf(a.x), fabsf(a.y)),
+                                       fmaxf(fabsf(b.x), fabsf(b.y))));
+        }
     }
     red[tid] = local;
     __syncthreads();
@@ -137,22 +152,37 @@ __global__ void w4fp4_act_quant_kernel(const __nv_bfloat16* __restrict__ x,
 
     auto* out_codes = codes + static_cast<std::int64_t>(token) * (hidden / 2);
     auto* out_sf    = sf_plane + static_cast<std::int64_t>(token) * (hidden / 16);
-    for (int g = tid; g < hidden / 16; g += kThreads) {
+    for (int g = tid; g < groups; g += kThreads) {
+        const uint4 v0 = *reinterpret_cast<const uint4*>(row + g * 16);
+        const uint4 v1 = *reinterpret_cast<const uint4*>(row + g * 16 + 8);
+        float vals[16];
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            const float2 a = __bfloat1622float2(
+                *reinterpret_cast<const __nv_bfloat162*>(&(&v0.x)[w]));
+            const float2 b = __bfloat1622float2(
+                *reinterpret_cast<const __nv_bfloat162*>(&(&v1.x)[w]));
+            vals[2 * w]     = a.x;
+            vals[2 * w + 1] = a.y;
+            vals[8 + 2 * w]     = b.x;
+            vals[8 + 2 * w + 1] = b.y;
+        }
         float gmax = 0.0f;
 #pragma unroll
-        for (int i = 0; i < 16; ++i) {
-            gmax = fmaxf(gmax, fabsf(__bfloat162float(row[g * 16 + i])));
-        }
+        for (int i = 0; i < 16; ++i) { gmax = fmaxf(gmax, fabsf(vals[i])); }
         const int sf_byte  = ue4m3_encode_up(gmax / (6.0f * scale));
         const float sf_dec = ue4m3_decode(sf_byte);
         const float inv    = sf_dec > 0.0f ? 1.0f / (scale * sf_dec) : 0.0f;
         out_sf[g] = static_cast<std::uint8_t>(sf_byte);
+        std::uint8_t packed[8];
 #pragma unroll
         for (int p = 0; p < 8; ++p) {
-            const int lo = e2m1_encode(__bfloat162float(row[g * 16 + 2 * p]) * inv);
-            const int hi = e2m1_encode(__bfloat162float(row[g * 16 + 2 * p + 1]) * inv);
-            out_codes[g * 8 + p] = static_cast<std::uint8_t>(lo | (hi << 4));
+            const int lo = e2m1_encode(vals[2 * p] * inv);
+            const int hi = e2m1_encode(vals[2 * p + 1] * inv);
+            packed[p]    = static_cast<std::uint8_t>(lo | (hi << 4));
         }
+        *reinterpret_cast<std::uint64_t*>(out_codes + g * 8) =
+            *reinterpret_cast<const std::uint64_t*>(packed);
     }
 }
 

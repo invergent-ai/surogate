@@ -293,10 +293,10 @@ never a default). Measured 2026-08-26, graphs on:
 
 | point | engine fp4 | vLLM NVFP4 (AxionML) |
 |---|---:|---:|
-| prefill @472 | **13,777** | 8,469 |
-| prefill @962 | **18,565** | 17,351 |
-| prefill @1912 | 24,114 | **35,169** |
-| decode | **~210** | 162 |
+| prefill @472 | **13,968** | 8,469 |
+| prefill @962 | **18,914** | 17,351 |
+| prefill @1912 | 24,664 | **35,169** |
+| decode | **~211** | 162 |
 
 (2026-08-26 second pass, PATCHES #23 256-element K-tiles: @962 flipped to
 a win; three of four points now ours, @1912 gap -31%.)
