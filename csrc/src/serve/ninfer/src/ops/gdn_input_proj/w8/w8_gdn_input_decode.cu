@@ -3,6 +3,8 @@
 #include "core/device.h"
 #include "ops/gdn_input_proj/gdn_conv.cuh"
 #include "ops/linear/w8/w8_k2048_decode.cuh"
+#include "ops/linear/w8a8/w4fp4_decode.cuh"
+#include "ops/linear/w8a8/w4fp4_plane.h"
 
 namespace ninfer::ops::detail {
 namespace {
@@ -83,6 +85,18 @@ void w8_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& q
     // surogate vendor patch (PATCHES.md #18): qwen3.5-4b shares the 35B fused
     // row structure at hidden 2560.
     if (weight.k == 2560) {
+        // surogate vendor patch (PATCHES.md #22): fp4 profile decode.
+        if (w8_prefill_quant_mode() == PrefillQuantMode::Fp4) {
+            const W4Fp4Plane plane = w4fp4_plane_for(weight, stream);
+            if (plane.codes != nullptr) {
+                w4fp4_decode_kernel<kRows, kRowsPerCta, Output, W8DecodeStoreEpilogue, 2560>
+                    <<<kRows / kRowsPerCta, kRowsPerCta * 32, 0, stream>>>(
+                        static_cast<const __nv_bfloat16*>(x.data), plane.codes, plane.sf,
+                        plane.row_scales, output);
+                CUDA_CHECK(cudaGetLastError());
+                return;
+            }
+        }
         w8_k2048_decode_kernel<kRows, kRowsPerCta, Output, W8DecodeStoreEpilogue, 2560>
             <<<kRows / kRowsPerCta, kRowsPerCta * 32, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(x.data),
@@ -142,6 +156,18 @@ void w8_gdn_input_decode_conv_snapshot_launch(
     // surogate vendor patch (PATCHES.md #18): qwen3.5-4b shares the 35B fused
     // row structure at hidden 2560.
     if (weight.k == 2560) {
+        // surogate vendor patch (PATCHES.md #22): fp4 profile decode.
+        if (w8_prefill_quant_mode() == PrefillQuantMode::Fp4) {
+            const W4Fp4Plane plane = w4fp4_plane_for(weight, stream);
+            if (plane.codes != nullptr) {
+                w4fp4_decode_kernel<kRows, kRowsPerCta, Output, W8GdnDecodeConvEpilogue, 2560>
+                    <<<kRows / kRowsPerCta, kRowsPerCta * 32, 0, stream>>>(
+                        static_cast<const __nv_bfloat16*>(x.data), plane.codes, plane.sf,
+                        plane.row_scales, ignored_output, epilogue);
+                CUDA_CHECK(cudaGetLastError());
+                return;
+            }
+        }
         w8_k2048_decode_kernel<kRows, kRowsPerCta, Output, W8GdnDecodeConvEpilogue, 2560>
             <<<kRows / kRowsPerCta, kRowsPerCta * 32, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(x.data),

@@ -118,15 +118,24 @@ W8Fp8Plane w8fp8_plane_for(const Weight& weight, cudaStream_t stream) {
         return {nullptr, nullptr};
     }
 
+    // Graph capture discipline: a capturing stream may LOOK UP a finished
+    // plane (the pre-capture warmup decode derived and synchronized it) but
+    // must not derive (cudaMalloc) or wait on external events.
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    (void)cudaStreamIsCapturing(stream, &capture_status);
+    const bool capturing = capture_status != cudaStreamCaptureStatusNone;
+
     std::lock_guard<std::mutex> lock(g_mutex);
     auto found = g_planes.find(weight.qdata);
     if (found != g_planes.end()) {
         // Order this stream after the deriving stream (no-op once complete).
-        if (found->second.ready != nullptr) {
+        if (!capturing && found->second.ready != nullptr) {
             cudaStreamWaitEvent(stream, found->second.ready, 0);
         }
         return {found->second.codes, found->second.row_scales};
     }
+
+    if (capturing) { return {nullptr, nullptr}; }
 
     const std::size_t code_bytes = static_cast<std::size_t>(weight.n) * weight.k;
     const std::size_t scale_bytes = static_cast<std::size_t>(weight.n) * sizeof(float);

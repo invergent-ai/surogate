@@ -2,6 +2,8 @@
 
 #include "core/device.h"
 #include "ops/linear/w8/w8_k2048_decode.cuh"
+#include "ops/linear/w8a8/w4fp4_decode.cuh"
+#include "ops/linear/w8a8/w4fp4_plane.h"
 
 namespace ninfer::ops::detail {
 
@@ -36,6 +38,19 @@ void w8_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& 
                               static_cast<__nv_bfloat16*>(k.data),
                               static_cast<__nv_bfloat16*>(gate.data),
                               static_cast<__nv_bfloat16*>(v.data)};
+        // surogate vendor patch (PATCHES.md #22): fp4 profile decode reads
+        // the derived NVFP4 plane (half the weight traffic).
+        if (w8_prefill_quant_mode() == PrefillQuantMode::Fp4) {
+            const W4Fp4Plane plane = w4fp4_plane_for(weight, stream);
+            if (plane.codes != nullptr) {
+                w4fp4_decode_kernel<kRows4B, kRowsPerCta4B, Output4B, W8DecodeStoreEpilogue, 2560>
+                    <<<kRows4B / kRowsPerCta4B, kRowsPerCta4B * 32, 0, stream>>>(
+                        static_cast<const __nv_bfloat16*>(x.data), plane.codes, plane.sf,
+                        plane.row_scales, output);
+                CUDA_CHECK(cudaGetLastError());
+                return;
+            }
+        }
         w8_k2048_decode_kernel<kRows4B, kRowsPerCta4B, Output4B, W8DecodeStoreEpilogue, 2560>
             <<<kRows4B / kRowsPerCta4B, kRowsPerCta4B * 32, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(x.data),

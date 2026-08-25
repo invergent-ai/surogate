@@ -4,6 +4,8 @@
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
+#include "ops/linear/w8a8/w4fp4_decode.cuh"
+#include "ops/linear/w8a8/w4fp4_plane.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -88,9 +90,93 @@ __global__ __launch_bounds__(RowsPerCta * 32, 2) void w8_linear_swiglu_decode_pa
     if (lane == 0) { out[row] = __float2bfloat16_rn(silu(gate_acc) * up_acc); }
 }
 
+
+// surogate vendor patch (PATCHES.md #22): fp4 profile twin — gate/up rows
+// read from the derived NVFP4 plane (half the weight traffic of the pair).
+template <int RowsPerCta, int Intermediate, int K>
+__global__ __launch_bounds__(RowsPerCta * 32, 2) void w4fp4_swiglu_decode_pair_kernel(
+    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
+    const std::uint8_t* __restrict__ sf, const float* __restrict__ row_scales,
+    __nv_bfloat16* __restrict__ out) {
+    constexpr int kIntermediate   = Intermediate;
+    constexpr int kK              = K;
+    constexpr int kValuesPerLane  = 8;
+    constexpr int kValuesPerPhase = 32 * kValuesPerLane;
+    constexpr int kSfPerPhase     = kValuesPerPhase / 16;
+    constexpr int kPhases         = kK / kValuesPerPhase;
+    constexpr unsigned kMask      = 0xffffffffu;
+
+    const int lane       = static_cast<int>(threadIdx.x) & 31;
+    const int warp       = static_cast<int>(threadIdx.x) >> 5;
+    const int row        = static_cast<int>(blockIdx.x) * RowsPerCta + warp;
+    const int up_row     = row + kIntermediate;
+    const auto* gate_row = codes + static_cast<std::int64_t>(row) * (kK / 2);
+    const auto* up_codes = codes + static_cast<std::int64_t>(up_row) * (kK / 2);
+    const auto* gate_sf  = sf + static_cast<std::int64_t>(row) * (kK / 16);
+    const auto* up_sf    = sf + static_cast<std::int64_t>(up_row) * (kK / 16);
+
+    float gate_acc = 0.0f;
+    float up_acc   = 0.0f;
+#pragma unroll
+    for (int phase = 0; phase < kPhases; ++phase) {
+        unsigned gate_sf_bits = 0;
+        unsigned up_sf_bits   = 0;
+        if (lane < kSfPerPhase) {
+            gate_sf_bits = gate_sf[phase * kSfPerPhase + lane];
+            up_sf_bits   = up_sf[phase * kSfPerPhase + lane];
+        }
+        gate_sf_bits           = __shfl_sync(kMask, gate_sf_bits, lane >> 1);
+        up_sf_bits             = __shfl_sync(kMask, up_sf_bits, lane >> 1);
+        const float gate_scale = w4fp4_ue4m3_decode(gate_sf_bits);
+        const float up_scale   = w4fp4_ue4m3_decode(up_sf_bits);
+
+        const int phase_k = phase * kValuesPerPhase + lane * kValuesPerLane;
+        const std::uint32_t gate_packed =
+            *reinterpret_cast<const std::uint32_t*>(gate_row + phase_k / 2);
+        const std::uint32_t up_packed =
+            *reinterpret_cast<const std::uint32_t*>(up_codes + phase_k / 2);
+        const uint4 values = load_vec<uint4>(x + phase_k);
+        const float2 xv[4] = {
+            bf16x2_bits_to_float2(values.x),
+            bf16x2_bits_to_float2(values.y),
+            bf16x2_bits_to_float2(values.z),
+            bf16x2_bits_to_float2(values.w),
+        };
+        float gate_partial = 0.0f;
+        float up_partial   = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const float2 pair      = xv[j >> 1];
+            const float activation = (j & 1) == 0 ? pair.x : pair.y;
+            gate_partial =
+                fmaf(w4fp4_e2m1_decode((gate_packed >> (4 * j)) & 0xFu), activation, gate_partial);
+            up_partial =
+                fmaf(w4fp4_e2m1_decode((up_packed >> (4 * j)) & 0xFu), activation, up_partial);
+        }
+        gate_acc = fmaf(gate_partial, gate_scale, gate_acc);
+        up_acc   = fmaf(up_partial, up_scale, up_acc);
+    }
+
+    gate_acc = warp_reduce_sum(gate_acc) * row_scales[row];
+    up_acc   = warp_reduce_sum(up_acc) * row_scales[up_row];
+    if (lane == 0) { out[row] = __float2bfloat16_rn(silu(gate_acc) * up_acc); }
+}
+
 template <int RowsPerCta, int Intermediate = 6144, int K = 2048>
 void launch_decode(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     static_assert(Intermediate % RowsPerCta == 0);
+    // surogate vendor patch (PATCHES.md #22): fp4 profile decode.
+    if (w8_prefill_quant_mode() == PrefillQuantMode::Fp4) {
+        const W4Fp4Plane plane = w4fp4_plane_for(w, stream);
+        if (plane.codes != nullptr) {
+            w4fp4_swiglu_decode_pair_kernel<RowsPerCta, Intermediate, K>
+                <<<Intermediate / RowsPerCta, RowsPerCta * 32, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(x.data), plane.codes, plane.sf,
+                    plane.row_scales, static_cast<__nv_bfloat16*>(out.data));
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+    }
     w8_linear_swiglu_decode_pair_kernel<RowsPerCta, Intermediate, K>
         <<<Intermediate / RowsPerCta, RowsPerCta * 32, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),

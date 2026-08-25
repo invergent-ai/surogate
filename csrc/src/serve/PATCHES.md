@@ -386,6 +386,30 @@
    NVFP4's 162), plus a deep-tuned FP4 prefill pass for the 35k class.
    Greedy E2E answers exactly under fp4 mode.
 
+22. **fp4 profile, stage 2: W4 decode kernels (UNVALIDATED — GPU pending).**
+   Under the fp4 profile, decode now reads the derived NVFP4 plane too:
+   `w4fp4_decode_kernel` (twin of w8_k2048_decode with half the weight
+   traffic: one u32 of e2m1 codes per lane per 256-value phase, ue4m3
+   per-16 scales shuffled from the low half-warp, f32 row scale at the
+   end, same Output/Epilogue contract) plus a gate/up pair twin for the
+   swiglu decode kernel. Wired for the 4B shapes: attn qkgv 10240/2560,
+   gdn qkvz 12288/2560 (plain and fused decode-conv-snapshot), swiglu
+   18432/2560. Weight traffic those cover: ~2.5 GB/step of the ~4.2 GB
+   total.
+
+   CUDA-graph integration needs no plumbing: program_impl already runs one
+   EAGER warmup decode + synchronize before capturing, so the wrapper's
+   lazy derivation happens there and capture bakes the plane pointers.
+   Both plane registries got capture guards: a capturing stream may look
+   up a finished plane but never derives (cudaMalloc) nor waits on
+   external events.
+
+   NOT yet covered: the SIMT decode family (o_proj/down at T<=4), lm_head,
+   and the 0.8b/2b/35B decode K-branches (same pattern). Validation queue
+   (next GPU window): fp4 smoke incl graphs, decode bench vs the ~160
+   tok/s W8 line (expect ~+25-40% from the covered families alone), and
+   the fp4-vs-fp8 quality delta beyond greedy smoke.
+
 ### sm_89 port status
 
 With patches 5–10 the **entire tree compiles and links for sm_89**
