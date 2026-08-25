@@ -76,10 +76,6 @@ ninfer_add_test(ninfer_kv_capacity_test SOURCES test_kv_capacity.cpp)
 ninfer_add_test(ninfer_sampling_defaults_test
   SOURCES test_sampling_defaults.cpp
   LIBRARIES ninfer_engine)
-target_include_directories(ninfer_sampling_defaults_test PRIVATE
-  ${SERVE_ROOT}/targets/qwen3_6/export
-  ${SERVE_ROOT}/targets/qwen3_6_27b/export
-  ${SERVE_ROOT}/targets/qwen3_6_35b_a3b/export)
 ninfer_add_test(ninfer_kv_cache_test
   SOURCES test_kv_cache.cpp
   LIBRARIES ninfer_core)
@@ -109,12 +105,20 @@ target_include_directories(ninfer_qwen3_6_frontend_test PRIVATE
 ninfer_add_test(ninfer_qwen3_6_runtime_mechanisms_test
   SOURCES targets/qwen3_6/test_runtime_mechanisms.cpp
   LIBRARIES ninfer_engine ninfer_core)
-target_include_directories(ninfer_qwen3_6_runtime_mechanisms_test PRIVATE
-  ${SERVE_ROOT}/targets/qwen3_6/export)
 ninfer_add_test(ninfer_qwen3_6_27b_prefix_real_test
   SOURCES targets/qwen3_6_27b/test_engine_prefix_real.cpp
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_qwen3_6_27b_prefix_real_test PROPERTIES SKIP_RETURN_CODE 77)
+# surogate: 4B prefix/rewrite-checkpoint exercise, run in both checkpoint
+# modes — the "defer" registration is the gate for defaulting
+# SUROGATE_SERVE_DEFER_REWRITE_CHECKPOINT on (PATCHES.md #24).
+ninfer_add_test(ninfer_qwen3_5_4b_prefix_real_test
+  SOURCES targets/qwen3_5_4b/test_engine_prefix_real.cpp
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_qwen3_5_4b_prefix_real_test PROPERTIES SKIP_RETURN_CODE 77)
+add_test(NAME ninfer_qwen3_5_4b_prefix_defer_test
+  COMMAND ninfer_qwen3_5_4b_prefix_real_test defer)
+set_tests_properties(ninfer_qwen3_5_4b_prefix_defer_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_6_27b_load_plan_test
   SOURCES targets/qwen3_6_27b/test_load_plan.cpp
   NEEDS_SOURCE_DIR
