@@ -702,6 +702,26 @@ old ninfer/ paths.)
    chunked prefill interleave, admit-on-arrival — not vLLM code),
    kMaximumConcurrency 8->32+, board revalidation.
 
+29. **Multi-user campaign, Phase 3a: concurrency ceiling 8 -> 16.**
+   Reordered ahead of the scheduler: at closed-loop load, queue TTFT is
+   throughput-bound (queue/lanes x service), so lanes move both numbers
+   while interleave alone moves neither. kMaximumConcurrency = 16
+   (api/types.h); every batch<=8 gate proved to be host-side validation
+   mirroring the old constant (conv snapshot, GDN snapshot forms across
+   w8/q4q5/nvfp4/fp8 plans, gqa workspace, kv_cache_append_prefix, swa,
+   prepare_masked_block, the decode batch message) — the kernels are
+   grid-scaled; all mirrors raised to 16. Exact-T decode tables and the
+   conv-fused GDN path cover T<=16 by construction (PATCHES #28), so
+   batch-16 rounds stay on the fast kernels. MEASURED (idle 5090, 4B
+   fp4): 16-user pure decode 1,213.8 tok/s (908.6 at C=8), multi100
+   1,141 (865; campaign total 354 -> 1,141 = 3.2x, vLLM gap 9.6x ->
+   3.0x), TTFT p50 13.1 -> 9.1 s, 896/0 completions, load +~2s for the
+   16-batch graph captures. Suite green. C=32 needs T=17..32 route
+   coverage (linear_add SIMT band, GDN exact tables + conv ActiveCols,
+   attn/swiglu tables to 32) plus the same mirror sweep; the per-stream
+   drop at 16 (71.6 vs 109 at 8) says the T=16 kernels lean on the
+   tuning tail — measure before going wider.
+
 ### sm_89 port status
 
 With patches 5–10 the **entire tree compiles and links for sm_89**

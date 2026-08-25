@@ -115,7 +115,7 @@ W8GdnInputPlan w8_gdn_input_resolve_plan(const W8GdnInputProblem& problem) {
 
 W8GdnInputConvPlan w8_gdn_input_conv_resolve_plan(const W8GdnInputProblem& problem,
                                                   std::int32_t batch_size) {
-    if (!w8_gdn_input_admits(problem) || batch_size <= 0 || batch_size > 8) {
+    if (!w8_gdn_input_admits(problem) || batch_size <= 0 || batch_size > 16) { // PATCHES.md #29
         throw std::invalid_argument(
             "W8 GDN input conv: exact problem or column count is not admitted");
     }
