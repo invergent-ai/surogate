@@ -3,9 +3,10 @@
 Date: 2026-08-25 · GPU: one idle RTX 5090 (32 GB, driver 590.44.01)
 · Engines: **surogate serve** (this repo @ 9b75e59; prefill CUDA graphs
 on, deferred rewrite checkpoint on, fp4 prefill profile on W8 artifacts),
-**vLLM 0.27.1** (flashinfer 0.6.16.post3), **llama.cpp** (brew build,
-**Vulkan** backend, NV_coopmat2 — no CUDA llama.cpp build exists on this
-host; small models ran b8500, 27B required the 0.3.0 upgrade).
+**vLLM 0.27.1** (flashinfer 0.6.16.post3), **llama.cpp** in two builds:
+**CUDA** (0.3.0-dev @ f1357e4, source build, sm_120 — llama.cpp's
+strongest backend on this card, the primary rows) and the brew
+**Vulkan** build (NV_coopmat2; kept where noted for reference).
 
 ## Method
 
@@ -21,9 +22,11 @@ share a prefix, identical token accounting). Three workloads per
 | 100 users | 100 closed-loop clients, ~512-token prompts, 128 out, 90 s | aggregate output tok/s, TTFT p50, completions |
 
 Server configs — surogate: `--max-concurrency 8 --max-pending-requests
-256 --kv-capacity auto`; llama.cpp: `-ngl 99 --parallel 8 -c 32768
---jinja`; vLLM: `--max-model-len 4096` (defaults otherwise, 27B/35B add
-`--gpu-memory-utilization 0.92`).
+256 --kv-capacity auto`; llama-server single-user cells: `-ngl 99
+--parallel 8 -c 32768 --jinja`; llama-server 100-user cells use its
+multi-user shape: `--parallel 32 -c 65536 --threads-http 32` (16 slots at
+35B for VRAM); vLLM: `--max-model-len 4096` (defaults otherwise, 27B/35B
+add `--gpu-memory-utilization 0.92`).
 
 **Bit-width pairing.** Rows serve the closest available format of the
 same weight class: llama.cpp serves GGUF **Q4_K_M** (~4.5 bpw); vLLM
@@ -38,15 +41,15 @@ below).
 | engine | weights | TTFT @1.9k | decode tok/s (1 user) | 100-user agg tok/s | 100-user TTFT p50 | 100-user reqs ok/err |
 |---|---|---:|---:|---:|---:|---:|
 | **surogate serve** | from GGUF Q4_K_M | **48 ms** | **473** | 1,255 | 9.3 s | 984/0 |
-| llama.cpp (Vulkan) | GGUF Q4_K_M | 199 ms | 266 | 449 | 25.8 s | 405/242 |
+| llama-server (CUDA) | GGUF Q4_K_M | 168 ms | 391 | 772 | 10.9 s | 612/419 |
 | vLLM | NVFP4 (4-bit) | 55 ms | 364 | **5,958** | **0.41 s** | 4,200/0 |
 
 ## Qwen3.5-4B
 
 | engine | weights | TTFT @1.9k | decode tok/s (1 user) | 100-user agg tok/s | 100-user TTFT p50 | 100-user reqs ok/err |
 |---|---|---:|---:|---:|---:|---:|
-| **surogate serve** | from GGUF Q4_K_M | **57 ms** | **214** | 354 | 28.9 s | 336/0 |
-| llama.cpp (Vulkan) | GGUF Q4_K_M | 407 ms | 138 | 199 | 59.0 s | 235/106 |
+| **surogate serve** | from GGUF Q4_K_M | **57 ms** | **214** | **354** | 28.9 s | 336/0 |
+| llama-server (CUDA) | GGUF Q4_K_M | 445 ms | 190 | 331 | 27.4 s | 306/174 |
 | vLLM | NVFP4 (4-bit) | 71 ms | 166 | **3,390** | **0.24 s** | 2,400/0 |
 
 ## Qwen3.8-27B
@@ -54,35 +57,37 @@ below).
 | engine | weights | TTFT @1.9k | decode tok/s (1 user) | 100-user agg tok/s | 100-user TTFT p50 | 100-user reqs ok/err |
 |---|---|---:|---:|---:|---:|---:|
 | surogate serve | NVFP4 (4-bit resident) | *pending* | *pending* | *pending* | *pending* | — |
-| llama.cpp (Vulkan) | GGUF Q4_K_M | 2,330 ms † | 42 † | *pending* | *pending* | — |
-| vLLM | NVFP4 (4-bit) | *pending* | *pending* | *pending* | *pending* | — |
+| llama-server (CUDA) | GGUF Q4_K_M | 1,829 ms | 49 | 82 | 102.4 s | 135/28 |
+| vLLM | NVFP4 (4-bit) | *load bug* † | — | — | — | — |
 
-† partial: single-user workloads only, small sample (run interrupted for
-GPU handoff). llama.cpp b8500 could not load this GGUF at all (missing
-`blk.64.ssm_conv1d.weight` in its qwen3.8 mapping); the 0.3.0 upgrade
-loads and serves it.
+† vLLM 0.27.1 cannot load this NVFP4 checkpoint
+(`'MergedColumnParallelLinear' object has no attribute 'data'`); an
+FP8-dynamic fallback on the base checkpoint (8-bit — width-noted) is
+being measured instead. llama.cpp b8500 could not load this GGUF either
+(missing `blk.64.ssm_conv1d.weight`); the 0.3.0 source build serves it.
+The 27B dense at 32 slots thrashes badly (3.4 tok/s per stream).
 
 ## Qwen3.6-35B-A3B (MoE)
 
 | engine | weights | TTFT @1.9k | decode tok/s (1 user) | 100-user agg tok/s | 100-user TTFT p50 | 100-user reqs ok/err |
 |---|---|---:|---:|---:|---:|---:|
 | surogate serve | — | *no 4-bit MoE artifact yet* | — | — | — | — |
-| llama.cpp (Vulkan) | GGUF Q4_K_M | *crashed* ‡ | — | — | — | — |
-| vLLM | NVFP4 (4-bit) | 208 ms | 163 | 1,565 | 2.2 s | 1,172/0 |
+| llama-server (CUDA) | GGUF Q4_K_M | 608 ms | 159 | 213 | 51.0 s | 238/111 |
+| vLLM | NVFP4 (4-bit) | **208 ms** | **163** | **1,565** | **2.2 s** | 1,172/0 |
 
-‡ llama.cpp (b8500, Vulkan) loaded the 22 GB Q4_K_M but the server died
-silently mid-prefill (~1.5k tokens in); retry with 0.3.0 pending.
-The surogate W8 artifact (~35 GB) exceeds the card; an NVFP4 MoE
-conversion path (the 27B family already has one) is the missing piece.
+The Vulkan brew build crashed mid-prefill on this MoE; the CUDA source
+build serves it. The surogate W8 artifact (~35 GB) exceeds the card; an
+NVFP4 MoE conversion path (the 27B family already has one) is the
+missing piece.
 
 ## Reading
 
 - **Single user / small-stream serving: surogate wins every measured
-  cell.** TTFT 48–57 ms on 1.9k-token prompts (llama.cpp: 199–407 ms;
-  vLLM: 55–71 ms) and per-stream decode +29–30% over vLLM NVFP4 and
-  +55–78% over llama.cpp on the same-width weights. Against the
-  llama.cpp user profile (same GGUF in, one box, few users) the engine
-  is strictly better at every size that fits.
+  cell** — including against llama.cpp's CUDA build on the same GGUF
+  (0.8B: TTFT 48 vs 168 ms, decode 473 vs 391, 100-user 1,255 vs 641).
+  Per-stream decode runs +29–30% over vLLM NVFP4 at matched widths.
+  Against the llama.cpp user profile (same GGUF in, one box, few users)
+  the engine is strictly better at every size that fits.
 - **100-user throughput: vLLM wins by 4.7× (0.8B) to 9.6× (4B).** The
   engine's aggregate is its 8 lanes times a per-lane decode that scales
   weakly (4B: 44/stream batched vs 214 solo ≈ 1.65× total; 0.8B: 2.65×);
@@ -92,9 +97,13 @@ conversion path (the 27B family already has one) is the missing piece.
   the next engine campaign: raise the 8-lane ceiling, make batched
   decode scale (weight-read amortization across lanes), and admit
   continuously instead of queueing whole requests.
-- **llama.cpp multi-user is not production-shaped** on this backend:
-  40–50% of requests errored under 100-user load at 0.8B/4B (connection
-  drops), and the 35B MoE crashed outright.
+- **llama-server's multi-user shape helps but does not change the
+  order.** At its tuned config (32 slots, continuous batching) it gains
+  +18–20% aggregate over 8 slots at 0.8B/4B (772/331 tok/s) yet still
+  trails the engine's 8 lanes (1,255/354) with 30–40% of requests
+  errored (connection drops), and collapses on the dense 27B (82 tok/s,
+  102 s TTFT). The Vulkan brew build was strictly slower everywhere and
+  crashed on the 35B MoE; only CUDA rows are shown.
 - The engine's serving stack adds no measurable overhead to the
   kernels: single-stream decode over HTTP (473 @0.8B, 214 @4B) matches
   the offline CLI board (`design/serve-engine-bench.md`, same GPU),
@@ -114,6 +123,5 @@ conversion path (the 27B family already has one) is the missing piece.
 
 ## Pending
 
-27B: NVFP4 artifact conversion + engine legs; vLLM legs; llama.cpp
-100-user leg. 35B: llama.cpp retry on 0.3.0. All staged; blocked only on
-GPU availability.
+27B: the surogate NVFP4 artifact conversion (converter naming fixes in
+review) + engine legs; the vLLM FP8 fallback measurement.
