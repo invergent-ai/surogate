@@ -118,6 +118,10 @@ public:
         if (dead_) { return nullptr; }
         auto found = buckets_.find(bucket);
         if (found != buckets_.end()) { return &found->second; }
+        if (std::getenv("SUROGATE_SERVE_PREFILL_GRAPH_LOG") != nullptr) {
+            std::fprintf(stderr, "prefill-graph: capturing bucket %d (chunk %d)\n", bucket,
+                         prefill_chunk_);
+        }
         try {
             std::size_t free_before = 0;
             std::size_t total       = 0;

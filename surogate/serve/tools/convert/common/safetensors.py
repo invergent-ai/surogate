@@ -77,6 +77,19 @@ class ShardReader:
     def _stored_name(self, name: str) -> str:
         return getattr(self, "_aliases", {}).get(name, name)
 
+    def _resolve(self, name: str) -> str:
+        # Requirements may use either the stored multimodal naming
+        # (model.language_model.*) or the folded text naming (model.*);
+        # serve both against the folded map.
+        if name in self.weight_map:
+            return name
+        prefix = "model.language_model."
+        if name.startswith(prefix):
+            flat = "model." + name[len(prefix):]
+            if flat in self.weight_map:
+                return flat
+        return name
+
     def _reset_handle(self) -> None:
         self._current_shard: str | None = None
         self._context = None
@@ -87,7 +100,7 @@ class ShardReader:
         return tuple(self.weight_map)
 
     def has(self, name: str) -> bool:
-        return name in self.weight_map
+        return self._resolve(name) in self.weight_map
 
     def _open_shard(self, shard: str):
         if shard == self._current_shard:
@@ -103,6 +116,7 @@ class ShardReader:
         return self._handle
 
     def get(self, name: str) -> torch.Tensor:
+        name = self._resolve(name)
         shard = self.weight_map[name]
         handle = self._open_shard(shard)
         return handle.get_tensor(self._stored_name(name))
@@ -110,9 +124,12 @@ class ShardReader:
     def metadata(self, names: Iterable[str]) -> dict[str, TensorMetadata]:
         self.close()
         by_shard: dict[str, list[str]] = {}
+        requested: dict[str, str] = {}
         for name in names:
-            shard = self.weight_map[name]
-            by_shard.setdefault(shard, []).append(name)
+            resolved = self._resolve(name)
+            requested[resolved] = name
+            shard = self.weight_map[resolved]
+            by_shard.setdefault(shard, []).append(resolved)
 
         result: dict[str, TensorMetadata] = {}
         for shard, shard_names in by_shard.items():
@@ -123,8 +140,9 @@ class ShardReader:
             ) as handle:
                 for name in shard_names:
                     tensor_slice = handle.get_slice(self._stored_name(name))
-                    result[name] = TensorMetadata(
-                        name=name,
+                    original = requested.get(name, name)
+                    result[original] = TensorMetadata(
+                        name=original,
                         shard=shard,
                         shape=tuple(tensor_slice.get_shape()),
                         dtype=str(tensor_slice.get_dtype()),

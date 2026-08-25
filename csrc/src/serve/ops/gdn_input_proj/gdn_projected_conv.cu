@@ -126,6 +126,14 @@ void dispatch(const Tensor& projected, const Tensor& conv_weight, const Tensor& 
                                        initial_state_slots, query, key, value, publish, stream);
         return;
     }
+    // qwen3_5 0.8B/2B share one GDN geometry (16x128 keys/values): required for
+    // any max_concurrency > 1 (batch decode/verify snapshot path).
+    if (projected.ne[0] == 6144 && query.ne[0] == 2048 && key.ne[0] == 2048 &&
+        value.ne[0] == 2048) {
+        launch<6144, 2048, 2048, 2048>(projected, conv_weight, state_read, valid_columns,
+                                       initial_state_slots, query, key, value, publish, stream);
+        return;
+    }
     throw std::invalid_argument("GDN projected-conv received an unregistered geometry");
 }
 
