@@ -72,6 +72,7 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         // fell onto the runtime MMA tile at ~1.76ms per round).
         if (n == 248320 || n == 131072) {
             if (t <= 16) { return launch_w8_simt_r8_c4; }
+            if (n == 248320 && t <= 32) { return launch_w8_small_t; } // PATCHES.md #29
             if (t <= 128) { return launch_w8_mma_r32_c128; }
             return launch_w8_mma_r64_c128;
         }
@@ -81,6 +82,7 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         // (lm head 248320, draft head 131072; hidden 1024).
         if (n == 248320 || n == 131072) {
             if (t <= 16) { return launch_w8_simt_r8_c4; }
+            if (n == 248320 && t <= 32) { return launch_w8_small_t; } // PATCHES.md #29
             if (t <= 128) { return launch_w8_mma_r32_c128; }
             return launch_w8_mma_r64_c128;
         }
@@ -91,6 +93,7 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         case 248320:
         case 131072:
             if (t <= 16) { return launch_w8_simt_r8_c4; }
+            if (n == 248320 && t <= 32) { return launch_w8_small_t; } // PATCHES.md #29
             if (t <= 128) { return launch_w8_mma_r32_c128; }
             return launch_w8_mma_r64_c128;
         case 1024:

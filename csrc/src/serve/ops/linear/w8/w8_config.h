@@ -66,6 +66,15 @@ using W8MtpGateUpProjectionGeometry    = W8LinearGeometry<34816, 5120>;
 using W8MtpDownProjectionGeometry      = W8LinearGeometry<5120, 17408>;
 using W835bMtpProjectionGeometry       = W8LinearGeometry<2048, 4096>;
 
+// surogate vendor patch (PATCHES.md #29): small-target vocabulary heads at
+// the C=32 batch band (T=2..16 rides the batched W4 decode at fp4; these
+// exact-T tables serve T=17..32 where the W4 32-accumulator bucket spilled).
+using W8Q4bVocabularyGeometry = W8LinearGeometry<248320, 2560>;
+using W8Q2bVocabularyGeometry = W8LinearGeometry<248320, 2048>;
+using W8Q08VocabularyGeometry = W8LinearGeometry<248320, 1024>;
+inline constexpr std::int32_t kW8SmallVocabFirstSmallT = 17;
+inline constexpr std::int32_t kW8SmallVocabLastSmallT  = 32;
+
 inline constexpr std::int32_t kW8VocabularyFirstSmallT         = 1;
 inline constexpr std::int32_t kW8VocabularyLastSmallT          = 33;
 inline constexpr std::int32_t kW8MtpInputFirstSmallT           = 1;
@@ -83,6 +92,27 @@ inline constexpr std::int32_t kW835bMtpProjectionLastSmallT    = 48;
 
 template <class Geometry, int ActiveTokens>
 struct W8LinearSmallTProductionSchedule;
+
+// surogate vendor patch (PATCHES.md #29): the small-target vocab heads use
+// the default schedule at their 17..32 band (measured tuning pending; any
+// exact-T single-pass read beats the runtime tile they replace).
+template <class Geometry, int ActiveTokens>
+struct W8SmallVocabDefaultProduction {
+    static_assert(ActiveTokens >= kW8SmallVocabFirstSmallT);
+    static_assert(ActiveTokens <= kW8SmallVocabLastSmallT);
+    static constexpr int kTileTokens = ActiveTokens <= 24 ? 24 : 32;
+    using Type                       = W8SmallTMmaDefaultSchedule<kTileTokens, ActiveTokens>;
+};
+
+template <int ActiveTokens>
+struct W8LinearSmallTProductionSchedule<W8Q4bVocabularyGeometry, ActiveTokens>
+    : W8SmallVocabDefaultProduction<W8Q4bVocabularyGeometry, ActiveTokens> {};
+template <int ActiveTokens>
+struct W8LinearSmallTProductionSchedule<W8Q2bVocabularyGeometry, ActiveTokens>
+    : W8SmallVocabDefaultProduction<W8Q2bVocabularyGeometry, ActiveTokens> {};
+template <int ActiveTokens>
+struct W8LinearSmallTProductionSchedule<W8Q08VocabularyGeometry, ActiveTokens>
+    : W8SmallVocabDefaultProduction<W8Q08VocabularyGeometry, ActiveTokens> {};
 
 template <int ActiveTokens>
 struct W8LinearSmallTProductionSchedule<W8VocabularyProjectionGeometry, ActiveTokens> {

@@ -57,9 +57,32 @@ constexpr auto k35bMtpProjectionLaunchers = make_launchers<W835bMtpProjectionGeo
                                                            kW835bMtpProjectionFirstSmallT>(
     std::make_index_sequence<kW835bMtpProjectionLastSmallT - kW835bMtpProjectionFirstSmallT + 1>{});
 
+// surogate vendor patch (PATCHES.md #29): small-target vocabulary heads,
+// T=17..32 only (see w8_config.h).
+using SmallVocabSeq =
+    std::make_index_sequence<kW8SmallVocabLastSmallT - kW8SmallVocabFirstSmallT + 1>;
+constexpr auto kQ4bVocabularyLaunchers =
+    make_launchers<W8Q4bVocabularyGeometry, kW8SmallVocabFirstSmallT>(SmallVocabSeq{});
+constexpr auto kQ2bVocabularyLaunchers =
+    make_launchers<W8Q2bVocabularyGeometry, kW8SmallVocabFirstSmallT>(SmallVocabSeq{});
+constexpr auto kQ08VocabularyLaunchers =
+    make_launchers<W8Q08VocabularyGeometry, kW8SmallVocabFirstSmallT>(SmallVocabSeq{});
+
 } // namespace
 
 void launch_w8_small_t(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    // surogate vendor patch (PATCHES.md #29): small-target vocab heads.
+    if (weight.n == 248320 &&
+        (weight.k == 2560 || weight.k == 2048 || weight.k == 1024) &&
+        weight.padded_shape[1] == weight.k && x.ne[1] >= kW8SmallVocabFirstSmallT &&
+        x.ne[1] <= kW8SmallVocabLastSmallT) {
+        const std::size_t index = static_cast<std::size_t>(x.ne[1] - kW8SmallVocabFirstSmallT);
+        const auto& launchers   = weight.k == 2560   ? kQ4bVocabularyLaunchers
+                                  : weight.k == 2048 ? kQ2bVocabularyLaunchers
+                                                     : kQ08VocabularyLaunchers;
+        launchers[index](x, weight, out, stream);
+        return;
+    }
     if (weight.n == W8VocabularyProjectionGeometry::kOutputRows &&
         weight.k == W8VocabularyProjectionGeometry::kInputRows &&
         weight.padded_shape[1] == W8VocabularyProjectionGeometry::kInputRows &&

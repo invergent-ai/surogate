@@ -759,7 +759,15 @@ old ninfer/ paths.)
    T=17..32 census pass. ATTEMPTED same day: a W4
    MaxTokens=32 bucket measured WORSE everywhere (0.8B 2,625, 4B 1,128 —
    32 accumulators spill and the extra local traffic loses to the tile);
-   reverted. The vocab exact-T table remains the real unlock.
+   reverted. The vocab exact-T table remains the real unlock. BUILT same day: W8Q{4b,2b,08}VocabularyGeometry
+   (248320 x 2560/2048/1024) exact-T tables at the 17..32 band only
+   (T<=16 keeps the winning batched-W4 path at fp4), default production
+   schedules (measured tuning pending), head routes gain the
+   n==248320 && t<=32 -> launch_w8_small_t band. MEASURED: 4B at C=32
+   now WINS — multi100 1,429 tok/s / TTFT 5.9s (vs 1,302 at C=16; vLLM
+   gap 2.4x); the 0.8B keeps its C=16 optimum (3,433 vs 3,062 at 32).
+   Per-model sweet spots are the recommendation: 4B -> 32, 0.8B -> 16.
+   Suite green.
 
 ### sm_89 port status
 

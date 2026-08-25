@@ -48,7 +48,7 @@ unsloth NVFP4 export + base checkpoint by the vendored converter).
 
 | engine | weights | TTFT @1.9k | decode tok/s (1 user) | 100-user agg tok/s | 100-user TTFT p50 | 100-user reqs ok/err |
 |---|---|---:|---:|---:|---:|---:|
-| **surogate serve** | from GGUF Q4_K_M | **57 ms** | **214** | **1,302** † | 7.9 s | 1,012/0 |
+| **surogate serve** | from GGUF Q4_K_M | **57 ms** | **214** | **1,429** † | 5.9 s | 1,092/0 |
 | llama-server (CUDA) | GGUF Q4_K_M | 445 ms | 190 | 331 | 27.4 s | 306/174 |
 | vLLM | NVFP4 (4-bit) | 71 ms | 166 | **3,390** | **0.24 s** | 2,400/0 |
 
@@ -94,7 +94,7 @@ missing piece.
 - **100-user throughput: vLLM still wins where it serves, but the gap
   collapsed** († = after the PATCHES #28 batch-decode route fix, same
   build for all engine cells): 1.7× at 0.8B (5,958 vs 3,433, was 4.7×)
-  and 2.6× at 4B (3,390 vs 1,302 at `--max-concurrency 16`, was 9.6×),
+  and 2.4× at 4B (3,390 vs 1,429 at `--max-concurrency 32`, was 9.6×),
   with the engine now 2.6–3.4×
   ahead of llama-server's tuned multi-user config. The fix: batch
   T=2..16 layer GEMMs ran prefill-class MMA tiles at ~6% utilization
