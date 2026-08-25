@@ -661,12 +661,18 @@ old ninfer/ paths.)
    rode the base band) + route flip, and linear_add SIMT band widened
    1..4 -> 1..16 for the small-target tables (runtime-shaped SIMT kernel,
    no new instantiation; exact-T bakes for 2560x{4096,9216} and
-   2048x2048 are the refinement pass). REMAINING: gdn_input_proj — all
-   three small targets route T>=2 to MmaR64C128; its bespoke split-K
-   kernel bakes the 35B geometry (kRows=12288/kHidden=2048 namespace
-   constexprs); template the geometry (the 4B shares 12288 rows — only
-   Hidden varies: 2560/2048/1024 + Output splits 8192/4096 vs 6144/2048)
-   and flip the small-target 2..32 band. Check linear_pair similarly. Then: batch-T w4fp4_decode
+   2048x2048 are the refinement pass). gdn_input_proj DONE in the
+   third pass: the conv-fused exact-T path (w8_small_t_mma under a
+   GdnConvEpilogue) is geometry-templated (Rows/Hidden/QkvRows/Q/K/V/Z),
+   with table sets for 4B (12288x2560, 35B split 8192=2048+2048+4096,
+   z 4096), 2B (8192x2048, 6144=3x2048, z 2048) and 0.8B (8192x1024) in
+   projection/snapshot/record forms (T=2..16) plus variant selection by
+   (weight.n, weight.k) and the small-target route band 2..16 ->
+   SplitKMmaDirect (T>=17 keeps the runtime-dim MMA; the medium kernel
+   still bakes 35B geometry). linear_pair checked: MTP-only, not in
+   ordinary rounds — no change. Phase-1 W8 route work is COMPLETE for
+   every family a batch decode round touches; batch-T w4fp4_decode
+   (T=1-only today) is the remaining Phase-1 kernel item. Then: batch-T w4fp4_decode
    (T=1 only today — fp4 profile batch rounds pay 2x weight bytes),
    decode-graph recapture is automatic at load. VALIDATE when GPU
    returns: per-op bench (ninfer_attn_input_proj_bench --tokens 1..8 at

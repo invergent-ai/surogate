@@ -28,7 +28,9 @@ constexpr int kLastProjectionExactCols = 32;
 constexpr int kLastSnapshotExactCols   = 16;
 using Output                           = W8SplitOutput2<8192, 4096>;
 
-template <class Publish>
+// surogate vendor patch (PATCHES.md #28): the qkv/z boundary is templated so
+// the small targets (qkv 6144 / z 2048) share this epilogue.
+template <class Publish, int QkvRows = 8192, int ZRows = 4096>
 struct W8GdnSplitKConvEpilogue {
     GdnConvEpilogue<Publish> conv;
     __nv_bfloat16* z;
@@ -36,12 +38,12 @@ struct W8GdnSplitKConvEpilogue {
     template <int ActiveCols>
     __device__ __forceinline__ void store(std::int32_t row,
                                           const float (&projected)[ActiveCols]) const {
-        if (row < 8192) {
+        if (row < QkvRows) {
             conv.store(row, projected);
         } else {
 #pragma unroll
             for (int token = 0; token < ActiveCols; ++token) {
-                z[static_cast<std::int64_t>(token) * 4096 + row - 8192] =
+                z[static_cast<std::int64_t>(token) * ZRows + row - QkvRows] =
                     __float2bfloat16_rn(projected[token]);
             }
         }
@@ -272,34 +274,42 @@ __launch_bounds__(KSplits* NGroups * 32, MinBlocks) void w8_gdn_input_medium_t_s
     }
 }
 
-template <int ActiveCols>
+template <int ActiveCols, int Rows = kRows, int Hidden = kHidden, int QkvRows = 8192,
+          int ZRows = 4096>
 void launch_active_cols(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                         cudaStream_t stream) {
     constexpr int TileCols =
         ActiveCols <= 8 ? 8 : (ActiveCols <= 16 ? 16 : (ActiveCols <= 24 ? 24 : 32));
-    using Geometry = W8LinearGeometry<kRows, kHidden>;
-    using Schedule = W8SmallTMmaDefaultSchedule<TileCols, ActiveCols>;
-    static_assert((8192 % kRowsPerCta) == 0 && (4096 % kRowsPerCta) == 0);
-    const Output output{static_cast<__nv_bfloat16*>(qkv.data), static_cast<__nv_bfloat16*>(z.data)};
-    w8_small_t_mma_kernel<Geometry, ActiveCols, Schedule>
-        <<<kRows / kRowsPerCta, Schedule::kThreads, 0, stream>>>(
+    using Geometry   = W8LinearGeometry<Rows, Hidden>;
+    using Schedule   = W8SmallTMmaDefaultSchedule<TileCols, ActiveCols>;
+    using SplitOut   = W8SplitOutput2<QkvRows, ZRows>;
+    static_assert((QkvRows % kRowsPerCta) == 0 && (ZRows % kRowsPerCta) == 0);
+    const SplitOut output{static_cast<__nv_bfloat16*>(qkv.data),
+                          static_cast<__nv_bfloat16*>(z.data)};
+    w8_small_t_mma_kernel<Geometry, ActiveCols, Schedule, SplitOut>
+        <<<Rows / kRowsPerCta, Schedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), output);
 }
 
-template <int ActiveCols, class Publish>
+template <int ActiveCols, class Publish, int Rows = kRows, int Hidden = kHidden,
+          int QkvRows = 8192, int QRows = 2048, int KRows = 2048, int VRows = 4096,
+          int ZRows = 4096>
 void launch_active_cols_conv(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
                              const Tensor& conv_states, const Tensor& valid_columns,
                              const Tensor& initial_slot, Tensor& query, Tensor& key, Tensor& value,
                              Tensor& z, Publish publish, cudaStream_t stream) {
     static_assert(ActiveCols >= 2 && ActiveCols <= 16);
+    static_assert(QRows + KRows + VRows == QkvRows && QkvRows + ZRows == Rows);
     constexpr int TileCols = ActiveCols <= 8 ? 8 : 16;
-    using Geometry         = W8LinearGeometry<kRows, kHidden>;
+    using Geometry         = W8LinearGeometry<Rows, Hidden>;
     using Schedule         = W8SmallTMmaDefaultSchedule<TileCols, ActiveCols>;
-    const Output ignored_output{static_cast<__nv_bfloat16*>(query.data),
-                                static_cast<__nv_bfloat16*>(z.data)};
-    const W8GdnSplitKConvEpilogue<Publish> epilogue{
+    using SplitOut         = W8SplitOutput2<QkvRows, ZRows>;
+    using Epilogue         = W8GdnSplitKConvEpilogue<Publish, QkvRows, ZRows>;
+    const SplitOut ignored_output{static_cast<__nv_bfloat16*>(query.data),
+                                  static_cast<__nv_bfloat16*>(z.data)};
+    const Epilogue epilogue{
         {
             static_cast<const __nv_bfloat16*>(conv_weight.data),
             static_cast<const __nv_bfloat16*>(conv_states.data),
@@ -309,10 +319,10 @@ void launch_active_cols_conv(const Tensor& x, const Weight& weight, const Tensor
             static_cast<__nv_bfloat16*>(query.data),
             static_cast<__nv_bfloat16*>(key.data),
             static_cast<__nv_bfloat16*>(value.data),
-            8192,
-            2048,
-            2048,
-            4096,
+            QkvRows,
+            QRows,
+            KRows,
+            VRows,
             0,
             ActiveCols,
             0,
@@ -320,35 +330,39 @@ void launch_active_cols_conv(const Tensor& x, const Weight& weight, const Tensor
         },
         static_cast<__nv_bfloat16*>(z.data),
     };
-    w8_small_t_mma_kernel<Geometry, ActiveCols, Schedule, Output, W8GdnSplitKConvEpilogue<Publish>>
-        <<<kRows / kRowsPerCta, Schedule::kThreads, 0, stream>>>(
+    w8_small_t_mma_kernel<Geometry, ActiveCols, Schedule, SplitOut, Epilogue>
+        <<<Rows / kRowsPerCta, Schedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), ignored_output, epilogue);
 }
 
-template <int ActiveCols>
+template <int ActiveCols, int Rows = kRows, int Hidden = kHidden, int QkvRows = 8192,
+          int QRows = 2048, int KRows = 2048, int VRows = 4096, int ZRows = 4096>
 void launch_active_cols_conv_snapshot(const Tensor& x, const Weight& weight,
                                       const Tensor& conv_weight, Tensor& conv_states,
                                       const Tensor& valid_columns, const Tensor& initial_slot,
                                       const Tensor& snapshot_base_slot, Tensor& query, Tensor& key,
                                       Tensor& value, Tensor& z, cudaStream_t stream) {
-    launch_active_cols_conv<ActiveCols>(
+    launch_active_cols_conv<ActiveCols, SnapshotHistoryPublish, Rows, Hidden, QkvRows, QRows,
+                            KRows, VRows, ZRows>(
         x, weight, conv_weight, conv_states, valid_columns, initial_slot, query, key, value, z,
         SnapshotHistoryPublish{static_cast<__nv_bfloat16*>(conv_states.data),
-                               static_cast<const std::int32_t*>(snapshot_base_slot.data), 8192},
+                               static_cast<const std::int32_t*>(snapshot_base_slot.data), QkvRows},
         stream);
 }
 
-template <int ActiveCols>
+template <int ActiveCols, int Rows = kRows, int Hidden = kHidden, int QkvRows = 8192,
+          int QRows = 2048, int KRows = 2048, int VRows = 4096, int ZRows = 4096>
 void launch_active_cols_conv_record(const Tensor& x, const Weight& weight,
                                     const Tensor& conv_weight, const Tensor& conv_states,
                                     const Tensor& valid_columns, const Tensor& initial_slot,
                                     Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
                                     Tensor& z, cudaStream_t stream) {
-    launch_active_cols_conv<ActiveCols>(
+    launch_active_cols_conv<ActiveCols, RecordColumnPublish, Rows, Hidden, QkvRows, QRows, KRows,
+                            VRows, ZRows>(
         x, weight, conv_weight, conv_states, valid_columns, initial_slot, query, key, value, z,
-        RecordColumnPublish{static_cast<__nv_bfloat16*>(conv_record.data), 8192, ActiveCols},
+        RecordColumnPublish{static_cast<__nv_bfloat16*>(conv_record.data), QkvRows, ActiveCols},
         stream);
 }
 
@@ -397,6 +411,54 @@ constexpr auto kSnapshotLaunchers = make_snapshot_launchers(
 constexpr auto kRecordLaunchers =
     make_record_launchers(std::make_index_sequence<kLastSnapshotExactCols - kFirstExactCols + 1>{});
 
+// surogate vendor patch (PATCHES.md #28): small-target exact-T tables. The 4B
+// shares the 35B row split (12288 = 8192 qkv + 4096 z) at hidden 2560; the
+// 2B/0.8B use the 6144/2048 split at hidden 2048/1024. Batch decode rounds
+// live at T=2..16 and previously routed onto the runtime-shaped MMA tiles.
+template <int Rows, int Hidden, int QkvRows, int QRows, int KRows, int VRows, int ZRows>
+struct GdnVariantTables {
+    template <std::size_t... Offsets>
+    static constexpr auto projection(std::index_sequence<Offsets...>) {
+        return std::array<ProjectionLauncher, sizeof...(Offsets)>{
+            &launch_active_cols<kFirstExactCols + static_cast<int>(Offsets), Rows, Hidden, QkvRows,
+                                ZRows>...};
+    }
+    template <std::size_t... Offsets>
+    static constexpr auto snapshot(std::index_sequence<Offsets...>) {
+        return std::array<SnapshotLauncher, sizeof...(Offsets)>{
+            &launch_active_cols_conv_snapshot<kFirstExactCols + static_cast<int>(Offsets), Rows,
+                                              Hidden, QkvRows, QRows, KRows, VRows, ZRows>...};
+    }
+    template <std::size_t... Offsets>
+    static constexpr auto record(std::index_sequence<Offsets...>) {
+        return std::array<RecordLauncher, sizeof...(Offsets)>{
+            &launch_active_cols_conv_record<kFirstExactCols + static_cast<int>(Offsets), Rows,
+                                            Hidden, QkvRows, QRows, KRows, VRows, ZRows>...};
+    }
+};
+
+using Q4bTables = GdnVariantTables<12288, 2560, 8192, 2048, 2048, 4096, 4096>;
+using Q2bTables = GdnVariantTables<8192, 2048, 6144, 2048, 2048, 2048, 2048>;
+using Q08Tables = GdnVariantTables<8192, 1024, 6144, 2048, 2048, 2048, 2048>;
+using SmallSeq  = std::make_index_sequence<kLastSnapshotExactCols - kFirstExactCols + 1>;
+
+constexpr auto kQ4bProjectionLaunchers = Q4bTables::projection(SmallSeq{});
+constexpr auto kQ4bSnapshotLaunchers   = Q4bTables::snapshot(SmallSeq{});
+constexpr auto kQ4bRecordLaunchers     = Q4bTables::record(SmallSeq{});
+constexpr auto kQ2bProjectionLaunchers = Q2bTables::projection(SmallSeq{});
+constexpr auto kQ2bSnapshotLaunchers   = Q2bTables::snapshot(SmallSeq{});
+constexpr auto kQ2bRecordLaunchers     = Q2bTables::record(SmallSeq{});
+constexpr auto kQ08ProjectionLaunchers = Q08Tables::projection(SmallSeq{});
+constexpr auto kQ08SnapshotLaunchers   = Q08Tables::snapshot(SmallSeq{});
+constexpr auto kQ08RecordLaunchers     = Q08Tables::record(SmallSeq{});
+
+enum class GdnVariant { k35B, kQ4b, kQ2b, kQ08 };
+
+GdnVariant gdn_variant_for(const Weight& weight) {
+    if (weight.n == 12288) { return weight.k == 2560 ? GdnVariant::kQ4b : GdnVariant::k35B; }
+    return weight.k == 1024 ? GdnVariant::kQ08 : GdnVariant::kQ2b;
+}
+
 } // namespace
 
 void w8_gdn_input_splitk_mma_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
@@ -404,6 +466,19 @@ void w8_gdn_input_splitk_mma_launch(const Tensor& x, const Weight& weight, Tenso
     const std::int32_t cols = x.ne[1];
     if (cols < kFirstExactCols || cols > 96) {
         throw std::invalid_argument("W8 GDN split-K MMA requires T=2..96");
+    }
+    const GdnVariant variant = gdn_variant_for(weight);
+    if (variant != GdnVariant::k35B) {
+        if (cols > kLastSnapshotExactCols) {
+            throw std::invalid_argument(
+                "W8 GDN split-K MMA: small-target exact tables cover T=2..16");
+        }
+        const auto& launchers = variant == GdnVariant::kQ4b   ? kQ4bProjectionLaunchers
+                                : variant == GdnVariant::kQ2b ? kQ2bProjectionLaunchers
+                                                              : kQ08ProjectionLaunchers;
+        launchers[cols - kFirstExactCols](x, weight, qkv, z, stream);
+        CUDA_CHECK(cudaGetLastError());
+        return;
     }
     if (cols <= kLastProjectionExactCols) {
         kProjectionLaunchers[cols - kFirstExactCols](x, weight, qkv, z, stream);
@@ -425,9 +500,14 @@ void w8_gdn_input_splitk_conv_snapshot_launch(
     if (cols < kFirstExactCols || cols > kLastSnapshotExactCols) {
         throw std::invalid_argument("W8 fused GDN input snapshot requires T=2..16");
     }
-    kSnapshotLaunchers[cols - kFirstExactCols](x, weight, conv_weight, conv_states, valid_columns,
-                                               initial_slot, snapshot_base_slot, query, key, value,
-                                               z, stream);
+    const GdnVariant variant = gdn_variant_for(weight);
+    const auto& launchers    = variant == GdnVariant::kQ4b   ? kQ4bSnapshotLaunchers
+                               : variant == GdnVariant::kQ2b ? kQ2bSnapshotLaunchers
+                               : variant == GdnVariant::kQ08 ? kQ08SnapshotLaunchers
+                                                             : kSnapshotLaunchers;
+    launchers[cols - kFirstExactCols](x, weight, conv_weight, conv_states, valid_columns,
+                                      initial_slot, snapshot_base_slot, query, key, value, z,
+                                      stream);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -440,7 +520,12 @@ void w8_gdn_input_splitk_conv_record_launch(const Tensor& x, const Weight& weigh
     if (cols < kFirstExactCols || cols > kLastSnapshotExactCols) {
         throw std::invalid_argument("W8 fused GDN input record requires T=2..16");
     }
-    kRecordLaunchers[cols - kFirstExactCols](x, weight, conv_weight, conv_states, valid_columns,
+    const GdnVariant record_variant = gdn_variant_for(weight);
+    const auto& record_launchers    = record_variant == GdnVariant::kQ4b ? kQ4bRecordLaunchers
+                                      : record_variant == GdnVariant::kQ2b ? kQ2bRecordLaunchers
+                                      : record_variant == GdnVariant::kQ08 ? kQ08RecordLaunchers
+                                                                           : kRecordLaunchers;
+    record_launchers[cols - kFirstExactCols](x, weight, conv_weight, conv_states, valid_columns,
                                              initial_slot, conv_record, query, key, value, z,
                                              stream);
     CUDA_CHECK(cudaGetLastError());

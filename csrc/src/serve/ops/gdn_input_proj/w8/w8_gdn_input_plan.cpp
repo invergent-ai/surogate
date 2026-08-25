@@ -34,13 +34,14 @@ constexpr bool catalog_is_closed() {
 
 static_assert(catalog_is_closed(), "W8 GDN input routes must be exact and closed");
 
-// surogate vendor patch (PATCHES.md #13/#16): qwen3.5-0.8b AND -2b routes
-// (both have the 6144-row qkv split). The split-K medium-T kernel bakes the
-// 35B geometry (port tracked); route their 2..96 band to the runtime-dim
-// MMA schedule instead.
-constexpr std::array<RouteSpec, 2> kRoutes08{{
+// surogate vendor patch (PATCHES.md #13/#16/#28): qwen3.5-0.8b/-2b/-4b. The
+// exact-T split-K tables are instantiated for all three now (T=2..16, the
+// batch-decode band); the medium band still bakes the 35B geometry, so
+// T>=17 keeps the runtime-dim MMA schedule.
+constexpr std::array<RouteSpec, 3> kRoutes08{{
     {1, 1, W8GdnInputScheduleId::DecodeR8Direct},
-    {2, kAnyCols, W8GdnInputScheduleId::MmaR64C128},
+    {2, 16, W8GdnInputScheduleId::SplitKMmaDirect},
+    {17, kAnyCols, W8GdnInputScheduleId::MmaR64C128},
 }};
 
 bool supported_shape(const W8GdnInputProblem& problem) noexcept {
