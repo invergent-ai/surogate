@@ -252,12 +252,19 @@ Same method, idle 5090, batch 1, greedy, 128 decode tokens. Engine =
 first correctness-first pass (measured 2026-08-25, prompt tokens
 463/953/1903; decode averaged over the same runs).
 
-| point | engine W8 | vLLM bf16 | vLLM FP8 | vLLM NVFP4 (AxionML) |
+| point | engine W8+FP8 | vLLM bf16 | vLLM FP8 | vLLM NVFP4 (AxionML) |
 |---|---:|---:|---:|---:|
-| prefill @472 | 10,101 | 9,855 | **11,838** | 8,469 |
-| prefill @962 | 13,608 | 11,475 | 15,985 | **17,351** |
-| prefill @1912 | 17,064 | 12,679 | 19,743 | **35,169** |
+| prefill @472 | **11,845** | 9,855 | 11,838 | 8,469 |
+| prefill @962 | 15,952 | 11,475 | 15,985 | **17,351** |
+| prefill @1912 | **20,355** | 12,679 | 19,743 | **35,169** |
 | decode | **~160** | 100 | 115 | **162** |
+
+Engine column = 2026-08-25 evening state: PATCHES #18 target + #19 wide
+gate/fused swiglu + #20 derived FP8-e4m3 prefill plane (decode stays
+int8-exact W8; measured with --prefill-warmup = steady serving state).
+History: first pass 10.1/13.6/17.1k; +wide gate 17.6k; +fused swiglu
+10.5/13.8/18.0k; +FP8 plane as shown. vLLM FP8 is now tied @472/@962 and
+beaten @1912; only 4-bit NVFP4 prefill at 962+ remains ahead.
 
 Reading:
 - Decode 158-162 tok/s: +60% over vLLM bf16, +39% over FP8, and a tie

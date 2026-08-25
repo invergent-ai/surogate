@@ -328,6 +328,34 @@
    @472/962/1912 (vLLM bf16 9.9/11.5/12.7, FP8 11.8/16.0/19.7), decode
    ~160 unchanged.
 
+20. **Derived FP8-e4m3 prefill plane — vLLM FP8 matched/beaten in-class.**
+   Measured first: an e4m3/F16-acc mma swap alone gains ZERO (the IMMA
+   kernel is bound by its per-group software scale tail, not MMA rate).
+   The win is FOLDING the scales away: at first large-T use of a W8G32
+   parent the engine derives fp8_codes[row,k] = e4m3(w / rowmax) plus
+   row_scales[row] (registry keyed by device pointer, event-ordered
+   publication, VRAM guard at 2x plane size, SUROGATE_SERVE_FP8_PREFILL=0
+   veto; artifact unchanged — decode stays int8-exact W8). Activations
+   quantize per token to e4m3 at 448/xmax. The folded kernel
+   (w8fp8_gemm.cuh, same staging as IMMA) chains the f16 accumulator
+   across each 64-wide k-tile — bounded by 2*32*1.0*448 = 28672 < 65504,
+   no satfinite clamping by construction — spills to f32 once per tile,
+   and applies row_scale * x_scale once in the tail (the swiglu paired
+   tail scales each half by its own row before silu*mul). Probe: -12..16%
+   vs IMMA at every shape. Engine opts in at construction; op tests keep
+   int8-exact numerics. CLI gains --prefill-warmup (one discarded request
+   so measured runs exclude the one-time ~10 ms derivation, matching how
+   a server amortizes it).
+
+   4B steady state (idle 5090, batch 1): prefill 11,845 / 15,952 /
+   20,355 @472/962/1912 vs vLLM FP8 11,838 / 15,985 / 19,743 — tie, tie,
+   +3% — with decode ~160 vs their 115 (+39%). Quality class: FP8
+   per-row (finer than vLLM's per-tensor). Greedy E2E answer unchanged
+   with the plane on and off. Remaining ahead-of-us: NVFP4 prefill at
+   962+ (4-bit compute; the native 4-bit profile is the answer) and a
+   dedicated FP8-plane op test + mxf8f6f4 block-scale variant (hardware
+   ue8m0 per-32 scales; possibly faster and finer than per-row).
+
 ### sm_89 port status
 
 With patches 5–10 the **entire tree compiles and links for sm_89**

@@ -148,6 +148,7 @@ add_library(ninfer_ops STATIC
   ops/gdn_input_proj/gdn_projected_conv.cu
   ops/linear/w8a8/w8a8_act_quant.cu
   ops/linear/w8a8/w8a8_dispatch.cu
+  ops/linear/w8a8/w8fp8_plane.cu
   ops/linear_swiglu/w8a8/w8a8_linear_swiglu.cu
   ops/gdn_input_proj/w8/w8_gdn_input_decode.cu
   ops/gdn_input_proj/w8/w8_gdn_input_gemm_mma.cu

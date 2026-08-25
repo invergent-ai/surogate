@@ -13,6 +13,8 @@
 #include "ops/common/math.h"
 #include "ops/linear/w8a8/w8a8_act_quant.h"
 #include "ops/linear/w8a8/w8a8_imma_gemm.cuh"
+#include "ops/linear/w8a8/w8fp8_gemm.cuh"
+#include "ops/linear/w8a8/w8fp8_plane.h"
 
 #include <cuda_bf16.h>
 
@@ -50,10 +52,35 @@ void w8a8_linear_swiglu_dispatch(const Tensor& x, const Weight& gate_up_weight, 
     auto scope                    = workspace.scope();
     auto* base = static_cast<std::uint8_t*>(workspace.alloc_bytes(quant_bytes, 16).data);
 
-    const W8A8QuantizedActivations quantized = w8a8_act_quant(x, base, stream);
-
     const W8A8SwigluPairRowMap row_map{intermediate};
     const SwigluPairColumnMajor epilogue{static_cast<__nv_bfloat16*>(out.data), intermediate};
+
+    // surogate vendor patch (PATCHES.md #20): folded-scale FP8 plane.
+    const W8Fp8Plane plane = w8fp8_plane_for(gate_up_weight, stream);
+    if (plane.codes != nullptr) {
+        const W8Fp8QuantizedActivations fp8 = w8fp8_act_quant(x, base, stream);
+        if (tokens >= kW8A8WideMinTokens && gate_up_rows >= 4096) {
+            using Cfg = W8A8ImmaWideConfig;
+            const dim3 grid(static_cast<unsigned>(div_up(gate_up_rows, Cfg::BM)),
+                            static_cast<unsigned>(div_up(tokens, Cfg::BN)), 1u);
+            w8fp8_gemm_kernel<W8A8SwigluPairRowMap, SwigluPairColumnMajor, Cfg>
+                <<<grid, Cfg::THREADS, 0, stream>>>(plane.codes, plane.row_scales, fp8.codes,
+                                                    fp8.scales, gate_up_rows, k, tokens, row_map,
+                                                    epilogue);
+        } else {
+            using Cfg = W8A8ImmaConfig;
+            const dim3 grid(static_cast<unsigned>(div_up(gate_up_rows, Cfg::BM)),
+                            static_cast<unsigned>(div_up(tokens, Cfg::BN)), 1u);
+            w8fp8_gemm_kernel<W8A8SwigluPairRowMap, SwigluPairColumnMajor, Cfg>
+                <<<grid, Cfg::THREADS, 0, stream>>>(plane.codes, plane.row_scales, fp8.codes,
+                                                    fp8.scales, gate_up_rows, k, tokens, row_map,
+                                                    epilogue);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
+    const W8A8QuantizedActivations quantized = w8a8_act_quant(x, base, stream);
     if (tokens >= kW8A8WideMinTokens && gate_up_rows >= 4096) {
         using Cfg = W8A8ImmaWideConfig;
         const dim3 grid(static_cast<unsigned>(div_up(gate_up_rows, Cfg::BM)),

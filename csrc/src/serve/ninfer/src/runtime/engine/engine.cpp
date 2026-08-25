@@ -3,6 +3,7 @@
 #include "core/device.h"
 #include "runtime/contract/sampling.h"
 #include "runtime/contract/types.h"
+#include "ops/linear/w8a8/w8fp8_plane.h"
 #include "runtime/engine/concurrent_executor.h"
 #include "targets/registry.h"
 
@@ -142,6 +143,10 @@ public:
 
     explicit Impl(EngineOptions engine_options)
         : options(std::move(engine_options)), device(options.device) {
+        // surogate vendor patch (PATCHES.md #20): the engine opts into the
+        // derived FP8 prefill plane (op tests stay int8-exact by default;
+        // SUROGATE_SERVE_FP8_PREFILL=0 vetoes).
+        ops::detail::w8fp8_plane_set_enabled(true);
         auto constructed  = targets::construct_target(options, device);
         active            = std::move(constructed.active);
         load              = std::move(constructed.load);

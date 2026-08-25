@@ -31,6 +31,11 @@ std::uint32_t prefill_chunk  = 2048;
     bool enable_vision  = false;
     bool use_cuda_graph = true;
 
+    // surogate vendor patch (PATCHES.md #20): run one discarded warmup
+    // request first so measured runs exclude one-time lazy work (FP8 plane
+    // derivation). Off by default; benches enable it.
+    bool prefill_warmup = false;
+
     bool raw_output      = false;
     bool print_token_ids = false;
     bool enable_thinking = true;

@@ -274,6 +274,23 @@ int main(int argc, char** argv) {
         print_load_summary(engine.load_summary(), load_wall);
         engine.reset_memory_peaks();
 
+        // surogate vendor patch (PATCHES.md #20): a discarded warmup request
+        // absorbs one-time lazy work (FP8 plane derivation) so the measured
+        // request reflects steady serving state.
+        if (cli.prefill_warmup) {
+            std::string warm_text;
+            for (int i = 0; i < 300; ++i) { warm_text += "warm "; }
+            ninfer::PromptInput warm_input =
+                ninfer::product::prompt_from_text(warm_text, false);
+            ninfer::RequestOptions warm_request;
+            warm_request.execution.requested_output_tokens = 1;
+            warm_request.execution.allow_prefix_reuse      = false;
+            ninfer::GenerationHandle warm_generation =
+                engine.submit(engine.prepare(std::move(warm_input)), std::move(warm_request));
+            (void)warm_generation.wait(nullptr);
+            engine.reset_memory_peaks();
+        }
+
         ninfer::PreparedPrompt prompt = engine.prepare(std::move(input));
 
         StreamingSink sink;

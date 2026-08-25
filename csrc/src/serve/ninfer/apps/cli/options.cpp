@@ -82,7 +82,7 @@ std::string usage_text(const char* argv0) {
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
-           "       [--raw-output] [--print-token-ids] [--no-thinking]\n"
+           "       [--raw-output] [--print-token-ids] [--no-thinking] [--prefill-warmup]\n"
            "       [--reasoning-effort low|medium|xhigh] [--vision]\n"
            "       [--no-cuda-graph]\n"
            "\n"
@@ -141,6 +141,8 @@ Options parse_options(int argc, char** argv) {
             options.raw_output = true;
         } else if (arg == "--print-token-ids") {
             options.print_token_ids = true;
+        } else if (arg == "--prefill-warmup") {
+            options.prefill_warmup = true;
         } else if (arg == "--no-thinking") {
             options.enable_thinking = false;
         } else if (arg == "--reasoning-effort") {
