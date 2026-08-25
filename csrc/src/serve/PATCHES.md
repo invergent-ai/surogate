@@ -793,6 +793,19 @@ old ninfer/ paths.)
    batch 32), sampler now healthy (173us/round). Remaining alongside:
    Phase 2 scheduler, fused-family W4 decision, Phase 4 board rerun.
 
+   Chunked-prefill interleave measured: the executor's worker loop
+   already strictly alternates decode rounds with prefill steps, so
+   --prefill-chunk is a zero-code interleave knob — and finer chunks
+   LOSE (multi100 @4B C=32: 1,736 at 2048 vs 1,307 at 512 vs 1,208 at
+   256): prefill-blocking was not a loss term at this churn, and extra
+   steps just add fixed cost. The Phase-2 scheduler's remaining value is
+   admission shaping and open-loop TTFT, not closed-loop throughput; the
+   throughput gap to vLLM now lives almost entirely in the exact-T
+   kernel efficiency at the wide-token band (52% of window at 4.5x the
+   weight-read floor) — which needs op-bench admission for the
+   small-target shapes and kernel-level work on wide-T activation
+   staging.
+
 ### sm_89 port status
 
 With patches 5–10 the **entire tree compiles and links for sm_89**
