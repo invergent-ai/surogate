@@ -1,6 +1,8 @@
 #include "ops/linear/w8a8/w8fp8_plane.h"
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/program.h"
+#include <cstdio>
+#include <cstdlib>
 
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 #include "ninfer/ops/gdn_replay.h"
@@ -470,9 +472,19 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         prompt.identity.rewrite_checkpoint) {
         throw std::logic_error("planned rewrite checkpoint drop does not describe the prompt");
     }
+    // surogate vendor patch (PATCHES.md #24): with opt-in deferral the
+    // frontier legitimately lies AHEAD of the reuse base (the capture is
+    // skipped, not already-held); the invariant relaxes to "the prompt
+    // still describes a checkpoint".
+    static const bool defer_capture_enabled = [] {
+        const char* env = std::getenv("SUROGATE_SERVE_DEFER_REWRITE_CHECKPOINT");
+        return env != nullptr && env[0] == '1';
+    }();
     if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::DeferCapture &&
-        (!prompt.identity.rewrite_checkpoint || request_plan.reuse == ReusePath::FullReset ||
-         prompt.identity.rewrite_checkpoint->frontier > request_plan.reuse_base)) {
+        (!prompt.identity.rewrite_checkpoint ||
+         (!defer_capture_enabled &&
+          (request_plan.reuse == ReusePath::FullReset ||
+           prompt.identity.rewrite_checkpoint->frontier > request_plan.reuse_base)))) {
         throw std::logic_error("planned rewrite checkpoint deferral is invalid");
     }
 
@@ -627,6 +639,11 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 device, model, work, staged.prompt, *staged.vision_plan, staged.transient);
         }
         staged.elapsed_seconds = std::chrono::duration<double>(Clock::now() - started).count();
+        // surogate vendor patch (PATCHES.md #23): segment timing probe.
+        if (std::getenv("SUROGATE_SERVE_PREFILL_TIMING") != nullptr) {
+            std::fprintf(stderr, "prefill-timing: staging %.3f ms\n",
+                         staged.elapsed_seconds * 1e3);
+        }
         request.lifecycle      = Lifecycle::Prefilling;
         return advance_prefill(sequence, request);
     } catch (...) {
@@ -1607,6 +1624,10 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             }
             processed_prompt_tokens = result.processed_tokens;
             if (staged.vision) { staged.vision->release_encoded_media_payloads(); }
+            if (std::getenv("SUROGATE_SERVE_PREFILL_TIMING") != nullptr) {
+                std::fprintf(stderr, "prefill-timing: chunk nominal %u processed %u final %d\n",
+                             nominal, result.processed_tokens, int(result.finalized));
+            }
             staged.cursor += result.processed_tokens;
             sequence.text_kv_valid = staged.cursor;
             if (staged.prepare_mtp) { sequence.mtp_kv_valid = staged.cursor; }
@@ -1620,6 +1641,13 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 }
                 staged.elapsed_seconds +=
                     std::chrono::duration<double>(Clock::now() - started).count();
+                // surogate vendor patch (PATCHES.md #23): segment timing probe.
+                if (std::getenv("SUROGATE_SERVE_PREFILL_TIMING") != nullptr) {
+                    std::fprintf(
+                        stderr, "prefill-timing: slice %.3f ms (cursor %u/%u)\n",
+                        std::chrono::duration<double>(Clock::now() - started).count() * 1e3,
+                        staged.cursor, staged.prompt_tokens);
+                }
                 return runtime::PrefillStepResult{
                     .summary = summary, .processed_prompt_tokens = processed_prompt_tokens};
             }
@@ -1661,8 +1689,15 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                                        staged.initial_mtp_extent * sizeof(TokenId),
                                        cudaMemcpyDeviceToHost, device.stream));
         }
+        const auto pre_sync = Clock::now();
         device.synchronize();
         staged.elapsed_seconds += std::chrono::duration<double>(Clock::now() - started).count();
+        // surogate vendor patch (PATCHES.md #23): segment timing probe.
+        if (std::getenv("SUROGATE_SERVE_PREFILL_TIMING") != nullptr) {
+            std::fprintf(stderr, "prefill-timing: compute+sync %.3f ms (sync tail %.3f ms)\n",
+                         std::chrono::duration<double>(Clock::now() - started).count() * 1e3,
+                         std::chrono::duration<double>(Clock::now() - pre_sync).count() * 1e3);
+        }
         const double vision_seconds = staged.vision ? staged.vision->elapsed_seconds() : 0.0;
         const std::optional<RewriteCheckpointSpec> rewrite_checkpoint_capture =
             staged.rewrite_checkpoint_capture;

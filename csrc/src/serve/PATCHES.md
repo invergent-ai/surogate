@@ -472,6 +472,33 @@
    TMA/dynamic-smem staging and the non-GEMM pool (act quant, scan,
    host span).
 
+24. **Deferred rewrite-checkpoint capture — the hidden 12 ms tail pass.**
+   Segment-timing probes (SUROGATE_SERVE_PREFILL_TIMING=1, kept) showed
+   every prefill ends with a second full-model pass over the last 4
+   tokens: the frontend plans a rewrite checkpoint at prompt-4 (the
+   thinking-suffix rewind boundary), the chunk loop must split there to
+   materialize exact GDN state, and the 4-token tail re-reads every
+   weight in the A16 regime (~12 ms at 4B — 15% of a 1.9k prefill, and a
+   FIXED cost, so worst at short prompts). staging measured 0.3 ms and
+   the final sync 0.007 ms — the long-standing "staging residue" was
+   this tail plus host-issue overlap.
+
+   SUROGATE_SERVE_DEFER_REWRITE_CHECKPOINT=1 (default OFF) maps
+   CaptureNew -> DeferCapture: the checkpoint is simply not captured at
+   prefill; a later rewrite request falls back to prefix recompute (the
+   deferral validator is relaxed for the opt-in: the frontier may lie
+   ahead of the reuse base). Behavioral trade: rewind-heavy thinking
+   flows pay on rewind instead of every prefill. The rewind fallback
+   path is NOT yet exercised by a test — required before defaulting ON.
+
+   Measured with the flag (idle 5090, all three targets, decode
+   unchanged, greedy exact): 4B default 16.6k/19.7k/23.2k @472/962/1912
+   (+40/+23/+14%), 4B fp4 21.2k/24.4k/28.9k (+52/+29/+17%); 2B
+   33.0k/42.7k/50.0k — now past vLLM-NVFP4 at EVERY point incl @1912
+   (+12%); 0.8B 48.7k/69.9k/85.5k (2.2x vLLM-NVFP4 @1912). 4B standing:
+   the default 8-bit profile beats every vLLM config at @472/@962; fp4
+   closes @1912 to -18% (28.9 vs 35.2k).
+
 ### sm_89 port status
 
 With patches 5–10 the **entire tree compiles and links for sm_89**

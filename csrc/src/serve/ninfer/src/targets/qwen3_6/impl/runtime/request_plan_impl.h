@@ -1,5 +1,6 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/program.h"
+#include <cstdlib>
 
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 
@@ -245,8 +246,22 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
                                               ? RewriteCheckpointAction::KeepExisting
                                               : RewriteCheckpointAction::ReclassifyExisting;
     } else if (desired->frontier > plan->reuse_base) {
-        plan->rewrite_checkpoint_action  = RewriteCheckpointAction::CaptureNew;
-        plan->rewrite_checkpoint_capture = desired;
+        // surogate vendor patch (PATCHES.md #24): capturing the rewrite
+        // checkpoint splits the final prefill chunk at frontier (prompt - 4)
+        // and pays a second full-model pass for the tail (~12 ms at 4B, 15%
+        // of a 1.9k prefill). With deferral the checkpoint is captured only
+        // when a rewrite actually replays that prefix — rewind-heavy flows
+        // pay the same cost later; everything else keeps the 12 ms.
+        static const bool defer_capture = [] {
+            const char* env = std::getenv("SUROGATE_SERVE_DEFER_REWRITE_CHECKPOINT");
+            return env != nullptr && env[0] == '1';
+        }();
+        if (defer_capture) {
+            plan->rewrite_checkpoint_action = RewriteCheckpointAction::DeferCapture;
+        } else {
+            plan->rewrite_checkpoint_action  = RewriteCheckpointAction::CaptureNew;
+            plan->rewrite_checkpoint_capture = desired;
+        }
     } else {
         // The selected continuation state is already past the desired boundary. It remains a
         // valid hit; do not replay an otherwise reusable prefix merely to materialize an older
