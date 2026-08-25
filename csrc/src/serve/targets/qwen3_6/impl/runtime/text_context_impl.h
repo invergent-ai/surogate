@@ -641,7 +641,7 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
                                         Tensor& logits) {
     const std::int32_t batch = ids.ne[0];
     if (batch <= 0 || batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
-        throw std::invalid_argument("ordinary decode batch size must be in [1,16]");
+        throw std::invalid_argument("ordinary decode batch size must be in [1,32]");
     }
     require_tensor_shape(ids, DType::I32, {batch}, "ordinary decode ids");
     require_tensor_shape(cache_positions, DType::I32, {batch}, "ordinary decode cache positions");

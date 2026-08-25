@@ -81,7 +81,7 @@ void launch_projection(const Tensor& x, const Weight& weight, Tensor& projected,
 Fp8GdnConvPlan fp8_gdn_snapshot_resolve_plan(LinearPolicy policy, std::int32_t width,
                                              std::int32_t batch_size) {
     require_policy(policy, "fp8 GDN snapshot");
-    if (width <= 0 || batch_size <= 0 || batch_size > 16 || (batch_size > 1 && width > 16)) {
+    if (width <= 0 || batch_size <= 0 || batch_size > 32 || (batch_size > 1 && width > 16)) {
         throw std::invalid_argument("fp8 GDN snapshot: invalid B/W domain");
     }
     if (batch_size == 1) {
@@ -99,7 +99,7 @@ Fp8GdnConvPlan fp8_gdn_snapshot_resolve_plan(LinearPolicy policy, std::int32_t w
 Fp8GdnConvPlan fp8_gdn_record_resolve_plan(LinearPolicy policy, std::int32_t width,
                                            std::int32_t batch_size) {
     require_policy(policy, "fp8 GDN record");
-    if (width < 2 || width > 16 || batch_size <= 0 || batch_size > 16) {
+    if (width < 2 || width > 16 || batch_size <= 0 || batch_size > 32) {
         throw std::invalid_argument("fp8 GDN record: invalid B/W domain");
     }
     if (batch_size == 1) {

@@ -106,7 +106,7 @@ void swa(const Tensor& q, const Tensor& query_k, const Tensor& query_v, const Te
     if (tokens < 1 || tokens > 16) {
         throw std::invalid_argument("swa: optimized domain is T=1..16");
     }
-    if (batch < 1 || batch > 16) { throw std::invalid_argument("swa: B must be 1..16"); }
+    if (batch < 1 || batch > 32) { throw std::invalid_argument("swa: B must be 1..32"); }
     require_shape(q, kHeadDim, kQHeads, tokens, batch, op, "q");
     require_shape(query_k, kHeadDim, kKVHeads, tokens, batch, op, "query k");
     require_shape(query_v, kHeadDim, kKVHeads, tokens, batch, op, "query v");

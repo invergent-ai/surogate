@@ -745,6 +745,19 @@ old ninfer/ paths.)
    solo 503) — 1.7x from vLLM's 5,958 (campaign start: 4.7x). Suite
    green.
 
+   Round 3 (same day): kMaximumConcurrency 16 -> 32 (all mirrors swept
+   again; GDN small-target projection tables and linear_add small bakes
+   extended to T=32; attn/swiglu already reached 48; the conv-fused
+   snapshot/record forms stay T<=16 — batch decode uses the Materialized
+   conv path). MEASURED: C=32 is NOT the sweet spot yet — 4B multi100
+   1,378 (vs 1,302 at C=16, +6%) and 0.8B REGRESSES to 2,986 (vs 3,433):
+   the lm_head at T=17..32 falls onto the runtime MMA tile (the batched
+   W4 buckets stop at 16) and per-round overheads grow. The 32 cap SHIPS
+   (operators choose --max-concurrency; 16 remains the measured
+   recommendation and the board's config). The 32-lane unlock is a vocab
+   exact-T table (248320 x hidden) or W4 MaxTokens=32 bucket, plus a
+   T=17..32 census pass.
+
 ### sm_89 port status
 
 With patches 5–10 the **entire tree compiles and links for sm_89**

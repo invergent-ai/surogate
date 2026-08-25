@@ -62,7 +62,7 @@ constexpr auto kK6144ProjectionLaunchers = make_projection_launchers<6144>(
 // surogate vendor patch (PATCHES.md #29): qwen3.5-4b o_proj (2560x4096) and
 // mlp down (2560x9216) exact-T tables, T=2..16 (the batch-decode band; the
 // runtime-shaped SIMT read weights ceil(T/4) times there).
-constexpr int kQ4bLastExactCols = 16;
+constexpr int kQ4bLastExactCols = 32; // PATCHES.md #29: C=32 batch band
 template <int Hidden, std::size_t... Offsets>
 constexpr auto make_q4b_launchers(std::index_sequence<Offsets...>) {
     return std::array<ProjectionLauncher, sizeof...(Offsets)>{
@@ -119,7 +119,7 @@ void w8_linear_add_splitk_mma_launch(const Tensor& x, const Weight& weight, Tens
     if (weight.n == 2560 || weight.n == 1024 || (weight.n == 2048 && weight.k == 2048)) {
         if (x.ne[1] > kQ4bLastExactCols) {
             throw std::invalid_argument(
-                "W8 linear_add: small-target exact tables cover T=2..16");
+                "W8 linear_add: small-target exact tables cover T=2..32");
         }
         const auto& launchers = weight.n == 2560
                                     ? (weight.k == 9216 ? kQ4bK9216Launchers : kQ4bK4096Launchers)

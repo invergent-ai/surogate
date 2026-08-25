@@ -44,7 +44,7 @@ void prepare_masked_block(const Tensor& anchors, const Tensor& lengths, const Te
     if (block_size < 1 || block_size > 16) {
         throw std::invalid_argument("prepare_masked_block: W must be 1..16");
     }
-    if (batch_size < 1 || batch_size > 16) { // mirrors kMaximumConcurrency (PATCHES.md #29)
+    if (batch_size < 1 || batch_size > 32) { // mirrors kMaximumConcurrency (PATCHES.md #29)
         throw std::invalid_argument("prepare_masked_block: B must be 1..8");
     }
     if (mask_id < 0) {

@@ -40,8 +40,8 @@ static_assert(catalog_is_closed(), "W8 GDN input routes must be exact and closed
 // T>=17 keeps the runtime-dim MMA schedule.
 constexpr std::array<RouteSpec, 3> kRoutes08{{
     {1, 1, W8GdnInputScheduleId::DecodeR8Direct},
-    {2, 16, W8GdnInputScheduleId::SplitKMmaDirect},
-    {17, kAnyCols, W8GdnInputScheduleId::MmaR64C128},
+    {2, 32, W8GdnInputScheduleId::SplitKMmaDirect},
+    {33, kAnyCols, W8GdnInputScheduleId::MmaR64C128},
 }};
 
 bool supported_shape(const W8GdnInputProblem& problem) noexcept {
@@ -115,7 +115,7 @@ W8GdnInputPlan w8_gdn_input_resolve_plan(const W8GdnInputProblem& problem) {
 
 W8GdnInputConvPlan w8_gdn_input_conv_resolve_plan(const W8GdnInputProblem& problem,
                                                   std::int32_t batch_size) {
-    if (!w8_gdn_input_admits(problem) || batch_size <= 0 || batch_size > 16) { // PATCHES.md #29
+    if (!w8_gdn_input_admits(problem) || batch_size <= 0 || batch_size > 32) { // PATCHES.md #29
         throw std::invalid_argument(
             "W8 GDN input conv: exact problem or column count is not admitted");
     }

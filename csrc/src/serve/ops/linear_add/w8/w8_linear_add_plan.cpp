@@ -75,8 +75,8 @@ constexpr std::array<RouteSpec, 5> kQ08Routes{{
     // surogate vendor patch (PATCHES.md #28/#29): T=1 SIMT; the 2..16
     // batch-decode band rides the exact-T bakes now.
     {1, 1, W8LinearAddScheduleId::SimtR8C4},
-    {2, 16, W8LinearAddScheduleId::SplitKMmaExactT},
-    {17, 128, W8LinearAddScheduleId::MmaR32C128},
+    {2, 32, W8LinearAddScheduleId::SplitKMmaExactT},
+    {33, 128, W8LinearAddScheduleId::MmaR32C128},
     {129, 1024, W8LinearAddScheduleId::MmaR32C128},
     {1025, kAnyCols, W8LinearAddScheduleId::MmaR48C128},
 }};
@@ -87,8 +87,8 @@ constexpr std::array<RouteSpec, 6> kQ2BRoutes{{
     // surogate vendor patch (PATCHES.md #28/#29): batch-decode band on the
     // exact-T bakes.
     {1, 1, W8LinearAddScheduleId::SimtR8C4},
-    {2, 16, W8LinearAddScheduleId::SplitKMmaExactT},
-    {17, 512, W8LinearAddScheduleId::MmaR32C96},
+    {2, 32, W8LinearAddScheduleId::SplitKMmaExactT},
+    {33, 512, W8LinearAddScheduleId::MmaR32C96},
     {513, 900, W8LinearAddScheduleId::MmaR48C128},
     {901, 1024, W8LinearAddScheduleId::MmaR32C128},
     {1025, kAnyCols, W8LinearAddScheduleId::MmaR48C128},
@@ -97,8 +97,8 @@ constexpr std::array<RouteSpec, 6> kQ2BRoutes{{
 // surogate vendor patch (PATCHES.md #29): qwen3.5-4b output/down routes.
 constexpr std::array<RouteSpec, 5> kQ4B29Routes{{
     {1, 1, W8LinearAddScheduleId::SimtR8C4},
-    {2, 16, W8LinearAddScheduleId::SplitKMmaExactT},
-    {17, 512, W8LinearAddScheduleId::MmaR32C96},
+    {2, 32, W8LinearAddScheduleId::SplitKMmaExactT},
+    {33, 512, W8LinearAddScheduleId::MmaR32C96},
     {513, 1024, W8LinearAddScheduleId::MmaR48C128},
     {1025, kAnyCols, W8LinearAddScheduleId::MmaR48C128},
 }};

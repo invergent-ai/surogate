@@ -441,14 +441,20 @@ using Q4bTables = GdnVariantTables<12288, 2560, 8192, 2048, 2048, 4096, 4096>;
 using Q2bTables = GdnVariantTables<8192, 2048, 6144, 2048, 2048, 2048, 2048>;
 using Q08Tables = GdnVariantTables<8192, 1024, 6144, 2048, 2048, 2048, 2048>;
 using SmallSeq  = std::make_index_sequence<kLastSnapshotExactCols - kFirstExactCols + 1>;
+// surogate vendor patch (PATCHES.md #29): projection tables reach T=32 for
+// C=32 batch decode (the Materialized conv path pairs them with the batched
+// conv snapshot); the conv-FUSED snapshot/record forms stay T<=16.
+constexpr int kLastSmallProjectionCols = 32;
+using SmallProjSeq =
+    std::make_index_sequence<kLastSmallProjectionCols - kFirstExactCols + 1>;
 
-constexpr auto kQ4bProjectionLaunchers = Q4bTables::projection(SmallSeq{});
+constexpr auto kQ4bProjectionLaunchers = Q4bTables::projection(SmallProjSeq{});
 constexpr auto kQ4bSnapshotLaunchers   = Q4bTables::snapshot(SmallSeq{});
 constexpr auto kQ4bRecordLaunchers     = Q4bTables::record(SmallSeq{});
-constexpr auto kQ2bProjectionLaunchers = Q2bTables::projection(SmallSeq{});
+constexpr auto kQ2bProjectionLaunchers = Q2bTables::projection(SmallProjSeq{});
 constexpr auto kQ2bSnapshotLaunchers   = Q2bTables::snapshot(SmallSeq{});
 constexpr auto kQ2bRecordLaunchers     = Q2bTables::record(SmallSeq{});
-constexpr auto kQ08ProjectionLaunchers = Q08Tables::projection(SmallSeq{});
+constexpr auto kQ08ProjectionLaunchers = Q08Tables::projection(SmallProjSeq{});
 constexpr auto kQ08SnapshotLaunchers   = Q08Tables::snapshot(SmallSeq{});
 constexpr auto kQ08RecordLaunchers     = Q08Tables::record(SmallSeq{});
 
@@ -469,9 +475,9 @@ void w8_gdn_input_splitk_mma_launch(const Tensor& x, const Weight& weight, Tenso
     }
     const GdnVariant variant = gdn_variant_for(weight);
     if (variant != GdnVariant::k35B) {
-        if (cols > kLastSnapshotExactCols) {
+        if (cols > kLastSmallProjectionCols) {
             throw std::invalid_argument(
-                "W8 GDN split-K MMA: small-target exact tables cover T=2..16");
+                "W8 GDN split-K MMA: small-target exact tables cover T=2..32");
         }
         const auto& launchers = variant == GdnVariant::kQ4b   ? kQ4bProjectionLaunchers
                                 : variant == GdnVariant::kQ2b ? kQ2bProjectionLaunchers

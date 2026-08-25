@@ -110,7 +110,7 @@ Geometry validate_recurrent_snapshot(const Tensor& q, const Tensor& k, const Ten
                                      const Tensor& ssm_states, const Tensor& valid_columns,
                                      const Tensor& initial_state_slots,
                                      const Tensor& snapshot_base_slots, const Tensor& out) {
-    constexpr std::int32_t kMaximumBatch = 16; // mirrors kMaximumConcurrency (PATCHES.md #29)
+    constexpr std::int32_t kMaximumBatch = 32; // mirrors kMaximumConcurrency (PATCHES.md #29)
     constexpr std::int32_t kMaximumWidth = 16;
     const bool masked                    = valid_columns.data != nullptr;
     require_dtype(q, DType::BF16, "q must be BF16");
