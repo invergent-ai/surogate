@@ -76,7 +76,9 @@ void launch(const Tensor& x, const Weight& weight, Epilogue epilogue, WorkspaceA
 
     // Wide tiles need grid volume: at 2048 output rows BM128 leaves the GPU
     // underfilled (measured: the residual projections ran at half rate).
-    if (tokens >= kW8A8WideMinTokens && weight.n >= 4096) {
+    // surogate vendor patch (PATCHES.md #18): 2560 rows fill fine (20 row
+    // tiles; probe: o_proj 241->214us, down 519->441us vs the base config).
+    if (tokens >= kW8A8WideMinTokens && weight.n >= 2560) {
         using Cfg = W8A8ImmaWideConfig;
         const dim3 grid(static_cast<unsigned>(div_up(weight.n, Cfg::BM)),
                         static_cast<unsigned>(div_up(tokens, Cfg::BN)), 1u);
