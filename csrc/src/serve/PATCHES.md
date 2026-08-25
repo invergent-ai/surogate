@@ -806,6 +806,19 @@ old ninfer/ paths.)
    small-target shapes and kernel-level work on wide-T activation
    staging.
 
+   GOAL ARC (owner: close the gap with vLLM). 27B rerun on the current
+   build at C=32: multi100 363 tok/s (was 235 at C=8) vs vLLM 688 —
+   and the census replays the known disease in the NVFP4 artifact's op
+   families: fp8_mma_kernel (the A8 route's MMA) is 35% of the window at
+   195us x ~30/round (~6x off the FP8 weight-read floor at T~28; every
+   27B problem routes A8 at batch: attn>=12, gdn>=11, gateup>=5,
+   residual>=25), nvfp4_w4a4_mma is 31% at 132.7us, the FP8 vocabulary
+   head runs ~1TB/s (1.27ms/round — semi-optimal, ~40% headroom). THE
+   27B ATTACK: tuned/exact-T tiles for fp8_a8_mma at T=17..32 (the
+   fp8_a8_schedule.cuh + fp8_a8_plan.h band structure), then w4a4 tile
+   shapes at the same band, then the vocabulary head's last 40%. Same
+   playbook as PATCHES #28: census -> band routes -> measured kernels.
+
 ### sm_89 port status
 
 With patches 5–10 the **entire tree compiles and links for sm_89**
