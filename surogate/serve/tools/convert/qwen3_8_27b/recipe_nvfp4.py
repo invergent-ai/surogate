@@ -513,7 +513,7 @@ EXPECTED_QUANTIZED_FIELDS = frozenset(
 def preflight_quantized_metadata(
     reader: ShardReader,
 ) -> family_recipe.SourcePreflight:
-    missing = set(SOURCE_REQUIREMENTS).difference(reader.names)
+    missing = {name for name in SOURCE_REQUIREMENTS if not reader.has(name)}
     if missing:
         raise ValueError(f"quantized source is missing {sorted(missing)[0]}")
 
@@ -532,15 +532,24 @@ def preflight_quantized_metadata(
                 f"NVFP4 source has forbidden field {source.field('weight')}"
             )
 
-    metadata = reader.metadata(reader.names)
+    # The reader folds VL-style nesting (model.language_model.* -> model.*)
+    # while this recipe addresses sources in the nested dialect; compare the
+    # closure in the folded dialect so both spellings agree.
+    def _folded(name: str) -> str:
+        prefix = "model.language_model."
+        return "model." + name[len(prefix):] if name.startswith(prefix) else name
+
+    metadata = reader.metadata(list(SOURCE_REQUIREMENTS))
+    stored_metadata = reader.metadata(reader.names)
+    expected_folded = frozenset(_folded(name) for name in EXPECTED_QUANTIZED_FIELDS)
     actual_quantized_fields = frozenset(
         name
-        for name, item in metadata.items()
+        for name, item in stored_metadata.items()
         if item.dtype in ("F8_E4M3", "F32", "U8")
     )
-    if actual_quantized_fields != EXPECTED_QUANTIZED_FIELDS:
-        unexpected = actual_quantized_fields.difference(EXPECTED_QUANTIZED_FIELDS)
-        missing_fields = EXPECTED_QUANTIZED_FIELDS.difference(
+    if actual_quantized_fields != expected_folded:
+        unexpected = actual_quantized_fields.difference(expected_folded)
+        missing_fields = expected_folded.difference(
             actual_quantized_fields
         )
         detail = (

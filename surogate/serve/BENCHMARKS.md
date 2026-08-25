@@ -32,9 +32,9 @@ add `--gpu-memory-utilization 0.92`).
 same weight class: llama.cpp serves GGUF **Q4_K_M** (~4.5 bpw); vLLM
 serves **NVFP4** (4-bit, modelopt); surogate serves the artifact
 repacked **from the same Q4_K_M GGUF** (W8 resident codes carrying the
-GGUF's 4-bit information, fp4 compute profile), or native NVFP4 (4-bit
-resident) where the target supports it (27B family — conversion pending
-below).
+GGUF's 4-bit information, fp4 compute profile) at 0.8B/4B, and the
+native **NVFP4 (4-bit resident)** artifact at 27B (built from the
+unsloth NVFP4 export + base checkpoint by the vendored converter).
 
 ## Qwen3.5-0.8B
 
@@ -56,16 +56,20 @@ below).
 
 | engine | weights | TTFT @1.9k | decode tok/s (1 user) | 100-user agg tok/s | 100-user TTFT p50 | 100-user reqs ok/err |
 |---|---|---:|---:|---:|---:|---:|
-| surogate serve | NVFP4 (4-bit resident) | *pending* | *pending* | *pending* | *pending* | — |
-| llama-server (CUDA) | GGUF Q4_K_M | 1,829 ms | 49 | 82 | 102.4 s | 135/28 |
-| vLLM | NVFP4 (4-bit) | *load bug* † | — | — | — | — |
+| **surogate serve** | NVFP4 (4-bit resident) | **352 ms** | 45 | **235** | 30.1 s | 222/0 |
+| llama-server (CUDA) | GGUF Q4_K_M | 1,829 ms | **49** | 82 | 102.4 s | 135/28 |
+| vLLM | — | *no working config* † | — | — | — | — |
 
-† vLLM 0.27.1 cannot load this NVFP4 checkpoint
-(`'MergedColumnParallelLinear' object has no attribute 'data'`); an
-FP8-dynamic fallback on the base checkpoint (8-bit — width-noted) is
-being measured instead. llama.cpp b8500 could not load this GGUF either
-(missing `blk.64.ssm_conv1d.weight`); the 0.3.0 source build serves it.
-The 27B dense at 32 slots thrashes badly (3.4 tok/s per stream).
+† vLLM 0.27.1 has no servable 27B on this card: it cannot load the
+NVFP4 checkpoint (`'MergedColumnParallelLinear' object has no attribute
+'data'`), the official FP8 checkpoint OOMs before KV allocation even
+with `--enforce-eager --max-model-len 2560` (30.3 GB allocated on a
+31.4 GB device), and bf16 is 54 GB. The engine's 20 GB NVFP4-resident
+artifact serves this class with capacity to spare. llama.cpp b8500 could
+not load the GGUF either (missing `blk.64.ssm_conv1d.weight`); the 0.3.0
+source build serves it, and its single-stream decode edges the engine's
+W4 decode at this size (49 vs 45 tok/s) while everything else — TTFT
+5.2x, 100-user aggregate 2.9x, zero errors — favors the engine.
 
 ## Qwen3.6-35B-A3B (MoE)
 
@@ -121,7 +125,16 @@ missing piece.
   (`model.language_model.*` → `model.*`) but refused the unfolded names
   the 27B NVFP4 recipe requests. Resolution now accepts both.
 
-## Pending
+## Open items this board surfaced
 
-27B: the surogate NVFP4 artifact conversion (converter naming fixes in
-review) + engine legs; the vLLM FP8 fallback measurement.
+- **Multi-user campaign** (the one place vLLM wins): raise the 8-lane
+  ceiling, make batched decode scale, admit continuously. Target: close
+  the 4.7–9.6× 100-user gap at 0.8B/4B.
+- **NVFP4 MoE conversion** for the 35B-A3B class (vLLM's 1,565 tok/s
+  aggregate there is the bar; the engine has no 4-bit MoE artifact).
+- **Single-source NVFP4 ingest**: the converter currently needs the
+  bf16 base + the quantized export; the export alone carries every
+  tensor. Dropping the base requirement removes a 52 GB download from
+  the workflow.
+- 27B W4 decode kernel: llama.cpp's Q4_K GEMV edges it 49 vs 45 tok/s
+  single-stream; worth a look during the multi-user campaign.

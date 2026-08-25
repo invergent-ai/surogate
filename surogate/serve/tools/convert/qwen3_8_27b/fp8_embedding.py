@@ -160,16 +160,18 @@ def iter_reader_payload(
     if isinstance(rows_per_chunk, bool) or chunk_rows <= 0:
         raise ValueError("rows_per_chunk must be a positive integer")
     geometry = row_scale_geometry("FP8_E4M3FN_ROW_BF16S", shape)
-    if source_name not in reader.weight_map:
+    resolved = reader._resolve(source_name)
+    if resolved not in reader.weight_map:
         raise ValueError(f"embedding source is missing {source_name}")
 
-    shard = reader.weight_map[source_name]
+    shard = reader.weight_map[resolved]
+    stored_name = reader._stored_name(resolved)
     reader.close()
     scale_words = np.empty(geometry.n, dtype=np.uint16)
     with safe_open(
         str(reader.model_dir / shard), framework="pt", device="cpu"
     ) as handle:
-        source = handle.get_slice(source_name)
+        source = handle.get_slice(stored_name)
         actual_shape = tuple(source.get_shape())
         actual_dtype = str(source.get_dtype())
         if actual_shape != (geometry.n, geometry.k) or actual_dtype != "BF16":

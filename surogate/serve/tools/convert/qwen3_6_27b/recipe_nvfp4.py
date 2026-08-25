@@ -346,7 +346,7 @@ SOURCE_REQUIREMENTS = _expected_source_names()
 
 def preflight_metadata(reader: ShardReader) -> dict[str, int]:
     expected_names = set(SOURCE_REQUIREMENTS)
-    missing = expected_names.difference(reader.names)
+    missing = {name for name in expected_names if not reader.has(name)}
     if missing:
         raise ValueError(f"NVFP4 source is missing {sorted(missing)[0]}")
 
