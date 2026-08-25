@@ -115,7 +115,7 @@ __global__ __launch_bounds__(RowsPerCta * 32, 2) void w4fp4_decode_batch_kernel(
     const std::uint8_t* __restrict__ sf, const float* __restrict__ row_scales, Output output,
     std::int32_t tokens) {
     static_assert(Rows > 0 && RowsPerCta > 0 && (Rows % RowsPerCta) == 0);
-    static_assert(MaxTokens >= 2 && MaxTokens <= 16);
+    static_assert(MaxTokens >= 2 && MaxTokens <= 16); // 32-bucket rejected by measurement (PATCHES.md #29): register spill loses to the tile
     constexpr int kK                 = K;
     constexpr int kValuesPerLane     = 8;
     constexpr int kValuesPerPhase    = 32 * kValuesPerLane;
