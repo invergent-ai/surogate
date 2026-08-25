@@ -66,28 +66,31 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         }
         break;
     case 2560:
-        // surogate vendor patch (PATCHES.md #18): qwen3.5-4b heads.
+        // surogate vendor patch (PATCHES.md #18/#29): qwen3.5-4b heads. The
+        // SIMT launcher's fp4 gate serves T<=16 with the batched W4 decode
+        // kernel (310MB vs the 620MB W8 read; the T=14..16 gap previously
+        // fell onto the runtime MMA tile at ~1.76ms per round).
         if (n == 248320 || n == 131072) {
-            if (t <= 13) { return launch_w8_simt_r8_c4; }
+            if (t <= 16) { return launch_w8_simt_r8_c4; }
             if (t <= 128) { return launch_w8_mma_r32_c128; }
             return launch_w8_mma_r64_c128;
         }
         break;
     case 1024:
-        // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b heads
+        // surogate vendor patch (PATCHES.md #13/#29): qwen3.5-0.8b heads
         // (lm head 248320, draft head 131072; hidden 1024).
         if (n == 248320 || n == 131072) {
-            if (t <= 13) { return launch_w8_simt_r8_c4; }
+            if (t <= 16) { return launch_w8_simt_r8_c4; }
             if (t <= 128) { return launch_w8_mma_r32_c128; }
             return launch_w8_mma_r64_c128;
         }
         break;
     case 2048:
         switch (n) {
-        // surogate vendor patch (PATCHES.md #16): qwen3.5-2b heads.
+        // surogate vendor patch (PATCHES.md #16/#29): qwen3.5-2b heads.
         case 248320:
         case 131072:
-            if (t <= 13) { return launch_w8_simt_r8_c4; }
+            if (t <= 16) { return launch_w8_simt_r8_c4; }
             if (t <= 128) { return launch_w8_mma_r32_c128; }
             return launch_w8_mma_r64_c128;
         case 1024:

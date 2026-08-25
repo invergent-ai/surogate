@@ -18,7 +18,7 @@ constexpr int kFirstExactCols = 2;
 constexpr int kLastExactCols  = 48;
 using ProjectionLauncher      = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
-template <int Hidden, int ActiveCols>
+template <int Hidden, int ActiveCols, int Rows = kRows>
 void launch_active_cols(const Tensor& x, const Weight& weight, Tensor& residual_out,
                         cudaStream_t stream) {
     constexpr int TileCols = ActiveCols <= 8    ? 8
@@ -35,14 +35,14 @@ void launch_active_cols(const Tensor& x, const Weight& weight, Tensor& residual_
     constexpr auto ActivationCache =
         Hidden == 4096 && (ActiveCols == 4 || (ActiveCols >= 27 && ActiveCols <= 40)) ? Cache::cg
                                                                                       : Cache::ca;
-    using Geometry = W8LinearGeometry<kRows, Hidden>;
+    using Geometry = W8LinearGeometry<Rows, Hidden>;
     using Schedule = W8SmallTMmaSchedule<KWarps, TileCols, MinBlocks, ScaleAccess, ActivationCache>;
-    static_assert((kRows % kRowsPerCta) == 0);
+    static_assert((Rows % kRowsPerCta) == 0);
     auto* residual = static_cast<__nv_bfloat16*>(residual_out.data);
-    const W8ContiguousOutput output{residual, kRows};
+    const W8ContiguousOutput output{residual, Rows};
     w8_small_t_mma_kernel<Geometry, ActiveCols, Schedule, W8ContiguousOutput,
                           W8SmallTMmaResidualEpilogue>
-        <<<kRows / kRowsPerCta, Schedule::kThreads, 0, stream>>>(
+        <<<Rows / kRowsPerCta, Schedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), output, W8SmallTMmaResidualEpilogue{});
@@ -58,6 +58,20 @@ constexpr auto kK4096ProjectionLaunchers = make_projection_launchers<4096>(
     std::make_index_sequence<kLastExactCols - kFirstExactCols + 1>{});
 constexpr auto kK6144ProjectionLaunchers = make_projection_launchers<6144>(
     std::make_index_sequence<kLastExactCols - kFirstExactCols + 1>{});
+
+// surogate vendor patch (PATCHES.md #29): qwen3.5-4b o_proj (2560x4096) and
+// mlp down (2560x9216) exact-T tables, T=2..16 (the batch-decode band; the
+// runtime-shaped SIMT read weights ceil(T/4) times there).
+constexpr int kQ4bLastExactCols = 16;
+template <int Hidden, std::size_t... Offsets>
+constexpr auto make_q4b_launchers(std::index_sequence<Offsets...>) {
+    return std::array<ProjectionLauncher, sizeof...(Offsets)>{
+        &launch_active_cols<Hidden, kFirstExactCols + static_cast<int>(Offsets), 2560>...};
+}
+constexpr auto kQ4bK4096Launchers = make_q4b_launchers<4096>(
+    std::make_index_sequence<kQ4bLastExactCols - kFirstExactCols + 1>{});
+constexpr auto kQ4bK9216Launchers = make_q4b_launchers<9216>(
+    std::make_index_sequence<kQ4bLastExactCols - kFirstExactCols + 1>{});
 
 template <int Hidden, int TileCols, int KSplits, int NGroups, int MinBlocks>
 void launch_medium(const Tensor& x, Tensor& residual_out, const Weight& weight,
@@ -88,7 +102,14 @@ void w8_linear_add_splitk_mma_launch(const Tensor& x, const Weight& weight, Tens
     if (x.ne[1] < kFirstExactCols || x.ne[1] > kLastExactCols) {
         throw std::invalid_argument("W8 linear_add split-K MMA requires exact T=2..48");
     }
-    if (weight.k == 6144) {
+    if (weight.n == 2560) {
+        if (x.ne[1] > kQ4bLastExactCols) {
+            throw std::invalid_argument("W8 linear_add: 4b exact tables cover T=2..16");
+        }
+        (weight.k == 9216 ? kQ4bK9216Launchers
+                          : kQ4bK4096Launchers)[x.ne[1] - kFirstExactCols](x, weight, residual_out,
+                                                                          stream);
+    } else if (weight.k == 6144) {
         kK6144ProjectionLaunchers[x.ne[1] - kFirstExactCols](x, weight, residual_out, stream);
     } else {
         kK4096ProjectionLaunchers[x.ne[1] - kFirstExactCols](x, weight, residual_out, stream);

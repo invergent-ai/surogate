@@ -92,6 +92,15 @@ constexpr std::array<RouteSpec, 5> kQ2BRoutes{{
     {1025, kAnyCols, W8LinearAddScheduleId::MmaR48C128},
 }};
 
+// surogate vendor patch (PATCHES.md #29): qwen3.5-4b output/down routes.
+constexpr std::array<RouteSpec, 5> kQ4B29Routes{{
+    {1, 1, W8LinearAddScheduleId::SimtR8C4},
+    {2, 16, W8LinearAddScheduleId::SplitKMmaExactT},
+    {17, 512, W8LinearAddScheduleId::MmaR32C96},
+    {513, 1024, W8LinearAddScheduleId::MmaR48C128},
+    {1025, kAnyCols, W8LinearAddScheduleId::MmaR48C128},
+}};
+
 template <std::size_t N>
 constexpr bool routes_are_closed(const std::array<RouteSpec, N>& routes) {
     std::int64_t expected = 1;
@@ -104,7 +113,7 @@ constexpr bool routes_are_closed(const std::array<RouteSpec, N>& routes) {
 
 static_assert(routes_are_closed(kK4096Routes) && routes_are_closed(kK6144Routes) &&
                   routes_are_closed(kQ08Routes) &&
-                  routes_are_closed(kQ2BRoutes),
+                  routes_are_closed(kQ2BRoutes) && routes_are_closed(kQ4B29Routes),
               "W8 LinearAdd routes must be exact, contiguous, and closed");
 
 std::int32_t schedule_rows(W8LinearAddScheduleId schedule) {
@@ -251,9 +260,9 @@ W8LinearAddPlan w8_linear_add_resolve_plan(const W8LinearAddProblem& problem) {
     // bench/ops/q08_route_sweep_bench: 472 -> r32c96 63.5us, 888 -> r48c128
     // 102.8us (+26% over r32c128), 1024 -> r32c128, 1912 -> r48c128).
     if (problem.k == 2048) { return resolve_from(kQ2BRoutes); }
-    // qwen3.5-4b (2560 rows): the exact-T bakes don't cover it either;
-    // measured-class runtime schedules (A8 takes T >= 224 anyway).
-    if (problem.rows == 2560) { return resolve_from(kQ2BRoutes); }
+    // surogate vendor patch (PATCHES.md #29): qwen3.5-4b (2560 rows) has its
+    // exact-T bakes now (T=2..16, k=4096/9216).
+    if (problem.rows == 2560) { return resolve_from(kQ4B29Routes); }
     return problem.k == 6144 ? resolve_from(kK6144Routes) : resolve_from(kK4096Routes);
 }
 
