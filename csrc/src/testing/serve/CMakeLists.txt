@@ -112,6 +112,12 @@ set_tests_properties(ninfer_qwen3_6_27b_prefix_real_test PROPERTIES SKIP_RETURN_
 # surogate: 4B prefix/rewrite-checkpoint exercise, run in both checkpoint
 # modes — the "defer" registration is the gate for defaulting
 # SUROGATE_SERVE_DEFER_REWRITE_CHECKPOINT on (PATCHES.md #24).
+# surogate: byte-exact host verification of the derived FP8/NVFP4 planes
+# (PATCHES.md #20/#21/#25) incl the cutlass atom SF layout.
+ninfer_add_test(ninfer_w8_quant_planes_test
+  SOURCES ops/test_w8_quant_planes.cpp
+  LIBRARIES ninfer_ops)
+set_tests_properties(ninfer_w8_quant_planes_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_5_4b_prefix_real_test
   SOURCES targets/qwen3_5_4b/test_engine_prefix_real.cpp
   LIBRARIES ninfer_engine)
