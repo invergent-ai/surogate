@@ -468,7 +468,20 @@ old ninfer/ paths.)
    staging/final-sync structure — engine-level, unattributed by the
    layer-scoped NVTX ranges; a tiny-T floor probe is confounded by the
    A16 regime below T=224). Road to NVFP4's 35.2k (54ms): TMA-class
-   GEMM staging (42 -> ~28ms), the scan pool, and that staging residue. The same tile-amortization
+   GEMM staging (42 -> ~28ms), the scan pool, and that staging residue.
+
+   CLOSURE (2026-08-27, after #24 defer + #25 cutlass): the host-bound
+   residue is GONE as a side effect — nsys @1912 fp4: 49.4ms window,
+   45.6ms kernel-busy, 3.7ms idle; host CUDA-API work is ~4.3ms (657
+   launches at 4.4us + memsets/copies) fully hidden behind execution, and
+   the one 43.7ms cudaStreamSynchronize is the host WAITING on the GPU.
+   The killed 4-token tail slice and the cutlass path's fewer/bigger
+   kernels were the fix. Prefill is GPU-bound again at ~92% window
+   occupancy; the remaining levers are the 3.7ms of launch bubbles
+   (prefill CUDA graphs would close them) and the GDN scan pool.
+   Adapter-cost fear from the race bench also resolved: per-call cutlass
+   host cost in-engine is tens of us (704 cuTensorMapEncodeTiled calls
+   total 0.11ms) — the 3ms/call artifact was bench-loop-specific. The same tile-amortization
    does NOT transfer to the FP8/IMMA kernels (probed: -0..3%) — their
    64-element tiles are already 64 bytes/row, so the barrier cost per
    staged byte was pre-amortized 2x; the default profile's kernel stands
