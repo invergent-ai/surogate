@@ -769,6 +769,17 @@ old ninfer/ paths.)
    Per-model sweet spots are the recommendation: 4B -> 32, 0.8B -> 16.
    Suite green.
 
+   Round 4 — the C=32 census found the real ceiling: kSamplerMaxColumns
+   was 16, so batch 17..32 rounds fell off the multi-block sampler onto
+   sample_row_kernel at 4.1ms per round (17% of the window; the shared
+   layout authority meant the workspace plan consistently allocated
+   nothing, so it degraded silently instead of crashing). Raised to 32:
+   4B multi100 1,429 -> 1,736 (TTFT 4.8s), 0.8B 3,433 -> 4,733 (TTFT
+   1.8s, C=32 now beats C=16 for BOTH models — the earlier "0.8B prefers
+   16" verdict was an artifact of the broken sampler; the W4-32
+   rejection stands, both sides of that A/B carried the same tax). vLLM
+   gaps: 4B 1.95x, 0.8B 1.26x. Suite green.
+
 ### sm_89 port status
 
 With patches 5–10 the **entire tree compiles and links for sm_89**
