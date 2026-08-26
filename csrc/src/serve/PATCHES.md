@@ -2214,3 +2214,50 @@ intact and is what a converter-written Marlin residency would use if the in-situ
 regression is ever explained. That explanation is a profiling question: Marlin
 is 2.4-2.75x on these shapes in isolation and a loss in the round, and nothing
 in this patch series accounts for the difference.
+
+## 63. Why Marlin wins the bench and loses the round (2026-08-26)
+
+Profiled both configurations on the 27B under identical 100-user load, six
+seconds of steady state each.
+
+                        adoption off        adoption on
+  device busy              5,697 ms            5,818 ms
+  device idle                303 ms              182 ms
+  fp8_mma_kernel           2,469 ms            1,152 ms
+  marlin::Marlin                 0 ms           1,493 ms
+  silu_and_mul                83 ms /1,355        94 ms /1,934
+  residual_add                 0 ms /    0        28 ms /5,663
+
+Two things, and neither is the kernel being slow.
+
+**The epilogues stopped being free.** The FP8 kernels are fused: the swiglu
+path computes gate_up and applies silu-mul in one launch, and linear_add folds
+the residual into its epilogue. Marlin computes a GEMM and nothing else, so
+each adopted call grows a second pass over its output — residual_add appears
+from nothing at 5,663 launches and 28 ms, and silu_and_mul gains 579 launches.
+The two ops adopted, linear_add and linear_swiglu, are precisely the two most
+fused paths in the model. Of every candidate, those were the worst choices.
+
+**The baseline in the probe was stale.** #59 compared Marlin against
+412-503 GB/s exact-T numbers taken from the bd27v census, which predates the A8
+batch tile and the other decode work landed since. The FP8 GEMM the 27B
+actually runs today averages 213.9 us; Marlin averages 200.3 us. Marlin is
+about 6% faster per call, not 2.4-2.75x — the probe was measuring against a
+kernel the engine had already stopped using.
+
+Net: GEMM time +176 ms (+7.1%) across +1,664 launches, plus ~40 ms of new
+epilogue passes, for -6% throughput. Idle falls (303 ms to 182 ms) because the
+device is doing more work, not less.
+
+What this says about where Marlin could still pay: only where the incumbent has
+no fused epilogue to lose. That is the plain projections — attn_input_proj and
+gdn_input_proj — which is the opposite of what was adopted, and which is also
+where the removed fused-split path was headed before it was deleted for
+unrelated correctness reasons. Any retry should (a) re-derive the baseline from
+a current census rather than a remembered one, and (b) target unfused ops, or
+give Marlin an epilogue.
+
+The general lesson is about measurement altitude, and it is the second time
+this session: a kernel benchmark answers "is this kernel faster", which is not
+the same question as "does the round get shorter". A fused incumbent can be
+slower per GEMM and still win.
