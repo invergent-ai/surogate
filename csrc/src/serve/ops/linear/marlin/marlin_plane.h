@@ -31,21 +31,31 @@ std::size_t marlin_plane_bytes() noexcept;
 MarlinPlane marlin_plane_for(const Weight& weight, cudaStream_t stream);
 
 struct MarlinScratch {
-    void* gemm_out = nullptr;  // bf16, >= max_n * kMarlinMaxBandTokens
+    void* gemm_out = nullptr;  // bf16 [kMarlinFixedM, n] row-major
+    void* a_pad    = nullptr;  // bf16 [kMarlinFixedM, k], pad rows zeroed
     void* c_tmp    = nullptr;  // fp32 reduce buffer
     int* locks     = nullptr;  // zero-initialized lock array
     int sm_count   = 0;
 };
 
+// Every band call runs the GEMM at this fixed M, copying the round's real
+// rows into a zero-padded A. Marlin picks its kernel from
+// thread_m_blocks = min(ceil(M/16), 4), so a width-dependent M puts
+// different kernels into decode graphs that share a topology class and
+// cudaGraphExecUpdate rejects them (PATCHES.md #35). Pinning M removes that
+// coupling, and it is nearly free: Marlin's cost is flat from M=24 to M=32
+// (gate_up 42.1 vs 42.4 us measured). The pad rows compute garbage that no
+// reader ever sees, since C's first t rows are exactly the [n, t] result.
+inline constexpr int kMarlinFixedM = 32;
+
 // Band floor. Marlin wins by ~3x at the 4B's wide shapes even at T=16,
 // while the exact-T split-K kernels stay competitive at the small ones;
 // SUROGATE_SERVE_MARLIN_MIN_T overrides for sweeps.
 int marlin_min_band_tokens() noexcept;
-// Band ceiling. Marlin picks its kernel from thread_m_blocks =
-// min(ceil(M/16), 4), so a band spanning a 16-token boundary would put
-// different kernels in decode graphs that share a topology class and the
-// exec update rejects them. 17..32 is exactly one class (mb = 2).
-inline constexpr int kMarlinMaxBandTokens = 32;
+// Band ceiling: the fixed M every call pads to. Rounds wider than this fall
+// back to the engine's own kernels; widening means raising kMarlinFixedM
+// (one more zero-padded row block for every call), not splitting the band.
+inline constexpr int kMarlinMaxBandTokens = kMarlinFixedM;
 
 // Valid once any plane derived; null members otherwise.
 MarlinScratch marlin_scratch() noexcept;

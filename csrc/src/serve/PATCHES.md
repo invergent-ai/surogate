@@ -1146,3 +1146,24 @@ two diverge. Raising the ceiling is now: change two constants, and the
 compiler names any op that has not kept up.
 
 No behavior change at 32.
+
+## 37. Marlin runs at a fixed M (2026-08-26)
+
+Band calls now pad the round's rows into a zero-filled A of kMarlinFixedM
+rows and run the GEMM at that width. Marlin picks its kernel from
+thread_m_blocks = min(ceil(M/16), 4), so with a width-dependent M the
+decode graphs for different batch sizes hold different kernels and
+cudaGraphExecUpdate rejects them (#35). Pinning M removes the coupling:
+one kernel for the whole band, whatever the round's width.
+
+It is nearly free. Marlin's cost is flat across the band (gate_up 42.1 us
+at M=24 vs 42.4 at M=32), the A copy is t*k*2 bytes (164 KB at the 4B's
+widest), and C comes out [kMarlinFixedM, n] row-major whose first t rows
+are bit-for-bit the caller's [n, t] result — so the fused families read
+them in place and only the plain-linear path copies out.
+
+Widening the band is now raising kMarlinFixedM rather than splitting the
+range, which is what the 64-lane ceiling needs. Unmeasured: the card was
+returned to its owner before this could run. It compiles, and the
+correctness bench covers the kernel underneath it; treat the band as
+unverified until a 100-user run confirms both models.

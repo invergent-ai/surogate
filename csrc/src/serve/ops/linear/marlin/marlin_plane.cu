@@ -5,6 +5,8 @@
 #include "ops/linear/marlin/marlin_gemm.h"
 #include "ops/linear/marlin/marlin_repack.h"
 
+#include "core/device.h"
+
 #include <cstdlib>
 #include <map>
 #include <mutex>
@@ -26,49 +28,71 @@ std::map<const void*, PlaneEntry> g_planes;
 
 MarlinScratch g_scratch;
 std::size_t g_scratch_out_bytes = 0;
+std::size_t g_scratch_a_bytes   = 0;
 bool g_scratch_frozen           = false;
 
-bool ensure_scratch(std::size_t out_bytes, cudaStream_t stream) {
-    if (g_scratch.gemm_out != nullptr && out_bytes <= g_scratch_out_bytes) { return true; }
+bool ensure_scratch(std::size_t out_bytes, std::size_t a_bytes, cudaStream_t stream) {
+    if (g_scratch.gemm_out != nullptr && out_bytes <= g_scratch_out_bytes &&
+        a_bytes <= g_scratch_a_bytes) {
+        return true;
+    }
     // The scratch grows only until the engine freezes it after capture: from
     // then on its addresses live inside captured graphs and must not move.
     if (g_scratch_frozen) { return false; }
     if (g_scratch.gemm_out != nullptr) {
+        const std::size_t want_out = out_bytes > g_scratch_out_bytes ? out_bytes
+                                                                     : g_scratch_out_bytes;
+        const std::size_t want_a   = a_bytes > g_scratch_a_bytes ? a_bytes : g_scratch_a_bytes;
+        void* grown_out = nullptr;
+        void* grown_a   = nullptr;
+        if (cudaMalloc(&grown_out, want_out) != cudaSuccess) { return false; }
+        if (cudaMalloc(&grown_a, want_a) != cudaSuccess) {
+            cudaFree(grown_out);
+            return false;
+        }
+        cudaMemsetAsync(grown_a, 0, want_a, stream);
         cudaFree(g_scratch.gemm_out);
-        g_bytes -= g_scratch_out_bytes;
-        g_scratch.gemm_out  = nullptr;
-        g_scratch_out_bytes = 0;
-        void* grown = nullptr;
-        if (cudaMalloc(&grown, out_bytes) != cudaSuccess) { return false; }
-        g_scratch.gemm_out  = grown;
-        g_scratch_out_bytes = out_bytes;
-        g_bytes += out_bytes;
+        cudaFree(g_scratch.a_pad);
+        g_bytes -= g_scratch_out_bytes + g_scratch_a_bytes;
+        g_scratch.gemm_out  = grown_out;
+        g_scratch.a_pad     = grown_a;
+        g_scratch_out_bytes = want_out;
+        g_scratch_a_bytes   = want_a;
+        g_bytes += want_out + want_a;
         return true;
     }
     int device = 0;
     cudaGetDevice(&device);
     int sms = 0;
     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
-    const std::size_t c_tmp_bytes =
-        marlin_c_tmp_floats(sms, kMarlinMaxBandTokens) * sizeof(float);
+    const std::size_t c_tmp_bytes = marlin_c_tmp_floats(sms, kMarlinFixedM) * sizeof(float);
     const std::size_t lock_bytes = marlin_workspace_locks_count(sms) * sizeof(int);
     void* out_buf   = nullptr;
+    void* a_buf     = nullptr;
     void* c_tmp_buf = nullptr;
     void* lock_buf  = nullptr;
     if (cudaMalloc(&out_buf, out_bytes) != cudaSuccess) { return false; }
+    if (cudaMalloc(&a_buf, a_bytes) != cudaSuccess) {
+        cudaFree(out_buf);
+        return false;
+    }
     if (cudaMalloc(&c_tmp_buf, c_tmp_bytes) != cudaSuccess) {
         cudaFree(out_buf);
+        cudaFree(a_buf);
         return false;
     }
     if (cudaMalloc(&lock_buf, lock_bytes) != cudaSuccess) {
         cudaFree(out_buf);
+        cudaFree(a_buf);
         cudaFree(c_tmp_buf);
         return false;
     }
+    cudaMemsetAsync(a_buf, 0, a_bytes, stream);
     cudaMemsetAsync(lock_buf, 0, lock_bytes, stream);
-    g_scratch = MarlinScratch{out_buf, c_tmp_buf, static_cast<int*>(lock_buf), sms};
+    g_scratch = MarlinScratch{out_buf, a_buf, c_tmp_buf, static_cast<int*>(lock_buf), sms};
     g_scratch_out_bytes = out_bytes;
-    g_bytes += out_bytes + c_tmp_bytes + lock_bytes;
+    g_scratch_a_bytes   = a_bytes;
+    g_bytes += out_bytes + a_bytes + c_tmp_bytes + lock_bytes;
     return true;
 }
 
@@ -126,7 +150,8 @@ MarlinPlane marlin_plane_for(const Weight& weight, cudaStream_t stream) {
         free_bytes < 2 * (b_bytes + s_bytes + gptq_bytes)) {
         return {};
     }
-    if (!ensure_scratch(static_cast<std::size_t>(n) * kMarlinMaxBandTokens * 2, stream)) {
+    if (!ensure_scratch(static_cast<std::size_t>(n) * kMarlinFixedM * 2,
+                        static_cast<std::size_t>(k) * kMarlinFixedM * 2, stream)) {
         return {};
     }
 
@@ -161,18 +186,37 @@ MarlinScratch marlin_scratch_for(const Weight& weight, cudaStream_t stream) {
 
 bool marlin_w8_run(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     const std::int32_t t = x.ne[1];
-    if (t < 1 || t > kMarlinMaxBandTokens) { return false; }
+    if (t < 1 || t > kMarlinFixedM) { return false; }
     if (out.ne[0] != weight.n || out.ne[1] != t) { return false; }
     const MarlinPlane plane = marlin_plane_for(weight, stream);
     if (plane.b_packed == nullptr) { return false; }
     const MarlinScratch scratch = marlin_scratch();
-    if (scratch.gemm_out == nullptr ||
-        static_cast<std::size_t>(weight.n) * t * 2 > g_scratch_out_bytes) {
+    if (scratch.gemm_out == nullptr || scratch.a_pad == nullptr ||
+        static_cast<std::size_t>(weight.n) * kMarlinFixedM * 2 > g_scratch_out_bytes ||
+        static_cast<std::size_t>(weight.k) * kMarlinFixedM * 2 > g_scratch_a_bytes) {
         return false;
     }
-    marlin_gemm_bf16(x.data, plane.b_packed, plane.scales, out.data, scratch.c_tmp,
-                     scratch.locks, t, weight.n, weight.k, /*group_size=*/32,
-                     /*b_is_fp8=*/false, scratch.sm_count, stream);
+
+    // The activation block is [k, t] column-major, i.e. [t, k] row-major and
+    // contiguous, so the round's rows copy straight into the head of the
+    // zero-padded A. The pad rows below stay zero for the life of the
+    // scratch.
+    const std::size_t a_used = static_cast<std::size_t>(weight.k) * t * 2;
+    if (cudaMemcpyAsync(scratch.a_pad, x.data, a_used, cudaMemcpyDeviceToDevice, stream) !=
+        cudaSuccess) {
+        return false;
+    }
+    marlin_gemm_bf16(scratch.a_pad, plane.b_packed, plane.scales, scratch.gemm_out,
+                     scratch.c_tmp, scratch.locks, kMarlinFixedM, weight.n, weight.k,
+                     /*group_size=*/32, /*b_is_fp8=*/false, scratch.sm_count, stream);
+    // C is [kMarlinFixedM, n] row-major, so its first t rows are exactly the
+    // caller's [n, t] result; a caller writing into the scratch itself reads
+    // them in place.
+    if (out.data != scratch.gemm_out) {
+        const std::size_t c_used = static_cast<std::size_t>(weight.n) * t * 2;
+        CUDA_CHECK(cudaMemcpyAsync(out.data, scratch.gemm_out, c_used, cudaMemcpyDeviceToDevice,
+                                   stream));
+    }
     return true;
 }
 
