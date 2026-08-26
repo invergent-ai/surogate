@@ -1,4 +1,5 @@
 // ninfer::ops - GQA A1/A2/A3 validation and finite route dispatch.
+#include "core/limits.h"
 #include "api/ops/gqa_attention.h"
 
 #include "core/layout.h"
@@ -19,7 +20,7 @@ constexpr std::int32_t kQuantGroup                   = 64;
 constexpr float kExpectedScale                       = 0.0625f;
 constexpr std::int32_t kSmallTChunkTokens            = 6;
 constexpr std::int32_t kMaximumVerifyTokens          = 16;
-constexpr std::int32_t kMaximumBatchSize             = 32; // mirrors kMaximumConcurrency (PATCHES.md #29)
+constexpr std::int32_t kMaximumBatchSize             = kMaximumBatchColumns;
 constexpr std::uint32_t kTwoChunkPromptVisibleKeys   = 512;
 constexpr std::uint32_t kThreeChunkPromptVisibleKeys = 1024;
 

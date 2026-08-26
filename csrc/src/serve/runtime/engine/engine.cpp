@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "runtime/contract/sampling.h"
+#include "core/limits.h"
 #include "runtime/contract/types.h"
 #include "ops/linear/w8a8/w4fp4_plane.h"
 #include "ops/linear/marlin/marlin_plane.h"
@@ -19,7 +20,13 @@
 #include <variant>
 
 namespace ninfer {
-namespace {
+
+
+// The ops layer bounds batched work by kMaximumBatchColumns; the serving
+// layer hands it kMaximumConcurrency lanes. They must agree, or a raise on
+// one side silently outruns the other (PATCHES.md #35).
+static_assert(static_cast<std::int32_t>(kMaximumConcurrency) == kMaximumBatchColumns,
+              "serving concurrency ceiling and the ops batch bound must match");namespace {
 
 runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefaults& defaults,
                                                         SamplingMode mode, RequestOptions options) {

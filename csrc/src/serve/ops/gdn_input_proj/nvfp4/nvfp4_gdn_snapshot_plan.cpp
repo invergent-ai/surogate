@@ -1,3 +1,4 @@
+#include "core/limits.h"
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.h"
 
 #include "core/layout.h"
@@ -27,7 +28,7 @@ Nvfp4GdnProjectedWorkspace allocate_workspace(Allocator& allocator, std::int32_t
 
 Nvfp4GdnConvPlan nvfp4_gdn_conv_resolve_plan(LinearPolicy policy, std::int32_t tokens,
                                              std::int32_t batch_size) {
-    if (tokens <= 0 || batch_size <= 0 || batch_size > 32) {
+    if (tokens <= 0 || batch_size <= 0 || batch_size > kMaximumBatchColumns) {
         throw std::invalid_argument("nvfp4 gdn conv: invalid B/T domain");
     }
     if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4) {

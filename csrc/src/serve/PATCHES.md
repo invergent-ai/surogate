@@ -1128,3 +1128,21 @@ bounds.
 Still open for the ceiling raise: with the bucket fixed, 64 lanes needs
 re-verification on hardware (the six mirrors are reverted to 32 in the
 tree so the shipped configuration stays the proven one).
+
+## 36. One bound for batched work (2026-08-26)
+
+The #35 ceiling attempt cost a full cycle to hardcoded mirrors: eleven
+copies of the literal 32 across the ops layer, found one error at a
+time, and the ones that clamp rather than throw corrupt the stream
+instead of failing. Ops cannot see the serving API's
+kMaximumConcurrency, which is why the mirrors existed.
+
+core/limits.h now holds kMaximumBatchColumns and every batched op spells
+its bound with it (gqa_attention, GDN input/conv/snapshot plans across
+w8/fp8/nvfp4/q4_q5, gated_delta_net, causal_conv1d_silu,
+kv_cache_append_prefix, prepare_masked_block, swa). A static assertion in
+the engine binds it to kMaximumConcurrency, verified to fire when the
+two diverge. Raising the ceiling is now: change two constants, and the
+compiler names any op that has not kept up.
+
+No behavior change at 32.

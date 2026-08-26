@@ -1,3 +1,4 @@
+#include "core/limits.h"
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.h"
 
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_kernels.h"
@@ -83,7 +84,7 @@ Q4Q5GdnInputPlan q4_q5_gdn_input_resolve_plan(const Q4Q5GdnInputProblem& problem
 
 Q4Q5GdnInputConvPlan q4_q5_gdn_input_conv_resolve_plan(const Q4Q5GdnInputProblem& problem,
                                                        std::int32_t batch_size) {
-    if (!q4_q5_gdn_input_admits(problem) || batch_size <= 0 || batch_size > 32) {
+    if (!q4_q5_gdn_input_admits(problem) || batch_size <= 0 || batch_size > kMaximumBatchColumns) {
         throw std::invalid_argument(
             "Q4/Q5 GDN input conv: exact problem or column count is not admitted");
     }
