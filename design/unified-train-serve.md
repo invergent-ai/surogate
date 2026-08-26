@@ -95,3 +95,33 @@ about to be generated, and the tuning would have to be re-expressed in the
 generator anyway. The exception is work that changes the *abstraction* — the
 geometry parameterisation, the round-lifecycle contract — because the generator
 will emit against those interfaces and they should be right first.
+
+## Progress: the generator
+
+`surogate/serve/tools/generate/` holds the first piece.
+
+  target_spec.py     one architecture described once: shapes, head geometry,
+                     linear-attention dims, tensor names. Validates what C++
+                     would otherwise discover as a template error — head
+                     grouping, head-dim multiples, rotary within head dim.
+  emit_config.py     emits impl/config.h from a spec.
+  check_roundtrip.py regenerates the committed targets and diffs.
+
+Correctness is established by regeneration against the committed targets as
+fixtures, not by review. Both qwen3_5_0_8b and qwen3_5_4b reproduce byte for
+byte through the emitted section. A generator that cannot reproduce what it
+replaces has not earned the right to replace it, and the check is what makes
+deleting the hand-written copies safe later rather than hopeful.
+
+It has already paid: the first run rejected the 0.8B declaration, where two
+values had been written from memory (layers 28 for 24, key heads 8 for 16).
+Wrong constants in a serve target do not fail to build — they produce a model
+that loads and generates nonsense, which is the failure mode this session spent
+hours chasing from the other direction.
+
+Next, in order: extend emission through the derived block and the MTP section
+of config.h; then bindings.h/bindings.cpp, which is where 218 of the 309
+differing lines live and where the tensor-name mappings from the DSL
+(`_hf_block_mappings_`) replace hand-written tables; then read the spec from
+the DSL declaration itself rather than restating it in check_roundtrip.py, so
+that a model trained by the DSL is servable without a second description.
