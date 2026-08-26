@@ -156,9 +156,10 @@ template <>
 runtime::PrefillStepResult
 Program<Variant>::start_prefill_lane(std::uint32_t lane, PreparedPrompt&& prompt,
                                      RequestPlan<Variant>&& plan,
-                                     runtime::TransientRegion transient) {
+                                     runtime::TransientRegion transient,
+                                    bool defer_first_chunk) {
     return impl_->start_prefill_lane(lane, PreparedPromptAccess::take(std::move(prompt)),
-                                     std::move(plan), transient);
+                                     std::move(plan), transient, defer_first_chunk);
 }
 
 template <>
@@ -171,6 +172,19 @@ runtime::BatchedGeneratedRound
 Program<Variant>::decode_batch(std::span<const std::uint32_t> lanes,
                                std::span<const runtime::RoundBudget> budgets) {
     return impl_->decode_batch(lanes, budgets);
+}
+
+template <>
+runtime::MixedRoundResult
+Program<Variant>::advance_prefill_mixed(std::uint32_t prefill_lane,
+                                        std::span<const std::uint32_t> lanes,
+                                        std::span<const runtime::RoundBudget> budgets) {
+    return impl_->advance_prefill_mixed(prefill_lane, lanes, budgets);
+}
+
+template <>
+bool Program<Variant>::mixed_round_supported(std::uint32_t prefill_lane) const noexcept {
+    return impl_->mixed_round_supported(prefill_lane);
 }
 
 template <>

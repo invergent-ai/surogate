@@ -16,6 +16,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <deque>
 #include <exception>
 #include <memory>
@@ -500,12 +501,16 @@ private:
     }
 
     void consume_service_work(const std::shared_ptr<Request>& request, std::uint64_t work) {
-        if (work == 0 || work > request->remaining_service_work) {
-            throw std::logic_error("request service projection consumed " + std::to_string(work) +
-                                   " quanta with " +
-                                   std::to_string(request->remaining_service_work) + " remaining");
+        if (work == 0) {
+            throw std::logic_error("request service projection consumed zero quanta");
         }
-        request->remaining_service_work -= work;
+        // Mixed-token rounds (PATCHES.md #30) legitimately take more steps
+        // than the admission-time projection (smaller effective chunks plus
+        // the zero-suffix finalize), so the projection saturates instead of
+        // failing the engine.
+        const std::uint64_t ceiling =
+            request->remaining_service_work > 1 ? request->remaining_service_work - 1 : 0;
+        request->remaining_service_work -= std::min<std::uint64_t>(work, ceiling);
     }
 
     [[nodiscard]] std::array<bool, kMaximumConcurrency> snapshot_cancellations() const noexcept {
@@ -816,12 +821,15 @@ private:
             publish_runtime_stats();
             target_started                = true;
             const PrefillStepResult first = instance_.program->start_prefill_lane(
-                lane, std::move(request->prompt), std::move(selected_plan), transient);
+                lane, std::move(request->prompt), std::move(selected_plan), transient,
+                /*defer_first_chunk=*/true);
             if (!first.complete && (!prefill_lane_ || *prefill_lane_ != lane)) {
                 throw std::logic_error("partial prefill did not retain its execution owner");
             }
             const bool cancel_at_boundary = request->cancelled.load(std::memory_order_acquire);
-            resolve_prefill_step(request, first, cancel_at_boundary);
+            if (first.processed_prompt_tokens != 0 || first.complete || cancel_at_boundary) {
+                resolve_prefill_step(request, first, cancel_at_boundary);
+            }
             publish_runtime_stats();
         } catch (...) {
             const std::exception_ptr error = std::current_exception();
@@ -985,6 +993,32 @@ private:
         const std::span<const std::uint32_t> lanes = membership.lane_span();
         const BatchedGeneratedRound round =
             instance_.program->decode_batch(lanes, membership.budget_span());
+        process_decode_round(membership, round);
+        ++cumulative_stats_.decode_rounds;
+    }
+
+    // Mixed-token round (PATCHES.md #30): one forward advances the staged
+    // prefill by a chunk and produces one decode token per active lane.
+    void run_mixed_round(const RoundMembership& membership) {
+        if (!prefill_lane_) { throw std::logic_error("no request owns staged prefill"); }
+        const std::uint32_t lane = *prefill_lane_;
+        const auto request       = slots_[lane];
+        if (request == nullptr || request->decode_ready) {
+            throw std::logic_error("staged prefill lane has invalid request state");
+        }
+        const std::span<const std::uint32_t> lanes = membership.lane_span();
+        const MixedRoundResult mixed =
+            instance_.program->advance_prefill_mixed(lane, lanes, membership.budget_span());
+        process_decode_round(membership, mixed.round);
+        ++cumulative_stats_.decode_rounds;
+        const bool cancel_at_boundary = request->cancelled.load(std::memory_order_acquire);
+        resolve_prefill_step(request, mixed.prefill, cancel_at_boundary);
+        publish_runtime_stats();
+    }
+
+    void process_decode_round(const RoundMembership& membership,
+                              const BatchedGeneratedRound& round) {
+        const std::span<const std::uint32_t> lanes = membership.lane_span();
 
         std::array<std::uint8_t, kMaximumConcurrency> cancelled{};
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -1055,7 +1089,6 @@ private:
                 remove_completed_slot(lane);
             }
         }
-        ++cumulative_stats_.decode_rounds;
         cumulative_stats_.decode_row_rounds += lanes.size();
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             if (!cancelled[row]) { cumulative_stats_.committed_decode_tokens += accepted[row]; }
@@ -1117,6 +1150,12 @@ private:
                 const RoundMembership membership = build_round_membership();
 
                 if (prefill_lane_) {
+                    if (!membership.empty() &&
+                        instance_.program->mixed_round_supported(*prefill_lane_)) {
+                        run_mixed_round(membership);
+                        previous_unit_was_decode = false;
+                        continue;
+                    }
                     if (!membership.empty() && !previous_unit_was_decode) {
                         run_decode_round(membership);
                         previous_unit_was_decode = true;
@@ -1143,7 +1182,12 @@ private:
                     previous_unit_was_decode = true;
                     continue;
                 }
+            } catch (const std::exception& error) {
+                std::fprintf(stderr, "engine worker loop fatal: %s\n", error.what());
+                fail_all(std::current_exception());
+                return;
             } catch (...) {
+                std::fprintf(stderr, "engine worker loop fatal: unknown exception\n");
                 fail_all(std::current_exception());
                 return;
             }

@@ -397,7 +397,8 @@ runtime::AdmissionResources ProgramImplCore::admission_capacity() const noexcept
 runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lane,
                                                                PreparedPromptData&& prompt,
                                                                RequestPlan&& plan,
-                                                               runtime::TransientRegion transient) {
+                                                               runtime::TransientRegion transient,
+                                                               bool defer_first_chunk) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
     SequenceState& sequence = sequences[lane];
     RequestControl& request = requests[lane];
@@ -660,6 +661,18 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                          staged.elapsed_seconds * 1e3);
         }
         request.lifecycle      = Lifecycle::Prefilling;
+        // Deferred first chunk (PATCHES.md #30): leave the staged prefill to
+        // the executor loop so it can ride a mixed round with the active
+        // decode lanes. Ineligible shapes keep the classic behavior.
+        if (defer_first_chunk && speculative_backend == SpeculativeBackend::None &&
+            !staged.vision && !staged.prepare_mtp && staged.mtp_bridge == MtpBridgeMode::None &&
+            staged.cursor < staged.prompt_tokens) {
+            return runtime::PrefillStepResult{
+                .summary = runtime::BeginSummary{.prompt_tokens        = staged.prompt_tokens,
+                                                 .reused_prompt_tokens = staged.base,
+                                                 .prefix_reuse_path    = staged.reuse},
+                .processed_prompt_tokens = 0};
+        }
         return advance_prefill(sequence, request);
     } catch (...) {
         try {
@@ -1946,6 +1959,180 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         try {
             device.synchronize();
         } catch (...) {}
+        for (const std::uint32_t lane : lanes) {
+            if (lane < max_concurrency) { clear_lane(sequences[lane], requests[lane]); }
+        }
+        throw;
+    }
+}
+
+bool ProgramImplCore::mixed_round_supported(std::uint32_t prefill_lane) const noexcept {
+    if (speculative_backend != SpeculativeBackend::None || prefill_lane >= max_concurrency) {
+        return false;
+    }
+    const RequestControl& request = requests[prefill_lane];
+    if (request.lifecycle != Lifecycle::Prefilling || !request.prefill) { return false; }
+    const RequestControl::Prefill& staged = *request.prefill;
+    return !staged.vision && !staged.prepare_mtp && staged.mtp_bridge == MtpBridgeMode::None &&
+           staged.cursor < staged.prompt_tokens && requests[prefill_lane].prefill->prompt.token_ids.size() != 0;
+}
+
+runtime::MixedRoundResult
+ProgramImplCore::advance_prefill_mixed(std::uint32_t prefill_lane,
+                                       std::span<const std::uint32_t> lanes,
+                                       std::span<const runtime::RoundBudget> budgets) {
+    if (speculative_backend != SpeculativeBackend::None || lanes.empty() ||
+        budgets.size() != lanes.size() || prefill_lane >= max_concurrency) {
+        throw std::invalid_argument("mixed round requires plain decode lanes and a prefill lane");
+    }
+    SequenceState& prefill_sequence = sequences[prefill_lane];
+    RequestControl& prefill_request = requests[prefill_lane];
+    if (prefill_request.lifecycle != Lifecycle::Prefilling || !prefill_request.prefill) {
+        throw std::logic_error("mixed round requires an active prefill lane");
+    }
+    RequestControl::Prefill& staged = *prefill_request.prefill;
+    if (staged.vision || staged.prepare_mtp || staged.cursor >= staged.prompt_tokens ||
+        staged.mtp_bridge != MtpBridgeMode::None) {
+        throw std::logic_error("mixed round does not support this staged prefill");
+    }
+
+    std::uint32_t maximum_frontier = 0;
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        const std::uint32_t lane = lanes[row];
+        if (lane >= max_concurrency || lane == prefill_lane ||
+            std::find(lanes.begin(), lanes.begin() + static_cast<std::ptrdiff_t>(row), lane) !=
+                lanes.begin() + static_cast<std::ptrdiff_t>(row)) {
+            throw std::invalid_argument("mixed round contains an invalid or duplicate lane");
+        }
+        const SequenceState& sequence = sequences[lane];
+        const RequestControl& request = requests[lane];
+        if (request.lifecycle != Lifecycle::Active ||
+            budgets[row].generated_tokens_remaining == 0 || !sequence.kv ||
+            sequence.kv->text.bound_row() < 0 || sequence.execution_frontier >= capacity ||
+            sequence.ledger_frontier != sequence.execution_frontier + 1) {
+            throw std::logic_error("mixed round row is not decode-ready");
+        }
+        maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
+    }
+
+    const auto start        = Clock::now();
+    const std::int32_t rows = static_cast<std::int32_t>(lanes.size());
+    try {
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            SequenceState& sequence            = sequences[lanes[row]];
+            const RequestControl& request      = requests[lanes[row]];
+            const std::uint32_t frontier       = sequence.execution_frontier;
+            ordinary_host_ingress->tokens[row] = sequence.ledger.back();
+            ordinary_host_ingress->cache_positions[row] =
+                checked_i32(frontier, "mixed round position");
+            ordinary_host_ingress->rope_positions[row] =
+                checked_i32(frontier, "mixed round RoPE position") + sequence.rope_delta;
+            ordinary_host_ingress->text_kv_table_rows[row] = sequence.kv->text.bound_row();
+            ordinary_host_ingress->lanes[row]    = static_cast<std::int32_t>(sequence.lane);
+            ordinary_host_ingress->sampling[row] = request.sampling_host;
+            materialize_sequence_kv(sequence, frontier + 1, 0);
+        }
+        qwen3_6::OrdinaryDecodeState& ordinary = *io.ordinary;
+        CUDA_CHECK(cudaMemcpyAsync(ordinary.ingress.data, ordinary_host_ingress,
+                                   sizeof(qwen3_6::OrdinaryDecodeIngress), cudaMemcpyHostToDevice,
+                                   device.stream));
+
+        // The workspace plan covers prefill_chunk columns; the decode batch
+        // rides in the same window, so the chunk shrinks by the batch size.
+        const std::uint32_t mixed_chunk_cap =
+            prefill_chunk > static_cast<std::uint32_t>(rows)
+                ? prefill_chunk - static_cast<std::uint32_t>(rows)
+                : 1U;
+        const std::uint32_t nominal =
+            std::min(mixed_chunk_cap, staged.prompt_tokens - staged.cursor);
+        const bool final_candidate = staged.cursor + nominal == staged.prompt_tokens;
+        mark_workspace_usage(workspace_plan.text_prefill);
+        mark_workspace_usage(workspace_plan.ordinary_round);
+
+        schedule::TextContext card(device, model, work, text_kv_view(prefill_sequence),
+                                   decoder->linear_attention, io, prefill_hidden, prefill_chunk,
+                                   staged.cursor, {}, &decoder->text_kv, decoder->mtp_cache());
+        card.set_sampling(static_cast<const ops::SamplingConfig*>(
+            sampling_config.slice(1, static_cast<std::int32_t>(prefill_sequence.lane), 1).data));
+        card.set_linear_state_slots(
+            LinearStateSlots::current_state_slot(prefill_sequence.lane, max_concurrency),
+            LinearStateSlots::rewrite_checkpoint_state_slot(prefill_sequence.lane,
+                                                            max_concurrency));
+        card.set_gdn_state_action(schedule::GdnStateAction::UpdateInPlace, nullptr);
+        set_device_i32(io.text_kv_table_row, prefill_sequence.kv->text.bound_row());
+
+        schedule::TextContext::MixedDecodeSlice slice;
+        slice.ids                = ordinary.tokens.slice(0, 0, rows);
+        slice.cache_positions    = ordinary.cache_positions.slice(0, 0, rows);
+        slice.rope_positions     = ordinary.rope_positions.slice(0, 0, rows);
+        slice.kv_table_rows      = ordinary.text_kv_table_rows.slice(0, 0, rows);
+        slice.linear_state_slots = ordinary.lanes.slice(0, 0, rows);
+        slice.envelope           = {maximum_frontier + 1, maximum_frontier + 1};
+        slice.hidden             = ordinary.hidden.slice(1, 0, rows);
+        slice.logits             = ordinary.logits.slice(1, 0, rows);
+
+        (void)final_candidate;
+        const schedule::PrefillChunkResult chunk = card.mixed_chunk(
+            std::span<const TokenId>(staged.prompt.token_ids), staged.cursor, nominal,
+            /*finalize_at_end=*/false, slice);
+
+        Tensor sampled         = ordinary.sampled_tokens.slice(0, 0, rows);
+        Tensor cache_positions = ordinary.cache_positions.slice(0, 0, rows);
+        Tensor lanes_tensor    = ordinary.lanes.slice(0, 0, rows);
+        ops::scatter(slice.hidden, lanes_tensor, tail_hidden_store, device.stream);
+        ops::sample(slice.logits, sampled, TextConfig::token_domain, ordinary.sampling,
+                    cache_positions, ops::kSamplePurposeDecode, work, device.stream);
+        CUDA_CHECK(cudaMemcpyAsync(ordinary_host_egress, ordinary.egress.data,
+                                   sizeof(qwen3_6::OrdinaryDecodeEgress), cudaMemcpyDeviceToHost,
+                                   device.stream));
+        device.synchronize();
+
+        const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            SequenceState& sequence    = sequences[lanes[row]];
+            RequestControl& request    = requests[lanes[row]];
+            const std::uint32_t base_E = sequence.execution_frontier;
+            const std::uint32_t base_S = sequence.ledger_frontier;
+            const TokenId token        = ordinary_host_egress->sampled_tokens[row];
+            validate_licensed_tokens(std::span<const TokenId>(&token, 1));
+            sequence.text_kv_valid     = base_E + 1;
+            sequence.tail_hidden_valid = true;
+            sequence.ledger.push_back(token);
+            sequence.prefix_identity.append_generated(1, sequence.rope_delta);
+            request.pending   = PendingCandidate{.kind          = PendingKind::Ordinary,
+                                                 .base_E        = base_E,
+                                                 .base_S        = base_S,
+                                                 .prompt_tokens = 0,
+                                                 .produced      = 1};
+            request.lifecycle = Lifecycle::Pending;
+            request.timings.decode_seconds += seconds;
+        }
+
+        runtime::MixedRoundResult result;
+        result.round = runtime::BatchedGeneratedRound{
+            .tokens = std::span<const TokenId>(ordinary_host_egress->sampled_tokens.data(),
+                                               lanes.size())};
+        const runtime::BeginSummary summary{.prompt_tokens        = staged.prompt_tokens,
+                                            .reused_prompt_tokens = staged.base,
+                                            .prefix_reuse_path    = staged.reuse};
+        staged.cursor += chunk.processed_tokens;
+        prefill_sequence.text_kv_valid = staged.cursor;
+        result.prefill = runtime::PrefillStepResult{
+            .summary = summary, .processed_prompt_tokens = chunk.processed_tokens};
+        if (staged.cursor == staged.prompt_tokens) {
+            // The next ordinary advance takes the zero-suffix path off the
+            // tail hidden (reusing the whole finalize machinery).
+            copy_tail(prefill_sequence,
+                      prefill_hidden.slice(
+                          1, static_cast<std::int32_t>(chunk.processed_tokens) - 1, 1));
+            prefill_sequence.tail_hidden_valid = true;
+        }
+        return result;
+    } catch (...) {
+        try {
+            device.synchronize();
+        } catch (...) {}
+        clear_lane(prefill_sequence, prefill_request);
         for (const std::uint32_t lane : lanes) {
             if (lane < max_concurrency) { clear_lane(sequences[lane], requests[lane]); }
         }

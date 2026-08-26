@@ -207,6 +207,24 @@ public:
 
     [[nodiscard]] int proposal_head_n() const noexcept { return proposal_head_n_; }
 
+    // Mixed-token round (PATCHES.md #30): one forward over concatenated
+    // [prefill-chunk | decode-batch] columns. GEMM/fused ops run once over
+    // all columns; the mixers split per slice (prefill kernels over the
+    // chunk columns, batch forms over the decode columns).
+    struct MixedDecodeSlice {
+        Tensor ids;                // I32 [B]
+        Tensor cache_positions;    // I32 [B]
+        Tensor rope_positions;     // I32 [B]
+        Tensor kv_table_rows;      // I32 [B]
+        Tensor linear_state_slots; // I32 [B]
+        ops::GqaExecutionEnvelope envelope{};
+        Tensor hidden;             // BF16 [hidden, B] out
+        Tensor logits;             // BF16 [vocab, B] out
+    };
+    [[nodiscard]] PrefillChunkResult
+    mixed_chunk(std::span<const int> full_ids, std::uint32_t begin, std::uint32_t nominal_length,
+                bool finalize_at_end, const MixedDecodeSlice& decode);
+
     [[nodiscard]] PrefillChunkResult prefill_chunk(std::span<const int> full_ids,
                                                    std::uint32_t begin,
                                                    std::uint32_t nominal_length,
@@ -298,23 +316,7 @@ private:
                                                int base_i, bool is_last, int checkpoint_rel);
     void prefill_graph_window(std::int32_t bucket);
 
-    // Mixed-token round (PATCHES.md #30): one forward over concatenated
-    // [prefill-chunk | decode-batch] columns. GEMM/fused ops run once over
-    // all columns; the mixers split per slice (prefill kernels over the
-    // chunk columns, batch forms over the decode columns).
-    struct MixedDecodeSlice {
-        Tensor ids;                // I32 [B]
-        Tensor cache_positions;    // I32 [B]
-        Tensor rope_positions;     // I32 [B]
-        Tensor kv_table_rows;      // I32 [B]
-        Tensor linear_state_slots; // I32 [B]
-        ops::GqaExecutionEnvelope envelope{};
-        Tensor hidden;             // BF16 [hidden, B] out
-        Tensor logits;             // BF16 [vocab, B] out
-    };
-    [[nodiscard]] PrefillChunkResult
-    mixed_chunk(std::span<const int> full_ids, std::uint32_t begin, std::uint32_t nominal_length,
-                bool finalize_at_end, const MixedDecodeSlice& decode);
+
 
     template <class Tap>
     [[nodiscard]] PrefillChunkResult

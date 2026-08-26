@@ -221,11 +221,16 @@ public:
     [[nodiscard]] runtime::PrefillStepResult start_prefill_lane(std::uint32_t lane,
                                                                 PreparedPromptData&& prompt,
                                                                 RequestPlan&& plan,
-                                                                runtime::TransientRegion transient);
+                                                                runtime::TransientRegion transient,
+                                                                bool defer_first_chunk = false);
     [[nodiscard]] runtime::PrefillStepResult advance_prefill_lane(std::uint32_t lane);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_batch(std::span<const std::uint32_t> lanes,
                  std::span<const runtime::RoundBudget> budgets);
+    [[nodiscard]] runtime::MixedRoundResult
+    advance_prefill_mixed(std::uint32_t prefill_lane, std::span<const std::uint32_t> lanes,
+                          std::span<const runtime::RoundBudget> budgets);
+    [[nodiscard]] bool mixed_round_supported(std::uint32_t prefill_lane) const noexcept;
     void resolve_prefill_lane(std::uint32_t lane, bool terminal);
     void resolve_pending_batch(std::span<const std::uint32_t> lanes,
                                std::span<const std::uint32_t> accepted_tokens,

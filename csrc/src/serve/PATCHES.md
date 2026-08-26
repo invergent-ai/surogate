@@ -843,6 +843,23 @@ old ninfer/ paths.)
    tile actually entered the recaptured decode graphs — it measured
    neutral twice on the 27B, which contradicts the census arithmetic.
 
+   SHIPPED + MEASURED (2026-08-26): the full mixed-round path is live —
+   TextContext::mixed_chunk (GEMMs over concatenated columns, mixers
+   split per slice), ProgramImplCore::advance_prefill_mixed (ordinary
+   ingress staging + prefill card + batch sampling + zero-suffix
+   finalize handoff via tail_hidden), executor run_mixed_round with a
+   deferred first chunk (start_prefill_lane stages without advancing so
+   single-chunk prompts reach the loop), and a saturating service-work
+   projection (mixed rounds legitimately exceed the admission-time step
+   estimate; floor 1 while active — the strict form killed the worker).
+   Eager v1, chunk capped at prefill_chunk - batch. 4B multi100 1,736 ->
+   1,872.8 (TTFT 4.6s, 1,403/0, only 3 classic chunks in the run); 0.8B
+   4,733 -> 4,892.4 (TTFT 1.76s, 2,412/0); solo unchanged (532/stream
+   0.8B); suite green. vLLM gaps: 4B 1.81x, 0.8B 1.22x. NEXT multipliers
+   for the mixed line: capture mixed rounds as graphs (eager pays ~600
+   launches/round), and per-op fusion along the owner's torch.compile
+   observation.
+
 ### sm_89 port status
 
 With patches 5–10 the **entire tree compiles and links for sm_89**

@@ -85,6 +85,13 @@ struct RoundBudget {
     std::uint32_t generated_tokens_remaining = 0;
 };
 
+// Mixed-token round (PATCHES.md #30): one forward advanced the prefill lane
+// by a chunk AND produced one decode token per active lane.
+struct MixedRoundResult {
+    PrefillStepResult prefill;
+    BatchedGeneratedRound round;
+};
+
 // Target-produced affine reservation curve for one Main KV physical-capacity axis. The byte
 // values come from complete target physical layout plans, not from a model geometry formula in
 // the common runtime.
