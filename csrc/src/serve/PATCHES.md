@@ -1510,3 +1510,39 @@ first. Whether this is the wide-batch fault is unproven: growth happens
 during warmup rather than at 90 s, so the timing does not obviously fit,
 but the corruption it causes is unbounded in where it lands. Needs a 90 s
 run at 64 lanes with SUROGATE_SERVE_MARLIN_WIDE=1 to test.
+
+## 47. A measurement error, and what the numbers really are (2026-08-26)
+
+Two 90-second runs invalidate a batch of this session's reporting.
+
+The 4B at 64 lanes gives 2,633 tok/s over 40 seconds and 2,110 over 90
+seconds, in the same build and config. The short window is dominated by
+the ramp: lanes are still filling, contexts are short, and attention and
+GDN both cost less per token than they do once every lane carries its
+full 512+128. The board's vLLM figures are 90-second runs, so every
+40-second number this session was compared against a steady state it
+never reached. Only 90-second runs go on the board from here.
+
+Second: Marlin is NEUTRAL at 64 lanes (4B, 90 s: 2,110 with, 2,104
+without, both clean). Its measured win was at 32 lanes, where the band
+sits at M=32 and the exact-T kernels are weakest. At M=64 they match it.
+It stays wired — it costs nothing and it is the vehicle for the 27B FP8
+work — but it is not what carries the 4B.
+
+Third, and the reason the above got looked at: with Marlin ON at 64
+lanes the 0.8B dies with "invalid UTF-8 leading byte in generated token
+stream" partway through a 90-second run. With Marlin OFF at 64 lanes,
+and with Marlin ON at 32 lanes, the same load is clean. So there is a
+real defect in Marlin at 64-wide batches under sustained churn; the
+short runs never surfaced it.
+
+Honest standing, all 90-second, all stable:
+  0.8B  5,429 (64 lanes, Marlin off)  v vLLM 5,958   -9%
+  4B    2,110 (64 lanes)              v vLLM 3,390  -38%
+  27B     370 (32 lanes, 40 s)        v vLLM   688  -46%  [needs a 90 s rerun]
+
+The 0.8B's "+0.8% ahead" from #44 does not survive this correction: that
+was a 40-second run at 64 lanes with Marlin, which is both the optimistic
+window and the unstable configuration. The sampler fix in #44 is still
+real and still worth its keep — it is why 64 lanes is usable at all —
+but the headline was wrong.
