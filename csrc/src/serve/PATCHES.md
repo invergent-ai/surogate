@@ -1970,3 +1970,36 @@ Board after this change, all 90-second steady state, 100 users:
   0.8B  6,646 v vLLM 5,958   +11.6%  AHEAD
   4B    3,024 v vLLM 3,390   -11%    (was -45% at session start)
   27B     582 v vLLM   688   -15%    (was -46%)
+
+## 58. Post-bf16 census, and two more rejected levers (2026-08-26)
+
+4B census after #57 (100 users, 64 lanes). recurrent_snapshot fell from
+211 us to 95.6 us per call and from 22.6% to 11.7% of device, exactly the
+halving the narrower storage predicts:
+
+   23.7%  cutlass prefill GEMMs      72.6 us x 17076
+   21.5%  marlin decode GEMMs        69.1 us x 16226
+   11.7%  gdn recurrent_snapshot     95.6 us x  6394
+   10.1%  small fused/elementwise    18.3 us x 28807
+    7.9%  gqa decode attention      193.5 us x  2131
+    13%   idle
+
+Two levers tested against that and rejected, both by measurement:
+
+  Lane scaling, retried now that state traffic halved. It paid on the 27B
+  (32 -> 48 lanes, +12%) but not here: 64 lanes 3,024, 80 lanes 2,680, 96
+  lanes 2,675. The 4B stays at 64.
+
+  Attention split target. The wave count driving the split policy is now
+  tunable (SUROGATE_SERVE_ATTN_WAVES, default 2). Sweeping it changes
+  nothing: 2 waves 3,007, 4 waves 3,023 — inside run variance. The decode
+  attention kernel is not split-limited, so its ~2x gap to the KV-read
+  roofline needs the fused rewrite, not a knob.
+
+What remains on the 4B is diffuse: GEMMs are 45% of device across two
+families, attention is 7.9% at about half of peak bandwidth, and 13% is
+the structural admission idle from #56. No single fix closes 11%.
+
+The 27B is the better investment: its FP8-class GEMMs are 47% of device
+at 412-503 GB/s against 926 GB/s proven achievable on the same class of
+problem, which is one target rather than four.
