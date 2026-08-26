@@ -125,3 +125,24 @@ differing lines live and where the tensor-name mappings from the DSL
 (`_hf_block_mappings_`) replace hand-written tables; then read the spec from
 the DSL declaration itself rather than restating it in check_roundtrip.py, so
 that a model trained by the DSL is servable without a second description.
+
+### What does not work: text templating
+
+The obvious way to generate `bindings.cpp` — take a committed target, replace
+its shape values with placeholders, render for other models — is unsound, and
+the check that proves it is worth keeping.
+
+Rendering the derived template for the model it came from always succeeds, so a
+single-model check would have passed it. Rendering for a second model fails on
+28 lines, every one a constant that shares a value with a shape:
+
+    const std::uint64_t low_group = 32;    32 is a group size, not value_heads
+    materialized_weight(..., 2560, 1024)   2560 is another variant's branch
+
+A shape and a constant that coincide are indistinguishable to substitution, and
+the failure is silent for the source model. So `bindings.cpp` has to be emitted
+from structure — a weight table whose entries carry their own rows and columns
+computed from the spec — as `emit_config.py` does for `config.h`, rather than
+patched from an existing file. The rejected attempt is retained under
+`rejected_text_template*.py` so the next person does not spend the afternoon
+rediscovering it.
