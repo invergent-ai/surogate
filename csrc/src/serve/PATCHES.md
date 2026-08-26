@@ -1737,3 +1737,21 @@ partial-plus-reduce design writes partials to global and reads them back
 which is the async-scheduler work whose infrastructure #32 already
 built. GDN recurrent_snapshot (21.9%) and the cutlass prefill GEMMs
 (20.1%) are both near roofline and are not worth attacking.
+
+### #51 follow-up: the residency theory does not explain the 4B
+
+The obvious structural suspicion — we serve the 4B W8-resident (4.80 GiB
+loaded) while vLLM serves NVFP4, so we read twice the weight bytes per
+decode round — does not survive arithmetic. At 41.6 rounds per second
+that is ~200 GB/s of weight traffic against the card's ~1.79 TB/s, so
+weights are about 11% of bandwidth and not the binding constraint.
+Halving them would not close a 22% gap. (Residency still matters for the
+27B, which is lane-limited by memory rather than bandwidth — a different
+argument.)
+
+So the 4B's deficit is accounted for, almost exactly, by the two items
+already named: decode attention running ~2.6x off its KV-read roofline
+at 9.2% of device, and 12% device idle in the host serial path. Together
+that is ~21% against a measured 22% gap. Both are real engineering —
+a fused flash-style decode attention kernel, and finishing the async
+scheduler on the #32 infrastructure — and neither is a tuning knob.
