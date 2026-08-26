@@ -1698,3 +1698,18 @@ exact-width capture keeps both correctness and speed.
 Two rejected theories are recorded in #49 so nobody re-walks them. The
 lesson: three sessions of reasoning about Marlin's buffers were worth
 less than ten lines that recorded which round produced the bad token.
+
+### #50 follow-up: standing after the fix
+
+  model  surogate   vLLM    gap      runs
+  0.8B      6,076  5,958   +2.0%  AHEAD   3 x 90 s, zero errors
+  4B        2,661  3,390   -22%           2 x 90 s, zero errors
+  27B         370    688   -46%           40 s provisional
+
+The 0.8B is past vLLM on a stable configuration. The 4B is unchanged by
+the exact-width fix (2,661 against 2,685 with padding — within run
+variance, and now correct), so its deficit is elsewhere: its census puts
+GDN recurrent_snapshot at 21.9% near roofline, cutlass prefill at 20.1%,
+decode GEMMs at 18.2%, attention at 9.2% still ~2.6x off its KV-read
+roofline, and 12% device idle in the host serial path between rounds.
+The 27B remains lane-limited by memory and entirely compute-bound.
