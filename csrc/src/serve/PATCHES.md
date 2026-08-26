@@ -1049,3 +1049,37 @@ plane built at load before the decode-graph captures (the w4fp4/w8fp8
 plane precedent), family dispatch for the T=17..48 band with fused
 epilogues run separately, and the FP8 variant for the 27B's
 fp8_small_t offenders (5120x6144 / 5120x17408 at 412-503 GB/s).
+
+## 34. Marlin band wired into the serve families (2026-08-26) — Phase B
+
+The #33 kernels now carry the T=17..48 decode band for W8 weights:
+plain linear (vocab head), linear_add (residual add as its own pass),
+linear_swiglu (silu_mul over the [2*out, T] result), and gdn_input_proj
+(two strided copies for the [qkv | z] row split — kilobytes next to the
+GEMM's tens of megabytes). A derived-plane registry (marlin_plane.h,
+same discipline as the FP8/FP4 planes: process-global, keyed by the
+device codes pointer, VRAM-guarded, never derives on a capturing stream)
+holds the repacked B tiles and permuted scales; shared scratch (gemm
+output, fp32 reduce buffer, locks) grows during warmup and is frozen
+after capture so graphs may bake its addresses.
+
+Two integration bugs, both found by measurement:
+
+- Planes never derived, so the captures baked the old kernels and the
+  4B measured unchanged (1,899 vs 1,902). The pre-capture warmup ran at
+  batch 1, below the band; it now also runs one band-sized round.
+- The 0.8B stream turned to garbage (invalid UTF-8) while the 4B stayed
+  clean. Marlin's atomic-add reduce accumulates into C and needs a
+  zeroed output, and it engages only when ceil(M/64)*N <= 2048 — true
+  for the 0.8B's N=1024 projections, false for every 4B shape. vLLM
+  keeps this path off by default for the same reason
+  (VLLM_MARLIN_USE_ATOMIC_ADD); the serve integration does too.
+
+Derived planes duplicate the W8 residency (~3 GB at the 4B), which the
+graph-allowance accounting counted as graph memory until
+marlin_plane_bytes() joined the same subtraction the FP8/FP4 planes use.
+
+Measured, 100 users, 512/128: 4B 1,902 -> 2,118 tok/s (vLLM 3,390, gap
+-44% -> -38%); 0.8B 5,134 -> 5,107 (neutral: its band shapes are small
+enough that the exact-T kernels were already competitive). Suite green
+apart from the known environmental frontend failure.

@@ -1,3 +1,5 @@
+#include "core/device.h"
+#include "ops/linear/marlin/marlin_plane.h"
 #include "api/ops/gdn_input_proj.h"
 #include "ops/linear/w8a8/w4fp4_plane.h"
 
@@ -358,6 +360,28 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
         workspace != nullptr) {
         detail::w8a8_gemm_split2(x, weight, qkv, z, *workspace, stream);
         return;
+    }
+    // Marlin band (PATCHES.md #33): one GEMM into scratch, then two strided
+    // copies for the [qkv | z] row split (kilobytes next to the GEMM's
+    // tens of megabytes).
+    if (cols >= detail::kMarlinMinBandTokens && cols <= detail::kMarlinMaxBandTokens) {
+        const detail::MarlinScratch scratch = detail::marlin_scratch_for(weight, stream);
+        if (scratch.gemm_out != nullptr) {
+            Tensor fused(scratch.gemm_out, DType::BF16, {weight.n, cols});
+            if (detail::marlin_w8_run(x, weight, fused, stream)) {
+                const std::size_t parent_pitch = static_cast<std::size_t>(weight.n) * 2;
+                const auto* base = static_cast<const unsigned char*>(scratch.gemm_out);
+                CUDA_CHECK(cudaMemcpy2DAsync(qkv.data, static_cast<std::size_t>(kQkvRows) * 2,
+                                             base, parent_pitch,
+                                             static_cast<std::size_t>(kQkvRows) * 2, cols,
+                                             cudaMemcpyDeviceToDevice, stream));
+                CUDA_CHECK(cudaMemcpy2DAsync(z.data, static_cast<std::size_t>(kZRows) * 2,
+                                             base + static_cast<std::size_t>(kQkvRows) * 2,
+                                             parent_pitch, static_cast<std::size_t>(kZRows) * 2,
+                                             cols, cudaMemcpyDeviceToDevice, stream));
+                return;
+            }
+        }
     }
     detail::w8_gdn_input_dispatch(x, weight, qkv, z, stream);
 }

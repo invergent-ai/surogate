@@ -37,7 +37,10 @@ int main() {
     struct Shape { int n, k; const char* name; };
     const Shape shapes[] = {{2560, 9216, "down"},    {18432, 2560, "gate_up"},
                             {12288, 2560, "gdn_in"}, {2560, 4096, "out"},
-                            {10240, 2560, "attn_in"}, {248320, 2560, "vocab"}};
+                            {10240, 2560, "attn_in"}, {248320, 2560, "vocab"},
+                            {7168, 1024, "q08_gate_up"}, {1024, 3584, "q08_down"},
+                            {8192, 1024, "q08_gdn_in"}, {1024, 2048, "q08_out"},
+                            {6144, 1024, "q08_attn_in"}, {248320, 1024, "q08_vocab"}};
     const int ts[] = {16, 24, 32, 48};
 
     for (const Shape& sh : shapes) {

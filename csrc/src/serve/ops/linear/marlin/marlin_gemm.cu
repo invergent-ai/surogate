@@ -465,7 +465,12 @@ void marlin_gemm_bf16(const void* a, const void* b_packed, const void* b_scales,
         locks, a_type, b_type, c_type, s_type, /*has_bias=*/false,
         /*has_act_order=*/false, /*is_k_full=*/true, /*has_zp=*/false, num_groups,
         group_size, dev, stream, /*thread_k=*/-1, /*thread_n=*/-1, sm_count,
-        /*use_atomic_add=*/true, /*use_fp32_reduce=*/true, /*is_zp_float=*/false);
+        // The atomic-add reduce accumulates into C and so requires a zeroed
+        // output; the serve buffers are live scratch, and vLLM keeps this off
+        // by default too (VLLM_MARLIN_USE_ATOMIC_ADD). It engages only when
+        // ceil(M/64)*N <= 2048, which is exactly the small-N projections that
+        // corrupted the 0.8B stream when it was on.
+        /*use_atomic_add=*/false, /*use_fp32_reduce=*/true, /*is_zp_float=*/false);
 }
 
 } // namespace ninfer::ops::detail

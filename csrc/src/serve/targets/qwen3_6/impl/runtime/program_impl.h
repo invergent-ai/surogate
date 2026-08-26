@@ -1,3 +1,4 @@
+#include "ops/linear/marlin/marlin_plane.h"
 #include "ops/linear/w8a8/w4fp4_plane.h"
 #include "ops/linear/w8a8/w8fp8_plane.h"
 #include "targets/qwen3_6/impl/runtime/instance.h"
@@ -1308,6 +1309,22 @@ void ProgramImplCore::prepare_graphs() {
         schedule::ordinary_decode_batch(ordinary_state, 1, {code_warm.min + 1, code_warm.max + 1},
                                         nullptr);
         device.synchronize();
+        // Marlin band (PATCHES.md #33): derived planes must exist before the
+        // captures, and only a band-sized round derives them (a capturing
+        // stream may look one up but never derive). Warm one, then freeze the
+        // shared scratch so the captures can bake its addresses.
+        if (ordinary_batch_limit >= ops::detail::kMarlinMinBandTokens) {
+            const std::uint32_t band =
+                std::min<std::uint32_t>(ordinary_batch_limit,
+                                        ops::detail::kMarlinMaxBandTokens);
+            prepare_representative(code_warm.min, band);
+            device.synchronize();
+            schedule::ordinary_decode_batch(ordinary_state, static_cast<std::int32_t>(band),
+                                            {code_warm.min + 1, code_warm.max + 1}, nullptr);
+            device.synchronize();
+            prepare_representative(code_warm.min, 1);
+            device.synchronize();
+        }
 
         ordinary_graphs.profiles.reserve(ordinary_profiles.size() * ordinary_batch_limit);
         for (std::uint32_t batch_size = 1; batch_size <= ordinary_batch_limit; ++batch_size) {
@@ -1430,6 +1447,7 @@ void ProgramImplCore::prepare_graphs() {
         instantiate_graph_family(ordinary_chained_graphs, "ordinary chained", device,
                                  prepare_representative);
     }
+    ops::detail::marlin_plane_freeze_scratch();
     if (speculative_backend == SpeculativeBackend::Mtp) {
         instantiate_graph_family(mtp_graphs, "MTP", device, prepare_representative);
     }
@@ -1471,7 +1489,8 @@ void ProgramImplCore::prepare_graphs() {
     // surogate vendor patch (PATCHES.md #22): derived quant planes (fp8/fp4
     // registries) allocate lazily during the pre-capture warmup decode; they
     // carry their own VRAM guard and are not graph memory, so exclude them.
-    const std::size_t plane_bytes = ops::detail::w8_derived_plane_bytes();
+    const std::size_t plane_bytes =
+        ops::detail::w8_derived_plane_bytes() + ops::detail::marlin_plane_bytes();
     consumed                      = consumed > plane_bytes ? consumed - plane_bytes : 0;
     graph_observed_bytes          = consumed;
     if (consumed > graph_allowance_bytes) {

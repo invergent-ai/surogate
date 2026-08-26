@@ -4,6 +4,7 @@
 #include "runtime/contract/sampling.h"
 #include "runtime/contract/types.h"
 #include "ops/linear/w8a8/w4fp4_plane.h"
+#include "ops/linear/marlin/marlin_plane.h"
 #include "ops/linear/w8a8/w8fp8_plane.h"
 #include "runtime/engine/concurrent_executor.h"
 #include "targets/registry.h"
@@ -151,6 +152,7 @@ public:
         // derived FP8 prefill plane (op tests stay int8-exact by default;
         // SUROGATE_SERVE_FP8_PREFILL=0 vetoes).
         ops::detail::w8fp8_plane_set_enabled(true);
+        ops::detail::marlin_plane_set_enabled(true);
         // surogate vendor patch (PATCHES.md #21): NVFP4 prefill profile is
         // an explicit opt-in (quality class change).
         if (const char* mode = std::getenv("SUROGATE_SERVE_PREFILL_QUANT");

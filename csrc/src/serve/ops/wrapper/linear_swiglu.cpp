@@ -1,5 +1,8 @@
 #include "api/ops/linear_swiglu.h"
 
+#include "api/ops/silu_mul.h"
+#include "ops/linear/marlin/marlin_plane.h"
+
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.h"
@@ -151,6 +154,23 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     }
 
     if (w8_weight) {
+        // Marlin band (PATCHES.md #33): gate_up is the largest decode GEMM;
+        // the vendored kernel runs it 2.2x faster and silu_mul then folds
+        // the [2*out, T] result down.
+        if (t >= detail::kMarlinMinBandTokens && t <= detail::kMarlinMaxBandTokens) {
+            const detail::MarlinScratch scratch =
+                detail::marlin_scratch_for(gate_up_weight, stream);
+            if (scratch.gemm_out != nullptr) {
+                Tensor fused(scratch.gemm_out, DType::BF16, {gate_up_weight.n, t});
+                if (detail::marlin_w8_run(x, gate_up_weight, fused, stream)) {
+                    const std::int32_t half = gate_up_weight.n / 2;
+                    Tensor gate = fused.slice(0, 0, half);
+                    Tensor up   = fused.slice(0, half, half);
+                    silu_mul(gate, up, out, stream);
+                    return;
+                }
+            }
+        }
         // surogate vendor patch (PATCHES.md #17): AllowA8 large-T prefill runs
         // the W8A8-int IMMA path; decode and small T stay on the A16 kernels.
         if (policy == LinearPolicy::AllowA8 && t >= detail::kW8A8MinTokens) {

@@ -1017,6 +1017,7 @@ add_library(ninfer_ops STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/linear/marlin/marlin_gemm.cu
   ${SERVE_ROOT}/ops/linear/marlin/marlin_kernels_generated.cu
   ${SERVE_ROOT}/ops/linear/marlin/marlin_repack.cu
+  ${SERVE_ROOT}/ops/linear/marlin/marlin_plane.cu
   ${SERVE_ROOT}/ops/linear/w8/w8_small_t.cu
   ${SERVE_ROOT}/ops/linear/w8/w8_rowsplit_gemm_splitk.cu
   ${SERVE_ROOT}/ops/linear/w8/w8_dispatch.cpp

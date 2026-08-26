@@ -1,3 +1,4 @@
+#include "ops/linear/marlin/marlin_plane.h"
 #include "api/ops/linear.h"
 
 #include "ops/linear/bf16/bf16_config.h"
@@ -88,6 +89,13 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
         detail::q6_dispatch(x, w, out, policy, stream);
         return;
     case QType::W8G32_F16S:
+        // Marlin band (PATCHES.md #33): the vocab head and any plain W8 GEMM
+        // in the batch band run the vendored kernel straight into `out`
+        // (its row-major [T,N] result is this column-major [N,T] buffer).
+        if (x.ne[1] >= detail::kMarlinMinBandTokens && x.ne[1] <= detail::kMarlinMaxBandTokens &&
+            detail::marlin_w8_run(x, w, out, stream)) {
+            return;
+        }
         detail::w8_dispatch(x, w, out, policy, stream);
         return;
     case QType::BF16_CTRL:
