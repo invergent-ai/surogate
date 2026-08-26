@@ -352,6 +352,38 @@ MarlinPlane marlin_fp8_plane_for(const Weight& weight, cudaStream_t stream) {
 //
 // Never adopts during capture — it allocates and synchronizes — so adoption
 // happens on the warmup pass, before any graph is recorded.
+// Dedicated staging for the fused parent an adopted weight produces.
+//
+// This buffer does not belong in the workspace arena. Its size depends on the
+// widest call a target makes, the arena is planned per phase, and threading a
+// conditional reservation through every phase that might see an adopted weight
+// is both invasive and easy to get wrong — the first attempt was short by
+// exactly one buffer and surfaced as an arena exhaustion during warmup. It is
+// scratch with the same lifetime as the Marlin scratch beside it, so it lives
+// there instead, and grows on demand before capture.
+void* g_fused_parent            = nullptr;
+std::size_t g_fused_parent_bytes = 0;
+
+void* marlin_fused_parent(std::size_t bytes, cudaStream_t stream) {
+    if (bytes == 0) { return nullptr; }
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_fused_parent != nullptr && bytes <= g_fused_parent_bytes) { return g_fused_parent; }
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    (void)cudaStreamIsCapturing(stream, &status);
+    if (status != cudaStreamCaptureStatusNone) { return nullptr; }
+    void* grown = nullptr;
+    if (cudaMalloc(&grown, bytes) != cudaSuccess) { return nullptr; }
+    if (g_fused_parent != nullptr) {
+        cudaStreamSynchronize(stream);
+        cudaFree(g_fused_parent);
+        g_bytes -= g_fused_parent_bytes;
+    }
+    g_fused_parent       = grown;
+    g_fused_parent_bytes = bytes;
+    g_bytes += bytes;
+    return g_fused_parent;
+}
+
 std::size_t marlin_fused_parent_bytes(std::int32_t parent_rows, std::int32_t columns) noexcept {
     static const bool adopt_opt_in = [] {
         const char* env = std::getenv("SUROGATE_SERVE_MARLIN_FP8");
@@ -445,7 +477,15 @@ MarlinScratch marlin_fp8_scratch_for(const Weight& weight, cudaStream_t stream) 
 bool marlin_fp8_run(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     const std::int32_t t = x.ne[1];
     if (t < 1) { return false; }
-    if (t > marlin_fixed_m()) {
+    // An adopted weight (PATCHES.md #60) always takes the exact-M path. Padding
+    // M up to the band exists so that a captured decode graph sees a constant
+    // launch geometry, but a decode graph is captured per batch size, so the
+    // exact t is already constant within each one — and the padded form was
+    // never validated for FP8: the bench measures exact M, and enabling the
+    // padded path on the 27B produced a correct first token followed by
+    // degenerate decode. Exact M also skips the A copy.
+    const bool adopted = weight.layout == QuantLayout::MarlinTiles;
+    if (adopted || t > marlin_fixed_m()) {
         if (out.ne[0] != weight.n || out.ne[1] != t) { return false; }
         if (!x.is_contiguous() || x.ne[0] != weight.k || !out.is_contiguous()) { return false; }
         const MarlinPlane wide = marlin_fp8_plane_for(weight, stream);

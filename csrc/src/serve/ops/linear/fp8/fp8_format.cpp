@@ -35,6 +35,16 @@ std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment, const char*
 } // namespace
 
 Fp8WeightGeometry validate_fp8_weight(const Weight& weight, const char* operation) {
+    // A weight whose residency was adopted (PATCHES.md #60) holds Marlin tiles,
+    // not e4m3, and the FP8 kernels would read them as if they were — producing
+    // fluent-looking nonsense with nothing raised. Every FP8 route funnels
+    // through here, so this is the choke point that turns "some consumer was
+    // not wired to Marlin" from silent corruption into a named failure.
+    if (weight.layout == QuantLayout::MarlinTiles) {
+        throw std::invalid_argument(
+            std::string(operation) +
+            ": weight holds Marlin tiles; this route has no Marlin path and cannot read it");
+    }
     if (weight.n <= 0 || weight.k <= 0) {
         throw std::invalid_argument(std::string(operation) + ": FP8 shape must be positive");
     }

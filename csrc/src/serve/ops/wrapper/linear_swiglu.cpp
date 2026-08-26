@@ -69,7 +69,15 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
         return detail::nvfp4_linear_swiglu_workspace_capacity_bytes(policy, min_tokens, max_tokens);
     }
     if (qtype == QType::FP8_E4M3FN_ROW_BF16S && gate_up_rows == 34816 && input_rows == 5120) {
-        return detail::fp8_linear_swiglu_workspace_capacity_bytes(policy, min_tokens, max_tokens);
+        // A weight with adopted Marlin residency (PATCHES.md #60) is served by
+        // Marlin at every T, and above the decode band Marlin writes the fused
+        // [gate_up_rows, T] parent into the workspace rather than the fixed
+        // scratch. That buffer has to be in the plan: it is ~70 MB at prefill
+        // width for the 27B, and a workspace that is short of it throws
+        // std::bad_alloc during warmup rather than falling back, because an
+        // adopted weight has no fallback.
+        return detail::fp8_linear_swiglu_workspace_capacity_bytes(policy, min_tokens, max_tokens) +
+               detail::marlin_fused_parent_bytes(gate_up_rows, max_tokens);
     }
     throw std::invalid_argument("linear_swiglu workspace: unsupported weight format");
 }
@@ -140,9 +148,16 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
         if (gate_up_weight.layout == QuantLayout::MarlinTiles) {
             const detail::MarlinScratch adopted =
                 detail::marlin_fp8_scratch_for(gate_up_weight, stream);
-            Tensor fused = adopted.gemm_out != nullptr && t <= detail::marlin_fixed_m()
-                               ? Tensor(adopted.gemm_out, DType::BF16, {gate_up_weight.n, t})
-                               : ws.alloc(DType::BF16, {gate_up_weight.n, t});
+            void* wide = adopted.gemm_out != nullptr && t <= detail::marlin_fixed_m()
+                             ? adopted.gemm_out
+                             : detail::marlin_fused_parent(
+                                   static_cast<std::size_t>(gate_up_weight.n) *
+                                       static_cast<std::size_t>(t) * 2,
+                                   stream);
+            if (wide == nullptr) {
+                throw std::invalid_argument("linear_swiglu: no staging for a Marlin-tile weight");
+            }
+            Tensor fused(wide, DType::BF16, {gate_up_weight.n, t});
             if (!detail::marlin_fp8_run(x, gate_up_weight, fused, stream)) {
                 throw std::invalid_argument(
                     "linear_swiglu: weight holds Marlin tiles but Marlin declined");

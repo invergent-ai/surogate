@@ -145,8 +145,12 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
         if (!supported || (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8)) {
             throw std::invalid_argument("linear_add workspace: unsupported FP8 profile");
         }
+        // Adopted Marlin residency (PATCHES.md #60) writes the [output_rows, T]
+        // product into the workspace above the decode band, and an adopted
+        // weight cannot fall back, so the plan must carry it.
         return detail::fp8_linear_add_workspace_capacity_bytes(output_rows, input_rows, policy,
-                                                               min_tokens, max_tokens);
+                                                               min_tokens, max_tokens) +
+               detail::marlin_fused_parent_bytes(output_rows, max_tokens);
     }
     throw std::invalid_argument("linear_add workspace: unsupported weight format");
 }
@@ -289,9 +293,15 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         // than fall through to the e4m3 kernels, which would misread the tiles.
         if (w.layout == QuantLayout::MarlinTiles) {
             const detail::MarlinScratch adopted = detail::marlin_fp8_scratch_for(w, stream);
-            Tensor gemm_out = adopted.gemm_out != nullptr && t <= detail::marlin_fixed_m()
-                                  ? Tensor(adopted.gemm_out, DType::BF16, {w.n, t})
-                                  : ws.alloc(DType::BF16, {w.n, t});
+            void* wide = adopted.gemm_out != nullptr && t <= detail::marlin_fixed_m()
+                             ? adopted.gemm_out
+                             : detail::marlin_fused_parent(
+                                   static_cast<std::size_t>(w.n) * static_cast<std::size_t>(t) * 2,
+                                   stream);
+            if (wide == nullptr) {
+                throw std::invalid_argument("linear_add: no staging for a Marlin-tile weight");
+            }
+            Tensor gemm_out(wide, DType::BF16, {w.n, t});
             if (!detail::marlin_fp8_run(x, w, gemm_out, stream)) {
                 throw std::invalid_argument(
                     "linear_add: weight holds Marlin tiles but Marlin declined the call");

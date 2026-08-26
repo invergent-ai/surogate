@@ -51,6 +51,11 @@ bool marlin_fp8_maybe_adopt(const Weight& weight, cudaStream_t stream);
 // the reservation on builds that will never use it.
 std::size_t marlin_fused_parent_bytes(std::int32_t parent_rows, std::int32_t columns) noexcept;
 
+// Growable staging for the fused parent an adopted weight produces. Returns
+// nullptr during capture or on allocation failure; callers of an adopted weight
+// must treat that as an error, since such a weight has no fallback route.
+void* marlin_fused_parent(std::size_t bytes, cudaStream_t stream);
+
 struct MarlinScratch {
     void* gemm_out = nullptr;  // bf16 [kMarlinFixedM, n] row-major
     void* a_pad    = nullptr;  // bf16 [kMarlinFixedM, k], pad rows zeroed

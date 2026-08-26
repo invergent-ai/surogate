@@ -2125,3 +2125,59 @@ Worth recording plainly: all three failures were named errors at startup.
 The same code without QuantLayout::MarlinTiles (#59) produced garbage
 tokens and raised nothing at all. The tag is doing precisely what it was
 added to do, even while the feature it guards is unfinished.
+
+## 62. Marlin residency finished, measured, and NOT enabled (2026-08-26)
+
+The mechanism is complete and correct; the measurement says do not turn it on.
+
+Completed since #61:
+
+  The arena now names its own exhaustion — request, offset, capacity, and how
+  short it fell — instead of throwing a bare std::bad_alloc. That is what
+  turned the blocking failure into a five-minute fix, after it had cost a
+  debugging cycle as an anonymous exception.
+
+  The fused parent an adopted weight produces gets dedicated growable scratch
+  rather than a workspace reservation. Its size depends on the widest call a
+  target makes, the arena is planned per phase, and threading a conditional
+  reservation through every phase that could see an adopted weight was both
+  invasive and wrong on the first attempt.
+
+  validate_fp8_weight rejects QuantLayout::MarlinTiles. Every FP8 route funnels
+  through it, so an unwired consumer is now a named error rather than fluent
+  nonsense.
+
+  Adopted weights take the exact-M Marlin path. Padding M to the band exists so
+  a captured decode graph sees constant geometry, but decode graphs are captured
+  per batch size, so t is already constant within each.
+
+Measured on the 27B, 100 users, 90-second runs:
+
+  adoption off (default)                 581 tok/s
+  adoption on, linear_add + swiglu       547 tok/s   -6%
+
+**The isolated probe did not translate.** Marlin FP8 is 2.4-2.75x on these
+shapes in the bench (#59) and a net LOSS in the serving loop. That is the
+caveat this work was gated on — "the 2.4-2.7x is measured on isolated shapes,
+not in the serving loop; probe one shape end-to-end before building the full
+converter path" — and the probe was run at the wrong altitude: a kernel
+benchmark, not a serving measurement. The gap is not explained yet. Candidates
+are the exact-M path forgoing whatever the padded band buys in the round, the
+fused staging adding a copy the e4m3 route does not pay, and Marlin's advantage
+at T=17-18 evaporating once it is one op among many rather than the only thing
+running.
+
+Adoption on the two fused projections is additionally still WRONG: it produces
+a correct first token and then degenerate decode, isolated by bisect to the
+parent-split rather than to adoption itself. It is behind its own switch
+(SUROGATE_SERVE_MARLIN_FP8_FUSED) and stays off.
+
+Default path re-verified unchanged at 581 tok/s, zero errors. Both switches
+default off, so none of this is live.
+
+What this cost and what it bought: the residency mechanism, the layout tag that
+makes misreads unrepresentable, an arena that explains itself, and a measured
+answer that the 27B's remaining gap is not closed by this route. The FP8-class
+GEMMs are still 47% of its device time at half their achievable bandwidth; the
+reason Marlin does not capture that in situ is the next question, and it is a
+profiling question rather than an implementation one.

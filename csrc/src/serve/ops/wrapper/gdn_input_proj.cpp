@@ -353,13 +353,18 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
         // Adopted residency (PATCHES.md #60): Marlin is the only route that can
         // read this weight's bytes, so it must serve every T and a decline is a
         // hard error. The fused parent is produced whole and split afterwards.
-        (void)detail::marlin_fp8_maybe_adopt(weight, stream);
+        // Bisect switch: the fused projections split Marlin's parent themselves,
+        // so they are the newest and least proven part of adoption.
+        static const bool kFusedAdopt = std::getenv("SUROGATE_SERVE_MARLIN_FP8_FUSED") != nullptr;
+        if (kFusedAdopt) { (void)detail::marlin_fp8_maybe_adopt(weight, stream); }
         if (weight.layout == QuantLayout::MarlinTiles) {
-            if (workspace == nullptr) {
+            void* staging = detail::marlin_fused_parent(
+                static_cast<std::size_t>(kRows) * static_cast<std::size_t>(cols) * 2, stream);
+            if (staging == nullptr) {
                 throw std::invalid_argument(
-                    "fp8 gdn_input_proj: Marlin-tile weight needs a workspace");
+                    "fp8 gdn_input_proj: Marlin-tile weight has no fused staging");
             }
-            Tensor parent = workspace->alloc(DType::BF16, {kRows, cols});
+            Tensor parent(staging, DType::BF16, {kRows, cols});
             if (!detail::marlin_fp8_run(x, weight, parent, stream)) {
                 throw std::invalid_argument(
                     "fp8 gdn_input_proj: weight holds Marlin tiles but Marlin declined");
