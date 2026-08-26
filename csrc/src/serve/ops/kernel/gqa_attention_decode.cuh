@@ -19,7 +19,7 @@
 
 namespace ninfer::ops {
 
-inline constexpr int kGqaHeadDim = 256;
+// Head dimension now lives on the geometry (see gqa_attention_geometry.cuh).
 
 struct GqaAppendInput {
     static constexpr bool writes_cache = true;
@@ -34,13 +34,13 @@ struct GqaCachedInput {
 template <typename Geometry>
 __device__ __forceinline__ std::int64_t gqa_cache_index(int physical_page, int kv_head, int d,
                                                         int page_offset) {
-    return paged_kv_element_offset<kGqaHeadDim, Geometry::KVHeads>(physical_page, kv_head,
+    return paged_kv_element_offset<Geometry::HeadDim, Geometry::KVHeads>(physical_page, kv_head,
                                                                    page_offset, d);
 }
 
 template <typename Geometry>
 __device__ __forceinline__ std::int64_t gqa_q_index(int q_head, int d, int token = 0) {
-    return static_cast<std::int64_t>(d) + static_cast<std::int64_t>(kGqaHeadDim) *
+    return static_cast<std::int64_t>(d) + static_cast<std::int64_t>(Geometry::HeadDim) *
                                               (static_cast<std::int64_t>(q_head) +
                                                static_cast<std::int64_t>(Geometry::QHeads) * token);
 }
@@ -48,7 +48,7 @@ __device__ __forceinline__ std::int64_t gqa_q_index(int q_head, int d, int token
 template <typename Geometry>
 __device__ __forceinline__ std::int64_t gqa_kv_new_index(int kv_head, int d, int token = 0) {
     return static_cast<std::int64_t>(d) +
-           static_cast<std::int64_t>(kGqaHeadDim) *
+           static_cast<std::int64_t>(Geometry::HeadDim) *
                (static_cast<std::int64_t>(kv_head) +
                 static_cast<std::int64_t>(Geometry::KVHeads) * token);
 }
@@ -57,7 +57,7 @@ template <typename Geometry>
 __device__ __forceinline__ std::int64_t gqa_partial_acc_index(int q_head, int d, int token,
                                                               int split, int tokens) {
     return static_cast<std::int64_t>(d) +
-           static_cast<std::int64_t>(kGqaHeadDim) *
+           static_cast<std::int64_t>(Geometry::HeadDim) *
                (static_cast<std::int64_t>(q_head) +
                 static_cast<std::int64_t>(Geometry::QHeads) *
                     (static_cast<std::int64_t>(token) + static_cast<std::int64_t>(tokens) * split));
@@ -148,7 +148,7 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
     const std::int32_t* positions, const std::int32_t* valid_columns, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t batch_size,
     std::int32_t split_count, __nv_bfloat16* out) {
-    static_assert(DChunk > 0 && DChunk <= kGqaHeadDim);
+    static_assert(DChunk > 0 && DChunk <= Geometry::HeadDim);
 
     const int q_head      = static_cast<int>(blockIdx.x);
     const int d_start     = static_cast<int>(blockIdx.y) * DChunk;
@@ -173,7 +173,7 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
     if constexpr (MultiBatch) { output_column += batch * full_width; }
 
     if constexpr (MultiBatch) {
-        const std::int64_t partial_acc_row = static_cast<std::int64_t>(batch) * kGqaHeadDim *
+        const std::int64_t partial_acc_row = static_cast<std::int64_t>(batch) * Geometry::HeadDim *
                                              Geometry::QHeads * tokens * split_count;
         const std::int64_t partial_stat_row =
             static_cast<std::int64_t>(batch) * Geometry::QHeads * tokens * split_count;
@@ -205,7 +205,7 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
 
     if (head_m == -CUDART_INF_F) {
         const int d = d_start + tid;
-        if (tid < DChunk && d < kGqaHeadDim) {
+        if (tid < DChunk && d < Geometry::HeadDim) {
             out[gqa_q_index<Geometry>(q_head, d, output_column)] = __float2bfloat16(0.0f);
         }
         return;
@@ -232,7 +232,7 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
     const float head_l = reduce[0];
 
     const int d = d_start + tid;
-    if (tid >= DChunk || d >= kGqaHeadDim) { return; }
+    if (tid >= DChunk || d >= Geometry::HeadDim) { return; }
 
     float numerator = 0.0f;
     if (head_l > 0.0f) {

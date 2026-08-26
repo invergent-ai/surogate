@@ -29,7 +29,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     constexpr int Wc      = WarpsPerCta;
     constexpr int Br      = Wc * 16;
     constexpr int Bc      = 32;
-    constexpr int D       = kGqaHeadDim;
+    constexpr int D       = Geometry::HeadDim;
     constexpr int Threads = Wc * 32;
     constexpr int QKNt    = Bc / 8;
     constexpr int QKKs    = D / 16;
@@ -65,17 +65,17 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
 
     std::int64_t column_base = column_begin;
     if constexpr (MultiBatch) { column_base += static_cast<std::int64_t>(batch) * full_width; }
-    q += static_cast<std::int64_t>(kGqaHeadDim) * Geometry::QHeads * column_base;
+    q += static_cast<std::int64_t>(Geometry::HeadDim) * Geometry::QHeads * column_base;
     pos += column_base;
     if constexpr (CacheInput::writes_cache) {
-        input.k += static_cast<std::int64_t>(kGqaHeadDim) * Geometry::KVHeads * column_base;
-        input.v += static_cast<std::int64_t>(kGqaHeadDim) * Geometry::KVHeads * column_base;
+        input.k += static_cast<std::int64_t>(Geometry::HeadDim) * Geometry::KVHeads * column_base;
+        input.v += static_cast<std::int64_t>(Geometry::HeadDim) * Geometry::KVHeads * column_base;
     }
     const int table_row = table_rows == nullptr ? 0 : table_rows[batch];
     const std::int32_t* block_table =
         block_tables + static_cast<std::int64_t>(table_row) * table_stride;
     if constexpr (MultiBatch) {
-        partial_acc += static_cast<std::int64_t>(batch) * kGqaHeadDim * Geometry::QHeads * tokens *
+        partial_acc += static_cast<std::int64_t>(batch) * Geometry::HeadDim * Geometry::QHeads * tokens *
                        split_count;
         partial_m += static_cast<std::int64_t>(batch) * Geometry::QHeads * tokens * split_count;
         partial_l += static_cast<std::int64_t>(batch) * Geometry::QHeads * tokens * split_count;

@@ -124,7 +124,7 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
     auto launch = [&]<int WarpsPerCta, int MinBlocksPerSm, int KeyBlock, bool DynamicArena>() {
         const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
         constexpr std::size_t kDynamicBytes =
-            DynamicArena ? static_cast<std::size_t>(4 * KeyBlock * kGqaHeadDim) : 0u;
+            DynamicArena ? static_cast<std::size_t>(4 * KeyBlock * Geometry::HeadDim) : 0u;
         if constexpr (DynamicArena) {
             static const cudaError_t attr = cudaFuncSetAttribute(
                 gqa_attention_decode_i8_tiled_kernel<Geometry, TokenTile, WarpsPerCta,
@@ -336,7 +336,7 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
 
     constexpr int kReduceBlock = 256;
     constexpr int kDChunk      = 64;
-    const dim3 reduce_grid(Geometry::QHeads, div_up(kGqaHeadDim, kDChunk),
+    const dim3 reduce_grid(Geometry::QHeads, div_up(Geometry::HeadDim, kDChunk),
                            invocation.width * invocation.batch_size);
     const auto launch_reduce = [&]<bool Int8, bool MultiBatch, bool Masked, bool Offset>() {
         gqa_attention_small_t_reduce_output_kernel<Geometry, kDChunk, Int8, MultiBatch, Masked,

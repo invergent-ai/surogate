@@ -1803,3 +1803,33 @@ Confirmed on the default configuration with no environment flags: 0.8B
 6,051 tok/s over 90 s, 4,406 requests, zero errors, zero fatals. The
 env-flag measurement was 6,076, so the flip reproduces it. Every engine
 row on the board is now what `surogate serve` does out of the box.
+
+## 54. Head dimension becomes a shape parameter (2026-08-26)
+
+First landing of the multi-architecture plan (design/serve-engine-multiarch.md).
+
+`kGqaHeadDim = 256` was a file-scope constant baked into every decode
+kernel and index helper, and the geometries around it were registered as
+model-named aliases — Gqa27Geometry, Gqa08Geometry, Gqa4BGeometry. That
+is a hard stop at the first architecture with a different head dimension,
+which is all of Gemma, GLM and Kimi.
+
+Head dimension is now a template parameter on GqaGeometry, threaded
+through the decode kernels, the index helpers and the launcher, and the
+registration table names shapes rather than checkpoints:
+
+    Gqa256_24q4   Gqa256_16q2   Gqa256_8q2   Gqa256_16q4
+
+with the checkpoints that use each recorded in a comment. The model-named
+aliases remain as compatibility typedefs and disappear as the remaining
+dispatchers convert. Adding an architecture whose shape is already
+registered is now a config change; adding a new shape is one line, and an
+unregistered combination fails the build rather than degrading at runtime.
+
+Behaviour-neutral, as intended: 0.8B 6,022 tok/s over 90 s, zero errors,
+against 6,051 and 6,076 on the two preceding builds.
+
+Still to do on this item: KV dtype is a shape property in the design but
+remains a parallel code path (separate bf16 and i8 kernel headers selected
+at runtime), and the fused flash decode kernel itself is not started —
+the geometry work is its precondition, not the kernel.
