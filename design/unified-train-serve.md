@@ -232,3 +232,26 @@ The 2B keeps more literals than its siblings because more of its quantities
 coincide: hidden and query_size are both 2048, intermediate and
 convolution_dim both 6144. Every remaining literal there is one the tool
 refused rather than guessed, which is the intended behaviour.
+
+### Weight shapes by name — the form that actually closes it
+
+Value-based substitution cannot resolve a literal whose value coincides with
+another quantity, and positional rules cannot tell rows from columns without
+knowing which weight is being bound. The artifact names every weight, and a name
+fixes both dimensions exactly: "mlp/down" is hidden rows by intermediate
+columns, whatever those equal for a given model.
+
+`weight_shapes.py` rewrites shapes by name and closes the residue:
+
+  qwen3_5_0_8b vs qwen3_5_4b   218 differing lines -> 30 (14 beyond the name)
+  qwen3_5_0_8b vs qwen3_5_2b                        -> 34 (18)
+  qwen3_5_2b   vs qwen3_5_4b                        -> 36 (20)
+
+Verified value-preserving the only way that counts: all 29 named weights in each
+of the three targets were compared against their pre-refactor literals — 87
+shapes, zero mismatches. A shape table keyed by name is also the form the
+generator should emit from, so this pass is a step toward emission rather than a
+detour around it.
+
+Regression after the whole series, 100 users, 90 seconds, coherent at
+temperature 0: 0.8B 6,692 tok/s, 4B 3,032 tok/s, both zero errors.

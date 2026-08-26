@@ -234,7 +234,7 @@ void bind_groupwise_text_layers(artifact::Binder& binder, BindingPlan& out) {
             target.attention.key_norm = artifact::bind_device_tensor(
                 binder, prefix + "attention/key_norm", NumericFormat::BF16, {TextConfig::head_dim});
             target.attention.output = bind_weight(binder, prefix + "attention/output",
-                                                  NumericFormat::W8G32_F16S, {TextConfig::query_size, TextConfig::query_size});
+                                                  NumericFormat::W8G32_F16S, {TextConfig::hidden, TextConfig::query_size});
         } else {
             target.gdn.a_log       = artifact::bind_device_tensor(binder, prefix + "gdn/a_log",
                                                                   NumericFormat::FP32, {TextConfig::gdn_value_heads});
@@ -256,14 +256,14 @@ void bind_groupwise_text_layers(artifact::Binder& binder, BindingPlan& out) {
             target.gdn.norm = artifact::bind_device_tensor(binder, prefix + "gdn/norm",
                                                            NumericFormat::BF16, {TextConfig::gdn_key_head_dim});
             target.gdn.output =
-                bind_weight(binder, prefix + "gdn/output", NumericFormat::W8G32_F16S, {2048, TextConfig::hidden});
+                bind_weight(binder, prefix + "gdn/output", NumericFormat::W8G32_F16S, {TextConfig::hidden, TextConfig::value_dim});
         }
         target.post_attention_norm = artifact::bind_device_tensor(
             binder, prefix + "post_attention_norm", NumericFormat::BF16, {TextConfig::hidden});
         target.mlp.gate_up =
             bind_weight(binder, prefix + "mlp/gate_up", NumericFormat::W8G32_F16S, {2 * TextConfig::intermediate, TextConfig::hidden});
         target.mlp.down =
-            bind_weight(binder, prefix + "mlp/down", NumericFormat::W8G32_F16S, {2048, TextConfig::intermediate});
+            bind_weight(binder, prefix + "mlp/down", NumericFormat::W8G32_F16S, {TextConfig::hidden, TextConfig::intermediate});
     }
 }
 
@@ -281,7 +281,7 @@ void bind_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out) {
                                     NumericFormat::BF16, {TextConfig::mtp_attention_input_rows, TextConfig::hidden});
             } else {
                 input = bind_nvfp4_weight(
-                    binder, prefix + "attention/query_key_gate_value", TextConfig::mtp_attention_input_rows, 2048,
+                    binder, prefix + "attention/query_key_gate_value", TextConfig::mtp_attention_input_rows, TextConfig::hidden,
                     prefix + "attention/input_projection/input_scale_divisor");
             }
             target.attention.projection =
@@ -292,10 +292,10 @@ void bind_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out) {
                 binder, prefix + "attention/key_norm", NumericFormat::BF16, {TextConfig::head_dim});
             if (is_bf16_attention_output(layer)) {
                 target.attention.output = bind_weight(binder, prefix + "attention/output",
-                                                      NumericFormat::BF16, {TextConfig::query_size, TextConfig::query_size});
+                                                      NumericFormat::BF16, {TextConfig::hidden, TextConfig::query_size});
             } else {
                 target.attention.output =
-                    bind_nvfp4_weight(binder, prefix + "attention/output", TextConfig::query_size, TextConfig::query_size,
+                    bind_nvfp4_weight(binder, prefix + "attention/output", TextConfig::hidden, TextConfig::query_size,
                                       prefix + "attention/output_projection/input_scale_divisor");
             }
         } else {
@@ -313,26 +313,26 @@ void bind_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out) {
             };
             target.gdn.input_projection = FusedGdnInputProjectionPlan{
                 .query_key_value_z =
-                    bind_nvfp4_weight(binder, prefix + "gdn/query_key_value_z", TextConfig::convolution_dim + TextConfig::value_dim, 2048,
+                    bind_nvfp4_weight(binder, prefix + "gdn/query_key_value_z", TextConfig::convolution_dim + TextConfig::value_dim, TextConfig::hidden,
                                       prefix + "gdn/input_projection/input_scale_divisor"),
             };
             target.gdn.norm = artifact::bind_device_tensor(binder, prefix + "gdn/norm",
                                                            NumericFormat::BF16, {TextConfig::gdn_key_head_dim});
             if (is_bf16_gdn_output(layer)) {
                 target.gdn.output =
-                    bind_weight(binder, prefix + "gdn/output", NumericFormat::BF16, {2048, TextConfig::hidden});
+                    bind_weight(binder, prefix + "gdn/output", NumericFormat::BF16, {TextConfig::hidden, TextConfig::value_dim});
             } else {
                 target.gdn.output =
-                    bind_nvfp4_weight(binder, prefix + "gdn/output", 2048, 2048,
+                    bind_nvfp4_weight(binder, prefix + "gdn/output", TextConfig::hidden, TextConfig::value_dim,
                                       prefix + "gdn/output_projection/input_scale_divisor");
             }
         }
         target.post_attention_norm = artifact::bind_device_tensor(
             binder, prefix + "post_attention_norm", NumericFormat::BF16, {TextConfig::hidden});
         target.mlp.gate_up =
-            bind_nvfp4_weight(binder, prefix + "mlp/gate_up", 2 * TextConfig::intermediate, 2048,
+            bind_nvfp4_weight(binder, prefix + "mlp/gate_up", 2 * TextConfig::intermediate, TextConfig::hidden,
                               prefix + "mlp/gate_up_projection/input_scale_divisor");
-        target.mlp.down = bind_nvfp4_weight(binder, prefix + "mlp/down", 2048, TextConfig::intermediate,
+        target.mlp.down = bind_nvfp4_weight(binder, prefix + "mlp/down", TextConfig::hidden, TextConfig::intermediate,
                                             prefix + "mlp/down_projection/input_scale_divisor");
     }
 }
@@ -355,7 +355,7 @@ void bind_qwen38_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out) {
             target.attention.key_norm = artifact::bind_device_tensor(
                 binder, prefix + "attention/key_norm", NumericFormat::BF16, {TextConfig::head_dim});
             target.attention.output =
-                bind_weight(binder, prefix + "attention/output", kFp8, {TextConfig::query_size, TextConfig::query_size});
+                bind_weight(binder, prefix + "attention/output", kFp8, {TextConfig::hidden, TextConfig::query_size});
         } else {
             target.gdn.a_log       = artifact::bind_device_tensor(binder, prefix + "gdn/a_log",
                                                                   NumericFormat::FP32, {TextConfig::gdn_value_heads});
@@ -373,19 +373,19 @@ void bind_qwen38_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out) {
             };
             target.gdn.norm   = artifact::bind_device_tensor(binder, prefix + "gdn/norm",
                                                              NumericFormat::BF16, {TextConfig::gdn_key_head_dim});
-            target.gdn.output = bind_weight(binder, prefix + "gdn/output", kFp8, {2048, TextConfig::hidden});
+            target.gdn.output = bind_weight(binder, prefix + "gdn/output", kFp8, {TextConfig::hidden, TextConfig::value_dim});
         }
         target.post_attention_norm = artifact::bind_device_tensor(
             binder, prefix + "post_attention_norm", NumericFormat::BF16, {TextConfig::hidden});
         if (layer < 56) {
             target.mlp.gate_up =
-                bind_nvfp4_weight(binder, prefix + "mlp/gate_up", 2 * TextConfig::intermediate, 2048,
+                bind_nvfp4_weight(binder, prefix + "mlp/gate_up", 2 * TextConfig::intermediate, TextConfig::hidden,
                                   prefix + "mlp/gate_up_projection/input_scale_divisor");
-            target.mlp.down = bind_nvfp4_weight(binder, prefix + "mlp/down", 2048, TextConfig::intermediate,
+            target.mlp.down = bind_nvfp4_weight(binder, prefix + "mlp/down", TextConfig::hidden, TextConfig::intermediate,
                                                 prefix + "mlp/down_projection/input_scale_divisor");
         } else {
             target.mlp.gate_up = bind_weight(binder, prefix + "mlp/gate_up", kFp8, {2 * TextConfig::intermediate, TextConfig::hidden});
-            target.mlp.down    = bind_weight(binder, prefix + "mlp/down", kFp8, {2048, TextConfig::intermediate});
+            target.mlp.down    = bind_weight(binder, prefix + "mlp/down", kFp8, {TextConfig::hidden, TextConfig::intermediate});
         }
     }
 }
@@ -477,14 +477,14 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     out.mtp.query_norm = bind_mtp("mtp/layer/attention/query_norm", NumericFormat::BF16, {TextConfig::head_dim});
     out.mtp.key_norm   = bind_mtp("mtp/layer/attention/key_norm", NumericFormat::BF16, {TextConfig::head_dim});
     out.mtp.output =
-        bind_mtp("mtp/layer/attention/output", NumericFormat::W8G32_F16S, {TextConfig::query_size, TextConfig::query_size});
+        bind_mtp("mtp/layer/attention/output", NumericFormat::W8G32_F16S, {TextConfig::hidden, TextConfig::query_size});
     out.mtp.post_attention_norm =
         bind_mtp("mtp/layer/post_attention_norm", NumericFormat::BF16, {TextConfig::hidden});
     out.mtp.mlp.gate_up = WeightPlan{
         .object = bind_mtp("mtp/layer/mlp/gate_up", NumericFormat::W8G32_F16S, {2 * TextConfig::intermediate, TextConfig::hidden}),
         .format = NumericFormat::W8G32_F16S};
     out.mtp.mlp.down = WeightPlan{
-        .object = bind_mtp("mtp/layer/mlp/down", NumericFormat::W8G32_F16S, {2048, TextConfig::intermediate}),
+        .object = bind_mtp("mtp/layer/mlp/down", NumericFormat::W8G32_F16S, {TextConfig::hidden, TextConfig::intermediate}),
         .format = NumericFormat::W8G32_F16S};
     out.mtp.final_norm = bind_mtp("mtp/final_norm", NumericFormat::BF16, {TextConfig::hidden});
     }

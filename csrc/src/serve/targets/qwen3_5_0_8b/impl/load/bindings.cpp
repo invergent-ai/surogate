@@ -256,7 +256,7 @@ void bind_groupwise_text_layers(artifact::Binder& binder, BindingPlan& out) {
             target.gdn.norm = artifact::bind_device_tensor(binder, prefix + "gdn/norm",
                                                            NumericFormat::BF16, {TextConfig::gdn_key_head_dim});
             target.gdn.output =
-                bind_weight(binder, prefix + "gdn/output", NumericFormat::W8G32_F16S, {TextConfig::hidden, TextConfig::query_size});
+                bind_weight(binder, prefix + "gdn/output", NumericFormat::W8G32_F16S, {TextConfig::hidden, TextConfig::value_dim});
         }
         target.post_attention_norm = artifact::bind_device_tensor(
             binder, prefix + "post_attention_norm", NumericFormat::BF16, {TextConfig::hidden});
@@ -320,10 +320,10 @@ void bind_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out) {
                                                            NumericFormat::BF16, {TextConfig::gdn_key_head_dim});
             if (is_bf16_gdn_output(layer)) {
                 target.gdn.output =
-                    bind_weight(binder, prefix + "gdn/output", NumericFormat::BF16, {TextConfig::hidden, TextConfig::query_size});
+                    bind_weight(binder, prefix + "gdn/output", NumericFormat::BF16, {TextConfig::hidden, TextConfig::value_dim});
             } else {
                 target.gdn.output =
-                    bind_nvfp4_weight(binder, prefix + "gdn/output", TextConfig::hidden, TextConfig::query_size,
+                    bind_nvfp4_weight(binder, prefix + "gdn/output", TextConfig::hidden, TextConfig::value_dim,
                                       prefix + "gdn/output_projection/input_scale_divisor");
             }
         }
@@ -373,7 +373,7 @@ void bind_qwen38_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out) {
             };
             target.gdn.norm   = artifact::bind_device_tensor(binder, prefix + "gdn/norm",
                                                              NumericFormat::BF16, {TextConfig::gdn_key_head_dim});
-            target.gdn.output = bind_weight(binder, prefix + "gdn/output", kFp8, {TextConfig::hidden, TextConfig::query_size});
+            target.gdn.output = bind_weight(binder, prefix + "gdn/output", kFp8, {TextConfig::hidden, TextConfig::value_dim});
         }
         target.post_attention_norm = artifact::bind_device_tensor(
             binder, prefix + "post_attention_norm", NumericFormat::BF16, {TextConfig::hidden});
