@@ -41,7 +41,11 @@ struct MarlinScratch {
 // while the exact-T split-K kernels stay competitive at the small ones;
 // SUROGATE_SERVE_MARLIN_MIN_T overrides for sweeps.
 int marlin_min_band_tokens() noexcept;
-inline constexpr int kMarlinMaxBandTokens = 48;
+// Band ceiling. Marlin picks its kernel from thread_m_blocks =
+// min(ceil(M/16), 4), so a band spanning a 16-token boundary would put
+// different kernels in decode graphs that share a topology class and the
+// exec update rejects them. 17..32 is exactly one class (mb = 2).
+inline constexpr int kMarlinMaxBandTokens = 32;
 
 // Valid once any plane derived; null members otherwise.
 MarlinScratch marlin_scratch() noexcept;

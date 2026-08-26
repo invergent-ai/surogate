@@ -119,8 +119,16 @@ public:
                                                 std::int32_t batch_bucket) noexcept {
         return (chunk_bucket << 8) | batch_bucket;
     }
+    // Round the decode batch up to the next multiple of 8, never past the
+    // concurrency ceiling. The bucket must be >= the real row count: a bucket
+    // below it would run a graph with fewer decode columns than the round has
+    // rows and the uncovered rows would read stale egress (a silent
+    // wrong-token bug, which is what a fixed 32 cap produced once the ceiling
+    // rose above 32).
     [[nodiscard]] static std::int32_t batch_bucket_for(std::int32_t batch) noexcept {
-        return batch <= 8 ? 8 : batch <= 16 ? 16 : batch <= 24 ? 24 : 32;
+        const std::int32_t rounded = ((batch + 7) / 8) * 8;
+        const auto ceiling         = static_cast<std::int32_t>(kMaximumConcurrency);
+        return rounded < 8 ? 8 : rounded > ceiling ? ceiling : rounded;
     }
 
     DecodeGraphExecutable* ensure(std::int32_t bucket, const std::function<void()>& body) {

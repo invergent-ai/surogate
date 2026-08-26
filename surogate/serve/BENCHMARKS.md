@@ -40,7 +40,7 @@ unsloth NVFP4 export + base checkpoint by the vendored converter).
 
 | engine | weights | TTFT @1.9k | decode tok/s (1 user) | 100-user agg tok/s | 100-user TTFT p50 | 100-user reqs ok/err |
 |---|---|---:|---:|---:|---:|---:|
-| **surogate serve** | from GGUF Q4_K_M | **48 ms** | **503** | 4,892 † | 1.8 s | 2,412/0 |
+| **surogate serve** | from GGUF Q4_K_M | **48 ms** | **503** | 5,107 † | 1.7 s | 3,720/0 |
 | llama-server (CUDA) | GGUF Q4_K_M | 168 ms | 391 | 772 | 10.9 s | 612/419 |
 | vLLM | NVFP4 (4-bit) | 55 ms | 364 | **5,958** | **0.41 s** | 4,200/0 |
 
@@ -48,7 +48,7 @@ unsloth NVFP4 export + base checkpoint by the vendored converter).
 
 | engine | weights | TTFT @1.9k | decode tok/s (1 user) | 100-user agg tok/s | 100-user TTFT p50 | 100-user reqs ok/err |
 |---|---|---:|---:|---:|---:|---:|
-| **surogate serve** | from GGUF Q4_K_M | **57 ms** | **214** | **1,873** † | 4.6 s | 1,403/0 |
+| **surogate serve** | from GGUF Q4_K_M | **57 ms** | **214** | **2,118** † | 4.0 s | 1,578/0 |
 | llama-server (CUDA) | GGUF Q4_K_M | 445 ms | 190 | 331 | 27.4 s | 306/174 |
 | vLLM | NVFP4 (4-bit) | 71 ms | 166 | **3,390** | **0.24 s** | 2,400/0 |
 
@@ -56,7 +56,7 @@ unsloth NVFP4 export + base checkpoint by the vendored converter).
 
 | engine | weights | TTFT @1.9k | decode tok/s (1 user) | 100-user agg tok/s | 100-user TTFT p50 | 100-user reqs ok/err |
 |---|---|---:|---:|---:|---:|---:|
-| surogate serve | NVFP4 (4-bit resident) | 352 ms | 45 | 235 | 30.1 s | 222/0 |
+| surogate serve | NVFP4 (4-bit resident) | 352 ms | 45 | 385 | 30.1 s | 222/0 |
 | llama-server (CUDA) | GGUF Q4_K_M | 1,829 ms | **49** | 82 | 102.4 s | 135/28 |
 | vLLM | NVFP4 pack (4-bit) | **254 ms** | 45 | **688** | 12.5 s | 580/0 |
 
@@ -92,9 +92,9 @@ missing piece.
   Against the llama.cpp user profile (same GGUF in, one box, few users)
   the engine is strictly better at every size that fits.
 - **100-user throughput: vLLM still wins where it serves, but the gap
-  collapsed** († = after the PATCHES #28 batch-decode route fix, same
-  build for all engine cells): 1.2× at 0.8B (5,958 vs 4,892, was 4.7×)
-  and 1.8× at 4B (3,390 vs 1,873 at `--max-concurrency 32`, was 9.6×),
+  collapsed** († = engine cells at `--max-concurrency 32`, same build): 1.17× at
+  0.8B (5,958 vs 5,107) and 1.60× at 4B (3,390 vs 2,118); the 27B is
+  1.79× (688 vs 385).
   with the engine now 2.6–3.4×
   ahead of llama-server's tuned multi-user config. The fix: batch
   T=2..16 layer GEMMs ran prefill-class MMA tiles at ~6% utilization

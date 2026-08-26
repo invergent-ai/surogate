@@ -1092,3 +1092,39 @@ kernel from thread_m_blocks = min(ceil(M/16), 4), so batches 1..16 and
 the changed node. A floor of 17 keeps every band batch on one kernel.
 Supporting a lower floor needs per-batch topology classes for the
 Marlin nodes, not a knob change.
+
+## 35. Mixed-round batch bucket: silent truncation above 32 lanes (2026-08-26)
+
+Found while raising kMaximumConcurrency to 64 (the 100-user TTFT gap is
+queueing: 100 clients against 32 lanes gives 4.0 s at the 4B against
+vLLM's 0.24 s). The raise needs six batch-32 host mirrors lifted
+(gqa_attention workspace, GDN conv/snapshot plans, causal conv, KV
+append-prefix, masked block, SWA) and then still corrupted the token
+stream. Cause, found by inspection rather than measurement:
+`PrefillGraphFamily::batch_bucket_for` (PATCHES #31) ended in a fixed
+`: 32`, so a mixed round with more than 32 decode rows ran its graph
+with 32 decode columns while the bookkeeping read egress for every row
+— the uncovered rows committed whatever was left in the egress buffer,
+which surfaces as invalid UTF-8 in the stream.
+
+The bucket now rounds up to the next multiple of 8 and clamps to
+kMaximumConcurrency, and `advance_prefill_mixed` throws if a bucket ever
+lands below the row count, so the failure mode cannot come back silently.
+At the current ceiling of 32 the buckets are unchanged (rows 17..24 ->
+24, 25..32 -> 32), so this is a no-op today and a prerequisite for the
+raise.
+
+Also from that attempt, kept: the Marlin band ceiling drops to 32
+(PATCHES #34 carried 48). Marlin selects its kernel from
+thread_m_blocks = min(ceil(M/16), 4), so a band crossing a 16-token
+boundary puts different kernels into decode graphs that share a topology
+class and cudaGraphExecUpdate rejects them (measured:
+cudaErrorGraphExecUpdateFailure at both a lowered floor and a raised
+ceiling). 17..32 is exactly one class. Widening the band later means
+padding M to a fixed width inside the Marlin call — its cost is flat
+from M=24 to M=32, so the padding is close to free — not moving the
+bounds.
+
+Still open for the ceiling raise: with the bucket fixed, 64 lanes needs
+re-verification on hardware (the six mirrors are reverted to 32 in the
+tree so the shipped configuration stays the proven one).

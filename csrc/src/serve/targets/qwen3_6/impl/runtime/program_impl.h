@@ -2155,6 +2155,9 @@ ProgramImplCore::advance_prefill_mixed(std::uint32_t prefill_lane,
         // bucket by duplicating row 0: a pad column recomputes that lane's
         // own update, so every state/KV write lands as identical bytes.
         const std::int32_t batch_bucket = PrefillGraphFamily::batch_bucket_for(rows);
+        if (batch_bucket < rows) {
+            throw std::logic_error("mixed round bucket is smaller than the decode row count");
+        }
         for (std::int32_t row = rows; row < batch_bucket; ++row) {
             const std::size_t pad                          = static_cast<std::size_t>(row);
             ordinary_host_ingress->tokens[pad]             = ordinary_host_ingress->tokens[0];
