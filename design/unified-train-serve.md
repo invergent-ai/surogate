@@ -146,3 +146,33 @@ computed from the spec — as `emit_config.py` does for `config.h`, rather than
 patched from an existing file. The rejected attempt is retained under
 `rejected_text_template*.py` so the next person does not spend the afternoon
 rediscovering it.
+
+### What does work: de-literalising, not generating
+
+The templating failure pointed at a better design. `config.h` is already
+generated and already names every shape a target needs, so `bindings.cpp` does
+not need to be generated at all — it needs to stop restating those shapes as
+literals.
+
+`deliteralize.py` rewrites the shape literals in a target's `bindings.cpp` into
+the `TextConfig` expressions that equal them, confining substitution to the
+argument lists of the calls that carry weight shapes so that a group size or a
+vocabulary constant sharing a value with a shape is left alone. It is
+value-preserving by construction: a literal is only ever replaced by an
+expression equal to it in that target's own config, so anything ambiguous stays
+literal rather than being guessed at.
+
+Result on the two Qwen variants: **309 differing lines fall to 38**, of which 12
+are the target's own name in namespaces and includes. Both targets compile.
+
+The 26 that remain are worth reading rather than papering over, because they are
+places where the two targets genuinely disagree:
+
+    0.8b: materialized_weight(..., split->query_key, 2560, TextConfig::hidden)
+    4b:   materialized_weight(..., split->query_key, TextConfig::hidden, ...)
+
+A literal 2560 in the 0.8B, whose hidden size is 1024. Either that path is dead
+for this target or it carries a wrong constant; either way de-literalising made
+a discrepancy visible that reading 605 lines of near-identical code would not.
+Resolving those is the remaining work before `bindings.cpp` can move to the
+shared implementation and stop being copied per target.
