@@ -16,4 +16,11 @@ void marlin_repack_w8g32(const void* codes, const void* scales_f16, int n, int k
 
 std::size_t marlin_b_out_words(int n, int k);
 
+// Repack the serve FP8 residency (codes [N,K] e4m3 row-major, scales [N]
+// BF16 per output channel) into Marlin B tiles plus channelwise scales.
+// gptq_tmp holds (k/4)*n uint32; b_out marlin_b_out_words(n,k) uint32;
+// scales_out n bf16.
+void marlin_repack_fp8_row(const void* codes, const void* row_scales_bf16, int n, int k,
+                           void* gptq_tmp, void* b_out, void* scales_out, cudaStream_t stream);
+
 } // namespace ninfer::ops::detail

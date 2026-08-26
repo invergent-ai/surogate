@@ -315,7 +315,79 @@ __global__ void permute_scales_kernel(const __half* __restrict__ scales_f16,
     out[idx] = __float2bfloat16(value);
 }
 
+// FP8 codes carry no bias: the dequant reads the raw e4m3 byte, so packing
+// is the plain [N,K] -> [K/4, N] u32 regroup.
+__global__ void pack_fp8_to_gptq_kernel(const std::uint8_t* __restrict__ codes,
+                                        std::uint32_t* __restrict__ qweight, int n, int k) {
+    const int col  = blockIdx.x * blockDim.x + threadIdx.x;
+    const int krow = blockIdx.y * blockDim.y + threadIdx.y;
+    if (col >= n || krow >= k / 4) { return; }
+    const std::uint8_t* row = codes + static_cast<std::size_t>(col) * k + krow * 4;
+    std::uint32_t packed = 0;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) { packed |= static_cast<std::uint32_t>(row[i]) << (8 * i); }
+    qweight[static_cast<std::size_t>(krow) * n + col] = packed;
+}
+
+// Channelwise scales use the 32-wide single-group permutation, and Marlin's
+// FP8 dequant expects the exponent bias folded in: e4m3 has a 4-bit
+// exponent against BF16's 8, so the scale carries 2^(2^7 - 2^3) = 2^120.
+__constant__ int kScalePermSingle32[32];
+
+__global__ void permute_row_scales_kernel(const __nv_bfloat16* __restrict__ scales_in,
+                                          __nv_bfloat16* __restrict__ out, int n) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) { return; }
+    const int base   = idx / 32 * 32;
+    const int source = base + kScalePermSingle32[idx % 32];
+    const float value = __bfloat162float(scales_in[source]);
+    out[idx] = __float2bfloat16(value * 1.329227996e36F); // 2^120
+}
+
 } // namespace
+
+void marlin_repack_fp8_row(const void* codes, const void* row_scales_bf16, int n, int k,
+                           void* gptq_tmp, void* b_out, void* scales_out, cudaStream_t stream) {
+    if (n % MARLIN_NAMESPACE_NAME::tile_n_size != 0 ||
+        k % MARLIN_NAMESPACE_NAME::tile_k_size != 0 || (n % 32) != 0 || (k % 4) != 0) {
+        throw std::invalid_argument("marlin fp8 repack: shape is not tileable");
+    }
+    {
+        dim3 block(32, 8);
+        dim3 grid((n + 31) / 32, (k / 4 + 7) / 8);
+        pack_fp8_to_gptq_kernel<<<grid, block, 0, stream>>>(
+            static_cast<const std::uint8_t*>(codes), static_cast<std::uint32_t*>(gptq_tmp), n, k);
+    }
+    {
+        int host_perm[32];
+        int at = 0;
+        for (int i = 0; i < 4; ++i) {
+            const int lanes[8] = {0, 1, 8, 9, 16, 17, 24, 25};
+            for (int j = 0; j < 8; ++j) { host_perm[at++] = 2 * i + lanes[j]; }
+        }
+        cudaMemcpyToSymbolAsync(kScalePermSingle32, host_perm, sizeof(host_perm), 0,
+                                cudaMemcpyHostToDevice, stream);
+        const int threads = 256;
+        const int blocks  = (n + threads - 1) / threads;
+        permute_row_scales_kernel<<<blocks, threads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(row_scales_bf16),
+            static_cast<__nv_bfloat16*>(scales_out), n);
+    }
+    {
+        int device = 0;
+        cudaGetDevice(&device);
+        int sms = 0;
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
+        int max_shared_mem = 0;
+        cudaDeviceGetAttribute(&max_shared_mem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+        auto kernel = MARLIN_NAMESPACE_NAME::gptq_marlin_repack_kernel<
+            MARLIN_NAMESPACE_NAME::repack_threads, 8, false, false>;
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem);
+        kernel<<<sms, MARLIN_NAMESPACE_NAME::repack_threads, max_shared_mem, stream>>>(
+            static_cast<const std::uint32_t*>(gptq_tmp), nullptr,
+            static_cast<std::uint32_t*>(b_out), k, n);
+    }
+}
 
 void marlin_repack_w8g32(const void* codes, const void* scales_f16, int n, int k,
                          void* gptq_tmp, void* b_out, void* scales_out, cudaStream_t stream) {

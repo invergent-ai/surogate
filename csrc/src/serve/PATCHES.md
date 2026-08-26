@@ -1167,3 +1167,27 @@ range, which is what the 64-lane ceiling needs. Unmeasured: the card was
 returned to its owner before this could run. It compiles, and the
 correctness bench covers the kernel underneath it; treat the band as
 unverified until a 100-user run confirms both models.
+
+## 38. Marlin FP8 residency path (2026-08-26) — groundwork, UNMEASURED
+
+The 27B is the widest gap (385 vs vLLM's 688) and its census says why:
+FP8-class GEMMs are 47% of its device time, with the exact-T decode
+kernels (5120x6144 and 5120x17408 at T=17/18) running 412-503 GB/s
+against the 926 GB/s the A8 batch tile reaches on the same class of
+problem in the same profile.
+
+marlin_repack_fp8_row takes the serve FP8 residency (codes [N,K] e4m3
+row-major, scales [N] BF16 per output channel, the RowScale layout
+validate_fp8_weight enforces) into Marlin B tiles plus channelwise
+scales: the pack is the plain [N,K] -> [K/4,N] regroup with no bias
+(FP8 dequant reads the raw byte), the scales take the 32-wide single
+permutation, and the exponent bias folds into them — e4m3's 4-bit
+exponent against BF16's 8 gives 2^(2^7 - 2^3) = 2^120, matching vLLM's
+fp8_fused_exponent_bias_into_scales. marlin_fp8_plane_for and
+marlin_fp8_run mirror the W8 pair through the same registry, scratch and
+fixed-M discipline, dispatching Marlin's kFE4M3fn kernels at
+group_blocks = -1 (the instantiations were generated in #33).
+
+Not wired into any family and NOT MEASURED — no GPU was available. The
+next hardware session validates it with the one-hot bench on the 27B's
+FP8 shapes before anything routes through it.

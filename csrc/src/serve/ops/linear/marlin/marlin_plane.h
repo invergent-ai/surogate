@@ -30,6 +30,13 @@ std::size_t marlin_plane_bytes() noexcept;
 
 MarlinPlane marlin_plane_for(const Weight& weight, cudaStream_t stream);
 
+// Same registry for the FP8 residency (codes [n,k] e4m3, per-channel BF16
+// scales), which Marlin serves through its kFE4M3fn kernels at
+// group_blocks = -1. The 27B's decode band lives here: its FP8 GEMMs are
+// 47% of that model's device time at 412-503 GB/s.
+MarlinPlane marlin_fp8_plane_for(const Weight& weight, cudaStream_t stream);
+bool marlin_fp8_run(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream);
+
 struct MarlinScratch {
     void* gemm_out = nullptr;  // bf16 [kMarlinFixedM, n] row-major
     void* a_pad    = nullptr;  // bf16 [kMarlinFixedM, k], pad rows zeroed

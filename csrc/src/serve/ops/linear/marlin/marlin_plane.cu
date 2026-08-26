@@ -184,6 +184,95 @@ MarlinScratch marlin_scratch_for(const Weight& weight, cudaStream_t stream) {
     return marlin_scratch();
 }
 
+MarlinPlane marlin_fp8_plane_for(const Weight& weight, cudaStream_t stream) {
+    if (!g_enabled || weight.qtype != QType::FP8_E4M3FN_ROW_BF16S ||
+        weight.layout != QuantLayout::RowScale || weight.scale_dtype != DType::BF16 ||
+        weight.qdata == nullptr || weight.scales == nullptr || (weight.k % 64) != 0 ||
+        (weight.n % 64) != 0) {
+        return {};
+    }
+
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    (void)cudaStreamIsCapturing(stream, &capture_status);
+    const bool capturing = capture_status != cudaStreamCaptureStatusNone;
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto found = g_planes.find(weight.qdata);
+    if (found != g_planes.end()) {
+        if (!capturing && found->second.ready != nullptr) {
+            cudaStreamWaitEvent(stream, found->second.ready, 0);
+        }
+        return {found->second.b_packed, found->second.scales};
+    }
+    if (capturing) { return {}; }
+
+    const int n = weight.n;
+    const int k = weight.k;
+    const std::size_t b_bytes    = marlin_b_out_words(n, k) * sizeof(std::uint32_t);
+    const std::size_t s_bytes    = static_cast<std::size_t>(n) * 2;
+    const std::size_t gptq_bytes = static_cast<std::size_t>(k / 4) * n * sizeof(std::uint32_t);
+
+    std::size_t free_bytes = 0, total_bytes = 0;
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess ||
+        free_bytes < 2 * (b_bytes + s_bytes + gptq_bytes)) {
+        return {};
+    }
+    if (!ensure_scratch(static_cast<std::size_t>(n) * kMarlinFixedM * 2,
+                        static_cast<std::size_t>(k) * kMarlinFixedM * 2, stream)) {
+        return {};
+    }
+
+    PlaneEntry entry;
+    void* gptq_tmp = nullptr;
+    if (cudaMalloc(&entry.b_packed, b_bytes) != cudaSuccess) { return {}; }
+    if (cudaMalloc(&entry.scales, s_bytes) != cudaSuccess) {
+        cudaFree(entry.b_packed);
+        return {};
+    }
+    if (cudaMalloc(&gptq_tmp, gptq_bytes) != cudaSuccess) {
+        cudaFree(entry.b_packed);
+        cudaFree(entry.scales);
+        return {};
+    }
+    marlin_repack_fp8_row(weight.qdata, weight.scales, n, k, gptq_tmp, entry.b_packed,
+                          entry.scales, stream);
+    cudaEventCreateWithFlags(&entry.ready, cudaEventDisableTiming);
+    cudaEventRecord(entry.ready, stream);
+    cudaEventSynchronize(entry.ready);
+    cudaFree(gptq_tmp);
+    g_bytes += b_bytes + s_bytes;
+    g_planes.emplace(weight.qdata, entry);
+    return {entry.b_packed, entry.scales};
+}
+
+bool marlin_fp8_run(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    const std::int32_t t = x.ne[1];
+    if (t < 1 || t > kMarlinFixedM) { return false; }
+    if (out.ne[0] != weight.n || out.ne[1] != t) { return false; }
+    const MarlinPlane plane = marlin_fp8_plane_for(weight, stream);
+    if (plane.b_packed == nullptr) { return false; }
+    const MarlinScratch scratch = marlin_scratch();
+    if (scratch.gemm_out == nullptr || scratch.a_pad == nullptr ||
+        static_cast<std::size_t>(weight.n) * kMarlinFixedM * 2 > g_scratch_out_bytes ||
+        static_cast<std::size_t>(weight.k) * kMarlinFixedM * 2 > g_scratch_a_bytes) {
+        return false;
+    }
+    const std::size_t a_used = static_cast<std::size_t>(weight.k) * t * 2;
+    if (cudaMemcpyAsync(scratch.a_pad, x.data, a_used, cudaMemcpyDeviceToDevice, stream) !=
+        cudaSuccess) {
+        return false;
+    }
+    marlin_gemm_bf16(scratch.a_pad, plane.b_packed, plane.scales, scratch.gemm_out, scratch.c_tmp,
+                     scratch.locks, kMarlinFixedM, weight.n, weight.k, /*group_size=*/-1,
+                     /*b_is_fp8=*/true, scratch.sm_count, stream);
+    if (out.data != scratch.gemm_out) {
+        const std::size_t c_used = static_cast<std::size_t>(weight.n) * t * 2;
+        CUDA_CHECK(cudaMemcpyAsync(out.data, scratch.gemm_out, c_used, cudaMemcpyDeviceToDevice,
+                                   stream));
+    }
+    return true;
+}
+
 bool marlin_w8_run(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     const std::int32_t t = x.ne[1];
     if (t < 1 || t > kMarlinFixedM) { return false; }
