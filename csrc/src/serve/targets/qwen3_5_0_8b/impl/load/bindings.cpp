@@ -172,11 +172,14 @@ DensePostMixerPayload load_mlp(const MlpPlan& plan,
 FullAttentionProjectionPayload
 load_attention_projection(const FullAttentionPlan& plan,
                           const artifact::MaterializedArtifact& materialized) {
-    if (const auto* split = std::get_if<SplitAttentionProjectionPlan>(&plan.projection)) {
-        return SplitAttentionProjectionPayload{
-            .query_key  = materialized_weight(materialized, split->query_key, 2560, TextConfig::hidden),
-            .gate_value = materialized_weight(materialized, split->gate_value, 2560, TextConfig::hidden),
-        };
+    // The split attention plan is never constructed for this target — only the
+    // 27B produces one. The branch that used to live here carried shape
+    // constants copied from a sibling target (a hidden size that was not this
+    // target's), which nothing caught because the code was unreachable. If a
+    // split plan ever does appear here, that is a binding bug and it should
+    // stop the load rather than silently materialise wrong extents.
+    if (std::holds_alternative<SplitAttentionProjectionPlan>(plan.projection)) {
+        throw std::invalid_argument("attention projection: split plans are not produced for this target");
     }
     const auto& fused = std::get<FusedAttentionProjectionPlan>(plan.projection);
     return FusedAttentionProjectionPayload{
@@ -187,11 +190,9 @@ load_attention_projection(const FullAttentionPlan& plan,
 
 GdnInputProjectionPayload
 load_gdn_input_projection(const GdnPlan& plan, const artifact::MaterializedArtifact& materialized) {
-    if (const auto* split = std::get_if<SplitGdnInputProjectionPlan>(&plan.input_projection)) {
-        return SplitGdnInputProjectionPayload{
-            .query_key = materialized_weight(materialized, split->query_key, 4096, TextConfig::hidden),
-            .value_z   = materialized_weight(materialized, split->value_z, 4096, TextConfig::hidden),
-        };
+    // Same as the attention split above: never constructed for this target.
+    if (std::holds_alternative<SplitGdnInputProjectionPlan>(plan.input_projection)) {
+        throw std::invalid_argument("gdn input projection: split plans are not produced for this target");
     }
     const auto& fused = std::get<FusedGdnInputProjectionPlan>(plan.input_projection);
     return FusedGdnInputProjectionPayload{

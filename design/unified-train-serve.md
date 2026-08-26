@@ -176,3 +176,35 @@ for this target or it carries a wrong constant; either way de-literalising made
 a discrepancy visible that reading 605 lines of near-identical code would not.
 Resolving those is the remaining work before `bindings.cpp` can move to the
 shared implementation and stop being copied per target.
+
+### Where de-literalising landed
+
+Applied across the three Qwen3.5 variants, with the tool grown to handle what
+the first pass got wrong:
+
+  qwen3_5_0_8b vs qwen3_5_4b   218 differing lines -> 34 (18 beyond the name)
+  qwen3_5_2b   vs the others   still ~120, its remaining literals ambiguous
+
+Three corrections were needed along the way, each caught by comparing against a
+second model rather than by review:
+
+  The value map was a dict literal, so two config quantities sharing a value
+  silently overwrote each other — the 2B's intermediate and convolution_dim are
+  both 6144, its hidden and query_size both 2048. Built as pairs now, so a
+  collision survives to be refused instead of being resolved at random.
+
+  Refusing ambiguous values is correct but leaves them literal. Two kinds of
+  rule resolve most of them: the call's own text (a weight named "mlp/down" has
+  intermediate columns) and the weight's identity fixing what each dimension
+  means (`plan.down` is hidden rows by intermediate columns), because rows and
+  columns cannot be told apart by value.
+
+  The dead `SplitAttentionProjectionPlan` branch, which only the 27B ever
+  constructs, carried shape constants copied from a sibling target — a hidden
+  size that was not the target's own. Unreachable code, so nothing caught it.
+  It now throws in the three Qwen3.5 targets rather than materialising wrong
+  extents if it ever becomes reachable.
+
+That last one is the argument for this whole exercise in miniature: the wrong
+constant sat in three targets, was invisible to review, and only surfaced when
+two files that should agree were made to agree.
