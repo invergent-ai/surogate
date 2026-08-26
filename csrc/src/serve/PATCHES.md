@@ -2261,3 +2261,33 @@ The general lesson is about measurement altitude, and it is the second time
 this session: a kernel benchmark answers "is this kernel faster", which is not
 the same question as "does the round get shorter". A fused incumbent can be
 slower per GEMM and still win.
+
+### #63 follow-up: the unfused projections were tried too
+
+The profile said Marlin can only pay where the incumbent has no fused epilogue,
+which points at attn_input_proj and gdn_input_proj. That was implemented — the
+stride-correct split, adoption restricted to those two ops, the fused kernels
+left on their own fp8 path — and it does not run:
+
+  kv auto, 48 lanes    cudaErrorMemoryAllocation during graph capture
+  kv 32768             same
+  kv 24576             cudaErrorGraphExecUpdateFailure
+
+The staging buffer these projections need is sized by the widest call — tens of
+megabytes at prefill width — and it is allocated during warmup, AFTER the KV
+cache has already claimed the headroom from auto-sizing. Shrinking KV clears the
+allocation failure and exposes the graph-update failure underneath, which is the
+same one the earlier attempt hit and which closing adoption before the first
+capture did not resolve.
+
+So the theoretically right target is blocked by two engine-level facts rather
+than by the kernel: staging that competes with the KV cache because it is
+claimed after it, and a graph-update path that will not accept whatever this
+route changes. Both are fixable — stage before KV sizing, and find what actually
+differs between the captured and updated topology — but neither is worth doing
+before the premise is re-established, because the premise itself is now in
+doubt: Marlin is ~6% faster per GEMM here, not 2.4-2.75x, and 6% of the GEMM
+share is a small prize to buy with this much machinery.
+
+Reverted to the committed state. The engine is unchanged and the default path
+measures 581 tok/s.
