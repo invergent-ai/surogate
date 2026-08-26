@@ -2,6 +2,7 @@
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 
 #include "api/ops/sampling.h"
+#include "api/ops/position.h"
 #include "api/ops/scatter.h"
 
 #include <stdexcept>
@@ -46,7 +47,67 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
     };
 }
 
+// Round chaining (PATCHES.md #32): the same round without the ingress H2D —
+// the frame already holds the chained tokens/positions — and with chain ops
+// at the tail: the sampled tokens become the next round's inputs and the
+// positions advance, all in stream order, so consecutive rounds replay
+// back-to-back with no host staging between them.
+auto ordinary_batch_body_chained(OrdinaryBatchContext& state, std::int32_t batch_size,
+                                 ops::GqaExecutionEnvelope envelope) {
+    return [&state, batch_size, envelope] {
+        if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumConcurrency) ||
+            state.chain_one.data == nullptr) {
+            throw std::logic_error("chained decode batch state is incomplete");
+        }
+
+        qwen3_6::OrdinaryDecodeState& ordinary = state.frame;
+        TextContext card(state.execution.device, state.execution.model, state.execution.work, {},
+                         state.execution.linear_attention, state.execution.io,
+                         state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
+                         &state.text_cache);
+
+        Tensor tokens          = ordinary.tokens.slice(0, 0, batch_size);
+        Tensor cache_positions = ordinary.cache_positions.slice(0, 0, batch_size);
+        Tensor rope_positions  = ordinary.rope_positions.slice(0, 0, batch_size);
+        Tensor kv_rows         = ordinary.text_kv_table_rows.slice(0, 0, batch_size);
+        Tensor lanes           = ordinary.lanes.slice(0, 0, batch_size);
+        Tensor hidden          = ordinary.hidden.slice(1, 0, batch_size);
+        Tensor logits          = ordinary.logits.slice(1, 0, batch_size);
+        Tensor sampled         = ordinary.sampled_tokens.slice(0, 0, batch_size);
+
+        card.ordinary_decode_batch(tokens, cache_positions, rope_positions, kv_rows, lanes,
+                                   envelope, hidden, logits);
+        ops::scatter(hidden, lanes, state.continuation_hidden_store, state.execution.device.stream);
+        ops::sample(logits, sampled, TextConfig::token_domain, ordinary.sampling, cache_positions,
+                    ops::kSamplePurposeDecode, state.execution.work, state.execution.device.stream);
+        CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, ordinary.egress.data,
+                                   sizeof(qwen3_6::OrdinaryDecodeEgress), cudaMemcpyDeviceToHost,
+                                   state.execution.device.stream));
+        CUDA_CHECK(cudaMemcpyAsync(tokens.data, sampled.data,
+                                   static_cast<std::size_t>(batch_size) * sizeof(std::int32_t),
+                                   cudaMemcpyDeviceToDevice, state.execution.device.stream));
+        ops::offset_i32_positions(cache_positions, state.chain_one, cache_positions,
+                                  state.execution.device.stream);
+        ops::offset_i32_positions(rope_positions, state.chain_one, rope_positions,
+                                  state.execution.device.stream);
+    };
+}
+
 } // namespace
+
+void capture_ordinary_decode_batch_chained(OrdinaryBatchContext& state, std::int32_t batch_size,
+                                           ops::GqaExecutionEnvelope envelope,
+                                           DecodeGraphDefinition& definition) {
+    auto body = ordinary_batch_body_chained(state, batch_size, envelope);
+    capture_graph(state, definition, body);
+}
+
+void ordinary_decode_batch_chained(OrdinaryBatchContext& state, std::int32_t batch_size,
+                                   ops::GqaExecutionEnvelope envelope,
+                                   DecodeGraphExecutable* executable) {
+    auto body = ordinary_batch_body_chained(state, batch_size, envelope);
+    run_prepared(state, executable, body);
+}
 
 void capture_ordinary_decode_batch(OrdinaryBatchContext& state, std::int32_t batch_size,
                                    ops::GqaExecutionEnvelope envelope,

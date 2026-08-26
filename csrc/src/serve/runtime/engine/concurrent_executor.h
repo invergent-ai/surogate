@@ -991,6 +991,30 @@ private:
 
     void run_decode_round(const RoundMembership& membership) {
         const std::span<const std::uint32_t> lanes = membership.lane_span();
+        // Round chaining (PATCHES.md #32): burst pure-decode stretches, but
+        // admission rides the round cadence (one attempt per GPU unit), so
+        // the burst length must yield to admission pressure: single rounds
+        // while a prefill is staged or a queued request could admit into a
+        // free lane, short bursts while the queue waits on full lanes, full
+        // bursts only when nothing is waiting.
+        std::uint32_t burst_limit = 8;
+        if (prefill_lane_) {
+            burst_limit = 1;
+        } else {
+            bool queue_waiting = false;
+            {
+                std::lock_guard lock(queue_mutex_);
+                queue_waiting = !pending_.empty();
+            }
+            if (queue_waiting) {
+                std::uint32_t free_lanes = 0;
+                for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                    free_lanes += slots_[lane] == nullptr ? 1U : 0U;
+                }
+                burst_limit = free_lanes > 0 ? 1U : 3U;
+            }
+        }
+        instance_.program->set_round_burst_limit(burst_limit);
         const BatchedGeneratedRound round =
             instance_.program->decode_batch(lanes, membership.budget_span());
         process_decode_round(membership, round);
@@ -1032,6 +1056,7 @@ private:
             throw std::logic_error("decode batch returned an invalid ragged layout");
         }
 
+        const auto t_preview = Clock::now();
         std::array<std::uint32_t, kMaximumConcurrency> accepted{};
         std::array<std::uint8_t, kMaximumConcurrency> terminal{};
         std::array<FinishReason, kMaximumConcurrency> finish_reasons{};
@@ -1063,11 +1088,15 @@ private:
             finish_reasons[row] = decision.finish_reason;
         }
 
+        seg_timer_.preview += std::chrono::duration<double>(Clock::now() - t_preview).count();
+        const auto t_resolve = Clock::now();
         instance_.program->resolve_pending_batch(
             lanes, std::span<const std::uint32_t>(accepted.data(), lanes.size()),
             std::span<const std::uint8_t>(terminal.data(), lanes.size()),
             std::span<const std::uint8_t>(cancelled.data(), lanes.size()));
+        seg_timer_.resolve += std::chrono::duration<double>(Clock::now() - t_resolve).count();
 
+        const auto t_append = Clock::now();
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             const std::uint32_t lane = lanes[row];
             const auto& request      = slots_[lane];
@@ -1089,11 +1118,14 @@ private:
                 remove_completed_slot(lane);
             }
         }
+        seg_timer_.append += std::chrono::duration<double>(Clock::now() - t_append).count();
         cumulative_stats_.decode_row_rounds += lanes.size();
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             if (!cancelled[row]) { cumulative_stats_.committed_decode_tokens += accepted[row]; }
         }
+        const auto t_stats = Clock::now();
         publish_runtime_stats();
+        seg_timer_.stats += std::chrono::duration<double>(Clock::now() - t_stats).count();
     }
 
     void fail_all(std::exception_ptr error) noexcept {
@@ -1144,16 +1176,25 @@ private:
 
             try {
                 std::scoped_lock execution_lock(execution_mutex_);
+                const auto seg_t0                = Clock::now();
                 const bool have_pending          = expire_pending_requests();
                 const auto cancelled_at_boundary = snapshot_cancellations();
                 cancel_active_requests(cancelled_at_boundary);
                 const RoundMembership membership = build_round_membership();
+                seg_timer_.boundary += std::chrono::duration<double>(Clock::now() - seg_t0).count();
+                seg_timer_.maybe_report();
 
                 if (prefill_lane_) {
                     if (!membership.empty() &&
                         instance_.program->mixed_round_supported(*prefill_lane_)) {
+                        const auto t_mixed = Clock::now();
                         run_mixed_round(membership);
-                        previous_unit_was_decode = false;
+                        seg_timer_.mixed +=
+                            std::chrono::duration<double>(Clock::now() - t_mixed).count();
+                        seg_timer_.mixed_rounds += 1;
+                        // The mixed round carried the decode batch, so the
+                        // admission branch may run next (PATCHES.md #32).
+                        previous_unit_was_decode = true;
                         continue;
                     }
                     if (!membership.empty() && !previous_unit_was_decode) {
@@ -1167,7 +1208,10 @@ private:
                 }
 
                 if (have_pending && (membership.empty() || previous_unit_was_decode)) {
+                    const auto t_admit               = Clock::now();
                     const AdmissionProgress progress = try_admit_one();
+                    seg_timer_.admit +=
+                        std::chrono::duration<double>(Clock::now() - t_admit).count();
                     if (progress == AdmissionProgress::RanGpuUnit) {
                         previous_unit_was_decode = false;
                         continue;
@@ -1178,7 +1222,11 @@ private:
                 }
 
                 if (!membership.empty()) {
+                    const auto t_decode = Clock::now();
                     run_decode_round(membership);
+                    seg_timer_.decode +=
+                        std::chrono::duration<double>(Clock::now() - t_decode).count();
+                    seg_timer_.decode_rounds += 1;
                     previous_unit_was_decode = true;
                     continue;
                 }
@@ -1193,6 +1241,32 @@ private:
             }
         }
     }
+
+    struct SegmentTimer {
+        bool enabled = std::getenv("SUROGATE_SERVE_ROUND_TIMING") != nullptr;
+        double boundary = 0, admit = 0, mixed = 0, decode = 0;
+        double preview = 0, resolve = 0, append = 0, stats = 0;
+        std::uint64_t mixed_rounds = 0, decode_rounds = 0;
+        std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+        void maybe_report() {
+            if (!enabled) { return; }
+            const auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration<double>(now - last).count() < 5.0) { return; }
+            std::fprintf(stderr,
+                         "round-timing: boundary %.0fms admit %.0fms mixed %.0fms/%llu decode "
+                         "%.0fms/%llu | preview %.0fms resolve %.0fms append %.0fms stats %.0fms "
+                         "(per 5s)\n",
+                         boundary * 1e3, admit * 1e3, mixed * 1e3,
+                         static_cast<unsigned long long>(mixed_rounds), decode * 1e3,
+                         static_cast<unsigned long long>(decode_rounds), preview * 1e3,
+                         resolve * 1e3, append * 1e3, stats * 1e3);
+            boundary = admit = mixed = decode = 0;
+            preview = resolve = append = stats = 0;
+            mixed_rounds = decode_rounds = 0;
+            last         = now;
+        }
+    };
+    SegmentTimer seg_timer_;
 
     Instance& instance_;
     const std::uint32_t max_concurrency_;

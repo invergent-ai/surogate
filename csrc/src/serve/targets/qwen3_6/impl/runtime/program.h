@@ -231,6 +231,8 @@ public:
     advance_prefill_mixed(std::uint32_t prefill_lane, std::span<const std::uint32_t> lanes,
                           std::span<const runtime::RoundBudget> budgets);
     [[nodiscard]] bool mixed_round_supported(std::uint32_t prefill_lane) const noexcept;
+    void set_round_burst_limit(std::uint32_t limit) noexcept { round_burst_limit = limit; }
+    static void burst_egress_copy_host(void* user) noexcept;
     void resolve_prefill_lane(std::uint32_t lane, bool terminal);
     void resolve_pending_batch(std::span<const std::uint32_t> lanes,
                                std::span<const std::uint32_t> accepted_tokens,
@@ -281,6 +283,24 @@ public:
     std::array<RequestControl, kMaximumConcurrency> requests;
 
     DecodeGraphFamily ordinary_graphs;
+    // Round chaining (PATCHES.md #32): the chained flavor of every ordinary
+    // profile, plus the device 1-scalar its in-graph increments read and the
+    // host-side burst plumbing (per-round egress copies via stream host
+    // functions, row-major token assembly for the ragged round result).
+    DecodeGraphFamily ordinary_chained_graphs;
+    void* chain_one_storage = nullptr;
+    Tensor chain_one;
+    static constexpr std::uint32_t kChainBurstLimit = 8;
+    struct BurstEgressCopy {
+        TokenId* destination      = nullptr;
+        const TokenId* source     = nullptr;
+        std::int32_t count        = 0;
+    };
+    std::array<TokenId, kMaximumConcurrency * kChainBurstLimit> burst_rounds{};
+    std::array<TokenId, kMaximumConcurrency * kChainBurstLimit> burst_tokens{};
+    std::array<std::int32_t, kMaximumConcurrency> burst_counts{};
+    std::array<BurstEgressCopy, kChainBurstLimit> burst_copy_ctx{};
+    std::uint32_t round_burst_limit = 1;
     // Prefill CUDA graphs (PATCHES.md #27); engaged in prepare_graphs when the
     // backend is plain decode and SUROGATE_SERVE_PREFILL_GRAPH != 0.
     std::optional<PrefillGraphFamily> prefill_graphs;

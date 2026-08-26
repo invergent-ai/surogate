@@ -188,6 +188,11 @@ bool Program<Variant>::mixed_round_supported(std::uint32_t prefill_lane) const n
 }
 
 template <>
+void Program<Variant>::set_round_burst_limit(std::uint32_t limit) noexcept {
+    impl_->set_round_burst_limit(limit);
+}
+
+template <>
 void Program<Variant>::resolve_pending_batch(std::span<const std::uint32_t> lanes,
                                              std::span<const std::uint32_t> accepted_tokens,
                                              std::span<const std::uint8_t> terminal,

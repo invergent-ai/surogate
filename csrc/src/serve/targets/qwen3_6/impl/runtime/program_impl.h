@@ -270,6 +270,10 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     set_device_i32(io.text_kv_table_row, 0);
     set_device_i32(io.backend_kv_table_row, 0);
 
+    CUDA_CHECK(cudaMalloc(&chain_one_storage, sizeof(std::int32_t)));
+    chain_one = Tensor(chain_one_storage, DType::I32, {1});
+    set_device_i32(chain_one, 1);
+
     host_tokens = static_cast<TokenId*>(round_host.data());
     if (ordinary_host) {
         ordinary_host_ingress = static_cast<qwen3_6::OrdinaryDecodeIngress*>(ordinary_host->data());
@@ -314,6 +318,13 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
 
 ProgramImplCore::~ProgramImplCore() noexcept {
     if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
+    if (chain_one_storage != nullptr) { (void)cudaFree(chain_one_storage); }
+}
+
+void ProgramImplCore::burst_egress_copy_host(void* user) noexcept {
+    const auto* ctx = static_cast<const BurstEgressCopy*>(user);
+    std::memcpy(ctx->destination, ctx->source,
+                static_cast<std::size_t>(ctx->count) * sizeof(TokenId));
 }
 
 bool ProgramImplCore::can_admit_lane(std::uint32_t lane, const RequestPlan& plan) const noexcept {
@@ -1289,7 +1300,8 @@ void ProgramImplCore::prepare_graphs() {
         const std::uint32_t ordinary_batch_limit = max_concurrency;
         schedule::OrdinaryBatchContext ordinary_state{execution_core(),      decoder->text_kv,
                                                       *io.ordinary,          *ordinary_host_ingress,
-                                                      *ordinary_host_egress, tail_hidden_store};
+                                                      *ordinary_host_egress, tail_hidden_store,
+                                                      chain_one};
         const GraphExecutionProfile code_warm = ordinary_profiles.front();
         prepare_representative(code_warm.min, 1);
         device.synchronize();
@@ -1311,6 +1323,28 @@ void ProgramImplCore::prepare_graphs() {
                 schedule::capture_ordinary_decode_batch(ordinary_state,
                                                         static_cast<std::int32_t>(batch_size),
                                                         envelope, profile.definition);
+            }
+        }
+
+        // Round chaining (PATCHES.md #32): the chained flavor of every
+        // ordinary profile, captured over the same representative state.
+        schedule::ordinary_decode_batch_chained(ordinary_state, 1,
+                                                {code_warm.min + 1, code_warm.max + 1}, nullptr);
+        device.synchronize();
+        ordinary_chained_graphs.profiles.reserve(ordinary_profiles.size() * ordinary_batch_limit);
+        for (std::uint32_t batch_size = 1; batch_size <= ordinary_batch_limit; ++batch_size) {
+            for (const GraphExecutionProfile planned : ordinary_profiles) {
+                ordinary_chained_graphs.profiles.emplace_back();
+                DecodeGraphProfile& profile    = ordinary_chained_graphs.profiles.back();
+                profile.batch_size             = batch_size;
+                profile.min_execution_frontier = planned.min;
+                profile.max_execution_frontier = planned.max;
+                profile.topology_class =
+                    planned.topology_class * ordinary_batch_limit + (batch_size - 1U);
+                const ops::GqaExecutionEnvelope envelope{planned.min + 1, planned.max + 1};
+                schedule::capture_ordinary_decode_batch_chained(
+                    ordinary_state, static_cast<std::int32_t>(batch_size), envelope,
+                    profile.definition);
             }
         }
     }
@@ -1391,6 +1425,10 @@ void ProgramImplCore::prepare_graphs() {
 
     if (!ordinary_graphs.profiles.empty()) {
         instantiate_graph_family(ordinary_graphs, "ordinary", device, prepare_representative);
+    }
+    if (!ordinary_chained_graphs.profiles.empty()) {
+        instantiate_graph_family(ordinary_chained_graphs, "ordinary chained", device,
+                                 prepare_representative);
     }
     if (speculative_backend == SpeculativeBackend::Mtp) {
         instantiate_graph_family(mtp_graphs, "MTP", device, prepare_representative);
@@ -1892,14 +1930,37 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
 
     const auto start = Clock::now();
     try {
+        // Round chaining (PATCHES.md #32): launch up to round_burst_limit
+        // consecutive rounds; the chained flavor consumes the previous
+        // round's sampled tokens device-side, per-round stream host
+        // functions copy each egress out in order, and one synchronize
+        // covers the whole burst.
+        std::uint32_t burst = std::min(round_burst_limit, kChainBurstLimit);
+        for (const runtime::RoundBudget& budget : budgets) {
+            burst = std::min(burst, budget.generated_tokens_remaining);
+        }
+        burst = std::min(burst, capacity - maximum_frontier);
+        if (burst == 0) { burst = 1; }
+
         DecodeGraphExecutable* executable = nullptr;
-        ops::GqaExecutionEnvelope envelope{maximum_frontier + 1, maximum_frontier + 1};
+        DecodeGraphExecutable* chained    = nullptr;
+        ops::GqaExecutionEnvelope envelope{maximum_frontier + 1, maximum_frontier + burst};
         if (use_cuda_graph) {
             DecodeGraphProfile& profile =
                 select_graph_profile(ordinary_graphs, static_cast<std::uint32_t>(lanes.size()),
                                      maximum_frontier, "ordinary batch");
             executable = &install_graph_profile(ordinary_graphs, profile, "ordinary batch");
             envelope   = {profile.min_execution_frontier + 1, profile.max_execution_frontier + 1};
+            burst      = std::min(burst,
+                                  profile.max_execution_frontier - maximum_frontier + 1);
+            if (burst > 1) {
+                DecodeGraphProfile& chained_profile = select_graph_profile(
+                    ordinary_chained_graphs, static_cast<std::uint32_t>(lanes.size()),
+                    maximum_frontier, "ordinary chained batch");
+                chained =
+                    &install_graph_profile(ordinary_chained_graphs, chained_profile,
+                                           "ordinary chained batch");
+            }
         }
 
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -1914,7 +1975,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             ordinary_host_ingress->text_kv_table_rows[row] = sequence.kv->text.bound_row();
             ordinary_host_ingress->lanes[row]    = static_cast<std::int32_t>(sequence.lane);
             ordinary_host_ingress->sampling[row] = request.sampling_host;
-            materialize_sequence_kv(sequence, frontier + 1, 0);
+            materialize_sequence_kv(sequence, frontier + burst, 0);
         }
 
         schedule::OrdinaryBatchContext schedule_state{
@@ -1925,11 +1986,43 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             *io.ordinary,
             *ordinary_host_ingress,
             *ordinary_host_egress,
-            tail_hidden_store};
+            tail_hidden_store,
+            chain_one};
 
         mark_workspace_usage(workspace_plan.ordinary_round);
-        schedule::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
-                                        envelope, executable);
+        const std::int32_t rows_i32            = static_cast<std::int32_t>(lanes.size());
+        qwen3_6::OrdinaryDecodeState& ordinary = *io.ordinary;
+        for (std::uint32_t round = 0; round < burst; ++round) {
+            if (round == 0) {
+                schedule::ordinary_decode_batch(schedule_state, rows_i32, envelope, executable);
+                if (burst > 1) {
+                    // The classic round-0 body carries no chain tail; advance
+                    // the frame the same way the chained flavor does so round
+                    // 1 consumes round 0's sampled tokens at the next
+                    // position instead of replaying round 0.
+                    Tensor tokens          = ordinary.tokens.slice(0, 0, rows_i32);
+                    Tensor sampled         = ordinary.sampled_tokens.slice(0, 0, rows_i32);
+                    Tensor cache_positions = ordinary.cache_positions.slice(0, 0, rows_i32);
+                    Tensor rope_positions  = ordinary.rope_positions.slice(0, 0, rows_i32);
+                    CUDA_CHECK(cudaMemcpyAsync(tokens.data, sampled.data,
+                                               lanes.size() * sizeof(std::int32_t),
+                                               cudaMemcpyDeviceToDevice, device.stream));
+                    ops::offset_i32_positions(cache_positions, chain_one, cache_positions,
+                                              device.stream);
+                    ops::offset_i32_positions(rope_positions, chain_one, rope_positions,
+                                              device.stream);
+                }
+            } else {
+                schedule::ordinary_decode_batch_chained(schedule_state, rows_i32, envelope,
+                                                        chained);
+            }
+            burst_copy_ctx[round] = BurstEgressCopy{
+                .destination = burst_rounds.data() + round * kMaximumConcurrency,
+                .source      = ordinary_host_egress->sampled_tokens.data(),
+                .count       = static_cast<std::int32_t>(lanes.size())};
+            CUDA_CHECK(cudaLaunchHostFunc(device.stream, &ProgramImplCore::burst_egress_copy_host,
+                                          &burst_copy_ctx[round]));
+        }
         device.synchronize();
 
         const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
@@ -1938,23 +2031,30 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             RequestControl& request    = requests[lanes[row]];
             const std::uint32_t base_E = sequence.execution_frontier;
             const std::uint32_t base_S = sequence.ledger_frontier;
-            const TokenId token        = ordinary_host_egress->sampled_tokens[row];
-            validate_licensed_tokens(std::span<const TokenId>(&token, 1));
-            sequence.text_kv_valid     = base_E + 1;
+            TokenId* row_tokens        = burst_tokens.data() + row * burst;
+            for (std::uint32_t round = 0; round < burst; ++round) {
+                row_tokens[round] = burst_rounds[round * kMaximumConcurrency + row];
+            }
+            validate_licensed_tokens(std::span<const TokenId>(row_tokens, burst));
+            sequence.text_kv_valid     = base_E + burst;
             sequence.tail_hidden_valid = true;
-            sequence.ledger.push_back(token);
-            sequence.prefix_identity.append_generated(1, sequence.rope_delta);
+            for (std::uint32_t round = 0; round < burst; ++round) {
+                sequence.ledger.push_back(row_tokens[round]);
+            }
+            sequence.prefix_identity.append_generated(burst, sequence.rope_delta);
+            burst_counts[row] = static_cast<std::int32_t>(burst);
             request.pending   = PendingCandidate{.kind          = PendingKind::Ordinary,
                                                  .base_E        = base_E,
                                                  .base_S        = base_S,
                                                  .prompt_tokens = 0,
-                                                 .produced      = 1};
+                                                 .produced      = burst};
             request.lifecycle = Lifecycle::Pending;
             request.timings.decode_seconds += seconds;
         }
         return runtime::BatchedGeneratedRound{
-            .tokens = std::span<const TokenId>(ordinary_host_egress->sampled_tokens.data(),
-                                               lanes.size())};
+            .tokens     = std::span<const TokenId>(burst_tokens.data(), lanes.size() * burst),
+            .row_counts = std::span<const std::int32_t>(burst_counts.data(), lanes.size()),
+            .row_stride = burst};
     } catch (...) {
         try {
             device.synchronize();
@@ -2537,20 +2637,35 @@ void ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence,
     if (request.lifecycle != Lifecycle::Pending) {
         throw std::logic_error("pending resolution requires a pending generated round");
     }
+    const std::uint32_t produced = request.pending.produced;
     if ((request.pending.kind != PendingKind::Begin &&
          request.pending.kind != PendingKind::Ordinary) ||
-        request.pending.produced != 1 || accepted_tokens != 1) {
-        throw std::logic_error("non-speculative pending round must commit its single token");
+        produced == 0 || accepted_tokens == 0 || accepted_tokens > produced ||
+        (!terminal && accepted_tokens != produced) ||
+        (request.pending.kind == PendingKind::Begin && produced != 1)) {
+        throw std::logic_error("non-speculative pending round must commit a licensed prefix");
     }
 
+    bool retain_prefix = true;
     switch (request.pending.kind) {
     case PendingKind::Begin:
         sequence.execution_frontier = request.pending.prompt_tokens;
         sequence.ledger_frontier    = request.pending.prompt_tokens + 1;
         break;
     case PendingKind::Ordinary:
-        sequence.execution_frontier = request.pending.base_E + request.pending.produced;
-        sequence.ledger_frontier    = request.pending.base_S + request.pending.produced;
+        if (accepted_tokens < produced) {
+            // Chained-burst truncation (PATCHES.md #32, terminal-only): trim
+            // the ledger and identity to the licensed prefix. The lane's
+            // resident GDN state ran the full burst, so the prefix must not
+            // be retained for reuse.
+            sequence.ledger.resize(request.pending.base_S + accepted_tokens);
+            sequence.prefix_identity.truncate(request.pending.base_S + accepted_tokens);
+            sequence.text_kv_valid =
+                std::min(sequence.text_kv_valid, request.pending.base_E + accepted_tokens);
+            retain_prefix = false;
+        }
+        sequence.execution_frontier = request.pending.base_E + accepted_tokens;
+        sequence.ledger_frontier    = request.pending.base_S + accepted_tokens;
         break;
     case PendingKind::Speculative:
     case PendingKind::None:
@@ -2566,7 +2681,7 @@ void ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence,
         sequence.mtp_draft_count = 0;
         release_sequence_growth_entitlement(sequence);
         unbind_sequence_kv(sequence);
-        sequence.retained = true;
+        sequence.retained = retain_prefix;
     }
     request.lifecycle = terminal ? Lifecycle::Complete : Lifecycle::Active;
     request.pending   = {};

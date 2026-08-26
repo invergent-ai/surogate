@@ -69,6 +69,9 @@ struct OrdinaryBatchContext {
     const qwen3_6::OrdinaryDecodeIngress& host_ingress;
     qwen3_6::OrdinaryDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
+    // Round chaining (PATCHES.md #32): device I32 scalar holding 1 for the
+    // in-graph position increments of the chained round flavor.
+    Tensor chain_one;
 };
 
 struct MtpBatchContext {
@@ -170,6 +173,12 @@ void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prom
 void capture_ordinary_decode_batch(OrdinaryBatchContext& state, std::int32_t batch_size,
                                    ops::GqaExecutionEnvelope envelope,
                                    DecodeGraphDefinition& definition);
+void capture_ordinary_decode_batch_chained(OrdinaryBatchContext& state, std::int32_t batch_size,
+                                           ops::GqaExecutionEnvelope envelope,
+                                           DecodeGraphDefinition& definition);
+void ordinary_decode_batch_chained(OrdinaryBatchContext& state, std::int32_t batch_size,
+                                   ops::GqaExecutionEnvelope envelope,
+                                   DecodeGraphExecutable* executable);
 void ordinary_decode_batch(OrdinaryBatchContext& state, std::int32_t batch_size,
                            ops::GqaExecutionEnvelope envelope, DecodeGraphExecutable* executable);
 

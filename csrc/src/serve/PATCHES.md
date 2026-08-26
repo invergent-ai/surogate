@@ -976,3 +976,40 @@ small). Census after: 100% of kernels from graph nodes, but idle is still
 (sync -> egress read -> bookkeeping -> stage -> launch), ~1ms/round of dark
 device. That is the actual scheduler gap vs vLLM's async staging; next arc
 is round chaining (stage round N+1 before consuming round N's egress).
+
+## 32. Decode round chaining (2026-08-26)
+
+After #31 the 0.8B still idled ~18% under 100-user load with 100% of
+kernels in graphs: the gap moved between rounds, into the serial host path
+(sync -> egress -> bookkeeping -> stage -> launch, ~1.3ms per program
+call). This entry builds the chaining infrastructure: a chained flavor of
+every ordinary decode graph (no ingress H2D; in-graph chain tail copies the
+sampled tokens into the next round's inputs and advances both position
+rows via a device one-scalar), a burst driver that launches K rounds
+back-to-back with per-round egress copies via stream host functions and a
+single synchronize, and a generalized non-speculative resolve
+(produced=K, truncation at terminal with ledger/identity trim; a
+partial-terminal lane is not retained for prefix reuse because its
+resident GDN state ran the full burst). Round 0 runs the classic captured
+body plus an eager chain tail — without it round 1 replays round 0 and
+the stream is garbage (found as an invalid-UTF-8 fatal).
+
+Scheduling: admission rides the round cadence (one attempt per GPU unit),
+so the burst length adapts — 1 while a prefill is staged or a queued
+request could admit into a free lane, 3 while the queue waits on full
+lanes, 8 when nothing waits. A fixed burst of 8 capped admissions at
+~25/s and collapsed the 0.8B to 3,084 tok/s (fast lanes, few of them);
+the adaptive policy restores 5,134. Mixed rounds now count as decode
+units so admission may follow them directly.
+
+Measured (0.8B, 100 users): 5,134 tok/s — neutral at this churn (vLLM
+5,958). Segment timing (SUROGATE_SERVE_ROUND_TIMING=1, per 5s): mixed
+calls 2,050ms/204, decode burst calls 2,800ms/305 (bursts of ~3 engage),
+executor resolve tails are trivial (preview 20ms, append 50ms, stats 0).
+The residual host serial is the program call chain sync -> resolve ->
+membership -> launch, which is load-bearing: the next lever is chaining
+across resolve boundaries (launch round N+1 on chained device state
+before consuming round N's egress; host functions check EOS ids to drain
+early; membership refresh lags one round), i.e. the vLLM async-scheduler
+equivalent. The chain tail, egress host functions, and generalized
+resolve built here are the pieces that design needs.
