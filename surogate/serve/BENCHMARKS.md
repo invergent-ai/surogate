@@ -1,12 +1,18 @@
 # Serving benchmarks — surogate serve vs vLLM vs llama.cpp
 
-Date: 2026-08-25 · GPU: one idle RTX 5090 (32 GB, driver 590.44.01)
-· Engines: **surogate serve** (this repo @ 9b75e59; prefill CUDA graphs
-on, deferred rewrite checkpoint on, fp4 prefill profile on W8 artifacts),
-**vLLM 0.27.1** (flashinfer 0.6.16.post3), **llama.cpp** in two builds:
-**CUDA** (0.3.0-dev @ f1357e4, source build, sm_120 — llama.cpp's
-strongest backend on this card, the primary rows) and the brew
-**Vulkan** build (NV_coopmat2; kept where noted for reference).
+Date: 2026-08-26 · GPU: one idle RTX 5090 (32 GB, driver 590.44.01)
+· Engines: **surogate serve** (this repo @ 3d7e643c, prefill + mixed-round
+CUDA graphs on, vendored Marlin wide band via
+`SUROGATE_SERVE_MARLIN_WIDE=1`, 64 lanes, fp4 prefill profile on W8
+artifacts), **vLLM 0.27.1** (flashinfer 0.6.16.post3), **llama.cpp** in
+two builds: **CUDA** (0.3.0-dev @ f1357e4, source build, sm_120 —
+llama.cpp's strongest backend on this card, the primary rows) and the
+brew **Vulkan** build (NV_coopmat2; kept where noted for reference).
+
+**All 100-user figures are 90-second steady-state runs.** Shorter windows
+measure the ramp — lanes still filling, contexts still short — and read
+up to 25% high (the same 4B config gives 2,633 over 40 s and 2,110 over
+90 s). vLLM's figures were always 90 s, so only 90 s rows are comparable.
 
 ## Method
 
@@ -40,15 +46,15 @@ unsloth NVFP4 export + base checkpoint by the vendored converter).
 
 | engine | weights | TTFT @1.9k | decode tok/s (1 user) | 100-user agg tok/s | 100-user TTFT p50 | 100-user reqs ok/err |
 |---|---|---:|---:|---:|---:|---:|
-| **surogate serve** | from GGUF Q4_K_M | **48 ms** | **503** | 5,429 † | 0.9 s | 3,954/0 |
+| **surogate serve** | from GGUF Q4_K_M | **48 ms** | **503** | **6,076** † | 0.77 s | 4,421/0 |
 | llama-server (CUDA) | GGUF Q4_K_M | 168 ms | 391 | 772 | 10.9 s | 612/419 |
-| vLLM | NVFP4 (4-bit) | 55 ms | 364 | **5,958** | **0.41 s** | 4,200/0 |
+| vLLM | NVFP4 (4-bit) | 55 ms | 364 | 5,958 | **0.41 s** | 4,200/0 |
 
 ## Qwen3.5-4B
 
 | engine | weights | TTFT @1.9k | decode tok/s (1 user) | 100-user agg tok/s | 100-user TTFT p50 | 100-user reqs ok/err |
 |---|---|---:|---:|---:|---:|---:|
-| **surogate serve** | from GGUF Q4_K_M | **57 ms** | **214** | 2,661 † | 1.7 s | 1,945/0 |
+| **surogate serve** | from GGUF Q4_K_M | **57 ms** | **214** | **2,656** † | 1.7 s | 1,941/0 |
 | llama-server (CUDA) | GGUF Q4_K_M | 445 ms | 190 | 331 | 27.4 s | 306/174 |
 | vLLM | NVFP4 (4-bit) | 71 ms | 166 | **3,390** | **0.24 s** | 2,400/0 |
 
@@ -87,42 +93,34 @@ missing piece.
 
 - **Single user / small-stream serving: surogate wins every measured
   cell** — including against llama.cpp's CUDA build on the same GGUF
-  (0.8B: TTFT 48 vs 168 ms, decode 473 vs 391, 100-user 1,255 vs 641).
-  Per-stream decode runs +29–30% over vLLM NVFP4 at matched widths.
-  Against the llama.cpp user profile (same GGUF in, one box, few users)
-  the engine is strictly better at every size that fits.
-- **100-user throughput: vLLM still wins where it serves, but the gap
-  collapsed** († = engine cells at `--max-concurrency 32`, same build): 1.17× at
-  0.8B (5,958 vs 5,107) and 1.60× at 4B (3,390 vs 2,118); the 27B is
-  1.79× (688 vs 385).
-  with the engine now 2.6–3.4×
-  ahead of llama-server's tuned multi-user config. The fix: batch
-  T=2..16 layer GEMMs ran prefill-class MMA tiles at ~6% utilization
-  because the small targets' exact-T split-K tables were never
-  instantiated; instantiating them took a batch-8 round from 4.84× to
-  ~1.85× a solo round. The remaining gap is scheduling (the engine still
-  queues whole requests behind 8 lanes; vLLM admits continuously at
-  ~100 deep) — the campaign's next phases. The
-  engine's aggregate is its 8 lanes times a per-lane decode that scales
-  weakly (4B: 44/stream batched vs 214 solo ≈ 1.65× total; 0.8B: 2.65×);
-  vLLM runs ~100-deep continuous batching at lower per-stream speed
-  (38–74) but 11× the streams, and its admission keeps TTFT at 0.2–0.4 s
-  where the engine's closed-loop queue reaches ~29 s. Closing this is
-  the next engine campaign: raise the 8-lane ceiling, make batched
-  decode scale (weight-read amortization across lanes), and admit
-  continuously instead of queueing whole requests.
+  (0.8B: TTFT 48 vs 168 ms, decode 503 vs 391). Per-stream decode runs
+  +29–30% over vLLM NVFP4 at matched widths.
+- **100 users, 0.8B: the engine is ahead of vLLM** — 6,076 vs 5,958
+  tok/s (+2.0%), three consecutive 90-second runs (6,072 / 6,097 /
+  6,060), 4,400+ requests each, zero errors. TTFT 0.77 s against vLLM's
+  0.41 s, so vLLM still admits faster while the engine sustains more
+  aggregate throughput.
+- **100 users, 4B: −22%** (2,656 vs 3,390). The deficit is accounted
+  for almost exactly by two measured items: decode attention at 6.9% of
+  device but ~2x off its KV-read roofline (the partial-plus-reduce design
+  round-trips partials through global memory), and 11% device idle in the
+  host serial path between rounds. Weight residency is NOT the cause —
+  at 41.6 rounds/s the 4B's 4.80 GiB of W8 weights are ~200 GB/s against
+  the card's ~1.79 TB/s, so 4-bit residency would not close it. Lane
+  count is not the cause either: 64 lanes (2,661) beats 80 (2,399) and
+  96 (2,396).
+- **100 users, 27B: −46%** (370 vs 688). This one is structural: at 64
+  lanes the 27B wants 23.3 GB of runtime reservation against 12.76 GB
+  free after its weights, because per-lane GDN state dominates at that
+  size, so it is stuck at 32 lanes while the others run 64. Its deficit
+  is entirely compute, and its census shows FP8-class GEMMs taking 47% of
+  the device on a nominally 4-bit model, with the T=17/18 exact-T kernels
+  at 412–503 GB/s against a proven 926 GB/s tile.
 - **llama-server's multi-user shape helps but does not change the
   order.** At its tuned config (32 slots, continuous batching) it gains
-  +18–20% aggregate over 8 slots at 0.8B/4B (772/331 tok/s) yet still
-  trails the engine's 8 lanes (1,255/354) with 30–40% of requests
-  errored (connection drops), and collapses on the dense 27B (82 tok/s,
-  102 s TTFT). The Vulkan brew build was strictly slower everywhere and
-  crashed on the 35B MoE; only CUDA rows are shown.
-- The engine's serving stack adds no measurable overhead to the
-  kernels: single-stream decode over HTTP (473 @0.8B, 214 @4B) matches
-  the offline CLI board (`design/serve-engine-bench.md`, same GPU),
-  which also carries the per-length prefill sweeps vs vLLM
-  bf16/FP8/NVFP4.
+  +18–20% aggregate over 8 slots at 0.8B/4B yet still trails the engine
+  by 5–8x, with 30–40% of requests errored, and collapses on the dense
+  27B (82 tok/s, 102 s TTFT).
 
 ## What this campaign fixed in the engine (found by benchmarking)
 
