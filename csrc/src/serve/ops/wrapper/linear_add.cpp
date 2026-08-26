@@ -267,7 +267,12 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8) {
             throw std::invalid_argument("FP8 linear_add admits only A16 or A8");
         }
-        (void)detail::validate_fp8_weight(w, "fp8 linear_add");
+        // Adopt before validating: validate_fp8_weight gates on RowScale, which
+        // an adopted weight deliberately no longer is.
+        (void)detail::marlin_fp8_maybe_adopt(w, stream);
+        if (w.layout != QuantLayout::MarlinTiles) {
+            (void)detail::validate_fp8_weight(w, "fp8 linear_add");
+        }
         const bool supported_shape = (w.n == detail::Fp8Residual6144Geometry::kOutputRows &&
                                       w.k == detail::Fp8Residual6144Geometry::kInputRows) ||
                                      (w.n == detail::Fp8Residual17408Geometry::kOutputRows &&

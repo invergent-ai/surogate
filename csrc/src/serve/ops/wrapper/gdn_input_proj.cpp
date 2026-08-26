@@ -56,6 +56,21 @@ bool overlaps(const Tensor& lhs, const Tensor& rhs) {
     return lhs_begin < rhs_begin + rhs.bytes() && rhs_begin < lhs_begin + lhs.bytes();
 }
 
+// Row band out of a fused parent [parent_rows, T] into [rows, T]; both are
+// column-major with contiguous columns, so the band is a strided copy.
+void copy_parent_rows(const Tensor& parent, std::int32_t row_offset, Tensor& out,
+                      cudaStream_t stream) {
+    const std::int32_t rows = out.ne[0];
+    const std::int32_t cols = out.ne[1];
+    CUDA_CHECK(cudaMemcpy2DAsync(out.data, static_cast<std::size_t>(rows) * 2,
+                                 static_cast<const std::uint8_t*>(parent.data) +
+                                     static_cast<std::size_t>(row_offset) * 2,
+                                 static_cast<std::size_t>(parent.ne[0]) * 2,
+                                 static_cast<std::size_t>(rows) * 2,
+                                 static_cast<std::size_t>(cols), cudaMemcpyDeviceToDevice,
+                                 stream));
+}
+
 void require_single_parent_nonoverlap(const Tensor& x, const Tensor& qkv, const Tensor& z) {
     if (overlaps(x, qkv) || overlaps(x, z) || overlaps(qkv, z)) {
         throw std::invalid_argument("gdn_input_proj: x, qkv, and z must not overlap");
@@ -332,10 +347,28 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
         require_matrix(qkv, kQkvRows, cols, "qkv");
         require_matrix(z, kZRows, cols, "z");
         require_single_parent_nonoverlap(x, qkv, z);
-        detail::validate_fp8_weight(weight, "fp8 gdn_input_proj");
         if (weight.n != kRows || weight.k != kHidden) {
             throw std::invalid_argument("fp8 gdn_input_proj: unsupported weight shape");
         }
+        // Adopted residency (PATCHES.md #60): Marlin is the only route that can
+        // read this weight's bytes, so it must serve every T and a decline is a
+        // hard error. The fused parent is produced whole and split afterwards.
+        (void)detail::marlin_fp8_maybe_adopt(weight, stream);
+        if (weight.layout == QuantLayout::MarlinTiles) {
+            if (workspace == nullptr) {
+                throw std::invalid_argument(
+                    "fp8 gdn_input_proj: Marlin-tile weight needs a workspace");
+            }
+            Tensor parent = workspace->alloc(DType::BF16, {kRows, cols});
+            if (!detail::marlin_fp8_run(x, weight, parent, stream)) {
+                throw std::invalid_argument(
+                    "fp8 gdn_input_proj: weight holds Marlin tiles but Marlin declined");
+            }
+            copy_parent_rows(parent, 0, qkv, stream);
+            copy_parent_rows(parent, kQkvRows, z, stream);
+            return;
+        }
+        detail::validate_fp8_weight(weight, "fp8 gdn_input_proj");
         detail::fp8_gdn_input_dispatch(x, weight, qkv, z, policy, workspace, stream);
         return;
     }

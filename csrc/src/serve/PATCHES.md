@@ -2088,3 +2088,40 @@ Marlin route yet, so only the linear_add and linear_swiglu families are
 eligible today. Wiring those two, then adopting at load time from the
 target's declared compute profile, is what turns the 2.4-2.75x the probe
 measured into throughput.
+
+## 61. Marlin residency adoption: wired, not yet working (2026-08-26)
+
+All four FP8 consumer families now have a Marlin route, which is the
+precondition for adopting a weight's residency: `linear_add`,
+`linear_swiglu`, and — new here — `attn_input_proj` and `gdn_input_proj`.
+The fused pair needed the GEMM separated from the fusion: Marlin emits the
+whole [parent_rows, T] parent and the split becomes a strided copy
+afterwards, a few hundred KB against tens of MB of GEMM.
+
+`marlin_fp8_maybe_adopt` triggers adoption from those routes and nowhere
+else, which is exactly the safety precondition — a weight only becomes
+Marlin-tiled because a route that can read tiles asked for it. It never
+adopts during capture, so adoption lands on the warmup pass.
+
+**State: enabling it on the 27B does not work yet.** Three failures so far,
+each fixed and each replaced by the next:
+
+  1. "weight holds Marlin tiles but Marlin declined" — an adopted weight
+     skips the repack path that allocates the scratch. Fixed by priming the
+     scratch at adoption and on the adopted branch of plane_for.
+  2. "invalid FP8 weight" — validate_fp8_weight gates on RowScale, which an
+     adopted weight deliberately is not. Fixed by adopting before validating.
+  3. std::bad_alloc — current. The plan now reserves the fused parent
+     (marlin_fused_parent_bytes, zero unless adoption is enabled) and the
+     row arithmetic checks out for the 27B (attention 6144*2 + 1024*2 =
+     14336; GDN 2048*2 + 6144*2 = 16384), so the reservation is either
+     landing in the wrong phase or the arena is short for another reason.
+     Unresolved; needs a GPU to bisect.
+
+Everything is behind SUROGATE_SERVE_MARLIN_FP8, and both gates return
+false/zero when it is unset, so the default path is byte-identical.
+
+Worth recording plainly: all three failures were named errors at startup.
+The same code without QuantLayout::MarlinTiles (#59) produced garbage
+tokens and raised nothing at all. The tag is doing precisely what it was
+added to do, even while the feature it guards is unfinished.

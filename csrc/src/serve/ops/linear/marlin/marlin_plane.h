@@ -41,6 +41,16 @@ MarlinPlane marlin_fp8_plane_for(const Weight& weight, cudaStream_t stream);
 // at the definition.
 bool marlin_fp8_adopt_residency(Weight& weight, cudaStream_t stream);
 
+// Adopts on first use from a Marlin-capable route; no-op during capture or when
+// adoption is not enabled. Returns true when the weight holds Marlin tiles.
+bool marlin_fp8_maybe_adopt(const Weight& weight, cudaStream_t stream);
+
+// Staging bytes a fused projection needs when its weight holds Marlin tiles:
+// Marlin emits the whole [parent_rows, T] parent and the fusion splits it
+// afterwards. Zero when adoption is not enabled, so the plan does not carry
+// the reservation on builds that will never use it.
+std::size_t marlin_fused_parent_bytes(std::int32_t parent_rows, std::int32_t columns) noexcept;
+
 struct MarlinScratch {
     void* gemm_out = nullptr;  // bf16 [kMarlinFixedM, n] row-major
     void* a_pad    = nullptr;  // bf16 [kMarlinFixedM, k], pad rows zeroed

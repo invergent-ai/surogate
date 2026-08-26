@@ -134,6 +134,25 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     }
 
     if (fp8_weight) {
+        // Adopted residency (PATCHES.md #60): Marlin is the only route that can
+        // read these bytes, at any T, and a decline must throw.
+        (void)detail::marlin_fp8_maybe_adopt(gate_up_weight, stream);
+        if (gate_up_weight.layout == QuantLayout::MarlinTiles) {
+            const detail::MarlinScratch adopted =
+                detail::marlin_fp8_scratch_for(gate_up_weight, stream);
+            Tensor fused = adopted.gemm_out != nullptr && t <= detail::marlin_fixed_m()
+                               ? Tensor(adopted.gemm_out, DType::BF16, {gate_up_weight.n, t})
+                               : ws.alloc(DType::BF16, {gate_up_weight.n, t});
+            if (!detail::marlin_fp8_run(x, gate_up_weight, fused, stream)) {
+                throw std::invalid_argument(
+                    "linear_swiglu: weight holds Marlin tiles but Marlin declined");
+            }
+            const std::int32_t half = gate_up_weight.n / 2;
+            Tensor gate             = fused.slice(0, 0, half);
+            Tensor up               = fused.slice(0, half, half);
+            silu_mul(gate, up, out, stream);
+            return;
+        }
         (void)detail::validate_fp8_weight(gate_up_weight, "fp8 linear_swiglu");
         // Marlin band (PATCHES.md #38): the 27B's largest decode GEMM.
         if (t >= detail::marlin_min_band_tokens() && t <= detail::marlin_fixed_m()) {

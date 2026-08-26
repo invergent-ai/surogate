@@ -1,5 +1,6 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/layouts.h"
+#include "ops/linear/marlin/marlin_plane.h"
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
@@ -257,6 +258,13 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         (void)workspace_recipe::text_attention_projection<TextConfig>(layout, last);
         scratch(layout, Variant::attention_projection_workspace_capacity_bytes(plan.weights_profile,
                                                                                phase, first, last));
+        // Marlin-tile residency (PATCHES.md #60) produces the fused parent whole
+        // and splits it afterwards, so the plan must carry a [parent_rows, T]
+        // staging buffer. Reserved whenever adoption is enabled, because an
+        // adopted weight has no other route and a short workspace would be a
+        // hard failure rather than a fallback.
+        scratch(layout, ops::detail::marlin_fused_parent_bytes(
+                            TextConfig::query_size * 2 + TextConfig::kv_size * 2, last));
         (void)workspace_recipe::text_attention_results<TextConfig>(layout, last);
         scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
                             TextConfig::query_heads, plan.kv_dtype, envelope, batch_size, min_width,
@@ -282,6 +290,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             (void)workspace_recipe::gdn_prefill_conv<TextConfig>(layout, last);
             scratch(layout, Variant::gdn_input_projection_workspace_capacity_bytes(
                                 plan.weights_profile, phase, first, last));
+            scratch(layout, ops::detail::marlin_fused_parent_bytes(
+                                TextConfig::key_dim * 2 + TextConfig::value_dim * 2, last));
         }
         (void)workspace_recipe::gdn_recurrent_output<TextConfig>(layout, last);
         if (path == GdnWorkspacePath::Prefill) {

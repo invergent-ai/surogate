@@ -240,8 +240,19 @@ MarlinPlane marlin_fp8_plane_for(const Weight& weight, cudaStream_t stream) {
         weight.scales == nullptr || (weight.k % 64) != 0 || (weight.n % 64) != 0) {
         return {};
     }
-    // Already adopted: the weight IS the plane.
+    // Already adopted: the weight IS the plane. The scratch still has to exist —
+    // an adopted weight skips the repack path that would otherwise allocate it,
+    // and marlin_fp8_run declines without it, which for a Marlin-tile weight is
+    // a hard error rather than a fallback.
     if (weight.layout == QuantLayout::MarlinTiles) {
+        cudaStreamCaptureStatus adopted_capture = cudaStreamCaptureStatusNone;
+        (void)cudaStreamIsCapturing(stream, &adopted_capture);
+        if (adopted_capture == cudaStreamCaptureStatusNone) {
+            std::lock_guard<std::mutex> scratch_lock(g_mutex);
+            (void)ensure_scratch(static_cast<std::size_t>(weight.n) * marlin_fixed_m() * 2,
+                                 static_cast<std::size_t>(weight.k) * marlin_fixed_m() * 2,
+                                 stream);
+        }
         return {const_cast<void*>(weight.qdata), const_cast<void*>(weight.scales)};
     }
     if (!fp8_opt_in || weight.layout != QuantLayout::RowScale) { return {}; }
@@ -331,6 +342,38 @@ MarlinPlane marlin_fp8_plane_for(const Weight& weight, cudaStream_t stream) {
 // misreading the tiles. Adoption must therefore only be applied to weights
 // whose consumers can all serve Marlin; the caller decides that, and a wrong
 // decision fails loudly at plan time rather than silently at run time.
+// Adoption trigger for a route that can serve Marlin tiles at any T.
+//
+// Called from the four FP8 families that have a Marlin route — linear_add,
+// linear_swiglu, attn_input_proj, gdn_input_proj. Reaching one of them IS the
+// safety precondition: a weight only becomes Marlin-tiled if a route that can
+// read tiles is asking for it, and any other consumer of the same weight then
+// fails at plan time rather than misreading (PATCHES.md #60).
+//
+// Never adopts during capture — it allocates and synchronizes — so adoption
+// happens on the warmup pass, before any graph is recorded.
+std::size_t marlin_fused_parent_bytes(std::int32_t parent_rows, std::int32_t columns) noexcept {
+    static const bool adopt_opt_in = [] {
+        const char* env = std::getenv("SUROGATE_SERVE_MARLIN_FP8");
+        return env != nullptr && env[0] == '1';
+    }();
+    if (!adopt_opt_in || parent_rows <= 0 || columns <= 0) { return 0; }
+    return static_cast<std::size_t>(parent_rows) * static_cast<std::size_t>(columns) * 2;
+}
+
+bool marlin_fp8_maybe_adopt(const Weight& weight, cudaStream_t stream) {
+    static const bool adopt_opt_in = [] {
+        const char* env = std::getenv("SUROGATE_SERVE_MARLIN_FP8");
+        return env != nullptr && env[0] == '1';
+    }();
+    if (!adopt_opt_in) { return false; }
+    if (weight.layout == QuantLayout::MarlinTiles) { return true; }
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    (void)cudaStreamIsCapturing(stream, &status);
+    if (status != cudaStreamCaptureStatusNone) { return false; }
+    return marlin_fp8_adopt_residency(const_cast<Weight&>(weight), stream);
+}
+
 bool marlin_fp8_adopt_residency(Weight& weight, cudaStream_t stream) {
     if (!g_enabled || weight.qtype != QType::FP8_E4M3FN_ROW_BF16S ||
         weight.layout != QuantLayout::RowScale || weight.scale_dtype != DType::BF16 ||
@@ -376,6 +419,10 @@ bool marlin_fp8_adopt_residency(Weight& weight, cudaStream_t stream) {
     cudaFree(b_tmp);
     cudaFree(s_tmp);
     weight.layout = QuantLayout::MarlinTiles;
+    // Prime the scratch now, while allocation is still legal, so the first
+    // in-band call after adoption cannot decline for want of it.
+    (void)ensure_scratch(static_cast<std::size_t>(n) * marlin_fixed_m() * 2,
+                         static_cast<std::size_t>(k) * marlin_fixed_m() * 2, stream);
     return true;
 }
 
