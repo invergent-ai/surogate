@@ -1316,7 +1316,7 @@ void ProgramImplCore::prepare_graphs() {
         if (ordinary_batch_limit >= ops::detail::marlin_min_band_tokens()) {
             const std::uint32_t band =
                 std::min<std::uint32_t>(ordinary_batch_limit,
-                                        ops::detail::kMarlinMaxBandTokens);
+                                        ops::detail::marlin_fixed_m());
             prepare_representative(code_warm.min, band);
             device.synchronize();
             schedule::ordinary_decode_batch(ordinary_state, static_cast<std::int32_t>(band),

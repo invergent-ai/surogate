@@ -230,7 +230,7 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         // split-K family by 1.5-2.3x from T=17; the residual add runs as its
         // own pass over the scratch result.
         if (x.ne[1] >= detail::marlin_min_band_tokens() &&
-            x.ne[1] <= detail::kMarlinMaxBandTokens) {
+            x.ne[1] <= detail::marlin_fixed_m()) {
             const detail::MarlinScratch scratch = detail::marlin_scratch_for(w, stream);
             if (scratch.gemm_out != nullptr) {
                 Tensor gemm_out(scratch.gemm_out, DType::BF16, {w.n, x.ne[1]});
@@ -281,7 +281,7 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         // Marlin band (PATCHES.md #38): the 27B's FP8 decode GEMMs run
         // 412-503 GB/s on the exact-T kernels; the vendored kFE4M3fn path
         // takes the band and residual_add runs as its own pass.
-        if (t >= detail::marlin_min_band_tokens() && t <= detail::kMarlinMaxBandTokens) {
+        if (t >= detail::marlin_min_band_tokens() && t <= detail::marlin_fixed_m()) {
             const detail::MarlinScratch scratch = detail::marlin_fp8_scratch_for(w, stream);
             if (scratch.gemm_out != nullptr) {
                 Tensor gemm_out(scratch.gemm_out, DType::BF16, {w.n, t});

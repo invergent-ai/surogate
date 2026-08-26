@@ -1249,3 +1249,24 @@ exact-T FP8 kernels on the shapes that bind it (down 5120x17408: 67.5 us
 vs 185.4; out 5120x6144: 31.4 vs 76.4), so the win is real but needs a
 residency-REPLACING path — repack at load, free the original — rather
 than a duplicating plane. That is the 27B's next arc.
+
+## 40. The band width follows the lane count (2026-08-26)
+
+#39 rejected 64 lanes because batches above 32 fell off the Marlin band.
+Raising kMarlinFixedM to 64 with the ceiling confirms the diagnosis and
+inverts the result at the 4B: 2,234 tok/s at 64 lanes against 2,076 at
+32, with TTFT halved (2.04 s from 4.00 s) and no errors. The same build
+costs the 0.8B 11% (4,441 against 5,013) — its shapes are narrow enough
+that paying a 64-wide M on every band call outweighs the wider batch.
+
+So the width is not a constant. marlin_set_fixed_m takes the engine's
+runtime lane count at construction (32 lanes -> M 32, above -> M 64) and
+the band ceiling follows it, which lets one binary serve the 0.8B at 32
+lanes and the 4B at 64 and give each its best: measured together after
+the change, 0.8B 4,990 and 4B 2,234, zero errors and zero fatals in both.
+
+Against vLLM: 0.8B 4,990 v 5,958 (-16%), 4B 2,234 v 3,390 (-34%), 27B
+370 v 688 (-46%). The 4B is the cell that moved; note its 64-lane run
+needs an explicit --kv-capacity (auto sizes the cache before the doubled
+decode-graph set is accounted for and capture OOMs), which is the next
+thing to fix in the planner rather than in the flags.

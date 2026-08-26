@@ -52,7 +52,12 @@ struct MarlinScratch {
 // coupling, and it is nearly free: Marlin's cost is flat from M=24 to M=32
 // (gate_up 42.1 vs 42.4 us measured). The pad rows compute garbage that no
 // reader ever sees, since C's first t rows are exactly the [n, t] result.
-inline constexpr int kMarlinFixedM = 32;
+// Set once at engine construction from the runtime lane count: the 4B gains
+// 7.5% from a 64-wide band at 64 lanes while the 0.8B loses 11% paying that
+// width on narrow shapes, so the width has to follow the deployment rather
+// than a compile-time constant.
+void marlin_set_fixed_m(int lanes) noexcept;
+int marlin_fixed_m() noexcept;
 
 // Band floor. Marlin wins by ~3x at the 4B's wide shapes even at T=16,
 // while the exact-T split-K kernels stay competitive at the small ones;
@@ -61,7 +66,7 @@ int marlin_min_band_tokens() noexcept;
 // Band ceiling: the fixed M every call pads to. Rounds wider than this fall
 // back to the engine's own kernels; widening means raising kMarlinFixedM
 // (one more zero-padded row block for every call), not splitting the band.
-inline constexpr int kMarlinMaxBandTokens = kMarlinFixedM;
+
 
 // Valid once any plane derived; null members otherwise.
 MarlinScratch marlin_scratch() noexcept;

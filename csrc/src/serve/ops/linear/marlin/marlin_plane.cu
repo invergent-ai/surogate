@@ -65,7 +65,7 @@ bool ensure_scratch(std::size_t out_bytes, std::size_t a_bytes, cudaStream_t str
     cudaGetDevice(&device);
     int sms = 0;
     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
-    const std::size_t c_tmp_bytes = marlin_c_tmp_floats(sms, kMarlinFixedM) * sizeof(float);
+    const std::size_t c_tmp_bytes = marlin_c_tmp_floats(sms, marlin_fixed_m()) * sizeof(float);
     const std::size_t lock_bytes = marlin_workspace_locks_count(sms) * sizeof(int);
     void* out_buf   = nullptr;
     void* a_buf     = nullptr;
@@ -107,12 +107,19 @@ std::size_t marlin_plane_bytes() noexcept { return g_bytes; }
 MarlinScratch marlin_scratch() noexcept { return g_scratch; }
 void marlin_plane_freeze_scratch() noexcept { g_scratch_frozen = true; }
 
+int g_fixed_m = 32;
+void marlin_set_fixed_m(int lanes) noexcept {
+    const int rounded = lanes <= 32 ? 32 : 64;
+    if (g_scratch.gemm_out == nullptr) { g_fixed_m = rounded; }
+}
+int marlin_fixed_m() noexcept { return g_fixed_m; }
+
 int marlin_min_band_tokens() noexcept {
     static const int floor_tokens = [] {
         const char* env = std::getenv("SUROGATE_SERVE_MARLIN_MIN_T");
         if (env == nullptr) { return 17; }
         const int parsed = std::atoi(env);
-        return parsed >= 1 && parsed <= kMarlinMaxBandTokens ? parsed : 17;
+        return parsed >= 1 && parsed <= marlin_fixed_m() ? parsed : 17;
     }();
     return floor_tokens;
 }
@@ -155,8 +162,8 @@ MarlinPlane marlin_plane_for(const Weight& weight, cudaStream_t stream) {
         // it; weights past the budget keep the engine's own kernels.
         return {};
     }
-    if (!ensure_scratch(static_cast<std::size_t>(n) * kMarlinFixedM * 2,
-                        static_cast<std::size_t>(k) * kMarlinFixedM * 2, stream)) {
+    if (!ensure_scratch(static_cast<std::size_t>(n) * marlin_fixed_m() * 2,
+                        static_cast<std::size_t>(k) * marlin_fixed_m() * 2, stream)) {
         return {};
     }
 
@@ -236,8 +243,8 @@ MarlinPlane marlin_fp8_plane_for(const Weight& weight, cudaStream_t stream) {
         // it; weights past the budget keep the engine's own kernels.
         return {};
     }
-    if (!ensure_scratch(static_cast<std::size_t>(n) * kMarlinFixedM * 2,
-                        static_cast<std::size_t>(k) * kMarlinFixedM * 2, stream)) {
+    if (!ensure_scratch(static_cast<std::size_t>(n) * marlin_fixed_m() * 2,
+                        static_cast<std::size_t>(k) * marlin_fixed_m() * 2, stream)) {
         return {};
     }
 
@@ -272,7 +279,7 @@ MarlinScratch marlin_fp8_scratch_for(const Weight& weight, cudaStream_t stream) 
 
 bool marlin_fp8_run(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     const std::int32_t t = x.ne[1];
-    if (t < 1 || t > kMarlinFixedM) { return false; }
+    if (t < 1 || t > marlin_fixed_m()) { return false; }
     if (out.ne[0] != weight.n || out.ne[1] != t) { return false; }
     // The padded-A copy assumes the [k, t] block is contiguous, which is what
     // makes it [t, k] row-major for Marlin. A strided view would copy the
@@ -282,8 +289,8 @@ bool marlin_fp8_run(const Tensor& x, const Weight& weight, Tensor& out, cudaStre
     if (plane.b_packed == nullptr) { return false; }
     const MarlinScratch scratch = marlin_scratch();
     if (scratch.gemm_out == nullptr || scratch.a_pad == nullptr ||
-        static_cast<std::size_t>(weight.n) * kMarlinFixedM * 2 > g_scratch_out_bytes ||
-        static_cast<std::size_t>(weight.k) * kMarlinFixedM * 2 > g_scratch_a_bytes) {
+        static_cast<std::size_t>(weight.n) * marlin_fixed_m() * 2 > g_scratch_out_bytes ||
+        static_cast<std::size_t>(weight.k) * marlin_fixed_m() * 2 > g_scratch_a_bytes) {
         return false;
     }
     const std::size_t a_used = static_cast<std::size_t>(weight.k) * t * 2;
@@ -292,7 +299,7 @@ bool marlin_fp8_run(const Tensor& x, const Weight& weight, Tensor& out, cudaStre
         return false;
     }
     marlin_gemm_bf16(scratch.a_pad, plane.b_packed, plane.scales, scratch.gemm_out, scratch.c_tmp,
-                     scratch.locks, kMarlinFixedM, weight.n, weight.k, /*group_size=*/-1,
+                     scratch.locks, marlin_fixed_m(), weight.n, weight.k, /*group_size=*/-1,
                      /*b_is_fp8=*/true, scratch.sm_count, stream);
     if (out.data != scratch.gemm_out) {
         // The copy-out is contiguous [t, n]; a strided destination would take
@@ -307,7 +314,7 @@ bool marlin_fp8_run(const Tensor& x, const Weight& weight, Tensor& out, cudaStre
 
 bool marlin_w8_run(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     const std::int32_t t = x.ne[1];
-    if (t < 1 || t > kMarlinFixedM) { return false; }
+    if (t < 1 || t > marlin_fixed_m()) { return false; }
     if (out.ne[0] != weight.n || out.ne[1] != t) { return false; }
     // The padded-A copy assumes the [k, t] block is contiguous, which is what
     // makes it [t, k] row-major for Marlin. A strided view would copy the
@@ -317,8 +324,8 @@ bool marlin_w8_run(const Tensor& x, const Weight& weight, Tensor& out, cudaStrea
     if (plane.b_packed == nullptr) { return false; }
     const MarlinScratch scratch = marlin_scratch();
     if (scratch.gemm_out == nullptr || scratch.a_pad == nullptr ||
-        static_cast<std::size_t>(weight.n) * kMarlinFixedM * 2 > g_scratch_out_bytes ||
-        static_cast<std::size_t>(weight.k) * kMarlinFixedM * 2 > g_scratch_a_bytes) {
+        static_cast<std::size_t>(weight.n) * marlin_fixed_m() * 2 > g_scratch_out_bytes ||
+        static_cast<std::size_t>(weight.k) * marlin_fixed_m() * 2 > g_scratch_a_bytes) {
         return false;
     }
 
@@ -332,9 +339,9 @@ bool marlin_w8_run(const Tensor& x, const Weight& weight, Tensor& out, cudaStrea
         return false;
     }
     marlin_gemm_bf16(scratch.a_pad, plane.b_packed, plane.scales, scratch.gemm_out,
-                     scratch.c_tmp, scratch.locks, kMarlinFixedM, weight.n, weight.k,
+                     scratch.c_tmp, scratch.locks, marlin_fixed_m(), weight.n, weight.k,
                      /*group_size=*/32, /*b_is_fp8=*/false, scratch.sm_count, stream);
-    // C is [kMarlinFixedM, n] row-major, so its first t rows are exactly the
+    // C is [marlin_fixed_m(), n] row-major, so its first t rows are exactly the
     // caller's [n, t] result; a caller writing into the scratch itself reads
     // them in place.
     if (out.data != scratch.gemm_out) {

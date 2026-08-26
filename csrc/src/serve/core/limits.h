@@ -14,6 +14,6 @@
 
 namespace ninfer {
 
-inline constexpr std::int32_t kMaximumBatchColumns = 32;
+inline constexpr std::int32_t kMaximumBatchColumns = 64;
 
 } // namespace ninfer

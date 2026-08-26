@@ -40,7 +40,7 @@ unsloth NVFP4 export + base checkpoint by the vendored converter).
 
 | engine | weights | TTFT @1.9k | decode tok/s (1 user) | 100-user agg tok/s | 100-user TTFT p50 | 100-user reqs ok/err |
 |---|---|---:|---:|---:|---:|---:|
-| **surogate serve** | from GGUF Q4_K_M | **48 ms** | **503** | 5,107 † | 1.7 s | 3,720/0 |
+| **surogate serve** | from GGUF Q4_K_M | **48 ms** | **503** | 4,990 † | 1.7 s | 1,490/0 |
 | llama-server (CUDA) | GGUF Q4_K_M | 168 ms | 391 | 772 | 10.9 s | 612/419 |
 | vLLM | NVFP4 (4-bit) | 55 ms | 364 | **5,958** | **0.41 s** | 4,200/0 |
 
@@ -48,7 +48,7 @@ unsloth NVFP4 export + base checkpoint by the vendored converter).
 
 | engine | weights | TTFT @1.9k | decode tok/s (1 user) | 100-user agg tok/s | 100-user TTFT p50 | 100-user reqs ok/err |
 |---|---|---:|---:|---:|---:|---:|
-| **surogate serve** | from GGUF Q4_K_M | **57 ms** | **214** | **2,118** † | 4.0 s | 1,578/0 |
+| **surogate serve** | from GGUF Q4_K_M | **57 ms** | **214** | **2,234** † | 2.0 s | 766/0 |
 | llama-server (CUDA) | GGUF Q4_K_M | 445 ms | 190 | 331 | 27.4 s | 306/174 |
 | vLLM | NVFP4 (4-bit) | 71 ms | 166 | **3,390** | **0.24 s** | 2,400/0 |
 
