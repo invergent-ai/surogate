@@ -235,12 +235,16 @@ MarlinPlane marlin_fp8_plane_for(const Weight& weight, cudaStream_t stream) {
         const char* env = std::getenv("SUROGATE_SERVE_MARLIN_FP8");
         return env != nullptr && env[0] == '1';
     }();
-    if (!fp8_opt_in || !g_enabled || weight.qtype != QType::FP8_E4M3FN_ROW_BF16S ||
-        weight.layout != QuantLayout::RowScale || weight.scale_dtype != DType::BF16 ||
-        weight.qdata == nullptr || weight.scales == nullptr || (weight.k % 64) != 0 ||
-        (weight.n % 64) != 0) {
+    if (!g_enabled || weight.qtype != QType::FP8_E4M3FN_ROW_BF16S ||
+        weight.scale_dtype != DType::BF16 || weight.qdata == nullptr ||
+        weight.scales == nullptr || (weight.k % 64) != 0 || (weight.n % 64) != 0) {
         return {};
     }
+    // Already adopted: the weight IS the plane.
+    if (weight.layout == QuantLayout::MarlinTiles) {
+        return {const_cast<void*>(weight.qdata), const_cast<void*>(weight.scales)};
+    }
+    if (!fp8_opt_in || weight.layout != QuantLayout::RowScale) { return {}; }
 
     cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
     (void)cudaStreamIsCapturing(stream, &capture_status);
@@ -309,6 +313,70 @@ MarlinPlane marlin_fp8_plane_for(const Weight& weight, cudaStream_t stream) {
     g_bytes += b_bytes + s_bytes;
     g_planes.emplace(weight.qdata, entry);
     return {entry.b_packed, entry.scales};
+}
+
+// Residency adoption (design/serve-engine-multiarch.md item 3). Repacks the
+// weight into Marlin tiles IN PLACE and stamps QuantLayout::MarlinTiles.
+//
+// For FP8 the packed form is exactly n*k bytes and the scales exactly n*2 — the
+// sizes the residency already holds — so adoption costs nothing permanent, only
+// transient repack buffers. That is what makes it viable on a model whose
+// weights leave no room for a duplicate plane, which is precisely the case
+// (the 27B) where the Marlin kernels are worth the most: 2.4-2.75x on the
+// families that are 47% of its device time.
+//
+// The tag is the safety mechanism. Once stamped, routes that gate on
+// QuantLayout::RowScale no longer match the weight, so a path that cannot
+// serve Marlin tiles reaches its "unsupported weight format" throw instead of
+// misreading the tiles. Adoption must therefore only be applied to weights
+// whose consumers can all serve Marlin; the caller decides that, and a wrong
+// decision fails loudly at plan time rather than silently at run time.
+bool marlin_fp8_adopt_residency(Weight& weight, cudaStream_t stream) {
+    if (!g_enabled || weight.qtype != QType::FP8_E4M3FN_ROW_BF16S ||
+        weight.layout != QuantLayout::RowScale || weight.scale_dtype != DType::BF16 ||
+        weight.qdata == nullptr || weight.scales == nullptr || (weight.k % 64) != 0 ||
+        (weight.n % 64) != 0) {
+        return false;
+    }
+    const int n = weight.n;
+    const int k = weight.k;
+    const std::size_t b_bytes    = marlin_b_out_words(n, k) * sizeof(std::uint32_t);
+    const std::size_t s_bytes    = static_cast<std::size_t>(n) * 2;
+    const std::size_t gptq_bytes = static_cast<std::size_t>(k / 4) * n * sizeof(std::uint32_t);
+    // In-place only when the packed form is size-exact against the residency;
+    // decline rather than corrupt.
+    if (b_bytes != static_cast<std::size_t>(n) * k) { return false; }
+
+    std::size_t free_bytes = 0, total_bytes = 0;
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess ||
+        free_bytes < 2 * (b_bytes + s_bytes + gptq_bytes)) {
+        return false;
+    }
+
+    void* b_tmp    = nullptr;
+    void* s_tmp    = nullptr;
+    void* gptq_tmp = nullptr;
+    if (cudaMalloc(&b_tmp, b_bytes) != cudaSuccess) { return false; }
+    if (cudaMalloc(&s_tmp, s_bytes) != cudaSuccess) {
+        cudaFree(b_tmp);
+        return false;
+    }
+    if (cudaMalloc(&gptq_tmp, gptq_bytes) != cudaSuccess) {
+        cudaFree(b_tmp);
+        cudaFree(s_tmp);
+        return false;
+    }
+    marlin_repack_fp8_row(weight.qdata, weight.scales, n, k, gptq_tmp, b_tmp, s_tmp, stream);
+    CUDA_CHECK(cudaMemcpyAsync(const_cast<void*>(weight.qdata), b_tmp, b_bytes,
+                               cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(const_cast<void*>(weight.scales), s_tmp, s_bytes,
+                               cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    cudaFree(gptq_tmp);
+    cudaFree(b_tmp);
+    cudaFree(s_tmp);
+    weight.layout = QuantLayout::MarlinTiles;
+    return true;
 }
 
 MarlinScratch marlin_fp8_scratch_for(const Weight& weight, cudaStream_t stream) {

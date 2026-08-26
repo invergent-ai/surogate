@@ -44,6 +44,16 @@ enum class QuantLayout : std::uint16_t {
     Contiguous          = 1,
     BlockScaleK16M128x4 = 2,
     RowScale            = 3,
+    // The weight's bytes are Marlin tiles, not the format its QType names.
+    // Residency-replacing repack (design/serve-engine-multiarch.md item 3)
+    // rewrites a weight in place and stamps this, which is what makes the
+    // replacement safe: a route that cannot serve Marlin tiles no longer
+    // matches the weight, so it falls through to its "unsupported weight
+    // format" throw at plan time instead of reading the tiles as e4m3 and
+    // emitting noise (PATCHES.md #59). The tag lives here, on the weight,
+    // rather than in a target, so any architecture inherits it by declaring
+    // a compute profile.
+    MarlinTiles         = 4,
 };
 
 struct Weight {

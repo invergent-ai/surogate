@@ -278,6 +278,22 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         if (!aligned_to(x.data, 16) || !aligned_to(residual_out.data, 16)) {
             throw std::invalid_argument("linear_add: FP8 requires 16-byte x/residual alignment");
         }
+        // Adopted residency (PATCHES.md #60): the weight IS Marlin tiles, so
+        // Marlin is the only route that can read it. Any T — the wide path
+        // passes A and C straight through. A failure here must throw rather
+        // than fall through to the e4m3 kernels, which would misread the tiles.
+        if (w.layout == QuantLayout::MarlinTiles) {
+            const detail::MarlinScratch adopted = detail::marlin_fp8_scratch_for(w, stream);
+            Tensor gemm_out = adopted.gemm_out != nullptr && t <= detail::marlin_fixed_m()
+                                  ? Tensor(adopted.gemm_out, DType::BF16, {w.n, t})
+                                  : ws.alloc(DType::BF16, {w.n, t});
+            if (!detail::marlin_fp8_run(x, w, gemm_out, stream)) {
+                throw std::invalid_argument(
+                    "linear_add: weight holds Marlin tiles but Marlin declined the call");
+            }
+            residual_add(gemm_out, residual_out, stream);
+            return;
+        }
         // Marlin band (PATCHES.md #38): the 27B's FP8 decode GEMMs run
         // 412-503 GB/s on the exact-T kernels; the vendored kFE4M3fn path
         // takes the band and residual_add runs as its own pass.

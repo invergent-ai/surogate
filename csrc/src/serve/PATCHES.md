@@ -2049,3 +2049,42 @@ prerequisite in place and the unsafe shortcut out.
 
 27B verified restored after the revert: 581 tok/s at 48 lanes, correct
 output, zero errors.
+
+## 60. The residency layout tag (2026-08-26)
+
+#59 showed that replacing a weight's residency with Marlin tiles is
+size-exact and free, and unsafe without a way for the rest of the engine to
+know it happened. This adds that way.
+
+`QuantLayout::MarlinTiles` joins the shared weight abstraction in
+core/tensor.h — on the weight, not in a target, so any architecture
+inherits it by declaring a compute profile rather than by having code
+written for it (design/unified-train-serve.md: abstraction work comes
+before generation, because the generator emits against these interfaces).
+
+Three pieces:
+
+  marlin_fp8_adopt_residency(Weight&, stream) repacks a weight into Marlin
+  tiles in place and stamps the tag. Transient buffers only; nothing
+  permanent, because for FP8 the packed form is exactly n*k and the scales
+  exactly n*2 — the sizes the residency already holds.
+
+  marlin_fp8_plane_for recognises an adopted weight and returns the weight's
+  own pointers as the plane, so no second copy exists anywhere.
+
+  linear_add routes a MarlinTiles weight to Marlin at any T and THROWS if
+  Marlin declines, instead of falling through to the e4m3 kernels.
+
+The safety argument is now structural rather than by inspection. Routes gate
+on QuantLayout::RowScale; an adopted weight no longer matches them, so a path
+that cannot serve Marlin tiles reaches its "unsupported weight format" throw
+at plan time. The failure mode #59 hit — tiles read as e4m3, noise emitted,
+nothing raised — is unrepresentable: to misread the bytes a route would have
+to match a layout it does not accept.
+
+Still to land: the call that adopts. Adoption must cover every consumer of a
+weight before it is applied, and gdn_input_proj and attn_input_proj have no
+Marlin route yet, so only the linear_add and linear_swiglu families are
+eligible today. Wiring those two, then adopting at load time from the
+target's declared compute profile, is what turns the 2.4-2.75x the probe
+measured into throughput.

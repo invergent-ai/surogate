@@ -36,6 +36,11 @@ MarlinPlane marlin_plane_for(const Weight& weight, cudaStream_t stream);
 // 47% of that model's device time at 412-503 GB/s.
 MarlinPlane marlin_fp8_plane_for(const Weight& weight, cudaStream_t stream);
 
+// Repacks a weight into Marlin tiles in place and stamps QuantLayout::MarlinTiles.
+// Only for weights whose every consumer can be served from Marlin; see the note
+// at the definition.
+bool marlin_fp8_adopt_residency(Weight& weight, cudaStream_t stream);
+
 struct MarlinScratch {
     void* gemm_out = nullptr;  // bf16 [kMarlinFixedM, n] row-major
     void* a_pad    = nullptr;  // bf16 [kMarlinFixedM, k], pad rows zeroed
