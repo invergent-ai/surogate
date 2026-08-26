@@ -87,6 +87,9 @@ class TargetSpec:
     rope_theta: float
     attention: AttentionSpec
     linear_attention: LinearAttentionSpec | None = None
+    native_context: int = 262144
+    mtp_draft_tokens: int = 5
+    attention_interval: int = 4
     tensor_names: dict[str, str] = field(default_factory=dict)
 
     def validate(self) -> None:
@@ -98,6 +101,27 @@ class TargetSpec:
         self.attention.validate()
         if self.linear_attention is not None:
             self.linear_attention.validate()
+
+    @property
+    def full_attention_layers(self) -> int:
+        """Mirrors qwen3_6::full_attention_layers so the emitted static_asserts
+        state the same thing the header computes — if the two ever disagree the
+        generated target fails to compile, which is the intent."""
+        return self.layers // self.attention_interval
+
+    @property
+    def gdn_layers(self) -> int:
+        return self.layers - self.full_attention_layers
+
+    @property
+    def attention_scale(self) -> float:
+        return self.attention.head_dim ** -0.5
+
+    @property
+    def gdn_scale(self) -> float:
+        if self.linear_attention is None:
+            raise ValueError("gdn scale requires a linear-attention spec")
+        return self.linear_attention.key_head_dim ** -0.5
 
     @property
     def query_size(self) -> int:

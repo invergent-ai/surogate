@@ -36,10 +36,9 @@ def main(root: pathlib.Path) -> int:
     for name, spec in SPECS.items():
         committed = (root / name / "impl" / "config.h").read_text()
         generated = emit_config_h(spec)
-        # The emitter covers the header through rope_theta; compare that prefix.
-        prefix = committed[: len(generated)]
+        prefix = committed
         if prefix == generated:
-            print(f"{name}: config.h prefix reproduced ({len(generated.splitlines())} lines)")
+            print(f"{name}: config.h reproduced in full ({len(generated.splitlines())} lines)")
             continue
         failures += 1
         print(f"{name}: MISMATCH")

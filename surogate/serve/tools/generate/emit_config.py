@@ -65,4 +65,62 @@ struct TextConfig {{
     static constexpr int full_attention_interval = qwen3_6::kHybridAttentionInterval;
     static constexpr float rms_epsilon           = {_float_literal(spec.rms_epsilon)};
     static constexpr float rope_theta            = {_float_literal(spec.rope_theta)};
+
+    static constexpr int key_dim               = gdn_key_heads * gdn_key_head_dim;
+    static constexpr int value_dim             = gdn_value_heads * gdn_value_head_dim;
+    static constexpr int convolution_dim       = 2 * key_dim + value_dim;
+    static constexpr int query_size            = query_heads * head_dim;
+    static constexpr int kv_size               = kv_heads * head_dim;
+    static constexpr int query_projection_rows = 2 * query_size;
+
+    static constexpr int mtp_layers               = 1;
+    static constexpr int mtp_input_rows           = 2 * hidden;
+    static constexpr int mtp_attention_input_rows = 2 * query_size + 2 * kv_size;
+    static constexpr int mtp_mlp_gate_up_rows     = 2 * intermediate;
+
+    [[nodiscard]] static constexpr bool is_full_attention(int layer) {{
+        return qwen3_6::is_full_attention_layer(layer);
+    }}
+
+    [[nodiscard]] static constexpr int full_attention_layers() {{
+        return qwen3_6::full_attention_layers(layers);
+    }}
+
+    [[nodiscard]] static constexpr int gdn_layers() {{ return qwen3_6::gdn_layers(layers); }}
+
+    [[nodiscard]] static constexpr int full_attention_index(int layer) {{
+        return qwen3_6::full_attention_index(layer);
+    }}
+
+    [[nodiscard]] static constexpr int gdn_index(int layer) {{ return qwen3_6::gdn_index(layer); }}
+}};
+
+static_assert(TextConfig::full_attention_layers() == {spec.full_attention_layers});
+static_assert(TextConfig::gdn_layers() == {spec.gdn_layers});
+
+struct VisionConfig : qwen3_6::VisionBackboneConfig {{
+    static constexpr int output_hidden = TextConfig::hidden;
+}};
+
+struct DFlashConfig {{
+    static constexpr bool supported     = false;
+    static constexpr int local_layers   = 0;
+    static constexpr int local_capacity = 0;
+    static constexpr int kv_heads       = 0;
+    static constexpr int head_dim       = 0;
+    static constexpr int feature_rows   = 0;
+    static constexpr int hidden         = 0;
+    static constexpr int intermediate   = 0;
+    static constexpr int query_size     = 0;
+    static constexpr int kv_size        = 0;
+}};
+
+inline constexpr float kAttentionScale                   = {spec.attention_scale!r}F;
+inline constexpr float kGdnScale                         = {spec.gdn_scale!r}F;
+inline constexpr std::uint32_t kPrefillChunkAlignment    = 128;
+inline constexpr std::uint32_t kMaximumMtpDraftTokens    = {spec.mtp_draft_tokens};
+inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 0;
+inline constexpr std::uint32_t kNativeContext            = {spec.native_context};
+
+}} // namespace ninfer::targets::{spec.name}::detail
 """
