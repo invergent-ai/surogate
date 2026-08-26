@@ -104,7 +104,7 @@ template <class Geometry>
 void launch_problem(const Weight& weight, Tensor& out, Fp8A8Workspace workspace,
                     std::int32_t tokens, cudaStream_t stream) {
     if (tokens <= 32) {
-        using Batch = Fp8LinearA8BatchSchedule;
+        using Batch = typename Fp8LinearA8BatchScheduleFor<Geometry>::Type;
         if ((tokens % Batch::kBlockTokens) == 0) {
             launch_mma<Geometry, Batch, true>(weight, out, workspace, tokens, stream);
         } else {

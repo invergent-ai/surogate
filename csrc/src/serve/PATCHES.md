@@ -2291,3 +2291,39 @@ share is a small prize to buy with this much machinery.
 
 Reverted to the committed state. The engine is unchanged and the default path
 measures 581 tok/s.
+
+## 64. Row tiling at N=5120, and the 27B's real constraint (2026-08-26)
+
+The FP8 launch grid is (output_rows / kBlockRows) * token_tiles, so at decode
+and narrow-prefill widths the row tiling alone decides occupancy. At N=5120 a
+128-row tile yields 40 CTAs on a 170-SM device — a quarter of the machine — and
+those shapes measured 324-334 GB/s where N=16384 reaches 894 GB/s on the same
+schedule. o_proj and down_proj are ~17% of the 27B's device time.
+
+Halving the row tile to 64 (80 CTAs) gives 581 -> 596 tok/s. Halving again to
+32 (160 CTAs) gives 590, so 64 is the optimum: past that the per-CTA work is
+too small to amortise its own setup.
+
+Note the near-miss: the same change applied to the BATCH schedule first was
+neutral, because the 27B serves 48 lanes and decode t exceeds the 32-token
+batch band. It lands in the production schedule, which serves both prefill and
+wide decode.
+
+Also measured, both kept:
+  int8 KV     596 -> 604 tok/s, and doubles resolved KV (46,016 -> 89,280)
+  bf16 KV     593 for comparison at the same tiling
+
+And measured, both rejected:
+  128-token prefill tiles   557 (-8%): wider token tiles cost more occupancy
+                            than the weight-traffic they save
+  fp4 prefill profile       581 either way: the flag drives the W8 path, and
+                            the 27B is NVFP4/FP8 resident, so it is a no-op
+
+**What the numbers say about the 27B's gap.** The board's vLLM figure uses
+--max-num-seqs 32, so 688 tok/s is 32 concurrent streams at ~21.5 tok/s each.
+Ours is 48 lanes at ~12.6 aggregate-per-lane, and the per-stream decode rate is
+comparable — the difference is duty cycle. Roughly 40% of the device goes to
+prefill here, and the same NVFP4 pattern is visible: its N=5120 prefill calls
+run 40 CTAs at 152 GB/s while N=34816 reaches 828. The NVFP4 prefill schedule
+is a different family from the FP8 one and has not had this treatment; that is
+the next concrete lever, worth roughly the 7% of device those calls occupy.
