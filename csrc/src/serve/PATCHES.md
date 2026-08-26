@@ -1618,3 +1618,46 @@ Why this is the highest-value item on the board: the 0.8B measured 6,003
 tok/s in the wide-band configuration before it corrupted, against vLLM's
 5,958. Fixing this one fault plausibly closes the 0.8B cell outright, and
 the same band is already worth +27% on the 4B.
+
+## 49. The 0.8B beats vLLM when it runs; the fault is not yet found (2026-08-26)
+
+Seven 90-second runs of the 0.8B at 64 lanes with the wide Marlin band
+(SUROGATE_SERVE_MARLIN_WIDE=1):
+
+  6,015  clean      6,078  clean
+  4,198  CRASHED    2,836  CRASHED
+  6,075  clean      6,101  clean
+                    6,046  clean
+
+Five clean runs, all between 6,015 and 6,101 tok/s, against vLLM's 5,958
+— the engine is 1-2% AHEAD whenever the round completes. Two runs died
+with "invalid UTF-8 leading byte in generated token stream". No
+functional code differs between crashing and clean runs; the fault is
+intermittent at roughly one run in three.
+
+Two theories tested and REJECTED by measurement, not by argument:
+
+  Lock array undersized. Rejected statically — the grid is sms blocks,
+  blocks_per_sm is 1 on every path, locks_off < sms. The change was
+  written and reverted before shipping.
+
+  Out-of-bounds locks[-1] from marlin_template.h:422 corrupting the
+  adjacent allocation. This write is real (blockIdx.x == 0 gives -1 on
+  that branch) and is now guarded by front-padding the allocation, but
+  guarding it did NOT change the failure rate: 3 clean / 1 crash over
+  four runs, indistinguishable from unguarded. The guard stays as
+  defensive hygiene, labelled as such. The fault is elsewhere.
+
+Also relevant: compute-sanitizer memcheck runs clean, but only ~25
+requests complete under instrumentation, far below the churn that
+triggers it — so a clean memcheck is not evidence here.
+
+Next step is instrumentation of the failure path rather than more
+theories: when the frontend rejects a generated token, dump the round's
+shape (mixed vs pure decode, graph vs eager, batch width, lane index).
+That names the producing path in one crash instead of narrowing by
+elimination. Roughly ten lines on a path that costs nothing until it
+fires.
+
+Standing: 0.8B 6,046 (wide band, 5 of 7 runs) or 5,462 (default, stable)
+v vLLM 5,958; 4B 2,685 v 3,390 (-21%); 27B 370 v 688 (-46%).

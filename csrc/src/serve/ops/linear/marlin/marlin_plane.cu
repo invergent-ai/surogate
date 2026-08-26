@@ -26,6 +26,9 @@ struct PlaneEntry {
 
 std::map<const void*, PlaneEntry> g_planes;
 
+// Guard bytes in front of the locks array; see the note at its allocation.
+constexpr std::size_t kLockGuardBytes = 256;
+
 MarlinScratch g_scratch;
 std::size_t g_scratch_out_bytes = 0;
 std::size_t g_scratch_a_bytes   = 0;
@@ -73,7 +76,7 @@ bool ensure_scratch(std::size_t out_bytes, std::size_t a_bytes, cudaStream_t str
     int sms = 0;
     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
     const std::size_t c_tmp_bytes = marlin_c_tmp_floats(sms, marlin_fixed_m()) * sizeof(float);
-    const std::size_t lock_bytes = marlin_workspace_locks_count(sms) * sizeof(int);
+    std::size_t lock_bytes = marlin_workspace_locks_count(sms) * sizeof(int);
     void* out_buf   = nullptr;
     void* a_buf     = nullptr;
     void* c_tmp_buf = nullptr;
@@ -88,6 +91,15 @@ bool ensure_scratch(std::size_t out_bytes, std::size_t a_bytes, cudaStream_t str
         cudaFree(a_buf);
         return false;
     }
+    // Defensive, NOT a fix for the wide-band fault. The reduce computes
+    // locks_off = (iters * blockIdx.x) / k_tiles - 1 on the branch taken when
+    // the problem's mn-tile count is below the grid width, which is -1 for
+    // block 0 (marlin_template.h:422) — a real one-int write before the array
+    // that lands in the adjacent allocation instead of faulting. Front-padding
+    // makes it harmless. It was measured against the 0.8B wide-band corruption
+    // and did NOT change the failure rate (3 clean / 1 crash over four 90 s
+    // runs, same as unguarded), so the observed fault is elsewhere.
+    lock_bytes += kLockGuardBytes;
     if (cudaMalloc(&lock_buf, lock_bytes) != cudaSuccess) {
         cudaFree(out_buf);
         cudaFree(a_buf);
@@ -96,6 +108,7 @@ bool ensure_scratch(std::size_t out_bytes, std::size_t a_bytes, cudaStream_t str
     }
     cudaMemsetAsync(a_buf, 0, a_bytes, stream);
     cudaMemsetAsync(lock_buf, 0, lock_bytes, stream);
+    lock_buf = static_cast<void*>(static_cast<char*>(lock_buf) + kLockGuardBytes);
     g_scratch = MarlinScratch{out_buf, a_buf, c_tmp_buf, static_cast<int*>(lock_buf), sms};
     g_scratch_out_bytes = out_bytes;
     g_scratch_a_bytes   = a_bytes;
