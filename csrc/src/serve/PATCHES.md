@@ -1351,3 +1351,38 @@ the wall clock. The decode-side work (Marlin, lanes, admission, bursts)
 has been mined out; the next real gain is prefill throughput, which is
 also where the resident-Marlin change pays a second time by letting
 Marlin serve prefill instead of the current cutlass/fp4 path.
+
+## 43. One prompt per mixed round is the 4B's ceiling (2026-08-26)
+
+Round timing at the 64-lane optimum, per 5 s: mixed 2,980 ms over 90
+rounds (33 ms each, 60% of the wall), decode 1,950 ms over 90 rounds
+(21.7 ms each, 39%), executor tails 60 ms total. The loop alternates
+one mixed round with one decode round.
+
+The arithmetic that matters: a mixed round admits up to
+prefill_chunk - batch = 960 columns, but it carries exactly ONE prompt,
+because there is a single prefill lane. At 512-token prompts it
+therefore uses 512 of its 960 columns and retires one prompt per round.
+Ninety mixed rounds per five seconds is 18 prompts/s is 9,216 prefill
+tok/s — which is the 8,900 the benchmark actually demands, so prefill is
+running exactly at its structural limit while leaving 45% of each mixed
+round's column budget unused.
+
+Marginal cost confirms the headroom is real: a decode round moves 64
+columns in 21.7 ms, a mixed round moves 576 in 33 ms, so 512 prefill
+columns cost 11 ms on top of a round we were paying for anyway. Filling
+the remaining 448 columns with a second prompt is close to free.
+
+This also explains why #41 and #42 came back neutral. Admission cadence
+and burst length never mattered: the queue drains at one prompt per
+mixed round regardless of how many requests are admitted or how many
+decode rounds are chained behind them. Prefill chunk size does not
+change it either (1024/2048/3072 all measure the same), because the
+limit is prompts per round, not columns per round.
+
+The fix is multi-prompt mixed rounds: let one round carry the tail of
+one prompt and the head of the next, up to the column budget. That means
+a prefill lane set rather than the single prefill_lane_, and a
+mixed_chunk that takes a list of (lane, span) rather than one prompt.
+It is the largest remaining decode-side lever at the 4B and it is a
+scheduler change, not a kernel change.
