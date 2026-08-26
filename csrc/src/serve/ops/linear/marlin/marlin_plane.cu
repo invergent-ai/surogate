@@ -109,9 +109,19 @@ void marlin_plane_freeze_scratch() noexcept { g_scratch_frozen = true; }
 
 int g_fixed_m = 32;
 void marlin_set_fixed_m(int lanes) noexcept {
-    // At M >= 64 Marlin's thread_m_blocks saturates at 4, so every width from
-    // 64 up selects the same kernel and the decode graphs stay one class.
-    const int rounded = lanes <= 32 ? 32 : lanes <= 64 ? 64 : ((lanes + 31) / 32) * 32;
+    // Pinned to 32 pending a fix. A 64-wide band measured faster over 40 s
+    // (0.8B 6,003, 4B 2,633) but BOTH models fail under 90 s of sustained
+    // load — the 0.8B with an invalid-UTF-8 fatal, the 4B with collapsing
+    // throughput and truncated streams — while the same 90 s load is clean at
+    // 32 lanes with Marlin, and clean at 64 lanes with Marlin off
+    // (SUROGATE_SERVE_MARLIN=0, 5,429 tok/s, zero errors). So the fault is
+    // Marlin at wide batches, not the lane count. At 32 the band only serves
+    // rounds it is proven on and wider rounds take the engine's own kernels.
+    // SUROGATE_SERVE_MARLIN_WIDE=1 restores the 64-wide band for debugging.
+    const char* wide = std::getenv("SUROGATE_SERVE_MARLIN_WIDE");
+    const bool allow_wide = wide != nullptr && wide[0] == '1';
+    const int rounded = (!allow_wide || lanes <= 32) ? 32
+                                                     : (lanes <= 64 ? 64 : ((lanes + 31) / 32) * 32);
     if (g_scratch.gemm_out == nullptr) { g_fixed_m = rounded; }
 }
 int marlin_fixed_m() noexcept { return g_fixed_m; }

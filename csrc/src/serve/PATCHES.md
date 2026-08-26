@@ -1458,3 +1458,44 @@ Marlin (1.5-2.3x on decode GEMMs), the lane raise with band width
 following it, and the batch-aware KV split clamp. Three of those four
 were width constants or routing that degraded silently rather than
 failing — which is the pattern worth carrying into the next session.
+
+## 47. Marlin is unstable at wide batches — band pinned to 32 (2026-08-26)
+
+Forty-second runs are not long enough to qualify this engine. A 90 s
+confirmation of the 0.8B's 6,003 tok/s died partway with "invalid UTF-8
+leading byte in generated token stream"; a 90 s 4B run at the same
+settings did not log a fatal but collapsed to 1,212 tok/s with 9,240
+truncated streams. Both had shown clean 40 s runs.
+
+Isolation, all 90 s, 100 users:
+  0.8B 32 lanes, Marlin on   5,111 tok/s  3,730 reqs  0 errors  CLEAN
+  0.8B 64 lanes, Marlin off  5,429 tok/s  3,954 reqs  0 errors  CLEAN
+  0.8B 64 lanes, Marlin on   died at ~90 s
+  4B   64 lanes, Marlin on   collapsed mid-run
+
+So the fault is Marlin at wide batches, not the lane count and not the
+sampler cap (#44 is clean at 32 lanes over 90 s). kMarlinFixedM is
+therefore pinned to 32 regardless of lane count: the band serves only
+the widths it is proven on and wider rounds take the engine's own
+kernels. SUROGATE_SERVE_MARLIN_WIDE=1 restores the 64-wide band for
+debugging.
+
+Honest standing, stable configurations only:
+  0.8B  5,429 v vLLM 5,958  (-9%)   64 lanes, Marlin off
+  4B    needs a 90 s run at 64 lanes with Marlin off; the 2,633 figure
+        is a 40 s number on a configuration now known to be unstable
+  27B   370 v 688 (-46%)    32 lanes, unchanged
+
+Suspects for the wide-batch fault, in order: the shared Marlin scratch
+(gemm_out / a_pad / c_tmp / locks are process-global and sized from the
+first derive — a later weight or a wider round can outgrow what the
+freeze locked in, and marlin_w8_run's size guards return false rather
+than resize, so a partially-written buffer is possible); the locks array
+(Marlin's global reduce self-resets it, and a grid change between calls
+could leave it dirty); and c_tmp sizing, which is computed from
+marlin_fixed_m() at first derive and would be short if the width ever
+rose afterwards. All three are consistent with a fault that needs
+sustained load and varied batch widths to surface.
+
+METHOD NOTE: every performance figure in this file measured over 40 s
+should be re-qualified at 90 s before it is trusted.
