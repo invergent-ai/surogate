@@ -225,6 +225,14 @@ public:
     mixed_chunk(std::span<const int> full_ids, std::uint32_t begin, std::uint32_t nominal_length,
                 bool finalize_at_end, const MixedDecodeSlice& decode);
 
+    // Mixed-round CUDA graphs (PATCHES.md #30): the mixed body captured at a
+    // (chunk bucket, batch bucket) pair. The decode slice must be sliced to
+    // the batch bucket, with pad rows staged as duplicates of a live row.
+    [[nodiscard]] bool try_mixed_graph_chunk(std::span<const int> full_ids, std::uint32_t begin,
+                                             std::uint32_t nominal, const MixedDecodeSlice& decode,
+                                             std::int32_t batch_bucket);
+    void mixed_graph_window(std::int32_t chunk_bucket, std::int32_t batch_bucket);
+
     [[nodiscard]] PrefillChunkResult prefill_chunk(std::span<const int> full_ids,
                                                    std::uint32_t begin,
                                                    std::uint32_t nominal_length,
@@ -351,6 +359,7 @@ private:
     std::int64_t prefill_rewrite_checkpoint_frontier_     = -1;
     PrefillGraphFamily* prefill_graph_family_             = nullptr;
     Tensor graph_pad_valid_storage_;
+    MixedDecodeSlice mixed_graph_decode_{};
     const Tensor* graph_pad_valid_                        = nullptr;
     Tensor* rewrite_checkpoint_hidden_output_             = nullptr;
     std::uint32_t mtp_proposal_extent_                    = 0;

@@ -945,3 +945,34 @@ CPU pass on this host (`CUDA_VISIBLE_DEVICES="" ctest`): 83/89 after patch 4.
    ("SUROGATE SERVE OK"; thinking + no-thinking modes both coherent),
    stop-token finish. Perf untuned (q08 routes favor correctness over
    measured tiles; decode measured only on a contended GPU so far).
+
+## 31. Mixed-round CUDA graphs + graphed-prompt state-slot fix (2026-08-26)
+
+The bd08m census showed 16.2% device idle at the 0.8B under 100-user mixed
+load: every round with a live prefill lane ran the eager mixed body
+(~600 launches with 2-5us bubbles). Mixed rounds now capture and replay as
+CUDA graphs, keyed (chunk_bucket x 128, batch bucket {8,16,24,32}) in the
+PATCHES #27 family (`mixed_key = (chunk<<8)|batch`, disjoint from plain
+buckets). Prefill-side padding reuses the #27 discipline (ingress `valid`,
+pad-aware conv, g/beta zeroed over the prefill window only — a sliced
+`mask_columns_zero`, no new op). Decode-side padding is entirely host-side:
+pad ingress rows duplicate row 0, so a pad column recomputes that lane's own
+update and every state/KV write lands as identical bytes. The decode
+envelope bakes {1, kv_capacity} (worst-case launch geometry, same as the
+prefill graph side). Epilogues (scatter, sample, egress) stay eager at the
+real row count.
+
+Also fixed while wiring: `advance_prefill_mixed` configured the lane state
+slot while graphed prompts (`staged.use_graph`) run all other chunks on the
+shared scratch slot — multi-chunk prompts interleaving mixed and classic
+chunks split their GDN state across two slots (benches never hit it:
+512-token prompts are single-chunk). The mixed card now follows the same
+ternary and the mixed completion path copies scratch back to the lane slot.
+
+Measured (100 users, 512/128): 0.8B 4,892 -> 5,131 tok/s (vLLM 5,958, gap
+-18% -> -14%); 4B 1,873 -> 1,902 (compute-dominated rounds, launch tax was
+small). Census after: 100% of kernels from graph nodes, but idle is still
+~18% at the 0.8B — the residual is the serial per-round host path
+(sync -> egress read -> bookkeeping -> stage -> launch), ~1ms/round of dark
+device. That is the actual scheduler gap vs vLLM's async staging; next arc
+is round chaining (stage round N+1 before consuming round N's egress).

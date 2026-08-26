@@ -39,8 +39,9 @@
 namespace ninfer::targets::qwen3_6::detail {
 
 struct PrefillGraphIngress {
-    std::int32_t base  = 0; // absolute position of the chunk's first token
-    std::int32_t valid = 0; // real token count in the padded window
+    std::int32_t base        = 0; // absolute position of the chunk's first token
+    std::int32_t valid       = 0; // real token count in the padded window
+    std::int32_t batch_valid = 0; // mixed rounds: real decode lanes in the batch bucket
 };
 
 class PrefillGraphFamily {
@@ -59,14 +60,14 @@ public:
                                  sizeof(PrefillGraphIngress), cudaHostAllocDefault));
         *ingress_staging_ = {};
 
-        CUDA_CHECK(cudaMalloc(&ingress_device_storage_, 2 * sizeof(std::int32_t)));
+        CUDA_CHECK(cudaMalloc(&ingress_device_storage_, 3 * sizeof(std::int32_t)));
         CUDA_CHECK(
             cudaMalloc(&iota_storage_,
                        static_cast<std::size_t>(prefill_chunk_) * sizeof(std::int32_t)));
         CUDA_CHECK(
             cudaMalloc(&rope_positions_storage_,
                        static_cast<std::size_t>(prefill_chunk_) * sizeof(std::int32_t)));
-        CUDA_CHECK(cudaMemsetAsync(ingress_device_storage_, 0, 2 * sizeof(std::int32_t),
+        CUDA_CHECK(cudaMemsetAsync(ingress_device_storage_, 0, 3 * sizeof(std::int32_t),
                                    device_.stream));
         Tensor iota = iota_window(prefill_chunk_);
         ops::fill_i32_positions(iota, 0, device_.stream);
@@ -100,7 +101,7 @@ public:
 
     // Device tensors the captured body bakes.
     [[nodiscard]] Tensor ingress_device() const {
-        return Tensor(ingress_device_storage_, DType::I32, {2});
+        return Tensor(ingress_device_storage_, DType::I32, {3});
     }
     [[nodiscard]] Tensor iota_window(std::int32_t tokens) const {
         return Tensor(iota_storage_, DType::I32, {tokens});
@@ -114,6 +115,14 @@ public:
      * bucket's first use. Returns nullptr when the family is dead or capture
      * fails (the caller runs the eager body; failure poisons the family).
      */
+    [[nodiscard]] static std::int32_t mixed_key(std::int32_t chunk_bucket,
+                                                std::int32_t batch_bucket) noexcept {
+        return (chunk_bucket << 8) | batch_bucket;
+    }
+    [[nodiscard]] static std::int32_t batch_bucket_for(std::int32_t batch) noexcept {
+        return batch <= 8 ? 8 : batch <= 16 ? 16 : batch <= 24 ? 24 : 32;
+    }
+
     DecodeGraphExecutable* ensure(std::int32_t bucket, const std::function<void()>& body) {
         if (dead_) { return nullptr; }
         auto found = buckets_.find(bucket);

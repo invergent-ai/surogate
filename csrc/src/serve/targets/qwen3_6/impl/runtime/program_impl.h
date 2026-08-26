@@ -2032,6 +2032,19 @@ ProgramImplCore::advance_prefill_mixed(std::uint32_t prefill_lane,
             ordinary_host_ingress->sampling[row] = request.sampling_host;
             materialize_sequence_kv(sequence, frontier + 1, 0);
         }
+        // Mixed-round graphs (PATCHES.md #30) pad the decode batch to its
+        // bucket by duplicating row 0: a pad column recomputes that lane's
+        // own update, so every state/KV write lands as identical bytes.
+        const std::int32_t batch_bucket = PrefillGraphFamily::batch_bucket_for(rows);
+        for (std::int32_t row = rows; row < batch_bucket; ++row) {
+            const std::size_t pad                          = static_cast<std::size_t>(row);
+            ordinary_host_ingress->tokens[pad]             = ordinary_host_ingress->tokens[0];
+            ordinary_host_ingress->cache_positions[pad]    = ordinary_host_ingress->cache_positions[0];
+            ordinary_host_ingress->rope_positions[pad]     = ordinary_host_ingress->rope_positions[0];
+            ordinary_host_ingress->text_kv_table_rows[pad] = ordinary_host_ingress->text_kv_table_rows[0];
+            ordinary_host_ingress->lanes[pad]              = ordinary_host_ingress->lanes[0];
+            ordinary_host_ingress->sampling[pad]           = ordinary_host_ingress->sampling[0];
+        }
         qwen3_6::OrdinaryDecodeState& ordinary = *io.ordinary;
         CUDA_CHECK(cudaMemcpyAsync(ordinary.ingress.data, ordinary_host_ingress,
                                    sizeof(qwen3_6::OrdinaryDecodeIngress), cudaMemcpyHostToDevice,
@@ -2054,11 +2067,19 @@ ProgramImplCore::advance_prefill_mixed(std::uint32_t prefill_lane,
                                    staged.cursor, {}, &decoder->text_kv, decoder->mtp_cache());
         card.set_sampling(static_cast<const ops::SamplingConfig*>(
             sampling_config.slice(1, static_cast<std::int32_t>(prefill_sequence.lane), 1).data));
+        // Graph prompts run every chunk (graph or eager fallback alike) on
+        // the shared scratch state slot (PATCHES.md #27) so mixed rounds and
+        // classic chunks of one prompt stay on a single state stream.
         card.set_linear_state_slots(
-            LinearStateSlots::current_state_slot(prefill_sequence.lane, max_concurrency),
+            staged.use_graph
+                ? LinearStateSlots::prefill_scratch_state_slot(max_concurrency)
+                : LinearStateSlots::current_state_slot(prefill_sequence.lane, max_concurrency),
             LinearStateSlots::rewrite_checkpoint_state_slot(prefill_sequence.lane,
                                                             max_concurrency));
         card.set_gdn_state_action(schedule::GdnStateAction::UpdateInPlace, nullptr);
+        if (staged.use_graph && prefill_graphs.has_value()) {
+            card.set_prefill_graph_family(&*prefill_graphs);
+        }
         set_device_i32(io.text_kv_table_row, prefill_sequence.kv->text.bound_row());
 
         schedule::TextContext::MixedDecodeSlice slice;
@@ -2072,9 +2093,42 @@ ProgramImplCore::advance_prefill_mixed(std::uint32_t prefill_lane,
         slice.logits             = ordinary.logits.slice(1, 0, rows);
 
         (void)final_candidate;
-        const schedule::PrefillChunkResult chunk = card.mixed_chunk(
-            std::span<const TokenId>(staged.prompt.token_ids), staged.cursor, nominal,
-            /*finalize_at_end=*/false, slice);
+        schedule::PrefillChunkResult chunk{};
+        bool graph_hit = false;
+        if (staged.use_graph && prefill_graphs.has_value()) {
+            // The graph ladder rounds the chunk up to a 128 bucket, so the
+            // nominal must leave room for both the rounding and the batch
+            // bucket inside the prefill_chunk workspace window.
+            const std::uint32_t graph_cap =
+                prefill_chunk > static_cast<std::uint32_t>(batch_bucket)
+                    ? ((prefill_chunk - static_cast<std::uint32_t>(batch_bucket)) / 128U) * 128U
+                    : 0U;
+            const std::uint32_t graph_nominal =
+                std::min(graph_cap, staged.prompt_tokens - staged.cursor);
+            if (graph_nominal > 0) {
+                schedule::TextContext::MixedDecodeSlice bucket_slice;
+                bucket_slice.ids                = ordinary.tokens.slice(0, 0, batch_bucket);
+                bucket_slice.cache_positions    = ordinary.cache_positions.slice(0, 0, batch_bucket);
+                bucket_slice.rope_positions     = ordinary.rope_positions.slice(0, 0, batch_bucket);
+                bucket_slice.kv_table_rows      = ordinary.text_kv_table_rows.slice(0, 0, batch_bucket);
+                bucket_slice.linear_state_slots = ordinary.lanes.slice(0, 0, batch_bucket);
+                bucket_slice.envelope           = {maximum_frontier + 1, maximum_frontier + 1};
+                bucket_slice.hidden             = ordinary.hidden.slice(1, 0, batch_bucket);
+                bucket_slice.logits             = ordinary.logits.slice(1, 0, batch_bucket);
+                if (card.try_mixed_graph_chunk(
+                        std::span<const TokenId>(staged.prompt.token_ids), staged.cursor,
+                        graph_nominal, bucket_slice, batch_bucket)) {
+                    graph_hit = true;
+                    chunk     = schedule::PrefillChunkResult{.processed_tokens = graph_nominal,
+                                                             .finalized        = false};
+                }
+            }
+        }
+        if (!graph_hit) {
+            chunk = card.mixed_chunk(std::span<const TokenId>(staged.prompt.token_ids),
+                                     staged.cursor, nominal,
+                                     /*finalize_at_end=*/false, slice);
+        }
 
         Tensor sampled         = ordinary.sampled_tokens.slice(0, 0, rows);
         Tensor cache_positions = ordinary.cache_positions.slice(0, 0, rows);
@@ -2120,6 +2174,12 @@ ProgramImplCore::advance_prefill_mixed(std::uint32_t prefill_lane,
         result.prefill = runtime::PrefillStepResult{
             .summary = summary, .processed_prompt_tokens = chunk.processed_tokens};
         if (staged.cursor == staged.prompt_tokens) {
+            if (staged.use_graph) {
+                decoder->linear_attention.copy_slot(
+                    LinearStateSlots::prefill_scratch_state_slot(max_concurrency),
+                    LinearStateSlots::current_state_slot(prefill_sequence.lane, max_concurrency),
+                    device.stream);
+            }
             // The next ordinary advance takes the zero-suffix path off the
             // tail hidden (reusing the whole finalize machinery).
             copy_tail(prefill_sequence,
