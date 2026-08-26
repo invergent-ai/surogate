@@ -1546,3 +1546,39 @@ was a 40-second run at 64 lanes with Marlin, which is both the optimistic
 window and the unstable configuration. The sampler fix in #44 is still
 real and still worth its keep — it is why 64 lanes is usable at all —
 but the headline was wrong.
+
+## 48. The wide band is right for the 4B; the 0.8B fault is still unexplained (2026-08-26)
+
+Two corrections to #47, both from 90-second runs.
+
+The wide Marlin band is a large WIN on the 4B and it is stable: 2,685
+tok/s over 90 s at 64 lanes, 1,958 requests, zero errors, zero fatals,
+against 2,110 with the band pinned to 32. That is +27%, and it reverses
+#47's claim that the 4B fails with the wide band — it does not, only the
+0.8B does. The earlier with/without-Marlin comparison that read as
+"neutral" was measuring the pinned build against itself: with the band at
+32 and rounds 64 wide, Marlin never engages either way.
+
+The 0.8B default at 64 lanes (band pinned) is 5,462 tok/s over 90 s,
+zero errors — so the sampler fix in #44 is what makes 64 lanes usable,
+and that stands.
+
+A lock-array theory for the 0.8B corruption was investigated and is
+WRONG. The reduce indexes locks[locks_off] where locks_off is either
+blockIdx.x or a smaller derived value, and determine_exec_config returns
+blocks_per_sm = 1 on every path, so the grid is exactly sms blocks and
+locks_off < sms. The existing sm_count*4 array has 4x headroom. The
+change that sized locks by N was reverted before it shipped: it came
+from pattern-matching upstream's Python-side workspace formula instead
+of reading the vendored kernel's indexing, and it fixed nothing.
+
+So the 0.8B's wide-band corruption under sustained load is still
+unexplained. What is known: it needs the wide band AND that model's
+shapes AND sustained churn; the 4B with the same band and the same load
+is clean over 90 s; the 0.8B at 32-wide is clean. Its distinguishing
+feature remains the vocab GEMM's aspect ratio (248320 x 1024), which is
+where a next investigation should start — but with the kernel's own
+indexing read first this time, not inferred.
+
+Standing (90 s, stable configs): 0.8B 5,462 v 5,958 (-8%), 4B 2,685 v
+3,390 (-21%), 27B 370 v 688 (-46%, 40 s provisional).
