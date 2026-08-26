@@ -92,7 +92,7 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
         // Marlin band (PATCHES.md #33): the vocab head and any plain W8 GEMM
         // in the batch band run the vendored kernel straight into `out`
         // (its row-major [T,N] result is this column-major [N,T] buffer).
-        if (x.ne[1] >= detail::kMarlinMinBandTokens && x.ne[1] <= detail::kMarlinMaxBandTokens &&
+        if (x.ne[1] >= detail::marlin_min_band_tokens() && x.ne[1] <= detail::kMarlinMaxBandTokens &&
             detail::marlin_w8_run(x, w, out, stream)) {
             return;
         }

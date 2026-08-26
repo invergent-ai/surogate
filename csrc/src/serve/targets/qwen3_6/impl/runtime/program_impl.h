@@ -1313,7 +1313,7 @@ void ProgramImplCore::prepare_graphs() {
         // captures, and only a band-sized round derives them (a capturing
         // stream may look one up but never derive). Warm one, then freeze the
         // shared scratch so the captures can bake its addresses.
-        if (ordinary_batch_limit >= ops::detail::kMarlinMinBandTokens) {
+        if (ordinary_batch_limit >= ops::detail::marlin_min_band_tokens()) {
             const std::uint32_t band =
                 std::min<std::uint32_t>(ordinary_batch_limit,
                                         ops::detail::kMarlinMaxBandTokens);

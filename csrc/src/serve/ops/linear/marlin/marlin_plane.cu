@@ -83,6 +83,16 @@ std::size_t marlin_plane_bytes() noexcept { return g_bytes; }
 MarlinScratch marlin_scratch() noexcept { return g_scratch; }
 void marlin_plane_freeze_scratch() noexcept { g_scratch_frozen = true; }
 
+int marlin_min_band_tokens() noexcept {
+    static const int floor_tokens = [] {
+        const char* env = std::getenv("SUROGATE_SERVE_MARLIN_MIN_T");
+        if (env == nullptr) { return 17; }
+        const int parsed = std::atoi(env);
+        return parsed >= 1 && parsed <= kMarlinMaxBandTokens ? parsed : 17;
+    }();
+    return floor_tokens;
+}
+
 MarlinPlane marlin_plane_for(const Weight& weight, cudaStream_t stream) {
     if (!g_enabled || weight.qtype != QType::W8G32_F16S ||
         weight.layout != QuantLayout::RowSplit || weight.scale_dtype != DType::FP16 ||

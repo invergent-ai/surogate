@@ -157,7 +157,7 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
         // Marlin band (PATCHES.md #33): gate_up is the largest decode GEMM;
         // the vendored kernel runs it 2.2x faster and silu_mul then folds
         // the [2*out, T] result down.
-        if (t >= detail::kMarlinMinBandTokens && t <= detail::kMarlinMaxBandTokens) {
+        if (t >= detail::marlin_min_band_tokens() && t <= detail::kMarlinMaxBandTokens) {
             const detail::MarlinScratch scratch =
                 detail::marlin_scratch_for(gate_up_weight, stream);
             if (scratch.gemm_out != nullptr) {

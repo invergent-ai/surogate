@@ -364,7 +364,7 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
     // Marlin band (PATCHES.md #33): one GEMM into scratch, then two strided
     // copies for the [qkv | z] row split (kilobytes next to the GEMM's
     // tens of megabytes).
-    if (cols >= detail::kMarlinMinBandTokens && cols <= detail::kMarlinMaxBandTokens) {
+    if (cols >= detail::marlin_min_band_tokens() && cols <= detail::kMarlinMaxBandTokens) {
         const detail::MarlinScratch scratch = detail::marlin_scratch_for(weight, stream);
         if (scratch.gemm_out != nullptr) {
             Tensor fused(scratch.gemm_out, DType::BF16, {weight.n, cols});

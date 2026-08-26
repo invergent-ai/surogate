@@ -37,7 +37,10 @@ struct MarlinScratch {
     int sm_count   = 0;
 };
 
-inline constexpr int kMarlinMinBandTokens = 17;
+// Band floor. Marlin wins by ~3x at the 4B's wide shapes even at T=16,
+// while the exact-T split-K kernels stay competitive at the small ones;
+// SUROGATE_SERVE_MARLIN_MIN_T overrides for sweeps.
+int marlin_min_band_tokens() noexcept;
 inline constexpr int kMarlinMaxBandTokens = 48;
 
 // Valid once any plane derived; null members otherwise.

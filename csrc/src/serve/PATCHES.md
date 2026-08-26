@@ -1083,3 +1083,12 @@ Measured, 100 users, 512/128: 4B 1,902 -> 2,118 tok/s (vLLM 3,390, gap
 -44% -> -38%); 0.8B 5,134 -> 5,107 (neutral: its band shapes are small
 enough that the exact-T kernels were already competitive). Suite green
 apart from the known environmental frontend failure.
+
+Band floor: measured rejection. Lowering it below 17
+(SUROGATE_SERVE_MARLIN_MIN_T, kept as a sweep knob) breaks decode-graph
+instantiation with cudaErrorGraphExecUpdateFailure: Marlin picks its
+kernel from thread_m_blocks = min(ceil(M/16), 4), so batches 1..16 and
+17..32 land on different kernels and the family's exec update rejects
+the changed node. A floor of 17 keeps every band batch on one kernel.
+Supporting a lower floor needs per-batch topology classes for the
+Marlin nodes, not a knob change.

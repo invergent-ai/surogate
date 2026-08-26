@@ -229,7 +229,7 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         // Marlin band (PATCHES.md #33): the vendored kernel beats the exact-T
         // split-K family by 1.5-2.3x from T=17; the residual add runs as its
         // own pass over the scratch result.
-        if (x.ne[1] >= detail::kMarlinMinBandTokens &&
+        if (x.ne[1] >= detail::marlin_min_band_tokens() &&
             x.ne[1] <= detail::kMarlinMaxBandTokens) {
             const detail::MarlinScratch scratch = detail::marlin_scratch_for(w, stream);
             if (scratch.gemm_out != nullptr) {
