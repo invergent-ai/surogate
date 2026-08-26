@@ -276,6 +276,9 @@ bool marlin_fp8_run(const Tensor& x, const Weight& weight, Tensor& out, cudaStre
                      scratch.locks, kMarlinFixedM, weight.n, weight.k, /*group_size=*/-1,
                      /*b_is_fp8=*/true, scratch.sm_count, stream);
     if (out.data != scratch.gemm_out) {
+        // The copy-out is contiguous [t, n]; a strided destination would take
+        // the wrong bytes without erroring.
+        if (!out.is_contiguous()) { return false; }
         const std::size_t c_used = static_cast<std::size_t>(weight.n) * t * 2;
         CUDA_CHECK(cudaMemcpyAsync(out.data, scratch.gemm_out, c_used, cudaMemcpyDeviceToDevice,
                                    stream));
@@ -316,6 +319,9 @@ bool marlin_w8_run(const Tensor& x, const Weight& weight, Tensor& out, cudaStrea
     // caller's [n, t] result; a caller writing into the scratch itself reads
     // them in place.
     if (out.data != scratch.gemm_out) {
+        // The copy-out is contiguous [t, n]; a strided destination would take
+        // the wrong bytes without erroring.
+        if (!out.is_contiguous()) { return false; }
         const std::size_t c_used = static_cast<std::size_t>(weight.n) * t * 2;
         CUDA_CHECK(cudaMemcpyAsync(out.data, scratch.gemm_out, c_used, cudaMemcpyDeviceToDevice,
                                    stream));
