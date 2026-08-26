@@ -278,6 +278,20 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         if (!aligned_to(x.data, 16) || !aligned_to(residual_out.data, 16)) {
             throw std::invalid_argument("linear_add: FP8 requires 16-byte x/residual alignment");
         }
+        // Marlin band (PATCHES.md #38): the 27B's FP8 decode GEMMs run
+        // 412-503 GB/s on the exact-T kernels; the vendored kFE4M3fn path
+        // takes the band and residual_add runs as its own pass.
+        if (t >= detail::marlin_min_band_tokens() && t <= detail::kMarlinMaxBandTokens) {
+            const detail::MarlinScratch scratch = detail::marlin_scratch();
+            if (detail::marlin_fp8_plane_for(w, stream).b_packed != nullptr &&
+                scratch.gemm_out != nullptr) {
+                Tensor gemm_out(scratch.gemm_out, DType::BF16, {w.n, t});
+                if (detail::marlin_fp8_run(x, w, gemm_out, stream)) {
+                    residual_add(gemm_out, residual_out, stream);
+                    return;
+                }
+            }
+        }
         detail::fp8_linear_add_dispatch(x, w, residual_out, policy, ws, stream);
         return;
     }

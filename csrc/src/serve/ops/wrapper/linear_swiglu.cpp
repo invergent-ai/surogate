@@ -135,6 +135,21 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
 
     if (fp8_weight) {
         (void)detail::validate_fp8_weight(gate_up_weight, "fp8 linear_swiglu");
+        // Marlin band (PATCHES.md #38): the 27B's largest decode GEMM.
+        if (t >= detail::marlin_min_band_tokens() && t <= detail::kMarlinMaxBandTokens) {
+            const detail::MarlinScratch scratch = detail::marlin_scratch();
+            if (detail::marlin_fp8_plane_for(gate_up_weight, stream).b_packed != nullptr &&
+                scratch.gemm_out != nullptr) {
+                Tensor fused(scratch.gemm_out, DType::BF16, {gate_up_weight.n, t});
+                if (detail::marlin_fp8_run(x, gate_up_weight, fused, stream)) {
+                    const std::int32_t half = gate_up_weight.n / 2;
+                    Tensor gate = fused.slice(0, 0, half);
+                    Tensor up   = fused.slice(0, half, half);
+                    silu_mul(gate, up, out, stream);
+                    return;
+                }
+            }
+        }
         detail::fp8_linear_swiglu_dispatch(x, gate_up_weight, out, policy, ws, stream);
         return;
     }

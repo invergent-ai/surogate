@@ -1188,6 +1188,12 @@ marlin_fp8_run mirror the W8 pair through the same registry, scratch and
 fixed-M discipline, dispatching Marlin's kFE4M3fn kernels at
 group_blocks = -1 (the instantiations were generated in #33).
 
-Not wired into any family and NOT MEASURED — no GPU was available. The
-next hardware session validates it with the one-hot bench on the 27B's
-FP8 shapes before anything routes through it.
+Wired into linear_add (5120x6144, 5120x17408) and linear_swiglu
+(34816x5120), the two families that carry most of the 27B's FP8 decode
+time, and ninfer_marlin_w8_bench now covers the FP8 shapes with the same
+one-hot check that caught the W8 packing (each output must equal exactly
+one code times its channel scale). STILL UNMEASURED — no GPU was
+available for any of it. The one-hot bench is the gate: it must pass on
+all five 27B shapes before the 27B is served through this path, and the
+wiring falls back to the existing kernels whenever the plane declines,
+so a failed derive degrades rather than breaks.
