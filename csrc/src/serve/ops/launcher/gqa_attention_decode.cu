@@ -265,8 +265,21 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
                                       cudaStream_t stream) {
     const auto logical_capacity      = static_cast<std::int32_t>(envelope.max_visible_keys);
     const auto implementation_window = static_cast<std::int32_t>(envelope.max_visible_keys);
-    const auto splits =
-        gqa_small_t_launch_capacity<Geometry>(envelope, invocation.width, cache.dtype);
+    auto splits = gqa_small_t_launch_capacity<Geometry>(envelope, invocation.width, cache.dtype);
+    // Batch-aware clamp: the grid is (KVHeads, splits, batch), so the batch
+    // dimension already supplies parallelism at multi-user widths. Splitting KV
+    // further past a full wave only multiplies the partial-buffer traffic the
+    // reducer then has to read back — at 64 lanes the old policy asked for ~10
+    // splits and 15 waves of CTAs. Keep enough CTAs to fill the device twice
+    // over and no more. The value stays constant per (envelope, batch), which
+    // is what a captured decode graph requires.
+    if (invocation.batch_size > 0) {
+        constexpr std::int32_t kTargetCtas = 2 * 170;
+        const std::int32_t per_split       = Geometry::KVHeads * invocation.batch_size;
+        const std::int32_t wanted          = per_split > 0 ? div_up(kTargetCtas, per_split) : splits;
+        const std::int32_t floored         = wanted < 1 ? 1 : wanted;
+        splits                             = splits < floored ? splits : floored;
+    }
 
     // BF16 keeps its row-tile warp count; INT8 selects its producer/consumer
     // geometry inside launch_tc_partial_i8.

@@ -1415,3 +1415,21 @@ Lesson worth keeping: three separate times now, a width constant that
 silently degrades instead of failing has cost more than any kernel
 optimisation gained. The remaining ones should be tied to
 kMaximumBatchColumns or made to throw.
+
+## 45. Batch-aware KV splits for decode attention (2026-08-26)
+
+The decode attention grid is (KVHeads, splits, batch), but the split
+policy only ever looked at the window — it had INT8 special cases and
+nothing for batch. At the 4B's ~640-key window it asks for ~10 splits,
+which at 64 lanes and 4 KV heads is 2,560 CTAs, roughly fifteen waves on
+170 SMs. The extra splits buy no parallelism the batch dimension does not
+already provide; they multiply the partial-buffer traffic that the
+reducer then reads back, which is why the kernel measured 265.9 us
+against a ~102 us KV-read roofline.
+
+Splits are now clamped so (KVHeads x batch x splits) targets two waves.
+The value stays constant per (envelope, batch), which is what a captured
+decode graph needs. 4B 100-user: 2,571 -> 2,629 tok/s, TTFT 1.77 -> 1.72
+s, zero errors.
+
+Standing: 0.8B 6,003 v vLLM 5,958 (AHEAD), 4B 2,629 v 3,390 (-22%).
