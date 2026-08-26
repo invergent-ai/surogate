@@ -1303,3 +1303,14 @@ gate is a 100-user 4B run at 64 lanes: TTFT should fall toward vLLM's
 while aggregate throughput holds at 2,250, and any regression in
 throughput means admission is now stealing from decode and the loop
 needs a per-iteration cap below max_concurrency.
+
+Burst cap follows: #32's adaptive policy dropped to three rounds whenever
+the queue held work, because each GPU unit bought exactly one admission
+and long bursts starved lane refills (a fixed eight collapsed the 0.8B to
+3,084). Continuous admission removes that coupling — a queue backed up
+behind full lanes has nowhere to admit — so a full burst there costs
+nothing but saves host round-trips, which is the same quantity the async
+scheduler targets. Free lanes still take a single round so the next
+iteration refills them. UNMEASURED; gated on the same 4B run, where a
+throughput regression would mean the two changes interact and the cap
+belongs back at three.

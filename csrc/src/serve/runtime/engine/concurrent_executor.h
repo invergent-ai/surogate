@@ -1011,7 +1011,12 @@ private:
                 for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
                     free_lanes += slots_[lane] == nullptr ? 1U : 0U;
                 }
-                burst_limit = free_lanes > 0 ? 1U : 3U;
+                // With continuous admission (PATCHES.md #41) a queue backed up
+                // behind full lanes has nothing to admit into, so the short
+                // burst that used to protect admission cadence only costs host
+                // round-trips. Free lanes still take the single round, so the
+                // next iteration can refill them.
+                burst_limit = free_lanes > 0 ? 1U : 8U;
             }
         }
         instance_.program->set_round_burst_limit(burst_limit);
