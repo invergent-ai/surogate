@@ -1216,3 +1216,36 @@ bucket is a separately captured graph of the whole layer stack, so the
 boundary costs a handful of decode columns against a prefill chunk of
 several hundred. At 32 lanes the ladder is 8, 16, 32 where it was
 8, 16, 24, 32 — one graph fewer, and rounds of 17..24 now pad to 32.
+
+## 39. Measured: the queued levers, three outcomes (2026-08-26)
+
+Correctness gate first, and it passed everything including the code
+written without hardware: the fixed-M W8 band and the FP8 repack both
+clear the one-hot check on all seventeen shapes (max_rel 0.0036-0.0071,
+which is BF16 scale rounding). The 32-wide scale permutation and the
+2^120 exponent bias were right.
+
+Fixed-M band, SHIPPED: 0.8B 5,013 and 4B 2,076 tok/s at 32 lanes, zero
+errors, zero fatals — correct and throughput-neutral, so #37 loses its
+unmeasured label.
+
+64 lanes, MEASURED REJECTION, reverted: the 4B falls to 1,802 tok/s from
+2,076. TTFT does improve (2.5 s from 4.0 s) and errors stay at zero, so
+the queueing theory was right, but throughput loses more than admission
+gains: per-stream decode halves (29 vs 67 tok/s) because every batch
+above 32 drops off the Marlin band onto the kernels Marlin was adopted
+to replace, and capture OOMs at auto KV capacity because 64 lanes double
+the decode-graph set. Raising the ceiling only pays together with
+kMarlinFixedM = 64, which costs every band call the wider M — worth
+measuring, not worth assuming.
+
+FP8 planes, now opt-in behind SUROGATE_SERVE_MARLIN_FP8=1: the 27B OOMs
+during graph capture with them on, at auto KV and even under a
+quarter-of-device budget, because a plane duplicates the residency it
+accelerates and the 27B's residency is most of the card. With them off
+the 27B serves normally (370 tok/s over a 40 s window against its 385
+baseline). The kernels are validated and 2.4-2.7x faster than the
+exact-T FP8 kernels on the shapes that bind it (down 5120x17408: 67.5 us
+vs 185.4; out 5120x6144: 31.4 vs 76.4), so the win is real but needs a
+residency-REPLACING path — repack at load, free the original — rather
+than a duplicating plane. That is the 27B's next arc.

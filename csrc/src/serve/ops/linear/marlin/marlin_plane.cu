@@ -147,7 +147,12 @@ MarlinPlane marlin_plane_for(const Weight& weight, cudaStream_t stream) {
 
     std::size_t free_bytes = 0, total_bytes = 0;
     if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess ||
-        free_bytes < 2 * (b_bytes + s_bytes + gptq_bytes)) {
+        free_bytes < 2 * (b_bytes + s_bytes + gptq_bytes) ||
+        g_bytes + b_bytes + s_bytes > total_bytes / 4) {
+        // Global budget: planes duplicate the residency they accelerate, so a
+        // large model would otherwise consume the memory the KV cache and the
+        // decode graphs need and abort capture. A quarter of the card bounds
+        // it; weights past the budget keep the engine's own kernels.
         return {};
     }
     if (!ensure_scratch(static_cast<std::size_t>(n) * kMarlinFixedM * 2,
@@ -185,7 +190,16 @@ MarlinScratch marlin_scratch_for(const Weight& weight, cudaStream_t stream) {
 }
 
 MarlinPlane marlin_fp8_plane_for(const Weight& weight, cudaStream_t stream) {
-    if (!g_enabled || weight.qtype != QType::FP8_E4M3FN_ROW_BF16S ||
+    // Opt-in: the FP8 residency belongs to the large models, where a plane
+    // duplicating it starves the KV cache and aborts graph capture (measured
+    // on the 27B, which OOMs at capture with planes on and serves normally
+    // with them off). The kernels are correctness-validated; what is missing
+    // is a residency-replacing path rather than a duplicating one.
+    static const bool fp8_opt_in = [] {
+        const char* env = std::getenv("SUROGATE_SERVE_MARLIN_FP8");
+        return env != nullptr && env[0] == '1';
+    }();
+    if (!fp8_opt_in || !g_enabled || weight.qtype != QType::FP8_E4M3FN_ROW_BF16S ||
         weight.layout != QuantLayout::RowScale || weight.scale_dtype != DType::BF16 ||
         weight.qdata == nullptr || weight.scales == nullptr || (weight.k % 64) != 0 ||
         (weight.n % 64) != 0) {
@@ -214,7 +228,12 @@ MarlinPlane marlin_fp8_plane_for(const Weight& weight, cudaStream_t stream) {
 
     std::size_t free_bytes = 0, total_bytes = 0;
     if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess ||
-        free_bytes < 2 * (b_bytes + s_bytes + gptq_bytes)) {
+        free_bytes < 2 * (b_bytes + s_bytes + gptq_bytes) ||
+        g_bytes + b_bytes + s_bytes > total_bytes / 4) {
+        // Global budget: planes duplicate the residency they accelerate, so a
+        // large model would otherwise consume the memory the KV cache and the
+        // decode graphs need and abort capture. A quarter of the card bounds
+        // it; weights past the budget keep the engine's own kernels.
         return {};
     }
     if (!ensure_scratch(static_cast<std::size_t>(n) * kMarlinFixedM * 2,
