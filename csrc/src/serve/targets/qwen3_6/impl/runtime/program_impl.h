@@ -2217,7 +2217,7 @@ ProgramImplCore::advance_prefill_mixed(std::uint32_t prefill_lane,
         (void)final_candidate;
         schedule::PrefillChunkResult chunk{};
         bool graph_hit = false;
-        if (staged.use_graph && prefill_graphs.has_value()) {
+        if (staged.use_graph && prefill_graphs.has_value() && batch_bucket == rows) {
             // The graph ladder rounds the chunk up to a 128 bucket, so the
             // nominal must leave room for both the rounding and the batch
             // bucket inside the prefill_chunk workspace window.

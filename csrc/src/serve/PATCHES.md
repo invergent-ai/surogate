@@ -1661,3 +1661,40 @@ fires.
 
 Standing: 0.8B 6,046 (wide band, 5 of 7 runs) or 5,462 (default, stable)
 v vLLM 5,958; 4B 2,685 v 3,390 (-21%); 27B 370 v 688 (-46%).
+
+## 50. The mixed-round pad race — found, fixed, 0.8B passes vLLM (2026-08-26)
+
+Instrumenting the failure path (record each round's shape; print it in the
+worker's fatal line) named the producing round on the first crash:
+
+  invalid UTF-8 continuation byte ... [last round #4820 kind=mixed
+  batch=63 prefill_lane=29 lanes=64]
+
+A mixed round with 63 decode rows. batch_bucket_for rounded 63 up to 64,
+so exactly one pad row existed, and #30's padding scheme gives a pad row
+a duplicate of row 0's ingress — same token, position, KV row, and state
+slot. That reasoning held for the KV write, which is idempotent, and
+FAILED for the GDN mixers: causal_conv1d_silu_snapshot and
+gated_delta_net_snapshot update the lane's state read-modify-write, so
+the pad column and row 0 do concurrent RMW on one slot inside a single
+launch. The loser's update is lost, the state drifts, and a wrong token
+appears in some later round of that sequence — far from the cause, which
+is why it read as a Marlin bug. Marlin was never implicated: the wide
+band only made rounds faster, so more of them hit the race.
+
+Fixed by capturing per exact decode width instead of a rounded bucket,
+which removes padding entirely. Capture is on demand, so only widths that
+actually occur cost a graph.
+
+Measured, 0.8B, 64 lanes, 90 s, wide band, three consecutive runs:
+
+  6,072   6,097   6,060 tok/s     zero errors, zero fatals
+
+against vLLM's 5,958 — the engine is AHEAD by 1.7-2.3% and stable. An
+interim fix that gated the graph on rows == bucket was also clean (four
+runs, 5,749-5,789) but cost 4.5% by dropping non-bucket rounds to eager;
+exact-width capture keeps both correctness and speed.
+
+Two rejected theories are recorded in #49 so nobody re-walks them. The
+lesson: three sessions of reasoning about Marlin's buffers were worth
+less than ten lines that recorded which round produced the bad token.

@@ -1193,6 +1193,9 @@ private:
                     if (!membership.empty() &&
                         instance_.program->mixed_round_supported(*prefill_lane_)) {
                         const auto t_mixed = Clock::now();
+                        last_round_ = LastRound{"mixed",
+                                                static_cast<std::uint32_t>(membership.size),
+                                                *prefill_lane_, last_round_.index + 1};
                         run_mixed_round(membership);
                         seg_timer_.mixed +=
                             std::chrono::duration<double>(Clock::now() - t_mixed).count();
@@ -1253,6 +1256,9 @@ private:
 
                 if (!membership.empty()) {
                     const auto t_decode = Clock::now();
+                    last_round_ = LastRound{"decode",
+                                            static_cast<std::uint32_t>(membership.size), 0,
+                                            last_round_.index + 1};
                     run_decode_round(membership);
                     seg_timer_.decode +=
                         std::chrono::duration<double>(Clock::now() - t_decode).count();
@@ -1261,7 +1267,12 @@ private:
                     continue;
                 }
             } catch (const std::exception& error) {
-                std::fprintf(stderr, "engine worker loop fatal: %s\n", error.what());
+                std::fprintf(stderr,
+                             "engine worker loop fatal: %s [last round #%llu kind=%s batch=%u "
+                             "prefill_lane=%u lanes=%u]\n",
+                             error.what(), static_cast<unsigned long long>(last_round_.index),
+                             last_round_.kind, last_round_.batch, last_round_.prefill_lane,
+                             max_concurrency_);
                 fail_all(std::current_exception());
                 return;
             } catch (...) {
@@ -1271,6 +1282,18 @@ private:
             }
         }
     }
+
+    // Failure-path diagnostic (PATCHES.md #49): the wide-band corruption
+    // surfaces as a bad token in the frontend, far from the round that
+    // produced it. Recording each round's shape costs two stores and names
+    // the producing path in the fatal line.
+    struct LastRound {
+        const char* kind  = "none";
+        std::uint32_t batch = 0;
+        std::uint32_t prefill_lane = 0;
+        std::uint64_t index = 0;
+    };
+    LastRound last_round_;
 
     struct SegmentTimer {
         bool enabled = std::getenv("SUROGATE_SERVE_ROUND_TIMING") != nullptr;

@@ -126,14 +126,17 @@ public:
     // wrong-token bug, which is what a fixed 32 cap produced once the ceiling
     // rose above 32).
     [[nodiscard]] static std::int32_t batch_bucket_for(std::int32_t batch) noexcept {
-        // Coarse above 16: every bucket is a separately captured graph of the
-        // whole layer stack, so an 8-wide ladder would multiply capture time
-        // and graph memory as the ceiling rises. Padding to 16 costs a few
-        // decode columns against a prefill chunk of several hundred.
-        const std::int32_t rounded =
-            batch <= 8 ? 8 : batch <= 16 ? 16 : ((batch + 15) / 16) * 16;
+        // Exact, not rounded (PATCHES.md #50). Rounding meant padding the
+        // decode batch, and a pad column shares its ingress row with a live
+        // lane — including that lane's GDN state slot, which the conv and
+        // recurrent snapshots update read-modify-write. Two columns doing RMW
+        // on one slot inside a single launch is a race; it corrupted about one
+        // round in a hundred thousand and surfaced as a bad token far away.
+        // Exact widths remove padding entirely. Capture is on demand, so only
+        // the widths that actually occur cost a graph, and the family's budget
+        // guard falls back to eager if they stop fitting.
         const auto ceiling = static_cast<std::int32_t>(kMaximumConcurrency);
-        return rounded > ceiling ? ceiling : rounded;
+        return batch > ceiling ? ceiling : batch;
     }
 
     DecodeGraphExecutable* ensure(std::int32_t bucket, const std::function<void()>& body) {
