@@ -262,6 +262,17 @@ MarlinPlane marlin_fp8_plane_for(const Weight& weight, cudaStream_t stream) {
     const std::size_t s_bytes    = static_cast<std::size_t>(n) * 2;
     const std::size_t gptq_bytes = static_cast<std::size_t>(k / 4) * n * sizeof(std::uint32_t);
 
+    // Residency replacement was implemented here and REVERTED as unsafe; see
+    // PATCHES.md #59. Writing the packed layout back over the weight is
+    // size-exact for FP8 and costs nothing permanent, but it is only sound if
+    // no consumer can ever read those bytes as anything other than Marlin —
+    // and every decline path in marlin_fp8_run (capture without a cached plane,
+    // an unavailable scratch, a non-contiguous view) falls back to the FP8
+    // kernel, which then reinterprets Marlin bytes as e4m3 and emits garbage.
+    // The fix is the layout TAG from design/serve-engine-multiarch.md item 3:
+    // the converter writes Marlin tiles, the loader records the layout per
+    // tensor, and routing dispatches on it, so a fallback is a type error
+    // rather than a silent misread.
     std::size_t free_bytes = 0, total_bytes = 0;
     if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess ||
         free_bytes < 2 * (b_bytes + s_bytes + gptq_bytes) ||
@@ -306,9 +317,31 @@ MarlinScratch marlin_fp8_scratch_for(const Weight& weight, cudaStream_t stream) 
     return marlin_scratch();
 }
 
+// Any-T FP8 Marlin. Below the band the call goes through the padded scratch, so
+// the launch geometry is constant and a captured graph stays valid. Above it,
+// A and C are passed straight through: x is [k, t] contiguous, which is [t, k]
+// row-major — exactly Marlin's A layout — and out is [n, t], which is [t, n]
+// row-major, exactly its C. No padding means no fixed geometry, which is fine
+// because wide calls are prefill and prefill is not captured at a fixed width.
+//
+// This matters beyond speed: replacing a weight's residency with Marlin's
+// layout only becomes safe once EVERY T can be served from it, because the
+// original bytes are gone and there is no kernel left to fall back to.
 bool marlin_fp8_run(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     const std::int32_t t = x.ne[1];
-    if (t < 1 || t > marlin_fixed_m()) { return false; }
+    if (t < 1) { return false; }
+    if (t > marlin_fixed_m()) {
+        if (out.ne[0] != weight.n || out.ne[1] != t) { return false; }
+        if (!x.is_contiguous() || x.ne[0] != weight.k || !out.is_contiguous()) { return false; }
+        const MarlinPlane wide = marlin_fp8_plane_for(weight, stream);
+        if (wide.b_packed == nullptr) { return false; }
+        const MarlinScratch wide_scratch = marlin_scratch();
+        if (wide_scratch.c_tmp == nullptr || wide_scratch.locks == nullptr) { return false; }
+        marlin_gemm_bf16(x.data, wide.b_packed, wide.scales, out.data, wide_scratch.c_tmp,
+                         wide_scratch.locks, t, weight.n, weight.k, /*group_size=*/-1,
+                         /*b_is_fp8=*/true, wide_scratch.sm_count, stream);
+        return true;
+    }
     if (out.ne[0] != weight.n || out.ne[1] != t) { return false; }
     // The padded-A copy assumes the [k, t] block is contiguous, which is what
     // makes it [t, k] row-major for Marlin. A strided view would copy the

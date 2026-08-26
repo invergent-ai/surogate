@@ -2003,3 +2003,49 @@ the structural admission idle from #56. No single fix closes 11%.
 The 27B is the better investment: its FP8-class GEMMs are 47% of device
 at 412-503 GB/s against 926 GB/s proven achievable on the same class of
 problem, which is one target rather than four.
+
+## 59. FP8 Marlin: probe passed, all-T routing landed, residency needs the tag (2026-08-26)
+
+**Probe.** Marlin FP8 measured against the kernels it would replace, on the
+27B's own shapes, on this card, correctness checked (max_rel 0.0036-0.0038):
+
+  shape                     live              marlin fp8        gain
+  N=5120  K=6144  (out)     76.4us  412 GB/s   31.3us 1005 GB/s  2.4x
+  N=5120  K=17408 (down)   185.4us  481 GB/s   67.3us 1325 GB/s  2.75x
+  N=16384 K=5120  (gdn_in)  90.6us  926 GB/s   61.8us 1358 GB/s  1.47x
+
+Those families are 47% of the 27B's device time, so the probe justifies the
+work — it beats even the A8 tile that was already the fast path.
+
+**Landed: any-T FP8 Marlin routing.** Below the band the call still goes
+through the padded scratch so captured geometry stays fixed. Above it, A
+and C pass straight through — x is [k,t] contiguous, which is [t,k]
+row-major, exactly Marlin's A, and out is [n,t], exactly its C. This is a
+prerequisite for residency replacement, not a nicety: once a weight holds
+Marlin bytes there is no other kernel that can read them.
+
+**Attempted and REVERTED: in-place residency replacement.** For FP8 the
+packed form is exactly n*k bytes and the scales exactly n*2 — the sizes the
+residency already holds — so the repacked layout can be written back over
+the original and the plane costs nothing permanent. That is what makes the
+27B feasible where duplication never was. It produced garbage on the first
+request.
+
+The reason is instructive and is the argument for doing this properly.
+Replacement makes the weight's bytes meaningful only to Marlin, but every
+decline path in marlin_fp8_run — capture without a cached plane, an
+unavailable scratch, a non-contiguous view — falls back to the FP8 kernel,
+which then reads Marlin tiles as e4m3. Nothing errors; the model simply
+emits noise. Safety here cannot come from "the wired call sites happen to
+cover it", because a decline is a runtime property, not a call-site one.
+
+So residency replacement needs the per-tensor layout TAG from
+design/serve-engine-multiarch.md item 3: the converter writes Marlin tiles,
+the loader records the layout on the weight, and routing dispatches on it,
+so a path that cannot serve a Marlin-layout weight is a type error at plan
+time instead of a silent misread at run time. The probe says that work is
+worth roughly 20% of the 27B's device time; this patch leaves the routing
+prerequisite in place and the unsafe shortcut out.
+
+27B verified restored after the revert: 581 tok/s at 48 lanes, correct
+output, zero errors.
