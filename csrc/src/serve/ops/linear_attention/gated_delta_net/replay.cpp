@@ -117,7 +117,7 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
     require_tensor(v, DType::BF16, {kStateDim, value_heads, width, rows}, 2, kOp, "v");
     require_tensor(g, DType::FP32, {value_heads, width, rows}, 4, kOp, "g");
     require_tensor(beta, DType::FP32, {value_heads, width, rows}, 4, kOp, "beta");
-    require_tensor(states, DType::FP32, {kStateDim, kStateDim, value_heads, states.ne[3]}, 16, kOp,
+    require_tensor(states, DType::BF16, {kStateDim, kStateDim, value_heads, states.ne[3]}, 16, kOp,
                    "states");
     require_tensor(initial_slots, DType::I32, {rows}, 4, kOp, "initial state slots");
     if (valid_columns.data != nullptr) {
@@ -200,7 +200,7 @@ void validate_fold_states(const GdnReplayRecords& records,
     }
     require_tensor(states.conv_layer0, DType::BF16, {record.conv_channels, 3, state.slot_count},
                    256, kOp, "conv state layer 0");
-    require_tensor(states.recurrent_layer0, DType::FP32,
+    require_tensor(states.recurrent_layer0, DType::BF16,
                    {kStateDim, kStateDim, record.value_heads, state.slot_count}, 256, kOp,
                    "recurrent state layer 0");
     if (states.conv_layer_stride_bytes <= 0 || states.recurrent_layer_stride_bytes <= 0 ||

@@ -1911,3 +1911,39 @@ not be driven to overlap on it for this workload shape.
 The knob (SUROGATE_SERVE_FREE_LANE_BURST) stays so the measurement can be
 repeated on other workload shapes; a batch-style workload with a saturated
 queue and no free lanes would flip this result.
+
+## 57. GDN recurrent state moves to bf16 storage (2026-08-26)
+
+The largest single cost in a decode round was the gated-delta-net
+recurrent state, and it was being stored twice as wide as it needed to be.
+
+At 32 value heads x 128 x 128 the state is 2 MiB per lane per layer. At 64
+lanes across 24 GDN layers a decode round reads and writes ~6 GiB of it.
+The snapshot kernel measured 211 us per layer call, which is 268 MB at
+1,271 GB/s — 71% of peak, so bandwidth-bound and not fixable by tuning.
+It was 22.6% of device time, and because the traffic scales linearly with
+batch it is also why raising the lane count never bought throughput.
+
+vLLM stores this state at the model dtype: gated_delta_net_state_dtype
+resolves mamba_ssm_cache_dtype "auto" to the activation dtype, i.e. bf16.
+We stored fp32. So the comparison engine was moving half the bytes we
+were, on the single biggest item in the round.
+
+Compute is unchanged — the state still lives in registers as fp32 and the
+delta rule still runs in fp32. Only the HBM representation narrows, at the
+one seam where it touches memory: load_qk_lane / store_qk_lane in the
+recurrent kernels, and the scalar loads/stores in the chunked
+state-passing kernel. The storage type is a named alias, GdnStateStorage,
+so a quality-sensitive deployment can put it back to float in one line.
+
+Measured, 100 users, 512/128, 90-second runs:
+
+  4B    2,666 -> 3,015 / 3,024 tok/s   (+13%)
+  0.8B  6,047 -> 6,646 tok/s           (+10%)
+
+Correctness checked at temperature 0 before either benchmark: coherent,
+factually right answers (Rayleigh scattering, the first six primes). Zero
+errors and zero fatals across all runs.
+
+Standing against vLLM: 0.8B 6,646 v 5,958 (+11.6% AHEAD), 4B 3,024 v 3,390
+(-11%, was -21%), 27B pending re-measure.

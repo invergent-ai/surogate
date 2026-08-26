@@ -75,11 +75,11 @@ struct state_passing_config {
     const __nv_bfloat16* U = nullptr;
     const __nv_bfloat16* k = nullptr;
     const float* g_cumsum  = nullptr;
-    const float* state_in  = nullptr;
+    const __nv_bfloat16* state_in  = nullptr;
 
     __nv_bfloat16* v_new   = nullptr;
     __nv_bfloat16* h_chunk = nullptr;
-    float* state_out       = nullptr;
+    __nv_bfloat16* state_out       = nullptr;
 
     cudaStream_t stream = nullptr;
 };

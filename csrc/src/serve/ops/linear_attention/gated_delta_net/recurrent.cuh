@@ -19,6 +19,20 @@ static_assert(kStateDim % kWarpSize == 0);
 static_assert(kQkPerLane == 4);
 static_assert(kStateDim % kBlockDv == 0);
 
+// Storage type of the recurrent state. Compute is fp32 regardless; this is the
+// width it occupies in HBM, and it is the single largest cost in a decode
+// round. Declared in one place so a target or a quality-sensitive deployment
+// can move it back to float without touching kernels.
+using GdnStateStorage = __nv_bfloat16;
+
+// The recurrent state is held in registers as fp32 and computed in fp32; only
+// its STORAGE width is a choice. At 32 value heads x 128 x 128 the state is 2
+// MiB per lane per layer, so at 64 lanes across 24 GDN layers a decode round
+// moves ~6 GiB of it in fp32 — 22.6% of device time, measured at 71% of peak
+// bandwidth, which makes this the largest single cost in a decode round and the
+// reason lane count never bought throughput. Storing bf16 halves that traffic.
+// (vLLM's gated_delta_net_state_dtype defaults to "auto", i.e. the model dtype,
+// so bf16 storage is what the comparison engine already does.)
 __device__ __forceinline__ void load_qk_lane(float (&reg)[kQkPerLane], const float* base,
                                              std::uint32_t dqk_base) {
     store_vec(reg, load_vec<float4>(base + dqk_base));
@@ -27,6 +41,26 @@ __device__ __forceinline__ void load_qk_lane(float (&reg)[kQkPerLane], const flo
 __device__ __forceinline__ void store_qk_lane(const float (&reg)[kQkPerLane], float* base,
                                               std::uint32_t dqk_base) {
     store_vec(base + dqk_base, load_vec<float4>(reg));
+}
+
+__device__ __forceinline__ void load_qk_lane(float (&reg)[kQkPerLane], const __nv_bfloat16* base,
+                                             std::uint32_t dqk_base) {
+    static_assert(kQkPerLane == 4, "bf16 state lane load assumes a 4-wide lane");
+    const __nv_bfloat162* pair = reinterpret_cast<const __nv_bfloat162*>(base + dqk_base);
+    const float2 lo            = __bfloat1622float2(pair[0]);
+    const float2 hi            = __bfloat1622float2(pair[1]);
+    reg[0]                     = lo.x;
+    reg[1]                     = lo.y;
+    reg[2]                     = hi.x;
+    reg[3]                     = hi.y;
+}
+
+__device__ __forceinline__ void store_qk_lane(const float (&reg)[kQkPerLane], __nv_bfloat16* base,
+                                              std::uint32_t dqk_base) {
+    static_assert(kQkPerLane == 4, "bf16 state lane store assumes a 4-wide lane");
+    __nv_bfloat162* pair = reinterpret_cast<__nv_bfloat162*>(base + dqk_base);
+    pair[0]              = __floats2bfloat162_rn(reg[0], reg[1]);
+    pair[1]              = __floats2bfloat162_rn(reg[2], reg[3]);
 }
 
 __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
@@ -309,7 +343,7 @@ struct SnapshotAccess {
     const __nv_bfloat16* v;
     const float* g;
     const float* beta;
-    float* states;
+    GdnStateStorage* states;
     const std::int32_t* valid_columns;
     const std::int32_t* initial_slots;
     const std::int32_t* snapshot_bases;
@@ -335,7 +369,7 @@ struct SnapshotAccess {
         return static_cast<std::int64_t>(coord.batch) * width + token;
     }
 
-    __device__ __forceinline__ const float*
+    __device__ __forceinline__ const GdnStateStorage*
     state_read_base(const RecurrentCoordinates& coord) const {
         return states + static_cast<std::int64_t>(initial_slots[coord.batch]) * state_slot_stride +
                static_cast<std::int64_t>(coord.value_head) * kStateDim * kStateDim;
@@ -369,7 +403,7 @@ struct SnapshotAccess {
     __device__ __forceinline__ void
     store_snapshot(const RecurrentCoordinates& coord, std::int32_t token,
                    const float (&state)[kDvPerWarp][kQkPerLane]) const {
-        float* snapshot =
+        GdnStateStorage* snapshot =
             states +
             static_cast<std::int64_t>(snapshot_bases[coord.batch] + token) * state_slot_stride +
             static_cast<std::int64_t>(coord.value_head) * kStateDim * kStateDim;
@@ -389,7 +423,7 @@ struct RecordAccess {
     const __nv_bfloat16* v;
     const float* g;
     const float* beta;
-    const float* states;
+    const GdnStateStorage* states;
     const std::int32_t* valid_columns;
     const std::int32_t* initial_slots;
     __nv_bfloat16* key_record;
@@ -417,7 +451,7 @@ struct RecordAccess {
         return static_cast<std::int64_t>(coord.batch) * width + token;
     }
 
-    __device__ __forceinline__ const float*
+    __device__ __forceinline__ const GdnStateStorage*
     state_read_base(const RecurrentCoordinates& coord) const {
         return states + static_cast<std::int64_t>(initial_slots[coord.batch]) * state_slot_stride +
                static_cast<std::int64_t>(coord.value_head) * kStateDim * kStateDim;
@@ -494,7 +528,7 @@ struct FoldAccess {
     const __nv_bfloat16* value_record;
     const uint2* gate_record;
     const __nv_bfloat16* conv_record;
-    float* recurrent_layer0;
+    GdnStateStorage* recurrent_layer0;
     __nv_bfloat16* conv_layer0;
     std::int64_t recurrent_layer_stride;
     std::int64_t conv_layer_stride;
@@ -533,7 +567,7 @@ struct FoldAccess {
         return static_cast<std::int64_t>(coord.layer) * record_capacity + coord.batch;
     }
 
-    __device__ __forceinline__ float* state_read_base(const RecurrentCoordinates& coord) const {
+    __device__ __forceinline__ GdnStateStorage* state_read_base(const RecurrentCoordinates& coord) const {
         const std::int64_t slot_stride =
             static_cast<std::int64_t>(Geometry::kValueHeads) * kStateDim * kStateDim;
         return recurrent_layer0 + static_cast<std::int64_t>(coord.layer) * recurrent_layer_stride +
@@ -562,7 +596,7 @@ struct FoldAccess {
     __device__ __forceinline__ void
     store_final_state(const RecurrentCoordinates& coord,
                       const float (&state)[kDvPerWarp][kQkPerLane]) const {
-        float* destination = state_read_base(coord);
+        GdnStateStorage* destination = state_read_base(coord);
 #pragma unroll
         for (int r = 0; r < kDvPerWarp; ++r) {
             store_qk_lane(state[r],
@@ -617,7 +651,7 @@ __device__ __forceinline__ void recurrent_bf16_body(const Access& access,
         if (valid == 0) { return; }
     }
 
-    const float* initial = access.state_read_base(coord);
+    const GdnStateStorage* initial = access.state_read_base(coord);
     __align__(16) float state[kDvPerWarp][kQkPerLane];
 #pragma unroll
     for (int r = 0; r < kDvPerWarp; ++r) {

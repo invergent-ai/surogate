@@ -50,10 +50,10 @@ void launch_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const Ten
     state.U         = static_cast<const __nv_bfloat16*>(U.data);
     state.k         = static_cast<const __nv_bfloat16*>(k.data);
     state.g_cumsum  = static_cast<const float*>(g_cumsum.data);
-    state.state_in  = static_cast<const float*>(ssm_state_in.data);
+    state.state_in  = static_cast<const __nv_bfloat16*>(ssm_state_in.data);
     state.v_new     = static_cast<__nv_bfloat16*>(v_new.data);
     state.h_chunk   = static_cast<__nv_bfloat16*>(h_chunk.data);
-    state.state_out = static_cast<float*>(ssm_state_out.data);
+    state.state_out = static_cast<__nv_bfloat16*>(ssm_state_out.data);
     state.stream    = stream;
     CUDA_CHECK(chunked::launch_state_passing(state));
 
