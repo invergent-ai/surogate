@@ -1713,3 +1713,27 @@ GDN recurrent_snapshot at 21.9% near roofline, cutlass prefill at 20.1%,
 decode GEMMs at 18.2%, attention at 9.2% still ~2.6x off its KV-read
 roofline, and 12% device idle in the host serial path between rounds.
 The 27B remains lane-limited by memory and entirely compute-bound.
+
+## 51. The 4B lane sweep, re-run on the fixed build (2026-08-26)
+
+vLLM's 4B advantage is stream count — roughly 100 concurrent against our
+64 — so the lane sweep was worth repeating now that the pad race (#50)
+and the rounded buckets are gone, since the earlier sweep ran with both.
+
+  64 lanes  2,661 tok/s   (kv 131072)
+  80 lanes  2,399         (kv 98304)
+  96 lanes  2,396         (kv 98304)
+
+The conclusion survives the fix: 64 is the 4B's optimum and more lanes
+cost throughput. Per-stream decode falls faster than lane count rises,
+so the aggregate drops. Concurrency is not the lever here; the ceiling
+is reverted to 64.
+
+That leaves the two openings the census already named, and nothing else
+above a few percent: decode attention at 9.2% of device but still ~2.6x
+off its KV-read roofline even after the split clamp (#45) — the
+partial-plus-reduce design writes partials to global and reads them back
+— and 12% device idle sitting in the host serial path between rounds,
+which is the async-scheduler work whose infrastructure #32 already
+built. GDN recurrent_snapshot (21.9%) and the cutlass prefill GEMMs
+(20.1%) are both near roofline and are not worth attacking.
