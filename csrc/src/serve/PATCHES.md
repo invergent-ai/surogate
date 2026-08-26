@@ -860,6 +860,18 @@ old ninfer/ paths.)
    launches/round), and per-op fusion along the owner's torch.compile
    observation.
 
+   27B follow-ups (2026-08-26): mixed rounds lift it only to 385 tok/s
+   (100 users) — prefill wasn't its constraint. The A8 batch-tile
+   verdict is CORRECTED by template-arg census: BlockTokens=32 kernels
+   are live at 99us average versus the production tile's earlier 195us
+   (and the production schedule is BlockTokens=64, not 128 as first
+   read) — the change worked at the kernel level; the earlier "neutral"
+   reads were aggregate-level, where the 27B binds elsewhere: its
+   nvfp4_w4a4 block, GDN at batch, the FP8 vocabulary head, and prefill
+   throughput (~5.4k tok/s at 512-token prompts against admission
+   churn). The 27B needs its own census-driven campaign; the 0.8B/4B
+   line continues with mixed-round graph capture and epilogue fusion.
+
 ### sm_89 port status
 
 With patches 5–10 the **entire tree compiles and links for sm_89**
