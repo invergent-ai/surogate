@@ -46,7 +46,7 @@ unsloth NVFP4 export + base checkpoint by the vendored converter).
 
 | engine | weights | TTFT @1.9k | decode tok/s (1 user) | 100-user agg tok/s | 100-user TTFT p50 | 100-user reqs ok/err |
 |---|---|---:|---:|---:|---:|---:|
-| **surogate serve** | from GGUF Q4_K_M | **48 ms** | **503** | **6,076** † | 0.77 s | 4,421/0 |
+| **surogate serve** | from GGUF Q4_K_M | **48 ms** | **503** | **6,047** † | 0.77 s | 4,400/0 |
 | llama-server (CUDA) | GGUF Q4_K_M | 168 ms | 391 | 772 | 10.9 s | 612/419 |
 | vLLM | NVFP4 (4-bit) | 55 ms | 364 | 5,958 | **0.41 s** | 4,200/0 |
 

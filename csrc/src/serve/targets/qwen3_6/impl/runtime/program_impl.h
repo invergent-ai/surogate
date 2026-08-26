@@ -1916,8 +1916,11 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
     }
 }
 
-runtime::BatchedGeneratedRound
-ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
+// Launch half of the round lifecycle (runtime/contract/round_lifecycle.h):
+// enqueue the round and its egress copies, record what consume will need, and
+// return WITHOUT synchronizing.
+runtime::RoundHandle
+ProgramImplCore::launch_ordinary_round(std::span<const std::uint32_t> lanes,
                                        std::span<const runtime::RoundBudget> budgets) {
     if (speculative_backend != SpeculativeBackend::None) {
         throw std::logic_error("ordinary batch execution requires the ordinary backend");
@@ -2042,6 +2045,36 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             CUDA_CHECK(cudaLaunchHostFunc(device.stream, &ProgramImplCore::burst_egress_copy_host,
                                           &burst_copy_ctx[round]));
         }
+        in_flight_ = InFlightRound{.id    = ++in_flight_counter_,
+                                   .rows  = static_cast<std::uint32_t>(lanes.size()),
+                                   .burst = burst,
+                                   .start = start};
+        std::copy(lanes.begin(), lanes.end(), in_flight_.lanes.begin());
+        return runtime::RoundHandle{.id = in_flight_.id, .rows = in_flight_.rows};
+    } catch (...) {
+        try {
+            device.synchronize();
+        } catch (...) {}
+        for (const std::uint32_t lane : lanes) {
+            if (lane < max_concurrency) { clear_lane(sequences[lane], requests[lane]); }
+        }
+        throw;
+    }
+}
+
+// Consume half of the round lifecycle (runtime/contract/round_lifecycle.h).
+// Everything here needs the device's answers, so this is the half that waits;
+// the launch half deliberately does not, which is what lets a caller start the
+// next round before this one is read back.
+runtime::BatchedGeneratedRound
+ProgramImplCore::consume_ordinary_round(runtime::RoundHandle handle) {
+    if (!handle.valid() || handle.id != in_flight_.id) {
+        throw std::logic_error("consuming a decode round that is not in flight");
+    }
+    const std::span<const std::uint32_t> lanes(in_flight_.lanes.data(), in_flight_.rows);
+    const std::uint32_t burst = in_flight_.burst;
+    const auto start          = in_flight_.start;
+    try {
         device.synchronize();
 
         const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
@@ -2083,6 +2116,15 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         }
         throw;
     }
+}
+
+// The synchronous form every caller used before the split: launch, then
+// consume immediately. Kept so targets and tests that do not overlap read the
+// same as they always did.
+runtime::BatchedGeneratedRound
+ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
+                                       std::span<const runtime::RoundBudget> budgets) {
+    return consume_ordinary_round(launch_ordinary_round(lanes, budgets));
 }
 
 bool ProgramImplCore::mixed_round_supported(std::uint32_t prefill_lane) const noexcept {
@@ -2217,7 +2259,14 @@ ProgramImplCore::advance_prefill_mixed(std::uint32_t prefill_lane,
         (void)final_candidate;
         schedule::PrefillChunkResult chunk{};
         bool graph_hit = false;
-        if (staged.use_graph && prefill_graphs.has_value() && batch_bucket == rows) {
+        // Mixed-round graphs are ON. Two causes of the corruption they used to
+        // produce have been found and fixed: a pad column racing a live lane on
+        // its GDN state slot (#50, fixed by capturing per exact decode width),
+        // and an unbanded attention envelope (#55, below).
+        // SUROGATE_SERVE_NO_MIXED_GRAPH=1 forces the eager path for bisecting.
+        static const bool kNoMixedGraph = std::getenv("SUROGATE_SERVE_NO_MIXED_GRAPH") != nullptr;
+        if (!kNoMixedGraph && staged.use_graph && prefill_graphs.has_value() &&
+            batch_bucket == rows) {
             // The graph ladder rounds the chunk up to a 128 bucket, so the
             // nominal must leave room for both the rounding and the batch
             // bucket inside the prefill_chunk workspace window.
@@ -2227,6 +2276,22 @@ ProgramImplCore::advance_prefill_mixed(std::uint32_t prefill_lane,
                     : 0U;
             const std::uint32_t graph_nominal =
                 std::min(graph_cap, staged.prompt_tokens - staged.cursor);
+            // The graph writes a whole 128-rounded chunk, pad columns included,
+            // but KV pages are mapped in units of kPagedKVPageSize = 64 up to
+            // the prompt length. A prompt whose length lands in the upper half
+            // of a 128-block therefore has the pad columns writing past its
+            // mapped pages and into whatever block-table slots follow — another
+            // sequence's KV. That is the mixed-round corruption: intermittent
+            // (it depends on prompt length mod 128), mixed-only, and it shows up
+            // as a wrong token in a DIFFERENT lane's stream. Map the rounded
+            // window before replaying.
+            if (graph_nominal > 0) {
+                const std::uint32_t graph_window =
+                    staged.cursor + static_cast<std::uint32_t>(
+                                        PrefillGraphFamily::chunk_bucket_for(graph_nominal));
+                materialize_sequence_kv(prefill_sequence,
+                                        std::min(graph_window, capacity), 0);
+            }
             if (graph_nominal > 0) {
                 schedule::TextContext::MixedDecodeSlice bucket_slice;
                 bucket_slice.ids                = ordinary.tokens.slice(0, 0, batch_bucket);
@@ -2234,12 +2299,22 @@ ProgramImplCore::advance_prefill_mixed(std::uint32_t prefill_lane,
                 bucket_slice.rope_positions     = ordinary.rope_positions.slice(0, 0, batch_bucket);
                 bucket_slice.kv_table_rows      = ordinary.text_kv_table_rows.slice(0, 0, batch_bucket);
                 bucket_slice.linear_state_slots = ordinary.lanes.slice(0, 0, batch_bucket);
-                bucket_slice.envelope           = {maximum_frontier + 1, maximum_frontier + 1};
+                // Band the decode envelope exactly as the ordinary decode graphs
+                // do, and key the capture on that band, so a replay can never
+                // see a frontier outside the window it was captured for. The
+                // graph previously baked {1, kv_capacity} here — the one
+                // structural difference between it and that proven path.
+                DecodeGraphProfile& mixed_profile =
+                    select_graph_profile(ordinary_graphs, static_cast<std::uint32_t>(rows),
+                                         maximum_frontier, "mixed round");
+                bucket_slice.envelope = {mixed_profile.min_execution_frontier + 1,
+                                         mixed_profile.max_execution_frontier + 1};
                 bucket_slice.hidden             = ordinary.hidden.slice(1, 0, batch_bucket);
                 bucket_slice.logits             = ordinary.logits.slice(1, 0, batch_bucket);
                 if (card.try_mixed_graph_chunk(
                         std::span<const TokenId>(staged.prompt.token_ids), staged.cursor,
-                        graph_nominal, bucket_slice, batch_bucket)) {
+                        graph_nominal, bucket_slice, batch_bucket,
+                        static_cast<std::int32_t>(mixed_profile.topology_class))) {
                     graph_hit = true;
                     chunk     = schedule::PrefillChunkResult{.processed_tokens = graph_nominal,
                                                              .finalized        = false};

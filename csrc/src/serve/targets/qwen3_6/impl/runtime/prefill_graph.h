@@ -115,6 +115,22 @@ public:
      * bucket's first use. Returns nullptr when the family is dead or capture
      * fails (the caller runs the eager body; failure poisons the family).
      */
+    // The chunk rounding the graph ladder applies, exposed so callers can map
+    // KV for the window the graph actually writes (PATCHES.md #55).
+    [[nodiscard]] static std::int32_t chunk_bucket_for(std::uint32_t length) noexcept {
+        return static_cast<std::int32_t>(((length + 127U) / 128U) * 128U);
+    }
+
+    [[nodiscard]] static std::int32_t mixed_key(std::int32_t chunk_bucket,
+                                                std::int32_t batch_bucket,
+                                                std::int32_t topology_class) noexcept {
+        // The frontier band belongs in the key. The ordinary decode graphs bake
+        // a banded envelope {min+1, max+1} from their profile and key on the
+        // band; the mixed graph baked {1, kv_capacity} instead, which is the
+        // one structural difference between it and that proven path.
+        return (topology_class << 20) | mixed_key(chunk_bucket, batch_bucket);
+    }
+
     [[nodiscard]] static std::int32_t mixed_key(std::int32_t chunk_bucket,
                                                 std::int32_t batch_bucket) noexcept {
         return (chunk_bucket << 8) | batch_bucket;

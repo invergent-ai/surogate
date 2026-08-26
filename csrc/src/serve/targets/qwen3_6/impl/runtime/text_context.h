@@ -230,7 +230,8 @@ public:
     // the batch bucket, with pad rows staged as duplicates of a live row.
     [[nodiscard]] bool try_mixed_graph_chunk(std::span<const int> full_ids, std::uint32_t begin,
                                              std::uint32_t nominal, const MixedDecodeSlice& decode,
-                                             std::int32_t batch_bucket);
+                                             std::int32_t batch_bucket,
+                                             std::int32_t topology_class);
     void mixed_graph_window(std::int32_t chunk_bucket, std::int32_t batch_bucket);
 
     [[nodiscard]] PrefillChunkResult prefill_chunk(std::span<const int> full_ids,

@@ -1,4 +1,5 @@
 #pragma once
+#include "runtime/contract/round_lifecycle.h"
 #include "targets/qwen3_6/impl/runtime/instance.h"
 // Qwen3.6 family runtime implementation; instantiated only by exact variants.
 
@@ -296,6 +297,19 @@ public:
         const TokenId* source     = nullptr;
         std::int32_t count        = 0;
     };
+        // Round lifecycle state (runtime/contract/round_lifecycle.h): what the
+    // launch half hands the consume half. Depth is one today; overlap means
+    // rotating these per in-flight round.
+    struct InFlightRound {
+        std::uint64_t id    = 0;
+        std::uint32_t rows  = 0;
+        std::uint32_t burst = 0;
+        std::chrono::steady_clock::time_point start{};
+        std::array<std::uint32_t, kMaximumConcurrency> lanes{};
+    };
+    InFlightRound in_flight_{};
+    std::uint64_t in_flight_counter_ = 0;
+
     std::array<TokenId, kMaximumConcurrency * kChainBurstLimit> burst_rounds{};
     std::array<TokenId, kMaximumConcurrency * kChainBurstLimit> burst_tokens{};
     std::array<std::int32_t, kMaximumConcurrency> burst_counts{};
@@ -339,6 +353,14 @@ private:
                                        std::span<const std::uint32_t> counts);
     void validate_licensed_tokens(std::span<const TokenId> tokens) const;
     void mark_workspace_usage(std::size_t phase_bytes) noexcept;
+    [[nodiscard]] runtime::RoundHandle
+    launch_ordinary_round(std::span<const std::uint32_t> lanes,
+                          std::span<const runtime::RoundBudget> budgets);
+    [[nodiscard]] runtime::BatchedGeneratedRound
+    consume_ordinary_round(runtime::RoundHandle handle);
+    [[nodiscard]] static constexpr std::uint32_t maximum_rounds_in_flight() noexcept {
+        return 1;
+    }
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                           std::span<const runtime::RoundBudget> budgets);

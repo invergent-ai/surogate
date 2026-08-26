@@ -1833,3 +1833,43 @@ Still to do on this item: KV dtype is a shape property in the design but
 remains a parallel code path (separate bf16 and i8 kernel headers selected
 at runtime), and the fused flash decode kernel itself is not started —
 the geometry work is its precondition, not the kernel.
+
+## 55. The mixed-round corruption: KV pages, not Marlin (2026-08-26)
+
+Root cause of the wrong-token fatals that have shadowed the 64-lane
+configuration all session.
+
+A mixed-round graph is captured at a chunk length rounded up to a
+multiple of 128, and it writes that whole rounded window — pad columns
+included. KV pages are mapped in units of kPagedKVPageSize = **64**, and
+only up to the prompt length. So a prompt whose length lands in the upper
+half of a 128-block has its pad columns writing past the mapped pages:
+548 real tokens map 576, the graph writes 640, and the last 64 columns
+land in whatever block-table slots follow — another sequence's KV.
+
+Every observed symptom follows from that. Intermittent, because it
+depends on prompt length mod 128 and the loadgen salts every prompt.
+Mixed-only, because only the mixed path pairs a 128-rounded window with
+an un-mapped tail. And the corrupted token appears in a *different*
+lane's stream than the round that produced it, which is why it read as a
+Marlin bug for so long.
+
+Fixed by mapping KV for the window the graph actually writes, before
+replay: PrefillGraphFamily::chunk_bucket_for exposes the ladder's
+rounding, and advance_prefill_mixed materializes to it.
+
+Measured, 0.8B at 64 lanes, mixed graphs ON, four consecutive 90-second
+runs: 6,065 / 6,014 / 6,051 / 6,058 tok/s, zero errors, zero fatals.
+Against vLLM's 5,958 that is +1.6% and stable at full speed.
+
+Three theories were tested and rejected before this one, all by
+measurement rather than argument, and all are recorded so they are not
+re-walked: the Marlin lock array is adequately sized (#49); guarding the
+real locks[-1] write changes nothing (#49); and an unbanded attention
+envelope in the graph is not the cause either — banding it, which this
+patch keeps because it matches the proven decode-graph design, still
+crashed at batch 62. The one that worked came from instrumentation, not
+inspection: recording each round's shape and printing it in the worker's
+fatal line named `kind=mixed batch=62/63` every time, and the constant
+appearance of near-full batches with a live prefill lane is what finally
+pointed at the prefill window rather than the decode batch.

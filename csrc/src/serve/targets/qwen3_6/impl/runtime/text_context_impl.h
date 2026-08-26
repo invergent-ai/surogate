@@ -1386,7 +1386,9 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
                                cudaMemcpyDeviceToDevice, s));
 
     const ops::GqaExecutionEnvelope prefill_envelope{1, family.kv_capacity()};
-    const ops::GqaExecutionEnvelope decode_envelope{1, family.kv_capacity()};
+    // Banded, matching the ordinary decode graphs (the band is part of the
+    // graph key, so a replay never sees a frontier outside it).
+    const ops::GqaExecutionEnvelope decode_envelope = mixed_graph_decode_.envelope;
 
     Tensor x = roots.residual;
     ops::embedding(ids_device, *embed_, x, s);
@@ -1585,7 +1587,8 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
 // does not fit the workspace window: the caller runs the eager mixed body.
 bool TextContext::try_mixed_graph_chunk(std::span<const int> full_ids, std::uint32_t begin,
                                         std::uint32_t nominal, const MixedDecodeSlice& decode,
-                                        std::int32_t batch_bucket) {
+                                        std::int32_t batch_bucket,
+                                        std::int32_t topology_class) {
     if (prefill_graph_family_ == nullptr || rope_delta_ != 0) { return false; }
     PrefillGraphFamily& family = *prefill_graph_family_;
     if (family.dead()) { return false; }
@@ -1611,7 +1614,7 @@ bool TextContext::try_mixed_graph_chunk(std::span<const int> full_ids, std::uint
     mixed_graph_decode_          = decode;
 
     DecodeGraphExecutable* executable = family.ensure(
-        PrefillGraphFamily::mixed_key(chunk_bucket, batch_bucket),
+        PrefillGraphFamily::mixed_key(chunk_bucket, batch_bucket, topology_class),
         [this, chunk_bucket, batch_bucket] { mixed_graph_window(chunk_bucket, batch_bucket); });
     if (executable == nullptr) { return false; }
     executable->launch(ctx_.stream);
