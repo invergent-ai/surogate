@@ -1433,3 +1433,28 @@ decode graph needs. 4B 100-user: 2,571 -> 2,629 tok/s, TTFT 1.77 -> 1.72
 s, zero errors.
 
 Standing: 0.8B 6,003 v vLLM 5,958 (AHEAD), 4B 2,629 v 3,390 (-22%).
+
+## 46. Session standing (2026-08-26)
+
+  model  surogate   vLLM   gap
+  0.8B      6,003  5,958   +0.8%  AHEAD
+  4B        2,629  3,390   -22%
+  27B         370    688   -46%
+
+The 0.8B is past vLLM. The 4B closed from -45% at session start to -22%.
+The 27B is unmoved and now has a clean diagnosis: it cannot take the
+lane raise that paid on the other two — 64 lanes wants 23.3 GB of
+runtime reservation against 12.76 GB free after its weights, because
+per-lane GDN state at that model size dominates — so its concurrency is
+memory-bound at 32 and its deficit is entirely compute. That is the FP8
+residency work: Marlin FP8 measured 2.4-2.7x faster on the shapes that
+bind it, and the only thing standing in the way is that a derived plane
+duplicates a residency already filling the card. Loader-level layout
+replacement is the fix.
+
+What actually moved the needle this session, in order of size: the
+stale sampler cap (15.3% of device on the fallback path), vendoring
+Marlin (1.5-2.3x on decode GEMMs), the lane raise with band width
+following it, and the batch-aware KV split clamp. Three of those four
+were width constants or routing that degraded silently rather than
+failing — which is the pattern worth carrying into the next session.
