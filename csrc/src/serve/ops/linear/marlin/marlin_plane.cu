@@ -109,7 +109,9 @@ void marlin_plane_freeze_scratch() noexcept { g_scratch_frozen = true; }
 
 int g_fixed_m = 32;
 void marlin_set_fixed_m(int lanes) noexcept {
-    const int rounded = lanes <= 32 ? 32 : 64;
+    // At M >= 64 Marlin's thread_m_blocks saturates at 4, so every width from
+    // 64 up selects the same kernel and the decode graphs stay one class.
+    const int rounded = lanes <= 32 ? 32 : lanes <= 64 ? 64 : ((lanes + 31) / 32) * 32;
     if (g_scratch.gemm_out == nullptr) { g_fixed_m = rounded; }
 }
 int marlin_fixed_m() noexcept { return g_fixed_m; }

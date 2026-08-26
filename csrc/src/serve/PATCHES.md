@@ -1270,3 +1270,13 @@ Against vLLM: 0.8B 4,990 v 5,958 (-16%), 4B 2,234 v 3,390 (-34%), 27B
 needs an explicit --kv-capacity (auto sizes the cache before the doubled
 decode-graph set is accounted for and capture OOMs), which is the next
 thing to fix in the planner rather than in the flags.
+
+Lane sweep, 4B: 32 -> 2,076; 64 -> 2,250; 96 -> 2,024. Sixty-four is the
+optimum. Past it the KV cache has to shrink to fit the decode-graph set
+(98,304 tokens at 96 lanes against 131,072 at 64) and the wider M wastes
+more on rounds that never fill it, so both ends of the trade turn
+against the raise. Final confirmation over 60 s: 4B 2,250 tok/s, TTFT
+p50 2.04 s and p95 2.05 s, 1,124 requests, zero errors, zero fatals.
+
+Standing against vLLM: 0.8B 4,990 v 5,958 (-16%), 4B 2,250 v 3,390
+(-34%), 27B 370 v 688 (-46%).
