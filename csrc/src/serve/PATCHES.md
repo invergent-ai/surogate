@@ -1314,3 +1314,40 @@ scheduler targets. Free lanes still take a single round so the next
 iteration refills them. UNMEASURED; gated on the same 4B run, where a
 throughput regression would mean the two changes interact and the cap
 belongs back at three.
+
+## 42. What the gate and the lane sweep actually proved (2026-08-26)
+
+Continuous admission (#41) and the lifted burst cap measure NEUTRAL:
+4B 2,216 against a 2,250 baseline, 0.8B 5,015 against 4,990, no errors
+in either. Neither was wrong, both were aimed at the wrong thing, and
+the runs say why.
+
+TTFT is not a lever here. It reads 2,038-2,040 ms in every single
+configuration — 64 lanes, 100 lanes, prefill chunk 1024/2048/3072,
+admission rationed or continuous. That constancy is the tell: with 100
+closed-loop clients against L lanes and a ~3.5 s request, the wait is
+just (100-L)/L x 3.5 s, which is 2.0 s at 64 lanes. TTFT is a derived
+quantity of the harness, not a property to optimise. Only throughput
+moves.
+
+The burst cap barely engaged either: under sustained load a prefill lane
+is always staged, and the policy forces burst_limit = 1 whenever
+prefill_lane_ is set. Raising the ceiling for full lanes changed a path
+the load never takes.
+
+Lane sweep, extended: 32 -> 2,076, 64 -> 2,250, 96 -> 2,024, 100 ->
+2,002, and at 100 lanes the KV capacity makes no difference at all
+(131,072 and 98,304 both give ~2,000). KV was never the constraint.
+Beyond 64 the loss is the padded M: kMarlinFixedM rounds 100 up to 128
+because Marlin's own M-loop splits at multiples of 64 (a remainder chunk
+picks a different thread_m_blocks and would break graph stability), so
+every band call at 100 lanes computes 128 rows to use 100. Sixty-four
+lanes with a 64-wide M is a genuine local optimum for this design.
+
+Which leaves per-round efficiency as the only remaining axis, and the
+workload shape says where: at 512 prompt tokens for 128 generated, this
+benchmark is 4:1 prefill-to-decode by token count, so prefill dominates
+the wall clock. The decode-side work (Marlin, lanes, admission, bursts)
+has been mined out; the next real gain is prefill throughput, which is
+also where the resident-Marlin change pays a second time by letting
+Marlin serve prefill instead of the current cutlass/fp4 path.
