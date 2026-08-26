@@ -184,7 +184,7 @@ load_attention_projection(const FullAttentionPlan& plan,
     const auto& fused = std::get<FusedAttentionProjectionPlan>(plan.projection);
     return FusedAttentionProjectionPayload{
         .query_key_gate_value =
-            materialized_weight(materialized, fused.query_key_gate_value, TextConfig::mtp_attention_input_rows, 2048),
+            materialized_weight(materialized, fused.query_key_gate_value, TextConfig::mtp_attention_input_rows, TextConfig::hidden),
     };
 }
 
@@ -197,7 +197,7 @@ load_gdn_input_projection(const GdnPlan& plan, const artifact::MaterializedArtif
     const auto& fused = std::get<FusedGdnInputProjectionPlan>(plan.input_projection);
     return FusedGdnInputProjectionPayload{
         .query_key_value_z =
-            materialized_weight(materialized, fused.query_key_value_z, TextConfig::convolution_dim + TextConfig::value_dim, 2048),
+            materialized_weight(materialized, fused.query_key_value_z, TextConfig::convolution_dim + TextConfig::value_dim, TextConfig::hidden),
     };
 }
 
@@ -206,13 +206,13 @@ load_gdn_control_projection(const GdnPlan& plan,
                             const artifact::MaterializedArtifact& materialized) {
     if (const auto* split = std::get_if<SplitGdnControlProjectionPlan>(&plan.control_projection)) {
         return SplitGdnControlProjectionPayload{
-            .a_projection = materialized_weight(materialized, split->a_projection, TextConfig::gdn_value_heads, 2048),
-            .b_projection = materialized_weight(materialized, split->b_projection, TextConfig::gdn_value_heads, 2048),
+            .a_projection = materialized_weight(materialized, split->a_projection, TextConfig::gdn_value_heads, TextConfig::hidden),
+            .b_projection = materialized_weight(materialized, split->b_projection, TextConfig::gdn_value_heads, TextConfig::hidden),
         };
     }
     const auto& fused = std::get<FusedGdnControlProjectionPlan>(plan.control_projection);
     return FusedGdnControlProjectionPayload{
-        .a_b_projection = materialized_weight(materialized, fused.a_b_projection, 2 * TextConfig::gdn_value_heads, 2048),
+        .a_b_projection = materialized_weight(materialized, fused.a_b_projection, 2 * TextConfig::gdn_value_heads, TextConfig::hidden),
     };
 }
 
@@ -227,7 +227,7 @@ void bind_groupwise_text_layers(artifact::Binder& binder, BindingPlan& out) {
             target.attention.projection = FusedAttentionProjectionPlan{
                 .query_key_gate_value =
                     bind_weight(binder, prefix + "attention/query_key_gate_value",
-                                NumericFormat::W8G32_F16S, {TextConfig::mtp_attention_input_rows, 2048}),
+                                NumericFormat::W8G32_F16S, {TextConfig::mtp_attention_input_rows, TextConfig::hidden}),
             };
             target.attention.query_norm = artifact::bind_device_tensor(
                 binder, prefix + "attention/query_norm", NumericFormat::BF16, {TextConfig::head_dim});
@@ -244,24 +244,24 @@ void bind_groupwise_text_layers(artifact::Binder& binder, BindingPlan& out) {
                 binder, prefix + "gdn/convolution", NumericFormat::BF16, {TextConfig::gdn_conv_kernel, TextConfig::convolution_dim});
             target.gdn.control_projection = SplitGdnControlProjectionPlan{
                 .a_projection = bind_weight(binder, prefix + "gdn/a_projection",
-                                            NumericFormat::BF16, {TextConfig::gdn_value_heads, 2048}),
+                                            NumericFormat::BF16, {TextConfig::gdn_value_heads, TextConfig::hidden}),
                 .b_projection = bind_weight(binder, prefix + "gdn/b_projection",
-                                            NumericFormat::BF16, {TextConfig::gdn_value_heads, 2048}),
+                                            NumericFormat::BF16, {TextConfig::gdn_value_heads, TextConfig::hidden}),
             };
             target.gdn.input_projection = FusedGdnInputProjectionPlan{
                 .query_key_value_z =
                     bind_weight(binder, prefix + "gdn/query_key_value_z",
-                                NumericFormat::W8G32_F16S, {TextConfig::convolution_dim + TextConfig::value_dim, 2048}),
+                                NumericFormat::W8G32_F16S, {TextConfig::convolution_dim + TextConfig::value_dim, TextConfig::hidden}),
             };
             target.gdn.norm = artifact::bind_device_tensor(binder, prefix + "gdn/norm",
                                                            NumericFormat::BF16, {TextConfig::gdn_key_head_dim});
             target.gdn.output =
-                bind_weight(binder, prefix + "gdn/output", NumericFormat::W8G32_F16S, {2048, 2048});
+                bind_weight(binder, prefix + "gdn/output", NumericFormat::W8G32_F16S, {2048, TextConfig::hidden});
         }
         target.post_attention_norm = artifact::bind_device_tensor(
             binder, prefix + "post_attention_norm", NumericFormat::BF16, {TextConfig::hidden});
         target.mlp.gate_up =
-            bind_weight(binder, prefix + "mlp/gate_up", NumericFormat::W8G32_F16S, {2 * TextConfig::intermediate, 2048});
+            bind_weight(binder, prefix + "mlp/gate_up", NumericFormat::W8G32_F16S, {2 * TextConfig::intermediate, TextConfig::hidden});
         target.mlp.down =
             bind_weight(binder, prefix + "mlp/down", NumericFormat::W8G32_F16S, {2048, TextConfig::intermediate});
     }
@@ -278,7 +278,7 @@ void bind_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out) {
             WeightPlan input;
             if (is_early_attention_input(layer)) {
                 input = bind_weight(binder, prefix + "attention/query_key_gate_value",
-                                    NumericFormat::BF16, {TextConfig::mtp_attention_input_rows, 2048});
+                                    NumericFormat::BF16, {TextConfig::mtp_attention_input_rows, TextConfig::hidden});
             } else {
                 input = bind_nvfp4_weight(
                     binder, prefix + "attention/query_key_gate_value", TextConfig::mtp_attention_input_rows, 2048,
@@ -307,9 +307,9 @@ void bind_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out) {
                 binder, prefix + "gdn/convolution", NumericFormat::BF16, {TextConfig::gdn_conv_kernel, TextConfig::convolution_dim});
             target.gdn.control_projection = SplitGdnControlProjectionPlan{
                 .a_projection = bind_weight(binder, prefix + "gdn/a_projection",
-                                            NumericFormat::BF16, {TextConfig::gdn_value_heads, 2048}),
+                                            NumericFormat::BF16, {TextConfig::gdn_value_heads, TextConfig::hidden}),
                 .b_projection = bind_weight(binder, prefix + "gdn/b_projection",
-                                            NumericFormat::BF16, {TextConfig::gdn_value_heads, 2048}),
+                                            NumericFormat::BF16, {TextConfig::gdn_value_heads, TextConfig::hidden}),
             };
             target.gdn.input_projection = FusedGdnInputProjectionPlan{
                 .query_key_value_z =
@@ -320,7 +320,7 @@ void bind_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out) {
                                                            NumericFormat::BF16, {TextConfig::gdn_key_head_dim});
             if (is_bf16_gdn_output(layer)) {
                 target.gdn.output =
-                    bind_weight(binder, prefix + "gdn/output", NumericFormat::BF16, {2048, 2048});
+                    bind_weight(binder, prefix + "gdn/output", NumericFormat::BF16, {2048, TextConfig::hidden});
             } else {
                 target.gdn.output =
                     bind_nvfp4_weight(binder, prefix + "gdn/output", 2048, 2048,
@@ -348,7 +348,7 @@ void bind_qwen38_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out) {
         if (target.is_full_attention) {
             target.attention.projection = FusedAttentionProjectionPlan{
                 .query_key_gate_value = bind_weight(
-                    binder, prefix + "attention/query_key_gate_value", kFp8, {TextConfig::mtp_attention_input_rows, 2048}),
+                    binder, prefix + "attention/query_key_gate_value", kFp8, {TextConfig::mtp_attention_input_rows, TextConfig::hidden}),
             };
             target.attention.query_norm = artifact::bind_device_tensor(
                 binder, prefix + "attention/query_norm", NumericFormat::BF16, {TextConfig::head_dim});
@@ -365,15 +365,15 @@ void bind_qwen38_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out) {
                 binder, prefix + "gdn/convolution", NumericFormat::BF16, {TextConfig::gdn_conv_kernel, TextConfig::convolution_dim});
             target.gdn.control_projection = FusedGdnControlProjectionPlan{
                 .a_b_projection = bind_weight(binder, prefix + "gdn/a_b_projection",
-                                              NumericFormat::BF16, {2 * TextConfig::gdn_value_heads, 2048}),
+                                              NumericFormat::BF16, {2 * TextConfig::gdn_value_heads, TextConfig::hidden}),
             };
             target.gdn.input_projection = FusedGdnInputProjectionPlan{
                 .query_key_value_z =
-                    bind_weight(binder, prefix + "gdn/query_key_value_z", kFp8, {TextConfig::convolution_dim + TextConfig::value_dim, 2048}),
+                    bind_weight(binder, prefix + "gdn/query_key_value_z", kFp8, {TextConfig::convolution_dim + TextConfig::value_dim, TextConfig::hidden}),
             };
             target.gdn.norm   = artifact::bind_device_tensor(binder, prefix + "gdn/norm",
                                                              NumericFormat::BF16, {TextConfig::gdn_key_head_dim});
-            target.gdn.output = bind_weight(binder, prefix + "gdn/output", kFp8, {2048, 2048});
+            target.gdn.output = bind_weight(binder, prefix + "gdn/output", kFp8, {2048, TextConfig::hidden});
         }
         target.post_attention_norm = artifact::bind_device_tensor(
             binder, prefix + "post_attention_norm", NumericFormat::BF16, {TextConfig::hidden});
@@ -384,7 +384,7 @@ void bind_qwen38_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out) {
             target.mlp.down = bind_nvfp4_weight(binder, prefix + "mlp/down", 2048, TextConfig::intermediate,
                                                 prefix + "mlp/down_projection/input_scale_divisor");
         } else {
-            target.mlp.gate_up = bind_weight(binder, prefix + "mlp/gate_up", kFp8, {2 * TextConfig::intermediate, 2048});
+            target.mlp.gate_up = bind_weight(binder, prefix + "mlp/gate_up", kFp8, {2 * TextConfig::intermediate, TextConfig::hidden});
             target.mlp.down    = bind_weight(binder, prefix + "mlp/down", kFp8, {2048, TextConfig::intermediate});
         }
     }
@@ -420,7 +420,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
 
     const NumericFormat vocabulary_format = endpoint_format(weights_profile);
     out.token_embedding =
-        bind_weight(binder, "text/token_embedding", vocabulary_format, {TextConfig::output_rows, 2048});
+        bind_weight(binder, "text/token_embedding", vocabulary_format, {TextConfig::output_rows, TextConfig::hidden});
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
@@ -437,7 +437,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     }
     out.final_norm =
         artifact::bind_device_tensor(binder, "text/final_norm", NumericFormat::BF16, {TextConfig::hidden});
-    out.output_head = bind_weight(binder, "text/output_head", vocabulary_format, {TextConfig::output_rows, 2048});
+    out.output_head = bind_weight(binder, "text/output_head", vocabulary_format, {TextConfig::output_rows, TextConfig::hidden});
     const artifact::TensorPlacement proposal_placement =
         features.optimized_proposal() ? artifact::TensorPlacement::Device
                                       : artifact::TensorPlacement::ValidateOnly;
@@ -473,7 +473,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     out.mtp.hidden_norm          = bind_mtp("mtp/hidden_norm", NumericFormat::BF16, {TextConfig::hidden});
     out.mtp.input_norm           = bind_mtp("mtp/layer/input_norm", NumericFormat::BF16, {TextConfig::hidden});
     out.mtp.query_key_gate_value = bind_mtp("mtp/layer/attention/query_key_gate_value",
-                                            NumericFormat::W8G32_F16S, {TextConfig::mtp_attention_input_rows, 2048});
+                                            NumericFormat::W8G32_F16S, {TextConfig::mtp_attention_input_rows, TextConfig::hidden});
     out.mtp.query_norm = bind_mtp("mtp/layer/attention/query_norm", NumericFormat::BF16, {TextConfig::head_dim});
     out.mtp.key_norm   = bind_mtp("mtp/layer/attention/key_norm", NumericFormat::BF16, {TextConfig::head_dim});
     out.mtp.output =
@@ -481,7 +481,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     out.mtp.post_attention_norm =
         bind_mtp("mtp/layer/post_attention_norm", NumericFormat::BF16, {TextConfig::hidden});
     out.mtp.mlp.gate_up = WeightPlan{
-        .object = bind_mtp("mtp/layer/mlp/gate_up", NumericFormat::W8G32_F16S, {2 * TextConfig::intermediate, 2048}),
+        .object = bind_mtp("mtp/layer/mlp/gate_up", NumericFormat::W8G32_F16S, {2 * TextConfig::intermediate, TextConfig::hidden}),
         .format = NumericFormat::W8G32_F16S};
     out.mtp.mlp.down = WeightPlan{
         .object = bind_mtp("mtp/layer/mlp/down", NumericFormat::W8G32_F16S, {2048, TextConfig::intermediate}),
@@ -511,7 +511,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     auto& final_norm      = runtime.final_norm;
     auto& output_head     = runtime.output_head;
 
-    token_embedding        = materialized_weight(backing, plan.token_embedding, TextConfig::output_rows, 2048);
+    token_embedding        = materialized_weight(backing, plan.token_embedding, TextConfig::output_rows, TextConfig::hidden);
     std::size_t full_index = 0;
     std::size_t gdn_index  = 0;
     for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
@@ -554,11 +554,11 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     }
     final_norm =
         artifact::materialized_tensor(backing, plan.final_norm, NumericFormat::BF16, {TextConfig::hidden});
-    output_head = materialized_weight(backing, plan.output_head, TextConfig::output_rows, 2048);
+    output_head = materialized_weight(backing, plan.output_head, TextConfig::output_rows, TextConfig::hidden);
     if (plan.features.optimized_proposal()) {
         auto& proposal     = runtime.optimized_proposal.emplace();
         proposal.head      = artifact::materialized_weight(backing, plan.draft_head,
-                                                           NumericFormat::W8G32_F16S, 131072, 2048);
+                                                           NumericFormat::W8G32_F16S, 131072, TextConfig::hidden);
         proposal.token_ids = artifact::materialized_tensor(backing, plan.draft_head_token_ids,
                                                            NumericFormat::I32, {131072});
     }
@@ -574,19 +574,19 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
         mtp.input_norm       = artifact::materialized_tensor(backing, plan.mtp.input_norm,
                                                              NumericFormat::BF16, {TextConfig::hidden});
         mtp.attention.packed = artifact::materialized_weight(
-            backing, plan.mtp.query_key_gate_value, NumericFormat::W8G32_F16S, TextConfig::mtp_attention_input_rows, 2048);
+            backing, plan.mtp.query_key_gate_value, NumericFormat::W8G32_F16S, TextConfig::mtp_attention_input_rows, TextConfig::hidden);
         // surogate vendor patch (PATCHES.md #13): qwen3.5-2b fused qkgv rows
         // (q 2048 | k 512 | gate 2048 | v 512), not the 27B extents.
-        mtp.attention.query       = row_view(mtp.attention.packed, 0, 2048);
-        mtp.attention.key         = row_view(mtp.attention.packed, 2048, TextConfig::kv_size);
-        mtp.attention.output_gate = row_view(mtp.attention.packed, 2560, 2048);
-        mtp.attention.value       = row_view(mtp.attention.packed, 4608, TextConfig::kv_size);
+        mtp.attention.query       = row_view(mtp.attention.packed, 0, TextConfig::query_size);
+        mtp.attention.key         = row_view(mtp.attention.packed, TextConfig::query_size, TextConfig::kv_size);
+        mtp.attention.output_gate = row_view(mtp.attention.packed, TextConfig::query_size + TextConfig::kv_size, TextConfig::query_size);
+        mtp.attention.value       = row_view(mtp.attention.packed, 2 * TextConfig::query_size + TextConfig::kv_size, TextConfig::kv_size);
         mtp.query_norm =
             artifact::materialized_tensor(backing, plan.mtp.query_norm, NumericFormat::BF16, {TextConfig::head_dim});
         mtp.key_norm =
             artifact::materialized_tensor(backing, plan.mtp.key_norm, NumericFormat::BF16, {TextConfig::head_dim});
         mtp.output              = artifact::materialized_weight(backing, plan.mtp.output,
-                                                                NumericFormat::W8G32_F16S, 2048, 2048);
+                                                                NumericFormat::W8G32_F16S, 2048, TextConfig::hidden);
         mtp.post_attention_norm = artifact::materialized_tensor(
             backing, plan.mtp.post_attention_norm, NumericFormat::BF16, {TextConfig::hidden});
         mtp.post_mixer = load_mlp(plan.mtp.mlp, backing);
@@ -601,7 +601,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
         vision.merger_fc2      = artifact::materialized_weight(backing, plan.vision_merger_fc2,
                                                                NumericFormat::W8G32_F16S, 2048, 4608);
         vision.merger_fc2_bias = artifact::materialized_tensor(backing, plan.vision_merger_fc2_bias,
-                                                               NumericFormat::BF16, {2048});
+                                                               NumericFormat::BF16, {TextConfig::hidden});
     }
 }
 

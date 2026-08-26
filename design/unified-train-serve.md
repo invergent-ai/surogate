@@ -208,3 +208,27 @@ second model rather than by review:
 That last one is the argument for this whole exercise in miniature: the wrong
 constant sat in three targets, was invisible to review, and only surfaced when
 two files that should agree were made to agree.
+
+### De-literalising, finished pass
+
+  qwen3_5_0_8b vs qwen3_5_4b   218 differing lines -> 30 (14 beyond the name)
+  qwen3_5_2b   vs either        ~70 (54 beyond the name)
+
+Two more rules were needed, and one of them was wrong first:
+
+  A weight's trailing dimension is its input width, so an ambiguous value
+  sitting there means hidden. Except in `row_view`, whose trailing argument is
+  a row COUNT — applying the rule there rewrote a count as hidden, which is
+  correct by value on the 2B (where hidden and query_size are both 2048) and
+  wrong in meaning. `row_view` is excluded now.
+
+  The MTP packed attention layout (q | k | gate | v) is expressed symbolically
+  in all three targets: offsets 0, q, q+kv, 2q+kv and counts q, kv, q, kv.
+  Verified against the pre-refactor literals — all twelve extents in all three
+  targets reproduce exactly, so the change is value-preserving rather than
+  merely plausible.
+
+The 2B keeps more literals than its siblings because more of its quantities
+coincide: hidden and query_size are both 2048, intermediate and
+convolution_dim both 6144. Every remaining literal there is one the tool
+refused rather than guessed, which is the intended behaviour.

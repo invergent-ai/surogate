@@ -579,8 +579,8 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
         // (q 2048 | k 512 | gate 2048 | v 512), not the 27B extents.
         mtp.attention.query       = row_view(mtp.attention.packed, 0, TextConfig::query_size);
         mtp.attention.key         = row_view(mtp.attention.packed, TextConfig::query_size, TextConfig::kv_size);
-        mtp.attention.output_gate = row_view(mtp.attention.packed, TextConfig::mtp_input_rows, TextConfig::query_size);
-        mtp.attention.value       = row_view(mtp.attention.packed, TextConfig::intermediate, TextConfig::kv_size);
+        mtp.attention.output_gate = row_view(mtp.attention.packed, TextConfig::query_size + TextConfig::kv_size, TextConfig::query_size);
+        mtp.attention.value       = row_view(mtp.attention.packed, 2 * TextConfig::query_size + TextConfig::kv_size, TextConfig::kv_size);
         mtp.query_norm =
             artifact::materialized_tensor(backing, plan.mtp.query_norm, NumericFormat::BF16, {TextConfig::head_dim});
         mtp.key_norm =

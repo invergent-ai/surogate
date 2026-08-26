@@ -114,6 +114,28 @@ def apply_role_rules(call_text: str, resolved: dict[int, str]) -> str:
     return call_text
 
 
+def apply_trailing_dim_rule(call_text: str, ambiguous: dict[int, list[str]]) -> str:
+    """A weight's trailing dimension is its input width, i.e. hidden.
+
+    True for every weight in these targets except the two whose columns are the
+    MLP intermediate or the MTP input rows, and those are already resolved by
+    the role rules above, so by the time an ambiguous value is still sitting in
+    the trailing position, hidden is what it means. Only the trailing token is
+    touched — the leading dimension keeps whatever the value-based pass decided.
+    """
+    # row_view's trailing argument is a ROW COUNT, not an input width. Applying
+    # the rule there rewrote a count as hidden — correct by value on the 2B,
+    # where hidden and query_size coincide, and wrong in meaning.
+    if "row_view" in call_text:
+        return call_text
+    for value, options in ambiguous.items():
+        if "TextConfig::hidden" not in options:
+            continue
+        pattern = rf"(?<![\w:.]){value}(?![\w.])(\s*[}}\)]?\s*)$"
+        call_text = re.sub(pattern, r"TextConfig::hidden\1", call_text.rstrip()) + ""
+    return call_text
+
+
 def resolve_ambiguous(call_text: str, value: int, options: list[str]) -> str | None:
     """Picks one of several equal-valued expressions using the call's own text."""
     for token, _kind, expr in CONTEXT_RULES:
@@ -133,6 +155,7 @@ def transform(src: str, values: dict[int, str]) -> str:
                 text = re.sub(rf"(?<![\w:.]){v}(?![\w.])", expr, text)
         if AMBIGUOUS:
             text = apply_role_rules(text, values)
+            text = apply_trailing_dim_rule(text, AMBIGUOUS)
         return text
     out, i = [], 0
     pattern = re.compile(rf"\b({'|'.join(CALLS)})\s*\(")
