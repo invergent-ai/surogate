@@ -1280,3 +1280,26 @@ p50 2.04 s and p95 2.05 s, 1,124 requests, zero errors, zero fatals.
 
 Standing against vLLM: 0.8B 4,990 v 5,958 (-16%), 4B 2,250 v 3,390
 (-34%), 27B 370 v 688 (-46%).
+
+## 41. Continuous admission (2026-08-26) — UNMEASURED
+
+Lever three of the structural set. The worker loop admits at most one
+request per GPU unit, which made sense when admission ran the first
+prefill chunk itself. Since #30 it does not: with the deferred first
+chunk an admission only stages the prompt and leaves the prefill to a
+mixed round, so it is CPU-only work being rationed at the cadence of GPU
+rounds. That rationing is what the 4B's TTFT shows — 2.04 s against
+vLLM's 0.24 s at the same 100 clients, with vLLM admitting continuously
+into ~100 slots.
+
+The loop now keeps admitting while the queue holds work and a lane is
+free, stopping on the first admission that runs a GPU unit (a vision or
+MTP prompt, or any shape the deferred path does not cover) so a single
+iteration cannot monopolise the device. The bound is max_concurrency
+attempts.
+
+Not measured — GPU2 went back to its owner before this could run. The
+gate is a 100-user 4B run at 64 lanes: TTFT should fall toward vLLM's
+while aggregate throughput holds at 2,250, and any regression in
+throughput means admission is now stealing from decode and the loop
+needs a per-iteration cap below max_concurrency.

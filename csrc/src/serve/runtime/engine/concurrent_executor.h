@@ -1208,8 +1208,33 @@ private:
                 }
 
                 if (have_pending && (membership.empty() || previous_unit_was_decode)) {
-                    const auto t_admit               = Clock::now();
-                    const AdmissionProgress progress = try_admit_one();
+                    const auto t_admit         = Clock::now();
+                    AdmissionProgress progress = try_admit_one();
+                    // Continuous admission (PATCHES.md #41): with the deferred
+                    // first chunk (#30) an admission is CPU-only — it stages
+                    // the prompt and leaves the prefill to a mixed round — so
+                    // one admission per GPU unit needlessly rations lane
+                    // refills and shows up as TTFT. Keep admitting while the
+                    // queue holds work, lanes are free and no GPU unit ran.
+                    if (progress == AdmissionProgress::ControlProgress) {
+                        for (std::uint32_t extra = 1; extra < max_concurrency_; ++extra) {
+                            bool lane_free = false;
+                            for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                                lane_free = lane_free || slots_[lane] == nullptr;
+                            }
+                            if (!lane_free) { break; }
+                            {
+                                std::lock_guard lock(queue_mutex_);
+                                if (pending_.empty()) { break; }
+                            }
+                            const AdmissionProgress more = try_admit_one();
+                            if (more == AdmissionProgress::None) { break; }
+                            if (more == AdmissionProgress::RanGpuUnit) {
+                                progress = more;
+                                break;
+                            }
+                        }
+                    }
                     seg_timer_.admit +=
                         std::chrono::duration<double>(Clock::now() - t_admit).count();
                     if (progress == AdmissionProgress::RanGpuUnit) {
