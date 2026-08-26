@@ -1790,3 +1790,16 @@ loader.
 So: still worth doing, still a converter plus loader change, but it is a
 kernel-throughput play on 47% of the device, not a memory or concurrency
 play.
+
+## 53. The wide Marlin band becomes the default (2026-08-26)
+
+The band was pinned to 32 because a wide band corrupted the 0.8B under
+sustained load. That fault was the mixed-round pad race (#50), not
+Marlin, and it is fixed. The pin's rationale is gone, so the band follows
+the lane ceiling again; SUROGATE_SERVE_MARLIN_NARROW=1 pins it back for
+bisecting.
+
+Confirmed on the default configuration with no environment flags: 0.8B
+6,051 tok/s over 90 s, 4,406 requests, zero errors, zero fatals. The
+env-flag measurement was 6,076, so the flip reproduces it. Every engine
+row on the board is now what `surogate serve` does out of the box.
