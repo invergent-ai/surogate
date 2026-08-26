@@ -10,6 +10,9 @@ function(ninfer_add_op_bench name)
   target_compile_options(${name} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 endfunction()
 
+ninfer_add_op_bench(ninfer_marlin_w8_bench SOURCES ops/marlin_w8_bench.cu)
+set_source_files_properties(ops/marlin_w8_bench.cu
+  PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>")
 ninfer_add_op_bench(ninfer_silu_mul_bench SOURCES ops/silu_mul_bench.cu)
 ninfer_add_op_bench(ninfer_residual_add_bench SOURCES ops/residual_add_bench.cu)
 ninfer_add_op_bench(ninfer_sigmoid_mul_bench SOURCES ops/sigmoid_mul_bench.cu)

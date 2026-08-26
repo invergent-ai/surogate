@@ -1014,6 +1014,9 @@ add_library(ninfer_ops STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/linear/w8/w8_rowsplit_gemm_mma.cu
   ${SERVE_ROOT}/ops/linear/w8/w8_rowsplit_gemm_simt.cu
   ${SERVE_ROOT}/ops/linear/w8/w8_rowsplit_gemm_decode.cu
+  ${SERVE_ROOT}/ops/linear/marlin/marlin_gemm.cu
+  ${SERVE_ROOT}/ops/linear/marlin/marlin_kernels_generated.cu
+  ${SERVE_ROOT}/ops/linear/marlin/marlin_repack.cu
   ${SERVE_ROOT}/ops/linear/w8/w8_small_t.cu
   ${SERVE_ROOT}/ops/linear/w8/w8_rowsplit_gemm_splitk.cu
   ${SERVE_ROOT}/ops/linear/w8/w8_dispatch.cpp
@@ -1066,6 +1069,12 @@ add_library(ninfer_ops STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/wrapper/sparse_moe.cpp
   ${SERVE_ROOT}/ops/wrapper/vision_attention.cpp
   ${SERVE_ROOT}/ops/wrapper/vision_pos_embed.cpp)
+
+set_source_files_properties(
+  ${SERVE_ROOT}/ops/linear/marlin/marlin_gemm.cu
+  ${SERVE_ROOT}/ops/linear/marlin/marlin_kernels_generated.cu
+  ${SERVE_ROOT}/ops/linear/marlin/marlin_repack.cu
+  PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>")
 ninfer_internal_includes(ninfer_ops)
 # surogate vendor patch (PATCHES.md #25): cutlass headers for the sm_120a
 # blockscaled NVFP4 GEMM TU. Points at the flashinfer-shipped cutlass by

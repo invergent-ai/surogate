@@ -1013,3 +1013,39 @@ before consuming round N's egress; host functions check EOS ids to drain
 early; membership refresh lags one round), i.e. the vLLM async-scheduler
 equivalent. The chain tail, egress host functions, and generalized
 resolve built here are the pieces that design needs.
+
+## 33. Marlin W8 GEMM vendored (2026-08-26) — Phase A
+
+The 4B census under the current engine: `w8_small_t_mma` is 47% of device
+time at 328-630 GB/s (the exact-T split-K kernels parallelize K only
+across warps, so small-N shapes raise ~160 CTAs on a 170-SM card).
+Routing the band to the R32C96 tile made it worse (1,425 tok/s, reverted)
+— #28's finding holds. Per the owner's directive to borrow what wins,
+vLLM's Marlin is vendored from study/vllm (Apache-2.0, IST-DASLab /
+Neural Magic lineage) under ops/linear/marlin/: the kernel template stack
+unmodified in vendor/ (scalar_type.hpp carries a torch-free STD_TORCH_CHECK
+shim), instantiations generated for (BF16 x kU8B128/kFE4M3fn x group_blocks
+{2,-1,8}) at stages 4, the dispatch adapted from marlin.cu to a raw-pointer
+entry (marlin_gemm_bf16), and a load-time repack path that takes the serve
+W8G32 residency (codes [N,K] int8 row-major, scales [N,K/32] FP16) through
+GPTQ packing (codes ^ 0x80 -> [K/4,N] u32) into the Marlin B tiles plus
+transposed/permuted BF16 scales. The engine's [K,T] column-major
+activations are byte-identical to Marlin's row-major A, so no transposes
+anywhere.
+
+Measured on the 4B decode shapes (ninfer_marlin_w8_bench, one-hot
+correctness max_rel 0.006 = BF16 scale rounding):
+
+  shape              engine kernel   marlin    speedup
+  down    2560x9216      71.8us      31.2us     2.30x
+  gate_up 18432x2560     94.4us      42.1us     2.24x
+  gdn_in  12288x2560     67.8us      35.7us     1.90x
+  attn_in 10240x2560     55.9us      29.5us     1.89x
+  out     2560x4096      31.6us      20.7us     1.53x
+  vocab   248320x2560   1008.8us    694.2us     1.45x
+
+These shapes are ~53% of 4B device time. Phase B (next): a Marlin weight
+plane built at load before the decode-graph captures (the w4fp4/w8fp8
+plane precedent), family dispatch for the T=17..48 band with fused
+epilogues run separately, and the FP8 variant for the 27B's
+fp8_small_t offenders (5120x6144 / 5120x17408 at 412-503 GB/s).
