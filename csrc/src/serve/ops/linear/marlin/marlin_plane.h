@@ -35,7 +35,6 @@ MarlinPlane marlin_plane_for(const Weight& weight, cudaStream_t stream);
 // group_blocks = -1. The 27B's decode band lives here: its FP8 GEMMs are
 // 47% of that model's device time at 412-503 GB/s.
 MarlinPlane marlin_fp8_plane_for(const Weight& weight, cudaStream_t stream);
-bool marlin_fp8_run(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream);
 
 struct MarlinScratch {
     void* gemm_out = nullptr;  // bf16 [kMarlinFixedM, n] row-major
@@ -70,6 +69,12 @@ MarlinScratch marlin_scratch() noexcept;
 // Ensures a plane exists for `weight` (deriving outside capture) and returns
 // the shared scratch; gemm_out is null when the weight has no usable plane.
 MarlinScratch marlin_scratch_for(const Weight& weight, cudaStream_t stream);
+
+// FP8 counterparts (PATCHES.md #38). marlin_fp8_scratch_for derives the plane
+// first and returns the scratch after, since reading the scratch before the
+// first derive sees it unallocated.
+MarlinScratch marlin_fp8_scratch_for(const Weight& weight, cudaStream_t stream);
+bool marlin_fp8_run(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream);
 
 // Called once after graph capture: the shared scratch may no longer move,
 // because captured graphs have baked its addresses. Derives that would need

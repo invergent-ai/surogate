@@ -1197,3 +1197,14 @@ available for any of it. The one-hot bench is the gate: it must pass on
 all five 27B shapes before the 27B is served through this path, and the
 wiring falls back to the existing kernels whenever the plane declines,
 so a failed derive degrades rather than breaks.
+
+Review pass on the blind-written code (no GPU to test it, so it got read
+instead). Two defects fixed before they could reach hardware: the FP8
+call sites read the shared scratch before the plane derive that
+allocates it, so the first band call in a process always fell back
+(harmless in the end, because capture happens after the warmup, but
+wrong and fragile) — marlin_fp8_scratch_for now derives first and
+returns the scratch after, matching the W8 pair; and both run paths now
+decline when the activation block is not contiguous, since the padded-A
+copy treats [k, t] as row-major [t, k] and a strided view would copy the
+wrong bytes with no error.

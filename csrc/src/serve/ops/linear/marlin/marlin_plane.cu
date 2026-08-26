@@ -245,10 +245,20 @@ MarlinPlane marlin_fp8_plane_for(const Weight& weight, cudaStream_t stream) {
     return {entry.b_packed, entry.scales};
 }
 
+MarlinScratch marlin_fp8_scratch_for(const Weight& weight, cudaStream_t stream) {
+    const MarlinPlane plane = marlin_fp8_plane_for(weight, stream);
+    if (plane.b_packed == nullptr) { return {}; }
+    return marlin_scratch();
+}
+
 bool marlin_fp8_run(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     const std::int32_t t = x.ne[1];
     if (t < 1 || t > kMarlinFixedM) { return false; }
     if (out.ne[0] != weight.n || out.ne[1] != t) { return false; }
+    // The padded-A copy assumes the [k, t] block is contiguous, which is what
+    // makes it [t, k] row-major for Marlin. A strided view would copy the
+    // wrong bytes silently, so decline instead.
+    if (!x.is_contiguous() || x.ne[0] != weight.k) { return false; }
     const MarlinPlane plane = marlin_fp8_plane_for(weight, stream);
     if (plane.b_packed == nullptr) { return false; }
     const MarlinScratch scratch = marlin_scratch();
@@ -277,6 +287,10 @@ bool marlin_w8_run(const Tensor& x, const Weight& weight, Tensor& out, cudaStrea
     const std::int32_t t = x.ne[1];
     if (t < 1 || t > kMarlinFixedM) { return false; }
     if (out.ne[0] != weight.n || out.ne[1] != t) { return false; }
+    // The padded-A copy assumes the [k, t] block is contiguous, which is what
+    // makes it [t, k] row-major for Marlin. A strided view would copy the
+    // wrong bytes silently, so decline instead.
+    if (!x.is_contiguous() || x.ne[0] != weight.k) { return false; }
     const MarlinPlane plane = marlin_plane_for(weight, stream);
     if (plane.b_packed == nullptr) { return false; }
     const MarlinScratch scratch = marlin_scratch();

@@ -282,9 +282,8 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         // 412-503 GB/s on the exact-T kernels; the vendored kFE4M3fn path
         // takes the band and residual_add runs as its own pass.
         if (t >= detail::marlin_min_band_tokens() && t <= detail::kMarlinMaxBandTokens) {
-            const detail::MarlinScratch scratch = detail::marlin_scratch();
-            if (detail::marlin_fp8_plane_for(w, stream).b_packed != nullptr &&
-                scratch.gemm_out != nullptr) {
+            const detail::MarlinScratch scratch = detail::marlin_fp8_scratch_for(w, stream);
+            if (scratch.gemm_out != nullptr) {
                 Tensor gemm_out(scratch.gemm_out, DType::BF16, {w.n, t});
                 if (detail::marlin_fp8_run(x, w, gemm_out, stream)) {
                     residual_add(gemm_out, residual_out, stream);
