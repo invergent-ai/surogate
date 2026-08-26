@@ -1947,3 +1947,26 @@ errors and zero fatals across all runs.
 
 Standing against vLLM: 0.8B 6,646 v 5,958 (+11.6% AHEAD), 4B 3,024 v 3,390
 (-11%, was -21%), 27B pending re-measure.
+
+### #57 follow-up: the 27B, and the second-order win
+
+The 27B gains most from bf16 state, and then gains again because the state
+is what capped its concurrency.
+
+  32 lanes, fp32 state    376 tok/s   TTFT 26.0 s
+  32 lanes, bf16 state    520 tok/s   TTFT 16.1 s   (+38%)
+  48 lanes, bf16 state    582 tok/s   TTFT 11.1 s   (+55% over baseline)
+  64 lanes                does not fit (headroom check fails after weights)
+
+Per-lane GDN state is what made 40 lanes impossible before (13.95 GB
+wanted against 12.76 GB free). Halving it moved the ceiling from 32 to 48,
+and the extra lanes are worth another 12% on top of the 38% the narrower
+traffic gives directly. This is the same coupling seen everywhere in this
+model: its state dominates both bandwidth and capacity, so anything that
+shrinks it pays twice.
+
+Board after this change, all 90-second steady state, 100 users:
+
+  0.8B  6,646 v vLLM 5,958   +11.6%  AHEAD
+  4B    3,024 v vLLM 3,390   -11%    (was -45% at session start)
+  27B     582 v vLLM   688   -15%    (was -46%)
