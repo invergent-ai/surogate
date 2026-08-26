@@ -51,6 +51,13 @@ bool ensure_scratch(std::size_t out_bytes, std::size_t a_bytes, cudaStream_t str
             return false;
         }
         cudaMemsetAsync(grown_a, 0, want_a, stream);
+        // The buffers being replaced may still be referenced by kernels this
+        // stream has not finished — the warmup round derives every weight in
+        // one pass, and a later, larger weight (the vocab head dwarfs any
+        // layer) triggers growth while earlier layers' GEMMs are still in
+        // flight. Freeing them under those kernels is a use-after-free that
+        // corrupts whatever is allocated next. Drain first.
+        cudaStreamSynchronize(stream);
         cudaFree(g_scratch.gemm_out);
         cudaFree(g_scratch.a_pad);
         g_bytes -= g_scratch_out_bytes + g_scratch_a_bytes;

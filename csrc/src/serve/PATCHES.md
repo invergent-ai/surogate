@@ -1499,3 +1499,14 @@ sustained load and varied batch widths to surface.
 
 METHOD NOTE: every performance figure in this file measured over 40 s
 should be re-qualified at 90 s before it is trusted.
+
+Review found one concrete defect while the card was unavailable: the
+scratch growth path freed the old gemm_out and a_pad without draining
+the stream. The warmup round derives every weight in a single pass and
+the vocab head (248,320 rows) dwarfs any layer, so growth fires while
+earlier layers' GEMMs are still in flight — freeing under them is a
+use-after-free that corrupts whatever is allocated next. Now drains
+first. Whether this is the wide-batch fault is unproven: growth happens
+during warmup rather than at 90 s, so the timing does not obviously fit,
+but the corruption it causes is unbounded in where it lands. Needs a 90 s
+run at 64 lanes with SUROGATE_SERVE_MARLIN_WIDE=1 to test.
