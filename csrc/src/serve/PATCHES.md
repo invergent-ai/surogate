@@ -1208,3 +1208,11 @@ returns the scratch after, matching the W8 pair; and both run paths now
 decline when the activation block is not contiguous, since the padded-A
 copy treats [k, t] as row-major [t, k] and a strided view would copy the
 wrong bytes with no error.
+
+Mixed-round bucket ladder coarsened to 8, 16, then multiples of 16. Each
+bucket is a separately captured graph of the whole layer stack, so the
+8-wide ladder above would have doubled capture time and graph memory at a
+64 ceiling (eight buckets instead of five). Padding a round to a 16
+boundary costs a handful of decode columns against a prefill chunk of
+several hundred. At 32 lanes the ladder is 8, 16, 32 where it was
+8, 16, 24, 32 — one graph fewer, and rounds of 17..24 now pad to 32.

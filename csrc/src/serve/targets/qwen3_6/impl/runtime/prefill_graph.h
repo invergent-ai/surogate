@@ -126,9 +126,14 @@ public:
     // wrong-token bug, which is what a fixed 32 cap produced once the ceiling
     // rose above 32).
     [[nodiscard]] static std::int32_t batch_bucket_for(std::int32_t batch) noexcept {
-        const std::int32_t rounded = ((batch + 7) / 8) * 8;
-        const auto ceiling         = static_cast<std::int32_t>(kMaximumConcurrency);
-        return rounded < 8 ? 8 : rounded > ceiling ? ceiling : rounded;
+        // Coarse above 16: every bucket is a separately captured graph of the
+        // whole layer stack, so an 8-wide ladder would multiply capture time
+        // and graph memory as the ceiling rises. Padding to 16 costs a few
+        // decode columns against a prefill chunk of several hundred.
+        const std::int32_t rounded =
+            batch <= 8 ? 8 : batch <= 16 ? 16 : ((batch + 15) / 16) * 16;
+        const auto ceiling = static_cast<std::int32_t>(kMaximumConcurrency);
+        return rounded > ceiling ? ceiling : rounded;
     }
 
     DecodeGraphExecutable* ensure(std::int32_t bucket, const std::function<void()>& body) {
