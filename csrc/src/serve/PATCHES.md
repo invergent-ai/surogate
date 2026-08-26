@@ -1755,3 +1755,38 @@ at 9.2% of device, and 12% device idle in the host serial path. Together
 that is ~21% against a measured 22% gap. Both are real engineering —
 a fused flash-style decode attention kernel, and finishing the async
 scheduler on the #32 infrastructure — and neither is a tuning knob.
+
+## 52. The 27B lane probe, and what native Marlin residency is actually worth (2026-08-26)
+
+90-second baseline at 32 lanes: 376 tok/s (the 370 on the board was a
+40-second provisional; they agree). Above that the model will not start:
+
+  40 lanes, kv 8192   needs 13.95 GB, 12.76 GB available
+  40 lanes, kv auto   fails on headroom
+  64 lanes            needs 23.30 GB (measured earlier)
+
+Per-lane GDN state dominates at this size, so the 27B is capped near 32
+lanes on a 32 GB card while the 0.8B and 4B run 64. Squeezing KV does not
+buy the next lane band — 40 lanes is short by 1.2 GB with KV already at
+the floor.
+
+This corrects the case for native Marlin residency. The earlier argument
+was that making Marlin the resident format frees the derived plane and
+that the freed VRAM buys lanes. That is wrong for the 27B: no plane is
+derived there, precisely because it does not fit — which is why Marlin
+FP8 never reached this model. Replacing the resident layout is
+byte-neutral, so it buys no lanes, and the probe above shows lanes were
+not going to help much anyway.
+
+What it does buy is the only path to Marlin FP8 on the shapes that bind
+this model. Its census: FP8-class GEMMs are 47% of device time on a
+nominally 4-bit model, and the binding exact-T kernels (T=17/18,
+N=5120, K=6144/17408) run at 412-503 GB/s where a same-class tile in the
+same profile reaches 926 GB/s. Marlin FP8 measured 2.4-2.7x on those
+shapes in isolation. Since a runtime-derived plane cannot fit, the layout
+has to come from the converter and be mapped as the residency by the
+loader.
+
+So: still worth doing, still a converter plus loader change, but it is a
+kernel-throughput play on 47% of the device, not a memory or concurrency
+play.
