@@ -1582,3 +1582,39 @@ indexing read first this time, not inferred.
 
 Standing (90 s, stable configs): 0.8B 5,462 v 5,958 (-8%), 4B 2,685 v
 3,390 (-21%), 27B 370 v 688 (-46%, 40 s provisional).
+
+### #48 follow-up: how to settle the 0.8B wide-band fault (needs a GPU)
+
+Static elimination so far: the lock array is adequately sized (grid is
+sms blocks, blocks_per_sm is 1 on every path, locks_off < sms);
+use_atomic_add is hardcoded false so the accumulate-into-C path that
+would need a zeroed output is never taken; C_tmp at sms * 64 * 256
+floats exactly covers the largest config (thread_m_blocks 4 x
+thread_n 256); and the sampler workspace plan scales with the same
+constant the runtime path uses.
+
+One unexamined candidate remains, in the vendored reduce:
+
+    locks_off = (iters * blockIdx.x) / k_tiles - 1;   // marlin_template.h:422
+
+For blockIdx.x == 0 this is -1, so the taken branch writes locks[-1].
+The branch is guarded by part2_mn_tiles < gridDim.x, so whether it is
+reachable depends on the problem's tile count against the SM count —
+which is exactly what differs between the 0.8B's 248320x1024 vocab GEMM
+and the 4B's shapes, and between a 64-wide band (thread_m_blocks 4) and
+a 32-wide one (thread_m_blocks 2).
+
+Do not fix this by inspection. The next GPU window should run:
+
+    compute-sanitizer --tool memcheck --launch-timeout 120 \
+      surogate-engine <0.8b artifact> --max-concurrency 64 ...
+
+with SUROGATE_SERVE_MARLIN_WIDE=1 under ~60 s of 100-user load. memcheck
+names the offending kernel and offset directly. racecheck is the follow-up
+if memcheck comes back clean. Budget ~15 minutes of GPU; the run is
+heavily slowed by instrumentation, so use a shorter load and fewer users.
+
+Why this is the highest-value item on the board: the 0.8B measured 6,003
+tok/s in the wide-band configuration before it corrupted, against vLLM's
+5,958. Fixing this one fault plausibly closes the 0.8B cell outright, and
+the same band is already worth +27% on the 4B.
