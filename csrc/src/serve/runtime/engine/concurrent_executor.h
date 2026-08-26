@@ -1016,7 +1016,23 @@ private:
                 // burst that used to protect admission cadence only costs host
                 // round-trips. Free lanes still take the single round, so the
                 // next iteration can refill them.
-                burst_limit = free_lanes > 0 ? 1U : 8U;
+                // A free lane used to mean "take a single round so the next
+                // iteration can admit into it". With continuous admission
+                // (PATCHES.md #41) admission runs after any decode unit, so a
+                // free lane no longer needs a single-round cadence — and under
+                // 100-user load a lane is nearly always free, which pinned the
+                // burst at 1 and left every round paying full host serial.
+                // Keep a floor so the serial cost is amortised either way.
+                // MEASURED (4B, 100 users, 90 s): 1 -> 2,661 tok/s, 2 -> 2,174,
+                // 4 -> 1,708, with TTFT 1.7 s / 3.3 s / 5.5 s. Delaying a free
+                // lane's refill by even ONE round costs 18%, which is far more
+                // than the host serial a burst amortises. Keep it at 1; the
+                // knob exists so the measurement can be repeated.
+                static const std::uint32_t kFreeLaneBurst = [] {
+                    const char* raw = std::getenv("SUROGATE_SERVE_FREE_LANE_BURST");
+                    return raw != nullptr ? static_cast<std::uint32_t>(std::atoi(raw)) : 1U;
+                }();
+                burst_limit = free_lanes > 0 ? kFreeLaneBurst : 8U;
             }
         }
         instance_.program->set_round_burst_limit(burst_limit);

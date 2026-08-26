@@ -1873,3 +1873,41 @@ inspection: recording each round's shape and printing it in the worker's
 fatal line named `kind=mixed batch=62/63` every time, and the constant
 appearance of near-full batches with a live prefill lane is what finally
 pointed at the prefill window rather than the decode batch.
+
+## 56. The async scheduler is the wrong lever, and here is the measurement (2026-08-26)
+
+The plan (design/serve-engine-multiarch.md, item 2) was to overlap rounds:
+launch N+1 before consuming N, to recover the 11-12% device idle sitting
+in the host serial path. The lifecycle split that enables it is built
+(#54 groundwork, launch_ordinary_round / consume_ordinary_round behind
+runtime/contract/round_lifecycle.h). Before wiring the executor to it, the
+cost of the one thing overlap unavoidably delays — refilling a free lane —
+was measured directly, using the burst floor as a proxy, since a burst of
+K delays lane refill exactly as an overlap depth of K does.
+
+4B, 100 users, 90-second runs:
+
+  free-lane burst 1   2,661 tok/s   TTFT 1.7 s
+  free-lane burst 2   2,174 tok/s   TTFT 3.3 s
+  free-lane burst 4   1,708 tok/s   TTFT 5.5 s
+
+Delaying a free lane's refill by a SINGLE round costs 18% of throughput.
+The host serial that overlap would recover is worth about 11%. Overlap
+therefore loses, and loses more the deeper it goes.
+
+The reason is structural: this engine admits through a GPU unit — a free
+lane needs a prefill before it produces anything — so an idle lane is
+expensive in a way an idle host microsecond is not. Under 100-user load a
+lane is nearly always free, so the scheduler is right to take single
+rounds and refill immediately. The 11% idle is the price of keeping 64
+lanes full, not waste to be reclaimed.
+
+What this redirects: the 4B's remaining gap has to come from making rounds
+faster, not from overlapping them. That is decode attention, still ~2x off
+its KV-read roofline. The round-lifecycle contract stays — it is the right
+interface for a target to expose and costs nothing — but the executor will
+not be driven to overlap on it for this workload shape.
+
+The knob (SUROGATE_SERVE_FREE_LANE_BURST) stays so the measurement can be
+repeated on other workload shapes; a batch-style workload with a saturated
+queue and no free lanes would flip this result.
