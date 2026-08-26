@@ -106,6 +106,10 @@ bool marlin_fp8_run(const Tensor& x, const Weight& weight, Tensor& out, cudaStre
 // a larger scratch afterwards decline instead (callers fall back).
 void marlin_plane_freeze_scratch() noexcept;
 
+// Closes residency adoption. Must be called before the FIRST graph capture:
+// adopting afterwards changes a captured graph's topology.
+void marlin_fp8_close_adoption() noexcept;
+
 // Runs the Marlin GEMM for `weight` through its derived plane into
 // `out` ([n, t] BF16 column-major). Returns false (and does nothing) when
 // no plane is available (caller falls back to its own kernels).

@@ -1326,6 +1326,12 @@ void ProgramImplCore::prepare_graphs() {
             device.synchronize();
         }
 
+        // Warmup above has run every op once, so every weight that can adopt
+        // Marlin residency already has. Close adoption HERE — before the first
+        // capture, not merely before the last family — because a weight that
+        // adopts between two captures leaves them disagreeing and the next exec
+        // update fails with cudaErrorGraphExecUpdateFailure.
+        ops::detail::marlin_fp8_close_adoption();
         ordinary_graphs.profiles.reserve(ordinary_profiles.size() * ordinary_batch_limit);
         for (std::uint32_t batch_size = 1; batch_size <= ordinary_batch_limit; ++batch_size) {
             for (const GraphExecutionProfile planned : ordinary_profiles) {

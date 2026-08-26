@@ -33,6 +33,7 @@ MarlinScratch g_scratch;
 std::size_t g_scratch_out_bytes = 0;
 std::size_t g_scratch_a_bytes   = 0;
 bool g_scratch_frozen           = false;
+bool g_adoption_closed          = false;
 
 bool ensure_scratch(std::size_t out_bytes, std::size_t a_bytes, cudaStream_t stream) {
     if (g_scratch.gemm_out != nullptr && out_bytes <= g_scratch_out_bytes &&
@@ -126,6 +127,14 @@ bool marlin_plane_enabled() noexcept { return g_enabled; }
 std::size_t marlin_plane_bytes() noexcept { return g_bytes; }
 MarlinScratch marlin_scratch() noexcept { return g_scratch; }
 void marlin_plane_freeze_scratch() noexcept { g_scratch_frozen = true; }
+
+// Adoption changes an op's kernel selection, so it changes a captured graph's
+// topology. It must close BEFORE the first capture, not merely before the last:
+// a weight that adopts between two captures leaves the families disagreeing and
+// the next exec update fails with cudaErrorGraphExecUpdateFailure — observed
+// exactly that way on the 27B. Separate from the scratch freeze, which is about
+// pointer stability and happens later.
+void marlin_fp8_close_adoption() noexcept { g_adoption_closed = true; }
 
 int g_fixed_m = 32;
 void marlin_set_fixed_m(int lanes) noexcept {
@@ -400,6 +409,13 @@ bool marlin_fp8_maybe_adopt(const Weight& weight, cudaStream_t stream) {
     }();
     if (!adopt_opt_in) { return false; }
     if (weight.layout == QuantLayout::MarlinTiles) { return true; }
+    // Adoption changes which kernels an op runs, so it changes a captured
+    // graph's topology. Adopting a weight after any graph exists makes the next
+    // exec update fail with cudaErrorGraphExecUpdateFailure — observed exactly
+    // that way. The scratch freeze marks the point where capture has begun; past
+    // it, a weight that has not already adopted keeps its e4m3 residency for the
+    // life of the process, which is correct and stable if slower.
+    if (g_adoption_closed || g_scratch_frozen) { return false; }
     cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
     (void)cudaStreamIsCapturing(stream, &status);
     if (status != cudaStreamCaptureStatusNone) { return false; }

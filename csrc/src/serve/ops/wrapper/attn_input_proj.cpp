@@ -22,20 +22,6 @@
 namespace ninfer::ops {
 namespace {
 
-// Copies a row band out of a fused parent [parent_rows, T] into a destination
-// [rows, T]. Both are column-major with contiguous columns, so a band is a
-// strided copy, one column at a time.
-void copy_rows(const Tensor& parent, std::int32_t row_offset, Tensor& out, cudaStream_t stream) {
-    const std::int32_t rows = out.ne[0];
-    const std::int32_t cols = out.ne[1];
-    CUDA_CHECK(cudaMemcpy2DAsync(out.data, static_cast<std::size_t>(rows) * 2,
-                                 static_cast<const std::uint8_t*>(parent.data) +
-                                     static_cast<std::size_t>(row_offset) * 2,
-                                 static_cast<std::size_t>(parent.ne[0]) * 2,
-                                 static_cast<std::size_t>(rows) * 2,
-                                 static_cast<std::size_t>(cols), cudaMemcpyDeviceToDevice,
-                                 stream));
-}
 
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
     return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
@@ -167,33 +153,6 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
         require_matrix(v, kKvRows, cols, "v");
         if (weight.n != kRows || weight.k != kHidden) {
             throw std::invalid_argument("fp8 attn_input_proj: unsupported weight shape");
-        }
-        // Adopted residency (PATCHES.md #60): the weight IS Marlin tiles, so no
-        // e4m3 route can read it. Marlin produces the whole [kRows, T] parent in
-        // one call and the fusion becomes a row split afterwards — negligible
-        // against the GEMM it replaces (a few hundred KB against tens of MB).
-        // Declining here must throw, never fall through.
-        // Bisect switch: the fused projections split Marlin's parent themselves,
-        // so they are the newest and least proven part of adoption.
-        static const bool kFusedAdopt = std::getenv("SUROGATE_SERVE_MARLIN_FP8_FUSED") != nullptr;
-        if (kFusedAdopt) { (void)detail::marlin_fp8_maybe_adopt(weight, stream); }
-        if (weight.layout == QuantLayout::MarlinTiles) {
-            void* staging = detail::marlin_fused_parent(
-                static_cast<std::size_t>(kRows) * static_cast<std::size_t>(cols) * 2, stream);
-            if (staging == nullptr) {
-                throw std::invalid_argument(
-                    "fp8 attn_input_proj: Marlin-tile weight has no fused staging");
-            }
-            Tensor parent(staging, DType::BF16, {kRows, cols});
-            if (!detail::marlin_fp8_run(x, weight, parent, stream)) {
-                throw std::invalid_argument(
-                    "fp8 attn_input_proj: weight holds Marlin tiles but Marlin declined");
-            }
-            copy_rows(parent, 0, q, stream);
-            copy_rows(parent, kQRows, gate, stream);
-            copy_rows(parent, 2 * kQRows, k, stream);
-            copy_rows(parent, 2 * kQRows + kKvRows, v, stream);
-            return;
         }
         detail::validate_fp8_weight(weight, "fp8 attn_input_proj");
         detail::fp8_attn_input_dispatch(x, weight, q, gate, k, v, policy, workspace, stream);

@@ -2181,3 +2181,36 @@ answer that the 27B's remaining gap is not closed by this route. The FP8-class
 GEMMs are still 47% of its device time at half their achievable bandwidth; the
 reason Marlin does not capture that in situ is the next question, and it is a
 profiling question rather than an implementation one.
+
+### #62 follow-up: fused adoption removed, not parked
+
+The fused-projection adoption path is deleted rather than left behind a flag.
+
+Two defects were found and one fixed. The parent split assumed a contiguous
+destination; the decode path passes views into wider buffers, so it wrote the
+wrong bytes — a correct first token followed by degenerate decode. Taking the
+stride from the tensor fixes that, and the fix is kept in the split helper's
+absence as the lesson: never assume nb[1] == rows * element_size.
+
+The second is structural and is why the path is gone. Adoption changes an op's
+kernel selection, so it changes a captured graph's topology, and adopting
+between two captures makes the next exec update fail with
+cudaErrorGraphExecUpdateFailure. Closing adoption before the first capture (a
+distinct signal from the scratch freeze, which is about pointer stability and
+happens later) was necessary but not sufficient: the fused route still failed
+the same way, and further bisection was not worth it on a feature that measures
+NEGATIVE end to end.
+
+Final state, 27B, 100 users, 90-second runs, both verified coherent at
+temperature 0:
+
+  adoption off (default)              581 tok/s
+  adoption on, linear_add + swiglu    546 tok/s   -6%
+
+No known-defective code remains: what is left is correct and simply slower, so
+it stays off. The mechanism — the layout tag, in-place adoption, the exact-M
+route, the self-describing arena, the FP8 validator that rejects tiles — is
+intact and is what a converter-written Marlin residency would use if the in-situ
+regression is ever explained. That explanation is a profiling question: Marlin
+is 2.4-2.75x on these shapes in isolation and a loss in the round, and nothing
+in this patch series accounts for the difference.
