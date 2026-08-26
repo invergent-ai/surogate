@@ -4,6 +4,7 @@
 // The same builder supplies the public sizing query and launcher-side binding.
 
 #include "core/layout.h"
+#include "core/limits.h"
 #include "ops/common/math.h"
 
 #include <cuda_runtime.h>
@@ -23,7 +24,11 @@ inline constexpr int kSamplerGroupTileItems      = kSamplerGroupBlock * kSampler
 inline constexpr int kSamplerPartialsPerGroup    = 25;
 inline constexpr int kSamplerFastCandidates      = 20;
 inline constexpr int kSamplerCandidateCap        = kSamplerFastCandidates;
-inline constexpr int kSamplerMaxColumns          = 32; // PATCHES.md #29: C=32 decode rounds
+// Tied to the ops batch bound: a stale cap here does not fail, it silently
+// drops decode rounds wider than the cap onto sample_row at ~4 ms a call
+// (measured at 15% of device time when the ceiling moved to 64 and this
+// stayed at 32). Never hardcode it again.
+inline constexpr int kSamplerMaxColumns          = kMaximumBatchColumns;
 
 static_assert(kSamplerPartialsPerGroup * kSamplerCandidateCap <= kSamplerGroupTileItems,
               "group merge tile must hold one group's candidates");

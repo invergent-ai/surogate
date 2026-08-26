@@ -1386,3 +1386,32 @@ a prefill lane set rather than the single prefill_lane_, and a
 mixed_chunk that takes a list of (lane, span) rather than one prompt.
 It is the largest remaining decode-side lever at the 4B and it is a
 scheduler change, not a kernel change.
+
+## 44. The sampler cap went stale and cost 15% of the device (2026-08-26)
+
+nsys on a 64-lane 4B decode round: sample_row_kernel at 828 ms of a 5.4 s
+busy window — 15.3%, 202 calls averaging 4.1 ms. That is the slow
+fallback path, taken because kSamplerMaxColumns was still 32 while the
+lane ceiling had moved to 64: sampler_multiblock_ok rejects cols > cap
+and the launcher quietly drops to sample_row. Exactly the failure #29
+fixed at 16 -> 32, reintroduced by moving the ceiling without moving the
+cap. It is now kSamplerMaxColumns = kMaximumBatchColumns so the two
+cannot drift again.
+
+Measured, 100 users, 512/128:
+  4B  64 lanes: 2,250 -> 2,571 tok/s (+14%), TTFT 2.04 s -> 1.77 s
+  0.8B 64 lanes: 6,003 tok/s, TTFT 0.77 s
+
+The 0.8B number BEATS vLLM (5,958). It also retracts #40's conclusion:
+the earlier "64 lanes costs the 0.8B 11%" measurement was taken with the
+broken sampler, so the regression was the fallback, not the width. With
+the cap fixed the 0.8B gains 20% from 64 lanes (5,021 -> 6,003) rather
+than losing 11%.
+
+Standing against vLLM: 0.8B 6,003 v 5,958 (+0.8%, AHEAD), 4B 2,571 v
+3,390 (-24%), 27B unmeasured since the fix.
+
+Lesson worth keeping: three separate times now, a width constant that
+silently degrades instead of failing has cost more than any kernel
+optimisation gained. The remaining ones should be tied to
+kMaximumBatchColumns or made to throw.
