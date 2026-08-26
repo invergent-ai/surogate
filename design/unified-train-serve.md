@@ -27,25 +27,40 @@ covers Qwen only.
 
 ## The finding
 
-Two whole serve targets, 1,723 lines each, **differ by 75 lines**:
+Two whole serve targets, 1,723 lines each, **share about 82% of their lines**.
+Measured file by file with difflib rather than a shell diff (an earlier
+revision of this document said 75 lines and 96%; that came from diffing the
+`impl` directory without `-r`, which counts only the summary lines — the
+figures below are the corrected ones):
 
-    $ diff -r targets/qwen3_5_0_8b/impl targets/qwen3_5_4b/impl | grep -c '^[<>]'
-    75
-    $ diff -q targets/qwen3_5_0_8b/CMakeLists.txt targets/qwen3_5_4b/CMakeLists.txt
-    (identical)
+    CMakeLists.txt         8 lines,   0 changed
+    impl/config.h         93 lines,  20 changed
+    impl/load/bindings.cpp 605 lines, 218 changed
+    impl/load/bindings.h  225 lines,  14 changed
+    impl/package.cpp      143 lines,  14 changed
+    impl/variant.cpp      519 lines,  35 changed
+    impl/variant.h        130 lines,   8 changed
+    TOTAL               1,723 lines, 309 changed  (18%)
 
-and every one of those 75 lines is a shape or a tensor name — head counts,
-projection widths, embedding names. About 96% of each per-architecture target
-is copy-paste. The architecture-specific content of a serve target is roughly
-the size of a config struct; the rest is ceremony that a code generator should
-be emitting.
+Of the 309, about 80% carry a shape constant or a quoted tensor name, and the
+rest are the namespace and include renames that follow from the target's name:
+
+    -namespace ninfer::targets::qwen3_5_0_8b::detail {
+    +namespace ninfer::targets::qwen3_5_4b::detail {
+    -    out.gate_up = materialized_weight(materialized, plan.gate_up, 7168, 1024);
+    +    out.gate_up = materialized_weight(materialized, plan.gate_up, 18432, 2560);
+
+So the architecture-specific content of a serve target is a config struct and a
+weight table; the other ~1,400 lines are ceremony that a generator should be
+emitting. The conclusion is unchanged from the earlier revision — 82% is still
+overwhelming duplication — but the number is now one that can be reproduced.
 
 ## What to unify, in order of payoff
 
 **1. Generate serve targets from the DSL declaration.** The DSL is already the
 source of truth for what a model *is*, and it already describes every shape the
 serve target restates. A build-time generator that emits the target from the
-same declaration removes ~1,650 of every 1,723 lines and makes "train it, then
+same declaration removes ~1,400 of every 1,723 lines and makes "train it, then
 serve it" one declaration instead of two implementations. This is the single
 biggest win and it needs no kernel work.
 
