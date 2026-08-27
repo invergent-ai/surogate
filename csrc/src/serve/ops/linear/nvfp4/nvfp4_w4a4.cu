@@ -125,6 +125,15 @@ void launch_nvfp4_w4a4_quantize(const Tensor& x, const Weight& weight, Nvfp4W4a4
     case Nvfp4Activation17408Geometry::kInputRows:
         launch_quantize_exact<Nvfp4Activation17408Geometry>(x, weight, workspace, stream, layout);
         return;
+    case Nvfp4Activation2560Geometry::kInputRows:
+        launch_quantize_exact<Nvfp4Activation2560Geometry>(x, weight, workspace, stream, layout);
+        return;
+    case Nvfp4Activation4096Geometry::kInputRows:
+        launch_quantize_exact<Nvfp4Activation4096Geometry>(x, weight, workspace, stream, layout);
+        return;
+    case Nvfp4Activation9216Geometry::kInputRows:
+        launch_quantize_exact<Nvfp4Activation9216Geometry>(x, weight, workspace, stream, layout);
+        return;
     default:
         throw std::invalid_argument("nvfp4 W4A4 quantize: unsupported K");
     }
@@ -133,6 +142,14 @@ void launch_nvfp4_w4a4_quantize(const Tensor& x, const Weight& weight, Nvfp4W4a4
 void launch_nvfp4_w4a4(const Tensor& x, const Weight& weight, Tensor& out,
                        Nvfp4W4a4Workspace workspace, cudaStream_t stream) {
     const std::int32_t tokens = x.ne[1];
+    // Shapes outside the registered geometries have no in-house ladder - the mma and TMA
+    // schedules are templated on Geometry - so they run on cuBLASLt at every width (#82).
+    if (is_nvfp4_generic_problem(weight.n, weight.k)) {
+        launch_nvfp4_w4a4_quantize(x, weight, workspace, stream, Nvfp4ScaleLayout::Tiled);
+        nvfp4_cublaslt_gemm(weight, 0, weight.n, workspace.codes, workspace.scales,
+                            static_cast<__nv_bfloat16*>(out.data), weight.n, tokens, 0.0F, stream);
+        return;
+    }
     if (nvfp4_cublaslt_route(tokens)) {
         launch_nvfp4_w4a4_quantize(x, weight, workspace, stream, Nvfp4ScaleLayout::Tiled);
         nvfp4_cublaslt_gemm(weight, 0, weight.n, workspace.codes, workspace.scales,

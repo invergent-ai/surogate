@@ -113,6 +113,11 @@ using Nvfp4MlpGateUpGeometry     = Nvfp4GemvGeometry<34816, 5120>;
 using Nvfp4Residual6144Geometry  = Nvfp4GemvGeometry<5120, 6144>;
 using Nvfp4Residual17408Geometry = Nvfp4GemvGeometry<5120, 17408>;
 
+// Shapes outside the five registered geometries run on the cuBLASLt route alone (#82): it is
+// shape-generic, so only the activation quantizer needs an instantiation per K.
+using Nvfp4Activation2560Geometry  = Nvfp4ActivationGeometry<2560>;
+using Nvfp4Activation4096Geometry  = Nvfp4ActivationGeometry<4096>;
+using Nvfp4Activation9216Geometry  = Nvfp4ActivationGeometry<9216>;
 using Nvfp4Activation5120Geometry  = Nvfp4ActivationGeometry<5120>;
 using Nvfp4Activation6144Geometry  = Nvfp4ActivationGeometry<6144>;
 using Nvfp4Activation17408Geometry = Nvfp4ActivationGeometry<17408>;
@@ -136,6 +141,15 @@ enum class Nvfp4Problem : std::uint8_t {
     Residual17408,
 };
 
+// The cuBLASLt route needs 128-aligned output rows (its scale tiles) and 64-aligned K; the
+// activation quantizer additionally needs a K it was instantiated for.
+inline constexpr bool is_nvfp4_generic_problem(std::int32_t output_rows, std::int32_t input_rows) {
+    if (output_rows <= 0 || input_rows <= 0 || (output_rows % 128) != 0 || (input_rows % 64) != 0) {
+        return false;
+    }
+    return input_rows == 2560 || input_rows == 4096 || input_rows == 9216;
+}
+
 inline constexpr bool is_nvfp4_linear_problem(std::int32_t output_rows, std::int32_t input_rows) {
     return (output_rows == Nvfp4AttnInputGeometry::kOutputRows &&
             input_rows == Nvfp4AttnInputGeometry::kInputRows) ||
@@ -146,7 +160,8 @@ inline constexpr bool is_nvfp4_linear_problem(std::int32_t output_rows, std::int
            (output_rows == Nvfp4Residual6144Geometry::kOutputRows &&
             input_rows == Nvfp4Residual6144Geometry::kInputRows) ||
            (output_rows == Nvfp4Residual17408Geometry::kOutputRows &&
-            input_rows == Nvfp4Residual17408Geometry::kInputRows);
+            input_rows == Nvfp4Residual17408Geometry::kInputRows) ||
+           is_nvfp4_generic_problem(output_rows, input_rows);
 }
 
 inline Nvfp4Problem resolve_nvfp4_problem(std::int32_t output_rows, std::int32_t input_rows) {

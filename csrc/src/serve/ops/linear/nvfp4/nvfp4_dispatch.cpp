@@ -22,10 +22,14 @@ Nvfp4LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows
     if (tokens <= 0 || !is_nvfp4_linear_problem(output_rows, input_rows)) {
         throw std::invalid_argument("nvfp4 linear: unsupported shape");
     }
-    if (policy == LinearPolicy::A16Only) { return Nvfp4LinearRoute::A16; }
-    if (policy != LinearPolicy::AllowA4) {
+    if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4) {
         throw std::invalid_argument("nvfp4 linear: unsupported policy");
     }
+    // Shapes outside the registered geometries have no in-house A16 kernel either (the gemv and
+    // small-T paths are templated on Geometry), so they take W4A4 at every width - quantised
+    // activations throughout, which is what the NVFP4 exports assume anyway (#82).
+    if (is_nvfp4_generic_problem(output_rows, input_rows)) { return Nvfp4LinearRoute::W4A4; }
+    if (policy == LinearPolicy::A16Only) { return Nvfp4LinearRoute::A16; }
 
     switch (resolve_nvfp4_problem(output_rows, input_rows)) {
     case Nvfp4Problem::AttnInput:
