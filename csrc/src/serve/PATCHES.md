@@ -2332,3 +2332,24 @@ those calls are (40,6) = 240 CTAs and (80,2) = 160, which is 1-1.5 waves and not
 starved. The FP8 launcher is 1-D, which is why its 40 was real and why halving
 its row tile paid. NVFP4 needs no equivalent fix, and the 7% it was supposed to
 be worth does not exist.
+
+## 65. int8 KV withdrawn: a throughput number bought with quality (2026-08-27)
+
+#64 recorded int8 KV as a win (27B 596 -> 604, and 4B 3,032 -> 3,113). It is
+withdrawn from the recommended configuration and from the board.
+
+It is a quality change, and the evidence was in the same runs that produced the
+numbers. Asked to name three colors at temperature 0, the 4B answered "Red,
+blue, and green." with bf16 KV and "I'm not sure if this is what you're
+look..." with int8. That was visible when the number was recorded and was not
+acted on.
+
+The engine rows on the board are all bf16 KV now. The honest 27B figure is 593,
+not 604, and the gap to vLLM is -14% rather than -12%. vLLM's own 27B row does
+run --kv-cache-dtype fp8, so a matched-precision comparison would be a
+reasonable thing to construct deliberately — with a quality measurement beside
+it, not inferred from a single prompt — but silently adopting reduced KV
+precision to close a throughput gap is not that.
+
+The int8 path stays available behind --kv-dtype int8 for anyone who wants the
+trade explicitly. What is removed is the assumption that it is free.

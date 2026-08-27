@@ -273,7 +273,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
-        throw std::invalid_argument("--max-concurrency must be in [1,8]");
+        // The bound is kMaximumConcurrency; say so rather than restating a
+        // number. This message read "[1,8]" long after the ceiling moved to 64,
+        // which sends anyone hitting it looking in the wrong place.
+        throw std::invalid_argument("--max-concurrency must be in [1," +
+                                    std::to_string(kMaximumConcurrency) + "]");
     }
     if (options.max_pending_requests == 0) {
         throw std::invalid_argument("--max-pending-requests must be positive");

@@ -12,9 +12,13 @@ brew **Vulkan** build (NV_coopmat2; kept where noted for reference).
 Engine configuration for the 100-user rows: 64 lanes at 0.8B/4B and 48 at
 27B (each model's measured optimum — more lanes cost throughput on all
 three), mixed-round CUDA graphs on, GDN recurrent state stored bf16, and
-`--kv-dtype int8` at 27B only. vLLM's 27B row uses its own required
-config, which includes `--max-num-seqs 32` and `--kv-cache-dtype fp8`, so
-its 688 tok/s comes from 32 concurrent streams rather than 100.
+**bf16 KV throughout** — the engine rows are all at full KV precision.
+int8 KV was measured (27B 593 -> 604, 4B 3,032 -> 3,113) and is NOT used
+here: it changes output, visibly so at temperature 0, and a throughput
+number bought with quality is not comparable to one that is not. vLLM's
+27B row does use `--kv-cache-dtype fp8` in its own required config, along
+with `--max-num-seqs 32`, so its 688 tok/s comes from 32 concurrent
+streams at reduced KV precision rather than 100 at full.
 
 **All 100-user figures are 90-second steady-state runs.** Shorter windows
 measure the ramp — lanes still filling, contexts still short — and read
@@ -69,7 +73,7 @@ unsloth NVFP4 export + base checkpoint by the vendored converter).
 
 | engine | weights | TTFT @1.9k | decode tok/s (1 user) | 100-user agg tok/s | 100-user TTFT p50 | 100-user reqs ok/err |
 |---|---|---:|---:|---:|---:|---:|
-| surogate serve | NVFP4 (4-bit resident, int8 KV) | 352 ms | 45 | 604 | 10.7 s | 440/0 |
+| surogate serve | NVFP4 (4-bit resident) | 352 ms | 45 | 593 | 10.8 s | 432/0 |
 | llama-server (CUDA) | GGUF Q4_K_M | 1,829 ms | **49** | 82 | 102.4 s | 135/28 |
 | vLLM | NVFP4 pack (4-bit) | **254 ms** | 45 | **688** | 12.5 s | 580/0 |
 
@@ -111,7 +115,7 @@ missing piece.
   costs 18%, more than the idle is worth). The fp4 path's helper kernels
   — activation quantisation, output split, swiglu — are 9% of device and
   are the clearest remaining target.
-- **100 users, 27B: −12%** (604 vs 688). Not a concurrency problem: vLLM's
+- **100 users, 27B: −14%** (593 vs 688). Not a concurrency problem: vLLM's
   figure is 32 streams at ~21.5 tok/s each and our per-stream rate is
   comparable, so the difference is duty cycle — roughly 40% of the device
   goes to prefill. Lanes above 48 lose (52 → 561, 56 → 525) because
