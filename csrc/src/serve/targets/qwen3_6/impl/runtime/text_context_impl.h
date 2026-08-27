@@ -244,8 +244,14 @@ TextContext::~TextContext() = default;
 
 void TextContext::set_linear_state_slots(std::int32_t current_slot,
                                          std::int32_t rewrite_checkpoint_slot) {
-    if (current_slot < 0 || current_slot >= state_.slot_count() || rewrite_checkpoint_slot < 0 ||
-        rewrite_checkpoint_slot >= state_.slot_count() || current_slot == rewrite_checkpoint_slot) {
+    // kNoRewriteCheckpointSlot (-1) means the pool holds no checkpoint slots
+    // (EngineOptions::rewrite_checkpoints off); a capture request against it
+    // is refused where the capture would happen.
+    const bool checkpoint_ok = rewrite_checkpoint_slot == kNoRewriteCheckpointSlot ||
+                               (rewrite_checkpoint_slot >= 0 &&
+                                rewrite_checkpoint_slot < state_.slot_count() &&
+                                rewrite_checkpoint_slot != current_slot);
+    if (current_slot < 0 || current_slot >= state_.slot_count() || !checkpoint_ok) {
         throw std::invalid_argument("TextContext Linear Attention slots are invalid");
     }
     linear_state_current_slot_            = current_slot;
@@ -1740,6 +1746,9 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
     const int checkpoint_rel =
         has_rewrite_checkpoint ? static_cast<int>(checkpoint_abs - base64) : -1;
     const std::int32_t rewrite_checkpoint_slot = linear_state_rewrite_checkpoint_slot_;
+    if (checkpoint_rel > 0 && rewrite_checkpoint_slot == kNoRewriteCheckpointSlot) {
+        throw std::logic_error("rewrite checkpoint capture requested with checkpoints disabled");
+    }
 
     const bool prepare_mtp_prompt = mtp_enabled() && io_.mtp.has_value();
     if (prepare_mtp_prompt &&

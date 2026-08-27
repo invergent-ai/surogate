@@ -80,6 +80,28 @@ prefill at 0.8B and 4B. vLLM's own numbers moved against the 08-26 board too (4B
 under today's conditions; the 08-26 100-user rows are kept below only as
 history.
 
+## Prefill — 100 users, same card, same day (2026-08-27)
+
+Prefill-heavy shape: 2048-token prompts, 16 tokens out, 100 closed-loop
+users, 90 s, vLLM then the engine on the card shown. This is the shape that
+isolates prompt processing; the balanced table above shows prefill only as a
+by-product of a decode-limited workload.
+
+| model | card | engine | prefill tok/s | decode tok/s | TTFT p50 | TTFT p95 | reqs ok/err |
+|---|---|---|---:|---:|---:|---:|---:|
+| Qwen3.5-0.8B | GPU4 | **surogate serve** | **81,376** | 636 | **2.39 s** | 2.39 s | 3,672/0 |
+| | GPU4 | vLLM | 45,106 | 352 | 3.88 s | 3.95 s | 2,065/0 |
+| Qwen3.5-4B | GPU5 | **surogate serve** | **40,677** | 318 | 4.77 s | 4.78 s | 1,883/0 |
+| | GPU5 | vLLM | 34,964 | 273 | 5.00 s | 5.09 s | 1,621/0 |
+| Qwen3.8-27B | GPU6 | surogate serve | 5,964 | 47 | 29.7 s | 30.3 s | 350/0 |
+| | GPU6 | **vLLM** | **12,089** | 94 | **14.5 s** | 14.9 s | 619/0 |
+
+Engine prefill: **+80%** at 0.8B, **+16%** at 4B, **−51%** at 27B. The 27B's
+balanced-shape deficit (−21% on decode above) is this: the engine prefills
+the 27B at half vLLM's rate, so with four prompt tokens per generated token
+the prefill duty cycle starves decode. Prefill is the 27B lever, not lanes
+or KV.
+
 ## Single user (2026-08-26, GPU2)
 
 Not re-measured on 08-27. Same shapes, same loadgen; engine at bf16 KV.
@@ -139,6 +161,26 @@ prefill duty cycle), so the capacity does not show up as throughput there.
 Only full-attention layers hold KV planes, so a quantized cache cannot reach
 a linear-attention layer; `--kv-cache-dtype-skip-layers L,...` holds named
 full-attention layers at bf16.
+
+## Rewrite checkpoints off by default (PATCHES.md #73)
+
+The GDN state pool used to hold two slots per lane: the live state and a
+rewrite checkpoint for resuming an edited last turn. On the 27B a slot is
+72 MiB, so the checkpoints held 3.4 GB at 48 lanes and pushed 64 lanes off a
+cliff (8,576 KV tokens). They are now off by default (`--rewrite-checkpoints`
+opts in; an edited turn re-prefills its prefix instead):
+
+| 27B, fp8 KV, `--kv-capacity auto` | KV tokens | decode tok/s | TTFT p50 |
+|---|---:|---:|---:|
+| 48 lanes, checkpoints on (GPU7) | 92,096 | 824 | 8.0 s |
+| 48 lanes, checkpoints off (GPU6) | 206,976 | 822 | 8.0 s |
+| **64 lanes, checkpoints off (GPU7)** | 161,792 | **859** | **5.4 s** |
+
+64 lanes is now the better 27B default. The gain is small because the 27B is
+prefill-bound (prefill table above), not lane-bound. The 0.8B/4B board rows
+are unchanged within noise on the new default (7,721 / 4,368 on the paired
+cards), and the decode-heavy soaks on it are clean (27B 820 and 4B 3,846
+requests, 0 errors, 0 fatals).
 
 ## Correctness coverage: the decode-heavy soak
 

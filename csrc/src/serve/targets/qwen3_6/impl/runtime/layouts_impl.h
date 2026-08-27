@@ -102,7 +102,7 @@ TensorLayout add_tensor(LayoutBuilder& builder, DType dtype,
 
 PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     const std::int32_t linear_state_slots =
-        LinearStateSlots::state_slot_count(plan.max_concurrency);
+        LinearStateSlots::state_slot_count(plan.max_concurrency, plan.rewrite_checkpoints);
     const auto effective_prefill_chunk =
         static_cast<std::int32_t>(std::min(plan.prefill_chunk, plan.capacity));
     const std::uint32_t logical_pages  = page_count(plan.capacity);
@@ -644,6 +644,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->kv_dtype            = inputs.kv_dtype;
     impl->kv_quant_group      = inputs.kv_quant_group;
     impl->kv_skip_layers      = inputs.kv_skip_layers;
+    impl->rewrite_checkpoints = inputs.rewrite_checkpoints;
     impl->persistent          = persistent_layout(*impl);
     impl->workspace           = build_workspace_plan(*impl);
     if (impl->features.vision) {
@@ -720,6 +721,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .kv_quant_group = options.kv_cache == KvCacheStorage::Int8Group64 ? qwen3_6::kKvQuantGroup
                                                                          : 0,
         .kv_skip_layers = options.kv_cache_skip_layers,
+        .rewrite_checkpoints = options.rewrite_checkpoints,
         .proposal_head  = options.speculative.proposal_head,
         .features       = qwen3_6::startup_features(options),
         .use_cuda_graph = options.use_cuda_graph,

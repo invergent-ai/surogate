@@ -45,6 +45,7 @@ struct ServeOptions {
     int device                             = 0;
     KvCacheStorage kv_cache                = KvCacheStorage::Fp8E4M3;
     std::vector<std::uint32_t> kv_cache_skip_layers;
+    bool rewrite_checkpoints = false;
     SpeculativeOptions speculative;
     bool enable_vision      = false;
     bool use_cuda_graph     = true;

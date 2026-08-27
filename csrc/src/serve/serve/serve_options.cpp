@@ -141,6 +141,9 @@ std::string serve_usage_text(const char* argv0) {
            "         full-attention layers hold a KV cache, so linear-attention layers are\n"
            "         never quantized. --kv-cache-dtype-skip-layers holds named\n"
            "         full-attention layers at bf16 (comma-separated indices)\n"
+           "       --rewrite-checkpoints keeps a per-lane GDN checkpoint so an edited last turn\n"
+           "         resumes from its prefix instead of re-prefilling it; one state slot per lane\n"
+           "         (72 MiB each on the 27B), off by default\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
@@ -262,6 +265,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
         } else if (arg == "--kv-cache-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-cache-dtype"));
+        } else if (arg == "--rewrite-checkpoints") {
+            options.rewrite_checkpoints = true;
+        } else if (arg == "--no-rewrite-checkpoints") {
+            options.rewrite_checkpoints = false;
         } else if (arg == "--kv-cache-dtype-skip-layers") {
             options.kv_cache_skip_layers =
                 parse_kv_skip_layers(require_value("--kv-cache-dtype-skip-layers"));

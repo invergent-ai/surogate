@@ -261,6 +261,7 @@ public:
     const SpeculativeBackend speculative_backend;
     const DType kv_dtype;
     const std::int32_t kv_quant_group;
+    const bool rewrite_checkpoints;
     // Shape of the most recent mixed round, kept for the corruption
     // attribution line: which band the graph was captured for, the batch's
     // maximum frontier, and each row's own frontier.

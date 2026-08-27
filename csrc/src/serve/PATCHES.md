@@ -2614,3 +2614,42 @@ run needs 250,000 requests for a ten-event sample, which is the method for
 the next attempt: `SUROGATE_SERVE_SURVIVE_CORRUPTION=1` across all eight GPUs
 for an hour per factor. With the fatal restored it kills a 0.8B worker about
 once per 25,000 requests under 100-user load.
+
+## 73
+
+Rewrite checkpoints are off by default; `--rewrite-checkpoints` opts in.
+
+The GDN state pool held two slots per lane plus the prefill scratch slot:
+the lane's live state and a rewrite checkpoint from which an edited last
+turn can resume instead of re-prefilling its prefix. On the 27B a slot is
+48 GDN layers x 48 value heads x 128 x 128 x bf16 = 72 MiB, so at 48 lanes
+the checkpoints alone held 3.4 GB, and the minimum runtime reservation
+(8.9 GB) dwarfed the KV cache (3.0 GB). That is why lanes above 48 fell off a
+cliff on the 27B: at 64 lanes the pool grew to 9.1 GB and `--kv-capacity
+auto` was left with 8,576 tokens.
+
+The slot layout is now [0, N) lanes, N scratch, then — only when checkpoints
+are enabled — [N+1, 2N+1) checkpoints. Disabled, the pool is N+1 slots, the
+checkpoint index is the sentinel kNoRewriteCheckpointSlot, the planner never
+desires, captures or defers a checkpoint (a prompt that describes one is
+simply dropped — re-prefilling that prefix is slower, never wrong), and any
+path that still reached for a checkpoint slot would index past the pool and
+fail loudly. Ordinary multi-turn append never used the checkpoint; it
+continues on the lane's live state as before.
+
+27B, fp8 KV, `--kv-capacity auto`, KV capacity with checkpoints off:
+
+  48 lanes   92,096 -> 206,976 tokens
+  56 lanes             184,384 tokens
+  64 lanes    8,576 -> 161,792 tokens
+
+Verified on the new default (checkpoints off), fp8 KV:
+
+  27B decode-heavy soak, 48 lanes, 300 s:   820 requests, 0 errors, 0 fatals
+  4B  decode-heavy soak, 64 lanes, 300 s: 3,846 requests, 0 errors, 0 fatals
+  board shapes, same cards as the paired rows: 0.8B 7,721 (was 7,666),
+    4B 4,368 (was 4,359), 27B 822 (was 827) — unchanged within noise
+  27B at 64 lanes (GPU7): 859 tok/s, TTFT p50 5.4 s (48 lanes on the same
+    card: 824 tok/s, 8.0 s) — the lane cliff is gone; 64 is now the better
+    default for the 27B, and the small gain confirms the 27B is prefill-bound,
+    not lane-bound (BENCHMARKS.md, prefill table).

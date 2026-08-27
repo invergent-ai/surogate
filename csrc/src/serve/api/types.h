@@ -94,6 +94,14 @@ struct EngineOptions {
     // quantized. Linear-attention layers hold no KV planes, so they are never
     // candidates and need not be listed.
     std::vector<std::uint32_t> kv_cache_skip_layers;
+    // Rewrite checkpoints keep a second GDN state per lane so an edited last
+    // turn can resume from its prefix instead of re-prefilling it. That is one
+    // full state slot per lane, allocated up front — 72 MiB per lane on the
+    // 27B, where disabling it took the KV cache from 92,096 to 206,976 tokens
+    // at 48 lanes. Off by default: ordinary multi-turn append never uses it,
+    // and the memory is throughput. A product with edit-and-resend turns
+    // opts in with --rewrite-checkpoints.
+    bool rewrite_checkpoints           = false;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;

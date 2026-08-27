@@ -233,7 +233,11 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         plan->reuse_base = 0;
     }
 
-    const std::optional<RewriteCheckpointSpec>& desired = base.rewrite_checkpoint;
+    // With rewrite checkpoints disabled the state pool holds no checkpoint
+    // slots, so nothing may be desired, captured or deferred: the plan drops.
+    static const std::optional<RewriteCheckpointSpec> kNoCheckpoint;
+    const std::optional<RewriteCheckpointSpec>& desired =
+        rewrite_checkpoints ? base.rewrite_checkpoint : kNoCheckpoint;
     const bool existing_checkpoint_matches =
         desired && plan->reuse != ReusePath::FullReset && sequence.rewrite_checkpoint.valid &&
         sequence.rewrite_checkpoint.frontier == desired->frontier &&

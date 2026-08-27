@@ -189,6 +189,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       max_concurrency(plan.max_concurrency), prefill_chunk(plan.prefill_chunk),
       draft_window(plan.draft_window), speculative_backend(plan.speculative_backend),
       kv_dtype(plan.kv_dtype), kv_quant_group(plan.kv_quant_group),
+      rewrite_checkpoints(plan.rewrite_checkpoints),
       proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
       use_cuda_graph(plan.use_cuda_graph), kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
@@ -482,7 +483,10 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
          request_plan.rewrite_checkpoint_capture->frontier > prompt_tokens)) {
         throw std::logic_error("planned rewrite checkpoint capture is invalid");
     }
-    if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::Drop &&
+    // With rewrite checkpoints disabled the plan drops every checkpoint the
+    // prompt describes: the pool has no slot to keep it in, and a later
+    // rewrite of that turn simply replays its prefix.
+    if (rewrite_checkpoints && request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::Drop &&
         prompt.identity.rewrite_checkpoint) {
         throw std::logic_error("planned rewrite checkpoint drop does not describe the prompt");
     }
@@ -1532,7 +1536,8 @@ void ProgramImplCore::prepare_graphs() {
                                            decoder->mtp_cache());
         capture_card.set_linear_state_slots(
             prefill_graphs->scratch_state_slot(),
-            LinearStateSlots::rewrite_checkpoint_state_slot(0, max_concurrency));
+            rewrite_checkpoints ? LinearStateSlots::rewrite_checkpoint_state_slot(0, max_concurrency)
+                                : kNoRewriteCheckpointSlot);
         capture_card.set_gdn_state_action(schedule::GdnStateAction::UpdateInPlace, nullptr);
         prepare_representative(1, 1);
         set_device_i32(io.text_kv_table_row, 0); // the bound dummy row
@@ -1711,7 +1716,9 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             staged.use_graph
                 ? LinearStateSlots::prefill_scratch_state_slot(max_concurrency)
                 : LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
-            LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane, max_concurrency),
+            rewrite_checkpoints
+                ? LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane, max_concurrency)
+                : kNoRewriteCheckpointSlot,
             staged.initial_mtp_extent,
             dflash_host_ingress,
             staged.use_graph && prefill_graphs.has_value() ? &*prefill_graphs : nullptr};
@@ -2261,8 +2268,10 @@ ProgramImplCore::advance_prefill_mixed(std::uint32_t prefill_lane,
             staged.use_graph
                 ? LinearStateSlots::prefill_scratch_state_slot(max_concurrency)
                 : LinearStateSlots::current_state_slot(prefill_sequence.lane, max_concurrency),
-            LinearStateSlots::rewrite_checkpoint_state_slot(prefill_sequence.lane,
-                                                            max_concurrency));
+            rewrite_checkpoints
+                ? LinearStateSlots::rewrite_checkpoint_state_slot(prefill_sequence.lane,
+                                                                  max_concurrency)
+                : kNoRewriteCheckpointSlot);
         card.set_gdn_state_action(schedule::GdnStateAction::UpdateInPlace, nullptr);
         if (staged.use_graph && prefill_graphs.has_value()) {
             card.set_prefill_graph_family(&*prefill_graphs);
