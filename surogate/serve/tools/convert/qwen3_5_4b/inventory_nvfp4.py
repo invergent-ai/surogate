@@ -1,8 +1,8 @@
 """Persistent-object contract for the Qwen3.5-4B NVFP4 artifact.
 
-The NVFP4 export (AxionML/Qwen3.5-4B-NVFP4) quantises the GDN projections and
-every MLP; its self-attention and embeddings stay BF16, so those keep the
-groupwise-int artifact's W8 encoding. Source-checkpoint mapping and
+The NVFP4 export (AxionML/Qwen3.5-4B-NVFP4) quantises every linear weight -
+self-attention, the GDN projections and the MLPs - and leaves only the tied
+embedding in BF16, which this artifact re-encodes as FP8 row-scaled. Source-checkpoint mapping and
 materialization live in the sibling conversion recipe.
 """
 
@@ -87,10 +87,10 @@ def _build_text_core_specs() -> tuple[TensorSpec, ...]:
         if layer in FULL_ATTENTION_LAYERS:
             specs.extend(
                 (
-                    _tensor(prefix + "attention/query_key_gate_value", (10240, 2560), FP8),
+                    _tensor(prefix + "attention/query_key_gate_value", (10240, 2560), NVFP4),
                     _tensor(prefix + "attention/query_norm", (256,), BF16),
                     _tensor(prefix + "attention/key_norm", (256,), BF16),
-                    _tensor(prefix + "attention/output", (2560, 4096), FP8),
+                    _tensor(prefix + "attention/output", (2560, 4096), NVFP4),
                 )
             )
         else:
