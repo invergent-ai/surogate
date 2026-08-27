@@ -14,7 +14,10 @@ namespace {
 
 static_assert(sizeof(GdnReplayFoldKernelRow) == 8);
 static_assert(alignof(GdnReplayFoldKernelRow) == 8);
-static_assert(sizeof(GdnReplayFoldKernelRows) == 64);
+static_assert(sizeof(GdnReplayFoldKernelRows) ==
+              sizeof(GdnReplayFoldKernelRow) * kMaximumBatchColumns);
+// The whole table travels as a kernel parameter; a launch may carry 32 KiB.
+static_assert(sizeof(GdnReplayFoldKernelRows) <= 4096);
 static_assert(alignof(GdnReplayFoldKernelRows) == 16);
 static_assert(std::is_trivially_copyable_v<GdnReplayFoldKernelRows>);
 

@@ -7,6 +7,8 @@
 #include <cuda_runtime.h>
 
 #include <cstddef>
+#include "core/limits.h"
+
 #include <cstdint>
 
 namespace ninfer::ops::detail::gated_delta_net {
@@ -16,8 +18,11 @@ struct alignas(8) GdnReplayFoldKernelRow {
     std::int32_t commit_columns;
 };
 
+// One entry per replaying lane. The fold kernel indexes it with blockIdx.y, so the only
+// thing the width costs is kernel-parameter space: kMaximumBatchColumns rows is 1 KiB of the
+// 32 KiB a launch may carry (#85).
 struct alignas(16) GdnReplayFoldKernelRows {
-    GdnReplayFoldKernelRow row[8];
+    GdnReplayFoldKernelRow row[kMaximumBatchColumns];
 };
 
 void launch_recurrent_fp32(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,

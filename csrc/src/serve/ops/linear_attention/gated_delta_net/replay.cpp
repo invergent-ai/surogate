@@ -19,7 +19,8 @@ namespace ninfer::ops {
 namespace {
 
 constexpr std::int32_t kStateDim    = detail::gated_delta_net::kStateDim;
-constexpr std::int32_t kMaximumRows = 8;
+// Speculation runs at serving concurrency, not just at a handful of lanes (#85).
+constexpr std::int32_t kMaximumRows = kMaximumBatchColumns;
 
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
     return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
