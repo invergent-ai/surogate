@@ -9,6 +9,13 @@ two builds: **CUDA** (0.3.0-dev @ f1357e4, source build, sm_120 —
 llama.cpp's strongest backend on this card, the primary rows) and the
 brew **Vulkan** build (NV_coopmat2; kept where noted for reference).
 
+Engine configuration for the 100-user rows: 64 lanes at 0.8B/4B and 48 at
+27B (each model's measured optimum — more lanes cost throughput on all
+three), mixed-round CUDA graphs on, GDN recurrent state stored bf16, and
+`--kv-dtype int8` at 27B only. vLLM's 27B row uses its own required
+config, which includes `--max-num-seqs 32` and `--kv-cache-dtype fp8`, so
+its 688 tok/s comes from 32 concurrent streams rather than 100.
+
 **All 100-user figures are 90-second steady-state runs.** Shorter windows
 measure the ramp — lanes still filling, contexts still short — and read
 up to 25% high (the same 4B config gives 2,633 over 40 s and 2,110 over
@@ -46,7 +53,7 @@ unsloth NVFP4 export + base checkpoint by the vendored converter).
 
 | engine | weights | TTFT @1.9k | decode tok/s (1 user) | 100-user agg tok/s | 100-user TTFT p50 | 100-user reqs ok/err |
 |---|---|---:|---:|---:|---:|---:|
-| **surogate serve** | from GGUF Q4_K_M | **48 ms** | **503** | **6,646** † | 0.77 s | 4,830/0 |
+| **surogate serve** | from GGUF Q4_K_M | **48 ms** | **503** | **6,692** † | 0.77 s | 4,860/0 |
 | llama-server (CUDA) | GGUF Q4_K_M | 168 ms | 391 | 772 | 10.9 s | 612/419 |
 | vLLM | NVFP4 (4-bit) | 55 ms | 364 | 5,958 | **0.41 s** | 4,200/0 |
 
@@ -54,7 +61,7 @@ unsloth NVFP4 export + base checkpoint by the vendored converter).
 
 | engine | weights | TTFT @1.9k | decode tok/s (1 user) | 100-user agg tok/s | 100-user TTFT p50 | 100-user reqs ok/err |
 |---|---|---:|---:|---:|---:|---:|
-| **surogate serve** | from GGUF Q4_K_M | **57 ms** | **214** | 3,024 † | 1.7 s | 2,205/0 |
+| **surogate serve** | from GGUF Q4_K_M | **57 ms** | **214** | 3,032 † | 1.7 s | 2,212/0 |
 | llama-server (CUDA) | GGUF Q4_K_M | 445 ms | 190 | 331 | 27.4 s | 306/174 |
 | vLLM | NVFP4 (4-bit) | 71 ms | 166 | **3,390** | **0.24 s** | 2,400/0 |
 
@@ -62,7 +69,7 @@ unsloth NVFP4 export + base checkpoint by the vendored converter).
 
 | engine | weights | TTFT @1.9k | decode tok/s (1 user) | 100-user agg tok/s | 100-user TTFT p50 | 100-user reqs ok/err |
 |---|---|---:|---:|---:|---:|---:|
-| surogate serve | NVFP4 (4-bit resident) | 352 ms | 45 | 604 | 10.7 s | 440/0 |
+| surogate serve | NVFP4 (4-bit resident, int8 KV) | 352 ms | 45 | 604 | 10.7 s | 440/0 |
 | llama-server (CUDA) | GGUF Q4_K_M | 1,829 ms | **49** | 82 | 102.4 s | 135/28 |
 | vLLM | NVFP4 pack (4-bit) | **254 ms** | 45 | **688** | 12.5 s | 580/0 |
 
@@ -92,35 +99,26 @@ missing piece.
 ## Reading
 
 - **Single user / small-stream serving: surogate wins every measured
-  cell** — including against llama.cpp's CUDA build on the same GGUF
-  (0.8B: TTFT 48 vs 168 ms, decode 503 vs 391). Per-stream decode runs
-  +29–30% over vLLM NVFP4 at matched widths.
-- **100 users, 0.8B: the engine is ahead of vLLM** — 6,076 vs 5,958
-  tok/s (+2.0%), three consecutive 90-second runs (6,072 / 6,097 /
-  6,060), 4,400+ requests each, zero errors. TTFT 0.77 s against vLLM's
-  0.41 s, so vLLM still admits faster while the engine sustains more
-  aggregate throughput.
-- **100 users, 4B: −22%** (2,656 vs 3,390). The deficit is accounted
-  for almost exactly by two measured items: decode attention at 6.9% of
-  device but ~2x off its KV-read roofline (the partial-plus-reduce design
-  round-trips partials through global memory), and 11% device idle in the
-  host serial path between rounds. Weight residency is NOT the cause —
-  at 41.6 rounds/s the 4B's 4.80 GiB of W8 weights are ~200 GB/s against
-  the card's ~1.79 TB/s, so 4-bit residency would not close it. Lane
-  count is not the cause either: 64 lanes (2,661) beats 80 (2,399) and
-  96 (2,396).
-- **100 users, 27B: −46%** (370 vs 688). This one is structural: at 64
-  lanes the 27B wants 23.3 GB of runtime reservation against 12.76 GB
-  free after its weights, because per-lane GDN state dominates at that
-  size, so it is stuck at 32 lanes while the others run 64. Its deficit
-  is entirely compute, and its census shows FP8-class GEMMs taking 47% of
-  the device on a nominally 4-bit model, with the T=17/18 exact-T kernels
-  at 412–503 GB/s against a proven 926 GB/s tile.
+  cell**, including against llama.cpp's CUDA build on the same GGUF.
+  Per-stream decode runs +29–30% over vLLM NVFP4 at matched widths.
+- **100 users, 0.8B: ahead of vLLM** — 6,692 vs 5,958 tok/s (+12.3%),
+  zero errors over 90 seconds. TTFT 0.77 s against vLLM's 0.41 s, so vLLM
+  still admits faster while the engine sustains more throughput.
+- **100 users, 4B: −11%** (3,032 vs 3,390). The gap is diffuse: GEMMs are
+  45% of device across two families, decode attention 7.9% at about half
+  its KV-read roofline, and 13% is admission idle that measurement showed
+  is not worth reclaiming (delaying a free lane's refill by one round
+  costs 18%, more than the idle is worth). The fp4 path's helper kernels
+  — activation quantisation, output split, swiglu — are 9% of device and
+  are the clearest remaining target.
+- **100 users, 27B: −12%** (604 vs 688). Not a concurrency problem: vLLM's
+  figure is 32 streams at ~21.5 tok/s each and our per-stream rate is
+  comparable, so the difference is duty cycle — roughly 40% of the device
+  goes to prefill. Lanes above 48 lose (52 → 561, 56 → 525) because
+  per-lane GDN state squeezes the KV cache until sequences thrash.
 - **llama-server's multi-user shape helps but does not change the
-  order.** At its tuned config (32 slots, continuous batching) it gains
-  +18–20% aggregate over 8 slots at 0.8B/4B yet still trails the engine
-  by 5–8x, with 30–40% of requests errored, and collapses on the dense
-  27B (82 tok/s, 102 s TTFT).
+  order**: it trails the engine by 5–8x at 0.8B/4B with 30–40% of
+  requests errored, and collapses on the dense 27B.
 
 ## What this campaign fixed in the engine (found by benchmarking)
 
