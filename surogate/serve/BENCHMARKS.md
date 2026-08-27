@@ -69,6 +69,35 @@ sampled mid-run vary with each workload's own draw, not with the card. The
 cause is still open, so treat any single number as provisional: only pairs
 taken back to back on one card, in the same batch, are compared here.
 
+## Verdict — paired, two passes (2026-08-27 evening)
+
+The measurement that decides the goal: vLLM and the engine on **one card,
+back to back, twice**, with all three models running as one batch so every
+pair sees the same background. 100 users, 90 s, 512-token prompts, 128
+output tokens. The two passes agree to within 0.5 % on every cell, so these
+supersede any conflicting row below.
+
+| model | card | engine decode tok/s | vLLM decode tok/s | ratio | engine TTFT p50 | vLLM TTFT p50 |
+|---|---|---:|---:|---:|---:|---:|
+| Qwen3.5-0.8B | GPU1 | **8,916 / 8,922** | 6,632 / 6,665 | **+34 %** | **523 ms** | 712 ms |
+| Qwen3.5-4B | GPU3 | 3,061 / 3,059 | **4,215 / 4,247** | **−28 %** | 1,515 ms | **250 ms** |
+| Qwen3.8-27B | GPU5 | 940 / 943 | **1,051 / 1,044** | **−10 %** | **4,863 ms** | 8,119 ms |
+
+So: the 0.8B is beaten comfortably, the 27B is close on decode while leading
+on TTFT, and **the 4B is behind** — the morning's +11 % row was not
+reproducible. The 4B's TTFT is the striking part: 1.5 s against vLLM's
+0.25 s, six times worse, while its steady state holds 64 lanes and 13,400
+prefill tok/s inside the run. That points at admission and prefill
+scheduling for short prompts rather than at kernels, and is where the 4B
+work should start.
+
+A caveat that is not yet resolved: runs of the *same* 4B config in different
+batches have measured 2,326 and 3,061 tok/s, each internally flat for its
+whole 90 s and with byte-identical startup logs. Within a batch the engine
+repeats to 0.5 %; across batches it does not, and neither the cards nor the
+host explains it (see the method note above). An 8-card identical-config
+test is running to separate card identity from launch-to-launch behaviour.
+
 ## 100 users — same card, same day, back to back (2026-08-27)
 
 vLLM served first, then the engine, on the card shown, quiet host, 100
