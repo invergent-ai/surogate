@@ -59,14 +59,15 @@ artifact at 27B.
 
 ### Why runs must be paired, and what varies (2026-08-27)
 
-The eight 5090s are identical and share one 400 W software cap. What varies
-is what else is running: engine throughput for the same model and shape has
-been seen to differ by more than 2× between an otherwise idle host and a
-host driving seven other engines, and SM clocks sampled mid-run (1,462 to
-2,625 MHz) track the workload's own power draw, not the card. So every
-comparison here is a pair taken back to back on one card, and absolute
-numbers are only comparable within a row group; the concurrency of the run
-is what a lone number silently hides.
+The eight 5090s are identical and none is specially configured. Repeated
+measurements of the same model, shape and config have still landed as far
+apart as 2,073 and 3,182 tok/s (4B, 64 lanes), and the usual suspects are
+ruled out: cards (identical), host CPU (64 cores at load average 5-7 with
+the client at 8 % of one core), memory (38 of 503 GB), and power/thermals
+(466 W total across eight cards, 55 °C, no throttle flags). SM clocks
+sampled mid-run vary with each workload's own draw, not with the card. The
+cause is still open, so treat any single number as provisional: only pairs
+taken back to back on one card, in the same batch, are compared here.
 
 ## 100 users — same card, same day, back to back (2026-08-27)
 
