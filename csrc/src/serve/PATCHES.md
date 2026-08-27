@@ -2353,3 +2353,17 @@ precision to close a throughput gap is not that.
 
 The int8 path stays available behind --kv-dtype int8 for anyone who wants the
 trade explicitly. What is removed is the assumption that it is free.
+
+### #65 follow-up: the standing rule
+
+Quantized KV is off the table for defaults and for board rows, confirmed by the
+owner: int8 KV is accuracy degradation. It remains reachable through
+--kv-dtype int8 as a trade a user can choose knowingly.
+
+The generalisation worth keeping: a throughput number bought with output
+quality is not comparable to one that is not, so any win from a precision
+change has to be read alongside the generated text before it is recorded. The
+GDN state move to bf16 (#57) passed that bar — it matches what the comparison
+engine stores, and coherence was checked at temperature 0 on two models before
+the number went on the board. int8 KV did not, and the failing evidence was in
+the very run that produced its number.
