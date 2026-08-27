@@ -208,7 +208,7 @@ private:
             std::lock_guard lock(queue_mutex_);
             snapshot.waiting_requests = static_cast<std::uint32_t>(pending_.size());
         }
-        snapshot.prefilling_requests = prefill_lane_.has_value() ? 1U : 0U;
+        snapshot.prefilling_requests = static_cast<std::uint32_t>(prefill_lanes_.size());
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] == nullptr) { continue; }
             ++snapshot.running_requests;
@@ -532,9 +532,9 @@ private:
             const auto& request = slots_[lane];
             if (request == nullptr || !cancelled_at_boundary[lane]) { continue; }
             instance_.program->abort_lane(lane);
-            if (prefill_lane_ && *prefill_lane_ == lane) {
-                instance_.request_memory.deactivate();
-                prefill_lane_.reset();
+            if (prefill_lanes_.contains(lane)) {
+                prefill_lanes_.erase(lane);
+                if (prefill_lanes_.empty()) { instance_.request_memory.deactivate(); }
             }
             complete_cancelled(request);
             remove_completed_slot(lane);
@@ -624,9 +624,9 @@ private:
         if (cancel_at_boundary) {
             if (!request->lane) { throw std::logic_error("cancelled prefill has no request lane"); }
             const std::uint32_t lane = *request->lane;
-            if (prefill_lane_ && lane == *prefill_lane_) {
-                instance_.request_memory.deactivate();
-                prefill_lane_.reset();
+            if (prefill_lanes_.contains(lane)) {
+                prefill_lanes_.erase(lane);
+                if (prefill_lanes_.empty()) { instance_.request_memory.deactivate(); }
             }
             instance_.program->abort_lane(lane);
             complete_cancelled(request);
@@ -635,9 +635,9 @@ private:
         }
         if (!step.complete) { return; }
         if (!request->lane) { throw std::logic_error("completed prefill has no request lane"); }
-        if (prefill_lane_ && *request->lane == *prefill_lane_) {
-            instance_.request_memory.deactivate();
-            prefill_lane_.reset();
+        if (prefill_lanes_.contains(*request->lane)) {
+            prefill_lanes_.erase(*request->lane);
+            if (prefill_lanes_.empty()) { instance_.request_memory.deactivate(); }
         }
         request->begin = step.summary;
         if (step.round.tokens.size() != 1) {
@@ -651,8 +651,8 @@ private:
     }
 
     void run_prefill_step() {
-        if (!prefill_lane_) { throw std::logic_error("no request owns staged prefill"); }
-        const std::uint32_t lane = *prefill_lane_;
+        if (prefill_lanes_.empty()) { throw std::logic_error("no request owns staged prefill"); }
+        const std::uint32_t lane = prefill_lanes_.front();
         const auto request       = slots_[lane];
         if (request == nullptr || request->decode_ready) {
             throw std::logic_error("staged prefill lane has invalid request state");
@@ -817,7 +817,7 @@ private:
             if (needs_prefill) {
                 instance_.request_memory.activate(summary.transient_bytes,
                                                   summary.transient_alignment);
-                prefill_lane_ = lane;
+                prefill_lanes_.add(lane);
                 transient     = instance_.request_memory.region();
             }
             publish_runtime_stats();
@@ -825,7 +825,7 @@ private:
             const PrefillStepResult first = instance_.program->start_prefill_lane(
                 lane, std::move(request->prompt), std::move(selected_plan), transient,
                 /*defer_first_chunk=*/true);
-            if (!first.complete && (!prefill_lane_ || *prefill_lane_ != lane)) {
+            if (!first.complete && !prefill_lanes_.contains(lane)) {
                 throw std::logic_error("partial prefill did not retain its execution owner");
             }
             const bool cancel_at_boundary = request->cancelled.load(std::memory_order_acquire);
@@ -836,9 +836,9 @@ private:
         } catch (...) {
             const std::exception_ptr error = std::current_exception();
             if (target_started) { instance_.program->abort_lane(lane); }
-            if (prefill_lane_ && *prefill_lane_ == lane) {
-                instance_.request_memory.deactivate();
-                prefill_lane_.reset();
+            if (prefill_lanes_.contains(lane)) {
+                prefill_lanes_.erase(lane);
+                if (prefill_lanes_.empty()) { instance_.request_memory.deactivate(); }
             }
             slots_[lane].reset();
             invalidate_lane_plans(lane);
@@ -1000,7 +1000,7 @@ private:
         // free lane, short bursts while the queue waits on full lanes, full
         // bursts only when nothing is waiting.
         std::uint32_t burst_limit = 8;
-        if (prefill_lane_) {
+        if (!prefill_lanes_.empty()) {
             burst_limit = 1;
         } else {
             bool queue_waiting = false;
@@ -1046,20 +1046,57 @@ private:
 
     // Mixed-token round (PATCHES.md #30): one forward advances the staged
     // prefill by a chunk and produces one decode token per active lane.
+    // Stage more prompts alongside the ones already waiting, so a single mixed round prefills
+    // several at once (#80). Admission with a deferred first chunk is CPU-only, so this costs
+    // nothing on the GPU; it stops as soon as an admission would run a unit or finds no work.
+    void top_up_prefill_lanes() {
+        while (!prefill_lanes_.full()) {
+            {
+                std::lock_guard lock(queue_mutex_);
+                if (pending_.empty()) { return; }
+            }
+            bool lane_free = false;
+            for (std::uint32_t lane = 0; lane < max_concurrency_ && !lane_free; ++lane) {
+                lane_free = slots_[lane] == nullptr;
+            }
+            if (!lane_free) { return; }
+            const std::size_t before = prefill_lanes_.size();
+            if (try_admit_one() != AdmissionProgress::ControlProgress) { return; }
+            if (prefill_lanes_.size() == before) { return; }
+        }
+    }
+
     void run_mixed_round(const RoundMembership& membership) {
-        if (!prefill_lane_) { throw std::logic_error("no request owns staged prefill"); }
-        const std::uint32_t lane = *prefill_lane_;
+        if (prefill_lanes_.empty()) { throw std::logic_error("no request owns staged prefill"); }
+        const std::uint32_t lane = prefill_lanes_.front();
         const auto request       = slots_[lane];
         if (request == nullptr || request->decode_ready) {
             throw std::logic_error("staged prefill lane has invalid request state");
         }
         const std::span<const std::uint32_t> lanes = membership.lane_span();
-        const MixedRoundResult mixed =
-            instance_.program->advance_prefill_mixed(lane, lanes, membership.budget_span());
+        // Only the prompts the program can still advance ride this round.
+        std::array<std::uint32_t, runtime::kMaximumMixedPrefills> staged{};
+        std::size_t staged_count = 0;
+        for (const std::uint32_t candidate : prefill_lanes_.span()) {
+            if (!instance_.program->mixed_round_supported(candidate)) { continue; }
+            const auto& owner = slots_[candidate];
+            if (owner == nullptr || owner->decode_ready) { continue; }
+            staged[staged_count++] = candidate;
+        }
+        if (staged_count == 0) { throw std::logic_error("mixed round has no advanceable prefill"); }
+        const MixedRoundResult mixed = instance_.program->advance_prefill_mixed(
+            std::span<const std::uint32_t>(staged.data(), staged_count), lanes,
+            membership.budget_span());
         process_decode_round(membership, mixed.round);
         ++cumulative_stats_.decode_rounds;
-        const bool cancel_at_boundary = request->cancelled.load(std::memory_order_acquire);
-        resolve_prefill_step(request, mixed.prefill, cancel_at_boundary);
+        // Resolve each staged prompt against its own result. resolve_prefill_step can retire a
+        // lane and edit prefill_lanes_, so the lanes were captured before the round ran.
+        for (std::size_t i = 0; i < mixed.prefill_count && i < staged_count; ++i) {
+            const auto owner = slots_[staged[i]];
+            if (owner == nullptr) { continue; }
+            const bool cancelled_now = owner->cancelled.load(std::memory_order_acquire);
+            resolve_prefill_step(owner, mixed.prefill_at(i), cancelled_now);
+        }
         publish_runtime_stats();
     }
 
@@ -1190,9 +1227,9 @@ private:
             pending.assign(pending_.begin(), pending_.end());
             pending_.clear();
         }
-        if (prefill_lane_) {
+        if (!prefill_lanes_.empty()) {
             instance_.request_memory.deactivate();
-            prefill_lane_.reset();
+            prefill_lanes_.clear();
         }
         protection_.reset();
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
@@ -1238,13 +1275,14 @@ private:
                 seg_timer_.boundary += std::chrono::duration<double>(Clock::now() - seg_t0).count();
                 seg_timer_.maybe_report();
 
-                if (prefill_lane_) {
+                if (!prefill_lanes_.empty()) {
+                    top_up_prefill_lanes();
                     if (!membership.empty() &&
-                        instance_.program->mixed_round_supported(*prefill_lane_)) {
+                        instance_.program->mixed_round_supported(prefill_lanes_.front())) {
                         const auto t_mixed = Clock::now();
                         last_round_ = LastRound{"mixed",
                                                 static_cast<std::uint32_t>(membership.size),
-                                                *prefill_lane_, last_round_.index + 1};
+                                                prefill_lanes_.front(), last_round_.index + 1};
                         run_mixed_round(membership);
                         seg_timer_.mixed +=
                             std::chrono::duration<double>(Clock::now() - t_mixed).count();
@@ -1384,7 +1422,41 @@ private:
     std::size_t outstanding_       = 0;
     std::uint64_t next_request_id_ = 1;
     std::array<std::shared_ptr<Request>, kMaximumConcurrency> slots_{};
-    std::optional<std::uint32_t> prefill_lane_;
+    // Multi-prompt prefill (#80): several prompts can be staged at once and share a round.
+    // The first one owns the round's card; the rest ride along as extra segments.
+    class PrefillLaneSet {
+      public:
+        [[nodiscard]] bool empty() const noexcept { return size_ == 0; }
+        [[nodiscard]] std::size_t size() const noexcept { return size_; }
+        [[nodiscard]] bool full() const noexcept { return size_ >= lanes_.size(); }
+        [[nodiscard]] std::uint32_t front() const { return lanes_.at(0); }
+        [[nodiscard]] std::span<const std::uint32_t> span() const noexcept {
+            return std::span<const std::uint32_t>(lanes_.data(), size_);
+        }
+        [[nodiscard]] bool contains(std::uint32_t lane) const noexcept {
+            return std::find(lanes_.begin(), lanes_.begin() + static_cast<std::ptrdiff_t>(size_),
+                             lane) != lanes_.begin() + static_cast<std::ptrdiff_t>(size_);
+        }
+        void add(std::uint32_t lane) {
+            if (full() || contains(lane)) { throw std::logic_error("prefill lane set overflow"); }
+            lanes_[size_++] = lane;
+        }
+        // Erasing keeps the order so the round's card owner stays stable.
+        void erase(std::uint32_t lane) noexcept {
+            for (std::size_t i = 0; i < size_; ++i) {
+                if (lanes_[i] != lane) { continue; }
+                for (std::size_t j = i + 1; j < size_; ++j) { lanes_[j - 1] = lanes_[j]; }
+                --size_;
+                return;
+            }
+        }
+        void clear() noexcept { size_ = 0; }
+
+      private:
+        std::array<std::uint32_t, runtime::kMaximumMixedPrefills> lanes_{};
+        std::size_t size_ = 0;
+    };
+    PrefillLaneSet prefill_lanes_;
     std::array<std::uint64_t, kMaximumConcurrency> lane_plan_versions_{};
     std::optional<AdmissionProtection> protection_;
     std::uint64_t next_protection_epoch_ = 1;

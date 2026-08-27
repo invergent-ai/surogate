@@ -166,7 +166,7 @@ public:
     decode_batch(std::span<const std::uint32_t> lanes,
                  std::span<const runtime::RoundBudget> budgets);
     [[nodiscard]] runtime::MixedRoundResult
-    advance_prefill_mixed(std::uint32_t prefill_lane, std::span<const std::uint32_t> lanes,
+    advance_prefill_mixed(std::span<const std::uint32_t> prefill_lanes, std::span<const std::uint32_t> lanes,
                           std::span<const runtime::RoundBudget> budgets);
     [[nodiscard]] bool mixed_round_supported(std::uint32_t prefill_lane) const noexcept;
     // One line describing the most recent mixed round for a given decode row:

@@ -2163,23 +2163,37 @@ bool ProgramImplCore::mixed_round_supported(std::uint32_t prefill_lane) const no
 }
 
 runtime::MixedRoundResult
-ProgramImplCore::advance_prefill_mixed(std::uint32_t prefill_lane,
+ProgramImplCore::advance_prefill_mixed(std::span<const std::uint32_t> prefill_lanes,
                                        std::span<const std::uint32_t> lanes,
                                        std::span<const runtime::RoundBudget> budgets) {
     if (speculative_backend != SpeculativeBackend::None || lanes.empty() ||
-        budgets.size() != lanes.size() || prefill_lane >= max_concurrency) {
-        throw std::invalid_argument("mixed round requires plain decode lanes and a prefill lane");
+        budgets.size() != lanes.size() || prefill_lanes.empty() ||
+        prefill_lanes.size() > runtime::kMaximumMixedPrefills) {
+        throw std::invalid_argument("mixed round requires plain decode lanes and prefill lanes");
     }
-    SequenceState& prefill_sequence = sequences[prefill_lane];
-    RequestControl& prefill_request = requests[prefill_lane];
-    if (prefill_request.lifecycle != Lifecycle::Prefilling || !prefill_request.prefill) {
-        throw std::logic_error("mixed round requires an active prefill lane");
+    for (std::size_t i = 0; i < prefill_lanes.size(); ++i) {
+        const std::uint32_t lane = prefill_lanes[i];
+        if (lane >= max_concurrency ||
+            std::find(prefill_lanes.begin(), prefill_lanes.begin() + static_cast<std::ptrdiff_t>(i),
+                      lane) != prefill_lanes.begin() + static_cast<std::ptrdiff_t>(i)) {
+            throw std::invalid_argument("mixed round has an invalid or duplicate prefill lane");
+        }
+        const RequestControl& request = requests[lane];
+        if (request.lifecycle != Lifecycle::Prefilling || !request.prefill) {
+            throw std::logic_error("mixed round requires active prefill lanes");
+        }
+        const RequestControl::Prefill& entry = *request.prefill;
+        if (entry.vision || entry.prepare_mtp || entry.cursor >= entry.prompt_tokens ||
+            entry.mtp_bridge != MtpBridgeMode::None) {
+            throw std::logic_error("mixed round does not support this staged prefill");
+        }
     }
-    RequestControl::Prefill& staged = *prefill_request.prefill;
-    if (staged.vision || staged.prepare_mtp || staged.cursor >= staged.prompt_tokens ||
-        staged.mtp_bridge != MtpBridgeMode::None) {
-        throw std::logic_error("mixed round does not support this staged prefill");
-    }
+    // The first staged prompt owns the card (its KV view and cursor); every prompt's KV is
+    // addressed per segment through the batch view and its own table row.
+    const std::uint32_t prefill_lane = prefill_lanes.front();
+    SequenceState& prefill_sequence  = sequences[prefill_lane];
+    RequestControl& prefill_request  = requests[prefill_lane];
+    RequestControl::Prefill& staged  = *prefill_request.prefill;
 
     std::uint32_t maximum_frontier = 0;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -2250,8 +2264,23 @@ ProgramImplCore::advance_prefill_mixed(std::uint32_t prefill_lane,
             prefill_chunk > static_cast<std::uint32_t>(rows)
                 ? prefill_chunk - static_cast<std::uint32_t>(rows)
                 : 1U;
-        const std::uint32_t nominal =
-            std::min(mixed_chunk_cap, staged.prompt_tokens - staged.cursor);
+        // Every staged prompt draws from the same window: give each one its remaining
+        // tokens in turn until the window is spent, so a round packs as many short prompts
+        // as fit and still chunks a long one exactly as before (#80).
+        std::array<std::uint32_t, runtime::kMaximumMixedPrefills> nominals{};
+        std::uint32_t window_left = mixed_chunk_cap;
+        std::size_t staged_count  = 0;
+        for (std::size_t i = 0; i < prefill_lanes.size() && window_left > 0; ++i) {
+            const RequestControl::Prefill& entry = *requests[prefill_lanes[i]].prefill;
+            const std::uint32_t want = entry.prompt_tokens - entry.cursor;
+            nominals[i]              = std::min(window_left, want);
+            window_left -= nominals[i];
+            ++staged_count;
+        }
+        if (staged_count == 0 || nominals[0] == 0) {
+            throw std::logic_error("mixed round staged no prefill tokens");
+        }
+        const std::uint32_t nominal = nominals[0];
         const bool final_candidate = staged.cursor + nominal == staged.prompt_tokens;
         mark_workspace_usage(workspace_plan.text_prefill);
         mark_workspace_usage(workspace_plan.ordinary_round);
@@ -2297,8 +2326,8 @@ ProgramImplCore::advance_prefill_mixed(std::uint32_t prefill_lane,
         // and an unbanded attention envelope (#55, below).
         // SUROGATE_SERVE_NO_MIXED_GRAPH=1 forces the eager path for bisecting.
         static const bool kNoMixedGraph = std::getenv("SUROGATE_SERVE_NO_MIXED_GRAPH") != nullptr;
-        if (!kNoMixedGraph && staged.use_graph && prefill_graphs.has_value() &&
-            batch_bucket == rows) {
+        if (!kNoMixedGraph && staged_count == 1 && staged.use_graph &&
+            prefill_graphs.has_value() && batch_bucket == rows) {
             // The graph ladder rounds the chunk up to a 128 bucket, so the
             // nominal must leave room for both the rounding and the batch
             // bucket inside the prefill_chunk workspace window.
@@ -2369,9 +2398,27 @@ ProgramImplCore::advance_prefill_mixed(std::uint32_t prefill_lane,
             }
         }
         if (!graph_hit) {
-            chunk = card.mixed_chunk(std::span<const TokenId>(staged.prompt.token_ids),
-                                     staged.cursor, nominal,
-                                     /*finalize_at_end=*/false, slice);
+            std::array<schedule::TextContext::MixedPrefillSegment, runtime::kMaximumMixedPrefills>
+                segments{};
+            for (std::size_t i = 0; i < staged_count; ++i) {
+                SequenceState& sequence              = sequences[prefill_lanes[i]];
+                const RequestControl::Prefill& entry = *requests[prefill_lanes[i]].prefill;
+                // Each prompt's chunk must own the KV it is about to write.
+                materialize_sequence_kv(sequence, entry.cursor + nominals[i], 0);
+                segments[i] = schedule::TextContext::MixedPrefillSegment{
+                    .ids = std::span<const TokenId>(entry.prompt.token_ids)
+                               .subspan(entry.cursor, nominals[i]),
+                    .kv_base      = static_cast<std::int32_t>(entry.cursor),
+                    .kv_table_row = sequence.kv->text.bound_row(),
+                    .state_slot   = static_cast<std::int32_t>(
+                        LinearStateSlots::current_state_slot(sequence.lane, max_concurrency)),
+                    .finalize = false,
+                };
+            }
+            chunk = card.mixed_chunk_multi(
+                std::span<const schedule::TextContext::MixedPrefillSegment>(segments.data(),
+                                                                            staged_count),
+                slice, schedule::TextContext::MixedPrefillFinalize{});
         }
 
         Tensor sampled         = ordinary.sampled_tokens.slice(0, 0, rows);
@@ -2410,26 +2457,39 @@ ProgramImplCore::advance_prefill_mixed(std::uint32_t prefill_lane,
         result.round = runtime::BatchedGeneratedRound{
             .tokens = std::span<const TokenId>(ordinary_host_egress->sampled_tokens.data(),
                                                lanes.size())};
-        const runtime::BeginSummary summary{.prompt_tokens        = staged.prompt_tokens,
-                                            .reused_prompt_tokens = staged.base,
-                                            .prefix_reuse_path    = staged.reuse};
-        staged.cursor += chunk.processed_tokens;
-        prefill_sequence.text_kv_valid = staged.cursor;
-        result.prefill = runtime::PrefillStepResult{
-            .summary = summary, .processed_prompt_tokens = chunk.processed_tokens};
-        if (staged.cursor == staged.prompt_tokens) {
-            if (staged.use_graph) {
-                decoder->linear_attention.copy_slot(
-                    LinearStateSlots::prefill_scratch_state_slot(max_concurrency),
-                    LinearStateSlots::current_state_slot(prefill_sequence.lane, max_concurrency),
-                    device.stream);
+        // Each staged prompt advances by its own chunk; the graph path processes exactly the
+        // first one, so its count matches what the forward consumed.
+        const std::uint32_t graph_processed = chunk.processed_tokens;
+        std::uint32_t column                = 0;
+        result.prefill_count                = graph_hit ? 1 : staged_count;
+        for (std::size_t i = 0; i < result.prefill_count; ++i) {
+            const std::uint32_t lane_id          = prefill_lanes[i];
+            SequenceState& sequence              = sequences[lane_id];
+            RequestControl::Prefill& entry       = *requests[lane_id].prefill;
+            const std::uint32_t processed        = graph_hit ? graph_processed : nominals[i];
+            const runtime::BeginSummary summary{.prompt_tokens        = entry.prompt_tokens,
+                                                .reused_prompt_tokens = entry.base,
+                                                .prefix_reuse_path    = entry.reuse};
+            entry.cursor += processed;
+            sequence.text_kv_valid = entry.cursor;
+            result.prefills[i]     = runtime::PrefillStepResult{
+                    .summary = summary, .processed_prompt_tokens = processed};
+            if (entry.cursor == entry.prompt_tokens) {
+                if (entry.use_graph && graph_hit) {
+                    decoder->linear_attention.copy_slot(
+                        LinearStateSlots::prefill_scratch_state_slot(max_concurrency),
+                        LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
+                        device.stream);
+                }
+                // The next ordinary advance takes the zero-suffix path off the tail hidden
+                // (reusing the whole finalize machinery). Each prompt's last column sits at
+                // the end of its own segment.
+                copy_tail(sequence,
+                          prefill_hidden.slice(
+                              1, static_cast<std::int32_t>(column + processed) - 1, 1));
+                sequence.tail_hidden_valid = true;
             }
-            // The next ordinary advance takes the zero-suffix path off the
-            // tail hidden (reusing the whole finalize machinery).
-            copy_tail(prefill_sequence,
-                      prefill_hidden.slice(
-                          1, static_cast<std::int32_t>(chunk.processed_tokens) - 1, 1));
-            prefill_sequence.tail_hidden_valid = true;
+            column += processed;
         }
         return result;
     } catch (...) {

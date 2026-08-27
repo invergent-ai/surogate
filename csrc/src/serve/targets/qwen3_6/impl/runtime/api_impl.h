@@ -176,10 +176,10 @@ Program<Variant>::decode_batch(std::span<const std::uint32_t> lanes,
 
 template <>
 runtime::MixedRoundResult
-Program<Variant>::advance_prefill_mixed(std::uint32_t prefill_lane,
+Program<Variant>::advance_prefill_mixed(std::span<const std::uint32_t> prefill_lanes,
                                         std::span<const std::uint32_t> lanes,
                                         std::span<const runtime::RoundBudget> budgets) {
-    return impl_->advance_prefill_mixed(prefill_lane, lanes, budgets);
+    return impl_->advance_prefill_mixed(prefill_lanes, lanes, budgets);
 }
 
 template <>

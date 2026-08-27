@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include "api/types.h"
 
 #include <cstddef>
@@ -87,9 +88,19 @@ struct RoundBudget {
 
 // Mixed-token round (PATCHES.md #30): one forward advanced the prefill lane
 // by a chunk AND produced one decode token per active lane.
+// A mixed round advances one decode step for every lane plus a prefill chunk for each staged
+// prompt (#80). `prefills[i]` belongs to the i-th lane the caller passed in.
+inline constexpr std::size_t kMaximumMixedPrefills = 8;
+
 struct MixedRoundResult {
-    PrefillStepResult prefill;
+    std::array<PrefillStepResult, kMaximumMixedPrefills> prefills{};
+    std::size_t prefill_count = 0;
     BatchedGeneratedRound round;
+
+    [[nodiscard]] const PrefillStepResult& prefill_at(std::size_t index) const {
+        if (index >= prefill_count) { throw std::out_of_range("mixed round prefill index"); }
+        return prefills[index];
+    }
 };
 
 // Target-produced affine reservation curve for one Main KV physical-capacity axis. The byte
