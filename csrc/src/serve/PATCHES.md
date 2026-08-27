@@ -2428,3 +2428,189 @@ row is never re-read or re-written at all. That is a plumbing change — the
 workspace the codes land in is allocated by the GEMM's dispatch, downstream of
 the norm — and it is the only version of this idea with a mechanism behind it
 rather than a hope.
+## 68
+
+KV cache sizing was blind to the derived weight residencies, so `--kv-capacity
+auto` over-committed and the engine died during CUDA Graph capture.
+
+The FP8/FP4 and Marlin planes hold a repacked copy of every W8 weight they
+adopt. They are allocated lazily — during graph warmup, or on first use when
+graphs are off — which is *after* `resolve_kv_capacity` has already sized and
+committed the cache. Measured with a `SUROGATE_SERVE_MEM_TRACE=1` counter:
+
+  4B    derived planes 2,774 MiB + Marlin 4,086 MiB = 6,860 MiB  (1.40x weights)
+  0.8B  derived planes   474 MiB + Marlin   770 MiB = 1,244 MiB
+  27B   0 MiB — NVFP4-resident, nothing to derive
+
+The policy therefore spent the card down to 72 MiB free and the graphs had
+nowhere to go. It surfaced three different ways depending on configuration,
+which is why it looked like three bugs: an abort during capture with graphs on,
+and — with `--enforce-eager`, where the planes are derived later still —
+17,733 requests of silently corrupted output, because a failed derivation is
+reported by returning a null plane that callers read through anyway.
+
+Three changes:
+
+  * Sizing projects the residency from the resident weight formats, so an
+    NVFP4 or FP8 artifact projects nothing and keeps the capacity it had. A
+    new architecture inherits the reserve without naming itself.
+  * `DecodeGraphDefinition::capture`, `instantiate` and `upload` throw instead
+    of `CUDA_CHECK`. cuda_check calls std::abort(), so the eager-fallback
+    catch in prefill_graph.h could never run — it was dead code for exactly
+    the failure it was written for.
+  * A graph that will not fit now exits cleanly naming `--enforce-eager`
+    rather than degrading. Degrading is wrong here: the device has no margin
+    left, and the other lazy allocators fail a moment later without saying so.
+
+  4B `--kv-capacity auto` @64: crash -> 3,015 tok/s, 446,656-token cache
+  0.8B 6,788 explicit / 6,589 auto · 27B 595 · 4B 3,038 explicit — all err=0
+
+## 69
+
+FP8 (e4m3) KV cache, default on, with a per-layer skip list.
+
+Storage is the raw e4m3 byte with no scale plane, which is what vLLM writes
+for `--kv-cache-dtype fp8` when no calibration is present: its k_scale/v_scale
+default to 1.0, so its scaled_convert reduces to a cast. Values above 448
+saturate rather than rescaling, matching that behaviour.
+
+Compute stays bf16. The codes are widened on the way into the shared tile, so
+the MMA, the swizzle and the shared-memory budget are unchanged and the bf16
+decode/prefill kernels are simply templated on their cache storage type rather
+than forked. The int8 cache needs its own kernel only because it feeds IMMA.
+That containment is deliberate: FA3 is known to *lose* throughput on fp8 KV at
+large head dimensions, and ours is 256.
+
+Measured, 90 s, 100 users:
+
+  0.8B  bf16 6,837 -> fp8 6,529   KV 3.71 -> 2.96 GiB
+  27B   bf16   594 -> fp8   582   KV 46,016 -> 92,096 tokens (exactly 2x)
+
+So it is a memory feature, not a throughput one: a few percent of decode buys
+double the cache. The 27B is not KV-capacity-bound at 48 lanes — its
+bottleneck is prefill duty cycle — so doubling a cache that was not full
+returns nothing there.
+
+Only full-attention layers own KV planes (`plan_cache` is built from
+`full_attention_layers`), so a quantized cache structurally cannot reach a
+linear-attention layer; the 35B-A3B asserts 10 such layers out of 40.
+`--kv-cache-dtype-skip-layers` holds named full-attention layers at bf16 for
+the sensitive ones. Verified by size, since bf16 and e4m3 layers occupy the
+same two planes: 0.8B 3.71 (bf16) / 2.96 (fp8) / 3.21 GiB (fp8 skipping 0,1).
+
+Not yet supported: `--spec dflash`, whose kv_cache_append_prefix path is
+BF16-only and will refuse an e4m3 cache.
+
+## 70
+
+`--spec dflash` now refuses an e4m3 cache at startup rather than mid-round.
+Its draft commit runs through `kv_cache_append_prefix`, which validates
+`dtype != DType::BF16` and throws; with fp8 becoming the default that would
+have surfaced as an exception the first time a draft landed, long after the
+server reported itself healthy. Supporting the pair properly means an e4m3
+path in that append kernel, which is not written.
+
+## 71
+
+The mixed-round corruption, root-caused: the mixed graph's cache key never
+carried the frontier band.
+
+PATCHES.md #55 meant to put the band in the key and passed
+`mixed_profile.topology_class`. `graph_profiles_through` builds every profile
+as `{begin, end}` and never sets that field, so it is zero for every band, and
+the key was `(chunk_bucket, batch)` alone. The first mixed graph captured for a
+pair — captured while every lane was young, with the low band's
+`max_visible = 512` baked into its decode attention grid — replayed for the
+rest of the process. Every lane that later crossed frontier 512 had its
+attention truncated inside mixed rounds: a valid forward pass over the wrong
+window, which is why the logits were finite and confident and simply wrong.
+
+The key now carries the ordinary profile's index, which identifies the band
+exactly. The ordinary decode graphs were never affected: they share one
+executable per batch width and re-parameterize per band through
+`executable.update`.
+
+Why it hid for so long, in the measurements that finally pinned it:
+
+  * Victims were always lanes past 512, always in mixed rounds, never in
+    ordinary decode rounds.
+  * Long prompts (lanes start past 512), short generations (lanes never reach
+    it), and a diagnostic run with the band edge moved to 1023 (lanes never
+    cross it) were all clean — the only clean configurations, and the only
+    ones in which a single band covers a lane's whole life.
+  * Moving the edge took the 27B from 25 corrupted streams in 300 s to zero;
+    restoring the edge and fixing the key does the same.
+  * The balanced 512/128 board rows never reach it: their lanes start past
+    512. Every board number stood on a configuration that cannot exercise
+    this path, which is an argument for a decode-heavy row on the board.
+
+Refused along the way, each by measurement rather than reasoning: the prefill
+graph's 128-rounded KV window (#55's hazard on the plain path — real, but not
+this), the Marlin wide band (narrow and off both still corrupt), the KV-split
+clamp, prefill ownership steals (never happened), double-used KV pages (an
+audit stayed silent), the sampler (it faithfully took the argmax of wrong
+logits), prompt content (identical prompts still corrupt), and the fp4
+activation-quant path (off still corrupts). An occupancy guard that refused
+near-full mixed rounds did stop it, at 16.6% of the 4B's throughput — rejected
+as a fix, and useful only as the observation that pointed at the mixed graph.
+
+Method note for the next one of these: the toggles that disable one graph
+family (`SUROGATE_SERVE_NO_MIXED_GRAPH`, `SUROGATE_SERVE_PREFILL_GRAPH=0`)
+corrupted fast at every lane count and were dismissed as "partially graphed
+state, not a control". That was wrong — see #72: `PREFILL_GRAPH=0` routes
+prompts through the eager prefill, which had its own bug, so the toggle was a
+faithful control for a defect that had not been found yet. Two overlapping
+bugs with one symptom is exactly when a toggle looks broken. compute-sanitizer
+memcheck cannot reach the graph-mode bug (its slowdown caps occupancy below
+the batch it needs, and it cannot see inside a captured graph); initcheck
+found the eager one in a single run. What worked for this one was making the
+failure survivable, attributing each event (row, lane, frontier, token,
+logits), and running the factor matrix across GPUs in parallel.
+
+## 72
+
+The eager-prefill corruption: the direct recurrent kernel still read the GDN
+state as fp32 after the storage moved to bf16.
+
+`recurrent_bf16_direct_kernel` — the non-chunked recurrent form the eager
+prefill takes for an exact-length remainder — kept `float*` state parameters
+and an fp32 launcher cast when the state pool became `GdnStateStorage`
+(bf16). It therefore addressed a half-size buffer with fp32 strides: reading
+past the slot's written extent (compute-sanitizer initcheck: "uninitialized
+__global__ memory read of size 16 bytes" at the state load) and writing back
+twice the bytes into whatever followed. Every other launcher in the file had
+been converted; this one had not.
+
+Only the eager prefill reaches that form steadily: the captured prefill body
+runs 128-multiple bucket lengths, which the chunked scan covers exactly, while
+the eager body runs exact lengths (545 = 8 x 64 + 33) whose tail is handed to
+the direct kernel. That is why `--enforce-eager` corrupted young lanes within
+seconds — 22 of 174 requests on the 0.8B board shape — and why
+`SUROGATE_SERVE_PREFILL_GRAPH=0` corrupted at every lane count: that toggle was
+not "broken", it isolated the culprit, and was misread as noise (#71's method
+note is corrected by this).
+
+After: 1 corrupted request in 14,415 on the same shape, initcheck reports no
+kernel read of uninitialized state, and the eager path's 916 tok/s (most of it
+rejections after the fatal) becomes 6,100.
+
+## Open: a rare 0.8B corruption, ~4 per 100,000 requests
+
+What remains after #71 and #72, measured on the fixed binary:
+
+  graph mode, 0.8B, 512/128, 600 s on two GPUs:  3 events in 81,319 requests
+  eager mode, same shape, 300 s:                  1 event  in 14,415 requests
+  4B, 27B, same shape, 300 s:                     0 in 18,500 and 4,000
+
+Every victim is in a mixed round, in the high band, with the graph replayed,
+and the victim's own frontier a few tokens below the batch maximum (654–676
+against 685–688); victims skew late in their 128-token generation. It
+predates this session: it is the intermittent 0.8B invalid-UTF-8 fault that
+5fa6603e pinned the Marlin band over, and the 600 s matrix here shows the
+narrow band does not prevent it (2 events in 30,857 requests), nor does
+Marlin off, bf16 KV, the fp4 path off, or 32 lanes — each of those ran too few
+requests to separate a 4-per-100k rate from zero. At this rate a single-GPU
+run needs 250,000 requests for a ten-event sample, which is the method for
+the next attempt: `SUROGATE_SERVE_SURVIVE_CORRUPTION=1` across all eight GPUs
+for an hour per factor. With the fatal restored it kills a 0.8B worker about
+once per 25,000 requests under 100-user load.

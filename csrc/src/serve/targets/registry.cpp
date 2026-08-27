@@ -4,6 +4,8 @@
 #include "artifact/materializer.h"
 #include "artifact/reader.h"
 #include "core/device.h"
+#include "ops/linear/marlin/marlin_plane.h"
+#include "ops/linear/w8a8/w8fp8_plane.h"
 #include "runtime/engine/kv_capacity.h"
 
 #include <chrono>
@@ -11,6 +13,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <variant>
 #include <utility>
 
 namespace ninfer::targets {
@@ -47,8 +50,18 @@ void validate_options(const EngineOptions& options) {
     default:
         throw std::invalid_argument("Engine kv_capacity mode is invalid");
     }
+    if (options.kv_cache == KvCacheStorage::Fp8E4M3 &&
+        options.speculative.backend == SpeculativeBackend::DFlash) {
+        // DFlash commits its draft through kv_cache_append_prefix, which has no
+        // e4m3 path. Refuse the pair at startup: the alternative is an
+        // exception thrown mid-round once a draft first lands.
+        throw std::invalid_argument(
+            "--spec dflash needs a bf16 KV cache (pass --kv-cache-dtype bf16); its draft commit "
+            "has no fp8 path");
+    }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
-        throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
+        throw std::invalid_argument("Engine max_concurrency must be in [1," +
+                                    std::to_string(kMaximumConcurrency) + "]");
     }
     if (options.max_pending_requests == 0 || options.pending_timeout_ms == 0) {
         throw std::invalid_argument("Engine pending request capacity and timeout must be nonzero");
@@ -86,6 +99,42 @@ std::size_t current_free_device_bytes() {
     return free_bytes;
 }
 
+std::size_t subtract_saturating(std::size_t value, std::size_t amount) noexcept {
+    return value > amount ? value - amount : 0;
+}
+
+// The FP8/FP4 and Marlin residencies derive a second, repacked copy of every
+// W8 weight they adopt. Those copies are allocated lazily -- during graph
+// warmup, or on first use when graphs are off -- which is after the KV cache
+// has already been sized and committed. A sizing policy blind to them spends
+// the whole card on KV and leaves the derivations to fail: with graphs on that
+// surfaced as an out-of-memory during capture, and with --enforce-eager as
+// silently corrupted output, because a failed derivation is reported by
+// returning a null plane that callers still read through.
+//
+// Project the footprint from the resident weights rather than a flat constant.
+// Only W8-format tensors are ever derived, so an artifact resident in NVFP4 or
+// FP8 projects nothing and keeps the capacity it had, and a new architecture
+// inherits the reserve from its weight formats without naming itself here.
+std::size_t projected_derived_residency_bytes(const artifact::Binder& binder,
+                                              const artifact::MaterializationPlan& plan) {
+    if (!ops::detail::w8fp8_plane_enabled() && !ops::detail::marlin_plane_enabled()) { return 0; }
+    std::uint64_t w8_bytes = 0;
+    for (const artifact::DeviceMaterialization& object : plan.device_objects) {
+        const auto& descriptor = binder.descriptor(object.object);
+        const auto* tensor     = std::get_if<artifact::TensorDescriptor>(&descriptor);
+        if (tensor != nullptr && tensor->format == artifact::NumericFormat::W8G32_F16S) {
+            w8_bytes += object.bytes;
+        }
+    }
+    // Measured on the 4B (4.80 GiB of W8 weights): 2,774 MiB of FP8/FP4 planes
+    // plus 4,086 MiB of Marlin tiles, 1.40x the resident bytes. Adoption is
+    // partial and profile-dependent, so round up rather than restate each
+    // predicate here -- under-reserving corrupts output, over-reserving only
+    // costs cache.
+    return static_cast<std::size_t>(w8_bytes + w8_bytes / 2U);
+}
+
 template <class Target, class Loaded, class Instance>
 ConstructedTarget construct_registered(const EngineOptions& options, DeviceContext& device,
                                        artifact::Reader& reader, Clock::time_point load_start,
@@ -98,8 +147,11 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     auto load_plan        = Target::plan_load(binder, options, weights_profile);
     auto sequence_planner = Target::make_sequence_planner(device, options, weights_profile);
     const runtime::SequenceCapacityCurve curve = sequence_planner.capacity_curve();
-    const std::size_t preflight_runtime_bytes =
-        runtime_bytes_after_planned_weights(load_plan.materialization().device_capacity_bytes);
+    const std::size_t derived_residency_bytes =
+        projected_derived_residency_bytes(binder, load_plan.materialization());
+    const std::size_t preflight_runtime_bytes = subtract_saturating(
+        runtime_bytes_after_planned_weights(load_plan.materialization().device_capacity_bytes),
+        derived_residency_bytes);
     (void)runtime::resolve_kv_capacity(options.kv_capacity, curve, preflight_runtime_bytes);
 
     auto progress     = artifact_progress(options.load_progress);
@@ -109,8 +161,9 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
 
     auto model = Target::construct_loaded_model(std::move(load_plan), std::move(materialized));
     device.synchronize();
-    runtime::KvCapacityResolution capacity_resolution =
-        runtime::resolve_kv_capacity(options.kv_capacity, curve, current_free_device_bytes());
+    runtime::KvCapacityResolution capacity_resolution = runtime::resolve_kv_capacity(
+        options.kv_capacity, curve,
+        subtract_saturating(current_free_device_bytes(), derived_residency_bytes));
     auto sequence_plan = std::move(sequence_planner).finalize(capacity_resolution.main_page_groups);
     if (sequence_plan.device_reservation_bytes() != capacity_resolution.runtime_reservation_bytes ||
         sequence_plan.kv_capacity() != capacity_resolution.resolved_tokens) {

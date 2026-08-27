@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <vector>
 
 namespace ninfer::targets::qwen3_6 {
 
@@ -20,6 +21,10 @@ struct DecoderStateSpec {
     std::int32_t attention_head_dim         = 0;
     DType kv_dtype                          = DType::BF16;
     std::int32_t kv_quant_group             = 0;
+    // Full-attention layer indices held at the model dtype while the rest of
+    // the cache is quantized. Linear-attention layers never appear here: they
+    // hold no KV planes at all, so a quantized cache cannot reach them.
+    std::vector<std::uint32_t> kv_skip_layers;
     bool enable_mtp                         = false;
     std::int32_t kv_table_rows              = 1;
     std::uint32_t text_physical_page_groups = 0;
@@ -35,6 +40,10 @@ struct PagedKVCacheLayout {
     std::int32_t head_dim     = 0;
     DType dtype               = DType::BF16;
     std::int32_t quant_group  = 0;
+    // Storage dtype per full-attention layer. A quantized cache may keep some
+    // layers at the model dtype (--kv-cache-dtype-skip-layers), so the pool is
+    // not necessarily homogeneous; dtype above is the cache's nominal setting.
+    std::vector<DType> layer_dtypes;
 
     [[nodiscard]] std::size_t payload_bytes() const noexcept { return pool.payload_bytes(); }
 };
@@ -90,6 +99,11 @@ private:
     std::int32_t head_dim_     = 0;
     DType dtype_               = DType::BF16;
     std::int32_t quant_group_  = 0;
+    std::vector<DType> layer_dtypes_;
+
+    [[nodiscard]] DType layer_dtype(std::uint32_t layer) const noexcept {
+        return layer < layer_dtypes_.size() ? layer_dtypes_[layer] : dtype_;
+    }
 };
 
 struct DecoderStateLayout {

@@ -18,14 +18,16 @@
 #include <math_constants.h>
 
 #include "ops/kernel/gqa_attention_prefill_common.cuh"
+#include "ops/kernel/gqa_attention_kv_quant.cuh"
 
 namespace ninfer::ops {
 
-template <typename Geometry, typename Metadata>
+template <typename Geometry, typename Metadata, typename CacheT = __nv_bfloat16>
 __global__ void gqa_attention_prefill_fill_bf16_kernel(
     const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
     const std::int32_t* __restrict__ positions, Metadata metadata,
-    __nv_bfloat16* __restrict__ cache_k, __nv_bfloat16* __restrict__ cache_v, std::int32_t width) {
+    CacheT* __restrict__ cache_k, CacheT* __restrict__ cache_v, std::int32_t width) {
+    constexpr bool kFp8Cache = GqaKvIsFp8<CacheT>::value;
     constexpr int VecElems = 8; // 8 bf16 == 16 B, matching the cache row alignment.
     const int tokens       = metadata.valid_tokens(width);
     const std::int64_t idx = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -45,23 +47,25 @@ __global__ void gqa_attention_prefill_fill_bf16_kernel(
     const std::int64_t src_off =
         static_cast<std::int64_t>(d) +
         static_cast<std::int64_t>(kGqaPrefillHeadDim) * (kv_head + Geometry::KVHeads * token);
-    const int4 k_value = load_vec<int4>(&k[src_off]);
-    const int4 v_value = load_vec<int4>(&v[src_off]);
-
     physical_page = __shfl_sync(0xffffffffu, physical_page, 0);
 
     const std::int64_t cache_off = paged_kv_element_offset<kGqaPrefillHeadDim, Geometry::KVHeads>(
         physical_page, kv_head, position & kPagedKVPageMask, d);
-    store_vec(&cache_k[cache_off], k_value);
-    store_vec(&cache_v[cache_off], v_value);
+    if constexpr (kFp8Cache) {
+        gqa_kv_store_fp8x8(&cache_k[cache_off], &k[src_off]);
+        gqa_kv_store_fp8x8(&cache_v[cache_off], &v[src_off]);
+    } else {
+        store_vec(&cache_k[cache_off], load_vec<int4>(&k[src_off]));
+        store_vec(&cache_v[cache_off], load_vec<int4>(&v[src_off]));
+    }
 }
 
 // Stage one [Bc, D] K or V tile from the per-kv-head contiguous cache into the
 // swizzled smem buffer. Keys beyond max_query_abs (which the causal mask always
 // drops) are zeroed so the padded/uninitialized cache tail never feeds NaNs into
 // the tensor cores. Mirrors FA's predicated K/V cp.async + Clear_OOB path.
-template <typename Geometry>
-__device__ __forceinline__ void gqa_prefill_stage_kv(__nv_bfloat16* dst, const __nv_bfloat16* cache,
+template <typename Geometry, typename CacheT = __nv_bfloat16>
+__device__ __forceinline__ void gqa_prefill_stage_kv(__nv_bfloat16* dst, const CacheT* cache,
                                                      int kv_head, int k0, int max_query_abs,
                                                      int physical_page, int tid) {
     constexpr int D         = kGqaPrefillHeadDim;
@@ -70,16 +74,25 @@ __device__ __forceinline__ void gqa_prefill_stage_kv(__nv_bfloat16* dst, const _
     constexpr int VecPerRow = D / 8; // 8 bf16 per 16B cp.async
     const bool full_tile    = (k0 + Bc - 1) <= max_query_abs;
     // Block base pointer computed once (int64); per-element offsets stay 32-bit.
-    const __nv_bfloat16* cache_block =
+    constexpr bool kFp8Cache = GqaKvIsFp8<CacheT>::value;
+    const CacheT* cache_block =
         cache + paged_kv_element_offset<kGqaPrefillHeadDim, Geometry::KVHeads>(
                     physical_page, kv_head, k0 & kPagedKVPageMask, 0);
+    // e4m3 codes are widened on the way into the swizzled tile; bf16 moves untouched.
+    const auto stage_one = [](__nv_bfloat16* p, const CacheT* src) {
+        if constexpr (kFp8Cache) {
+            store_vec(p, gqa_kv_dequant_fp8x8_from(src));
+        } else {
+            cp_async<16, Cache::cg>(p, src);
+        }
+    };
     if (full_tile) {
 #pragma unroll
         for (int chunk = tid; chunk < Bc * VecPerRow; chunk += Threads) {
             const int key_l  = chunk >> 5;        // / VecPerRow (32)
             const int d      = (chunk & 31) << 3; // (chunk % 32) * 8
             __nv_bfloat16* p = &dst[key_l * D + gqa_prefill_swz(key_l, d)];
-            cp_async<16, Cache::cg>(p, &cache_block[key_l * D + d]);
+            stage_one(p, &cache_block[key_l * D + d]);
         }
     } else {
 #pragma unroll
@@ -88,7 +101,7 @@ __device__ __forceinline__ void gqa_prefill_stage_kv(__nv_bfloat16* dst, const _
             const int d      = (chunk & 31) << 3; // (chunk % 32) * 8
             __nv_bfloat16* p = &dst[key_l * D + gqa_prefill_swz(key_l, d)];
             if ((k0 + key_l) <= max_query_abs) {
-                cp_async<16, Cache::cg>(p, &cache_block[key_l * D + d]);
+                stage_one(p, &cache_block[key_l * D + d]);
             } else {
                 store_vec(p, make_int4(0, 0, 0, 0));
             }
@@ -99,11 +112,11 @@ __device__ __forceinline__ void gqa_prefill_stage_kv(__nv_bfloat16* dst, const _
 // FlashAttention-2 forward, one CTA per (query 64-row block, query head). Grid is
 // (ceil(tokens/64), q_heads). seqlen_q = tokens, seqlen_k = base_pos + tokens, with
 // bottom-right causal alignment (query row i sees keys [0, base_pos + i]).
-template <typename Geometry, typename Metadata>
+template <typename Geometry, typename Metadata, typename CacheT = __nv_bfloat16>
 __launch_bounds__(kGqaPrefillThreads, 1) __global__
     void gqa_attention_prefill_bf16_kernel(const __nv_bfloat16* __restrict__ q,
-                                           const __nv_bfloat16* __restrict__ cache_k,
-                                           const __nv_bfloat16* __restrict__ cache_v,
+                                           const CacheT* __restrict__ cache_k,
+                                           const CacheT* __restrict__ cache_v,
                                            Metadata metadata,
                                            const std::int32_t* __restrict__ positions, float scale,
                                            __nv_bfloat16* __restrict__ out, std::int32_t width) {
@@ -222,7 +235,7 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
 
     // Prologue: commit Q, then kick off K(0). The loop's wait<0> below drains both.
     ninfer::ops::cp_commit();
-    gqa_prefill_stage_kv<Geometry>(k_s, cache_k, kv_head, 0, max_query_abs, physical_page, tid);
+    gqa_prefill_stage_kv<Geometry, CacheT>(k_s, cache_k, kv_head, 0, max_query_abs, physical_page, tid);
     ninfer::ops::cp_commit();
 
     for (int kb = 0; kb < n_block_max; ++kb) {
@@ -233,7 +246,7 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
         __syncthreads();
 
         // Overlap V(kb) load against the QK MMA below.
-        gqa_prefill_stage_kv<Geometry>(v_s, cache_v, kv_head, k0, max_query_abs, physical_page,
+        gqa_prefill_stage_kv<Geometry, CacheT>(v_s, cache_v, kv_head, k0, max_query_abs, physical_page,
                                        tid);
         ninfer::ops::cp_commit();
 
@@ -389,7 +402,7 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
         // Prefetch K(kb+1) into the (now-free) K buffer, overlapping the PV MMA.
         if (kb + 1 < n_block_max) {
             physical_page = next_physical_page;
-            gqa_prefill_stage_kv<Geometry>(k_s, cache_k, kv_head, (kb + 1) * Bc, max_query_abs,
+            gqa_prefill_stage_kv<Geometry, CacheT>(k_s, cache_k, kv_head, (kb + 1) * Bc, max_query_abs,
                                            physical_page, tid);
             ninfer::ops::cp_commit();
         }

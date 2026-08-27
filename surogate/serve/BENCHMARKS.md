@@ -154,3 +154,78 @@ missing piece.
   (vLLM: explicit quantization/loader flags; llama.cpp: a source build;
   engine: the NVFP4 conversion). The engine's `surogate serve <input>`
   one-command story is the differentiator to protect.
+
+## Prefill, and why these rows understate the engine
+
+Every 100-user row above reports **decode tokens only**. That is roughly a
+fifth of the work: the 512-in/128-out shape puts four prompt tokens through
+the engine for each token it generates, and prefill was never on the board.
+The load generator now reports `prompt_tok_per_s` and `total_tok_per_s`
+alongside the decode figure.
+
+4B, 100 users, 90 s, fp8 KV, three workload shapes:
+
+| shape | prompt/out | prefill tok/s | decode tok/s | total tok/s | TTFT p50 |
+|---|---|---:|---:|---:|---:|
+| balanced | 512 / 128 | 11,674 | 2,918 | **14,593** | 1.6 s |
+| prefill-heavy | 2048 / 16 | **26,891** | 210 | **27,101** | 7.2 s |
+| decode-heavy | 128 / 512 | 413 | 1,296 | 1,709 | 3.8 s |
+
+Prefill throughput more than doubles from 512-token to 2048-token prompts, so
+the balanced row is nowhere near the engine's prefill ceiling. Any comparison
+that reports only aggregate output tok/s is measuring the workload's
+prompt:generation ratio as much as the engine.
+
+## FP8 KV cache (default since PATCHES.md #69)
+
+The KV cache stores e4m3 codes by default. `--kv-cache-dtype bf16` asks for the
+full-precision cache; `auto` means the engine's choice, which is fp8 (vLLM
+reads `auto` as the model dtype instead — a deliberate divergence).
+
+| model | cache | 100-user decode tok/s | KV size |
+|---|---|---:|---|
+| 0.8B | bf16 | 6,837 | 3.71 GiB |
+| 0.8B | fp8 | 6,529 | 2.96 GiB |
+| 27B @48 | bf16 | 594 | 46,016 tokens |
+| 27B @48 | fp8 | 582 | **92,096 tokens** (exactly 2x) |
+
+It is a memory feature, not a throughput one: a few percent of decode buys
+double the cache. It does not close the vLLM gap, and it was not expected to —
+the 27B is not KV-capacity-bound at 48 lanes, its bottleneck is prefill duty
+cycle. Note that vLLM's 27B row already runs `--kv-cache-dtype fp8`, so that
+comparison is now matched on cache precision where it previously was not.
+
+Only full-attention layers hold KV planes, so a quantized cache cannot reach a
+linear-attention layer (the 35B-A3B has 10 such layers out of 40).
+`--kv-cache-dtype-skip-layers L,...` holds named full-attention layers at bf16.
+
+## Fixed: mixed-round corruption past frontier 512 (PATCHES.md #71)
+
+Sustained decode-heavy load (128-token prompts, 512-token generations) used
+to corrupt the token stream of lanes that crossed frontier 512, and kill the
+worker. The mixed graph's cache key did not carry the frontier band, so a
+graph captured for the low band replayed after lanes crossed into the high
+one, truncating their attention. The balanced 512/128 rows above never
+reach this path — their lanes start past 512 — so no board number was
+affected, and none of them could have caught it. A decode-heavy row is the
+missing coverage.
+
+## Re-based: same card, same day, both engines (2026-08-27)
+
+The rows above were measured on GPU2 for the engine and an unrecorded card
+for vLLM. That matters more than it should: the same engine binary measures
+**6,498 tok/s on GPU2 and 9,972 on GPU3** on the 0.8B (both x8 PCIe, same NUMA
+node), and every card differs. So this pairing was re-run with each engine on
+the same card, back to back, on a quiet host, fp8 KV, 100 users, 90 s:
+
+| model | card | vLLM 0.27.1 | surogate serve | ratio |
+|---|---|---:|---:|---:|
+| Qwen3.5-0.8B | GPU4 | 5,677 | **7,666** | +35% |
+| Qwen3.5-4B | GPU5 | 3,926 | **4,359** | +11% |
+| Qwen3.8-27B | GPU6 | **1,041** | 827 | −21% |
+
+vLLM configs as in the footnotes above (27B: compressed-tensors, fp8 KV, 32
+seqs). vLLM's own numbers moved too (4B 3,390 → 3,926; 27B 688 → 1,041), so
+neither side of the earlier board was measured under today's conditions.
+Board numbers are only comparable within one card on one day; the card must
+be recorded with every row from here on.

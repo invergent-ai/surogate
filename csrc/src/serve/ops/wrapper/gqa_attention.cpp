@@ -63,12 +63,15 @@ void require_contiguous_nonnull(const Tensor& tensor, const char* op, const char
 }
 
 std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_heads, const char* op) {
-    if ((cache.dtype != DType::BF16 && cache.dtype != DType::I8) ||
+    if ((cache.dtype != DType::BF16 && cache.dtype != DType::I8 &&
+         cache.dtype != DType::FP8_E4M3FN) ||
         cache.num_kv_heads != kv_heads || cache.head_dim != kHeadDim) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or dtype");
     }
-    if (cache.dtype == DType::BF16 && cache.quant_group != 0) {
-        throw std::invalid_argument(std::string(op) + ": BF16 KV cache must not have quant_group");
+    if (cache.dtype != DType::I8 && cache.quant_group != 0) {
+        // e4m3 codes carry no scale plane, so like BF16 they must not name a group.
+        throw std::invalid_argument(std::string(op) +
+                                    ": unquantized or e4m3 KV cache must not have quant_group");
     }
     if (cache.dtype == DType::I8 && cache.quant_group != kQuantGroup) {
         throw std::invalid_argument(std::string(op) + ": I8 KV cache must use quant_group 64");
@@ -82,7 +85,7 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
         throw std::invalid_argument(std::string(op) + ": invalid KV cache capacity");
     }
 
-    const DType code_dtype = cache.dtype == DType::I8 ? DType::I8 : DType::BF16;
+    const DType code_dtype = cache.dtype;
     if (cache.k_pages.dtype != code_dtype || cache.v_pages.dtype != code_dtype) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache code dtype");
     }
@@ -98,9 +101,13 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
     require_shape(cache.block_table, logical_pages, 1, 1, 1, op, "block table");
     require_contiguous_nonnull(cache.block_table, op, "block table");
 
-    if (cache.dtype == DType::BF16) {
+    // Only the grouped int8 cache carries scale planes. BF16 stores values
+    // directly and e4m3 stores self-describing codes, so both must arrive
+    // without them.
+    if (cache.dtype != DType::I8) {
         if (cache.k_scale_pages.data != nullptr || cache.v_scale_pages.data != nullptr) {
-            throw std::invalid_argument(std::string(op) + ": BF16 KV cache must not have scales");
+            throw std::invalid_argument(std::string(op) +
+                                        ": unquantized or e4m3 KV cache must not have scales");
         }
         return static_cast<std::uint32_t>(capacity);
     }
@@ -120,12 +127,15 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
 
 std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int32_t kv_heads,
                                    const char* op) {
-    if ((cache.dtype != DType::BF16 && cache.dtype != DType::I8) ||
+    if ((cache.dtype != DType::BF16 && cache.dtype != DType::I8 &&
+         cache.dtype != DType::FP8_E4M3FN) ||
         cache.num_kv_heads != kv_heads || cache.head_dim != kHeadDim) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or dtype");
     }
-    if (cache.dtype == DType::BF16 && cache.quant_group != 0) {
-        throw std::invalid_argument(std::string(op) + ": BF16 KV cache must not have quant_group");
+    if (cache.dtype != DType::I8 && cache.quant_group != 0) {
+        // e4m3 codes carry no scale plane, so like BF16 they must not name a group.
+        throw std::invalid_argument(std::string(op) +
+                                    ": unquantized or e4m3 KV cache must not have quant_group");
     }
     if (cache.dtype == DType::I8 && cache.quant_group != kQuantGroup) {
         throw std::invalid_argument(std::string(op) + ": I8 KV cache must use quant_group 64");
@@ -140,7 +150,7 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
         throw std::invalid_argument(std::string(op) + ": invalid KV cache capacity");
     }
 
-    const DType code_dtype = cache.dtype == DType::I8 ? DType::I8 : DType::BF16;
+    const DType code_dtype = cache.dtype;
     if (cache.k_pages.dtype != code_dtype || cache.v_pages.dtype != code_dtype) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache code dtype");
     }
@@ -156,9 +166,13 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
     require_shape(cache.block_tables, logical_pages, table_rows, 1, 1, op, "block tables");
     require_contiguous_nonnull(cache.block_tables, op, "block tables");
 
-    if (cache.dtype == DType::BF16) {
+    // Only the grouped int8 cache carries scale planes. BF16 stores values
+    // directly and e4m3 stores self-describing codes, so both must arrive
+    // without them.
+    if (cache.dtype != DType::I8) {
         if (cache.k_scale_pages.data != nullptr || cache.v_scale_pages.data != nullptr) {
-            throw std::invalid_argument(std::string(op) + ": BF16 KV cache must not have scales");
+            throw std::invalid_argument(std::string(op) +
+                                        ": unquantized or e4m3 KV cache must not have scales");
         }
         return static_cast<std::uint32_t>(capacity);
     }
@@ -366,7 +380,9 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
                                                    std::int32_t batch_size, std::int32_t min_width,
                                                    std::int32_t max_width) {
     (void)kv_heads_for_q_heads(q_heads, "gqa_attention workspace");
-    if ((cache_dtype != DType::BF16 && cache_dtype != DType::I8) || batch_size <= 0 ||
+    if ((cache_dtype != DType::BF16 && cache_dtype != DType::I8 &&
+         cache_dtype != DType::FP8_E4M3FN) ||
+        batch_size <= 0 ||
         batch_size > kMaximumBatchSize || min_width <= 0 || max_width < min_width ||
         (batch_size > 1 && max_width > kMaximumVerifyTokens) || envelope.min_visible_keys == 0 ||
         envelope.min_visible_keys > envelope.max_visible_keys ||

@@ -13,6 +13,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 
 #include <cstdint>
 
@@ -73,5 +74,75 @@ __device__ __forceinline__ int4 gqa_kv_dequant_i8x8_from(const std::int8_t* code
     return make_int4(static_cast<int>(packed[0]), static_cast<int>(packed[1]),
                      static_cast<int>(packed[2]), static_cast<int>(packed[3]));
 }
+
+// ---------------------------------------------------------------------------
+// E4M3 KV codec. Unlike the int8 codec above there is no scale plane and no
+// group: a code is the raw e4m3 byte, which is what vLLM stores for
+// --kv-cache-dtype fp8 when no calibration is present (its k_scale/v_scale
+// default to 1.0, so its scaled_convert reduces to a cast). Values beyond
+// e4m3's 448 saturate rather than rescaling, matching that behaviour.
+//
+// Storage is 1 byte per element with no side planes, so an fp8 cache is
+// slightly smaller than the int8 one, which carries an FP16 scale per 64
+// values. Compute stays bf16: the codes are widened at stage time and fed to
+// the same MMA as the bf16 cache, so this buys memory traffic rather than
+// tensor-core throughput -- which is the side decode attention is short on.
+__device__ __forceinline__ std::uint8_t gqa_kv_fp8_code(float x) {
+    return static_cast<std::uint8_t>(
+        __nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3));
+}
+
+// Widen 8 e4m3 codes already held in a register pair. Splitting the load from
+// the conversion lets a caller issue several cache reads before spending ALU on
+// any of them, which matters because the e4m3 stage cannot use cp.async: it has
+// to touch the values, so the only latency hiding available is issuing the
+// loads early.
+__device__ __forceinline__ int4 gqa_kv_dequant_fp8x8_raw(int2 raw) {
+    const std::uint8_t* c = reinterpret_cast<const std::uint8_t*>(&raw);
+    unsigned packed[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const __half2_raw h = __nv_cvt_fp8x2_to_halfraw2(
+            static_cast<__nv_fp8x2_storage_t>(static_cast<std::uint16_t>(c[2 * i]) |
+                                              (static_cast<std::uint16_t>(c[2 * i + 1]) << 8)),
+            __NV_E4M3);
+        const __half2 hv = *reinterpret_cast<const __half2*>(&h);
+        packed[i]        = pack_bf16x2(__low2float(hv), __high2float(hv));
+    }
+    return make_int4(static_cast<int>(packed[0]), static_cast<int>(packed[1]),
+                     static_cast<int>(packed[2]), static_cast<int>(packed[3]));
+}
+
+// Widen 8 consecutive e4m3 codes into 8 bf16 packed as an int4, reading the
+// codes with one 64-bit load. Mirrors gqa_kv_dequant_i8x8_from so the staging
+// paths differ only in the codec they name. e4m3 is exactly representable in
+// fp16, so the intermediate conversion is lossless.
+__device__ __forceinline__ int4 gqa_kv_dequant_fp8x8_from(const std::uint8_t* codes8) {
+    return gqa_kv_dequant_fp8x8_raw(load_vec<int2>(codes8));
+}
+
+// Narrow 8 consecutive bf16 values to 8 e4m3 codes with one 16-byte load and
+// one 8-byte store, the append-side mirror of gqa_kv_dequant_fp8x8_from.
+__device__ __forceinline__ void gqa_kv_store_fp8x8(std::uint8_t* dst8,
+                                                   const __nv_bfloat16* src8) {
+    const int4 raw            = load_vec<int4>(src8);
+    const __nv_bfloat16* vals = reinterpret_cast<const __nv_bfloat16*>(&raw);
+    std::uint8_t codes[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) { codes[i] = gqa_kv_fp8_code(__bfloat162float(vals[i])); }
+    store_vec(dst8, *reinterpret_cast<const int2*>(codes));
+}
+
+// Selects the cache codec at compile time without pulling in <type_traits>:
+// the KV kernels are shared between the bf16 cache and the e4m3 one, and this
+// is the only thing that distinguishes their storage.
+template <typename T>
+struct GqaKvIsFp8 {
+    static constexpr bool value = false;
+};
+template <>
+struct GqaKvIsFp8<std::uint8_t> {
+    static constexpr bool value = true;
+};
 
 } // namespace ninfer::ops

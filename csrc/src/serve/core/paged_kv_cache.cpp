@@ -1,5 +1,8 @@
 #include "core/paged_kv_cache.h"
 
+#include <cstdio>
+#include <cstdlib>
+
 #include "core/device.h"
 
 #include <algorithm>

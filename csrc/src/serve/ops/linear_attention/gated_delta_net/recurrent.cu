@@ -45,9 +45,14 @@ void launch_recurrent_direct_fixed(const Tensor& q, const Tensor& k, const Tenso
     recurrent_bf16_direct_kernel<NormalizeQK><<<grid, block, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k.data),
         static_cast<const __nv_bfloat16*>(v.data), static_cast<const float*>(g.data),
-        static_cast<const float*>(beta.data), static_cast<const float*>(state_read.data),
-        static_cast<float*>(state_write.data), static_cast<__nv_bfloat16*>(out.data), q.ne[2],
-        heads, scale);
+        static_cast<const float*>(beta.data),
+        // The state pool stores GdnStateStorage (bf16). This launcher kept an
+        // fp32 cast after the storage change, so the direct form read the slot
+        // at twice its byte extent and wrote twice as much back — the source of
+        // the eager-prefill corruption (PATCHES.md #72).
+        static_cast<const GdnStateStorage*>(state_read.data),
+        static_cast<GdnStateStorage*>(state_write.data), static_cast<__nv_bfloat16*>(out.data),
+        q.ne[2], heads, scale);
     CUDA_CHECK(cudaGetLastError());
 }
 

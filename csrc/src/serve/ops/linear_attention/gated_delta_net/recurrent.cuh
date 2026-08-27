@@ -256,9 +256,10 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
                                  const __nv_bfloat16* __restrict__ k,
                                  const __nv_bfloat16* __restrict__ v, const float* __restrict__ g,
                                  const float* __restrict__ beta,
-                                 const float* __restrict__ state_read,
-                                 float* __restrict__ state_write, __nv_bfloat16* __restrict__ out,
-                                 std::int32_t width, head_map heads, float scale) {
+                                 const GdnStateStorage* __restrict__ state_read,
+                                 GdnStateStorage* __restrict__ state_write,
+                                 __nv_bfloat16* __restrict__ out, std::int32_t width, head_map heads,
+                                 float scale) {
     const int lane           = threadIdx.x;
     const int warp_id        = threadIdx.y;
     const std::uint32_t h_v  = static_cast<std::uint32_t>(blockIdx.x);
@@ -266,7 +267,8 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     const std::uint32_t dv_base =
         static_cast<std::uint32_t>(blockIdx.z * kBlockDv + warp_id * kDvPerWarp);
     const std::uint32_t dqk_base = static_cast<std::uint32_t>(lane * kQkPerLane);
-    const float* read_h = state_read + static_cast<std::int64_t>(h_v) * kStateDim * kStateDim;
+    const GdnStateStorage* read_h =
+        state_read + static_cast<std::int64_t>(h_v) * kStateDim * kStateDim;
 
     __align__(16) float state[kDvPerWarp][kQkPerLane];
 #pragma unroll
@@ -294,7 +296,7 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
                                        dv_base, lane, scale);
     }
 
-    float* write_h = state_write + static_cast<std::int64_t>(h_v) * kStateDim * kStateDim;
+    GdnStateStorage* write_h = state_write + static_cast<std::int64_t>(h_v) * kStateDim * kStateDim;
 #pragma unroll
     for (int r = 0; r < kDvPerWarp; ++r) {
         store_qk_lane(state[r], write_h + static_cast<std::int64_t>(dv_base + r) * kStateDim,

@@ -1588,10 +1588,9 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
 bool TextContext::try_mixed_graph_chunk(std::span<const int> full_ids, std::uint32_t begin,
                                         std::uint32_t nominal, const MixedDecodeSlice& decode,
                                         std::int32_t batch_bucket,
-                                        std::int32_t topology_class) {
+                                        std::int32_t band) {
     if (prefill_graph_family_ == nullptr || rope_delta_ != 0) { return false; }
     PrefillGraphFamily& family = *prefill_graph_family_;
-    if (family.dead()) { return false; }
     if (begin >= full_ids.size() || nominal == 0 || nominal > full_ids.size() - begin) {
         return false;
     }
@@ -1614,7 +1613,7 @@ bool TextContext::try_mixed_graph_chunk(std::span<const int> full_ids, std::uint
     mixed_graph_decode_          = decode;
 
     DecodeGraphExecutable* executable = family.ensure(
-        PrefillGraphFamily::mixed_key(chunk_bucket, batch_bucket, topology_class),
+        PrefillGraphFamily::mixed_key(chunk_bucket, batch_bucket, band),
         [this, chunk_bucket, batch_bucket] { mixed_graph_window(chunk_bucket, batch_bucket); });
     if (executable == nullptr) { return false; }
     executable->launch(ctx_.stream);
@@ -1645,7 +1644,7 @@ void TextContext::precapture_prefill_graphs(std::int32_t effective_chunk) {
 bool TextContext::try_prefill_graph_chunk(std::span<const int> ids, int t0, int len, int base_i,
                                           bool is_last, int checkpoint_rel) {
     PrefillGraphFamily& family = *prefill_graph_family_;
-    if (family.dead() || len <= 0) { return false; }
+    if (len <= 0) { return false; }
     const std::int32_t bucket = family.bucket_for(len);
     if (bucket < len) { return false; }
 

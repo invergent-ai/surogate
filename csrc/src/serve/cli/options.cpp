@@ -55,6 +55,7 @@ float parse_float(const char* text, std::string_view label, float minimum, float
 KvCacheStorage parse_kv_cache(std::string_view text) {
     if (text == "bf16") { return KvCacheStorage::BFloat16; }
     if (text == "int8") { return KvCacheStorage::Int8Group64; }
+    if (text == "fp8" || text == "fp8_e4m3") { return KvCacheStorage::Fp8E4M3; }
     throw std::invalid_argument("invalid kv-dtype: " + std::string(text));
 }
 

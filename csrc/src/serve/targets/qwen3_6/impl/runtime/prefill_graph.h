@@ -90,7 +90,6 @@ public:
         return rounded < prefill_chunk_ ? rounded : prefill_chunk_;
     }
 
-    [[nodiscard]] bool dead() const noexcept { return dead_; }
     [[nodiscard]] std::uint32_t kv_capacity() const noexcept { return kv_capacity_; }
     [[nodiscard]] std::int32_t scratch_state_slot() const noexcept { return scratch_state_slot_; }
     [[nodiscard]] std::size_t graph_bytes() const noexcept { return graph_bytes_; }
@@ -123,12 +122,13 @@ public:
 
     [[nodiscard]] static std::int32_t mixed_key(std::int32_t chunk_bucket,
                                                 std::int32_t batch_bucket,
-                                                std::int32_t topology_class) noexcept {
-        // The frontier band belongs in the key. The ordinary decode graphs bake
-        // a banded envelope {min+1, max+1} from their profile and key on the
-        // band; the mixed graph baked {1, kv_capacity} instead, which is the
-        // one structural difference between it and that proven path.
-        return (topology_class << 20) | mixed_key(chunk_bucket, batch_bucket);
+                                                std::int32_t band) noexcept {
+        // The frontier band belongs in the key: the captured body bakes the
+        // band's envelope into its decode attention grid, so a replay under a
+        // different band truncates attention for every lane past the captured
+        // max. `band` is the ordinary profile's index — not its topology class,
+        // which is zero for every profile and once left the band out of the key.
+        return (band << 20) | mixed_key(chunk_bucket, batch_bucket);
     }
 
     [[nodiscard]] static std::int32_t mixed_key(std::int32_t chunk_bucket,
@@ -149,14 +149,14 @@ public:
         // on one slot inside a single launch is a race; it corrupted about one
         // round in a hundred thousand and surfaced as a bad token far away.
         // Exact widths remove padding entirely. Capture is on demand, so only
-        // the widths that actually occur cost a graph, and the family's budget
-        // guard falls back to eager if they stop fitting.
+        // the widths that actually occur cost a graph; if one stops fitting the
+        // engine stops rather than degrading, and --enforce-eager is the way to
+        // ask for a graph-free run.
         const auto ceiling = static_cast<std::int32_t>(kMaximumConcurrency);
         return batch > ceiling ? ceiling : batch;
     }
 
     DecodeGraphExecutable* ensure(std::int32_t bucket, const std::function<void()>& body) {
-        if (dead_) { return nullptr; }
         auto found = buckets_.find(bucket);
         if (found != buckets_.end()) { return &found->second; }
         if (std::getenv("SUROGATE_SERVE_PREFILL_GRAPH_LOG") != nullptr) {
@@ -182,18 +182,22 @@ public:
             auto emplaced = buckets_.emplace(bucket, std::move(executable));
             return &emplaced.first->second;
         } catch (const std::exception& error) {
+            // Do not degrade to the eager body. A capture that runs out of
+            // memory leaves the device with no margin, and the other lazy
+            // allocators on this path (Marlin scratch, the derived weight
+            // planes) fail the same way a moment later without saying so —
+            // the observed sequence was a fallback that "worked" and then an
+            // illegal access one round later. Serving eagerly is a decision
+            // for the operator to make up front with --enforce-eager, so
+            // report the shortfall and stop while the state is still sound.
             std::fprintf(stderr,
-                         "prefill-graph: capture for bucket %d failed (%s); the eager prefill "
-                         "body serves all further chunks\n",
+                         "prefill-graph: capture for bucket %d failed: %s\n"
+                         "The device has no room left for CUDA Graphs at this configuration. "
+                         "Re-run with --enforce-eager to serve without them, or lower "
+                         "--max-num-seqs / --kv-capacity to leave room.\n",
                          bucket, error.what());
-            dead_ = true;
-            buckets_.clear();
-            (void)cudaGetLastError();
-            try {
-                device_.synchronize();
-            } catch (...) {}
-            (void)cudaGetLastError();
-            return nullptr;
+            std::fflush(stderr);
+            std::_Exit(EXIT_FAILURE);
         }
     }
 
@@ -211,7 +215,6 @@ private:
 
     std::map<std::int32_t, DecodeGraphExecutable> buckets_;
     std::size_t graph_bytes_ = 0;
-    bool dead_               = false;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail

@@ -84,7 +84,7 @@ std::int32_t gqa_small_t_launch_capacity(GqaExecutionEnvelope envelope, std::int
 }
 
 template <typename Geometry, int TokenTile, int WarpsPerCta, bool MultiBatch, bool Masked,
-          typename CacheInput>
+          typename CacheInput, typename CacheT = __nv_bfloat16>
 void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos, float scale,
                             PagedKVBatchLayerView cache, const GqaSmallTInvocation& invocation,
                             std::int32_t logical_capacity, std::int32_t splits, Tensor& partial_acc,
@@ -95,10 +95,11 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
     Tensor& cache_v = cache.v_pages;
     // bf16 kernel uses only static smem (no dynamic staging).
     gqa_attention_small_t_tc_partial_bf16_kernel<Geometry, TokenTile, WarpsPerCta, MultiBatch,
-                                                 Masked, CacheInput><<<grid, kBlock, 0, stream>>>(
+                                                 Masked, CacheInput,
+                                                 CacheT><<<grid, kBlock, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(q.data), input,
-        static_cast<const std::int32_t*>(pos.data), static_cast<__nv_bfloat16*>(cache_k.data),
-        static_cast<__nv_bfloat16*>(cache_v.data),
+        static_cast<const std::int32_t*>(pos.data), static_cast<CacheT*>(cache_k.data),
+        static_cast<CacheT*>(cache_v.data),
         static_cast<const std::int32_t*>(cache.block_tables.data),
         invocation.valid_columns == nullptr
             ? nullptr
@@ -241,7 +242,8 @@ bool gqa_attention_uses_small_t(std::int32_t tokens) { return tokens >= 1 && tok
 
 std::int32_t gqa_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
                                           DType cache_dtype, GqaExecutionEnvelope envelope) {
-    if (tokens < 1 || tokens > 6 || (cache_dtype != DType::BF16 && cache_dtype != DType::I8) ||
+    if (tokens < 1 || tokens > 6 || (cache_dtype != DType::BF16 && cache_dtype != DType::I8 &&
+         cache_dtype != DType::FP8_E4M3FN) ||
         envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys) {
         throw std::invalid_argument("gqa_attention split capacity: invalid profile");
     }
@@ -298,6 +300,11 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
                 launch_tc_partial_i8<Geometry, (TOKENS), MultiBatch, Masked>(                      \
                     q, input, pos, scale, cache, invocation, logical_capacity,                     \
                     implementation_window, splits, partial_acc, partial_m, partial_l, stream);     \
+            } else if (cache.dtype == DType::FP8_E4M3FN) {                                         \
+                launch_tc_partial_bf16<Geometry, (TOKENS), (WARPS), MultiBatch, Masked,            \
+                                       decltype(input), std::uint8_t>(                             \
+                    q, input, pos, scale, cache, invocation, logical_capacity, splits,             \
+                    partial_acc, partial_m, partial_l, stream);                                    \
             } else {                                                                               \
                 launch_tc_partial_bf16<Geometry, (TOKENS), (WARPS), MultiBatch, Masked>(           \
                     q, input, pos, scale, cache, invocation, logical_capacity, splits,             \

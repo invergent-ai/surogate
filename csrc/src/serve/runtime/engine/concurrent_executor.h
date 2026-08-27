@@ -17,6 +17,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+
+#include "core/limits.h"
 #include <deque>
 #include <exception>
 #include <memory>
@@ -1098,8 +1100,39 @@ private:
                 finish_reasons[row] = FinishReason::Cancelled;
                 continue;
             }
-            const OutputDecision decision = request->output.preview(
-                row_tokens, request->budget->remaining(), request->budget->limit_reason());
+            OutputDecision decision{};
+            try {
+                decision = request->output.preview(row_tokens, request->budget->remaining(),
+                                                   request->budget->limit_reason());
+            } catch (const std::exception& error) {
+                // Name the row before the worker dies: which lane, how deep, and
+                // the token ids it just produced. Cheap, and it is what turned a
+                // "mixed rounds corrupt sometimes" report into a root cause.
+                std::string ids;
+                for (const TokenId id : row_tokens) {
+                    ids += std::to_string(id);
+                    ids += ' ';
+                }
+                std::fprintf(stderr,
+                             "decode round row %zu/%zu lane %u gen=%zu tokens=[ %s]: %s (%s)\n",
+                             row, lanes.size(), lane, request->generated.size(), ids.c_str(),
+                             error.what(),
+                             instance_.program->last_mixed_round_description(row).c_str());
+                std::fflush(stderr);
+                // SUROGATE_SERVE_SURVIVE_CORRUPTION=1: a diagnostic mode that
+                // fails only the corrupted request and keeps serving, so one
+                // run collects many attributed events. Never a production
+                // setting — a corrupted stream must be fatal by default.
+                static const bool survive =
+                    std::getenv("SUROGATE_SERVE_SURVIVE_CORRUPTION") != nullptr;
+                if (!survive) { throw; }
+                (void)request->output.preview_terminal(FinishReason::Cancelled);
+                accepted[row]       = 0;
+                terminal[row]       = 1;
+                finish_reasons[row] = FinishReason::Cancelled;
+                cancelled[row]      = 1;
+                continue;
+            }
             if (decision.accepted_tokens == 0 || decision.accepted_tokens > count ||
                 (!decision.finished() && decision.accepted_tokens != count)) {
                 throw std::logic_error("output policy returned an invalid licensed prefix");

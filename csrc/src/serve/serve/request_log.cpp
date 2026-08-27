@@ -92,7 +92,12 @@ std::string tool_choice_name(const ToolChoice& choice) {
 }
 
 const char* kv_cache_name(ninfer::KvCacheStorage storage) {
-    return storage == ninfer::KvCacheStorage::BFloat16 ? "bf16" : "int8-group64";
+    switch (storage) {
+    case ninfer::KvCacheStorage::BFloat16: return "bf16";
+    case ninfer::KvCacheStorage::Int8Group64: return "int8-group64";
+    case ninfer::KvCacheStorage::Fp8E4M3: return "fp8-e4m3";
+    }
+    return "unknown";
 }
 
 const char* kv_capacity_mode_name(ninfer::KvCapacityMode mode) {

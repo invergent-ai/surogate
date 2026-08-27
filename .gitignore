@@ -37,4 +37,4 @@ jackalope/dist/
 watch-out/
 watch-run.yaml*
 csrc/build*
-
+models/**

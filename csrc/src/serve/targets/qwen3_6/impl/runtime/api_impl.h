@@ -188,6 +188,11 @@ bool Program<Variant>::mixed_round_supported(std::uint32_t prefill_lane) const n
 }
 
 template <>
+std::string Program<Variant>::last_mixed_round_description(std::size_t row) const {
+    return impl_->last_mixed_round_description(row);
+}
+
+template <>
 void Program<Variant>::set_round_burst_limit(std::uint32_t limit) noexcept {
     impl_->set_round_burst_limit(limit);
 }

@@ -72,7 +72,12 @@ void DecodeGraphDefinition::capture(cudaStream_t stream, const std::function<voi
     cudaError_t err = cudaStreamEndCapture(stream, &graph);
     if (err != cudaSuccess) {
         destroy_graph(graph);
-        CUDA_CHECK(err);
+        // Throw rather than abort. Both graph families are written to fall
+        // back to the eager body when a capture stops fitting, and an
+        // aborting check makes those recovery paths unreachable.
+        throw std::runtime_error("CUDA Graph capture failed: " +
+                                 std::string(cudaGetErrorName(err)) + ": " +
+                                 cudaGetErrorString(err));
     }
 
     graph_ = graph;
@@ -108,7 +113,13 @@ void DecodeGraphExecutable::instantiate(const DecodeGraphDefinition& definition)
     const cudaError_t err = cudaGraphInstantiate(&exec, definition.graph_, 0);
     if (err != cudaSuccess) {
         destroy_graph_exec(exec);
-        CUDA_CHECK(err);
+        // Instantiation allocates, so this is where a tight device fails, and
+        // it is recoverable: serving the shape eagerly is slower but correct.
+        // Aborting here killed a live server mid-round.
+        (void)cudaGetLastError();
+        throw std::runtime_error("CUDA Graph instantiation failed: " +
+                                 std::string(cudaGetErrorName(err)) + ": " +
+                                 cudaGetErrorString(err));
     }
     exec_ = exec;
 }
@@ -129,7 +140,15 @@ void DecodeGraphExecutable::update(const DecodeGraphDefinition& definition) {
 
 void DecodeGraphExecutable::upload(cudaStream_t stream) {
     if (!ready()) { throw std::logic_error("cannot upload an empty CUDA Graph executable"); }
-    CUDA_CHECK(cudaGraphUpload(exec_, stream));
+    // Upload commits the executable's device allocation, so it shares
+    // instantiate's failure mode and must stay recoverable for the same reason.
+    const cudaError_t err = cudaGraphUpload(exec_, stream);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        throw std::runtime_error("CUDA Graph upload failed: " +
+                                 std::string(cudaGetErrorName(err)) + ": " +
+                                 cudaGetErrorString(err));
+    }
 }
 
 void DecodeGraphExecutable::launch(cudaStream_t stream) {

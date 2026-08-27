@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <string>
 
 namespace ninfer {
 struct DeviceContext;
@@ -168,6 +169,10 @@ public:
     advance_prefill_mixed(std::uint32_t prefill_lane, std::span<const std::uint32_t> lanes,
                           std::span<const runtime::RoundBudget> budgets);
     [[nodiscard]] bool mixed_round_supported(std::uint32_t prefill_lane) const noexcept;
+    // One line describing the most recent mixed round for a given decode row:
+    // the band its graph was keyed on, the batch maximum frontier, and the
+    // row's own frontier. Used by the executor's corruption attribution.
+    [[nodiscard]] std::string last_mixed_round_description(std::size_t row) const;
     void set_round_burst_limit(std::uint32_t limit) noexcept;
     void resolve_prefill_lane(std::uint32_t lane, bool terminal);
     void resolve_pending_batch(std::span<const std::uint32_t> lanes,

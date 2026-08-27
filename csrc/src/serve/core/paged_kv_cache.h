@@ -136,6 +136,7 @@ private:
     std::vector<Tensor> planes_;
     Tensor block_tables_;
     std::vector<std::int32_t> free_page_ids_;
+
     std::vector<bool> row_in_use_;
     std::uint32_t entitled_pages_ = 0;
     std::uint32_t mapped_pages_   = 0;

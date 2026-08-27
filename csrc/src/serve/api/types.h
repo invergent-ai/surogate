@@ -29,6 +29,7 @@ inline constexpr std::size_t kDefaultMediaLiveBytes   = 2ULL << 30;
 enum class KvCacheStorage : std::uint8_t {
     BFloat16,
     Int8Group64,
+    Fp8E4M3,
 };
 
 enum class KvCapacityMode : std::uint8_t {
@@ -84,7 +85,15 @@ struct EngineOptions {
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
-    KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
+
+    // e4m3 by default: it halves the cache for the same token count (measured
+    // exactly 2x capacity on the 27B) at a few percent of throughput, and the
+    // headroom it returns is what keeps large lane counts off the memory cliff.
+    KvCacheStorage kv_cache            = KvCacheStorage::Fp8E4M3;
+    // Full-attention layer indices kept at the model dtype when kv_cache is
+    // quantized. Linear-attention layers hold no KV planes, so they are never
+    // candidates and need not be listed.
+    std::vector<std::uint32_t> kv_cache_skip_layers;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;

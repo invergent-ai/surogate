@@ -2133,6 +2133,17 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
     return consume_ordinary_round(launch_ordinary_round(lanes, budgets));
 }
 
+std::string ProgramImplCore::last_mixed_round_description(std::size_t row) const {
+    const LastMixedRound& last = last_mixed_round;
+    std::string out = "last mixed round: band=" + std::to_string(last.band) +
+                      " graph=" + (last.graph_hit ? "1" : "0") +
+                      " max_frontier=" + std::to_string(last.maximum_frontier);
+    if (row < last.row_frontiers.size()) {
+        out += " row_frontier=" + std::to_string(last.row_frontiers[row]);
+    }
+    return out;
+}
+
 bool ProgramImplCore::mixed_round_supported(std::uint32_t prefill_lane) const noexcept {
     if (speculative_backend != SpeculativeBackend::None || prefill_lane >= max_concurrency) {
         return false;
@@ -2184,6 +2195,12 @@ ProgramImplCore::advance_prefill_mixed(std::uint32_t prefill_lane,
 
     const auto start        = Clock::now();
     const std::int32_t rows = static_cast<std::int32_t>(lanes.size());
+    last_mixed_round.maximum_frontier = maximum_frontier;
+    last_mixed_round.band             = -1;
+    last_mixed_round.graph_hit        = false;
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        last_mixed_round.row_frontiers[row] = sequences[lanes[row]].execution_frontier;
+    }
     try {
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence            = sequences[lanes[row]];
@@ -2317,11 +2334,26 @@ ProgramImplCore::advance_prefill_mixed(std::uint32_t prefill_lane,
                                          mixed_profile.max_execution_frontier + 1};
                 bucket_slice.hidden             = ordinary.hidden.slice(1, 0, batch_bucket);
                 bucket_slice.logits             = ordinary.logits.slice(1, 0, batch_bucket);
+                // The band is part of the key. This used to pass
+                // mixed_profile.topology_class, which graph_profiles_through
+                // never sets, so it was zero for every band and the key never
+                // carried the band at all: the first mixed graph captured for a
+                // (chunk, batch) pair — captured while every lane was young,
+                // with the low band's max_visible baked into its attention grid
+                // — replayed for the rest of the process, truncating attention
+                // for every lane that later crossed the band edge. That was the
+                // decode-heavy corruption: victims were always lanes past 512,
+                // always in mixed rounds, and runs whose lanes never crossed a
+                // band (long prompts, short generations, a moved edge) were
+                // clean. The profile's index identifies the band exactly.
+                const auto mixed_band = static_cast<std::int32_t>(
+                    &mixed_profile - ordinary_graphs.profiles.data());
+                last_mixed_round.band = mixed_band;
                 if (card.try_mixed_graph_chunk(
                         std::span<const TokenId>(staged.prompt.token_ids), staged.cursor,
-                        graph_nominal, bucket_slice, batch_bucket,
-                        static_cast<std::int32_t>(mixed_profile.topology_class))) {
-                    graph_hit = true;
+                        graph_nominal, bucket_slice, batch_bucket, mixed_band)) {
+                    graph_hit                  = true;
+                    last_mixed_round.graph_hit = true;
                     chunk     = schedule::PrefillChunkResult{.processed_tokens = graph_nominal,
                                                              .finalized        = false};
                 }

@@ -231,7 +231,7 @@ public:
     [[nodiscard]] bool try_mixed_graph_chunk(std::span<const int> full_ids, std::uint32_t begin,
                                              std::uint32_t nominal, const MixedDecodeSlice& decode,
                                              std::int32_t batch_bucket,
-                                             std::int32_t topology_class);
+                                             std::int32_t band);
     void mixed_graph_window(std::int32_t chunk_bucket, std::int32_t batch_bucket);
 
     [[nodiscard]] PrefillChunkResult prefill_chunk(std::span<const int> full_ids,

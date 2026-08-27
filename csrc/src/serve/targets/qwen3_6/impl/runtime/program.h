@@ -19,6 +19,7 @@
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
 
 #include <cstdint>
+#include <string>
 #include <array>
 #include <memory>
 #include <optional>
@@ -232,6 +233,7 @@ public:
     advance_prefill_mixed(std::uint32_t prefill_lane, std::span<const std::uint32_t> lanes,
                           std::span<const runtime::RoundBudget> budgets);
     [[nodiscard]] bool mixed_round_supported(std::uint32_t prefill_lane) const noexcept;
+    [[nodiscard]] std::string last_mixed_round_description(std::size_t row) const;
     void set_round_burst_limit(std::uint32_t limit) noexcept { round_burst_limit = limit; }
     static void burst_egress_copy_host(void* user) noexcept;
     void resolve_prefill_lane(std::uint32_t lane, bool terminal);
@@ -259,6 +261,16 @@ public:
     const SpeculativeBackend speculative_backend;
     const DType kv_dtype;
     const std::int32_t kv_quant_group;
+    // Shape of the most recent mixed round, kept for the corruption
+    // attribution line: which band the graph was captured for, the batch's
+    // maximum frontier, and each row's own frontier.
+    struct LastMixedRound {
+        std::uint32_t maximum_frontier = 0;
+        std::int32_t band              = -1;
+        bool graph_hit                 = false;
+        std::array<std::uint32_t, kMaximumConcurrency> row_frontiers{};
+    };
+    LastMixedRound last_mixed_round{};
     const ProposalHead proposal_head;
     const bool vision_enabled;
     const bool use_cuda_graph;

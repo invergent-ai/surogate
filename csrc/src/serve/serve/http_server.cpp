@@ -17,6 +17,11 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include "ops/linear/marlin/marlin_plane.h"
+#include "ops/linear/w8a8/w8fp8_plane.h"
+#include <cuda_runtime.h>
+#include <cstdlib>
+#include <sstream>
 
 namespace ninfer::serve {
 namespace {
@@ -165,6 +170,16 @@ void HttpServer::log_request_error(const RequestLogContext& context, const std::
 
 void HttpServer::log_throughput(const ThroughputReport& report) {
     log_line(format_throughput(report));
+    if (std::getenv("SUROGATE_SERVE_MEM_TRACE") != nullptr) {
+        std::size_t free_bytes = 0, total_bytes = 0;
+        cudaMemGetInfo(&free_bytes, &total_bytes);
+        const std::size_t derived = ninfer::ops::detail::w8_derived_plane_bytes();
+        const std::size_t marlin  = ninfer::ops::detail::marlin_plane_bytes();
+        std::ostringstream trace;
+        trace << "mem-trace derived-planes=" << (derived >> 20) << " MiB marlin-planes="
+              << (marlin >> 20) << " MiB free=" << (free_bytes >> 20) << " MiB";
+        log_line(trace.str());
+    }
     request_jsonl_.write_throughput(report);
 }
 

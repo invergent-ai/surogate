@@ -10,21 +10,53 @@
 #include <math_constants.h>
 
 #include "ops/kernel/gqa_attention_decode.cuh"
+#include "ops/kernel/gqa_attention_kv_quant.cuh"
 
 #include <cstdint>
 
+
 namespace ninfer::ops {
 
+// CacheT selects the KV cache storage: __nv_bfloat16 for the full-precision
+// cache, std::uint8_t for the e4m3 one. Only the append and the tile stage
+// differ -- the codes are widened to bf16 on the way into shared memory, so the
+// MMA path, the swizzle and the shared-memory budget are identical either way.
+// That keeps this a bandwidth change rather than a second attention kernel,
+// which is the distinction that matters: decode here runs at about half its
+// KV-read roofline, so halving the bytes is the win, and the int8 cache needs
+// its own kernel only because it feeds IMMA instead.
 template <typename Geometry, int TokenTile, int WarpsPerCta, bool MultiBatch, bool Masked,
-          typename CacheInput>
+          typename CacheInput, typename CacheT = __nv_bfloat16>
 __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_kernel(
-    const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, __nv_bfloat16* cache_k,
-    __nv_bfloat16* cache_v, const std::int32_t* block_tables, const std::int32_t* valid_columns,
+    const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, CacheT* cache_k,
+    CacheT* cache_v, const std::int32_t* block_tables, const std::int32_t* valid_columns,
     const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity, float scale,
     __nv_bfloat16* partial_acc, float* partial_m, float* partial_l) {
     static_assert(TokenTile >= 1 && TokenTile <= 6);
     static_assert(WarpsPerCta >= 1 && WarpsPerCta <= 4);
+
+    constexpr bool kFp8Cache = GqaKvIsFp8<CacheT>::value;
+    static_assert(kFp8Cache || sizeof(CacheT) == sizeof(__nv_bfloat16),
+                  "KV cache storage must be bf16 or e4m3 codes");
+
+    // One 8-value K/V pair from the cache into the swizzled shared tile. The
+    // bf16 cache moves the bytes asynchronously and untouched; the e4m3 cache
+    // has to widen them, so it loads and converts inline. That costs the
+    // async stage, but the surrounding loop commits and waits on every tile
+    // rather than pipelining across them, so nothing was being overlapped.
+    const auto stage_cache_pair = [](__nv_bfloat16* k_dst, __nv_bfloat16* v_dst,
+                                     const CacheT* k_src, const CacheT* v_src) {
+        if constexpr (kFp8Cache) {
+            const int2 k_raw = load_vec<int2>(k_src);
+            const int2 v_raw = load_vec<int2>(v_src);
+            store_vec(k_dst, gqa_kv_dequant_fp8x8_raw(k_raw));
+            store_vec(v_dst, gqa_kv_dequant_fp8x8_raw(v_raw));
+        } else {
+            ninfer::ops::cp_async<16>(k_dst, k_src);
+            ninfer::ops::cp_async<16>(v_dst, v_src);
+        }
+    };
 
     constexpr int Wc      = WarpsPerCta;
     constexpr int Br      = Wc * 16;
@@ -160,8 +192,13 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
                 physical_page     = __shfl_sync(FullMask, physical_page, 0);
                 const std::int64_t cache_off =
                     gqa_cache_index<Geometry>(physical_page, kv_head, d, p_tok & kPagedKVPageMask);
-                store_vec(&cache_k[cache_off], load_vec<int4>(&input.k[new_off]));
-                store_vec(&cache_v[cache_off], load_vec<int4>(&input.v[new_off]));
+                if constexpr (kFp8Cache) {
+                    gqa_kv_store_fp8x8(&cache_k[cache_off], &input.k[new_off]);
+                    gqa_kv_store_fp8x8(&cache_v[cache_off], &input.v[new_off]);
+                } else {
+                    store_vec(&cache_k[cache_off], load_vec<int4>(&input.k[new_off]));
+                    store_vec(&cache_v[cache_off], load_vec<int4>(&input.v[new_off]));
+                }
             }
         }
         __syncthreads();
@@ -238,14 +275,12 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
                     } else {
                         const std::int64_t off = gqa_cache_index<Geometry>(
                             physical_page, kv_head, d, key & kPagedKVPageMask);
-                        ninfer::ops::cp_async<16>(k_dst, &cache_k[off]);
-                        ninfer::ops::cp_async<16>(v_dst, &cache_v[off]);
+                        stage_cache_pair(k_dst, v_dst, &cache_k[off], &cache_v[off]);
                     }
                 } else {
                     const std::int64_t off = gqa_cache_index<Geometry>(physical_page, kv_head, d,
                                                                        key & kPagedKVPageMask);
-                    ninfer::ops::cp_async<16>(k_dst, &cache_k[off]);
-                    ninfer::ops::cp_async<16>(v_dst, &cache_v[off]);
+                    stage_cache_pair(k_dst, v_dst, &cache_k[off], &cache_v[off]);
                 }
             } else {
                 store_vec(k_dst, make_int4(0, 0, 0, 0));

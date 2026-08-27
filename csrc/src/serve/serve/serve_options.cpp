@@ -7,6 +7,8 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <vector>
+#include <algorithm>
 #include <string_view>
 
 namespace ninfer::serve {
@@ -47,18 +49,46 @@ std::uint64_t parse_u64(const char* text, const char* label) {
 
 KvCacheStorage parse_kv_dtype(const char* text) {
     const std::string value(text);
-    // "auto" is vLLM's spelling for "the model's own dtype", which here is bf16.
-    if (value == "bf16" || value == "auto") { return KvCacheStorage::BFloat16; }
+    // "auto" means "let the engine choose", and the engine chooses e4m3, which
+    // is also the default when the flag is absent. This is a deliberate
+    // divergence: vLLM reads auto as the model's own dtype. Ask for bf16 by
+    // name to get a full-precision cache.
+    if (value == "bf16") { return KvCacheStorage::BFloat16; }
+    if (value == "auto") { return KvCacheStorage::Fp8E4M3; }
     if (value == "int8") { return KvCacheStorage::Int8Group64; }
-    // fp8 KV is vLLM's other common setting and this engine has no fp8 KV path;
-    // say that rather than reporting a generic parse failure, because a command
-    // line copied from vLLM will land here.
-    if (value == "fp8" || value == "fp8_e4m3" || value == "fp8_e5m2") {
-        throw std::invalid_argument("kv-cache-dtype " + value +
-                                    " is not supported; this engine serves bf16 KV (auto) or "
-                                    "int8, and int8 costs accuracy");
+    // vLLM spells the e4m3 cache both ways and treats them as one setting.
+    if (value == "fp8" || value == "fp8_e4m3") { return KvCacheStorage::Fp8E4M3; }
+    // e5m2 trades mantissa for range that KV tensors do not use; the engine
+    // stores e4m3 only, so name the difference rather than parse-failing.
+    if (value == "fp8_e5m2") {
+        throw std::invalid_argument("kv-cache-dtype fp8_e5m2 is not supported; this engine stores "
+                                    "e4m3 (use fp8 or fp8_e4m3)");
     }
-    throw std::invalid_argument("invalid kv-cache-dtype: " + value + " (expected auto|bf16|int8)");
+    throw std::invalid_argument("invalid kv-cache-dtype: " + value +
+                                " (expected auto|bf16|fp8|fp8_e4m3|int8)");
+}
+
+std::vector<std::uint32_t> parse_kv_skip_layers(const char* text) {
+    std::vector<std::uint32_t> layers;
+    const std::string value(text);
+    std::size_t begin = 0;
+    while (begin <= value.size()) {
+        const std::size_t comma = value.find(',', begin);
+        const std::string item =
+            value.substr(begin, comma == std::string::npos ? std::string::npos : comma - begin);
+        if (!item.empty()) {
+            layers.push_back(static_cast<std::uint32_t>(
+                parse_nonnegative_int(item.c_str(), "kv-cache-dtype-skip-layers")));
+        }
+        if (comma == std::string::npos) { break; }
+        begin = comma + 1;
+    }
+    if (layers.empty()) {
+        throw std::invalid_argument("--kv-cache-dtype-skip-layers needs at least one layer index");
+    }
+    std::sort(layers.begin(), layers.end());
+    layers.erase(std::unique(layers.begin(), layers.end()), layers.end());
+    return layers;
 }
 
 KvCapacityPolicy parse_kv_capacity(const char* text) {
@@ -81,7 +111,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--media-preprocess-threads N] "
            "[--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
-           "[--kv-cache-dtype auto|int8] [--spec mtp|dflash --draft-tokens N] "
+           "[--kv-cache-dtype auto|fp8|int8] [--kv-cache-dtype-skip-layers L,...] "
+           "[--spec mtp|dflash --draft-tokens N] "
            "[--default-max-tokens N] "
            "[--vision] [--enforce-eager] [--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
@@ -104,6 +135,12 @@ std::string serve_usage_text(const char* argv0) {
            "       --kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
+           "       --kv-cache-dtype defaults to fp8 (e4m3), halving the cache; auto means the\n"
+           "         same, and bf16 asks for a full-precision cache. Note vLLM reads auto as\n"
+           "         the model dtype instead. Only\n"
+           "         full-attention layers hold a KV cache, so linear-attention layers are\n"
+           "         never quantized. --kv-cache-dtype-skip-layers holds named\n"
+           "         full-attention layers at bf16 (comma-separated indices)\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
@@ -225,6 +262,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
         } else if (arg == "--kv-cache-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-cache-dtype"));
+        } else if (arg == "--kv-cache-dtype-skip-layers") {
+            options.kv_cache_skip_layers =
+                parse_kv_skip_layers(require_value("--kv-cache-dtype-skip-layers"));
         } else if (arg == "--spec") {
             options.speculative.backend =
                 product::parse_speculative_backend(require_value("--spec"));
