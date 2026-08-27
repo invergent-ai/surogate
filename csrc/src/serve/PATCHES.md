@@ -2805,3 +2805,42 @@ takes ~150 ms end to end on the 27B and its GEMMs, even at the old speed,
 are only ~55 ms of that. The prefill family timer's `in_proj` bucket (50 %
 of the GDN family) therefore holds more than the GEMM; the next step is the
 post-#76 breakdown, taken eager on the same shape.
+
+## 77
+
+**Long prompts killed the worker: the mixed prefill window was mapped past the request's KV entitlement (2026-08-27).**
+
+**Symptom.** Four users sending ~2,200-token prompts (or a hundred sending
+~4,200) took the worker loop down within seconds: `engine worker loop fatal:
+Paged KV materialize extent is outside entitlement [kind=mixed …]`, every
+in-flight request failed. The board's 2,146-token loadgen prompts never hit
+it.
+
+**Root cause.** #55 made the mixed round map the whole 128-rounded chunk
+window before replay — the graph writes its pad columns, and unmapped pad
+columns were the mixed-round corruption. The window was clamped to the KV
+capacity but not to what the request owns: admission reserves
+`pages_for_tokens(prompt + output − 1)` in 64-token pages. Whenever the
+tail chunk's 128-rounding crosses into a page the request does not own
+(prompt length mod 128 decides), `materialize_pages` throws and the round
+dies. 2,146 → tail 98 → rounds to exactly the last owned page; 2,200 →
+tail 152 → one page past it.
+
+**Fix.** `request_plan_impl.h` reserves
+`max(prompt + output − 1, round_up(prompt, 128))` (capped at capacity) — at
+most two extra pages per request — so the graph's window always lies inside
+the entitlement. The throw stays as the invariant check.
+
+**Verification.** Before the fix, four users with ~2,200-token
+prompts killed the worker within seconds (3 ok / 304 errors) and a hundred
+users with ~4,200-token prompts within one round (1 ok / 16,861 errors).
+After it: 2,200 tokens at 4 users — 80 ok, 0 errors; 4,200 tokens at 100
+users, `--max-num-batched-tokens 4096` — 201 ok, 0 errors, 6,869 prompt
+tok/s (27B, GPU7). The throw now reports the requested, mapped and entitled
+page counts so a recurrence is diagnosable from the log line.
+
+Also in this change: the prefill family timer gained a seven-way GDN
+sub-split (norm+control, input projection, conv, column extract, chunked
+scan, gated norm, output projection) in both prefill paths — the plain
+`run_layers` path had no sub-laps at all, which is why one-user runs printed
+none.

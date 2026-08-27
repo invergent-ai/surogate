@@ -858,9 +858,59 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     Variant::attention_output_projection(a.view({kCfg.q_size, T}), *w.o_proj, x, ph, work_, s);
 }
 
+struct PrefillFamilyTimer {
+    bool enabled = std::getenv("SUROGATE_SERVE_PREFILL_TIMING") != nullptr;
+    cudaEvent_t begin{}, attn{}, mlp_full{}, gdn{}, mlp_gdn{};
+    cudaEvent_t g_ctrl{}, g_proj{}, g_conv{}, g_extract{}, g_scan{}, g_norm{}, g_out{}, sub_begin{};
+    double t_attn = 0, t_mlp_full = 0, t_gdn = 0, t_mlp_gdn = 0;
+    double t_g_ctrl = 0, t_g_proj = 0, t_g_conv = 0, t_g_extract = 0, t_g_scan = 0, t_g_norm = 0,
+           t_g_out = 0;
+    std::uint64_t chunks = 0, tokens = 0;
+    PrefillFamilyTimer() {
+        if (!enabled) { return; }
+        for (cudaEvent_t* e : {&begin, &attn, &mlp_full, &gdn, &mlp_gdn, &g_ctrl, &g_proj, &g_conv,
+                               &g_extract, &g_scan, &g_norm, &g_out, &sub_begin}) {
+            cudaEventCreateWithFlags(e, cudaEventDefault);
+        }
+    }
+};
+inline PrefillFamilyTimer& prefill_family_timer() {
+    static PrefillFamilyTimer timer;
+    return timer;
+}
+inline void print_gdn_subsplit(const PrefillFamilyTimer& timer, const char* tag) {
+    const double g = timer.t_g_ctrl + timer.t_g_proj + timer.t_g_conv + timer.t_g_extract +
+                     timer.t_g_scan + timer.t_g_norm + timer.t_g_out;
+    if (g <= 0 || timer.chunks == 0) { return; }
+    std::fprintf(stderr,
+                 "%s gdn sub-split: norm+ctrl %.1f%% in_proj %.1f%% conv %.1f%% extract %.1f%% "
+                 "chunked scan %.1f%% gated norm %.1f%% out_proj %.1f%% (%.2f ms/chunk)\n",
+                 tag, 100 * timer.t_g_ctrl / g, 100 * timer.t_g_proj / g, 100 * timer.t_g_conv / g,
+                 100 * timer.t_g_extract / g, 100 * timer.t_g_scan / g, 100 * timer.t_g_norm / g,
+                 100 * timer.t_g_out / g, g / timer.chunks);
+}
+
 void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
+    // Sub-laps for the prefill family timer; they use their own begin event so the caller's
+    // family lap stays intact.
+    auto& ftimer                          = prefill_family_timer();
+    cudaStreamCaptureStatus sub_capturing = cudaStreamCaptureStatusNone;
+    if (ftimer.enabled) { cudaStreamIsCapturing(s, &sub_capturing); }
+    const bool sub_timing = ftimer.enabled && ph == Phase::Prefill &&
+                            sub_capturing == cudaStreamCaptureStatusNone;
+    float sub_ctrl = 0, sub_proj = 0, sub_conv = 0, sub_extract = 0, sub_scan = 0, sub_norm = 0,
+          sub_out = 0;
+    const auto sub_lap = [&](cudaEvent_t to, float& into) {
+        cudaEventRecord(to, s);
+        cudaEventSynchronize(to);
+        float ms = 0;
+        cudaEventElapsedTime(&ms, ftimer.sub_begin, to);
+        into += ms;
+        cudaEventRecord(ftimer.sub_begin, s);
+    };
+    if (sub_timing) { cudaEventRecord(ftimer.sub_begin, s); }
 
     const auto control = workspace_recipe::gdn_control<TextConfig>(work_, T);
     Tensor h           = control.hidden;
@@ -877,6 +927,7 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         ops::mask_columns_zero(beta, *graph_pad_valid_, s);
     }
 
+    if (sub_timing) { sub_lap(ftimer.g_ctrl, sub_ctrl); }
     const auto projection = workspace_recipe::gdn_projection<TextConfig>(work_, T);
     Tensor z              = projection.output_gate.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
     Tensor qc             = projection.query;
@@ -917,6 +968,7 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         const auto conv = workspace_recipe::gdn_prefill_conv<TextConfig>(work_, T);
         Tensor qkv      = conv.projected;
         Variant::gdn_input_projection(h, *w.projection, qkv, z, ph, work_, s);
+        if (sub_timing) { sub_lap(ftimer.g_proj, sub_proj); }
         Tensor qkv_c = conv.convolved;
         Tensor conv_state =
             state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_current_slot_);
@@ -926,9 +978,11 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         } else {
             ops::causal_conv1d_silu(qkv, *w.conv1d, conv_state, conv_state, qkv_c, s);
         }
+        if (sub_timing) { sub_lap(ftimer.g_conv, sub_conv); }
         ops::extract_bf16_columns(qkv_c, 0, qc, s);
         ops::extract_bf16_columns(qkv_c, kCfg.key_dim, kc, s);
         ops::extract_bf16_columns(qkv_c, 2 * kCfg.key_dim, vc, s);
+        if (sub_timing) { sub_lap(ftimer.g_extract, sub_extract); }
     }
 
     Tensor q_recurrent = qc.view({kCfg.gdn_k_dim, kCfg.gdn_k_heads, T});
@@ -971,9 +1025,17 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
 
     Tensor on = workspace_recipe::gdn_normalized_output<TextConfig>(work_, T).view(
         {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
+    if (sub_timing) { sub_lap(ftimer.g_scan, sub_scan); }
     ops::gated_rmsnorm(o, *w.gdn_norm, z, kCfg.rms_eps, on, s);
+    if (sub_timing) { sub_lap(ftimer.g_norm, sub_norm); }
 
     Variant::gdn_output_projection(on.view({kCfg.value_dim, T}), *w.out_proj, x, ph, work_, s);
+    if (sub_timing) {
+        sub_lap(ftimer.g_out, sub_out);
+        ftimer.t_g_ctrl += sub_ctrl;       ftimer.t_g_proj += sub_proj;   ftimer.t_g_conv += sub_conv;
+        ftimer.t_g_extract += sub_extract; ftimer.t_g_scan += sub_scan;   ftimer.t_g_norm += sub_norm;
+        ftimer.t_g_out += sub_out;
+    }
 }
 
 void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Phase ph) {
@@ -990,24 +1052,6 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Ph
 // instrument for "where does a prefill chunk's time go" when a profiler is
 // not available; the synchronize it adds at the end of run_layers only
 // exists while the switch is set.
-struct PrefillFamilyTimer {
-    bool enabled = std::getenv("SUROGATE_SERVE_PREFILL_TIMING") != nullptr;
-    cudaEvent_t begin{}, attn{}, mlp_full{}, gdn{}, mlp_gdn{};
-    cudaEvent_t g_proj{}, g_conv{}, g_scan{}, g_out{};
-    double t_attn = 0, t_mlp_full = 0, t_gdn = 0, t_mlp_gdn = 0;
-    double t_g_proj = 0, t_g_conv = 0, t_g_scan = 0, t_g_out = 0;
-    std::uint64_t chunks = 0, tokens = 0;
-    PrefillFamilyTimer() {
-        if (!enabled) { return; }
-        for (cudaEvent_t* e : {&begin, &attn, &mlp_full, &gdn, &mlp_gdn, &g_proj, &g_conv, &g_scan, &g_out}) {
-            cudaEventCreateWithFlags(e, cudaEventDefault);
-        }
-    }
-};
-inline PrefillFamilyTimer& prefill_family_timer() {
-    static PrefillFamilyTimer timer;
-    return timer;
-}
 
 template <class Tap>
 void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
@@ -1095,6 +1139,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                          100 * timer.t_attn / total, 100 * timer.t_mlp_full / total,
                          100 * timer.t_gdn / total, 100 * timer.t_mlp_gdn / total,
                          total / timer.chunks, 1000.0 * timer.tokens / total);
+            print_gdn_subsplit(timer, "prefill-families");
         }
     }
 }
@@ -1257,6 +1302,9 @@ PrefillChunkResult TextContext::mixed_chunk(std::span<const int> full_ids, std::
                 Variant::gdn_norm_control_projection(x, *gdn.input_norm, kCfg.rms_eps,
                                                      *gdn.projection, h, g, beta, work_, s);
 
+                float acc_g_ctrl = 0, acc_g_proj = 0, acc_g_conv = 0, acc_g_extract = 0,
+                      acc_g_scan = 0, acc_g_norm = 0, acc_g_out = 0;
+                if (timing) { lap(timer.begin, timer.g_ctrl, acc_g_ctrl); cudaEventRecord(timer.begin, s); }
                 const auto projection = workspace_recipe::gdn_projection<TextConfig>(work_, total);
                 Tensor z  = projection.output_gate.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, total});
                 Tensor qc = projection.query;
@@ -1266,7 +1314,6 @@ PrefillChunkResult TextContext::mixed_chunk(std::span<const int> full_ids, std::
                 Tensor qkv      = conv.projected;
                 Variant::gdn_input_projection(h, *gdn.projection, qkv, z, Phase::Prefill, work_, s);
                 Tensor qkv_c = conv.convolved;
-                float acc_g_proj = 0, acc_g_conv = 0, acc_g_scan = 0, acc_g_out = 0;
                 if (timing) { lap(timer.begin, timer.g_proj, acc_g_proj); cudaEventRecord(timer.begin, s); }
                 {
                     Tensor qkv_a   = qkv.slice(1, 0, prefill_cols);
@@ -1290,6 +1337,7 @@ PrefillChunkResult TextContext::mixed_chunk(std::span<const int> full_ids, std::
                 ops::extract_bf16_columns(qkv_c, 0, qc, s);
                 ops::extract_bf16_columns(qkv_c, kCfg.key_dim, kc, s);
                 ops::extract_bf16_columns(qkv_c, 2 * kCfg.key_dim, vc, s);
+                if (timing) { lap(timer.begin, timer.g_extract, acc_g_extract); cudaEventRecord(timer.begin, s); }
 
                 Tensor q_recurrent = qc.view({kCfg.gdn_k_dim, kCfg.gdn_k_heads, total});
                 Tensor k_recurrent = kc.view({kCfg.gdn_k_dim, kCfg.gdn_k_heads, total});
@@ -1330,9 +1378,10 @@ PrefillChunkResult TextContext::mixed_chunk(std::span<const int> full_ids, std::
                                 .view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, total});
                 if (timing) { lap(timer.begin, timer.g_scan, acc_g_scan); cudaEventRecord(timer.begin, s); }
                 ops::gated_rmsnorm(o, *gdn.gdn_norm, z, kCfg.rms_eps, on, s);
+                if (timing) { lap(timer.begin, timer.g_norm, acc_g_norm); cudaEventRecord(timer.begin, s); }
                 Variant::gdn_output_projection(on.view({kCfg.value_dim, total}), *gdn.out_proj, x,
                                                Phase::Prefill, work_, s);
-                if (timing) { lap(timer.begin, timer.g_out, acc_g_out); timer.t_g_proj += acc_g_proj; timer.t_g_conv += acc_g_conv; timer.t_g_scan += acc_g_scan; timer.t_g_out += acc_g_out; cudaEventRecord(timer.begin, s); }
+                if (timing) { lap(timer.begin, timer.g_out, acc_g_out); timer.t_g_ctrl += acc_g_ctrl; timer.t_g_proj += acc_g_proj; timer.t_g_conv += acc_g_conv; timer.t_g_extract += acc_g_extract; timer.t_g_scan += acc_g_scan; timer.t_g_norm += acc_g_norm; timer.t_g_out += acc_g_out; cudaEventRecord(timer.begin, s); }
                 if (timing) { lap(timer.begin, timer.gdn, acc_gdn); }
                 if (timing) { acc_gdn += acc_g_proj + acc_g_conv + acc_g_scan + acc_g_out; }
             }
@@ -1359,14 +1408,7 @@ PrefillChunkResult TextContext::mixed_chunk(std::span<const int> full_ids, std::
                          100 * timer.t_attn / tot, 100 * timer.t_mlp_full / tot,
                          100 * timer.t_gdn / tot, 100 * timer.t_mlp_gdn / tot,
                          tot / timer.chunks, 1000.0 * timer.tokens / tot);
-            const double g = timer.t_g_proj + timer.t_g_conv + timer.t_g_scan + timer.t_g_out;
-            if (g > 0) {
-                std::fprintf(stderr,
-                             "prefill-families(mixed) gdn sub-split: in_proj %.1f%% conv %.1f%% "
-                             "recurrent scan %.1f%% norm+out_proj %.1f%% (%.2f ms/chunk)\n",
-                             100 * timer.t_g_proj / g, 100 * timer.t_g_conv / g,
-                             100 * timer.t_g_scan / g, 100 * timer.t_g_out / g, g / timer.chunks);
-            }
+            print_gdn_subsplit(timer, "prefill-families(mixed)");
         }
     }
 

@@ -349,7 +349,10 @@ void PagedKVAllocation::cancel_unmapped_entitlement() noexcept {
 
 void PagedKVAllocation::materialize_pages(std::uint32_t pages, cudaStream_t stream) {
     if (!valid() || pages < mapped_page_count() || pages > page_entitlement_) {
-        throw std::invalid_argument("Paged KV materialize extent is outside entitlement");
+        throw std::invalid_argument("Paged KV materialize extent is outside entitlement (pages=" +
+                                    std::to_string(pages) + " mapped=" +
+                                    std::to_string(mapped_page_count()) + " entitled=" +
+                                    std::to_string(page_entitlement_) + ")");
     }
     const std::uint32_t old_count = mapped_page_count();
     const std::uint32_t count     = pages - old_count;

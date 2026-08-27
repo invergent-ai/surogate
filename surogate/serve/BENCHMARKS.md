@@ -79,8 +79,13 @@ users, 512/128, 90 s. Engine at fp8 KV; vLLM at its default cache (fp8 at
 | | GPU5 | vLLM | 3,926 | 15,702 | **0.30 s** | 2,800/0 |
 | Qwen3.8-27B | GPU3 | surogate serve | 833 | 3,332 | 7.87 s | 655/0 |
 | | GPU3 | **vLLM** | **1,040** | **4,158** | 8.2 s | 814/0 |
-| Qwen3.8-27B, decode-heavy 128/512 | GPU5 | **surogate serve** | **1,633** | 408 | **14.4 s** | 388/0 |
+| Qwen3.8-27B, decode-heavy 128/512 | GPU5 | **surogate serve** @48 | **1,633** | 408 | **14.4 s** | 388/0 |
+| | GPU5 | **surogate serve** @64 | **1,884** | 471 | 14.2 s | 534/0 |
 | | GPU5 | vLLM | 1,438 | 360 | 21.9 s | 356/0 |
+| Qwen3.8-27B @64 lanes | GPU6 | surogate serve | 897 | 3,586 | **5.1 s** | 687/0 |
+| | GPU6 | **vLLM** | **1,051** | **4,203** | 8.2 s | 836/0 |
+| Qwen3.8-27B @64 lanes, prefill-heavy 2048/16 | GPU6 | surogate serve | 49 | 6,280 | 30.0 s | 369/0 |
+| | GPU6 | **vLLM** | 92 | **11,822** | **14.9 s** | 607/0 |
 
 † engine prefill tok/s and TTFT p50 are taken from the server's own interval
 and per-request logs of the same runs (the pairing script summarised only
@@ -170,10 +175,17 @@ WY/WU preparation 30 %, output 23 % — moving 145 MB of intermediates per
 layer at 641 GB/s. Lanes: with #75/#76 in, 64 lanes beat 48 on the balanced
 shape (679 → 726 decode tok/s on GPU0, TTFT p50 9.5 → 6.2 s; prefill-heavy
 flat), so the 27B configuration moves to 64 lanes once re-paired.
-Prefill chunk width: `--max-num-batched-tokens 2048` against the default
-1,024 on the same card (GPU4, prefill-heavy, 48 lanes): 5,377 → 5,765 prompt
-tok/s (+7.2 %), TTFT unchanged — the GEMMs run at T≈2,100 instead of ≈1,100
-and a 2,048-token prompt takes one round instead of two. Single-user prefill
+Prefill chunk width (`--max-num-batched-tokens`, default 2,048) on the same
+card (GPU4, prefill-heavy, 48 lanes): 1,024 → 5,377, 2,048 → 5,765, 4,096 →
+6,131 (+6.3 % over the default), 8,192 flat at 6,117; TTFT unchanged. The loadgen's "2,048-token" prompts are 2,146 tokens
+with the chat template, so 1,024 needs three rounds, 2,048 two and 4,096
+one — about 7 % per round removed, which is the per-round fixed cost
+(decode-lane work and bookkeeping) that multi-prompt prefill rounds would
+amortise the same way. The same shape on the other models, same card each,
+1,024 → 2,048: 0.8B 58,042 → 64,150 (+10.5 %, GPU0), 4B 15,489 → 16,773
+(+8.3 %, GPU2), 35B-A3B 12,458 → 13,653 (+9.6 %, GPU1); the 35B at 4,096
+reaches 15,276 on GPU7. Lanes on the 27B: 64 beats 48 on every shape now
+(balanced 897 vs 833-class, decode-heavy 1,884 vs 1,633). Single-user prefill
 (2,048 tokens): engine 264 ms eager / 257 ms graph (GPU5) against vLLM
 213 ms (GPU3), so the single-stream gap is ~1.3× and the rest of the 2×
 lives in the 100-user mixed-round regime.

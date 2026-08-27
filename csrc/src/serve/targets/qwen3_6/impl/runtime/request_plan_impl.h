@@ -107,10 +107,19 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     base->summary.transient_bytes        = 0;
     base->sampling                       = translate_sampling(options.sampling);
     base->allow_prefix_reuse             = options.allow_prefix_reuse;
-    const std::uint32_t reserved_context_tokens =
-        base->summary.prompt_tokens + (base->summary.effective_output_tokens == 0
-                                           ? 0U
-                                           : base->summary.effective_output_tokens - 1U);
+    // The mixed prefill graph writes a 128-rounded chunk window, pad columns included, so
+    // the request must own the pages up to its rounded prompt as well as its output extent;
+    // otherwise mapping the last chunk lands outside the entitlement and the round dies.
+    const std::uint32_t rounded_prompt_tokens =
+        ((base->summary.prompt_tokens + 127U) / 128U) * 128U;
+    const std::uint32_t reserved_context_tokens = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+        capacity,
+        std::max<std::uint64_t>(
+            static_cast<std::uint64_t>(base->summary.prompt_tokens) +
+                (base->summary.effective_output_tokens == 0
+                     ? 0U
+                     : base->summary.effective_output_tokens - 1U),
+            rounded_prompt_tokens)));
     base->text_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
     if (speculative_backend == SpeculativeBackend::Mtp) {
         const std::uint32_t mtp_tokens    = static_cast<std::uint32_t>(std::min<std::uint64_t>(
