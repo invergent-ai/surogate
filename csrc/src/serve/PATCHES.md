@@ -2898,3 +2898,75 @@ startup with "workspace arena exhausted". Per-window laps then showed the
 remaining 27B deficit is not kernel time at all (see BENCHMARKS.md): single
 stream the engine is within 12 % of vLLM, and the 1.6× gap at 100 users is
 vLLM batching several prompts per prefill step.
+
+## 83
+
+**The 4B artifact carried 8-bit weights where vLLM's carried 4-bit (2026-08-27).**
+
+**Symptom.** The 4B was the one model the engine lost on throughput: 3,218
+decode tok/s against vLLM's 4,246 on the same card and shape, while winning
+TTFT 70 ms to 239 ms. Nsight put the Marlin W8 GEMMs at 52 % of decode time
+— our artifact was 5.26 GiB of W8G32, vLLM's an NVFP4 export.
+
+**Fix.** A converter for `AxionML/Qwen3.5-4B-NVFP4`, a ModelOpt export whose
+one checkpoint supplies the whole artifact: NVFP4 blocks pass through
+untouched (fused q,k,gate,v and qkv,z the way the W8 recipe fuses them),
+`in_proj_a`/`in_proj_b` are decoded back to BF16, the tied embedding is
+re-encoded W8 for the byte-wide head. 3.56 GiB, and a new
+`Qwen35Nvfp4Mixed` weights profile keyed on `weights_id == "nvfp4-mixed"`.
+
+Two traps, neither of which announces itself in the served text — the model
+answers, it just answers wrongly, which reads exactly like a kernel bug:
+
+  - ModelOpt writes `weight_scale_2` and `input_scale` as **multipliers**
+    (`amax/(448*6)`). The runtime's `weight_scale_divisor` /
+    `input_scale_divisor` are the compressed-tensors convention the 27B
+    recipe reads: block scale is `divisor * max_abs / 6` and the GEMM undoes
+    it with `alpha = 1/(input_div * weight_div)`. Passed through unchanged,
+    every GEMM was off by the square of the scale.
+  - the convolution ships channel-major `(8192,1,4)`; the artifact stores it
+    tap-major `(4,8192)`. The direct-object path reshapes, and a reshape
+    reinterprets those bytes instead of permuting them. The W8 recipe has
+    the transpose; the NVFP4 one had dropped it.
+
+Both were found by decoding the written artifact back and diffing it against
+the checkpoint — weights, block scales and divisors are bit-exact now. Do
+that before reading anything into what a converted model says.
+
+**Result.** 4,942 decode / 19,767 prefill tok/s, TTFT p50 45 ms: **+54 %**
+over our own W8 artifact and **+16.4 %** over vLLM, at 5.3× its TTFT.
+
+## 84
+
+**Every fused NVFP4 op was gated to the 27B's geometry (2026-08-27).**
+
+**Symptom.** The new 4B NVFP4 artifact would not load: `attn_input_proj
+workspace: unsupported NVFP4 profile`, then the same for `gdn_input_proj`,
+`linear_add` and `linear_swiglu` in turn. Each op checked its weight against
+one registered shape (14336/5120 attention, 16384/5120 GDN, 34816/5120 MLP,
+5120/6144 and 5120/17408 residual) because that is where its in-house W4A4
+ladder is instantiated.
+
+**Fix.** Keep the ladders registered-only and send everything else through
+cuBLASLt, which is generic in n and k (#76 already routes W4A4 from 64
+tokens up). `is_nvfp4_generic_problem` (n % 128 == 0, k in {2560, 4096,
+9216}) admits a shape; then:
+
+  - the attention and GDN input projections quantise once and issue one
+    row-sliced GEMM per output segment, with the split taken from the output
+    views rather than baked constants — the 128-row alignment the tiled
+    scale plane needs holds for 4096|1024|4096|1024 and 8192|4096
+  - `linear_add` and the plain linear resolve generic shapes to W4A4 at
+    every T: there is no A16 ladder for them to fall back to
+  - `linear_swiglu` GEMMs into a BF16 plane and folds it with `silu_mul`
+  - the GDN conv snapshot/record paths project-then-conv
+
+The trap is in the plan, not the kernels: the conv snapshot capacity for W8
+returns **zero** below 17 columns because W8 has a fused conv kernel there.
+NVFP4 has none, so its generic path always materialises the projected plane
+and its capacity has to carry it — otherwise the arena is short by exactly
+one plane (`request 20480 bytes at offset 17664 exceeds capacity 21760`)
+the first time a narrow snapshot runs.
+
+The 27B keeps every fused kernel it had; its registered paths were
+re-verified unchanged after the change.

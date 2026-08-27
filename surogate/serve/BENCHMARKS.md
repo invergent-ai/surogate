@@ -101,6 +101,45 @@ weight bandwidth, not scheduling: our 4B artifact is 5.13 GiB of W8G32
 against vLLM's ~2.2 GiB NVFP4 export, and the kernel profile puts the Marlin
 W8 GEMMs at 52 % of decode time. An NVFP4 4B artifact is the lever there.
 
+## 4B on NVFP4 weights (2026-08-27 late, PATCHES.md #83/#84)
+
+The 4B artifact was 5.26 GiB of W8G32 against vLLM's NVFP4 export, and the
+kernel profile put the Marlin W8 GEMMs at 52 % of decode time. It now
+converts from `AxionML/Qwen3.5-4B-NVFP4` to a native NVFP4 artifact of
+3.56 GiB. Getting there needed the fused ops to accept shapes outside the
+27B's registered geometry (#84): the in-house W4A4 ladders stay
+registered-only and every other shape runs on cuBLASLt, which is generic in
+n and k.
+
+Three engines, one card each, at the same time, 100 users, 90 s, 512/128,
+128 lanes, chunk 2,048:
+
+| engine | weights | decode tok/s | prefill tok/s | TTFT p50 | TTFT p95 | reqs ok/err |
+|---|---|---:|---:|---:|---:|---:|
+| **surogate serve** | NVFP4 3.56 GiB | **4,942** | **19,767** | **45 ms** | **51 ms** | 3,520/0 |
+| surogate serve | W8G32 5.26 GiB | 3,218 | 12,870 | 70 ms | 76 ms | 2,300/0 |
+| vLLM | NVFP4 | 4,246 | 16,984 | 239 ms | 304 ms | 3,000/0 |
+
+**+16.4 % on decode and on prefill, at 5.3× better TTFT.** The weight
+format was worth +54 % over our own W8 artifact — bigger than the whole gap
+to vLLM, which is what the 52 % Marlin share predicted.
+
+Two conversion traps cost more time than the kernels did, and both were
+found by decoding the written artifact and comparing it against the
+checkpoint rather than by looking at output text:
+
+  - ModelOpt writes `weight_scale_2` / `input_scale` as **multipliers**
+    (`amax/(448*6)`); the runtime's fields are **divisors** (the
+    compressed-tensors convention the 27B recipe reads, block scale =
+    `divisor * max_abs / 6`, undone by `alpha = 1/(input_div * weight_div)`).
+    Passed through unchanged, the model emitted fluent noise.
+  - the convolution ships channel-major `(8192,1,4)` and the artifact stores
+    it tap-major `(4,8192)`. A reshape silently reinterprets those bytes.
+
+Both artifacts decode bit-exact against the source now. The lesson for the
+next target: verify a converted artifact numerically against its checkpoint
+before reading anything into what the served model says.
+
 The 27B does not fit 128 lanes on 32 GB — it refuses at startup, asking for
 12.9 GiB of runtime reservation beyond its headroom — so it stays at 64 and
 is measured separately below.
