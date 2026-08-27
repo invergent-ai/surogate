@@ -81,6 +81,23 @@ pair on the same card in the same batch.** Cross-batch comparisons of a lone
 figure — which is how the morning's 4B row was read — can be off by a third
 for reasons that have nothing to do with the code.
 
+## Board of record (2026-08-27, end of day)
+
+Every engine on its own card, all running at once, 100 users, 90 s,
+512-token prompts, 128 output tokens, fp8 KV. The 27B row is the mean of two
+passes with the cards rotated between them.
+
+| model | weights | engine decode tok/s | vLLM decode tok/s | ratio | engine TTFT p50 | vLLM TTFT p50 |
+|---|---|---:|---:|---:|---:|---:|
+| Qwen3.5-0.8B | from GGUF Q4_K_M | **10,095** | 6,694 | **+51 %** | **45 ms** | 658 ms |
+| Qwen3.5-4B | NVFP4 3.56 GiB | **4,942** | 4,246 | **+16 %** | **45 ms** | 239 ms |
+| Qwen3.8-27B | NVFP4 mixed | 980 | **1,039** | **−6 %** | **1.9 s** | 8.3 s |
+
+Two of three beaten on throughput, all three on TTFT by 4–15x. The 27B's
+remaining 6 % is per-token compute, not scheduling — see the round-cost
+section below, which rules out batching, lanes, speculation and the chunk
+ladder by measurement.
+
 ## Verdict — paired, after the lane cap and multi-prompt rounds (2026-08-27 late)
 
 Two changes land together here: the eight cards were found to be running at
@@ -370,6 +387,72 @@ prompt tok/s. Lanes on the 27B: 64 beats 48 on every shape now
 (2,048 tokens): engine 264 ms eager / 257 ms graph (GPU5) against vLLM
 213 ms (GPU3), so the single-stream gap is ~1.3× and the rest of the 2×
 lives in the 100-user mixed-round regime.
+
+## What a 27B round costs, and what that rules out (2026-08-27 late)
+
+`SUROGATE_SERVE_ROUND_TIMING=1` (wall clock around each segment, no extra
+syncs — unlike `PREFILL_TIMING`, which slows the engine 2x and is useless
+for throughput attribution) at the tuned config, 96 lanes, chunk 4,096,
+100 users, 512/128:
+
+| round | ms | rounds per 60 s | columns |
+|---|---:|---:|---:|
+| mixed (one prompt's chunk + the decode batch) | 111.5 | 450 | 640 + 84 |
+| decode | 38.4 | 257 | 84 |
+
+Two points, one straight line: a round costs **28.8 ms fixed plus 114 us per
+column**. It reproduces the measurement (7.5 mixed + 4.3 decode rounds per
+second = 990 tok/s against 970 measured) and it holds three times further
+out — the prefill-heavy shape's 2,146-column rounds predict 7,664 prompt
+tok/s against 7,339 measured. So the second is spent:
+
+| | ms/s | share |
+|---|---:|---:|
+| prefill columns (5 per generated token at 512/128) | 494 | 49 % |
+| the fixed cost, once per round | 334 | 33 % |
+| decode columns | 111 | 11 % |
+
+Written out, `throughput = 1 / (6c + F/B)` with c the column cost, F the
+fixed cost and B the decode batch. That model rules out three things we
+tried, and the measurements agree with it in every case:
+
+  - **Batching several prompts into one mixed round** (the machinery from
+    #80). Algebraically a no-op: `n_m * 640ck` with `n_m = D/(128k)` is
+    independent of k. Fewer mixed rounds force exactly as many more decode
+    rounds, and every round pays F.
+  - **More lanes.** B is `min(lanes, KV pages / 11)`, and pages fall by 44
+    for every lane added (each lane reserves a ~99 MB GDN state slot), so
+    96 lanes admit 84 sequences and 72 lanes admit 72. Sweeping 72→104
+    lanes and 2,048/4,096 chunks moved decode between 944 and 994 — the
+    engine's own run-to-run spread.
+  - **MTP speculation** (#85 lifts the eight-row replay cap). It works and
+    it is not marginal: 76.8 % of drafts accepted, 1.77 tokens per round,
+    +33/48/55 % at eight lanes for one/two/three draft tokens. But it
+    reserves a second state slot per lane — 171 MB per lane against 99 — so
+    the 27B fits 48 lanes with it instead of 96, and 48 lanes + d=1 gives
+    885 against the 96-lane control's 996.
+  - **A finer prefill ladder.** A 552-token prompt runs a 640-column graph
+    under the 128-rounded ladder: 88 pad columns, 7.5 % of the second, and
+    at 114 us each they are not free. Rounding to 64 measured +2.8 % once
+    and −1.2 % when the cards were rotated (996/958 against 969/990), so it
+    is noise, and the 4B — five times as many rounds, so five times the
+    capture cost for the extra families — lost 3.6 %. Reverted.
+
+Final 27B board, two passes with the cards rotated between them, everything
+running at once:
+
+| | pass 1 | pass 2 | mean | TTFT p50 |
+|---|---:|---:|---:|---:|
+| surogate serve, 96 lanes | 969 | 990 | 980 | 1.9 s |
+| **vLLM** | 1,034 | 1,043 | **1,039** | 8.3 s |
+
+**94 % of vLLM on decode, 4.4x better on TTFT.** What is left is not
+scheduling and not batching: it is the 114 us column. That is 474 TFLOP/s
+against the 651–827 the GEMMs themselves measure, and the per-window laps
+already located the difference — about 18 % of a captured window is gaps
+between kernels, and the GDN chunked scan moves its 145 MB per layer at
+641 GB/s. Fusing the layer loop and widening that scan is the next 27B
+work; nothing above it is a config away.
 
 ## Single user (2026-08-26, GPU2)
 

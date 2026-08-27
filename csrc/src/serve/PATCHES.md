@@ -2970,3 +2970,47 @@ the first time a narrow snapshot runs.
 
 The 27B keeps every fused kernel it had; its registered paths were
 re-verified unchanged after the change.
+
+## 85
+
+**Speculation was capped at eight lanes, and two plan bugs sat behind it (2026-08-27).**
+
+**Symptom.** `--spec mtp` refused any serving concurrency: at 96 lanes the
+engine died at startup with `GDN replay record capacity exceeds eight rows`.
+Lifting that cap exposed two more failures, both at startup — a
+`cudaErrorStreamCaptureUnsupported` from `cudaMalloc`, then
+`workspace arena exhausted: request 2703360 bytes at offset 338432 exceeds
+capacity 338184`.
+
+**Fixes.**
+
+  - The replay row table was `GdnReplayFoldKernelRow row[8]`, and the two
+    validation constants mirrored it. Nothing in the fold kernel needs the
+    bound — it indexes rows with `blockIdx.y` — so the table is
+    `kMaximumBatchColumns` wide now: 1 KiB of the 32 KiB a launch may carry
+    as parameters.
+  - Both cuBLASLt routes build their handle and 32 MiB workspace on first
+    use, and a first use inside a graph capture cannot `cudaMalloc`. The
+    ordinary families happen to touch the routes eagerly first; the MTP
+    verify family's first NVFP4 GEMM is inside its own capture. Prewarm both
+    in the program constructor, before `prepare_graphs`.
+  - `snapshot_capacity` adds the FP8 route's fp32 staging to the plan;
+    `record_capacity` did not. A record round wide enough to take the route
+    (65 columns, and a verify batch is `lanes x (1 + draft tokens)`) then
+    asked for staging nobody had planned. Unreachable before, because every
+    caller of the record path ran below the threshold.
+
+**What it bought, and what it did not.** Speculation is real on this model:
+76.8 % of drafts accepted, 1.77 tokens per round at one draft token, and at
+eight lanes +33 % (d=1), +48 % (d=2), +55 % (d=3). It still loses the
+100-user board, for a reason that is memory rather than acceptance — it
+reserves a second GDN state slot per lane (171 MB against 99), so the 27B
+fits 48 lanes with it instead of 96. 48 lanes + d=1 measured 885 tok/s
+against the 96-lane control's 996, which is what the round-cost model in
+BENCHMARKS.md predicts. Until the shadow slot goes, `--spec mtp` belongs to
+low-concurrency serving.
+
+Also measured and reverted: rounding the prefill chunk ladder to 64 instead
+of 128. A 552-token prompt runs a 640-column graph, and those 88 pad columns
+are 7.5 % of the second at 114 us each — but the finer ladder measured
++2.8 % once and −1.2 % with the cards rotated, and cost the 4B 3.6 %.
