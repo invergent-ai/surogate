@@ -1,3 +1,4 @@
+#include "core/limits.h"
 #include "core/gdn_replay_records.h"
 #include "core/linear_attention_state.h"
 
@@ -148,19 +149,38 @@ int main() {
                                           .value_dim       = 128}),
                             111083520, "30-layer T16 capacity");
 
+    // One record row per lane, so the bound is the batch ceiling (#85), not eight.
     failures += expect_throw(
         [&] {
             ninfer::LayoutBuilder invalid;
-            (void)ninfer::plan_gdn_replay_records(invalid, {.layers          = 1,
-                                                            .record_capacity = 9,
-                                                            .width           = 2,
-                                                            .conv_channels   = 1,
-                                                            .qk_heads        = 1,
-                                                            .value_heads     = 1,
-                                                            .key_dim         = 1,
-                                                            .value_dim       = 1});
+            (void)ninfer::plan_gdn_replay_records(
+                invalid, {.layers          = 1,
+                          .record_capacity = ninfer::kMaximumBatchColumns + 1,
+                          .width           = 2,
+                          .conv_channels   = 1,
+                          .qk_heads        = 1,
+                          .value_heads     = 1,
+                          .key_dim         = 1,
+                          .value_dim       = 1});
         },
-        "record capacity above eight");
+        "record capacity above the batch ceiling");
+
+    {
+        // ...and the ceiling itself plans: speculation runs at serving concurrency.
+        ninfer::LayoutBuilder ceiling;
+        const auto planned = ninfer::plan_gdn_replay_records(
+            ceiling, {.layers          = 1,
+                      .record_capacity = ninfer::kMaximumBatchColumns,
+                      .width           = 2,
+                      .conv_channels   = 64,
+                      .qk_heads        = 1,
+                      .value_heads     = 1,
+                      .key_dim         = 64,
+                      .value_dim       = 64});
+        failures += expect_size(static_cast<std::size_t>(planned.spec.record_capacity),
+                                static_cast<std::size_t>(ninfer::kMaximumBatchColumns),
+                                "batch-ceiling record capacity");
+    }
 
     ninfer::LayoutBuilder state_builder;
     const auto state_layout = ninfer::plan_linear_attention_state_pool(
