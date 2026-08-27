@@ -315,6 +315,9 @@ int run_nvfp4_target() {
     failures += run_nvfp4_target_case(parent, 4, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_target_case(parent, 17, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_target_case(parent, 1024, ops::LinearPolicy::AllowA4);
+    failures += run_nvfp4_target_case(parent, 300, ops::LinearPolicy::AllowA4);
+    failures += run_nvfp4_target_case(parent, 1077, ops::LinearPolicy::AllowA4);
+    failures += run_nvfp4_target_case(parent, 1300, ops::LinearPolicy::AllowA4);
     return failures;
 }
 

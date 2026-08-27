@@ -2653,3 +2653,155 @@ Verified on the new default (checkpoints off), fp8 KV:
     card: 824 tok/s, 8.0 s) — the lane cliff is gone; 64 is now the better
     default for the 27B, and the small gain confirms the 27B is prefill-bound,
     not lane-bound (BENCHMARKS.md, prefill table).
+
+## 74
+
+Qwen3.6-35B-A3B serves on one 32 GB card; the DFlash drafter is optional.
+
+The target was already complete — registry, config (40 layers, 10
+full-attention + 30 GDN, 256 experts top-8 plus a shared expert), mixed
+Q4/Q5/Q6 routed-expert bindings, and the decode / prefill / small-T sparse
+MoE kernels — and BENCHMARKS.md's "~35 GB W8 artifact" note described a build
+the bindings no longer request. The committed recipe produces a 22.4 GB
+artifact whose resident core fits a 5090 with 8.4 GB left after weights, so
+the FreeToken-style expert offload studied for this model is not needed for
+it; that design targets the 122B/397B tiers and long-context KV pressure.
+
+What actually blocked conversion:
+
+  * `--dflash-model` was required. The DFlash drafter is a separate
+    checkpoint that is not public; the converter now omits the dflash/*
+    family when it is absent (889 objects instead of 940) and the 35B
+    bindings probe for the family (`has_dflash`, the has_mtp pattern) and
+    refuse `--spec dflash` against such an artifact with a startup error
+    instead of a missing-object failure.
+  * The recipe's exact-source contract addressed tensors in the nested
+    `model.language_model.*` dialect while the shard reader folds that to
+    `model.*`; the 27B NVFP4 recipe already compared in the folded dialect,
+    and the 35B preflight now does the same.
+
+First serve, GPU7, fp8 KV, 64 lanes, checkpoints off, `--kv-capacity auto`
+(456,192 tokens), 100 users, 90 s:
+
+  balanced 512/128:        1,596 decode tok/s, 6,384 prefill tok/s, TTFT 2.9 s
+  prefill-heavy 2048/16:  13,531 prefill tok/s, TTFT 14.4 s
+  coherent at temperature 0; 0 errors, 0 fatals
+
+Also in this entry: `SUROGATE_SERVE_PREFILL_TIMING` now prints a per-family
+split of eager prefill (attention mixer, GDN mixer with its in-proj / conv /
+recurrent scan / out-proj sub-split, and the MLPs), measured with events
+between the ops of the mixed-round body. It exists because nsys would not
+finalise a report in this environment (CPU sampling is unavailable at
+paranoid level 4, and the session's earlier profiles could not be reproduced).
+On the 27B's prefill-heavy shape it reads: GDN mixer 41.9%, MLP after GDN
+32.9%, attention 14.3%, MLP after attention 11.0% — the linear-attention
+mixers are the largest single cost of 27B prefill, which is the block vLLM
+serves with FLA's Triton chunked kernels and where its 2x prefill lead lives.
+
+## 75
+
+**NVFP4 W4A4 GEMMs: split launch so mixed serving rounds reach the TMA schedule (2026-08-27).**
+
+**Symptom.** The NVFP4-native 27B trailed vLLM by 2× on prefill (same card:
+5,964 vs 12,089 prompt tok/s) while the W8 0.8B/4B artifacts led. The
+per-family prefill timer put 42% of eager prefill in the GDN mixers and half
+of that in the input projection, running at ~285 TFLOP/s against ~580 for
+the MLP.
+
+**Root cause.** Every W4A4 launcher (`linear`, `attn_input_proj`,
+`gdn_input_proj`, `linear_add`) gated the TMA schedule on
+`tokens >= 1024 && tokens % 256 == 0`. A serving round is a mixed
+`[prefill chunk | decode batch]` GEMM — 1,072 + 5 or 1,024 + 63 columns —
+which is never block-aligned, so under load every prefill GEMM on the 27B
+fell to the mma ladder (`M128N128Resident`). The balanced board shape
+(545-token prompts) never reached the 1,024 floor at all. The W8 artifacts
+use a different GEMM family and were never affected, which is why only the
+27B was behind.
+
+**Fix.** `ops/linear/nvfp4/nvfp4_w4a4_split.h`: `nvfp4_w4a4_tma_split`
+hands the 256-aligned prefix to the TMA schedule and the ragged tail to the
+existing mma ladder, with token-major base offsets for the activation
+workspace (`K/2` code bytes, `K/16` scale bytes per token) and every output
+plane (`rows` elements per token). All four launchers use it; each ladder
+now takes raw activation/output views instead of tensors. The floor below
+which the whole problem stays on the ladder is `SUROGATE_SERVE_NVFP4_TMA_MIN_TOKENS`
+(default 512: the smallest prefix with two M-tiles that still splits the balanced shape's ~590-token rounds). A `static_assert` in `nvfp4_w4a4_tma.cu` ties the TMA
+schedules' block-M to the helper's constant.
+
+**Verification.** Op tests gained ragged cases (300, 1,077, 1,300 tokens)
+in all four W4A4 suites; they pass at the default floor and at 256
+(`ninfer_linear_nvfp4_a4_test`, `ninfer_gdn_input_proj_test`,
+`ninfer_attn_input_proj_test`, `ninfer_linear_add_nvfp4_test`; the
+linear_add harness sized its buffers from a 1,024-token constant and was
+raised to 1,300).
+
+27B, 48 lanes, fp8 KV auto, 100 users, single runs:
+| shape | old path (TMA off) | split, floor 1024 | split, floor 256 |
+|---|---|---|---|
+| prefill-heavy 2048/16, GPU6 | 5,867 prompt tok/s | 6,088 | 6,244 |
+| balanced 512/128, GPU7 | 826 decode / 3,303 prefill | 822 / 3,289 | 841 / 3,362 |
+
+The gain is real but small (+4-6% prefill-heavy, noise on balanced) because
+the two in-house schedules are close: the GDN input projection runs at 560
+TFLOP/s on the TMA schedule and 545 on the mma ladder at ~1k tokens
+(`ninfer_gdn_input_proj_bench`, GPU2). The six-card matrix that suggested
++23% was card spread, not the floor - the same-card controls above are the
+record. A cuBLASLt block-scaled FP4 matmul
+(`CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3`, CUDA 13.1) on the same card and
+shapes reaches 763 TFLOP/s at T=1,024 and 827 at T=2,048 (GDN geometry; MLP
+gate-up 825/850; residual 700-790): 1.35-1.45x the in-house W4A4 kernels at
+every prefill width. That, and the sequential GDN recurrent scan (23% of the
+GDN family's prefill time, where vLLM runs FLA's chunked kernel), are the
+27B prefill levers left; see BENCHMARKS.md.
+
+## 76
+
+**NVFP4 W4A4 prefill GEMMs on cuBLASLt's block-scaled FP4 matmul (2026-08-27).**
+
+**Why.** With #75 in, the in-house W4A4 schedules were measured against
+cuBLASLt (`CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3`, CUDA 13.1) on the
+27B's own shapes: 763 vs 560 TFLOP/s on the GDN input projection at 1,024
+tokens, 819 vs 575 on the MLP gate-up, 400 vs 215 on the 5120×6144 residual
+at 300 tokens — 1.4–1.9× at every prefill width, and slower only below 64
+tokens where the in-house small-T kernels already run at the weight-bandwidth
+limit (T=16: 35 µs vs 76 µs).
+
+**What made it free.** The artifact's NVFP4 storage already is cuBLASLt's
+layout: codes row-major with K contiguous and even columns in the low
+nibble, scales in the canonical 128×4 tile
+(`(row%32)*16 + (row/32)*4 + group%4`, K-tiles inner). Nothing is
+repacked; `ninfer_linear_nvfp4_cublaslt_test` shows the two paths bit-exact
+on identical quantized inputs (max abs diff 0.0000 on all three geometries).
+Only the activation scales change: `Nvfp4ScaleLayout::Tiled` makes the
+quantizer write the same tiled layout, and the W4A4 workspace pads the scale
+interval to 128 rows.
+
+**Route.** `ops/linear/nvfp4/nvfp4_cublaslt.{h,cpp}`: one handle, a 32 MB
+workspace and a descriptor/algorithm cache per device, keyed by (rows, K,
+tokens, ld, accumulate); scale pointers are rebound per call because they
+follow the weight, not the shape. `nvfp4_cublaslt_route(tokens)` is true
+from `kNvfp4CublasLtDefaultMinTokens` (64) up; `SUROGATE_SERVE_NVFP4_CUBLASLT=0`
+disables it and `SUROGATE_SERVE_NVFP4_CUBLASLT_MIN_TOKENS` moves the
+threshold. The five W4A4 families use it: `linear` (whole problem),
+`attn_input_proj` (four row-sliced calls straight into q/k/gate/v — the
+slices are 128-aligned so the scale tiles cut cleanly), `gdn_input_proj`
+(qkv and z), `linear_add` (`beta = 1` on the residual, in place), and the
+fused MLP, whose plan already runs T > 48 as a plain linear plus `silu_mul`
+and now prefers that path at T = 1024 as well when the route is on.
+
+**Verification.** All six NVFP4 suites pass with the route on and with it
+disabled (`SUROGATE_SERVE_NVFP4_CUBLASLT=0`); the workspace high-water
+checks stay exact because the padded scale interval is planned and used
+identically on both paths.
+
+27B, 48 lanes, fp8 KV auto, 100 users, same card per shape, one run each:
+| shape | route off | route on | delta |
+|---|---:|---:|---:|
+| prefill-heavy 2048/16, GPU3 (prompt tok/s) | 6,139 | 6,528 | +6.3 % |
+| balanced 512/128, GPU4 (decode / prompt tok/s) | 672 / 2,687 | 717 / 2,869 | +6.7 % |
+
+Consistent but far below the kernel-level 1.4–1.9×: a 1,024-token chunk
+takes ~150 ms end to end on the 27B and its GEMMs, even at the old speed,
+are only ~55 ms of that. The prefill family timer's `in_proj` bucket (50 %
+of the GDN family) therefore holds more than the GEMM; the next step is the
+post-#76 breakdown, taken eager on the same shape.

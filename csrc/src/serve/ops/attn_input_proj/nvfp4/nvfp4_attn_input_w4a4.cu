@@ -3,6 +3,8 @@
 #include "core/device.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_mma.cuh"
+#include "ops/linear/nvfp4/nvfp4_cublaslt.h"
+#include "ops/linear/nvfp4/nvfp4_w4a4_split.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_tma_launch.h"
 
 #include <cuda_bf16.h>
@@ -51,25 +53,18 @@ struct Nvfp4W4a4AttentionOutput {
     }
 };
 
-using M32N64                      = Nvfp4W4a4MmaSchedule<32, 64, 256, 2, 4, 2, 2>;
-using M32N128                     = Nvfp4W4a4MmaSchedule<32, 128, 256, 2, 4, 2, 1>;
-using M64N128                     = Nvfp4W4a4MmaSchedule<64, 128, 256, 4, 2, 2, 1>;
-using M128N128Pipelined           = Nvfp4W4a4MmaSchedule<128, 128, 256, 4, 2, 2, 1>;
-using M128N128Resident            = Nvfp4W4a4MmaSchedule<128, 128, 256, 4, 2, 1, 2>;
-constexpr std::int32_t kTmaBlockM = 256;
+using M32N64            = Nvfp4W4a4MmaSchedule<32, 64, 256, 2, 4, 2, 2>;
+using M32N128           = Nvfp4W4a4MmaSchedule<32, 128, 256, 2, 4, 2, 1>;
+using M64N128           = Nvfp4W4a4MmaSchedule<64, 128, 256, 4, 2, 2, 1>;
+using M128N128Pipelined = Nvfp4W4a4MmaSchedule<128, 128, 256, 4, 2, 2, 1>;
+using M128N128Resident  = Nvfp4W4a4MmaSchedule<128, 128, 256, 4, 2, 1, 2>;
 
 template <class Schedule>
-void launch_gemm(const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
-                 Nvfp4W4a4Workspace workspace, std::int32_t tokens, cudaStream_t stream) {
+void launch_gemm(const Weight& weight, Nvfp4W4a4AttentionOutput output,
+                 Nvfp4W4a4MaterializedActivation activation, std::int32_t tokens,
+                 cudaStream_t stream) {
     const dim3 grid(Geometry::kOutputRows / Schedule::kBlockN,
                     (tokens + Schedule::kBlockM - 1) / Schedule::kBlockM);
-    const Nvfp4W4a4MaterializedActivation activation{workspace.codes, workspace.scales};
-    const Nvfp4W4a4AttentionOutput output{
-        static_cast<__nv_bfloat16*>(q.data),
-        static_cast<__nv_bfloat16*>(k.data),
-        static_cast<__nv_bfloat16*>(gate.data),
-        static_cast<__nv_bfloat16*>(v.data),
-    };
     const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
     nvfp4_w4a4_mma_kernel<Geometry, Schedule><<<grid, Schedule::kThreads, 0, stream>>>(
         activation, static_cast<const std::uint8_t*>(weight.qdata),
@@ -78,34 +73,66 @@ void launch_gemm(const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tenso
     CUDA_CHECK(cudaGetLastError());
 }
 
+void launch_mma(const Weight& weight, Nvfp4W4a4AttentionOutput output,
+                Nvfp4W4a4MaterializedActivation activation, std::int32_t tokens,
+                cudaStream_t stream) {
+    if (tokens <= 64) {
+        launch_gemm<M32N64>(weight, output, activation, tokens, stream);
+    } else if (tokens <= 96) {
+        launch_gemm<M32N128>(weight, output, activation, tokens, stream);
+    } else if (tokens <= 128) {
+        launch_gemm<M128N128Pipelined>(weight, output, activation, tokens, stream);
+    } else if (tokens <= 192) {
+        launch_gemm<M64N128>(weight, output, activation, tokens, stream);
+    } else if (tokens <= 384) {
+        launch_gemm<M128N128Resident>(weight, output, activation, tokens, stream);
+    } else if (tokens <= 512) {
+        launch_gemm<M128N128Pipelined>(weight, output, activation, tokens, stream);
+    } else {
+        launch_gemm<M128N128Resident>(weight, output, activation, tokens, stream);
+    }
+}
+
 } // namespace
 
 void nvfp4_attn_input_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                   Tensor& k, Tensor& v, Nvfp4W4a4Workspace workspace,
                                   cudaStream_t stream) {
-    launch_nvfp4_w4a4_quantize(x, weight, workspace, stream);
     const std::int32_t tokens = x.ne[1];
-    if (tokens >= 1024 && (tokens % kTmaBlockM) == 0) {
+    if (nvfp4_cublaslt_route(tokens)) {
+        launch_nvfp4_w4a4_quantize(x, weight, workspace, stream, Nvfp4ScaleLayout::Tiled);
+        nvfp4_cublaslt_gemm(weight, 0, kQueryRows, workspace.codes, workspace.scales,
+                            static_cast<__nv_bfloat16*>(q.data), kQueryRows, tokens, 0.0F, stream);
+        nvfp4_cublaslt_gemm(weight, kKeyBegin, kKeyRows, workspace.codes, workspace.scales,
+                            static_cast<__nv_bfloat16*>(k.data), kKeyRows, tokens, 0.0F, stream);
+        nvfp4_cublaslt_gemm(weight, kGateBegin, kGateRows, workspace.codes, workspace.scales,
+                            static_cast<__nv_bfloat16*>(gate.data), kGateRows, tokens, 0.0F, stream);
+        nvfp4_cublaslt_gemm(weight, kValueBegin, kKeyRows, workspace.codes, workspace.scales,
+                            static_cast<__nv_bfloat16*>(v.data), kKeyRows, tokens, 0.0F, stream);
+        return;
+    }
+    launch_nvfp4_w4a4_quantize(x, weight, workspace, stream);
+    const Nvfp4W4a4TmaSplit split = nvfp4_w4a4_tma_split(tokens);
+    if (split.tma_tokens > 0) {
         const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
         launch_nvfp4_w4a4_tma_attention(
             workspace.codes, workspace.scales, static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(q.data),
             static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(k.data),
-            static_cast<__nv_bfloat16*>(v.data), tokens, alpha, stream);
-    } else if (tokens <= 64) {
-        launch_gemm<M32N64>(weight, q, gate, k, v, workspace, tokens, stream);
-    } else if (tokens <= 96) {
-        launch_gemm<M32N128>(weight, q, gate, k, v, workspace, tokens, stream);
-    } else if (tokens <= 128) {
-        launch_gemm<M128N128Pipelined>(weight, q, gate, k, v, workspace, tokens, stream);
-    } else if (tokens <= 192) {
-        launch_gemm<M64N128>(weight, q, gate, k, v, workspace, tokens, stream);
-    } else if (tokens <= 384) {
-        launch_gemm<M128N128Resident>(weight, q, gate, k, v, workspace, tokens, stream);
-    } else if (tokens <= 512) {
-        launch_gemm<M128N128Pipelined>(weight, q, gate, k, v, workspace, tokens, stream);
-    } else {
-        launch_gemm<M128N128Resident>(weight, q, gate, k, v, workspace, tokens, stream);
+            static_cast<__nv_bfloat16*>(v.data), split.tma_tokens, alpha, stream);
+    }
+    if (split.tail_tokens > 0) {
+        const Nvfp4W4a4Workspace tail =
+            nvfp4_w4a4_workspace_at(workspace, Geometry::kInputRows, split.tma_tokens);
+        launch_mma(weight,
+                   Nvfp4W4a4AttentionOutput{
+                       nvfp4_w4a4_column(q.data, kQueryRows, split.tma_tokens),
+                       nvfp4_w4a4_column(k.data, kKeyRows, split.tma_tokens),
+                       nvfp4_w4a4_column(gate.data, kGateRows, split.tma_tokens),
+                       nvfp4_w4a4_column(v.data, kKeyRows, split.tma_tokens),
+                   },
+                   Nvfp4W4a4MaterializedActivation{tail.codes, tail.scales}, split.tail_tokens,
+                   stream);
     }
 }
 

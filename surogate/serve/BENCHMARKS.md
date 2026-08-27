@@ -55,6 +55,16 @@ Q4_K_M GGUF** (W8 resident codes carrying the GGUF's 4-bit information, fp4
 compute profile) at 0.8B/4B, and the native **NVFP4 (4-bit resident)**
 artifact at 27B.
 
+### Why the card matters (2026-08-27)
+
+All eight 5090s run under a 400 W software power cap (hardware maximum
+575–600 W) and settle at very different SM clocks under load — measured
+mid-run: GPU2 1,462 MHz, GPU0 1,612, GPU4 1,710, GPU3 1,950, GPU5 2,167,
+GPU6 2,625. That 1.8× clock range is the whole "card spread": the same
+cuBLASLt GEMM runs 763 TFLOP/s on GPU2 and 1,379 on GPU7. Only same-card
+pairs are comparable; the kernel table below was taken on GPU2, the slowest
+card, so its absolute numbers are a floor and its ratios are what matters.
+
 ## 100 users — same card, same day, back to back (2026-08-27)
 
 vLLM served first, then the engine, on the card shown, quiet host, 100
@@ -67,8 +77,8 @@ users, 512/128, 90 s. Engine at fp8 KV; vLLM at its default cache (fp8 at
 | | GPU4 | vLLM | 5,677 | 22,714 | 0.82 s | 4,001/0 |
 | Qwen3.5-4B | GPU5 | **surogate serve** | **4,359** | **19,178** † | 1.05 s | 3,136/0 |
 | | GPU5 | vLLM | 3,926 | 15,702 | **0.30 s** | 2,800/0 |
-| Qwen3.8-27B | GPU6 | surogate serve | 827 | 3,677 † | 7.96 s | 650/0 |
-| | GPU6 | **vLLM** | **1,041** | **4,162** | 8.3 s | 814/0 |
+| Qwen3.8-27B | GPU3 | surogate serve | 833 | 3,332 | 7.87 s | 655/0 |
+| | GPU3 | **vLLM** | **1,040** | **4,158** | 8.2 s | 814/0 |
 
 † engine prefill tok/s and TTFT p50 are taken from the server's own interval
 and per-request logs of the same runs (the pairing script summarised only
@@ -93,14 +103,58 @@ by-product of a decode-limited workload.
 | | GPU4 | vLLM | 45,106 | 352 | 3.88 s | 3.95 s | 2,065/0 |
 | Qwen3.5-4B | GPU5 | **surogate serve** | **40,677** | 318 | 4.77 s | 4.78 s | 1,883/0 |
 | | GPU5 | vLLM | 34,964 | 273 | 5.00 s | 5.09 s | 1,621/0 |
-| Qwen3.8-27B | GPU6 | surogate serve | 5,964 | 47 | 29.7 s | 30.3 s | 350/0 |
-| | GPU6 | **vLLM** | **12,089** | 94 | **14.5 s** | 14.9 s | 619/0 |
+| Qwen3.8-27B | GPU3 | surogate serve | 6,135 | 48 | 30.0 s | 30.3 s | 360/0 |
+| | GPU3 | **vLLM** | **12,084** | 94 | **14.5 s** | 14.7 s | 617/0 |
 
 Engine prefill: **+80%** at 0.8B, **+16%** at 4B, **−51%** at 27B. The 27B's
 balanced-shape deficit (−21% on decode above) is this: the engine prefills
 the 27B at half vLLM's rate, so with four prompt tokens per generated token
 the prefill duty cycle starves decode. Prefill is the 27B lever, not lanes
 or KV.
+
+## Where the 27B prefill time goes (2026-08-27)
+
+The 27B is the only NVFP4-native artifact and the only model behind vLLM.
+Its W4A4 GEMM launchers gated the TMA schedule on `tokens >= 1024 &&
+tokens % 256 == 0`; a mixed serving round (prefill chunk + decode batch) is
+never block-aligned, so every prefill GEMM ran on the mma ladder. PATCHES.md
+#75 splits the launch (TMA over the 256-aligned prefix, mma over the tail).
+Same card, one run per cell, 48 lanes, fp8 KV auto:
+
+| shape | old path (TMA off) | split, floor 1024 | split, floor 256 |
+|---|---:|---:|---:|
+| prefill-heavy 2048/16, GPU6 (prompt tok/s) | 5,867 | 6,088 | 6,244 |
+| balanced 512/128, GPU7 (decode / prompt tok/s) | 826 / 3,303 | 822 / 3,289 | 841 / 3,362 |
+
+Only +4–6 % on the prefill-heavy shape, because the two in-house schedules
+are close. The kernel-level picture (GPU2, `ninfer_gdn_input_proj_bench` and
+the `ninfer_linear_nvfp4_cublaslt_test` timings, TFLOP/s):
+
+| GEMM | tokens | in-house W4A4 | cuBLASLt block-scaled FP4 |
+|---|---:|---:|---:|
+| GDN in_proj 16384×5120 | 1,024 (TMA) | 560 | 763 |
+| GDN in_proj 16384×5120 | 1,077 (mma) | 545 | 756 |
+| GDN in_proj 16384×5120 | 2,048 (TMA) | 611 | 827 |
+| MLP gate-up 34816×5120 | 1,024 | 575 | 819 |
+| residual 5120×6144 | 300 | 215 | 400 |
+| GDN in_proj 16384×5120 | 64 | 179 (60 µs) | 260 (41 µs) |
+| GDN in_proj 16384×5120 | 16 | 76 (35.5 µs) | 35 (76 µs) |
+
+cuBLASLt (`CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3`, CUDA 13.1) consumes
+the artifact's weight codes and 128×4-tiled scales in place and is
+bit-exact against the in-house kernels on identical quantized inputs
+(`ninfer_linear_nvfp4_cublaslt_test`); it is 1.4–1.9× faster from 64 tokens
+up and slower below (the in-house small-T kernels run at the weight-bandwidth
+limit). PATCHES.md #76 routes every W4A4 GEMM from 64 tokens up through cuBLASLt.
+Same card, route off → on, one run each: prefill-heavy 6,139 → 6,528 prompt
+tok/s (GPU3, +6.3 %); balanced 672 → 717 decode / 2,687 → 2,869 prompt tok/s
+(GPU4, +6.7 %). Consistent, but a 1,024-token chunk costs ~150 ms end to end
+and its GEMMs were only ~55 ms of it, so the GEMM family was never the 2×.
+The GDN chunked prefill path (`ninfer_gated_delta_net_bench`, GPU2, 48 value
+heads, 1,024 tokens) costs 287 µs per layer — state passing 47 %, WY/WU
+preparation 30 %, output 23 % — moving 145 MB of materialized intermediates
+per layer at 641 GB/s; that is the second GDN lever. The rest of the chunk
+time sits outside the GEMMs and needs the post-#76 family breakdown.
 
 ## Single user (2026-08-26, GPU2)
 
@@ -121,16 +175,32 @@ Not re-measured on 08-27. Same shapes, same loadgen; engine at bf16 KV.
 The engine leads every single-user cell except the 27B, where llama.cpp's
 Q4_K GEMV edges decode (49 vs 45) and vLLM's TTFT leads (254 vs 352 ms).
 
-## Qwen3.6-35B-A3B (MoE) — 2026-08-26, GPU2
+## Qwen3.6-35B-A3B (MoE)
 
-| engine | weights | TTFT @1.9k | decode tok/s (1 user) | 100-user tok/s | 100-user TTFT p50 | reqs ok/err |
-|---|---|---:|---:|---:|---:|---:|
-| surogate serve | — | *no 4-bit MoE artifact yet* | — | — | — | — |
-| llama-server (CUDA) | GGUF Q4_K_M | 608 ms | 159 | 213 | 51.0 s | 238/111 |
-| vLLM | NVFP4 | **208 ms** | **163** | **1,565** | **2.2 s** | 1,172/0 |
+First served on 2026-08-27 (PATCHES.md #74). The artifact is the committed
+mixed Q4/Q5/Q6 routed-expert recipe, 22.4 GB, converted without the DFlash
+drafter; it fits a 5090 with 8.4 GB left after weights, so no expert
+offloading is involved. 100 users, 90 s, GPU7, fp8 KV, 64 lanes:
 
-The surogate W8 artifact (~35 GB) exceeds the card; an NVFP4 MoE conversion
-path is the missing piece.
+| engine | card | decode tok/s | prefill tok/s | TTFT p50 | reqs ok/err |
+|---|---|---:|---:|---:|---:|
+| surogate serve (512/128) | GPU7 | **1,596** | 6,384 | 2.9 s | 1,184/0 |
+| surogate serve (2048/16) | GPU7 | 106 | **13,531** | 14.4 s | 690/0 |
+| surogate serve (512/128) | GPU1 | 1,510 | 6,041 | 3.0 s | 1,123/0 |
+| vLLM NVFP4 (512/128), same card | GPU1 | *pending* | | | |
+
+vLLM's half is blocked on an export this vLLM (0.27.1) can load: the
+`unsloth` NVFP4 export quantizes `linear_attn.in_proj_*` to FP8 and the fused
+`in_proj_qkvz` loader dies on the split `weight_scale`; the `RedHatAI` export
+keeps them bf16 but names them `in_proj_qkv`/`in_proj_z` in its ignore list
+while vLLM checks `in_proj_q/k/v/z` ("different quantization schemes"). A
+local copy with `re:.*linear_attn\\.in_proj_.*` added to the ignore list is
+the workaround under test. The export behind the 08-26 row was a local
+directory that no longer exists.
+
+For reference, the 2026-08-26 GPU2 rows: vLLM NVFP4 1,565 tok/s (TTFT 2.2 s,
+1,172/0), llama-server GGUF Q4_K_M 213 (238/111); single-user vLLM 208 ms
+TTFT @1.9k / 163 tok/s, llama-server 608 ms / 159.
 
 ## Prefill, by workload shape (4B, 2026-08-27, GPU2, fp8 KV)
 
@@ -241,9 +311,12 @@ PATCHES.md #44–#67 were measured against it.
 
 ## Open items
 
-- **27B, 100 users: −21%** against vLLM on the same card. Prefill duty cycle
-  is the lever; lanes above 48 lose because per-lane GDN state squeezes the
-  cache until sequences thrash.
+- **27B, 100 users: −20 % decode, −49 % prefill** against vLLM on the same
+  card. The GEMM family is the lever now measured: cuBLASLt's block-scaled
+  FP4 matmul is 1.4–1.9× the in-house W4A4 kernels from 64 tokens up,
+  bit-exact, in place (PATCHES.md #76 routes prefill widths to it); the GDN
+  recurrent scan (sequential, 23 % of the GDN family) is the next one.
+  Lanes above 48 lose because per-lane GDN state squeezes the cache.
 - **0.8B rare corruption**, ~4 per 100,000 requests (PATCHES.md, "Open").
 - **NVFP4 MoE conversion** for the 35B-A3B class (vLLM's 1,565 tok/s is the bar).
 - **Single-source NVFP4 ingest**: the converter still needs the bf16 base

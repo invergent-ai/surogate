@@ -395,7 +395,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
     }
 }
 
-template <class Geometry, int Threads = 256>
+template <class Geometry, int Threads = 256, bool TiledScales = false>
 __global__ __launch_bounds__(Threads, 512 / Threads) void nvfp4_w4a4_quantize_kernel(
     const __nv_bfloat16* __restrict__ input, std::uint8_t* __restrict__ codes,
     std::uint8_t* __restrict__ scales, std::int32_t tokens, float input_scale_divisor) {
@@ -414,7 +414,12 @@ __global__ __launch_bounds__(Threads, 512 / Threads) void nvfp4_w4a4_quantize_ke
     auto* code_destination =
         codes + static_cast<std::int64_t>(token) * Geometry::kCodeBytesPerRow + group * 8;
     store_vec(code_destination, make_uint2(quantized.codes_lo, quantized.codes_hi));
-    scales[static_cast<std::int64_t>(token) * kGroupsPerRow + group] = quantized.scale;
+    if constexpr (TiledScales) {
+        scales[nvfp4_tiled_scale_offset(token, group, Geometry::kInputRows / 64)] =
+            quantized.scale;
+    } else {
+        scales[static_cast<std::int64_t>(token) * kGroupsPerRow + group] = quantized.scale;
+    }
 }
 
 } // namespace ninfer::ops::detail

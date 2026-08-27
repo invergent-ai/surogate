@@ -964,6 +964,7 @@ add_library(ninfer_ops STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/linear/nvfp4/nvfp4_small_t.cu
   ${SERVE_ROOT}/ops/linear/nvfp4/nvfp4_w4a4.cu
   ${SERVE_ROOT}/ops/linear/nvfp4/nvfp4_dispatch.cpp
+  ${SERVE_ROOT}/ops/linear/nvfp4/nvfp4_cublaslt.cpp
   ${SERVE_ROOT}/ops/linear/q4/q4_small_t_mma.cu
   ${SERVE_ROOT}/ops/linear/q4/q4_rowsplit_gemm_mma.cu
   ${SERVE_ROOT}/ops/linear/q4/q4_rowsplit_gemm_simt.cu
@@ -1086,7 +1087,7 @@ set_source_files_properties(${SERVE_ROOT}/ops/linear/w8a8/w4fp4_cutlass_gemm.cu 
     INCLUDE_DIRECTORIES "${NINFER_CUTLASS_INCLUDE};${cutlass_SOURCE_DIR}/tools/util/include"
     COMPILE_OPTIONS "--expt-relaxed-constexpr")
 ninfer_cuda_archive(ninfer_ops)
-target_link_libraries(ninfer_ops PUBLIC ninfer_core PRIVATE ninfer_nvfp4_tma)
+target_link_libraries(ninfer_ops PUBLIC ninfer_core PRIVATE ninfer_nvfp4_tma CUDA::cublasLt)
 
 # Product-independent text and media mechanisms.
 add_library(ninfer_text STATIC EXCLUDE_FROM_ALL

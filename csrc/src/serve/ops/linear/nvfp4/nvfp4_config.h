@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cuda_runtime.h>
+
 #include <cstdint>
 #include <stdexcept>
 
@@ -114,6 +116,17 @@ using Nvfp4Residual17408Geometry = Nvfp4GemvGeometry<5120, 17408>;
 using Nvfp4Activation5120Geometry  = Nvfp4ActivationGeometry<5120>;
 using Nvfp4Activation6144Geometry  = Nvfp4ActivationGeometry<6144>;
 using Nvfp4Activation17408Geometry = Nvfp4ActivationGeometry<17408>;
+
+// Byte offset of the UE4M3 scale for (row, 16-wide group) in the 128x4 tiled layout shared by
+// the stored weight scales, the mma/TMA schedules and cuBLASLt's VEC16 block scaling.
+__host__ __device__ constexpr std::int64_t nvfp4_tiled_scale_offset(std::int32_t row,
+                                                                    std::int32_t group,
+                                                                    std::int32_t tiles_per_row) {
+    const std::int32_t m_tile    = row / 128;
+    const std::int32_t row_inner = row - m_tile * 128;
+    return (static_cast<std::int64_t>(m_tile) * tiles_per_row + group / 4) * 512 +
+           (row_inner & 31) * 16 + (row_inner >> 5) * 4 + (group & 3);
+}
 
 enum class Nvfp4Problem : std::uint8_t {
     AttnInput,

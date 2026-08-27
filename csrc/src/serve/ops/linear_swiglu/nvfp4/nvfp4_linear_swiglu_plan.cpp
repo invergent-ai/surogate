@@ -1,4 +1,5 @@
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
+#include "ops/linear/nvfp4/nvfp4_cublaslt.h"
 
 #include "core/layout.h"
 #include "api/ops/silu_mul.h"
@@ -36,7 +37,9 @@ Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
     if (tokens <= 4) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
     if (tokens <= 48) { return Nvfp4LinearSwiGluRoute::FusedW4A4; }
-    if (tokens == kPrimaryT) { return Nvfp4LinearSwiGluRoute::TmaFusedW4A4; }
+    if (tokens == kPrimaryT && !nvfp4_cublaslt_route(tokens)) {
+        return Nvfp4LinearSwiGluRoute::TmaFusedW4A4;
+    }
     return Nvfp4LinearSwiGluRoute::LinearW4A4Post;
 }
 
@@ -90,7 +93,8 @@ std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
     if (min_tokens <= 48 && max_tokens >= 5) {
         maximum = fused_workspace_bytes(std::min(max_tokens, 48));
     }
-    if (min_tokens <= kPrimaryT && max_tokens >= kPrimaryT) {
+    if (min_tokens <= kPrimaryT && max_tokens >= kPrimaryT &&
+        resolve_route(policy, kPrimaryT) == Nvfp4LinearSwiGluRoute::TmaFusedW4A4) {
         maximum = fused_workspace_bytes(kPrimaryT);
     }
 

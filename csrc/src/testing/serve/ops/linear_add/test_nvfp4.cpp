@@ -94,8 +94,11 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         Invocation{first_a4, ops::LinearPolicy::AllowA4},
         Invocation{17, ops::LinearPolicy::AllowA4},
         Invocation{1024, ops::LinearPolicy::AllowA4},
+        Invocation{300, ops::LinearPolicy::AllowA4},
+        Invocation{1077, ops::LinearPolicy::AllowA4},
+        Invocation{1300, ops::LinearPolicy::AllowA4},
     };
-    constexpr std::int32_t kMaximumTokens = 1024;
+    constexpr std::int32_t kMaximumTokens = 1300;
     quantized_weight::PatternedWeightOptions options;
     options.weight_scale_divisor = 0.125F;
     options.input_scale_divisor  = 3.5F;

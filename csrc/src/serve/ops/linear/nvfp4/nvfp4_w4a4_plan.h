@@ -14,6 +14,14 @@
 
 namespace ninfer::ops::detail {
 
+// How the activation quantizer lays out its UE4M3 scales: token-major for the in-house
+// schedules, 128x4 tiled (rows padded to 128) for the cuBLASLt route.
+enum class Nvfp4ScaleLayout : std::uint8_t { TokenMajor, Tiled };
+
+constexpr std::int32_t nvfp4_w4a4_scale_rows(std::int32_t tokens) {
+    return (tokens + 127) / 128 * 128;
+}
+
 struct Nvfp4W4a4Workspace {
     std::uint8_t* codes  = nullptr;
     std::uint8_t* scales = nullptr;
@@ -36,8 +44,8 @@ Nvfp4W4a4Workspace allocate_nvfp4_w4a4_workspace(Arena& arena, std::int32_t toke
     }
     const std::size_t code_bytes =
         nvfp4_w4a4_checked_bytes(tokens, static_cast<std::size_t>(input_rows) / 2);
-    const std::size_t scale_bytes =
-        nvfp4_w4a4_checked_bytes(tokens, static_cast<std::size_t>(input_rows) / 16);
+    const std::size_t scale_bytes = nvfp4_w4a4_checked_bytes(
+        nvfp4_w4a4_scale_rows(tokens), static_cast<std::size_t>(input_rows) / 16);
     const DeviceSpan codes  = arena.alloc_bytes(code_bytes, 256);
     const DeviceSpan scales = arena.alloc_bytes(scale_bytes, 256);
     return {static_cast<std::uint8_t*>(codes.data), static_cast<std::uint8_t*>(scales.data)};
@@ -51,7 +59,8 @@ inline std::size_t nvfp4_w4a4_workspace_capacity_bytes(std::int32_t tokens,
 }
 
 void launch_nvfp4_w4a4_quantize(const Tensor& x, const Weight& weight, Nvfp4W4a4Workspace workspace,
-                                cudaStream_t stream);
+                                cudaStream_t stream,
+                                Nvfp4ScaleLayout layout = Nvfp4ScaleLayout::TokenMajor);
 
 void launch_nvfp4_w4a4(const Tensor& x, const Weight& weight, Tensor& out,
                        Nvfp4W4a4Workspace workspace, cudaStream_t stream);

@@ -1,3 +1,4 @@
+#include "ops/linear/nvfp4/nvfp4_w4a4_split.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_tma_launch.h"
 
 #include "core/device.h"
@@ -15,6 +16,9 @@ namespace {
 
 using TmaM256N128   = Nvfp4W4a4TmaSchedule<256, 3, 1>;
 using TmaM256N128S2 = Nvfp4W4a4TmaSchedule<256, 2, 1>;
+static_assert(TmaM256N128::kBlockM == kNvfp4TmaBlockM &&
+                  TmaM256N128S2::kBlockM == kNvfp4TmaBlockM,
+              "the split helper must hand the TMA schedules whole blocks");
 
 constexpr std::int32_t kQueryRows  = 6144;
 constexpr std::int32_t kKeyRows    = 1024;
