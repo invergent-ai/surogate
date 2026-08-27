@@ -2367,3 +2367,36 @@ GDN state move to bf16 (#57) passed that bar — it matches what the comparison
 engine stores, and coherence was checked at temperature 0 on two models before
 the number went on the board. int8 KV did not, and the failing evidence was in
 the very run that produced its number.
+
+## 66. The serve CLI speaks vLLM's option vocabulary (2026-08-27)
+
+The server's flags are renamed to vLLM's, and the old spellings are removed
+rather than aliased:
+
+  --max-concurrency   ->  --max-num-seqs
+  --model-id          ->  --served-model-name
+  --max-context       ->  --max-model-len
+  --prefill-chunk     ->  --max-num-batched-tokens
+  --kv-dtype          ->  --kv-cache-dtype
+  --no-cuda-graph     ->  --enforce-eager
+
+A vLLM command line now transfers directly, which matters most for the thing
+this engine is measured against: a benchmark comparison should not require the
+reader to translate one side's knobs into the other's. --max-num-seqs in
+particular is the number the board's figures turn on — vLLM's 27B row is 32
+sequences, ours is 48 — and having both sides spell it the same way makes that
+visible rather than buried.
+
+--kv-cache-dtype accepts vLLM's "auto" as bf16. It rejects fp8 with a message
+saying so, because a command line copied from vLLM will carry
+--kv-cache-dtype fp8 and a generic parse error would send the reader looking
+for a typo instead of a missing feature. int8 remains available and remains
+documented as costing accuracy (#65).
+
+Error messages name the flag the caller can actually pass, and the bound is
+derived from kMaximumConcurrency rather than restated — this message read
+"--max-concurrency must be in [1,8]" long after the ceiling moved to 64.
+
+Old spellings are hard errors, verified one by one. The serve options test
+moved with them and passes. Bench binaries keep their own flag vocabularies;
+they are separate tools, not the server.

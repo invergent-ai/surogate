@@ -47,9 +47,18 @@ std::uint64_t parse_u64(const char* text, const char* label) {
 
 KvCacheStorage parse_kv_dtype(const char* text) {
     const std::string value(text);
-    if (value == "bf16") { return KvCacheStorage::BFloat16; }
+    // "auto" is vLLM's spelling for "the model's own dtype", which here is bf16.
+    if (value == "bf16" || value == "auto") { return KvCacheStorage::BFloat16; }
     if (value == "int8") { return KvCacheStorage::Int8Group64; }
-    throw std::invalid_argument("invalid kv-dtype: " + value);
+    // fp8 KV is vLLM's other common setting and this engine has no fp8 KV path;
+    // say that rather than reporting a generic parse failure, because a command
+    // line copied from vLLM will land here.
+    if (value == "fp8" || value == "fp8_e4m3" || value == "fp8_e5m2") {
+        throw std::invalid_argument("kv-cache-dtype " + value +
+                                    " is not supported; this engine serves bf16 KV (auto) or "
+                                    "int8, and int8 costs accuracy");
+    }
+    throw std::invalid_argument("invalid kv-cache-dtype: " + value + " (expected auto|bf16|int8)");
 }
 
 KvCapacityPolicy parse_kv_capacity(const char* text) {
@@ -64,16 +73,17 @@ KvCapacityPolicy parse_kv_capacity(const char* text) {
 std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
-           "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
+           "[--served-model-name ID] [--max-model-len N] [--kv-capacity N|auto] "
+           "[--max-num-seqs N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
-           "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
+           "[--max-num-batched-tokens N] [--log-stats-interval-ms N] [--device N] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
            "[--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
-           "[--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N] "
+           "[--kv-cache-dtype auto|int8] [--spec mtp|dflash --draft-tokens N] "
            "[--default-max-tokens N] "
-           "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
+           "[--vision] [--enforce-eager] [--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -86,7 +96,7 @@ std::string serve_usage_text(const char* argv0) {
            "       --media-live-mib defaults to 2048 and bounds all live BF16 patch payloads\n"
            "       --media-preprocess-threads defaults to 0 (auto, at most 16 workers)\n"
            "       --request-log-jsonl appends full-precision server/request records\n"
-           "       --model-id overrides the artifact identity.model_id reported by the server\n"
+           "       --served-model-name overrides the artifact identity.model_id reported by the server\n"
            "       Responses state is process-local and bounded to 1024 records / 256 MiB by "
            "default\n"
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
@@ -134,29 +144,33 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.port = parse_nonnegative_int(require_value("--port"), "port");
         } else if (arg == "--api-key") {
             options.api_key = require_value("--api-key");
-        } else if (arg == "--model-id") {
-            options.model_id_override = require_value("--model-id");
+        } else if (arg == "--served-model-name") {
+            options.model_id_override = require_value("--served-model-name");
             if (options.model_id_override->empty()) {
-                throw std::invalid_argument("--model-id must not be empty");
+                throw std::invalid_argument("--served-model-name must not be empty");
             }
-        } else if (arg == "--max-context") {
+        } else if (arg == "--max-model-len") {
             options.max_context = static_cast<std::uint32_t>(
-                parse_nonnegative_int(require_value("--max-context"), "max-context"));
+                parse_nonnegative_int(require_value("--max-model-len"), "max-model-len"));
         } else if (arg == "--kv-capacity") {
             options.kv_capacity  = parse_kv_capacity(require_value("--kv-capacity"));
             kv_capacity_explicit = true;
-        } else if (arg == "--max-concurrency") {
+        } else if (arg == "--max-num-seqs") {
+            // vLLM's name for the same quantity: sequences run per iteration,
+            // which here is the lane count. The engine speaks vLLM's option
+            // vocabulary so a command line transfers directly and a benchmark
+            // comparison is like-for-like without translation.
             options.max_concurrency = static_cast<std::uint32_t>(
-                parse_nonnegative_int(require_value("--max-concurrency"), "max-concurrency"));
+                parse_nonnegative_int(require_value("--max-num-seqs"), "max-num-seqs"));
         } else if (arg == "--max-pending-requests") {
             options.max_pending_requests = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--max-pending-requests"), "max-pending-requests"));
         } else if (arg == "--pending-timeout-ms") {
             options.pending_timeout_ms = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--pending-timeout-ms"), "pending-timeout-ms"));
-        } else if (arg == "--prefill-chunk") {
+        } else if (arg == "--max-num-batched-tokens") {
             options.prefill_chunk = static_cast<std::uint32_t>(
-                parse_nonnegative_int(require_value("--prefill-chunk"), "prefill-chunk"));
+                parse_nonnegative_int(require_value("--max-num-batched-tokens"), "max-num-batched-tokens"));
         } else if (arg == "--log-stats-interval-ms") {
             options.log_stats_interval_ms = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--log-stats-interval-ms"), "log-stats-interval-ms"));
@@ -209,8 +223,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.response_store_max_bytes = static_cast<std::size_t>(mib << 20);
         } else if (arg == "--device") {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
-        } else if (arg == "--kv-dtype") {
-            options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
+        } else if (arg == "--kv-cache-dtype") {
+            options.kv_cache = parse_kv_dtype(require_value("--kv-cache-dtype"));
         } else if (arg == "--spec") {
             options.speculative.backend =
                 product::parse_speculative_backend(require_value("--spec"));
@@ -223,7 +237,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             default_max_tokens_explicit = true;
         } else if (arg == "--vision") {
             options.enable_vision = true;
-        } else if (arg == "--no-cuda-graph") {
+        } else if (arg == "--enforce-eager") {
             options.use_cuda_graph = false;
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
@@ -267,16 +281,16 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.port <= 0 || options.port > 65535) {
         throw std::invalid_argument("--port must be in [1,65535]");
     }
-    if (options.max_context == 0) { throw std::invalid_argument("--max-context must be positive"); }
+    if (options.max_context == 0) { throw std::invalid_argument("--max-model-len must be positive"); }
     if (options.kv_capacity.mode == KvCapacityMode::Explicit &&
         options.kv_capacity.explicit_tokens < options.max_context) {
-        throw std::invalid_argument("--kv-capacity must be at least --max-context");
+        throw std::invalid_argument("--kv-capacity must be at least --max-model-len");
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         // The bound is kMaximumConcurrency; say so rather than restating a
         // number. This message read "[1,8]" long after the ceiling moved to 64,
         // which sends anyone hitting it looking in the wrong place.
-        throw std::invalid_argument("--max-concurrency must be in [1," +
+        throw std::invalid_argument("--max-num-seqs must be in [1," +
                                     std::to_string(kMaximumConcurrency) + "]");
     }
     if (options.max_pending_requests == 0) {
@@ -289,7 +303,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--max-request-mib must be positive");
     }
     if (options.prefill_chunk == 0 || options.prefill_chunk % 128 != 0) {
-        throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
+        throw std::invalid_argument("--max-num-batched-tokens must be a positive multiple of 128");
     }
     product::validate_speculative_cli_options(options.speculative);
     if (options.speculative.backend == SpeculativeBackend::DFlash && options.enable_vision) {

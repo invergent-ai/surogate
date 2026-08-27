@@ -60,7 +60,7 @@ int main() {
                       "artifact model id was not selected by default");
 
     const ServeOptions model_alias =
-        parse({"ninfer-serve", "model.ninfer", "--model-id", "deployment-alias"});
+        parse({"ninfer-serve", "model.ninfer", "--served-model-name", "deployment-alias"});
     failures +=
         check(model_alias.model_id_override == "deployment-alias" &&
                   resolve_public_model_id(model_alias, "artifact-model") == "deployment-alias",
@@ -68,9 +68,9 @@ int main() {
 
     bool empty_model_id_rejected = false;
     try {
-        (void)parse({"ninfer-serve", "model.ninfer", "--model-id", ""});
+        (void)parse({"ninfer-serve", "model.ninfer", "--served-model-name", ""});
     } catch (const std::invalid_argument&) { empty_model_id_rejected = true; }
-    failures += check(empty_model_id_rejected, "empty --model-id was accepted");
+    failures += check(empty_model_id_rejected, "empty --served-model-name was accepted");
 
     const ServeOptions dflash = parse({"ninfer-serve", "model.ninfer", "--spec", "dflash",
                                        "--draft-tokens", "15", "--lm-head-draft"});
@@ -98,13 +98,13 @@ int main() {
                                            "model.ninfer",
                                            "--no-prefix-reuse",
                                            "--vision",
-                                           "--max-concurrency",
+                                           "--max-num-seqs",
                                            "4",
                                            "--max-pending-requests",
                                            "12",
                                            "--pending-timeout-ms",
                                            "2500",
-                                           "--max-context",
+                                           "--max-model-len",
                                            "4096",
                                            "--kv-capacity",
                                            "8192",
@@ -123,7 +123,7 @@ int main() {
     failures +=
         check(configured.preserve_thinking, "--preserve-thinking did not reach serving options");
     failures +=
-        check(configured.max_concurrency == 4, "--max-concurrency did not reach serving options");
+        check(configured.max_concurrency == 4, "--max-num-seqs did not reach serving options");
     failures += check(configured.max_context == 4096 &&
                           configured.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
                           configured.kv_capacity.explicit_tokens == 8192,
@@ -207,10 +207,10 @@ int main() {
               "serve help omits the artifact-derived model id default");
 
     const ServeOptions inherited =
-        parse({"ninfer-serve", "model.ninfer", "--max-context", "16384"});
+        parse({"ninfer-serve", "model.ninfer", "--max-model-len", "16384"});
     failures += check(inherited.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
                           inherited.kv_capacity.explicit_tokens == 16384,
-                      "omitted --kv-capacity did not follow --max-context");
+                      "omitted --kv-capacity did not follow --max-model-len");
 
     const ServeOptions automatic = parse({"ninfer-serve", "model.ninfer", "--kv-capacity", "auto"});
     failures += check(automatic.kv_capacity.mode == ninfer::KvCapacityMode::Automatic &&
