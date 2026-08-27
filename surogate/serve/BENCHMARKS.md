@@ -13,7 +13,9 @@ Engines: **surogate serve** (this repo @ 6102534), **vLLM 0.27.1**
 (flashinfer 0.6.16.post3), **llama.cpp** CUDA source build (0.3.0-dev @
 f1357e4, sm_120; the brew Vulkan build is kept only where noted).
 
-Engine configuration: `--max-num-seqs 64` at 0.8B/4B and `48` at 27B (each
+Engine configuration (rows dated 2026-08-27 pm use `--max-num-seqs 64` and
+`--max-num-batched-tokens 4096` on the 27B/35B, see the chunk-width and lane
+paragraphs): originally `--max-num-seqs 64` at 0.8B/4B and `48` at 27B (each
 model's measured optimum), `--max-pending-requests 256`, prefill and
 mixed-round CUDA graphs on, GDN recurrent state stored bf16, **fp8 (e4m3) KV
 cache — the default since PATCHES.md #69**; `--kv-cache-dtype bf16` restores
@@ -86,6 +88,14 @@ users, 512/128, 90 s. Engine at fp8 KV; vLLM at its default cache (fp8 at
 | | GPU6 | **vLLM** | **1,051** | **4,203** | 8.2 s | 836/0 |
 | Qwen3.8-27B @64 lanes, prefill-heavy 2048/16 | GPU6 | surogate serve | 49 | 6,280 | 30.0 s | 369/0 |
 | | GPU6 | **vLLM** | 92 | **11,822** | **14.9 s** | 607/0 |
+| Qwen3.8-27B @64 lanes, chunk 4,096, prefill-heavy | GPU6 | surogate serve | 52 | 6,678 | 28.4 s | 388/0 |
+| | GPU6 | **vLLM** | 92 | **11,818** | **14.9 s** | 607/0 |
+| Qwen3.8-27B @64 lanes, chunk 4,096 (balanced) | GPU6 | surogate serve | 913 | 3,652 | **5.0 s** | 699/0 |
+| | GPU6 | **vLLM** | **1,062** | **4,247** | 8.1 s | 836/0 |
+| Qwen3.5-0.8B @64 lanes, chunk 2,048 | GPU0 | **surogate serve** | **6,478** | **25,910** | 0.72 s | 4,623/0 |
+| | GPU0 | vLLM | 6,174 | 24,700 | **0.51 s** | 4,398/0 |
+| Qwen3.5-0.8B @64 lanes, chunk 2,048, prefill-heavy | GPU0 | **surogate serve** | **502** | **64,208** | **3.0 s** | 2,917/0 |
+| | GPU0 | vLLM | 356 | 45,571 | 3.8 s | 2,086/0 |
 
 † engine prefill tok/s and TTFT p50 are taken from the server's own interval
 and per-request logs of the same runs (the pairing script summarised only
@@ -184,7 +194,9 @@ one — about 7 % per round removed, which is the per-round fixed cost
 amortise the same way. The same shape on the other models, same card each,
 1,024 → 2,048: 0.8B 58,042 → 64,150 (+10.5 %, GPU0), 4B 15,489 → 16,773
 (+8.3 %, GPU2), 35B-A3B 12,458 → 13,653 (+9.6 %, GPU1); the 35B at 4,096
-reaches 15,276 on GPU7. Lanes on the 27B: 64 beats 48 on every shape now
+reaches 15,276 on GPU7. CUDA graphs are not a lever on this shape: same card (GPU7), 64 lanes,
+chunk 4,096, 100 users, `--enforce-eager` 6,882 against graph replay 6,821
+prompt tok/s. Lanes on the 27B: 64 beats 48 on every shape now
 (balanced 897 vs 833-class, decode-heavy 1,884 vs 1,633). Single-user prefill
 (2,048 tokens): engine 264 ms eager / 257 ms graph (GPU5) against vLLM
 213 ms (GPU3), so the single-stream gap is ~1.3× and the rest of the 2×
@@ -222,10 +234,16 @@ offloading is involved. 100 users, 90 s, GPU7, fp8 KV, 64 lanes:
 | **vLLM** NVFP4 (512/128) | GPU1 | **2,252** | **9,009** | **2.9 s** | 1,631/0 |
 | surogate serve (2048/16) | GPU1 | 107 | 13,720 | 14.1 s | 698/0 |
 | **vLLM** NVFP4 (2048/16) | GPU1 | 176 | **22,569** | **7.7 s** | 1,076/0 |
+| surogate serve (512/128), chunk 4,096 | GPU3 | 1,509 | 6,036 | 3.0 s | 1,122/0 |
+| **vLLM** NVFP4 (512/128) | GPU3 | **2,260** | **9,042** | **1.3 s** | 1,641/0 |
+| surogate serve (2048/16), chunk 4,096 | GPU3 | 116 | 14,884 | 12.8 s | 748/0 |
+| **vLLM** NVFP4 (2048/16) | GPU3 | 172 | **22,050** | **7.9 s** | 1,052/0 |
 
-The engine is at 67 % of vLLM on the balanced shape and 61 % on prefill-heavy
-— the same gap as the 27B, and the 35B has no NVFP4 weights, so the gap is not
-the GEMM family. (Earlier GPU7 rows, different card: 1,596 / 6,384 and 13,531.)
+The engine is at 67 % of vLLM on both shapes (prefill-heavy 61 % before
+`--max-num-batched-tokens 4096`) — the same gap as the 27B, and the 35B has no
+NVFP4 weights, so the gap is not the GEMM family. `--max-num-seqs` is capped
+at 64 while vLLM runs the MoE at 256 sequences; that cap is the structural
+35B decode lever. (Earlier GPU7 rows, different card: 1,596 / 6,384 and 13,531.)
 
 vLLM's rows above run `RedHatAI/Qwen3.6-35B-A3B-NVFP4` from a local copy whose
 `config.json` ignore list gained `re:.*linear_attn\\.in_proj_.*` — the export
