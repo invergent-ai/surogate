@@ -64,7 +64,11 @@ std::size_t snapshot_capacity(Fp8GdnConvPlan maximum_plan, std::int32_t material
 
 std::size_t record_capacity(Fp8GdnConvPlan plan, std::int32_t aggregate_columns) {
     if (plan.schedule != Fp8GdnConvScheduleId::MaterializedA8) { return 0; }
-    return fp8_a8_workspace_capacity_bytes(aggregate_columns, Fp8GdnInputGeometry::kInputRows);
+    // The cuBLASLt route stages its fp32 product here exactly as the snapshot path does; the
+    // record path used to omit it, which only stayed hidden while every caller ran below the
+    // route's threshold (#85).
+    return fp8_a8_workspace_capacity_bytes(aggregate_columns, Fp8GdnInputGeometry::kInputRows,
+                                           fp8_cublaslt_route(aggregate_columns) ? 10240 : 0);
 }
 
 void launch_projection(const Tensor& x, const Weight& weight, Tensor& projected, Tensor& z,
