@@ -2400,3 +2400,31 @@ derived from kMaximumConcurrency rather than restated — this message read
 Old spellings are hard errors, verified one by one. The serve options test
 moved with them and passes. Bench binaries keep their own flag vocabularies;
 they are separate tools, not the server.
+
+## 67. The 4B's fp4 helper kernels resist tuning (2026-08-27)
+
+The fp4 path's helpers are 9% of the 4B's device time and look like pure
+overhead around the GEMMs: w4fp4_act_quant_atom 223 ms across 17,076 launches
+(4.3%), w4fp4_swiglu_pair 138 ms, w4fp4_split2 110 ms.
+
+The activation quantizer reads each row TWICE — once to reduce the token max,
+once to quantize — and with groups <= kThreads each thread re-reads the same 32
+bytes it already had. Caching those values in registers so the second pass
+replays from them is the obvious fix, and it measures NEGATIVE:
+
+  baseline                       4B 3,032   0.8B 6,692
+  cache 2 groups per thread      4B 2,986   0.8B 6,687
+  cache 1 group per thread       4B 3,010   0.8B 6,720
+
+Both worse on the 4B; the 0.8B's +28 is inside run variance. The extra
+registers cost more occupancy than the saved read returns, which says the
+kernel is not read-bound in the way its two passes suggest — at 13 us for a
+2.6 MB row it is short enough that launch and occupancy dominate.
+
+Reverted. What this rules out is tuning this kernel from the outside; what
+remains open is removing it, by folding the quantization into the producing
+rmsnorm's epilogue (the RmsEpilogue template parameter already exists) so the
+row is never re-read or re-written at all. That is a plumbing change — the
+workspace the codes land in is allocated by the GEMM's dispatch, downstream of
+the norm — and it is the only version of this idea with a mechanism behind it
+rather than a hope.
