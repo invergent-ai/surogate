@@ -190,6 +190,16 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeature
         binder, "vision/merger/fc2_bias", NumericFormat::BF16, {2048}, vision_placement);
     out.vision_merger_norm = qwen3_6::bind_vision_merger_norm(binder, vision_placement);
 
+    // The DFlash drafter is a separate checkpoint the converter may not have
+    // had; such artifacts omit every dflash/* object. Probe the family once
+    // and turn a missing drafter into a startup error only when DFlash was
+    // actually requested, rather than a missing-object failure on load.
+    out.has_dflash = binder.has("dflash/feature_projection");
+    if (!out.has_dflash && features.dflash()) {
+        throw std::runtime_error(
+            "qwen3.6-35b-a3b artifact has no DFlash drafter (converted without "
+            "--dflash-model); run without --spec dflash");
+    }
     const artifact::TensorPlacement dflash_placement =
         features.dflash() ? artifact::TensorPlacement::Device
                           : artifact::TensorPlacement::ValidateOnly;
@@ -197,6 +207,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeature
                                  std::initializer_list<std::uint64_t> shape) {
         return artifact::bind_tensor(binder, name, format, shape, dflash_placement);
     };
+    if (out.has_dflash) {
     out.dflash.feature_projection =
         bind_dflash("dflash/feature_projection", NumericFormat::W8G32_F16S, {2048, 16384});
     out.dflash.context_norm = bind_dflash("dflash/context_norm", NumericFormat::BF16, {2048});
@@ -218,6 +229,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeature
         target.down = bind_dflash(prefix + "mlp/down", NumericFormat::W8G32_F16S, {2048, 6144});
     }
     out.dflash.final_norm = bind_dflash("dflash/final_norm", NumericFormat::BF16, {2048});
+    }
 
     load_plan.materialization = binder.finish();
     return load_plan;

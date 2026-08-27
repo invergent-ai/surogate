@@ -490,9 +490,17 @@ def _preflight_exact_source(
     requirements: dict[str, SourceTensor],
     label: str,
 ) -> SourcePreflight:
+    # The reader folds VL-style nesting (model.language_model.* -> model.*)
+    # while this recipe addresses sources in the nested dialect; compare the
+    # inventory in the folded dialect so both spellings agree (the 27B NVFP4
+    # recipe does the same).
+    def _folded(name: str) -> str:
+        prefix = "model.language_model."
+        return "model." + name[len(prefix):] if name.startswith(prefix) else name
+
     with reader:
-        actual_names = set(reader.names)
-    required_names = set(requirements)
+        actual_names = {_folded(name) for name in reader.names}
+    required_names = {_folded(name) for name in requirements}
     if actual_names != required_names:
         missing = sorted(required_names - actual_names)
         extra = sorted(actual_names - required_names)

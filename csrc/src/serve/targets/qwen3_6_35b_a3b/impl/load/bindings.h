@@ -102,6 +102,9 @@ struct BindingPlan {
     artifact::ObjectHandle vision_merger_fc2_bias;
     qwen3_6::VisionMergerNormPlan vision_merger_norm;
     DFlashPlan dflash;
+    // Artifacts converted without the DFlash drafter checkpoint omit the
+    // dflash/* objects; the DFlash backend requires has_dflash.
+    bool has_dflash = false;
 };
 
 struct ArtifactLoadPlan {

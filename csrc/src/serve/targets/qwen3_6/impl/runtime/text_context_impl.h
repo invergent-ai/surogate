@@ -985,9 +985,48 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Ph
     Variant::post_mixer(h, *m.payload, x, ph, work_, s);
 }
 
+// Per-family prefill timing behind SUROGATE_SERVE_PREFILL_TIMING: events
+// around each mixer and MLP, summarised every 32 prefill chunks. It is the
+// instrument for "where does a prefill chunk's time go" when a profiler is
+// not available; the synchronize it adds at the end of run_layers only
+// exists while the switch is set.
+struct PrefillFamilyTimer {
+    bool enabled = std::getenv("SUROGATE_SERVE_PREFILL_TIMING") != nullptr;
+    cudaEvent_t begin{}, attn{}, mlp_full{}, gdn{}, mlp_gdn{};
+    cudaEvent_t g_proj{}, g_conv{}, g_scan{}, g_out{};
+    double t_attn = 0, t_mlp_full = 0, t_gdn = 0, t_mlp_gdn = 0;
+    double t_g_proj = 0, t_g_conv = 0, t_g_scan = 0, t_g_out = 0;
+    std::uint64_t chunks = 0, tokens = 0;
+    PrefillFamilyTimer() {
+        if (!enabled) { return; }
+        for (cudaEvent_t* e : {&begin, &attn, &mlp_full, &gdn, &mlp_gdn, &g_proj, &g_conv, &g_scan, &g_out}) {
+            cudaEventCreateWithFlags(e, cudaEventDefault);
+        }
+    }
+};
+inline PrefillFamilyTimer& prefill_family_timer() {
+    static PrefillFamilyTimer timer;
+    return timer;
+}
+
 template <class Tap>
 void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
     const bool prefill = ph == Phase::Prefill;
+    PrefillFamilyTimer& timer = prefill_family_timer();
+    // Event synchronisation is illegal inside stream capture, and a captured
+    // body's replay cannot be timed per family anyway: measure eager prefill
+    // only (--enforce-eager), never a body being captured.
+    cudaStreamCaptureStatus capturing = cudaStreamCaptureStatusNone;
+    if (prefill && timer.enabled) { cudaStreamIsCapturing(ctx_.stream, &capturing); }
+    const bool timing = prefill && timer.enabled && capturing == cudaStreamCaptureStatusNone;
+    float acc_attn = 0, acc_mlp_full = 0, acc_gdn = 0, acc_mlp_gdn = 0;
+    const auto lap = [&](cudaEvent_t from, cudaEvent_t to, float& into) {
+        cudaEventRecord(to, ctx_.stream);
+        cudaEventSynchronize(to);
+        float ms = 0;
+        cudaEventElapsedTime(&ms, from, to);
+        into += ms;
+    };
     for (int layer = 0; layer < kCfg.n_layers; ++layer) {
         if (ModelConfig::is_full(layer)) {
             const int fidx         = ModelConfig::full_idx(layer);
@@ -1000,14 +1039,18 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     prefill ? nvtx::Name::PrefillAttention : nvtx::Name::VerifyAttention,
                     nvtx::Category::Attention, static_cast<std::uint64_t>(layer));
                 auto mixer_scope = work_.scope();
+                if (timing) { cudaEventRecord(timer.begin, ctx_.stream); }
                 attn_mix(full, x, fidx, ph);
+                if (timing) { lap(timer.begin, timer.attn, acc_attn); }
             }
             {
                 nvtx::ScopedRange post_mixer_range(
                     prefill ? nvtx::Name::PrefillPostMixer : nvtx::Name::VerifyPostMixer,
                     nvtx::Category::PostMixer, static_cast<std::uint64_t>(layer));
                 auto mlp_scope = work_.scope();
+                if (timing) { cudaEventRecord(timer.begin, ctx_.stream); }
                 mlp_tail(full.post_attn_norm, full.mlp, x, ph);
+                if (timing) { lap(timer.begin, timer.mlp_full, acc_mlp_full); }
                 if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
             }
         } else {
@@ -1021,16 +1064,37 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     prefill ? nvtx::Name::PrefillGdn : nvtx::Name::VerifyGdn, nvtx::Category::Gdn,
                     static_cast<std::uint64_t>(layer));
                 auto mixer_scope = work_.scope();
+                if (timing) { cudaEventRecord(timer.begin, ctx_.stream); }
                 gdn_mix(gdn, x, gidx, ph);
+                if (timing) { lap(timer.begin, timer.gdn, acc_gdn); }
             }
             {
                 nvtx::ScopedRange post_mixer_range(
                     prefill ? nvtx::Name::PrefillPostMixer : nvtx::Name::VerifyPostMixer,
                     nvtx::Category::PostMixer, static_cast<std::uint64_t>(layer));
                 auto mlp_scope = work_.scope();
+                if (timing) { cudaEventRecord(timer.begin, ctx_.stream); }
                 mlp_tail(gdn.post_attn_norm, gdn.mlp, x, ph);
+                if (timing) { lap(timer.begin, timer.mlp_gdn, acc_mlp_gdn); }
                 if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
             }
+        }
+    }
+    if (timing) {
+        timer.t_attn += acc_attn; timer.t_mlp_full += acc_mlp_full;
+        timer.t_gdn += acc_gdn;   timer.t_mlp_gdn += acc_mlp_gdn;
+        timer.chunks += 1;        timer.tokens += static_cast<std::uint64_t>(x.ne[1]);
+        if (timer.chunks % 32 == 0) {
+            const double total = timer.t_attn + timer.t_mlp_full + timer.t_gdn + timer.t_mlp_gdn;
+            std::fprintf(stderr,
+                         "prefill-families: %llu chunks, %.0f tokens/chunk: attn %.1f%% "
+                         "mlp(full) %.1f%% gdn %.1f%% mlp(gdn) %.1f%% | %.2f ms/chunk, "
+                         "%.0f tok/s inside run_layers\n",
+                         static_cast<unsigned long long>(timer.chunks),
+                         static_cast<double>(timer.tokens) / timer.chunks,
+                         100 * timer.t_attn / total, 100 * timer.t_mlp_full / total,
+                         100 * timer.t_gdn / total, 100 * timer.t_mlp_gdn / total,
+                         total / timer.chunks, 1000.0 * timer.tokens / total);
         }
     }
 }
@@ -1089,12 +1153,25 @@ PrefillChunkResult TextContext::mixed_chunk(std::span<const int> full_ids, std::
     Tensor x = roots.residual;
     ops::embedding(ids_device, *embed_, x, s);
 
+    PrefillFamilyTimer& timer = prefill_family_timer();
+    cudaStreamCaptureStatus capturing = cudaStreamCaptureStatusNone;
+    if (timer.enabled) { cudaStreamIsCapturing(s, &capturing); }
+    const bool timing = timer.enabled && capturing == cudaStreamCaptureStatusNone;
+    float acc_attn = 0, acc_mlp_full = 0, acc_gdn = 0, acc_mlp_gdn = 0;
+    const auto lap = [&](cudaEvent_t from, cudaEvent_t to, float& into) {
+        cudaEventRecord(to, s);
+        cudaEventSynchronize(to);
+        float ms = 0;
+        cudaEventElapsedTime(&ms, from, to);
+        into += ms;
+    };
     for (int layer = 0; layer < kCfg.n_layers; ++layer) {
         if (ModelConfig::is_full(layer)) {
             const int fidx         = ModelConfig::full_idx(layer);
             const FullLayerW& full = full_.at(static_cast<std::size_t>(fidx));
             {
                 auto mixer_scope      = work_.scope();
+                if (timing) { cudaEventRecord(timer.begin, s); }
                 const auto projection = workspace_recipe::text_attention_projection<TextConfig>(
                     work_, total);
                 Tensor h = projection.hidden;
@@ -1159,16 +1236,20 @@ PrefillChunkResult TextContext::mixed_chunk(std::span<const int> full_ids, std::
                 ops::sigmoid_mul(gate, a, s);
                 Variant::attention_output_projection(a.view({kCfg.q_size, total}), *full.o_proj, x,
                                                      Phase::Prefill, work_, s);
+                if (timing) { lap(timer.begin, timer.attn, acc_attn); }
             }
             {
                 auto mlp_scope = work_.scope();
+                if (timing) { cudaEventRecord(timer.begin, s); }
                 mlp_tail(full.post_attn_norm, full.mlp, x, Phase::Prefill);
+                if (timing) { lap(timer.begin, timer.mlp_full, acc_mlp_full); }
             }
         } else {
             const int gidx       = ModelConfig::gdn_idx(layer);
             const GdnLayerW& gdn = gdn_.at(static_cast<std::size_t>(gidx));
             {
                 auto mixer_scope   = work_.scope();
+                if (timing) { cudaEventRecord(timer.begin, s); }
                 const auto control = workspace_recipe::gdn_control<TextConfig>(work_, total);
                 Tensor h           = control.hidden;
                 Tensor g           = control.g;
@@ -1185,6 +1266,8 @@ PrefillChunkResult TextContext::mixed_chunk(std::span<const int> full_ids, std::
                 Tensor qkv      = conv.projected;
                 Variant::gdn_input_projection(h, *gdn.projection, qkv, z, Phase::Prefill, work_, s);
                 Tensor qkv_c = conv.convolved;
+                float acc_g_proj = 0, acc_g_conv = 0, acc_g_scan = 0, acc_g_out = 0;
+                if (timing) { lap(timer.begin, timer.g_proj, acc_g_proj); cudaEventRecord(timer.begin, s); }
                 {
                     Tensor qkv_a   = qkv.slice(1, 0, prefill_cols);
                     Tensor qkv_ca  = qkv_c.slice(1, 0, prefill_cols);
@@ -1203,6 +1286,7 @@ PrefillChunkResult TextContext::mixed_chunk(std::span<const int> full_ids, std::
                                                      Tensor{}, decode.linear_state_slots,
                                                      decode.linear_state_slots, qkv_cb, s);
                 }
+                if (timing) { lap(timer.begin, timer.g_conv, acc_g_conv); cudaEventRecord(timer.begin, s); }
                 ops::extract_bf16_columns(qkv_c, 0, qc, s);
                 ops::extract_bf16_columns(qkv_c, kCfg.key_dim, kc, s);
                 ops::extract_bf16_columns(qkv_c, 2 * kCfg.key_dim, vc, s);
@@ -1244,13 +1328,44 @@ PrefillChunkResult TextContext::mixed_chunk(std::span<const int> full_ids, std::
                 }
                 Tensor on = workspace_recipe::gdn_normalized_output<TextConfig>(work_, total)
                                 .view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, total});
+                if (timing) { lap(timer.begin, timer.g_scan, acc_g_scan); cudaEventRecord(timer.begin, s); }
                 ops::gated_rmsnorm(o, *gdn.gdn_norm, z, kCfg.rms_eps, on, s);
                 Variant::gdn_output_projection(on.view({kCfg.value_dim, total}), *gdn.out_proj, x,
                                                Phase::Prefill, work_, s);
+                if (timing) { lap(timer.begin, timer.g_out, acc_g_out); timer.t_g_proj += acc_g_proj; timer.t_g_conv += acc_g_conv; timer.t_g_scan += acc_g_scan; timer.t_g_out += acc_g_out; cudaEventRecord(timer.begin, s); }
+                if (timing) { lap(timer.begin, timer.gdn, acc_gdn); }
+                if (timing) { acc_gdn += acc_g_proj + acc_g_conv + acc_g_scan + acc_g_out; }
             }
             {
                 auto mlp_scope = work_.scope();
+                if (timing) { cudaEventRecord(timer.begin, s); }
                 mlp_tail(gdn.post_attn_norm, gdn.mlp, x, Phase::Prefill);
+                if (timing) { lap(timer.begin, timer.mlp_gdn, acc_mlp_gdn); }
+            }
+        }
+    }
+    if (timing) {
+        timer.t_attn += acc_attn; timer.t_mlp_full += acc_mlp_full;
+        timer.t_gdn += acc_gdn;   timer.t_mlp_gdn += acc_mlp_gdn;
+        timer.chunks += 1;        timer.tokens += static_cast<std::uint64_t>(prefill_cols);
+        if (timer.chunks % 32 == 0) {
+            const double tot = timer.t_attn + timer.t_mlp_full + timer.t_gdn + timer.t_mlp_gdn;
+            std::fprintf(stderr,
+                         "prefill-families(mixed): %llu chunks, %.0f prefill tokens/chunk + %d "
+                         "decode cols: attn %.1f%% mlp(full) %.1f%% gdn %.1f%% mlp(gdn) %.1f%% | "
+                         "%.2f ms/chunk, %.0f prefill tok/s inside the layer loop\n",
+                         static_cast<unsigned long long>(timer.chunks),
+                         static_cast<double>(timer.tokens) / timer.chunks, batch,
+                         100 * timer.t_attn / tot, 100 * timer.t_mlp_full / tot,
+                         100 * timer.t_gdn / tot, 100 * timer.t_mlp_gdn / tot,
+                         tot / timer.chunks, 1000.0 * timer.tokens / tot);
+            const double g = timer.t_g_proj + timer.t_g_conv + timer.t_g_scan + timer.t_g_out;
+            if (g > 0) {
+                std::fprintf(stderr,
+                             "prefill-families(mixed) gdn sub-split: in_proj %.1f%% conv %.1f%% "
+                             "recurrent scan %.1f%% norm+out_proj %.1f%% (%.2f ms/chunk)\n",
+                             100 * timer.t_g_proj / g, 100 * timer.t_g_conv / g,
+                             100 * timer.t_g_scan / g, 100 * timer.t_g_out / g, g / timer.chunks);
             }
         }
     }

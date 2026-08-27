@@ -155,11 +155,11 @@ ObjectPlan = family_conversion.ObjectPlan
 @dataclass(frozen=True, slots=True)
 class ConversionPreflight:
     model_dir: Path
-    dflash_model_dir: Path
+    dflash_model_dir: Path | None
     base_config_summary: dict[str, object]
-    dflash_config_summary: dict[str, object]
+    dflash_config_summary: dict[str, object] | None
     base_source: recipe.SourcePreflight
-    dflash_source: recipe.SourcePreflight
+    dflash_source: recipe.SourcePreflight | None
     resources: tuple[ResourcePayload, ...]
     draft: draft_head.DraftHeadContext
     object_plan: ObjectPlan
@@ -323,31 +323,57 @@ def load_resources(model_dir: str | Path) -> tuple[ResourcePayload, ...]:
     )
 
 
-def build_object_plan(resources: Mapping[str, bytes]) -> ObjectPlan:
-    return family_conversion.build_object_plan(inventory.OBJECT_SPECS, resources)
+def object_specs(include_dflash: bool) -> tuple[inventory.StoredObjectSpec, ...]:
+    """The artifact's objects, with the dflash/* family only when a drafter
+    checkpoint was supplied. The engine probes for that family and refuses
+    --spec dflash against an artifact that lacks it."""
+    if include_dflash:
+        return inventory.OBJECT_SPECS
+    return tuple(
+        spec for spec in inventory.OBJECT_SPECS
+        if spec not in inventory.DFLASH_TENSOR_SPECS
+    )
+
+
+def build_object_plan(
+    resources: Mapping[str, bytes], include_dflash: bool = True
+) -> ObjectPlan:
+    return family_conversion.build_object_plan(object_specs(include_dflash), resources)
 
 
 def preflight_conversion(
     model_dir: str | Path,
-    dflash_model_dir: str | Path,
+    dflash_model_dir: str | Path | None,
 ) -> ConversionPreflight:
-    """Complete config, source, shortlist, and offset work before writing."""
+    """Complete config, source, shortlist, and offset work before writing.
+
+    ``dflash_model_dir`` is optional: the DFlash drafter is a separate
+    checkpoint, and without it the artifact simply omits the dflash/* family
+    (speculation stays available through MTP and the draft head)."""
 
     model = Path(model_dir)
-    dflash_model = Path(dflash_model_dir)
+    dflash_model = Path(dflash_model_dir) if dflash_model_dir is not None else None
     base_config_summary = validate_config(
         family_conversion.load_json(model / "config.json")
     )
-    dflash_config_summary = validate_dflash_config(
-        family_conversion.load_json(dflash_model / "config.json")
+    dflash_config_summary = (
+        validate_dflash_config(
+            family_conversion.load_json(dflash_model / "config.json")
+        )
+        if dflash_model is not None
+        else None
     )
     preflight_inventory()
     base_source = recipe.preflight_base_sources(model)
-    dflash_source = recipe.preflight_dflash_sources(dflash_model)
+    dflash_source = (
+        recipe.preflight_dflash_sources(dflash_model)
+        if dflash_model is not None
+        else None
+    )
 
     resources = load_resources(model)
     resource_map = {resource.name: resource.data for resource in resources}
-    object_plan = build_object_plan(resource_map)
+    object_plan = build_object_plan(resource_map, include_dflash=dflash_model is not None)
 
     ranking = _repo_root() / draft_head.DEFAULT_RANKING
     draft = draft_head.compute_shortlist(ranking, model)
@@ -398,13 +424,13 @@ def encode_tensor_payload(
 def build_conversion_report(
     *,
     model_dir: str | Path,
-    dflash_model_dir: str | Path,
+    dflash_model_dir: str | Path | None,
     out_path: str | Path,
     arguments: Mapping[str, object],
     base_config_summary: Mapping[str, object],
-    dflash_config_summary: Mapping[str, object],
+    dflash_config_summary: Mapping[str, object] | None,
     base_source_preflight: recipe.SourcePreflight,
-    dflash_source_preflight: recipe.SourcePreflight,
+    dflash_source_preflight: recipe.SourcePreflight | None,
     objects: Sequence[ArtifactObject],
     elapsed_seconds: float,
     final_bytes: int,
@@ -416,20 +442,20 @@ def build_conversion_report(
     combined_source = recipe.SourcePreflight(
         recipe_count=(
             base_source_preflight.recipe_count
-            + dflash_source_preflight.recipe_count
+            + (dflash_source_preflight.recipe_count if dflash_source_preflight else 0)
         ),
         source_tensor_count=(
             base_source_preflight.source_tensor_count
-            + dflash_source_preflight.source_tensor_count
+            + (dflash_source_preflight.source_tensor_count if dflash_source_preflight else 0)
         ),
         source_shard_count=(
             base_source_preflight.source_shard_count
-            + dflash_source_preflight.source_shard_count
+            + (dflash_source_preflight.source_shard_count if dflash_source_preflight else 0)
         ),
         source_dtype_counts={
             "BF16": (
                 base_source_preflight.source_dtype_counts.get("BF16", 0)
-                + dflash_source_preflight.source_dtype_counts.get("BF16", 0)
+                + (dflash_source_preflight.source_dtype_counts.get("BF16", 0) if dflash_source_preflight else 0)
             )
         },
     )
@@ -443,7 +469,7 @@ def build_conversion_report(
         arguments=arguments,
         config_summary={
             "base": dict(base_config_summary),
-            "dflash": dict(dflash_config_summary),
+            "dflash": dict(dflash_config_summary) if dflash_config_summary else None,
         },
         source_preflight=combined_source,
         objects=objects,
@@ -455,8 +481,8 @@ def build_conversion_report(
         environment_summary=environment,
     )
     report["source"]["base_model_path"] = report["source"].pop("model_path")
-    report["source"]["dflash_model_path"] = str(
-        Path(dflash_model_dir).resolve()
+    report["source"]["dflash_model_path"] = (
+        str(Path(dflash_model_dir).resolve()) if dflash_model_dir is not None else None
     )
     report["source_preflight"] = {
         "base": {
@@ -465,7 +491,7 @@ def build_conversion_report(
             "shards": base_source_preflight.source_shard_count,
             "dtypes": dict(base_source_preflight.source_dtype_counts),
         },
-        "dflash": {
+        "dflash": None if dflash_source_preflight is None else {
             "recipes": dflash_source_preflight.recipe_count,
             "tensors": dflash_source_preflight.source_tensor_count,
             "files": dflash_source_preflight.source_shard_count,
@@ -502,7 +528,7 @@ def build_conversion_report(
 
 def convert(
     model_dir: str | Path,
-    dflash_model_dir: str | Path,
+    dflash_model_dir: str | Path | None,
     out_path: str | Path,
     *,
     device: str | torch.device = "cuda",
@@ -514,13 +540,13 @@ def convert(
     output = Path(out_path)
     requested_device = str(device)
     resolved_device = pick_device(device)
-    dflash_model = Path(dflash_model_dir)
+    dflash_model = Path(dflash_model_dir) if dflash_model_dir is not None else None
     preflight = preflight_conversion(model, dflash_model)
 
     print(
         f"preflight complete: {len(preflight.object_plan.objects)} objects, "
         f"base={preflight.base_source.source_tensor_count} source tensors, "
-        f"dflash={preflight.dflash_source.source_tensor_count} source tensors, "
+        f"dflash={preflight.dflash_source.source_tensor_count if preflight.dflash_source else 0} source tensors, "
         f"device={resolved_device}",
         flush=True,
     )
@@ -538,7 +564,7 @@ def convert(
             writer.write(spec.name, payload)
             index += 1
             print(
-                f"[{index}/{len(inventory.OBJECT_SPECS)}] {spec.name}",
+                f"[{index}/{len(preflight.object_plan.specs)}] {spec.name}",
                 flush=True,
             )
 
@@ -563,27 +589,28 @@ def convert(
                 write_payload(spec, payload)
                 del payload
 
-        with ShardReader.from_file(
-            dflash_model / "model.safetensors"
-        ) as reader:
-            for spec in inventory.DFLASH_TENSOR_SPECS:
-                tensor = materialize_tensor(
-                    spec,
-                    reader,
-                    preflight.draft,
-                    recipe.DFLASH_RECIPES_BY_NAME,
-                )
-                payload = encode_tensor_payload(tensor, spec, resolved_device)
-                del tensor
-                write_payload(spec, payload)
-                del payload
+        if dflash_model is not None:
+            with ShardReader.from_file(
+                dflash_model / "model.safetensors"
+            ) as reader:
+                for spec in inventory.DFLASH_TENSOR_SPECS:
+                    tensor = materialize_tensor(
+                        spec,
+                        reader,
+                        preflight.draft,
+                        recipe.DFLASH_RECIPES_BY_NAME,
+                    )
+                    payload = encode_tensor_payload(tensor, spec, resolved_device)
+                    del tensor
+                    write_payload(spec, payload)
+                    del payload
 
     elapsed = time.perf_counter() - started
     final_bytes = output.stat().st_size
     ranking = _repo_root() / draft_head.DEFAULT_RANKING
     arguments = {
         "model": str(model_dir),
-        "dflash_model": str(dflash_model_dir),
+        "dflash_model": str(dflash_model_dir) if dflash_model_dir is not None else None,
         "out": str(out_path),
         "device": requested_device,
     }
@@ -616,7 +643,8 @@ def convert(
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, type=Path)
-    parser.add_argument("--dflash-model", required=True, type=Path)
+    parser.add_argument("--dflash-model", type=Path, default=None,
+                        help="DFlash drafter checkpoint; omit to build an artifact without the dflash/* family")
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args(argv)
