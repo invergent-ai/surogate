@@ -24,6 +24,9 @@ constexpr std::int32_t kFp8CublasLtDefaultMinTokens = 65;
 
 bool fp8_cublaslt_route(std::int32_t tokens);
 
+// See nvfp4_cublaslt_prewarm: build the device state before any capture can reach it (#85).
+void fp8_cublaslt_prewarm();
+
 // Bytes of fp32 staging the route needs for `rows` output rows and `tokens` columns.
 inline std::size_t fp8_cublaslt_staging_bytes(std::int32_t rows, std::int32_t tokens) {
     return static_cast<std::size_t>(rows) * static_cast<std::size_t>(tokens) * sizeof(float);

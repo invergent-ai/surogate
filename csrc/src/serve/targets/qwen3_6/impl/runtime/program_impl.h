@@ -9,6 +9,8 @@
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 #include "api/ops/gdn_replay.h"
 #include "api/ops/prepare_ragged_prefix.h"
+#include "ops/linear/fp8/fp8_cublaslt.h"
+#include "ops/linear/nvfp4/nvfp4_cublaslt.h"
 #include "api/ops/scatter.h"
 #include "api/ops/speculative_round.h"
 
@@ -312,6 +314,10 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     CUDA_CHECK(cudaMemsetAsync(token_counts.data, 0, token_counts.bytes(), device.stream));
     CUDA_CHECK(cudaMemsetAsync(sampling_config.data, 0, sampling_config.bytes(), device.stream));
     device.synchronize();
+    // Both cuBLASLt routes build their handle and workspace on first use, and capture cannot
+    // cudaMalloc. Build them here, while nothing is capturing (#85).
+    ops::detail::nvfp4_cublaslt_prewarm();
+    ops::detail::fp8_cublaslt_prewarm();
     prepare_graphs();
     work.reset();
     work.reset_peak();

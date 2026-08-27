@@ -132,6 +132,8 @@ const Plan& plan_for(DeviceState& state, const PlanKey& key) {
 
 } // namespace
 
+void fp8_cublaslt_prewarm() { (void)state_for_current_device(); }
+
 bool fp8_cublaslt_route(std::int32_t tokens) {
     static const bool enabled = [] {
         const char* raw = std::getenv("SUROGATE_SERVE_FP8_CUBLASLT");

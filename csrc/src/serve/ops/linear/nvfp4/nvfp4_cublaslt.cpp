@@ -146,6 +146,8 @@ const Plan& plan_for(DeviceState& state, const PlanKey& key, const void* a_scale
 
 } // namespace
 
+void nvfp4_cublaslt_prewarm() { (void)state_for_current_device(); }
+
 bool nvfp4_cublaslt_route(std::int32_t tokens) {
     static const bool enabled = [] {
         const char* raw = std::getenv("SUROGATE_SERVE_NVFP4_CUBLASLT");

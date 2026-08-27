@@ -19,6 +19,11 @@ constexpr std::int32_t kNvfp4CublasLtDefaultMinTokens = 64;
 
 bool nvfp4_cublaslt_route(std::int32_t tokens);
 
+// Create this device's handle and workspace now. The state is otherwise built on first use,
+// and a first use inside a CUDA graph capture cannot cudaMalloc: capture fails with
+// cudaErrorStreamCaptureUnsupported instead of the route quietly initialising (#85).
+void nvfp4_cublaslt_prewarm();
+
 // out[rows x tokens] (token-major, leading dimension out_ld) =
 //     alpha * W[row_begin, row_begin + rows) * X + beta * out
 // row_begin and rows must be multiples of 128 so the scale tiles slice cleanly.
