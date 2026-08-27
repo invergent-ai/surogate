@@ -150,11 +150,24 @@ Same card, route off → on, one run each: prefill-heavy 6,139 → 6,528 prompt
 tok/s (GPU3, +6.3 %); balanced 672 → 717 decode / 2,687 → 2,869 prompt tok/s
 (GPU4, +6.7 %). Consistent, but a 1,024-token chunk costs ~150 ms end to end
 and its GEMMs were only ~55 ms of it, so the GEMM family was never the 2×.
-The GDN chunked prefill path (`ninfer_gated_delta_net_bench`, GPU2, 48 value
-heads, 1,024 tokens) costs 287 µs per layer — state passing 47 %, WY/WU
-preparation 30 %, output 23 % — moving 145 MB of materialized intermediates
-per layer at 641 GB/s; that is the second GDN lever. The rest of the chunk
-time sits outside the GEMMs and needs the post-#76 family breakdown.
+Op-level, the route's gain depends on the card: on GPU7 (fast) the in-house
+GDN projection already runs at 904 TFLOP/s against cuBLASLt's 1,006 (+11 %),
+on GPU2 (slow) it is 545 against 751 (+38 %). The eager family timer at one
+user (GPU5, no host contention) puts the layer loop at 126.5 ms per
+1,073-token chunk with the route (137.7 without): attention 14.6 %, MLP of
+the full-attention layers 10.6 %, GDN 43.0 % (input projection 48.7 %, conv
+4.2 %, chunked scan 24.1 %, norm + output projection 23.0 %), MLP of the GDN
+layers 31.8 %. Summing the isolated op benches at the same shape gives only
+~90 ms, so ~35 ms per chunk are per-op overheads inside the layer loop that
+graph replay may or may not remove — the next measurement. Isolated costs:
+the prefill attention kernel is 311 µs per layer at 1,073 tokens (488 µs on
+a 2,146-token context), 91 TFLOP/s — ~5× off an FA3-class kernel but only
+5–8 ms of the chunk; the chunked GDN path (`ninfer_gated_delta_net_bench`,
+48 value heads, 1,024 tokens) is 287 µs per layer — state passing 47 %,
+WY/WU preparation 30 %, output 23 % — moving 145 MB of intermediates per
+layer at 641 GB/s. Lanes: with #75/#76 in, 64 lanes beat 48 on the balanced
+shape (679 → 726 decode tok/s on GPU0, TTFT p50 9.5 → 6.2 s; prefill-heavy
+flat), so the 27B configuration moves to 64 lanes once re-paired.
 
 ## Single user (2026-08-26, GPU2)
 
@@ -184,12 +197,22 @@ offloading is involved. 100 users, 90 s, GPU7, fp8 KV, 64 lanes:
 
 | engine | card | decode tok/s | prefill tok/s | TTFT p50 | reqs ok/err |
 |---|---|---:|---:|---:|---:|
-| surogate serve (512/128) | GPU7 | **1,596** | 6,384 | 2.9 s | 1,184/0 |
-| surogate serve (2048/16) | GPU7 | 106 | **13,531** | 14.4 s | 690/0 |
 | surogate serve (512/128) | GPU1 | 1,510 | 6,041 | 3.0 s | 1,123/0 |
-| vLLM NVFP4 (512/128), same card | GPU1 | *pending* | | | |
+| **vLLM** NVFP4 (512/128) | GPU1 | **2,252** | **9,009** | **2.9 s** | 1,631/0 |
+| surogate serve (2048/16) | GPU1 | 107 | 13,720 | 14.1 s | 698/0 |
+| **vLLM** NVFP4 (2048/16) | GPU1 | 176 | **22,569** | **7.7 s** | 1,076/0 |
 
-vLLM's half is blocked on an export this vLLM (0.27.1) can load: the
+The engine is at 67 % of vLLM on the balanced shape and 61 % on prefill-heavy
+— the same gap as the 27B, and the 35B has no NVFP4 weights, so the gap is not
+the GEMM family. (Earlier GPU7 rows, different card: 1,596 / 6,384 and 13,531.)
+
+vLLM's rows above run `RedHatAI/Qwen3.6-35B-A3B-NVFP4` from a local copy whose
+`config.json` ignore list gained `re:.*linear_attn\\.in_proj_.*` — the export
+keeps `linear_attn` in bf16 but names the modules `in_proj_qkv`/`in_proj_z`
+while vLLM checks `in_proj_q/k/v/z`, so unpatched it fails with "different
+quantization schemes". Flags: `--quantization compressed-tensors
+--language-model-only --kv-cache-dtype fp8 --gpu-memory-utilization 0.92`.
+Before that workaround, vLLM was blocked on an export it could load: the
 `unsloth` NVFP4 export quantizes `linear_attn.in_proj_*` to FP8 and the fused
 `in_proj_qkvz` loader dies on the split `weight_scale`; the `RedHatAI` export
 keeps them bf16 but names them `in_proj_qkv`/`in_proj_z` in its ignore list
