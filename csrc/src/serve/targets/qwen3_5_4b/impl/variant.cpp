@@ -346,6 +346,7 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
                                                                    std::int32_t last) {
     validate_token_interval(first, last);
     switch (weights_profile) {
+    case WeightsProfile::Qwen35Nvfp4Mixed: // the NVFP4 export leaves attention BF16
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
         // surogate vendor patch (PATCHES.md #17): the W8 profile opts into
@@ -367,6 +368,7 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
     WeightsProfile weights_profile, qwen3_6::TextPhase, std::int32_t first, std::int32_t last) {
     validate_token_interval(first, last);
     switch (weights_profile) {
+    case WeightsProfile::Qwen35Nvfp4Mixed: // the NVFP4 export leaves attention BF16
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
         // surogate vendor patch (PATCHES.md #17): AllowA8 sizes the IMMA path.
@@ -396,6 +398,7 @@ std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfil
         // surogate vendor patch (PATCHES.md #17): AllowA8 sizes the IMMA path.
         return ops::gdn_input_proj_workspace_capacity_bytes(
             QType::W8G32_F16S, 12288, TextConfig::hidden, ops::LinearPolicy::AllowA8, first, last);
+    case WeightsProfile::Qwen35Nvfp4Mixed:
     case WeightsProfile::Qwen36Nvfp4:
         return ops::gdn_input_proj_workspace_capacity_bytes(QType::NVFP4, 12288, TextConfig::hidden,
                                                             kNvfp4TextPolicy, first, last);
@@ -417,6 +420,7 @@ std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(
                         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
                             TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim,
                             batch_size, first, last));
+    case WeightsProfile::Qwen35Nvfp4Mixed:
     case WeightsProfile::Qwen36Nvfp4:
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
@@ -442,6 +446,7 @@ std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(
                         ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
                             TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim,
                             batch_size, first, last));
+    case WeightsProfile::Qwen35Nvfp4Mixed:
     case WeightsProfile::Qwen36Nvfp4:
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
@@ -467,6 +472,7 @@ std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfi
         return ops::linear_add_workspace_capacity_bytes(QType::W8G32_F16S, TextConfig::hidden,
                                                         TextConfig::value_dim,
                                                         ops::LinearPolicy::A16Only, first, last);
+    case WeightsProfile::Qwen35Nvfp4Mixed:
     case WeightsProfile::Qwen36Nvfp4:
         return ops::linear_add_workspace_capacity_bytes(
             QType::NVFP4, TextConfig::hidden, TextConfig::value_dim, kNvfp4TextPolicy, first, last);
@@ -493,6 +499,7 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_
     case WeightsProfile::Qwen38GroupwiseInt:
         return post_mixer_workspace_bytes(QType::W8G32_F16S, QType::W8G32_F16S,
                                           ops::LinearPolicy::A16Only, first, last);
+    case WeightsProfile::Qwen35Nvfp4Mixed:
     case WeightsProfile::Qwen36Nvfp4:
         return post_mixer_workspace_bytes(QType::NVFP4, QType::NVFP4, kNvfp4TextPolicy, first,
                                           last);

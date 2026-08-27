@@ -34,6 +34,9 @@ enum class WeightsProfile : std::uint8_t {
     Qwen38GroupwiseInt,
     Qwen36Nvfp4,
     Qwen38Nvfp4,
+    // NVFP4 exports of this model quantise the GDN projections and the MLPs but leave
+    // self-attention in BF16, so that family keeps the groupwise-int W8 encoding (#83).
+    Qwen35Nvfp4Mixed,
 };
 
 using Frontend       = qwen3_6::Frontend;

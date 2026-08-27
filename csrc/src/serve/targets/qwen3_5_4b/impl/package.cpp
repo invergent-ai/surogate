@@ -92,6 +92,9 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
     if (identity.model_id == model_id && identity.weights_id == "nvfp4") {
         return WeightsProfile::Qwen36Nvfp4;
     }
+    if (identity.model_id == model_id && identity.weights_id == "nvfp4-mixed") {
+        return WeightsProfile::Qwen35Nvfp4Mixed;
+    }
     if (identity.model_id == qwen3_8_model_id && identity.weights_id == "nvfp4") {
         return WeightsProfile::Qwen38Nvfp4;
     }
