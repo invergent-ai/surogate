@@ -59,15 +59,27 @@ artifact at 27B.
 
 ### Why runs must be paired, and what varies (2026-08-27)
 
-The eight 5090s are identical and none is specially configured. Repeated
-measurements of the same model, shape and config have still landed as far
-apart as 2,073 and 3,182 tok/s (4B, 64 lanes), and the usual suspects are
-ruled out: cards (identical), host CPU (64 cores at load average 5-7 with
-the client at 8 % of one core), memory (38 of 503 GB), and power/thermals
-(466 W total across eight cards, 55 °C, no throttle flags). SM clocks
-sampled mid-run vary with each workload's own draw, not with the card. The
-cause is still open, so treat any single number as provisional: only pairs
-taken back to back on one card, in the same batch, are compared here.
+The engine is **not** the source of the run-to-run spread — it repeats to
+about 1 % on a given card. The same 4B config on all eight cards at once,
+twice, measured (tok/s):
+
+| pass | gpu0 | gpu1 | gpu2 | gpu3 | gpu4 | gpu5 | gpu6 | gpu7 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 2,325 | 3,068 | 2,094 | 3,044 | 2,446 | 3,178 | 3,109 | 3,093 |
+| 2 | 2,316 | 3,055 | 2,086 | 3,042 | 2,448 | 3,146 | 3,030 | 3,071 |
+
+Each card reproduces itself within 0.1–2.5 %, but gpu0/2/4 sit 25–33 % below
+gpu1/3/5/6/7 — persistently, under identical config at the same moment. That
+split follows neither PCIe width (gpu0/1/4/6 are x16, the rest x8) nor NUMA
+node (gpu0–3 hang off node 0, gpu4–7 off node 1), and the host is far from
+saturated (load average 5–7 of 64 cores, 38 of 503 GB, 466 W total across
+eight cards at 55 °C with no throttle flags). Whether it is intrinsic to
+those cards or an artifact of eight simultaneous launches is under test.
+
+The consequence for this board: **a number is only meaningful next to its
+pair on the same card in the same batch.** Cross-batch comparisons of a lone
+figure — which is how the morning's 4B row was read — can be off by a third
+for reasons that have nothing to do with the code.
 
 ## Verdict — paired, two passes (2026-08-27 evening)
 
