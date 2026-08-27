@@ -81,7 +81,39 @@ pair on the same card in the same batch.** Cross-batch comparisons of a lone
 figure — which is how the morning's 4B row was read — can be off by a third
 for reasons that have nothing to do with the code.
 
-## Verdict — paired, two passes (2026-08-27 evening)
+## Verdict — paired, after the lane cap and multi-prompt rounds (2026-08-27 late)
+
+Two changes land together here: the eight cards were found to be running at
+different clock limits (three had been capped for heat) and were reset to
+parity, and the engine's concurrency cap moved from 64 to 128 lanes with the
+mixed round able to prefill several prompts at once (PATCHES.md #80). With
+100 users and only 64 lanes, a third of the load waited for a lane — that
+queue was the engine's TTFT.
+
+| model | lanes | engine decode tok/s | vLLM decode tok/s | engine TTFT p50 | vLLM TTFT p50 |
+|---|---:|---:|---:|---:|---:|
+| Qwen3.5-0.8B | 128 | **9,758** | 6,694 | **45 ms** | 658 ms |
+| Qwen3.5-4B | 128 | 3,208 | **4,238** | **71 ms** | 243 ms |
+
+The 0.8B now leads by **46 %** on throughput and 14× on TTFT. The 4B leads
+3.4× on TTFT but still trails 24 % on decode throughput, and that gap is
+weight bandwidth, not scheduling: our 4B artifact is 5.13 GiB of W8G32
+against vLLM's ~2.2 GiB NVFP4 export, and the kernel profile puts the Marlin
+W8 GEMMs at 52 % of decode time. An NVFP4 4B artifact is the lever there.
+
+The 27B does not fit 128 lanes on 32 GB — it refuses at startup, asking for
+12.9 GiB of runtime reservation beyond its headroom — so it stays at 64 and
+is measured separately below.
+
+Lane count for the same 4B config, one card, nothing else running:
+
+| lanes | decode tok/s | TTFT p50 |
+|---:|---:|---:|
+| 64 | 3,195 | 1,728 ms |
+| 100 | 3,262 | 69 ms |
+| 128 | 3,269 | 69 ms |
+
+## Verdict — paired, two passes (2026-08-27 evening, 64 lanes)
 
 The measurement that decides the goal: vLLM and the engine on **one card,
 back to back, twice**, with all three models running as one batch so every
