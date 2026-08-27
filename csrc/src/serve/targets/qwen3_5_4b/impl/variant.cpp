@@ -346,7 +346,6 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
                                                                    std::int32_t last) {
     validate_token_interval(first, last);
     switch (weights_profile) {
-    case WeightsProfile::Qwen35Nvfp4Mixed: // the NVFP4 export leaves attention BF16
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
         // surogate vendor patch (PATCHES.md #17): the W8 profile opts into
@@ -357,6 +356,7 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
     case WeightsProfile::Qwen36Nvfp4:
         return ops::attn_input_proj_workspace_capacity_bytes(
             QType::NVFP4, 10240, TextConfig::hidden, kNvfp4TextPolicy, first, last);
+    case WeightsProfile::Qwen35Nvfp4Mixed: // the export leaves attention BF16: encode it FP8
     case WeightsProfile::Qwen38Nvfp4:
         return ops::attn_input_proj_workspace_capacity_bytes(
             QType::FP8_E4M3FN_ROW_BF16S, 10240, TextConfig::hidden, kFp8TextPolicy, first, last);
@@ -368,7 +368,6 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
     WeightsProfile weights_profile, qwen3_6::TextPhase, std::int32_t first, std::int32_t last) {
     validate_token_interval(first, last);
     switch (weights_profile) {
-    case WeightsProfile::Qwen35Nvfp4Mixed: // the NVFP4 export leaves attention BF16
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
         // surogate vendor patch (PATCHES.md #17): AllowA8 sizes the IMMA path.
@@ -379,6 +378,7 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
         return ops::linear_add_workspace_capacity_bytes(QType::NVFP4, TextConfig::hidden,
                                                         TextConfig::query_size, kNvfp4TextPolicy,
                                                         first, last);
+    case WeightsProfile::Qwen35Nvfp4Mixed: // the export leaves attention BF16: encode it FP8
     case WeightsProfile::Qwen38Nvfp4:
         return ops::linear_add_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16S,
                                                         TextConfig::hidden, TextConfig::query_size,

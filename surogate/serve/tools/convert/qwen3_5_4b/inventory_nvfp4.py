@@ -77,7 +77,7 @@ _tensor = tensor_spec
 
 def _build_text_core_specs() -> tuple[TensorSpec, ...]:
     specs: list[TensorSpec] = [
-        _tensor("text/token_embedding", (248320, 2560), W8),
+        _tensor("text/token_embedding", (248320, 2560), FP8),
     ]
 
     for layer in range(32):
@@ -87,10 +87,10 @@ def _build_text_core_specs() -> tuple[TensorSpec, ...]:
         if layer in FULL_ATTENTION_LAYERS:
             specs.extend(
                 (
-                    _tensor(prefix + "attention/query_key_gate_value", (10240, 2560), W8),
+                    _tensor(prefix + "attention/query_key_gate_value", (10240, 2560), FP8),
                     _tensor(prefix + "attention/query_norm", (256,), BF16),
                     _tensor(prefix + "attention/key_norm", (256,), BF16),
-                    _tensor(prefix + "attention/output", (2560, 4096), W8),
+                    _tensor(prefix + "attention/output", (2560, 4096), FP8),
                 )
             )
         else:
@@ -118,7 +118,7 @@ def _build_text_core_specs() -> tuple[TensorSpec, ...]:
     specs.extend(
         (
             _tensor("text/final_norm", (2560,), BF16),
-            _tensor("text/output_head", (248320, 2560), W8),
+            _tensor("text/output_head", (248320, 2560), FP8),
         )
     )
     return tuple(specs)
