@@ -20,7 +20,7 @@ using TokenId = std::int32_t;
 // surogate vendor patch (PATCHES.md #29): raised 8 -> 16 for the multi-user
 // campaign. Every exact-T decode table and the conv-fused GDN path cover
 // T<=16; 32 needs the T=17..32 route coverage first.
-inline constexpr std::uint32_t kMaximumConcurrency = 64; // PATCHES.md #29: raised again for the multi-user campaign
+inline constexpr std::uint32_t kMaximumConcurrency = 128; // #79: 64 left a third of a 100-user load queued
 // Aggregate encoded image/video payload retained by one prompt, independent of item count.
 inline constexpr std::size_t kMaximumPromptMediaBytes = 256ULL << 20;
 inline constexpr std::size_t kDefaultMediaCacheBytes  = 1ULL << 30;

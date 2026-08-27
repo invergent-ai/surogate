@@ -1223,37 +1223,82 @@ PrefillChunkResult TextContext::mixed_chunk(std::span<const int> full_ids, std::
         nominal_length > full_ids.size() - begin) {
         throw std::invalid_argument("mixed chunk is outside the prompt");
     }
+    const bool is_last = finalize_at_end && begin + nominal_length == full_ids.size();
+    const MixedPrefillSegment segment{
+        .ids          = full_ids.subspan(begin, nominal_length),
+        .kv_base      = static_cast<std::int32_t>(text_kv_base_),
+        .kv_table_row = -1, // the program staged io_.text_kv_table_row for this lane
+        .state_slot   = static_cast<std::int32_t>(linear_state_current_slot_),
+        .finalize     = is_last,
+    };
+    MixedPrefillFinalize finalize{};
+    if (is_last) {
+        finalize.hidden    = Tensor{};
+        finalize.logits    = matrix_window(io_.logits, 1);
+        finalize.positions      = io_.pos;
+        finalize.rope_positions = io_.rope_pos;
+        finalize.tokens         = io_.token;
+        finalize.sampling  = sampling_config_;
+    }
+    return mixed_chunk_multi(std::span<const MixedPrefillSegment>(&segment, 1), decode, finalize);
+}
+
+PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSegment> segments,
+                                                  const MixedDecodeSlice& decode,
+                                                  const MixedPrefillFinalize& finalize) {
+    if (segments.empty()) {
+        throw std::invalid_argument("mixed chunk needs at least one prefill segment");
+    }
     const std::int32_t batch = decode.ids.ne[0];
     if (batch <= 0 || batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
         throw std::invalid_argument("mixed chunk decode batch is out of range");
     }
-    const auto ids     = full_ids.subspan(begin, nominal_length);
-    cudaStream_t s     = ctx_.stream;
-    const int prefill_cols = static_cast<int>(ids.size());
-    const int total    = prefill_cols + batch;
-    const int base_i   = static_cast<int>(text_kv_base_);
+    cudaStream_t s   = ctx_.stream;
+    int prefill_cols = 0;
+    int finalizers   = 0;
+    for (const auto& segment : segments) {
+        if (segment.ids.empty()) {
+            throw std::invalid_argument("mixed chunk segment carries no tokens");
+        }
+        prefill_cols += static_cast<int>(segment.ids.size());
+        finalizers += segment.finalize ? 1 : 0;
+    }
+    if (finalizers > 0 && (finalize.tokens.data == nullptr || finalize.sampling == nullptr)) {
+        throw std::invalid_argument("mixed chunk finalizers need sampler staging");
+    }
+    const int total  = prefill_cols + batch;
+    const int base_i = segments.front().kv_base;
     ops::set_i32_scalar(io_.rope_delta, rope_delta_, s);
 
     work_.reset();
     const auto roots = workspace_recipe::text_prefill_roots<TextConfig>(work_, total, 0, 0);
     Tensor ids_device = roots.ids;
-    Tensor ids_prefill = ids_device.slice(0, 0, prefill_cols);
-    copy_i32(ids.data(), ids_prefill, s);
     Tensor ids_decode = ids_device.slice(0, prefill_cols, batch);
     CUDA_CHECK(cudaMemcpyAsync(ids_decode.data, decode.ids.data,
                                static_cast<std::size_t>(batch) * sizeof(std::int32_t),
                                cudaMemcpyDeviceToDevice, s));
 
-    Tensor positions         = roots.positions;
-    Tensor positions_prefill = positions.slice(0, 0, prefill_cols);
-    ops::fill_i32_positions(positions_prefill, base_i, s);
+    Tensor positions = roots.positions;
+    // Each segment owns a column range; ids and positions are laid out segment by segment and
+    // every mixer below slices the same ranges.
+    std::array<int, kMaximumConcurrency> segment_begin{};
+    {
+        int cursor = 0;
+        for (std::size_t i = 0; i < segments.size(); ++i) {
+            const int length      = static_cast<int>(segments[i].ids.size());
+            segment_begin[i]      = cursor;
+            Tensor ids_segment    = ids_device.slice(0, cursor, length);
+            Tensor position_range = positions.slice(0, cursor, length);
+            copy_i32(segments[i].ids.data(), ids_segment, s);
+            ops::fill_i32_positions(position_range, segments[i].kv_base, s);
+            cursor += length;
+        }
+    }
     Tensor positions_decode = positions.slice(0, prefill_cols, batch);
     CUDA_CHECK(cudaMemcpyAsync(positions_decode.data, decode.cache_positions.data,
                                static_cast<std::size_t>(batch) * sizeof(std::int32_t),
                                cudaMemcpyDeviceToDevice, s));
 
-    const auto visible = static_cast<std::uint32_t>(base_i + prefill_cols);
-    const ops::GqaExecutionEnvelope prefill_envelope{visible, visible};
 
     Tensor x = roots.residual;
     ops::embedding(ids_device, *embed_, x, s);
@@ -1314,15 +1359,24 @@ PrefillChunkResult TextContext::mixed_chunk(std::span<const int> full_ids, std::
                 ops::rope(rope_all, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
 
                 Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, total});
-                {
-                    Tensor qa = qn.slice(2, 0, prefill_cols);
-                    Tensor ka = kn.slice(2, 0, prefill_cols);
-                    Tensor va = v.slice(2, 0, prefill_cols);
-                    Tensor aa = a.slice(2, 0, prefill_cols);
-                    ops::gqa_attention(qa, ka, va, positions_prefill, Tensor{},
+                for (std::size_t sg = 0; sg < segments.size(); ++sg) {
+                    const int off = segment_begin[sg];
+                    const int len = static_cast<int>(segments[sg].ids.size());
+                    // The row scalar is stream-ordered against this segment's launch, so one
+                    // scalar serves every segment in turn.
+                    if (segments[sg].kv_table_row >= 0) {
+                        ops::set_i32_scalar(io_.text_kv_table_row, segments[sg].kv_table_row, s);
+                    }
+                    const auto seen = static_cast<std::uint32_t>(segments[sg].kv_base + len);
+                    const ops::GqaExecutionEnvelope envelope{seen, seen};
+                    Tensor qa = qn.slice(2, off, len);
+                    Tensor ka = kn.slice(2, off, len);
+                    Tensor va = v.slice(2, off, len);
+                    Tensor aa = a.slice(2, off, len);
+                    ops::gqa_attention(qa, ka, va, positions.slice(0, off, len), Tensor{},
                                        io_.text_kv_table_row, kAttnScale,
-                                       batch_text_kv_->batch_layer_view(fidx), prefill_envelope,
-                                       work_, aa, s);
+                                       batch_text_kv_->batch_layer_view(fidx), envelope, work_, aa,
+                                       s);
                 }
                 {
                     Tensor qb = qn.slice(2, prefill_cols, batch)
@@ -1376,12 +1430,17 @@ PrefillChunkResult TextContext::mixed_chunk(std::span<const int> full_ids, std::
                 Tensor qkv_c = conv.convolved;
                 if (timing) { lap(timer.begin, timer.g_proj, acc_g_proj); cudaEventRecord(timer.begin, s); }
                 {
-                    Tensor qkv_a   = qkv.slice(1, 0, prefill_cols);
-                    Tensor qkv_ca  = qkv_c.slice(1, 0, prefill_cols);
-                    Tensor conv_state =
-                        state_.conv_slot(static_cast<std::uint32_t>(gidx),
-                                         linear_state_current_slot_);
-                    ops::causal_conv1d_silu(qkv_a, *gdn.conv1d, conv_state, conv_state, qkv_ca, s);
+                    for (std::size_t sg = 0; sg < segments.size(); ++sg) {
+                        const int off     = segment_begin[sg];
+                        const int len     = static_cast<int>(segments[sg].ids.size());
+                        Tensor qkv_a      = qkv.slice(1, off, len);
+                        Tensor qkv_ca     = qkv_c.slice(1, off, len);
+                        Tensor conv_state = state_.conv_slot(
+                            static_cast<std::uint32_t>(gidx),
+                            static_cast<std::uint32_t>(segments[sg].state_slot));
+                        ops::causal_conv1d_silu(qkv_a, *gdn.conv1d, conv_state, conv_state, qkv_ca,
+                                                s);
+                    }
                 }
                 {
                     Tensor qkv_b  = qkv.slice(1, prefill_cols, batch)
@@ -1405,17 +1464,21 @@ PrefillChunkResult TextContext::mixed_chunk(std::span<const int> full_ids, std::
                 Tensor o = workspace_recipe::gdn_recurrent_output<TextConfig>(work_, total)
                                .view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, total});
                 {
-                    Tensor qa = q_recurrent.slice(2, 0, prefill_cols);
-                    Tensor ka = k_recurrent.slice(2, 0, prefill_cols);
-                    Tensor va = vv.slice(2, 0, prefill_cols);
-                    Tensor ga = g.slice(1, 0, prefill_cols);
-                    Tensor ba = beta.slice(1, 0, prefill_cols);
-                    Tensor oa = o.slice(2, 0, prefill_cols);
-                    Tensor recurrent_state =
-                        state_.recurrent_slot(static_cast<std::uint32_t>(gidx),
-                                              linear_state_current_slot_);
+                    for (std::size_t sg = 0; sg < segments.size(); ++sg) {
+                    const int off = segment_begin[sg];
+                    const int len = static_cast<int>(segments[sg].ids.size());
+                    Tensor qa = q_recurrent.slice(2, off, len);
+                    Tensor ka = k_recurrent.slice(2, off, len);
+                    Tensor va = vv.slice(2, off, len);
+                    Tensor ga = g.slice(1, off, len);
+                    Tensor ba = beta.slice(1, off, len);
+                    Tensor oa = o.slice(2, off, len);
+                    Tensor recurrent_state = state_.recurrent_slot(
+                        static_cast<std::uint32_t>(gidx),
+                        static_cast<std::uint32_t>(segments[sg].state_slot));
                     ops::gated_delta_net(qa, ka, va, ga, ba, kGdnScale, true, work_,
                                          recurrent_state, oa, s);
+                    }
                 }
                 {
                     Tensor qb = q_recurrent.slice(2, prefill_cols, batch)
@@ -1486,20 +1549,42 @@ PrefillChunkResult TextContext::mixed_chunk(std::span<const int> full_ids, std::
         ops::linear(xf_decode, *lm_head_, logits_decode, s);
     }
 
-    const bool is_last = finalize_at_end && begin + ids.size() == full_ids.size();
-    if (is_last) {
-        Tensor last_xf = xf.slice(1, prefill_cols - 1, 1);
-        Tensor logits  = matrix_window(io_.logits, 1);
-        ops::linear(last_xf, *lm_head_, logits, s);
-        ops::set_i32_scalar(io_.pos, base_i + prefill_cols, s);
-        ops::set_i32_scalar(io_.rope_pos, base_i + prefill_cols + rope_delta_, s);
-        if (sampling_config_ != nullptr) {
-            ops::sample(logits, io_.token, kCfg.token_domain, sampling_config_, io_.pos,
-                        ops::kSamplePurposePrefill, work_, s);
-        } else {
-            ops::argmax(logits, io_.token, kCfg.token_domain, s);
+    // Every segment that finishes samples in this round. Their last hidden columns are
+    // gathered into one [hidden, F] window so a single lm_head serves all of them - F separate
+    // GEMMs would re-read the whole vocabulary projection F times.
+    if (finalizers > 0) {
+        int slot = 0;
+        for (std::size_t sg = 0; sg < segments.size(); ++sg) {
+            if (!segments[sg].finalize) { continue; }
+            const int len  = static_cast<int>(segments[sg].ids.size());
+            Tensor last_xf = xf.slice(1, segment_begin[sg] + len - 1, 1);
+            CUDA_CHECK(cudaMemcpyAsync(
+                static_cast<char*>(finalize.hidden.data) +
+                    static_cast<std::size_t>(slot) * kCfg.hidden * 2,
+                last_xf.data, static_cast<std::size_t>(kCfg.hidden) * 2,
+                cudaMemcpyDeviceToDevice, s));
+            const std::int32_t position = segments[sg].kv_base + len;
+            Tensor position_slot        = finalize.positions.slice(0, slot, 1);
+            ops::set_i32_scalar(position_slot, position, s);
+            if (finalize.rope_positions.data != nullptr) {
+                Tensor rope_slot = finalize.rope_positions.slice(0, slot, 1);
+                ops::set_i32_scalar(rope_slot, position + rope_delta_, s);
+            }
+            ++slot;
         }
+        Tensor gathered = finalize.hidden.data != nullptr
+                              ? finalize.hidden.slice(1, 0, finalizers)
+                              : xf.slice(1, segment_begin[segments.size() - 1] +
+                                                static_cast<int>(segments.back().ids.size()) - 1,
+                                         1);
+        Tensor logits   = finalize.logits.slice(1, 0, finalizers);
+        ops::linear(gathered, *lm_head_, logits, s);
+        Tensor sampled   = finalize.tokens.slice(0, 0, finalizers);
+        Tensor positions_out = finalize.positions.slice(0, 0, finalizers);
+        ops::sample(logits, sampled, kCfg.token_domain, finalize.sampling, positions_out,
+                    ops::kSamplePurposePrefill, work_, s);
     }
+    const bool is_last = finalizers > 0;
 
     ctx_.synchronize();
     work_.reset();

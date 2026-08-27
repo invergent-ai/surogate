@@ -68,6 +68,23 @@ RoundStateLayout begin_round_state_layout(LayoutBuilder& builder, const RoundSta
                        {spec.hidden, checked_i32(spec.batch_capacity, "RoundState batch capacity")},
                        "ordinary decode hidden");
     }
+    {
+        MixedPrefillFinalizeLayout& finalize = layout.prefill_finalize;
+        finalize.hidden    = add_tensor(builder, DType::BF16,
+                                        {spec.hidden, kMaximumPrefillSegments},
+                                        "mixed prefill finalize hidden");
+        finalize.logits    = add_tensor(builder, DType::BF16,
+                                        {spec.output_rows, kMaximumPrefillSegments},
+                                        "mixed prefill finalize logits");
+        finalize.positions = add_tensor(builder, DType::I32, {kMaximumPrefillSegments},
+                                        "mixed prefill finalize positions");
+        finalize.rope_positions = add_tensor(builder, DType::I32, {kMaximumPrefillSegments},
+                                             "mixed prefill finalize rope positions");
+        finalize.tokens    = add_tensor(builder, DType::I32, {kMaximumPrefillSegments},
+                                        "mixed prefill finalize tokens");
+        finalize.sampling  = builder.add(sizeof(ops::SamplingConfig) * kMaximumPrefillSegments, 256,
+                                         "mixed prefill finalize sampling");
+    }
     layout.token      = add_tensor(builder, DType::I32, {1}, "step token");
     layout.pos        = add_tensor(builder, DType::I32, {1}, "step position");
     layout.rope_pos   = add_tensor(builder, DType::I32, {1}, "step rope position");
@@ -344,6 +361,16 @@ RoundState::RoundState(DeviceSpan backing, const RoundStateLayout& layout) {
     if (!layout.complete) { throw std::invalid_argument("RoundState layout is incomplete"); }
     if (layout.ordinary) {
         ordinary.emplace(backing, *layout.ordinary, layout.spec.batch_capacity);
+    }
+    {
+        const MixedPrefillFinalizeLayout& fl = layout.prefill_finalize;
+        prefill_finalize.hidden         = fl.hidden.bind(backing);
+        prefill_finalize.logits         = fl.logits.bind(backing);
+        prefill_finalize.positions      = fl.positions.bind(backing);
+        prefill_finalize.rope_positions = fl.rope_positions.bind(backing);
+        prefill_finalize.tokens         = fl.tokens.bind(backing);
+        prefill_finalize.sampling =
+            static_cast<ops::SamplingConfig*>(fl.sampling.bind(backing).data);
     }
     token                = layout.token.bind(backing);
     pos                  = layout.pos.bind(backing);

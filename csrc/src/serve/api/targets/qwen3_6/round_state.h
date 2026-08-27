@@ -140,9 +140,33 @@ struct DFlashDecodeStateLayout {
     TensorRegion target_continuation_hidden;
 };
 
+// Multi-prompt prefill (#80): the prompts that finish inside one mixed round sample together.
+// Their last hidden columns gather here, one lm_head fills the logits, and the batched sampler
+// writes the tokens - so F finishing prompts cost one vocabulary projection, not F.
+inline constexpr std::int32_t kMaximumPrefillSegments = 8;
+
+struct MixedPrefillFinalizeLayout {
+    TensorRegion hidden;
+    TensorRegion logits;
+    TensorRegion positions;
+    TensorRegion rope_positions;
+    TensorRegion tokens;
+    LayoutRegion sampling; // raw ops::SamplingConfig[F]
+};
+
+struct MixedPrefillFinalizeState {
+    Tensor hidden;
+    Tensor logits;
+    Tensor positions;
+    Tensor rope_positions;
+    Tensor tokens;
+    ops::SamplingConfig* sampling = nullptr;
+};
+
 struct RoundStateLayout {
     RoundStateSpec spec;
     std::optional<OrdinaryDecodeStateLayout> ordinary;
+    MixedPrefillFinalizeLayout prefill_finalize;
     TensorRegion token;
     TensorRegion pos;
     TensorRegion rope_pos;
@@ -273,6 +297,7 @@ struct DFlashDecodeState {
 
 struct RoundState {
     std::optional<OrdinaryDecodeState> ordinary;
+    MixedPrefillFinalizeState prefill_finalize;
     Tensor token;
     Tensor pos;
     Tensor rope_pos;

@@ -225,6 +225,33 @@ public:
     mixed_chunk(std::span<const int> full_ids, std::uint32_t begin, std::uint32_t nominal_length,
                 bool finalize_at_end, const MixedDecodeSlice& decode);
 
+    // Multi-prompt prefill (#80): several prompts' chunks share one round. The GEMMs and
+    // fused ops already run over concatenated columns, so only the two mixers split per
+    // segment — each carries its own KV row, GDN/conv state slot and context base, and the
+    // segments that finish sample together through the batched sampler. One segment is
+    // exactly the single-prompt round above.
+    struct MixedPrefillSegment {
+        std::span<const int> ids;  // this prompt's chunk
+        std::int32_t kv_base;      // tokens already resident for this sequence
+        std::int32_t kv_table_row; // its paged-KV row; negative keeps the row the caller staged
+        std::int32_t state_slot;   // its GDN/conv state slot
+        bool finalize;             // sample after this chunk
+    };
+    // Staging for the segments that finish in this round: their last hidden columns are
+    // gathered into `hidden`, one lm_head produces `logits`, and the batched sampler writes
+    // `tokens`. Sized for the number of finalizing segments the caller allows.
+    struct MixedPrefillFinalize {
+        Tensor hidden;    // BF16 [hidden, F]
+        Tensor logits;    // BF16 [vocab, F]
+        Tensor positions;      // I32  [F] logical positions for the sampler
+        Tensor rope_positions; // I32  [F] optional; the single-prompt path keeps io_.rope_pos
+        Tensor tokens;    // I32  [F] out
+        const ops::SamplingConfig* sampling = nullptr; // device array [F]
+    };
+    [[nodiscard]] PrefillChunkResult
+    mixed_chunk_multi(std::span<const MixedPrefillSegment> segments,
+                      const MixedDecodeSlice& decode, const MixedPrefillFinalize& finalize);
+
     // Mixed-round CUDA graphs (PATCHES.md #30): the mixed body captured at a
     // (chunk bucket, batch bucket) pair. The decode slice must be sliced to
     // the batch bucket, with pad rows staged as duplicates of a live row.
