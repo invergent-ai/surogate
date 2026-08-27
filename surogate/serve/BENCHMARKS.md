@@ -57,15 +57,16 @@ Q4_K_M GGUF** (W8 resident codes carrying the GGUF's 4-bit information, fp4
 compute profile) at 0.8B/4B, and the native **NVFP4 (4-bit resident)**
 artifact at 27B.
 
-### Why the card matters (2026-08-27)
+### Why runs must be paired, and what varies (2026-08-27)
 
-All eight 5090s run under a 400 W software power cap (hardware maximum
-575–600 W) and settle at very different SM clocks under load — measured
-mid-run: GPU2 1,462 MHz, GPU0 1,612, GPU4 1,710, GPU3 1,950, GPU5 2,167,
-GPU6 2,625. That 1.8× clock range is the whole "card spread": the same
-cuBLASLt GEMM runs 763 TFLOP/s on GPU2 and 1,379 on GPU7. Only same-card
-pairs are comparable; the kernel table below was taken on GPU2, the slowest
-card, so its absolute numbers are a floor and its ratios are what matters.
+The eight 5090s are identical and share one 400 W software cap. What varies
+is what else is running: engine throughput for the same model and shape has
+been seen to differ by more than 2× between an otherwise idle host and a
+host driving seven other engines, and SM clocks sampled mid-run (1,462 to
+2,625 MHz) track the workload's own power draw, not the card. So every
+comparison here is a pair taken back to back on one card, and absolute
+numbers are only comparable within a row group; the concurrency of the run
+is what a lone number silently hides.
 
 ## 100 users — same card, same day, back to back (2026-08-27)
 
@@ -92,6 +93,8 @@ users, 512/128, 90 s. Engine at fp8 KV; vLLM at its default cache (fp8 at
 | | GPU6 | **vLLM** | 92 | **11,818** | **14.9 s** | 607/0 |
 | Qwen3.8-27B @64 lanes, chunk 4,096, prefill-heavy, #78 | GPU6 | surogate serve | 57 | 7,339 | 25.8 s | 418/0 |
 | | GPU6 | **vLLM** | 92 | **11,818** | **14.9 s** | 607/0 |
+| Qwen3.8-27B @64 lanes, chunk 4,096, #78 (balanced) | GPU6 | surogate serve | 919 | 3,677 | **5.0 s** | 703/0 |
+| | GPU6 | **vLLM** | **1,062** | **4,247** | 8.1 s | 836/0 |
 | Qwen3.8-27B @64 lanes, chunk 4,096 (balanced) | GPU6 | surogate serve | 913 | 3,652 | **5.0 s** | 699/0 |
 | | GPU6 | **vLLM** | **1,062** | **4,247** | 8.1 s | 836/0 |
 | Qwen3.5-4B @64 lanes, chunk 2,048 | GPU2 | surogate serve | 2,073 | 8,292 | 2.2 s | 1,520/0 |
@@ -200,11 +203,19 @@ one — about 7 % per round removed, which is the per-round fixed cost
 amortise the same way. The same shape on the other models, same card each,
 1,024 → 2,048: 0.8B 58,042 → 64,150 (+10.5 %, GPU0), 4B 15,489 → 16,773
 (+8.3 %, GPU2), 35B-A3B 12,458 → 13,653 (+9.6 %, GPU1); the 35B at 4,096
-reaches 15,276 on GPU7. The 4B rows above contradict the earlier GPU5 pair (4,359 vs 3,926): on GPU2,
-the slowest card (1,462 MHz under the cap), the engine's 4B throughput halves
-while vLLM's barely moves (3,641 vs 3,926). The engine's 4B path is
-clock-bound where vLLM's is not — a 4B lever in its own right, and the reason
-the card is recorded with every row.
+reaches 15,276 on GPU7. The 4B rows above contradict the earlier pair (4,359 vs 3,926 on GPU5): here
+the engine's 4B throughput roughly halves while vLLM's barely moves. Both
+rows are same-card pairs, so the difference is not the hardware — the GPU2
+pair ran while seven other engines were driving the host, the GPU5 pair did
+not. A model this small needs many rounds per second and its per-round host
+work does not overlap, so host contention costs it far more than it costs
+vLLM; the controlled measurement is below. Kernel by kernel under that load
+(Nsight Compute, GPU2, 100 users balanced, ~6 rounds): the Marlin W8 GEMMs
+52 % — the 4B artifact carries 8-bit weights where vLLM's is NVFP4, twice
+the bytes per decode step — the decode attention kernel 15.6 % (190 µs per
+layer for 64 lanes), the GDN recurrent step 10.5 %, top-k sampling 2.4 %. An
+NVFP4 4B artifact is the structural answer; the decode attention kernel the
+second.
 
 Where a 27B prefill chunk goes, kernel by kernel (Nsight Compute, one user,
 eager, 3,000 kernels ≈ 2.7 chunks of 2,146-token prompts, GPU5): the
@@ -221,6 +232,23 @@ balanced 949 → 960 decode tok/s (GPU5, noise — decode batches stay below the
 threshold). The exact fp32 staging of the finish pass eats part of the
 kernel gain (~670 MB per GDN projection at T = 4,096); a bf16 staging is the
 follow-up.
+
+Per-window laps (`SUROGATE_SERVE_PREFILL_TIMING=1`, one user, 2,146-token
+prompts, same card) show where a 27B prefill window actually goes: with
+graphs, 319 of 320 windows replay a captured body, 116.1 ms of the 116.8 ms
+stream time is inside the replay, and the host wall per window is 116.8 ms —
+**no host gap at all**, so the engine is not host-bound and graph capture is
+in play. Without graphs the same window costs 120.7 ms (eager layer loop
+120.3). The kernel sum from Nsight over the same shape is ~95 ms, so ~20 ms
+per window (≈18 %) sits between kernels inside the graph.
+
+That reframes the 27B gap. Single-stream, the two engines are close: TTFT for
+a 2,146-token prompt is 239 ms here against vLLM's 213 ms (1.12×). Under 100
+users the gap is 1.60× (7,372 against 11,818 prompt tok/s). So roughly
+three-quarters of the deficit is not kernel speed but concurrency handling:
+vLLM batches several prompts into one prefill step, while the executor holds
+a single `prefill_lane_` and runs one prompt's chunk per round. **Multi-prompt
+prefill rounds are the next 27B lever**, ahead of any further GEMM work.
 
 CUDA graphs are not a lever on this shape: same card (GPU7), 64 lanes,
 chunk 4,096, 100 users, `--enforce-eager` 6,882 against graph replay 6,821

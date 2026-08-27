@@ -2888,7 +2888,13 @@ shape, one run each:
 | prefill-heavy 2048/16, GPU6 (prompt tok/s) | 6,619 | 7,339 | +10.9 % |
 | balanced 512/128, GPU5 (decode / prompt tok/s) | 949 / 3,797 | 960 / 3,841 | noise (decode batches stay below the threshold) |
 
-Less than the kernel ratio promises: the exact fp32 staging is not free — at
-T = 4,096 the GDN projection's finish pass alone moves ~670 MB per layer. A
-bf16 staging with the scales applied in place would halve that at the cost
-of one extra rounding; the route-on profile decides whether to take it.
+Less than the kernel ratio promises, and the route-on profile says why: the
+finish pass is only 4.7 % of the chunk (a bf16 staging is not worth the
+rounding), while the in-house FP8 kernel still holds 10.6 % on the tails
+below the threshold. The threshold is 65 — one above the concurrency cap, so
+a decode round never takes the route: at 64 the decode rounds did, and since
+the workspace plans size the staging from `max_tokens`, every engine died at
+startup with "workspace arena exhausted". Per-window laps then showed the
+remaining 27B deficit is not kernel time at all (see BENCHMARKS.md): single
+stream the engine is within 12 % of vLLM, and the 1.6× gap at 100 users is
+vLLM batching several prompts per prefill step.

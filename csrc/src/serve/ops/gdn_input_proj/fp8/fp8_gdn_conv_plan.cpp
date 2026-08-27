@@ -1,4 +1,5 @@
 #include "core/limits.h"
+#include "ops/linear/fp8/fp8_cublaslt.h"
 #include "ops/gdn_input_proj/fp8/fp8_gdn_conv_plan.h"
 
 #include "core/layout.h"
@@ -55,7 +56,8 @@ std::size_t snapshot_capacity(Fp8GdnConvPlan maximum_plan, std::int32_t material
     WorkspaceLayoutBuilder layout;
     (void)allocate_projected(layout, materialized_columns);
     if (maximum_plan.schedule == Fp8GdnConvScheduleId::MaterializedA8) {
-        (void)allocate_fp8_a8_workspace(layout, maximum_columns, Fp8GdnInputGeometry::kInputRows);
+        (void)allocate_fp8_a8_workspace(layout, maximum_columns, Fp8GdnInputGeometry::kInputRows,
+                                        fp8_cublaslt_route(maximum_columns) ? 10240 : 0);
     }
     return layout.peak_bytes(1);
 }

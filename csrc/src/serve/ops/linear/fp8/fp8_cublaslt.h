@@ -18,7 +18,9 @@ namespace ninfer::ops::detail {
 // arithmetic with cuBLASLt's accumulation. Below kFp8CublasLtDefaultMinTokens the in-house
 // small-T kernels stay (they run at the weight-bandwidth limit). SUROGATE_SERVE_FP8_CUBLASLT=0
 // disables the route; SUROGATE_SERVE_FP8_CUBLASLT_MIN_TOKENS moves the threshold.
-constexpr std::int32_t kFp8CublasLtDefaultMinTokens = 128;
+// One above the concurrency cap: a decode round (at most 64 columns) never takes the route,
+// so its workspaces stay as planned; prefill tails from 65 tokens up do.
+constexpr std::int32_t kFp8CublasLtDefaultMinTokens = 65;
 
 bool fp8_cublaslt_route(std::int32_t tokens);
 

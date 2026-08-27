@@ -6,6 +6,7 @@
 #include "core/nvtx.h"
 #include "targets/qwen3_6/impl/runtime/visual_scatter.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
+#include <chrono>
 #include <api/targets/qwen3_6/vision_control.h>
 #include "api/ops/argmax.h"
 #include "api/ops/attn_input_proj.h"
@@ -889,6 +890,65 @@ inline void print_gdn_subsplit(const PrefillFamilyTimer& timer, const char* tag)
                  100 * timer.t_g_extract / g, 100 * timer.t_g_scan / g, 100 * timer.t_g_norm / g,
                  100 * timer.t_g_out / g, g / timer.chunks);
 }
+
+
+// Per-window prefill laps (SUROGATE_SERVE_PREFILL_TIMING=1): stream time of the graph replay,
+// the embedding/ingress before the layer loop, the eager layer loop, and the lm_head/sample tail,
+// plus the host wall time of the window. Eager and replay alike; never under capture.
+struct PrefillWindowLaps {
+    cudaStream_t stream;
+    bool active = false;
+    std::int32_t tokens;
+    cudaEvent_t begin{}, graph{}, pre{}, layers{}, end{};
+    std::chrono::steady_clock::time_point wall_begin;
+    bool graph_marked = false, pre_marked = false, layers_marked = false;
+    PrefillWindowLaps(cudaStream_t s, std::int32_t window_tokens) : stream(s), tokens(window_tokens) {
+        if (!prefill_family_timer().enabled) { return; }
+        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(stream, &status);
+        if (status != cudaStreamCaptureStatusNone) { return; }
+        for (cudaEvent_t* e : {&begin, &graph, &pre, &layers, &end}) {
+            cudaEventCreateWithFlags(e, cudaEventDefault);
+        }
+        cudaEventRecord(begin, stream);
+        wall_begin = std::chrono::steady_clock::now();
+        active     = true;
+    }
+    void mark_graph() { if (active) { cudaEventRecord(graph, stream); graph_marked = true; } }
+    void mark_pre() { if (active) { cudaEventRecord(pre, stream); pre_marked = true; } }
+    void mark_layers() { if (active) { cudaEventRecord(layers, stream); layers_marked = true; } }
+    ~PrefillWindowLaps() {
+        if (!active) { return; }
+        cudaEventRecord(end, stream);
+        cudaEventSynchronize(end);
+        const double wall_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wall_begin)
+                .count();
+        static double t_graph = 0, t_pre = 0, t_layers = 0, t_post = 0, t_stream = 0, t_wall = 0;
+        static std::uint64_t windows = 0, window_tokens = 0, graph_windows = 0;
+        auto lap = [](cudaEvent_t a, cudaEvent_t b) { float ms = 0; cudaEventElapsedTime(&ms, a, b); return static_cast<double>(ms); };
+        cudaEvent_t cursor = begin;
+        if (graph_marked) { t_graph += lap(cursor, graph); cursor = graph; ++graph_windows; }
+        if (pre_marked) { t_pre += lap(cursor, pre); cursor = pre; }
+        if (layers_marked) { t_layers += lap(cursor, layers); cursor = layers; }
+        t_post += lap(cursor, end);
+        t_stream += lap(begin, end);
+        t_wall += wall_ms;
+        windows += 1; window_tokens += static_cast<std::uint64_t>(tokens);
+        if (windows % 32 == 0) {
+            std::fprintf(stderr,
+                         "prefill-window: %llu windows (%llu graph), %.0f tokens/window: graph %.2f "
+                         "ms pre %.2f layers %.2f post %.2f | stream %.2f ms host wall %.2f ms per "
+                         "window, %.0f tok/s on the stream\n",
+                         static_cast<unsigned long long>(windows),
+                         static_cast<unsigned long long>(graph_windows),
+                         static_cast<double>(window_tokens) / windows, t_graph / windows,
+                         t_pre / windows, t_layers / windows, t_post / windows, t_stream / windows,
+                         t_wall / windows, 1000.0 * window_tokens / t_stream);
+        }
+        for (cudaEvent_t* e : {&begin, &graph, &pre, &layers, &end}) { cudaEventDestroy(*e); }
+    }
+};
 
 void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     cudaStream_t s = ctx_.stream;
@@ -1935,11 +1995,13 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                                       static_cast<std::uint64_t>(len));
 
         bool graph_chunk_ran = false;
+        PrefillWindowLaps window_laps(s, len);
         if constexpr (!Tap::enabled) {
             if (prefill_graph_family_ != nullptr && multimodal == nullptr &&
                 !prepare_mtp_prompt) {
                 graph_chunk_ran =
                     try_prefill_graph_chunk(ids, t0, len, base_i, is_last, checkpoint_rel);
+                window_laps.mark_graph();
             }
         }
         if (!graph_chunk_ran) {
@@ -1993,6 +2055,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
 
             Tensor x = roots.residual;
             ops::embedding(ids_device, *embed_, x, s);
+            window_laps.mark_pre();
             if (!local_scatter_indices.empty()) {
                 Tensor indices_device = roots.scatter_indices;
                 copy_i32(local_scatter_indices.data(), indices_device, s);
@@ -2002,6 +2065,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             }
             if constexpr (Tap::enabled) { tap.begin(x); }
             run_layers(x, Phase::Prefill, tap);
+            window_laps.mark_layers();
             if constexpr (requires { tap.capture_positions(positions, s); }) {
                 tap.capture_positions(positions, s);
             }
