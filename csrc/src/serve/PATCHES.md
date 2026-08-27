@@ -2323,7 +2323,12 @@ And measured, both rejected:
 --max-num-seqs 32, so 688 tok/s is 32 concurrent streams at ~21.5 tok/s each.
 Ours is 48 lanes at ~12.6 aggregate-per-lane, and the per-stream decode rate is
 comparable — the difference is duty cycle. Roughly 40% of the device goes to
-prefill here, and the same NVFP4 pattern is visible: its N=5120 prefill calls
-run 40 CTAs at 152 GB/s while N=34816 reaches 828. The NVFP4 prefill schedule
-is a different family from the FP8 one and has not had this treatment; that is
-the next concrete lever, worth roughly the 7% of device those calls occupy.
+prefill here.
+
+CORRECTION to the sentence that stood here: it claimed NVFP4 showed the same
+occupancy problem, its N=5120 calls running 40 CTAs. That was gridX read alone.
+The NVFP4 launcher uses a 2-D grid — (output_rows / kBlockN, token_tiles) — so
+those calls are (40,6) = 240 CTAs and (80,2) = 160, which is 1-1.5 waves and not
+starved. The FP8 launcher is 1-D, which is why its 40 was real and why halving
+its row tile paid. NVFP4 needs no equivalent fix, and the 7% it was supposed to
+be worth does not exist.
