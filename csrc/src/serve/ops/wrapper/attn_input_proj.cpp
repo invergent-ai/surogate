@@ -114,11 +114,16 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
     }
 
     if (weight.qtype == QType::NVFP4) {
-        constexpr std::int32_t kHidden = 5120;
-        constexpr std::int32_t kQRows  = 6144;
-        constexpr std::int32_t kKvRows = 1024;
-        constexpr std::int32_t kRows   = 14336;
-        const std::int32_t cols        = x.ne[1];
+        // Keyed on parent rows the way the W8 branch below is: 14336 is the 27B, 10240 the
+        // 4B (q,k,gate,v), 5120 the small fused parent (#84).
+        const bool registered      = weight.n == 14336;
+        const bool small_fused     = weight.n == 5120;
+        const bool q4b             = weight.n == 10240;
+        const std::int32_t kHidden = registered ? 5120 : weight.k;
+        const std::int32_t kQRows  = registered ? 6144 : (small_fused ? 2048 : 4096);
+        const std::int32_t kKvRows = (registered || q4b) ? 1024 : 512;
+        const std::int32_t kRows   = weight.n;
+        const std::int32_t cols    = x.ne[1];
         if (cols <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
         if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4) {
             throw std::invalid_argument("NVFP4 attn_input_proj admits only A16 or A4");
@@ -129,7 +134,9 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
         require_matrix(k, kKvRows, cols, "k");
         require_matrix(v, kKvRows, cols, "v");
         detail::validate_nvfp4_weight(weight, "nvfp4 attn_input_proj");
-        if (weight.n != kRows || weight.k != kHidden) {
+        if (weight.n != kRows || weight.k != kHidden ||
+            2 * kQRows + 2 * kKvRows != kRows ||
+            (!registered && !detail::is_nvfp4_generic_problem(weight.n, weight.k))) {
             throw std::invalid_argument("nvfp4 attn_input_proj: unsupported weight shape");
         }
         detail::nvfp4_attn_input_dispatch(x, weight, q, gate, k, v, policy, workspace, stream);
@@ -208,13 +215,17 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
             throw std::invalid_argument("attn_input_proj workspace: unsupported BF16 profile");
         }
         return 0;
-    case QType::NVFP4:
-        if (parent_rows != detail::Nvfp4AttnInputGeometry::kOutputRows ||
-            input_rows != detail::Nvfp4AttnInputGeometry::kInputRows ||
+    case QType::NVFP4: {
+        const bool registered = parent_rows == detail::Nvfp4AttnInputGeometry::kOutputRows &&
+                                input_rows == detail::Nvfp4AttnInputGeometry::kInputRows;
+        // Shapes outside the registered geometry run on the cuBLASLt route (#84).
+        if ((!registered && !detail::is_nvfp4_generic_problem(parent_rows, input_rows)) ||
             (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4)) {
             throw std::invalid_argument("attn_input_proj workspace: unsupported NVFP4 profile");
         }
-        return detail::nvfp4_attn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
+        return detail::nvfp4_attn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens,
+                                                                 parent_rows, input_rows);
+    }
     case QType::FP8_E4M3FN_ROW_BF16S:
         if (parent_rows != detail::Fp8AttnInputGeometry::kOutputRows ||
             input_rows != detail::Fp8AttnInputGeometry::kInputRows) {

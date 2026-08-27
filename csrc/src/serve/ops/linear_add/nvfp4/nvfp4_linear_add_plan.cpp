@@ -16,7 +16,10 @@ enum class Nvfp4LinearAddRoute : std::uint8_t {
 
 Nvfp4LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows,
                                   LinearPolicy policy, std::int32_t tokens) {
-    if (tokens <= 0 || output_rows != 5120 || (input_rows != 6144 && input_rows != 17408)) {
+    if (tokens <= 0) { throw std::invalid_argument("nvfp4 linear_add: unsupported shape"); }
+    // Generic shapes have no A16 ladder: they always run W4A4 through cuBLASLt (#84).
+    if (is_nvfp4_generic_problem(output_rows, input_rows)) { return Nvfp4LinearAddRoute::W4A4; }
+    if (output_rows != 5120 || (input_rows != 6144 && input_rows != 17408)) {
         throw std::invalid_argument("nvfp4 linear_add: unsupported shape");
     }
     if (policy == LinearPolicy::A16Only) { return Nvfp4LinearAddRoute::A16; }

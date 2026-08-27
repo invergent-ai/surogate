@@ -59,20 +59,27 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, 
 } // namespace
 
 std::size_t nvfp4_attn_input_workspace_capacity_bytes(LinearPolicy policy, std::int32_t min_tokens,
-                                                      std::int32_t max_tokens) {
+                                                      std::int32_t max_tokens,
+                                                      std::int32_t output_rows,
+                                                      std::int32_t input_rows) {
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("nvfp4 attn_input_proj workspace: invalid token interval");
     }
     (void)resolve_route(policy, min_tokens);
+    // Generic shapes have no A16 ladder: they always run W4A4 through cuBLASLt (#84).
+    if (is_nvfp4_generic_problem(output_rows, input_rows)) {
+        return nvfp4_w4a4_workspace_capacity_bytes(max_tokens, input_rows);
+    }
     return resolve_route(policy, max_tokens) == Nvfp4AttnInputRoute::W4A4
-               ? nvfp4_w4a4_workspace_capacity_bytes(max_tokens, Nvfp4AttnInputGeometry::kInputRows)
+               ? nvfp4_w4a4_workspace_capacity_bytes(max_tokens, input_rows)
                : 0;
 }
 
 void nvfp4_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
                                cudaStream_t stream) {
-    if (resolve_route(policy, x.ne[1]) == Nvfp4AttnInputRoute::A16) {
+    if (!is_nvfp4_generic_problem(weight.n, weight.k) &&
+        resolve_route(policy, x.ne[1]) == Nvfp4AttnInputRoute::A16) {
         launch_a16(x, weight, q, gate, k, v, stream);
         return;
     }

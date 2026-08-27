@@ -110,6 +110,21 @@ struct Nvfp4OpLaps {
 void nvfp4_gdn_input_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                  Nvfp4W4a4Workspace workspace, cudaStream_t stream) {
     const std::int32_t tokens = x.ne[1];
+    // Generic shapes take the split from the output views: the registered constants are the
+    // 27B's (#84).
+    if (is_nvfp4_generic_problem(weight.n, weight.k)) {
+        launch_nvfp4_w4a4_quantize(x, weight, workspace, stream, Nvfp4ScaleLayout::Tiled);
+        const std::int32_t qkv_rows = qkv.ne[0];
+        const std::int32_t z_rows   = z.ne[0];
+        if (qkv_rows + z_rows != weight.n) {
+            throw std::invalid_argument("nvfp4 gdn_input_proj: segments do not cover the weight");
+        }
+        nvfp4_cublaslt_gemm(weight, 0, qkv_rows, workspace.codes, workspace.scales,
+                            static_cast<__nv_bfloat16*>(qkv.data), qkv_rows, tokens, 0.0F, stream);
+        nvfp4_cublaslt_gemm(weight, qkv_rows, z_rows, workspace.codes, workspace.scales,
+                            static_cast<__nv_bfloat16*>(z.data), z_rows, tokens, 0.0F, stream);
+        return;
+    }
     if (nvfp4_cublaslt_route(tokens)) {
         Nvfp4OpLaps laps(stream, tokens);
         launch_nvfp4_w4a4_quantize(x, weight, workspace, stream, Nvfp4ScaleLayout::Tiled);

@@ -14,7 +14,9 @@ namespace ninfer::ops::detail {
 
 [[nodiscard]] std::size_t nvfp4_gdn_input_workspace_capacity_bytes(LinearPolicy policy,
                                                                    std::int32_t min_tokens,
-                                                                   std::int32_t max_tokens);
+                                                                   std::int32_t max_tokens,
+                                                                   std::int32_t output_rows,
+                                                                   std::int32_t input_rows);
 
 void nvfp4_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                    cudaStream_t stream);

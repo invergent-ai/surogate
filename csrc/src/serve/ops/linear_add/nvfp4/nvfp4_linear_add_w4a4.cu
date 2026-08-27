@@ -79,7 +79,8 @@ void launch_problem(const Weight& weight, Tensor& residual, Nvfp4W4a4Workspace w
 void nvfp4_linear_add_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                   Nvfp4W4a4Workspace workspace, cudaStream_t stream) {
     const std::int32_t tokens = x.ne[1];
-    if (nvfp4_cublaslt_route(tokens) && is_nvfp4_linear_problem(weight.n, weight.k)) {
+    if ((nvfp4_cublaslt_route(tokens) || is_nvfp4_generic_problem(weight.n, weight.k)) &&
+        is_nvfp4_linear_problem(weight.n, weight.k)) {
         launch_nvfp4_w4a4_quantize(x, weight, workspace, stream, Nvfp4ScaleLayout::Tiled);
         nvfp4_cublaslt_gemm(weight, 0, weight.n, workspace.codes, workspace.scales,
                             static_cast<__nv_bfloat16*>(residual.data), weight.n, tokens, 1.0F,

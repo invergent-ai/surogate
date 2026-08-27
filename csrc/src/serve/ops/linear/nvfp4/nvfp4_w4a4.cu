@@ -150,7 +150,7 @@ void launch_nvfp4_w4a4(const Tensor& x, const Weight& weight, Tensor& out,
                             static_cast<__nv_bfloat16*>(out.data), weight.n, tokens, 0.0F, stream);
         return;
     }
-    if (nvfp4_cublaslt_route(tokens)) {
+    if (nvfp4_cublaslt_route(tokens) || is_nvfp4_generic_problem(weight.n, weight.k)) {
         launch_nvfp4_w4a4_quantize(x, weight, workspace, stream, Nvfp4ScaleLayout::Tiled);
         nvfp4_cublaslt_gemm(weight, 0, weight.n, workspace.codes, workspace.scales,
                             static_cast<__nv_bfloat16*>(out.data), weight.n, tokens, 0.0F, stream);

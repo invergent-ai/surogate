@@ -19,7 +19,9 @@ Nvfp4GdnProjectedWorkspace allocate_workspace(Allocator& allocator, std::int32_t
     Nvfp4GdnProjectedWorkspace out;
     out.projected = allocator.alloc(DType::BF16, {10240, tokens}, 256);
     const std::size_t projection_bytes =
-        nvfp4_gdn_input_workspace_capacity_bytes(LinearPolicy::AllowA4, tokens, tokens);
+        nvfp4_gdn_input_workspace_capacity_bytes(LinearPolicy::AllowA4, tokens, tokens,
+                                                 Nvfp4GdnInputGeometry::kOutputRows,
+                                                 Nvfp4GdnInputGeometry::kInputRows);
     out.projection = allocator.alloc_bytes(projection_bytes, 256);
     return out;
 }

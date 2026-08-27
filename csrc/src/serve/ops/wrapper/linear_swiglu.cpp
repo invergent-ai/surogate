@@ -1,6 +1,8 @@
 #include "api/ops/linear_swiglu.h"
 
+#include "api/ops/linear.h"
 #include "api/ops/silu_mul.h"
+#include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/marlin/marlin_plane.h"
 
 #include "ops/linear/fp8/fp8_format.h"
@@ -67,6 +69,13 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
     }
     if (qtype == QType::NVFP4 && gate_up_rows == 34816 && input_rows == 5120) {
         return detail::nvfp4_linear_swiglu_workspace_capacity_bytes(policy, min_tokens, max_tokens);
+    }
+    if (qtype == QType::NVFP4 && detail::is_nvfp4_generic_problem(gate_up_rows, input_rows)) {
+        // GEMM into a BF16 [gate_up_rows, T] plane, then silu_mul folds it (#84).
+        return static_cast<std::size_t>(gate_up_rows) * static_cast<std::size_t>(max_tokens) * 2 +
+               256 +
+               linear_workspace_capacity_bytes(qtype, gate_up_rows, input_rows, policy, min_tokens,
+                                               max_tokens);
     }
     if (qtype == QType::FP8_E4M3FN_ROW_BF16S && gate_up_rows == 34816 && input_rows == 5120) {
         // A weight with adopted Marlin residency (PATCHES.md #60) is served by
@@ -135,7 +144,12 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
                            gate_up_weight.group_size == 32 && gate_up_weight.group == 32 &&
                            gate_up_weight.qhigh == nullptr &&
                            gate_up_weight.high_plane_bytes == 0 && common_row_split;
-    const bool nvfp4_weight = large_shape && gate_up_weight.qtype == QType::NVFP4;
+    const bool nvfp4_weight =
+        gate_up_weight.qtype == QType::NVFP4 &&
+        (large_shape ||
+         // outside the 27B geometry: GEMM into a BF16 plane, then fold (#84)
+         ((w8_shape || q08_shape || q4b_shape) &&
+          detail::is_nvfp4_generic_problem(gate_up_weight.n, gate_up_weight.k)));
     const bool fp8_weight   = large_shape && gate_up_weight.qtype == QType::FP8_E4M3FN_ROW_BF16S;
     if (!q4_weight && !w8_weight && !nvfp4_weight && !fp8_weight) {
         throw std::invalid_argument("linear_swiglu: unsupported weight");
@@ -190,6 +204,16 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
 
     if (nvfp4_weight) {
         (void)detail::validate_nvfp4_weight(gate_up_weight, "nvfp4 linear_swiglu");
+        if (!large_shape) {
+            auto scope = ws.scope();
+            Tensor fused = ws.alloc(DType::BF16, {gate_up_weight.n, t}, 256);
+            linear(x, gate_up_weight, fused, policy, ws, stream);
+            const std::int32_t half = gate_up_weight.n / 2;
+            Tensor gate             = fused.slice(0, 0, half);
+            Tensor up               = fused.slice(0, half, half);
+            silu_mul(gate, up, out, stream);
+            return;
+        }
         detail::nvfp4_linear_swiglu_dispatch(x, gate_up_weight, out, policy, ws, stream);
         return;
     }

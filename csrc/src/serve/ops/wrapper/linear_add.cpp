@@ -130,7 +130,9 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
         const bool supported = (output_rows == detail::Nvfp4Residual6144Geometry::kOutputRows &&
                                 input_rows == detail::Nvfp4Residual6144Geometry::kInputRows) ||
                                (output_rows == detail::Nvfp4Residual17408Geometry::kOutputRows &&
-                                input_rows == detail::Nvfp4Residual17408Geometry::kInputRows);
+                                input_rows == detail::Nvfp4Residual17408Geometry::kInputRows) ||
+                               // shapes outside the registered ladder run on cuBLASLt (#84)
+                               detail::is_nvfp4_generic_problem(output_rows, input_rows);
         if (!supported || (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4)) {
             throw std::invalid_argument("linear_add workspace: unsupported NVFP4 profile");
         }
@@ -256,7 +258,8 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         const bool supported_shape = (w.n == detail::Nvfp4Residual6144Geometry::kOutputRows &&
                                       w.k == detail::Nvfp4Residual6144Geometry::kInputRows) ||
                                      (w.n == detail::Nvfp4Residual17408Geometry::kOutputRows &&
-                                      w.k == detail::Nvfp4Residual17408Geometry::kInputRows);
+                                      w.k == detail::Nvfp4Residual17408Geometry::kInputRows) ||
+                                     detail::is_nvfp4_generic_problem(w.n, w.k);
         if (!supported_shape) {
             throw std::invalid_argument("nvfp4 linear_add: unsupported weight shape");
         }

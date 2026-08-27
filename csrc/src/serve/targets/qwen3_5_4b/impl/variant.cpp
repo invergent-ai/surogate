@@ -353,10 +353,10 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
         return ops::attn_input_proj_workspace_capacity_bytes(
             QType::W8G32_F16S, 10240, TextConfig::hidden, ops::LinearPolicy::AllowA8, first,
             last);
+    case WeightsProfile::Qwen35Nvfp4Mixed:
     case WeightsProfile::Qwen36Nvfp4:
         return ops::attn_input_proj_workspace_capacity_bytes(
             QType::NVFP4, 10240, TextConfig::hidden, kNvfp4TextPolicy, first, last);
-    case WeightsProfile::Qwen35Nvfp4Mixed: // the export leaves attention BF16: encode it FP8
     case WeightsProfile::Qwen38Nvfp4:
         return ops::attn_input_proj_workspace_capacity_bytes(
             QType::FP8_E4M3FN_ROW_BF16S, 10240, TextConfig::hidden, kFp8TextPolicy, first, last);
@@ -374,11 +374,11 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
         return ops::linear_add_workspace_capacity_bytes(QType::W8G32_F16S, TextConfig::hidden,
                                                         TextConfig::query_size,
                                                         ops::LinearPolicy::AllowA8, first, last);
+    case WeightsProfile::Qwen35Nvfp4Mixed:
     case WeightsProfile::Qwen36Nvfp4:
         return ops::linear_add_workspace_capacity_bytes(QType::NVFP4, TextConfig::hidden,
                                                         TextConfig::query_size, kNvfp4TextPolicy,
                                                         first, last);
-    case WeightsProfile::Qwen35Nvfp4Mixed: // the export leaves attention BF16: encode it FP8
     case WeightsProfile::Qwen38Nvfp4:
         return ops::linear_add_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16S,
                                                         TextConfig::hidden, TextConfig::query_size,

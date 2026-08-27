@@ -99,6 +99,35 @@ void nvfp4_attn_input_w4a4_launch(const Tensor& x, const Weight& weight, Tensor&
                                   Tensor& k, Tensor& v, Nvfp4W4a4Workspace workspace,
                                   cudaStream_t stream) {
     const std::int32_t tokens = x.ne[1];
+    // Shapes outside the registered geometry have no in-house ladder; the segments are taken
+    // from the output views so any q|k|gate|v split works (#84).
+    if (is_nvfp4_generic_problem(weight.n, weight.k)) {
+        launch_nvfp4_w4a4_quantize(x, weight, workspace, stream, Nvfp4ScaleLayout::Tiled);
+        const std::int32_t q_rows    = q.ne[0];
+        const std::int32_t k_rows    = k.ne[0];
+        const std::int32_t gate_rows = gate.ne[0];
+        const std::int32_t v_rows    = v.ne[0];
+        if (q_rows + k_rows + gate_rows + v_rows != weight.n) {
+            throw std::invalid_argument("nvfp4 attn_input_proj: segments do not cover the weight");
+        }
+        const struct {
+            std::int32_t begin;
+            std::int32_t rows;
+            Tensor* out;
+        } segments[] = {
+            {0, q_rows, &q},
+            {q_rows, k_rows, &k},
+            {q_rows + k_rows, gate_rows, &gate},
+            {q_rows + k_rows + gate_rows, v_rows, &v},
+        };
+        for (const auto& segment : segments) {
+            nvfp4_cublaslt_gemm(weight, segment.begin, segment.rows, workspace.codes,
+                                workspace.scales,
+                                static_cast<__nv_bfloat16*>(segment.out->data), segment.rows,
+                                tokens, 0.0F, stream);
+        }
+        return;
+    }
     if (nvfp4_cublaslt_route(tokens)) {
         launch_nvfp4_w4a4_quantize(x, weight, workspace, stream, Nvfp4ScaleLayout::Tiled);
         nvfp4_cublaslt_gemm(weight, 0, kQueryRows, workspace.codes, workspace.scales,
