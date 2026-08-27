@@ -959,6 +959,8 @@ add_library(ninfer_ops STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/linear/fp8/fp8_a16_mma.cu
   ${SERVE_ROOT}/ops/linear/fp8/fp8_a8.cu
   ${SERVE_ROOT}/ops/linear/fp8/fp8_dispatch.cpp
+  ${SERVE_ROOT}/ops/linear/fp8/fp8_cublaslt.cpp
+  ${SERVE_ROOT}/ops/linear/fp8/fp8_cublaslt_finish.cu
   ${SERVE_ROOT}/ops/linear/nvfp4/nvfp4_format.cpp
   ${SERVE_ROOT}/ops/linear/nvfp4/nvfp4_gemv.cu
   ${SERVE_ROOT}/ops/linear/nvfp4/nvfp4_small_t.cu

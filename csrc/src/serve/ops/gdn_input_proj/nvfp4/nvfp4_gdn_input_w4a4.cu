@@ -8,6 +8,12 @@
 #include "ops/linear/nvfp4/nvfp4_w4a4_split.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_tma_launch.h"
 
+#include <cstdint>
+
+#include <cstdlib>
+
+#include <cstdio>
+
 namespace ninfer::ops::detail {
 namespace {
 
@@ -51,17 +57,71 @@ void launch_mma(const Weight& weight, Nvfp4GdnInputOutput output,
 
 } // namespace
 
+
+namespace {
+
+// SUROGATE_SERVE_PREFILL_TIMING=1: time the route's three launches (quantize, qkv GEMM, z GEMM)
+// for prefill widths and print running averages every 256 calls. Eager only; a capturing
+// stream records nothing.
+struct Nvfp4OpLaps {
+    static constexpr int kStages = 3;
+    cudaStream_t stream;
+    bool active = false;
+    cudaEvent_t events[kStages + 1]{};
+    static bool enabled() {
+        static const bool value = std::getenv("SUROGATE_SERVE_PREFILL_TIMING") != nullptr;
+        return value;
+    }
+    Nvfp4OpLaps(cudaStream_t s, std::int32_t tokens) : stream(s) {
+        if (!enabled() || tokens < 512) { return; }
+        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(stream, &status);
+        if (status != cudaStreamCaptureStatusNone) { return; }
+        for (auto& e : events) { cudaEventCreateWithFlags(&e, cudaEventDefault); }
+        cudaEventRecord(events[0], stream);
+        active = true;
+    }
+    void mark(int stage) {
+        if (active) { cudaEventRecord(events[stage + 1], stream); }
+    }
+    ~Nvfp4OpLaps() {
+        if (!active) { return; }
+        static double sums[kStages]{};
+        static std::uint64_t calls = 0;
+        cudaEventSynchronize(events[kStages]);
+        for (int i = 0; i < kStages; ++i) {
+            float ms = 0;
+            cudaEventElapsedTime(&ms, events[i], events[i + 1]);
+            sums[i] += ms;
+        }
+        if (++calls % 256 == 0) {
+            std::fprintf(stderr,
+                         "gdn_input_proj route laps (avg over %llu calls, T>=512): quantize %.3f ms "
+                         "qkv gemm %.3f ms z gemm %.3f ms\n",
+                         static_cast<unsigned long long>(calls), sums[0] / calls, sums[1] / calls,
+                         sums[2] / calls);
+        }
+        for (auto& e : events) { cudaEventDestroy(e); }
+    }
+};
+
+} // namespace
+
 void nvfp4_gdn_input_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                  Nvfp4W4a4Workspace workspace, cudaStream_t stream) {
     const std::int32_t tokens = x.ne[1];
     if (nvfp4_cublaslt_route(tokens)) {
+        Nvfp4OpLaps laps(stream, tokens);
         launch_nvfp4_w4a4_quantize(x, weight, workspace, stream, Nvfp4ScaleLayout::Tiled);
+        laps.mark(0);
         nvfp4_cublaslt_gemm(weight, 0, Nvfp4GdnInputOutput::kQkvRows, workspace.codes,
                             workspace.scales, static_cast<__nv_bfloat16*>(qkv.data),
                             Nvfp4GdnInputOutput::kQkvRows, tokens, 0.0F, stream);
+        laps.mark(1);
         nvfp4_cublaslt_gemm(weight, Nvfp4GdnInputOutput::kQkvRows, Nvfp4GdnInputOutput::kZRows,
                             workspace.codes, workspace.scales, static_cast<__nv_bfloat16*>(z.data),
                             Nvfp4GdnInputOutput::kZRows, tokens, 0.0F, stream);
+        laps.mark(2);
         return;
     }
     launch_nvfp4_w4a4_quantize(x, weight, workspace, stream);

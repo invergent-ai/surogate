@@ -1,4 +1,5 @@
 #include "ops/linear_add/fp8/fp8_linear_add_plan.h"
+#include "ops/linear/fp8/fp8_cublaslt.h"
 
 #include "core/device.h"
 #include "ops/linear/fp8/fp8_a8_mma.cuh"
@@ -65,8 +66,16 @@ void launch_problem(const Weight& weight, Tensor& residual, Fp8A8Workspace works
 void fp8_linear_add_a8_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                               WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope                   = workspace.scope();
-    const Fp8A8Workspace scratch = allocate_fp8_a8_workspace(workspace, x.ne[1], weight.k);
+    const Fp8A8Workspace scratch = allocate_fp8_a8_workspace(
+        workspace, x.ne[1], weight.k, fp8_cublaslt_route(x.ne[1]) ? weight.n : 0);
     launch_fp8_a8_quantize(x, weight, scratch, stream);
+    if (scratch.staging != nullptr && fp8_cublaslt_route(x.ne[1])) {
+        fp8_cublaslt_gemm(weight, 0, weight.n, scratch.codes, scratch.staging, x.ne[1], stream);
+        fp8_cublaslt_finish(scratch.staging, static_cast<const __nv_bfloat16*>(weight.scales), 0,
+                            weight.n, scratch.scales, x.ne[1],
+                            static_cast<__nv_bfloat16*>(residual.data), weight.n, true, stream);
+        return;
+    }
     switch (resolve_fp8_problem(weight.n, weight.k)) {
     case Fp8Problem::Residual6144:
         launch_problem<Fp8Residual6144Geometry>(weight, residual, scratch, x.ne[1], stream);

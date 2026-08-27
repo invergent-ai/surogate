@@ -1,4 +1,5 @@
 #include "ops/linear_add/fp8/fp8_linear_add_plan.h"
+#include "ops/linear/fp8/fp8_cublaslt.h"
 
 #include "ops/linear/fp8/fp8_a8_plan.h"
 #include "ops/linear/fp8/fp8_config.h"
@@ -59,7 +60,8 @@ std::size_t fp8_linear_add_workspace_capacity_bytes(std::int32_t output_rows,
     }
     (void)resolve_route(output_rows, input_rows, policy, min_tokens);
     return resolve_route(output_rows, input_rows, policy, max_tokens) == Fp8LinearAddRoute::A8
-               ? fp8_a8_workspace_capacity_bytes(max_tokens, input_rows)
+               ? fp8_a8_workspace_capacity_bytes(max_tokens, input_rows,
+                                                 fp8_cublaslt_route(max_tokens) ? output_rows : 0)
                : 0;
 }
 

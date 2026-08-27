@@ -401,7 +401,7 @@ int run_fp8() {
 
     failures += run_fp8_case(parent, 1, ops::LinearPolicy::A16Only, true);
     failures += run_fp8_case(parent, 2, ops::LinearPolicy::A16Only);
-    for (const std::int32_t tokens : {1, 2, 7, 8, 48, 65, 1024}) {
+    for (const std::int32_t tokens : {1, 2, 7, 8, 48, 65, 300, 1024, 1077}) {
         failures += run_fp8_case(parent, tokens, ops::LinearPolicy::AllowA8);
     }
     return failures;

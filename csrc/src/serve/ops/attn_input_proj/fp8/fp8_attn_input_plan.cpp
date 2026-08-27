@@ -1,4 +1,5 @@
 #include "ops/attn_input_proj/fp8/fp8_attn_input_plan.h"
+#include "ops/linear/fp8/fp8_cublaslt.h"
 
 #include "ops/linear/fp8/fp8_config.h"
 
@@ -64,7 +65,8 @@ std::size_t fp8_attn_input_workspace_capacity_bytes(LinearPolicy policy, std::in
     }
     (void)resolve_route(policy, min_tokens);
     return resolve_route(policy, max_tokens) == Fp8AttnInputRoute::A8
-               ? fp8_a8_workspace_capacity_bytes(max_tokens, Fp8AttnInputGeometry::kInputRows)
+               ? fp8_a8_workspace_capacity_bytes(max_tokens, Fp8AttnInputGeometry::kInputRows,
+                                                 fp8_cublaslt_route(max_tokens) ? kFp8AttnInputCublasLtStagingRows : 0)
                : 0;
 }
 
@@ -79,7 +81,8 @@ void fp8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, T
         throw std::invalid_argument("fp8 A8 attn_input_proj requires caller workspace");
     }
     auto scope                   = workspace->scope();
-    const Fp8A8Workspace scratch = allocate_fp8_a8_workspace(*workspace, x.ne[1], weight.k);
+    const Fp8A8Workspace scratch = allocate_fp8_a8_workspace(
+        *workspace, x.ne[1], weight.k, fp8_cublaslt_route(x.ne[1]) ? kFp8AttnInputCublasLtStagingRows : 0);
     fp8_attn_input_a8_launch(x, weight, q, gate, k, v, scratch, stream);
 }
 

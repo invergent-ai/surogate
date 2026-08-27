@@ -1,4 +1,5 @@
 #include "ops/attn_input_proj/fp8/fp8_attn_input_plan.h"
+#include "ops/linear/fp8/fp8_cublaslt.h"
 
 #include "core/device.h"
 #include "ops/attn_input_proj/fp8/fp8_attn_input_output.cuh"
@@ -50,9 +51,34 @@ void launch_mma(const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tensor
 
 } // namespace
 
+static_assert(kFp8AttnInputCublasLtStagingRows == kFp8AttnInputQueryRows &&
+                  kFp8AttnInputQueryRows >= kFp8AttnInputGateRows &&
+                  kFp8AttnInputQueryRows >= kFp8AttnInputKeyRows,
+              "the cuBLASLt staging must cover the largest attention segment");
+
 void fp8_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                               Tensor& k, Tensor& v, Fp8A8Workspace workspace, cudaStream_t stream) {
     launch_fp8_a8_quantize(x, weight, workspace, stream);
+    if (workspace.staging != nullptr && fp8_cublaslt_route(x.ne[1])) {
+        const std::int32_t tokens = x.ne[1];
+        const auto* row_scales    = static_cast<const __nv_bfloat16*>(weight.scales);
+        const struct { std::int32_t begin, rows; Tensor* out; } segments[] = {
+            {0, kFp8AttnInputQueryRows, &q},
+            {kFp8AttnInputQueryRows, kFp8AttnInputKeyRows, &k},
+            {kFp8AttnInputQueryRows + kFp8AttnInputKeyRows, kFp8AttnInputGateRows, &gate},
+            {kFp8AttnInputQueryRows + kFp8AttnInputKeyRows + kFp8AttnInputGateRows,
+             kFp8AttnInputKeyRows, &v},
+        };
+        for (const auto& segment : segments) {
+            fp8_cublaslt_gemm(weight, segment.begin, segment.rows, workspace.codes,
+                              workspace.staging, tokens, stream);
+            fp8_cublaslt_finish(workspace.staging, row_scales, segment.begin, segment.rows,
+                                workspace.scales, tokens,
+                                static_cast<__nv_bfloat16*>(segment.out->data), segment.rows,
+                                false, stream);
+        }
+        return;
+    }
     if (x.ne[1] <= 32) {
         if ((x.ne[1] % Fp8LinearA8BatchSchedule::kBlockTokens) == 0) {
             launch_mma<Fp8LinearA8BatchSchedule, true>(weight, q, gate, k, v, workspace, x.ne[1], stream);

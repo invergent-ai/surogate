@@ -1,4 +1,5 @@
 #include "ops/linear/fp8/fp8_a8_plan.h"
+#include "ops/linear/fp8/fp8_cublaslt.h"
 
 #include "core/device.h"
 #include "ops/common/math.cuh"
@@ -146,6 +147,13 @@ void launch_fp8_a8(const Tensor& x, const Weight& weight, Tensor& out, Fp8A8Work
                    cudaStream_t stream) {
     launch_fp8_a8_quantize(x, weight, workspace, stream);
     const std::int32_t tokens = x.ne[1];
+    if (workspace.staging != nullptr && fp8_cublaslt_route(tokens)) {
+        fp8_cublaslt_gemm(weight, 0, weight.n, workspace.codes, workspace.staging, tokens, stream);
+        fp8_cublaslt_finish(workspace.staging, static_cast<const __nv_bfloat16*>(weight.scales), 0,
+                            weight.n, workspace.scales, tokens,
+                            static_cast<__nv_bfloat16*>(out.data), weight.n, false, stream);
+        return;
+    }
     switch (resolve_fp8_problem(weight.n, weight.k)) {
     case Fp8Problem::AttnInput:
         launch_problem<Fp8AttnInputGeometry>(weight, out, workspace, tokens, stream);

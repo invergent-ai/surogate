@@ -2844,3 +2844,51 @@ sub-split (norm+control, input projection, conv, column extract, chunked
 scan, gated norm, output projection) in both prefill paths — the plain
 `run_layers` path had no sub-laps at all, which is why one-user runs printed
 none.
+
+## 78
+
+**FP8 W8A8 prefill GEMMs on cuBLASLt (2026-08-27).**
+
+**Why.** The 27B keeps its GDN input projection (16384×5120), attention QKV
+(14336×5120) and both output projections (5120×6144) as FP8-row weights
+(`FP8_E4M3FN_ROW_BF16S`) on the in-house W8A8 kernel. Nsight Compute over a
+one-user prefill puts that one kernel at **52 %** of the chunk (529 µs
+average), ahead of the cuBLASLt NVFP4 MLP GEMMs (25.6 %); it runs at ~330
+TFLOP/s in the engine where cuBLASLt's FP8 GEMM does 651–750 at the same
+shapes.
+
+**Route.** `ops/linear/fp8/fp8_cublaslt.{h,cpp}` and
+`fp8_cublaslt_finish.cu`. cuBLASLt on this device only accepts scalar FP8
+scales (the outer-vector modes return INVALID_VALUE / NOT_SUPPORTED), so the
+GEMM accumulates the raw e4m3 codes — the artifact's weight codes and the A8
+quantizer's per-token activation codes, both consumed as they are — into an
+fp32 staging, and a finish kernel applies the weight's per-row bf16 scale and
+the activation's per-token fp32 scale exactly once, adding the residual for
+`linear_add`: the in-house epilogue's arithmetic with cuBLASLt's
+accumulation. `Fp8A8Workspace` carries the staging (sized by the largest
+output segment; the four plans reserve it when the route applies), and the
+four A8 launchers (`linear`, `attn_input_proj` with its four 16-aligned row
+segments written straight into q/k/gate/v, `gdn_input_proj` with qkv and z,
+`linear_add` accumulating into the residual) take it from
+`kFp8CublasLtDefaultMinTokens` (128) up. `SUROGATE_SERVE_FP8_CUBLASLT=0`
+disables the route, `SUROGATE_SERVE_FP8_CUBLASLT_MIN_TOKENS` moves the
+threshold.
+
+**Verification.** The FP8 suites (`ninfer_linear_fp8_a8_test`,
+`ninfer_linear_fp8_a16_test`, `ninfer_linear_add_fp8_test`, and the FP8 cases
+of `ninfer_attn_input_proj_test` / `ninfer_gdn_input_proj_test`) gained
+ragged 300- and 1,077-token cases and pass with the route on and with
+`SUROGATE_SERVE_FP8_CUBLASLT=0`.
+
+27B, 64 lanes, `--max-num-batched-tokens 4096`, 100 users, same card per
+shape, one run each:
+
+| shape | route off | route on | delta |
+|---|---:|---:|---:|
+| prefill-heavy 2048/16, GPU6 (prompt tok/s) | 6,619 | 7,339 | +10.9 % |
+| balanced 512/128, GPU5 (decode / prompt tok/s) | 949 / 3,797 | 960 / 3,841 | noise (decode batches stay below the threshold) |
+
+Less than the kernel ratio promises: the exact fp32 staging is not free — at
+T = 4,096 the GDN projection's finish pass alone moves ~670 MB per layer. A
+bf16 staging with the scales applied in place would halve that at the cost
+of one extra rounding; the route-on profile decides whether to take it.

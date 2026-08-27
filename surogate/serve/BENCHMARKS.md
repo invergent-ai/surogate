@@ -90,8 +90,14 @@ users, 512/128, 90 s. Engine at fp8 KV; vLLM at its default cache (fp8 at
 | | GPU6 | **vLLM** | 92 | **11,822** | **14.9 s** | 607/0 |
 | Qwen3.8-27B @64 lanes, chunk 4,096, prefill-heavy | GPU6 | surogate serve | 52 | 6,678 | 28.4 s | 388/0 |
 | | GPU6 | **vLLM** | 92 | **11,818** | **14.9 s** | 607/0 |
+| Qwen3.8-27B @64 lanes, chunk 4,096, prefill-heavy, #78 | GPU6 | surogate serve | 57 | 7,339 | 25.8 s | 418/0 |
+| | GPU6 | **vLLM** | 92 | **11,818** | **14.9 s** | 607/0 |
 | Qwen3.8-27B @64 lanes, chunk 4,096 (balanced) | GPU6 | surogate serve | 913 | 3,652 | **5.0 s** | 699/0 |
 | | GPU6 | **vLLM** | **1,062** | **4,247** | 8.1 s | 836/0 |
+| Qwen3.5-4B @64 lanes, chunk 2,048 | GPU2 | surogate serve | 2,073 | 8,292 | 2.2 s | 1,520/0 |
+| | GPU2 | **vLLM** | **3,641** | **14,564** | **0.20 s** | 2,600/0 |
+| Qwen3.5-4B @64 lanes, chunk 2,048, prefill-heavy | GPU2 | surogate serve | 131 | 16,788 | 11.6 s | 833/0 |
+| | GPU2 | **vLLM** | 273 | **34,989** | **5.0 s** | 1,623/0 |
 | Qwen3.5-0.8B @64 lanes, chunk 2,048 | GPU0 | **surogate serve** | **6,478** | **25,910** | 0.72 s | 4,623/0 |
 | | GPU0 | vLLM | 6,174 | 24,700 | **0.51 s** | 4,398/0 |
 | Qwen3.5-0.8B @64 lanes, chunk 2,048, prefill-heavy | GPU0 | **surogate serve** | **502** | **64,208** | **3.0 s** | 2,917/0 |
@@ -194,7 +200,29 @@ one — about 7 % per round removed, which is the per-round fixed cost
 amortise the same way. The same shape on the other models, same card each,
 1,024 → 2,048: 0.8B 58,042 → 64,150 (+10.5 %, GPU0), 4B 15,489 → 16,773
 (+8.3 %, GPU2), 35B-A3B 12,458 → 13,653 (+9.6 %, GPU1); the 35B at 4,096
-reaches 15,276 on GPU7. CUDA graphs are not a lever on this shape: same card (GPU7), 64 lanes,
+reaches 15,276 on GPU7. The 4B rows above contradict the earlier GPU5 pair (4,359 vs 3,926): on GPU2,
+the slowest card (1,462 MHz under the cap), the engine's 4B throughput halves
+while vLLM's barely moves (3,641 vs 3,926). The engine's 4B path is
+clock-bound where vLLM's is not — a 4B lever in its own right, and the reason
+the card is recorded with every row.
+
+Where a 27B prefill chunk goes, kernel by kernel (Nsight Compute, one user,
+eager, 3,000 kernels ≈ 2.7 chunks of 2,146-token prompts, GPU5): the
+in-house FP8 W8A8 GEMM (`fp8_mma_kernel`: GDN input projection, attention
+QKV, both output projections — the 27B keeps those weights FP8-row) **52 %**;
+the cuBLASLt NVFP4 GEMMs of the MLPs 25.6 %; the prefill attention kernel
+4.0 %; the chunked GDN path 7.9 % (state passing 3.9, WY/WU preparation 2.4,
+output 1.6); SiLU·mul 2.5 %; the NVFP4 quantizer 1.5 %; conv 1.3 %; norms
+~2 %. cuBLASLt's FP8 GEMM runs the same shapes 1.7–2× faster (651–750
+TFLOP/s at T ≥ 1,073 against the in-house ~330). PATCHES.md #78 routes the
+FP8 families to it from 128 tokens up; same card, route off → on, 64 lanes,
+chunk 4,096: prefill-heavy 6,619 → 7,339 prompt tok/s (+10.9 %, GPU6),
+balanced 949 → 960 decode tok/s (GPU5, noise — decode batches stay below the
+threshold). The exact fp32 staging of the finish pass eats part of the
+kernel gain (~670 MB per GDN projection at T = 4,096); a bf16 staging is the
+follow-up.
+
+CUDA graphs are not a lever on this shape: same card (GPU7), 64 lanes,
 chunk 4,096, 100 users, `--enforce-eager` 6,882 against graph replay 6,821
 prompt tok/s. Lanes on the 27B: 64 beats 48 on every shape now
 (balanced 897 vs 833-class, decode-heavy 1,884 vs 1,633). Single-user prefill
