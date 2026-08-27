@@ -39,7 +39,7 @@ SCALE_FIELD = "weight_scale"
 GLOBAL_SCALE_FIELD = "weight_scale_2"
 INPUT_SCALE_FIELD = "input_scale"
 
-EMBEDDING_SOURCE = "model.language_model.embed_tokens.weight"
+EMBEDDING_SOURCE = "model.embed_tokens.weight"
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +92,10 @@ class DirectRecipe:
     source_name: str
     shape: tuple[int, ...]
     dequantize: bool = False
+    # The convolution ships channel-major; the artifact stores it tap-major, so the
+    # source is folded to source_shape and transposed rather than reshaped in place.
+    source_shape: tuple[int, ...] | None = None
+    transpose: bool = False
 
 
 def _source(name: str, n: int, k: int) -> MatrixSource:
@@ -124,7 +128,7 @@ def _build_matrix_recipes() -> tuple[
     divisors: list[InputDivisorRecipe] = []
 
     for layer in range(LAYERS):
-        source_prefix = f"model.language_model.layers.{layer}."
+        source_prefix = f"model.layers.{layer}."
         object_prefix = f"text/layers/{layer}/"
 
         if layer in inventory.FULL_ATTENTION_LAYERS:
@@ -158,7 +162,7 @@ def _build_matrix_recipes() -> tuple[
                 (
                     InputDivisorRecipe(
                         object_prefix
-                        + "attention/query_key_gate_value_projection/input_scale_divisor",
+                        + "attention/input_projection/input_scale_divisor",
                         fused_sources,
                         (object_prefix + "attention/query_key_gate_value",),
                     ),
@@ -195,7 +199,7 @@ def _build_matrix_recipes() -> tuple[
             divisors.extend(
                 (
                     InputDivisorRecipe(
-                        object_prefix + "gdn/query_key_value_z_projection/input_scale_divisor",
+                        object_prefix + "gdn/input_projection/input_scale_divisor",
                         fused_sources,
                         (object_prefix + "gdn/query_key_value_z",),
                     ),
@@ -244,7 +248,7 @@ def _build_matrix_recipes() -> tuple[
 def _build_direct_recipes() -> tuple[DirectRecipe, ...]:
     items: list[DirectRecipe] = []
     for layer in range(LAYERS):
-        source_prefix = f"model.language_model.layers.{layer}."
+        source_prefix = f"model.layers.{layer}."
         object_prefix = f"text/layers/{layer}/"
         items.append(
             DirectRecipe(
@@ -285,6 +289,8 @@ def _build_direct_recipes() -> tuple[DirectRecipe, ...]:
                         object_prefix + "gdn/convolution",
                         source_prefix + "linear_attn.conv1d.weight",
                         (4, 8192),
+                        source_shape=(8192, 4),
+                        transpose=True,
                     ),
                     # in_proj_a and in_proj_b ship as NVFP4 blocks; the artifact wants
                     # them dense, so they are decoded back to BF16 on the way in.
@@ -316,7 +322,7 @@ def _build_direct_recipes() -> tuple[DirectRecipe, ...]:
         )
     items.append(
         DirectRecipe(
-            "text/final_norm", "model.language_model.norm.weight", (HIDDEN,)
+            "text/final_norm", "model.norm.weight", (HIDDEN,)
         )
     )
     return tuple(items)
@@ -339,6 +345,22 @@ def _select_rows(tensor: torch.Tensor, part: MatrixPart) -> torch.Tensor:
     if len(part.rows) == 1 and part.rows[0].begin == 0 and part.rows[0].end == tensor.shape[0]:
         return tensor
     return torch.cat([tensor[item.begin : item.end] for item in part.rows], dim=0)
+
+
+def _reciprocal(value: float, label: str) -> float:
+    """ModelOpt stores multipliers; the runtime fields are divisors.
+
+    A ModelOpt export writes ``weight_scale_2 = amax / (448 * 6)`` and the matching
+    ``input_scale``, i.e. the number a code is multiplied by. The engine's
+    ``weight_scale_divisor`` / ``input_scale_divisor`` are the compressed-tensors
+    convention instead - block_scale = divisor * max_abs / 6, undone by
+    alpha = 1 / (input_divisor * weight_divisor) - so each value has to be inverted
+    on the way in.
+    """
+
+    if not value > 0.0:
+        raise ValueError(f"{label}: scale must be positive, got {value}")
+    return 1.0 / value
 
 
 def _same_scalar(reader: ShardReader, sources: tuple[MatrixSource, ...], field: str) -> float:
@@ -385,12 +407,21 @@ def materialize_nvfp4_weight(
         recipe.shape[1] // 16,
     ):
         raise ValueError(f"{recipe.object_name}: NVFP4 shape mismatch after fusion")
-    divisor = _same_scalar(reader, recipe.divisor_sources, GLOBAL_SCALE_FIELD)
+    divisor = _reciprocal(
+        _same_scalar(reader, recipe.divisor_sources, GLOBAL_SCALE_FIELD),
+        recipe.object_name + "." + GLOBAL_SCALE_FIELD,
+    )
     return packed, scales, struct.pack("<f", divisor)
 
 
 def materialize_input_divisor(recipe: InputDivisorRecipe, reader: ShardReader) -> bytes:
-    return struct.pack("<f", _same_scalar(reader, recipe.sources, INPUT_SCALE_FIELD))
+    return struct.pack(
+        "<f",
+        _reciprocal(
+            _same_scalar(reader, recipe.sources, INPUT_SCALE_FIELD),
+            recipe.object_name,
+        ),
+    )
 
 
 def validate_recipe() -> None:

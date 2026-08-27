@@ -2,7 +2,8 @@
 
 The NVFP4 export (AxionML/Qwen3.5-4B-NVFP4) quantises every linear weight -
 self-attention, the GDN projections and the MLPs - and leaves only the tied
-embedding in BF16, which this artifact re-encodes as FP8 row-scaled. Source-checkpoint mapping and
+embedding in BF16, which this artifact re-encodes as W8 - the vocabulary
+format this target's NVFP4 profile expects. Source-checkpoint mapping and
 materialization live in the sibling conversion recipe.
 """
 
@@ -32,7 +33,7 @@ from surogate.serve.tools.convert.qwen3_6.common.inventory import (
 
 
 MODEL_ID = "qwen3.5-4b"
-WEIGHTS_ID = "nvfp4"
+WEIGHTS_ID = "nvfp4-mixed"
 TARGET_KEY = "qwen3_5_4b"
 
 NVFP4 = "NVFP4"
@@ -77,7 +78,7 @@ _tensor = tensor_spec
 
 def _build_text_core_specs() -> tuple[TensorSpec, ...]:
     specs: list[TensorSpec] = [
-        _tensor("text/token_embedding", (248320, 2560), FP8),
+        _tensor("text/token_embedding", (248320, 2560), W8),
     ]
 
     for layer in range(32):
@@ -88,9 +89,11 @@ def _build_text_core_specs() -> tuple[TensorSpec, ...]:
             specs.extend(
                 (
                     _tensor(prefix + "attention/query_key_gate_value", (10240, 2560), NVFP4),
+                    _tensor(prefix + "attention/input_projection/input_scale_divisor", (), FP32),
                     _tensor(prefix + "attention/query_norm", (256,), BF16),
                     _tensor(prefix + "attention/key_norm", (256,), BF16),
                     _tensor(prefix + "attention/output", (2560, 4096), NVFP4),
+                    _tensor(prefix + "attention/output_projection/input_scale_divisor", (), FP32),
                 )
             )
         else:
@@ -102,8 +105,10 @@ def _build_text_core_specs() -> tuple[TensorSpec, ...]:
                     _tensor(prefix + "gdn/a_projection", (32, 2560), BF16),
                     _tensor(prefix + "gdn/b_projection", (32, 2560), BF16),
                     _tensor(prefix + "gdn/query_key_value_z", (12288, 2560), NVFP4),
+                    _tensor(prefix + "gdn/input_projection/input_scale_divisor", (), FP32),
                     _tensor(prefix + "gdn/norm", (128,), BF16),
                     _tensor(prefix + "gdn/output", (2560, 4096), NVFP4),
+                    _tensor(prefix + "gdn/output_projection/input_scale_divisor", (), FP32),
                 )
             )
 
@@ -111,14 +116,16 @@ def _build_text_core_specs() -> tuple[TensorSpec, ...]:
             (
                 _tensor(prefix + "post_attention_norm", (2560,), BF16),
                 _tensor(prefix + "mlp/gate_up", (18432, 2560), NVFP4),
+                    _tensor(prefix + "mlp/gate_up_projection/input_scale_divisor", (), FP32),
                 _tensor(prefix + "mlp/down", (2560, 9216), NVFP4),
+                    _tensor(prefix + "mlp/down_projection/input_scale_divisor", (), FP32),
             )
         )
 
     specs.extend(
         (
             _tensor("text/final_norm", (2560,), BF16),
-            _tensor("text/output_head", (248320, 2560), FP8),
+            _tensor("text/output_head", (248320, 2560), W8),
         )
     )
     return tuple(specs)
@@ -157,12 +164,10 @@ DRAFT_HEAD_TENSOR_SPECS = _build_draft_head_specs()
 MTP_TENSOR_SPECS = _build_mtp_specs()
 VISION_TENSOR_SPECS: tuple[TensorSpec, ...] = ()  # text-only target
 
-TENSOR_SPECS = (
-    TEXT_CORE_TENSOR_SPECS
-    + DRAFT_HEAD_TENSOR_SPECS
-    + MTP_TENSOR_SPECS
-    + VISION_TENSOR_SPECS
-)
+# The NVFP4 export carries no drafter and no MTP head, so this artifact is the
+# text core alone: the engine probes both features and simply does not offer
+# them, exactly as it does for the 35B artifact converted without DFlash.
+TENSOR_SPECS = TEXT_CORE_TENSOR_SPECS + DRAFT_HEAD_TENSOR_SPECS
 OBJECT_SPECS: tuple[StoredObjectSpec, ...] = RESOURCE_SPECS + TENSOR_SPECS
 
 # surogate vendor patch (PATCHES.md #15): community GGUF exports frequently
@@ -170,7 +175,7 @@ OBJECT_SPECS: tuple[StoredObjectSpec, ...] = RESOURCE_SPECS + TENSOR_SPECS
 # omits the mtp/* objects entirely (the loader binds MTP only when present
 # and MTP speculation is refused with a clear error). The draft head stays:
 # it derives from the embedding, which every export carries.
-TENSOR_SPECS_NO_MTP = TEXT_CORE_TENSOR_SPECS + DRAFT_HEAD_TENSOR_SPECS + VISION_TENSOR_SPECS
+TENSOR_SPECS_NO_MTP = TEXT_CORE_TENSOR_SPECS + DRAFT_HEAD_TENSOR_SPECS
 OBJECT_SPECS_NO_MTP: tuple[StoredObjectSpec, ...] = RESOURCE_SPECS + TENSOR_SPECS_NO_MTP
 
 
@@ -335,4 +340,11 @@ ALIAS_SPECS = (
         layers=GDN_LAYERS,
         axis_order=(1, 0),
     ),
+)
+
+
+INPUT_SCALE_DIVISOR_SPECS = tuple(
+    spec
+    for spec in TENSOR_SPECS
+    if spec.format == FP32 and spec.name.endswith("/input_scale_divisor")
 )
