@@ -265,7 +265,9 @@ def materialize(source: GgufSource, name: str, device: torch.device) -> bytes:
         if leaf == "output":
             return w8_object(source, blk + "attn_output.weight", None, device)
         if leaf in ("query_norm", "key_norm"):
-            return bf16_bytes(source.float32(blk + f"attn_{leaf[0]}_norm.weight"), (inv.HEAD_DIM,))
+            # The runtime applies these with a unit offset (HF gamma w, norm = (1+w)*x); the GGUF
+            # carries the folded gamma 1+w. Every other norm keeps the folded form.
+            return bf16_bytes(source.float32(blk + f"attn_{leaf[0]}_norm.weight") - 1.0, (inv.HEAD_DIM,))
         if leaf.startswith("indexer/"):
             which = leaf.split("/")[-1]
             if which == "query":

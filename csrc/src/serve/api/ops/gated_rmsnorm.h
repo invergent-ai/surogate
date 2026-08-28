@@ -4,6 +4,8 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdint>
+
 namespace ninfer::ops {
 
 /**
@@ -22,5 +24,16 @@ namespace ninfer::ops {
  */
 void gated_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor& z, float eps, Tensor& out,
                    cudaStream_t stream);
+
+/// Gate activation applied to z: SiLU (Qwen3.5/3.6 GDN) or the logistic sigmoid
+/// (Qwen3.8-Flash-Next GDN, `output_gate_type: sigmoid`).
+enum class GatedRmsGate : std::uint8_t {
+    Silu,
+    Sigmoid,
+};
+
+/// As above with an explicit gate activation; `GatedRmsGate::Silu` is the two-argument form.
+void gated_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor& z, float eps,
+                   GatedRmsGate gate, Tensor& out, cudaStream_t stream);
 
 } // namespace ninfer::ops

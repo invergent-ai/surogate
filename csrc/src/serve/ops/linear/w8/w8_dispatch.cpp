@@ -50,6 +50,12 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
             if (t <= 48) { return launch_w8_small_t; }
             return launch_w8_mma_r64_c128;
         }
+        // Qwen3.8-Flash-Next attention/GDN output projections (2560 x 6144).
+        if (n == 2560) {
+            if (t <= 16) { return launch_w8_simt_r8_c4; }
+            if (t <= 128) { return launch_w8_mma_r32_c128; }
+            return launch_w8_mma_r64_c128;
+        }
         break;
     case 17408:
         if (n == 5120) {
@@ -73,6 +79,14 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         if (n == 248320 || n == 131072) {
             if (t <= 16) { return launch_w8_simt_r8_c4; }
             if (n == 248320 && t <= 32) { return launch_w8_small_t; } // PATCHES.md #29
+            if (t <= 128) { return launch_w8_mma_r32_c128; }
+            return launch_w8_mma_r64_c128;
+        }
+        // Qwen3.8-Flash-Next fused projections at hidden 2560: attention
+        // q|k|gate|v (13312 rows) and GDN qkv|z (16384 rows) ride the generic
+        // routes; the fused input-projection families are not extended for them.
+        if (n == 13312 || n == 16384) {
+            if (t <= 16) { return launch_w8_simt_r8_c4; }
             if (t <= 128) { return launch_w8_mma_r32_c128; }
             return launch_w8_mma_r64_c128;
         }

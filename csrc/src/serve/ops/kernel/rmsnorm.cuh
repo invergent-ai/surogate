@@ -15,6 +15,7 @@ enum class RmsEpilogue {
     Offset,
     Plain,
     Gated,
+    GatedSigmoid,
 };
 
 template <RmsEpilogue Epilogue>
@@ -22,6 +23,7 @@ __device__ __forceinline__ float rmsnorm_epilogue(float x, float inv, float weig
     if constexpr (Epilogue == RmsEpilogue::Offset) { weight += 1.0f; }
     float value = x * inv * weight;
     if constexpr (Epilogue == RmsEpilogue::Gated) { value *= silu(z); }
+    if constexpr (Epilogue == RmsEpilogue::GatedSigmoid) { value *= sigmoid(z); }
     return value;
 }
 
