@@ -107,6 +107,15 @@ and the baseline run is queued.
   the server log does not show — client timeouts (its default is short for 12-85 s requests);
   rerun with a long timeout queued. Its answers came with `<think>` blocks (the fork ignores
   `chat_template_kwargs.enable_thinking`), which does not change the throughput shape.
+- **35B regression confirmed on GPU 1 (2026-08-28):** current binary, `probe_35b.sh`, users=32:
+  decode 1,152 / prefill 4,610 tok/s (answers correct) vs 1,761 / 1,927 measured with the same
+  script earlier today after the MoE-geometry refactor. GPU 2 gives the same 1,137, so it is
+  the code, not the card. Bisect in flight: worktree `surogate-bisect` at 14ec176a (RMSNorm
+  fix, before the slot-table/hook commits) and the pre-today worktree `surogate-pretoday`
+  (f7145031), both probed on GPU 2 once the host is idle. Suspects, in order: the
+  `slot_of_expert` parameter/indirection in the MoE kernels (register pressure / occupancy
+  in the Q4/Q5 35B kernels, not the null check itself), the round-hook plumbing, the family
+  hook no-ops. Rule: the 35B board rows must not move for the Flash-Next work.
 5. **Prefill**: selective streaming of used experts per layer with whole-layer double
    buffering on a side stream.
 
