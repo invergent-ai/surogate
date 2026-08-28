@@ -548,6 +548,7 @@ struct CpuExpertPool::Impl {
     std::uint32_t threads = 0;
     std::vector<std::thread> workers;
     std::mutex mutex;
+    std::mutex run_mutex; // one round at a time: pipeline stages share the pool from driver threads
     std::condition_variable wake;
     std::condition_variable done;
     bool stop = false;
@@ -937,6 +938,7 @@ void CpuExpertPool::run(const CpuExpertBank& bank, const CpuExpertRound& round) 
     }
     if (round.jobs.empty()) { return; }
     Impl& impl = *impl_;
+    std::lock_guard<std::mutex> run_lock(impl.run_mutex);
     const auto jobs = round.jobs.size();
     impl.xq.resize(static_cast<std::size_t>(round.tokens) * impl.geometry.hidden);
     impl.xs.resize(static_cast<std::size_t>(round.tokens) * (impl.geometry.hidden / kGroup));
