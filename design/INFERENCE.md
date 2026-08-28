@@ -805,3 +805,14 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   and shared by every graph/eager round with that slice shape (identical triples have
   identical semantics). The earlier per-layer design was accidentally safe: its only
   replay-time field was `round_tokens`, and a too-large value merely computed unused columns.
+- Tile (interleaved-rows) kernel measured (2026-08-28): a wash — best-of-round 880 vs 954
+  GB/s-eq at ~10 tokens per expert and 1,302 vs 1,218 at ~40 (means too noisy to read). The
+  repack gathers 4 bytes per row with scalar loads (128 per 64-byte vector), which costs
+  about as much as the reuse saves at these group sizes. Opt-in now
+  (`SUROGATE_CPU_EXPERT_TILE=1`); a vectorised repack (transpose via `vpunpck`/`vpermt2d`
+  from 16 row loads) is the follow-up if the host kernel becomes the limit again.
+- Stable contexts + prefill split, measured (2026-08-28): 1 user, prefill 0.7 → TTFT 1.33 s;
+  **16 users, prefill 0.5 → 36.0 tok/s decode, 159 prefill, TTFT 5.8 s, 34 completions** —
+  the best 16-user point (33.5 / 12.3 s without the prefill split; 29.5 / 5.9 s at prefill
+  0.7): at concurrency the lower prefill share keeps the host off the critical path of the
+  mixed rounds. 64 users (corruption check), 0.8 @1 and 0.7 @16 follow.

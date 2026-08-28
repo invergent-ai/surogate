@@ -381,8 +381,10 @@ void dot_two_rows_two_tokens_avx512(const std::int8_t*, const std::uint16_t*, co
 
 const bool kUseAvx512 = kAvx512Compiled && detect_avx512();
 const bool kUseVnni   = kUseAvx512 && kVnniCompiled && detect_vnni() && std::getenv("SUROGATE_CPU_EXPERT_NO_VNNI") == nullptr;
-// The tile path pays a repack per expert chunk; it wins once enough tokens share the expert.
-const bool kUseTile   = kUseVnni && std::getenv("SUROGATE_CPU_EXPERT_NO_TILE") == nullptr;
+// The tile path pays a repack per expert chunk. As written (scalar 4-byte gathers in the
+// repack) it measures level with the pairwise VNNI path at 10-40 tokens per expert, so it is
+// opt-in (SUROGATE_CPU_EXPERT_TILE=1) until the repack is vectorised.
+const bool kUseTile   = kUseVnni && std::getenv("SUROGATE_CPU_EXPERT_TILE") != nullptr;
 const int kTileMinTokens = [] {
     const char* v = std::getenv("SUROGATE_CPU_EXPERT_TILE_MIN");
     return v != nullptr && *v != '\0' ? std::max(2, std::atoi(v)) : 4;

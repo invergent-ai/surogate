@@ -86,7 +86,7 @@ private:
 /// by SUROGATE_CPU_EXPERT_NO_VNNI=1).
 [[nodiscard]] bool cpu_expert_compute_has_vnni() noexcept;
 /// True when expert groups with enough tokens run through the repacked 16-row tiles
-/// (needs VNNI; SUROGATE_CPU_EXPERT_NO_TILE=1 vetoes, SUROGATE_CPU_EXPERT_TILE_MIN=<tokens>
+/// (needs VNNI; opt-in with SUROGATE_CPU_EXPERT_TILE=1, SUROGATE_CPU_EXPERT_TILE_MIN=<tokens>
 /// sets the group size from which the repack pays).
 [[nodiscard]] bool cpu_expert_compute_has_tile() noexcept;
 
