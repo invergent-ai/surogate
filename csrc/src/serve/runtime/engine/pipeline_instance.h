@@ -105,6 +105,8 @@ public:
         }
         assembled_tokens_.resize(kMaximumConcurrency);
         assembled_counts_.resize(kMaximumConcurrency);
+        flights_.resize(groups_);
+        stage_owner_.assign(stages_.size(), -1);
     }
 
     [[nodiscard]] RequestBasePlan plan_request_base(const PreparedPrompt& prompt,
@@ -265,7 +267,193 @@ public:
         for (Stage* stage : stages_) { stage->program->reset_memory_peaks(); }
     }
 
+    // ---- Steady-state pipeline (step C3): groups are independent rounds that flow through the
+    // stages while other groups occupy other stages; the executor launches a group when it has
+    // nothing in flight and processes it when its last stage completes.
+    enum class FlightKind : std::uint8_t { Decode, Mixed, Prefill };
+    struct GroupResult {
+        FlightKind kind = FlightKind::Decode;
+        BatchedGeneratedRound round{};
+        MixedRoundResult mixed{};
+        PrefillStepResult prefill{};
+    };
+    [[nodiscard]] std::uint32_t group_count() const noexcept { return groups_; }
+    [[nodiscard]] bool group_in_flight(std::uint32_t g) const noexcept { return flights_.at(g).active; }
+    [[nodiscard]] bool any_in_flight() const noexcept {
+        for (const auto& f : flights_) { if (f.active) { return true; } }
+        return false;
+    }
+    void launch_group_decode(std::uint32_t g, std::span<const std::uint32_t> lanes, std::span<const RoundBudget> budgets) {
+        begin_flight(g, FlightKind::Decode, {}, lanes, budgets, 0);
+    }
+    void launch_group_mixed(std::uint32_t g, std::span<const std::uint32_t> prefill_lanes,
+                            std::span<const std::uint32_t> lanes, std::span<const RoundBudget> budgets) {
+        begin_flight(g, FlightKind::Mixed, prefill_lanes, lanes, budgets, 0);
+    }
+    void launch_group_prefill(std::uint32_t g, std::uint32_t lane) {
+        begin_flight(g, FlightKind::Prefill, {}, {}, {}, lane);
+    }
+    /// Advances the pipeline: consumes the stage round that has been running longest (the only
+    /// blocking wait), moves its group to the next stage or finishes it, and launches every
+    /// parked group whose next stage is free. Returns the groups that finished.
+    std::vector<std::uint32_t> tick() {
+        std::vector<std::uint32_t> finished;
+        int oldest = -1;
+        for (std::size_t g = 0; g < flights_.size(); ++g) {
+            const Flight& f = flights_[g];
+            if (!f.active || f.between) { continue; }
+            if (oldest < 0 || f.stage_sequence < flights_[static_cast<std::size_t>(oldest)].stage_sequence) {
+                oldest = static_cast<int>(g);
+            }
+        }
+        if (oldest >= 0) {
+            Flight& f = flights_[static_cast<std::size_t>(oldest)];
+            const std::size_t s = f.stage;
+            select(s);
+            trace("consume", s, static_cast<std::size_t>(oldest));
+            if (f.kind == FlightKind::Mixed) {
+                MixedRoundResult part = stages_[s]->program->consume_mixed_round(f.handle);
+                if (s + 1 == stages_.size()) {
+                    f.result.kind  = FlightKind::Mixed;
+                    f.result.mixed = part;
+                    store_round(f, part.round);
+                    f.result.mixed.round = f.result.round;
+                }
+            } else {
+                const BatchedGeneratedRound part = stages_[s]->program->consume_decode_round(f.handle);
+                if (s + 1 == stages_.size()) {
+                    f.result.kind = FlightKind::Decode;
+                    store_round(f, part);
+                }
+            }
+            f.handle = RoundHandle{};
+            stage_owner_[s] = -1;
+            finish_stage(static_cast<std::uint32_t>(oldest), s, finished);
+        }
+        advance_parked(finished);
+        return finished;
+    }
+    [[nodiscard]] const GroupResult& group_result(std::uint32_t g) const { return flights_.at(g).result; }
+
 private:
+    struct Flight {
+        bool active   = false;
+        bool between  = false; // parked: export copied out, waiting for `stage` to be free
+        FlightKind kind = FlightKind::Decode;
+        std::size_t stage = 0;
+        std::uint64_t stage_sequence = 0;
+        RoundHandle handle{};
+        std::vector<std::uint32_t> lanes;
+        std::vector<RoundBudget> budgets;
+        std::vector<std::uint32_t> prefill_lanes;
+        std::uint32_t prefill_lane = 0;
+        std::vector<TokenId> tokens;
+        std::vector<std::int32_t> counts;
+        std::vector<std::byte> park;
+        GroupResult result{};
+    };
+    std::vector<Flight> flights_;
+    std::vector<int> stage_owner_;
+    std::uint64_t stage_sequence_counter_ = 0;
+
+    void begin_flight(std::uint32_t g, FlightKind kind, std::span<const std::uint32_t> prefill_lanes,
+                      std::span<const std::uint32_t> lanes, std::span<const RoundBudget> budgets, std::uint32_t prefill_lane) {
+        Flight& f = flights_.at(g);
+        if (f.active) { throw std::logic_error("pipeline group already in flight"); }
+        f.active  = true;
+        f.between = true;
+        f.kind    = kind;
+        f.stage   = 0;
+        f.lanes.assign(lanes.begin(), lanes.end());
+        f.budgets.assign(budgets.begin(), budgets.end());
+        f.prefill_lanes.assign(prefill_lanes.begin(), prefill_lanes.end());
+        f.prefill_lane = prefill_lane;
+        f.result       = GroupResult{};
+        std::vector<std::uint32_t> none;
+        advance_parked(none);
+    }
+    void store_round(Flight& f, const BatchedGeneratedRound& part) {
+        const std::size_t stride = part.row_stride > 0 ? static_cast<std::size_t>(part.row_stride) : 1;
+        f.tokens.resize(f.lanes.size());
+        f.counts.resize(f.lanes.size());
+        for (std::size_t i = 0; i < f.lanes.size(); ++i) {
+            const std::int32_t count = part.row_counts.empty() ? 1 : part.row_counts[i];
+            if (count > 1) { throw std::logic_error("pipeline stages expect single-token rounds"); }
+            f.counts[i] = count;
+            f.tokens[i] = count == 1 ? part.tokens[i * stride] : 0;
+        }
+        f.result.round = BatchedGeneratedRound{
+            .tokens     = std::span<const TokenId>(f.tokens.data(), f.lanes.size()),
+            .row_counts = std::span<const std::int32_t>(f.counts.data(), f.lanes.size()),
+            .row_stride = 1};
+    }
+    // The group finished stage s (consumed, or a synchronous prefill step): park it for the
+    // next stage or complete it.
+    void finish_stage(std::uint32_t g, std::size_t s, std::vector<std::uint32_t>& finished) {
+        Flight& f = flights_[g];
+        trace("finished-stage", s, g);
+        if (s + 1 < stages_.size()) {
+            f.park.resize(boundary_bytes_);
+            std::memcpy(f.park.data(), stages_[s]->program->stage_export_buffer(), boundary_bytes_);
+            f.between = true;
+            f.stage   = s + 1;
+            return;
+        }
+        // Last stage: commit tokens on the head-less stages and hand the group back.
+        if (f.kind == FlightKind::Prefill) {
+            if (f.result.prefill.complete) { propagate_prefill_token(f.prefill_lane, f.result.prefill); }
+        } else {
+            propagate_round_tokens(f.lanes, f.result.round);
+            if (f.kind == FlightKind::Mixed) {
+                for (std::size_t i = 0; i < f.result.mixed.prefill_count && i < f.prefill_lanes.size(); ++i) {
+                    const PrefillStepResult& step = f.result.mixed.prefill_at(i);
+                    if (step.complete) { propagate_prefill_token(f.prefill_lanes[i], step); }
+                }
+            }
+        }
+        f.active  = false;
+        f.between = false;
+        finished.push_back(g);
+    }
+    // Launch every parked group whose next stage is free, oldest first (a prefill flight runs
+    // its stage synchronously and moves on at once).
+    void advance_parked(std::vector<std::uint32_t>& finished) {
+        for (;;) {
+            int pick = -1;
+            for (std::size_t g = 0; g < flights_.size(); ++g) {
+                const Flight& f = flights_[g];
+                if (!f.active || !f.between || stage_owner_[f.stage] >= 0) { continue; }
+                if (pick < 0 || f.stage_sequence < flights_[static_cast<std::size_t>(pick)].stage_sequence) {
+                    pick = static_cast<int>(g);
+                }
+            }
+            if (pick < 0) { return; }
+            Flight& f           = flights_[static_cast<std::size_t>(pick)];
+            const std::size_t s = f.stage;
+            select(s);
+            if (s > 0) {
+                std::memcpy(stages_[s]->program->stage_import_buffer(), f.park.data(), boundary_bytes_);
+            }
+            f.between        = false;
+            f.stage_sequence = ++stage_sequence_counter_;
+            if (f.kind == FlightKind::Prefill) {
+                trace("prefill-step", s, static_cast<std::size_t>(pick));
+                f.result.kind    = FlightKind::Prefill;
+                f.result.prefill = stages_[s]->program->advance_prefill_lane(f.prefill_lane);
+                finish_stage(static_cast<std::uint32_t>(pick), s, finished);
+                continue;
+            }
+            stage_owner_[s] = pick;
+            if (f.kind == FlightKind::Mixed) {
+                trace("launch_mixed_round", s, f.prefill_lanes.size() * 1000 + f.lanes.size());
+                f.handle = stages_[s]->program->launch_mixed_round(f.prefill_lanes, f.lanes, f.budgets);
+            } else {
+                trace("launch_decode_round", s, f.lanes.size());
+                f.handle = stages_[s]->program->launch_decode_round(f.lanes, f.budgets);
+            }
+        }
+    }
+
     void select(std::size_t stage) const noexcept { (void)cudaSetDevice(devices_[stage]); }
 
     // One executor round as a software pipeline over the stages: the decode lanes are

@@ -42,6 +42,9 @@ public:
     using Program  = typename Package::Program;
     using BasePlan = typename Package::RequestBasePlan;
     using Plan     = typename Package::RequestPlan;
+    // Pipeline programs (runtime/engine/pipeline_instance.h) expose per-group rounds; the
+    // worker loop then keeps several groups in flight across the stages (step C3).
+    static constexpr bool kPipelined = requires(typename Package::Program& p) { p.tick(); p.group_count(); };
     using Clock    = std::chrono::steady_clock;
 
     ConcurrentExecutor(Instance& instance, const EngineOptions& options)
@@ -991,6 +994,116 @@ private:
         }
     }
 
+    // ---- Steady-state pipeline (step C3) ------------------------------------------------
+    struct GroupMeta {
+        RoundMembership membership;
+        std::array<std::uint32_t, runtime::kMaximumMixedPrefills> staged{};
+        std::size_t staged_count  = 0;
+        std::uint32_t prefill_lane = 0;
+    };
+    std::vector<GroupMeta> group_meta_;
+
+    void pipelined_iteration(bool have_pending) {
+        auto& program = *instance_.program;
+        const std::uint32_t groups = program.group_count();
+        if (group_meta_.size() != groups) { group_meta_.resize(groups); }
+        if (!prefill_lanes_.empty()) { top_up_prefill_lanes(); }
+        // Admission is CPU-only (deferred first chunk): keep admitting while the queue holds
+        // work and lanes are free.
+        if (have_pending) {
+            const auto t_admit = Clock::now();
+            for (std::uint32_t extra = 0; extra < max_concurrency_; ++extra) {
+                bool lane_free = false;
+                for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) { lane_free = lane_free || slots_[lane] == nullptr; }
+                if (!lane_free) { break; }
+                {
+                    std::lock_guard lock(queue_mutex_);
+                    if (pending_.empty()) { break; }
+                }
+                if (try_admit_one() == AdmissionProgress::None) { break; }
+            }
+            seg_timer_.admit += std::chrono::duration<double>(Clock::now() - t_admit).count();
+            if (!prefill_lanes_.empty()) { top_up_prefill_lanes(); }
+        }
+        // Launch every idle group that has work.
+        bool launched = false;
+        for (std::uint32_t g = 0; g < groups; ++g) {
+            if (program.group_in_flight(g)) { continue; }
+            GroupMeta& meta = group_meta_[g];
+            meta.membership = RoundMembership{};
+            for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                if (lane % groups != g) { continue; }
+                const auto& request = slots_[lane];
+                if (request == nullptr || !request->decode_ready) { continue; }
+                if (!request->budget) { throw std::logic_error("decode-ready request has no generation budget"); }
+                meta.membership.lanes[meta.membership.size]   = lane;
+                meta.membership.budgets[meta.membership.size] = request->budget->round_budget();
+                ++meta.membership.size;
+            }
+            meta.staged_count = 0;
+            for (const std::uint32_t candidate : prefill_lanes_.span()) {
+                if (candidate % groups != g || !program.mixed_round_supported(candidate)) { continue; }
+                const auto& owner = slots_[candidate];
+                if (owner == nullptr || owner->decode_ready) { continue; }
+                meta.staged[meta.staged_count++] = candidate;
+            }
+            if (meta.staged_count > 0 && !meta.membership.empty()) {
+                last_round_ = LastRound{"mixed", static_cast<std::uint32_t>(meta.membership.size), meta.staged[0], last_round_.index + 1};
+                program.launch_group_mixed(g, std::span<const std::uint32_t>(meta.staged.data(), meta.staged_count),
+                                           meta.membership.lane_span(), meta.membership.budget_span());
+                launched = true;
+            } else if (meta.staged_count > 0) {
+                meta.prefill_lane = meta.staged[0];
+                last_round_ = LastRound{"prefill", 0, meta.prefill_lane, last_round_.index + 1};
+                program.launch_group_prefill(g, meta.prefill_lane);
+                launched = true;
+            } else if (!meta.membership.empty()) {
+                last_round_ = LastRound{"decode", static_cast<std::uint32_t>(meta.membership.size), 0, last_round_.index + 1};
+                program.launch_group_decode(g, meta.membership.lane_span(), meta.membership.budget_span());
+                launched = true;
+            }
+        }
+        if (!program.any_in_flight()) {
+            if (!launched) { std::this_thread::sleep_for(std::chrono::microseconds(200)); }
+            return;
+        }
+        const auto t_round = Clock::now();
+        const std::vector<std::uint32_t> finished = program.tick();
+        seg_timer_.decode += std::chrono::duration<double>(Clock::now() - t_round).count();
+        for (const std::uint32_t g : finished) {
+            const GroupMeta& meta = group_meta_[g];
+            const auto& result    = program.group_result(g);
+            switch (result.kind) {
+            case std::remove_reference_t<decltype(program)>::FlightKind::Decode:
+                process_decode_round(meta.membership, result.round);
+                ++cumulative_stats_.decode_rounds;
+                seg_timer_.decode_rounds += 1;
+                break;
+            case std::remove_reference_t<decltype(program)>::FlightKind::Mixed:
+                process_decode_round(meta.membership, result.mixed.round);
+                ++cumulative_stats_.decode_rounds;
+                seg_timer_.mixed_rounds += 1;
+                for (std::size_t i = 0; i < result.mixed.prefill_count && i < meta.staged_count; ++i) {
+                    const auto owner = slots_[meta.staged[i]];
+                    if (owner == nullptr) { continue; }
+                    const bool cancelled_now = owner->cancelled.load(std::memory_order_acquire);
+                    resolve_prefill_step(owner, result.mixed.prefill_at(i), cancelled_now);
+                }
+                publish_runtime_stats();
+                break;
+            case std::remove_reference_t<decltype(program)>::FlightKind::Prefill: {
+                const auto owner = slots_[meta.prefill_lane];
+                if (owner != nullptr) {
+                    const bool cancelled_now = owner->cancelled.load(std::memory_order_acquire);
+                    resolve_prefill_step(owner, result.prefill, cancelled_now);
+                }
+                publish_runtime_stats();
+                break;
+            }
+            }
+        }
+    }
+
     void run_decode_round(const RoundMembership& membership) {
         const std::span<const std::uint32_t> lanes = membership.lane_span();
         // Round chaining (PATCHES.md #32): burst pure-decode stretches, but
@@ -1271,6 +1384,12 @@ private:
                 const bool have_pending          = expire_pending_requests();
                 const auto cancelled_at_boundary = snapshot_cancellations();
                 cancel_active_requests(cancelled_at_boundary);
+                if constexpr (kPipelined) {
+                    seg_timer_.boundary += std::chrono::duration<double>(Clock::now() - seg_t0).count();
+                    seg_timer_.maybe_report();
+                    pipelined_iteration(have_pending);
+                    continue;
+                }
                 const RoundMembership membership = build_round_membership();
                 seg_timer_.boundary += std::chrono::duration<double>(Clock::now() - seg_t0).count();
                 seg_timer_.maybe_report();
