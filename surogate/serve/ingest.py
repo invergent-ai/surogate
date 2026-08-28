@@ -170,10 +170,13 @@ def _ensure_from_gguf(gguf_path: Path, *, echo=print) -> Path:
             "surogate serve: this GGUF is not yet supported by the native engine.\n"
             f"  architecture={s['architecture']!r} hidden={s['hidden_size']} "
             f"layers={s['num_hidden_layers']} quants={s['quant_types']}\n"
-            "  Registered today: Qwen3.6-27B, Qwen3.8-27B, Qwen3.6-35B-A3B."
+            "  Registered today: Qwen3.6-27B, Qwen3.8-27B, Qwen3.6-35B-A3B, Qwen3.8-Flash-Next."
         )
 
     out = cache_dir() / f"{target_key}-gguf-{fp}.ninfer"
+
+    if target_key == "qwen4exp":
+        return _convert_gguf_native(root, gguf_path, out, echo=echo)
 
     # Q8_0 repack (PATCHES.md #14): for targets whose converter takes
     # --gguf-repack, plan against the converter's own recipes which candidate
@@ -200,6 +203,50 @@ def _ensure_from_gguf(gguf_path: Path, *, echo=print) -> Path:
         )
     finally:
         shutil.rmtree(work, ignore_errors=True)
+
+
+def _convert_gguf_native(root: Path, gguf_path: Path, out: Path, *, echo=print) -> Path:
+    """Qwen3.8-Flash-Next: the GGUF is the weight source and the model's own HF frontend
+    (tokenizer, chat template, generation and preprocessor configs) is fetched from the Hub;
+    the converter repacks the GGUF tensors directly (no bridged BF16 shards)."""
+    from surogate.serve.tools.convert.qwen4exp import inventory as inv
+    frontend_files = [spec.name.removeprefix("frontend/") for spec in inv.RESOURCE_SPECS]
+    frontend_dir = cache_dir() / "frontends" / "Qwen3.8-Flash-Next"
+    missing = [name for name in frontend_files if not (frontend_dir / name).is_file()]
+    if missing:
+        try:
+            from huggingface_hub import snapshot_download
+        except ImportError as error:
+            raise SystemExit(
+                "surogate serve: huggingface_hub is required to fetch the Qwen3.8-Flash-Next "
+                "frontend (tokenizer, chat template, generation config)."
+            ) from error
+        echo("surogate serve: fetching the Qwen3.8-Flash-Next frontend from the Hub")
+        frontend_dir.mkdir(parents=True, exist_ok=True)
+        snapshot_download("Qwen/Qwen3.8-Flash-Next", allow_patterns=frontend_files + ["config.json"],
+                          local_dir=str(frontend_dir))
+        missing = [name for name in frontend_files if not (frontend_dir / name).is_file()]
+        if missing:
+            raise SystemExit(f"surogate serve: frontend files missing after download: {missing}")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_suffix(".ninfer.partial")
+    tmp.unlink(missing_ok=True)
+    echo(f"surogate serve: preparing engine weights for Qwen3.8-Flash-Next "
+         f"(one-time conversion of the GGUF shards; cached at {out})")
+    cmd = [sys.executable, "-m", "surogate.serve.tools.convert.qwen4exp.convert",
+           "--gguf", str(gguf_path), "--frontend", str(frontend_dir), "--out", str(tmp),
+           "--device", os.environ.get("SUROGATE_CONVERT_DEVICE", "cuda")]
+    if os.environ.get("SUROGATE_SERVE_DRY"):
+        echo("DRY: cwd=" + str(root))
+        echo("DRY: " + " ".join(cmd))
+        raise SystemExit(0)
+    env = {**os.environ, "PYTHONPATH": str(root) + os.pathsep + os.environ.get("PYTHONPATH", "")}
+    result = subprocess.run(cmd, cwd=root, env=env)
+    if result.returncode != 0 or not tmp.is_file():
+        tmp.unlink(missing_ok=True)
+        raise SystemExit(f"surogate serve: conversion failed (exit {result.returncode}).")
+    tmp.replace(out)
+    return out
 
 
 def _repack_planner(root: Path, target_key: str):

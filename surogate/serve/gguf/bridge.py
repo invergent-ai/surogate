@@ -321,4 +321,7 @@ def gguf_target_key(gguf_path: Path, reader=None):
         return "qwen3_8_27b"
     if arch in ("qwen35moe", "qwen3moe", "qwen3_6_moe", "qwen3_5_moe") and hidden > 0:
         return "qwen3_6_35b_a3b"
+    if arch == "qwen4exp":
+        # Qwen3.8-Flash-Next: converted straight from the GGUF (no HF bridge).
+        return "qwen4exp"
     return None
