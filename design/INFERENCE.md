@@ -403,6 +403,36 @@ Steps, each with its test:
 - D. Offload inside stages: W8 bank with pools per stage (the memory that does not fit),
   auto share per stage; then the board rows.
 
+Step C3 — steady-state pipeline (design, 2026-08-28 22:05). The C1/C2 driver runs every
+executor round as a closed software pipeline (fill, G steps, drain), so a token costs
+(G+N−1) stage-round fixed costs instead of one; for a model that fits one card this is
+slower than the card. Steady state means a group re-enters stage 0 as soon as its previous
+tokens are committed, while the other groups sit at other stages, so the fixed cost is paid
+once per group-round and the stages stay busy. That needs the executor to reason per group:
+
+- Lanes are partitioned into G groups (lane % G, G = stages by default, width-limited as
+  now). Each group has its own membership, its own staged prefills (a prefill lane belongs to
+  its lane's group; a group's round is mixed when it has staged prefills), and at most one
+  round in flight.
+- The pipeline program exposes `launch_group(g, prefill_lanes, lanes, budgets)` (stage 0
+  launch, records the group's in-flight state), `tick()` (advances every in-flight group by
+  one stage where the next stage is free: consume stage s — blocking only on the group that
+  has been in flight longest — park/copy the boundary, launch stage s+1; returns the groups
+  whose last stage completed with their assembled results), and the existing per-lane
+  bookkeeping calls (resolve, tokens propagation) applied per finished group.
+- The executor's worker loop becomes: admit/top-up as now; for every group without a round
+  in flight and with decode-ready lanes (or staged prefills), build its membership and
+  launch; `tick()`; for each finished group, run the existing `process_decode_round` /
+  prefill resolution on that group's membership and results. A group that has nothing to run
+  idles. With N stages and G ≥ N groups the pipeline stays full; with one lane it degrades
+  to lockstep (unchanged latency).
+- Non-pipeline instances keep the single-round loop (the group machinery compiles in only
+  for the pipeline instance type).
+- Expected: a token then costs ~one stage round per group, and eight stages pipelined give
+  ~N× the per-stage rate at high concurrency; the per-stage fixed cost (~30 ms today, far
+  above the stage's GPU work) remains the multiplier on everything and is decomposed by the
+  timestamped trace.
+
 Non-goals for phase 3: tensor parallelism (needs all-reduce per layer — the EP argument
 applies), expert parallelism (rejected below), P2P copies (not available; the host-staged
 copy is the design, and it is also what a multi-host version would use).
