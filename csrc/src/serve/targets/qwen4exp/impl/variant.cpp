@@ -14,7 +14,7 @@
 #include "ops/linear/bf16/bf16_cublaslt.h"
 
 #include <algorithm>
-#include <array>
+#include <deque>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -74,15 +74,23 @@ struct ExpertSlotCache {
         std::int32_t round_offset = 0;
         bool round_split          = false;
     };
-    // One host-function context per staged slice (a ring: slices of one round and the next
-    // are enqueued in stream order, so a small ring is never overrun).
+    // Host-function contexts. A hook runs at graph capture and its context pointer is baked
+    // into the host-function node, so a context must stay valid and unchanged for every
+    // replay: one address-stable context per distinct (layer, offset, tokens), shared by every
+    // graph and eager round with that slice shape.
     struct SliceContext {
         Layer* entry         = nullptr;
         std::int32_t offset  = 0;
         std::int32_t tokens  = 0;
     };
-    std::array<SliceContext, 32> slice_ring{};
-    std::uint32_t slice_next = 0;
+    std::deque<SliceContext> slice_contexts;
+    SliceContext& slice_context(Layer& entry, std::int32_t offset, std::int32_t tokens) {
+        for (SliceContext& c : slice_contexts) {
+            if (c.entry == &entry && c.offset == offset && c.tokens == tokens) { return c; }
+        }
+        slice_contexts.push_back(SliceContext{&entry, offset, tokens});
+        return slice_contexts.back();
+    }
     bool enabled = false;
     std::int32_t slots = 0;
     void* pool_memory      = nullptr;
@@ -193,8 +201,7 @@ struct ExpertSlotCache {
             throw std::logic_error("qwen4exp: CPU split round wider than its staging");
         }
         entry.round_tokens = tokens;
-        SliceContext& slice = slice_ring[slice_next++ % slice_ring.size()];
-        slice               = SliceContext{&entry, offset, tokens};
+        SliceContext& slice = slice_context(entry, offset, tokens);
         const std::size_t column0 = static_cast<std::size_t>(offset) * hidden;
         CUDA_CHECK(cudaEventRecord(fork_event, stream));
         CUDA_CHECK(cudaStreamWaitEvent(cpu_stream, fork_event, 0));

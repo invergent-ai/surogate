@@ -789,3 +789,19 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   `dpbusd` advances 16 rows and the scale applies per 16 rows per group), which needs an
   on-the-fly repack of each expert chunk into a thread-local tile (repack ≈ one GEMV pass,
   then ~3× per token; pays off from ~4 tokens per expert). Queued after the mixed-round fix.
+- Multi-slice staging, measured (2026-08-28, prefill share 0.7, decode share 0.7, interleave):
+  1 user TTFT 1.44 s (as before, 23.9 decode); **16 users: 0 errors, TTFT 12.3 → 5.9 s,
+  completions 21 → 39, prefill 138 → 177 loadgen, decode 33.5 → 29.5** — total tokens per
+  second 171 → 206 (+20 %) although the decode column reads lower: the host is now the
+  critical path of the mixed rounds (0.7 of ~450 prefill misses per layer on the host vs 0.3
+  over PCIe), so the decode lanes riding along wait for it. A lower prefill share at high
+  concurrency (0.4-0.5) should rebalance; sweep queued. 32 users at 2,000 slots: 23.2 /
+  154, 44 completions, TTFT 20 s (30.9 / 136 / 34 without the prefill split).
+- 64 users with the prefill split corrupted again (decode round of 40 lanes, after mixed
+  rounds): the slice contexts came from a 32-entry ring, but a hook runs at *graph capture*
+  and its context pointer is baked into the host-function node — 48 layers × slices × the
+  graph ladder overrun the ring, so a replay read another slice's offset. Fix (this commit):
+  one address-stable context per distinct (layer, offset, tokens), deduplicated in a deque
+  and shared by every graph/eager round with that slice shape (identical triples have
+  identical semantics). The earlier per-layer design was accidentally safe: its only
+  replay-time field was `round_tokens`, and a too-large value merely computed unused columns.
