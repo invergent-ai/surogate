@@ -22,6 +22,8 @@
 #include <span>
 #include <vector>
 
+#include "targets/qwen3_6/impl/runtime/residual_policy.h"
+
 namespace ninfer::targets::qwen3_6::detail {
 class PrefillGraphFamily;
 } // namespace ninfer::targets::qwen3_6::detail
@@ -33,6 +35,7 @@ namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 // neither weights nor device state.
 struct ModelConfig {
     static constexpr int hidden              = TextConfig::hidden;
+    static constexpr int residual            = residual_width<TextConfig>();
     static constexpr int n_layers            = TextConfig::layers;
     static constexpr int intermediate        = TextConfig::intermediate;
     static constexpr int vocab               = TextConfig::output_rows;
@@ -73,6 +76,7 @@ struct ModelConfig {
 };
 
 inline constexpr ModelConfig kCfg{};
+using Hooks = ResidualHooks<Variant>;
 inline constexpr float kAttnScale                     = kAttentionScale;
 inline constexpr std::uint32_t kPrefillChunkAlignment = 128;
 

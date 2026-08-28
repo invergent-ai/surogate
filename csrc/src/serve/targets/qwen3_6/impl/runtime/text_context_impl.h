@@ -670,11 +670,11 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
         ScopedValue<std::int32_t> batch_binding(active_sequence_batch_, batch);
         ScopedValue<std::int32_t> width_binding(active_sequence_width_, 1);
 
-        Tensor x = work_.alloc(DType::BF16, {kCfg.hidden, batch});
-        ops::embedding(ids, *embed_, x, stream);
+        Tensor x = work_.alloc(DType::BF16, {kCfg.residual, batch});
+        Hooks::embed(weights_, ids, x, work_, stream);
         NullTap tap;
         run_layers(x, Phase::Verify, tap);
-        ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, hidden, stream);
+        Hooks::finish(weights_, x, kCfg.rms_eps, hidden, work_, stream);
         ops::linear(hidden, *lm_head_, logits, stream);
     }
     work_.reset();
@@ -721,9 +721,9 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         ScopedValue<std::int32_t> batch_binding(active_sequence_batch_, batch);
         ScopedValue<std::int32_t> width_binding(active_sequence_width_, width);
 
-        Tensor x        = work_.alloc(DType::BF16, {kCfg.hidden, columns});
+        Tensor x        = work_.alloc(DType::BF16, {kCfg.residual, columns});
         Tensor flat_ids = ids.view({columns});
-        ops::embedding(flat_ids, *embed_, x, stream);
+        Hooks::embed(weights_, flat_ids, x, work_, stream);
         if constexpr (Tap::enabled) { tap.begin(x); }
         run_layers(x, Phase::Verify, tap);
         if constexpr (requires { tap.capture_positions(cache_positions, stream); }) {
@@ -732,7 +732,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         Tensor flat_hidden = hidden.view({kCfg.hidden, columns});
         Tensor flat_logits = logits.view({kCfg.vocab, columns});
         Tensor flat_tokens = target_tokens.view({columns});
-        ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, flat_hidden, stream);
+        Hooks::finish(weights_, x, kCfg.rms_eps, flat_hidden, work_, stream);
         ops::linear(flat_hidden, *lm_head_, flat_logits, stream);
         ops::argmax(flat_logits, flat_tokens, kCfg.token_domain, stream);
     }
@@ -807,7 +807,7 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
 
     const auto projection = workspace_recipe::text_attention_projection<TextConfig>(work_, T);
     Tensor h              = projection.hidden;
-    ops::rmsnorm(x, *w.input_norm, kCfg.rms_eps, true, h, s);
+    Hooks::attention_norm(x, *w.input_norm, kCfg.rms_eps, *w.projection, h, work_, s);
 
     Tensor q         = projection.query.view({kCfg.head_dim, kCfg.n_q, T});
     Tensor gate      = projection.gate.view({kCfg.head_dim, kCfg.n_q, T});
@@ -1102,7 +1102,7 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Ph
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
     Tensor h       = workspace_recipe::post_mixer_hidden<TextConfig>(work_, T);
-    ops::rmsnorm(x, *post_norm, kCfg.rms_eps, true, h, s);
+    Hooks::post_mixer_norm(x, *post_norm, kCfg.rms_eps, *m.payload, h, work_, s);
 
     Variant::post_mixer(h, *m.payload, x, ph, work_, s);
 }
@@ -1301,7 +1301,7 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
 
 
     Tensor x = roots.residual;
-    ops::embedding(ids_device, *embed_, x, s);
+    Hooks::embed(weights_, ids_device, x, work_, s);
 
     PrefillFamilyTimer& timer = prefill_family_timer();
     cudaStreamCaptureStatus capturing = cudaStreamCaptureStatusNone;
@@ -1325,7 +1325,8 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                 const auto projection = workspace_recipe::text_attention_projection<TextConfig>(
                     work_, total);
                 Tensor h = projection.hidden;
-                ops::rmsnorm(x, *full.input_norm, kCfg.rms_eps, true, h, s);
+                Hooks::attention_norm(x, *full.input_norm, kCfg.rms_eps, *full.projection, h,
+                                      work_, s);
                 Tensor q         = projection.query.view({kCfg.head_dim, kCfg.n_q, total});
                 Tensor gate      = projection.gate.view({kCfg.head_dim, kCfg.n_q, total});
                 Tensor k         = projection.key.view({kCfg.head_dim, kCfg.n_kv, total});
@@ -1538,7 +1539,7 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
     Tensor xf = prefill_hidden_.data != nullptr
                     ? matrix_window(prefill_hidden_, total)
                     : work_.alloc(DType::BF16, {kCfg.hidden, total});
-    ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, xf, s);
+    Hooks::finish(weights_, x, kCfg.rms_eps, xf, work_, s);
 
     {
         Tensor xf_decode = xf.slice(1, prefill_cols, batch);
@@ -1632,7 +1633,7 @@ void TextContext::prefill_graph_window(std::int32_t bucket) {
     ScopedValue<const Tensor*> scoped_pad(graph_pad_valid_, &graph_pad_valid_storage_);
 
     Tensor x = roots.residual;
-    ops::embedding(ids_device, *embed_, x, s);
+    Hooks::embed(weights_, ids_device, x, work_, s);
     NullTap tap;
     run_layers(x, Phase::Prefill, tap);
 
@@ -1640,7 +1641,7 @@ void TextContext::prefill_graph_window(std::int32_t bucket) {
         throw std::logic_error("prefill graph body requires the persistent prefill hidden store");
     }
     Tensor xf = matrix_window(prefill_hidden_, bucket);
-    ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, xf, s);
+    Hooks::finish(weights_, x, kCfg.rms_eps, xf, work_, s);
 }
 
 // The capturable mixed-round body (PATCHES.md #30): one forward over
@@ -1699,7 +1700,7 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
     const ops::GqaExecutionEnvelope decode_envelope = mixed_graph_decode_.envelope;
 
     Tensor x = roots.residual;
-    ops::embedding(ids_device, *embed_, x, s);
+    Hooks::embed(weights_, ids_device, x, work_, s);
 
     for (int layer = 0; layer < kCfg.n_layers; ++layer) {
         if (ModelConfig::is_full(layer)) {
@@ -1710,7 +1711,8 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
                 const auto projection = workspace_recipe::text_attention_projection<TextConfig>(
                     work_, total);
                 Tensor h = projection.hidden;
-                ops::rmsnorm(x, *full.input_norm, kCfg.rms_eps, true, h, s);
+                Hooks::attention_norm(x, *full.input_norm, kCfg.rms_eps, *full.projection, h,
+                                      work_, s);
                 Tensor q         = projection.query.view({kCfg.head_dim, kCfg.n_q, total});
                 Tensor gate      = projection.gate.view({kCfg.head_dim, kCfg.n_q, total});
                 Tensor k         = projection.key.view({kCfg.head_dim, kCfg.n_kv, total});
@@ -1877,7 +1879,7 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
         throw std::logic_error("mixed graph body requires the persistent prefill hidden store");
     }
     Tensor xf = matrix_window(prefill_hidden_, total);
-    ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, xf, s);
+    Hooks::finish(weights_, x, kCfg.rms_eps, xf, work_, s);
 
     Tensor xf_decode = xf.slice(1, prefill_cols, batch);
     CUDA_CHECK(cudaMemcpyAsync(decode.hidden.data, xf_decode.data,
@@ -2139,7 +2141,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             ScopedEnvelope scoped_envelope(active_gqa_envelope_, chunk_envelope);
 
             Tensor x = roots.residual;
-            ops::embedding(ids_device, *embed_, x, s);
+            Hooks::embed(weights_, ids_device, x, work_, s);
             window_laps.mark_pre();
             if (!local_scatter_indices.empty()) {
                 Tensor indices_device = roots.scatter_indices;
@@ -2158,7 +2160,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             Tensor xf = prefill_hidden_.data != nullptr
                             ? matrix_window(prefill_hidden_, len)
                             : work_.alloc(DType::BF16, {kCfg.hidden, len});
-            ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, xf, s);
+            Hooks::finish(weights_, x, kCfg.rms_eps, xf, work_, s);
 
             if (is_last) {
                 Tensor last_xf = xf.slice(1, len - 1, 1);

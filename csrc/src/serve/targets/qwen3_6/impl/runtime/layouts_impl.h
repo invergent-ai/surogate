@@ -397,7 +397,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     for (std::int32_t batch = 1; batch <= static_cast<std::int32_t>(plan.max_concurrency);
          ++batch) {
         WorkspaceLayoutBuilder ordinary;
-        matrix(ordinary, DType::BF16, TextConfig::hidden, batch);
+        matrix(ordinary, DType::BF16, residual_width<TextConfig>(), batch);
         target_body(ordinary, batch, batch, qwen3_6::TextPhase::Verify, GdnWorkspacePath::Snapshot,
                     batch, 1, 1, text_envelope);
         scratch(ordinary,
@@ -439,7 +439,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
              ++batch) {
             const std::int32_t aggregate = batch * verify;
             WorkspaceLayoutBuilder target;
-            matrix(target, DType::BF16, TextConfig::hidden, aggregate);
+            matrix(target, DType::BF16, residual_width<TextConfig>(), aggregate);
             target_body(target, aggregate, aggregate, qwen3_6::TextPhase::Verify,
                         GdnWorkspacePath::ReplayRecord, batch, verify, verify, text_envelope);
 
@@ -529,7 +529,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                  ++batch) {
                 const std::int32_t aggregate = verify * batch;
                 WorkspaceLayoutBuilder target;
-                matrix(target, DType::BF16, TextConfig::hidden, aggregate);
+                matrix(target, DType::BF16, residual_width<TextConfig>(), aggregate);
                 target_body(target, aggregate, aggregate, qwen3_6::TextPhase::Verify,
                             GdnWorkspacePath::ReplayRecord, batch, verify, verify, text_envelope);
                 const std::size_t accept =

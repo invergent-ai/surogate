@@ -8,6 +8,8 @@
 
 #include <cstdint>
 
+#include "targets/qwen3_6/impl/runtime/residual_policy.h"
+
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::workspace_recipe {
 
 template <class Allocator>
@@ -35,7 +37,7 @@ TextPrefillRoots text_prefill_roots(Allocator& allocator, std::int32_t tokens,
     out.ids       = vector(allocator, DType::I32, tokens);
     out.positions = vector(allocator, DType::I32, tokens);
     if (rope_axes != 0) { out.rope_positions = matrix(allocator, DType::I32, tokens, rope_axes); }
-    out.residual = matrix(allocator, DType::BF16, Config::hidden, tokens);
+    out.residual = matrix(allocator, DType::BF16, residual_width<Config>(), tokens);
     if (scatter_tokens != 0) {
         out.scatter_indices = vector(allocator, DType::I32, scatter_tokens);
     }
