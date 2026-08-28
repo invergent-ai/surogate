@@ -48,8 +48,16 @@ is ~20 tok/s (10 experts × 4.9 MB × 48 layers = 2.4 GB/token at ~50 GB/s), so 
 Design (model-agnostic, keyed by `SparseMoeGeometry`; no kernel changes):
 
 1. **Expert slot pool** on the device: `slots × (gate_up rows + down rows)` in the kernels'
-   own W8 row-split layout, so a slot is addressed exactly like an expert
-   (`row_base = slot * 2 * intermediate`); `SparseMoeWeights.routed_*` point at the pool.
+   own W8 row-split layout (planes are row-major, so one expert is one contiguous slice per
+   plane: codes + scales = two banks per matrix), so a slot is addressed exactly like an
+   expert (`row_base = slot * 2 * intermediate`); `SparseMoeWeights.routed_*` point at the
+   pool. Indirection: an optional per-layer device table `slot_of_expert[experts]` on
+   `SparseMoeWeights`, consulted at the five row-base sites (decode d3/d4, small-T, prefill
+   ×3) — ids stay expert ids everywhere (the prefill histogram/scan is per expert), a null
+   table means resident experts. One-line change per site, no schedule changes.
+   Split points (read 2026-08-28): decode d2 (top-k ids) → d3; small-T s2 → s3; prefill
+   `select_count` (ids final) → `scan`/gather/expert kernels — resolve runs once per layer on
+   the ids buffer each path already produces, so the three schedules keep their kernels.
 2. **Resolve + gather op** between routing and the expert kernels: the wrapper splits into
    `sparse_moe_route` (d1/d2 → expert ids, α, shared scale), `expert_slot_resolve` (device
    table `[layers × experts] → slot`, LRU timestamps, active-slot protection, miss list with
@@ -116,6 +124,10 @@ Exit for phase 2: the single-GPU board row at 1, 16 and 100 users, ≥ 3× llama
   (never while an engine process is live: mmap SIGBUS).
 - 35B regression probe: scratchpad `probe_35b.sh` (coherence + loadgen, GPU 1, port 8898).
 - llama.cpp oracle: `study/llama.cpp-master/build/bin/llama-server` (readiness = `/health`).
+
+Parity tooling (2026-08-28): `surogate/serve/tools/parity/qwen4exp/` (README inside) — engine
+stage dumps via `SUROGATE_SERVE_DUMP_RESIDUAL`, CPU re-derivation of token 0 from the GGUF,
+per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle.
 
 ## Log
 
@@ -320,3 +332,8 @@ Exit for phase 2: the single-GPU board row at 1, 16 and 100 users, ≥ 3× llama
   zero-copy, so it is the worst part of v0 (llama.cpp CPU-MoE: 16.3 decode / 65 prefill at 16
   users, 512/128). 32-user probe, `nsys` decode profile and the board-shape 512/128 probes
   queued behind it.
+- During the 32-user run (rebuilt binary) GPU 1 sits at 100 % utilisation with the host
+  97 % idle: v0 is GPU-bound on PCIe-latency-bound zero-copy reads inside the MoE kernels,
+  not host-bound — the slot pool + bulk gather is the right first move (bulk 16-byte
+  coalesced row copies reach 52 GB/s; the kernels' scattered 2.5 KB rows do not). The
+  coherence answers on this binary match llama.cpp's verbatim for the primes prompt.
