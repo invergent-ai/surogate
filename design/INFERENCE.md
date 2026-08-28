@@ -886,3 +886,13 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   a clear win at 16 users (37.9 vs 33.5, TTFT halved) and slightly negative at 64, where the
   host is already the round's critical path with the decode share; the default stays 0.5
   and the 64-user trio (0.7 / 0.5 / 0) on the per-slice-mirror binary follows in lane A.
+- Parallel lanes (2026-08-28, two node-bound instances at once — GPU 2 + NUMA node 0, GPU 3 +
+  node 1, 16 host threads each, cpuset-aware pinning; the binary with per-slice job mirrors):
+  **64 users at prefill 0.7: 0 fatals, 0 errors** — the share-dependent corruption is closed.
+  Numbers are about half the single-instance ones, as each lane has half the cores and the
+  two share DRAM (16.6 / 19.2 at 64 users for 0.7 / 0.5; 18.9 / 23.6 at 16 users for 0.5 /
+  0.3; 12.0 and TTFT 2.4 s at one user), so lanes are for A/B sweeps and correctness at
+  concurrency, not board rows. Two instances is the host's limit: each pins its own 154 GB
+  bank (331 GB used with two). Reading: the prefill-share optimum tracks host strength (0.3
+  on 16 threads, 0.5 on 32, 0.7 for a single user on 32), so with `--cpu-moe-share auto` the
+  prefill share now defaults to the measured decode share − 0.3 in [0.2, 0.7] unless given.

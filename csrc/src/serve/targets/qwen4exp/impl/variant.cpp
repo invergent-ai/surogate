@@ -150,6 +150,7 @@ struct ExpertSlotCache {
     std::int32_t cpu_prefill_max_tokens  = 0;
     bool auto_share             = false;
     bool share_measured         = false;
+    bool prefill_share_default  = false; // prefill share not given: follows the measured decode share
     std::unique_ptr<ops::CpuExpertPool> cpu_pool;
     cudaStream_t cpu_stream = nullptr; // side stream: the host round overlaps the GPU experts
     cudaEvent_t fork_event   = nullptr;
@@ -389,7 +390,8 @@ ExpertSlotCache& expert_slot_cache_for_current_device() {
         prefill_fraction = std::strtod(share, nullptr);
         if (prefill_chunk == 0) { prefill_chunk = 2048; }
     }
-    if (prefill_fraction < 0.0) { prefill_fraction = fraction > 0.0 ? 0.5 : 0.0; }
+    const bool prefill_default = prefill_fraction < 0.0;
+    if (prefill_default) { prefill_fraction = fraction > 0.0 ? 0.5 : 0.0; }
     if (prefill_chunk == 0) { prefill_chunk = 2048; }
     {
         if (fraction > 0.0 || prefill_fraction > 0.0) {
@@ -449,7 +451,8 @@ ExpertSlotCache& expert_slot_cache_for_current_device() {
             CUDA_CHECK(cudaEventCreateWithFlags(&cache.fork_event, cudaEventDisableTiming));
             CUDA_CHECK(cudaEventCreateWithFlags(&cache.join_event, cudaEventDisableTiming));
             CUDA_CHECK(cudaEventCreateWithFlags(&cache.copied_event, cudaEventDisableTiming));
-            cache.auto_share = auto_share;
+            cache.auto_share            = auto_share;
+            cache.prefill_share_default = prefill_default;
             std::fprintf(stderr, "qwen4exp: CPU expert split enabled: %.0f%% of decode misses, %.0f%% of prefill misses (rounds up to %d columns) on %u host threads%s\n",
                          100.0 * fraction, 100.0 * prefill_fraction, cache.cpu_prefill_max_tokens,
                          cache.cpu_pool->threads(), auto_share ? " (auto: measured at startup)" : "");
@@ -711,6 +714,14 @@ void Variant::prepare_expert_split(const ModelView& model) {
     share        = std::min(0.9, std::max(0.3, share));
     cache.cpu_share_q16  = static_cast<std::uint32_t>(share * 65536.0);
     cache.share_measured = true;
+    // The prefill share optimum sits below the decode one and tracks host strength (measured
+    // 2026-08-28: 0.5 at 32 host threads where the decode share measures ~0.8, 0.3 at 16
+    // threads): share − 0.3, clamped to [0.2, 0.7], unless given explicitly.
+    if (cache.prefill_share_default && cache.cpu_prefill_share_q16 > 0) {
+        const double prefill = std::min(0.7, std::max(0.2, share - 0.3));
+        cache.cpu_prefill_share_q16 = static_cast<std::uint32_t>(prefill * 65536.0);
+        std::fprintf(stderr, "qwen4exp: CPU split auto prefill share: %.0f%%\n", 100.0 * prefill);
+    }
     // Leave the pool directory clean for the real rounds.
     ops::expert_slot_directory_reset(cache.directory, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
