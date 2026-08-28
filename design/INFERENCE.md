@@ -14,7 +14,7 @@ stays model- and SM-agnostic: every new architecture is a target on top of share
 
 Phase 1 = onboard the model on the qwen3_6 family runtime with simple expert streaming;
 phase 2 = FreeToken hybrid (GPU slot cache + CPU expert compute + bandwidth-matched split);
-phase 3 = PP across 8 GPUs; phase 4 = EP measured against PP.
+phase 3 = PP across 8 GPUs with the offload inside each stage; phase 4 (EP) rejected by analysis for PCIe-only hosts — see Decisions.
 
 ## Status
 
@@ -338,6 +338,17 @@ Exit for phase 2: the single-GPU board row at 1, 16 and 100 users, ≥ 3× llama
 `--cpu-moe` (7.1 / 16.3 tok/s on this box).
 
 ## Decisions that shape the code
+
+- **Multi-GPU = pipeline parallelism with the phase-2 offload inside each stage; expert
+  parallelism is rejected for PCIe-only hosts (2026-08-28).** Both splits cut per-card expert
+  memory 8-way, so the choice is the communication pattern. PP moves one 5 KB activation per
+  token per stage boundary (7 hops per round, host-staged, no P2P needed) and scales with
+  micro-batches in flight. EP needs an all-to-all dispatch and combine in every layer — 96
+  host-staged exchanges with a barrier per round: ~20 ms of exchange floor at decode, and at
+  prefill width (T × top-10 × 5 KB each way per layer) more PCIe time than expert compute.
+  EP pays only where an exchange costs microseconds (NVLink); revisit on a P2P-capable box.
+  PP × EP keeps the all-to-all for a marginal single-user gain and is not worth it. Phase 4
+  therefore becomes a measurement only if such hardware appears; phase 3 is the work.
 
 - Experts stay W8G32 in the artifact: regrouping K-quants into the kernels' group-64 formats
   measures 11–12 % rel-L2 error; W8 0.55 %; Q8_0/Q4_0/Q5_0/IQ4_NL repack bit-exactly.
