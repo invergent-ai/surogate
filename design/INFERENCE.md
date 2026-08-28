@@ -171,6 +171,20 @@ and the baseline run is queued.
   call them), so the readout now skips capturing streams and is an eager-mode diagnostic
   (`--no-cuda-graph`); the CPU round itself is captured properly (memcpy + host-function +
   kernel nodes) and replays do call the host function.
+- CPU split v2 (design, to do after v1 is measured): v1 serialises the host round on the
+  main stream (D2H → host function → partial add → expert kernels), so the CPU and the PCIe
+  gather never overlap. v2 moves the host round to a side stream forked after resolve
+  (event), writes the partial into its own FP32 plane instead of the MoE output, and joins
+  before `combine_into`, which then adds both planes (one extra read in the combine kernel).
+  Expected at users=1 with share 0.7: CPU 1.4 GB at ~150 GB/s ≈ 9 ms overlapped with PCIe
+  0.6 GB at 50 GB/s ≈ 12 ms → ~12 ms/token instead of ~21 ms serial (the pool-only path is
+  ~40 ms). The share should track the measured CPU GB/s (the micro-benchmark) vs PCIe.
+- Slot sweep (users=1, 512/128): 1,500 slots → 18.2 tok/s, 3,000 → 18.5. The pool size barely
+  matters at one user, i.e. the hit rate is low either way and the gain over v0 came from the
+  *bulk gather* (coalesced 16-byte copies at ~50 GB/s vs the kernels' 5–12 GB/s row reads),
+  not from caching. Consequences: the pool can stay small (a staging buffer of a few layers'
+  worth of experts) and give the memory back to KV; the CPU split and stream overlap are the
+  levers; the eager hit-rate readout will quantify this. 4,500-slot point pending.
 5. **Prefill**: selective streaming of used experts per layer with whole-layer double
    buffering on a side stream.
 
