@@ -1013,3 +1013,19 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   mixed-round results, which carry one token per row and no counts. Lockstep cost at one
   user: 4.3 tok/s against 11.5 on one device (each stage pays the full per-round fixed cost
   and the stages run one after the other) — step C's overlap is what pipelining is for.
+- Step B evidence and step C1 written (2026-08-28): 2 stages serve correctly at 1 and 4 users
+  (4 users, split on: 32.7 tok/s, 16 completions, 0 fatals, correct answers under load);
+  lockstep at one user 10.2 vs 11.5 tok/s on one device. Text parity is inconclusive by
+  construction — two identical single-device runs already differ (the prefill MoE kernels
+  assign work with atomics, so the reduce order and the bf16 roundings vary); the numeric
+  token-0 dump comparison (final residual of forwards 0/1, one device vs two stages) is the
+  parity test and is running. Step C1 (commit 6a64db16): `PipelineProgram::decode_batch`
+  partitions the round into `groups` micro-batches (lane % groups, default = stages,
+  `SUROGATE_SERVE_PIPELINE_GROUPS`), and runs them as a software pipeline over the stages
+  with the program's launch/consume seam: at step t stage s consumes the group it launched at
+  t−1 (parking its export in a per-(boundary, group) host slot; the last stage's tokens go
+  to the assembled result) and launches group t−s after copying the previous stage's parked
+  export into its own import buffer — consuming stage s before launching stage s+1 orders the
+  data while the other stages keep running. Stages now own their import buffers. Mixed
+  rounds stay lockstep per round (C2 splits them). Test running: one device vs lockstep vs
+  pipelined at 8 users on the decode-heavy 128/512 shape (GPUs 2+3).
