@@ -1070,3 +1070,8 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   stage. Per-stream latency is not what the pipeline buys — aggregate throughput is — and
   the single-stream case will need the two stages' host rounds to run on separate sockets
   (per-socket pools) to get back to parity with one card.
+- **8 stages construct and answer** (2026-08-28, first try, pre-C2 binary): `--devices
+  0,…,7` builds eight stage instances of six layers each on all cards; each stage measures
+  its own split (x16 cards: host ~195 GB/s vs PCIe 52 → 79 %; the x8 cards 2/3/5/7: PCIe 26
+  → 88 %), and the served answers are correct ('Paris', the primes, the ocean sentence).
+  The 1/16/64-user runs on the C2 binary follow the C2 comparison on GPUs 2+3.
