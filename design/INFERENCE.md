@@ -253,6 +253,14 @@ and the baseline run is queued.
   rows in 8 chunks with atomic adds into the token column) so 10 jobs occupy all cores, and
   workers spin ~20k pauses before sleeping. Building + measuring (unit test, idle-host bench,
   parity, probes at 0.5/0.7 share, 1 and 16 users, NUMA-interleaved run).
+- Results (idle host): unit test OK; bench 1 thread 13.5 GB/s, 16 threads 157, **32 threads
+  209 GB/s** (195 mean; was 154), and the 10-job single-user shape **177 GB/s best / 142 mean at
+  0.37 ms per round** (was ~6 ms). CLI with `--cpu-moe-share 0.5`: still "Paris", decode
+  **27.4 tok/s** (v1 8.9; pool-only 31.7). Reading: at one user a round misses only ~3–4
+  experts (63 % hits), so the host takes ~2 experts (≈70 µs of work) but pays the fixed
+  per-layer cost of four D2H copies, a host-function node and the partial-add kernel
+  (~0.1 ms × 48 layers ≈ 5 ms/token) — the split cannot pay at one user until v2 overlaps it;
+  at 16 users (~150 misses/round) it should. Probes running.
 5. **Prefill**: selective streaming of used experts per layer with whole-layer double
    buffering on a side stream.
 
