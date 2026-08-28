@@ -279,6 +279,10 @@ public:
     [[nodiscard]] runtime::BatchedGeneratedRound consume_decode_round(runtime::RoundHandle handle) {
         return consume_ordinary_round(handle);
     }
+    [[nodiscard]] runtime::RoundHandle launch_mixed_round(std::span<const std::uint32_t> prefill_lanes,
+                                                          std::span<const std::uint32_t> lanes,
+                                                          std::span<const runtime::RoundBudget> budgets);
+    [[nodiscard]] runtime::MixedRoundResult consume_mixed_round(runtime::RoundHandle handle);
     const std::uint32_t capacity;
     const std::uint32_t kv_capacity;
     const std::uint32_t max_concurrency;
@@ -348,6 +352,22 @@ public:
     };
     InFlightRound in_flight_{};
     std::uint64_t in_flight_counter_ = 0;
+    // A mixed round between launch and consume (the pipeline driver's seam).
+    struct MixedInFlight {
+        bool valid          = false;
+        std::uint64_t id    = 0;
+        std::chrono::steady_clock::time_point start{};
+        std::uint32_t rows  = 0;
+        std::array<std::uint32_t, kMaximumConcurrency> lanes{};
+        std::uint32_t prefill_lane_count = 0;
+        std::array<std::uint32_t, runtime::kMaximumMixedPrefills> prefill_lanes{};
+        std::size_t staged_count = 0;
+        bool graph_hit           = false;
+        schedule::PrefillChunkResult chunk{};
+        std::array<std::uint32_t, runtime::kMaximumMixedPrefills> nominals{};
+    };
+    MixedInFlight mixed_in_flight_{};
+    std::uint64_t mixed_in_flight_counter_ = 0;
 
     std::array<TokenId, kMaximumConcurrency * kChainBurstLimit> burst_rounds{};
     std::array<TokenId, kMaximumConcurrency * kChainBurstLimit> burst_tokens{};

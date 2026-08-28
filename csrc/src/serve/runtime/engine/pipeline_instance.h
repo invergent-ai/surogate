@@ -176,50 +176,7 @@ public:
             select(0);
             return stages_[0]->program->decode_batch(lanes, budgets);
         }
-        // Partition the round into groups (lane % groups), skipping empty ones.
-        std::vector<std::vector<std::uint32_t>> group_lanes(groups_);
-        std::vector<std::vector<RoundBudget>> group_budgets(groups_);
-        std::vector<std::vector<std::size_t>> group_rows(groups_);
-        for (std::size_t row = 0; row < lanes.size(); ++row) {
-            const std::uint32_t g = lanes[row] % groups_;
-            group_lanes[g].push_back(lanes[row]);
-            group_budgets[g].push_back(budgets[row]);
-            group_rows[g].push_back(row);
-        }
-        std::vector<std::uint32_t> active;
-        for (std::uint32_t g = 0; g < groups_; ++g) {
-            if (!group_lanes[g].empty()) { active.push_back(g); }
-        }
-        const std::size_t N = stages_.size(), G = active.size();
-        std::vector<RoundHandle> in_flight(N);
-        // Step t: stage s consumes the group it launched at t-1 (index t-1-s into `active`),
-        // parks its export in the group's staging slot, then launches group t-s after
-        // copying the previous stage's parked export into its own import buffer. Consuming
-        // stage s before launching stage s+1 orders the data; the other stages keep running.
-        for (std::size_t t = 0; t + 1 < G + N + 1; ++t) {
-            for (std::size_t s = 0; s < N; ++s) {
-                if (t >= s + 1 && t - s - 1 < G) {
-                    const std::uint32_t g = active[t - s - 1];
-                    select(s);
-                    const BatchedGeneratedRound part = stages_[s]->program->consume_decode_round(in_flight[s]);
-                    in_flight[s] = RoundHandle{};
-                    if (s + 1 < N) {
-                        std::memcpy(slots_[s][g].data(), stages_[s]->program->stage_export_buffer(), boundary_bytes_);
-                    } else {
-                        collect_tokens(group_rows[g], part);
-                    }
-                }
-                if (t >= s && t - s < G) {
-                    const std::uint32_t g = active[t - s];
-                    select(s);
-                    if (s > 0) {
-                        std::memcpy(stages_[s]->program->stage_import_buffer(), slots_[s - 1][g].data(), boundary_bytes_);
-                    }
-                    trace("launch_decode_round", s, group_lanes[g].size());
-                    in_flight[s] = stages_[s]->program->launch_decode_round(group_lanes[g], group_budgets[g]);
-                }
-            }
-        }
+        run_grouped_round({}, lanes, budgets);
         BatchedGeneratedRound result{
             .tokens     = std::span<const TokenId>(assembled_tokens_.data(), lanes.size()),
             .row_counts = std::span<const std::int32_t>(assembled_counts_.data(), lanes.size()),
@@ -230,18 +187,16 @@ public:
     [[nodiscard]] MixedRoundResult advance_prefill_mixed(std::span<const std::uint32_t> prefill_lanes,
                                                          std::span<const std::uint32_t> lanes,
                                                          std::span<const RoundBudget> budgets) {
-        // Lockstep through the stages (C1: the mixed path has no launch/consume split yet); the
-        // residual is handed over through the stages' own import buffers.
-        MixedRoundResult result{};
-        for (std::size_t s = 0; s < stages_.size(); ++s) {
-            select(s);
-            if (s > 0) {
-                std::memcpy(stages_[s]->program->stage_import_buffer(),
-                            stages_[s - 1]->program->stage_export_buffer(), boundary_bytes_);
-            }
-            trace("advance_prefill_mixed", s, prefill_lanes.size() * 1000 + lanes.size());
-            result = stages_[s]->program->advance_prefill_mixed(prefill_lanes, lanes, budgets);
+        if (stages_.size() == 1) {
+            select(0);
+            return stages_[0]->program->advance_prefill_mixed(prefill_lanes, lanes, budgets);
         }
+        run_grouped_round(prefill_lanes, lanes, budgets);
+        MixedRoundResult result = assembled_mixed_;
+        result.round            = BatchedGeneratedRound{
+            .tokens     = std::span<const TokenId>(assembled_tokens_.data(), lanes.size()),
+            .row_counts = std::span<const std::int32_t>(assembled_counts_.data(), lanes.size()),
+            .row_stride = 1};
         propagate_round_tokens(lanes, result.round);
         for (std::size_t i = 0; i < result.prefill_count && i < prefill_lanes.size(); ++i) {
             const PrefillStepResult& step = result.prefill_at(i);
@@ -304,6 +259,80 @@ public:
 
 private:
     void select(std::size_t stage) const noexcept { (void)cudaSetDevice(devices_[stage]); }
+
+    // One executor round as a software pipeline over the stages: the decode lanes are
+    // partitioned into groups (lane % groups); when the round carries prefill lanes they all
+    // ride with the first non-empty group as a mixed round (the executor's prefill-result
+    // semantics stay those of one mixed call), the other groups run decode-only rounds. At
+    // step t stage s consumes the group it launched at t-1 — parking its export in the
+    // group's host slot, or collecting the last stage's tokens — then launches group t-s
+    // after copying the previous stage's parked export into its own import buffer.
+    // Consuming stage s before launching stage s+1 orders the data; the other stages keep
+    // running meanwhile.
+    void run_grouped_round(std::span<const std::uint32_t> prefill_lanes, std::span<const std::uint32_t> lanes,
+                           std::span<const RoundBudget> budgets) {
+        std::vector<std::vector<std::uint32_t>> group_lanes(groups_);
+        std::vector<std::vector<RoundBudget>> group_budgets(groups_);
+        std::vector<std::vector<std::size_t>> group_rows(groups_);
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            const std::uint32_t g = lanes[row] % groups_;
+            group_lanes[g].push_back(lanes[row]);
+            group_budgets[g].push_back(budgets[row]);
+            group_rows[g].push_back(row);
+        }
+        std::vector<std::uint32_t> active;
+        for (std::uint32_t g = 0; g < groups_; ++g) {
+            if (!group_lanes[g].empty()) { active.push_back(g); }
+        }
+        const bool mixed = !prefill_lanes.empty();
+        if (mixed && active.empty()) {
+            throw std::logic_error("pipeline mixed round needs decode lanes");
+        }
+        const std::uint32_t mixed_group = mixed ? active.front() : groups_;
+        const std::size_t N = stages_.size(), G = active.size();
+        std::vector<RoundHandle> in_flight(N);
+        std::vector<bool> in_flight_mixed(N, false);
+        assembled_mixed_ = MixedRoundResult{};
+        for (std::size_t t = 0; t + 1 < G + N + 1; ++t) {
+            for (std::size_t s = 0; s < N; ++s) {
+                if (t >= s + 1 && t - s - 1 < G) {
+                    const std::uint32_t g = active[t - s - 1];
+                    select(s);
+                    if (in_flight_mixed[s]) {
+                        MixedRoundResult part = stages_[s]->program->consume_mixed_round(in_flight[s]);
+                        if (s + 1 == N) {
+                            collect_tokens(group_rows[g], part.round);
+                            assembled_mixed_.prefill_count = part.prefill_count;
+                            assembled_mixed_.prefills      = part.prefills;
+                        }
+                    } else {
+                        const BatchedGeneratedRound part = stages_[s]->program->consume_decode_round(in_flight[s]);
+                        if (s + 1 == N) { collect_tokens(group_rows[g], part); }
+                    }
+                    in_flight[s] = RoundHandle{};
+                    if (s + 1 < N) {
+                        std::memcpy(slots_[s][g].data(), stages_[s]->program->stage_export_buffer(), boundary_bytes_);
+                    }
+                }
+                if (t >= s && t - s < G) {
+                    const std::uint32_t g = active[t - s];
+                    select(s);
+                    if (s > 0) {
+                        std::memcpy(stages_[s]->program->stage_import_buffer(), slots_[s - 1][g].data(), boundary_bytes_);
+                    }
+                    if (g == mixed_group) {
+                        trace("launch_mixed_round", s, prefill_lanes.size() * 1000 + group_lanes[g].size());
+                        in_flight[s]       = stages_[s]->program->launch_mixed_round(prefill_lanes, group_lanes[g], group_budgets[g]);
+                        in_flight_mixed[s] = true;
+                    } else {
+                        trace("launch_decode_round", s, group_lanes[g].size());
+                        in_flight[s]       = stages_[s]->program->launch_decode_round(group_lanes[g], group_budgets[g]);
+                        in_flight_mixed[s] = false;
+                    }
+                }
+            }
+        }
+    }
     // Copy a group's tokens from the last stage's round into the assembled result (the
     // program's buffers are reused by its next consume).
     void collect_tokens(const std::vector<std::size_t>& rows, const BatchedGeneratedRound& part) {
@@ -361,6 +390,7 @@ private:
     std::vector<std::vector<std::vector<std::byte>>> slots_; // [boundary][group]
     std::vector<TokenId> assembled_tokens_;
     std::vector<std::int32_t> assembled_counts_;
+    MixedRoundResult assembled_mixed_{};
 };
 
 /// The executor's instance: owns the stage instances and their device contexts.

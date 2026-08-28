@@ -278,6 +278,18 @@ runtime::BatchedGeneratedRound Program<Variant>::consume_decode_round(runtime::R
 }
 
 template <>
+runtime::RoundHandle Program<Variant>::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes,
+                                                          std::span<const std::uint32_t> lanes,
+                                                          std::span<const runtime::RoundBudget> budgets) {
+    return impl_->launch_mixed_round(prefill_lanes, lanes, budgets);
+}
+
+template <>
+runtime::MixedRoundResult Program<Variant>::consume_mixed_round(runtime::RoundHandle handle) {
+    return impl_->consume_mixed_round(handle);
+}
+
+template <>
 SequencePlanner<Variant> make_sequence_planner<Variant>(DeviceContext& device,
                                                         const EngineOptions& options,
                                                         Variant::WeightsProfile weights_profile) {

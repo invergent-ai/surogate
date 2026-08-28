@@ -2226,8 +2226,8 @@ bool ProgramImplCore::mixed_round_supported(std::uint32_t prefill_lane) const no
            staged.cursor < staged.prompt_tokens && requests[prefill_lane].prefill->prompt.token_ids.size() != 0;
 }
 
-runtime::MixedRoundResult
-ProgramImplCore::advance_prefill_mixed(std::span<const std::uint32_t> prefill_lanes,
+runtime::RoundHandle
+ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes,
                                        std::span<const std::uint32_t> lanes,
                                        std::span<const runtime::RoundBudget> budgets) {
     if (speculative_backend != SpeculativeBackend::None || lanes.empty() ||
@@ -2496,6 +2496,48 @@ ProgramImplCore::advance_prefill_mixed(std::span<const std::uint32_t> prefill_la
         CUDA_CHECK(cudaMemcpyAsync(ordinary_host_egress, ordinary.egress.data,
                                    sizeof(qwen3_6::OrdinaryDecodeEgress), cudaMemcpyDeviceToHost,
                                    device.stream));
+        // The round is enqueued; consume_mixed_round synchronises and commits it.
+        mixed_in_flight_.valid        = true;
+        mixed_in_flight_.id           = ++mixed_in_flight_counter_;
+        mixed_in_flight_.start        = start;
+        mixed_in_flight_.rows         = static_cast<std::uint32_t>(lanes.size());
+        std::copy(lanes.begin(), lanes.end(), mixed_in_flight_.lanes.begin());
+        mixed_in_flight_.prefill_lane_count = static_cast<std::uint32_t>(prefill_lanes.size());
+        std::copy(prefill_lanes.begin(), prefill_lanes.end(), mixed_in_flight_.prefill_lanes.begin());
+        mixed_in_flight_.staged_count = staged_count;
+        mixed_in_flight_.graph_hit    = graph_hit;
+        mixed_in_flight_.chunk        = chunk;
+        mixed_in_flight_.nominals     = nominals;
+        return runtime::RoundHandle{.id = mixed_in_flight_.id, .rows = mixed_in_flight_.rows};
+    } catch (...) {
+        try {
+            device.synchronize();
+        } catch (...) {}
+        clear_lane(prefill_sequence, prefill_request);
+        for (const std::uint32_t lane : lanes) {
+            if (lane < max_concurrency) { clear_lane(sequences[lane], requests[lane]); }
+        }
+        throw;
+    }
+}
+
+runtime::MixedRoundResult ProgramImplCore::consume_mixed_round(runtime::RoundHandle handle) {
+    if (!handle.valid() || !mixed_in_flight_.valid || handle.id != mixed_in_flight_.id) {
+        throw std::logic_error("consuming a mixed round that is not in flight");
+    }
+    MixedInFlight& flight = mixed_in_flight_;
+    flight.valid          = false;
+    const std::span<const std::uint32_t> lanes(flight.lanes.data(), flight.rows);
+    const std::span<const std::uint32_t> prefill_lanes(flight.prefill_lanes.data(), flight.prefill_lane_count);
+    const auto start                                  = flight.start;
+    const std::size_t staged_count                    = flight.staged_count;
+    const bool graph_hit                              = flight.graph_hit;
+    const schedule::PrefillChunkResult chunk          = flight.chunk;
+    const std::array<std::uint32_t, runtime::kMaximumMixedPrefills> nominals = flight.nominals;
+    const std::uint32_t prefill_lane = prefill_lanes.front();
+    SequenceState& prefill_sequence  = sequences[prefill_lane];
+    RequestControl& prefill_request  = requests[prefill_lane];
+    try {
         device.synchronize();
 
         const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
@@ -2568,6 +2610,13 @@ ProgramImplCore::advance_prefill_mixed(std::span<const std::uint32_t> prefill_la
         }
         throw;
     }
+}
+
+runtime::MixedRoundResult
+ProgramImplCore::advance_prefill_mixed(std::span<const std::uint32_t> prefill_lanes,
+                                       std::span<const std::uint32_t> lanes,
+                                       std::span<const runtime::RoundBudget> budgets) {
+    return consume_mixed_round(launch_mixed_round(prefill_lanes, lanes, budgets));
 }
 
 runtime::BatchedGeneratedRound

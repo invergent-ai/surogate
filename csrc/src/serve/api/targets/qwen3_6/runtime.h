@@ -202,6 +202,10 @@ public:
     [[nodiscard]] runtime::RoundHandle launch_decode_round(std::span<const std::uint32_t> lanes,
                                                            std::span<const runtime::RoundBudget> budgets);
     [[nodiscard]] runtime::BatchedGeneratedRound consume_decode_round(runtime::RoundHandle handle);
+    [[nodiscard]] runtime::RoundHandle launch_mixed_round(std::span<const std::uint32_t> prefill_lanes,
+                                                          std::span<const std::uint32_t> lanes,
+                                                          std::span<const runtime::RoundBudget> budgets);
+    [[nodiscard]] runtime::MixedRoundResult consume_mixed_round(runtime::RoundHandle handle);
 
 private:
     explicit Program(std::unique_ptr<detail::ProgramImpl<Variant>> impl) noexcept;
