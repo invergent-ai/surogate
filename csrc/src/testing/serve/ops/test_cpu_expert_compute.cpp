@@ -2,7 +2,10 @@
 // of the same quantised arithmetic, single job and pooled rounds (no GPU needed).
 #include "api/ops/cpu_expert_compute.h"
 
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <thread>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
@@ -180,6 +183,27 @@ int main() {
         }
         std::vector<float> got(outs.begin() + t * H, outs.begin() + (t + 1) * H);
         failures += compare("pooled round token " + std::to_string(t), got, want);
+    }
+    // Stress: many tiny rounds on a full-width pool exercise the wake-up/barrier protocol; a
+    // lost wake-up shows up as a hang, so the test runs it with a watchdog thread.
+    {
+        std::atomic<bool> finished{false};
+        std::thread watchdog([&] {
+            for (int i = 0; i < 600 && !finished.load(); ++i) { std::this_thread::sleep_for(std::chrono::milliseconds(100)); }
+            if (!finished.load()) { std::cout << "FAIL pool stress hung\n"; std::_Exit(2); }
+        });
+        ops::CpuExpertPool wide(kGeometry, {.threads = 32, .pin_threads = false});
+        std::vector<ops::CpuExpertJob> tiny = {{0, 1, 1.0F}};
+        std::vector<float> tiny_out(static_cast<std::size_t>(H), 0.0F);
+        ops::CpuExpertRound tiny_round{x.data(), tiny_out.data(), 1, tiny};
+        for (int r = 0; r < 3000; ++r) {
+            std::fill(tiny_out.begin(), tiny_out.end(), 0.0F);
+            wide.run(bank.view(), tiny_round);
+            if (r % 7 == 0) { std::this_thread::sleep_for(std::chrono::milliseconds(2)); } // let workers sleep
+        }
+        failures += compare("stress round (last)", tiny_out, reference_job(bank, 1, x, 1.0F));
+        finished.store(true);
+        watchdog.join();
     }
     std::cout << (failures ? "FAIL" : "OK") << " cpu_expert_compute\n";
     return failures ? 1 : 0;

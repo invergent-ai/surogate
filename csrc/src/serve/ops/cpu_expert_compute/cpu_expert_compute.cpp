@@ -518,14 +518,22 @@ void CpuExpertPool::run(const CpuExpertBank& bank, const CpuExpertRound& round) 
     impl.round = &round;
     impl.finished.store(0, std::memory_order_relaxed);
     impl.phase.store(0, std::memory_order_release);
-    // Publish the round; then open the three phases in turn, each behind a barrier.
-    impl.generation.fetch_add(1, std::memory_order_acq_rel);
+    // Publish the round under the mutex: a worker that has just failed its predicate check
+    // cannot miss the notification (it re-checks under the same mutex before blocking).
+    {
+        std::lock_guard<std::mutex> lock(impl.mutex);
+        impl.generation.fetch_add(1, std::memory_order_acq_rel);
+    }
     impl.wake.notify_all();
     for (int ph = 0; ph < 3; ++ph) {
         impl.next_item.store(0, std::memory_order_relaxed);
         impl.arrived.store(0, std::memory_order_relaxed);
         impl.phase.store(ph + 1, std::memory_order_release);
-        while (impl.arrived.load(std::memory_order_acquire) < impl.threads) { cpu_relax(); }
+        std::uint32_t spins = 0;
+        while (impl.arrived.load(std::memory_order_acquire) < impl.threads) {
+            cpu_relax();
+            if ((++spins & 0xFFFFU) == 0U) { impl.wake.notify_all(); } // belt and braces for sleepers
+        }
     }
     impl.phase.store(4, std::memory_order_release); // release the last barrier
     std::unique_lock<std::mutex> lock(impl.mutex);
