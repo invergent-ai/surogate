@@ -646,6 +646,7 @@ yet. llama.cpp upstream master (added `qwen4exp` this week; CUDA build at
 | | 16 | 23.9 | 96 | 30 s |
 | **surogate serve + expert slot cache** (`--expert-slots 3000`, 14.6 GiB device pool, bulk host→device gather of misses, no CPU compute) | 1 | 18.5 | 74 | 3.0 s |
 | | 16 | 9.4 | 38 | 17.9 s |
+| **surogate serve + slot cache + CPU expert split** (`--expert-slots 3000 --cpu-moe-share 0.5`, host round overlapped on a side stream, `numactl --interleave=all`, 32 host threads) | 16 | 23.0 | 92 | 17.1 s |
 
 Both configurations answer the probes correctly (`'Paris'`, `'2, 3, and 5'`).
 The engine row (2026-08-28, parity with llama.cpp verified stage by stage, see
