@@ -35,6 +35,8 @@ phase 3 = PP across 8 GPUs; phase 4 = EP measured against PP.
 | Target `targets/qwen4exp/` (package, bindings, host bank, variant, registry) | serves with parity (2026-08-28) | model_id `qwen3.8-flash-next`, weights_id `w8-hc-v1`, target key `qwen4exp`; experts and the PLE table live in pinned, device-mapped host memory and the kernels read them zero-copy (v0) |
 | Expert access v0: zero-copy reads from the pinned host bank (`impl/load/host_bank.*`) | written with the target | no staging copies at all in v0; the device slot cache and CPU expert compute come in phase 2 |
 | Parity vs llama.cpp | done 2026-08-28 | token-0 stages within BF16 noise of the CPU reference, `l_last-0/1/2` match, answers `Paris` / 2,3,5 / ocean; defects were the SiLU gate (4aaa07fc) and the RMSNorm kernels' gate load (see log) |
+| Phase 2: expert slot cache (`--expert-slots N`) | done 2026-08-28 | users=1 18.5 tok/s loadgen / 31.7 pure decode (v0 5.2), 63 % hits at one user, pool created before the KV plan; 16 users 9.4 (pool thrashes) |
+| Phase 2: CPU expert split (`--cpu-moe-share F`) | v1 parity OK, v2 measuring | host kernel 209 GB/s @32 threads; v1 serial 27.4 tok/s @1; v2 overlaps the host round with the GPU experts — 16-user probes decide |
 | First throughput row (zero-copy experts v0, board shape 512/128) | done 2026-08-28 | users=1: 5.2 decode / 21 prefill tok/s, TTFT 1.79 s; users=16: 7.6 / 30, TTFT 15.1 s; (128/128: 4.9 @1, 8.3 @16, 26.6 @32). llama.cpp 1×5090 CPU-MoE: 7.1 / 29 @1, 16.3 / 65 @16 |
 
 ## Next: phase 2 (single-GPU offload) — plan as of 2026-08-28
@@ -268,6 +270,11 @@ and the baseline run is queued.
   so the host computes while the GPU runs the pooled experts. Buffer reuse across layers is
   ordered by the single side stream and the per-block join. v2 build + parity + probes
   (0.5/0.7 share at 1 and 16 users, NUMA-interleaved 16-user run) queued behind the v1 probes.
+- Prefill stays on the gather for now: a 512-token prompt routes ~10 tokens to each of the ~512
+  experts a layer touches, i.e. ~49 M MACs per expert — at the host kernel's ~2.6 GMAC/s per
+  core (it is a DRAM-shaped GEMV, not a GEMM) that is ~19 ms per expert-job, so 50 % of a
+  layer on 32 cores would take ~150 ms against the 52 ms gather. Prefill on the CPU needs a
+  tiled int8 GEMM (ik's `iqk_mul_mat_moe` shape) and is a separate step.
 5. **Prefill**: selective streaming of used experts per layer with whole-layer double
    buffering on a side stream.
 
