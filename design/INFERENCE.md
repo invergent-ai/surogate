@@ -228,6 +228,13 @@ and the baseline run is queued.
   below DRAM speed per core — the scalar fp16 scale conversion and per-row reductions
   dominated; the kernel now converts 16 scales at a time (F16C) and processes gate/up and
   down rows in pairs; re-measuring.
+  Re-measured (while the 35B 100-user probe was loading the host, so aggregate figures are
+  contaminated): one thread 405 µs per 5.2 MB expert = **13 GB/s per core** (was ~6 ms per
+  job, i.e. the tightening is ~15×); 32 threads 139 GB/s, 16 threads 91 GB/s (contended);
+  single-token rounds still ~6 ms because the 10 jobs leave 22 pinned threads idle and the
+  wake-up latency under a loaded host dominates — an idle-host rerun is queued after the
+  split probes. The pool needs job splitting (rows of one expert across threads) for
+  single-user rounds and a spin-then-wait wake to cut the latency.
 - NUMA plan for the CPU split (this box: 2 × EPYC 9124, 16 cores each, 2 nodes, ~160–190 GB/s
   per node): the pinned host bank is allocated by one thread, so its pages sit on one node and
   the 32-thread pool pays remote bandwidth. Two steps: (1) measure with the process under
