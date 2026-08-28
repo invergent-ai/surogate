@@ -337,6 +337,76 @@ and the baseline run is queued.
 Exit for phase 2: the single-GPU board row at 1, 16 and 100 users, ≥ 3× llama.cpp
 `--cpu-moe` (7.1 / 16.3 tok/s on this box).
 
+## Phase 3: pipeline parallelism across the 8 cards — design (2026-08-28)
+
+Goal: serve Flash-Next (and any family model) split by layer ranges over N GPUs, with several
+micro-batches in flight so every card is busy, the phase-2 offload (slot pool + CPU split)
+running inside each stage for what its layers' experts do not fit, and no P2P/NVLink
+assumed. Bar: llama.cpp `--split-mode layer` on 8× 5090 — 39.3 tok/s at one user, 28.8 at
+32 (its cards run one at a time); target: ~40+ per stream at one user and an order of
+magnitude more aggregate at 64 users.
+
+Hardware facts that shape it: GPUs 0-3 sit on NUMA node 0 (CPUs 0-15), 4-7 on node 1
+(16-31); every GPU pair is PCIe-only (`nvidia-smi topo`: NODE within a socket, SYS across);
+x16 on GPUs 0/1/4/6, x8 on 2/3/5/7; ~50 GB/s host↔device per x16 card. Stage order 0→7
+therefore crosses sockets once (3→4), and a hop's pinned staging buffer lives on the socket
+of its two GPUs (`numa_alloc_onnode` + `cudaHostRegister`).
+
+What crosses a stage boundary: the family residual after layer `last-1` — for qwen4exp the
+four hyper-connection streams, `[4, hidden, T]` BF16 = 20 KB per column (11.8 MB at a
+576-column mixed round), plus the round's column metadata (positions, lane ids, segment
+facts) which every stage needs to build the same round. Transport is device→pinned→device
+(one `cudaMemcpyAsync` each side, events for ordering): ~0.25 ms per hop per direction at
+T = 576, negligible against a ~100 ms stage round.
+
+Structure:
+
+1. **Layer-range programs.** `create_program` takes a layer range `[first, last)`: a stage
+   with `first == 0` runs embedding (+ PLE at layer 1) and exports the residual after its
+   last layer; a middle stage imports the residual and exports; the last stage imports,
+   runs its layers, final norm, lm_head and sampling. Each program owns the per-layer state
+   of its own layers only (KV pages of its attention layers, GDN slots of its GDN layers,
+   PLE state on stage 0), so state memory also splits N ways. Weights: each stage
+   materialises only its layers (the registry's per-layer bindings; the host bank stays one
+   process-wide object, and each stage's slot pool caches its own layers' experts).
+2. **One process, N device contexts.** Stages are threads in one process, each bound to a
+   device (its own streams, graphs, workspace, pool, cache): the 154 GB host bank and the
+   CPU pool are shared, requests and lanes live in one scheduler. The current-device
+   globals (`expert_slot_cache_for_current_device`) already key by device.
+3. **Micro-batch pipelining.** Lanes are partitioned into G groups (G = N by default); a
+   round is built per group and flows stage 0 → N-1; the executor keeps one round per stage
+   in flight, so stage s works on group g while stage s+1 works on group g-1. Decode: group
+   g's next token is available when its round leaves stage N-1 and feeds stage 0's next
+   round for g — a lane sees one token per G rounds of its group, i.e. per-stream latency ≈
+   one full-model round as today, and aggregate ≈ N× a single card. A prompt's prefill
+   chunks belong to its lane's group (mixed rounds as now). Graph capture per stage keys on
+   the same (columns, band) ladder; capture happens per device.
+4. **Per-stage offload.** Each stage decides its residency from its own free memory after
+   its KV/state plan: the pool holds what fits of its 6 layers' experts (at W8, ~26 GB per
+   stage does not fit, so the pool + CPU split run as in phase 2; at a Q4 bank everything is
+   resident). The CPU split's host pool serves all stages: its rounds are sequential per
+   layer anyway, and the stages' host rounds interleave; if the host becomes the limit,
+   the per-socket split (16 threads per socket, stages 0-3 on node 0) is the lever measured
+   in the lanes experiment.
+5. **Sampling and streaming** stay where they are (last stage produces logits; the executor
+   samples, streams, and hands tokens to stage 0 for the group's next round).
+
+Steps, each with its test:
+- A. Layer-range program on one device: run [0, 24) and [24, 48) back to back with the
+  boundary export/import and compare token-0 residual and sampled tokens with the single
+  program (parity tooling from phase 1; must be bit-exact given identical kernels).
+- B. Two devices, one micro-batch: stage 0 on GPU 2, stage 1 on GPU 3 (same socket), then
+  GPU 3 → GPU 4 (cross socket); parity again; measure hop cost.
+- C. G micro-batches in flight on N devices (2, 4, 8): correctness under load (the
+  under-load coherence probes, 0 fatals at 64 users), then throughput scaling at 1 / 16 /
+  64 users; compare to the phase-2 single-card rows and llama.cpp's 8-card rows.
+- D. Offload inside stages: W8 bank with pools per stage (the memory that does not fit),
+  auto share per stage; then the board rows.
+
+Non-goals for phase 3: tensor parallelism (needs all-reduce per layer — the EP argument
+applies), expert parallelism (rejected below), P2P copies (not available; the host-staged
+copy is the design, and it is also what a multi-host version would use).
+
 ## Decisions that shape the code
 
 - **Multi-GPU = pipeline parallelism with the phase-2 offload inside each stage; expert
