@@ -602,9 +602,10 @@ void launch_d3_small_t_codec(const Tensor& x, const SparseMoeWeights& weights, c
         launch_d3_small_t_paths<Codec, 3, Adaptive>(x, weights, token_ids, token_activations,
                                                     tokens, stream, adaptive_route_jobs);
         return;
-    case SparseMoeSmallTD3Schedule::Paths9:
-        launch_d3_small_t_paths<Codec, 9, Adaptive>(x, weights, token_ids, token_activations,
-                                                    tokens, stream, adaptive_route_jobs);
+    case SparseMoeSmallTD3Schedule::PathsAll:
+        launch_d3_small_t_paths<Codec, kTopK + 1, Adaptive>(x, weights, token_ids,
+                                                            token_activations, tokens, stream,
+                                                            adaptive_route_jobs);
         return;
     }
     throw std::logic_error("sparse_moe: unknown small-T D3 schedule");
@@ -656,10 +657,14 @@ void launch_d4_small_t_codec(const SparseMoeWeights& weights, Tensor& destinatio
 
 } // namespace
 
-void sparse_moe_decode_launch_d3_small_t(const Tensor& x, const SparseMoeWeights& weights,
-                                         const int* token_ids, float* token_activations,
-                                         std::int32_t tokens, SparseMoeSmallTD3Schedule schedule,
-                                         cudaStream_t stream, const int* adaptive_route_jobs) {
+void sparse_moe_decode_launch_d3_small_t(const SparseMoeGeometry& geometry, const Tensor& x,
+                                         const SparseMoeWeights& weights, const int* token_ids,
+                                         float* token_activations, std::int32_t tokens,
+                                         SparseMoeSmallTD3Schedule schedule, cudaStream_t stream,
+                                         const int* adaptive_route_jobs) {
+    if (geometry != kSparseMoeQwen36Geometry) {
+        throw std::invalid_argument("sparse_moe: kernels are compiled for the Qwen3.6 geometry only");
+    }
     switch (weights.routed_gate_up.qtype) {
     case QType::Q4G64_F16S:
         if (adaptive_route_jobs == nullptr) {
@@ -679,11 +684,15 @@ void sparse_moe_decode_launch_d3_small_t(const Tensor& x, const SparseMoeWeights
     }
 }
 
-void sparse_moe_decode_launch_d4_small_t(const SparseMoeWeights& weights, Tensor& destination,
+void sparse_moe_decode_launch_d4_small_t(const SparseMoeGeometry& geometry,
+                                         const SparseMoeWeights& weights, Tensor& destination,
                                          const int* token_ids, const float* token_alpha,
                                          const float* shared_scale, const float* token_activations,
                                          std::int32_t tokens, SparseMoeSmallTD4Schedule schedule,
                                          cudaStream_t stream, const int* adaptive_route_jobs) {
+    if (geometry != kSparseMoeQwen36Geometry) {
+        throw std::invalid_argument("sparse_moe: kernels are compiled for the Qwen3.6 geometry only");
+    }
     switch (weights.routed_down.qtype) {
     case QType::Q5G64_F16S:
         if (adaptive_route_jobs == nullptr) {
@@ -717,8 +726,12 @@ void sparse_moe_decode_launch_d4_small_t(const SparseMoeWeights& weights, Tensor
     }
 }
 
-void sparse_moe_decode_launch(const Tensor& x, const SparseMoeWeights& weights, Tensor& destination,
+void sparse_moe_decode_launch(const SparseMoeGeometry& geometry, const Tensor& x,
+                              const SparseMoeWeights& weights, Tensor& destination,
                               const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream) {
+    if (geometry != kSparseMoeQwen36Geometry) {
+        throw std::invalid_argument("sparse_moe: kernels are compiled for the Qwen3.6 geometry only");
+    }
     launch_d1(x, weights.router_shared_gate, workspace, stream);
     launch_d2_d3(x, weights, workspace, stream);
     launch_d4_dependent(weights, destination, workspace, stream);

@@ -7,6 +7,7 @@
 #include <cuda_runtime.h>
 
 #include <cstddef>
+#include <algorithm>
 #include <cstdint>
 
 namespace ninfer::ops::detail {
@@ -26,33 +27,40 @@ struct SparseMoeDecodeWorkspace {
 };
 
 template <class Arena>
-SparseMoeDecodeWorkspace allocate_sparse_moe_decode_workspace(Arena& arena) {
+SparseMoeDecodeWorkspace allocate_sparse_moe_decode_workspace(Arena& arena,
+                                                              const SparseMoeGeometry& geometry) {
     SparseMoeDecodeWorkspace out;
-    out.ids          = arena.alloc(DType::I32, {8}, 16);
-    out.alpha        = arena.alloc(DType::FP32, {8}, 16);
+    out.ids          = arena.alloc(DType::I32, {geometry.experts_per_token}, 16);
+    out.alpha        = arena.alloc(DType::FP32, {geometry.experts_per_token}, 16);
     out.shared_scale = arena.alloc(DType::FP32, {1}, 4);
-    // D1 uses the first 257 values as scores. D3 then reuses the same lifetime for [9,512]
-    // natural FP32 SwiGLU results consumed by D4.
-    out.scratch = arena.alloc(DType::FP32, {9, 512}, 256);
+    // D1 uses the first router_rows values as scores. D3 then reuses the same lifetime for
+    // [paths, intermediate] natural FP32 SwiGLU results consumed by D4.
+    const std::int32_t scratch_rows = std::max(geometry.paths(), (geometry.router_rows() +
+                                                                    geometry.intermediate - 1) /
+                                                                       geometry.intermediate);
+    out.scratch = arena.alloc(DType::FP32, {scratch_rows, geometry.intermediate}, 256);
     return out;
 }
 
-[[nodiscard]] std::size_t sparse_moe_decode_workspace_bytes();
-[[nodiscard]] SparseMoeDecodePlan resolve_sparse_moe_decode_plan(QType routed_gate_up,
+[[nodiscard]] std::size_t sparse_moe_decode_workspace_bytes(const SparseMoeGeometry& geometry);
+[[nodiscard]] SparseMoeDecodePlan resolve_sparse_moe_decode_plan(const SparseMoeGeometry& geometry,
+                                                                 QType routed_gate_up,
                                                                  QType routed_down);
 
-void sparse_moe_decode_launch_d3_small_t(const Tensor& x, const SparseMoeWeights& weights,
-                                         const int* token_ids, float* token_activations,
-                                         std::int32_t tokens, SparseMoeSmallTD3Schedule schedule,
-                                         cudaStream_t stream,
+void sparse_moe_decode_launch_d3_small_t(const SparseMoeGeometry& geometry, const Tensor& x,
+                                         const SparseMoeWeights& weights, const int* token_ids,
+                                         float* token_activations, std::int32_t tokens,
+                                         SparseMoeSmallTD3Schedule schedule, cudaStream_t stream,
                                          const int* adaptive_route_jobs = nullptr);
-void sparse_moe_decode_launch_d4_small_t(const SparseMoeWeights& weights, Tensor& destination,
+void sparse_moe_decode_launch_d4_small_t(const SparseMoeGeometry& geometry,
+                                         const SparseMoeWeights& weights, Tensor& destination,
                                          const int* token_ids, const float* token_alpha,
                                          const float* shared_scale, const float* token_activations,
                                          std::int32_t tokens, SparseMoeSmallTD4Schedule schedule,
                                          cudaStream_t stream,
                                          const int* adaptive_route_jobs = nullptr);
-void sparse_moe_decode_launch(const Tensor& x, const SparseMoeWeights& weights, Tensor& destination,
+void sparse_moe_decode_launch(const SparseMoeGeometry& geometry, const Tensor& x,
+                              const SparseMoeWeights& weights, Tensor& destination,
                               const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

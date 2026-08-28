@@ -71,6 +71,7 @@ SparseMoePayload load_moe(const MoePlan& plan, const artifact::MaterializedArtif
                                                             NumericFormat::W8G32_F16S, 1024, 2048),
             .shared_down    = artifact::materialized_weight(materialized, plan.shared_down,
                                                             NumericFormat::W8G32_F16S, 2048, 512),
+            .experts_per_token = ops::kSparseMoeQwen36Geometry.experts_per_token,
         }};
 }
 

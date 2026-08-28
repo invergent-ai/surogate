@@ -10,13 +10,47 @@
 
 namespace ninfer::ops {
 
+/**
+ * The closed geometry of one sparse-MoE family instance. The kernels are compiled per
+ * registered geometry; the wrapper derives the geometry from the weights and refuses any
+ * combination that is not registered.
+ */
+struct SparseMoeGeometry {
+    std::int32_t hidden            = 0;
+    std::int32_t experts           = 0;
+    std::int32_t experts_per_token = 0;
+    std::int32_t intermediate      = 0;
+
+    [[nodiscard]] constexpr std::int32_t router_rows() const noexcept { return experts + 1; }
+    [[nodiscard]] constexpr std::int32_t expert_rows() const noexcept { return 2 * intermediate; }
+    [[nodiscard]] constexpr std::int32_t routed_gate_rows() const noexcept {
+        return experts * expert_rows();
+    }
+    [[nodiscard]] constexpr std::int32_t routed_down_rows() const noexcept {
+        return experts * hidden;
+    }
+    [[nodiscard]] constexpr std::int32_t paths() const noexcept { return experts_per_token + 1; }
+
+    friend constexpr bool operator==(const SparseMoeGeometry&, const SparseMoeGeometry&) = default;
+};
+
+/// Qwen3.5/3.6 MoE (35B-A3B and the 4B/2B MTP heads): 256 experts, top-8, FFN 512, hidden 2048.
+inline constexpr SparseMoeGeometry kSparseMoeQwen36Geometry{2048, 256, 8, 512};
+/// Qwen3.8-Flash-Next: 512 experts, top-10, FFN 640, hidden 2560.
+inline constexpr SparseMoeGeometry kSparseMoeFlashNextGeometry{2560, 512, 10, 640};
+
 struct SparseMoeWeights {
     Weight router_shared_gate;
     Weight routed_gate_up;
     Weight routed_down;
     Weight shared_gate_up;
     Weight shared_down;
+    /// Routed experts selected per token; with the weight shapes this fixes the geometry.
+    std::int32_t experts_per_token = 0;
 };
+
+/// The geometry implied by the weights (router rows, hidden, shared-down width, top-k).
+[[nodiscard]] SparseMoeGeometry sparse_moe_geometry(const SparseMoeWeights& weights);
 
 enum class SparseMoeEpilogue : std::uint8_t {
     AddResidual,
@@ -27,13 +61,15 @@ enum class SparseMoeEpilogue : std::uint8_t {
  * [min_tokens,max_tokens] interval. The routed QTypes are the fixed implementation profile.
  * Invalid profiles or intervals throw.
  */
-[[nodiscard]] std::size_t sparse_moe_workspace_capacity_bytes(QType routed_gate_up,
+[[nodiscard]] std::size_t sparse_moe_workspace_capacity_bytes(const SparseMoeGeometry& geometry,
+                                                              QType routed_gate_up,
                                                               QType routed_down,
                                                               std::int32_t min_tokens,
                                                               std::int32_t max_tokens);
 
 /**
- * Closed sparse-MoE Op for the exact future 35B-A3B geometry.
+ * Closed sparse-MoE Op over the registered geometries (kSparseMoeQwen36Geometry,
+ * kSparseMoeFlashNextGeometry); the text below names the Qwen3.6 instance.
  *
  * For contiguous BF16 x [2048,T] and destination [2048,T] with T>0, 256 routed experts, top-8
  * selection, and one always-on shared expert, this Op owns router projection and selection,

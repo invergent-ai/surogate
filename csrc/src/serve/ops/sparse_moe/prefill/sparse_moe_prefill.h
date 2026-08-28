@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 
 namespace ninfer::ops::detail {
 
@@ -20,8 +21,11 @@ inline constexpr std::int32_t kSparseMoePrefillW8W8Min      = 20;
 inline constexpr std::int32_t kSparseMoePrefillWideMin      = 768;
 inline constexpr std::int32_t kSparseMoePrefillSliceMax     = 4096;
 inline constexpr std::int32_t kSparseMoeRouteTileTokens     = 8;
-// 257 logits padded to a 16-byte-aligned per-token stride.
-inline constexpr std::int32_t kSparseMoeRouterScoreRows = 260;
+// Router logits padded to a 16-byte-aligned per-token stride (257 -> 260, 513 -> 516).
+[[nodiscard]] constexpr std::int32_t
+sparse_moe_router_score_rows(const SparseMoeGeometry& geometry) noexcept {
+    return (geometry.router_rows() + 3) / 4 * 4;
+}
 
 struct SparseMoePrefillPlan {
     std::int32_t tokens         = 0;
@@ -58,9 +62,13 @@ struct SparseMoePrefillWorkspace {
 
 template <class Arena>
 SparseMoePrefillWorkspace allocate_sparse_moe_prefill_workspace(Arena& arena,
+                                                                const SparseMoeGeometry& geometry,
                                                                 std::int32_t capacity_tokens) {
     SparseMoePrefillWorkspace out;
-    const std::int32_t assignments = 8 * capacity_tokens;
+    const std::int32_t assignments = geometry.experts_per_token * capacity_tokens;
+    const std::int32_t experts     = geometry.experts;
+    const std::int32_t hidden      = geometry.hidden;
+    const std::int32_t inter       = geometry.intermediate;
     const std::int32_t route_tiles =
         (capacity_tokens + kSparseMoeRouteTileTokens - 1) / kSparseMoeRouteTileTokens;
 
@@ -68,34 +76,48 @@ SparseMoePrefillWorkspace allocate_sparse_moe_prefill_workspace(Arena& arena,
     out.token_alpha    = arena.alloc(DType::FP32, {assignments}, 256);
     out.packed_index   = arena.alloc(DType::I32, {assignments}, 256);
     out.shared_scale   = arena.alloc(DType::FP32, {capacity_tokens}, 256);
-    out.tile_counts    = arena.alloc(DType::I32, {256, route_tiles}, 256);
-    out.tile_bases     = arena.alloc(DType::I32, {256, route_tiles}, 256);
-    out.expert_offsets = arena.alloc(DType::I32, {257}, 256);
+    out.tile_counts    = arena.alloc(DType::I32, {experts, route_tiles}, 256);
+    out.tile_bases     = arena.alloc(DType::I32, {experts, route_tiles}, 256);
+    out.expert_offsets = arena.alloc(DType::I32, {experts + 1}, 256);
     // A route job is one nonempty expert column tile. The bound is for the
     // narrowest prefill tile (32 assignments) and includes every expert tail.
-    const std::int32_t max_route_jobs = assignments / 32 + 256;
+    const std::int32_t max_route_jobs = assignments / 32 + experts;
     out.route_job_experts             = arena.alloc(DType::I32, {max_route_jobs}, 256);
     out.route_job_columns             = arena.alloc(DType::I32, {max_route_jobs}, 256);
     out.route_job_count               = arena.alloc(DType::I32, {1}, 256);
 
-    out.score_storage = arena.alloc(DType::FP32, {kSparseMoeRouterScoreRows, capacity_tokens}, 256);
-    out.shared_activation = Tensor(out.score_storage.data, DType::BF16, {512, capacity_tokens});
+    // Lifetime unions must hold both tenants; the per-token byte counts are checked here so a
+    // new geometry cannot silently overrun them.
+    const std::int32_t score_rows = sparse_moe_router_score_rows(geometry);
+    if (static_cast<std::int64_t>(score_rows) * 4 < static_cast<std::int64_t>(inter) * 2 ||
+        static_cast<std::int64_t>(inter) * geometry.experts_per_token * 2 <
+            static_cast<std::int64_t>(hidden) * 4 ||
+        static_cast<std::int64_t>(hidden) * geometry.experts_per_token * 2 <
+            static_cast<std::int64_t>(geometry.paths()) * inter * 4) {
+        throw std::invalid_argument("sparse_moe prefill: geometry breaks a workspace union");
+    }
+    out.score_storage     = arena.alloc(DType::FP32, {score_rows, capacity_tokens}, 256);
+    out.shared_activation = Tensor(out.score_storage.data, DType::BF16, {inter, capacity_tokens});
 
-    out.grouped_io = arena.alloc(DType::BF16, {2048, assignments}, 256);
+    out.grouped_io = arena.alloc(DType::BF16, {hidden, assignments}, 256);
 
-    out.routed_storage = arena.alloc(DType::BF16, {512, assignments}, 256);
-    out.routed_sum     = Tensor(out.routed_storage.data, DType::FP32, {2048, capacity_tokens});
+    out.routed_storage = arena.alloc(DType::BF16, {inter, assignments}, 256);
+    out.routed_sum     = Tensor(out.routed_storage.data, DType::FP32, {hidden, capacity_tokens});
     return out;
 }
 
 [[nodiscard]] bool sparse_moe_uses_prefill(std::int32_t tokens, QType routed_gate_up,
                                            QType routed_down) noexcept;
-[[nodiscard]] std::size_t sparse_moe_prefill_workspace_bytes(std::int32_t max_tokens);
-[[nodiscard]] SparseMoePrefillPlan
-resolve_sparse_moe_prefill_plan(std::int32_t tokens, QType routed_gate_up, QType routed_down);
+[[nodiscard]] std::size_t sparse_moe_prefill_workspace_bytes(const SparseMoeGeometry& geometry,
+                                                             std::int32_t max_tokens);
+[[nodiscard]] SparseMoePrefillPlan resolve_sparse_moe_prefill_plan(const SparseMoeGeometry& geometry,
+                                                                   std::int32_t tokens,
+                                                                   QType routed_gate_up,
+                                                                   QType routed_down);
 
-void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
-                               Tensor& destination, const SparseMoePrefillPlan& plan,
+void sparse_moe_prefill_launch(const SparseMoeGeometry& geometry, const Tensor& x,
+                               const SparseMoeWeights& weights, Tensor& destination,
+                               const SparseMoePrefillPlan& plan,
                                const SparseMoePrefillWorkspace& workspace, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

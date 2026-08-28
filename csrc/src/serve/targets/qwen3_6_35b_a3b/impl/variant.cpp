@@ -67,7 +67,8 @@ void run_sparse_moe(const Tensor& hidden, const ops::SparseMoeWeights& weights, 
                     WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope               = workspace.scope();
     const DeviceSpan storage = workspace.alloc_bytes(ops::sparse_moe_workspace_capacity_bytes(
-        weights.routed_gate_up.qtype, weights.routed_down.qtype, hidden.ne[1], hidden.ne[1]));
+        ops::kSparseMoeQwen36Geometry, weights.routed_gate_up.qtype, weights.routed_down.qtype,
+        hidden.ne[1], hidden.ne[1]));
     WorkspaceArena leaf_workspace(storage);
     ops::sparse_moe(hidden, weights, ops::SparseMoeEpilogue::AddResidual, residual, leaf_workspace,
                     stream);
@@ -308,15 +309,18 @@ std::size_t Variant::gdn_norm_control_projection_workspace_capacity_bytes(std::i
 
 std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile, qwen3_6::TextPhase,
                                                          std::int32_t first, std::int32_t last) {
-    return std::max(
-        ops::sparse_moe_workspace_capacity_bytes(QType::Q4G64_F16S, QType::Q5G64_F16S, first, last),
-        ops::sparse_moe_workspace_capacity_bytes(QType::Q4G64_F16S, QType::Q6G64_F16S, first,
-                                                 last));
+    return std::max(ops::sparse_moe_workspace_capacity_bytes(ops::kSparseMoeQwen36Geometry,
+                                                             QType::Q4G64_F16S, QType::Q5G64_F16S,
+                                                             first, last),
+                    ops::sparse_moe_workspace_capacity_bytes(ops::kSparseMoeQwen36Geometry,
+                                                             QType::Q4G64_F16S, QType::Q6G64_F16S,
+                                                             first, last));
 }
 
 std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(std::int32_t first,
                                                              std::int32_t last) {
-    return ops::sparse_moe_workspace_capacity_bytes(QType::W8G32_F16S, QType::W8G32_F16S, first,
+    return ops::sparse_moe_workspace_capacity_bytes(ops::kSparseMoeQwen36Geometry,
+                                                    QType::W8G32_F16S, QType::W8G32_F16S, first,
                                                     last);
 }
 

@@ -33,6 +33,7 @@ constexpr int kExperts      = 256;
 constexpr int kRouterRows   = 257;
 constexpr int kTopK         = 8;
 constexpr int kIntermediate = 512;
+constexpr int kSparseMoeRouterScoreRows = 260;
 
 constexpr int kRouterBM      = 16;
 constexpr int kRouterBN      = 64;
@@ -1163,9 +1164,13 @@ __global__ void sparse_moe_prefill_reduce_kernel(const __nv_bfloat16* __restrict
 
 } // namespace
 
-void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
-                               Tensor& destination, const SparseMoePrefillPlan& plan,
+void sparse_moe_prefill_launch(const SparseMoeGeometry& geometry, const Tensor& x,
+                               const SparseMoeWeights& weights, Tensor& destination,
+                               const SparseMoePrefillPlan& plan,
                                const SparseMoePrefillWorkspace& workspace, cudaStream_t stream) {
+    if (geometry != kSparseMoeQwen36Geometry) {
+        throw std::invalid_argument("sparse_moe: kernels are compiled for the Qwen3.6 geometry only");
+    }
     if (x.ne[1] != plan.tokens || destination.ne[1] != plan.tokens || plan.slice_tokens < 1) {
         throw std::invalid_argument("sparse_moe prefill: launch plan does not match tensors");
     }
@@ -1242,12 +1247,13 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
 
         if (adaptive) {
             auto* adaptive_activations = reinterpret_cast<float*>(grouped_io);
-            sparse_moe_decode_launch_d3_small_t(input_slice, weights, ids, adaptive_activations,
-                                                tokens, SparseMoeSmallTD3Schedule::Paths3, stream,
+            sparse_moe_decode_launch_d3_small_t(geometry, input_slice, weights, ids,
+                                                adaptive_activations, tokens,
+                                                SparseMoeSmallTD3Schedule::Paths3, stream,
                                                 route_job_count);
             sparse_moe_decode_launch_d4_small_t(
-                weights, output_slice, ids, alpha, shared_scale, adaptive_activations, tokens,
-                SparseMoeSmallTD4Schedule::Rows4, stream, route_job_count);
+                geometry, weights, output_slice, ids, alpha, shared_scale, adaptive_activations,
+                tokens, SparseMoeSmallTD4Schedule::Rows4, stream, route_job_count);
             sparse_moe_prefill_gather_kernel<true><<<assignments, kExpertThreads, 0, stream>>>(
                 input, ids, packed_index, tile_bases, grouped_io, route_job_count);
         } else {

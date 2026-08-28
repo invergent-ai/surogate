@@ -6,24 +6,24 @@
 
 namespace ninfer::ops::detail {
 
-std::size_t sparse_moe_decode_workspace_bytes() {
+std::size_t sparse_moe_decode_workspace_bytes(const SparseMoeGeometry& geometry) {
     WorkspaceLayoutBuilder layout;
-    (void)allocate_sparse_moe_decode_workspace(layout);
+    (void)allocate_sparse_moe_decode_workspace(layout, geometry);
     return layout.peak_bytes(1);
 }
 
-SparseMoeDecodePlan resolve_sparse_moe_decode_plan(QType routed_gate_up, QType routed_down) {
+SparseMoeDecodePlan resolve_sparse_moe_decode_plan(const SparseMoeGeometry& geometry,
+                                                   QType routed_gate_up, QType routed_down) {
     const bool main_profile =
         routed_gate_up == QType::Q4G64_F16S &&
         (routed_down == QType::Q5G64_F16S || routed_down == QType::Q6G64_F16S);
-    const bool mtp_profile =
+    const bool w8_profile =
         routed_gate_up == QType::W8G32_F16S && routed_down == QType::W8G32_F16S;
-    if (!main_profile && !mtp_profile) {
+    if (!main_profile && !w8_profile) {
         throw std::invalid_argument("sparse_moe: unsupported routed codec profile");
     }
-
     SparseMoeDecodePlan plan;
-    plan.workspace_bytes = sparse_moe_decode_workspace_bytes();
+    plan.workspace_bytes = sparse_moe_decode_workspace_bytes(geometry);
     return plan;
 }
 
