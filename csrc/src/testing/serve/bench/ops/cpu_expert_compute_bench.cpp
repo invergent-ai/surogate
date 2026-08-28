@@ -30,7 +30,7 @@ int main(int argc, char** argv) {
     const std::size_t per_expert  = gate_codes + gate_scales + down_codes + down_scales;
     std::cout << "bank: " << bank_experts << " experts x " << per_expert / 1e6 << " MB = "
               << static_cast<double>(per_expert) * bank_experts / 1e9 << " GB; avx512 "
-              << (ops::cpu_expert_compute_has_avx512() ? "yes" : "no") << "\n";
+              << (ops::cpu_expert_compute_has_avx512() ? "yes" : "no") << " vnni " << (ops::cpu_expert_compute_has_vnni() ? "yes" : "no") << "\n";
 
     std::mt19937 rng(7);
     std::vector<std::byte> gc(gate_codes * bank_experts), gs(gate_scales * bank_experts),

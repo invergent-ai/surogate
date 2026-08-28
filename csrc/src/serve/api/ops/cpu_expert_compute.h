@@ -82,5 +82,8 @@ private:
 /// True when the AVX-512 path is compiled in and the CPU supports it; otherwise the scalar
 /// path runs (same numerics, slower).
 [[nodiscard]] bool cpu_expert_compute_has_avx512() noexcept;
+/// True when the AVX512-VNNI batched inner loop is in use (compiled, supported, and not vetoed
+/// by SUROGATE_CPU_EXPERT_NO_VNNI=1).
+[[nodiscard]] bool cpu_expert_compute_has_vnni() noexcept;
 
 } // namespace ninfer::ops

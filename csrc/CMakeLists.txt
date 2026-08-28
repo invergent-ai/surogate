@@ -1106,7 +1106,7 @@ set(NINFER_CUTLASS_INCLUDE "${cutlass_SOURCE_DIR}/include")
 # The CPU expert-compute kernels carry their own AVX-512 code path (runtime-detected); the
 # rest of the engine stays generic x86-64.
 set_source_files_properties(${SERVE_ROOT}/ops/cpu_expert_compute/cpu_expert_compute.cpp PROPERTIES
-  COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mf16c;-mfma")
+  COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mf16c;-mfma")
 set_source_files_properties(${SERVE_ROOT}/ops/linear/w8a8/w4fp4_cutlass_gemm.cu PROPERTIES
     INCLUDE_DIRECTORIES "${NINFER_CUTLASS_INCLUDE};${cutlass_SOURCE_DIR}/tools/util/include"
     COMPILE_OPTIONS "--expt-relaxed-constexpr")

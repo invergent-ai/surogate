@@ -18,6 +18,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstring>
+#include <cstdlib>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
@@ -70,6 +71,16 @@ inline float fp16_to_float(std::uint16_t h) {
 inline float silu(float v) { return v / (1.0F + std::exp(-v)); }
 
 /// Quantises `count` floats (a multiple of 32) into int8 groups with one float scale each.
+void quantise_groups(const float* values, int count, std::int8_t* q, float* scales);
+/// Same quantisation plus, per group, 128 × Σ q (the VNNI kernel's u8×s8 compensation term).
+void quantise_groups_sums(const float* values, int count, std::int8_t* q, float* scales, std::int32_t* sums128) {
+    quantise_groups(values, count, q, scales);
+    for (int g = 0; g < count / kGroup; ++g) {
+        std::int32_t sum = 0;
+        for (int i = 0; i < kGroup; ++i) { sum += q[g * kGroup + i]; }
+        sums128[g] = 128 * sum;
+    }
+}
 void quantise_groups(const float* values, int count, std::int8_t* q, float* scales) {
     for (int g = 0; g < count / kGroup; ++g) {
         float amax = 0.0F;
@@ -203,6 +214,73 @@ void dot_two_rows_two_tokens_avx512(const std::int8_t* codes0, const std::uint16
     out1b = _mm512_reduce_add_ps(acc1b);
 }
 
+#if defined(__AVX512VNNI__)
+constexpr bool kVnniCompiled = true;
+bool detect_vnni() { return __builtin_cpu_supports("avx512vnni"); }
+
+/// VNNI variant of the two-rows × two-tokens dot: `vpdpbusd` takes 64 u8×s8 products per
+/// instruction (two 32-groups per zmm). The weights are the unsigned operand (w + 128 via a
+/// sign-bit flip), so each group's exact int32 dot is D_g − 128·Σx_g with the token's group
+/// sums precomputed at quantisation; the numerics stay the exact-int32-then-float-scale of the
+/// other paths. Needs k % 64 == 0.
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512dq,avx512vnni,f16c,fma")))
+void dot_two_rows_two_tokens_vnni(const std::int8_t* codes0, const std::uint16_t* scales0,
+                                  const std::int8_t* codes1, const std::uint16_t* scales1,
+                                  const std::int8_t* xqa, const float* xsa, const std::int32_t* xca,
+                                  const std::int8_t* xqb, const float* xsb, const std::int32_t* xcb, int k,
+                                  float& out0a, float& out1a, float& out0b, float& out1b) {
+    const int groups = k / kGroup; // even
+    const __m512i flip = _mm512_set1_epi8(static_cast<char>(0x80));
+    __m512 acc0a = _mm512_setzero_ps(), acc1a = _mm512_setzero_ps();
+    __m512 acc0b = _mm512_setzero_ps(), acc1b = _mm512_setzero_ps();
+    // Lane maps for a group pair (2i, 2i+1) within a 16-group block: scale lanes 0-7 ← group
+    // 2i, lanes 8-15 ← group 2i+1; the compensation sits in lane 0 of each group's 8 lanes.
+    const __mmask16 comp_mask = 0x0101;
+    int g = 0;
+    for (; g < groups; g += 16) {
+        const int block = std::min(16, groups - g); // 16 or a tail (multiple of 2)
+        const __mmask16 bm = static_cast<__mmask16>((1U << block) - 1U);
+        const __m512 ws0 = _mm512_cvtph_ps(_mm256_maskz_loadu_epi16(bm, scales0 + g));
+        const __m512 ws1 = _mm512_cvtph_ps(_mm256_maskz_loadu_epi16(bm, scales1 + g));
+        const __m512 xsav = _mm512_maskz_loadu_ps(bm, xsa + g);
+        const __m512 xsbv = _mm512_maskz_loadu_ps(bm, xsb + g);
+        const __m512 s0a = _mm512_mul_ps(ws0, xsav), s1a = _mm512_mul_ps(ws1, xsav);
+        const __m512 s0b = _mm512_mul_ps(ws0, xsbv), s1b = _mm512_mul_ps(ws1, xsbv);
+        const __m512i ca = _mm512_maskz_loadu_epi32(bm, xca + g);
+        const __m512i cb = _mm512_maskz_loadu_epi32(bm, xcb + g);
+        for (int i = 0; i < block / 2; ++i) {
+            const int gg = g + 2 * i;
+            const __m512i idx = _mm512_set_epi32(2 * i + 1, 2 * i + 1, 2 * i + 1, 2 * i + 1, 2 * i + 1, 2 * i + 1,
+                                                 2 * i + 1, 2 * i + 1, 2 * i, 2 * i, 2 * i, 2 * i, 2 * i, 2 * i, 2 * i, 2 * i);
+            const __m512i w0 = _mm512_xor_si512(_mm512_loadu_si512(codes0 + gg * kGroup), flip);
+            const __m512i w1 = _mm512_xor_si512(_mm512_loadu_si512(codes1 + gg * kGroup), flip);
+            const __m512i xa = _mm512_loadu_si512(xqa + gg * kGroup);
+            const __m512i xb = _mm512_loadu_si512(xqb + gg * kGroup);
+            const __m512i compa = _mm512_maskz_permutexvar_epi32(comp_mask, idx, ca);
+            const __m512i compb = _mm512_maskz_permutexvar_epi32(comp_mask, idx, cb);
+            const __m512i d0a = _mm512_sub_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), w0, xa), compa);
+            const __m512i d1a = _mm512_sub_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), w1, xa), compa);
+            const __m512i d0b = _mm512_sub_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), w0, xb), compb);
+            const __m512i d1b = _mm512_sub_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), w1, xb), compb);
+            acc0a = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d0a), _mm512_permutexvar_ps(idx, s0a), acc0a);
+            acc1a = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d1a), _mm512_permutexvar_ps(idx, s1a), acc1a);
+            acc0b = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d0b), _mm512_permutexvar_ps(idx, s0b), acc0b);
+            acc1b = _mm512_fmadd_ps(_mm512_cvtepi32_ps(d1b), _mm512_permutexvar_ps(idx, s1b), acc1b);
+        }
+    }
+    out0a = _mm512_reduce_add_ps(acc0a);
+    out1a = _mm512_reduce_add_ps(acc1a);
+    out0b = _mm512_reduce_add_ps(acc0b);
+    out1b = _mm512_reduce_add_ps(acc1b);
+}
+#else
+constexpr bool kVnniCompiled = false;
+bool detect_vnni() { return false; }
+void dot_two_rows_two_tokens_vnni(const std::int8_t*, const std::uint16_t*, const std::int8_t*, const std::uint16_t*,
+                                  const std::int8_t*, const float*, const std::int32_t*, const std::int8_t*,
+                                  const float*, const std::int32_t*, int, float&, float&, float&, float&) {}
+#endif
+
 __attribute__((target("avx512f,avx512bw,avx512vl,avx512dq,f16c,fma")))
 float dot_row_avx512(const std::int8_t* codes, const std::uint16_t* scales, const std::int8_t* xq,
                      const float* xs, int k) {
@@ -212,7 +290,12 @@ float dot_row_avx512(const std::int8_t* codes, const std::uint16_t* scales, cons
 }
 #else
 constexpr bool kAvx512Compiled = false;
+constexpr bool kVnniCompiled   = false;
 bool detect_avx512() { return false; }
+bool detect_vnni() { return false; }
+void dot_two_rows_two_tokens_vnni(const std::int8_t*, const std::uint16_t*, const std::int8_t*, const std::uint16_t*,
+                                  const std::int8_t*, const float*, const std::int32_t*, const std::int8_t*,
+                                  const float*, const std::int32_t*, int, float&, float&, float&, float&) {}
 float dot_row_avx512(const std::int8_t*, const std::uint16_t*, const std::int8_t*, const float*, int) {
     return 0.0F;
 }
@@ -224,6 +307,7 @@ void dot_two_rows_two_tokens_avx512(const std::int8_t*, const std::uint16_t*, co
 #endif
 
 const bool kUseAvx512 = kAvx512Compiled && detect_avx512();
+const bool kUseVnni   = kUseAvx512 && kVnniCompiled && detect_vnni() && std::getenv("SUROGATE_CPU_EXPERT_NO_VNNI") == nullptr;
 
 inline float dot_row(const std::int8_t* codes, const std::uint16_t* scales, const std::int8_t* xq,
                      const float* xs, int k) {
@@ -242,10 +326,13 @@ inline void dot_two_rows(const std::int8_t* codes0, const std::uint16_t* scales0
 
 inline void dot_two_rows_two_tokens(const std::int8_t* codes0, const std::uint16_t* scales0,
                                     const std::int8_t* codes1, const std::uint16_t* scales1,
-                                    const std::int8_t* xqa, const float* xsa, const std::int8_t* xqb,
-                                    const float* xsb, int k, float& out0a, float& out1a, float& out0b,
-                                    float& out1b) {
-    if (kUseAvx512) {
+                                    const std::int8_t* xqa, const float* xsa, const std::int32_t* xca,
+                                    const std::int8_t* xqb, const float* xsb, const std::int32_t* xcb, int k,
+                                    float& out0a, float& out1a, float& out0b, float& out1b) {
+    if (kUseVnni && k % 64 == 0) {
+        dot_two_rows_two_tokens_vnni(codes0, scales0, codes1, scales1, xqa, xsa, xca, xqb, xsb, xcb, k, out0a, out1a,
+                                     out0b, out1b);
+    } else if (kUseAvx512) {
         dot_two_rows_two_tokens_avx512(codes0, scales0, codes1, scales1, xqa, xsa, xqb, xsb, k, out0a, out1a,
                                        out0b, out1b);
     } else {
@@ -288,6 +375,7 @@ void require_geometry(const SparseMoeGeometry& geometry) {
 } // namespace
 
 bool cpu_expert_compute_has_avx512() noexcept { return kUseAvx512; }
+bool cpu_expert_compute_has_vnni() noexcept { return kUseVnni; }
 
 std::size_t cpu_expert_scratch_bytes(const SparseMoeGeometry& geometry) {
     require_geometry(geometry);
@@ -396,6 +484,8 @@ struct CpuExpertPool::Impl {
     std::vector<float> h;          // [jobs][intermediate]
     std::vector<std::int8_t> hq;   // [jobs][intermediate]
     std::vector<float> hs;         // [jobs][intermediate/32]
+    std::vector<std::int32_t> xc;  // [tokens][hidden/32] 128·Σq per group (VNNI compensation)
+    std::vector<std::int32_t> hc;  // [jobs][intermediate/32]
     std::vector<float> x_float;    // [threads][hidden] scratch for phase 0
     // Jobs grouped by expert: `order` lists job indices expert by expert, group g spans
     // order[group_start[g] .. group_start[g+1]).
@@ -444,7 +534,8 @@ struct CpuExpertPool::Impl {
             float* xf    = x_float.data() + static_cast<std::size_t>(worker) * hidden;
             const std::uint16_t* x = round->x + t * hidden;
             for (int i = 0; i < hidden; ++i) { xf[i] = bf16_to_float(x[i]); }
-            quantise_groups(xf, hidden, xq.data() + t * hidden, xs.data() + t * groups_h);
+            quantise_groups_sums(xf, hidden, xq.data() + t * hidden, xs.data() + t * groups_h,
+                                 xc.data() + t * groups_h);
             return;
         }
         if (ph == 1) {
@@ -472,8 +563,10 @@ struct CpuExpertPool::Impl {
                     float ga = 0.0F, ua = 0.0F, gb = 0.0F, ub = 0.0F;
                     dot_two_rows_two_tokens(gc, gs, uc, us, xq.data() + static_cast<std::size_t>(ja.token) * hidden,
                                             xs.data() + static_cast<std::size_t>(ja.token) * groups_h,
+                                            xc.data() + static_cast<std::size_t>(ja.token) * groups_h,
                                             xq.data() + static_cast<std::size_t>(jb.token) * hidden,
-                                            xs.data() + static_cast<std::size_t>(jb.token) * groups_h, hidden, ga, ua, gb, ub);
+                                            xs.data() + static_cast<std::size_t>(jb.token) * groups_h,
+                                            xc.data() + static_cast<std::size_t>(jb.token) * groups_h, hidden, ga, ua, gb, ub);
                     h[static_cast<std::size_t>(order[static_cast<std::size_t>(i)]) * intermediate + j]     = silu(ga) * ua;
                     h[static_cast<std::size_t>(order[static_cast<std::size_t>(i + 1)]) * intermediate + j] = silu(gb) * ub;
                 }
@@ -489,8 +582,8 @@ struct CpuExpertPool::Impl {
         }
         if (ph == 2) {
             const auto job_index = static_cast<std::size_t>(item);
-            quantise_groups(h.data() + job_index * intermediate, intermediate, hq.data() + job_index * intermediate,
-                            hs.data() + job_index * groups_i);
+            quantise_groups_sums(h.data() + job_index * intermediate, intermediate, hq.data() + job_index * intermediate,
+                                 hs.data() + job_index * groups_i, hc.data() + job_index * groups_i);
             return;
         }
         // phase 3: down rows of one expert group against every job of the group.
@@ -521,7 +614,8 @@ struct CpuExpertPool::Impl {
                 const CpuExpertJob& jb = round->jobs[ib];
                 float y0a = 0.0F, y1a = 0.0F, y0b = 0.0F, y1b = 0.0F;
                 dot_two_rows_two_tokens(c0, s0, c1, s1, hq.data() + ia * intermediate, hs.data() + ia * groups_i,
-                                        hq.data() + ib * intermediate, hs.data() + ib * groups_i, intermediate, y0a, y1a,
+                                        hc.data() + ia * groups_i, hq.data() + ib * intermediate,
+                                        hs.data() + ib * groups_i, hc.data() + ib * groups_i, intermediate, y0a, y1a,
                                         y0b, y1b);
                 float* outa = round->out + static_cast<std::size_t>(ja.token) * hidden;
                 float* outb = round->out + static_cast<std::size_t>(jb.token) * hidden;
@@ -663,6 +757,8 @@ void CpuExpertPool::run(const CpuExpertBank& bank, const CpuExpertRound& round) 
     impl.h.resize(jobs * impl.geometry.intermediate);
     impl.hq.resize(jobs * impl.geometry.intermediate);
     impl.hs.resize(jobs * (impl.geometry.intermediate / kGroup));
+    impl.xc.resize(static_cast<std::size_t>(round.tokens) * (impl.geometry.hidden / kGroup));
+    impl.hc.resize(jobs * (impl.geometry.intermediate / kGroup));
     impl.bank  = &bank;
     impl.round = &round;
     impl.group_jobs();

@@ -151,7 +151,7 @@ int main() {
     const int H     = kGeometry.hidden;
     std::uniform_real_distribution<float> act(-2.0F, 2.0F);
     int failures = 0;
-    std::cout << "avx512 path: " << (ops::cpu_expert_compute_has_avx512() ? "yes" : "no (scalar)") << "\n";
+    std::cout << "avx512 path: " << (ops::cpu_expert_compute_has_avx512() ? "yes" : "no (scalar)") << ", vnni: " << (ops::cpu_expert_compute_has_vnni() ? "yes" : "no") << "\n";
 
     // Single job vs reference.
     std::vector<std::uint16_t> x(H);

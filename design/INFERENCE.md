@@ -710,3 +710,23 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   last linked at 15:31 with the min-tokens change (so the 33.5 / 33.9 rows are valid; the
   auto-share and allowance changes were never in a running binary). Chains now build the
   serve targets explicitly and print the binary's link time.
+- Batched host kernel measured (2026-08-28, `ninfer_cpu_expert_compute_bench`, 32 threads):
+  decode shape (160 jobs over 512 experts) 236 GB/s mean (was 209); prefill shape at ~10
+  tokens per expert (5120 jobs) **574 GB/s-equivalent, 2.4×**; at ~40 tokens per expert
+  (20,480 jobs) **900, 3.8×** — the host is compute-bound there (~0.9 TMAC/s with the
+  int16-madd inner loop). Auto share works on the relinked binary: host 199 GB/s vs PCIe
+  gather 52 GB/s → 79 %, 32.3 tok/s @16 (plateau; TTFT 8.6 s, 29 requests vs 21 at 0.7
+  fixed). The 32-user probe at 3,000 slots fails on the runtime reservation (4.0 GB needed
+  after the pool, 486 MB free) — it reruns at 2,000 slots like the 64-user one.
+- Prefill metric correction: the board's "prefill tok/s" is loadgen's prompt tokens ÷ run
+  wall time (decode included), not a prompt-processing rate; the comparable single-user
+  number is 512 ÷ TTFT ≈ 174 t/s (ik_llama.cpp ≈ 285), so the gap to the external
+  references is 2-4.5×, not 4-10×. Ceiling of the bandwidth-matched prefill split at 512-token
+  prompts: ≈ 340 t/s with the int16 inner loop, ≈ 450-500 with VNNI; 765 (5090, Q3, 18
+  layers resident, 4-5k prompts) is a longer-prompt regime (4× the per-expert reuse) and is
+  to be measured at that prompt length.
+- VNNI inner loop written (2026-08-28, unbuilt): `vpdpbusd` u8×s8 with the weights as the
+  unsigned operand (sign-bit flip) and the token's per-group 128·Σq compensation subtracted
+  in int32 before the float scale, so the numerics equal the int16 path; takes the batched
+  2×2 calls when k % 64 == 0; `SUROGATE_CPU_EXPERT_NO_VNNI=1` vetoes it (A/B in the bench).
+  This EPYC 9124 pair has avx512_vnni and avx512_bf16.
