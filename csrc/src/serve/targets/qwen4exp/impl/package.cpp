@@ -6,6 +6,7 @@
 #include "ops/linear/bf16/bf16_cublaslt.h"
 #include "targets/qwen4exp/impl/load/bindings.h"
 #include "targets/qwen4exp/impl/variant.h"
+#include "core/device.h"
 
 #include <stdexcept>
 #include <utility>
@@ -113,7 +114,16 @@ Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineO
 Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
                                                         const EngineOptions& options,
                                                         WeightsProfile weights_profile) {
+    // The expert slot pool is device memory the KV planner must not count as free: create it
+    // here, before the engine measures free memory for `--kv-capacity auto`.
     detail::Variant::configure_expert_slots(options.expert_slots);
+    {
+        int previous = 0;
+        CUDA_CHECK(cudaGetDevice(&previous));
+        CUDA_CHECK(cudaSetDevice(device.device));
+        detail::Variant::prewarm_device_scratch();
+        CUDA_CHECK(cudaSetDevice(previous));
+    }
     return qwen3_6::make_sequence_planner<detail::Variant>(device, options, weights_profile);
 }
 

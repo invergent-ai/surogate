@@ -76,6 +76,14 @@ Design (model-agnostic, keyed by `SparseMoeGeometry`; no kernel changes):
    five AVX-512 macros per `docs/build.md`), and its `mul_mat_id` scheduling (rows grouped per
    expert, expert chunking over an atomic counter). Re-measure the CPU-MoE bar with that fork
    (`-fmoe`, no `-rtr` in hybrid mode) before claiming the ≥ 3× exit.
+   Layout note for that step: our host bank is W8G32 *planar* (codes plane + fp16 scales
+   plane per matrix, which is what the GPU gather wants); ik's kernels consume ggml block
+   types (`Q8_0` = interleaved `{fp16 d; int8 qs[32]}`, numerically the same format). Either
+   (a) keep a second, interleaved copy of the experts for the CPU (host RAM: 2 × 154 GB is
+   tight on 503 GB), (b) gather from an interleaved bank and de-interleave in the gather
+   kernel (byte-granular copies, PCIe is still the bound), or (c) write a planar-W8 AVX-512
+   GEMV/GEMM of our own (decode is DRAM-bound so a simple VNNI kernel suffices; prefill is
+   where ik's tiled GEMM would pay). Decide after the slot-cache numbers.
 5. **Prefill**: selective streaming of used experts per layer with whole-layer double
    buffering on a side stream.
 
@@ -386,6 +394,8 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   from, so an unmapped table entry (-1) is never dereferenced.
 - `--expert-slots N` (server and CLI, `EngineOptions::expert_slots`) replaces the env knob:
   `qwen4exp`'s `make_sequence_planner` records it and `prewarm_device_scratch` allocates the
-  pool; `SUROGATE_SERVE_EXPERT_SLOTS` stays as the fallback. Caveat until the planner
-  integration: the pool is allocated after the KV plan, so with `--kv-capacity auto` the two
-  can overcommit — use an explicit `--kv-capacity` with the pool for now.
+  pool; `SUROGATE_SERVE_EXPERT_SLOTS` stays as the fallback. The pool is created in
+  `make_sequence_planner`, i.e. before the engine measures free device memory for
+  `--kv-capacity auto` (registry.cpp resolves the KV curve against `current_free_device_bytes()`
+  after materialisation), so KV and pool no longer overcommit; the early preflight check does
+  not see it (it is computed from planned weight bytes), which only weakens that early check.
