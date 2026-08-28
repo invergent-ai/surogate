@@ -168,7 +168,28 @@ consecutive ids into single memcpys, cache the id read across gate/up/down);
 (`--cpu-moe`, `--n-cpu-moe N`); and the warning that a rotating input-copy
 ring invalidates captured graphs (pin copy 0 for decode).
 
-## 3. Phases
+**D7. Experts stay 8-bit in the artifact; native K-quant kernels are the
+bandwidth lever, not requantisation.** Measured on layers 0 and 3 (16 experts
+each, relative L2 against gguf-py's dequantisation of the shipped blocks):
+
+| source → engine format | Q4G64 | Q5G64 | Q6G64 | **W8G32** |
+|---|---:|---:|---:|---:|
+| gate/up `Q4_K` | 11.7 % | 5.5 % | 2.6 % | **0.57 %** |
+| down `Q5_1` | — | 5.2 % | 2.5 % | **0.55 %** |
+| down `Q8_0` | — | — | — | **exact** (bridge) |
+
+The symmetric group-64 formats the sparse-MoE kernels take would be a second
+quantisation of every expert (the K-quants carry per-32 scale *and* min, which
+group-64 scale-only cannot represent) — the same class of silent quality loss
+the 4B conversion rule forbids. W8G32 is one byte per weight and doubles the
+expert bytes (62 → 125 GB host-resident, 15.7 GB per PP stage), so every
+bandwidth figure in §1 and §4 is for the 8-bit banks until the engine's
+`ExpertBank` speaks `Q4_K`/`Q5_1` natively (llama.cpp's formats, its
+dequant kernels as the reference) — a Phase 2 item that halves the stream
+without touching the weights. The PLE table repacks IQ4_NL → W8G32 exactly
+(51 GB pinned host); the dense Q8_0 tensors repack exactly through the
+existing GGUF bridge; hyper-connection and PLE projections dequantise to BF16.
+
 
 ### Phase 1 — the model runs (single GPU, streamed experts, exact ≤ 2,051 ctx)
 
