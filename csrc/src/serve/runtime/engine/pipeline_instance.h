@@ -224,15 +224,23 @@ private:
     // the tokens the last stage sampled (one per lane; stages run single rounds).
     void propagate_round_tokens(std::span<const std::uint32_t> lanes, const BatchedGeneratedRound& round) {
         if (stages_.size() < 2 || lanes.empty()) { return; }
-        std::vector<TokenId> tokens(lanes.size());
+        // Decode rounds carry per-row counts and a stride; mixed rounds carry one token per
+        // row and nothing else. Stages run single rounds, so every row has at most one token.
+        const std::size_t stride = round.row_stride > 0 ? static_cast<std::size_t>(round.row_stride) : 1;
+        std::vector<std::uint32_t> replaced_lanes;
+        std::vector<TokenId> tokens;
         for (std::size_t row = 0; row < lanes.size(); ++row) {
-            if (round.row_counts.size() <= row || round.row_counts[row] != 1) {
+            const std::int32_t count = round.row_counts.empty() ? 1 : round.row_counts[row];
+            if (count == 0) { continue; }
+            if (count != 1 || row * stride >= round.tokens.size()) {
                 throw std::logic_error("pipeline stages expect one sampled token per lane per round");
             }
-            tokens[row] = round.tokens[row * static_cast<std::size_t>(round.row_stride)];
+            replaced_lanes.push_back(lanes[row]);
+            tokens.push_back(round.tokens[row * stride]);
         }
+        if (replaced_lanes.empty()) { return; }
         for (std::size_t s = 0; s + 1 < stages_.size(); ++s) {
-            stages_[s]->program->replace_pending_tokens(lanes, tokens);
+            stages_[s]->program->replace_pending_tokens(replaced_lanes, tokens);
         }
     }
     void propagate_prefill_token(std::uint32_t lane, const PrefillStepResult& step) {
