@@ -191,6 +191,11 @@ public:
 
     void set_linear_state_slots(std::int32_t current_slot, std::int32_t rewrite_checkpoint_slot);
     void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records);
+    /// The per-slot state a layer prologue keeps (null when the target has none).
+    void set_ple_state(NgramPleStatePool* pool) noexcept { ple_state_ = pool; }
+    // Column facts for the layer prologue, staged by each forward entry before its layers.
+    PrologueColumns prologue_{};
+    NgramPleStatePool* ple_state_ = nullptr;
 
     // Prefill CUDA graphs (PATCHES.md #27): non-null routes eligible prefill
     // chunks through bucket-captured graph bodies; null keeps the eager body.

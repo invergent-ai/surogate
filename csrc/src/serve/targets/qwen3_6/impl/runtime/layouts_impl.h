@@ -324,6 +324,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                  std::int32_t last, qwen3_6::TextPhase phase, GdnWorkspacePath path,
                                  std::int32_t batch_size, std::int32_t min_width,
                                  std::int32_t max_width, ops::GqaExecutionEnvelope envelope) {
+        if constexpr (ResidualHooks<Variant>::prologue) {
+            // The staged column facts (ids are the caller's) and the prologue's own scratch.
+            matrix(layout, DType::I32, 1, last);
+            matrix(layout, DType::I32, 1, last);
+            matrix(layout, DType::I32, 1, last);
+            scratch(layout,
+                    ResidualHooks<Variant>::layer_prologue_workspace_capacity_bytes(first, last));
+        }
         attention_stage(layout, first, last, phase, batch_size, min_width, max_width, envelope);
         gdn_stage(layout, first, last, phase, path, batch_size, min_width, max_width);
         post_mixer_stage(layout, first, last, phase);

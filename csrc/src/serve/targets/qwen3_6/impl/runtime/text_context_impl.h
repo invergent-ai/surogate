@@ -1,3 +1,5 @@
+#include "api/ops/ngram_ple.h"
+#include <cuda.h>
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/prefill_graph.h"
@@ -641,6 +643,59 @@ void TextContext::mtp_forward_ar_step(const Tensor& token, const Tensor& previou
     proposal_argmax(mtp_hidden, logits, draft_token);
 }
 
+
+// --- layer-prologue column staging ---------------------------------------------------------
+// Only reached by targets whose Variant declares a layer prologue; the planes come from the
+// transient arena of the forward that stages them.
+namespace prologue_staging {
+
+inline void fill_i32(Tensor& tensor, std::int32_t value, cudaStream_t stream) {
+    const CUresult status = cuMemsetD32Async(reinterpret_cast<CUdeviceptr>(tensor.data),
+                                             static_cast<unsigned int>(value),
+                                             static_cast<std::size_t>(tensor.numel()), stream);
+    if (status != CUDA_SUCCESS) {
+        throw std::runtime_error("prologue staging: 32-bit fill failed");
+    }
+}
+
+// Decode columns: every column is its own segment on its own slot.
+inline PrologueColumns decode_columns(WorkspaceArena& work, const Tensor& ids, const Tensor& slots,
+                                      std::int32_t columns, cudaStream_t stream) {
+    PrologueColumns out;
+    out.ids           = ids;
+    out.slots         = slots;
+    out.segment_begin = work.alloc(DType::I32, {columns});
+    out.segment_last  = work.alloc(DType::I32, {columns});
+    ops::fill_i32_positions(out.segment_begin, 0, stream);
+    fill_i32(out.segment_last, 1, stream);
+    return out;
+}
+
+// One prompt segment on one slot, `valid` columns long: a host count, or a device scalar for
+// the bucket-padded graph bodies where the count is an ingress value.
+inline PrologueColumns single_segment_columns(WorkspaceArena& work, const Tensor& ids,
+                                              std::int32_t columns, std::int32_t slot,
+                                              const Tensor* valid_scalar, std::int32_t valid_host,
+                                              cudaStream_t stream) {
+    PrologueColumns out;
+    out.ids           = ids;
+    out.segment_begin = work.alloc(DType::I32, {columns});
+    out.slots         = work.alloc(DType::I32, {columns});
+    out.segment_last  = work.alloc(DType::I32, {columns});
+    fill_i32(out.segment_begin, 0, stream);
+    fill_i32(out.slots, slot, stream);
+    fill_i32(out.segment_last, 0, stream);
+    if (valid_scalar != nullptr) {
+        ops::ngram_ple_mark_segment_last(out.segment_last, *valid_scalar, 0, stream);
+    } else {
+        Tensor last = out.segment_last.slice(0, valid_host - 1, 1);
+        ops::set_i32_scalar(last, 1, stream);
+    }
+    return out;
+}
+
+} // namespace prologue_staging
+
 void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_positions,
                                         const Tensor& rope_positions, const Tensor& kv_table_rows,
                                         const Tensor& linear_state_slots,
@@ -671,6 +726,10 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
         ScopedValue<std::int32_t> width_binding(active_sequence_width_, 1);
 
         Tensor x = work_.alloc(DType::BF16, {kCfg.residual, batch});
+        if constexpr (Hooks::prologue) {
+            prologue_ =
+                prologue_staging::decode_columns(work_, ids, linear_state_slots, batch, stream);
+        }
         Hooks::embed(weights_, ids, x, work_, stream);
         NullTap tap;
         run_layers(x, Phase::Verify, tap);
@@ -723,6 +782,13 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
 
         Tensor x        = work_.alloc(DType::BF16, {kCfg.residual, columns});
         Tensor flat_ids = ids.view({columns});
+        if constexpr (Hooks::prologue) {
+            if (width != 1) {
+                throw std::invalid_argument("layer prologue targets serve one column per lane");
+            }
+            prologue_ = prologue_staging::decode_columns(work_, flat_ids, linear_state_slots,
+                                                         columns, stream);
+        }
         Hooks::embed(weights_, flat_ids, x, work_, stream);
         if constexpr (Tap::enabled) { tap.begin(x); }
         run_layers(x, Phase::Verify, tap);
@@ -1132,6 +1198,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
         into += ms;
     };
     for (int layer = 0; layer < kCfg.n_layers; ++layer) {
+        Hooks::layer_prologue(weights_, layer, x, prologue_, ple_state_, work_, ctx_.stream);
         if (ModelConfig::is_full(layer)) {
             const int fidx         = ModelConfig::full_idx(layer);
             const FullLayerW& full = full_.at(static_cast<std::size_t>(fidx));
@@ -1294,6 +1361,37 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
             cursor += length;
         }
     }
+    if constexpr (Hooks::prologue) {
+        // Segment columns take their segment's start and slot; the decode lanes behind them
+        // are one-column segments on their own slots.
+        std::vector<int> begin_host(static_cast<std::size_t>(total));
+        std::vector<int> last_host(static_cast<std::size_t>(total), 0);
+        std::vector<int> slot_host(static_cast<std::size_t>(prefill_cols));
+        for (std::size_t i = 0; i < segments.size(); ++i) {
+            const int length = static_cast<int>(segments[i].ids.size());
+            for (int c = 0; c < length; ++c) {
+                begin_host[static_cast<std::size_t>(segment_begin[i] + c)] = segment_begin[i];
+                slot_host[static_cast<std::size_t>(segment_begin[i] + c)]  = segments[i].state_slot;
+            }
+            last_host[static_cast<std::size_t>(segment_begin[i] + length - 1)] = 1;
+        }
+        for (int c = prefill_cols; c < total; ++c) {
+            begin_host[static_cast<std::size_t>(c)] = c;
+            last_host[static_cast<std::size_t>(c)]  = 1;
+        }
+        prologue_.ids           = ids_device;
+        prologue_.segment_begin = work_.alloc(DType::I32, {total});
+        prologue_.segment_last  = work_.alloc(DType::I32, {total});
+        prologue_.slots         = work_.alloc(DType::I32, {total});
+        copy_i32(begin_host.data(), prologue_.segment_begin, s);
+        copy_i32(last_host.data(), prologue_.segment_last, s);
+        Tensor slots_prefill = prologue_.slots.slice(0, 0, prefill_cols);
+        copy_i32(slot_host.data(), slots_prefill, s);
+        Tensor slots_decode = prologue_.slots.slice(0, prefill_cols, batch);
+        CUDA_CHECK(cudaMemcpyAsync(slots_decode.data, decode.linear_state_slots.data,
+                                   static_cast<std::size_t>(batch) * sizeof(std::int32_t),
+                                   cudaMemcpyDeviceToDevice, s));
+    }
     Tensor positions_decode = positions.slice(0, prefill_cols, batch);
     CUDA_CHECK(cudaMemcpyAsync(positions_decode.data, decode.cache_positions.data,
                                static_cast<std::size_t>(batch) * sizeof(std::int32_t),
@@ -1316,6 +1414,7 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
         into += ms;
     };
     for (int layer = 0; layer < kCfg.n_layers; ++layer) {
+        Hooks::layer_prologue(weights_, layer, x, prologue_, ple_state_, work_, ctx_.stream);
         if (ModelConfig::is_full(layer)) {
             const int fidx         = ModelConfig::full_idx(layer);
             const FullLayerW& full = full_.at(static_cast<std::size_t>(fidx));
@@ -1633,6 +1732,10 @@ void TextContext::prefill_graph_window(std::int32_t bucket) {
     ScopedValue<const Tensor*> scoped_pad(graph_pad_valid_, &graph_pad_valid_storage_);
 
     Tensor x = roots.residual;
+    if constexpr (Hooks::prologue) {
+        prologue_ = prologue_staging::single_segment_columns(
+            work_, ids_device, bucket, linear_state_current_slot_, &graph_pad_valid_storage_, 0, s);
+    }
     Hooks::embed(weights_, ids_device, x, work_, s);
     NullTap tap;
     run_layers(x, Phase::Prefill, tap);
@@ -1699,10 +1802,26 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
     // graph key, so a replay never sees a frontier outside it).
     const ops::GqaExecutionEnvelope decode_envelope = mixed_graph_decode_.envelope;
 
+    if constexpr (Hooks::prologue) {
+        // Prefill window: one segment on the scratch slot, ending at the ingress valid count;
+        // decode columns: one-column segments on the lanes' slots.
+        prologue_ = prologue_staging::single_segment_columns(work_, ids_device, total,
+                                                             linear_state_current_slot_, &valid,
+                                                             0, s);
+        Tensor begin_decode = prologue_.segment_begin.slice(0, prefill_cols, batch);
+        ops::fill_i32_positions(begin_decode, prefill_cols, s);
+        Tensor last_decode = prologue_.segment_last.slice(0, prefill_cols, batch);
+        prologue_staging::fill_i32(last_decode, 1, s);
+        Tensor slots_decode = prologue_.slots.slice(0, prefill_cols, batch);
+        CUDA_CHECK(cudaMemcpyAsync(slots_decode.data, decode.linear_state_slots.data,
+                                   static_cast<std::size_t>(batch) * sizeof(std::int32_t),
+                                   cudaMemcpyDeviceToDevice, s));
+    }
     Tensor x = roots.residual;
     Hooks::embed(weights_, ids_device, x, work_, s);
 
     for (int layer = 0; layer < kCfg.n_layers; ++layer) {
+        Hooks::layer_prologue(weights_, layer, x, prologue_, ple_state_, work_, ctx_.stream);
         if (ModelConfig::is_full(layer)) {
             const int fidx         = ModelConfig::full_idx(layer);
             const FullLayerW& full = full_.at(static_cast<std::size_t>(fidx));
@@ -2141,6 +2260,10 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             ScopedEnvelope scoped_envelope(active_gqa_envelope_, chunk_envelope);
 
             Tensor x = roots.residual;
+            if constexpr (Hooks::prologue) {
+                prologue_ = prologue_staging::single_segment_columns(
+                    work_, ids_device, len, linear_state_current_slot_, nullptr, len, s);
+            }
             Hooks::embed(weights_, ids_device, x, work_, s);
             window_laps.mark_pre();
             if (!local_scatter_indices.empty()) {

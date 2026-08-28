@@ -266,6 +266,14 @@ __global__ void ple_conv_state_update_kernel(const __nv_bfloat16* __restrict__ n
     }
 }
 
+__global__ void mark_last_kernel(int* __restrict__ flags, const int* __restrict__ count, int base,
+                                 int columns) {
+    int index = base + *count - 1;
+    if (index < 0) { index = 0; }
+    if (index >= columns) { index = columns - 1; }
+    flags[index] = 1;
+}
+
 void require_shape(const Tensor& tensor, DType dtype, std::int32_t rows, std::int32_t tokens,
                    const char* name) {
     if (tensor.dtype != dtype || tensor.ne[0] != rows || tensor.ne[1] != tokens ||
@@ -294,6 +302,18 @@ unsigned grid_for(std::int64_t count) {
 }
 
 } // namespace
+
+void ngram_ple_mark_segment_last(Tensor& flags, const Tensor& count_scalar, std::int32_t base,
+                                 cudaStream_t stream) {
+    if (flags.dtype != DType::I32 || flags.numel() <= 0 || flags.data == nullptr ||
+        count_scalar.dtype != DType::I32 || count_scalar.data == nullptr) {
+        throw std::invalid_argument("ngram_ple_mark_segment_last: invalid operands");
+    }
+    mark_last_kernel<<<1, 1, 0, stream>>>(static_cast<int*>(flags.data),
+                                          static_cast<const int*>(count_scalar.data), base,
+                                          static_cast<int>(flags.numel()));
+    CUDA_CHECK(cudaGetLastError());
+}
 
 std::size_t ngram_ple_workspace_capacity_bytes(std::int32_t streams, std::int32_t hidden,
                                                std::int32_t embed_dim, std::int32_t heads,

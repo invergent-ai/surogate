@@ -111,6 +111,11 @@ struct NgramPleState {
  * The per-slot state is read for the first columns of each segment and rewritten by the
  * segment's last column; every slot appears in at most one segment per call.
  */
+/// flags[clamp(base + count - 1)] = 1 where `count_scalar` is a device I32 scalar (a bucket's
+/// valid column count); flags is I32 [T].
+void ngram_ple_mark_segment_last(Tensor& flags, const Tensor& count_scalar, std::int32_t base,
+                                 cudaStream_t stream);
+
 void ngram_ple_forward(Tensor& residual, const NgramPleColumns& columns, const NgramPleHash& hash,
                        const NgramPleTable& table, const NgramPleWeights& weights,
                        NgramPleState& state, std::int32_t streams, std::int32_t conv_kernel,

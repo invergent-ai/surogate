@@ -8,7 +8,12 @@
 #include "api/ops/embedding.h"
 #include "api/ops/rmsnorm.h"
 #include "core/arena.h"
+#include "core/ngram_ple_state.h"
 #include "core/tensor.h"
+#include "targets/qwen3_6/impl/runtime/prologue_columns.h"
+
+#include <cstddef>
+#include <cstdint>
 
 #include <cuda_runtime.h>
 
@@ -25,8 +30,41 @@ template <class Config>
 }
 
 template <class Variant>
+[[nodiscard]] constexpr bool has_layer_prologue() {
+    if constexpr (requires { Variant::has_layer_prologue; }) {
+        return Variant::has_layer_prologue;
+    } else {
+        return false;
+    }
+}
+
+template <class Variant>
 struct ResidualHooks {
     using Model = typename Variant::ModelView;
+
+    /// Whether the Variant runs something on the residual before a layer (an n-gram memory).
+    static constexpr bool prologue = has_layer_prologue<Variant>();
+
+    static void layer_prologue(const Model& model, int layer, Tensor& residual,
+                               const PrologueColumns& columns, NgramPleStatePool* ple_state,
+                               WorkspaceArena& work, cudaStream_t stream) {
+        if constexpr (prologue) {
+            Variant::layer_prologue(model, layer, residual, columns, ple_state, work, stream);
+        } else {
+            (void)model; (void)layer; (void)residual; (void)columns; (void)ple_state; (void)work;
+            (void)stream;
+        }
+    }
+
+    [[nodiscard]] static std::size_t layer_prologue_workspace_capacity_bytes(std::int32_t first,
+                                                                             std::int32_t last) {
+        if constexpr (prologue) {
+            return Variant::layer_prologue_workspace_capacity_bytes(first, last);
+        } else {
+            (void)first; (void)last;
+            return 0;
+        }
+    }
 
     /// Token ids into the residual planes.
     static void embed(const Model& model, const Tensor& ids, Tensor& residual,
