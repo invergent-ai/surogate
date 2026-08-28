@@ -836,3 +836,12 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   and the v2 overlap was gone (the 16-user 36.0 was reached despite it). Fix (this commit):
   the two copies run on the main stream (stream order alone protects the job list from the
   next resolve), only the host function is forked. Rerun at 1 / 16 / 64 users follows.
+- Copies on the main stream, measured (2026-08-28, binary 17:40): 1 user prefill 0.7 → TTFT
+  1.41 s; **16 users prefill 0.5 → 37.9 tok/s decode, 172 prefill, TTFT 7.3 s** (best 16-user
+  decode); **64 users prefill 0.5 → 33.4 / 157 / 27.5 s, unchanged** — so the serialisation
+  was not what costs the 64-user run (86.5 / 346 / 18.6 s without the prefill share). The
+  arithmetic says the split should shorten a 576-column mixed round (gather 3.6 s → 1.8 s
+  with the host taking the other half in ~1.5 s at the bench rate), so either the host round
+  runs far slower in situ than in the bench at that width, or the decode rounds changed too.
+  Measuring instead of guessing: a same-binary pair at 64 users, prefill share 0 vs 0.5, with
+  `SUROGATE_SERVE_ROUND_TIMING=1` (per-round-kind wall clock) is queued.
