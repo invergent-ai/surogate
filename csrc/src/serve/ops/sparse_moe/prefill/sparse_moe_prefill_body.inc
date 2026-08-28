@@ -349,6 +349,7 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gat
         const int row_block     = work - route_job * row_blocks;
         const int expert        = route_job_experts[route_job];
         const int block = slot_of_expert != nullptr ? slot_of_expert[expert] : expert;
+        if (block < 0) { continue; } // computed on the host (expert split); uniform per CTA
         const int logical0      = row_block * (kExpertBM / 2);
         const int begin         = expert_offsets[expert];
         const int count         = expert_offsets[expert + 1] - begin;
@@ -536,6 +537,7 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_w8_gate_
     }
     const int expert   = Routed ? static_cast<int>(blockIdx.y) : 0;
     const int block  = (Routed && slot_of_expert != nullptr) ? slot_of_expert[expert] : expert;
+    if (block < 0) { return; } // computed on the host (expert split)
     const int logical0 = static_cast<int>(blockIdx.x) * (kExpertBM / 2);
     const int begin    = Routed ? expert_offsets[expert] : static_cast<int>(blockIdx.y) * kExpertBN;
     const int count    = Routed ? expert_offsets[expert + 1] - begin
@@ -774,6 +776,7 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_qx_dow
         const int row_block   = work - route_job * row_blocks;
         const int expert      = route_job_experts[route_job];
         const int block = slot_of_expert != nullptr ? slot_of_expert[expert] : expert;
+        if (block < 0) { continue; } // computed on the host (expert split); uniform per CTA
         const int row0        = row_block * kExpertBM;
         const int begin       = expert_offsets[expert];
         const int count       = expert_offsets[expert + 1] - begin;
@@ -926,6 +929,7 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_w8_down_
     }
     const int expert = Routed ? static_cast<int>(blockIdx.y) : 0;
     const int block  = (Routed && slot_of_expert != nullptr) ? slot_of_expert[expert] : expert;
+    if (block < 0) { return; } // computed on the host (expert split)
     const int row0   = static_cast<int>(blockIdx.x) * kExpertBM;
     const int begin  = Routed ? expert_offsets[expert] : static_cast<int>(blockIdx.y) * kExpertBN;
     const int count  = Routed ? expert_offsets[expert + 1] - begin
@@ -1325,6 +1329,14 @@ void prefill_launch(const Tensor& x, const SparseMoeWeights& weights, Tensor& de
                 throw std::invalid_argument(
                     "sparse_moe prefill: Q5/Q6 routed down needs intermediate 512 for this geometry");
             }
+        }
+        if (weights.slot_of_expert != nullptr) {
+            // With an expert slot pool some routed experts may be unmapped (slot -1: computed
+            // on the host by the expert split). The down kernels skip them, so their
+            // assignment rows must read as zero in the reduce that follows.
+            CUDA_CHECK(cudaMemsetAsync(grouped_io, 0,
+                                       static_cast<std::size_t>(tokens) * kTopK * kHidden * sizeof(__nv_bfloat16),
+                                       stream));
         }
         switch (weights.routed_down.qtype) {
         case QType::Q5G64_F16S:

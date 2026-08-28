@@ -736,3 +736,12 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   per distinct expert, not per token, so wider rounds amortise it; the plateau seen in the
   16-user share sweep was the per-round bound, and concurrency is the way past it on this
   path. 32 users at 3,000 slots fails on the runtime reservation; it reruns at 2,000.
+- Prefill split defect (2026-08-28): the first prefill-share probes answered `!!!!` (NaN) with
+  TTFT 0.2 s — VOID rows. Cause: the four prefill W8/Qx kernels looked up `slot_of_expert`
+  but did not skip an unmapped expert (slot -1 = computed on the host), so they read a
+  negative row base; the decode kernels had the `block >= 0` skip, the prefill ones did not.
+  Fix (this commit): whole-CTA `continue`/`return` on `block < 0` in all four, and
+  `grouped_io` zeroed between the gate/up and the down launches when a slot table is in use
+  (the down kernels write per-assignment rows that the reduce sums, so a skipped expert's
+  rows must be zero; 26 MB at 5,120 assignments). Small-T rounds (s2→s3) still need the
+  same audit before the split is allowed there beyond 64 columns.
