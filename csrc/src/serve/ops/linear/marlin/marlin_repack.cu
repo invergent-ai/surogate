@@ -435,6 +435,24 @@ void marlin_repack_w8g32(const void* codes, const void* scales_f16, int n, int k
     }
 }
 
+// The 4-bit tile repack, for the MoE path: the vendored kernel is instantiated here
+// because this is the translation unit that owns it (#89).
+void marlin_repack_tiles_q4(const void* gptq_tmp, void* b_out, int n, int k,
+                            cudaStream_t stream) {
+    int device = 0;
+    cudaGetDevice(&device);
+    int sms = 0;
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
+    int max_shared_mem = 0;
+    cudaDeviceGetAttribute(&max_shared_mem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+    auto kernel = MARLIN_NAMESPACE_NAME::gptq_marlin_repack_kernel<
+        MARLIN_NAMESPACE_NAME::repack_threads, 4, false, false>;
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem);
+    kernel<<<sms, MARLIN_NAMESPACE_NAME::repack_threads, max_shared_mem, stream>>>(
+        static_cast<const std::uint32_t*>(gptq_tmp), nullptr,
+        static_cast<std::uint32_t*>(b_out), k, n);
+}
+
 std::size_t marlin_b_out_words(int n, int k) {
     return static_cast<std::size_t>(k / MARLIN_NAMESPACE_NAME::tile_size) *
            (static_cast<std::size_t>(n) * MARLIN_NAMESPACE_NAME::tile_size / 4);

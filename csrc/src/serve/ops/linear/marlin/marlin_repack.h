@@ -16,6 +16,11 @@ void marlin_repack_w8g32(const void* codes, const void* scales_f16, int n, int k
 
 std::size_t marlin_b_out_words(int n, int k);
 
+// The 4-bit Marlin tile repack, used by the MoE path (#89). gptq_tmp holds (k/8)*n uint32
+// in GPTQ order; b_out receives marlin_b_out_words(n, k) uint32.
+void marlin_repack_tiles_q4(const void* gptq_tmp, void* b_out, int n, int k,
+                            cudaStream_t stream);
+
 // Repack the serve FP8 residency (codes [N,K] e4m3 row-major, scales [N]
 // BF16 per output channel) into Marlin B tiles plus channelwise scales.
 // gptq_tmp holds (k/4)*n uint32; b_out marlin_b_out_words(n,k) uint32;

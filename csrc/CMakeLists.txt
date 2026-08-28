@@ -1029,6 +1029,9 @@ add_library(ninfer_ops STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/linear_pair/w8/w8_pair_gemm_mma.cu
   ${SERVE_ROOT}/ops/linear_pair/w8/w8_pair_gemm_splitk.cu
   ${SERVE_ROOT}/ops/linear_pair/w8/w8_pair_plan.cpp
+  ${SERVE_ROOT}/ops/sparse_moe/marlin/marlin_moe_gemm.cu
+  ${SERVE_ROOT}/ops/sparse_moe/marlin/marlin_moe_kernels_generated.cu
+  ${SERVE_ROOT}/ops/sparse_moe/marlin/marlin_moe_repack.cu
   ${SERVE_ROOT}/ops/sparse_moe/decode/sparse_moe_decode_kernels.cu
   ${SERVE_ROOT}/ops/sparse_moe/decode/sparse_moe_decode_plan.cpp
   ${SERVE_ROOT}/ops/sparse_moe/prefill/sparse_moe_prefill_kernels.cu
@@ -1078,7 +1081,16 @@ set_source_files_properties(
   ${SERVE_ROOT}/ops/linear/marlin/marlin_gemm.cu
   ${SERVE_ROOT}/ops/linear/marlin/marlin_kernels_generated.cu
   ${SERVE_ROOT}/ops/linear/marlin/marlin_repack.cu
+  ${SERVE_ROOT}/ops/sparse_moe/marlin/marlin_moe_gemm.cu
+  ${SERVE_ROOT}/ops/sparse_moe/marlin/marlin_moe_kernels_generated.cu
+  ${SERVE_ROOT}/ops/sparse_moe/marlin/marlin_moe_repack.cu
   PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>")
+
+set_source_files_properties(
+  ${SERVE_ROOT}/ops/sparse_moe/marlin/marlin_moe_gemm.cu
+  ${SERVE_ROOT}/ops/sparse_moe/marlin/marlin_moe_kernels_generated.cu
+  PROPERTIES COMPILE_OPTIONS
+  "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;-static-global-template-stub=false>")
 ninfer_internal_includes(ninfer_ops)
 # surogate vendor patch (PATCHES.md #25): cutlass headers for the sm_120a
 # blockscaled NVFP4 GEMM TU. Points at the flashinfer-shipped cutlass by

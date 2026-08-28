@@ -18,7 +18,11 @@
 
 #include <algorithm>
 #include <cstdint>
+#include "ops/sparse_moe/marlin/marlin_moe_gemm.h"
+
 #include <cstdlib>
+#include <mutex>
+#include <unordered_map>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -257,10 +261,74 @@ constexpr int kExpertThreads           = 32 * kExpertWarps;
 constexpr int kRtx5090SmCount          = 170;
 constexpr int kPrefillBlocksPerSm      = 3;
 constexpr int kPrefillPersistentBlocks = kPrefillBlocksPerSm * kRtx5090SmCount;
+// Marlin's MoE block: 16 rows, the smallest that is not the m_block_size_8 path.
+constexpr int kMarlinMoeBlock          = 16;
 
 // The routed GEMMs stream every touched expert once and the bench puts them at ~30 % of peak
 // bandwidth, so how many requests are in flight matters more than anything else here. The
 // persistent grid is the knob for that, tunable so it can be swept rather than guessed.
+// MoE Marlin residency (#89). The routed gate/up is 53 % of a MoE layer and its kernel is
+// issue-bound, so vLLM's tuned Marlin is worth the repack - and our Q4G64 codes are already
+// kU4B8 with group 64, so this regroups bytes rather than requantising. Planes are built on
+// first use and keyed by the weight pointer.
+struct MarlinMoePlane {
+    void* b_tiles                     = nullptr;
+    void* scales                      = nullptr;
+    void* product                     = nullptr;
+    void* c_tmp                       = nullptr;
+    std::int32_t* sorted_token_ids    = nullptr;
+    std::int32_t* expert_ids          = nullptr;
+    std::int32_t* past_padded         = nullptr;
+    std::int32_t* locks               = nullptr;
+    std::int32_t capacity_assignments = 0;
+};
+
+MarlinMoePlane& marlin_moe_plane_for(const Weight& weight, std::int32_t experts, std::int32_t n,
+                                     std::int32_t k, std::int32_t assignments,
+                                     cudaStream_t stream) {
+    static std::mutex mutex;
+    static std::unordered_map<const void*, MarlinMoePlane> planes;
+    const std::lock_guard<std::mutex> lock(mutex);
+    MarlinMoePlane& plane = planes[weight.qdata];
+    if (plane.b_tiles == nullptr) {
+        const std::size_t b_bytes = detail::marlin_moe_b_bytes(n, k) * experts;
+        const std::size_t s_bytes = detail::marlin_moe_scale_bytes(n, k) * experts;
+        void* gptq_tmp            = nullptr;
+        CUDA_CHECK(cudaMalloc(&plane.b_tiles, b_bytes));
+        CUDA_CHECK(cudaMalloc(&plane.scales, s_bytes));
+        CUDA_CHECK(cudaMalloc(&gptq_tmp, static_cast<std::size_t>(k / 8) * n * sizeof(std::uint32_t)));
+        detail::marlin_moe_repack_q4g64(weight.qdata, weight.scales, experts, n, k, gptq_tmp,
+                                        plane.b_tiles, plane.scales, stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(cudaFree(gptq_tmp));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&plane.locks),
+                              detail::marlin_moe_lock_bytes()));
+        CUDA_CHECK(cudaMemsetAsync(plane.locks, 0, detail::marlin_moe_lock_bytes(), stream));
+    }
+    if (assignments > plane.capacity_assignments) {
+        if (plane.product != nullptr) {
+            CUDA_CHECK(cudaFree(plane.product));
+            CUDA_CHECK(cudaFree(plane.c_tmp));
+            CUDA_CHECK(cudaFree(plane.sorted_token_ids));
+            CUDA_CHECK(cudaFree(plane.expert_ids));
+            CUDA_CHECK(cudaFree(plane.past_padded));
+        }
+        const std::int32_t padded =
+            detail::marlin_moe_padded_rows(assignments, experts, kMarlinMoeBlock);
+        CUDA_CHECK(cudaMalloc(&plane.product,
+                              static_cast<std::size_t>(assignments) * n * sizeof(__nv_bfloat16)));
+        CUDA_CHECK(cudaMalloc(&plane.c_tmp, detail::marlin_moe_c_tmp_bytes(assignments, n)));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&plane.sorted_token_ids),
+                              static_cast<std::size_t>(padded) * sizeof(std::int32_t)));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&plane.expert_ids),
+                              static_cast<std::size_t>(padded / kMarlinMoeBlock + 1) *
+                                  sizeof(std::int32_t)));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&plane.past_padded), sizeof(std::int32_t)));
+        plane.capacity_assignments = assignments;
+    }
+    return plane;
+}
+
 inline int prefill_persistent_blocks() {
     static const int blocks = [] {
         const char* raw = std::getenv("SUROGATE_SERVE_MOE_BLOCKS_PER_SM");
@@ -1189,7 +1257,23 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         CUDA_CHECK(cudaGetLastError());
 
         const dim3 routed_gate_grid(kIntermediate / (kExpertBM / 2), kExperts);
-        if (weights.routed_gate_up.qtype == QType::Q4G64_F16S) {
+        if (weights.routed_gate_up.qtype == QType::Q4G64_F16S &&
+            detail::marlin_moe_route_enabled()) {
+            // Marlin produces the raw [rows, 2*intermediate] product; the fold that our own
+            // kernel does inline becomes a separate pass (#89).
+            const std::int32_t assignments = tokens * kTopK;
+            MarlinMoePlane& plane          = marlin_moe_plane_for(
+                weights.routed_gate_up, kExperts, 2 * kIntermediate, kHidden, assignments, stream);
+            detail::marlin_moe_build_routing(offsets, kExperts, assignments, kMarlinMoeBlock,
+                                             plane.sorted_token_ids, plane.expert_ids,
+                                             plane.past_padded, stream);
+            detail::marlin_moe_gemm_q4g64_bf16(
+                grouped_io, plane.b_tiles, plane.scales, plane.product, plane.c_tmp,
+                plane.sorted_token_ids, plane.expert_ids, plane.past_padded, assignments,
+                2 * kIntermediate, kHidden, kExperts, kMarlinMoeBlock, plane.locks, stream);
+            detail::marlin_moe_silu_mul(plane.product, routed_activation, assignments,
+                                        kIntermediate, stream);
+        } else if (weights.routed_gate_up.qtype == QType::Q4G64_F16S) {
             if (wide_plan) {
                 sparse_moe_prefill_q4_gate_up_kernel<8, 64>
                     <<<prefill_persistent_blocks(), 8 * 32, 0, stream>>>(
