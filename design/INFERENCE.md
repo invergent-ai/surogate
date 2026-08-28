@@ -141,6 +141,16 @@ and the baseline run is queued.
   hit rate is low, so ~400 misses × 5.2 MB ≈ 2 GB/token at ~50 GB/s ≈ 40 ms is the floor of
   this design — the CPU compute split (host DRAM 160–320 GB/s) is the next multiplier, then
   pool sizing against the KV floor.
+- users=16 with the slot cache (512/128): decode 9.4 tok/s aggregate (v0 7.6), prefill 38,
+  TTFT 17.9 s. Reading: at 16 lanes a decode round touches ~150 distinct experts per layer and
+  a 512-token prefill chunk touches nearly all 512, so 3,000 slots (≈62 per layer) thrash and
+  the round is one big PCIe gather (~0.8 GB per decode layer, 2.6 GB per prefill layer). The
+  pool is a single-user / low-concurrency accelerator on this card; concurrency needs the CPU
+  compute split (host DRAM 160–320 GB/s vs PCIe ~50) — implementation started:
+  `api/ops/cpu_expert_compute.h` (planar-W8 gated FFN on the host, AVX-512 int8×int8 group
+  dots with runtime detection and a scalar fallback, pinned worker pool, unit test against a
+  double reference). The GPU-round integration (miss split, activation hand-off, host-function
+  handshake, kernels skipping CPU-assigned pairs) is the next step.
 5. **Prefill**: selective streaming of used experts per layer with whole-layer double
    buffering on a side stream.
 

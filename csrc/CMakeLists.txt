@@ -1043,6 +1043,7 @@ add_library(ninfer_ops STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/hyper_connection/hyper_connection.cu
   ${SERVE_ROOT}/ops/ngram_ple/ngram_ple.cu
   ${SERVE_ROOT}/ops/expert_slot_cache/expert_slot_cache.cu
+  ${SERVE_ROOT}/ops/cpu_expert_compute/cpu_expert_compute.cpp
   ${SERVE_ROOT}/ops/linear/linear.cpp
   ${SERVE_ROOT}/ops/wrapper/add_bias.cpp
   ${SERVE_ROOT}/ops/wrapper/argmax.cpp
@@ -1102,6 +1103,10 @@ ninfer_internal_includes(ninfer_ops)
 # default; vendoring a snapshot is tracked.
 # cutlass comes from the main project's FetchContent (v4.6.1).
 set(NINFER_CUTLASS_INCLUDE "${cutlass_SOURCE_DIR}/include")
+# The CPU expert-compute kernels carry their own AVX-512 code path (runtime-detected); the
+# rest of the engine stays generic x86-64.
+set_source_files_properties(${SERVE_ROOT}/ops/cpu_expert_compute/cpu_expert_compute.cpp PROPERTIES
+  COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mf16c;-mfma")
 set_source_files_properties(${SERVE_ROOT}/ops/linear/w8a8/w4fp4_cutlass_gemm.cu PROPERTIES
     INCLUDE_DIRECTORIES "${NINFER_CUTLASS_INCLUDE};${cutlass_SOURCE_DIR}/tools/util/include"
     COMPILE_OPTIONS "--expt-relaxed-constexpr")
