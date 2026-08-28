@@ -187,6 +187,11 @@ and the baseline run is queued.
   levers; the eager hit-rate readout will quantify this. 4,500 slots (21.9 GiB) is refused by
   the planner on the 32 GB card ("automatic KV headroom requires 1 GiB, 0 available after
   weights") — the pool-before-KV ordering works as intended.
+- Queue stall (2026-08-28, ~35 min lost): the bisect chain's process guard used `pgrep -f` with a
+  pattern that also occurred elsewhere in its own command line, matched itself and spun; every
+  chain gated on it (CPU-split run, hit-rate readout, CPU benchmark) waited until the owner
+  pointed out the idle GPUs. Chains now gate on marker lines in output files and guard with
+  `pgrep -x surogate-engine`; the bisect probes and the GPU-1 sequence were relaunched.
 5. **Prefill**: selective streaming of used experts per layer with whole-layer double
    buffering on a side stream.
 
