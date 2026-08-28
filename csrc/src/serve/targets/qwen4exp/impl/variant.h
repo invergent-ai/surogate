@@ -3,6 +3,7 @@
 #include <api/targets/qwen4exp/package.h>
 #include <api/targets/qwen3_6/runtime.h>
 
+#include "api/ops/gated_rmsnorm.h"
 #include "core/arena.h"
 #include "core/ngram_ple_state.h"
 #include "core/tensor.h"
@@ -38,6 +39,8 @@ struct Variant {
 
     static constexpr float attention_scale                     = kAttentionScale;
     static constexpr float gdn_scale                           = kGdnScale;
+    // The GDN output gate is a logistic sigmoid (`output_gate_type: sigmoid`), not SiLU.
+    static constexpr ops::GatedRmsGate gdn_output_gate         = ops::GatedRmsGate::Sigmoid;
     static constexpr std::uint32_t prefill_chunk_alignment     = kPrefillChunkAlignment;
     static constexpr std::uint32_t maximum_mtp_draft_tokens    = kMaximumMtpDraftTokens;
     static constexpr std::uint32_t maximum_dflash_draft_tokens = kMaximumDFlashDraftTokens;

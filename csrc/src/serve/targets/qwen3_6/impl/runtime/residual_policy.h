@@ -6,6 +6,7 @@
 // connections) supplies the members the `requires` clauses probe for.
 
 #include "api/ops/embedding.h"
+#include "api/ops/gated_rmsnorm.h"
 #include "api/ops/rmsnorm.h"
 #include "core/arena.h"
 #include "core/ngram_ple_state.h"
@@ -36,6 +37,17 @@ template <class Variant>
         return Variant::has_layer_prologue;
     } else {
         return false;
+    }
+}
+
+/// Activation of the GDN output gate (`z`): SiLU unless the variant declares otherwise
+/// (Qwen3.8-Flash-Next gates with the logistic sigmoid).
+template <class Variant>
+[[nodiscard]] constexpr ops::GatedRmsGate gdn_output_gate() {
+    if constexpr (requires { Variant::gdn_output_gate; }) {
+        return Variant::gdn_output_gate;
+    } else {
+        return ops::GatedRmsGate::Silu;
     }
 }
 

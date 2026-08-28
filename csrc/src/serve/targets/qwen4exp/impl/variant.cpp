@@ -108,13 +108,31 @@ void dump_tensor(const Tensor& tensor, const std::string& name, int forward, cud
     std::fclose(file);
 }
 
-// Layer 0's prologue marks the start of a forward.
+// Layer 0's prologue marks the start of a forward; the layer index is kept for the
+// per-block intermediate dumps of the first two layers.
+int g_dump_layer = -1;
+int g_dump_block = 0; // mixes seen in the current layer: 0 = mixer block, 1 = MLP block
+
 void maybe_dump_layer(int layer, const Tensor& residual, cudaStream_t stream) {
     ResidualDump& dump = residual_dump();
     if (dump.dir.empty() || residual.ne[1] > 64) { return; }
     if (layer == 0) { dump.forward += 1; }
+    g_dump_layer = layer;
+    g_dump_block = 0;
     if (dump.forward > dump.limit) { return; }
     dump_tensor(residual, "f" + std::to_string(dump.forward) + "_layer" + std::to_string(layer),
+                dump.forward, stream);
+}
+
+void maybe_dump_block(const char* tag, const Tensor& tensor, cudaStream_t stream) {
+    ResidualDump& dump = residual_dump();
+    if (dump.dir.empty() || tensor.ne[1] > 64 || dump.forward > dump.limit || g_dump_layer < 0 ||
+        g_dump_layer > 1) {
+        return;
+    }
+    dump_tensor(tensor,
+                "f" + std::to_string(dump.forward) + "_L" + std::to_string(g_dump_layer) +
+                    (g_dump_block == 0 ? "_mixer_" : "_mlp_") + tag,
                 dump.forward, stream);
 }
 
@@ -154,6 +172,8 @@ void mix_into(const Tensor& residual, const ops::HyperConnectionWeights& weights
     ops::hyper_connection_mix(residual, weights, kStreams, kEps, hidden, &inject, workspace,
                               stream);
     t_inject = inject;
+    maybe_dump_block("mixed", hidden, stream);
+    maybe_dump_block("inject", inject, stream);
 }
 
 // Scatters a block output into the residual streams with the gates the mix kept.
@@ -161,7 +181,10 @@ void combine_into(const Tensor& block_output, Tensor& residual, cudaStream_t str
     if (t_inject.data == nullptr || t_inject.ne[1] != residual.ne[1]) {
         throw std::logic_error("qwen4exp: combine without a matching mix");
     }
+    maybe_dump_block("blockout", block_output, stream);
     ops::hyper_connection_combine(block_output, t_inject, residual, stream);
+    maybe_dump_block("combined", residual, stream);
+    g_dump_block += 1;
     t_inject = Tensor{};
 }
 
@@ -236,9 +259,11 @@ void Variant::layer_prologue(const ModelView& model, int layer, Tensor& residual
     ops::NgramPleColumns ple_columns{columns.ids, columns.segment_begin, columns.slots,
                                      columns.segment_last};
     ops::NgramPleState state{ple_state->history, ple_state->conv_state};
+    maybe_dump_block("ple_in", residual, stream);
     ops::ngram_ple_forward(residual, ple_columns, model.ple.hash, model.ple.table, model.ple.op,
                            state, kStreams, TextConfig::ple_conv_kernel,
                            TextConfig::ple_conv_dilation, kEps, workspace, stream);
+    maybe_dump_block("ple_out", residual, stream);
 }
 
 NgramPleStatePoolSpec Variant::ple_state_spec(std::int32_t slot_count) {
@@ -311,6 +336,7 @@ void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeig
     Tensor flat_hidden        = hidden.view({kHidden, tokens});
     Tensor fused = workspace.alloc(DType::BF16, {TextConfig::gdn_projection_rows, tokens});
     ops::linear(flat_hidden, weights.query_key_value_z, fused, kPolicy, workspace, stream);
+    maybe_dump_block("gdn_fused", fused, stream);
     Tensor qkv_flat  = qkv.view({TextConfig::convolution_dim, tokens});
     Tensor gate_flat = output_gate.view({TextConfig::value_dim, tokens});
     ops::extract_bf16_columns(fused, 0, qkv_flat, stream);
@@ -333,6 +359,7 @@ void Variant::gdn_input_projection_snapshot(
     ops::causal_conv1d_silu_snapshot(projected, conv_weight, conv_states, valid_columns,
                                      initial_slot, snapshot_base_slot, convolved, stream);
     Tensor convolved_flat = convolved.view({TextConfig::convolution_dim, tokens});
+    maybe_dump_block("gdn_conv", convolved_flat, stream);
     Tensor query_flat     = query.view({TextConfig::key_dim, tokens});
     Tensor key_flat       = key.view({TextConfig::key_dim, tokens});
     Tensor value_flat     = value.view({TextConfig::value_dim, tokens});
@@ -354,7 +381,9 @@ void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, 
                                     cudaStream_t stream) {
     auto scope    = workspace.scope();
     Tensor output = workspace.alloc(DType::BF16, {kHidden, hidden.ne[1]});
+    maybe_dump_block("gdn_final", hidden, stream);
     ops::linear(hidden, weight, output, kPolicy, workspace, stream);
+    maybe_dump_block("gdn_out", output, stream);
     combine_into(output, residual, stream);
 }
 
@@ -371,6 +400,9 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor&,
     Tensor a = rows_of(ab, 0, heads, workspace, stream);
     Tensor b = rows_of(ab, heads, heads, workspace, stream);
     ops::gdn_gating(a, b, weights.a_log, weights.dt_bias, g, beta, stream);
+    maybe_dump_block("gdn_ab", ab, stream);
+    maybe_dump_block("gdn_g", g, stream);
+    maybe_dump_block("gdn_beta", beta, stream);
 }
 
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,

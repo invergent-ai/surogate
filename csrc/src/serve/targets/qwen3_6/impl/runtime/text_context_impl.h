@@ -1152,7 +1152,7 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     Tensor on = workspace_recipe::gdn_normalized_output<TextConfig>(work_, T).view(
         {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
     if (sub_timing) { sub_lap(ftimer.g_scan, sub_scan); }
-    ops::gated_rmsnorm(o, *w.gdn_norm, z, kCfg.rms_eps, on, s);
+    ops::gated_rmsnorm(o, *w.gdn_norm, z, kCfg.rms_eps, gdn_output_gate<Variant>(), on, s);
     if (sub_timing) { sub_lap(ftimer.g_norm, sub_norm); }
 
     Variant::gdn_output_projection(on.view({kCfg.value_dim, T}), *w.out_proj, x, ph, work_, s);
@@ -1600,7 +1600,7 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                 Tensor on = workspace_recipe::gdn_normalized_output<TextConfig>(work_, total)
                                 .view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, total});
                 if (timing) { lap(timer.begin, timer.g_scan, acc_g_scan); cudaEventRecord(timer.begin, s); }
-                ops::gated_rmsnorm(o, *gdn.gdn_norm, z, kCfg.rms_eps, on, s);
+                ops::gated_rmsnorm(o, *gdn.gdn_norm, z, kCfg.rms_eps, gdn_output_gate<Variant>(), on, s);
                 if (timing) { lap(timer.begin, timer.g_norm, acc_g_norm); cudaEventRecord(timer.begin, s); }
                 Variant::gdn_output_projection(on.view({kCfg.value_dim, total}), *gdn.out_proj, x,
                                                Phase::Prefill, work_, s);
@@ -1983,7 +1983,7 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
                 }
                 Tensor on = workspace_recipe::gdn_normalized_output<TextConfig>(work_, total)
                                 .view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, total});
-                ops::gated_rmsnorm(o, *gdn.gdn_norm, z, kCfg.rms_eps, on, s);
+                ops::gated_rmsnorm(o, *gdn.gdn_norm, z, kCfg.rms_eps, gdn_output_gate<Variant>(), on, s);
                 Variant::gdn_output_projection(on.view({kCfg.value_dim, total}), *gdn.out_proj, x,
                                                Phase::Prefill, work_, s);
             }

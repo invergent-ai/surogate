@@ -313,6 +313,8 @@ def materialize(source: GgufSource, name: str, device: torch.device) -> bytes:
         if leaf == "dt_bias":
             return f32_bytes(_untile_v_heads(source.float32(blk + "ssm_dt.bias").reshape(inv.GDN_VALUE_HEADS), 0), (inv.GDN_VALUE_HEADS,))
         if leaf == "convolution":
+            # The conv kernel reads weight[tap * C + c] (tap-major, channel fastest), so the
+            # GGUF's (10240, 4) is transposed; the value channels are re-ordered like the rows.
             conv = source.float32(blk + "ssm_conv1d.weight").T  # (4, 10240)
             key_channels = 2 * inv.GDN_KEY_DIM
             conv = np.concatenate([conv[:, :key_channels], _untile_v(conv[:, key_channels:], 1)], axis=1)

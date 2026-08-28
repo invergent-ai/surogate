@@ -169,3 +169,68 @@ phase 3 = PP across 8 GPUs; phase 4 = EP measured against PP.
   did). Scale rows that are not 16-byte aligned are now staged in 8-byte pieces (both W8
   prefill kernels; the 35B geometry keeps its 16-byte path). Build + launch-blocking probe
   chained in the background.
+- **First end-to-end serve of Qwen3.8-Flash-Next (2026-08-28):** loads in 126 s, no faults,
+  generates tokens — but the text is garbage ("Ken Ken Ken…"), so the forward has a semantic
+  bug. Parity harness: `SUROGATE_SERVE_DUMP_RESIDUAL=<dir>` (Variant, debug-only) dumps the
+  residual streams before every layer and the final mixed hidden of the first forwards
+  (`compare_dumps.py` prints per-layer stats); llama.cpp's `llama-eval-callback` (built in
+  `study/llama.cpp-master/build/bin`) prints every tensor's sum for the same templated prompt
+  (`<|im_start|>user\nThe capital of France is<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n`,
+  17 tokens, identical ids from the HF tokenizer and `llama-tokenize`). Comparison in
+  progress: engine dump before layer L ↔ llama.cpp `l_last-(L-1)`, layer 0 ↔ `hc_init`.
+- Parity localisation (2026-08-28): `hc_init` matches llama.cpp exactly (token 0 stream 0
+  `[-0.0054, 0.0036, 0.0000]`, sums 45.28 vs 45.08), the residual after layer 0 already differs
+  (engine sum 59.47 vs `l_last-0` 54.39; token-0 stream-0 `[-0.0045, 0.0060, 0.0075]` vs
+  `[-0.0062, 0.0043, -0.0023]`) and layer 1 diverges massively (74.06 vs 32.14). Token 0 is a
+  clean single-token unit test (no cross-token dependence), so the Variant now dumps the
+  block intermediates too (`f<N>_L<L>_{mixer,mlp}_{mixed,inject,blockout,combined}.bin`,
+  first two forwards, layers 0-1). llama.cpp reference for token 0 of layer 0: attention-side
+  `hc_mixed-0` `[-0.2837, 0.4208, 0.0000 … 0.5738, -1.5387, -1.9012]` (sum 1895.9), attention
+  `hc_inject-0` logits `[-18.04, -18.65, -11.47, -17.88]`, `linear_attn_out-0`
+  `[-0.0390, 0.0326, -0.1039 … -0.0458, 0.0117, 0.2767]`, MLP-side `hc_mixed-0`
+  `[-0.2214, 0.3401, -0.6444 … -0.0265, -0.8906, 0.7217]`, MLP `hc_inject-0`
+  `[-41.57, -19.83, -6.72, -22.50]`, `ffn_out-0` `[0.0526, -0.0239, 0.0497 … -0.0338, 0.0537, 0.0255]`
+  (from `bench/oracle_eval.txt` in the scratchpad; llama.cpp's mix algebra is in
+  `study/llama.cpp-master/src/models/qwen4exp.cpp` `build_hc_mix`: per-stream RMS, folded
+  gamma over all streams, `lo = silu(down·xn / hc)`, `gate = sigmoid(up·lo)`,
+  `mixed = mean_s(xn ⊙ gate)`, `inject = w_inject·xn`, combine `x += out ⊗ 2σ(inject/hc)`).
+- Per-block dumps (2026-08-28): the engine's layer-0 attention-side mix and inject gates match
+  llama.cpp exactly (`mixed` `[-0.2812, 0.4219, 0 … 0.574, -1.539, -1.906]`, gates
+  `[0.0218, 0.0187, 0.1077, 0.0226]` = `2σ(logit/4)` of llama's logits) and the combine is
+  self-consistent (`-0.0054 + 0.0218·out`), so the hyper-connection op is right; a NumPy
+  re-derivation from the GGUF (`hc_reference.py` in the scratchpad) reproduces llama.cpp's
+  values too. **The GDN block output is wrong**: token 0 `[0.039, 0.106, 0.346 … 0.301]` vs
+  `linear_attn_out-0` `[-0.039, 0.033, -0.104 … 0.277]`. First confirmed cause: the family's
+  three `gated_rmsnorm` call sites always applied the SiLU output gate — Flash-Next's GDN gates
+  with the sigmoid (`output_gate_type: sigmoid`, llama.cpp `build_norm_gated`). The gate is now a
+  `requires`-probed Variant policy (`Variant::gdn_output_gate`, family default SiLU,
+  `residual_policy.h::gdn_output_gate<Variant>()`); rebuild + dump rerun in flight to see whether
+  the block output now matches or whether the 3:1 value/key head pairing (converter un-tiles
+  llama.cpp's tiled V order to HF grouped order; kernel pairs value head h with key head
+  ⌊h/3⌋) hides a second bug.
+- With the sigmoid gate the GDN block output changed but still differs (token 0
+  `[-0.117, -0.019, -0.158 … 0.231]` vs `[-0.039, 0.033, -0.104 … 0.277]`), so a second defect
+  sits in the GDN chain. A NumPy re-derivation of the **whole layer 0 for token 0** from the
+  GGUF now reproduces llama.cpp stage by stage (`gdn_reference.py`, `mlp_reference.py` in the
+  scratchpad; to be folded into a repo parity tool): qkv/z projection, conv+SiLU, α/β/g
+  gating, delta rule with llama.cpp's *tiled* pairing (value head h ↔ key head h mod 16 —
+  the converter's un-tiling to HF grouped order, key head ⌊h/3⌋, is the equivalent
+  convention the kernel uses), sigmoid-gated RMSNorm, out-projection
+  (`[-0.039, 0.034, -0.104 … 0.277]`), combine, MLP-side mix + inject, softmax router
+  top-10 `[136, 317, 77, 257, 175, 414, 2, 373, 242, 368]` (weights 0.246 … 0.067),
+  routed experts (`ffn_moe_out` `[0.065, -0.032, 0.032]`), sigmoid-gated shared expert,
+  `ffn_out` `[0.0545, -0.0226, 0.0504]`, layer output stream 0 `[-0.0062, 0.0044, -0.0023]`.
+  The Variant dumps every GDN stage (`gdn_fused`, `gdn_ab`, `gdn_g`, `gdn_beta`, `gdn_final`,
+  `gdn_out`) so the first mismatching stage can be read off directly.
+- Conv-layout detour (2026-08-28, resolved as a non-bug): the stage dumps match the CPU
+  reference through the fused qkv/z projection and the α/β/g gating and diverge at the
+  gated-norm output, whose token-0 value is ∝ the direction of the convolved value channels,
+  so the convolution weight layout was suspected: the op header documents the weight as
+  `[C,4]` while the bindings declare ne `{4, C}`. The kernel is the authority: it reads
+  `weight[tap*C + c]` (tap-major, channel fastest) and the 35B recipe writes
+  `Transpose(Reshape(conv, (C,4)), (1,0))` — exactly what the Flash-Next converter already
+  wrote. A channel-major patch made the output *worse* and was reverted (artifact re-patched
+  in place from the GGUF, bit-exact; `verify_flash_artifact.py` now checks the conv object).
+  Still open: something between the conv and the gated norm (or the norm itself); next is a
+  full-vector, per-head comparison of `gdn_final` and `gdn_fused` (`compare_stage.py`) rather
+  than first/last-3 spot checks.
