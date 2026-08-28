@@ -160,7 +160,9 @@ card at every layer boundary and at the output.
 | 2 stages, pipelined (2 groups) | 8 | 128/512 | 68.3 | 4.2 s |
 | 2 stages, 1 user | 1 | 512/128 | 13.1 | 4.3 s |
 | llama.cpp 8× 5090 `--split-mode layer` | 1 / 16 / 64 | 512/128 | 39.3 / 39.1 / 24.7 | 0.95 s / 86 s / 311 s |
-| 8 stages (all cards) | 1 / 16 / 64 | 512/128 | (running) | |
+| 4 stages (GPUs 4-7), shared host pool | 16 | 512/128 | **79.7** | **1.3 s** |
+| 8 stages (all cards), shared host pool, 8 groups | 1 / 16 | 512/128 | 4.3 / 32.8 | 14.3 s / 14.1 s |
+| 8 stages, per-socket pools, width-following groups | 1 / 16 / 64 | 512/128 | (running) | |
 
 Reading so far: two stages in lockstep already double the 8-user throughput because each
 stage's pool holds twice the share of its experts; the single-stream case runs the stages

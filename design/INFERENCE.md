@@ -1101,3 +1101,13 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   host path does not. The 2× over one card is the residency effect. Two A/Bs isolate the
   overlap and are queued after the 8-card runs: split off (GPU + PCIe only), and a
   cross-socket pair (GPUs 3+4) with per-socket pools.
+- **First 8-card and 4-card Flash-Next numbers** (2026-08-28, C2 binary, shared host pool,
+  512/128): 8 stages — 1 user 4.3 tok/s / TTFT 14.3 s; 16 users 32.8 / 14.1 s (32 completions,
+  admission timeouts); 64 users did not fit (runtime reservation 7.6 GB vs 4.9 GB free beside
+  the 14.6 GiB pool and 64-lane graphs). **4 stages on GPUs 4-7, 16 users: 79.7 tok/s, TTFT
+  1.3 s, 65 completions, 0 errors — 2.4× one card.** Reading: with 8 groups at 16 users a
+  round carries 2 lanes, so every step pays a full round's fixed costs eight times over, and
+  every stage's host round queues on the single shared pool; 4 stages put 4 lanes per round
+  on one socket. Fixes queued: groups follow the round's width (a minimum lane count per
+  group, `SUROGATE_SERVE_PIPELINE_MIN_LANES`, default 4), 2,000 slots at 64 lanes, and the
+  per-socket pools (building now).
