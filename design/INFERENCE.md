@@ -1002,3 +1002,14 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   with the last stage's samples after every round (`Program::replace_pending_tokens`).
   Lockstep: no overlap yet (step C). First test running: greedy parity of a 2-stage pipeline
   on GPUs 2+3 against one device, CPU split off so the gather is deterministic.
+- First 2-stage run (2026-08-28, GPUs 2+3, layers [0,24) / [24,48), CPU split off): the stage
+  programs construct, capture their graphs, and the served answers are correct ('Paris',
+  the primes identical to one device; the ocean/sky sentences equal a previous single-device
+  run's — the single-device path itself varies run to run, control queued). Two defects on
+  the way: kernel attributes (`cudaFuncSetAttribute` for dynamic shared memory) were set once
+  per process under function-local statics, so the second device's launches failed with
+  `cudaErrorInvalidValue` — now once per (device, kernel) via
+  `ops/kernel/func_attribute.cuh` (15 sites); and the driver's token propagation refused
+  mixed-round results, which carry one token per row and no counts. Lockstep cost at one
+  user: 4.3 tok/s against 11.5 on one device (each stage pays the full per-round fixed cost
+  and the stages run one after the other) — step C's overlap is what pipelining is for.
