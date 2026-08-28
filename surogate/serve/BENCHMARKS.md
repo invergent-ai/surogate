@@ -640,8 +640,15 @@ yet. llama.cpp upstream master (added `qwen4exp` this week; CUDA build at
 | | 32 | 28.8 | 115 | 132 s |
 | 1× 5090, experts + PLE table on CPU (`-ot exps=CPU`), 32 threads | 1 | 7.1 | 29 | 2.0 s |
 | | 16 | 16.3 | 65 | 29 s |
+| **surogate serve v0**, 1× 5090, experts + PLE table zero-copy from pinned host (no cache, no CPU compute) | 1 | 5.2 | 21 | 1.79 s |
+| | 16 | 7.6 | 30 | 15.1 s |
 
 Both configurations answer the probes correctly (`'Paris'`, `'2, 3, and 5'`).
+The engine row (2026-08-28, parity with llama.cpp verified stage by stage, see
+`design/INFERENCE.md`) is the zero-copy v0: the MoE kernels dereference the
+pinned host bank row by row over PCIe, which `nsys` shows is 95 % of decode at
+4.7–12 GB/s effective. The expert slot cache (bulk gather at ~50 GB/s, hits free)
+is the first phase-2 step; the CPU expert compute split is the second.
 The 8-GPU number is the interesting one: eight cards holding every weight
 resident produce *less* aggregate throughput at 32 users than at one, because
 layer split without micro-batch pipelining serialises the cards and the

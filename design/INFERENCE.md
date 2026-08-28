@@ -35,7 +35,7 @@ phase 3 = PP across 8 GPUs; phase 4 = EP measured against PP.
 | Target `targets/qwen4exp/` (package, bindings, host bank, variant, registry) | serves with parity (2026-08-28) | model_id `qwen3.8-flash-next`, weights_id `w8-hc-v1`, target key `qwen4exp`; experts and the PLE table live in pinned, device-mapped host memory and the kernels read them zero-copy (v0) |
 | Expert access v0: zero-copy reads from the pinned host bank (`impl/load/host_bank.*`) | written with the target | no staging copies at all in v0; the device slot cache and CPU expert compute come in phase 2 |
 | Parity vs llama.cpp | done 2026-08-28 | token-0 stages within BF16 noise of the CPU reference, `l_last-0/1/2` match, answers `Paris` / 2,3,5 / ocean; defects were the SiLU gate (4aaa07fc) and the RMSNorm kernels' gate load (see log) |
-| First throughput row (zero-copy experts v0) | measuring | users=1: 4.9 tok/s decode, prefill 10 tok/s, TTFT 1.3 s (128-token prompts); 32-user run in flight; llama.cpp 1×5090 CPU-MoE is 7.1 @1 / 16.3 @32 |
+| First throughput row (zero-copy experts v0, board shape 512/128) | done 2026-08-28 | users=1: 5.2 decode / 21 prefill tok/s, TTFT 1.79 s; users=16: 7.6 / 30, TTFT 15.1 s; (128/128: 4.9 @1, 8.3 @16, 26.6 @32). llama.cpp 1×5090 CPU-MoE: 7.1 / 29 @1, 16.3 / 65 @16 |
 
 ## Next: phase 2 (single-GPU offload) — plan as of 2026-08-28
 
@@ -366,7 +366,9 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   Variant can resolve + gather before the expert kernels, then the target wiring
   (pool sized from free device memory, per-layer host banks), then measure.
 - Board-shape probe (512-token prompts / 128 new, zero-copy v0): users=1 decode 5.2 tok/s,
-  prefill 21 tok/s, TTFT 1.79 s (llama.cpp CPU-MoE: 7.1 / 29 / 2.0 s).
+  prefill 21 tok/s, TTFT 1.79 s (llama.cpp CPU-MoE: 7.1 / 29 / 2.0 s); users=16 decode 7.6 tok/s
+  aggregate, prefill 30 tok/s, TTFT 15.1 s (llama.cpp CPU-MoE: 16.3 / 65 / 29 s). v0 is below
+  the llama.cpp CPU-MoE bar at both points; the slot cache is the first move.
 - Round hook + target wiring written (2026-08-28, compiling object-only): `SparseMoeRoundHook`
   (`sparse_moe(..., hook)`) is called with the round's final ids after decode d2 / small-T s2 /
   prefill select_count of each token slice; `qwen4exp`'s `post_mixer` builds the pooled

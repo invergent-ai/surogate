@@ -13,6 +13,7 @@
 #include <vector>
 
 using namespace ninfer;
+using namespace ninfer::test;
 
 namespace {
 
@@ -67,8 +68,8 @@ HostBank make_bank() {
     return bank;
 }
 
-ops::Weight host_weight(std::byte* codes, std::byte* scales, std::int32_t rows, std::int32_t k) {
-    ops::Weight w{};
+Weight host_weight(std::byte* codes, std::byte* scales, std::int32_t rows, std::int32_t k) {
+    Weight w{};
     w.payload       = codes;
     w.qtype         = QType::W8G32_F16S;
     w.layout        = QuantLayout::RowSplit;
@@ -107,10 +108,10 @@ struct Fixture {
         void* mapped = nullptr;
         cuda_check(cudaHostGetDevicePointer(&mapped, bank.pinned, 0), "cudaHostGetDevicePointer");
         const std::ptrdiff_t shift = static_cast<std::byte*>(mapped) - bank.base();
-        const ops::Weight gate_up = host_weight(bank.gate_codes_plane() + shift,
+        const Weight gate_up = host_weight(bank.gate_codes_plane() + shift,
                                                 bank.gate_scales_plane() + shift,
                                                 kGeometry.routed_gate_rows(), kGeometry.hidden);
-        const ops::Weight down    = host_weight(bank.down_codes_plane() + shift,
+        const Weight down    = host_weight(bank.down_codes_plane() + shift,
                                                 bank.down_scales_plane() + shift,
                                                 kGeometry.routed_down_rows(), kGeometry.intermediate);
         host      = ops::expert_host_bank(kGeometry, gate_up, down);
