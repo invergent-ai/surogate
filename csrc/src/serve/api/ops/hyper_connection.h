@@ -61,6 +61,10 @@ void hyper_connection_mix(const Tensor& residual, const HyperConnectionWeights& 
  */
 void hyper_connection_combine(const Tensor& block_output, const Tensor& inject, Tensor& residual,
                               cudaStream_t stream);
+/// As above with an FP32 [hidden, T] term added to `block_output` before the scatter (a partial
+/// computed elsewhere, e.g. on the host, read through a device-mapped pointer); null = none.
+void hyper_connection_combine(const Tensor& block_output, const float* extra, const Tensor& inject,
+                              Tensor& residual, cudaStream_t stream);
 
 /// residual[s*hidden+d, t] = source[d, t] for every stream s (the embedding entry point).
 void broadcast_streams(const Tensor& source, std::int32_t streams, Tensor& residual,

@@ -43,6 +43,12 @@ constexpr auto kPolicy           = ops::LinearPolicy::A16Only;
 // through a thread-local handle rather than a family-visible parameter.
 constexpr std::size_t kInjectScratchBytes = 1u << 20; // [4 streams, T] FP32 up to T = 65536
 thread_local Tensor t_inject;
+// A host-computed partial of the block being executed: consumed by the next combine.
+struct PendingPartial {
+    const float* device_alias = nullptr;
+    cudaEvent_t join          = nullptr;
+};
+thread_local PendingPartial t_partial;
 
 struct InjectScratch {
     void* data        = nullptr;
@@ -99,6 +105,9 @@ struct ExpertSlotCache {
     std::uint32_t cpu_share_q16 = 0;
     std::int32_t cpu_max_tokens = 0;
     std::unique_ptr<ops::CpuExpertPool> cpu_pool;
+    cudaStream_t cpu_stream = nullptr; // side stream: the host round overlaps the GPU experts
+    cudaEvent_t fork_event  = nullptr;
+    cudaEvent_t join_event  = nullptr;
     void* cpu_jobs_memory = nullptr;
     ops::ExpertCpuJobList cpu_jobs;
     // Pinned host staging: activations, jobs, count, and the FP32 partial the GPU adds back.
@@ -130,24 +139,28 @@ struct ExpertSlotCache {
         cache.cpu_pool->run(entry->cpu_bank, round);
     }
 
-    void cpu_round(Layer& entry, const Tensor& x, Tensor& destination, cudaStream_t stream) {
+    void cpu_round(Layer& entry, const Tensor& x, Tensor& /*destination*/, cudaStream_t stream) {
         const std::int32_t hidden = ops::kSparseMoeFlashNextGeometry.hidden;
         const std::int32_t tokens = static_cast<std::int32_t>(x.numel() / hidden);
         entry.round_tokens        = tokens;
-        // Activations and the job list to the host, the host computes, the partial is added.
+        // Fork the host round onto the side stream: it overlaps the GPU expert kernels of this
+        // block, and the block's combine joins it and adds the partial (v2 overlap).
+        CUDA_CHECK(cudaEventRecord(fork_event, stream));
+        CUDA_CHECK(cudaStreamWaitEvent(cpu_stream, fork_event, 0));
         CUDA_CHECK(cudaMemcpyAsync(x_host, x.data,
                                    static_cast<std::size_t>(hidden) * tokens * sizeof(std::uint16_t),
-                                   cudaMemcpyDeviceToHost, stream));
+                                   cudaMemcpyDeviceToHost, cpu_stream));
         CUDA_CHECK(cudaMemcpyAsync(jobs_tokens_host, cpu_jobs.tokens.data, cpu_jobs.tokens.bytes(),
-                                   cudaMemcpyDeviceToHost, stream));
+                                   cudaMemcpyDeviceToHost, cpu_stream));
         CUDA_CHECK(cudaMemcpyAsync(jobs_experts_host, cpu_jobs.experts.data, cpu_jobs.experts.bytes(),
-                                   cudaMemcpyDeviceToHost, stream));
+                                   cudaMemcpyDeviceToHost, cpu_stream));
         CUDA_CHECK(cudaMemcpyAsync(jobs_weights_host, cpu_jobs.weights.data, cpu_jobs.weights.bytes(),
-                                   cudaMemcpyDeviceToHost, stream));
+                                   cudaMemcpyDeviceToHost, cpu_stream));
         CUDA_CHECK(cudaMemcpyAsync(jobs_count_host, cpu_jobs.count.data, sizeof(long long),
-                                   cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaLaunchHostFunc(stream, &ExpertSlotCache::run_cpu_round, &entry));
-        ops::expert_cpu_partial_add(out_device_alias, destination, stream);
+                                   cudaMemcpyDeviceToHost, cpu_stream));
+        CUDA_CHECK(cudaLaunchHostFunc(cpu_stream, &ExpertSlotCache::run_cpu_round, &entry));
+        CUDA_CHECK(cudaEventRecord(join_event, cpu_stream));
+        t_partial = PendingPartial{static_cast<const float*>(out_device_alias), join_event};
     }
 
     static void resolve_round(void* context, const Tensor& ids, const Tensor& alpha,
@@ -286,6 +299,9 @@ ExpertSlotCache& expert_slot_cache_for_current_device() {
             CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&cache.jobs_weights_host), capacity * sizeof(float), cudaHostAllocPortable));
             CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&cache.jobs_count_host), sizeof(long long), cudaHostAllocPortable));
             cache.cpu_pool = std::make_unique<ops::CpuExpertPool>(geometry);
+            CUDA_CHECK(cudaStreamCreateWithFlags(&cache.cpu_stream, cudaStreamNonBlocking));
+            CUDA_CHECK(cudaEventCreateWithFlags(&cache.fork_event, cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&cache.join_event, cudaEventDisableTiming));
             std::fprintf(stderr, "qwen4exp: CPU expert split enabled: %.0f%% of misses on %u host threads\n",
                          100.0 * fraction, cache.cpu_pool->threads());
         }
@@ -430,7 +446,14 @@ void combine_into(const Tensor& block_output, Tensor& residual, cudaStream_t str
         throw std::logic_error("qwen4exp: combine without a matching mix");
     }
     maybe_dump_block("blockout", block_output, stream);
-    ops::hyper_connection_combine(block_output, t_inject, residual, stream);
+    if (t_partial.device_alias != nullptr) {
+        // Join the host round (side stream) before the combine reads its partial.
+        CUDA_CHECK(cudaStreamWaitEvent(stream, t_partial.join, 0));
+        ops::hyper_connection_combine(block_output, t_partial.device_alias, t_inject, residual, stream);
+        t_partial = PendingPartial{};
+    } else {
+        ops::hyper_connection_combine(block_output, t_inject, residual, stream);
+    }
     maybe_dump_block("combined", residual, stream);
     g_dump_block += 1;
     t_inject = Tensor{};

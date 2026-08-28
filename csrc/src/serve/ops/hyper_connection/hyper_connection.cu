@@ -118,7 +118,8 @@ __global__ void finish_kernel(const __nv_bfloat16* __restrict__ residual,
     }
 }
 
-__global__ void combine_kernel(const __nv_bfloat16* __restrict__ block_output,
+__global__ void combine_kernel(const float* __restrict__ extra,
+                               const __nv_bfloat16* __restrict__ block_output,
                                const float* __restrict__ inject, int hidden, int streams,
                                std::int64_t count, __nv_bfloat16* __restrict__ residual) {
     const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -129,8 +130,9 @@ __global__ void combine_kernel(const __nv_bfloat16* __restrict__ block_output,
     const int stream        = within / hidden;
     const int d             = within - stream * hidden;
     const float weight      = inject[tok * streams + stream];
-    const float value       = __bfloat162float(residual[i]) +
-                        weight * __bfloat162float(block_output[tok * hidden + d]);
+    float block = __bfloat162float(block_output[tok * hidden + d]);
+    if (extra != nullptr) { block += extra[tok * hidden + d]; }
+    const float value = __bfloat162float(residual[i]) + weight * block;
     residual[i] = __float2bfloat16_rn(value);
 }
 
@@ -251,6 +253,11 @@ void hyper_connection_mix(const Tensor& residual, const HyperConnectionWeights& 
 
 void hyper_connection_combine(const Tensor& block_output, const Tensor& inject, Tensor& residual,
                               cudaStream_t stream) {
+    hyper_connection_combine(block_output, nullptr, inject, residual, stream);
+}
+
+void hyper_connection_combine(const Tensor& block_output, const float* extra, const Tensor& inject,
+                              Tensor& residual, cudaStream_t stream) {
     const std::int32_t width   = residual.ne[0];
     const std::int32_t tokens  = residual.ne[1];
     const std::int32_t streams = inject.ne[0];
@@ -263,6 +270,7 @@ void hyper_connection_combine(const Tensor& block_output, const Tensor& inject, 
     require_contiguous(inject, DType::FP32, streams, tokens, "inject");
     const std::int64_t count = static_cast<std::int64_t>(width) * tokens;
     combine_kernel<<<grid_for(count), kThreads, 0, stream>>>(
+        extra,
         static_cast<const __nv_bfloat16*>(block_output.data),
         static_cast<const float*>(inject.data), hidden, streams, count,
         static_cast<__nv_bfloat16*>(residual.data));
