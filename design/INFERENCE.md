@@ -1050,3 +1050,9 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   sees exactly one mixed result), the other groups run decode-only rounds, and the software
   pipeline over stages is the same as C1's. Measurements queued: one device vs lockstep
   (groups=1) vs pipelined at 8 users on the decode-heavy 128/512 shape, C1 then C2.
+- Eager 2-stage path verified after the Marlin fix (2026-08-28): the traced CLI run on GPUs
+  4+5 generates through both stages (deferred start, one prefill chunk per stage, decode
+  rounds stage 0 → 1), exit 0. C1 at 8 users on 128/512 (GPUs 2+3): one device 36.9 tok/s;
+  **two stages in lockstep 72.5 tok/s** — 2× before any overlap, because each stage's pool
+  caches only its own 24 layers' experts (3,000 slots per stage = twice the resident set),
+  so misses and host rounds halve per stage. The pipelined number follows.
