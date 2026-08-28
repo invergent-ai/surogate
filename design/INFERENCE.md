@@ -816,3 +816,12 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   the best 16-user point (33.5 / 12.3 s without the prefill split; 29.5 / 5.9 s at prefill
   0.7): at concurrency the lower prefill share keeps the host off the critical path of the
   mixed rounds. 64 users (corruption check), 0.8 @1 and 0.7 @16 follow.
+- 64 users with the prefill split (2026-08-28): **clean** — 0 fatals, 0 errors, 66
+  completions — so the stable contexts hold. But 32.7 decode / 164 prefill / TTFT 28.9 s
+  against 86.5 / 346 / 18.6 s without the prefill share, and the cause is in the slices fix,
+  not the split: the staging copies stayed on the side stream and the main stream waited on
+  a `copied_event` recorded after them — in stream order that event sits behind the previous
+  layer's host function, so every layer's GPU work waited for the previous layer's host round
+  and the v2 overlap was gone (the 16-user 36.0 was reached despite it). Fix (this commit):
+  the two copies run on the main stream (stream order alone protects the job list from the
+  next resolve), only the host function is forked. Rerun at 1 / 16 / 64 users follows.

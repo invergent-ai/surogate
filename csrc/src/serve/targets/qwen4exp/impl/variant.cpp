@@ -203,17 +203,18 @@ struct ExpertSlotCache {
         entry.round_tokens = tokens;
         SliceContext& slice = slice_context(entry, offset, tokens);
         const std::size_t column0 = static_cast<std::size_t>(offset) * hidden;
-        CUDA_CHECK(cudaEventRecord(fork_event, stream));
-        CUDA_CHECK(cudaStreamWaitEvent(cpu_stream, fork_event, 0));
+        // The staging copies run on the main stream: they are small, and stream order then
+        // guarantees the next slice's resolve cannot rewrite the job list before it is copied
+        // — without making the main stream wait behind the side stream (which would queue it
+        // behind the previous layer's host round and serialise host and GPU).
         CUDA_CHECK(cudaMemcpyAsync(x_host + column0, x.data,
                                    static_cast<std::size_t>(hidden) * tokens * sizeof(std::uint16_t),
-                                   cudaMemcpyDeviceToHost, cpu_stream));
-        // The job list is one contiguous device block mirrored by one pinned block. The main
-        // stream waits for the copy before the next slice's resolve may rewrite the list.
+                                   cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaMemcpyAsync(jobs_host_block, cpu_jobs_memory, jobs_block_bytes,
-                                   cudaMemcpyDeviceToHost, cpu_stream));
-        CUDA_CHECK(cudaEventRecord(copied_event, cpu_stream));
-        CUDA_CHECK(cudaStreamWaitEvent(stream, copied_event, 0));
+                                   cudaMemcpyDeviceToHost, stream));
+        // Fork only the host function onto the side stream so it overlaps the GPU experts.
+        CUDA_CHECK(cudaEventRecord(fork_event, stream));
+        CUDA_CHECK(cudaStreamWaitEvent(cpu_stream, fork_event, 0));
         CUDA_CHECK(cudaLaunchHostFunc(cpu_stream, &ExpertSlotCache::run_cpu_round, &slice));
         CUDA_CHECK(cudaEventRecord(join_event, cpu_stream));
         entry.round_offset = offset + tokens;
