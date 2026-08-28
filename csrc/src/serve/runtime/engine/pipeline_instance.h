@@ -17,6 +17,7 @@
 #include "runtime/contract/types.h"
 #include "runtime/engine/request_memory.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <stdexcept>
@@ -88,6 +89,12 @@ public:
         }
         boundary_bytes_ = stages_.front()->program->stage_boundary_bytes();
         trace_ = std::getenv("SUROGATE_SERVE_PIPELINE_TRACE") != nullptr;
+        // A group narrower than this is not worth a round of its own (every round pays the
+        // fixed costs on every stage): the group count follows the round's width.
+        if (const char* raw = std::getenv("SUROGATE_SERVE_PIPELINE_MIN_LANES"); raw != nullptr && *raw != '\0') {
+            const long parsed = std::strtol(raw, nullptr, 10);
+            if (parsed >= 1 && parsed <= 128) { min_lanes_per_group_ = static_cast<std::uint32_t>(parsed); }
+        }
         // One host staging slot per (boundary, group): a stage's export of one group is parked
         // there while the stage moves on to the next group.
         slots_.resize(stages_.size() > 1 ? stages_.size() - 1 : 0);
@@ -271,24 +278,29 @@ private:
     // running meanwhile.
     void run_grouped_round(std::span<const std::uint32_t> prefill_lanes, std::span<const std::uint32_t> lanes,
                            std::span<const RoundBudget> budgets) {
-        std::vector<std::vector<std::uint32_t>> group_lanes(groups_);
-        std::vector<std::vector<RoundBudget>> group_budgets(groups_);
-        std::vector<std::vector<std::size_t>> group_rows(groups_);
+        // Groups for this round: as many as the stages, but never narrower than
+        // min_lanes_per_group_ (the partition is per round; every lane's state lives on every
+        // stage, so lanes may move between groups from round to round).
+        const std::uint32_t width_groups = static_cast<std::uint32_t>(std::max<std::size_t>(1, lanes.size() / min_lanes_per_group_));
+        const std::uint32_t groups       = std::max<std::uint32_t>(1, std::min(groups_, width_groups));
+        std::vector<std::vector<std::uint32_t>> group_lanes(groups);
+        std::vector<std::vector<RoundBudget>> group_budgets(groups);
+        std::vector<std::vector<std::size_t>> group_rows(groups);
         for (std::size_t row = 0; row < lanes.size(); ++row) {
-            const std::uint32_t g = lanes[row] % groups_;
+            const std::uint32_t g = static_cast<std::uint32_t>(row) % groups;
             group_lanes[g].push_back(lanes[row]);
             group_budgets[g].push_back(budgets[row]);
             group_rows[g].push_back(row);
         }
         std::vector<std::uint32_t> active;
-        for (std::uint32_t g = 0; g < groups_; ++g) {
+        for (std::uint32_t g = 0; g < groups; ++g) {
             if (!group_lanes[g].empty()) { active.push_back(g); }
         }
         const bool mixed = !prefill_lanes.empty();
         if (mixed && active.empty()) {
             throw std::logic_error("pipeline mixed round needs decode lanes");
         }
-        const std::uint32_t mixed_group = mixed ? active.front() : groups_;
+        const std::uint32_t mixed_group = mixed ? active.front() : groups;
         const std::size_t N = stages_.size(), G = active.size();
         std::vector<RoundHandle> in_flight(N);
         std::vector<bool> in_flight_mixed(N, false);
@@ -386,6 +398,7 @@ private:
         if (trace_) { std::fprintf(stderr, "pipeline-trace: %s stage %zu columns %zu\n", op, stage, columns); }
     }
     std::uint32_t groups_      = 1;
+    std::uint32_t min_lanes_per_group_ = 4;
     std::size_t boundary_bytes_ = 0;
     std::vector<std::vector<std::vector<std::byte>>> slots_; // [boundary][group]
     std::vector<TokenId> assembled_tokens_;
