@@ -100,6 +100,13 @@ and the baseline run is queued.
   gated throughput probes did not run; rebuilt with the pool-before-KV-plan change and
   re-queued with `--kv-capacity auto` behind the ik_llama.cpp baseline and the GPU-1 35B
   probe (both need an uncontended host / GPU 1).
+- **ik_llama.cpp CPU-MoE baseline (2026-08-28, AVX-512 build, fused MoE default, `-ot exps=CPU`,
+  32 threads, 512/128):** users=1 decode 21.8 tok/s, prefill 87 tok/s, TTFT 1.8 s; users=16
+  decode 23.9, prefill 96, TTFT 30 s — 3× upstream llama.cpp's `--cpu-moe` (7.1 / 16.3) and
+  the new phase-2 bar. Caveat: the loadgen counted errors (10/21 at users=1, 4/27 at 16) that
+  the server log does not show — client timeouts (its default is short for 12-85 s requests);
+  rerun with a long timeout queued. Its answers came with `<think>` blocks (the fork ignores
+  `chat_template_kwargs.enable_thinking`), which does not change the throughput shape.
 5. **Prefill**: selective streaming of used experts per layer with whole-layer double
    buffering on a side stream.
 
