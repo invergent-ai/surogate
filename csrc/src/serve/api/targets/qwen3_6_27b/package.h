@@ -34,6 +34,9 @@ enum class WeightsProfile : std::uint8_t {
     Qwen38GroupwiseInt,
     Qwen36Nvfp4,
     Qwen38Nvfp4,
+    // Every language linear NVFP4, from the export that quantises them all (#86). Qwen38Nvfp4
+    // keeps the attention and GDN projections FP8 because its export does.
+    Qwen38Nvfp4All,
 };
 
 using Frontend       = qwen3_6::Frontend;
