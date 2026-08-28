@@ -1,4 +1,5 @@
 #include "ops/gdn_input_proj/fp8/fp8_gdn_input_plan.h"
+#include "ops/kernel/func_attribute.cuh"
 #include "ops/linear/fp8/fp8_cublaslt.h"
 
 #include "core/device.h"
@@ -30,10 +31,9 @@ void launch_mma(const Weight& weight, Tensor& qkv, Tensor& z, Fp8A8Workspace wor
                                    static_cast<__nv_bfloat16*>(z.data)};
 
     if constexpr (Sched::kSharedBytes > 48 * 1024) {
-        static const cudaError_t attribute = cudaFuncSetAttribute(
+        CUDA_CHECK(::ninfer::ops::set_func_attribute_per_device(
             fp8_mma_kernel<Geometry, Sched, FullTokens, Fp8IdentityEpilogue, Fp8GdnInputOutput>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, Sched::kSharedBytes);
-        CUDA_CHECK(attribute);
+            cudaFuncAttributeMaxDynamicSharedMemorySize, Sched::kSharedBytes));
     }
     fp8_mma_kernel<Geometry, Sched, FullTokens>
         <<<blocks, Sched::kThreads, Sched::kSharedBytes, stream>>>(

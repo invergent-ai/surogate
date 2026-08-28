@@ -1,4 +1,5 @@
 #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.h"
+#include "ops/kernel/func_attribute.cuh"
 
 #include "core/device.h"
 #include "ops/linear/fp8/fp8_a8_mma.cuh"
@@ -32,11 +33,10 @@ void launch_mma(const Weight& weight, Tensor& out, Fp8A8Workspace workspace, std
     const Fp8SwiGluOutput output{static_cast<__nv_bfloat16*>(out.data), kIntermediate};
 
     if constexpr (Sched::kSharedBytes > 48 * 1024) {
-        static const cudaError_t attribute = cudaFuncSetAttribute(
+        CUDA_CHECK(::ninfer::ops::set_func_attribute_per_device(
             fp8_mma_kernel<Geometry, Sched, FullTokens, Fp8IdentityEpilogue, Fp8SwiGluOutput,
                            Rows, true>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, Sched::kSharedBytes);
-        CUDA_CHECK(attribute);
+            cudaFuncAttributeMaxDynamicSharedMemorySize, Sched::kSharedBytes));
     }
     fp8_mma_kernel<Geometry, Sched, FullTokens, Fp8IdentityEpilogue, Fp8SwiGluOutput, Rows, true>
         <<<blocks, Sched::kThreads, Sched::kSharedBytes, stream>>>(

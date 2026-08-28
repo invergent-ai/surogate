@@ -1,4 +1,5 @@
 #include "ops/linear_add/fp8/fp8_linear_add_plan.h"
+#include "ops/kernel/func_attribute.cuh"
 #include "ops/linear/fp8/fp8_cublaslt.h"
 
 #include "core/device.h"
@@ -28,11 +29,10 @@ void launch_mma(const Weight& weight, Tensor& residual, Fp8A8Workspace workspace
     const Fp8ContiguousOutput destination{output, Geometry::kOutputRows};
 
     if constexpr (Schedule::kSharedBytes > 48 * 1024) {
-        static const cudaError_t attribute = cudaFuncSetAttribute(
+        CUDA_CHECK(::ninfer::ops::set_func_attribute_per_device(
             fp8_mma_kernel<Geometry, Schedule, FullTokens, Fp8AddResidualEpilogue,
                            Fp8ContiguousOutput>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, Schedule::kSharedBytes);
-        CUDA_CHECK(attribute);
+            cudaFuncAttributeMaxDynamicSharedMemorySize, Schedule::kSharedBytes));
     }
     fp8_mma_kernel<Geometry, Schedule, FullTokens>
         <<<blocks, Schedule::kThreads, Schedule::kSharedBytes, stream>>>(

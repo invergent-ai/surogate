@@ -1,5 +1,6 @@
 // ninfer::ops - split-KV GQA small-T launcher and unified route dispatcher.
 #include "ops/launcher/gqa_attention.h"
+#include "ops/kernel/func_attribute.cuh"
 
 #include "ops/common/math.h"
 #include "ops/kernel/gqa_attention_decode.cuh"
@@ -128,12 +129,11 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
         constexpr std::size_t kDynamicBytes =
             DynamicArena ? static_cast<std::size_t>(4 * KeyBlock * Geometry::HeadDim) : 0u;
         if constexpr (DynamicArena) {
-            static const cudaError_t attr = cudaFuncSetAttribute(
+            CUDA_CHECK(::ninfer::ops::set_func_attribute_per_device(
                 gqa_attention_decode_i8_tiled_kernel<Geometry, TokenTile, WarpsPerCta,
                                                      MinBlocksPerSm, KeyBlock, DynamicArena,
                                                      MultiBatch, Masked, CacheInput>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kDynamicBytes));
-            CUDA_CHECK(attr);
+                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kDynamicBytes)));
         }
         gqa_attention_decode_i8_tiled_kernel<Geometry, TokenTile, WarpsPerCta, MinBlocksPerSm,
                                              KeyBlock, DynamicArena, MultiBatch, Masked, CacheInput>

@@ -1,6 +1,7 @@
 // ninfer::ops - gqa_attention prompt-scale launcher: fill k/v at device
 // positions then launch causal attention over absolute cached history.
 #include "ops/launcher/gqa_attention.h"
+#include "ops/kernel/func_attribute.cuh"
 
 #include "ops/common/math.h"
 #include "ops/kernel/gqa_attention_prefill_bf16.cuh"
@@ -20,14 +21,10 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
     const Tensor& cache_k = cache.k_pages;
     const Tensor& cache_v = cache.v_pages;
     // Both dtype-specialized kernels exceed the default 48 KiB dynamic-smem ceiling.
-    static const cudaError_t attr_bf16 =
-        cudaFuncSetAttribute(gqa_attention_prefill_bf16_kernel<Geometry, Metadata>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaPrefillSmemBytes);
-    CUDA_CHECK(attr_bf16);
-    static const cudaError_t attr_i8 =
-        cudaFuncSetAttribute(gqa_attention_prefill_i8_kernel<Geometry, Metadata>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaPrefillI8SmemBytes);
-    CUDA_CHECK(attr_i8);
+    CUDA_CHECK(::ninfer::ops::set_func_attribute_per_device(gqa_attention_prefill_bf16_kernel<Geometry, Metadata>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaPrefillSmemBytes));
+    CUDA_CHECK(::ninfer::ops::set_func_attribute_per_device(gqa_attention_prefill_i8_kernel<Geometry, Metadata>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaPrefillI8SmemBytes));
 
     const auto tokens = static_cast<std::int32_t>(q.ne[2]);
     if (cache.dtype == DType::I8) {
@@ -45,10 +42,9 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
                 static_cast<const std::int32_t*>(positions.data), scale,
                 static_cast<__nv_bfloat16*>(out.data), tokens);
     } else if (cache.dtype == DType::FP8_E4M3FN) {
-        static const cudaError_t attr_fp8 = cudaFuncSetAttribute(
+        CUDA_CHECK(::ninfer::ops::set_func_attribute_per_device(
             gqa_attention_prefill_bf16_kernel<Geometry, Metadata, std::uint8_t>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaPrefillSmemBytes);
-        CUDA_CHECK(attr_fp8);
+            cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaPrefillSmemBytes));
         const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillBr)),
                                   static_cast<unsigned>(Geometry::QHeads), 1u);
         gqa_attention_prefill_bf16_kernel<Geometry, Metadata, std::uint8_t>
