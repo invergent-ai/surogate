@@ -166,6 +166,11 @@ and the baseline run is queued.
 - ik_llama.cpp's loadgen errors are `ServerDisconnectedError` (its server drops some streamed
   connections; nothing in its log) — the ok requests carry the throughput figure. Options
   `--expert-slots N` / `--cpu-moe-share F` (server + CLI) now cover both phase-2 knobs.
+- The first hit-rate diagnostic aborted: the readout did a synchronous copy inside the round
+  hook while the decode graph was being captured. Hooks run once at capture (replays never
+  call them), so the readout now skips capturing streams and is an eager-mode diagnostic
+  (`--no-cuda-graph`); the CPU round itself is captured properly (memcpy + host-function +
+  kernel nodes) and replays do call the host function.
 5. **Prefill**: selective streaming of used experts per layer with whole-layer double
    buffering on a side stream.
 
