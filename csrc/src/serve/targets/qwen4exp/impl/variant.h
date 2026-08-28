@@ -62,6 +62,8 @@ struct Variant {
                                Tensor& hidden, WorkspaceArena& workspace, cudaStream_t stream);
     static void post_mixer_norm(const Tensor& residual, const PostMixerWeights& weights,
                                 Tensor& hidden, WorkspaceArena& workspace, cudaStream_t stream);
+    /// Creates the device scratch the mix/combine pair shares; call before any graph capture.
+    static void prewarm_device_scratch();
     static constexpr bool has_layer_prologue = true;
     [[nodiscard]] static NgramPleStatePoolSpec ple_state_spec(std::int32_t slot_count);
     static void layer_prologue(const ModelView& model, int layer, Tensor& residual,

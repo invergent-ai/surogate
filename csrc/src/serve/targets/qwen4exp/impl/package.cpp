@@ -122,6 +122,7 @@ Package::create_program(const LoadedModel& model, SequencePlan&& plan, DeviceCon
     // The program captures its decode graphs at construction; the cuBLASLt route must own its
     // handle and workspace before any capture (plans themselves are host-side).
     ops::detail::bf16_cublaslt_prewarm();
+    detail::Variant::prewarm_device_scratch();
     return qwen3_6::create_program<detail::Variant>(
         model.impl_->data.runtime, model.impl_->weights_profile, std::move(plan), device);
 }

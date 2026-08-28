@@ -13,7 +13,9 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <mutex>
 #include <stdexcept>
+#include <unordered_map>
 #include <vector>
 
 #define NINFER_QWEN36_VARIANT    ::ninfer::targets::qwen4exp::detail::Variant
@@ -30,10 +32,26 @@ constexpr std::int32_t kLowRank  = TextConfig::hc_low_rank;
 constexpr float kEps             = TextConfig::rms_epsilon;
 constexpr auto kPolicy           = ops::LinearPolicy::A16Only;
 
-// The mix hook of a block computes the inject gates its output projection scatters with. Both
-// run on the same thread inside one arena scope of the family runtime, so the gates travel
+// The mix hook of a block computes the inject gates its output projection scatters with. The
+// family plans the hooks' scratch as transient, so the gates cannot live in the arena between
+// the two calls; they use a small device buffer created before any graph capture, and travel
 // through a thread-local handle rather than a family-visible parameter.
+constexpr std::size_t kInjectScratchBytes = 1u << 20; // [4 streams, T] FP32 up to T = 65536
 thread_local Tensor t_inject;
+
+struct InjectScratch {
+    void* data        = nullptr;
+    std::size_t bytes = 0;
+};
+
+InjectScratch& inject_scratch_for_current_device() {
+    static std::mutex mutex;
+    static std::unordered_map<int, InjectScratch> registry;
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    const std::lock_guard<std::mutex> lock(mutex);
+    return registry[device];
+}
 
 std::vector<GraphExecutionProfile>
 graph_profiles_through(std::uint32_t max_frontier, const std::vector<std::uint32_t>& ends) {
@@ -59,8 +77,7 @@ std::size_t plane_bytes(std::int32_t rows, std::int32_t tokens, DType dtype) {
 
 std::size_t mix_capacity(std::int32_t first, std::int32_t last) {
     return ops::hyper_connection_mix_workspace_capacity_bytes(kStreams, kHidden, kLowRank, first,
-                                                              last) +
-           plane_bytes(kStreams, last, DType::FP32);
+                                                              last);
 }
 
 std::size_t w8_capacity(std::int32_t rows, std::int32_t columns, std::int32_t first,
@@ -73,7 +90,13 @@ std::size_t w8_capacity(std::int32_t rows, std::int32_t columns, std::int32_t fi
 void mix_into(const Tensor& residual, const ops::HyperConnectionWeights& weights, Tensor& hidden,
               WorkspaceArena& workspace, cudaStream_t stream) {
     const std::int32_t tokens = residual.ne[1];
-    Tensor inject             = workspace.alloc(DType::FP32, {kStreams, tokens});
+    const InjectScratch& scratch = inject_scratch_for_current_device();
+    const std::size_t needed =
+        static_cast<std::size_t>(kStreams) * static_cast<std::size_t>(tokens) * sizeof(float);
+    if (scratch.data == nullptr || needed > scratch.bytes) {
+        throw std::logic_error("qwen4exp: inject scratch is missing or too small for this forward");
+    }
+    Tensor inject(scratch.data, DType::FP32, {kStreams, tokens});
     ops::hyper_connection_mix(residual, weights, kStreams, kEps, hidden, &inject, workspace,
                               stream);
     t_inject = inject;
@@ -114,10 +137,20 @@ std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t,
 
 void Variant::embed_residual(const ModelView& model, const Tensor& ids, Tensor& residual,
                              WorkspaceArena& workspace, cudaStream_t stream) {
+    // Transient: the broadcast consumes the embedding before anything else runs.
+    auto scope                = workspace.scope();
     const std::int32_t tokens = residual.ne[1];
     Tensor embedded           = workspace.alloc(DType::BF16, {kHidden, tokens});
     ops::embedding(ids, model.token_embedding, embedded, stream);
     ops::broadcast_streams(embedded, kStreams, residual, stream);
+}
+
+void Variant::prewarm_device_scratch() {
+    InjectScratch& scratch = inject_scratch_for_current_device();
+    if (scratch.data == nullptr) {
+        CUDA_CHECK(cudaMalloc(&scratch.data, kInjectScratchBytes));
+        scratch.bytes = kInjectScratchBytes;
+    }
 }
 
 void Variant::final_residual_mix(const ModelView& model, const Tensor& residual, Tensor& hidden,
@@ -164,9 +197,11 @@ NgramPleStatePoolSpec Variant::ple_state_spec(std::int32_t slot_count) {
 
 std::size_t Variant::layer_prologue_workspace_capacity_bytes(std::int32_t first,
                                                              std::int32_t last) {
-    return ops::ngram_ple_workspace_capacity_bytes(kStreams, kHidden, TextConfig::ple_embed,
-                                                   TextConfig::ple_heads, first, last) +
-           plane_bytes(kHidden, last, DType::BF16); // the embedding before its broadcast
+    // The PLE forward and the transient embedding never overlap; reserve the larger.
+    return std::max(ops::ngram_ple_workspace_capacity_bytes(kStreams, kHidden,
+                                                            TextConfig::ple_embed,
+                                                            TextConfig::ple_heads, first, last),
+                    plane_bytes(kHidden, last, DType::BF16));
 }
 
 // --- projections -------------------------------------------------------------------------------

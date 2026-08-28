@@ -155,3 +155,10 @@ phase 3 = PP across 8 GPUs; phase 4 = EP measured against PP.
   (width ≥ 6 with group 12) is refused explicitly instead of silently skipped by the BF16
   kernel. Build in flight.
 - The server no longer appends the CLI usage after a load/serve failure (dc2996bc).
+- With the 24q2 attention geometry the program got further and failed on workspace
+  accounting: `workspace arena exhausted ... short by 10,518,528 bytes` = the embedding plane
+  `embed_residual` kept alive for the whole forward (2560×2048×2) plus the inject-gate plane
+  (4×2048×4) that outlived its scoped reservation. Fix: the embedding is transient (scoped,
+  consumed by the broadcast) and the inject gates live in a 1 MB device buffer created in
+  `create_program` (`Variant::prewarm_device_scratch`) instead of the arena. Build + probe
+  chained in the background.
