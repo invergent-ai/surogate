@@ -106,9 +106,10 @@ ExpertSlotCache& expert_slot_cache_for_current_device() {
     auto it = registry.find(device);
     if (it != registry.end()) { return it->second; }
     ExpertSlotCache& cache = registry[device];
-    long requested         = 0;
+    // --expert-slots N wins when set; otherwise the environment knob; 0 keeps zero-copy.
+    long requested = 0;
     if (auto configured = configured_expert_slots().find(device);
-        configured != configured_expert_slots().end()) {
+        configured != configured_expert_slots().end() && configured->second > 0) {
         requested = static_cast<long>(configured->second);
     } else if (const char* raw = std::getenv("SUROGATE_SERVE_EXPERT_SLOTS");
                raw != nullptr && *raw != '\0') {

@@ -116,6 +116,13 @@ and the baseline run is queued.
   `slot_of_expert` parameter/indirection in the MoE kernels (register pressure / occupancy
   in the Q4/Q5 35B kernels, not the null check itself), the round-hook plumbing, the family
   hook no-ops. Rule: the 35B board rows must not move for the Flash-Next work.
+- Slot cache end-to-end, second attempt (2026-08-28): with `--kv-capacity auto` the CLI ran
+  and answered "The capital of France is **Paris**." — but at 5.37 tok/s, and the log had no
+  "slot cache enabled" line: the new `--expert-slots` plumbing always calls
+  `configure_expert_slots(0)` from the CLI default, and the lookup treated a configured 0 as
+  "set" and skipped the env fallback, so the run measured v0 again. Fixed (a configured 0
+  falls through to the env knob); the validation + probes rerun with `--expert-slots 3000`,
+  then the ik baseline rerun and the 35B bisect probes follow on the same queue.
 5. **Prefill**: selective streaming of used experts per layer with whole-layer double
    buffering on a side stream.
 
