@@ -36,7 +36,7 @@ phase 3 = PP across 8 GPUs; phase 4 = EP measured against PP.
 | Expert access v0: zero-copy reads from the pinned host bank (`impl/load/host_bank.*`) | written with the target | no staging copies at all in v0; the device slot cache and CPU expert compute come in phase 2 |
 | Parity vs llama.cpp | done 2026-08-28 | token-0 stages within BF16 noise of the CPU reference, `l_last-0/1/2` match, answers `Paris` / 2,3,5 / ocean; defects were the SiLU gate (4aaa07fc) and the RMSNorm kernels' gate load (see log) |
 | Phase 2: expert slot cache (`--expert-slots N`) | done 2026-08-28 | users=1 18.5 tok/s loadgen / 31.7 pure decode (v0 5.2), 63 % hits at one user, pool created before the KV plan; 16 users 9.4 (pool thrashes) |
-| Phase 2: CPU expert split (`--cpu-moe-share F`) | v2 works: **23.0 tok/s @16** (pool-only 9.4, ik 24.0) | host kernel 209 GB/s @32 threads; overlapped host round; min-tokens policy for small rounds; NUMA-aware banks + share tuning next |
+| Phase 2: CPU expert split (`--cpu-moe-share F`) | v2 works: **32.9 tok/s @16 at share 0.7** (pool-only 9.4, ik 24.0) | host kernel 209 GB/s @32 threads; overlapped host round; min-tokens policy for small rounds; NUMA-aware banks + share tuning next |
 | First throughput row (zero-copy experts v0, board shape 512/128) | done 2026-08-28 | users=1: 5.2 decode / 21 prefill tok/s, TTFT 1.79 s; users=16: 7.6 / 30, TTFT 15.1 s; (128/128: 4.9 @1, 8.3 @16, 26.6 @32). llama.cpp 1×5090 CPU-MoE: 7.1 / 29 @1, 16.3 / 65 @16 |
 
 ## Next: phase 2 (single-GPU offload) — plan as of 2026-08-28
@@ -315,6 +315,16 @@ and the baseline run is queued.
   --interleave=all` gives every round both nodes' bandwidth with half the traffic remote; the
   policy rerun measures interleaved vs not at 16 users, and that delta decides whether the
   two-allocation bank is worth its complexity.
+- **Policy rerun (2026-08-28 15:49, min-tokens 4, single job copy, 512/128, 3,000 slots):**
+  users=1 share 0.5 → 18.4 tok/s (= pool-only 18.5: the split stays out of one-user rounds);
+  users=16 share 0.5 → 20.7 plain / 21.7 interleaved (NUMA interleave ≈ +5 %, so the
+  two-allocation bank is not a priority); **users=16 share 0.7 → decode 32.9 tok/s, prefill
+  132, TTFT 16.3 s** — 3.5× pool-only, 4.3× v0, 37 % above ik_llama.cpp's 24.0. Reading: at
+  share 0.5 the GPU gather (~75 experts ≈ 0.4 GB at ~50 GB/s ≈ 8 ms/layer-round) still
+  bounds the round while the host does its ~75 experts in ~2 ms; at 0.7 the balance shifts
+  toward the host's ~180 GB/s. A share sweep (0.8, 0.9) and 32/64-user probes are queued;
+  the bandwidth-matched split of the design (share from measured host vs PCIe rates) is the
+  follow-up.
 5. **Prefill**: selective streaming of used experts per layer with whole-layer double
    buffering on a side stream.
 
