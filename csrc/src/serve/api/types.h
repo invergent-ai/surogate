@@ -90,6 +90,9 @@ struct EngineOptions {
     int pipeline_stage_last            = 0;
     const void* pipeline_import_pinned = nullptr;
     std::uint32_t pipeline_boundary_columns = 0;
+    // Host expert pools per NUMA node (each device's stage uses the pool of its socket) instead
+    // of one pool over every core; set by the pipeline constructor.
+    bool cpu_moe_pool_per_socket       = false;
     std::uint32_t max_context          = 2048; // Exact logical ceiling of each request.
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
     // Expert slot cache for targets that stream MoE experts from the host: number of device

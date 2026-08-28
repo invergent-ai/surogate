@@ -827,9 +827,16 @@ struct CpuExpertPool::Impl {
         }
     }
 
+    std::vector<int> cpus; // explicit pin targets, when given
+
     void worker_loop(std::uint32_t index, bool pin) {
 #if defined(__x86_64__)
-        if (pin) {
+        if (pin && index < cpus.size()) {
+            cpu_set_t set;
+            CPU_ZERO(&set);
+            CPU_SET(cpus[index], &set);
+            sched_setaffinity(0, sizeof(set), &set);
+        } else if (pin) {
             // Pin to the index-th CPU the process is allowed to run on (honours a cpuset or
             // numactl --cpunodebind; the first half of a node's allowed set is its physical
             // cores on the usual numbering).
@@ -886,6 +893,10 @@ CpuExpertPool::CpuExpertPool(const SparseMoeGeometry& geometry, Options options)
     require_geometry(geometry);
     impl_->geometry = geometry;
     std::uint32_t threads = options.threads;
+    if (!options.cpus.empty()) {
+        impl_->cpus = options.cpus;
+        threads     = static_cast<std::uint32_t>(options.cpus.size());
+    }
     if (threads == 0) {
         // One per physical core on SMT-2 parts, within the CPUs the process may run on.
         unsigned hw = std::thread::hardware_concurrency();

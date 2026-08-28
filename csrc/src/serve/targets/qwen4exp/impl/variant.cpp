@@ -14,6 +14,8 @@
 #include "ops/linear/bf16/bf16_cublaslt.h"
 
 #include <algorithm>
+#include <thread>
+#include <cctype>
 #include <array>
 #include <deque>
 #include <chrono>
@@ -313,6 +315,53 @@ std::unordered_map<int, std::pair<float, std::uint32_t>>& configured_cpu_prefill
     static std::unordered_map<int, std::pair<float, std::uint32_t>> map;
     return map;
 }
+bool& configured_cpu_pool_per_socket() {
+    static bool per_socket = false;
+    return per_socket;
+}
+
+// The NUMA node of a CUDA device (its PCI function's `numa_node`), -1 when unknown.
+int device_numa_node(int device) {
+    char bus_id[32] = {};
+    if (cudaDeviceGetPCIBusId(bus_id, sizeof(bus_id), device) != cudaSuccess) { return -1; }
+    std::string path = "/sys/bus/pci/devices/";
+    for (char* c = bus_id; *c != '\0'; ++c) { *c = static_cast<char>(std::tolower(static_cast<unsigned char>(*c))); }
+    path += bus_id;
+    path += "/numa_node";
+    FILE* file = std::fopen(path.c_str(), "r");
+    if (file == nullptr) { return -1; }
+    int node = -1;
+    if (std::fscanf(file, "%d", &node) != 1) { node = -1; }
+    std::fclose(file);
+    return node;
+}
+
+// The physical cores of a NUMA node: the first half of its cpulist on SMT-2 parts (the
+// usual numbering lists the siblings after all physical cores).
+std::vector<int> node_physical_cpus(int node) {
+    std::vector<int> cpus;
+    const std::string path = "/sys/devices/system/node/node" + std::to_string(node) + "/cpulist";
+    FILE* file             = std::fopen(path.c_str(), "r");
+    if (file == nullptr) { return cpus; }
+    char buffer[512] = {};
+    if (std::fgets(buffer, sizeof(buffer), file) != nullptr) {
+        const char* p = buffer;
+        while (*p != '\0' && *p != '\n') {
+            char* end   = nullptr;
+            const long a = std::strtol(p, &end, 10);
+            long b       = a;
+            p            = end;
+            if (*p == '-') { b = std::strtol(p + 1, &end, 10); p = end; }
+            for (long c = a; c <= b; ++c) { cpus.push_back(static_cast<int>(c)); }
+            if (*p == ',') { ++p; }
+        }
+    }
+    std::fclose(file);
+    const unsigned threads_per_core = std::thread::hardware_concurrency() / 2 > 0 ? 2 : 1;
+    if (threads_per_core == 2 && cpus.size() >= 2) { cpus.resize(cpus.size() / 2); }
+    return cpus;
+}
+
 std::unordered_map<int, std::uint32_t>& configured_cpu_min_tokens() {
     static std::unordered_map<int, std::uint32_t> configured;
     return configured;
@@ -447,13 +496,28 @@ ExpertSlotCache& expert_slot_cache_for_current_device() {
                 pool_options.threads = static_cast<std::uint32_t>(std::strtoul(threads, nullptr, 10));
             }
             {
+                // One pool per process, or — for pipeline stages — one per NUMA node pinned to
+                // that node's physical cores, so stages on different sockets run their host
+                // rounds concurrently on their own cores and memory.
                 static std::mutex pool_mutex;
-                static std::weak_ptr<ops::CpuExpertPool> shared_pool;
+                static std::unordered_map<int, std::weak_ptr<ops::CpuExpertPool>> pools; // node → pool (-1 = shared)
+                int node = -1;
+                if (configured_cpu_pool_per_socket()) {
+                    node = device_numa_node(device);
+                    if (node >= 0) {
+                        pool_options.cpus = node_physical_cpus(node);
+                        if (pool_options.cpus.empty()) { node = -1; }
+                    }
+                }
                 std::lock_guard<std::mutex> lock(pool_mutex);
-                cache.cpu_pool = shared_pool.lock();
+                cache.cpu_pool = pools[node].lock();
                 if (cache.cpu_pool == nullptr) {
                     cache.cpu_pool = std::make_shared<ops::CpuExpertPool>(geometry, pool_options);
-                    shared_pool    = cache.cpu_pool;
+                    pools[node]    = cache.cpu_pool;
+                    if (node >= 0) {
+                        std::fprintf(stderr, "qwen4exp: host expert pool for NUMA node %d: %zu threads\n", node,
+                                     pool_options.cpus.size());
+                    }
                 }
             }
             CUDA_CHECK(cudaStreamCreateWithFlags(&cache.cpu_stream, cudaStreamNonBlocking));
@@ -745,6 +809,10 @@ void Variant::configure_cpu_moe_prefill(float share, std::uint32_t prefill_chunk
     int device = 0;
     CUDA_CHECK(cudaGetDevice(&device));
     configured_cpu_prefill()[device] = {share, prefill_chunk};
+}
+
+void Variant::configure_cpu_pool_per_socket(bool per_socket) {
+    configured_cpu_pool_per_socket() = per_socket;
 }
 
 void Variant::configure_cpu_moe_min_tokens(std::uint32_t tokens) {

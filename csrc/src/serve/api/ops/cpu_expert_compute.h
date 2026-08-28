@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <vector>
 
 namespace ninfer::ops {
 
@@ -60,6 +61,7 @@ void cpu_expert_compute_job(const SparseMoeGeometry& geometry, const CpuExpertBa
 struct CpuExpertPoolOptions {
     std::uint32_t threads = 0; // 0 = one per physical core
     bool pin_threads      = true;
+    std::vector<int> cpus;     // explicit CPUs to pin to (one thread each); overrides `threads`
 };
 
 class CpuExpertPool {

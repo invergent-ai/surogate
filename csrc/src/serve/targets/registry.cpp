@@ -363,6 +363,7 @@ ConstructedTarget construct_pipeline_target(const EngineOptions& options) {
         stage_options.pipeline_stage_first     = layers * s / stage_count;
         stage_options.pipeline_stage_last      = layers * (s + 1) / stage_count;
         stage_options.pipeline_import_pinned   = nullptr; // each stage owns its import buffer
+        stage_options.cpu_moe_pool_per_socket  = std::getenv("SUROGATE_SERVE_CPU_MOE_POOL_SHARED") == nullptr;
         stage_options.pipeline_boundary_columns = options.prefill_chunk + options.max_concurrency + 128;
         if (s > 0) { stage_options.kv_capacity = KvCapacityPolicy::explicit_capacity(resolved_kv); }
         ConstructedTarget stage = construct_registered<Qwen38FlashNext, LoadedQwen38FlashNext, Qwen38FlashNextInstance>(

@@ -79,6 +79,8 @@ struct Variant {
     /// Share of a prefill round's misses computed on the host (batched kernel) and the widest
     /// prefill round (the engine's prefill chunk), which sizes the host staging.
     static void configure_cpu_moe_prefill(float share, std::uint32_t prefill_chunk);
+    /// Host pools per NUMA node (pipeline stages) instead of one over all cores.
+    static void configure_cpu_pool_per_socket(bool per_socket);
     /// With `--cpu-moe-share auto`, times a PCIe gather and a host round of layer 0's experts
     /// (outside graph capture) and sets the share to host/(host+pcie). Called by
     /// create_program before the graphs are captured; a no-op otherwise.
