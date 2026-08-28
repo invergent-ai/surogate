@@ -36,7 +36,7 @@ phase 3 = PP across 8 GPUs; phase 4 = EP measured against PP.
 | Expert access v0: zero-copy reads from the pinned host bank (`impl/load/host_bank.*`) | written with the target | no staging copies at all in v0; the device slot cache and CPU expert compute come in phase 2 |
 | Parity vs llama.cpp | done 2026-08-28 | token-0 stages within BF16 noise of the CPU reference, `l_last-0/1/2` match, answers `Paris` / 2,3,5 / ocean; defects were the SiLU gate (4aaa07fc) and the RMSNorm kernels' gate load (see log) |
 | Phase 2: expert slot cache (`--expert-slots N`) | done 2026-08-28 | users=1 18.5 tok/s loadgen / 31.7 pure decode (v0 5.2), 63 % hits at one user, pool created before the KV plan; 16 users 9.4 (pool thrashes) |
-| Phase 2: CPU expert split (`--cpu-moe-share F`) | v2 works: **32.9 tok/s @16 at share 0.7** (pool-only 9.4, ik 24.0) | host kernel 209 GB/s @32 threads; overlapped host round; min-tokens policy for small rounds; NUMA-aware banks + share tuning next |
+| Phase 2: CPU expert split (`--cpu-moe-share F`) | v2 works: **33.5 tok/s @16 at share 0.7 + NUMA interleave** (32.9 plain; pool-only 9.4, ik 24.0) | host kernel 209 GB/s @32 threads; overlapped host round; min-tokens policy for small rounds; NUMA-aware banks + share tuning next |
 | First throughput row (zero-copy experts v0, board shape 512/128) | done 2026-08-28 | users=1: 5.2 decode / 21 prefill tok/s, TTFT 1.79 s; users=16: 7.6 / 30, TTFT 15.1 s; (128/128: 4.9 @1, 8.3 @16, 26.6 @32). llama.cpp 1×5090 CPU-MoE: 7.1 / 29 @1, 16.3 / 65 @16 |
 
 ## Next: phase 2 (single-GPU offload) — plan as of 2026-08-28
@@ -646,3 +646,36 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   `--kv-capacity auto` (registry.cpp resolves the KV curve against `current_free_device_bytes()`
   after materialisation), so KV and pool no longer overcommit; the early preflight check does
   not see it (it is computed from planned weight bytes), which only weakens that early check.
+- Policy chain complete (2026-08-28): share 0.7 at 16 users with `numactl --interleave=all`
+  gives **33.5 tok/s decode / 138 prefill / TTFT 12.3 s** (32.9/132/16.3 s without interleave;
+  the bank's +5 % NUMA gain shows up as +2 % end to end). Share 0.5 stays at 20.7/21.7. The
+  two-allocation NUMA bank stays deprioritised.
+- 32/64-user probes did not start (2026-08-28): 64 seqs — after the 14.6 GiB pool the engine's
+  minimum runtime reservation (5.98 GB) does not fit (486 MB free); 32 seqs — graph preparation
+  consumed 1004 MB against the planned 32 × 24 MiB. The wider decode lanes cost more per lane
+  than the 16-lane measurement (31.4 vs 21.4 MiB), so `Variant::ordinary_graph_allowance_per_lane_bytes`
+  is 48 MiB (commit 4b2baf9d); the 64-user probe reruns with `--expert-slots 2000` (9.7 GiB pool).
+- `--cpu-moe-share auto` implemented (commit 4b2baf9d, object-compiled, not yet built into the
+  binary while the sweep runs): `Variant::prepare_expert_split(model)`, called by
+  `create_program` after `prewarm_device_scratch` and before the graphs are captured, times a
+  gather of 64 experts of the first MoE layer into the pool (cudaEvents, 4 repeats) and a
+  host round of the same 64 experts over 8 tokens (pool.run, 4 repeats) and sets
+  `share = host_rate / (host_rate + pcie_rate)` clamped to [0.3, 0.9]; both rates are logged.
+  The directory is reset afterwards. `EngineOptions::cpu_moe_share = -1` (server and CLI
+  parse `auto`; `SUROGATE_SERVE_CPU_MOE_SHARE=auto`) requests it; an explicit share wins.
+- External references (owner-supplied, 2026-08-28; not run here; in BENCHMARKS.md): llama.cpp
+  PR #27742 — 4090 + DDR4, UD-Q4_K_XL, `-cmoe -b 4096 -ub 4096`, 28k prompt: 20.8-22.5 decode,
+  356-384 prefill; 5090 + 64 GB DDR5, UD-Q2_K_XL: 33-34 decode at 32k, 26 at 131k, ~300
+  prefill; 5090 + 64 GB, UD-Q3_K_XL, 18 layers' experts resident, KV q8_0, 128k: 22.1-22.8
+  decode, ~765 prefill on 4-5k-token prompts. All single user. Reading: single-user decode is
+  bytes-per-expert over the host path (Q2_K_XL ≈ half of Q4_K_XL ≈ 0.6× the W8 bank), so 18.4
+  at one user is where a W8 bank lands; a Q4-class host bank (host int4 kernel + 4-bit gather)
+  is the single-user lever and is not on the plan yet. The **prefill gap (74 vs 300-770)** is
+  the real one: llama.cpp prefills the experts on the CPU with a batched int8 GEMM at
+  4096-token micro-batches (compute-bound, ~80 tokens per expert per layer), while this engine
+  gathers every touched expert per 512-token prompt (≈211 GB over PCIe ≈ 4 s). Two levers,
+  both phase-2: (a) the tiled host int8 GEMM for prefill rounds (the deferred item), and (b)
+  wider prefill rounds across users so the per-round gather is amortised (the gather is a
+  fixed cost once most experts are touched: ~120 t/s ceiling at 512 columns, ~975 at 4096).
+  None of the references report multi-user throughput; 33.5 aggregate at 16 users has no
+  comparable there. Long context (their 80k-250k) is untested here (probes run at 2048).

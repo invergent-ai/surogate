@@ -660,6 +660,7 @@ PR #27742 (not run here; different hardware, quantisation and prompt shape):
 | RTX 4090 + 110 GB DDR4, PCIe 4.0 x16, UD-Q4_K_XL, `-cmoe -b 4096 -ub 4096`, 28k prompt, 80k-250k context | 1 | 20.8-21.0 | 356-364 |
 | same, `-ncmoe 40` (40 layers' experts resident) | 1 | 22.5 | 384 |
 | RTX 5090 + 64 GB DDR5, UD-Q2_K_XL (experts ~half the bytes of Q4_K_XL), 32k / 131k context | 1 | 33-34 / 26 | ~300 |
+| RTX 5090 + 64 GB, UD-Q3_K_XL, 18 layers' experts resident (30 layers + n-gram table on CPU), KV q8_0, 128k context, 4-5k prompts | 1 | 22.1-22.8 | ~765 |
 
 The single-user decode numbers agree with the bandwidth reading above: the
 host moves one expert set per token, so decode scales with bytes per expert
