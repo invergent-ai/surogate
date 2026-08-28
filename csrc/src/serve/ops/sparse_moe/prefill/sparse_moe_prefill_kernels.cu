@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -256,6 +257,20 @@ constexpr int kExpertThreads           = 32 * kExpertWarps;
 constexpr int kRtx5090SmCount          = 170;
 constexpr int kPrefillBlocksPerSm      = 3;
 constexpr int kPrefillPersistentBlocks = kPrefillBlocksPerSm * kRtx5090SmCount;
+
+// The routed GEMMs stream every touched expert once and the bench puts them at ~30 % of peak
+// bandwidth, so how many requests are in flight matters more than anything else here. The
+// persistent grid is the knob for that, tunable so it can be swept rather than guessed.
+inline int prefill_persistent_blocks() {
+    static const int blocks = [] {
+        const char* raw = std::getenv("SUROGATE_SERVE_MOE_BLOCKS_PER_SM");
+        if (raw == nullptr || *raw == '\0') { return kPrefillPersistentBlocks; }
+        const long parsed = std::strtol(raw, nullptr, 10);
+        if (parsed <= 0 || parsed > 32) { return kPrefillPersistentBlocks; }
+        return static_cast<int>(parsed) * kRtx5090SmCount;
+    }();
+    return blocks;
+}
 
 template <int ExpertWarps, int ExpertBN>
 __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gate_up_kernel(
@@ -1141,7 +1156,16 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
             scores, ids, alpha, shared_scale, packed_index, tile_counts, tokens);
         CUDA_CHECK(cudaGetLastError());
 
-        const bool wide_plan   = tokens >= kSparseMoePrefillWideMin;
+        // A serving mixed round carries one prompt's chunk plus the decode batch - about 735
+        // columns at the board's shape - which lands just under the 768 the wide plan asks
+        // for. The threshold is tunable so that edge can be measured rather than assumed.
+        static const std::int32_t wide_min = [] {
+            const char* raw = std::getenv("SUROGATE_SERVE_MOE_WIDE_MIN");
+            if (raw == nullptr || *raw == '\0') { return kSparseMoePrefillWideMin; }
+            const long parsed = std::strtol(raw, nullptr, 10);
+            return parsed > 0 ? static_cast<std::int32_t>(parsed) : kSparseMoePrefillWideMin;
+        }();
+        const bool wide_plan   = tokens >= wide_min;
         const int route_job_bn = wide_plan ? 64 : 32;
         sparse_moe_prefill_scan_kernel<<<1, kExpertThreads, 0, stream>>>(
             tile_counts, tile_bases, offsets, route_job_experts, route_job_columns, route_job_count,
@@ -1168,12 +1192,12 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         if (weights.routed_gate_up.qtype == QType::Q4G64_F16S) {
             if (wide_plan) {
                 sparse_moe_prefill_q4_gate_up_kernel<8, 64>
-                    <<<kPrefillPersistentBlocks, 8 * 32, 0, stream>>>(
+                    <<<prefill_persistent_blocks(), 8 * 32, 0, stream>>>(
                         grouped_io, offsets, route_job_experts, route_job_columns, route_job_count,
                         routed_gate_codes, routed_gate_scales, routed_activation);
             } else {
                 sparse_moe_prefill_q4_gate_up_kernel<4, 32>
-                    <<<kPrefillPersistentBlocks, 4 * 32, 0, stream>>>(
+                    <<<prefill_persistent_blocks(), 4 * 32, 0, stream>>>(
                         grouped_io, offsets, route_job_experts, route_job_columns, route_job_count,
                         routed_gate_codes, routed_gate_scales, routed_activation);
             }
@@ -1207,13 +1231,13 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         case QType::Q5G64_F16S:
             if (wide_plan) {
                 sparse_moe_prefill_qx_down_kernel<Q5DownMma, 8, 64>
-                    <<<kPrefillPersistentBlocks, 8 * 32, 0, stream>>>(
+                    <<<prefill_persistent_blocks(), 8 * 32, 0, stream>>>(
                         routed_activation, offsets, route_job_experts, route_job_columns,
                         route_job_count, routed_down_codes, routed_down_high, routed_down_scales,
                         grouped_io);
             } else {
                 sparse_moe_prefill_qx_down_kernel<Q5DownMma, 4, 32>
-                    <<<kPrefillPersistentBlocks, 4 * 32, 0, stream>>>(
+                    <<<prefill_persistent_blocks(), 4 * 32, 0, stream>>>(
                         routed_activation, offsets, route_job_experts, route_job_columns,
                         route_job_count, routed_down_codes, routed_down_high, routed_down_scales,
                         grouped_io);
@@ -1222,13 +1246,13 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         case QType::Q6G64_F16S:
             if (wide_plan) {
                 sparse_moe_prefill_qx_down_kernel<Q6DownMma, 8, 64>
-                    <<<kPrefillPersistentBlocks, 8 * 32, 0, stream>>>(
+                    <<<prefill_persistent_blocks(), 8 * 32, 0, stream>>>(
                         routed_activation, offsets, route_job_experts, route_job_columns,
                         route_job_count, routed_down_codes, routed_down_high, routed_down_scales,
                         grouped_io);
             } else {
                 sparse_moe_prefill_qx_down_kernel<Q6DownMma, 4, 32>
-                    <<<kPrefillPersistentBlocks, 4 * 32, 0, stream>>>(
+                    <<<prefill_persistent_blocks(), 4 * 32, 0, stream>>>(
                         routed_activation, offsets, route_job_experts, route_job_columns,
                         route_job_count, routed_down_codes, routed_down_high, routed_down_scales,
                         grouped_io);

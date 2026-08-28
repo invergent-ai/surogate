@@ -1277,6 +1277,24 @@ private:
 
                 if (!prefill_lanes_.empty()) {
                     top_up_prefill_lanes();
+                    // Let the staged set grow before spending a round on it (#88). Bounded, so
+                    // a prompt whose neighbours never arrive still goes out promptly.
+                    if (prefill_lanes_.size() < mixed_prefill_batch_target() &&
+                        !prefill_lanes_.full() && !membership.empty() &&
+                        deferred_mixed_rounds_ < mixed_prefill_batch_wait_rounds()) {
+                        ++deferred_mixed_rounds_;
+                        const auto t_decode = Clock::now();
+                        last_round_         = LastRound{"decode",
+                                                static_cast<std::uint32_t>(membership.size), 0,
+                                                last_round_.index + 1};
+                        run_decode_round(membership);
+                        seg_timer_.decode +=
+                            std::chrono::duration<double>(Clock::now() - t_decode).count();
+                        seg_timer_.decode_rounds += 1;
+                        previous_unit_was_decode = true;
+                        continue;
+                    }
+                    deferred_mixed_rounds_ = 0;
                     if (!membership.empty() &&
                         instance_.program->mixed_round_supported(prefill_lanes_.front())) {
                         const auto t_mixed = Clock::now();
@@ -1381,6 +1399,38 @@ private:
         std::uint64_t index = 0;
     };
     LastRound last_round_;
+
+    // Batched prefill (#88). A mixed round streams every touched expert once no matter how
+    // many columns it carries, so on an MoE the per-prompt cost of prefill falls steeply with
+    // width: the 35B's routed GEMMs measure 1.26 us per token at 640 columns and 0.65 at
+    // 2,176. Waiting a few rounds to stage several prompts and prefilling them together is
+    // therefore real work saved - unlike a dense model, where the column cost is flat and the
+    // same trade is algebraically a no-op (see the 27B round-cost model in BENCHMARKS.md).
+    //
+    // A staged prompt is not decode-ready, so holding it back costs no decode throughput; it
+    // costs that prompt's own latency, and only while the deferral bound allows.
+    static std::size_t mixed_prefill_batch_target() {
+        static const std::size_t target = [] {
+            const char* raw = std::getenv("SUROGATE_SERVE_PREFILL_BATCH");
+            if (raw == nullptr || *raw == '\0') { return std::size_t{1}; }
+            const long parsed = std::strtol(raw, nullptr, 10);
+            if (parsed <= 1) { return std::size_t{1}; }
+            return std::min(static_cast<std::size_t>(parsed), runtime::kMaximumMixedPrefills);
+        }();
+        return target;
+    }
+
+    static std::uint32_t mixed_prefill_batch_wait_rounds() {
+        static const std::uint32_t rounds = [] {
+            const char* raw = std::getenv("SUROGATE_SERVE_PREFILL_BATCH_WAIT");
+            if (raw == nullptr || *raw == '\0') { return std::uint32_t{8}; }
+            const long parsed = std::strtol(raw, nullptr, 10);
+            return parsed > 0 ? static_cast<std::uint32_t>(parsed) : std::uint32_t{8};
+        }();
+        return rounds;
+    }
+
+    std::uint32_t deferred_mixed_rounds_ = 0;
 
     struct SegmentTimer {
         bool enabled = std::getenv("SUROGATE_SERVE_ROUND_TIMING") != nullptr;
