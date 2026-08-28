@@ -184,7 +184,9 @@ and the baseline run is queued.
   *bulk gather* (coalesced 16-byte copies at ~50 GB/s vs the kernels' 5–12 GB/s row reads),
   not from caching. Consequences: the pool can stay small (a staging buffer of a few layers'
   worth of experts) and give the memory back to KV; the CPU split and stream overlap are the
-  levers; the eager hit-rate readout will quantify this. 4,500-slot point pending.
+  levers; the eager hit-rate readout will quantify this. 4,500 slots (21.9 GiB) is refused by
+  the planner on the 32 GB card ("automatic KV headroom requires 1 GiB, 0 available after
+  weights") — the pool-before-KV ordering works as intended.
 5. **Prefill**: selective streaming of used experts per layer with whole-layer double
    buffering on a side stream.
 
