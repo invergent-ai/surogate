@@ -594,10 +594,10 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_w8_gate_
                     if constexpr (groups_per_row % 8 == 0) {
                         cp_async<16, Cache::cg>(&Sr[row * 16], &scales[gi * 2]);
                     } else {
+                        // See the down kernel: an 8-byte-aligned scale row is staged in pieces.
+                        cp_async<8>(&Sr[row * 16], &scales[gi * 2]);
                         if (group0 + 8 <= groups_per_row) {
-                            cp_async<16, Cache::cg>(&Sr[row * 16], &scales[gi * 2]);
-                        } else {
-                            cp_async<8>(&Sr[row * 16], &scales[gi * 2]);
+                            cp_async<8>(&Sr[row * 16 + 8], &scales[gi * 2 + 8]);
                         }
                     }
                 }
@@ -978,10 +978,11 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_w8_down_
                     if constexpr (groups_per_row % 8 == 0) {
                         cp_async<16, Cache::cg>(&Sr[row * 16], &scales[gi * 2]);
                     } else {
+                        // A scale row of groups_per_row * 2 bytes is only 8-byte aligned when
+                        // the group count is not a multiple of eight; stage in 8-byte pieces.
+                        cp_async<8>(&Sr[row * 16], &scales[gi * 2]);
                         if (group0 + 8 <= groups_per_row) {
-                            cp_async<16, Cache::cg>(&Sr[row * 16], &scales[gi * 2]);
-                        } else {
-                            cp_async<8>(&Sr[row * 16], &scales[gi * 2]);
+                            cp_async<8>(&Sr[row * 16 + 8], &scales[gi * 2 + 8]);
                         }
                     }
                 }

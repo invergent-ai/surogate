@@ -162,3 +162,10 @@ phase 3 = PP across 8 GPUs; phase 4 = EP measured against PP.
   consumed by the broadcast) and the inject gates live in a 1 MB device buffer created in
   `create_program` (`Variant::prewarm_device_scratch`) instead of the arena. Build + probe
   chained in the background.
+- With the workspace fix the first forward ran and faulted with `cudaErrorMisalignedAddress`;
+  `CUDA_LAUNCH_BLOCKING=1` attributed it to the prefill W8 routed-down MoE kernel: it stages
+  eight FP16 scales with one 16-byte `cp.async`, and a 640-wide expert has 20 groups = a
+  40-byte scale row, so odd rows sit on an 8-byte boundary (the 35B's 32-byte rows never
+  did). Scale rows that are not 16-byte aligned are now staged in 8-byte pieces (both W8
+  prefill kernels; the 35B geometry keeps its 16-byte path). Build + launch-blocking probe
+  chained in the background.
