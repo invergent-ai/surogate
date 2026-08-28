@@ -261,6 +261,13 @@ and the baseline run is queued.
   per-layer cost of four D2H copies, a host-function node and the partial-add kernel
   (~0.1 ms × 48 layers ≈ 5 ms/token) — the split cannot pay at one user until v2 overlaps it;
   at 16 users (~150 misses/round) it should. Probes running.
+- **v2 overlap implemented (2026-08-28):** the host round now forks onto a side stream after
+  resolve/gather (fork event → D2H staging → host-function round → join event) and the MLP
+  block's `combine_into` joins it and adds the FP32 partial as an extra term of the
+  hyper-connection combine (`hyper_connection_combine(block_output, extra, inject, residual)`),
+  so the host computes while the GPU runs the pooled experts. Buffer reuse across layers is
+  ordered by the single side stream and the per-block join. v2 build + parity + probes
+  (0.5/0.7 share at 1 and 16 users, NUMA-interleaved 16-user run) queued behind the v1 probes.
 5. **Prefill**: selective streaming of used experts per layer with whole-layer double
    buffering on a side stream.
 
