@@ -704,3 +704,9 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
 - Auto-share probe at 16 users came back at 10.0 tok/s (the pool-only number): the split did
   not engage and the server log was overwritten by the next probe. `prepare_expert_split`
   now logs why it did not measure; the rerun keeps its log.
+- VOID results (2026-08-28 16:15): the auto-share probe (10.0 @16) and the 32/64-user probes
+  (graph allowance errors at 32 × 24 MiB / 64 × 24 MiB) ran a stale binary — plain `ninja`
+  in `csrc/build-serve` builds `all`, which does not include `surogate-engine`; the binary was
+  last linked at 15:31 with the min-tokens change (so the 33.5 / 33.9 rows are valid; the
+  auto-share and allowance changes were never in a running binary). Chains now build the
+  serve targets explicitly and print the binary's link time.
