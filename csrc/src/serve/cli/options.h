@@ -29,6 +29,7 @@ struct Options {
 // activation workspace stays small at qwen3.5-0.8b widths.
 std::uint32_t prefill_chunk  = 2048;
     int device                   = 0;
+    std::vector<int> devices;    // --devices a,b,c
 
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;

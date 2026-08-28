@@ -149,10 +149,11 @@ public:
     using Executor27 = runtime::ConcurrentExecutor<targets::Qwen3_6_27BInstance>;
     using Executor35 = runtime::ConcurrentExecutor<targets::Qwen3_6_35BA3BInstance>;
     using ExecutorFN = runtime::ConcurrentExecutor<targets::Qwen38FlashNextInstance>;
+    using ExecutorPP = runtime::ConcurrentExecutor<targets::Qwen38FlashNextPipeline>;
     using Executor   = std::variant<std::monostate, std::unique_ptr<Executor08>,
                                   std::unique_ptr<Executor2B>, std::unique_ptr<Executor4B>,
                                   std::unique_ptr<Executor27>, std::unique_ptr<Executor35>,
-                                  std::unique_ptr<ExecutorFN>>;
+                                  std::unique_ptr<ExecutorFN>, std::unique_ptr<ExecutorPP>>;
 
     explicit Impl(EngineOptions engine_options)
         : options(std::move(engine_options)), device(options.device) {
@@ -179,7 +180,8 @@ public:
                              ops::detail::w8_device_compute_capability() % 10);
             }
         }
-        auto constructed  = targets::construct_target(options, device);
+        auto constructed = options.devices.size() > 1 ? targets::construct_pipeline_target(options)
+                                                      : targets::construct_target(options, device);
         active            = std::move(constructed.active);
         load              = std::move(constructed.load);
         sampling_defaults = constructed.sampling_defaults;
@@ -197,6 +199,8 @@ public:
                     return std::make_unique<Executor27>(*target_ptr, options);
                 } else if constexpr (std::is_same_v<Instance, targets::Qwen3_6_35BA3BInstance>) {
                     return std::make_unique<Executor35>(*target_ptr, options);
+                } else if constexpr (std::is_same_v<Instance, targets::Qwen38FlashNextPipeline>) {
+                    return std::make_unique<ExecutorPP>(*target_ptr, options);
                 } else {
                     return std::make_unique<ExecutorFN>(*target_ptr, options);
                 }

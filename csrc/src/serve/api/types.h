@@ -79,6 +79,9 @@ struct LoadProgress {
 struct EngineOptions {
     std::filesystem::path artifact_path;
     int device                         = 0;
+    // Pipeline parallelism (phase 3): more than one device splits the model into that many
+    // layer-range stages, one per device in this order (the first is also `device`).
+    std::vector<int> devices;
     // Pipeline parallelism (phase 3): this engine instance runs layers [pipeline_stage_first,
     // pipeline_stage_last) of the model (0/0 = the whole model); a stage after the first reads
     // the residual from `pipeline_import_pinned` (the previous stage's export buffer, sized

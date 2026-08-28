@@ -106,7 +106,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--served-model-name ID] [--max-model-len N] [--kv-capacity N|auto] [--expert-slots N] [--cpu-moe-share F|auto] [--cpu-moe-prefill-share F] [--cpu-moe-min-tokens N] "
            "[--max-num-seqs N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
-           "[--max-num-batched-tokens N] [--log-stats-interval-ms N] [--device N] "
+           "[--max-num-batched-tokens N] [--log-stats-interval-ms N] [--device N] [--devices A,B,...] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
            "[--request-log-jsonl FILE] "
@@ -284,6 +284,19 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.response_store_max_bytes = static_cast<std::size_t>(mib << 20);
         } else if (arg == "--device") {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
+        } else if (arg == "--devices") {
+            options.devices.clear();
+            std::string list = require_value("--devices");
+            std::size_t start = 0;
+            while (start <= list.size()) {
+                const std::size_t comma = list.find(',', start);
+                const std::string item  = list.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+                if (!item.empty()) { options.devices.push_back(parse_nonnegative_int(item.c_str(), "devices")); }
+                if (comma == std::string::npos) { break; }
+                start = comma + 1;
+            }
+            if (options.devices.empty()) { throw std::invalid_argument("--devices needs at least one device"); }
+            options.device = options.devices.front();
         } else if (arg == "--kv-cache-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-cache-dtype"));
         } else if (arg == "--rewrite-checkpoints") {

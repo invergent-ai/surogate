@@ -77,7 +77,7 @@ std::string usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N] [--kv-capacity N|auto] [--expert-slots N] [--cpu-moe-share F] [--cpu-moe-min-tokens N] [--prefill-chunk N] [--max-new N]\n"
-           "       [--device N]\n"
+           "       [--device N] [--devices A,B,...]\n"
            "       [--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N]\n"
            "       [--lm-head-draft]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
@@ -149,6 +149,19 @@ Options parse_options(int argc, char** argv) {
             options.prefill_chunk = parse_u32(value(arg), "prefill-chunk");
         } else if (arg == "--device") {
             options.device = parse_device(value(arg));
+        } else if (arg == "--devices") {
+            options.devices.clear();
+            const std::string list = value(arg);
+            std::size_t start = 0;
+            while (start <= list.size()) {
+                const std::size_t comma = list.find(',', start);
+                const std::string item  = list.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+                if (!item.empty()) { options.devices.push_back(parse_device(item.c_str())); }
+                if (comma == std::string::npos) { break; }
+                start = comma + 1;
+            }
+            if (options.devices.empty()) { throw std::invalid_argument("--devices needs at least one device"); }
+            options.device = options.devices.front();
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value(arg));
         } else if (arg == "--spec") {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "api/types.h"
+#include "runtime/engine/pipeline_instance.h"
 #include "runtime/engine/request_memory.h"
 #include <api/targets/qwen3_5_0_8b/package.h>
 #include <api/targets/qwen3_5_2b/package.h>
@@ -205,18 +206,25 @@ struct Qwen38FlashNextInstance {
     Qwen38FlashNextInstance& operator=(const Qwen38FlashNextInstance&) = delete;
 };
 
+using Qwen38FlashNextPipeline = runtime::PipelineInstance<Qwen38FlashNextInstance>;
+
 using ActiveTarget =
     std::variant<std::unique_ptr<Qwen3_5_0_8BInstance>,
                  std::unique_ptr<Qwen3_5_2BInstance>,
                  std::unique_ptr<Qwen3_5_4BInstance>, std::unique_ptr<Qwen3_6_27BInstance>,
                  std::unique_ptr<Qwen3_6_35BA3BInstance>,
-                 std::unique_ptr<Qwen38FlashNextInstance>>;
+                 std::unique_ptr<Qwen38FlashNextInstance>,
+                 std::unique_ptr<Qwen38FlashNextPipeline>>;
 
 struct ConstructedTarget {
     ActiveTarget active;
     LoadSummary load;
     ModelSamplingDefaults sampling_defaults;
 };
+
+/// Pipeline parallelism: one stage instance per device in `options.devices`, layers split
+/// evenly, the residual handed over through pinned memory. Only Qwen3.8-Flash-Next is wired.
+[[nodiscard]] ConstructedTarget construct_pipeline_target(const EngineOptions& options);
 
 [[nodiscard]] ConstructedTarget construct_target(const EngineOptions& options,
                                                  DeviceContext& device);

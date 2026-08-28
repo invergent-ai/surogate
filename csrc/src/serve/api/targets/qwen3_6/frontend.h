@@ -41,6 +41,8 @@ public:
     [[nodiscard]] PromptSummary summary() const;
     [[nodiscard]] PromptPreparationStats preparation_stats() const noexcept;
     [[nodiscard]] explicit operator bool() const noexcept;
+    /// A deep copy (pipeline stages each start the same prompt on their own program).
+    [[nodiscard]] PreparedPrompt clone() const;
 
 private:
     explicit PreparedPrompt(std::unique_ptr<PreparedPromptData> data) noexcept;

@@ -670,6 +670,10 @@ PreparedPrompt::PreparedPrompt(std::unique_ptr<PreparedPromptData> data) noexcep
 
 PreparedPrompt::~PreparedPrompt()                                    = default;
 PreparedPrompt::PreparedPrompt(PreparedPrompt&&) noexcept            = default;
+
+PreparedPrompt PreparedPrompt::clone() const {
+    return data_ ? PreparedPrompt(std::make_unique<PreparedPromptData>(*data_)) : PreparedPrompt();
+}
 PreparedPrompt& PreparedPrompt::operator=(PreparedPrompt&&) noexcept = default;
 
 PromptSummary PreparedPrompt::summary() const {
