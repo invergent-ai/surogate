@@ -116,6 +116,7 @@ experts on the CPU (`-ot exps=CPU`, 32 threads).
 | same, `--cpu-moe-share auto` (measured host 199 GB/s vs PCIe 52 GB/s → 79 %) | 16 | 32.3 | 131 | 8.6 s |
 | same, `--expert-slots 2000` (so 64 lanes fit) | 64 | **86.5** | 346 | 18.6 s |
 | + prefill on the host (`--cpu-moe-prefill-share 0.7`, batched VNNI kernel) | 1 | 22.5 | 109 | **1.43 s** |
+| same | 16 | 29.5 | 177 | **5.9 s** (39 completions vs 21) |
 
 Prompt processing at one user (512 ÷ TTFT): full gather 174 t/s, prefill
 split **358 t/s**; ik_llama.cpp ≈ 285. Both engines answer the probes
@@ -137,7 +138,10 @@ matches the 4090 reference at 512-token prompts; the 765 figure is a
 4–5k-prompt regime (4× the per-expert reuse) that needs Flash-Next's sparse
 attention indexer beyond 2,051 tokens, not yet implemented. The 16-user
 number on this shape is prefill-dominated, so the prefill split is the lever
-at every concurrency; results for 16/32/64 users with it are pending.
+at every concurrency: at 16 users it halves TTFT and lifts total tokens per
+second by 20 % (the decode column reads lower because the host is now the
+critical path of the mixed rounds; a lower prefill share at high concurrency
+is the next sweep).
 
 ## Open items
 
