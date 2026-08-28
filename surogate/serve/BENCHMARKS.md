@@ -525,16 +525,34 @@ Everything else measured and rejected, so the next reader does not re-run it:
   - **bf16 KV** (1,774 against 1,798) and **chunk width** 2,048/4,096/8,192
     (1,765/1,798/1,778): flat.
 
+The gap is the same on every shape, and it is **not weight bytes**. Two
+passes, cards rotated, 100 users, 90 s:
+
+| shape | engine | vLLM | ratio |
+|---|---:|---:|---:|
+| 512/128 (prefill-weighted) | 1,942 | 2,290 | 85 % |
+| 256/256 | 2,897 | 3,406 | 85 % |
+| 128/512 (decode-heavy) | 3,339 | 3,740 | 89 % |
+
+A uniform 11-15 %, so it is per-round efficiency rather than anything about
+how the workload is shaped. And the bytes run the other way: **our weights are
+19.59 GiB where vLLM's are 21.03 GiB** (its own loader reports it). We stream
+7 % less and are 13 % slower, so at equal kernel quality this model should be
+ours by about 7 %. Everything left is kernel efficiency.
+
 What is left is the two things the round model names. The fixed term is 41 % of
 the second and is the expert stream — 18.6 GB per round at ~890 GB/s, half of
 what the card can do — and the routed kernels are latency-bound rather than
 bandwidth- or compute-bound (sm__throughput 60 %, dram 23 %, warps_active
 44 %, occupancy capped by shared memory). The other 55 % is the column cost of
 those same kernels. Both are the same kernel-design problem, and vLLM's own
-kernel is not the answer to it at these widths. The other lever is bytes: our
-artifact is 21.3 GB of Q4/Q5/Q6 where vLLM reads an NVFP4 export, which is
-most of the 15 % that remains — the same finding as the 4B and the 27B, but it
-needs an NVFP4 MoE kernel we do not have.
+kernel is not the answer to it at these widths. There is no byte lever here — we already read less than vLLM does. The
+concrete opening is the decode-width warp waste: at 99 columns our kernel
+leaves three of four warps idle, Marlin's row-parallel decomposition is 19 %
+faster there, and a decomposition that splits row-blocks across warps (four
+busy warps, weights decoded in registers, activations shared) should beat both.
+The round model says that kernel at ~400 us per layer, together with prefill
+batch 6, lands about 2,340 — past vLLM. That kernel does not exist yet.
 
 ## What a 27B round costs, and what that rules out (2026-08-27 late)
 
