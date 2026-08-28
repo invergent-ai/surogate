@@ -47,6 +47,10 @@ struct SparseMoeWeights {
     Weight shared_down;
     /// Routed experts selected per token; with the weight shapes this fixes the geometry.
     std::int32_t experts_per_token = 0;
+    /// Optional per-layer device table I32 [experts] mapping an expert id to the row block the
+    /// routed weights hold it in (an expert slot cache); null means the routed weights are the
+    /// resident experts in id order.
+    const std::int32_t* slot_of_expert = nullptr;
 };
 
 /// The geometry implied by the weights (router rows, hidden, shared-down width, top-k).

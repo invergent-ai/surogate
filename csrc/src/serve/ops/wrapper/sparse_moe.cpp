@@ -144,10 +144,26 @@ void validate_weights(const SparseMoeWeights& weights, const SparseMoeGeometry& 
         weights.shared_down.qtype != QType::W8G32_F16S) {
         throw std::invalid_argument("sparse_moe: shared weights must be W8");
     }
-    require_quantized(weights.routed_gate_up, geometry.routed_gate_rows(), geometry.hidden,
-                      "routed_gate_up", ranges);
-    require_quantized(weights.routed_down, geometry.routed_down_rows(), geometry.intermediate,
-                      "routed_down", ranges);
+    if (weights.slot_of_expert == nullptr) {
+        require_quantized(weights.routed_gate_up, geometry.routed_gate_rows(), geometry.hidden,
+                          "routed_gate_up", ranges);
+        require_quantized(weights.routed_down, geometry.routed_down_rows(), geometry.intermediate,
+                          "routed_down", ranges);
+    } else {
+        // An expert slot pool: the routed weights hold `slots` experts in id-independent order
+        // and the per-layer table maps expert ids to row blocks.
+        const std::int32_t gate_rows = geometry.expert_rows();
+        if (weights.routed_gate_up.n <= 0 || weights.routed_gate_up.n % gate_rows != 0 ||
+            weights.routed_down.n <= 0 || weights.routed_down.n % geometry.hidden != 0 ||
+            weights.routed_gate_up.n / gate_rows != weights.routed_down.n / geometry.hidden) {
+            throw std::invalid_argument(
+                "sparse_moe: expert slot pool rows are not a whole number of experts");
+        }
+        require_quantized(weights.routed_gate_up, weights.routed_gate_up.n, geometry.hidden,
+                          "routed_gate_up", ranges);
+        require_quantized(weights.routed_down, weights.routed_down.n, geometry.intermediate,
+                          "routed_down", ranges);
+    }
     require_quantized(weights.shared_gate_up, geometry.expert_rows(), geometry.hidden,
                       "shared_gate_up", ranges);
     require_quantized(weights.shared_down, geometry.hidden, geometry.intermediate, "shared_down",

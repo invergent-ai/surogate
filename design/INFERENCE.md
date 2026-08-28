@@ -337,3 +337,33 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   not host-bound — the slot pool + bulk gather is the right first move (bulk 16-byte
   coalesced row copies reach 52 GB/s; the kernels' scattered 2.5 KB rows do not). The
   coherence answers on this binary match llama.cpp's verbatim for the primes prompt.
+- 32 users (rebuilt binary, 128/128): decode 26.6 tok/s aggregate, prefill 27 tok/s, TTFT
+  14.3 s, 32/32 ok. v0 scales with concurrency because the touched expert set per round is
+  shared across users (PCIe reads amortise), which is also why the slot pool + CPU compute
+  design targets the round, not the token. Board-shape (512/128) probes at 1 and 16 users and
+  the ik_llama.cpp CPU-MoE baseline are queued.
+- Memory-planner integration for the slot pool (design note): `resolve_kv_capacity` hands the
+  KV curve `available_runtime_bytes` after weights; the expert pool takes its share *before*
+  the curve (MoE-first against a KV floor, `serve-engine-flash-next.md` D3), as a new field
+  on `KvCapacityPolicy` (`expert_pool_bytes`, default from a fraction of free memory), so the
+  existing explicit/automatic modes keep their meaning.
+- **nsys profile of single-stream decode (2026-08-28, 17-token prompt + 24 new tokens):** the
+  zero-copy MoE kernels are ~95 % of GPU time — per layer per token d4 (down) 3.50 ms + d3
+  (gate/up) 2.67 ms = 6.2 ms, ×48 layers ≈ 0.3 s/token; the prefill W8 gate/up 24 ms + down
+  10 ms per layer for 17 tokens. Effective PCIe rates: d3 32.8 MB in 2.67 ms = 12 GB/s, d4
+  16.4 MB (640-byte rows) in 3.5 ms = 4.7 GB/s, against 52 GB/s for bulk 16-byte-coalesced
+  row copies. Everything else (hc mix/combine, cuBLASLt, W8 GEMMs) is ~2 %. So the slot
+  pool + bulk miss gather is worth ~6× on decode even at a 0 % hit rate, and the CPU compute
+  split comes on top. Implementation started: `slot_of_expert` threaded through the
+  decode/small-T kernels (null = identity), wrapper accepts a slot pool; prefill kernels next.
+- Slot cache code landed unexercised (2026-08-28): `slot_of_expert` threaded through all nine
+  row-base sites (decode d3/d4, small-T, prefill q4/w8 gate-up and qx/w8 down; the Marlin
+  gate/up route refuses a pool), `api/ops/expert_slot_cache.h` + `ops/expert_slot_cache/`
+  (pool over W8 row-split planes, directory with flat ids, one-block resolve with a clock-hand
+  LRU and active-round protection, four-bank 16-byte gather with a device row count) — all
+  compiled object-only (no link while GPU 1 measures). Next: a round hook in `sparse_moe()`
+  (called with the final ids after decode d2 / small-T s2 / prefill select_count) so the
+  Variant can resolve + gather before the expert kernels, then the target wiring
+  (pool sized from free device memory, per-layer host banks), then measure.
+- Board-shape probe (512-token prompts / 128 new, zero-copy v0): users=1 decode 5.2 tok/s,
+  prefill 21 tok/s, TTFT 1.79 s (llama.cpp CPU-MoE: 7.1 / 29 / 2.0 s).
