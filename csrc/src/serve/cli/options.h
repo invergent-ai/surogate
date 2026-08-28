@@ -23,7 +23,7 @@ struct Options {
     std::uint32_t expert_slots = 0; // --expert-slots N
     float cpu_moe_share = 0.0F; // --cpu-moe-share F
     std::uint32_t cpu_moe_min_tokens = 0; // --cpu-moe-min-tokens N
-    float cpu_moe_prefill_share      = 0.0F; // --cpu-moe-prefill-share F
+    float cpu_moe_prefill_share      = -1.0F; // --cpu-moe-prefill-share F (default 0.5 with the split; 0 = off)
     // surogate vendor patch (PATCHES.md #13): 2048 measured +16% prefill at
 // ~1.9k-token prompts on RTX 5090 (K=1024 GEMM tiles amortize better);
 // activation workspace stays small at qwen3.5-0.8b widths.

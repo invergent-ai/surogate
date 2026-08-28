@@ -93,8 +93,9 @@ struct EngineOptions {
     // costs more than it saves); 0 = the target's default.
     std::uint32_t cpu_moe_min_tokens   = 0;
     // Fraction [0,1] of a *prefill* round's missing experts computed on the host (batched
-    // kernel; 0 = prefill keeps the full gather). Needs expert_slots > 0.
-    float cpu_moe_prefill_share        = 0.0F;
+    // kernel). -1 = default: 0.5 whenever the CPU split is on; 0 keeps the full gather for
+    // prefill. Needs expert_slots > 0.
+    float cpu_moe_prefill_share        = -1.0F;
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;

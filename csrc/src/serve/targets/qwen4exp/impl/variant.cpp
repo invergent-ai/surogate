@@ -377,7 +377,9 @@ ExpertSlotCache& expert_slot_cache_for_current_device() {
             fraction = std::strtod(share, nullptr);
         }
     }
-    double prefill_fraction        = 0.0;
+    // Prefill share: -1 (unset) → 0.5 when the split is on (measured optimum at concurrency;
+    // 0.7 is better for a single user), 0 turns the prefill split off.
+    double prefill_fraction        = -1.0;
     std::uint32_t prefill_chunk    = 0;
     if (auto configured = configured_cpu_prefill().find(device); configured != configured_cpu_prefill().end()) {
         prefill_fraction = static_cast<double>(configured->second.first);
@@ -387,6 +389,8 @@ ExpertSlotCache& expert_slot_cache_for_current_device() {
         prefill_fraction = std::strtod(share, nullptr);
         if (prefill_chunk == 0) { prefill_chunk = 2048; }
     }
+    if (prefill_fraction < 0.0) { prefill_fraction = fraction > 0.0 ? 0.5 : 0.0; }
+    if (prefill_chunk == 0) { prefill_chunk = 2048; }
     {
         if (fraction > 0.0 || prefill_fraction > 0.0) {
             cache.cpu_share_q16 = static_cast<std::uint32_t>(std::min(1.0, std::max(0.0, fraction)) * 65536.0);
