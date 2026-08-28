@@ -626,6 +626,29 @@ between kernels, and the GDN chunked scan moves its 145 MB per layer at
 641 GB/s. Fusing the layer loop and widening that scan is the next 27B
 work; nothing above it is a config away.
 
+## Qwen3.8-Flash-Next — the llama.cpp baseline (2026-08-28)
+
+The next target (`design/serve-engine-flash-next.md`): 111 GB, 512-expert MoE
+with hyper-connections and an n-gram memory, which no engine target serves
+yet. llama.cpp upstream master (added `qwen4exp` this week; CUDA build at
+`study/llama.cpp-master/build`) is the parity oracle and the bar. 512/128,
+90 s at 16-32 users, 60 s at one:
+
+| config | users | decode tok/s | prefill tok/s | TTFT p50 |
+|---|---:|---:|---:|---:|
+| 8× 5090, `--split-mode layer`, all resident | 1 | 39.3 | 157 | 0.95 s |
+| | 32 | 28.8 | 115 | 132 s |
+| 1× 5090, experts + PLE table on CPU (`-ot exps=CPU`), 32 threads | 1 | 7.1 | 29 | 2.0 s |
+| | 16 | 16.3 | 65 | 29 s |
+
+Both configurations answer the probes correctly (`'Paris'`, `'2, 3, and 5'`).
+The 8-GPU number is the interesting one: eight cards holding every weight
+resident produce *less* aggregate throughput at 32 users than at one, because
+layer split without micro-batch pipelining serialises the cards and the
+scheduler starves prefill (132 s TTFT). That is the shape the pipeline-parallel
+design in phase 3 is built to beat by an order of magnitude; the single-GPU
+CPU-MoE row is the phase-2 bar.
+
 ## Single user (2026-08-26, GPU2)
 
 Not re-measured on 08-27. Same shapes, same loadgen; engine at bf16 KV.
