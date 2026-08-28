@@ -141,16 +141,8 @@ enum class Nvfp4Problem : std::uint8_t {
     Residual17408,
 };
 
-// The cuBLASLt route needs 128-aligned output rows (its scale tiles) and 64-aligned K; the
-// activation quantizer additionally needs a K it was instantiated for.
-inline constexpr bool is_nvfp4_generic_problem(std::int32_t output_rows, std::int32_t input_rows) {
-    if (output_rows <= 0 || input_rows <= 0 || (output_rows % 128) != 0 || (input_rows % 64) != 0) {
-        return false;
-    }
-    return input_rows == 2560 || input_rows == 4096 || input_rows == 9216;
-}
-
-inline constexpr bool is_nvfp4_linear_problem(std::int32_t output_rows, std::int32_t input_rows) {
+inline constexpr bool is_nvfp4_registered_problem(std::int32_t output_rows,
+                                                 std::int32_t input_rows) {
     return (output_rows == Nvfp4AttnInputGeometry::kOutputRows &&
             input_rows == Nvfp4AttnInputGeometry::kInputRows) ||
            (output_rows == Nvfp4GdnInputGeometry::kOutputRows &&
@@ -160,7 +152,23 @@ inline constexpr bool is_nvfp4_linear_problem(std::int32_t output_rows, std::int
            (output_rows == Nvfp4Residual6144Geometry::kOutputRows &&
             input_rows == Nvfp4Residual6144Geometry::kInputRows) ||
            (output_rows == Nvfp4Residual17408Geometry::kOutputRows &&
-            input_rows == Nvfp4Residual17408Geometry::kInputRows) ||
+            input_rows == Nvfp4Residual17408Geometry::kInputRows);
+}
+
+// The cuBLASLt route needs 128-aligned output rows (its scale tiles) and 64-aligned K; the
+// activation quantizer additionally needs a K it was instantiated for. A registered shape is
+// never generic: its ladder owns it, and the in-house small-T kernels beat cuBLASLt below the
+// route's threshold, so admitting 5120 here must not pull the 27B's own shapes off them (#87).
+inline constexpr bool is_nvfp4_generic_problem(std::int32_t output_rows, std::int32_t input_rows) {
+    if (output_rows <= 0 || input_rows <= 0 || (output_rows % 128) != 0 || (input_rows % 64) != 0) {
+        return false;
+    }
+    if (is_nvfp4_registered_problem(output_rows, input_rows)) { return false; }
+    return input_rows == 2560 || input_rows == 4096 || input_rows == 5120 || input_rows == 9216;
+}
+
+inline constexpr bool is_nvfp4_linear_problem(std::int32_t output_rows, std::int32_t input_rows) {
+    return is_nvfp4_registered_problem(output_rows, input_rows) ||
            is_nvfp4_generic_problem(output_rows, input_rows);
 }
 

@@ -55,6 +55,14 @@ struct SplitGdnInputProjectionPlan {
     WeightPlan value_z;
 };
 
+// qkv|z, kept apart because an NVFP4 object carries one weight divisor and some exports
+// quantise the two halves with different global scales (#87). Distinct from
+// SplitGdnInputProjectionPlan, which is the Q4/Q5 qk|value_z arrangement.
+struct SplitQkvZGdnInputProjectionPlan {
+    WeightPlan query_key_value;
+    WeightPlan z;
+};
+
 struct FusedGdnInputProjectionPlan {
     WeightPlan query_key_value_z;
 };
@@ -76,7 +84,9 @@ struct GdnPlan {
     artifact::ObjectHandle dt_bias;
     artifact::ObjectHandle convolution;
     GdnControlProjectionPlan control_projection;
-    std::variant<SplitGdnInputProjectionPlan, FusedGdnInputProjectionPlan> input_projection;
+    std::variant<SplitGdnInputProjectionPlan, SplitQkvZGdnInputProjectionPlan,
+                 FusedGdnInputProjectionPlan>
+        input_projection;
     artifact::ObjectHandle norm;
     WeightPlan output;
 };
@@ -153,12 +163,18 @@ struct SplitGdnInputProjectionPayload {
     Weight value_z;
 };
 
+struct SplitQkvZGdnInputProjectionPayload {
+    Weight query_key_value;
+    Weight z;
+};
+
 struct FusedGdnInputProjectionPayload {
     Weight query_key_value_z;
 };
 
 using GdnInputProjectionPayload =
-    std::variant<SplitGdnInputProjectionPayload, FusedGdnInputProjectionPayload>;
+    std::variant<SplitGdnInputProjectionPayload, SplitQkvZGdnInputProjectionPayload,
+                 FusedGdnInputProjectionPayload>;
 
 struct SplitGdnControlProjectionPayload {
     Weight a_projection;

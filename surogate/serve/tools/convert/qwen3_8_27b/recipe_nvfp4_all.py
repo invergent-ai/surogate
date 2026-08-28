@@ -111,14 +111,16 @@ def _build_matrix_recipes() -> tuple[
             )
             z = _source(source_prefix + "linear_attn.in_proj_z", 6144, 5120)
             output = _source(source_prefix + "linear_attn.out_proj", 5120, 6144)
-            fused = (query_key_value, z)
             weights.extend(
                 (
                     Nvfp4WeightRecipe(
-                        object_prefix + "gdn/query_key_value_z",
-                        (16384, 5120),
-                        (_all(query_key_value), _all(z)),
-                        fused,
+                        object_prefix + "gdn/query_key_value",
+                        query_key_value.shape,
+                        (_all(query_key_value),),
+                        (query_key_value,),
+                    ),
+                    Nvfp4WeightRecipe(
+                        object_prefix + "gdn/z", z.shape, (_all(z),), (z,)
                     ),
                     Nvfp4WeightRecipe(
                         object_prefix + "gdn/output",
@@ -132,8 +134,13 @@ def _build_matrix_recipes() -> tuple[
                 (
                     InputDivisorRecipe(
                         object_prefix + "gdn/input_projection/input_scale_divisor",
-                        fused,
-                        (object_prefix + "gdn/query_key_value_z",),
+                        (query_key_value,),
+                        (object_prefix + "gdn/query_key_value",),
+                    ),
+                    InputDivisorRecipe(
+                        object_prefix + "gdn/z_projection/input_scale_divisor",
+                        (z,),
+                        (object_prefix + "gdn/z",),
                     ),
                     InputDivisorRecipe(
                         object_prefix + "gdn/output_projection/input_scale_divisor",

@@ -69,6 +69,14 @@ std::size_t gdn_snapshot_workspace_bytes(const Tensor& hidden,
                             TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim, batch,
                             width, width));
     }
+    if (const auto* pair =
+            std::get_if<SplitQkvZGdnInputProjectionPayload>(&weights.input_projection)) {
+        return std::max(kMinimumLeafWorkspaceBytes,
+                        ops::gdn_input_proj_conv_snapshot_split_workspace_capacity_bytes(
+                            pair->query_key_value.qtype, pair->query_key_value.n, pair->z.n,
+                            pair->query_key_value.k, text_policy(pair->query_key_value), batch,
+                            width, width));
+    }
     const Weight& parent =
         std::get<FusedGdnInputProjectionPayload>(weights.input_projection).query_key_value_z;
     return std::max(
@@ -85,6 +93,14 @@ std::size_t gdn_record_workspace_bytes(const Tensor& hidden,
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
                             TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim, batch,
+                            width, width));
+    }
+    if (const auto* pair =
+            std::get_if<SplitQkvZGdnInputProjectionPayload>(&weights.input_projection)) {
+        return std::max(kMinimumLeafWorkspaceBytes,
+                        ops::gdn_input_proj_conv_record_split_workspace_capacity_bytes(
+                            pair->query_key_value.qtype, pair->query_key_value.n, pair->z.n,
+                            pair->query_key_value.k, text_policy(pair->query_key_value), batch,
                             width, width));
     }
     const Weight& parent =
@@ -213,6 +229,12 @@ void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeig
                             stream);
         return;
     }
+    if (const auto* pair =
+            std::get_if<SplitQkvZGdnInputProjectionPayload>(&weights.input_projection)) {
+        ops::gdn_input_proj_split(hidden, pair->query_key_value, pair->z, qkv, output_gate_flat,
+                                  text_policy(pair->query_key_value), workspace, stream);
+        return;
+    }
     const Weight& fused =
         std::get<FusedGdnInputProjectionPayload>(weights.input_projection).query_key_value_z;
     ops::gdn_input_proj(hidden, fused, qkv, output_gate_flat, text_policy(fused), workspace,
@@ -234,6 +256,14 @@ void Variant::gdn_input_projection_snapshot(
                                           conv_states, valid_columns, initial_slot,
                                           snapshot_base_slot, query, key, value, output_gate_view,
                                           leaf_workspace, stream);
+        return;
+    }
+    if (const auto* pair =
+            std::get_if<SplitQkvZGdnInputProjectionPayload>(&weights.input_projection)) {
+        ops::gdn_input_proj_conv_snapshot_split(
+            hidden, pair->query_key_value, pair->z, conv_weight, conv_states, valid_columns,
+            initial_slot, snapshot_base_slot, query, key, value, output_gate_view,
+            text_policy(pair->query_key_value), leaf_workspace, stream);
         return;
     }
     const Weight& fused =
@@ -259,6 +289,14 @@ void Variant::gdn_input_projection_record(const Tensor& hidden, const GdnProject
                                         conv_states, valid_columns, initial_slots, conv_record,
                                         query, key, value, output_gate_view, leaf_workspace,
                                         stream);
+        return;
+    }
+    if (const auto* pair =
+            std::get_if<SplitQkvZGdnInputProjectionPayload>(&weights.input_projection)) {
+        ops::gdn_input_proj_conv_record_split(
+            hidden, pair->query_key_value, pair->z, conv_weight, conv_states, valid_columns,
+            initial_slots, conv_record, query, key, value, output_gate_view,
+            text_policy(pair->query_key_value), leaf_workspace, stream);
         return;
     }
     const Weight& fused =
@@ -388,9 +426,11 @@ std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfil
     case WeightsProfile::Qwen38GroupwiseInt:
         return 0;
     case WeightsProfile::Qwen36Nvfp4:
-    case WeightsProfile::Qwen38Nvfp4All:
         return ops::gdn_input_proj_workspace_capacity_bytes(QType::NVFP4, 16384, TextConfig::hidden,
                                                             kNvfp4TextPolicy, first, last);
+    case WeightsProfile::Qwen38Nvfp4All:
+        return ops::gdn_input_proj_split_workspace_capacity_bytes(
+            QType::NVFP4, 10240, 6144, TextConfig::hidden, kNvfp4TextPolicy, first, last);
     case WeightsProfile::Qwen38Nvfp4:
         return ops::gdn_input_proj_workspace_capacity_bytes(
             QType::FP8_E4M3FN_ROW_BF16S, 16384, TextConfig::hidden, kFp8TextPolicy, first, last);
@@ -410,11 +450,15 @@ std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(
                             TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim,
                             batch_size, first, last));
     case WeightsProfile::Qwen36Nvfp4:
-    case WeightsProfile::Qwen38Nvfp4All:
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
                             QType::NVFP4, 16384, TextConfig::hidden, kNvfp4TextPolicy, batch_size,
                             first, last));
+    case WeightsProfile::Qwen38Nvfp4All:
+        return std::max(kMinimumLeafWorkspaceBytes,
+                        ops::gdn_input_proj_conv_snapshot_split_workspace_capacity_bytes(
+                            QType::NVFP4, 10240, 6144, TextConfig::hidden, kNvfp4TextPolicy,
+                            batch_size, first, last));
     case WeightsProfile::Qwen38Nvfp4:
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
@@ -436,11 +480,15 @@ std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(
                             TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim,
                             batch_size, first, last));
     case WeightsProfile::Qwen36Nvfp4:
-    case WeightsProfile::Qwen38Nvfp4All:
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
                             QType::NVFP4, 16384, TextConfig::hidden, kNvfp4TextPolicy, batch_size,
                             first, last));
+    case WeightsProfile::Qwen38Nvfp4All:
+        return std::max(kMinimumLeafWorkspaceBytes,
+                        ops::gdn_input_proj_conv_record_split_workspace_capacity_bytes(
+                            QType::NVFP4, 10240, 6144, TextConfig::hidden, kNvfp4TextPolicy,
+                            batch_size, first, last));
     case WeightsProfile::Qwen38Nvfp4:
         return std::max(kMinimumLeafWorkspaceBytes,
                         ops::gdn_input_proj_conv_record_workspace_capacity_bytes(

@@ -79,6 +79,47 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
                     cudaStream_t stream);
 
 /**
+ * Split qkv|z GDN projection (#87).
+ *
+ * An NVFP4 object carries one weight divisor, and some exports quantise in_proj_qkv and
+ * in_proj_z with different global scales - restating one half onto the other's divisor is a
+ * second quantisation of that half. Those artifacts keep the two matrices apart and the
+ * projection runs as two GEMMs, which is what the cuBLASLt route does with the fused weight
+ * anyway. qkv and z receive the same columns the fused form writes.
+ */
+void gdn_input_proj_split(const Tensor& x, const Weight& query_key_value_weight,
+                          const Weight& z_weight, Tensor& qkv, Tensor& z, LinearPolicy policy,
+                          WorkspaceArena& workspace, cudaStream_t stream);
+
+[[nodiscard]] std::size_t gdn_input_proj_split_workspace_capacity_bytes(
+    QType qtype, std::int32_t qkv_rows, std::int32_t z_rows, std::int32_t input_rows,
+    LinearPolicy policy, std::int32_t min_tokens, std::int32_t max_tokens);
+
+/** Split qkv|z snapshot: project both halves, then the shared projected convolution (#87). */
+void gdn_input_proj_conv_snapshot_split(
+    const Tensor& x, const Weight& query_key_value_weight, const Weight& z_weight,
+    const Tensor& conv_weight, Tensor& conv_states, const Tensor& valid_columns,
+    const Tensor& initial_state_slots, const Tensor& snapshot_base_slots, Tensor& query,
+    Tensor& key, Tensor& value, Tensor& z, LinearPolicy policy, WorkspaceArena& workspace,
+    cudaStream_t stream);
+
+[[nodiscard]] std::size_t gdn_input_proj_conv_snapshot_split_workspace_capacity_bytes(
+    QType qtype, std::int32_t qkv_rows, std::int32_t z_rows, std::int32_t input_rows,
+    LinearPolicy policy, std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width);
+
+/** Split qkv|z record: project into the caller's record plane and z, then the convolution. */
+void gdn_input_proj_conv_record_split(
+    const Tensor& x, const Weight& query_key_value_weight, const Weight& z_weight,
+    const Tensor& conv_weight, const Tensor& conv_states, const Tensor& valid_columns,
+    const Tensor& initial_state_slots, Tensor& conv_record, Tensor& query, Tensor& key,
+    Tensor& value, Tensor& z, LinearPolicy policy, WorkspaceArena& workspace,
+    cudaStream_t stream);
+
+[[nodiscard]] std::size_t gdn_input_proj_conv_record_split_workspace_capacity_bytes(
+    QType qtype, std::int32_t qkv_rows, std::int32_t z_rows, std::int32_t input_rows,
+    LinearPolicy policy, std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width);
+
+/**
  * Returns the transient capacity required by the registered two-parent Q4/Q5 or single-parent W8
  * snapshot profile. `batch_size` is exact and the query covers every W in the inclusive width
  * interval. B=1 preserves the format-specific fused/composed resolver. B=2..8 uses aggregate

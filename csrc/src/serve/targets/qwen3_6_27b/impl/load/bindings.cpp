@@ -193,6 +193,12 @@ load_gdn_input_projection(const GdnPlan& plan, const artifact::MaterializedArtif
             .value_z   = materialized_weight(materialized, split->value_z, 12288, 5120),
         };
     }
+    if (const auto* split = std::get_if<SplitQkvZGdnInputProjectionPlan>(&plan.input_projection)) {
+        return SplitQkvZGdnInputProjectionPayload{
+            .query_key_value = materialized_weight(materialized, split->query_key_value, 10240, 5120),
+            .z               = materialized_weight(materialized, split->z, 6144, 5120),
+        };
+    }
     const auto& fused = std::get<FusedGdnInputProjectionPlan>(plan.input_projection);
     return FusedGdnInputProjectionPayload{
         .query_key_value_z =
@@ -425,10 +431,12 @@ void bind_qwen38_nvfp4_all_text_layers(artifact::Binder& binder, BindingPlan& ou
                 .a_b_projection = bind_weight(binder, prefix + "gdn/a_b_projection",
                                               NumericFormat::BF16, {96, 5120}),
             };
-            target.gdn.input_projection = FusedGdnInputProjectionPlan{
-                .query_key_value_z =
-                    bind_nvfp4_weight(binder, prefix + "gdn/query_key_value_z", 16384, 5120,
+            target.gdn.input_projection = SplitQkvZGdnInputProjectionPlan{
+                .query_key_value =
+                    bind_nvfp4_weight(binder, prefix + "gdn/query_key_value", 10240, 5120,
                                       prefix + "gdn/input_projection/input_scale_divisor"),
+                .z = bind_nvfp4_weight(binder, prefix + "gdn/z", 6144, 5120,
+                                       prefix + "gdn/z_projection/input_scale_divisor"),
             };
             target.gdn.norm   = artifact::bind_device_tensor(binder, prefix + "gdn/norm",
                                                              NumericFormat::BF16, {128});

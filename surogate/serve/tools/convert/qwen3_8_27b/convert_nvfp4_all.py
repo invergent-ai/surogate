@@ -17,7 +17,7 @@ from typing import Iterable, Mapping, Sequence
 
 import torch
 
-from surogate.serve.tools.artifact.container import ArtifactIdentity, ArtifactWriter
+from surogate.serve.tools.artifact.container import Artifact, ArtifactIdentity, ArtifactWriter
 from surogate.serve.tools.artifact.layouts import encode_direct, encode_nvfp4
 from surogate.serve.tools.convert.common.quantize import pick_device
 from surogate.serve.tools.convert.common.safetensors import ShardReader
@@ -48,13 +48,40 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def preflight_conversion(model_dir: str | Path) -> ConversionPreflight:
+def _resources_from_artifact(path: Path) -> tuple:
+    """Take the frontend resources from an existing artifact for this model.
+
+    This export is the MTP+vision variant and its tokenizer_config.json does not satisfy the
+    target's Qwen3.6 prefix-semantics check, while its weights are the same model. The
+    resources are identity, not weights, so they come from an artifact already known to load.
+    """
+
+    artifact = Artifact.open(path)
+    available = {obj.name: obj for obj in artifact.objects}
+    payloads = []
+    for spec in inventory.RESOURCE_SPECS:
+        obj = available.get(spec.name)
+        if obj is None:
+            raise KeyError(f"{path}: no resource {spec.name!r} to borrow")
+        payloads.append(
+            family_conversion.ResourcePayload(spec.name, bytes(artifact.payload(obj)))
+        )
+    return tuple(payloads)
+
+
+def preflight_conversion(
+    model_dir: str | Path, resources_from: str | Path | None = None
+) -> ConversionPreflight:
     source = Path(model_dir)
     if not source.is_dir():
         raise FileNotFoundError(f"NVFP4 source directory not found: {source}")
     inventory.validate_inventory()
     recipe.validate_recipe()
-    resources = family_conversion.load_resources(source, inventory.RESOURCE_SPECS)
+    resources = (
+        _resources_from_artifact(Path(resources_from))
+        if resources_from is not None
+        else family_conversion.load_resources(source, inventory.RESOURCE_SPECS)
+    )
     plan = family_conversion.build_object_plan(
         inventory.OBJECT_SPECS, {item.name: item.data for item in resources}
     )
@@ -72,11 +99,12 @@ def convert(
     out_path: str | Path,
     *,
     device: str | torch.device = "cuda",
+    resources_from: str | Path | None = None,
 ) -> Path:
     started = time.perf_counter()
     output = Path(out_path)
     resolved_device = pick_device(device)
-    preflight = preflight_conversion(model_dir)
+    preflight = preflight_conversion(model_dir, resources_from)
     print(
         f"preflight complete: {len(preflight.object_plan.objects)} objects, "
         f"{len(recipe.NVFP4_WEIGHT_RECIPES)} NVFP4 matrices, device={resolved_device}",
@@ -117,12 +145,16 @@ def convert(
                         recipe.INPUT_DIVISORS_BY_NAME[spec.name], reader
                     )
                     payload = encode_direct(scalar, inventory.FP32)
-                elif spec.name == "text/token_embedding":
-                    payload = fp8_embedding.iter_reader_payload(
-                        reader,
-                        mixed_recipe.OFFICIAL_EMBEDDING_SOURCE.name,
-                        spec.shape,
+                elif spec.name in ("text/token_embedding", "text/output_head"):
+                    # Both endpoints ship bf16 in this export and the target reads a byte-wide
+                    # head, so both are encoded FP8 row-scaled here (the mixed recipe takes its
+                    # head straight from an already-FP8 source instead).
+                    source = (
+                        mixed_recipe.OFFICIAL_EMBEDDING_SOURCE.name
+                        if spec.name == "text/token_embedding"
+                        else "lm_head.weight"
                     )
+                    payload = fp8_embedding.iter_reader_payload(reader, source, spec.shape)
                 elif spec.name.endswith(_CONTROL_SUFFIX):
                     # in_proj_a/in_proj_b arrive quantised in this export.
                     tensor = recipe.materialize_control_projection(
@@ -155,8 +187,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--model", required=True, help="NVFP4 export directory")
     parser.add_argument("--out", required=True, help="artifact output path")
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--resources-from",
+        default=None,
+        help="take the frontend resources from this existing .ninfer instead of the checkpoint",
+    )
     args = parser.parse_args(argv)
-    convert(args.model, args.out, device=args.device)
+    convert(args.model, args.out, device=args.device, resources_from=args.resources_from)
     return 0
 
 

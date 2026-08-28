@@ -92,10 +92,13 @@ def _build_text_core_specs() -> tuple[TensorSpec, ...]:
                     tensor_spec(prefix + "gdn/dt_bias", (48,), FP32),
                     tensor_spec(prefix + "gdn/convolution", (4, 10240), BF16),
                     tensor_spec(prefix + "gdn/a_b_projection", (96, 5120), BF16),
-                    tensor_spec(
-                        prefix + "gdn/query_key_value_z", (16384, 5120), NVFP4
-                    ),
+                    # in_proj_qkv and in_proj_z carry different weight global scales in
+                    # this export, and an NVFP4 object holds one divisor, so the two halves
+                    # stay apart and the projection runs as two GEMMs (#87).
+                    tensor_spec(prefix + "gdn/query_key_value", (10240, 5120), NVFP4),
                     _divisor(prefix + "gdn/input_projection/input_scale_divisor"),
+                    tensor_spec(prefix + "gdn/z", (6144, 5120), NVFP4),
+                    _divisor(prefix + "gdn/z_projection/input_scale_divisor"),
                     tensor_spec(prefix + "gdn/norm", (128,), BF16),
                     tensor_spec(prefix + "gdn/output", (5120, 6144), NVFP4),
                     _divisor(prefix + "gdn/output_projection/input_scale_divisor"),
@@ -156,7 +159,8 @@ LOGICAL_ALIAS_SPECS = getattr(base, "LOGICAL_ALIAS_SPECS", ())
 def validate_inventory() -> None:
     """Every language linear is NVFP4 and every one of them carries a divisor."""
 
-    quantised = 64 * 2 + len(FULL_ATTENTION_LAYERS) * 2 + len(GDN_LAYERS) * 2
+    # per layer: mlp gate_up + down, then attention in/out or gdn qkv + z + out
+    quantised = 64 * 2 + len(FULL_ATTENTION_LAYERS) * 2 + len(GDN_LAYERS) * 3
     if len(NVFP4_TENSOR_SPECS) != quantised:
         raise ValueError(
             f"expected {quantised} NVFP4 matrices, found {len(NVFP4_TENSOR_SPECS)}"
