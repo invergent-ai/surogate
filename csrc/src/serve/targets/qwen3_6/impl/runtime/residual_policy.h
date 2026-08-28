@@ -49,6 +49,17 @@ inline void debug_probe(const char* tag, const Tensor& tensor, cudaStream_t stre
     }
 }
 
+/// Device memory reserved per decode lane for the ordinary (non-speculative) CUDA graphs:
+/// the family's 12 MiB unless the variant declares a larger footprint.
+template <class Variant>
+[[nodiscard]] constexpr std::size_t ordinary_graph_allowance_per_lane_bytes() {
+    if constexpr (requires { Variant::ordinary_graph_allowance_per_lane_bytes; }) {
+        return Variant::ordinary_graph_allowance_per_lane_bytes;
+    } else {
+        return 12ULL * 1024ULL * 1024ULL;
+    }
+}
+
 /// Activation of the GDN output gate (`z`): SiLU unless the variant declares otherwise
 /// (Qwen3.8-Flash-Next gates with the logistic sigmoid).
 template <class Variant>

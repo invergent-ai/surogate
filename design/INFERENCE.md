@@ -37,6 +37,43 @@ phase 3 = PP across 8 GPUs; phase 4 = EP measured against PP.
 | Parity vs llama.cpp | done 2026-08-28 | token-0 stages within BF16 noise of the CPU reference, `l_last-0/1/2` match, answers `Paris` / 2,3,5 / ocean; defects were the SiLU gate (4aaa07fc) and the RMSNorm kernels' gate load (see log) |
 | First throughput row (zero-copy experts v0) | measuring | users=1: 4.9 tok/s decode, prefill 10 tok/s, TTFT 1.3 s (128-token prompts); 32-user run in flight; llama.cpp 1×5090 CPU-MoE is 7.1 @1 / 16.3 @32 |
 
+## Next: phase 2 (single-GPU offload) — plan as of 2026-08-28
+
+Where v0 stands: the MoE kernels read expert rows straight out of the pinned host bank over
+PCIe (zero-copy inside the kernel), 4.9 tok/s at one user. The bandwidth bound for that path
+is ~20 tok/s (10 experts × 4.9 MB × 48 layers = 2.4 GB/token at ~50 GB/s), so the kernel's
+2.5 KB-row access pattern is latency-bound over PCIe, not bandwidth-bound — profile first
+(`nsys` on the CLI decode) to confirm before changing anything.
+
+Design (model-agnostic, keyed by `SparseMoeGeometry`; no kernel changes):
+
+1. **Expert slot pool** on the device: `slots × (gate_up rows + down rows)` in the kernels'
+   own W8 row-split layout, so a slot is addressed exactly like an expert
+   (`row_base = slot * 2 * intermediate`); `SparseMoeWeights.routed_*` point at the pool.
+2. **Resolve + gather op** between routing and the expert kernels: the wrapper splits into
+   `sparse_moe_route` (d1/d2 → expert ids, α, shared scale), `expert_slot_resolve` (device
+   table `[layers × experts] → slot`, LRU timestamps, active-slot protection, miss list with
+   a device count word), `expert_slot_gather` (FreeToken's `fast_index_copy_multi` pattern:
+   one launch copies every bank of the missing experts from pinned host pointers, row count
+   read from the device word, `L1::no_allocate` loads) and the unchanged expert kernels fed
+   with *slot* ids. Everything reads device words, so the whole round captures into the
+   decode graph.
+3. **Sizing**: MoE-first against a KV floor (`--kv-capacity`), flat id `layer*experts+expert`;
+   `decode_routing_stats`-style oracle hit rate from observed routing before any policy
+   beyond LRU.
+4. **CPU expert compute + bandwidth split** (D3 in `serve-engine-flash-next.md`): only after
+   1–3 are measured; the split fraction is computed on the device from a measured profile.
+   CPU kernels: reuse `study/ik_llama.cpp` (owner's pointer, 2026-08-28) — `ggml/src/iqk/`
+   `iqk_mul_mat_moe` / `iqk_moe_fused_up_gate` (AVX-512 `HAVE_FANCY_SIMD` path, needs the
+   five AVX-512 macros per `docs/build.md`), and its `mul_mat_id` scheduling (rows grouped per
+   expert, expert chunking over an atomic counter). Re-measure the CPU-MoE bar with that fork
+   (`-fmoe`, no `-rtr` in hybrid mode) before claiming the ≥ 3× exit.
+5. **Prefill**: selective streaming of used experts per layer with whole-layer double
+   buffering on a side stream.
+
+Exit for phase 2: the single-GPU board row at 1, 16 and 100 users, ≥ 3× llama.cpp
+`--cpu-moe` (7.1 / 16.3 tok/s on this box).
+
 ## Decisions that shape the code
 
 - Experts stay W8G32 in the artifact: regrouping K-quants into the kernels' group-64 formats
@@ -272,3 +309,14 @@ phase 3 = PP across 8 GPUs; phase 4 = EP measured against PP.
   spot checks (the "V rows wrong" scare was the reference's own slip, the real defect was
   invisible to spot checks); when a stage matches on `o` but not on the norm output, read the
   kernel — the bug was a `constexpr` guard, not numerics.
+- Throughput probing (2026-08-28): the first 32-sequence server refused to start —
+  `CUDA Graph preparation consumed 502,936,672 bytes, exceeding the planned allowance of
+  402,653,184` — the family reserves 12 MiB of graph memory per decode lane and Flash-Next's
+  decode graphs (48 layers, four-stream residual, PLE nodes) measure 15.7 MiB per lane. The
+  allowance is now a `requires`-probed Variant policy
+  (`ordinary_graph_allowance_per_lane_bytes<Variant>()`, family default 12 MiB, Flash-Next
+  20 MiB). 16-user probe (old binary, 128-token prompts / 128 new): decode 8.3 tok/s
+  aggregate, prefill 8 tok/s, TTFT 10.1 s — prefill streams every used expert per chunk over
+  zero-copy, so it is the worst part of v0 (llama.cpp CPU-MoE: 16.3 decode / 65 prefill at 16
+  users, 512/128). 32-user probe, `nsys` decode profile and the board-shape 512/128 probes
+  queued behind it.

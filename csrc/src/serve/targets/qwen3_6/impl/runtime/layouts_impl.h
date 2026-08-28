@@ -1,5 +1,6 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/layouts.h"
+#include "targets/qwen3_6/impl/runtime/residual_policy.h"
 #include "ops/linear/marlin/marlin_plane.h"
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
@@ -667,8 +668,9 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         // each reachable node-topology class. These bounds cover the largest profile installed in
         // each class and the driver/module state materialized while qualifying all definitions.
         if (impl->speculative_backend == SpeculativeBackend::None) {
-            impl->graph_allowance_bytes = checked_mul(12ULL * kMiB, impl->max_concurrency,
-                                                      "ordinary exact-b graph allowance");
+            impl->graph_allowance_bytes =
+                checked_mul(ordinary_graph_allowance_per_lane_bytes<Variant>(),
+                            impl->max_concurrency, "ordinary exact-b graph allowance");
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
             const auto profiles = mtp_graph_profiles(impl->capacity, impl->draft_window);
             const std::size_t per_batch_allowance = graph_topology_allowance(

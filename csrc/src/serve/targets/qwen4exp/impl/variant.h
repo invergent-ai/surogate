@@ -68,6 +68,9 @@ struct Variant {
     /// Creates the device scratch the mix/combine pair shares; call before any graph capture.
     static void prewarm_device_scratch();
     static constexpr bool has_layer_prologue = true;
+    // 48 layers, a four-stream residual and the PLE nodes: the decode graphs measured
+    // 15.7 MiB per lane (503 MB at 32 lanes) against the family's 12 MiB.
+    static constexpr std::size_t ordinary_graph_allowance_per_lane_bytes = 20ULL * 1024ULL * 1024ULL;
     // Parity probe: dumps family-loop intermediates under SUROGATE_SERVE_DUMP_RESIDUAL.
     static void debug_probe(const char* tag, const Tensor& tensor, cudaStream_t stream);
     [[nodiscard]] static NgramPleStatePoolSpec ple_state_spec(std::int32_t slot_count);
