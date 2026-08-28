@@ -990,3 +990,15 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   names and sizes) and the CPU pool are now process-wide, so N stage instances pin the
   experts once. Next: `--devices`, N instances in the engine, and the `PipelineProgram`
   wrapper that drives the stages in lockstep behind the unchanged executor.
+- Phase 3 v1 written (2026-08-28, commits b0727deb..70d6d67a): `--devices A,B,...` builds one
+  stage instance per device (`construct_pipeline_target`: even layer split, one artifact
+  reader, the host bank and CPU pool shared, later stages pinned to stage 0's resolved KV
+  capacity, each stage's pinned export buffer handed to the next as its import);
+  `PipelineProgram` presents the family `Program` interface to the unchanged executor and
+  replays every call on every stage in order (device selected per call), sampling on the
+  last stage; `PipelineRequestMemory` activates every stage's transient region;
+  `PreparedPrompt::clone` gives each stage its own prompt; stages skip the chained decode
+  family and run single rounds; head-less stages' placeholder ledger tokens are overwritten
+  with the last stage's samples after every round (`Program::replace_pending_tokens`).
+  Lockstep: no overlap yet (step C). First test running: greedy parity of a 2-stage pipeline
+  on GPUs 2+3 against one device, CPU split off so the gather is deterministic.
