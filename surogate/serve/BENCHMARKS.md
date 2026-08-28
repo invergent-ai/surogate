@@ -162,12 +162,21 @@ card at every layer boundary and at the output.
 | llama.cpp 8× 5090 `--split-mode layer` | 1 / 16 / 64 | 512/128 | 39.3 / 39.1 / 24.7 | 0.95 s / 86 s / 311 s |
 | 4 stages (GPUs 4-7), shared host pool | 16 | 512/128 | **79.7** | **1.3 s** |
 | 8 stages (all cards), shared host pool, 8 groups | 1 / 16 | 512/128 | 4.3 / 32.8 | 14.3 s / 14.1 s |
-| 8 stages, per-socket pools, width-following groups | 1 / 16 / 64 | 512/128 | (running) | |
+| 8 stages, per-socket pools | 1 / 16 | 512/128 | 3.5 / 31.8 | 19.4 s / 18.8 s |
+| 8 stages, width-following groups, residency policy | 16 / 64 | 512/128 | (running) | |
+| **Qwen3.8-27B** (all-NVFP4), 8 stages | 1 / 100 | 512/128 | 19.6 / 213 | 0.43 s / 0.75 s |
+| Qwen3.8-27B, one card (board) | 100 | 512/128 | 1,330 | 170 ms |
+| **Qwen3.6-35B-A3B**, 8 stages | 1 / 100 | 512/128 | 50.1 / 574 | 0.35 s / 0.34 s |
+| Qwen3.6-35B-A3B, one card (board) | 100 | 512/128 | 1,942 | 253 ms |
 
-Reading so far: two stages in lockstep already double the 8-user throughput because each
-stage's pool holds twice the share of its experts; the single-stream case runs the stages
-one after another (two rounds' fixed costs, two serialised host rounds) and needs
-per-socket host pools to match one card.
+Reading so far: all three models serve correctly across the eight cards. Two stages double
+Flash-Next's 8-user throughput because each stage's pool holds twice the share of its
+experts, and 4 stages give 79.7 tok/s at 16 users. But the pipeline as built fills and
+drains within every executor round (G+N−1 steps for G groups over N stages: 53 % pipeline
+efficiency at 8×8) and every step pays a stage round's ~30 ms fixed cost, so a model that
+fits one card is slower on eight — the 27B and 35B rows above are that arithmetic. The
+levers, in order: keep groups in flight across executor rounds (steady-state pipeline), and
+cut the stage round's fixed cost (the timestamped trace decomposes it).
 
 ## Open items
 

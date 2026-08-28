@@ -1122,3 +1122,18 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   timestamps so the next pipelined run shows whether stage rounds actually overlap. The
   remaining levers are prefill batching (several prompts per mixed round: the executor's
   `mixed_prefill_batch_target`) and cutting the round's fixed cost itself.
+- **27B and 35B-A3B serve on 8 stages** (2026-08-28, pp9 binary): 27B — 1 user 19.6 tok/s,
+  TTFT 0.43 s; 100 users 213 tok/s, prefill 852, TTFT 0.75 s, 207 completions, some admission
+  timeouts. 35B-A3B — 1 user 50.1, TTFT 0.35 s; 100 users 574, prefill 2,295, TTFT 0.34 s,
+  469 completions. Correct answers, 0 fatals, 17.8 GB per card for the 27B. Against one card
+  (1,330 / 1,942) the eight-card pipeline is 6× slower, and the arithmetic explains it
+  exactly: `run_grouped_round` fills and drains the pipeline inside every executor round —
+  G+N−1 = 15 steps for 8 groups over 8 stages (efficiency 8/15) — and each step costs one
+  stage round's fixed part (~30 ms), so a token costs ~15 × 30 ms ≈ 0.5 s for all lanes: 100
+  lanes / 0.5 s ≈ 200 tok/s, as measured. One card pays the fixed cost once per token
+  (~40 ms for 100 lanes). Therefore: (1) the pipeline must run steady-state across executor
+  rounds — each group is its own round that re-enters stage 0 as soon as its tokens are
+  committed, which is the executor change deferred in step C: G independent round contexts
+  instead of one membership; (2) the ~30-36 ms stage-round fixed cost (a 6-layer stage at
+  one lane) is far above its GPU work and is the other half — the timestamped trace run is
+  queued to split it between device time (consume blocking) and host gaps.
