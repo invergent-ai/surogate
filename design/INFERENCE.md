@@ -243,6 +243,16 @@ and the baseline run is queued.
   range across the two nodes, `mbind` before the first touch) and run one pool per node whose
   threads take the jobs whose expert lives on their node — the design's "one pool per NUMA
   node over that node's half of the expert bank".
+- **CPU split v1 parity (2026-08-28):** with the hook carrying the round's views the CLI answers
+  "The capital of France is **Paris**." with 50 % of every round's misses computed on the host —
+  the whole host path (jobs from the resolve kernel, D2H staging, host-function round, FP32
+  partial add) is numerically right. Speed as predicted for v1: 8.9 tok/s decode / 11.5 prefill
+  (pool-only: 31.7), because the old pool served one expert per thread (10 jobs → 22 idle
+  cores) and woke through a condition variable. Pool rewritten: a round runs as three
+  row-chunked phases (quantise each token once; gate/up rows of every job in 8 chunks; down
+  rows in 8 chunks with atomic adds into the token column) so 10 jobs occupy all cores, and
+  workers spin ~20k pauses before sleeping. Building + measuring (unit test, idle-host bench,
+  parity, probes at 0.5/0.7 share, 1 and 16 users, NUMA-interleaved run).
 5. **Prefill**: selective streaming of used experts per layer with whole-layer double
    buffering on a side stream.
 
