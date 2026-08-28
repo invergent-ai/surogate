@@ -271,6 +271,14 @@ public:
     /// Pipeline stages without the head record a placeholder token per round; the driver
     /// replaces each lane's last ledger entry with the token the last stage sampled.
     void replace_pending_tokens(std::span<const std::uint32_t> lanes, std::span<const TokenId> tokens);
+    /// Pipeline driver access to the decode round's two halves.
+    [[nodiscard]] runtime::RoundHandle launch_decode_round(std::span<const std::uint32_t> lanes,
+                                                           std::span<const runtime::RoundBudget> budgets) {
+        return launch_ordinary_round(lanes, budgets);
+    }
+    [[nodiscard]] runtime::BatchedGeneratedRound consume_decode_round(runtime::RoundHandle handle) {
+        return consume_ordinary_round(handle);
+    }
     const std::uint32_t capacity;
     const std::uint32_t kv_capacity;
     const std::uint32_t max_concurrency;

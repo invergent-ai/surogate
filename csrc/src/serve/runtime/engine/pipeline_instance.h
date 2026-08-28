@@ -18,6 +18,7 @@
 #include "runtime/engine/request_memory.h"
 
 #include <cstdint>
+#include <cstdio>
 #include <stdexcept>
 #include <cstring>
 #include <cstdlib>
@@ -86,6 +87,7 @@ public:
             if (parsed >= 1 && parsed <= 64) { groups_ = static_cast<std::uint32_t>(parsed); }
         }
         boundary_bytes_ = stages_.front()->program->stage_boundary_bytes();
+        trace_ = std::getenv("SUROGATE_SERVE_PIPELINE_TRACE") != nullptr;
         // One host staging slot per (boundary, group): a stage's export of one group is parked
         // there while the stage moves on to the next group.
         slots_.resize(stages_.size() > 1 ? stages_.size() - 1 : 0);
@@ -147,6 +149,7 @@ public:
         for (std::size_t s = 0; s < stages_.size(); ++s) {
             select(s);
             PreparedPrompt copy = (s + 1 == stages_.size()) ? std::move(prompt) : prompt.clone();
+            trace("start_prefill_lane", s, defer_first_chunk ? 0 : 1);
             result = stages_[s]->program->start_prefill_lane(lane, std::move(copy), std::move(plan.stages[s]),
                                                             stages_[s]->request_memory.region(),
                                                             defer_first_chunk);
@@ -161,6 +164,7 @@ public:
                 std::memcpy(stages_[s]->program->stage_import_buffer(),
                             stages_[s - 1]->program->stage_export_buffer(), boundary_bytes_);
             }
+            trace("advance_prefill_lane", s, 1);
             result = stages_[s]->program->advance_prefill_lane(lane);
         }
         if (result.complete) { propagate_prefill_token(lane, result); }
@@ -211,6 +215,7 @@ public:
                     if (s > 0) {
                         std::memcpy(stages_[s]->program->stage_import_buffer(), slots_[s - 1][g].data(), boundary_bytes_);
                     }
+                    trace("launch_decode_round", s, group_lanes[g].size());
                     in_flight[s] = stages_[s]->program->launch_decode_round(group_lanes[g], group_budgets[g]);
                 }
             }
@@ -234,6 +239,7 @@ public:
                 std::memcpy(stages_[s]->program->stage_import_buffer(),
                             stages_[s - 1]->program->stage_export_buffer(), boundary_bytes_);
             }
+            trace("advance_prefill_mixed", s, prefill_lanes.size() * 1000 + lanes.size());
             result = stages_[s]->program->advance_prefill_mixed(prefill_lanes, lanes, budgets);
         }
         propagate_round_tokens(lanes, result.round);
@@ -346,6 +352,10 @@ private:
 
     std::vector<Stage*> stages_;
     std::vector<int> devices_;
+    bool trace_                = false;
+    void trace(const char* op, std::size_t stage, std::size_t columns) const {
+        if (trace_) { std::fprintf(stderr, "pipeline-trace: %s stage %zu columns %zu\n", op, stage, columns); }
+    }
     std::uint32_t groups_      = 1;
     std::size_t boundary_bytes_ = 0;
     std::vector<std::vector<std::vector<std::byte>>> slots_; // [boundary][group]

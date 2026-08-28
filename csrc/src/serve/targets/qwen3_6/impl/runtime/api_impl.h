@@ -269,12 +269,12 @@ std::size_t Program<Variant>::stage_boundary_bytes() const noexcept {
 template <>
 runtime::RoundHandle Program<Variant>::launch_decode_round(std::span<const std::uint32_t> lanes,
                                                            std::span<const runtime::RoundBudget> budgets) {
-    return impl_->launch_ordinary_round(lanes, budgets);
+    return impl_->launch_decode_round(lanes, budgets);
 }
 
 template <>
 runtime::BatchedGeneratedRound Program<Variant>::consume_decode_round(runtime::RoundHandle handle) {
-    return impl_->consume_ordinary_round(handle);
+    return impl_->consume_decode_round(handle);
 }
 
 template <>

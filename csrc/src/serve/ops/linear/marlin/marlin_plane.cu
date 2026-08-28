@@ -29,10 +29,24 @@ std::map<const void*, PlaneEntry> g_planes;
 // Guard bytes in front of the locks array; see the note at its allocation.
 constexpr std::size_t kLockGuardBytes = 256;
 
-MarlinScratch g_scratch;
-std::size_t g_scratch_out_bytes = 0;
-std::size_t g_scratch_a_bytes   = 0;
-bool g_scratch_frozen           = false;
+// The scratch is per device: pipeline stages on several devices each run the Marlin route,
+// and a buffer allocated on one device is an illegal address on another.
+struct ScratchState {
+    MarlinScratch scratch;
+    std::size_t out_bytes = 0;
+    std::size_t a_bytes   = 0;
+    bool frozen           = false;
+};
+ScratchState& scratch_state() {
+    static std::map<int, ScratchState> states;
+    int device = 0;
+    (void)cudaGetDevice(&device);
+    return states[device];
+}
+#define g_scratch (scratch_state().scratch)
+#define g_scratch_out_bytes (scratch_state().out_bytes)
+#define g_scratch_a_bytes (scratch_state().a_bytes)
+#define g_scratch_frozen (scratch_state().frozen)
 bool g_adoption_closed          = false;
 
 bool ensure_scratch(std::size_t out_bytes, std::size_t a_bytes, cudaStream_t stream) {
