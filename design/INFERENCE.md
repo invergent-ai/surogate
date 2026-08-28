@@ -1093,3 +1093,11 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   count yet — layer-subset materialisation is the follow-up; the throughput win comes from
   the stages running in parallel on different micro-batches. Queued after the Flash-Next
   chains: 27B and 35B as 8-stage pipelines at one user and the 100-user board shape.
+- C2 measured (2026-08-28, GPUs 2+3, 8 users, 128/512, split on): one card 42.2, two stages
+  lockstep 68.9, two stages pipelined (2 groups) **68.3** — no gain from the overlap, no hang,
+  answers correct. Reading: with the decode share at ~0.8 the host round is each stage's
+  critical path, and the stages' host rounds serialise on the shared pool (both cards are on
+  socket 0, so per-socket pools cannot separate them either); the GPU sides overlap but the
+  host path does not. The 2× over one card is the residency effect. Two A/Bs isolate the
+  overlap and are queued after the 8-card runs: split off (GPU + PCIe only), and a
+  cross-socket pair (GPUs 3+4) with per-socket pools.

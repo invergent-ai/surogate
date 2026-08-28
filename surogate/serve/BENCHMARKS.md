@@ -157,7 +157,7 @@ card at every layer boundary and at the output.
 |---|---:|---|---:|---:|
 | one card (GPU 2), split on | 8 | 128/512 | 36.9 | 4.6 s |
 | 2 stages (GPUs 2+3), lockstep | 8 | 128/512 | **72.5** | 2.7 s |
-| 2 stages, pipelined (2 groups) | 8 | 128/512 | (running) | |
+| 2 stages, pipelined (2 groups) | 8 | 128/512 | 68.3 | 4.2 s |
 | 2 stages, 1 user | 1 | 512/128 | 13.1 | 4.3 s |
 | llama.cpp 8× 5090 `--split-mode layer` | 1 / 16 / 64 | 512/128 | 39.3 / 39.1 / 24.7 | 0.95 s / 86 s / 311 s |
 | 8 stages (all cards) | 1 / 16 / 64 | 512/128 | (running) | |
