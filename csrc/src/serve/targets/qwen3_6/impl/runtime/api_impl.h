@@ -257,6 +257,27 @@ void Program<Variant>::replace_pending_tokens(std::span<const std::uint32_t> lan
 }
 
 template <>
+void* Program<Variant>::stage_import_buffer() const noexcept {
+    return impl_->stage_import_buffer();
+}
+
+template <>
+std::size_t Program<Variant>::stage_boundary_bytes() const noexcept {
+    return impl_->stage_boundary_bytes();
+}
+
+template <>
+runtime::RoundHandle Program<Variant>::launch_decode_round(std::span<const std::uint32_t> lanes,
+                                                           std::span<const runtime::RoundBudget> budgets) {
+    return impl_->launch_ordinary_round(lanes, budgets);
+}
+
+template <>
+runtime::BatchedGeneratedRound Program<Variant>::consume_decode_round(runtime::RoundHandle handle) {
+    return impl_->consume_ordinary_round(handle);
+}
+
+template <>
 SequencePlanner<Variant> make_sequence_planner<Variant>(DeviceContext& device,
                                                         const EngineOptions& options,
                                                         Variant::WeightsProfile weights_profile) {

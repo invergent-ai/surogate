@@ -198,16 +198,20 @@ void ProgramImplCore::configure_stage(const SequencePlanImpl& plan) {
     stage.first   = plan.pipeline_stage_first;
     stage.last    = plan.pipeline_stage_last;
     stage.columns = static_cast<std::int32_t>(plan.pipeline_boundary_columns);
+    stage_boundary_bytes_ = static_cast<std::size_t>(residual_width<TextConfig>()) *
+                            plan.pipeline_boundary_columns * sizeof(std::uint16_t);
     if (stage.first > 0) {
-        if (plan.pipeline_import_pinned == nullptr) {
-            throw std::invalid_argument("pipeline stage after the first needs the previous stage's export buffer");
+        // The stage owns its import buffer (the driver copies the previous stage's export
+        // into it), so stages can run different micro-batches at the same time.
+        if (plan.pipeline_import_pinned != nullptr) {
+            stage.import_pinned = plan.pipeline_import_pinned;
+        } else {
+            CUDA_CHECK(cudaHostAlloc(&stage_import.data, stage_boundary_bytes_, cudaHostAllocPortable));
+            stage.import_pinned = stage_import.data;
         }
-        stage.import_pinned = plan.pipeline_import_pinned;
     }
     if (stage.last < layers) {
-        const std::size_t bytes = static_cast<std::size_t>(residual_width<TextConfig>()) *
-                                  plan.pipeline_boundary_columns * sizeof(std::uint16_t);
-        CUDA_CHECK(cudaHostAlloc(&stage_export.data, bytes, cudaHostAllocPortable));
+        CUDA_CHECK(cudaHostAlloc(&stage_export.data, stage_boundary_bytes_, cudaHostAllocPortable));
         stage.export_pinned = stage_export.data;
     }
     std::fprintf(stderr, "pipeline stage: layers [%d, %d) of %d, boundary %u columns%s%s\n", stage.first,

@@ -3,6 +3,7 @@
 #include "api/types.h"
 #include "runtime/contract/transient_region.h"
 #include "runtime/contract/types.h"
+#include "runtime/contract/round_lifecycle.h"
 #include <api/targets/qwen3_6/prepared_prompt.h>
 
 #include <cstddef>
@@ -190,8 +191,17 @@ public:
     /// Pipeline stage before the last: the pinned buffer holding the residual it exports
     /// (the next stage's `pipeline_import_pinned`); null for a whole-model program.
     [[nodiscard]] const void* stage_export_buffer() const noexcept;
+    /// Pipeline stage after the first: its own pinned import buffer; null otherwise.
+    [[nodiscard]] void* stage_import_buffer() const noexcept;
+    /// Bytes of the boundary buffers ([residual, boundary columns] BF16); 0 for a whole model.
+    [[nodiscard]] std::size_t stage_boundary_bytes() const noexcept;
     /// Pipeline driver: overwrite the placeholder tokens a head-less stage recorded this round.
     void replace_pending_tokens(std::span<const std::uint32_t> lanes, std::span<const TokenId> tokens);
+    /// Pipeline driver: the decode round in two halves — enqueue without synchronising, then
+    /// synchronise and commit (the RoundLifecycle seam); at most one round in flight.
+    [[nodiscard]] runtime::RoundHandle launch_decode_round(std::span<const std::uint32_t> lanes,
+                                                           std::span<const runtime::RoundBudget> budgets);
+    [[nodiscard]] runtime::BatchedGeneratedRound consume_decode_round(runtime::RoundHandle handle);
 
 private:
     explicit Program(std::unique_ptr<detail::ProgramImpl<Variant>> impl) noexcept;

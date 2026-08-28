@@ -18,6 +18,9 @@
 #include "runtime/engine/request_memory.h"
 
 #include <cstdint>
+#include <stdexcept>
+#include <cstring>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <span>
@@ -73,7 +76,26 @@ public:
     };
 
     PipelineProgram(std::vector<Stage*> stages, std::vector<int> devices)
-        : stages_(std::move(stages)), devices_(std::move(devices)) {}
+        : stages_(std::move(stages)), devices_(std::move(devices)) {
+        // Micro-batch groups: lanes are partitioned by lane % groups and the groups flow
+        // through the stages as a software pipeline (SUROGATE_SERVE_PIPELINE_GROUPS overrides;
+        // 1 = lockstep).
+        groups_ = static_cast<std::uint32_t>(stages_.size());
+        if (const char* raw = std::getenv("SUROGATE_SERVE_PIPELINE_GROUPS"); raw != nullptr && *raw != '\0') {
+            const long parsed = std::strtol(raw, nullptr, 10);
+            if (parsed >= 1 && parsed <= 64) { groups_ = static_cast<std::uint32_t>(parsed); }
+        }
+        boundary_bytes_ = stages_.front()->program->stage_boundary_bytes();
+        // One host staging slot per (boundary, group): a stage's export of one group is parked
+        // there while the stage moves on to the next group.
+        slots_.resize(stages_.size() > 1 ? stages_.size() - 1 : 0);
+        for (auto& boundary : slots_) {
+            boundary.resize(groups_);
+            for (auto& slot : boundary) { slot.resize(boundary_bytes_); }
+        }
+        assembled_tokens_.resize(kMaximumConcurrency);
+        assembled_counts_.resize(kMaximumConcurrency);
+    }
 
     [[nodiscard]] RequestBasePlan plan_request_base(const PreparedPrompt& prompt,
                                                     const ResolvedExecutionOptions& options) {
@@ -135,6 +157,10 @@ public:
         PrefillStepResult result{};
         for (std::size_t s = 0; s < stages_.size(); ++s) {
             select(s);
+            if (s > 0) {
+                std::memcpy(stages_[s]->program->stage_import_buffer(),
+                            stages_[s - 1]->program->stage_export_buffer(), boundary_bytes_);
+            }
             result = stages_[s]->program->advance_prefill_lane(lane);
         }
         if (result.complete) { propagate_prefill_token(lane, result); }
@@ -142,20 +168,72 @@ public:
     }
     [[nodiscard]] BatchedGeneratedRound decode_batch(std::span<const std::uint32_t> lanes,
                                                      std::span<const RoundBudget> budgets) {
-        BatchedGeneratedRound result{};
-        for (std::size_t s = 0; s < stages_.size(); ++s) {
-            select(s);
-            result = stages_[s]->program->decode_batch(lanes, budgets);
+        if (stages_.size() == 1) {
+            select(0);
+            return stages_[0]->program->decode_batch(lanes, budgets);
         }
+        // Partition the round into groups (lane % groups), skipping empty ones.
+        std::vector<std::vector<std::uint32_t>> group_lanes(groups_);
+        std::vector<std::vector<RoundBudget>> group_budgets(groups_);
+        std::vector<std::vector<std::size_t>> group_rows(groups_);
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            const std::uint32_t g = lanes[row] % groups_;
+            group_lanes[g].push_back(lanes[row]);
+            group_budgets[g].push_back(budgets[row]);
+            group_rows[g].push_back(row);
+        }
+        std::vector<std::uint32_t> active;
+        for (std::uint32_t g = 0; g < groups_; ++g) {
+            if (!group_lanes[g].empty()) { active.push_back(g); }
+        }
+        const std::size_t N = stages_.size(), G = active.size();
+        std::vector<RoundHandle> in_flight(N);
+        // Step t: stage s consumes the group it launched at t-1 (index t-1-s into `active`),
+        // parks its export in the group's staging slot, then launches group t-s after
+        // copying the previous stage's parked export into its own import buffer. Consuming
+        // stage s before launching stage s+1 orders the data; the other stages keep running.
+        for (std::size_t t = 0; t + 1 < G + N + 1; ++t) {
+            for (std::size_t s = 0; s < N; ++s) {
+                if (t >= s + 1 && t - s - 1 < G) {
+                    const std::uint32_t g = active[t - s - 1];
+                    select(s);
+                    const BatchedGeneratedRound part = stages_[s]->program->consume_decode_round(in_flight[s]);
+                    in_flight[s] = RoundHandle{};
+                    if (s + 1 < N) {
+                        std::memcpy(slots_[s][g].data(), stages_[s]->program->stage_export_buffer(), boundary_bytes_);
+                    } else {
+                        collect_tokens(group_rows[g], part);
+                    }
+                }
+                if (t >= s && t - s < G) {
+                    const std::uint32_t g = active[t - s];
+                    select(s);
+                    if (s > 0) {
+                        std::memcpy(stages_[s]->program->stage_import_buffer(), slots_[s - 1][g].data(), boundary_bytes_);
+                    }
+                    in_flight[s] = stages_[s]->program->launch_decode_round(group_lanes[g], group_budgets[g]);
+                }
+            }
+        }
+        BatchedGeneratedRound result{
+            .tokens     = std::span<const TokenId>(assembled_tokens_.data(), lanes.size()),
+            .row_counts = std::span<const std::int32_t>(assembled_counts_.data(), lanes.size()),
+            .row_stride = 1};
         propagate_round_tokens(lanes, result);
         return result;
     }
     [[nodiscard]] MixedRoundResult advance_prefill_mixed(std::span<const std::uint32_t> prefill_lanes,
                                                          std::span<const std::uint32_t> lanes,
                                                          std::span<const RoundBudget> budgets) {
+        // Lockstep through the stages (C1: the mixed path has no launch/consume split yet); the
+        // residual is handed over through the stages' own import buffers.
         MixedRoundResult result{};
         for (std::size_t s = 0; s < stages_.size(); ++s) {
             select(s);
+            if (s > 0) {
+                std::memcpy(stages_[s]->program->stage_import_buffer(),
+                            stages_[s - 1]->program->stage_export_buffer(), boundary_bytes_);
+            }
             result = stages_[s]->program->advance_prefill_mixed(prefill_lanes, lanes, budgets);
         }
         propagate_round_tokens(lanes, result.round);
@@ -220,6 +298,17 @@ public:
 
 private:
     void select(std::size_t stage) const noexcept { (void)cudaSetDevice(devices_[stage]); }
+    // Copy a group's tokens from the last stage's round into the assembled result (the
+    // program's buffers are reused by its next consume).
+    void collect_tokens(const std::vector<std::size_t>& rows, const BatchedGeneratedRound& part) {
+        const std::size_t stride = part.row_stride > 0 ? static_cast<std::size_t>(part.row_stride) : 1;
+        for (std::size_t i = 0; i < rows.size(); ++i) {
+            const std::int32_t count = part.row_counts.empty() ? 1 : part.row_counts[i];
+            if (count > 1) { throw std::logic_error("pipeline stages expect single-token rounds"); }
+            assembled_counts_[rows[i]] = count;
+            assembled_tokens_[rows[i]] = count == 1 ? part.tokens[i * stride] : 0;
+        }
+    }
     // The stages without the head recorded placeholder tokens this round: overwrite them with
     // the tokens the last stage sampled (one per lane; stages run single rounds).
     void propagate_round_tokens(std::span<const std::uint32_t> lanes, const BatchedGeneratedRound& round) {
@@ -257,6 +346,11 @@ private:
 
     std::vector<Stage*> stages_;
     std::vector<int> devices_;
+    std::uint32_t groups_      = 1;
+    std::size_t boundary_bytes_ = 0;
+    std::vector<std::vector<std::vector<std::byte>>> slots_; // [boundary][group]
+    std::vector<TokenId> assembled_tokens_;
+    std::vector<std::int32_t> assembled_counts_;
 };
 
 /// The executor's instance: owns the stage instances and their device contexts.
