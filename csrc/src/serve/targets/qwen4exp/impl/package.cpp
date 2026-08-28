@@ -3,6 +3,7 @@
 #include <api/targets/qwen3_6/prepared_prompt.h>
 
 #include "artifact/reader.h"
+#include "ops/linear/bf16/bf16_cublaslt.h"
 #include "targets/qwen4exp/impl/load/bindings.h"
 #include "targets/qwen4exp/impl/variant.h"
 
@@ -118,6 +119,9 @@ Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
 std::unique_ptr<Package::Program>
 Package::create_program(const LoadedModel& model, SequencePlan&& plan, DeviceContext& device) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
+    // The program captures its decode graphs at construction; the cuBLASLt route must own its
+    // handle and workspace before any capture (plans themselves are host-side).
+    ops::detail::bf16_cublaslt_prewarm();
     return qwen3_6::create_program<detail::Variant>(
         model.impl_->data.runtime, model.impl_->weights_profile, std::move(plan), device);
 }
