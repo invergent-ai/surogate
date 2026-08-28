@@ -36,7 +36,7 @@ phase 3 = PP across 8 GPUs with the offload inside each stage; phase 4 (EP) reje
 | Expert access v0: zero-copy reads from the pinned host bank (`impl/load/host_bank.*`) | written with the target | no staging copies at all in v0; the device slot cache and CPU expert compute come in phase 2 |
 | Parity vs llama.cpp | done 2026-08-28 | token-0 stages within BF16 noise of the CPU reference, `l_last-0/1/2` match, answers `Paris` / 2,3,5 / ocean; defects were the SiLU gate (4aaa07fc) and the RMSNorm kernels' gate load (see log) |
 | Phase 2: expert slot cache (`--expert-slots N`) | done 2026-08-28 | users=1 18.5 tok/s loadgen / 31.7 pure decode (v0 5.2), 63 % hits at one user, pool created before the KV plan; 16 users 9.4 (pool thrashes) |
-| Phase 2: CPU expert split (`--cpu-moe-share F`) | v2 works: **86.5 tok/s @64 (2,000 slots), 33.5 @16** at share 0.7 + NUMA interleave (pool-only 9.4 @16, ik 24.0 @16) | host kernel 209 GB/s @32 threads; overlapped host round; min-tokens policy for small rounds; NUMA-aware banks + share tuning next |
+| Phase 2: CPU expert split (`--cpu-moe-share F`) | v2 works: **37.9 tok/s @16 with the prefill split, 37.0 @64** (share 0.7, interleave; pool-only 9.4 @16, ik 24.0 @16) | host kernel 209 GB/s @32 threads; overlapped host round; min-tokens policy for small rounds; NUMA-aware banks + share tuning next |
 | First throughput row (zero-copy experts v0, board shape 512/128) | done 2026-08-28 | users=1: 5.2 decode / 21 prefill tok/s, TTFT 1.79 s; users=16: 7.6 / 30, TTFT 15.1 s; (128/128: 4.9 @1, 8.3 @16, 26.6 @32). llama.cpp 1×5090 CPU-MoE: 7.1 / 29 @1, 16.3 / 65 @16 |
 
 ## Next: phase 2 (single-GPU offload) — plan as of 2026-08-28
@@ -853,3 +853,16 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   (this commit): one pinned mirror per slice ordinal within the round (8), owned by the
   slice context (keyed by layer, offset, tokens, ordinal); x_host/out_host were already
   per-offset and the next round starts only after the combine joined the last slice.
+- **VOID: the 86.5 tok/s at 64 users** (2026-08-28, found by the round-timing control): the same
+  configuration on the current binary gives 37.0 / 174 / TTFT 24.3 s with the same number of
+  completions (67 vs 68). The 86.5 run used the 16:15 binary, before the prefill-kernel skip
+  fix — in 47-64-column rounds the prefill kernels read garbage for host-routed experts, and
+  garbage outputs run to `max_tokens` (128) where correct answers stop early (~50 tokens), so
+  the decode count was inflated ~2×. The 1-user probes could not catch it (T = 1 rounds run
+  the decode kernels, which had the guard). Consequences: the true concurrency curve without
+  the prefill split is flat — 33.5 @16, 30.9 @32, 37.0 @64 — prefill-dominated everywhere,
+  and the "47+ columns are superlinear" reading is withdrawn. The 64-user "regressions" of
+  the slices/copies fixes were comparisons against this void number; those fixes stand on
+  their own evidence (0 fatals, correct answers). Board corrected. Lesson: a throughput row
+  needs its completions × tokens sanity-checked, and correctness probes must run at the
+  concurrency being measured.

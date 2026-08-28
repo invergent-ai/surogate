@@ -114,7 +114,7 @@ experts on the CPU (`-ot exps=CPU`, 32 threads).
 | + expert slot cache (`--expert-slots 3000`, 14.6 GiB pool, bulk gather of misses) | 1 / 16 | 18.5 / 9.4 | 74 / 38 | 3.0 s / 17.9 s |
 | + CPU expert split (`--cpu-moe-share 0.7`, host round overlapped, `numactl --interleave=all`) | 1 / 16 | 18.4 / **33.5** | 74 / 138 | 2.95 s / 12.3 s |
 | same, `--cpu-moe-share auto` (measured host 199 GB/s vs PCIe 52 GB/s → 79 %) | 16 | 32.3 | 131 | 8.6 s |
-| same, `--expert-slots 2000` (so 64 lanes fit) | 64 | **86.5** | 346 | 18.6 s |
+| same, `--expert-slots 2000` (so 64 lanes fit) | 64 | 37.0 | 174 | 24.3 s |
 | + prefill on the host (`--cpu-moe-prefill-share 0.7`, batched VNNI kernel) | 1 | 22.5 | 109 | **1.43 s** |
 | same, prefill share 0.5 | 16 | **36.0** | 159 | **5.8 s** |
 
