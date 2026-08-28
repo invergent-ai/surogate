@@ -93,6 +93,13 @@ the day's family changes; a GPU-1 rerun with the current binary is queued behind
 Flash-Next measurements and decides it. The ik_llama.cpp build (7cff686d, CUDA + AVX-512)
 succeeded; its server has fused MoE on by default (`-no-fmoe` disables; `-fmoe` is not a flag)
 and the baseline run is queued.
+- Slot cache, first end-to-end attempt (2026-08-28): full build OK, `ninfer_expert_slot_cache_test`
+  **passes** (hits keep slots, misses gathered bit-exact through all four planes, eviction
+  across layers, active-round protection). The CLI run itself tripped on my option choice
+  (`--kv-capacity 4096` exceeds the CLI's usable range for `--max-context 2048`), so the
+  gated throughput probes did not run; rebuilt with the pool-before-KV-plan change and
+  re-queued with `--kv-capacity auto` behind the ik_llama.cpp baseline and the GPU-1 35B
+  probe (both need an uncontended host / GPU 1).
 5. **Prefill**: selective streaming of used experts per layer with whole-layer double
    buffering on a side stream.
 
