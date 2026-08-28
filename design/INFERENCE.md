@@ -300,6 +300,21 @@ and the baseline run is queued.
   round misses ~3–4 experts and the host round-trip (~0.1 ms × 48 layers) costs more than
   the ~2 experts it saves — and the job list is staged with one D2H copy (contiguous device
   block mirrored by a pinned block carved the same way) instead of four.
+- **v2 probes (2026-08-28, 512/128, 3,000 slots):** users=1 share 0.5 → 17.1 tok/s (pool-only
+  18.5: the split costs at one user, hence the min-tokens policy); **users=16 share 0.5 under
+  `numactl --interleave=all` → decode 23.0 tok/s, prefill 92, TTFT 17.1 s** — 2.4× the
+  pool-only 9.4, 3× v0's 7.6, level with ik_llama.cpp's 24.0 @16, before NUMA-aware banks and
+  share tuning. Three configurations failed to start with `cudaMalloc(pool)` because my chain
+  launched the next server before the killed one's GPU memory was released — the rerun waits
+  for GPU 1 to be free between servers.
+- NUMA placement, refined: the host bank's pinned pages are placed by the driver at
+  `cudaHostAlloc` time (one allocation per matrix), not by the copy threads' first touch, so
+  node-affine expert halves need a two-allocation bank (experts [0, 256) on node 0, the rest on
+  node 1, allocated from threads bound to each node) plus a range-aware gather source and a
+  pool whose worker groups are pinned per node and take jobs by expert range. `numactl
+  --interleave=all` gives every round both nodes' bandwidth with half the traffic remote; the
+  policy rerun measures interleaved vs not at 16 users, and that delta decides whether the
+  two-allocation bank is worth its complexity.
 5. **Prefill**: selective streaming of used experts per layer with whole-layer double
    buffering on a side stream.
 
