@@ -164,6 +164,7 @@ card at every layer boundary and at the output.
 | 8 stages (all cards), shared host pool, 8 groups | 1 / 16 | 512/128 | 4.3 / 32.8 | 14.3 s / 14.1 s |
 | 8 stages, per-socket pools | 1 / 16 | 512/128 | 3.5 / 31.8 | 19.4 s / 18.8 s |
 | 8 stages, width-following groups, residency policy (closed pipeline) | 16 | 512/128 | 57.8 | 0.6 s |
+| same, prefill batch 4 | 16 / 64 | 512/128 | 58.2 / 59.6 | 2.6 s / 18 s |
 | 2 stages GPUs 2+3 (both x8), split off: lockstep / pipelined | 8 | 128/512 | 44.5 / 44.8 | 16 s / 17 s |
 | 2 stages GPUs 3+4 (x8 + x16), per-socket pools: lockstep / pipelined | 8 | 128/512 | 75.9 / 70.0 | 3.2 s / 3.4 s |
 | **Qwen3.8-27B** (all-NVFP4), 8 stages | 1 / 100 | 512/128 | 19.6 / 213 | 0.43 s / 0.75 s |

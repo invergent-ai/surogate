@@ -1193,3 +1193,15 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   `cudaGraphExecUpdate` result 5 (parameters changed) while instantiating its graph ladder;
   `DecodeGraphExecutable::update` now re-instantiates the executable when the driver
   refuses an in-place update (logged once), so the profile still runs as a graph.
+- Trace and prefill batching (2026-08-28): the timestamped trace of the "pipelined, split
+  off" 2-stage run shows a single group per round — 8 lanes over a 4-lane minimum give two
+  groups only while all eight are active, and as requests finish (7, 6, 5 … lanes) the
+  round is one group, i.e. lockstep — so the overlap A/Bs measured nothing about overlap.
+  The trace also sizes a stage round: at one lane a 24-layer stage takes 14-18 ms with the
+  gather over an x8 link and ~60-80 ms at 5-7 lanes; the host gap between one stage's
+  consume and the next launch is ~5 ms (14 ms when the executor processes tokens). So the
+  "fixed cost" is mostly miss gathers plus host-function latency per layer, which the
+  98 %-resident 8-stage configuration does not pay. Prefill batch 4 on 8 stages: 16 users
+  58.2 (TTFT 2.6 s — batching waits), **64 users 59.6 tok/s, 65 completions, TTFT 18 s** (it
+  ran; the graph-update failure did not recur). Throughput flat from 16 to 64 users is the
+  fill/drain signature; C3 is building.
