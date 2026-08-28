@@ -490,6 +490,14 @@ Everything else measured and rejected, so the next reader does not re-run it:
     against 6.8 GB free after weights, and the MTP block adds 2.2 GB of its own
     (it carries a full expert set). It does not fit at any lane count worth
     running.
+  - **Decoding the A fragments straight into registers**, dropping the 8 KiB
+    decoded-weight plane so the block fits 3 -> 4 per SM. Occupancy is what the
+    profile says the kernel wants, and the fragment math is right (parity
+    passes), but it is slower everywhere: 592/934/2,204 us at 99/704/2,688
+    columns against 571/848/1,735. `ldmatrix` earns its 8 KiB — sharing the
+    plane means one wide shared load per fragment and one decode for all eight
+    warps, where the register form makes every warp redo the decode over
+    byte-wide, bank-conflicted reads.
   - **bf16 KV** (1,774 against 1,798) and **chunk width** 2,048/4,096/8,192
     (1,765/1,798/1,778): flat.
 
