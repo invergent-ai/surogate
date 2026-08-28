@@ -75,6 +75,10 @@ struct SequencePlanningInputs {
     StartupFeatures features;
     bool use_cuda_graph = true;
     int device          = 0;
+    int pipeline_stage_first               = 0; // pipeline stage layer range (0/0 = whole model)
+    int pipeline_stage_last                = 0;
+    const void* pipeline_import_pinned     = nullptr;
+    std::uint32_t pipeline_boundary_columns = 0;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
@@ -87,6 +91,10 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     std::uint32_t capacity                 = 0;
     std::uint32_t kv_capacity              = 0;
     std::uint32_t main_page_groups         = 0;
+    int pipeline_stage_first               = 0; // pipeline stage layer range (0/0 = whole model)
+    int pipeline_stage_last                = 0;
+    const void* pipeline_import_pinned     = nullptr;
+    std::uint32_t pipeline_boundary_columns = 0;
     std::uint32_t max_concurrency          = 1;
     std::uint32_t prefill_chunk            = 0;
     std::uint32_t draft_window             = 0;

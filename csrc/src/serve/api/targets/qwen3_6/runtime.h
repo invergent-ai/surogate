@@ -187,6 +187,9 @@ public:
 
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept;
+    /// Pipeline stage before the last: the pinned buffer holding the residual it exports
+    /// (the next stage's `pipeline_import_pinned`); null for a whole-model program.
+    [[nodiscard]] const void* stage_export_buffer() const noexcept;
 
 private:
     explicit Program(std::unique_ptr<detail::ProgramImpl<Variant>> impl) noexcept;

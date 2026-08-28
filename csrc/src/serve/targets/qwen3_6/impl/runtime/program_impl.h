@@ -185,6 +185,36 @@ void instantiate_graph_family(DecodeGraphFamily& family, const char* label, Devi
 
 } // namespace
 
+void ProgramImplCore::configure_stage(const SequencePlanImpl& plan) {
+    if (plan.pipeline_stage_first == 0 && plan.pipeline_stage_last == 0) { return; }
+    constexpr int layers = static_cast<int>(TextConfig::layers);
+    if (plan.pipeline_stage_first < 0 || plan.pipeline_stage_last > layers ||
+        plan.pipeline_stage_first >= plan.pipeline_stage_last) {
+        throw std::invalid_argument("pipeline stage layer range is invalid");
+    }
+    if (plan.pipeline_boundary_columns == 0) {
+        throw std::invalid_argument("pipeline stage needs a boundary column capacity");
+    }
+    stage.first   = plan.pipeline_stage_first;
+    stage.last    = plan.pipeline_stage_last;
+    stage.columns = static_cast<std::int32_t>(plan.pipeline_boundary_columns);
+    if (stage.first > 0) {
+        if (plan.pipeline_import_pinned == nullptr) {
+            throw std::invalid_argument("pipeline stage after the first needs the previous stage's export buffer");
+        }
+        stage.import_pinned = plan.pipeline_import_pinned;
+    }
+    if (stage.last < layers) {
+        const std::size_t bytes = static_cast<std::size_t>(residual_width<TextConfig>()) *
+                                  plan.pipeline_boundary_columns * sizeof(std::uint16_t);
+        CUDA_CHECK(cudaHostAlloc(&stage_export.data, bytes, cudaHostAllocPortable));
+        stage.export_pinned = stage_export.data;
+    }
+    std::fprintf(stderr, "pipeline stage: layers [%d, %d) of %d, boundary %u columns%s%s\n", stage.first,
+                 stage.last, layers, plan.pipeline_boundary_columns, stage.first > 0 ? ", imports" : "",
+                 stage.last < layers ? ", exports" : "");
+}
+
 ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const SequencePlanImpl& plan,
                                  DeviceContext& device_in)
     : model(model_in), device(device_in), capacity(plan.capacity), kv_capacity(plan.kv_capacity),
@@ -227,6 +257,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     if (model.dflash.has_value() && model.vision.has_value()) {
         throw std::invalid_argument("DFlash and Vision model views are mutually exclusive");
     }
+    configure_stage(plan);
     const DeviceSpan backing = persistent.alloc_bytes(plan.persistent.bytes, 256);
     decoder = std::make_unique<qwen3_6::DecoderState>(backing, plan.persistent.decoder);
     if (plan.persistent.replay_records) {
@@ -1302,7 +1333,7 @@ void ProgramImplCore::prepare_graphs() {
                                        io,
                                        prefill_hidden,
                                        prefill_chunk,
-                                       proposal_head, &decoder->ple};
+                                       proposal_head, &decoder->ple, stage};
     };
 
     if (speculative_backend == SpeculativeBackend::None) {
@@ -2296,6 +2327,7 @@ ProgramImplCore::advance_prefill_mixed(std::span<const std::uint32_t> prefill_la
                                    decoder->linear_attention, io, prefill_hidden, prefill_chunk,
                                    staged.cursor, {}, &decoder->text_kv, decoder->mtp_cache());
         card.set_ple_state(&decoder->ple);
+        card.set_stage(stage);
         card.set_sampling(static_cast<const ops::SamplingConfig*>(
             sampling_config.slice(1, static_cast<std::int32_t>(prefill_sequence.lane), 1).data));
         // Graph prompts run every chunk (graph or eager fallback alike) on

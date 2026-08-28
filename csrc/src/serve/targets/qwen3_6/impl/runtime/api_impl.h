@@ -246,6 +246,11 @@ void Program<Variant>::reset_memory_peaks() noexcept {
 }
 
 template <>
+const void* Program<Variant>::stage_export_buffer() const noexcept {
+    return impl_->stage_export_buffer();
+}
+
+template <>
 SequencePlanner<Variant> make_sequence_planner<Variant>(DeviceContext& device,
                                                         const EngineOptions& options,
                                                         Variant::WeightsProfile weights_profile) {

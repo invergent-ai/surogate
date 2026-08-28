@@ -157,6 +157,17 @@ struct DFlashFeatureSink {
 
 class VisionPrefillSession;
 
+/// Pipeline stage: the layer range this program runs, and the pinned buffers the residual
+/// crosses at the boundaries (import when first > 0, export when last < layers). Whole-model
+/// programs leave the defaults.
+struct StageSpan {
+    int first                 = 0;
+    int last                  = -1;      // -1: through the last layer
+    const void* import_pinned = nullptr; // [residual, columns] BF16, written by the previous stage
+    void* export_pinned       = nullptr; // [residual, columns] BF16, read by the next stage
+    std::int32_t columns      = 0;       // capacity of both buffers
+};
+
 class TextContext {
 public:
     TextContext(DeviceContext& ctx, const LoadedModelData& weights, WorkspaceArena& work,
@@ -171,6 +182,11 @@ public:
     TextContext(const TextContext&)            = delete;
     TextContext& operator=(const TextContext&) = delete;
 
+    /// Pipeline stage: restricts the layer loop to [first, last) and swaps the embedding for a
+    /// residual import (first > 0) and the finish/head for a residual export (last < layers).
+    void set_stage(const StageSpan& stage);
+    [[nodiscard]] bool stage_embeds() const noexcept { return stage_first_ == 0; }
+    [[nodiscard]] bool stage_finishes() const noexcept { return stage_last_ == kCfg.n_layers; }
     void set_proposal_head(const Weight* weight, const std::int32_t* ids, int count) noexcept {
         proposal_head_     = weight;
         proposal_head_ids_ = ids;
@@ -400,6 +416,12 @@ private:
     const Tensor* graph_pad_valid_                        = nullptr;
     Tensor* rewrite_checkpoint_hidden_output_             = nullptr;
     std::uint32_t mtp_proposal_extent_                    = 0;
+
+    int stage_first_                            = 0;
+    int stage_last_                             = kCfg.n_layers;
+    StageSpan stage_{};
+    void stage_import(Tensor& x, cudaStream_t stream);
+    void stage_export(const Tensor& x, cudaStream_t stream);
 
     const Weight* embed_                        = nullptr;
     const Tensor* final_norm_                   = nullptr;

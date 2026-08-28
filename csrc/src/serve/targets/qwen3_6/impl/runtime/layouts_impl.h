@@ -645,6 +645,10 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         "resolved Paged KV capacity exceeds int32"));
     impl->max_concurrency     = inputs.max_concurrency;
     impl->prefill_chunk       = inputs.prefill_chunk;
+    impl->pipeline_stage_first = inputs.pipeline_stage_first;
+    impl->pipeline_stage_last  = inputs.pipeline_stage_last;
+    impl->pipeline_import_pinned = inputs.pipeline_import_pinned;
+    impl->pipeline_boundary_columns = inputs.pipeline_boundary_columns;
     impl->draft_window        = inputs.draft_window;
     impl->speculative_backend = inputs.speculative_backend;
     impl->proposal_head       = inputs.proposal_head;
@@ -737,6 +741,10 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .features       = qwen3_6::startup_features(options),
         .use_cuda_graph = options.use_cuda_graph,
         .device         = options.device,
+        .pipeline_stage_first = options.pipeline_stage_first,
+        .pipeline_stage_last = options.pipeline_stage_last,
+        .pipeline_import_pinned = options.pipeline_import_pinned,
+        .pipeline_boundary_columns = options.pipeline_boundary_columns,
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);
     const std::uint32_t minimum_pages = std::max(logical_pages, inputs.max_concurrency);

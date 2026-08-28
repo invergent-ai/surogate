@@ -1,5 +1,6 @@
 #pragma once
 
+#include <memory>
 #include <api/targets/qwen4exp/package.h>
 #include <api/targets/qwen3_6/frontend_resources.h>
 #include <api/targets/qwen3_6/model_view.h>
@@ -163,7 +164,7 @@ public:
     LoadedModelData& operator=(LoadedModelData&&)      = delete;
 
     artifact::MaterializedArtifact backing;
-    HostBank host_bank;
+    std::shared_ptr<HostBank> host_bank; // shared by the pipeline stages of one process
     qwen3_6::FrontendResources frontend;
     RuntimeModelView runtime;
 };

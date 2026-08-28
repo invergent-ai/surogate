@@ -27,6 +27,7 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          &state.text_cache);
         card.set_ple_state(state.execution.ple);
+        card.set_stage(state.execution.stage);
 
         Tensor tokens          = ordinary.tokens.slice(0, 0, batch_size);
         Tensor cache_positions = ordinary.cache_positions.slice(0, 0, batch_size);
@@ -39,6 +40,7 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
 
         card.ordinary_decode_batch(tokens, cache_positions, rope_positions, kv_rows, lanes,
                                    envelope, hidden, logits);
+        if (!card.stage_finishes()) { return; } // a pipeline stage without the head: nothing to sample
         ops::scatter(hidden, lanes, state.continuation_hidden_store, state.execution.device.stream);
         ops::sample(logits, sampled, TextConfig::token_domain, ordinary.sampling, cache_positions,
                     ops::kSamplePurposeDecode, state.execution.work, state.execution.device.stream);
@@ -67,6 +69,7 @@ auto ordinary_batch_body_chained(OrdinaryBatchContext& state, std::int32_t batch
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          &state.text_cache);
         card.set_ple_state(state.execution.ple);
+        card.set_stage(state.execution.stage);
 
         Tensor tokens          = ordinary.tokens.slice(0, 0, batch_size);
         Tensor cache_positions = ordinary.cache_positions.slice(0, 0, batch_size);
@@ -79,6 +82,7 @@ auto ordinary_batch_body_chained(OrdinaryBatchContext& state, std::int32_t batch
 
         card.ordinary_decode_batch(tokens, cache_positions, rope_positions, kv_rows, lanes,
                                    envelope, hidden, logits);
+        if (!card.stage_finishes()) { return; } // a pipeline stage without the head: nothing to sample
         ops::scatter(hidden, lanes, state.continuation_hidden_store, state.execution.device.stream);
         ops::sample(logits, sampled, TextConfig::token_domain, ordinary.sampling, cache_positions,
                     ops::kSamplePurposeDecode, state.execution.work, state.execution.device.stream);

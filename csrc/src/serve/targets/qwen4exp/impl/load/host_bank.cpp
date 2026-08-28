@@ -2,6 +2,9 @@
 
 #include "core/device.h"
 
+#include <string>
+#include <unordered_map>
+#include <mutex>
 #include <cuda_runtime.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -73,6 +76,26 @@ const HostObject& HostBank::object(artifact::ObjectHandle handle) const {
         if (index == handle.index) { return object; }
     }
     throw std::out_of_range("host bank has no object for this handle");
+}
+
+
+std::shared_ptr<HostBank> HostBank::shared(const HostBankPlan& plan) {
+    static std::mutex mutex;
+    static std::unordered_map<std::string, std::weak_ptr<HostBank>> banks;
+    std::string key;
+    for (const auto& source : plan.objects) {
+        key += source.name;
+        key += ':';
+        key += std::to_string(source.payload.size());
+        key += ';';
+    }
+    std::lock_guard<std::mutex> lock(mutex);
+    if (auto found = banks.find(key); found != banks.end()) {
+        if (auto live = found->second.lock()) { return live; }
+    }
+    auto bank  = std::make_shared<HostBank>(plan);
+    banks[key] = bank;
+    return bank;
 }
 
 } // namespace ninfer::targets::qwen4exp::detail

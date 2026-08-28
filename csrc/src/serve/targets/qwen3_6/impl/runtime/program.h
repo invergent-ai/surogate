@@ -253,6 +253,14 @@ public:
 
     const LoadedModelData& model;
     DeviceContext& device;
+    schedule::StageSpan stage{}; // pipeline stage of this program (whole model by default)
+    // Pinned export buffer of a stage before the last ([residual, boundary columns] BF16).
+    struct PinnedBoundary {
+        void* data = nullptr;
+        ~PinnedBoundary() { if (data != nullptr) { cudaFreeHost(data); } }
+    } stage_export;
+    [[nodiscard]] const void* stage_export_buffer() const noexcept { return stage_export.data; }
+    void configure_stage(const SequencePlanImpl& plan);
     const std::uint32_t capacity;
     const std::uint32_t kv_capacity;
     const std::uint32_t max_concurrency;

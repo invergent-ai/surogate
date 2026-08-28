@@ -151,7 +151,7 @@ struct ExpertSlotCache {
     bool auto_share             = false;
     bool share_measured         = false;
     bool prefill_share_default  = false; // prefill share not given: follows the measured decode share
-    std::unique_ptr<ops::CpuExpertPool> cpu_pool;
+    std::shared_ptr<ops::CpuExpertPool> cpu_pool; // one per process: pipeline stages share the host cores
     cudaStream_t cpu_stream = nullptr; // side stream: the host round overlaps the GPU experts
     cudaEvent_t fork_event   = nullptr;
     cudaEvent_t join_event   = nullptr;
@@ -446,7 +446,16 @@ ExpertSlotCache& expert_slot_cache_for_current_device() {
             if (const char* threads = std::getenv("SUROGATE_SERVE_CPU_MOE_THREADS"); threads != nullptr && *threads != '\0') {
                 pool_options.threads = static_cast<std::uint32_t>(std::strtoul(threads, nullptr, 10));
             }
-            cache.cpu_pool = std::make_unique<ops::CpuExpertPool>(geometry, pool_options);
+            {
+                static std::mutex pool_mutex;
+                static std::weak_ptr<ops::CpuExpertPool> shared_pool;
+                std::lock_guard<std::mutex> lock(pool_mutex);
+                cache.cpu_pool = shared_pool.lock();
+                if (cache.cpu_pool == nullptr) {
+                    cache.cpu_pool = std::make_shared<ops::CpuExpertPool>(geometry, pool_options);
+                    shared_pool    = cache.cpu_pool;
+                }
+            }
             CUDA_CHECK(cudaStreamCreateWithFlags(&cache.cpu_stream, cudaStreamNonBlocking));
             CUDA_CHECK(cudaEventCreateWithFlags(&cache.fork_event, cudaEventDisableTiming));
             CUDA_CHECK(cudaEventCreateWithFlags(&cache.join_event, cudaEventDisableTiming));

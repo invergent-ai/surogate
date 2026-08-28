@@ -280,7 +280,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeature
 }
 
 LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized)
-    : backing(std::move(materialized)), host_bank(plan.host_bank) {
+    : backing(std::move(materialized)), host_bank(HostBank::shared(plan.host_bank)) {
     frontend = qwen3_6::take_frontend_resources(backing, plan.frontend);
 
     runtime.weights_arena   = &backing.device_arena();
@@ -308,7 +308,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             target.output = artifact::materialized_weight(
                 backing, source.attention.output, NumericFormat::W8G32_F16S,
                 static_cast<std::int32_t>(kHidden), TextConfig::query_size);
-            target.post_mixer = load_moe(backing, host_bank, source.moe, std::move(mix_mlp));
+            target.post_mixer = load_moe(backing, *host_bank, source.moe, std::move(mix_mlp));
             target.post_mixer.layer = static_cast<std::int32_t>(layer);
         } else {
             GdnWeights& target = runtime.gdn_layers.at(gdn_index++);
@@ -333,7 +333,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             target.output = artifact::materialized_weight(
                 backing, source.gdn.output, NumericFormat::W8G32_F16S,
                 static_cast<std::int32_t>(kHidden), static_cast<std::int32_t>(kValueDim));
-            target.post_mixer = load_moe(backing, host_bank, source.moe, std::move(mix_mlp));
+            target.post_mixer = load_moe(backing, *host_bank, source.moe, std::move(mix_mlp));
             target.post_mixer.layer = static_cast<std::int32_t>(layer);
         }
         if (source.has_ple) {
@@ -382,7 +382,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
         ple.hash.head_offsets[h]     = plan.ple_head_offsets[static_cast<std::size_t>(h)];
         ple.hash.head_vocab_sizes[h] = plan.ple_head_vocab_sizes[static_cast<std::size_t>(h)];
     }
-    const HostObject& table = host_bank.object(plan.ple_table);
+    const HostObject& table = host_bank->object(plan.ple_table);
     ple.table.rows          = table.device;
     ple.table.row_count     = TextConfig::ple_table_rows;
     ple.table.row_bytes     = TextConfig::ple_table_row_bytes;

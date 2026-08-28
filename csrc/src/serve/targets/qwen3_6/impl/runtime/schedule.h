@@ -45,6 +45,7 @@ struct ExecutionCore {
     std::uint32_t prefill_chunk;
     ProposalHead proposal_head;
     NgramPleStatePool* ple = nullptr; ///< the layer prologue's per-slot state, when the target has one
+    StageSpan stage{};                 ///< pipeline stage (whole model by default)
 };
 
 struct PrefillContext {

@@ -107,7 +107,7 @@ experts on the CPU (`-ot exps=CPU`, 32 threads).
 
 | config | users | decode tok/s | prefill tok/s | TTFT p50 |
 |---|---:|---:|---:|---:|
-| llama.cpp, 8× 5090 `--split-mode layer`, all resident | 1 / 32 | 39.3 / 28.8 | 157 / 115 | 0.95 s / 132 s |
+| llama.cpp, 8× 5090 `--split-mode layer`, all resident | 1 / 16 / 32 / 64 | 39.3 / 39.1 / 28.8 / 24.7 | 157 / 156 / 115 / 99 | 0.95 s / 86 s / 132 s / 311 s (16 of 48 requests timed out at 16 users) |
 | llama.cpp, 1× 5090, experts on CPU | 1 / 16 | 7.1 / 16.3 | 29 / 65 | 2.0 s / 29 s |
 | ik_llama.cpp, 1× 5090, experts on CPU (AVX-512 iqk kernels) | 1 / 16 | 21.8 / 23.9 | 87 / 96 | 1.8 s / 30 s |
 | surogate v0: experts zero-copy from pinned host | 1 / 16 | 5.2 / 7.6 | 21 / 30 | 1.8 s / 15.1 s |

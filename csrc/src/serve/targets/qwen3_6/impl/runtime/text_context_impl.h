@@ -730,11 +730,15 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
             prologue_ =
                 prologue_staging::decode_columns(work_, ids, linear_state_slots, batch, stream);
         }
-        Hooks::embed(weights_, ids, x, work_, stream);
+        if (stage_embeds()) { Hooks::embed(weights_, ids, x, work_, stream); } else { stage_import(x, stream); }
         NullTap tap;
         run_layers(x, Phase::Verify, tap);
-        Hooks::finish(weights_, x, kCfg.rms_eps, hidden, work_, stream);
-        ops::linear(hidden, *lm_head_, logits, stream);
+        if (stage_finishes()) {
+            Hooks::finish(weights_, x, kCfg.rms_eps, hidden, work_, stream);
+            ops::linear(hidden, *lm_head_, logits, stream);
+        } else {
+            stage_export(x, stream);
+        }
     }
     work_.reset();
 }
@@ -789,7 +793,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
             prologue_ = prologue_staging::decode_columns(work_, flat_ids, linear_state_slots,
                                                          columns, stream);
         }
-        Hooks::embed(weights_, flat_ids, x, work_, stream);
+        if (stage_embeds()) { Hooks::embed(weights_, flat_ids, x, work_, stream); } else { stage_import(x, stream); }
         if constexpr (Tap::enabled) { tap.begin(x); }
         run_layers(x, Phase::Verify, tap);
         if constexpr (requires { tap.capture_positions(cache_positions, stream); }) {
@@ -798,9 +802,13 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         Tensor flat_hidden = hidden.view({kCfg.hidden, columns});
         Tensor flat_logits = logits.view({kCfg.vocab, columns});
         Tensor flat_tokens = target_tokens.view({columns});
-        Hooks::finish(weights_, x, kCfg.rms_eps, flat_hidden, work_, stream);
-        ops::linear(flat_hidden, *lm_head_, flat_logits, stream);
-        ops::argmax(flat_logits, flat_tokens, kCfg.token_domain, stream);
+        if (stage_finishes()) {
+            Hooks::finish(weights_, x, kCfg.rms_eps, flat_hidden, work_, stream);
+            ops::linear(flat_hidden, *lm_head_, flat_logits, stream);
+            ops::argmax(flat_logits, flat_tokens, kCfg.token_domain, stream);
+        } else {
+            stage_export(x, stream);
+        }
     }
     work_.reset();
 }
@@ -1201,7 +1209,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
         cudaEventElapsedTime(&ms, from, to);
         into += ms;
     };
-    for (int layer = 0; layer < kCfg.n_layers; ++layer) {
+    for (int layer = stage_first_; layer < stage_last_; ++layer) {
         Hooks::layer_prologue(weights_, layer, x, prologue_, ple_state_, work_, ctx_.stream);
         if (ModelConfig::is_full(layer)) {
             const int fidx         = ModelConfig::full_idx(layer);
@@ -1273,6 +1281,36 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
             print_gdn_subsplit(timer, "prefill-families");
         }
     }
+}
+
+void TextContext::set_stage(const StageSpan& stage) {
+    const int last = stage.last < 0 ? kCfg.n_layers : stage.last;
+    if (stage.first < 0 || last > kCfg.n_layers || stage.first >= last) {
+        throw std::invalid_argument("pipeline stage layer range is invalid");
+    }
+    if ((stage.first > 0 && stage.import_pinned == nullptr) ||
+        (last < kCfg.n_layers && stage.export_pinned == nullptr)) {
+        throw std::invalid_argument("pipeline stage boundary buffer is missing");
+    }
+    stage_first_ = stage.first;
+    stage_last_  = last;
+    stage_       = stage;
+}
+
+void TextContext::stage_import(Tensor& x, cudaStream_t stream) {
+    const std::int32_t columns = x.ne[1];
+    if (columns > stage_.columns) { throw std::logic_error("pipeline stage import wider than its buffer"); }
+    CUDA_CHECK(cudaMemcpyAsync(x.data, stage_.import_pinned,
+                               static_cast<std::size_t>(kCfg.residual) * columns * sizeof(std::uint16_t),
+                               cudaMemcpyHostToDevice, stream));
+}
+
+void TextContext::stage_export(const Tensor& x, cudaStream_t stream) {
+    const std::int32_t columns = x.ne[1];
+    if (columns > stage_.columns) { throw std::logic_error("pipeline stage export wider than its buffer"); }
+    CUDA_CHECK(cudaMemcpyAsync(stage_.export_pinned, x.data,
+                               static_cast<std::size_t>(kCfg.residual) * columns * sizeof(std::uint16_t),
+                               cudaMemcpyDeviceToHost, stream));
 }
 
 void TextContext::run_layers(Tensor& x, Phase ph) {
@@ -1403,7 +1441,7 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
 
 
     Tensor x = roots.residual;
-    Hooks::embed(weights_, ids_device, x, work_, s);
+    if (stage_embeds()) { Hooks::embed(weights_, ids_device, x, work_, s); } else { stage_import(x, s); }
 
     PrefillFamilyTimer& timer = prefill_family_timer();
     cudaStreamCaptureStatus capturing = cudaStreamCaptureStatusNone;
@@ -1417,7 +1455,7 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
         cudaEventElapsedTime(&ms, from, to);
         into += ms;
     };
-    for (int layer = 0; layer < kCfg.n_layers; ++layer) {
+    for (int layer = stage_first_; layer < stage_last_; ++layer) {
         Hooks::layer_prologue(weights_, layer, x, prologue_, ple_state_, work_, ctx_.stream);
         if (ModelConfig::is_full(layer)) {
             const int fidx         = ModelConfig::full_idx(layer);
@@ -1642,6 +1680,9 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
     Tensor xf = prefill_hidden_.data != nullptr
                     ? matrix_window(prefill_hidden_, total)
                     : work_.alloc(DType::BF16, {kCfg.hidden, total});
+    if (!stage_finishes()) {
+        stage_export(x, s);
+    } else {
     Hooks::finish(weights_, x, kCfg.rms_eps, xf, work_, s);
 
     {
@@ -1688,6 +1729,7 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
         ops::sample(logits, sampled, kCfg.token_domain, finalize.sampling, positions_out,
                     ops::kSamplePurposePrefill, work_, s);
     }
+    } // stage_finishes
     const bool is_last = finalizers > 0;
 
     ctx_.synchronize();
@@ -1740,7 +1782,7 @@ void TextContext::prefill_graph_window(std::int32_t bucket) {
         prologue_ = prologue_staging::single_segment_columns(
             work_, ids_device, bucket, linear_state_current_slot_, &graph_pad_valid_storage_, 0, s);
     }
-    Hooks::embed(weights_, ids_device, x, work_, s);
+    if (stage_embeds()) { Hooks::embed(weights_, ids_device, x, work_, s); } else { stage_import(x, s); }
     NullTap tap;
     run_layers(x, Phase::Prefill, tap);
 
@@ -1748,7 +1790,11 @@ void TextContext::prefill_graph_window(std::int32_t bucket) {
         throw std::logic_error("prefill graph body requires the persistent prefill hidden store");
     }
     Tensor xf = matrix_window(prefill_hidden_, bucket);
-    Hooks::finish(weights_, x, kCfg.rms_eps, xf, work_, s);
+    if (stage_finishes()) {
+        Hooks::finish(weights_, x, kCfg.rms_eps, xf, work_, s);
+    } else {
+        stage_export(x, s);
+    }
 }
 
 // The capturable mixed-round body (PATCHES.md #30): one forward over
@@ -1822,9 +1868,9 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
                                    cudaMemcpyDeviceToDevice, s));
     }
     Tensor x = roots.residual;
-    Hooks::embed(weights_, ids_device, x, work_, s);
+    if (stage_embeds()) { Hooks::embed(weights_, ids_device, x, work_, s); } else { stage_import(x, s); }
 
-    for (int layer = 0; layer < kCfg.n_layers; ++layer) {
+    for (int layer = stage_first_; layer < stage_last_; ++layer) {
         Hooks::layer_prologue(weights_, layer, x, prologue_, ple_state_, work_, ctx_.stream);
         if (ModelConfig::is_full(layer)) {
             const int fidx         = ModelConfig::full_idx(layer);
@@ -2002,6 +2048,10 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
         throw std::logic_error("mixed graph body requires the persistent prefill hidden store");
     }
     Tensor xf = matrix_window(prefill_hidden_, total);
+    if (!stage_finishes()) {
+        stage_export(x, s);
+        return;
+    }
     Hooks::finish(weights_, x, kCfg.rms_eps, xf, work_, s);
 
     Tensor xf_decode = xf.slice(1, prefill_cols, batch);
@@ -2268,7 +2318,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 prologue_ = prologue_staging::single_segment_columns(
                     work_, ids_device, len, linear_state_current_slot_, nullptr, len, s);
             }
-            Hooks::embed(weights_, ids_device, x, work_, s);
+            if (stage_embeds()) { Hooks::embed(weights_, ids_device, x, work_, s); } else { stage_import(x, s); }
             window_laps.mark_pre();
             if (!local_scatter_indices.empty()) {
                 Tensor indices_device = roots.scatter_indices;
@@ -2287,9 +2337,13 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             Tensor xf = prefill_hidden_.data != nullptr
                             ? matrix_window(prefill_hidden_, len)
                             : work_.alloc(DType::BF16, {kCfg.hidden, len});
-            Hooks::finish(weights_, x, kCfg.rms_eps, xf, work_, s);
+            if (stage_finishes()) {
+                Hooks::finish(weights_, x, kCfg.rms_eps, xf, work_, s);
+            } else {
+                stage_export(x, s);
+            }
 
-            if (is_last) {
+            if (is_last && stage_finishes()) {
                 Tensor last_xf = xf.slice(1, len - 1, 1);
                 Tensor logits  = matrix_window(io_.logits, 1);
                 ops::linear(last_xf, *lm_head_, logits, s);

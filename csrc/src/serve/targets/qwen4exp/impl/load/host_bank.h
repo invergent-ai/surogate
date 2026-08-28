@@ -9,6 +9,7 @@
 #include "artifact/reader.h"
 
 #include <cstddef>
+#include <memory>
 #include <cstdint>
 #include <span>
 #include <string>
@@ -48,6 +49,11 @@ public:
 
     [[nodiscard]] const HostObject& object(artifact::ObjectHandle handle) const;
     [[nodiscard]] std::size_t total_bytes() const noexcept { return total_bytes_; }
+
+    /// The process-wide bank for this plan: pipeline stages of one model in one process share
+    /// the pinned experts instead of pinning them once per device (keyed by the objects' names
+    /// and sizes, so the same artifact loaded for another stage reuses the live bank).
+    [[nodiscard]] static std::shared_ptr<HostBank> shared(const HostBankPlan& plan);
 
 private:
     std::vector<std::pair<std::size_t, HostObject>> objects_;

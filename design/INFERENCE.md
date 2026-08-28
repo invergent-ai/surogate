@@ -975,3 +975,18 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   users is ~±8 % (32.2 / 36.0 / 37.9 for near-identical configs). Left for later inside
   phase 2's scope: Q4 host bank (single-user decode), vectorised tile repack, the sparse
   indexer beyond 2,051 tokens. Phase 3 starts.
+- Phase-3 bar completed (2026-08-28): llama.cpp 8× 5090 layer split at 16 users 39.1 tok/s,
+  TTFT 86 s, 16 of 48 requests timed out; at 64 users 24.7, TTFT 311 s. Its cards run one at a
+  time, so aggregate throughput does not rise with users and the queue explodes.
+- Phase 3 step A infrastructure written and compiling (2026-08-28): `StageSpan` on the family
+  `TextContext` (layer loop `[first, last)`, residual import instead of embed, residual export
+  instead of finish/head, in all six forward entries and both graph bodies; head epilogues
+  (scatter/sample/egress) skipped on stages without the head; chained decode rounds refused
+  for stages), carried by `ExecutionCore` and set by every card configuration site;
+  `EngineOptions::pipeline_stage_first/last`, `pipeline_import_pinned`,
+  `pipeline_boundary_columns` flow through the sequence plan into the program, which
+  allocates its pinned export buffer before graph capture and exposes it
+  (`Program::stage_export_buffer`). The host bank (`HostBank::shared`, keyed by object
+  names and sizes) and the CPU pool are now process-wide, so N stage instances pin the
+  experts once. Next: `--devices`, N instances in the engine, and the `PipelineProgram`
+  wrapper that drives the stages in lockstep behind the unchanged executor.

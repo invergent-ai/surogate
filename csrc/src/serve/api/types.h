@@ -79,6 +79,14 @@ struct LoadProgress {
 struct EngineOptions {
     std::filesystem::path artifact_path;
     int device                         = 0;
+    // Pipeline parallelism (phase 3): this engine instance runs layers [pipeline_stage_first,
+    // pipeline_stage_last) of the model (0/0 = the whole model); a stage after the first reads
+    // the residual from `pipeline_import_pinned` (the previous stage's export buffer, sized
+    // for `pipeline_boundary_columns` columns) and a stage before the last exports its own.
+    int pipeline_stage_first           = 0;
+    int pipeline_stage_last            = 0;
+    const void* pipeline_import_pinned = nullptr;
+    std::uint32_t pipeline_boundary_columns = 0;
     std::uint32_t max_context          = 2048; // Exact logical ceiling of each request.
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
     // Expert slot cache for targets that stream MoE experts from the host: number of device
