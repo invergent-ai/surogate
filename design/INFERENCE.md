@@ -1056,3 +1056,11 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   **two stages in lockstep 72.5 tok/s** — 2× before any overlap, because each stage's pool
   caches only its own 24 layers' experts (3,000 slots per stage = twice the resident set),
   so misses and host rounds halve per stage. The pipelined number follows.
+- First pipelined (groups=2) run hung under load (2026-08-28): server up, probes correct, no
+  completions. With two groups in flight the two stages' CPU host rounds run at the same time
+  on CUDA driver threads, and the shared `CpuExpertPool::run` is not re-entrant (its
+  generation/phase protocol assumes one caller) — the workers waited on a phase that never
+  came. Fix (commit 80bc1b9c): `run` takes a mutex, so the stages' host rounds alternate on the
+  same cores; per-socket pools per stage group remain the option if the host becomes the
+  limit. Other shared host state audited: the bank is read-only, the caches and slice
+  contexts are per device, the thread-locals live on the driver thread only.
