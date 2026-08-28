@@ -92,8 +92,9 @@ passes with the cards rotated between them.
 | Qwen3.5-0.8B | from GGUF Q4_K_M | **10,095** | 6,694 | **+51 %** | **45 ms** | 658 ms |
 | Qwen3.5-4B | NVFP4 3.56 GiB | **4,942** | 4,246 | **+16 %** | **45 ms** | 239 ms |
 | Qwen3.8-27B | NVFP4 mixed | 980 | **1,039** | **−6 %** | **1.9 s** | 8.3 s |
+| Qwen3.6-35B-A3B | Q4/Q5/Q6 MoE | 1,784 | **2,257** | **−21 %** | **129 ms** | 1.26 s |
 
-Two of three beaten on throughput, all three on TTFT by 4–15x. The 27B's
+Two of four beaten on throughput, all four on TTFT by 4–15x. The 27B's
 remaining 6 % is per-token compute, not scheduling — see the round-cost
 section below, which rules out batching, lanes, speculation and the chunk
 ladder by measurement.
@@ -492,10 +493,35 @@ offloading is involved. 100 users, 90 s, GPU7, fp8 KV, 64 lanes:
 | **vLLM** NVFP4 (2048/16) | GPU3 | 172 | **22,050** | **7.9 s** | 1,052/0 |
 
 The engine is at 67 % of vLLM on both shapes (prefill-heavy 61 % before
-`--max-num-batched-tokens 4096`) — the same gap as the 27B, and the 35B has no
-NVFP4 weights, so the gap is not the GEMM family. `--max-num-seqs` is capped
-at 64 while vLLM runs the MoE at 256 sequences; that cap is the structural
-35B decode lever. (Earlier GPU7 rows, different card: 1,596 / 6,384 and 13,531.)
+`--max-num-batched-tokens 4096`). (Earlier GPU7 rows, different card:
+1,596 / 6,384 and 13,531.)
+
+**The 64-lane figure above was the engine's old ceiling, not the 35B's**
+(2026-08-28). #79 moved the cap to 128 and nothing about the 35B stops it
+taking them — the artifact leaves 8.4 GB after weights, and KV then admits 99
+sequences. One card each, everything at once, 512/128, 100 users, 90 s:
+
+| lanes | chunk | decode tok/s | prefill tok/s | KV pages | running | TTFT p50 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 64 | 4,096 | 1,595 | 6,380 | 6,724 | 64 | 3,456 ms |
+| 96 | 4,096 | 1,746 | 6,983 | 4,428 | 96 | 320 ms |
+| 128 | 4,096 | **1,781** | **7,126** | 2,133 | 99 | **129 ms** |
+| 128 | 2,048 | 1,763 | 7,053 | 2,530 | 99 | 129 ms |
+
+**+12 % decode and 27x better TTFT for a flag.** Paired against vLLM at that
+setting, two passes with the cards rotated:
+
+| | pass 1 | pass 2 | mean | TTFT p50 |
+|---|---:|---:|---:|---:|
+| surogate serve, 128 lanes | 1,787 | 1,780 | 1,784 | **129 ms** |
+| **vLLM** | 2,280 | 2,234 | **2,257** | 1,259 ms |
+
+So the 35B is at **79 % of vLLM** on decode, up from 67 %, and leads TTFT by
+**9.8x**. What is left is the weight format, as at the 4B: our artifact is
+21.3 GB of mixed Q4/Q5/Q6 routed experts where vLLM reads an NVFP4 export.
+`RedHatAI/Qwen3.6-35B-A3B-NVFP4` is on disk and quantises the attention,
+output and expert matrices (only `linear_attn` stays BF16), so the 4B's
++54 %-from-format result is the precedent to chase here.
 
 vLLM's rows above run `RedHatAI/Qwen3.6-35B-A3B-NVFP4` from a local copy whose
 `config.json` ignore list gained `re:.*linear_attn\\.in_proj_.*` — the export
