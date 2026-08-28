@@ -31,8 +31,8 @@ phase 3 = PP across 8 GPUs; phase 4 = EP measured against PP.
 | Hyper-connection op (`api/ops/hyper_connection.h`, `ops/hyper_connection/`) | built (commit 81257e66) | mix / combine / broadcast_streams |
 | PLE op (`api/ops/ngram_ple.h`, `ops/ngram_ple/`) | built (commit 81257e66) | device-side hash, IQ4_NL row gather from pinned host, group norms, gate, dilated conv with per-slot state |
 | qwen3_6 family: residual-width trait, embed/finish/norm hooks (F1), layer-prologue hook with per-column segment facts (F2) | done (commits 5b1b6efd, b4e13eb6), 35B unchanged | `runtime/residual_policy.h`, `runtime/prologue_columns.h`; staging in every forward entry |
-| PLE state pool `core/ngram_ple_state.*` (per-slot conv history [9,10240] + token history [2]) | wired (F3, building) | `DecoderState::{copy,reset}_state_slot` forward to both pools at the slot-lifecycle sites; `ExecutionCore::ple` reaches every TextContext |
-| Target `targets/qwen4exp/` (package, bindings, host bank, variant, registry) | written, first build in flight | model_id `qwen3.8-flash-next`, weights_id `w8-hc-v1`, target key `qwen4exp`; experts and the PLE table live in pinned, device-mapped host memory and the kernels read them zero-copy (v0) |
+| PLE state pool `core/ngram_ple_state.*` (per-slot conv history [9,10240] + token history [2]) | wired (F3, in 9a374d71) | `DecoderState::{copy,reset}_state_slot` forward to both pools at the slot-lifecycle sites; `ExecutionCore::ple` reaches every TextContext |
+| Target `targets/qwen4exp/` (package, bindings, host bank, variant, registry) | built and committed (9a374d71); first serve in flight | model_id `qwen3.8-flash-next`, weights_id `w8-hc-v1`, target key `qwen4exp`; experts and the PLE table live in pinned, device-mapped host memory and the kernels read them zero-copy (v0) |
 | Expert access v0: zero-copy reads from the pinned host bank (`impl/load/host_bank.*`) | written with the target | no staging copies at all in v0; the device slot cache and CPU expert compute come in phase 2 |
 | Parity vs llama.cpp, first throughput row | not started | |
 
@@ -133,3 +133,10 @@ phase 3 = PP across 8 GPUs; phase 4 = EP measured against PP.
   helpers used at the six `program_impl.h` sites and the rewrite-checkpoint copy in the text
   context; `ExecutionCore::ple` set at its six initialisers; `configure_text_card` and the
   decode/dflash/mtp cards call `set_ple_state`. Variant supplies `ple_state_spec(slot_count)`.
+- Target + F3 committed (9a374d71). First serve attempt of the 163 GB artifact on GPU 1
+  (`probe_flash.sh`: `--max-num-seqs 4 --max-model-len 2048`, three greedy prompts, then a
+  1-user loadgen) is running; the server option for the context is `--max-model-len`.
+- First load attempt crawled at ~67 MB/s: the artifact mapping serves random object reads
+  without readahead, so copying 154 GB out of it faulted one page at a time. `HostBank` now
+  asks for `MADV_SEQUENTIAL` + `MADV_WILLNEED` over each object before its 16-thread copy;
+  the serve was relaunched with that build (the stalled process had to be killed).

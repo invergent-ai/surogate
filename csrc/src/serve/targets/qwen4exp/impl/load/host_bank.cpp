@@ -3,7 +3,11 @@
 #include "core/device.h"
 
 #include <cuda_runtime.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
+#include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <stdexcept>
 #include <thread>
@@ -29,8 +33,17 @@ HostBank::HostBank(const HostBankPlan& plan) {
         void* device = nullptr;
         CUDA_CHECK(cudaHostGetDevicePointer(&device, object.host, 0));
         object.device = device;
-        // Parallel copy: the artifact mapping is page-cache backed and a single memcpy of a
-        // 100+ GB bank would leave most of the memory bandwidth idle.
+        // The artifact mapping is read-ahead-free (it serves random object reads), so a
+        // straight copy would fault it in one page at a time; ask for sequential readahead over
+        // the whole object first, then copy it with several threads.
+        {
+            const auto address = reinterpret_cast<std::uintptr_t>(source.payload.data());
+            const std::uintptr_t page = static_cast<std::uintptr_t>(sysconf(_SC_PAGESIZE));
+            const std::uintptr_t start = address & ~(page - 1);
+            const std::size_t length = static_cast<std::size_t>(address + object.bytes - start);
+            (void)madvise(reinterpret_cast<void*>(start), length, MADV_SEQUENTIAL);
+            (void)madvise(reinterpret_cast<void*>(start), length, MADV_WILLNEED);
+        }
         const std::size_t workers = 16;
         const std::size_t chunk   = (object.bytes + workers - 1) / workers;
         std::vector<std::thread> threads;
