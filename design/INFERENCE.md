@@ -1029,3 +1029,11 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   data while the other stages keep running. Stages now own their import buffers. Mixed
   rounds stay lockstep per round (C2 splits them). Test running: one device vs lockstep vs
   pipelined at 8 users on the decode-heavy 128/512 shape (GPUs 2+3).
+- **Step B parity: bit-exact** (2026-08-28). Token-0 dumps of the prompt forward ("The capital
+  of France is", 17 columns, CPU split off) from one device and from the 2-stage pipeline
+  (GPUs 2+3, boundary after layer 24) are identical at every layer boundary — all 48
+  `f1_layer*.bin` at rel-L2 0, including layer 24 (the imported residual) — and at
+  `f1_final`. The residual crosses the pinned boundary exactly. (The CLI run with dumps then
+  aborted at the first decode step with an illegal address surfacing in the dump helper;
+  the serving path decodes correctly with graphs, so this is being localised with
+  CUDA_LAUNCH_BLOCKING on the eager path.)
