@@ -649,6 +649,25 @@ yet. llama.cpp upstream master (added `qwen4exp` this week; CUDA build at
 | **surogate serve + slot cache + CPU expert split** (`--expert-slots 3000 --cpu-moe-share 0.7`, host round overlapped on a side stream, min-tokens 4, 32 host threads) | 1 | 18.4 | 74 | 2.95 s |
 | | 16 | **32.9** | 132 | 16.3 s |
 | (share 0.5, `numactl --interleave=all`) | 16 | 21.7 | 93 | 16.9 s |
+| (share 0.7, `numactl --interleave=all`) | 16 | **33.5** | 138 | 12.3 s |
+
+
+External single-user references reported by others on this model with llama.cpp
+PR #27742 (not run here; different hardware, quantisation and prompt shape):
+
+| config | users | decode tok/s | prefill tok/s |
+|---|---:|---:|---:|
+| RTX 4090 + 110 GB DDR4, PCIe 4.0 x16, UD-Q4_K_XL, `-cmoe -b 4096 -ub 4096`, 28k prompt, 80k-250k context | 1 | 20.8-21.0 | 356-364 |
+| same, `-ncmoe 40` (40 layers' experts resident) | 1 | 22.5 | 384 |
+| RTX 5090 + 64 GB DDR5, UD-Q2_K_XL (experts ~half the bytes of Q4_K_XL), 32k / 131k context | 1 | 33-34 / 26 | ~300 |
+
+The single-user decode numbers agree with the bandwidth reading above: the
+host moves one expert set per token, so decode scales with bytes per expert
+(Q2_K_XL ≈ 2× Q4_K_XL ≈ 1.5× the W8 bank used here), and our 18.4 at one user
+sits where a W8 bank on this host lands. The prefill gap (74 here vs ~360) is
+real and is the next phase-2 item: llama.cpp prefills the experts on the CPU
+with a batched int8 GEMM at `-ub 4096`, while this engine still gathers every
+touched expert over PCIe for each 512-token prompt (≈211 GB per prompt).
 
 Both configurations answer the probes correctly (`'Paris'`, `'2, 3, and 5'`).
 The engine row (2026-08-28, parity with llama.cpp verified stage by stage, see

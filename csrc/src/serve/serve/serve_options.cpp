@@ -103,7 +103,7 @@ KvCapacityPolicy parse_kv_capacity(const char* text) {
 std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
-           "[--served-model-name ID] [--max-model-len N] [--kv-capacity N|auto] [--expert-slots N] [--cpu-moe-share F] [--cpu-moe-min-tokens N] "
+           "[--served-model-name ID] [--max-model-len N] [--kv-capacity N|auto] [--expert-slots N] [--cpu-moe-share F|auto] [--cpu-moe-min-tokens N] "
            "[--max-num-seqs N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--max-num-batched-tokens N] [--log-stats-interval-ms N] [--device N] "
@@ -202,9 +202,14 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.cpu_moe_min_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--cpu-moe-min-tokens"), "cpu-moe-min-tokens"));
         } else if (arg == "--cpu-moe-share") {
-            options.cpu_moe_share = std::strtof(require_value("--cpu-moe-share"), nullptr);
-            if (options.cpu_moe_share < 0.0F || options.cpu_moe_share > 1.0F) {
-                throw std::invalid_argument("--cpu-moe-share must be within [0, 1]");
+            const char* text = require_value("--cpu-moe-share");
+            if (std::string(text) == "auto") {
+                options.cpu_moe_share = -1.0F; // measured at startup (bandwidth-matched)
+            } else {
+                options.cpu_moe_share = std::strtof(text, nullptr);
+                if (options.cpu_moe_share < 0.0F || options.cpu_moe_share > 1.0F) {
+                    throw std::invalid_argument("--cpu-moe-share must be within [0, 1] or auto");
+                }
             }
         } else if (arg == "--max-num-seqs") {
             // vLLM's name for the same quantity: sequences run per iteration,

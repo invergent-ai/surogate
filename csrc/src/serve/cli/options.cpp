@@ -131,9 +131,14 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--cpu-moe-min-tokens") {
             options.cpu_moe_min_tokens = parse_u32(value(arg), "cpu-moe-min-tokens");
         } else if (arg == "--cpu-moe-share") {
-            options.cpu_moe_share = std::strtof(value(arg), nullptr);
-            if (options.cpu_moe_share < 0.0F || options.cpu_moe_share > 1.0F) {
-                throw std::invalid_argument("--cpu-moe-share must be within [0, 1]");
+            const std::string text = value(arg);
+            if (text == "auto") {
+                options.cpu_moe_share = -1.0F; // measured at startup (bandwidth-matched)
+            } else {
+                options.cpu_moe_share = std::strtof(text.c_str(), nullptr);
+                if (options.cpu_moe_share < 0.0F || options.cpu_moe_share > 1.0F) {
+                    throw std::invalid_argument("--cpu-moe-share must be within [0, 1] or auto");
+                }
             }
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = parse_u32(value(arg), "prefill-chunk");

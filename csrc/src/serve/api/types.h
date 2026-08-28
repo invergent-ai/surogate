@@ -86,7 +86,8 @@ struct EngineOptions {
     // host bank ignore it.
     std::uint32_t expert_slots         = 0;
     // Fraction [0,1] of a round's missing experts computed on the host instead of fetched into
-    // the slot cache (0 = everything is fetched). Needs expert_slots > 0.
+    // the slot cache (0 = everything is fetched; -1 = measure host vs PCIe rates at startup and
+    // match them). Needs expert_slots > 0.
     float cpu_moe_share                = 0.0F;
     // Rounds narrower than this many columns keep every miss on the GPU (the host round-trip
     // costs more than it saves); 0 = the target's default.

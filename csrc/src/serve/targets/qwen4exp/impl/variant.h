@@ -76,10 +76,15 @@ struct Variant {
     static void configure_cpu_moe_share(float share);
     /// Minimum round width (columns) for the split; 0 keeps the default (4).
     static void configure_cpu_moe_min_tokens(std::uint32_t tokens);
+    /// With `--cpu-moe-share auto`, times a PCIe gather and a host round of layer 0's experts
+    /// (outside graph capture) and sets the share to host/(host+pcie). Called by
+    /// create_program before the graphs are captured; a no-op otherwise.
+    static void prepare_expert_split(const ModelView& model);
     static constexpr bool has_layer_prologue = true;
     // 48 layers, a four-stream residual, the PLE nodes and (with the CPU split) the host-round
-    // nodes per layer: the decode graphs measure 15.7-21.4 MiB per lane against the family's 12.
-    static constexpr std::size_t ordinary_graph_allowance_per_lane_bytes = 24ULL * 1024ULL * 1024ULL;
+    // nodes per layer: the decode graphs measure 15.7-21.4 MiB per lane at 16 lanes and 31.4 MiB
+    // per lane at 32 (the wider lanes cost more) against the family's 12.
+    static constexpr std::size_t ordinary_graph_allowance_per_lane_bytes = 48ULL * 1024ULL * 1024ULL;
     // Parity probe: dumps family-loop intermediates under SUROGATE_SERVE_DUMP_RESIDUAL.
     static void debug_probe(const char* tag, const Tensor& tensor, cudaStream_t stream);
     [[nodiscard]] static NgramPleStatePoolSpec ple_state_spec(std::int32_t slot_count);

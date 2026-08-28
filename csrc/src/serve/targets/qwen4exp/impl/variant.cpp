@@ -14,6 +14,7 @@
 #include "ops/linear/bf16/bf16_cublaslt.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -104,6 +105,8 @@ struct ExpertSlotCache {
     // --- CPU expert split (SUROGATE_SERVE_CPU_MOE_SHARE=<fraction of misses>) ---
     std::uint32_t cpu_share_q16 = 0;
     std::int32_t cpu_max_tokens = 0;
+    bool auto_share             = false;
+    bool share_measured         = false;
     std::unique_ptr<ops::CpuExpertPool> cpu_pool;
     cudaStream_t cpu_stream = nullptr; // side stream: the host round overlaps the GPU experts
     cudaEvent_t fork_event  = nullptr;
@@ -275,12 +278,23 @@ ExpertSlotCache& expert_slot_cache_for_current_device() {
         cache.stats_every = std::strtol(stats, nullptr, 10);
     }
     double fraction = 0.0;
+    bool auto_share = false;
     if (auto configured = configured_cpu_share().find(device);
-        configured != configured_cpu_share().end() && configured->second > 0.0F) {
-        fraction = static_cast<double>(configured->second);
+        configured != configured_cpu_share().end() && configured->second != 0.0F) {
+        if (configured->second < 0.0F) {
+            auto_share = true;
+            fraction   = 0.7; // placeholder until prepare_expert_split measures the rates
+        } else {
+            fraction = static_cast<double>(configured->second);
+        }
     } else if (const char* share = std::getenv("SUROGATE_SERVE_CPU_MOE_SHARE");
                share != nullptr && *share != '\0') {
-        fraction = std::strtod(share, nullptr);
+        if (std::string(share) == "auto") {
+            auto_share = true;
+            fraction   = 0.7;
+        } else {
+            fraction = std::strtod(share, nullptr);
+        }
     }
     {
         if (fraction > 0.0) {
@@ -318,8 +332,9 @@ ExpertSlotCache& expert_slot_cache_for_current_device() {
             CUDA_CHECK(cudaStreamCreateWithFlags(&cache.cpu_stream, cudaStreamNonBlocking));
             CUDA_CHECK(cudaEventCreateWithFlags(&cache.fork_event, cudaEventDisableTiming));
             CUDA_CHECK(cudaEventCreateWithFlags(&cache.join_event, cudaEventDisableTiming));
-            std::fprintf(stderr, "qwen4exp: CPU expert split enabled: %.0f%% of misses on %u host threads\n",
-                         100.0 * fraction, cache.cpu_pool->threads());
+            cache.auto_share = auto_share;
+            std::fprintf(stderr, "qwen4exp: CPU expert split enabled: %.0f%% of misses on %u host threads%s\n",
+                         100.0 * fraction, cache.cpu_pool->threads(), auto_share ? " (auto: measured at startup)" : "");
         }
     }
     std::fprintf(stderr, "qwen4exp: expert slot cache enabled: %d slots (%.1f GiB pool)\n",
@@ -514,6 +529,71 @@ void Variant::configure_expert_slots(std::uint32_t slots) {
     CUDA_CHECK(cudaGetDevice(&device));
     std::lock_guard<std::mutex> lock(expert_slot_mutex());
     configured_expert_slots()[device] = slots;
+}
+
+void Variant::prepare_expert_split(const ModelView& model) {
+    ExpertSlotCache& cache = expert_slot_cache_for_current_device();
+    if (!cache.enabled || !cache.cpu_split_enabled() || !cache.auto_share || cache.share_measured) {
+        return;
+    }
+    // Layer 0's routed experts: the first MoE layer's payload.
+    const SparseMoePayload* payload = nullptr;
+    for (const auto& gdn : model.gdn_layers) {
+        if (gdn.post_mixer.layer >= 0) { payload = &gdn.post_mixer; break; }
+    }
+    if (payload == nullptr || payload->host_gate_up == nullptr) { return; }
+    ExpertSlotCache::Layer& layer = cache.layer(*payload);
+    const auto geometry           = ops::kSparseMoeFlashNextGeometry;
+    constexpr int kExpertsTimed   = 64;
+    constexpr int kRepeats        = 4;
+    cudaStream_t stream           = nullptr;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    // PCIe: gather kExpertsTimed experts into the first slots (the pool is otherwise empty).
+    std::vector<std::int32_t> slots(kExpertsTimed), experts(kExpertsTimed);
+    for (int i = 0; i < kExpertsTimed; ++i) { slots[i] = i; experts[i] = i; }
+    const long long count = kExpertsTimed;
+    CUDA_CHECK(cudaMemcpy(cache.misses.slots.data, slots.data(), slots.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(cache.misses.experts.data, experts.data(), experts.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(cache.misses.count.data, &count, sizeof(count), cudaMemcpyHostToDevice));
+    ops::expert_slot_gather(layer.bank, cache.misses, cache.pool, stream); // warm
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    cudaEvent_t t0 = nullptr, t1 = nullptr;
+    CUDA_CHECK(cudaEventCreate(&t0));
+    CUDA_CHECK(cudaEventCreate(&t1));
+    CUDA_CHECK(cudaEventRecord(t0, stream));
+    for (int r = 0; r < kRepeats; ++r) { ops::expert_slot_gather(layer.bank, cache.misses, cache.pool, stream); }
+    CUDA_CHECK(cudaEventRecord(t1, stream));
+    CUDA_CHECK(cudaEventSynchronize(t1));
+    float gather_ms = 0.0F;
+    CUDA_CHECK(cudaEventElapsedTime(&gather_ms, t0, t1));
+    const double expert_bytes = static_cast<double>(layer.bank.gate_up_codes_bytes_per_expert + layer.bank.gate_up_scales_bytes_per_expert +
+                                                    layer.bank.down_codes_bytes_per_expert + layer.bank.down_scales_bytes_per_expert);
+    const double pcie_gbs = expert_bytes * kExpertsTimed * kRepeats / (gather_ms * 1e-3) / 1e9;
+    // Host: the same experts as jobs over 8 tokens of zeros-free activations (the round's x is
+    // arbitrary for timing; use the staged buffer as is).
+    const int tokens = 8;
+    cache.job_scratch.resize(static_cast<std::size_t>(kExpertsTimed));
+    for (int i = 0; i < kExpertsTimed; ++i) { cache.job_scratch[static_cast<std::size_t>(i)] = {i % tokens, i, 0.1F}; }
+    std::fill_n(cache.x_host, static_cast<std::size_t>(geometry.hidden) * tokens, static_cast<std::uint16_t>(0x3F80)); // 1.0 in BF16
+    ops::CpuExpertRound round{cache.x_host, cache.out_host, tokens, cache.job_scratch};
+    std::fill_n(cache.out_host, static_cast<std::size_t>(geometry.hidden) * tokens, 0.0F);
+    cache.cpu_pool->run(layer.cpu_bank, round); // warm
+    const auto h0 = std::chrono::steady_clock::now();
+    for (int r = 0; r < kRepeats; ++r) { cache.cpu_pool->run(layer.cpu_bank, round); }
+    const double host_s   = std::chrono::duration<double>(std::chrono::steady_clock::now() - h0).count();
+    const double host_gbs = expert_bytes * kExpertsTimed * kRepeats / host_s / 1e9;
+    double share = host_gbs / (host_gbs + pcie_gbs);
+    share        = std::min(0.9, std::max(0.3, share));
+    cache.cpu_share_q16  = static_cast<std::uint32_t>(share * 65536.0);
+    cache.share_measured = true;
+    // Leave the pool directory clean for the real rounds.
+    ops::expert_slot_directory_reset(cache.directory, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaEventDestroy(t0));
+    CUDA_CHECK(cudaEventDestroy(t1));
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    std::fprintf(stderr, "qwen4exp: CPU split auto share: host %.0f GB/s, PCIe gather %.0f GB/s -> %.0f%% of misses on the host\n",
+                 host_gbs, pcie_gbs, 100.0 * share);
 }
 
 void Variant::configure_cpu_moe_min_tokens(std::uint32_t tokens) {
