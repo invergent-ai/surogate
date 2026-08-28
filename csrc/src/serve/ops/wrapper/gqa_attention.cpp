@@ -37,6 +37,8 @@ std::int32_t kv_heads_for_q_heads(std::int32_t q_heads, const char* op) {
 std::int32_t kv_heads_for_pair(std::int32_t q_heads, std::int32_t source_kv_heads,
                                const char* op) {
     if (q_heads == 16 && source_kv_heads == 4) { return 4; }
+    // Qwen3.8-Flash-Next: 24 query heads over 2 KV heads (the 27B pairs 24 with 4).
+    if (q_heads == 24 && source_kv_heads == 2) { return 2; }
     return kv_heads_for_q_heads(q_heads, op);
 }
 

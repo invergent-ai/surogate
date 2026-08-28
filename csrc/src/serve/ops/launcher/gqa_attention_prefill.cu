@@ -150,6 +150,11 @@ void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positi
                                            cudaStream_t stream) {
     const GqaPrefillDirectMetadata metadata{
         static_cast<const std::int32_t*>(cache.block_table.data)};
+    if (q.ne[1] == Gqa256_24q2::QHeads && cache.num_kv_heads == Gqa256_24q2::KVHeads) {
+        gqa_attention_prompt_attention_launch_for<Gqa256_24q2>(q, positions, scale, cache,
+                                                               metadata, out, stream);
+        return;
+    }
     if (q.ne[1] == Gqa27Geometry::QHeads) {
         gqa_attention_prompt_attention_launch_for<Gqa27Geometry>(q, positions, scale, cache,
                                                                  metadata, out, stream);
@@ -178,6 +183,7 @@ void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positi
         gqa_kv_append_launch_for<Gqa27Geometry>(k, v, positions, cache, metadata, stream);
         return;
     }
+    // KV append depends on KVHeads only; every two-head geometry shares the 35B's.
     gqa_kv_append_launch_for<Gqa35Geometry>(k, v, positions, cache, metadata, stream);
 }
 
@@ -193,6 +199,12 @@ void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor&
             .table_rows   = static_cast<const std::int32_t*>(table_rows.data),
             .table_stride = cache.block_tables.ne[0],
         };
+        if (q.ne[1] == Gqa256_24q2::QHeads && cache.num_kv_heads == Gqa256_24q2::KVHeads) {
+            gqa_kv_append_launch_for<Gqa256_24q2>(k, v, positions, cache, metadata, stream);
+            gqa_attention_prompt_attention_launch_for<Gqa256_24q2>(q, positions, scale, cache,
+                                                                   metadata, out, stream);
+            return;
+        }
         if (q.ne[1] == Gqa27Geometry::QHeads) {
             gqa_kv_append_launch_for<Gqa27Geometry>(k, v, positions, cache, metadata, stream);
             gqa_attention_prompt_attention_launch_for<Gqa27Geometry>(q, positions, scale, cache,

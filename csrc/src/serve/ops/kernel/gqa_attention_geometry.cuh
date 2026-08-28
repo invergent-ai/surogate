@@ -43,6 +43,7 @@ using Gqa256_24q4  = GqaGeometry<256, 24, 4, 1>; // qwen3.8-27b
 using Gqa256_16q2  = GqaGeometry<256, 16, 2, 2>; // qwen3.6-35b-a3b
 using Gqa256_8q2   = GqaGeometry<256, 8, 2, 2>;  // qwen3.5-0.8b
 using Gqa256_16q4  = GqaGeometry<256, 16, 4, 2>; // qwen3.5-4b, qwen3.5-2b
+using Gqa256_24q2  = GqaGeometry<256, 24, 2, 1>; // qwen3.8-flash-next (group of twelve)
 
 // Compatibility aliases for call sites not yet migrated. New code uses the
 // shape names above; these disappear once the last dispatcher is converted.

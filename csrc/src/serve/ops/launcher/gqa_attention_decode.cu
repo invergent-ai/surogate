@@ -297,9 +297,14 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
     do {                                                                                           \
         const auto launch_profile = [&]<bool MultiBatch, bool Masked>() {                          \
             if (cache.dtype == DType::I8) {                                                        \
-                launch_tc_partial_i8<Geometry, (TOKENS), MultiBatch, Masked>(                      \
-                    q, input, pos, scale, cache, invocation, logical_capacity,                     \
-                    implementation_window, splits, partial_acc, partial_m, partial_l, stream);     \
+                if constexpr (Geometry::GroupSize > 8) {                                           \
+                    throw std::invalid_argument(                                                   \
+                        "gqa_attention: int8 KV is not served for this head geometry");            \
+                } else {                                                                           \
+                    launch_tc_partial_i8<Geometry, (TOKENS), MultiBatch, Masked>(                  \
+                        q, input, pos, scale, cache, invocation, logical_capacity,                 \
+                        implementation_window, splits, partial_acc, partial_m, partial_l, stream); \
+                }                                                                                  \
             } else if (cache.dtype == DType::FP8_E4M3FN) {                                         \
                 launch_tc_partial_bf16<Geometry, (TOKENS), (WARPS), MultiBatch, Masked,            \
                                        decltype(input), std::uint8_t>(                             \
@@ -325,6 +330,10 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
         }                                                                                          \
     } while (0)
 
+    if (invocation.width * Geometry::GroupSize > 64) {
+        throw std::invalid_argument(
+            "gqa_attention: this head geometry serves at most 64 query rows per lane step");
+    }
     switch (invocation.width) {
     case 1:
         NINFER_GQA_SMALL_T_DISPATCH(1, 2);
@@ -413,6 +422,12 @@ void gqa_attention_small_t_launch(const Tensor& q, const Tensor& k, const Tensor
         .width         = width,
         .batch_size    = q.ne[3],
     };
+    if (q.ne[1] == Gqa256_24q2::QHeads && cache.num_kv_heads == Gqa256_24q2::KVHeads) {
+        gqa_attention_small_t_launch_for<Gqa256_24q2>(q, input, pos, scale, cache, invocation,
+                                                      envelope, partial_acc, partial_m, partial_l,
+                                                      out, stream);
+        return;
+    }
     if (q.ne[1] == Gqa27Geometry::QHeads) {
         gqa_attention_small_t_launch_for<Gqa27Geometry>(q, input, pos, scale, cache, invocation,
                                                         envelope, partial_acc, partial_m, partial_l,
@@ -453,6 +468,12 @@ void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, flo
         .batch_size    = 1,
     };
     const PagedKVBatchLayerView batch_cache = single_row_batch_view(cache);
+    if (q.ne[1] == Gqa256_24q2::QHeads && batch_cache.num_kv_heads == Gqa256_24q2::KVHeads) {
+        gqa_attention_small_t_launch_for<Gqa256_24q2>(q, input, pos, scale, batch_cache,
+                                                      invocation, envelope, partial_acc,
+                                                      partial_m, partial_l, out, stream);
+        return;
+    }
     if (q.ne[1] == Gqa27Geometry::QHeads) {
         gqa_attention_small_t_launch_for<Gqa27Geometry>(q, input, pos, scale, batch_cache,
                                                         invocation, envelope, partial_acc,
