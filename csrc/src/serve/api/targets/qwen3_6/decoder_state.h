@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/ngram_ple_state.h"
 #include "core/linear_attention_state.h"
 #include "core/layout.h"
 #include "core/paged_kv_cache.h"
@@ -30,6 +31,8 @@ struct DecoderStateSpec {
     std::uint32_t text_physical_page_groups = 0;
     std::uint32_t mtp_physical_page_groups  = 0;
     LinearAttentionStatePoolSpec linear_attention;
+    // Per-slot state of a layer prologue (n-gram memory); absent for targets without one.
+    std::optional<NgramPleStatePoolSpec> ple;
 };
 
 struct PagedKVCacheLayout {
@@ -110,6 +113,7 @@ struct DecoderStateLayout {
     PagedKVCacheLayout text_kv;
     std::optional<PagedKVCacheLayout> mtp_kv;
     LinearAttentionStatePoolLayout linear_attention;
+    std::optional<NgramPleStatePoolLayout> ple;
 
     [[nodiscard]] std::size_t kv_payload_bytes() const noexcept;
 };
@@ -121,11 +125,16 @@ struct DecoderState {
     PagedKVCache text_kv;
     std::optional<PagedKVCache> mtp_kv;
     LinearAttentionStatePool linear_attention;
+    NgramPleStatePool ple; ///< empty unless the layout planned one
 
     DecoderState(DeviceSpan backing, const DecoderStateLayout& layout);
 
     [[nodiscard]] PagedKVCache* mtp_cache() noexcept;
     [[nodiscard]] const PagedKVCache* mtp_cache() const noexcept;
+
+    /// Slot lifecycle across every per-slot pool (linear attention and, when present, PLE).
+    void copy_state_slot(std::int32_t src, std::int32_t dst, cudaStream_t stream);
+    void reset_state_slot(std::int32_t slot, cudaStream_t stream);
 };
 
 } // namespace ninfer::targets::qwen3_6

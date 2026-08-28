@@ -578,7 +578,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
             resize_sequence_kv_entitlement(sequence, request_plan.text_kv_page_entitlement,
                                            request_plan.backend_kv_page_entitlement);
-            decoder->linear_attention.copy_slot(
+            decoder->copy_state_slot(
                 LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane, max_concurrency),
                 LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
                 device.stream);
@@ -609,7 +609,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                                         !request_plan.prepare_mtp && !prompt.has_media() &&
                                         base < prompt_tokens;
         if (prefill_uses_graph) {
-            decoder->linear_attention.copy_slot(
+            decoder->copy_state_slot(
                 LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
                 LinearStateSlots::prefill_scratch_state_slot(max_concurrency), device.stream);
         }
@@ -1109,7 +1109,7 @@ void ProgramImplCore::set_device_i32(Tensor& tensor, std::int32_t value) {
 }
 
 void ProgramImplCore::ordered_reset(SequenceState& sequence) {
-    decoder->linear_attention.zero_slot(
+    decoder->reset_state_slot(
         LinearStateSlots::current_state_slot(sequence.lane, max_concurrency), device.stream);
     work.reset();
     set_device_i32(io.pos, 0);
@@ -1215,7 +1215,7 @@ void ProgramImplCore::prepare_graphs() {
         }
         if (dflash) { zero_capture_pages(dflash->full, dflash_capture_allocations, batch_size); }
         for (std::uint32_t row = 0; row < batch_size; ++row) {
-            decoder->linear_attention.zero_slot(
+            decoder->reset_state_slot(
                 LinearStateSlots::current_state_slot(row, max_concurrency), device.stream);
             if (dflash) {
                 zero_cyclic_lane(dflash->local, row);
@@ -1302,7 +1302,7 @@ void ProgramImplCore::prepare_graphs() {
                                        io,
                                        prefill_hidden,
                                        prefill_chunk,
-                                       proposal_head};
+                                       proposal_head, &decoder->ple};
     };
 
     if (speculative_backend == SpeculativeBackend::None) {
@@ -1540,6 +1540,7 @@ void ProgramImplCore::prepare_graphs() {
                                            decoder->linear_attention, io, prefill_hidden,
                                            prefill_chunk, 0, {}, &decoder->text_kv,
                                            decoder->mtp_cache());
+        capture_card.set_ple_state(&decoder->ple);
         capture_card.set_linear_state_slots(
             prefill_graphs->scratch_state_slot(),
             rewrite_checkpoints ? LinearStateSlots::rewrite_checkpoint_state_slot(0, max_concurrency)
@@ -1676,7 +1677,7 @@ void ProgramImplCore::enqueue_dflash_context_append(std::span<const std::uint32_
 
     schedule::DFlashAppendContext state{{device, model, work, decoder->linear_attention,
                                          replay_records ? &*replay_records : nullptr, io,
-                                         prefill_hidden, prefill_chunk, proposal_head},
+                                         prefill_hidden, prefill_chunk, proposal_head, &decoder->ple},
                                         *dflash};
     mark_workspace_usage(workspace_plan.dflash_context);
     schedule::dflash_append_context(state, features, positions, device_counts, lane_tensor,
@@ -1707,7 +1708,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         schedule::PrefillContext schedule_state{
             {device, model, work, decoder->linear_attention,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head},
+             proposal_head, &decoder->ple},
             text_kv_view(sequence),
             mtp_kv_view(sequence),
             decoder->text_kv,
@@ -1818,7 +1819,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 throw std::logic_error("staged prefill sampled before the prompt frontier");
             }
             if (staged.use_graph) {
-                decoder->linear_attention.copy_slot(
+                decoder->copy_state_slot(
                     LinearStateSlots::prefill_scratch_state_slot(max_concurrency),
                     LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
                     device.stream);
@@ -2022,7 +2023,7 @@ ProgramImplCore::launch_ordinary_round(std::span<const std::uint32_t> lanes,
         schedule::OrdinaryBatchContext schedule_state{
             {device, model, work, decoder->linear_attention,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head},
+             proposal_head, &decoder->ple},
             decoder->text_kv,
             *io.ordinary,
             *ordinary_host_ingress,
@@ -2294,6 +2295,7 @@ ProgramImplCore::advance_prefill_mixed(std::span<const std::uint32_t> prefill_la
         schedule::TextContext card(device, model, work, text_kv_view(prefill_sequence),
                                    decoder->linear_attention, io, prefill_hidden, prefill_chunk,
                                    staged.cursor, {}, &decoder->text_kv, decoder->mtp_cache());
+        card.set_ple_state(&decoder->ple);
         card.set_sampling(static_cast<const ops::SamplingConfig*>(
             sampling_config.slice(1, static_cast<std::int32_t>(prefill_sequence.lane), 1).data));
         // Graph prompts run every chunk (graph or eager fallback alike) on
@@ -2482,7 +2484,7 @@ ProgramImplCore::advance_prefill_mixed(std::span<const std::uint32_t> prefill_la
                     .summary = summary, .processed_prompt_tokens = processed};
             if (entry.cursor == entry.prompt_tokens) {
                 if (entry.use_graph && graph_hit) {
-                    decoder->linear_attention.copy_slot(
+                    decoder->copy_state_slot(
                         LinearStateSlots::prefill_scratch_state_slot(max_concurrency),
                         LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
                         device.stream);
@@ -2595,7 +2597,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 
         schedule::MtpBatchContext schedule_state{{device, model, work, decoder->linear_attention,
                                                   replay_records ? &*replay_records : nullptr, io,
-                                                  prefill_hidden, prefill_chunk, proposal_head},
+                                                  prefill_hidden, prefill_chunk, proposal_head, &decoder->ple},
                                                  decoder->text_kv,
                                                  *decoder->mtp_cache(),
                                                  *io.mtp_decode,
@@ -2757,7 +2759,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         schedule::DFlashBatchContext schedule_state{{device, model, work, decoder->linear_attention,
                                                      replay_records ? &*replay_records : nullptr,
                                                      io, prefill_hidden, prefill_chunk,
-                                                     proposal_head},
+                                                     proposal_head, &decoder->ple},
                                                     decoder->text_kv,
                                                     *dflash,
                                                     *io.dflash_decode,

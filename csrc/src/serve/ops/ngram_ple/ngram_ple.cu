@@ -230,7 +230,7 @@ __global__ void ple_conv_kernel(const __nv_bfloat16* __restrict__ gated,
     float acc       = 0.0F;
     for (int k = 0; k < kernel; ++k) {
         const int back = (kernel - 1 - k) * dilation;
-        const float w  = __bfloat162float(weight[static_cast<std::int64_t>(c) * kernel + k]);
+        const float w  = __bfloat162float(weight[static_cast<std::int64_t>(k) * width + c]);
         acc = fmaf(w, conv_input(normalized, conv_state, width, c, t, back, begin, slot, history,
                                  slot_count),
                    acc);
@@ -374,11 +374,11 @@ void ngram_ple_forward(Tensor& residual, const NgramPleColumns& columns, const N
     require_vector(weights.norm_key, DType::FP32, width, "norm_key");
     require_vector(weights.norm_query, DType::FP32, width, "norm_query");
     require_vector(weights.norm_conv, DType::FP32, width, "norm_conv");
-    if (weights.convolution.dtype != DType::BF16 || weights.convolution.ne[0] != conv_kernel ||
-        weights.convolution.ne[1] != width || weights.convolution.numel() !=
-                                                  static_cast<std::int64_t>(conv_kernel) * width ||
+    if (weights.convolution.dtype != DType::BF16 || weights.convolution.ne[0] != width ||
+        weights.convolution.ne[1] != conv_kernel || weights.convolution.numel() !=
+                                                        static_cast<std::int64_t>(conv_kernel) * width ||
         !weights.convolution.is_contiguous() || weights.convolution.data == nullptr) {
-        throw std::invalid_argument("ngram_ple: convolution must be BF16 [kernel, streams*hidden]");
+        throw std::invalid_argument("ngram_ple: convolution must be BF16 [streams*hidden, kernel]");
     }
     const std::int32_t slot_count = state.history.ne[1];
     if (state.history.dtype != DType::I32 || state.history.ne[0] != hash.ngram - 1 ||

@@ -50,7 +50,8 @@ struct NgramPleTable {
  *   norm_key     FP32 [streams*hidden] folded gamma
  *   norm_query   FP32 [streams*hidden]
  *   norm_conv    FP32 [streams*hidden]
- *   convolution  BF16 [streams*hidden, kernel] (tap k of channel c at [c, k]); tap k reads
+ *   convolution  BF16 [streams*hidden, kernel] with the channel fastest (tap k of channel c
+ *                at k*width + c, the family's causal-conv weight layout); tap k reads
  *                (kernel-1-k)*dilation positions back
  */
 struct NgramPleWeights {

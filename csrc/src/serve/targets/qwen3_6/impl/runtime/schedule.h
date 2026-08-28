@@ -1,4 +1,5 @@
 #pragma once
+#include "core/ngram_ple_state.h"
 #include "targets/qwen3_6/impl/runtime/instance.h"
 // Qwen3.6 family runtime implementation; instantiated only by exact variants.
 
@@ -43,6 +44,7 @@ struct ExecutionCore {
     Tensor& prefill_hidden;
     std::uint32_t prefill_chunk;
     ProposalHead proposal_head;
+    NgramPleStatePool* ple = nullptr; ///< the layer prologue's per-slot state, when the target has one
 };
 
 struct PrefillContext {

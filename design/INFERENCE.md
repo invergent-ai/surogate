@@ -27,13 +27,13 @@ phase 3 = PP across 8 GPUs; phase 4 = EP measured against PP.
 | Sigmoid-gated RMSNorm, W8 dispatch arms (13312/16384 × 2560, 2560 × 6144) | done | commit d2174926 |
 | Sparse-MoE geometry from the weights (stage A) | done | commit 13a08634 |
 | Sparse-MoE kernels instantiated per geometry, 512/10/640/2560 compiled (stage B) | done, 35B probe clean | see 2026-08-28 entry below |
-| BF16 cuBLASLt GEMM route (`ops/linear/bf16/bf16_cublaslt.*`) | written, not yet built | for hc down/up/inject, PLE key/value, GDN a_b at 96×2560 |
-| Hyper-connection op (`api/ops/hyper_connection.h`, `ops/hyper_connection/`) | written, not yet built | mix / combine / broadcast_streams |
-| PLE op (`api/ops/ngram_ple.h`, `ops/ngram_ple/`) | in progress | device-side hash, IQ4_NL row gather from pinned host, group norms, gate, dilated conv with per-slot state |
-| qwen3_6 family: residual-width trait + norm/embed/final/prologue hooks | not started | three layer loops: `run_layers`, `mixed_chunk_multi`, `mixed_graph_window` |
-| PLE state pool (per-slot conv history [10240,9] + token history [2]) | not started | mirror `core/linear_attention_state.*`; 7 slot-lifecycle sites in `program_impl.h` / `text_context_impl.h` |
-| Target `targets/qwen4exp/` (package, bindings, variant, registry) | not started | model_id `qwen3.8-flash-next`, weights_id `w8-hc-v1`, target key `qwen4exp` |
-| Expert streaming v0 (pinned host bank, per-layer coalesced H2D of touched experts) | not started | bind experts + PLE table ValidateOnly, `Reader::read_direct` into pinned memory |
+| BF16 cuBLASLt GEMM route (`ops/linear/bf16/bf16_cublaslt.*`) | built (commit 81257e66) | for hc down/up/inject, PLE key/value, GDN a_b at 96×2560 |
+| Hyper-connection op (`api/ops/hyper_connection.h`, `ops/hyper_connection/`) | built (commit 81257e66) | mix / combine / broadcast_streams |
+| PLE op (`api/ops/ngram_ple.h`, `ops/ngram_ple/`) | built (commit 81257e66) | device-side hash, IQ4_NL row gather from pinned host, group norms, gate, dilated conv with per-slot state |
+| qwen3_6 family: residual-width trait, embed/finish/norm hooks (F1), layer-prologue hook with per-column segment facts (F2) | done (commits 5b1b6efd, b4e13eb6), 35B unchanged | `runtime/residual_policy.h`, `runtime/prologue_columns.h`; staging in every forward entry |
+| PLE state pool `core/ngram_ple_state.*` (per-slot conv history [9,10240] + token history [2]) | wired (F3, building) | `DecoderState::{copy,reset}_state_slot` forward to both pools at the slot-lifecycle sites; `ExecutionCore::ple` reaches every TextContext |
+| Target `targets/qwen4exp/` (package, bindings, host bank, variant, registry) | written, first build in flight | model_id `qwen3.8-flash-next`, weights_id `w8-hc-v1`, target key `qwen4exp`; experts and the PLE table live in pinned, device-mapped host memory and the kernels read them zero-copy (v0) |
+| Expert access v0: zero-copy reads from the pinned host bank (`impl/load/host_bank.*`) | written with the target | no staging copies at all in v0; the device slot cache and CPU expert compute come in phase 2 |
 | Parity vs llama.cpp, first throughput row | not started | |
 
 ## Decisions that shape the code
@@ -98,3 +98,38 @@ phase 3 = PP across 8 GPUs; phase 4 = EP measured against PP.
   build; 35B probe on the new kernels: coherent, 0 fatals, 1,147 tok/s at 32 users /
   `--max-num-seqs 32` (board row is 100 users / 128 lanes / chunk 4096: 1,942).
 - Written but unbuilt: BF16 cuBLASLt route, hyper-connection op.
+- 35B probes on the geometry-instantiated kernels, all coherent with 0 fatals: 1,147 tok/s
+  (32 users, 32 lanes), 846 (100 users, 8 lanes, queue-bound), 1,752 (100 users, 128 lanes,
+  chunk 4096, 60 s; the board row is 1,942 at 90 s) — a 90 s run is in flight to close the
+  comparison. The kernel arithmetic for the Qwen3.6 geometry is unchanged by the
+  instantiation; only launch shapes were generalised.
+- Written, unbuilt: `ops/ngram_ple/ngram_ple.cu` (+ API), `core/ngram_ple_state.*`; all new
+  sources are listed in `csrc/CMakeLists.txt`. Next: build them, then the family runtime
+  residual-width trait and hooks, then the `qwen4exp` target.
+- 35B at the board configuration (100 users, 128 lanes, chunk 4096, 90 s, fp8 KV is the
+  server default) on the refactored kernels and the F1 family hooks: **1,761 tok/s unbatched,
+  matching the board's own unbatched row (1,762)**; the board's 1,942 is the
+  `SUROGATE_SERVE_PREFILL_BATCH=4` configuration (a run with it is in flight). No regression.
+- Family stage F1 (residual trait + four hooks) builds and is committed (5b1b6efd); the
+  existing targets take the default branch of every hook. Next: the per-layer prologue hook
+  with PLE column metadata (F2), state-pool wiring (F3), then the `qwen4exp` target.
+- Board-configuration probe with `SUROGATE_SERVE_PREFILL_BATCH=4` on the F1 build: 1,927 tok/s
+  (board mean 1,942 from passes of 1,960/1,924) — the refactors are throughput-neutral.
+- F2 (layer prologue + column staging) committed (b4e13eb6). The `qwen4exp` target is written:
+  `api/targets/qwen4exp/package.h`, `targets/qwen4exp/impl/{config.h,package.cpp,variant.{h,cpp},
+  load/{bindings.{h,cpp},host_bank.{h,cpp}}}`, registry entries, CMake. Design points: the
+  Variant mixes the streams in the norm hooks and keeps the inject gates in a thread-local
+  handle for the output projections; projections are plain W8 `linear` + column extraction
+  (+ `causal_conv1d_silu_snapshot` for decode GDN); the MoE writes into a zeroed plane and is
+  combined into the streams; the GDN control projection is a cuBLASLt BF16 GEMM + `gdn_gating`
+  (already 48-head); MTP/DFlash/vision are refused at plan_load.
+- The target builds and links (engine executor variant extended for it). llama.cpp's greedy
+  answers for the parity prompts (8-GPU layer split, `enable_thinking=false`, 40 tokens) are in
+  the scratchpad `bench/oracle_flash.txt`: "Paris"; "Three prime numbers are **2**, **3**,
+  and **5**."; "The vast ocean stretches endlessly, its deep blue waters hiding countless
+  mysteries beneath the rolling waves."; sky: "Sunlight enters Earth's atmosphere and scatters
+  in all directions, with shorter blue wavelengths scattering more strongly ...".
+- F3: `DecoderStateSpec::ple` → `plan_ngram_ple_state_pool`, `DecoderState::ple`, slot copy/reset
+  helpers used at the six `program_impl.h` sites and the rewrite-checkpoint copy in the text
+  context; `ExecutionCore::ple` set at its six initialisers; `configure_text_card` and the
+  decode/dflash/mtp cards call `set_ple_state`. Variant supplies `ple_state_spec(slot_count)`.

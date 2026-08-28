@@ -1162,6 +1162,7 @@ add_subdirectory(${SERVE_ROOT}/targets/qwen3_5_2b serve_t_qwen3_5_2b EXCLUDE_FRO
 add_subdirectory(${SERVE_ROOT}/targets/qwen3_5_4b serve_t_qwen3_5_4b EXCLUDE_FROM_ALL)
 add_subdirectory(${SERVE_ROOT}/targets/qwen3_6_27b serve_t_qwen3_6_27b EXCLUDE_FROM_ALL)
 add_subdirectory(${SERVE_ROOT}/targets/qwen3_6_35b_a3b serve_t_qwen3_6_35b_a3b EXCLUDE_FROM_ALL)
+add_subdirectory(${SERVE_ROOT}/targets/qwen4exp serve_t_qwen4exp EXCLUDE_FROM_ALL)
 
 target_link_libraries(ninfer_engine
   PRIVATE

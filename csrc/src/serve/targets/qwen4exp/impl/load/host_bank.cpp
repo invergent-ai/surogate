@@ -1,0 +1,65 @@
+#include "targets/qwen4exp/impl/load/host_bank.h"
+
+#include "core/device.h"
+
+#include <cuda_runtime.h>
+
+#include <cstring>
+#include <stdexcept>
+#include <thread>
+
+namespace ninfer::targets::qwen4exp::detail {
+
+std::size_t HostBankPlan::total_bytes() const noexcept {
+    std::size_t total = 0;
+    for (const auto& object : objects) { total += object.payload.size(); }
+    return total;
+}
+
+HostBank::HostBank(const HostBankPlan& plan) {
+    objects_.reserve(plan.objects.size());
+    for (const auto& source : plan.objects) {
+        HostObject object;
+        object.bytes = source.payload.size();
+        object.name  = source.name;
+        if (object.bytes == 0) {
+            throw std::invalid_argument("host bank object " + source.name + " is empty");
+        }
+        CUDA_CHECK(cudaHostAlloc(&object.host, object.bytes, cudaHostAllocMapped | cudaHostAllocPortable));
+        void* device = nullptr;
+        CUDA_CHECK(cudaHostGetDevicePointer(&device, object.host, 0));
+        object.device = device;
+        // Parallel copy: the artifact mapping is page-cache backed and a single memcpy of a
+        // 100+ GB bank would leave most of the memory bandwidth idle.
+        const std::size_t workers = 16;
+        const std::size_t chunk   = (object.bytes + workers - 1) / workers;
+        std::vector<std::thread> threads;
+        for (std::size_t w = 0; w < workers; ++w) {
+            const std::size_t begin = w * chunk;
+            if (begin >= object.bytes) { break; }
+            const std::size_t count = std::min(chunk, object.bytes - begin);
+            threads.emplace_back([&, begin, count] {
+                std::memcpy(static_cast<std::byte*>(object.host) + begin,
+                            source.payload.data() + begin, count);
+            });
+        }
+        for (auto& thread : threads) { thread.join(); }
+        total_bytes_ += object.bytes;
+        objects_.emplace_back(source.handle.index, object);
+    }
+}
+
+HostBank::~HostBank() {
+    for (auto& [index, object] : objects_) {
+        if (object.host != nullptr) { (void)cudaFreeHost(object.host); }
+    }
+}
+
+const HostObject& HostBank::object(artifact::ObjectHandle handle) const {
+    for (const auto& [index, object] : objects_) {
+        if (index == handle.index) { return object; }
+    }
+    throw std::out_of_range("host bank has no object for this handle");
+}
+
+} // namespace ninfer::targets::qwen4exp::detail

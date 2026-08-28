@@ -143,6 +143,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                              .slot_count     = linear_state_slots,
                              .conv_dtype     = DType::BF16,
                          },
+                     .ple = ResidualHooks<Variant>::ple_state_spec(linear_state_slots),
                  });
     if (plan.speculative_backend != SpeculativeBackend::None) {
         out.replay_records = plan_gdn_replay_records(

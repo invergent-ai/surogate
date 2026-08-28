@@ -278,6 +278,22 @@ Qwen3_6_35BA3BInstance::Qwen3_6_35BA3BInstance(std::unique_ptr<LoadedQwen3_6_35B
 
 Qwen3_6_35BA3BInstance::~Qwen3_6_35BA3BInstance() = default;
 
+LoadedQwen38FlashNext::LoadedQwen38FlashNext(
+    std::unique_ptr<Qwen38FlashNext::LoadedModel> stable_model, const EngineOptions& options)
+    : model(std::move(stable_model)), frontend(Qwen38FlashNext::make_frontend(*model, options)) {}
+
+LoadedQwen38FlashNext::~LoadedQwen38FlashNext() = default;
+
+Qwen38FlashNextInstance::Qwen38FlashNextInstance(
+    std::unique_ptr<LoadedQwen38FlashNext> stable_loaded, runtime::KvCapacityResolution resolution,
+    Qwen38FlashNext::SequencePlan sequence_plan, DeviceContext& device)
+    : loaded(std::move(stable_loaded)), kv_capacity_resolution(resolution),
+      request_memory(device, sequence_plan.request_transient_capacity_bytes()),
+      capacity(sequence_plan.capacity()),
+      program(Qwen38FlashNext::create_program(*loaded->model, std::move(sequence_plan), device)) {}
+
+Qwen38FlashNextInstance::~Qwen38FlashNextInstance() = default;
+
 ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& device) {
     validate_options(options);
     const auto load_start = Clock::now();
@@ -303,6 +319,11 @@ ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& 
     if (identity.model_id == Qwen3_6_27B::qwen3_8_model_id) {
         return construct_registered<Qwen3_6_27B, LoadedQwen3_6_27B, Qwen3_6_27BInstance>(
             options, device, reader, load_start, Qwen3_6_27B::qwen3_8_target_key);
+    }
+    if (identity.model_id == Qwen38FlashNext::model_id) {
+        return construct_registered<Qwen38FlashNext, LoadedQwen38FlashNext,
+                                    Qwen38FlashNextInstance>(options, device, reader, load_start,
+                                                             Qwen38FlashNext::target_key);
     }
     if (identity.model_id == Qwen3_6_35BA3B::model_id) {
         return construct_registered<Qwen3_6_35BA3B, LoadedQwen3_6_35BA3B, Qwen3_6_35BA3BInstance>(

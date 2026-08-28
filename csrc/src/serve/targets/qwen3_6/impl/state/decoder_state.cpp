@@ -93,6 +93,7 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
                                    spec.kv_skip_layers);
     }
     layout.linear_attention = plan_linear_attention_state_pool(builder, spec.linear_attention);
+    if (spec.ple) { layout.ple = plan_ngram_ple_state_pool(builder, *spec.ple); }
     return layout;
 }
 
@@ -169,6 +170,17 @@ std::size_t DecoderStateLayout::kv_payload_bytes() const noexcept {
 DecoderState::DecoderState(DeviceSpan backing, const DecoderStateLayout& layout)
     : text_kv(backing, layout.text_kv), linear_attention(backing, layout.linear_attention) {
     if (layout.mtp_kv) { mtp_kv.emplace(backing, *layout.mtp_kv); }
+    if (layout.ple) { ple = NgramPleStatePool(backing, *layout.ple); }
+}
+
+void DecoderState::copy_state_slot(std::int32_t src, std::int32_t dst, cudaStream_t stream) {
+    linear_attention.copy_slot(src, dst, stream);
+    if (!ple.empty()) { ple.copy_slot(src, dst, stream); }
+}
+
+void DecoderState::reset_state_slot(std::int32_t slot, cudaStream_t stream) {
+    linear_attention.zero_slot(slot, stream);
+    if (!ple.empty()) { ple.reset_slot(slot, stream); }
 }
 
 PagedKVCache* DecoderState::mtp_cache() noexcept { return mtp_kv ? &*mtp_kv : nullptr; }

@@ -7,6 +7,7 @@
 #include <api/targets/qwen3_5_4b/package.h>
 #include <api/targets/qwen3_6_27b/package.h>
 #include <api/targets/qwen3_6_35b_a3b/package.h>
+#include <api/targets/qwen4exp/package.h>
 
 #include <memory>
 #include <variant>
@@ -22,6 +23,7 @@ using Qwen3_5_2B      = qwen3_5_2b::Package;
 using Qwen3_5_4B      = qwen3_5_4b::Package;
 using Qwen3_6_27B    = qwen3_6_27b::Package;
 using Qwen3_6_35BA3B = qwen3_6_35b_a3b::Package;
+using Qwen38FlashNext = qwen4exp::Package;
 
 struct LoadedQwen3_5_0_8B {
     std::unique_ptr<Qwen3_5_0_8B::LoadedModel> model;
@@ -173,11 +175,42 @@ struct Qwen3_6_35BA3BInstance {
     Qwen3_6_35BA3BInstance& operator=(const Qwen3_6_35BA3BInstance&) = delete;
 };
 
+struct LoadedQwen38FlashNext {
+    std::unique_ptr<Qwen38FlashNext::LoadedModel> model;
+    Qwen38FlashNext::Frontend frontend;
+
+    LoadedQwen38FlashNext(std::unique_ptr<Qwen38FlashNext::LoadedModel> stable_model,
+                          const EngineOptions& options);
+    ~LoadedQwen38FlashNext();
+
+    LoadedQwen38FlashNext(const LoadedQwen38FlashNext&)            = delete;
+    LoadedQwen38FlashNext& operator=(const LoadedQwen38FlashNext&) = delete;
+};
+
+struct Qwen38FlashNextInstance {
+    using Package = Qwen38FlashNext;
+
+    std::unique_ptr<LoadedQwen38FlashNext> loaded;
+    runtime::KvCapacityResolution kv_capacity_resolution;
+    runtime::RequestMemory request_memory;
+    const std::uint32_t capacity;
+    std::unique_ptr<Qwen38FlashNext::Program> program;
+
+    Qwen38FlashNextInstance(std::unique_ptr<LoadedQwen38FlashNext> stable_loaded,
+                            runtime::KvCapacityResolution resolution,
+                            Qwen38FlashNext::SequencePlan sequence_plan, DeviceContext& device);
+    ~Qwen38FlashNextInstance();
+
+    Qwen38FlashNextInstance(const Qwen38FlashNextInstance&)            = delete;
+    Qwen38FlashNextInstance& operator=(const Qwen38FlashNextInstance&) = delete;
+};
+
 using ActiveTarget =
     std::variant<std::unique_ptr<Qwen3_5_0_8BInstance>,
                  std::unique_ptr<Qwen3_5_2BInstance>,
                  std::unique_ptr<Qwen3_5_4BInstance>, std::unique_ptr<Qwen3_6_27BInstance>,
-                 std::unique_ptr<Qwen3_6_35BA3BInstance>>;
+                 std::unique_ptr<Qwen3_6_35BA3BInstance>,
+                 std::unique_ptr<Qwen38FlashNextInstance>>;
 
 struct ConstructedTarget {
     ActiveTarget active;

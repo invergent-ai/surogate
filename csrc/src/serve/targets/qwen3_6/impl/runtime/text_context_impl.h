@@ -2401,6 +2401,9 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
 
         if (checkpoint_rel > 0 && t0 + len == checkpoint_rel) {
             state_.copy_slot(linear_state_current_slot_, rewrite_checkpoint_slot, s);
+            if (ple_state_ != nullptr && !ple_state_->empty()) {
+                ple_state_->copy_slot(linear_state_current_slot_, rewrite_checkpoint_slot, s);
+            }
         }
 
         t0 += len;

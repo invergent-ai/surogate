@@ -5,7 +5,9 @@
 
 #include <api/targets/qwen3_6/frontend.h>
 #include <api/targets/qwen3_6/hybrid_topology.h>
+#include <api/targets/qwen3_6/vision.h>
 
+#include <array>
 #include <cstdint>
 
 namespace ninfer::targets::qwen4exp::detail {
@@ -16,6 +18,7 @@ struct TextConfig {
     static constexpr int intermediate = 640; // routed expert FFN width
 
     static constexpr int output_rows  = 248320;
+    static constexpr int eos_token    = 248044; // also cuts the n-gram context
     static constexpr int token_domain = static_cast<int>(qwen3_6::kTokenDomain);
 
     // Hyper-connections: the residual is `hc_count` streams of `hidden`, mixed through a
@@ -23,6 +26,8 @@ struct TextConfig {
     static constexpr int hc_count    = 4;
     static constexpr int hc_width    = hc_count * hidden; // 10240
     static constexpr int hc_low_rank = 320;
+    // The family sizes its residual planes from this: four streams side by side.
+    static constexpr int residual    = hc_width;
 
     // Gated delta net (the Qwen3.5/3.6 mixer with a sigmoid output gate).
     static constexpr int gdn_conv_kernel      = 4;
@@ -71,6 +76,13 @@ struct TextConfig {
 
     static constexpr int full_attention_interval = 4;
 
+    // No MTP block is served (the GGUF carries none); the family's MTP planes are sized by
+    // these but never materialised, so they mirror the text block's shapes.
+    static constexpr int mtp_layers               = 1;
+    static constexpr int mtp_input_rows           = 2 * hidden;
+    static constexpr int mtp_attention_input_rows = 2 * (query_heads * head_dim) + 2 * (kv_heads * head_dim);
+    static constexpr int mtp_mlp_gate_up_rows     = 2 * intermediate;
+
     static constexpr int key_dim               = gdn_key_heads * gdn_key_head_dim;     // 2048
     static constexpr int value_dim             = gdn_value_heads * gdn_value_head_dim; // 6144
     static constexpr int convolution_dim       = 2 * key_dim + value_dim;              // 10240
@@ -102,5 +114,41 @@ static_assert(TextConfig::gdn_index(0) == 0 && TextConfig::gdn_index(4) == 3 &&
               TextConfig::gdn_index(46) == 35);
 static_assert(TextConfig::ple_embed == TextConfig::hidden);
 static_assert(TextConfig::gdn_projection_rows == 16384 && TextConfig::query_projection_rows == 13312);
+
+// The family's vision context is instantiated but never enabled for this target.
+struct VisionConfig : qwen3_6::VisionBackboneConfig {
+    static constexpr int output_hidden = TextConfig::hidden;
+};
+
+struct DFlashConfig {
+    static constexpr bool supported     = false;
+    static constexpr int layers         = 1;
+    static constexpr int local_layers   = 1;
+    static constexpr int feature_layers = 1;
+    static constexpr int feature_rows   = feature_layers * TextConfig::hidden;
+    static constexpr int hidden         = TextConfig::hidden;
+    static constexpr int intermediate   = TextConfig::intermediate;
+    static constexpr int query_heads    = TextConfig::query_heads;
+    static constexpr int kv_heads       = TextConfig::kv_heads;
+    static constexpr int head_dim       = TextConfig::head_dim;
+    static constexpr int query_size     = query_heads * head_dim;
+    static constexpr int kv_size        = kv_heads * head_dim;
+    static constexpr int local_capacity = 1;
+    static constexpr int mask_token     = 0;
+    static constexpr float rms_epsilon  = TextConfig::rms_epsilon;
+    static constexpr float rope_theta   = TextConfig::rope_theta;
+    static constexpr float attention_scale = 0.0625F;
+    static constexpr std::array<int, feature_layers> target_feature_layers{0};
+};
+
+// 1/sqrt(head_dim) for both mixers (head 256 and GDN head 128).
+inline constexpr float kAttentionScale                   = 0.0625F;
+inline constexpr float kGdnScale                         = 0.08838834764831845F;
+inline constexpr std::uint32_t kPrefillChunkAlignment    = 128;
+inline constexpr std::uint32_t kMaximumMtpDraftTokens    = 5;
+inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 15;
+// Dense attention is exact only below the indexer's budget; longer contexts wait for the
+// QSA indexer.
+inline constexpr std::uint32_t kNativeContext            = TextConfig::dense_exact_context;
 
 } // namespace ninfer::targets::qwen4exp::detail

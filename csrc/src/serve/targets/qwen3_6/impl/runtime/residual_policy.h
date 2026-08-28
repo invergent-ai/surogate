@@ -14,6 +14,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 
 #include <cuda_runtime.h>
 
@@ -53,6 +54,16 @@ struct ResidualHooks {
         } else {
             (void)model; (void)layer; (void)residual; (void)columns; (void)ple_state; (void)work;
             (void)stream;
+        }
+    }
+
+    /// The prologue's per-slot state pool, planned next to the linear-attention pool.
+    [[nodiscard]] static std::optional<NgramPleStatePoolSpec> ple_state_spec(std::int32_t slots) {
+        if constexpr (prologue) {
+            return Variant::ple_state_spec(slots);
+        } else {
+            (void)slots;
+            return std::nullopt;
         }
     }
 
