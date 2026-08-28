@@ -132,9 +132,18 @@ void DecodeGraphExecutable::update(const DecodeGraphDefinition& definition) {
     cudaGraphExecUpdateResultInfo result{};
     const cudaError_t err = cudaGraphExecUpdate(exec_, definition.graph_, &result);
     if (err != cudaSuccess || result.result != cudaGraphExecUpdateSuccess) {
-        throw std::runtime_error(
-            "CUDA Graph executable update failed: " + std::string(cudaGetErrorName(err)) +
-            " (update result " + std::to_string(static_cast<int>(result.result)) + ")");
+        // An update the driver refuses (parameters it cannot patch in place — seen on a
+        // pipeline stage's 64-lane profiles) is not fatal: re-instantiate from the new
+        // definition instead. Slower to switch, identical to run.
+        (void)cudaGetLastError();
+        static bool reported = false;
+        if (!reported) {
+            reported = true;
+            std::fprintf(stderr,
+                         "decode graph: executable update refused (%s, result %d); re-instantiating instead\n",
+                         cudaGetErrorName(err), static_cast<int>(result.result));
+        }
+        instantiate(definition);
     }
 }
 

@@ -1182,3 +1182,14 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   lanes instead of 2 halve the fixed-cost multiplier and the stages skip the host round
   trips at 98 % residency. Still under the 4-stage 79.7 (fixed cost × 8 stages, fill/drain);
   the steady-state pipeline (C3) is what removes the fill/drain.
+- Overlap A/Bs read (2026-08-28, closed pipeline, 8 users, 128/512): split off on GPUs 2+3 —
+  lockstep 44.5 vs pipelined 44.8; cross-socket GPUs 3+4 with per-socket pools — 75.9 vs
+  70.0. Neither is a driver defect: GPUs 2 and 3 are the x8 cards (26 GB/s each, evidently
+  on shared lanes), so with the split off both stages' expert gathers contend on one link and
+  cannot overlap; on the 3+4 pair the x8 stage is the bottleneck, and with two groups
+  lockstep R3+R4 equals the pipeline's 1.5·R3. The pipeline pays where stage rounds are
+  balanced and their bottleneck resources are independent — the 8-stage, high-residency
+  case, which is C3's target. 8 stages at 64 lanes failed on stage 7 with
+  `cudaGraphExecUpdate` result 5 (parameters changed) while instantiating its graph ladder;
+  `DecodeGraphExecutable::update` now re-instantiates the executable when the driver
+  refuses an in-place update (logged once), so the profile still runs as a graph.
