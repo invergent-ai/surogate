@@ -653,6 +653,12 @@ yet. llama.cpp upstream master (added `qwen4exp` this week; CUDA build at
 | (share 0.8 / 0.9, no interleave) | 16 | 33.9 / 33.0 | 143 / 152 | 12.1 / 12.3 s |
 
 
+Reading the prefill column: loadgen's "prefill tok/s" is prompt tokens ÷ the
+run's wall time with the decode phases included, not a prompt-processing rate.
+The prompt-processing rate at one user is 512 ÷ TTFT: ik_llama.cpp ≈ 285 t/s,
+surogate serve (slot cache + split) ≈ 174 t/s. Use that when comparing with
+the external references below, which quote prompt processing.
+
 External single-user references reported by others on this model with llama.cpp
 PR #27742 (not run here; different hardware, quantisation and prompt shape):
 
@@ -666,10 +672,11 @@ PR #27742 (not run here; different hardware, quantisation and prompt shape):
 The single-user decode numbers agree with the bandwidth reading above: the
 host moves one expert set per token, so decode scales with bytes per expert
 (Q2_K_XL ≈ 2× Q4_K_XL ≈ 1.5× the W8 bank used here), and our 18.4 at one user
-sits where a W8 bank on this host lands. The prefill gap (74 here vs ~360) is
-real and is the next phase-2 item: llama.cpp prefills the experts on the CPU
-with a batched int8 GEMM at `-ub 4096`, while this engine still gathers every
-touched expert over PCIe for each 512-token prompt (≈211 GB per prompt).
+sits where a W8 bank on this host lands. The prefill gap (174 here vs 300-770) is
+real (2-4.5× on the prompt-processing rate) and is the next phase-2 item:
+llama.cpp prefills the experts on the CPU with a batched int8 GEMM at
+`-ub 4096`, while this engine still gathers every touched expert over PCIe for
+each 512-token prompt (≈180-211 GB per prompt).
 
 Both configurations answer the probes correctly (`'Paris'`, `'2, 3, and 5'`).
 The engine row (2026-08-28, parity with llama.cpp verified stage by stage, see
