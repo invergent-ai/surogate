@@ -137,6 +137,7 @@ public:
             select(s);
             result = stages_[s]->program->advance_prefill_lane(lane);
         }
+        if (result.complete) { propagate_prefill_token(lane, result); }
         return result;
     }
     [[nodiscard]] BatchedGeneratedRound decode_batch(std::span<const std::uint32_t> lanes,
@@ -146,6 +147,7 @@ public:
             select(s);
             result = stages_[s]->program->decode_batch(lanes, budgets);
         }
+        propagate_round_tokens(lanes, result);
         return result;
     }
     [[nodiscard]] MixedRoundResult advance_prefill_mixed(std::span<const std::uint32_t> prefill_lanes,
@@ -155,6 +157,11 @@ public:
         for (std::size_t s = 0; s < stages_.size(); ++s) {
             select(s);
             result = stages_[s]->program->advance_prefill_mixed(prefill_lanes, lanes, budgets);
+        }
+        propagate_round_tokens(lanes, result.round);
+        for (std::size_t i = 0; i < result.prefill_count && i < prefill_lanes.size(); ++i) {
+            const PrefillStepResult& step = result.prefill_at(i);
+            if (step.complete) { propagate_prefill_token(prefill_lanes[i], step); }
         }
         return result;
     }
@@ -213,6 +220,32 @@ public:
 
 private:
     void select(std::size_t stage) const noexcept { (void)cudaSetDevice(devices_[stage]); }
+    // The stages without the head recorded placeholder tokens this round: overwrite them with
+    // the tokens the last stage sampled (one per lane; stages run single rounds).
+    void propagate_round_tokens(std::span<const std::uint32_t> lanes, const BatchedGeneratedRound& round) {
+        if (stages_.size() < 2 || lanes.empty()) { return; }
+        std::vector<TokenId> tokens(lanes.size());
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            if (round.row_counts.size() <= row || round.row_counts[row] != 1) {
+                throw std::logic_error("pipeline stages expect one sampled token per lane per round");
+            }
+            tokens[row] = round.tokens[row * static_cast<std::size_t>(round.row_stride)];
+        }
+        for (std::size_t s = 0; s + 1 < stages_.size(); ++s) {
+            stages_[s]->program->replace_pending_tokens(lanes, tokens);
+        }
+    }
+    void propagate_prefill_token(std::uint32_t lane, const PrefillStepResult& step) {
+        if (stages_.size() < 2) { return; }
+        if (step.round.tokens.size() != 1) {
+            throw std::logic_error("pipeline stages expect one sampled token from a finished prefill");
+        }
+        const std::uint32_t lanes[1] = {lane};
+        const TokenId tokens[1]      = {step.round.tokens[0]};
+        for (std::size_t s = 0; s + 1 < stages_.size(); ++s) {
+            stages_[s]->program->replace_pending_tokens(lanes, tokens);
+        }
+    }
 
     std::vector<Stage*> stages_;
     std::vector<int> devices_;

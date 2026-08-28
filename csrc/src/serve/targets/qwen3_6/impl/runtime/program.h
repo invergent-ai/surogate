@@ -265,6 +265,9 @@ public:
         return stage.first > 0 || (stage.last >= 0 && stage.last < static_cast<int>(TextConfig::layers));
     }
     void configure_stage(const SequencePlanImpl& plan);
+    /// Pipeline stages without the head record a placeholder token per round; the driver
+    /// replaces each lane's last ledger entry with the token the last stage sampled.
+    void replace_pending_tokens(std::span<const std::uint32_t> lanes, std::span<const TokenId> tokens);
     const std::uint32_t capacity;
     const std::uint32_t kv_capacity;
     const std::uint32_t max_concurrency;

@@ -251,6 +251,12 @@ const void* Program<Variant>::stage_export_buffer() const noexcept {
 }
 
 template <>
+void Program<Variant>::replace_pending_tokens(std::span<const std::uint32_t> lanes,
+                                              std::span<const TokenId> tokens) {
+    impl_->replace_pending_tokens(lanes, tokens);
+}
+
+template <>
 SequencePlanner<Variant> make_sequence_planner<Variant>(DeviceContext& device,
                                                         const EngineOptions& options,
                                                         Variant::WeightsProfile weights_profile) {

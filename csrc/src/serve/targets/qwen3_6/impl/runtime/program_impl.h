@@ -741,6 +741,24 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill_lane(std::uint32_t l
     return advance_prefill(sequences[lane], requests[lane]);
 }
 
+void ProgramImplCore::replace_pending_tokens(std::span<const std::uint32_t> lanes,
+                                             std::span<const TokenId> tokens) {
+    if (lanes.size() != tokens.size()) {
+        throw std::invalid_argument("pending token replacement has inconsistent membership");
+    }
+    for (std::size_t i = 0; i < lanes.size(); ++i) {
+        const std::uint32_t lane = lanes[i];
+        if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
+        RequestControl& request = requests[lane];
+        SequenceState& sequence = sequences[lane];
+        if ((request.pending.kind != PendingKind::Begin && request.pending.kind != PendingKind::Ordinary) ||
+            request.pending.produced != 1 || sequence.ledger.empty()) {
+            throw std::logic_error("pending token replacement needs one pending token on the lane");
+        }
+        sequence.ledger.back() = tokens[i];
+    }
+}
+
 void ProgramImplCore::resolve_prefill_lane(std::uint32_t lane, bool terminal) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
     if (requests[lane].pending.kind != PendingKind::Begin) {
