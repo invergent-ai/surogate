@@ -275,6 +275,14 @@ and the baseline run is queued.
   core (it is a DRAM-shaped GEMV, not a GEMM) that is ~19 ms per expert-job, so 50 % of a
   layer on 32 cores would take ~150 ms against the 52 ms gather. Prefill on the CPU needs a
   tiled int8 GEMM (ik's `iqk_mul_mat_moe` shape) and is a separate step.
+- **Hang in the v1 probe (2026-08-28, 15:00):** the one-user run stalled on its first
+  512-token request for 20 min with the GPU idle and 32 host threads spinning; one pool
+  worker was asleep. Cause: the pool published a round (`generation++` + `notify_all`) without
+  holding the mutex, so a worker that had just failed its wait predicate but not yet blocked
+  slept through the notification, and the coordinator — running inside a CUDA host-function
+  callback — spun on the barrier forever, freezing the stream. Fix: publish under the mutex
+  and re-notify periodically while waiting; the unit test now runs 3,000 tiny rounds on a
+  32-thread pool under a watchdog. Every step of the measurement chain carries a timeout.
 5. **Prefill**: selective streaming of used experts per layer with whole-layer double
    buffering on a side stream.
 
