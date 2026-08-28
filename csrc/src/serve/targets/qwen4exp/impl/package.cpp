@@ -117,7 +117,23 @@ Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
     // The expert slot pool is device memory the KV planner must not count as free: create it
     // here, before the engine measures free memory for `--kv-capacity auto`.
     detail::Variant::configure_expert_slots(options.expert_slots);
-    detail::Variant::configure_cpu_moe_share(options.cpu_moe_share);
+    {
+        // A pipeline stage whose pool holds (nearly) all of its layers' experts gains nothing
+        // from the CPU split — every layer would still pay a host round trip — so the split
+        // is off above 90 % residency unless the share was given explicitly.
+        float share = options.cpu_moe_share;
+        const bool staged = options.pipeline_stage_first != 0 || options.pipeline_stage_last != 0;
+        if (staged && share < 0.0F && options.expert_slots > 0) {
+            const int stage_layers = options.pipeline_stage_last - options.pipeline_stage_first;
+            const std::uint64_t stage_experts = static_cast<std::uint64_t>(stage_layers) * detail::TextConfig::experts;
+            if (static_cast<std::uint64_t>(options.expert_slots) * 10 >= stage_experts * 9) {
+                share = 0.0F;
+                std::fprintf(stderr, "qwen4exp: stage holds %u of %llu experts resident; CPU split off\n",
+                             options.expert_slots, static_cast<unsigned long long>(stage_experts));
+            }
+        }
+        detail::Variant::configure_cpu_moe_share(share);
+    }
     detail::Variant::configure_cpu_moe_min_tokens(options.cpu_moe_min_tokens);
     detail::Variant::configure_cpu_moe_prefill(options.cpu_moe_prefill_share, options.prefill_chunk);
     detail::Variant::configure_cpu_pool_per_socket(options.cpu_moe_pool_per_socket);

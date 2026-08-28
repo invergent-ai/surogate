@@ -18,6 +18,7 @@
 #include "runtime/engine/request_memory.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <stdexcept>
@@ -310,6 +311,7 @@ private:
                 if (t >= s + 1 && t - s - 1 < G) {
                     const std::uint32_t g = active[t - s - 1];
                     select(s);
+                    trace("consume", s, g);
                     if (in_flight_mixed[s]) {
                         MixedRoundResult part = stages_[s]->program->consume_mixed_round(in_flight[s]);
                         if (s + 1 == N) {
@@ -322,6 +324,7 @@ private:
                         if (s + 1 == N) { collect_tokens(group_rows[g], part); }
                     }
                     in_flight[s] = RoundHandle{};
+                    trace("consumed", s, g);
                     if (s + 1 < N) {
                         std::memcpy(slots_[s][g].data(), stages_[s]->program->stage_export_buffer(), boundary_bytes_);
                     }
@@ -395,7 +398,10 @@ private:
     std::vector<int> devices_;
     bool trace_                = false;
     void trace(const char* op, std::size_t stage, std::size_t columns) const {
-        if (trace_) { std::fprintf(stderr, "pipeline-trace: %s stage %zu columns %zu\n", op, stage, columns); }
+        if (!trace_) { return; }
+        static const auto origin = std::chrono::steady_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - origin).count();
+        std::fprintf(stderr, "pipeline-trace: %10.1f ms %s stage %zu columns %zu\n", ms, op, stage, columns);
     }
     std::uint32_t groups_      = 1;
     std::uint32_t min_lanes_per_group_ = 4;
