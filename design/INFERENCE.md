@@ -140,3 +140,18 @@ phase 3 = PP across 8 GPUs; phase 4 = EP measured against PP.
   without readahead, so copying 154 GB out of it faulted one page at a time. `HostBank` now
   asks for `MADV_SEQUENTIAL` + `MADV_WILLNEED` over each object before its 16-thread copy;
   the serve was relaunched with that build (the stalled process had to be killed).
+- Launcher: `gguf_target_key` maps arch `qwen4exp` → target `qwen4exp`; `ingest.py` fetches the
+  model's own frontend from the Hub and runs the GGUF-native converter (95e5a9dc). The cuBLASLt
+  BF16 route is prewarmed in `Package::create_program` before the program captures its graphs
+  (uncommitted until the next build). The pinned host bank now fills at ~1.3 GB/s (154 GB in
+  ~2 min) with the readahead fix.
+- First serve attempt: the model loads in ~3 min (5.5 GiB device weights in 2 s, then the
+  154 GB pinned bank), then program construction stopped at `gqa_attention: invalid KV cache
+  head geometry` — the attention family registered 24q4 (27B), 16q2, 8q2, 16q4 but not the
+  Flash-Next pair 24 query / 2 KV heads (group of twelve). Registered `Gqa256_24q2`
+  (`GqaGeometry<256, 24, 2, 1>`): the wrapper pairs 24 with 2 when the cache says so, the
+  decode/prefill launchers pick it by the cache's KV head count, int8 KV is refused for it
+  (its kernels tile at most three query-row tiles), and a lane step of more than 64 query rows
+  (width ≥ 6 with group 12) is refused explicitly instead of silently skipped by the BF16
+  kernel. Build in flight.
+- The server no longer appends the CLI usage after a load/serve failure (dc2996bc).

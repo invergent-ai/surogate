@@ -50,3 +50,28 @@ staging, swizzle and scale indexing, so this is a rewrite of the family, not a
 constant change. Budget it as a kernel project with the bench
 (`ninfer_sparse_moe_bench --sweep 64:2688`) and parity test
 (`ninfer_sparse_moe_test`) as the harness.
+
+## B2 — Flash-Next phase-1 exclusions (2026-08-28)
+
+Recorded while onboarding Qwen3.8-Flash-Next (`targets/qwen4exp/`); none blocks the
+first serve, each is a known limit of phase 1.
+
+- **Context above 2051 tokens.** Dense attention is exact only below the QSA indexer's
+  budget (`indexer_top_k + block - 1`); the indexer weights are in the artifact (validated,
+  not resident). Serving longer contexts needs the indexer op and its selected-token mask in
+  `gqa_attention`.
+- **int8 KV for the 24q2 attention geometry.** The int8 decode kernel tiles at most three
+  query-row tiles (48 rows); the group of twelve exceeds that from width 5. fp8 (the server
+  default) and bf16 KV use the BF16 kernel and are served. Lane steps of more than 64 query
+  rows (width ≥ 6 at group 12) are refused; only speculative widths reach them.
+- **Speculative decoding (MTP/DFlash) and vision** are refused at `plan_load`; the GGUF
+  carries no MTP block.
+- **Expert access is zero-copy from pinned host memory (v0).** Every routed expert read
+  crosses PCIe; phase 2 adds the device slot cache, CPU expert compute, and the
+  bandwidth-matched split (FreeToken hybrid). The pinned bank fills at ~1.3 GB/s at load
+  (~2 min for 154 GB); `Reader::read_direct` in large chunks would cut that.
+- **BF16 dense GEMMs run through cuBLASLt** (hc down/up/inject, PLE key/value, GDN a_b);
+  the hand-tuned BF16 family knows only the 27B MTP shapes. The hc weights read 1.26 GB
+  per decode round at batch 1 (BF16); W8 storage would halve that.
+- **Launcher GGUF path** fetches the frontend from the Hub (`Qwen/Qwen3.8-Flash-Next`);
+  offline conversions need `--frontend` pointed at a local snapshot.
