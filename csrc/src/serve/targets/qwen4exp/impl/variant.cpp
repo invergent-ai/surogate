@@ -14,6 +14,7 @@
 #include "ops/linear/bf16/bf16_cublaslt.h"
 
 #include <algorithm>
+#include <array>
 #include <deque>
 #include <chrono>
 #include <cstdint>
@@ -72,23 +73,38 @@ struct ExpertSlotCache {
         // at its column offset.
         std::int32_t round_total  = 0;
         std::int32_t round_offset = 0;
+        std::int32_t round_slice  = 0; // ordinal of the next slice within the round
         bool round_split          = false;
     };
+    // Pinned mirrors of the device job list, one per slice ordinal: the copies run on the
+    // main stream, so slice k+1's copy may land while slice k's host function still reads
+    // its jobs — each slice therefore owns a mirror.
+    struct JobMirror {
+        void* block                = nullptr;
+        std::int32_t* tokens       = nullptr;
+        std::int32_t* experts      = nullptr;
+        float* weights             = nullptr;
+        long long* count           = nullptr;
+    };
+    static constexpr int kJobMirrors = 8;
+    std::array<JobMirror, kJobMirrors> mirrors{};
     // Host-function contexts. A hook runs at graph capture and its context pointer is baked
     // into the host-function node, so a context must stay valid and unchanged for every
     // replay: one address-stable context per distinct (layer, offset, tokens), shared by every
     // graph and eager round with that slice shape.
     struct SliceContext {
-        Layer* entry         = nullptr;
-        std::int32_t offset  = 0;
-        std::int32_t tokens  = 0;
+        Layer* entry             = nullptr;
+        std::int32_t offset      = 0;
+        std::int32_t tokens      = 0;
+        std::int32_t ordinal     = 0;
+        const JobMirror* mirror  = nullptr;
     };
     std::deque<SliceContext> slice_contexts;
-    SliceContext& slice_context(Layer& entry, std::int32_t offset, std::int32_t tokens) {
+    SliceContext& slice_context(Layer& entry, std::int32_t offset, std::int32_t tokens, std::int32_t ordinal) {
         for (SliceContext& c : slice_contexts) {
-            if (c.entry == &entry && c.offset == offset && c.tokens == tokens) { return c; }
+            if (c.entry == &entry && c.offset == offset && c.tokens == tokens && c.ordinal == ordinal) { return c; }
         }
-        slice_contexts.push_back(SliceContext{&entry, offset, tokens});
+        slice_contexts.push_back(SliceContext{&entry, offset, tokens, ordinal, &mirrors[static_cast<std::size_t>(ordinal)]});
         return slice_contexts.back();
     }
     bool enabled = false;
@@ -167,6 +183,7 @@ struct ExpertSlotCache {
     void begin_round(Layer& entry, std::int32_t tokens) {
         entry.round_total  = tokens;
         entry.round_offset = 0;
+        entry.round_slice  = 0;
         entry.round_split  = cpu_split_enabled() && share_for(tokens) > 0 && tokens >= cpu_min_tokens &&
                              entry.cpu_bank.gate_up_codes != nullptr;
     }
@@ -178,13 +195,13 @@ struct ExpertSlotCache {
         const std::int32_t hidden = ops::kSparseMoeFlashNextGeometry.hidden;
         const std::int32_t tokens = slice->tokens;
         const std::size_t column0 = static_cast<std::size_t>(slice->offset) * hidden;
-        const long long count     = std::min<long long>(*cache.jobs_count_host, cache.cpu_jobs.capacity);
+        const JobMirror& mirror   = *slice->mirror;
+        const long long count     = std::min<long long>(*mirror.count, cache.cpu_jobs.capacity);
         std::fill_n(cache.out_host + column0, static_cast<std::size_t>(hidden) * tokens, 0.0F);
         if (count <= 0) { return; }
         cache.job_scratch.resize(static_cast<std::size_t>(count));
         for (long long i = 0; i < count; ++i) {
-            cache.job_scratch[static_cast<std::size_t>(i)] = {cache.jobs_tokens_host[i], cache.jobs_experts_host[i],
-                                                              cache.jobs_weights_host[i]};
+            cache.job_scratch[static_cast<std::size_t>(i)] = {mirror.tokens[i], mirror.experts[i], mirror.weights[i]};
         }
         ops::CpuExpertRound round{cache.x_host + column0, cache.out_host + column0, tokens, cache.job_scratch};
         cache.cpu_pool->run(entry->cpu_bank, round);
@@ -201,7 +218,11 @@ struct ExpertSlotCache {
             throw std::logic_error("qwen4exp: CPU split round wider than its staging");
         }
         entry.round_tokens = tokens;
-        SliceContext& slice = slice_context(entry, offset, tokens);
+        const std::int32_t ordinal = entry.round_slice++;
+        if (ordinal >= kJobMirrors) {
+            throw std::logic_error("qwen4exp: CPU split round has more slices than job mirrors");
+        }
+        SliceContext& slice = slice_context(entry, offset, tokens, ordinal);
         const std::size_t column0 = static_cast<std::size_t>(offset) * hidden;
         // The staging copies run on the main stream: they are small, and stream order then
         // guarantees the next slice's resolve cannot rewrite the job list before it is copied
@@ -210,7 +231,7 @@ struct ExpertSlotCache {
         CUDA_CHECK(cudaMemcpyAsync(x_host + column0, x.data,
                                    static_cast<std::size_t>(hidden) * tokens * sizeof(std::uint16_t),
                                    cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaMemcpyAsync(jobs_host_block, cpu_jobs_memory, jobs_block_bytes,
+        CUDA_CHECK(cudaMemcpyAsync(slice.mirror->block, cpu_jobs_memory, jobs_block_bytes,
                                    cudaMemcpyDeviceToHost, stream));
         // Fork only the host function onto the side stream so it overlaps the GPU experts.
         CUDA_CHECK(cudaEventRecord(fork_event, stream));
@@ -394,15 +415,20 @@ ExpertSlotCache& expert_slot_cache_for_current_device() {
                                      cudaHostAllocMapped | cudaHostAllocPortable));
             CUDA_CHECK(cudaHostGetDevicePointer(&cache.out_device_alias, cache.out_host, 0));
             cache.jobs_block_bytes = ops::expert_cpu_job_list_bytes(capacity);
-            CUDA_CHECK(cudaHostAlloc(&cache.jobs_host_block, cache.jobs_block_bytes, cudaHostAllocPortable));
-            {
+            for (auto& m : cache.mirrors) {
+                CUDA_CHECK(cudaHostAlloc(&m.block, cache.jobs_block_bytes, cudaHostAllocPortable));
                 // Same carve as the device list, so field offsets match after the block copy.
-                const ops::ExpertCpuJobList mirror = ops::create_expert_cpu_job_list(capacity, cache.jobs_host_block);
-                cache.jobs_tokens_host  = static_cast<std::int32_t*>(mirror.tokens.data);
-                cache.jobs_experts_host = static_cast<std::int32_t*>(mirror.experts.data);
-                cache.jobs_weights_host = static_cast<float*>(mirror.weights.data);
-                cache.jobs_count_host   = static_cast<long long*>(mirror.count.data);
+                const ops::ExpertCpuJobList view = ops::create_expert_cpu_job_list(capacity, m.block);
+                m.tokens  = static_cast<std::int32_t*>(view.tokens.data);
+                m.experts = static_cast<std::int32_t*>(view.experts.data);
+                m.weights = static_cast<float*>(view.weights.data);
+                m.count   = static_cast<long long*>(view.count.data);
             }
+            cache.jobs_host_block   = cache.mirrors[0].block;
+            cache.jobs_tokens_host  = cache.mirrors[0].tokens;
+            cache.jobs_experts_host = cache.mirrors[0].experts;
+            cache.jobs_weights_host = cache.mirrors[0].weights;
+            cache.jobs_count_host   = cache.mirrors[0].count;
             if (auto configured = configured_cpu_min_tokens().find(device);
                 configured != configured_cpu_min_tokens().end() && configured->second > 0) {
                 cache.cpu_min_tokens = static_cast<std::int32_t>(configured->second);
@@ -410,7 +436,11 @@ ExpertSlotCache& expert_slot_cache_for_current_device() {
                        min != nullptr && *min != '\0') {
                 cache.cpu_min_tokens = static_cast<std::int32_t>(std::strtol(min, nullptr, 10));
             }
-            cache.cpu_pool = std::make_unique<ops::CpuExpertPool>(geometry);
+            ops::CpuExpertPoolOptions pool_options;
+            if (const char* threads = std::getenv("SUROGATE_SERVE_CPU_MOE_THREADS"); threads != nullptr && *threads != '\0') {
+                pool_options.threads = static_cast<std::uint32_t>(std::strtoul(threads, nullptr, 10));
+            }
+            cache.cpu_pool = std::make_unique<ops::CpuExpertPool>(geometry, pool_options);
             CUDA_CHECK(cudaStreamCreateWithFlags(&cache.cpu_stream, cudaStreamNonBlocking));
             CUDA_CHECK(cudaEventCreateWithFlags(&cache.fork_event, cudaEventDisableTiming));
             CUDA_CHECK(cudaEventCreateWithFlags(&cache.join_event, cudaEventDisableTiming));

@@ -845,3 +845,11 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   runs far slower in situ than in the bench at that width, or the decode rounds changed too.
   Measuring instead of guessing: a same-binary pair at 64 users, prefill share 0 vs 0.5, with
   `SUROGATE_SERVE_ROUND_TIMING=1` (per-round-kind wall clock) is queued.
+- 64 users, prefill share 0.7, copies-on-main-stream binary: corrupted again (fatal in a
+  mixed round; 0.5 was clean twice). Share-dependent → a race that widens with the host
+  round's length: the pinned job-list mirror was one buffer, and with the copies on the main
+  stream slice k+1's copy can land while slice k's host function still reads its jobs (the
+  side-stream sequencing that used to prevent it was what serialised host and GPU). Fix
+  (this commit): one pinned mirror per slice ordinal within the round (8), owned by the
+  slice context (keyed by layer, offset, tokens, ordinal); x_host/out_host were already
+  per-offset and the next round starts only after the combine joined the last slice.

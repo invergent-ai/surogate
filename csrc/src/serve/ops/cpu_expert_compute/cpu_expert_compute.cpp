@@ -829,10 +829,23 @@ struct CpuExpertPool::Impl {
     void worker_loop(std::uint32_t index, bool pin) {
 #if defined(__x86_64__)
         if (pin) {
-            cpu_set_t set;
-            CPU_ZERO(&set);
-            CPU_SET(static_cast<int>(index), &set);
-            sched_setaffinity(0, sizeof(set), &set);
+            // Pin to the index-th CPU the process is allowed to run on (honours a cpuset or
+            // numactl --cpunodebind; the first half of a node's allowed set is its physical
+            // cores on the usual numbering).
+            cpu_set_t allowed;
+            CPU_ZERO(&allowed);
+            if (sched_getaffinity(0, sizeof(allowed), &allowed) == 0) {
+                int seen = -1, chosen = -1;
+                for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+                    if (CPU_ISSET(cpu, &allowed) && ++seen == static_cast<int>(index)) { chosen = cpu; break; }
+                }
+                if (chosen >= 0) {
+                    cpu_set_t set;
+                    CPU_ZERO(&set);
+                    CPU_SET(chosen, &set);
+                    sched_setaffinity(0, sizeof(set), &set);
+                }
+            }
         }
 #else
         (void)pin;
@@ -873,8 +886,14 @@ CpuExpertPool::CpuExpertPool(const SparseMoeGeometry& geometry, Options options)
     impl_->geometry = geometry;
     std::uint32_t threads = options.threads;
     if (threads == 0) {
-        const unsigned hw = std::thread::hardware_concurrency();
-        threads           = hw > 1 ? hw / 2 : 1; // one per physical core on SMT-2 parts
+        // One per physical core on SMT-2 parts, within the CPUs the process may run on.
+        unsigned hw = std::thread::hardware_concurrency();
+#if defined(__x86_64__)
+        cpu_set_t allowed;
+        CPU_ZERO(&allowed);
+        if (sched_getaffinity(0, sizeof(allowed), &allowed) == 0) { hw = static_cast<unsigned>(CPU_COUNT(&allowed)); }
+#endif
+        threads = hw > 1 ? hw / 2 : 1;
     }
     impl_->threads = threads;
     impl_->x_float.resize(static_cast<std::size_t>(threads) * geometry.hidden);
