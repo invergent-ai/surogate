@@ -84,6 +84,15 @@ Design (model-agnostic, keyed by `SparseMoeGeometry`; no kernel changes):
    kernel (byte-granular copies, PCIe is still the bound), or (c) write a planar-W8 AVX-512
    GEMV/GEMM of our own (decode is DRAM-bound so a simple VNNI kernel suffices; prefill is
    where ik's tiled GEMM would pay). Decide after the slot-cache numbers.
+
+35B regression watch (2026-08-28): `probe_35b.sh` on GPU 2 (both under host contention and
+with an idle host) reports users=32 decode 1,137 / prefill 4,547 tok/s with correct answers,
+against the board's 1,761 / 1,927 measured on GPU 1 earlier this session. The two GPU-2 runs
+printed identical figures, so it is either a GPU-2 vs GPU-1 difference or a regression from
+the day's family changes; a GPU-1 rerun with the current binary is queued behind the
+Flash-Next measurements and decides it. The ik_llama.cpp build (7cff686d, CUDA + AVX-512)
+succeeded; its server has fused MoE on by default (`-no-fmoe` disables; `-fmoe` is not a flag)
+and the baseline run is queued.
 5. **Prefill**: selective streaming of used experts per layer with whole-layer double
    buffering on a side stream.
 
