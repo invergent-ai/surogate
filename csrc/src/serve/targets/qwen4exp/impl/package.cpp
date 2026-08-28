@@ -118,6 +118,7 @@ Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
     // here, before the engine measures free memory for `--kv-capacity auto`.
     detail::Variant::configure_expert_slots(options.expert_slots);
     detail::Variant::configure_cpu_moe_share(options.cpu_moe_share);
+    detail::Variant::configure_cpu_moe_min_tokens(options.cpu_moe_min_tokens);
     {
         int previous = 0;
         CUDA_CHECK(cudaGetDevice(&previous));

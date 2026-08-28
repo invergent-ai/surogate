@@ -325,6 +325,12 @@ and the baseline run is queued.
   toward the host's ~180 GB/s. A share sweep (0.8, 0.9) and 32/64-user probes are queued;
   the bandwidth-matched split of the design (share from measured host vs PCIe rates) is the
   follow-up.
+- Bandwidth-matched share (design D4), planned: at startup, with the pool and the split on,
+  time a gather of N experts over PCIe and a host round of N experts, and set
+  `share = host_rate / (host_rate + pcie_rate)` (clamped to [0.3, 0.9]) unless
+  `--cpu-moe-share` is given; log both rates. On this box that formula predicts ~0.78
+  (host ~180 GB/s vs PCIe ~50). `--cpu-moe-min-tokens N` (server + CLI) now sets the split's
+  minimum round width (env `SUROGATE_SERVE_CPU_MOE_MIN_TOKENS`, default 4).
 5. **Prefill**: selective streaming of used experts per layer with whole-layer double
    buffering on a side stream.
 

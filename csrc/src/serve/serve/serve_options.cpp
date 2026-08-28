@@ -103,7 +103,7 @@ KvCapacityPolicy parse_kv_capacity(const char* text) {
 std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
-           "[--served-model-name ID] [--max-model-len N] [--kv-capacity N|auto] [--expert-slots N] [--cpu-moe-share F] "
+           "[--served-model-name ID] [--max-model-len N] [--kv-capacity N|auto] [--expert-slots N] [--cpu-moe-share F] [--cpu-moe-min-tokens N] "
            "[--max-num-seqs N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--max-num-batched-tokens N] [--log-stats-interval-ms N] [--device N] "
@@ -198,6 +198,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--expert-slots") {
             options.expert_slots =
                 static_cast<std::uint32_t>(parse_nonnegative_int(require_value("--expert-slots"), "expert-slots"));
+        } else if (arg == "--cpu-moe-min-tokens") {
+            options.cpu_moe_min_tokens = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--cpu-moe-min-tokens"), "cpu-moe-min-tokens"));
         } else if (arg == "--cpu-moe-share") {
             options.cpu_moe_share = std::strtof(require_value("--cpu-moe-share"), nullptr);
             if (options.cpu_moe_share < 0.0F || options.cpu_moe_share > 1.0F) {

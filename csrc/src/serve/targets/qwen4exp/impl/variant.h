@@ -74,6 +74,8 @@ struct Variant {
     /// Fraction of a round's missing experts the host computes (SUROGATE_SERVE_CPU_MOE_SHARE is
     /// the fallback when nothing was configured).
     static void configure_cpu_moe_share(float share);
+    /// Minimum round width (columns) for the split; 0 keeps the default (4).
+    static void configure_cpu_moe_min_tokens(std::uint32_t tokens);
     static constexpr bool has_layer_prologue = true;
     // 48 layers, a four-stream residual, the PLE nodes and (with the CPU split) the host-round
     // nodes per layer: the decode graphs measure 15.7-21.4 MiB per lane against the family's 12.

@@ -76,7 +76,7 @@ ReasoningEffort parse_reasoning_effort(std::string_view text) {
 std::string usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
-           "       [--max-context N] [--kv-capacity N|auto] [--expert-slots N] [--cpu-moe-share F] [--prefill-chunk N] [--max-new N]\n"
+           "       [--max-context N] [--kv-capacity N|auto] [--expert-slots N] [--cpu-moe-share F] [--cpu-moe-min-tokens N] [--prefill-chunk N] [--max-new N]\n"
            "       [--device N]\n"
            "       [--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N]\n"
            "       [--lm-head-draft]\n"
@@ -128,6 +128,8 @@ Options parse_options(int argc, char** argv) {
             kv_capacity_explicit = true;
         } else if (arg == "--expert-slots") {
             options.expert_slots = parse_u32(value(arg), "expert-slots");
+        } else if (arg == "--cpu-moe-min-tokens") {
+            options.cpu_moe_min_tokens = parse_u32(value(arg), "cpu-moe-min-tokens");
         } else if (arg == "--cpu-moe-share") {
             options.cpu_moe_share = std::strtof(value(arg), nullptr);
             if (options.cpu_moe_share < 0.0F || options.cpu_moe_share > 1.0F) {

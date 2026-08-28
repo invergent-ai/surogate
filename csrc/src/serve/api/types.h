@@ -88,6 +88,9 @@ struct EngineOptions {
     // Fraction [0,1] of a round's missing experts computed on the host instead of fetched into
     // the slot cache (0 = everything is fetched). Needs expert_slots > 0.
     float cpu_moe_share                = 0.0F;
+    // Rounds narrower than this many columns keep every miss on the GPU (the host round-trip
+    // costs more than it saves); 0 = the target's default.
+    std::uint32_t cpu_moe_min_tokens   = 0;
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;

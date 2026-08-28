@@ -228,6 +228,10 @@ std::unordered_map<int, float>& configured_cpu_share() {
     static std::unordered_map<int, float> configured;
     return configured;
 }
+std::unordered_map<int, std::uint32_t>& configured_cpu_min_tokens() {
+    static std::unordered_map<int, std::uint32_t> configured;
+    return configured;
+}
 
 ExpertSlotCache& expert_slot_cache_for_current_device() {
     static std::unordered_map<int, ExpertSlotCache> registry;
@@ -303,7 +307,11 @@ ExpertSlotCache& expert_slot_cache_for_current_device() {
                 cache.jobs_weights_host = static_cast<float*>(mirror.weights.data);
                 cache.jobs_count_host   = static_cast<long long*>(mirror.count.data);
             }
-            if (const char* min = std::getenv("SUROGATE_SERVE_CPU_MOE_MIN_TOKENS"); min != nullptr && *min != '\0') {
+            if (auto configured = configured_cpu_min_tokens().find(device);
+                configured != configured_cpu_min_tokens().end() && configured->second > 0) {
+                cache.cpu_min_tokens = static_cast<std::int32_t>(configured->second);
+            } else if (const char* min = std::getenv("SUROGATE_SERVE_CPU_MOE_MIN_TOKENS");
+                       min != nullptr && *min != '\0') {
                 cache.cpu_min_tokens = static_cast<std::int32_t>(std::strtol(min, nullptr, 10));
             }
             cache.cpu_pool = std::make_unique<ops::CpuExpertPool>(geometry);
@@ -506,6 +514,13 @@ void Variant::configure_expert_slots(std::uint32_t slots) {
     CUDA_CHECK(cudaGetDevice(&device));
     std::lock_guard<std::mutex> lock(expert_slot_mutex());
     configured_expert_slots()[device] = slots;
+}
+
+void Variant::configure_cpu_moe_min_tokens(std::uint32_t tokens) {
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    std::lock_guard<std::mutex> lock(expert_slot_mutex());
+    configured_cpu_min_tokens()[device] = tokens;
 }
 
 void Variant::configure_cpu_moe_share(float share) {
