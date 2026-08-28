@@ -181,6 +181,14 @@ struct ExpertSlotCache {
     std::int64_t stats_misses = 0;
     std::int64_t stats_ids    = 0;
     void record_stats(const Tensor& ids, cudaStream_t stream) {
+        // Hooks run once at capture time and never during graph replays, and a synchronous
+        // readout is illegal on a capturing stream: the readout is an eager-mode
+        // (--no-cuda-graph) diagnostic only.
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess ||
+            capture != cudaStreamCaptureStatusNone) {
+            return;
+        }
         ++stats_rounds;
         stats_ids += ids.numel();
         if (stats_rounds % stats_every != 0) { return; }
@@ -205,6 +213,10 @@ std::mutex& expert_slot_mutex() {
 }
 std::unordered_map<int, std::uint32_t>& configured_expert_slots() {
     static std::unordered_map<int, std::uint32_t> configured;
+    return configured;
+}
+std::unordered_map<int, float>& configured_cpu_share() {
+    static std::unordered_map<int, float> configured;
     return configured;
 }
 
@@ -249,8 +261,15 @@ ExpertSlotCache& expert_slot_cache_for_current_device() {
     if (const char* stats = std::getenv("SUROGATE_SERVE_EXPERT_STATS"); stats != nullptr && *stats != '\0') {
         cache.stats_every = std::strtol(stats, nullptr, 10);
     }
-    if (const char* share = std::getenv("SUROGATE_SERVE_CPU_MOE_SHARE"); share != nullptr && *share != '\0') {
-        const double fraction = std::strtod(share, nullptr);
+    double fraction = 0.0;
+    if (auto configured = configured_cpu_share().find(device);
+        configured != configured_cpu_share().end() && configured->second > 0.0F) {
+        fraction = static_cast<double>(configured->second);
+    } else if (const char* share = std::getenv("SUROGATE_SERVE_CPU_MOE_SHARE");
+               share != nullptr && *share != '\0') {
+        fraction = std::strtod(share, nullptr);
+    }
+    {
         if (fraction > 0.0) {
             cache.cpu_share_q16 = static_cast<std::uint32_t>(std::min(1.0, fraction) * 65536.0);
             cache.cpu_max_tokens = 64; // decode and small-T rounds; prefill keeps the full gather
@@ -459,6 +478,13 @@ void Variant::configure_expert_slots(std::uint32_t slots) {
     CUDA_CHECK(cudaGetDevice(&device));
     std::lock_guard<std::mutex> lock(expert_slot_mutex());
     configured_expert_slots()[device] = slots;
+}
+
+void Variant::configure_cpu_moe_share(float share) {
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    std::lock_guard<std::mutex> lock(expert_slot_mutex());
+    configured_cpu_share()[device] = share;
 }
 
 void Variant::prewarm_device_scratch() {

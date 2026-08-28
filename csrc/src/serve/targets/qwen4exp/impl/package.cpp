@@ -117,6 +117,7 @@ Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
     // The expert slot pool is device memory the KV planner must not count as free: create it
     // here, before the engine measures free memory for `--kv-capacity auto`.
     detail::Variant::configure_expert_slots(options.expert_slots);
+    detail::Variant::configure_cpu_moe_share(options.cpu_moe_share);
     {
         int previous = 0;
         CUDA_CHECK(cudaGetDevice(&previous));

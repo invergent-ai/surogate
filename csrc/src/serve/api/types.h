@@ -85,6 +85,9 @@ struct EngineOptions {
     // expert slots (0 = experts are read from the host bank in place). Targets without a
     // host bank ignore it.
     std::uint32_t expert_slots         = 0;
+    // Fraction [0,1] of a round's missing experts computed on the host instead of fetched into
+    // the slot cache (0 = everything is fetched). Needs expert_slots > 0.
+    float cpu_moe_share                = 0.0F;
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;

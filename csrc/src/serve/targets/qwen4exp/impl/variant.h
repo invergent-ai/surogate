@@ -71,6 +71,9 @@ struct Variant {
     /// when the cache is created in prewarm_device_scratch. SUROGATE_SERVE_EXPERT_SLOTS is the
     /// fallback when nothing was configured.
     static void configure_expert_slots(std::uint32_t slots);
+    /// Fraction of a round's missing experts the host computes (SUROGATE_SERVE_CPU_MOE_SHARE is
+    /// the fallback when nothing was configured).
+    static void configure_cpu_moe_share(float share);
     static constexpr bool has_layer_prologue = true;
     // 48 layers, a four-stream residual and the PLE nodes: the decode graphs measured
     // 15.7 MiB per lane (503 MB at 32 lanes) against the family's 12 MiB.

@@ -163,6 +163,9 @@ and the baseline run is queued.
   `qwen4exp`'s hook stages the activations + jobs to pinned memory, runs the pool from a
   `cudaLaunchHostFunc` node and adds the FP32 partial back (`SUROGATE_SERVE_CPU_MOE_SHARE=<f>`,
   decode/small-T rounds ≤ 64 tokens; prefill keeps the full gather). Compiling.
+- ik_llama.cpp's loadgen errors are `ServerDisconnectedError` (its server drops some streamed
+  connections; nothing in its log) — the ok requests carry the throughput figure. Options
+  `--expert-slots N` / `--cpu-moe-share F` (server + CLI) now cover both phase-2 knobs.
 5. **Prefill**: selective streaming of used experts per layer with whole-layer double
    buffering on a side stream.
 

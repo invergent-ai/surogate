@@ -29,6 +29,7 @@ struct ServeOptions {
     std::uint32_t max_context              = 8192;
     KvCapacityPolicy kv_capacity           = KvCapacityPolicy::explicit_capacity(8192);
     std::uint32_t expert_slots             = 0; // --expert-slots N (host-streamed MoE targets)
+    float cpu_moe_share                    = 0.0F; // --cpu-moe-share F (fraction of misses on the host)
     std::uint32_t max_concurrency          = 1;
     std::uint32_t max_pending_requests     = 16;
     std::uint32_t pending_timeout_ms       = 30000;
