@@ -13,7 +13,10 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <mutex>
+#include <string>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
@@ -69,6 +72,57 @@ graph_profiles_through(std::uint32_t max_frontier, const std::vector<std::uint32
 }
 
 std::size_t round_up(std::size_t bytes) { return (bytes + 255) / 256 * 256; }
+
+// Debug parity dumps: SUROGATE_SERVE_DUMP_RESIDUAL=<dir> writes the residual streams before
+// every layer and the final mixed hidden state of the first forwards with at most 64 columns,
+// as raw BF16 with a 16-byte header {magic, rows, columns, forward}. Synchronises the stream.
+struct ResidualDump {
+    std::string dir;
+    int forward = 0;
+    int limit   = 0;
+};
+
+ResidualDump& residual_dump() {
+    static ResidualDump dump = [] {
+        ResidualDump out;
+        if (const char* raw = std::getenv("SUROGATE_SERVE_DUMP_RESIDUAL"); raw != nullptr && *raw) {
+            out.dir   = raw;
+            out.limit = 2;
+        }
+        return out;
+    }();
+    return dump;
+}
+
+void dump_tensor(const Tensor& tensor, const std::string& name, int forward, cudaStream_t stream) {
+    const std::size_t bytes = tensor.bytes();
+    std::vector<std::byte> host(bytes);
+    CUDA_CHECK(cudaMemcpyAsync(host.data(), tensor.data, bytes, cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    const std::string path = residual_dump().dir + "/" + name + ".bin";
+    FILE* file             = std::fopen(path.c_str(), "wb");
+    if (file == nullptr) { return; }
+    const std::int32_t header[4] = {0x52455344, tensor.ne[0], tensor.ne[1], forward};
+    std::fwrite(header, sizeof(header), 1, file);
+    std::fwrite(host.data(), 1, bytes, file);
+    std::fclose(file);
+}
+
+// Layer 0's prologue marks the start of a forward.
+void maybe_dump_layer(int layer, const Tensor& residual, cudaStream_t stream) {
+    ResidualDump& dump = residual_dump();
+    if (dump.dir.empty() || residual.ne[1] > 64) { return; }
+    if (layer == 0) { dump.forward += 1; }
+    if (dump.forward > dump.limit) { return; }
+    dump_tensor(residual, "f" + std::to_string(dump.forward) + "_layer" + std::to_string(layer),
+                dump.forward, stream);
+}
+
+void maybe_dump_final(const Tensor& hidden, cudaStream_t stream) {
+    ResidualDump& dump = residual_dump();
+    if (dump.dir.empty() || hidden.ne[1] > 64 || dump.forward > dump.limit) { return; }
+    dump_tensor(hidden, "f" + std::to_string(dump.forward) + "_final", dump.forward, stream);
+}
 
 std::size_t plane_bytes(std::int32_t rows, std::int32_t tokens, DType dtype) {
     return round_up(static_cast<std::size_t>(rows) * static_cast<std::size_t>(tokens) *
@@ -157,6 +211,7 @@ void Variant::final_residual_mix(const ModelView& model, const Tensor& residual,
                                  WorkspaceArena& workspace, cudaStream_t stream) {
     ops::hyper_connection_mix(residual, model.output_mix, kStreams, kEps, hidden, nullptr,
                               workspace, stream);
+    maybe_dump_final(hidden, stream);
 }
 
 void Variant::attention_norm(const Tensor& residual, const FullAttentionProjectionWeights& weights,
@@ -173,6 +228,7 @@ void Variant::layer_prologue(const ModelView& model, int layer, Tensor& residual
                              const qwen3_6::detail::PrologueColumns& columns,
                              NgramPleStatePool* ple_state, WorkspaceArena& workspace,
                              cudaStream_t stream) {
+    maybe_dump_layer(layer, residual, stream);
     if (layer != model.ple.layer) { return; }
     if (ple_state == nullptr || ple_state->empty()) {
         throw std::logic_error("qwen4exp: the PLE layer needs its state pool");
