@@ -651,6 +651,8 @@ yet. llama.cpp upstream master (added `qwen4exp` this week; CUDA build at
 | (share 0.5, `numactl --interleave=all`) | 16 | 21.7 | 93 | 16.9 s |
 | (share 0.7, `numactl --interleave=all`) | 16 | **33.5** | 138 | 12.3 s |
 | (share 0.8 / 0.9, no interleave) | 16 | 33.9 / 33.0 | 143 / 152 | 12.1 / 12.3 s |
+| (share 0.7, interleave, `--expert-slots 2000` so the 64-lane graphs and KV fit) | 64 | **86.5** | 346 | 18.6 s |
+| (`--cpu-moe-share auto` → measured host 199 GB/s vs PCIe 52 GB/s → 79 %, interleave) | 16 | 32.3 | 131 | 8.6 s |
 
 
 Reading the prefill column: loadgen's "prefill tok/s" is prompt tokens ÷ the
