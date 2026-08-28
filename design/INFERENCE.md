@@ -192,6 +192,20 @@ and the baseline run is queued.
   chain gated on it (CPU-split run, hit-rate readout, CPU benchmark) waited until the owner
   pointed out the idle GPUs. Chains now gate on marker lines in output files and guard with
   `pgrep -x surogate-engine`; the bisect probes and the GPU-1 sequence were relaunched.
+- 35B bisect (GPU 2, users=32): 81257e66 (before the family residual hooks) 1,134 and b4e13eb6
+  (after them) 1,119 tok/s — the hooks are not it either; the slowdown predates 81257e66, which
+  leaves stage B (823e240b, MoE kernels instantiated per geometry with derived constants) as
+  the prime suspect. Stage A (13a08634) is building for the decisive probe; if it measures
+  ~1,760 the fix is to compare stage B's derived constants (D1 warps, adaptive block counts,
+  small-T router partitions / S2 batch limits, prefill persistent blocks, score-row padding)
+  with the previous hand-tuned values for the 256/8/512/2048 geometry.
+- **Correction:** the 1,761 / 1,927 figures came from `probe_35b_full.sh` (100 users, 128
+  seqs, 4,096 batched tokens — the board's configuration), while every run today used
+  `probe_35b.sh` (32 users, 32 seqs). All bisect points agree at ~1,130 tok/s *for 32 users*,
+  so no regression has been demonstrated; the comparison was apples to oranges. The board
+  configuration is being rerun with the current binary on GPU 2 (expect ~1,760 unbatched);
+  the stage-A 32-user datapoint still lands as a sanity check. Lesson recorded: compare
+  against the board only with the board's script.
 5. **Prefill**: selective streaming of used experts per layer with whole-layer double
    buffering on a side stream.
 
