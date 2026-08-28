@@ -116,10 +116,12 @@ experts on the CPU (`-ot exps=CPU`, 32 threads).
 | same, `--cpu-moe-share auto` (measured host 199 GB/s vs PCIe 52 GB/s → 79 %) | 16 | 32.3 | 131 | 8.6 s |
 | same, `--expert-slots 2000` (so 64 lanes fit) | 64 | 37.0 | 174 | 24.3 s |
 | + prefill on the host (`--cpu-moe-prefill-share 0.7`, batched VNNI kernel) | 1 | 22.5 | 109 | **1.43 s** |
-| same, prefill share 0.5 | 16 | **36.0** | 159 | **5.8 s** |
+| same, prefill share 0.5 (explicit) | 16 | **37.9** | 172 | 7.3 s |
+| **phase-2 defaults** (`--expert-slots 3000 --cpu-moe-share auto`: measured 80 % decode / 50 % prefill on the host) | 16 | 32.2 | 174 | 9.0 s |
+| same, 1 user (prefill share 0.7) | 1 | 22.4 | 110 | **1.40 s** |
 
 Prompt processing at one user (512 ÷ TTFT): full gather 174 t/s, prefill
-split **358 t/s**; ik_llama.cpp ≈ 285. Both engines answer the probes
+split **358-366 t/s**; ik_llama.cpp ≈ 285. Both engines answer the probes
 correctly (`Paris`, `2, 3, 5`).
 
 External single-user references (llama.cpp PR #27742, other hardware and
