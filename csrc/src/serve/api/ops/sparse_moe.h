@@ -113,9 +113,12 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
  * host at launch time (also during graph capture) and must only enqueue work on `stream`.
  */
 struct SparseMoeRoundHook {
-    void (*resolve)(void* context, const Tensor& ids, const Tensor& alpha,
-                    cudaStream_t stream) = nullptr;
-    void* context                       = nullptr;
+    /// `x` and `destination` are the round's own columns ([hidden, tokens] BF16 views: one
+    /// token in the decode loop, the slice otherwise) so the hook can compute part of the
+    /// round elsewhere and add it into the same destination.
+    void (*resolve)(void* context, const Tensor& ids, const Tensor& alpha, const Tensor& x,
+                    Tensor& destination, cudaStream_t stream) = nullptr;
+    void* context                                             = nullptr;
 };
 
 /// As above with a round hook; a hook with a null `resolve` is the plain call.

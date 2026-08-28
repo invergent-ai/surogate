@@ -507,7 +507,7 @@ void launch_d3_dependent_codec(const Tensor& x, const SparseMoeWeights& weights,
         shared_scales, act));
 }
 
-void launch_d2_d3(const Tensor& x, const SparseMoeWeights& weights,
+void launch_d2_d3(const Tensor& x, const SparseMoeWeights& weights, Tensor& destination,
                   const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream,
                   const SparseMoeRoundHook* hook) {
     const auto* scores = static_cast<const float*>(workspace.scratch.data);
@@ -519,7 +519,7 @@ void launch_d2_d3(const Tensor& x, const SparseMoeWeights& weights,
     // The round hook sees the final ids before the expert kernels; its launches sit between
     // D2 and D3 on the stream, so D3's programmatic wait resolves against them.
     if (hook != nullptr && hook->resolve != nullptr) {
-        hook->resolve(hook->context, workspace.ids, workspace.alpha, stream);
+        hook->resolve(hook->context, workspace.ids, workspace.alpha, x, destination, stream);
     }
 
     switch (weights.routed_gate_up.qtype) {
@@ -752,7 +752,7 @@ void decode_launch(const Tensor& x, const SparseMoeWeights& weights, Tensor& des
                    const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream,
                    const SparseMoeRoundHook* hook) {
     launch_d1(x, weights.router_shared_gate, workspace, stream);
-    launch_d2_d3(x, weights, workspace, stream, hook);
+    launch_d2_d3(x, weights, destination, workspace, stream, hook);
     launch_d4_dependent(weights, destination, workspace, stream);
 }
 

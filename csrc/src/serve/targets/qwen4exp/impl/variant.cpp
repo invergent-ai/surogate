@@ -43,9 +43,6 @@ constexpr auto kPolicy           = ops::LinearPolicy::A16Only;
 // through a thread-local handle rather than a family-visible parameter.
 constexpr std::size_t kInjectScratchBytes = 1u << 20; // [4 streams, T] FP32 up to T = 65536
 thread_local Tensor t_inject;
-// The MoE input and output planes of the block being executed (for the CPU expert split).
-thread_local Tensor t_moe_input;
-thread_local Tensor t_moe_output;
 
 struct InjectScratch {
     void* data        = nullptr;
@@ -133,12 +130,12 @@ struct ExpertSlotCache {
         cache.cpu_pool->run(entry->cpu_bank, round);
     }
 
-    void cpu_round(Layer& entry, const Tensor& ids, cudaStream_t stream) {
-        const std::int32_t tokens = ids.ne[1] > 0 ? ids.ne[1] : 1;
+    void cpu_round(Layer& entry, const Tensor& x, Tensor& destination, cudaStream_t stream) {
         const std::int32_t hidden = ops::kSparseMoeFlashNextGeometry.hidden;
+        const std::int32_t tokens = static_cast<std::int32_t>(x.numel() / hidden);
         entry.round_tokens        = tokens;
         // Activations and the job list to the host, the host computes, the partial is added.
-        CUDA_CHECK(cudaMemcpyAsync(x_host, t_moe_input.data,
+        CUDA_CHECK(cudaMemcpyAsync(x_host, x.data,
                                    static_cast<std::size_t>(hidden) * tokens * sizeof(std::uint16_t),
                                    cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaMemcpyAsync(jobs_tokens_host, cpu_jobs.tokens.data, cpu_jobs.tokens.bytes(),
@@ -150,18 +147,18 @@ struct ExpertSlotCache {
         CUDA_CHECK(cudaMemcpyAsync(jobs_count_host, cpu_jobs.count.data, sizeof(long long),
                                    cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaLaunchHostFunc(stream, &ExpertSlotCache::run_cpu_round, &entry));
-        Tensor destination = t_moe_output.view({hidden, tokens});
         ops::expert_cpu_partial_add(out_device_alias, destination, stream);
     }
 
     static void resolve_round(void* context, const Tensor& ids, const Tensor& alpha,
-                              cudaStream_t stream) {
+                              const Tensor& x, Tensor& destination, cudaStream_t stream) {
         auto* entry = static_cast<Layer*>(context);
         ExpertSlotCache& cache = *entry->owner;
-        const std::int32_t tokens = ids.ne[1] > 0 ? ids.ne[1] : 1;
-        const bool split = cache.cpu_split_enabled() && tokens <= cache.cpu_max_tokens &&
-                           entry->cpu_bank.gate_up_codes != nullptr && t_moe_input.data != nullptr &&
-                           t_moe_output.data != nullptr;
+        const std::int32_t tokens =
+            static_cast<std::int32_t>(x.numel() / ops::kSparseMoeFlashNextGeometry.hidden);
+        const bool split = cache.cpu_split_enabled() && tokens >= 1 && tokens <= cache.cpu_max_tokens &&
+                           entry->cpu_bank.gate_up_codes != nullptr && x.data != nullptr &&
+                           destination.data != nullptr;
         if (split) {
             ops::expert_slot_resolve(ids, alpha, entry->index, cache.directory, cache.misses,
                                      &cache.cpu_jobs, cache.cpu_share_q16, stream);
@@ -169,7 +166,7 @@ struct ExpertSlotCache {
             ops::expert_slot_resolve(ids, entry->index, cache.directory, cache.misses, stream);
         }
         ops::expert_slot_gather(entry->bank, cache.misses, cache.pool, stream);
-        if (split) { cache.cpu_round(*entry, ids, stream); }
+        if (split) { cache.cpu_round(*entry, x, destination, stream); }
         if (cache.stats_every > 0) { cache.record_stats(ids, stream); }
     }
 
@@ -698,8 +695,6 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
         weights.op.routed_down.qtype, tokens, tokens));
     WorkspaceArena leaf(storage);
     ExpertSlotCache& cache = expert_slot_cache_for_current_device();
-    t_moe_input  = hidden;
-    t_moe_output = output;
     if (cache.enabled) {
         // Routed experts come from the device slot pool: the round hook resolves the routing
         // against the directory and gathers the misses from the host bank before the expert
@@ -710,8 +705,6 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
         ops::SparseMoeRoundHook hook{&ExpertSlotCache::resolve_round, &layer};
         ops::sparse_moe(hidden, pooled, ops::SparseMoeEpilogue::AddResidual, output, leaf, stream,
                         hook);
-        t_moe_input  = Tensor{};
-        t_moe_output = Tensor{};
     } else {
         ops::sparse_moe(hidden, weights.op, ops::SparseMoeEpilogue::AddResidual, output, leaf,
                         stream);

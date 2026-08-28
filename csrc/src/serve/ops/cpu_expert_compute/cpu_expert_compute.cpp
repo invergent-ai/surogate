@@ -106,34 +106,57 @@ bool detect_avx512() {
            __builtin_cpu_supports("avx512vl") && __builtin_cpu_supports("avx512dq");
 }
 
-/// AVX-512 dot: per 32-group, widen int8→int16 (32 lanes), vpmaddwd → 16 int32 pairs, reduce.
+/// AVX-512 dots of two W8 rows against one quantised activation (gate and up rows share the
+/// activation loads): per 32-group, widen int8→int16 (32 lanes), vpmaddwd → 16 int32 pair sums,
+/// scale by (w_scale * x_scale) with the row's fp16 scales converted 16 at a time (F16C), and
+/// reduce once per row at the end.
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512dq,f16c,fma")))
+void dot_two_rows_avx512(const std::int8_t* codes0, const std::uint16_t* scales0,
+                         const std::int8_t* codes1, const std::uint16_t* scales1,
+                         const std::int8_t* xq, const float* xs, int k, float& out0, float& out1) {
+    const int groups = k / kGroup;
+    __m512 acc0 = _mm512_setzero_ps();
+    __m512 acc1 = _mm512_setzero_ps();
+    int g = 0;
+    for (; g + 16 <= groups; g += 16) {
+        // 16 groups' worth of scales at once.
+        const __m512 ws0 = _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(scales0 + g)));
+        const __m512 ws1 = _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(scales1 + g)));
+        const __m512 xsv = _mm512_loadu_ps(xs + g);
+        const __m512 s0  = _mm512_mul_ps(ws0, xsv);
+        const __m512 s1  = _mm512_mul_ps(ws1, xsv);
+        alignas(64) float sc0[16];
+        alignas(64) float sc1[16];
+        _mm512_store_ps(sc0, s0);
+        _mm512_store_ps(sc1, s1);
+        for (int i = 0; i < 16; ++i) {
+            const int gg     = g + i;
+            const __m512i xv = _mm512_cvtepi8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(xq + gg * kGroup)));
+            const __m512i w0 = _mm512_cvtepi8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(codes0 + gg * kGroup)));
+            const __m512i w1 = _mm512_cvtepi8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(codes1 + gg * kGroup)));
+            acc0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_madd_epi16(w0, xv)), _mm512_set1_ps(sc0[i]), acc0);
+            acc1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_madd_epi16(w1, xv)), _mm512_set1_ps(sc1[i]), acc1);
+        }
+    }
+    for (; g < groups; ++g) {
+        const __m512i xv = _mm512_cvtepi8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(xq + g * kGroup)));
+        const __m512i w0 = _mm512_cvtepi8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(codes0 + g * kGroup)));
+        const __m512i w1 = _mm512_cvtepi8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(codes1 + g * kGroup)));
+        const float s0   = fp16_to_float(scales0[g]) * xs[g];
+        const float s1   = fp16_to_float(scales1[g]) * xs[g];
+        acc0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_madd_epi16(w0, xv)), _mm512_set1_ps(s0), acc0);
+        acc1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_madd_epi16(w1, xv)), _mm512_set1_ps(s1), acc1);
+    }
+    out0 = _mm512_reduce_add_ps(acc0);
+    out1 = _mm512_reduce_add_ps(acc1);
+}
+
 __attribute__((target("avx512f,avx512bw,avx512vl,avx512dq,f16c,fma")))
 float dot_row_avx512(const std::int8_t* codes, const std::uint16_t* scales, const std::int8_t* xq,
                      const float* xs, int k) {
-    const int groups = k / kGroup;
-    __m512 acc       = _mm512_setzero_ps();
-    int g            = 0;
-    // Two groups per iteration to amortise the horizontal reduction: 16 int32 lanes each.
-    for (; g + 2 <= groups; g += 2) {
-        const __m512i w0 = _mm512_cvtepi8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(codes + g * kGroup)));
-        const __m512i x0 = _mm512_cvtepi8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(xq + g * kGroup)));
-        const __m512i w1 = _mm512_cvtepi8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(codes + (g + 1) * kGroup)));
-        const __m512i x1 = _mm512_cvtepi8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(xq + (g + 1) * kGroup)));
-        const __m512i p0 = _mm512_madd_epi16(w0, x0); // 16 x int32, each a sum of 2 products
-        const __m512i p1 = _mm512_madd_epi16(w1, x1);
-        const float s0   = fp16_to_float(scales[g]) * xs[g];
-        const float s1   = fp16_to_float(scales[g + 1]) * xs[g + 1];
-        acc = _mm512_fmadd_ps(_mm512_cvtepi32_ps(p0), _mm512_set1_ps(s0), acc);
-        acc = _mm512_fmadd_ps(_mm512_cvtepi32_ps(p1), _mm512_set1_ps(s1), acc);
-    }
-    for (; g < groups; ++g) {
-        const __m512i w0 = _mm512_cvtepi8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(codes + g * kGroup)));
-        const __m512i x0 = _mm512_cvtepi8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(xq + g * kGroup)));
-        const __m512i p0 = _mm512_madd_epi16(w0, x0);
-        const float s0   = fp16_to_float(scales[g]) * xs[g];
-        acc = _mm512_fmadd_ps(_mm512_cvtepi32_ps(p0), _mm512_set1_ps(s0), acc);
-    }
-    return _mm512_reduce_add_ps(acc);
+    float a = 0.0F, b = 0.0F;
+    dot_two_rows_avx512(codes, scales, codes, scales, xq, xs, k, a, b);
+    return a;
 }
 #else
 constexpr bool kAvx512Compiled = false;
@@ -141,6 +164,8 @@ bool detect_avx512() { return false; }
 float dot_row_avx512(const std::int8_t*, const std::uint16_t*, const std::int8_t*, const float*, int) {
     return 0.0F;
 }
+void dot_two_rows_avx512(const std::int8_t*, const std::uint16_t*, const std::int8_t*, const std::uint16_t*,
+                         const std::int8_t*, const float*, int, float&, float&) {}
 #endif
 
 const bool kUseAvx512 = kAvx512Compiled && detect_avx512();
@@ -148,6 +173,16 @@ const bool kUseAvx512 = kAvx512Compiled && detect_avx512();
 inline float dot_row(const std::int8_t* codes, const std::uint16_t* scales, const std::int8_t* xq,
                      const float* xs, int k) {
     return kUseAvx512 ? dot_row_avx512(codes, scales, xq, xs, k) : dot_row_scalar(codes, scales, xq, xs, k);
+}
+inline void dot_two_rows(const std::int8_t* codes0, const std::uint16_t* scales0, const std::int8_t* codes1,
+                         const std::uint16_t* scales1, const std::int8_t* xq, const float* xs, int k,
+                         float& out0, float& out1) {
+    if (kUseAvx512) {
+        dot_two_rows_avx512(codes0, scales0, codes1, scales1, xq, xs, k, out0, out1);
+    } else {
+        out0 = dot_row_scalar(codes0, scales0, xq, xs, k);
+        out1 = dot_row_scalar(codes1, scales1, xq, xs, k);
+    }
 }
 
 struct Scratch {
@@ -212,9 +247,10 @@ void cpu_expert_compute_job(const SparseMoeGeometry& geometry, const CpuExpertBa
     const auto* gate_scales = reinterpret_cast<const std::uint16_t*>(bank.gate_up_scales) +
                               static_cast<std::size_t>(job.expert) * gate_rows * gate_row_scales;
     for (int j = 0; j < intermediate; ++j) {
-        const float g = dot_row(gate_codes + j * gate_row_codes, gate_scales + j * gate_row_scales, s.xq, s.xs, hidden);
-        const float u = dot_row(gate_codes + (intermediate + j) * gate_row_codes,
-                                gate_scales + (intermediate + j) * gate_row_scales, s.xq, s.xs, hidden);
+        float g = 0.0F, u = 0.0F;
+        dot_two_rows(gate_codes + j * gate_row_codes, gate_scales + j * gate_row_scales,
+                     gate_codes + (intermediate + j) * gate_row_codes,
+                     gate_scales + (intermediate + j) * gate_row_scales, s.xq, s.xs, hidden, g, u);
         s.h[j] = silu(g) * u;
     }
     quantise_groups(s.h, intermediate, s.hq, s.hs);
@@ -225,7 +261,16 @@ void cpu_expert_compute_job(const SparseMoeGeometry& geometry, const CpuExpertBa
                            static_cast<std::size_t>(job.expert) * hidden * down_row_codes;
     const auto* down_scales = reinterpret_cast<const std::uint16_t*>(bank.down_scales) +
                               static_cast<std::size_t>(job.expert) * hidden * down_row_scales;
-    for (int r = 0; r < hidden; ++r) {
+    for (int r = 0; r + 1 < hidden; r += 2) {
+        float y0 = 0.0F, y1 = 0.0F;
+        dot_two_rows(down_codes + r * down_row_codes, down_scales + r * down_row_scales,
+                     down_codes + (r + 1) * down_row_codes, down_scales + (r + 1) * down_row_scales, s.hq, s.hs,
+                     intermediate, y0, y1);
+        out_column[r] += job.weight * y0;
+        out_column[r + 1] += job.weight * y1;
+    }
+    if (hidden % 2 != 0) {
+        const int r = hidden - 1;
         out_column[r] += job.weight * dot_row(down_codes + r * down_row_codes, down_scales + r * down_row_scales,
                                               s.hq, s.hs, intermediate);
     }

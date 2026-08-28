@@ -66,6 +66,7 @@ int main(int argc, char** argv) {
         best_gbs = std::max(best_gbs, gbs);
         total_s += s;
     }
+    std::cout << "per job: " << total_s / rounds / jobs_per_round * 1e6 * pool.threads() << " us thread-time\n";
     std::cout << "expert bytes: best " << best_gbs << " GB/s, mean "
               << static_cast<double>(per_expert) * jobs_per_round * rounds / total_s / 1e9
               << " GB/s over " << rounds << " rounds (" << total_s / rounds * 1e3 << " ms/round)\n";

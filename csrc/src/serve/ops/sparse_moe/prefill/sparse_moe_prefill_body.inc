@@ -1222,7 +1222,7 @@ void prefill_launch(const Tensor& x, const SparseMoeWeights& weights, Tensor& de
         if (hook != nullptr && hook->resolve != nullptr) {
             const Tensor slice_ids(ids, DType::I32, {assignments});
             const Tensor slice_alpha(alpha, DType::FP32, {assignments});
-            hook->resolve(hook->context, slice_ids, slice_alpha, stream);
+            hook->resolve(hook->context, slice_ids, slice_alpha, input_slice, output_slice, stream);
         }
 
         // A serving mixed round carries one prompt's chunk plus the decode batch - about 735
