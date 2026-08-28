@@ -307,6 +307,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
                 backing, source.attention.output, NumericFormat::W8G32_F16S,
                 static_cast<std::int32_t>(kHidden), TextConfig::query_size);
             target.post_mixer = load_moe(backing, host_bank, source.moe, std::move(mix_mlp));
+            target.post_mixer.layer = static_cast<std::int32_t>(layer);
         } else {
             GdnWeights& target = runtime.gdn_layers.at(gdn_index++);
             target.projection.a_log =
@@ -331,6 +332,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
                 backing, source.gdn.output, NumericFormat::W8G32_F16S,
                 static_cast<std::int32_t>(kHidden), static_cast<std::int32_t>(kValueDim));
             target.post_mixer = load_moe(backing, host_bank, source.moe, std::move(mix_mlp));
+            target.post_mixer.layer = static_cast<std::int32_t>(layer);
         }
         if (source.has_ple) {
             PleWeights& ple = runtime.ple;

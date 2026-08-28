@@ -81,13 +81,14 @@ void sparse_moe_decode_launch_d4_small_t(const SparseMoeGeometry& geometry,
 
 void sparse_moe_decode_launch(const SparseMoeGeometry& geometry, const Tensor& x,
                               const SparseMoeWeights& weights, Tensor& destination,
-                              const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream) {
+                              const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream,
+                              const SparseMoeRoundHook* hook) {
     if (geometry == kSparseMoeQwen36Geometry) {
-        geometry_qwen36::decode_launch(x, weights, destination, workspace, stream);
+        geometry_qwen36::decode_launch(x, weights, destination, workspace, stream, hook);
         return;
     }
     if (geometry == kSparseMoeFlashNextGeometry) {
-        geometry_flash_next::decode_launch(x, weights, destination, workspace, stream);
+        geometry_flash_next::decode_launch(x, weights, destination, workspace, stream, hook);
         return;
     }
     throw std::invalid_argument("sparse_moe: geometry has no compiled decode kernels");

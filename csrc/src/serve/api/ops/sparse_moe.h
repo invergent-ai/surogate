@@ -102,4 +102,22 @@ enum class SparseMoeEpilogue : std::uint8_t {
 void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilogue epilogue,
                 Tensor& destination, WorkspaceArena& workspace, cudaStream_t stream);
 
+/**
+ * Round hook: called once the routing of a round is final (decode after the top-k selection,
+ * small-T after its selection, prefill after select/count of every token slice) with the
+ * device I32 expert ids of that round on `stream`, before any expert kernel of the round is
+ * launched. An expert slot cache resolves and gathers here; the kernels then read the routed
+ * weights through `SparseMoeWeights::slot_of_expert`. The callback runs on the host at launch
+ * time (also during graph capture) and must only enqueue work on `stream`.
+ */
+struct SparseMoeRoundHook {
+    void (*resolve)(void* context, const Tensor& ids, cudaStream_t stream) = nullptr;
+    void* context                                                            = nullptr;
+};
+
+/// As above with a round hook; a hook with a null `resolve` is the plain call.
+void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilogue epilogue,
+                Tensor& destination, WorkspaceArena& workspace, cudaStream_t stream,
+                const SparseMoeRoundHook& hook);
+
 } // namespace ninfer::ops

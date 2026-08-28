@@ -1161,7 +1161,7 @@ __global__ void sparse_moe_prefill_reduce_kernel(const __nv_bfloat16* __restrict
 
 void prefill_launch(const Tensor& x, const SparseMoeWeights& weights, Tensor& destination,
                     const SparseMoePrefillPlan& plan, const SparseMoePrefillWorkspace& workspace,
-                    cudaStream_t stream) {
+                    cudaStream_t stream, const SparseMoeRoundHook* hook) {
     if (x.ne[1] != plan.tokens || destination.ne[1] != plan.tokens || plan.slice_tokens < 1) {
         throw std::invalid_argument("sparse_moe prefill: launch plan does not match tensors");
     }
@@ -1219,6 +1219,10 @@ void prefill_launch(const Tensor& x, const SparseMoeWeights& weights, Tensor& de
         sparse_moe_prefill_select_count_kernel<<<route_tiles, kRouterThreads, 0, stream>>>(
             scores, ids, alpha, shared_scale, packed_index, tile_counts, tokens);
         CUDA_CHECK(cudaGetLastError());
+        if (hook != nullptr && hook->resolve != nullptr) {
+            const Tensor slice_ids(ids, DType::I32, {assignments});
+            hook->resolve(hook->context, slice_ids, stream);
+        }
 
         // A serving mixed round carries one prompt's chunk plus the decode batch - about 735
         // columns at the board's shape - which lands just under the 768 the wide plan asks

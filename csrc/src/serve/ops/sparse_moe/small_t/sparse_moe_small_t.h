@@ -77,6 +77,7 @@ SparseMoeSmallTWorkspace allocate_sparse_moe_small_t_workspace(Arena& arena,
 void sparse_moe_small_t_launch(const SparseMoeGeometry& geometry, const Tensor& x,
                                const SparseMoeWeights& weights, Tensor& destination,
                                const SparseMoeSmallTPlan& plan,
-                               const SparseMoeSmallTWorkspace& workspace, cudaStream_t stream);
+                               const SparseMoeSmallTWorkspace& workspace, cudaStream_t stream,
+                               const SparseMoeRoundHook* hook = nullptr);
 
 } // namespace ninfer::ops::detail

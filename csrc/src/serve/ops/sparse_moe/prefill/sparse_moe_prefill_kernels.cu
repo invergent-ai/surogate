@@ -50,13 +50,14 @@ constexpr int kIntermediate           = kGeometry.intermediate;
 void sparse_moe_prefill_launch(const SparseMoeGeometry& geometry, const Tensor& x,
                                const SparseMoeWeights& weights, Tensor& destination,
                                const SparseMoePrefillPlan& plan,
-                               const SparseMoePrefillWorkspace& workspace, cudaStream_t stream) {
+                               const SparseMoePrefillWorkspace& workspace, cudaStream_t stream,
+                               const SparseMoeRoundHook* hook) {
     if (geometry == kSparseMoeQwen36Geometry) {
-        geometry_qwen36::prefill_launch(x, weights, destination, plan, workspace, stream);
+        geometry_qwen36::prefill_launch(x, weights, destination, plan, workspace, stream, hook);
         return;
     }
     if (geometry == kSparseMoeFlashNextGeometry) {
-        geometry_flash_next::prefill_launch(x, weights, destination, plan, workspace, stream);
+        geometry_flash_next::prefill_launch(x, weights, destination, plan, workspace, stream, hook);
         return;
     }
     throw std::invalid_argument("sparse_moe: geometry has no compiled prefill kernels");

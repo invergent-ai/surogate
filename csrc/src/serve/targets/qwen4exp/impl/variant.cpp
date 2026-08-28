@@ -3,6 +3,7 @@
 #include "api/ops/causal_conv1d_silu.h"
 #include "api/ops/embedding.h"
 #include "api/ops/gdn_gating.h"
+#include "api/ops/expert_slot_cache.h"
 #include "api/ops/hyper_connection.h"
 #include "api/ops/linear.h"
 #include "api/ops/ngram_ple.h"
@@ -46,6 +47,84 @@ struct InjectScratch {
     void* data        = nullptr;
     std::size_t bytes = 0;
 };
+
+// Expert slot cache (phase 2): one pool per device, enabled by SUROGATE_SERVE_EXPERT_SLOTS
+// (slot count; 0 or unset keeps the zero-copy path). The pool/directory/miss list are device
+// memory owned here; the per-layer host banks come from the layer's W8 host Weights.
+struct ExpertSlotCache {
+    struct Layer {
+        ExpertSlotCache* owner = nullptr;
+        std::int32_t index     = -1;
+        ops::ExpertHostBank bank;
+    };
+    bool enabled = false;
+    std::int32_t slots = 0;
+    void* pool_memory      = nullptr;
+    void* directory_memory = nullptr;
+    void* miss_memory      = nullptr;
+    ops::ExpertSlotPool pool;
+    ops::ExpertSlotDirectory directory;
+    ops::ExpertMissList misses;
+    std::vector<Layer> layers;
+
+    Layer& layer(const SparseMoePayload& weights) {
+        if (weights.layer < 0 || weights.layer >= static_cast<std::int32_t>(layers.size())) {
+            throw std::logic_error("qwen4exp: MoE payload has no layer index for the slot cache");
+        }
+        Layer& entry = layers[static_cast<std::size_t>(weights.layer)];
+        if (entry.owner == nullptr) {
+            entry.owner = this;
+            entry.index = weights.layer;
+            entry.bank  = ops::expert_host_bank(ops::kSparseMoeFlashNextGeometry,
+                                                weights.op.routed_gate_up, weights.op.routed_down);
+        }
+        return entry;
+    }
+
+    static void resolve_round(void* context, const Tensor& ids, cudaStream_t stream) {
+        auto* entry = static_cast<Layer*>(context);
+        ExpertSlotCache& cache = *entry->owner;
+        ops::expert_slot_resolve(ids, entry->index, cache.directory, cache.misses, stream);
+        ops::expert_slot_gather(entry->bank, cache.misses, cache.pool, stream);
+    }
+};
+
+ExpertSlotCache& expert_slot_cache_for_current_device() {
+    static std::mutex mutex;
+    static std::unordered_map<int, ExpertSlotCache> registry;
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    std::lock_guard<std::mutex> lock(mutex);
+    auto it = registry.find(device);
+    if (it != registry.end()) { return it->second; }
+    ExpertSlotCache& cache = registry[device];
+    const char* raw        = std::getenv("SUROGATE_SERVE_EXPERT_SLOTS");
+    const long requested   = raw != nullptr && *raw != '\0' ? std::strtol(raw, nullptr, 10) : 0;
+    if (requested <= 0) { return cache; }
+    const auto geometry = ops::kSparseMoeFlashNextGeometry;
+    // A round can touch every expert of a layer, and resolve must never leave a routed expert
+    // unmapped, so the pool holds at least one layer's worth of experts.
+    cache.slots         = std::max(static_cast<std::int32_t>(requested), geometry.experts);
+    const std::size_t pool_bytes = ops::expert_slot_pool_bytes(geometry, cache.slots);
+    const std::size_t dir_bytes =
+        ops::expert_slot_directory_bytes(TextConfig::layers, geometry.experts, cache.slots);
+    // A round can miss at most one whole layer's expert set.
+    const std::size_t miss_bytes = ops::expert_miss_list_bytes(geometry.experts);
+    CUDA_CHECK(cudaMalloc(&cache.pool_memory, pool_bytes));
+    CUDA_CHECK(cudaMalloc(&cache.directory_memory, dir_bytes));
+    CUDA_CHECK(cudaMalloc(&cache.miss_memory, miss_bytes));
+    cache.pool      = ops::create_expert_slot_pool(geometry, cache.slots, cache.pool_memory);
+    cache.directory = ops::create_expert_slot_directory(TextConfig::layers, geometry.experts,
+                                                        cache.slots, cache.directory_memory,
+                                                        nullptr);
+    cache.misses    = ops::create_expert_miss_list(geometry.experts, cache.miss_memory);
+    CUDA_CHECK(cudaStreamSynchronize(nullptr));
+    cache.layers.resize(static_cast<std::size_t>(TextConfig::layers));
+    cache.enabled = true;
+    std::fprintf(stderr, "qwen4exp: expert slot cache enabled: %d slots (%.1f GiB pool)\n",
+                 cache.slots, static_cast<double>(pool_bytes) / (1024.0 * 1024.0 * 1024.0));
+    return cache;
+}
 
 InjectScratch& inject_scratch_for_current_device() {
     static std::mutex mutex;
@@ -228,6 +307,7 @@ void Variant::prewarm_device_scratch() {
         CUDA_CHECK(cudaMalloc(&scratch.data, kInjectScratchBytes));
         scratch.bytes = kInjectScratchBytes;
     }
+    expert_slot_cache_for_current_device();
 }
 
 void Variant::final_residual_mix(const ModelView& model, const Tensor& residual, Tensor& hidden,
@@ -431,7 +511,21 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
         ops::kSparseMoeFlashNextGeometry, weights.op.routed_gate_up.qtype,
         weights.op.routed_down.qtype, tokens, tokens));
     WorkspaceArena leaf(storage);
-    ops::sparse_moe(hidden, weights.op, ops::SparseMoeEpilogue::AddResidual, output, leaf, stream);
+    ExpertSlotCache& cache = expert_slot_cache_for_current_device();
+    if (cache.enabled) {
+        // Routed experts come from the device slot pool: the round hook resolves the routing
+        // against the directory and gathers the misses from the host bank before the expert
+        // kernels run; the kernels read the pool through the layer's slot table.
+        ExpertSlotCache::Layer& layer = cache.layer(weights);
+        const ops::SparseMoeWeights pooled =
+            ops::expert_slot_weights(cache.pool, cache.directory, weights.layer, weights.op);
+        ops::SparseMoeRoundHook hook{&ExpertSlotCache::resolve_round, &layer};
+        ops::sparse_moe(hidden, pooled, ops::SparseMoeEpilogue::AddResidual, output, leaf, stream,
+                        hook);
+    } else {
+        ops::sparse_moe(hidden, weights.op, ops::SparseMoeEpilogue::AddResidual, output, leaf,
+                        stream);
+    }
     combine_into(output, residual, stream);
 }
 

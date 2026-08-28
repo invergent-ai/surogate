@@ -496,13 +496,19 @@ void launch_d3_dependent_codec(const Tensor& x, const SparseMoeWeights& weights,
 }
 
 void launch_d2_d3(const Tensor& x, const SparseMoeWeights& weights,
-                  const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream) {
+                  const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream,
+                  const SparseMoeRoundHook* hook) {
     const auto* scores = static_cast<const float*>(workspace.scratch.data);
     auto* ids          = static_cast<int*>(workspace.ids.data);
     auto* alpha        = static_cast<float*>(workspace.alpha.data);
     auto* shared_scale = static_cast<float*>(workspace.shared_scale.data);
     sparse_moe_d2_warp_kernel<<<1, 32, 0, stream>>>(scores, ids, alpha, shared_scale);
     CUDA_CHECK(cudaGetLastError());
+    // The round hook sees the final ids before the expert kernels; its launches sit between
+    // D2 and D3 on the stream, so D3's programmatic wait resolves against them.
+    if (hook != nullptr && hook->resolve != nullptr) {
+        hook->resolve(hook->context, workspace.ids, stream);
+    }
 
     switch (weights.routed_gate_up.qtype) {
     case QType::Q4G64_F16S:
@@ -731,9 +737,10 @@ void decode_launch_d4_small_t(const SparseMoeWeights& weights, Tensor& destinati
 }
 
 void decode_launch(const Tensor& x, const SparseMoeWeights& weights, Tensor& destination,
-                   const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream) {
+                   const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream,
+                   const SparseMoeRoundHook* hook) {
     launch_d1(x, weights.router_shared_gate, workspace, stream);
-    launch_d2_d3(x, weights, workspace, stream);
+    launch_d2_d3(x, weights, workspace, stream, hook);
     launch_d4_dependent(weights, destination, workspace, stream);
 }
 

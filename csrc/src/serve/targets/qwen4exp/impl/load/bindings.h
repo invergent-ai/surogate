@@ -122,6 +122,7 @@ struct GdnProjectionPayload {
 struct SparseMoePayload {
     ops::SparseMoeWeights op;
     ops::HyperConnectionWeights mix;
+    std::int32_t layer = -1; // text layer index (the expert slot cache keys its tables by it)
 };
 
 struct PleWeights {

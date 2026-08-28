@@ -36,13 +36,14 @@ constexpr int kTopK                   = kGeometry.experts_per_token;
 void sparse_moe_small_t_launch(const SparseMoeGeometry& geometry, const Tensor& x,
                                const SparseMoeWeights& weights, Tensor& destination,
                                const SparseMoeSmallTPlan& plan,
-                               const SparseMoeSmallTWorkspace& workspace, cudaStream_t stream) {
+                               const SparseMoeSmallTWorkspace& workspace, cudaStream_t stream,
+                               const SparseMoeRoundHook* hook) {
     if (geometry == kSparseMoeQwen36Geometry) {
-        geometry_qwen36::small_t_launch(x, weights, destination, plan, workspace, stream);
+        geometry_qwen36::small_t_launch(x, weights, destination, plan, workspace, stream, hook);
         return;
     }
     if (geometry == kSparseMoeFlashNextGeometry) {
-        geometry_flash_next::small_t_launch(x, weights, destination, plan, workspace, stream);
+        geometry_flash_next::small_t_launch(x, weights, destination, plan, workspace, stream, hook);
         return;
     }
     throw std::invalid_argument("sparse_moe: geometry has no compiled small-T kernels");

@@ -61,6 +61,7 @@ void sparse_moe_decode_launch_d4_small_t(const SparseMoeGeometry& geometry,
                                          const int* adaptive_route_jobs = nullptr);
 void sparse_moe_decode_launch(const SparseMoeGeometry& geometry, const Tensor& x,
                               const SparseMoeWeights& weights, Tensor& destination,
-                              const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream);
+                              const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream,
+                              const SparseMoeRoundHook* hook = nullptr);
 
 } // namespace ninfer::ops::detail

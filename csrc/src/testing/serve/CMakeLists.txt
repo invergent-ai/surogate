@@ -196,6 +196,7 @@ set(ninfer_op_tests
   sigmoid_mul
   rmsnorm
   gated_rmsnorm
+  expert_slot_cache
   l2norm
   gated_delta_net
   causal_conv1d_silu

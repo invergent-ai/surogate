@@ -367,3 +367,12 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   (pool sized from free device memory, per-layer host banks), then measure.
 - Board-shape probe (512-token prompts / 128 new, zero-copy v0): users=1 decode 5.2 tok/s,
   prefill 21 tok/s, TTFT 1.79 s (llama.cpp CPU-MoE: 7.1 / 29 / 2.0 s).
+- Round hook + target wiring written (2026-08-28, compiling object-only): `SparseMoeRoundHook`
+  (`sparse_moe(..., hook)`) is called with the round's final ids after decode d2 / small-T s2 /
+  prefill select_count of each token slice; `qwen4exp`'s `post_mixer` builds the pooled
+  weights for the layer (`expert_slot_weights`) and its hook resolves + gathers; the cache is
+  per device, created in `prewarm_device_scratch` when `SUROGATE_SERVE_EXPERT_SLOTS=<slots>`
+  is set (env knob for the first measurements; the memory-planner integration and a CLI
+  option follow). Each layer's `SparseMoePayload` now carries its layer index. First test:
+  `SUROGATE_SERVE_EXPERT_SLOTS=3000 --kv-capacity 4096` on GPU 1 (`probe_slots.sh`), answer
+  parity first, then users=1/16 throughput.

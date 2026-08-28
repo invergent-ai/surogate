@@ -226,6 +226,13 @@ std::size_t sparse_moe_workspace_capacity_bytes(const SparseMoeGeometry& geometr
 
 void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilogue epilogue,
                 Tensor& destination, WorkspaceArena& workspace, cudaStream_t stream) {
+    sparse_moe(x, weights, epilogue, destination, workspace, stream, SparseMoeRoundHook{});
+}
+
+void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilogue epilogue,
+                Tensor& destination, WorkspaceArena& workspace, cudaStream_t stream,
+                const SparseMoeRoundHook& hook) {
+    const SparseMoeRoundHook* round_hook = hook.resolve != nullptr ? &hook : nullptr;
     if (epilogue != SparseMoeEpilogue::AddResidual) {
         throw std::invalid_argument("sparse_moe: unsupported epilogue");
     }
@@ -271,7 +278,8 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
             detail::resolve_sparse_moe_prefill_plan(geometry, tokens, gate_up, down);
         const detail::SparseMoePrefillWorkspace views =
             detail::allocate_sparse_moe_prefill_workspace(workspace, geometry, plan.slice_tokens);
-        detail::sparse_moe_prefill_launch(geometry, x, weights, destination, plan, views, stream);
+        detail::sparse_moe_prefill_launch(geometry, x, weights, destination, plan, views, stream,
+                                          round_hook);
         return;
     }
     if (use_small_t) {
@@ -279,7 +287,8 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
             detail::resolve_sparse_moe_small_t_plan(geometry, tokens, gate_up, down);
         const detail::SparseMoeSmallTWorkspace views =
             detail::allocate_sparse_moe_small_t_workspace(workspace, geometry, tokens);
-        detail::sparse_moe_small_t_launch(geometry, x, weights, destination, plan, views, stream);
+        detail::sparse_moe_small_t_launch(geometry, x, weights, destination, plan, views, stream,
+                                          round_hook);
         return;
     }
     const detail::SparseMoeDecodeWorkspace views =
@@ -288,7 +297,7 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
         const Tensor x_column     = x.slice(1, token, 1);
         Tensor destination_column = destination.slice(1, token, 1);
         detail::sparse_moe_decode_launch(geometry, x_column, weights, destination_column, views,
-                                         stream);
+                                         stream, round_hook);
     }
 }
 
