@@ -522,6 +522,12 @@ Everything else measured and rejected, so the next reader does not re-run it:
     plane means one wide shared load per fragment and one decode for all eight
     warps, where the register form makes every warp redo the decode over
     byte-wide, bank-conflicted reads.
+  - **The MoE family crossover.** `sparse_moe` picks the decode family below 47
+    tokens and the prefill family above, and both halves of that are right:
+    the decode family costs 2,246 us at 99 columns against the prefill family's
+    584, and at the crossover itself they meet (473 us at T=46 decode, 489 at
+    T=64 prefill). A serving round at 100 users carries 98 decode columns, so
+    the board already runs the right one.
   - **bf16 KV** (1,774 against 1,798) and **chunk width** 2,048/4,096/8,192
     (1,765/1,798/1,778): flat.
 
