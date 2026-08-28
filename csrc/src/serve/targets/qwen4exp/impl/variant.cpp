@@ -14,6 +14,7 @@
 #include "ops/linear/bf16/bf16_cublaslt.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -66,7 +67,22 @@ struct ExpertSlotCache {
         ops::ExpertHostBank bank;
         ops::CpuExpertBank cpu_bank; // host addresses of the same planes
         std::int32_t round_tokens = 0; // set before the host function of a round is enqueued
+        // Round bookkeeping for the CPU split: a round may reach the hook in several slices
+        // (prefill and mixed rounds); the split decision is per round and each slice is staged
+        // at its column offset.
+        std::int32_t round_total  = 0;
+        std::int32_t round_offset = 0;
+        bool round_split          = false;
     };
+    // One host-function context per staged slice (a ring: slices of one round and the next
+    // are enqueued in stream order, so a small ring is never overrun).
+    struct SliceContext {
+        Layer* entry         = nullptr;
+        std::int32_t offset  = 0;
+        std::int32_t tokens  = 0;
+    };
+    std::array<SliceContext, 32> slice_ring{};
+    std::uint32_t slice_next = 0;
     bool enabled = false;
     std::int32_t slots = 0;
     void* pool_memory      = nullptr;
@@ -112,8 +128,10 @@ struct ExpertSlotCache {
     bool share_measured         = false;
     std::unique_ptr<ops::CpuExpertPool> cpu_pool;
     cudaStream_t cpu_stream = nullptr; // side stream: the host round overlaps the GPU experts
-    cudaEvent_t fork_event  = nullptr;
-    cudaEvent_t join_event  = nullptr;
+    cudaEvent_t fork_event   = nullptr;
+    cudaEvent_t join_event   = nullptr;
+    cudaEvent_t copied_event = nullptr; // the slice's staging copies are done (the job list may be reused)
+    std::int32_t stage_tokens = 0;      // columns the host staging holds
     void* cpu_jobs_memory = nullptr;
     ops::ExpertCpuJobList cpu_jobs;
     // Pinned host staging: activations, jobs, count, and the FP32 partial the GPU adds back.
@@ -130,45 +148,68 @@ struct ExpertSlotCache {
     std::vector<ops::CpuExpertJob> job_scratch;
 
     bool cpu_split_enabled() const { return cpu_pool != nullptr; }
-    // The share and the widest round for a round of `tokens` columns (0 share = no split).
+    // The share for a round of `tokens` columns in total (0 = no split): decode-sized rounds
+    // use the decode share, wider ones the prefill share, and nothing wider than the staging.
     std::uint32_t share_for(std::int32_t tokens) const {
+        if (tokens > stage_tokens) { return 0U; }
         if (tokens <= cpu_max_tokens) { return cpu_share_q16; }
         return tokens <= cpu_prefill_max_tokens ? cpu_prefill_share_q16 : 0U;
     }
+    // Called by post_mixer before the MoE op: fixes the round's split decision and share.
+    void begin_round(Layer& entry, std::int32_t tokens) {
+        entry.round_total  = tokens;
+        entry.round_offset = 0;
+        entry.round_split  = cpu_split_enabled() && share_for(tokens) > 0 && tokens >= cpu_min_tokens &&
+                             entry.cpu_bank.gate_up_codes != nullptr;
+    }
 
     static void run_cpu_round(void* context) {
-        auto* entry            = static_cast<Layer*>(context);
+        auto* slice            = static_cast<SliceContext*>(context);
+        Layer* entry           = slice->entry;
         ExpertSlotCache& cache = *entry->owner;
         const std::int32_t hidden = ops::kSparseMoeFlashNextGeometry.hidden;
-        const std::int32_t tokens = entry->round_tokens;
+        const std::int32_t tokens = slice->tokens;
+        const std::size_t column0 = static_cast<std::size_t>(slice->offset) * hidden;
         const long long count     = std::min<long long>(*cache.jobs_count_host, cache.cpu_jobs.capacity);
-        std::fill_n(cache.out_host, static_cast<std::size_t>(hidden) * tokens, 0.0F);
+        std::fill_n(cache.out_host + column0, static_cast<std::size_t>(hidden) * tokens, 0.0F);
         if (count <= 0) { return; }
         cache.job_scratch.resize(static_cast<std::size_t>(count));
         for (long long i = 0; i < count; ++i) {
             cache.job_scratch[static_cast<std::size_t>(i)] = {cache.jobs_tokens_host[i], cache.jobs_experts_host[i],
                                                               cache.jobs_weights_host[i]};
         }
-        ops::CpuExpertRound round{cache.x_host, cache.out_host, tokens, cache.job_scratch};
+        ops::CpuExpertRound round{cache.x_host + column0, cache.out_host + column0, tokens, cache.job_scratch};
         cache.cpu_pool->run(entry->cpu_bank, round);
     }
 
+    // Stages one slice of the round (columns [round_offset, round_offset + tokens) of the
+    // block) and forks its host round onto the side stream; the block's combine joins the
+    // last slice's event and adds the round-wide partial (v2 overlap).
     void cpu_round(Layer& entry, const Tensor& x, Tensor& /*destination*/, cudaStream_t stream) {
         const std::int32_t hidden = ops::kSparseMoeFlashNextGeometry.hidden;
         const std::int32_t tokens = static_cast<std::int32_t>(x.numel() / hidden);
-        entry.round_tokens        = tokens;
-        // Fork the host round onto the side stream: it overlaps the GPU expert kernels of this
-        // block, and the block's combine joins it and adds the partial (v2 overlap).
+        const std::int32_t offset = entry.round_offset;
+        if (offset + tokens > stage_tokens) {
+            throw std::logic_error("qwen4exp: CPU split round wider than its staging");
+        }
+        entry.round_tokens = tokens;
+        SliceContext& slice = slice_ring[slice_next++ % slice_ring.size()];
+        slice               = SliceContext{&entry, offset, tokens};
+        const std::size_t column0 = static_cast<std::size_t>(offset) * hidden;
         CUDA_CHECK(cudaEventRecord(fork_event, stream));
         CUDA_CHECK(cudaStreamWaitEvent(cpu_stream, fork_event, 0));
-        CUDA_CHECK(cudaMemcpyAsync(x_host, x.data,
+        CUDA_CHECK(cudaMemcpyAsync(x_host + column0, x.data,
                                    static_cast<std::size_t>(hidden) * tokens * sizeof(std::uint16_t),
                                    cudaMemcpyDeviceToHost, cpu_stream));
-        // The job list is one contiguous device block mirrored by one pinned block.
+        // The job list is one contiguous device block mirrored by one pinned block. The main
+        // stream waits for the copy before the next slice's resolve may rewrite the list.
         CUDA_CHECK(cudaMemcpyAsync(jobs_host_block, cpu_jobs_memory, jobs_block_bytes,
                                    cudaMemcpyDeviceToHost, cpu_stream));
-        CUDA_CHECK(cudaLaunchHostFunc(cpu_stream, &ExpertSlotCache::run_cpu_round, &entry));
+        CUDA_CHECK(cudaEventRecord(copied_event, cpu_stream));
+        CUDA_CHECK(cudaStreamWaitEvent(stream, copied_event, 0));
+        CUDA_CHECK(cudaLaunchHostFunc(cpu_stream, &ExpertSlotCache::run_cpu_round, &slice));
         CUDA_CHECK(cudaEventRecord(join_event, cpu_stream));
+        entry.round_offset = offset + tokens;
         t_partial = PendingPartial{static_cast<const float*>(out_device_alias), join_event};
     }
 
@@ -178,10 +219,9 @@ struct ExpertSlotCache {
         ExpertSlotCache& cache = *entry->owner;
         const std::int32_t tokens =
             static_cast<std::int32_t>(x.numel() / ops::kSparseMoeFlashNextGeometry.hidden);
-        const std::uint32_t share = cache.cpu_split_enabled() ? cache.share_for(tokens) : 0U;
-        const bool split = share > 0 && tokens >= cache.cpu_min_tokens &&
-                           entry->cpu_bank.gate_up_codes != nullptr && x.data != nullptr &&
-                           destination.data != nullptr;
+        // The split decision is per round (begin_round); every slice of the round follows it.
+        const bool split          = entry->round_split && x.data != nullptr && destination.data != nullptr;
+        const std::uint32_t share = split ? cache.share_for(entry->round_total) : 0U;
         if (split) {
             ops::expert_slot_resolve(ids, alpha, entry->index, cache.directory, cache.misses,
                                      &cache.cpu_jobs, share, stream);
@@ -326,9 +366,16 @@ ExpertSlotCache& expert_slot_cache_for_current_device() {
                 cache.cpu_prefill_share_q16 = static_cast<std::uint32_t>(std::min(1.0, prefill_fraction) * 65536.0);
                 cache.cpu_prefill_max_tokens = static_cast<std::int32_t>(prefill_chunk);
             }
-            const std::int32_t hidden      = geometry.hidden;
-            const std::int32_t stage_tokens = std::max(cache.cpu_max_tokens, cache.cpu_prefill_max_tokens);
-            const std::int32_t capacity    = stage_tokens * geometry.experts_per_token;
+            const std::int32_t hidden = geometry.hidden;
+            // Staging covers the widest round: a prefill chunk plus the decode lanes of a mixed
+            // round (or just the decode lanes without a prefill share).
+            const std::int32_t stage_tokens = cache.cpu_prefill_max_tokens > 0
+                                                  ? cache.cpu_prefill_max_tokens + 256
+                                                  : cache.cpu_max_tokens;
+            cache.stage_tokens              = stage_tokens;
+            // Jobs per slice: a slice is at most a prefill chunk (or the decode lanes) wide.
+            const std::int32_t capacity = std::max(cache.cpu_max_tokens, cache.cpu_prefill_max_tokens) *
+                                          geometry.experts_per_token;
             CUDA_CHECK(cudaMalloc(&cache.cpu_jobs_memory, ops::expert_cpu_job_list_bytes(capacity)));
             cache.cpu_jobs = ops::create_expert_cpu_job_list(capacity, cache.cpu_jobs_memory);
             CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&cache.x_host),
@@ -359,6 +406,7 @@ ExpertSlotCache& expert_slot_cache_for_current_device() {
             CUDA_CHECK(cudaStreamCreateWithFlags(&cache.cpu_stream, cudaStreamNonBlocking));
             CUDA_CHECK(cudaEventCreateWithFlags(&cache.fork_event, cudaEventDisableTiming));
             CUDA_CHECK(cudaEventCreateWithFlags(&cache.join_event, cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&cache.copied_event, cudaEventDisableTiming));
             cache.auto_share = auto_share;
             std::fprintf(stderr, "qwen4exp: CPU expert split enabled: %.0f%% of decode misses, %.0f%% of prefill misses (rounds up to %d columns) on %u host threads%s\n",
                          100.0 * fraction, 100.0 * prefill_fraction, cache.cpu_prefill_max_tokens,
@@ -869,6 +917,7 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
         ExpertSlotCache::Layer& layer = cache.layer(weights);
         const ops::SparseMoeWeights pooled =
             ops::expert_slot_weights(cache.pool, cache.directory, weights.layer, weights.op);
+        cache.begin_round(layer, tokens);
         ops::SparseMoeRoundHook hook{&ExpertSlotCache::resolve_round, &layer};
         ops::sparse_moe(hidden, pooled, ops::SparseMoeEpilogue::AddResidual, output, leaf, stream,
                         hook);

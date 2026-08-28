@@ -759,3 +759,33 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   **TTFT 1.865 s (from 2.95 s) → 275 t/s prompt processing (from 174), 1.58×**; loadgen
   decode 22.4 (18.4) because the prompt phase takes less of the wall. Share 0.7, 16 users, 32
   users at 2,000 slots and the 4k-prompt pair follow in the same chain.
+- Prefill split, share 0.7 at one user (2026-08-28): **TTFT 1.43 s → 358 t/s prompt processing
+  (2.06× over the full gather's 174)**, answers correct; level with the 4090/Q4_K_XL llama.cpp
+  reference at this prompt length, as the arithmetic predicted (~340).
+- 16 users with the prefill split collapsed (2 ok / 2,576 errors): a garbage token in a
+  *mixed* round (`kind=mixed batch=2 prefill_lane=3 lanes=16`) killed the worker loop. Root
+  cause: the host-round staging was per hook call, but prefill and mixed rounds reach the hook
+  in several slices — the second slice's host round zeroed the first's partial in the shared
+  `out_host` and its job-list copy could race the next resolve. Fix (this commit): the split
+  decision is per round (`begin_round` in post_mixer), each slice is staged at its column
+  offset in a round-wide `x_host`/`out_host` (sized prefill chunk + 256 lanes), one host
+  function per slice (ring of contexts), the main stream waits for the slice's copies before
+  the next resolve, and the combine joins the last slice.
+- 32 users at 2,000 slots, no prefill split: 30.9 tok/s (16 users: 33.5; 64 users: 86.5). On
+  the 512/128 shape the 16-32-user numbers are prefill-dominated: 21-34 prompts × ~1.5-3 s of
+  prefill fill most of the 90 s, and decode lanes only ride along in mixed rounds. 64 users
+  gain because more lanes ride each prefill and because rounds of 47+ columns use the
+  prefill (GEMM-shaped) kernels instead of small-T. So the prefill split is the lever for the
+  board numbers at every concurrency, not just TTFT.
+- 4k-token prompts are refused: `max_context exceeds the variant native context capacity` —
+  `dense_exact_context = 2051` (indexer_top_k + indexer_block − 1); beyond it the attention
+  layers need Flash-Next's sparse indexer, which the engine does not implement yet. The
+  long-prompt comparison with the external references (their 4-28k prompts) waits on that;
+  it is the next model-contract item after the prefill path.
+- Host kernel profile (`perf`, 5,120-job shape): ~80 % of round time inside
+  `dot_two_rows_two_tokens_vnni` at ~7.8 MAC/cycle/core, 8× under `vpdpbusd` peak — the
+  per-group fp16 scale costs a cvt + fmadd + scale permute per 64 MACs per (row, token). The
+  way past it is ik_llama.cpp's interleaved-rows layout (16 rows per zmm lane so one
+  `dpbusd` advances 16 rows and the scale applies per 16 rows per group), which needs an
+  on-the-fly repack of each expert chunk into a thread-local tile (repack ≈ one GEMV pass,
+  then ~3× per token; pays off from ~4 tokens per expert). Queued after the mixed-round fix.
