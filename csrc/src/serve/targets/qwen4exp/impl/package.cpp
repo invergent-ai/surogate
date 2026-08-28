@@ -113,6 +113,7 @@ Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineO
 Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
                                                         const EngineOptions& options,
                                                         WeightsProfile weights_profile) {
+    detail::Variant::configure_expert_slots(options.expert_slots);
     return qwen3_6::make_sequence_planner<detail::Variant>(device, options, weights_profile);
 }
 

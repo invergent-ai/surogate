@@ -67,6 +67,10 @@ struct Variant {
                                 Tensor& hidden, WorkspaceArena& workspace, cudaStream_t stream);
     /// Creates the device scratch the mix/combine pair shares; call before any graph capture.
     static void prewarm_device_scratch();
+    /// Number of expert slots the cache on the current device should hold (0 disables); read
+    /// when the cache is created in prewarm_device_scratch. SUROGATE_SERVE_EXPERT_SLOTS is the
+    /// fallback when nothing was configured.
+    static void configure_expert_slots(std::uint32_t slots);
     static constexpr bool has_layer_prologue = true;
     // 48 layers, a four-stream residual and the PLE nodes: the decode graphs measured
     // 15.7 MiB per lane (503 MB at 32 lanes) against the family's 12 MiB.

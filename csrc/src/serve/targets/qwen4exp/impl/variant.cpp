@@ -89,17 +89,31 @@ struct ExpertSlotCache {
     }
 };
 
-ExpertSlotCache& expert_slot_cache_for_current_device() {
+std::mutex& expert_slot_mutex() {
     static std::mutex mutex;
+    return mutex;
+}
+std::unordered_map<int, std::uint32_t>& configured_expert_slots() {
+    static std::unordered_map<int, std::uint32_t> configured;
+    return configured;
+}
+
+ExpertSlotCache& expert_slot_cache_for_current_device() {
     static std::unordered_map<int, ExpertSlotCache> registry;
     int device = 0;
     CUDA_CHECK(cudaGetDevice(&device));
-    std::lock_guard<std::mutex> lock(mutex);
+    std::lock_guard<std::mutex> lock(expert_slot_mutex());
     auto it = registry.find(device);
     if (it != registry.end()) { return it->second; }
     ExpertSlotCache& cache = registry[device];
-    const char* raw        = std::getenv("SUROGATE_SERVE_EXPERT_SLOTS");
-    const long requested   = raw != nullptr && *raw != '\0' ? std::strtol(raw, nullptr, 10) : 0;
+    long requested         = 0;
+    if (auto configured = configured_expert_slots().find(device);
+        configured != configured_expert_slots().end()) {
+        requested = static_cast<long>(configured->second);
+    } else if (const char* raw = std::getenv("SUROGATE_SERVE_EXPERT_SLOTS");
+               raw != nullptr && *raw != '\0') {
+        requested = std::strtol(raw, nullptr, 10);
+    }
     if (requested <= 0) { return cache; }
     const auto geometry = ops::kSparseMoeFlashNextGeometry;
     // A round can touch every expert of a layer, and resolve must never leave a routed expert
@@ -299,6 +313,13 @@ void Variant::embed_residual(const ModelView& model, const Tensor& ids, Tensor& 
     Tensor embedded           = workspace.alloc(DType::BF16, {kHidden, tokens});
     ops::embedding(ids, model.token_embedding, embedded, stream);
     ops::broadcast_streams(embedded, kStreams, residual, stream);
+}
+
+void Variant::configure_expert_slots(std::uint32_t slots) {
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    std::lock_guard<std::mutex> lock(expert_slot_mutex());
+    configured_expert_slots()[device] = slots;
 }
 
 void Variant::prewarm_device_scratch() {

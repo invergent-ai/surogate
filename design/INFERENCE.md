@@ -378,3 +378,14 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   option follow). Each layer's `SparseMoePayload` now carries its layer index. First test:
   `SUROGATE_SERVE_EXPERT_SLOTS=3000 --kv-capacity 4096` on GPU 1 (`probe_slots.sh`), answer
   parity first, then users=1/16 throughput.
+- Invariant checked for the pool (2026-08-28): every kernel that reads routed weights through
+  `slot_of_expert` does so only for experts that appear in the round's ids (decode/small-T:
+  the ids themselves; prefill q4/qx: route jobs exist only for routed experts; prefill W8:
+  the grid covers all experts but returns before any weight access when the expert has no
+  assignments in the slice), and the hook receives exactly the ids the offsets were built
+  from, so an unmapped table entry (-1) is never dereferenced.
+- `--expert-slots N` (server and CLI, `EngineOptions::expert_slots`) replaces the env knob:
+  `qwen4exp`'s `make_sequence_planner` records it and `prewarm_device_scratch` allocates the
+  pool; `SUROGATE_SERVE_EXPERT_SLOTS` stays as the fallback. Caveat until the planner
+  integration: the pool is allocated after the KV plan, so with `--kv-capacity auto` the two
+  can overcommit — use an explicit `--kv-capacity` with the pool for now.

@@ -81,6 +81,10 @@ struct EngineOptions {
     int device                         = 0;
     std::uint32_t max_context          = 2048; // Exact logical ceiling of each request.
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
+    // Expert slot cache for targets that stream MoE experts from the host: number of device
+    // expert slots (0 = experts are read from the host bank in place). Targets without a
+    // host bank ignore it.
+    std::uint32_t expert_slots         = 0;
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;

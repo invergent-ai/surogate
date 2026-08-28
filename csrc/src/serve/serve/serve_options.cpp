@@ -103,7 +103,7 @@ KvCapacityPolicy parse_kv_capacity(const char* text) {
 std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
-           "[--served-model-name ID] [--max-model-len N] [--kv-capacity N|auto] "
+           "[--served-model-name ID] [--max-model-len N] [--kv-capacity N|auto] [--expert-slots N] "
            "[--max-num-seqs N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--max-num-batched-tokens N] [--log-stats-interval-ms N] [--device N] "
@@ -195,6 +195,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--kv-capacity") {
             options.kv_capacity  = parse_kv_capacity(require_value("--kv-capacity"));
             kv_capacity_explicit = true;
+        } else if (arg == "--expert-slots") {
+            options.expert_slots =
+                static_cast<std::uint32_t>(parse_nonnegative_int(require_value("--expert-slots"), "expert-slots"));
         } else if (arg == "--max-num-seqs") {
             // vLLM's name for the same quantity: sequences run per iteration,
             // which here is the lane count. The engine speaks vLLM's option

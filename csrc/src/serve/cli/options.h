@@ -20,6 +20,7 @@ struct Options {
     std::uint32_t max_new        = 128;
     std::uint32_t max_context    = 2048;
     KvCapacityPolicy kv_capacity = KvCapacityPolicy::explicit_capacity(2048);
+    std::uint32_t expert_slots = 0; // --expert-slots N
     // surogate vendor patch (PATCHES.md #13): 2048 measured +16% prefill at
 // ~1.9k-token prompts on RTX 5090 (K=1024 GEMM tiles amortize better);
 // activation workspace stays small at qwen3.5-0.8b widths.
