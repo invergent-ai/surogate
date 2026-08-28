@@ -68,6 +68,8 @@ struct Variant {
     /// Creates the device scratch the mix/combine pair shares; call before any graph capture.
     static void prewarm_device_scratch();
     static constexpr bool has_layer_prologue = true;
+    // Parity probe: dumps family-loop intermediates under SUROGATE_SERVE_DUMP_RESIDUAL.
+    static void debug_probe(const char* tag, const Tensor& tensor, cudaStream_t stream);
     [[nodiscard]] static NgramPleStatePoolSpec ple_state_spec(std::int32_t slot_count);
     static void layer_prologue(const ModelView& model, int layer, Tensor& residual,
                                const qwen3_6::detail::PrologueColumns& columns,

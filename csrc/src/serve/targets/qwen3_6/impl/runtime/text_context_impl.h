@@ -1098,12 +1098,14 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         Tensor qkv_c = conv.convolved;
         Tensor conv_state =
             state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_current_slot_);
+        debug_probe<Variant>("gdn_conv_state_in", conv_state, s);
         if (graph_pad_valid_ != nullptr) {
             ops::causal_conv1d_silu(qkv, *w.conv1d, conv_state, conv_state, qkv_c,
                                     *graph_pad_valid_, s);
         } else {
             ops::causal_conv1d_silu(qkv, *w.conv1d, conv_state, conv_state, qkv_c, s);
         }
+        debug_probe<Variant>("gdn_conv", qkv_c, s);
         if (sub_timing) { sub_lap(ftimer.g_conv, sub_conv); }
         ops::extract_bf16_columns(qkv_c, 0, qc, s);
         ops::extract_bf16_columns(qkv_c, kCfg.key_dim, kc, s);
@@ -1145,8 +1147,10 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     } else {
         Tensor recurrent_state =
             state_.recurrent_slot(static_cast<std::uint32_t>(gidx), linear_state_current_slot_);
+        debug_probe<Variant>("gdn_recurrent_state_in", recurrent_state, s);
         ops::gated_delta_net(q_recurrent, k_recurrent, vv, g, beta, kGdnScale,
                              /*normalize_qk=*/true, work_, recurrent_state, o, s);
+        debug_probe<Variant>("gdn_o", o, s);
     }
 
     Tensor on = workspace_recipe::gdn_normalized_output<TextConfig>(work_, T).view(

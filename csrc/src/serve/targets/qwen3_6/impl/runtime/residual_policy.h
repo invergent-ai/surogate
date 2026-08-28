@@ -40,6 +40,15 @@ template <class Variant>
     }
 }
 
+/// Debug probe for parity work: a variant may observe intermediate tensors of the family's
+/// layer loop by tag (the default is a no-op that compiles away).
+template <class Variant>
+inline void debug_probe(const char* tag, const Tensor& tensor, cudaStream_t stream) {
+    if constexpr (requires { Variant::debug_probe(tag, tensor, stream); }) {
+        Variant::debug_probe(tag, tensor, stream);
+    }
+}
+
 /// Activation of the GDN output gate (`z`): SiLU unless the variant declares otherwise
 /// (Qwen3.8-Flash-Next gates with the logistic sigmoid).
 template <class Variant>

@@ -32,9 +32,10 @@ phase 3 = PP across 8 GPUs; phase 4 = EP measured against PP.
 | PLE op (`api/ops/ngram_ple.h`, `ops/ngram_ple/`) | built (commit 81257e66) | device-side hash, IQ4_NL row gather from pinned host, group norms, gate, dilated conv with per-slot state |
 | qwen3_6 family: residual-width trait, embed/finish/norm hooks (F1), layer-prologue hook with per-column segment facts (F2) | done (commits 5b1b6efd, b4e13eb6), 35B unchanged | `runtime/residual_policy.h`, `runtime/prologue_columns.h`; staging in every forward entry |
 | PLE state pool `core/ngram_ple_state.*` (per-slot conv history [9,10240] + token history [2]) | wired (F3, in 9a374d71) | `DecoderState::{copy,reset}_state_slot` forward to both pools at the slot-lifecycle sites; `ExecutionCore::ple` reaches every TextContext |
-| Target `targets/qwen4exp/` (package, bindings, host bank, variant, registry) | built and committed (9a374d71); first serve in flight | model_id `qwen3.8-flash-next`, weights_id `w8-hc-v1`, target key `qwen4exp`; experts and the PLE table live in pinned, device-mapped host memory and the kernels read them zero-copy (v0) |
+| Target `targets/qwen4exp/` (package, bindings, host bank, variant, registry) | serves with parity (2026-08-28) | model_id `qwen3.8-flash-next`, weights_id `w8-hc-v1`, target key `qwen4exp`; experts and the PLE table live in pinned, device-mapped host memory and the kernels read them zero-copy (v0) |
 | Expert access v0: zero-copy reads from the pinned host bank (`impl/load/host_bank.*`) | written with the target | no staging copies at all in v0; the device slot cache and CPU expert compute come in phase 2 |
-| Parity vs llama.cpp, first throughput row | not started | |
+| Parity vs llama.cpp | done 2026-08-28 | token-0 stages within BF16 noise of the CPU reference, `l_last-0/1/2` match, answers `Paris` / 2,3,5 / ocean; defects were the SiLU gate (4aaa07fc) and the RMSNorm kernels' gate load (see log) |
+| First throughput row (zero-copy experts v0) | measuring | users=1: 4.9 tok/s decode, prefill 10 tok/s, TTFT 1.3 s (128-token prompts); 32-user run in flight; llama.cpp 1×5090 CPU-MoE is 7.1 @1 / 16.3 @32 |
 
 ## Decisions that shape the code
 
@@ -234,3 +235,40 @@ phase 3 = PP across 8 GPUs; phase 4 = EP measured against PP.
   Still open: something between the conv and the gated norm (or the norm itself); next is a
   full-vector, per-head comparison of `gdn_final` and `gdn_fused` (`compare_stage.py`) rather
   than first/last-3 spot checks.
+- Full-vector comparison (2026-08-28): with the CPU reference corrected (its "fused" vector had
+  used the conv output for the V rows), the engine's fused qkv|z projection matches over all
+  16,384 rows (rel-L2 0.002; the artifact's V rows decode bit-exact against the un-tiled
+  GGUF — the verifier only samples the first/last 512 rows, `check_rows.py` covers the
+  middle). The gated-norm output mismatch has per-*head* structure (cos 0.4–0.9 per head,
+  per-dim ratios inconsistent across heads), so the delta-net output `o` itself is off; for
+  token 0 that can only come from a non-zero initial state (conv or recurrent slot) or the
+  conv/delta ops seeing a different input than the dumped one. A generic family probe
+  (`debug_probe<Variant>()`, no-op unless the Variant defines it) now dumps the conv state
+  and recurrent state *before* layer 0's ops plus the conv output and `o`. 35B sanity on
+  GPU 2 with the refactored family: "Paris" / 2,3,5 / ocean sentence — correct (its
+  throughput was measured while GPU 1 ran the Flash-Next CLI, so it is not a board number).
+- **Root cause of the remaining layer-0 mismatch (2026-08-28): the RMSNorm kernels load `z`
+  only for the SiLU epilogue.** The probes showed the conv output and the delta-net output
+  `o` matching the reference per head (cos 1.000, conv state all zero), leaving the gated
+  norm. Reading `ops/kernel/rmsnorm.cuh`: every kernel variant guards the gate load with
+  `if constexpr (Epilogue == RmsEpilogue::Gated)`, so the new `GatedSigmoid` epilogue saw
+  `z = 0` and multiplied by `sigmoid(0) = 0.5`. Check: `0.5 / σ(z)` for head 0 dims 0–2 is
+  `[0.555, 0.72, 0.93]`, exactly the observed engine/reference ratios `[0.552, 0.718, 0.925]`.
+  Fix: `kRmsEpilogueReadsGate<Epilogue>` (Gated or GatedSigmoid) gates the load in all six
+  sites; `test_gated_rmsnorm` now covers the sigmoid gate (incl. the eps-dominated tiny-input
+  regime, the unaligned path and the d=1024/4096 kernel paths).
+- **Parity reached (2026-08-28, commit below).** With the kernel fix every probed stage of layer
+  0 and the entry of layer 1 sits within BF16 noise of the CPU reference for token 0
+  (rel-L2: fused projection 0.002, gated norm 0.005, GDN out 0.004, MLP-side mix 0.006, MoE+shared
+  out 0.003, layer-1 input 0.003, PLE out 0.003, layer-1 mix 0.005); the residual after layers
+  0/1/2 matches llama.cpp's `l_last-0/1/2` (token 0 stream 0: `[-0.0062, 0.0044, -0.0023]`,
+  `[-0.0027, -0.0105, -0.0028]`, `[-0.0074, -0.0127, -0.0019]`). Greedy CLI:
+  "The capital of France is **Paris**."; served answers: `Paris`; "The first three prime
+  numbers are **2**, **3**, and **5**." (llama.cpp: "Three prime numbers are **2**, **3**, and
+  **5**."); "The vast ocean stretches endlessly …" (same opening as llama.cpp, then diverges).
+  Remaining differences are quantisation-level (W8-requantised experts vs Q4_K, BF16 GEMMs),
+  not semantic. Verification pattern worth keeping: token 0 of a fresh sequence is a
+  state-free unit test of every block; per-head full-vector comparison beats first/last-3
+  spot checks (the "V rows wrong" scare was the reference's own slip, the real defect was
+  invisible to spot checks); when a stage matches on `o` but not on the norm output, read the
+  kernel — the bug was a `constexpr` guard, not numerics.

@@ -18,6 +18,11 @@ enum class RmsEpilogue {
     GatedSigmoid,
 };
 
+/// Epilogues that multiply by an activation of the gate operand `z`.
+template <RmsEpilogue Epilogue>
+inline constexpr bool kRmsEpilogueReadsGate =
+    Epilogue == RmsEpilogue::Gated || Epilogue == RmsEpilogue::GatedSigmoid;
+
 template <RmsEpilogue Epilogue>
 __device__ __forceinline__ float rmsnorm_epilogue(float x, float inv, float weight, float z) {
     if constexpr (Epilogue == RmsEpilogue::Offset) { weight += 1.0f; }
@@ -69,7 +74,7 @@ __launch_bounds__(Block) __global__
             const float2 xf = __bfloat1622float2(values[k]);
             const float2 wf = __bfloat1622float2(weight[pair]);
             float2 zf{0.0f, 0.0f};
-            if constexpr (Epilogue == RmsEpilogue::Gated) {
+            if constexpr (kRmsEpilogueReadsGate<Epilogue>) {
                 zf = __bfloat1622float2(z[row_base + pair]);
             }
             out[row_base + pair] =
@@ -111,7 +116,7 @@ __launch_bounds__(Block) __global__
     const float2 w1 = __bfloat1622float2(weight[pair1]);
     float2 z0{0.0f, 0.0f};
     float2 z1{0.0f, 0.0f};
-    if constexpr (Epilogue == RmsEpilogue::Gated) {
+    if constexpr (kRmsEpilogueReadsGate<Epilogue>) {
         z0 = __bfloat1622float2(z[row_base + pair0]);
         z1 = __bfloat1622float2(z[row_base + pair1]);
     }
@@ -164,7 +169,7 @@ __launch_bounds__(Block) __global__
             const float2 xf = __bfloat1622float2(values[k]);
             const float2 wf = __bfloat1622float2(weight[pair]);
             float2 zf{0.0f, 0.0f};
-            if constexpr (Epilogue == RmsEpilogue::Gated) {
+            if constexpr (kRmsEpilogueReadsGate<Epilogue>) {
                 zf = __bfloat1622float2(z[row_base + pair]);
             }
             out[row_base + pair] =
@@ -207,7 +212,7 @@ __launch_bounds__(512) __global__
     const float2 w1 = __bfloat1622float2(weight[pair1]);
     float2 z0{0.0f, 0.0f};
     float2 z1{0.0f, 0.0f};
-    if constexpr (Epilogue == RmsEpilogue::Gated) {
+    if constexpr (kRmsEpilogueReadsGate<Epilogue>) {
         z0 = __bfloat1622float2(z[row_base + pair0]);
         z1 = __bfloat1622float2(z[row_base + pair1]);
     }
@@ -250,7 +255,7 @@ __launch_bounds__(256) __global__
         const float xv           = __bfloat162float(x[index]);
         const float wv           = __bfloat162float(weight[i]);
         float zv                 = 0.0f;
-        if constexpr (Epilogue == RmsEpilogue::Gated) { zv = __bfloat162float(z[index]); }
+        if constexpr (kRmsEpilogueReadsGate<Epilogue>) { zv = __bfloat162float(z[index]); }
         out[index] = __float2bfloat16_rn(rmsnorm_epilogue<Epilogue>(xv, inv, wv, zv));
     }
 }

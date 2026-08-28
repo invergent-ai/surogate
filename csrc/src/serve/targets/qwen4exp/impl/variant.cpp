@@ -266,6 +266,21 @@ void Variant::layer_prologue(const ModelView& model, int layer, Tensor& residual
     maybe_dump_block("ple_out", residual, stream);
 }
 
+void Variant::debug_probe(const char* tag, const Tensor& tensor, cudaStream_t stream) {
+    ResidualDump& dump = residual_dump();
+    if (dump.dir.empty() || dump.forward > dump.limit || g_dump_layer < 0 || g_dump_layer > 1) {
+        return;
+    }
+    // Flatten to [ne0, rest] so the dump header describes the payload.
+    const std::int64_t rest = tensor.numel() / tensor.ne[0];
+    if (rest > 8192) { return; }
+    Tensor flat = tensor.view({tensor.ne[0], static_cast<std::int32_t>(rest)});
+    dump_tensor(flat,
+                "f" + std::to_string(dump.forward) + "_L" + std::to_string(g_dump_layer) +
+                    (g_dump_block == 0 ? "_mixer_" : "_mlp_") + tag,
+                dump.forward, stream);
+}
+
 NgramPleStatePoolSpec Variant::ple_state_spec(std::int32_t slot_count) {
     return NgramPleStatePoolSpec{
         .history_tokens = TextConfig::ple_ngram - 1,
