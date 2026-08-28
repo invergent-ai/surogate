@@ -295,6 +295,11 @@ and the baseline run is queued.
   events per layer) grow the captured decode graphs to 21.4 MiB per lane, over the 20 MiB
   Flash-Next allowance (16 lanes → 341.8 MB vs 335.5 MB). Allowance raised to 24 MiB;
   rebuild + the five probes rerunning.
+- Policy + trimming for the split (committed, not yet in the probe binary): the split applies
+  only to rounds of ≥ `SUROGATE_SERVE_CPU_MOE_MIN_TOKENS` columns (default 4) — at one user a
+  round misses ~3–4 experts and the host round-trip (~0.1 ms × 48 layers) costs more than
+  the ~2 experts it saves — and the job list is staged with one D2H copy (contiguous device
+  block mirrored by a pinned block carved the same way) instead of four.
 5. **Prefill**: selective streaming of used experts per layer with whole-layer double
    buffering on a side stream.
 
