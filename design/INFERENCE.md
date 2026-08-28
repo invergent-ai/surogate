@@ -84,6 +84,15 @@ Design (model-agnostic, keyed by `SparseMoeGeometry`; no kernel changes):
    kernel (byte-granular copies, PCIe is still the bound), or (c) write a planar-W8 AVX-512
    GEMV/GEMM of our own (decode is DRAM-bound so a simple VNNI kernel suffices; prefill is
    where ik's tiled GEMM would pay). Decide after the slot-cache numbers.
+   Decision (2026-08-28, after the slot-cache numbers): (c) — an AVX-512 kernel over our own
+   planar W8G32 rows, with ik's `iqk_gemm_legacy_quants.cpp` (Q8_0 path) as the reference
+   for the inner loop. Reasons: decode is DRAM-bound (a whole layer's misses are ~2 GB/token
+   at 160–320 GB/s), so a straightforward int8×bf16 FMA loop with one pinned thread per core
+   per NUMA node reaches the bound; prefill is gather-bound per layer today (all ~512 used
+   experts of a layer, 2.6 GB, land in the pool once per layer per chunk), so the CPU share
+   helps prefill through the same split; and one host copy of the experts keeps the pinned
+   footprint at 154 GB. The interleaved second copy (a) and the de-interleaving gather (b) are
+   fallbacks if the planar kernel cannot reach DRAM speed.
 
 35B regression watch (2026-08-28): `probe_35b.sh` on GPU 2 (both under host contention and
 with an idle host) reports users=32 decode 1,137 / prefill 4,547 tok/s with correct answers,

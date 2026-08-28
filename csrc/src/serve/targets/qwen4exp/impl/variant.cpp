@@ -86,7 +86,33 @@ struct ExpertSlotCache {
         ExpertSlotCache& cache = *entry->owner;
         ops::expert_slot_resolve(ids, entry->index, cache.directory, cache.misses, stream);
         ops::expert_slot_gather(entry->bank, cache.misses, cache.pool, stream);
+        if (cache.stats_every > 0) { cache.record_stats(ids, stream); }
     }
+
+    // Diagnostic hit-rate readout (SUROGATE_SERVE_EXPERT_STATS=<rounds>): every `stats_every`
+    // rounds the miss count is read back synchronously, so it perturbs throughput and is not
+    // for measurements. A "round" here is one layer's resolve.
+    std::int64_t stats_every  = 0;
+    std::int64_t stats_rounds = 0;
+    std::int64_t stats_misses = 0;
+    std::int64_t stats_ids    = 0;
+    void record_stats(const Tensor& ids, cudaStream_t stream) {
+        ++stats_rounds;
+        stats_ids += ids.numel();
+        if (stats_rounds % stats_every != 0) { return; }
+        long long misses = 0;
+        CUDA_CHECK(cudaMemcpyAsync(&misses, cache_count_ptr(), sizeof(misses), cudaMemcpyDeviceToHost,
+                                   stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        stats_misses += misses * stats_every; // sampled: one readout stands for the window
+        std::fprintf(stderr,
+                     "qwen4exp: expert cache rounds=%lld sampled misses/round=%lld ids/round=%.1f "
+                     "(cumulative sampled miss share %.1f%%)\n",
+                     static_cast<long long>(stats_rounds), misses,
+                     static_cast<double>(stats_ids) / static_cast<double>(stats_rounds),
+                     100.0 * static_cast<double>(stats_misses) / static_cast<double>(stats_ids));
+    }
+    const void* cache_count_ptr() const { return misses.count.data; }
 };
 
 std::mutex& expert_slot_mutex() {
@@ -136,6 +162,9 @@ ExpertSlotCache& expert_slot_cache_for_current_device() {
     CUDA_CHECK(cudaStreamSynchronize(nullptr));
     cache.layers.resize(static_cast<std::size_t>(TextConfig::layers));
     cache.enabled = true;
+    if (const char* stats = std::getenv("SUROGATE_SERVE_EXPERT_STATS"); stats != nullptr && *stats != '\0') {
+        cache.stats_every = std::strtol(stats, nullptr, 10);
+    }
     std::fprintf(stderr, "qwen4exp: expert slot cache enabled: %d slots (%.1f GiB pool)\n",
                  cache.slots, static_cast<double>(pool_bytes) / (1024.0 * 1024.0 * 1024.0));
     return cache;

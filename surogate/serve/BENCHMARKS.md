@@ -644,6 +644,8 @@ yet. llama.cpp upstream master (added `qwen4exp` this week; CUDA build at
 | | 16 | 7.6 | 30 | 15.1 s |
 | ik_llama.cpp 7cff686d (AVX-512 iqk kernels, fused MoE), 1× 5090, `-ot exps=CPU`, 32 threads — loadgen timeouts counted as errors, rerun pending | 1 | 21.8 | 87 | 1.8 s |
 | | 16 | 23.9 | 96 | 30 s |
+| **surogate serve + expert slot cache** (`--expert-slots 3000`, 14.6 GiB device pool, bulk host→device gather of misses, no CPU compute) | 1 | 18.5 | 74 | 3.0 s |
+| | 16 | (running) | | |
 
 Both configurations answer the probes correctly (`'Paris'`, `'2, 3, and 5'`).
 The engine row (2026-08-28, parity with llama.cpp verified stage by stage, see
