@@ -1064,3 +1064,9 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   same cores; per-socket pools per stage group remain the option if the host becomes the
   limit. Other shared host state audited: the bank is read-only, the caches and slice
   contexts are per device, the thread-locals live on the driver thread only.
+- 2 stages at one user, split on (2026-08-28): 13.1 tok/s, TTFT 4.3 s (one card: 22.4 / 1.4 s).
+  With one lane there is one group, so the stages run in lockstep and every token pays two
+  rounds' fixed costs plus two serialised host rounds; the prefill likewise runs stage after
+  stage. Per-stream latency is not what the pipeline buys — aggregate throughput is — and
+  the single-stream case will need the two stages' host rounds to run on separate sockets
+  (per-socket pools) to get back to parity with one card.
