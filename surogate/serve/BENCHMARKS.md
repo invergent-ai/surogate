@@ -92,7 +92,7 @@ passes with the cards rotated between them.
 | Qwen3.5-0.8B | from GGUF Q4_K_M | **10,095** | 6,694 | **+51 %** | **45 ms** | 658 ms |
 | Qwen3.5-4B | NVFP4 3.56 GiB | **4,942** | 4,246 | **+16 %** | **45 ms** | 239 ms |
 | Qwen3.8-27B | NVFP4 all, 128 lanes | **1,330** | 1,039 | **+28 %** | **170 ms** | 8.26 s |
-| Qwen3.6-35B-A3B | Q4/Q5/Q6 MoE | 1,784 | **2,257** | **−21 %** | **129 ms** | 1.26 s |
+| Qwen3.6-35B-A3B | Q4/Q5/Q6 MoE | 1,942 | **2,290** | **−15 %** | **253 ms** | 1.26 s |
 
 Three of four beaten on throughput, all four on TTFT by 9–48x. The 27B row is
 the all-NVFP4 artifact (#87): the round-cost section below rules out batching,
@@ -435,6 +435,74 @@ The lesson is now the same at two scales: **on this hardware the weight format
 is worth more than every scheduling lever put together.** The 4B gained 54 %
 from it, the 27B 37 %, and in both cases the levers the round-cost model
 ranked above it moved nothing.
+
+## The 35B's round, and everything that did not move it (2026-08-28)
+
+The 35B is the one model still behind. Its round-cost model, measured the same
+way as the 27B's:
+
+| round | ms | columns |
+|---|---:|---:|
+| mixed (one prompt + the decode batch) | 62.0 | 640 + 95 |
+| decode | 26.0 | 95 |
+
+**20.9 ms fixed plus 56 us per column** unbatched — and unlike the 27B, the
+column cost is *not* flat. The routed experts are streamed once per round no
+matter how wide it is, so per-token cost falls steeply with width
+(`ninfer_sparse_moe_bench`, q4-q5, cold, one layer):
+
+| columns | 640 | 1,152 | 2,176 | 2,688 | 3,712 |
+|---|---:|---:|---:|---:|---:|
+| us/token | 1.26 | 0.91 | 0.67 | 0.64 | 0.64 |
+
+That is why **batched prefill** (#88) pays here and is a no-op on a dense
+model: four prompts in one mixed round cost about what two cost separately.
+Two passes, cards rotated, 100 users, 512/128, 90 s:
+
+| | pass 1 | pass 2 | mean | TTFT p50 |
+|---|---:|---:|---:|---:|
+| engine, prefill batch 4 | 1,960 | 1,924 | **1,942** | 253 ms |
+| engine, unbatched | 1,756 | 1,768 | 1,762 | 130 ms |
+| **vLLM** | 2,278 | 2,303 | **2,290** | 1,256 ms |
+
+With the lane cap lifted first (1,595 -> 1,762) that is **+22 % on this model
+this session**, at 85 % of vLLM and 5x its TTFT.
+
+Everything else measured and rejected, so the next reader does not re-run it:
+
+  - **vLLM's MoE Marlin** (#89, ported in full, kept behind
+    `SUROGATE_SERVE_MOE_MARLIN`): −7.5 % at 704 columns, −1.4 % at 1,408,
+    **+4.5 % at 2,688** — and 2,688 is the width a batched round runs at. Our
+    kernel computes gate and up in registers and writes `silu(gate)*up` at 512
+    wide; Marlin must materialise the 1024-wide product and fold it in a second
+    pass, which costs more than its better MMA schedule wins, and costs
+    accuracy too (rel_l2 1.56 % against our 0.16 %).
+  - **A deeper cp.async pipeline** in the routed kernels: 3 stages instead of 2
+    is 590/848/2,139 us at 99/704/2,688 columns against 571/848/1,735 — shared
+    memory is what caps occupancy at 3 blocks/SM, and a third stage spends more
+    than it hides.
+  - **The MoE wide-plan threshold** (`SUROGATE_SERVE_MOE_WIDE_MIN`): the
+    crossover is already right. Narrow wins below ~1,100 columns, wide above,
+    and a batched round is above it. Sweeping it moved 1,792-1,823, noise.
+  - **The persistent grid** (`SUROGATE_SERVE_MOE_BLOCKS_PER_SM`): saturates at
+    the 3 blocks/SM it already uses (553 GB/s; 8 blocks gives 561, 2 gives 505).
+  - **MTP speculation**: needs 16.4 GB of runtime reservation at 128 lanes
+    against 6.8 GB free after weights, and the MTP block adds 2.2 GB of its own
+    (it carries a full expert set). It does not fit at any lane count worth
+    running.
+  - **bf16 KV** (1,774 against 1,798) and **chunk width** 2,048/4,096/8,192
+    (1,765/1,798/1,778): flat.
+
+What is left is the two things the round model names. The fixed term is 41 % of
+the second and is the expert stream — 18.6 GB per round at ~890 GB/s, half of
+what the card can do — and the routed kernels are latency-bound rather than
+bandwidth- or compute-bound (sm__throughput 60 %, dram 23 %, warps_active
+44 %, occupancy capped by shared memory). The other 55 % is the column cost of
+those same kernels. Both are the same kernel-design problem, and vLLM's own
+kernel is not the answer to it at these widths. The other lever is bytes: our
+artifact is 21.3 GB of Q4/Q5/Q6 where vLLM reads an NVFP4 export, which is
+most of the 15 % that remains — the same finding as the 4B and the 27B, but it
+needs an NVFP4 MoE kernel we do not have.
 
 ## What a 27B round costs, and what that rules out (2026-08-27 late)
 
