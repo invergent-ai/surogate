@@ -1167,3 +1167,13 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   instead of one membership; (2) the ~30-36 ms stage-round fixed cost (a 6-layer stage at
   one lane) is far above its GPU work and is the other half — the timestamped trace run is
   queued to split it between device time (consume blocking) and host gaps.
+- Step C3 written (2026-08-28, commit above): the driver keeps one flight per group (decode,
+  mixed, or a lone prefill run stage by stage synchronously), `tick()` consumes only the
+  stage round that has been running longest, parks its export, and launches every parked
+  group whose next stage is free (oldest first); the executor, for a pipeline program, runs
+  `pipelined_iteration`: continuous CPU-only admission, then a launch for every idle group
+  with work (its own membership by lane % groups, its own staged prefills), then one tick,
+  then the usual per-round processing for each finished group. The closed-pipeline
+  `decode_batch`/`advance_prefill_mixed` stay for the non-pipelined executor path. Test chain
+  queued behind the trace run: 2 stages split-off vs the closed pipeline, then 8 stages at
+  16/64/1 users, then the 27B and 35B at 100 users.
