@@ -382,6 +382,19 @@ Exit for phase 2: the single-GPU board row at 1, 16 and 100 users, ≥ 3× llama
 
 ## How to run / verify
 
+- Serve on one 5090 with the phase-2 offload (the configuration behind the board rows):
+  `numactl --interleave=all surogate-engine <artifact>.ninfer --max-num-seqs 16 --kv-capacity auto
+  --max-model-len 2048 --expert-slots 3000 --cpu-moe-share auto` — the pool takes 14.6 GiB
+  (use `--expert-slots 2000` for 32-64 lanes so the graphs and KV fit), the decode share is
+  measured at startup (host vs PCIe rates, ~0.8 here), the prefill share defaults to 0.5
+  (`--cpu-moe-prefill-share 0.7` is better for a single user; 0 turns it off), the host
+  pool takes one thread per physical core within the allowed cpuset
+  (`SUROGATE_SERVE_CPU_MOE_THREADS` overrides). Diagnostics: `SUROGATE_SERVE_EXPERT_STATS=<rounds>`
+  (eager only), `SUROGATE_SERVE_ROUND_TIMING=1`, `SUROGATE_CPU_EXPERT_NO_VNNI=1`,
+  `SUROGATE_CPU_EXPERT_TILE=1`.
+- Probe at concurrency: scratchpad `probe_slots.sh` (env USERS/SEQS/DUR/PTOK/MTOK/GPU/KV/EXTRA/
+  NUMA/MAXLEN/PORT/OUT/SRVLOG) runs the coherence prompts before and *during* the load;
+  `lane.sh` runs a list of probes node-bound on one GPU so two lanes share the host.
 - Convert: `python -m surogate.serve.tools.convert.qwen4exp.convert --gguf <shard1> --frontend
   models/Qwen3.8-Flash-Next-frontend --out <path>.ninfer --device cuda` (GPU 7 was used).
 - Verify an artifact against the GGUF: scratchpad `verify_flash_artifact.py` (decode objects,
@@ -866,3 +879,10 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   their own evidence (0 fatals, correct answers). Board corrected. Lesson: a throughput row
   needs its completions × tokens sanity-checked, and correctness probes must run at the
   concurrency being measured.
+- Round-timing pair at 64 users (2026-08-28, binary 17:40, 32 threads): prefill share 0 →
+  37.0 / 174 / TTFT 24.3 s; prefill share 0.5 → 33.3 / 156 / 25.8 s. The timer reports every
+  round as "decode" at this concurrency (a prompt's chunk rides inside the lane rounds), so
+  it does not separate the prefill cost; rounds run ~0.7-1 s. Reading: the prefill split is
+  a clear win at 16 users (37.9 vs 33.5, TTFT halved) and slightly negative at 64, where the
+  host is already the round's critical path with the decode share; the default stays 0.5
+  and the 64-user trio (0.7 / 0.5 / 0) on the per-slice-mirror binary follows in lane A.
