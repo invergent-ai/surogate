@@ -1111,3 +1111,14 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   on one socket. Fixes queued: groups follow the round's width (a minimum lane count per
   group, `SUROGATE_SERVE_PIPELINE_MIN_LANES`, default 4), 2,000 slots at 64 lanes, and the
   per-socket pools (building now).
+- Per-socket pools measured (2026-08-28): 8 stages at 16 users 31.8 tok/s, TTFT 18.8 s; at one
+  user 3.5 tok/s — no change, so the shared pool was not the limiter. The reading that fits
+  all the 8-stage numbers: **the per-round fixed cost.** At one user a token is eight
+  sequential stage rounds of ~36 ms although each stage runs a sixth of the layers (a single
+  card's whole round is ~45 ms), and the mixed (prefill) rounds cross the eight stages one
+  after another, so TTFT doubles and admission queues. Two responses, committed: a stage
+  whose pool holds ≥ 90 % of its experts (8 stages: 3,000 of 3,072) switches the CPU split
+  off — the host round trip per layer buys nothing there; and the pipeline trace now carries
+  timestamps so the next pipelined run shows whether stage rounds actually overlap. The
+  remaining levers are prefill batching (several prompts per mixed round: the executor's
+  `mixed_prefill_batch_target`) and cutting the round's fixed cost itself.
