@@ -813,6 +813,7 @@ add_library(ninfer_core STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/core/cyclic_kv_cache.cpp
   ${SERVE_ROOT}/core/paged_kv_cache.cpp
   ${SERVE_ROOT}/core/linear_attention_state.cpp
+  ${SERVE_ROOT}/core/ngram_ple_state.cpp
   ${SERVE_ROOT}/core/layout.cpp
   ${SERVE_ROOT}/core/tensor.cpp
   ${SERVE_ROOT}/core/decode_graph.cpp
@@ -1038,6 +1039,9 @@ add_library(ninfer_ops STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/sparse_moe/prefill/sparse_moe_prefill_plan.cpp
   ${SERVE_ROOT}/ops/sparse_moe/small_t/sparse_moe_small_t_kernels.cu
   ${SERVE_ROOT}/ops/sparse_moe/small_t/sparse_moe_small_t_plan.cpp
+  ${SERVE_ROOT}/ops/linear/bf16/bf16_cublaslt.cpp
+  ${SERVE_ROOT}/ops/hyper_connection/hyper_connection.cu
+  ${SERVE_ROOT}/ops/ngram_ple/ngram_ple.cu
   ${SERVE_ROOT}/ops/linear/linear.cpp
   ${SERVE_ROOT}/ops/wrapper/add_bias.cpp
   ${SERVE_ROOT}/ops/wrapper/argmax.cpp
