@@ -75,8 +75,8 @@ struct Variant {
     /// the fallback when nothing was configured).
     static void configure_cpu_moe_share(float share);
     static constexpr bool has_layer_prologue = true;
-    // 48 layers, a four-stream residual and the PLE nodes: the decode graphs measured
-    // 15.7 MiB per lane (503 MB at 32 lanes) against the family's 12 MiB.
+    // 48 layers, a four-stream residual, the PLE nodes and (with the CPU split) the host-round
+    // nodes per layer: the decode graphs measure 15.7-21.4 MiB per lane against the family's 12.
     static constexpr std::size_t ordinary_graph_allowance_per_lane_bytes = 24ULL * 1024ULL * 1024ULL;
     // Parity probe: dumps family-loop intermediates under SUROGATE_SERVE_DUMP_RESIDUAL.
     static void debug_probe(const char* tag, const Tensor& tensor, cudaStream_t stream);

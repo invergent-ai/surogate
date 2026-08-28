@@ -114,10 +114,13 @@ struct ExpertSlotCache {
     std::uint16_t* x_host   = nullptr;
     float* out_host         = nullptr;
     void* out_device_alias  = nullptr;
+    void* jobs_host_block           = nullptr; // pinned mirror of the device job list (same carve)
+    std::size_t jobs_block_bytes    = 0;
     std::int32_t* jobs_tokens_host  = nullptr;
     std::int32_t* jobs_experts_host = nullptr;
     float* jobs_weights_host        = nullptr;
     long long* jobs_count_host      = nullptr;
+    std::int32_t cpu_min_tokens     = 4; // below this the host round-trip costs more than it saves
     std::vector<ops::CpuExpertJob> job_scratch;
 
     bool cpu_split_enabled() const { return cpu_share_q16 > 0 && cpu_pool != nullptr; }
@@ -150,13 +153,8 @@ struct ExpertSlotCache {
         CUDA_CHECK(cudaMemcpyAsync(x_host, x.data,
                                    static_cast<std::size_t>(hidden) * tokens * sizeof(std::uint16_t),
                                    cudaMemcpyDeviceToHost, cpu_stream));
-        CUDA_CHECK(cudaMemcpyAsync(jobs_tokens_host, cpu_jobs.tokens.data, cpu_jobs.tokens.bytes(),
-                                   cudaMemcpyDeviceToHost, cpu_stream));
-        CUDA_CHECK(cudaMemcpyAsync(jobs_experts_host, cpu_jobs.experts.data, cpu_jobs.experts.bytes(),
-                                   cudaMemcpyDeviceToHost, cpu_stream));
-        CUDA_CHECK(cudaMemcpyAsync(jobs_weights_host, cpu_jobs.weights.data, cpu_jobs.weights.bytes(),
-                                   cudaMemcpyDeviceToHost, cpu_stream));
-        CUDA_CHECK(cudaMemcpyAsync(jobs_count_host, cpu_jobs.count.data, sizeof(long long),
+        // The job list is one contiguous device block mirrored by one pinned block.
+        CUDA_CHECK(cudaMemcpyAsync(jobs_host_block, cpu_jobs_memory, jobs_block_bytes,
                                    cudaMemcpyDeviceToHost, cpu_stream));
         CUDA_CHECK(cudaLaunchHostFunc(cpu_stream, &ExpertSlotCache::run_cpu_round, &entry));
         CUDA_CHECK(cudaEventRecord(join_event, cpu_stream));
@@ -169,7 +167,8 @@ struct ExpertSlotCache {
         ExpertSlotCache& cache = *entry->owner;
         const std::int32_t tokens =
             static_cast<std::int32_t>(x.numel() / ops::kSparseMoeFlashNextGeometry.hidden);
-        const bool split = cache.cpu_split_enabled() && tokens >= 1 && tokens <= cache.cpu_max_tokens &&
+        const bool split = cache.cpu_split_enabled() && tokens >= cache.cpu_min_tokens &&
+                           tokens <= cache.cpu_max_tokens &&
                            entry->cpu_bank.gate_up_codes != nullptr && x.data != nullptr &&
                            destination.data != nullptr;
         if (split) {
@@ -294,10 +293,19 @@ ExpertSlotCache& expert_slot_cache_for_current_device() {
                                      static_cast<std::size_t>(hidden) * cache.cpu_max_tokens * sizeof(float),
                                      cudaHostAllocMapped | cudaHostAllocPortable));
             CUDA_CHECK(cudaHostGetDevicePointer(&cache.out_device_alias, cache.out_host, 0));
-            CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&cache.jobs_tokens_host), capacity * sizeof(std::int32_t), cudaHostAllocPortable));
-            CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&cache.jobs_experts_host), capacity * sizeof(std::int32_t), cudaHostAllocPortable));
-            CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&cache.jobs_weights_host), capacity * sizeof(float), cudaHostAllocPortable));
-            CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&cache.jobs_count_host), sizeof(long long), cudaHostAllocPortable));
+            cache.jobs_block_bytes = ops::expert_cpu_job_list_bytes(capacity);
+            CUDA_CHECK(cudaHostAlloc(&cache.jobs_host_block, cache.jobs_block_bytes, cudaHostAllocPortable));
+            {
+                // Same carve as the device list, so field offsets match after the block copy.
+                const ops::ExpertCpuJobList mirror = ops::create_expert_cpu_job_list(capacity, cache.jobs_host_block);
+                cache.jobs_tokens_host  = static_cast<std::int32_t*>(mirror.tokens.data);
+                cache.jobs_experts_host = static_cast<std::int32_t*>(mirror.experts.data);
+                cache.jobs_weights_host = static_cast<float*>(mirror.weights.data);
+                cache.jobs_count_host   = static_cast<long long*>(mirror.count.data);
+            }
+            if (const char* min = std::getenv("SUROGATE_SERVE_CPU_MOE_MIN_TOKENS"); min != nullptr && *min != '\0') {
+                cache.cpu_min_tokens = static_cast<std::int32_t>(std::strtol(min, nullptr, 10));
+            }
             cache.cpu_pool = std::make_unique<ops::CpuExpertPool>(geometry);
             CUDA_CHECK(cudaStreamCreateWithFlags(&cache.cpu_stream, cudaStreamNonBlocking));
             CUDA_CHECK(cudaEventCreateWithFlags(&cache.fork_event, cudaEventDisableTiming));
