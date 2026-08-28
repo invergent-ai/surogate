@@ -123,6 +123,15 @@ and the baseline run is queued.
   "set" and skipped the env fallback, so the run measured v0 again. Fixed (a configured 0
   falls through to the env knob); the validation + probes rerun with `--expert-slots 3000`,
   then the ik baseline rerun and the 35B bisect probes follow on the same queue.
+- **Expert slot cache, first numbers (2026-08-28, `--expert-slots 3000` = 14.6 GiB pool, KV auto,
+  512/128):** users=1 decode **18.5 tok/s** (v0 5.2 → 3.6×), prefill 74 tok/s (v0 21 → 3.5×),
+  TTFT 3.0 s, answers coherent on all four prompts (Paris; 2, 3, 5; ocean; Rayleigh
+  scattering). That is within 15 % of ik_llama.cpp's 21.8 with only the bulk gather —
+  no CPU expert compute, no hit-rate tuning, no prefill streaming yet. 16-user probe running.
+  Reading of the round at users=1 (~54 ms/token): with 3,000 of 24,576 experts resident the
+  hit rate is low, so ~400 misses × 5.2 MB ≈ 2 GB/token at ~50 GB/s ≈ 40 ms is the floor of
+  this design — the CPU compute split (host DRAM 160–320 GB/s) is the next multiplier, then
+  pool sizing against the KV floor.
 5. **Prefill**: selective streaming of used experts per layer with whole-layer double
    buffering on a side stream.
 
