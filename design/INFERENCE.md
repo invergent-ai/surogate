@@ -687,3 +687,20 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   (host 209 GB/s vs PCIe ~50 → 0.8) lands on it; no need for a finer policy. The next step
   up at 16 users is the round cost itself (host round latency: fewer, wider jobs per thread,
   prefetch of the next layer's jobs — or the Q4 host bank that halves the bytes).
+- Prefill on the host, written (2026-08-28, unit-tested, unmeasured): the pool groups a
+  round's jobs by expert (counting sort) and runs four phases — quantise x per token; gate/up
+  row chunks per *expert group* with a 2-rows × 2-tokens AVX-512 inner kernel (the weight
+  loads and the fp16 scale conversions are shared by the two tokens, so a row read from DRAM
+  once serves every token routed to the expert); quantise h per job; down row chunks per
+  expert group with atomic adds. Decode rounds degenerate to the old row-chunked GEMV.
+  Engine side: `--cpu-moe-prefill-share F` (`SUROGATE_SERVE_CPU_MOE_PREFILL_SHARE`) gives
+  rounds wider than 64 columns their own share, the host staging is sized to
+  `prefill_chunk` columns (x 10 MB, out 20 MB, 20,480 jobs at 2048), and `share_for(tokens)`
+  picks the share per round. Expectation from the arithmetic: ~10 tokens per expert on a
+  512-token prompt lifts the host from DRAM-bound (13 GB/s/core) toward the int16-madd
+  compute bound (~3×), and the gather shrinks by the prefill share; the prefill share
+  optimum is bandwidth-matched like decode's (PCIe ≈ 4.2 s per 512-token prompt vs host
+  ≈ 2-2.5 s → ~0.65).
+- Auto-share probe at 16 users came back at 10.0 tok/s (the pool-only number): the split did
+  not engage and the server log was overwritten by the next probe. `prepare_expert_split`
+  now logs why it did not measure; the rerun keeps its log.

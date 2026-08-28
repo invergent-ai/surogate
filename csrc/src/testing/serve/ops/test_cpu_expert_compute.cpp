@@ -184,6 +184,37 @@ int main() {
         std::vector<float> got(outs.begin() + t * H, outs.begin() + (t + 1) * H);
         failures += compare("pooled round token " + std::to_string(t), got, want);
     }
+    // A prefill-shaped round: 13 tokens over the 4 experts with uneven, odd-sized groups (the
+    // grouped path pairs tokens two at a time and must handle the trailing one).
+    {
+        const int many = 13;
+        std::vector<std::uint16_t> xm(static_cast<std::size_t>(H) * many);
+        for (auto& v : xm) { v = float_to_bf16(act(rng)); }
+        std::vector<ops::CpuExpertJob> jm;
+        std::uniform_real_distribution<float> wdist(0.05F, 0.95F);
+        for (int t2 = 0; t2 < many; ++t2) {
+            jm.push_back({t2, t2 % 4, wdist(rng)});
+            jm.push_back({t2, (t2 * 7 + 1) % 4, wdist(rng)});
+            if (t2 % 3 == 0) { jm.push_back({t2, 3, wdist(rng)}); } // expert 3 gets extra, odd count
+        }
+        std::vector<float> om(static_cast<std::size_t>(H) * many, 0.0F);
+        ops::CpuExpertPool pool6(kGeometry, {.threads = 6, .pin_threads = false});
+        ops::CpuExpertRound rm{xm.data(), om.data(), many, jm};
+        pool6.run(bank.view(), rm);
+        int bad = 0;
+        for (int t2 = 0; t2 < many; ++t2) {
+            std::vector<std::uint16_t> column(xm.begin() + t2 * H, xm.begin() + (t2 + 1) * H);
+            std::vector<double> want(H, 0.0);
+            for (const auto& j : jm) {
+                if (j.token != t2) { continue; }
+                const std::vector<double> y = reference_job(bank, j.expert, column, j.weight);
+                for (int i = 0; i < H; ++i) { want[i] += y[i]; }
+            }
+            std::vector<float> got(om.begin() + t2 * H, om.begin() + (t2 + 1) * H);
+            bad += compare("grouped round token " + std::to_string(t2), got, want);
+        }
+        failures += bad;
+    }
     // Stress: many tiny rounds on a full-width pool exercise the wake-up/barrier protocol; a
     // lost wake-up shows up as a hang, so the test runs it with a watchdog thread.
     {

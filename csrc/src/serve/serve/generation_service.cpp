@@ -233,6 +233,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.expert_slots             = options_.expert_slots;
     engine_options.cpu_moe_share            = options_.cpu_moe_share;
     engine_options.cpu_moe_min_tokens       = options_.cpu_moe_min_tokens;
+    engine_options.cpu_moe_prefill_share    = options_.cpu_moe_prefill_share;
     engine_options.max_concurrency          = options_.max_concurrency;
     engine_options.max_pending_requests     = options_.max_pending_requests;
     engine_options.pending_timeout_ms       = options_.pending_timeout_ms;

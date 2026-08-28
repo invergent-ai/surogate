@@ -140,6 +140,11 @@ Options parse_options(int argc, char** argv) {
                     throw std::invalid_argument("--cpu-moe-share must be within [0, 1] or auto");
                 }
             }
+        } else if (arg == "--cpu-moe-prefill-share") {
+            options.cpu_moe_prefill_share = std::strtof(value(arg), nullptr);
+            if (options.cpu_moe_prefill_share < 0.0F || options.cpu_moe_prefill_share > 1.0F) {
+                throw std::invalid_argument("--cpu-moe-prefill-share must be within [0, 1]");
+            }
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = parse_u32(value(arg), "prefill-chunk");
         } else if (arg == "--device") {

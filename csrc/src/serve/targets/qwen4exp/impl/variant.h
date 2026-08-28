@@ -76,6 +76,9 @@ struct Variant {
     static void configure_cpu_moe_share(float share);
     /// Minimum round width (columns) for the split; 0 keeps the default (4).
     static void configure_cpu_moe_min_tokens(std::uint32_t tokens);
+    /// Share of a prefill round's misses computed on the host (batched kernel) and the widest
+    /// prefill round (the engine's prefill chunk), which sizes the host staging.
+    static void configure_cpu_moe_prefill(float share, std::uint32_t prefill_chunk);
     /// With `--cpu-moe-share auto`, times a PCIe gather and a host round of layer 0's experts
     /// (outside graph capture) and sets the share to host/(host+pcie). Called by
     /// create_program before the graphs are captured; a no-op otherwise.

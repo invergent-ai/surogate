@@ -2,7 +2,9 @@
 // geometry (2560/512/10/640) from a synthetic planar W8 bank, for decode-shaped rounds
 // (few tokens, many distinct experts) with the pool's thread count.
 //
-//   ninfer_cpu_expert_compute_bench [threads] [experts_in_bank] [jobs_per_round] [rounds]
+//   ninfer_cpu_expert_compute_bench [threads] [experts_in_bank] [jobs_per_round] [rounds] [experts_per_round]
+//   (experts_per_round < experts_in_bank draws each round's experts from a subset, i.e. several
+//   tokens per expert as in a prefill round; default = the whole bank)
 #include "api/ops/cpu_expert_compute.h"
 
 #include <chrono>
@@ -19,6 +21,7 @@ int main(int argc, char** argv) {
     const int bank_experts    = argc > 2 ? std::atoi(argv[2]) : 512;
     const int jobs_per_round  = argc > 3 ? std::atoi(argv[3]) : 160; // ~16 tokens × 10 paths
     const int rounds          = argc > 4 ? std::atoi(argv[4]) : 20;
+    const int experts_per_round = argc > 5 ? std::atoi(argv[5]) : bank_experts;
     const ops::SparseMoeGeometry geometry{2560, bank_experts, 10, 640};
     const std::size_t gate_codes  = static_cast<std::size_t>(geometry.expert_rows()) * geometry.hidden;
     const std::size_t gate_scales = static_cast<std::size_t>(geometry.expert_rows()) * (geometry.hidden / 32) * 2;
@@ -51,11 +54,11 @@ int main(int argc, char** argv) {
 
     ops::CpuExpertPool pool(geometry, {.threads = threads, .pin_threads = true});
     std::cout << "threads: " << pool.threads() << ", tokens/round: " << tokens << ", jobs/round: "
-              << jobs_per_round << "\n";
+              << jobs_per_round << ", distinct experts/round <= " << experts_per_round << "\n";
     double best_gbs = 0.0, total_s = 0.0;
     for (int r = 0; r < rounds; ++r) {
         for (int j = 0; j < jobs_per_round; ++j) {
-            jobs[static_cast<std::size_t>(j)] = {j % tokens, static_cast<int>(rng() % bank_experts), 0.1F};
+            jobs[static_cast<std::size_t>(j)] = {j % tokens, static_cast<int>((r * 131 + rng() % experts_per_round) % bank_experts), 0.1F};
         }
         std::fill(out.begin(), out.end(), 0.0F);
         const auto t0 = std::chrono::steady_clock::now();

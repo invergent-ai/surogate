@@ -119,6 +119,7 @@ Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
     detail::Variant::configure_expert_slots(options.expert_slots);
     detail::Variant::configure_cpu_moe_share(options.cpu_moe_share);
     detail::Variant::configure_cpu_moe_min_tokens(options.cpu_moe_min_tokens);
+    detail::Variant::configure_cpu_moe_prefill(options.cpu_moe_prefill_share, options.prefill_chunk);
     {
         int previous = 0;
         CUDA_CHECK(cudaGetDevice(&previous));

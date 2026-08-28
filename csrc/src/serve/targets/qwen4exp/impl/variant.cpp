@@ -105,6 +105,9 @@ struct ExpertSlotCache {
     // --- CPU expert split (SUROGATE_SERVE_CPU_MOE_SHARE=<fraction of misses>) ---
     std::uint32_t cpu_share_q16 = 0;
     std::int32_t cpu_max_tokens = 0;
+    // Prefill rounds (wider than cpu_max_tokens) use their own share; 0 keeps the full gather.
+    std::uint32_t cpu_prefill_share_q16  = 0;
+    std::int32_t cpu_prefill_max_tokens  = 0;
     bool auto_share             = false;
     bool share_measured         = false;
     std::unique_ptr<ops::CpuExpertPool> cpu_pool;
@@ -126,7 +129,12 @@ struct ExpertSlotCache {
     std::int32_t cpu_min_tokens     = 4; // below this the host round-trip costs more than it saves
     std::vector<ops::CpuExpertJob> job_scratch;
 
-    bool cpu_split_enabled() const { return cpu_share_q16 > 0 && cpu_pool != nullptr; }
+    bool cpu_split_enabled() const { return cpu_pool != nullptr; }
+    // The share and the widest round for a round of `tokens` columns (0 share = no split).
+    std::uint32_t share_for(std::int32_t tokens) const {
+        if (tokens <= cpu_max_tokens) { return cpu_share_q16; }
+        return tokens <= cpu_prefill_max_tokens ? cpu_prefill_share_q16 : 0U;
+    }
 
     static void run_cpu_round(void* context) {
         auto* entry            = static_cast<Layer*>(context);
@@ -170,13 +178,13 @@ struct ExpertSlotCache {
         ExpertSlotCache& cache = *entry->owner;
         const std::int32_t tokens =
             static_cast<std::int32_t>(x.numel() / ops::kSparseMoeFlashNextGeometry.hidden);
-        const bool split = cache.cpu_split_enabled() && tokens >= cache.cpu_min_tokens &&
-                           tokens <= cache.cpu_max_tokens &&
+        const std::uint32_t share = cache.cpu_split_enabled() ? cache.share_for(tokens) : 0U;
+        const bool split = share > 0 && tokens >= cache.cpu_min_tokens &&
                            entry->cpu_bank.gate_up_codes != nullptr && x.data != nullptr &&
                            destination.data != nullptr;
         if (split) {
             ops::expert_slot_resolve(ids, alpha, entry->index, cache.directory, cache.misses,
-                                     &cache.cpu_jobs, cache.cpu_share_q16, stream);
+                                     &cache.cpu_jobs, share, stream);
         } else {
             ops::expert_slot_resolve(ids, entry->index, cache.directory, cache.misses, stream);
         }
@@ -230,6 +238,10 @@ std::unordered_map<int, std::uint32_t>& configured_expert_slots() {
 std::unordered_map<int, float>& configured_cpu_share() {
     static std::unordered_map<int, float> configured;
     return configured;
+}
+std::unordered_map<int, std::pair<float, std::uint32_t>>& configured_cpu_prefill() {
+    static std::unordered_map<int, std::pair<float, std::uint32_t>> map;
+    return map;
 }
 std::unordered_map<int, std::uint32_t>& configured_cpu_min_tokens() {
     static std::unordered_map<int, std::uint32_t> configured;
@@ -296,19 +308,34 @@ ExpertSlotCache& expert_slot_cache_for_current_device() {
             fraction = std::strtod(share, nullptr);
         }
     }
+    double prefill_fraction        = 0.0;
+    std::uint32_t prefill_chunk    = 0;
+    if (auto configured = configured_cpu_prefill().find(device); configured != configured_cpu_prefill().end()) {
+        prefill_fraction = static_cast<double>(configured->second.first);
+        prefill_chunk    = configured->second.second;
+    }
+    if (const char* share = std::getenv("SUROGATE_SERVE_CPU_MOE_PREFILL_SHARE"); share != nullptr && *share != '\0') {
+        prefill_fraction = std::strtod(share, nullptr);
+        if (prefill_chunk == 0) { prefill_chunk = 2048; }
+    }
     {
-        if (fraction > 0.0) {
-            cache.cpu_share_q16 = static_cast<std::uint32_t>(std::min(1.0, fraction) * 65536.0);
-            cache.cpu_max_tokens = 64; // decode and small-T rounds; prefill keeps the full gather
-            const std::int32_t hidden   = geometry.hidden;
-            const std::int32_t capacity = cache.cpu_max_tokens * geometry.experts_per_token;
+        if (fraction > 0.0 || prefill_fraction > 0.0) {
+            cache.cpu_share_q16 = static_cast<std::uint32_t>(std::min(1.0, std::max(0.0, fraction)) * 65536.0);
+            cache.cpu_max_tokens = 64; // decode and small-T rounds use cpu_share; wider rounds are prefill
+            if (prefill_fraction > 0.0 && prefill_chunk > 0) {
+                cache.cpu_prefill_share_q16 = static_cast<std::uint32_t>(std::min(1.0, prefill_fraction) * 65536.0);
+                cache.cpu_prefill_max_tokens = static_cast<std::int32_t>(prefill_chunk);
+            }
+            const std::int32_t hidden      = geometry.hidden;
+            const std::int32_t stage_tokens = std::max(cache.cpu_max_tokens, cache.cpu_prefill_max_tokens);
+            const std::int32_t capacity    = stage_tokens * geometry.experts_per_token;
             CUDA_CHECK(cudaMalloc(&cache.cpu_jobs_memory, ops::expert_cpu_job_list_bytes(capacity)));
             cache.cpu_jobs = ops::create_expert_cpu_job_list(capacity, cache.cpu_jobs_memory);
             CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&cache.x_host),
-                                     static_cast<std::size_t>(hidden) * cache.cpu_max_tokens * sizeof(std::uint16_t),
+                                     static_cast<std::size_t>(hidden) * stage_tokens * sizeof(std::uint16_t),
                                      cudaHostAllocPortable));
             CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&cache.out_host),
-                                     static_cast<std::size_t>(hidden) * cache.cpu_max_tokens * sizeof(float),
+                                     static_cast<std::size_t>(hidden) * stage_tokens * sizeof(float),
                                      cudaHostAllocMapped | cudaHostAllocPortable));
             CUDA_CHECK(cudaHostGetDevicePointer(&cache.out_device_alias, cache.out_host, 0));
             cache.jobs_block_bytes = ops::expert_cpu_job_list_bytes(capacity);
@@ -333,8 +360,9 @@ ExpertSlotCache& expert_slot_cache_for_current_device() {
             CUDA_CHECK(cudaEventCreateWithFlags(&cache.fork_event, cudaEventDisableTiming));
             CUDA_CHECK(cudaEventCreateWithFlags(&cache.join_event, cudaEventDisableTiming));
             cache.auto_share = auto_share;
-            std::fprintf(stderr, "qwen4exp: CPU expert split enabled: %.0f%% of misses on %u host threads%s\n",
-                         100.0 * fraction, cache.cpu_pool->threads(), auto_share ? " (auto: measured at startup)" : "");
+            std::fprintf(stderr, "qwen4exp: CPU expert split enabled: %.0f%% of decode misses, %.0f%% of prefill misses (rounds up to %d columns) on %u host threads%s\n",
+                         100.0 * fraction, 100.0 * prefill_fraction, cache.cpu_prefill_max_tokens,
+                         cache.cpu_pool->threads(), auto_share ? " (auto: measured at startup)" : "");
         }
     }
     std::fprintf(stderr, "qwen4exp: expert slot cache enabled: %d slots (%.1f GiB pool)\n",
@@ -534,6 +562,10 @@ void Variant::configure_expert_slots(std::uint32_t slots) {
 void Variant::prepare_expert_split(const ModelView& model) {
     ExpertSlotCache& cache = expert_slot_cache_for_current_device();
     if (!cache.enabled || !cache.cpu_split_enabled() || !cache.auto_share || cache.share_measured) {
+        if (cache.auto_share && !cache.share_measured) {
+            std::fprintf(stderr, "qwen4exp: CPU split auto share not measured (cache %d, pool %d)\n",
+                         int(cache.enabled), int(cache.cpu_split_enabled()));
+        }
         return;
     }
     // Layer 0's routed experts: the first MoE layer's payload.
@@ -541,7 +573,10 @@ void Variant::prepare_expert_split(const ModelView& model) {
     for (const auto& gdn : model.gdn_layers) {
         if (gdn.post_mixer.layer >= 0) { payload = &gdn.post_mixer; break; }
     }
-    if (payload == nullptr || payload->host_gate_up == nullptr) { return; }
+    if (payload == nullptr || payload->host_gate_up == nullptr) {
+        std::fprintf(stderr, "qwen4exp: CPU split auto share not measured (no MoE layer with a host bank)\n");
+        return;
+    }
     ExpertSlotCache::Layer& layer = cache.layer(*payload);
     const auto geometry           = ops::kSparseMoeFlashNextGeometry;
     constexpr int kExpertsTimed   = 64;
@@ -594,6 +629,12 @@ void Variant::prepare_expert_split(const ModelView& model) {
     CUDA_CHECK(cudaStreamDestroy(stream));
     std::fprintf(stderr, "qwen4exp: CPU split auto share: host %.0f GB/s, PCIe gather %.0f GB/s -> %.0f%% of misses on the host\n",
                  host_gbs, pcie_gbs, 100.0 * share);
+}
+
+void Variant::configure_cpu_moe_prefill(float share, std::uint32_t prefill_chunk) {
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    configured_cpu_prefill()[device] = {share, prefill_chunk};
 }
 
 void Variant::configure_cpu_moe_min_tokens(std::uint32_t tokens) {

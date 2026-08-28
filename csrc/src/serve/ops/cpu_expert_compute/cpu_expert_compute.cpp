@@ -151,6 +151,58 @@ void dot_two_rows_avx512(const std::int8_t* codes0, const std::uint16_t* scales0
     out1 = _mm512_reduce_add_ps(acc1);
 }
 
+/// Two rows against two tokens: the row loads/widening and the fp16 scale conversion are shared
+/// across the tokens, which is the reuse a batched round lives on (a row read from DRAM once
+/// serves every token routed to the expert).
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512dq,f16c,fma")))
+void dot_two_rows_two_tokens_avx512(const std::int8_t* codes0, const std::uint16_t* scales0,
+                                    const std::int8_t* codes1, const std::uint16_t* scales1,
+                                    const std::int8_t* xqa, const float* xsa,
+                                    const std::int8_t* xqb, const float* xsb, int k,
+                                    float& out0a, float& out1a, float& out0b, float& out1b) {
+    const int groups = k / kGroup;
+    __m512 acc0a = _mm512_setzero_ps(), acc1a = _mm512_setzero_ps();
+    __m512 acc0b = _mm512_setzero_ps(), acc1b = _mm512_setzero_ps();
+    int g = 0;
+    for (; g + 16 <= groups; g += 16) {
+        const __m512 ws0 = _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(scales0 + g)));
+        const __m512 ws1 = _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(scales1 + g)));
+        const __m512 xsav = _mm512_loadu_ps(xsa + g);
+        const __m512 xsbv = _mm512_loadu_ps(xsb + g);
+        alignas(64) float s0a[16], s1a[16], s0b[16], s1b[16];
+        _mm512_store_ps(s0a, _mm512_mul_ps(ws0, xsav));
+        _mm512_store_ps(s1a, _mm512_mul_ps(ws1, xsav));
+        _mm512_store_ps(s0b, _mm512_mul_ps(ws0, xsbv));
+        _mm512_store_ps(s1b, _mm512_mul_ps(ws1, xsbv));
+        for (int i = 0; i < 16; ++i) {
+            const int gg     = g + i;
+            const __m512i w0 = _mm512_cvtepi8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(codes0 + gg * kGroup)));
+            const __m512i w1 = _mm512_cvtepi8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(codes1 + gg * kGroup)));
+            const __m512i xa = _mm512_cvtepi8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(xqa + gg * kGroup)));
+            const __m512i xb = _mm512_cvtepi8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(xqb + gg * kGroup)));
+            acc0a = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_madd_epi16(w0, xa)), _mm512_set1_ps(s0a[i]), acc0a);
+            acc1a = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_madd_epi16(w1, xa)), _mm512_set1_ps(s1a[i]), acc1a);
+            acc0b = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_madd_epi16(w0, xb)), _mm512_set1_ps(s0b[i]), acc0b);
+            acc1b = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_madd_epi16(w1, xb)), _mm512_set1_ps(s1b[i]), acc1b);
+        }
+    }
+    for (; g < groups; ++g) {
+        const __m512i w0 = _mm512_cvtepi8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(codes0 + g * kGroup)));
+        const __m512i w1 = _mm512_cvtepi8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(codes1 + g * kGroup)));
+        const __m512i xa = _mm512_cvtepi8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(xqa + g * kGroup)));
+        const __m512i xb = _mm512_cvtepi8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(xqb + g * kGroup)));
+        const float w0s = fp16_to_float(scales0[g]), w1s = fp16_to_float(scales1[g]);
+        acc0a = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_madd_epi16(w0, xa)), _mm512_set1_ps(w0s * xsa[g]), acc0a);
+        acc1a = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_madd_epi16(w1, xa)), _mm512_set1_ps(w1s * xsa[g]), acc1a);
+        acc0b = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_madd_epi16(w0, xb)), _mm512_set1_ps(w0s * xsb[g]), acc0b);
+        acc1b = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_madd_epi16(w1, xb)), _mm512_set1_ps(w1s * xsb[g]), acc1b);
+    }
+    out0a = _mm512_reduce_add_ps(acc0a);
+    out1a = _mm512_reduce_add_ps(acc1a);
+    out0b = _mm512_reduce_add_ps(acc0b);
+    out1b = _mm512_reduce_add_ps(acc1b);
+}
+
 __attribute__((target("avx512f,avx512bw,avx512vl,avx512dq,f16c,fma")))
 float dot_row_avx512(const std::int8_t* codes, const std::uint16_t* scales, const std::int8_t* xq,
                      const float* xs, int k) {
@@ -166,6 +218,9 @@ float dot_row_avx512(const std::int8_t*, const std::uint16_t*, const std::int8_t
 }
 void dot_two_rows_avx512(const std::int8_t*, const std::uint16_t*, const std::int8_t*, const std::uint16_t*,
                          const std::int8_t*, const float*, int, float&, float&) {}
+void dot_two_rows_two_tokens_avx512(const std::int8_t*, const std::uint16_t*, const std::int8_t*,
+                                    const std::uint16_t*, const std::int8_t*, const float*, const std::int8_t*,
+                                    const float*, int, float&, float&, float&, float&) {}
 #endif
 
 const bool kUseAvx512 = kAvx512Compiled && detect_avx512();
@@ -182,6 +237,22 @@ inline void dot_two_rows(const std::int8_t* codes0, const std::uint16_t* scales0
     } else {
         out0 = dot_row_scalar(codes0, scales0, xq, xs, k);
         out1 = dot_row_scalar(codes1, scales1, xq, xs, k);
+    }
+}
+
+inline void dot_two_rows_two_tokens(const std::int8_t* codes0, const std::uint16_t* scales0,
+                                    const std::int8_t* codes1, const std::uint16_t* scales1,
+                                    const std::int8_t* xqa, const float* xsa, const std::int8_t* xqb,
+                                    const float* xsb, int k, float& out0a, float& out1a, float& out0b,
+                                    float& out1b) {
+    if (kUseAvx512) {
+        dot_two_rows_two_tokens_avx512(codes0, scales0, codes1, scales1, xqa, xsa, xqb, xsb, k, out0a, out1a,
+                                       out0b, out1b);
+    } else {
+        out0a = dot_row_scalar(codes0, scales0, xqa, xsa, k);
+        out1a = dot_row_scalar(codes1, scales1, xqa, xsa, k);
+        out0b = dot_row_scalar(codes0, scales0, xqb, xsb, k);
+        out1b = dot_row_scalar(codes1, scales1, xqb, xsb, k);
     }
 }
 
@@ -277,16 +348,20 @@ void cpu_expert_compute_job(const SparseMoeGeometry& geometry, const CpuExpertBa
 }
 
 // ---------------------------------------------------------------------------------------------
-// Pool: a round runs in three phases over row-chunked work items so a handful of jobs still
+// Pool: a round runs in four phases over row-chunked work items so a handful of jobs still
 // occupies every core — (0) quantise each token's activation once, (1) gate/up row chunks of
-// every job into the job's intermediate, (2) quantise that intermediate and run the down row
-// chunks, accumulating into the token column (one chunk owns a disjoint row range, so no
-// locks). Workers spin briefly before sleeping, which keeps the wake-up latency in the
+// every expert group (the jobs of one expert, so a weight row read from DRAM serves every
+// token routed to it: two rows × two tokens per inner call), (2) quantise each job's
+// intermediate, (3) the down row chunks per expert group, accumulating into the token columns
+// with atomic adds. Decode rounds (one token per expert) degenerate to the row-chunked GEMV;
+// prefill rounds (~10 tokens per expert on a 512-token prompt) run compute-bound instead of
+// DRAM-bound. Workers spin briefly before sleeping, which keeps the wake-up latency in the
 // microseconds for decode-sized rounds.
 // ---------------------------------------------------------------------------------------------
 
 namespace {
 
+constexpr int kPhases      = 4;
 constexpr int kPhaseAChunks = 8;  // gate/up: intermediate split into 8 row ranges
 constexpr int kPhaseBChunks = 8;  // down: hidden split into 8 row ranges
 
@@ -322,12 +397,41 @@ struct CpuExpertPool::Impl {
     std::vector<std::int8_t> hq;   // [jobs][intermediate]
     std::vector<float> hs;         // [jobs][intermediate/32]
     std::vector<float> x_float;    // [threads][hidden] scratch for phase 0
+    // Jobs grouped by expert: `order` lists job indices expert by expert, group g spans
+    // order[group_start[g] .. group_start[g+1]).
+    std::vector<std::int32_t> order;
+    std::vector<std::int32_t> group_start;
+    std::vector<std::int32_t> expert_count; // [experts] scratch for the counting sort
+    std::int64_t groups = 0;
+
+    void group_jobs() {
+        const auto jobs = static_cast<std::int32_t>(round->jobs.size());
+        expert_count.assign(static_cast<std::size_t>(geometry.experts), 0);
+        for (const CpuExpertJob& job : round->jobs) { ++expert_count[static_cast<std::size_t>(job.expert)]; }
+        order.resize(static_cast<std::size_t>(jobs));
+        group_start.clear();
+        std::int32_t running = 0;
+        for (int e = 0; e < geometry.experts; ++e) {
+            const std::int32_t n = expert_count[static_cast<std::size_t>(e)];
+            if (n == 0) { continue; }
+            group_start.push_back(running);
+            expert_count[static_cast<std::size_t>(e)] = running; // becomes the scatter cursor
+            running += n;
+        }
+        group_start.push_back(running);
+        groups = static_cast<std::int64_t>(group_start.size()) - 1;
+        for (std::int32_t j = 0; j < jobs; ++j) {
+            const int e = round->jobs[static_cast<std::size_t>(j)].expert;
+            order[static_cast<std::size_t>(expert_count[static_cast<std::size_t>(e)]++)] = j;
+        }
+    }
 
     std::int64_t items_for_phase(int ph) const {
         const auto jobs = static_cast<std::int64_t>(round->jobs.size());
         if (ph == 0) { return round->tokens; }
-        if (ph == 1) { return jobs * kPhaseAChunks; }
-        return jobs * kPhaseBChunks;
+        if (ph == 1) { return groups * kPhaseAChunks; }
+        if (ph == 2) { return jobs; }
+        return groups * kPhaseBChunks;
     }
 
     void do_item(int ph, std::int64_t item, std::uint32_t worker) {
@@ -344,62 +448,107 @@ struct CpuExpertPool::Impl {
             return;
         }
         if (ph == 1) {
-            const auto job_index = static_cast<std::size_t>(item / kPhaseAChunks);
-            const int chunk      = static_cast<int>(item % kPhaseAChunks);
-            const CpuExpertJob& job = round->jobs[job_index];
-            const int per_chunk     = intermediate / kPhaseAChunks;
+            const auto group = static_cast<std::size_t>(item / kPhaseAChunks);
+            const int chunk  = static_cast<int>(item % kPhaseAChunks);
+            const std::int32_t g0 = group_start[group], g1 = group_start[group + 1];
+            const int expert      = round->jobs[static_cast<std::size_t>(order[static_cast<std::size_t>(g0)])].expert;
+            const int per_chunk   = intermediate / kPhaseAChunks;
             const int j0 = chunk * per_chunk;
             const int j1 = chunk == kPhaseAChunks - 1 ? intermediate : j0 + per_chunk;
             const std::size_t gate_rows = static_cast<std::size_t>(2) * intermediate;
             const auto* gate_codes = reinterpret_cast<const std::int8_t*>(bank->gate_up_codes) +
-                                     static_cast<std::size_t>(job.expert) * gate_rows * hidden;
+                                     static_cast<std::size_t>(expert) * gate_rows * hidden;
             const auto* gate_scales = reinterpret_cast<const std::uint16_t*>(bank->gate_up_scales) +
-                                      static_cast<std::size_t>(job.expert) * gate_rows * groups_h;
-            const std::int8_t* txq = xq.data() + static_cast<std::size_t>(job.token) * hidden;
-            const float* txs       = xs.data() + static_cast<std::size_t>(job.token) * groups_h;
-            float* hj              = h.data() + job_index * intermediate;
+                                      static_cast<std::size_t>(expert) * gate_rows * groups_h;
             for (int j = j0; j < j1; ++j) {
-                float g = 0.0F, u = 0.0F;
-                dot_two_rows(gate_codes + static_cast<std::size_t>(j) * hidden, gate_scales + static_cast<std::size_t>(j) * groups_h,
-                             gate_codes + static_cast<std::size_t>(intermediate + j) * hidden,
-                             gate_scales + static_cast<std::size_t>(intermediate + j) * groups_h, txq, txs, hidden, g, u);
-                hj[j] = silu(g) * u;
+                const std::int8_t* gc = gate_codes + static_cast<std::size_t>(j) * hidden;
+                const std::uint16_t* gs = gate_scales + static_cast<std::size_t>(j) * groups_h;
+                const std::int8_t* uc = gate_codes + static_cast<std::size_t>(intermediate + j) * hidden;
+                const std::uint16_t* us = gate_scales + static_cast<std::size_t>(intermediate + j) * groups_h;
+                std::int32_t i = g0;
+                for (; i + 1 < g1; i += 2) {
+                    const CpuExpertJob& ja = round->jobs[static_cast<std::size_t>(order[static_cast<std::size_t>(i)])];
+                    const CpuExpertJob& jb = round->jobs[static_cast<std::size_t>(order[static_cast<std::size_t>(i + 1)])];
+                    float ga = 0.0F, ua = 0.0F, gb = 0.0F, ub = 0.0F;
+                    dot_two_rows_two_tokens(gc, gs, uc, us, xq.data() + static_cast<std::size_t>(ja.token) * hidden,
+                                            xs.data() + static_cast<std::size_t>(ja.token) * groups_h,
+                                            xq.data() + static_cast<std::size_t>(jb.token) * hidden,
+                                            xs.data() + static_cast<std::size_t>(jb.token) * groups_h, hidden, ga, ua, gb, ub);
+                    h[static_cast<std::size_t>(order[static_cast<std::size_t>(i)]) * intermediate + j]     = silu(ga) * ua;
+                    h[static_cast<std::size_t>(order[static_cast<std::size_t>(i + 1)]) * intermediate + j] = silu(gb) * ub;
+                }
+                if (i < g1) {
+                    const CpuExpertJob& ja = round->jobs[static_cast<std::size_t>(order[static_cast<std::size_t>(i)])];
+                    float ga = 0.0F, ua = 0.0F;
+                    dot_two_rows(gc, gs, uc, us, xq.data() + static_cast<std::size_t>(ja.token) * hidden,
+                                 xs.data() + static_cast<std::size_t>(ja.token) * groups_h, hidden, ga, ua);
+                    h[static_cast<std::size_t>(order[static_cast<std::size_t>(i)]) * intermediate + j] = silu(ga) * ua;
+                }
             }
             return;
         }
-        // phase 2: chunk 0 of every job quantises the intermediate first? No — quantisation must
-        // precede all chunks, so it is done by each chunk redundantly on its own copy only when
-        // cheap; here every chunk quantises the whole intermediate into thread-local scratch
-        // (intermediate is small: 640 values), which keeps the phases at two barriers.
-        const auto job_index = static_cast<std::size_t>(item / kPhaseBChunks);
-        const int chunk      = static_cast<int>(item % kPhaseBChunks);
-        const CpuExpertJob& job = round->jobs[job_index];
-        std::int8_t* thq = hq.data() + static_cast<std::size_t>(worker) * intermediate;
-        float* ths       = hs.data() + static_cast<std::size_t>(worker) * groups_i;
-        quantise_groups(h.data() + job_index * intermediate, intermediate, thq, ths);
-        const int per_chunk = hidden / kPhaseBChunks;
+        if (ph == 2) {
+            const auto job_index = static_cast<std::size_t>(item);
+            quantise_groups(h.data() + job_index * intermediate, intermediate, hq.data() + job_index * intermediate,
+                            hs.data() + job_index * groups_i);
+            return;
+        }
+        // phase 3: down rows of one expert group against every job of the group.
+        const auto group = static_cast<std::size_t>(item / kPhaseBChunks);
+        const int chunk  = static_cast<int>(item % kPhaseBChunks);
+        const std::int32_t g0 = group_start[group], g1 = group_start[group + 1];
+        const int expert      = round->jobs[static_cast<std::size_t>(order[static_cast<std::size_t>(g0)])].expert;
+        const int per_chunk   = hidden / kPhaseBChunks;
         const int r0 = chunk * per_chunk;
         const int r1 = chunk == kPhaseBChunks - 1 ? hidden : r0 + per_chunk;
         const auto* down_codes = reinterpret_cast<const std::int8_t*>(bank->down_codes) +
-                                 static_cast<std::size_t>(job.expert) * hidden * intermediate;
+                                 static_cast<std::size_t>(expert) * hidden * intermediate;
         const auto* down_scales = reinterpret_cast<const std::uint16_t*>(bank->down_scales) +
-                                  static_cast<std::size_t>(job.expert) * hidden * groups_i;
-        float* out = round->out + static_cast<std::size_t>(job.token) * hidden;
-        // Several jobs of the same token write disjoint row ranges only within a job; across
-        // jobs the same rows are shared, so accumulate with atomic adds (cheap at this width).
+                                  static_cast<std::size_t>(expert) * hidden * groups_i;
+        // Jobs of different experts share output rows, so accumulate with atomic adds (cheap at
+        // this width).
         int r = r0;
         for (; r + 1 < r1; r += 2) {
-            float y0 = 0.0F, y1 = 0.0F;
-            dot_two_rows(down_codes + static_cast<std::size_t>(r) * intermediate, down_scales + static_cast<std::size_t>(r) * groups_i,
-                         down_codes + static_cast<std::size_t>(r + 1) * intermediate,
-                         down_scales + static_cast<std::size_t>(r + 1) * groups_i, thq, ths, intermediate, y0, y1);
-            atomic_add(out + r, job.weight * y0);
-            atomic_add(out + r + 1, job.weight * y1);
+            const std::int8_t* c0 = down_codes + static_cast<std::size_t>(r) * intermediate;
+            const std::uint16_t* s0 = down_scales + static_cast<std::size_t>(r) * groups_i;
+            const std::int8_t* c1 = down_codes + static_cast<std::size_t>(r + 1) * intermediate;
+            const std::uint16_t* s1 = down_scales + static_cast<std::size_t>(r + 1) * groups_i;
+            std::int32_t i = g0;
+            for (; i + 1 < g1; i += 2) {
+                const auto ia = static_cast<std::size_t>(order[static_cast<std::size_t>(i)]);
+                const auto ib = static_cast<std::size_t>(order[static_cast<std::size_t>(i + 1)]);
+                const CpuExpertJob& ja = round->jobs[ia];
+                const CpuExpertJob& jb = round->jobs[ib];
+                float y0a = 0.0F, y1a = 0.0F, y0b = 0.0F, y1b = 0.0F;
+                dot_two_rows_two_tokens(c0, s0, c1, s1, hq.data() + ia * intermediate, hs.data() + ia * groups_i,
+                                        hq.data() + ib * intermediate, hs.data() + ib * groups_i, intermediate, y0a, y1a,
+                                        y0b, y1b);
+                float* outa = round->out + static_cast<std::size_t>(ja.token) * hidden;
+                float* outb = round->out + static_cast<std::size_t>(jb.token) * hidden;
+                atomic_add(outa + r, ja.weight * y0a);
+                atomic_add(outa + r + 1, ja.weight * y1a);
+                atomic_add(outb + r, jb.weight * y0b);
+                atomic_add(outb + r + 1, jb.weight * y1b);
+            }
+            if (i < g1) {
+                const auto ia = static_cast<std::size_t>(order[static_cast<std::size_t>(i)]);
+                const CpuExpertJob& ja = round->jobs[ia];
+                float y0 = 0.0F, y1 = 0.0F;
+                dot_two_rows(c0, s0, c1, s1, hq.data() + ia * intermediate, hs.data() + ia * groups_i, intermediate, y0, y1);
+                float* out = round->out + static_cast<std::size_t>(ja.token) * hidden;
+                atomic_add(out + r, ja.weight * y0);
+                atomic_add(out + r + 1, ja.weight * y1);
+            }
         }
         if (r < r1) {
-            atomic_add(out + r, job.weight * dot_row(down_codes + static_cast<std::size_t>(r) * intermediate,
-                                                     down_scales + static_cast<std::size_t>(r) * groups_i, thq, ths,
-                                                     intermediate));
+            for (std::int32_t i = g0; i < g1; ++i) {
+                const auto ia = static_cast<std::size_t>(order[static_cast<std::size_t>(i)]);
+                const CpuExpertJob& ja = round->jobs[ia];
+                atomic_add(round->out + static_cast<std::size_t>(ja.token) * hidden + r,
+                           ja.weight * dot_row(down_codes + static_cast<std::size_t>(r) * intermediate,
+                                               down_scales + static_cast<std::size_t>(r) * groups_i,
+                                               hq.data() + ia * intermediate, hs.data() + ia * groups_i, intermediate));
+            }
         }
     }
 
@@ -452,7 +601,7 @@ struct CpuExpertPool::Impl {
             }
             if (stop) { return; }
             seen = gen;
-            for (int ph = 0; ph < 3; ++ph) {
+            for (int ph = 0; ph < kPhases; ++ph) {
                 // Wait for the phase to open (the coordinator advances `phase` after a barrier).
                 while (phase.load(std::memory_order_acquire) != ph + 1) { cpu_relax(); }
                 run_phase(ph, index);
@@ -478,8 +627,6 @@ CpuExpertPool::CpuExpertPool(const SparseMoeGeometry& geometry, Options options)
     }
     impl_->threads = threads;
     impl_->x_float.resize(static_cast<std::size_t>(threads) * geometry.hidden);
-    impl_->hq.resize(static_cast<std::size_t>(threads) * geometry.intermediate);
-    impl_->hs.resize(static_cast<std::size_t>(threads) * (geometry.intermediate / kGroup));
     for (std::uint32_t i = 0; i < threads; ++i) {
         impl_->workers.emplace_back([impl = impl_.get(), i, pin = options.pin_threads] { impl->worker_loop(i, pin); });
     }
@@ -514,8 +661,11 @@ void CpuExpertPool::run(const CpuExpertBank& bank, const CpuExpertRound& round) 
     impl.xq.resize(static_cast<std::size_t>(round.tokens) * impl.geometry.hidden);
     impl.xs.resize(static_cast<std::size_t>(round.tokens) * (impl.geometry.hidden / kGroup));
     impl.h.resize(jobs * impl.geometry.intermediate);
+    impl.hq.resize(jobs * impl.geometry.intermediate);
+    impl.hs.resize(jobs * (impl.geometry.intermediate / kGroup));
     impl.bank  = &bank;
     impl.round = &round;
+    impl.group_jobs();
     impl.finished.store(0, std::memory_order_relaxed);
     impl.phase.store(0, std::memory_order_release);
     // Publish the round under the mutex: a worker that has just failed its predicate check
@@ -525,7 +675,7 @@ void CpuExpertPool::run(const CpuExpertBank& bank, const CpuExpertRound& round) 
         impl.generation.fetch_add(1, std::memory_order_acq_rel);
     }
     impl.wake.notify_all();
-    for (int ph = 0; ph < 3; ++ph) {
+    for (int ph = 0; ph < kPhases; ++ph) {
         impl.next_item.store(0, std::memory_order_relaxed);
         impl.arrived.store(0, std::memory_order_relaxed);
         impl.phase.store(ph + 1, std::memory_order_release);
@@ -535,7 +685,7 @@ void CpuExpertPool::run(const CpuExpertBank& bank, const CpuExpertRound& round) 
             if ((++spins & 0xFFFFU) == 0U) { impl.wake.notify_all(); } // belt and braces for sleepers
         }
     }
-    impl.phase.store(4, std::memory_order_release); // release the last barrier
+    impl.phase.store(kPhases + 1, std::memory_order_release); // release the last barrier
     std::unique_lock<std::mutex> lock(impl.mutex);
     impl.done.wait(lock, [&] { return impl.finished.load(std::memory_order_acquire) == impl.threads; });
     impl.phase.store(0, std::memory_order_release);
