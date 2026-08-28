@@ -206,6 +206,11 @@ and the baseline run is queued.
   configuration is being rerun with the current binary on GPU 2 (expect ~1,760 unbatched);
   the stage-A 32-user datapoint still lands as a sanity check. Lesson recorded: compare
   against the board only with the board's script.
+- **Resolved:** the board configuration (`probe_35b_full.sh`, 100 users, 128 seqs, 4,096
+  batched tokens) with the current binary gives decode **1,770 tok/s**, prefill 7,082, TTFT
+  129 ms, 866/866 ok (board: 1,762 / —) — the 35B rows are intact after all of today's family
+  and kernel changes. The 32-user datapoints (~1,130 at every commit) are simply the 32-user
+  throughput. Bisect worktrees removed.
 - **CPU split v1, first run (2026-08-28):** the CLI failed with `view element count mismatch`
   — in the decode loop the hook receives one token's ids but not which column of the block's
   output it is, so the Variant's thread-local output view had the wrong shape. Fix: the hook
