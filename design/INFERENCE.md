@@ -679,3 +679,11 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   fixed cost once most experts are touched: ~120 t/s ceiling at 512 columns, ~975 at 4096).
   None of the references report multi-user throughput; 33.5 aggregate at 16 users has no
   comparable there. Long context (their 80k-250k) is untested here (probes run at 2048).
+- Share sweep at 16 users (2026-08-28, no interleave): 0.7 → 32.9 / 132, 0.8 → 33.9 / 143,
+  0.9 → 33.0 / 152 (decode / prefill tok/s). Flat from 0.7 up: the split is saturated — with
+  most misses on the host the round is bounded by the host round's own latency (the GPU side
+  finishes first and waits at the join), and pushing the last misses off PCIe buys nothing.
+  Consequence for the auto share: the optimum is a plateau, so the bandwidth-matched estimate
+  (host 209 GB/s vs PCIe ~50 → 0.8) lands on it; no need for a finer policy. The next step
+  up at 16 users is the round cost itself (host round latency: fewer, wider jobs per thread,
+  prefetch of the next layer's jobs — or the Q4 host bank that halves the bytes).

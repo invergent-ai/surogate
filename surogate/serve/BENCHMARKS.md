@@ -650,6 +650,7 @@ yet. llama.cpp upstream master (added `qwen4exp` this week; CUDA build at
 | | 16 | **32.9** | 132 | 16.3 s |
 | (share 0.5, `numactl --interleave=all`) | 16 | 21.7 | 93 | 16.9 s |
 | (share 0.7, `numactl --interleave=all`) | 16 | **33.5** | 138 | 12.3 s |
+| (share 0.8 / 0.9, no interleave) | 16 | 33.9 / 33.0 | 143 / 152 | 12.1 / 12.3 s |
 
 
 External single-user references reported by others on this model with llama.cpp
