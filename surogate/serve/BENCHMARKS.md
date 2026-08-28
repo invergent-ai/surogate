@@ -81,7 +81,7 @@ pair on the same card in the same batch.** Cross-batch comparisons of a lone
 figure — which is how the morning's 4B row was read — can be off by a third
 for reasons that have nothing to do with the code.
 
-## Board of record (2026-08-27, end of day)
+## Board of record (2026-08-28)
 
 Every engine on its own card, all running at once, 100 users, 90 s,
 512-token prompts, 128 output tokens, fp8 KV. The 27B row is the mean of two
@@ -91,13 +91,13 @@ passes with the cards rotated between them.
 |---|---|---:|---:|---:|---:|---:|
 | Qwen3.5-0.8B | from GGUF Q4_K_M | **10,095** | 6,694 | **+51 %** | **45 ms** | 658 ms |
 | Qwen3.5-4B | NVFP4 3.56 GiB | **4,942** | 4,246 | **+16 %** | **45 ms** | 239 ms |
-| Qwen3.8-27B | NVFP4 mixed | 980 | **1,039** | **−6 %** | **1.9 s** | 8.3 s |
+| Qwen3.8-27B | NVFP4 all, 128 lanes | **1,330** | 1,039 | **+28 %** | **170 ms** | 8.26 s |
 | Qwen3.6-35B-A3B | Q4/Q5/Q6 MoE | 1,784 | **2,257** | **−21 %** | **129 ms** | 1.26 s |
 
-Two of four beaten on throughput, all four on TTFT by 4–15x. The 27B's
-remaining 6 % is per-token compute, not scheduling — see the round-cost
-section below, which rules out batching, lanes, speculation and the chunk
-ladder by measurement.
+Three of four beaten on throughput, all four on TTFT by 9–48x. The 27B row is
+the all-NVFP4 artifact (#87): the round-cost section below rules out batching,
+lanes, speculation and the chunk ladder by measurement, and the weight format
+is what moved it. The 35B's remaining gap is that same lever, untaken.
 
 ## Verdict — paired, after the lane cap and multi-prompt rounds (2026-08-27 late)
 
@@ -388,6 +388,53 @@ prompt tok/s. Lanes on the 27B: 64 beats 48 on every shape now
 (2,048 tokens): engine 264 ms eager / 257 ms graph (GPU5) against vLLM
 213 ms (GPU3), so the single-stream gap is ~1.3× and the rest of the 2×
 lives in the 100-user mixed-round regime.
+
+## 27B on all-NVFP4 weights (2026-08-28, PATCHES.md #87)
+
+The round-cost section below ruled out batching, lanes, speculation and the
+chunk ladder by measurement, and ended on "what is left is the 114 us column".
+It was the weight format, exactly as at the 4B.
+
+Our 27B artifact kept the attention and GDN projections FP8-row only because
+`unsloth/Qwen3.8-27B-NVFP4` exports them that way, and Nsight put those FP8
+GEMMs at 52 % of a prefill chunk running at 651-750 TFLOP/s where the NVFP4
+ones reach 827. **The checkpoint vLLM is served from in every paired row on
+this board — `sakamakismile/Qwen3.8-27B-MTP-NVFP4` — quantises every language
+linear**, ignore list the vision tower alone. Same 64 layers, same 5120 hidden,
+same 48 value heads, and it carries the bf16 embedding, lm_head, MTP block and
+vision tower too, so one checkpoint supplies the whole artifact.
+
+One thing had to be solved first. The GDN input projection fuses `in_proj_qkv`
+and `in_proj_z` into a 16384-row object and an NVFP4 object carries **one**
+weight divisor, but this export gives the two sources different weight global
+scales (layer 0: 6176 against 11264; layer 1: 8064 against 10112). Restating
+one half onto the other's divisor measured **~2 % mean relative error with
+93 % of its values moving** — a second quantisation of every GDN gate weight,
+which is not a trade to make for throughput. So the halves stay apart and the
+projection runs as two GEMMs, which is what the cuBLASLt route does with the
+fused weight anyway. Attention (q|k|v) and MLP (gate|up) share their scales and
+fuse cleanly.
+
+Weights 18.98 -> 15.16 GiB. KV then holds 1,471 pages instead of 931 and 99
+sequences run instead of 84. Two passes, cards rotated, everything at once,
+100 users, 512/128, 90 s:
+
+| | pass 1 | pass 2 | mean | prefill tok/s | TTFT p50 |
+|---|---:|---:|---:|---:|---:|
+| **all-NVFP4, 128 lanes** | 1,357 | 1,302 | **1,330** | **5,319** | **170 ms** |
+| all-NVFP4, 96 lanes | 1,317 | 1,350 | 1,334 | 5,333 | 416 ms |
+| mixed NVFP4/FP8 (before) | 966 | 985 | 976 | 3,901 | 1,916 ms |
+| vLLM | 1,034 | 1,044 | 1,039 | 4,156 | 8,260 ms |
+
+**+37 % over our own mixed artifact and +28 % over vLLM, at 48x its TTFT.**
+128 lanes is the configuration: decode ties 96 lanes and TTFT is 2.4x better.
+Every object decodes bit-exact against the checkpoint, and the served model
+answers as it did before.
+
+The lesson is now the same at two scales: **on this hardware the weight format
+is worth more than every scheduling lever put together.** The 4B gained 54 %
+from it, the 27B 37 %, and in both cases the levers the round-cost model
+ranked above it moved nothing.
 
 ## What a 27B round costs, and what that rules out (2026-08-27 late)
 

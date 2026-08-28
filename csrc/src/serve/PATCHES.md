@@ -3014,3 +3014,58 @@ Also measured and reverted: rounding the prefill chunk ladder to 64 instead
 of 128. A 552-token prompt runs a 640-column graph, and those 88 pad columns
 are 7.5 % of the second at 114 us each — but the finer ladder measured
 +2.8 % once and −1.2 % with the cards rotated, and cost the 4B 3.6 %.
+
+## 87
+
+**The 27B lost on weight format, and the fix needed the GDN pair unfused (2026-08-28).**
+
+**Symptom.** The 27B was the one model behind vLLM (976 against 1,039), and
+every scheduling lever had been measured and rejected: prompt batching is
+algebraically a no-op under the round-cost model, lane sweeps 72-104 moved
+nothing, MTP speculation costs more lanes than it earns, a finer chunk ladder
+was noise. What remained was the 114 us column — and Nsight had already said
+where it goes: the in-house FP8 GEMMs are 52 % of a prefill chunk at 651-750
+TFLOP/s where the NVFP4 ones reach 827.
+
+**Root cause.** Our artifact kept the attention and GDN projections FP8-row
+only because `unsloth/Qwen3.8-27B-NVFP4` exports them that way.
+`sakamakismile/Qwen3.8-27B-MTP-NVFP4` — the checkpoint vLLM itself is served
+from on this board — quantises every language linear, ignore list the vision
+tower alone, and carries the bf16 embedding, lm_head, MTP block and vision
+tower besides. One checkpoint, whole artifact.
+
+**The obstacle, and why it was not worked around.** The GDN input projection
+fuses `in_proj_qkv` and `in_proj_z` into a 16384-row object, and an NVFP4
+object carries one weight divisor. This export gives the two sources different
+weight global scales (layer 0: 6176 against 11264). Restating one half onto the
+other's divisor measures ~2 % mean relative error with 93 % of its values
+moving — a second quantisation of every GDN gate weight. That is a quality
+trade, so the halves stay apart instead:
+
+  - `gdn_input_proj_split` and its `_conv_snapshot_split` / `_conv_record_split`
+    twins run the projection as two GEMMs. The cuBLASLt route already issues
+    two row-sliced GEMMs for the fused weight, so nothing is lost; snapshot
+    projects into the shared plane, record into the caller's, and both take the
+    existing projected convolution.
+  - `SplitQkvZGdnInputProjectionPayload` carries the pair — a third
+    arrangement, distinct from the Q4/Q5 `qk|value_z` split.
+  - `is_nvfp4_generic_problem` admits k=5120 for the halves. **It now excludes
+    registered shapes explicitly**, and that guard is the point: without it,
+    admitting 5120 would have pulled the 27B's own 34816x5120 MLP off its
+    in-house small-T ladder onto cuBLASLt at every token count, which is slower
+    below the route's threshold.
+  - the converter's `--resources-from` borrows the frontend resources from an
+    existing artifact: this export is the MTP+vision variant and its
+    `tokenizer_config.json` does not satisfy the target's Qwen3.6
+    prefix-semantics check, while its weights are the same model.
+
+**Result.** Weights 18.98 -> 15.16 GiB, so KV holds 1,471 pages instead of 931
+and 99 sequences run instead of 84. Two passes, cards rotated: **1,330 tok/s
+against vLLM's 1,039 (+28 %), and +37 % over our own mixed artifact**, at
+170 ms TTFT against 8.26 s. Every object decodes bit-exact against the
+checkpoint. 128 lanes is the configuration — decode ties 96 lanes, TTFT is
+2.4x better.
+
+The lesson at two scales now: on this hardware the weight format is worth more
+than every scheduling lever put together. The 4B gained 54 % from it (#83), the
+27B 37 %, and in both cases the levers ranked above it moved nothing.
