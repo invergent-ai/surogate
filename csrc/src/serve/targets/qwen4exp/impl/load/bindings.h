@@ -123,6 +123,10 @@ struct SparseMoePayload {
     ops::SparseMoeWeights op;
     ops::HyperConnectionWeights mix;
     std::int32_t layer = -1; // text layer index (the expert slot cache keys its tables by it)
+    // Host virtual addresses of the routed expert objects (the Weights above hold the
+    // device-mapped aliases); the CPU expert compute reads the planes through these.
+    const std::byte* host_gate_up = nullptr;
+    const std::byte* host_down    = nullptr;
 };
 
 struct PleWeights {

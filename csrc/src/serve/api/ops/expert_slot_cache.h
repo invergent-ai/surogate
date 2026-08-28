@@ -57,6 +57,7 @@ struct ExpertSlotDirectory {
     Tensor round;           // I32-typed unsigned [1]: current round stamp, bumped by resolve
     Tensor hand;            // I32 [1]: clock hand of the victim search
     Tensor seen;            // I32-typed unsigned [experts]: per-round dedupe stamps
+    Tensor cpu_round;       // I32-typed unsigned [experts]: stamp of the round that sent the expert to the CPU
     std::int32_t layers  = 0;
     std::int32_t experts = 0;
 };
@@ -98,12 +99,33 @@ void expert_slot_directory_reset(ExpertSlotDirectory& directory, cudaStream_t st
                                               const Weight& routed_gate_up,
                                               const Weight& routed_down);
 
+/// Jobs for the host: the (token, expert, router weight) paths of a round whose expert the
+/// split sent to the CPU instead of the pool; `count` is a device word.
+struct ExpertCpuJobList {
+    Tensor tokens;   // I32 [capacity]
+    Tensor experts;  // I32 [capacity]
+    Tensor weights;  // FP32 [capacity]
+    Tensor count;    // I64 [1]
+    std::int32_t capacity = 0;
+};
+[[nodiscard]] std::size_t expert_cpu_job_list_bytes(std::int32_t capacity);
+[[nodiscard]] ExpertCpuJobList create_expert_cpu_job_list(std::int32_t capacity, void* device_bytes);
+
 /// Resolves the routing of one layer for one round: for every expert id in `ids` (I32
 /// [experts_per_token, tokens]) touch its slot or assign the least recently used slot that is
 /// not active in this round, appending misses to `misses`. Writes `slot_of_expert` for the
 /// layer and leaves `ids` untouched (the kernels look slots up through the table).
+///
+/// With a CPU split (`cpu_share_q16` > 0, `alpha` and `cpu_jobs` given) a `cpu_share_q16/65536`
+/// fraction of the *missing* experts is not fetched: their table entries stay -1 (the kernels
+/// contribute nothing for those paths) and every (token, path) that routes to them becomes a
+/// job in `cpu_jobs` with its router weight. Hits are never split.
 void expert_slot_resolve(const Tensor& ids, std::int32_t layer, ExpertSlotDirectory& directory,
                          ExpertMissList& misses, cudaStream_t stream);
+void expert_slot_resolve(const Tensor& ids, const Tensor& alpha, std::int32_t layer,
+                         ExpertSlotDirectory& directory, ExpertMissList& misses,
+                         ExpertCpuJobList* cpu_jobs, std::uint32_t cpu_share_q16,
+                         cudaStream_t stream);
 
 /// Copies the missing experts of `layer` from the host bank into their slots: one launch,
 /// four banks (gate_up codes/scales, down codes/scales), 16-byte units, row count read from
@@ -111,6 +133,10 @@ void expert_slot_resolve(const Tensor& ids, std::int32_t layer, ExpertSlotDirect
 /// the resident working set.
 void expert_slot_gather(const ExpertHostBank& bank, const ExpertMissList& misses,
                         ExpertSlotPool& pool, cudaStream_t stream);
+
+/// Adds a host-computed FP32 partial ([hidden, tokens], read through its device-mapped
+/// pointer) into a BF16 destination of the same shape.
+void expert_cpu_partial_add(const void* partial_device_ptr, Tensor& destination, cudaStream_t stream);
 
 /// The MoE kernels' view of this layer: the pool's weights plus the layer's slot table.
 [[nodiscard]] SparseMoeWeights expert_slot_weights(const ExpertSlotPool& pool,

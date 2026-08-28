@@ -4,6 +4,7 @@
 #include "api/ops/embedding.h"
 #include "api/ops/gdn_gating.h"
 #include "api/ops/expert_slot_cache.h"
+#include "api/ops/cpu_expert_compute.h"
 #include "api/ops/hyper_connection.h"
 #include "api/ops/linear.h"
 #include "api/ops/ngram_ple.h"
@@ -42,6 +43,9 @@ constexpr auto kPolicy           = ops::LinearPolicy::A16Only;
 // through a thread-local handle rather than a family-visible parameter.
 constexpr std::size_t kInjectScratchBytes = 1u << 20; // [4 streams, T] FP32 up to T = 65536
 thread_local Tensor t_inject;
+// The MoE input and output planes of the block being executed (for the CPU expert split).
+thread_local Tensor t_moe_input;
+thread_local Tensor t_moe_output;
 
 struct InjectScratch {
     void* data        = nullptr;
@@ -56,6 +60,8 @@ struct ExpertSlotCache {
         ExpertSlotCache* owner = nullptr;
         std::int32_t index     = -1;
         ops::ExpertHostBank bank;
+        ops::CpuExpertBank cpu_bank; // host addresses of the same planes
+        std::int32_t round_tokens = 0; // set before the host function of a round is enqueued
     };
     bool enabled = false;
     std::int32_t slots = 0;
@@ -77,15 +83,93 @@ struct ExpertSlotCache {
             entry.index = weights.layer;
             entry.bank  = ops::expert_host_bank(ops::kSparseMoeFlashNextGeometry,
                                                 weights.op.routed_gate_up, weights.op.routed_down);
+            if (weights.host_gate_up != nullptr && weights.host_down != nullptr) {
+                // Plane offsets are the same in the host and device views of the object.
+                const auto gate_scale_offset = static_cast<const std::byte*>(weights.op.routed_gate_up.scales) -
+                                               static_cast<const std::byte*>(weights.op.routed_gate_up.qdata);
+                const auto down_scale_offset = static_cast<const std::byte*>(weights.op.routed_down.scales) -
+                                               static_cast<const std::byte*>(weights.op.routed_down.qdata);
+                entry.cpu_bank.gate_up_codes  = weights.host_gate_up;
+                entry.cpu_bank.gate_up_scales = weights.host_gate_up + gate_scale_offset;
+                entry.cpu_bank.down_codes     = weights.host_down;
+                entry.cpu_bank.down_scales    = weights.host_down + down_scale_offset;
+            }
         }
         return entry;
     }
 
-    static void resolve_round(void* context, const Tensor& ids, cudaStream_t stream) {
+    // --- CPU expert split (SUROGATE_SERVE_CPU_MOE_SHARE=<fraction of misses>) ---
+    std::uint32_t cpu_share_q16 = 0;
+    std::int32_t cpu_max_tokens = 0;
+    std::unique_ptr<ops::CpuExpertPool> cpu_pool;
+    void* cpu_jobs_memory = nullptr;
+    ops::ExpertCpuJobList cpu_jobs;
+    // Pinned host staging: activations, jobs, count, and the FP32 partial the GPU adds back.
+    std::uint16_t* x_host   = nullptr;
+    float* out_host         = nullptr;
+    void* out_device_alias  = nullptr;
+    std::int32_t* jobs_tokens_host  = nullptr;
+    std::int32_t* jobs_experts_host = nullptr;
+    float* jobs_weights_host        = nullptr;
+    long long* jobs_count_host      = nullptr;
+    std::vector<ops::CpuExpertJob> job_scratch;
+
+    bool cpu_split_enabled() const { return cpu_share_q16 > 0 && cpu_pool != nullptr; }
+
+    static void run_cpu_round(void* context) {
+        auto* entry            = static_cast<Layer*>(context);
+        ExpertSlotCache& cache = *entry->owner;
+        const std::int32_t hidden = ops::kSparseMoeFlashNextGeometry.hidden;
+        const std::int32_t tokens = entry->round_tokens;
+        const long long count     = std::min<long long>(*cache.jobs_count_host, cache.cpu_jobs.capacity);
+        std::fill_n(cache.out_host, static_cast<std::size_t>(hidden) * tokens, 0.0F);
+        if (count <= 0) { return; }
+        cache.job_scratch.resize(static_cast<std::size_t>(count));
+        for (long long i = 0; i < count; ++i) {
+            cache.job_scratch[static_cast<std::size_t>(i)] = {cache.jobs_tokens_host[i], cache.jobs_experts_host[i],
+                                                              cache.jobs_weights_host[i]};
+        }
+        ops::CpuExpertRound round{cache.x_host, cache.out_host, tokens, cache.job_scratch};
+        cache.cpu_pool->run(entry->cpu_bank, round);
+    }
+
+    void cpu_round(Layer& entry, const Tensor& ids, cudaStream_t stream) {
+        const std::int32_t tokens = ids.ne[1] > 0 ? ids.ne[1] : 1;
+        const std::int32_t hidden = ops::kSparseMoeFlashNextGeometry.hidden;
+        entry.round_tokens        = tokens;
+        // Activations and the job list to the host, the host computes, the partial is added.
+        CUDA_CHECK(cudaMemcpyAsync(x_host, t_moe_input.data,
+                                   static_cast<std::size_t>(hidden) * tokens * sizeof(std::uint16_t),
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(jobs_tokens_host, cpu_jobs.tokens.data, cpu_jobs.tokens.bytes(),
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(jobs_experts_host, cpu_jobs.experts.data, cpu_jobs.experts.bytes(),
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(jobs_weights_host, cpu_jobs.weights.data, cpu_jobs.weights.bytes(),
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(jobs_count_host, cpu_jobs.count.data, sizeof(long long),
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaLaunchHostFunc(stream, &ExpertSlotCache::run_cpu_round, &entry));
+        Tensor destination = t_moe_output.view({hidden, tokens});
+        ops::expert_cpu_partial_add(out_device_alias, destination, stream);
+    }
+
+    static void resolve_round(void* context, const Tensor& ids, const Tensor& alpha,
+                              cudaStream_t stream) {
         auto* entry = static_cast<Layer*>(context);
         ExpertSlotCache& cache = *entry->owner;
-        ops::expert_slot_resolve(ids, entry->index, cache.directory, cache.misses, stream);
+        const std::int32_t tokens = ids.ne[1] > 0 ? ids.ne[1] : 1;
+        const bool split = cache.cpu_split_enabled() && tokens <= cache.cpu_max_tokens &&
+                           entry->cpu_bank.gate_up_codes != nullptr && t_moe_input.data != nullptr &&
+                           t_moe_output.data != nullptr;
+        if (split) {
+            ops::expert_slot_resolve(ids, alpha, entry->index, cache.directory, cache.misses,
+                                     &cache.cpu_jobs, cache.cpu_share_q16, stream);
+        } else {
+            ops::expert_slot_resolve(ids, entry->index, cache.directory, cache.misses, stream);
+        }
         ops::expert_slot_gather(entry->bank, cache.misses, cache.pool, stream);
+        if (split) { cache.cpu_round(*entry, ids, stream); }
         if (cache.stats_every > 0) { cache.record_stats(ids, stream); }
     }
 
@@ -164,6 +248,31 @@ ExpertSlotCache& expert_slot_cache_for_current_device() {
     cache.enabled = true;
     if (const char* stats = std::getenv("SUROGATE_SERVE_EXPERT_STATS"); stats != nullptr && *stats != '\0') {
         cache.stats_every = std::strtol(stats, nullptr, 10);
+    }
+    if (const char* share = std::getenv("SUROGATE_SERVE_CPU_MOE_SHARE"); share != nullptr && *share != '\0') {
+        const double fraction = std::strtod(share, nullptr);
+        if (fraction > 0.0) {
+            cache.cpu_share_q16 = static_cast<std::uint32_t>(std::min(1.0, fraction) * 65536.0);
+            cache.cpu_max_tokens = 64; // decode and small-T rounds; prefill keeps the full gather
+            const std::int32_t hidden   = geometry.hidden;
+            const std::int32_t capacity = cache.cpu_max_tokens * geometry.experts_per_token;
+            CUDA_CHECK(cudaMalloc(&cache.cpu_jobs_memory, ops::expert_cpu_job_list_bytes(capacity)));
+            cache.cpu_jobs = ops::create_expert_cpu_job_list(capacity, cache.cpu_jobs_memory);
+            CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&cache.x_host),
+                                     static_cast<std::size_t>(hidden) * cache.cpu_max_tokens * sizeof(std::uint16_t),
+                                     cudaHostAllocPortable));
+            CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&cache.out_host),
+                                     static_cast<std::size_t>(hidden) * cache.cpu_max_tokens * sizeof(float),
+                                     cudaHostAllocMapped | cudaHostAllocPortable));
+            CUDA_CHECK(cudaHostGetDevicePointer(&cache.out_device_alias, cache.out_host, 0));
+            CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&cache.jobs_tokens_host), capacity * sizeof(std::int32_t), cudaHostAllocPortable));
+            CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&cache.jobs_experts_host), capacity * sizeof(std::int32_t), cudaHostAllocPortable));
+            CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&cache.jobs_weights_host), capacity * sizeof(float), cudaHostAllocPortable));
+            CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&cache.jobs_count_host), sizeof(long long), cudaHostAllocPortable));
+            cache.cpu_pool = std::make_unique<ops::CpuExpertPool>(geometry);
+            std::fprintf(stderr, "qwen4exp: CPU expert split enabled: %.0f%% of misses on %u host threads\n",
+                         100.0 * fraction, cache.cpu_pool->threads());
+        }
     }
     std::fprintf(stderr, "qwen4exp: expert slot cache enabled: %d slots (%.1f GiB pool)\n",
                  cache.slots, static_cast<double>(pool_bytes) / (1024.0 * 1024.0 * 1024.0));
@@ -563,6 +672,8 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
         weights.op.routed_down.qtype, tokens, tokens));
     WorkspaceArena leaf(storage);
     ExpertSlotCache& cache = expert_slot_cache_for_current_device();
+    t_moe_input  = hidden;
+    t_moe_output = output;
     if (cache.enabled) {
         // Routed experts come from the device slot pool: the round hook resolves the routing
         // against the directory and gathers the misses from the host bank before the expert
@@ -573,6 +684,8 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
         ops::SparseMoeRoundHook hook{&ExpertSlotCache::resolve_round, &layer};
         ops::sparse_moe(hidden, pooled, ops::SparseMoeEpilogue::AddResidual, output, leaf, stream,
                         hook);
+        t_moe_input  = Tensor{};
+        t_moe_output = Tensor{};
     } else {
         ops::sparse_moe(hidden, weights.op, ops::SparseMoeEpilogue::AddResidual, output, leaf,
                         stream);

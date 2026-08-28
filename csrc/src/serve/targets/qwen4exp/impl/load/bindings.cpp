@@ -153,6 +153,8 @@ SparseMoePayload load_moe(const artifact::MaterializedArtifact& backing, const H
                                                        static_cast<std::int32_t>(kFfn));
     out.op.experts_per_token = TextConfig::experts_per_token;
     out.mix                  = std::move(mix);
+    out.host_gate_up = static_cast<const std::byte*>(bank.object(plan.routed_gate_up).host);
+    out.host_down    = static_cast<const std::byte*>(bank.object(plan.routed_down).host);
     return out;
 }
 

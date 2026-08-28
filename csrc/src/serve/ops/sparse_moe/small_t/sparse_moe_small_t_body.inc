@@ -338,7 +338,7 @@ void small_t_launch(const Tensor& x, const SparseMoeWeights& weights, Tensor& de
                           static_cast<float*>(workspace.shared_scale.data), stream);
     });
     if (hook != nullptr && hook->resolve != nullptr) {
-        hook->resolve(hook->context, workspace.token_ids, stream);
+        hook->resolve(hook->context, workspace.token_ids, workspace.token_alpha, stream);
     }
     launch_s3_tiled(x, weights, plan, workspace, stream);
     launch_s4_tiled(weights, destination, plan, workspace, stream);

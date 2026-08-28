@@ -1221,7 +1221,8 @@ void prefill_launch(const Tensor& x, const SparseMoeWeights& weights, Tensor& de
         CUDA_CHECK(cudaGetLastError());
         if (hook != nullptr && hook->resolve != nullptr) {
             const Tensor slice_ids(ids, DType::I32, {assignments});
-            hook->resolve(hook->context, slice_ids, stream);
+            const Tensor slice_alpha(alpha, DType::FP32, {assignments});
+            hook->resolve(hook->context, slice_ids, slice_alpha, stream);
         }
 
         // A serving mixed round carries one prompt's chunk plus the decode batch - about 735

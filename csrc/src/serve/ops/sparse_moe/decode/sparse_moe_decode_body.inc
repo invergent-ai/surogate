@@ -228,9 +228,11 @@ __global__ void sparse_moe_d3_nine_warp_kernel(
         const int expert   = ids[warp];
         const int block  = slot_of_expert != nullptr ? slot_of_expert[expert] : expert;
         const int row_base = block * (2 * kIntermediate);
-        dot_two_rows<RoutedCodec, kHidden>(routed_codes, routed_high, routed_scales, row_base + j,
-                                           row_base + kIntermediate + j, x_shared, 0, kHidden, gate,
-                                           up);
+        if (block >= 0) {
+            dot_two_rows<RoutedCodec, kHidden>(routed_codes, routed_high, routed_scales,
+                                               row_base + j, row_base + kIntermediate + j, x_shared,
+                                               0, kHidden, gate, up);
+        }
     } else {
         dot_two_rows<W8Codec, kHidden>(shared_codes, nullptr, shared_scales, j, kIntermediate + j,
                                        x_shared, 0, kHidden, gate, up);
@@ -289,9 +291,11 @@ __global__ void sparse_moe_d3_path_tiled_kernel(
             const int expert   = token_ids[token * kTopK + path];
             const int block  = slot_of_expert != nullptr ? slot_of_expert[expert] : expert;
             const int row_base = block * (2 * kIntermediate);
-            dot_two_rows<RoutedCodec, kHidden>(routed_codes, routed_high, routed_scales,
-                                               row_base + j, row_base + kIntermediate + j, x_shared,
-                                               0, kHidden, gate, up);
+            if (block >= 0) {
+                dot_two_rows<RoutedCodec, kHidden>(routed_codes, routed_high, routed_scales,
+                                                   row_base + j, row_base + kIntermediate + j,
+                                                   x_shared, 0, kHidden, gate, up);
+            }
         } else {
             dot_two_rows<W8Codec, kHidden>(shared_codes, nullptr, shared_scales, j,
                                            kIntermediate + j, x_shared, 0, kHidden, gate, up);
@@ -373,10 +377,14 @@ __global__ void sparse_moe_d4_nine_warp_kernel(
         const int expert = ids[warp];
         const int block  = slot_of_expert != nullptr ? slot_of_expert[expert] : expert;
         float dot[Rows];
-        dot_fp32_rows<RoutedCodec, Rows>(routed_codes, routed_high, routed_scales,
-                                         block * kHidden + row_base,
-                                         act + static_cast<std::int64_t>(warp) * kIntermediate, 0,
-                                         kIntermediate / RoutedCodec::kGroupK, dot);
+        if (block >= 0) {
+            dot_fp32_rows<RoutedCodec, Rows>(routed_codes, routed_high, routed_scales,
+                                             block * kHidden + row_base,
+                                             act + static_cast<std::int64_t>(warp) * kIntermediate,
+                                             0, kIntermediate / RoutedCodec::kGroupK, dot);
+        } else {
+            for (int r = 0; r < Rows; ++r) { dot[r] = 0.0f; }
+        }
         if (lane == 0) {
 #pragma unroll
             for (int row = 0; row < Rows; ++row) { paths[warp][row] = alpha[warp] * dot[row]; }
@@ -433,10 +441,14 @@ __global__ void sparse_moe_d4_token_kernel(
             const int expert = token_ids[token * kTopK + warp];
             const int block  = slot_of_expert != nullptr ? slot_of_expert[expert] : expert;
             float dot[Rows];
-            dot_fp32_rows<RoutedCodec, Rows>(routed_codes, routed_high, routed_scales,
-                                             block * kHidden + row_base,
-                                             act + static_cast<std::int64_t>(warp) * kIntermediate,
-                                             0, kIntermediate / RoutedCodec::kGroupK, dot);
+            if (block >= 0) {
+                dot_fp32_rows<RoutedCodec, Rows>(routed_codes, routed_high, routed_scales,
+                                                 block * kHidden + row_base,
+                                                 act + static_cast<std::int64_t>(warp) * kIntermediate,
+                                                 0, kIntermediate / RoutedCodec::kGroupK, dot);
+            } else {
+                for (int r = 0; r < Rows; ++r) { dot[r] = 0.0f; }
+            }
             if (lane == 0) {
 #pragma unroll
                 for (int row = 0; row < Rows; ++row) {
@@ -507,7 +519,7 @@ void launch_d2_d3(const Tensor& x, const SparseMoeWeights& weights,
     // The round hook sees the final ids before the expert kernels; its launches sit between
     // D2 and D3 on the stream, so D3's programmatic wait resolves against them.
     if (hook != nullptr && hook->resolve != nullptr) {
-        hook->resolve(hook->context, workspace.ids, stream);
+        hook->resolve(hook->context, workspace.ids, workspace.alpha, stream);
     }
 
     switch (weights.routed_gate_up.qtype) {

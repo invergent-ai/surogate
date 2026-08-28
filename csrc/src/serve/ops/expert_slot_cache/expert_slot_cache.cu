@@ -108,22 +108,29 @@ __global__ void directory_reset_kernel(int* __restrict__ slot_of_expert, int ids
 /// One block. `ids` holds `count` expert ids of one layer (duplicates allowed). `seen` is a
 /// per-layer scratch of `experts` stamps that dedupes the round's ids.
 __global__ void __launch_bounds__(kResolveThreads)
-    resolve_kernel(const int* __restrict__ ids, int count, int layer, int experts, int slots,
-                   int* __restrict__ slot_of_expert, int* __restrict__ expert_of_slot,
-                   unsigned* __restrict__ last_used, unsigned* __restrict__ active_round,
-                   unsigned* __restrict__ round, int* __restrict__ hand,
-                   unsigned* __restrict__ seen, int* __restrict__ miss_slots,
+    resolve_kernel(const int* __restrict__ ids, const float* __restrict__ alpha, int count,
+                   int layer, int experts, int slots, int* __restrict__ slot_of_expert,
+                   int* __restrict__ expert_of_slot, unsigned* __restrict__ last_used,
+                   unsigned* __restrict__ active_round, unsigned* __restrict__ round,
+                   int* __restrict__ hand, unsigned* __restrict__ seen,
+                   unsigned* __restrict__ cpu_round, int* __restrict__ miss_slots,
                    int* __restrict__ miss_experts, long long* __restrict__ miss_count,
-                   int miss_capacity) {
+                   int miss_capacity, unsigned cpu_share_q16, int per_token,
+                   int* __restrict__ cpu_tokens,
+                   int* __restrict__ cpu_experts, float* __restrict__ cpu_weights,
+                   long long* __restrict__ cpu_count, int cpu_capacity) {
     __shared__ unsigned s_round;
     __shared__ int s_pending;
     __shared__ int s_pending_experts[1024];
+    __shared__ int s_cpu_pending;
     const int tid = static_cast<int>(threadIdx.x);
     if (tid == 0) {
-        s_round    = *round + 1U;
-        *round     = s_round;
-        s_pending  = 0;
-        *miss_count = 0;
+        s_round       = *round + 1U;
+        *round        = s_round;
+        s_pending     = 0;
+        s_cpu_pending = 0;
+        *miss_count   = 0;
+        if (cpu_count != nullptr) { *cpu_count = 0; }
     }
     __syncthreads();
     const unsigned this_round = s_round;
@@ -145,13 +152,23 @@ __global__ void __launch_bounds__(kResolveThreads)
     }
     __syncthreads();
 
-    // Pass 2: one thread assigns victims with a clock hand; the order is deterministic.
+    // Pass 2: one thread assigns victims with a clock hand; the order is deterministic. With a
+    // CPU split, a `cpu_share` fraction of the misses is handed to the host instead: those
+    // experts keep -1 in the table and are stamped in `cpu_round` for pass 3.
     if (tid == 0) {
         const int pending = s_pending < 1024 ? s_pending : 1024;
         int h             = *hand;
         int written       = 0;
+        int sent_to_cpu   = 0;
         for (int p = 0; p < pending; ++p) {
             const int expert = s_pending_experts[p];
+            if (cpu_share_q16 > 0U && cpu_count != nullptr &&
+                static_cast<unsigned long long>(sent_to_cpu) * 65536ULL <
+                    static_cast<unsigned long long>(p + 1) * cpu_share_q16) {
+                cpu_round[expert] = this_round;
+                ++sent_to_cpu;
+                continue;
+            }
             // Find a slot that is not active in this round; prefer the least recently used
             // among the next few candidates the hand passes (bounded sweep keeps it cheap).
             int victim        = -1;
@@ -181,8 +198,24 @@ __global__ void __launch_bounds__(kResolveThreads)
             }
             ++written;
         }
-        *hand       = h;
-        *miss_count = written < miss_capacity ? written : miss_capacity;
+        *hand         = h;
+        *miss_count   = written < miss_capacity ? written : miss_capacity;
+        s_cpu_pending = sent_to_cpu;
+    }
+    __syncthreads();
+
+    // Pass 3: every (token, path) routed to a CPU expert becomes a host job with its weight.
+    if (s_cpu_pending > 0 && cpu_count != nullptr) {
+        for (int i = tid; i < count; i += kResolveThreads) {
+            const int expert = ids[i];
+            if (expert < 0 || expert >= experts || cpu_round[expert] != this_round) { continue; }
+            const long long at = atomicAdd(reinterpret_cast<unsigned long long*>(cpu_count), 1ULL);
+            if (at < cpu_capacity) {
+                cpu_tokens[at]  = i / per_token;
+                cpu_experts[at] = expert;
+                cpu_weights[at] = alpha != nullptr ? alpha[i] : 1.0f;
+            }
+        }
     }
 }
 
@@ -220,7 +253,25 @@ __global__ void __launch_bounds__(kGatherThreads)
     }
 }
 
+__global__ void partial_add_kernel(const float* __restrict__ partial, __nv_bfloat16* __restrict__ destination,
+                                   long long count) {
+    const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= count) { return; }
+    destination[i] = __float2bfloat16_rn(__bfloat162float(destination[i]) + partial[i]);
+}
+
 } // namespace
+
+void expert_cpu_partial_add(const void* partial_device_ptr, Tensor& destination, cudaStream_t stream) {
+    if (partial_device_ptr == nullptr || destination.data == nullptr || destination.dtype != DType::BF16) {
+        throw std::invalid_argument("expert_slot_cache: partial add needs a BF16 destination");
+    }
+    const long long count = destination.numel();
+    const int grid        = static_cast<int>((count + 255) / 256);
+    partial_add_kernel<<<grid, 256, 0, stream>>>(static_cast<const float*>(partial_device_ptr),
+                                                 static_cast<__nv_bfloat16*>(destination.data), count);
+    CUDA_CHECK(cudaGetLastError());
+}
 
 // ---------------------------------------------------------------------------------------------
 // Sizes and construction
@@ -246,7 +297,7 @@ std::size_t expert_slot_directory_bytes(std::int32_t layers, std::int32_t expert
     return align_up(ids * sizeof(int)) + align_up(static_cast<std::size_t>(slots) * sizeof(int)) +
            2 * align_up(static_cast<std::size_t>(slots) * sizeof(unsigned)) +
            align_up(sizeof(unsigned)) + align_up(sizeof(int)) +
-           align_up(static_cast<std::size_t>(experts) * sizeof(unsigned));
+           2 * align_up(static_cast<std::size_t>(experts) * sizeof(unsigned));
 }
 
 std::size_t expert_miss_list_bytes(std::int32_t capacity) {
@@ -304,6 +355,7 @@ ExpertSlotDirectory create_expert_slot_directory(std::int32_t layers, std::int32
     out.round          = take(DType::I32, 1, sizeof(unsigned));
     out.hand           = take(DType::I32, 1, sizeof(int));
     out.seen           = take(DType::I32, experts, sizeof(unsigned));
+    out.cpu_round      = take(DType::I32, experts, sizeof(unsigned));
     expert_slot_directory_reset(out, stream);
     return out;
 }
@@ -323,6 +375,29 @@ ExpertMissList create_expert_miss_list(std::int32_t capacity, void* device_bytes
     return out;
 }
 
+std::size_t expert_cpu_job_list_bytes(std::int32_t capacity) {
+    if (capacity <= 0) { throw std::invalid_argument("expert_slot_cache: cpu job capacity must be positive"); }
+    return 2 * align_up(static_cast<std::size_t>(capacity) * sizeof(int)) +
+           align_up(static_cast<std::size_t>(capacity) * sizeof(float)) + align_up(sizeof(long long));
+}
+
+ExpertCpuJobList create_expert_cpu_job_list(std::int32_t capacity, void* device_bytes) {
+    if (device_bytes == nullptr) {
+        throw std::invalid_argument("expert_slot_cache: cpu job list memory is null");
+    }
+    auto* base = static_cast<std::byte*>(device_bytes);
+    ExpertCpuJobList out;
+    out.capacity = capacity;
+    out.tokens   = Tensor(base, DType::I32, {capacity});
+    base += align_up(static_cast<std::size_t>(capacity) * sizeof(int));
+    out.experts = Tensor(base, DType::I32, {capacity});
+    base += align_up(static_cast<std::size_t>(capacity) * sizeof(int));
+    out.weights = Tensor(base, DType::FP32, {capacity});
+    base += align_up(static_cast<std::size_t>(capacity) * sizeof(float));
+    out.count = Tensor(base, DType::I64, {1});
+    return out;
+}
+
 void expert_slot_directory_reset(ExpertSlotDirectory& directory, cudaStream_t stream) {
     const int ids   = directory.layers * directory.experts;
     const int slots = static_cast<int>(directory.expert_of_slot.ne[0]);
@@ -336,6 +411,7 @@ void expert_slot_directory_reset(ExpertSlotDirectory& directory, cudaStream_t st
         static_cast<unsigned*>(directory.round.data), static_cast<int*>(directory.hand.data));
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaMemsetAsync(directory.seen.data, 0, directory.seen.bytes(), stream));
+    CUDA_CHECK(cudaMemsetAsync(directory.cpu_round.data, 0, directory.cpu_round.bytes(), stream));
 }
 
 ExpertHostBank expert_host_bank(const SparseMoeGeometry& geometry, const Weight& routed_gate_up,
@@ -370,6 +446,13 @@ ExpertHostBank expert_host_bank(const SparseMoeGeometry& geometry, const Weight&
 
 void expert_slot_resolve(const Tensor& ids, std::int32_t layer, ExpertSlotDirectory& directory,
                          ExpertMissList& misses, cudaStream_t stream) {
+    expert_slot_resolve(ids, Tensor{}, layer, directory, misses, nullptr, 0U, stream);
+}
+
+void expert_slot_resolve(const Tensor& ids, const Tensor& alpha, std::int32_t layer,
+                         ExpertSlotDirectory& directory, ExpertMissList& misses,
+                         ExpertCpuJobList* cpu_jobs, std::uint32_t cpu_share_q16,
+                         cudaStream_t stream) {
     if (ids.dtype != DType::I32 || ids.data == nullptr) {
         throw std::invalid_argument("expert_slot_cache: ids must be a device I32 tensor");
     }
@@ -380,17 +463,34 @@ void expert_slot_resolve(const Tensor& ids, std::int32_t layer, ExpertSlotDirect
     if (count <= 0 || count > (1LL << 30)) {
         throw std::invalid_argument("expert_slot_cache: invalid id count");
     }
+    // ids are [experts_per_token, tokens]; the leading extent is the per-token path count.
+    const int per_token = ids.ne[0] > 0 ? ids.ne[0] : static_cast<int>(count);
+    const bool split    = cpu_share_q16 > 0U && cpu_jobs != nullptr;
+    if (split) {
+        if (cpu_share_q16 > 65536U) {
+            throw std::invalid_argument("expert_slot_cache: cpu share must be <= 65536");
+        }
+        if (alpha.dtype != DType::FP32 || alpha.data == nullptr || alpha.numel() != count) {
+            throw std::invalid_argument("expert_slot_cache: the CPU split needs router weights matching ids");
+        }
+    }
     const int slots = static_cast<int>(directory.expert_of_slot.ne[0]);
     resolve_kernel<<<1, kResolveThreads, 0, stream>>>(
-        static_cast<const int*>(ids.data), static_cast<int>(count), layer, directory.experts,
-        slots, static_cast<int*>(directory.slot_of_expert.data),
+        static_cast<const int*>(ids.data), split ? static_cast<const float*>(alpha.data) : nullptr,
+        static_cast<int>(count), layer, directory.experts, slots,
+        static_cast<int*>(directory.slot_of_expert.data),
         static_cast<int*>(directory.expert_of_slot.data),
         static_cast<unsigned*>(directory.last_used.data),
         static_cast<unsigned*>(directory.active_round.data),
         static_cast<unsigned*>(directory.round.data), static_cast<int*>(directory.hand.data),
-        static_cast<unsigned*>(directory.seen.data), static_cast<int*>(misses.slots.data),
-        static_cast<int*>(misses.experts.data), static_cast<long long*>(misses.count.data),
-        misses.capacity);
+        static_cast<unsigned*>(directory.seen.data), static_cast<unsigned*>(directory.cpu_round.data),
+        static_cast<int*>(misses.slots.data), static_cast<int*>(misses.experts.data),
+        static_cast<long long*>(misses.count.data), misses.capacity, split ? cpu_share_q16 : 0U,
+        per_token, split ? static_cast<int*>(cpu_jobs->tokens.data) : nullptr,
+        split ? static_cast<int*>(cpu_jobs->experts.data) : nullptr,
+        split ? static_cast<float*>(cpu_jobs->weights.data) : nullptr,
+        split ? static_cast<long long*>(cpu_jobs->count.data) : nullptr,
+        split ? cpu_jobs->capacity : 0);
     CUDA_CHECK(cudaGetLastError());
 }
 

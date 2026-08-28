@@ -151,6 +151,18 @@ and the baseline run is queued.
   dots with runtime detection and a scalar fallback, pinned worker pool, unit test against a
   double reference). The GPU-round integration (miss split, activation hand-off, host-function
   handshake, kernels skipping CPU-assigned pairs) is the next step.
+- Follow-ups landed (2026-08-28, later): ik_llama.cpp rerun agrees (21.6 @1 / 24.0 @16, errors
+  persist and are not server-side); the 35B bisect at 14ec176a gives 1,136 — the regression
+  predates the slot-table/hook commits; the pre-today binary (f7145031) cannot load the current
+  35B artifact (`dflash/feature_projection` missing — today's converter changes), so the next
+  bisect points are 81257e66 (before the family residual hooks) and b4e13eb6 (after them,
+  before the qwen4exp target), building now. The CPU expert-compute unit test passes on the
+  AVX-512 path (rel-L2 ~1e-7 vs the double reference); the GPU-round integration is written:
+  the resolve kernel takes a `cpu_share` and emits (token, expert, weight) jobs for the misses it
+  keeps off the pool, the decode/small-T kernels contribute nothing for paths mapped to -1, and
+  `qwen4exp`'s hook stages the activations + jobs to pinned memory, runs the pool from a
+  `cudaLaunchHostFunc` node and adds the FP32 partial back (`SUROGATE_SERVE_CPU_MOE_SHARE=<f>`,
+  decode/small-T rounds ≤ 64 tokens; prefill keeps the full gather). Compiling.
 5. **Prefill**: selective streaming of used experts per layer with whole-layer double
    buffering on a side stream.
 

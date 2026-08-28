@@ -57,13 +57,15 @@ void cpu_expert_compute_job(const SparseMoeGeometry& geometry, const CpuExpertBa
 /// A pool of pinned worker threads (one per physical core by default) that splits a round's
 /// jobs across cores and blocks until they are done. Output columns shared by several jobs
 /// are accumulated under a per-token lock, so job order does not matter.
+struct CpuExpertPoolOptions {
+    std::uint32_t threads = 0; // 0 = one per physical core
+    bool pin_threads      = true;
+};
+
 class CpuExpertPool {
 public:
-    struct Options {
-        std::uint32_t threads = 0; // 0 = one per physical core
-        bool pin_threads      = true;
-    };
-    explicit CpuExpertPool(const SparseMoeGeometry& geometry, Options options = {});
+    using Options = CpuExpertPoolOptions;
+    explicit CpuExpertPool(const SparseMoeGeometry& geometry, Options options = Options{});
     ~CpuExpertPool();
     CpuExpertPool(const CpuExpertPool&)            = delete;
     CpuExpertPool& operator=(const CpuExpertPool&) = delete;
