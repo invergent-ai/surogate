@@ -1037,3 +1037,16 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   aborted at the first decode step with an illegal address surfacing in the dump helper;
   the serving path decodes correctly with graphs, so this is being localised with
   CUDA_LAUNCH_BLOCKING on the eager path.)
+- Two more per-process statics found by the eager 2-stage run (2026-08-28): the Marlin
+  scratch (`g_scratch`, one buffer on the first device → illegal address on the second) is
+  now per device; and `launch_ordinary_round`/`consume_ordinary_round` were private for the
+  other variants (the C1 build had failed silently behind a stale binary; the chain now
+  prints the binary's link time and the build exit). Step C2 (commit dd6956a8):
+  `advance_prefill_mixed` is split at its synchronize into `launch_mixed_round` (staging,
+  forward, sample, egress copy; the eager fallback still synchronises inside) and
+  `consume_mixed_round` (synchronize + bookkeeping) with the in-flight record kept on the
+  program; the driver's `run_grouped_round` pipelines every executor round: the prefill
+  lanes all ride with the first non-empty decode group as the mixed round (so the executor
+  sees exactly one mixed result), the other groups run decode-only rounds, and the software
+  pipeline over stages is the same as C1's. Measurements queued: one device vs lockstep
+  (groups=1) vs pipelined at 8 users on the decode-heavy 128/512 shape, C1 then C2.
