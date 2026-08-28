@@ -283,6 +283,11 @@ and the baseline run is queued.
   callback — spun on the barrier forever, freezing the stream. Fix: publish under the mutex
   and re-notify periodically while waiting; the unit test now runs 3,000 tiny rounds on a
   32-thread pool under a watchdog. Every step of the measurement chain carries a timeout.
+- The session's process crashed at ~15:05 while the relaunch waited on the hung server (the
+  server needed SIGKILL; SIGTERM was ignored by the spinning callback thread). Resumed at 15:06:
+  host idle, GPUs free, the pool fix and stress test were on disk but uncommitted; the chain
+  (build → unit+stress test → v2 parity → probes 0.5/0.7 share at 1 and 16 users +
+  NUMA-interleaved) was relaunched and the commit is gated on the stress test passing.
 5. **Prefill**: selective streaming of used experts per layer with whole-layer double
    buffering on a side stream.
 
