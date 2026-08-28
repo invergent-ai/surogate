@@ -8,6 +8,8 @@
 #include "ops/linear/w8a8/w8fp8_plane.h"
 #include "runtime/engine/kv_capacity.h"
 #include "targets/qwen4exp/impl/config.h"
+#include "targets/qwen3_6_27b/impl/config.h"
+#include "targets/qwen3_6_35b_a3b/impl/config.h"
 
 #include <chrono>
 #include <cstdio>
@@ -335,40 +337,30 @@ ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& 
                              "' has no registered target for this device");
 }
 
-ConstructedTarget construct_pipeline_target(const EngineOptions& options) {
-    validate_options(options);
-    if (options.devices.size() < 2) {
-        throw std::invalid_argument("pipeline parallelism needs at least two devices");
-    }
-    const auto load_start = Clock::now();
-    artifact::Reader reader(options.artifact_path);
-    const auto& identity = reader.identity();
-    if (identity.model_id != Qwen38FlashNext::model_id) {
-        throw std::runtime_error("pipeline parallelism is wired for Qwen3.8-Flash-Next only (artifact is " +
-                                 identity.model_id + ")");
-    }
-    constexpr int layers    = qwen4exp::detail::TextConfig::layers;
-    const int stage_count   = static_cast<int>(options.devices.size());
+template <class Target, class Loaded, class Instance, int Layers>
+ConstructedTarget construct_pipeline(const EngineOptions& options, artifact::Reader& reader,
+                                     Clock::time_point load_start, std::string_view target_key) {
+    constexpr int layers  = Layers;
+    const int stage_count = static_cast<int>(options.devices.size());
     if (stage_count > layers) { throw std::invalid_argument("more pipeline stages than layers"); }
     std::vector<std::unique_ptr<DeviceContext>> devices;
-    std::vector<std::unique_ptr<Qwen38FlashNextInstance>> stages;
+    std::vector<std::unique_ptr<Instance>> stages;
     LoadSummary summary;
     ModelSamplingDefaults sampling_defaults{};
-    const void* import_pinned = nullptr;
     std::uint32_t resolved_kv = 0;
     for (int s = 0; s < stage_count; ++s) {
         devices.push_back(std::make_unique<DeviceContext>(options.devices[static_cast<std::size_t>(s)]));
-        EngineOptions stage_options            = options;
-        stage_options.device                   = options.devices[static_cast<std::size_t>(s)];
-        stage_options.pipeline_stage_first     = layers * s / stage_count;
-        stage_options.pipeline_stage_last      = layers * (s + 1) / stage_count;
-        stage_options.pipeline_import_pinned   = nullptr; // each stage owns its import buffer
-        stage_options.cpu_moe_pool_per_socket  = std::getenv("SUROGATE_SERVE_CPU_MOE_POOL_SHARED") == nullptr;
+        EngineOptions stage_options             = options;
+        stage_options.device                    = options.devices[static_cast<std::size_t>(s)];
+        stage_options.pipeline_stage_first      = layers * s / stage_count;
+        stage_options.pipeline_stage_last       = layers * (s + 1) / stage_count;
+        stage_options.pipeline_import_pinned    = nullptr; // each stage owns its import buffer
+        stage_options.cpu_moe_pool_per_socket   = std::getenv("SUROGATE_SERVE_CPU_MOE_POOL_SHARED") == nullptr;
         stage_options.pipeline_boundary_columns = options.prefill_chunk + options.max_concurrency + 128;
         if (s > 0) { stage_options.kv_capacity = KvCapacityPolicy::explicit_capacity(resolved_kv); }
-        ConstructedTarget stage = construct_registered<Qwen38FlashNext, LoadedQwen38FlashNext, Qwen38FlashNextInstance>(
-            stage_options, *devices.back(), reader, load_start, Qwen38FlashNext::target_key);
-        auto* instance = std::get<std::unique_ptr<Qwen38FlashNextInstance>>(stage.active).release();
+        ConstructedTarget stage = construct_registered<Target, Loaded, Instance>(
+            stage_options, *devices.back(), reader, load_start, target_key);
+        auto* instance = std::get<std::unique_ptr<Instance>>(stage.active).release();
         stages.emplace_back(instance);
         if (s == 0) {
             resolved_kv       = instance->kv_capacity_resolution.resolved_tokens;
@@ -378,15 +370,41 @@ ConstructedTarget construct_pipeline_target(const EngineOptions& options) {
             summary.artifact_bytes_read += stage.load.artifact_bytes_read;
             summary.host_to_device_bytes += stage.load.host_to_device_bytes;
         }
-        import_pinned = instance->program->stage_export_buffer();
         std::fprintf(stderr, "pipeline: stage %d on device %d, layers [%d, %d)\n", s, stage_options.device,
                      stage_options.pipeline_stage_first, stage_options.pipeline_stage_last);
     }
     summary.load_seconds = std::chrono::duration<double>(Clock::now() - load_start).count();
-    auto pipeline = std::make_unique<Qwen38FlashNextPipeline>(std::move(devices), std::move(stages));
+    auto pipeline = std::make_unique<runtime::PipelineInstance<Instance>>(std::move(devices), std::move(stages));
     return ConstructedTarget{.active            = ActiveTarget(std::move(pipeline)),
                              .load              = std::move(summary),
                              .sampling_defaults = sampling_defaults};
+}
+
+ConstructedTarget construct_pipeline_target(const EngineOptions& options) {
+    validate_options(options);
+    if (options.devices.size() < 2) {
+        throw std::invalid_argument("pipeline parallelism needs at least two devices");
+    }
+    const auto load_start = Clock::now();
+    artifact::Reader reader(options.artifact_path);
+    const auto& identity = reader.identity();
+    if (identity.model_id == Qwen38FlashNext::model_id) {
+        return construct_pipeline<Qwen38FlashNext, LoadedQwen38FlashNext, Qwen38FlashNextInstance,
+                                  qwen4exp::detail::TextConfig::layers>(options, reader, load_start,
+                                                                        Qwen38FlashNext::target_key);
+    }
+    if (identity.model_id == Qwen3_6_27B::model_id || identity.model_id == Qwen3_6_27B::qwen3_8_model_id) {
+        return construct_pipeline<Qwen3_6_27B, LoadedQwen3_6_27B, Qwen3_6_27BInstance,
+                                  qwen3_6_27b::detail::TextConfig::layers>(
+            options, reader, load_start,
+            identity.model_id == Qwen3_6_27B::model_id ? Qwen3_6_27B::target_key : Qwen3_6_27B::qwen3_8_target_key);
+    }
+    if (identity.model_id == Qwen3_6_35BA3B::model_id) {
+        return construct_pipeline<Qwen3_6_35BA3B, LoadedQwen3_6_35BA3B, Qwen3_6_35BA3BInstance,
+                                  qwen3_6_35b_a3b::detail::TextConfig::layers>(options, reader, load_start,
+                                                                               Qwen3_6_35BA3B::target_key);
+    }
+    throw std::runtime_error("pipeline parallelism is not wired for artifact '" + identity.model_id + "'");
 }
 
 } // namespace ninfer::targets
