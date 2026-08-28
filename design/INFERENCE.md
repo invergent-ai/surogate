@@ -1083,3 +1083,13 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   their host rounds concurrently on their own cores and memory (16 threads each; the
   single-card server keeps the one 32-thread pool). `SUROGATE_SERVE_CPU_MOE_POOL_SHARED=1`
   restores the shared pool for A/B.
+- Goal widened by the owner (2026-08-28 21:05): phase 3 = Flash-Next, Qwen3.8-27B and
+  Qwen3.6-35B-A3B served on all 8 GPUs with pipeline parallelism. The stage machinery is the
+  family's (`StageSpan` in `TextContext`, the driver templated on the stage instance), so
+  wiring the two other targets is the registry's constructor templated over (Target, Loaded,
+  Instance, layers) plus their executor variants (commit after fe9af1be). v1 caveat for the
+  dense/resident targets: every stage materialises the whole model and plans all layers'
+  state (the 27B is 15 GB per card, the 35B 21 GB), so memory does not shrink with the stage
+  count yet — layer-subset materialisation is the follow-up; the throughput win comes from
+  the stages running in parallel on different micro-batches. Queued after the Flash-Next
+  chains: 27B and 35B as 8-stage pipelines at one user and the 100-user board shape.
