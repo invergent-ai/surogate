@@ -1177,3 +1177,8 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   `decode_batch`/`advance_prefill_mixed` stay for the non-pipelined executor path. Test chain
   queued behind the trace run: 2 stages split-off vs the closed pipeline, then 8 stages at
   16/64/1 users, then the 27B and 35B at 100 users.
+- Width-following groups + residency policy measured (2026-08-28, 8 stages, closed pipeline):
+  **16 users 57.8 tok/s, TTFT 0.6 s, 48 completions** (31.8 / 18.8 s before). Rounds of 4
+  lanes instead of 2 halve the fixed-cost multiplier and the stages skip the host round
+  trips at 98 % residency. Still under the 4-stage 79.7 (fixed cost × 8 stages, fill/drain);
+  the steady-state pipeline (C3) is what removes the fill/drain.
