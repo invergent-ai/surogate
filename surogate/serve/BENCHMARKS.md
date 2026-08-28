@@ -144,6 +144,29 @@ at every concurrency: at 16 users (prefill share 0.5) it halves TTFT and adds
 7 % decode; the share is lower than at one user (0.7) because at concurrency
 the host must stay off the critical path of the mixed rounds.
 
+## Qwen3.8-Flash-Next — pipeline parallelism across cards (phase 3, 2026-08-28)
+
+`--devices A,B,...` splits the model into one layer-range stage per card; the residual
+crosses each boundary through pinned host memory (no P2P), micro-batch groups flow through
+the stages as a software pipeline, and each stage keeps the phase-2 offload for its own
+layers (its pool caches only its layers' experts, so residency per stage rises with the
+stage count). Parity: the prompt forward of a 2-stage pipeline is bit-exact against one
+card at every layer boundary and at the output.
+
+| config | users | shape | decode tok/s | TTFT p50 |
+|---|---:|---|---:|---:|
+| one card (GPU 2), split on | 8 | 128/512 | 36.9 | 4.6 s |
+| 2 stages (GPUs 2+3), lockstep | 8 | 128/512 | **72.5** | 2.7 s |
+| 2 stages, pipelined (2 groups) | 8 | 128/512 | (running) | |
+| 2 stages, 1 user | 1 | 512/128 | 13.1 | 4.3 s |
+| llama.cpp 8× 5090 `--split-mode layer` | 1 / 16 / 64 | 512/128 | 39.3 / 39.1 / 24.7 | 0.95 s / 86 s / 311 s |
+| 8 stages (all cards) | 1 / 16 / 64 | 512/128 | (running) | |
+
+Reading so far: two stages in lockstep already double the 8-user throughput because each
+stage's pool holds twice the share of its experts; the single-stream case runs the stages
+one after another (two rounds' fixed costs, two serialised host rounds) and needs
+per-socket host pools to match one card.
+
 ## Open items
 
 - **35B-A3B**: NVFP4 expert artifact; row-parallel decode-width routed kernel.
