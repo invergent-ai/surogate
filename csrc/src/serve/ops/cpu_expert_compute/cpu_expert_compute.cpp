@@ -273,9 +273,77 @@ void dot_two_rows_two_tokens_vnni(const std::int8_t* codes0, const std::uint16_t
     out0b = _mm512_reduce_add_ps(acc0b);
     out1b = _mm512_reduce_add_ps(acc1b);
 }
+
+/// Interleaved-rows tile ("R16"): a block of 16 rows is stored group by group as 8 zmm of
+/// [16 rows][4 k-elements] int8, followed by the rows' 128·Σw compensation (int32[16]) and
+/// their fp16 scales converted to float ([16]). One `vpdpbusd` against a broadcast of the
+/// token's 4 activation bytes (u8: q ^ 0x80) advances all 16 rows, and the per-group scale is
+/// applied once per 16 rows. The tile is built once per expert chunk and reused by every
+/// token routed to the expert.
+constexpr int kTileRows            = 16;
+constexpr int kTileGroupCodeBytes  = kGroup * kTileRows;                       // 512
+constexpr int kTileGroupBytes      = kTileGroupCodeBytes + 2 * 64;             // + comp + scales
+inline std::size_t tile_block_bytes(int k) { return static_cast<std::size_t>(k / kGroup) * kTileGroupBytes; }
+
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512dq,avx512vnni,f16c,fma")))
+void repack_tile_block_vnni(const std::int8_t* codes, const std::uint16_t* scales, int k, std::byte* tile) {
+    // codes: 16 rows, row stride k; scales: 16 rows, row stride k/32.
+    const int groups     = k / kGroup;
+    const __m512i ones   = _mm512_set1_epi8(1);
+    for (int g = 0; g < groups; ++g) {
+        std::byte* out = tile + static_cast<std::size_t>(g) * kTileGroupBytes;
+        __m512i comp   = _mm512_setzero_si512();
+        for (int step = 0; step < 8; ++step) {
+            // Gather 4 bytes of each of the 16 rows: 16 dword loads.
+            alignas(64) std::int32_t lanes[16];
+            for (int r = 0; r < kTileRows; ++r) {
+                std::memcpy(&lanes[r], codes + static_cast<std::size_t>(r) * k + g * kGroup + step * 4, 4);
+            }
+            const __m512i w = _mm512_load_si512(lanes);
+            _mm512_storeu_si512(out + step * 64, w);
+            comp = _mm512_dpbusd_epi32(comp, ones, w); // Σ of the 4 signed bytes per row lane
+        }
+        _mm512_storeu_si512(out + kTileGroupCodeBytes, _mm512_slli_epi32(comp, 7)); // 128·Σw
+        alignas(64) std::uint16_t sc[16];
+        for (int r = 0; r < kTileRows; ++r) { sc[r] = scales[static_cast<std::size_t>(r) * groups + g]; }
+        _mm512_storeu_ps(reinterpret_cast<float*>(out + kTileGroupCodeBytes + 64),
+                         _mm512_cvtph_ps(_mm256_load_si256(reinterpret_cast<const __m256i*>(sc))));
+    }
+}
+
+/// 16 rows of one tile block against two tokens (u8 activations `xua`/`xub` = q ^ 0x80, group
+/// scales `xsa`/`xsb`); writes 16 floats per token.
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512dq,avx512vnni,f16c,fma")))
+void dot_tile_block_two_tokens_vnni(const std::byte* tile, int k, const std::uint8_t* xua, const float* xsa,
+                                    const std::uint8_t* xub, const float* xsb, float* outa, float* outb) {
+    const int groups = k / kGroup;
+    __m512 acca = _mm512_setzero_ps(), accb = _mm512_setzero_ps();
+    for (int g = 0; g < groups; ++g) {
+        const std::byte* blk = tile + static_cast<std::size_t>(g) * kTileGroupBytes;
+        __m512i da = _mm512_setzero_si512(), db = _mm512_setzero_si512();
+        const std::int32_t* xa32 = reinterpret_cast<const std::int32_t*>(xua + g * kGroup);
+        const std::int32_t* xb32 = reinterpret_cast<const std::int32_t*>(xub + g * kGroup);
+        for (int step = 0; step < 8; ++step) {
+            const __m512i w = _mm512_loadu_si512(blk + step * 64);
+            da = _mm512_dpbusd_epi32(da, _mm512_set1_epi32(xa32[step]), w);
+            db = _mm512_dpbusd_epi32(db, _mm512_set1_epi32(xb32[step]), w);
+        }
+        const __m512i comp = _mm512_loadu_si512(blk + kTileGroupCodeBytes);
+        const __m512 ws    = _mm512_loadu_ps(reinterpret_cast<const float*>(blk + kTileGroupCodeBytes + 64));
+        acca = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_sub_epi32(da, comp)), _mm512_mul_ps(ws, _mm512_set1_ps(xsa[g])), acca);
+        accb = _mm512_fmadd_ps(_mm512_cvtepi32_ps(_mm512_sub_epi32(db, comp)), _mm512_mul_ps(ws, _mm512_set1_ps(xsb[g])), accb);
+    }
+    _mm512_storeu_ps(outa, acca);
+    _mm512_storeu_ps(outb, accb);
+}
 #else
 constexpr bool kVnniCompiled = false;
 bool detect_vnni() { return false; }
+constexpr int kTileRows = 16;
+inline std::size_t tile_block_bytes(int) { return 0; }
+void repack_tile_block_vnni(const std::int8_t*, const std::uint16_t*, int, std::byte*) {}
+void dot_tile_block_two_tokens_vnni(const std::byte*, int, const std::uint8_t*, const float*, const std::uint8_t*,
+                                    const float*, float*, float*) {}
 void dot_two_rows_two_tokens_vnni(const std::int8_t*, const std::uint16_t*, const std::int8_t*, const std::uint16_t*,
                                   const std::int8_t*, const float*, const std::int32_t*, const std::int8_t*,
                                   const float*, const std::int32_t*, int, float&, float&, float&, float&) {}
@@ -293,6 +361,11 @@ constexpr bool kAvx512Compiled = false;
 constexpr bool kVnniCompiled   = false;
 bool detect_avx512() { return false; }
 bool detect_vnni() { return false; }
+constexpr int kTileRows = 16;
+inline std::size_t tile_block_bytes(int) { return 0; }
+void repack_tile_block_vnni(const std::int8_t*, const std::uint16_t*, int, std::byte*) {}
+void dot_tile_block_two_tokens_vnni(const std::byte*, int, const std::uint8_t*, const float*, const std::uint8_t*,
+                                    const float*, float*, float*) {}
 void dot_two_rows_two_tokens_vnni(const std::int8_t*, const std::uint16_t*, const std::int8_t*, const std::uint16_t*,
                                   const std::int8_t*, const float*, const std::int32_t*, const std::int8_t*,
                                   const float*, const std::int32_t*, int, float&, float&, float&, float&) {}
@@ -308,6 +381,12 @@ void dot_two_rows_two_tokens_avx512(const std::int8_t*, const std::uint16_t*, co
 
 const bool kUseAvx512 = kAvx512Compiled && detect_avx512();
 const bool kUseVnni   = kUseAvx512 && kVnniCompiled && detect_vnni() && std::getenv("SUROGATE_CPU_EXPERT_NO_VNNI") == nullptr;
+// The tile path pays a repack per expert chunk; it wins once enough tokens share the expert.
+const bool kUseTile   = kUseVnni && std::getenv("SUROGATE_CPU_EXPERT_NO_TILE") == nullptr;
+const int kTileMinTokens = [] {
+    const char* v = std::getenv("SUROGATE_CPU_EXPERT_TILE_MIN");
+    return v != nullptr && *v != '\0' ? std::max(2, std::atoi(v)) : 4;
+}();
 
 inline float dot_row(const std::int8_t* codes, const std::uint16_t* scales, const std::int8_t* xq,
                      const float* xs, int k) {
@@ -376,6 +455,7 @@ void require_geometry(const SparseMoeGeometry& geometry) {
 
 bool cpu_expert_compute_has_avx512() noexcept { return kUseAvx512; }
 bool cpu_expert_compute_has_vnni() noexcept { return kUseVnni; }
+bool cpu_expert_compute_has_tile() noexcept { return kUseTile; }
 
 std::size_t cpu_expert_scratch_bytes(const SparseMoeGeometry& geometry) {
     require_geometry(geometry);
@@ -486,6 +566,10 @@ struct CpuExpertPool::Impl {
     std::vector<float> hs;         // [jobs][intermediate/32]
     std::vector<std::int32_t> xc;  // [tokens][hidden/32] 128·Σq per group (VNNI compensation)
     std::vector<std::int32_t> hc;  // [jobs][intermediate/32]
+    std::vector<std::uint8_t> xu;  // [tokens][hidden] q ^ 0x80 (tile path activations)
+    std::vector<std::uint8_t> hu;  // [jobs][intermediate]
+    std::vector<std::byte> tiles;  // [threads][tile scratch] repacked expert chunk
+    std::size_t tile_bytes = 0;    // per worker
     std::vector<float> x_float;    // [threads][hidden] scratch for phase 0
     // Jobs grouped by expert: `order` lists job indices expert by expert, group g spans
     // order[group_start[g] .. group_start[g+1]).
@@ -536,6 +620,9 @@ struct CpuExpertPool::Impl {
             for (int i = 0; i < hidden; ++i) { xf[i] = bf16_to_float(x[i]); }
             quantise_groups_sums(xf, hidden, xq.data() + t * hidden, xs.data() + t * groups_h,
                                  xc.data() + t * groups_h);
+            for (int i = 0; i < hidden; ++i) {
+                xu[t * hidden + i] = static_cast<std::uint8_t>(static_cast<std::uint8_t>(xq[t * hidden + i]) ^ 0x80U);
+            }
             return;
         }
         if (ph == 1) {
@@ -551,6 +638,41 @@ struct CpuExpertPool::Impl {
                                      static_cast<std::size_t>(expert) * gate_rows * hidden;
             const auto* gate_scales = reinterpret_cast<const std::uint16_t*>(bank->gate_up_scales) +
                                       static_cast<std::size_t>(expert) * gate_rows * groups_h;
+            if (kUseTile && g1 - g0 >= kTileMinTokens && (j1 - j0) % kTileRows == 0) {
+                // Tile path: repack the chunk's gate rows then up rows (16-row blocks) once,
+                // then run every token pair of the group against the tiles.
+                std::byte* tile      = tiles.data() + static_cast<std::size_t>(worker) * tile_bytes;
+                const int blocks     = (j1 - j0) / kTileRows;
+                const std::size_t bb = tile_block_bytes(hidden);
+                for (int b = 0; b < blocks; ++b) {
+                    repack_tile_block_vnni(gate_codes + static_cast<std::size_t>(j0 + b * kTileRows) * hidden,
+                                           gate_scales + static_cast<std::size_t>(j0 + b * kTileRows) * groups_h, hidden,
+                                           tile + static_cast<std::size_t>(b) * bb);
+                    repack_tile_block_vnni(gate_codes + static_cast<std::size_t>(intermediate + j0 + b * kTileRows) * hidden,
+                                           gate_scales + static_cast<std::size_t>(intermediate + j0 + b * kTileRows) * groups_h,
+                                           hidden, tile + static_cast<std::size_t>(blocks + b) * bb);
+                }
+                alignas(64) float ga[kTileRows], gb[kTileRows], ua[kTileRows], ub[kTileRows];
+                for (std::int32_t i = g0; i < g1; i += 2) {
+                    const auto ia = static_cast<std::size_t>(order[static_cast<std::size_t>(i)]);
+                    const auto ib = static_cast<std::size_t>(order[static_cast<std::size_t>(std::min(i + 1, g1 - 1))]);
+                    const CpuExpertJob& ja = round->jobs[ia];
+                    const CpuExpertJob& jb = round->jobs[ib];
+                    const std::uint8_t* xa = xu.data() + static_cast<std::size_t>(ja.token) * hidden;
+                    const std::uint8_t* xb = xu.data() + static_cast<std::size_t>(jb.token) * hidden;
+                    const float* sa        = xs.data() + static_cast<std::size_t>(ja.token) * groups_h;
+                    const float* sb        = xs.data() + static_cast<std::size_t>(jb.token) * groups_h;
+                    for (int b = 0; b < blocks; ++b) {
+                        dot_tile_block_two_tokens_vnni(tile + static_cast<std::size_t>(b) * bb, hidden, xa, sa, xb, sb, ga, gb);
+                        dot_tile_block_two_tokens_vnni(tile + static_cast<std::size_t>(blocks + b) * bb, hidden, xa, sa, xb, sb, ua, ub);
+                        for (int r = 0; r < kTileRows; ++r) {
+                            h[ia * intermediate + j0 + b * kTileRows + r] = silu(ga[r]) * ua[r];
+                            if (i + 1 < g1) { h[ib * intermediate + j0 + b * kTileRows + r] = silu(gb[r]) * ub[r]; }
+                        }
+                    }
+                }
+                return;
+            }
             for (int j = j0; j < j1; ++j) {
                 const std::int8_t* gc = gate_codes + static_cast<std::size_t>(j) * hidden;
                 const std::uint16_t* gs = gate_scales + static_cast<std::size_t>(j) * groups_h;
@@ -584,6 +706,10 @@ struct CpuExpertPool::Impl {
             const auto job_index = static_cast<std::size_t>(item);
             quantise_groups_sums(h.data() + job_index * intermediate, intermediate, hq.data() + job_index * intermediate,
                                  hs.data() + job_index * groups_i, hc.data() + job_index * groups_i);
+            for (int i = 0; i < intermediate; ++i) {
+                hu[job_index * intermediate + i] =
+                    static_cast<std::uint8_t>(static_cast<std::uint8_t>(hq[job_index * intermediate + i]) ^ 0x80U);
+            }
             return;
         }
         // phase 3: down rows of one expert group against every job of the group.
@@ -598,6 +724,35 @@ struct CpuExpertPool::Impl {
                                  static_cast<std::size_t>(expert) * hidden * intermediate;
         const auto* down_scales = reinterpret_cast<const std::uint16_t*>(bank->down_scales) +
                                   static_cast<std::size_t>(expert) * hidden * groups_i;
+        if (kUseTile && g1 - g0 >= kTileMinTokens && (r1 - r0) % kTileRows == 0) {
+            std::byte* tile      = tiles.data() + static_cast<std::size_t>(worker) * tile_bytes;
+            const int blocks     = (r1 - r0) / kTileRows;
+            const std::size_t bb = tile_block_bytes(intermediate);
+            for (int b = 0; b < blocks; ++b) {
+                repack_tile_block_vnni(down_codes + static_cast<std::size_t>(r0 + b * kTileRows) * intermediate,
+                                       down_scales + static_cast<std::size_t>(r0 + b * kTileRows) * groups_i, intermediate,
+                                       tile + static_cast<std::size_t>(b) * bb);
+            }
+            alignas(64) float ya[kTileRows], yb[kTileRows];
+            for (std::int32_t i = g0; i < g1; i += 2) {
+                const auto ia = static_cast<std::size_t>(order[static_cast<std::size_t>(i)]);
+                const auto ib = static_cast<std::size_t>(order[static_cast<std::size_t>(std::min(i + 1, g1 - 1))]);
+                const CpuExpertJob& ja = round->jobs[ia];
+                const CpuExpertJob& jb = round->jobs[ib];
+                float* outa = round->out + static_cast<std::size_t>(ja.token) * hidden;
+                float* outb = round->out + static_cast<std::size_t>(jb.token) * hidden;
+                for (int b = 0; b < blocks; ++b) {
+                    dot_tile_block_two_tokens_vnni(tile + static_cast<std::size_t>(b) * bb, intermediate,
+                                                   hu.data() + ia * intermediate, hs.data() + ia * groups_i,
+                                                   hu.data() + ib * intermediate, hs.data() + ib * groups_i, ya, yb);
+                    for (int rr = 0; rr < kTileRows; ++rr) {
+                        atomic_add(outa + r0 + b * kTileRows + rr, ja.weight * ya[rr]);
+                        if (i + 1 < g1) { atomic_add(outb + r0 + b * kTileRows + rr, jb.weight * yb[rr]); }
+                    }
+                }
+            }
+            return;
+        }
         // Jobs of different experts share output rows, so accumulate with atomic adds (cheap at
         // this width).
         int r = r0;
@@ -721,6 +876,16 @@ CpuExpertPool::CpuExpertPool(const SparseMoeGeometry& geometry, Options options)
     }
     impl_->threads = threads;
     impl_->x_float.resize(static_cast<std::size_t>(threads) * geometry.hidden);
+    if (kUseTile) {
+        // Per worker: the larger of a gate/up chunk (2 × intermediate/8 rows × hidden) and a
+        // down chunk (hidden/8 rows × intermediate), in 16-row tile blocks.
+        const std::size_t gate_chunk = static_cast<std::size_t>(2 * (geometry.intermediate / kPhaseAChunks) / kTileRows + 2) *
+                                       tile_block_bytes(geometry.hidden);
+        const std::size_t down_chunk = static_cast<std::size_t>((geometry.hidden / kPhaseBChunks) / kTileRows + 2) *
+                                       tile_block_bytes(geometry.intermediate);
+        impl_->tile_bytes = std::max(gate_chunk, down_chunk) + 64;
+        impl_->tiles.resize(static_cast<std::size_t>(threads) * impl_->tile_bytes);
+    }
     for (std::uint32_t i = 0; i < threads; ++i) {
         impl_->workers.emplace_back([impl = impl_.get(), i, pin = options.pin_threads] { impl->worker_loop(i, pin); });
     }
@@ -759,6 +924,8 @@ void CpuExpertPool::run(const CpuExpertBank& bank, const CpuExpertRound& round) 
     impl.hs.resize(jobs * (impl.geometry.intermediate / kGroup));
     impl.xc.resize(static_cast<std::size_t>(round.tokens) * (impl.geometry.hidden / kGroup));
     impl.hc.resize(jobs * (impl.geometry.intermediate / kGroup));
+    impl.xu.resize(static_cast<std::size_t>(round.tokens) * impl.geometry.hidden);
+    impl.hu.resize(jobs * impl.geometry.intermediate);
     impl.bank  = &bank;
     impl.round = &round;
     impl.group_jobs();

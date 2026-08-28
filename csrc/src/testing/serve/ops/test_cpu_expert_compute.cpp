@@ -17,7 +17,7 @@ using namespace ninfer;
 
 namespace {
 
-constexpr ops::SparseMoeGeometry kGeometry{128, 4, 2, 64}; // hidden 128, 4 experts, top-2, ffn 64
+constexpr ops::SparseMoeGeometry kGeometry{128, 4, 2, 128}; // hidden 128, 4 experts, top-2, ffn 128 (16-row chunks: the tile path runs)
 
 std::uint16_t float_to_fp16(float f) {
     std::uint32_t w;
@@ -151,7 +151,7 @@ int main() {
     const int H     = kGeometry.hidden;
     std::uniform_real_distribution<float> act(-2.0F, 2.0F);
     int failures = 0;
-    std::cout << "avx512 path: " << (ops::cpu_expert_compute_has_avx512() ? "yes" : "no (scalar)") << ", vnni: " << (ops::cpu_expert_compute_has_vnni() ? "yes" : "no") << "\n";
+    std::cout << "avx512 path: " << (ops::cpu_expert_compute_has_avx512() ? "yes" : "no (scalar)") << ", vnni: " << (ops::cpu_expert_compute_has_vnni() ? "yes" : "no") << ", tile: " << (ops::cpu_expert_compute_has_tile() ? "yes" : "no") << "\n";
 
     // Single job vs reference.
     std::vector<std::uint16_t> x(H);

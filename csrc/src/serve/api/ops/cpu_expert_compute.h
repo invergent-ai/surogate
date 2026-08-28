@@ -85,5 +85,9 @@ private:
 /// True when the AVX512-VNNI batched inner loop is in use (compiled, supported, and not vetoed
 /// by SUROGATE_CPU_EXPERT_NO_VNNI=1).
 [[nodiscard]] bool cpu_expert_compute_has_vnni() noexcept;
+/// True when expert groups with enough tokens run through the repacked 16-row tiles
+/// (needs VNNI; SUROGATE_CPU_EXPERT_NO_TILE=1 vetoes, SUROGATE_CPU_EXPERT_TILE_MIN=<tokens>
+/// sets the group size from which the repack pays).
+[[nodiscard]] bool cpu_expert_compute_has_tile() noexcept;
 
 } // namespace ninfer::ops
