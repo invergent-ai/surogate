@@ -277,27 +277,156 @@ void cpu_expert_compute_job(const SparseMoeGeometry& geometry, const CpuExpertBa
 }
 
 // ---------------------------------------------------------------------------------------------
-// Pool
+// Pool: a round runs in three phases over row-chunked work items so a handful of jobs still
+// occupies every core — (0) quantise each token's activation once, (1) gate/up row chunks of
+// every job into the job's intermediate, (2) quantise that intermediate and run the down row
+// chunks, accumulating into the token column (one chunk owns a disjoint row range, so no
+// locks). Workers spin briefly before sleeping, which keeps the wake-up latency in the
+// microseconds for decode-sized rounds.
 // ---------------------------------------------------------------------------------------------
+
+namespace {
+
+constexpr int kPhaseAChunks = 8;  // gate/up: intermediate split into 8 row ranges
+constexpr int kPhaseBChunks = 8;  // down: hidden split into 8 row ranges
+
+inline void cpu_relax() {
+#if defined(__x86_64__)
+    _mm_pause();
+#endif
+}
+
+} // namespace
 
 struct CpuExpertPool::Impl {
     SparseMoeGeometry geometry;
     std::uint32_t threads = 0;
     std::vector<std::thread> workers;
-    std::vector<std::vector<std::byte>> scratch;
     std::mutex mutex;
     std::condition_variable wake;
     std::condition_variable done;
     bool stop = false;
-    // Current round
-    std::uint64_t generation = 0;
-    const CpuExpertBank* bank = nullptr;
-    const CpuExpertRound* round = nullptr;
-    std::atomic<std::int64_t> next_job{0};
+    std::atomic<std::uint64_t> generation{0};
+    std::atomic<int> phase{0};
+    std::atomic<std::int64_t> next_item{0};
+    std::atomic<std::uint32_t> arrived{0};
     std::atomic<std::uint32_t> finished{0};
-    std::vector<std::unique_ptr<std::mutex>> token_locks;
 
-    void worker(std::uint32_t index, bool pin) {
+    // Round state
+    const CpuExpertBank* bank   = nullptr;
+    const CpuExpertRound* round = nullptr;
+    // Per-token quantised activations, per-job intermediates (float, then int8 + scales).
+    std::vector<std::int8_t> xq;   // [tokens][hidden]
+    std::vector<float> xs;         // [tokens][hidden/32]
+    std::vector<float> h;          // [jobs][intermediate]
+    std::vector<std::int8_t> hq;   // [jobs][intermediate]
+    std::vector<float> hs;         // [jobs][intermediate/32]
+    std::vector<float> x_float;    // [threads][hidden] scratch for phase 0
+
+    std::int64_t items_for_phase(int ph) const {
+        const auto jobs = static_cast<std::int64_t>(round->jobs.size());
+        if (ph == 0) { return round->tokens; }
+        if (ph == 1) { return jobs * kPhaseAChunks; }
+        return jobs * kPhaseBChunks;
+    }
+
+    void do_item(int ph, std::int64_t item, std::uint32_t worker) {
+        const int hidden       = geometry.hidden;
+        const int intermediate = geometry.intermediate;
+        const int groups_h     = hidden / kGroup;
+        const int groups_i     = intermediate / kGroup;
+        if (ph == 0) {
+            const auto t = static_cast<std::size_t>(item);
+            float* xf    = x_float.data() + static_cast<std::size_t>(worker) * hidden;
+            const std::uint16_t* x = round->x + t * hidden;
+            for (int i = 0; i < hidden; ++i) { xf[i] = bf16_to_float(x[i]); }
+            quantise_groups(xf, hidden, xq.data() + t * hidden, xs.data() + t * groups_h);
+            return;
+        }
+        if (ph == 1) {
+            const auto job_index = static_cast<std::size_t>(item / kPhaseAChunks);
+            const int chunk      = static_cast<int>(item % kPhaseAChunks);
+            const CpuExpertJob& job = round->jobs[job_index];
+            const int per_chunk     = intermediate / kPhaseAChunks;
+            const int j0 = chunk * per_chunk;
+            const int j1 = chunk == kPhaseAChunks - 1 ? intermediate : j0 + per_chunk;
+            const std::size_t gate_rows = static_cast<std::size_t>(2) * intermediate;
+            const auto* gate_codes = reinterpret_cast<const std::int8_t*>(bank->gate_up_codes) +
+                                     static_cast<std::size_t>(job.expert) * gate_rows * hidden;
+            const auto* gate_scales = reinterpret_cast<const std::uint16_t*>(bank->gate_up_scales) +
+                                      static_cast<std::size_t>(job.expert) * gate_rows * groups_h;
+            const std::int8_t* txq = xq.data() + static_cast<std::size_t>(job.token) * hidden;
+            const float* txs       = xs.data() + static_cast<std::size_t>(job.token) * groups_h;
+            float* hj              = h.data() + job_index * intermediate;
+            for (int j = j0; j < j1; ++j) {
+                float g = 0.0F, u = 0.0F;
+                dot_two_rows(gate_codes + static_cast<std::size_t>(j) * hidden, gate_scales + static_cast<std::size_t>(j) * groups_h,
+                             gate_codes + static_cast<std::size_t>(intermediate + j) * hidden,
+                             gate_scales + static_cast<std::size_t>(intermediate + j) * groups_h, txq, txs, hidden, g, u);
+                hj[j] = silu(g) * u;
+            }
+            return;
+        }
+        // phase 2: chunk 0 of every job quantises the intermediate first? No — quantisation must
+        // precede all chunks, so it is done by each chunk redundantly on its own copy only when
+        // cheap; here every chunk quantises the whole intermediate into thread-local scratch
+        // (intermediate is small: 640 values), which keeps the phases at two barriers.
+        const auto job_index = static_cast<std::size_t>(item / kPhaseBChunks);
+        const int chunk      = static_cast<int>(item % kPhaseBChunks);
+        const CpuExpertJob& job = round->jobs[job_index];
+        std::int8_t* thq = hq.data() + static_cast<std::size_t>(worker) * intermediate;
+        float* ths       = hs.data() + static_cast<std::size_t>(worker) * groups_i;
+        quantise_groups(h.data() + job_index * intermediate, intermediate, thq, ths);
+        const int per_chunk = hidden / kPhaseBChunks;
+        const int r0 = chunk * per_chunk;
+        const int r1 = chunk == kPhaseBChunks - 1 ? hidden : r0 + per_chunk;
+        const auto* down_codes = reinterpret_cast<const std::int8_t*>(bank->down_codes) +
+                                 static_cast<std::size_t>(job.expert) * hidden * intermediate;
+        const auto* down_scales = reinterpret_cast<const std::uint16_t*>(bank->down_scales) +
+                                  static_cast<std::size_t>(job.expert) * hidden * groups_i;
+        float* out = round->out + static_cast<std::size_t>(job.token) * hidden;
+        // Several jobs of the same token write disjoint row ranges only within a job; across
+        // jobs the same rows are shared, so accumulate with atomic adds (cheap at this width).
+        int r = r0;
+        for (; r + 1 < r1; r += 2) {
+            float y0 = 0.0F, y1 = 0.0F;
+            dot_two_rows(down_codes + static_cast<std::size_t>(r) * intermediate, down_scales + static_cast<std::size_t>(r) * groups_i,
+                         down_codes + static_cast<std::size_t>(r + 1) * intermediate,
+                         down_scales + static_cast<std::size_t>(r + 1) * groups_i, thq, ths, intermediate, y0, y1);
+            atomic_add(out + r, job.weight * y0);
+            atomic_add(out + r + 1, job.weight * y1);
+        }
+        if (r < r1) {
+            atomic_add(out + r, job.weight * dot_row(down_codes + static_cast<std::size_t>(r) * intermediate,
+                                                     down_scales + static_cast<std::size_t>(r) * groups_i, thq, ths,
+                                                     intermediate));
+        }
+    }
+
+    static void atomic_add(float* target, float value) {
+        auto* word = reinterpret_cast<std::atomic<std::uint32_t>*>(target);
+        std::uint32_t expected = word->load(std::memory_order_relaxed);
+        for (;;) {
+            float current;
+            std::memcpy(&current, &expected, sizeof(current));
+            const float next = current + value;
+            std::uint32_t desired;
+            std::memcpy(&desired, &next, sizeof(desired));
+            if (word->compare_exchange_weak(expected, desired, std::memory_order_relaxed)) { return; }
+        }
+    }
+
+    // Runs one phase: all workers (and the caller) pull items, then barrier.
+    void run_phase(int ph, std::uint32_t worker) {
+        const std::int64_t items = items_for_phase(ph);
+        for (;;) {
+            const std::int64_t item = next_item.fetch_add(1, std::memory_order_relaxed);
+            if (item >= items) { break; }
+            do_item(ph, item, worker);
+        }
+    }
+
+    void worker_loop(std::uint32_t index, bool pin) {
 #if defined(__x86_64__)
         if (pin) {
             cpu_set_t set;
@@ -310,23 +439,27 @@ struct CpuExpertPool::Impl {
 #endif
         std::uint64_t seen = 0;
         for (;;) {
-            {
+            // Spin briefly for a new round, then sleep on the condition variable.
+            std::uint64_t gen = generation.load(std::memory_order_acquire);
+            for (int spin = 0; gen == seen && !stop && spin < 20000; ++spin) {
+                cpu_relax();
+                gen = generation.load(std::memory_order_acquire);
+            }
+            if (gen == seen && !stop) {
                 std::unique_lock<std::mutex> lock(mutex);
-                wake.wait(lock, [&] { return stop || generation != seen; });
-                if (stop) { return; }
-                seen = generation;
+                wake.wait(lock, [&] { return stop || generation.load(std::memory_order_acquire) != seen; });
+                gen = generation.load(std::memory_order_acquire);
             }
-            std::byte* local = scratch[index].data();
-            for (;;) {
-                const std::int64_t j = next_job.fetch_add(1);
-                if (j >= static_cast<std::int64_t>(round->jobs.size())) { break; }
-                const CpuExpertJob& job = round->jobs[static_cast<std::size_t>(j)];
-                const std::uint16_t* x  = round->x + static_cast<std::size_t>(job.token) * geometry.hidden;
-                float* out              = round->out + static_cast<std::size_t>(job.token) * geometry.hidden;
-                std::lock_guard<std::mutex> guard(*token_locks[static_cast<std::size_t>(job.token)]);
-                cpu_expert_compute_job(geometry, *bank, job, x, out, local);
+            if (stop) { return; }
+            seen = gen;
+            for (int ph = 0; ph < 3; ++ph) {
+                // Wait for the phase to open (the coordinator advances `phase` after a barrier).
+                while (phase.load(std::memory_order_acquire) != ph + 1) { cpu_relax(); }
+                run_phase(ph, index);
+                arrived.fetch_add(1, std::memory_order_acq_rel);
+                while (phase.load(std::memory_order_acquire) == ph + 1) { cpu_relax(); } // barrier release
             }
-            if (finished.fetch_add(1) + 1 == threads) {
+            if (finished.fetch_add(1, std::memory_order_acq_rel) + 1 == threads) {
                 std::lock_guard<std::mutex> lock(mutex);
                 done.notify_all();
             }
@@ -344,10 +477,11 @@ CpuExpertPool::CpuExpertPool(const SparseMoeGeometry& geometry, Options options)
         threads           = hw > 1 ? hw / 2 : 1; // one per physical core on SMT-2 parts
     }
     impl_->threads = threads;
-    impl_->scratch.resize(threads);
-    for (auto& s : impl_->scratch) { s.resize(cpu_expert_scratch_bytes(geometry) + 64); }
+    impl_->x_float.resize(static_cast<std::size_t>(threads) * geometry.hidden);
+    impl_->hq.resize(static_cast<std::size_t>(threads) * geometry.intermediate);
+    impl_->hs.resize(static_cast<std::size_t>(threads) * (geometry.intermediate / kGroup));
     for (std::uint32_t i = 0; i < threads; ++i) {
-        impl_->workers.emplace_back([impl = impl_.get(), i, pin = options.pin_threads] { impl->worker(i, pin); });
+        impl_->workers.emplace_back([impl = impl_.get(), i, pin = options.pin_threads] { impl->worker_loop(i, pin); });
     }
 }
 
@@ -370,23 +504,33 @@ void CpuExpertPool::run(const CpuExpertBank& bank, const CpuExpertRound& round) 
         if (job.token < 0 || job.token >= round.tokens) {
             throw std::invalid_argument("cpu_expert_compute: job token out of range");
         }
+        if (job.expert < 0 || job.expert >= impl_->geometry.experts) {
+            throw std::invalid_argument("cpu_expert_compute: job expert out of range");
+        }
     }
     if (round.jobs.empty()) { return; }
     Impl& impl = *impl_;
-    if (impl.token_locks.size() < static_cast<std::size_t>(round.tokens)) {
-        impl.token_locks.reserve(static_cast<std::size_t>(round.tokens));
-        while (impl.token_locks.size() < static_cast<std::size_t>(round.tokens)) {
-            impl.token_locks.emplace_back(std::make_unique<std::mutex>());
-        }
-    }
-    std::unique_lock<std::mutex> lock(impl.mutex);
+    const auto jobs = round.jobs.size();
+    impl.xq.resize(static_cast<std::size_t>(round.tokens) * impl.geometry.hidden);
+    impl.xs.resize(static_cast<std::size_t>(round.tokens) * (impl.geometry.hidden / kGroup));
+    impl.h.resize(jobs * impl.geometry.intermediate);
     impl.bank  = &bank;
     impl.round = &round;
-    impl.next_job.store(0);
-    impl.finished.store(0);
-    ++impl.generation;
+    impl.finished.store(0, std::memory_order_relaxed);
+    impl.phase.store(0, std::memory_order_release);
+    // Publish the round; then open the three phases in turn, each behind a barrier.
+    impl.generation.fetch_add(1, std::memory_order_acq_rel);
     impl.wake.notify_all();
-    impl.done.wait(lock, [&] { return impl.finished.load() == impl.threads; });
+    for (int ph = 0; ph < 3; ++ph) {
+        impl.next_item.store(0, std::memory_order_relaxed);
+        impl.arrived.store(0, std::memory_order_relaxed);
+        impl.phase.store(ph + 1, std::memory_order_release);
+        while (impl.arrived.load(std::memory_order_acquire) < impl.threads) { cpu_relax(); }
+    }
+    impl.phase.store(4, std::memory_order_release); // release the last barrier
+    std::unique_lock<std::mutex> lock(impl.mutex);
+    impl.done.wait(lock, [&] { return impl.finished.load(std::memory_order_acquire) == impl.threads; });
+    impl.phase.store(0, std::memory_order_release);
     impl.bank  = nullptr;
     impl.round = nullptr;
 }
