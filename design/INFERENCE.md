@@ -206,6 +206,23 @@ and the baseline run is queued.
   configuration is being rerun with the current binary on GPU 2 (expect ~1,760 unbatched);
   the stage-A 32-user datapoint still lands as a sanity check. Lesson recorded: compare
   against the board only with the board's script.
+- **CPU split v1, first run (2026-08-28):** the CLI failed with `view element count mismatch`
+  — in the decode loop the hook receives one token's ids but not which column of the block's
+  output it is, so the Variant's thread-local output view had the wrong shape. Fix: the hook
+  now carries the round's own input/output views (`resolve(ctx, ids, alpha, x, destination,
+  stream)`; one column in the decode loop, the slice otherwise) and the Variant uses them.
+- **Hit-rate readout (eager, 3,000 slots, single stream, 48 tokens):** sampled miss share
+  36.5 % — i.e. **~63 % of routed experts hit the pool** at one user, far more than the sweep
+  suggested; and the CLI's pure decode rate with the cache is **31.7 tok/s** (the loadgen's
+  18.5 divides output tokens by wall time including the 512-token prefill; ik's per-stream p50
+  is 35.4). So single-stream we are within ~10 % of ik with the pool alone.
+- **CPU kernel micro-benchmark (synthetic 512-expert bank, real geometry):** 32 threads
+  154 GB/s best (140 mean), 16 threads 178 (167), 8 threads 99 — one socket's DRAM speed;
+  the 32-thread case loses to cross-NUMA traffic (the bank lives on one node) → NUMA-split
+  banks next. Single-token rounds (10 jobs) only 10 GB/s: per job the kernel took ~6 ms, far
+  below DRAM speed per core — the scalar fp16 scale conversion and per-row reductions
+  dominated; the kernel now converts 16 scales at a time (F16C) and processes gate/up and
+  down rows in pairs; re-measuring.
 5. **Prefill**: selective streaming of used experts per layer with whole-layer double
    buffering on a side stream.
 
