@@ -745,3 +745,17 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   (the down kernels write per-assignment rows that the reduce sums, so a skipped expert's
   rows must be zero; 26 MB at 5,120 assignments). Small-T rounds (s2→s3) still need the
   same audit before the split is allowed there beyond 64 columns.
+- Small-T audit (2026-08-28): small-T's s3/s4 call the decode launchers
+  (`sparse_moe_decode_launch_d3_small_t` / `d4_small_t`) whose kernels carry the `block >= 0`
+  guard, so the prefill kernels were the only unguarded schedule; all three now skip
+  host-routed experts.
+- VNNI A/B (2026-08-28, bench, 32 threads, mean over rounds): decode shape 236 vs 240 GB/s
+  (bandwidth-bound, no change as expected); 10 tokens/expert **872 vs 771 GB/s-eq (+13 %)**;
+  40 tokens/expert **1,083 vs 897 (+21 %)**. Far below the 1.5-1.8× the instruction count
+  suggests — the batched kernel is bound by something other than the dot (the per-pair
+  permutes and the compensation, the atomic adds of the down phase, the phase barriers, or
+  the per-job quantisation); a `perf` profile of the bench is the next step there.
+- Prefill split, corrected binary (2026-08-28): share 0.5 at one user answers correctly and
+  **TTFT 1.865 s (from 2.95 s) → 275 t/s prompt processing (from 174), 1.58×**; loadgen
+  decode 22.4 (18.4) because the prompt phase takes less of the wall. Share 0.7, 16 users, 32
+  users at 2,000 slots and the 4k-prompt pair follow in the same chain.
