@@ -223,6 +223,14 @@ and the baseline run is queued.
   below DRAM speed per core — the scalar fp16 scale conversion and per-row reductions
   dominated; the kernel now converts 16 scales at a time (F16C) and processes gate/up and
   down rows in pairs; re-measuring.
+- NUMA plan for the CPU split (this box: 2 × EPYC 9124, 16 cores each, 2 nodes, ~160–190 GB/s
+  per node): the pinned host bank is allocated by one thread, so its pages sit on one node and
+  the 32-thread pool pays remote bandwidth. Two steps: (1) measure with the process under
+  `numactl --interleave=all` (pages spread over both nodes; queued in the probe chain);
+  (2) if it pays, allocate the bank per node (each layer's expert planes split by expert
+  range across the two nodes, `mbind` before the first touch) and run one pool per node whose
+  threads take the jobs whose expert lives on their node — the design's "one pool per NUMA
+  node over that node's half of the expert bank".
 5. **Prefill**: selective streaming of used experts per layer with whole-layer double
    buffering on a side stream.
 
