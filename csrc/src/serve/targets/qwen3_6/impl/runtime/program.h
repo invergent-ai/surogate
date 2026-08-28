@@ -260,6 +260,10 @@ public:
         ~PinnedBoundary() { if (data != nullptr) { cudaFreeHost(data); } }
     } stage_export;
     [[nodiscard]] const void* stage_export_buffer() const noexcept { return stage_export.data; }
+    /// True for a program that runs only part of the model (a pipeline stage).
+    [[nodiscard]] bool pipeline_stage() const noexcept {
+        return stage.first > 0 || (stage.last >= 0 && stage.last < static_cast<int>(TextConfig::layers));
+    }
     void configure_stage(const SequencePlanImpl& plan);
     const std::uint32_t capacity;
     const std::uint32_t kv_capacity;

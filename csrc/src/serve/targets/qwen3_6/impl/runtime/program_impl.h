@@ -1391,7 +1391,10 @@ void ProgramImplCore::prepare_graphs() {
         }
 
         // Round chaining (PATCHES.md #32): the chained flavor of every
-        // ordinary profile, captured over the same representative state.
+        // ordinary profile, captured over the same representative state. A pipeline stage
+        // has no sampled tokens to chain (the head lives on the last stage), so it keeps
+        // the family empty and always runs single rounds.
+        if (!pipeline_stage()) {
         schedule::ordinary_decode_batch_chained(ordinary_state, 1,
                                                 {code_warm.min + 1, code_warm.max + 1}, nullptr);
         device.synchronize();
@@ -1411,6 +1414,7 @@ void ProgramImplCore::prepare_graphs() {
                     profile.definition);
             }
         }
+        } // !pipeline_stage
     }
 
     if (speculative_backend == SpeculativeBackend::Mtp) {
@@ -2013,7 +2017,7 @@ ProgramImplCore::launch_ordinary_round(std::span<const std::uint32_t> lanes,
             burst = std::min(burst, budget.generated_tokens_remaining);
         }
         burst = std::min(burst, capacity - maximum_frontier);
-        if (burst == 0) { burst = 1; }
+        if (burst == 0 || pipeline_stage()) { burst = 1; }
 
         DecodeGraphExecutable* executable = nullptr;
         DecodeGraphExecutable* chained    = nullptr;
