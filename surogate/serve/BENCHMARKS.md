@@ -471,12 +471,36 @@ this session**, at 85 % of vLLM and 5x its TTFT.
 Everything else measured and rejected, so the next reader does not re-run it:
 
   - **vLLM's MoE Marlin** (#89, ported in full, kept behind
-    `SUROGATE_SERVE_MOE_MARLIN`): −7.5 % at 704 columns, −1.4 % at 1,408,
-    **+4.5 % at 2,688** — and 2,688 is the width a batched round runs at. Our
-    kernel computes gate and up in registers and writes `silu(gate)*up` at 512
-    wide; Marlin must materialise the 1024-wide product and fold it in a second
-    pass, which costs more than its better MMA schedule wins, and costs
-    accuracy too (rel_l2 1.56 % against our 0.16 %).
+    `SUROGATE_SERVE_MOE_MARLIN`). It is **faster where it matters and slower
+    where it does not**, per MoE layer (q4-q5, cold):
+
+    | columns | 99 | 128 | 192 | 320 | 704 | 1,408 | 2,688 |
+    |---|---:|---:|---:|---:|---:|---:|---:|
+    | ours (us) | 582 | 631 | 690 | 735 | 848 | 1,182 | **1,735** |
+    | Marlin (us) | **471** | **502** | **559** | **616** | **784** | **1,165** | 1,812 |
+
+    Marlin wins by 16-20 % up to a few hundred columns and loses by 4.5 % at
+    2,688. The reason is where each finds its parallelism: at 99 columns an
+    expert holds about four rows, and our kernel splits a job's 32 columns
+    across four warps, so one warp works and three idle — the decode-width
+    profile shows it plainly (sm 37 %, dram 40 %, **warps_active 24 %**, none
+    of them the limit). Marlin parallelises over the expert's 1,024 output
+    rows instead and keeps every warp busy. Above the crossover ours wins
+    because it computes gate and up in registers and writes `silu(gate)*up`
+    directly, where Marlin needs a second fold pass.
+
+    **Decode rounds are 15.8 of every 19.6 rounds**, so this is the dominant
+    regime — but the crossover cannot be built as things stand. The Marlin B
+    tiles are byte-identical in size to our Q4 codes, so a weight is adopted
+    *in place* (40 layers of a second plane would be 10.7 GB, which the card
+    does not have), and adoption is one-way: our kernels cannot read Marlin
+    tiles. Routing only the narrow rounds through it therefore corrupts every
+    wide round, and the decode and small-T MoE families — which graph capture
+    exercises at T = 1..16 — would need porting too. With all of that done the
+    round model puts the result at **~2,200 against vLLM's 2,290**, still short,
+    and Marlin's rel_l2 is 1.56 % where ours is 0.16 % (gate and up round
+    through bf16 before the fold, and our FP16 scales round to BF16 because
+    Marlin ties the scale type to the compute type).
   - **A deeper cp.async pipeline** in the routed kernels: 3 stages instead of 2
     is 590/848/2,139 us at 99/704/2,688 columns against 571/848/1,735 — shared
     memory is what caps occupancy at 3 blocks/SM, and a third stage spends more
