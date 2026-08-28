@@ -1075,3 +1075,11 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   its own split (x16 cards: host ~195 GB/s vs PCIe 52 → 79 %; the x8 cards 2/3/5/7: PCIe 26
   → 88 %), and the served answers are correct ('Paris', the primes, the ocean sentence).
   The 1/16/64-user runs on the C2 binary follow the C2 comparison on GPUs 2+3.
+- Per-socket host pools (2026-08-28, unbuilt into a binary yet): with stages on both sockets
+  the shared pool serialised every stage's host round on the same 32 cores. The pipeline
+  constructor now sets `EngineOptions::cpu_moe_pool_per_socket`, and each stage's cache
+  takes the pool of its GPU's NUMA node (PCI `numa_node` → the node's physical cores from
+  `/sys/devices/system/node/nodeN/cpulist`, first half on SMT-2), so stages 0-3 and 4-7 run
+  their host rounds concurrently on their own cores and memory (16 threads each; the
+  single-card server keeps the one 32-thread pool). `SUROGATE_SERVE_CPU_MOE_POOL_SHARED=1`
+  restores the shared pool for A/B.
