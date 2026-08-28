@@ -288,6 +288,8 @@ and the baseline run is queued.
   host idle, GPUs free, the pool fix and stress test were on disk but uncommitted; the chain
   (build → unit+stress test → v2 parity → probes 0.5/0.7 share at 1 and 16 users +
   NUMA-interleaved) was relaunched and the commit is gated on the stress test passing.
+- Stress test passed (3,000 rounds, 32 threads, watchdog quiet); pool fix committed (597d01c2).
+  v2 parity + probes running.
 5. **Prefill**: selective streaming of used experts per layer with whole-layer double
    buffering on a side stream.
 
