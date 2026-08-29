@@ -110,7 +110,7 @@ DecodeGraphTopology& select_graph_topology(DecodeGraphFamily& family, std::uint3
 }
 
 DecodeGraphExecutable& install_graph_profile(DecodeGraphFamily& family, DecodeGraphProfile& profile,
-                                             const char* label) {
+                                             const char* label, cudaStream_t stream) {
     DecodeGraphTopology& topology   = select_graph_topology(family, profile.topology_class, label);
     const std::size_t profile_index = static_cast<std::size_t>(&profile - family.profiles.data());
     if (topology.installed_profile != profile_index) {
@@ -127,7 +127,12 @@ DecodeGraphExecutable& install_graph_profile(DecodeGraphFamily& family, DecodeGr
         if (update_in_place) {
             topology.executable.update(profile.definition);
         } else {
+            // Mirror the family's own initialisation exactly: a fresh executable must be
+            // uploaded on the launch stream before its first launch (the upload commits its
+            // device allocation; launching an un-uploaded chained executable produced garbage
+            // egress on the first round after the switch).
             topology.executable.instantiate(profile.definition);
+            topology.executable.upload(stream);
         }
         topology.installed_profile = profile_index;
     }
@@ -2092,7 +2097,7 @@ ProgramImplCore::launch_ordinary_round(std::span<const std::uint32_t> lanes,
             DecodeGraphProfile& profile =
                 select_graph_profile(ordinary_graphs, static_cast<std::uint32_t>(lanes.size()),
                                      maximum_frontier, "ordinary batch");
-            executable = &install_graph_profile(ordinary_graphs, profile, "ordinary batch");
+            executable = &install_graph_profile(ordinary_graphs, profile, "ordinary batch", device.stream);
             envelope   = {profile.min_execution_frontier + 1, profile.max_execution_frontier + 1};
             burst      = std::min(burst,
                                   profile.max_execution_frontier - maximum_frontier + 1);
@@ -2101,8 +2106,7 @@ ProgramImplCore::launch_ordinary_round(std::span<const std::uint32_t> lanes,
                     ordinary_chained_graphs, static_cast<std::uint32_t>(lanes.size()),
                     maximum_frontier, "ordinary chained batch");
                 chained =
-                    &install_graph_profile(ordinary_chained_graphs, chained_profile,
-                                           "ordinary chained batch");
+                    &install_graph_profile(ordinary_chained_graphs, chained_profile, "ordinary chained batch", device.stream);
             }
         }
 
@@ -2744,7 +2748,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             DecodeGraphProfile& profile =
                 select_graph_profile(mtp_graphs, static_cast<std::uint32_t>(lanes.size()),
                                      maximum_frontier, "MTP batch");
-            executable = &install_graph_profile(mtp_graphs, profile, "MTP batch");
+            executable = &install_graph_profile(mtp_graphs, profile, "MTP batch", device.stream);
             envelopes  = mtp_gqa_envelopes(profile.max_execution_frontier, draft_window, capacity);
         }
 
@@ -2911,7 +2915,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             DecodeGraphProfile& profile =
                 select_graph_profile(dflash_graphs, static_cast<std::uint32_t>(lanes.size()),
                                      maximum_frontier, "DFlash batch");
-            executable      = &install_graph_profile(dflash_graphs, profile, "DFlash batch");
+            executable      = &install_graph_profile(dflash_graphs, profile, "DFlash batch", device.stream);
             envelopes       = dflash_envelopes(profile.min_execution_frontier,
                                                profile.max_execution_frontier, draft_window);
             target_envelope = {
