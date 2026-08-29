@@ -1384,4 +1384,13 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   off (explicit `--cpu-moe-share` still enables it); the bug stays open — suspects are the
   per-socket pool shared by four stages and the per-cache staging under concurrent stage
   rounds. Phase-2 single-device split: re-probing at 64 users.
+- Phase-2 split re-probed on one card at 64 users (2,000 slots, split auto): all probes correct
+  before and under load, 28.7 tok/s (TTFT 30.8 s is the admission queue at 64 lanes on one
+  card). The cross-lane corruption is specific to the pipelined multi-stage split.
+- State at 05:15: `csrc/build-serve` and `csrc/build-serve-b` both build the current source
+  (per-device prefill timer, layer-subset stages, staged capture card, split off for stages).
+  Phase 3 complete: the three models serve on the eight cards through `--devices`, verified
+  with the under-load probes at every measured concurrency; open items are the split bug
+  above, the slow synchronous prompt path (bypassed), scan-resistant replacement for stages
+  that cannot hold their experts, and the sparse indexer for >2k context.
 
