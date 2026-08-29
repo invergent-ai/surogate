@@ -1358,8 +1358,8 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
     if (segments.empty()) {
         throw std::invalid_argument("mixed chunk needs at least one prefill segment");
     }
-    const std::int32_t batch = decode.ids.ne[0];
-    if (batch <= 0 || batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
+    const std::int32_t batch = decode.ids.ne[0]; // 0: a batched prefill round without decode lanes
+    if (batch < 0 || batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
         throw std::invalid_argument("mixed chunk decode batch is out of range");
     }
     cudaStream_t s   = ctx_.stream;
@@ -1491,7 +1491,7 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                     throw std::logic_error("mixed chunk does not support rope-delta prompts yet");
                 }
                 Tensor rope_all = rope_positions.view({total});
-                {
+                if (batch > 0) {
                     Tensor rope_decode = rope_positions.slice(0, prefill_cols, batch);
                     CUDA_CHECK(cudaMemcpyAsync(rope_decode.data, decode.rope_positions.data,
                                                static_cast<std::size_t>(batch) *
@@ -1520,7 +1520,7 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                                        batch_text_kv_->batch_layer_view(fidx), envelope, work_, aa,
                                        s);
                 }
-                {
+                if (batch > 0) {
                     Tensor qb = qn.slice(2, prefill_cols, batch)
                                     .view({kCfg.head_dim, kCfg.n_q, 1, batch});
                     Tensor kb = kn.slice(2, prefill_cols, batch)
@@ -1584,7 +1584,7 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                                                 s);
                     }
                 }
-                {
+                if (batch > 0) {
                     Tensor qkv_b  = qkv.slice(1, prefill_cols, batch)
                                        .view({kCfg.conv_dim, 1, batch});
                     Tensor qkv_cb = qkv_c.slice(1, prefill_cols, batch)
@@ -1622,7 +1622,7 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                                          recurrent_state, oa, s);
                     }
                 }
-                {
+                if (batch > 0) {
                     Tensor qb = q_recurrent.slice(2, prefill_cols, batch)
                                     .view({kCfg.gdn_k_dim, kCfg.gdn_k_heads, 1, batch});
                     Tensor kb = k_recurrent.slice(2, prefill_cols, batch)
@@ -1902,7 +1902,7 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
 
                 Tensor rope_positions = roots.positions;
                 Tensor rope_all       = rope_positions.view({total});
-                {
+                if (batch > 0) {
                     Tensor rope_decode = rope_positions.slice(0, prefill_cols, batch);
                     CUDA_CHECK(cudaMemcpyAsync(rope_decode.data, decode.rope_positions.data,
                                                static_cast<std::size_t>(batch) *
@@ -1922,7 +1922,7 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
                                        batch_text_kv_->batch_layer_view(fidx), prefill_envelope,
                                        work_, aa, s);
                 }
-                {
+                if (batch > 0) {
                     Tensor qb = qn.slice(2, prefill_cols, batch)
                                     .view({kCfg.head_dim, kCfg.n_q, 1, batch});
                     Tensor kb = kn.slice(2, prefill_cols, batch)
@@ -1982,7 +1982,7 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
                     ops::causal_conv1d_silu(qkv_a, *gdn.conv1d, conv_state, conv_state, qkv_ca,
                                             valid, s);
                 }
-                {
+                if (batch > 0) {
                     Tensor qkv_b  = qkv.slice(1, prefill_cols, batch)
                                        .view({kCfg.conv_dim, 1, batch});
                     Tensor qkv_cb = qkv_c.slice(1, prefill_cols, batch)
@@ -2014,7 +2014,7 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
                     ops::gated_delta_net(qa, ka, va, ga, ba, kGdnScale, true, work_,
                                          recurrent_state, oa, s);
                 }
-                {
+                if (batch > 0) {
                     Tensor qb = q_recurrent.slice(2, prefill_cols, batch)
                                     .view({kCfg.gdn_k_dim, kCfg.gdn_k_heads, 1, batch});
                     Tensor kb = k_recurrent.slice(2, prefill_cols, batch)

@@ -111,7 +111,7 @@ Tensor Tensor::reshape(std::initializer_list<std::int32_t> shape) const { return
 
 Tensor Tensor::slice(int dim, std::int32_t start, std::int32_t len) const {
     if (dim < 0 || dim >= 4) { throw std::invalid_argument("slice dim out of range"); }
-    if (start < 0 || len <= 0 || start > ne[dim] || len > ne[dim] - start) {
+    if (start < 0 || len < 0 || start > ne[dim] || len > ne[dim] - start) {
         throw std::invalid_argument("slice range out of bounds");
     }
 
