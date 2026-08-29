@@ -1205,3 +1205,11 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   58.2 (TTFT 2.6 s — batching waits), **64 users 59.6 tok/s, 65 completions, TTFT 18 s** (it
   ran; the graph-update failure did not recur). Throughput flat from 16 to 64 users is the
   fill/drain signature; C3 is building.
+- C3's first binary hung on the first request (2026-08-29): a lone-prefill flight runs its
+  stages synchronously inside `launch_group_prefill`, so it was finished before any
+  `tick()`, and `begin_flight` dropped the finished-group list — the executor never resolved
+  the prefill, the lane never became decode-ready, and the loop spun on it (the server's
+  warm-up then aborted). Fix (ed8f9033): launches park finished groups in
+  `pending_finished_`, which the next `tick()` returns; the executor ticks whenever
+  something is in flight or pending. The C3 chain is rerun with a 2-stage CLI generation
+  check first.
