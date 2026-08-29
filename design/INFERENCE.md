@@ -1235,3 +1235,12 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   pipelined loop's own admission loop admitted into every free lane, but admission stages
   the prompt into the mixed prefill set, which holds 8. `top_up_prefill_lanes` already admits
   exactly while the set has room; the pipelined loop now uses it alone.
+- **C3 on 8 stages traced** (2026-08-29 02:45, 16 users): decode is fine — one-column stage
+  rounds of 3-10 ms cycling through all eight stages — but the lone prefill steps cost
+  **1.5-2 s per stage** (96 steps, 12 prompts × 8 stages), executed synchronously on the
+  executor thread, so decode starves and TTFT reaches 116 s (3.5 tok/s). The closed
+  pipeline's mixed rounds prefilled the same 512-token chunk on a stage in ~75 ms, so the
+  lone `advance_prefill_lane` path is ~20× slower than the mixed path on the same stage.
+  Two threads of work: an A/B (prefill share 0; split off) to see which component the lone
+  step spends its time in, and the structural fix — run lone prefills as asynchronous
+  mixed rounds with zero decode lanes so the pipeline never blocks on them.
