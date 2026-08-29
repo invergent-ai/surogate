@@ -1227,3 +1227,7 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   that passed `mixed_round_supported`, so when none did (no decode lanes yet), nothing was
   ever launched. The single-round loop advances any staged prefill. Fix (e9bdc3b5): a lone
   prefill takes the group's first staged lane; mixed support gates only the mixed round.
+- **C3 measured, first point** (2026-08-29 02:09): 2 stages on GPUs 2+3, split off, 8 users,
+  128/512: **53.7 tok/s, 15 completions** against 44.5-44.8 for the closed pipeline / lockstep
+  and 42.2 for one card — +21 % with the stages' gathers sharing one x8 link. The 8-stage
+  points (16/64/1 users) and the 27B/35B at 100 users follow in the same chain.
