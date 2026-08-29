@@ -206,9 +206,15 @@ concurrency, not before the load.
 - **35B-A3B**: NVFP4 expert artifact; row-parallel decode-width routed kernel.
 - **27B**: layer-loop fusion and a wider GDN chunked scan (the 114 µs column).
 - **Flash-Next**: prefill split at 16–64 users; host tile kernel (interleaved
-  rows); Q4 host bank. The sparse (QSA) indexer shipped 2026-08-29 — contexts up
-  to the model's trained 262,144 are served, needle retrieval 12/12 at 3.5k and
-  5.7k tokens, and nothing runs below its 2,051-token budget.
+  rows). The sparse (QSA) indexer shipped 2026-08-29 (contexts to the trained
+  262,144; needle 12/12 at 3.5k and 5.7k tokens; nothing runs below its budget).
+  The Q4 host bank shipped 2026-08-29: `--host-expert-bank q4` requantises the
+  pinned experts W8→Q4G32AM at load — process peak 101 GB vs 297, startup 96 s,
+  decode ~+10 % (host GEMV and PCIe gather bytes nearly halve), quality at
+  parity on the 100-probe battery.
+- **Prefix reuse leaks cross-request content** (2026-08-29, severity high, open):
+  blended other-request topics at 16 lanes under load, in both bank formats;
+  `--no-prefix-reuse` removes it entirely (97/100). Details in INFERENCE.md.
 - **0.8B**: ~4-per-100,000 mixed-round corruption.
 - Record the card with every number; re-measure single-user cells on the
   same card as the 100-user rows.
