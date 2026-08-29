@@ -1394,7 +1394,20 @@ private:
                 std::scoped_lock execution_lock(execution_mutex_);
                 const auto seg_t0                = Clock::now();
                 const bool have_pending          = expire_pending_requests();
-                const auto cancelled_at_boundary = snapshot_cancellations();
+                auto cancelled_at_boundary = snapshot_cancellations();
+                if constexpr (kPipelined) {
+                    // A lane whose group is mid-pipeline is cancelled at its group's boundary
+                    // (the snapshot is retaken every iteration), never under an in-flight round.
+                    for (std::uint32_t g = 0; g < group_meta_.size(); ++g) {
+                        if (!instance_.program->group_in_flight(g)) { continue; }
+                        const GroupMeta& meta = group_meta_[g];
+                        for (std::size_t row = 0; row < meta.membership.size; ++row) {
+                            cancelled_at_boundary[meta.membership.lanes[row]] = false;
+                        }
+                        for (std::size_t i = 0; i < meta.staged_count; ++i) { cancelled_at_boundary[meta.staged[i]] = false; }
+                        cancelled_at_boundary[meta.prefill_lane] = cancelled_at_boundary[meta.prefill_lane] && meta.staged_count != 0 && false;
+                    }
+                }
                 cancel_active_requests(cancelled_at_boundary);
                 if constexpr (kPipelined) {
                     seg_timer_.boundary += std::chrono::duration<double>(Clock::now() - seg_t0).count();
