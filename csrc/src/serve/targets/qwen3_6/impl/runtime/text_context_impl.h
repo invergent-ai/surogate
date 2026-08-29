@@ -12,6 +12,7 @@
 #include <chrono>
 #include <api/targets/qwen3_6/vision_control.h>
 #include "api/ops/argmax.h"
+#include "ops/linear/bf16/bf16_cublaslt.h"
 #include "api/ops/attn_input_proj.h"
 #include "api/ops/causal_conv1d_silu.h"
 #include "api/ops/embedding.h"
@@ -1290,6 +1291,65 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                          total / timer.chunks, 1000.0 * timer.tokens / total);
             print_gdn_subsplit(timer, "prefill-families");
         }
+    }
+}
+
+// QSA sparse selection for one full-attention layer. Model-agnostic: driven entirely by the
+// Variant's indexer traits and the layer's indexer weights, both absent for every other target.
+
+template <class V>
+ops::GqaBlockMask TextContext::text_indexer_selection(const FullLayerW& w, const Tensor& hidden,
+                                                      std::int32_t tokens,
+                                                      const Tensor& cache_positions,
+                                                      const Tensor& rope_positions,
+                                                      const Tensor& table_rows, std::int32_t keys,
+                                                      PagedKVBatchLayerView cache) {
+    if constexpr (!requires { V::indexer_head_dim; }) {
+        return ops::GqaBlockMask{};
+    } else {
+        const ops::QsaIndexerGeometry geometry{
+            .head_dim   = V::indexer_head_dim,
+            .heads      = V::indexer_heads,
+            .block      = V::indexer_block,
+            .top_k      = V::indexer_top_k,
+            .rotary_dim = kCfg.rotary_dim,
+            .rope_theta = kCfg.rope_theta,
+            .rms_eps    = kCfg.rms_eps,
+        };
+        // Dependent on V so the discarded branch is never checked against a target whose
+        // attention payload has no indexer.
+        const auto& payload =
+            static_cast<const typename V::FullAttentionProjectionWeights&>(*w.projection);
+        const auto& indexer = payload.indexer;
+        if (!indexer.valid() || cache.indexer_pages.data == nullptr || tokens <= 0) {
+            return ops::GqaBlockMask{};
+        }
+        cudaStream_t s = ctx_.stream;
+        // The keys are cached raw for every column, whatever the history length: a later query
+        // pools them into a block key, so skipping the append below the budget would leave holes.
+        Tensor raw_keys = work_.alloc(DType::BF16, {geometry.head_dim, tokens});
+        ops::detail::bf16_cublaslt_gemm(indexer.key, hidden, raw_keys, s);
+        ops::qsa_indexer_append(raw_keys, cache_positions, table_rows, indexer.key_norm, geometry,
+                                cache, s);
+        if (ops::qsa_selection_is_dense(keys, geometry)) { return ops::GqaBlockMask{}; }
+
+        const std::int32_t width = geometry.head_dim * geometry.heads;
+        Tensor queries           = work_.alloc(DType::BF16, {width, tokens});
+        ops::detail::bf16_cublaslt_gemm(indexer.query, hidden, queries, s);
+        Tensor normalized = work_.alloc(DType::BF16, {width, tokens});
+        Tensor heads      = queries.view({geometry.head_dim, geometry.heads, tokens});
+        Tensor heads_norm = normalized.view({geometry.head_dim, geometry.heads, tokens});
+        ops::rmsnorm(heads, indexer.query_norm, geometry.rms_eps, true, heads_norm, s);
+        Tensor rope_view = rope_positions.view({tokens});
+        ops::rope(rope_view, geometry.rotary_dim, geometry.rope_theta, heads_norm, s);
+
+        const std::int32_t words = ops::qsa_block_mask_words(keys, geometry.block);
+        Tensor mask              = work_.alloc(DType::I32, {words, tokens});
+        ops::qsa_indexer_select(heads_norm, cache_positions, table_rows, geometry, cache, keys,
+                                work_, mask, s);
+        return ops::GqaBlockMask{.words  = static_cast<const std::uint32_t*>(mask.data),
+                                 .stride = words,
+                                 .block  = geometry.block};
     }
 }
 

@@ -153,8 +153,11 @@ int main() {
         Tensor keys(d_keys.p, DType::BF16, {kHeadDim, count});
         Tensor pos_t(d_pos.p, DType::I32, {count});
         Tensor gain_t(d_gain.p, DType::BF16, {kHeadDim});
-        ninfer::ops::qsa_indexer_append(keys, pos_t, gain_t, geometry(2048), cache.layer_view(),
-                                        nullptr);
+        std::vector<int> rows(static_cast<std::size_t>(count), 0);
+        DeviceBuffer d_rows = to_device_i32(rows);
+        Tensor rows_t(d_rows.p, DType::I32, {count});
+        ninfer::ops::qsa_indexer_append(keys, pos_t, rows_t, gain_t, geometry(2048),
+                                        cache.batch_view(), nullptr);
         cudaStreamSynchronize(nullptr);
     };
     append(0, 256);

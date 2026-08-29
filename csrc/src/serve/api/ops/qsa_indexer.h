@@ -51,9 +51,10 @@ struct QsaIndexerGeometry {
 ///   positions I32  [T]             absolute cache position of each column, ascending
 ///   key_norm  BF16 [head_dim]      RMSNorm gain of the block key
 ///   cache     the layer's view; `indexer_pages` and `block_table` are read and written
-void qsa_indexer_append(const Tensor& keys, const Tensor& positions, const Tensor& key_norm,
-                        const QsaIndexerGeometry& geometry, const PagedKVLayerView& cache,
-                        cudaStream_t stream);
+///   table_rows I32 [T]  block-table row of each column's sequence
+void qsa_indexer_append(const Tensor& keys, const Tensor& positions, const Tensor& table_rows,
+                        const Tensor& key_norm, const QsaIndexerGeometry& geometry,
+                        PagedKVBatchLayerView cache, cudaStream_t stream);
 
 /// Selects the visible blocks of every query row and writes its bitmask.
 ///   q          BF16 [head_dim, heads, rows]  normalised and roped indexer queries

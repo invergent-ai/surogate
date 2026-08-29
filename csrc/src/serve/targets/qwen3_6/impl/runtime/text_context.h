@@ -11,6 +11,7 @@
 #include "core/weight.h"
 #include "api/ops/sampling.h"
 #include "api/ops/gqa_attention.h"
+#include "api/ops/qsa_indexer.h"
 #include <api/targets/qwen3_6/decoder_state.h>
 #include <api/targets/qwen3_6/prepared_prompt.h>
 #include <api/targets/qwen3_6/round_state.h>
@@ -185,6 +186,20 @@ public:
     /// Pipeline stage: restricts the layer loop to [first, last) and swaps the embedding for a
     /// residual import (first > 0) and the finish/head for a residual export (last < layers).
     void set_stage(const StageSpan& stage);
+
+    // QSA sparse selection for one full-attention layer (design/INFERENCE.md, phase 4): projects
+    // the layer's indexer keys and queries out of the attention input, folds the completed blocks
+    // into the cache's indexer plane, and scores the blocks for every query column. Returns an
+    // empty mask when the target has no indexer or the history still fits the budget — the dense
+    // attention below `dense_exact_context` is then bit-identical to what it was.
+    template <class V = Variant>
+    [[nodiscard]] ops::GqaBlockMask text_indexer_selection(const FullLayerW& w, const Tensor& hidden,
+                                                           std::int32_t tokens,
+                                                           const Tensor& cache_positions,
+                                                           const Tensor& rope_positions,
+                                                           const Tensor& table_rows,
+                                                           std::int32_t keys,
+                                                           PagedKVBatchLayerView cache);
     [[nodiscard]] bool stage_embeds() const noexcept { return stage_first_ == 0; }
     [[nodiscard]] bool stage_finishes() const noexcept { return stage_last_ == kCfg.n_layers; }
     void set_proposal_head(const Weight* weight, const std::int32_t* ids, int count) noexcept {

@@ -40,8 +40,10 @@ __device__ __forceinline__ void rope_sincos(float position, int pair, int rotary
 // folds that block's `kBlock` raw keys into the block key kept at the block's first cell.
 __global__ void qsa_append_kernel(const __nv_bfloat16* __restrict__ keys,
                                   const std::int32_t* __restrict__ positions,
+                                  const std::int32_t* __restrict__ table_rows,
+                                  const std::int32_t* __restrict__ block_tables,
+                                  std::int32_t table_stride,
                                   const __nv_bfloat16* __restrict__ key_norm,
-                                  const std::int32_t* __restrict__ block_table,
                                   __nv_bfloat16* __restrict__ plane, int tokens, int rotary_dim,
                                   float theta, float eps) {
     const int warp  = static_cast<int>(threadIdx.x) / kWarp;
@@ -50,6 +52,9 @@ __global__ void qsa_append_kernel(const __nv_bfloat16* __restrict__ keys,
     if (token >= tokens) { return; }
     const int position = positions[token];
     const int d0       = lane * kPerLane;
+    const std::int32_t* block_table =
+        block_tables + static_cast<std::int64_t>(table_rows == nullptr ? 0 : table_rows[token]) *
+                           table_stride;
 
     float raw[kPerLane];
     const __nv_bfloat16* src = keys + static_cast<std::int64_t>(token) * kHeadDim + d0;
@@ -251,9 +256,9 @@ std::size_t qsa_indexer_select_workspace_capacity_bytes(std::int32_t rows, std::
     return static_cast<std::size_t>(rows) * blocks * sizeof(float) + 256U;
 }
 
-void qsa_indexer_append(const Tensor& keys, const Tensor& positions, const Tensor& key_norm,
-                        const QsaIndexerGeometry& geometry, const PagedKVLayerView& cache,
-                        cudaStream_t stream) {
+void qsa_indexer_append(const Tensor& keys, const Tensor& positions, const Tensor& table_rows,
+                        const Tensor& key_norm, const QsaIndexerGeometry& geometry,
+                        PagedKVBatchLayerView cache, cudaStream_t stream) {
     require(geometry.head_dim == kHeadDim && geometry.block == kBlock,
             "only the 128-wide, 4-cell indexer is registered");
     require(geometry.rotary_dim > 0 && geometry.rotary_dim <= kHeadDim &&
@@ -263,16 +268,19 @@ void qsa_indexer_append(const Tensor& keys, const Tensor& positions, const Tenso
     require(positions.dtype == DType::I32, "positions must be I32");
     require(keys.ne[0] == kHeadDim, "keys must be [head_dim, T]");
     require(cache.indexer_pages.data != nullptr, "the cache carries no indexer plane");
-    require(cache.block_table.data != nullptr, "the cache view has no block table");
+    require(cache.block_tables.data != nullptr, "the cache view has no block tables");
     const int tokens = static_cast<int>(keys.ne[1]);
     if (tokens == 0) { return; }
     require(positions.ne[0] == tokens, "positions must match the columns");
     const int blocks = (tokens + kWarps - 1) / kWarps;
+    require(table_rows.data == nullptr || table_rows.ne[0] == tokens,
+            "table rows must match the columns");
     qsa_append_kernel<<<blocks, kThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(keys.data),
         static_cast<const std::int32_t*>(positions.data),
+        static_cast<const std::int32_t*>(table_rows.data),
+        static_cast<const std::int32_t*>(cache.block_tables.data), cache.block_tables.ne[0],
         static_cast<const __nv_bfloat16*>(key_norm.data),
-        static_cast<const std::int32_t*>(cache.block_table.data),
         static_cast<__nv_bfloat16*>(cache.indexer_pages.data), tokens, geometry.rotary_dim,
         geometry.rope_theta, geometry.rms_eps);
 }
