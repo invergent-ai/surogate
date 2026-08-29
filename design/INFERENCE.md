@@ -1351,4 +1351,7 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   layers). Fixed by `capture_card.set_stage(stage)`. The request-side prefill graph path does
   not key on the stage; the mixed-round captures (the pipelined prompt path) always ran on
   staged cards.
+- Layer-subset stages verified (2026-08-29 04:48): 2-stage CLI answers "The capital of France
+  is **Paris**." with 6.80 GiB of weights uploaded across both stages (11 GiB per stage
+  before). Running: 8 stages × 3,072 slots at 64 and 32 users.
 
