@@ -1344,4 +1344,11 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   clean. Suspect: the CPU split's per-slice pinned mirror ring (8 entries per process) with 8
   stages each holding a round in flight. To discriminate: 64 users at 3,072 slots (split off)
   and 64 users at 2,100 slots with `--cpu-moe-share 0`.
+- Capture card without a stage (2026-08-29): the program constructor's warm-up prefill and
+  prefill-graph precapture ran on a `TextContext` that never received the stage span, so every
+  stage warmed up and precaptured all 48 layers (harmless while every layer was materialised —
+  except for the startup time — and a hard error once a stage materialises only its own
+  layers). Fixed by `capture_card.set_stage(stage)`. The request-side prefill graph path does
+  not key on the stage; the mixed-round captures (the pipelined prompt path) always ran on
+  staged cards.
 

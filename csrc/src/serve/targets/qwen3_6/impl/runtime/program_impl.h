@@ -1598,6 +1598,9 @@ void ProgramImplCore::prepare_graphs() {
                                            prefill_chunk, 0, {}, &decoder->text_kv,
                                            decoder->mtp_cache());
         capture_card.set_ple_state(&decoder->ple);
+        // A pipeline stage warms up and captures its own layer span only (the other
+        // layers are not materialised on this device).
+        capture_card.set_stage(stage);
         capture_card.set_linear_state_slots(
             prefill_graphs->scratch_state_slot(),
             rewrite_checkpoints ? LinearStateSlots::rewrite_checkpoint_state_slot(0, max_concurrency)
