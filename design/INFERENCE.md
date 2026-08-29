@@ -1365,4 +1365,13 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   p50 1.34 s, 386 ok / 0 errors, probes correct — faster than the same pool with the split
   on (387.8) and clean. The split-auto rerun on this configuration decides whether the
   cross-lane answer belongs to the CPU split path.
+- **CPU split corrupts lanes in the pipelined 8-stage configuration (2026-08-29 05:07)**: 8
+  stages, 64 users, 2,100 slots, `--cpu-moe-share auto` (per-socket pools) — 395.2 tok/s and
+  the under-load probe "What is the capital of France?" answered 'Based' (the earlier run of
+  the same point answered the primes question with another lane's p+q+r problem); the same
+  point with the split forced off: 514.0 tok/s, both probes correct, and 3,072 / 2,816 slots
+  with the split off were clean at 16-64 users. Decision: pipeline stages default the split
+  off (explicit `--cpu-moe-share` still enables it); the bug stays open — suspects are the
+  per-socket pool shared by four stages and the per-cache staging under concurrent stage
+  rounds. Phase-2 single-device split: re-probing at 64 users.
 

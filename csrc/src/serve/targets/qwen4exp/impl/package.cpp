@@ -125,13 +125,15 @@ Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
         float share = options.cpu_moe_share;
         const bool staged = options.pipeline_stage_first != 0 || options.pipeline_stage_last != 0;
         if (staged && share < 0.0F && options.expert_slots > 0) {
+            // Pipeline stages default to the gather-only pool: at 8 stages a 68 %-resident
+            // stage decodes faster without the split (514 vs 395 tok/s at 64 users) and the
+            // split showed cross-lane answers in that configuration (INFERENCE.md,
+            // 2026-08-29). An explicit --cpu-moe-share still enables it.
             const int stage_layers = options.pipeline_stage_last - options.pipeline_stage_first;
             const std::uint64_t stage_experts = static_cast<std::uint64_t>(stage_layers) * detail::TextConfig::experts;
-            if (static_cast<std::uint64_t>(options.expert_slots) * 10 >= stage_experts * 9) {
-                share = 0.0F;
-                std::fprintf(stderr, "qwen4exp: stage holds %u of %llu experts resident; CPU split off\n",
-                             options.expert_slots, static_cast<unsigned long long>(stage_experts));
-            }
+            share = 0.0F;
+            std::fprintf(stderr, "qwen4exp: pipeline stage holds %u of %llu experts; CPU split off (pass --cpu-moe-share to enable)\n",
+                         options.expert_slots, static_cast<unsigned long long>(stage_experts));
         }
         detail::Variant::configure_cpu_moe_share(share);
     }
