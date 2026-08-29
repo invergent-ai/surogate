@@ -1857,3 +1857,24 @@ worker fatals in a battery). The existing refusal fallback had the same gap.
   97 across the day's runs before it. The refusal fallback inside `update()` now returns
   whether it re-instantiated so the caller uploads in that case too (commit above).
 
+### Prompt-flight batching: measured, not built (2026-08-29 19:25)
+
+The eager multi-prompt mixed body already exists behind `SUROGATE_SERVE_PREFILL_BATCH=N`, so
+the question "is a multi-prompt *graph* flight worth building" was answered by measuring the
+eager one on the fixed binary. 8 stages, 64 users, 512/128, streaming TTFT probe
+(`tools/probe/ttft.py`):
+
+| flights | TTFT p50 | TTFT p90 | decode |
+|---|---:|---:|---:|
+| one prompt per flight (graph, default) | **2.57 s** | **8.4 s** | 285 chunks/s |
+| up to four prompts per flight (eager) | 2.81 s | 12.2 s | 217 chunks/s |
+
+Worse on every axis. At 512-token prompts the round is compute-bound, so a four-prompt flight
+is a ~4× longer flight through all eight stages: the prompts inside it finish no sooner than
+four short flights would, they first wait for the batch to assemble, and the group's decode
+lanes get no rounds meanwhile. A graphed multi-segment body would trim the eager overhead but
+not that arithmetic. Batching only pays where the per-round fixed cost dominates — short
+prompts — which is not the board's shape. Not built; the knob stays for that workload.
+The TTFT levers at this load are structural instead: more than one flight in flight per
+group, or prefill/decode disaggregation across stages.
+
