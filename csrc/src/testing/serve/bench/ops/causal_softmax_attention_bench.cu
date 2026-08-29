@@ -360,8 +360,8 @@ std::size_t workspace_capacity(const Geometry& geometry, DType dtype, std::int32
                                std::int32_t batch, std::int32_t visible) {
     const ops::GqaExecutionEnvelope envelope{static_cast<std::uint32_t>(visible),
                                              static_cast<std::uint32_t>(visible)};
-    return ops::gqa_attention_workspace_capacity_bytes(geometry.query_heads, dtype, envelope, batch,
-                                                       tokens, tokens);
+    return ops::gqa_attention_workspace_capacity_bytes(geometry.query_heads, geometry.kv_heads, dtype,
+                                                       envelope, batch, tokens, tokens);
 }
 
 std::int32_t profile_visible(std::span<const std::int32_t> contexts,

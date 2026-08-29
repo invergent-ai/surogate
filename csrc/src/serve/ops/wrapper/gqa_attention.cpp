@@ -18,7 +18,6 @@ namespace {
 constexpr std::int32_t kHeadDim                      = 256;
 constexpr std::int32_t kQuantGroup                   = 64;
 constexpr float kExpectedScale                       = 0.0625f;
-constexpr std::int32_t kSmallTChunkTokens            = 6;
 constexpr std::int32_t kMaximumVerifyTokens          = 16;
 constexpr std::int32_t kMaximumBatchSize             = kMaximumBatchColumns;
 constexpr std::uint32_t kTwoChunkPromptVisibleKeys   = 512;
@@ -299,10 +298,11 @@ SmallTWorkspace allocate_small_t_workspace(Allocator& workspace, std::int32_t q_
 
 template <typename Launch>
 void for_each_small_t_chunk(const Tensor& q, const Tensor& positions, WorkspaceArena& workspace,
-                            DType cache_dtype, GqaExecutionEnvelope envelope, Tensor& out,
-                            Launch&& launch) {
-    for (std::int32_t begin = 0; begin < q.ne[2]; begin += kSmallTChunkTokens) {
-        const std::int32_t count = std::min(kSmallTChunkTokens, q.ne[2] - begin);
+                            std::int32_t kv_heads, DType cache_dtype,
+                            GqaExecutionEnvelope envelope, Tensor& out, Launch&& launch) {
+    const std::int32_t step = detail::gqa_attention_small_t_max_width(q.ne[1], kv_heads);
+    for (std::int32_t begin = 0; begin < q.ne[2]; begin += step) {
+        const std::int32_t count = std::min(step, q.ne[2] - begin);
         auto chunk_scope         = workspace.scope();
         const std::int32_t splits =
             detail::gqa_attention_split_capacity(q.ne[1], count, cache_dtype, envelope);
@@ -319,8 +319,9 @@ void launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
                             const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
                             GqaExecutionEnvelope envelope, WorkspaceArena& workspace, Tensor& out,
                             cudaStream_t stream, GqaBlockMask selection = {}) {
-    for (std::int32_t begin = 0; begin < q.ne[2]; begin += kSmallTChunkTokens) {
-        const std::int32_t count = std::min(kSmallTChunkTokens, q.ne[2] - begin);
+    const std::int32_t step = detail::gqa_attention_small_t_max_width(q.ne[1], k.ne[1]);
+    for (std::int32_t begin = 0; begin < q.ne[2]; begin += step) {
+        const std::int32_t count = std::min(step, q.ne[2] - begin);
         auto chunk_scope         = workspace.scope();
         const std::int32_t splits =
             detail::gqa_attention_split_capacity(q.ne[1], count, cache.dtype, envelope);
@@ -337,7 +338,7 @@ void launch_cached_chunked_small_t(const Tensor& q, const Tensor& positions, flo
                                    WorkspaceArena& workspace, Tensor& out, cudaStream_t stream,
                                    GqaBlockMask selection = {}) {
     for_each_small_t_chunk(
-        q, positions, workspace, cache.dtype, envelope, out,
+        q, positions, workspace, cache.num_kv_heads, cache.dtype, envelope, out,
         [&](std::int32_t, std::int32_t, const Tensor& q_chunk, const Tensor& position_chunk,
             SmallTWorkspace& partial, Tensor& out_chunk) {
             detail::gqa_attention_cached_small_t_launch(q_chunk, position_chunk, scale, cache,
@@ -350,13 +351,14 @@ void launch_cached_chunked_small_t(const Tensor& q, const Tensor& positions, flo
 
 namespace detail {
 
-GqaAttentionRoute gqa_attention_resolve_route(std::int32_t q_heads, std::int32_t width,
-                                              std::int32_t batch_size,
+GqaAttentionRoute gqa_attention_resolve_route(std::int32_t q_heads, std::int32_t kv_heads,
+                                              std::int32_t width, std::int32_t batch_size,
                                               GqaExecutionEnvelope envelope) {
-    if (width >= 1 && width <= kSmallTChunkTokens) { return GqaAttentionRoute::SmallT; }
+    const std::int32_t step = gqa_attention_small_t_max_width(q_heads, kv_heads);
+    if (width >= 1 && width <= step) { return GqaAttentionRoute::SmallT; }
     if (batch_size > 1) { return GqaAttentionRoute::ChunkedSmallT; }
     const std::uint32_t prompt_visible_keys =
-        width <= 2 * kSmallTChunkTokens ? kTwoChunkPromptVisibleKeys : kThreeChunkPromptVisibleKeys;
+        width <= 2 * step ? kTwoChunkPromptVisibleKeys : kThreeChunkPromptVisibleKeys;
     if (q_heads == 16 && width <= kMaximumVerifyTokens &&
         envelope.max_visible_keys > prompt_visible_keys) {
         return GqaAttentionRoute::ChunkedSmallT;
@@ -378,11 +380,14 @@ const char* gqa_attention_route_name(GqaAttentionRoute route) {
 
 } // namespace detail
 
-std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType cache_dtype,
+std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, std::int32_t kv_heads,
+                                                   DType cache_dtype,
                                                    GqaExecutionEnvelope envelope,
                                                    std::int32_t batch_size, std::int32_t min_width,
                                                    std::int32_t max_width) {
-    (void)kv_heads_for_q_heads(q_heads, "gqa_attention workspace");
+    if (kv_heads_for_pair(q_heads, kv_heads, "gqa_attention workspace") != kv_heads) {
+        throw std::invalid_argument("gqa_attention workspace: unsupported Q/KV head geometry");
+    }
     if ((cache_dtype != DType::BF16 && cache_dtype != DType::I8 &&
          cache_dtype != DType::FP8_E4M3FN) ||
         batch_size <= 0 ||
@@ -403,13 +408,13 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
     };
     const auto exact_capacity = [&](std::int32_t width) {
         const detail::GqaAttentionRoute route =
-            detail::gqa_attention_resolve_route(q_heads, width, batch_size, envelope);
+            detail::gqa_attention_resolve_route(q_heads, kv_heads, width, batch_size, envelope);
         if (route == detail::GqaAttentionRoute::Prompt) { return std::size_t{0}; }
         if (route == detail::GqaAttentionRoute::SmallT) { return chunk_capacity(width); }
-        std::size_t maximum = 0;
-        for (std::int32_t begin = 0; begin < width; begin += kSmallTChunkTokens) {
-            maximum =
-                std::max(maximum, chunk_capacity(std::min(kSmallTChunkTokens, width - begin)));
+        const std::int32_t step = detail::gqa_attention_small_t_max_width(q_heads, kv_heads);
+        std::size_t maximum     = 0;
+        for (std::int32_t begin = 0; begin < width; begin += step) {
+            maximum = std::max(maximum, chunk_capacity(std::min(step, width - begin)));
         }
         return maximum;
     };
@@ -445,7 +450,7 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
 
     auto scope = workspace.scope();
     const detail::GqaAttentionRoute route =
-        detail::gqa_attention_resolve_route(q.ne[1], width, batch, envelope);
+        detail::gqa_attention_resolve_route(q.ne[1], kv_heads, width, batch, envelope);
     if (route == detail::GqaAttentionRoute::ChunkedSmallT) {
         launch_chunked_small_t(q, k, v, positions, valid_columns, kv_table_rows, scale, cache,
                                envelope, workspace, out, stream, selection);
@@ -499,13 +504,14 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
     validate_attention_tensors(q, positions, out, cache, envelope, scale, op);
 
     auto scope = workspace.scope();
-    if (detail::gqa_attention_resolve_route(q.ne[1], q.ne[2], 1, envelope) ==
+    if (detail::gqa_attention_resolve_route(q.ne[1], cache.num_kv_heads, q.ne[2], 1, envelope) ==
         detail::GqaAttentionRoute::ChunkedSmallT) {
         launch_cached_chunked_small_t(q, positions, scale, cache, envelope, workspace, out, stream,
                                       selection);
         return;
     }
-    if (detail::gqa_attention_uses_small_t(q.ne[2])) {
+    if (q.ne[2] >= 1 &&
+        q.ne[2] <= detail::gqa_attention_small_t_max_width(q.ne[1], cache.num_kv_heads)) {
         const std::int32_t splits =
             detail::gqa_attention_split_capacity(q.ne[1], q.ne[2], cache.dtype, envelope);
         SmallTWorkspace partial = allocate_small_t_workspace(workspace, q.ne[1], q.ne[2], splits);

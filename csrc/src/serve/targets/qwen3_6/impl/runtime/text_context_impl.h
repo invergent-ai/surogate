@@ -2190,6 +2190,11 @@ bool TextContext::try_mixed_graph_chunk(std::span<const int> full_ids, std::uint
         return false;
     }
     if (decode.ids.ne[0] != batch_bucket) { return false; }
+    // Bisection switch: run only a prompt's first chunk through the mixed graph and the
+    // continuation chunks (begin > 0) through the eager mixed body.
+    static const bool kFirstChunkOnly =
+        std::getenv("SUROGATE_SERVE_MIXED_GRAPH_FIRST_CHUNK_ONLY") != nullptr;
+    if (kFirstChunkOnly && begin > 0) { return false; }
     const int len                   = static_cast<int>(nominal);
     const std::int32_t chunk_bucket = family.bucket_for(len);
     if (chunk_bucket < len ||

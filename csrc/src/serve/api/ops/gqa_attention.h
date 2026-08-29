@@ -62,9 +62,10 @@ struct GqaExecutionEnvelope {
  * return zero.
  */
 [[nodiscard]] std::size_t
-gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType cache_dtype,
-                                       GqaExecutionEnvelope envelope, std::int32_t batch_size,
-                                       std::int32_t min_width, std::int32_t max_width);
+gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, std::int32_t kv_heads,
+                                       DType cache_dtype, GqaExecutionEnvelope envelope,
+                                       std::int32_t batch_size, std::int32_t min_width,
+                                       std::int32_t max_width);
 
 /**
  * A1: append K/V for B independent sequences and compute causal grouped-query attention. Let

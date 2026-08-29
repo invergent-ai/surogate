@@ -10,6 +10,7 @@
 #include "api/ops/gqa_attention.h"
 
 #include <cstdint>
+#include <string>
 #include <cstdlib>
 #include <stdexcept>
 
@@ -266,6 +267,15 @@ PagedKVBatchLayerView single_row_batch_view(const PagedKVLayerView& cache) {
 
 bool gqa_attention_uses_small_t(std::int32_t tokens) { return tokens >= 1 && tokens <= 6; }
 
+std::int32_t gqa_attention_small_t_max_width(std::int32_t q_heads, std::int32_t kv_heads) {
+    if (q_heads <= 0 || kv_heads <= 0 || q_heads % kv_heads != 0) {
+        throw std::invalid_argument("gqa_attention small-T width: unsupported head geometry");
+    }
+    const std::int32_t group = q_heads / kv_heads;
+    const std::int32_t rows  = 64 / group;
+    return rows < 6 ? rows : 6;
+}
+
 std::int32_t gqa_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
                                           DType cache_dtype, GqaExecutionEnvelope envelope) {
     if (tokens < 1 || tokens > 6 || (cache_dtype != DType::BF16 && cache_dtype != DType::I8 &&
@@ -358,7 +368,11 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
 
     if (invocation.width * Geometry::GroupSize > 64) {
         throw std::invalid_argument(
-            "gqa_attention: this head geometry serves at most 64 query rows per lane step");
+            "gqa_attention: this head geometry serves at most 64 query rows per lane step (width " +
+            std::to_string(invocation.width) + " x group " + std::to_string(Geometry::GroupSize) +
+            ", batch " + std::to_string(invocation.batch_size) + ", full width " +
+            std::to_string(invocation.full_width) + ", column begin " +
+            std::to_string(invocation.column_begin) + ")");
     }
     switch (invocation.width) {
     case 1:
