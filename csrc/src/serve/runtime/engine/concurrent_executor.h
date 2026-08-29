@@ -1075,7 +1075,7 @@ private:
                 launched = true;
             }
         }
-        if (!program.any_in_flight()) {
+        if (!program.any_in_flight() && !program.has_finished_pending()) {
             if (!launched) { std::this_thread::sleep_for(std::chrono::microseconds(200)); }
             return;
         }

@@ -279,6 +279,7 @@ public:
     };
     [[nodiscard]] std::uint32_t group_count() const noexcept { return groups_; }
     [[nodiscard]] bool group_in_flight(std::uint32_t g) const noexcept { return flights_.at(g).active; }
+    [[nodiscard]] bool has_finished_pending() const noexcept { return !pending_finished_.empty(); }
     [[nodiscard]] bool any_in_flight() const noexcept {
         for (const auto& f : flights_) { if (f.active) { return true; } }
         return false;
@@ -297,7 +298,10 @@ public:
     /// blocking wait), moves its group to the next stage or finishes it, and launches every
     /// parked group whose next stage is free. Returns the groups that finished.
     std::vector<std::uint32_t> tick() {
-        std::vector<std::uint32_t> finished;
+        // Groups that completed inside a launch (a lone prefill runs its stages synchronously)
+        // are handed back here.
+        std::vector<std::uint32_t> finished = std::move(pending_finished_);
+        pending_finished_.clear();
         int oldest = -1;
         for (std::size_t g = 0; g < flights_.size(); ++g) {
             const Flight& f = flights_[g];
@@ -369,9 +373,9 @@ private:
         f.prefill_lanes.assign(prefill_lanes.begin(), prefill_lanes.end());
         f.prefill_lane = prefill_lane;
         f.result       = GroupResult{};
-        std::vector<std::uint32_t> none;
-        advance_parked(none);
+        advance_parked(pending_finished_);
     }
+    std::vector<std::uint32_t> pending_finished_;
     void store_round(Flight& f, const BatchedGeneratedRound& part) {
         const std::size_t stride = part.row_stride > 0 ? static_cast<std::size_t>(part.row_stride) : 1;
         f.tokens.resize(f.lanes.size());
