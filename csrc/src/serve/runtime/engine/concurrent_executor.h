@@ -1168,7 +1168,14 @@ private:
                     const char* raw = std::getenv("SUROGATE_SERVE_FREE_LANE_BURST");
                     return raw != nullptr ? static_cast<std::uint32_t>(std::atoi(raw)) : 1U;
                 }();
-                burst_limit = free_lanes > 0 ? kFreeLaneBurst : 8U;
+                // SUROGATE_SERVE_BURST_CAP caps the saturated-lane burst too (bisection knob:
+                // the burst chains rounds device-side, and a mid-burst stop token makes the
+                // resolution unwind — cap 1 removes that whole path).
+                static const std::uint32_t kSaturatedBurst = [] {
+                    const char* raw = std::getenv("SUROGATE_SERVE_BURST_CAP");
+                    return raw != nullptr ? static_cast<std::uint32_t>(std::atoi(raw)) : 8U;
+                }();
+                burst_limit = free_lanes > 0 ? kFreeLaneBurst : kSaturatedBurst;
             }
         }
         instance_.program->set_round_burst_limit(burst_limit);

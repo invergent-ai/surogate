@@ -283,6 +283,25 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     }
 
     plan->summary.reusable_prompt_tokens = plan->reuse_base;
+    // SUROGATE_SERVE_REUSE_TRACE=1: every non-FullReset plan, with enough identity to correlate
+    // a later wrong answer with the reuse decision that produced it.
+    static const bool reuse_trace = std::getenv("SUROGATE_SERVE_REUSE_TRACE") != nullptr;
+    if (reuse_trace && plan->reuse != ReusePath::FullReset) {
+        const auto head = [](const auto& tokens, std::size_t n) {
+            std::string out;
+            for (std::size_t i = 0; i < n && i < tokens.size(); ++i) {
+                out += std::to_string(tokens[i]);
+                out += ',';
+            }
+            return out;
+        };
+        std::fprintf(stderr,
+                     "reuse-trace: plan lane %u path %d base %u frontier %u prompt %zu "
+                     "prompt_head %s ledger_head %s\n",
+                     lane, static_cast<int>(plan->reuse), plan->reuse_base,
+                     sequence.execution_frontier, prompt.token_ids.size(),
+                     head(prompt.token_ids, 6).c_str(), head(sequence.ledger, 6).c_str());
+    }
     if (speculative_backend == SpeculativeBackend::Mtp) {
         if (plan->reuse == ReusePath::FullReset) {
             plan->prepare_mtp = true;

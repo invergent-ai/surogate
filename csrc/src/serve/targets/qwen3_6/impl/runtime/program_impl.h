@@ -569,6 +569,12 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             reserve_sequence_kv(sequence, request_plan.text_kv_page_entitlement,
                                 request_plan.backend_kv_page_entitlement);
         } else if (request_plan.reuse == ReusePath::AppendAtFrontier) {
+            static const bool reuse_trace = std::getenv("SUROGATE_SERVE_REUSE_TRACE") != nullptr;
+            if (reuse_trace) {
+                std::fprintf(stderr,
+                             "reuse-trace: begin-append lane %u base %u prompt %u kv_valid %u\n",
+                             sequence.lane, base, prompt_tokens, sequence.text_kv_valid);
+            }
             if (!sequence.kv) {
                 throw std::logic_error("resident prefix has no KV allocation bundle");
             }
@@ -636,18 +642,18 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         sequence.rope_delta = prompt.rope_delta;
         set_device_i32(io.rope_delta, sequence.rope_delta);
 
-        // Prefill CUDA graphs (PATCHES.md #27): graph prompts compute their
-        // GDN/conv state in the shared scratch slot so captured bodies stay
-        // lane-independent. Seed it from the lane's current slot (zeros after
-        // a reset, the resident state for prefix-append) once per prompt.
+        // Prefill CUDA graphs (PATCHES.md #27): graph prompts compute their GDN/conv state in
+        // the shared scratch slot so captured bodies stay lane-independent. The scratch is
+        // owned per CHUNK, not per prompt: every graph chunk restores lane→scratch before it
+        // runs and saves scratch→lane after (advance_prefill and the mixed round below).
+        // Seeding once at begin was the cross-request leak of 2026-08-29: with two staged
+        // prompts in flight, the other prompt's chunks ran the scratch between this prompt's
+        // begin and its first chunk, so the chunk started from the other prompt's recurrent
+        // state — the "capital of France in a primes answer" blends, and (through an eager
+        // mixed continuation reading the lane slot instead) the invalid-UTF-8 crashes.
         const bool prefill_uses_graph = prefill_graphs.has_value() && !request_plan.vision &&
                                         !request_plan.prepare_mtp && !prompt.has_media() &&
                                         base < prompt_tokens;
-        if (prefill_uses_graph) {
-            decoder->copy_state_slot(
-                LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
-                LinearStateSlots::prefill_scratch_state_slot(max_concurrency), device.stream);
-        }
 
         if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::Drop ||
             request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::CaptureNew) {
@@ -1829,6 +1835,15 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 mark_workspace_usage(workspace_plan.dflash_context);
             }
             schedule::PrefillChunkResult result;
+            if (staged.use_graph) {
+                // Chunk-atomic scratch ownership: restore this prompt's state into the shared
+                // scratch slot right before its chunk runs (the lane slot always holds the
+                // prompt's current state — zeros after a reset, the resident state for
+                // prefix-append, or the previous chunk's save).
+                decoder->copy_state_slot(
+                    LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
+                    LinearStateSlots::prefill_scratch_state_slot(max_concurrency), device.stream);
+            }
             const std::optional<std::uint32_t> rewrite_checkpoint_capture_frontier =
                 staged.rewrite_checkpoint_capture
                     ? std::optional<std::uint32_t>(staged.rewrite_checkpoint_capture->frontier)
@@ -1851,6 +1866,23 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             if (std::getenv("SUROGATE_SERVE_PREFILL_TIMING") != nullptr) {
                 std::fprintf(stderr, "prefill-timing: chunk nominal %u processed %u final %d\n",
                              nominal, result.processed_tokens, int(result.finalized));
+            }
+            {
+                static const bool state_trace =
+                    std::getenv("SUROGATE_SERVE_STATE_TRACE") != nullptr;
+                if (state_trace) {
+                    std::fprintf(stderr,
+                                 "state-trace: run lane=%u cursor=%u nominal=%u graph=%d\n",
+                                 sequence.lane, staged.cursor, nominal, int(staged.use_graph));
+                }
+            }
+            if (staged.use_graph) {
+                // Chunk-atomic scratch ownership: save the chunk's end state back to the lane
+                // so the next chunk (this prompt's or another's) can restore its own.
+                decoder->copy_state_slot(
+                    LinearStateSlots::prefill_scratch_state_slot(max_concurrency),
+                    LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
+                    device.stream);
             }
             staged.cursor += result.processed_tokens;
             sequence.text_kv_valid = staged.cursor;
@@ -1878,12 +1910,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             if (staged.cursor != staged.prompt_tokens) {
                 throw std::logic_error("staged prefill sampled before the prompt frontier");
             }
-            if (staged.use_graph) {
-                decoder->copy_state_slot(
-                    LinearStateSlots::prefill_scratch_state_slot(max_concurrency),
-                    LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
-                    device.stream);
-            }
+            // (The chunk-atomic save above already parked the final state in the lane slot.)
             copy_tail(sequence, prefill_hidden.slice(
                                     1, static_cast<std::int32_t>(result.processed_tokens) - 1, 1));
         } else {
@@ -2481,6 +2508,11 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
                                                               ordinary_graphs.profiles.data())
                                   : 0;
                 last_mixed_round.band = mixed_band;
+                // Chunk-atomic scratch ownership (see advance_prefill): the captured mixed
+                // body runs the prompt's columns on the shared scratch slot.
+                decoder->copy_state_slot(
+                    LinearStateSlots::current_state_slot(prefill_sequence.lane, max_concurrency),
+                    LinearStateSlots::prefill_scratch_state_slot(max_concurrency), device.stream);
                 if (card.try_mixed_graph_chunk(
                         std::span<const TokenId>(staged.prompt.token_ids), staged.cursor,
                         graph_nominal, bucket_slice, batch_bucket, mixed_band)) {
@@ -2613,13 +2645,16 @@ runtime::MixedRoundResult ProgramImplCore::consume_mixed_round(runtime::RoundHan
             sequence.text_kv_valid = entry.cursor;
             result.prefills[i]     = runtime::PrefillStepResult{
                     .summary = summary, .processed_prompt_tokens = processed};
+            if (entry.use_graph && graph_hit) {
+                // Chunk-atomic scratch ownership: park the chunk's end state in the lane slot
+                // whether or not the prompt is finished — another prompt's chunk may run the
+                // scratch before this one's next chunk.
+                decoder->copy_state_slot(
+                    LinearStateSlots::prefill_scratch_state_slot(max_concurrency),
+                    LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
+                    device.stream);
+            }
             if (entry.cursor == entry.prompt_tokens) {
-                if (entry.use_graph && graph_hit) {
-                    decoder->copy_state_slot(
-                        LinearStateSlots::prefill_scratch_state_slot(max_concurrency),
-                        LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
-                        device.stream);
-                }
                 // The next ordinary advance takes the zero-suffix path off the tail hidden
                 // (reusing the whole finalize machinery). Each prompt's last column sits at
                 // the end of its own segment.
@@ -3032,6 +3067,11 @@ void ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence,
         release_sequence_growth_entitlement(sequence);
         unbind_sequence_kv(sequence);
         sequence.retained = retain_prefix;
+        static const bool reuse_trace = std::getenv("SUROGATE_SERVE_REUSE_TRACE") != nullptr;
+        if (reuse_trace && retain_prefix) {
+            std::fprintf(stderr, "reuse-trace: retain lane %u frontier %u ledger %zu\n",
+                         sequence.lane, sequence.execution_frontier, sequence.ledger.size());
+        }
     }
     request.lifecycle = terminal ? Lifecycle::Complete : Lifecycle::Active;
     request.pending   = {};
