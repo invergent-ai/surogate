@@ -36,7 +36,9 @@ public:
     DecodeGraphExecutable& operator=(DecodeGraphExecutable&& other) noexcept;
 
     void instantiate(const DecodeGraphDefinition& definition);
-    void update(const DecodeGraphDefinition& definition);
+    /// Patches the executable in place; returns true when the driver refused and the
+    /// executable was re-instantiated instead (it then needs `upload` before its next launch).
+    bool update(const DecodeGraphDefinition& definition);
     void upload(cudaStream_t stream);
     void launch(cudaStream_t stream);
     [[nodiscard]] bool ready() const noexcept;

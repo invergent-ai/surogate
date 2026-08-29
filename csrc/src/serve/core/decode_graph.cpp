@@ -124,7 +124,7 @@ void DecodeGraphExecutable::instantiate(const DecodeGraphDefinition& definition)
     exec_ = exec;
 }
 
-void DecodeGraphExecutable::update(const DecodeGraphDefinition& definition) {
+bool DecodeGraphExecutable::update(const DecodeGraphDefinition& definition) {
     if (!ready() || !definition.ready()) {
         throw std::logic_error("CUDA Graph update requires a definition and executable");
     }
@@ -144,7 +144,9 @@ void DecodeGraphExecutable::update(const DecodeGraphDefinition& definition) {
                          cudaGetErrorName(err), static_cast<int>(result.result));
         }
         instantiate(definition);
+        return true; // the caller must upload the fresh executable before launching it
     }
+    return false;
 }
 
 void DecodeGraphExecutable::upload(cudaStream_t stream) {

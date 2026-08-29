@@ -125,7 +125,9 @@ DecodeGraphExecutable& install_graph_profile(DecodeGraphFamily& family, DecodeGr
         static const bool update_in_place =
             std::getenv("SUROGATE_SERVE_GRAPH_UPDATE_INPLACE") != nullptr;
         if (update_in_place) {
-            topology.executable.update(profile.definition);
+            if (topology.executable.update(profile.definition)) {
+                topology.executable.upload(stream); // refused update → fresh executable
+            }
         } else {
             // Mirror the family's own initialisation exactly: a fresh executable must be
             // uploaded on the launch stream before its first launch (the upload commits its
