@@ -1361,4 +1361,8 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
 - 8 stages, 32 users, 3,072 slots, layer-subset stages: 518.5 tok/s, TTFT p50 971 ms, 383 ok /
   0 errors, probes correct. Flash-Next on 8×5090 at full residency: 57.9 / 383.9 / 518.5 /
   604.8 tok/s at 1 / 16 / 32 / 64 users.
+- 8 stages, 64 users, 2,100 slots (68 % resident), **split forced off**: 514.0 tok/s, TTFT
+  p50 1.34 s, 386 ok / 0 errors, probes correct — faster than the same pool with the split
+  on (387.8) and clean. The split-auto rerun on this configuration decides whether the
+  cross-lane answer belongs to the CPU split path.
 
