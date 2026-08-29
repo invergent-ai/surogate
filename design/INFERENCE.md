@@ -1394,3 +1394,51 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   above, the slow synchronous prompt path (bypassed), scan-resistant replacement for stages
   that cannot hold their experts, and the sparse indexer for >2k context.
 
+## Phase 4: the QSA sparse indexer — design (2026-08-29)
+
+Contexts above 2,051 tokens are refused today (`kNativeContext = indexer_top_k + indexer_block
+- 1`): below that the indexer selects every cell, so dense attention *is* the sparse path, and
+above it dense attention is a different model. The indexer is what lifts the cap.
+
+Reference: `study/llama.cpp-master/src/models/qwen4exp.cpp` `build_qsa_top_k` (:469-608),
+`build_attn_qsa` (:612), and `llama_memory_hybrid_idx_context::set_input_qsa` for the bias
+rules. The artifact already carries the weights on all 12 full-attention layers (3, 7, ..., 47):
+`indexer/query [512,2560]`, `indexer/key [128,2560]`, `indexer/query_norm [128]`,
+`indexer/key_norm [128]`, BF16, ~39 MB in total — bound `ValidateOnly` until now.
+
+Math per full-attention layer and round, with r = `indexer_block` = 4:
+
+1. `k_raw = index_k_proj · x` → [128, T], written **raw** into the token's cache cell (pooling
+   precedes norm and rotation, so neither is applied before caching).
+2. Blocks: block b covers cells at positions [b·r, (b+1)·r). `k_blk[b] = rmsnorm(mean of the
+   block's raw keys, index_k_norm)` roped at position b·r.
+3. `q = rmsnorm(index_q_proj · x, index_q_norm)` → [128, 4 heads, T], roped at the token's
+   position.
+4. `score[b] = Σ_heads relu(q_h · k_blk[b])` — the DeepSeek lightning-indexer rectified sum.
+5. Bias per query token at position p: blocks whose start ≥ `(p+1)/r·r` (the incomplete tail)
+   get +1e9 (always visible); blocks not fully filled get −inf; blocks past p are already −inf
+   from the causal mask.
+6. Selection: the reference takes the top `min(n_kv, top_k + r − 1)` = 2,051 **cells**, and
+   cells inherit their block's score, so the cut lands on a block boundary plus a 3-cell
+   remainder. We select whole blocks — `ceil(2051/r)` = 513 — which is that set plus at most
+   one cell; never fewer keys than the reference, and the difference is one cell of the
+   lowest-scoring selected block.
+
+Engine design:
+
+- **Indexer keys ride in the text KV pool as one extra plane per full-attention layer**
+  (BF16, leading extent 128, one head). Page ids, block tables, prefix reuse, forking and
+  eviction then come for free: the indexer key for cell j lives in the page that holds cell j's
+  K/V. Cost: +256 B/token/layer, +12.5 % on the text KV cache.
+- **The selection is a per-row block bitmask**, `std::uint32_t` words over `ceil(n_kv/r)`
+  blocks (1 KB per row at 32k). The attention kernels take an optional
+  `(const std::uint32_t* block_mask, std::int32_t words_per_row)`: a key tile whose mask word
+  is zero is skipped before its `cp.async` stage — that is where the speed comes from — and
+  surviving tiles mask each score by its block bit. `nullptr` is today's dense path, so the
+  contract and the numbers below 2,051 tokens are unchanged.
+- The whole indexer path is skipped while `n_kv ≤ 2051`: every cell is visible there, so it
+  would only cost time.
+
+Steps: (1) materialise the weights, (2) the cache plane, (3) the forward and the mask, (4) the
+kernel mask, (5) raise `kNativeContext` and verify against llama.cpp at 8k and 32k.
+
