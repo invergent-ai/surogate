@@ -11,6 +11,7 @@
 // routing and the expert kernels of every schedule (decode d2→d3, small-T s2→s3, prefill
 // select_count→scan).
 
+#include "api/ops/cpu_expert_compute.h"
 #include "api/ops/sparse_moe.h"
 #include "core/arena.h"
 #include "core/tensor.h"
@@ -26,15 +27,30 @@ namespace ninfer::ops {
 /// kernels read them, in pinned, device-mapped host memory. Byte offsets are per plane
 /// (codes, scales) so an expert is one contiguous slice per plane.
 struct ExpertHostBank {
+    ExpertBankFormat format         = ExpertBankFormat::W8G32;
     const std::byte* gate_up_codes  = nullptr; // [experts * 2 * intermediate rows] codes plane
     const std::byte* gate_up_scales = nullptr; // scales plane, same row order
+    const std::byte* gate_up_mins   = nullptr; // Q4G32AM only: FP16 group minima
     const std::byte* down_codes     = nullptr; // [experts * hidden rows]
     const std::byte* down_scales    = nullptr;
-    std::uint64_t gate_up_codes_bytes_per_expert  = 0;
-    std::uint64_t gate_up_scales_bytes_per_expert = 0;
+    const std::byte* down_mins      = nullptr; // Q4G32AM only
+    std::uint64_t gate_up_codes_bytes_per_expert  = 0; // halves under Q4G32AM
+    std::uint64_t gate_up_scales_bytes_per_expert = 0; // also the mins stride
     std::uint64_t down_codes_bytes_per_expert     = 0;
     std::uint64_t down_scales_bytes_per_expert    = 0;
 };
+
+/// Plane layout of one Q4G32AM host object holding `rows_total x k` weights (all experts of
+/// one matrix): packed nibbles, then every group's FP16 scale, then every group's FP16 min —
+/// codes, scales and mins traverse the (row, k-group) order in parallel, exactly as W8 does.
+struct Q4BankPlanes {
+    std::uint64_t groups        = 0; // rows_total * k / 32
+    std::uint64_t codes_bytes   = 0; // 16 * groups, at offset 0
+    std::uint64_t scales_offset = 0; // == codes_bytes
+    std::uint64_t mins_offset   = 0; // scales_offset + 2 * groups
+    std::uint64_t total_bytes   = 0; // 20 * groups
+};
+[[nodiscard]] Q4BankPlanes q4_bank_planes(std::int64_t rows_total, std::int32_t k);
 
 /// Device pool of `slots` experts in the same plane layout; `routed_gate_up` / `routed_down`
 /// are Weights over the pool that the MoE kernels consume unchanged (n = slots * rows).
@@ -98,6 +114,12 @@ void expert_slot_directory_reset(ExpertSlotDirectory& directory, cudaStream_t st
 [[nodiscard]] ExpertHostBank expert_host_bank(const SparseMoeGeometry& geometry,
                                               const Weight& routed_gate_up,
                                               const Weight& routed_down);
+
+/// The Q4G32AM flavour: `gate_up_base` / `down_base` are the objects' device-mapped base
+/// pointers laid out per `q4_bank_planes` (per-expert strides derive from the geometry).
+[[nodiscard]] ExpertHostBank expert_host_bank_q4(const SparseMoeGeometry& geometry,
+                                                 const void* gate_up_base,
+                                                 const void* down_base);
 
 /// Jobs for the host: the (token, expert, router weight) paths of a round whose expert the
 /// split sent to the CPU instead of the pool; `count` is a device word.

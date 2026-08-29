@@ -253,6 +253,81 @@ __global__ void __launch_bounds__(kGatherThreads)
     }
 }
 
+// One Q4G32AM matrix of the bank: nibble codes plus FP16 scale/min planes on the host, W8
+// codes and scales in the pool. One thread owns one 32-group: it decodes the affine grid,
+// requantises to the pool's symmetric int8 (fresh amax/127 scale) and writes 32 codes + 1
+// scale — the kernels reading the pool never learn the bank changed format.
+struct GatherQ4Bank {
+    const std::uint8_t* src_codes   = nullptr; // 16 B per group
+    const std::uint16_t* src_scales = nullptr;
+    const std::uint16_t* src_mins   = nullptr;
+    std::byte* dst_codes            = nullptr; // pool planes (32 B codes, 2 B scale per group)
+    std::byte* dst_scales           = nullptr;
+    std::uint64_t groups_per_expert = 0;
+    std::uint64_t dst_codes_bytes   = 0; // per expert (pool stride)
+    std::uint64_t dst_scales_bytes  = 0;
+};
+
+struct GatherQ4Params {
+    GatherQ4Bank banks[2];
+    const int* miss_slots;
+    const int* miss_experts;
+    const long long* miss_count;
+};
+
+__global__ void __launch_bounds__(kGatherThreads)
+    gather_unpack_q4_kernel(const __grid_constant__ GatherQ4Params p) {
+    const int bank         = static_cast<int>(blockIdx.x) / kGatherBlocksPerBank;
+    const int blk          = static_cast<int>(blockIdx.x) % kGatherBlocksPerBank;
+    const GatherQ4Bank b   = p.banks[bank];
+    const long long n      = *p.miss_count;
+    const std::uint64_t total = static_cast<std::uint64_t>(n) * b.groups_per_expert;
+    const std::uint64_t stride =
+        static_cast<std::uint64_t>(kGatherBlocksPerBank) * kGatherThreads;
+    for (std::uint64_t u = static_cast<std::uint64_t>(blk) * kGatherThreads + threadIdx.x;
+         u < total; u += stride) {
+        const std::uint64_t row     = u / b.groups_per_expert;
+        const std::uint64_t group   = u - row * b.groups_per_expert;
+        const std::uint64_t src_row = static_cast<std::uint64_t>(p.miss_experts[row]);
+        const std::uint64_t dst_row = static_cast<std::uint64_t>(p.miss_slots[row]);
+        const std::uint64_t g       = src_row * b.groups_per_expert + group;
+        const uint4 packed = __ldcs(reinterpret_cast<const uint4*>(b.src_codes + g * 16));
+        const float step   = __half2float(reinterpret_cast<const __half&>(b.src_scales[g]));
+        const float lo     = __half2float(reinterpret_cast<const __half&>(b.src_mins[g]));
+        float value[32];
+        const std::uint32_t words[4] = {packed.x, packed.y, packed.z, packed.w};
+        float amax = 0.0F;
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int q     = (words[w] >> (4 * i)) & 0xF;
+                const float v   = step * static_cast<float>(q) + lo;
+                value[w * 8 + i] = v;
+                amax             = fmaxf(amax, fabsf(v));
+            }
+        }
+        const float scale = amax / 127.0F;
+        const float inv   = scale > 0.0F ? 1.0F / scale : 0.0F;
+        std::uint32_t out[8]; // 32 int8 codes, byte j = code j
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            std::uint32_t packed_out = 0;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int c = __float2int_rn(value[w * 4 + i] * inv);
+                packed_out |= (static_cast<std::uint32_t>(c) & 0xFFU) << (8 * i);
+            }
+            out[w] = packed_out;
+        }
+        std::byte* dst = b.dst_codes + dst_row * b.dst_codes_bytes + group * 32;
+        __stcs(reinterpret_cast<uint4*>(dst), make_uint4(out[0], out[1], out[2], out[3]));
+        __stcs(reinterpret_cast<uint4*>(dst + 16), make_uint4(out[4], out[5], out[6], out[7]));
+        *reinterpret_cast<__half*>(b.dst_scales + dst_row * b.dst_scales_bytes + group * 2) =
+            __float2half_rn(scale);
+    }
+}
+
 __global__ void partial_add_kernel(const float* __restrict__ partial, __nv_bfloat16* __restrict__ destination,
                                    long long count) {
     const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -494,10 +569,80 @@ void expert_slot_resolve(const Tensor& ids, const Tensor& alpha, std::int32_t la
     CUDA_CHECK(cudaGetLastError());
 }
 
+Q4BankPlanes q4_bank_planes(std::int64_t rows_total, std::int32_t k) {
+    if (rows_total <= 0 || k <= 0 || k % kW8Group != 0) {
+        throw std::invalid_argument("expert_slot_cache: q4 planes need rows and k % 32 == 0");
+    }
+    Q4BankPlanes out;
+    out.groups        = static_cast<std::uint64_t>(rows_total) * static_cast<std::uint64_t>(k) /
+                 static_cast<std::uint64_t>(kW8Group);
+    out.codes_bytes   = out.groups * 16;
+    out.scales_offset = out.codes_bytes;
+    out.mins_offset   = out.scales_offset + out.groups * 2;
+    out.total_bytes   = out.mins_offset + out.groups * 2;
+    return out;
+}
+
+ExpertHostBank expert_host_bank_q4(const SparseMoeGeometry& geometry, const void* gate_up_base,
+                                   const void* down_base) {
+    require_geometry(geometry);
+    if (gate_up_base == nullptr || down_base == nullptr) {
+        throw std::invalid_argument("expert_slot_cache: q4 bank needs both object base pointers");
+    }
+    const Q4BankPlanes gate =
+        q4_bank_planes(static_cast<std::int64_t>(geometry.experts) * geometry.expert_rows(),
+                       geometry.hidden);
+    const Q4BankPlanes down =
+        q4_bank_planes(static_cast<std::int64_t>(geometry.experts) * geometry.hidden,
+                       geometry.intermediate);
+    const std::uint64_t experts = static_cast<std::uint64_t>(geometry.experts);
+    ExpertHostBank bank;
+    bank.format         = ExpertBankFormat::Q4G32AM;
+    bank.gate_up_codes  = static_cast<const std::byte*>(gate_up_base);
+    bank.gate_up_scales = static_cast<const std::byte*>(gate_up_base) + gate.scales_offset;
+    bank.gate_up_mins   = static_cast<const std::byte*>(gate_up_base) + gate.mins_offset;
+    bank.down_codes     = static_cast<const std::byte*>(down_base);
+    bank.down_scales    = static_cast<const std::byte*>(down_base) + down.scales_offset;
+    bank.down_mins      = static_cast<const std::byte*>(down_base) + down.mins_offset;
+    bank.gate_up_codes_bytes_per_expert  = gate.codes_bytes / experts;
+    bank.gate_up_scales_bytes_per_expert = gate.groups / experts * 2;
+    bank.down_codes_bytes_per_expert     = down.codes_bytes / experts;
+    bank.down_scales_bytes_per_expert    = down.groups / experts * 2;
+    return bank;
+}
+
 void expert_slot_gather(const ExpertHostBank& bank, const ExpertMissList& misses,
                         ExpertSlotPool& pool, cudaStream_t stream) {
     if (bank.gate_up_codes == nullptr || pool.gate_up_codes == nullptr) {
         throw std::invalid_argument("expert_slot_cache: gather needs a bank and a pool");
+    }
+    if (bank.format == ExpertBankFormat::Q4G32AM) {
+        if (bank.gate_up_mins == nullptr || bank.down_mins == nullptr) {
+            throw std::invalid_argument("expert_slot_cache: q4 bank has no min planes");
+        }
+        GatherQ4Params p{};
+        p.banks[0] = {reinterpret_cast<const std::uint8_t*>(bank.gate_up_codes),
+                      reinterpret_cast<const std::uint16_t*>(bank.gate_up_scales),
+                      reinterpret_cast<const std::uint16_t*>(bank.gate_up_mins),
+                      pool.gate_up_codes,
+                      pool.gate_up_scales,
+                      bank.gate_up_scales_bytes_per_expert / 2,
+                      bank.gate_up_codes_bytes_per_expert * 2,
+                      bank.gate_up_scales_bytes_per_expert};
+        p.banks[1] = {reinterpret_cast<const std::uint8_t*>(bank.down_codes),
+                      reinterpret_cast<const std::uint16_t*>(bank.down_scales),
+                      reinterpret_cast<const std::uint16_t*>(bank.down_mins),
+                      pool.down_codes,
+                      pool.down_scales,
+                      bank.down_scales_bytes_per_expert / 2,
+                      bank.down_codes_bytes_per_expert * 2,
+                      bank.down_scales_bytes_per_expert};
+        p.miss_slots   = static_cast<const int*>(misses.slots.data);
+        p.miss_experts = static_cast<const int*>(misses.experts.data);
+        p.miss_count   = static_cast<const long long*>(misses.count.data);
+        gather_unpack_q4_kernel<<<2 * kGatherBlocksPerBank, kGatherThreads, 0, stream>>>(p);
+        CUDA_CHECK(cudaGetLastError());
+        return;
     }
     const std::uint64_t per_expert[4] = {
         bank.gate_up_codes_bytes_per_expert, bank.gate_up_scales_bytes_per_expert,

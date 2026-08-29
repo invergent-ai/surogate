@@ -1,5 +1,6 @@
 // Expert slot cache: resolve (directory, LRU, active-round protection, miss list) and gather
 // (four W8 planes from a pinned host bank into the device pool) on a small synthetic geometry.
+#include "api/ops/cpu_expert_compute.h"
 #include "api/ops/expert_slot_cache.h"
 #include "ops/op_tester.h"
 
@@ -10,6 +11,8 @@
 #include <cstring>
 #include <iostream>
 #include <string>
+#include <cmath>
+#include <random>
 #include <vector>
 
 using namespace ninfer;
@@ -231,6 +234,177 @@ int main() {
     failures += f.pool_memory.verify_guards("pool");
     failures += f.directory_memory.verify_guards("directory");
     failures += f.miss_memory.verify_guards("miss list");
+
+    // --- Q4G32AM bank: the gather unpacks nibbles + affine grid into W8 pool planes. ---
+    {
+        std::mt19937 rng(20260829U);
+        // A numeric W8 source (sane fp16 scales), requantised to a pinned q4 object per matrix.
+        const std::size_t gate_rows = static_cast<std::size_t>(kGeometry.experts) *
+                                      static_cast<std::size_t>(kGeometry.expert_rows());
+        const std::size_t down_rows = static_cast<std::size_t>(kGeometry.experts) *
+                                      static_cast<std::size_t>(kGeometry.hidden);
+        auto fp16 = [](float v) {
+            // encode via the op itself: requantise a 1-value... simpler: bit round-trip through
+            // __fp16 is unavailable portably here, so use a coarse encoder: scale values are
+            // chosen as exact powers of two, whose fp16 bits are exact.
+            std::uint16_t bits = 0;
+            if (v == 0.5F) { bits = 0x3800; }
+            if (v == 0.25F) { bits = 0x3400; }
+            if (v == 0.125F) { bits = 0x3000; }
+            if (v == 0.0078125F) { bits = 0x2000; }
+            return bits;
+        };
+        std::uniform_int_distribution<int> code(-127, 127);
+        const std::uint16_t scale_choices[4] = {fp16(0.5F), fp16(0.25F), fp16(0.125F),
+                                                fp16(0.0078125F)};
+        std::vector<std::int8_t> gate_codes(gate_rows * kGeometry.hidden);
+        std::vector<std::uint16_t> gate_scales(gate_rows * (kGeometry.hidden / 32));
+        std::vector<std::int8_t> down_codes(down_rows * kGeometry.intermediate);
+        std::vector<std::uint16_t> down_scales(down_rows * (kGeometry.intermediate / 32));
+        for (auto& c : gate_codes) { c = static_cast<std::int8_t>(code(rng)); }
+        for (auto& c : down_codes) { c = static_cast<std::int8_t>(code(rng)); }
+        for (auto& v : gate_scales) { v = scale_choices[rng() % 4]; }
+        for (auto& v : down_scales) { v = scale_choices[rng() % 4]; }
+
+        const ops::Q4BankPlanes gate_planes =
+            ops::q4_bank_planes(static_cast<std::int64_t>(gate_rows), kGeometry.hidden);
+        const ops::Q4BankPlanes down_planes =
+            ops::q4_bank_planes(static_cast<std::int64_t>(down_rows), kGeometry.intermediate);
+        void* gate_pinned = nullptr;
+        void* down_pinned = nullptr;
+        cuda_check(cudaHostAlloc(&gate_pinned, gate_planes.total_bytes,
+                                 cudaHostAllocMapped | cudaHostAllocPortable),
+                   "q4 gate alloc");
+        cuda_check(cudaHostAlloc(&down_pinned, down_planes.total_bytes,
+                                 cudaHostAllocMapped | cudaHostAllocPortable),
+                   "q4 down alloc");
+        auto* gb = static_cast<std::byte*>(gate_pinned);
+        auto* db = static_cast<std::byte*>(down_pinned);
+        ops::requantise_w8_expert_groups_to_q4(
+            gate_codes.data(), gate_scales.data(), static_cast<std::int64_t>(gate_planes.groups),
+            reinterpret_cast<std::uint8_t*>(gb),
+            reinterpret_cast<std::uint16_t*>(gb + gate_planes.scales_offset),
+            reinterpret_cast<std::uint16_t*>(gb + gate_planes.mins_offset));
+        ops::requantise_w8_expert_groups_to_q4(
+            down_codes.data(), down_scales.data(), static_cast<std::int64_t>(down_planes.groups),
+            reinterpret_cast<std::uint8_t*>(db),
+            reinterpret_cast<std::uint16_t*>(db + down_planes.scales_offset),
+            reinterpret_cast<std::uint16_t*>(db + down_planes.mins_offset));
+        void* gate_mapped = nullptr;
+        void* down_mapped = nullptr;
+        cuda_check(cudaHostGetDevicePointer(&gate_mapped, gate_pinned, 0), "q4 gate map");
+        cuda_check(cudaHostGetDevicePointer(&down_mapped, down_pinned, 0), "q4 down map");
+        const ops::ExpertHostBank q4 =
+            ops::expert_host_bank_q4(kGeometry, gate_mapped, down_mapped);
+
+        GuardedDeviceBuffer pool_memory(ops::expert_slot_pool_bytes(kGeometry, kSlots));
+        GuardedDeviceBuffer directory_memory(
+            ops::expert_slot_directory_bytes(kLayers, kGeometry.experts, kSlots));
+        GuardedDeviceBuffer miss_memory(ops::expert_miss_list_bytes(kGeometry.experts));
+        GuardedDeviceBuffer ids_memory(8 * sizeof(int));
+        ops::ExpertSlotPool pool = ops::create_expert_slot_pool(kGeometry, kSlots, pool_memory.data());
+        ops::ExpertSlotDirectory directory = ops::create_expert_slot_directory(
+            kLayers, kGeometry.experts, kSlots, directory_memory.data(), nullptr);
+        ops::ExpertMissList misses = ops::create_expert_miss_list(kGeometry.experts, miss_memory.data());
+        const std::vector<int> ids = {0, 5, 3};
+        cuda_check(cudaMemcpy(ids_memory.data(), ids.data(), ids.size() * sizeof(int),
+                              cudaMemcpyHostToDevice),
+                   "q4 ids upload");
+        Tensor ids_tensor(ids_memory.data(), DType::I32, {3});
+        ops::expert_slot_resolve(ids_tensor, 0, directory, misses, nullptr);
+        ops::expert_slot_gather(q4, misses, pool, nullptr);
+        cuda_synchronize();
+        const auto miss_count   = from_device<long long>(misses.count.data, 1)[0];
+        const auto miss_slots   = from_device<int>(misses.slots.data, static_cast<std::size_t>(miss_count));
+        const auto miss_experts = from_device<int>(misses.experts.data, static_cast<std::size_t>(miss_count));
+        failures += expect(miss_count == 3, "q4 gather misses == 3");
+
+        // Expected pool planes: decode the q4 grid, requantise symmetric int8 with the same
+        // float math as the kernel — byte-exact.
+        auto fp16f = [](std::uint16_t h) {
+            const std::uint32_t sign = (h & 0x8000U) << 16;
+            std::uint32_t exp        = (h >> 10) & 0x1FU;
+            std::uint32_t mant       = h & 0x3FFU;
+            std::uint32_t f;
+            if (exp == 0) {
+                if (mant == 0) { f = sign; }
+                else {
+                    exp = 127 - 15 + 1;
+                    while ((mant & 0x400U) == 0) { mant <<= 1; --exp; }
+                    mant &= 0x3FFU;
+                    f = sign | (exp << 23) | (mant << 13);
+                }
+            } else if (exp == 31) { f = sign | 0x7F800000U | (mant << 13); }
+            else { f = sign | ((exp - 15 + 127) << 23) | (mant << 13); }
+            float out;
+            std::memcpy(&out, &f, sizeof(out));
+            return out;
+        };
+        for (std::size_t m = 0; m < static_cast<std::size_t>(miss_count); ++m) {
+            const int slot   = miss_slots[m];
+            const int expert = miss_experts[m];
+            struct Matrix {
+                const std::byte* src;
+                const ops::Q4BankPlanes* planes;
+                const std::byte* pool_codes;
+                const std::byte* pool_scales;
+                std::size_t rows_per_expert;
+                int k;
+            } matrices[2] = {
+                {gb, &gate_planes, pool.gate_up_codes, pool.gate_up_scales,
+                 static_cast<std::size_t>(kGeometry.expert_rows()), kGeometry.hidden},
+                {db, &down_planes, pool.down_codes, pool.down_scales,
+                 static_cast<std::size_t>(kGeometry.hidden), kGeometry.intermediate},
+            };
+            for (int which = 0; which < 2; ++which) {
+                const Matrix& mx     = matrices[which];
+                const std::size_t groups_per_expert = mx.rows_per_expert * mx.k / 32;
+                const std::size_t codes_bytes       = groups_per_expert * 32;
+                const std::vector<std::int8_t> got_codes = from_device<std::int8_t>(
+                    mx.pool_codes + static_cast<std::size_t>(slot) * codes_bytes, codes_bytes);
+                const std::vector<std::uint16_t> got_scales = from_device<std::uint16_t>(
+                    mx.pool_scales + static_cast<std::size_t>(slot) * groups_per_expert * 2,
+                    groups_per_expert);
+                const auto* q4c = reinterpret_cast<const std::uint8_t*>(mx.src);
+                const auto* q4s = reinterpret_cast<const std::uint16_t*>(mx.src + mx.planes->scales_offset);
+                const auto* q4m = reinterpret_cast<const std::uint16_t*>(mx.src + mx.planes->mins_offset);
+                int bad = 0;
+                for (std::size_t g = 0; g < groups_per_expert && bad < 4; ++g) {
+                    const std::size_t src_g = static_cast<std::size_t>(expert) * groups_per_expert + g;
+                    const float step = fp16f(q4s[src_g]);
+                    const float lo   = fp16f(q4m[src_g]);
+                    float value[32];
+                    float amax = 0.0F;
+                    for (int i = 0; i < 32; ++i) {
+                        const int q = (q4c[src_g * 16 + i / 2] >> (4 * (i % 2))) & 0xF;
+                        value[i]     = step * static_cast<float>(q) + lo;
+                        amax         = std::max(amax, std::fabs(value[i]));
+                    }
+                    const float scale = amax / 127.0F;
+                    const float inv   = scale > 0.0F ? 1.0F / scale : 0.0F;
+                    for (int i = 0; i < 32; ++i) {
+                        const int want = static_cast<int>(std::nearbyint(value[i] * inv));
+                        if (static_cast<int>(got_codes[g * 32 + i]) != want) {
+                            std::cout << "FAIL q4 gather codes matrix " << which << " group " << g
+                                      << " lane " << i << " got " << int(got_codes[g * 32 + i])
+                                      << " want " << want << "\n";
+                            ++bad;
+                        }
+                    }
+                    // The kernel's __float2half_rn(scale): compare through the decoded value.
+                    const float got_scale = fp16f(got_scales[g]);
+                    if (std::fabs(got_scale - scale) > std::max(1e-3F * scale, 1e-8F)) {
+                        std::cout << "FAIL q4 gather scale matrix " << which << " group " << g
+                                  << " got " << got_scale << " want " << scale << "\n";
+                        ++bad;
+                    }
+                }
+                failures += bad != 0;
+            }
+        }
+        cudaFreeHost(gate_pinned);
+        cudaFreeHost(down_pinned);
+    }
     std::cout << (failures ? "FAIL" : "OK") << " expert_slot_cache\n";
     return failures ? 1 : 0;
 }
