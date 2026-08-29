@@ -1042,6 +1042,7 @@ add_library(ninfer_ops STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/linear/bf16/bf16_cublaslt.cpp
   ${SERVE_ROOT}/ops/hyper_connection/hyper_connection.cu
   ${SERVE_ROOT}/ops/ngram_ple/ngram_ple.cu
+  ${SERVE_ROOT}/ops/qsa_indexer/qsa_indexer.cu
   ${SERVE_ROOT}/ops/expert_slot_cache/expert_slot_cache.cu
   ${SERVE_ROOT}/ops/cpu_expert_compute/cpu_expert_compute.cpp
   ${SERVE_ROOT}/ops/linear/linear.cpp
