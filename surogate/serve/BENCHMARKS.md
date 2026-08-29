@@ -206,8 +206,9 @@ concurrency, not before the load.
 - **35B-A3B**: NVFP4 expert artifact; row-parallel decode-width routed kernel.
 - **27B**: layer-loop fusion and a wider GDN chunked scan (the 114 µs column).
 - **Flash-Next**: prefill split at 16–64 users; host tile kernel (interleaved
-  rows); sparse indexer for >2k context; Q4 host bank; then pipeline/expert
-  parallelism across cards (phases 3–4 in `design/INFERENCE.md`).
+  rows); Q4 host bank. The sparse (QSA) indexer shipped 2026-08-29 — contexts up
+  to the model's trained 262,144 are served, needle retrieval 12/12 at 3.5k and
+  5.7k tokens, and nothing runs below its 2,051-token budget.
 - **0.8B**: ~4-per-100,000 mixed-round corruption.
 - Record the card with every number; re-measure single-user cells on the
   same card as the 100-user rows.

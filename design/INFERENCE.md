@@ -39,6 +39,7 @@ phase 3 = PP across 8 GPUs with the offload inside each stage; phase 4 (EP) reje
 | Phase 2: CPU expert split (`--cpu-moe-share F|auto`, prefill share, batched VNNI host kernel) | **done 2026-08-28** — defaults: 1 user TTFT 1.40 s (366 t/s prompt processing) / 22.4 tok/s; 16 users 32.2 tok/s (37.9 at explicit shares); correct under load, 0 fatals; 35B board unchanged (1,769) | rows in BENCHMARKS.md; the remaining phase-2 levers (Q4 host bank, vectorised tile repack, sparse indexer for >2k) are listed under Open items |
 | First throughput row (zero-copy experts v0, board shape 512/128) | done 2026-08-28 | users=1: 5.2 decode / 21 prefill tok/s, TTFT 1.79 s; users=16: 7.6 / 30, TTFT 15.1 s; (128/128: 4.9 @1, 8.3 @16, 26.6 @32). llama.cpp 1×5090 CPU-MoE: 7.1 / 29 @1, 16.3 / 65 @16 |
 | Phase 3: pipeline parallelism (`--devices A,B,...`, one layer-range stage per card, residual over pinned host memory, per-stage offload, steady-state software pipeline with prompts as asynchronous batch-0 mixed flights) | **done 2026-08-29** | 2-stage forward bit-exact vs one card at all 48 boundaries; Flash-Next on 8×5090 (3,072 slots/stage, fully resident): 57.9 tok/s @1 (TTFT 237 ms), 383.9 @16 (615 ms); 27B 1,057 @100; 35B-A3B 1,960 @100; answers correct under load at the measured concurrency |
+| QSA indexer (contexts past 2,051) | **done 2026-08-29** | op + unit test; wired at every text attention site; context cap 262,144; needle retrieval 12/12 at 3.5k and 12/12 at 5.7k tokens (dense control 11/12 each); no indexer kernel runs below the budget |
 | Phase 3: 64/32-user points, per-stage prefill timing, scan-resistant replacement for stages that cannot hold their experts, parallel stage construction (8-stage startup ~13 min) | open | see the 2026-08-29 entries |
 
 ## Next: phase 2 (single-GPU offload) — plan as of 2026-08-28
@@ -504,6 +505,13 @@ copy is the design, and it is also what a multi-host version would use).
   `SUROGATE_SERVE_PIPELINE_TRACE=1` (timestamped stage rounds on stderr),
   `SUROGATE_SERVE_PIPELINE_GROUPS=N`, `SUROGATE_SERVE_PIPELINE_LONE_PREFILL=1` (synchronous
   prompt steps instead of batch-0 mixed flights).
+- Serve past 2,051 tokens: pass `--max-model-len <N>` (the cap is the model's trained 262,144;
+  the default stays 2048). The QSA indexer engages by itself above `top_k + block - 1` and
+  nothing below it changes. `SUROGATE_SERVE_NO_QSA_INDEXER=1` disables it for bisection.
+- **Launch every serving binary through `surogate/serve/tools/run_guarded.sh`** (`--mem 300G`):
+  one Flash-Next process peaks at 297 GB (152 GB pinned bank + the artifact's page cache), so
+  an unguarded run — or a second one — takes the machine down. The guard caps the process in a
+  cgroup, refuses a second serving process and forces `numactl --interleave=all`.
 - Probe at concurrency: scratchpad `probe_slots.sh` (env USERS/SEQS/DUR/PTOK/MTOK/GPU/KV/EXTRA/
   NUMA/MAXLEN/PORT/OUT/SRVLOG) runs the coherence prompts before and *during* the load;
   `lane.sh` runs a list of probes node-bound on one GPU so two lanes share the host.
@@ -1485,43 +1493,64 @@ kernel mask, (5) raise `kNativeContext` and verify against llama.cpp at 8k and 3
   batch), so a near-tie at that fork can flip under load. Not the same failure: the pre-fix
   corruption replaced the first token with an unrelated one.
 
-### Indexer: what is built and what is left (2026-08-29 06:50)
+### Indexer: shipped (2026-08-29 09:10)
 
-Built and verified:
+The QSA indexer serves the model's trained context. Below the budget it selects every cell, so
+attention is dense and exact and nothing changes; above it each query attends only to its
+highest-scoring blocks, which is what the model was trained to do.
 
-- the weights materialise on all 12 full-attention layers (`50ef757f`);
-- the text KV pool carries one BF16 indexer plane per full-attention layer, sharing pages,
-  block tables and prefix reuse (`7939a021`);
-- `ops::qsa_indexer_append` / `qsa_indexer_select` with a unit test against a scalar reference
-  on a shuffled paged cache — block keys within a BF16 ulp, the selection exact against a
-  sorted reference at two budgets (`6ec9bb76`, `2334e4a0`);
-- the bf16 decode and prefill attention kernels take an optional `GqaBlockMask`, threaded
-  through the wrapper and both launchers; a quantized KV cache refuses a selection. `Sparse`
-  defaults to false, so the dense instantiation is the code that was there (`4fc7536f`);
-- `TextContext::text_indexer_selection`, the per-layer forward: indexer key and query
-  projections off the attention input, the raw-key append (which folds completed blocks), the
-  query norm and rope, the selection, and the mask (`0acabdca`). `ops::rope` now accepts the
-  1-D D128 head with a partial rotation, which is what the indexer's queries need.
+- Op: `api/ops/qsa_indexer.h`, `ops/qsa_indexer/qsa_indexer.cu` — `qsa_indexer_append` (raw key
+  per column, then a second launch folds completed blocks: mean over the block, RMSNorm, rope
+  at the block's first position — a separate launch because a block's cells are written by
+  warps of other CTAs and only a launch boundary orders those) and `qsa_indexer_select`
+  (per-head rope'd query, `sum_h relu(q·k_block)`, top-k blocks, a bitmask over the history).
+  Unit-tested against a scalar CPU reference on a shuffled paged cache.
+- The text KV pool carries one BF16 indexer plane per full-attention layer, sharing pages,
+  block tables and prefix reuse.
+- The bf16 decode and prefill attention kernels take an optional `GqaBlockMask`; `Sparse`
+  defaults to false, so the dense instantiation is byte-for-byte the code that was there. A
+  quantized KV cache refuses a selection.
+- `TextContext::text_indexer_selection` runs at every text attention site — `text_prefill`
+  (single sequence and sequence batch), both `mixed_chunk_multi` calls and both
+  `mixed_graph_window` calls — so every column's key is cached exactly once per layer. Table
+  rows are mapped by `columns_per_row`, which covers one sequence per call (a prefill segment),
+  one column per sequence (a decode batch) and a width per sequence (a batched prefill).
+- The transient bytes are reserved in the workspace plan (`variant_indexer_workspace_bytes`),
+  so a selection can never overflow the arena.
+- `kNativeContext` for the target is the GGUF's `context_length` (262,144), up from 2,051. The
+  engine's default `max_context` stays 2048, so long context is opt-in per deployment, and the
+  append is skipped entirely when the configured KV capacity cannot reach the budget — a
+  short-context deployment runs no indexer kernel at all.
+- `SUROGATE_SERVE_NO_QSA_INDEXER=1` turns the whole indexer off (no keys cached, dense
+  attention over the history) as the bisection control.
 
-Left, in order:
+**Validation (needle-in-a-haystack retrieval rate, greedy, one 5090):** a random 5-digit code
+planted at a random depth of a filler archive, scored on whether the answer contains it. The
+rate is the metric, not a single answer — this engine is not run-to-run deterministic at the
+digit level (batch-noninvariance, MoE routing), and a single prompt's answer proves nothing.
 
-1. **Call the helper at the three text attention sites** (`text_prefill` ~line 924,
-   `mixed_chunk_multi` ~1528, `mixed_graph_window` ~1932) and pass the mask to
-   `ops::gqa_attention`. The append must run for *every* column at every site or the plane
-   develops holes, so this lands as one change, not per site.
-2. **Per-column block-table rows.** The append and the selection index the cache per column;
-   a mixed round's columns belong to several sequences (prefill segments plus decode rows), so
-   the round needs an I32 [columns] table-row tensor. The prologue already builds per-column
-   tables (`prologue_.slots`) — the same shape.
-3. **Workspace plan.** The mask is `ceil(ceil(keys/4)/32)` words per column (1 KB per column at
-   32k) plus the selection's score scratch; both come out of the round workspace, so the
-   recipe and the planned capacity have to include them.
-4. **CUDA graphs.** The mask width depends on the history length, which the captured body
-   would bake in. Simplest first landing: refuse the mixed/prefill graph when a selection is
-   active (`try_mixed_graph_chunk` returns false), and revisit once the shape ladder is known.
-5. **Raise `kNativeContext`** from `dense_exact_context` and validate against llama.cpp at 4k
-   and 32k — the engine's answers, and the selected block sets, against `build_qsa_top_k`.
+| context | indexer on | indexer off (dense) |
+|---|---:|---:|
+| ~3,500 tokens (1.7x the budget) | **12/12** | 11/12 |
+| ~5,700 tokens (2.8x the budget) | **12/12** | 11/12 |
 
-Nothing above 2,051 tokens is admitted until step 5, so every piece landed so far is inert:
-the selection cannot engage, and the dense path is byte-for-byte what it was.
+Needles landed at depths 3-78 of 80 and 3-129 of 130, so the selection reaches the start of the
+context, not just the recent window. Dense attention past the budget is off-distribution for
+this model (it was trained with the selection), which is why it scores no better.
+
+A caution for whoever reads the earlier log entries: single hand-made needle prompts sent me
+chasing a "long-context bug" that does not exist. Two prompts at the same length disagreed,
+`--no-thinking` and thinking disagreed, and llama.cpp answered a third way — all within the
+engine's own answer instability. Only the rate over a dozen prompts settled it.
+
+- **Three host OOM crashes (2026-08-29)**: five parallel one-GPU CLI runs took the machine down,
+  then two more crashes followed, the last a hard reset with no OOM line (journald had already
+  been killed). Measured inside a cgroup afterwards: one Flash-Next process peaks at **297 GB**
+  of this box's 503 GB — the 152 GB pinned expert bank plus the 152 GB artifact's page cache —
+  so even two are fatal, and `numactl --membind=<one node>` for a full-model run confines the
+  bank to one node's 251 GB. Fixed by `surogate/serve/tools/run_guarded.sh`: a
+  `systemd-run --scope` with `MemoryMax`, verified to kill the process
+  (`constraint=CONSTRAINT_MEMCG`) and leave the machine up, plus a one-process-at-a-time check,
+  a free-RAM floor and interleaved NUMA. `vm.min_free_kbytes` also raised to 4 GB at runtime.
+  The scratchpad does not survive a reboot: the probe and chain scripts were lost twice.
 
