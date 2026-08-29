@@ -1271,3 +1271,8 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   lands in a `cudaErrorInvalidResourceHandle` at the third stage's warm-up — the window-lap
   events it uses belong to the first device. Debug-only path; left as is (multi-device
   unsafe, noted). The lone-path decomposition therefore waits; C3v5 is building.
+- Zero-lane mixed rounds hit `slice range out of bounds` in the family's mixed body
+  (`Tensor::slice` refuses length 0 and `mixed_chunk_multi` rejects batch ≤ 0), so the
+  executor's launch of them is behind `SUROGATE_SERVE_PIPELINE_ZERO_LANE_MIXED` until the
+  body accepts batch 0 (10b69c98). Meanwhile the lone path's cost is measured directly on a
+  2-stage server with the capture log and the trace (one user, several ~512-token prompts).
