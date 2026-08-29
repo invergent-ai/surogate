@@ -1354,4 +1354,8 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
 - Layer-subset stages verified (2026-08-29 04:48): 2-stage CLI answers "The capital of France
   is **Paris**." with 6.80 GiB of weights uploaded across both stages (11 GiB per stage
   before). Running: 8 stages × 3,072 slots at 64 and 32 users.
+- **8 stages, 64 users, 3,072 slots, layer-subset stages (2026-08-29 04:52): 604.8 tok/s, TTFT
+  p50 1.24 s, 453 ok / 0 errors, probes correct under load.** The 8-stage startup is ~2 min now
+  (was ~13: each stage uploaded 11 GiB and warmed up / precaptured all 48 layers). The
+  cross-lane answer seen at 2,100 slots with the split on did not appear here (split off).
 
