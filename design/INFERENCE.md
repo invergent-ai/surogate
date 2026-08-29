@@ -1826,3 +1826,25 @@ battery 40/40. Fewer-than-8-stage deployments are now usable.
   (`run_guarded.sh`) remains the standard way to start serving binaries — it is cheap insurance
   either way — and no crash has occurred since the Q4 bank shrank the pinned footprint.
 
+### The residual truncation class: in-place CUDA-graph updates (2026-08-29 19:00, commit 564b673b)
+
+The burst-cap lead paid off. Bisection on the saturated 16-lane single-card battery with
+`SUROGATE_SERVE_BURST_CAP=1` (maximum batch recomposition, one decode round per host trip):
+
+| arm | score |
+|---|---:|
+| graphs on, in-place `cudaGraphExecUpdate` on profile switch (the old default) | 77/100, truncations / wrong tokens / template leaks ('user') |
+| `--enforce-eager` | 99/100 (the miss is a queue 503) |
+| graphs on, executable **rebuilt** on every profile switch | 99/100 (same 503) |
+
+So the decode-graph family's shared executable, patched in place when the batch size or
+frontier band changed, was misapplying parameters at some rate — enough to corrupt a decode
+round now and then. Every battery all day carried it: the ~5-10 % arithmetic-drift /
+truncation misses that survived the scratch-state fix in every configuration and format are
+this. Fix: `install_graph_profile` rebuilds the executable from the profile's definition on
+every switch (`SUROGATE_SERVE_GRAPH_UPDATE_INPLACE=1` restores the old path for bisection).
+Cost: none measurable at 16 users (19.3 vs 16.1 tok/s, both arms without the CPU split —
+profile switches are rare against the rounds between them; the burst keeps them rarer).
+The update-refusal fallback (re-instantiate on `cudaGraphExecUpdate` failure) already
+existed for the pipeline's 64-lane profiles; the silent-success case is the one that hurt.
+
