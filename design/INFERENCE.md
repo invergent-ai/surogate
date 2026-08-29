@@ -40,7 +40,7 @@ phase 3 = PP across 8 GPUs with the offload inside each stage; phase 4 (EP) reje
 | First throughput row (zero-copy experts v0, board shape 512/128) | done 2026-08-28 | users=1: 5.2 decode / 21 prefill tok/s, TTFT 1.79 s; users=16: 7.6 / 30, TTFT 15.1 s; (128/128: 4.9 @1, 8.3 @16, 26.6 @32). llama.cpp 1×5090 CPU-MoE: 7.1 / 29 @1, 16.3 / 65 @16 |
 | Phase 3: pipeline parallelism (`--devices A,B,...`, one layer-range stage per card, residual over pinned host memory, per-stage offload, steady-state software pipeline with prompts as asynchronous batch-0 mixed flights) | **done 2026-08-29** | 2-stage forward bit-exact vs one card at all 48 boundaries; Flash-Next on 8×5090 (3,072 slots/stage, fully resident): 57.9 tok/s @1 (TTFT 237 ms), 383.9 @16 (615 ms); 27B 1,057 @100; 35B-A3B 1,960 @100; answers correct under load at the measured concurrency |
 | QSA indexer (contexts past 2,051) | **done 2026-08-29** | op + unit test; wired at every text attention site; context cap 262,144; needle retrieval 12/12 at 3.5k and 12/12 at 5.7k tokens (dense control 11/12 each); no indexer kernel runs below the budget |
-| Phase 3: 64/32-user points, per-stage prefill timing, scan-resistant replacement for stages that cannot hold their experts, parallel stage construction (8-stage startup ~13 min) | open | see the 2026-08-29 entries |
+| Phase 3 leftovers: scan-resistant slot replacement for stages that cannot hold their expert scan (the 2-stage points), the ~2 s synchronous prefill stage-step (bypassed by batch-0 flights, never explained), parallel stage construction (startup ~2 min) | open | see the 2026-08-29 entries |
 
 ## Next: phase 2 (single-GPU offload) — plan as of 2026-08-28
 
