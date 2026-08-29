@@ -1042,11 +1042,16 @@ private:
                 meta.membership.budgets[meta.membership.size] = request->budget->round_budget();
                 ++meta.membership.size;
             }
-            meta.staged_count = 0;
+            // Staged prompts of this group: any of them can take a lone prefill step; only the
+            // ones the program can advance inside a mixed round ride with the decode lanes.
+            meta.staged_count       = 0;
+            std::uint32_t lone_lane = max_concurrency_;
             for (const std::uint32_t candidate : prefill_lanes_.span()) {
-                if (candidate % groups != g || !program.mixed_round_supported(candidate)) { continue; }
+                if (candidate % groups != g) { continue; }
                 const auto& owner = slots_[candidate];
                 if (owner == nullptr || owner->decode_ready) { continue; }
+                if (lone_lane == max_concurrency_) { lone_lane = candidate; }
+                if (!program.mixed_round_supported(candidate)) { continue; }
                 meta.staged[meta.staged_count++] = candidate;
             }
             // Prefill batching (#88) in the pipelined loop: let a group's staged set grow for a
@@ -1066,8 +1071,9 @@ private:
                 program.launch_group_mixed(g, std::span<const std::uint32_t>(meta.staged.data(), meta.staged_count),
                                            meta.membership.lane_span(), meta.membership.budget_span());
                 launched = true;
-            } else if (meta.staged_count > 0) {
-                meta.prefill_lane   = meta.staged[0];
+            } else if (lone_lane != max_concurrency_) {
+                meta.staged_count   = 0;
+                meta.prefill_lane   = lone_lane;
                 meta.prefill_flight = true;
                 last_round_ = LastRound{"prefill", 0, meta.prefill_lane, last_round_.index + 1};
                 program.launch_group_prefill(g, meta.prefill_lane);
