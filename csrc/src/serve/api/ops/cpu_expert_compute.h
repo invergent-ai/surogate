@@ -24,12 +24,30 @@
 namespace ninfer::ops {
 
 /// One layer's routed experts in host memory (the pinned bank's host pointers).
+/// Storage of the routed expert bank the host (and the miss gather) read.
+/// - W8G32: int8 codes, one FP16 scale per 32-group (the artifact's own encoding).
+/// - Q4G32AM: unsigned 4-bit codes packed two per byte (low nibble = even element), one FP16
+///   scale AND one FP16 min per 32-group (`w = scale * q + min`). Requantised from W8 at load;
+///   the affine form reproduces the Q4_K-derived weights almost exactly at 59 % of the bytes.
+enum class ExpertBankFormat : std::uint8_t { W8G32 = 0, Q4G32AM = 1 };
+
 struct CpuExpertBank {
-    const std::byte* gate_up_codes  = nullptr; // [experts][2*intermediate][hidden] int8
+    ExpertBankFormat format         = ExpertBankFormat::W8G32;
+    const std::byte* gate_up_codes  = nullptr; // [experts][2*intermediate][hidden] int8 | u4x2
     const std::byte* gate_up_scales = nullptr; // [experts][2*intermediate][hidden/32] fp16
-    const std::byte* down_codes     = nullptr; // [experts][hidden][intermediate] int8
+    const std::byte* gate_up_mins   = nullptr; // Q4G32AM only, same shape as the scales
+    const std::byte* down_codes     = nullptr; // [experts][hidden][intermediate] int8 | u4x2
     const std::byte* down_scales    = nullptr; // [experts][hidden][intermediate/32] fp16
+    const std::byte* down_mins      = nullptr; // Q4G32AM only
 };
+
+/// Requantises `groups` W8 groups (32 int8 codes + FP16 scale each, in parallel plane order)
+/// into Q4G32AM: per group, the decoded values' [min, max] span becomes a 16-level affine grid
+/// (both endpoints stored as FP16, and the codes are fitted against the *rounded* endpoints).
+/// Runs on the calling thread; callers parallelise over disjoint group ranges.
+void requantise_w8_expert_groups_to_q4(const std::int8_t* codes, const std::uint16_t* scales,
+                                       std::int64_t groups, std::uint8_t* q4,
+                                       std::uint16_t* q4_scales, std::uint16_t* q4_mins);
 
 /// One (token, expert) pair the CPU computes; `weight` is the router weight of that path.
 struct CpuExpertJob {

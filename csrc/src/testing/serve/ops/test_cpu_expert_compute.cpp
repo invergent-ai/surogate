@@ -53,10 +53,12 @@ struct Bank {
     std::vector<std::int8_t> gate_codes, down_codes;
     std::vector<std::uint16_t> gate_scales, down_scales;
     ops::CpuExpertBank view() const {
-        return {reinterpret_cast<const std::byte*>(gate_codes.data()),
-                reinterpret_cast<const std::byte*>(gate_scales.data()),
-                reinterpret_cast<const std::byte*>(down_codes.data()),
-                reinterpret_cast<const std::byte*>(down_scales.data())};
+        ops::CpuExpertBank bank;
+        bank.gate_up_codes  = reinterpret_cast<const std::byte*>(gate_codes.data());
+        bank.gate_up_scales = reinterpret_cast<const std::byte*>(gate_scales.data());
+        bank.down_codes     = reinterpret_cast<const std::byte*>(down_codes.data());
+        bank.down_scales    = reinterpret_cast<const std::byte*>(down_scales.data());
+        return bank;
     }
 };
 
@@ -125,6 +127,91 @@ std::vector<double> reference_job(const Bank& b, int expert, const std::vector<s
     const std::uint16_t* ds = b.down_scales.data() + static_cast<std::size_t>(expert) * H * (I / 32);
     std::vector<double> y(H);
     for (int r = 0; r < H; ++r) { y[r] = weight * dot_ref(dc + r * I, ds + r * (I / 32), hq, hs, I); }
+    return y;
+}
+
+// --- Q4G32AM bank: requantised from the W8 bank; the reference decodes the affine grid. ---
+struct Q4Bank {
+    std::vector<std::uint8_t> gate_codes, down_codes;
+    std::vector<std::uint16_t> gate_scales, gate_mins, down_scales, down_mins;
+    ops::CpuExpertBank view() const {
+        ops::CpuExpertBank bank;
+        bank.format         = ops::ExpertBankFormat::Q4G32AM;
+        bank.gate_up_codes  = reinterpret_cast<const std::byte*>(gate_codes.data());
+        bank.gate_up_scales = reinterpret_cast<const std::byte*>(gate_scales.data());
+        bank.gate_up_mins   = reinterpret_cast<const std::byte*>(gate_mins.data());
+        bank.down_codes     = reinterpret_cast<const std::byte*>(down_codes.data());
+        bank.down_scales    = reinterpret_cast<const std::byte*>(down_scales.data());
+        bank.down_mins      = reinterpret_cast<const std::byte*>(down_mins.data());
+        return bank;
+    }
+};
+
+Q4Bank requantise_bank(const Bank& b) {
+    Q4Bank q;
+    const auto gate_groups = static_cast<std::int64_t>(b.gate_scales.size());
+    const auto down_groups = static_cast<std::int64_t>(b.down_scales.size());
+    q.gate_codes.resize(static_cast<std::size_t>(gate_groups) * 16);
+    q.gate_scales.resize(b.gate_scales.size());
+    q.gate_mins.resize(b.gate_scales.size());
+    q.down_codes.resize(static_cast<std::size_t>(down_groups) * 16);
+    q.down_scales.resize(b.down_scales.size());
+    q.down_mins.resize(b.down_scales.size());
+    ops::requantise_w8_expert_groups_to_q4(b.gate_codes.data(), b.gate_scales.data(), gate_groups,
+                                           q.gate_codes.data(), q.gate_scales.data(),
+                                           q.gate_mins.data());
+    ops::requantise_w8_expert_groups_to_q4(b.down_codes.data(), b.down_scales.data(), down_groups,
+                                           q.down_codes.data(), q.down_scales.data(),
+                                           q.down_mins.data());
+    return q;
+}
+
+double dot_ref_q4(const std::uint8_t* q4, const std::uint16_t* scales, const std::uint16_t* mins,
+                  const std::vector<int>& xq, const std::vector<double>& xs, int k) {
+    double acc = 0.0;
+    for (int g = 0; g < k / 32; ++g) {
+        long dot = 0, sum = 0;
+        for (int i = 0; i < 16; ++i) {
+            const int q0 = q4[g * 16 + i] & 0x0F;
+            const int q1 = q4[g * 16 + i] >> 4;
+            dot += static_cast<long>(q0) * xq[g * 32 + 2 * i] +
+                   static_cast<long>(q1) * xq[g * 32 + 2 * i + 1];
+            sum += xq[g * 32 + 2 * i] + xq[g * 32 + 2 * i + 1];
+        }
+        acc += xs[g] * (static_cast<double>(fp16_to_float(scales[g])) * static_cast<double>(dot) +
+                        static_cast<double>(fp16_to_float(mins[g])) * static_cast<double>(sum));
+    }
+    return acc;
+}
+
+std::vector<double> reference_job_q4(const Q4Bank& b, int expert,
+                                     const std::vector<std::uint16_t>& x, float weight) {
+    const int H = kGeometry.hidden, I = kGeometry.intermediate;
+    std::vector<double> xf(H);
+    for (int i = 0; i < H; ++i) { xf[i] = bf16_to_float(x[i]); }
+    std::vector<int> xq;
+    std::vector<double> xs;
+    quantise_ref(xf, xq, xs);
+    const std::uint8_t* gc  = b.gate_codes.data() + static_cast<std::size_t>(expert) * 2 * I * (H / 2);
+    const std::uint16_t* gs = b.gate_scales.data() + static_cast<std::size_t>(expert) * 2 * I * (H / 32);
+    const std::uint16_t* gm = b.gate_mins.data() + static_cast<std::size_t>(expert) * 2 * I * (H / 32);
+    std::vector<double> h(I);
+    for (int j = 0; j < I; ++j) {
+        const double g = dot_ref_q4(gc + j * (H / 2), gs + j * (H / 32), gm + j * (H / 32), xq, xs, H);
+        const double u = dot_ref_q4(gc + (I + j) * (H / 2), gs + (I + j) * (H / 32),
+                                    gm + (I + j) * (H / 32), xq, xs, H);
+        h[j] = (g / (1.0 + std::exp(-g))) * u;
+    }
+    std::vector<int> hq;
+    std::vector<double> hs;
+    quantise_ref(h, hq, hs);
+    const std::uint8_t* dc  = b.down_codes.data() + static_cast<std::size_t>(expert) * H * (I / 2);
+    const std::uint16_t* ds = b.down_scales.data() + static_cast<std::size_t>(expert) * H * (I / 32);
+    const std::uint16_t* dm = b.down_mins.data() + static_cast<std::size_t>(expert) * H * (I / 32);
+    std::vector<double> y(H);
+    for (int r = 0; r < H; ++r) {
+        y[r] = weight * dot_ref_q4(dc + r * (I / 2), ds + r * (I / 32), dm + r * (I / 32), hq, hs, I);
+    }
     return y;
 }
 
@@ -235,6 +322,80 @@ int main() {
         failures += compare("stress round (last)", tiny_out, reference_job(bank, 1, x, 1.0F));
         finished.store(true);
         watchdog.join();
+    }
+    // --- Q4G32AM bank ---
+    {
+        // Requantiser fidelity on an exact 16-level affine grid (a Q4_K sub-block's shape):
+        // c = -60 + 8q with q in [0,15], so max-min = 15 steps and the affine fit reproduces
+        // every decoded value to FP16 endpoint rounding.
+        std::vector<std::int8_t> grid_codes(32);
+        std::vector<std::uint16_t> grid_scale = {float_to_fp16(0.01F)};
+        for (int i = 0; i < 32; ++i) {
+            grid_codes[static_cast<std::size_t>(i)] = static_cast<std::int8_t>(-60 + 8 * (i % 16));
+        }
+        std::vector<std::uint8_t> gq(16);
+        std::vector<std::uint16_t> gs(1), gm(1);
+        ops::requantise_w8_expert_groups_to_q4(grid_codes.data(), grid_scale.data(), 1, gq.data(),
+                                               gs.data(), gm.data());
+        double worst = 0.0;
+        for (int i = 0; i < 32; ++i) {
+            const int q = (gq[static_cast<std::size_t>(i / 2)] >> (4 * (i % 2))) & 0x0F;
+            const double got  = static_cast<double>(fp16_to_float(gs[0])) * q + fp16_to_float(gm[0]);
+            const double want = static_cast<double>(grid_codes[static_cast<std::size_t>(i)]) *
+                                fp16_to_float(grid_scale[0]);
+            worst = std::max(worst, std::fabs(got - want));
+        }
+        const bool grid_ok = worst < 2.0e-3 * 1.2; // 1.2 = the grid's value range
+        std::cout << (grid_ok ? "ok   " : "FAIL ") << "q4 affine grid max|err| " << worst << "\n";
+        failures += grid_ok ? 0 : 1;
+
+        const Q4Bank q4 = requantise_bank(bank);
+        // Scalar oracle path (cpu_expert_compute_job).
+        std::vector<float> outq(H, 0.0F);
+        ops::cpu_expert_compute_job(kGeometry, q4.view(), job, x.data(), outq.data(), scratch.data());
+        failures += compare("q4 single job expert 2", outq, reference_job_q4(q4, 2, x, 0.75F));
+
+        // Pooled round through the VNNI kernels (paired tokens, odd tails, one-token groups).
+        const int many = 13;
+        std::vector<std::uint16_t> xm(static_cast<std::size_t>(H) * many);
+        for (auto& v : xm) { v = float_to_bf16(act(rng)); }
+        std::vector<ops::CpuExpertJob> jm;
+        std::uniform_real_distribution<float> wdist(0.05F, 0.95F);
+        for (int t2 = 0; t2 < many; ++t2) {
+            jm.push_back({t2, t2 % 4, wdist(rng)});
+            if (t2 % 2 == 0) { jm.push_back({t2, (t2 * 7 + 1) % 4, wdist(rng)}); }
+        }
+        std::vector<float> om(static_cast<std::size_t>(H) * many, 0.0F);
+        ops::CpuExpertPool poolq(kGeometry, {.threads = 6, .pin_threads = false});
+        ops::CpuExpertRound rq{xm.data(), om.data(), many, jm};
+        poolq.run(q4.view(), rq);
+        int bad = 0;
+        for (int t2 = 0; t2 < many; ++t2) {
+            std::vector<std::uint16_t> column(xm.begin() + t2 * H, xm.begin() + (t2 + 1) * H);
+            std::vector<double> want(H, 0.0);
+            for (const auto& j2 : jm) {
+                if (j2.token != t2) { continue; }
+                const std::vector<double> y = reference_job_q4(q4, j2.expert, column, j2.weight);
+                for (int i = 0; i < H; ++i) { want[i] += y[i]; }
+            }
+            std::vector<float> got(om.begin() + t2 * H, om.begin() + (t2 + 1) * H);
+            bad += compare("q4 pooled token " + std::to_string(t2), got, want);
+        }
+        failures += bad;
+
+        // The requantised bank must stay close to the W8 bank it came from: same job, W8
+        // reference, loose bound (this is the 4-bit quantisation error itself, on random,
+        // non-affine synthetic codes — the worst case the real Q4_K-derived weights never hit).
+        std::vector<double> w8_want = reference_job(bank, 2, x, 0.75F);
+        double err2 = 0.0, ref2 = 0.0;
+        for (int i = 0; i < H; ++i) {
+            const double d = static_cast<double>(outq[static_cast<std::size_t>(i)]) - w8_want[static_cast<std::size_t>(i)];
+            err2 += d * d;
+            ref2 += w8_want[static_cast<std::size_t>(i)] * w8_want[static_cast<std::size_t>(i)];
+        }
+        const double rel = std::sqrt(err2 / std::max(ref2, 1e-30));
+        std::cout << "info q4-vs-w8 rel-L2 " << rel << " (random codes; affine sources are near-exact)\n";
+        failures += rel < 0.2 ? 0 : 1;
     }
     std::cout << (failures ? "FAIL" : "OK") << " cpu_expert_compute\n";
     return failures ? 1 : 0;
