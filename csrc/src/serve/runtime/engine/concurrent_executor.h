@@ -1315,10 +1315,12 @@ private:
 
         seg_timer_.preview += std::chrono::duration<double>(Clock::now() - t_preview).count();
         const auto t_resolve = Clock::now();
-        instance_.program->resolve_pending_batch(
-            lanes, std::span<const std::uint32_t>(accepted.data(), lanes.size()),
-            std::span<const std::uint8_t>(terminal.data(), lanes.size()),
-            std::span<const std::uint8_t>(cancelled.data(), lanes.size()));
+        if (!lanes.empty()) { // a zero-lane mixed round (pipelined prefill) has nothing to resolve
+            instance_.program->resolve_pending_batch(
+                lanes, std::span<const std::uint32_t>(accepted.data(), lanes.size()),
+                std::span<const std::uint8_t>(terminal.data(), lanes.size()),
+                std::span<const std::uint8_t>(cancelled.data(), lanes.size()));
+        }
         seg_timer_.resolve += std::chrono::duration<double>(Clock::now() - t_resolve).count();
 
         const auto t_append = Clock::now();
