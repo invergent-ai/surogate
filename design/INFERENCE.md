@@ -1665,3 +1665,28 @@ The memory drop also shrinks the machine-crash trigger (the ~150 GB pinned teard
 in the 4th crash): the pinned bank is now ~90 GB. Running: the 100-probe coherence battery on
 Q4, then the W8 control arm, then the needle battery with the indexer.
 
+### Prefix reuse leaks cross-request content (2026-08-29 12:55, pre-existing, NOT the Q4 bank)
+
+Found while validating the Q4 bank with the 100-probe coherence battery (16 lanes, one 5090).
+Ten of the Q4 arm's misses answered "Name three prime numbers." with blended capital-of-France
+content ("Three common examples of the capital of France are: **Paris** ... since you asked
+for..."). Three-arm discrimination:
+
+| arm | score | topic-blends |
+|---|---:|---|
+| W8, prefix reuse on (default) | 79/100 | many |
+| Q4, prefix reuse on | 90/100 | 10 |
+| Q4, `--no-prefix-reuse` | **97/100** | **0** |
+
+And on a server whose *current* battery never asked the capital question, the primes answers
+still blended it — the content came from requests minutes earlier, which only the prefix cache
+retains. So: format-independent (W8 worse than Q4 in the same sample), present only with
+reuse enabled, and carrying real other-request content. The bug is in the reuse machinery,
+despite `prefix_matches` comparing token ids all-or-nothing at the execution frontier and
+`ordered_reset` zeroing the lane state slot — the mechanism is still to be found (suspects:
+the ledger/identity drifting from the actual resident KV under mixed rounds, or a reuse-base
+admitted from a lane whose KV was since rewritten). **Open, severity high** (cross-user
+content leakage on a busy server); `--no-prefix-reuse` is the mitigation until it is
+root-caused. The 8-stage batteries' 3-4 % "math-problem drift" from this morning now reads as
+the same bug at a lower trigger rate.
+
