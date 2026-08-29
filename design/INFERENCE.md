@@ -1259,3 +1259,11 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   per stage transition, a large share of a 6 ms decode stage round. Decode flights now carry
   exactly their lanes' columns (one column per lane); mixed and prefill rounds keep the full
   copy because their graphs pad to buckets.
+- Lone-prefill A/B (b) (2026-08-29 03:00): split fully off → still 1.75 s median per stage step
+  (decode stage rounds 6.2 ms). The lone `advance_prefill_lane` path is slow on a stage on
+  its own, independent of the expert path; and in C3 almost every prompt takes it, because
+  a group prefills alone whenever *its own* group has no decode lanes — with eight groups
+  and few decoding lanes that is nearly always (12 of 12 prompts in the trace). The mixed
+  path prefilled the same chunk on a stage in ~75 ms in the closed pipeline, which is why
+  C3v5's zero-lane mixed rounds are the fix; the prefill-timing run decomposes the lone
+  path meanwhile.
