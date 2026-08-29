@@ -29,6 +29,17 @@
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 namespace {
 
+// QSA indexer width of the target (design/INFERENCE.md, phase 4), or 0 when the model has no
+// indexer: the KV cache then carries one extra BF16 plane per full-attention layer.
+template <class V>
+[[nodiscard]] constexpr std::int32_t variant_indexer_head_dim() noexcept {
+    if constexpr (requires { V::indexer_head_dim; }) {
+        return static_cast<std::int32_t>(V::indexer_head_dim);
+    } else {
+        return 0;
+    }
+}
+
 constexpr std::size_t kMiB        = 1024ULL * 1024ULL;
 constexpr std::size_t kArenaAlign = 256ULL;
 

@@ -45,6 +45,12 @@ struct Variant {
     static constexpr std::uint32_t maximum_mtp_draft_tokens    = kMaximumMtpDraftTokens;
     static constexpr std::uint32_t maximum_dflash_draft_tokens = kMaximumDFlashDraftTokens;
     static constexpr std::uint32_t maximum_context             = kNativeContext;
+    // QSA indexer (phase 4): the cache carries one BF16 plane of this width per full-attention
+    // layer, and the selection engages only past TextConfig::dense_exact_context.
+    static constexpr std::int32_t indexer_head_dim             = TextConfig::indexer_head_dim;
+    static constexpr std::int32_t indexer_heads                = TextConfig::indexer_heads;
+    static constexpr std::int32_t indexer_block                = TextConfig::indexer_block;
+    static constexpr std::int32_t indexer_top_k                = TextConfig::indexer_top_k;
     static constexpr bool supports_dflash                      = DFlashConfig::supported;
     static constexpr std::int32_t draft_head_rows              = 131072;
 
