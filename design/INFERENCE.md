@@ -1254,3 +1254,8 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   the lone step is still 1.8 s median (88 steps) while decode stage rounds take 6.2 ms — the
   host prefill split is not the cause. (b) split off, then the built-in prefill timer
   (`SUROGATE_SERVE_PREFILL_TIMING`) follow; C3v5 (zero-lane mixed rounds) is queued behind them.
+- Boundary copy cost (2026-08-29, commit 6041be16): the driver copied the whole 47 MB boundary
+  buffer twice per hop (park, import) regardless of the round's width — ~9 ms of host memcpy
+  per stage transition, a large share of a 6 ms decode stage round. Decode flights now carry
+  exactly their lanes' columns (one column per lane); mixed and prefill rounds keep the full
+  copy because their graphs pad to buckets.
