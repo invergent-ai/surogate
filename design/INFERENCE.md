@@ -1288,3 +1288,10 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   For fewer stages the pool cannot hold the scan, and the lever there is a scan-resistant
   replacement (keep the resident set, gather scan misses through slots the scan itself just
   filled) or the CPU prefill split.
+- Batch-0 mixed rounds (2026-08-29, commit ab89f445): the family's mixed bodies accept a
+  decode batch of zero (the decode-row blocks — rope, attention, GDN conv and recurrent
+  snapshots — are guarded, `Tensor::slice` allows an empty range, the head/sampling were
+  already guarded), so a staged prompt's chunk runs as an asynchronous mixed flight through
+  the stages; the pipelined loop uses that by default (`SUROGATE_SERVE_PIPELINE_LONE_PREFILL`
+  forces the old synchronous step). Queued: rebuild, CLI check, then 8 stages at 3,072 slots
+  (16 traced / 64 / 1), the 2-stage point and the 27B/35B at 100 users.
