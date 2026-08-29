@@ -170,6 +170,8 @@ card at every layer boundary and at the output.
 | 2 stages GPUs 2+3, split off, steady-state pipeline (C3), synchronous prompt steps | 8 | 128/512 | 53.7 | 15 s |
 | 2 stages GPUs 2+3, split off, C3 + prompts as asynchronous flights | 8 | 128/512 | **56.1** | 17 s |
 | **8 stages, 3,072 slots (every expert resident), C3 + asynchronous prompt flights** | 1 / 16 | 512/128 | **57.9 / 383.9** | **237 ms / 615 ms** |
+| same, stages materialise only their own layers (64 lanes fit beside the pool) | 32 / 64 | 512/128 | **518.5 / 604.8** | 971 ms / 1.24 s |
+| 8 stages, 2,816 slots (92 %, split off) / 2,100 slots (68 %, split on) | 32 / 64 | 512/128 | 504 / 387.8 | 1.0 s / 2.1 s |
 | Qwen3.8-27B (all-NVFP4), 8 stages, closed pipeline | 1 / 100 | 512/128 | 19.6 / 213 | 0.43 s / 0.75 s |
 | **Qwen3.8-27B**, 8 stages, C3 + asynchronous prompt flights | 100 | 512/128 | **1,057** | 834 ms |
 | Qwen3.8-27B, one card (board) | 100 | 512/128 | 1,330 | 170 ms |
@@ -182,8 +184,8 @@ under-load probes at the measured concurrency. Flash-Next is the model the pipel
 at 8 stages each card holds every expert of its 6 layers (3,072 slots, 14.9 GiB), no expert
 crosses PCIe after warm-up, and with the steady-state pipeline (groups stay in flight across
 executor rounds) and prompts processed as asynchronous flights through the stages, 16 users
-get 383.9 tok/s at a 615 ms TTFT — 12× the one-card 32.2 tok/s, and 57.9 tok/s for a single
-user against 22.4. What held the 8-stage points at 3–4 tok/s before was the synchronous
+get 383.9 tok/s at a 615 ms TTFT — 12× the one-card 32.2 tok/s — 604.8 at 64 users, and 57.9
+tok/s for a single user against 22.4. What held the 8-stage points at 3–4 tok/s before was the synchronous
 prompt step (~2 s per stage-step even fully resident) serialised on the executor thread;
 turning a staged prompt's chunk into a batch-0 mixed round removed it. The 27B and 35B rows
 are what a model that already fits one card gets from a pipeline: capacity, not throughput

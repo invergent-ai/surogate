@@ -1358,4 +1358,7 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   p50 1.24 s, 453 ok / 0 errors, probes correct under load.** The 8-stage startup is ~2 min now
   (was ~13: each stage uploaded 11 GiB and warmed up / precaptured all 48 layers). The
   cross-lane answer seen at 2,100 slots with the split on did not appear here (split off).
+- 8 stages, 32 users, 3,072 slots, layer-subset stages: 518.5 tok/s, TTFT p50 971 ms, 383 ok /
+  0 errors, probes correct. Flash-Next on 8×5090 at full residency: 57.9 / 383.9 / 518.5 /
+  604.8 tok/s at 1 / 16 / 32 / 64 users.
 
