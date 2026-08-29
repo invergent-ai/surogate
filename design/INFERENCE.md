@@ -39,6 +39,7 @@ phase 3 = PP across 8 GPUs with the offload inside each stage; phase 4 (EP) reje
 | Phase 2: CPU expert split (`--cpu-moe-share F|auto`, prefill share, batched VNNI host kernel) | **done 2026-08-28** — defaults: 1 user TTFT 1.40 s (366 t/s prompt processing) / 22.4 tok/s; 16 users 32.2 tok/s (37.9 at explicit shares); correct under load, 0 fatals; 35B board unchanged (1,769) | rows in BENCHMARKS.md; the remaining phase-2 levers (Q4 host bank, vectorised tile repack, sparse indexer for >2k) are listed under Open items |
 | First throughput row (zero-copy experts v0, board shape 512/128) | done 2026-08-28 | users=1: 5.2 decode / 21 prefill tok/s, TTFT 1.79 s; users=16: 7.6 / 30, TTFT 15.1 s; (128/128: 4.9 @1, 8.3 @16, 26.6 @32). llama.cpp 1×5090 CPU-MoE: 7.1 / 29 @1, 16.3 / 65 @16 |
 | Phase 3: pipeline parallelism (`--devices A,B,...`, one layer-range stage per card, residual over pinned host memory, per-stage offload, steady-state software pipeline with prompts as asynchronous batch-0 mixed flights) | **done 2026-08-29** | 2-stage forward bit-exact vs one card at all 48 boundaries; Flash-Next on 8×5090 (3,072 slots/stage, fully resident): 57.9 tok/s @1 (TTFT 237 ms), 383.9 @16 (615 ms); 27B 1,057 @100; 35B-A3B 1,960 @100; answers correct under load at the measured concurrency |
+| Q4 host expert bank (`--host-expert-bank`, **default q4 with the slot cache**) | **done 2026-08-29** | requantiser + VNNI host kernels + gather unpack, all unit-tested (affine grids to 6e-5, kernels 1e-7, unpack byte-exact); process peak 101 GB vs 297, startup 96 s, decode +~10 %; coherence 97/100 vs W8 95/100 (reuse off), needle 12/12 at 3.5k and 11/12 at 5.7k with the indexer |
 | QSA indexer (contexts past 2,051) | **done 2026-08-29** | op + unit test; wired at every text attention site; context cap 262,144; needle retrieval 12/12 at 3.5k and 12/12 at 5.7k tokens (dense control 11/12 each); no indexer kernel runs below the budget |
 | Phase 3 leftovers: scan-resistant slot replacement for stages that cannot hold their expert scan (the 2-stage points), the ~2 s synchronous prefill stage-step (bypassed by batch-0 flights, never explained), parallel stage construction (startup ~2 min) | open | see the 2026-08-29 entries |
 
@@ -485,6 +486,10 @@ copy is the design, and it is also what a multi-host version would use).
 
 ## How to run / verify
 
+- The host expert bank defaults to **Q4G32AM** whenever `--expert-slots` is on (the pinned
+  experts drop from 152 GB to ~90 GB, decode gains ~10 %); `--host-expert-bank w8` restores the
+  artifact's W8 bank, and a zero-copy run (no slot cache) keeps W8 automatically. Requantisation
+  happens while the bank loads (startup ~96 s on this box).
 - Serve on one 5090 with the phase-2 offload (the configuration behind the board rows):
   `numactl --interleave=all surogate-engine <artifact>.ninfer --max-num-seqs 16 --kv-capacity auto
   --max-model-len 2048 --expert-slots 3000 --cpu-moe-share auto` — the pool takes 14.6 GiB
@@ -1689,4 +1694,20 @@ admitted from a lane whose KV was since rewritten). **Open, severity high** (cro
 content leakage on a busy server); `--no-prefix-reuse` is the mitigation until it is
 root-caused. The 8-stage batteries' 3-4 % "math-problem drift" from this morning now reads as
 the same bug at a lower trigger rate.
+
+### Q4 host bank: validation closed (2026-08-29 13:25)
+
+The clean-pair batteries (both with `--no-prefix-reuse`, removing the leak's confound): W8
+95/100, Q4 97/100 — parity, zero topic-blends in either arm, remaining misses are the model's
+own arithmetic drift on "17 plus 25" in both formats. Needle with the QSA indexer on the Q4
+bank: 12/12 at 3.5k tokens, 11/12 at 5.7k (the dense arms scored 11/12 on the same battery).
+Greedy outputs differ from W8 by formatting-level tokens ("Paris." vs "**Paris**."), as
+expected from a near-exact refit of Q4_K-derived weights.
+
+Defaults: `HostExpertBank::Auto` picks Q4 exactly when the slot cache is on; explicit `w8`/`q4`
+wins; explicit `q4` without the cache is refused (the zero-copy kernels read W8 only). Pipeline
+stages of one process share the requantised bank (`HostBank::shared`, format in the key), so an
+8-stage run pins ~90 GB instead of 152 — the pinned-teardown crash suspect shrinks by the same
+amount. Residuals: no 8-stage battery was run on Q4 yet (single-device validation only), and
+the requantiser is scalar (bank load measured 96 s total, so it is not the bottleneck).
 
