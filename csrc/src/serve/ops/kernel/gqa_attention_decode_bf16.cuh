@@ -25,14 +25,34 @@ namespace ninfer::ops {
 // which is the distinction that matters: decode here runs at about half its
 // KV-read roofline, so halving the bytes is the win, and the int8 cache needs
 // its own kernel only because it feeds IMMA instead.
+// QSA sparse selection (design/INFERENCE.md, phase 4): `block_mask` holds one bit per block of
+// `SparseBlock` cells for every query column, and a key whose block bit is clear scores -inf.
+// `Sparse == false` compiles to exactly the dense kernel.
+struct GqaBlockMask {
+    const std::uint32_t* words = nullptr;
+    std::int32_t stride        = 0; // words per query column
+};
+
+template <bool Sparse, int SparseBlock>
+__device__ __forceinline__ bool gqa_block_visible(const std::uint32_t* row_words, int key) {
+    if constexpr (!Sparse) {
+        return true;
+    } else {
+        const int block = key / SparseBlock;
+        return ((row_words[block >> 5] >> (block & 31)) & 1U) != 0U;
+    }
+}
+
 template <typename Geometry, int TokenTile, int WarpsPerCta, bool MultiBatch, bool Masked,
-          typename CacheInput, typename CacheT = __nv_bfloat16>
+          typename CacheInput, typename CacheT = __nv_bfloat16, bool Sparse = false,
+          int SparseBlock = 4>
 __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_kernel(
     const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, CacheT* cache_k,
     CacheT* cache_v, const std::int32_t* block_tables, const std::int32_t* valid_columns,
     const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity, float scale,
-    __nv_bfloat16* partial_acc, float* partial_m, float* partial_l) {
+    __nv_bfloat16* partial_acc, float* partial_m, float* partial_l,
+    GqaBlockMask block_mask = GqaBlockMask{}) {
     static_assert(TokenTile >= 1 && TokenTile <= 6);
     static_assert(WarpsPerCta >= 1 && WarpsPerCta <= 4);
 
@@ -314,6 +334,15 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
         gqa_small_t_tc_row_to_qt<Geometry>(row1, tokens, kv_head, q_head1, token1);
         const int qabs0 = (row0 < row_count) ? pos[token0] : -1;
         const int qabs1 = (row1 < row_count) ? pos[token1] : -1;
+        // A query column's own mask row; the heads of a column share one selection.
+        const std::uint32_t* mask0 =
+            Sparse && row0 < row_count
+                ? block_mask.words + static_cast<std::int64_t>(column_base + token0) * block_mask.stride
+                : nullptr;
+        const std::uint32_t* mask1 =
+            Sparse && row1 < row_count
+                ? block_mask.words + static_cast<std::int64_t>(column_base + token1) * block_mask.stride
+                : nullptr;
 
         float bm0 = -CUDART_INF_F, bm1 = -CUDART_INF_F;
 #pragma unroll
@@ -322,22 +351,22 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
             const int col1 = col0 + 1;
             const int key0 = k0 + col0;
             const int key1 = col1 + k0;
-            score[nt][0] =
-                (row0 < row_count && key0 >= split_start && key0 < split_end && key0 <= qabs0)
-                    ? score[nt][0] * scale
-                    : -CUDART_INF_F;
-            score[nt][1] =
-                (row0 < row_count && key1 >= split_start && key1 < split_end && key1 <= qabs0)
-                    ? score[nt][1] * scale
-                    : -CUDART_INF_F;
-            score[nt][2] =
-                (row1 < row_count && key0 >= split_start && key0 < split_end && key0 <= qabs1)
-                    ? score[nt][2] * scale
-                    : -CUDART_INF_F;
-            score[nt][3] =
-                (row1 < row_count && key1 >= split_start && key1 < split_end && key1 <= qabs1)
-                    ? score[nt][3] * scale
-                    : -CUDART_INF_F;
+            score[nt][0] = (row0 < row_count && key0 >= split_start && key0 < split_end &&
+                            key0 <= qabs0 && gqa_block_visible<Sparse, SparseBlock>(mask0, key0))
+                               ? score[nt][0] * scale
+                               : -CUDART_INF_F;
+            score[nt][1] = (row0 < row_count && key1 >= split_start && key1 < split_end &&
+                            key1 <= qabs0 && gqa_block_visible<Sparse, SparseBlock>(mask0, key1))
+                               ? score[nt][1] * scale
+                               : -CUDART_INF_F;
+            score[nt][2] = (row1 < row_count && key0 >= split_start && key0 < split_end &&
+                            key0 <= qabs1 && gqa_block_visible<Sparse, SparseBlock>(mask1, key0))
+                               ? score[nt][2] * scale
+                               : -CUDART_INF_F;
+            score[nt][3] = (row1 < row_count && key1 >= split_start && key1 < split_end &&
+                            key1 <= qabs1 && gqa_block_visible<Sparse, SparseBlock>(mask1, key1))
+                               ? score[nt][3] * scale
+                               : -CUDART_INF_F;
             bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
             bm1 = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
         }

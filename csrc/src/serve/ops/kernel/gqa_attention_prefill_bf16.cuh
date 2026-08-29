@@ -1,5 +1,8 @@
 #pragma once
 
+// GqaBlockMask and gqa_block_visible are shared with the decode kernel.
+#include "ops/kernel/gqa_attention_decode_bf16.cuh"
+
 // BF16-only GQA prompt kernel. INT8 has an independent kernel body and resource
 // policy in gqa_attention_prefill_i8.cuh.
 //
@@ -112,14 +115,18 @@ __device__ __forceinline__ void gqa_prefill_stage_kv(__nv_bfloat16* dst, const C
 // FlashAttention-2 forward, one CTA per (query 64-row block, query head). Grid is
 // (ceil(tokens/64), q_heads). seqlen_q = tokens, seqlen_k = base_pos + tokens, with
 // bottom-right causal alignment (query row i sees keys [0, base_pos + i]).
-template <typename Geometry, typename Metadata, typename CacheT = __nv_bfloat16>
+// `Sparse` adds the QSA block selection (design/INFERENCE.md, phase 4): one bit per block of
+// `SparseBlock` cells for every query row of the chunk. `Sparse == false` is the dense kernel.
+template <typename Geometry, typename Metadata, typename CacheT = __nv_bfloat16,
+          bool Sparse = false, int SparseBlock = 4>
 __launch_bounds__(kGqaPrefillThreads, 1) __global__
     void gqa_attention_prefill_bf16_kernel(const __nv_bfloat16* __restrict__ q,
                                            const CacheT* __restrict__ cache_k,
                                            const CacheT* __restrict__ cache_v,
                                            Metadata metadata,
                                            const std::int32_t* __restrict__ positions, float scale,
-                                           __nv_bfloat16* __restrict__ out, std::int32_t width) {
+                                           __nv_bfloat16* __restrict__ out, std::int32_t width,
+                                           GqaBlockMask block_mask = GqaBlockMask{}) {
     constexpr int D             = kGqaPrefillHeadDim; // 256
     constexpr int Br            = kGqaPrefillBr;      // 64 query rows
     constexpr int Bc            = kGqaPrefillBc;      // 64 key cols
@@ -301,7 +308,17 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
         const int qrow1            = q0 + row1;
         const int qabs0            = (qrow0 < tokens) ? base_pos + qrow0 : -1;
         const int qabs1            = (qrow1 < tokens) ? base_pos + qrow1 : -1;
-        const bool full_score_tile = (q0 + Br <= tokens) && ((k0 + Bc - 1) <= (base_pos + q0));
+        // A sparse chunk never has a "full" tile: every key must pass its query's selection.
+        const bool full_score_tile =
+            !Sparse && (q0 + Br <= tokens) && ((k0 + Bc - 1) <= (base_pos + q0));
+        const std::uint32_t* mask0 =
+            Sparse && qrow0 < tokens
+                ? block_mask.words + static_cast<std::int64_t>(qrow0) * block_mask.stride
+                : nullptr;
+        const std::uint32_t* mask1 =
+            Sparse && qrow1 < tokens
+                ? block_mask.words + static_cast<std::int64_t>(qrow1) * block_mask.stride
+                : nullptr;
 
         // block row-max on raw (unscaled) scores; scale is folded into exp2 below
         float bm0 = -CUDART_INF_F, bm1 = -CUDART_INF_F;
@@ -316,10 +333,22 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
             for (int nt = 0; nt < QKNt; ++nt) {
                 const int key0 = k0 + nt * 8 + 2 * lid;
                 const int key1 = key0 + 1;
-                score[nt][0]   = (qrow0 < tokens && key0 <= qabs0) ? score[nt][0] : -CUDART_INF_F;
-                score[nt][1]   = (qrow0 < tokens && key1 <= qabs0) ? score[nt][1] : -CUDART_INF_F;
-                score[nt][2]   = (qrow1 < tokens && key0 <= qabs1) ? score[nt][2] : -CUDART_INF_F;
-                score[nt][3]   = (qrow1 < tokens && key1 <= qabs1) ? score[nt][3] : -CUDART_INF_F;
+                score[nt][0] = (qrow0 < tokens && key0 <= qabs0 &&
+                                gqa_block_visible<Sparse, SparseBlock>(mask0, key0))
+                                   ? score[nt][0]
+                                   : -CUDART_INF_F;
+                score[nt][1] = (qrow0 < tokens && key1 <= qabs0 &&
+                                gqa_block_visible<Sparse, SparseBlock>(mask0, key1))
+                                   ? score[nt][1]
+                                   : -CUDART_INF_F;
+                score[nt][2] = (qrow1 < tokens && key0 <= qabs1 &&
+                                gqa_block_visible<Sparse, SparseBlock>(mask1, key0))
+                                   ? score[nt][2]
+                                   : -CUDART_INF_F;
+                score[nt][3] = (qrow1 < tokens && key1 <= qabs1 &&
+                                gqa_block_visible<Sparse, SparseBlock>(mask1, key1))
+                                   ? score[nt][3]
+                                   : -CUDART_INF_F;
                 bm0            = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
                 bm1            = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
             }
