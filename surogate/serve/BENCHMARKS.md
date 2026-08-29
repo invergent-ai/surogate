@@ -144,7 +144,7 @@ at every concurrency: at 16 users (prefill share 0.5) it halves TTFT and adds
 7 % decode; the share is lower than at one user (0.7) because at concurrency
 the host must stay off the critical path of the mixed rounds.
 
-## Qwen3.8-Flash-Next — pipeline parallelism across cards (phase 3, 2026-08-28)
+## Pipeline parallelism across cards (phase 3, 2026-08-29)
 
 `--devices A,B,...` splits the model into one layer-range stage per card; the residual
 crosses each boundary through pinned host memory (no P2P), micro-batch groups flow through
@@ -167,20 +167,28 @@ card at every layer boundary and at the output.
 | same, prefill batch 4 | 16 / 64 | 512/128 | 58.2 / 59.6 | 2.6 s / 18 s |
 | 2 stages GPUs 2+3 (both x8), split off: lockstep / pipelined | 8 | 128/512 | 44.5 / 44.8 | 16 s / 17 s |
 | 2 stages GPUs 3+4 (x8 + x16), per-socket pools: lockstep / pipelined | 8 | 128/512 | 75.9 / 70.0 | 3.2 s / 3.4 s |
-| 2 stages GPUs 2+3, split off, **steady-state pipeline (C3)** | 8 | 128/512 | **53.7** | 15 s |
-| **Qwen3.8-27B** (all-NVFP4), 8 stages | 1 / 100 | 512/128 | 19.6 / 213 | 0.43 s / 0.75 s |
+| 2 stages GPUs 2+3, split off, steady-state pipeline (C3), synchronous prompt steps | 8 | 128/512 | 53.7 | 15 s |
+| 2 stages GPUs 2+3, split off, C3 + prompts as asynchronous flights | 8 | 128/512 | **56.1** | 17 s |
+| **8 stages, 3,072 slots (every expert resident), C3 + asynchronous prompt flights** | 1 / 16 | 512/128 | **57.9 / 383.9** | **237 ms / 615 ms** |
+| Qwen3.8-27B (all-NVFP4), 8 stages, closed pipeline | 1 / 100 | 512/128 | 19.6 / 213 | 0.43 s / 0.75 s |
+| **Qwen3.8-27B**, 8 stages, C3 + asynchronous prompt flights | 100 | 512/128 | **1,057** | 834 ms |
 | Qwen3.8-27B, one card (board) | 100 | 512/128 | 1,330 | 170 ms |
-| **Qwen3.6-35B-A3B**, 8 stages | 1 / 100 | 512/128 | 50.1 / 574 | 0.35 s / 0.34 s |
+| Qwen3.6-35B-A3B, 8 stages, closed pipeline | 1 / 100 | 512/128 | 50.1 / 574 | 0.35 s / 0.34 s |
+| **Qwen3.6-35B-A3B**, 8 stages, C3 + asynchronous prompt flights | 100 | 512/128 | **1,960** | 386 ms |
 | Qwen3.6-35B-A3B, one card (board) | 100 | 512/128 | 1,942 | 253 ms |
 
-Reading so far: all three models serve correctly across the eight cards. Two stages double
-Flash-Next's 8-user throughput because each stage's pool holds twice the share of its
-experts, and 4 stages give 79.7 tok/s at 16 users. But the pipeline as built fills and
-drains within every executor round (G+N−1 steps for G groups over N stages: 53 % pipeline
-efficiency at 8×8) and every step pays a stage round's ~30 ms fixed cost, so a model that
-fits one card is slower on eight — the 27B and 35B rows above are that arithmetic. The
-levers, in order: keep groups in flight across executor rounds (steady-state pipeline), and
-cut the stage round's fixed cost (the timestamped trace decomposes it).
+Reading: all three models serve correctly across the eight cards, verified with the
+under-load probes at the measured concurrency. Flash-Next is the model the pipeline is for:
+at 8 stages each card holds every expert of its 6 layers (3,072 slots, 14.9 GiB), no expert
+crosses PCIe after warm-up, and with the steady-state pipeline (groups stay in flight across
+executor rounds) and prompts processed as asynchronous flights through the stages, 16 users
+get 383.9 tok/s at a 615 ms TTFT — 12× the one-card 32.2 tok/s, and 57.9 tok/s for a single
+user against 22.4. What held the 8-stage points at 3–4 tok/s before was the synchronous
+prompt step (~2 s per stage-step even fully resident) serialised on the executor thread;
+turning a staged prompt's chunk into a batch-0 mixed round removed it. The 27B and 35B rows
+are what a model that already fits one card gets from a pipeline: capacity, not throughput
+per card — with ~12 lanes per group the per-round fixed cost of a stage does not shrink with
+its layer count.
 
 ## Open items
 
