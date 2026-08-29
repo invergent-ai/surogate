@@ -1329,4 +1329,10 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   (1,330): with ~12 lanes per group the per-round fixed cost of a stage does not shrink with
   the layer count, and a model that fits one card gains capacity from the pipeline, not
   throughput per card.
+- Layer-subset materialisation (2026-08-29, commit 362e6bd5): a Flash-Next pipeline stage now
+  uploads only the dense weights of its own layers (the others are validated, never
+  materialised; the routed experts still join the one shared host bank). Before, every stage
+  held the whole ~11 GB dense model, which left 4.5 GB beside a fully resident 14.9 GiB pool
+  and refused the 32- and 64-lane reservations (4.0 / 7.6 GB). Built in `csrc/build-serve-b`;
+  queued: CLI check, then 64 and 32 users at 3,072 slots.
 
