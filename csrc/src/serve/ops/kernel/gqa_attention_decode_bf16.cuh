@@ -1,5 +1,7 @@
 #pragma once
 
+#include "api/ops/gqa_attention.h"
+
 // ninfer::ops - split-KV GQA small-T attention, BF16 KV-cache partial kernel.
 // Standalone from the int8 kernel (gqa_attention_decode_i8.cuh): shared scaffolding
 // lives in gqa_attention_decode.cuh, but the body/append/load are not shared so the
@@ -28,11 +30,6 @@ namespace ninfer::ops {
 // QSA sparse selection (design/INFERENCE.md, phase 4): `block_mask` holds one bit per block of
 // `SparseBlock` cells for every query column, and a key whose block bit is clear scores -inf.
 // `Sparse == false` compiles to exactly the dense kernel.
-struct GqaBlockMask {
-    const std::uint32_t* words = nullptr;
-    std::int32_t stride        = 0; // words per query column
-};
-
 template <bool Sparse, int SparseBlock>
 __device__ __forceinline__ bool gqa_block_visible(const std::uint32_t* row_words, int key) {
     if constexpr (!Sparse) {

@@ -1464,4 +1464,15 @@ kernel mask, (5) raise `kNativeContext` and verify against llama.cpp at 8k and 3
   split nor expert eviction, and the corrupted token is the *first* one of the answer with the
   rest coherent — the signature of a prompt cursor that diverged on the last chunk, which is
   what the graph-dependent plan produced. Validation of the fix queued on the same points.
+- **The actual cause of the pipelined contamination (2026-08-29 06:20)**: the graph-plan fix
+  above is a real bug but not this one — the reproducer still showed a wrong *first* token
+  ('Based', 'The', once a French narration) with a correct continuation. A prompt's first
+  sampled token reaches the caller as `PrefillStepResult::round.tokens`, a **span into the last
+  stage's egress buffer**. In the pipeline the executor reads that result *after* `tick()`
+  returns, and `tick()` ends by launching every parked group it can — including a new round on
+  that same stage, which overwrites the buffer. The decode tokens were already copied into the
+  flight (`store_round`); the prompt's token was not. Fix: `store_prefill_token` copies it into
+  flight-owned storage and re-points the span, in both the steady-state and the lockstep path.
+  Signature match: only the first token of an answer, only in the pipeline, worse with more
+  prompts in flight, and the wrong token is whatever another lane sampled.
 

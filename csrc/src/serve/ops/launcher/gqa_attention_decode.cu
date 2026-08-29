@@ -94,7 +94,33 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
     const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
     Tensor& cache_k = cache.k_pages;
     Tensor& cache_v = cache.v_pages;
-    // bf16 kernel uses only static smem (no dynamic staging).
+    // bf16 kernel uses only static smem (no dynamic staging). A QSA selection instantiates the
+    // sparse specialization; without one the dense kernel is unchanged.
+    if (invocation.selection.words != nullptr) {
+        if (invocation.selection.block != 4) {
+            throw std::invalid_argument("gqa_attention: unregistered QSA block size");
+        }
+        gqa_attention_small_t_tc_partial_bf16_kernel<Geometry, TokenTile, WarpsPerCta, MultiBatch,
+                                                     Masked, CacheInput, CacheT, true, 4>
+            <<<grid, kBlock, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(q.data), input,
+                static_cast<const std::int32_t*>(pos.data), static_cast<CacheT*>(cache_k.data),
+                static_cast<CacheT*>(cache_v.data),
+                static_cast<const std::int32_t*>(cache.block_tables.data),
+                invocation.valid_columns == nullptr
+                    ? nullptr
+                    : static_cast<const std::int32_t*>(invocation.valid_columns->data),
+                invocation.table_rows == nullptr
+                    ? nullptr
+                    : static_cast<const std::int32_t*>(invocation.table_rows->data),
+                cache.block_tables.ne[0], invocation.width, invocation.full_width,
+                invocation.column_begin, logical_capacity, scale,
+                static_cast<__nv_bfloat16*>(partial_acc.data),
+                static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
+                invocation.selection);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     gqa_attention_small_t_tc_partial_bf16_kernel<Geometry, TokenTile, WarpsPerCta, MultiBatch,
                                                  Masked, CacheInput,
                                                  CacheT><<<grid, kBlock, 0, stream>>>(
@@ -411,12 +437,13 @@ void gqa_attention_small_t_launch(const Tensor& q, const Tensor& k, const Tensor
                                   PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
                                   std::int32_t column_begin, std::int32_t width,
                                   Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l,
-                                  Tensor& out, cudaStream_t stream) {
+                                  Tensor& out, cudaStream_t stream, GqaBlockMask selection) {
     const GqaAppendInput input{static_cast<const __nv_bfloat16*>(k.data),
                                static_cast<const __nv_bfloat16*>(v.data)};
     const GqaSmallTInvocation invocation{
         .valid_columns = valid_columns.data == nullptr ? nullptr : &valid_columns,
         .table_rows    = &table_rows,
+        .selection     = selection,
         .full_width    = q.ne[2],
         .column_begin  = column_begin,
         .width         = width,
@@ -457,11 +484,12 @@ void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, flo
                                          const PagedKVLayerView& cache,
                                          GqaExecutionEnvelope envelope, Tensor& partial_acc,
                                          Tensor& partial_m, Tensor& partial_l, Tensor& out,
-                                         cudaStream_t stream) {
+                                         cudaStream_t stream, GqaBlockMask selection) {
     const GqaCachedInput input{};
     const GqaSmallTInvocation invocation{
         .valid_columns = nullptr,
         .table_rows    = nullptr,
+        .selection     = selection,
         .full_width    = q.ne[2],
         .column_begin  = 0,
         .width         = q.ne[2],

@@ -1,6 +1,8 @@
 #pragma once
 
-// GqaBlockMask and gqa_block_visible are shared with the decode kernel.
+#include "api/ops/gqa_attention.h"
+
+// gqa_block_visible is shared with the decode kernel.
 #include "ops/kernel/gqa_attention_decode_bf16.cuh"
 
 // BF16-only GQA prompt kernel. INT8 has an independent kernel body and resource

@@ -318,7 +318,7 @@ void launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
                             const Tensor& positions, const Tensor& valid_columns,
                             const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
                             GqaExecutionEnvelope envelope, WorkspaceArena& workspace, Tensor& out,
-                            cudaStream_t stream) {
+                            cudaStream_t stream, GqaBlockMask selection = {}) {
     for (std::int32_t begin = 0; begin < q.ne[2]; begin += kSmallTChunkTokens) {
         const std::int32_t count = std::min(kSmallTChunkTokens, q.ne[2] - begin);
         auto chunk_scope         = workspace.scope();
@@ -328,20 +328,21 @@ void launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
             allocate_small_t_workspace(workspace, q.ne[1], count, splits, q.ne[3]);
         detail::gqa_attention_small_t_launch(q, k, v, positions, valid_columns, table_rows, scale,
                                              cache, envelope, begin, count, partial.acc, partial.m,
-                                             partial.l, out, stream);
+                                             partial.l, out, stream, selection);
     }
 }
 
 void launch_cached_chunked_small_t(const Tensor& q, const Tensor& positions, float scale,
                                    const PagedKVLayerView& cache, GqaExecutionEnvelope envelope,
-                                   WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
+                                   WorkspaceArena& workspace, Tensor& out, cudaStream_t stream,
+                                   GqaBlockMask selection = {}) {
     for_each_small_t_chunk(
         q, positions, workspace, cache.dtype, envelope, out,
         [&](std::int32_t, std::int32_t, const Tensor& q_chunk, const Tensor& position_chunk,
             SmallTWorkspace& partial, Tensor& out_chunk) {
             detail::gqa_attention_cached_small_t_launch(q_chunk, position_chunk, scale, cache,
                                                         envelope, partial.acc, partial.m, partial.l,
-                                                        out_chunk, stream);
+                                                        out_chunk, stream, selection);
         });
 }
 
@@ -426,7 +427,8 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
 void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
                    const Tensor& valid_columns, const Tensor& kv_table_rows, float scale,
                    PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
-                   WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
+                   WorkspaceArena& workspace, Tensor& out, cudaStream_t stream,
+                   GqaBlockMask selection) {
     constexpr const char* op = "gqa_attention";
     validate_batched_attention_tensors(q, positions, valid_columns, kv_table_rows, out, cache,
                                        envelope, scale, op);
@@ -446,7 +448,7 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
         detail::gqa_attention_resolve_route(q.ne[1], width, batch, envelope);
     if (route == detail::GqaAttentionRoute::ChunkedSmallT) {
         launch_chunked_small_t(q, k, v, positions, valid_columns, kv_table_rows, scale, cache,
-                               envelope, workspace, out, stream);
+                               envelope, workspace, out, stream, selection);
         return;
     }
     if (route == detail::GqaAttentionRoute::SmallT) {
@@ -456,11 +458,11 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
             allocate_small_t_workspace(workspace, q.ne[1], width, splits, batch);
         detail::gqa_attention_small_t_launch(q, k, v, positions, valid_columns, kv_table_rows,
                                              scale, cache, envelope, 0, width, partial.acc,
-                                             partial.m, partial.l, out, stream);
+                                             partial.m, partial.l, out, stream, selection);
         return;
     }
     detail::gqa_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows, scale,
-                                        cache, out, stream);
+                                        cache, out, stream, selection);
 }
 
 void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,
@@ -491,14 +493,16 @@ void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,
 
 void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
                           const PagedKVLayerView& cache, GqaExecutionEnvelope envelope,
-                          WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
+                          WorkspaceArena& workspace, Tensor& out, cudaStream_t stream,
+                          GqaBlockMask selection) {
     constexpr const char* op = "gqa_attention_cached";
     validate_attention_tensors(q, positions, out, cache, envelope, scale, op);
 
     auto scope = workspace.scope();
     if (detail::gqa_attention_resolve_route(q.ne[1], q.ne[2], 1, envelope) ==
         detail::GqaAttentionRoute::ChunkedSmallT) {
-        launch_cached_chunked_small_t(q, positions, scale, cache, envelope, workspace, out, stream);
+        launch_cached_chunked_small_t(q, positions, scale, cache, envelope, workspace, out, stream,
+                                      selection);
         return;
     }
     if (detail::gqa_attention_uses_small_t(q.ne[2])) {
@@ -506,10 +510,12 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
             detail::gqa_attention_split_capacity(q.ne[1], q.ne[2], cache.dtype, envelope);
         SmallTWorkspace partial = allocate_small_t_workspace(workspace, q.ne[1], q.ne[2], splits);
         detail::gqa_attention_cached_small_t_launch(q, positions, scale, cache, envelope,
-                                                    partial.acc, partial.m, partial.l, out, stream);
+                                                    partial.acc, partial.m, partial.l, out, stream,
+                                                    selection);
         return;
     }
-    detail::gqa_attention_prompt_attention_launch(q, positions, scale, cache, out, stream);
+    detail::gqa_attention_prompt_attention_launch(q, positions, scale, cache, out, stream,
+                                                  selection);
 }
 
 } // namespace ninfer::ops

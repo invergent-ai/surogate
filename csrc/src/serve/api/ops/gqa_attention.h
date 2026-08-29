@@ -12,6 +12,15 @@ namespace ninfer::ops {
 
 inline constexpr std::uint32_t kGqaAttentionMaximumVisibleKeys = 262144;
 
+/// QSA sparse selection (design/INFERENCE.md, phase 4): one bit per block of `block` cache cells
+/// for every query column, `stride` words apart. A key whose block bit is clear scores -inf; a
+/// null `words` is the dense path and every kernel compiles to exactly what it was.
+struct GqaBlockMask {
+    const std::uint32_t* words = nullptr;
+    std::int32_t stride        = 0;
+    std::int32_t block         = 0;
+};
+
 struct GqaExecutionEnvelope {
     std::uint32_t min_visible_keys = 0;
     std::uint32_t max_visible_keys = 0;
@@ -90,7 +99,8 @@ gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType cache_dtype,
 void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
                    const Tensor& valid_columns, const Tensor& kv_table_rows, float scale,
                    PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
-                   WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
+                   WorkspaceArena& workspace, Tensor& out, cudaStream_t stream,
+                   GqaBlockMask selection = {});
 
 /**
  * A2: perform only the cache-write part of A1. k/v are contiguous BF16 `[256,4|2,T]`, positions is
@@ -108,6 +118,7 @@ void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,
  */
 void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
                           const PagedKVLayerView& cache, GqaExecutionEnvelope envelope,
-                          WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
+                          WorkspaceArena& workspace, Tensor& out, cudaStream_t stream,
+                          GqaBlockMask selection = {});
 
 } // namespace ninfer::ops

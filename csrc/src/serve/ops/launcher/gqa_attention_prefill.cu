@@ -9,6 +9,7 @@
 #include "core/device.h" // CUDA_CHECK
 
 #include <cstdint>
+#include <stdexcept>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -17,9 +18,14 @@ template <typename Geometry, typename CacheView, typename Metadata>
 void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& positions,
                                                float scale, const CacheView& cache,
                                                Metadata metadata, Tensor& out,
-                                               cudaStream_t stream) {
+                                               cudaStream_t stream,
+                                               GqaBlockMask selection = {}) {
     const Tensor& cache_k = cache.k_pages;
     const Tensor& cache_v = cache.v_pages;
+    if (selection.words != nullptr && cache.dtype != DType::BF16) {
+        throw std::invalid_argument(
+            "gqa_attention: the QSA selection needs a BF16 KV cache (the quantized kernels are dense)");
+    }
     // Both dtype-specialized kernels exceed the default 48 KiB dynamic-smem ceiling.
     CUDA_CHECK(::ninfer::ops::set_func_attribute_per_device(gqa_attention_prefill_bf16_kernel<Geometry, Metadata>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaPrefillSmemBytes));
@@ -57,13 +63,30 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
     } else {
         const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillBr)),
                                   static_cast<unsigned>(Geometry::QHeads), 1u);
-        gqa_attention_prefill_bf16_kernel<Geometry, Metadata>
-            <<<attention_grid, kGqaPrefillThreads, kGqaPrefillSmemBytes, stream>>>(
-                static_cast<const __nv_bfloat16*>(q.data),
-                static_cast<const __nv_bfloat16*>(cache_k.data),
-                static_cast<const __nv_bfloat16*>(cache_v.data), metadata,
-                static_cast<const std::int32_t*>(positions.data), scale,
-                static_cast<__nv_bfloat16*>(out.data), tokens);
+        if (selection.words != nullptr) {
+            // QSA selection: only the 4-cell block is registered.
+            if (selection.block != 4) {
+                throw std::invalid_argument("gqa_attention: unregistered QSA block size");
+            }
+            CUDA_CHECK(::ninfer::ops::set_func_attribute_per_device(
+                gqa_attention_prefill_bf16_kernel<Geometry, Metadata, __nv_bfloat16, true, 4>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaPrefillSmemBytes));
+            gqa_attention_prefill_bf16_kernel<Geometry, Metadata, __nv_bfloat16, true, 4>
+                <<<attention_grid, kGqaPrefillThreads, kGqaPrefillSmemBytes, stream>>>(
+                    static_cast<const __nv_bfloat16*>(q.data),
+                    static_cast<const __nv_bfloat16*>(cache_k.data),
+                    static_cast<const __nv_bfloat16*>(cache_v.data), metadata,
+                    static_cast<const std::int32_t*>(positions.data), scale,
+                    static_cast<__nv_bfloat16*>(out.data), tokens, selection);
+        } else {
+            gqa_attention_prefill_bf16_kernel<Geometry, Metadata>
+                <<<attention_grid, kGqaPrefillThreads, kGqaPrefillSmemBytes, stream>>>(
+                    static_cast<const __nv_bfloat16*>(q.data),
+                    static_cast<const __nv_bfloat16*>(cache_k.data),
+                    static_cast<const __nv_bfloat16*>(cache_v.data), metadata,
+                    static_cast<const std::int32_t*>(positions.data), scale,
+                    static_cast<__nv_bfloat16*>(out.data), tokens);
+        }
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -143,32 +166,32 @@ void gqa_kv_append_launch_for(const Tensor& k, const Tensor& v, const Tensor& po
 
 void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positions, float scale,
                                            const PagedKVLayerView& cache, Tensor& out,
-                                           cudaStream_t stream) {
+                                           cudaStream_t stream, GqaBlockMask selection) {
     const GqaPrefillDirectMetadata metadata{
         static_cast<const std::int32_t*>(cache.block_table.data)};
     if (q.ne[1] == Gqa256_24q2::QHeads && cache.num_kv_heads == Gqa256_24q2::KVHeads) {
         gqa_attention_prompt_attention_launch_for<Gqa256_24q2>(q, positions, scale, cache,
-                                                               metadata, out, stream);
+                                                               metadata, out, stream, selection);
         return;
     }
     if (q.ne[1] == Gqa27Geometry::QHeads) {
         gqa_attention_prompt_attention_launch_for<Gqa27Geometry>(q, positions, scale, cache,
-                                                                 metadata, out, stream);
+                                                                 metadata, out, stream, selection);
         return;
     }
     if (q.ne[1] == Gqa08Geometry::QHeads) {
         gqa_attention_prompt_attention_launch_for<Gqa08Geometry>(q, positions, scale, cache,
-                                                                 metadata, out, stream);
+                                                                 metadata, out, stream, selection);
         return;
     }
     // surogate vendor patch (PATCHES.md #18): the cache resolves the 16-query pair.
     if (cache.num_kv_heads == Gqa4BGeometry::KVHeads) {
         gqa_attention_prompt_attention_launch_for<Gqa4BGeometry>(q, positions, scale, cache,
-                                                                 metadata, out, stream);
+                                                                 metadata, out, stream, selection);
         return;
     }
     gqa_attention_prompt_attention_launch_for<Gqa35Geometry>(q, positions, scale, cache, metadata,
-                                                             out, stream);
+                                                             out, stream, selection);
 }
 
 void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
@@ -186,7 +209,7 @@ void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positi
 void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                  const Tensor& positions, const Tensor& valid_columns,
                                  const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
-                                 Tensor& out, cudaStream_t stream) {
+                                 Tensor& out, cudaStream_t stream, GqaBlockMask selection) {
     const auto launch = [&]<bool Masked>() {
         const GqaPrefillBatchMetadata<Masked> metadata{
             .tables = static_cast<const std::int32_t*>(cache.block_tables.data),
@@ -198,20 +221,20 @@ void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor&
         if (q.ne[1] == Gqa256_24q2::QHeads && cache.num_kv_heads == Gqa256_24q2::KVHeads) {
             gqa_kv_append_launch_for<Gqa256_24q2>(k, v, positions, cache, metadata, stream);
             gqa_attention_prompt_attention_launch_for<Gqa256_24q2>(q, positions, scale, cache,
-                                                                   metadata, out, stream);
+                                                                   metadata, out, stream, selection);
             return;
         }
         if (q.ne[1] == Gqa27Geometry::QHeads) {
             gqa_kv_append_launch_for<Gqa27Geometry>(k, v, positions, cache, metadata, stream);
             gqa_attention_prompt_attention_launch_for<Gqa27Geometry>(q, positions, scale, cache,
-                                                                     metadata, out, stream);
+                                                                     metadata, out, stream, selection);
             return;
         }
         if (q.ne[1] == Gqa08Geometry::QHeads) {
             // KV append is GroupSize-independent; Gqa08's KVHeads matches.
             gqa_kv_append_launch_for<Gqa08Geometry>(k, v, positions, cache, metadata, stream);
             gqa_attention_prompt_attention_launch_for<Gqa08Geometry>(q, positions, scale, cache,
-                                                                     metadata, out, stream);
+                                                                     metadata, out, stream, selection);
             return;
         }
         // surogate vendor patch (PATCHES.md #18): the cache resolves the
@@ -219,12 +242,12 @@ void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor&
         if (cache.num_kv_heads == Gqa4BGeometry::KVHeads) {
             gqa_kv_append_launch_for<Gqa4BGeometry>(k, v, positions, cache, metadata, stream);
             gqa_attention_prompt_attention_launch_for<Gqa4BGeometry>(q, positions, scale, cache,
-                                                                     metadata, out, stream);
+                                                                     metadata, out, stream, selection);
             return;
         }
         gqa_kv_append_launch_for<Gqa35Geometry>(k, v, positions, cache, metadata, stream);
         gqa_attention_prompt_attention_launch_for<Gqa35Geometry>(q, positions, scale, cache,
-                                                                 metadata, out, stream);
+                                                                 metadata, out, stream, selection);
     };
     if (valid_columns.data == nullptr) {
         launch.template operator()<false>();

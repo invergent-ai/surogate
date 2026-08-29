@@ -17,6 +17,7 @@ enum class GqaAttentionRoute { SmallT, ChunkedSmallT, Prompt };
 struct GqaSmallTInvocation {
     const Tensor* valid_columns = nullptr;
     const Tensor* table_rows    = nullptr;
+    GqaBlockMask selection{}; // QSA sparse selection; a null `words` is the dense path
     std::int32_t full_width     = 0;
     std::int32_t column_begin   = 0;
     std::int32_t width          = 0;
@@ -40,24 +41,25 @@ void gqa_attention_small_t_launch(const Tensor& q, const Tensor& k, const Tensor
                                   PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
                                   std::int32_t column_begin, std::int32_t width,
                                   Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l,
-                                  Tensor& out, cudaStream_t stream);
+                                  Tensor& out, cudaStream_t stream,
+                                  GqaBlockMask selection = {});
 
 void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& positions, float scale,
                                          const PagedKVLayerView& cache,
                                          GqaExecutionEnvelope envelope, Tensor& partial_acc,
                                          Tensor& partial_m, Tensor& partial_l, Tensor& out,
-                                         cudaStream_t stream);
+                                         cudaStream_t stream, GqaBlockMask selection = {});
 
 void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                  const Tensor& positions, const Tensor& valid_columns,
                                  const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
-                                 Tensor& out, cudaStream_t stream);
+                                 Tensor& out, cudaStream_t stream, GqaBlockMask selection = {});
 
 void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                           PagedKVLayerView cache, cudaStream_t stream);
 
 void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positions, float scale,
                                            const PagedKVLayerView& cache, Tensor& out,
-                                           cudaStream_t stream);
+                                           cudaStream_t stream, GqaBlockMask selection = {});
 
 } // namespace ninfer::ops::detail
