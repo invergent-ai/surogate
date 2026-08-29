@@ -1009,23 +1009,13 @@ private:
         auto& program = *instance_.program;
         const std::uint32_t groups = program.group_count();
         if (group_meta_.size() != groups) { group_meta_.resize(groups); }
-        if (!prefill_lanes_.empty()) { top_up_prefill_lanes(); }
-        // Admission is CPU-only (deferred first chunk): keep admitting while the queue holds
-        // work and lanes are free.
+        // Admission is CPU-only (deferred first chunk) and stages the prompt into the mixed
+        // prefill set; top_up admits while that set has room and a lane is free, which is
+        // exactly the bound the set can hold.
         if (have_pending) {
             const auto t_admit = Clock::now();
-            for (std::uint32_t extra = 0; extra < max_concurrency_; ++extra) {
-                bool lane_free = false;
-                for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) { lane_free = lane_free || slots_[lane] == nullptr; }
-                if (!lane_free) { break; }
-                {
-                    std::lock_guard lock(queue_mutex_);
-                    if (pending_.empty()) { break; }
-                }
-                if (try_admit_one() == AdmissionProgress::None) { break; }
-            }
+            top_up_prefill_lanes();
             seg_timer_.admit += std::chrono::duration<double>(Clock::now() - t_admit).count();
-            if (!prefill_lanes_.empty()) { top_up_prefill_lanes(); }
         }
         // Launch every idle group that has work.
         bool launched = false;

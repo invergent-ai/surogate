@@ -1231,3 +1231,7 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   128/512: **53.7 tok/s, 15 completions** against 44.5-44.8 for the closed pipeline / lockstep
   and 42.2 for one card — +21 % with the stages' gathers sharing one x8 link. The 8-stage
   points (16/64/1 users) and the 27B/35B at 100 users follow in the same chain.
+- Third C3 fatal (2026-08-29 02:15, 8 stages, 16 users): "prefill lane set overflow" — the
+  pipelined loop's own admission loop admitted into every free lane, but admission stages
+  the prompt into the mixed prefill set, which holds 8. `top_up_prefill_lanes` already admits
+  exactly while the set has room; the pipelined loop now uses it alone.
