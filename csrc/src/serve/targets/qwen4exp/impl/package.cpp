@@ -128,9 +128,10 @@ Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
         const bool staged = options.pipeline_stage_first != 0 || options.pipeline_stage_last != 0;
         if (staged && share < 0.0F && options.expert_slots > 0) {
             // Pipeline stages default to the gather-only pool: at 8 stages a 68 %-resident
-            // stage decodes faster without the split (514 vs 395 tok/s at 64 users) and the
-            // split showed cross-lane answers in that configuration (INFERENCE.md,
-            // 2026-08-29). An explicit --cpu-moe-share still enables it.
+            // stage decodes faster without the split (514 vs 395 tok/s at 64 users), because it
+            // pays a host round trip per layer it could have served from its own slots. (The
+            // cross-lane corruption once blamed on this path was a sampling artefact and is
+            // retracted — INFERENCE.md, 2026-08-29 10:50.) An explicit --cpu-moe-share enables it.
             const int stage_layers = options.pipeline_stage_last - options.pipeline_stage_first;
             const std::uint64_t stage_experts = static_cast<std::uint64_t>(stage_layers) * detail::TextConfig::experts;
             share = 0.0F;

@@ -1383,7 +1383,9 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   p50 1.34 s, 386 ok / 0 errors, probes correct — faster than the same pool with the split
   on (387.8) and clean. The split-auto rerun on this configuration decides whether the
   cross-lane answer belongs to the CPU split path.
-- **CPU split corrupts lanes in the pipelined 8-stage configuration (2026-08-29 05:07)**: 8
+- **RETRACTED — see the 2026-08-29 10:50 entry: this was too few samples, and the control run
+  shows the same rate with the split off. The default (split off for stages) stands on the
+  throughput measurement alone.** Original note: 8
   stages, 64 users, 2,100 slots, `--cpu-moe-share auto` (per-socket pools) — 395.2 tok/s and
   the under-load probe "What is the capital of France?" answered 'Based' (the earlier run of
   the same point answered the primes question with another lane's p+q+r problem); the same
@@ -1593,4 +1595,39 @@ and not the memory ceiling. This needs a hardware/driver-side check (PSU rails u
 combined AVX-512 + GPU draw, and the NVIDIA driver's handling of a 150 GB pinned unmap); it is
 not something the engine can prove from inside. Until then: **do not run Flash-Next unattended**
 — the VRAM-only targets (27B, 35B, 4B) have never triggered it and are the safe vehicle.
+
+### The pipelined CPU split does not corrupt anything (2026-08-29 10:50)
+
+Retracting the 05:07 entry. That claim rested on one or two probe answers per configuration —
+the same methodological error as the needle prompts earlier in the day. Scored properly, 100
+probes per arm on 8 stages at 64 users with 2,100 slots (four short factual questions, greedy,
+asked repeatedly while 64 loaders saturate the engine):
+
+| configuration | answers matching |
+|---|---:|
+| `--cpu-moe-share 0.8` (split on) | 96/100 |
+| `--cpu-moe-share 0` (split off) | 97/100 |
+
+Within noise, and the failures have the same character in both arms: they are dominated by
+"Name three prime numbers.", where the model drifts into a math-problem continuation ("Three
+prime numbers p, q, r satisfy p + q + r = 100...") instead of answering — three of the three
+split-off misses, two of the four split-on misses. That is the model under a strict regex, not
+cross-lane contamination. What earlier looked like another lane's text ('Based', a p+q+r
+problem) appears with the split off too.
+
+Two diagnostics were written while chasing it and are worth keeping
+(`SUROGATE_SERVE_CPU_MOE_VERIFY=1`): every CPU-split job list is checked against its own slice
+(a round of T columns routes at most T x experts_per_token paths, each naming a column of the
+slice and an expert of the layer), and the mixer-to-combine hand-offs — the pending host
+partial and the inject gates, which travel through a thread-local while the buffers they name
+belong to a device — are checked to never cross a device, which is the shape a pipelining bug
+would take. Both were silent across the whole run, and the host pool independently range-checks
+every job it receives. A third check on staging generations was written and removed: it
+compared host issue order, which legitimately runs thousands of slices ahead of the callbacks,
+so it fired constantly on a clean run.
+
+**The default is unchanged and still right**, but for one reason rather than two: at 8 stages
+with 2,100 slots the split is simply slower (514 tok/s off vs 395 on at 64 users), because a
+68%-resident stage pays a host round trip per layer it could have served from its own pool.
+`--cpu-moe-share` still enables it.
 
