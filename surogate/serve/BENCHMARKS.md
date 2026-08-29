@@ -170,13 +170,14 @@ card at every layer boundary and at the output.
 | 2 stages GPUs 2+3, split off, steady-state pipeline (C3), synchronous prompt steps | 8 | 128/512 | 53.7 | 15 s |
 | 2 stages GPUs 2+3, split off, C3 + prompts as asynchronous flights | 8 | 128/512 | **56.1** | 17 s |
 | **8 stages, 3,072 slots (every expert resident), C3 + asynchronous prompt flights** | 1 / 16 | 512/128 | **57.9 / 383.9** | **237 ms / 615 ms** |
+| same, re-validated on the fixed binary with the Q4 host bank (battery 100/100) | 1 / 16 / 32 / 64 | 512/128 | 51.0 / 381.6 / 488.2 / 604.1 | — |
 | same, stages materialise only their own layers (64 lanes fit beside the pool) | 32 / 64 | 512/128 | **518.5 / 583.6** | 971 ms / 1.14 s |
 | 8 stages, 2,816 slots (92 %, split off) / 2,100 slots (68 %, split on) | 32 / 64 | 512/128 | 504 / 387.8 | 1.0 s / 2.1 s |
 | Qwen3.8-27B (all-NVFP4), 8 stages, closed pipeline | 1 / 100 | 512/128 | 19.6 / 213 | 0.43 s / 0.75 s |
-| **Qwen3.8-27B**, 8 stages, C3 + asynchronous prompt flights | 100 | 512/128 | **1,057** | 834 ms |
+| **Qwen3.8-27B**, 8 stages, C3 + asynchronous prompt flights (re-validated post scratch-fix, seqs 128, ignore_eos) | 100 | 512/128 | **1,332** | — |
 | Qwen3.8-27B, one card (board) | 100 | 512/128 | 1,330 | 170 ms |
 | Qwen3.6-35B-A3B, 8 stages, closed pipeline | 1 / 100 | 512/128 | 50.1 / 574 | 0.35 s / 0.34 s |
-| **Qwen3.6-35B-A3B**, 8 stages, C3 + asynchronous prompt flights | 100 | 512/128 | **1,960** | 386 ms |
+| **Qwen3.6-35B-A3B**, 8 stages, C3 + asynchronous prompt flights (re-validated post scratch-fix, seqs 128, ignore_eos) | 100 | 512/128 | **2,368** | — |
 | Qwen3.6-35B-A3B, one card (board) | 100 | 512/128 | 1,942 | 253 ms |
 
 Reading: all three models serve correctly across the eight cards, verified with the

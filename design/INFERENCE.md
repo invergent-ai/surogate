@@ -1760,3 +1760,30 @@ Two follow-ups from the investigation:
   the requests collapse to one sampling round each (995 "tok/s" at 10 ms latency). Loadgen
   prompts must vary, or measure with `--no-prefix-reuse`.
 
+### 8-GPU re-validation on the fixed binary (2026-08-29 17:00)
+
+Every pipeline number on the board predated the scratch-state fix, so the whole set was re-run
+on the fixed binary with the Q4 host bank default active (first 8-stage Q4 run) and the
+repo-resident probes (`surogate/serve/tools/probe/`). Method notes: `tput.py` now tags every
+prompt (identical prompts collapse under prefix reuse) and passes `ignore_eos: true` — added
+to the OpenAI layer in bfbe165d, mapping onto `StopPolicy.include_model_defaults` — because
+decode-tok/s comparisons are meaningless unless the output length is fixed (the *pre-fix*
+runs generated full-length answers only because corrupted prefill state made the model
+ramble; the fixed engine answers the loadgen prompt honestly in ~22 tokens).
+
+| point | recorded | re-validated |
+|---|---:|---:|
+| Flash-Next 8 stages, 100-probe battery @16 | 90-97, blends | **100/100, zero blends** |
+| Flash-Next 1 / 16 / 32 / 64 users | 57.9 / 383.9 / 518.5 / 604.8 | 51.0 / 381.6 / 488.2 / **604.1** |
+| auto max context on the pipeline | untested | **262,144** resolved by stage 0, correct answers |
+| 27B @100 (seqs 128) | 1,057 | **1,332** (level with its one-card row) |
+| 35B-A3B @100 (seqs 128) | 1,960 | **2,368** (above its one-card 1,942) |
+| worker fatals across the pass | — | **0** |
+
+Reading: Flash-Next throughput is unchanged (the fix costs nothing; the Q4 bank costs nothing
+at full residency), quality went to a perfect battery, and the 27B/35B gained 21-26 % — the
+interleaved-prompt state corruption was degrading the dense/MoE pipeline rounds too. The 8
+stages share one ~90 GB Q4 bank (was ~152 GB W8). The 0.8B mixed-round-corruption board item
+cannot be retested yet: no 0.8B artifact exists in `models/ninfer` — converting one is the
+prerequisite.
+
