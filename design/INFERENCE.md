@@ -1821,3 +1821,8 @@ the ring was built for:**
 The scratch fix alone was +63 % here; the ring adds +26 % on top (2.05× vs the board row),
 battery 40/40. Fewer-than-8-stage deployments are now usable.
 
+- Machine-crash investigation dropped (owner decision, 2026-08-29): the hardware/driver-side
+  follow-up on the host crashes is no longer tracked as an open item. The guarded launcher
+  (`run_guarded.sh`) remains the standard way to start serving binaries — it is cheap insurance
+  either way — and no crash has occurred since the Q4 bank shrank the pinned footprint.
+
