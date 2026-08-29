@@ -71,11 +71,16 @@ struct ExpertSlotDirectory {
     Tensor last_used;       // I32-typed unsigned [slots]: round stamp of the last touch (LRU)
     Tensor active_round;    // I32-typed unsigned [slots]: stamp of the current touch (eviction guard)
     Tensor round;           // I32-typed unsigned [1]: current round stamp, bumped by resolve
-    Tensor hand;            // I32 [1]: clock hand of the victim search
+    Tensor hand;            // I32 [2]: clock hand of the LRU victim search; ring cursor of the scan region
     Tensor seen;            // I32-typed unsigned [experts]: per-round dedupe stamps
     Tensor cpu_round;       // I32-typed unsigned [experts]: stamp of the round that sent the expert to the CPU
     std::int32_t layers  = 0;
     std::int32_t experts = 0;
+    // Scan resistance: the last `scan_ring` slots are a sacrificial ring that only scan-mode
+    // resolves (wide prefill rounds) allocate from, round-robin; the LRU clock never places
+    // there. A prompt's per-layer expert sweep then cycles inside the ring instead of wiping
+    // the decode working set. 0 = plain LRU over every slot.
+    std::int32_t scan_ring = 0;
 };
 
 /// Per-round miss list written by resolve and consumed by gather; `count` is a device word so
@@ -101,9 +106,12 @@ struct ExpertMissList {
 /// at zero); `expert_slot_directory_reset` returns it to that state.
 [[nodiscard]] ExpertSlotPool create_expert_slot_pool(const SparseMoeGeometry& geometry,
                                                       std::int32_t slots, void* device_bytes);
+/// `scan_ring` reserves that many trailing slots for scan-mode resolves (see the struct); it
+/// must be 0, or at least `experts` and at most half the slots.
 [[nodiscard]] ExpertSlotDirectory create_expert_slot_directory(std::int32_t layers,
                                                                 std::int32_t experts,
                                                                 std::int32_t slots,
+                                                                std::int32_t scan_ring,
                                                                 void* device_bytes,
                                                                 cudaStream_t stream);
 [[nodiscard]] ExpertMissList create_expert_miss_list(std::int32_t capacity, void* device_bytes);
@@ -142,12 +150,14 @@ struct ExpertCpuJobList {
 /// fraction of the *missing* experts is not fetched: their table entries stay -1 (the kernels
 /// contribute nothing for those paths) and every (token, path) that routes to them becomes a
 /// job in `cpu_jobs` with its router weight. Hits are never split.
+/// `scan` marks a wide (prefill-shaped) round: misses allocate from the directory's scan ring
+/// instead of evicting LRU slots (no-op when the directory has no ring).
 void expert_slot_resolve(const Tensor& ids, std::int32_t layer, ExpertSlotDirectory& directory,
-                         ExpertMissList& misses, cudaStream_t stream);
+                         ExpertMissList& misses, cudaStream_t stream, bool scan = false);
 void expert_slot_resolve(const Tensor& ids, const Tensor& alpha, std::int32_t layer,
                          ExpertSlotDirectory& directory, ExpertMissList& misses,
                          ExpertCpuJobList* cpu_jobs, std::uint32_t cpu_share_q16,
-                         cudaStream_t stream);
+                         cudaStream_t stream, bool scan = false);
 
 /// Copies the missing experts of `layer` from the host bank into their slots: one launch,
 /// four banks (gate_up codes/scales, down codes/scales), 16-byte units, row count read from

@@ -119,7 +119,7 @@ struct Fixture {
                                                 kGeometry.routed_down_rows(), kGeometry.intermediate);
         host      = ops::expert_host_bank(kGeometry, gate_up, down);
         pool      = ops::create_expert_slot_pool(kGeometry, kSlots, pool_memory.data());
-        directory = ops::create_expert_slot_directory(kLayers, kGeometry.experts, kSlots,
+        directory = ops::create_expert_slot_directory(kLayers, kGeometry.experts, kSlots, 0,
                                                       directory_memory.data(), nullptr);
         misses    = ops::create_expert_miss_list(kGeometry.experts, miss_memory.data());
         cuda_synchronize();
@@ -304,7 +304,7 @@ int main() {
         GuardedDeviceBuffer ids_memory(8 * sizeof(int));
         ops::ExpertSlotPool pool = ops::create_expert_slot_pool(kGeometry, kSlots, pool_memory.data());
         ops::ExpertSlotDirectory directory = ops::create_expert_slot_directory(
-            kLayers, kGeometry.experts, kSlots, directory_memory.data(), nullptr);
+            kLayers, kGeometry.experts, kSlots, 0, directory_memory.data(), nullptr);
         ops::ExpertMissList misses = ops::create_expert_miss_list(kGeometry.experts, miss_memory.data());
         const std::vector<int> ids = {0, 5, 3};
         cuda_check(cudaMemcpy(ids_memory.data(), ids.data(), ids.size() * sizeof(int),
@@ -404,6 +404,81 @@ int main() {
         }
         cudaFreeHost(gate_pinned);
         cudaFreeHost(down_pinned);
+    }
+    // --- Scan ring: wide (scan) resolves cycle in the trailing ring; the LRU region and its
+    // resident decode set survive a full expert sweep. ---
+    {
+        constexpr std::int32_t kRingSlots = 20; // 12 LRU + ring of 8 (= experts)
+        GuardedDeviceBuffer pool_memory(ops::expert_slot_pool_bytes(kGeometry, kRingSlots));
+        GuardedDeviceBuffer directory_memory(
+            ops::expert_slot_directory_bytes(kLayers, kGeometry.experts, kRingSlots));
+        GuardedDeviceBuffer miss_memory(ops::expert_miss_list_bytes(kGeometry.experts));
+        GuardedDeviceBuffer ids_memory(16 * sizeof(int));
+        ops::ExpertSlotPool pool =
+            ops::create_expert_slot_pool(kGeometry, kRingSlots, pool_memory.data());
+        ops::ExpertSlotDirectory directory = ops::create_expert_slot_directory(
+            kLayers, kGeometry.experts, kRingSlots, kGeometry.experts, directory_memory.data(),
+            nullptr);
+        ops::ExpertMissList misses = ops::create_expert_miss_list(kGeometry.experts, miss_memory.data());
+        HostBank ring_bank = make_bank();
+        void* mapped       = nullptr;
+        cuda_check(cudaHostGetDevicePointer(&mapped, ring_bank.pinned, 0), "ring bank map");
+        const std::ptrdiff_t shift = static_cast<std::byte*>(mapped) - ring_bank.base();
+        const Weight gate_up = host_weight(ring_bank.gate_codes_plane() + shift,
+                                           ring_bank.gate_scales_plane() + shift,
+                                           kGeometry.routed_gate_rows(), kGeometry.hidden);
+        const Weight down = host_weight(ring_bank.down_codes_plane() + shift,
+                                        ring_bank.down_scales_plane() + shift,
+                                        kGeometry.routed_down_rows(), kGeometry.intermediate);
+        const ops::ExpertHostBank host = ops::expert_host_bank(kGeometry, gate_up, down);
+
+        const auto resolve = [&](const std::vector<int>& ids, int layer, bool scan) {
+            cuda_check(cudaMemcpy(ids_memory.data(), ids.data(), ids.size() * sizeof(int),
+                                  cudaMemcpyHostToDevice),
+                       "ring ids upload");
+            Tensor t(ids_memory.data(), DType::I32, {static_cast<std::int32_t>(ids.size())});
+            ops::expert_slot_resolve(t, layer, directory, misses, nullptr, scan);
+            ops::expert_slot_gather(host, misses, pool, nullptr);
+            cuda_synchronize();
+            return from_device<int>(directory.slot_of_expert.data,
+                                    static_cast<std::size_t>(kLayers) * kGeometry.experts);
+        };
+
+        // Decode-style resolves park experts 0..3 of layer 0 in the LRU region [0, 12).
+        auto table = resolve({0, 1, 2, 3}, 0, false);
+        int lru_ok = 1;
+        std::array<int, 4> resident{};
+        for (int e = 0; e < 4; ++e) {
+            resident[static_cast<std::size_t>(e)] = table[e];
+            lru_ok &= table[e] >= 0 && table[e] < 12;
+        }
+        failures += expect(lru_ok == 1, "ring: decode set placed in the LRU region");
+
+        // A full scan of layer 1 (all 8 experts) lands entirely in the ring [12, 20) and the
+        // decode set keeps its slots.
+        table = resolve({0, 1, 2, 3, 4, 5, 6, 7}, 1, true);
+        int ring_ok = 1;
+        for (int e = 0; e < kGeometry.experts; ++e) {
+            const int slot = table[kGeometry.experts + e];
+            ring_ok &= slot >= 12 && slot < 20;
+        }
+        failures += expect(ring_ok == 1, "ring: scan misses placed in the ring only");
+        int kept = 1;
+        for (int e = 0; e < 4; ++e) { kept &= table[e] == resident[static_cast<std::size_t>(e)]; }
+        failures += expect(kept == 1, "ring: decode set survives a full scan");
+
+        // A second full scan (layer 0's other experts) recycles the ring, evicting layer 1's
+        // scan entries but still never touching the LRU region.
+        table = resolve({4, 5, 6, 7, 0, 1, 2, 3}, 0, true);
+        int recycled = 1;
+        for (int e = 4; e < 8; ++e) { recycled &= table[e] >= 12 && table[e] < 20; }
+        failures += expect(recycled == 1, "ring: second scan recycles the ring");
+        kept = 1;
+        for (int e = 0; e < 4; ++e) { kept &= table[e] == resident[static_cast<std::size_t>(e)]; }
+        failures += expect(kept == 1, "ring: decode set survives ring recycling (hits keep slots)");
+        cudaFreeHost(ring_bank.pinned);
+        failures += pool_memory.verify_guards("ring pool");
+        failures += directory_memory.verify_guards("ring directory");
     }
     std::cout << (failures ? "FAIL" : "OK") << " expert_slot_cache\n";
     return failures ? 1 : 0;

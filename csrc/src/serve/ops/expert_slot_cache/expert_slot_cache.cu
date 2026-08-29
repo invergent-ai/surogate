@@ -91,6 +91,7 @@ __global__ void directory_reset_kernel(int* __restrict__ slot_of_expert, int ids
                                        unsigned* __restrict__ last_used,
                                        unsigned* __restrict__ active_round, int slots,
                                        unsigned* __restrict__ round, int* __restrict__ hand) {
+    // hand[0] = LRU clock, hand[1] = scan-ring cursor.
     const int i = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) +
                   static_cast<int>(threadIdx.x);
     if (i < ids) { slot_of_expert[i] = -1; }
@@ -101,7 +102,8 @@ __global__ void directory_reset_kernel(int* __restrict__ slot_of_expert, int ids
     }
     if (i == 0) {
         *round = 0U;
-        *hand  = 0;
+        hand[0] = 0;
+        hand[1] = 0;
     }
 }
 
@@ -109,7 +111,8 @@ __global__ void directory_reset_kernel(int* __restrict__ slot_of_expert, int ids
 /// per-layer scratch of `experts` stamps that dedupes the round's ids.
 __global__ void __launch_bounds__(kResolveThreads)
     resolve_kernel(const int* __restrict__ ids, const float* __restrict__ alpha, int count,
-                   int layer, int experts, int slots, int* __restrict__ slot_of_expert,
+                   int layer, int experts, int slots, int scan_ring, int scan,
+                   int* __restrict__ slot_of_expert,
                    int* __restrict__ expert_of_slot, unsigned* __restrict__ last_used,
                    unsigned* __restrict__ active_round, unsigned* __restrict__ round,
                    int* __restrict__ hand, unsigned* __restrict__ seen,
@@ -157,9 +160,15 @@ __global__ void __launch_bounds__(kResolveThreads)
     // experts keep -1 in the table and are stamped in `cpu_round` for pass 3.
     if (tid == 0) {
         const int pending = s_pending < 1024 ? s_pending : 1024;
-        int h             = *hand;
-        int written       = 0;
-        int sent_to_cpu   = 0;
+        // The LRU clock owns slots [0, lru_slots); scan-mode misses cycle through the trailing
+        // ring [lru_slots, slots) instead, so a prompt's expert sweep cannot evict the decode
+        // working set. Within one round the ring never wraps onto itself: misses are deduped,
+        // so pending <= experts <= scan_ring, and active slots are skipped.
+        const bool use_ring = scan != 0 && scan_ring > 0;
+        const int lru_slots = slots - scan_ring;
+        int h               = use_ring ? hand[1] : *hand;
+        int written         = 0;
+        int sent_to_cpu     = 0;
         for (int p = 0; p < pending; ++p) {
             const int expert = s_pending_experts[p];
             if (cpu_share_q16 > 0U && cpu_count != nullptr &&
@@ -169,22 +178,32 @@ __global__ void __launch_bounds__(kResolveThreads)
                 ++sent_to_cpu;
                 continue;
             }
-            // Find a slot that is not active in this round; prefer the least recently used
-            // among the next few candidates the hand passes (bounded sweep keeps it cheap).
-            int victim        = -1;
-            unsigned best_age = 0U;
-            for (int probe = 0; probe < slots; ++probe) {
-                const int s = (h + probe) % slots;
-                if (active_round[s] == this_round) { continue; }
-                const unsigned age = this_round - last_used[s];
-                if (victim < 0 || age > best_age) {
-                    victim   = s;
-                    best_age = age;
-                    if (expert_of_slot[s] < 0 || age >= 64U) { break; } // empty or stale enough
+            int victim = -1;
+            if (use_ring) {
+                for (int probe = 0; probe < scan_ring; ++probe) {
+                    const int s = lru_slots + (h + probe) % scan_ring;
+                    if (active_round[s] == this_round) { continue; }
+                    victim = s;
+                    h      = (h + probe + 1) % scan_ring;
+                    break;
                 }
+            } else {
+                // Find a slot that is not active in this round; prefer the least recently used
+                // among the next few candidates the hand passes (bounded sweep keeps it cheap).
+                unsigned best_age = 0U;
+                for (int probe = 0; probe < lru_slots; ++probe) {
+                    const int s = (h + probe) % lru_slots;
+                    if (active_round[s] == this_round) { continue; }
+                    const unsigned age = this_round - last_used[s];
+                    if (victim < 0 || age > best_age) {
+                        victim   = s;
+                        best_age = age;
+                        if (expert_of_slot[s] < 0 || age >= 64U) { break; } // empty or stale
+                    }
+                }
+                if (victim >= 0) { h = (victim + 1) % lru_slots; }
             }
-            if (victim < 0) { break; } // every slot is active in this round: cannot serve
-            h = (victim + 1) % slots;
+            if (victim < 0) { break; } // every candidate slot is active in this round
             const int old_flat = expert_of_slot[victim];
             if (old_flat >= 0) { slot_of_expert[old_flat] = -1; }
             const int flat        = layer * experts + expert;
@@ -198,7 +217,11 @@ __global__ void __launch_bounds__(kResolveThreads)
             }
             ++written;
         }
-        *hand         = h;
+        if (use_ring) {
+            hand[1] = h;
+        } else {
+            *hand = h;
+        }
         *miss_count   = written < miss_capacity ? written : miss_capacity;
         s_cpu_pending = sent_to_cpu;
     }
@@ -408,15 +431,21 @@ ExpertSlotPool create_expert_slot_pool(const SparseMoeGeometry& geometry, std::i
 }
 
 ExpertSlotDirectory create_expert_slot_directory(std::int32_t layers, std::int32_t experts,
-                                                 std::int32_t slots, void* device_bytes,
-                                                 cudaStream_t stream) {
+                                                 std::int32_t slots, std::int32_t scan_ring,
+                                                 void* device_bytes, cudaStream_t stream) {
+    if (scan_ring != 0 && (scan_ring < experts || scan_ring > slots / 2)) {
+        throw std::invalid_argument(
+            "expert_slot_cache: scan ring must be 0, or in [experts, slots/2] so one deduped "
+            "per-layer scan always fits without wrapping onto itself");
+    }
     if (device_bytes == nullptr) {
         throw std::invalid_argument("expert_slot_cache: directory memory is null");
     }
     const std::int32_t ids = layers * experts;
     auto* base             = static_cast<std::byte*>(device_bytes);
     ExpertSlotDirectory out;
-    out.layers  = layers;
+    out.layers    = layers;
+    out.scan_ring = scan_ring;
     out.experts = experts;
     auto take = [&](DType dtype, std::int32_t count, std::size_t element) {
         Tensor t(base, dtype, {count});
@@ -428,7 +457,7 @@ ExpertSlotDirectory create_expert_slot_directory(std::int32_t layers, std::int32
     out.last_used      = take(DType::I32, slots, sizeof(unsigned));
     out.active_round   = take(DType::I32, slots, sizeof(unsigned));
     out.round          = take(DType::I32, 1, sizeof(unsigned));
-    out.hand           = take(DType::I32, 1, sizeof(int));
+    out.hand           = take(DType::I32, 2, 2 * sizeof(int));
     out.seen           = take(DType::I32, experts, sizeof(unsigned));
     out.cpu_round      = take(DType::I32, experts, sizeof(unsigned));
     expert_slot_directory_reset(out, stream);
@@ -520,14 +549,14 @@ ExpertHostBank expert_host_bank(const SparseMoeGeometry& geometry, const Weight&
 // ---------------------------------------------------------------------------------------------
 
 void expert_slot_resolve(const Tensor& ids, std::int32_t layer, ExpertSlotDirectory& directory,
-                         ExpertMissList& misses, cudaStream_t stream) {
-    expert_slot_resolve(ids, Tensor{}, layer, directory, misses, nullptr, 0U, stream);
+                         ExpertMissList& misses, cudaStream_t stream, bool scan) {
+    expert_slot_resolve(ids, Tensor{}, layer, directory, misses, nullptr, 0U, stream, scan);
 }
 
 void expert_slot_resolve(const Tensor& ids, const Tensor& alpha, std::int32_t layer,
                          ExpertSlotDirectory& directory, ExpertMissList& misses,
                          ExpertCpuJobList* cpu_jobs, std::uint32_t cpu_share_q16,
-                         cudaStream_t stream) {
+                         cudaStream_t stream, bool scan) {
     if (ids.dtype != DType::I32 || ids.data == nullptr) {
         throw std::invalid_argument("expert_slot_cache: ids must be a device I32 tensor");
     }
@@ -552,8 +581,8 @@ void expert_slot_resolve(const Tensor& ids, const Tensor& alpha, std::int32_t la
     const int slots = static_cast<int>(directory.expert_of_slot.ne[0]);
     resolve_kernel<<<1, kResolveThreads, 0, stream>>>(
         static_cast<const int*>(ids.data), split ? static_cast<const float*>(alpha.data) : nullptr,
-        static_cast<int>(count), layer, directory.experts, slots,
-        static_cast<int*>(directory.slot_of_expert.data),
+        static_cast<int>(count), layer, directory.experts, slots, directory.scan_ring,
+        scan ? 1 : 0, static_cast<int*>(directory.slot_of_expert.data),
         static_cast<int*>(directory.expert_of_slot.data),
         static_cast<unsigned*>(directory.last_used.data),
         static_cast<unsigned*>(directory.active_round.data),

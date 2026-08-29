@@ -139,7 +139,8 @@ struct ExpertSlotCache {
         return slice_contexts.back();
     }
     bool enabled = false;
-    std::int32_t slots = 0;
+    std::int32_t slots     = 0;
+    std::int32_t scan_ring = 0; // trailing slots reserved for prefill scans (0 = plain LRU)
     void* pool_memory      = nullptr;
     void* directory_memory = nullptr;
     void* miss_memory      = nullptr;
@@ -333,11 +334,15 @@ struct ExpertSlotCache {
         // The split decision is per round (begin_round); every slice of the round follows it.
         const bool split          = entry->round_split && x.data != nullptr && destination.data != nullptr;
         const std::uint32_t share = split ? cache.share_for(entry->round_total) : 0U;
+        // Wide rounds are prompt scans: their misses go to the directory's scan ring so the
+        // decode working set stays resident (design/INFERENCE.md, scan resistance).
+        const bool scan = entry->round_total > 32;
         if (split) {
             ops::expert_slot_resolve(ids, alpha, entry->index, cache.directory, cache.misses,
-                                     &cache.cpu_jobs, share, stream);
+                                     &cache.cpu_jobs, share, stream, scan);
         } else {
-            ops::expert_slot_resolve(ids, entry->index, cache.directory, cache.misses, stream);
+            ops::expert_slot_resolve(ids, entry->index, cache.directory, cache.misses, stream,
+                                     scan);
         }
         ops::expert_slot_gather(entry->bank, cache.misses, cache.pool, stream);
         if (split) { cache.cpu_round(*entry, x, destination, stream); }
@@ -477,8 +482,19 @@ ExpertSlotCache& expert_slot_cache_for_current_device() {
     CUDA_CHECK(cudaMalloc(&cache.directory_memory, dir_bytes));
     CUDA_CHECK(cudaMalloc(&cache.miss_memory, miss_bytes));
     cache.pool      = ops::create_expert_slot_pool(geometry, cache.slots, cache.pool_memory);
+    // Scan resistance: reserve one expert-set of trailing slots for prefill scans when the
+    // pool cannot hold every expert of its layers but is comfortably bigger than one scan.
+    // Below that, plain LRU (a ring would eat half a tiny pool for no stable set to protect).
+    const auto stage_experts =
+        static_cast<std::int64_t>(TextConfig::layers) * geometry.experts; // whole-model bound
+    cache.scan_ring = (static_cast<std::int64_t>(cache.slots) < stage_experts &&
+                       cache.slots >= geometry.experts * 3 / 2 &&
+                       std::getenv("SUROGATE_SERVE_NO_SCAN_RING") == nullptr)
+                          ? geometry.experts
+                          : 0;
     cache.directory = ops::create_expert_slot_directory(TextConfig::layers, geometry.experts,
-                                                        cache.slots, cache.directory_memory,
+                                                        cache.slots, cache.scan_ring,
+                                                        cache.directory_memory,
                                                         nullptr);
     cache.misses    = ops::create_expert_miss_list(geometry.experts, cache.miss_memory);
     CUDA_CHECK(cudaStreamSynchronize(nullptr));
@@ -610,8 +626,10 @@ ExpertSlotCache& expert_slot_cache_for_current_device() {
                          cache.cpu_pool->threads(), auto_share ? " (auto: measured at startup)" : "");
         }
     }
-    std::fprintf(stderr, "qwen4exp: expert slot cache enabled: %d slots (%.1f GiB pool)\n",
-                 cache.slots, static_cast<double>(pool_bytes) / (1024.0 * 1024.0 * 1024.0));
+    std::fprintf(stderr,
+                 "qwen4exp: expert slot cache enabled: %d slots (%.1f GiB pool), scan ring %d\n",
+                 cache.slots, static_cast<double>(pool_bytes) / (1024.0 * 1024.0 * 1024.0),
+                 cache.scan_ring);
     return cache;
 }
 
