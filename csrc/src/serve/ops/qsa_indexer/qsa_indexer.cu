@@ -18,6 +18,8 @@ constexpr int kBlock    = 4;   // the only registered compress ratio
 constexpr int kWarp     = 32;
 constexpr int kPerLane  = kHeadDim / kWarp; // 4 values of the head per lane
 constexpr int kWarps    = 4;
+// Scratch the selection may use for block scores, whatever the context length.
+constexpr std::int64_t kSelectScratchBytes = 64LL << 20;
 constexpr int kThreads  = kWarps * kWarp;
 
 // The indexer plane holds one head of `kHeadDim` per cell.
@@ -138,7 +140,7 @@ template <int Heads>
 __global__ void qsa_select_kernel(const __nv_bfloat16* __restrict__ q,
                                   const std::int32_t* __restrict__ positions,
                                   const std::int32_t* __restrict__ table_rows,
-                                  std::int32_t columns_per_row,
+                                  std::int32_t columns_per_row, std::int32_t row_offset,
                                   const std::int32_t* __restrict__ block_tables,
                                   std::int32_t table_stride,
                                   const __nv_bfloat16* __restrict__ plane,
@@ -152,7 +154,7 @@ __global__ void qsa_select_kernel(const __nv_bfloat16* __restrict__ q,
     const int d0       = lane * kPerLane;
     const std::int32_t* block_table =
         block_tables +
-        static_cast<std::int64_t>(table_rows[row / columns_per_row]) * table_stride;
+        static_cast<std::int64_t>(table_rows[(row_offset + row) / columns_per_row]) * table_stride;
     std::uint32_t* row_mask = mask + static_cast<std::int64_t>(row) * words;
 
     const int visible = position + 1;                    // cells 0..position are populated
@@ -259,12 +261,25 @@ bool qsa_selection_is_dense(std::int32_t keys, const QsaIndexerGeometry& geometr
     return keys <= geometry.top_k + geometry.block - 1;
 }
 
+std::int32_t qsa_select_row_tile(std::int32_t rows, std::int32_t keys,
+                                 const QsaIndexerGeometry& geometry) noexcept {
+    // The block scores are per query row, so the scratch would grow as rows x blocks: 512 MB for
+    // a 2,048-column chunk over a 262k context. The rows are independent, so the selection runs
+    // in tiles and the plan reserves one tile.
+    const std::int64_t blocks = (keys + geometry.block - 1) / geometry.block;
+    if (blocks <= 0) { return rows > 0 ? rows : 1; }
+    const std::int64_t tile = kSelectScratchBytes / (blocks * static_cast<std::int64_t>(sizeof(float)));
+    const std::int64_t clamped = std::max<std::int64_t>(1, std::min<std::int64_t>(tile, rows));
+    return static_cast<std::int32_t>(clamped);
+}
+
 std::size_t qsa_indexer_select_workspace_capacity_bytes(std::int32_t rows, std::int32_t keys,
                                                         const QsaIndexerGeometry& geometry) {
     require(rows >= 0 && keys >= 0 && geometry.block > 0, "workspace geometry must be positive");
     const std::size_t blocks =
         static_cast<std::size_t>((keys + geometry.block - 1) / geometry.block);
-    return static_cast<std::size_t>(rows) * blocks * sizeof(float) + 256U;
+    const auto tile = static_cast<std::size_t>(qsa_select_row_tile(rows, keys, geometry));
+    return tile * blocks * sizeof(float) + 256U;
 }
 
 void qsa_indexer_append(const Tensor& keys, const Tensor& positions, const Tensor& table_rows,
@@ -326,23 +341,30 @@ void qsa_indexer_select(const Tensor& q, const Tensor& positions, const Tensor& 
                     static_cast<std::int32_t>(table_rows.ne[0]),
             "table rows must cover every query row's sequence");
     const int blocks  = (keys + geometry.block - 1) / geometry.block;
-    Tensor scores     = workspace.alloc(DType::FP32, {blocks, rows});
+    const int tile    = qsa_select_row_tile(rows, keys, geometry);
+    Tensor scores     = workspace.alloc(DType::FP32, {blocks, tile});
     const auto stride = static_cast<int>(blocks);
     const int budget  = geometry.top_k / geometry.block;
-    const auto launch = [&](auto heads) {
-        qsa_select_kernel<decltype(heads)::value><<<rows, kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(q.data),
-            static_cast<const std::int32_t*>(positions.data),
-            static_cast<const std::int32_t*>(table_rows.data), columns_per_row,
+    // One tile of query rows at a time: the rows are independent, and the per-row scratch is
+    // what would otherwise scale with the context length.
+    const auto launch = [&](auto heads, int first, int count) {
+        qsa_select_kernel<decltype(heads)::value><<<count, kThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(q.data) +
+                static_cast<std::int64_t>(first) * kHeadDim * geometry.heads,
+            static_cast<const std::int32_t*>(positions.data) + first,
+            static_cast<const std::int32_t*>(table_rows.data), columns_per_row, first,
             static_cast<const std::int32_t*>(cache.block_tables.data), cache.block_tables.ne[0],
             static_cast<const __nv_bfloat16*>(cache.indexer_pages.data),
-            static_cast<std::uint32_t*>(mask.data), words, budget,
-            static_cast<float*>(scores.data), stride);
+            static_cast<std::uint32_t*>(mask.data) + static_cast<std::int64_t>(first) * words,
+            words, budget, static_cast<float*>(scores.data), stride);
     };
-    switch (geometry.heads) {
-    case 4: launch(std::integral_constant<int, 4>{}); break;
-    case 8: launch(std::integral_constant<int, 8>{}); break;
-    default: throw std::invalid_argument("qsa_indexer: unregistered indexer head count");
+    for (int first = 0; first < rows; first += tile) {
+        const int count = std::min(tile, rows - first);
+        switch (geometry.heads) {
+        case 4: launch(std::integral_constant<int, 4>{}, first, count); break;
+        case 8: launch(std::integral_constant<int, 8>{}, first, count); break;
+        default: throw std::invalid_argument("qsa_indexer: unregistered indexer head count");
+        }
     }
 }
 
