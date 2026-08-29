@@ -79,6 +79,10 @@ struct TextLayerPlan {
     bool has_ple           = false;
     PlePlan ple{};
     MoePlan moe;
+    // A pipeline stage materialises only its own layers on the device: the others are
+    // validated against the artifact but never uploaded (their routed experts still join the
+    // shared host bank, which every stage of a process maps once).
+    bool resident = true;
 };
 
 struct BindingPlan {
@@ -103,7 +107,10 @@ struct ArtifactLoadPlan {
     artifact::MaterializationPlan materialization;
 };
 
-ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeatures features);
+/// `stage_first/stage_last` (0/0 = every layer) restrict device residency to the layers of a
+/// pipeline stage.
+ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeatures features,
+                               int stage_first = 0, int stage_last = 0);
 
 /// Per-block hyper-connection weights ride on the projection payloads the family hands to the
 /// Variant at the norm hooks, so the Variant can mix before its projection.

@@ -26,9 +26,13 @@ constexpr std::uint64_t kExperts  = TextConfig::experts;
 constexpr std::uint64_t kFfn      = TextConfig::intermediate;
 constexpr std::uint64_t kValueDim = TextConfig::value_dim;
 
+// Placement of the layer being bound: Device for the layers this program runs, ValidateOnly
+// for the layers of other pipeline stages (validated, never uploaded).
+thread_local TensorPlacement g_layer_placement = TensorPlacement::Device;
+
 artifact::ObjectHandle device(artifact::Binder& binder, const std::string& name,
                               NumericFormat format, std::initializer_list<std::uint64_t> shape) {
-    return artifact::bind_device_tensor(binder, name, format, shape);
+    return artifact::bind_tensor(binder, name, format, shape, g_layer_placement);
 }
 
 // Validates the object and records its mapping for the pinned host bank.
@@ -160,7 +164,9 @@ SparseMoePayload load_moe(const artifact::MaterializedArtifact& backing, const H
 
 } // namespace
 
-ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeatures features) {
+ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeatures features,
+                               int stage_first, int stage_last) {
+    const bool staged = stage_last > 0;
     ArtifactLoadPlan load_plan;
     BindingPlan& out    = load_plan.bindings;
     out.frontend        = qwen3_6::bind_frontend_resources(binder);
@@ -171,6 +177,9 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeature
     for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
         TextLayerPlan& target    = out.text_layers[layer];
         const std::string prefix = "text/layers/" + std::to_string(layer) + "/";
+        target.resident = !staged || (static_cast<int>(layer) >= stage_first &&
+                                      static_cast<int>(layer) < stage_last);
+        g_layer_placement = target.resident ? TensorPlacement::Device : TensorPlacement::ValidateOnly;
         target.hc_attention      = bind_hc(binder, prefix + "hc_attn/", true);
         target.hc_mlp            = bind_hc(binder, prefix + "hc_ffn/", true);
         target.is_full_attention = TextConfig::is_full_attention(static_cast<int>(layer));
@@ -238,6 +247,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeature
         }
         target.moe = bind_moe(binder, out.host_bank, prefix + "mlp/");
     }
+    g_layer_placement = TensorPlacement::Device;
 
     out.output_mix  = bind_hc(binder, "text/output_hc/", false);
     out.output_head = device(binder, "text/output_head", NumericFormat::W8G32_F16S, {kVocab, kHidden});
@@ -292,7 +302,11 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     std::size_t full_index = 0;
     std::size_t gdn_index  = 0;
     for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
-        const TextLayerPlan& source          = plan.text_layers[layer];
+        const TextLayerPlan& source = plan.text_layers[layer];
+        if (!source.resident) { // another stage's layer: keep the index bookkeeping only
+            if (source.is_full_attention) { ++full_index; } else { ++gdn_index; }
+            continue;
+        }
         ops::HyperConnectionWeights mix_attn = load_hc(backing, source.hc_attention, true);
         ops::HyperConnectionWeights mix_mlp  = load_hc(backing, source.hc_mlp, true);
         if (source.is_full_attention) {

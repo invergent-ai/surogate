@@ -87,7 +87,8 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
             "qwen3.8-flash-next: speculative decoding (MTP/DFlash) is not served by this target");
     }
     return LoadPlan(std::make_unique<LoadPlan::Impl>(weights_profile,
-                                                     detail::bind_artifact(binder, features)));
+                                                     detail::bind_artifact(binder, features, options.pipeline_stage_first,
+                                                                           options.pipeline_stage_last)));
 }
 
 std::unique_ptr<Package::LoadedModel>
