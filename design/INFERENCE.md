@@ -1878,3 +1878,18 @@ prompts — which is not the board's shape. Not built; the knob stays for that w
 The TTFT levers at this load are structural instead: more than one flight in flight per
 group, or prefill/decode disaggregation across stages.
 
+### Single-card prefill under load: the split ratio is not the lever (2026-08-29 19:40)
+
+One 5090, 16 users, 512/128, split auto, streaming TTFT probe, sweeping the prefill share:
+
+| prefill share | TTFT p50 | TTFT p90 | decode (stream chunks/s) |
+|---:|---:|---:|---:|
+| 0.5 (auto default) | 1.99 s | 9.2 s | 13.0 |
+| 0.7 | 2.08 s | 9.0 s | 15.3 |
+| 0.85 | 2.23 s | 12.2 s | 12.4 |
+
+Flat within run noise on TTFT; 0.85 saturates the host and loses. The p50-vs-p90 gap is
+the tell: a prompt's own mixed round costs ~2 s, and the p90 of ~9 s is *queueing* behind
+the other prompts' rounds on a single serial executor, during which the decode lanes stall
+as well. Moving bytes between PCIe and the host does not touch that. The auto formula stays.
+
