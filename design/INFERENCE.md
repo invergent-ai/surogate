@@ -1222,3 +1222,8 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   one lane a 24-layer stage round is 15-30 ms with the gather over the x8 link. The C3 chain
   now measures the 2-stage A/B at 8 users (2-lane groups), 8 stages at 16/64/1 users, and the
   27B and 35B at 100 users.
+- Second C3 stall (2026-08-29 02:00): 8 users admitted, all six remaining sat in "prefilling"
+  with the worker idle — the pipelined loop only launched a lone prefill for staged lanes
+  that passed `mixed_round_supported`, so when none did (no decode lanes yet), nothing was
+  ever launched. The single-round loop advances any staged prefill. Fix (e9bdc3b5): a lone
+  prefill takes the group's first staged lane; mixed support gates only the mixed round.
