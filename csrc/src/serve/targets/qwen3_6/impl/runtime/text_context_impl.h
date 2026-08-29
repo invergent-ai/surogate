@@ -8,6 +8,7 @@
 #include "core/nvtx.h"
 #include "targets/qwen3_6/impl/runtime/visual_scatter.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
+#include <array>
 #include <chrono>
 #include <api/targets/qwen3_6/vision_control.h>
 #include "api/ops/argmax.h"
@@ -941,16 +942,25 @@ struct PrefillFamilyTimer {
     double t_g_ctrl = 0, t_g_proj = 0, t_g_conv = 0, t_g_extract = 0, t_g_scan = 0, t_g_norm = 0,
            t_g_out = 0;
     std::uint64_t chunks = 0, tokens = 0;
-    PrefillFamilyTimer() {
-        if (!enabled) { return; }
+    int device = -1;
+    PrefillFamilyTimer() = default;
+    void ensure_events() {
+        if (!enabled || device >= 0) { return; }
+        cudaGetDevice(&device);
         for (cudaEvent_t* e : {&begin, &attn, &mlp_full, &gdn, &mlp_gdn, &g_ctrl, &g_proj, &g_conv,
                                &g_extract, &g_scan, &g_norm, &g_out, &sub_begin}) {
             cudaEventCreateWithFlags(e, cudaEventDefault);
         }
     }
 };
+// One timer per device: events belong to the device they were created on, and a pipeline
+// stage's context runs on its own device.
 inline PrefillFamilyTimer& prefill_family_timer() {
-    static PrefillFamilyTimer timer;
+    static std::array<PrefillFamilyTimer, 16> timers;
+    int device = 0;
+    cudaGetDevice(&device);
+    PrefillFamilyTimer& timer = timers[static_cast<std::size_t>(device) % timers.size()];
+    timer.ensure_events();
     return timer;
 }
 inline void print_gdn_subsplit(const PrefillFamilyTimer& timer, const char* tag) {
