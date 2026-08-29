@@ -169,6 +169,7 @@ card at every layer boundary and at the output.
 | 2 stages GPUs 3+4 (x8 + x16), per-socket pools: lockstep / pipelined | 8 | 128/512 | 75.9 / 70.0 | 3.2 s / 3.4 s |
 | 2 stages GPUs 2+3, split off, steady-state pipeline (C3), synchronous prompt steps | 8 | 128/512 | 53.7 | 15 s |
 | 2 stages GPUs 2+3, split off, C3 + prompts as asynchronous flights | 8 | 128/512 | **56.1** | 17 s |
+| same, post scratch-fix + **scan-resistant slot ring** (2026-08-29) | 8 | 128/512 | **115.3** (91.5 ring-off) | 36 s full-request p50 |
 | **8 stages, 3,072 slots (every expert resident), C3 + asynchronous prompt flights** | 1 / 16 | 512/128 | **57.9 / 383.9** | **237 ms / 615 ms** |
 | same, re-validated on the fixed binary with the Q4 host bank (battery 100/100) | 1 / 16 / 32 / 64 | 512/128 | 51.0 / 381.6 / 488.2 / 604.1 | — |
 | same, stages materialise only their own layers (64 lanes fit beside the pool) | 32 / 64 | 512/128 | **518.5 / 583.6** | 971 ms / 1.14 s |
@@ -218,6 +219,7 @@ concurrency, not before the load.
   but consumed per chunk; interleaved prompts ran each other's GDN state. Blends
   10/10 → 0 on the reproducing battery; the graphs-off crash config runs clean;
   multi-turn reuse verified exact. Details in INFERENCE.md.
-- **0.8B**: ~4-per-100,000 mixed-round corruption.
+- ~~0.8B ~4-per-100,000 mixed-round corruption~~ closed 2026-08-29: matched the
+  scratch-state bug's fingerprint; 1,440 probes clean post-fix.
 - Record the card with every number; re-measure single-user cells on the
   same card as the 100-user rows.

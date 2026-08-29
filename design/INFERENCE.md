@@ -1787,3 +1787,37 @@ stages share one ~90 GB Q4 bank (was ~152 GB W8). The 0.8B mixed-round-corruptio
 cannot be retested yet: no 0.8B artifact exists in `models/ninfer` — converting one is the
 prerequisite.
 
+### Burst-cap retest, 0.8B soak, scan-resistant slot replacement (2026-08-29 17:45)
+
+- **0.8B mixed-round corruption: closed.** A 0.8B artifact was converted (the upstream HF repo
+  ships no `generation_config.json`; the family file from the 4B/2B siblings — identical
+  hashes, same tokenizer and eos — completes it; the target loads resources unpinned). Soaked
+  at 32 users on the fixed binary: **1,440/1,440 probes correct, zero fatals**. The item's
+  fingerprint matched the scratch-state bug and does not reproduce after the fix.
+- **Burst cap 1 under saturation: no longer fatal, still degraded.** Pre-fix this config
+  crashed the worker loop; post-fix it runs (0 fatals) but scores 77/100 with
+  truncation-shaped garbage ('user', 'Three prime number:'). A non-default knob
+  (`SUROGATE_SERVE_BURST_CAP`), filed as open — and a lead: the default config's residual
+  ~5-10 % truncation/drift may be the same egress behaviour at its natural rate.
+- **Scan-resistant slot replacement shipped** (commit 4b27a9e2): the directory reserves one
+  expert-set of trailing slots as a scan ring; resolves for wide (prefill-shaped, >32-column)
+  rounds allocate misses round-robin from the ring, and the LRU clock owns only the remaining
+  slots — so a prompt's per-layer expert sweep cycles inside the ring instead of wiping the
+  decode working set. Ring size = `experts` exactly: misses are deduped per resolve, so one
+  scan can never wrap onto itself; active slots are skipped, and hits promote wherever they
+  live. Enabled automatically when the pool cannot hold every expert of its layers but holds
+  at least 1.5 expert-sets; `SUROGATE_SERVE_NO_SCAN_RING=1` bisects. Unit-tested (placement,
+  survival of the decode set across two full scans, ring recycling).
+
+**2-stage Flash-Next (GPUs 2+3, 3,000 slots, 8 users, 128/512, ignore_eos), the configuration
+the ring was built for:**
+
+| | decode tok/s | latency p50 |
+|---|---:|---:|
+| board row (pre scratch-fix, plain LRU) | 56.1 | (TTFT 17 s) |
+| fixed binary, ring off | 91.5 | 45.0 s |
+| fixed binary, **ring on (default)** | **115.3** | **36.1 s** |
+
+The scratch fix alone was +63 % here; the ring adds +26 % on top (2.05× vs the board row),
+battery 40/40. Fewer-than-8-stage deployments are now usable.
+
