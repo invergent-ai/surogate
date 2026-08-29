@@ -1320,4 +1320,6 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
 - Same configuration, 1 user: **57.9 tok/s, TTFT 237 ms** (one card with the CPU split: 22.4 /
   1.40 s). 64 users with a 16,384-token KV did not fit beside the 14.9 GiB pool (needs 7.7 GB,
   4.5 GB free) — rerun queued with the auto KV size, plus 32 users.
+- 27B dense on 8 stages, 100 users (asynchronous prefill flights): **1,057.5 tok/s, TTFT p50
+  834 ms, 796 ok / 0 errors, correct under load** (closed pipeline: 213).
 
