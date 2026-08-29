@@ -1302,4 +1302,11 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   the layer count. Decode rounds on the same stages take ~7 ms each. Next measurement: the
   asynchronous batch-0 mixed flights (C3v6 chain) — if a stage's mixed step is as slow the
   constant is in the chunk forward itself and gets decomposed with per-device timing.
+- Batch-0 mixed flights work (2026-08-29, commits ab89f445..9fd7d5cb): 2 stages (GPUs 2+3,
+  split off) at 8 users: **56.1 tok/s** (C3 with synchronous lone prefill 53.7; lockstep 44.5),
+  answers correct at load. TTFT p50 17.3 s — the prompt still costs ~0.8 s per 24-layer stage
+  even for a 15-token prompt (CLI trace: mixed flight 810 ms on stage 0, 740 ms on stage 1),
+  so a stage's prefill step is dominated by something that scales with the graph bucket, not
+  the prompt. Per-device prefill timing (the family timer was a process-wide static with
+  events on device 0) is being built in `csrc/build-serve-b` to decompose it.
 
