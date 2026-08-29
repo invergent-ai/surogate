@@ -114,7 +114,21 @@ DecodeGraphExecutable& install_graph_profile(DecodeGraphFamily& family, DecodeGr
     DecodeGraphTopology& topology   = select_graph_topology(family, profile.topology_class, label);
     const std::size_t profile_index = static_cast<std::size_t>(&profile - family.profiles.data());
     if (topology.installed_profile != profile_index) {
-        topology.executable.update(profile.definition);
+        // A profile switch rebuilds the executable from its definition. Patching the shared
+        // executable in place (cudaGraphExecUpdate) was the residual corruption of
+        // 2026-08-29: under rapid batch recomposition (a saturated 16-lane box with the burst
+        // capped at 1) the in-place update misapplied parameters and 23 % of answers came out
+        // truncated or with a wrong token; rebuilding on every switch scored 99/100 on the
+        // same battery, at no measurable throughput cost (profile switches are rare against
+        // the rounds between them). SUROGATE_SERVE_GRAPH_UPDATE_INPLACE=1 restores the old
+        // path for bisection.
+        static const bool update_in_place =
+            std::getenv("SUROGATE_SERVE_GRAPH_UPDATE_INPLACE") != nullptr;
+        if (update_in_place) {
+            topology.executable.update(profile.definition);
+        } else {
+            topology.executable.instantiate(profile.definition);
+        }
         topology.installed_profile = profile_index;
     }
     return topology.executable;
