@@ -22,7 +22,7 @@ def worker():
             tag = serial[0]
         prompt = f"request {tag}: " + "word " * ptok
         body = json.dumps({"model": model, "messages": [{"role": "user", "content": prompt}],
-                           "max_tokens": mtok, "temperature": 0}).encode()
+                           "max_tokens": mtok, "temperature": 0, "ignore_eos": True}).encode()
         req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions", body,
                                      {"Content-Type": "application/json"})
         t0 = time.time()
