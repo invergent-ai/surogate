@@ -1309,4 +1309,12 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   so a stage's prefill step is dominated by something that scales with the graph bucket, not
   the prompt. Per-device prefill timing (the family timer was a process-wide static with
   events on device 0) is being built in `csrc/build-serve-b` to decompose it.
+- **8 stages, fully resident, asynchronous prefill (2026-08-29 04:10)**: Flash-Next on 8×5090,
+  3,072 slots per stage (every expert of the stage resident, CPU split off), batch-0 mixed
+  flights for the staged prompts: **383.9 tok/s decode at 16 users, TTFT p50 615 ms,
+  1,549 prompt tok/s, 278 requests ok / 0 errors in 90 s, answers correct under load** — the
+  synchronous lone step gave 3.8 tok/s on the same configuration; one card serves 32.2 at 16
+  users. The 2-stage prompt cost (0.8 s per 24-layer stage) is the expert gather over the x8
+  link of GPUs 2/3 (~150 paths × 24 layers × 5 MB ≈ 18 GB at 26 GB/s), which full residency
+  removes at 8 stages.
 
