@@ -44,11 +44,19 @@ struct MoePlan {
     artifact::ObjectHandle shared_down;
 };
 
+struct IndexerPlan {
+    artifact::ObjectHandle query;      // [indexer_heads * indexer_head_dim, hidden]
+    artifact::ObjectHandle key;        // [indexer_head_dim, hidden]
+    artifact::ObjectHandle query_norm; // [indexer_head_dim]
+    artifact::ObjectHandle key_norm;
+};
+
 struct FullAttentionPlan {
     artifact::ObjectHandle query_key_gate_value;
     artifact::ObjectHandle query_norm;
     artifact::ObjectHandle key_norm;
     artifact::ObjectHandle output;
+    IndexerPlan indexer{};
 };
 
 struct GdnPlan {
@@ -114,9 +122,20 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeature
 
 /// Per-block hyper-connection weights ride on the projection payloads the family hands to the
 /// Variant at the norm hooks, so the Variant can mix before its projection.
+/// QSA indexer of one full-attention layer (design/INFERENCE.md, phase 4). Empty tensors mean
+/// the layer has no indexer (or it is not materialised on this pipeline stage).
+struct IndexerWeights {
+    Weight query;      // BF16 [indexer_heads * indexer_head_dim, hidden]
+    Weight key;        // BF16 [indexer_head_dim, hidden]
+    Tensor query_norm; // BF16 [indexer_head_dim]
+    Tensor key_norm;
+    [[nodiscard]] bool valid() const noexcept { return query.qdata != nullptr; }
+};
+
 struct AttentionProjectionPayload {
     Weight query_key_gate_value;
     ops::HyperConnectionWeights mix;
+    IndexerWeights indexer;
 };
 
 struct GdnProjectionPayload {

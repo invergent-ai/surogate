@@ -196,21 +196,21 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeature
                                              {kHidden, TextConfig::query_size});
             // The QSA indexer arrives with the artifact; dense attention serves the exact
             // context range for now, so its weights are validated but not resident.
-            const auto validate = [&](std::string_view name, NumericFormat format,
-                                      std::initializer_list<std::uint64_t> shape) {
-                (void)artifact::bind_tensor(binder, name, format, shape,
-                                            TensorPlacement::ValidateOnly);
-            };
-            validate(prefix + "attention/indexer/query", NumericFormat::BF16,
-                     {static_cast<std::uint64_t>(TextConfig::indexer_heads) *
-                          TextConfig::indexer_head_dim,
-                      kHidden});
-            validate(prefix + "attention/indexer/key", NumericFormat::BF16,
-                     {TextConfig::indexer_head_dim, kHidden});
-            validate(prefix + "attention/indexer/query_norm", NumericFormat::BF16,
-                     {TextConfig::indexer_head_dim});
-            validate(prefix + "attention/indexer/key_norm", NumericFormat::BF16,
-                     {TextConfig::indexer_head_dim});
+            // QSA indexer (design/INFERENCE.md, phase 4): resident on the layers this
+            // program runs; the selection only engages past `dense_exact_context`.
+            target.attention.indexer.query =
+                device(binder, prefix + "attention/indexer/query", NumericFormat::BF16,
+                       {static_cast<std::uint64_t>(TextConfig::indexer_heads) *
+                            TextConfig::indexer_head_dim,
+                        kHidden});
+            target.attention.indexer.key = device(binder, prefix + "attention/indexer/key",
+                                        NumericFormat::BF16, {TextConfig::indexer_head_dim, kHidden});
+            target.attention.indexer.query_norm =
+                device(binder, prefix + "attention/indexer/query_norm", NumericFormat::BF16,
+                       {TextConfig::indexer_head_dim});
+            target.attention.indexer.key_norm =
+                device(binder, prefix + "attention/indexer/key_norm", NumericFormat::BF16,
+                       {TextConfig::indexer_head_dim});
         } else {
             target.gdn.a_log   = device(binder, prefix + "gdn/a_log", NumericFormat::FP32,
                                         {TextConfig::gdn_value_heads});
@@ -319,6 +319,19 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
                 backing, source.attention.query_norm, NumericFormat::BF16, {TextConfig::head_dim});
             target.key_norm = artifact::materialized_tensor(
                 backing, source.attention.key_norm, NumericFormat::BF16, {TextConfig::head_dim});
+            target.projection.indexer.query = artifact::materialized_weight(
+                backing, source.attention.indexer.query, NumericFormat::BF16,
+                static_cast<std::int32_t>(TextConfig::indexer_heads) * TextConfig::indexer_head_dim,
+                static_cast<std::int32_t>(kHidden));
+            target.projection.indexer.key = artifact::materialized_weight(
+                backing, source.attention.indexer.key, NumericFormat::BF16,
+                TextConfig::indexer_head_dim, static_cast<std::int32_t>(kHidden));
+            target.projection.indexer.query_norm =
+                artifact::materialized_tensor(backing, source.attention.indexer.query_norm,
+                                              NumericFormat::BF16, {TextConfig::indexer_head_dim});
+            target.projection.indexer.key_norm =
+                artifact::materialized_tensor(backing, source.attention.indexer.key_norm,
+                                              NumericFormat::BF16, {TextConfig::indexer_head_dim});
             target.output = artifact::materialized_weight(
                 backing, source.attention.output, NumericFormat::W8G32_F16S,
                 static_cast<std::int32_t>(kHidden), TextConfig::query_size);
