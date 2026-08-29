@@ -263,7 +263,7 @@ int main(int argc, char** argv) {
         engine_options.max_context    = cli.max_context;
         engine_options.kv_capacity    = cli.kv_capacity;
         engine_options.expert_slots   = cli.expert_slots;
-        engine_options.host_expert_bank_q4 = cli.host_expert_bank_q4;
+        engine_options.host_expert_bank    = cli.host_expert_bank;
         engine_options.cpu_moe_share  = cli.cpu_moe_share;
         engine_options.cpu_moe_min_tokens = cli.cpu_moe_min_tokens;
         engine_options.cpu_moe_prefill_share = cli.cpu_moe_prefill_share;

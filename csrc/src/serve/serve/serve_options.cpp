@@ -205,9 +205,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--host-expert-bank") {
             const std::string text = require_value("--host-expert-bank");
             if (text == "q4") {
-                options.host_expert_bank_q4 = true;
-            } else if (text != "w8") {
-                throw std::invalid_argument("--host-expert-bank must be w8 or q4");
+                options.host_expert_bank = EngineOptions::HostExpertBank::Q4;
+            } else if (text == "w8") {
+                options.host_expert_bank = EngineOptions::HostExpertBank::W8;
+            } else if (text != "auto") {
+                throw std::invalid_argument("--host-expert-bank must be w8, q4 or auto");
             }
         } else if (arg == "--expert-slots") {
             options.expert_slots =
