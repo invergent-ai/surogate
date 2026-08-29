@@ -170,7 +170,7 @@ card at every layer boundary and at the output.
 | 2 stages GPUs 2+3, split off, steady-state pipeline (C3), synchronous prompt steps | 8 | 128/512 | 53.7 | 15 s |
 | 2 stages GPUs 2+3, split off, C3 + prompts as asynchronous flights | 8 | 128/512 | **56.1** | 17 s |
 | **8 stages, 3,072 slots (every expert resident), C3 + asynchronous prompt flights** | 1 / 16 | 512/128 | **57.9 / 383.9** | **237 ms / 615 ms** |
-| same, stages materialise only their own layers (64 lanes fit beside the pool) | 32 / 64 | 512/128 | **518.5 / 604.8** | 971 ms / 1.24 s |
+| same, stages materialise only their own layers (64 lanes fit beside the pool) | 32 / 64 | 512/128 | **518.5 / 583.6** | 971 ms / 1.14 s |
 | 8 stages, 2,816 slots (92 %, split off) / 2,100 slots (68 %, split on) | 32 / 64 | 512/128 | 504 / 387.8 | 1.0 s / 2.1 s |
 | Qwen3.8-27B (all-NVFP4), 8 stages, closed pipeline | 1 / 100 | 512/128 | 19.6 / 213 | 0.43 s / 0.75 s |
 | **Qwen3.8-27B**, 8 stages, C3 + asynchronous prompt flights | 100 | 512/128 | **1,057** | 834 ms |
@@ -191,6 +191,15 @@ turning a staged prompt's chunk into a batch-0 mixed round removed it. The 27B a
 are what a model that already fits one card gets from a pipeline: capacity, not throughput
 per card — with ~12 lanes per group the per-round fixed cost of a stage does not shrink with
 its layer count.
+
+### Correctness note (2026-08-29)
+
+Two pipeline bugs found and fixed while probing at 64 users, both invisible on one card:
+a prompt's first sampled token was a span into the last stage's egress buffer that the next
+round could overwrite before the executor read it, and a mixed round's prompt-chunk size
+depended on whether that stage could replay a CUDA graph, so stages consumed different numbers
+of prompt tokens. The rows above are from the fixed binary; probe every board row **at** its
+concurrency, not before the load.
 
 ## Open items
 

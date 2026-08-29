@@ -1475,4 +1475,13 @@ kernel mask, (5) raise `kNativeContext` and verify against llama.cpp at 8k and 3
   flight-owned storage and re-points the span, in both the steady-state and the lockstep path.
   Signature match: only the first token of an answer, only in the pipeline, worse with more
   prompts in flight, and the wrong token is whatever another lane sampled.
+- **Fix validated (2026-08-29 06:45)**: 8 stages, three points (64 users at 3,072 and 2,100
+  slots, 16 users at 3,072), six probe rounds each — **all 18 "capital of France" probes answer
+  'Paris'** where the pre-fix binary produced 'Based' and 'The', and no probe carries another
+  lane's text. Throughput is unchanged: 583.6 tok/s at 64 users / 3,072 slots (604.8 pre-fix,
+  same run-to-run band), 493.7 at 2,100 slots, 383.1 at 16 users. What remains is two of 36
+  probes answering "Name three prime numbers." with a different math-problem continuation after
+  a correct first word — the engine is not batch-invariant (BF16 reduction order depends on the
+  batch), so a near-tie at that fork can flip under load. Not the same failure: the pre-fix
+  corruption replaced the first token with an unrelated one.
 
