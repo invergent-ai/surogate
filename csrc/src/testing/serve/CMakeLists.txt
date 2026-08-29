@@ -197,6 +197,7 @@ set(ninfer_op_tests
   rmsnorm
   gated_rmsnorm
   expert_slot_cache
+  qsa_indexer
   cpu_expert_compute
   l2norm
   gated_delta_net

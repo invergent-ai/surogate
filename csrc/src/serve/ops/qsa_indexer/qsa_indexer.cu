@@ -26,8 +26,14 @@ __device__ __forceinline__ std::int64_t indexer_offset(const std::int32_t* block
     return paged_kv_element_offset<kHeadDim, 1>(block_table, 0, position, 0);
 }
 
-__device__ __forceinline__ float rope_angle(float position, int pair, int rotary_dim, float theta) {
-    return position * __powf(theta, -2.0F * static_cast<float>(pair) / static_cast<float>(rotary_dim));
+// Same arithmetic as the engine's rope kernel (ops/kernel/rope.cuh): an accurate `powf` for the
+// frequency and `sincosf` for the rotation — the fast intrinsics lose the low-frequency pairs,
+// whose angle grows with the position.
+__device__ __forceinline__ void rope_sincos(float position, int pair, int rotary_dim, float theta,
+                                            float* sine, float* cosine) {
+    const float frequency =
+        powf(theta, -2.0F * static_cast<float>(pair) / static_cast<float>(rotary_dim));
+    sincosf(position * frequency, sine, cosine);
 }
 
 // One warp per new column: writes the token's raw key and, when the column completes a block,
@@ -103,7 +109,7 @@ __global__ void qsa_append_kernel(const __nv_bfloat16* __restrict__ keys,
         if (d >= rotary_dim) { continue; }
         const int pair = d < half ? d : d - half;
         float sin_a, cos_a;
-        __sincosf(rope_angle(static_cast<float>(first), pair, rotary_dim, theta), &sin_a, &cos_a);
+        rope_sincos(static_cast<float>(first), pair, rotary_dim, theta, &sin_a, &cos_a);
         value[i] = d < half ? value[i] * cos_a - partner[i] * sin_a
                             : value[i] * cos_a + partner[i] * sin_a;
     }
