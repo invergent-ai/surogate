@@ -1485,3 +1485,43 @@ kernel mask, (5) raise `kNativeContext` and verify against llama.cpp at 8k and 3
   batch), so a near-tie at that fork can flip under load. Not the same failure: the pre-fix
   corruption replaced the first token with an unrelated one.
 
+### Indexer: what is built and what is left (2026-08-29 06:50)
+
+Built and verified:
+
+- the weights materialise on all 12 full-attention layers (`50ef757f`);
+- the text KV pool carries one BF16 indexer plane per full-attention layer, sharing pages,
+  block tables and prefix reuse (`7939a021`);
+- `ops::qsa_indexer_append` / `qsa_indexer_select` with a unit test against a scalar reference
+  on a shuffled paged cache — block keys within a BF16 ulp, the selection exact against a
+  sorted reference at two budgets (`6ec9bb76`, `2334e4a0`);
+- the bf16 decode and prefill attention kernels take an optional `GqaBlockMask`, threaded
+  through the wrapper and both launchers; a quantized KV cache refuses a selection. `Sparse`
+  defaults to false, so the dense instantiation is the code that was there (`4fc7536f`);
+- `TextContext::text_indexer_selection`, the per-layer forward: indexer key and query
+  projections off the attention input, the raw-key append (which folds completed blocks), the
+  query norm and rope, the selection, and the mask (`0acabdca`). `ops::rope` now accepts the
+  1-D D128 head with a partial rotation, which is what the indexer's queries need.
+
+Left, in order:
+
+1. **Call the helper at the three text attention sites** (`text_prefill` ~line 924,
+   `mixed_chunk_multi` ~1528, `mixed_graph_window` ~1932) and pass the mask to
+   `ops::gqa_attention`. The append must run for *every* column at every site or the plane
+   develops holes, so this lands as one change, not per site.
+2. **Per-column block-table rows.** The append and the selection index the cache per column;
+   a mixed round's columns belong to several sequences (prefill segments plus decode rows), so
+   the round needs an I32 [columns] table-row tensor. The prologue already builds per-column
+   tables (`prologue_.slots`) — the same shape.
+3. **Workspace plan.** The mask is `ceil(ceil(keys/4)/32)` words per column (1 KB per column at
+   32k) plus the selection's score scratch; both come out of the round workspace, so the
+   recipe and the planned capacity have to include them.
+4. **CUDA graphs.** The mask width depends on the history length, which the captured body
+   would bake in. Simplest first landing: refuse the mixed/prefill graph when a selection is
+   active (`try_mixed_graph_chunk` returns false), and revisit once the shape ladder is known.
+5. **Raise `kNativeContext`** from `dense_exact_context` and validate against llama.cpp at 4k
+   and 32k — the engine's answers, and the selected block sets, against `build_qsa_top_k`.
+
+Nothing above 2,051 tokens is admitted until step 5, so every piece landed so far is inert:
+the selection cannot engage, and the dense path is byte-for-byte what it was.
+
