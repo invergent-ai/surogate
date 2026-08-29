@@ -1893,3 +1893,22 @@ the tell: a prompt's own mixed round costs ~2 s, and the p90 of ~9 s is *queuein
 the other prompts' rounds on a single serial executor, during which the decode lanes stall
 as well. Moving bytes between PCIe and the host does not touch that. The auto formula stays.
 
+### Chunked prefill under load is broken (2026-08-29 20:15, open, diagnosis in progress)
+
+Found while testing the prefill-chunk lever on one card (16 users, 524-token prompts): when
+the prompt is longer than `--max-num-batched-tokens`, so it prefills in more than one chunk
+through mixed rounds, the worker loop dies within minutes:
+
+- window 512 (chunks 512 + 12): "invalid UTF-8 continuation byte" garbage egress in a decode
+  lane right after a graphed mixed round of the 12-token tail (bucket 128);
+- window 256 (chunks 242 + 242 + 40): `gqa_attention: this head geometry serves at most 64
+  query rows per lane step` thrown inside an eager mixed round.
+
+The default 2,048-token window never chunks a 524-token prompt, which is why every battery
+today was clean — but any prompt longer than the window under concurrent load takes this
+path (the needle runs at 3.5-5.7k tokens were clean only because a single user prefills
+through the *lone* path). Severity high for long-prompt serving at load. Two arms running:
+the 512 window with `SUROGATE_SERVE_NO_MIXED_GRAPH=1` splits the graphed tail from the shared
+bookkeeping; the 256 window with the geometry message extended (width, group, batch) names
+the call that trips the 64-row limit.
+
