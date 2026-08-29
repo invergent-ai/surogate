@@ -172,6 +172,7 @@ card at every layer boundary and at the output.
 | same, post scratch-fix + **scan-resistant slot ring** (2026-08-29) | 8 | 128/512 | **115.3** (91.5 ring-off) | 36 s full-request p50 |
 | **8 stages, 3,072 slots (every expert resident), C3 + asynchronous prompt flights** | 1 / 16 | 512/128 | **57.9 / 383.9** | **237 ms / 615 ms** |
 | same, re-validated on the fixed binary with the Q4 host bank (battery 100/100) | 1 / 16 / 32 / 64 | 512/128 | 51.0 / 381.6 / 488.2 / 604.1 | — |
+| single card, default config, after the CUDA-graph switch fix (564b673b): battery 99/100, 0 fatals (was 90-97) | 16 | — | — | — |
 | same, stages materialise only their own layers (64 lanes fit beside the pool) | 32 / 64 | 512/128 | **518.5 / 583.6** | 971 ms / 1.14 s |
 | 8 stages, 2,816 slots (92 %, split off) / 2,100 slots (68 %, split on) | 32 / 64 | 512/128 | 504 / 387.8 | 1.0 s / 2.1 s |
 | Qwen3.8-27B (all-NVFP4), 8 stages, closed pipeline | 1 / 100 | 512/128 | 19.6 / 213 | 0.43 s / 0.75 s |

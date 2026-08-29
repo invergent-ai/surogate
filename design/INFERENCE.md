@@ -1852,4 +1852,8 @@ be **uploaded on the launch stream** before its first launch, exactly as the fam
 initialisation does — the default burst-8 path switches the *chained* executable too, and
 launching one un-uploaded produced garbage egress on the first round after the switch (19
 worker fatals in a battery). The existing refusal fallback had the same gap.
+- Validation of the graph-switch fix on the default single-card configuration (16 lanes, burst
+  8, CPU split auto, Q4 bank): **99/100, zero fatals** — this battery had scored 90 / 93 / 95 /
+  97 across the day's runs before it. The refusal fallback inside `update()` now returns
+  whether it re-instantiated so the caller uploads in that case too (commit above).
 
