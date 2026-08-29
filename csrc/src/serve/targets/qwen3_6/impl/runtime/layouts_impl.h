@@ -4,6 +4,7 @@
 #include "ops/linear/marlin/marlin_plane.h"
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
+#include "api/ops/qsa_indexer.h"
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
 
 #include "core/device.h"
@@ -29,8 +30,44 @@
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 namespace {
 
+[[nodiscard]] constexpr std::size_t round_up_256(std::size_t bytes) noexcept {
+    return (bytes + 255U) & ~static_cast<std::size_t>(255U);
+}
+
 // QSA indexer width of the target (design/INFERENCE.md, phase 4), or 0 when the model has no
 // indexer: the KV cache then carries one extra BF16 plane per full-attention layer.
+// Transient bytes one full-attention layer's QSA indexer needs for `tokens` columns over a
+// history of `keys` cells; zero for a target without an indexer.
+template <class V>
+[[nodiscard]] std::size_t variant_indexer_workspace_bytes(std::int32_t tokens,
+                                                          std::int32_t keys) noexcept {
+    if constexpr (!requires { V::indexer_head_dim; }) {
+        (void)tokens;
+        (void)keys;
+        return 0;
+    } else {
+        const auto columns = static_cast<std::size_t>(std::max(tokens, 1));
+        const auto width   = static_cast<std::size_t>(V::indexer_head_dim);
+        const auto heads   = static_cast<std::size_t>(V::indexer_heads);
+        const std::size_t raw_keys  = round_up_256(columns * width * sizeof(std::uint16_t));
+        const std::size_t queries   = round_up_256(columns * width * heads * sizeof(std::uint16_t));
+        const ops::QsaIndexerGeometry geometry{.head_dim   = V::indexer_head_dim,
+                                               .heads      = V::indexer_heads,
+                                               .block      = V::indexer_block,
+                                               .top_k      = V::indexer_top_k,
+                                               .rotary_dim = 0,
+                                               .rope_theta = 0.0F,
+                                               .rms_eps    = 0.0F};
+        const std::size_t mask = round_up_256(
+            static_cast<std::size_t>(ops::qsa_block_mask_words(keys, V::indexer_block)) * columns *
+            sizeof(std::int32_t));
+        const std::size_t scores =
+            ops::qsa_indexer_select_workspace_capacity_bytes(static_cast<std::int32_t>(columns),
+                                                             keys, geometry);
+        return raw_keys + 2 * queries + mask + scores;
+    }
+}
+
 template <class V>
 [[nodiscard]] constexpr std::int32_t variant_indexer_head_dim() noexcept {
     if constexpr (requires { V::indexer_head_dim; }) {
@@ -289,6 +326,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         scratch(layout, ops::detail::marlin_fused_parent_bytes(
                             TextConfig::query_size * 2 + TextConfig::kv_size * 2, last));
         (void)workspace_recipe::text_attention_results<TextConfig>(layout, last);
+        // QSA indexer (design/INFERENCE.md, phase 4): raw keys, queries and their norm, the
+        // per-column block mask and the selection's score scratch. Reserved whenever the target
+        // has an indexer — the selection engages only past its budget, but the append runs for
+        // every column of every round, and a short workspace would be a hard failure.
+        scratch(layout, variant_indexer_workspace_bytes<Variant>(
+                            last, static_cast<std::int32_t>(envelope.max_visible_keys)));
         scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
                             TextConfig::query_heads, plan.kv_dtype, envelope, batch_size, min_width,
                             max_width));

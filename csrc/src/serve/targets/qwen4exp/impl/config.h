@@ -147,8 +147,10 @@ inline constexpr float kGdnScale                         = 0.08838834764831845F;
 inline constexpr std::uint32_t kPrefillChunkAlignment    = 128;
 inline constexpr std::uint32_t kMaximumMtpDraftTokens    = 5;
 inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 15;
-// Dense attention is exact only below the indexer's budget; longer contexts wait for the
-// QSA indexer.
-inline constexpr std::uint32_t kNativeContext            = TextConfig::dense_exact_context;
+// The QSA indexer (design/INFERENCE.md, phase 4) serves the model's trained context: below
+// `TextConfig::dense_exact_context` it selects every cell and attention is dense and exact,
+// above it the selection restricts each query to its highest-scoring blocks. The GGUF declares
+// `qwen4exp.context_length = 262144`.
+inline constexpr std::uint32_t kNativeContext            = 262144;
 
 } // namespace ninfer::targets::qwen4exp::detail

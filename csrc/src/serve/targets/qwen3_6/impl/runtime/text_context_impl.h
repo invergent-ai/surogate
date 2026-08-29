@@ -1331,7 +1331,10 @@ ops::GqaBlockMask TextContext::text_indexer_selection(const FullLayerW& w, const
         const auto& payload =
             static_cast<const typename V::FullAttentionProjectionWeights&>(*w.projection);
         const auto& indexer = payload.indexer;
-        if (!indexer.valid() || cache.indexer_pages.data == nullptr || tokens <= 0) {
+        // SUROGATE_SERVE_NO_QSA_INDEXER=1 turns the whole indexer off — no keys cached, no
+        // selection, dense attention over the history: the bisection control.
+        static const bool disabled = std::getenv("SUROGATE_SERVE_NO_QSA_INDEXER") != nullptr;
+        if (disabled || !indexer.valid() || cache.indexer_pages.data == nullptr || tokens <= 0) {
             return ops::GqaBlockMask{};
         }
         cudaStream_t s = ctx_.stream;
