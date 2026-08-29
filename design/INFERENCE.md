@@ -1216,3 +1216,9 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
 - Pipelined-loop hardening (2026-08-29, 7eca72fe+): a lane whose group is mid-pipeline is not
   aborted under its in-flight round; the cancellation snapshot masks in-flight lanes and is
   retaken every iteration, so the cancel lands at the group's boundary.
+- **C3 runs** (2026-08-29 01:50): the 2-stage CLI check generates correctly ('Paris', exit 0)
+  and its trace shows the steady state — a group's next round launches on stage 0 in the same
+  millisecond its previous round finished on the last stage, with no drain in between; at
+  one lane a 24-layer stage round is 15-30 ms with the gather over the x8 link. The C3 chain
+  now measures the 2-stage A/B at 8 users (2-lane groups), 8 stages at 16/64/1 users, and the
+  27B and 35B at 100 users.
