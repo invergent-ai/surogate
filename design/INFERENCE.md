@@ -1554,3 +1554,43 @@ engine's own answer instability. Only the rate over a dozen prompts settled it.
   a free-RAM floor and interleaved NUMA. `vm.min_free_kbytes` also raised to 4 GB at runtime.
   The scratchpad does not survive a reboot: the probe and chain scripts were lost twice.
 
+### Max context resolves from device memory (2026-08-29, commit 1c76e237)
+
+`--max-model-len` / `--max-context` accept `auto` and **default to it**; `max_context == 0` in
+`EngineOptions` is the same request (the struct default stays 2048 for programmatic callers).
+The per-request ceiling sizes the KV floor — one sequence at full length must fit — and the
+block tables; the pool itself is then grown by `resolve_kv_capacity`, so the two now move
+together instead of the operator having to guess a pair. `Package::maximum_context()` reports
+what the weights were trained for and the resolution never exceeds it.
+
+How it resolves: the byte stride per KV page does not depend on the ceiling, so one probe plan
+at 2,048 tokens gives the slope; the affordable page count follows from the free memory after
+weights, minus the KV headroom; the candidate is then verified by planning at it (the ceiling
+also moves the workspace and graph reservations a little) and halved until it fits. Decode
+graph bands are a fixed set of four edges, so a large ceiling does not multiply captures.
+An explicit `--kv-capacity N` still pins the pool, and the ceiling becomes that pool.
+
+Measured on one 5090 (32 GB) with the all-NVFP4 27B (16.5 GB of weights): CLI **131,072
+tokens**, server at `--max-num-seqs 16` **262,144** (the native ceiling), both serving correct
+answers; `--max-context 4096` still gives exactly 4,096. Before this the default was 2,048
+whatever the card held.
+
+### Fourth crash: not memory (2026-08-29 09:31)
+
+The box died again with **no OOM, no machine check, no Xid and no kernel message at all** — the
+journal simply stops. The only OOM in that boot was my own deliberate cgroup test
+(`CONSTRAINT_MEMCG`, process killed, machine unharmed), which is the guard working. So the
+memory guard is sound and this class of crash is something else.
+
+What the evidence says: `surogate-guarded-84685.scope` started 09:29:53 and never logged the
+`Consumed ... CPU time` line its two predecessors did, so the machine died inside that run —
+about two minutes in, which is where these Flash-Next CLI runs finish generating and tear down.
+Three of the four crashes fit "a Flash-Next process holding ~150 GB of pinned host memory is
+alive, and is loading or tearing down". Nothing in the 8-GPU pipeline benchmarks (VRAM-only,
+hours of load on all eight cards) has ever done this. The suspect is therefore the giant pinned
+host allocation — its release, or the CUDA context teardown that unmaps it — not compute load
+and not the memory ceiling. This needs a hardware/driver-side check (PSU rails under the
+combined AVX-512 + GPU draw, and the NVIDIA driver's handling of a 150 GB pinned unmap); it is
+not something the engine can prove from inside. Until then: **do not run Flash-Next unattended**
+— the VRAM-only targets (27B, 35B, 4B) have never triggered it and are the safe vehicle.
+
