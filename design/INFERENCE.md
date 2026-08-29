@@ -1250,3 +1250,7 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   rounds, so a prompt's chunk is an asynchronous flight through the stages like any decode
   group instead of a synchronous stage-by-stage step on the executor thread. The
   synchronous lone-prefill flight remains only for prompts the mixed path cannot advance.
+- Lone-prefill A/B (a) (2026-08-29 02:53, 8 stages, 16 users): with `--cpu-moe-prefill-share 0`
+  the lone step is still 1.8 s median (88 steps) while decode stage rounds take 6.2 ms — the
+  host prefill split is not the cause. (b) split off, then the built-in prefill timer
+  (`SUROGATE_SERVE_PREFILL_TIMING`) follow; C3v5 (zero-lane mixed rounds) is queued behind them.
