@@ -263,6 +263,7 @@ public:
     [[nodiscard]] const void* stage_export_buffer() const noexcept { return stage_export.data; }
     [[nodiscard]] void* stage_import_buffer() const noexcept { return stage_import.data; }
     [[nodiscard]] std::size_t stage_boundary_bytes() const noexcept { return stage_boundary_bytes_; }
+    [[nodiscard]] std::int32_t stage_boundary_columns() const noexcept { return stage.columns; }
     /// True for a program that runs only part of the model (a pipeline stage).
     [[nodiscard]] bool pipeline_stage() const noexcept {
         return stage.first > 0 || (stage.last >= 0 && stage.last < static_cast<int>(TextConfig::layers));

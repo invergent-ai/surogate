@@ -267,6 +267,11 @@ std::size_t Program<Variant>::stage_boundary_bytes() const noexcept {
 }
 
 template <>
+std::int32_t Program<Variant>::stage_boundary_columns() const noexcept {
+    return impl_->stage_boundary_columns();
+}
+
+template <>
 runtime::RoundHandle Program<Variant>::launch_decode_round(std::span<const std::uint32_t> lanes,
                                                            std::span<const runtime::RoundBudget> budgets) {
     return impl_->launch_decode_round(lanes, budgets);

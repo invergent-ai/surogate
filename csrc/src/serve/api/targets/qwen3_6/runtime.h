@@ -195,6 +195,7 @@ public:
     [[nodiscard]] void* stage_import_buffer() const noexcept;
     /// Bytes of the boundary buffers ([residual, boundary columns] BF16); 0 for a whole model.
     [[nodiscard]] std::size_t stage_boundary_bytes() const noexcept;
+    [[nodiscard]] std::int32_t stage_boundary_columns() const noexcept;
     /// Pipeline driver: overwrite the placeholder tokens a head-less stage recorded this round.
     void replace_pending_tokens(std::span<const std::uint32_t> lanes, std::span<const TokenId> tokens);
     /// Pipeline driver: the decode round in two halves — enqueue without synchronising, then

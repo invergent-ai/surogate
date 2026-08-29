@@ -89,6 +89,10 @@ public:
             if (parsed >= 1 && parsed <= 64) { groups_ = static_cast<std::uint32_t>(parsed); }
         }
         boundary_bytes_ = stages_.front()->program->stage_boundary_bytes();
+        {
+            const std::int32_t columns = stages_.front()->program->stage_boundary_columns();
+            column_bytes_ = columns > 0 ? boundary_bytes_ / static_cast<std::size_t>(columns) : boundary_bytes_;
+        }
         trace_ = std::getenv("SUROGATE_SERVE_PIPELINE_TRACE") != nullptr;
         // A group narrower than this is not worth a round of its own (every round pays the
         // fixed costs on every stage): the group count follows the round's width.
@@ -354,6 +358,7 @@ private:
         std::vector<TokenId> tokens;
         std::vector<std::int32_t> counts;
         std::vector<std::byte> park;
+        std::size_t carry_bytes = 0; // bytes of residual this flight carries across a boundary
         GroupResult result{};
     };
     std::vector<Flight> flights_;
@@ -373,6 +378,10 @@ private:
         f.prefill_lanes.assign(prefill_lanes.begin(), prefill_lanes.end());
         f.prefill_lane = prefill_lane;
         f.result       = GroupResult{};
+        // A decode round's residual is exactly one column per lane; mixed and prefill rounds
+        // carry the full boundary (their graphs pad to buckets).
+        f.carry_bytes = kind == FlightKind::Decode ? std::min(boundary_bytes_, column_bytes_ * lanes.size())
+                                                   : boundary_bytes_;
         advance_parked(pending_finished_);
     }
     std::vector<std::uint32_t> pending_finished_;
@@ -398,7 +407,7 @@ private:
         trace("finished-stage", s, g);
         if (s + 1 < stages_.size()) {
             f.park.resize(boundary_bytes_);
-            std::memcpy(f.park.data(), stages_[s]->program->stage_export_buffer(), boundary_bytes_);
+            std::memcpy(f.park.data(), stages_[s]->program->stage_export_buffer(), f.carry_bytes);
             f.between = true;
             f.stage   = s + 1;
             return;
@@ -436,7 +445,7 @@ private:
             const std::size_t s = f.stage;
             select(s);
             if (s > 0) {
-                std::memcpy(stages_[s]->program->stage_import_buffer(), f.park.data(), boundary_bytes_);
+                std::memcpy(stages_[s]->program->stage_import_buffer(), f.park.data(), f.carry_bytes);
             }
             f.between        = false;
             f.stage_sequence = ++stage_sequence_counter_;
@@ -598,6 +607,7 @@ private:
     std::uint32_t groups_      = 1;
     std::uint32_t min_lanes_per_group_ = 4;
     std::size_t boundary_bytes_ = 0;
+    std::size_t column_bytes_   = 0;
     std::vector<std::vector<std::vector<std::byte>>> slots_; // [boundary][group]
     std::vector<TokenId> assembled_tokens_;
     std::vector<std::int32_t> assembled_counts_;
