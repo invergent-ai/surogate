@@ -198,6 +198,7 @@ public:
                                                            const Tensor& cache_positions,
                                                            const Tensor& rope_positions,
                                                            const Tensor& table_rows,
+                                                           std::int32_t columns_per_row,
                                                            std::int32_t keys,
                                                            PagedKVBatchLayerView cache);
     [[nodiscard]] bool stage_embeds() const noexcept { return stage_first_ == 0; }

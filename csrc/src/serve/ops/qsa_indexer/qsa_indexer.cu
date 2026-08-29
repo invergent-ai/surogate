@@ -36,39 +36,50 @@ __device__ __forceinline__ void rope_sincos(float position, int pair, int rotary
     sincosf(position * frequency, sine, cosine);
 }
 
-// One warp per new column: writes the token's raw key and, when the column completes a block,
-// folds that block's `kBlock` raw keys into the block key kept at the block's first cell.
-__global__ void qsa_append_kernel(const __nv_bfloat16* __restrict__ keys,
-                                  const std::int32_t* __restrict__ positions,
-                                  const std::int32_t* __restrict__ table_rows,
-                                  const std::int32_t* __restrict__ block_tables,
-                                  std::int32_t table_stride,
-                                  const __nv_bfloat16* __restrict__ key_norm,
-                                  __nv_bfloat16* __restrict__ plane, int tokens, int rotary_dim,
-                                  float theta, float eps) {
+// One warp per new column: writes the token's raw indexer key into its cell.
+__global__ void qsa_append_raw_kernel(const __nv_bfloat16* __restrict__ keys,
+                                      const std::int32_t* __restrict__ positions,
+                                      const std::int32_t* __restrict__ table_rows,
+                                      std::int32_t columns_per_row,
+                                      const std::int32_t* __restrict__ block_tables,
+                                      std::int32_t table_stride, __nv_bfloat16* __restrict__ plane,
+                                      int tokens) {
+    const int warp  = static_cast<int>(threadIdx.x) / kWarp;
+    const int lane  = static_cast<int>(threadIdx.x) % kWarp;
+    const int token = static_cast<int>(blockIdx.x) * kWarps + warp;
+    if (token >= tokens) { return; }
+    const int d0                    = lane * kPerLane;
+    const std::int32_t* block_table = block_tables + static_cast<std::int64_t>(
+                                                         table_rows[token / columns_per_row]) *
+                                                         table_stride;
+    const __nv_bfloat16* src = keys + static_cast<std::int64_t>(token) * kHeadDim + d0;
+    __nv_bfloat16* dst       = plane + indexer_offset(block_table, positions[token]) + d0;
+#pragma unroll
+    for (int i = 0; i < kPerLane; ++i) { dst[i] = src[i]; }
+}
+
+// One warp per new column: if the column completed a block, folds that block's raw keys into the
+// block key kept at the block's first cell — mean, RMSNorm, rope at the first position. A
+// separate launch from the raw writes above: a block's cells can be written by warps of other
+// CTAs, and only a launch boundary orders those against this read.
+__global__ void qsa_append_fold_kernel(const std::int32_t* __restrict__ positions,
+                                       const std::int32_t* __restrict__ table_rows,
+                                       std::int32_t columns_per_row,
+                                       const std::int32_t* __restrict__ block_tables,
+                                       std::int32_t table_stride,
+                                       const __nv_bfloat16* __restrict__ key_norm,
+                                       __nv_bfloat16* __restrict__ plane, int tokens,
+                                       int rotary_dim, float theta, float eps) {
     const int warp  = static_cast<int>(threadIdx.x) / kWarp;
     const int lane  = static_cast<int>(threadIdx.x) % kWarp;
     const int token = static_cast<int>(blockIdx.x) * kWarps + warp;
     if (token >= tokens) { return; }
     const int position = positions[token];
-    const int d0       = lane * kPerLane;
-    const std::int32_t* block_table =
-        block_tables + static_cast<std::int64_t>(table_rows == nullptr ? 0 : table_rows[token]) *
-                           table_stride;
-
-    float raw[kPerLane];
-    const __nv_bfloat16* src = keys + static_cast<std::int64_t>(token) * kHeadDim + d0;
-    __nv_bfloat16* dst       = plane + indexer_offset(block_table, position) + d0;
-#pragma unroll
-    for (int i = 0; i < kPerLane; ++i) {
-        raw[i] = __bfloat162float(src[i]);
-        dst[i] = __float2bfloat16(raw[i]);
-    }
     if ((position + 1) % kBlock != 0) { return; } // the block is still open
-
-    // Every cell of the block is written: the earlier ones by earlier rounds or by earlier
-    // columns of this launch, whose stores are ordered before this read by the fence.
-    __threadfence();
+    const int d0                    = lane * kPerLane;
+    const std::int32_t* block_table = block_tables + static_cast<std::int64_t>(
+                                                         table_rows[token / columns_per_row]) *
+                                                         table_stride;
     const int first = position - (kBlock - 1);
     float value[kPerLane];
 #pragma unroll
@@ -88,18 +99,16 @@ __global__ void qsa_append_kernel(const __nv_bfloat16* __restrict__ keys,
     square            = __shfl_sync(0xFFFFFFFFU, square, 0);
     const float scale = rsqrtf(square / static_cast<float>(kHeadDim) + eps);
 #pragma unroll
-    for (int i = 0; i < kPerLane; ++i) {
-        value[i] *= scale * __bfloat162float(key_norm[d0 + i]);
-    }
+    for (int i = 0; i < kPerLane; ++i) { value[i] *= scale * __bfloat162float(key_norm[d0 + i]); }
 
-    // Split-half NeoX rope at the block's first position. The partner of dimension d < half is
-    // d + half, and both halves live inside this warp, so a shuffle fetches it.
+    // Split-half NeoX rope at the block's first position; the partner dimension lives in this
+    // warp, so a shuffle fetches it.
     const int half = rotary_dim / 2;
     float partner[kPerLane];
 #pragma unroll
     for (int i = 0; i < kPerLane; ++i) {
-        const int d    = d0 + i;
-        const int mate = d < half ? d + half : d - half;
+        const int d      = d0 + i;
+        const int mate   = d < half ? d + half : d - half;
         float mate_value = 0.0F;
 #pragma unroll
         for (int j = 0; j < kPerLane; ++j) {
@@ -129,6 +138,7 @@ template <int Heads>
 __global__ void qsa_select_kernel(const __nv_bfloat16* __restrict__ q,
                                   const std::int32_t* __restrict__ positions,
                                   const std::int32_t* __restrict__ table_rows,
+                                  std::int32_t columns_per_row,
                                   const std::int32_t* __restrict__ block_tables,
                                   std::int32_t table_stride,
                                   const __nv_bfloat16* __restrict__ plane,
@@ -141,7 +151,8 @@ __global__ void qsa_select_kernel(const __nv_bfloat16* __restrict__ q,
     const int lane     = tid % kWarp;
     const int d0       = lane * kPerLane;
     const std::int32_t* block_table =
-        block_tables + static_cast<std::int64_t>(table_rows[row]) * table_stride;
+        block_tables +
+        static_cast<std::int64_t>(table_rows[row / columns_per_row]) * table_stride;
     std::uint32_t* row_mask = mask + static_cast<std::int64_t>(row) * words;
 
     const int visible = position + 1;                    // cells 0..position are populated
@@ -257,8 +268,9 @@ std::size_t qsa_indexer_select_workspace_capacity_bytes(std::int32_t rows, std::
 }
 
 void qsa_indexer_append(const Tensor& keys, const Tensor& positions, const Tensor& table_rows,
-                        const Tensor& key_norm, const QsaIndexerGeometry& geometry,
-                        PagedKVBatchLayerView cache, cudaStream_t stream) {
+                        std::int32_t columns_per_row, const Tensor& key_norm,
+                        const QsaIndexerGeometry& geometry, PagedKVBatchLayerView cache,
+                        cudaStream_t stream) {
     require(geometry.head_dim == kHeadDim && geometry.block == kBlock,
             "only the 128-wide, 4-cell indexer is registered");
     require(geometry.rotary_dim > 0 && geometry.rotary_dim <= kHeadDim &&
@@ -273,12 +285,20 @@ void qsa_indexer_append(const Tensor& keys, const Tensor& positions, const Tenso
     if (tokens == 0) { return; }
     require(positions.ne[0] == tokens, "positions must match the columns");
     const int blocks = (tokens + kWarps - 1) / kWarps;
-    require(table_rows.data == nullptr || table_rows.ne[0] == tokens,
-            "table rows must match the columns");
-    qsa_append_kernel<<<blocks, kThreads, 0, stream>>>(
+    require(table_rows.data != nullptr && table_rows.dtype == DType::I32,
+            "table rows must be a non-null I32 vector");
+    require(columns_per_row > 0 && (tokens + columns_per_row - 1) / columns_per_row <=
+                                       static_cast<std::int32_t>(table_rows.ne[0]),
+            "table rows must cover every column's sequence");
+    qsa_append_raw_kernel<<<blocks, kThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(keys.data),
         static_cast<const std::int32_t*>(positions.data),
-        static_cast<const std::int32_t*>(table_rows.data),
+        static_cast<const std::int32_t*>(table_rows.data), columns_per_row,
+        static_cast<const std::int32_t*>(cache.block_tables.data), cache.block_tables.ne[0],
+        static_cast<__nv_bfloat16*>(cache.indexer_pages.data), tokens);
+    qsa_append_fold_kernel<<<blocks, kThreads, 0, stream>>>(
+        static_cast<const std::int32_t*>(positions.data),
+        static_cast<const std::int32_t*>(table_rows.data), columns_per_row,
         static_cast<const std::int32_t*>(cache.block_tables.data), cache.block_tables.ne[0],
         static_cast<const __nv_bfloat16*>(key_norm.data),
         static_cast<__nv_bfloat16*>(cache.indexer_pages.data), tokens, geometry.rotary_dim,
@@ -286,9 +306,9 @@ void qsa_indexer_append(const Tensor& keys, const Tensor& positions, const Tenso
 }
 
 void qsa_indexer_select(const Tensor& q, const Tensor& positions, const Tensor& table_rows,
-                        const QsaIndexerGeometry& geometry, PagedKVBatchLayerView cache,
-                        std::int32_t keys, WorkspaceArena& workspace, Tensor& mask,
-                        cudaStream_t stream) {
+                        std::int32_t columns_per_row, const QsaIndexerGeometry& geometry,
+                        PagedKVBatchLayerView cache, std::int32_t keys, WorkspaceArena& workspace,
+                        Tensor& mask, cudaStream_t stream) {
     require(geometry.head_dim == kHeadDim && geometry.block == kBlock,
             "only the 128-wide, 4-cell indexer is registered");
     require(q.dtype == DType::BF16 && positions.dtype == DType::I32 &&
@@ -300,8 +320,11 @@ void qsa_indexer_select(const Tensor& q, const Tensor& positions, const Tensor& 
     if (rows == 0) { return; }
     const int words = qsa_block_mask_words(keys, geometry.block);
     require(mask.ne[0] == words && mask.ne[1] == rows, "mask must be [words, rows]");
-    require(positions.ne[0] == rows && table_rows.ne[0] == rows,
-            "positions and table rows must match the query rows");
+    require(positions.ne[0] == rows, "positions must match the query rows");
+    require(table_rows.data != nullptr && columns_per_row > 0 &&
+                (rows + columns_per_row - 1) / columns_per_row <=
+                    static_cast<std::int32_t>(table_rows.ne[0]),
+            "table rows must cover every query row's sequence");
     const int blocks  = (keys + geometry.block - 1) / geometry.block;
     Tensor scores     = workspace.alloc(DType::FP32, {blocks, rows});
     const auto stride = static_cast<int>(blocks);
@@ -310,7 +333,7 @@ void qsa_indexer_select(const Tensor& q, const Tensor& positions, const Tensor& 
         qsa_select_kernel<decltype(heads)::value><<<rows, kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(q.data),
             static_cast<const std::int32_t*>(positions.data),
-            static_cast<const std::int32_t*>(table_rows.data),
+            static_cast<const std::int32_t*>(table_rows.data), columns_per_row,
             static_cast<const std::int32_t*>(cache.block_tables.data), cache.block_tables.ne[0],
             static_cast<const __nv_bfloat16*>(cache.indexer_pages.data),
             static_cast<std::uint32_t*>(mask.data), words, budget,

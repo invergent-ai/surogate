@@ -153,10 +153,10 @@ int main() {
         Tensor keys(d_keys.p, DType::BF16, {kHeadDim, count});
         Tensor pos_t(d_pos.p, DType::I32, {count});
         Tensor gain_t(d_gain.p, DType::BF16, {kHeadDim});
-        std::vector<int> rows(static_cast<std::size_t>(count), 0);
+        std::vector<int> rows(1, 0);
         DeviceBuffer d_rows = to_device_i32(rows);
-        Tensor rows_t(d_rows.p, DType::I32, {count});
-        ninfer::ops::qsa_indexer_append(keys, pos_t, rows_t, gain_t, geometry(2048),
+        Tensor rows_t(d_rows.p, DType::I32, {1});
+        ninfer::ops::qsa_indexer_append(keys, pos_t, rows_t, count, gain_t, geometry(2048),
                                         cache.batch_view(), nullptr);
         cudaStreamSynchronize(nullptr);
     };
@@ -209,7 +209,7 @@ int main() {
     Tensor qrow_t(d_qrow.p, DType::I32, {rows});
     Tensor mask_t(d_mask.p, DType::I32, {words, rows});
 
-    ninfer::ops::qsa_indexer_select(q_t, qpos_t, qrow_t, geometry(2048), cache.batch_view(),
+    ninfer::ops::qsa_indexer_select(q_t, qpos_t, qrow_t, 1, geometry(2048), cache.batch_view(),
                                     tokens, arena, mask_t, nullptr);
     cudaStreamSynchronize(nullptr);
     expect(cudaGetLastError() == cudaSuccess, "select launched cleanly");
@@ -232,8 +232,8 @@ int main() {
 
     // A budget of 32 cells = 8 complete blocks, plus the always-visible tail.
     arena.reset();
-    ninfer::ops::qsa_indexer_select(q_t, qpos_t, qrow_t, geometry(32), cache.batch_view(), tokens,
-                                    arena, mask_t, nullptr);
+    ninfer::ops::qsa_indexer_select(q_t, qpos_t, qrow_t, 1, geometry(32), cache.batch_view(),
+                                    tokens, arena, mask_t, nullptr);
     cudaStreamSynchronize(nullptr);
     const std::vector<int> mask = from_device_i32(d_mask, static_cast<std::size_t>(words) * rows);
     for (int r = 0; r < rows; ++r) {

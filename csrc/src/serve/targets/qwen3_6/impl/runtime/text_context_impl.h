@@ -911,6 +911,14 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, T});
     const Tensor& kv_table_rows =
         active_kv_table_rows_ != nullptr ? *active_kv_table_rows_ : io_.text_kv_table_row;
+    // QSA indexer: cache this chunk's indexer keys and, past the budget, select the blocks each
+    // column may attend to. Empty below the budget, so the dense path is untouched.
+    const std::int32_t indexer_columns_per_row =
+        active_sequence_batch_ != 0 ? active_sequence_width_ : T;
+    const ops::GqaBlockMask selection = text_indexer_selection(
+        w, h, T, cache_positions, rope_positions, kv_table_rows, indexer_columns_per_row,
+        static_cast<std::int32_t>(active_gqa_envelope_->max_visible_keys),
+        batch_text_kv_->batch_layer_view(fidx));
     if (active_sequence_batch_ != 0) {
         const std::int32_t width = active_sequence_width_;
         if (width <= 0 || width * active_sequence_batch_ != T) {
@@ -924,11 +932,11 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
         ops::gqa_attention(q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows,
                            kAttnScale, batch_text_kv_->batch_layer_view(fidx),
-                           *active_gqa_envelope_, work_, a_batch, s);
+                           *active_gqa_envelope_, work_, a_batch, s, selection);
     } else {
         ops::gqa_attention(qn, kn, v, cache_positions, Tensor{}, kv_table_rows, kAttnScale,
                            batch_text_kv_->batch_layer_view(fidx), *active_gqa_envelope_, work_, a,
-                           s);
+                           s, selection);
     }
     ops::sigmoid_mul(gate, a, s);
 
@@ -1302,7 +1310,9 @@ ops::GqaBlockMask TextContext::text_indexer_selection(const FullLayerW& w, const
                                                       std::int32_t tokens,
                                                       const Tensor& cache_positions,
                                                       const Tensor& rope_positions,
-                                                      const Tensor& table_rows, std::int32_t keys,
+                                                      const Tensor& table_rows,
+                                                      std::int32_t columns_per_row,
+                                                      std::int32_t keys,
                                                       PagedKVBatchLayerView cache) {
     if constexpr (!requires { V::indexer_head_dim; }) {
         return ops::GqaBlockMask{};
@@ -1329,8 +1339,8 @@ ops::GqaBlockMask TextContext::text_indexer_selection(const FullLayerW& w, const
         // pools them into a block key, so skipping the append below the budget would leave holes.
         Tensor raw_keys = work_.alloc(DType::BF16, {geometry.head_dim, tokens});
         ops::detail::bf16_cublaslt_gemm(indexer.key, hidden, raw_keys, s);
-        ops::qsa_indexer_append(raw_keys, cache_positions, table_rows, indexer.key_norm, geometry,
-                                cache, s);
+        ops::qsa_indexer_append(raw_keys, cache_positions, table_rows, columns_per_row,
+                                indexer.key_norm, geometry, cache, s);
         if (ops::qsa_selection_is_dense(keys, geometry)) { return ops::GqaBlockMask{}; }
 
         const std::int32_t width = geometry.head_dim * geometry.heads;
@@ -1345,8 +1355,8 @@ ops::GqaBlockMask TextContext::text_indexer_selection(const FullLayerW& w, const
 
         const std::int32_t words = ops::qsa_block_mask_words(keys, geometry.block);
         Tensor mask              = work_.alloc(DType::I32, {words, tokens});
-        ops::qsa_indexer_select(heads_norm, cache_positions, table_rows, geometry, cache, keys,
-                                work_, mask, s);
+        ops::qsa_indexer_select(heads_norm, cache_positions, table_rows, columns_per_row, geometry,
+                                cache, keys, work_, mask, s);
         return ops::GqaBlockMask{.words  = static_cast<const std::uint32_t*>(mask.data),
                                  .stride = words,
                                  .block  = geometry.block};
@@ -1600,9 +1610,15 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                     Tensor ab = a.slice(2, prefill_cols, batch)
                                     .view({kCfg.head_dim, kCfg.n_q, 1, batch});
                     Tensor position_batch = decode.cache_positions.view({1, batch});
+                    auto decode_scope = work_.scope();
+                    const ops::GqaBlockMask decode_selection = text_indexer_selection(
+                        full, h.slice(1, prefill_cols, batch), batch, decode.cache_positions,
+                        rope_all.slice(0, prefill_cols, batch), decode.kv_table_rows, 1,
+                        static_cast<std::int32_t>(decode.envelope.max_visible_keys),
+                        batch_text_kv_->batch_layer_view(fidx));
                     ops::gqa_attention(qb, kb, vb, position_batch, Tensor{}, decode.kv_table_rows,
                                        kAttnScale, batch_text_kv_->batch_layer_view(fidx),
-                                       decode.envelope, work_, ab, s);
+                                       decode.envelope, work_, ab, s, decode_selection);
                 }
                 ops::sigmoid_mul(gate, a, s);
                 Variant::attention_output_projection(a.view({kCfg.q_size, total}), *full.o_proj, x,
@@ -1989,10 +2005,16 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
                     Tensor ka = kn.slice(2, 0, prefill_cols);
                     Tensor va = v.slice(2, 0, prefill_cols);
                     Tensor aa = a.slice(2, 0, prefill_cols);
+                    auto segment_scope = work_.scope();
+                    const ops::GqaBlockMask segment_selection = text_indexer_selection(
+                        full, h.slice(1, 0, prefill_cols), prefill_cols, positions_prefill,
+                        rope_all.slice(0, 0, prefill_cols), io_.text_kv_table_row, prefill_cols,
+                        static_cast<std::int32_t>(prefill_envelope.max_visible_keys),
+                        batch_text_kv_->batch_layer_view(fidx));
                     ops::gqa_attention(qa, ka, va, positions_prefill, Tensor{},
                                        io_.text_kv_table_row, kAttnScale,
                                        batch_text_kv_->batch_layer_view(fidx), prefill_envelope,
-                                       work_, aa, s);
+                                       work_, aa, s, segment_selection);
                 }
                 if (batch > 0) {
                     Tensor qb = qn.slice(2, prefill_cols, batch)
@@ -2004,9 +2026,15 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
                     Tensor ab = a.slice(2, prefill_cols, batch)
                                     .view({kCfg.head_dim, kCfg.n_q, 1, batch});
                     Tensor position_batch = decode.cache_positions.view({1, batch});
+                    auto decode_scope = work_.scope();
+                    const ops::GqaBlockMask decode_selection = text_indexer_selection(
+                        full, h.slice(1, prefill_cols, batch), batch, decode.cache_positions,
+                        rope_all.slice(0, prefill_cols, batch), decode.kv_table_rows, 1,
+                        static_cast<std::int32_t>(decode_envelope.max_visible_keys),
+                        batch_text_kv_->batch_layer_view(fidx));
                     ops::gqa_attention(qb, kb, vb, position_batch, Tensor{}, decode.kv_table_rows,
                                        kAttnScale, batch_text_kv_->batch_layer_view(fidx),
-                                       decode_envelope, work_, ab, s);
+                                       decode_envelope, work_, ab, s, decode_selection);
                 }
                 ops::sigmoid_mul(gate, a, s);
                 Variant::attention_output_projection(a.view({kCfg.q_size, total}), *full.o_proj, x,

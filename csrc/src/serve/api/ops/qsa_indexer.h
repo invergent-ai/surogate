@@ -51,10 +51,13 @@ struct QsaIndexerGeometry {
 ///   positions I32  [T]             absolute cache position of each column, ascending
 ///   key_norm  BF16 [head_dim]      RMSNorm gain of the block key
 ///   cache     the layer's view; `indexer_pages` and `block_table` are read and written
-///   table_rows I32 [T]  block-table row of each column's sequence
+///   table_rows I32 [S]  block-table row per sequence; column c belongs to sequence
+///                       `c / columns_per_row` (one sequence for the whole call when
+///                       `columns_per_row` is the column count, one column each when it is 1)
 void qsa_indexer_append(const Tensor& keys, const Tensor& positions, const Tensor& table_rows,
-                        const Tensor& key_norm, const QsaIndexerGeometry& geometry,
-                        PagedKVBatchLayerView cache, cudaStream_t stream);
+                        std::int32_t columns_per_row, const Tensor& key_norm,
+                        const QsaIndexerGeometry& geometry, PagedKVBatchLayerView cache,
+                        cudaStream_t stream);
 
 /// Selects the visible blocks of every query row and writes its bitmask.
 ///   q          BF16 [head_dim, heads, rows]  normalised and roped indexer queries
@@ -66,9 +69,9 @@ void qsa_indexer_append(const Tensor& keys, const Tensor& positions, const Tenso
 /// which selects at most the reference's cells and never more (the reference tops its whole
 /// blocks up with `block - 1` cells of the next one).
 void qsa_indexer_select(const Tensor& q, const Tensor& positions, const Tensor& table_rows,
-                        const QsaIndexerGeometry& geometry, PagedKVBatchLayerView cache,
-                        std::int32_t keys, WorkspaceArena& workspace, Tensor& mask,
-                        cudaStream_t stream);
+                        std::int32_t columns_per_row, const QsaIndexerGeometry& geometry,
+                        PagedKVBatchLayerView cache, std::int32_t keys, WorkspaceArena& workspace,
+                        Tensor& mask, cudaStream_t stream);
 
 /// Transient bytes `qsa_indexer_select` needs for `rows` queries over a `keys`-long history.
 [[nodiscard]] std::size_t qsa_indexer_select_workspace_capacity_bytes(
