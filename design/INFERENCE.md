@@ -1295,3 +1295,11 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   the stages; the pipelined loop uses that by default (`SUROGATE_SERVE_PIPELINE_LONE_PREFILL`
   forces the old synchronous step). Queued: rebuild, CLI check, then 8 stages at 3,072 slots
   (16 traced / 64 / 1), the 2-stage point and the 27B/35B at 100 users.
+- Full residency does not fix the lone prefill step (2026-08-29): 8 stages with 3,072 slots
+  (every expert of a stage resident, CPU split off by the policy) still show a 2.0 s median per
+  lone prefill stage-step at 16 users (3.8 tok/s; the first prompt's steps 0.9-1.3 s per stage
+  cold). So the cost is a per-step constant of the synchronous path, not the gather and not
+  the layer count. Decode rounds on the same stages take ~7 ms each. Next measurement: the
+  asynchronous batch-0 mixed flights (C3v6 chain) — if a stage's mixed step is as slow the
+  constant is in the chunk forward itself and gets decomposed with per-device timing.
+

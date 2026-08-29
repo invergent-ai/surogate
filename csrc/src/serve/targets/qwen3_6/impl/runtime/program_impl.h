@@ -2432,11 +2432,19 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
                 // see a frontier outside the window it was captured for. The
                 // graph previously baked {1, kv_capacity} here — the one
                 // structural difference between it and that proven path.
-                DecodeGraphProfile& mixed_profile =
-                    select_graph_profile(ordinary_graphs, static_cast<std::uint32_t>(rows),
-                                         maximum_frontier, "mixed round");
-                bucket_slice.envelope = {mixed_profile.min_execution_frontier + 1,
-                                         mixed_profile.max_execution_frontier + 1};
+                // A round without decode rows (a pipeline stage prefilling a
+                // staged prompt asynchronously) has no decode band: the decode
+                // blocks of the body are skipped for batch 0, so the envelope
+                // and band are placeholders and the key carries bucket 0.
+                DecodeGraphProfile* mixed_profile =
+                    rows > 0 ? &select_graph_profile(ordinary_graphs,
+                                                     static_cast<std::uint32_t>(rows),
+                                                     maximum_frontier, "mixed round")
+                             : nullptr;
+                bucket_slice.envelope = mixed_profile
+                                            ? ops::GqaExecutionEnvelope{mixed_profile->min_execution_frontier + 1,
+                                                                 mixed_profile->max_execution_frontier + 1}
+                                            : ops::GqaExecutionEnvelope{1, 1};
                 bucket_slice.hidden             = ordinary.hidden.slice(1, 0, batch_bucket);
                 bucket_slice.logits             = ordinary.logits.slice(1, 0, batch_bucket);
                 // The band is part of the key. This used to pass
@@ -2451,8 +2459,10 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
                 // always in mixed rounds, and runs whose lanes never crossed a
                 // band (long prompts, short generations, a moved edge) were
                 // clean. The profile's index identifies the band exactly.
-                const auto mixed_band = static_cast<std::int32_t>(
-                    &mixed_profile - ordinary_graphs.profiles.data());
+                const auto mixed_band =
+                    mixed_profile ? static_cast<std::int32_t>(mixed_profile -
+                                                              ordinary_graphs.profiles.data())
+                                  : 0;
                 last_mixed_round.band = mixed_band;
                 if (card.try_mixed_graph_chunk(
                         std::span<const TokenId>(staged.prompt.token_ids), staged.cursor,
