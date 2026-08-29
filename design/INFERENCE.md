@@ -1457,4 +1457,11 @@ kernel mask, (5) raise `kNativeContext` and verify against llama.cpp at 8k and 3
   mechanism vary; the eager fallback then processes exactly the graph's chunk. It was not the
   CPU split (the reproducer had the split off) and not the expert pool (one device with 8 %
   residency at 64 users is clean).
+- Diagnosis confirmed by measurement (2026-08-29 05:48): the reproducer matrix on the
+  pre-fix binary — one device at 64 and 16 users (2,000 slots, 8 % residency): **clean**;
+  8 stages at 64 users with a **fully resident** pool (3,072 slots): **reproduces** ('Based'
+  for "capital of France", 'Based prime numbers are 2, 3, and 5.'). So it is neither the CPU
+  split nor expert eviction, and the corrupted token is the *first* one of the answer with the
+  rest coherent — the signature of a prompt cursor that diverged on the last chunk, which is
+  what the graph-dependent plan produced. Validation of the fix queued on the same points.
 
