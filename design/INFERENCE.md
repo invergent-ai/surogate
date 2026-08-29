@@ -1244,3 +1244,9 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   Two threads of work: an A/B (prefill share 0; split off) to see which component the lone
   step spends its time in, and the structural fix — run lone prefills as asynchronous
   mixed rounds with zero decode lanes so the pipeline never blocks on them.
+- Structural fix for the lone prefill (2026-08-29, commit 996041b8): a mixed round may now
+  have zero decode lanes — it is then a batched prefill step (the decode head, sampling and
+  egress are skipped at batch 0) — and the pipelined loop launches staged prompts as such
+  rounds, so a prompt's chunk is an asynchronous flight through the stages like any decode
+  group instead of a synchronous stage-by-stage step on the executor thread. The
+  synchronous lone-prefill flight remains only for prompts the mixed path cannot advance.
