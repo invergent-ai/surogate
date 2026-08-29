@@ -1337,6 +1337,14 @@ ops::GqaBlockMask TextContext::text_indexer_selection(const FullLayerW& w, const
         if (disabled || !indexer.valid() || cache.indexer_pages.data == nullptr || tokens <= 0) {
             return ops::GqaBlockMask{};
         }
+        // A deployment whose whole KV cache is shorter than the budget can never reach a
+        // selection, so the keys would never be read: skip the append too. This is what keeps
+        // the indexer off the cost of every short-context run (the board's shapes included).
+        if (batch_text_kv_ != nullptr &&
+            ops::qsa_selection_is_dense(static_cast<std::int32_t>(batch_text_kv_->max_context()),
+                                        geometry)) {
+            return ops::GqaBlockMask{};
+        }
         cudaStream_t s = ctx_.stream;
         // The keys are cached raw for every column, whatever the history length: a later query
         // pools them into a block key, so skipping the append below the budget would leave holes.
