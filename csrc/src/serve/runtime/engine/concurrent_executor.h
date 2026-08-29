@@ -1061,6 +1061,13 @@ private:
                 program.launch_group_mixed(g, std::span<const std::uint32_t>(meta.staged.data(), meta.staged_count),
                                            meta.membership.lane_span(), meta.membership.budget_span());
                 launched = true;
+            } else if (meta.staged_count > 0) {
+                // No decode lanes yet: the staged prompts still ride an asynchronous mixed
+                // round (zero decode lanes) rather than blocking the thread stage by stage.
+                last_round_ = LastRound{"mixed", 0, meta.staged[0], last_round_.index + 1};
+                program.launch_group_mixed(g, std::span<const std::uint32_t>(meta.staged.data(), meta.staged_count),
+                                           std::span<const std::uint32_t>{}, std::span<const RoundBudget>{});
+                launched = true;
             } else if (lone_lane != max_concurrency_) {
                 meta.staged_count   = 0;
                 meta.prefill_lane   = lone_lane;

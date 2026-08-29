@@ -1685,7 +1685,7 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
     } else {
     Hooks::finish(weights_, x, kCfg.rms_eps, xf, work_, s);
 
-    {
+    if (batch > 0) {
         Tensor xf_decode = xf.slice(1, prefill_cols, batch);
         CUDA_CHECK(cudaMemcpyAsync(decode.hidden.data, xf_decode.data,
                                    static_cast<std::size_t>(kCfg.hidden) * batch * 2,
@@ -2054,6 +2054,7 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
     }
     Hooks::finish(weights_, x, kCfg.rms_eps, xf, work_, s);
 
+    if (batch == 0) { return; }
     Tensor xf_decode = xf.slice(1, prefill_cols, batch);
     CUDA_CHECK(cudaMemcpyAsync(decode.hidden.data, xf_decode.data,
                                static_cast<std::size_t>(kCfg.hidden) * batch * 2,

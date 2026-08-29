@@ -2230,9 +2230,10 @@ runtime::RoundHandle
 ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes,
                                        std::span<const std::uint32_t> lanes,
                                        std::span<const runtime::RoundBudget> budgets) {
-    if (speculative_backend != SpeculativeBackend::None || lanes.empty() ||
-        budgets.size() != lanes.size() || prefill_lanes.empty() ||
-        prefill_lanes.size() > runtime::kMaximumMixedPrefills) {
+    // No decode lanes is allowed: the round is then a batched prefill step (pipeline stages
+    // use it so a prompt's chunk is an asynchronous round like any other).
+    if (speculative_backend != SpeculativeBackend::None || budgets.size() != lanes.size() ||
+        prefill_lanes.empty() || prefill_lanes.size() > runtime::kMaximumMixedPrefills) {
         throw std::invalid_argument("mixed round requires plain decode lanes and prefill lanes");
     }
     for (std::size_t i = 0; i < prefill_lanes.size(); ++i) {
@@ -2487,15 +2488,17 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
                 slice, schedule::TextContext::MixedPrefillFinalize{});
         }
 
-        Tensor sampled         = ordinary.sampled_tokens.slice(0, 0, rows);
-        Tensor cache_positions = ordinary.cache_positions.slice(0, 0, rows);
-        Tensor lanes_tensor    = ordinary.lanes.slice(0, 0, rows);
-        ops::scatter(slice.hidden, lanes_tensor, tail_hidden_store, device.stream);
-        ops::sample(slice.logits, sampled, TextConfig::token_domain, ordinary.sampling,
-                    cache_positions, ops::kSamplePurposeDecode, work, device.stream);
-        CUDA_CHECK(cudaMemcpyAsync(ordinary_host_egress, ordinary.egress.data,
-                                   sizeof(qwen3_6::OrdinaryDecodeEgress), cudaMemcpyDeviceToHost,
-                                   device.stream));
+        if (rows > 0) {
+            Tensor sampled         = ordinary.sampled_tokens.slice(0, 0, rows);
+            Tensor cache_positions = ordinary.cache_positions.slice(0, 0, rows);
+            Tensor lanes_tensor    = ordinary.lanes.slice(0, 0, rows);
+            ops::scatter(slice.hidden, lanes_tensor, tail_hidden_store, device.stream);
+            ops::sample(slice.logits, sampled, TextConfig::token_domain, ordinary.sampling,
+                        cache_positions, ops::kSamplePurposeDecode, work, device.stream);
+            CUDA_CHECK(cudaMemcpyAsync(ordinary_host_egress, ordinary.egress.data,
+                                       sizeof(qwen3_6::OrdinaryDecodeEgress), cudaMemcpyDeviceToHost,
+                                       device.stream));
+        }
         // The round is enqueued; consume_mixed_round synchronises and commits it.
         mixed_in_flight_.valid        = true;
         mixed_in_flight_.id           = ++mixed_in_flight_counter_;
