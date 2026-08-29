@@ -494,6 +494,16 @@ copy is the design, and it is also what a multi-host version would use).
   (`SUROGATE_SERVE_CPU_MOE_THREADS` overrides). Diagnostics: `SUROGATE_SERVE_EXPERT_STATS=<rounds>`
   (eager only), `SUROGATE_SERVE_ROUND_TIMING=1`, `SUROGATE_CPU_EXPERT_NO_VNNI=1`,
   `SUROGATE_CPU_EXPERT_TILE=1`.
+- Serve on all eight 5090s with pipeline parallelism (phase 3, the configuration behind the
+  8-stage rows): `numactl --interleave=all surogate-engine <artifact>.ninfer --devices
+  0,1,2,3,4,5,6,7 --max-num-seqs 64 --kv-capacity auto --max-model-len 2048 --expert-slots 3072`
+  — one 6-layer stage per card, each stage materialises only its own layers (~3.4 GiB) and
+  holds every expert of those layers in its 14.9 GiB pool, the CPU split is off by default for
+  stages (`--cpu-moe-share` enables it; it corrupted lanes at 8 stages × 64 users), startup
+  ~2 min. The 27B and 35B take the same `--devices` flag (no `--expert-slots`). Diagnostics:
+  `SUROGATE_SERVE_PIPELINE_TRACE=1` (timestamped stage rounds on stderr),
+  `SUROGATE_SERVE_PIPELINE_GROUPS=N`, `SUROGATE_SERVE_PIPELINE_LONE_PREFILL=1` (synchronous
+  prompt steps instead of batch-0 mixed flights).
 - Probe at concurrency: scratchpad `probe_slots.sh` (env USERS/SEQS/DUR/PTOK/MTOK/GPU/KV/EXTRA/
   NUMA/MAXLEN/PORT/OUT/SRVLOG) runs the coherence prompts before and *during* the load;
   `lane.sh` runs a list of probes node-bound on one GPU so two lanes share the host.
