@@ -123,7 +123,13 @@ struct ExpertSlotCache {
         std::int32_t tokens      = 0;
         std::int32_t ordinal     = 0;
         const JobMirror* mirror  = nullptr;
+        // Issue order of this slice. Not a race detector: the host runs far ahead of the
+        // stream, so a large gap between this and `staging_generation` is normal — the
+        // overwriting copy is only *enqueued*, and the main stream cannot reach it until the
+        // combine's wait on `join_event` has retired this callback.
+        std::uint64_t staged_generation = 0;
     };
+    std::uint64_t staging_generation = 0;
     std::deque<SliceContext> slice_contexts;
     SliceContext& slice_context(Layer& entry, std::int32_t offset, std::int32_t tokens, std::int32_t ordinal) {
         for (SliceContext& c : slice_contexts) {
@@ -274,6 +280,7 @@ struct ExpertSlotCache {
             throw std::logic_error("qwen4exp: CPU split round has more slices than job mirrors");
         }
         SliceContext& slice = slice_context(entry, offset, tokens, ordinal);
+        slice.staged_generation = ++staging_generation;
         const std::size_t column0 = static_cast<std::size_t>(offset) * hidden;
         // The staging copies run on the main stream: they are small, and stream order then
         // guarantees the next slice's resolve cannot rewrite the job list before it is copied
