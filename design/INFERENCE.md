@@ -1317,4 +1317,7 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   users. The 2-stage prompt cost (0.8 s per 24-layer stage) is the expert gather over the x8
   link of GPUs 2/3 (~150 paths × 24 layers × 5 MB ≈ 18 GB at 26 GB/s), which full residency
   removes at 8 stages.
+- Same configuration, 1 user: **57.9 tok/s, TTFT 237 ms** (one card with the CPU split: 22.4 /
+  1.40 s). 64 users with a 16,384-token KV did not fit beside the 14.9 GiB pool (needs 7.7 GB,
+  4.5 GB free) — rerun queued with the auto KV size, plus 32 users.
 
