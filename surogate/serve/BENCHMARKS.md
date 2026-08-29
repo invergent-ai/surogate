@@ -212,9 +212,11 @@ concurrency, not before the load.
   pinned experts W8→Q4G32AM at load — process peak 101 GB vs 297, startup 96 s,
   decode ~+10 % (host GEMV and PCIe gather bytes nearly halve), quality at
   parity on the 100-probe battery.
-- **Prefix reuse leaks cross-request content** (2026-08-29, severity high, open):
-  blended other-request topics at 16 lanes under load, in both bank formats;
-  `--no-prefix-reuse` removes it entirely (97/100). Details in INFERENCE.md.
+- ~~Prefix reuse leaks cross-request content~~ **root-caused and fixed 2026-08-29**
+  (commit 85d12840): the shared prefill scratch state slot was seeded per request
+  but consumed per chunk; interleaved prompts ran each other's GDN state. Blends
+  10/10 → 0 on the reproducing battery; the graphs-off crash config runs clean;
+  multi-turn reuse verified exact. Details in INFERENCE.md.
 - **0.8B**: ~4-per-100,000 mixed-round corruption.
 - Record the card with every number; re-measure single-user cells on the
   same card as the 100-user rows.

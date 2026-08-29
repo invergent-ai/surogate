@@ -1748,11 +1748,14 @@ arithmetic-drift/truncation class the clean arms always showed. Multi-turn prefi
 verified exact after the fix (facts recalled across three turns via AppendAtFrontier).
 `--no-prefix-reuse` is no longer a needed mitigation.
 
-Two follow-ups filed from the investigation:
-- **Token-stream corruption, still open**: forcing eager mixed rounds
-  (`SUROGATE_SERVE_PREFILL_GRAPH=0`) or a saturated burst cap of 1 crashed the worker loop
-  with "invalid UTF-8 continuation byte" garbage egress before the fix; being retested after.
-  The default battery's residual truncation-shaped misses may be its low-rate form.
+Two follow-ups from the investigation:
+- **The "invalid UTF-8" worker fatals were the same bug, and are fixed**: before the fix,
+  `SUROGATE_SERVE_PREFILL_GRAPH=0` crashed the worker loop with garbage egress within 5-11
+  minutes (an eager mixed continuation read the lane slot while the graph chunks had left the
+  state in the scratch); after the fix the same configuration ran a full battery with zero
+  fatals, 93/100. The residual ~5-10 % arithmetic-drift/echo misses appear in every
+  configuration and format, carry no cross-request content, and match the model's own
+  behaviour on these terse prompts (the phase-2 "batch-noninvariance drift").
 - **Throughput measurements with identical-prompt load generators are invalid with reuse on**:
   the requests collapse to one sampling round each (995 "tok/s" at 10 ms latency). Loadgen
   prompts must vary, or measure with `--no-prefix-reuse`.
