@@ -1847,4 +1847,9 @@ Cost: none measurable at 16 users (19.3 vs 16.1 tok/s, both arms without the CPU
 profile switches are rare against the rounds between them; the burst keeps them rarer).
 The update-refusal fallback (re-instantiate on `cudaGraphExecUpdate` failure) already
 existed for the pipeline's 64-lane profiles; the silent-success case is the one that hurt.
+One more wrinkle found the hard way (commit a24990ea): a freshly instantiated executable must
+be **uploaded on the launch stream** before its first launch, exactly as the family's own
+initialisation does — the default burst-8 path switches the *chained* executable too, and
+launching one un-uploaded produced garbage egress on the first round after the switch (19
+worker fatals in a battery). The existing refusal fallback had the same gap.
 
