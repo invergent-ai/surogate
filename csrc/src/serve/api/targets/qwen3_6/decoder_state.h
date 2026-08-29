@@ -22,6 +22,9 @@ struct DecoderStateSpec {
     std::int32_t attention_head_dim         = 0;
     DType kv_dtype                          = DType::BF16;
     std::int32_t kv_quant_group             = 0;
+    // QSA indexer keys per full-attention layer (0 = none): one BF16 plane of this width
+    // beside the layer's K/V, sharing the pages and block tables (phase 4).
+    std::int32_t indexer_head_dim           = 0;
     // Full-attention layer indices held at the model dtype while the rest of
     // the cache is quantized. Linear-attention layers never appear here: they
     // hold no KV planes at all, so a quantized cache cannot reach them.
@@ -43,6 +46,7 @@ struct PagedKVCacheLayout {
     std::int32_t head_dim     = 0;
     DType dtype               = DType::BF16;
     std::int32_t quant_group  = 0;
+    std::int32_t indexer_head_dim = 0;
     // Storage dtype per full-attention layer. A quantized cache may keep some
     // layers at the model dtype (--kv-cache-dtype-skip-layers), so the pool is
     // not necessarily homogeneous; dtype above is the cache's nominal setting.
@@ -102,6 +106,7 @@ private:
     std::int32_t head_dim_     = 0;
     DType dtype_               = DType::BF16;
     std::int32_t quant_group_  = 0;
+    std::int32_t indexer_head_dim_ = 0;
     std::vector<DType> layer_dtypes_;
 
     [[nodiscard]] DType layer_dtype(std::uint32_t layer) const noexcept {

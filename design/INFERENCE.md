@@ -1441,4 +1441,20 @@ Engine design:
 
 Steps: (1) materialise the weights, (2) the cache plane, (3) the forward and the mask, (4) the
 kernel mask, (5) raise `kNativeContext` and verify against llama.cpp at 8k and 32k.
+- **Root cause of the pipelined contamination (2026-08-29)**: a mixed round's prompt-chunk plan
+  depended on whether *that stage* could replay a mixed CUDA graph. The graph path advances the
+  prompt by `graph_nominal` (the 128-rounded chunk that fits beside the decode bucket) and
+  processes exactly one staged prompt; the eager path advances every staged prompt by its own
+  unrounded `nominals[i]`. Each stage owns its graph family and captures on demand, and a
+  capture can fail on one device and succeed on another (graph memory), so the stages of one
+  pipeline could consume *different numbers of prompt tokens* for the same lane. The cursors
+  then diverge: later stages read a KV frontier the earlier ones never wrote, and the lane
+  answers coherently but for a different context — which is exactly what the probes showed
+  ("Based numbers are in the ratio 2:3:5…" for "Name three prime numbers."). It needs several
+  prompts in flight to show, which is why 64 users hit it and 16 did not, and it is invisible on
+  one device (a single graph family). Fix: decide the plan — which prompts, how many tokens each
+  — before the forward, from state every stage shares (`graph_planned`), and let only the
+  mechanism vary; the eager fallback then processes exactly the graph's chunk. It was not the
+  CPU split (the reproducer had the split off) and not the expert pool (one device with 8 %
+  residency at 64 users is clean).
 

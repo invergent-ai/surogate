@@ -2348,6 +2348,28 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
         if (staged_count == 0 || nominals[0] == 0) {
             throw std::logic_error("mixed round staged no prefill tokens");
         }
+        // How many prompt tokens this round consumes must not depend on whether a CUDA graph
+        // is available: the pipeline runs the same round on every stage, each with its own
+        // graph family, and a stage that replays the graph would otherwise advance a prompt by
+        // the graph's 128-rounded chunk while a stage that fell back to the eager body advanced
+        // it by the unrounded nominal. The cursors then diverge and the lane's later stages read
+        // a KV frontier the earlier ones never wrote — coherent output for a different context.
+        // So decide the plan first, from state every stage shares, and let only the *mechanism*
+        // vary.
+        static const bool kNoMixedGraph = std::getenv("SUROGATE_SERVE_NO_MIXED_GRAPH") != nullptr;
+        const std::uint32_t graph_cap =
+            prefill_chunk > static_cast<std::uint32_t>(batch_bucket)
+                ? ((prefill_chunk - static_cast<std::uint32_t>(batch_bucket)) / 128U) * 128U
+                : 0U;
+        const std::uint32_t graph_nominal =
+            std::min(graph_cap, staged.prompt_tokens - staged.cursor);
+        const bool graph_planned = !kNoMixedGraph && staged_count == 1 && staged.use_graph &&
+                                   prefill_graphs.has_value() && batch_bucket == rows &&
+                                   graph_nominal > 0;
+        if (graph_planned) {
+            nominals[0]  = graph_nominal; // the graph's chunk, eager fallback included
+            staged_count = 1;
+        }
         const std::uint32_t nominal = nominals[0];
         const bool final_candidate = staged.cursor + nominal == staged.prompt_tokens;
         mark_workspace_usage(workspace_plan.text_prefill);
@@ -2395,18 +2417,10 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
         // its GDN state slot (#50, fixed by capturing per exact decode width),
         // and an unbanded attention envelope (#55, below).
         // SUROGATE_SERVE_NO_MIXED_GRAPH=1 forces the eager path for bisecting.
-        static const bool kNoMixedGraph = std::getenv("SUROGATE_SERVE_NO_MIXED_GRAPH") != nullptr;
-        if (!kNoMixedGraph && staged_count == 1 && staged.use_graph &&
-            prefill_graphs.has_value() && batch_bucket == rows) {
+        if (graph_planned) {
             // The graph ladder rounds the chunk up to a 128 bucket, so the
-            // nominal must leave room for both the rounding and the batch
-            // bucket inside the prefill_chunk workspace window.
-            const std::uint32_t graph_cap =
-                prefill_chunk > static_cast<std::uint32_t>(batch_bucket)
-                    ? ((prefill_chunk - static_cast<std::uint32_t>(batch_bucket)) / 128U) * 128U
-                    : 0U;
-            const std::uint32_t graph_nominal =
-                std::min(graph_cap, staged.prompt_tokens - staged.cursor);
+            // nominal leaves room for both the rounding and the batch bucket
+            // inside the prefill_chunk workspace window (graph_nominal above).
             // The graph writes a whole 128-rounded chunk, pad columns included,
             // but KV pages are mapped in units of kPagedKVPageSize = 64 up to
             // the prompt length. A prompt whose length lands in the upper half
@@ -2583,14 +2597,15 @@ runtime::MixedRoundResult ProgramImplCore::consume_mixed_round(runtime::RoundHan
                                                lanes.size())};
         // Each staged prompt advances by its own chunk; the graph path processes exactly the
         // first one, so its count matches what the forward consumed.
-        const std::uint32_t graph_processed = chunk.processed_tokens;
-        std::uint32_t column                = 0;
-        result.prefill_count                = graph_hit ? 1 : staged_count;
+        // The plan (which prompts, how many tokens each) was fixed before the forward, so a
+        // graph replay and the eager body advance the cursors identically.
+        std::uint32_t column = 0;
+        result.prefill_count = staged_count;
         for (std::size_t i = 0; i < result.prefill_count; ++i) {
             const std::uint32_t lane_id          = prefill_lanes[i];
             SequenceState& sequence              = sequences[lane_id];
             RequestControl::Prefill& entry       = *requests[lane_id].prefill;
-            const std::uint32_t processed        = graph_hit ? graph_processed : nominals[i];
+            const std::uint32_t processed        = nominals[i];
             const runtime::BeginSummary summary{.prompt_tokens        = entry.prompt_tokens,
                                                 .reused_prompt_tokens = entry.base,
                                                 .prefix_reuse_path    = entry.reuse};

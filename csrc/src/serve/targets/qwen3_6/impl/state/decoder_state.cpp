@@ -15,7 +15,8 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
                               std::int32_t kv_heads, std::int32_t head_dim, DType dtype,
                               std::int32_t quant_group, std::int32_t table_rows,
                               std::uint32_t physical_page_groups,
-                              const std::vector<std::uint32_t>& skip_layers) {
+                              const std::vector<std::uint32_t>& skip_layers,
+                              std::int32_t indexer_head_dim) {
     if (layers == 0 ||
         layers > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
         kv_heads <= 0 || head_dim <= 0 || table_rows <= 0) {
@@ -54,7 +55,9 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
     pool_spec.page_group_count      = physical_page_groups;
     pool_spec.logical_page_capacity = logical_pages;
     pool_spec.table_rows            = table_rows;
-    pool_spec.planes.reserve(static_cast<std::size_t>(layers) * (grouped ? 4ULL : 2ULL));
+    const std::size_t planes_per_layer =
+        (grouped ? 4ULL : 2ULL) + (indexer_head_dim > 0 ? 1ULL : 0ULL);
+    pool_spec.planes.reserve(static_cast<std::size_t>(layers) * planes_per_layer);
     std::vector<DType> layer_dtypes(layers, dtype);
     for (const std::uint32_t skipped : skip_layers) { layer_dtypes[skipped] = DType::BF16; }
     for (std::uint32_t layer = 0; layer < layers; ++layer) {
@@ -65,6 +68,11 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
             pool_spec.planes.push_back({DType::FP16, head_dim / quant_group, kv_heads, 256});
             pool_spec.planes.push_back({DType::FP16, head_dim / quant_group, kv_heads, 256});
         }
+        // The indexer plane is always BF16 and one head: the selection reads raw keys and a
+        // quantized cache would change which cells the model attends to, not just their values.
+        if (indexer_head_dim > 0) {
+            pool_spec.planes.push_back({DType::BF16, indexer_head_dim, 1, 256});
+        }
     }
     return PagedKVCacheLayout{
         .pool        = plan_paged_kv_pool(builder, pool_spec),
@@ -74,6 +82,7 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
         .head_dim    = head_dim,
         .dtype        = dtype,
         .quant_group  = quant_group,
+        .indexer_head_dim = indexer_head_dim,
         .layer_dtypes = std::move(layer_dtypes),
     };
 }
@@ -85,12 +94,12 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
     layout.text_kv = plan_cache(builder, spec.full_attention_layers, spec.capacity, spec.kv_heads,
                                 spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,
                                 spec.kv_table_rows, spec.text_physical_page_groups,
-                                spec.kv_skip_layers);
+                                spec.kv_skip_layers, spec.indexer_head_dim);
     if (spec.enable_mtp) {
         layout.mtp_kv = plan_cache(builder, spec.mtp_layers, spec.capacity, spec.kv_heads,
                                    spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,
                                    spec.kv_table_rows, spec.mtp_physical_page_groups,
-                                   spec.kv_skip_layers);
+                                   spec.kv_skip_layers, 0);
     }
     layout.linear_attention = plan_linear_attention_state_pool(builder, spec.linear_attention);
     if (spec.ple) { layout.ple = plan_ngram_ple_state_pool(builder, *spec.ple); }
@@ -100,7 +109,8 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
 PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout)
     : pool_(backing, layout.pool), layers_(layout.layers), max_context_(layout.max_context),
       kv_heads_(layout.kv_heads), head_dim_(layout.head_dim), dtype_(layout.dtype),
-      quant_group_(layout.quant_group), layer_dtypes_(layout.layer_dtypes) {}
+      quant_group_(layout.quant_group), indexer_head_dim_(layout.indexer_head_dim),
+      layer_dtypes_(layout.layer_dtypes) {}
 
 PagedKVCacheView::PagedKVCacheView(const PagedKVCache& cache, Tensor block_table) noexcept
     : cache_(&cache), block_table_(block_table) {}
@@ -127,13 +137,15 @@ PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_tabl
     // fp8 layer occupies the same two planes a bf16 layer does, which is what
     // lets the two be mixed within one pool.
     const bool grouped       = dtype_ == DType::I8;
-    const std::size_t stride = grouped ? 4ULL : 2ULL;
+    const std::size_t stride =
+        (grouped ? 4ULL : 2ULL) + (indexer_head_dim_ > 0 ? 1ULL : 0ULL);
     const std::size_t base   = static_cast<std::size_t>(layer) * stride;
     return PagedKVLayerView{
         .k_pages       = pool_.plane(base),
         .v_pages       = pool_.plane(base + 1),
         .k_scale_pages = grouped ? pool_.plane(base + 2) : Tensor(),
         .v_scale_pages = grouped ? pool_.plane(base + 3) : Tensor(),
+        .indexer_pages = indexer_head_dim_ > 0 ? pool_.plane(base + (grouped ? 4ULL : 2ULL)) : Tensor(),
         .block_table   = block_table,
         .head_dim      = head_dim_,
         .num_kv_heads  = kv_heads_,
@@ -148,13 +160,15 @@ PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const 
     // fp8 layer occupies the same two planes a bf16 layer does, which is what
     // lets the two be mixed within one pool.
     const bool grouped       = dtype_ == DType::I8;
-    const std::size_t stride = grouped ? 4ULL : 2ULL;
+    const std::size_t stride =
+        (grouped ? 4ULL : 2ULL) + (indexer_head_dim_ > 0 ? 1ULL : 0ULL);
     const std::size_t base   = static_cast<std::size_t>(layer) * stride;
     return PagedKVBatchLayerView{
         .k_pages       = pool_.plane(base),
         .v_pages       = pool_.plane(base + 1),
         .k_scale_pages = grouped ? pool_.plane(base + 2) : Tensor(),
         .v_scale_pages = grouped ? pool_.plane(base + 3) : Tensor(),
+        .indexer_pages = indexer_head_dim_ > 0 ? pool_.plane(base + (grouped ? 4ULL : 2ULL)) : Tensor(),
         .block_tables  = pool_.block_tables(),
         .head_dim      = head_dim_,
         .num_kv_heads  = kv_heads_,
