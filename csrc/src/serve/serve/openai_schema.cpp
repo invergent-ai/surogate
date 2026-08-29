@@ -380,6 +380,9 @@ void parse_tool_choice(const Json& body, GenerationRequest& out) {
 }
 
 void parse_stop(const Json& body, GenerationRequest& out) {
+    if (body.contains("ignore_eos") && body.at("ignore_eos").is_boolean()) {
+        out.ignore_eos = body.at("ignore_eos").get<bool>();
+    }
     if (!body.contains("stop") || body.at("stop").is_null()) { return; }
     const Json& stop = body.at("stop");
     if (stop.is_string()) {

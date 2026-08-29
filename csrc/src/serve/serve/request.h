@@ -171,6 +171,9 @@ struct GenerationRequest {
     std::size_t tool_name_max_length = 64;
     ToolChoice tool_choice;
     std::vector<std::string> stop_strings;
+    // Benchmark knob (vLLM-compatible): generation ignores the model's stop tokens and runs to
+    // max_tokens, so throughput is measured on a fixed output length.
+    bool ignore_eos = false;
     int max_tokens      = 0; // 0 => use server default
     bool max_tokens_set = false;
     bool stream         = false;

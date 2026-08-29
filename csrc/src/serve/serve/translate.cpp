@@ -222,6 +222,7 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
     options.execution.sampling             = resolve_sampling_overrides(request.sampling, server);
     options.output.raw                     = false;
     options.output.preserve_special_tokens = request.uses_tools() || request.has_tool_history();
+    options.stop.include_model_defaults = !request.ignore_eos;
     options.stop.strings.reserve(request.stop_strings.size());
     for (const std::string& stop : request.stop_strings) {
         if (!stop.empty()) {
