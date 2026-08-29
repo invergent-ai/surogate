@@ -203,6 +203,31 @@ struct ExpertSlotCache {
         std::fill_n(cache.out_host + column0, static_cast<std::size_t>(hidden) * tokens, 0.0F);
         if (count <= 0) { return; }
         cache.job_scratch.resize(static_cast<std::size_t>(count));
+        // SUROGATE_SERVE_CPU_MOE_VERIFY=1: the mirror this callback reads must describe *this*
+        // slice. A round of T columns routes at most T * experts_per_token paths, and every job
+        // names a column of the slice and an expert of the layer — so a mirror overwritten by a
+        // later slice, or read before its copy landed, shows up here instead of as a wrong token
+        // several layers later. Off by default: it is a per-job check on the host's critical path.
+        static const bool verify = std::getenv("SUROGATE_SERVE_CPU_MOE_VERIFY") != nullptr;
+        if (verify) {
+            const auto geometry = ops::kSparseMoeFlashNextGeometry;
+            const long long ceiling =
+                static_cast<long long>(tokens) * geometry.experts_per_token;
+            long long bad = count > ceiling ? -1 : 0;
+            for (long long i = 0; bad == 0 && i < count; ++i) {
+                if (mirror.tokens[i] < 0 || mirror.tokens[i] >= tokens ||
+                    mirror.experts[i] < 0 || mirror.experts[i] >= geometry.experts) {
+                    bad = i + 1;
+                }
+            }
+            if (bad != 0) {
+                std::fprintf(stderr,
+                             "qwen4exp: CPU split job list is inconsistent (layer %d, slice "
+                             "offset %d, tokens %d, ordinal %d, count %lld, ceiling %lld, %s)\n",
+                             entry->index, slice->offset, tokens, slice->ordinal, count, ceiling,
+                             bad < 0 ? "count over ceiling" : "job out of range");
+            }
+        }
         for (long long i = 0; i < count; ++i) {
             cache.job_scratch[static_cast<std::size_t>(i)] = {mirror.tokens[i], mirror.experts[i], mirror.weights[i]};
         }
