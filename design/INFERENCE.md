@@ -1631,3 +1631,37 @@ with 2,100 slots the split is simply slower (514 tok/s off vs 395 on at 64 users
 68%-resident stage pays a host round trip per layer it could have served from its own pool.
 `--cpu-moe-share` still enables it.
 
+### Q4 host expert bank (2026-08-29, in validation)
+
+`--host-expert-bank q4` requantises the routed expert objects W8→Q4G32AM while they are copied
+into pinned memory: 4-bit unsigned codes on a 16-level affine grid per 32-group (FP16 scale +
+FP16 min), 20 bytes per group against W8's 34. The GGUF source was Q4_K, whose sub-blocks are
+16-level affine grids of 32 — so the refit is near-exact for these weights (the unit test
+reproduces an exact grid to 6e-5; fully random codes, the worst case the real weights never
+hit, land at 12 % rel-L2). Layout and consumers:
+
+- one pinned object per matrix: nibble plane, then FP16 scales, then FP16 mins, all in the W8
+  planes' (row, k-group) order (`ops::q4_bank_planes`);
+- the miss gather (`gather_unpack_q4_kernel`) decodes the grid and requantises to the pool's
+  symmetric W8 with a fresh amax/127 scale — the pool and every MoE kernel are unchanged, and
+  the unit test shows the unpack byte-exact against the CPU expectation;
+- the CPU split reads Q4 natively: VNNI kernels dot the unsigned nibbles directly and fold the
+  affine min through the already-precomputed 128·Σxq group sums (three extra vector ops per 16
+  groups); scalar oracle for tails and as the tested reference;
+- the zero-copy path cannot read Q4, so the flag requires `--expert-slots`; requantisation runs
+  inside the bank loader's worker threads.
+
+First measurements (one 5090, guarded, slots 3000, share auto, 16 lanes):
+
+| | W8 bank | Q4 bank |
+|---|---:|---:|
+| cgroup peak at listen | 297 GB | **101 GB** |
+| host available while serving | ~206 GB | **383 GB** |
+| startup to listening | ~2-3 min | **96 s** |
+| decode 1 user (same probe, same day) | 13.8 tok/s | **15.0** |
+| decode 16 users | 23.8 tok/s | **26.2** |
+
+The memory drop also shrinks the machine-crash trigger (the ~150 GB pinned teardown suspected
+in the 4th crash): the pinned bank is now ~90 GB. Running: the 100-probe coherence battery on
+Q4, then the W8 control arm, then the needle battery with the indexer.
+
