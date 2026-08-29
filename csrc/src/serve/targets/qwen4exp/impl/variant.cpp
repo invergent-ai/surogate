@@ -52,8 +52,31 @@ thread_local Tensor t_inject;
 struct PendingPartial {
     const float* device_alias = nullptr;
     cudaEvent_t join          = nullptr;
+    int device                = -1; // the device whose buffers this partial points at
 };
 thread_local PendingPartial t_partial;
+// The inject gates and the partial are handed from the mixer to the combine through this
+// thread, while the buffers they name belong to a device. One thread drives every stage of a
+// pipeline, so a hand-off that crosses a stage boundary would add one device's expert output
+// into another's residual. SUROGATE_SERVE_CPU_MOE_VERIFY=1 checks that it never does.
+thread_local int t_inject_device = -1;
+
+[[nodiscard]] inline bool cpu_moe_verify() {
+    static const bool on = std::getenv("SUROGATE_SERVE_CPU_MOE_VERIFY") != nullptr;
+    return on;
+}
+
+inline void check_device_handoff(const char* what, int produced_on) {
+    if (!cpu_moe_verify() || produced_on < 0) { return; }
+    int current = -1;
+    cudaGetDevice(&current);
+    if (current != produced_on) {
+        std::fprintf(stderr,
+                     "qwen4exp: %s was produced on device %d and is being consumed on device "
+                     "%d\n",
+                     what, produced_on, current);
+    }
+}
 
 struct InjectScratch {
     void* data        = nullptr;
@@ -267,7 +290,10 @@ struct ExpertSlotCache {
         CUDA_CHECK(cudaLaunchHostFunc(cpu_stream, &ExpertSlotCache::run_cpu_round, &slice));
         CUDA_CHECK(cudaEventRecord(join_event, cpu_stream));
         entry.round_offset = offset + tokens;
-        t_partial = PendingPartial{static_cast<const float*>(out_device_alias), join_event};
+        int partial_device = -1;
+        CUDA_CHECK(cudaGetDevice(&partial_device));
+        t_partial =
+            PendingPartial{static_cast<const float*>(out_device_alias), join_event, partial_device};
     }
 
     static void resolve_round(void* context, const Tensor& ids, const Tensor& alpha,
@@ -686,6 +712,7 @@ void mix_into(const Tensor& residual, const ops::HyperConnectionWeights& weights
     ops::hyper_connection_mix(residual, weights, kStreams, kEps, hidden, &inject, workspace,
                               stream);
     t_inject = inject;
+    CUDA_CHECK(cudaGetDevice(&t_inject_device));
     maybe_dump_block("mixed", hidden, stream);
     maybe_dump_block("inject", inject, stream);
 }
@@ -697,6 +724,7 @@ void combine_into(const Tensor& block_output, Tensor& residual, cudaStream_t str
     }
     maybe_dump_block("blockout", block_output, stream);
     if (t_partial.device_alias != nullptr) {
+        check_device_handoff("a host expert partial", t_partial.device);
         // Join the host round (side stream) before the combine reads its partial.
         CUDA_CHECK(cudaStreamWaitEvent(stream, t_partial.join, 0));
         ops::hyper_connection_combine(block_output, t_partial.device_alias, t_inject, residual, stream);
@@ -706,6 +734,8 @@ void combine_into(const Tensor& block_output, Tensor& residual, cudaStream_t str
     }
     maybe_dump_block("combined", residual, stream);
     g_dump_block += 1;
+    check_device_handoff("the inject gates", t_inject_device);
+    t_inject_device = -1;
     t_inject = Tensor{};
 }
 
