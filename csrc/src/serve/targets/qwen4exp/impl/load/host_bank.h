@@ -21,6 +21,11 @@ struct HostObjectPlan {
     artifact::ObjectHandle handle;
     std::span<const std::byte> payload; ///< the artifact mapping; valid while the reader lives
     std::string name;
+    // Non-zero: requantise this W8 row-split object to Q4G32AM while it is copied into pinned
+    // memory (`q4_rows x q4_k` weights; `q4_w8_scale_offset` locates the source scales plane).
+    std::int64_t q4_rows           = 0;
+    std::int32_t q4_k              = 0;
+    std::size_t q4_w8_scale_offset = 0;
 };
 
 struct HostBankPlan {

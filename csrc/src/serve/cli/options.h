@@ -21,6 +21,7 @@ struct Options {
     std::uint32_t max_context    = 2048;
     KvCapacityPolicy kv_capacity = KvCapacityPolicy::explicit_capacity(2048);
     std::uint32_t expert_slots = 0; // --expert-slots N
+    bool host_expert_bank_q4   = false; // --host-expert-bank q4
     float cpu_moe_share = 0.0F; // --cpu-moe-share F
     std::uint32_t cpu_moe_min_tokens = 0; // --cpu-moe-min-tokens N
     float cpu_moe_prefill_share      = -1.0F; // --cpu-moe-prefill-share F (default 0.5 with the split; 0 = off)

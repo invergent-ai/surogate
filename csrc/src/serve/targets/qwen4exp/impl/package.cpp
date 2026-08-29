@@ -88,9 +88,19 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
         throw std::runtime_error(
             "qwen3.8-flash-next: speculative decoding (MTP/DFlash) is not served by this target");
     }
-    return LoadPlan(std::make_unique<LoadPlan::Impl>(weights_profile,
-                                                     detail::bind_artifact(binder, features, options.pipeline_stage_first,
-                                                                           options.pipeline_stage_last)));
+    if (options.host_expert_bank_q4 && options.expert_slots == 0) {
+        throw std::invalid_argument(
+            "qwen3.8-flash-next: --host-expert-bank q4 requires --expert-slots (the zero-copy "
+            "kernels read the W8 bank directly)");
+    }
+    if (options.host_expert_bank_q4) {
+        std::fprintf(stderr, "qwen4exp: host expert bank Q4G32AM (59 %% of the W8 bytes; "
+                             "requantised while loading)\n");
+    }
+    return LoadPlan(std::make_unique<LoadPlan::Impl>(
+        weights_profile, detail::bind_artifact(binder, features, options.pipeline_stage_first,
+                                               options.pipeline_stage_last,
+                                               options.host_expert_bank_q4)));
 }
 
 std::unique_ptr<Package::LoadedModel>

@@ -95,6 +95,10 @@ struct EngineOptions {
     bool cpu_moe_pool_per_socket       = false;
     std::uint32_t max_context          = 2048; // Exact logical ceiling of each request.
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
+    // Store the pinned host expert bank as Q4G32AM (4-bit affine groups requantised from the
+    // artifact's W8 at load): 59 % of the bytes, near-exact for Q4_K-derived experts. Requires
+    // the expert slot cache (the zero-copy kernels read W8 only).
+    bool host_expert_bank_q4           = false;
     // Expert slot cache for targets that stream MoE experts from the host: number of device
     // expert slots (0 = experts are read from the host bank in place). Targets without a
     // host bank ignore it.

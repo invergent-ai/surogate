@@ -35,6 +35,22 @@ artifact::ObjectHandle device(artifact::Binder& binder, const std::string& name,
     return artifact::bind_tensor(binder, name, format, shape, g_layer_placement);
 }
 
+// As `host`, but marks the object for W8→Q4G32AM requantisation at bank load.
+artifact::ObjectHandle host_q4(artifact::Binder& binder, HostBankPlan& bank,
+                               const std::string& name, NumericFormat format,
+                               std::initializer_list<std::uint64_t> shape) {
+    const artifact::ObjectHandle handle =
+        artifact::bind_tensor(binder, name, format, shape, TensorPlacement::ValidateOnly);
+    const artifact::RowSplitGeometry geometry = artifact::row_split_geometry(
+        format, std::span<const std::uint64_t>(shape.begin(), shape.size()));
+    HostObjectPlan plan{handle, binder.payload(handle).data, name};
+    plan.q4_rows            = static_cast<std::int64_t>(*shape.begin());
+    plan.q4_k               = static_cast<std::int32_t>(*(shape.begin() + 1));
+    plan.q4_w8_scale_offset = geometry.scale_plane_offset;
+    bank.objects.push_back(std::move(plan));
+    return handle;
+}
+
 // Validates the object and records its mapping for the pinned host bank.
 artifact::ObjectHandle host(artifact::Binder& binder, HostBankPlan& bank, const std::string& name,
                             NumericFormat format, std::initializer_list<std::uint64_t> shape) {
@@ -56,14 +72,17 @@ HyperConnectionPlan bind_hc(artifact::Binder& binder, const std::string& prefix,
     return plan;
 }
 
-MoePlan bind_moe(artifact::Binder& binder, HostBankPlan& bank, const std::string& prefix) {
+MoePlan bind_moe(artifact::Binder& binder, HostBankPlan& bank, const std::string& prefix,
+                 bool q4) {
+    const auto routed = [&](const std::string& name, std::initializer_list<std::uint64_t> shape) {
+        return q4 ? host_q4(binder, bank, name, NumericFormat::W8G32_F16S, shape)
+                  : host(binder, bank, name, NumericFormat::W8G32_F16S, shape);
+    };
     return MoePlan{
         .router_shared_gate = device(binder, prefix + "router_shared_gate", NumericFormat::BF16,
                                      {kExperts + 1, kHidden}),
-        .routed_gate_up = host(binder, bank, prefix + "routed_gate_up", NumericFormat::W8G32_F16S,
-                               {kExperts * 2 * kFfn, kHidden}),
-        .routed_down    = host(binder, bank, prefix + "routed_down", NumericFormat::W8G32_F16S,
-                               {kExperts * kHidden, kFfn}),
+        .routed_gate_up = routed(prefix + "routed_gate_up", {kExperts * 2 * kFfn, kHidden}),
+        .routed_down    = routed(prefix + "routed_down", {kExperts * kHidden, kFfn}),
         .shared_gate_up = device(binder, prefix + "shared_gate_up", NumericFormat::W8G32_F16S,
                                  {2 * kFfn, kHidden}),
         .shared_down =
@@ -136,18 +155,56 @@ Weight host_w8_weight(const HostObject& object, std::int32_t rows, std::int32_t 
     return out;
 }
 
+// The Q4G32AM flavour: base pointer + shape only. The object is not a W8 plane pair, so the
+// W8 size validation and the scale-plane split do not apply; readers derive the Q4 planes from
+// the geometry (ops::q4_bank_planes).
+Weight host_q4_weight(const HostObject& object, std::int32_t rows, std::int32_t columns) {
+    Weight out{};
+    out.payload         = static_cast<const std::byte*>(object.device);
+    out.payload_bytes   = object.bytes;
+    out.qtype           = QType::W8G32_F16S; // metadata only; see above
+    out.layout          = QuantLayout::RowSplit;
+    out.group_size      = 32;
+    out.qdata           = static_cast<const std::byte*>(object.device);
+    out.qhigh           = nullptr;
+    out.scales          = nullptr;
+    out.n               = rows;
+    out.k               = columns;
+    out.group           = 32;
+    out.scale_dtype     = DType::FP16;
+    out.ndim            = 2;
+    out.shape[0]        = rows;
+    out.shape[1]        = columns;
+    out.padded_shape[0] = rows;
+    out.padded_shape[1] = columns;
+    return out;
+}
+
 SparseMoePayload load_moe(const artifact::MaterializedArtifact& backing, const HostBank& bank,
-                          const MoePlan& plan, ops::HyperConnectionWeights mix) {
+                          const MoePlan& plan, ops::HyperConnectionWeights mix, bool q4) {
     SparseMoePayload out;
+    out.host_bank_q4          = q4;
     out.op.router_shared_gate = artifact::materialized_weight(
         backing, plan.router_shared_gate, NumericFormat::BF16,
         static_cast<std::int32_t>(kExperts + 1), static_cast<std::int32_t>(kHidden));
-    out.op.routed_gate_up = host_w8_weight(bank.object(plan.routed_gate_up),
-                                           static_cast<std::int32_t>(kExperts * 2 * kFfn),
-                                           static_cast<std::int32_t>(kHidden));
-    out.op.routed_down    = host_w8_weight(bank.object(plan.routed_down),
-                                           static_cast<std::int32_t>(kExperts * kHidden),
-                                           static_cast<std::int32_t>(kFfn));
+    if (q4) {
+        // The Q4 objects carry their own plane layout; the routed Weights hold only the
+        // mapped base pointer and shape metadata (the slot cache is mandatory, so no kernel
+        // ever reads them as W8 planes — expert_slot_weights swaps in the pool's).
+        out.op.routed_gate_up = host_q4_weight(bank.object(plan.routed_gate_up),
+                                               static_cast<std::int32_t>(kExperts * 2 * kFfn),
+                                               static_cast<std::int32_t>(kHidden));
+        out.op.routed_down    = host_q4_weight(bank.object(plan.routed_down),
+                                               static_cast<std::int32_t>(kExperts * kHidden),
+                                               static_cast<std::int32_t>(kFfn));
+    } else {
+        out.op.routed_gate_up = host_w8_weight(bank.object(plan.routed_gate_up),
+                                               static_cast<std::int32_t>(kExperts * 2 * kFfn),
+                                               static_cast<std::int32_t>(kHidden));
+        out.op.routed_down    = host_w8_weight(bank.object(plan.routed_down),
+                                               static_cast<std::int32_t>(kExperts * kHidden),
+                                               static_cast<std::int32_t>(kFfn));
+    }
     out.op.shared_gate_up = artifact::materialized_weight(
         backing, plan.shared_gate_up, NumericFormat::W8G32_F16S, static_cast<std::int32_t>(2 * kFfn),
         static_cast<std::int32_t>(kHidden));
@@ -165,12 +222,13 @@ SparseMoePayload load_moe(const artifact::MaterializedArtifact& backing, const H
 } // namespace
 
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeatures features,
-                               int stage_first, int stage_last) {
+                               int stage_first, int stage_last, bool host_bank_q4) {
     const bool staged = stage_last > 0;
     ArtifactLoadPlan load_plan;
     BindingPlan& out    = load_plan.bindings;
     out.frontend        = qwen3_6::bind_frontend_resources(binder);
     out.features        = features;
+    out.host_bank_q4    = host_bank_q4;
     out.token_embedding = device(binder, "text/token_embedding", NumericFormat::W8G32_F16S,
                                  {kVocab, kHidden});
 
@@ -245,7 +303,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeature
             target.ple.convolution = device(binder, prefix + "ple/convolution", NumericFormat::BF16,
                                             {TextConfig::ple_conv_kernel, kHcWidth});
         }
-        target.moe = bind_moe(binder, out.host_bank, prefix + "mlp/");
+        target.moe = bind_moe(binder, out.host_bank, prefix + "mlp/", host_bank_q4);
     }
     g_layer_placement = TensorPlacement::Device;
 
@@ -335,7 +393,8 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             target.output = artifact::materialized_weight(
                 backing, source.attention.output, NumericFormat::W8G32_F16S,
                 static_cast<std::int32_t>(kHidden), TextConfig::query_size);
-            target.post_mixer = load_moe(backing, *host_bank, source.moe, std::move(mix_mlp));
+            target.post_mixer = load_moe(backing, *host_bank, source.moe, std::move(mix_mlp),
+                                         plan.host_bank_q4);
             target.post_mixer.layer = static_cast<std::int32_t>(layer);
         } else {
             GdnWeights& target = runtime.gdn_layers.at(gdn_index++);
@@ -360,7 +419,8 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             target.output = artifact::materialized_weight(
                 backing, source.gdn.output, NumericFormat::W8G32_F16S,
                 static_cast<std::int32_t>(kHidden), static_cast<std::int32_t>(kValueDim));
-            target.post_mixer = load_moe(backing, *host_bank, source.moe, std::move(mix_mlp));
+            target.post_mixer = load_moe(backing, *host_bank, source.moe, std::move(mix_mlp),
+                                         plan.host_bank_q4);
             target.post_mixer.layer = static_cast<std::int32_t>(layer);
         }
         if (source.has_ple) {

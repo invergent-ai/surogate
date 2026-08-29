@@ -96,6 +96,7 @@ struct TextLayerPlan {
 struct BindingPlan {
     qwen3_6::FrontendResourcePlan frontend;
     qwen3_6::StartupFeatures features;
+    bool host_bank_q4 = false; // the routed expert objects are requantised to Q4G32AM
     artifact::ObjectHandle token_embedding;
     std::array<TextLayerPlan, kTextLayers> text_layers;
     HyperConnectionPlan output_mix;
@@ -118,7 +119,8 @@ struct ArtifactLoadPlan {
 /// `stage_first/stage_last` (0/0 = every layer) restrict device residency to the layers of a
 /// pipeline stage.
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeatures features,
-                               int stage_first = 0, int stage_last = 0);
+                               int stage_first = 0, int stage_last = 0,
+                               bool host_bank_q4 = false);
 
 /// Per-block hyper-connection weights ride on the projection payloads the family hands to the
 /// Variant at the norm hooks, so the Variant can mix before its projection.
@@ -149,6 +151,7 @@ struct GdnProjectionPayload {
 struct SparseMoePayload {
     ops::SparseMoeWeights op;
     ops::HyperConnectionWeights mix;
+    bool host_bank_q4  = false; // the routed objects are Q4G32AM (slot cache required)
     std::int32_t layer = -1; // text layer index (the expert slot cache keys its tables by it)
     // Host virtual addresses of the routed expert objects (the Weights above hold the
     // device-mapped aliases); the CPU expert compute reads the planes through these.

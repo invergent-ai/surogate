@@ -76,7 +76,7 @@ ReasoningEffort parse_reasoning_effort(std::string_view text) {
 std::string usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
-           "       [--max-context N|auto] [--kv-capacity N|auto] [--expert-slots N] [--cpu-moe-share F] [--cpu-moe-min-tokens N] [--prefill-chunk N] [--max-new N]\n"
+           "       [--max-context N|auto] [--kv-capacity N|auto] [--expert-slots N] [--host-expert-bank w8|q4] [--cpu-moe-share F] [--cpu-moe-min-tokens N] [--prefill-chunk N] [--max-new N]\n"
            "       [--device N] [--devices A,B,...]\n"
            "       [--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N]\n"
            "       [--lm-head-draft]\n"
@@ -129,6 +129,13 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--kv-capacity") {
             options.kv_capacity  = parse_kv_capacity(value(arg));
             kv_capacity_explicit = true;
+        } else if (arg == "--host-expert-bank") {
+            const std::string text = value(arg);
+            if (text == "q4") {
+                options.host_expert_bank_q4 = true;
+            } else if (text != "w8") {
+                throw std::invalid_argument("--host-expert-bank must be w8 or q4");
+            }
         } else if (arg == "--expert-slots") {
             options.expert_slots = parse_u32(value(arg), "expert-slots");
         } else if (arg == "--cpu-moe-min-tokens") {

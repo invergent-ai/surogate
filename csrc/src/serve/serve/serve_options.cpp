@@ -103,7 +103,7 @@ KvCapacityPolicy parse_kv_capacity(const char* text) {
 std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
-           "[--served-model-name ID] [--max-model-len N|auto] [--kv-capacity N|auto] [--expert-slots N] [--cpu-moe-share F|auto] [--cpu-moe-prefill-share F] [--cpu-moe-min-tokens N] "
+           "[--served-model-name ID] [--max-model-len N|auto] [--kv-capacity N|auto] [--expert-slots N] [--host-expert-bank w8|q4] [--cpu-moe-share F|auto] [--cpu-moe-prefill-share F] [--cpu-moe-min-tokens N] "
            "[--max-num-seqs N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--max-num-batched-tokens N] [--log-stats-interval-ms N] [--device N] [--devices A,B,...] "
@@ -202,6 +202,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--kv-capacity") {
             options.kv_capacity  = parse_kv_capacity(require_value("--kv-capacity"));
             kv_capacity_explicit = true;
+        } else if (arg == "--host-expert-bank") {
+            const std::string text = require_value("--host-expert-bank");
+            if (text == "q4") {
+                options.host_expert_bank_q4 = true;
+            } else if (text != "w8") {
+                throw std::invalid_argument("--host-expert-bank must be w8 or q4");
+            }
         } else if (arg == "--expert-slots") {
             options.expert_slots =
                 static_cast<std::uint32_t>(parse_nonnegative_int(require_value("--expert-slots"), "expert-slots"));

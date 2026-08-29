@@ -156,8 +156,29 @@ struct ExpertSlotCache {
         if (entry.owner == nullptr) {
             entry.owner = this;
             entry.index = weights.layer;
-            entry.bank  = ops::expert_host_bank(ops::kSparseMoeFlashNextGeometry,
-                                                weights.op.routed_gate_up, weights.op.routed_down);
+            const auto geometry = ops::kSparseMoeFlashNextGeometry;
+            if (weights.host_bank_q4) {
+                entry.bank = ops::expert_host_bank_q4(geometry, weights.op.routed_gate_up.qdata,
+                                                      weights.op.routed_down.qdata);
+                if (weights.host_gate_up != nullptr && weights.host_down != nullptr) {
+                    const ops::Q4BankPlanes gate = ops::q4_bank_planes(
+                        static_cast<std::int64_t>(geometry.experts) * geometry.expert_rows(),
+                        geometry.hidden);
+                    const ops::Q4BankPlanes down = ops::q4_bank_planes(
+                        static_cast<std::int64_t>(geometry.experts) * geometry.hidden,
+                        geometry.intermediate);
+                    entry.cpu_bank.format         = ops::ExpertBankFormat::Q4G32AM;
+                    entry.cpu_bank.gate_up_codes  = weights.host_gate_up;
+                    entry.cpu_bank.gate_up_scales = weights.host_gate_up + gate.scales_offset;
+                    entry.cpu_bank.gate_up_mins   = weights.host_gate_up + gate.mins_offset;
+                    entry.cpu_bank.down_codes     = weights.host_down;
+                    entry.cpu_bank.down_scales    = weights.host_down + down.scales_offset;
+                    entry.cpu_bank.down_mins      = weights.host_down + down.mins_offset;
+                }
+                return entry;
+            }
+            entry.bank  = ops::expert_host_bank(geometry, weights.op.routed_gate_up,
+                                                weights.op.routed_down);
             if (weights.host_gate_up != nullptr && weights.host_down != nullptr) {
                 // Plane offsets are the same in the host and device views of the object.
                 const auto gate_scale_offset = static_cast<const std::byte*>(weights.op.routed_gate_up.scales) -

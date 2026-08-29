@@ -232,6 +232,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.max_context              = options_.max_context;
     engine_options.kv_capacity              = options_.kv_capacity;
     engine_options.expert_slots             = options_.expert_slots;
+    engine_options.host_expert_bank_q4      = options_.host_expert_bank_q4;
     engine_options.cpu_moe_share            = options_.cpu_moe_share;
     engine_options.cpu_moe_min_tokens       = options_.cpu_moe_min_tokens;
     engine_options.cpu_moe_prefill_share    = options_.cpu_moe_prefill_share;
