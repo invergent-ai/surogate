@@ -80,6 +80,10 @@ private:
 struct Package {
     static constexpr std::string_view model_id   = "qwen3.8-flash-next";
     static constexpr std::string_view target_key = "qwen4exp";
+    /// Longest context the weights were trained for; `max_context = 0` asks the engine to
+    /// fit the largest context the device's free memory allows, up to this. A function, not a
+    /// constant: `detail::Variant` is only forward-declared here.
+    [[nodiscard]] static std::uint32_t maximum_context() noexcept;
 
     using WeightsProfile  = detail::WeightsProfile;
     using LoadPlan        = detail::LoadPlan;

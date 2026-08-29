@@ -103,7 +103,7 @@ KvCapacityPolicy parse_kv_capacity(const char* text) {
 std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
-           "[--served-model-name ID] [--max-model-len N] [--kv-capacity N|auto] [--expert-slots N] [--cpu-moe-share F|auto] [--cpu-moe-prefill-share F] [--cpu-moe-min-tokens N] "
+           "[--served-model-name ID] [--max-model-len N|auto] [--kv-capacity N|auto] [--expert-slots N] [--cpu-moe-share F|auto] [--cpu-moe-prefill-share F] [--cpu-moe-min-tokens N] "
            "[--max-num-seqs N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--max-num-batched-tokens N] [--log-stats-interval-ms N] [--device N] [--devices A,B,...] "
@@ -166,6 +166,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     bool default_max_tokens_explicit = false;
     bool kv_capacity_explicit        = false;
+    bool max_context_explicit        = false;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         options.help_requested = true;
         return options;
@@ -190,8 +191,14 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument("--served-model-name must not be empty");
             }
         } else if (arg == "--max-model-len") {
-            options.max_context = static_cast<std::uint32_t>(
-                parse_nonnegative_int(require_value("--max-model-len"), "max-model-len"));
+            const std::string text = require_value("--max-model-len");
+            // `auto` (and the absence of the flag) means: fit the largest context the device's
+            // free memory allows, up to what the weights were trained for.
+            options.max_context =
+                text == "auto" ? 0U
+                               : static_cast<std::uint32_t>(
+                                     parse_nonnegative_int(text.c_str(), "max-model-len"));
+            max_context_explicit = true;
         } else if (arg == "--kv-capacity") {
             options.kv_capacity  = parse_kv_capacity(require_value("--kv-capacity"));
             kv_capacity_explicit = true;
@@ -356,14 +363,16 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             throw std::invalid_argument("unknown argument: " + arg);
         }
     }
+    if (!max_context_explicit) { options.max_context = 0; } // auto by default
     if (!kv_capacity_explicit) {
-        options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
+        options.kv_capacity = options.max_context == 0
+                                  ? KvCapacityPolicy::automatic(kDefaultKvCapacityHeadroomBytes)
+                                  : KvCapacityPolicy::explicit_capacity(options.max_context);
     }
     if (options.port <= 0 || options.port > 65535) {
         throw std::invalid_argument("--port must be in [1,65535]");
     }
-    if (options.max_context == 0) { throw std::invalid_argument("--max-model-len must be positive"); }
-    if (options.kv_capacity.mode == KvCapacityMode::Explicit &&
+    if (options.kv_capacity.mode == KvCapacityMode::Explicit && options.max_context != 0 &&
         options.kv_capacity.explicit_tokens < options.max_context) {
         throw std::invalid_argument("--kv-capacity must be at least --max-model-len");
     }

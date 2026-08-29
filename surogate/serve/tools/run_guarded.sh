@@ -24,8 +24,11 @@ while [ $# -gt 0 ]; do
 done
 [ $# -gt 0 ] || { echo "run_guarded.sh: no command given" >&2; exit 2; }
 
-# One offloaded model at a time: a second copy of the bank is what exhausts the host.
-live=$(pgrep -x surogate-engine; pgrep -f 'surogate-engine-cl[i]') || true
+# One offloaded model at a time: a second copy of the bank is what exhausts the host. Match on
+# the executing binary (`-x`), never the command line: a `-f` pattern also matches this script,
+# whose own arguments name the binary.  `comm` truncates at 15 characters, so this one name
+# covers surogate-engine and surogate-engine-cli alike.
+live=$(pgrep -x surogate-engine) || true
 if [ -n "${live//[$'\n' ]/}" ]; then
   echo "run_guarded.sh: a serving process is already running (${live//$'\n'/ }); refusing to start a second" >&2
   exit 1

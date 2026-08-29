@@ -82,6 +82,8 @@ ModelSamplingDefaults Package::sampling_defaults(std::string_view model) {
                              std::string(target_key) + "'");
 }
 
+std::uint32_t Package::maximum_context() noexcept { return detail::Variant::maximum_context; }
+
 Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentity& identity) {
     if (identity.model_id == model_id && identity.weights_id == "groupwise-int") {
         return WeightsProfile::Qwen36GroupwiseInt;

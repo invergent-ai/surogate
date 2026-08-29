@@ -76,7 +76,7 @@ ReasoningEffort parse_reasoning_effort(std::string_view text) {
 std::string usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
-           "       [--max-context N] [--kv-capacity N|auto] [--expert-slots N] [--cpu-moe-share F] [--cpu-moe-min-tokens N] [--prefill-chunk N] [--max-new N]\n"
+           "       [--max-context N|auto] [--kv-capacity N|auto] [--expert-slots N] [--cpu-moe-share F] [--cpu-moe-min-tokens N] [--prefill-chunk N] [--max-new N]\n"
            "       [--device N] [--devices A,B,...]\n"
            "       [--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N]\n"
            "       [--lm-head-draft]\n"
@@ -107,6 +107,7 @@ Options parse_options(int argc, char** argv) {
     if (argc < 2) { throw std::invalid_argument(".ninfer model path is required"); }
     options.artifact_path     = argv[1];
     bool kv_capacity_explicit = false;
+    bool max_context_explicit = false;
 
     for (int i = 2; i < argc; ++i) {
         const std::string_view arg(argv[i]);
@@ -122,7 +123,9 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--max-new") {
             options.max_new = parse_u32(value(arg), "max-new");
         } else if (arg == "--max-context") {
-            options.max_context = parse_u32(value(arg), "max-context");
+            const std::string text = value(arg);
+            options.max_context    = text == "auto" ? 0U : parse_u32(text.c_str(), "max-context");
+            max_context_explicit   = true;
         } else if (arg == "--kv-capacity") {
             options.kv_capacity  = parse_kv_capacity(value(arg));
             kv_capacity_explicit = true;
@@ -238,7 +241,13 @@ Options parse_options(int argc, char** argv) {
     if (options.prefill_chunk % 128 != 0) {
         throw std::invalid_argument("--prefill-chunk must be a multiple of 128");
     }
-    if (options.kv_capacity.mode == KvCapacityMode::Explicit &&
+    if (!max_context_explicit) { options.max_context = 0; } // auto by default
+    if (!kv_capacity_explicit && options.max_context == 0) {
+        // An automatic context sizes the pool from free memory too; a fixed default pool would
+        // silently cap it.
+        options.kv_capacity = KvCapacityPolicy::automatic(kDefaultKvCapacityHeadroomBytes);
+    }
+    if (options.kv_capacity.mode == KvCapacityMode::Explicit && options.max_context != 0 &&
         options.kv_capacity.explicit_tokens < options.max_context) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");
     }

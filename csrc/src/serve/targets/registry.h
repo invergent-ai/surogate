@@ -223,6 +223,9 @@ struct ConstructedTarget {
     ActiveTarget active;
     LoadSummary load;
     ModelSamplingDefaults sampling_defaults;
+    /// The per-request context ceiling this target was planned with — the value the caller
+    /// asked for, or, when it asked for 0, the largest the device's free memory allowed.
+    std::uint32_t resolved_max_context = 0;
 };
 
 /// Pipeline parallelism: one stage instance per device in `options.devices`, layers split

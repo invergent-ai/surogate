@@ -188,6 +188,12 @@ public:
         active            = std::move(constructed.active);
         load              = std::move(constructed.load);
         sampling_defaults = constructed.sampling_defaults;
+        // An automatic context (max_context == 0) is resolved by the target against the device's
+        // free memory; every consumer below — the executors, admission, the prompt ceiling —
+        // must see the resolved value, not the request.
+        if (constructed.resolved_max_context != 0) {
+            options.max_context = constructed.resolved_max_context;
+        }
         executor          = std::visit(
             [&](auto& target_ptr) -> Executor {
                 using Instance =
