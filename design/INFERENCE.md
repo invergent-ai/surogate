@@ -1322,4 +1322,9 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   4.5 GB free) — rerun queued with the auto KV size, plus 32 users.
 - 27B dense on 8 stages, 100 users (asynchronous prefill flights): **1,057.5 tok/s, TTFT p50
   834 ms, 796 ok / 0 errors, correct under load** (closed pipeline: 213).
+- 35B-A3B on 8 stages, 100 users: **1,960 tok/s, TTFT p50 386 ms, 1,426 ok / 0 errors, correct
+  under load** (one card 1,769; closed pipeline 574). The 27B stays below its one-card row
+  (1,330): with ~12 lanes per group the per-round fixed cost of a stage does not shrink with
+  the layer count, and a model that fits one card gains capacity from the pipeline, not
+  throughput per card.
 
