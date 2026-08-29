@@ -1213,3 +1213,6 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   `pending_finished_`, which the next `tick()` returns; the executor ticks whenever
   something is in flight or pending. The C3 chain is rerun with a 2-stage CLI generation
   check first.
+- Pipelined-loop hardening (2026-08-29, 7eca72fe+): a lane whose group is mid-pipeline is not
+  aborted under its in-flight round; the cancellation snapshot masks in-flight lanes and is
+  retaken every iteration, so the cancel lands at the group's boundary.

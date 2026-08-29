@@ -1001,6 +1001,7 @@ private:
         std::size_t staged_count  = 0;
         std::uint32_t prefill_lane = 0;
         std::uint32_t deferred     = 0;
+        bool prefill_flight        = false;
     };
     std::vector<GroupMeta> group_meta_;
 
@@ -1059,13 +1060,15 @@ private:
             } else {
                 meta.deferred = 0;
             }
+            meta.prefill_flight = false;
             if (meta.staged_count > 0 && !meta.membership.empty()) {
                 last_round_ = LastRound{"mixed", static_cast<std::uint32_t>(meta.membership.size), meta.staged[0], last_round_.index + 1};
                 program.launch_group_mixed(g, std::span<const std::uint32_t>(meta.staged.data(), meta.staged_count),
                                            meta.membership.lane_span(), meta.membership.budget_span());
                 launched = true;
             } else if (meta.staged_count > 0) {
-                meta.prefill_lane = meta.staged[0];
+                meta.prefill_lane   = meta.staged[0];
+                meta.prefill_flight = true;
                 last_round_ = LastRound{"prefill", 0, meta.prefill_lane, last_round_.index + 1};
                 program.launch_group_prefill(g, meta.prefill_lane);
                 launched = true;
@@ -1405,7 +1408,7 @@ private:
                             cancelled_at_boundary[meta.membership.lanes[row]] = false;
                         }
                         for (std::size_t i = 0; i < meta.staged_count; ++i) { cancelled_at_boundary[meta.staged[i]] = false; }
-                        cancelled_at_boundary[meta.prefill_lane] = cancelled_at_boundary[meta.prefill_lane] && meta.staged_count != 0 && false;
+                        if (meta.prefill_flight) { cancelled_at_boundary[meta.prefill_lane] = false; }
                     }
                 }
                 cancel_active_requests(cancelled_at_boundary);
