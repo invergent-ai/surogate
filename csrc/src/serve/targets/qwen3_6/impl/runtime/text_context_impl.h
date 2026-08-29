@@ -1858,14 +1858,16 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
         prologue_ = prologue_staging::single_segment_columns(work_, ids_device, total,
                                                              linear_state_current_slot_, &valid,
                                                              0, s);
-        Tensor begin_decode = prologue_.segment_begin.slice(0, prefill_cols, batch);
-        ops::fill_i32_positions(begin_decode, prefill_cols, s);
-        Tensor last_decode = prologue_.segment_last.slice(0, prefill_cols, batch);
-        prologue_staging::fill_i32(last_decode, 1, s);
-        Tensor slots_decode = prologue_.slots.slice(0, prefill_cols, batch);
-        CUDA_CHECK(cudaMemcpyAsync(slots_decode.data, decode.linear_state_slots.data,
-                                   static_cast<std::size_t>(batch) * sizeof(std::int32_t),
-                                   cudaMemcpyDeviceToDevice, s));
+        if (batch > 0) {
+            Tensor begin_decode = prologue_.segment_begin.slice(0, prefill_cols, batch);
+            ops::fill_i32_positions(begin_decode, prefill_cols, s);
+            Tensor last_decode = prologue_.segment_last.slice(0, prefill_cols, batch);
+            prologue_staging::fill_i32(last_decode, 1, s);
+            Tensor slots_decode = prologue_.slots.slice(0, prefill_cols, batch);
+            CUDA_CHECK(cudaMemcpyAsync(slots_decode.data, decode.linear_state_slots.data,
+                                       static_cast<std::size_t>(batch) * sizeof(std::int32_t),
+                                       cudaMemcpyDeviceToDevice, s));
+        }
     }
     Tensor x = roots.residual;
     if (stage_embeds()) { Hooks::embed(weights_, ids_device, x, work_, s); } else { stage_import(x, s); }
