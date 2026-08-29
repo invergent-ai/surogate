@@ -1337,4 +1337,11 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   queued: CLI check, then 64 and 32 users at 3,072 slots.
 - 8 stages, 32 users, 2,816 slots (92 % of the stage's experts resident, split off by the
   policy): **504 tok/s, TTFT p50 1.01 s, 372 ok / 0 errors, correct under load**.
+- 8 stages, 64 users, 2,100 slots (68 % resident, CPU split on, per-socket pools): 387.8 tok/s,
+  TTFT p50 2.1 s, 298 ok / 0 errors — **but the under-load probe "Name three prime numbers."
+  answered another lane's prompt** ("The distinct prime numbers p, q, r satisfy p+q+r=100…"),
+  i.e. cross-lane contamination at this point; the 16/32-user points with the split off were
+  clean. Suspect: the CPU split's per-slice pinned mirror ring (8 entries per process) with 8
+  stages each holding a round in flight. To discriminate: 64 users at 3,072 slots (split off)
+  and 64 users at 2,100 slots with `--cpu-moe-share 0`.
 
