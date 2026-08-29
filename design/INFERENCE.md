@@ -1276,3 +1276,15 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   executor's launch of them is behind `SUROGATE_SERVE_PIPELINE_ZERO_LANE_MIXED` until the
   body accepts batch 0 (10b69c98). Meanwhile the lone path's cost is measured directly on a
   2-stage server with the capture log and the trace (one user, several ~512-token prompts).
+- **Prefill on a stage is gather-bound in both paths** (2026-08-29 03:15). The lone-path
+  experiment (2 stages, 1 user, capture log): all 32 captures happen at warm-up, none per
+  request; the steps are replays of 1.1-3.5 s (bimodal) on the x8 pair. The closed
+  pipeline's own trace has its mixed rounds at 1.3-2.4 s per stage as well. A 512-token
+  prompt scans every expert of the stage (24 layers × ~440 ≈ 10k on 2 stages, 3,072 on 8) and
+  a pool smaller than the scan misses nearly all of it (LRU on a cyclic scan) — 24 layers ×
+  440 × 5 MB ≈ 50-90 GB per prefill step at 26-52 GB/s. So on 8 stages the pool is 72 slots
+  short of fully resident: **3,072 slots ≈ 15 GiB fit**, after which a stage never gathers.
+  Test running: 8 stages at 3,072 slots, 16 users (traced), 64 users (KV bounded), 1 user.
+  For fewer stages the pool cannot hold the scan, and the lever there is a scan-resistant
+  replacement (keep the resident set, gather scan misses through slots the scan itself just
+  filled) or the CPU prefill split.
