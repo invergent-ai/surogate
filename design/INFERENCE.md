@@ -1267,3 +1267,7 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   path prefilled the same chunk on a stage in ~75 ms in the closed pipeline, which is why
   C3v5's zero-lane mixed rounds are the fix; the prefill-timing run decomposes the lone
   path meanwhile.
+- The prefill-timing run could not start (2026-08-29 03:04): `SUROGATE_SERVE_PREFILL_TIMING`
+  lands in a `cudaErrorInvalidResourceHandle` at the third stage's warm-up — the window-lap
+  events it uses belong to the first device. Debug-only path; left as is (multi-device
+  unsafe, noted). The lone-path decomposition therefore waits; C3v5 is building.
