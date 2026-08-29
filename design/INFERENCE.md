@@ -1670,7 +1670,9 @@ The memory drop also shrinks the machine-crash trigger (the ~150 GB pinned teard
 in the 4th crash): the pinned bank is now ~90 GB. Running: the 100-probe coherence battery on
 Q4, then the W8 control arm, then the needle battery with the indexer.
 
-### Prefix reuse leaks cross-request content (2026-08-29 12:55, pre-existing, NOT the Q4 bank)
+### Prefix reuse leaks cross-request content — ROOT-CAUSED AND FIXED at 16:00, see below
+
+### [superseded] Prefix reuse leaks cross-request content (2026-08-29 12:55, pre-existing, NOT the Q4 bank)
 
 Found while validating the Q4 bank with the 100-probe coherence battery (16 lanes, one 5090).
 Ten of the Q4 arm's misses answered "Name three prime numbers." with blended capital-of-France
@@ -1710,4 +1712,48 @@ stages of one process share the requantised bank (`HostBank::shared`, format in 
 8-stage run pins ~90 GB instead of 152 — the pinned-teardown crash suspect shrinks by the same
 amount. Residuals: no 8-stage battery was run on Q4 yet (single-device validation only), and
 the requantiser is scalar (bank load measured 96 s total, so it is not the bottleneck).
+
+### The cross-request leak: root cause and fix (2026-08-29 16:00, commit 85d12840)
+
+The leak was never in the reuse *decisions* — the reuse trace proved the probes never reused
+(all 67,934 reuse events in a blend-reproducing run were the loaders' own identical-prompt
+chain). The vehicle was **the shared prefill scratch state slot**: graph prompts compute their
+GDN/conv state in one scratch slot so captured bodies stay lane-independent, and the slot was
+seeded from the lane **once at request begin** but consumed **at chunk time**. With two staged
+prompts in flight, the other prompt's chunks ran the scratch between this prompt's begin and
+its first chunk — so the chunk started from the *other prompt's recurrent state*. 36 of 48
+layers are GDN: the foreign state carries real content, which surfaced mid-answer once the
+prompt's own KV attention thinned ("Here are three examples of prime numbers (which are often
+associated with the color of the sky…"). Every blended fragment quoted another request's
+*question* — prompt-prefill state, exactly what the scratch holds.
+
+Why reuse on/off changed the rate rather than the fact: with reuse on, the identical-prompt
+loaders collapse to one-sampling-round requests (`gen=1 finish=stop_token` chains — retention
+rewinds to the prompt, the retained tail hidden re-emits the stop), so the rare interleaved
+prefills were the *probes*, and probe questions leaked into probe answers — visible topic
+blends. With reuse off, the loaders' 524-token word-salad prompts did the interleaving, and
+the same leak surfaced only as arithmetic drift. An eager mixed continuation of a graph
+prompt read the lane slot where the graph chunks had left state in the scratch — the
+discontinuity behind the invalid-UTF-8 crashes the ablation configs hit.
+
+**Fix: chunk-atomic scratch ownership.** Every graph chunk restores lane→scratch immediately
+before it runs and saves scratch→lane immediately after (lone path in `advance_prefill`,
+mixed path around `try_mixed_graph_chunk` / in `consume_mixed_round`, no longer only at the
+finishing chunk); the begin-time seed is gone. Two ~1.4 MB slot copies per chunk — noise
+against a chunk's compute.
+
+Validated on the reproducing battery (16 lanes, reuse on, 100 probes): **before, 10/10 misses
+were cross-request topic blends; after, zero blends** — the remaining misses are the same
+arithmetic-drift/truncation class the clean arms always showed. Multi-turn prefix reuse
+verified exact after the fix (facts recalled across three turns via AppendAtFrontier).
+`--no-prefix-reuse` is no longer a needed mitigation.
+
+Two follow-ups filed from the investigation:
+- **Token-stream corruption, still open**: forcing eager mixed rounds
+  (`SUROGATE_SERVE_PREFILL_GRAPH=0`) or a saturated burst cap of 1 crashed the worker loop
+  with "invalid UTF-8 continuation byte" garbage egress before the fix; being retested after.
+  The default battery's residual truncation-shaped misses may be its low-rate form.
+- **Throughput measurements with identical-prompt load generators are invalid with reuse on**:
+  the requests collapse to one sampling round each (995 "tok/s" at 10 ms latency). Loadgen
+  prompts must vary, or measure with `--no-prefix-reuse`.
 
