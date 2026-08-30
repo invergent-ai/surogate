@@ -166,6 +166,7 @@ what the engine does and how the number was arrived at.
 | llama.cpp | 1 | 16 | 65 | 16.3 | 81 | 29 s |  |
 | ik_llama.cpp | 1 | 1 | 87 | 21.8 | 109 | 1.8 s | AVX-512 iqk CPU-MoE kernels |
 | ik_llama.cpp | 1 | 16 | 96 | 23.9 | 120 | 30 s |  |
+| ik_llama.cpp | 1 | 1 | 1,068 | 40.4 | — | — | **reported, not measured here** (2026-08-30): same commit 7cff686d on an **RTX 3090 24 GB + Ryzen 9 9950X**, AD-4.27bpw Q4_K_M, 3-run average at temperature 0, single slot, 10,006-token prompt without cache reuse, 128 generated; KV Q8_0/Q8_0 (their setting — no board row of ours quantises the KV), 22.1 GB VRAM |
 | **surogate** | 8 | 1 | **209** | **46.8** | **256** | **0.85 s** | 8 stages, 3,072 slots per card (every expert resident, nothing crosses PCIe after warm-up), C3 + asynchronous prompt flights, `--max-model-len 2048`; 2026-08-30 08:06, uncapped |
 | **surogate** | 8 | 16 | **1,231** | **276.1** | **1,507** | **2.37 s** | same; 4.1× the one-card 66.9 |
 | **surogate** | 8 | 32 | **1,527** | **342.3** | **1,869** | **2.42 s** | same, stages materialise only their own layers (64 lanes fit beside the pool) |
@@ -190,6 +191,11 @@ what the engine does and how the number was arrived at.
   the Q4 bank's halving of host bytes paid. The slot ring and the split carry
   16 users to 66.9 tok/s (median 66.7 over four runs, spread 0.6 %),
   and 64 users add queueing rather than throughput (73.8 tok/s at a 40 s TTFT).
+  The reported ik_llama.cpp figure on a Ryzen 9 9950X desktop — 40.4 tok/s at one
+  user, 1.85× the 21.8 the same commit measures on this host's EPYC 9124 — sizes
+  the host-CPU lever for that one-user row: a 16-core Zen 5 at desktop clocks
+  against a 16-core Zen 4 server part, same expert kernels, same weights. The
+  one-card single-user number is a CPU benchmark before it is an engine one.
   The card's PCIe link width moves that number as much as any engine change —
   x8 costs a third — and in-engine NUMA placement is worth +3 %. **Eight cards**
   make every expert
