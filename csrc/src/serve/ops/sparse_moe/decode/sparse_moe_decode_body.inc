@@ -109,32 +109,53 @@ struct Q6Codec {
     }
 };
 
-// NVFP4: e2m1 codes with an e4m3 scale every 16 values. The second, per-expert level of the
-// format (`weight_global_scale`) is *not* applied here — a factor constant over an expert
-// comes out of the dot product, so the kernels multiply the finished dot by
-// `divisor[expert]` once instead of every decoded weight (design/NVFP4_ROUTED_EXPERTS.md).
+// NVFP4: e2m1 codes with an e4m3 scale every 16 values, in the same
+// `BlockScaleK16M128x4` layout the dense NVFP4 path and the artifact use — one layout for the
+// format across the engine rather than a routed-only variant (design/NVFP4_ROUTED_EXPERTS.md).
 //
-// UNFINISHED: this reads scales row-major, the convention of the other MoE codecs, while the
-// dense NVFP4 path and the test fixture use QuantLayout::BlockScaleK16M128x4 (tiles of 128
-// rows by 4). The design note recommends adopting the dense layout here rather than carrying
-// two, which means mapping (row, group) through that swizzle below. Nothing instantiates this
-// codec until that is settled, so it cannot yet be exercised numerically.
-struct Nvfp4Codec {
-    static constexpr int kGroupK       = 16;
-    static constexpr bool kPackedWord8 = true;
+// Codes are row-major, two values per byte, so a group's eight-value lane slice is at
+// `group_index * 8 + lane * 4` exactly as the other codecs index. Scales are swizzled: a tile
+// covers 128 rows by 4 groups in 512 bytes, addressed as
+//     (row/128 · tiles_per_row + group/4) · 512 + (row%128 %32) · 16 + (row%128 /32) · 4 + group%4
+// which is why the codec needs the row width as a template parameter — the shared codec
+// interface passes only the flattened `group_index`.
+//
+// The second level of the format, the per-expert `weight_global_scale`, is deliberately not
+// applied here: a factor constant over an expert comes out of the dot product, so the kernels
+// multiply the finished dot by `divisor[expert]` once instead of touching every weight.
+template <int kGroupsPerRow>
+struct Nvfp4CodecFor {
+    static constexpr int kGroupK                = 16;
+    static constexpr bool kPackedWord8          = true;
+    // D3 has two specialised transaction shapes (Q4's four-group word and W8's one value per
+    // lane); NVFP4 uses neither and takes the generic packed branch below.
+    static constexpr bool kD3PackedWord8        = false;
+    static constexpr bool kD3SingleValuePerLane = false;
+
+    __device__ static __forceinline__ float scale_of(const std::uint8_t* scales,
+                                                     std::int64_t group_index) {
+        constexpr int kTilesPerRow = kGroupsPerRow / 4;
+        const int row              = static_cast<int>(group_index / kGroupsPerRow);
+        const int group            = static_cast<int>(group_index - static_cast<std::int64_t>(row) * kGroupsPerRow);
+        const int row_inner        = row & 127;
+        const std::int64_t offset =
+            (static_cast<std::int64_t>(row >> 7) * kTilesPerRow + (group >> 2)) * 512 +
+            static_cast<std::int64_t>(row_inner & 31) * 16 +
+            static_cast<std::int64_t>(row_inner >> 5) * 4 + (group & 3);
+        return detail::decode_nvfp4_e4m3(scales[offset]);
+    }
 
     __device__ static __forceinline__ void
     load_eight(const std::uint8_t* codes, const std::uint8_t* /*high*/,
                const std::uint8_t* scales, std::int64_t group_index, int lane_in_group,
                float (&weights)[8]) {
-        // A group is 16 values: 8 code bytes (two e2m1 per byte) and one e4m3 scale.
         const std::uint32_t packed = *reinterpret_cast<const std::uint32_t*>(
             codes + group_index * (kGroupK / 2) + lane_in_group * 4);
-        const float scale = detail::decode_nvfp4_e4m3(scales[group_index]);
+        const float scale = scale_of(scales, group_index);
 #pragma unroll
         for (int pair = 0; pair < 4; ++pair) {
-            const float2 decoded =
-                detail::decode_nvfp4_e2m1x2(static_cast<std::uint8_t>((packed >> (8 * pair)) & 0xFFu));
+            const float2 decoded = detail::decode_nvfp4_e2m1x2(
+                static_cast<std::uint8_t>((packed >> (8 * pair)) & 0xFFu));
             weights[2 * pair]     = decoded.x * scale;
             weights[2 * pair + 1] = decoded.y * scale;
         }
@@ -200,6 +221,37 @@ __device__ __forceinline__ void dot_two_rows(const std::uint8_t* codes, const st
             const float2 x2       = bf16x2_bits_to_float2(input.z);
             const float2 x3       = bf16x2_bits_to_float2(input.w);
             const float values[8] = {x0.x, x0.y, x1.x, x1.y, x2.x, x2.y, x3.x, x3.y};
+#pragma unroll
+            for (int item = 0; item < 8; ++item) {
+                acc0 = fmaf(weights0[item], values[item], acc0);
+                acc1 = fmaf(weights1[item], values[item], acc1);
+            }
+        }
+    } else if constexpr (Codec::kPackedWord8) {
+        // Generic packed path: every lane owns eight consecutive K values, so a group spans
+        // kGroupK/8 lanes and a warp steps 32/(kGroupK/8) groups at a time. Same shape as the
+        // D4 loop; it serves any codec that offers load_eight (NVFP4 today, Q5/Q6 if they are
+        // ever wanted for gate/up).
+        constexpr int kLanesPerGroup = Codec::kGroupK / 8;
+        constexpr int kGroupsPerWarp = 32 / kLanesPerGroup;
+        static_assert(Codec::kGroupK % 8 == 0, "packed codecs own eight values per lane");
+        const int lane_group    = lane / kLanesPerGroup;
+        const int lane_in_group = lane % kLanesPerGroup;
+        for (int group_base = first_group; group_base < last_group; group_base += kGroupsPerWarp) {
+            const int group = group_base + lane_group;
+            if (group >= last_group) { break; }
+            const uint4 input = load_vec<uint4>(x + group * Codec::kGroupK + lane_in_group * 8);
+            const float2 x0   = bf16x2_bits_to_float2(input.x);
+            const float2 x1   = bf16x2_bits_to_float2(input.y);
+            const float2 x2   = bf16x2_bits_to_float2(input.z);
+            const float2 x3   = bf16x2_bits_to_float2(input.w);
+            const float values[8] = {x0.x, x0.y, x1.x, x1.y, x2.x, x2.y, x3.x, x3.y};
+            const std::int64_t index0 = static_cast<std::int64_t>(row0) * kGroups + group;
+            const std::int64_t index1 = static_cast<std::int64_t>(row1) * kGroups + group;
+            float weights0[8];
+            float weights1[8];
+            Codec::load_eight(codes, high, scales, index0, lane_in_group, weights0);
+            Codec::load_eight(codes, high, scales, index1, lane_in_group, weights1);
 #pragma unroll
             for (int item = 0; item < 8; ++item) {
                 acc0 = fmaf(weights0[item], values[item], acc0);
@@ -565,6 +617,9 @@ void launch_d2_d3(const Tensor& x, const SparseMoeWeights& weights, Tensor& dest
     case QType::W8G32_F16S:
         launch_d3_dependent_codec<W8Codec>(x, weights, workspace, stream);
         return;
+    case QType::NVFP4:
+        launch_d3_dependent_codec<Nvfp4CodecFor<kHidden / 16>>(x, weights, workspace, stream);
+        return;
     default:
         throw std::invalid_argument("sparse_moe: unsupported D3 codec");
     }
@@ -611,6 +666,10 @@ void launch_d4_dependent(const SparseMoeWeights& weights, Tensor& destination,
         return;
     case QType::W8G32_F16S:
         launch_d4_dependent_codec<W8Codec>(weights, destination, workspace, stream);
+        return;
+    case QType::NVFP4:
+        launch_d4_dependent_codec<Nvfp4CodecFor<kIntermediate / 16>>(weights, destination,
+                                                                     workspace, stream);
         return;
     default:
         throw std::invalid_argument("sparse_moe: unsupported D4 codec");
