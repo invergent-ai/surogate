@@ -126,9 +126,10 @@ what the engine does and how the number was arrived at.
 | **vLLM** | 1 | 100 | **11,818** | 92 | 11,910 | **14.9 s** | prefill-heavy, 2026-08-27 pass |
 | surogate | 1 | 100 | 7,339 | 57 | 7,396 | 25.8 s | the 2026-08-27 pass that defined "the 27B prefill gap": 62 % of vLLM. Superseded by the row above |
 | **surogate** | 1 | 1 | **11,200 †** | **70.8** | — | **170 ms** | 2026-08-30 10:21, uncapped GPU 0, fp8 KV, ~1,900-token prompt. Beats every 08-26 figure below on both axes |
+| **vLLM** | 1 | 1 | **13,600 †** | **71.7** | — | **140 ms** | `sakamakismile/Qwen3.8-27B-MTP-NVFP4`; 2026-08-30 10:37, uncapped GPU 1. The one shape where vLLM leads us at one user — decode within 1 %, TTFT 20 % better |
 | surogate | 1 | 1 | 5,400 † | 45 | — | 352 ms | the 2026-08-26 pass (GPU 2) this replaces |
+| vLLM | 1 | 1 | 7,500 † | 45 | — | 254 ms | the 2026-08-26 pass this replaces |
 | llama.cpp | 1 | 1 | 1,040 † | 49 | — | 1,829 ms | 2026-08-26, not re-measured |
-| vLLM | 1 | 1 | 7,500 † | 45 | — | 254 ms | 2026-08-26; an uncapped pair is being re-measured |
 
 ### Qwen3.6-35B-A3B
 
@@ -244,7 +245,8 @@ what the engine does and how the number was arrived at.
   prompt) and now sit on the same binary and cards as everything else; the
   llama.cpp ones are still the 2026-08-26 pass and are labelled as such. Someone
   wanting a current three-way single-user comparison needs one llama-server run
-  per model.
+  per model. The 4B has no current vLLM pair either — that checkpoint is gone
+  from this host.
 
 ### Closed on 2026-08-30
 
