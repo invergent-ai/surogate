@@ -121,8 +121,5 @@ concurrency.
   row-parallel decode-width routed kernel.
 - **27B**: prefill at half vLLM's rate on the prefill-heavy shape (layer-loop
   fusion, a wider GDN chunked scan).
-- **Flash-Next**: host tile kernel (interleaved rows); the QSA indexer,
-  the Q4 bank, the scan ring, the split fix and the small-T geometry fix all
-  shipped 2026-08-29/30 (INFERENCE.md).
 - Record the card with every number; re-measure single-user cells on the
   same card as the 100-user rows.
