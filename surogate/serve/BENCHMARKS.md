@@ -1,6 +1,6 @@
 # Serving benchmarks — surogate serve vs vLLM vs llama.cpp
 
-Board of record, one table. The narrative behind every row (superseded rows,
+Board of record, one table per model with the same columns. The narrative behind every row (superseded rows,
 rejected levers, kernel profiles, the reasoning behind each lever, and the
 per-model sections this table replaced on 2026-08-30) is in
 `BENCHMARKS_HISTORY.md`; the dated engineering log is `design/INFERENCE.md`.
@@ -47,51 +47,75 @@ concurrency.
 
 ## Board of record (2026-08-30)
 
-| model | engine | GPUs | users | prefill tok/s | decode tok/s | throughput tok/s | TTFT p50 | comments |
-|---|---|---:|---:|---:|---:|---:|---:|---|
-| Qwen3.5-0.8B | **surogate** | 1 | 100 | ≈ 40,400 | **10,095** | ≈ 50,500 | **45 ms** | GGUF Q4_K_M repack, 128 lanes; 2026-08-28, all cards busy |
-| Qwen3.5-0.8B | vLLM | 1 | 100 | ≈ 26,800 | 6,694 | ≈ 33,500 | 658 ms | same pass; surogate +51 % decode, 14× TTFT |
-| Qwen3.5-0.8B | **surogate** | 1 | 100 | **81,376** | 636 | 82,012 | 2.39 s | prefill-heavy 2048/16 (2026-08-27, GPU4) |
-| Qwen3.5-0.8B | vLLM | 1 | 100 | 45,106 | 352 | 45,458 | 3.88 s | prefill-heavy, same card |
-| Qwen3.5-0.8B | **surogate** | 1 | 1 | 39,600 † | **503** | — | **48 ms** | 2026-08-26, GPU2, bf16 KV |
-| Qwen3.5-0.8B | llama.cpp | 1 | 1 | 11,300 † | 391 | — | 168 ms | |
-| Qwen3.5-0.8B | vLLM | 1 | 1 | 34,500 † | 364 | — | 55 ms | |
-| Qwen3.5-4B | **surogate** | 1 | 100 | **19,767** | **4,942** | **24,709** | **45 ms** | NVFP4 3.56 GiB, 128 lanes, chunk 2,048 |
-| Qwen3.5-4B | vLLM | 1 | 100 | 16,984 | 4,246 | 21,230 | 239 ms | NVFP4; surogate +16 % on both, 5.3× TTFT |
-| Qwen3.5-4B | **surogate** | 1 | 100 | **40,677** | 318 | 40,995 | 4.77 s | prefill-heavy 2048/16 (GPU5) |
-| Qwen3.5-4B | vLLM | 1 | 100 | 34,964 | 273 | 35,237 | 5.00 s | prefill-heavy, same card |
-| Qwen3.5-4B | **surogate** | 1 | 1 | 33,300 † | **214** | — | **57 ms** | 2026-08-26, GPU2 |
-| Qwen3.5-4B | llama.cpp | 1 | 1 | 4,300 † | 190 | — | 445 ms | |
-| Qwen3.5-4B | vLLM | 1 | 1 | 26,800 † | 166 | — | 71 ms | |
-| Qwen3.8-27B | **surogate** | 1 | 100 | **5,319** | **1,330** | **6,649** | **170 ms** | all-NVFP4, 128 lanes; mean of two passes, cards rotated |
-| Qwen3.8-27B | vLLM | 1 | 100 | 4,156 | 1,039 | 5,195 | 8.26 s | NVFP4; surogate +28 % decode, 48× TTFT |
-| Qwen3.8-27B | surogate | 8 | 100 | ≈ 5,300 | 1,332 | ≈ 6,600 | — | 8-stage pipeline, C3 + asynchronous prompt flights: capacity, not throughput per card |
-| Qwen3.8-27B | surogate | 8 | 1 | ≈ 78 | 19.6 | ≈ 98 | 0.43 s | 8 stages, closed pipeline |
-| Qwen3.8-27B | **surogate** | 1 | 100 | 471 | **1,884** | 2,355 | **14.2 s** | decode-heavy 128/512, 64 lanes (GPU5) |
-| Qwen3.8-27B | vLLM | 1 | 100 | 360 | 1,438 | 1,798 | 21.9 s | decode-heavy, same card |
-| Qwen3.8-27B | surogate | 1 | 100 | 7,339 | 57 | 7,396 | 25.8 s | prefill-heavy 2048/16, chunk 4,096 (GPU6); the open 27B gap |
-| Qwen3.8-27B | **vLLM** | 1 | 100 | **11,818** | 92 | 11,910 | **14.9 s** | prefill-heavy, same card |
-| Qwen3.8-27B | surogate | 1 | 1 | 5,400 † | 45 | — | 352 ms | 2026-08-26, GPU2 |
-| Qwen3.8-27B | llama.cpp | 1 | 1 | 1,040 † | **49** | — | 1,829 ms | |
-| Qwen3.8-27B | vLLM | 1 | 1 | 7,500 † | 45 | — | **254 ms** | |
-| Qwen3.6-35B-A3B | surogate | 1 | 100 | ≈ 7,770 | 1,942 | ≈ 9,700 | **253 ms** | Q4/Q5/Q6 MoE from GGUF, prefill batch 4; mean of two passes |
-| Qwen3.6-35B-A3B | **vLLM** | 1 | 100 | ≈ 9,160 | **2,290** | ≈ 11,450 | 1.26 s | surogate at 85 %: per-round routed-kernel efficiency, not bytes (open, kernel project) |
-| Qwen3.6-35B-A3B | surogate | 8 | 100 | ≈ 9,470 | **2,368** | ≈ 11,840 | — | 8-stage pipeline, C3 + asynchronous prompt flights |
-| Qwen3.6-35B-A3B | surogate | 8 | 1 | ≈ 200 | 50.1 | ≈ 250 | 0.35 s | 8 stages, closed pipeline |
-| Qwen3.8-Flash-Next 111 GB | **surogate** | 1 | 1 | 132 | **32.0** | 164 | **1.06 s** | experts on the host: Q4G32AM bank (pinned, 91 GB), 3,000-slot expert cache, CPU split auto (76 % of decode misses / 46 % of prefill on 32 host threads); 2026-08-30, fixed host split |
-| Qwen3.8-Flash-Next | **surogate** | 1 | 16 | **311** | **75.3** | **386** | **2.27 s** | same defaults (81 % / 51 % measured shares); TTFT p90 12.4 s |
-| Qwen3.8-Flash-Next | surogate | 1 | 64 | 313 | 75.7 | 389 | 37.1 s | `--expert-slots 2000` so 64 lanes fit, `--pending-timeout-ms 600000` (the 30 s default expires a third of the queue at this concurrency); the round is host-bound, 64 users only queue — TTFT p90 68.7 s |
-| Qwen3.8-Flash-Next | llama.cpp | 1 | 1 | 29 | 7.1 | 36 | 2.0 s | experts on CPU (`-ot exps=CPU`, 32 threads), 2026-08-28 |
-| Qwen3.8-Flash-Next | llama.cpp | 1 | 16 | 65 | 16.3 | 81 | 29 s | |
-| Qwen3.8-Flash-Next | ik_llama.cpp | 1 | 1 | 87 | 21.8 | 109 | 1.8 s | AVX-512 iqk CPU-MoE kernels |
-| Qwen3.8-Flash-Next | ik_llama.cpp | 1 | 16 | 96 | 23.9 | 120 | 30 s | |
-| Qwen3.8-Flash-Next | **surogate** | 8 | 1 | ≈ 204 | **51.0** | ≈ 255 | ≈ 0.24 s | 8 stages, 3,072 slots per card (every expert resident, nothing crosses PCIe after warm-up), C3 + asynchronous prompt flights; re-validated on the fixed binary 2026-08-29 |
-| Qwen3.8-Flash-Next | **surogate** | 8 | 16 | ≈ 1,530 | **381.6** | ≈ 1,910 | **615 ms** | same; 5× the one-card 75 |
-| Qwen3.8-Flash-Next | **surogate** | 8 | 32 | ≈ 2,070 | **518.5** | ≈ 2,590 | 971 ms | same, stages materialise only their own layers (64 lanes fit beside the pool) |
-| Qwen3.8-Flash-Next | **surogate** | 8 | 64 | ≈ 2,330 | **583.6** | ≈ 2,920 | 1.14 s | same |
-| Qwen3.8-Flash-Next | llama.cpp | 8 | 1 | 157 | 39.3 | 196 | 0.95 s | `--split-mode layer`, all resident |
-| Qwen3.8-Flash-Next | llama.cpp | 8 | 16 | 156 | 39.1 | 195 | 86 s | 16 of 48 requests timed out |
-| Qwen3.8-Flash-Next | llama.cpp | 8 | 64 | 99 | 24.7 | 124 | 311 s | |
+One table per model, the same columns throughout.
+
+### Qwen3.5-0.8B
+
+| engine | GPUs | users | prefill tok/s | decode tok/s | throughput tok/s | TTFT p50 | comments |
+|---|---:|---:|---:|---:|---:|---:|---|
+| **surogate** | 1 | 100 | ≈ 40,400 | **10,095** | ≈ 50,500 | **45 ms** | GGUF Q4_K_M repack, 128 lanes; 2026-08-28, all cards busy |
+| vLLM | 1 | 100 | ≈ 26,800 | 6,694 | ≈ 33,500 | 658 ms | same pass; surogate +51 % decode, 14× TTFT |
+| **surogate** | 1 | 100 | **81,376** | 636 | 82,012 | 2.39 s | prefill-heavy 2048/16 (2026-08-27, GPU4) |
+| vLLM | 1 | 100 | 45,106 | 352 | 45,458 | 3.88 s | prefill-heavy, same card |
+| **surogate** | 1 | 1 | 39,600 † | **503** | — | **48 ms** | 2026-08-26, GPU2, bf16 KV |
+| llama.cpp | 1 | 1 | 11,300 † | 391 | — | 168 ms |  |
+| vLLM | 1 | 1 | 34,500 † | 364 | — | 55 ms |  |
+
+### Qwen3.5-4B
+
+| engine | GPUs | users | prefill tok/s | decode tok/s | throughput tok/s | TTFT p50 | comments |
+|---|---:|---:|---:|---:|---:|---:|---|
+| **surogate** | 1 | 100 | **19,767** | **4,942** | **24,709** | **45 ms** | NVFP4 3.56 GiB, 128 lanes, chunk 2,048 |
+| vLLM | 1 | 100 | 16,984 | 4,246 | 21,230 | 239 ms | NVFP4; surogate +16 % on both, 5.3× TTFT |
+| **surogate** | 1 | 100 | **40,677** | 318 | 40,995 | 4.77 s | prefill-heavy 2048/16 (GPU5) |
+| vLLM | 1 | 100 | 34,964 | 273 | 35,237 | 5.00 s | prefill-heavy, same card |
+| **surogate** | 1 | 1 | 33,300 † | **214** | — | **57 ms** | 2026-08-26, GPU2 |
+| llama.cpp | 1 | 1 | 4,300 † | 190 | — | 445 ms |  |
+| vLLM | 1 | 1 | 26,800 † | 166 | — | 71 ms |  |
+
+### Qwen3.8-27B
+
+| engine | GPUs | users | prefill tok/s | decode tok/s | throughput tok/s | TTFT p50 | comments |
+|---|---:|---:|---:|---:|---:|---:|---|
+| **surogate** | 1 | 100 | **5,319** | **1,330** | **6,649** | **170 ms** | all-NVFP4, 128 lanes; mean of two passes, cards rotated |
+| vLLM | 1 | 100 | 4,156 | 1,039 | 5,195 | 8.26 s | NVFP4; surogate +28 % decode, 48× TTFT |
+| surogate | 8 | 100 | ≈ 5,300 | 1,332 | ≈ 6,600 | — | 8-stage pipeline, C3 + asynchronous prompt flights: capacity, not throughput per card |
+| surogate | 8 | 1 | ≈ 78 | 19.6 | ≈ 98 | 0.43 s | 8 stages, closed pipeline |
+| **surogate** | 1 | 100 | 471 | **1,884** | 2,355 | **14.2 s** | decode-heavy 128/512, 64 lanes (GPU5) |
+| vLLM | 1 | 100 | 360 | 1,438 | 1,798 | 21.9 s | decode-heavy, same card |
+| surogate | 1 | 100 | 7,339 | 57 | 7,396 | 25.8 s | prefill-heavy 2048/16, chunk 4,096 (GPU6); the open 27B gap |
+| **vLLM** | 1 | 100 | **11,818** | 92 | 11,910 | **14.9 s** | prefill-heavy, same card |
+| surogate | 1 | 1 | 5,400 † | 45 | — | 352 ms | 2026-08-26, GPU2 |
+| llama.cpp | 1 | 1 | 1,040 † | **49** | — | 1,829 ms |  |
+| vLLM | 1 | 1 | 7,500 † | 45 | — | **254 ms** |  |
+
+### Qwen3.6-35B-A3B
+
+| engine | GPUs | users | prefill tok/s | decode tok/s | throughput tok/s | TTFT p50 | comments |
+|---|---:|---:|---:|---:|---:|---:|---|
+| surogate | 1 | 100 | ≈ 7,770 | 1,942 | ≈ 9,700 | **253 ms** | Q4/Q5/Q6 MoE from GGUF, prefill batch 4; mean of two passes |
+| **vLLM** | 1 | 100 | ≈ 9,160 | **2,290** | ≈ 11,450 | 1.26 s | surogate at 85 %: per-round routed-kernel efficiency, not bytes (open, kernel project) |
+| surogate | 8 | 100 | ≈ 9,470 | **2,368** | ≈ 11,840 | — | 8-stage pipeline, C3 + asynchronous prompt flights |
+| surogate | 8 | 1 | ≈ 200 | 50.1 | ≈ 250 | 0.35 s | 8 stages, closed pipeline |
+
+### Qwen3.8-Flash-Next (111 GB MoE; on one card the experts live on the host)
+
+| engine | GPUs | users | prefill tok/s | decode tok/s | throughput tok/s | TTFT p50 | comments |
+|---|---:|---:|---:|---:|---:|---:|---|
+| **surogate** | 1 | 1 | 132 | **32.0** | 164 | **1.06 s** | experts on the host: Q4G32AM bank (pinned, 91 GB), 3,000-slot expert cache, CPU split auto (76 % of decode misses / 46 % of prefill on 32 host threads); 2026-08-30, fixed host split |
+| **surogate** | 1 | 16 | **311** | **75.3** | **386** | **2.27 s** | same defaults (81 % / 51 % measured shares); TTFT p90 12.4 s |
+| surogate | 1 | 64 | 313 | 75.7 | 389 | 37.1 s | `--expert-slots 2000` so 64 lanes fit, `--pending-timeout-ms 600000` (the 30 s default expires a third of the queue at this concurrency); the round is host-bound, 64 users only queue — TTFT p90 68.7 s |
+| llama.cpp | 1 | 1 | 29 | 7.1 | 36 | 2.0 s | experts on CPU (`-ot exps=CPU`, 32 threads), 2026-08-28 |
+| llama.cpp | 1 | 16 | 65 | 16.3 | 81 | 29 s |  |
+| ik_llama.cpp | 1 | 1 | 87 | 21.8 | 109 | 1.8 s | AVX-512 iqk CPU-MoE kernels |
+| ik_llama.cpp | 1 | 16 | 96 | 23.9 | 120 | 30 s |  |
+| **surogate** | 8 | 1 | ≈ 204 | **51.0** | ≈ 255 | ≈ 0.24 s | 8 stages, 3,072 slots per card (every expert resident, nothing crosses PCIe after warm-up), C3 + asynchronous prompt flights; re-validated on the fixed binary 2026-08-29 |
+| **surogate** | 8 | 16 | ≈ 1,530 | **381.6** | ≈ 1,910 | **615 ms** | same; 5× the one-card 75 |
+| **surogate** | 8 | 32 | ≈ 2,070 | **518.5** | ≈ 2,590 | 971 ms | same, stages materialise only their own layers (64 lanes fit beside the pool) |
+| **surogate** | 8 | 64 | ≈ 2,330 | **583.6** | ≈ 2,920 | 1.14 s | same |
+| llama.cpp | 8 | 1 | 157 | 39.3 | 196 | 0.95 s | `--split-mode layer`, all resident |
+| llama.cpp | 8 | 16 | 156 | 39.1 | 195 | 86 s | 16 of 48 requests timed out |
+| llama.cpp | 8 | 64 | 99 | 24.7 | 124 | 311 s |  |
 
 ## Reading the table
 
