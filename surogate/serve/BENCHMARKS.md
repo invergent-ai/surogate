@@ -219,30 +219,35 @@ what the engine does and how the number was arrived at.
 
 ## Open items
 
-- **35B-A3B**: NVFP4 expert artifact — a kernel project, not a conversion: the
-  sparse-MoE kernels and the expert slot cache read W8G32 routed experts only,
-  so an NVFP4 routed arm (kernel + converter recipe) comes first; then a
-  row-parallel decode-width routed kernel.
-- ~~**27B**: prefill at half vLLM's rate~~ **closed 2026-08-30.** Re-measured on
-  the current binary it serves **11,208 prompt tok/s against vLLM's 11,818**
-  (95 %) at a comparable TTFT, and `ninfer_bench` puts the kernels at 12,707 with
-  no scheduler — so there was never a kernel deficit, and round timing shows the
-  executor 97 % occupied in mixed rounds with admission, boundary and append all
-  at 0 ms. The 7,339 the board carried was a 2026-08-27 configuration. The
-  layer-loop fusion and wider GDN scan queued against it are dropped, not
-  deferred. See `design/27B_PREFILL.md`.
-- ~~**Flash-Next, one card**: overlap the miss-gather with the hit-compute~~
-  **closed 2026-08-30 without building it.** The Q4 bank is 3.07 MB per expert and
-  all 48 layers route, but the measured miss share at 16 users is **2.1 %**, and
-  the CPU split sends 80 % of those to the host, where the work is forked onto a
-  side stream and already overlapped. What crosses PCIe is 0.042 experts per
-  layer — **6.2 MB per token, 0.13 ms** — so the overlap would hide about a tenth
-  of a percent. (At one user, where misses are frequent, the same arithmetic gives
-  7 %; with the split off, 34 %.) Revisit only if the split is turned down.
-- **Hardware**: GPUs 2, 3, 5 and 7 train their PCIe links at x8 although both
-  ends advertise x16 — a physical path issue, not bifurcation. It costs the
-  host-offloaded model half its gather bandwidth (23 vs 46 GB/s) and about a
+- **35B-A3B: NVFP4 routed experts.** The one model still on a non-NVFP4 routed
+  artifact and the one still behind vLLM (1,984 against 2,162 on one card, 92 %).
+  A kernel project, not a conversion — the sparse-MoE kernels and the expert slot
+  cache read W8G32 routed experts only. Four gated phases, the constraint that
+  the per-tensor divisor cannot fold into the router weight for gate/up, and the
+  independent row-parallel decode-width kernel that composes with it:
+  `design/NVFP4_ROUTED_EXPERTS.md`.
+- **Hardware: four PCIe links train at x8.** GPUs 2, 3, 5 and 7, although both
+  the card and its root port advertise x16 — so a physical path issue (MCIO
+  cable, seating or a retimer channel), not bifurcation. It halves the gather
+  bandwidth for the host-offloaded model (23 against 46 GB/s) and costs about a
   third of its throughput; VRAM-resident models are unaffected. Until it is
   fixed, single-card Flash-Next rows belong on GPU 0, 1, 4 or 6.
-- Record the card with every number; re-measure single-user cells on the
-  same card as the 100-user rows.
+- **Single-user rows predate the rest.** The † rows are from 2026-08-26 on GPU 2
+  with bf16 KV. Each is internally consistent with its llama.cpp and vLLM pair,
+  but none is on the same card or binary as the 100-user rows above it, so read
+  them as a set rather than against the rest of the table.
+
+### Closed on 2026-08-30
+
+Three items died to measurement rather than to code; the reasoning is in
+`design/INFERENCE.md`, kept because each was about to become days of work.
+
+- **27B prefill gap** — did not exist on the current binary: 11,208 prompt tok/s
+  against vLLM's 11,818 (95 %), with the kernels at 12,707 unserved and the
+  executor 97 % occupied in mixed rounds. The layer-loop fusion and wider GDN
+  chunked scan queued against it are dropped. `design/27B_PREFILL.md`.
+- **Flash-Next gather/compute overlap** — 0.13 ms of a token once the measured
+  2.1 % miss share and the CPU split are accounted for, against the third of a
+  round it was queued on.
+- **The 08-29/30 "regressions"** — the per-card clock profile, not the engine.
+  Every model reproduces or beats its pre-cap row.
