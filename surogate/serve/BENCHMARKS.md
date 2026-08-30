@@ -104,8 +104,9 @@ derived (≈) number say so in their comment.
 
 | engine | GPUs | users | prefill tok/s | decode tok/s | throughput tok/s | TTFT p50 | comments |
 |---|---:|---:|---:|---:|---:|---:|---|
-| **surogate** | 1 | 100 | **5,319** | **1,330** | **6,649** | **170 ms** | all-NVFP4, 128 lanes; mean of two passes, cards rotated |
-| vLLM | 1 | 100 | 4,156 | 1,039 | 5,195 | 8.26 s | NVFP4; surogate +28 % decode, 48× TTFT |
+| **surogate** | 1 | 100 | **5,815** | **1,302** | **7,117** | **170 ms** | all-NVFP4, 128 lanes, chunk 4,096, `--max-model-len 2048`; 2026-08-30 07:11, uncapped GPU 2. Reproduces the 08-28 pass below within noise, so nothing regressed — the 1,068 measured under the caps was the cap |
+| surogate | 1 | 100 | 5,319 | 1,330 | 6,649 | 170 ms | the 2026-08-28 pass (pre-cap): mean of two passes, cards rotated |
+| vLLM | 1 | 100 | 4,156 | 1,039 | 5,195 | 8.26 s | NVFP4, 2026-08-28 pass; a same-batch uncapped pair is in flight |
 | surogate | 8 | 100 | ≈ 5,300 | 1,332 | ≈ 6,600 | — | 8-stage pipeline, C3 + asynchronous prompt flights: capacity, not throughput per card |
 | surogate | 8 | 1 | ≈ 78 | 19.6 | ≈ 98 | 0.43 s | 8 stages, closed pipeline |
 | **surogate** | 1 | 100 | 471 | **1,884** | 2,355 | **14.2 s** | decode-heavy 128/512, 64 lanes (GPU5) |
