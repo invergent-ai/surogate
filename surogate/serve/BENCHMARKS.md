@@ -21,7 +21,11 @@ all-decode rounds, which reads high — an 8-stage Flash-Next pass measured that
 reported 381 tok/s at 16 users against 276 staggered.
 
 Every engine was measured on the same card class, and **a number is only comparable
-to its pair on the same card in the same batch**. One binary repeats within **0.6 %**
+to its pair on the same card in the same batch**. Most rows were taken one model at a
+time on an idle host; the four prefill-heavy 2048/16 rows on the 0.8B and 4B were taken
+with three model pairs running at once, one per card, so each pair is internally fair —
+both arms started and probed together under the same host load — but their absolute
+rates may sit below what an idle host would give. Their comments say so. One binary repeats within **0.6 %**
 on a card and the eight cards agree within **2.7 %**, so a difference above ~3 % is
 real and anything under it is not.
 
@@ -81,8 +85,8 @@ them.
 |---|---:|---:|---:|---:|---:|---:|---|
 | **surogate** | 1 | 100 | **46,225** | **11,166** | **57,391** | **20 ms** | GGUF Q4_K_M repack, 128 lanes, `--max-model-len 2048`, 8 client shards; 2026-08-30 07:08, uncapped GPU 0 |
 | vLLM | 1 | 100 | 29,122 | 7,009 | 36,131 | 0.69 s | NVFP4 (`surogate/Qwen3.5-0.8B-NVFP4`), `--max-model-len 2048`; same batch, uncapped GPU 1. surogate **+59 % decode, 34× TTFT** |
-| **surogate** | 1 | 100 | **81,376** | 636 | 82,012 | 2.39 s | prefill-heavy 2048/16 (2026-08-27, GPU4) |
-| vLLM | 1 | 100 | 45,106 | 352 | 45,458 | 3.88 s | prefill-heavy, same card |
+| **surogate** | 1 | 100 | **117,563** | 910.5 | **118,473** | **1.48 s** | prefill-heavy 2048/16, `--max-model-len 2304`, 128 lanes, chunk 4,096, 4 client shards; 2026-08-30 19:17, GPU 0. Replaces a 2026-08-27 pass that read 81,376 — **+44 % on the current binary** |
+| vLLM | 1 | 100 | 46,990 | 363.6 | 47,354 | 3.70 s | prefill-heavy, GPU 1, launched and probed concurrently with the row above. surogate **+150 % prefill** |
 | **surogate** | 1 | 1 | **95,000 †** | **673** | — | **20 ms** | 2026-08-30 10:16, uncapped GPU 0, fp8 KV, ~1,900-token prompt |
 | vLLM | 1 | 1 | 38,000 † | 498 | — | 50 ms | same batch, uncapped GPU 1. surogate **+35 % decode, 2.5× TTFT** |
 | llama.cpp | 1 | 1 | **19,000 †** | **411** | — | **100 ms** | 2026-08-30 12:01, uncapped GPU 5, `llama-server -ngl 999 -c 4096 -np 1` on the same Q4_K_M GGUF. Its own prompt-eval timing is 34,500 tok/s; the † above is the board's prompt÷TTFT and carries the queueing. **Use `study/llama.cpp-master/build/bin` — the `llama-server` on `PATH` is Homebrew's Vulkan build** (no CUDA, ignores `CUDA_VISIBLE_DEVICES`) and reads 252 tg / 6,880 pp512 on `llama-bench`, roughly 40 % of the CUDA build |
@@ -93,8 +97,8 @@ them.
 |---|---:|---:|---:|---:|---:|---:|---|
 | **surogate** | 1 | 100 | **22,121** | **5,345** | **27,466** | **40 ms** | NVFP4 3.56 GiB, 128 lanes, chunk 2,048, `--max-model-len 2048`, 8 client shards; 2026-08-30 07:17, uncapped GPU 6; re-confirmed on the one-token routing fix binary (`fc2906fc`): 21,752 / 5,256 / 40 ms on GPU 4, 3,738 requests, 0 errors — the fix cannot fire above one token, and does not |
 | vLLM | 1 | 100 | 18,543 | 4,481 | 23,023 | 0.23 s | `surogate/Qwen3.5-4B-NVFP4` (ModelOpt), `--max-num-seqs 128`, `--max-model-len 2048`; 2026-08-30 13:24, uncapped GPU 5, 3,200 requests, 0 errors. surogate **+19 % decode, +19 % prefill, 5.8x TTFT** |
-| **surogate** | 1 | 100 | **40,677** | 318 | 40,995 | 4.77 s | prefill-heavy 2048/16 (GPU5) |
-| vLLM | 1 | 100 | 34,964 | 273 | 35,237 | 5.00 s | prefill-heavy, same card |
+| **surogate** | 1 | 100 | **48,259** | 373.8 | **48,633** | **3.61 s** | prefill-heavy 2048/16, `--max-model-len 2304`, 128 lanes, chunk 4,096, 3 client shards; 2026-08-30 19:17, GPU 2. Replaces an undated pass that read 40,677 — **+19 % on the current binary** |
+| vLLM | 1 | 100 | 36,308 | 281.2 | 36,589 | 4.80 s | prefill-heavy, GPU 3, launched and probed concurrently with the row above. surogate **+33 % prefill** |
 | **surogate** | 1 | 1 | **63,300 †** | **313** | — | **30 ms** | 2026-08-30 14:00, uncapped GPU 6, two passes (314.3, 312.8), fp8 KV, ~1,900-token prompt, on the decode-GEMV routing fix: the 4B's five linear shapes were unregistered NVFP4 geometries and ran a 128-row cuBLASLt tile on one row at every width; at one token they now take the decode GEMV (kernel-only tg128 213.5 → 350.8). **+26 % over vLLM's 249**, at half its TTFT |
 | llama.cpp | 1 | 1 | **7,000 †** | **182** | — | **270 ms** | 2026-08-30 12:05, uncapped GPU 5, CUDA build, `unsloth/Qwen3.5-4B-GGUF` Q4_K_M (fetched for this row; our side is NVFP4). Its own prompt-eval timing is 13,000 tok/s |
 | vLLM | 1 | 1 | 31,700 † | 249 | — | 60 ms | same checkpoint (`surogate/Qwen3.5-4B-NVFP4`, ModelOpt); 2026-08-30 13:27, uncapped GPU 5. Led decode by 22 % for four hours — that was our routing gap, not their kernels |
