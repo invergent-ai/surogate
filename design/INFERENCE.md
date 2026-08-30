@@ -2221,3 +2221,34 @@ cores back), where the 34 % figure applies instead.
 Worth keeping from the exercise: the per-expert byte figure and the fact that the host split
 is doing double duty — it is not only extra compute capacity, it is also what keeps three
 quarters of the miss traffic off PCIe.
+
+### NUMA placement: measured, +3 %, and it retires the wrapper's numactl (2026-08-30 09:05)
+
+Six arms on GPU 6 (x16, uncapped), Flash-Next at 16 users, 512/128, one at a time on an idle
+host. `direct` launches the engine straight; `guarded` goes through `run_guarded.sh`, which
+prefixes `numactl --interleave=all`:
+
+| arm | launch | `SUROGATE_SERVE_NUMA` | decode tok/s |
+|---|---|---|---:|
+| A | direct | off | 64.6 |
+| B | direct | **auto** | **67.0** |
+| C | guarded | off | 64.9 |
+| D | guarded | **auto** | **66.7** |
+| E | guarded | auto (repeat) | 66.5 |
+| F | guarded | auto (repeat) | 66.6 |
+
+Two things fall out. **In-engine placement is worth +3.0 %** (66.7 mean against 64.75), and the
+three repeats sit within 0.6 % of each other, so the effect is well clear of run-to-run noise.
+**`numactl --interleave=all` is worth nothing on top**: A vs C is +0.5 % and B vs D is −0.4 %,
+both inside the repeat spread. That is the expected shape — the wrapper interleaves everything
+including the per-device staging buffers, while the engine interleaves the shared expert bank
+and binds the staging to the device's own node, which is strictly better placement. The wrapper
+keeps its other two jobs (the memory cap and refusing a second offloaded process); its numactl
+prefix is now belt-and-braces.
+
+**A correction this forces.** The board explained the 75.3-vs-66.9 difference between two
+Flash-Next 16-user runs as "±10 % host-bandwidth probe spread". These repeats show the real
+repeat spread is 0.6 %, so that explanation was wrong. The two runs differ in card (GPU 1 on
+node 0 versus GPU 6 on node 1) and in binary (23:59 versus 05:04), and a same-binary comparison
+across GPU 1, GPU 4 and GPU 0 is queued to say which. Until it lands the board should not claim
+either.

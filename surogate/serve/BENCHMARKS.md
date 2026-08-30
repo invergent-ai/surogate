@@ -142,7 +142,7 @@ what the engine does and how the number was arrived at.
 | **surogate** | 1 | 1 | 128 | **28.7** | 156 | **1.36 s** | experts on the host: Q4G32AM bank (pinned, 91 GB), 3,000-slot expert cache, CPU split auto; 2026-08-30 07:55, uncapped GPU 6 (**x16 link**, gather 46 GB/s) |
 | **surogate** | 1 | 16 | **298** | **66.9** | **365** | **2.62 s** | same, 81 % / 51 % measured shares; TTFT p90 14.7 s |
 | surogate | 1 | 64 | 329 | 73.8 | 403 | 40.5 s | `--expert-slots 2000` so 64 lanes fit, `--pending-timeout-ms 600000` (the 30 s default expires a third of the queue here); host-bound, so 64 users only queue — TTFT p90 70.2 s |
-| surogate | 1 | 1 / 16 / 64 | 132 / 311 / 313 | 32.0 / 75.3 / 75.7 | 164 / 386 / 389 | 1.06 s / 2.27 s / 37.1 s | the same rows measured earlier the same day on GPU 1 (x16, but clock-capped at 2,500 MHz). Within the ±10 % spread of the host-bandwidth probe, which reads 147-193 GB/s run to run and moves the auto split with it — this row is host-DRAM noise, not clock |
+| surogate | 1 | 1 / 16 / 64 | 132 / 311 / 313 | 32.0 / 75.3 / 75.7 | 164 / 386 / 389 | 1.06 s / 2.27 s / 37.1 s | the same rows measured earlier the same day on GPU 1 (node 0, x16, clock-capped at 2,500 MHz) with the 23:59 binary. **The 12 % difference from the row above is unexplained**: repeats of the top row sit within 0.6 %, so it is not run-to-run noise, and the capped card reading *higher* rules out clocks. Card/NUMA node or binary; a same-binary comparison across GPU 0, 1 and 4 is running |
 | surogate | 1 | 1 / 16 | 92 / 262 | 20.8 / 58.8 | 113 / 321 | 1.71 s / 3.35 s | **on GPU 7, whose PCIe link trains at x8**: gather 23 GB/s instead of 46, and a third of the throughput. Kept as the cost of the link fault (see Open items) |
 | llama.cpp | 1 | 1 | 29 | 7.1 | 36 | 2.0 s | experts on CPU (`-ot exps=CPU`, 32 threads), 2026-08-28 |
 | llama.cpp | 1 | 16 | 65 | 16.3 | 81 | 29 s |  |
@@ -166,10 +166,11 @@ what the engine does and how the number was arrived at.
   third of the load queued for a lane and that queue was the TTFT.
 - **Flash-Next on one card** is host-bound: the Q4 bank halves the host bytes
   per expert, the CPU split at its measured share and the scan-resistant slot
-  ring carry 16 users to 66.9 tok/s, and 64 users add queueing rather than
-  throughput (73.8 tok/s at a 40 s TTFT). Two things move that number as much
-  as any engine change — the card's PCIe link width (x8 costs a third) and the
-  host-bandwidth probe's own ±10 % spread. **Eight cards** make every expert
+  ring carry 16 users to 66.9 tok/s (median 66.7 over four runs, spread 0.6 %),
+  and 64 users add queueing rather than throughput (73.8 tok/s at a 40 s TTFT).
+  The card's PCIe link width moves that number as much as any engine change —
+  x8 costs a third — and in-engine NUMA placement is worth +3 %. **Eight cards**
+  make every expert
   resident and the pipeline delivers 4.1× at 16 users and 5.3× at 64, with
   TTFT under 3 s throughout.
 - **A pipeline is capacity, not throughput per card** — and only for a dense
