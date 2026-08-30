@@ -17,7 +17,44 @@ were profiled on 2026-08-27 and neither has been addressed:
    sustains, because the scan runs in chunks sized for decode rather than for a 2k-token
    prompt.
 
-## Measured 2026-08-30 09:12: it is not a kernel problem
+## Closed 2026-08-30: there is no gap on the current binary
+
+Two measurements, an hour apart, took this item apart.
+
+**The kernels were never the limit.** `ninfer_bench` — same binary, same card, no server, no
+scheduler — does 12,707 prompt tok/s at pp2048 (13,108 at pp512), *above* vLLM's served 11,818.
+
+**And neither was serving.** Re-measured with the current binary at 100 users, chunk 4,096 and
+`--max-model-len 4096`:
+
+| | prefill tok/s | TTFT p50 |
+|---|---:|---:|
+| surogate, 2026-08-30 | **11,208** | 15.9 s |
+| vLLM, 2026-08-27 | 11,818 | 14.9 s |
+| surogate, 2026-08-27 (the "gap") | 7,339 | 25.8 s |
+
+95 % of vLLM at a comparable TTFT. `SUROGATE_SERVE_ROUND_TIMING=1` confirms there is nothing
+left to find in the scheduler: over 5-second windows the executor spends 4,850 ms of 5,000 in
+mixed rounds and **0 ms in boundary, admit, resolve and decode**, with 1 ms of preview and 2 ms
+of append. The engine is compute-bound in the rounds themselves, which is where it should be.
+
+So the 7,339 was the 2026-08-27 configuration, not a defect — that pass predates the graph
+switch fix, the host-split fixes, the current artifact and the context handling. **Both levers
+below are dropped, not deferred**: fusing the layer loop and widening the GDN chunked scan
+would have been days of kernel work against a number that no longer exists.
+
+What remains worth knowing: admission caps concurrency at 23 running of 100 offered on this
+shape (KV at a 4,096 context with 2,048-token prompts), and the queue drains cleanly
+(`waiting` falls 76 → 2 across the run). If prefill-heavy traffic ever needs more, that is the
+knob — more KV, not more kernel.
+
+---
+
+*The original analysis is kept below for the record; its two levers are the ones now dropped.*
+
+## Superseded: the 2026-08-27 profile
+
+
 
 `ninfer_bench` runs the same engine with no server, no scheduler and no concurrency:
 
