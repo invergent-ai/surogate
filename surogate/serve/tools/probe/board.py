@@ -17,6 +17,8 @@ Reports, over the measured window only (a warm-up of the same shape runs first w
 """
 
 import json
+import os
+import random
 import statistics
 import sys
 import threading
@@ -25,13 +27,21 @@ import urllib.request
 
 
 def run(port, model, users, seconds, prompt_tokens, max_tokens, label):
-    stop = time.time() + seconds
+    jitter = float(os.environ.get("SUROGATE_PROBE_JITTER", "0") or 0)
+    stop = time.time() + seconds + jitter
     lock = threading.Lock()
     serial = [0]
     ttfts, prompt_sum, completion_sum, latencies, ok, err = [], [0], [0], [], [0], [0]
     errors = []
 
     def worker():
+        # Closed-loop clients started together stay together: every request takes about the
+        # same time, so they re-submit in waves and the engine alternates between all-prefill
+        # and all-decode rounds (on a pipeline, decode collapses to ~5 % while eight prompts
+        # prefill together). SUROGATE_PROBE_JITTER=<seconds> staggers the first request so the
+        # arrivals stay smooth; the phase spread then persists for the run.
+        if jitter > 0:
+            time.sleep(random.uniform(0.0, jitter))
         while time.time() < stop:
             with lock:
                 serial[0] += 1

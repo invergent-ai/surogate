@@ -2118,3 +2118,54 @@ experts through the same host DRAM.
 The board itself was rewritten the same night into one table across every model, engine
 and GPU count (prefill, decode, throughput, users, TTFT, comments); the per-model sections
 it replaced are archived in `BENCHMARKS_HISTORY.md`.
+
+### Per-GPU clock caps invalidated every performance number from 2026-08-29 09:34 (2026-08-30 07:10)
+
+While chasing why tonight's rows read 20-25 % under the board, a controlled pair settled it:
+two 35B engines, identical flags and load, started at the same moment on GPU 0 and GPU 5,
+gave 1,519 and 1,986 tok/s. Not the binary, not the flags, not the client — the cards were
+running at different clocks.
+
+`/etc/systemd/system/gpu-thermal-profile.service` (owner-installed, ran at boot on
+2026-08-29 09:34) locked per-card maximum SM clocks with `nvidia-smi -lgc`:
+
+| GPU | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| cap (MHz) | 1,700 | 2,500 | 1,500 | 2,500 | 1,800 | 2,400 | none | none |
+
+The script's loop covers cards 0-5 only, so 6 and 7 boosted freely to ~2,950. **The locks are
+invisible to the obvious query**: `clocks.max.sm` still reports 3,090-3,135 MHz and the
+"Applications Clocks" fields are deprecated on this driver. The only tells are the running
+clock pinned at its cap under load, and the script itself.
+
+What that means for the record:
+
+- Everything dated 08-26, 08-27 and 08-28 on this board was measured **before** the profile
+  existed: full boost, cards equivalent. Those rows stand.
+- Everything measured **after 2026-08-29 09:34** on GPUs 0-5 is clock-limited: the 08-29
+  8-GPU re-validation (27B 1,332, 35B 2,368, Flash-Next 51.0 / 381.6 / 488.2 / 604.1 — a
+  pipeline is bounded by its slowest stage, GPU 2 at 1,500 MHz), the Flash-Next one-card rows
+  of 2026-08-30 (32.0 / 75.3 / 75.7, GPU 1 at 2,500), and tonight's 0.8B / 27B / 35B one-card
+  rows (GPUs 0, 2, 5). A/B *ratios* measured on one card survive (the scan ring's 56.1 → 115.3,
+  the host-split fix's shadow verdicts, every correctness result); the absolute rates do not.
+- The "27B regression" (1,330 → 1,068) and the "0.8B regression" (10,095 → 7,785) were the
+  caps. Ruled out on the way: the graph-switch fix (in-place 1,067.8 vs re-instantiate 1,068.5),
+  the context setting (1,063 auto vs 1,068 capped), chunk width, and the client (sharding the
+  probe over 8 processes is worth ~4 %).
+
+The owner had the profile removed: the service and `/usr/local/sbin/gpu-thermal-profile.sh`
+are deleted (backup in `~/work/gpu-thermal-profile-backup-2026-08-30/`), `nvidia-smi -rgc`
+reset every card, and the 400 W power limit from `nvidia-power-limit.service` stays. The cards
+are now equivalent, verified with `ninfer_bench` on the 0.8B: GPU 0 774, GPU 2 763, GPU 5 756,
+GPU 7 781 tok/s single-stream decode at 2,850-2,977 MHz (GPU 0 read 1,672 MHz an hour before).
+
+**Method changes from this pass**, all in `surogate/serve/tools/probe/board.py`:
+sharded clients (one Python process caps a fast engine), reasoning deltas count towards TTFT,
+in-stream SSE errors count as errors (at 64 users the 30 s `--pending-timeout-ms` default
+expired a third of the queue inside 200 responses), and an opt-in arrival jitter
+(`SUROGATE_PROBE_JITTER`) because closed-loop clients started together stay in phase and make
+a pipeline alternate between all-prefill and all-decode rounds. And the fast path that was
+here all along: **`csrc/build-serve/serve_bench/ninfer_bench`** — a llama-bench-style pp/tg
+harness over the engine (load, warm-up and five repetitions of pp512+tg128 on the 0.8B in
+3.4 s). Engine-level questions (flags, binaries, cards, kernels) belong there; the server and
+probe are only for what needs the scheduler: concurrency, TTFT, admission.
