@@ -109,6 +109,32 @@ struct Q6Codec {
     }
 };
 
+// NVFP4: e2m1 codes with an e4m3 scale every 16 values. The second, per-expert level of the
+// format (`weight_global_scale`) is *not* applied here — a factor constant over an expert
+// comes out of the dot product, so the kernels multiply the finished dot by
+// `divisor[expert]` once instead of every decoded weight (design/NVFP4_ROUTED_EXPERTS.md).
+struct Nvfp4Codec {
+    static constexpr int kGroupK       = 16;
+    static constexpr bool kPackedWord8 = true;
+
+    __device__ static __forceinline__ void
+    load_eight(const std::uint8_t* codes, const std::uint8_t* /*high*/,
+               const std::uint8_t* scales, std::int64_t group_index, int lane_in_group,
+               float (&weights)[8]) {
+        // A group is 16 values: 8 code bytes (two e2m1 per byte) and one e4m3 scale.
+        const std::uint32_t packed = *reinterpret_cast<const std::uint32_t*>(
+            codes + group_index * (kGroupK / 2) + lane_in_group * 4);
+        const float scale = detail::decode_nvfp4_e4m3(scales[group_index]);
+#pragma unroll
+        for (int pair = 0; pair < 4; ++pair) {
+            const float2 decoded =
+                detail::decode_nvfp4_e2m1x2(static_cast<std::uint8_t>((packed >> (8 * pair)) & 0xFFu));
+            weights[2 * pair]     = decoded.x * scale;
+            weights[2 * pair + 1] = decoded.y * scale;
+        }
+    }
+};
+
 struct W8Codec {
     static constexpr int kGroupK                = 32;
     static constexpr bool kD3SingleValuePerLane = true;
@@ -320,11 +346,15 @@ __device__ __forceinline__ void dot_fp32_rows(const std::uint8_t* codes, const s
 #pragma unroll
     for (int row = 0; row < Rows; ++row) { acc[row] = 0.0f; }
     if constexpr (Codec::kPackedWord8) {
-        // Q5/Q6 use the same eight-value lane ownership as D3. The high plane and FP16 scale are
-        // decoded exactly from their registered row-split codec before FP32 accumulation.
-        const int lane_group    = lane >> 3;
-        const int lane_in_group = lane & 7;
-        for (int group_base = first_group; group_base < last_group; group_base += 4) {
+        // Every lane owns eight consecutive K values, so a group spans kGroupK/8 lanes and a
+        // warp covers 32/(kGroupK/8) groups per step. That is 8 lanes and 4 groups for the
+        // 64-wide codecs (Q5/Q6, unchanged) and 2 lanes and 16 groups for NVFP4's 16-wide one.
+        constexpr int kLanesPerGroup   = Codec::kGroupK / 8;
+        constexpr int kGroupsPerWarp   = 32 / kLanesPerGroup;
+        static_assert(Codec::kGroupK % 8 == 0, "packed codecs own eight values per lane");
+        const int lane_group    = lane / kLanesPerGroup;
+        const int lane_in_group = lane % kLanesPerGroup;
+        for (int group_base = first_group; group_base < last_group; group_base += kGroupsPerWarp) {
             const int group = group_base + lane_group;
             const float4 x0 = load_vec<float4>(x + group * Codec::kGroupK + lane_in_group * 8);
             const float4 x1 = load_vec<float4>(x + group * Codec::kGroupK + lane_in_group * 8 + 4);
