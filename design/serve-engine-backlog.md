@@ -40,7 +40,40 @@ a no-op on dense models by the same arithmetic.
 | MTP speculation | needs 16.4 GB at 128 lanes vs 6.8 free (MTP block carries an expert set) |
 | bf16 KV, chunk width, compacting `Sr` | flat / 16x sector amplification |
 
-**The scoped fix was built and is worth nothing — 2026-08-30.** A row-parallel
+**Counters, at last (2026-08-30, after the profiling fix below).** The routed
+expert GEMM family is **synchronisation-bound, not memory-bound**, at both
+widths — which is why the row-parallel kernel below changed nothing on its own:
+
+| metric | narrow T=100 `<4,32>` | wide T=1024 `<8,64>` |
+|---|---:|---:|
+| stalled on **barrier** | 25.7 % | **32.1 %** |
+| stalled on memory (long scoreboard) | 13.5 % | 2.4 % |
+| DRAM throughput | 39.1 % | 29.5 % |
+| SM throughput | 43.6 % | — |
+| warps active | 24.4 % | 45.9 % |
+
+Barrier stall is *higher* in the wide plan, where every warp has columns and the
+MMA is balanced, so it is not the idle-warp imbalance — it is the three
+`__syncthreads()` each k-step pays (32 k-steps, 96 barriers per work item).
+Memory stall collapses to 2.4 % at width while DRAM *falls* to 29.5 %. The
+"scattered 32-byte reads" hypothesis recorded earlier is **not** the first-order
+problem; L1 sector hit rate is 0.95 % and L2 19.4 %, i.e. a clean stream that
+simply is not the thing waiting.
+
+**So the next build is barrier elimination, and it needs the row-parallel
+decomposition as its precondition.** Warp w already reads only As rows
+[16w, 16w+16). Give it its own `Cr` staging rows too and it owns its weights end
+to end: stage → `cp.async.wait_group` (per-thread, no barrier) → decode into its
+own As rows → `ldmatrix`. The two barriers around `decode_weight` disappear and
+only the shared `Bs` activation staging still needs one. Three barriers become
+one.
+
+**Getting counters.** `ncu` was refused (`ERR_NVGPUCTRPERM`) because
+`/etc/modprobe.d/nvidia.conf` read `nvidia NVreg_...` with no `options` keyword,
+so modprobe silently ignored it. With `options` prepended, an initramfs rebuild
+and a reboot, counters work.
+
+**The row-parallel kernel alone was flat — 2026-08-30.** A row-parallel
 gate/up kernel (`<4, 32>`: warp w owns row tile w and walks every column tile,
 the SwiGLU pair exchanged through the dead `Bs` buffer) passes the fp64 oracle
 including T=47, which routes through it, and `nsys` confirms it is the kernel
