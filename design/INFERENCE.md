@@ -2498,3 +2498,39 @@ parity. Left on the single-user table: the W8 LM head is 12 % of the token at 69
 (halving its bytes means an NVFP4 head, a quality trade, not a default); the 2560 family has no
 small-T (2-4 token) A16 path; and the structural fix for static geometries is the JIT/CuTe path
 in `surogate/kernels`, where every shape is registered by construction.
+
+## 2026-08-30 — which vLLM kernel to take for the 35B, and what the A/B could and could not say
+
+The owner's standing permission is to take kernels from vLLM directly. Measured across the
+board, there is exactly one place that helps: the 35B's routed experts (1,984 against 2,162 at
+100 users). Every dense shape we lead or tie, and today's 4B single-user gap was our routing,
+not their kernel.
+
+vLLM's own startup log names the kernel behind the 2,162: **FLASHINFER_CUTLASS**, FlashInfer's
+TRT-LLM cutlass fused MoE, JIT-built for sm_120 with autotuned tiles cached — *not* vLLM's
+in-tree `nvfp4_blockwise_moe_kernel.cu` (747 lines), which vLLM ranks below it and only falls
+back to. So "take vLLM's kernel" means TRT-LLM's MoE GEMM: `moe_gemm` (3,957 lines),
+`cutlass_extensions` (19,468) and `moe_kernels` out of a 50.5k-line tree, whose inner
+`CutlassMoeFCRunner` is raw-pointer C++ we can call without torch. Our cutlass 4.6.1 is newer
+than vLLM's 4.4.2 and already has the SM120 block-scaled grouped mainloop. Two to three days if
+the build cooperates; ceiling parity with vLLM's kernel, i.e. ~2,160, with our TTFT kept.
+
+FlashInfer also ships a CuTe-DSL MoE written for SM120/121 ("B12x", ~22k lines, with a w4a16
+variant and a plain-pointer `@cute.jit` ABI that `surogate/kernels` can load) — the
+JIT/autotuned path the owner asked about this afternoon. vLLM excludes it from auto-selection
+only for an SM121 build guard. Serving it through vLLM on this card failed three times at
+init: FlashInfer allocates a per-expert worst-case static workspace
+(`[256 x max_num_tokens x top_k x K/2]`) that does not fit beside 21 GB of weights on 32 GB. An
+allocation policy, not a kernel property — our routed job list bounds the same buffer at tens of
+MB — but it means B12x's speed here is unknown and cannot be learned through vLLM.
+
+One more finding from the attempt: vLLM's 35B decode is **configuration-sensitive by 2x**. With
+`--max-num-batched-tokens 512 --max-num-seqs 100` (the flags B12x needed to have any chance),
+FLASHINFER_CUTLASS drops from 2,162 to 1,056. The board's pair is defaults against defaults,
+which is the right comparison; there is no matched-flags number against our 1,984.
+
+**Decision:** port (b). (c) follows inside our engine once (b) has built the packed-weight and
+workspace plumbing they share. Costed in `design/35B_VLLM_KERNELS.md`. Two process lessons paid
+for today: a global `pkill` by process name in one serve script killed a parallel run on another
+GPU (now a hard rule: kill only PIDs a script started), and the HF-cache snapshot of the 35B
+lacks the `linear_attn` ignore-list patch — serve vLLM from `models/hf/…-redhat-vllm`.
