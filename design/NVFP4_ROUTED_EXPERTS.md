@@ -75,6 +75,39 @@ the block scales are a different granularity (16 vs 32), so:
 - The Q4G32AM **host** bank is a separate thing and stays as it is: it feeds the CPU expert
   path, which is VNNI integer and has no fp4 route.
 
+## The two NVFP4 checkpoint formats (read this before writing Phase 4)
+
+"NVFP4" names a numeric format, not a checkpoint layout, and two ecosystems write it
+differently. Our entire NVFP4 path — converter validation and engine — currently understands
+exactly one of them.
+
+| | **compressed-tensors** (llm-compressor, RedHat/neuralmagic) | **ModelOpt** (NVIDIA TensorRT) |
+|---|---|---|
+| config | `quant_method: compressed-tensors`, `format: nvfp4-pack-quantized` | `quant_algo: NVFP4` under a ModelOpt block |
+| packed codes | `…weight_packed` | `…weight` |
+| block scales (e4m3, per 16) | `…weight_scale` | `…weight_scale` |
+| global scale | `…weight_global_scale` | `…weight_scale_2` |
+| activation scale | `…input_global_scale` | `…input_scale` |
+
+**What we support.** `qwen3_6_27b/convert_nvfp4.py` asserts `compressed-tensors` and
+`nvfp4-pack-quantized` and rejects anything else, and the engine consumes the global scale as a
+*divisor* — `alpha = 1 / (input_scale_divisor · weight_scale_divisor)`
+(`nvfp4_cublaslt.cpp`, `nvfp4_linear_swiglu_plan.cpp`). That matches compressed-tensors, where
+the global scale is `amax`-derived and divides.
+
+**Why it matters here.** `RedHatAI/Qwen3.6-35B-A3B-NVFP4` — the checkpoint Phase 4 reads and
+the one vLLM serves for the board's pair — is compressed-tensors, so the 35B recipe can follow
+the 27B path. But NVFP4 releases of the same model from other publishers are frequently
+ModelOpt, and the two differ in the *direction* of the global scale as well as its name. A
+ModelOpt checkpoint fed to a converter that assumes compressed-tensors would either fail a
+name lookup (the good case) or silently mis-scale every expert (the bad one).
+
+**So Phase 4 owes two things**, neither large: detect the format from `quantization_config`
+rather than from tensor names, and refuse an unrecognised one with a message that says which
+format was found. Supporting ModelOpt as a second arm is optional and should not be written
+from memory — the multiply-versus-divide convention has to be verified against a real ModelOpt
+checkpoint and a numerical round-trip before it is trusted.
+
 ## Phase 4 — the recipe
 
 `RedHatAI/Qwen3.6-35B-A3B-NVFP4` (already on this host, and what vLLM serves for the pair) has
