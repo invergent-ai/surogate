@@ -1123,10 +1123,17 @@ union alignas(16) SparseMoeBf16x8 {
     __nv_bfloat162 pair[4];
 };
 
+// Sums a token's routed paths from the grouped down outputs. A path whose expert the slot
+// table maps to -1 was computed elsewhere (the round hook's host split): the gate/up and down
+// kernels skipped it, so its grouped column holds whatever an earlier round left there — it
+// must carry no weight here, or the token gets that stale column on top of the host's
+// contribution.
 template <bool Adaptive>
 __global__ void sparse_moe_prefill_reduce_kernel(const __nv_bfloat16* __restrict__ grouped_output,
                                                  const int* __restrict__ packed_index,
+                                                 const int* __restrict__ ids,
                                                  const float* __restrict__ alpha,
+                                                 const int* __restrict__ slot_of_expert,
                                                  float* __restrict__ routed_sum,
                                                  const int* __restrict__ route_job_count) {
     if constexpr (Adaptive) {
@@ -1138,7 +1145,9 @@ __global__ void sparse_moe_prefill_reduce_kernel(const __nv_bfloat16* __restrict
     const int tid   = static_cast<int>(threadIdx.x);
     if (tid < kTopK) {
         columns[tid] = packed_index[token * kTopK + tid];
-        weights[tid] = alpha[token * kTopK + tid];
+        const bool served_here =
+            slot_of_expert == nullptr || slot_of_expert[ids[token * kTopK + tid]] >= 0;
+        weights[tid] = served_here ? alpha[token * kTopK + tid] : 0.0f;
     }
     __syncthreads();
 
@@ -1382,10 +1391,11 @@ void prefill_launch(const Tensor& x, const SparseMoeWeights& weights, Tensor& de
 
         if (adaptive) {
             sparse_moe_prefill_reduce_kernel<true><<<tokens, kHidden / 8, 0, stream>>>(
-                grouped_io, packed_index, alpha, routed_sum, route_job_count);
+                grouped_io, packed_index, ids, alpha, weights.slot_of_expert, routed_sum,
+                route_job_count);
         } else {
             sparse_moe_prefill_reduce_kernel<false><<<tokens, kHidden / 8, 0, stream>>>(
-                grouped_io, packed_index, alpha, routed_sum, nullptr);
+                grouped_io, packed_index, ids, alpha, weights.slot_of_expert, routed_sum, nullptr);
         }
         CUDA_CHECK(cudaGetLastError());
 

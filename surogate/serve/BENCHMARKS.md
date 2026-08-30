@@ -224,5 +224,16 @@ concurrency, not before the load.
   multi-turn reuse verified exact. Details in INFERENCE.md.
 - ~~0.8B ~4-per-100,000 mixed-round corruption~~ closed 2026-08-29: matched the
   scratch-state bug's fingerprint; 1,440 probes clean post-fix.
+- ~~Flash-Next: chunked prefill under load~~ **root-caused and fixed 2026-08-30.** Two
+  defects, neither about chunking: the CPU expert split put every host job of a
+  prefill-path round on token 0 (paths-per-token read off a flat ids view), and the
+  prefill reduce summed host-bound paths over a stale column; plus a small-T
+  attention step that overflowed the 64-row lane step for the 24-over-2 head
+  geometry. A 1–3 % rate of garbage bursts and dropped digits that coherence
+  batteries could not see; found with the strict-structure probes
+  (`probe/chunkcount.py`) and a GPU shadow oracle. Every serving number on this
+  board for Flash-Next was measured with the host split on; throughput is
+  unaffected by the fixes, quality of that path was not what the board implied.
+  Details in INFERENCE.md (2026-08-29 21:50 → 2026-08-30 00:10).
 - Record the card with every number; re-measure single-user cells on the
   same card as the 100-user rows.

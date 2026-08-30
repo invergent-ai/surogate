@@ -28,7 +28,8 @@ done
 # the executing binary (`-x`), never the command line: a `-f` pattern also matches this script,
 # whose own arguments name the binary.  `comm` truncates at 15 characters, so this one name
 # covers surogate-engine and surogate-engine-cli alike.
-live=$(pgrep -x surogate-engine) || true
+# A killed engine can linger as a zombie until its parent reaps it; only live processes count.
+live=$(for p in $(pgrep -x surogate-engine); do [ "$(ps -o stat= -p "$p" | cut -c1)" != "Z" ] && echo "$p"; done) || true
 if [ -n "${live//[$'\n' ]/}" ]; then
   echo "run_guarded.sh: a serving process is already running (${live//$'\n'/ }); refusing to start a second" >&2
   exit 1

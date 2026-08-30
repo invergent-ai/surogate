@@ -550,13 +550,14 @@ ExpertHostBank expert_host_bank(const SparseMoeGeometry& geometry, const Weight&
 
 void expert_slot_resolve(const Tensor& ids, std::int32_t layer, ExpertSlotDirectory& directory,
                          ExpertMissList& misses, cudaStream_t stream, bool scan) {
-    expert_slot_resolve(ids, Tensor{}, layer, directory, misses, nullptr, 0U, stream, scan);
+    expert_slot_resolve(ids, Tensor{}, layer, directory, misses, nullptr, 0U,
+                        ids.ne[0] > 0 ? ids.ne[0] : 1, stream, scan);
 }
 
 void expert_slot_resolve(const Tensor& ids, const Tensor& alpha, std::int32_t layer,
                          ExpertSlotDirectory& directory, ExpertMissList& misses,
                          ExpertCpuJobList* cpu_jobs, std::uint32_t cpu_share_q16,
-                         cudaStream_t stream, bool scan) {
+                         std::int32_t experts_per_token, cudaStream_t stream, bool scan) {
     if (ids.dtype != DType::I32 || ids.data == nullptr) {
         throw std::invalid_argument("expert_slot_cache: ids must be a device I32 tensor");
     }
@@ -567,8 +568,13 @@ void expert_slot_resolve(const Tensor& ids, const Tensor& alpha, std::int32_t la
     if (count <= 0 || count > (1LL << 30)) {
         throw std::invalid_argument("expert_slot_cache: invalid id count");
     }
-    // ids are [experts_per_token, tokens]; the leading extent is the per-token path count.
-    const int per_token = ids.ne[0] > 0 ? ids.ne[0] : static_cast<int>(count);
+    // A job's token is its index over the per-token path count, which the caller states:
+    // the prefill path passes a flat [assignments] view of the same token-major layout, and
+    // reading the count off the leading extent put every job of such a round on token 0.
+    if (experts_per_token <= 0 || count % experts_per_token != 0) {
+        throw std::invalid_argument("expert_slot_cache: id count is not a multiple of the paths per token");
+    }
+    const int per_token = experts_per_token;
     const bool split    = cpu_share_q16 > 0U && cpu_jobs != nullptr;
     if (split) {
         if (cpu_share_q16 > 65536U) {

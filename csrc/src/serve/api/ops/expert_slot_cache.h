@@ -154,10 +154,15 @@ struct ExpertCpuJobList {
 /// instead of evicting LRU slots (no-op when the directory has no ring).
 void expert_slot_resolve(const Tensor& ids, std::int32_t layer, ExpertSlotDirectory& directory,
                          ExpertMissList& misses, cudaStream_t stream, bool scan = false);
+/// `experts_per_token` is the number of routed paths per token: `ids` holds `tokens *
+/// experts_per_token` entries in token-major order, whatever its shape (the prefill path
+/// passes a flat [assignments] view, the decode paths [experts_per_token, tokens]); a job's
+/// token is its index divided by it. It is not inferred from the tensor shape.
 void expert_slot_resolve(const Tensor& ids, const Tensor& alpha, std::int32_t layer,
                          ExpertSlotDirectory& directory, ExpertMissList& misses,
                          ExpertCpuJobList* cpu_jobs, std::uint32_t cpu_share_q16,
-                         cudaStream_t stream, bool scan = false);
+                         std::int32_t experts_per_token, cudaStream_t stream,
+                         bool scan = false);
 
 /// Copies the missing experts of `layer` from the host bank into their slots: one launch,
 /// four banks (gate_up codes/scales, down codes/scales), 16-byte units, row count read from

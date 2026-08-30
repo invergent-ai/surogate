@@ -9,7 +9,8 @@ sites of a mixed round. Runs `users` concurrent loaders for `rounds` rounds.
 
     python chunkcount.py PORT MODEL USERS ROUNDS WORDS [MAX_TOKENS]
 
-Prints one summary line (ok / wrong / error) and the first few failures.
+Prints one summary line (ok / short / garbage / wrong / error) and the first failures;
+`garbage` — characters a count cannot contain — is the corruption class.
 """
 
 import json
@@ -68,14 +69,24 @@ def ask(port: int, model: str, prompt: str, max_tokens: int):
     return payload["choices"][0]["message"]["content"]
 
 
-def check(start: int, answer: str):
-    """The reply must be the counting sequence from `start`; the last number may be cut."""
+def classify(start: int, answer: str) -> str:
+    """ok: the counting sequence from `start` (or `start` + 1, a reading the model
+    takes about a third of the time); short: a valid sequence that stopped early;
+    garbage: characters outside the digits/commas of a count — the corruption class;
+    wrong: a well-formed but incorrect sequence."""
     numbers = re.findall(r"\d+", answer)
-    stripped = re.sub(r"[\d,\s]", "", answer)
-    if stripped or len(numbers) < 4:
-        return False
-    complete = numbers[:-1]  # the final number may be truncated by max_tokens
-    return all(int(value) == start + i for i, value in enumerate(complete))
+    stripped = re.sub(r"[\d,\s.]", "", answer)
+    if stripped:
+        return "garbage"
+    if not numbers:
+        return "wrong"
+    first = int(numbers[0])
+    if first not in (start, start + 1):
+        return "wrong"
+    complete = numbers[:-1] if len(numbers) > 1 else numbers
+    if any(int(value) != first + i for i, value in enumerate(complete)):
+        return "wrong"
+    return "ok" if len(numbers) >= 8 else "short"
 
 
 def main() -> None:
@@ -83,7 +94,7 @@ def main() -> None:
         int(sys.argv[1]), sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]))
     max_tokens = int(sys.argv[6]) if len(sys.argv) > 6 else 128
     lock = threading.Lock()
-    tally = {"ok": 0, "wrong": 0, "error": 0}
+    tally = {"ok": 0, "short": 0, "garbage": 0, "wrong": 0, "error": 0}
     failures = []
 
     def loader(user: int) -> None:
@@ -97,13 +108,12 @@ def main() -> None:
                     tally["error"] += 1
                     failures.append(f"user {user} round {round_index}: error {exc}")
                 continue
+            verdict = classify(start, answer)
             with lock:
-                if check(start, answer):
-                    tally["ok"] += 1
-                else:
-                    tally["wrong"] += 1
+                tally[verdict] += 1
+                if verdict != "ok":
                     failures.append(
-                        f"user {user} round {round_index}: from {start}, got {answer!r}")
+                        f"user {user} round {round_index} {verdict}: from {start}, got {answer!r}")
 
     started = time.time()
     threads = [threading.Thread(target=loader, args=(u,)) for u in range(users)]
@@ -112,10 +122,11 @@ def main() -> None:
     for thread in threads:
         thread.join()
     print(f"chunkcount: users={users} rounds={rounds} words={words} max_tokens={max_tokens}: "
-          f"ok={tally['ok']} wrong={tally['wrong']} error={tally['error']} "
+          f"ok={tally['ok']} short={tally['short']} garbage={tally['garbage']} "
+          f"wrong={tally['wrong']} error={tally['error']} "
           f"wall={time.time() - started:.0f}s", flush=True)
-    for line in failures[:6]:
-        print("  " + line[:220], flush=True)
+    for line in failures[:12]:
+        print("  " + line[:160], flush=True)
 
 
 if __name__ == "__main__":

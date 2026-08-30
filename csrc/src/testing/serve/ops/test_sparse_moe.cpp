@@ -374,7 +374,8 @@ std::vector<double> sparse_moe_oracle(const std::vector<float>& input,
                                       const std::vector<HostExpert>& experts,
                                       const quantized_weight::PackedWeight& shared_gate_up,
                                       const quantized_weight::PackedWeight& shared_down,
-                                      const RoutePattern& intended_route) {
+                                      const RoutePattern& intended_route,
+                                      std::span<const int> excluded = {}) {
     const std::vector<double> x(input.begin(), input.end());
     std::vector<double> scores(kExperts + 1);
     parallel_rows(kExperts + 1,
@@ -422,6 +423,11 @@ std::vector<double> sparse_moe_oracle(const std::vector<float>& input,
     parallel_rows(kHidden, [&](std::int32_t row) {
         double value = static_cast<double>(residual[row]);
         for (int route = 0; route < kTopK; ++route) {
+            // A path served elsewhere (the round hook's host split) keeps its routing weight
+            // and contributes nothing here.
+            if (std::find(excluded.begin(), excluded.end(), selected[route]) != excluded.end()) {
+                continue;
+            }
             const HostExpert& expert = find_expert(experts, selected[route]);
             value += route_weight[route] *
                      dot_fp64(expert.down.dequant, row, kIntermediate, routed_activation[route]);
@@ -523,10 +529,11 @@ public:
             routed_down_.weight(),
             shared_gate_.weight(),
             shared_down_device_.weight(),
+            kTopK,
         };
         Tensor x(device_input.p, DType::BF16, {kHidden, tokens});
         Tensor destination(destination_storage.data(), DType::BF16, {kHidden, tokens});
-        const std::size_t workspace_bytes = ops::sparse_moe_workspace_capacity_bytes(
+        const std::size_t workspace_bytes = ops::sparse_moe_workspace_capacity_bytes(ops::kSparseMoeQwen36Geometry, 
             weights.routed_gate_up.qtype, weights.routed_down.qtype, tokens, tokens);
         WorkspaceArena workspace(workspace_bytes);
 
@@ -567,6 +574,70 @@ public:
             std::cerr << label << ": workspace query/execution high-water mismatch\n";
             ++failures;
         }
+        return failures;
+    }
+
+    // Experts the slot table maps to -1 are "computed elsewhere": every kernel of the round
+    // must leave their paths out, including the prefill reduce, which once summed a stale
+    // grouped column for them (the Flash-Next host-split corruption, 2026-08-29).
+    int run_host_bound(std::int32_t tokens, int first_pattern, std::span<const int> excluded) {
+        const std::string label = std::string(profile_.name) + " T=" + std::to_string(tokens) +
+                                  " host-bound experts";
+        std::vector<float> input(static_cast<std::size_t>(kHidden) * tokens);
+        std::vector<float> residual(static_cast<std::size_t>(kHidden) * tokens);
+        std::vector<double> reference(static_cast<std::size_t>(kHidden) * tokens);
+        for (std::int32_t token = 0; token < tokens; ++token) {
+            const int pattern = (first_pattern + token) % static_cast<int>(kRoutePatterns.size());
+            std::copy(inputs_[pattern].begin(), inputs_[pattern].end(),
+                      input.begin() + static_cast<std::size_t>(token) * kHidden);
+            std::copy(residuals_[pattern].begin(), residuals_[pattern].end(),
+                      residual.begin() + static_cast<std::size_t>(token) * kHidden);
+            const std::vector<double> partial =
+                sparse_moe_oracle(inputs_[pattern], residuals_[pattern], router_, experts_,
+                                  shared_gate_host_, shared_down_host_, kRoutePatterns[pattern],
+                                  excluded);
+            std::copy(partial.begin(), partial.end(),
+                      reference.begin() + static_cast<std::size_t>(token) * kHidden);
+        }
+        std::vector<std::int32_t> table(static_cast<std::size_t>(kExperts));
+        std::iota(table.begin(), table.end(), 0);
+        for (const int expert : excluded) { table[static_cast<std::size_t>(expert)] = -1; }
+        DeviceBuffer device_table = to_device(table);
+
+        const std::vector<std::uint16_t> input_bits    = bf16_bits(input);
+        const std::vector<std::uint16_t> residual_bits = bf16_bits(residual);
+        DeviceBuffer device_input                      = to_device(input_bits);
+        DeviceBuffer residual_seed                     = to_device(residual_bits);
+        GuardedBf16Output destination_storage(residual.size());
+        cuda_check(cudaMemcpy(destination_storage.data(), residual_seed.p, residual_seed.bytes,
+                              cudaMemcpyDeviceToDevice),
+                   "seed SparseMoe destination");
+        ops::SparseMoeWeights weights{
+            dense_bf16_weight(device_router_.p, kExperts + 1, kHidden),
+            routed_gate_.weight(),
+            routed_down_.weight(),
+            shared_gate_.weight(),
+            shared_down_device_.weight(),
+            kTopK,
+        };
+        weights.slot_of_expert = static_cast<const std::int32_t*>(device_table.p);
+        Tensor x(device_input.p, DType::BF16, {kHidden, tokens});
+        Tensor destination(destination_storage.data(), DType::BF16, {kHidden, tokens});
+        const std::size_t workspace_bytes = ops::sparse_moe_workspace_capacity_bytes(ops::kSparseMoeQwen36Geometry, 
+            weights.routed_gate_up.qtype, weights.routed_down.qtype, tokens, tokens);
+        WorkspaceArena workspace(workspace_bytes);
+        // Twice: the second call runs over a workspace the first one left populated, which
+        // is where a stale grouped column would come from.
+        for (int pass = 0; pass < 2; ++pass) {
+            cuda_check(cudaMemcpy(destination_storage.data(), residual_seed.p, residual_seed.bytes,
+                                  cudaMemcpyDeviceToDevice),
+                       "reseed SparseMoe destination");
+            ops::sparse_moe(x, weights, ops::SparseMoeEpilogue::AddResidual, destination,
+                            workspace, nullptr);
+            cuda_synchronize();
+        }
+        int failures = compare_output(label, destination_storage.values(), reference);
+        failures += destination_storage.verify_guards(label);
         return failures;
     }
 
@@ -614,18 +685,24 @@ int run_profile(const CodecProfile& profile) {
     for (std::size_t index = 0; index < profile.token_cases.size(); ++index) {
         const std::int32_t tokens = profile.token_cases[index];
         witness =
-            std::max(witness, ops::sparse_moe_workspace_capacity_bytes(
+            std::max(witness, ops::sparse_moe_workspace_capacity_bytes(ops::kSparseMoeQwen36Geometry, 
                                   profile.routed_gate_up, profile.routed_down, tokens, tokens));
         // Decode starts with the exact top-8 boundary tie; multi-token cases cycle the tie,
         // high/low expert ids, and a different ordering of the same experts.
         failures +=
             fixture.run(tokens, index == 0 ? 1 : 0, profile.verify_graph_replay && index == 1);
     }
-    const std::size_t interval = ops::sparse_moe_workspace_capacity_bytes(
+    const std::size_t interval = ops::sparse_moe_workspace_capacity_bytes(ops::kSparseMoeQwen36Geometry, 
         profile.routed_gate_up, profile.routed_down, 1, profile.token_cases.back());
     if (interval != witness) {
         std::cerr << profile.name << ": interval workspace capacity missed a route witness\n";
         ++failures;
+    }
+    if (profile.routed_gate_up == QType::W8G32_F16S) {
+        constexpr std::array<int, 2> kHostBound{{17, 191}};
+        for (const std::int32_t tokens : {std::int32_t{20}, std::int32_t{768}}) {
+            failures += fixture.run_host_bound(tokens, 0, kHostBound);
+        }
     }
     failures += fixture.verify_persistent_inputs();
     return failures;

@@ -480,6 +480,65 @@ int main() {
         failures += pool_memory.verify_guards("ring pool");
         failures += directory_memory.verify_guards("ring directory");
     }
+    // --- CPU split job list: a job's token comes from the stated paths-per-token count, for
+    // a flat [assignments] view (the prefill path) and a [paths, tokens] view alike. Reading
+    // it off the leading extent put every job of a flat round on token 0 (2026-08-29). ---
+    {
+        constexpr std::int32_t kPaths  = 2;
+        constexpr std::int32_t kTokens = 4;
+        GuardedDeviceBuffer directory_memory(
+            ops::expert_slot_directory_bytes(kLayers, kGeometry.experts, kSlots));
+        GuardedDeviceBuffer miss_memory(ops::expert_miss_list_bytes(kGeometry.experts));
+        GuardedDeviceBuffer jobs_memory(ops::expert_cpu_job_list_bytes(kPaths * kTokens));
+        GuardedDeviceBuffer ids_memory(kPaths * kTokens * sizeof(int));
+        GuardedDeviceBuffer alpha_memory(kPaths * kTokens * sizeof(float));
+        ops::ExpertSlotDirectory directory = ops::create_expert_slot_directory(
+            kLayers, kGeometry.experts, kSlots, 0, directory_memory.data(), nullptr);
+        ops::ExpertMissList misses = ops::create_expert_miss_list(kGeometry.experts, miss_memory.data());
+        ops::ExpertCpuJobList jobs = ops::create_expert_cpu_job_list(kPaths * kTokens, jobs_memory.data());
+        // Token-major: token t routes to experts (2t, 2t+1) with weights 0.1 (t+1), 0.2 (t+1).
+        std::vector<int> ids;
+        std::vector<float> alpha;
+        for (int t = 0; t < kTokens; ++t) {
+            for (int path = 0; path < kPaths; ++path) {
+                ids.push_back(2 * t + path);
+                alpha.push_back(0.1F * static_cast<float>(path + 1) * static_cast<float>(t + 1));
+            }
+        }
+        cuda_check(cudaMemcpy(ids_memory.data(), ids.data(), ids.size() * sizeof(int),
+                              cudaMemcpyHostToDevice), "split ids upload");
+        cuda_check(cudaMemcpy(alpha_memory.data(), alpha.data(), alpha.size() * sizeof(float),
+                              cudaMemcpyHostToDevice), "split alpha upload");
+        for (const bool flat : {true, false}) {
+            ops::expert_slot_directory_reset(directory, nullptr);
+            const Tensor t = flat ? Tensor(ids_memory.data(), DType::I32, {kPaths * kTokens})
+                                  : Tensor(ids_memory.data(), DType::I32, {kPaths, kTokens});
+            const Tensor a = flat ? Tensor(alpha_memory.data(), DType::FP32, {kPaths * kTokens})
+                                  : Tensor(alpha_memory.data(), DType::FP32, {kPaths, kTokens});
+            // Every miss goes to the host: share 1.0.
+            ops::expert_slot_resolve(t, a, 0, directory, misses, &jobs, 65536U, kPaths, nullptr,
+                                     false);
+            cuda_synchronize();
+            const auto count   = from_device<long long>(jobs.count.data, 1)[0];
+            const auto tokens  = from_device<int>(jobs.tokens.data, static_cast<std::size_t>(kPaths * kTokens));
+            const auto experts = from_device<int>(jobs.experts.data, static_cast<std::size_t>(kPaths * kTokens));
+            const auto weights = from_device<float>(jobs.weights.data, static_cast<std::size_t>(kPaths * kTokens));
+            const std::string shape = flat ? "flat" : "2-d";
+            failures += expect(count == kPaths * kTokens,
+                               "split " + shape + ": every path became a job (got " +
+                                   std::to_string(count) + ")");
+            int consistent = 1;
+            for (long long j = 0; j < std::min<long long>(count, kPaths * kTokens); ++j) {
+                const int expert = experts[static_cast<std::size_t>(j)];
+                const int token  = tokens[static_cast<std::size_t>(j)];
+                // expert 2t+path belongs to token t and carries alpha[2t+path].
+                consistent &= expert >= 0 && expert < kPaths * kTokens && token == expert / kPaths &&
+                              weights[static_cast<std::size_t>(j)] == alpha[static_cast<std::size_t>(expert)];
+            }
+            failures += expect(consistent == 1, "split " + shape + ": jobs carry their own token and weight");
+        }
+    }
+
     std::cout << (failures ? "FAIL" : "OK") << " expert_slot_cache\n";
     return failures ? 1 : 0;
 }

@@ -2,6 +2,8 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdlib>
+
 #include <cstddef>
 #include <utility>
 
@@ -22,6 +24,8 @@ struct LaunchConfig {
 // ordinary stream ordering — semantically identical, without the overlap.
 inline bool pdl_supported() {
     static const bool supported = [] {
+        // SUROGATE_SERVE_NO_PDL=1: plain stream ordering everywhere (bisection switch).
+        if (std::getenv("SUROGATE_SERVE_NO_PDL") != nullptr) return false;
         int device = 0;
         if (cudaGetDevice(&device) != cudaSuccess) return false;
         int major = 0;

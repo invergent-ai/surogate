@@ -1912,3 +1912,148 @@ the 512 window with `SUROGATE_SERVE_NO_MIXED_GRAPH=1` splits the graphed tail fr
 bookkeeping; the 256 window with the geometry message extended (width, group, batch) names
 the call that trips the 64-row limit.
 
+
+### The "chunked prefill" bugs, resolved into two different things (2026-08-29 21:50, commit ce150b1e)
+
+The two arms discriminated cleanly, and neither bug is what the 20:15 entry supposed.
+
+**Bug 2 (the 64-row throw) was a fixed constant meeting a new head geometry.** The extended
+message read `width 6 x group 12, batch 1, full width 6, column begin 0`: a 6-token prompt
+segment in an eager mixed round, routed through the small-T attention path, which steps
+prompt segments 6 tokens at a time. The lane step packs `width × group` query rows and holds
+64; Flash-Next is 24 query heads over 2 KV heads — a group of twelve — so 6 × 12 = 72 and
+the launcher refuses. The 27B (24/4), 35B (16/2), 4B (16/4) and 0.8B (8/2) never exceed 48.
+Until today no path produced a 6-wide segment on Flash-Next: decode is 1-wide, prompts take
+the prompt kernel, and only a chunk window small enough to leave a 6-token tail (256 with
+these prompts) hits it. Fix (ce150b1e): the step is now `gqa_attention_small_t_max_width`
+= min(6, 64 / group) from the geometry; the route, the chunk loops and the cached path all
+use it, and the workspace-capacity API takes the KV-head count so its estimate is exact for
+the geometry that runs (24 query heads name two geometries, and the old estimate resolved
+24 to the 27B's 4). The attention test now enumerates the 24-over-2 shape (int8 KV skipped
+past a group of eight, as the launcher refuses it) and passes; the 256 window ran 96 probes
+under 16 users without the throw.
+
+**Bug 1 is not a chunked-prefill bug.** The 512 window with `SUROGATE_SERVE_NO_MIXED_GRAPH=1`
+was clean, which pointed at the graphed continuation chunk; a bisection switch
+(`SUROGATE_SERVE_MIXED_GRAPH_FIRST_CHUNK_ONLY=1`) and two new load probes then showed the
+defect is present at the default window as well, on single-chunk prompts, and absent on a
+VRAM-only model. The probes (`surogate/serve/tools/probe/`): `longprompt.py` (a code planted
+before ~580 tokens of filler, asked back — recall across chunks) and `chunkcount.py` (the
+same filler, then "count upwards from N": at temperature 0 the model reproduces the sequence,
+so any character a count cannot contain is a corrupted round, with a near-zero model floor;
+`garbage` is that class, `wrong` a well-formed but broken sequence, `short` an early stop).
+16 users × 6 rounds, 128-token generations, on the Q4-bank Flash-Next deployment (3,000 slots):
+
+| arm | garbage | wrong | short | note |
+|---|---:|---:|---:|---|
+| 512 window, default | 1 | 0 | 2 | '272, 3 available,乃...' |
+| 512, first chunk only graphed | 0 | 0 | 2 | ', ,' then stop |
+| 512, no mixed graph (eager) | 1 | 1 | 2 | 'EL LoASC Var隅T`=', '282, 83, 284' |
+| 2048 window (single chunk) | 0 | 1 | 0 | '222, 23, 24' — a dropped digit mid-count |
+| 512, no scan ring | 4 | 3 | 6 | wall 2.5× (thrash); one user wrong in 6/6 rounds |
+| 512, W8 host bank | 0 | 1 | 1 | same class |
+| 512, CPU_MOE_VERIFY=1 | 1 | 1 | 1 | no hand-off or job-list report |
+| 35B-A3B, 2048, one 5090 | 0 | 0 | 0 | 96/96 in 18 s |
+
+What the table says: the defect is a *transient wrong-logits round for one lane* — a lane
+emits one garbage burst or drops a digit and then continues coherently, so its KV and state
+are intact and one round's output was wrong. It is independent of graphs (the eager arm
+fails), of the chunk window (the 2048 arm fails), of the bank format (W8 fails), and of the
+attention geometry (the 35B GDN+MoE model is clean on the same probe). It scales with expert
+miss traffic: removing the scan ring, which thrashes the slot cache, multiplies it by ~7.
+It is lane-persistent — the same loader fails round after round, and lanes are sticky per
+loader — which fits a per-column resource more than a random race. The earlier "invalid
+UTF-8" fatals were this class caught by the egress validator; the chunked windows only made
+prompts spend more mixed rounds under it. The 1,000-probe batteries never saw it because
+the coherence probe's answers are short and free-form and `tput.py` only sees fatals.
+
+Not yet excluded: the host expert split (`--cpu-moe-share 0` arm running) and, on the GPU
+side, the slot directory (a stale `slot_of_expert` after a recycle would serve another
+expert's weights on a later hit; `SUROGATE_SERVE_SLOT_DIRECTORY_VERIFY=1` added, unbuilt
+until the arms finish). The pool's barrier protocol and the fork/join ordering of the host
+partial read correct; the job-list mirror is consistent under verify. Next: the share-0
+verdict decides which side gets the reference check.
+
+### The Flash-Next corruption: root cause (2026-08-29 23:35, fix built, validation running)
+
+Eight more arms narrowed the 21:50 table to one seam, and the seam was a kernel.
+
+Exclusions in order: `--cpu-moe-share 0` (GPU experts only) is structurally clean, 96/96,
+so the host expert split is involved. The host path's *data* is correct: the pool run twice
+is bit-identical (7e-9), and every token of one narrow round in eight plus sixteen tokens of
+one wide round in thirty-two match the single-thread reference job path to 1e-3 relative,
+over 32,500 host rounds, in an arm that still produced a garbage burst
+(`SUROGATE_SERVE_CPU_MOE_SELFCHECK=1`). Its *timing* is not the trigger either: with the
+split off but the same fork / host-sleep / join dance on every layer
+(`SUROGATE_SERVE_CPU_MOE_FAKE_WAIT=3`), 95/96 with one early stop. Decode-width host rounds
+alone (prefill share 0) are clean, 95/96; prefill-width host rounds alone (decode share 0)
+94/96 with two early stops; both together fail at 2-3 per 96. So: host rounds on the
+*prefill path* — mixed rounds, which carry the decode rows — and the fault is on the GPU
+side of that path, in how it treats a path the hook handed to the host.
+
+The prefill path marks such a path by `slot_of_expert[expert] = -1`. The routed gate/up
+kernel skips it (`continue`), the routed down kernel skips it (`return`), the decode-family
+D3/D4 kernels zero it — and `sparse_moe_prefill_reduce_kernel`, which sums each token's
+top-k grouped down outputs with the routing weights, did not know the table existed. For a
+host-bound path it added `alpha ×` the grouped column at that path's packed index, which no
+kernel had written this round: whatever an earlier round or slice left there. Then the
+combine added the host's correct contribution on top. Hence everything in the table:
+transient (the stale column varies), data-dependent, prefill-path rounds only (decode-only
+rounds run the small-T kernels, which zero the path), present under graphs and eager, at
+any window, with either bank, absent at share 0 and on models without a slot cache; worse
+without the scan ring because more misses go to the host. Lane persistence came from the
+packed-column reuse pattern, not from the lane.
+
+Fix (`sparse_moe_prefill_body.inc`): the reduce takes `ids` and the slot table and gives a
+host-bound path zero weight. Regression test in `test_sparse_moe.cpp`: a slot table that
+maps two of the routed experts to -1, checked against the oracle with those paths left out,
+at T=20 (small-T) and T=768 (prefill), run twice over the same workspace so the second pass
+sees a populated grouped buffer. Validation arms on the fixed engine: 512 window, 2048
+window, and a 16 × 12 soak.
+
+Diagnostics kept, all off by default: `SUROGATE_SERVE_CPU_MOE_SELFCHECK` (pool rerun +
+reference), `SUROGATE_SERVE_CPU_MOE_STAGECHECK` (side-stream copy of the staged activations,
+device-side read-back of the host partial), `SUROGATE_SERVE_CPU_MOE_FAKE_WAIT=<ms>`,
+`SUROGATE_SERVE_SLOT_DIRECTORY_VERIFY`, `SUROGATE_SERVE_NO_PDL`, and the probes.
+`run_guarded.sh` now ignores a zombie engine when refusing a second process.
+
+### The Flash-Next corruption: the actual root cause (2026-08-30 00:10)
+
+The 23:35 entry named the prefill reduce; the fixed binary still corrupted at the old rate, so
+that was a secondary defect. The primary one needed a stronger oracle than the pool
+self-check: `SUROGATE_SERVE_CPU_MOE_SHADOW=n` recomputes every n-th split round entirely on
+the GPU (the hook resolves without a host share, so every miss is gathered) and compares the
+split's GPU part plus the host partial against it, per token. 414 of 414 checked rounds
+mismatched — all of them the eager 512-token prefill chunks, since graph replays never run
+host code — 410 worst at token 0, with the **host partial** at token 0 of 5–18 against a
+full-GPU maximum of 0.03–0.12 and an ordinary activation (max|x| 2.6–4.5). Token 0 was
+receiving the whole round's host jobs.
+
+`expert_slot_resolve`'s split overload took the paths-per-token count from `ids.ne[0]`
+("ids are [experts_per_token, tokens]"). The decode and small-T paths pass that shape; the
+prefill path passes a flat `[assignments]` view of the same token-major buffer, so the
+"paths per token" became the assignment count and every job's token, `i / per_token`, was 0.
+In every prefill-path host round — every mixed round, which is where the decode rows live —
+token 0 got ~2,000 expert contributions and every other token lost its host-bound experts.
+That is the whole table of 21:50: present under graphs and eager, at any window, with either
+bank; absent at share 0 (no host jobs) and on the 35B (no split); worse without the scan
+ring (more misses, more host jobs); decode-only host rounds nearly clean (their shape is
+2-D); "lane-persistent" because column 0 of a chunk is a fixed position and a lane's decode
+row keeps losing the same experts. The pool self-check could not see it: pool and reference
+consumed the same wrong job list. The invalid-UTF-8 fatals, the recall misses, the dropped
+and repeated digits, the early stops — one bug.
+
+Fixes: the split overload takes `experts_per_token` explicitly (the variant passes the
+geometry's) and rejects a count that is not a multiple of it; the prefill reduce gives
+host-bound paths zero weight (the 23:35 defect, kept). Unit tests: the slot-cache test
+resolves a split round with flat and 2-D ids and checks every job's token, expert and
+weight; the sparse-MoE test runs host-bound experts through the prefill and small-T paths
+twice over a populated workspace. All three ops tests pass (attention with the 24-over-2
+shape, sparse MoE, slot cache).
+
+Validation on the fixed engine (16 users, 420-word prompts, 128-token counts): 512 window,
+192 probes — 191 ok, 0 garbage, 0 short, 1 well-formed slip at the second number
+('238, 240, 241…'); before the fix the same arm gave 2–3 garbage/wrong and 2–4 early stops
+per 96. 2048 window (single-chunk prompts, decode-only host rounds): 96/96, no short, no
+garbage, no wrong. 256 window (the 20:15 reproducer): 96/96, no geometry throw. Shadow oracle
+on the fixed engine and a 2048-window 192-probe soak: appended below when they finish.

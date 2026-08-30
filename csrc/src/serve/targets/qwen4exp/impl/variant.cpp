@@ -19,9 +19,11 @@
 #include <array>
 #include <deque>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <stdexcept>
@@ -206,6 +208,8 @@ struct ExpertSlotCache {
     bool prefill_share_default  = false; // prefill share not given: follows the measured decode share
     std::shared_ptr<ops::CpuExpertPool> cpu_pool; // one per process: pipeline stages share the host cores
     cudaStream_t cpu_stream = nullptr; // side stream: the host round overlaps the GPU experts
+    cudaStream_t fake_stream = nullptr; // SUROGATE_SERVE_CPU_MOE_FAKE_WAIT: timing-only fork/join
+    cudaEvent_t fake_fork = nullptr, fake_join = nullptr;
     cudaEvent_t fork_event   = nullptr;
     cudaEvent_t join_event   = nullptr;
     cudaEvent_t copied_event = nullptr; // the slice's staging copies are done (the job list may be reused)
@@ -242,6 +246,11 @@ struct ExpertSlotCache {
                              entry.cpu_bank.gate_up_codes != nullptr;
     }
 
+    static void fake_wait_round(void* context) {
+        const int ms = *static_cast<const int*>(context);
+        std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+    }
+
     static void run_cpu_round(void* context) {
         auto* slice            = static_cast<SliceContext*>(context);
         Layer* entry           = slice->entry;
@@ -251,6 +260,7 @@ struct ExpertSlotCache {
         const std::size_t column0 = static_cast<std::size_t>(slice->offset) * hidden;
         const JobMirror& mirror   = *slice->mirror;
         const long long count     = std::min<long long>(*mirror.count, cache.cpu_jobs.capacity);
+        if (cache.stagecheck) { cache.stagecheck_round(*entry, slice, column0, tokens); }
         std::fill_n(cache.out_host + column0, static_cast<std::size_t>(hidden) * tokens, 0.0F);
         if (count <= 0) { return; }
         cache.job_scratch.resize(static_cast<std::size_t>(count));
@@ -284,6 +294,142 @@ struct ExpertSlotCache {
         }
         ops::CpuExpertRound round{cache.x_host + column0, cache.out_host + column0, tokens, cache.job_scratch};
         cache.cpu_pool->run(entry->cpu_bank, round);
+        // SUROGATE_SERVE_CPU_MOE_SELFCHECK=1: run the pool a second time and compare (a race
+        // in the pool shows as a run-to-run difference far above accumulation-order noise),
+        // then recompute two of the round's tokens on this thread with the reference job
+        // path and compare those columns (a deterministic error in the pool shows there).
+        // Off by default: it doubles the host round.
+        static const bool selfcheck = std::getenv("SUROGATE_SERVE_CPU_MOE_SELFCHECK") != nullptr;
+        if (selfcheck) { cache.selfcheck_round(*entry, slice, round); }
+    }
+
+    std::int64_t selfcheck_rounds     = 0;
+    std::int64_t selfcheck_violations = 0;
+    // SUROGATE_SERVE_CPU_MOE_STAGECHECK=1: a second copy of every slice's activations is taken on
+    // the side stream at the fork (x_check) and compared with the main-stream staging in the
+    // host round; after each combine the device's view of the host partial is copied back
+    // (out_check) and compared with what the host wrote, in the next host round.
+    const bool stagecheck = std::getenv("SUROGATE_SERVE_CPU_MOE_STAGECHECK") != nullptr;
+    std::uint16_t* x_check    = nullptr;
+    float* out_check          = nullptr;
+    std::int32_t out_check_tokens = -1; // tokens the last combine covered; -1 = nothing pending
+    std::int64_t stagecheck_rounds = 0, stagecheck_x_violations = 0, stagecheck_out_violations = 0;
+    void stagecheck_round(Layer& entry, const SliceContext* slice, std::size_t column0, std::int32_t tokens) {
+        const std::int32_t hidden = ops::kSparseMoeFlashNextGeometry.hidden;
+        ++stagecheck_rounds;
+        // The previous combine's device-side view of the partial vs what the host wrote.
+        if (out_check_tokens >= 0 && slice->offset == 0) {
+            const std::size_t n = static_cast<std::size_t>(hidden) * out_check_tokens;
+            std::size_t bad = 0, first = n;
+            for (std::size_t i = 0; i < n; ++i) {
+                if (out_check[i] != out_host[i]) { if (first == n) { first = i; } ++bad; }
+            }
+            if (bad != 0) {
+                ++stagecheck_out_violations;
+                std::fprintf(stderr,
+                             "qwen4exp: stage check: the device read a host partial that differs from what "
+                             "the host wrote (%zu of %zu values, first at token %zu row %zu: device %.4g host "
+                             "%.4g; layer %d, %d tokens; violation %lld of %lld rounds)\n",
+                             bad, n, first / static_cast<std::size_t>(hidden), first % static_cast<std::size_t>(hidden),
+                             static_cast<double>(out_check[first]), static_cast<double>(out_host[first]),
+                             entry.index, out_check_tokens, static_cast<long long>(stagecheck_out_violations),
+                             static_cast<long long>(stagecheck_rounds));
+            }
+            out_check_tokens = -1;
+        }
+        // The side-stream copy of the activations vs the main-stream staging.
+        const std::size_t n = static_cast<std::size_t>(hidden) * tokens;
+        std::size_t bad = 0, first = n;
+        for (std::size_t i = 0; i < n; ++i) {
+            if (x_check[column0 + i] != x_host[column0 + i]) { if (first == n) { first = i; } ++bad; }
+        }
+        if (bad != 0) {
+            ++stagecheck_x_violations;
+            std::fprintf(stderr,
+                         "qwen4exp: stage check: the activations staged for the host differ between the "
+                         "main-stream copy and the side-stream copy (%zu of %zu values, first at token %zu; "
+                         "layer %d, slice offset %d, %d tokens; violation %lld of %lld rounds)\n",
+                         bad, n, first / static_cast<std::size_t>(hidden), entry.index, slice->offset, tokens,
+                         static_cast<long long>(stagecheck_x_violations), static_cast<long long>(stagecheck_rounds));
+        }
+        if (stagecheck_rounds % 2000 == 0) {
+            std::fprintf(stderr, "qwen4exp: stage check: %lld rounds, %lld activation and %lld partial violations\n",
+                         static_cast<long long>(stagecheck_rounds), static_cast<long long>(stagecheck_x_violations),
+                         static_cast<long long>(stagecheck_out_violations));
+        }
+    }
+
+    void selfcheck_round(Layer& entry, const SliceContext* slice, const ops::CpuExpertRound& round) {
+        const auto geometry       = ops::kSparseMoeFlashNextGeometry;
+        const std::int32_t hidden = geometry.hidden;
+        const std::size_t elements = static_cast<std::size_t>(hidden) * round.tokens;
+        ++selfcheck_rounds;
+        std::vector<float> first(round.out, round.out + elements);
+        std::fill_n(round.out, elements, 0.0F);
+        cpu_pool->run(entry.cpu_bank, round);
+        float scale = 1e-6F;
+        for (const float v : first) { scale = std::max(scale, std::fabs(v)); }
+        float worst_rerun = 0.0F;
+        std::int32_t worst_rerun_token = -1;
+        for (std::size_t i = 0; i < elements; ++i) {
+            const float d = std::fabs(first[i] - round.out[i]);
+            if (d > worst_rerun) {
+                worst_rerun       = d;
+                worst_rerun_token = static_cast<std::int32_t>(i / static_cast<std::size_t>(hidden));
+            }
+        }
+        // Reference: every token of a narrow round on one round in 8, sixteen tokens of a wide
+        // round on one round in 32 (the single-thread job path is slow, and this runs on the
+        // host's critical path). A per-job error at the percent level needs this coverage.
+        const bool narrow          = round.tokens <= 32;
+        const bool reference_round = narrow ? selfcheck_rounds % 8 == 0 : selfcheck_rounds % 32 == 0;
+        std::vector<std::byte> scratch_bytes(reference_round ? ops::cpu_expert_scratch_bytes(geometry) + 64 : 0);
+        auto* scratch = reinterpret_cast<std::byte*>(
+            (reinterpret_cast<std::uintptr_t>(scratch_bytes.data()) + 63) & ~std::uintptr_t{63});
+        std::vector<float> reference(static_cast<std::size_t>(hidden));
+        std::vector<char> token_checked(static_cast<std::size_t>(round.tokens), 0);
+        float worst_ref              = 0.0F;
+        std::int32_t worst_ref_token = -1;
+        int checked_count            = 0;
+        const int check_limit        = narrow ? round.tokens : 16;
+        for (const ops::CpuExpertJob& job : round.jobs) {
+            if (!reference_round || checked_count >= check_limit) { break; }
+            if (token_checked[static_cast<std::size_t>(job.token)] != 0) { continue; }
+            token_checked[static_cast<std::size_t>(job.token)] = 1;
+            ++checked_count;
+            std::fill(reference.begin(), reference.end(), 0.0F);
+            for (const ops::CpuExpertJob& other : round.jobs) {
+                if (other.token != job.token) { continue; }
+                ops::cpu_expert_compute_job(geometry, entry.cpu_bank, other,
+                                            round.x + static_cast<std::size_t>(job.token) * hidden,
+                                            reference.data(), scratch);
+            }
+            const float* column = round.out + static_cast<std::size_t>(job.token) * hidden;
+            for (std::int32_t r = 0; r < hidden; ++r) {
+                const float d = std::fabs(reference[static_cast<std::size_t>(r)] - column[r]);
+                if (d > worst_ref) {
+                    worst_ref       = d;
+                    worst_ref_token = job.token;
+                }
+            }
+        }
+        const float tolerance = 5e-3F * scale;
+        if (worst_rerun > tolerance || worst_ref > tolerance) {
+            ++selfcheck_violations;
+            std::fprintf(stderr,
+                         "qwen4exp: host expert self-check violation (layer %d, slice offset %d, "
+                         "tokens %d, jobs %zu): rerun differs by %.3g at token %d, reference "
+                         "differs by %.3g at token %d, scale %.3g (violation %lld of %lld rounds)\n",
+                         entry.index, slice->offset, round.tokens, round.jobs.size(),
+                         static_cast<double>(worst_rerun), worst_rerun_token,
+                         static_cast<double>(worst_ref), worst_ref_token,
+                         static_cast<double>(scale), static_cast<long long>(selfcheck_violations),
+                         static_cast<long long>(selfcheck_rounds));
+        } else if (selfcheck_rounds % 500 == 0) {
+            std::fprintf(stderr, "qwen4exp: host expert self-check: %lld rounds, %lld violations\n",
+                         static_cast<long long>(selfcheck_rounds),
+                         static_cast<long long>(selfcheck_violations));
+        }
     }
 
     // Stages one slice of the round (columns [round_offset, round_offset + tokens) of the
@@ -316,6 +462,11 @@ struct ExpertSlotCache {
         // Fork only the host function onto the side stream so it overlaps the GPU experts.
         CUDA_CHECK(cudaEventRecord(fork_event, stream));
         CUDA_CHECK(cudaStreamWaitEvent(cpu_stream, fork_event, 0));
+        if (stagecheck && x_check != nullptr) {
+            CUDA_CHECK(cudaMemcpyAsync(x_check + column0, x.data,
+                                       static_cast<std::size_t>(hidden) * tokens * sizeof(std::uint16_t),
+                                       cudaMemcpyDeviceToHost, cpu_stream));
+        }
         CUDA_CHECK(cudaLaunchHostFunc(cpu_stream, &ExpertSlotCache::run_cpu_round, &slice));
         CUDA_CHECK(cudaEventRecord(join_event, cpu_stream));
         entry.round_offset = offset + tokens;
@@ -323,6 +474,20 @@ struct ExpertSlotCache {
         CUDA_CHECK(cudaGetDevice(&partial_device));
         t_partial =
             PendingPartial{static_cast<const float*>(out_device_alias), join_event, partial_device};
+    }
+
+    // SUROGATE_SERVE_CPU_MOE_SHADOW=<n>: every n-th split round is recomputed entirely on the
+    // GPU (this hook resolves without a host share, so every miss is gathered) into a shadow
+    // plane, and the split's GPU part plus the host partial is compared with it per token.
+    std::int64_t shadow_rounds = 0, shadow_checked = 0, shadow_violations = 0;
+    static void resolve_round_shadow(void* context, const Tensor& ids, const Tensor& /*alpha*/,
+                                     const Tensor& /*x*/, Tensor& /*destination*/,
+                                     cudaStream_t stream) {
+        auto* entry            = static_cast<Layer*>(context);
+        ExpertSlotCache& cache = *entry->owner;
+        const bool scan        = entry->round_total > 32;
+        ops::expert_slot_resolve(ids, entry->index, cache.directory, cache.misses, stream, scan);
+        ops::expert_slot_gather(entry->bank, cache.misses, cache.pool, stream);
     }
 
     static void resolve_round(void* context, const Tensor& ids, const Tensor& alpha,
@@ -339,14 +504,104 @@ struct ExpertSlotCache {
         const bool scan = entry->round_total > 32;
         if (split) {
             ops::expert_slot_resolve(ids, alpha, entry->index, cache.directory, cache.misses,
-                                     &cache.cpu_jobs, share, stream, scan);
+                                     &cache.cpu_jobs, share,
+                                     ops::kSparseMoeFlashNextGeometry.experts_per_token, stream,
+                                     scan);
         } else {
             ops::expert_slot_resolve(ids, entry->index, cache.directory, cache.misses, stream,
                                      scan);
         }
         ops::expert_slot_gather(entry->bank, cache.misses, cache.pool, stream);
         if (split) { cache.cpu_round(*entry, x, destination, stream); }
+        // SUROGATE_SERVE_CPU_MOE_FAKE_WAIT=<ms>: with the split off, still fork a host function
+        // that sleeps for <ms> and make the combine wait for it — the host split's stream
+        // timing without its data. Tells a data fault in the host path from a latent race
+        // elsewhere that the split's idle gaps expose.
+        static const int fake_wait_ms = [] {
+            const char* raw = std::getenv("SUROGATE_SERVE_CPU_MOE_FAKE_WAIT");
+            return raw != nullptr && *raw != '\0' ? std::atoi(raw) : 0;
+        }();
+        if (!split && fake_wait_ms > 0) {
+            if (cache.fake_stream == nullptr) {
+                CUDA_CHECK(cudaStreamCreateWithFlags(&cache.fake_stream, cudaStreamNonBlocking));
+                CUDA_CHECK(cudaEventCreateWithFlags(&cache.fake_fork, cudaEventDisableTiming));
+                CUDA_CHECK(cudaEventCreateWithFlags(&cache.fake_join, cudaEventDisableTiming));
+            }
+            CUDA_CHECK(cudaEventRecord(cache.fake_fork, stream));
+            CUDA_CHECK(cudaStreamWaitEvent(cache.fake_stream, cache.fake_fork, 0));
+            CUDA_CHECK(cudaLaunchHostFunc(cache.fake_stream, &ExpertSlotCache::fake_wait_round,
+                                          const_cast<int*>(&fake_wait_ms)));
+            CUDA_CHECK(cudaEventRecord(cache.fake_join, cache.fake_stream));
+            CUDA_CHECK(cudaStreamWaitEvent(stream, cache.fake_join, 0));
+        }
         if (cache.stats_every > 0) { cache.record_stats(ids, stream); }
+        if (cache.directory_verify) { cache.verify_directory(ids, entry->index, stream); }
+    }
+
+    // SUROGATE_SERVE_SLOT_DIRECTORY_VERIFY=1: after every resolve, read the directory back and
+    // check it is a bijection (slot_of_expert and expert_of_slot agree both ways) and that every
+    // expert this layer routed to is either resident or stamped for the host this round. A
+    // synchronous eager-mode diagnostic; a violation is printed once per layer-round.
+    const bool directory_verify = std::getenv("SUROGATE_SERVE_SLOT_DIRECTORY_VERIFY") != nullptr;
+    std::int64_t directory_violations = 0;
+    void verify_directory(const Tensor& ids, int layer, cudaStream_t stream) {
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess ||
+            capture != cudaStreamCaptureStatusNone) {
+            return;
+        }
+        const std::int32_t experts = directory.experts;
+        const std::int32_t layers  = directory.layers;
+        const auto slots           = static_cast<std::int32_t>(directory.expert_of_slot.ne[0]);
+        std::vector<int> table(static_cast<std::size_t>(layers) * experts);
+        std::vector<int> owners(static_cast<std::size_t>(slots));
+        std::vector<unsigned> cpu_stamp(static_cast<std::size_t>(experts));
+        std::vector<int> routed(static_cast<std::size_t>(ids.numel()));
+        unsigned round = 0;
+        CUDA_CHECK(cudaMemcpyAsync(table.data(), directory.slot_of_expert.data,
+                                   table.size() * sizeof(int), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(owners.data(), directory.expert_of_slot.data,
+                                   owners.size() * sizeof(int), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(cpu_stamp.data(), directory.cpu_round.data,
+                                   cpu_stamp.size() * sizeof(unsigned), cudaMemcpyDeviceToHost,
+                                   stream));
+        CUDA_CHECK(cudaMemcpyAsync(routed.data(), ids.data, routed.size() * sizeof(int),
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(&round, directory.round.data, sizeof(round),
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        std::int64_t bad_forward = 0, bad_backward = 0, unserved = 0;
+        for (std::size_t f = 0; f < table.size(); ++f) {
+            const int slot = table[f];
+            if (slot < 0) { continue; }
+            if (slot >= slots || owners[static_cast<std::size_t>(slot)] != static_cast<int>(f)) {
+                ++bad_forward;
+            }
+        }
+        for (std::int32_t s = 0; s < slots; ++s) {
+            const int flat = owners[static_cast<std::size_t>(s)];
+            if (flat < 0) { continue; }
+            if (flat >= static_cast<int>(table.size()) || table[static_cast<std::size_t>(flat)] != s) {
+                ++bad_backward;
+            }
+        }
+        for (const int expert : routed) {
+            if (expert < 0 || expert >= experts) { continue; }
+            const std::size_t flat = static_cast<std::size_t>(layer) * experts + expert;
+            if (table[flat] < 0 && cpu_stamp[static_cast<std::size_t>(expert)] != round) {
+                ++unserved;
+            }
+        }
+        if (bad_forward != 0 || bad_backward != 0 || unserved != 0) {
+            ++directory_violations;
+            std::fprintf(stderr,
+                         "qwen4exp: slot directory violation at layer %d round %u: %lld forward, "
+                         "%lld backward, %lld routed experts neither resident nor on the host "
+                         "(violation %lld)\n",
+                         layer, round, static_cast<long long>(bad_forward),
+                         static_cast<long long>(bad_backward), static_cast<long long>(unserved),
+                         static_cast<long long>(directory_violations));
+        }
     }
 
     // Diagnostic hit-rate readout (SUROGATE_SERVE_EXPERT_STATS=<rounds>): every `stats_every`
@@ -564,6 +819,15 @@ ExpertSlotCache& expert_slot_cache_for_current_device() {
                                      static_cast<std::size_t>(hidden) * stage_tokens * sizeof(float),
                                      cudaHostAllocMapped | cudaHostAllocPortable));
             CUDA_CHECK(cudaHostGetDevicePointer(&cache.out_device_alias, cache.out_host, 0));
+            if (cache.stagecheck) {
+                // Allocated here, not lazily: the first host round may run under graph capture.
+                CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&cache.x_check),
+                                         static_cast<std::size_t>(hidden) * stage_tokens * sizeof(std::uint16_t),
+                                         cudaHostAllocPortable));
+                CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&cache.out_check),
+                                         static_cast<std::size_t>(hidden) * stage_tokens * sizeof(float),
+                                         cudaHostAllocPortable));
+            }
             cache.jobs_block_bytes = ops::expert_cpu_job_list_bytes(capacity);
             for (auto& m : cache.mirrors) {
                 CUDA_CHECK(cudaHostAlloc(&m.block, cache.jobs_block_bytes, cudaHostAllocPortable));
@@ -774,6 +1038,17 @@ void combine_into(const Tensor& block_output, Tensor& residual, cudaStream_t str
         // Join the host round (side stream) before the combine reads its partial.
         CUDA_CHECK(cudaStreamWaitEvent(stream, t_partial.join, 0));
         ops::hyper_connection_combine(block_output, t_partial.device_alias, t_inject, residual, stream);
+        {
+            ExpertSlotCache& cache = expert_slot_cache_for_current_device();
+            if (cache.stagecheck && cache.out_check != nullptr) {
+                const std::int32_t tokens = block_output.ne[1];
+                CUDA_CHECK(cudaMemcpyAsync(cache.out_check, cache.out_device_alias,
+                                           static_cast<std::size_t>(ops::kSparseMoeFlashNextGeometry.hidden) *
+                                               tokens * sizeof(float),
+                                           cudaMemcpyDefault, stream));
+                cache.out_check_tokens = tokens;
+            }
+        }
         t_partial = PendingPartial{};
     } else {
         ops::hyper_connection_combine(block_output, t_inject, residual, stream);
@@ -1152,6 +1427,98 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
         ops::SparseMoeRoundHook hook{&ExpertSlotCache::resolve_round, &layer};
         ops::sparse_moe(hidden, pooled, ops::SparseMoeEpilogue::AddResidual, output, leaf, stream,
                         hook);
+        static const int shadow_every = [] {
+            const char* raw = std::getenv("SUROGATE_SERVE_CPU_MOE_SHADOW");
+            return raw != nullptr && *raw != '\0' ? std::atoi(raw) : 0;
+        }();
+        if (shadow_every > 0 && layer.round_split && t_partial.device_alias != nullptr) {
+            cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+            const bool capturing = cudaStreamIsCapturing(stream, &capture) != cudaSuccess ||
+                                   capture != cudaStreamCaptureStatusNone;
+            if (!capturing && ++cache.shadow_rounds % shadow_every == 0) {
+                Tensor shadow = workspace.alloc(DType::BF16, {kHidden, tokens});
+                CUDA_CHECK(cudaMemsetAsync(shadow.data, 0, shadow.bytes(), stream));
+                const DeviceSpan storage2 = workspace.alloc_bytes(ops::sparse_moe_workspace_capacity_bytes(
+                    ops::kSparseMoeFlashNextGeometry, weights.op.routed_gate_up.qtype,
+                    weights.op.routed_down.qtype, tokens, tokens));
+                WorkspaceArena leaf2(storage2);
+                ops::SparseMoeRoundHook shadow_hook{&ExpertSlotCache::resolve_round_shadow, &layer};
+                ops::sparse_moe(hidden, pooled, ops::SparseMoeEpilogue::AddResidual, shadow, leaf2,
+                                stream, shadow_hook);
+                CUDA_CHECK(cudaStreamWaitEvent(stream, t_partial.join, 0));
+                const std::size_t n = static_cast<std::size_t>(kHidden) * tokens;
+                std::vector<std::uint16_t> part(n), full(n);
+                CUDA_CHECK(cudaMemcpyAsync(part.data(), output.data, n * sizeof(std::uint16_t),
+                                           cudaMemcpyDeviceToHost, stream));
+                CUDA_CHECK(cudaMemcpyAsync(full.data(), shadow.data, n * sizeof(std::uint16_t),
+                                           cudaMemcpyDeviceToHost, stream));
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                const float* partial = cache.out_host;
+                auto bf16 = [](std::uint16_t bits) {
+                    std::uint32_t w = static_cast<std::uint32_t>(bits) << 16;
+                    float f;
+                    std::memcpy(&f, &w, sizeof(f));
+                    return f;
+                };
+                float scale = 1e-6F, worst = 0.0F;
+                std::int32_t worst_token = -1;
+                std::int64_t bad_tokens = 0;
+                for (std::int32_t t = 0; t < tokens; ++t) {
+                    float token_worst = 0.0F;
+                    for (std::int32_t d = 0; d < kHidden; ++d) {
+                        const std::size_t i = static_cast<std::size_t>(t) * kHidden + d;
+                        const float reference = bf16(full[i]);
+                        const float value     = bf16(part[i]) + partial[i];
+                        scale                 = std::max(scale, std::fabs(reference));
+                        token_worst           = std::max(token_worst, std::fabs(value - reference));
+                    }
+                    if (token_worst > worst) { worst = token_worst; worst_token = t; }
+                    if (token_worst > 0.05F) { ++bad_tokens; }
+                }
+                ++cache.shadow_checked;
+                if (worst > 0.02F * scale) {
+                    ++cache.shadow_violations;
+                    // The worst token, decomposed: its GPU part, host partial, full result, and
+                    // the magnitude of its activation (host activations are int8 per group).
+                    float part_max = 0.0F, partial_max = 0.0F, full_max = 0.0F, x_max = 0.0F;
+                    std::int32_t x_argmax = -1;
+                    std::vector<std::uint16_t> x_bits(static_cast<std::size_t>(kHidden));
+                    CUDA_CHECK(cudaMemcpy(x_bits.data(),
+                                          static_cast<const std::uint16_t*>(hidden.data) +
+                                              static_cast<std::size_t>(worst_token) * kHidden,
+                                          x_bits.size() * sizeof(std::uint16_t), cudaMemcpyDeviceToHost));
+                    for (std::int32_t d = 0; d < kHidden; ++d) {
+                        const std::size_t i = static_cast<std::size_t>(worst_token) * kHidden + d;
+                        part_max    = std::max(part_max, std::fabs(bf16(part[i])));
+                        partial_max = std::max(partial_max, std::fabs(partial[i]));
+                        full_max    = std::max(full_max, std::fabs(bf16(full[i])));
+                        const float xv = std::fabs(bf16(x_bits[static_cast<std::size_t>(d)]));
+                        if (xv > x_max) { x_max = xv; x_argmax = d; }
+                    }
+                    std::int64_t host_jobs = 0;
+                    for (const ops::CpuExpertJob& job : cache.job_scratch) {
+                        if (job.token == worst_token) { ++host_jobs; }
+                    }
+                    std::fprintf(stderr,
+                                 "qwen4exp: host split shadow mismatch (layer %d, %d tokens): worst "
+                                 "|split - full| %.4g at token %d, scale %.3g, %lld tokens over 0.05 "
+                                 "(violation %lld of %lld checked); token %d: max|gpu part| %.4g, "
+                                 "max|host partial| %.4g, max|full| %.4g, max|x| %.4g at dim %d, %lld "
+                                 "host jobs in the last slice\n",
+                                 weights.layer, tokens, static_cast<double>(worst), worst_token,
+                                 static_cast<double>(scale), static_cast<long long>(bad_tokens),
+                                 static_cast<long long>(cache.shadow_violations),
+                                 static_cast<long long>(cache.shadow_checked), worst_token,
+                                 static_cast<double>(part_max), static_cast<double>(partial_max),
+                                 static_cast<double>(full_max), static_cast<double>(x_max), x_argmax,
+                                 static_cast<long long>(host_jobs));
+                } else if (cache.shadow_checked % 200 == 0) {
+                    std::fprintf(stderr, "qwen4exp: host split shadow: %lld rounds checked, %lld mismatches\n",
+                                 static_cast<long long>(cache.shadow_checked),
+                                 static_cast<long long>(cache.shadow_violations));
+                }
+            }
+        }
     } else {
         ops::sparse_moe(hidden, weights.op, ops::SparseMoeEpilogue::AddResidual, output, leaf,
                         stream);
