@@ -450,15 +450,27 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             }
             stream->started = true;
             try {
-                write_stream_item(sink, *stream,
-                                  make_chat_chunk_role(id, model, created, include_usage));
+                // The role chunk goes out with the first streamed item, not at acceptance:
+                // that is when the OpenAI and vLLM servers send theirs, and it is what a
+                // client's time-to-first-token clock stops on (vllm bench stamps TTFT on the
+                // first chunk carrying `choices`). Sent up front it read as a 50 ms TTFT
+                // for every request.
+                bool role_sent   = false;
+                auto ensure_role = [&] {
+                    if (role_sent) { return; }
+                    role_sent = true;
+                    write_stream_item(sink, *stream,
+                                      make_chat_chunk_role(id, model, created, include_usage));
+                };
                 StreamSink output;
                 output.on_content = [&](const std::string& text) {
+                    ensure_role();
                     write_stream_item(
                         sink, *stream,
                         make_chat_chunk_content(id, model, created, text, include_usage));
                 };
                 output.on_reasoning = [&](const std::string& text) {
+                    ensure_role();
                     write_stream_item(
                         sink, *stream,
                         make_chat_chunk_reasoning(id, model, created, text, include_usage));
@@ -470,6 +482,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
 
                 const GenerationOutcome outcome = service_->run(stream->prepared, &output);
                 log_request_done(log_context, outcome);
+                ensure_role();
                 const std::string_view remaining = unstreamed_content(outcome);
                 if (!outcome.tool_calls.empty()) {
                     if (!remaining.empty()) {

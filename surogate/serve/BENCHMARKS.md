@@ -1,239 +1,128 @@
 # Serving benchmarks — surogate serve vs vLLM vs llama.cpp
 
-Board of record. The full narrative (superseded rows, rejected levers, kernel
-profiles, the reasoning behind each lever) is in `BENCHMARKS_HISTORY.md`.
+Board of record, one table. The narrative behind every row (superseded rows,
+rejected levers, kernel profiles, the reasoning behind each lever, and the
+per-model sections this table replaced on 2026-08-30) is in
+`BENCHMARKS_HISTORY.md`; the dated engineering log is `design/INFERENCE.md`.
 
 Host: 8× RTX 5090 (32 GB, driver 590.44.01), two NUMA nodes (GPUs 0–3 / 4–7),
-2× EPYC 9124 (32 cores, AVX512-VNNI). Engines: **surogate serve** (this repo),
-**vLLM 0.27.1** (flashinfer 0.6.16.post3), **llama.cpp** CUDA build
-(0.3.0-dev @ f1357e4; Flash-Next rows use upstream master with `qwen4exp`,
-plus `ik_llama.cpp` 7cff686d for the CPU-MoE bar).
+2× EPYC 9124 (32 cores, AVX512-VNNI), 503 GB RAM. Engines: **surogate serve**
+(this repo), **vLLM 0.27.1** (flashinfer 0.6.16.post3), **llama.cpp** CUDA
+build (0.3.0-dev @ f1357e4; Flash-Next rows use upstream master with
+`qwen4exp`, plus `ik_llama.cpp` 7cff686d for the CPU-MoE bar).
 
 ## Method
 
-One HTTP load generator for every engine (streaming `/v1/chat/completions`,
-salted prompts so nothing shares a prefix, identical token accounting). All
-numbers exclude model load. 100-user rows are **90-second steady state**
-(shorter windows read up to 25 % high).
+Closed-loop HTTP clients against each engine's OpenAI endpoint (streaming
+`/v1/chat/completions`, salted prompts so nothing shares a prefix, the engine's
+own token accounting). Numbers exclude model load; rows at 16+ users are
+90-second steady state (shorter windows read up to 25 % high), one-user rows
+60 s. Every engine was measured on the same card class; a number is only
+comparable to its pair on the same card in the same batch (the same binary
+repeats to ~1 % on a card, but cards and days differ by up to 50 %).
 
-| workload | shape |
-|---|---|
-| 100 users (board shape) | 100 closed-loop clients, ~512-token prompts, 128 out, 90 s |
-| prefill-heavy | ~2k-token prompts, 16 out |
-| decode-heavy | 128-token prompts, 512 out; also the 300–600 s correctness soak |
-| 1 user | ~1.9k prompt / 128 out for TTFT; ~60 prompt / 512 out for decode |
+Columns:
 
-Rules that keep the numbers honest:
+- **GPUs** — cards the engine used (1, or an 8-card layer pipeline).
+- **users** — concurrent closed-loop clients.
+- **prefill tok/s** — prompt tokens ÷ the run's wall time (a throughput share,
+  decode phases included — not a prompt-processing rate). At one user the
+  prompt-processing rate is prompt tokens ÷ TTFT, marked †.
+- **decode tok/s** — generated tokens ÷ wall time, summed over users (a
+  one-user row is that stream's speed).
+- **throughput tok/s** — prefill + decode: all tokens the engine moved per second.
+- **TTFT p50** — median time to the first streamed content token.
+- **≈** — the pass recorded decode but not prefill; the figure is derived from
+  the workload shape (512/128 → prefill ≈ 4× decode) and so is the throughput.
 
-- **A number is only comparable to its pair on the same card in the same
-  batch.** The same binary measures 6,498 tok/s on GPU2 and 9,972 on GPU3
-  (0.8B); the engine itself repeats to ~1 % on a given card.
-- **"prefill tok/s" is prompt tokens ÷ the run's wall time**, decode phases
-  included. It is a throughput share, not a prompt-processing rate. At one
-  user the prompt-processing rate is prompt tokens ÷ TTFT.
-- KV cache is fp8 (e4m3) by default; int8 KV is never used on this board (it
-  changes output). Engine defaults: 128 lanes (64 where the model does not
-  fit more), `--max-num-batched-tokens 4096` on the 27B/35B, CUDA graphs on.
-- Weight pairing: llama.cpp serves GGUF Q4_K_M (~4.5 bpw), vLLM NVFP4, surogate
-  the native NVFP4 artifact (4B, 27B) or the artifact repacked from the same
-  GGUF (0.8B, 35B mixed Q4/Q5/Q6). All artifacts decode bit-exact against
-  their source before any number is recorded.
+Shapes: **512/128** unless the comment says otherwise (prefill-heavy is
+2048/16, decode-heavy 128/512, single-user TTFT at a ~1.9k prompt). KV cache
+fp8 (e4m3) on surogate; int8 KV is never used on this board (it changes
+output). Weight pairing: llama.cpp serves GGUF Q4_K_M (~4.5 bpw), vLLM NVFP4,
+surogate the native NVFP4 artifact (4B, 27B) or the artifact repacked from the
+same GGUF (0.8B; 35B mixed Q4/Q5/Q6; Flash-Next W8 → Q4G32AM host bank).
+Every artifact decodes bit-exact against its source before a number is
+recorded, and every surogate row is probed for correctness **at** its
+concurrency.
 
-## Board of record (2026-08-28)
+## Board of record (2026-08-30)
 
-Every engine on its own card, all running at once, 100 users, 512/128, 90 s,
-fp8 KV. The 27B and 35B rows are means of two passes with the cards rotated.
+| model | engine | GPUs | users | prefill tok/s | decode tok/s | throughput tok/s | TTFT p50 | comments |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| Qwen3.5-0.8B | **surogate** | 1 | 100 | ≈ 40,400 | **10,095** | ≈ 50,500 | **45 ms** | GGUF Q4_K_M repack, 128 lanes; 2026-08-28, all cards busy |
+| Qwen3.5-0.8B | vLLM | 1 | 100 | ≈ 26,800 | 6,694 | ≈ 33,500 | 658 ms | same pass; surogate +51 % decode, 14× TTFT |
+| Qwen3.5-0.8B | **surogate** | 1 | 100 | **81,376** | 636 | 82,012 | 2.39 s | prefill-heavy 2048/16 (2026-08-27, GPU4) |
+| Qwen3.5-0.8B | vLLM | 1 | 100 | 45,106 | 352 | 45,458 | 3.88 s | prefill-heavy, same card |
+| Qwen3.5-0.8B | **surogate** | 1 | 1 | 39,600 † | **503** | — | **48 ms** | 2026-08-26, GPU2, bf16 KV |
+| Qwen3.5-0.8B | llama.cpp | 1 | 1 | 11,300 † | 391 | — | 168 ms | |
+| Qwen3.5-0.8B | vLLM | 1 | 1 | 34,500 † | 364 | — | 55 ms | |
+| Qwen3.5-4B | **surogate** | 1 | 100 | **19,767** | **4,942** | **24,709** | **45 ms** | NVFP4 3.56 GiB, 128 lanes, chunk 2,048 |
+| Qwen3.5-4B | vLLM | 1 | 100 | 16,984 | 4,246 | 21,230 | 239 ms | NVFP4; surogate +16 % on both, 5.3× TTFT |
+| Qwen3.5-4B | **surogate** | 1 | 100 | **40,677** | 318 | 40,995 | 4.77 s | prefill-heavy 2048/16 (GPU5) |
+| Qwen3.5-4B | vLLM | 1 | 100 | 34,964 | 273 | 35,237 | 5.00 s | prefill-heavy, same card |
+| Qwen3.5-4B | **surogate** | 1 | 1 | 33,300 † | **214** | — | **57 ms** | 2026-08-26, GPU2 |
+| Qwen3.5-4B | llama.cpp | 1 | 1 | 4,300 † | 190 | — | 445 ms | |
+| Qwen3.5-4B | vLLM | 1 | 1 | 26,800 † | 166 | — | 71 ms | |
+| Qwen3.8-27B | **surogate** | 1 | 100 | **5,319** | **1,330** | **6,649** | **170 ms** | all-NVFP4, 128 lanes; mean of two passes, cards rotated |
+| Qwen3.8-27B | vLLM | 1 | 100 | 4,156 | 1,039 | 5,195 | 8.26 s | NVFP4; surogate +28 % decode, 48× TTFT |
+| Qwen3.8-27B | surogate | 8 | 100 | ≈ 5,300 | 1,332 | ≈ 6,600 | — | 8-stage pipeline, C3 + asynchronous prompt flights: capacity, not throughput per card |
+| Qwen3.8-27B | surogate | 8 | 1 | ≈ 78 | 19.6 | ≈ 98 | 0.43 s | 8 stages, closed pipeline |
+| Qwen3.8-27B | **surogate** | 1 | 100 | 471 | **1,884** | 2,355 | **14.2 s** | decode-heavy 128/512, 64 lanes (GPU5) |
+| Qwen3.8-27B | vLLM | 1 | 100 | 360 | 1,438 | 1,798 | 21.9 s | decode-heavy, same card |
+| Qwen3.8-27B | surogate | 1 | 100 | 7,339 | 57 | 7,396 | 25.8 s | prefill-heavy 2048/16, chunk 4,096 (GPU6); the open 27B gap |
+| Qwen3.8-27B | **vLLM** | 1 | 100 | **11,818** | 92 | 11,910 | **14.9 s** | prefill-heavy, same card |
+| Qwen3.8-27B | surogate | 1 | 1 | 5,400 † | 45 | — | 352 ms | 2026-08-26, GPU2 |
+| Qwen3.8-27B | llama.cpp | 1 | 1 | 1,040 † | **49** | — | 1,829 ms | |
+| Qwen3.8-27B | vLLM | 1 | 1 | 7,500 † | 45 | — | **254 ms** | |
+| Qwen3.6-35B-A3B | surogate | 1 | 100 | ≈ 7,770 | 1,942 | ≈ 9,700 | **253 ms** | Q4/Q5/Q6 MoE from GGUF, prefill batch 4; mean of two passes |
+| Qwen3.6-35B-A3B | **vLLM** | 1 | 100 | ≈ 9,160 | **2,290** | ≈ 11,450 | 1.26 s | surogate at 85 %: per-round routed-kernel efficiency, not bytes (open, kernel project) |
+| Qwen3.6-35B-A3B | surogate | 8 | 100 | ≈ 9,470 | **2,368** | ≈ 11,840 | — | 8-stage pipeline, C3 + asynchronous prompt flights |
+| Qwen3.6-35B-A3B | surogate | 8 | 1 | ≈ 200 | 50.1 | ≈ 250 | 0.35 s | 8 stages, closed pipeline |
+| Qwen3.8-Flash-Next 111 GB | **surogate** | 1 | 1 | 132 | **32.0** | 164 | **1.06 s** | experts on the host: Q4G32AM bank (pinned, 91 GB), 3,000-slot expert cache, CPU split auto (76 % of decode misses / 46 % of prefill on 32 host threads); 2026-08-30, fixed host split |
+| Qwen3.8-Flash-Next | **surogate** | 1 | 16 | **311** | **75.3** | **386** | **2.27 s** | same defaults (81 % / 51 % measured shares); TTFT p90 12.4 s |
+| Qwen3.8-Flash-Next | surogate | 1 | 64 | 313 | 75.7 | 389 | 37.1 s | `--expert-slots 2000` so 64 lanes fit, `--pending-timeout-ms 600000` (the 30 s default expires a third of the queue at this concurrency); the round is host-bound, 64 users only queue — TTFT p90 68.7 s |
+| Qwen3.8-Flash-Next | llama.cpp | 1 | 1 | 29 | 7.1 | 36 | 2.0 s | experts on CPU (`-ot exps=CPU`, 32 threads), 2026-08-28 |
+| Qwen3.8-Flash-Next | llama.cpp | 1 | 16 | 65 | 16.3 | 81 | 29 s | |
+| Qwen3.8-Flash-Next | ik_llama.cpp | 1 | 1 | 87 | 21.8 | 109 | 1.8 s | AVX-512 iqk CPU-MoE kernels |
+| Qwen3.8-Flash-Next | ik_llama.cpp | 1 | 16 | 96 | 23.9 | 120 | 30 s | |
+| Qwen3.8-Flash-Next | **surogate** | 8 | 1 | ≈ 204 | **51.0** | ≈ 255 | ≈ 0.24 s | 8 stages, 3,072 slots per card (every expert resident, nothing crosses PCIe after warm-up), C3 + asynchronous prompt flights; re-validated on the fixed binary 2026-08-29 |
+| Qwen3.8-Flash-Next | **surogate** | 8 | 16 | ≈ 1,530 | **381.6** | ≈ 1,910 | **615 ms** | same; 5× the one-card 75 |
+| Qwen3.8-Flash-Next | **surogate** | 8 | 32 | ≈ 2,070 | **518.5** | ≈ 2,590 | 971 ms | same, stages materialise only their own layers (64 lanes fit beside the pool) |
+| Qwen3.8-Flash-Next | **surogate** | 8 | 64 | ≈ 2,330 | **583.6** | ≈ 2,920 | 1.14 s | same |
+| Qwen3.8-Flash-Next | llama.cpp | 8 | 1 | 157 | 39.3 | 196 | 0.95 s | `--split-mode layer`, all resident |
+| Qwen3.8-Flash-Next | llama.cpp | 8 | 16 | 156 | 39.1 | 195 | 86 s | 16 of 48 requests timed out |
+| Qwen3.8-Flash-Next | llama.cpp | 8 | 64 | 99 | 24.7 | 124 | 311 s | |
 
-| model | weights | surogate decode tok/s | vLLM decode tok/s | ratio | surogate TTFT p50 | vLLM TTFT p50 |
-|---|---|---:|---:|---:|---:|---:|
-| Qwen3.5-0.8B | from GGUF Q4_K_M | **10,095** | 6,694 | **+51 %** | **45 ms** | 658 ms |
-| Qwen3.5-4B | NVFP4 3.56 GiB | **4,942** | 4,246 | **+16 %** | **45 ms** | 239 ms |
-| Qwen3.8-27B | NVFP4 all, 128 lanes | **1,330** | 1,039 | **+28 %** | **170 ms** | 8.26 s |
-| Qwen3.6-35B-A3B | Q4/Q5/Q6 MoE, prefill batch 4 | 1,942 | **2,290** | −15 % | **253 ms** | 1.26 s |
+## Reading the table
 
-Three of four ahead on throughput, all four on TTFT by 5–48×.
-
-Single user (2026-08-26, GPU2, bf16 KV; TTFT at a 1.9k prompt):
-
-| model | surogate TTFT / decode | llama-server TTFT / decode | vLLM TTFT / decode |
-|---|---:|---:|---:|
-| Qwen3.5-0.8B | **48 ms / 503** | 168 ms / 391 | 55 ms / 364 |
-| Qwen3.5-4B | **57 ms / 214** | 445 ms / 190 | 71 ms / 166 |
-| Qwen3.8-27B | 352 ms / 45 | 1,829 ms / **49** | **254 ms** / 45 |
-
-## What moved each model, and what is next
-
-- **Weight format is worth more than every scheduling lever on this
-  hardware.** The 4B gained +54 % going from our W8G32 artifact to NVFP4
-  (3,218 → 4,942); the 27B +37 % from the mixed NVFP4/FP8 artifact to
-  all-NVFP4 (976 → 1,330). In both cases lanes, chunk width, MTP and prefill
-  batching had been measured first and moved nothing (27B round model:
-  28.8 ms fixed + 114 µs per column, so `throughput = 1/(6c + F/B)` is
-  indifferent to batching). Only the 35B is still on a non-NVFP4 artifact.
-- **Lanes: 128** (PATCHES.md #79/#80). With 100 users and 64 lanes a third of
-  the load queued for a lane; that queue was the TTFT. The 27B and 35B fit
-  128 lanes only after rewrite checkpoints went off by default (#73) and, on
-  the 27B, the all-NVFP4 weights.
-- **35B-A3B (the one behind, 85 % of vLLM).** Prefill batching pays here
-  because routed experts stream once per round (per-token MoE cost falls
-  from 1.26 to 0.64 µs between 640 and 2,688 columns): 1,762 → 1,942. The
-  gap is uniform across shapes (85–89 %) and not bytes (we stream 7 % less
-  than vLLM), so it is per-round kernel efficiency: at decode width our
-  routed kernel leaves three of four warps idle. Measured and rejected (do
-  not re-run): vLLM's MoE Marlin (faster below ~1,100 columns, slower above,
-  one-way in-place adoption, 10× the quantisation error), a 3-stage cp.async
-  pipeline, register-decoded fragments, the wide-plan threshold, the
-  persistent-grid width, MTP (does not fit), bf16 KV, chunk width. Next: an
-  NVFP4 expert artifact (`RedHatAI/Qwen3.6-35B-A3B-NVFP4`) and a
-  row-parallel decode-width routed kernel (~2,340 by the round model).
-- **27B, remaining.** 114 µs per column is 474 TFLOP/s against the 651–827
-  the GEMMs measure; ~18 % of a captured window is gaps between kernels and
-  the GDN chunked scan moves 145 MB per layer at 641 GB/s. Fusing the layer
-  loop and widening that scan is the next 27B work.
-- **fp8 KV** costs a few percent of decode and doubles the cache (27B:
-  46k → 92k tokens at 48 lanes). Rewrite checkpoints off by default freed
-  3.4 GB on the 27B (206,976 KV tokens at 48 lanes) and made 64+ lanes
-  possible.
-- **Correctness soak**: after the two mixed-round fixes (#71, #72) the 27B
-  and 4B decode-heavy soaks are clean (1,060 and 4,097 requests, 0 corrupted);
-  the 0.8B keeps a ~4-per-100,000 mixed-round corruption (open).
-
-## Qwen3.8-Flash-Next — 111 GB MoE on one 5090 with CPU offload (2026-08-28)
-
-512-expert MoE with hyper-connections and an n-gram memory; the experts
-(W8 host bank, 154 GB pinned) do not fit the card. 512/128; 90 s at 16+
-users, 60 s at one; GPU 1. llama.cpp / ik_llama.cpp serve the same GGUF with
-experts on the CPU (`-ot exps=CPU`, 32 threads).
-
-| config | users | decode tok/s | prefill tok/s | TTFT p50 |
-|---|---:|---:|---:|---:|
-| llama.cpp, 8× 5090 `--split-mode layer`, all resident | 1 / 16 / 32 / 64 | 39.3 / 39.1 / 28.8 / 24.7 | 157 / 156 / 115 / 99 | 0.95 s / 86 s / 132 s / 311 s (16 of 48 requests timed out at 16 users) |
-| llama.cpp, 1× 5090, experts on CPU | 1 / 16 | 7.1 / 16.3 | 29 / 65 | 2.0 s / 29 s |
-| ik_llama.cpp, 1× 5090, experts on CPU (AVX-512 iqk kernels) | 1 / 16 | 21.8 / 23.9 | 87 / 96 | 1.8 s / 30 s |
-| surogate v0: experts zero-copy from pinned host | 1 / 16 | 5.2 / 7.6 | 21 / 30 | 1.8 s / 15.1 s |
-| + expert slot cache (`--expert-slots 3000`, 14.6 GiB pool, bulk gather of misses) | 1 / 16 | 18.5 / 9.4 | 74 / 38 | 3.0 s / 17.9 s |
-| + CPU expert split (`--cpu-moe-share 0.7`, host round overlapped, `numactl --interleave=all`) | 1 / 16 | 18.4 / **33.5** | 74 / 138 | 2.95 s / 12.3 s |
-| same, `--cpu-moe-share auto` (measured host 199 GB/s vs PCIe 52 GB/s → 79 %) | 16 | 32.3 | 131 | 8.6 s |
-| same, `--expert-slots 2000` (so 64 lanes fit) | 64 | 37.0 | 174 | 24.3 s |
-| + prefill on the host (`--cpu-moe-prefill-share 0.7`, batched VNNI kernel) | 1 | 22.5 | 109 | **1.43 s** |
-| same, prefill share 0.5 (explicit) | 16 | **37.9** | 172 | 7.3 s |
-| **phase-2 defaults** (`--expert-slots 3000 --cpu-moe-share auto`: measured 80 % decode / 50 % prefill on the host) | 16 | 32.2 | 174 | 9.0 s |
-| same, 1 user (prefill share 0.7) | 1 | 22.4 | 110 | **1.40 s** |
-
-Prompt processing at one user (512 ÷ TTFT): full gather 174 t/s, prefill
-split **358-366 t/s**; ik_llama.cpp ≈ 285. Both engines answer the probes
-correctly (`Paris`, `2, 3, 5`).
-
-External single-user references (llama.cpp PR #27742, other hardware and
-quantisations; not run here):
-
-| config | decode tok/s | prompt processing t/s |
-|---|---:|---:|
-| RTX 4090 + DDR4, UD-Q4_K_XL, `-cmoe -ub 4096`, 28k prompt | 20.8–22.5 | 356–384 |
-| RTX 5090 + DDR5, UD-Q2_K_XL | 33–34 (26 @131k) | ~300 |
-| RTX 5090, UD-Q3_K_XL, 18 layers' experts resident, KV q8_0, 4–5k prompts | 22.1–22.8 | ~765 |
-
-Reading: single-user decode is bytes per expert over the host path (our W8
-bank is ~1.5× the bytes of Q4_K_XL), so 18–22 is where a W8 bank lands — a
-Q4-class host bank is the single-user decode lever. The prefill split now
-matches the 4090 reference at 512-token prompts; the 765 figure is a
-4–5k-prompt regime (4× the per-expert reuse) that needs Flash-Next's sparse
-attention indexer beyond 2,051 tokens, not yet implemented. The 16-user
-number on this shape is prefill-dominated, so the prefill split is the lever
-at every concurrency: at 16 users (prefill share 0.5) it halves TTFT and adds
-7 % decode; the share is lower than at one user (0.7) because at concurrency
-the host must stay off the critical path of the mixed rounds.
-
-## Pipeline parallelism across cards (phase 3, 2026-08-29)
-
-`--devices A,B,...` splits the model into one layer-range stage per card; the residual
-crosses each boundary through pinned host memory (no P2P), micro-batch groups flow through
-the stages as a software pipeline, and each stage keeps the phase-2 offload for its own
-layers (its pool caches only its layers' experts, so residency per stage rises with the
-stage count). Parity: the prompt forward of a 2-stage pipeline is bit-exact against one
-card at every layer boundary and at the output.
-
-| config | users | shape | decode tok/s | TTFT p50 |
-|---|---:|---|---:|---:|
-| one card (GPU 2), split on | 8 | 128/512 | 36.9 | 4.6 s |
-| 2 stages (GPUs 2+3), lockstep | 8 | 128/512 | **72.5** | 2.7 s |
-| 2 stages, pipelined (2 groups) | 8 | 128/512 | 68.3 | 4.2 s |
-| 2 stages, 1 user | 1 | 512/128 | 13.1 | 4.3 s |
-| llama.cpp 8× 5090 `--split-mode layer` | 1 / 16 / 64 | 512/128 | 39.3 / 39.1 / 24.7 | 0.95 s / 86 s / 311 s |
-| 4 stages (GPUs 4-7), shared host pool | 16 | 512/128 | **79.7** | **1.3 s** |
-| 8 stages (all cards), shared host pool, 8 groups | 1 / 16 | 512/128 | 4.3 / 32.8 | 14.3 s / 14.1 s |
-| 8 stages, per-socket pools | 1 / 16 | 512/128 | 3.5 / 31.8 | 19.4 s / 18.8 s |
-| 8 stages, width-following groups, residency policy (closed pipeline) | 16 | 512/128 | 57.8 | 0.6 s |
-| same, prefill batch 4 | 16 / 64 | 512/128 | 58.2 / 59.6 | 2.6 s / 18 s |
-| 2 stages GPUs 2+3 (both x8), split off: lockstep / pipelined | 8 | 128/512 | 44.5 / 44.8 | 16 s / 17 s |
-| 2 stages GPUs 3+4 (x8 + x16), per-socket pools: lockstep / pipelined | 8 | 128/512 | 75.9 / 70.0 | 3.2 s / 3.4 s |
-| 2 stages GPUs 2+3, split off, steady-state pipeline (C3), synchronous prompt steps | 8 | 128/512 | 53.7 | 15 s |
-| 2 stages GPUs 2+3, split off, C3 + prompts as asynchronous flights | 8 | 128/512 | **56.1** | 17 s |
-| same, post scratch-fix + **scan-resistant slot ring** (2026-08-29) | 8 | 128/512 | **115.3** (91.5 ring-off) | 36 s full-request p50 |
-| **8 stages, 3,072 slots (every expert resident), C3 + asynchronous prompt flights** | 1 / 16 | 512/128 | **57.9 / 383.9** | **237 ms / 615 ms** |
-| same, re-validated on the fixed binary with the Q4 host bank (battery 100/100) | 1 / 16 / 32 / 64 | 512/128 | 51.0 / 381.6 / 488.2 / 604.1 | — |
-| single card, default config, after the CUDA-graph switch fix (564b673b): battery 99/100, 0 fatals (was 90-97) | 16 | — | — | — |
-| same, stages materialise only their own layers (64 lanes fit beside the pool) | 32 / 64 | 512/128 | **518.5 / 583.6** | 971 ms / 1.14 s |
-| 8 stages, 2,816 slots (92 %, split off) / 2,100 slots (68 %, split on) | 32 / 64 | 512/128 | 504 / 387.8 | 1.0 s / 2.1 s |
-| Qwen3.8-27B (all-NVFP4), 8 stages, closed pipeline | 1 / 100 | 512/128 | 19.6 / 213 | 0.43 s / 0.75 s |
-| **Qwen3.8-27B**, 8 stages, C3 + asynchronous prompt flights (re-validated post scratch-fix, seqs 128, ignore_eos) | 100 | 512/128 | **1,332** | — |
-| Qwen3.8-27B, one card (board) | 100 | 512/128 | 1,330 | 170 ms |
-| Qwen3.6-35B-A3B, 8 stages, closed pipeline | 1 / 100 | 512/128 | 50.1 / 574 | 0.35 s / 0.34 s |
-| **Qwen3.6-35B-A3B**, 8 stages, C3 + asynchronous prompt flights (re-validated post scratch-fix, seqs 128, ignore_eos) | 100 | 512/128 | **2,368** | — |
-| Qwen3.6-35B-A3B, one card (board) | 100 | 512/128 | 1,942 | 253 ms |
-
-Reading: all three models serve correctly across the eight cards, verified with the
-under-load probes at the measured concurrency. Flash-Next is the model the pipeline is for:
-at 8 stages each card holds every expert of its 6 layers (3,072 slots, 14.9 GiB), no expert
-crosses PCIe after warm-up, and with the steady-state pipeline (groups stay in flight across
-executor rounds) and prompts processed as asynchronous flights through the stages, 16 users
-get 383.9 tok/s at a 615 ms TTFT — 12× the one-card 32.2 tok/s — 604.8 at 64 users, and 57.9
-tok/s for a single user against 22.4. What held the 8-stage points at 3–4 tok/s before was the synchronous
-prompt step (~2 s per stage-step even fully resident) serialised on the executor thread;
-turning a staged prompt's chunk into a batch-0 mixed round removed it. The 27B and 35B rows
-are what a model that already fits one card gets from a pipeline: capacity, not throughput
-per card — with ~12 lanes per group the per-round fixed cost of a stage does not shrink with
-its layer count.
-
-### Correctness note (2026-08-29)
-
-Two pipeline bugs found and fixed while probing at 64 users, both invisible on one card:
-a prompt's first sampled token was a span into the last stage's egress buffer that the next
-round could overwrite before the executor read it, and a mixed round's prompt-chunk size
-depended on whether that stage could replay a CUDA graph, so stages consumed different numbers
-of prompt tokens. The rows above are from the fixed binary; probe every board row **at** its
-concurrency, not before the load.
+- **Weight format beats every scheduling lever on this hardware**: NVFP4 gave
+  the 4B +54 % and the 27B +37 % over our own W8/mixed artifacts; the 35B is
+  the one model still on a non-NVFP4 routed artifact and the one behind vLLM.
+- **Lanes are 128** where the model fits them; with 100 users and 64 lanes a
+  third of the load queued for a lane and that queue was the TTFT.
+- **Flash-Next on one card** is host-bound: the Q4 bank halves the host bytes
+  per expert (single user 22 → 32 tok/s), the CPU split at its measured share
+  and the scan-resistant slot ring carry 16 users to 75 tok/s, and 64 users
+  add queueing, not throughput. **Eight cards** make every expert resident
+  and the pipeline delivers 5–8× the one-card figures at sub-second TTFT.
+- **The 27B pipeline** is capacity, not throughput per card: with ~12 lanes per
+  group a stage's per-round fixed cost does not shrink with its layer count.
+- Every surogate row above is from a binary that passes the correctness
+  batteries at its concurrency (coherence and the strict-structure counting
+  probe, `surogate/serve/tools/probe/`). The Flash-Next one-card rows are the
+  first measured after the host-split fix of 2026-08-30 (`bfb87ec6`); the
+  earlier 22.4 / 32.2 / 37.0 rows were measured through it.
 
 ## Open items
 
-- **35B-A3B**: NVFP4 expert artifact — a kernel project, not a conversion: the sparse-MoE
-  kernels and the expert slot cache read W8G32 routed experts only, so an NVFP4 routed
-  arm (kernel + converter recipe) comes first; row-parallel decode-width routed kernel.
-- **27B**: layer-loop fusion and a wider GDN chunked scan (the 114 µs column).
-- **Flash-Next**: prefill split at 16–64 users; host tile kernel (interleaved
-  rows). The sparse (QSA) indexer shipped 2026-08-29 (contexts to the trained
-  262,144; needle 12/12 at 3.5k and 5.7k tokens; nothing runs below its budget).
-  The Q4 host bank shipped 2026-08-29: `--host-expert-bank q4` requantises the
-  pinned experts W8→Q4G32AM at load — process peak 101 GB vs 297, startup 96 s,
-  decode ~+10 % (host GEMV and PCIe gather bytes nearly halve), quality at
-  parity on the 100-probe battery.
-- ~~Prefix reuse leaks cross-request content~~ **root-caused and fixed 2026-08-29**
-  (commit 85d12840): the shared prefill scratch state slot was seeded per request
-  but consumed per chunk; interleaved prompts ran each other's GDN state. Blends
-  10/10 → 0 on the reproducing battery; the graphs-off crash config runs clean;
-  multi-turn reuse verified exact. Details in INFERENCE.md.
-- ~~0.8B ~4-per-100,000 mixed-round corruption~~ closed 2026-08-29: matched the
-  scratch-state bug's fingerprint; 1,440 probes clean post-fix.
-- ~~Flash-Next: chunked prefill under load~~ **root-caused and fixed 2026-08-30.** Two
-  defects, neither about chunking: the CPU expert split put every host job of a
-  prefill-path round on token 0 (paths-per-token read off a flat ids view), and the
-  prefill reduce summed host-bound paths over a stale column; plus a small-T
-  attention step that overflowed the 64-row lane step for the 24-over-2 head
-  geometry. A 1–3 % rate of garbage bursts and dropped digits that coherence
-  batteries could not see; found with the strict-structure probes
-  (`probe/chunkcount.py`) and a GPU shadow oracle. Every serving number on this
-  board for Flash-Next was measured with the host split on; throughput is
-  unaffected by the fixes, quality of that path was not what the board implied.
-  Details in INFERENCE.md (2026-08-29 21:50 → 2026-08-30 00:10).
+- **35B-A3B**: NVFP4 expert artifact — a kernel project, not a conversion: the
+  sparse-MoE kernels and the expert slot cache read W8G32 routed experts only,
+  so an NVFP4 routed arm (kernel + converter recipe) comes first; then a
+  row-parallel decode-width routed kernel.
+- **27B**: prefill at half vLLM's rate on the prefill-heavy shape (layer-loop
+  fusion, a wider GDN chunked scan).
+- **Flash-Next**: host tile kernel (interleaved rows); the QSA indexer,
+  the Q4 bank, the scan ring, the split fix and the small-T geometry fix all
+  shipped 2026-08-29/30 (INFERENCE.md).
 - Record the card with every number; re-measure single-user cells on the
   same card as the 100-user rows.

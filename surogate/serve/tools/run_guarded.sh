@@ -9,15 +9,21 @@
 # hard reboot. A cgroup limit turns that into a killed process (verified: the kernel reports
 # `constraint=CONSTRAINT_MEMCG` and the box keeps running).
 #
-#   run_guarded.sh [--mem 300G] [--numa interleave|none] -- <binary> [args...]
+#   run_guarded.sh [--mem 300G] [--numa interleave|none] [--allow N] -- <binary> [args...]
 #
 # Env: GUARD_MIN_AVAIL_GB (default 200) is the free-memory floor the launch requires.
+# --allow N permits up to N serving processes at once (default 1). With the Q4 host bank a
+# Flash-Next process peaks near 101 GB, so this 503 GB box holds several for correctness and
+# diagnostic runs (each under its own --mem); throughput rows still run one at a time, since
+# every process streams its experts through the same host DRAM and the auto share is set
+# from that bandwidth.
 set -u
-mem=300G; numa=interleave
+mem=300G; numa=interleave; allow=1
 while [ $# -gt 0 ]; do
   case "$1" in
     --mem) mem=$2; shift 2 ;;
     --numa) numa=$2; shift 2 ;;
+    --allow) allow=$2; shift 2 ;;
     --) shift; break ;;
     *) echo "run_guarded.sh: unexpected argument '$1'" >&2; exit 2 ;;
   esac
@@ -30,8 +36,9 @@ done
 # covers surogate-engine and surogate-engine-cli alike.
 # A killed engine can linger as a zombie until its parent reaps it; only live processes count.
 live=$(for p in $(pgrep -x surogate-engine); do [ "$(ps -o stat= -p "$p" | cut -c1)" != "Z" ] && echo "$p"; done) || true
-if [ -n "${live//[$'\n' ]/}" ]; then
-  echo "run_guarded.sh: a serving process is already running (${live//$'\n'/ }); refusing to start a second" >&2
+count=$(echo "${live//[$'\n' ]/ }" | wc -w)
+if [ "$count" -ge "$allow" ]; then
+  echo "run_guarded.sh: $count serving process(es) already running (${live//$'\n'/ }); --allow is $allow, refusing to start another" >&2
   exit 1
 fi
 avail=$(awk '/MemAvailable/ {print int($2/1048576)}' /proc/meminfo)

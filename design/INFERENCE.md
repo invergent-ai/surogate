@@ -2066,3 +2066,55 @@ fully clean Flash-Next arm of the day. Throughput on the fixed engine (`tput.py`
 many there are. The board's Flash-Next rows still carry 2026-08-28's 32-38 tok/s, measured
 before the scan ring, the Q4 bank and the indexer landed; they want a refresh pass of their
 own.
+
+### Flash-Next board refresh on the fixed engine (2026-08-30 05:30)
+
+The board's one-card Flash-Next rows dated from 2026-08-28, before the Q4 bank, the scan
+ring, the indexer and tonight's host-split fix. Re-measured on the fixed engine at the
+current defaults (`--expert-slots 3000 --cpu-moe-share auto`, Q4 bank, auto shares measured
+at start: 76–81 % of decode misses and 46–51 % of prefill on the host), GPU 1, 512/128,
+closed-loop clients, 15–30 s warm-up then 60 s (one user) / 90 s (16 and 64 users), with
+the board probe (`probe/board.py`: streaming, salted prompts, the engine's own `usage`
+counts, TTFT at the first content chunk — the definitions the board has always used):
+
+| users | prefill tok/s | decode tok/s | TTFT p50 / p90 | board 08-28 (decode / prefill / TTFT) |
+|---:|---:|---:|---:|---|
+| 1 | 132 | 32.0 | 1.06 s / 1.28 s | 22.4 / 110 / 1.40 s |
+| 16 | 311 | 75.3 | 2.27 s / 12.4 s | 32.2 / 174 / 9.0 s |
+| 64 (2,000 slots) | 313 | 75.7 | 37.1 s / 68.7 s | 37.0 / 174 / 24.3 s |
+
+Single-user decode 22.4 → 32.0 is the Q4 bank (fewer host bytes per expert — the board's
+own prediction); 16 users 32 → 75 is the split at its measured shares plus the scan ring;
+64 users buys nothing over 16 (the round is host-bound; the extra lanes queue, TTFT 37 s).
+`vllm bench serve` (openai-chat backend, random dataset) was run on the same instances at
+the owner's suggestion and read 5–10 % under the probe (fixed prompt counts, ramp-down in
+the duration); it reports output tokens only, no prefill/decode split, so the board keeps
+the probe's numbers and the bench is set aside.
+
+Two things the refresh found, both fixed or worked around:
+
+- **TTFT under any client that stops its clock at the first chunk read 50 ms.** vllm bench
+  stamps TTFT on the first chunk carrying `choices`, and the server sent the role chunk at
+  acceptance, before prefill. The OpenAI and vLLM servers send the role with the first
+  token; ours now does too (`http_server.cpp`: the role chunk goes out right before the
+  first streamed item). Wire format unchanged, only the timing.
+- **At 64 users, a third of the requests silently expired.** `--pending-timeout-ms`
+  defaults to 30 s and a request queued for a lane at 64 closed-loop clients waits longer
+  than that (lanes free in waves); the server answers with an SSE `error` event inside a
+  200 response, which the first version of the probe (and vllm bench) counted as a
+  completed request with zero tokens (the earlier 64-user numbers were measured over 98
+  real completions plus 64 expiries). The row above is with `--pending-timeout-ms 600000`
+  and an error-aware probe: 64 completions, 0 expiries. The 08-28 64-user row very likely
+  carried the same expiries.
+
+Also noted, not changed: at one user the stream advances in ~8-token chunks (inter-chunk
+192 ms against 24 ms per token) — the executor's burst path publishes several decode rounds
+per egress. Throughput and TTFT are unaffected; the per-token streaming cadence is a latency
+trade the burst design makes deliberately. `run_guarded.sh --allow N` now permits several
+offloaded processes (Q4 bank: ~101 GB each on a 503 GB box) for correctness and diagnostic
+arms in parallel; throughput rows stay one at a time because every process streams its
+experts through the same host DRAM.
+
+The board itself was rewritten the same night into one table across every model, engine
+and GPU count (prefill, decode, throughput, users, TTFT, comments); the per-model sections
+it replaced are archived in `BENCHMARKS_HISTORY.md`.
