@@ -4,8 +4,10 @@
 #include "ops/sparse_moe/decode/sparse_moe_decode.h"
 #include "ops/sparse_moe/prefill/sparse_moe_prefill.h"
 #include "ops/sparse_moe/small_t/sparse_moe_small_t.h"
+#include "ops/sparse_moe/trtllm/trtllm_moe.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
@@ -164,6 +166,31 @@ void validate_weights(const SparseMoeWeights& weights, const SparseMoeGeometry& 
         throw std::invalid_argument(
             "sparse_moe: routed_down_scale is required for NVFP4 and rejected otherwise");
     }
+    // The NVFP4 routed profile is served by the vendored W4A4 runner, which also quantises the
+    // activations, so it needs the checkpoint's per-expert activation scale and the matching
+    // epilogue alpha. Both are as load-bearing as the weight scale and equally silent if absent.
+    {
+        const bool nvfp4_routed = weights.routed_gate_up.qtype == QType::NVFP4 &&
+                                  weights.routed_down.qtype == QType::NVFP4;
+        const bool present = weights.routed_gate_up_act_scale != nullptr &&
+                             weights.routed_gate_up_alpha != nullptr &&
+                             weights.routed_down_act_scale != nullptr &&
+                             weights.routed_down_alpha != nullptr;
+        const bool any = weights.routed_gate_up_act_scale != nullptr ||
+                         weights.routed_gate_up_alpha != nullptr ||
+                         weights.routed_down_act_scale != nullptr ||
+                         weights.routed_down_alpha != nullptr;
+        if (nvfp4_routed ? !present : any) {
+            throw std::invalid_argument(
+                "sparse_moe: the four routed activation-scale and alpha arrays are required for "
+                "NVFP4 routed experts and rejected otherwise");
+        }
+        if (nvfp4_routed && !detail::trtllm_moe::available()) {
+            throw std::invalid_argument(
+                "sparse_moe: NVFP4 routed experts need the TRT-LLM MoE runner, which this build "
+                "does not contain (it needs the sm_120a architecture)");
+        }
+    }
     if (weights.slot_of_expert == nullptr) {
         require_quantized(weights.routed_gate_up, geometry.routed_gate_rows(), geometry.hidden,
                           "routed_gate_up", ranges);
@@ -203,6 +230,31 @@ void require_registered(const SparseMoeGeometry& geometry) {
 
 } // namespace
 
+void sparse_moe_prepare(const SparseMoeWeights& weights, std::int32_t max_tokens,
+                        cudaStream_t stream) {
+    if (weights.routed_gate_up.qtype != QType::NVFP4 ||
+        weights.routed_down.qtype != QType::NVFP4) {
+        return;
+    }
+    const SparseMoeGeometry geometry = sparse_moe_geometry(weights);
+    require_registered(geometry);
+    std::vector<AddressRange> ranges;
+    validate_weights(weights, geometry, ranges);
+    detail::trtllm_moe::Nvfp4RoutedExperts experts;
+    experts.gate_up_codes        = weights.routed_gate_up.qdata;
+    experts.gate_up_block_scales = weights.routed_gate_up.scales;
+    experts.gate_up_act_scale    = weights.routed_gate_up_act_scale;
+    experts.gate_up_alpha        = weights.routed_gate_up_alpha;
+    experts.down_codes           = weights.routed_down.qdata;
+    experts.down_block_scales    = weights.routed_down.scales;
+    experts.down_act_scale       = weights.routed_down_act_scale;
+    experts.down_alpha           = weights.routed_down_alpha;
+    detail::trtllm_moe::prepare(detail::trtllm_moe::Geometry{geometry.hidden, geometry.experts,
+                                                            geometry.experts_per_token,
+                                                            geometry.intermediate},
+                                experts, max_tokens, stream);
+}
+
 SparseMoeGeometry sparse_moe_geometry(const SparseMoeWeights& weights) {
     const SparseMoeGeometry geometry{
         .hidden            = weights.router_shared_gate.k,
@@ -234,6 +286,20 @@ std::int32_t small_t_widest_slice(std::int32_t min_tokens, std::int32_t max_toke
     return widest;
 }
 
+/// The narrowest round the routed-NVFP4 profile hands to the vendored runner. Below it our own
+/// decode and small-T kernels are faster: the runner permutes, groups and reduces for a batch,
+/// and at a handful of rows that scaffolding costs more than the GEMMs it enables. Measured, and
+/// overridable so the crossover can be re-measured rather than assumed.
+std::int32_t trtllm_min_tokens() {
+    static const std::int32_t value = [] {
+        const char* raw = std::getenv("SUROGATE_SERVE_MOE_TRTLLM_MIN");
+        if (raw == nullptr || *raw == '\0') { return kSparseMoeTrtllmMinTokens; }
+        const long parsed = std::strtol(raw, nullptr, 10);
+        return parsed > 0 ? static_cast<std::int32_t>(parsed) : kSparseMoeTrtllmMinTokens;
+    }();
+    return value;
+}
+
 std::size_t sparse_moe_workspace_capacity_bytes(const SparseMoeGeometry& geometry,
                                                 QType routed_gate_up, QType routed_down,
                                                 std::int32_t min_tokens, std::int32_t max_tokens) {
@@ -243,11 +309,11 @@ std::size_t sparse_moe_workspace_capacity_bytes(const SparseMoeGeometry& geometr
     }
     (void)detail::resolve_sparse_moe_decode_plan(geometry, routed_gate_up, routed_down);
     const bool w8_profile = routed_gate_up == QType::W8G32_F16S && routed_down == QType::W8G32_F16S;
-    // NVFP4 has no prefill MMA arm; wide rounds walk the small-T path in slices (see
-    // sparse_moe below), so nothing in the interval ever needs the prefill workspace.
+    // The NVFP4 routed profile has no kernel of ours at any width: the prefill family carries it
+    // from a single token upwards, with the vendored runner computing the routed half.
     const bool nvfp4_profile = routed_gate_up == QType::NVFP4 && routed_down == QType::NVFP4;
     const std::int32_t prefill_first =
-        nvfp4_profile ? std::numeric_limits<std::int32_t>::max()
+        nvfp4_profile ? trtllm_min_tokens()
         : w8_profile  ? detail::kSparseMoePrefillW8W8Min
                       : (routed_down == QType::Q5G64_F16S ? detail::kSparseMoePrefillQ4Q5Min
                                                           : detail::kSparseMoePrefillQ4Q6Min);
@@ -260,16 +326,19 @@ std::size_t sparse_moe_workspace_capacity_bytes(const SparseMoeGeometry& geometr
         required =
             std::max(required, detail::sparse_moe_small_t_workspace_bytes(geometry, small_last));
     }
-    if (nvfp4_profile && max_tokens >= detail::kSparseMoeSmallTMin) {
-        // Any NVFP4 round of two or more tokens runs as small-T slices, so the widest slice
-        // any round in the interval takes sets the requirement.
-        const std::int32_t slice = small_t_widest_slice(min_tokens, max_tokens);
+    if (nvfp4_profile && small_last >= detail::kSparseMoeSmallTMin) {
+        // Between the small-T bound and the runner's first width, an NVFP4 round still walks the
+        // small-T path in slices, so the widest slice any round in that band takes sets the
+        // requirement.
+        const std::int32_t slice =
+            small_t_widest_slice(std::max(min_tokens, detail::kSparseMoeSmallTMin),
+                                 std::min(max_tokens, prefill_first - 1));
         required = std::max(required, detail::sparse_moe_small_t_workspace_bytes(geometry, slice));
     }
     const std::int32_t prefill_interval_first = std::max(min_tokens, prefill_first);
     if (prefill_interval_first <= max_tokens) {
-        required =
-            std::max(required, detail::sparse_moe_prefill_workspace_bytes(geometry, max_tokens));
+        required = std::max(required, detail::sparse_moe_prefill_workspace_bytes(
+                                          geometry, max_tokens, nvfp4_profile));
     }
     return required;
 }
@@ -299,15 +368,17 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
 
     const QType gate_up = weights.routed_gate_up.qtype;
     const QType down    = weights.routed_down.qtype;
-    // NVFP4 shares the decode and small-T codec templates but has no prefill MMA kernel, so a
-    // round wider than the small-T bound is served as a sequence of small-T slices. Correct at
-    // every width, and slower than the MMA path would be — the prefill arm is a performance
-    // item, not a correctness one (design/NVFP4_ROUTED_EXPERTS.md, Phase 2).
+    // The NVFP4 routed profile has two arms. Wide rounds go to the vendored TRT-LLM runner
+    // through the prefill family, which is where its grouped GEMMs pay; narrow ones stay on our
+    // decode and small-T kernels, which read the same artifact because the codec carries its
+    // [up; gate] row order (`Nvfp4CodecFor::kGateRowsFirst`). Rounds between the small-T bound
+    // and the crossover walk small-T in slices, as they did before the runner existed.
     const bool nvfp4_routed = gate_up == QType::NVFP4 && down == QType::NVFP4;
+    const bool use_prefill  = nvfp4_routed
+                                  ? tokens >= trtllm_min_tokens()
+                                  : detail::sparse_moe_uses_prefill(tokens, gate_up, down);
     const bool use_small_t =
-        detail::sparse_moe_uses_small_t(tokens) || (nvfp4_routed && tokens > 1);
-    const bool use_prefill =
-        !nvfp4_routed && detail::sparse_moe_uses_prefill(tokens, gate_up, down);
+        !use_prefill && (detail::sparse_moe_uses_small_t(tokens) || (nvfp4_routed && tokens > 1));
     nvtx::ScopedRange moe_range(use_prefill   ? nvtx::Name::SparseMoePrefill
                                 : use_small_t ? nvtx::Name::SparseMoeSmallT
                                               : nvtx::Name::SparseMoeDecode,
@@ -337,7 +408,8 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
         const detail::SparseMoePrefillPlan plan =
             detail::resolve_sparse_moe_prefill_plan(geometry, tokens, gate_up, down);
         const detail::SparseMoePrefillWorkspace views =
-            detail::allocate_sparse_moe_prefill_workspace(workspace, geometry, plan.slice_tokens);
+            detail::allocate_sparse_moe_prefill_workspace(workspace, geometry, plan.slice_tokens,
+                                                          plan.routed_trtllm);
         detail::sparse_moe_prefill_launch(geometry, x, weights, destination, plan, views, stream,
                                           round_hook);
         return;

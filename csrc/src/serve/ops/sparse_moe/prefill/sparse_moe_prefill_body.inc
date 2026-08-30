@@ -1172,6 +1172,28 @@ __global__ void sparse_moe_prefill_reduce_kernel(const __nv_bfloat16* __restrict
 
 } // namespace
 
+/// This geometry's shape as the vendored runner spells it.
+constexpr trtllm_moe::Geometry trtllm_geometry{kHidden, kExperts, kTopK, kIntermediate};
+
+/// The routed weights as the runner reads them. The artifact stores an expert's gate/up rows as
+/// [up; gate] for this profile precisely because that is the order the runner assumes.
+trtllm_moe::Nvfp4RoutedExperts trtllm_experts(const SparseMoeWeights& weights) {
+    if (weights.slot_of_expert != nullptr) {
+        throw std::invalid_argument(
+            "sparse_moe prefill: the TRT-LLM routed route does not take an expert slot pool");
+    }
+    trtllm_moe::Nvfp4RoutedExperts experts;
+    experts.gate_up_codes        = weights.routed_gate_up.qdata;
+    experts.gate_up_block_scales = weights.routed_gate_up.scales;
+    experts.gate_up_act_scale    = weights.routed_gate_up_act_scale;
+    experts.gate_up_alpha        = weights.routed_gate_up_alpha;
+    experts.down_codes           = weights.routed_down.qdata;
+    experts.down_block_scales    = weights.routed_down.scales;
+    experts.down_act_scale       = weights.routed_down_act_scale;
+    experts.down_alpha           = weights.routed_down_alpha;
+    return experts;
+}
+
 void prefill_launch(const Tensor& x, const SparseMoeWeights& weights, Tensor& destination,
                     const SparseMoePrefillPlan& plan, const SparseMoePrefillWorkspace& workspace,
                     cudaStream_t stream, const SparseMoeRoundHook* hook) {
@@ -1236,6 +1258,33 @@ void prefill_launch(const Tensor& x, const SparseMoeWeights& weights, Tensor& de
             const Tensor slice_ids(ids, DType::I32, {assignments});
             const Tensor slice_alpha(alpha, DType::FP32, {assignments});
             hook->resolve(hook->context, slice_ids, slice_alpha, input_slice, output_slice, stream);
+        }
+
+        if (plan.routed_trtllm) {
+            // The routed experts are computed by the vendored TRT-LLM runner, which does its own
+            // permutation from `ids` and its own top-k reduction with `alpha`. Everything the
+            // route scan, the gather and this family's four routed kernels would produce is
+            // internal to it, so the slice goes straight from selection to the shared expert and
+            // the combine.
+            const dim3 shared_gate_grid(kIntermediate / (kExpertBM / 2),
+                                        (tokens + kExpertBN - 1) / kExpertBN);
+            sparse_moe_prefill_w8_gate_up_kernel<false, false>
+                <<<shared_gate_grid, kExpertThreads, 0, stream>>>(
+                    input, nullptr, nullptr, shared_gate_codes, shared_gate_scales,
+                    shared_activation, tokens, nullptr);
+            CUDA_CHECK(cudaGetLastError());
+
+            trtllm_moe::run(trtllm_geometry, input, tokens, ids, alpha,
+                            trtllm_experts(weights), workspace.trtllm_workspace.data,
+                            workspace.trtllm_workspace.bytes, routed_sum, stream);
+
+            const dim3 shared_down_grid(kHidden / kExpertBM, (tokens + kExpertBN - 1) / kExpertBN);
+            sparse_moe_prefill_w8_down_kernel<false, false>
+                <<<shared_down_grid, kExpertThreads, 0, stream>>>(
+                    shared_activation, nullptr, nullptr, shared_down_codes, shared_down_scales,
+                    nullptr, routed_sum, shared_scale, output, tokens, nullptr);
+            CUDA_CHECK(cudaGetLastError());
+            continue;
         }
 
         // A serving mixed round carries one prompt's chunk plus the decode batch - about 735

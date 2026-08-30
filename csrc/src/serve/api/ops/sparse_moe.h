@@ -66,10 +66,40 @@ struct SparseMoeWeights {
     /// Null for every other format, where the codec carries the whole scale.
     const float* routed_gate_up_scale = nullptr;
     const float* routed_down_scale    = nullptr;
+    /// The W4A4 runner's contract for the `routed-nvfp4` profile, all [blocks] FP32 and required
+    /// together with the two above when both routed weights are NVFP4. In that profile the two
+    /// `routed_gate_up_scale` entries of a block are equal and its row halves run [up; gate].
+    ///   `routed_gate_up_act_scale` — the checkpoint's `input_global_scale`, the multiplier applied
+    ///                                to the rows before their e2m1 rounding (6 * 448 / amax);
+    ///   `routed_gate_up_alpha`     — 1 / (act scale * weight global scale), the fc1 epilogue
+    ///                                alpha that undoes both global scales after the MMA;
+    ///   `routed_down_act_scale`, `routed_down_alpha` — the same for down.
+    const float* routed_gate_up_act_scale = nullptr;
+    const float* routed_gate_up_alpha     = nullptr;
+    const float* routed_down_act_scale    = nullptr;
+    const float* routed_down_alpha        = nullptr;
 };
 
 /// The geometry implied by the weights (router rows, hidden, shared-down width, top-k).
 [[nodiscard]] SparseMoeGeometry sparse_moe_geometry(const SparseMoeWeights& weights);
+
+/// The narrowest round the routed-NVFP4 profile serves through the vendored TRT-LLM runner;
+/// below it the round stays on our own kernels. Overridable at runtime with
+/// `SUROGATE_SERVE_MOE_TRTLLM_MIN` so the crossover can be re-measured.
+inline constexpr std::int32_t kSparseMoeTrtllmMinTokens = 47;
+
+/// The widest round `sparse_moe` hands the routed-NVFP4 runner in one call, and therefore the
+/// width `sparse_moe_prepare` has to tune up to.
+inline constexpr std::int32_t kSparseMoeTrtllmPrepareWidth = 4096;
+
+/**
+ * Tunes and caches the routed-NVFP4 runner's grouped-GEMM tactics for every round width up to
+ * `max_tokens`, timing the candidates on `weights`. Must run before any stream capture that
+ * contains a sparse_moe round of that profile (a captured round of an untuned width throws).
+ * A no-op for every other profile and for widths already tuned; the choice persists on disk.
+ */
+void sparse_moe_prepare(const SparseMoeWeights& weights, std::int32_t max_tokens,
+                        cudaStream_t stream);
 
 enum class SparseMoeEpilogue : std::uint8_t {
     AddResidual,

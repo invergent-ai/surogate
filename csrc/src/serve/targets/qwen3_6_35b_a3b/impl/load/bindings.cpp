@@ -147,12 +147,20 @@ MoePlan bind_moe(artifact::Binder& binder, const std::string& prefix, NumericFor
     if (routed_gate_up == NumericFormat::NVFP4) {
         plan.routed_gate_up_scale =
             bind(prefix + "routed_gate_up_scale", NumericFormat::FP32, {2 * kRoutedExperts});
+        plan.routed_gate_up_act_scale =
+            bind(prefix + "routed_gate_up_act_scale", NumericFormat::FP32, {kRoutedExperts});
+        plan.routed_gate_up_alpha =
+            bind(prefix + "routed_gate_up_alpha", NumericFormat::FP32, {kRoutedExperts});
         require_identity_divisor(binder, plan.routed_gate_up, prefix + "routed_gate_up", 262144,
                                  2048);
     }
     if (routed_down == NumericFormat::NVFP4) {
         plan.routed_down_scale =
             bind(prefix + "routed_down_scale", NumericFormat::FP32, {kRoutedExperts});
+        plan.routed_down_act_scale =
+            bind(prefix + "routed_down_act_scale", NumericFormat::FP32, {kRoutedExperts});
+        plan.routed_down_alpha =
+            bind(prefix + "routed_down_alpha", NumericFormat::FP32, {kRoutedExperts});
         require_identity_divisor(binder, plan.routed_down, prefix + "routed_down", 524288, 512);
     }
     return plan;
@@ -194,6 +202,18 @@ SparseMoePayload load_moe(const MoePlan& plan, const artifact::MaterializedArtif
                                                                     {kRoutedExperts})
                                           .data);
     }
+    const auto per_expert = [&](const std::optional<artifact::ObjectHandle>& handle) {
+        return handle.has_value()
+                   ? static_cast<const float*>(
+                         artifact::materialized_tensor(materialized, *handle, NumericFormat::FP32,
+                                                       {kRoutedExperts})
+                             .data)
+                   : nullptr;
+    };
+    payload.op.routed_gate_up_act_scale = per_expert(plan.routed_gate_up_act_scale);
+    payload.op.routed_gate_up_alpha     = per_expert(plan.routed_gate_up_alpha);
+    payload.op.routed_down_act_scale    = per_expert(plan.routed_down_act_scale);
+    payload.op.routed_down_alpha        = per_expert(plan.routed_down_alpha);
     return payload;
 }
 

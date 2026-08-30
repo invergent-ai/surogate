@@ -2534,3 +2534,86 @@ workspace plumbing they share. Costed in `design/35B_VLLM_KERNELS.md`. Two proce
 for today: a global `pkill` by process name in one serve script killed a parallel run on another
 GPU (now a hard rule: kill only PIDs a script started), and the HF-cache snapshot of the 35B
 lacks the `linear_attn` ignore-list patch — serve vLLM from `models/hf/…-redhat-vllm`.
+
+## 2026-08-30 (evening) — the TRT-LLM cutlass MoE runs inside our engine
+
+The port landed. `csrc/src/third_party/trtllm_moe/` holds TensorRT-LLM's fused-MoE subset as
+FlashInfer ships it (Apache-2.0, LICENSE and NOTICE beside it): the `moe_gemm` family, the SM120
+grouped block-scaled instantiations, `cutlass_extensions`, and — found only at link — TRT-LLM's
+own error/logging/formatting runtime, its DeepSeek block-scale GEMM and its LoRA hook, both of
+which the runner's constructor builds whether or not those paths are taken. One instantiation is
+compiled, `CutlassMoeFCRunner<__nv_fp4_e2m1, __nv_fp4_e2m1, __nv_bfloat16, __nv_bfloat16>`, into
+`ninfer_trtllm_moe` (87 MiB static archive, sm_120a only; a stub library fails loudly elsewhere).
+Two build traps worth recording: the vendored launcher is written against cutlass **4.5.0**, whose
+grouped `LinearCombination` epilogue argument struct differs from our 4.6.1 — under `-std=c++20`
+the aggregate initialisation binds the wrong field and reports "a value of type const float\*\*
+cannot be used to initialize an entity of type float". Compiling that one target at **C++17**
+resolves it, because `construct_if_true`'s brace-init then follows the pre-C++20 rules the code
+assumes. And the closure of headers is not what `ninja -t deps` suggests: it needs
+`flashinfer/exception.h` and `fp4_layout.cuh` from FlashInfer's own include tree.
+
+`ops/sparse_moe/trtllm/trtllm_moe.{h,cu}` is the whole surface: `available()`, a width ladder
+matching FlashInfer's hybrid buckets, `workspace_bytes()`, `prepare()` and `run()`. Tactics are
+chosen by timing — GEMM_1 swept against a partner that runs, then GEMM_2 against the winner, three
+warm-ups and ten timed runs each, candidates that throw or leave a sticky CUDA error skipped —
+and persisted under `~/.cache/surogate/trtllm_moe/` keyed by device, geometry and a tuning
+version, stored by the tactic's printed form rather than its index. A width that was never tuned
+tunes itself on first use; inside a stream capture it throws instead, so a captured graph can
+never freeze an arbitrary tactic. `Package::create_program` calls `ops::sparse_moe_prepare` for
+the `routed-nvfp4` profile before any capture.
+
+The routed-NVFP4 profile now takes the prefill family at **every** width, one token included:
+the router, the selection, the shared expert and the residual combine stay ours, and the runner
+replaces the gather, the two routed GEMMs and the reduction. Our own NVFP4 routed kernels are no
+longer reachable from the op — the artifact stores an expert's gate/up rows as `[up; gate]`,
+which is what the runner reads and the opposite of what those kernels assume, so serving that
+artifact through them would silently compute the wrong function.
+
+The W4A4 contract took reading the vendored quantiser to pin down. `fc1_act_global_scale` is the
+multiplier applied to a row *before* its e2m1 rounding, and the epilogue alpha is
+`1 / (act_scale * weight_global_scale)`; the product of the three is 1 by construction, so only
+where the e4m3 block scale lands distinguishes this pairing from its reciprocal — and vLLM uses
+the reciprocal, which puts small blocks near e4m3's subnormal floor. We write the checkpoint's
+`input_global_scale` verbatim (the large number, `6*448/amax`) and derive alpha, per expert, and
+pass `use_per_expert_act_scale` for both GEMMs: gate/up's activation scale is uniform across the
+35B's 256 experts but **down's spans 145 to 2,336**, so a single global scale is a real loss vLLM
+takes and we do not. The converter writes four new per-expert arrays per layer and refuses a
+checkpoint whose gate and up disagree on either global scale, because the runner carries one of
+each per expert.
+
+### Measured: 2,594 tok/s at 100 users, and why the runner needed a crossover
+
+Paired back-to-back on GPU 1, same session and flags, `probe/board.py … 512 128`:
+
+| users | routed NVFP4 + runner | groupwise-int (shipped) | delta |
+|---:|---|---|---|
+| 100 | 10,733 pp / **2,594** tg / 0.09 s | 7,806 / 1,887 / 0.12 s | **+38 % / +37 %** |
+| 16 | 4,818 / **1,165** / 0.07 s | 4,397 / 1,063 / 0.10 s | +10 % / +10 % |
+| 1 | 1,308 / **316.5** / 0.03 s | 1,275 / 308.4 / 0.04 s | +2.6 % / +2.6 % |
+
+Against vLLM's own board row on this hardware — 8,946 / 2,162 / 3.17 s — that is **+20 % decode
+with a TTFT 35× lower**, and it beats the 2,160-2,300 the costing predicted. The estimate was
+for parity with their kernel; the extra came from keeping our scheduler and from a per-expert
+activation scale they do not use.
+
+The first version routed *every* width through the runner and cost 47 % of single-user decode:
+`ninfer_bench pp512+tg128` read 19,061 pp / 182 tg against the baseline's 13,398 / 347. The
+runner builds a permutation, expert offsets and a grouped problem list before it computes
+anything, and at eight expert rows that scaffolding is the whole round. Splitting at
+`kSparseMoeTrtllmMinTokens` (47, `SUROGATE_SERVE_MOE_TRTLLM_MIN` overrides it) gives 19,074 pp /
+347.5 tg — the runner's prefill and our own decode, both. What made the split possible is that
+the row order is a property of the codec, not of the kernel: `Nvfp4CodecFor::kGateRowsFirst` is
+false and the two routed sites in the decode body bind their halves through it, so our kernels
+read the runner's `[up; gate]` artifact at no cost. A negative control confirms the test sees
+this — packing `[gate; up]` fails every width by 4×.
+
+One consequence to keep in view: the profile now computes two functions. Below the crossover the
+activations stay BF16 (W4A16); above it the runner rounds them to E2M1 (W4A4), which the
+checkpoint is calibrated for — it carries `input_global_scale` — but which is a real numeric step,
+2.0e-2 relative-L2 against an exact oracle versus 1.6e-3 for our own kernels on the same weights.
+`test_sparse_moe` carries both references and asserts against the one the width selects. Neither
+correctness battery objects: coherence 100/100 at 100 users, chunkcount 191 ok / 0 wrong. Both
+had to be run with `--no-thinking` — they read only `content`, which a thinking model leaves
+empty until the reasoning block closes, so their default 40-token budget scores 0/100 on *any*
+artifact.
+

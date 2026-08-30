@@ -141,14 +141,20 @@ what the engine does and how the number was arrived at.
 
 | engine | GPUs | users | prefill tok/s | decode tok/s | throughput tok/s | TTFT p50 | comments |
 |---|---:|---:|---:|---:|---:|---:|---|
-| surogate | 1 | 100 | **8,209** | **1,984** | **10,193** | **0.32 s** | Q4/Q5/Q6 MoE from GGUF, 128 lanes, chunk 4,096, prefill batch 4, `--max-model-len 2048`; 2026-08-30 07:14, uncapped GPU 4. Reproduces the 08-28 pass (1,942) |
+| **surogate** | 1 | 100 | **10,733** | **2,594** | **13,327** | **0.09 s** | **routed NVFP4 through TensorRT-LLM's cutlass fused MoE** (`csrc/src/third_party/trtllm_moe`, the kernel behind vLLM's row below), our router/shared expert/combine kept, our kernels below 47 tokens; `--max-model-len 2048 --max-num-seqs 128 --max-num-batched-tokens 4096`; 2026-08-30 16:11, GPU 1. Coherence 100/100 at 100 users and chunkcount 191 ok / 0 wrong, both `--no-thinking` |
+| surogate | 1 | 100 | 7,806 | 1,887 | 9,693 | 0.12 s | the shipped groupwise-int artifact, measured back-to-back with the row above as its pair — same card, session and flags. The routed-NVFP4 pair is **+37 % decode and +38 % prefill** |
+| **surogate** | 1 | 16 | **4,818** | **1,165** | **5,982** | **0.07 s** | routed NVFP4, same session. At 16 users a decode round is ~16 columns, below the crossover, so the gain here is the wider prefill rounds |
+| surogate | 1 | 16 | 4,397 | 1,063 | 5,460 | 0.10 s | groupwise-int at 16 users, the pair for the row above (+10 % decode) |
+| **surogate** | 1 | 1 | **1,308** | **316.5** | **1,625** | **0.03 s** | routed NVFP4, one user: every decode round is a single token and stays on our own kernels, so this is the weight format alone |
+| surogate | 1 | 1 | 1,275 | 308.4 | 1,583 | 0.04 s | groupwise-int at one user, the pair for the row above (+2.6 % decode) |
+| surogate | 1 | 100 | 8,209 | 1,984 | 10,193 | 0.32 s | Q4/Q5/Q6 MoE from GGUF, 128 lanes, chunk 4,096, prefill batch 4, `--max-model-len 2048`; 2026-08-30 07:14, uncapped GPU 4. Reproduces the 08-28 pass (1,942) |
 | vLLM | 1 | 100 | 8,946 | **2,162** | 11,108 | 3.17 s | `RedHatAI/Qwen3.6-35B-A3B-NVFP4`, `--max-num-seqs 128`; 2026-08-30 07:14, uncapped GPU 5, same batch as the row above. surogate at **92 % of decode with 10× the TTFT** |
 | surogate | 1 | 100 | 7,933 | 1,919 | 9,852 | 0.29 s | the same configuration under the caps (GPU 5 at 2,400 MHz) |
 | surogate | 1 | 100 | 5,780 | 1,394 | 7,174 | 0.35 s | capped, and with `--no-thinking`: −27 % decode on top. On this MoE the generated text changes the expert spread per round, so the thinking mode is part of the configuration; the dense 27B shows no such gap |
 | **surogate** | 8 | 100 | **8,785** | **2,123** | **10,908** | **0.58 s** | 8-stage pipeline, C3 + asynchronous prompt flights, `--max-model-len 2048`; 2026-08-30 08:25, uncapped. Above the one card, and the only configuration that beats vLLM's single-card decode |
 | **surogate** | 8 | 1 | **965** | **233.4** | **1,198** | **0.09 s** | same, one user: 3 B active split eight ways puts a token at ~0.9 ms |
 | surogate | 8 | 100 / 1 | — | 2,368 / 50.1 | — | — / 0.35 s | the 2026-08-29 pass (clock-capped, in-phase clients) |
-| surogate | 1 | 100 | 1,463 | 354 | 1,817 | 0.73 s | **routed NVFP4**, not adopted — the experts read verbatim from `RedHatAI/Qwen3.6-35B-A3B-NVFP4` (the checkpoint vLLM serves above). Same card, session and flags as the pair below; 2026-08-30 11:47, GPU 3 |
+| surogate | 1 | 100 | 1,463 | 354 | 1,817 | 0.73 s | **superseded 2026-08-30 by the rows at the top of this table.** Routed NVFP4 on *our own* routed kernels, not adopted — the experts read verbatim from `RedHatAI/Qwen3.6-35B-A3B-NVFP4` (the checkpoint vLLM serves above). Same card, session and flags as the pair below; 2026-08-30 11:47, GPU 3 |
 | surogate | 1 | 100 | 7,581 | 1,832 | 9,413 | 0.12 s | the shipped groupwise-int artifact, measured back-to-back with the row above as its pair (within 8 % of the 07:14 board row on a different card) |
 | surogate | 1 | 16 | 1,345 | 325 | 1,670 | 0.64 s | routed NVFP4 at a concurrency where decode rounds are narrow enough to avoid the MMA path on either artifact — it still loses, because a 512-token prompt chunk is a wide round |
 | surogate | 1 | 16 | 4,254 | 1,028 | 5,282 | 0.10 s | groupwise-int at 16 users, the pair for the row above |
@@ -179,8 +185,17 @@ what the engine does and how the number was arrived at.
 ## Reading the table
 
 - **Weight format beats every scheduling lever on this hardware**: NVFP4 gave
-  the 4B +54 % and the 27B +37 % over our own W8/mixed artifacts; the 35B is
-  the one model still on a non-NVFP4 routed artifact and the one behind vLLM.
+  the 4B +54 % and the 27B +37 % over our own W8/mixed artifacts, and now the
+  35B +37 % — but only once its routed experts had a kernel worth the format.
+  Our own routed-NVFP4 kernels reached 354 tok/s where the groupwise-int ones
+  reached 1,832; TensorRT-LLM's fused MoE on the *same* weights reaches 2,594.
+  The format was never the problem on that model, and neither was the schedule.
+- **A borrowed kernel is not a whole answer either.** The runner permutes,
+  groups and reduces for a batch, so at one token it costs more than it saves:
+  serving every width through it drops single-user decode from 347 to 182 tok/s
+  on the engine bench while lifting prefill 42 %. The crossover is a measured
+  constant (`kSparseMoeTrtllmMinTokens`, 47, overridable), and with it the 35B
+  wins at 100, 16 and 1 users at once.
 - **Lanes are 128** where the model fits them; with 100 users and 64 lanes a
   third of the load queued for a lane and that queue was the TTFT.
 - **Flash-Next on one card is host-bound at one user and GPU-bound above it.**

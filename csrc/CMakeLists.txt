@@ -867,6 +867,69 @@ set_target_properties(ninfer_nvfp4_tma PROPERTIES
 target_compile_options(ninfer_nvfp4_tma PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 target_link_libraries(ninfer_nvfp4_tma PRIVATE ninfer_core CUDA::cudart CUDA::cuda_driver)
 
+# TensorRT-LLM's CUTLASS fused-MoE runner, vendored from FlashInfer 0.6.16.post3
+# (src/third_party/trtllm_moe, Apache-2.0; NOTICE there records provenance). It is the kernel
+# vLLM serves NVFP4 routed experts through on this hardware (design/35B_VLLM_KERNELS.md), built
+# with FlashInfer's own flag set so the instantiations it generated for architecture 120 apply
+# unchanged. sm_120-only, non-RDC, like the W4A4 TMA archive above; other architectures link a
+# loud-failure stub.
+set(TRTLLM_MOE_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/trtllm_moe)
+if("120a" IN_LIST SUROGATE_SERVE_CUDA_ARCHS OR SUROGATE_SERVE_CUDA_ARCHS STREQUAL "120a")
+  file(GLOB TRTLLM_MOE_GENERATED ${TRTLLM_MOE_ROOT}/cutlass_instantiations/120/gemm_grouped/120/*.generated.cu)
+  add_library(ninfer_trtllm_moe STATIC EXCLUDE_FROM_ALL
+    ${TRTLLM_MOE_ROOT}/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp4_fp4.cu
+    ${TRTLLM_MOE_ROOT}/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_tma_warp_specialized_input.cu
+    ${TRTLLM_MOE_ROOT}/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_mixed_utils.cu
+    ${TRTLLM_MOE_ROOT}/nv_internal/tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.cpp
+    # TensorRT-LLM's own error, logging and formatting runtime: the kernels' TLLM_CHECK macros
+    # raise and log through it, so the library does not link without these four.
+    ${TRTLLM_MOE_ROOT}/nv_internal/cpp/common/tllmException.cpp
+    ${TRTLLM_MOE_ROOT}/nv_internal/cpp/common/logger.cpp
+    ${TRTLLM_MOE_ROOT}/nv_internal/cpp/common/stringUtils.cpp
+    ${TRTLLM_MOE_ROOT}/nv_internal/cpp/common/envUtils.cpp
+    # The runner's constructor builds a DeepSeek block-scale GEMM runner and its LoRA hook
+    # unconditionally, so both are needed at link even though the routed-NVFP4 profile takes
+    # neither path.
+    ${TRTLLM_MOE_ROOT}/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.cu
+    ${TRTLLM_MOE_ROOT}/nv_internal/tensorrt_llm/kernels/lora/lora.cpp
+    ${TRTLLM_MOE_ROOT}/fused_moe/cutlass_backend/cutlass_fused_moe_instantiation.cu
+    ${TRTLLM_MOE_GENERATED}
+    ${SERVE_ROOT}/ops/sparse_moe/trtllm/trtllm_moe.cu)
+  target_compile_definitions(ninfer_trtllm_moe PRIVATE
+    COMPILE_BLACKWELL_TMA_GEMMS COMPILE_BLACKWELL_SM120_TMA_GROUPED_GEMMS
+    ENABLE_BF16 ENABLE_FP8 ENABLE_FP4 USING_OSS_CUTLASS_MOE_GEMM CUTLASS_ENABLE_GDC_FOR_SM100=1
+    FLASHINFER_ENABLE_BF16 FLASHINFER_ENABLE_F16 FLASHINFER_ENABLE_FP8_E4M3
+    FLASHINFER_ENABLE_FP8_E5M2 FLASHINFER_ENABLE_FP8_E8M0 FLASHINFER_ENABLE_FP4_E2M1)
+  target_compile_options(ninfer_trtllm_moe PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+    $<$<COMPILE_LANGUAGE:CUDA>:-static-global-template-stub=false>
+    $<$<COMPILE_LANGUAGE:CUDA>:--threads=${SUROGATE_NVCC_THREADS}>
+    $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+else()
+  add_library(ninfer_trtllm_moe STATIC EXCLUDE_FROM_ALL
+    ${SERVE_ROOT}/ops/sparse_moe/trtllm/trtllm_moe_stub.cpp)
+endif()
+ninfer_internal_includes(ninfer_trtllm_moe)
+target_include_directories(ninfer_trtllm_moe PRIVATE
+  ${TRTLLM_MOE_ROOT}
+  ${TRTLLM_MOE_ROOT}/nv_internal
+  ${TRTLLM_MOE_ROOT}/nv_internal/include
+  ${TRTLLM_MOE_ROOT}/nv_internal/tensorrt_llm/cutlass_extensions/include
+  ${TRTLLM_MOE_ROOT}/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include
+  ${TRTLLM_MOE_ROOT}/nv_internal/tensorrt_llm/kernels/cutlass_kernels
+  ${TRTLLM_MOE_ROOT}/cutlass_instantiations/120
+  ${TRTLLM_MOE_ROOT}/flashinfer_include
+  ${cutlass_SOURCE_DIR}/include
+  ${cutlass_SOURCE_DIR}/tools/util/include
+  # cutlass's host-compiled headers reach for libcudacxx; nvcc finds CCCL itself, g++ does not.
+  ${CUDAToolkit_INCLUDE_DIRS}/cccl)
+set_target_properties(ninfer_trtllm_moe PROPERTIES
+  CUDA_SEPARABLE_COMPILATION OFF
+  CUDA_RESOLVE_DEVICE_SYMBOLS OFF
+  CUDA_STANDARD 17
+  CXX_STANDARD 17)
+target_link_libraries(ninfer_trtllm_moe PRIVATE ninfer_core CUDA::cudart CUDA::cuda_driver)
+
 # Shared mathematical Ops. The list is intentionally explicit: adding a
 # source is a build-boundary decision, not an accidental recursive-glob side effect.
 add_library(ninfer_ops STATIC EXCLUDE_FROM_ALL
@@ -1122,7 +1185,7 @@ set_source_files_properties(${SERVE_ROOT}/ops/linear/w8a8/w4fp4_cutlass_gemm.cu 
     INCLUDE_DIRECTORIES "${NINFER_CUTLASS_INCLUDE};${cutlass_SOURCE_DIR}/tools/util/include"
     COMPILE_OPTIONS "--expt-relaxed-constexpr")
 ninfer_cuda_archive(ninfer_ops)
-target_link_libraries(ninfer_ops PUBLIC ninfer_core PRIVATE ninfer_nvfp4_tma CUDA::cublasLt)
+target_link_libraries(ninfer_ops PUBLIC ninfer_core PRIVATE ninfer_nvfp4_tma ninfer_trtllm_moe CUDA::cublasLt)
 
 # Product-independent text and media mechanisms.
 add_library(ninfer_text STATIC EXCLUDE_FROM_ALL

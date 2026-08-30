@@ -106,6 +106,27 @@ us. In every case the weight format is the routed-NVFP4 artifact, rebuilt in
 bytes than groupwise-int, per-expert second-level scales as reciprocal arrays), our route and scheduler stay, and only the expert GEMMs become
 theirs. Expected outcome on the 35B at 100 users: 1,984 → 2,160-2,300.
 
+## Outcome (2026-08-30, same day)
+
+(b) shipped and beat its own estimate: **2,594 tok/s** at 100 users against the predicted
+2,160-2,300, +37 % over the groupwise-int pair measured back-to-back and +20 % over vLLM's row,
+with TTFT 0.09 s against their 3.17 s. Prefill 10,733 against 7,806. The three surprises worth
+carrying forward:
+
+- **The build fought us in one specific way.** The vendored launcher is written against cutlass
+  4.5.0; under `-std=c++20` its brace-initialisation of the grouped epilogue's argument struct
+  binds the wrong field of our 4.6.1. Compiling that target at C++17 fixes it. The header closure
+  is also wider than the sources suggest — TRT-LLM's error/logging/formatting runtime, its
+  DeepSeek block-scale GEMM and its LoRA hook are all needed at link even though the routed-NVFP4
+  profile takes none of those paths.
+- **The runner is a batch kernel and must not serve narrow rounds.** All-widths routing cost 47 %
+  of single-user decode. The crossover is 47 tokens and is a measured constant.
+- **The ceiling was not parity.** Their kernel plus our scheduler plus a per-expert activation
+  scale (which vLLM collapses to a single global minimum) is worth more than their kernel alone.
+
+(c), the CuTe-DSL B12x path, remains the follow-on experiment; the packed-weight and workspace
+plumbing it shares with (b) now exists.
+
 ## What not to do
 
 - Port kernels for the dense family. We lead or tie on every dense shape, and today's

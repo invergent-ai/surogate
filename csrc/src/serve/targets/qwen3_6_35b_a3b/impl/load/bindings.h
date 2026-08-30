@@ -29,10 +29,15 @@ struct MoePlan {
     artifact::ObjectHandle routed_down;
     artifact::ObjectHandle shared_gate_up;
     artifact::ObjectHandle shared_down;
-    /// NVFP4 only: the format's second level, per expert and per projection (see
-    /// `ops::SparseMoeWeights`). Unset for a groupwise-int artifact, which has no such objects.
+    /// NVFP4 only: the format's second level plus the W4A4 runner's activation scale and
+    /// epilogue alpha, per expert and per projection (see `ops::SparseMoeWeights`). All unset for
+    /// a groupwise-int artifact, which has no such objects.
     std::optional<artifact::ObjectHandle> routed_gate_up_scale;
     std::optional<artifact::ObjectHandle> routed_down_scale;
+    std::optional<artifact::ObjectHandle> routed_gate_up_act_scale;
+    std::optional<artifact::ObjectHandle> routed_gate_up_alpha;
+    std::optional<artifact::ObjectHandle> routed_down_act_scale;
+    std::optional<artifact::ObjectHandle> routed_down_alpha;
 };
 
 struct FullAttentionPlan {

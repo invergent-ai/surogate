@@ -9,6 +9,9 @@ namespace ninfer::ops::detail {
 namespace {
 
 std::int32_t prefill_min_tokens(QType routed_gate_up, QType routed_down) noexcept {
+    // NVFP4's routed experts have no kernel of this family - the vendored TRT-LLM runner computes
+    // them - so the family serves that profile at every width, down to a single token.
+    if (routed_gate_up == QType::NVFP4 && routed_down == QType::NVFP4) { return 1; }
     if (routed_gate_up == QType::Q4G64_F16S) {
         if (routed_down == QType::Q5G64_F16S) { return kSparseMoePrefillQ4Q5Min; }
         if (routed_down == QType::Q6G64_F16S) { return kSparseMoePrefillQ4Q6Min; }
@@ -28,13 +31,13 @@ bool sparse_moe_uses_prefill(std::int32_t tokens, QType routed_gate_up,
 }
 
 std::size_t sparse_moe_prefill_workspace_bytes(const SparseMoeGeometry& geometry,
-                                               std::int32_t max_tokens) {
-    if (max_tokens < kSparseMoePrefillWorkspaceMin) {
-        throw std::invalid_argument("sparse_moe prefill: max_tokens must be at least 20");
+                                               std::int32_t max_tokens, bool routed_trtllm) {
+    if (max_tokens < 1) {
+        throw std::invalid_argument("sparse_moe prefill: max_tokens must be at least 1");
     }
     const std::int32_t capacity_tokens = std::min(max_tokens, kSparseMoePrefillSliceMax);
     WorkspaceLayoutBuilder layout;
-    (void)allocate_sparse_moe_prefill_workspace(layout, geometry, capacity_tokens);
+    (void)allocate_sparse_moe_prefill_workspace(layout, geometry, capacity_tokens, routed_trtllm);
     return layout.peak_bytes(1);
 }
 
@@ -49,7 +52,10 @@ SparseMoePrefillPlan resolve_sparse_moe_prefill_plan(const SparseMoeGeometry& ge
         throw std::invalid_argument("sparse_moe prefill: unsupported token count");
     }
     const std::int32_t slice_tokens = std::min(tokens, kSparseMoePrefillSliceMax);
-    return {tokens, slice_tokens, sparse_moe_prefill_workspace_bytes(geometry, tokens)};
+    const bool routed_trtllm =
+        routed_gate_up == QType::NVFP4 && routed_down == QType::NVFP4;
+    return {tokens, slice_tokens,
+            sparse_moe_prefill_workspace_bytes(geometry, tokens, routed_trtllm), routed_trtllm};
 }
 
 } // namespace ninfer::ops::detail

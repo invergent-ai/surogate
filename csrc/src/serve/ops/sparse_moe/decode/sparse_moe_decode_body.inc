@@ -70,12 +70,18 @@ __global__ void sparse_moe_d2_warp_kernel(const float* __restrict__ scores, int*
                                                   selected_logits);
 }
 
+/// An expert's gate/up block stores the gate rows first in every groupwise-int and W8 artifact.
+/// The NVFP4 profile stores them second, because it is served by TensorRT-LLM's fused MoE runner
+/// wherever the round is wide enough to prefer it, and that runner reads [up; gate]. The order is
+/// a property of the codec's artifact, so it rides on the codec rather than on a runtime flag.
 struct Q4Codec {
+    static constexpr bool kGateRowsFirst = true;
     static constexpr int kGroupK         = 64;
     static constexpr bool kD3PackedWord8 = true;
 };
 
 struct Q5Codec {
+    static constexpr bool kGateRowsFirst = true;
     static constexpr int kGroupK       = 64;
     static constexpr bool kPackedWord8 = true;
 
@@ -93,6 +99,7 @@ struct Q5Codec {
 };
 
 struct Q6Codec {
+    static constexpr bool kGateRowsFirst = true;
     static constexpr int kGroupK       = 64;
     static constexpr bool kPackedWord8 = true;
 
@@ -125,6 +132,7 @@ struct Q6Codec {
 // multiply the finished dot by `divisor[expert]` once instead of touching every weight.
 template <int kGroupsPerRow>
 struct Nvfp4CodecFor {
+    static constexpr bool kGateRowsFirst        = false;
     static constexpr int kGroupK                = 16;
     static constexpr bool kPackedWord8          = true;
     // D3 has two specialised transaction shapes (Q4's four-group word and W8's one value per
@@ -163,6 +171,7 @@ struct Nvfp4CodecFor {
 };
 
 struct W8Codec {
+    static constexpr bool kGateRowsFirst        = true;
     static constexpr int kGroupK                = 32;
     static constexpr bool kD3SingleValuePerLane = true;
     static constexpr bool kD3PackedWord8        = false;
@@ -314,14 +323,17 @@ __global__ void sparse_moe_d3_nine_warp_kernel(
         const int block  = slot_of_expert != nullptr ? slot_of_expert[expert] : expert;
         const int row_base = block * (2 * kIntermediate);
         if (block >= 0) {
+            float& first  = RoutedCodec::kGateRowsFirst ? gate : up;
+            float& second = RoutedCodec::kGateRowsFirst ? up : gate;
             dot_two_rows<RoutedCodec, kHidden>(routed_codes, routed_high, routed_scales,
                                                row_base + j, row_base + kIntermediate + j, x_shared,
-                                               0, kHidden, gate, up);
+                                               0, kHidden, first, second);
             // NVFP4's second level, one multiply per path instead of one per weight. It lands
-            // before SwiGLU, which is where a gate/up scale has to be.
+            // before SwiGLU, which is where a gate/up scale has to be. The array is indexed by
+            // row half, so it follows the codec's order rather than the names.
             if (routed_gate_up_scale != nullptr) {
-                gate *= routed_gate_up_scale[block * 2];
-                up *= routed_gate_up_scale[block * 2 + 1];
+                first *= routed_gate_up_scale[block * 2];
+                second *= routed_gate_up_scale[block * 2 + 1];
             }
         }
     } else {
@@ -384,12 +396,14 @@ __global__ void sparse_moe_d3_path_tiled_kernel(
             const int block  = slot_of_expert != nullptr ? slot_of_expert[expert] : expert;
             const int row_base = block * (2 * kIntermediate);
             if (block >= 0) {
+                float& first  = RoutedCodec::kGateRowsFirst ? gate : up;
+                float& second = RoutedCodec::kGateRowsFirst ? up : gate;
                 dot_two_rows<RoutedCodec, kHidden>(routed_codes, routed_high, routed_scales,
                                                    row_base + j, row_base + kIntermediate + j,
-                                                   x_shared, 0, kHidden, gate, up);
+                                                   x_shared, 0, kHidden, first, second);
                 if (routed_gate_up_scale != nullptr) {
-                    gate *= routed_gate_up_scale[block * 2];
-                    up *= routed_gate_up_scale[block * 2 + 1];
+                    first *= routed_gate_up_scale[block * 2];
+                    second *= routed_gate_up_scale[block * 2 + 1];
                 }
             }
         } else {

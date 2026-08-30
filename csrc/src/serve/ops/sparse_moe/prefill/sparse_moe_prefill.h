@@ -3,6 +3,7 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "api/ops/sparse_moe.h"
+#include "ops/sparse_moe/trtllm/trtllm_moe.h"
 
 #include <cuda_runtime.h>
 
@@ -14,7 +15,6 @@ namespace ninfer::ops::detail {
 
 // RTX 5090 codec frontiers balance trace-like and independent expert distributions. The public
 // workspace query starts at the earliest codec-specific prefill route.
-inline constexpr std::int32_t kSparseMoePrefillWorkspaceMin = 20;
 inline constexpr std::int32_t kSparseMoePrefillQ4Q5Min      = 47;
 inline constexpr std::int32_t kSparseMoePrefillQ4Q6Min      = 47;
 inline constexpr std::int32_t kSparseMoePrefillW8W8Min      = 20;
@@ -31,6 +31,10 @@ struct SparseMoePrefillPlan {
     std::int32_t tokens         = 0;
     std::int32_t slice_tokens   = 0;
     std::size_t workspace_bytes = 0;
+    /// The routed experts run through the vendored TRT-LLM runner rather than this family's own
+    /// gather/gate-up/down/reduce chain. Set for the NVFP4 routed profile, whose weights are
+    /// stored in that runner's [up; gate] row order and have no kernel of ours.
+    bool routed_trtllm = false;
 };
 
 struct SparseMoePrefillWorkspace {
@@ -58,12 +62,16 @@ struct SparseMoePrefillWorkspace {
     Tensor grouped_io;
     Tensor routed_storage;
     Tensor routed_sum;
+    /// Only allocated for a `routed_trtllm` plan: the runner's own scratch, its BF16 output block
+    /// and its permutation map, laid out by `trtllm_moe::workspace_bytes`.
+    DeviceSpan trtllm_workspace;
 };
 
 template <class Arena>
 SparseMoePrefillWorkspace allocate_sparse_moe_prefill_workspace(Arena& arena,
                                                                 const SparseMoeGeometry& geometry,
-                                                                std::int32_t capacity_tokens) {
+                                                                std::int32_t capacity_tokens,
+                                                                bool routed_trtllm = false) {
     SparseMoePrefillWorkspace out;
     const std::int32_t assignments = geometry.experts_per_token * capacity_tokens;
     const std::int32_t experts     = geometry.experts;
@@ -103,13 +111,23 @@ SparseMoePrefillWorkspace allocate_sparse_moe_prefill_workspace(Arena& arena,
 
     out.routed_storage = arena.alloc(DType::BF16, {inter, assignments}, 256);
     out.routed_sum     = Tensor(out.routed_storage.data, DType::FP32, {hidden, capacity_tokens});
+    if (routed_trtllm) {
+        out.trtllm_workspace =
+            arena.alloc_bytes(trtllm_moe::workspace_bytes(
+                                  trtllm_moe::Geometry{geometry.hidden, geometry.experts,
+                                                       geometry.experts_per_token,
+                                                       geometry.intermediate},
+                                  capacity_tokens),
+                              256);
+    }
     return out;
 }
 
 [[nodiscard]] bool sparse_moe_uses_prefill(std::int32_t tokens, QType routed_gate_up,
                                            QType routed_down) noexcept;
 [[nodiscard]] std::size_t sparse_moe_prefill_workspace_bytes(const SparseMoeGeometry& geometry,
-                                                             std::int32_t max_tokens);
+                                                             std::int32_t max_tokens,
+                                                             bool routed_trtllm = false);
 [[nodiscard]] SparseMoePrefillPlan resolve_sparse_moe_prefill_plan(const SparseMoeGeometry& geometry,
                                                                    std::int32_t tokens,
                                                                    QType routed_gate_up,

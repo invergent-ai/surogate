@@ -307,8 +307,15 @@ std::size_t Variant::gdn_norm_control_projection_workspace_capacity_bytes(std::i
                                                               TextConfig::hidden, first, last);
 }
 
-std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile, qwen3_6::TextPhase,
-                                                         std::int32_t first, std::int32_t last) {
+std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_profile,
+                                                         qwen3_6::TextPhase, std::int32_t first,
+                                                         std::int32_t last) {
+    if (weights_profile == WeightsProfile::RoutedNvfp4) {
+        return ops::sparse_moe_workspace_capacity_bytes(ops::kSparseMoeQwen36Geometry,
+                                                        QType::NVFP4, QType::NVFP4, first, last);
+    }
+    // A groupwise-int artifact mixes Q5 and Q6 down projections across its layers, and the
+    // scratch is one arena for all of them.
     return std::max(ops::sparse_moe_workspace_capacity_bytes(ops::kSparseMoeQwen36Geometry,
                                                              QType::Q4G64_F16S, QType::Q5G64_F16S,
                                                              first, last),

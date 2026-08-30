@@ -114,6 +114,14 @@ Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
 std::unique_ptr<Package::Program>
 Package::create_program(const LoadedModel& model, SequencePlan&& plan, DeviceContext& device) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
+    // The routed-NVFP4 experts run on the vendored TRT-LLM runner, whose grouped GEMMs pick a
+    // tactic per round width by measurement. That measurement launches and synchronises, so it
+    // has to happen before the program captures its decode graphs; every layer shares the
+    // geometry and the tactic, so tuning against one layer's weights tunes them all.
+    if (model.impl_->weights_profile == WeightsProfile::RoutedNvfp4) {
+        ops::sparse_moe_prepare(model.impl_->data.runtime.gdn_layers.at(0).post_mixer.op,
+                                ops::kSparseMoeTrtllmPrepareWidth, device.stream);
+    }
     return qwen3_6::create_program<detail::Variant>(
         model.impl_->data.runtime, model.impl_->weights_profile, std::move(plan), device);
 }

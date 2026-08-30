@@ -1,0 +1,10 @@
+Vendored from FlashInfer 0.6.16.post3 (flashinfer-python), which ships NVIDIA TensorRT-LLM's
+CUTLASS MoE kernels under `flashinfer/data/csrc/nv_internal`. Both are Apache-2.0 (see LICENSE).
+
+What is here, and why: the fused MoE runner (`CutlassMoeFCRunner`) and its SM120 block-scaled
+grouped-GEMM instantiations, taken so the serving engine can run NVFP4 routed experts through
+the same kernel vLLM uses on this hardware (`design/35B_VLLM_KERNELS.md`). The
+`cutlass_instantiations/120` files are FlashInfer's generator output
+(`flashinfer/jit/gemm/cutlass/generate_kernels.py`) for architecture 120, captured from the
+JIT cache of a vLLM run on 2026-08-30. Nothing here is modified except
+`cutlass_fused_moe_instantiation.cu`, trimmed to the instantiation the engine uses.

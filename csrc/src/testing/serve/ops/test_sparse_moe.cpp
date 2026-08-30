@@ -49,6 +49,18 @@ constexpr ReductionCriterion kSparseMoeA16Tolerance{
     /*gross_relative_to_max_reference*/ 0.0,
 };
 
+// The NVFP4 routed profile is served by a W4A4 runner, so the oracle rounds the activations to
+// E2M1 as well (`round_activation_to_nvfp4`) and this bound covers only what is left: E2M1 ties
+// broken differently from the hardware converter, the runner's fast reciprocal, and FP32 against
+// the oracle's FP64. Measured maxima over the complete case matrix are rel-L2 2.049e-2 and
+// pointwise 1.151e-2; without the activation model the same cases sit at 9.86e-2, which is the
+// format's own headroom on this fixture's narrow-range input rather than an error of the kernel.
+constexpr ReductionCriterion kSparseMoeA4Tolerance{
+    /*relative_l2*/ 2.5e-2,
+    /*gross_absolute*/ 1.5e-2,
+    /*gross_relative_to_max_reference*/ 0.0,
+};
+
 constexpr std::size_t kOutputGuardBytes = 256;
 constexpr std::uint8_t kOutputGuardByte = 0xa5;
 
@@ -87,6 +99,26 @@ QuantGeometry quant_geometry(QType qtype) {
 /// projection. The packer quantises `source / block_scale` and leaves the multiply to the kernel,
 /// so `dequant` (the oracle's view) still holds the full weight and a kernel that forgets the
 /// multiply fails by the size of the scale rather than by rounding.
+/// An expert's gate/up rows with the two halves exchanged. The vendored runner reads [up; gate];
+/// every other codec, and this file's oracle, reads [gate; up].
+std::vector<float> swap_halves(const std::vector<float>& source, std::int32_t columns) {
+    const std::size_t half = source.size() / 2;
+    std::vector<float> out(source.size());
+    std::copy(source.begin() + static_cast<std::ptrdiff_t>(half), source.end(), out.begin());
+    std::copy(source.begin(), source.begin() + static_cast<std::ptrdiff_t>(half),
+              out.begin() + static_cast<std::ptrdiff_t>(half));
+    (void)columns;
+    return out;
+}
+
+/// Undoes `swap_halves` on a packed weight's decoded values, so the oracle keeps reading
+/// [gate; up] while the device payload stays in the runner's order.
+quantized_weight::PackedWeight swap_halves_of_dequant(quantized_weight::PackedWeight packed,
+                                                      std::int32_t columns) {
+    packed.dequant = swap_halves(packed.dequant, columns);
+    return packed;
+}
+
 quantized_weight::PackedWeight pack_nvfp4(const std::vector<float>& source, std::int32_t n,
                                           std::int32_t k,
                                           const std::vector<float>& block_scale) {
@@ -191,8 +223,8 @@ std::vector<std::uint16_t> bf16_bits(const std::vector<float>& values) {
 }
 
 int compare_output(const std::string& label, const std::vector<double>& actual,
-                   const std::vector<double>& reference) {
-    return verify_reduction(label, actual, reference, kSparseMoeA16Tolerance);
+                   const std::vector<double>& reference, const ReductionCriterion& criterion) {
+    return verify_reduction(label, actual, reference, criterion);
 }
 
 class GuardedBf16Output {
@@ -477,6 +509,53 @@ double dot_fp64(const std::vector<float>& matrix, std::int32_t row, std::int32_t
     return result;
 }
 
+/// The routed experts of the NVFP4 profile are served by a W4A4 runner, so the activations reach
+/// the MMA rounded to E2M1 as well. That rounding is part of the arithmetic the profile defines,
+/// not an error of the implementation, so the oracle performs it — from the format's own rules,
+/// independently of how the kernel spells them.
+///
+/// A block of 16 shares one E4M3 scale derived from the block's own maximum and the expert's
+/// activation global scale: `SF = e4m3(vecMax * scale / 6)`, and the value the MMA sees is
+/// `round_e2m1(v * scale / SF) * SF / scale`. The global scale cancels except through that E4M3
+/// rounding, which is exactly why it only has to put `SF` inside E4M3's normal range.
+struct Nvfp4ActivationModel {
+    const std::vector<float>* gate_up_scale = nullptr;
+    const std::vector<float>* down_scale    = nullptr;
+
+    [[nodiscard]] bool enabled() const noexcept { return gate_up_scale != nullptr; }
+};
+
+void round_activation_to_nvfp4(std::vector<double>& values, float activation_scale) {
+    static constexpr double kMagnitudes[8] = {0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0};
+    constexpr std::size_t kBlock           = 16;
+    for (std::size_t base = 0; base < values.size(); base += kBlock) {
+        double block_max = 0.0;
+        for (std::size_t i = base; i < base + kBlock; ++i) {
+            block_max = std::max(block_max, std::fabs(values[i]));
+        }
+        const __nv_fp8_e4m3 stored(static_cast<float>(block_max * activation_scale / 6.0));
+        const double block_scale = static_cast<double>(static_cast<float>(stored));
+        if (!(block_scale > 0.0)) {
+            for (std::size_t i = base; i < base + kBlock; ++i) { values[i] = 0.0; }
+            continue;
+        }
+        const double step = block_scale / static_cast<double>(activation_scale);
+        for (std::size_t i = base; i < base + kBlock; ++i) {
+            const double normalised = std::fabs(values[i]) / step;
+            int best                = 0;
+            double best_error       = std::fabs(normalised - kMagnitudes[0]);
+            for (int candidate = 1; candidate < 8; ++candidate) {
+                const double error = std::fabs(normalised - kMagnitudes[candidate]);
+                if (error < best_error) {
+                    best_error = error;
+                    best       = candidate;
+                }
+            }
+            values[i] = std::copysign(kMagnitudes[best] * step, values[i]);
+        }
+    }
+}
+
 // The one SparseMoe oracle. It directly evaluates the complete public formula from represented
 // BF16 values and independently decoded logical weights, with FP64 accumulation throughout.
 // It has no production route, staging cast, workspace dtype, reduction tree, or output rounding.
@@ -487,7 +566,8 @@ std::vector<double> sparse_moe_oracle(const std::vector<float>& input,
                                       const quantized_weight::PackedWeight& shared_gate_up,
                                       const quantized_weight::PackedWeight& shared_down,
                                       const RoutePattern& intended_route,
-                                      std::span<const int> excluded = {}) {
+                                      std::span<const int> excluded         = {},
+                                      const Nvfp4ActivationModel& activation = {}) {
     const std::vector<double> x(input.begin(), input.end());
     std::vector<double> scores(kExperts + 1);
     parallel_rows(kExperts + 1,
@@ -517,11 +597,27 @@ std::vector<double> sparse_moe_oracle(const std::vector<float>& input,
     for (int route = 0; route < kTopK; ++route) {
         routed_activation[route].resize(kIntermediate);
         const HostExpert& expert = find_expert(experts, selected[route]);
+        std::vector<double> expert_x = x;
+        if (activation.enabled()) {
+            round_activation_to_nvfp4(
+                expert_x, (*activation.gate_up_scale)[static_cast<std::size_t>(expert.id)]);
+        }
         parallel_rows(kIntermediate, [&](std::int32_t row) {
-            const double gate = dot_fp64(expert.gate_up.dequant, row, kHidden, x);
-            const double up   = dot_fp64(expert.gate_up.dequant, kIntermediate + row, kHidden, x);
+            double gate = dot_fp64(expert.gate_up.dequant, row, kHidden, expert_x);
+            double up   = dot_fp64(expert.gate_up.dequant, kIntermediate + row, kHidden, expert_x);
+            if (activation.enabled()) {
+                // The runner writes the first GEMM's result as BF16 and reads it back to form the
+                // SwiGLU, so the reference rounds there too.
+                gate = static_cast<double>(bf16_to_f32(f32_to_bf16(static_cast<float>(gate))));
+                up   = static_cast<double>(bf16_to_f32(f32_to_bf16(static_cast<float>(up))));
+            }
             routed_activation[route][row] = (gate / (1.0 + std::exp(-gate))) * up;
         });
+        if (activation.enabled()) {
+            round_activation_to_nvfp4(
+                routed_activation[route],
+                (*activation.down_scale)[static_cast<std::size_t>(expert.id)]);
+        }
     }
 
     std::vector<double> shared_activation(kIntermediate);
@@ -594,17 +690,27 @@ public:
             // across one layer's experts, measured on RedHatAI/Qwen3.6-35B-A3B-NVFP4), so the
             // test gives every expert its own gate, up and down scale rather than a shared one.
             const float gate_scale = 0.55f + static_cast<float>((expert * 7) % 13) * 0.07f;
-            const float up_scale   = 0.62f + static_cast<float>((expert * 5) % 11) * 0.09f;
+            // The vendored runner carries one epilogue alpha per expert, so the NVFP4 profile's
+            // gate and up share a second-level scale — as they do in the published checkpoint,
+            // which the converter refuses to convert when they do not.
+            const float up_scale = profile.routed_gate_up == QType::NVFP4
+                                       ? gate_scale
+                                       : 0.62f + static_cast<float>((expert * 5) % 11) * 0.09f;
             const float down_scale = 0.71f + static_cast<float>((expert * 3) % 17) * 0.05f;
             gate_up_scale_host_[static_cast<std::size_t>(expert) * 2]     = gate_scale;
             gate_up_scale_host_[static_cast<std::size_t>(expert) * 2 + 1] = up_scale;
             down_scale_host_[static_cast<std::size_t>(expert)]            = down_scale;
-            auto gate_up = profile.routed_gate_up == QType::NVFP4
-                               ? pack_nvfp4(gate_up_source, kExpertGateRows, kHidden,
-                                            {gate_scale, up_scale})
-                               : quantized_weight::pack_row_split_lowbit(
-                                     gate_up_source, kExpertGateRows, kHidden,
-                                     profile.routed_gate_up);
+            auto gate_up =
+                profile.routed_gate_up == QType::NVFP4
+                    // The runner reads an expert's rows as [up; gate]; the oracle keeps the
+                    // [gate; up] view of the same numbers, so the decoded weights are swapped
+                    // back after packing.
+                    ? swap_halves_of_dequant(pack_nvfp4(swap_halves(gate_up_source, kHidden),
+                                                        kExpertGateRows, kHidden,
+                                                        {up_scale, gate_scale}),
+                                             kHidden)
+                    : quantized_weight::pack_row_split_lowbit(gate_up_source, kExpertGateRows,
+                                                              kHidden, profile.routed_gate_up);
             auto down = profile.routed_down == QType::NVFP4
                             ? pack_nvfp4(down_source, kHidden, kIntermediate, {down_scale})
                             : quantized_weight::pack_row_split_lowbit(
@@ -622,11 +728,19 @@ public:
         shared_down_device_.copy_rows(shared_down_host_, 0);
         gate_up_scale_device_ = to_device(gate_up_scale_host_);
         down_scale_device_    = to_device(down_scale_host_);
+        if (profile.routed_gate_up == QType::NVFP4) { calibrate_activation_scales(); }
 
         for (int pattern = 0; pattern < static_cast<int>(kRoutePatterns.size()); ++pattern) {
             references_.push_back(sparse_moe_oracle(inputs_[pattern], residuals_[pattern], router_,
                                                     experts_, shared_gate_host_, shared_down_host_,
                                                     kRoutePatterns[pattern]));
+            // The NVFP4 profile computes two different functions: our own kernels keep the
+            // activations in BF16, and the vendored runner rounds them to E2M1. Which one serves
+            // a round is decided by its width, so the suite carries both references and asserts
+            // against the one the width selects.
+            w4a4_references_.push_back(sparse_moe_oracle(
+                inputs_[pattern], residuals_[pattern], router_, experts_, shared_gate_host_,
+                shared_down_host_, kRoutePatterns[pattern], {}, activation_model()));
         }
     }
 
@@ -641,7 +755,8 @@ public:
                       input.begin() + static_cast<std::size_t>(token) * kHidden);
             std::copy(residuals_[pattern].begin(), residuals_[pattern].end(),
                       residual.begin() + static_cast<std::size_t>(token) * kHidden);
-            std::copy(references_[pattern].begin(), references_[pattern].end(),
+            const std::vector<double>& source = reference_for(tokens, pattern);
+            std::copy(source.begin(), source.end(),
                       reference.begin() + static_cast<std::size_t>(token) * kHidden);
         }
 
@@ -697,7 +812,7 @@ public:
             cuda_synchronize();
         }
 
-        int failures = compare_output(label, destination_storage.values(), reference);
+        int failures = compare_output(label, destination_storage.values(), reference, tolerance(tokens));
         failures += destination_storage.verify_guards(label);
         failures +=
             verify_exact((label + " input preservation").c_str(),
@@ -727,7 +842,8 @@ public:
             const std::vector<double> partial =
                 sparse_moe_oracle(inputs_[pattern], residuals_[pattern], router_, experts_,
                                   shared_gate_host_, shared_down_host_, kRoutePatterns[pattern],
-                                  excluded);
+                                  excluded, runs_on_runner(tokens) ? activation_model()
+                                                                   : Nvfp4ActivationModel{});
             std::copy(partial.begin(), partial.end(),
                       reference.begin() + static_cast<std::size_t>(token) * kHidden);
         }
@@ -769,7 +885,7 @@ public:
                             workspace, nullptr);
             cuda_synchronize();
         }
-        int failures = compare_output(label, destination_storage.values(), reference);
+        int failures = compare_output(label, destination_storage.values(), reference, tolerance(tokens));
         failures += destination_storage.verify_guards(label);
         return failures;
     }
@@ -799,10 +915,94 @@ public:
     void attach_nvfp4_scales(ops::SparseMoeWeights& weights) const {
         if (profile_.routed_gate_up == QType::NVFP4) {
             weights.routed_gate_up_scale = static_cast<const float*>(gate_up_scale_device_.p);
+            weights.routed_gate_up_act_scale =
+                static_cast<const float*>(gate_up_act_device_.p);
+            weights.routed_gate_up_alpha = static_cast<const float*>(gate_up_alpha_device_.p);
         }
         if (profile_.routed_down == QType::NVFP4) {
-            weights.routed_down_scale = static_cast<const float*>(down_scale_device_.p);
+            weights.routed_down_scale     = static_cast<const float*>(down_scale_device_.p);
+            weights.routed_down_act_scale = static_cast<const float*>(down_act_device_.p);
+            weights.routed_down_alpha     = static_cast<const float*>(down_alpha_device_.p);
         }
+    }
+
+    /// Empty for every A16 codec; for the NVFP4 profile it hands the oracle the same per-expert
+    /// activation scales the runner receives.
+    /// True when a round of this width is served by the vendored runner rather than our own
+    /// kernels — the same crossover `ops::sparse_moe` applies.
+    [[nodiscard]] bool runs_on_runner(std::int32_t tokens) const {
+        return profile_.routed_gate_up == QType::NVFP4 &&
+               tokens >= ops::kSparseMoeTrtllmMinTokens;
+    }
+
+    [[nodiscard]] Nvfp4ActivationModel activation_model() const {
+        if (profile_.routed_gate_up != QType::NVFP4) { return {}; }
+        return {&gate_up_act_host_, &down_act_host_};
+    }
+
+    [[nodiscard]] const ReductionCriterion& tolerance(std::int32_t tokens) const {
+        return runs_on_runner(tokens) ? kSparseMoeA4Tolerance : kSparseMoeA16Tolerance;
+    }
+
+    [[nodiscard]] const std::vector<double>& reference_for(std::int32_t tokens,
+                                                           int pattern) const {
+        return runs_on_runner(tokens) ? w4a4_references_[static_cast<std::size_t>(pattern)]
+                                      : references_[static_cast<std::size_t>(pattern)];
+    }
+
+    /// The activation global scales the checkpoint would carry: `6 * 448 / amax` of what each
+    /// projection sees, per expert. `amax` is measured here the way a calibration pass measures
+    /// it — over this fixture's own inputs for gate/up, and over the SwiGLU output the routed
+    /// experts produce from them for down — so the E4M3 block scales the runner derives land in
+    /// that format's normal range, which is the only thing the choice governs.
+    void calibrate_activation_scales() {
+        constexpr float kFp4Max = 6.0f;
+        constexpr float kFp8Max = 448.0f;
+        double input_amax       = 0.0;
+        for (const std::vector<float>& input : inputs_) {
+            for (float value : input) {
+                input_amax = std::max(input_amax, static_cast<double>(std::fabs(value)));
+            }
+        }
+        double activation_amax = 0.0;
+        for (const std::vector<float>& input : inputs_) {
+            const std::vector<double> x(input.begin(), input.end());
+            for (const HostExpert& expert : experts_) {
+                std::vector<double> row_max(kIntermediate, 0.0);
+                parallel_rows(kIntermediate, [&](std::int32_t row) {
+                    const double gate = dot_fp64(expert.gate_up.dequant, row, kHidden, x);
+                    const double up = dot_fp64(expert.gate_up.dequant, kIntermediate + row,
+                                               kHidden, x);
+                    row_max[static_cast<std::size_t>(row)] =
+                        std::fabs((gate / (1.0 + std::exp(-gate))) * up);
+                });
+                for (double value : row_max) { activation_amax = std::max(activation_amax, value); }
+            }
+        }
+        gate_up_act_host_.assign(static_cast<std::size_t>(kExperts), 1.0f);
+        gate_up_alpha_host_.assign(static_cast<std::size_t>(kExperts), 1.0f);
+        down_act_host_.assign(static_cast<std::size_t>(kExperts), 1.0f);
+        down_alpha_host_.assign(static_cast<std::size_t>(kExperts), 1.0f);
+        for (const HostExpert& expert : experts_) {
+            const auto slot = static_cast<std::size_t>(expert.id);
+            // A per-expert spread, as a real calibration produces: the runner indexes these by
+            // expert, and a wrong index would otherwise be invisible.
+            const float jitter = 0.85f + static_cast<float>((expert.id * 5) % 7) * 0.05f;
+            const float gate_up_act =
+                jitter * static_cast<float>(kFp8Max * kFp4Max / std::max(input_amax, 1e-6));
+            const float down_act =
+                jitter * static_cast<float>(kFp8Max * kFp4Max / std::max(activation_amax, 1e-6));
+            gate_up_act_host_[slot] = gate_up_act;
+            down_act_host_[slot]    = down_act;
+            // The weight's global scale divides in the checkpoint, so its reciprocal is what the
+            // second-level array already holds; alpha undoes both global scales at once.
+            gate_up_alpha_host_[slot] = gate_up_scale_host_[slot * 2] / gate_up_act;
+            down_alpha_host_[slot]    = down_scale_host_[slot] / down_act;
+        }
+        gate_up_act_device_   = to_device(gate_up_act_host_);
+        gate_up_alpha_device_ = to_device(gate_up_alpha_host_);
+        down_act_device_      = to_device(down_act_host_);
+        down_alpha_device_    = to_device(down_alpha_host_);
     }
 
 private:
@@ -820,12 +1020,23 @@ private:
     std::vector<float> down_scale_host_;
     DeviceBuffer gate_up_scale_device_;
     DeviceBuffer down_scale_device_;
+    // The W4A4 runner's per-expert activation scale and epilogue alpha, one pair per projection.
+    std::vector<float> gate_up_act_host_;
+    std::vector<float> gate_up_alpha_host_;
+    std::vector<float> down_act_host_;
+    std::vector<float> down_alpha_host_;
+    DeviceBuffer gate_up_act_device_;
+    DeviceBuffer gate_up_alpha_device_;
+    DeviceBuffer down_act_device_;
+    DeviceBuffer down_alpha_device_;
     std::vector<std::vector<float>> inputs_;
     std::vector<std::vector<float>> residuals_;
     std::vector<HostExpert> experts_;
     quantized_weight::PackedWeight shared_gate_host_;
     quantized_weight::PackedWeight shared_down_host_;
     std::vector<std::vector<double>> references_;
+    // The same rounds with the activations rounded to E2M1, for the widths the runner serves.
+    std::vector<std::vector<double>> w4a4_references_;
 };
 
 int run_profile(const CodecProfile& profile) {
@@ -872,18 +1083,21 @@ int main() {
     constexpr std::array<std::int32_t, 6> kQ4Q5Tokens{{1, 2, 46, 47, 768, 4097}};
     constexpr std::array<std::int32_t, 5> kQ4Q6Tokens{{1, 2, 46, 47, 768}};
     constexpr std::array<std::int32_t, 5> kW8W8Tokens{{1, 2, 19, 20, 768}};
-    // NVFP4 covers every width: decode at 1, small-T at 2/19/20, and wider rounds as a
-    // sequence of small-T slices. 47 and 139 are the widths whose last slice would otherwise
-    // be a single token, which small-T does not serve; 768 and 4,097 cross the slice bound.
+    // The NVFP4 routed profile runs on the vendored TRT-LLM runner at every width, so the cases
+    // walk that runner's own tuning ladder: 1 and 2 are buckets of their own, 19/20 and 47 land
+    // inside the power-of-two rungs, 139 and 768 inside the linear ones, and 4,097 crosses the
+    // 4,096-row slice bound into a second call.
     constexpr std::array<std::int32_t, 8> kNvfp4Tokens{{1, 2, 19, 20, 47, 139, 768, 4097}};
     const std::array<CodecProfile, 4> profiles{{
         {"sparse_moe q4+q5 a16", QType::Q4G64_F16S, QType::Q5G64_F16S, kQ4Q5Tokens, true},
         {"sparse_moe q4+q6 a16", QType::Q4G64_F16S, QType::Q6G64_F16S, kQ4Q6Tokens, false},
         {"sparse_moe w8+w8 a16", QType::W8G32_F16S, QType::W8G32_F16S, kW8W8Tokens, false},
-        // NVFP4 routed experts: e2m1 codes with an e4m3 scale every 16 values in the dense
-        // BlockScaleK16M128x4 layout. Shapes line up — gate/up is 1,024 x 2,048 and down
-        // 2,048 x 512, so N is a multiple of 128 and K of 64 for both.
-        {"sparse_moe nvfp4+nvfp4 a16", QType::NVFP4, QType::NVFP4, kNvfp4Tokens, false},
+            // NVFP4 routed experts, served by the vendored TRT-LLM runner: e2m1 codes with an
+            // e4m3 scale every 16 values in the dense BlockScaleK16M128x4 layout, an expert's
+            // gate/up rows stored [up; gate], and the activations rounded to the same format by
+            // the runner. Shapes line up — gate/up is 1,024 x 2,048 and down 2,048 x 512, so N
+            // is a multiple of 128 and K of 64 for both.
+        {"sparse_moe nvfp4 w4a4", QType::NVFP4, QType::NVFP4, kNvfp4Tokens, false},
     }};
 
     int failures = 0;
