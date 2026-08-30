@@ -108,9 +108,9 @@ theirs. Expected outcome on the 35B at 100 users: 1,984 → 2,160-2,300.
 
 ## Outcome (2026-08-30, same day)
 
-(b) shipped and beat its own estimate: **2,614 tok/s** at 100 users against the predicted
-2,160-2,300, +39 % over the groupwise-int pair measured back-to-back and +21 % over vLLM's row,
-with TTFT 0.09 s against their 3.17 s. Prefill 10,817 against 7,806. At 16 users, +33 %. The three surprises worth
+(b) shipped and beat its own estimate: **2,607 tok/s** at 100 users against the predicted
+2,160-2,300, +40 % over the groupwise-int pair measured in the same session and +21 % over vLLM's
+row, with TTFT 0.09 s against their 3.17 s. Prefill 10,789 against 7,708. At 16 users, +36 %. The three surprises worth
 carrying forward:
 
 - **The build fought us in one specific way.** The vendored launcher is written against cutlass

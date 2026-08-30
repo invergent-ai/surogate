@@ -2587,11 +2587,13 @@ Paired back-to-back on GPU 1, same session and flags, `probe/board.py … 512 12
 
 | users | routed NVFP4 + runner | groupwise-int (shipped) | delta |
 |---:|---|---|---|
-| 100 | 10,817 pp / **2,614** tg / 0.09 s | 7,806 / 1,887 / 0.12 s | **+39 % / +39 %** |
-| 16 | 5,848 / **1,413** / 0.07 s | 4,397 / 1,063 / 0.10 s | **+33 % / +33 %** |
-| 1 | 1,306 / **315.9** / 0.03 s | 1,275 / 308.4 / 0.04 s | +2.4 % / +2.4 % |
+| 100 | 10,789 pp / **2,607** tg / 0.09 s | 7,708 / 1,863 / 0.12 s | **+40 % / +40 %** |
+| 16 | 5,829 / **1,409** / 0.07 s | 4,300 / 1,040 / 0.10 s | **+36 % / +36 %** |
+| 1 | 1,307 / **316.2** / 0.03 s | 1,272 / 307.8 / 0.04 s | +2.7 % / +2.7 % |
 
-Against vLLM's own board row on this hardware — 8,946 / 2,162 / 3.17 s — that is **+20 % decode
+(All six from one back-to-back session on GPU 1, 18:45-18:52; an earlier split-session pass read
+2,614 / 1,413 / 315.9, within 0.3 % of these.) Against vLLM's own board row on this hardware —
+8,946 / 2,162 / 3.17 s — that is **+21 % decode
 with a TTFT 35× lower**, and it beats the 2,160-2,300 the costing predicted. The estimate was
 for parity with their kernel; the extra came from keeping our scheduler and from a per-expert
 activation scale they do not use.
