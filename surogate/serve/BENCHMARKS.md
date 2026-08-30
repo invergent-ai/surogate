@@ -117,8 +117,9 @@ what the engine does and how the number was arrived at.
 | surogate | 8 | 100 / 1 | — | 1,332 / 19.6 | — | — / 0.43 s | the 2026-08-29 pass (clock-capped, in-phase clients) |
 | **surogate** | 1 | 100 | 471 | **1,884** | 2,355 | **14.2 s** | decode-heavy 128/512, 64 lanes (GPU5) |
 | vLLM | 1 | 100 | 360 | 1,438 | 1,798 | 21.9 s | decode-heavy, same card |
-| surogate | 1 | 100 | 7,339 | 57 | 7,396 | 25.8 s | prefill-heavy 2048/16, chunk 4,096 (GPU6); the open 27B gap |
-| **vLLM** | 1 | 100 | **11,818** | 92 | 11,910 | **14.9 s** | prefill-heavy, same card |
+| **surogate** | 1 | 100 | **11,208** | 85 | **11,293** | 15.9 s | prefill-heavy 2048/16, chunk 4,096, `--max-model-len 4096`, 128 lanes; 2026-08-30 09:24, uncapped GPU 3. **95 % of vLLM's prefill at a comparable TTFT** — the gap the board carried was the 08-27 configuration, not the engine |
+| **vLLM** | 1 | 100 | **11,818** | 92 | 11,910 | **14.9 s** | prefill-heavy, 2026-08-27 pass |
+| surogate | 1 | 100 | 7,339 | 57 | 7,396 | 25.8 s | the 2026-08-27 pass that defined "the 27B prefill gap": 62 % of vLLM. Superseded by the row above |
 | surogate | 1 | 1 | 5,400 † | 45 | — | 352 ms | 2026-08-26, GPU2 |
 | llama.cpp | 1 | 1 | 1,040 † | **49** | — | 1,829 ms |  |
 | vLLM | 1 | 1 | 7,500 † | 45 | — | **254 ms** |  |
@@ -142,7 +143,7 @@ what the engine does and how the number was arrived at.
 | **surogate** | 1 | 1 | 128 | **28.7** | 156 | **1.36 s** | experts on the host: Q4G32AM bank (pinned, 91 GB), 3,000-slot expert cache, CPU split auto; 2026-08-30 07:55, uncapped GPU 6 (**x16 link**, gather 46 GB/s) |
 | **surogate** | 1 | 16 | **298** | **66.9** | **365** | **2.62 s** | same, 81 % / 51 % measured shares; TTFT p90 14.7 s |
 | surogate | 1 | 64 | 329 | 73.8 | 403 | 40.5 s | `--expert-slots 2000` so 64 lanes fit, `--pending-timeout-ms 600000` (the 30 s default expires a third of the queue here); host-bound, so 64 users only queue — TTFT p90 70.2 s |
-| surogate | 1 | 1 / 16 / 64 | 132 / 311 / 313 | 32.0 / 75.3 / 75.7 | 164 / 386 / 389 | 1.06 s / 2.27 s / 37.1 s | the same rows measured earlier the same day on GPU 1 (node 0, x16, **clock-capped at 2,500 MHz**) with the 23:59 binary. The 12 % it reads above the current row is **not** the card: the same binary now gives 66.9 / 66.5 / 65.1 on GPUs 1, 4 and 0 (2.7 % spread, no NUMA-node effect) and 66.5-67.0 across four repeats on GPU 6. That leaves the clock cap itself — a lower ceiling under the same 400 W budget can hold steadier clocks on a bursty workload — which is being retested by re-applying the 2,500 MHz lock to GPU 1 alone |
+| surogate | 1 | 1 / 16 / 64 | 132 / 311 / 313 | 32.0 / 75.3 / 75.7 | 164 / 386 / 389 | 1.06 s / 2.27 s / 37.1 s | the same rows measured earlier the same day on GPU 1 (node 0, x16, **clock-capped at 2,500 MHz**) with the 23:59 binary. The 12 % it reads above the current row is **not** the card: the same binary now gives 66.9 / 66.5 / 65.1 on GPUs 1, 4 and 0 (2.7 % spread, no NUMA-node effect) and 66.5-67.0 across four repeats on GPU 6. The clock cap is ruled out too: re-locking that card to 2,500 MHz gives 66.3 against 69.1 released, so capping *costs* ~4 % as physics expects. Card, node, cap and run-to-run noise are all eliminated; the row is **not reproducible on the current binary** (65.1-69.1 across four cards and six repeats) and is kept only as the historical measurement it was |
 | surogate | 1 | 1 / 16 | 92 / 262 | 20.8 / 58.8 | 113 / 321 | 1.71 s / 3.35 s | **on GPU 7, whose PCIe link trains at x8**: gather 23 GB/s instead of 46, and a third of the throughput. Kept as the cost of the link fault (see Open items) |
 | llama.cpp | 1 | 1 | 29 | 7.1 | 36 | 2.0 s | experts on CPU (`-ot exps=CPU`, 32 threads), 2026-08-28 |
 | llama.cpp | 1 | 16 | 65 | 16.3 | 81 | 29 s |  |
@@ -211,13 +212,14 @@ what the engine does and how the number was arrived at.
   sparse-MoE kernels and the expert slot cache read W8G32 routed experts only,
   so an NVFP4 routed arm (kernel + converter recipe) comes first; then a
   row-parallel decode-width routed kernel.
-- **27B prefill is a serving problem, not a kernel one** (measured 2026-08-30):
-  `ninfer_bench` puts the same binary at **12,707 prompt tok/s** on pp2048 with
-  no scheduler — above vLLM's *served* 11,818 — while we serve 7,339 at 100
-  users. The missing 42 % is in admission and the prefill/decode interleave, not
-  in the GEMMs, so the layer-loop fusion and wider GDN scan that were queued here
-  are demoted. Next step is `SUROGATE_SERVE_ROUND_TIMING=1` on the prefill-heavy
-  shape. See `design/27B_PREFILL.md`.
+- ~~**27B**: prefill at half vLLM's rate~~ **closed 2026-08-30.** Re-measured on
+  the current binary it serves **11,208 prompt tok/s against vLLM's 11,818**
+  (95 %) at a comparable TTFT, and `ninfer_bench` puts the kernels at 12,707 with
+  no scheduler — so there was never a kernel deficit, and round timing shows the
+  executor 97 % occupied in mixed rounds with admission, boundary and append all
+  at 0 ms. The 7,339 the board carried was a 2026-08-27 configuration. The
+  layer-loop fusion and wider GDN scan queued against it are dropped, not
+  deferred. See `design/27B_PREFILL.md`.
 - ~~**Flash-Next, one card**: overlap the miss-gather with the hit-compute~~
   **closed 2026-08-30 without building it.** The Q4 bank is 3.07 MB per expert
   and all 48 layers route, so at a 63 % hit rate the misses are 3.7 experts per
