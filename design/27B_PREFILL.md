@@ -17,7 +17,30 @@ were profiled on 2026-08-27 and neither has been addressed:
    sustains, because the scan runs in chunks sized for decode rather than for a 2k-token
    prompt.
 
-## Lever 1 — fuse the layer loop
+## Measured 2026-08-30 09:12: it is not a kernel problem
+
+`ninfer_bench` runs the same engine with no server, no scheduler and no concurrency:
+
+| shape | 27B kernels | 27B served @100 users | vLLM served @100 users |
+|---|---:|---:|---:|
+| pp512 | 13,108 t/s | — | — |
+| **pp2048** | **12,707 t/s** | **7,339 t/s** | 11,818 t/s |
+| 35B pp2048 (for scale) | 18,291 t/s | — | — |
+
+**Our prefill kernels are faster than vLLM's served rate.** The served number is 58 % of what
+the same binary does on the same card without a scheduler, so the 42 % that goes missing is in
+serving, not in the kernels — and the two levers below, both kernel work, would have been the
+wrong thing to build. They stay documented but demoted.
+
+Where to look instead, in order: admission and the prefill/decode interleave at 100 users with
+2,048-token prompts (a prompt that long spans several chunks, and each chunk rides a mixed
+round that also carries decode rows); KV materialisation per chunk; and the chunk ladder
+(`--max-num-batched-tokens 4096` against a 2,048-token prompt means one chunk, so the graph
+bucket ladder may be capturing or falling back per prompt). `SUROGATE_SERVE_ROUND_TIMING=1`
+splits a served round into boundary / admit / mixed / decode / preview / resolve / append, which
+is the next measurement.
+
+## Lever 1 — fuse the layer loop (demoted: the kernels are not the limit)
 
 Collapse the per-layer launch sequence so a prompt chunk walks the layers with fewer, larger
 kernels: the prologue (norm + projections) and the mixer already have their own launches, and
@@ -34,7 +57,7 @@ the gaps between them dominate the 18 %. Candidates, cheapest first:
 versus gaps. The 18 % figure is from 2026-08-27, before the graph-switch fix and the current
 artifact; it may have moved.
 
-## Lever 2 — widen the GDN chunked scan
+## Lever 2 — widen the GDN chunked scan (demoted for the same reason)
 
 The scan's chunk width is chosen for decode. At 2,048-token prompts the same kernel moves
 145 MB per layer at 641 GB/s; a wider chunk amortises the state loads across more columns.

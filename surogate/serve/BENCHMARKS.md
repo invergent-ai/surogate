@@ -211,8 +211,13 @@ what the engine does and how the number was arrived at.
   sparse-MoE kernels and the expert slot cache read W8G32 routed experts only,
   so an NVFP4 routed arm (kernel + converter recipe) comes first; then a
   row-parallel decode-width routed kernel.
-- **27B**: prefill at half vLLM's rate on the prefill-heavy shape (layer-loop
-  fusion, a wider GDN chunked scan).
+- **27B prefill is a serving problem, not a kernel one** (measured 2026-08-30):
+  `ninfer_bench` puts the same binary at **12,707 prompt tok/s** on pp2048 with
+  no scheduler — above vLLM's *served* 11,818 — while we serve 7,339 at 100
+  users. The missing 42 % is in admission and the prefill/decode interleave, not
+  in the GEMMs, so the layer-loop fusion and wider GDN scan that were queued here
+  are demoted. Next step is `SUROGATE_SERVE_ROUND_TIMING=1` on the prefill-heavy
+  shape. See `design/27B_PREFILL.md`.
 - ~~**Flash-Next, one card**: overlap the miss-gather with the hit-compute~~
   **closed 2026-08-30 without building it.** The Q4 bank is 3.07 MB per expert
   and all 48 layers route, so at a 63 % hit rate the misses are 3.7 experts per
