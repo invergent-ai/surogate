@@ -2267,3 +2267,40 @@ repeat spread is 0.6 %, so that explanation was wrong. The two runs differ in ca
 node 0 versus GPU 6 on node 1) and in binary (23:59 versus 05:04), and a same-binary comparison
 across GPU 1, GPU 4 and GPU 0 is queued to say which. Until it lands the board should not claim
 either.
+
+### Single-user rows re-measured, and NVFP4 Phase 1 groundwork (2026-08-30 10:30)
+
+**Single-user.** The board's dagger rows were the 2026-08-26 pass on GPU 2 with bf16 KV — a
+different card, binary and KV format from everything above them. Re-measured at a ~1,900-token
+prompt, 128 out, uncapped, fp8 KV, pairs in the same batch:
+
+| model | decode tok/s | TTFT | prompt processing † | was (08-26) |
+|---|---:|---:|---:|---|
+| 0.8B | **673** | **20 ms** | 95,000 | 503 / 48 ms / 39,600 |
+| 0.8B vLLM | 498 | 50 ms | 38,000 | 364 / 55 ms / 34,500 |
+| 4B | **204** | **30 ms** | 63,300 | 214 / 57 ms / 33,300 |
+| 27B | **70.8** | **170 ms** | 11,200 | 45 / 352 ms / 5,400 |
+
+Decode is up everywhere except the 4B, which is flat within noise while its TTFT halves; prompt
+processing is 1.9-2.4x across the board. The llama.cpp dagger rows are untouched and stay
+labelled 08-26 — closing that needs one `llama-server` run per model, which is filed rather
+than done.
+
+A runner bug worth remembering: `row2.sh` appended its own `--max-model-len 2048` after the
+caller's arguments, so a 4,096 request silently became 2,048 and a 1,900-token prompt plus 128
+output overflowed. vLLM answered 13,212 requests with 400s while the probe counted 10,573
+errors and reported 0 tok/s — a failure that looks like a dead engine but is a duplicated flag.
+
+**NVFP4 Phase 1.** `Nvfp4Codec` is written against the dense path's decode atoms and compiles
+into both the decode and prefill translation units. Two things came out of writing it:
+
+- The packed-codec loop hardcoded eight lanes per group, which is `kGroupK == 64`. It now
+  derives lanes and groups-per-warp-step from `kGroupK`, giving identical arithmetic for Q5/Q6
+  and correct indexing for NVFP4's 16-wide groups. **The sparse-MoE oracle test passes
+  unchanged**, which is the evidence that the generalisation is behaviour-preserving.
+- The first build failed on a missing include, and the harness happily ran the *previous* test
+  binary and printed OK. Build failures have to be read before test results are believed.
+
+Not done, and the commit says so: no kernel instantiates the codec, and the test has no NVFP4
+profile. Phase 1 is groundwork plus a proof that the existing arms are intact, not a serving
+capability.
