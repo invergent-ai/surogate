@@ -45,6 +45,19 @@ Every artifact decodes bit-exact against its source before a number is
 recorded, and every surogate row is probed for correctness **at** its
 concurrency.
 
+**Reading prefill and decode on the non-balanced shapes.** Both columns are
+token counts divided by the same run wall time, so the shape fixes their
+ratio: on prefill-heavy 2048/16 every completed request contributes 2,048
+prompt tokens and 16 generated tokens, and decode tok/s is always prefill
+tok/s ÷ 128 (0.8B: 81,376 / 636; 27B: 7,339 / 57 — the same 128 for vLLM).
+That decode figure is completions per second × 16, not a decode speed: the
+engine spends the run processing prompts and the 16-token tail is the small
+share left over. On that shape the number to read is prefill (prompt
+processing at 100 users) and TTFT (the queue for it); per-stream decode speed
+is what the 512/128 and the decode-heavy 128/512 rows measure, where the
+pinned ratio runs the other way (prefill = decode ÷ 4). Never compare a
+column across shapes.
+
 ## Board of record (2026-08-30)
 
 One table per model, the same columns throughout.
