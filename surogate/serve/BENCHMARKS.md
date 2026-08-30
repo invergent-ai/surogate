@@ -93,7 +93,7 @@ them.
 |---|---:|---:|---:|---:|---:|---:|---|
 | **surogate** | 1 | 100 | **46,225** | **11,166** | **57,391** | **20 ms** | GGUF Q4_K_M repack, 128 lanes, `--max-model-len 2048`, 8 client shards; 2026-08-30 07:08, uncapped GPU 0 |
 | vLLM | 1 | 100 | 29,122 | 7,009 | 36,131 | 0.69 s | NVFP4 (`surogate/Qwen3.5-0.8B-NVFP4`), `--max-model-len 2048`; same batch, uncapped GPU 1. surogate **+59 % decode, 34× TTFT** |
-| surogate | 1 | 100 | 27,222 | 6,577 | 33,799 | 40 ms | **the context lever, measured against itself**: the same configuration with `--max-model-len` left at auto (262,144 → a 4.25 M-token KV cache the shape never touches) reads 6,577 against 7,785 for the capped-clock run with 2048 — **−16 %**. Both halves are clock-capped, so read the ratio, not the rates || **surogate** | 1 | 100 | **81,376** | 636 | 82,012 | 2.39 s | prefill-heavy 2048/16 (2026-08-27, GPU4) |
+| **surogate** | 1 | 100 | **81,376** | 636 | 82,012 | 2.39 s | prefill-heavy 2048/16 (2026-08-27, GPU4) |
 | vLLM | 1 | 100 | 45,106 | 352 | 45,458 | 3.88 s | prefill-heavy, same card |
 | **surogate** | 1 | 1 | **95,000 †** | **673** | — | **20 ms** | 2026-08-30 10:16, uncapped GPU 0, fp8 KV, ~1,900-token prompt |
 | vLLM | 1 | 1 | 38,000 † | 498 | — | 50 ms | same batch, uncapped GPU 1. surogate **+35 % decode, 2.5× TTFT** |
@@ -137,9 +137,8 @@ them.
 | surogate | 1 | 16 | 4,300 | 1,040 | 5,339 | 0.10 s | groupwise-int at 16 users, the pair for the row above (**+35.5 % decode**) |
 | **surogate** | 1 | 1 | **1,307** | **316.2** | **1,623** | **0.03 s** | routed NVFP4, one user: every decode round is a single token and stays on our own kernels, so this is the weight format alone |
 | surogate | 1 | 1 | 1,272 | 307.8 | 1,580 | 0.04 s | groupwise-int at one user, the pair for the row above (+2.7 % decode) |
-| surogate | 1 | 100 | 8,209 | 1,984 | 10,193 | 0.32 s | Q4/Q5/Q6 MoE from GGUF, 128 lanes, chunk 4,096, prefill batch 4, `--max-model-len 2048`; 2026-08-30 07:14, uncapped GPU 4. Reproduces the 08-28 pre-cap pass (1,942). **Superseded as the reference by the routed-NVFP4 rows at the top of this table**; kept because the vLLM row below is its same-batch pair |
-| vLLM | 1 | 100 | 8,946 | **2,162** | 11,108 | 3.17 s | `RedHatAI/Qwen3.6-35B-A3B-NVFP4`, `--max-num-seqs 128`; 2026-08-30 07:14, uncapped GPU 5, same batch as the row above. Against *that* row surogate was at 92 % of decode with 10× the TTFT; against the current reference at the top of this table it is **−17 % decode at 35× the TTFT** |
-| surogate | 1 | 100 | 5,780 | 1,394 | 7,174 | 0.35 s | **the thinking lever, measured against itself**: the same configuration with `--no-thinking` reads 1,394 against 1,919 with thinking on — **−27 % decode**. On this MoE the generated text changes the expert spread per round, so the thinking mode is part of the configuration; the dense 27B shows no such gap. Both halves are clock-capped, so read the ratio, not the rates || surogate | 8 | 100 | 8,785 | 2,123 | 10,908 | 0.58 s | 8-stage pipeline, C3 + asynchronous prompt flights, `--max-model-len 2048`; 2026-08-30 08:25, uncapped. **On the groupwise-int artifact**, where it beat the one card (1,984). It now sits 19 % *below* the one-card routed-NVFP4 row above; whether eight stages still gain on the new artifact is unmeasured — see Open items |
+| vLLM | 1 | 100 | 8,946 | 2,162 | 11,108 | 3.17 s | `RedHatAI/Qwen3.6-35B-A3B-NVFP4` — the same checkpoint our routed experts are read from — `--max-num-seqs 128`; 2026-08-30 07:14, uncapped GPU 5. Against the reference at the top of this table: **−17 % decode, −17 % prefill, 35× the TTFT** |
+| surogate | 8 | 100 | 8,785 | 2,123 | 10,908 | 0.58 s | 8-stage pipeline, C3 + asynchronous prompt flights, `--max-model-len 2048`; 2026-08-30 08:25, uncapped. **On the groupwise-int artifact**, where it beat the one card (1,984). It now sits 19 % *below* the one-card routed-NVFP4 row above; whether eight stages still gain on the new artifact is unmeasured — see Open items |
 | **surogate** | 8 | 1 | **965** | **233.4** | **1,198** | **0.09 s** | same, one user: 3 B active split eight ways puts a token at ~0.9 ms |
 
 ### Qwen3.8-Flash-Next (111 GB MoE; on one card the experts live on the host)
@@ -220,10 +219,13 @@ them.
   The detour that found it — binaries, flags, client shards, graph updates, all
   ruled out — is in INFERENCE.md.
 - **Three configuration levers worth as much as a kernel change.** Capping the
-  context to the workload (`--max-model-len 2048`) is worth 16 % on the 0.8B,
-  because auto sizes a 4.25 M-token KV cache the shape never touches. On the 35B
-  MoE, `--no-thinking` costs 27 % of decode, since the generated text changes the
-  expert spread per round. And on the host-offloaded model, in-engine NUMA
+  context to the workload (`--max-model-len 2048`) is worth **16 % on the 0.8B** —
+  7,785 against 6,577 tok/s at 100 users, measured against itself in one
+  clock-capped session, so read the ratio and not the rates — because auto sizes a
+  4.25 M-token KV cache the shape never touches. On the 35B
+  MoE, `--no-thinking` costs **27 % of decode** — 1,394 against 1,919 tok/s at 100
+  users, measured against itself in one clock-capped session, so read the ratio and
+  not the rates — since the generated text changes the expert spread per round. And on the host-offloaded model, in-engine NUMA
   placement is worth 3 % (`SUROGATE_SERVE_NUMA`, default `auto`: the shared expert
   bank interleaved, the per-device staging bound to that device's node — which
   also makes the launcher's `numactl --interleave=all` redundant, measured at
