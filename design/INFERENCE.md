@@ -2169,3 +2169,30 @@ here all along: **`csrc/build-serve/serve_bench/ninfer_bench`** — a llama-benc
 harness over the engine (load, warm-up and five repetitions of pp512+tg128 on the 0.8B in
 3.4 s). Engine-level questions (flags, binaries, cards, kernels) belong there; the server and
 probe are only for what needs the scheduler: concurrency, TTFT, admission.
+
+### Queued: overlap the expert miss-gather with the hit-compute (2026-08-30)
+
+One-card Flash-Next serialises every round: `expert_slot_resolve` marks the misses,
+`expert_slot_gather` pulls them over PCIe into the slot pool, and only then do the expert
+kernels run — all on one stream, so the transfer is dead time. The experts that hit are
+already resident and could compute while the misses land; the slot table distinguishes them
+already (it returns -1 for a path served elsewhere, which is how the host split works).
+
+`study/flash-moe` — a Metal engine streaming a 397B MoE from SSD on an M3 Max — arrives at
+the same structure from the I/O side and rules out the tempting alternative: you cannot
+prefetch layer N+1's experts, because its routing depends on layer N's output. Its plan doc
+lands on overlapping the fetch with the same layer's compute, which is exactly the shape
+above.
+
+**Measure before building**: instrument a Flash-Next round into gather and compute time. At
+the observed 63 % hit rate the gather is order 10 MB per layer (≈0.2 ms at 46 GB/s, ~10 ms of
+a ~35 ms token), so the ceiling is around a third of the round — but that estimate assumes
+the gather is never already overlapped with the host split's side stream, which it may partly
+be. If the instrumented share is small the item dies there.
+
+Two other notes from that study, recorded so they are not re-derived: its "trust the OS page
+cache" result (every custom cache lost to the kernel's) does not apply to our pinned-RAM bank,
+but it does apply to any future SSD-backed tier; and its 2-bit experts broke JSON and tool
+calling, which argues against dropping the host bank below 4 bits. Its 397B at 4-bit is ~200 GB
+and would fit this box's 503 GB of host RAM outright, so that tier is more of what Flash-Next
+already does rather than a new streaming engine — with its 4.4 tok/s as the bar.

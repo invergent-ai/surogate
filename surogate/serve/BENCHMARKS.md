@@ -195,5 +195,19 @@ what the engine does and how the number was arrived at.
   row-parallel decode-width routed kernel.
 - **27B**: prefill at half vLLM's rate on the prefill-heavy shape (layer-loop
   fusion, a wider GDN chunked scan).
+- **Flash-Next, one card**: overlap the miss-gather with the hit-compute. The
+  round serialises `expert_slot_resolve` → `expert_slot_gather` → expert
+  kernels on one stream, so the PCIe transfer is dead time, while the slot
+  table already separates resident experts from the rest. Measure the split of
+  a round into gather and compute first — at the observed 63 % hit rate the
+  gather is order 10 MB per layer, which is worth chasing only if it is a
+  third of the round rather than a twentieth. (`study/flash-moe` reaches the
+  same structure from the SSD side and lands on the same answer: prefetching a
+  layer ahead is impossible because routing for layer N+1 does not exist yet.)
+- **Hardware**: GPUs 2, 3, 5 and 7 train their PCIe links at x8 although both
+  ends advertise x16 — a physical path issue, not bifurcation. It costs the
+  host-offloaded model half its gather bandwidth (23 vs 46 GB/s) and about a
+  third of its throughput; VRAM-resident models are unaffected. Until it is
+  fixed, single-card Flash-Next rows belong on GPU 0, 1, 4 or 6.
 - Record the card with every number; re-measure single-user cells on the
   same card as the 100-user rows.
