@@ -2222,6 +2222,21 @@ Worth keeping from the exercise: the per-expert byte figure and the fact that th
 is doing double duty — it is not only extra compute capacity, it is also what keeps three
 quarters of the miss traffic off PCIe.
 
+**Measured afterwards, and it buries the item completely (09:10).** The 63 % hit rate above
+came from a one-user run in an earlier session. `SUROGATE_SERVE_EXPERT_STATS=200` at **16
+users** reports a cumulative **miss share of 2.1 %** — the 3,000-slot pool holds only 12 % of
+the 24,576 expert-layer pairs, but routing at concurrency is concentrated enough that it
+almost always hits. Redoing the arithmetic with the measured number: 0.21 misses per layer, of
+which the split sends 80 % to the host, leaves **0.042 experts gathered per layer = 6.2 MB per
+token = 0.13 ms at 46 GB/s**. The overlap would hide a tenth of a percent.
+
+**And it questions the board's framing.** At 16 users only **1.7 % of expert paths** are
+computed on the CPU, so the host split cannot be what limits that row — "Flash-Next on one card
+is host-bound" is true at one user (where misses are frequent) and false at concurrency, where
+the cost is the routed kernel reading the resident pool plus attention and GDN, exactly like
+any other MoE. The one-card rows should be read that way: single-user is a PCIe/host story,
+16-plus users is a GPU story.
+
 ### NUMA placement: measured, +3 %, and it retires the wrapper's numactl (2026-08-30 09:05)
 
 Six arms on GPU 6 (x16, uncapped), Flash-Next at 16 users, 512/128, one at a time on an idle

@@ -164,9 +164,13 @@ what the engine does and how the number was arrived at.
   the one model still on a non-NVFP4 routed artifact and the one behind vLLM.
 - **Lanes are 128** where the model fits them; with 100 users and 64 lanes a
   third of the load queued for a lane and that queue was the TTFT.
-- **Flash-Next on one card** is host-bound: the Q4 bank halves the host bytes
-  per expert, the CPU split at its measured share and the scan-resistant slot
-  ring carry 16 users to 66.9 tok/s (median 66.7 over four runs, spread 0.6 %),
+- **Flash-Next on one card is host-bound at one user and GPU-bound above it.**
+  Measured at 16 users, the expert cache misses on only **2.1 %** of lookups and
+  just **1.7 % of paths reach the CPU**, so the split and the PCIe gather cannot
+  be what limits that row — the routed kernel over the resident pool is. At one
+  user misses are frequent and the host path does set the pace, which is where
+  the Q4 bank's halving of host bytes paid. The slot ring and the split carry
+  16 users to 66.9 tok/s (median 66.7 over four runs, spread 0.6 %),
   and 64 users add queueing rather than throughput (73.8 tok/s at a 40 s TTFT).
   The card's PCIe link width moves that number as much as any engine change —
   x8 costs a third — and in-engine NUMA placement is worth +3 %. **Eight cards**
