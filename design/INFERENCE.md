@@ -2587,9 +2587,9 @@ Paired back-to-back on GPU 1, same session and flags, `probe/board.py … 512 12
 
 | users | routed NVFP4 + runner | groupwise-int (shipped) | delta |
 |---:|---|---|---|
-| 100 | 10,733 pp / **2,594** tg / 0.09 s | 7,806 / 1,887 / 0.12 s | **+38 % / +37 %** |
-| 16 | 4,818 / **1,165** / 0.07 s | 4,397 / 1,063 / 0.10 s | +10 % / +10 % |
-| 1 | 1,308 / **316.5** / 0.03 s | 1,275 / 308.4 / 0.04 s | +2.6 % / +2.6 % |
+| 100 | 10,817 pp / **2,614** tg / 0.09 s | 7,806 / 1,887 / 0.12 s | **+39 % / +39 %** |
+| 16 | 5,848 / **1,413** / 0.07 s | 4,397 / 1,063 / 0.10 s | **+33 % / +33 %** |
+| 1 | 1,306 / **315.9** / 0.03 s | 1,275 / 308.4 / 0.04 s | +2.4 % / +2.4 % |
 
 Against vLLM's own board row on this hardware — 8,946 / 2,162 / 3.17 s — that is **+20 % decode
 with a TTFT 35× lower**, and it beats the 2,160-2,300 the costing predicted. The estimate was
@@ -2600,8 +2600,13 @@ The first version routed *every* width through the runner and cost 47 % of singl
 `ninfer_bench pp512+tg128` read 19,061 pp / 182 tg against the baseline's 13,398 / 347. The
 runner builds a permutation, expert offsets and a grouped problem list before it computes
 anything, and at eight expert rows that scaffolding is the whole round. Splitting at
-`kSparseMoeTrtllmMinTokens` (47, `SUROGATE_SERVE_MOE_TRTLLM_MIN` overrides it) gives 19,074 pp /
-347.5 tg — the runner's prefill and our own decode, both. What made the split possible is that
+`kSparseMoeTrtllmMinTokens` (`SUROGATE_SERVE_MOE_TRTLLM_MIN` overrides it) gives 19,024 pp /
+347.0 tg — the runner's prefill and our own decode, both. The crossover was then swept at 2, 4,
+8, 16 and 47: everything from 2 to 16 measures the same (16 users, decode tok/s: 1,413 / 1,410 /
+1,413 / 1,408) and 47 gives up **21 %**, because a 16-user decode round is 16 columns wide and
+never reaches it. So the batch kernel is worth taking at *two* tokens; only the single-token
+round is worth keeping. The default is 2, and the 47 that seemed obvious was the expensive
+guess. What made the split possible is that
 the row order is a property of the codec, not of the kernel: `Nvfp4CodecFor::kGateRowsFirst` is
 false and the two routed sites in the decode body bind their halves through it, so our kernels
 read the runner's `[up; gate]` artifact at no cost. A negative control confirms the test sees

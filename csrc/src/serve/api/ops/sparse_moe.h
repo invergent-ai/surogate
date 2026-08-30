@@ -84,9 +84,13 @@ struct SparseMoeWeights {
 [[nodiscard]] SparseMoeGeometry sparse_moe_geometry(const SparseMoeWeights& weights);
 
 /// The narrowest round the routed-NVFP4 profile serves through the vendored TRT-LLM runner;
-/// below it the round stays on our own kernels. Overridable at runtime with
-/// `SUROGATE_SERVE_MOE_TRTLLM_MIN` so the crossover can be re-measured.
-inline constexpr std::int32_t kSparseMoeTrtllmMinTokens = 47;
+/// below it the round stays on our own kernels. Only a single-token round is below it: swept at
+/// 2, 4, 8, 16 and 47 on the 35B, everything from 2 to 16 measured the same (16 users:
+/// 1,413 / 1,410 / 1,413 / 1,408 decode tok/s) and 47 gave up 21 % because a 16-user decode
+/// round is 16 columns wide and fell short of it. At one token the runner's permute-group-reduce
+/// scaffolding is the whole round and costs about half the throughput, so that width stays ours.
+/// `SUROGATE_SERVE_MOE_TRTLLM_MIN` overrides it, so the crossover can be re-measured.
+inline constexpr std::int32_t kSparseMoeTrtllmMinTokens = 2;
 
 /// The widest round `sparse_moe` hands the routed-NVFP4 runner in one call, and therefore the
 /// width `sparse_moe_prepare` has to tune up to.

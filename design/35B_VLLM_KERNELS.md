@@ -108,9 +108,9 @@ theirs. Expected outcome on the 35B at 100 users: 1,984 → 2,160-2,300.
 
 ## Outcome (2026-08-30, same day)
 
-(b) shipped and beat its own estimate: **2,594 tok/s** at 100 users against the predicted
-2,160-2,300, +37 % over the groupwise-int pair measured back-to-back and +20 % over vLLM's row,
-with TTFT 0.09 s against their 3.17 s. Prefill 10,733 against 7,806. The three surprises worth
+(b) shipped and beat its own estimate: **2,614 tok/s** at 100 users against the predicted
+2,160-2,300, +39 % over the groupwise-int pair measured back-to-back and +21 % over vLLM's row,
+with TTFT 0.09 s against their 3.17 s. Prefill 10,817 against 7,806. At 16 users, +33 %. The three surprises worth
 carrying forward:
 
 - **The build fought us in one specific way.** The vendored launcher is written against cutlass
@@ -119,8 +119,10 @@ carrying forward:
   is also wider than the sources suggest — TRT-LLM's error/logging/formatting runtime, its
   DeepSeek block-scale GEMM and its LoRA hook are all needed at link even though the routed-NVFP4
   profile takes none of those paths.
-- **The runner is a batch kernel and must not serve narrow rounds.** All-widths routing cost 47 %
-  of single-user decode. The crossover is 47 tokens and is a measured constant.
+- **The runner is a batch kernel, but "narrow" means exactly one token.** All-widths routing
+  cost 47 % of single-user decode, which looked like a case for a wide crossover; the sweep says
+  otherwise. Two tokens is already enough for the runner to win, and the plausible-sounding 47
+  gives up 21 % at 16 users.
 - **The ceiling was not parity.** Their kernel plus our scheduler plus a per-expert activation
   scale (which vLLM collapses to a single global minimum) is worth more than their kernel alone.
 
