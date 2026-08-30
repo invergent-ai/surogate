@@ -111,8 +111,8 @@ them.
 | vLLM | 1 | 100 | 5,003 | 1,120 | 6,123 | 8.06 s | `sakamakismile/Qwen3.8-27B-MTP-NVFP4`, `--max-num-seqs 128`; 2026-08-30 07:28, uncapped GPU 3, idle host. surogate **+16 % decode, 47× TTFT** |
 | surogate | 8 | 100 | 4,403 | 986 | 5,389 | 1.33 s | 8-stage pipeline, C3 + asynchronous prompt flights, `--max-model-len 2048`; 2026-08-30 08:18, uncapped. **Below the one card above** — the pipeline buys capacity, not throughput per card |
 | **surogate** | 8 | 1 | **306** | **68.6** | **374** | **0.16 s** | same, one user: each card holds 6 layers, so a token costs ~0.9 ms across the eight stages against ~5 ms on one card |
-| **surogate** | 1 | 100 | 471 | **1,884** | 2,355 | **14.2 s** | decode-heavy 128/512, 64 lanes (GPU5) |
-| vLLM | 1 | 100 | 360 | 1,438 | 1,798 | 21.9 s | decode-heavy, same card |
+| **surogate** | 1 | 100 | 768 | **2,097** | **2,865** | **13.7 s** | decode-heavy 128/512, 64 lanes, `--max-model-len 1024 --max-pending-requests 512`; 2026-08-30 19:32, GPU 4, launched and probed concurrently with the row below. Replaces an undated pass that read 1,884. The pending queue is not optional here — 100 users against 64 lanes rejects with 429 on the default |
+| vLLM | 1 | 100 | 608 | 1,662 | 2,270 | 21.8 s | decode-heavy, GPU 5, same session. surogate **+26 % decode at 0.6× the TTFT** |
 | surogate | 1 | 100 | 11,557 | 87.8 | 11,645 | 15.38 s | prefill-heavy 2048/16, chunk 4,096, `--max-model-len 2304`, 128 lanes; 2026-08-30 18:57, GPU 1, same session as the vLLM row below. **89 % of vLLM's prefill** — and the shape is insensitive to the two obvious knobs: KV/admission moves it 1.5 % (context 4,096 → 2,304, 11,389 → 11,557) and the prompt chunk not at all (2,048 fails on KV entitlement; 8,192 reads 11,553 and 16,384 reads 11,538) |
 | **vLLM** | 1 | 100 | **12,942** | 98.3 | **13,040** | **13.81 s** | prefill-heavy, same card and session; `--max-model-len 4096 --max-num-seqs 128`, and it ran with **less** KV than we did (66,901 tokens against our 104,384), so admission is not what separates them. Replaces a 2026-08-27 pass that read 11,818 |
 | **surogate** | 1 | 1 | **11,200 †** | **70.8** | — | **170 ms** | 2026-08-30 10:21, uncapped GPU 0, fp8 KV, ~1,900-token prompt. Beats the 08-26 pass it replaces (45 tok/s at 352 ms) on both axes |
@@ -266,10 +266,17 @@ them.
   borrowed kernel may have removed the reason to spread the model at all — the
   measurement is one server launch and one probe, and until it is run the "MoE
   gains from a pipeline" claim stands only for the old artifact.
-- **Two rows were taken at 62 s and the rest at 76-90 s.** The window is inside the
+- **Two rows were taken at 62 s and the rest at 76-97 s.** The window is inside the
   band the Method names, but an early pass measured a shorter window reading up to
   25 % high, and that sensitivity has never been re-checked on the current binary.
   One 90 s repeat of the 35B reference against its 62 s reading settles it.
+- **Agent-shaped traffic is not measured at all.** Every row here salts its prompts so
+  nothing shares a prefix, which is the worst case for prompt processing and the
+  opposite of a harness re-sending a growing conversation behind a fixed system prompt
+  and tool definitions. `probe/agentloop.py` drives that shape, but its first run could
+  not separate prefix reuse on from off — the conversation grew only 4.5k → 5.5k tokens,
+  so the difference sat inside TTFT overhead. It needs a prompt that grows several-fold
+  before it says anything.
 - Otherwise **every row on this board is from 2026-08-30**, on the same binary and on
   cards with no clock cap. (A boot service capped per-card SM clocks between
   2026-08-29 09:34 and 2026-08-30 07:07 — invisible to `clocks.max.sm`, worth 1,519
