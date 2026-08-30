@@ -2678,3 +2678,55 @@ separate, real lever (~3×) if the CPU path is ever wanted for prefill again.
 Confirmation battery (throughput at three shapes plus coherence, chunkcount and longprompt under
 the new flags) and the llama.cpp multi-user and 8-card axes are queued; board rows follow it.
 
+### The fix confirmed end to end, and the two probe misses are the model, not the config
+
+The confirmation battery (two servers, since 32k-context x 16 lanes of KV plus the slot pool do
+not fit one card beside the runtime reservation — the first attempt died on exactly that):
+one card, prefill split off, chunk 8,192 —
+
+| shape | result |
+|---|---|
+| 1 user, 28k prompt | **3,966** prompt tok/s (TTFT 7.06 s) |
+| 1 user, 512/128 | decode **32.0** (was 28.4), TTFT 0.85 s |
+| 16 users, 512/128 | decode **91.1** (was 67.1) |
+| 64 users, 512/128 | decode **110.1** (old row 73.8) |
+| coherence @16u | 24/24 |
+
+The balanced shapes gain because the prompt half of every mixed round shrinks. After the
+rebuild, the *default* flags reproduce 3,949 tok/s with coherence 16/16 — the fix carries the
+number without any flag.
+
+The battery's two probe misses (one wrong recall code, one "Blue" to a counting prompt) forced a
+three-arm experiment before any of this could be believed: chunk 8,192 with prefix reuse, the
+same with `--no-prefix-reuse`, and the old chunk 1,024 — 88 probes each. Every arm shows the
+same ~1-2 % miss rate, including the no-reuse arm (whose one miss was a wrong code — with no
+prefix cache to leak through) and the old default. It is the model's base rate at 4.5 bpw, not
+cross-lane contamination and not the new configuration.
+
+Two more instrument notes for the file: the auto CPU-split's startup bandwidth measurement is
+not concurrency-safe — three servers starting together each measured the host at 12-15 GB/s
+instead of 138 and picked 30 % decode shares — and an 8-stage pipeline hates giant chunks
+(chunk 8,192 read 208-296 decode at 16-64 users against the old rows' 276-392; one huge chunk
+starves the stages of in-flight work; the 1,024/2,048 pair is being re-measured).
+
+### Goal closed: llama.cpp beaten on every Flash-Next axis
+
+Same host, same weights, llama.cpp on its best flags (`-cmoe -b 4096 -ub 4096`, per-concurrency
+`-np`), surogate on `b4ee3216` defaults plus the chunk noted:
+
+| axis | surogate | llama.cpp | margin |
+|---|---|---|---|
+| 1 GPU, 1 user, decode | 32.0 (512/128), 40.8 after 28k | 20.8 / 27.3 | +54 % / +49 % |
+| 1 GPU, 1 user, ingestion | 3,966 tok/s @28k | 1,216 | 3.3× |
+| 1 GPU, 16 users | 91.1 | 56.8 | +60 %, 9× lower TTFT |
+| 1 GPU, 64 users | 110.1 | 10.4 (TTFT 655 s) | 10.6× |
+| 8 GPU, 1 / 16 / 64 users | 43.3 / 272.3 / 405.2 | 39.3 / 39.1 / 24.7 | +10 % / 7× / 16× |
+
+llama.cpp's 64-user collapse is structural, not a mis-launch: with `-cmoe` the experts compute on
+the CPU, 64 concurrent decodes serialise on it, and the queue becomes the run (64 completions in
+789 s, one per user). The 8-card chunk question resolved the other way from one card: a pipeline
+wants small chunks (272/405 at 1,024 against 208/296 at 8,192 for 16/64 users) because in-flight
+chunks are what fill eight stages. GGUF warm-up note for anyone re-measuring: the pinned banks
+evict the page cache, and a cold llama.cpp load then outruns a 20-minute ready window; one
+sequential `cat` of the shards (33 s) fixes it.
+

@@ -135,21 +135,28 @@ them.
 
 ### Qwen3.8-Flash-Next (111 GB MoE; on one card the experts live on the host)
 
+All surogate rows: 2026-08-30 22:xx, the `b4ee3216` binary (CPU prefill split off by default —
+its removal is the night's +38 % to +64 %), fp8 KV, x16 cards. llama.cpp rows: `-cmoe
+-b 4096 -ub 4096`, the flags its own community benchmarks use — the earlier `-ot exps=CPU` rows
+without batch flags understated it 3.9× and are gone.
+
 | engine | GPUs | users | prefill tok/s | decode tok/s | throughput tok/s | TTFT p50 | comments |
 |---|---:|---:|---:|---:|---:|---:|---|
-| **surogate** | 1 | 1 | 128 | **28.7** | 156 | **1.36 s** | experts on the host: Q4G32AM bank (pinned, 91 GB), 3,000-slot expert cache, CPU split auto; 2026-08-30 07:55, uncapped GPU 6 (**x16 link**, gather 46 GB/s) |
-| **surogate** | 1 | 16 | **298** | **66.9** | **365** | **2.62 s** | same, 81 % / 51 % measured shares; TTFT p90 14.7 s |
-| surogate | 1 | 64 | 329 | 73.8 | 403 | 40.5 s | `--expert-slots 2000` so 64 lanes fit, `--pending-timeout-ms 600000` (the 30 s default expires a third of the queue here); host-bound, so 64 users only queue — TTFT p90 70.2 s |
-| surogate | 1 | 1 / 16 | 92 / 262 | 20.8 / 58.8 | 113 / 321 | 1.71 s / 3.35 s | **on GPU 7, whose PCIe link trains at x8**: gather 23 GB/s instead of 46, and a third of the throughput. Kept as the cost of the link fault (see Open items) |
-| llama.cpp | 1 | 1 | 29 | 7.1 | 36 | 2.0 s | experts on CPU (`-ot exps=CPU`, 32 threads), 2026-08-28 |
-| llama.cpp | 1 | 16 | 65 | 16.3 | 81 | 29 s |  |
-| ik_llama.cpp | 1 | 1 | 87 | 21.8 | 109 | 1.8 s | AVX-512 iqk CPU-MoE kernels |
+| **surogate** | 1 | 1 | **143** | **32.0** | **175** | **0.85 s** | chunk 8,192, `--expert-slots 3000 --host-expert-bank q4 --cpu-moe-share auto`; decode split auto (70 % of misses), prefill split off. Correctness at this config: coherence 24/24 under 16 users, and the ~1-2 % chunkcount/longprompt miss rate is the model's base rate — present identically with `--no-prefix-reuse` and at the old chunk (three arms × 88 probes) |
+| llama.cpp | 1 | 1 | 93 | 20.8 | 114 | 2.95 s | same GGUF the artifact repacks. surogate **+54 % decode, 3.5× the prompt rate** |
+| **surogate** | 1 | 1 | — | **40.8** | — | **7.06 s** | 28k prompt into 131k context (23.1 GiB VRAM): **3,966 tok/s prompt processing**; decode is the post-28k stream rate |
+| llama.cpp | 1 | 1 | — | 27.3 | — | 23.02 s | 28k prompt, 80k context: 1,216 tok/s prompt processing. surogate **3.3× ingestion, +49 % decode** |
+| cafe-llama.cpp `-hmoe` | 1 | 1 | — | 18.8 / 4.3 | — | 3.55 s / 25.46 s | 512 and 28k prompts. Experts pinned in host memory, computed on the GPU over PCIe — **our architecture in their engine** (935-1,100 tok/s at 28k); kept as the like-for-like reference |
+| **surogate** | 1 | 16 | **406** | **91.1** | **497** | **1.75 s** | same config; the old 66.9 row was the prefill split's tax on every mixed round |
+| llama.cpp | 1 | 16 | 253 | 56.8 | 310 | 16.17 s | `-np 16`. surogate **+60 % decode at 9× lower TTFT** |
+| **surogate** | 1 | 64 | **491** | **110.1** | **601** | **6.17 s** | `--expert-slots 2000` so 64 lanes fit; old row 73.8 |
+| llama.cpp | 1 | 64 | 46 | 10.4 | 56 | 655 s | `-np 64`: CPU expert compute serialises across 64 decodes and the queue is the run — every request ~13 min. surogate **10.6×** |
+| ik_llama.cpp | 1 | 1 | 87 | 21.8 | 109 | 1.8 s | AVX-512 iqk CPU-MoE kernels, `-ot exps=CPU` |
 | ik_llama.cpp | 1 | 16 | 96 | 23.9 | 120 | 30 s |  |
 | ik_llama.cpp | 1 | 1 | 1,068 | 40.4 | — | — | **reported, not measured here** (2026-08-30): same commit 7cff686d on an **RTX 3090 24 GB + Ryzen 9 9950X**, AD-4.27bpw Q4_K_M, 3-run average at temperature 0, single slot, 10,006-token prompt without cache reuse, 128 generated; KV Q8_0/Q8_0 (their setting — no board row of ours quantises the KV), 22.1 GB VRAM |
-| **surogate** | 8 | 1 | **209** | **46.8** | **256** | **0.85 s** | 8 stages, 3,072 slots per card (every expert resident, nothing crosses PCIe after warm-up), C3 + asynchronous prompt flights, `--max-model-len 2048`; 2026-08-30 08:06, uncapped |
-| **surogate** | 8 | 16 | **1,231** | **276.1** | **1,507** | **2.37 s** | same; 4.1× the one-card 66.9 |
-| **surogate** | 8 | 32 | **1,527** | **342.3** | **1,869** | **2.42 s** | same, stages materialise only their own layers (64 lanes fit beside the pool) |
-| **surogate** | 8 | 64 | **1,750** | **392.3** | **2,142** | **2.80 s** | same; 5.3× the one card, and TTFT holds under 3 s where one card is at 40 s |
+| **surogate** | 8 | 1 | **193** | **43.3** | **236** | **1.07 s** | 8 stages, 3,072 slots per card (every expert resident), chunk 8,192 |
+| **surogate** | 8 | 16 | **1,214** | **272.3** | **1,486** | **2.27 s** | chunk 1,024 — **a pipeline wants small chunks**: chunk 8,192 reads 208 here (one giant chunk starves 8 stages of in-flight work) |
+| **surogate** | 8 | 64 | **1,807** | **405.2** | **2,212** | **2.79 s** | chunk 1,024; chunk 8,192 reads 296, chunk 2,048 sits between (364) |
 | llama.cpp | 8 | 1 | 157 | 39.3 | 196 | 0.95 s | `--split-mode layer`, all resident |
 | llama.cpp | 8 | 16 | 156 | 39.1 | 195 | 86 s | 16 of 48 requests timed out |
 | llama.cpp | 8 | 64 | 99 | 24.7 | 124 | 311 s |  |
@@ -183,27 +190,19 @@ them.
   do. The one-user 27B row is the same finding seen from the other end — a †
   prefill figure is TTFT restated, so 11,200 † against 13,600 † and 170 ms against
   140 ms are one fact, not two.
-- **Flash-Next on one card is host-bound at one user and GPU-bound above it.**
-  Measured at 16 users, the expert cache misses on only **2.1 %** of lookups and
-  just **1.7 % of paths reach the CPU**, so the split and the PCIe gather cannot
-  be what limits that row — the routed kernel over the resident pool is. At one
-  user misses are frequent and the host path does set the pace, which is where
-  the Q4 bank's halving of host bytes paid. The slot ring and the split carry
-  16 users to 66.9 tok/s (median 66.7 over four runs, spread 0.6 %),
-  and 64 users add queueing rather than throughput (73.8 tok/s at a 40 s TTFT).
-  An earlier binary read 75.3 there and **that number has never reproduced**:
-  card, NUMA node, clock cap and run-to-run noise were each eliminated (65.1-69.1
-  across four cards and six repeats), so it is not on this board.
-  The reported ik_llama.cpp figure on a Ryzen 9 9950X desktop — 40.4 tok/s at one
-  user, 1.85× the 21.8 the same commit measures on this host's EPYC 9124 — sizes
-  the host-CPU lever for that one-user row: a 16-core Zen 5 at desktop clocks
-  against a 16-core Zen 4 server part, same expert kernels, same weights. The
-  one-card single-user number is a CPU benchmark before it is an engine one.
-  The card's PCIe link width moves that number as much as any engine change —
-  x8 costs a third — and in-engine NUMA placement is worth +3 %. **Eight cards**
-  make every expert
-  resident and the pipeline delivers 4.1× at 16 users and 5.3× at 64, with
-  TTFT under 3 s throughout.
+- **Flash-Next: the CPU belongs in decode, not in prefill.** The decode split (70 %
+  of misses on the host, measured shares) carries the one-user rows; the *prefill*
+  split was a pure loss at every chunk width — the host GEMM runs at 16 % of VNNI
+  peak and every layer's combine waits on its host tail — and turning it off is
+  most of tonight's +54-64 % on one card (28.4→32.0, 66.9→91.1, 73.8→110.1) and
+  the whole of the ingestion flip (484 → 3,966 tok/s at 28k, against llama.cpp's
+  1,216 with its best flags). Pure-GPU prefill scales almost linearly with the
+  chunk: 1,632 / 2,428 / 3,275 / 3,944 at 1k/2k/4k/8k. The expert cache itself is
+  at its ceiling (2.1 % misses at 16 users); the reported ik_llama.cpp figure on a
+  Ryzen 9 9950X desktop — 40.4 tok/s, 1.85× this host's EPYC on the same commit —
+  still sizes the host-CPU lever for CPU-offload engines, and the x8-link cards
+  (2/3/5/7) still cost a gather-bound row a third.
+
 - **A pipeline is capacity, not throughput per card.** The 27B on eight stages
   serves 986 tok/s against 1,302 on one card, because with ~12 lanes per group a
   stage's per-round fixed cost does not shrink with its layer count. The 35B was
@@ -262,10 +261,9 @@ them.
   fixed, single-card Flash-Next rows belong on GPU 0, 1, 4 or 6.
 - **The 35B's eight-card pipeline has not been measured on the routed-NVFP4
   artifact.** Its 2,123 tok/s is a groupwise-int number, taken when one card did
-  1,984; one card now does 2,607. Eight stages may still add capacity, or the
-  borrowed kernel may have removed the reason to spread the model at all — the
-  measurement is one server launch and one probe, and until it is run the "MoE
-  gains from a pipeline" claim stands only for the old artifact.
+  1,984; one card now does 2,607. (The Flash-Next 8-card rows were re-measured
+  tonight on the current binary; the 35B's were not.)
+
 - **Two rows were taken at 62 s and the rest at 76-97 s.** The window is inside the
   band the Method names, but an early pass measured a shorter window reading up to
   25 % high, and that sensitivity has never been re-checked on the current binary.
