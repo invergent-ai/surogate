@@ -2362,3 +2362,17 @@ a round of 46k+1 tokens left a one-token slice small-T refuses (47 runs 45 + 2 n
 workspace query has to compute the slice width with the same rule the loop uses or the capacity
 contract fails. The oracle test missed the first because 768 and 4,097 leave remainders of 32
 and 3; the 35B found it on its first served round.
+
+## 2026-08-30 — the llama.cpp rows, and a binary that looked like a regression
+
+All three llama.cpp single-user rows are current again (0.8B 411 tok/s at 100 ms,
+4B 182 at 270 ms, 27B 44.8 at 1.18 s), which took two things: fetching the 4B and 27B
+GGUFs, which had left this host, and noticing that the `llama-server` on `PATH` is
+**Homebrew's Vulkan build**. It has no CUDA backend, ignores `CUDA_VISIBLE_DEVICES`,
+enumerates all eight cards through Vulkan and runs at about 40 % of the CUDA build:
+the first 0.8B pass read 138 tok/s at 400 ms against a three-day-old row of 391 at
+168 ms, which looks exactly like a regression and is a different binary.
+`study/llama.cpp-master/build/bin` is the CUDA one, and the board now says so.
+
+Every single-user row on the board is from the same week. The one that cannot be
+closed is the 4B's vLLM pair — that checkpoint is gone from this host.
