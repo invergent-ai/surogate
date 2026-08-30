@@ -824,9 +824,9 @@ int main() {
     constexpr std::array<std::int32_t, 6> kQ4Q5Tokens{{1, 2, 46, 47, 768, 4097}};
     constexpr std::array<std::int32_t, 5> kQ4Q6Tokens{{1, 2, 46, 47, 768}};
     constexpr std::array<std::int32_t, 5> kW8W8Tokens{{1, 2, 19, 20, 768}};
-    // NVFP4 now covers decode (T=1) and small-T (2, 19, 20); the prefill MMA path is still
-    // bf16-fragment only, so 768 is excluded rather than silently passing.
-    constexpr std::array<std::int32_t, 4> kNvfp4Tokens{{1, 2, 19, 20}};
+    // NVFP4 covers every width: decode at 1, small-T at 2/19/20, and wider rounds as a
+    // sequence of small-T slices (768 here, and 4,097 to cross the internal slice bound).
+    constexpr std::array<std::int32_t, 6> kNvfp4Tokens{{1, 2, 19, 20, 768, 4097}};
     const std::array<CodecProfile, 4> profiles{{
         {"sparse_moe q4+q5 a16", QType::Q4G64_F16S, QType::Q5G64_F16S, kQ4Q5Tokens, true},
         {"sparse_moe q4+q6 a16", QType::Q4G64_F16S, QType::Q6G64_F16S, kQ4Q6Tokens, false},

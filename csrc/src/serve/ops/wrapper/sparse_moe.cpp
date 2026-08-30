@@ -212,10 +212,14 @@ std::size_t sparse_moe_workspace_capacity_bytes(const SparseMoeGeometry& geometr
     }
     (void)detail::resolve_sparse_moe_decode_plan(geometry, routed_gate_up, routed_down);
     const bool w8_profile = routed_gate_up == QType::W8G32_F16S && routed_down == QType::W8G32_F16S;
+    // NVFP4 has no prefill MMA arm; wide rounds walk the small-T path in slices (see
+    // sparse_moe below), so nothing in the interval ever needs the prefill workspace.
+    const bool nvfp4_profile = routed_gate_up == QType::NVFP4 && routed_down == QType::NVFP4;
     const std::int32_t prefill_first =
-        w8_profile ? detail::kSparseMoePrefillW8W8Min
-                   : (routed_down == QType::Q5G64_F16S ? detail::kSparseMoePrefillQ4Q5Min
-                                                       : detail::kSparseMoePrefillQ4Q6Min);
+        nvfp4_profile ? std::numeric_limits<std::int32_t>::max()
+        : w8_profile  ? detail::kSparseMoePrefillW8W8Min
+                      : (routed_down == QType::Q5G64_F16S ? detail::kSparseMoePrefillQ4Q5Min
+                                                          : detail::kSparseMoePrefillQ4Q6Min);
     std::size_t required = 0;
     if (min_tokens == 1) { required = detail::sparse_moe_decode_workspace_bytes(geometry); }
     const std::int32_t small_first = std::max(min_tokens, detail::kSparseMoeSmallTMin);
@@ -224,6 +228,12 @@ std::size_t sparse_moe_workspace_capacity_bytes(const SparseMoeGeometry& geometr
     if (small_first <= small_last) {
         required =
             std::max(required, detail::sparse_moe_small_t_workspace_bytes(geometry, small_last));
+    }
+    if (nvfp4_profile && max_tokens >= detail::kSparseMoeSmallTMin) {
+        // Any NVFP4 round of two or more tokens runs as small-T slices, so the widest slice
+        // sets the requirement whatever the interval's upper end is.
+        const std::int32_t slice = std::min(max_tokens, detail::kSparseMoeSmallTMax);
+        required = std::max(required, detail::sparse_moe_small_t_workspace_bytes(geometry, slice));
     }
     const std::int32_t prefill_interval_first = std::max(min_tokens, prefill_first);
     if (prefill_interval_first <= max_tokens) {
@@ -256,10 +266,17 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
     ranges.push_back(address_range(destination.data, destination.bytes(), "destination"));
     validate_weights(weights, geometry, ranges);
 
-    const QType gate_up    = weights.routed_gate_up.qtype;
-    const QType down       = weights.routed_down.qtype;
-    const bool use_small_t = detail::sparse_moe_uses_small_t(tokens);
-    const bool use_prefill = detail::sparse_moe_uses_prefill(tokens, gate_up, down);
+    const QType gate_up = weights.routed_gate_up.qtype;
+    const QType down    = weights.routed_down.qtype;
+    // NVFP4 shares the decode and small-T codec templates but has no prefill MMA kernel, so a
+    // round wider than the small-T bound is served as a sequence of small-T slices. Correct at
+    // every width, and slower than the MMA path would be — the prefill arm is a performance
+    // item, not a correctness one (design/NVFP4_ROUTED_EXPERTS.md, Phase 2).
+    const bool nvfp4_routed = gate_up == QType::NVFP4 && down == QType::NVFP4;
+    const bool use_small_t =
+        detail::sparse_moe_uses_small_t(tokens) || (nvfp4_routed && tokens > 1);
+    const bool use_prefill =
+        !nvfp4_routed && detail::sparse_moe_uses_prefill(tokens, gate_up, down);
     nvtx::ScopedRange moe_range(use_prefill   ? nvtx::Name::SparseMoePrefill
                                 : use_small_t ? nvtx::Name::SparseMoeSmallT
                                               : nvtx::Name::SparseMoeDecode,
@@ -269,7 +286,10 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
         required = detail::resolve_sparse_moe_prefill_plan(geometry, tokens, gate_up, down)
                        .workspace_bytes;
     } else if (use_small_t) {
-        required = detail::resolve_sparse_moe_small_t_plan(geometry, tokens, gate_up, down)
+        // Wide rounds run as slices, so the workspace only has to hold one slice.
+        const std::int32_t slice =
+            std::min(tokens, static_cast<std::int32_t>(detail::kSparseMoeSmallTMax));
+        required = detail::resolve_sparse_moe_small_t_plan(geometry, slice, gate_up, down)
                        .workspace_bytes;
     } else {
         required = detail::resolve_sparse_moe_decode_plan(geometry, gate_up, down).workspace_bytes;
@@ -292,12 +312,20 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
         return;
     }
     if (use_small_t) {
-        const detail::SparseMoeSmallTPlan plan =
-            detail::resolve_sparse_moe_small_t_plan(geometry, tokens, gate_up, down);
-        const detail::SparseMoeSmallTWorkspace views =
-            detail::allocate_sparse_moe_small_t_workspace(workspace, geometry, tokens);
-        detail::sparse_moe_small_t_launch(geometry, x, weights, destination, plan, views, stream,
-                                          round_hook);
+        for (std::int32_t offset = 0; offset < tokens;) {
+            const std::int32_t slice =
+                std::min(tokens - offset, static_cast<std::int32_t>(detail::kSparseMoeSmallTMax));
+            auto slice_scope = workspace.scope();
+            const detail::SparseMoeSmallTPlan plan =
+                detail::resolve_sparse_moe_small_t_plan(geometry, slice, gate_up, down);
+            const detail::SparseMoeSmallTWorkspace views =
+                detail::allocate_sparse_moe_small_t_workspace(workspace, geometry, slice);
+            const Tensor x_slice     = x.slice(1, offset, slice);
+            Tensor destination_slice = destination.slice(1, offset, slice);
+            detail::sparse_moe_small_t_launch(geometry, x_slice, weights, destination_slice, plan,
+                                              views, stream, round_hook);
+            offset += slice;
+        }
         return;
     }
     const detail::SparseMoeDecodeWorkspace views =
