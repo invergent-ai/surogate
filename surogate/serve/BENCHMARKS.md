@@ -225,10 +225,14 @@ what the engine does and how the number was arrived at.
 - **35B-A3B: NVFP4 routed experts.** The one model still on a non-NVFP4 routed
   artifact and the one still behind vLLM (1,984 against 2,162 on one card, 92 %).
   A kernel project, not a conversion — the sparse-MoE kernels and the expert slot
-  cache read W8G32 routed experts only. Four gated phases, the constraint that
-  the per-tensor divisor cannot fold into the router weight for gate/up, and the
-  independent row-parallel decode-width kernel that composes with it:
-  `design/NVFP4_ROUTED_EXPERTS.md`.
+  cache read W8G32 routed experts only. Four gated phases; the checkpoint's
+  global scale is per expert per projection but factors out of the dot product,
+  so the kernels apply it once rather than the codec carrying it; and the
+  converter must detect compressed-tensors versus ModelOpt from
+  `quantization_config`, since the two disagree on whether that scale multiplies
+  or divides. `design/NVFP4_ROUTED_EXPERTS.md`. Phase 1 (the decode codec and a
+  generalised packed-lane mapping) is written and under test; the independent
+  row-parallel decode-width kernel composes with it.
 - **Hardware: four PCIe links train at x8.** GPUs 2, 3, 5 and 7, although both
   the card and its root port advertise x16 — so a physical path issue (MCIO
   cable, seating or a retimer channel), not bifurcation. It halves the gather
