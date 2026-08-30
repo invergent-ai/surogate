@@ -18,8 +18,11 @@ Closed-loop HTTP clients against each engine's OpenAI endpoint (streaming
 own token accounting). Numbers exclude model load; rows at 16+ users are
 90-second steady state (shorter windows read up to 25 % high), one-user rows
 60 s. Every engine was measured on the same card class; a number is only
-comparable to its pair on the same card in the same batch (the same binary
-repeats to ~1 % on a card, but cards and days differ by up to 50 %).
+comparable to its pair on the same card in the same batch. Measured on
+2026-08-30 with the clock caps gone: one binary repeats within **0.6 %** on a
+card and the eight cards agree within **2.7 %**, so a difference above ~3 % is
+real. (The "cards differ by up to 50 %" this section used to warn about was the
+clock profile of 2026-08-29, not the hardware.)
 
 Columns:
 
@@ -58,7 +61,7 @@ concurrency.
 token counts divided by the same run wall time, so the shape fixes their
 ratio: on prefill-heavy 2048/16 every completed request contributes 2,048
 prompt tokens and 16 generated tokens, and decode tok/s is always prefill
-tok/s ÷ 128 (0.8B: 81,376 / 636; 27B: 7,339 / 57 — the same 128 for vLLM).
+tok/s ÷ 128 (0.8B: 81,376 / 636; 27B: 11,208 / 85 — the same 128 for vLLM).
 That decode figure is completions per second × 16, not a decode speed: the
 engine spends the run processing prompts and the 16-token tail is the small
 share left over. On that shape the number to read is prefill (prompt
@@ -189,11 +192,19 @@ what the engine does and how the number was arrived at.
   (11,166 vs 10,095), and the 27B, 35B and 4B reproduce theirs (1,302 vs 1,330;
   1,984 vs 1,942; 5,345 vs 4,942). The detour that found it — binaries, flags,
   client shards, graph updates, all ruled out — is in INFERENCE.md.
-- **Two configuration levers worth as much as a kernel change**: capping the
+- **Three configuration levers worth as much as a kernel change.** Capping the
   context to the workload (`--max-model-len 2048`) is worth 16 % on the 0.8B,
-  because auto sizes a 4.25 M-token KV cache the shape never touches; and on the
-  35B MoE, `--no-thinking` costs 27 % of decode, since the generated text
-  changes the expert spread per round. Both belong in every row's comment.
+  because auto sizes a 4.25 M-token KV cache the shape never touches. On the 35B
+  MoE, `--no-thinking` costs 27 % of decode, since the generated text changes the
+  expert spread per round. And on the host-offloaded model, in-engine NUMA
+  placement is worth 3 % (`SUROGATE_SERVE_NUMA`, default `auto`: the shared expert
+  bank interleaved, the per-device staging bound to that device's node — which
+  also makes the launcher's `numactl --interleave=all` redundant, measured at
+  ±0.5 %). All three belong in every row's comment.
+- **And one that dwarfs them, on the 27B**: the prefill-heavy row moved from
+  7,339 to 11,208 prompt tok/s between the 08-27 and 08-30 configurations without
+  a kernel change. Configuration is not a footnote on this board; it is most of
+  the variance between rows.
 - Every surogate row above is from a binary that passes the correctness
   batteries at its concurrency (coherence and the strict-structure counting
   probe, `surogate/serve/tools/probe/`). The Flash-Next one-card rows are the
@@ -221,14 +232,13 @@ what the engine does and how the number was arrived at.
   layer-loop fusion and wider GDN scan queued against it are dropped, not
   deferred. See `design/27B_PREFILL.md`.
 - ~~**Flash-Next, one card**: overlap the miss-gather with the hit-compute~~
-  **closed 2026-08-30 without building it.** The Q4 bank is 3.07 MB per expert
-  and all 48 layers route, so at a 63 % hit rate the misses are 3.7 experts per
-  layer — but the CPU split already sends 76–81 % of them to the host, where the
-  work is forked onto a side stream and overlapped. Only ~0.74 experts per layer
-  actually cross PCIe: 0.11 GB per token, **2.4 ms of a ~35 ms token (7 %)**, and
-  a perfect overlap would gain less than the ±10 % spread of the host-bandwidth
-  probe. It would be worth 34 % only with the split off. Revisit if the split is
-  ever reduced.
+  **closed 2026-08-30 without building it.** The Q4 bank is 3.07 MB per expert and
+  all 48 layers route, but the measured miss share at 16 users is **2.1 %**, and
+  the CPU split sends 80 % of those to the host, where the work is forked onto a
+  side stream and already overlapped. What crosses PCIe is 0.042 experts per
+  layer — **6.2 MB per token, 0.13 ms** — so the overlap would hide about a tenth
+  of a percent. (At one user, where misses are frequent, the same arithmetic gives
+  7 %; with the split off, 34 %.) Revisit only if the split is turned down.
 - **Hardware**: GPUs 2, 3, 5 and 7 train their PCIe links at x8 although both
   ends advertise x16 — a physical path issue, not bifurcation. It costs the
   host-offloaded model half its gather bandwidth (23 vs 46 GB/s) and about a
