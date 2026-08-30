@@ -121,9 +121,10 @@ derived (≈) number say so in their comment.
 
 | engine | GPUs | users | prefill tok/s | decode tok/s | throughput tok/s | TTFT p50 | comments |
 |---|---:|---:|---:|---:|---:|---:|---|
-| surogate | 1 | 100 | 7,933 | 1,919 | 9,852 | **0.29 s** | Q4/Q5/Q6 MoE from GGUF, 128 lanes, chunk 4,096, prefill batch 4, `--max-model-len 2048`; 2026-08-30 (a quiet-host re-run is in flight) |
-| surogate | 1 | 100 | 5,780 | 1,394 | 7,174 | 0.35 s | same with `--no-thinking`: −27 % decode. On this MoE the generated text changes the expert spread per round, so the thinking mode is part of the configuration; the dense 27B shows no such gap |
-| **vLLM** | 1 | 100 | **8,957** | **2,166** | **11,123** | 3.13 s | `RedHatAI/Qwen3.6-35B-A3B-NVFP4`, `--max-num-seqs 128`; 2026-08-30, quiet host. surogate at 89 % of decode with 11× the TTFT |
+| surogate | 1 | 100 | **8,209** | **1,984** | **10,193** | **0.32 s** | Q4/Q5/Q6 MoE from GGUF, 128 lanes, chunk 4,096, prefill batch 4, `--max-model-len 2048`; 2026-08-30 07:14, uncapped GPU 4. Reproduces the 08-28 pass (1,942) |
+| vLLM | 1 | 100 | 8,957 | **2,166** | 11,123 | 3.13 s | `RedHatAI/Qwen3.6-35B-A3B-NVFP4`, `--max-num-seqs 128`; measured under the caps on GPU 3 (2,500 MHz) — an uncapped same-batch pair is in flight. surogate at 92 % of decode with 10× the TTFT |
+| surogate | 1 | 100 | 7,933 | 1,919 | 9,852 | 0.29 s | the same configuration under the caps (GPU 5 at 2,400 MHz) |
+| surogate | 1 | 100 | 5,780 | 1,394 | 7,174 | 0.35 s | capped, and with `--no-thinking`: −27 % decode on top. On this MoE the generated text changes the expert spread per round, so the thinking mode is part of the configuration; the dense 27B shows no such gap |
 | surogate | 8 | 100 | ≈ 9,470 | **2,368** | ≈ 11,840 | — | 8-stage pipeline, C3 + asynchronous prompt flights |
 | surogate | 8 | 1 | ≈ 200 | 50.1 | ≈ 250 | 0.35 s | 8 stages, closed pipeline |
 
