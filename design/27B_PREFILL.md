@@ -1,12 +1,16 @@
-# The 27B prefill gap
+# The 27B prefill gap — closed 2026-08-30
 
-**The number.** On the prefill-heavy shape (2,048-token prompts, 16 out, 100 users) the 27B
-processes 7,339 prompt tok/s against vLLM's 11,818 on the same card — 62 %, and the only shape
-on the board where we lose badly. TTFT follows: 25.8 s against 14.9 s. On the balanced 512/128
-shape we lead (5,815 vs 5,003 prefill, 1,302 vs 1,120 decode), so this is specific to
-prompt-dominated traffic, where the prefill duty cycle starves everything else.
+**Status: there is no gap.** The board carried one for three days — 7,339 prompt tok/s against
+vLLM's 11,818 on the prefill-heavy shape, 62 % — and it turned out to be the configuration that
+number was measured with, not the engine. Re-measured on the current binary the 27B serves
+**11,208 against 11,818 (95 %)** at a comparable TTFT, with the executor 97 % occupied in mixed
+rounds and nothing left in the scheduler. The two kernel levers this document was written to
+scope are **dropped**.
 
-**What the round model already says.** A 27B round costs 28.8 ms fixed + 114 µs per column, and
+The measurements are in the next section; the original 2026-08-27 analysis is kept below them
+because the reasoning was sound against the data it had — it was the data that expired.
+
+**What the round model said in 2026-08-27 terms.** A 27B round costs 28.8 ms fixed + 114 µs per column, and
 114 µs per column is 474 TFLOP/s against the 651–827 the GEMMs measure standalone. Two causes
 were profiled on 2026-08-27 and neither has been addressed:
 
