@@ -107,7 +107,8 @@ what the engine does and how the number was arrived at.
 | vLLM | 1 | 100 | 34,964 | 273 | 35,237 | 5.00 s | prefill-heavy, same card |
 | **surogate** | 1 | 1 | **63,300 †** | **204** | — | **30 ms** | 2026-08-30 10:19, uncapped GPU 0, fp8 KV, ~1,900-token prompt. No vLLM pair: the NVFP4 4B checkpoint is no longer on this host |
 | surogate | 1 | 1 | 33,300 † | 214 | — | 57 ms | the 2026-08-26 pass (GPU 2) this replaces — decode within 5 %, prompt processing 1.9× |
-| llama.cpp | 1 | 1 | 4,300 † | 190 | — | 445 ms | 2026-08-26; not re-measurable here — the 4B GGUF is no longer on this host |
+| llama.cpp | 1 | 1 | **7,000 †** | **182** | — | **270 ms** | 2026-08-30 12:05, uncapped GPU 5, CUDA build, `unsloth/Qwen3.5-4B-GGUF` Q4_K_M (fetched for this row; our side is NVFP4). Its own prompt-eval timing is 13,000 tok/s |
+| llama.cpp | 1 | 1 | 4,300 † | 190 | — | 445 ms | the 2026-08-26 pass this replaces — TTFT 1.6× better, decode flat |
 | vLLM | 1 | 1 | 26,800 † | 166 | — | 71 ms | 2026-08-26, not re-measured |
 
 ### Qwen3.8-27B
@@ -130,7 +131,8 @@ what the engine does and how the number was arrived at.
 | **vLLM** | 1 | 1 | **13,600 †** | **71.7** | — | **140 ms** | `sakamakismile/Qwen3.8-27B-MTP-NVFP4`; 2026-08-30 10:37, uncapped GPU 1. The one shape where vLLM leads us at one user — decode within 1 %, TTFT 20 % better |
 | surogate | 1 | 1 | 5,400 † | 45 | — | 352 ms | the 2026-08-26 pass (GPU 2) this replaces |
 | vLLM | 1 | 1 | 7,500 † | 45 | — | 254 ms | the 2026-08-26 pass this replaces |
-| llama.cpp | 1 | 1 | 1,040 † | 49 | — | 1,829 ms | 2026-08-26; not re-measurable here — the 27B GGUF is no longer on this host |
+| llama.cpp | 1 | 1 | **1,610 †** | **44.8** | — | **1.18 s** | 2026-08-30 12:07, uncapped GPU 5, CUDA build, `unsloth/Qwen3.8-27B-GGUF` UD-Q4_K_M (fetched for this row; our side is all-NVFP4). Its own prompt-eval timing is 2,734 tok/s |
+| llama.cpp | 1 | 1 | 1,040 † | 49 | — | 1,829 ms | the 2026-08-26 pass this replaces — TTFT 1.6× better, decode within 9 % |
 
 ### Qwen3.6-35B-A3B
 
@@ -226,6 +228,12 @@ what the engine does and how the number was arrived at.
   `csrc/build-serve/serve_bench/ninfer_bench` instead, which does load, warm-up
   and five repetitions of pp512+tg128 in about 3 s (it needs
   `--corpus csrc/src/testing/serve/bench/fixtures/bench_corpus.ids`).
+- **llama.cpp rows** use `study/llama.cpp-master/build/bin/llama-server -ngl 999
+  -c 4096 -np 1` — **not** the `llama-server` on `PATH`, which is Homebrew's
+  Vulkan build (no CUDA, ignores `CUDA_VISIBLE_DEVICES`, about 40 % of the CUDA
+  build's rate). The GGUFs are in the HF cache: `unsloth/Qwen3.5-4B-GGUF`
+  Q4_K_M and `unsloth/Qwen3.8-27B-GGUF` UD-Q4_K_M, fetched 2026-08-30 for these
+  rows; the 0.8B one is `models/Qwen3.5-0.8B-Q4_K_M.gguf`.
 - **How to rebuild the 35B's routed-NVFP4 artifact**, if the format is ever
   wanted for a model that arrives on W8:
   `python -m surogate.serve.tools.convert.qwen3_6_35b_a3b.convert --model <BF16 dir>
@@ -241,16 +249,9 @@ what the engine does and how the number was arrived at.
   bandwidth for the host-offloaded model (23 against 46 GB/s) and costs about a
   third of its throughput; VRAM-resident models are unaffected. Until it is
   fixed, single-card Flash-Next rows belong on GPU 0, 1, 4 or 6.
-- **Single-user llama.cpp rows: the 0.8B is current, the 4B and 27B cannot be.**
-  The 0.8B was re-measured on 2026-08-30 (411 decode at 100 ms TTFT, up from
-  391/168 ms) once a CUDA llama.cpp was found: the `llama-server` on `PATH` is
-  Homebrew's **Vulkan** build, which has no CUDA backend, ignores
-  `CUDA_VISIBLE_DEVICES` and reads about 40 % of the CUDA build — anyone
-  refreshing these rows must use `study/llama.cpp-master/build/bin`. The 4B and
-  27B rows stay at 2026-08-26 because **their GGUFs are no longer on this host**
-  (only 0.8B, 2B, 9B and Flash-Next are), so closing them means fetching ~20 GB
-  of weights, not running a probe. The 4B has no current vLLM pair either — that
-  checkpoint is gone from this host too.
+- **The 4B has no current vLLM pair.** That checkpoint is gone from this host, so
+  the 4B's three-way stays two-way (surogate and llama.cpp are both 2026-08-30).
+  Every other single-user row on this board is now from the same week.
 
 ### Closed on 2026-08-30
 
