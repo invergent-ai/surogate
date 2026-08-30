@@ -92,8 +92,9 @@ derived (≈) number say so in their comment.
 
 | engine | GPUs | users | prefill tok/s | decode tok/s | throughput tok/s | TTFT p50 | comments |
 |---|---:|---:|---:|---:|---:|---:|---|
-| **surogate** | 1 | 100 | **19,767** | **4,942** | **24,709** | **45 ms** | NVFP4 3.56 GiB, 128 lanes, chunk 2,048 |
-| vLLM | 1 | 100 | 16,984 | 4,246 | 21,230 | 239 ms | NVFP4; surogate +16 % on both, 5.3× TTFT |
+| **surogate** | 1 | 100 | **22,121** | **5,345** | **27,466** | **40 ms** | NVFP4 3.56 GiB, 128 lanes, chunk 2,048, `--max-model-len 2048`, 8 client shards; 2026-08-30 07:17, uncapped GPU 6 |
+| surogate | 1 | 100 | 19,767 | 4,942 | 24,709 | 45 ms | the 2026-08-28 pass (pre-cap), which this reproduces +8 % |
+| vLLM | 1 | 100 | 16,984 | 4,246 | 21,230 | 239 ms | NVFP4, 2026-08-28 pass; not re-measured — the NVFP4 4B checkpoint is no longer on this host, so the pair stays the 08-28 one (surogate +16 % on both, 5.3× TTFT) |
 | **surogate** | 1 | 100 | **40,677** | 318 | 40,995 | 4.77 s | prefill-heavy 2048/16 (GPU5) |
 | vLLM | 1 | 100 | 34,964 | 273 | 35,237 | 5.00 s | prefill-heavy, same card |
 | **surogate** | 1 | 1 | 33,300 † | **214** | — | **57 ms** | 2026-08-26, GPU2 |
