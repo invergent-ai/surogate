@@ -255,7 +255,7 @@ what the engine does and how the number was arrived at.
 
 ### Closed on 2026-08-30
 
-Four items died to measurement rather than to code; the reasoning is in
+Five items died to measurement rather than to code; the reasoning is in
 `design/INFERENCE.md`, kept because each was about to become days of work.
 
 - **35B-A3B: NVFP4 routed experts** — built end to end and **not adopted**. The
@@ -271,9 +271,21 @@ Four items died to measurement rather than to code; the reasoning is in
   A 2 % byte cut cannot move a bandwidth-bound decode: `ninfer_bench` tg128 is
   343.1 against 347.5. The rest is the missing prefill MMA arm — a 4,096-token
   chunk runs as 89 small-T slices — which costs pp2048 2,008 against 15,219.
-  The 35B's decode gap needs the other lever instead: a row-parallel
-  decode-width routed kernel (~2,340 by the round model), which stays open.
   `design/NVFP4_ROUTED_EXPERTS.md`.
+- **35B-A3B: the row-parallel routed kernel** — the lever the entry above
+  deferred to, also built and also flat. At decode width an expert holds ~3
+  columns and the narrow plan's four warps leave three idle, so a
+  row-block-per-warp kernel should have found ~19 %; it finds nothing at 64,
+  100, 128, 256 or 512 columns, and neither do blocks/SM 3→12 nor a higher
+  residency hint. Idle warps were a symptom: gate/up is 63 % of a 532 µs round
+  and streams 209 MB in 345 µs — **606 GB/s, 34 % of peak, on 5 % of the card's
+  math rate**. It is short of memory throughput, not warps. The kernel was
+  reverted and the measurement kept in `design/serve-engine-backlog.md` B1,
+  which also names what to do next: get GPU counter permissions (`ncu` is
+  refused on this host) and measure sector efficiency before writing anything,
+  because the suspect is the weight read *shape* — a k-group's consecutive rows
+  sit 1,024 bytes apart, so a block issues 128 scattered 32-byte reads per
+  k-step.
 
 - **27B prefill gap** — did not exist on the current binary: 11,208 prompt tok/s
   against vLLM's 11,818 (95 %), with the kernels at 12,707 unserved and the

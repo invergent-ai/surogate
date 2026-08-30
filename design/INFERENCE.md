@@ -2376,3 +2376,44 @@ the first 0.8B pass read 138 tok/s at 400 ms against a three-day-old row of 391 
 
 Every single-user row on the board is from the same week. The one that cannot be
 closed is the 4B's vLLM pair — that checkpoint is gone from this host.
+
+## 2026-08-30 — the row-parallel routed kernel, also measured and also flat
+
+The lever the NVFP4 entry deferred to. `design/serve-engine-backlog.md` B1 scoped it well:
+at decode width the 35B routes ~800 assignments over ~190 experts, so an expert holds about
+three columns, and the narrow plan hands each of four warps eight columns — one works, three
+idle. A row-block-per-warp kernel should have found ~19 %.
+
+It finds nothing. Built as `sparse_moe_prefill_q4_gate_up_rows_kernel<4, 32>` (warp w owns row
+tile w and walks every column tile; rows 0-31 are gate and 32-63 the matching up rows, so the
+up warps hand their accumulators to the gate warps through `Bs`, dead once the K loop ends).
+It passes the fp64 oracle including T=47, which routes through it, and `nsys` confirms it is
+the kernel that runs:
+
+| T | row-parallel | column-parallel |
+|---:|---:|---:|
+| 64 | 442.4 us | 440.4 us |
+| 100 | 532.5 us | 530.4 us |
+| 128 | 571.4 us | 573.5 us |
+| 256 | 659.5 us | 661.5 us |
+| 512 | 702.5 us | 702.5 us |
+
+Every point within 0.5 %, the bench's own quantisation. Two more occupancy levers move it as
+little: `SUROGATE_SERVE_MOE_BLOCKS_PER_SM` 3 → 12, and the launch-bounds residency hint 3 → 8.
+
+**The arithmetic nobody had done.** At T=100 the round is 532 us and gate/up is 63 % of it
+(345 us by `nsys`; the routed down kernel is another 20 %). In those 345 us gate/up streams the
+188 touched experts' weights — 188 x 1024 x 2048 at 4.25 bpw = 209 MB — which is **606 GB/s,
+34 % of the 1,792 peak**, against 3.4 GFLOP of math, about **5 % of the card's bf16 rate**. A
+kernel at 34 % of memory and 5 % of math is not short of warps; it is short of memory
+throughput, and warps_active 24 % was the symptom of waiting, not the cause of it.
+
+The suspect is the read *shape*: for a fixed k-group consecutive rows sit `GroupsPerRow * 32`
+= 1,024 bytes apart, so a block issues 128 scattered 32-byte reads per k-step and never gets a
+contiguous run. That is a weight-layout question, and it is **not confirmed** — `ncu` is refused
+on this host (`ERR_NVGPUCTRPERM`), so the next person starts by getting counter permissions and
+measuring sector efficiency, not by writing a kernel.
+
+Two repairs came out of it: the MoE bench had not compiled since the geometry argument landed
+(so the binary on disk was stale, and its fixture left `experts_per_token` at zero), and the
+prefill translation unit still included the NVFP4 codec header after its arm moved to decode.
