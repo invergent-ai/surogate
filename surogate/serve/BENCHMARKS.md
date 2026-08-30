@@ -141,7 +141,7 @@ what the engine does and how the number was arrived at.
 
 | engine | GPUs | users | prefill tok/s | decode tok/s | throughput tok/s | TTFT p50 | comments |
 |---|---:|---:|---:|---:|---:|---:|---|
-| **surogate** | 1 | 100 | **10,817** | **2,614** | **13,431** | **0.09 s** | **routed NVFP4 through TensorRT-LLM's cutlass fused MoE** (`csrc/src/third_party/trtllm_moe`, the kernel behind vLLM's row below), our router/shared expert/combine kept, single-token rounds kept on our own kernels; `--max-model-len 2048 --max-num-seqs 128 --max-num-batched-tokens 4096`; 2026-08-30 16:5x, GPU 1. Coherence 100/100 at 100 users and chunkcount 191 ok / 0 wrong, both `--no-thinking` |
+| **surogate** | 1 | 100 | **10,817** | **2,614** | **13,431** | **0.09 s** | **routed NVFP4 through TensorRT-LLM's cutlass fused MoE** (`csrc/src/third_party/trtllm_moe`, the kernel behind vLLM's row below), our router/shared expert/combine kept, single-token rounds kept on our own kernels; `--max-model-len 2048 --max-num-seqs 128 --max-num-batched-tokens 4096`; 2026-08-30 16:5x, GPU 1. Correctness with thinking on, the mode this row is measured in: coherence 48/48 at 100 users, chunkcount 94 ok / 1 wrong / 0 garbage, longprompt 31 ok / 0 wrong |
 | surogate | 1 | 100 | 7,806 | 1,887 | 9,693 | 0.12 s | the shipped groupwise-int artifact, measured back-to-back with the row above as its pair — same card, session and flags. The routed-NVFP4 pair is **+37 % decode and +38 % prefill** |
 | **surogate** | 1 | 16 | **5,848** | **1,413** | **7,261** | **0.07 s** | routed NVFP4, same session |
 | surogate | 1 | 16 | 4,397 | 1,063 | 5,460 | 0.10 s | groupwise-int at 16 users, the pair for the row above (**+33 % decode**) |
@@ -245,7 +245,14 @@ what the engine does and how the number was arrived at.
   the variance between rows.
 - Every surogate row above is from a binary that passes the correctness
   batteries at its concurrency (coherence and the strict-structure counting
-  probe, `surogate/serve/tools/probe/`). The Flash-Next one-card rows are the
+  probe, `surogate/serve/tools/probe/`). Those probes were rewritten on
+  2026-08-30 for thinking models, which is now every model here: they score the
+  **answer** and never the reasoning — the reasoning contains the expected token
+  long before the model commits to an answer, so matching it would pass a run
+  that never answered — and they report a request whose budget expired inside
+  the reasoning as `truncated`, which says raise `max_tokens` rather than blaming
+  the engine. Their old budgets (24 to 128 tokens) never reached the answer at
+  all, so they scored zero on every model and every artifact alike. The Flash-Next one-card rows are the
   first measured after the host-split fix of 2026-08-30 (`bfb87ec6`); the
   earlier 22.4 / 32.2 / 37.0 rows were measured through it.
 - **How to reproduce a row.** Serving rows: `probe/board.py PORT MODEL USERS

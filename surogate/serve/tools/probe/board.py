@@ -25,6 +25,8 @@ import threading
 import time
 import urllib.request
 
+import chat
+
 
 def run(port, model, users, seconds, prompt_tokens, max_tokens, label):
     jitter = float(os.environ.get("SUROGATE_PROBE_JITTER", "0") or 0)
@@ -81,7 +83,7 @@ def run(port, model, users, seconds, prompt_tokens, max_tokens, label):
                         choices = d.get("choices") or [{}]
                         delta = choices[0].get("delta", {})
                         # Reasoning tokens stream first when thinking is on; they count.
-                        if delta.get("content") or delta.get("reasoning_content") or delta.get("reasoning"):
+                        if chat.is_first_token(delta):
                             if first is None:
                                 first = time.time() - t0
                             chunks += 1

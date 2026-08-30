@@ -2617,8 +2617,22 @@ activations stay BF16 (W4A16); above it the runner rounds them to E2M1 (W4A4), w
 checkpoint is calibrated for — it carries `input_global_scale` — but which is a real numeric step,
 2.0e-2 relative-L2 against an exact oracle versus 1.6e-3 for our own kernels on the same weights.
 `test_sparse_moe` carries both references and asserts against the one the width selects. Neither
-correctness battery objects: coherence 100/100 at 100 users, chunkcount 191 ok / 0 wrong. Both
-had to be run with `--no-thinking` — they read only `content`, which a thinking model leaves
-empty until the reasoning block closes, so their default 40-token budget scores 0/100 on *any*
-artifact.
+correctness battery objects, measured with thinking on — the mode the throughput rows are
+measured in: coherence 48/48 at 100 users, chunkcount 94 ok / 1 wrong / 0 garbage, longprompt
+31 ok / 0 wrong.
+
+Getting those numbers took fixing the probes, which is worth its own note. They read only
+`content` and asked for 24 to 128 tokens; a thinking model spends that entire budget in its
+reasoning block, so `content` came back empty and every probe scored zero — on any model and any
+artifact, ours or the baseline. The first fix that suggests itself, searching the reasoning text
+too, is worse: a model thinking about the capital of France writes "Paris" long before it decides
+how to answer, so a run that never answers still matches. `probe/chat.py` now holds the rule —
+score the answer, never the reasoning, and give a request whose budget expired mid-reasoning its
+own outcome, `truncated`, which says raise the budget rather than blaming the engine. Budgets are
+set from measurement (the 35B: 273-285 completion tokens for longprompt, under 512 for coherence,
+1,401-2,259 for a bounded count), and `chunkcount`'s instruction is now bounded — asked to "keep
+counting until you are stopped" the model reasoned about an unbounded task and ran past 4,026
+tokens without finishing. `ttft.py` had the same bug from the other side: it timed the first
+*answer* chunk, which on a thinking model is the end of the reasoning, not the first token
+generated — 68 ms once fixed, against the seconds it would otherwise have reported.
 

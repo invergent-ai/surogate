@@ -1,8 +1,16 @@
 # Time-to-first-token under load: U concurrent users stream unique-tagged prompts for D
-# seconds; reports TTFT p50/p90 (first SSE content chunk) and decode tok/s.
+# seconds; reports TTFT p50/p90 and decode tok/s.
+#
+# First token means the first token the model generated, which on a thinking model is a
+# reasoning token — the models this engine serves emit a reasoning block before any answer, and
+# waiting for the first `content` chunk would report the time to the *answer* instead. That is a
+# different and much larger number, it is not what board.py reports, and it would change meaning
+# silently the day a model stops reasoning. `chat.is_first_token` is the shared rule.
 #
 #   python ttft.py <port> <model> <users> <seconds> <prompt_tokens> <max_tokens>
 import json, statistics, sys, threading, time, urllib.request
+
+import chat
 
 port, model = sys.argv[1], sys.argv[2]
 users, dur, ptok, mtok = int(sys.argv[3]), float(sys.argv[4]), int(sys.argv[5]), int(sys.argv[6])
@@ -35,7 +43,7 @@ def worker():
                     except ValueError:
                         continue
                     delta = d.get("choices", [{}])[0].get("delta", {})
-                    if delta.get("content"):
+                    if chat.is_first_token(delta):
                         if first is None:
                             first = time.time() - t0
                         n += 1
