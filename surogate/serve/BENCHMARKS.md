@@ -136,17 +136,20 @@ what the engine does and how the number was arrived at.
 
 | engine | GPUs | users | prefill tok/s | decode tok/s | throughput tok/s | TTFT p50 | comments |
 |---|---:|---:|---:|---:|---:|---:|---|
-| **surogate** | 1 | 1 | 132 | **32.0** | 164 | **1.06 s** | experts on the host: Q4G32AM bank (pinned, 91 GB), 3,000-slot expert cache, CPU split auto (76 % of decode misses / 46 % of prefill on 32 host threads); 2026-08-30, fixed host split |
-| **surogate** | 1 | 16 | **311** | **75.3** | **386** | **2.27 s** | same defaults (81 % / 51 % measured shares); TTFT p90 12.4 s |
-| surogate | 1 | 64 | 313 | 75.7 | 389 | 37.1 s | `--expert-slots 2000` so 64 lanes fit, `--pending-timeout-ms 600000` (the 30 s default expires a third of the queue at this concurrency); the round is host-bound, 64 users only queue — TTFT p90 68.7 s |
+| **surogate** | 1 | 1 | 128 | **28.7** | 156 | **1.36 s** | experts on the host: Q4G32AM bank (pinned, 91 GB), 3,000-slot expert cache, CPU split auto; 2026-08-30 07:55, uncapped GPU 6 (**x16 link**, gather 46 GB/s) |
+| **surogate** | 1 | 16 | **298** | **66.9** | **365** | **2.62 s** | same, 81 % / 51 % measured shares; TTFT p90 14.7 s |
+| surogate | 1 | 64 | 329 | 73.8 | 403 | 40.5 s | `--expert-slots 2000` so 64 lanes fit, `--pending-timeout-ms 600000` (the 30 s default expires a third of the queue here); host-bound, so 64 users only queue — TTFT p90 70.2 s |
+| surogate | 1 | 1 / 16 / 64 | 132 / 311 / 313 | 32.0 / 75.3 / 75.7 | 164 / 386 / 389 | 1.06 s / 2.27 s / 37.1 s | the same rows measured earlier the same day on GPU 1 (x16, but clock-capped at 2,500 MHz). Within the ±10 % spread of the host-bandwidth probe, which reads 147-193 GB/s run to run and moves the auto split with it — this row is host-DRAM noise, not clock |
+| surogate | 1 | 1 / 16 | 92 / 262 | 20.8 / 58.8 | 113 / 321 | 1.71 s / 3.35 s | **on GPU 7, whose PCIe link trains at x8**: gather 23 GB/s instead of 46, and a third of the throughput. Kept as the cost of the link fault (see Open items) |
 | llama.cpp | 1 | 1 | 29 | 7.1 | 36 | 2.0 s | experts on CPU (`-ot exps=CPU`, 32 threads), 2026-08-28 |
 | llama.cpp | 1 | 16 | 65 | 16.3 | 81 | 29 s |  |
 | ik_llama.cpp | 1 | 1 | 87 | 21.8 | 109 | 1.8 s | AVX-512 iqk CPU-MoE kernels |
 | ik_llama.cpp | 1 | 16 | 96 | 23.9 | 120 | 30 s |  |
-| **surogate** | 8 | 1 | ≈ 204 | **51.0** | ≈ 255 | ≈ 0.24 s | 8 stages, 3,072 slots per card (every expert resident, nothing crosses PCIe after warm-up), C3 + asynchronous prompt flights; re-validated on the fixed binary 2026-08-29 |
-| **surogate** | 8 | 16 | ≈ 1,530 | **381.6** | ≈ 1,910 | **615 ms** | same; 5× the one-card 75 |
-| **surogate** | 8 | 32 | ≈ 2,070 | **518.5** | ≈ 2,590 | 971 ms | same, stages materialise only their own layers (64 lanes fit beside the pool) |
-| **surogate** | 8 | 64 | ≈ 2,330 | **583.6** | ≈ 2,920 | 1.14 s | same |
+| **surogate** | 8 | 1 | **209** | **46.8** | **256** | **0.85 s** | 8 stages, 3,072 slots per card (every expert resident, nothing crosses PCIe after warm-up), C3 + asynchronous prompt flights, `--max-model-len 2048`; 2026-08-30 08:06, uncapped |
+| **surogate** | 8 | 16 | **1,231** | **276.1** | **1,507** | **2.37 s** | same; 4.1× the one-card 66.9 |
+| **surogate** | 8 | 32 | **1,527** | **342.3** | **1,869** | **2.42 s** | same, stages materialise only their own layers (64 lanes fit beside the pool) |
+| **surogate** | 8 | 64 | **1,750** | **392.3** | **2,142** | **2.80 s** | same; 5.3× the one card, and TTFT holds under 3 s where one card is at 40 s |
+| surogate | 8 | 1 / 16 / 32 / 64 | — | 51.0 / 381.6 / 488.2 / 604.1 | — | 0.24 s / 615 ms / 971 ms / 1.14 s | the 2026-08-29 pass, measured under the clock caps *and* with a load generator that started all clients together; closed-loop clients in phase make a pipeline alternate between all-prefill and all-decode rounds, which is why its decode reads high against the staggered probe used above |
 | llama.cpp | 8 | 1 | 157 | 39.3 | 196 | 0.95 s | `--split-mode layer`, all resident |
 | llama.cpp | 8 | 16 | 156 | 39.1 | 195 | 86 s | 16 of 48 requests timed out |
 | llama.cpp | 8 | 64 | 99 | 24.7 | 124 | 311 s |  |
