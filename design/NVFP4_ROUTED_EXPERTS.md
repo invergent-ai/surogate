@@ -33,17 +33,23 @@ Test: extend `testing/serve/ops/test_sparse_moe.cpp` with an NVFP4 profile besid
 ones — it already packs weights per codec and compares against an fp64 oracle, so the arm is a
 `CodecProfile` entry plus a packer.
 
-**The one design decision Phase 1 forces: where the per-tensor global scale goes.** NVFP4 is
-two-level — an e4m3 scale per 16 values *and* a per-tensor divisor, which the dense path
-applies as `decode_nvfp4_e4m3(scale) * inverse_weight_divisor` (`nvfp4_gemv.cuh`). The MoE
-codec interface (`load_one` / `load_pair` / `load_eight`) has no slot for a scalar, and the
-obvious shortcut — folding the divisor into the router weight `alpha` — **only works for the
-down projection**. Gate/up feeds SwiGLU, and the nonlinearity means the scale has to be applied
-before SiLU, not after. So Phase 1 must either extend the codec interface with a per-expert
-divisor pointer (indexed like the codes) or pre-scale at pack time. Pre-scaling is not free
-either: NVFP4's block scales are e4m3 and folding a divisor into them loses range. The
-interface extension is the honest option, and it is small: the kernels already carry the
-expert index needed to look the divisor up.
+**Where the global scale goes — settled against the checkpoint (2026-08-30).** NVFP4 is
+two-level: an e4m3 scale per 16 values and a global scale. `RedHatAI/Qwen3.6-35B-A3B-NVFP4`
+stores that second level **per expert and per projection** —
+`layers.L.mlp.experts.E.gate_proj.weight_global_scale` — so `Weight::weight_scale_divisor`,
+a single float for a whole tensor, cannot express it once 256 experts are stacked into one
+routed weight.
+
+The fix is smaller than it looks, and it is *not* an interface change to the codec. A divisor
+constant over an expert factors out of the dot product:
+
+    sum_k (code_k · blockscale_k · divisor) · x_k  =  divisor · sum_k (code_k · blockscale_k) · x_k
+
+so the codec decodes exactly as the others do and the kernel multiplies the finished dot by
+`divisor[expert]` once. That also lands the scale *before* SwiGLU on the gate/up path, which is
+where it has to be. What Phase 1 adds is therefore two device arrays on `SparseMoeWeights`
+(`[experts]` divisors for gate/up and for down) and one multiply per dot, not a new codec
+signature.
 
 ## Phase 2 — the prefill path
 
