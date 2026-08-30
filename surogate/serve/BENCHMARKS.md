@@ -70,9 +70,12 @@ column across shapes.
 
 ## Board of record (2026-08-30)
 
-One table per model, the same columns throughout. A re-measurement on uncapped, uniform cards
-(2026-08-30 07:07 onwards) is landing model by model; rows that still carry a capped or
-derived (≈) number say so in their comment.
+One table per model, the same columns throughout. **The first row of each model's table is the
+current reference**: measured on 2026-08-30 after the clock caps were removed, one model at a
+time on an idle host, with its vLLM pair in the same batch on a second card wherever the
+checkpoint is still on this machine. Rows below it are kept for provenance — the pre-cap pass
+they reproduce, the capped runs (labelled), and the other shapes — so the table shows both
+what the engine does and how the number was arrived at.
 
 ### Qwen3.5-0.8B
 
@@ -162,11 +165,27 @@ derived (≈) number say so in their comment.
   and the pipeline delivers 5–8× the one-card figures at sub-second TTFT.
 - **The 27B pipeline** is capacity, not throughput per card: with ~12 lanes per
   group a stage's per-round fixed cost does not shrink with its layer count.
+- **Nothing regressed between 08-28 and 08-30.** Every apparent drop measured
+  on 08-29/30 was the clock profile: uncapped, the 0.8B beats its pre-cap row
+  (11,166 vs 10,095), and the 27B, 35B and 4B reproduce theirs (1,302 vs 1,330;
+  1,984 vs 1,942; 5,345 vs 4,942). The detour that found it — binaries, flags,
+  client shards, graph updates, all ruled out — is in INFERENCE.md.
+- **Two configuration levers worth as much as a kernel change**: capping the
+  context to the workload (`--max-model-len 2048`) is worth 16 % on the 0.8B,
+  because auto sizes a 4.25 M-token KV cache the shape never touches; and on the
+  35B MoE, `--no-thinking` costs 27 % of decode, since the generated text
+  changes the expert spread per round. Both belong in every row's comment.
 - Every surogate row above is from a binary that passes the correctness
   batteries at its concurrency (coherence and the strict-structure counting
   probe, `surogate/serve/tools/probe/`). The Flash-Next one-card rows are the
   first measured after the host-split fix of 2026-08-30 (`bfb87ec6`); the
   earlier 22.4 / 32.2 / 37.0 rows were measured through it.
+- **How to reproduce a row.** Serving rows: `probe/board.py PORT MODEL USERS
+  SECONDS 512 128 WARMUP SHARDS` against the launch line in the row's comment
+  (shard the clients above ~5k tok/s; one Python process caps a fast engine).
+  Engine-level questions — flags, binaries, cards, kernels — belong in
+  `csrc/build-serve/serve_bench/ninfer_bench` instead, which does load, warm-up
+  and five repetitions of pp512+tg128 in about 3 s.
 
 ## Open items
 
