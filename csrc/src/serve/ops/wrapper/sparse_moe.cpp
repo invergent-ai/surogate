@@ -83,6 +83,9 @@ struct QuantGeometry {
     std::int32_t group_size;
     std::size_t code_bytes_per_group;
     std::size_t high_bytes_per_group;
+    std::size_t scale_bytes_per_group = 2;      // fp16 for the row-split codecs
+    QuantLayout layout                = QuantLayout::RowSplit;
+    DType scale_dtype                 = DType::FP16;
 };
 
 QuantGeometry quant_geometry(QType qtype) {
@@ -95,6 +98,10 @@ QuantGeometry quant_geometry(QType qtype) {
         return {64, 32, 16};
     case QType::W8G32_F16S:
         return {32, 32, 0};
+    case QType::NVFP4:
+        // Sixteen values per group, two per code byte, one e4m3 scale byte, and the dense
+        // block-scale tiling rather than row-split.
+        return {16, 8, 0, 1, QuantLayout::BlockScaleK16M128x4, DType::FP8_E4M3FN};
     default:
         throw std::invalid_argument("sparse_moe: unsupported quantized weight format");
     }
@@ -107,15 +114,15 @@ void require_quantized(const Weight& weight, std::int32_t n, std::int32_t k, con
     const std::size_t groups           = static_cast<std::size_t>(n) * k / geometry.group_size;
     const std::size_t code_bytes       = groups * geometry.code_bytes_per_group;
     const std::size_t high_bytes       = groups * geometry.high_bytes_per_group;
-    const std::size_t scale_bytes      = groups * 2;
+    const std::size_t scale_bytes      = groups * geometry.scale_bytes_per_group;
     const std::size_t required_payload = code_bytes + high_bytes + scale_bytes;
-    if (weight.layout != QuantLayout::RowSplit || weight.scale_dtype != DType::FP16 ||
+    if (weight.layout != geometry.layout || weight.scale_dtype != geometry.scale_dtype ||
         weight.group_size != static_cast<std::uint32_t>(geometry.group_size) ||
         weight.group != geometry.group_size || weight.qdata == nullptr ||
         weight.scales == nullptr || weight.payload_bytes < required_payload ||
         weight.high_plane_bytes < high_bytes || !aligned_to(weight.qdata, 16) ||
         !aligned_to(weight.scales, 16)) {
-        throw std::invalid_argument(std::string("sparse_moe: invalid row-split ") + name);
+        throw std::invalid_argument(std::string("sparse_moe: invalid quantized ") + name);
     }
     if ((high_bytes == 0 && weight.qhigh != nullptr) ||
         (high_bytes != 0 && (weight.qhigh == nullptr || !aligned_to(weight.qhigh, 16)))) {
@@ -132,13 +139,15 @@ void validate_weights(const SparseMoeWeights& weights, const SparseMoeGeometry& 
                       std::vector<AddressRange>& ranges) {
     require_router(weights.router_shared_gate, geometry, ranges);
     if (weights.routed_gate_up.qtype != QType::Q4G64_F16S &&
-        weights.routed_gate_up.qtype != QType::W8G32_F16S) {
-        throw std::invalid_argument("sparse_moe: routed_gate_up must be Q4 or W8");
+        weights.routed_gate_up.qtype != QType::W8G32_F16S &&
+        weights.routed_gate_up.qtype != QType::NVFP4) {
+        throw std::invalid_argument("sparse_moe: routed_gate_up must be Q4, W8, or NVFP4");
     }
     if (weights.routed_down.qtype != QType::Q5G64_F16S &&
         weights.routed_down.qtype != QType::Q6G64_F16S &&
-        weights.routed_down.qtype != QType::W8G32_F16S) {
-        throw std::invalid_argument("sparse_moe: routed_down must be Q5, Q6, or W8");
+        weights.routed_down.qtype != QType::W8G32_F16S &&
+        weights.routed_down.qtype != QType::NVFP4) {
+        throw std::invalid_argument("sparse_moe: routed_down must be Q5, Q6, W8, or NVFP4");
     }
     if (weights.shared_gate_up.qtype != QType::W8G32_F16S ||
         weights.shared_down.qtype != QType::W8G32_F16S) {

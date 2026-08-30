@@ -3,6 +3,7 @@
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
 
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -55,6 +56,8 @@ struct QuantGeometry {
     std::int32_t group;
     std::size_t code_bytes_per_group;
     std::size_t high_bytes_per_group;
+    std::size_t scale_bytes_per_group = 2;   // fp16 for the row-split codecs, e4m3 for NVFP4
+    bool block_scale                  = false; // NVFP4 stores scales in 128x4 tiles, not per row
 };
 
 QuantGeometry quant_geometry(QType qtype) {
@@ -67,9 +70,101 @@ QuantGeometry quant_geometry(QType qtype) {
         return {64, 32, 16};
     case QType::W8G32_F16S:
         return {32, 32, 0};
+    case QType::NVFP4:
+        return {16, 8, 0, 1, true};
     default:
         throw std::invalid_argument("sparse_moe test: unsupported codec");
     }
+}
+
+// Quantises a float source into NVFP4 for the routed-expert arm: e2m1 codes row-major, two per
+// byte, and one e4m3 scale per 16 values written through the BlockScaleK16M128x4 swizzle the
+// engine and the artifact use. The shared fixture cannot do this — `pack_row_split_lowbit`
+// handles only row-split codecs, and the options-based packer synthesises scale *patterns*
+// rather than quantising real values, which an oracle comparison needs.
+quantized_weight::PackedWeight pack_nvfp4(const std::vector<float>& source, std::int32_t n,
+                                          std::int32_t k) {
+    if ((n % 128) != 0 || (k % 64) != 0 || source.size() != static_cast<std::size_t>(n) * k) {
+        throw std::invalid_argument("nvfp4 test packer: N must be a multiple of 128, K of 64");
+    }
+    // E2M1 magnitudes, index = code & 7, sign in bit 3.
+    static constexpr float kMagnitudes[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+    const std::int32_t groups_per_row     = k / 16;
+    const std::int32_t k_tiles            = k / 64;
+
+    quantized_weight::PackedWeight packed;
+    packed.code_plane_bytes   = static_cast<std::uint64_t>(n) * k / 2;
+    packed.scale_plane_offset = (packed.code_plane_bytes + 255U) / 256U * 256U;
+    packed.scale_plane_bytes  = static_cast<std::uint64_t>(n) * k / 16;
+    packed.weight_divisor_offset = packed.scale_plane_offset + packed.scale_plane_bytes;
+    packed.payload.assign(static_cast<std::size_t>(packed.weight_divisor_offset) + 4U, 0);
+    packed.dequant.assign(source.size(), 0.0f);
+
+    for (std::int32_t row = 0; row < n; ++row) {
+        for (std::int32_t group = 0; group < groups_per_row; ++group) {
+            const std::size_t base = static_cast<std::size_t>(row) * k + group * 16;
+            float amax             = 0.0f;
+            for (int i = 0; i < 16; ++i) { amax = std::max(amax, std::fabs(source[base + i])); }
+            // Scale so the largest magnitude lands on E2M1's 6, then round it to a real e4m3
+            // value — the kernel decodes the stored byte, so the reference must use that same
+            // rounded scale rather than the ideal one.
+            const float wanted = amax > 0.0f ? amax / 6.0f : 1.0f;
+            const __nv_fp8_e4m3 stored_scale(wanted);
+            const float scale = static_cast<float>(stored_scale);
+            const float inverse = scale > 0.0f ? 1.0f / scale : 0.0f;
+
+            for (int i = 0; i < 16; ++i) {
+                const float value     = source[base + i];
+                const float normalised = std::fabs(value) * inverse;
+                int best = 0;
+                float best_error = std::fabs(normalised - kMagnitudes[0]);
+                for (int candidate = 1; candidate < 8; ++candidate) {
+                    const float error = std::fabs(normalised - kMagnitudes[candidate]);
+                    if (error < best_error) { best_error = error; best = candidate; }
+                }
+                const bool negative = std::signbit(value);
+                const std::uint8_t code =
+                    static_cast<std::uint8_t>((negative ? 0x8u : 0x0u) | static_cast<unsigned>(best));
+                const std::size_t byte = (static_cast<std::size_t>(row) * k + group * 16 + i) / 2;
+                if ((i & 1) == 0) {
+                    packed.payload[byte] = static_cast<std::uint8_t>((packed.payload[byte] & 0xF0u) | code);
+                } else {
+                    packed.payload[byte] =
+                        static_cast<std::uint8_t>((packed.payload[byte] & 0x0Fu) | (code << 4));
+                }
+                packed.dequant[base + i] = (negative ? -1.0f : 1.0f) * kMagnitudes[best] * scale;
+            }
+
+            const std::int32_t row_inner = row % 128;
+            const std::size_t offset =
+                packed.scale_plane_offset +
+                static_cast<std::size_t>((row / 128) * k_tiles + group / 4) * 512U +
+                static_cast<std::size_t>(row_inner % 32) * 16U +
+                static_cast<std::size_t>(row_inner / 32) * 4U +
+                static_cast<std::size_t>(group % 4);
+            packed.payload[offset] = stored_scale.__x;
+        }
+    }
+
+    packed.weight.qtype                = QType::NVFP4;
+    packed.weight.layout               = QuantLayout::BlockScaleK16M128x4;
+    packed.weight.scale_dtype          = DType::FP8_E4M3FN;
+    packed.weight.payload              = packed.payload.data();
+    packed.weight.payload_bytes        = packed.payload.size();
+    packed.weight.qdata                = packed.payload.data();
+    packed.weight.scales               = packed.payload.data() + packed.scale_plane_offset;
+    packed.weight.group_size           = 16;
+    packed.weight.group                = 16;
+    packed.weight.ndim                 = 2;
+    packed.weight.shape[0]             = n;
+    packed.weight.shape[1]             = k;
+    packed.weight.padded_shape[0]      = n;
+    packed.weight.padded_shape[1]      = k;
+    packed.weight.n                    = n;
+    packed.weight.k                    = k;
+    packed.weight.weight_scale_divisor = 1.0f;
+    packed.weight.input_scale_divisor  = 1.0f;
+    return packed;
 }
 
 std::vector<std::uint16_t> bf16_bits(const std::vector<float>& values) {
@@ -113,7 +208,8 @@ public:
                           geometry_.code_bytes_per_group),
           high_row_bytes_(static_cast<std::size_t>(groups_per_row_) *
                           geometry_.high_bytes_per_group),
-          scale_row_bytes_(static_cast<std::size_t>(groups_per_row_) * sizeof(std::uint16_t)),
+          scale_row_bytes_(static_cast<std::size_t>(groups_per_row_) *
+                           geometry_.scale_bytes_per_group),
           codes_(static_cast<std::size_t>(rows) * code_row_bytes_),
           scales_(static_cast<std::size_t>(rows) * scale_row_bytes_) {
         codes_.fill(0);
@@ -157,8 +253,9 @@ public:
         result.n                = rows_;
         result.k                = columns_;
         result.group            = geometry_.group;
-        result.layout           = QuantLayout::RowSplit;
-        result.scale_dtype      = DType::FP16;
+        result.layout      = geometry_.block_scale ? QuantLayout::BlockScaleK16M128x4
+                                                   : QuantLayout::RowSplit;
+        result.scale_dtype = geometry_.block_scale ? DType::FP8_E4M3FN : DType::FP16;
         result.ndim             = 2;
         result.shape[0]         = rows_;
         result.shape[1]         = columns_;
@@ -472,14 +569,19 @@ public:
         std::sort(expert_ids.begin(), expert_ids.end());
         for (int expert : expert_ids) {
             const float factor = 0.8f + static_cast<float>((expert * 3) % 11) * 0.045f;
-            auto gate_up       = quantized_weight::pack_row_split_lowbit(
-                make_gate_up(kExpertGateRows, kHidden, 100U + static_cast<std::uint32_t>(expert),
-                                   factor),
-                kExpertGateRows, kHidden, profile.routed_gate_up);
-            auto down = quantized_weight::pack_row_split_lowbit(
-                make_down(kHidden, kIntermediate, 300U + static_cast<std::uint32_t>(expert),
-                          factor),
-                kHidden, kIntermediate, profile.routed_down);
+            const auto gate_up_source = make_gate_up(
+                kExpertGateRows, kHidden, 100U + static_cast<std::uint32_t>(expert), factor);
+            const auto down_source = make_down(
+                kHidden, kIntermediate, 300U + static_cast<std::uint32_t>(expert), factor);
+            auto gate_up = profile.routed_gate_up == QType::NVFP4
+                               ? pack_nvfp4(gate_up_source, kExpertGateRows, kHidden)
+                               : quantized_weight::pack_row_split_lowbit(
+                                     gate_up_source, kExpertGateRows, kHidden,
+                                     profile.routed_gate_up);
+            auto down = profile.routed_down == QType::NVFP4
+                            ? pack_nvfp4(down_source, kHidden, kIntermediate)
+                            : quantized_weight::pack_row_split_lowbit(
+                                  down_source, kHidden, kIntermediate, profile.routed_down);
             routed_gate_.copy_rows(gate_up, expert * kExpertGateRows);
             routed_down_.copy_rows(down, expert * kHidden);
             experts_.push_back({expert, std::move(gate_up), std::move(down)});
@@ -722,10 +824,17 @@ int main() {
     constexpr std::array<std::int32_t, 6> kQ4Q5Tokens{{1, 2, 46, 47, 768, 4097}};
     constexpr std::array<std::int32_t, 5> kQ4Q6Tokens{{1, 2, 46, 47, 768}};
     constexpr std::array<std::int32_t, 5> kW8W8Tokens{{1, 2, 19, 20, 768}};
-    const std::array<CodecProfile, 3> profiles{{
+    // NVFP4 covers the decode path only for now: the small-T and prefill kernels have no
+    // NVFP4 codec yet, and their plans still refuse the profile (Phase 2).
+    constexpr std::array<std::int32_t, 1> kNvfp4Tokens{{1}};
+    const std::array<CodecProfile, 4> profiles{{
         {"sparse_moe q4+q5 a16", QType::Q4G64_F16S, QType::Q5G64_F16S, kQ4Q5Tokens, true},
         {"sparse_moe q4+q6 a16", QType::Q4G64_F16S, QType::Q6G64_F16S, kQ4Q6Tokens, false},
         {"sparse_moe w8+w8 a16", QType::W8G32_F16S, QType::W8G32_F16S, kW8W8Tokens, false},
+        // NVFP4 routed experts: e2m1 codes with an e4m3 scale every 16 values in the dense
+        // BlockScaleK16M128x4 layout. Shapes line up — gate/up is 1,024 x 2,048 and down
+        // 2,048 x 512, so N is a multiple of 128 and K of 64 for both.
+        {"sparse_moe nvfp4+nvfp4 a16", QType::NVFP4, QType::NVFP4, kNvfp4Tokens, false},
     }};
 
     int failures = 0;

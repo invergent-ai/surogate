@@ -19,7 +19,8 @@ SparseMoeDecodePlan resolve_sparse_moe_decode_plan(const SparseMoeGeometry& geom
         (routed_down == QType::Q5G64_F16S || routed_down == QType::Q6G64_F16S);
     const bool w8_profile =
         routed_gate_up == QType::W8G32_F16S && routed_down == QType::W8G32_F16S;
-    if (!main_profile && !w8_profile) {
+    const bool nvfp4_profile = routed_gate_up == QType::NVFP4 && routed_down == QType::NVFP4;
+    if (!main_profile && !w8_profile && !nvfp4_profile) {
         throw std::invalid_argument("sparse_moe: unsupported routed codec profile");
     }
     SparseMoeDecodePlan plan;
