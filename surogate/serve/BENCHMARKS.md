@@ -35,6 +35,16 @@ Columns:
 - **≈** — the pass recorded decode but not prefill; the figure is derived from
   the workload shape (512/128 → prefill ≈ 4× decode) and so is the throughput.
 
+**Clock caps, 2026-08-29 09:34 → 2026-08-30 07:07.** For that window a boot service locked
+per-card maximum SM clocks (GPUs 0-5 at 1,700 / 2,500 / 1,500 / 2,500 / 1,800 / 2,400 MHz;
+6 and 7 untouched), invisible to `clocks.max.sm`. Every rate measured inside it is
+clock-limited and is **not** comparable to a row from outside it — a controlled pair read
+1,519 vs 1,986 tok/s for the same engine on GPU 0 and GPU 5. The profile has been removed and
+the cards verify equal within 3 %; rows dated 08-26/27/28 predate it, rows dated 2026-08-30
+07:07 or later are uncapped, and any row still carrying a capped number says so in its
+comment. Power stays limited to 400 W per card, which is what the clock settles against
+(~2.0 GHz on the 27B).
+
 Shapes: **512/128** unless the comment says otherwise (prefill-heavy is
 2048/16, decode-heavy 128/512, single-user TTFT at a ~1.9k prompt). KV cache
 fp8 (e4m3) on surogate; int8 KV is never used on this board (it changes
@@ -60,17 +70,18 @@ column across shapes.
 
 ## Board of record (2026-08-30)
 
-One table per model, the same columns throughout. A measurement pass on 2026-08-30 replaced
-the derived (≈) cells for the models that fit one card; the 27B and the eight-card pipeline
-rows are in flight and are the ones still marked ≈.
+One table per model, the same columns throughout. A re-measurement on uncapped, uniform cards
+(2026-08-30 07:07 onwards) is landing model by model; rows that still carry a capped or
+derived (≈) number say so in their comment.
 
 ### Qwen3.5-0.8B
 
 | engine | GPUs | users | prefill tok/s | decode tok/s | throughput tok/s | TTFT p50 | comments |
 |---|---:|---:|---:|---:|---:|---:|---|
-| **surogate** | 1 | 100 | **32,226** | **7,785** | **40,011** | **30 ms** | GGUF Q4_K_M repack, 128 lanes, `--max-model-len 2048`; 2026-08-30, quiet host, 8 client shards |
-| surogate | 1 | 100 | 27,222 | 6,577 | 33,799 | 40 ms | same, context left at auto (262,144 → a 4.25 M-token KV cache): −16 % decode for a shape that never uses it |
-| vLLM | 1 | 100 | 29,050 | 6,992 | 36,042 | 0.71 s | NVFP4 (`surogate/Qwen3.5-0.8B-NVFP4`), vLLM defaults, `--max-model-len 2048`; 2026-08-30, quiet host |
+| **surogate** | 1 | 100 | **46,225** | **11,166** | **57,391** | **20 ms** | GGUF Q4_K_M repack, 128 lanes, `--max-model-len 2048`, 8 client shards; 2026-08-30 07:08, uncapped GPU 0 |
+| vLLM | 1 | 100 | 29,122 | 7,009 | 36,131 | 0.69 s | NVFP4 (`surogate/Qwen3.5-0.8B-NVFP4`), `--max-model-len 2048`; same batch, uncapped GPU 1. surogate **+59 % decode, 34× TTFT** |
+| surogate | 1 | 100 | 32,226 | 7,785 | 40,011 | 30 ms | the same run under the clock caps (GPU 0 pinned to 1,700 MHz) — kept as the scale of the cap, not a board row |
+| surogate | 1 | 100 | 27,222 | 6,577 | 33,799 | 40 ms | capped, and with the context left at auto (262,144 → a 4.25 M-token KV cache): −16 % more for a shape that never uses it |
 | **surogate** | 1 | 100 | **81,376** | 636 | 82,012 | 2.39 s | prefill-heavy 2048/16 (2026-08-27, GPU4) |
 | vLLM | 1 | 100 | 45,106 | 352 | 45,458 | 3.88 s | prefill-heavy, same card |
 | **surogate** | 1 | 1 | 39,600 † | **503** | — | **48 ms** | 2026-08-26, GPU2, bf16 KV |
