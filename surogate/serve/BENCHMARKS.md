@@ -102,14 +102,16 @@ what the engine does and how the number was arrived at.
 |---|---:|---:|---:|---:|---:|---:|---|
 | **surogate** | 1 | 100 | **22,121** | **5,345** | **27,466** | **40 ms** | NVFP4 3.56 GiB, 128 lanes, chunk 2,048, `--max-model-len 2048`, 8 client shards; 2026-08-30 07:17, uncapped GPU 6 |
 | surogate | 1 | 100 | 19,767 | 4,942 | 24,709 | 45 ms | the 2026-08-28 pass (pre-cap), which this reproduces +8 % |
-| vLLM | 1 | 100 | 16,984 | 4,246 | 21,230 | 239 ms | NVFP4, 2026-08-28 pass; not re-measured — the NVFP4 4B checkpoint is no longer on this host, so the pair stays the 08-28 one (surogate +16 % on both, 5.3× TTFT) |
+| vLLM | 1 | 100 | 18,543 | 4,481 | 23,023 | 0.23 s | `surogate/Qwen3.5-4B-NVFP4` (ModelOpt), `--max-num-seqs 128`, `--max-model-len 2048`; 2026-08-30 13:24, uncapped GPU 5, 3,200 requests, 0 errors. surogate **+19 % decode, +19 % prefill, 5.8x TTFT** |
+| vLLM | 1 | 100 | 16,984 | 4,246 | 21,230 | 239 ms | the 2026-08-28 pass this replaces; the row above reproduces it +5.5 % on decode (surogate +16 % on both, 5.3× TTFT) |
 | **surogate** | 1 | 100 | **40,677** | 318 | 40,995 | 4.77 s | prefill-heavy 2048/16 (GPU5) |
 | vLLM | 1 | 100 | 34,964 | 273 | 35,237 | 5.00 s | prefill-heavy, same card |
-| **surogate** | 1 | 1 | **63,300 †** | **204** | — | **30 ms** | 2026-08-30 10:19, uncapped GPU 0, fp8 KV, ~1,900-token prompt. No vLLM pair: the NVFP4 4B checkpoint is no longer on this host |
+| **surogate** | 1 | 1 | **63,300 †** | **204** | — | **30 ms** | 2026-08-30 10:19, uncapped GPU 0, fp8 KV, ~1,900-token prompt. Paired 2026-08-30; vLLM leads decode on this shape, see this host |
 | surogate | 1 | 1 | 33,300 † | 214 | — | 57 ms | the 2026-08-26 pass (GPU 2) this replaces — decode within 5 %, prompt processing 1.9× |
 | llama.cpp | 1 | 1 | **7,000 †** | **182** | — | **270 ms** | 2026-08-30 12:05, uncapped GPU 5, CUDA build, `unsloth/Qwen3.5-4B-GGUF` Q4_K_M (fetched for this row; our side is NVFP4). Its own prompt-eval timing is 13,000 tok/s |
 | llama.cpp | 1 | 1 | 4,300 † | 190 | — | 445 ms | the 2026-08-26 pass this replaces — TTFT 1.6× better, decode flat |
-| vLLM | 1 | 1 | 26,800 † | 166 | — | 71 ms | 2026-08-26, not re-measured |
+| **vLLM** | 1 | 1 | 31,700 † | **249** | — | 60 ms | same checkpoint and card; 2026-08-30 13:27, ~1,900-token prompt. **vLLM leads decode here by 22 %** (249 against 204) while we keep 2x on TTFT and prompt processing — the second single-user shape where they lead, after the 27B |
+| vLLM | 1 | 1 | 26,800 † | 166 | — | 71 ms | the 2026-08-26 pass this replaces |
 
 ### Qwen3.8-27B
 
@@ -249,9 +251,8 @@ what the engine does and how the number was arrived at.
   bandwidth for the host-offloaded model (23 against 46 GB/s) and costs about a
   third of its throughput; VRAM-resident models are unaffected. Until it is
   fixed, single-card Flash-Next rows belong on GPU 0, 1, 4 or 6.
-- **The 4B has no current vLLM pair.** That checkpoint is gone from this host, so
-  the 4B's three-way stays two-way (surogate and llama.cpp are both 2026-08-30).
-  Every other single-user row on this board is now from the same week.
+- **Nothing. Every row on this board is from 2026-08-30**, on the same binary and
+  uncapped cards, except the hardware item below.
 
 ### Closed on 2026-08-30
 

@@ -2417,3 +2417,28 @@ measuring sector efficiency, not by writing a kernel.
 Two repairs came out of it: the MoE bench had not compiled since the geometry argument landed
 (so the binary on disk was stale, and its fixture left `experts_per_token` at zero), and the
 prefill translation unit still included the NVFP4 codec header after its arm moved to decode.
+
+## 2026-08-30 — the 4B pair closes, and vLLM wins one shape
+
+`surogate/Qwen3.5-4B-NVFP4` was fetched back (it had left the host, and was in neither
+user's cache) and served on vLLM against our NVFP4 4B, both shapes, same card:
+
+| shape | surogate | vLLM |
+|---|---|---|
+| 100 users, 512/128 | 22,121 prefill / **5,345** decode / 40 ms | 18,543 / 4,481 / 0.23 s |
+| 1 user, ~1,900 prompt | 63,300 † / 204 / **30 ms** | 31,700 † / **249** / 60 ms |
+
+At 100 users we lead on everything: +19 % decode, +19 % prefill, 5.8x TTFT, 3,200
+requests with no errors on either side. **At one user vLLM leads decode by 22 %** — 249
+against 204 — while we keep 2x on TTFT and prompt processing. That is the second
+single-user shape where they lead, after the 27B (71.7 against 70.8), and the pattern is
+consistent: their per-token decode path is better when there is nothing to batch, ours
+wins the moment concurrency or time-to-first-token matters.
+
+Worth keeping in view rather than acting on: single-user decode is the shape our
+scheduler contributes least to, so the gap is kernel-side, and it is the same routed and
+dense GEMM families whose ceiling is now measured (`design/serve-engine-backlog.md` B1:
+16 of 48 warps, registers and shared memory binding together).
+
+With this the board has no stale rows left. Every figure is 2026-08-30, on one binary and
+uncapped cards; the only open item is the four x8 PCIe links, which is hardware.
