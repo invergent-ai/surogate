@@ -2638,3 +2638,43 @@ tokens without finishing. `ttft.py` had the same bug from the other side: it tim
 *answer* chunk, which on a thinking model is the end of the reasoning, not the first token
 generated — 68 ms once fixed, against the seconds it would otherwise have reported.
 
+## 2026-08-30 (night) — Flash-Next prompt processing: the CPU prefill split was the whole gap
+
+Chasing the goal of beating llama.cpp on every Flash-Next axis, the one losing axis was
+long-prompt ingestion: 484 prompt tok/s against 1,216 from llama.cpp's `-cmoe -b 4096 -ub 4096`
+(measured on our own host — the board's llama.cpp row, 7.1 tok/s decode under `-ot exps=CPU`
+with no batch flags, understates that engine by 3.9× and its flags, not its kernels, were the
+difference). The trail had three false leads before the real one:
+
+1. **Not the chunk count.** A gather-per-chunk model (91 GB × 28 chunks ÷ 46 GB/s = 55.4 s)
+   matched the 484 baseline to 4.5 % — and then predicted 4× *faster* at chunk 4,096, where the
+   first sweep measured 3× *slower* (167 t/s). The model happened to fit at one point.
+2. **Not the sweep's own confound.** That first sweep passed an explicit prefill share in every
+   cell while the baseline ran `auto` — which does not resolve to 0 as assumed but to a measured
+   45 %. Two variables moved at once, twice.
+3. **Not the x8 cards.** One instrumented rerun landed on GPUs 2/3, whose links train at x8 —
+   banned by the board's own guidance for this model. Thrown away.
+
+The clean experiment — CPU split fully off, x16 cards, four chunk widths, one batch —
+settled it:
+
+| prefill chunk | pure GPU (tok/s) | with the split |
+|---:|---:|---:|
+| 1,024 | 1,632 | 484 (auto, 45 %) |
+| 2,048 | 2,428 | — |
+| 4,096 | 3,275 | 167 (0.5) |
+| 8,192 | **3,944** | 135-168 (0.5-1.0) |
+
+**The pure-GPU path scales almost linearly with the chunk and beats llama.cpp 3.2× at 8,192.**
+The CPU prefill split is a loss at *every* width, and its cost grows with the chunk: the host
+GEMM (`ninfer_cpu_expert_compute_bench`, prefill shapes) runs at ~1.06 TMAC/s — 16 % of VNNI
+peak, against the ~55 % llama.cpp's own CPU prefill implies — and each layer's combine waits on
+its host tail (`t_partial.join`, variant.cpp), so 60 layers of host GEMM sum into the round.
+Defaulting the prefill share to 0 (decode split untouched — at one token per lane the gather is
+misses-only and the host genuinely relieves it) turns the one losing axis into the largest win:
+484 → 3,944 t/s on the same binary, flags only. The inner q4 VNNI kernel's 16 %-of-peak is a
+separate, real lever (~3×) if the CPU path is ever wanted for prefill again.
+
+Confirmation battery (throughput at three shapes plus coherence, chunkcount and longprompt under
+the new flags) and the llama.cpp multi-user and 8-card axes are queued; board rows follow it.
+

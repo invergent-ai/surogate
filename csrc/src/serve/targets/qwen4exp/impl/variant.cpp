@@ -778,8 +778,14 @@ ExpertSlotCache& expert_slot_cache_for_current_device() {
             fraction = std::strtod(share, nullptr);
         }
     }
-    // Prefill share: -1 (unset) → 0.5 when the split is on (measured optimum at concurrency;
-    // 0.7 is better for a single user), 0 turns the prefill split off.
+    // Prefill share: -1 (unset) → 0. The prefill split is a measured loss at every chunk width
+    // on this host (2026-08-30, 28k prompt, x16 card): pure GPU reads 1,632 / 2,428 / 3,275 /
+    // 3,944 prompt tok/s at chunks 1,024 / 2,048 / 4,096 / 8,192, while the auto split (45 %)
+    // read 484 at 1,024 and forcing 0.5-1.0 read 151-168 at any width — the host GEMM runs at
+    // ~16 % of VNNI peak and every layer's combine waits on its host tail, so the split caps the
+    // round at the CPU's pace. The decode split is a separate decision and keeps its own share:
+    // at one token per lane the gather is misses-only and the host genuinely relieves it. An
+    // explicit --cpu-moe-prefill-share still turns the prefill split on for re-measurement.
     double prefill_fraction        = -1.0;
     std::uint32_t prefill_chunk    = 0;
     if (auto configured = configured_cpu_prefill().find(device); configured != configured_cpu_prefill().end()) {
@@ -791,7 +797,7 @@ ExpertSlotCache& expert_slot_cache_for_current_device() {
         if (prefill_chunk == 0) { prefill_chunk = 2048; }
     }
     const bool prefill_default = prefill_fraction < 0.0;
-    if (prefill_default) { prefill_fraction = fraction > 0.0 ? 0.5 : 0.0; }
+    if (prefill_default) { prefill_fraction = 0.0; }
     if (prefill_chunk == 0) { prefill_chunk = 2048; }
     {
         if (fraction > 0.0 || prefill_fraction > 0.0) {
