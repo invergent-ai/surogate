@@ -32,8 +32,7 @@ Columns:
   one-user row is that stream's speed).
 - **throughput tok/s** — prefill + decode: all tokens the engine moved per second.
 - **TTFT p50** — median time to the first streamed content token.
-- **≈** — the pass recorded decode but not prefill; the figure is derived from
-  the workload shape (512/128 → prefill ≈ 4× decode) and so is the throughput.
+
 
 **Clock caps, 2026-08-29 09:34 → 2026-08-30 07:07.** For that window a boot service locked
 per-card maximum SM clocks (GPUs 0-5 at 1,700 / 2,500 / 1,500 / 2,500 / 1,800 / 2,400 MHz;
@@ -70,7 +69,8 @@ column across shapes.
 
 ## Board of record (2026-08-30)
 
-One table per model, the same columns throughout. **The first row of each model's table is the
+One table per model, the same columns throughout; **every cell is measured** — the derived
+figures the board used to carry are gone. **The first row of each model's table is the
 current reference**: measured on 2026-08-30 after the clock caps were removed, one model at a
 time on an idle host, with its vLLM pair in the same batch on a second card wherever the
 checkpoint is still on this machine. Rows below it are kept for provenance — the pre-cap pass
@@ -111,8 +111,9 @@ what the engine does and how the number was arrived at.
 | **surogate** | 1 | 100 | **5,815** | **1,302** | **7,117** | **170 ms** | all-NVFP4, 128 lanes, chunk 4,096, `--max-model-len 2048`; 2026-08-30 07:11, uncapped GPU 2. Reproduces the 08-28 pass below within noise, so nothing regressed — the 1,068 measured under the caps was the cap |
 | surogate | 1 | 100 | 5,319 | 1,330 | 6,649 | 170 ms | the 2026-08-28 pass (pre-cap): mean of two passes, cards rotated |
 | vLLM | 1 | 100 | 4,156 | 1,039 | 5,195 | 8.26 s | NVFP4, 2026-08-28 pass; a same-batch uncapped pair is in flight |
-| surogate | 8 | 100 | ≈ 5,300 | 1,332 | ≈ 6,600 | — | 8-stage pipeline, C3 + asynchronous prompt flights: capacity, not throughput per card |
-| surogate | 8 | 1 | ≈ 78 | 19.6 | ≈ 98 | 0.43 s | 8 stages, closed pipeline |
+| surogate | 8 | 100 | 4,403 | 986 | 5,389 | 1.33 s | 8-stage pipeline, C3 + asynchronous prompt flights, `--max-model-len 2048`; 2026-08-30 08:18, uncapped. **Below the one card above** — the pipeline buys capacity, not throughput per card |
+| **surogate** | 8 | 1 | **306** | **68.6** | **374** | **0.16 s** | same, one user: each card holds 6 layers, so a token costs ~0.9 ms across the eight stages against ~5 ms on one card |
+| surogate | 8 | 100 / 1 | — | 1,332 / 19.6 | — | — / 0.43 s | the 2026-08-29 pass (clock-capped, in-phase clients) |
 | **surogate** | 1 | 100 | 471 | **1,884** | 2,355 | **14.2 s** | decode-heavy 128/512, 64 lanes (GPU5) |
 | vLLM | 1 | 100 | 360 | 1,438 | 1,798 | 21.9 s | decode-heavy, same card |
 | surogate | 1 | 100 | 7,339 | 57 | 7,396 | 25.8 s | prefill-heavy 2048/16, chunk 4,096 (GPU6); the open 27B gap |
@@ -129,8 +130,9 @@ what the engine does and how the number was arrived at.
 | vLLM | 1 | 100 | 8,957 | **2,166** | 11,123 | 3.13 s | `RedHatAI/Qwen3.6-35B-A3B-NVFP4`, `--max-num-seqs 128`; measured under the caps on GPU 3 (2,500 MHz) — an uncapped same-batch pair is in flight. surogate at 92 % of decode with 10× the TTFT |
 | surogate | 1 | 100 | 7,933 | 1,919 | 9,852 | 0.29 s | the same configuration under the caps (GPU 5 at 2,400 MHz) |
 | surogate | 1 | 100 | 5,780 | 1,394 | 7,174 | 0.35 s | capped, and with `--no-thinking`: −27 % decode on top. On this MoE the generated text changes the expert spread per round, so the thinking mode is part of the configuration; the dense 27B shows no such gap |
-| surogate | 8 | 100 | ≈ 9,470 | **2,368** | ≈ 11,840 | — | 8-stage pipeline, C3 + asynchronous prompt flights |
-| surogate | 8 | 1 | ≈ 200 | 50.1 | ≈ 250 | 0.35 s | 8 stages, closed pipeline |
+| **surogate** | 8 | 100 | **8,785** | **2,123** | **10,908** | **0.58 s** | 8-stage pipeline, C3 + asynchronous prompt flights, `--max-model-len 2048`; 2026-08-30 08:25, uncapped. Above the one card, and the only configuration that beats vLLM's single-card decode |
+| **surogate** | 8 | 1 | **965** | **233.4** | **1,198** | **0.09 s** | same, one user: 3 B active split eight ways puts a token at ~0.9 ms |
+| surogate | 8 | 100 / 1 | — | 2,368 / 50.1 | — | — / 0.35 s | the 2026-08-29 pass (clock-capped, in-phase clients) |
 
 ### Qwen3.8-Flash-Next (111 GB MoE; on one card the experts live on the host)
 
