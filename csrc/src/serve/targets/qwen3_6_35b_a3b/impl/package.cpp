@@ -70,6 +70,9 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
     if (identity.model_id == model_id && identity.weights_id == "groupwise-int") {
         return WeightsProfile::GroupwiseInt;
     }
+    if (identity.model_id == model_id && identity.weights_id == "routed-nvfp4") {
+        return WeightsProfile::RoutedNvfp4;
+    }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
                              "' is not supported by target '" + std::string(target_key) + "'");
 }
@@ -77,7 +80,8 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
                                      WeightsProfile weights_profile) {
     return LoadPlan(std::make_unique<LoadPlan::Impl>(
-        weights_profile, detail::bind_artifact(binder, qwen3_6::startup_features(options))));
+        weights_profile,
+        detail::bind_artifact(binder, qwen3_6::startup_features(options), weights_profile)));
 }
 
 std::unique_ptr<Package::LoadedModel>

@@ -31,6 +31,10 @@ struct Variant;
 
 enum class WeightsProfile : std::uint8_t {
     GroupwiseInt,
+    // Routed experts NVFP4, everything else as GroupwiseInt has it. The routed weights are the
+    // only ones the 35B still reads from a GGUF-derived groupwise export, and the format is worth
+    // more on this hardware than any scheduling lever the board has measured.
+    RoutedNvfp4,
 };
 
 using Frontend       = qwen3_6::Frontend;

@@ -29,6 +29,10 @@ struct MoePlan {
     artifact::ObjectHandle routed_down;
     artifact::ObjectHandle shared_gate_up;
     artifact::ObjectHandle shared_down;
+    /// NVFP4 only: the format's second level, per expert and per projection (see
+    /// `ops::SparseMoeWeights`). Unset for a groupwise-int artifact, which has no such objects.
+    std::optional<artifact::ObjectHandle> routed_gate_up_scale;
+    std::optional<artifact::ObjectHandle> routed_down_scale;
 };
 
 struct FullAttentionPlan {
@@ -89,6 +93,9 @@ struct DFlashPlan {
 struct BindingPlan {
     qwen3_6::FrontendResourcePlan frontend;
     qwen3_6::StartupFeatures features;
+    /// Which weight formats the artifact carries; decided by the identity, read by both the
+    /// binder (which object formats to expect) and the loader (which Weights to build).
+    WeightsProfile weights = WeightsProfile::GroupwiseInt;
     artifact::ObjectHandle token_embedding;
     std::array<TextLayerPlan, kTextLayers> text_layers;
     artifact::ObjectHandle final_norm;
@@ -112,7 +119,8 @@ struct ArtifactLoadPlan {
     artifact::MaterializationPlan materialization;
 };
 
-ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeatures features);
+ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeatures features,
+                               WeightsProfile weights);
 
 struct SparseMoePayload {
     ops::SparseMoeWeights op;

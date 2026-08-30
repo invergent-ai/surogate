@@ -1,5 +1,34 @@
 # NVFP4 routed experts for the 35B-A3B
 
+**Status 2026-08-30: the kernels are done and the artifact is being built.** The decode codec,
+the small-T path and wide rounds (as small-T slices) all pass the fp64 oracle, the format's
+second level is applied per expert, and the converter reads
+`RedHatAI/Qwen3.6-35B-A3B-NVFP4` — the same checkpoint vLLM serves for the board's pair —
+without a dequantise/requantise round trip. What is left is measurement.
+
+Two things the plan below got wrong, both found by measuring rather than reasoning:
+
+* **Phase 3 (the expert slot cache) is not on this path at all.** The slot cache is used by one
+  target, `qwen4exp` (Flash-Next, host-offloaded); the 35B is VRAM-resident on one card, so its
+  routed weights are plain resident `Weight`s. Phase 1 was never blocked on Phase 3.
+* **Phase 2 (the prefill MMA arm) is not a correctness gate either.** A wide round now runs as a
+  sequence of small-T slices, correct at every width, so the MMA arm is a pure performance item.
+
+**And one thing it got right and then had to pay for:** the second level really does have to be
+per expert. Measured over layer 0 and layer 20 of the checkpoint, `weight_global_scale` takes
+96-118 distinct values across the 256 experts of one projection, spanning 3.3-7.0x. It is
+applied as a multiply on the finished dot (`ops::SparseMoeWeights::routed_gate_up_scale`,
+`routed_down_scale`), which is exact and costs one multiply per expert path.
+
+The checkpoint is 40 layers x 256 experts, `moe_intermediate` 512 over hidden 2,048, all 40
+layers MoE, `compressed-tensors` / `nvfp4-pack-quantized`.
+
+---
+
+*The original plan follows. Its Phase 1 is shipped; Phases 3 and 4 are superseded by the notes
+above and by the converter that now exists.*
+
+
 **Why.** The 35B is the last model on a non-NVFP4 routed artifact and the last one behind
 vLLM: 1,984 tok/s decode against 2,162 on the same shape and day (92 %), with 10× better TTFT.
 Every other model gained more from the weight format than from any scheduling lever — the 4B

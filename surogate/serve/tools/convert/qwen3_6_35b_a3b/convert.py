@@ -29,7 +29,7 @@ from surogate.serve.tools.convert.common.safetensors import ShardReader
 from surogate.serve.tools.convert.qwen3_6.common import conversion as family_conversion
 from surogate.serve.tools.convert.qwen3_6.common import official_resources
 
-from . import draft_head, inventory, recipe
+from . import draft_head, inventory, recipe, routed_nvfp4
 
 
 RECIPE_ID = "qwen3_6_35b_a3b-v2"
@@ -163,6 +163,8 @@ class ConversionPreflight:
     resources: tuple[ResourcePayload, ...]
     draft: draft_head.DraftHeadContext
     object_plan: ObjectPlan
+    routed_nvfp4_dir: Path | None = None
+    routed_nvfp4_summary: dict[str, object] | None = None
 
 
 def _repo_root() -> Path:
@@ -323,27 +325,37 @@ def load_resources(model_dir: str | Path) -> tuple[ResourcePayload, ...]:
     )
 
 
-def object_specs(include_dflash: bool) -> tuple[inventory.StoredObjectSpec, ...]:
+def tensor_specs(routed_nvfp4_source: bool) -> tuple[inventory.TensorSpec, ...]:
+    """The tensor half of the inventory for the requested weights profile."""
+    return routed_nvfp4.tensor_specs() if routed_nvfp4_source else inventory.TENSOR_SPECS
+
+
+def object_specs(
+    include_dflash: bool, routed_nvfp4_source: bool = False
+) -> tuple[inventory.StoredObjectSpec, ...]:
     """The artifact's objects, with the dflash/* family only when a drafter
     checkpoint was supplied. The engine probes for that family and refuses
     --spec dflash against an artifact that lacks it."""
+    specs = inventory.RESOURCE_SPECS + tensor_specs(routed_nvfp4_source)
     if include_dflash:
-        return inventory.OBJECT_SPECS
-    return tuple(
-        spec for spec in inventory.OBJECT_SPECS
-        if spec not in inventory.DFLASH_TENSOR_SPECS
-    )
+        return specs
+    return tuple(spec for spec in specs if spec not in inventory.DFLASH_TENSOR_SPECS)
 
 
 def build_object_plan(
-    resources: Mapping[str, bytes], include_dflash: bool = True
+    resources: Mapping[str, bytes],
+    include_dflash: bool = True,
+    routed_nvfp4_source: bool = False,
 ) -> ObjectPlan:
-    return family_conversion.build_object_plan(object_specs(include_dflash), resources)
+    return family_conversion.build_object_plan(
+        object_specs(include_dflash, routed_nvfp4_source), resources
+    )
 
 
 def preflight_conversion(
     model_dir: str | Path,
     dflash_model_dir: str | Path | None,
+    routed_nvfp4_dir: str | Path | None = None,
 ) -> ConversionPreflight:
     """Complete config, source, shortlist, and offset work before writing.
 
@@ -353,6 +365,14 @@ def preflight_conversion(
 
     model = Path(model_dir)
     dflash_model = Path(dflash_model_dir) if dflash_model_dir is not None else None
+    routed_nvfp4_model = Path(routed_nvfp4_dir) if routed_nvfp4_dir is not None else None
+    routed_nvfp4_summary = (
+        routed_nvfp4.validate_config(
+            family_conversion.load_json(routed_nvfp4_model / "config.json")
+        )
+        if routed_nvfp4_model is not None
+        else None
+    )
     base_config_summary = validate_config(
         family_conversion.load_json(model / "config.json")
     )
@@ -373,7 +393,11 @@ def preflight_conversion(
 
     resources = load_resources(model)
     resource_map = {resource.name: resource.data for resource in resources}
-    object_plan = build_object_plan(resource_map, include_dflash=dflash_model is not None)
+    object_plan = build_object_plan(
+        resource_map,
+        include_dflash=dflash_model is not None,
+        routed_nvfp4_source=routed_nvfp4_model is not None,
+    )
 
     ranking = _repo_root() / draft_head.DEFAULT_RANKING
     draft = draft_head.compute_shortlist(ranking, model)
@@ -387,6 +411,8 @@ def preflight_conversion(
         resources=resources,
         draft=draft,
         object_plan=object_plan,
+        routed_nvfp4_dir=routed_nvfp4_model,
+        routed_nvfp4_summary=routed_nvfp4_summary,
     )
 
 
@@ -532,6 +558,7 @@ def convert(
     out_path: str | Path,
     *,
     device: str | torch.device = "cuda",
+    routed_nvfp4_dir: str | Path | None = None,
 ) -> Path:
     """Run the complete target conversion and return its report path."""
 
@@ -541,7 +568,7 @@ def convert(
     requested_device = str(device)
     resolved_device = pick_device(device)
     dflash_model = Path(dflash_model_dir) if dflash_model_dir is not None else None
-    preflight = preflight_conversion(model, dflash_model)
+    preflight = preflight_conversion(model, dflash_model, routed_nvfp4_dir)
 
     print(
         f"preflight complete: {len(preflight.object_plan.objects)} objects, "
@@ -554,7 +581,12 @@ def convert(
     resources = {resource.name: resource.data for resource in preflight.resources}
     with ArtifactWriter(
         output,
-        ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
+        ArtifactIdentity(
+            inventory.MODEL_ID,
+            routed_nvfp4.WEIGHTS_ID
+            if preflight.routed_nvfp4_dir is not None
+            else inventory.WEIGHTS_ID,
+        ),
         preflight.object_plan.specs,
     ) as writer:
         index = 0
@@ -571,29 +603,53 @@ def convert(
         for spec in inventory.RESOURCE_SPECS:
             write_payload(spec, resources[spec.name])
 
-        base_specs = inventory.TENSOR_SPECS[
-            : -len(inventory.DFLASH_TENSOR_SPECS)
-        ]
-        with ShardReader.from_index(
-            model / "model.safetensors.index.json"
-        ) as reader:
-            for spec in base_specs:
-                tensor = materialize_tensor(
-                    spec,
-                    reader,
-                    preflight.draft,
-                    recipe.BASE_RECIPES_BY_NAME,
-                )
-                payload = encode_tensor_payload(tensor, spec, resolved_device)
-                del tensor
-                write_payload(spec, payload)
-                del payload
+        all_specs = tensor_specs(preflight.routed_nvfp4_dir is not None)
+        base_specs = all_specs[: -len(inventory.DFLASH_TENSOR_SPECS)]
+        routed_reader = (
+            ShardReader.from_index(
+                preflight.routed_nvfp4_dir / "model.safetensors.index.json"
+            )
+            if preflight.routed_nvfp4_dir is not None
+            else None
+        )
+        routed_cache = routed_nvfp4.LayerCache(routed_reader) if routed_reader else None
+        try:
+            with ShardReader.from_index(
+                model / "model.safetensors.index.json"
+            ) as reader:
+                for spec in base_specs:
+                    if routed_cache is not None and routed_nvfp4.is_routed_object(spec.name):
+                        # The routed experts come from the NVFP4 checkpoint as stored words:
+                        # no dequantise-requantise round trip, so the artifact holds exactly
+                        # the codes vLLM serves from the same checkpoint.
+                        payload = routed_cache.payload_for(
+                            spec.name,
+                            lambda tensor, spec=spec: encode_tensor_payload(
+                                tensor, spec, resolved_device
+                            ),
+                        )
+                        write_payload(spec, payload)
+                        del payload
+                        continue
+                    tensor = materialize_tensor(
+                        spec,
+                        reader,
+                        preflight.draft,
+                        recipe.BASE_RECIPES_BY_NAME,
+                    )
+                    payload = encode_tensor_payload(tensor, spec, resolved_device)
+                    del tensor
+                    write_payload(spec, payload)
+                    del payload
+        finally:
+            if routed_reader is not None:
+                routed_reader.close()
 
         if dflash_model is not None:
             with ShardReader.from_file(
                 dflash_model / "model.safetensors"
             ) as reader:
-                for spec in inventory.DFLASH_TENSOR_SPECS:
+                for spec in all_specs[-len(inventory.DFLASH_TENSOR_SPECS) :]:
                     tensor = materialize_tensor(
                         spec,
                         reader,
@@ -611,6 +667,7 @@ def convert(
     arguments = {
         "model": str(model_dir),
         "dflash_model": str(dflash_model_dir) if dflash_model_dir is not None else None,
+        "routed_nvfp4": str(routed_nvfp4_dir) if routed_nvfp4_dir is not None else None,
         "out": str(out_path),
         "device": requested_device,
     }
@@ -646,6 +703,16 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--dflash-model", type=Path, default=None,
                         help="DFlash drafter checkpoint; omit to build an artifact without the dflash/* family")
     parser.add_argument("--out", required=True, type=Path)
+    parser.add_argument(
+        "--routed-nvfp4",
+        type=Path,
+        default=None,
+        help=(
+            "NVFP4 checkpoint (compressed-tensors nvfp4-pack-quantized) whose routed "
+            "expert tensors replace the groupwise-int ones; writes the routed-nvfp4 "
+            "weights profile"
+        ),
+    )
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args(argv)
     convert(
@@ -653,6 +720,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         args.dflash_model,
         args.out,
         device=args.device,
+        routed_nvfp4_dir=args.routed_nvfp4,
     )
 
 
