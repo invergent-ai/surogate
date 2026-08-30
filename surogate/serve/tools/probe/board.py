@@ -4,12 +4,15 @@
 unique tag, so nothing shares a prefix) with a fixed output length for `seconds`; every
 request asks for `stream_options.include_usage` so the token accounting is the engine's own.
 
-    python board.py PORT MODEL USERS SECONDS PROMPT_TOKENS MAX_TOKENS [WARMUP_SECONDS]
+    python board.py PORT MODEL USERS SECONDS PROMPT_TOKENS MAX_TOKENS [WARMUP_SECONDS] [SHARDS]
+
+SHARDS > 1 spreads the clients over that many processes (one process cannot drive a fast
+engine: 100 streaming clients under one GIL saturate a core before the engine saturates).
 
 Reports, over the measured window only (a warm-up of the same shape runs first when asked):
   decode tok/s   = completion tokens / wall
   prefill tok/s  = prompt tokens / wall (a throughput share, decode phases included)
-  TTFT p50 / p90 = time to the first streamed content chunk
+  TTFT p50 / p90 = time to the first streamed token (content or reasoning)
   requests completed, errors, mean request latency.
 """
 
@@ -67,7 +70,8 @@ def run(port, model, users, seconds, prompt_tokens, max_tokens, label):
                             usage = d["usage"]
                         choices = d.get("choices") or [{}]
                         delta = choices[0].get("delta", {})
-                        if delta.get("content"):
+                        # Reasoning tokens stream first when thinking is on; they count.
+                        if delta.get("content") or delta.get("reasoning_content") or delta.get("reasoning"):
                             if first is None:
                                 first = time.time() - t0
                             chunks += 1
@@ -98,7 +102,32 @@ def run(port, model, users, seconds, prompt_tokens, max_tokens, label):
         "prefill": prompt_sum[0] / wall, "ttft_p50": q(50), "ttft_p90": q(90),
         "ok": ok[0], "err": err[0],
         "latency_mean": statistics.mean(latencies) if latencies else 0.0,
-        "errors": errors,
+        "errors": errors, "ttfts": ttfts,
+    }
+
+
+def run_sharded(port, model, users, seconds, prompt_tokens, max_tokens, label, shards):
+    """Spread the clients over `shards` processes: one Python process cannot drive a fast
+    engine (100 streaming clients under one GIL is itself the bottleneck above a few
+    thousand tok/s)."""
+    import multiprocessing as mp
+    per = [users // shards + (1 if i < users % shards else 0) for i in range(shards)]
+    with mp.Pool(shards) as pool:
+        parts = pool.starmap(run, [(port, model, n, seconds, prompt_tokens, max_tokens,
+                                    f"{label}{i}") for i, n in enumerate(per) if n])
+    wall = max(p["wall"] for p in parts)
+    ttfts = [t for p in parts for t in p["ttfts"]]
+    q = (lambda pc: statistics.quantiles(ttfts, n=100)[pc - 1] if len(ttfts) >= 2
+         else (ttfts[0] if ttfts else 0.0))
+    return {
+        "users": users, "wall": wall,
+        "decode": sum(p["decode"] * p["wall"] for p in parts) / wall,
+        "prefill": sum(p["prefill"] * p["wall"] for p in parts) / wall,
+        "ttft_p50": q(50), "ttft_p90": q(90),
+        "ok": sum(p["ok"] for p in parts), "err": sum(p["err"] for p in parts),
+        "latency_mean": (statistics.mean([p["latency_mean"] for p in parts if p["ok"]])
+                         if any(p["ok"] for p in parts) else 0.0),
+        "errors": [e for p in parts for e in p["errors"]], "ttfts": ttfts,
     }
 
 
@@ -107,12 +136,16 @@ def main():
     users, seconds = int(sys.argv[3]), float(sys.argv[4])
     prompt_tokens, max_tokens = int(sys.argv[5]), int(sys.argv[6])
     warmup = float(sys.argv[7]) if len(sys.argv) > 7 else 0.0
+    shards = int(sys.argv[8]) if len(sys.argv) > 8 else 1
+    go = (lambda secs, label: run_sharded(port, model, users, secs, prompt_tokens, max_tokens,
+                                          label, shards) if shards > 1
+          else run(port, model, users, secs, prompt_tokens, max_tokens, label))
     if warmup > 0:
-        w = run(port, model, users, warmup, prompt_tokens, max_tokens, "warm")
+        w = go(warmup, "warm")
         print(f"warm-up users={users} {warmup:.0f}s: decode={w['decode']:.1f} tok/s "
               f"ok={w['ok']} err={w['err']}", flush=True)
-    r = run(port, model, users, seconds, prompt_tokens, max_tokens, "board")
-    print(f"board users={users} {r['wall']:.0f}s {prompt_tokens}/{max_tokens}: "
+    r = go(seconds, "board")
+    print(f"board users={users} shards={shards} {r['wall']:.0f}s {prompt_tokens}/{max_tokens}: "
           f"decode={r['decode']:.1f} tok/s prefill={r['prefill']:.1f} tok/s "
           f"ttft_p50={r['ttft_p50'] / 1e3:.2f}s ttft_p90={r['ttft_p90'] / 1e3:.2f}s "
           f"latency_mean={r['latency_mean']:.1f}s ok={r['ok']} err={r['err']}", flush=True)

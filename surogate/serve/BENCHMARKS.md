@@ -60,14 +60,17 @@ column across shapes.
 
 ## Board of record (2026-08-30)
 
-One table per model, the same columns throughout.
+One table per model, the same columns throughout. A measurement pass on 2026-08-30 replaced
+the derived (≈) cells for the models that fit one card; the 27B and the eight-card pipeline
+rows are in flight and are the ones still marked ≈.
 
 ### Qwen3.5-0.8B
 
 | engine | GPUs | users | prefill tok/s | decode tok/s | throughput tok/s | TTFT p50 | comments |
 |---|---:|---:|---:|---:|---:|---:|---|
-| **surogate** | 1 | 100 | ≈ 40,400 | **10,095** | ≈ 50,500 | **45 ms** | GGUF Q4_K_M repack, 128 lanes; 2026-08-28, all cards busy |
-| vLLM | 1 | 100 | ≈ 26,800 | 6,694 | ≈ 33,500 | 658 ms | same pass; surogate +51 % decode, 14× TTFT |
+| **surogate** | 1 | 100 | **32,226** | **7,785** | **40,011** | **30 ms** | GGUF Q4_K_M repack, 128 lanes, `--max-model-len 2048`; 2026-08-30, quiet host, 8 client shards |
+| surogate | 1 | 100 | 27,222 | 6,577 | 33,799 | 40 ms | same, context left at auto (262,144 → a 4.25 M-token KV cache): −16 % decode for a shape that never uses it |
+| vLLM | 1 | 100 | 29,050 | 6,992 | 36,042 | 0.71 s | NVFP4 (`surogate/Qwen3.5-0.8B-NVFP4`), vLLM defaults, `--max-model-len 2048`; 2026-08-30, quiet host |
 | **surogate** | 1 | 100 | **81,376** | 636 | 82,012 | 2.39 s | prefill-heavy 2048/16 (2026-08-27, GPU4) |
 | vLLM | 1 | 100 | 45,106 | 352 | 45,458 | 3.88 s | prefill-heavy, same card |
 | **surogate** | 1 | 1 | 39,600 † | **503** | — | **48 ms** | 2026-08-26, GPU2, bf16 KV |
@@ -106,8 +109,9 @@ One table per model, the same columns throughout.
 
 | engine | GPUs | users | prefill tok/s | decode tok/s | throughput tok/s | TTFT p50 | comments |
 |---|---:|---:|---:|---:|---:|---:|---|
-| surogate | 1 | 100 | ≈ 7,770 | 1,942 | ≈ 9,700 | **253 ms** | Q4/Q5/Q6 MoE from GGUF, prefill batch 4; mean of two passes |
-| **vLLM** | 1 | 100 | ≈ 9,160 | **2,290** | ≈ 11,450 | 1.26 s | surogate at 85 %: per-round routed-kernel efficiency, not bytes (open, kernel project) |
+| surogate | 1 | 100 | 7,933 | 1,919 | 9,852 | **0.29 s** | Q4/Q5/Q6 MoE from GGUF, 128 lanes, chunk 4,096, prefill batch 4, `--max-model-len 2048`; 2026-08-30 (a quiet-host re-run is in flight) |
+| surogate | 1 | 100 | 5,780 | 1,394 | 7,174 | 0.35 s | same with `--no-thinking`: −27 % decode. On this MoE the generated text changes the expert spread per round, so the thinking mode is part of the configuration; the dense 27B shows no such gap |
+| **vLLM** | 1 | 100 | **8,957** | **2,166** | **11,123** | 3.13 s | `RedHatAI/Qwen3.6-35B-A3B-NVFP4`, `--max-num-seqs 128`; 2026-08-30, quiet host. surogate at 89 % of decode with 11× the TTFT |
 | surogate | 8 | 100 | ≈ 9,470 | **2,368** | ≈ 11,840 | — | 8-stage pipeline, C3 + asynchronous prompt flights |
 | surogate | 8 | 1 | ≈ 200 | 50.1 | ≈ 250 | 0.35 s | 8 stages, closed pipeline |
 
