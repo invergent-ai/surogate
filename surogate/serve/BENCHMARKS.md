@@ -14,69 +14,54 @@ build (0.3.0-dev @ f1357e4; Flash-Next rows use upstream master with
 ## Method
 
 Closed-loop HTTP clients against each engine's OpenAI endpoint (streaming
-`/v1/chat/completions`, salted prompts so nothing shares a prefix, the engine's
-own token accounting). Clients are **staggered**, not started together: closed-loop
-clients in phase make a pipeline alternate between all-prefill and all-decode
-rounds, which reads high — an 8-stage Flash-Next pass measured that way reported
-381 tok/s at 16 users against 276 staggered. Numbers exclude model load; rows at 16+ users are
-90-second steady state (shorter windows read up to 25 % high), one-user rows
-60 s. Every engine was measured on the same card class; a number is only
-comparable to its pair on the same card in the same batch. Measured on
-2026-08-30 with the clock caps gone: one binary repeats within **0.6 %** on a
-card and the eight cards agree within **2.7 %**, so a difference above ~3 % is
-real. (The "cards differ by up to 50 %" this section used to warn about was the
-clock profile of 2026-08-29, not the hardware.)
+`/v1/chat/completions`, salted prompts so nothing shares a prefix, the engine's own
+token accounting), model load excluded. Clients are **staggered**, not started
+together: in phase they make a pipeline alternate between all-prefill and
+all-decode rounds, which reads high — an 8-stage Flash-Next pass measured that way
+reported 381 tok/s at 16 users against 276 staggered.
+
+Every engine was measured on the same card class, and **a number is only comparable
+to its pair on the same card in the same batch**. One binary repeats within **0.6 %**
+on a card and the eight cards agree within **2.7 %**, so a difference above ~3 % is
+real and anything under it is not.
+
+Measurement windows are 60-90 s of steady state after a warm-up, one-user rows 45-60 s.
+The window matters: a shorter one reads high, by up to 25 % against a 90 s window on
+an early pass. Today's rows were taken at 62-76 s, so they are inside that band but
+not all at the same point in it — see Open items.
+
+Shapes: **512/128** unless the comment says otherwise (prefill-heavy 2048/16,
+decode-heavy 128/512, single-user TTFT at a ~1.9k prompt). KV cache fp8 (e4m3) on
+surogate; int8 KV is never used on this board, because it changes the output. Weight
+pairing: llama.cpp serves GGUF Q4_K_M (~4.5 bpw), vLLM NVFP4, surogate the native
+NVFP4 artifact (4B, 27B, and since 2026-08-30 the 35B's routed experts, read verbatim
+from the same `RedHatAI` checkpoint vLLM serves) or an artifact repacked from the same
+GGUF (0.8B, the 35B's groupwise-int control rows, Flash-Next's W8 → Q4G32AM host bank).
+Every artifact decodes bit-exact against its source before a number is recorded, and
+every surogate row is probed for correctness **at** its concurrency.
 
 Columns:
 
 - **GPUs** — cards the engine used (1, or an 8-card layer pipeline).
 - **users** — concurrent closed-loop clients.
-- **prefill tok/s** — prompt tokens ÷ the run's wall time (a throughput share,
-  decode phases included — not a prompt-processing rate). At one user the
-  prompt-processing rate is prompt tokens ÷ TTFT, marked †.
-- **decode tok/s** — generated tokens ÷ wall time, summed over users (a
-  one-user row is that stream's speed).
+- **prefill tok/s** — prompt tokens ÷ the run's wall time: a throughput share with the
+  decode phases included, *not* a prompt-processing rate. At one user the
+  prompt-processing rate is prompt tokens ÷ TTFT, marked †. A † figure is
+  client-observed and carries queueing, so it reads below an engine's own prompt-eval
+  timer — comparable between the engines here, not against a published number.
+- **decode tok/s** — generated tokens ÷ wall time, summed over users (a one-user row
+  is that stream's speed).
 - **throughput tok/s** — prefill + decode: all tokens the engine moved per second.
-- **TTFT p50** — median time to the first streamed token, reasoning or answer.
-  Every model here reasons before it answers, so timing the first *content* chunk
-  would report the end of the reasoning block instead — seconds where the truth is
-  tens of milliseconds.
+- **TTFT p50** — median time to the first streamed token, reasoning or answer. Every
+  model here reasons before it answers, so timing the first *content* chunk would
+  report the end of the reasoning block — seconds where the truth is milliseconds.
 
-
-**Clock caps, 2026-08-29 09:34 → 2026-08-30 07:07.** For that window a boot service locked
-per-card maximum SM clocks (GPUs 0-5 at 1,700 / 2,500 / 1,500 / 2,500 / 1,800 / 2,400 MHz;
-6 and 7 untouched), invisible to `clocks.max.sm`. Every rate measured inside it is
-clock-limited and is **not** comparable to a row from outside it — a controlled pair read
-1,519 vs 1,986 tok/s for the same engine on GPU 0 and GPU 5. The profile has been removed and
-the cards verify equal within 3 %; rows dated 08-26/27/28 predate it, rows dated 2026-08-30
-07:07 or later are uncapped, and any row still carrying a capped number says so in its
-comment. Power stays limited to 400 W per card, which is what the clock settles against
-(~2.0 GHz on the 27B).
-
-Shapes: **512/128** unless the comment says otherwise (prefill-heavy is
-2048/16, decode-heavy 128/512, single-user TTFT at a ~1.9k prompt). KV cache
-fp8 (e4m3) on surogate; int8 KV is never used on this board (it changes
-output). Weight pairing: llama.cpp serves GGUF Q4_K_M (~4.5 bpw), vLLM NVFP4,
-surogate the native NVFP4 artifact (4B, 27B, and since 2026-08-30 the 35B's
-routed experts, read verbatim from the same `RedHatAI` checkpoint vLLM serves) or
-the artifact repacked from the same GGUF (0.8B; the 35B's superseded mixed
-Q4/Q5/Q6 rows; Flash-Next W8 → Q4G32AM host bank).
-Every artifact decodes bit-exact against its source before a number is
-recorded, and every surogate row is probed for correctness **at** its
-concurrency.
-
-**Reading prefill and decode on the non-balanced shapes.** Both columns are
-token counts divided by the same run wall time, so the shape fixes their
-ratio: on prefill-heavy 2048/16 every completed request contributes 2,048
-prompt tokens and 16 generated tokens, and decode tok/s is always prefill
-tok/s ÷ 128 (0.8B: 81,376 / 636; 27B: 11,208 / 85 — the same 128 for vLLM).
-That decode figure is completions per second × 16, not a decode speed: the
-engine spends the run processing prompts and the 16-token tail is the small
-share left over. On that shape the number to read is prefill (prompt
-processing at 100 users) and TTFT (the queue for it); per-stream decode speed
-is what the 512/128 and the decode-heavy 128/512 rows measure, where the
-pinned ratio runs the other way (prefill = decode ÷ 4). Never compare a
-column across shapes.
+**Never compare a column across shapes.** Both token columns divide by the same wall
+time, so the shape pins their ratio: on prefill-heavy 2048/16 each request contributes
+2,048 prompt and 16 generated tokens, making decode tok/s always prefill ÷ 128. That
+decode figure is completions per second × 16, not a decode speed. On that shape read
+prefill and TTFT; per-stream decode speed is what 512/128 and decode-heavy 128/512
+measure, where the pinned ratio runs the other way.
 
 ## Board of record (2026-08-30)
 
@@ -124,8 +109,8 @@ them.
 | **surogate** | 8 | 1 | **306** | **68.6** | **374** | **0.16 s** | same, one user: each card holds 6 layers, so a token costs ~0.9 ms across the eight stages against ~5 ms on one card |
 | **surogate** | 1 | 100 | 471 | **1,884** | 2,355 | **14.2 s** | decode-heavy 128/512, 64 lanes (GPU5) |
 | vLLM | 1 | 100 | 360 | 1,438 | 1,798 | 21.9 s | decode-heavy, same card |
-| **surogate** | 1 | 100 | **11,208** | 85 | **11,293** | 15.9 s | prefill-heavy 2048/16, chunk 4,096, `--max-model-len 4096`, 128 lanes; 2026-08-30 09:24, uncapped GPU 3. **95 % of vLLM's prefill at a comparable TTFT** — the gap the board carried was the 08-27 configuration, not the engine |
-| **vLLM** | 1 | 100 | **11,818** | 92 | 11,910 | **14.9 s** | prefill-heavy, 2026-08-27 pass |
+| surogate | 1 | 100 | 11,557 | 87.8 | 11,645 | 15.38 s | prefill-heavy 2048/16, chunk 4,096, `--max-model-len 2304`, 128 lanes; 2026-08-30 18:57, GPU 1, same session as the vLLM row below. **89 % of vLLM's prefill** — and the shape is insensitive to the two obvious knobs: KV/admission moves it 1.5 % (context 4,096 → 2,304, 11,389 → 11,557) and the prompt chunk not at all (2,048 fails on KV entitlement; 8,192 reads 11,553 and 16,384 reads 11,538) |
+| **vLLM** | 1 | 100 | **12,942** | 98.3 | **13,040** | **13.81 s** | prefill-heavy, same card and session; `--max-model-len 4096 --max-num-seqs 128`, and it ran with **less** KV than we did (66,901 tokens against our 104,384), so admission is not what separates them. Replaces a 2026-08-27 pass that read 11,818 |
 | **surogate** | 1 | 1 | **11,200 †** | **70.8** | — | **170 ms** | 2026-08-30 10:21, uncapped GPU 0, fp8 KV, ~1,900-token prompt. Beats the 08-26 pass it replaces (45 tok/s at 352 ms) on both axes |
 | **vLLM** | 1 | 1 | **13,600 †** | **71.7** | — | **140 ms** | `sakamakismile/Qwen3.8-27B-MTP-NVFP4`; 2026-08-30 10:37, uncapped GPU 1. The one shape where vLLM leads us at one user — decode within 1 %, TTFT 20 % better |
 | llama.cpp | 1 | 1 | **1,610 †** | **44.8** | — | **1.18 s** | 2026-08-30 12:07, uncapped GPU 5, CUDA build, `unsloth/Qwen3.8-27B-GGUF` UD-Q4_K_M (fetched for this row; our side is all-NVFP4). Its own prompt-eval timing is 2,734 tok/s |
@@ -184,6 +169,16 @@ them.
   the measured value the 35B wins at 100, 16 and 1 users at once.
 - **Lanes are 128** where the model fits them; with 100 users and 64 lanes a
   third of the load queued for a lane and that queue was the TTFT.
+- **The 27B's prompt processing is the one place a competitor is ahead, and it is
+  not the kernels.** vLLM serves 12,942 prompt tok/s on the prefill-heavy shape
+  against our 11,557 — 89 %, measured in one session on one card. Our kernels do
+  **12,707** at pp2048 in `ninfer_bench` with no server at all, which is vLLM's
+  served number to within 2 %, so the loss sits between our kernels and our
+  serving. Neither obvious knob touches it: admission is worth 1.5 % and the prompt
+  chunk nothing across 2,048-16,384, and vLLM wins while running *less* KV than we
+  do. The one-user 27B row is the same finding seen from the other end — a †
+  prefill figure is TTFT restated, so 11,200 † against 13,600 † and 170 ms against
+  140 ms are one fact, not two.
 - **Flash-Next on one card is host-bound at one user and GPU-bound above it.**
   Measured at 16 users, the expert cache misses on only **2.1 %** of lookups and
   just **1.7 % of paths reach the CPU**, so the split and the PCIe gather cannot
@@ -267,5 +262,13 @@ them.
   borrowed kernel may have removed the reason to spread the model at all — the
   measurement is one server launch and one probe, and until it is run the "MoE
   gains from a pipeline" claim stands only for the old artifact.
-- Otherwise **every row on this board is from 2026-08-30**, on the same binary and
-  uncapped cards, except the hardware item below.
+- **Two rows were taken at 62 s and the rest at 76-90 s.** The window is inside the
+  band the Method names, but an early pass measured a shorter window reading up to
+  25 % high, and that sensitivity has never been re-checked on the current binary.
+  One 90 s repeat of the 35B reference against its 62 s reading settles it.
+- Otherwise **every row on this board is from 2026-08-30**, on the same binary and on
+  cards with no clock cap. (A boot service capped per-card SM clocks between
+  2026-08-29 09:34 and 2026-08-30 07:07 — invisible to `clocks.max.sm`, worth 1,519
+  against 1,986 tok/s on a controlled pair. It is gone, no row here was measured
+  inside it, and the forensics are in `BENCHMARKS_HISTORY.md`. Power stays limited to
+  400 W per card, which is what the clock settles against — ~2.0 GHz on the 27B.)
