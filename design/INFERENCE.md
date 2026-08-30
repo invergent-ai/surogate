@@ -2056,4 +2056,13 @@ Validation on the fixed engine (16 users, 420-word prompts, 128-token counts): 5
 ('238, 240, 241…'); before the fix the same arm gave 2–3 garbage/wrong and 2–4 early stops
 per 96. 2048 window (single-chunk prompts, decode-only host rounds): 96/96, no short, no
 garbage, no wrong. 256 window (the 20:15 reproducer): 96/96, no geometry throw. Shadow oracle
-on the fixed engine and a 2048-window 192-probe soak: appended below when they finish.
+on the fixed engine (`SUROGATE_SERVE_CPU_MOE_SHADOW=4`, 512 window): 800 rounds checked, 0
+mismatches — against 414 of 414 before — with the probe at 95/96 (one early stop after six
+numbers). 2048-window 192-probe soak: 192/192 — no short, no garbage, no wrong, the first
+fully clean Flash-Next arm of the day. Throughput on the fixed engine (`tput.py`, 16 users,
+512-token prompts, 128-token generations, 150 s, default window): 78.9 tok/s at the probe,
+85.5 tok/s over the engine's last twelve 5-second intervals — level with this morning's
+72-ish on the same probe; the fixes change what the host jobs are attributed to, not how
+many there are. The board's Flash-Next rows still carry 2026-08-28's 32-38 tok/s, measured
+before the scan ring, the Q4 bank and the indexer landed; they want a refresh pass of their
+own.
