@@ -93,7 +93,8 @@ what the engine does and how the number was arrived at.
 | **surogate** | 1 | 1 | **95,000 †** | **673** | — | **20 ms** | 2026-08-30 10:16, uncapped GPU 0, fp8 KV, ~1,900-token prompt |
 | vLLM | 1 | 1 | 38,000 † | 498 | — | 50 ms | same batch, uncapped GPU 1. surogate **+35 % decode, 2.5× TTFT** |
 | surogate | 1 | 1 | 39,600 † | 503 | — | 48 ms | the 2026-08-26 pass (GPU 2, bf16 KV) this replaces |
-| llama.cpp | 1 | 1 | 11,300 † | 391 | — | 168 ms | 2026-08-26, not re-measured |
+| llama.cpp | 1 | 1 | **19,000 †** | **411** | — | **100 ms** | 2026-08-30 12:01, uncapped GPU 5, `llama-server -ngl 999 -c 4096 -np 1` on the same Q4_K_M GGUF. Its own prompt-eval timing is 34,500 tok/s; the † above is the board's prompt÷TTFT and carries the queueing. **Use `study/llama.cpp-master/build/bin` — the `llama-server` on `PATH` is Homebrew's Vulkan build** (no CUDA, ignores `CUDA_VISIBLE_DEVICES`) and reads 252 tg / 6,880 pp512 on `llama-bench`, roughly 40 % of the CUDA build |
+| llama.cpp | 1 | 1 | 11,300 † | 391 | — | 168 ms | the 2026-08-26 pass this replaces |
 
 ### Qwen3.5-4B
 
@@ -106,7 +107,7 @@ what the engine does and how the number was arrived at.
 | vLLM | 1 | 100 | 34,964 | 273 | 35,237 | 5.00 s | prefill-heavy, same card |
 | **surogate** | 1 | 1 | **63,300 †** | **204** | — | **30 ms** | 2026-08-30 10:19, uncapped GPU 0, fp8 KV, ~1,900-token prompt. No vLLM pair: the NVFP4 4B checkpoint is no longer on this host |
 | surogate | 1 | 1 | 33,300 † | 214 | — | 57 ms | the 2026-08-26 pass (GPU 2) this replaces — decode within 5 %, prompt processing 1.9× |
-| llama.cpp | 1 | 1 | 4,300 † | 190 | — | 445 ms | 2026-08-26, not re-measured |
+| llama.cpp | 1 | 1 | 4,300 † | 190 | — | 445 ms | 2026-08-26; not re-measurable here — the 4B GGUF is no longer on this host |
 | vLLM | 1 | 1 | 26,800 † | 166 | — | 71 ms | 2026-08-26, not re-measured |
 
 ### Qwen3.8-27B
@@ -129,7 +130,7 @@ what the engine does and how the number was arrived at.
 | **vLLM** | 1 | 1 | **13,600 †** | **71.7** | — | **140 ms** | `sakamakismile/Qwen3.8-27B-MTP-NVFP4`; 2026-08-30 10:37, uncapped GPU 1. The one shape where vLLM leads us at one user — decode within 1 %, TTFT 20 % better |
 | surogate | 1 | 1 | 5,400 † | 45 | — | 352 ms | the 2026-08-26 pass (GPU 2) this replaces |
 | vLLM | 1 | 1 | 7,500 † | 45 | — | 254 ms | the 2026-08-26 pass this replaces |
-| llama.cpp | 1 | 1 | 1,040 † | 49 | — | 1,829 ms | 2026-08-26, not re-measured |
+| llama.cpp | 1 | 1 | 1,040 † | 49 | — | 1,829 ms | 2026-08-26; not re-measurable here — the 27B GGUF is no longer on this host |
 
 ### Qwen3.6-35B-A3B
 
@@ -240,13 +241,16 @@ what the engine does and how the number was arrived at.
   bandwidth for the host-offloaded model (23 against 46 GB/s) and costs about a
   third of its throughput; VRAM-resident models are unaffected. Until it is
   fixed, single-card Flash-Next rows belong on GPU 0, 1, 4 or 6.
-- **Single-user llama.cpp rows still predate the rest.** The surogate and vLLM
-  single-user rows were re-measured on 2026-08-30 (uncapped, fp8 KV, ~1,900-token
-  prompt) and now sit on the same binary and cards as everything else; the
-  llama.cpp ones are still the 2026-08-26 pass and are labelled as such. Someone
-  wanting a current three-way single-user comparison needs one llama-server run
-  per model. The 4B has no current vLLM pair either — that checkpoint is gone
-  from this host.
+- **Single-user llama.cpp rows: the 0.8B is current, the 4B and 27B cannot be.**
+  The 0.8B was re-measured on 2026-08-30 (411 decode at 100 ms TTFT, up from
+  391/168 ms) once a CUDA llama.cpp was found: the `llama-server` on `PATH` is
+  Homebrew's **Vulkan** build, which has no CUDA backend, ignores
+  `CUDA_VISIBLE_DEVICES` and reads about 40 % of the CUDA build — anyone
+  refreshing these rows must use `study/llama.cpp-master/build/bin`. The 4B and
+  27B rows stay at 2026-08-26 because **their GGUFs are no longer on this host**
+  (only 0.8B, 2B, 9B and Flash-Next are), so closing them means fetching ~20 GB
+  of weights, not running a probe. The 4B has no current vLLM pair either — that
+  checkpoint is gone from this host too.
 
 ### Closed on 2026-08-30
 
