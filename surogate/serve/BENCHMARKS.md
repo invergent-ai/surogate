@@ -90,9 +90,10 @@ what the engine does and how the number was arrived at.
 | surogate | 1 | 100 | 27,222 | 6,577 | 33,799 | 40 ms | capped, and with the context left at auto (262,144 → a 4.25 M-token KV cache): −16 % more for a shape that never uses it |
 | **surogate** | 1 | 100 | **81,376** | 636 | 82,012 | 2.39 s | prefill-heavy 2048/16 (2026-08-27, GPU4) |
 | vLLM | 1 | 100 | 45,106 | 352 | 45,458 | 3.88 s | prefill-heavy, same card |
-| **surogate** | 1 | 1 | 39,600 † | **503** | — | **48 ms** | 2026-08-26, GPU2, bf16 KV |
-| llama.cpp | 1 | 1 | 11,300 † | 391 | — | 168 ms |  |
-| vLLM | 1 | 1 | 34,500 † | 364 | — | 55 ms |  |
+| **surogate** | 1 | 1 | **95,000 †** | **673** | — | **20 ms** | 2026-08-30 10:16, uncapped GPU 0, fp8 KV, ~1,900-token prompt |
+| vLLM | 1 | 1 | 38,000 † | 498 | — | 50 ms | same batch, uncapped GPU 1. surogate **+35 % decode, 2.5× TTFT** |
+| surogate | 1 | 1 | 39,600 † | 503 | — | 48 ms | the 2026-08-26 pass (GPU 2, bf16 KV) this replaces |
+| llama.cpp | 1 | 1 | 11,300 † | 391 | — | 168 ms | 2026-08-26, not re-measured |
 
 ### Qwen3.5-4B
 
@@ -103,9 +104,10 @@ what the engine does and how the number was arrived at.
 | vLLM | 1 | 100 | 16,984 | 4,246 | 21,230 | 239 ms | NVFP4, 2026-08-28 pass; not re-measured — the NVFP4 4B checkpoint is no longer on this host, so the pair stays the 08-28 one (surogate +16 % on both, 5.3× TTFT) |
 | **surogate** | 1 | 100 | **40,677** | 318 | 40,995 | 4.77 s | prefill-heavy 2048/16 (GPU5) |
 | vLLM | 1 | 100 | 34,964 | 273 | 35,237 | 5.00 s | prefill-heavy, same card |
-| **surogate** | 1 | 1 | 33,300 † | **214** | — | **57 ms** | 2026-08-26, GPU2 |
-| llama.cpp | 1 | 1 | 4,300 † | 190 | — | 445 ms |  |
-| vLLM | 1 | 1 | 26,800 † | 166 | — | 71 ms |  |
+| **surogate** | 1 | 1 | **63,300 †** | **204** | — | **30 ms** | 2026-08-30 10:19, uncapped GPU 0, fp8 KV, ~1,900-token prompt. No vLLM pair: the NVFP4 4B checkpoint is no longer on this host |
+| surogate | 1 | 1 | 33,300 † | 214 | — | 57 ms | the 2026-08-26 pass (GPU 2) this replaces — decode within 5 %, prompt processing 1.9× |
+| llama.cpp | 1 | 1 | 4,300 † | 190 | — | 445 ms | 2026-08-26, not re-measured |
+| vLLM | 1 | 1 | 26,800 † | 166 | — | 71 ms | 2026-08-26, not re-measured |
 
 ### Qwen3.8-27B
 
@@ -123,9 +125,10 @@ what the engine does and how the number was arrived at.
 | **surogate** | 1 | 100 | **11,208** | 85 | **11,293** | 15.9 s | prefill-heavy 2048/16, chunk 4,096, `--max-model-len 4096`, 128 lanes; 2026-08-30 09:24, uncapped GPU 3. **95 % of vLLM's prefill at a comparable TTFT** — the gap the board carried was the 08-27 configuration, not the engine |
 | **vLLM** | 1 | 100 | **11,818** | 92 | 11,910 | **14.9 s** | prefill-heavy, 2026-08-27 pass |
 | surogate | 1 | 100 | 7,339 | 57 | 7,396 | 25.8 s | the 2026-08-27 pass that defined "the 27B prefill gap": 62 % of vLLM. Superseded by the row above |
-| surogate | 1 | 1 | 5,400 † | 45 | — | 352 ms | 2026-08-26, GPU2 |
-| llama.cpp | 1 | 1 | 1,040 † | **49** | — | 1,829 ms |  |
-| vLLM | 1 | 1 | 7,500 † | 45 | — | **254 ms** |  |
+| **surogate** | 1 | 1 | **11,200 †** | **70.8** | — | **170 ms** | 2026-08-30 10:21, uncapped GPU 0, fp8 KV, ~1,900-token prompt. Beats every 08-26 figure below on both axes |
+| surogate | 1 | 1 | 5,400 † | 45 | — | 352 ms | the 2026-08-26 pass (GPU 2) this replaces |
+| llama.cpp | 1 | 1 | 1,040 † | 49 | — | 1,829 ms | 2026-08-26, not re-measured |
+| vLLM | 1 | 1 | 7,500 † | 45 | — | 254 ms | 2026-08-26; an uncapped pair is being re-measured |
 
 ### Qwen3.6-35B-A3B
 
@@ -232,10 +235,12 @@ what the engine does and how the number was arrived at.
   bandwidth for the host-offloaded model (23 against 46 GB/s) and costs about a
   third of its throughput; VRAM-resident models are unaffected. Until it is
   fixed, single-card Flash-Next rows belong on GPU 0, 1, 4 or 6.
-- **Single-user rows predate the rest.** The † rows are from 2026-08-26 on GPU 2
-  with bf16 KV. Each is internally consistent with its llama.cpp and vLLM pair,
-  but none is on the same card or binary as the 100-user rows above it, so read
-  them as a set rather than against the rest of the table.
+- **Single-user llama.cpp rows still predate the rest.** The surogate and vLLM
+  single-user rows were re-measured on 2026-08-30 (uncapped, fp8 KV, ~1,900-token
+  prompt) and now sit on the same binary and cards as everything else; the
+  llama.cpp ones are still the 2026-08-26 pass and are labelled as such. Someone
+  wanting a current three-way single-user comparison needs one llama-server run
+  per model.
 
 ### Closed on 2026-08-30
 
