@@ -110,7 +110,8 @@ what the engine does and how the number was arrived at.
 |---|---:|---:|---:|---:|---:|---:|---|
 | **surogate** | 1 | 100 | **5,815** | **1,302** | **7,117** | **170 ms** | all-NVFP4, 128 lanes, chunk 4,096, `--max-model-len 2048`; 2026-08-30 07:11, uncapped GPU 2. Reproduces the 08-28 pass below within noise, so nothing regressed — the 1,068 measured under the caps was the cap |
 | surogate | 1 | 100 | 5,319 | 1,330 | 6,649 | 170 ms | the 2026-08-28 pass (pre-cap): mean of two passes, cards rotated |
-| vLLM | 1 | 100 | 4,156 | 1,039 | 5,195 | 8.26 s | NVFP4, 2026-08-28 pass; a same-batch uncapped pair is in flight |
+| vLLM | 1 | 100 | 5,003 | 1,120 | 6,123 | 8.06 s | `sakamakismile/Qwen3.8-27B-MTP-NVFP4`, `--max-num-seqs 128`; 2026-08-30 07:28, uncapped GPU 3, idle host. surogate **+16 % decode, 47× TTFT** |
+| vLLM | 1 | 100 | 4,156 | 1,039 | 5,195 | 8.26 s | the 2026-08-28 pass (pre-cap), which the row above reproduces +8 % |
 | surogate | 8 | 100 | 4,403 | 986 | 5,389 | 1.33 s | 8-stage pipeline, C3 + asynchronous prompt flights, `--max-model-len 2048`; 2026-08-30 08:18, uncapped. **Below the one card above** — the pipeline buys capacity, not throughput per card |
 | **surogate** | 8 | 1 | **306** | **68.6** | **374** | **0.16 s** | same, one user: each card holds 6 layers, so a token costs ~0.9 ms across the eight stages against ~5 ms on one card |
 | surogate | 8 | 100 / 1 | — | 1,332 / 19.6 | — | — / 0.43 s | the 2026-08-29 pass (clock-capped, in-phase clients) |
@@ -127,7 +128,7 @@ what the engine does and how the number was arrived at.
 | engine | GPUs | users | prefill tok/s | decode tok/s | throughput tok/s | TTFT p50 | comments |
 |---|---:|---:|---:|---:|---:|---:|---|
 | surogate | 1 | 100 | **8,209** | **1,984** | **10,193** | **0.32 s** | Q4/Q5/Q6 MoE from GGUF, 128 lanes, chunk 4,096, prefill batch 4, `--max-model-len 2048`; 2026-08-30 07:14, uncapped GPU 4. Reproduces the 08-28 pass (1,942) |
-| vLLM | 1 | 100 | 8,957 | **2,166** | 11,123 | 3.13 s | `RedHatAI/Qwen3.6-35B-A3B-NVFP4`, `--max-num-seqs 128`; measured under the caps on GPU 3 (2,500 MHz) — an uncapped same-batch pair is in flight. surogate at 92 % of decode with 10× the TTFT |
+| vLLM | 1 | 100 | 8,946 | **2,162** | 11,108 | 3.17 s | `RedHatAI/Qwen3.6-35B-A3B-NVFP4`, `--max-num-seqs 128`; 2026-08-30 07:14, uncapped GPU 5, same batch as the row above. surogate at **92 % of decode with 10× the TTFT** |
 | surogate | 1 | 100 | 7,933 | 1,919 | 9,852 | 0.29 s | the same configuration under the caps (GPU 5 at 2,400 MHz) |
 | surogate | 1 | 100 | 5,780 | 1,394 | 7,174 | 0.35 s | capped, and with `--no-thinking`: −27 % decode on top. On this MoE the generated text changes the expert spread per round, so the thinking mode is part of the configuration; the dense 27B shows no such gap |
 | **surogate** | 8 | 100 | **8,785** | **2,123** | **10,908** | **0.58 s** | 8-stage pipeline, C3 + asynchronous prompt flights, `--max-model-len 2048`; 2026-08-30 08:25, uncapped. Above the one card, and the only configuration that beats vLLM's single-card decode |
@@ -164,12 +165,19 @@ what the engine does and how the number was arrived at.
 - **Lanes are 128** where the model fits them; with 100 users and 64 lanes a
   third of the load queued for a lane and that queue was the TTFT.
 - **Flash-Next on one card** is host-bound: the Q4 bank halves the host bytes
-  per expert (single user 22 → 32 tok/s), the CPU split at its measured share
-  and the scan-resistant slot ring carry 16 users to 75 tok/s, and 64 users
-  add queueing, not throughput. **Eight cards** make every expert resident
-  and the pipeline delivers 5–8× the one-card figures at sub-second TTFT.
-- **The 27B pipeline** is capacity, not throughput per card: with ~12 lanes per
-  group a stage's per-round fixed cost does not shrink with its layer count.
+  per expert, the CPU split at its measured share and the scan-resistant slot
+  ring carry 16 users to 66.9 tok/s, and 64 users add queueing rather than
+  throughput (73.8 tok/s at a 40 s TTFT). Two things move that number as much
+  as any engine change — the card's PCIe link width (x8 costs a third) and the
+  host-bandwidth probe's own ±10 % spread. **Eight cards** make every expert
+  resident and the pipeline delivers 4.1× at 16 users and 5.3× at 64, with
+  TTFT under 3 s throughout.
+- **A pipeline is capacity, not throughput per card** — and only for a dense
+  model. The 27B on eight stages serves 986 tok/s against 1,302 on one card,
+  because with ~12 lanes per group a stage's per-round fixed cost does not
+  shrink with its layer count. The 35B, whose active weights are a fraction of
+  its size, gains instead: 2,123 against 1,984. Both slash single-user latency
+  (27B 0.16 s TTFT, 35B 0.09 s) because each card holds only six layers.
 - **Nothing regressed between 08-28 and 08-30.** Every apparent drop measured
   on 08-29/30 was the clock profile: uncapped, the 0.8B beats its pre-cap row
   (11,166 vs 10,095), and the 27B, 35B and 4B reproduce theirs (1,302 vs 1,330;
