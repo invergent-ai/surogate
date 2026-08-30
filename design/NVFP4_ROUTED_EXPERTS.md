@@ -33,6 +33,18 @@ Test: extend `testing/serve/ops/test_sparse_moe.cpp` with an NVFP4 profile besid
 ones — it already packs weights per codec and compares against an fp64 oracle, so the arm is a
 `CodecProfile` entry plus a packer.
 
+**The one design decision Phase 1 forces: where the per-tensor global scale goes.** NVFP4 is
+two-level — an e4m3 scale per 16 values *and* a per-tensor divisor, which the dense path
+applies as `decode_nvfp4_e4m3(scale) * inverse_weight_divisor` (`nvfp4_gemv.cuh`). The MoE
+codec interface (`load_one` / `load_pair` / `load_eight`) has no slot for a scalar, and the
+obvious shortcut — folding the divisor into the router weight `alpha` — **only works for the
+down projection**. Gate/up feeds SwiGLU, and the nonlinearity means the scale has to be applied
+before SiLU, not after. So Phase 1 must either extend the codec interface with a per-expert
+divisor pointer (indexed like the codes) or pre-scale at pack time. Pre-scaling is not free
+either: NVFP4's block scales are e4m3 and folding a divisor into them loses range. The
+interface extension is the honest option, and it is small: the kernels already carry the
+expert index needed to look the divisor up.
+
 ## Phase 2 — the prefill path
 
 `sparse_moe_prefill_body.inc` is an MMA path that dequantises into bf16 fragments. Two options:
