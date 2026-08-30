@@ -800,6 +800,16 @@ void decode_launch_d3_small_t(const Tensor& x, const SparseMoeWeights& weights,
         launch_d3_small_t_codec<W8Codec, false>(x, weights, token_ids, token_activations, tokens,
                                                 schedule, stream, nullptr);
         return;
+    case QType::NVFP4:
+        if (adaptive_route_jobs == nullptr) {
+            launch_d3_small_t_codec<Nvfp4CodecFor<kHidden / 16>, false>(
+                x, weights, token_ids, token_activations, tokens, schedule, stream, nullptr);
+        } else {
+            launch_d3_small_t_codec<Nvfp4CodecFor<kHidden / 16>, true>(
+                x, weights, token_ids, token_activations, tokens, schedule, stream,
+                adaptive_route_jobs);
+        }
+        return;
     default:
         throw std::invalid_argument("sparse_moe: unsupported small-T D3 codec");
     }
@@ -837,6 +847,17 @@ void decode_launch_d4_small_t(const SparseMoeWeights& weights, Tensor& destinati
         launch_d4_small_t_codec<W8Codec, false>(weights, destination, token_ids, token_alpha,
                                                 shared_scale, token_activations, tokens, schedule,
                                                 stream, nullptr);
+        return;
+    case QType::NVFP4:
+        if (adaptive_route_jobs == nullptr) {
+            launch_d4_small_t_codec<Nvfp4CodecFor<kIntermediate / 16>, false>(
+                weights, destination, token_ids, token_alpha, shared_scale, token_activations,
+                tokens, schedule, stream, nullptr);
+        } else {
+            launch_d4_small_t_codec<Nvfp4CodecFor<kIntermediate / 16>, true>(
+                weights, destination, token_ids, token_alpha, shared_scale, token_activations,
+                tokens, schedule, stream, adaptive_route_jobs);
+        }
         return;
     default:
         throw std::invalid_argument("sparse_moe: unsupported small-T D4 codec");
