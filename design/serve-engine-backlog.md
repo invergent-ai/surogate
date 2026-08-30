@@ -60,13 +60,44 @@ Memory stall collapses to 2.4 % at width while DRAM *falls* to 29.5 %. The
 problem; L1 sector hit rate is 0.95 % and L2 19.4 %, i.e. a clean stream that
 simply is not the thing waiting.
 
-**So the next build is barrier elimination, and it needs the row-parallel
-decomposition as its precondition.** Warp w already reads only As rows
-[16w, 16w+16). Give it its own `Cr` staging rows too and it owns its weights end
-to end: stage → `cp.async.wait_group` (per-thread, no barrier) → decode into its
-own As rows → `ldmatrix`. The two barriers around `decode_weight` disappear and
-only the shared `Bs` activation staging still needs one. Three barriers become
-one.
+**Barrier elimination was built too, and it is also flat — 2026-08-30.** Warp w
+already reads only As rows [16w, 16w+16), and the `Cr` staging already hands
+thread `tid` row `tid >> 1`, which for four warps *is* rows [16w, 16w+16). So the
+weight path was made warp-local end to end (stage → per-thread
+`cp.async.wait_group` → decode → `ldmatrix`), the two barriers around
+`decode_weight` became a `__syncwarp`, and a third pipeline stage with prefetch
+distance S-1 removed the trailing one: three block barriers down to one. It
+passes the oracle and, measured side by side in one session,
+
+    barrier-lean (rows)    348,480 ns
+    shipped (columns)      343,424 ns
+
+it is **1.5 % slower**. Barrier stall is the *shape* of the waiting, not its
+cause: the whole block is collectively waiting on the weight stream, so removing
+the barrier just moves the wait onto the load.
+
+**The actual ceiling, measured.** For the shipped `<4, 32>` kernel:
+
+    launch__occupancy_limit_registers        4 blocks   <- binds
+    launch__occupancy_limit_shared_mem       4 blocks   <- binds equally
+    launch__occupancy_limit_warps           12 blocks
+    launch__registers_per_thread           113
+    launch__shared_mem_per_block_static     24.58 KB
+    sm__maximum_warps_per_active_cycle_pct  33.33 %
+
+Residency is 4 blocks x 4 warps = **16 of 48 warps, a 33 % ceiling**, and
+registers and shared memory bind *simultaneously* — cutting one alone buys
+nothing. Measured `warps_active` 24.4 % is 73 % of that ceiling, so the kernel
+is already close to the most concurrency its own footprint allows. That is why
+every structural change inside the block measured flat, and why the 3-stage
+variant lost: it raised shared memory to ~30 KB and gave back a block.
+
+**What would actually move it**, in the order the numbers justify: cut registers
+(113/thread) *and* shared memory (24.6 KB) *together* — 96 regs and ~20 KB would
+buy a fifth block, 80 and ~16 KB a sixth — or change the shape so fewer warps
+wait on the same stream. Anything that touches only one of the two is already
+known to do nothing. Do not re-run: row-parallel decomposition, barrier
+elimination, blocks/SM grid size, launch-bounds residency hints.
 
 **Getting counters.** `ncu` was refused (`ERR_NVGPUCTRPERM`) because
 `/etc/modprobe.d/nvidia.conf` read `nvidia NVreg_...` with no `options` keyword,
