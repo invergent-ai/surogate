@@ -40,16 +40,43 @@ a no-op on dense models by the same arithmetic.
 | MTP speculation | needs 16.4 GB at 128 lanes vs 6.8 free (MTP block carries an expert set) |
 | bf16 KV, chunk width, compacting `Sr` | flat / 16x sector amplification |
 
-**The scoped fix.** A row-block-per-warp decomposition of the routed gate/up
-and down kernels: each warp owns a row-block of the expert (four busy warps at
-any width), weights decoded in registers, activations shared, ≤25 KiB shared so
-4 blocks/SM fit. Marlin's row-parallel decomposition proves ~19 % is there at
-decode width; the round model needs ~1.3x across all widths for parity and
-~1.5x to win clearly. `kExpertBK=64` is one Q4 group and is baked into the
-staging, swizzle and scale indexing, so this is a rewrite of the family, not a
-constant change. Budget it as a kernel project with the bench
-(`ninfer_sparse_moe_bench --sweep 64:2688`) and parity test
-(`ninfer_sparse_moe_test`) as the harness.
+**The scoped fix was built and is worth nothing — 2026-08-30.** A row-parallel
+gate/up kernel (`<4, 32>`: warp w owns row tile w and walks every column tile,
+the SwiGLU pair exchanged through the dead `Bs` buffer) passes the fp64 oracle
+including T=47, which routes through it, and `nsys` confirms it is the kernel
+that runs. It is **flat at every width**:
+
+| T | row-parallel | column-parallel |
+|---:|---:|---:|
+| 64 | 442.4 us | 440.4 us |
+| 100 | 532.5 us | 530.4 us |
+| 128 | 571.4 us | 573.5 us |
+| 256 | 659.5 us | 661.5 us |
+| 512 | 702.5 us | 702.5 us |
+
+Idle warps were a symptom, not the cause. Two more occupancy levers move it
+just as little: `SUROGATE_SERVE_MOE_BLOCKS_PER_SM` 3 → 12 (530-553 us, no
+trend) and raising the kernel's `__launch_bounds__` residency hint from 3 to 8
+(532 us). The kernel was reverted; only the finding is kept.
+
+**What the arithmetic says instead.** At T=100 the round is 532 us and
+`sparse_moe_prefill_q4_gate_up_kernel` is 63 % of it (345 us, `nsys`); the
+routed down kernel is another 20 %. In those 345 us gate/up streams the 188
+touched experts' weights — 188 x 1024 rows x 2048 values at 4.25 bpw = 209 MB —
+which is **606 GB/s, 34 % of the 1,792 peak**, against 3.4 GFLOP of math, about
+5 % of the card's bf16 rate. The kernel is not short of warps or blocks; it is
+short of memory throughput on a stream that no occupancy knob accelerates.
+
+The leading hypothesis is the read *shape*, not the byte count: for a fixed
+k-group consecutive rows sit `GroupsPerRow * 32` = 1,024 bytes apart, so a block
+issues 128 scattered 32-byte reads per k-step and never gets a contiguous run.
+That is a weight-layout question — k-group-major within a row block — which is
+the rewrite `kExpertBK=64` was always going to force. It is **not** confirmed:
+`ncu` needs GPU counter permissions this host does not grant
+(`ERR_NVGPUCTRPERM`), so the next person should start by getting counters and
+measuring sector efficiency before writing any kernel. The bench
+(`ninfer_sparse_moe_bench`, repaired 2026-08-30 — it had not compiled since the
+geometry argument landed) and `ninfer_sparse_moe_test` are the harness.
 
 ## B2 — Flash-Next phase-1 exclusions (2026-08-28)
 

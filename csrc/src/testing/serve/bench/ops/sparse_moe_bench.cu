@@ -530,6 +530,7 @@ public:
             routed_down_.weight,
             shared_gate_.weight,
             shared_down_.weight,
+            kTopK,
         };
         CUDA_CHECK(cudaDeviceSynchronize());
     }
@@ -559,7 +560,8 @@ public:
           residual_(static_cast<std::size_t>(tokens) * kHidden * 2),
           destination_(static_cast<std::size_t>(tokens) * kHidden * 2),
           workspace_bytes_(ops::sparse_moe_workspace_capacity_bytes(
-              gate_codec(profile), down_codec(profile), tokens, tokens)),
+              ops::kSparseMoeQwen36Geometry, gate_codec(profile), down_codec(profile), tokens,
+              tokens)),
           workspace_(workspace_bytes_) {
         std::vector<std::uint16_t> input(static_cast<std::size_t>(tokens) * kHidden);
         std::vector<std::uint16_t> residual(static_cast<std::size_t>(tokens) * kHidden);
