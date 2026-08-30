@@ -1,4 +1,5 @@
 #include "targets/qwen4exp/impl/load/host_bank.h"
+#include "core/numa.h"
 
 #include "api/ops/cpu_expert_compute.h"
 #include "api/ops/expert_slot_cache.h"
@@ -37,6 +38,10 @@ HostBank::HostBank(const HostBankPlan& plan) {
         if (object.bytes == 0 || source.payload.empty()) {
             throw std::invalid_argument("host bank object " + source.name + " is empty");
         }
+        // Every host expert thread reads every expert, so the bank belongs across the nodes
+        // rather than on one of them (core/numa.h). The policy has to be in place before the
+        // allocation: pinned pages cannot be moved afterwards.
+        const ScopedMemoryPolicy placement = ScopedMemoryPolicy::interleaved();
         CUDA_CHECK(cudaHostAlloc(&object.host, object.bytes, cudaHostAllocMapped | cudaHostAllocPortable));
         void* device = nullptr;
         CUDA_CHECK(cudaHostGetDevicePointer(&device, object.host, 0));

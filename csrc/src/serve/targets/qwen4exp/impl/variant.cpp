@@ -1,4 +1,5 @@
 #include "targets/qwen4exp/impl/variant.h"
+#include "core/numa.h"
 
 #include "api/ops/causal_conv1d_silu.h"
 #include "api/ops/embedding.h"
@@ -812,12 +813,20 @@ ExpertSlotCache& expert_slot_cache_for_current_device() {
                                           geometry.experts_per_token;
             CUDA_CHECK(cudaMalloc(&cache.cpu_jobs_memory, ops::expert_cpu_job_list_bytes(capacity)));
             cache.cpu_jobs = ops::create_expert_cpu_job_list(capacity, cache.cpu_jobs_memory);
-            CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&cache.x_host),
-                                     static_cast<std::size_t>(hidden) * stage_tokens * sizeof(std::uint16_t),
-                                     cudaHostAllocPortable));
-            CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&cache.out_host),
-                                     static_cast<std::size_t>(hidden) * stage_tokens * sizeof(float),
-                                     cudaHostAllocMapped | cudaHostAllocPortable));
+            // The staging buffers are what this device DMAs through every round, so they go on
+            // its own node rather than across both (core/numa.h). The expert bank, which every
+            // core reads, is interleaved instead.
+            {
+                int placement_device = 0;
+                CUDA_CHECK(cudaGetDevice(&placement_device));
+                const ScopedMemoryPolicy placement = ScopedMemoryPolicy::for_device(placement_device);
+                CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&cache.x_host),
+                                         static_cast<std::size_t>(hidden) * stage_tokens * sizeof(std::uint16_t),
+                                         cudaHostAllocPortable));
+                CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&cache.out_host),
+                                         static_cast<std::size_t>(hidden) * stage_tokens * sizeof(float),
+                                         cudaHostAllocMapped | cudaHostAllocPortable));
+            }
             CUDA_CHECK(cudaHostGetDevicePointer(&cache.out_device_alias, cache.out_host, 0));
             if (cache.stagecheck) {
                 // Allocated here, not lazily: the first host round may run under graph capture.
@@ -894,6 +903,9 @@ ExpertSlotCache& expert_slot_cache_for_current_device() {
                  "qwen4exp: expert slot cache enabled: %d slots (%.1f GiB pool), scan ring %d\n",
                  cache.slots, static_cast<double>(pool_bytes) / (1024.0 * 1024.0 * 1024.0),
                  cache.scan_ring);
+    if (const std::string numa = numa_policy_description(); !numa.empty()) {
+        std::fprintf(stderr, "qwen4exp: %s\n", numa.c_str());
+    }
     return cache;
 }
 

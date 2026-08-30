@@ -809,6 +809,7 @@ add_library(ninfer_core STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/core/device.cu
   ${SERVE_ROOT}/core/dtype.cpp
   ${SERVE_ROOT}/core/host_worker_pool.cpp
+  ${SERVE_ROOT}/core/numa.cpp
   ${SERVE_ROOT}/core/gdn_replay_records.cpp
   ${SERVE_ROOT}/core/cyclic_kv_cache.cpp
   ${SERVE_ROOT}/core/paged_kv_cache.cpp
@@ -824,6 +825,15 @@ add_library(ninfer_core STATIC EXCLUDE_FROM_ALL
 ninfer_internal_includes(ninfer_core)
 ninfer_cuda_archive(ninfer_core)
 target_link_libraries(ninfer_core PUBLIC CUDA::cudart CUDA::nvtx3 Threads::Threads)
+# libnuma places the host buffers of an offloaded model (core/numa.*). Optional: without it the
+# engine warns and the operator must run under `numactl --interleave=all` on a multi-socket host.
+find_library(NUMA_LIBRARY NAMES numa)
+if(NUMA_LIBRARY)
+  target_link_libraries(ninfer_core PUBLIC ${NUMA_LIBRARY})
+  message(STATUS "libnuma: ${NUMA_LIBRARY} (host buffer placement enabled)")
+else()
+  message(STATUS "libnuma not found: host buffer placement disabled; run multi-socket hosts under numactl --interleave=all")
+endif()
 
 # Generic .ninfer framing, binding, and direct final materialization.
 add_library(ninfer_artifact STATIC EXCLUDE_FROM_ALL
