@@ -2196,3 +2196,28 @@ but it does apply to any future SSD-backed tier; and its 2-bit experts broke JSO
 calling, which argues against dropping the host bank below 4 bits. Its 397B at 4-bit is ~200 GB
 and would fit this box's 503 GB of host RAM outright, so that tier is more of what Flash-Next
 already does rather than a new streaming engine — with its 4.4 tok/s as the bar.
+
+### The gather/compute overlap, closed by arithmetic (2026-08-30 08:45)
+
+The item queued an hour earlier dies on its own measurement gate, and the gate was worth
+having: my estimate of "order a third of the round" ignored the CPU split.
+
+The Q4G32AM bank is 3.07 MB per expert (4.92 M weights at 20 bytes per 32, confirmed against
+`q4_bank_planes`: 16 code bytes + 2 scale + 2 min per group of 32), and all 48 layers route
+top-10 of 512. At the 63 % hit rate the misses are 3.7 experts per layer — but the split sends
+76-81 % of them to the host, and that work is already forked onto a side stream and overlapped
+with the GPU. What actually crosses PCIe is ~0.74 experts per layer:
+
+| configuration | gathered/layer | per token | at 46 GB/s | share of a ~35 ms token |
+|---|---:|---:|---:|---:|
+| split off | 3.70 | 0.55 GB | 11.9 ms | 34 % |
+| **split at its default share** | **0.74** | **0.11 GB** | **2.4 ms** | **7 %** |
+
+So the serialised transfer the overlap would hide is 7 % of the round, and a perfect overlap
+would gain less than the ±10 % run-to-run spread of the host-bandwidth probe. Not built. The
+item stays closed unless the split is reduced (a busier host, or a deployment that wants the
+cores back), where the 34 % figure applies instead.
+
+Worth keeping from the exercise: the per-expert byte figure and the fact that the host split
+is doing double duty — it is not only extra compute capacity, it is also what keeps three
+quarters of the miss traffic off PCIe.

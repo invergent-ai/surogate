@@ -208,15 +208,15 @@ what the engine does and how the number was arrived at.
   row-parallel decode-width routed kernel.
 - **27B**: prefill at half vLLM's rate on the prefill-heavy shape (layer-loop
   fusion, a wider GDN chunked scan).
-- **Flash-Next, one card**: overlap the miss-gather with the hit-compute. The
-  round serialises `expert_slot_resolve` → `expert_slot_gather` → expert
-  kernels on one stream, so the PCIe transfer is dead time, while the slot
-  table already separates resident experts from the rest. Measure the split of
-  a round into gather and compute first — at the observed 63 % hit rate the
-  gather is order 10 MB per layer, which is worth chasing only if it is a
-  third of the round rather than a twentieth. (`study/flash-moe` reaches the
-  same structure from the SSD side and lands on the same answer: prefetching a
-  layer ahead is impossible because routing for layer N+1 does not exist yet.)
+- ~~**Flash-Next, one card**: overlap the miss-gather with the hit-compute~~
+  **closed 2026-08-30 without building it.** The Q4 bank is 3.07 MB per expert
+  and all 48 layers route, so at a 63 % hit rate the misses are 3.7 experts per
+  layer — but the CPU split already sends 76–81 % of them to the host, where the
+  work is forked onto a side stream and overlapped. Only ~0.74 experts per layer
+  actually cross PCIe: 0.11 GB per token, **2.4 ms of a ~35 ms token (7 %)**, and
+  a perfect overlap would gain less than the ±10 % spread of the host-bandwidth
+  probe. It would be worth 34 % only with the split off. Revisit if the split is
+  ever reduced.
 - **Hardware**: GPUs 2, 3, 5 and 7 train their PCIe links at x8 although both
   ends advertise x16 — a physical path issue, not bifurcation. It costs the
   host-offloaded model half its gather bandwidth (23 vs 46 GB/s) and about a
