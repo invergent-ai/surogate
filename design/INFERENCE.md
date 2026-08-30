@@ -2304,3 +2304,61 @@ into both the decode and prefill translation units. Two things came out of writi
 Not done, and the commit says so: no kernel instantiates the codec, and the test has no NVFP4
 profile. Phase 1 is groundwork plus a proof that the existing arms are intact, not a serving
 capability.
+
+## 2026-08-30 — NVFP4 routed experts: shipped, measured, and not adopted
+
+The 35B's routed experts now have a complete NVFP4 path — decode codec, small-T, wide rounds,
+the format's per-expert second level, a converter, a target profile and an artifact that serves
+coherent text. It is also **6.4x slower at prompt processing and flat at decode**, and the
+reason is not the kernels. It is that the 35B was never carrying the bytes the format saves.
+
+**Bits per weight, which is what the board's "format beats scheduling" reading was really
+about:**
+
+| format | bits/weight | where the scale goes |
+|---|---:|---|
+| W8G32_F16S | 8.5 | one FP16 per 32 values |
+| Q6G64_F16S | 6.25 | one FP16 per 64 |
+| Q5G64_F16S | 5.25 | one FP16 per 64 |
+| **NVFP4** | **4.5** | one E4M3 per **16** |
+| Q4G64_F16S | 4.25 | one FP16 per 64 |
+
+NVFP4 is *larger* than Q4G64. Its 16-wide blocks cost 0.5 bits per weight against Q4's 0.25,
+and the 4B (+54 %) and 27B (+37 %) gains came from **W8 → NVFP4**, which halves the bytes — not
+from "NVFP4" as such. The 35B's routed gate/up was already Q4G64, so it *grew* 5.9 %; only the
+Q5/Q6 down projection shrank. Per MoE layer 461 MB → 453 MB, and over the whole artifact
+**19.59 GiB → 19.19 GiB, 2.0 %**. A 2 % byte cut cannot move a bandwidth-bound decode, and it
+did not: 347.5 → 343.1 tok/s at batch 1 (`ninfer_bench` tg128), which is the 2 % of bytes minus
+the swizzled scale reads.
+
+**And the wide-round cost is real.** NVFP4 has no prefill MMA arm, so rounds wider than 46
+tokens run as small-T slices — 89 of them for a 4,096-token chunk, times four kernels, times 40
+layers. Same card, same binary, same session:
+
+| | pp512 | pp2048 | tg128 |
+|---|---:|---:|---:|
+| routed NVFP4 | 2,062 | 2,008 | 343.1 |
+| groupwise-int | 13,328 | 15,219 | 347.5 |
+
+Served at 100 users (512/128, four client shards, GPU 3, no errors either side):
+
+| | prefill tok/s | decode tok/s | TTFT p50 |
+|---|---:|---:|---:|
+| routed NVFP4 | 1,463 | 354 | 0.73 s |
+| groupwise-int | 7,581 | 1,832 | 0.12 s |
+
+Decode falls 5.2x as well as prefill, because at 100 users a decode round is ~98 rows and the
+groupwise artifact serves those through the *prefill* MMA path (its threshold is 47 tokens),
+while NVFP4 slices them into three small-T calls.
+
+**So the 35B keeps its groupwise-int artifact.** The NVFP4 path stays in the tree: it is
+correct at every width against the fp64 oracle, it is what a routed model arriving on W8 would
+want, and building it produced the bits-per-weight table above, which is the part worth
+remembering. What it does not do is close the 35B's decode gap against vLLM — that gap needs
+the other lever, the row-parallel decode-width routed kernel.
+
+Two bugs the exercise found, both in the slicing that makes wide rounds work at all:
+a round of 46k+1 tokens left a one-token slice small-T refuses (47 runs 45 + 2 now), and the
+workspace query has to compute the slice width with the same rule the loop uses or the capacity
+contract fails. The oracle test missed the first because 768 and 4,097 leave remainders of 32
+and 3; the 35B found it on its first served round.

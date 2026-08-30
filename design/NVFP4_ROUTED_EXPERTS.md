@@ -1,24 +1,46 @@
 # NVFP4 routed experts for the 35B-A3B
 
-**Status 2026-08-30: the kernels are done and the artifact is being built.** The decode codec,
-the small-T path and wide rounds (as small-T slices) all pass the fp64 oracle, the format's
-second level is applied per expert, and the converter reads
-`RedHatAI/Qwen3.6-35B-A3B-NVFP4` — the same checkpoint vLLM serves for the board's pair —
-without a dequantise/requantise round trip. What is left is measurement.
+**Status 2026-08-30: built, measured, and not adopted.** The path is complete — decode codec,
+small-T, wide rounds as small-T slices, the format's per-expert second level, a converter arm, a
+`routed-nvfp4` weights profile and a 21.9 GB artifact that serves coherent text. It is also
+**6.4x slower at prompt processing and flat at decode**, so the 35B keeps its groupwise-int
+artifact. The numbers and the reason are in `design/INFERENCE.md` under 2026-08-30; the short
+version is one line of arithmetic this plan never did:
 
-Two things the plan below got wrong, both found by measuring rather than reasoning:
+    NVFP4 is 4.5 bits/weight. Q4G64_F16S is 4.25.
 
-* **Phase 3 (the expert slot cache) is not on this path at all.** The slot cache is used by one
-  target, `qwen4exp` (Flash-Next, host-offloaded); the 35B is VRAM-resident on one card, so its
-  routed weights are plain resident `Weight`s. Phase 1 was never blocked on Phase 3.
-* **Phase 2 (the prefill MMA arm) is not a correctness gate either.** A wide round now runs as a
-  sequence of small-T slices, correct at every width, so the MMA arm is a pure performance item.
+NVFP4 spends an E4M3 scale every 16 values (0.5 bpw) where Q4G64 spends an FP16 every 64
+(0.25). The 4B's +54 % and the 27B's +37 % came from **W8 (8.5 bpw) → NVFP4**, halving the
+bytes. The 35B's routed gate/up was already Q4G64, so it *grew* 5.9 %; only the Q5/Q6 down
+projection shrank, and the whole artifact moved 19.59 → 19.19 GiB, **2.0 %**. A 2 % byte cut
+cannot move a bandwidth-bound decode, and it did not.
 
-**And one thing it got right and then had to pay for:** the second level really does have to be
-per expert. Measured over layer 0 and layer 20 of the checkpoint, `weight_global_scale` takes
-96-118 distinct values across the 256 experts of one projection, spanning 3.3-7.0x. It is
-applied as a multiply on the finished dot (`ops::SparseMoeWeights::routed_gate_up_scale`,
-`routed_down_scale`), which is exact and costs one multiply per expert path.
+So the premise at the top of this plan — "every other model gained more from the weight format
+than from any scheduling lever" — was true and still led to the wrong target. What those models
+gained was *fewer bytes*; the 35B had already spent that gain.
+
+**What the work is still worth.** The arm is correct at every width against the fp64 oracle and
+is what a routed model arriving on W8 would want; the packed-lane generalisation and the
+per-expert second level are both reusable; and the bits-per-weight table above is the part to
+remember before the next "switch it to NVFP4" proposal.
+
+**What the 35B's decode gap actually needs** is the other lever this document already names: a
+row-parallel decode-width routed kernel (~2,340 tok/s by the round model). NVFP4 does not
+substitute for it.
+
+Two corrections to the plan below, both found by measuring:
+
+* **Phase 3 (the expert slot cache) was never on this path.** The slot cache belongs to one
+  target, `qwen4exp` (Flash-Next, host-offloaded); the 35B is VRAM-resident, so its routed
+  weights are plain resident `Weight`s. Phase 1 was never blocked on it.
+* **Phase 2 (the prefill MMA arm) is a performance item, not a correctness gate** — wide rounds
+  run as small-T slices. It is also the thing that would have to be built to make this artifact
+  competitive, and given the 2 % byte finding there is no reason to build it for this model.
+
+**And one thing the plan got right and had to pay for:** the second level really is per expert.
+Over layers 0 and 20, `weight_global_scale` takes 96-118 distinct values across the 256 experts
+of one projection, spanning 3.3-7.0x. It is applied as a multiply on the finished dot, which is
+exact and costs one multiply per expert path.
 
 The checkpoint is 40 layers x 256 experts, `moe_intermediate` 512 over hidden 2,048, all 40
 layers MoE, `compressed-tensors` / `nvfp4-pack-quantized`.

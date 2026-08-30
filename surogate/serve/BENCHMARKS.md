@@ -142,6 +142,10 @@ what the engine does and how the number was arrived at.
 | **surogate** | 8 | 100 | **8,785** | **2,123** | **10,908** | **0.58 s** | 8-stage pipeline, C3 + asynchronous prompt flights, `--max-model-len 2048`; 2026-08-30 08:25, uncapped. Above the one card, and the only configuration that beats vLLM's single-card decode |
 | **surogate** | 8 | 1 | **965** | **233.4** | **1,198** | **0.09 s** | same, one user: 3 B active split eight ways puts a token at ~0.9 ms |
 | surogate | 8 | 100 / 1 | — | 2,368 / 50.1 | — | — / 0.35 s | the 2026-08-29 pass (clock-capped, in-phase clients) |
+| surogate | 1 | 100 | 1,463 | 354 | 1,817 | 0.73 s | **routed NVFP4**, not adopted — the experts read verbatim from `RedHatAI/Qwen3.6-35B-A3B-NVFP4` (the checkpoint vLLM serves above). Same card, session and flags as the pair below; 2026-08-30 11:47, GPU 3 |
+| surogate | 1 | 100 | 7,581 | 1,832 | 9,413 | 0.12 s | the shipped groupwise-int artifact, measured back-to-back with the row above as its pair (within 8 % of the 07:14 board row on a different card) |
+| surogate | 1 | 16 | 1,345 | 325 | 1,670 | 0.64 s | routed NVFP4 at a concurrency where decode rounds are narrow enough to avoid the MMA path on either artifact — it still loses, because a 512-token prompt chunk is a wide round |
+| surogate | 1 | 16 | 4,254 | 1,028 | 5,282 | 0.10 s | groupwise-int at 16 users, the pair for the row above |
 
 ### Qwen3.8-Flash-Next (111 GB MoE; on one card the experts live on the host)
 
@@ -219,21 +223,17 @@ what the engine does and how the number was arrived at.
   (shard the clients above ~5k tok/s; one Python process caps a fast engine).
   Engine-level questions — flags, binaries, cards, kernels — belong in
   `csrc/build-serve/serve_bench/ninfer_bench` instead, which does load, warm-up
-  and five repetitions of pp512+tg128 in about 3 s.
+  and five repetitions of pp512+tg128 in about 3 s (it needs
+  `--corpus csrc/src/testing/serve/bench/fixtures/bench_corpus.ids`).
+- **How to rebuild the 35B's routed-NVFP4 artifact**, if the format is ever
+  wanted for a model that arrives on W8:
+  `python -m surogate.serve.tools.convert.qwen3_6_35b_a3b.convert --model <BF16 dir>
+  --routed-nvfp4 <compressed-tensors NVFP4 dir> --out <path>.ninfer` — 77 s, and
+  the converter refuses anything that is not `compressed-tensors` /
+  `nvfp4-pack-quantized` (a ModelOpt export inverts the global-scale convention).
 
 ## Open items
 
-- **35B-A3B: NVFP4 routed experts.** The one model still on a non-NVFP4 routed
-  artifact and the one still behind vLLM (1,984 against 2,162 on one card, 92 %).
-  A kernel project, not a conversion — the sparse-MoE kernels and the expert slot
-  cache read W8G32 routed experts only. Four gated phases; the checkpoint's
-  global scale is per expert per projection but factors out of the dot product,
-  so the kernels apply it once rather than the codec carrying it; and the
-  converter must detect compressed-tensors versus ModelOpt from
-  `quantization_config`, since the two disagree on whether that scale multiplies
-  or divides. `design/NVFP4_ROUTED_EXPERTS.md`. Phase 1 (the decode codec and a
-  generalised packed-lane mapping) is written and under test; the independent
-  row-parallel decode-width kernel composes with it.
 - **Hardware: four PCIe links train at x8.** GPUs 2, 3, 5 and 7, although both
   the card and its root port advertise x16 — so a physical path issue (MCIO
   cable, seating or a retimer channel), not bifurcation. It halves the gather
@@ -250,8 +250,25 @@ what the engine does and how the number was arrived at.
 
 ### Closed on 2026-08-30
 
-Three items died to measurement rather than to code; the reasoning is in
+Four items died to measurement rather than to code; the reasoning is in
 `design/INFERENCE.md`, kept because each was about to become days of work.
+
+- **35B-A3B: NVFP4 routed experts** — built end to end and **not adopted**. The
+  arm is complete (decode codec, small-T, wide rounds as small-T slices, the
+  format's per-expert second level, a converter, a `routed-nvfp4` profile, a
+  21.9 GB artifact that serves coherent text) and correct at every width against
+  the fp64 oracle. It is also 6.4x slower at prompt processing and flat at
+  decode, because of one line of arithmetic the plan never did: **NVFP4 is 4.5
+  bits per weight and Q4G64_F16S is 4.25** — an E4M3 scale every 16 values
+  against an FP16 every 64. The 4B's +54 % and the 27B's +37 % came from **W8
+  (8.5 bpw) → NVFP4**, halving the bytes; the 35B's routed gate/up was already
+  Q4G64, so it grew 5.9 %, and the whole artifact moved 19.59 → 19.19 GiB, 2.0 %.
+  A 2 % byte cut cannot move a bandwidth-bound decode: `ninfer_bench` tg128 is
+  343.1 against 347.5. The rest is the missing prefill MMA arm — a 4,096-token
+  chunk runs as 89 small-T slices — which costs pp2048 2,008 against 15,219.
+  The 35B's decode gap needs the other lever instead: a row-parallel
+  decode-width routed kernel (~2,340 by the round model), which stays open.
+  `design/NVFP4_ROUTED_EXPERTS.md`.
 
 - **27B prefill gap** — did not exist on the current binary: 11,208 prompt tok/s
   against vLLM's 11,818 (95 %), with the kernels at 12,707 unserved and the
