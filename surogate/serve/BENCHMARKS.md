@@ -15,7 +15,10 @@ build (0.3.0-dev @ f1357e4; Flash-Next rows use upstream master with
 
 Closed-loop HTTP clients against each engine's OpenAI endpoint (streaming
 `/v1/chat/completions`, salted prompts so nothing shares a prefix, the engine's
-own token accounting). Numbers exclude model load; rows at 16+ users are
+own token accounting). Clients are **staggered**, not started together: closed-loop
+clients in phase make a pipeline alternate between all-prefill and all-decode
+rounds, which reads high — an 8-stage Flash-Next pass measured that way reported
+381 tok/s at 16 users against 276 staggered. Numbers exclude model load; rows at 16+ users are
 90-second steady state (shorter windows read up to 25 % high), one-user rows
 60 s. Every engine was measured on the same card class; a number is only
 comparable to its pair on the same card in the same batch. Measured on
@@ -148,7 +151,6 @@ them.
 | **surogate** | 1 | 1 | 128 | **28.7** | 156 | **1.36 s** | experts on the host: Q4G32AM bank (pinned, 91 GB), 3,000-slot expert cache, CPU split auto; 2026-08-30 07:55, uncapped GPU 6 (**x16 link**, gather 46 GB/s) |
 | **surogate** | 1 | 16 | **298** | **66.9** | **365** | **2.62 s** | same, 81 % / 51 % measured shares; TTFT p90 14.7 s |
 | surogate | 1 | 64 | 329 | 73.8 | 403 | 40.5 s | `--expert-slots 2000` so 64 lanes fit, `--pending-timeout-ms 600000` (the 30 s default expires a third of the queue here); host-bound, so 64 users only queue — TTFT p90 70.2 s |
-| surogate | 1 | 1 / 16 / 64 | 132 / 311 / 313 | 32.0 / 75.3 / 75.7 | 164 / 386 / 389 | 1.06 s / 2.27 s / 37.1 s | the same rows measured earlier the same day on GPU 1 (node 0, x16, **clock-capped at 2,500 MHz**) with the 23:59 binary. The 12 % it reads above the current row is **not** the card: the same binary now gives 66.9 / 66.5 / 65.1 on GPUs 1, 4 and 0 (2.7 % spread, no NUMA-node effect) and 66.5-67.0 across four repeats on GPU 6. The clock cap is ruled out too: re-locking that card to 2,500 MHz gives 66.3 against 69.1 released, so capping *costs* ~4 % as physics expects. Card, node, cap and run-to-run noise are all eliminated; the row is **not reproducible on the current binary** (65.1-69.1 across four cards and six repeats) and is kept only as the historical measurement it was |
 | surogate | 1 | 1 / 16 | 92 / 262 | 20.8 / 58.8 | 113 / 321 | 1.71 s / 3.35 s | **on GPU 7, whose PCIe link trains at x8**: gather 23 GB/s instead of 46, and a third of the throughput. Kept as the cost of the link fault (see Open items) |
 | llama.cpp | 1 | 1 | 29 | 7.1 | 36 | 2.0 s | experts on CPU (`-ot exps=CPU`, 32 threads), 2026-08-28 |
 | llama.cpp | 1 | 16 | 65 | 16.3 | 81 | 29 s |  |
@@ -159,7 +161,6 @@ them.
 | **surogate** | 8 | 16 | **1,231** | **276.1** | **1,507** | **2.37 s** | same; 4.1× the one-card 66.9 |
 | **surogate** | 8 | 32 | **1,527** | **342.3** | **1,869** | **2.42 s** | same, stages materialise only their own layers (64 lanes fit beside the pool) |
 | **surogate** | 8 | 64 | **1,750** | **392.3** | **2,142** | **2.80 s** | same; 5.3× the one card, and TTFT holds under 3 s where one card is at 40 s |
-| surogate | 8 | 1 / 16 / 32 / 64 | — | 51.0 / 381.6 / 488.2 / 604.1 | — | 0.24 s / 615 ms / 971 ms / 1.14 s | the 2026-08-29 pass, measured under the clock caps *and* with a load generator that started all clients together; closed-loop clients in phase make a pipeline alternate between all-prefill and all-decode rounds, which is why its decode reads high against the staggered probe used above |
 | llama.cpp | 8 | 1 | 157 | 39.3 | 196 | 0.95 s | `--split-mode layer`, all resident |
 | llama.cpp | 8 | 16 | 156 | 39.1 | 195 | 86 s | 16 of 48 requests timed out |
 | llama.cpp | 8 | 64 | 99 | 24.7 | 124 | 311 s |  |
@@ -191,6 +192,9 @@ them.
   the Q4 bank's halving of host bytes paid. The slot ring and the split carry
   16 users to 66.9 tok/s (median 66.7 over four runs, spread 0.6 %),
   and 64 users add queueing rather than throughput (73.8 tok/s at a 40 s TTFT).
+  An earlier binary read 75.3 there and **that number has never reproduced**:
+  card, NUMA node, clock cap and run-to-run noise were each eliminated (65.1-69.1
+  across four cards and six repeats), so it is not on this board.
   The reported ik_llama.cpp figure on a Ryzen 9 9950X desktop — 40.4 tok/s at one
   user, 1.85× the 21.8 the same commit measures on this host's EPYC 9124 — sizes
   the host-CPU lever for that one-user row: a 16-core Zen 5 at desktop clocks
@@ -211,13 +215,6 @@ them.
   be the mistake this board exists to prevent. Both configurations do slash
   single-user latency (27B 0.16 s TTFT, 35B 0.09 s), because each card holds only
   six layers.
-- **Nothing regressed between 08-28 and 08-30.** Every apparent drop measured
-  on 08-29/30 was the clock profile: uncapped, the 0.8B beats its pre-cap figure
-  (11,166 vs 10,095), and the 27B, 35B and 4B reproduce theirs (1,302 vs 1,330;
-  1,984 vs 1,942; 5,345 vs 4,942). Those pre-cap rows are no longer on this board
-  — the comparison is what they were kept for, and it is recorded here.
-  The detour that found it — binaries, flags, client shards, graph updates, all
-  ruled out — is in INFERENCE.md.
 - **Three configuration levers worth as much as a kernel change.** Capping the
   context to the workload (`--max-model-len 2048`) is worth **16 % on the 0.8B** —
   7,785 against 6,577 tok/s at 100 users, measured against itself in one
@@ -230,22 +227,12 @@ them.
   bank interleaved, the per-device staging bound to that device's node — which
   also makes the launcher's `numactl --interleave=all` redundant, measured at
   ±0.5 %). All three belong in every row's comment.
-- **And one that dwarfs them, on the 27B**: the prefill-heavy row moved from
-  7,339 to 11,208 prompt tok/s between the 08-27 and 08-30 configurations without
-  a kernel change. Configuration is not a footnote on this board; it is most of
-  the variance between rows.
-- Every surogate row above is from a binary that passes the correctness
-  batteries at its concurrency (coherence and the strict-structure counting
-  probe, `surogate/serve/tools/probe/`). Those probes were rewritten on
-  2026-08-30 for thinking models, which is now every model here: they score the
-  **answer** and never the reasoning — the reasoning contains the expected token
-  long before the model commits to an answer, so matching it would pass a run
-  that never answered — and they report a request whose budget expired inside
-  the reasoning as `truncated`, which says raise `max_tokens` rather than blaming
-  the engine. Their old budgets (24 to 128 tokens) never reached the answer at
-  all, so they scored zero on every model and every artifact alike. The Flash-Next one-card rows are the
-  first measured after the host-split fix of 2026-08-30 (`bfb87ec6`); the
-  earlier 22.4 / 32.2 / 37.0 rows were measured through it.
+- Every surogate row above is from a binary that passes the correctness batteries
+  at its concurrency (`surogate/serve/tools/probe/`), run with thinking on — the
+  mode the rows are measured in. The probes score the model's **answer** and never
+  its reasoning, and report a request whose budget expired mid-reasoning as
+  `truncated` rather than wrong; `probe/chat.py` carries the rule and the reason.
+
 - **How to reproduce a row.** Serving rows: `probe/board.py PORT MODEL USERS
   SECONDS 512 128 WARMUP SHARDS` against the launch line in the row's comment
   (shard the clients above ~5k tok/s; one Python process caps a fast engine).
@@ -282,68 +269,3 @@ them.
   gains from a pipeline" claim stands only for the old artifact.
 - Otherwise **every row on this board is from 2026-08-30**, on the same binary and
   uncapped cards, except the hardware item below.
-
-### Closed on 2026-08-30
-
-One item was fixed and five died to measurement; the reasoning is in
-`design/INFERENCE.md`, kept because each was about to become days of work.
-
-- **4B single-user decode, 204 → 313 tok/s (+53 %)** — fixed, and it reverses
-  the one single-user shape vLLM led. The engine's NVFP4 linear geometries are
-  compile-time templates keyed to the 27B (all K = 5,120); every other model's
-  shapes are "generic" and take cuBLASLt at every width, **including one
-  token** — a 128x128x256 block-scaled MMA tile on a single row. At batch 1 the
-  4B's linears were 65 % of a 4.7 ms token running at 37 % of memory bandwidth
-  (2.0 GB of weights, 1.12 ms floor, 3.05 ms spent) while the 27B, whose shapes
-  are registered, decodes at 76 % of peak with the decode GEMV. Fix:
-  `Nvfp4GemvOnlyProblem`, a hidden-2560 geometry family that exists for exactly
-  one route — the decode GEMV at tokens == 1 — in all four fused ops
-  (`attn_input_proj`, `gdn_input_proj`, `linear_add`, `linear_swiglu`); every
-  other width stays on cuBLASLt, so the 100-user row cannot move. Kernel-only
-  213.5 → 350.8; served 204 → 313 at the same 30 ms TTFT; 27B unchanged (78.5);
-  coherence verified through the new q/k/gate/v and qkv/z epilogues. The
-  earlier board reading — "their per-token path is better when there is nothing
-  to batch" — was wrong for the 4B; the 27B pair (70.8 vs 71.7) stays parity.
-
-- **35B-A3B: NVFP4 routed experts** — **reopened and adopted the same day**: the
-  weights were never the problem, the kernel over them was, and TensorRT-LLM's
-  fused MoE on these exact bytes serves 2,607 tok/s at 100 users (top of the 35B
-  table). What follows is why *our own* kernels over them were not worth adopting,
-  which is still the reason the format alone bought nothing. The
-  arm is complete (decode codec, small-T, wide rounds as small-T slices, the
-  format's per-expert second level, a converter, a `routed-nvfp4` profile, a
-  21.9 GB artifact that serves coherent text) and correct at every width against
-  the fp64 oracle. It is also 6.4x slower at prompt processing and flat at
-  decode, because of one line of arithmetic the plan never did: **NVFP4 is 4.5
-  bits per weight and Q4G64_F16S is 4.25** — an E4M3 scale every 16 values
-  against an FP16 every 64. The 4B's +54 % and the 27B's +37 % came from **W8
-  (8.5 bpw) → NVFP4**, halving the bytes; the 35B's routed gate/up was already
-  Q4G64, so it grew 5.9 %, and the whole artifact moved 19.59 → 19.19 GiB, 2.0 %.
-  A 2 % byte cut cannot move a bandwidth-bound decode: `ninfer_bench` tg128 is
-  343.1 against 347.5. The rest is the missing prefill MMA arm — a 4,096-token
-  chunk runs as 89 small-T slices — which costs pp2048 2,008 against 15,219.
-  `design/NVFP4_ROUTED_EXPERTS.md`.
-- **35B-A3B: the row-parallel routed kernel** — the lever the entry above
-  deferred to, also built and also flat. At decode width an expert holds ~3
-  columns and the narrow plan's four warps leave three idle, so a
-  row-block-per-warp kernel should have found ~19 %; it finds nothing at 64,
-  100, 128, 256 or 512 columns, and neither do blocks/SM 3→12 nor a higher
-  residency hint. Idle warps were a symptom: gate/up is 63 % of a 532 µs round
-  and streams 209 MB in 345 µs — **606 GB/s, 34 % of peak, on 5 % of the card's
-  math rate**. It is short of memory throughput, not warps. The kernel was
-  reverted and the measurement kept in `design/serve-engine-backlog.md` B1,
-  which also names what to do next: get GPU counter permissions (`ncu` is
-  refused on this host) and measure sector efficiency before writing anything,
-  because the suspect is the weight read *shape* — a k-group's consecutive rows
-  sit 1,024 bytes apart, so a block issues 128 scattered 32-byte reads per
-  k-step.
-
-- **27B prefill gap** — did not exist on the current binary: 11,208 prompt tok/s
-  against vLLM's 11,818 (95 %), with the kernels at 12,707 unserved and the
-  executor 97 % occupied in mixed rounds. The layer-loop fusion and wider GDN
-  chunked scan queued against it are dropped. `design/27B_PREFILL.md`.
-- **Flash-Next gather/compute overlap** — 0.13 ms of a token once the measured
-  2.1 % miss share and the CPU split are accounted for, against the third of a
-  round it was queued on.
-- **The 08-29/30 "regressions"** — the per-card clock profile, not the engine.
-  Every model reproduces or beats its pre-cap row.
