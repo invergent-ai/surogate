@@ -78,6 +78,13 @@ std::size_t nvfp4_attn_input_workspace_capacity_bytes(LinearPolicy policy, std::
 void nvfp4_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
                                cudaStream_t stream) {
+    // One token on the hidden-2560 family: the decode GEMV, instantiated for that family and
+    // nothing wider (Nvfp4GemvOnlyProblem). Every other width of a generic shape stays on
+    // cuBLASLt, so the served wide rounds do not move.
+    if (x.ne[1] == 1 && is_nvfp4_gemv_only_problem(weight.n, weight.k)) {
+        nvfp4_attn_input_decode_launch(x, weight, q, gate, k, v, stream);
+        return;
+    }
     if (!is_nvfp4_generic_problem(weight.n, weight.k) &&
         resolve_route(policy, x.ne[1]) == Nvfp4AttnInputRoute::A16) {
         launch_a16(x, weight, q, gate, k, v, stream);

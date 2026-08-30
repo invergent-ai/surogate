@@ -166,3 +166,15 @@ first serve, each is a known limit of phase 1.
   per decode round at batch 1 (BF16); W8 storage would halve that.
 - **Launcher GGUF path** fetches the frontend from the Hub (`Qwen/Qwen3.8-Flash-Next`);
   offline conversions need `--frontend` pointed at a local snapshot.
+
+
+## B3. Dense NVFP4 geometries are 27B-only templates — 2026-08-30
+
+Every registered `Nvfp4GemvGeometry` has K = 5,120. Other hidden sizes are "generic" and run
+cuBLASLt at every width, including one token, which cost the 4B 35 % of its single-user decode
+(fixed for tokens == 1 via `Nvfp4GemvOnlyProblem`; see `design/INFERENCE.md` 2026-08-30 and the
+board's closed items). Still open on this family: small-T (2-16 tokens) A16 for hidden-2560
+shapes; the two 2,560-row residual GEMVs at 52-59 % of bandwidth (CTA count is not the limiter —
+measured — split-K next); and making geometries runtime or JIT-compiled so the next model does not
+repeat this. Diagnostic: `nsys --cuda-graph-trace=node` on `ninfer_bench -n 128` — any
+`cutlass…block_scaled` kernel at batch 1 is an unregistered shape.

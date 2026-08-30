@@ -88,9 +88,15 @@ int verify_preserved(const GuardedDeviceBuffer& device, std::span<const std::uin
 
 int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
     const std::int32_t first_a4 = k == 6144 ? 7 : 8;
+    // The registered (5120-row) shapes have an A16 small-T ladder; the hidden-2560 family has
+    // the decode GEMV at one token and nothing wider, and a generic shape silently serves W4A4
+    // whatever the policy says (production passes AllowA4 throughout). Ask for A16 only where
+    // it exists, so the A16 tolerance is applied to an A16 result.
+    const ops::LinearPolicy t4_policy =
+        n == 5120 ? ops::LinearPolicy::A16Only : ops::LinearPolicy::AllowA4;
     const std::array invocations{
         Invocation{1, ops::LinearPolicy::A16Only},
-        Invocation{4, ops::LinearPolicy::A16Only},
+        Invocation{4, t4_policy},
         Invocation{first_a4, ops::LinearPolicy::AllowA4},
         Invocation{17, ops::LinearPolicy::AllowA4},
         Invocation{1024, ops::LinearPolicy::AllowA4},
@@ -187,6 +193,9 @@ int main() {
     int failures = 0;
     failures += run_shape(5120, 6144, 811U);
     failures += run_shape(5120, 17408, 821U);
+    // The hidden-2560 family (Qwen3.5-4B): decode GEMV at one token, cuBLASLt above.
+    failures += run_shape(2560, 4096, 831U);
+    failures += run_shape(2560, 9216, 841U);
     std::cout << (failures == 0 ? "OK" : "FAIL") << " NVFP4 linear_add\n";
     return failures == 0 ? 0 : 1;
 }

@@ -2442,3 +2442,59 @@ dense GEMM families whose ceiling is now measured (`design/serve-engine-backlog.
 
 With this the board has no stale rows left. Every figure is 2026-08-30, on one binary and
 uncapped cards; the only open item is the four x8 PCIe links, which is hardware.
+
+
+## 2026-08-30 — the 4B single-user deficit was a routing gap: 204 → 313 tok/s
+
+Asked whether single-user numbers could improve, without speculation. The arithmetic said
+yes: at one user the whole model streams once per token, and the 4B sat at 43 % of the memory
+ceiling where the 27B sat at 69 % — the signature of something fixed per token. Three probes,
+in parallel: round timing put the scheduler at 0.1 % of wall (decode rounds 95 %); kernel-only
+`ninfer_bench` did 213.5 against 201-204 served, so serving cost 6 %; and a graph-node `nsys`
+profile put the linears at **65 % of a 4.7 ms token, streaming 2.0 GB of weights in 3.05 ms —
+37 % of bandwidth** — through `cutlass … block_scaled … 128x128x256`, a 128-row MMA tile on one
+row.
+
+**Why.** `ops/linear/nvfp4/nvfp4_config.h` registers five `Nvfp4GemvGeometry<N, K>`, all with
+K = 5,120 — the 27B's hidden size. Any other (N, K) is an `is_nvfp4_generic_problem` and takes
+cuBLASLt at every width, one token included. The 4B's shapes (10240/12288/18432 x 2560,
+2560 x 4096/9216) all fall through. The decode GEMV that puts the 27B at 76 % of peak is a plain
+template over the geometry; the 4B simply never reached it.
+
+**Why one fix was not enough.** Routing `nvfp4_dispatch` alone bought +7 % (213.5 → 229.0):
+only one linear per layer goes through plain `ops::linear` (gate_up — `linear_swiglu` on a
+generic shape unfolds into `linear` + `silu_and_mul`). The 4B's decode path runs four fused ops,
+each with its own plan and its own `generic → cuBLASLt` gate, and the attention/GDN decode
+epilogues hard-code the 27B's segment split (query 6144 / key 1024; qkv 10240 / z 6144). After
+the first fix 145 cuBLASLt launches per token remained, at ~30 % of bandwidth.
+
+**The fix.** `Nvfp4GemvOnlyProblem` — a hidden-2560 geometry family that exists for exactly one
+route, the decode GEMV at tokens == 1, in all four ops; every other width of a generic shape
+stays on cuBLASLt, so served wide rounds do not move. Attention and GDN get a 4B segment layout
+(4096/1024 and 8192/4096 — 16 x 256 query heads with 4 x 256 keys; 16 key and 32 value heads of
+128). The 2,560-row residual shapes get a 4-warp schedule (8 rows per CTA, 320 CTAs — at 16 rows
+the grid was 160 CTAs on 170 SMs).
+
+| | kernel-only tg128 | served, 1 user | vLLM |
+|---|---:|---:|---:|
+| before | 213.5 | 204 / 30 ms | 249 / 60 ms |
+| gate_up only | 229.0 | — | |
+| all four ops | **350.8** (repeat 349.4) | **313 / 30 ms** (314.3, 312.8) | |
+
+27B unchanged (78.5 — its shapes were registered all along). Coherence verified through the new
+epilogues: a correct MoE definition, valid primes with a proof, an exact French translation. The
+after-profile shows no cutlass launch at one token; per shape the GEMV runs at 83 % (gate_up),
+77 % (GDN input), 73 % (attention), 59 % and 52 % (the two residuals) of bandwidth.
+
+Two things measured and not taken: halving the residual schedule again (4 rows per CTA, 640
+CTAs) is flat (348.2 vs 350.8), so those two are not CTA-count-bound — split-K is the next idea.
+And the `linear_add` test tripped on a pre-existing quirk: an `A16Only` request on a generic
+shape is silently served as W4A4 (production passes `AllowA4` throughout, so it never happens in
+serving); the test now asks for A16 only where the family has it.
+
+**What this corrects.** The board's reading two hours earlier — vLLM's per-token path is better
+when there is nothing to batch — was wrong for the 4B; it was our routing. The 27B pair stays at
+parity. Left on the single-user table: the W8 LM head is 12 % of the token at 69 % of bandwidth
+(halving its bytes means an NVFP4 head, a quality trade, not a default); the 2560 family has no
+small-T (2-4 token) A16 path; and the structural fix for static geometries is the JIT/CuTe path
+in `surogate/kernels`, where every shape is registered by construction.

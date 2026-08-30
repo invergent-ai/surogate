@@ -36,6 +36,20 @@ int run_nvfp4_a16() {
                           {5120, 6144, 705U, Comparison::Sampled, true, new_problem_invocations});
     failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
                           {5120, 17408, 707U, Comparison::Sampled, true, new_problem_invocations});
+    // The hidden-2560 family (Qwen3.5-4B) has the decode GEMV at one token and nothing wider.
+    constexpr std::array decode_only_invocations{
+        Invocation{1, CallForm::Policy, ops::LinearPolicy::A16Only},
+    };
+    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                          {10240, 2560, 711U, Comparison::Sampled, true, decode_only_invocations});
+    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                          {12288, 2560, 712U, Comparison::Sampled, true, decode_only_invocations});
+    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                          {18432, 2560, 713U, Comparison::Sampled, true, decode_only_invocations});
+    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                          {2560, 4096, 714U, Comparison::Sampled, true, decode_only_invocations});
+    failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
+                          {2560, 9216, 715U, Comparison::Sampled, true, decode_only_invocations});
     return failures;
 }
 

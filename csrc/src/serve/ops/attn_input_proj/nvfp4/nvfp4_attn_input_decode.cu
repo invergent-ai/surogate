@@ -9,6 +9,10 @@
 namespace ninfer::ops::detail {
 namespace {
 
+/// The fused [query | key | gate | value] row layout of one attention projection. The 27B
+/// (24 x 256 query heads, 4 x 256 key) and the 4B (16 x 256, 4 x 256) store the halves in this
+/// order; only the sizes differ.
+template <std::int32_t kQueryRows, std::int32_t kKeyRows>
 struct Nvfp4AttentionInputOutput {
     __nv_bfloat16* query;
     __nv_bfloat16* key;
@@ -17,9 +21,7 @@ struct Nvfp4AttentionInputOutput {
 
     __device__ __forceinline__ void store(std::int32_t parent_row, std::int32_t,
                                           float result) const {
-        constexpr std::int32_t kQueryRows  = 6144;
-        constexpr std::int32_t kKeyRows    = 1024;
-        constexpr std::int32_t kGateRows   = 6144;
+        constexpr std::int32_t kGateRows   = kQueryRows;
         constexpr std::int32_t kKeyBegin   = kQueryRows;
         constexpr std::int32_t kGateBegin  = kKeyBegin + kKeyRows;
         constexpr std::int32_t kValueBegin = kGateBegin + kGateRows;
@@ -39,14 +41,15 @@ struct Nvfp4AttentionInputOutput {
 
 } // namespace
 
-void nvfp4_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
-                                    Tensor& k, Tensor& v, cudaStream_t stream) {
-    using Geometry = Nvfp4AttnInputGeometry;
+template <class Geometry, std::int32_t kQueryRows, std::int32_t kKeyRows>
+void launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
+            cudaStream_t stream) {
     using Schedule = typename Nvfp4LinearDecodeProductionSchedule<Geometry>::Type;
-    static_assert((6144 % 128) == 0);
-    static_assert((1024 % 128) == 0);
+    static_assert((kQueryRows % 128) == 0);
+    static_assert((kKeyRows % 128) == 0);
+    static_assert(2 * kQueryRows + 2 * kKeyRows == Geometry::kOutputRows);
 
-    const Nvfp4AttentionInputOutput output{
+    const Nvfp4AttentionInputOutput<kQueryRows, kKeyRows> output{
         static_cast<__nv_bfloat16*>(q.data),
         static_cast<__nv_bfloat16*>(k.data),
         static_cast<__nv_bfloat16*>(gate.data),
@@ -59,6 +62,16 @@ void nvfp4_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tenso
         static_cast<const std::uint8_t*>(weight.scales), inverse_weight_divisor,
         Nvfp4IdentityEpilogue{}, output);
     CUDA_CHECK(cudaGetLastError());
+}
+
+void nvfp4_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
+                                    Tensor& k, Tensor& v, cudaStream_t stream) {
+    if (resolve_nvfp4_gemv_only_problem(weight.n, weight.k) ==
+        Nvfp4GemvOnlyProblem::AttnInput2560) {
+        launch<Nvfp4AttnInput2560Geometry, 4096, 1024>(x, weight, q, gate, k, v, stream);
+        return;
+    }
+    launch<Nvfp4AttnInputGeometry, 6144, 1024>(x, weight, q, gate, k, v, stream);
 }
 
 } // namespace ninfer::ops::detail

@@ -26,6 +26,16 @@ void launch(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_
 
 void nvfp4_linear_add_decode_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                     cudaStream_t stream) {
+    switch (resolve_nvfp4_gemv_only_problem(weight.n, weight.k)) {
+    case Nvfp4GemvOnlyProblem::Residual4096:
+        launch<Nvfp4Residual4096Geometry>(x, weight, residual, stream);
+        return;
+    case Nvfp4GemvOnlyProblem::Residual9216:
+        launch<Nvfp4Residual9216Geometry>(x, weight, residual, stream);
+        return;
+    default:
+        break;
+    }
     switch (resolve_nvfp4_problem(weight.n, weight.k)) {
     case Nvfp4Problem::Residual6144:
         launch<Nvfp4Residual6144Geometry>(x, weight, residual, stream);

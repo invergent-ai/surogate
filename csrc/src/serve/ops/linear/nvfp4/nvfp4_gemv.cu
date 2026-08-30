@@ -33,6 +33,25 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream
 } // namespace
 
 void launch_nvfp4_decode(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    switch (resolve_nvfp4_gemv_only_problem(weight.n, weight.k)) {
+    case Nvfp4GemvOnlyProblem::AttnInput2560:
+        launch_exact<Nvfp4AttnInput2560Geometry>(x, weight, out, stream);
+        return;
+    case Nvfp4GemvOnlyProblem::GdnInput2560:
+        launch_exact<Nvfp4GdnInput2560Geometry>(x, weight, out, stream);
+        return;
+    case Nvfp4GemvOnlyProblem::MlpGateUp2560:
+        launch_exact<Nvfp4MlpGateUp2560Geometry>(x, weight, out, stream);
+        return;
+    case Nvfp4GemvOnlyProblem::Residual4096:
+        launch_exact<Nvfp4Residual4096Geometry>(x, weight, out, stream);
+        return;
+    case Nvfp4GemvOnlyProblem::Residual9216:
+        launch_exact<Nvfp4Residual9216Geometry>(x, weight, out, stream);
+        return;
+    case Nvfp4GemvOnlyProblem::None:
+        break;
+    }
     switch (resolve_nvfp4_problem(weight.n, weight.k)) {
     case Nvfp4Problem::AttnInput:
         launch_exact<Nvfp4AttnInputGeometry>(x, weight, out, stream);

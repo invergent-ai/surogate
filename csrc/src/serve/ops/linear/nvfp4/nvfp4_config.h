@@ -113,6 +113,59 @@ using Nvfp4MlpGateUpGeometry     = Nvfp4GemvGeometry<34816, 5120>;
 using Nvfp4Residual6144Geometry  = Nvfp4GemvGeometry<5120, 6144>;
 using Nvfp4Residual17408Geometry = Nvfp4GemvGeometry<5120, 17408>;
 
+// The hidden-2560 family (Qwen3.5-4B). These shapes are *generic* problems — they have no
+// in-house small-T or W4A4 ladder and take cuBLASLt at every width — with one exception that
+// pays for itself at a single user: the decode GEMV is a plain template over the geometry, and
+// at one token a GEMV streams the weight once where the cuBLASLt route runs a 128-row MMA tile
+// on a single row (measured 2026-08-30: the 4B decodes at 45 % of memory peak against the
+// 27B's 76 %, and its linears are 54 % of the token in that tile). So these geometries exist
+// for exactly one route, `launch_nvfp4_decode`, and nothing else keys on them.
+using Nvfp4AttnInput2560Geometry   = Nvfp4GemvGeometry<10240, 2560>;
+using Nvfp4GdnInput2560Geometry    = Nvfp4GemvGeometry<12288, 2560>;
+using Nvfp4MlpGateUp2560Geometry   = Nvfp4GemvGeometry<18432, 2560>;
+using Nvfp4Residual4096Geometry    = Nvfp4GemvGeometry<2560, 4096>;
+using Nvfp4Residual9216Geometry    = Nvfp4GemvGeometry<2560, 9216>;
+
+enum class Nvfp4GemvOnlyProblem : std::uint8_t {
+    AttnInput2560,
+    GdnInput2560,
+    MlpGateUp2560,
+    Residual4096,
+    Residual9216,
+    None,
+};
+
+/// The GEMV-only geometry for a shape, or `None`. Disjoint from the registered problems by
+/// construction (no registered shape has K = 2560, 4096 or 9216 with these row counts).
+inline constexpr Nvfp4GemvOnlyProblem resolve_nvfp4_gemv_only_problem(std::int32_t output_rows,
+                                                                      std::int32_t input_rows) {
+    if (output_rows == Nvfp4AttnInput2560Geometry::kOutputRows &&
+        input_rows == Nvfp4AttnInput2560Geometry::kInputRows) {
+        return Nvfp4GemvOnlyProblem::AttnInput2560;
+    }
+    if (output_rows == Nvfp4GdnInput2560Geometry::kOutputRows &&
+        input_rows == Nvfp4GdnInput2560Geometry::kInputRows) {
+        return Nvfp4GemvOnlyProblem::GdnInput2560;
+    }
+    if (output_rows == Nvfp4MlpGateUp2560Geometry::kOutputRows &&
+        input_rows == Nvfp4MlpGateUp2560Geometry::kInputRows) {
+        return Nvfp4GemvOnlyProblem::MlpGateUp2560;
+    }
+    if (output_rows == Nvfp4Residual4096Geometry::kOutputRows &&
+        input_rows == Nvfp4Residual4096Geometry::kInputRows) {
+        return Nvfp4GemvOnlyProblem::Residual4096;
+    }
+    if (output_rows == Nvfp4Residual9216Geometry::kOutputRows &&
+        input_rows == Nvfp4Residual9216Geometry::kInputRows) {
+        return Nvfp4GemvOnlyProblem::Residual9216;
+    }
+    return Nvfp4GemvOnlyProblem::None;
+}
+
+inline constexpr bool is_nvfp4_gemv_only_problem(std::int32_t output_rows, std::int32_t input_rows) {
+    return resolve_nvfp4_gemv_only_problem(output_rows, input_rows) != Nvfp4GemvOnlyProblem::None;
+}
+
 // Shapes outside the five registered geometries run on the cuBLASLt route alone (#82): it is
 // shape-generic, so only the activation quantizer needs an instantiation per K.
 using Nvfp4Activation2560Geometry  = Nvfp4ActivationGeometry<2560>;
@@ -201,6 +254,21 @@ template <class Geometry>
 struct Nvfp4LinearDecodeProductionSchedule {
     using Type =
         Nvfp4GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
+};
+
+// The 2,560-row residual shapes cannot fill the card at 16 rows per CTA (160 CTAs on 170 SMs),
+// so they take half the rows per CTA and twice the grid. Halving again (4 rows, 640 CTAs)
+// measured flat (348.2 against 350.8 tok/s on the 4B, inside noise), so CTA count is not what
+// holds these two at 52-59 % of bandwidth; a split-K would be the next thing to try.
+template <>
+struct Nvfp4LinearDecodeProductionSchedule<Nvfp4Residual4096Geometry> {
+    using Type =
+        Nvfp4GemvSchedule<4, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
+};
+template <>
+struct Nvfp4LinearDecodeProductionSchedule<Nvfp4Residual9216Geometry> {
+    using Type =
+        Nvfp4GemvSchedule<4, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
 };
 
 inline constexpr std::int32_t kNvfp4FirstSmallT = 2;

@@ -106,11 +106,12 @@ what the engine does and how the number was arrived at.
 | vLLM | 1 | 100 | 16,984 | 4,246 | 21,230 | 239 ms | the 2026-08-28 pass this replaces; the row above reproduces it +5.5 % on decode (surogate +16 % on both, 5.3× TTFT) |
 | **surogate** | 1 | 100 | **40,677** | 318 | 40,995 | 4.77 s | prefill-heavy 2048/16 (GPU5) |
 | vLLM | 1 | 100 | 34,964 | 273 | 35,237 | 5.00 s | prefill-heavy, same card |
-| **surogate** | 1 | 1 | **63,300 †** | **204** | — | **30 ms** | 2026-08-30 10:19, uncapped GPU 0, fp8 KV, ~1,900-token prompt. Paired 2026-08-30; vLLM leads decode on this shape, see this host |
+| **surogate** | 1 | 1 | **63,300 †** | **313** | — | **30 ms** | 2026-08-30 14:00, uncapped GPU 6, two passes (314.3, 312.8), fp8 KV, ~1,900-token prompt, on the decode-GEMV routing fix: the 4B's five linear shapes were unregistered NVFP4 geometries and ran a 128-row cuBLASLt tile on one row at every width; at one token they now take the decode GEMV (kernel-only tg128 213.5 → 350.8). **+26 % over vLLM's 249**, at half its TTFT |
+| surogate | 1 | 1 | 63,300 † | 204 | — | 30 ms | the 2026-08-30 10:19 pass this replaces — same card class, same conditions, before the routing fix |
 | surogate | 1 | 1 | 33,300 † | 214 | — | 57 ms | the 2026-08-26 pass (GPU 2) this replaces — decode within 5 %, prompt processing 1.9× |
 | llama.cpp | 1 | 1 | **7,000 †** | **182** | — | **270 ms** | 2026-08-30 12:05, uncapped GPU 5, CUDA build, `unsloth/Qwen3.5-4B-GGUF` Q4_K_M (fetched for this row; our side is NVFP4). Its own prompt-eval timing is 13,000 tok/s |
 | llama.cpp | 1 | 1 | 4,300 † | 190 | — | 445 ms | the 2026-08-26 pass this replaces — TTFT 1.6× better, decode flat |
-| **vLLM** | 1 | 1 | 31,700 † | **249** | — | 60 ms | same checkpoint and card; 2026-08-30 13:27, ~1,900-token prompt. **vLLM leads decode here by 22 %** (249 against 204) while we keep 2x on TTFT and prompt processing — the second single-user shape where they lead, after the 27B |
+| vLLM | 1 | 1 | 31,700 † | 249 | — | 60 ms | same checkpoint (`surogate/Qwen3.5-4B-NVFP4`, ModelOpt); 2026-08-30 13:27, uncapped GPU 5. Led decode by 22 % for four hours — that was our routing gap, not their kernels |
 | vLLM | 1 | 1 | 26,800 † | 166 | — | 71 ms | the 2026-08-26 pass this replaces |
 
 ### Qwen3.8-27B
@@ -256,8 +257,25 @@ what the engine does and how the number was arrived at.
 
 ### Closed on 2026-08-30
 
-Five items died to measurement rather than to code; the reasoning is in
+One item was fixed and five died to measurement; the reasoning is in
 `design/INFERENCE.md`, kept because each was about to become days of work.
+
+- **4B single-user decode, 204 → 313 tok/s (+53 %)** — fixed, and it reverses
+  the one single-user shape vLLM led. The engine's NVFP4 linear geometries are
+  compile-time templates keyed to the 27B (all K = 5,120); every other model's
+  shapes are "generic" and take cuBLASLt at every width, **including one
+  token** — a 128x128x256 block-scaled MMA tile on a single row. At batch 1 the
+  4B's linears were 65 % of a 4.7 ms token running at 37 % of memory bandwidth
+  (2.0 GB of weights, 1.12 ms floor, 3.05 ms spent) while the 27B, whose shapes
+  are registered, decodes at 76 % of peak with the decode GEMV. Fix:
+  `Nvfp4GemvOnlyProblem`, a hidden-2560 geometry family that exists for exactly
+  one route — the decode GEMV at tokens == 1 — in all four fused ops
+  (`attn_input_proj`, `gdn_input_proj`, `linear_add`, `linear_swiglu`); every
+  other width stays on cuBLASLt, so the 100-user row cannot move. Kernel-only
+  213.5 → 350.8; served 204 → 313 at the same 30 ms TTFT; 27B unchanged (78.5);
+  coherence verified through the new q/k/gate/v and qkv/z epilogues. The
+  earlier board reading — "their per-token path is better when there is nothing
+  to batch" — was wrong for the 4B; the 27B pair (70.8 vs 71.7) stays parity.
 
 - **35B-A3B: NVFP4 routed experts** — built end to end and **not adopted**. The
   arm is complete (decode codec, small-T, wide rounds as small-T slices, the

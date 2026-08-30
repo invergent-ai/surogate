@@ -28,6 +28,12 @@ Nvfp4LinearRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows
     // Shapes outside the registered geometries have no in-house A16 kernel either (the gemv and
     // small-T paths are templated on Geometry), so they take W4A4 at every width - quantised
     // activations throughout, which is what the NVFP4 exports assume anyway (#82).
+    // One token on a hidden-2560 shape: the decode GEMV, which is instantiated for that family
+    // and nothing wider (see Nvfp4GemvOnlyProblem). Every other width of a generic shape stays
+    // on cuBLASLt, so the served wide rounds do not move.
+    if (tokens == 1 && is_nvfp4_gemv_only_problem(output_rows, input_rows)) {
+        return Nvfp4LinearRoute::A16;
+    }
     if (is_nvfp4_generic_problem(output_rows, input_rows)) { return Nvfp4LinearRoute::W4A4; }
     if (policy == LinearPolicy::A16Only) { return Nvfp4LinearRoute::A16; }
 
