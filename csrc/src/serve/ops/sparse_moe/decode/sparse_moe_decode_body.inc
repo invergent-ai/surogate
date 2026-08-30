@@ -113,6 +113,12 @@ struct Q6Codec {
 // format (`weight_global_scale`) is *not* applied here — a factor constant over an expert
 // comes out of the dot product, so the kernels multiply the finished dot by
 // `divisor[expert]` once instead of every decoded weight (design/NVFP4_ROUTED_EXPERTS.md).
+//
+// UNFINISHED: this reads scales row-major, the convention of the other MoE codecs, while the
+// dense NVFP4 path and the test fixture use QuantLayout::BlockScaleK16M128x4 (tiles of 128
+// rows by 4). The design note recommends adopting the dense layout here rather than carrying
+// two, which means mapping (row, group) through that swizzle below. Nothing instantiates this
+// codec until that is settled, so it cannot yet be exercised numerically.
 struct Nvfp4Codec {
     static constexpr int kGroupK       = 16;
     static constexpr bool kPackedWord8 = true;

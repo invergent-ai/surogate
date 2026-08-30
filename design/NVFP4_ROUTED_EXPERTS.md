@@ -51,6 +51,37 @@ where it has to be. What Phase 1 adds is therefore two device arrays on `SparseM
 (`[experts]` divisors for gate/up and for down) and one multiply per dot, not a new codec
 signature.
 
+## The scale layout: a decision Phase 1 cannot avoid (found 2026-08-30 10:40)
+
+The dense NVFP4 path stores block scales in `QuantLayout::BlockScaleK16M128x4` — swizzled in
+tiles of 128 rows by 4 — because that is what its MMA and TMA kernels want, and the test
+fixture (`quantized_weight.h`) packs exactly that, refusing N not divisible by 128 and K not
+divisible by 64. Every other MoE codec (Q4/Q5/Q6/W8) instead reads scales row-major, indexed
+`row * groups_per_row + group`, and `Nvfp4Codec` as written follows that convention.
+
+So the routed experts have to pick one, and the choice is not free either way:
+
+- **Row-major scales for routed experts** (what the codec assumes). The decode kernels stay
+  simple and identical in shape to the other codecs, and the expert slot cache keeps copying
+  opaque planes. The converter must then write a routed-expert layout that differs from the
+  dense one, and a future prefill MMA arm would have to swizzle or re-pack.
+- **Reuse `BlockScaleK16M128x4`.** One layout everywhere, and Phase 2's MMA arm inherits the
+  dense path's tiling for free. The decode codec must then implement the swizzle in its
+  `load_eight`, and the 128-row alignment has to hold *per expert*, which for the 35B's
+  `[experts × 2·intermediate]` gate/up stack means checking that each expert's row block starts
+  on a 128 boundary (2 · 640 = 1,280 rows per expert, so it does).
+
+**Recommendation: reuse the dense layout.** The alignment works out, it keeps one packing path
+in the converter, and it is the only option that does not strand Phase 2. The cost is confined
+to `Nvfp4Codec::load_eight`, which has to map (row, group) through the tile swizzle instead of
+multiplying — a change to one function, against a converter and a second layout to maintain
+forever.
+
+Until that is done, Phase 1 is **groundwork only**: the codec compiles and the packed-loop
+generalisation is proven not to disturb Q4/Q5/W8 (the oracle test passes unchanged), but no
+kernel instantiates it and the fixture cannot pack a matching input, so it is not yet possible
+to test the codec numerically. That test is the next step, and it needs the swizzle first.
+
 ## Phase 2 — the prefill path
 
 `sparse_moe_prefill_body.inc` is an MMA path that dequantises into bf16 fragments. Two options:
