@@ -214,6 +214,26 @@ SparseMoeGeometry sparse_moe_geometry(const SparseMoeWeights& weights) {
     return geometry;
 }
 
+/// The widest small-T slice a round of `tokens` runs. Small-T starts at two, so a slice that
+/// would leave a single token behind gives one back: 47 runs 45 + 2, never 46 + 1. The first
+/// slice is always the widest, which is what a workspace has to hold.
+constexpr std::int32_t small_t_first_slice(std::int32_t tokens) noexcept {
+    const std::int32_t slice =
+        tokens < detail::kSparseMoeSmallTMax ? tokens : detail::kSparseMoeSmallTMax;
+    return tokens - slice == 1 ? slice - 1 : slice;
+}
+
+/// The widest slice any round in `[min_tokens, max_tokens]` runs. `small_t_first_slice` rises
+/// with `tokens` apart from the one dip at 47, and an interval that reaches past 46 also
+/// contains a round of exactly 46 unless it starts above it.
+std::int32_t small_t_widest_slice(std::int32_t min_tokens, std::int32_t max_tokens) noexcept {
+    std::int32_t widest = small_t_first_slice(max_tokens);
+    if (max_tokens > detail::kSparseMoeSmallTMax && min_tokens <= detail::kSparseMoeSmallTMax) {
+        widest = std::max(widest, static_cast<std::int32_t>(detail::kSparseMoeSmallTMax));
+    }
+    return widest;
+}
+
 std::size_t sparse_moe_workspace_capacity_bytes(const SparseMoeGeometry& geometry,
                                                 QType routed_gate_up, QType routed_down,
                                                 std::int32_t min_tokens, std::int32_t max_tokens) {
@@ -242,8 +262,8 @@ std::size_t sparse_moe_workspace_capacity_bytes(const SparseMoeGeometry& geometr
     }
     if (nvfp4_profile && max_tokens >= detail::kSparseMoeSmallTMin) {
         // Any NVFP4 round of two or more tokens runs as small-T slices, so the widest slice
-        // sets the requirement whatever the interval's upper end is.
-        const std::int32_t slice = std::min(max_tokens, detail::kSparseMoeSmallTMax);
+        // any round in the interval takes sets the requirement.
+        const std::int32_t slice = small_t_widest_slice(min_tokens, max_tokens);
         required = std::max(required, detail::sparse_moe_small_t_workspace_bytes(geometry, slice));
     }
     const std::int32_t prefill_interval_first = std::max(min_tokens, prefill_first);
@@ -297,11 +317,11 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
         required = detail::resolve_sparse_moe_prefill_plan(geometry, tokens, gate_up, down)
                        .workspace_bytes;
     } else if (use_small_t) {
-        // Wide rounds run as slices, so the workspace only has to hold one slice.
-        const std::int32_t slice =
-            std::min(tokens, static_cast<std::int32_t>(detail::kSparseMoeSmallTMax));
-        required = detail::resolve_sparse_moe_small_t_plan(geometry, slice, gate_up, down)
-                       .workspace_bytes;
+        // Wide rounds run as slices, so the workspace only has to hold the widest one.
+        required =
+            detail::resolve_sparse_moe_small_t_plan(geometry, small_t_first_slice(tokens), gate_up,
+                                                    down)
+                .workspace_bytes;
     } else {
         required = detail::resolve_sparse_moe_decode_plan(geometry, gate_up, down).workspace_bytes;
     }
@@ -324,8 +344,7 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
     }
     if (use_small_t) {
         for (std::int32_t offset = 0; offset < tokens;) {
-            const std::int32_t slice =
-                std::min(tokens - offset, static_cast<std::int32_t>(detail::kSparseMoeSmallTMax));
+            const std::int32_t slice = small_t_first_slice(tokens - offset);
             auto slice_scope = workspace.scope();
             const detail::SparseMoeSmallTPlan plan =
                 detail::resolve_sparse_moe_small_t_plan(geometry, slice, gate_up, down);

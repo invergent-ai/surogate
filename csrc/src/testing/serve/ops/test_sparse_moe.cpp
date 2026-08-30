@@ -873,8 +873,9 @@ int main() {
     constexpr std::array<std::int32_t, 5> kQ4Q6Tokens{{1, 2, 46, 47, 768}};
     constexpr std::array<std::int32_t, 5> kW8W8Tokens{{1, 2, 19, 20, 768}};
     // NVFP4 covers every width: decode at 1, small-T at 2/19/20, and wider rounds as a
-    // sequence of small-T slices (768 here, and 4,097 to cross the internal slice bound).
-    constexpr std::array<std::int32_t, 6> kNvfp4Tokens{{1, 2, 19, 20, 768, 4097}};
+    // sequence of small-T slices. 47 and 139 are the widths whose last slice would otherwise
+    // be a single token, which small-T does not serve; 768 and 4,097 cross the slice bound.
+    constexpr std::array<std::int32_t, 8> kNvfp4Tokens{{1, 2, 19, 20, 47, 139, 768, 4097}};
     const std::array<CodecProfile, 4> profiles{{
         {"sparse_moe q4+q5 a16", QType::Q4G64_F16S, QType::Q5G64_F16S, kQ4Q5Tokens, true},
         {"sparse_moe q4+q6 a16", QType::Q4G64_F16S, QType::Q6G64_F16S, kQ4Q6Tokens, false},
