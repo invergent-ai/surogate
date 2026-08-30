@@ -51,6 +51,21 @@ struct SparseMoeWeights {
     /// routed weights hold it in (an expert slot cache); null means the routed weights are the
     /// resident experts in id order.
     const std::int32_t* slot_of_expert = nullptr;
+    /// NVFP4 only, and required there: the format's second level. NVFP4 pairs an e4m3 scale per
+    /// 16 values with a global scale that the checkpoint stores per expert and per projection, so
+    /// stacking the experts into one routed weight leaves a factor that `Weight`'s single
+    /// `weight_scale_divisor` cannot express. A factor constant over an expert comes out of the
+    /// dot product, so these are applied once to the finished dot rather than by the codec to
+    /// every weight — the codecs stay identical across formats.
+    ///
+    /// Device F32, indexed by *row block* (the expert, or its slot when `slot_of_expert` is set),
+    /// and multipliers: the dequantised weight is `code * block_scale * scale[block]`. The
+    /// checkpoint's `weight_global_scale` divides, so a converter writes its reciprocal.
+    ///   `routed_gate_up_scale` — [blocks][2], gate then up, matching the row halves of a block.
+    ///   `routed_down_scale`    — [blocks].
+    /// Null for every other format, where the codec carries the whole scale.
+    const float* routed_gate_up_scale = nullptr;
+    const float* routed_down_scale    = nullptr;
 };
 
 /// The geometry implied by the weights (router rows, hidden, shared-down width, top-k).

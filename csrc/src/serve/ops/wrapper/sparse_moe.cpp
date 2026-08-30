@@ -153,6 +153,17 @@ void validate_weights(const SparseMoeWeights& weights, const SparseMoeGeometry& 
         weights.shared_down.qtype != QType::W8G32_F16S) {
         throw std::invalid_argument("sparse_moe: shared weights must be W8");
     }
+    // NVFP4's second level is not optional: the checkpoint's per-expert global scale spans 3-7x
+    // across the experts of one layer, so a missing array is not a small error but a per-expert
+    // gain of the wrong size — and it would be silent. Fail here instead.
+    if ((weights.routed_gate_up.qtype == QType::NVFP4) != (weights.routed_gate_up_scale != nullptr)) {
+        throw std::invalid_argument(
+            "sparse_moe: routed_gate_up_scale is required for NVFP4 and rejected otherwise");
+    }
+    if ((weights.routed_down.qtype == QType::NVFP4) != (weights.routed_down_scale != nullptr)) {
+        throw std::invalid_argument(
+            "sparse_moe: routed_down_scale is required for NVFP4 and rejected otherwise");
+    }
     if (weights.slot_of_expert == nullptr) {
         require_quantized(weights.routed_gate_up, geometry.routed_gate_rows(), geometry.hidden,
                           "routed_gate_up", ranges);

@@ -82,11 +82,21 @@ QuantGeometry quant_geometry(QType qtype) {
 // engine and the artifact use. The shared fixture cannot do this — `pack_row_split_lowbit`
 // handles only row-split codecs, and the options-based packer synthesises scale *patterns*
 // rather than quantising real values, which an oracle comparison needs.
+/// `block_scale` is the format's second level, one entry per equal band of rows — gate and up
+/// for a stacked gate/up expert, one for a down expert — exactly as the checkpoint stores it per
+/// projection. The packer quantises `source / block_scale` and leaves the multiply to the kernel,
+/// so `dequant` (the oracle's view) still holds the full weight and a kernel that forgets the
+/// multiply fails by the size of the scale rather than by rounding.
 quantized_weight::PackedWeight pack_nvfp4(const std::vector<float>& source, std::int32_t n,
-                                          std::int32_t k) {
+                                          std::int32_t k,
+                                          const std::vector<float>& block_scale) {
     if ((n % 128) != 0 || (k % 64) != 0 || source.size() != static_cast<std::size_t>(n) * k) {
         throw std::invalid_argument("nvfp4 test packer: N must be a multiple of 128, K of 64");
     }
+    if (block_scale.empty() || (n % static_cast<std::int32_t>(block_scale.size())) != 0) {
+        throw std::invalid_argument("nvfp4 test packer: block_scale must divide the rows");
+    }
+    const std::int32_t rows_per_scale = n / static_cast<std::int32_t>(block_scale.size());
     // E2M1 magnitudes, index = code & 7, sign in bit 3.
     static constexpr float kMagnitudes[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
     const std::int32_t groups_per_row     = k / 16;
@@ -103,8 +113,12 @@ quantized_weight::PackedWeight pack_nvfp4(const std::vector<float>& source, std:
     for (std::int32_t row = 0; row < n; ++row) {
         for (std::int32_t group = 0; group < groups_per_row; ++group) {
             const std::size_t base = static_cast<std::size_t>(row) * k + group * 16;
-            float amax             = 0.0f;
-            for (int i = 0; i < 16; ++i) { amax = std::max(amax, std::fabs(source[base + i])); }
+            const float second       = block_scale[static_cast<std::size_t>(row / rows_per_scale)];
+            const float inverse_second = 1.0f / second;
+            float amax                 = 0.0f;
+            for (int i = 0; i < 16; ++i) {
+                amax = std::max(amax, std::fabs(source[base + i]) * inverse_second);
+            }
             // Scale so the largest magnitude lands on E2M1's 6, then round it to a real e4m3
             // value — the kernel decodes the stored byte, so the reference must use that same
             // rounded scale rather than the ideal one.
@@ -114,7 +128,7 @@ quantized_weight::PackedWeight pack_nvfp4(const std::vector<float>& source, std:
             const float inverse = scale > 0.0f ? 1.0f / scale : 0.0f;
 
             for (int i = 0; i < 16; ++i) {
-                const float value     = source[base + i];
+                const float value      = source[base + i] * inverse_second;
                 const float normalised = std::fabs(value) * inverse;
                 int best = 0;
                 float best_error = std::fabs(normalised - kMagnitudes[0]);
@@ -132,7 +146,8 @@ quantized_weight::PackedWeight pack_nvfp4(const std::vector<float>& source, std:
                     packed.payload[byte] =
                         static_cast<std::uint8_t>((packed.payload[byte] & 0x0Fu) | (code << 4));
                 }
-                packed.dequant[base + i] = (negative ? -1.0f : 1.0f) * kMagnitudes[best] * scale;
+                packed.dequant[base + i] =
+                    (negative ? -1.0f : 1.0f) * kMagnitudes[best] * scale * second;
             }
 
             const std::int32_t row_inner = row % 128;
@@ -552,7 +567,9 @@ public:
           routed_gate_(profile.routed_gate_up, kRoutedGateRows, kHidden),
           routed_down_(profile.routed_down, kRoutedDownRows, kIntermediate),
           shared_gate_(QType::W8G32_F16S, kSharedGateRows, kHidden),
-          shared_down_device_(QType::W8G32_F16S, kHidden, kIntermediate) {
+          shared_down_device_(QType::W8G32_F16S, kHidden, kIntermediate),
+          gate_up_scale_host_(static_cast<std::size_t>(kExperts) * 2, 1.0f),
+          down_scale_host_(static_cast<std::size_t>(kExperts), 1.0f) {
         for (int pattern = 0; pattern < static_cast<int>(kRoutePatterns.size()); ++pattern) {
             inputs_.push_back(make_input(pattern));
             residuals_.push_back(make_residual(pattern));
@@ -573,13 +590,23 @@ public:
                 kExpertGateRows, kHidden, 100U + static_cast<std::uint32_t>(expert), factor);
             const auto down_source = make_down(
                 kHidden, kIntermediate, 300U + static_cast<std::uint32_t>(expert), factor);
+            // The checkpoint's second-level scales differ per expert and per projection (3-7x
+            // across one layer's experts, measured on RedHatAI/Qwen3.6-35B-A3B-NVFP4), so the
+            // test gives every expert its own gate, up and down scale rather than a shared one.
+            const float gate_scale = 0.55f + static_cast<float>((expert * 7) % 13) * 0.07f;
+            const float up_scale   = 0.62f + static_cast<float>((expert * 5) % 11) * 0.09f;
+            const float down_scale = 0.71f + static_cast<float>((expert * 3) % 17) * 0.05f;
+            gate_up_scale_host_[static_cast<std::size_t>(expert) * 2]     = gate_scale;
+            gate_up_scale_host_[static_cast<std::size_t>(expert) * 2 + 1] = up_scale;
+            down_scale_host_[static_cast<std::size_t>(expert)]            = down_scale;
             auto gate_up = profile.routed_gate_up == QType::NVFP4
-                               ? pack_nvfp4(gate_up_source, kExpertGateRows, kHidden)
+                               ? pack_nvfp4(gate_up_source, kExpertGateRows, kHidden,
+                                            {gate_scale, up_scale})
                                : quantized_weight::pack_row_split_lowbit(
                                      gate_up_source, kExpertGateRows, kHidden,
                                      profile.routed_gate_up);
             auto down = profile.routed_down == QType::NVFP4
-                            ? pack_nvfp4(down_source, kHidden, kIntermediate)
+                            ? pack_nvfp4(down_source, kHidden, kIntermediate, {down_scale})
                             : quantized_weight::pack_row_split_lowbit(
                                   down_source, kHidden, kIntermediate, profile.routed_down);
             routed_gate_.copy_rows(gate_up, expert * kExpertGateRows);
@@ -593,6 +620,8 @@ public:
             make_down(kHidden, kIntermediate, 0x731U, 0.87f), kHidden, kIntermediate);
         shared_gate_.copy_rows(shared_gate_host_, 0);
         shared_down_device_.copy_rows(shared_down_host_, 0);
+        gate_up_scale_device_ = to_device(gate_up_scale_host_);
+        down_scale_device_    = to_device(down_scale_host_);
 
         for (int pattern = 0; pattern < static_cast<int>(kRoutePatterns.size()); ++pattern) {
             references_.push_back(sparse_moe_oracle(inputs_[pattern], residuals_[pattern], router_,
@@ -625,7 +654,7 @@ public:
                               cudaMemcpyDeviceToDevice),
                    "seed SparseMoe destination");
 
-        const ops::SparseMoeWeights weights{
+        ops::SparseMoeWeights weights{
             dense_bf16_weight(device_router_.p, kExperts + 1, kHidden),
             routed_gate_.weight(),
             routed_down_.weight(),
@@ -633,6 +662,7 @@ public:
             shared_down_device_.weight(),
             kTopK,
         };
+        attach_nvfp4_scales(weights);
         Tensor x(device_input.p, DType::BF16, {kHidden, tokens});
         Tensor destination(destination_storage.data(), DType::BF16, {kHidden, tokens});
         const std::size_t workspace_bytes = ops::sparse_moe_workspace_capacity_bytes(ops::kSparseMoeQwen36Geometry, 
@@ -723,6 +753,7 @@ public:
             kTopK,
         };
         weights.slot_of_expert = static_cast<const std::int32_t*>(device_table.p);
+        attach_nvfp4_scales(weights);
         Tensor x(device_input.p, DType::BF16, {kHidden, tokens});
         Tensor destination(destination_storage.data(), DType::BF16, {kHidden, tokens});
         const std::size_t workspace_bytes = ops::sparse_moe_workspace_capacity_bytes(ops::kSparseMoeQwen36Geometry, 
@@ -763,6 +794,17 @@ public:
         return failures;
     }
 
+    /// The op requires the second-level arrays for NVFP4 and rejects them for anything else,
+    /// so attach exactly where the profile calls for it.
+    void attach_nvfp4_scales(ops::SparseMoeWeights& weights) const {
+        if (profile_.routed_gate_up == QType::NVFP4) {
+            weights.routed_gate_up_scale = static_cast<const float*>(gate_up_scale_device_.p);
+        }
+        if (profile_.routed_down == QType::NVFP4) {
+            weights.routed_down_scale = static_cast<const float*>(down_scale_device_.p);
+        }
+    }
+
 private:
     const CodecProfile& profile_;
     std::vector<float> router_;
@@ -772,6 +814,12 @@ private:
     DeviceRowSplit routed_down_;
     DeviceRowSplit shared_gate_;
     DeviceRowSplit shared_down_device_;
+    // NVFP4's second level: [experts][2] gate/up and [experts] down, uploaded once. Unit for
+    // every other codec, where the arrays stay off the weights entirely.
+    std::vector<float> gate_up_scale_host_;
+    std::vector<float> down_scale_host_;
+    DeviceBuffer gate_up_scale_device_;
+    DeviceBuffer down_scale_device_;
     std::vector<std::vector<float>> inputs_;
     std::vector<std::vector<float>> residuals_;
     std::vector<HostExpert> experts_;
