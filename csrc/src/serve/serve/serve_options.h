@@ -9,6 +9,8 @@
 #include <string_view>
 #include <vector>
 
+#include "serve/output_parsers.h"
+
 namespace sinfer::serve {
 
 // Protocol default when the client omits max_tokens. Engine independently
@@ -61,6 +63,35 @@ struct ServeOptions {
     bool preserve_thinking = false;
     int default_max_tokens = kDefaultMaxTokens;
     bool enable_cors       = false; // send permissive CORS headers for browser UIs
+
+    // Output parsing, named the way vLLM names it. Defaults preserve the behaviour
+    // that was hard-wired before the flags existed: reasoning fenced with <think>,
+    // tool calls in the Qwen block.
+    ReasoningFormat reasoning_format = ReasoningFormat::ThinkTags;
+    ToolCallFormat tool_call_format  = ToolCallFormat::QwenXml;
+    /// --enable-auto-tool-choice: vLLM gates automatic tool selection behind this
+    /// flag and requires a tool-call parser with it. Off, a request asking for
+    /// `tool_choice: "auto"` with tools attached is refused rather than answered
+    /// with prose the caller will try to parse as a call.
+    bool enable_auto_tool_choice = false;
+    /// --chat-template: a Jinja template read from disk that replaces the one the
+    /// artifact carries. Empty keeps the artifact's.
+    std::string chat_template;
+    std::string chat_template_path;
+
+    /// --enable-lora / --lora-modules name=path[,name=path...]. A request selects an
+    /// adapter by naming it in `model`; the base model keeps its own id. vLLM's
+    /// --max-loras and --max-lora-rank bound what a deployment will admit, and are
+    /// checked at load so a too-large adapter is refused with its rank named rather
+    /// than at the first request.
+    struct LoraModule {
+        std::string name;
+        std::string path;
+    };
+    bool enable_lora = false;
+    std::vector<LoraModule> lora_modules;
+    std::uint32_t max_loras     = 1;
+    std::uint32_t max_lora_rank = 16;
     // Process-level explicit overrides layered between registered model/mode defaults and request
     // fields. An omitted seed is replaced per request with a fresh random seed.
     SamplingOverrides sampling_overrides;

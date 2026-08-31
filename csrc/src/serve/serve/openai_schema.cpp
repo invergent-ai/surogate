@@ -684,12 +684,23 @@ std::string make_chat_chunk_usage(const std::string& id, const std::string& mode
 
 std::string sse_done() { return "data: [DONE]\n\n"; }
 
-std::string make_models_list(const std::string& model_id, std::int64_t created) {
-    const Json payload = {{"object", "list"},
-                          {"data", Json::array({Json{{"id", model_id},
-                                                     {"object", "model"},
-                                                     {"created", created},
-                                                     {"owned_by", "sinfer"}}})}};
+std::string make_models_list(const std::string& model_id, std::int64_t created,
+                             const std::vector<std::string>& adapters) {
+    Json data = Json::array({Json{{"id", model_id},
+                                  {"object", "model"},
+                                  {"created", created},
+                                  {"owned_by", "sinfer"}}});
+    // Adapters are selectable model ids, so they belong in the listing: a client
+    // discovers what it may put in `model`, and an adapter that is loaded but
+    // invisible here cannot be found by anything that enumerates first.
+    for (const std::string& adapter : adapters) {
+        data.push_back(Json{{"id", adapter},
+                            {"object", "model"},
+                            {"created", created},
+                            {"owned_by", "sinfer"},
+                            {"parent", model_id}});
+    }
+    const Json payload = {{"object", "list"}, {"data", std::move(data)}};
     return payload.dump();
 }
 

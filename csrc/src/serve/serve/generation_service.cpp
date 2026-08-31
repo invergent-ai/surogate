@@ -2,6 +2,7 @@
 
 #include "product/media_acquire/acquire.h"
 #include "serve/console_log.h"
+#include "serve/output_parsers.h"
 #include "serve/tool_call_parser.h"
 #include "serve/translate.h"
 
@@ -249,6 +250,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.media_cache_bytes        = options_.media_cache_bytes;
     engine_options.media_live_bytes         = options_.media_live_bytes;
     engine_options.media_preprocess_threads = options_.media_preprocess_threads;
+    engine_options.chat_template_override   = options_.chat_template;
     engine_options.load_progress            = std::move(load_progress);
     engine_              = std::make_unique<sinfer::Engine>(std::move(engine_options));
     prompt_capabilities_ = engine_->prompt_capabilities();
@@ -282,6 +284,18 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
     PreparedRequest prepared;
     sinfer::RequestOptions request_options = to_request_options(request, options_);
     prepared.include_usage                 = request.include_usage;
+    // --enable-auto-tool-choice, vLLM's gate. Without it a request may still name a
+    // function or demand one; what it may not do is leave the choice to the model,
+    // because the deployment has not said the model's calls can be read back.
+    if (!options_.enable_auto_tool_choice && !request.tools.empty() &&
+        request.tool_choice.mode == ToolChoiceMode::Auto) {
+        ApiError error;
+        error.message = "tool_choice 'auto' needs the server started with "
+                        "--enable-auto-tool-choice (and --tool-call-parser)";
+        error.param   = "tool_choice";
+        error.code    = "auto_tool_choice_disabled";
+        throw ApiException(std::move(error));
+    }
     prepared.tool_capable                  = request.uses_tools() || request.has_tool_history();
     prepared.tool_name_max_length          = request.tool_name_max_length;
     const ResolvedPromptSemantics semantics =
@@ -409,12 +423,18 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
 
     bool is_tool_call_response = false;
     if (prepared.tool_capable) {
-        ParsedToolCallOutput parsed =
-            parse_qwen_tool_call_output(outcome.text, prepared.tool_name_max_length);
-        outcome.text          = std::move(parsed.content);
-        is_tool_call_response = parsed.is_tool_call_response;
+        ParsedToolCalls parsed = parse_tool_calls(options_.tool_call_format, outcome.text,
+                                                  prepared.tool_name_max_length);
+        outcome.text           = std::move(parsed.content);
+        is_tool_call_response  = parsed.is_tool_call_response;
         if (is_tool_call_response) { outcome.tool_calls = std::move(parsed.tool_calls); }
     }
+    // --reasoning-parser reconciles what the frontend already split. `none` folds
+    // the span back into the answer rather than dropping it.
+    ReasoningSplit split = split_reasoning(options_.reasoning_format,
+                                           std::move(outcome.reasoning), std::move(outcome.text));
+    outcome.reasoning    = std::move(split.reasoning);
+    outcome.text         = std::move(split.content);
     if (output_sink) {
         outcome.streamed_content_bytes = output_sink->finish(is_tool_call_response);
     }

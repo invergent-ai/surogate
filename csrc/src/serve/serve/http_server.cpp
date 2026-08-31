@@ -1,5 +1,7 @@
 #include "serve/http_server.h"
 
+#include "serve/lora_registry.h"
+
 #include "serve/anthropic_schema.h"
 #include "serve/console_log.h"
 #include "serve/openai_schema.h"
@@ -139,6 +141,36 @@ HttpServer::HttpServer(ServeOptions options)
     server_.new_task_queue         = [queued_requests, worker_count] {
         return new httplib::ThreadPool(worker_count, queued_requests);
     };
+    // Adapters are read and validated here, before the port opens: an adapter the
+    // deployment named but cannot be served is a startup failure, not a surprise
+    // waiting for the first request that selects it.
+    if (options_.enable_lora) {
+        std::vector<std::pair<std::string, std::string>> modules;
+        modules.reserve(options_.lora_modules.size());
+        for (const auto& module : options_.lora_modules) {
+            modules.emplace_back(module.name, module.path);
+        }
+        lora_.load(modules, options_.max_lora_rank);
+        // The adapters are read, validated and selectable, but no target applies
+        // them to its forward yet: every projection an adapter targets is fused
+        // (q/k/v arrive as one tensor), so a q_proj delta lands on a strided row
+        // range that the contiguous residual add cannot take. Serving them anyway
+        // would answer every request naming an adapter with the base model's
+        // output and call it adapted -- fluent, and silently wrong. Refuse instead,
+        // and say what is missing.
+        //
+        // What remains, and the shape it should take: stack the A matrices of a
+        // fused group and build a block-diagonal B, so q/k/v together are one
+        // rank-3r product over the whole fused output. That keeps `ops::lora_delta`
+        // exactly as it is -- two GEMMs and a contiguous add -- and needs no
+        // strided kernel. Then upload per target and call it after each projection.
+        throw std::runtime_error(
+            "--enable-lora: " + std::to_string(lora_.adapters().size()) +
+            " adapter(s) load and validate, but this target does not apply them to its "
+            "forward yet (its q/k/v projections are fused), so serving them would return "
+            "unadapted output. Merge the adapter into the checkpoint before conversion "
+            "(`surogate merge`) until the runtime path lands.");
+    }
     server_.set_payload_max_length(options_.max_request_bytes);
     register_routes();
 }
@@ -331,12 +363,15 @@ void HttpServer::register_routes() {
 }
 
 void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {
-    res.set_content(make_models_list(public_model_id_, unix_time_now()), "application/json");
+    std::vector<std::string> adapters;
+    for (const auto& [name, adapter] : lora_.adapters()) { adapters.push_back(name); }
+    res.set_content(make_models_list(public_model_id_, unix_time_now(), adapters),
+                    "application/json");
 }
 
 void HttpServer::handle_model(const httplib::Request& req, httplib::Response& res) const {
     const std::string id = req.matches.size() > 1 ? req.matches[1].str() : std::string();
-    if (id != public_model_id_) {
+    if (id != public_model_id_ && lora_.find(id) == nullptr) {
         ApiError error;
         error.status  = 404;
         error.type    = "invalid_request_error";
@@ -365,13 +400,19 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
         request                   = parse_chat_completion_request(body, limits);
+        // A request selects an adapter by naming it in `model`; the base id keeps
+        // meaning the unadapted model.
         if (request.model != public_model_id_) {
-            ApiError error;
-            error.status  = 404;
-            error.type    = "invalid_request_error";
-            error.code    = "model_not_found";
-            error.message = "model '" + request.model + "' not found";
-            throw ApiException(std::move(error));
+            const LoraAdapter* adapter = lora_.find(request.model);
+            if (adapter == nullptr) {
+                ApiError error;
+                error.status  = 404;
+                error.type    = "invalid_request_error";
+                error.code    = "model_not_found";
+                error.message = "model '" + request.model + "' not found";
+                throw ApiException(std::move(error));
+            }
+            request.lora_adapter = adapter->name;
         }
     } catch (const ApiException& e) {
         write_error(res, e.error());

@@ -1,6 +1,8 @@
 #include "serve/serve_options.h"
 #include "product/speculative_options.h"
 
+#include <fstream>
+#include <sstream>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
@@ -107,6 +109,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--max-num-seqs N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--max-num-batched-tokens N] [--log-stats-interval-ms N] [--device N] [--devices A,B,...] "
+           "[--reasoning-parser NAME] [--tool-call-parser NAME] [--enable-auto-tool-choice] "
+           "[--chat-template FILE] [--enable-prefix-caching|--no-enable-prefix-caching] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
            "[--request-log-jsonl FILE] "
@@ -148,6 +152,13 @@ std::string serve_usage_text(const char* argv0) {
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
+           "       --reasoning-parser selects how a reasoning span is recognised (default qwen3);\n"
+           "         --tool-call-parser how a tool call is (default qwen3_xml). Both accept the\n"
+           "         vLLM names, and an unknown one is refused with the supported list.\n"
+           "       --enable-auto-tool-choice permits tool_choice 'auto'; it needs a tool-call parser.\n"
+           "       --chat-template replaces the artifact's Jinja template with one read from FILE.\n"
+           "       --enable-prefix-caching is this engine's default; the flag is accepted for\n"
+           "         command-line compatibility, and --no-enable-prefix-caching turns it off.\n"
            "       --greedy forces temperature 0 (exact argmax).\n";
 }
 
@@ -338,6 +349,50 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.use_cuda_graph = false;
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
+        } else if (arg == "--enable-prefix-caching") {
+            // vLLM's spelling for what this engine has done by default since it
+            // shipped; accepted so a command line written for vLLM runs unchanged.
+            options.allow_prefix_reuse = true;
+        } else if (arg == "--no-enable-prefix-caching") {
+            options.allow_prefix_reuse = false;
+        } else if (arg == "--reasoning-parser") {
+            options.reasoning_format = parse_reasoning_format(require_value("--reasoning-parser"));
+        } else if (arg == "--tool-call-parser") {
+            options.tool_call_format = parse_tool_call_format(require_value("--tool-call-parser"));
+        } else if (arg == "--enable-auto-tool-choice") {
+            options.enable_auto_tool_choice = true;
+        } else if (arg == "--chat-template") {
+            options.chat_template_path = require_value("--chat-template");
+        } else if (arg == "--enable-lora") {
+            options.enable_lora = true;
+        } else if (arg == "--lora-modules") {
+            // `name=path` entries, comma separated or repeated, as vLLM accepts them.
+            std::string spec = require_value("--lora-modules");
+            std::size_t begin = 0;
+            while (begin <= spec.size()) {
+                const std::size_t comma = spec.find(',', begin);
+                const std::string entry =
+                    spec.substr(begin, comma == std::string::npos ? std::string::npos
+                                                                  : comma - begin);
+                if (!entry.empty()) {
+                    const std::size_t equals = entry.find('=');
+                    if (equals == std::string::npos || equals == 0 ||
+                        equals + 1 >= entry.size()) {
+                        throw std::invalid_argument(
+                            "--lora-modules entries are name=path, got '" + entry + "'");
+                    }
+                    options.lora_modules.push_back(
+                        {entry.substr(0, equals), entry.substr(equals + 1)});
+                }
+                if (comma == std::string::npos) { break; }
+                begin = comma + 1;
+            }
+        } else if (arg == "--max-loras") {
+            options.max_loras = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--max-loras"), "max-loras"));
+        } else if (arg == "--max-lora-rank") {
+            options.max_lora_rank = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--max-lora-rank"), "max-lora-rank"));
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--no-thinking") {
@@ -394,6 +449,54 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (options.max_pending_requests == 0) {
         throw std::invalid_argument("--max-pending-requests must be positive");
+    }
+    // vLLM couples these two: automatic tool choice needs a parser to read the
+    // model's calls back, and enabling it without one produces a server that
+    // accepts `tool_choice: "auto"` and can never satisfy it.
+    if (options.enable_auto_tool_choice && options.tool_call_format == ToolCallFormat::None) {
+        throw std::invalid_argument(
+            "--enable-auto-tool-choice needs --tool-call-parser (supported: " +
+            tool_call_parser_names() + ")");
+    }
+    if (!options.lora_modules.empty() && !options.enable_lora) {
+        throw std::invalid_argument("--lora-modules needs --enable-lora");
+    }
+    if (options.enable_lora) {
+        if (options.lora_modules.empty()) {
+            throw std::invalid_argument("--enable-lora needs at least one --lora-modules name=path");
+        }
+        if (options.max_loras == 0) { throw std::invalid_argument("--max-loras must be positive"); }
+        if (options.max_lora_rank == 0) {
+            throw std::invalid_argument("--max-lora-rank must be positive");
+        }
+        if (options.lora_modules.size() > options.max_loras) {
+            throw std::invalid_argument("--lora-modules names " +
+                                        std::to_string(options.lora_modules.size()) +
+                                        " adapters but --max-loras is " +
+                                        std::to_string(options.max_loras));
+        }
+        std::vector<std::string> seen;
+        for (const auto& module : options.lora_modules) {
+            if (std::find(seen.begin(), seen.end(), module.name) != seen.end()) {
+                throw std::invalid_argument("--lora-modules repeats the name '" + module.name +
+                                            "'; a request selects an adapter by name");
+            }
+            seen.push_back(module.name);
+        }
+    }
+    if (!options.chat_template_path.empty()) {
+        std::ifstream file(options.chat_template_path, std::ios::binary);
+        if (!file) {
+            throw std::invalid_argument("--chat-template: cannot read " +
+                                        options.chat_template_path);
+        }
+        std::ostringstream buffer;
+        buffer << file.rdbuf();
+        options.chat_template = buffer.str();
+        if (options.chat_template.empty()) {
+            throw std::invalid_argument("--chat-template: " + options.chat_template_path +
+                                        " is empty");
+        }
     }
     if (options.pending_timeout_ms == 0) {
         throw std::invalid_argument("--pending-timeout-ms must be positive");

@@ -205,7 +205,14 @@ void validate_tokenizer_config(const FrontendResources& resources) {
     }
 }
 
-fi::CompiledChatTemplate compile_chat_template(const FrontendResources& resources) {
+fi::CompiledChatTemplate compile_chat_template(const FrontendResources& resources,
+                                               const std::string& override_template) {
+    if (!override_template.empty()) {
+        // The artifact's template is cross-checked against its tokenizer_config;
+        // an operator-supplied one cannot be, by definition. Compile it and let a
+        // malformed template fail loudly here rather than mid-request.
+        return fi::CompiledChatTemplate::resolve(override_template);
+    }
     validate_tokenizer_config(resources);
     return fi::CompiledChatTemplate::resolve(resources.chat_template_jinja);
 }
@@ -595,7 +602,7 @@ DecoderState terminal_state(DecoderState state) {
 class Frontend::Impl {
 public:
     Impl(const FrontendResources& resources, bool registered_checkpoint, FrontendOptions options)
-        : chat_template(compile_chat_template(resources)),
+        : chat_template(compile_chat_template(resources, options.chat_template_override)),
           tokenizer(std::make_shared<const fi::Tokenizer>(
               fi::TokenizerResources{.tokenizer_json         = resources.tokenizer_json,
                                      .tokenizer_config_json  = resources.tokenizer_config_json,

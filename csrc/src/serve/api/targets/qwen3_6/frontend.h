@@ -6,6 +6,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <memory>
 #include <span>
 #include <vector>
@@ -20,6 +21,8 @@ struct FrontendOptions {
     std::size_t media_cache_bytes          = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes           = kDefaultMediaLiveBytes;
     std::uint32_t media_preprocess_threads = 0;
+    /// Replaces the artifact's chat template when non-empty (--chat-template).
+    std::string chat_template_override;
 };
 
 struct FrontendResources;

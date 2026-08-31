@@ -3,6 +3,7 @@
 #include "serve/generation_service.h"
 #include "serve/response_store.h"
 #include "serve/request_log.h"
+#include "serve/lora_registry.h"
 #include "serve/serve_options.h"
 
 #include <httplib.h>
@@ -63,6 +64,8 @@ private:
     void stop_stats_reporter();
 
     GenerationService* service_ = nullptr;
+    /// Adapters this server may serve; empty unless --enable-lora named some.
+    LoraRegistry lora_;
     ServeOptions options_;
     std::string public_model_id_;
     ResponseStore response_store_;

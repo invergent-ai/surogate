@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace sinfer::serve {
 
@@ -66,7 +67,8 @@ std::string make_chat_chunk_usage(const std::string& id, const std::string& mode
 std::string sse_done();
 
 // /v1/models payloads.
-std::string make_models_list(const std::string& model_id, std::int64_t created);
+std::string make_models_list(const std::string& model_id, std::int64_t created,
+                             const std::vector<std::string>& adapters = {});
 std::string make_model_object(const std::string& model_id, std::int64_t created);
 
 // Error object body.

@@ -185,6 +185,11 @@ struct GenerationRequest {
     bool preserve_thinking_semantic_change = false;
     SamplingParams sampling;
 
+    /// The adapter this request selected by naming it in `model`, empty for the
+    /// base model. Resolved by the HTTP layer against the registry, so by the time
+    /// the service sees it the name is known to exist.
+    std::string lora_adapter;
+
     [[nodiscard]] bool uses_tools() const noexcept {
         return !tools.empty() && tool_choice.mode != ToolChoiceMode::None;
     }

@@ -172,6 +172,9 @@ sinfer_add_test(sinfer_tool_call_parser_test
 sinfer_add_test(sinfer_serve_options_test
   SOURCES test_serve_options.cpp
   LIBRARIES sinfer_serve)
+sinfer_add_test(sinfer_output_parsers_test
+  SOURCES test_output_parsers.cpp
+  LIBRARIES sinfer_serve)
 sinfer_add_test(sinfer_request_log_test
   SOURCES test_request_log.cpp
   LIBRARIES sinfer_serve)
@@ -219,6 +222,7 @@ set(sinfer_op_tests
   rmsnorm
   gated_rmsnorm
   expert_slot_cache
+  lora
   qsa_indexer
   cpu_expert_compute
   l2norm

@@ -94,6 +94,10 @@ struct EngineOptions {
     // of one pool over every core; set by the pipeline constructor.
     bool cpu_moe_pool_per_socket       = false;
     std::uint32_t max_context          = 2048; // Exact logical ceiling of each request.
+    // --chat-template: a Jinja template that replaces the artifact's. Empty keeps the
+    // artifact's, which is the only one whose agreement with tokenizer_config.json the
+    // loader can check -- an override is the operator taking that responsibility.
+    std::string chat_template_override;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
     // Storage of the pinned host expert bank. Q4G32AM (4-bit affine groups requantised from
     // the artifact's W8 at load) is 59 % of the bytes and near-exact for Q4_K-derived experts,
