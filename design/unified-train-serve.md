@@ -532,3 +532,29 @@ targets that carry a recipe, and was verified by re-stubbing one: coverage fails
 with *"recipe order or coverage does not match the tensor inventory"*. Full CPU
 suite: 374 passed, 1 skipped — the DPO end-to-end included, now that the fp8
 LM-head nondeterminism is fixed.
+
+## The same facts, a fourth time
+
+Conversion still refused after the recipe fix: `convert.py` guards every run with
+`preflight_inventory`, which compares hardcoded section counts —
+`(6, 267, 2, 12, 0, 281, 287)` — against the inventory. The `0` is the vision
+count. So the geometry of an artifact was stated in four places: the declaration,
+the inventory, the recipe, and this tuple, and only the first three had been
+reconciled.
+
+Updated for all three dense targets, and `test_converter_preflight_accepts_its_own_inventory`
+now runs it, so all three halves of a converter are checked together. That is the
+third guard this exercise has had to add after being caught by a failure rather
+than a test — which is itself the argument for deriving these things rather than
+restating them.
+
+With that, Qwen3.5-2B converts: **584 objects**, exactly the count the declaration
+implies, preflight passing with the vision tower included and its 632 source
+tensors resolving out of the checkpoint. The tower was in the weights all along;
+only the converter had it stubbed out.
+
+One unrelated gap found on the way: `Qwen/Qwen3.5-0.8B` does not publish a
+`generation_config.json` (the hub returns 404), and the family's `RESOURCE_SPECS`
+requires one, so that target cannot convert from its own checkpoint. The 9B is in
+the same position. Not caused by this work, but it is why the parity run uses the
+2B.

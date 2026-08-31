@@ -228,3 +228,20 @@ def test_conversion_recipe_covers_its_inventory(target):
     import importlib
 
     importlib.import_module(f"surogate.serve.tools.convert.{target}.recipe")
+
+
+@pytest.mark.parametrize("target", RECIPE_TARGETS)
+def test_converter_preflight_accepts_its_own_inventory(target):
+    """The third half. `convert.py` guards conversion with `preflight_inventory`,
+    which compares hardcoded section counts against the inventory — a fourth
+    restatement of the same facts, and the one that actually blocks a conversion
+    run. Growing an inventory without updating it fails at convert time, long
+    after the tests have gone green, so it is checked here too."""
+
+    import importlib
+
+    module = importlib.import_module(f"surogate.serve.tools.convert.{target}.convert")
+    preflight = getattr(module, "preflight_inventory", None)
+    if preflight is None:
+        pytest.skip(f"{target} has no preflight_inventory")
+    preflight()
