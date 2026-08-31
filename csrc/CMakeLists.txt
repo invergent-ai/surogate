@@ -950,6 +950,7 @@ add_library(sinfer_ops STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_16q4.cu
   ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_24q2.cu
   ${SERVE_ROOT}/ops/launcher/gelu.cu
+  ${SERVE_ROOT}/ops/launcher/gelu_and_mul.cu
   ${SERVE_ROOT}/ops/launcher/bidirectional_gqa_attention.cu
   ${SERVE_ROOT}/ops/launcher/swa.cu
   ${SERVE_ROOT}/ops/launcher/gqa_attention_decode.cu
@@ -971,6 +972,7 @@ add_library(sinfer_ops STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/launcher/scalar.cu
   ${SERVE_ROOT}/ops/launcher/scatter.cu
   ${SERVE_ROOT}/ops/launcher/sigmoid_gate_mul.cu
+  ${SERVE_ROOT}/ops/launcher/mean_pool.cu
   ${SERVE_ROOT}/ops/launcher/silu_and_mul.cu
   ${SERVE_ROOT}/ops/launcher/vision_attention.cu
   ${SERVE_ROOT}/ops/launcher/vision_pos_embed.cu
@@ -1138,6 +1140,7 @@ add_library(sinfer_ops STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/wrapper/gdn_gating_proj.cpp
   ${SERVE_ROOT}/ops/wrapper/gdn_input_proj.cpp
   ${SERVE_ROOT}/ops/wrapper/gelu.cpp
+  ${SERVE_ROOT}/ops/wrapper/gelu_mul.cpp
   ${SERVE_ROOT}/ops/wrapper/bidirectional_gqa_attention.cpp
   ${SERVE_ROOT}/ops/wrapper/swa.cpp
   ${SERVE_ROOT}/ops/wrapper/gqa_attention.cpp
@@ -1162,6 +1165,7 @@ add_library(sinfer_ops STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/wrapper/scalar.cpp
   ${SERVE_ROOT}/ops/wrapper/scatter.cpp
   ${SERVE_ROOT}/ops/wrapper/sigmoid_mul.cpp
+  ${SERVE_ROOT}/ops/wrapper/mean_pool.cpp
   ${SERVE_ROOT}/ops/wrapper/silu_mul.cpp
   ${SERVE_ROOT}/ops/wrapper/sparse_moe.cpp
   ${SERVE_ROOT}/ops/wrapper/vision_attention.cpp
