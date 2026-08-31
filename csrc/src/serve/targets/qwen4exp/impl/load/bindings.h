@@ -107,6 +107,14 @@ struct BindingPlan {
     std::array<std::uint64_t, TextConfig::ple_ngram> ple_multipliers{};
     std::array<std::int32_t, TextConfig::ple_heads> ple_head_offsets{};
     std::array<std::int32_t, TextConfig::ple_heads> ple_head_vocab_sizes{};
+    // The vision tower. Flash-Next ships the same 27x1152 tower the Qwen3.6 targets
+    // do, so the family's default VisionBackboneConfig describes it exactly and no
+    // per-target geometry is needed here.
+    qwen3_6::VisionBackbonePlan vision_backbone;
+    qwen3_6::VisionMergerInputPlan vision_merger_input;
+    artifact::ObjectHandle vision_merger_fc2;
+    artifact::ObjectHandle vision_merger_fc2_bias;
+    qwen3_6::VisionMergerNormPlan vision_merger_norm;
     // Host-resident objects are copied out of the artifact mapping while the reader lives.
     HostBankPlan host_bank;
 };

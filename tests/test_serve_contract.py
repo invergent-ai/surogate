@@ -55,9 +55,12 @@ CHECKED_TARGETS = (("qwen4exp", "models/Qwen3.8-Flash-Next-frontend"),)
 #: artifact carries a capability's objects only when its target implements it —
 #: the three Qwen3.5 targets and qwen4exp are text-only in C++ today.
 INVENTORY_TARGETS = (
-    ("qwen4exp", "dir:models/Qwen3.8-Flash-Next-frontend", {"text"}),
+    # Flash-Next ships the 27x1152 tower the vision kernels implement, and its
+    # binder consumes it, so its artifact carries it.
+    ("qwen4exp", "dir:models/Qwen3.8-Flash-Next-frontend", {"text", "vision"}),
     ("qwen3_5_0_8b", "hub:models--Qwen--Qwen3.5-0.8B", {"text"}),
-    # The 2B's binder now consumes its tower, so its artifact carries it.
+    # The 2B binds its tower so the artifact is complete, but serving it is
+    # gated: its head_dim is 64 and the vision kernels implement 72.
     ("qwen3_5_2b", "hub:models--Qwen--Qwen3.5-2B", {"text", "vision"}),
     ("qwen3_5_4b", "hub:models--Qwen--Qwen3.5-4B", {"text"}),
     ("qwen3_6_35b_a3b", "hub:models--Qwen--Qwen3.6-35B-A3B", {"text", "vision", "dflash"}),

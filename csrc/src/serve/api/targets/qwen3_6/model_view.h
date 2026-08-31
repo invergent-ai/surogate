@@ -80,7 +80,11 @@ struct DFlashWeights {
 
 template <class FullProjectionPayload, class GdnProjectionPayload, class MainPostMixerPayload,
           class MtpAttentionPayload, class MtpPostMixerPayload, class DFlashPayload,
-          std::size_t FullAttentionLayers, std::size_t GdnLayers>
+          std::size_t FullAttentionLayers, std::size_t GdnLayers,
+          // The tower a target ships. Defaulted to the family's so every existing
+          // instantiation is unchanged; a target with its own overrides it, and the
+          // weights below are sized by it rather than by the family.
+          class VisionCfg = VisionBackboneConfig>
 struct ModelView {
     using FullLayer = FullAttentionWeights<FullProjectionPayload, MainPostMixerPayload>;
     using GdnLayer  = GdnWeights<GdnProjectionPayload, MainPostMixerPayload>;
@@ -97,7 +101,7 @@ struct ModelView {
     std::optional<OptimizedProposalWeights> optimized_proposal;
     std::optional<MtpLayer> mtp;
     std::optional<DFlashPayload> dflash;
-    std::optional<VisionWeights> vision;
+    std::optional<VisionWeightsFor<VisionCfg>> vision;
 };
 
 } // namespace targets::qwen3_6

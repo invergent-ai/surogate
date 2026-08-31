@@ -343,6 +343,26 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeature
         out.host_bank.objects.push_back({out.ple_table, payload, "text/ple/table.iq4nl"});
     }
 
+    // Flash-Next's checkpoint carries a vision tower, so the artifact may hold it and
+    // this binder must consume it — the loader refuses any object no binder claims.
+    // Its geometry is the family default (27 layers of 1152, head_dim 72), which is
+    // what the vision kernels implement, so nothing here is target-specific.
+    const artifact::TensorPlacement vision_placement =
+        features.vision ? artifact::TensorPlacement::Device
+                        : artifact::TensorPlacement::ValidateOnly;
+    out.vision_backbone =
+        qwen3_6::bind_vision_backbone<qwen3_6::VisionBackboneConfig>(binder, vision_placement);
+    out.vision_merger_input =
+        qwen3_6::bind_vision_merger_input<qwen3_6::VisionBackboneConfig>(binder, vision_placement);
+    out.vision_merger_fc2 = artifact::bind_tensor(
+        binder, "vision/merger/fc2", artifact::NumericFormat::W8G32_F16S,
+        {TextConfig::hidden, qwen3_6::VisionBackboneConfig::merger_hidden}, vision_placement);
+    out.vision_merger_fc2_bias =
+        artifact::bind_tensor(binder, "vision/merger/fc2_bias", artifact::NumericFormat::BF16,
+                              {TextConfig::hidden}, vision_placement);
+    out.vision_merger_norm =
+        qwen3_6::bind_vision_merger_norm<qwen3_6::VisionBackboneConfig>(binder, vision_placement);
+
     load_plan.materialization = binder.finish();
     return load_plan;
 }
