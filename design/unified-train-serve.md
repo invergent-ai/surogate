@@ -291,3 +291,51 @@ released or dev version ships `qwen4_exp`, and the checkpoint carries no remote
 code. The path is the one the serve side already built — the GGUF-fed CPU
 references in `surogate/serve/tools/parity/qwen4exp/` against
 `SUROGATE_DEBUG_DUMP_TENSORS` dumps.
+
+## Progress: the DSL becomes the source (2026-08-31, step ①)
+
+`from_dsl.py` reads a declaration and produces the `TargetSpec` the emitters
+consume, so the shape constants a serve target states are now the values
+training actually compiles rather than a transcription of them. The two inputs
+are the ones training already uses — `surogate/dsl/models/*.py` for the
+architecture, the checkpoint's own `config.json` for this instance's sizing —
+and the handful of scalars the declaration neither derives nor interprets
+(`rope_theta`) are read from the config and named in `CONFIG_PASSTHROUGH`, so
+the places where the DSL is *not* yet the source are countable.
+
+`check_roundtrip.py` no longer restates the values it checks: it builds both
+specs through `from_dsl` and still reproduces `qwen3_5_0_8b` and `qwen3_5_4b`
+`config.h` byte for byte, which is what retires the hand-written literals.
+
+For targets nobody intends to generate yet there is a second, weaker-looking but
+stricter check. `qwen4exp/impl/config.h` is hand-written and carries prose that
+records why values are what they are; a generator forced to reproduce that prose
+would relocate the duplication rather than remove it. So `check_contract.py`
+parses the literal `static constexpr` values out of the committed header and
+compares them against the declaration. On Flash-Next: **30 constants agree, none
+disagree** — hidden, layer schedule, both head geometries, hyper-connection count
+and rank, all three MoE widths, all four indexer fields, every PLE quantity
+including the 1-based-to-0-based layer conversion, and the MTP count. Four
+constants sit outside the contract by design (`eos_token`, the IQ4_NL table
+facts, the `rope_theta` pass-through), and `ple_embed` is checked through its
+inputs because the header derives it.
+
+That result is worth more than the check: the declaration written yesterday and a
+serving target written independently, tuned and benchmarked, agree on every
+architectural quantity. Two constants of that parse — `DFlashConfig` reuses the
+name `layers` — is also why the parser scopes to `struct TextConfig`; flattening
+the file silently substituted a draft-head constant for the text stack's.
+
+**LoRA is carried from the start.** `TargetSpec.params` holds every declared
+parameter with its checkpoint path and its adapter slices, lifted from the IR's
+`lora_targets` — 72 adapter-addressable parameters on the 0.8B, 96 on the 4B. The
+slices already carry the fused-projection offsets (`mlp_up_weight` is
+`[(up, 0, 3584), (gate, 3584, 3584)]`), which is exactly what serving LoRA needs
+in order to apply an adapter trained on one logical projection to the right row
+range of a fused serve tensor. Serving has no LoRA math and no weight-update path
+today, so this is preparation, not capability — but it means the contract will
+not have to be re-derived when GRPO needs it.
+
+Next: bindings.h/cpp from the same contract (218 of the 309 differing lines),
+then the converter inventory, then the train/serve numeric parity test, with
+GLM-5.3-Flash written declaration-first as the acceptance test.

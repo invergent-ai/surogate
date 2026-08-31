@@ -91,6 +91,11 @@ class TargetSpec:
     mtp_draft_tokens: int = 5
     attention_interval: int = 4
     tensor_names: dict[str, str] = field(default_factory=dict)
+    #: Every learnable parameter the declaration knows about, with its HF path
+    #: and adapter slices. Empty for specs written by hand; populated by
+    #: ``from_dsl``. Consumed by the bindings and converter-inventory emitters,
+    #: and by LoRA serving once it exists.
+    params: tuple[ParamSpec, ...] = ()
 
     def validate(self) -> None:
         if not self.name.isidentifier():
@@ -130,3 +135,40 @@ class TargetSpec:
     @property
     def kv_size(self) -> int:
         return self.attention.kv_heads * self.attention.head_dim
+
+
+@dataclass(frozen=True)
+class LoraSlice:
+    """One adapter-addressable slice of a parameter's output dimension.
+
+    Mirrors ``surogate.dsl.specs.LoRATarget``. Fused projections carry one slice
+    per logical projection — the training DSL declares ``mlp_up_weight`` as
+    ``[(up, 0, 3584), (gate, 3584, 3584)]`` — which is precisely what a serving
+    engine needs in order to apply an adapter trained on one logical projection
+    to the right row range of a fused serve tensor. Carried through the contract
+    now so that LoRA serving is later a wiring exercise rather than an
+    archaeological one.
+    """
+
+    name: str
+    offset: int
+    size: int
+
+
+@dataclass(frozen=True)
+class ParamSpec:
+    """One learnable parameter as the declaration sees it.
+
+    ``dsl_name`` is the canonical (post-remap) name the training runtime binds,
+    ``hf_name`` the checkpoint path it loads from — the join key every serving
+    consumer needs, since the converter reads the same checkpoint.
+    """
+
+    dsl_name: str
+    hf_name: str | None
+    shape: tuple[str, ...]
+    lora: tuple[LoraSlice, ...] = ()
+
+    @property
+    def is_lora_target(self) -> bool:
+        return bool(self.lora)
