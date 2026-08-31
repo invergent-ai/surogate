@@ -201,44 +201,64 @@ def expression_sources(expression: Expression) -> tuple[SourceTensor, ...]:
     raise TypeError(f"unknown recipe expression {type(expression)!r}")
 
 
-def build_vision_recipes(text_width: int) -> tuple[TensorRecipe, ...]:
-    """Build checkpoint-invariant Vision recipes for a target text width."""
+def build_vision_recipes(
+    text_width: int,
+    *,
+    layers: int = 27,
+    hidden: int = 1152,
+    intermediate: int = 4304,
+    qkv_rows: int = 3456,
+    patch_channels: int = 3,
+    patch_temporal: int = 2,
+    patch_size: int = 16,
+    position_embeddings: int = 2304,
+    merger_hidden: int = 4608,
+) -> tuple[TensorRecipe, ...]:
+    """Build Vision recipes for a target's own tower.
 
+    The defaults are the Qwen3.6 tower the 27B and 35B carry. They are defaults
+    only: every target ships a vision tower and the towers differ, so the geometry
+    must be a parameter here for the same reason it is in `build_vision_specs` —
+    and the two must agree, which `validate_recipe_coverage` enforces.
+    """
+
+    patch_rows = patch_channels * patch_temporal * patch_size * patch_size
     source_prefix = "model.visual."
     recipes: list[TensorRecipe] = [
         TensorRecipe(
             "vision/patch_embedding",
             Reshape(
-                source(source_prefix + "patch_embed.proj.weight", (1152, 3, 2, 16, 16)),
-                (1152, 1536),
+                source(source_prefix + "patch_embed.proj.weight",
+                       (hidden, patch_channels, patch_temporal, patch_size, patch_size)),
+                (hidden, patch_rows),
             ),
         ),
         TensorRecipe(
             "vision/patch_embedding_bias",
-            source(source_prefix + "patch_embed.proj.bias", (1152,)),
+            source(source_prefix + "patch_embed.proj.bias", (hidden,)),
         ),
         TensorRecipe(
             "vision/position_embedding",
-            source(source_prefix + "pos_embed.weight", (2304, 1152)),
+            source(source_prefix + "pos_embed.weight", (position_embeddings, hidden)),
         ),
     ]
 
-    for layer in VISION_LAYERS:
+    for layer in range(layers):
         source_layer = source_prefix + f"blocks.{layer}."
         object_layer = f"vision/layers/{layer}/"
         for object_suffix, source_suffix, shape in (
-            ("attention/qkv", "attn.qkv.weight", (3456, 1152)),
-            ("attention/qkv_bias", "attn.qkv.bias", (3456,)),
-            ("attention/output", "attn.proj.weight", (1152, 1152)),
-            ("attention/output_bias", "attn.proj.bias", (1152,)),
-            ("mlp/fc1", "mlp.linear_fc1.weight", (4304, 1152)),
-            ("mlp/fc1_bias", "mlp.linear_fc1.bias", (4304,)),
-            ("mlp/fc2", "mlp.linear_fc2.weight", (1152, 4304)),
-            ("mlp/fc2_bias", "mlp.linear_fc2.bias", (1152,)),
-            ("norm1/weight", "norm1.weight", (1152,)),
-            ("norm1/bias", "norm1.bias", (1152,)),
-            ("norm2/weight", "norm2.weight", (1152,)),
-            ("norm2/bias", "norm2.bias", (1152,)),
+            ("attention/qkv", "attn.qkv.weight", (qkv_rows, hidden)),
+            ("attention/qkv_bias", "attn.qkv.bias", (qkv_rows,)),
+            ("attention/output", "attn.proj.weight", (hidden, hidden)),
+            ("attention/output_bias", "attn.proj.bias", (hidden,)),
+            ("mlp/fc1", "mlp.linear_fc1.weight", (intermediate, hidden)),
+            ("mlp/fc1_bias", "mlp.linear_fc1.bias", (intermediate,)),
+            ("mlp/fc2", "mlp.linear_fc2.weight", (hidden, intermediate)),
+            ("mlp/fc2_bias", "mlp.linear_fc2.bias", (hidden,)),
+            ("norm1/weight", "norm1.weight", (hidden,)),
+            ("norm1/bias", "norm1.bias", (hidden,)),
+            ("norm2/weight", "norm2.weight", (hidden,)),
+            ("norm2/bias", "norm2.bias", (hidden,)),
         ):
             recipes.append(
                 TensorRecipe(
@@ -248,12 +268,12 @@ def build_vision_recipes(text_width: int) -> tuple[TensorRecipe, ...]:
             )
 
     for object_suffix, source_suffix, shape in (
-        ("fc1", "linear_fc1.weight", (4608, 4608)),
-        ("fc1_bias", "linear_fc1.bias", (4608,)),
-        ("fc2", "linear_fc2.weight", (text_width, 4608)),
+        ("fc1", "linear_fc1.weight", (merger_hidden, merger_hidden)),
+        ("fc1_bias", "linear_fc1.bias", (merger_hidden,)),
+        ("fc2", "linear_fc2.weight", (text_width, merger_hidden)),
         ("fc2_bias", "linear_fc2.bias", (text_width,)),
-        ("norm/weight", "norm.weight", (1152,)),
-        ("norm/bias", "norm.bias", (1152,)),
+        ("norm/weight", "norm.weight", (hidden,)),
+        ("norm/bias", "norm.bias", (hidden,)),
     ):
         recipes.append(
             TensorRecipe(

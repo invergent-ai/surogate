@@ -512,3 +512,23 @@ The emitter also gained a small rule that makes this maintainable: an object who
 declared geometry resolves to zero is not in the artifact. A text-only checkpoint
 carries no tower, and that now falls out of the geometry instead of requiring a
 second object list.
+
+## A converter has two halves, and the tests only checked one
+
+Adding the vision tower to three inventories broke conversion for all three, and
+the suite stayed green. A converter is an inventory (what objects the artifact
+holds) *and* a recipe (where each object comes from in the checkpoint); the
+inventory tests checked the first and said nothing about the second, so three
+`_build_vision_recipes()` still returning `()` sailed through. `recipe.py` has
+always validated its own coverage on import — nothing was importing it.
+
+The shared `build_vision_recipes` needed the same treatment as
+`build_vision_specs`: it hardcoded the Qwen3.6 tower, so it could not have
+sourced the Qwen3.5 towers even had it been called. Both now take the geometry,
+and `validate_recipe_coverage` is what forces them to agree.
+
+`test_conversion_recipe_covers_its_inventory` closes the hole for all five
+targets that carry a recipe, and was verified by re-stubbing one: coverage fails
+with *"recipe order or coverage does not match the tensor inventory"*. Full CPU
+suite: 374 passed, 1 skipped — the DPO end-to-end included, now that the fp8
+LM-head nondeterminism is fixed.

@@ -200,3 +200,31 @@ def test_fused_serve_objects_name_their_components(emitters, target, model_dir):
 
     fused = [obj for obj in derived if len(obj["components"]) > 1]
     assert fused, "no fused objects declared; the composition map would be untested"
+
+
+#: Converters that carry a conversion recipe alongside their inventory. The recipe
+#: says where each artifact object comes from in the checkpoint, and it must cover
+#: the inventory exactly — an inventory that grows without its recipe produces a
+#: converter that cannot build the artifact it promises.
+RECIPE_TARGETS = (
+    "qwen3_5_0_8b",
+    "qwen3_5_2b",
+    "qwen3_5_4b",
+    "qwen3_6_27b",
+    "qwen3_6_35b_a3b",
+)
+
+
+@pytest.mark.parametrize("target", RECIPE_TARGETS)
+def test_conversion_recipe_covers_its_inventory(target):
+    """Importing a recipe runs its own coverage validation.
+
+    This test exists because the inventory checks above did not: vision objects
+    were added to three inventories whose recipes still returned `()`, and the
+    inventory tests passed while conversion was broken. The two halves of a
+    converter have to be checked together.
+    """
+
+    import importlib
+
+    importlib.import_module(f"surogate.serve.tools.convert.{target}.recipe")
