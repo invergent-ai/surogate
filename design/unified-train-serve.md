@@ -692,3 +692,31 @@ What is left is one layer further in: `qwen3_6::ModelView` holds
 27 long where this tower is 24, so materialising the target's tower needs the
 model view templated on the config the same way the plans and binders now are.
 After that, the forward runs it and the gate opens.
+
+## Running the tower, and what only running it could reveal
+
+With `qwen3_6::ModelView` gaining a defaulted `VisionCfg` parameter — so every
+existing instantiation is untouched and the 2B passes its own — the target
+materialises its own tower, and the family runtime already compiles the vision
+forward per variant (`variant.cpp` defines `NINFER_QWEN36_RUNTIME_NS` and pulls in
+`instantiate.h`, and `VisionScheduleConfig` reads whichever `VisionConfig` that
+namespace resolves). So the forward needed no work: removing the gate was enough
+for the engine to start with `--vision` and serve.
+
+Serving *text* with `--vision` proves nothing about the tower, though, and the
+first real image found two things no amount of reading would have:
+
+1. The engine had been built without FFmpeg, so image input was refused outright
+   ("media decoding is unavailable"). Installing the libav dev packages and
+   rebuilding fixed it — the "not found" line in the configure log is the tell.
+2. With decoding working, the tower ran and failed inside a kernel:
+   `q6 linear: unsupported shape or T`. `ops/linear/q6/q6_dispatch.cpp` whitelists
+   shapes, and for the patch projection (`k = 1536`) it knew only `n = 1152` — the
+   Qwen3.6 tower's width. The 2B's is 1024.
+
+The launchers take their shapes from the tensors, so the table is a tuning
+whitelist rather than a capability limit; the 1024 branch reuses the same
+launchers with 1152's schedule, which is honest about being mirrored rather than
+measured. That the vision path had exactly one width baked into a kernel dispatch
+is the same defect as `VisionBackboneConfig`, one layer down, and it took an
+actual image to surface it.
