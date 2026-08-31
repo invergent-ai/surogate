@@ -202,12 +202,9 @@ add_executable(sinfer_cpu_embed_cli encoder/cpu_embed_cli.cpp)
 target_include_directories(sinfer_cpu_embed_cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${SERVE_ROOT})
 target_link_libraries(sinfer_cpu_embed_cli PRIVATE sinfer_encoder)
 
-# The /v1/embeddings server. Same reason for living here: it needs an artifact,
-# so it is not a ctest, but it must not be allowed to stop compiling.
-add_executable(sinfer_embedding_server ${SERVE_ROOT}/encoder/embedding_server.cpp)
-target_include_directories(sinfer_embedding_server PRIVATE
-  ${SERVE_ROOT} ${SINFER_JSON_INCLUDE} ${SUROGATE_VENDOR_DIR}/cpp-httplib)
-target_link_libraries(sinfer_embedding_server PRIVATE sinfer_encoder)
+# The /v1/embeddings server moved to the product build as `surogate-embed`
+# (csrc/CMakeLists.txt): `surogate serve --embed` execs it, so it is not a test
+# fixture. Building it here too would compile the same source twice.
 
 # Shared Op numerical tests. Target-composed schedule tests are registered separately below.
 set(sinfer_op_tests

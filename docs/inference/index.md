@@ -1,13 +1,16 @@
 # Inference
 
-Surogate ships a serving engine beside the trainer. `surogate-engine` is a standalone
-C++/CUDA runtime that loads a converted model artifact and answers OpenAI- and
-Anthropic-compatible HTTP requests.
+Surogate serves models with the same CLI that trains them: `surogate serve` starts a
+standalone C++/CUDA runtime that answers OpenAI- and Anthropic-compatible HTTP requests.
+
+```bash
+surogate serve Qwen/Qwen3.6-27B --port 8080
+```
 
 It is deliberately **not** the training executor. A training step wants a full graph with
 activations retained for backward; a decode round wants one token per sequence at minimum
-latency, forever. The serving runtime lives in its own tree (`csrc/src/serve/`) and decode
-never routes through the training graph executor.
+latency, forever. Serving is its own runtime, and decode never routes through the training
+graph executor.
 
 ## What the engine does
 
@@ -20,32 +23,32 @@ never routes through the training graph executor.
 - **MoE larger than VRAM** — a pinned host expert bank, a device LRU slot cache, and optional
   CPU expert compute that takes a measured share of the routed work (`--expert-slots`,
   `--cpu-moe-share`).
-- **Vision input** (images, video) when the artifact carries a vision tower (`--vision`).
+- **Vision input** (images, video) for models that carry a vision tower (`--vision`).
 
 Embedding models take a separate, much smaller path: an encoder runs **one forward** — no KV
-cache, no sampler, no CUDA graphs, no round N+1 — so it is served by its own binary, on either
-GPU or CPU. See [Serving models](serving-models.md#embedding-model-cpu-and-gpu).
+cache, no sampler, no CUDA graphs, no round N+1 — so `surogate serve --embed` runs it in its own
+process, on either GPU or CPU. See [Serving models](serving-models.md#embedding-model-cpu-and-gpu).
 
-## The artifact: convert once, serve many
+## Conversion is transparent
 
-The engine serves `.sinfer` artifacts and nothing else. Conversion is a separate, offline step:
-a converter reads an HF safetensors checkpoint, a GGUF file, or an NVFP4 checkpoint, normalizes
-every tensor into an engine-owned layout, and writes one self-contained file.
+Point `surogate serve` at a **Hugging Face repo id, a local safetensors directory, or a GGUF
+file**. The first load converts the model into engine-owned layouts and caches the result under
+`~/.cache/surogate/serve`; every later start reuses it and begins in seconds.
 
 ```
-HF safetensors ─┐
-GGUF           ─┼─► python -m surogate.serve.tools.convert.<family> ─► model.sinfer ─► surogate-engine
-NVFP4          ─┘
+HF repo id     ─┐
+safetensors dir ┼─► surogate serve ─► (convert once, cached) ─► OpenAI/Anthropic endpoint
+GGUF file      ─┘
 ```
 
-Nothing is quantized or re-laid-out at startup, so load time is a file read. The artifact also
-carries its own *frontend* — tokenizer, chat template, generation config — so a serving host
-needs no Python and no `transformers`.
+The cached form is an internal, regenerable detail — not an interchange format. Nothing is
+quantized or re-laid-out at startup, so load time is a file read, and the cache carries the
+model's own tokenizer and chat template, so a serving host needs no Python and no
+`transformers`.
 
 ## Supported quantizations
 
-Artifact tensor formats are a closed registry
-(`surogate/serve/tools/artifact/numeric.py`). Every object in an artifact is stored in one of:
+Weight storage is a closed registry — every tensor the engine loads is in one of these:
 
 | Format | Weight | Group | Scale | Typical use |
 |---|---|---|---|---|
@@ -80,16 +83,18 @@ BF16. `int8` exists for experiments and is not recommended — it costs measurab
 
 ## Model families
 
-Each family has a converter module under `surogate/serve/tools/convert/`:
+Recognised automatically from the checkpoint:
 
-| Family | Module | Notes |
+| Family | Sizes | Notes |
 |---|---|---|
-| Qwen3.5 0.8B / 2B / 4B | `qwen3_5_0_8b`, `qwen3_5_2b`, `qwen3_5_4b` | dense; 4B also has `convert_nvfp4` |
-| Qwen3.6 27B | `qwen3_6_27b` | dense; `convert_nvfp4` for the FP4 build |
-| Qwen3.6 35B-A3B | `qwen3_6_35b_a3b` | MoE, routed experts; optional DFlash draft head |
-| Qwen3.8 27B | `qwen3_8_27b` | `convert_nvfp4`, `convert_nvfp4_all` |
-| Qwen3.8 Flash-Next | `qwen4exp` | GGUF-native MoE; CPU offload tier |
-| EmbeddingGemma 300M | `gemma_embedding` | encoder; GPU and CPU |
+| Qwen3.5 | 0.8B, 2B, 4B | dense; NVFP4 for the 4B |
+| Qwen3.6 | 27B | dense; BF16 and NVFP4 |
+| Qwen3.6 MoE | 35B-A3B | routed experts; optional draft head |
+| Qwen3.8 | 27B | BF16 and NVFP4 |
+| Qwen3.8 Flash-Next | MoE | GGUF source; the CPU-offload tier |
+| EmbeddingGemma | 300M | encoder; GPU and CPU |
+
+An unrecognised model is refused at load with the reason printed, never served incorrectly.
 
 ## Hardware
 

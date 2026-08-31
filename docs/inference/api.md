@@ -1,6 +1,6 @@
 # OpenAI-compatible API
 
-`surogate-engine` speaks the OpenAI wire format natively — point any OpenAI client at it by
+`surogate serve` speaks the OpenAI wire format natively — point any OpenAI client at it by
 overriding the base URL. The same process also serves the Anthropic Messages API, so both
 client ecosystems work against one endpoint without a proxy.
 
@@ -34,7 +34,7 @@ reports, which is how you keep a client's hard-coded model string working.
 | `POST` | `/v1/messages` | **Anthropic** Messages API |
 | `POST` | `/v1/messages/count_tokens` | **Anthropic** token counting |
 | `GET` | `/health` | Readiness probe |
-| `POST` | `/v1/embeddings` | Embeddings — served by the **encoder** binary, not `surogate-engine` |
+| `POST` | `/v1/embeddings` | Embeddings — served by `surogate serve --embed`, a separate process |
 
 ## Chat Completions
 
@@ -120,8 +120,8 @@ Anthropic SDK at the server's base URL.
 
 ## Embeddings
 
-`POST /v1/embeddings` is served by the **encoder binary** (`sinfer_embedding_server`), not by
-`surogate-engine` — an embedding model has no KV cache, sampler or decode loop, so it gets its
+`POST /v1/embeddings` is served by `surogate serve --embed`, a separate process from the
+generative server — an embedding model has no KV cache, sampler or decode loop, so it gets its
 own small server. All four OpenAI `input` forms are accepted: one string, an array of strings,
 one array of token ids, or an array of those.
 

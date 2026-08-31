@@ -12,8 +12,11 @@
 // another engine, where they keep the measurement on the model rather than on
 // two different tokenizers.
 //
-//   sinfer_embedding_server --artifact model.sinfer [--port 8413] [--device 0]
-//   sinfer_embedding_server --artifact model.sinfer --device cpu
+//   surogate-embed <model> [--host H] [--port 8413] [--device 0|cpu]
+//
+// The model is positional, as it is for the generative engine. Users reach this
+// through `surogate serve --embed <model>`, which resolves the model spec and
+// execs this binary.
 //
 // CPU serving wants OMP_WAIT_POLICY=ACTIVE in the environment. Everything —
 // oneDNN and the encoder's own kernels — runs on one OpenMP team, so the spin
@@ -30,6 +33,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstring>
 #include <exception>
 #include <functional>
 #include <mutex>
@@ -88,8 +92,11 @@ int main(int argc, char** argv) {
                 if (++i >= argc) { throw std::invalid_argument(std::string("missing ") + what); }
                 return argv[i];
             };
-            if (arg == "--artifact") {
-                artifact = next("--artifact");
+            if (!arg.empty() && arg.front() != '-') {
+                if (!artifact.empty()) {
+                    throw std::invalid_argument("unexpected extra argument: " + arg);
+                }
+                artifact = arg;
             } else if (arg == "--host") {
                 host = next("--host");
             } else if (arg == "--port") {
@@ -100,7 +107,7 @@ int main(int argc, char** argv) {
                 throw std::invalid_argument("unknown argument: " + arg);
             }
         }
-        if (artifact.empty()) { throw std::invalid_argument("--artifact is required"); }
+        if (artifact.empty()) { throw std::invalid_argument("a model is required"); }
 
         // One of the two encoders, behind the same three calls the handler uses.
         std::unique_ptr<sinfer::DeviceContext> gpu_device;
@@ -254,7 +261,9 @@ int main(int argc, char** argv) {
         }
         return 0;
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "sinfer_embedding_server: %s\n", error.what());
+        const char* program = argc > 0 ? argv[0] : "surogate-embed";
+        if (const char* slash = std::strrchr(program, '/')) { program = slash + 1; }
+        std::fprintf(stderr, "%s: %s\n", program, error.what());
         return 1;
     }
 }

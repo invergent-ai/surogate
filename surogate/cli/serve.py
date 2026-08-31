@@ -16,6 +16,7 @@ from pathlib import Path
 _USAGE = """\
 usage: surogate serve <model> [engine options...]
        surogate serve --generate <model> --prompt "..." [options...]
+       surogate serve --embed <model> [--frontend DIR] [options...]
 
 <model> is a Hugging Face repo id, a local safetensors model directory, or a
 GGUF file. First use converts transparently into a local cache; after that,
@@ -25,22 +26,27 @@ loads are instant.
   surogate serve ~/models/qwen3.6-27b-hf/
   surogate serve ~/models/qwen3.6-27b-Q4_K_M.gguf
 
-Serves OpenAI-/Anthropic-compatible HTTP (default), or runs a one-shot
-generation with --generate (streams the answer to stdout).
+Serves OpenAI-/Anthropic-compatible HTTP (default), runs a one-shot generation
+with --generate (streams the answer to stdout), or serves /v1/embeddings for an
+encoder model with --embed.
 
-Common engine options (full list: surogate serve --engine-help):
-  --host 0.0.0.0 --port 8080     bind address (server mode)
-  --max-context N                per-sequence context ceiling
+Common server options (full list: surogate serve --engine-help):
+  --host 0.0.0.0 --port 8080     bind address
+  --max-model-len N              per-sequence context ceiling
   --kv-capacity N|auto           KV pool size ('auto' = free VRAM minus 1 GiB)
-  --max-concurrency N            concurrent requests (server mode, 1-8)
+  --max-num-seqs N               concurrent lanes (default 1)
+  --kv-cache-dtype fp8|bf16      KV cache precision (default fp8)
   --spec mtp --draft-tokens 3    speculative decoding
-  --kv-dtype bf16|int8           KV cache precision
 
-The engine binary is resolved from, in order:
-  1. $SUROGATE_SERVE_BIN / $SUROGATE_ENGINE_CLI_BIN (explicit paths)
-  2. the repo build tree (csrc/build-serve/) when running from a checkout
-  3. $PATH (surogate-engine / surogate-engine-cli)
-Build it from a checkout with: make serve-build
+--generate runs one shot and has its own spellings for a few options
+(--max-context, --kv-dtype, --max-new): surogate serve --generate --engine-help.
+
+--embed serves an encoder model: --device N|cpu chooses the backend, and
+--frontend DIR supplies the tokenizer when converting a .gguf. CPU serving wants
+OMP_WAIT_POLICY=ACTIVE and OMP_NUM_THREADS set to the physical cores of one NUMA
+node.
+
+From a source checkout, build the engine first with: make serve-build
 """
 
 
@@ -50,9 +56,17 @@ def _repo_root() -> Path | None:
     return root if (root / "csrc" / "src" / "serve").is_dir() else None
 
 
-def _resolve_binary(server_mode: bool) -> str | None:
-    name = "surogate-engine" if server_mode else "surogate-engine-cli"
-    env = os.environ.get("SUROGATE_SERVE_BIN" if server_mode else "SUROGATE_ENGINE_CLI_BIN")
+_MODES = {
+    # mode -> (binary name, env override)
+    "server": ("surogate-engine", "SUROGATE_SERVE_BIN"),
+    "generate": ("surogate-engine-cli", "SUROGATE_ENGINE_CLI_BIN"),
+    "embed": ("surogate-embed", "SUROGATE_EMBED_BIN"),
+}
+
+
+def _resolve_binary(mode: str) -> str | None:
+    name, env_var = _MODES[mode]
+    env = os.environ.get(env_var)
     if env and Path(env).is_file():
         return env
     root = _repo_root()
@@ -74,22 +88,28 @@ def maybe_exec_serve() -> None:
         sys.stderr.write(_USAGE)
         sys.exit(0 if rest else 1)
 
-    # --generate switches to the one-shot CLI binary; --engine-help passes
-    # --help through to the engine so its full option surface stays canonical.
-    server_mode = True
+    # --generate switches to the one-shot CLI binary, --embed to the encoder
+    # server; --engine-help passes --help through so the binary's own option
+    # surface stays canonical.
+    mode = "server"
     if "--generate" in rest:
         rest = [a for a in rest if a != "--generate"]
-        server_mode = False
+        mode = "generate"
+    if "--embed" in rest:
+        if mode == "generate":
+            sys.stderr.write("surogate serve: --embed and --generate are different modes.\n")
+            sys.exit(2)
+        rest = [a for a in rest if a != "--embed"]
+        mode = "embed"
     if "--engine-help" in rest:
         rest = ["--help" if a == "--engine-help" else a for a in rest]
 
-    binary = _resolve_binary(server_mode)
+    binary = _resolve_binary(mode)
     if binary is None:
-        name = "surogate-engine" if server_mode else "surogate-engine-cli"
+        name = _MODES[mode][0]
         sys.stderr.write(
-            f"surogate serve: engine binary '{name}' not found.\n"
+            f"surogate serve: the serving engine is not built ({name} not found).\n"
             "Build it first:  make serve-build   (from the surogate repo root)\n"
-            "or point SUROGATE_SERVE_BIN at an existing binary.\n"
         )
         sys.exit(127)
 
@@ -105,7 +125,28 @@ def maybe_exec_serve() -> None:
                                  "--raw-output", "--print-token-ids"))),
         None,
     )
-    if model_index is not None:
+    if mode == "embed":
+        # The encoder server takes its model positionally, like the generative
+        # engine does; --frontend is a conversion input, consumed here.
+        frontend = None
+        if "--frontend" in rest:
+            i = rest.index("--frontend")
+            if i + 1 >= len(rest):
+                sys.stderr.write("surogate serve: --frontend needs a directory\n")
+                sys.exit(2)
+            frontend = rest[i + 1]
+            del rest[i:i + 2]
+            if model_index is not None and model_index > i:
+                model_index -= 2
+        if model_index is None:
+            sys.stderr.write("surogate serve --embed: a model is required\n")
+            sys.exit(2)
+        from surogate.serve.ingest import ensure_encoder_weights
+
+        resolved = ensure_encoder_weights(rest[model_index], frontend=frontend,
+                                          echo=lambda m: print(m, file=sys.stderr))
+        rest = [*rest[:model_index], str(resolved), *rest[model_index + 1:]]
+    elif model_index is not None:
         from surogate.serve.ingest import ensure_engine_weights
 
         resolved = ensure_engine_weights(rest[model_index],

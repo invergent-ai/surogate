@@ -58,7 +58,7 @@ serve-configure:
 
 serve-build: serve-configure
 	cmake --build $(SERVE_BUILD_DIR) --parallel $(PARALLEL_JOBS) \
-		--target surogate-engine-cli surogate-engine _surogate_serve
+		--target surogate-engine-cli surogate-engine surogate-embed _surogate_serve
 	cp -f $(SERVE_BUILD_DIR)/_surogate_serve*.so surogate/ 2>/dev/null || true
 	cp -f $(SERVE_BUILD_DIR)/_surogate_serve*.so .venv/lib/python3.12/site-packages/surogate/ 2>/dev/null || true
 

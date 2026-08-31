@@ -1260,6 +1260,14 @@ if(SINFER_ONEDNN_DIR)
   message(STATUS "CPU encoder: oneDNN at ${SINFER_ONEDNN_DIR}")
 endif()
 
+# The encoder server is a product binary, not a test fixture: `surogate serve
+# --embed` execs it, so it has to exist after `make serve-build` like the engine
+# does. Same source as the old serve_tests target, which is now gone.
+add_executable(surogate-embed EXCLUDE_FROM_ALL ${SERVE_ROOT}/encoder/embedding_server.cpp)
+target_include_directories(surogate-embed PRIVATE
+  ${SERVE_ROOT} ${SINFER_JSON_INCLUDE} ${SUROGATE_VENDOR_DIR}/cpp-httplib)
+target_link_libraries(surogate-embed PRIVATE sinfer_encoder)
+
 sinfer_internal_includes(sinfer_ops)
 # surogate vendor patch (PATCHES.md #25): cutlass headers for the sm_120a
 # blockscaled NVFP4 GEMM TU. Points at the flashinfer-shipped cutlass by
