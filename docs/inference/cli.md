@@ -84,7 +84,22 @@ For models whose experts exceed VRAM.
 
 ### Speculative decoding
 
-`--spec mtp|dflash`, `--draft-tokens N`, `--lm-head-draft`.
+Draft tokens are proposed cheaply and verified by the full model, so output is
+identical to non-speculative decoding — it just arrives faster. Measured 2.2–2.5×
+on decode at a draft window of 3.
+
+| Flag | Meaning |
+|---|---|
+| `--spec mtp` | Multi-token prediction, using the model's own MTP block. Draft window 1–5. |
+| `--spec dflash` | A separate trained drafter. Draft window 1–15; needs a bf16 KV cache, and is not combinable with `--vision`. |
+| `--draft-tokens N` | Tokens proposed per round |
+| `--lm-head-draft` | Propose through the reduced draft head instead of the full output head |
+
+Availability depends on what the model carries. `mtp` needs the checkpoint's MTP
+(`nextn`) block — most first-party checkpoints have it, and community exports
+frequently strip it. `dflash` needs a drafter checkpoint that is converted in
+alongside the model. Either way a model without one refuses at startup, naming
+what is missing, rather than silently serving unaccelerated.
 
 ### Sampling defaults
 

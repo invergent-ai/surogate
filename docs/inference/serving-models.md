@@ -46,8 +46,9 @@ Notes:
   compete for the same memory, so `--kv-capacity auto` is the easy pairing.
 - The KV cache is fp8 regardless of weight format. `--kv-cache-dtype bf16` for a full-precision
   cache.
-- Speculative decoding helps most at low concurrency: `--spec dflash --draft-tokens 3` when the
-  model carries a draft head.
+- Speculative decoding is worth turning on at low concurrency: `--spec mtp --draft-tokens 3`
+  measured 2.2–2.5× on decode, with byte-identical output. It needs the checkpoint's MTP block,
+  and says so at startup if the model lacks one.
 
 ## GGUF model
 
