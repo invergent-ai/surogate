@@ -19,28 +19,78 @@
 namespace {
 
 // Single-block exclusive scan over targets[BT] producing valid_idx[n_valid] +
-// n_valid (host int returned via cudaMemcpy after the kernel).
-// Assumes BT <= 65536; for the typical packed-sequence shapes (BT <= 32k) one
-// block of 1024 threads handles it iteratively.
+// n_valid (host int returned via cudaMemcpy after the kernel). Assumes
+// BT <= 65536; for the typical packed-sequence shapes (BT <= 32k) one block of
+// 1024 threads handles it iteratively.
+//
+// The compaction is ORDER-PRESERVING: valid_idx is ascending in the original row
+// index.
+//
+// The order is NOT an implementation detail. `dispatch_fused_lm_head_loss_compact`
+// slices the compacted rows into `lmhead_chunks` fixed-size chunks, and under
+// recipe fp8-hybrid `lm_head_logits_matmul` quantizes EACH chunk's activation with
+// a per-chunk abs_max. Chunk membership therefore selects the FP8 scale a row is
+// quantized with, so an atomicAdd-ordered (i.e. warp-scheduling dependent) index
+// list makes the same batch produce different log-probs from one forward to the
+// next. That silently breaks reproducibility of every fp8 run with row compaction,
+// and it breaks DPO outright: the frozen-reference forward and the policy forward
+// run over the same batch in the same step, so at LoRA init they must agree
+// bit-exactly for the step-0 identity (margin == 0, loss == log 2) to hold.
+//
+// A block-wide ballot prefix sum costs a few shared-memory ops per 1024-row tile
+// (the kernel is single-block and latency-bound either way) and makes the row
+// order — and hence the chunk boundaries and their FP8 scales — deterministic.
 __global__ void compact_valid_indices_kernel(const int* __restrict__ targets,
                                              int* __restrict__ valid_idx,
                                              int* __restrict__ n_valid_out,
                                              int BT) {
-    int tid = static_cast<int>(threadIdx.x);
-    int counter = 0;
+    const int tid = static_cast<int>(threadIdx.x);
+    const int nthreads = static_cast<int>(blockDim.x);
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int nwarps = (nthreads + 31) / 32;
+
+    __shared__ int warp_counts[32];  // blockDim.x <= 1024 => at most 32 warps
+    __shared__ int emitted;
     if (tid == 0) {
-        n_valid_out[0] = 0;
+        emitted = 0;
     }
     __syncthreads();
 
-    // Block-wide atomic compaction. Order of valid rows is non-deterministic
-    // but irrelevant because each row's loss/grad is row-local.
-    for (int i = tid; i < BT; i += blockDim.x) {
-        if (targets[i] != -100) {
-            int slot = atomicAdd(n_valid_out, 1);
-            valid_idx[slot] = i;
-            ++counter;
+    for (int tile = 0; tile < BT; tile += nthreads) {
+        const int i = tile + tid;
+        const bool valid = (i < BT) && (targets[i] != -100);
+
+        // Every thread of the block runs the same number of tile iterations, so the
+        // warp is fully converged here and the full-mask ballot is well defined.
+        const unsigned ballot = __ballot_sync(0xFFFFFFFFu, valid);
+        if (lane == 0) {
+            warp_counts[warp] = __popc(ballot);
         }
+        __syncthreads();
+
+        int warp_base = 0;
+        for (int w = 0; w < warp; ++w) {
+            warp_base += warp_counts[w];
+        }
+        if (valid) {
+            const int lane_prefix = __popc(ballot & ((1u << lane) - 1u));
+            valid_idx[emitted + warp_base + lane_prefix] = i;
+        }
+
+        int tile_total = 0;
+        for (int w = 0; w < nwarps; ++w) {
+            tile_total += warp_counts[w];
+        }
+        __syncthreads();  // all warp_counts / emitted reads done before the update
+        if (tid == 0) {
+            emitted += tile_total;
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        n_valid_out[0] = emitted;
     }
 }
 
