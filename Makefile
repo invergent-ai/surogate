@@ -14,8 +14,17 @@ CUDA_HOME ?= $(or $(CUDA_PATH),$(shell dirname $$(dirname $$(which nvcc 2>/dev/n
 CUDA_HOME := $(realpath $(CUDA_HOME))
 CUDA_CMAKE_FLAGS := -DCMAKE_CUDA_COMPILER=$(CUDA_HOME)/bin/nvcc -DCUDAToolkit_ROOT=$(CUDA_HOME)
 ifdef CCACHE
-CCACHE_FLAGS := -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
+CCACHE_FLAGS := -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+ -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
 export CCACHE_CUDA_PATHS := $(CUDA_HOME)
+endif
+
+# Link _surogate against the venv's pip NCCL (2.29.x, what torch expects) instead of the
+# system libnccl (2.28.x): loading the system copy first breaks torch's libtorch_cuda
+# (undefined ncclCommResume). The RPATH already points at $ORIGIN/../nvidia/nccl/lib.
+PIP_NCCL := $(abspath .venv/lib/python3.12/site-packages/nvidia/nccl)
+ifneq ($(wildcard $(PIP_NCCL)/lib/libnccl.so.2),)
+NCCL_CMAKE_FLAGS := -DNCCL_INCLUDE_DIR=$(PIP_NCCL)/include -DNCCL_LIB_DIR=$(PIP_NCCL)/lib
 endif
 
 .PHONY: all build export-checkpoint wheel wheel-cu128 wheel-cu129 wheel-cu130 configure clean clean-all build-tests test test-unit test-integration test-all regression-smoke regression-update-baseline regression-gpu help info format format-check format-cpp format-py lint-py
@@ -25,7 +34,7 @@ all: build
 
 # Configure the build
 configure:
-	cmake -S csrc -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) $(CUDA_CMAKE_FLAGS) $(CCACHE_FLAGS)
+	cmake -S csrc -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) $(CUDA_CMAKE_FLAGS) $(CCACHE_FLAGS) $(NCCL_CMAKE_FLAGS)
 
 # Build all targets
 build: configure
@@ -69,7 +78,7 @@ define build_wheel
 	cp pyproject.toml pyproject.toml.bak && \
 	trap 'mv -f pyproject.toml.bak pyproject.toml' EXIT INT TERM; \
 	uv run --no-project --with tomlkit python3 .github/scripts/set_cuda_version_tag.py $(1) && \
-	CMAKE_ARGS="$(CUDA_CMAKE_FLAGS) $(CCACHE_FLAGS)" CMAKE_BUILD_PARALLEL_LEVEL=$(PARALLEL_JOBS) uv build --wheel --out-dir dist && \
+	CMAKE_ARGS="$(CUDA_CMAKE_FLAGS) $(CCACHE_FLAGS) $(NCCL_CMAKE_FLAGS)" CMAKE_BUILD_PARALLEL_LEVEL=$(PARALLEL_JOBS) uv build --wheel --out-dir dist && \
 	uv run --no-project --with auditwheel --with patchelf auditwheel repair dist/*.whl \
 		-w dist/repaired/ \
 		--exclude libcuda.so.1 \
@@ -157,7 +166,7 @@ format-check:
 
 # Build test executables without running them
 build-tests:
-	cmake -S csrc -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) -DBUILD_TESTS=ON $(CUDA_CMAKE_FLAGS) $(CCACHE_FLAGS)
+	cmake -S csrc -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) -DBUILD_TESTS=ON $(CUDA_CMAKE_FLAGS) $(CCACHE_FLAGS) $(NCCL_CMAKE_FLAGS)
 	cmake --build $(BUILD_DIR) --parallel $(PARALLEL_JOBS) --target unit-tests integration-tests
 
 # Build and run unit tests (kernels, modules, components)
