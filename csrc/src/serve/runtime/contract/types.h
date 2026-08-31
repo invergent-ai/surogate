@@ -24,6 +24,8 @@ struct ResolvedExecutionOptions {
     ResolvedSamplingParameters sampling;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
+    /// Bank slot of the LoRA adapter this request selected, -1 for the base model.
+    std::int32_t lora_slot = -1;
 };
 
 struct ResolvedRequestOptions {

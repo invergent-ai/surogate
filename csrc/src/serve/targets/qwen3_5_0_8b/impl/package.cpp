@@ -135,6 +135,24 @@ namespace {
 void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& options) {
     if (options.lora_payloads.empty()) { return; }
     ops::LoraStore& store = ops::lora_store_for_current_device();
+    if (store.empty()) {
+        // The widest round an adapter can see: one column per lane, times the
+        // verify window when a draft is in flight.
+        const std::uint32_t window = options.speculative.backend == SpeculativeBackend::None
+                                         ? 1U
+                                         : options.speculative.draft_tokens + 1U;
+        // The widest round an adapter can see is a prefill chunk, not a decode
+        // batch: sizing this for lanes alone left every prompt without a scratch,
+        // so the prompt was built on the base model while the generated tokens
+        // carried the delta -- an adapter that looked weak rather than unapplied.
+        const std::uint32_t decode_columns =
+            std::max<std::uint32_t>(options.max_concurrency, 1) * window;
+        const std::uint32_t widest =
+            std::max<std::uint32_t>(decode_columns, std::max<std::uint32_t>(options.prefill_chunk, 1));
+        store.configure(static_cast<std::int32_t>(std::max<std::uint32_t>(options.lora_slots, 1)),
+                        static_cast<std::int32_t>(std::max<std::uint32_t>(options.lora_max_rank, 1)),
+                        static_cast<std::int32_t>(widest));
+    }
 
     // Text layer index -> the full-attention layer holding it, since only every
     // fourth layer is full attention in this family.
@@ -171,26 +189,10 @@ void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& opt
                 "' is not applied by this target (it applies q_proj and o_proj); an adapter "
                 "that is only partly applied would be neither the base model nor the fine-tune");
         }
-        store.add(base->qdata, payload.a, payload.b, payload.rank, payload.in_dim,
-                  payload.out_dim, payload.scale);
-        // Every width a captured decode graph can present, prewarmed here.
-        //
-        // The delta's two cuBLASLt GEMMs cache a plan per problem shape, and a plan
-        // built *during* capture corrupts the graph -- measurably: a B=0 adapter,
-        // whose delta is exactly zero, then changed the output and changed it
-        // differently on each run. Preparing only T=1 was why LoRA had to run eager.
-        // A captured decode round carries one column per lane, times the verify
-        // window when a draft is in flight, so the widths are small and few.
-        const std::uint32_t lanes = std::max<std::uint32_t>(options.max_concurrency, 1);
-        const std::uint32_t window =
-            options.speculative.backend == SpeculativeBackend::None
-                ? 1U
-                : options.speculative.draft_tokens + 1U;
-        for (std::uint32_t tokens = 1; tokens <= lanes * window; ++tokens) {
-            ops::lora_prepare(payload.out_dim, payload.in_dim, payload.rank,
-                              static_cast<std::int32_t>(tokens));
-        }
+        store.set_slot(base->qdata, payload.slot, payload.a, payload.b, payload.rank,
+                       payload.in_dim, payload.out_dim, payload.scale);
     }
+    ops::lora_set_active(true);
 }
 
 } // namespace

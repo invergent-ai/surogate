@@ -7,6 +7,8 @@
 
 #include <stdexcept>
 
+#include "api/ops/lora_store.h"
+
 namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS::schedule {
 namespace {
 
@@ -34,12 +36,26 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
         Tensor rope_positions  = ordinary.rope_positions.slice(0, 0, batch_size);
         Tensor kv_rows         = ordinary.text_kv_table_rows.slice(0, 0, batch_size);
         Tensor lanes           = ordinary.lanes.slice(0, 0, batch_size);
+        // Publish the round's adapter selection for the projection hooks. The slot
+        // vector is frame-resident and the scratch store-resident, so a captured
+        // graph records their addresses once and replays against what this round
+        // staged. Cleared after the card runs, so a later round without adapters
+        // cannot inherit these ids.
+        Tensor lora_slots     = ordinary.lora_slots.slice(0, 0, batch_size);
+        const bool lora_round = ops::lora_active();
+        if (lora_round) {
+            ops::LoraRound round;
+            round.slots   = &lora_slots;
+            round.scratch = ops::lora_store_for_current_device().scratch(batch_size);
+            ops::lora_set_round(round);
+        }
         Tensor hidden          = ordinary.hidden.slice(1, 0, batch_size);
         Tensor logits          = ordinary.logits.slice(1, 0, batch_size);
         Tensor sampled         = ordinary.sampled_tokens.slice(0, 0, batch_size);
 
         card.ordinary_decode_batch(tokens, cache_positions, rope_positions, kv_rows, lanes,
                                    envelope, hidden, logits);
+        if (lora_round) { ops::lora_clear_round(); }
         if (!card.stage_finishes()) { return; } // a pipeline stage without the head: nothing to sample
         ops::scatter(hidden, lanes, state.continuation_hidden_store, state.execution.device.stream);
         ops::sample(logits, sampled, TextConfig::token_domain, ordinary.sampling, cache_positions,
@@ -76,12 +92,26 @@ auto ordinary_batch_body_chained(OrdinaryBatchContext& state, std::int32_t batch
         Tensor rope_positions  = ordinary.rope_positions.slice(0, 0, batch_size);
         Tensor kv_rows         = ordinary.text_kv_table_rows.slice(0, 0, batch_size);
         Tensor lanes           = ordinary.lanes.slice(0, 0, batch_size);
+        // Publish the round's adapter selection for the projection hooks. The slot
+        // vector is frame-resident and the scratch store-resident, so a captured
+        // graph records their addresses once and replays against what this round
+        // staged. Cleared after the card runs, so a later round without adapters
+        // cannot inherit these ids.
+        Tensor lora_slots     = ordinary.lora_slots.slice(0, 0, batch_size);
+        const bool lora_round = ops::lora_active();
+        if (lora_round) {
+            ops::LoraRound round;
+            round.slots   = &lora_slots;
+            round.scratch = ops::lora_store_for_current_device().scratch(batch_size);
+            ops::lora_set_round(round);
+        }
         Tensor hidden          = ordinary.hidden.slice(1, 0, batch_size);
         Tensor logits          = ordinary.logits.slice(1, 0, batch_size);
         Tensor sampled         = ordinary.sampled_tokens.slice(0, 0, batch_size);
 
         card.ordinary_decode_batch(tokens, cache_positions, rope_positions, kv_rows, lanes,
                                    envelope, hidden, logits);
+        if (lora_round) { ops::lora_clear_round(); }
         if (!card.stage_finishes()) { return; } // a pipeline stage without the head: nothing to sample
         ops::scatter(hidden, lanes, state.continuation_hidden_store, state.execution.device.stream);
         ops::sample(logits, sampled, TextConfig::token_domain, ordinary.sampling, cache_positions,

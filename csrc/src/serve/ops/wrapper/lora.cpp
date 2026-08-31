@@ -81,20 +81,25 @@ std::size_t lora_batched_workspace_elements(std::int32_t rank, std::int32_t toke
     return static_cast<std::size_t>(rank) * static_cast<std::size_t>(tokens);
 }
 
-void lora_delta_batched(const Tensor& x, const LoraBank& bank, const Tensor& ids, Tensor& out,
-                        Tensor& scratch, cudaStream_t stream) {
+void lora_delta_batched(const Tensor& x, const LoraBank& bank, const Tensor& ids,
+                        const std::int32_t* uniform_slot, Tensor& out, Tensor& scratch,
+                        cudaStream_t stream) {
     if (bank.rank <= 0 || bank.a == nullptr || bank.b == nullptr) { return; }
     if (x.dtype != DType::BF16 || out.dtype != DType::BF16 || scratch.dtype != DType::BF16) {
         throw std::invalid_argument("lora_delta_batched: x/out/scratch must be BF16");
     }
-    if (ids.dtype != DType::I32 || ids.data == nullptr) {
+    // Either a per-token vector or one slot for the whole round; a prefill chunk
+    // is the latter, since all of its columns belong to one request.
+    const bool per_token = ids.data != nullptr;
+    if (per_token && ids.dtype != DType::I32) {
         throw std::invalid_argument("lora_delta_batched: ids must be a device I32 tensor");
     }
+    if (!per_token && uniform_slot == nullptr) { return; }
     if (!x.is_contiguous() || !out.is_contiguous() || !scratch.is_contiguous()) {
         throw std::invalid_argument("lora_delta_batched: x/out/scratch must be contiguous");
     }
     const std::int32_t tokens = x.ne[1];
-    if (tokens <= 0 || out.ne[1] != tokens || ids.numel() < tokens) {
+    if (tokens <= 0 || out.ne[1] != tokens || (per_token && ids.numel() < tokens)) {
         throw std::invalid_argument("lora_delta_batched: ids must cover the round's tokens");
     }
     if (x.ne[0] != bank.k || out.ne[0] != bank.n) {
@@ -107,9 +112,9 @@ void lora_delta_batched(const Tensor& x, const LoraBank& bank, const Tensor& ids
 
     Tensor low(scratch.data, DType::BF16, {bank.rank, tokens});
     detail::lora_batched_shrink_launch(x, bank.a, ids, low, bank.k, bank.rank, bank.a_stride,
-                                       stream);
+                                       uniform_slot, stream);
     detail::lora_batched_expand_launch(low, bank.b, ids, out, bank.n, bank.rank, bank.b_stride,
-                                       stream);
+                                       uniform_slot, stream);
 }
 
 } // namespace sinfer::ops

@@ -475,23 +475,19 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                                         " adapters but --max-loras is " +
                                         std::to_string(options.max_loras));
         }
-        // CUDA graphs off while an adapter is loaded.
+        // CUDA graphs off while adapters are loaded.
         //
-        // Prewarming every captured width was necessary and not sufficient. With the
-        // plans cached, a B=0 adapter is inert and reproducible under capture -- but
-        // a *real* adapter gives a different answer on every run (three runs, three
-        // hashes). The zero adapter cannot see it: B=0 zeroes the delta whatever the
-        // intermediate `A @ x` held, so it proves the add is inert, not that the
-        // path is sound.
-        //
-        // What is left is the scratch. `apply_lora` takes its buffer from the round's
-        // arena inside the hook, and a captured graph bakes that address in; the
-        // engine's own graph path keeps temporaries stable through the
-        // DeviceMemoryStack checkpoint/restore discipline, which this bypasses. The
-        // fix is to carry the delta scratch in the decode frame like every other
-        // temporary, not to allocate it per call. Until then, eager -- which is
-        // verified correct: base, an inert B=0 adapter and a repeatable real adapter
-        // all agree run to run.
+        // Eager is correct and reproducible: three adapters resident, each request
+        // selecting its own, every answer identical across runs, and a B=0 adapter
+        // inert. Under capture the same configuration answers differently on
+        // successive runs. The plans that first caused this are gone -- the delta
+        // is a pair of hand-written kernels now, allocating nothing -- and the ids
+        // and scratch are frame- and store-resident, so the remaining suspect is
+        // the capture itself: the prefill graph is recorded at startup, and a round
+        // published only when a request is in flight is not published then, so the
+        // captured graph can carry no adapter kernels while the decode graph does.
+        // Publishing a representative round during capture is the fix; until it is
+        // written and verified, adapters run eager.
         if (options.use_cuda_graph) {
             options.use_cuda_graph    = false;
             options.lora_forced_eager = true;

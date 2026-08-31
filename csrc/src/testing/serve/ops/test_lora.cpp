@@ -250,7 +250,7 @@ void test_batched(std::int32_t n, std::int32_t k, std::int32_t rank, std::int32_
     bank.n        = n;
     bank.k        = k;
 
-    ops::lora_delta_batched(x, bank, id_tensor, out, scratch, nullptr);
+    ops::lora_delta_batched(x, bank, id_tensor, nullptr, out, scratch, nullptr);
     cuda_synchronize();
     std::vector<std::uint16_t> got(static_cast<std::size_t>(n) * tokens);
     out_dev.copy_to_host(got.data(), out_dev.bytes());

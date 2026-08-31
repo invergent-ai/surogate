@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -85,6 +86,11 @@ public:
     explicit GenerationService(ServeOptions options, LoadProgress load_progress = {});
 
     [[nodiscard]] const ServeOptions& options() const noexcept { return options_; }
+    /// The bank slot for an adapter name, or -1 for the base model.
+    [[nodiscard]] std::int32_t lora_slot(const std::string& name) const {
+        const auto found = lora_slot_of_.find(name);
+        return found == lora_slot_of_.end() ? -1 : found->second;
+    }
 
     [[nodiscard]] sinfer::LoadSummary load_summary() const { return engine_->load_summary(); }
 
@@ -115,6 +121,9 @@ private:
     [[nodiscard]] std::shared_ptr<RequestLifetime> acquire_request_lifetime() const;
 
     ServeOptions options_;
+    /// Adapter name -> bank slot, fixed at load. A request carries the name; the
+    /// round carries the slot, and nothing below this class knows the name.
+    std::map<std::string, std::int32_t> lora_slot_of_;
     std::unique_ptr<sinfer::Engine> engine_;
     sinfer::PromptCapabilities prompt_capabilities_;
     std::shared_ptr<RequestCapacity> request_capacity_;

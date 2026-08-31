@@ -74,8 +74,12 @@ struct LoraBank {
 /// must be storage that outlives a graph replay -- a buffer allocated per call
 /// inside a captured region is baked in by address, which is how this path first
 /// went wrong.
-void lora_delta_batched(const Tensor& x, const LoraBank& bank, const Tensor& ids, Tensor& out,
-                        Tensor& scratch, cudaStream_t stream);
+/// `ids` selects per token; pass an empty tensor and a non-negative
+/// `uniform_slot` when the whole round belongs to one adapter, which is what a
+/// prefill chunk is.
+void lora_delta_batched(const Tensor& x, const LoraBank& bank, const Tensor& ids,
+                        const std::int32_t* uniform_slot, Tensor& out, Tensor& scratch,
+                        cudaStream_t stream);
 
 /// BF16 scratch elements `lora_delta_batched` needs for a round of `tokens`.
 [[nodiscard]] std::size_t lora_batched_workspace_elements(std::int32_t rank,

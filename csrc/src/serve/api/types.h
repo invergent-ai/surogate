@@ -104,6 +104,7 @@ struct EngineOptions {
     /// to the device store keyed by the base weight they adapt; nothing below the
     /// target needs to know PEFT's naming.
     struct LoraModulePayload {
+        std::int32_t slot    = 0;     ///< bank slot this adapter occupies
         std::int32_t layer   = -1;    ///< text layer index parsed from the module name
         std::string module;           ///< "q_proj", "o_proj", ...
         std::int32_t rank    = 0;
@@ -114,6 +115,11 @@ struct EngineOptions {
         std::vector<std::uint16_t> b; ///< [out_dim, rank] BF16
     };
     std::vector<LoraModulePayload> lora_payloads;
+    /// Bank geometry: how many adapters may be resident at once and the widest
+    /// rank any of them may have. Every bank is padded to these, so they fix the
+    /// launch geometry the projection hooks and a captured graph both need.
+    std::uint32_t lora_slots    = 0;
+    std::uint32_t lora_max_rank = 0;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
     // Storage of the pinned host expert bank. Q4G32AM (4-bit affine groups requantised from
     // the artifact's W8 at load) is 59 % of the bytes and near-exact for Q4_K-derived experts,
@@ -238,6 +244,10 @@ struct ExecutionOptions {
     SamplingOverrides sampling;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
+    /// Bank slot of the LoRA adapter this request selected, -1 for the base
+    /// model. A slot rather than a name: the round stages an integer per lane,
+    /// and every token of the batch may carry a different one.
+    std::int32_t lora_slot = -1;
 };
 
 struct OutputOptions {

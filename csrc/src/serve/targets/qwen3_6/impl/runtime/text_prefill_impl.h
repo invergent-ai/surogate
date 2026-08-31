@@ -10,6 +10,11 @@
 #include <algorithm>
 #include <stdexcept>
 
+#include <cstdio>
+#include <cstdlib>
+
+#include "api/ops/lora_store.h"
+
 namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS::schedule {
 namespace {
 
@@ -71,6 +76,42 @@ PrefillChunkResult prefill_text_chunk(
             : -1);
     card.set_prefill_graph_family(state.prefill_graphs);
     const std::span<const int> prompt(ids.data(), ids.size());
+    // The prompt must see the same adapter the generated tokens will: prefilling
+    // it on the base model and then decoding with the delta leaves the request
+    // reading a cache the adapter never wrote, which looks like a weak adapter
+    // rather than a bug.
+    struct LoraPrefillScope {
+        bool held = false;
+        explicit LoraPrefillScope(std::int32_t slot, std::int32_t columns) {
+            const bool dbg = std::getenv("SUROGATE_SERVE_LORA_DEBUG") != nullptr;
+            if (!ops::lora_active() || slot < 0) {
+                if (dbg) {
+                    std::fprintf(stderr, "lora-prefill: skip active=%d slot=%d\n",
+                                 ops::lora_active() ? 1 : 0, slot);
+                }
+                return;
+            }
+            ops::LoraRound round;
+            round.uniform = true;
+            round.scratch = ops::lora_store_for_current_device().scratch(columns);
+            if (round.scratch.data == nullptr) {
+                if (dbg) {
+                    std::fprintf(stderr, "lora-prefill: no scratch for %d columns\n", columns);
+                }
+                return;
+            }
+            ops::lora_set_round(round);
+            held = true;
+            if (dbg) { std::fprintf(stderr, "lora-prefill: held slot=%d cols=%d\n", slot, columns); }
+        }
+        ~LoraPrefillScope() {
+            if (held) { ops::lora_clear_round(); }
+        }
+    } lora_scope(state.lora_slot, static_cast<std::int32_t>(nominal_length));
+    if (lora_scope.held) {
+        ops::lora_store_for_current_device().write_uniform_slot(state.lora_slot,
+                                                                state.execution.device.stream);
+    }
     if (state.dflash != nullptr) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
         return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end,

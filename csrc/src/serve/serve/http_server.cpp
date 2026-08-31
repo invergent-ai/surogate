@@ -151,20 +151,12 @@ HttpServer::HttpServer(ServeOptions options)
             modules.emplace_back(module.name, module.path);
         }
         lora_.load(modules, options_.max_lora_rank);
+        // Many adapters may be resident at once: the round stages one slot per lane
+        // and the delta kernels read the adapter each token selected, so requests
+        // for different adapters share a batch.
         if (options_.lora_forced_eager) {
-            log_line("lora: CUDA graphs disabled -- the adapter's GEMM plans are not prewarmed "
-                     "for every captured shape, and creating one during capture corrupts the "
-                     "graph. Decode runs eager while an adapter is loaded.");
-        }
-        // One adapter is active for the whole server: applying a different one per
-        // request needs the scheduler to group lanes by adapter, which this does not
-        // do. Two named adapters would mean silently serving one of them for both.
-        if (lora_.adapters().size() > 1) {
-            throw std::runtime_error(
-                "--enable-lora: " + std::to_string(lora_.adapters().size()) +
-                " adapters named, but one adapter is active per server (per-request "
-                "selection needs lane grouping, which is not implemented). Run one "
-                "server per adapter.");
+            log_line("lora: CUDA graphs disabled -- adapters are correct and reproducible eager, "
+                     "and answer differently run to run under capture. See serve_options.cpp.");
         }
     }
     server_.set_payload_max_length(options_.max_request_bytes);

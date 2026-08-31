@@ -1,9 +1,13 @@
-// The resident adapter store (api/ops/lora_store.h).
+// The resident adapter banks (api/ops/lora_store.h).
 
 #include "api/ops/lora_store.h"
 
 #include "core/device.h"
 
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -11,23 +15,6 @@
 
 namespace sinfer::ops {
 namespace {
-
-Weight bf16_weight(const void* data, std::int32_t n, std::int32_t k) {
-    Weight w;
-    w.qtype           = QType::BF16_CTRL;
-    w.payload         = data;
-    w.qdata           = data;
-    w.payload_bytes   = static_cast<std::uint64_t>(n) * k * sizeof(std::uint16_t);
-    w.n               = n;
-    w.k               = k;
-    w.ndim            = 2;
-    w.shape[0]        = n;
-    w.shape[1]        = k;
-    w.padded_shape[0] = n;
-    w.padded_shape[1] = k;
-    w.layout          = QuantLayout::Contiguous;
-    return w;
-}
 
 float bf16_to_float(std::uint16_t bits) {
     const std::uint32_t word = static_cast<std::uint32_t>(bits) << 16U;
@@ -43,48 +30,143 @@ std::uint16_t float_to_bf16(float value) {
     return static_cast<std::uint16_t>(word >> 16U);
 }
 
-void* upload(const std::vector<std::uint16_t>& host) {
+void* upload_zeroed(std::size_t elements) {
     void* device = nullptr;
-    const std::size_t bytes = host.size() * sizeof(std::uint16_t);
+    const std::size_t bytes = elements * sizeof(std::uint16_t);
     CUDA_CHECK(cudaMalloc(&device, bytes));
-    CUDA_CHECK(cudaMemcpy(device, host.data(), bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(device, 0, bytes));
     return device;
 }
 
 } // namespace
 
 LoraStore::~LoraStore() {
-    for (void* pointer : owned_) { cudaFree(pointer); }
+    for (auto& [key, bank] : banks_) {
+        cudaFree(bank.a);
+        cudaFree(bank.b);
+    }
+    cudaFree(scratch_);
+    cudaFree(uniform_cell_);
 }
 
-void LoraStore::add(const void* base_key, const std::vector<std::uint16_t>& a,
-                    const std::vector<std::uint16_t>& b, std::int32_t rank, std::int32_t in_dim,
-                    std::int32_t out_dim, float scale) {
-    if (base_key == nullptr || rank <= 0 || in_dim <= 0 || out_dim <= 0) {
-        throw std::invalid_argument("lora_store: adapter geometry must be positive");
+void LoraStore::configure(std::int32_t slots, std::int32_t max_rank, std::int32_t max_tokens) {
+    if (slots <= 0 || max_rank <= 0 || max_tokens <= 0) {
+        throw std::invalid_argument("lora_store: slots, max_rank and max_tokens must be positive");
+    }
+    if (!banks_.empty()) {
+        throw std::logic_error("lora_store: configure must precede any slot");
+    }
+    slots_          = slots;
+    max_rank_       = max_rank;
+    scratch_tokens_ = max_tokens;
+    scratch_        = upload_zeroed(static_cast<std::size_t>(max_rank) * max_tokens);
+    CUDA_CHECK(cudaMalloc(&uniform_cell_, sizeof(std::int32_t)));
+    const std::int32_t none = -1;
+    CUDA_CHECK(cudaMemcpy(uniform_cell_, &none, sizeof(none), cudaMemcpyHostToDevice));
+}
+
+Tensor LoraStore::scratch(std::int32_t tokens) const {
+    if (scratch_ == nullptr || tokens <= 0 || tokens > scratch_tokens_) { return Tensor{}; }
+    // The view is the widest allocation, not the round's width: a captured graph
+    // must see one shape, and the kernels bound their work by the ids they read.
+    return Tensor(scratch_, DType::BF16, {max_rank_ * scratch_tokens_});
+}
+
+void LoraStore::set_slot(const void* base_key, std::int32_t slot,
+                         const std::vector<std::uint16_t>& a, const std::vector<std::uint16_t>& b,
+                         std::int32_t rank, std::int32_t in_dim, std::int32_t out_dim,
+                         float scale) {
+    if (slots_ == 0) { throw std::logic_error("lora_store: configure() first"); }
+    if (base_key == nullptr || slot < 0 || slot >= slots_) {
+        throw std::invalid_argument("lora_store: slot is outside the configured range");
+    }
+    if (rank <= 0 || rank > max_rank_ || in_dim <= 0 || out_dim <= 0) {
+        throw std::invalid_argument("lora_store: adapter geometry is outside the bank");
     }
     if (a.size() != static_cast<std::size_t>(rank) * in_dim ||
         b.size() != static_cast<std::size_t>(out_dim) * rank) {
         throw std::invalid_argument("lora_store: A must be [rank,in] and B [out,rank]");
     }
-    // alpha/r rides on A, so the runtime path is two plain GEMMs and an add.
-    std::vector<std::uint16_t> scaled(a.size());
-    for (std::size_t i = 0; i < a.size(); ++i) {
-        scaled[i] = float_to_bf16(bf16_to_float(a[i]) * scale);
+
+    auto found = banks_.find(base_key);
+    if (found == banks_.end()) {
+        Bank bank;
+        const std::size_t a_elements =
+            static_cast<std::size_t>(slots_) * max_rank_ * in_dim;
+        const std::size_t b_elements =
+            static_cast<std::size_t>(slots_) * out_dim * max_rank_;
+        bank.a             = upload_zeroed(a_elements);
+        bank.b             = upload_zeroed(b_elements);
+        bank.view.a        = bank.a;
+        bank.view.b        = bank.b;
+        bank.view.a_stride = static_cast<std::int64_t>(max_rank_) * in_dim;
+        bank.view.b_stride = static_cast<std::int64_t>(out_dim) * max_rank_;
+        bank.view.rank     = max_rank_;
+        bank.view.n        = out_dim;
+        bank.view.k        = in_dim;
+        found              = banks_.emplace(base_key, bank).first;
+    }
+    Bank& bank = found->second;
+    if (bank.view.k != in_dim || bank.view.n != out_dim) {
+        throw std::invalid_argument("lora_store: two adapters disagree on this projection's shape");
     }
 
-    void* a_device = upload(scaled);
-    owned_.push_back(a_device);
-    void* b_device = upload(b);
-    owned_.push_back(b_device);
+    // A padded to max_rank rows, with alpha/r folded in; rows past `rank` stay
+    // zero so a short adapter contributes nothing through them.
+    std::vector<std::uint16_t> a_padded(static_cast<std::size_t>(max_rank_) * in_dim, 0);
+    for (std::int32_t r = 0; r < rank; ++r) {
+        for (std::int32_t i = 0; i < in_dim; ++i) {
+            const float value = bf16_to_float(a[static_cast<std::size_t>(r) * in_dim + i]) * scale;
+            a_padded[static_cast<std::size_t>(r) * in_dim + i] = float_to_bf16(value);
+        }
+    }
+    // B padded to max_rank columns, likewise.
+    std::vector<std::uint16_t> b_padded(static_cast<std::size_t>(out_dim) * max_rank_, 0);
+    for (std::int32_t row = 0; row < out_dim; ++row) {
+        for (std::int32_t r = 0; r < rank; ++r) {
+            b_padded[static_cast<std::size_t>(row) * max_rank_ + r] =
+                b[static_cast<std::size_t>(row) * rank + r];
+        }
+    }
 
-    LoraWeights entry;
-    entry.a    = bf16_weight(a_device, rank, in_dim);
-    entry.b    = bf16_weight(b_device, out_dim, rank);
-    entry.rank = rank;
-    entries_.emplace(base_key, entry);
-    if (rank > max_rank_) { max_rank_ = rank; }
-    if (out_dim > max_out_dim_) { max_out_dim_ = out_dim; }
+    CUDA_CHECK(cudaMemcpy(static_cast<std::uint16_t*>(bank.a) + static_cast<std::size_t>(slot) *
+                                                                    bank.view.a_stride,
+                          a_padded.data(), a_padded.size() * sizeof(std::uint16_t),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(static_cast<std::uint16_t*>(bank.b) + static_cast<std::size_t>(slot) *
+                                                                    bank.view.b_stride,
+                          b_padded.data(), b_padded.size() * sizeof(std::uint16_t),
+                          cudaMemcpyHostToDevice));
+    if (std::getenv("SUROGATE_SERVE_LORA_DEBUG") != nullptr) {
+        double a_abs = 0.0, b_abs = 0.0;
+        for (std::size_t i = 0; i < a_padded.size(); ++i) {
+            a_abs = std::max(a_abs, std::abs(static_cast<double>(bf16_to_float(a_padded[i]))));
+        }
+        for (std::size_t i = 0; i < b_padded.size(); ++i) {
+            b_abs = std::max(b_abs, std::abs(static_cast<double>(bf16_to_float(b_padded[i]))));
+        }
+        std::fprintf(stderr, "lora-slot: slot=%d rank=%d in=%d out=%d scale=%.3f |A|max=%.5f |B|max=%.5f\n",
+                     slot, rank, in_dim, out_dim, static_cast<double>(scale), a_abs, b_abs);
+    }
+}
+
+void LoraStore::clear_slot(std::int32_t slot) {
+    if (slot < 0 || slot >= slots_) { return; }
+    for (auto& [key, bank] : banks_) {
+        CUDA_CHECK(cudaMemset(static_cast<std::uint16_t*>(bank.a) +
+                                  static_cast<std::size_t>(slot) * bank.view.a_stride,
+                              0, static_cast<std::size_t>(bank.view.a_stride) * sizeof(std::uint16_t)));
+        CUDA_CHECK(cudaMemset(static_cast<std::uint16_t*>(bank.b) +
+                                  static_cast<std::size_t>(slot) * bank.view.b_stride,
+                              0, static_cast<std::size_t>(bank.view.b_stride) * sizeof(std::uint16_t)));
+    }
+}
+
+void LoraStore::write_uniform_slot(std::int32_t slot, cudaStream_t stream) const {
+    if (uniform_cell_ == nullptr) { return; }
+    // Stream-ordered so it lands before the round that reads it, and captured as a
+    // node when the round is being recorded.
+    CUDA_CHECK(cudaMemcpyAsync(uniform_cell_, &slot, sizeof(slot), cudaMemcpyHostToDevice, stream));
 }
 
 LoraStore& lora_store_for_current_device() {
@@ -96,11 +178,16 @@ LoraStore& lora_store_for_current_device() {
     return stores[device];
 }
 
-bool lora_active() {
-    // Read once per process rather than per projection: the store is populated at
-    // load and never changes afterwards, and this sits in front of every hook.
-    static const bool active = !lora_store_for_current_device().empty();
-    return active;
-}
+namespace {
+bool g_lora_active = false;
+thread_local LoraRound t_round;
+} // namespace
+
+bool lora_active() { return g_lora_active; }
+void lora_set_active(bool active) { g_lora_active = active; }
+
+void lora_set_round(const LoraRound& round) { t_round = round; }
+void lora_clear_round() { t_round = LoraRound{}; }
+const LoraRound& lora_current_round() { return t_round; }
 
 } // namespace sinfer::ops

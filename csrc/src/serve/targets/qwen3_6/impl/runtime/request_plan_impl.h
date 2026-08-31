@@ -107,6 +107,7 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     base->summary.transient_bytes        = 0;
     base->sampling                       = translate_sampling(options.sampling);
     base->allow_prefix_reuse             = options.allow_prefix_reuse;
+    base->lora_slot                      = options.lora_slot;
     // The mixed prefill graph writes a 128-rounded chunk window, pad columns included, so
     // the request must own the pages up to its rounded prompt as well as its output extent;
     // otherwise mapping the last chunk lands outside the entitlement and the round dies.
@@ -200,6 +201,7 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     plan->sampling                    = base.sampling;
     plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;
     plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
+    plan->lora_slot                   = base.lora_slot;
 
     if (base.allow_prefix_reuse && prompt.identity.reusable && sequence.retained) {
         const bool dflash_append_ready =

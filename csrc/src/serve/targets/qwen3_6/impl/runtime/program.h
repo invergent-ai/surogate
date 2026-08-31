@@ -71,6 +71,8 @@ struct RequestBasePlanImpl<SINFER_QWEN36_VARIANT> {
     std::size_t vision_transient_bytes = 0;
     std::optional<qwen3_6::RewriteCheckpointSpec> rewrite_checkpoint;
     bool allow_prefix_reuse = false;
+    /// The adapter slot the request selected; copied into RequestControl at admit.
+    std::int32_t lora_slot = -1;
 };
 
 template <>
@@ -88,6 +90,8 @@ struct RequestPlanImpl<SINFER_QWEN36_VARIANT> {
     ops::SamplingConfig sampling;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
+    /// The adapter slot the request selected; read once at admission.
+    std::int32_t lora_slot = -1;
 };
 
 } // namespace sinfer::targets::qwen3_6::detail
@@ -180,6 +184,8 @@ struct RequestControl {
     Lifecycle lifecycle = Lifecycle::Empty;
     PendingCandidate pending;
     ops::SamplingConfig sampling_host;
+    /// The adapter slot this request selected; staged per lane every round.
+    std::int32_t lora_slot = -1;
     GenerationTimings timings;
     SpeculativeStats speculative_stats;
 

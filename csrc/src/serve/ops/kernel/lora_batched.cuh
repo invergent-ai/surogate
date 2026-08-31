@@ -32,11 +32,17 @@ __global__ void lora_batched_shrink_kernel(const __nv_bfloat16* __restrict__ x,
                                            const std::int32_t* __restrict__ ids,
                                            __nv_bfloat16* __restrict__ low, std::int32_t k,
                                            std::int32_t rank, std::int32_t tokens,
-                                           std::int64_t a_stride) {
+                                           std::int64_t a_stride,
+                                           const std::int32_t* __restrict__ uniform) {
     const int token = static_cast<int>(blockIdx.y);
     const int row   = static_cast<int>(blockIdx.x * blockDim.y + threadIdx.y);
     if (token >= tokens || row >= rank) { return; }
-    const int adapter = ids[token];
+    // Prefill hands one slot for the whole round rather than a vector: every
+    // column belongs to the same request. It arrives as a device cell rather than
+    // a launch argument because a captured graph freezes its arguments -- a slot
+    // passed by value would pin every later replay to whichever request was being
+    // prefilled when the graph was captured.
+    const int adapter = ids != nullptr ? ids[token] : (uniform != nullptr ? *uniform : -1);
     if (adapter < 0) {
         if (threadIdx.x == 0) { low[static_cast<std::int64_t>(token) * rank + row] = __float2bfloat16(0.0F); }
         return;
@@ -73,11 +79,12 @@ __global__ void lora_batched_expand_kernel(const __nv_bfloat16* __restrict__ low
                                            const std::int32_t* __restrict__ ids,
                                            __nv_bfloat16* __restrict__ out, std::int32_t n,
                                            std::int32_t rank, std::int32_t tokens,
-                                           std::int64_t b_stride) {
+                                           std::int64_t b_stride,
+                                           const std::int32_t* __restrict__ uniform) {
     const int token = static_cast<int>(blockIdx.y);
     const int row   = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (token >= tokens || row >= n) { return; }
-    const int adapter = ids[token];
+    const int adapter = ids != nullptr ? ids[token] : (uniform != nullptr ? *uniform : -1);
     if (adapter < 0) { return; }
 
     const __nv_bfloat16* b_row =

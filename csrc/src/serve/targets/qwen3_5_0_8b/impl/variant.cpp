@@ -5,6 +5,9 @@
 #include "api/ops/gdn_input_proj.h"
 #include "api/ops/linear.h"
 #include "api/ops/linear_add.h"
+#include <cstdio>
+#include <cstdlib>
+
 #include "api/ops/lora_store.h"
 #include "api/ops/lora.h"
 #include "api/ops/linear_pair.h"
@@ -164,23 +167,40 @@ std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t,
 
 namespace {
 
-/// Adds the active adapter's delta to a projection that has just been written.
+/// Adds the round's adapter deltas to a projection that has just been written.
 ///
 /// Keyed by the base weight's device pointer, which is this layer's identity --
-/// the variant methods take weights, not a layer index. `out` is the projection's
-/// own contiguous output (attn_input_proj scatters q/k/v into separate tensors,
-/// so each is adaptable on its own), and the scratch comes from the round's arena
-/// inside a scope, so it is released before the next op.
-void apply_lora(const Weight& base, const Tensor& hidden, Tensor& out,
-                WorkspaceArena& workspace, cudaStream_t stream) {
-    if (!ops::lora_active()) { return; }
-    const ops::LoraWeights* lora = ops::lora_store_for_current_device().find(base.qdata);
-    if (lora == nullptr) { return; }
-    const auto scope = workspace.scope();
-    Tensor scratch   = workspace.alloc(
-        DType::BF16,
-        {static_cast<std::int32_t>(ops::lora_workspace_elements(lora->rank, out.ne[0], out.ne[1]))});
-    ops::lora_delta(hidden, *lora, out, scratch, stream);
+/// the variant methods take weights, not a layer index. Every token in the round
+/// may name a different adapter (or none), which is why this reads the round's
+/// slot vector rather than a single active adapter.
+///
+/// The ids and the scratch both come from the decode frame, published by the
+/// schedule. They must: a captured graph records their addresses once and replays
+/// against whatever the round wrote, and a buffer allocated per call inside the
+/// hook is baked in by address instead -- which is what made an earlier version
+/// of this give a different answer on every replay.
+void apply_lora(const Weight& base, const Tensor& hidden, Tensor& out, cudaStream_t stream) {
+    const bool debug = std::getenv("SUROGATE_SERVE_LORA_DEBUG") != nullptr;
+    if (!ops::lora_active()) {
+        if (debug) { std::fprintf(stderr, "lora-hook: inactive\n"); }
+        return;
+    }
+    const ops::LoraBank* bank = ops::lora_store_for_current_device().find(base.qdata);
+    if (bank == nullptr) {
+        if (debug) { std::fprintf(stderr, "lora-hook: no bank for this weight\n"); }
+        return;
+    }
+    const ops::LoraRound& round = ops::lora_current_round();
+    if (!round.valid()) {
+        if (debug) { std::fprintf(stderr, "lora-hook: no round published\n"); }
+        return;
+    }
+    if (debug) { std::fprintf(stderr, "lora-hook: applying\n"); }
+    static const Tensor kNoIds{};
+    ops::lora_delta_batched(hidden, *bank, round.slots != nullptr ? *round.slots : kNoIds,
+                            round.uniform ? ops::lora_store_for_current_device().uniform_cell()
+                                          : nullptr,
+                            out, const_cast<Tensor&>(round.scratch), stream);
 }
 
 } // namespace
@@ -197,14 +217,14 @@ void Variant::attention_projection(const Tensor& hidden,
     const Weight& fused = std::get<FusedAttentionProjectionPayload>(weights).query_key_gate_value;
     ops::attn_input_proj(hidden, fused, query, gate, key, value, text_policy(fused), workspace,
                          stream);
-    apply_lora(fused, hidden, query, workspace, stream);
+    apply_lora(fused, hidden, query, stream);
 }
 
 void Variant::attention_output_projection(const Tensor& attention, const Weight& weight,
                                           Tensor& residual, qwen3_6::TextPhase,
                                           WorkspaceArena& workspace, cudaStream_t stream) {
     ops::linear_add(attention, weight, residual, text_policy(weight), workspace, stream);
-    apply_lora(weight, attention, residual, workspace, stream);
+    apply_lora(weight, attention, residual, stream);
 }
 
 void Variant::mtp_attention_projection(const Tensor& hidden,

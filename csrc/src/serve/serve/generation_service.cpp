@@ -263,6 +263,12 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
             modules.emplace_back(module.name, module.path);
         }
         registry.load(modules, options_.max_lora_rank);
+        // Slots are assigned here, once, in the order the deployment named them,
+        // and a request's adapter is turned into its slot index at admission. The
+        // engine below never sees a name.
+        engine_options.lora_slots    = options_.max_loras;
+        engine_options.lora_max_rank = options_.max_lora_rank;
+        std::int32_t slot            = 0;
         for (const auto& [name, adapter] : registry.adapters()) {
             std::vector<std::string> skipped;
             auto payloads = LoraRegistry::read_payloads(adapter, skipped);
@@ -272,8 +278,11 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
                     "' carries no layer index, so it cannot be bound to a projection");
             }
             for (auto& payload : payloads) {
+                payload.slot = slot;
                 engine_options.lora_payloads.push_back(std::move(payload));
             }
+            lora_slot_of_[name] = slot;
+            ++slot;
         }
     }
     engine_options.load_progress            = std::move(load_progress);
@@ -319,6 +328,10 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
                                            std::function<bool()> is_cancelled) const {
     PreparedRequest prepared;
     sinfer::RequestOptions request_options = to_request_options(request, options_);
+    // The adapter the request named, as its bank slot. Resolved here rather than
+    // deeper because this is the last place the name exists: the round stages an
+    // integer per lane and nothing below knows adapters by name.
+    request_options.execution.lora_slot = lora_slot(request.lora_adapter);
     prepared.include_usage                 = request.include_usage;
     // --enable-auto-tool-choice, vLLM's gate. Without it a request may still name a
     // function or demand one; what it may not do is leave the choice to the model,

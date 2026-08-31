@@ -483,6 +483,9 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         request.lifecycle == Lifecycle::Pending) {
         throw std::logic_error("staged prefill requires a free request lane");
     }
+    // Fixed for the request's lifetime, so it is read once here and staged per
+    // round rather than looked up on the hot path.
+    request.lora_slot = request_plan.lora_slot;
 
     const std::uint32_t prompt_tokens = static_cast<std::uint32_t>(prompt.token_ids.size());
     if (prompt_tokens != request_plan.summary.prompt_tokens ||
@@ -1370,6 +1373,7 @@ void ProgramImplCore::prepare_graphs() {
                 ordinary_host_ingress->text_kv_table_rows[row] = static_cast<std::int32_t>(row);
                 ordinary_host_ingress->lanes[row]              = static_cast<std::int32_t>(row);
                 ordinary_host_ingress->sampling[row]           = {};
+                ordinary_host_ingress->lora_slots[row]         = -1;
             }
         }
     };
@@ -1815,7 +1819,8 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 : kNoRewriteCheckpointSlot,
             staged.initial_mtp_extent,
             dflash_host_ingress,
-            staged.use_graph && prefill_graphs.has_value() ? &*prefill_graphs : nullptr};
+            staged.use_graph && prefill_graphs.has_value() ? &*prefill_graphs : nullptr,
+            requests[sequence.lane].lora_slot};
 
         if (staged.mtp_bridge == MtpBridgeMode::BeforeSuffix) {
             if (staged.cursor != staged.base || staged.base == 0 ||
@@ -2124,6 +2129,11 @@ ProgramImplCore::launch_ordinary_round(std::span<const std::uint32_t> lanes,
             ordinary_host_ingress->text_kv_table_rows[row] = sequence.kv->text.bound_row();
             ordinary_host_ingress->lanes[row]    = static_cast<std::int32_t>(sequence.lane);
             ordinary_host_ingress->sampling[row] = request.sampling_host;
+            ordinary_host_ingress->lora_slots[row] = request.lora_slot;
+            if (std::getenv("SUROGATE_SERVE_LORA_DEBUG") != nullptr) {
+                std::fprintf(stderr, "lora-debug: row=%zu lane=%u slot=%d\n", row,
+                             static_cast<unsigned>(sequence.lane), request.lora_slot);
+            }
             materialize_sequence_kv(sequence, frontier + burst, 0);
         }
 
@@ -2350,6 +2360,11 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
             ordinary_host_ingress->text_kv_table_rows[row] = sequence.kv->text.bound_row();
             ordinary_host_ingress->lanes[row]    = static_cast<std::int32_t>(sequence.lane);
             ordinary_host_ingress->sampling[row] = request.sampling_host;
+            ordinary_host_ingress->lora_slots[row] = request.lora_slot;
+            if (std::getenv("SUROGATE_SERVE_LORA_DEBUG") != nullptr) {
+                std::fprintf(stderr, "lora-debug: row=%zu lane=%u slot=%d\n", row,
+                             static_cast<unsigned>(sequence.lane), request.lora_slot);
+            }
             materialize_sequence_kv(sequence, frontier + 1, 0);
         }
         // Mixed-round graphs (PATCHES.md #30) pad the decode batch to its
@@ -2367,6 +2382,7 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
             ordinary_host_ingress->text_kv_table_rows[pad] = ordinary_host_ingress->text_kv_table_rows[0];
             ordinary_host_ingress->lanes[pad]              = ordinary_host_ingress->lanes[0];
             ordinary_host_ingress->sampling[pad]           = ordinary_host_ingress->sampling[0];
+            ordinary_host_ingress->lora_slots[pad]         = ordinary_host_ingress->lora_slots[0];
         }
         qwen3_6::OrdinaryDecodeState& ordinary = *io.ordinary;
         CUDA_CHECK(cudaMemcpyAsync(ordinary.ingress.data, ordinary_host_ingress,
