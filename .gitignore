@@ -38,3 +38,4 @@ watch-out/
 watch-run.yaml*
 csrc/build*
 models/**
+design/

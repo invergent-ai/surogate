@@ -321,6 +321,110 @@ def _run_converter_cached(model_dir: Path, out: Path, *, echo=print,
     return out
 
 
+# --------------------------------------------------------------------------------------------
+# Encoder (embedding) models
+# --------------------------------------------------------------------------------------------
+#
+# An encoder runs one forward: no KV cache, no sampler, no decode round. It is
+# served by its own binary, so it gets its own ingest entry rather than a branch
+# inside the generative one. The registered converter is GGUF-native, and its
+# frontend is a tokenizer and nothing else.
+
+ENCODER_TARGETS = {
+    # gguf architecture string -> (cache key, converter module, display)
+    "gemma-embedding": ("gemma_embedding",
+                        "surogate.serve.tools.convert.gemma_embedding.convert",
+                        "EmbeddingGemma"),
+}
+
+#: What the encoder converter reads out of a --frontend directory.
+ENCODER_FRONTEND_FILES = ("tokenizer.model", "tokenizer_config.json")
+
+
+def _gguf_architecture(path: Path) -> str | None:
+    """The GGUF's `general.architecture`, read through the same bridge the
+    generative path uses. Costs a full KV parse, so callers check the cache
+    first."""
+    from surogate.serve.gguf import bridge as serve_gguf
+
+    try:
+        reader = serve_gguf.open_gguf(path)
+        return serve_gguf.read_gguf_summary(path, reader)["architecture"]
+    except Exception:
+        return None
+
+
+def _encoder_frontend(gguf_path: Path, frontend: str | None) -> Path:
+    """Where the tokenizer comes from, with a message instead of a stack trace."""
+    if frontend is not None:
+        directory = Path(frontend).expanduser().resolve()
+        missing = [n for n in ENCODER_FRONTEND_FILES if not (directory / n).is_file()]
+        if missing:
+            raise SystemExit(
+                f"surogate serve --embed: --frontend {directory} is missing {', '.join(missing)}."
+            )
+        return directory
+    beside = gguf_path.parent
+    if all((beside / name).is_file() for name in ENCODER_FRONTEND_FILES):
+        return beside
+    raise SystemExit(
+        "surogate serve --embed: this GGUF needs a tokenizer to convert, and none was found\n"
+        f"  beside it in {beside}.\n"
+        "  Pass --frontend DIR pointing at the model's Hugging Face snapshot (the directory\n"
+        f"  holding {' and '.join(ENCODER_FRONTEND_FILES)})."
+    )
+
+
+def ensure_encoder_weights(spec: str, *, frontend: str | None = None, echo=print) -> Path:
+    """Resolve `spec` to encoder-loadable weights, converting through the cache.
+
+    Accepts an internal artifact (passthrough) or a `.gguf` file. Raises
+    SystemExit with a clear message on anything else."""
+    kind = classify_input(spec)
+    if kind == "artifact":
+        return Path(spec)
+    if kind != "gguf":
+        raise SystemExit(
+            f"surogate serve --embed: cannot interpret '{spec}'. The registered encoder "
+            "converter is GGUF-native, so pass a .gguf file (or an already-converted "
+            "artifact).\n  Registered today: EmbeddingGemma (gemma-embedding)."
+        )
+
+    gguf_path = Path(spec).expanduser().resolve()
+    architecture = _gguf_architecture(gguf_path)
+    target = ENCODER_TARGETS.get(architecture or "")
+    if target is None:
+        raise SystemExit(
+            "surogate serve --embed: this model is not yet supported by the encoder path.\n"
+            f"  gguf architecture={architecture!r}\n"
+            f"  Registered today: {', '.join(sorted(ENCODER_TARGETS))}."
+        )
+    key, module, display = target
+
+    fp = _gguf_fingerprint(gguf_path)
+    out = cache_dir() / f"{key}-gguf-{fp}.sinfer"
+    if out.is_file() and out.stat().st_size > 0:
+        echo(f"surogate serve: using cached encoder weights ({out.name})")
+        return out
+
+    frontend_dir = _encoder_frontend(gguf_path, frontend)
+    root = _sinfer_root()
+    if root is None:
+        raise SystemExit("surogate serve: vendored engine tree not found (run from a checkout).")
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    echo(f"surogate serve: converting {display} ({gguf_path.name}) -> {out.name}")
+    cmd = [sys.executable, "-m", module, "--gguf", str(gguf_path),
+           "--frontend", str(frontend_dir), "--out", str(out)]
+    if os.environ.get("SUROGATE_SERVE_DRY"):
+        echo("  (dry run) " + " ".join(cmd))
+        return out
+    result = subprocess.run(cmd, cwd=str(root))
+    if result.returncode != 0 or not out.is_file():
+        raise SystemExit(f"surogate serve: encoder conversion failed ({display}).")
+    return out
+
+
 def ensure_engine_weights(spec: str, *, echo=print) -> Path:
     """Resolve `spec` (safetensors dir | HF repo id | GGUF | internal artifact)
     to an engine-loadable weights file, converting through the transparent
@@ -356,8 +460,7 @@ def ensure_engine_weights(spec: str, *, echo=print) -> Path:
             "surogate serve: this model is not yet supported by the native engine.\n"
             f"  model_type={config.get('model_type')!r} hidden_size={config.get('hidden_size')} "
             f"layers={config.get('num_hidden_layers')}\n"
-            "  Registered today: Qwen3.6-27B, Qwen3.8-27B (BF16/NVFP4), Qwen3.6-35B-A3B.\n"
-            "  Model breadth is tracked in design/serve-engine-plan.md §6."
+            "  Registered today: Qwen3.6-27B, Qwen3.8-27B (BF16/NVFP4), Qwen3.6-35B-A3B."
         )
 
     fp = source_fingerprint(model_dir)
