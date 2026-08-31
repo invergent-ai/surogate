@@ -63,6 +63,7 @@ def geometry(config: dict[str, Any]) -> dict[str, int]:
         # No attention output gate: q, k and v stacked, nothing else.
         "QKV": query_size + 2 * kv_size,
         "AttnDim": query_size,
+        "KvDim": kv_size,
         "HcCount": config.get("hc_count", 0),
         "HcWidth": config.get("hc_count", 0) * hidden,
         "HcLowRank": config.get("hc_lowrank", 0),

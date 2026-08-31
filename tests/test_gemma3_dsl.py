@@ -282,7 +282,7 @@ def test_block_schemas_satisfy_the_serve_contract():
 
     for block in (Gemma3SlidingBlock, Gemma3FullBlock):
         assert block.schema.contract_errors() == (), block.__name__
-        assert len(block.schema.serve_objects) == 11
+        assert len(block.schema.serve_objects) == 13
 
 
 def test_only_the_generative_variant_carries_an_output_head():
@@ -439,11 +439,13 @@ def test_inventory_derives_from_the_declaration():
     it asks the declaration.
     """
     inventory = generated_inventory()
-    assert len(inventory) == 1 + 24 * 11 + 1 + 1 == 267
+    assert len(inventory) == 1 + 24 * 13 + 1 + 1 == 315
 
     by_name = {obj["name"]: obj for obj in inventory}
     assert by_name["text/token_embedding"]["shape"] == (262144, 768)
-    assert by_name["text/layers/0/attention/query_key_value"]["shape"] == (1280, 768)
+    assert by_name["text/layers/0/attention/query"]["shape"] == (768, 768)
+    assert by_name["text/layers/0/attention/key"]["shape"] == (256, 768)
+    assert by_name["text/layers/0/attention/value"]["shape"] == (256, 768)
     assert by_name["text/final_norm"]["shape"] == (768,)
     # The two Dense modules composed into one square matrix.
     assert by_name["text/embedding_head"]["shape"] == (768, 768)
@@ -476,11 +478,7 @@ def test_every_object_maps_onto_gguf_tensors_of_the_right_shape():
             consumed.add(name)
 
         parts = [shapes[n] for n in names]
-        if source.op == "concat_rows":
-            rows = sum(p[0] for p in parts)
-            assert {p[1] for p in parts} == {obj["shape"][1]}, obj["name"]
-            assert (rows, parts[0][1]) == obj["shape"], obj["name"]
-        elif source.op == "compose_linear":
+        if source.op == "compose_linear":
             # (n, k) @ (k, m) -> (n, m); here [768,3072] @ [3072,768].
             (n, k), (k2, m) = parts
             assert k == k2, obj["name"]
@@ -496,14 +494,14 @@ def test_only_the_norms_and_the_head_leave_the_quantised_path():
     """Q8_0 is W8G32_F16S, so anything built by row algebra repacks bit-exactly.
 
     The norms are F32 in the GGUF and must lose their folded one; the head has to
-    dequantize because a matrix product mixes k. That leaves five matrices per
-    layer — the Q/K/V fuse, the attention output and the three MLP projections —
-    plus the embedding table, all moving across untouched. 121 of 267 objects,
+    dequantize because a matrix product mixes k. That leaves seven matrices per
+    layer — Q, K, V, the attention output and the three MLP projections —
+    plus the embedding table, all moving across untouched. 169 of 315 objects,
     but very nearly all of the bytes.
     """
     from surogate.serve.tools.convert.gemma_embedding import source_for
 
     repackable = [o["name"] for o in generated_inventory() if source_for(o["name"]).repackable]
-    assert len(repackable) == 1 + 24 * 5 == 121
+    assert len(repackable) == 1 + 24 * 7 == 169
     assert "text/embedding_head" not in repackable
     assert not any(name.endswith("_norm") for name in repackable)

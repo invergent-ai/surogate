@@ -148,7 +148,16 @@ _GEMMA3_SERVE_OBJECTS: tuple[ServeObject, ...] = (
                 transform="unfold_unit_offset"),
     ServeObject("post_feedforward_norm", "bf16", ("C",), ("ln_post_ff_weight",),
                 transform="unfold_unit_offset"),
-    ServeObject("attention/query_key_value", "quantised", ("QKV", "C"), ("qkv_weight",)),
+    # Q, K and V stay separate, where the Qwen families fuse them. The fuse buys
+    # two fewer kernel launches per layer -- immaterial at 768 hidden -- and costs
+    # a split: per-head QK norm and rope both need their operand contiguous, and
+    # in a fused [q|k|v, tokens] matrix the query rows of successive tokens are
+    # not adjacent. Three GEMMs compose from ops that already exist; the fused
+    # form needs a split-norm-rope kernel written and tested first. Same FLOPs
+    # either way, and all three repack bit-exactly instead of concatenating.
+    ServeObject("attention/query", "quantised", ("AttnDim", "C"), ("qkv_weight",)),
+    ServeObject("attention/key", "quantised", ("KvDim", "C"), ("qkv_weight",)),
+    ServeObject("attention/value", "quantised", ("KvDim", "C"), ("qkv_weight",)),
     ServeObject("attention/query_norm", "bf16", ("HeadDim",), ("q_norm_weight",),
                 transform="unfold_unit_offset"),
     ServeObject("attention/key_norm", "bf16", ("HeadDim",), ("k_norm_weight",),

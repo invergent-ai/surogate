@@ -9,9 +9,9 @@ Three kinds of work, and only the first is free:
 * **Repack.** ``Q8_0`` and the artifact's ``W8G32_F16S`` are the same format
   (int8 codes, one binary16 scale per 32-group), so an object built by row
   algebra over Q8_0 sources moves across bit-exactly -- no dequantize, no
-  requantize, no GPU. Everything under ``attention/`` and ``mlp/`` qualifies,
-  including the Q/K/V fuse, because concatenating on the row axis leaves each
-  row's groups intact.
+  requantize, no GPU. Every matrix qualifies: the declaration keeps Q, K and V
+  separate, so each one is a plain copy of a GGUF tensor. 169 of 315 objects,
+  and all but a rounding error of the bytes.
 
 * **Unfold.** Gemma norms are zero-centred: HF stores ``w``, the GGUF stores the
   folded ``1 + w``, and the runtime re-applies the offset itself
@@ -37,8 +37,8 @@ class Source:
     """How one artifact object is built from GGUF tensors.
 
     ``op`` is the identity the declaration named (``ServeObject.transform``) or
-    the implicit one for a plain copy. ``tensors`` are GGUF names, in row order
-    for a concatenation and in application order for a composition.
+    the implicit one for a plain copy. ``tensors`` are GGUF names, in application
+    order for a composition.
     """
 
     tensors: tuple[str, ...]
@@ -48,10 +48,10 @@ class Source:
     def repackable(self) -> bool:
         """Whether this object can move from Q8_0 without dequantizing.
 
-        Row algebra only: a copy or a row-axis concatenation. ``unfold`` touches
-        values and ``compose_linear`` mixes columns, so neither qualifies.
+        ``unfold`` touches values and ``compose_linear`` mixes columns, so
+        neither qualifies; a plain copy does.
         """
-        return self.op in ("copy", "concat_rows")
+        return self.op == "copy"
 
 
 #: Per-layer objects. Keys are the object names the declaration emits, minus the
@@ -63,12 +63,11 @@ LAYER_SOURCES: dict[str, Source] = {
     "post_attention_norm": Source(("post_attention_norm.weight",), "unfold"),
     "pre_feedforward_norm": Source(("ffn_norm.weight",), "unfold"),
     "post_feedforward_norm": Source(("post_ffw_norm.weight",), "unfold"),
-    # Q, K and V stack on the row axis: 3*256 + 256 + 256 = 1280 rows of k=768.
-    # Gemma 3 has no attention output gate, so nothing is interleaved -- unlike
-    # the Qwen families, whose fuse splits an interleaved query/gate projection.
-    "attention/query_key_value": Source(
-        ("attn_q.weight", "attn_k.weight", "attn_v.weight"), "concat_rows"
-    ),
+    # Separate, matching the GGUF's own layout. Nothing is interleaved -- Gemma 3
+    # has no attention output gate -- so each is a plain copy and repacks exactly.
+    "attention/query": Source(("attn_q.weight",)),
+    "attention/key": Source(("attn_k.weight",)),
+    "attention/value": Source(("attn_v.weight",)),
     "attention/query_norm": Source(("attn_q_norm.weight",), "unfold"),
     "attention/key_norm": Source(("attn_k_norm.weight",), "unfold"),
     "attention/output": Source(("attn_output.weight",)),

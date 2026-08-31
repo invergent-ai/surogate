@@ -172,15 +172,12 @@ def materialize(source: GgufSource, name: str, shape: tuple[int, ...]) -> bytes:
         second, first = (source.float32(n).astype(np.float64) for n in names)
         return _bf16((second @ first).astype(np.float32), shape)
 
-    # Row algebra over Q8_0: repack the planes, no dequantize.
-    planes = [source.planes_exact(n) for n in names]
-    if any(source.tensor(n).type_name not in REPACKABLE_TYPES for n in names):
-        raise ValueError(f"{name}: source is not exactly repackable")
-    codes = np.concatenate([p[0] for p in planes], axis=0)
-    scales = np.concatenate([p[1] for p in planes], axis=0)
-    return encode_row_split(
-        torch.from_numpy(codes), torch.from_numpy(scales), _W8, (codes.shape[0], planes[0][2][1])
-    )
+    # Q8_0 straight into W8G32_F16S: same format, so repack the planes and never
+    # dequantize.
+    if source.tensor(names[0]).type_name not in REPACKABLE_TYPES:
+        raise ValueError(f"{name}: {source.tensor(names[0]).type_name} is not exactly repackable")
+    codes, scales, (rows, k) = source.planes_exact(names[0])
+    return encode_row_split(torch.from_numpy(codes), torch.from_numpy(scales), _W8, (rows, k))
 
 
 def load_frontend(frontend_dir: Path) -> dict[str, bytes]:
