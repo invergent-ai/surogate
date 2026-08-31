@@ -475,14 +475,25 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                                         " adapters but --max-loras is " +
                                         std::to_string(options.max_loras));
         }
-        // The delta runs two cuBLASLt GEMMs, and their plans are cached per problem
-        // shape. Every shape a round uses would have to be prewarmed before capture;
-        // one that is not is created *during* capture, which measurably corrupts the
-        // graph -- a B=0 adapter, whose delta is exactly zero, changed the output and
-        // changed it differently on each run. Eager is correct and is what the
-        // adapter path is verified in, so it is chosen rather than offered.
+        // CUDA graphs off while an adapter is loaded.
+        //
+        // Prewarming every captured width was necessary and not sufficient. With the
+        // plans cached, a B=0 adapter is inert and reproducible under capture -- but
+        // a *real* adapter gives a different answer on every run (three runs, three
+        // hashes). The zero adapter cannot see it: B=0 zeroes the delta whatever the
+        // intermediate `A @ x` held, so it proves the add is inert, not that the
+        // path is sound.
+        //
+        // What is left is the scratch. `apply_lora` takes its buffer from the round's
+        // arena inside the hook, and a captured graph bakes that address in; the
+        // engine's own graph path keeps temporaries stable through the
+        // DeviceMemoryStack checkpoint/restore discipline, which this bypasses. The
+        // fix is to carry the delta scratch in the decode frame like every other
+        // temporary, not to allocate it per call. Until then, eager -- which is
+        // verified correct: base, an inert B=0 adapter and a repeatable real adapter
+        // all agree run to run.
         if (options.use_cuda_graph) {
-            options.use_cuda_graph = false;
+            options.use_cuda_graph    = false;
             options.lora_forced_eager = true;
         }
         std::vector<std::string> seen;

@@ -2,6 +2,8 @@
 #include <api/targets/qwen3_6/frontend_resources.h>
 #include <api/targets/qwen3_6/prepared_prompt.h>
 
+#include <algorithm>
+
 #include "api/ops/lora_store.h"
 #include "artifact/reader.h"
 #include "targets/qwen3_5_0_8b/impl/load/bindings.h"
@@ -171,7 +173,23 @@ void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& opt
         }
         store.add(base->qdata, payload.a, payload.b, payload.rank, payload.in_dim,
                   payload.out_dim, payload.scale);
-        ops::lora_prepare(payload.out_dim, payload.in_dim, payload.rank, 1);
+        // Every width a captured decode graph can present, prewarmed here.
+        //
+        // The delta's two cuBLASLt GEMMs cache a plan per problem shape, and a plan
+        // built *during* capture corrupts the graph -- measurably: a B=0 adapter,
+        // whose delta is exactly zero, then changed the output and changed it
+        // differently on each run. Preparing only T=1 was why LoRA had to run eager.
+        // A captured decode round carries one column per lane, times the verify
+        // window when a draft is in flight, so the widths are small and few.
+        const std::uint32_t lanes = std::max<std::uint32_t>(options.max_concurrency, 1);
+        const std::uint32_t window =
+            options.speculative.backend == SpeculativeBackend::None
+                ? 1U
+                : options.speculative.draft_tokens + 1U;
+        for (std::uint32_t tokens = 1; tokens <= lanes * window; ++tokens) {
+            ops::lora_prepare(payload.out_dim, payload.in_dim, payload.rank,
+                              static_cast<std::int32_t>(tokens));
+        }
     }
 }
 
