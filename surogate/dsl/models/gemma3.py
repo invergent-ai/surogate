@@ -40,11 +40,12 @@ converter:
   which is the case for the declaration being the source of truth rather than
   the file.
 
-* **Norms arrive already unfolded.** The GGUF stores ``1 + w`` where the HF
-  checkpoint stores ``w``. Verified against both: ``cos(gguf - 1, hf) ==
-  1.000000`` for every norm tensor. So ``unfold_unit_offset`` -- which names the
-  state the artifact holds, not a step -- costs nothing from this source and an
-  addition from safetensors.
+* **Norms arrive folded.** The GGUF stores ``1 + w`` where the HF checkpoint
+  stores ``w``; verified against both, ``cos(gguf - 1, hf) == 1.000000`` for
+  every norm tensor. The runtime reads these with ``unit_offset=true`` and
+  re-applies the one itself, so the artifact must hold ``w`` and the converter
+  subtracts from *this* source where it would pass safetensors through. Skipping
+  it yields a gain of ``2 + w`` with nothing raised.
 
 * **Q8_0 is our W8G32_F16S.** Both are int8 codes with one binary16 scale per
   32-group, so the row-algebra objects repack bit-exactly with no dequantize and
@@ -348,6 +349,21 @@ class _Gemma3Base(nn.Model):
     #: stack. The output head is added only by the variant that has one.
     _serve_objects_ = GEMMA3_MODEL_SERVE_OBJECTS
     _serve_blocks_ = {"sliding": Gemma3SlidingBlock, "full": Gemma3FullBlock}
+
+    @staticmethod
+    def _serve_block_schedule_(config: dict) -> list[str]:
+        """Which block each layer runs, for the artifact inventory.
+
+        The hybrid families alternate attention against a linear-attention mixer;
+        Gemma 3 alternates local against *global attention*. Same shape of
+        question, different axis, so the derivation lives here rather than as
+        another branch in the emitter.
+        """
+        return _parse_gemma3_layer_types(
+            config.get("layer_types"),
+            config["n_layers"],
+            config["sliding_window_pattern"],
+        )
 
     def _init(
         self,

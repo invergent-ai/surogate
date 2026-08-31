@@ -381,9 +381,11 @@ def test_gguf_carries_the_geometry_but_not_the_three_that_matter():
 def test_gguf_ships_the_head_and_the_norms_pre_unfolded():
     """316 tensors: the 314 of the safetensors checkpoint plus dense_2/dense_3.
 
-    The norms arrive as ``1 + w`` where the HF checkpoint stores ``w``, so
-    `unfold_unit_offset` is free from this source and an addition from the other.
-    Unfolding twice gives a gain of ``2 + w`` and is entirely quiet.
+    The norms arrive folded as ``1 + w`` where the HF checkpoint stores ``w``.
+    The runtime re-applies the offset itself (``unit_offset=true``), so the
+    artifact must hold ``w`` and the converter subtracts from *this* source where
+    it would pass safetensors through. Skipping the subtraction gives a gain of
+    ``2 + w``, raises nothing, and inverts retrieval at plausible similarities.
     """
     from gguf import GGUFReader
     from gguf.quants import dequantize
@@ -413,3 +415,95 @@ def test_gguf_ships_the_head_and_the_norms_pre_unfolded():
         unfolded = g - 1.0
         cos = float(unfolded @ h / (np.linalg.norm(unfolded) * np.linalg.norm(h)))
         assert cos == pytest.approx(1.0, abs=1e-6), (gguf_name, cos)
+
+
+# ---------------------------------------------------------------------------
+# The converter's source mapping, against the real GGUF
+# ---------------------------------------------------------------------------
+
+
+def generated_inventory():
+    import sys
+
+    sys.path.insert(0, str(Path("surogate/serve/tools/generate").resolve()))
+    emit_inventory = pytest.importorskip("emit_inventory")
+    return emit_inventory.inventory_for(
+        "Gemma3TextModel", EMBEDDINGGEMMA_CONFIG, capabilities={"text", "embedding"}
+    )
+
+
+def test_inventory_derives_from_the_declaration():
+    """267 = 1 embedding + 24 layers x 11 + final norm + head.
+
+    Nothing here is written down twice: the converter has no inventory module,
+    it asks the declaration.
+    """
+    inventory = generated_inventory()
+    assert len(inventory) == 1 + 24 * 11 + 1 + 1 == 267
+
+    by_name = {obj["name"]: obj for obj in inventory}
+    assert by_name["text/token_embedding"]["shape"] == (262144, 768)
+    assert by_name["text/layers/0/attention/query_key_value"]["shape"] == (1280, 768)
+    assert by_name["text/final_norm"]["shape"] == (768,)
+    # The two Dense modules composed into one square matrix.
+    assert by_name["text/embedding_head"]["shape"] == (768, 768)
+    assert by_name["text/embedding_head"]["transform"] == "compose_linear"
+
+
+@pytest.mark.skipif(not GGUF.exists(), reason="embeddinggemma-300M-Q8_0.gguf not downloaded")
+def test_every_object_maps_onto_gguf_tensors_of_the_right_shape():
+    """The mapping is only worth having if it closes over the real file.
+
+    Checks both directions: every artifact object resolves to tensors that exist
+    and whose rows sum to the declared shape, and every tensor in the GGUF is
+    consumed by some object. A source the recipe forgets is a weight silently
+    left behind.
+    """
+    from gguf import GGUFReader
+
+    from surogate.serve.tools.convert.gemma_embedding import gguf_names, source_for
+
+    reader = GGUFReader(str(GGUF))
+    # gguf-py reports ne as [k, n]; the logical shape is the reverse.
+    shapes = {t.name: tuple(int(d) for d in reversed(t.shape)) for t in reader.tensors}
+
+    consumed: set[str] = set()
+    for obj in generated_inventory():
+        names = gguf_names(obj["name"])
+        source = source_for(obj["name"])
+        for name in names:
+            assert name in shapes, f"{obj['name']} -> missing {name}"
+            consumed.add(name)
+
+        parts = [shapes[n] for n in names]
+        if source.op == "concat_rows":
+            rows = sum(p[0] for p in parts)
+            assert {p[1] for p in parts} == {obj["shape"][1]}, obj["name"]
+            assert (rows, parts[0][1]) == obj["shape"], obj["name"]
+        elif source.op == "compose_linear":
+            # (n, k) @ (k, m) -> (n, m); here [768,3072] @ [3072,768].
+            (n, k), (k2, m) = parts
+            assert k == k2, obj["name"]
+            assert (n, m) == obj["shape"], obj["name"]
+        else:
+            assert parts[0] == obj["shape"], (obj["name"], parts[0], obj["shape"])
+
+    assert sorted(set(shapes) - consumed) == [], "GGUF tensors no object consumes"
+
+
+@pytest.mark.skipif(not GGUF.exists(), reason="embeddinggemma-300M-Q8_0.gguf not downloaded")
+def test_only_the_norms_and_the_head_leave_the_quantised_path():
+    """Q8_0 is W8G32_F16S, so anything built by row algebra repacks bit-exactly.
+
+    The norms are F32 in the GGUF and must lose their folded one; the head has to
+    dequantize because a matrix product mixes k. That leaves five matrices per
+    layer — the Q/K/V fuse, the attention output and the three MLP projections —
+    plus the embedding table, all moving across untouched. 121 of 267 objects,
+    but very nearly all of the bytes.
+    """
+    from surogate.serve.tools.convert.gemma_embedding import source_for
+
+    repackable = [o["name"] for o in generated_inventory() if source_for(o["name"]).repackable]
+    assert len(repackable) == 1 + 24 * 5 == 121
+    assert "text/embedding_head" not in repackable
+    assert not any(name.endswith("_norm") for name in repackable)

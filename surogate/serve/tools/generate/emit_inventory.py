@@ -33,9 +33,12 @@ def geometry(config: dict[str, Any]) -> dict[str, int]:
     """
 
     hidden = config["d_model"]
-    heads_v = config["linear_num_value_heads"]
-    dim_v = config["linear_value_head_dim"]
-    key_dim = config["linear_num_key_heads"] * config["linear_key_head_dim"]
+    # Linear-attention quantities, on the same footing as the MoE ones below: a
+    # pure-attention declaration (Gemma 3, any encoder) simply has none of them,
+    # and every symbol they feed resolves to 0, which `emit` then skips.
+    heads_v = config.get("linear_num_value_heads", 0)
+    dim_v = config.get("linear_value_head_dim", 0)
+    key_dim = config.get("linear_num_key_heads", 0) * config.get("linear_key_head_dim", 0)
     value_dim = heads_v * dim_v
     conv_dim = 2 * key_dim + value_dim
     query_size = config["num_query_heads"] * config["head_size"]
@@ -57,6 +60,9 @@ def geometry(config: dict[str, Any]) -> dict[str, int]:
         "HeadDim": config["head_size"],
         "QuerySize": query_size,
         "AttnFusedRows": 2 * query_size + 2 * kv_size,
+        # No attention output gate: q, k and v stacked, nothing else.
+        "QKV": query_size + 2 * kv_size,
+        "AttnDim": query_size,
         "HcCount": config.get("hc_count", 0),
         "HcWidth": config.get("hc_count", 0) * hidden,
         "HcLowRank": config.get("hc_lowrank", 0),
@@ -64,7 +70,7 @@ def geometry(config: dict[str, Any]) -> dict[str, int]:
         "TwoHv": 2 * heads_v,
         "Vd": dim_v,
         "ValueDim": value_dim,
-        "ConvK": config["linear_conv_kernel_dim"],
+        "ConvK": config.get("linear_conv_kernel_dim", 0),
         "ConvDim": conv_dim,
         "GdnFusedRows": conv_dim + value_dim,
         "RouterRows": experts + 1,
@@ -152,7 +158,7 @@ def inventory_for(
             f"objects cannot have its artifact inventory derived"
         )
 
-    block_types = _block_types(config)
+    block_types = _block_types(config, model_class)
 
     out: list[dict[str, Any]] = []
 
@@ -211,7 +217,19 @@ def _layer_matches(marker: str, layer: int, config: dict[str, Any]) -> bool:
     raise ValueError(f"unknown layer-object marker {marker!r}")
 
 
-def _block_types(config: dict[str, Any]) -> list[str]:
+def _block_types(config: dict[str, Any], model_class: Any = None) -> list[str]:
+    """Which block runs at each layer, named as `_serve_blocks_` names them.
+
+    A model may declare the derivation itself via `_serve_block_schedule_`, which
+    is where it belongs: the hybrid families alternate attention against a
+    linear-attention mixer, but Gemma 3 alternates *local against global
+    attention*, a different axis with a different vocabulary. Without the hook
+    this function would accumulate one branch per family.
+    """
+    declared = getattr(model_class, "_serve_block_schedule_", None)
+    if declared is not None:
+        return list(declared(config))
+
     types = config.get("layer_types")
     if types:
         return ["attention" if t == "full_attention" else "mamba" for t in types]

@@ -123,20 +123,23 @@ _GEMMA3_GELU_MLP_CONFIG = MLPConfig(
 #: How a serving artifact stores one Gemma 3 block.
 #:
 #: Every norm carries ``unfold_unit_offset``. Gemma stores RMSNorm weights
-#: zero-centred and applies them as ``1 + w``; the transform names the state the
-#: *artifact* holds -- the gain already unfolded -- so the runtime reads it with
-#: ``rmsnorm(..., unit_offset=false)``.
+#: zero-centred as ``w`` and applies them as ``1 + w``; the runtime does the same,
+#: reading these with ``rmsnorm(..., unit_offset=true)``, so the artifact must
+#: hold the *unfolded* ``w``. The transform names that requirement.
 #:
-#: It names a state, not a step, and the work behind it depends on the source:
-#: an HF safetensors checkpoint stores ``w`` and the converter adds the one; a
-#: GGUF already stores ``1 + w`` and the converter does nothing. Measured on
-#: embeddinggemma-300M-Q8_0: ``cos(gguf - 1, hf) == 1.000000`` for every norm.
+#: What it costs depends on the source, and the GGUF is the expensive one:
+#: an HF safetensors checkpoint already stores ``w`` and passes through, while a
+#: GGUF stores the folded ``1 + w`` and the converter must subtract the one.
+#: Measured on embeddinggemma-300M-Q8_0, ``cos(gguf - 1, hf) == 1.000000`` for
+#: every norm tensor. qwen4exp's converter does exactly this subtraction for its
+#: query/key norms (``convert.py:268``).
 #:
-#: Getting this wrong is quiet and expensive in both directions. Unfold twice and
-#: the gain is ``2 + w``; pass ``unit_offset=true`` over an already-unfolded
-#: artifact and it is the same. That is exactly the live qwen3_6 indexer bug,
-#: where the converter left the GGUF's offset folded while the runtime added its
-#: own past 2,051 cached tokens.
+#: Forgetting it is quiet and expensive: the artifact holds ``1 + w``, the runtime
+#: makes it ``2 + w``, and nothing raises. That is the live qwen3_6 indexer bug,
+#: where the same omission on ``indexer.q_norm`` only bites past 2,051 cached
+#: tokens. Here it would bite everywhere -- loading GGUF norms unsubtracted drops
+#: pooled embeddings to cosine ~0 against the reference with retrieval inverted,
+#: at plausible-looking similarities around 0.7.
 _GEMMA3_SERVE_OBJECTS: tuple[ServeObject, ...] = (
     ServeObject("input_norm", "bf16", ("C",), ("ln1_weight",), transform="unfold_unit_offset"),
     ServeObject("post_attention_norm", "bf16", ("C",), ("ln_post_attn_weight",),
