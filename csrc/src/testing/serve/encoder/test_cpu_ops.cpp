@@ -79,13 +79,13 @@ int test_gemm(cpu::ThreadPool& pool) {
     return check("gemm [1152,768] x 37 tokens", out, want, 2e-5);
 }
 
-int test_rmsnorm() {
+int test_rmsnorm(cpu::ThreadPool& pool) {
     const std::int32_t rows = 768, tokens = 5;
     const std::vector<float> x = random_floats(static_cast<std::size_t>(rows) * tokens, 3, -3.F, 3.F);
     const std::vector<float> weight = random_floats(rows, 4, -0.5F, 0.5F);
     const float epsilon = 1e-6F;
     std::vector<float> out(x.size());
-    cpu::rmsnorm(x.data(), weight.data(), epsilon, /*unit_offset*/ true, out.data(), rows, tokens);
+    cpu::rmsnorm(x.data(), weight.data(), epsilon, true, out.data(), rows, tokens, pool);
 
     std::vector<double> want(x.size());
     for (std::int32_t t = 0; t < tokens; ++t) {
@@ -177,12 +177,12 @@ int test_mean_pool() {
     return check("mean_pool 2048 tokens", out, want, 1e-6);
 }
 
-int test_gelu_mul() {
+int test_gelu_mul(cpu::ThreadPool& pool) {
     const std::size_t count = 4097; // odd, so any pair-wise tail is exercised
     const auto gate = random_floats(count, 9, -6.F, 6.F);
     const auto up   = random_floats(count, 10, -3.F, 3.F);
     std::vector<float> out(count);
-    cpu::gelu_mul(gate.data(), up.data(), out.data(), static_cast<std::int64_t>(count));
+    cpu::gelu_mul(gate.data(), up.data(), out.data(), static_cast<std::int64_t>(count), pool);
 
     std::vector<double> want(count);
     for (std::size_t i = 0; i < count; ++i) {
@@ -224,10 +224,10 @@ int main() {
 
     int failures = 0;
     failures += test_gemm(pool);
-    failures += test_rmsnorm();
+    failures += test_rmsnorm(pool);
     failures += test_attention(pool);
     failures += test_mean_pool();
-    failures += test_gelu_mul();
+    failures += test_gelu_mul(pool);
     failures += test_l2norm();
 
     if (failures != 0) {

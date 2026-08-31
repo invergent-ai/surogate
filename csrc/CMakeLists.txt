@@ -1208,6 +1208,14 @@ set_source_files_properties(
   ${SERVE_ROOT}/ops/sparse_moe/marlin/marlin_moe_kernels_generated.cu
   PROPERTIES COMPILE_OPTIONS
   "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;-static-global-template-stub=false>")
+# Vendor-tuned CPU GEMM, optional and injected by path. Both live outside the
+# tree as reference checkouts rather than vendored dependencies, so a build with
+# neither must still work -- the encoder's own AVX-512 microkernel is always
+# there. Which one a *run* uses is decided from the CPU vendor at runtime, not
+# here: a binary built on one machine has to choose sensibly on another.
+set(SINFER_ZENDNN_DIR "" CACHE PATH "ZenDNN install prefix (AMD Zen)")
+set(SINFER_ONEDNN_DIR "" CACHE PATH "oneDNN install prefix (Intel; what OpenVINO's CPU plugin uses)")
+
 add_library(sinfer_encoder STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/encoder/gemma_embedding.cpp
   ${SERVE_ROOT}/encoder/gemma_tokenizer.cpp
@@ -1218,6 +1226,36 @@ sinfer_internal_includes(sinfer_encoder)
 target_include_directories(sinfer_encoder PRIVATE ${sentencepiece_SOURCE_DIR}/src)
 target_link_libraries(sinfer_encoder PUBLIC sinfer_core sinfer_ops sinfer_artifact
                                      PRIVATE sentencepiece-static)
+if(SINFER_ZENDNN_DIR)
+  target_compile_definitions(sinfer_encoder PRIVATE SINFER_WITH_ZENDNN)
+  # ZenDNN's public header includes aocl-utils for cache/CPU identification, so
+  # that dependency's headers and library come along with it.
+  # ZenDNN's public headers reach into its own dependencies -- aocl-utils for
+  # CPU identification, AOCL-DLP for the BLAS backend -- so their include
+  # directories travel with it.
+  target_include_directories(sinfer_encoder PRIVATE
+    ${SINFER_ZENDNN_DIR}/include
+    ${SINFER_ZENDNN_DIR}/../deps/aoclutils/include
+    ${SINFER_ZENDNN_DIR}/../deps/aocldlp/include
+    ${SINFER_ZENDNN_DIR}/../deps/onednn/include)
+  target_link_libraries(sinfer_encoder PRIVATE ${SINFER_ZENDNN_DIR}/lib/libzendnnl_archive.a)
+  foreach(extra aoclutils/lib/libaoclutils.a aocldlp/lib/libaocl-dlp.a onednn/lib/libdnnl.a)
+    if(EXISTS ${SINFER_ZENDNN_DIR}/../deps/${extra})
+      target_link_libraries(sinfer_encoder PRIVATE ${SINFER_ZENDNN_DIR}/../deps/${extra})
+    endif()
+  endforeach()
+  message(STATUS "CPU encoder: ZenDNN at ${SINFER_ZENDNN_DIR}")
+endif()
+if(SINFER_ONEDNN_DIR)
+  # oneDNN's own threading runtime is OpenMP, so its symbols come with it. That
+  # is the whole of its integration: one header directory, one archive and this.
+  find_package(OpenMP REQUIRED)
+  target_compile_definitions(sinfer_encoder PRIVATE SINFER_WITH_ONEDNN)
+  target_include_directories(sinfer_encoder PRIVATE ${SINFER_ONEDNN_DIR}/include)
+  target_link_libraries(sinfer_encoder PRIVATE ${SINFER_ONEDNN_DIR}/lib/libdnnl.a
+                                               OpenMP::OpenMP_CXX)
+  message(STATUS "CPU encoder: oneDNN at ${SINFER_ONEDNN_DIR}")
+endif()
 
 sinfer_internal_includes(sinfer_ops)
 # surogate vendor patch (PATCHES.md #25): cutlass headers for the sm_120a

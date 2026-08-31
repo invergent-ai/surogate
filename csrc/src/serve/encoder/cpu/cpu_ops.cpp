@@ -1,5 +1,12 @@
 #include "encoder/cpu/cpu_ops.h"
 
+#if defined(SINFER_WITH_ZENDNN)
+#include <zendnnl.hpp>
+#endif
+#if defined(SINFER_WITH_ONEDNN)
+#include <oneapi/dnnl/dnnl.hpp>
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -13,6 +20,7 @@
 #include <thread>
 #include <limits>
 #include <stdexcept>
+#include <cstdlib>
 #include <unordered_set>
 
 #if defined(__x86_64__)
@@ -330,8 +338,154 @@ void ThreadPool::parallel_for(std::int64_t count,
 
 // --- kernels ----------------------------------------------------------------
 
+#if defined(SINFER_WITH_ZENDNN)
+namespace {
+
+/// out[n, tokens] = w[n, k] . w x[k, tokens], through AMD's tuned kernels.
+///
+/// The shapes line up without a copy. Activations and outputs are
+/// [rows, tokens] with rows contiguous, which reads as row-major
+/// [tokens, rows]; so C[tokens, n] = x[tokens, k] * w[n, k]^T is the call, and
+/// `transB` takes the weight exactly as the artifact stores it.
+/// `is_weights_const` lets the library prepack a weight once and keep the
+/// packing -- something an inference workload can promise and a training one
+/// cannot.
+bool gemm_zendnn(const float* w, const float* x, float* out, std::int32_t n, std::int32_t k,
+                 std::int32_t tokens, int threads) {
+    using namespace zendnnl::lowoha::matmul;
+    matmul_data_types dtypes;
+    dtypes.src     = zendnnl::data_type_t::f32;
+    dtypes.wei     = zendnnl::data_type_t::f32;
+    dtypes.dst     = zendnnl::data_type_t::f32;
+    dtypes.bias    = zendnnl::data_type_t::none;
+    dtypes.compute = zendnnl::data_type_t::none;
+
+    matmul_params params;
+    params.dtypes      = dtypes;
+    params.num_threads = threads;
+
+    matmul_batch_params_t batch;
+    batch.Batch_A = 1;
+    batch.Batch_B = 1;
+
+    const auto status = matmul_direct('r', /*transA*/ false, /*transB*/ true, tokens, n, k, 1.0F,
+                                      x, k, w, k, nullptr, 0.0F, out, n,
+                                      /*is_weights_const*/ true, batch, params);
+    return status == zendnnl::status_t::success;
+}
+
+} // namespace
+#endif
+
+
+#if defined(SINFER_WITH_ONEDNN)
+namespace {
+
+/// The same product through oneDNN, which is what Intel's stack -- OpenVINO's
+/// CPU plugin included -- runs underneath.
+///
+/// oneDNN caches primitives internally, so the descriptor work here is paid
+/// once per distinct shape rather than per call. The weight is described as
+/// [n, k] with an `ab` (row-major) layout and the product asks for its
+/// transpose by giving the destination `[tokens, n]`, exactly as the ZenDNN
+/// path does.
+bool gemm_onednn(const float* w, const float* x, float* out, std::int32_t n, std::int32_t k,
+                 std::int32_t tokens) {
+    using namespace dnnl;
+    static engine cpu_engine(engine::kind::cpu, 0);
+    static stream cpu_stream(cpu_engine);
+
+    const memory::dims src_dims{tokens, k};
+    const memory::dims weight_dims{k, n};
+    const memory::dims dst_dims{tokens, n};
+
+    // `ba` on the weight is the transpose: the buffer is [n, k] row-major, which
+    // is [k, n] with the strides swapped. No copy.
+    const memory::desc src_md(src_dims, memory::data_type::f32, memory::format_tag::ab);
+    const memory::desc weight_md(weight_dims, memory::data_type::f32, memory::format_tag::ba);
+    const memory::desc dst_md(dst_dims, memory::data_type::f32, memory::format_tag::ab);
+
+    const matmul::primitive_desc pd(cpu_engine, src_md, weight_md, dst_md);
+    const matmul primitive(pd);
+
+    memory src_mem(src_md, cpu_engine, const_cast<float*>(x));
+    memory weight_mem(weight_md, cpu_engine, const_cast<float*>(w));
+    memory dst_mem(dst_md, cpu_engine, out);
+
+    primitive.execute(cpu_stream, {{DNNL_ARG_SRC, src_mem},
+                                   {DNNL_ARG_WEIGHTS, weight_mem},
+                                   {DNNL_ARG_DST, dst_mem}});
+    cpu_stream.wait();
+    return true;
+}
+
+} // namespace
+#endif
+
+GemmBackend gemm_backend() {
+    static const GemmBackend chosen = [] {
+        // An override, so either vendor path can be exercised on whatever
+        // machine is to hand -- correctness does not depend on running the
+        // matching silicon, and being unable to test the other vendor's path is
+        // how it rots.
+        if (const char* forced = std::getenv("SINFER_CPU_GEMM")) {
+            const std::string name(forced);
+#if defined(SINFER_WITH_ZENDNN)
+            if (name == "zendnn") { return GemmBackend::ZenDnn; }
+#endif
+#if defined(SINFER_WITH_ONEDNN)
+            if (name == "onednn") { return GemmBackend::OneDnn; }
+#endif
+            if (name == "builtin") { return GemmBackend::Builtin; }
+        }
+#if defined(__x86_64__)
+        __builtin_cpu_init();
+#if defined(SINFER_WITH_ZENDNN)
+        if (__builtin_cpu_is("amd")) { return GemmBackend::ZenDnn; }
+#endif
+#if defined(SINFER_WITH_ONEDNN)
+        // Intel, and anything not recognised as AMD: oneDNN is what Intel's own
+        // stack runs underneath, OpenVINO's CPU plugin included.
+        return GemmBackend::OneDnn;
+#endif
+#endif
+        return GemmBackend::Builtin;
+    }();
+    return chosen;
+}
+
+const char* gemm_backend_name() {
+    switch (gemm_backend()) {
+    case GemmBackend::ZenDnn:
+        return "zendnn";
+    case GemmBackend::OneDnn:
+        return "onednn";
+    case GemmBackend::Builtin:
+        break;
+    }
+    return "builtin-avx512";
+}
+
+
 void gemm(const float* w, const float* x, float* out, std::int32_t n, std::int32_t k,
           std::int32_t tokens, ThreadPool& pool) {
+    // A vendor backend that declines a shape falls through to the builtin, so a
+    // build with one is never *less* capable than a build without.
+    switch (gemm_backend()) {
+    case GemmBackend::ZenDnn:
+#if defined(SINFER_WITH_ZENDNN)
+        if (gemm_zendnn(w, x, out, n, k, tokens, pool.threads())) { return; }
+#endif
+        break;
+    case GemmBackend::OneDnn:
+#if defined(SINFER_WITH_ONEDNN)
+        if (gemm_onednn(w, x, out, n, k, tokens)) { return; }
+#endif
+        break;
+    case GemmBackend::Builtin:
+        break;
+    }
+
     // One barrier for the whole GEMM: partition the output rows once, and let
     // each thread walk its own rows against every token. An earlier version
     // tiled tokens in an outer loop and paid a barrier per tile -- 1,512 of them
@@ -390,38 +544,65 @@ void embed(const float* table, const std::int32_t* ids, float* out, std::int32_t
 }
 
 void rmsnorm(const float* x, const float* weight, float epsilon, bool unit_offset, float* out,
-             std::int32_t rows, std::int32_t tokens) {
-    for (std::int32_t t = 0; t < tokens; ++t) {
-        const float* column = x + static_cast<std::int64_t>(t) * rows;
-        float* target       = out + static_cast<std::int64_t>(t) * rows;
-        double squares      = 0.0;
-        for (std::int32_t i = 0; i < rows; ++i) { squares += static_cast<double>(column[i]) * column[i]; }
-        const float inverse =
-            static_cast<float>(1.0 / std::sqrt(squares / static_cast<double>(rows) + epsilon));
-        for (std::int32_t i = 0; i < rows; ++i) {
-            const float gain = unit_offset ? 1.0F + weight[i] : weight[i];
-            target[i]        = column[i] * inverse * gain;
+             std::int32_t rows, std::int32_t tokens, ThreadPool& pool) {
+    // Every token's row is independent, and there are enough of them to be worth
+    // spreading: at 543 tokens this ran serially and cost more than the GEMM it
+    // feeds.
+    pool.parallel_for(tokens, [&](std::int64_t begin, std::int64_t end) {
+        for (std::int64_t t = begin; t < end; ++t) {
+            const float* column = x + t * rows;
+            float* target       = out + t * rows;
+            double squares      = 0.0;
+            for (std::int32_t i = 0; i < rows; ++i) {
+                squares += static_cast<double>(column[i]) * column[i];
+            }
+            const float inverse =
+                static_cast<float>(1.0 / std::sqrt(squares / static_cast<double>(rows) + epsilon));
+            for (std::int32_t i = 0; i < rows; ++i) {
+                const float gain = unit_offset ? 1.0F + weight[i] : weight[i];
+                target[i]        = column[i] * inverse * gain;
+            }
+        }
+    });
+}
+
+RopeTable::RopeTable(std::int32_t head_dim, std::int32_t max_tokens, float theta)
+    : half_(head_dim / 2),
+      cos_(static_cast<std::size_t>(max_tokens) * (head_dim / 2)),
+      sin_(static_cast<std::size_t>(max_tokens) * (head_dim / 2)) {
+    for (std::int32_t position = 0; position < max_tokens; ++position) {
+        for (std::int32_t i = 0; i < half_; ++i) {
+            const double inverse =
+                std::pow(static_cast<double>(theta),
+                         -2.0 * static_cast<double>(i) / static_cast<double>(head_dim));
+            const double angle = static_cast<double>(position) * inverse;
+            const std::size_t at = static_cast<std::size_t>(position) * half_ + i;
+            cos_[at] = static_cast<float>(std::cos(angle));
+            sin_[at] = static_cast<float>(std::sin(angle));
         }
     }
 }
 
+const float* RopeTable::cosines(std::int32_t position) const noexcept {
+    return cos_.data() + static_cast<std::size_t>(position) * half_;
+}
+const float* RopeTable::sines(std::int32_t position) const noexcept {
+    return sin_.data() + static_cast<std::size_t>(position) * half_;
+}
+
 void rope(float* x, const std::int32_t* positions, std::int32_t head_dim, std::int32_t heads,
-          std::int32_t tokens, float theta) {
+          std::int32_t tokens, const RopeTable& table) {
     const std::int32_t half = head_dim / 2;
     for (std::int32_t t = 0; t < tokens; ++t) {
-        const auto position = static_cast<float>(positions[t]);
+        const float* cosines = table.cosines(positions[t]);
+        const float* sines   = table.sines(positions[t]);
         for (std::int32_t head = 0; head < heads; ++head) {
             float* row = x + (static_cast<std::int64_t>(t) * heads + head) * head_dim;
             for (std::int32_t i = 0; i < half; ++i) {
-                const float frequency =
-                    position * std::pow(theta, -2.0F * static_cast<float>(i) /
-                                                   static_cast<float>(head_dim));
-                const float cosine = std::cos(frequency);
-                const float sine   = std::sin(frequency);
-                const float lo     = row[i];
-                const float hi     = row[i + half];
-                row[i]             = lo * cosine - hi * sine;
-                row[i + half]      = hi * cosine + lo * sine;
+                const float lo = row[i];
+                const float hi = row[i + half];
+                row[i]         = lo * cosines[i] - hi * sines[i];
+                row[i + half]  = hi * cosines[i] + lo * sines[i];
             }
         }
     }
@@ -485,12 +666,19 @@ void attention(const float* q, const float* k, const float* v, float* out, std::
     });
 }
 
-void gelu_mul(const float* gate, const float* up, float* out, std::int64_t count) {
-    for (std::int64_t i = 0; i < count; ++i) { out[i] = gelu_tanh(gate[i]) * up[i]; }
+void gelu_mul(const float* gate, const float* up, float* out, std::int64_t count,
+              ThreadPool& pool) {
+    // A tanh per element, and at 543 tokens that is 15 million of them per
+    // forward. Serially this was the largest single cost after the projections.
+    pool.parallel_for(count, [&](std::int64_t begin, std::int64_t end) {
+        for (std::int64_t i = begin; i < end; ++i) { out[i] = gelu_tanh(gate[i]) * up[i]; }
+    });
 }
 
-void add(const float* y, float* x, std::int64_t count) {
-    for (std::int64_t i = 0; i < count; ++i) { x[i] += y[i]; }
+void add(const float* y, float* x, std::int64_t count, ThreadPool& pool) {
+    pool.parallel_for(count, [&](std::int64_t begin, std::int64_t end) {
+        for (std::int64_t i = begin; i < end; ++i) { x[i] += y[i]; }
+    });
 }
 
 void scale(float* x, float factor, std::int64_t count) {

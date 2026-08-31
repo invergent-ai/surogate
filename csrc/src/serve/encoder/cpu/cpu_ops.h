@@ -67,6 +67,25 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+/// Which GEMM implementation a call will use.
+///
+/// Chosen from the CPU vendor at runtime, not from the build host: a binary
+/// built on one machine has to make a sensible choice on another. Each
+/// vendor-tuned option is compiled in only when its library was injected at
+/// configure time, and `Builtin` is always present, so a build with neither
+/// still runs everywhere.
+enum class GemmBackend {
+    Builtin,  ///< The AVX-512 microkernel in this file; portable, always available.
+    ZenDnn,   ///< AMD Zen. AMD's own library for this silicon.
+    OneDnn,   ///< Intel. What OpenVINO's CPU plugin runs underneath.
+};
+
+/// The backend this process will use, decided once.
+[[nodiscard]] GemmBackend gemm_backend();
+
+/// Its name, for logs and benchmark labels.
+[[nodiscard]] const char* gemm_backend_name();
+
 // --- the kernels ------------------------------------------------------------
 //
 // Activations are [rows, tokens] with rows contiguous, matching the GPU path,
@@ -83,11 +102,31 @@ void embed(const float* table, const std::int32_t* ids, float* out, std::int32_t
 /// RMSNorm over the fastest axis. `unit_offset` applies gain = 1 + weight,
 /// which is Gemma's zero-centred convention.
 void rmsnorm(const float* x, const float* weight, float epsilon, bool unit_offset, float* out,
-             std::int32_t rows, std::int32_t tokens);
+             std::int32_t rows, std::int32_t tokens, ThreadPool& pool);
+
+/// Precomputed rotation angles for one rope base.
+///
+/// The angles depend only on (position, pair, theta), never on the data, so
+/// they are built once and indexed. Computing them inline costs a `pow`, a
+/// `sin` and a `cos` per pair per token per head -- about 6.7 million
+/// transcendentals per forward at 543 tokens, which measured as the single
+/// largest cost in the whole encoder, larger than every GEMM combined.
+class RopeTable {
+public:
+    RopeTable() = default;
+    RopeTable(std::int32_t head_dim, std::int32_t max_tokens, float theta);
+
+    [[nodiscard]] const float* cosines(std::int32_t position) const noexcept;
+    [[nodiscard]] const float* sines(std::int32_t position) const noexcept;
+
+private:
+    std::int32_t half_ = 0;
+    std::vector<float> cos_, sin_;
+};
 
 /// Rotates [0, head_dim) of every head in place, positions[t] per column.
 void rope(float* x, const std::int32_t* positions, std::int32_t head_dim, std::int32_t heads,
-          std::int32_t tokens, float theta);
+          std::int32_t tokens, const RopeTable& table);
 
 /// Non-causal GQA over one sequence. `window` 0 admits every key; positive W
 /// admits abs(i - j) < W, symmetric -- what a window means once attention is
@@ -97,10 +136,11 @@ void attention(const float* q, const float* k, const float* v, float* out, std::
                float* scratch, ThreadPool& pool);
 
 /// out = gelu_tanh(gate) * up, elementwise.
-void gelu_mul(const float* gate, const float* up, float* out, std::int64_t count);
+void gelu_mul(const float* gate, const float* up, float* out, std::int64_t count,
+              ThreadPool& pool);
 
 /// x += y, elementwise.
-void add(const float* y, float* x, std::int64_t count);
+void add(const float* y, float* x, std::int64_t count, ThreadPool& pool);
 
 /// x *= factor, elementwise.
 void scale(float* x, float factor, std::int64_t count);

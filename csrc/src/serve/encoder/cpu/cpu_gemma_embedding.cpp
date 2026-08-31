@@ -117,6 +117,7 @@ struct CpuGemmaEmbedding::Impl {
     std::unique_ptr<GemmaTokenizer> tokenizer;
 
     std::vector<float> token_embedding, final_norm, embedding_head;
+    RopeTable rope_global, rope_local;
     std::vector<LayerWeights> layers;
     std::uint64_t bytes = 0;
 };
@@ -178,6 +179,10 @@ CpuGemmaEmbedding CpuGemmaEmbedding::load(const std::filesystem::path& path, Thr
         w.up     = matrix("mlp/up", config.intermediate, config.hidden);
         w.down   = matrix("mlp/down", config.hidden, config.intermediate);
     }
+
+    // Two bases, two tables, built once: the angles never depend on the data.
+    impl.rope_global = RopeTable(config.head_dim, config.max_tokens, config.rope_theta_global);
+    impl.rope_local  = RopeTable(config.head_dim, config.max_tokens, config.rope_theta_local);
 
     const auto tokenizer_bytes = reader.payload("frontend/tokenizer.model").data;
     impl.tokenizer =
@@ -247,11 +252,11 @@ std::vector<std::vector<float>> CpuGemmaEmbedding::embed_batch(
         for (std::int32_t layer = 0; layer < config.layers; ++layer) {
             const LayerWeights& w     = impl.layers[static_cast<std::size_t>(layer)];
             const bool global         = config.is_global(layer);
-            const float theta         = global ? config.rope_theta_global : config.rope_theta_local;
+            const RopeTable& angles   = global ? impl.rope_global : impl.rope_local;
             const std::int32_t window = global ? 0 : config.sliding_window;
 
             rmsnorm(x.data(), w.input_norm.data(), config.rms_epsilon, true, h.data(),
-                    config.hidden, tokens);
+                    config.hidden, tokens, *impl.pool);
             gemm(w.query.data(), h.data(), query.data(), config.query_size(), config.hidden,
                  tokens, *impl.pool);
             gemm(w.key.data(), h.data(), key.data(), config.head_dim, config.hidden, tokens,
@@ -262,13 +267,13 @@ std::vector<std::vector<float>> CpuGemmaEmbedding::embed_batch(
             // Per-head QK norm: heads are contiguous within a column, so the
             // whole buffer is heads * tokens rows of head_dim.
             rmsnorm(query.data(), w.query_norm.data(), config.rms_epsilon, true, query.data(),
-                    config.head_dim, config.query_heads * tokens);
+                    config.head_dim, config.query_heads * tokens, *impl.pool);
             rmsnorm(key.data(), w.key_norm.data(), config.rms_epsilon, true, key.data(),
-                    config.head_dim, tokens);
+                    config.head_dim, tokens, *impl.pool);
 
             rope(query.data(), positions.data(), config.head_dim, config.query_heads, tokens,
-                 theta);
-            rope(key.data(), positions.data(), config.head_dim, 1, tokens, theta);
+                 angles);
+            rope(key.data(), positions.data(), config.head_dim, 1, tokens, angles);
 
             attention(query.data(), key.data(), value.data(), attn_out.data(), config.query_heads,
                       config.head_dim, tokens, window, config.attention_scale, scratch.data(),
@@ -277,25 +282,26 @@ std::vector<std::vector<float>> CpuGemmaEmbedding::embed_batch(
             gemm(w.output.data(), attn_out.data(), attn.data(), config.hidden,
                  config.query_size(), tokens, *impl.pool);
             rmsnorm(attn.data(), w.post_attention_norm.data(), config.rms_epsilon, true,
-                    attn.data(), config.hidden, tokens);
-            add(attn.data(), x.data(), static_cast<std::int64_t>(x.size()));
+                    attn.data(), config.hidden, tokens, *impl.pool);
+            add(attn.data(), x.data(), static_cast<std::int64_t>(x.size()), *impl.pool);
 
             rmsnorm(x.data(), w.pre_feedforward_norm.data(), config.rms_epsilon, true, h.data(),
-                    config.hidden, tokens);
+                    config.hidden, tokens, *impl.pool);
             gemm(w.gate.data(), h.data(), gate.data(), config.intermediate, config.hidden, tokens,
                  *impl.pool);
             gemm(w.up.data(), h.data(), up.data(), config.intermediate, config.hidden, tokens,
                  *impl.pool);
-            gelu_mul(gate.data(), up.data(), gate.data(), static_cast<std::int64_t>(gate.size()));
+            gelu_mul(gate.data(), up.data(), gate.data(), static_cast<std::int64_t>(gate.size()),
+                     *impl.pool);
             gemm(w.down.data(), gate.data(), attn.data(), config.hidden, config.intermediate,
                  tokens, *impl.pool);
             rmsnorm(attn.data(), w.post_feedforward_norm.data(), config.rms_epsilon, true,
-                    attn.data(), config.hidden, tokens);
-            add(attn.data(), x.data(), static_cast<std::int64_t>(x.size()));
+                    attn.data(), config.hidden, tokens, *impl.pool);
+            add(attn.data(), x.data(), static_cast<std::int64_t>(x.size()), *impl.pool);
         }
 
         rmsnorm(x.data(), impl.final_norm.data(), config.rms_epsilon, true, h.data(),
-                config.hidden, tokens);
+                config.hidden, tokens, *impl.pool);
 
         std::vector<float> pooled(hidden);
         mean_pool(h.data(), pooled.data(), config.hidden, tokens);
