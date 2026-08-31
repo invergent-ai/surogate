@@ -82,11 +82,41 @@ def load_resources(
     resources: list[ResourcePayload] = []
     for spec in resource_specs:
         filename = spec.name.removeprefix("frontend/")
-        data = (root / filename).read_bytes()
+        path = root / filename
+        if not path.exists() and filename == "generation_config.json":
+            data = _synthesize_generation_config(root)
+        else:
+            data = path.read_bytes()
         if not data:
             raise ValueError(f"frontend resource {filename} is empty")
         resources.append(ResourcePayload(spec.name, data))
     return tuple(resources)
+
+
+def _synthesize_generation_config(root: Path) -> bytes:
+    """A generation config for checkpoints that publish none.
+
+    Not every model in this family ships `generation_config.json` — `Qwen/Qwen3.5-0.8B`
+    and `Qwen3.5-9B` do not, and the hub returns 404 for it — but the engine requires
+    one and reads `eos_token_id` out of it to seed its default stop tokens. That field
+    is not missing information: it is in `config.json`, which every checkpoint has. So
+    the converter carries it across rather than refusing a checkpoint for a file the
+    publisher chose not to write.
+    """
+
+    config = json.loads((root / "config.json").read_text())
+    text = config.get("text_config", config)
+    generation: dict[str, object] = {}
+    for key in ("eos_token_id", "bos_token_id", "pad_token_id"):
+        value = text.get(key, config.get(key))
+        if value is not None:
+            generation[key] = value
+    if "eos_token_id" not in generation:
+        raise ValueError(
+            "cannot synthesize generation_config.json: config.json declares no eos_token_id, "
+            "and the engine needs one to seed its default stop tokens"
+        )
+    return json.dumps(generation, indent=2).encode()
 
 
 def build_object_plan(
