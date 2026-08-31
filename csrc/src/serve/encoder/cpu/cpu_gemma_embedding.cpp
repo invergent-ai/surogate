@@ -175,6 +175,15 @@ struct CpuGemmaEmbedding::Impl {
 
     std::vector<std::uint16_t> token_embedding, embedding_head;
     std::vector<float> final_norm;
+
+    // Forward scratch, sized once for max_tokens and reused: allocating these
+    // per call meant page-faulting ~15 MB per forward, which measured as most
+    // of the ~28 ms the phase profile could not see.
+    struct Scratch {
+        std::vector<float> x, h, attn, query, key, value, attn_out, gate, up, scores;
+        std::vector<std::uint16_t> h16, wide16, q16, k16, v16;
+        std::vector<std::int32_t> positions;
+    } scratch;
     RopeTable rope_global, rope_local;
     std::vector<LayerWeights> layers;
     std::uint64_t bytes = 0;
@@ -247,6 +256,32 @@ CpuGemmaEmbedding CpuGemmaEmbedding::load(const std::filesystem::path& path, Thr
     impl.tokenizer =
         std::make_unique<GemmaTokenizer>(GemmaTokenizer::from_serialized_proto(tokenizer_bytes));
 
+    {
+        // Touch every scratch page now rather than during the first request.
+        const auto span         = static_cast<std::size_t>(config.max_tokens);
+        const auto hidden       = static_cast<std::size_t>(config.hidden);
+        const auto query_size   = static_cast<std::size_t>(config.query_size());
+        const auto head_dim     = static_cast<std::size_t>(config.head_dim);
+        const auto intermediate = static_cast<std::size_t>(config.intermediate);
+        Impl::Scratch& scratch  = impl.scratch;
+        scratch.x.assign(hidden * span, 0.0F);
+        scratch.h.assign(hidden * span, 0.0F);
+        scratch.attn.assign(hidden * span, 0.0F);
+        scratch.query.assign(query_size * span, 0.0F);
+        scratch.key.assign(head_dim * span, 0.0F);
+        scratch.value.assign(head_dim * span, 0.0F);
+        scratch.attn_out.assign(query_size * span, 0.0F);
+        scratch.gate.assign(intermediate * span, 0.0F);
+        scratch.up.assign(intermediate * span, 0.0F);
+        scratch.scores.assign(attention_scratch(config.query_heads, config.max_tokens), 0.0F);
+        scratch.h16.assign(hidden * span, 0);
+        scratch.wide16.assign(std::max(query_size, intermediate) * span, 0);
+        scratch.q16.assign(query_size * span, 0);
+        scratch.k16.assign(head_dim * span, 0);
+        scratch.v16.assign(head_dim * span, 0);
+        scratch.positions.assign(span, 0);
+    }
+
     impl.bytes = static_cast<std::uint64_t>(impl.token_embedding.size() +
                                             impl.embedding_head.size()) *
                      sizeof(std::uint16_t) +
@@ -294,26 +329,21 @@ std::vector<std::vector<float>> CpuGemmaEmbedding::embed_batch(
         const auto query_size   = static_cast<std::size_t>(config.query_size());
         const auto head_dim     = static_cast<std::size_t>(config.head_dim);
         const auto intermediate = static_cast<std::size_t>(config.intermediate);
-        const auto span         = static_cast<std::size_t>(tokens);
 
-        std::vector<std::int32_t> positions(span);
+        const auto span   = static_cast<std::size_t>(tokens);
+        Impl::Scratch& sc = impl.scratch;
+        auto& positions   = sc.positions;
         for (std::int32_t i = 0; i < tokens; ++i) { positions[static_cast<std::size_t>(i)] = i; }
-
-        std::vector<float> x(hidden * span), h(hidden * span), attn(hidden * span);
-        // BF16 mirrors of whatever feeds a GEMM next: the conversion is one
-        // parallel pass, and it buys the 2x BF16xBF16 kernel.
-        std::vector<std::uint16_t> h16(hidden * span);
-        std::vector<std::uint16_t> wide16(std::max(query_size, intermediate) * span);
-        std::vector<float> query(query_size * span), key(head_dim * span), value(head_dim * span);
-        std::vector<float> attn_out(query_size * span);
-        std::vector<float> gate(intermediate * span), up(intermediate * span);
-        std::vector<float> scratch(attention_scratch(config.query_heads, tokens));
+        auto &x = sc.x, &h = sc.h, &attn = sc.attn, &query = sc.query, &key = sc.key,
+             &value = sc.value, &attn_out = sc.attn_out, &gate = sc.gate, &up = sc.up;
+        auto &h16 = sc.h16, &wide16 = sc.wide16, &q16 = sc.q16, &k16 = sc.k16, &v16 = sc.v16;
+        auto& scratch = sc.scores;
         Profile profile;
 
         // Qualified: the member `embed` would otherwise shadow the kernel.
         cpu::embed(impl.token_embedding.data(), sequence.data(), x.data(), config.hidden, tokens,
                    config.vocab);
-        scale(x.data(), config.embedding_scale, static_cast<std::int64_t>(x.size()));
+        scale(x.data(), config.embedding_scale, static_cast<std::int64_t>(hidden * span));
 
         for (std::int32_t layer = 0; layer < config.layers; ++layer) {
             const LayerWeights& w     = impl.layers[static_cast<std::size_t>(layer)];
@@ -349,7 +379,12 @@ std::vector<std::vector<float>> CpuGemmaEmbedding::embed_batch(
             profile.end("qknorm+rope");
             profile.begin();
 
-            attention(query.data(), key.data(), value.data(), attn_out.data(), config.query_heads,
+            narrow(query.data(), q16.data(), static_cast<std::int64_t>(query_size * span),
+                   *impl.pool);
+            narrow(key.data(), k16.data(), static_cast<std::int64_t>(head_dim * span), *impl.pool);
+            narrow(value.data(), v16.data(), static_cast<std::int64_t>(head_dim * span),
+                   *impl.pool);
+            attention(q16.data(), k16.data(), v16.data(), attn_out.data(), config.query_heads,
                       config.head_dim, tokens, window, config.attention_scale, scratch.data(),
                       *impl.pool);
             profile.end("attention");
@@ -361,7 +396,7 @@ std::vector<std::vector<float>> CpuGemmaEmbedding::embed_batch(
                  config.query_size(), tokens, *impl.pool);
             rmsnorm(attn.data(), w.post_attention_norm.data(), config.rms_epsilon, true,
                     attn.data(), config.hidden, tokens, *impl.pool);
-            add(attn.data(), x.data(), static_cast<std::int64_t>(x.size()), *impl.pool);
+            add(attn.data(), x.data(), static_cast<std::int64_t>(hidden * span), *impl.pool);
 
             rmsnorm(x.data(), w.pre_feedforward_norm.data(), config.rms_epsilon, true, h.data(),
                     config.hidden, tokens, *impl.pool);
@@ -377,7 +412,7 @@ std::vector<std::vector<float>> CpuGemmaEmbedding::embed_batch(
                 gemm(w.gate.data(), h16.data(), gate.data(), config.intermediate, config.hidden,
                      tokens, *impl.pool);
                 gelu_mul(gate.data(), up.data(), gate.data(),
-                         static_cast<std::int64_t>(gate.size()), *impl.pool);
+                         static_cast<std::int64_t>(intermediate * span), *impl.pool);
             }
             profile.end("mlp_act");
             profile.begin();
@@ -387,7 +422,7 @@ std::vector<std::vector<float>> CpuGemmaEmbedding::embed_batch(
                  tokens, *impl.pool);
             rmsnorm(attn.data(), w.post_feedforward_norm.data(), config.rms_epsilon, true,
                     attn.data(), config.hidden, tokens, *impl.pool);
-            add(attn.data(), x.data(), static_cast<std::int64_t>(x.size()), *impl.pool);
+            add(attn.data(), x.data(), static_cast<std::int64_t>(hidden * span), *impl.pool);
             profile.end("gemm");
         }
 

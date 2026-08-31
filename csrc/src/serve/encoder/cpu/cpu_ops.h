@@ -141,9 +141,11 @@ void rope(float* x, const std::int32_t* positions, std::int32_t head_dim, std::i
 /// Non-causal GQA over one sequence. `window` 0 admits every key; positive W
 /// admits abs(i - j) < W, symmetric -- what a window means once attention is
 /// bidirectional.
-void attention(const float* q, const float* k, const float* v, float* out, std::int32_t q_heads,
-               std::int32_t head_dim, std::int32_t tokens, std::int32_t window, float scale,
-               float* scratch, ThreadPool& pool);
+/// Q, K and V arrive BF16 -- narrowed once after rope -- so both products run
+/// the same BF16 x BF16 kernel the projections use. Scores and output stay FP32.
+void attention(const std::uint16_t* q, const std::uint16_t* k, const std::uint16_t* v, float* out,
+               std::int32_t q_heads, std::int32_t head_dim, std::int32_t tokens,
+               std::int32_t window, float scale, float* scratch, ThreadPool& pool);
 
 /// The gate projection with gelu_tanh and the gating multiply fused into it:
 /// out = gelu_tanh(w . x) * up. Returns false when no backend can fuse, leaving

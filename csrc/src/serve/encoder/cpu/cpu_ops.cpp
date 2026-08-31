@@ -748,9 +748,10 @@ namespace {
 /// The softmax stays here because oneDNN's takes no mask, and a bidirectional
 /// sliding layer is nothing but a mask. It is O(T^2) of cheap arithmetic against
 /// the products' O(T^2 * d), so it is not where the time is.
-bool attention_onednn(const float* q, const float* k, const float* v, float* out,
-                      std::int32_t q_heads, std::int32_t head_dim, std::int32_t tokens,
-                      std::int32_t window, float scale, float* scores, ThreadPool& pool) {
+bool attention_onednn(const std::uint16_t* q, const std::uint16_t* k, const std::uint16_t* v,
+                      float* out, std::int32_t q_heads, std::int32_t head_dim,
+                      std::int32_t tokens, std::int32_t window, float scale, float* scores,
+                      ThreadPool& pool) {
     using namespace dnnl;
     static engine cpu_engine(engine::kind::cpu, 0);
     static stream cpu_stream(cpu_engine);
@@ -759,9 +760,9 @@ bool attention_onednn(const float* q, const float* k, const float* v, float* out
     const memory::dim query_rows = q_heads * head_dim;
 
     // Q as [heads, T, D] over a [T, heads*D] buffer.
-    const memory::desc q_md({heads, T, D}, memory::data_type::f32, {D, query_rows, 1});
+    const memory::desc q_md({heads, T, D}, memory::data_type::bf16, {D, query_rows, 1});
     // K^T as [1, D, T] over a [T, D] buffer: the transpose is the stride swap.
-    const memory::desc kt_md({1, D, T}, memory::data_type::f32, {1, 1, D});
+    const memory::desc kt_md({1, D, T}, memory::data_type::bf16, {1, 1, D});
     const memory::desc s_md({heads, T, T}, memory::data_type::f32, {T * T, T, 1});
 
     primitive_attr attributes;
@@ -771,8 +772,8 @@ bool attention_onednn(const float* q, const float* k, const float* v, float* out
 
     {
         const matmul::primitive_desc pd(cpu_engine, q_md, kt_md, s_md, attributes);
-        memory qm(q_md, cpu_engine, const_cast<float*>(q));
-        memory km(kt_md, cpu_engine, const_cast<float*>(k));
+        memory qm(q_md, cpu_engine, const_cast<std::uint16_t*>(q));
+        memory km(kt_md, cpu_engine, const_cast<std::uint16_t*>(k));
         memory sm(s_md, cpu_engine, scores);
         matmul(pd).execute(cpu_stream,
                            {{DNNL_ARG_SRC, qm}, {DNNL_ARG_WEIGHTS, km}, {DNNL_ARG_DST, sm}});
@@ -804,11 +805,12 @@ bool attention_onednn(const float* q, const float* k, const float* v, float* out
 
     {
         // V as [1, T, D], broadcast across heads; out as [heads, T, D] in place.
-        const memory::desc v_md({1, T, D}, memory::data_type::f32, {1, D, 1});
+        // P stays FP32 (the softmax wrote it); only V narrows.
+        const memory::desc v_md({1, T, D}, memory::data_type::bf16, {1, D, 1});
         const memory::desc o_md({heads, T, D}, memory::data_type::f32, {D, query_rows, 1});
         const matmul::primitive_desc pd(cpu_engine, s_md, v_md, o_md, attributes);
         memory sm(s_md, cpu_engine, scores);
-        memory vm(v_md, cpu_engine, const_cast<float*>(v));
+        memory vm(v_md, cpu_engine, const_cast<std::uint16_t*>(v));
         memory om(o_md, cpu_engine, out);
         matmul(pd).execute(cpu_stream,
                            {{DNNL_ARG_SRC, sm}, {DNNL_ARG_WEIGHTS, vm}, {DNNL_ARG_DST, om}});
@@ -827,9 +829,9 @@ std::size_t attention_scratch(std::int32_t q_heads, std::int32_t tokens) {
            static_cast<std::size_t>(tokens);
 }
 
-void attention(const float* q, const float* k, const float* v, float* out, std::int32_t q_heads,
-               std::int32_t head_dim, std::int32_t tokens, std::int32_t window, float scale,
-               float* scratch, ThreadPool& pool) {
+void attention(const std::uint16_t* q, const std::uint16_t* k, const std::uint16_t* v, float* out,
+               std::int32_t q_heads, std::int32_t head_dim, std::int32_t tokens,
+               std::int32_t window, float scale, float* scratch, ThreadPool& pool) {
 #if defined(SINFER_WITH_ONEDNN)
     if (gemm_backend() == GemmBackend::OneDnn &&
         attention_onednn(q, k, v, out, q_heads, head_dim, tokens, window, scale, scratch, pool)) {
@@ -856,13 +858,13 @@ void attention(const float* q, const float* k, const float* v, float* out, std::
 
             const std::int32_t lo = window > 0 ? std::max(0, query - window + 1) : 0;
             const std::int32_t hi = window > 0 ? std::min(tokens, query + window) : tokens;
-            const float* q_row =
+            const std::uint16_t* q_row =
                 q + static_cast<std::int64_t>(query) * query_rows + head * head_dim;
 
             float maximum = -std::numeric_limits<float>::infinity();
             for (std::int32_t key = lo; key < hi; ++key) {
-                const float* k_col = k + static_cast<std::int64_t>(key) * head_dim;
-                const float dot = ::sinfer::encoder::cpu::dot(q_row, k_col, head_dim);
+                const std::uint16_t* k_col = k + static_cast<std::int64_t>(key) * head_dim;
+                const float dot            = dot_bf16(q_row, k_col, head_dim);
                 const float value                            = dot * scale;
                 weights[static_cast<std::size_t>(key - lo)]  = value;
                 maximum                                      = std::max(maximum, value);
@@ -880,8 +882,8 @@ void attention(const float* q, const float* k, const float* v, float* out, std::
             std::fill(target, target + head_dim, 0.0F);
             for (std::int32_t key = lo; key < hi; ++key) {
                 const float weight = weights[static_cast<std::size_t>(key - lo)] * inverse;
-                const float* v_col = v + static_cast<std::int64_t>(key) * head_dim;
-                axpy(weight, v_col, target, head_dim);
+                const std::uint16_t* v_col = v + static_cast<std::int64_t>(key) * head_dim;
+                for (std::int32_t d = 0; d < head_dim; ++d) { target[d] += weight * widen(v_col[d]); }
             }
         }
     });

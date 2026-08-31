@@ -130,9 +130,14 @@ int test_rmsnorm(cpu::ThreadPool& pool) {
 /// that disagrees would be worse than none.
 int test_attention(cpu::ThreadPool& pool) {
     const std::int32_t heads = 3, head_dim = 256, tokens = 40;
-    const auto q = random_floats(static_cast<std::size_t>(heads) * head_dim * tokens, 5, -1.F, 1.F);
-    const auto k = random_floats(static_cast<std::size_t>(head_dim) * tokens, 6, -1.F, 1.F);
-    const auto v = random_floats(static_cast<std::size_t>(head_dim) * tokens, 7, -1.F, 1.F);
+    const auto raw_q =
+        random_floats(static_cast<std::size_t>(heads) * head_dim * tokens, 5, -1.F, 1.F);
+    const auto raw_k = random_floats(static_cast<std::size_t>(head_dim) * tokens, 6, -1.F, 1.F);
+    const auto raw_v = random_floats(static_cast<std::size_t>(head_dim) * tokens, 7, -1.F, 1.F);
+    std::vector<std::uint16_t> q(raw_q.size()), k(raw_k.size()), v(raw_v.size());
+    for (std::size_t i = 0; i < raw_q.size(); ++i) { q[i] = to_bf16(raw_q[i]); }
+    for (std::size_t i = 0; i < raw_k.size(); ++i) { k[i] = to_bf16(raw_k[i]); }
+    for (std::size_t i = 0; i < raw_v.size(); ++i) { v[i] = to_bf16(raw_v[i]); }
     const float scale = 1.0F / std::sqrt(static_cast<float>(head_dim));
     std::vector<float> scratch(cpu::attention_scratch(heads, tokens));
 
@@ -153,9 +158,11 @@ int test_attention(cpu::ThreadPool& pool) {
                 for (std::int32_t key = lo; key < hi; ++key) {
                     double dot = 0.0;
                     for (std::int32_t d = 0; d < head_dim; ++d) {
-                        dot += static_cast<double>(q[static_cast<std::size_t>(query) * rows +
-                                                     head * head_dim + d]) *
-                               static_cast<double>(k[static_cast<std::size_t>(key) * head_dim + d]);
+                        dot += static_cast<double>(from_bf16(
+                                   q[static_cast<std::size_t>(query) * rows + head * head_dim +
+                                     d])) *
+                               static_cast<double>(
+                                   from_bf16(k[static_cast<std::size_t>(key) * head_dim + d]));
                     }
                     weights[static_cast<std::size_t>(key - lo)] = dot * scale;
                     maximum = std::max(maximum, dot * scale);
@@ -169,7 +176,7 @@ int test_attention(cpu::ThreadPool& pool) {
                     double accumulated = 0.0;
                     for (std::int32_t key = lo; key < hi; ++key) {
                         accumulated += weights[static_cast<std::size_t>(key - lo)] *
-                                       v[static_cast<std::size_t>(key) * head_dim + d];
+                                       from_bf16(v[static_cast<std::size_t>(key) * head_dim + d]);
                     }
                     want[static_cast<std::size_t>(query) * rows + head * head_dim + d] =
                         accumulated / sum;
