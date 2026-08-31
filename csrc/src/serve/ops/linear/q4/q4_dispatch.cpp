@@ -65,6 +65,26 @@ Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
             return launch_q4_mma_r64_c128;
         }
         break;
+    // The vision tower's qkv (n = 3*hidden) and MLP fc1 (n = intermediate), keyed
+    // by the tower width. 1024 is the Qwen3.5 2B/4B tower, 1152 the Qwen3.6 family
+    // and Flash-Next. The launchers read their shapes from the tensors, so the two
+    // widths differ only in which tile is fastest; the 1024 schedules mirror 1152's
+    // rather than being measured.
+    case 1024:
+        if (t < 4 || t > 131072 || (t % 4) != 0) { break; }
+        switch (n) {
+        case 3072:  // qkv
+            if (t <= 36) { return launch_q4_simt_r8_c4; }
+            if (t <= 320) { return launch_q4_mma_r64_c64; }
+            return launch_q4_mma_r64_c128;
+        case 4096:  // mlp fc1
+            if (t <= 24) { return launch_q4_simt_r8_c8; }
+            if (t <= 320) { return launch_q4_mma_r64_c64; }
+            return launch_q4_mma_r64_c128;
+        default:
+            break;
+        }
+        break;
     case 1152:
         if (t < 4 || t > 131072 || (t % 4) != 0) { break; }
         switch (n) {

@@ -17,6 +17,9 @@ enum class RopeKernelMode : std::int32_t {
     DflashText1D,
     TextMrope,
     Vision2D,
+    // The Qwen3.5 towers are 64 wide (0.8B 12x768, 2B/4B 24x1024), where the
+    // Qwen3.6 family and Flash-Next are 72. Same 2-D scheme, half the pairs.
+    Vision2D64,
 };
 
 inline constexpr int kRopeMaxHalf = 128;
@@ -56,6 +59,14 @@ static __device__ __constant__ double kDflashRopeInvFrequency[64] = {
     1.28639694493697462e-07,
 };
 
+// theta^(-2i/32) for the 64-wide tower: 32 pairs, 16 per axis.
+static __device__ __constant__ float kVisionRopeInvFrequency64[16] = {
+    1.000000000e+00F, 5.623413252e-01F, 3.162277660e-01F, 1.778279410e-01F, 1.000000000e-01F,
+    5.623413252e-02F, 3.162277660e-02F, 1.778279410e-02F, 1.000000000e-02F, 5.623413252e-03F,
+    3.162277660e-03F, 1.778279410e-03F, 1.000000000e-03F, 5.623413252e-04F, 3.162277660e-04F,
+    1.778279410e-04F,
+};
+
 static __device__ __constant__ float kVisionRopeInvFrequency[18] = {
     1.000000000e+00F, 5.994842503e-01F, 3.593813664e-01F, 2.154434690e-01F, 1.291549665e-01F,
     7.742636827e-02F, 4.641588834e-02F, 2.782559402e-02F, 1.668100537e-02F, 1.000000000e-02F,
@@ -68,6 +79,9 @@ __device__ __forceinline__ void fixed_axis_frequency(int pair, int* axis, float*
     if constexpr (Mode == RopeKernelMode::Vision2D) {
         *axis      = pair / 18;
         *frequency = kVisionRopeInvFrequency[pair % 18];
+    } else if constexpr (Mode == RopeKernelMode::Vision2D64) {
+        *axis      = pair / 16;
+        *frequency = kVisionRopeInvFrequency64[pair % 16];
     } else if constexpr (Mode == RopeKernelMode::DflashText1D) {
         *axis      = 0;
         *frequency = static_cast<float>(kDflashRopeInvFrequency[pair]);
@@ -119,9 +133,11 @@ __global__ void rope_fixed_kernel(const std::int32_t* positions, __nv_bfloat16* 
                                   std::int32_t tokens, std::int64_t q_token_stride,
                                   std::int64_t k_token_stride) {
     constexpr int kHeadDim = Mode == RopeKernelMode::Vision2D       ? 72
+                             : Mode == RopeKernelMode::Vision2D64   ? 64
                              : Mode == RopeKernelMode::DflashText1D ? 128
                                                                     : 256;
     constexpr int kHalf    = Mode == RopeKernelMode::Vision2D       ? 36
+                             : Mode == RopeKernelMode::Vision2D64   ? 32
                              : Mode == RopeKernelMode::DflashText1D ? 64
                                                                     : 32;
     const int token        = static_cast<int>(blockIdx.x);

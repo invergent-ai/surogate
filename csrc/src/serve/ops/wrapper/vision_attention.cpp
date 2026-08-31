@@ -12,7 +12,9 @@
 namespace ninfer::ops {
 namespace {
 
-constexpr std::int32_t kHeadDim = 72;
+// Either tower: 72 (Qwen3.6 family, Flash-Next) or 64 (Qwen3.5).
+constexpr std::int32_t kHeadDim   = 72;
+constexpr std::int32_t kHeadDim64 = 64;
 constexpr std::int32_t kHeads   = 16;
 
 std::int32_t scratch_tiles(std::int32_t patches, std::int32_t segments) {
@@ -33,13 +35,14 @@ Tensor allocate_workspace(Allocator& allocator, std::int32_t patches, std::int32
 }
 
 void require_qkv(const Tensor& tensor, std::int32_t patches, const char* name) {
-    if (tensor.dtype != DType::BF16 || tensor.ne[0] != kHeadDim || tensor.ne[1] != kHeads ||
-        tensor.ne[2] != patches || tensor.ne[3] != 1) {
+    const std::int32_t head_dim = static_cast<std::int32_t>(tensor.ne[0]);
+    if (tensor.dtype != DType::BF16 || (head_dim != kHeadDim && head_dim != kHeadDim64) ||
+        tensor.ne[1] != kHeads || tensor.ne[2] != patches || tensor.ne[3] != 1) {
         throw std::invalid_argument(std::string("vision_attention: invalid ") + name + " shape");
     }
     constexpr std::int64_t elem = 2;
-    if (tensor.nb[0] != elem || tensor.nb[1] != elem * kHeadDim ||
-        tensor.nb[2] < elem * kHeadDim * kHeads || (tensor.nb[2] % elem) != 0) {
+    if (tensor.nb[0] != elem || tensor.nb[1] != elem * head_dim ||
+        tensor.nb[2] < elem * head_dim * kHeads || (tensor.nb[2] % elem) != 0) {
         throw std::invalid_argument(std::string("vision_attention: invalid ") + name + " strides");
     }
     if (tensor.data == nullptr) {

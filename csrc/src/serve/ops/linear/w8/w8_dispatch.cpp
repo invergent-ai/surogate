@@ -70,6 +70,13 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
             if (t <= 895) { return launch_w8_mma_r32_c128; }
             return launch_w8_mma_r64_c128;
         }
+        // The 64-wide vision tower's merger fc1: 4 patches merge into 4*1024, and
+        // the projection is square. Mirrors the 4608 tower's schedule below.
+        if (n == 4096) {
+            if (t <= 8 || t == 12) { return launch_w8_simt_r8_c4; }
+            if (t <= 256) { return launch_w8_mma_r32_c128; }
+            return launch_w8_mma_r64_c128;
+        }
         break;
     case 2560:
         // surogate vendor patch (PATCHES.md #18/#29): qwen3.5-4b heads. The

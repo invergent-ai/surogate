@@ -12,7 +12,10 @@ namespace ninfer::ops {
 namespace {
 
 constexpr std::int32_t kTextHeadDim = 256;
+// The vision tower's head dim: 72 on the Qwen3.6 family and Flash-Next
+// (27x1152), 64 on every Qwen3.5 tower (12x768, 24x1024). Both are served.
 constexpr std::int32_t kVisionDim   = 72;
+constexpr std::int32_t kVisionDim64 = 64;
 
 std::int64_t numel_allow_zero(const Tensor& tensor, const char* label) {
     bool zero      = false;
@@ -82,8 +85,11 @@ void require_positions_storage(const Tensor& positions) {
 
 void require_model_mode(int axes, int rotary_dim, std::int32_t head_dim) {
     if (axes == 2) {
-        if (head_dim != kVisionDim || rotary_dim != kVisionDim) {
-            throw std::invalid_argument("rope: 2-D Vision mode requires head_dim=rotary_dim=72");
+        const bool supported = (head_dim == kVisionDim && rotary_dim == kVisionDim) ||
+                               (head_dim == kVisionDim64 && rotary_dim == kVisionDim64);
+        if (!supported) {
+            throw std::invalid_argument(
+                "rope: 2-D Vision mode requires head_dim=rotary_dim of 72 or 64");
         }
         return;
     }
@@ -111,7 +117,7 @@ void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tenso
     (void)numel_allow_zero(k, "k");
     const std::int32_t tokens   = q.ne[2];
     const int axes              = position_axes(positions, tokens);
-    const std::int32_t head_dim = axes == 2 ? kVisionDim : q.ne[0];
+    const std::int32_t head_dim = q.ne[0];
     const std::int32_t q_heads  = q.ne[1];
     const std::int32_t k_heads  = k.ne[1];
     require_model_mode(axes, rotary_dim, head_dim);
@@ -132,7 +138,7 @@ void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& x, cudaS
     const std::int64_t x_numel  = numel_allow_zero(x, "tensor");
     const std::int32_t tokens   = x.ne[2];
     const int axes              = position_axes(positions, tokens);
-    const std::int32_t head_dim = axes == 2 ? kVisionDim : x.ne[0];
+    const std::int32_t head_dim = x.ne[0];
     const std::int32_t heads    = x.ne[1];
     require_model_mode(axes, rotary_dim, head_dim);
     require_tensor_layout(x, "tensor", head_dim, heads, tokens);

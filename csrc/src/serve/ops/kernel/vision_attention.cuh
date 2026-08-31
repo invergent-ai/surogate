@@ -11,7 +11,19 @@
 
 namespace ninfer::ops {
 
+// The tower's head dim: 72 on the Qwen3.6 family and Flash-Next (16 heads of a
+// 1152-wide tower), 64 on every Qwen3.5 tower (16 heads of 1024). The kernel takes
+// it as a template parameter; this remains the family default for callers that
+// still name it. `kVisionAttentionPaddedD` (128) is the shared-memory row stride
+// and comfortably covers both.
 inline constexpr int kVisionAttentionHeadDim = 72;
+
+// 1/sqrt(head_dim) for the softmax, spelled out per supported width rather than
+// computed, so an unsupported one fails to compile instead of silently scaling
+// wrong -- the scale was previously baked in as 1/sqrt(72).
+template <int D>
+inline constexpr float kVisionAttentionInvSqrtD =
+    D == 72 ? 0.11785113019775792073f : D == 64 ? 0.125f : 0.0f;
 inline constexpr int kVisionAttentionHeads   = 16;
 inline constexpr int kVisionAttentionBr      = 64;
 inline constexpr int kVisionAttentionBc      = 64;
@@ -65,7 +77,7 @@ __global__ void vision_attention_prepare_tiles_kernel(const std::int32_t* cu_seq
     }
 }
 
-template <int Br, int Threads>
+template <int D, int Br, int Threads>
 __device__ __forceinline__ void
 vision_attention_stage_q(__nv_bfloat16* dst, const __nv_bfloat16* q, int q0, int end, int head,
                          int tid, std::int64_t stride_d, std::int64_t stride_h,
@@ -74,7 +86,7 @@ vision_attention_stage_q(__nv_bfloat16* dst, const __nv_bfloat16* q, int q0, int
     for (int chunk = tid; chunk < Br * VecsPerRow; chunk += Threads) {
         const int row       = chunk / VecsPerRow;
         const int d         = (chunk % VecsPerRow) * 8;
-        const bool in_range = q0 + row < end && d < kVisionAttentionHeadDim;
+        const bool in_range = q0 + row < end && d < D;
         __nv_bfloat16* smem = &dst[row * kVisionAttentionPaddedD + vision_attention_swz(row, d)];
         const __nv_bfloat16* global = vision_attention_ptr(
             q, stride_d, stride_h, stride_t, in_range ? d : 0, head, in_range ? q0 + row : q0);
@@ -82,7 +94,7 @@ vision_attention_stage_q(__nv_bfloat16* dst, const __nv_bfloat16* q, int q0, int
     }
 }
 
-template <int Bc, int Threads>
+template <int D, int Bc, int Threads>
 __device__ __forceinline__ void
 vision_attention_stage_kv(__nv_bfloat16* dst, const __nv_bfloat16* src, int key0, int end, int head,
                           int tid, std::int64_t stride_d, std::int64_t stride_h,
@@ -91,7 +103,7 @@ vision_attention_stage_kv(__nv_bfloat16* dst, const __nv_bfloat16* src, int key0
     for (int chunk = tid; chunk < Bc * VecsPerRow; chunk += Threads) {
         const int row       = chunk / VecsPerRow;
         const int d         = (chunk % VecsPerRow) * 8;
-        const bool in_range = key0 + row < end && d < kVisionAttentionHeadDim;
+        const bool in_range = key0 + row < end && d < D;
         __nv_bfloat16* smem = &dst[row * kVisionAttentionPaddedD + vision_attention_swz(row, d)];
         const __nv_bfloat16* global =
             vision_attention_ptr(src, stride_d, stride_h, stride_t, in_range ? d : 0, head,
@@ -100,7 +112,7 @@ vision_attention_stage_kv(__nv_bfloat16* dst, const __nv_bfloat16* src, int key0
     }
 }
 
-template <int Br, int Bc>
+template <int D, int Br, int Bc>
 __launch_bounds__(Br * 2, 128 / Br) __global__ void vision_attention_flash_kernel(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
     const __nv_bfloat16* __restrict__ v, const VisionAttentionTile* __restrict__ tiles,
@@ -110,15 +122,16 @@ __launch_bounds__(Br * 2, 128 / Br) __global__ void vision_attention_flash_kerne
     std::int64_t v_stride_d, std::int64_t v_stride_h, std::int64_t v_stride_t) {
     static_assert(Br == 16 || Br == 32 || Br == 64);
     static_assert(Bc == 16 || Bc == 32 || Bc == 64);
-    constexpr int D             = kVisionAttentionHeadDim;
+    static_assert(kVisionAttentionInvSqrtD<D> > 0.0f,
+                  "vision_attention: unsupported head dim (expected 64 or 72)");
     constexpr int Dp            = kVisionAttentionPaddedD;
     constexpr int Threads       = Br * 2;
     constexpr int QKNt          = Bc / 8;
-    constexpr int QKKs          = 5; // ceil(72 / 16)
+    constexpr int QKKs          = (D + 15) / 16; // 5 at D=72, 4 at D=64
     constexpr int PVNt          = D / 8;
     constexpr int PVKs          = Bc / 16;
     constexpr int RowBytes      = Dp * static_cast<int>(sizeof(__nv_bfloat16));
-    constexpr float ScaleLog2E  = 0.11785113019775792073f * 1.4426950408889634074f;
+    constexpr float ScaleLog2E  = kVisionAttentionInvSqrtD<D> * 1.4426950408889634074f;
     constexpr unsigned FullMask = 0xffffffffu;
 
     VisionAttentionTile tile;
@@ -168,7 +181,7 @@ __launch_bounds__(Br * 2, 128 / Br) __global__ void vision_attention_flash_kerne
     const unsigned v_as = static_cast<unsigned>((lane >> 4) << 4);
     const unsigned v_r  = static_cast<unsigned>(b_rin << 4);
 
-    vision_attention_stage_q<Br, Threads>(q_s, q, tile.q0, tile.end, head, tid, q_stride_d,
+    vision_attention_stage_q<D, Br, Threads>(q_s, q, tile.q0, tile.end, head, tid, q_stride_d,
                                           q_stride_h, q_stride_t);
 
     float acc[PVNt][4];
@@ -183,7 +196,7 @@ __launch_bounds__(Br * 2, 128 / Br) __global__ void vision_attention_flash_kerne
     float l1 = 0.0f;
 
     cp_commit();
-    vision_attention_stage_kv<Bc, Threads>(k_s, k, tile.begin, tile.end, head, tid, k_stride_d,
+    vision_attention_stage_kv<D, Bc, Threads>(k_s, k, tile.begin, tile.end, head, tid, k_stride_d,
                                            k_stride_h, k_stride_t);
     cp_commit();
 
@@ -193,7 +206,7 @@ __launch_bounds__(Br * 2, 128 / Br) __global__ void vision_attention_flash_kerne
         cp_wait<0>();
         __syncthreads();
 
-        vision_attention_stage_kv<Bc, Threads>(v_s, v, key0, tile.end, head, tid, v_stride_d,
+        vision_attention_stage_kv<D, Bc, Threads>(v_s, v, key0, tile.end, head, tid, v_stride_d,
                                                v_stride_h, v_stride_t);
         cp_commit();
 
@@ -317,7 +330,7 @@ __launch_bounds__(Br * 2, 128 / Br) __global__ void vision_attention_flash_kerne
         cp_wait<0>();
         __syncthreads();
         if (kb + 1 < key_blocks) {
-            vision_attention_stage_kv<Bc, Threads>(k_s, k, key0 + Bc, tile.end, head, tid,
+            vision_attention_stage_kv<D, Bc, Threads>(k_s, k, key0 + Bc, tile.end, head, tid,
                                                    k_stride_d, k_stride_h, k_stride_t);
             cp_commit();
         }

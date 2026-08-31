@@ -115,6 +115,10 @@ bool launch_fixed_pair(const Tensor& positions, int rotary_dim, float theta, Ten
         launch_fixed<RopeKernelMode::Vision2D, 16, 16>(positions, &q, &k, stream);
         return true;
     }
+    if (axes == 2 && rotary_dim == 64 && theta == 10'000.0F && q.ne[1] == 16 && k.ne[1] == 16) {
+        launch_fixed<RopeKernelMode::Vision2D64, 16, 16>(positions, &q, &k, stream);
+        return true;
+    }
     return false;
 }
 
@@ -161,6 +165,10 @@ bool launch_fixed_single_dispatch(const Tensor& positions, int rotary_dim, float
     }
     if (axes == 2 && rotary_dim == 72 && theta == 10'000.0F && x.ne[1] == 16) {
         launch_fixed_single<RopeKernelMode::Vision2D, 16>(positions, x, stream);
+        return true;
+    }
+    if (axes == 2 && rotary_dim == 64 && theta == 10'000.0F && x.ne[1] == 16) {
+        launch_fixed_single<RopeKernelMode::Vision2D64, 16>(positions, x, stream);
         return true;
     }
     return false;
