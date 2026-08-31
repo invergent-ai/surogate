@@ -29,7 +29,8 @@ Captured in config but NOT yet part of the training graph (deferred, in priority
 from __future__ import annotations
 
 from .. import nn
-from ..blocks.qwen4_exp import Qwen4ExpAttentionBlock, Qwen4ExpLinearBlock
+from ..block_schema import ServeObject
+from ..blocks.qwen4_exp import _PLE_SERVE_OBJECTS, Qwen4ExpAttentionBlock, Qwen4ExpLinearBlock
 from ..hf import expand_module_mapping
 from ..modules import Embedding, HyperConnection, LMHead, StreamBroadcast
 from ..modules.attention import _resolve_rotary_dim
@@ -37,6 +38,26 @@ from ..modules.moe import MoESharedExpert
 from ..specs import ActivationScope
 from .qwen3_5 import _parse_qwen3_5_layer_types
 
+
+#: Model-level objects as a serving artifact stores them. The per-layer objects are
+#: declared on the block schemas; these are the ones outside the stack. There is no
+#: final norm — the output hyper-connection mix is it — and the n-gram table travels
+#: as a raw resource rather than a tensor, so only its hash parameters appear here.
+QWEN4_EXP_MODEL_SERVE_OBJECTS: tuple[ServeObject, ...] = (
+    ServeObject("text/token_embedding", "w8", ("Vocab", "C"), ("embedding",), scope="model"),
+    ServeObject("text/output_hc/norm", "fp32", ("HcWidth",), ("output_hc_norm",), scope="model"),
+    ServeObject("text/output_hc/down", "bf16", ("HcLowRank", "HcWidth"),
+                ("output_hc_down",), scope="model"),
+    ServeObject("text/output_hc/up", "bf16", ("HcWidth", "HcLowRank"),
+                ("output_hc_up",), scope="model"),
+    ServeObject("text/output_head", "w8", ("Vocab", "C"), ("lm_head",), scope="model"),
+    ServeObject("text/ple/multipliers", "i32", ("PleMultipliers",), scope="model"),
+    ServeObject("text/ple/head_offsets", "i32", ("PleHeads",), scope="model"),
+    ServeObject("text/ple/head_vocab_sizes", "i32", ("PleHeads",), scope="model"),
+)
+
+#: Objects that exist only on the layer carrying the n-gram memory.
+QWEN4_EXP_PLE_SERVE_OBJECTS = _PLE_SERVE_OBJECTS
 
 QWEN4_EXP_MODEL_NAME_REMAP: dict[str, str] = {
     # --- embedding ---

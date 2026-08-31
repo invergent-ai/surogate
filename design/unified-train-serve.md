@@ -376,3 +376,46 @@ failed has not been shown to guard anything.
 Emitting bindings is still worth doing, but as the *shared* implementation the two
 dense targets already almost are, not as a per-target generator — and after the
 converter inventory, which is where the object names actually live.
+
+## Three descriptions become one
+
+The question that reframed this work: if the DSL is the source of truth, why does
+the serving policy live somewhere else? The objection to putting it there — that
+formats and layouts are deployment concerns, not architecture — does not survive
+contact with the code. The declaration already carries `quantizable` (71
+references), `residency` (43), `offload_group` (27), `streaming_hint` (17);
+`SlotDecl` has residency and streaming fields; and `MoESharedExpert` declares
+`quantizable=False` with the comment *"Mirrors router weights being kept full
+precision"*, which is a numeric-format decision recorded in the declaration years
+before this exercise. Artifact names and serving formats are the same kind of
+thing, not a new kind.
+
+So `ServeObject` now sits in `block_schema.py` beside `SlotDecl`: an artifact
+object's name, numeric format, shape, the declared parameters that compose it *in
+row order*, and the name of the repacking the converter applies when the
+composition is not a plain concatenation. Blocks carry their objects on
+`BlockSchema.serve_objects`; the model carries the handful outside the stack.
+
+`emit_inventory.py` expands that over the layer schedule. Against the committed
+converter for Flash-Next: **986 tensors emitted, 986 committed, every name, shape
+and numeric format identical.** The converter's hand-written inventory is not a
+second description of the model — it is exactly what the declaration implies, and
+can be deleted in favour of the emitter.
+
+What deliberately stays hand-written is the repacking itself: untiling GDN value
+heads, unfolding a norm's folded `+1`, splitting an interleaved query/gate
+projection. Those are algorithms, not data. The declaration names them
+(`ServeObject.transform`) so the set in play is visible from the model, and stops
+there.
+
+The component lists are the second dividend. `attention/query_key_gate_value`
+records that it is built from the query, key and value projections under the
+`split_interleaved_query_gate` repacking; `gdn/query_key_value_z` that it fuses
+the qkv projection with the gate's z projection. That is the map an adapter needs
+to land on the right rows of a fused serve tensor — the thing serving LoRA cannot
+be written safely without, and the reason it was worth declaring now rather than
+reconstructing later.
+
+Both new guards were verified by breaking them: changing `hc_low_rank` in the
+committed header, and changing one declared serve format, each turn the suite red
+with the specific disagreement named.
