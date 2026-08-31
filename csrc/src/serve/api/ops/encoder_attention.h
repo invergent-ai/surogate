@@ -29,9 +29,12 @@ namespace sinfer::ops {
  * (`LLAMA_SWA_TYPE_SYMMETRIC`). This op implements W, matching the reference
  * that produced the published checkpoint's own numbers.
  *
- * `qkv` is a contiguous BF16 tensor [q_heads*head_dim + 2*head_dim, tokens] --
- * the fused projection, with query heads first, then the key head, then the
- * value head. `out` is contiguous BF16 [q_heads*head_dim, tokens].
+ * `q` is a contiguous BF16 tensor [q_heads*head_dim, tokens]; `k` and `v` are
+ * contiguous BF16 [head_dim, tokens], shared across the query heads. They are
+ * taken separately rather than as one fused projection because everything
+ * upstream already holds them that way: per-head QK norm and rope both need a
+ * contiguous operand, which a fused [q|k|v, tokens] matrix does not give.
+ * `out` is contiguous BF16 [q_heads*head_dim, tokens].
  *
  * `workspace` holds the score matrix and must be at least
  * `encoder_attention_workspace_bytes(q_heads, tokens)`. It is scratch: its
@@ -45,9 +48,9 @@ namespace sinfer::ops {
  * implementation-defined. The Op writes all of out, writes workspace, and keeps
  * no persistent state.
  */
-void encoder_attention(const Tensor& qkv, std::int32_t q_heads, std::int32_t head_dim,
-                       std::int32_t window, float scale, Tensor& out, void* workspace,
-                       std::size_t workspace_bytes, cudaStream_t stream);
+void encoder_attention(const Tensor& q, const Tensor& k, const Tensor& v, std::int32_t window,
+                       float scale, Tensor& out, void* workspace, std::size_t workspace_bytes,
+                       cudaStream_t stream);
 
 /// Scratch bytes `encoder_attention` needs for one sequence of `tokens`.
 std::size_t encoder_attention_workspace_bytes(std::int32_t q_heads, std::int32_t tokens);

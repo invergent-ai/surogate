@@ -36,11 +36,9 @@ struct Case {
 };
 
 /// The op's contract, in double: softmax over the admitted band, then P V.
-std::vector<double> oracle(const std::vector<float>& qkv, const Case& shape, float scale) {
-    const std::int64_t rows = static_cast<std::int64_t>(shape.q_heads + 2) * shape.head_dim;
+std::vector<double> oracle(const std::vector<float>& q, const std::vector<float>& k,
+                           const std::vector<float>& v, const Case& shape, float scale) {
     const std::int64_t out_rows = static_cast<std::int64_t>(shape.q_heads) * shape.head_dim;
-    const std::int64_t key_base = static_cast<std::int64_t>(shape.q_heads) * shape.head_dim;
-    const std::int64_t value_base = key_base + shape.head_dim;
 
     std::vector<double> out(static_cast<std::size_t>(out_rows) * shape.tokens, 0.0);
     std::vector<double> probability(shape.tokens);
@@ -56,8 +54,8 @@ std::vector<double> oracle(const std::vector<float>& qkv, const Case& shape, flo
             for (std::int32_t key = lo; key < hi; ++key) {
                 double dot = 0.0;
                 for (std::int32_t d = 0; d < shape.head_dim; ++d) {
-                    dot += static_cast<double>(qkv[query * rows + head * shape.head_dim + d]) *
-                           static_cast<double>(qkv[key * rows + key_base + d]);
+                    dot += static_cast<double>(q[query * out_rows + head * shape.head_dim + d]) *
+                           static_cast<double>(k[key * shape.head_dim + d]);
                 }
                 probability[key] = dot * scale;
                 maximum          = std::max(maximum, probability[key]);
@@ -71,7 +69,7 @@ std::vector<double> oracle(const std::vector<float>& qkv, const Case& shape, flo
                 double accumulated = 0.0;
                 for (std::int32_t key = lo; key < hi; ++key) {
                     accumulated += probability[key] *
-                                   static_cast<double>(qkv[key * rows + value_base + d]);
+                                   static_cast<double>(v[key * shape.head_dim + d]);
                 }
                 out[static_cast<std::size_t>(query) * out_rows + head * shape.head_dim + d] =
                     accumulated / sum;
@@ -82,31 +80,41 @@ std::vector<double> oracle(const std::vector<float>& qkv, const Case& shape, flo
 }
 
 int run(const Case& shape, std::uint32_t seed) {
-    const std::int64_t rows     = static_cast<std::int64_t>(shape.q_heads + 2) * shape.head_dim;
     const std::int64_t out_rows = static_cast<std::int64_t>(shape.q_heads) * shape.head_dim;
-    const auto qkv_elements     = static_cast<std::size_t>(rows) * shape.tokens;
-    const auto out_elements     = static_cast<std::size_t>(out_rows) * shape.tokens;
+    const auto q_elements       = static_cast<std::size_t>(out_rows) * shape.tokens;
+    const auto kv_elements      = static_cast<std::size_t>(shape.head_dim) * shape.tokens;
+    const auto out_elements     = q_elements;
     const float scale = 1.0F / std::sqrt(static_cast<float>(shape.head_dim));
 
-    std::vector<float> qkv(qkv_elements);
-    fill_uniform(qkv, seed, -2.0F, 2.0F);
-    round_to_bf16(qkv); // what the kernel will actually read
+    std::vector<float> q(q_elements);
+    std::vector<float> k(kv_elements);
+    std::vector<float> v(kv_elements);
+    fill_uniform(q, seed, -2.0F, 2.0F);
+    fill_uniform(k, seed + 101, -2.0F, 2.0F);
+    fill_uniform(v, seed + 202, -2.0F, 2.0F);
+    round_to_bf16(q); // what the kernel will actually read
+    round_to_bf16(k);
+    round_to_bf16(v);
 
-    const std::vector<double> reference = oracle(qkv, shape, scale);
+    const std::vector<double> reference = oracle(q, k, v, shape, scale);
 
-    DeviceBuffer device_qkv = to_device_bf16(qkv);
+    DeviceBuffer device_q = to_device_bf16(q);
+    DeviceBuffer device_k = to_device_bf16(k);
+    DeviceBuffer device_v = to_device_bf16(v);
     DeviceBuffer device_out(out_elements * sizeof(std::uint16_t));
     const std::size_t workspace_bytes =
         ops::encoder_attention_workspace_bytes(shape.q_heads, shape.tokens);
     DeviceBuffer workspace(workspace_bytes);
 
-    Tensor input(device_qkv.p, DType::BF16, {rows, shape.tokens});
+    Tensor tq(device_q.p, DType::BF16, {out_rows, shape.tokens});
+    Tensor tk(device_k.p, DType::BF16, {shape.head_dim, shape.tokens});
+    Tensor tv(device_v.p, DType::BF16, {shape.head_dim, shape.tokens});
     Tensor output(device_out.p, DType::BF16, {out_rows, shape.tokens});
 
     cudaStream_t stream = nullptr;
     cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
-    ops::encoder_attention(input, shape.q_heads, shape.head_dim, shape.window, scale, output,
-                           workspace.p, workspace_bytes, stream);
+    ops::encoder_attention(tq, tk, tv, shape.window, scale, output, workspace.p, workspace_bytes,
+                           stream);
     cuda_synchronize(stream);
     cuda_check(cudaStreamDestroy(stream), "stream destroy");
 

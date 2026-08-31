@@ -9,9 +9,9 @@
 // Orientation, which is the whole of the difficulty. Scores are held
 // column-major as s[key, query]: the key axis is contiguous, so the softmax
 // reduces over stride-1 data, and the same buffer feeds the second product with
-// no transpose. Both products read Q, K and V straight out of the fused
-// projection by pointer offset and leading dimension -- nothing is copied or
-// split out first.
+// no transpose. Q, K and V arrive as separate contiguous tensors -- the form
+// per-head QK norm and rope leave them in -- so the batch strides do the work:
+// Q advances one head per batch element while the shared K and V advance none.
 //
 // The only translation unit that includes this op's kernel header.
 // See docs/op-development.md §2.
@@ -127,18 +127,19 @@ void matmul(DeviceState& state, const Desc& desc, const void* a, const Layout& l
 
 void encoder_attention_prewarm() { (void)state_for_current_device(); }
 
-void encoder_attention_launch(const Tensor& qkv, std::int32_t q_heads, std::int32_t head_dim,
+void encoder_attention_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                               std::int32_t window, float scale, Tensor& out, void* workspace,
                               cudaStream_t stream) {
-    const auto tokens   = static_cast<std::int32_t>(qkv.ne[1]);
-    const auto qkv_rows = static_cast<std::int64_t>(qkv.ne[0]);
-    const auto out_rows = static_cast<std::int64_t>(q_heads) * head_dim;
+    const auto tokens         = static_cast<std::int32_t>(q.ne[1]);
+    const auto head_dim       = static_cast<std::int32_t>(k.ne[0]);
+    const auto q_rows         = static_cast<std::int64_t>(q.ne[0]);
+    const auto q_heads        = static_cast<std::int32_t>(q_rows / head_dim);
+    const auto out_rows       = q_rows;
     const std::int64_t matrix = static_cast<std::int64_t>(tokens) * tokens;
 
-    const auto* base = static_cast<const __nv_bfloat16*>(qkv.data);
-    const auto* q    = base;
-    const auto* k    = base + static_cast<std::int64_t>(q_heads) * head_dim;
-    const auto* v    = k + head_dim;
+    const auto* q_data = static_cast<const __nv_bfloat16*>(q.data);
+    const auto* k_data = static_cast<const __nv_bfloat16*>(k.data);
+    const auto* v_data = static_cast<const __nv_bfloat16*>(v.data);
 
     // Scores first (FP32), probabilities after them (BF16), in one scratch block.
     auto* scores = static_cast<float*>(workspace);
@@ -152,10 +153,10 @@ void encoder_attention_launch(const Tensor& qkv, std::int32_t q_heads, std::int3
         // s[key, query] = K^T Q. A is the shared key head, so its batch stride is
         // zero; Q advances one head per batch element.
         const Desc desc(CUBLAS_OP_T, CUBLAS_OP_N);
-        const Layout la(CUDA_R_16BF, head_dim, tokens, qkv_rows, q_heads, 0);
-        const Layout lb(CUDA_R_16BF, head_dim, tokens, qkv_rows, q_heads, head_dim);
+        const Layout la(CUDA_R_16BF, head_dim, tokens, head_dim, q_heads, 0);
+        const Layout lb(CUDA_R_16BF, head_dim, tokens, q_rows, q_heads, head_dim);
         const Layout lc(CUDA_R_32F, tokens, tokens, tokens, q_heads, matrix);
-        matmul(state, desc, k, la, q, lb, scores, lc, stream);
+        matmul(state, desc, k_data, la, q_data, lb, scores, lc, stream);
     }
 
     const dim3 grid(static_cast<unsigned int>(tokens), static_cast<unsigned int>(q_heads));
@@ -166,10 +167,10 @@ void encoder_attention_launch(const Tensor& qkv, std::int32_t q_heads, std::int3
     {
         // out[dim, query] = V P. V is shared across heads; P advances one matrix.
         const Desc desc(CUBLAS_OP_N, CUBLAS_OP_N);
-        const Layout la(CUDA_R_16BF, head_dim, tokens, qkv_rows, q_heads, 0);
+        const Layout la(CUDA_R_16BF, head_dim, tokens, head_dim, q_heads, 0);
         const Layout lb(CUDA_R_16BF, tokens, tokens, tokens, q_heads, matrix);
         const Layout lc(CUDA_R_16BF, head_dim, tokens, out_rows, q_heads, head_dim);
-        matmul(state, desc, v, la, probs, lb, out.data, lc, stream);
+        matmul(state, desc, v_data, la, probs, lb, out.data, lc, stream);
     }
 }
 

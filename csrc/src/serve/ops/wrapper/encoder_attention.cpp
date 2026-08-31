@@ -20,41 +20,47 @@ std::size_t encoder_attention_workspace_bytes(std::int32_t q_heads, std::int32_t
 
 void encoder_attention_prewarm() { detail::encoder_attention_prewarm(); }
 
-void encoder_attention(const Tensor& qkv, std::int32_t q_heads, std::int32_t head_dim,
-                       std::int32_t window, float scale, Tensor& out, void* workspace,
-                       std::size_t workspace_bytes, cudaStream_t stream) {
-    if (qkv.dtype != DType::BF16 || out.dtype != DType::BF16) {
-        throw std::invalid_argument("encoder_attention: qkv/out must be BF16");
+void encoder_attention(const Tensor& q, const Tensor& k, const Tensor& v, std::int32_t window,
+                       float scale, Tensor& out, void* workspace, std::size_t workspace_bytes,
+                       cudaStream_t stream) {
+    if (q.dtype != DType::BF16 || k.dtype != DType::BF16 || v.dtype != DType::BF16 ||
+        out.dtype != DType::BF16) {
+        throw std::invalid_argument("encoder_attention: q/k/v/out must be BF16");
     }
-    if (!qkv.is_contiguous() || !out.is_contiguous()) {
-        throw std::invalid_argument("encoder_attention: qkv/out must be contiguous");
+    if (!q.is_contiguous() || !k.is_contiguous() || !v.is_contiguous() || !out.is_contiguous()) {
+        throw std::invalid_argument("encoder_attention: q/k/v/out must be contiguous");
     }
-    if (q_heads <= 0 || head_dim <= 0) {
-        throw std::invalid_argument("encoder_attention: q_heads and head_dim must be positive");
+    const std::int64_t head_dim = k.ne[0];
+    const std::int64_t tokens   = q.ne[1];
+    if (head_dim <= 0 || q.ne[0] <= 0 || q.ne[0] % head_dim != 0) {
+        throw std::invalid_argument("encoder_attention: q rows must be a multiple of head_dim");
     }
-    // One key head and one value head follow the query heads in the fused projection.
-    if (qkv.ne[0] != static_cast<std::int64_t>(q_heads + 2) * head_dim) {
-        throw std::invalid_argument("encoder_attention: qkv rows must be (q_heads + 2) * head_dim");
+    if (v.ne[0] != head_dim || k.ne[1] != tokens || v.ne[1] != tokens) {
+        throw std::invalid_argument("encoder_attention: k/v must be [head_dim, tokens]");
     }
-    if (out.ne[0] != static_cast<std::int64_t>(q_heads) * head_dim || out.ne[1] != qkv.ne[1]) {
-        throw std::invalid_argument("encoder_attention: out must be [q_heads * head_dim, tokens]");
+    if (out.ne[0] != q.ne[0] || out.ne[1] != tokens) {
+        throw std::invalid_argument("encoder_attention: out must match q");
     }
-    if (qkv.ne[2] != 1 || qkv.ne[3] != 1) {
-        throw std::invalid_argument("encoder_attention: qkv must be one sequence");
+    for (const Tensor* t : {&q, &k, &v}) {
+        if (t->ne[2] != 1 || t->ne[3] != 1) {
+            throw std::invalid_argument("encoder_attention: inputs must be one sequence");
+        }
     }
-    if (window < 0) { throw std::invalid_argument("encoder_attention: window must not be negative"); }
-    const auto tokens = static_cast<std::int32_t>(qkv.ne[1]);
+    if (window < 0) {
+        throw std::invalid_argument("encoder_attention: window must not be negative");
+    }
     if (tokens == 0) { return; }
+    const auto q_heads = static_cast<std::int32_t>(q.ne[0] / head_dim);
     if (workspace == nullptr ||
-        workspace_bytes < encoder_attention_workspace_bytes(q_heads, tokens)) {
+        workspace_bytes <
+            encoder_attention_workspace_bytes(q_heads, static_cast<std::int32_t>(tokens))) {
         throw std::invalid_argument("encoder_attention: workspace too small");
     }
-    if (qkv.data == nullptr || out.data == nullptr) {
-        throw std::invalid_argument("encoder_attention: qkv/out data must be non-null");
+    if (q.data == nullptr || k.data == nullptr || v.data == nullptr || out.data == nullptr) {
+        throw std::invalid_argument("encoder_attention: q/k/v/out data must be non-null");
     }
 
-    detail::encoder_attention_launch(qkv, q_heads, head_dim, window, scale, out, workspace,
-                                     stream);
+    detail::encoder_attention_launch(q, k, v, window, scale, out, workspace, stream);
 }
 
 } // namespace sinfer::ops

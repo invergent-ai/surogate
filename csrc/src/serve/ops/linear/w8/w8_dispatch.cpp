@@ -100,6 +100,32 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
             return launch_w8_mma_r64_c128;
         }
         break;
+    // EmbeddingGemma (hidden 768, intermediate 1152). Every projection of the
+    // encoder lands here: q and the attention output are square 768, k and v are
+    // 256 rows, and the MLP gate/up are 1152. An encoder has no decode step, so
+    // T is the whole prompt and the small-T bands below matter far less than they
+    // do for a generative target -- they are kept only so a one-token request
+    // does not fall onto a 64-row tile. Bands follow the schedule the other
+    // narrow-hidden entries use; nothing here is measured yet.
+    case 768:
+        switch (n) {
+        case 768:  // attention query, attention output
+        case 256:  // attention key, attention value
+        case 1152: // mlp gate, mlp up
+            if (t <= 16) { return launch_w8_simt_r8_c4; }
+            if (t <= 128) { return launch_w8_mma_r32_c128; }
+            return launch_w8_mma_r64_c128;
+        default:
+            break;
+        }
+        break;
+    case 1152:
+        if (n == 768) { // mlp down
+            if (t <= 16) { return launch_w8_simt_r8_c4; }
+            if (t <= 128) { return launch_w8_mma_r32_c128; }
+            return launch_w8_mma_r64_c128;
+        }
+        break;
     case 1024:
         // surogate vendor patch (PATCHES.md #13/#29): qwen3.5-0.8b heads
         // (lm head 248320, draft head 131072; hidden 1024).
