@@ -201,9 +201,11 @@ def _build_text_core_specs() -> tuple[TensorSpec, ...]:
 
 TEXT_CORE_TENSOR_SPECS = _build_text_core_specs()
 
-# Serving carries the vision tower on every target. Flash-Next's is the Qwen3.6
-# tower (27 layers of 1152) merging into this model's 2560-wide text stack.
-VISION_TENSOR_SPECS = build_vision_specs(HIDDEN)
+# The declaration describes Flash-Next's vision tower (the Qwen3.6 one, 27 layers
+# of 1152), but this target's binder does not consume vision objects and the
+# engine refuses to load an artifact carrying any it cannot bind. Not exported
+# until the target binds it.
+VISION_TENSOR_SPECS: tuple[TensorSpec, ...] = ()
 
 TENSOR_SPECS = TEXT_CORE_TENSOR_SPECS + VISION_TENSOR_SPECS
 PLE_TABLE_SPEC = ResourceSpec(PLE_TABLE_RESOURCE)
@@ -225,13 +227,8 @@ def validate_inventory() -> None:
     if PLE_LAYER not in GDN_LAYERS:
         raise ValueError("the PLE layer is expected to be a GDN layer")
     per_layer_w8 = 4  # routed gate_up, routed down, shared gate_up, shared down
-    vision_w8 = 2  # the merger's two projections; the tower's own weights are K-quants
     expected_w8 = (
-        2
-        + LAYERS * per_layer_w8
-        + len(FULL_ATTENTION_LAYERS) * 2
-        + len(GDN_LAYERS) * 2
-        + vision_w8
+        2 + LAYERS * per_layer_w8 + len(FULL_ATTENTION_LAYERS) * 2 + len(GDN_LAYERS) * 2
     )
     if FORMAT_COUNTS[W8] != expected_w8:
         raise ValueError(f"expected {expected_w8} W8 objects, found {FORMAT_COUNTS[W8]}")

@@ -110,26 +110,33 @@ QWEN3_5_VISION_SERVE_SECTION_OBJECTS: tuple[ServeObject, ...] = (
 
 QWEN3_5_VISION_HEAD_OBJECTS: tuple[ServeObject, ...] = (
     ServeObject("vision/patch_embedding", "quantised", ("VisionHidden", "VisionPatchRows"),
-                scope="model"),
-    ServeObject("vision/patch_embedding_bias", "bf16", ("VisionHidden",), scope="model"),
+                scope="model", capability="vision"),
+    ServeObject("vision/patch_embedding_bias", "bf16", ("VisionHidden",), scope="model",
+                capability="vision"),
     ServeObject("vision/position_embedding", "bf16",
-                ("VisionPositionEmbeddings", "VisionHidden"), scope="model"),
+                ("VisionPositionEmbeddings", "VisionHidden"), scope="model",
+                capability="vision"),
 )
 
 QWEN3_5_VISION_MERGER_OBJECTS: tuple[ServeObject, ...] = (
     ServeObject("vision/merger/fc1", "quantised", ("VisionMergerHidden", "VisionMergerHidden"),
-                scope="model"),
-    ServeObject("vision/merger/fc1_bias", "bf16", ("VisionMergerHidden",), scope="model"),
-    ServeObject("vision/merger/fc2", "quantised", ("C", "VisionMergerHidden"), scope="model"),
-    ServeObject("vision/merger/fc2_bias", "bf16", ("C",), scope="model"),
-    ServeObject("vision/merger/norm/weight", "bf16", ("VisionHidden",), scope="model"),
-    ServeObject("vision/merger/norm/bias", "bf16", ("VisionHidden",), scope="model"),
+                scope="model", capability="vision"),
+    ServeObject("vision/merger/fc1_bias", "bf16", ("VisionMergerHidden",), scope="model",
+                capability="vision"),
+    ServeObject("vision/merger/fc2", "quantised", ("C", "VisionMergerHidden"),
+                scope="model", capability="vision"),
+    ServeObject("vision/merger/fc2_bias", "bf16", ("C",), scope="model", capability="vision"),
+    ServeObject("vision/merger/norm/weight", "bf16", ("VisionHidden",), scope="model",
+                capability="vision"),
+    ServeObject("vision/merger/norm/bias", "bf16", ("VisionHidden",), scope="model",
+                capability="vision"),
 )
 
 QWEN3_5_VISION_SERVE_SECTION = ServeSection(
     prefix="vision/layers/",
     objects=QWEN3_5_VISION_SERVE_SECTION_OBJECTS,
     repeat="vision_layers",
+    capability="vision",
 )
 
 # Serving always carries the tower, so the model-level object list gains its head

@@ -558,3 +558,48 @@ One unrelated gap found on the way: `Qwen/Qwen3.5-0.8B` does not publish a
 requires one, so that target cannot convert from its own checkpoint. The 9B is in
 the same position. Not caused by this work, but it is why the parity run uses the
 2B.
+
+## The engine settles it: an artifact may not carry what no binder consumes
+
+Converting the 2B and starting the engine on it produced:
+
+```
+error: artifact object was not consumed by the selected target: vision/patch_embedding
+```
+
+That refutes the caveat two sections above, which said the tower would "travel in
+the artifact and be ignored". It is not ignored; it is a hard load failure. The
+previous two commits therefore made four targets unservable, and only running the
+engine found it — no test did, because every test compared descriptions to each
+other and none of them loaded an artifact.
+
+It also corrects the reading that started this. `qwen3_5_2b/impl/load/bindings.cpp`
+says, in C++:
+
+```cpp
+// Text-only target: the qwen3_5_2b artifact carries no vision objects
+if (features.vision) {
+    throw std::runtime_error("qwen3.5-2b target is text-only: --vision is unsupported");
+}
+```
+
+So `VISION_TENSOR_SPECS = ()  # text-only target` was not a stub contradicting a
+design — it agreed with one. The dead `_build_vision_specs` beside it was the only
+genuine leftover. "Serving needs vision always" is a direction the engine does not
+yet implement for these targets, not a description of what it does.
+
+The resolution keeps both halves honest. `ServeObject` and `ServeSection` carry a
+`capability`, and `inventory_for` takes the set a target implements: the
+declaration describes the whole model — every Qwen3.5 checkpoint has a tower, with
+its own geometry — while a target exports only what its binder consumes.
+`test_declaration_describes_more_than_any_target_exports` pins that distinction so
+the declaration cannot quietly decay into a description of one target's export.
+
+Capability by target, read from the binders rather than assumed: `qwen3_6_27b` and
+`qwen3_6_35b_a3b` consume vision; `qwen3_5_0_8b`, `qwen3_5_2b` and `qwen3_5_4b`
+reject it explicitly; `qwen4exp` has no vision binding at all. Making vision
+universal means implementing it in those targets — binder, forward and the
+`--vision` gate — which is C++ work this exercise has now scoped rather than done.
+
+Verified end to end: the 2B converts to 281 objects, the engine loads it, and it
+answers a real request. 380 CPU tests pass.

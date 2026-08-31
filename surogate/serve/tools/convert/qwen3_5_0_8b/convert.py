@@ -171,12 +171,12 @@ def preflight_inventory() -> None:
         len(inventory.VISION_TENSOR_SPECS),
         len(inventory.TENSOR_SPECS),
         len(inventory.OBJECT_SPECS),
-    ) != (6, 267, 2, 12, 153, 434, 440):
+    ) != (6, 267, 2, 12, 0, 281, 287):
         raise ValueError("registered inventory is incomplete")
     if (
         len(inventory.TENSOR_SPECS_NO_MTP),
         len(inventory.OBJECT_SPECS_NO_MTP),
-    ) != (422, 428):
+    ) != (269, 275):
         raise ValueError("registered no-MTP inventory is incomplete")
     recipe.validate_recipe_coverage()
 

@@ -50,12 +50,16 @@ CHECKED_TARGETS = (("qwen4exp", "models/Qwen3.8-Flash-Next-frontend"),)
 #: where its checkpoint config lives. `qwen3_6_27b` and `qwen3_8_27b` are absent
 #: only because their configs are not on this machine — nothing about them is
 #: known to be undeclarable.
+#: (target, config source, what the target's C++ binder consumes). The engine
+#: refuses to load an artifact holding an object no binder consumes, so an
+#: artifact carries a capability's objects only when its target implements it —
+#: the three Qwen3.5 targets and qwen4exp are text-only in C++ today.
 INVENTORY_TARGETS = (
-    ("qwen4exp", "dir:models/Qwen3.8-Flash-Next-frontend"),
-    ("qwen3_5_0_8b", "hub:models--Qwen--Qwen3.5-0.8B"),
-    ("qwen3_5_2b", "hub:models--Qwen--Qwen3.5-2B"),
-    ("qwen3_5_4b", "hub:models--Qwen--Qwen3.5-4B"),
-    ("qwen3_6_35b_a3b", "hub:models--Qwen--Qwen3.6-35B-A3B"),
+    ("qwen4exp", "dir:models/Qwen3.8-Flash-Next-frontend", {"text"}),
+    ("qwen3_5_0_8b", "hub:models--Qwen--Qwen3.5-0.8B", {"text"}),
+    ("qwen3_5_2b", "hub:models--Qwen--Qwen3.5-2B", {"text"}),
+    ("qwen3_5_4b", "hub:models--Qwen--Qwen3.5-4B", {"text"}),
+    ("qwen3_6_35b_a3b", "hub:models--Qwen--Qwen3.6-35B-A3B", {"text", "vision", "dflash"}),
 )
 
 
@@ -70,8 +74,8 @@ def _resolve_source(source: str) -> pathlib.Path | None:
     return pathlib.Path(hits[0]) if hits else None
 
 
-@pytest.mark.parametrize("target,source", INVENTORY_TARGETS)
-def test_artifact_inventory_derives_from_the_declaration(emitters, target, source):
+@pytest.mark.parametrize("target,source,capabilities", INVENTORY_TARGETS)
+def test_artifact_inventory_derives_from_the_declaration(emitters, target, source, capabilities):
     """The whole artifact — text stack, MTP head, vision tower, DFlash scorer —
     must be what the declaration implies, name, shape and numeric width."""
 
@@ -84,7 +88,7 @@ def test_artifact_inventory_derives_from_the_declaration(emitters, target, sourc
 
     hf_config = json.loads(config_path.read_text())
     architecture = (hf_config.get("architectures") or [hf_config.get("model_type")])[0]
-    derived = emit_inventory.inventory_for(architecture, hf_config)
+    derived = emit_inventory.inventory_for(architecture, hf_config, capabilities=capabilities)
 
     inventory = importlib.import_module(f"surogate.serve.tools.convert.{target}.inventory")
     committed = {s.name: (tuple(s.shape), s.format) for s in inventory.TENSOR_SPECS}
@@ -168,6 +172,28 @@ def test_text_struct_scoping_is_not_fooled_by_sibling_structs(emitters):
     struct DFlashConfig { static constexpr int layers = 1; };
     """
     assert check_contract.parse_constants(header)["layers"] == 48
+
+
+def test_declaration_describes_more_than_any_target_exports():
+    """The declaration is the model, not the artifact. Every Qwen3.5 checkpoint
+    has a vision tower; the text-only targets do not export it because their
+    binders reject it. Losing that distinction would mean the declaration had
+    quietly become a description of one target's export instead."""
+
+    emit_inventory = pytest.importorskip("emit_inventory")
+    config_path = _resolve_source("hub:models--Qwen--Qwen3.5-2B")
+    if config_path is None:
+        pytest.skip("no Qwen3.5-2B config")
+
+    hf_config = json.loads(config_path.read_text())
+    architecture = (hf_config.get("architectures") or [hf_config.get("model_type")])[0]
+    everything = emit_inventory.inventory_for(architecture, hf_config)
+    text_only = emit_inventory.inventory_for(architecture, hf_config, capabilities={"text"})
+
+    tower = [o for o in everything if o["name"].startswith("vision/")]
+    assert tower, "the declaration should describe this model's vision tower"
+    assert not [o for o in text_only if o["name"].startswith("vision/")]
+    assert len(everything) > len(text_only)
 
 
 @pytest.mark.parametrize("target,model_dir", CHECKED_TARGETS)

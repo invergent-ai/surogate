@@ -107,8 +107,26 @@ def resolve(shape: tuple[str | int, ...], symbols: dict[str, int]) -> tuple[int,
     return tuple(resolved)
 
 
-def inventory_for(architecture: str, hf_config: dict[str, Any]) -> list[dict[str, Any]]:
-    """Every tensor a serving artifact stores, from the declaration alone."""
+def inventory_for(
+    architecture: str,
+    hf_config: dict[str, Any],
+    *,
+    capabilities: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Every tensor a serving artifact stores, from the declaration alone.
+
+    `capabilities` names what the *target* consumes. The declaration describes
+    the whole model — every Qwen3.5 checkpoint has a vision tower — but a
+    serve target binds only what its C++ knows about, and the engine refuses
+    to load an artifact carrying an object no binder consumes:
+
+        artifact object was not consumed by the selected target:
+        vision/patch_embedding
+
+    So a section whose capability the target lacks is declared and not
+    exported. `None` means every capability, which is what a check of the
+    declaration itself wants.
+    """
 
     from surogate.dsl.decorators import _block_registry, _model_registry  # noqa: PLC2701
 
@@ -153,6 +171,10 @@ def inventory_for(architecture: str, hf_config: dict[str, Any]) -> list[dict[str
             "transform": obj.transform,
         })
 
+    def supported(obj) -> bool:
+        return capabilities is None or obj.capability in capabilities
+
+    model_objects = [o for o in model_objects if supported(o)]
     leading = [o for o in model_objects if o.name.endswith("token_embedding")]
     trailing = [o for o in model_objects if o not in leading]
     for obj in leading:
@@ -169,6 +191,8 @@ def inventory_for(architecture: str, hf_config: dict[str, Any]) -> list[dict[str
         emit(obj.name, obj)
 
     for section in getattr(model_class, "_serve_sections_", ()):
+        if capabilities is not None and section.capability not in capabilities:
+            continue
         count = section.repeat if isinstance(section.repeat, int) else config[section.repeat]
         for index in range(count):
             prefix = section.prefix if count == 1 else f"{section.prefix}{index}/"

@@ -69,15 +69,17 @@ QWEN3_5_MOE_DFLASH_SERVE_SECTION = ServeSection(
         ServeObject("mlp/down", "quantised", ("C", "DflashFfn")),
     ),
     repeat="dflash_layers",
+    capability="dflash",
 )
 
 QWEN3_5_MOE_DFLASH_HEAD_OBJECTS: tuple[ServeObject, ...] = (
-    ServeObject("dflash/feature_projection", "quantised", ("C", "DflashFeatureRows"), scope="model"),
-    ServeObject("dflash/context_norm", "bf16", ("C",), scope="model"),
+    ServeObject("dflash/feature_projection", "quantised", ("C", "DflashFeatureRows"), scope="model",
+                capability="dflash"),
+    ServeObject("dflash/context_norm", "bf16", ("C",), scope="model", capability="dflash"),
 )
 
 QWEN3_5_MOE_DFLASH_TAIL_OBJECTS: tuple[ServeObject, ...] = (
-    ServeObject("dflash/final_norm", "bf16", ("C",), scope="model"),
+    ServeObject("dflash/final_norm", "bf16", ("C",), scope="model", capability="dflash"),
 )
 
 def _build_qwen3_5_moe_expert_mappings(layer_prefix: str) -> dict[str, object]:

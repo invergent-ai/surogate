@@ -50,6 +50,8 @@ class ServeObject:
     #: Layers this object exists on: every layer, or only the ones running this
     #: mixer. `None` means "wherever the block it belongs to runs".
     scope: Literal["block", "model"] = "block"
+    #: What a target must implement to consume this object; see `ServeSection`.
+    capability: str = "text"
 
 
 @dataclass(frozen=True)
@@ -69,6 +71,11 @@ class ServeSection:
     prefix: str
     objects: tuple["ServeObject", ...] = ()
     repeat: str | int = 1
+    #: What a target must implement to consume this section. A target that does
+    #: not is not merely uninterested — the engine refuses to load an artifact
+    #: holding objects no binder consumes — so the section is declared and simply
+    #: not exported for it.
+    capability: str = "text"
 
 
 @dataclass(frozen=True)

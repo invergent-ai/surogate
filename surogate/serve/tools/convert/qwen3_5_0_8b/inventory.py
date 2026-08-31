@@ -117,17 +117,11 @@ def _build_mtp_specs() -> tuple[TensorSpec, ...]:
 
 
 def _build_vision_specs() -> tuple[TensorSpec, ...]:
-    # This target's own tower, not the Qwen3.6 default. Serving carries vision
-    # on every target; the geometry comes from the model's vision_config, which
-    # the DSL declaration is the source of truth for.
-    return build_vision_specs(
-        1024,
-        layers=12,
-        hidden=768,
-        intermediate=3072,
-        qkv_rows=2304,
-        merger_hidden=3072,
-    )
+    # This target's C++ binder is explicitly text-only ("--vision is
+    # unsupported"), and the engine refuses to load an artifact holding an
+    # object no binder consumes. The declaration describes the tower; this
+    # target does not export it until the engine can bind it.
+    return ()
 
 
 TEXT_CORE_TENSOR_SPECS = _build_text_core_specs()
