@@ -130,8 +130,10 @@ class VisionTower(Module):
             eps=self.eps,
         )
         qkv = g.matmul_bias(
-            g.matmul(normed, tracer.prefixed(name + "qkv_weight"), transpose="NT"),
+            normed,
+            tracer.prefixed(name + "qkv_weight"),
             tracer.prefixed(name + "qkv_bias"),
+            transpose="NT",
             out_name=tracer.prefixed(name + "qkv"),
         )
         qkv = g.view(qkv, shape=["P", 3, self.VHeads, self.VHeadDim],
@@ -142,8 +144,10 @@ class VisionTower(Module):
         attended = g.view(attended, shape=["P", self.VH],
                           out_name=tracer.prefixed(name + "attn_flat"))
         projected = g.matmul_bias(
-            g.matmul(attended, tracer.prefixed(name + "out_weight"), transpose="NT"),
+            attended,
+            tracer.prefixed(name + "out_weight"),
             tracer.prefixed(name + "out_bias"),
+            transpose="NT",
             out_name=tracer.prefixed(name + "attn_out"),
         )
         x = g.add(x, projected, out_name=tracer.prefixed(name + "res_attn"))
@@ -153,14 +157,18 @@ class VisionTower(Module):
             eps=self.eps,
         )
         hidden = g.matmul_bias(
-            g.matmul(normed2, tracer.prefixed(name + "fc1_weight"), transpose="NT"),
+            normed2,
+            tracer.prefixed(name + "fc1_weight"),
             tracer.prefixed(name + "fc1_bias"),
+            transpose="NT",
             out_name=tracer.prefixed(name + "fc1"),
         )
         hidden = g.gelu(hidden, out_name=tracer.prefixed(name + "act"))
         hidden = g.matmul_bias(
-            g.matmul(hidden, tracer.prefixed(name + "fc2_weight"), transpose="NT"),
+            hidden,
+            tracer.prefixed(name + "fc2_weight"),
             tracer.prefixed(name + "fc2_bias"),
+            transpose="NT",
             out_name=tracer.prefixed(name + "fc2"),
         )
         return g.add(x, hidden, out_name=tracer.prefixed(name + "res_mlp"))
@@ -187,8 +195,10 @@ class VisionTower(Module):
         )
 
         x = g.matmul_bias(
-            g.matmul(patches.ref, tracer.prefixed("patch_embed_weight"), transpose="NT"),
+            patches.ref,
+            tracer.prefixed("patch_embed_weight"),
             tracer.prefixed("patch_embed_bias"),
+            transpose="NT",
             out_name=tracer.prefixed("patch_embed"),
         )
         # The position table is gathered per patch by the caller's index; adding it
@@ -205,14 +215,18 @@ class VisionTower(Module):
         merged = g.view(merged, shape=["P // merge_unit", self.VMerged],
                         out_name=tracer.prefixed("merged"))
         merged = g.matmul_bias(
-            g.matmul(merged, tracer.prefixed("merger_fc1_weight"), transpose="NT"),
+            merged,
+            tracer.prefixed("merger_fc1_weight"),
             tracer.prefixed("merger_fc1_bias"),
+            transpose="NT",
             out_name=tracer.prefixed("merger_fc1"),
         )
         merged = g.gelu(merged, out_name=tracer.prefixed("merger_act"))
         out = g.matmul_bias(
-            g.matmul(merged, tracer.prefixed("merger_fc2_weight"), transpose="NT"),
+            merged,
+            tracer.prefixed("merger_fc2_weight"),
             tracer.prefixed("merger_fc2_bias"),
+            transpose="NT",
             out_name=out_slot,
         )
         return Proxy(out_slot, out)
