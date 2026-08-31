@@ -90,6 +90,134 @@ std::vector<int> one_numa_node(const std::vector<int>& cores) {
     return out.empty() ? cores : out;
 }
 
+
+// --- dot products -----------------------------------------------------------
+//
+// The file is compiled generic; only these carry AVX-512, selected once at
+// startup. `cpu_expert_compute.cpp` does the same, and for the same reason: a
+// binary built here has to start on a host without the instructions.
+
+float dot_scalar(const float* a, const float* b, std::int32_t n) {
+    float sum = 0.0F;
+    for (std::int32_t i = 0; i < n; ++i) { sum += a[i] * b[i]; }
+    return sum;
+}
+
+void axpy_scalar(float weight, const float* x, float* out, std::int32_t n) {
+    for (std::int32_t i = 0; i < n; ++i) { out[i] += weight * x[i]; }
+}
+
+#if defined(__x86_64__)
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512dq,fma")))
+float dot_avx512(const float* a, const float* b, std::int32_t n) {
+    __m512 acc0 = _mm512_setzero_ps();
+    __m512 acc1 = _mm512_setzero_ps();
+    std::int32_t i = 0;
+    // Two accumulators: one FMA chain cannot cover the unit's latency.
+    for (; i + 2 * kLanes <= n; i += 2 * kLanes) {
+        acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i), acc0);
+        acc1 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i + kLanes), _mm512_loadu_ps(b + i + kLanes),
+                               acc1);
+    }
+    for (; i + kLanes <= n; i += kLanes) {
+        acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i), acc0);
+    }
+    float sum = _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
+    for (; i < n; ++i) { sum += a[i] * b[i]; }
+    return sum;
+}
+
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512dq,fma")))
+void axpy_avx512(float weight, const float* x, float* out, std::int32_t n) {
+    const __m512 w = _mm512_set1_ps(weight);
+    std::int32_t i = 0;
+    for (; i + kLanes <= n; i += kLanes) {
+        _mm512_storeu_ps(out + i,
+                         _mm512_fmadd_ps(w, _mm512_loadu_ps(x + i), _mm512_loadu_ps(out + i)));
+    }
+    for (; i < n; ++i) { out[i] += weight * x[i]; }
+}
+
+bool have_avx512() {
+    static const bool yes = __builtin_cpu_supports("avx512f") &&
+                            __builtin_cpu_supports("avx512bw") &&
+                            __builtin_cpu_supports("avx512vl") &&
+                            __builtin_cpu_supports("avx512dq");
+    return yes;
+}
+#endif
+
+inline float dot(const float* a, const float* b, std::int32_t n) {
+#if defined(__x86_64__)
+    if (have_avx512()) { return dot_avx512(a, b, n); }
+#endif
+    return dot_scalar(a, b, n);
+}
+
+inline void axpy(float weight, const float* x, float* out, std::int32_t n) {
+#if defined(__x86_64__)
+    if (have_avx512()) { return axpy_avx512(weight, x, out, n); }
+#endif
+    axpy_scalar(weight, x, out, n);
+}
+
+
+#if defined(__x86_64__)
+/// 4 weight rows x 4 token columns, accumulated in registers.
+///
+/// A dot-product GEMM issues one FMA per two loads and then pays a horizontal
+/// reduction for every single output, which leaves it load-bound well below the
+/// FMA units. Blocking four by four turns eight loads per k-step into sixteen
+/// FMAs and amortises the reductions sixteen ways -- the ratio Zen4's two loads
+/// and two FMAs per cycle actually want.
+__attribute__((target("avx512f,avx512bw,avx512vl,avx512dq,fma")))
+void gemm_4x4_avx512(const float* w0, const float* w1, const float* w2, const float* w3,
+                     const float* x0, const float* x1, const float* x2, const float* x3,
+                     std::int32_t k, float* out, std::int32_t out_stride) {
+    __m512 acc[4][4];
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) { acc[r][c] = _mm512_setzero_ps(); }
+    }
+    std::int32_t i = 0;
+    for (; i + kLanes <= k; i += kLanes) {
+        const __m512 wv0 = _mm512_loadu_ps(w0 + i);
+        const __m512 wv1 = _mm512_loadu_ps(w1 + i);
+        const __m512 wv2 = _mm512_loadu_ps(w2 + i);
+        const __m512 wv3 = _mm512_loadu_ps(w3 + i);
+        const __m512 xv0 = _mm512_loadu_ps(x0 + i);
+        const __m512 xv1 = _mm512_loadu_ps(x1 + i);
+        const __m512 xv2 = _mm512_loadu_ps(x2 + i);
+        const __m512 xv3 = _mm512_loadu_ps(x3 + i);
+        acc[0][0] = _mm512_fmadd_ps(wv0, xv0, acc[0][0]);
+        acc[0][1] = _mm512_fmadd_ps(wv0, xv1, acc[0][1]);
+        acc[0][2] = _mm512_fmadd_ps(wv0, xv2, acc[0][2]);
+        acc[0][3] = _mm512_fmadd_ps(wv0, xv3, acc[0][3]);
+        acc[1][0] = _mm512_fmadd_ps(wv1, xv0, acc[1][0]);
+        acc[1][1] = _mm512_fmadd_ps(wv1, xv1, acc[1][1]);
+        acc[1][2] = _mm512_fmadd_ps(wv1, xv2, acc[1][2]);
+        acc[1][3] = _mm512_fmadd_ps(wv1, xv3, acc[1][3]);
+        acc[2][0] = _mm512_fmadd_ps(wv2, xv0, acc[2][0]);
+        acc[2][1] = _mm512_fmadd_ps(wv2, xv1, acc[2][1]);
+        acc[2][2] = _mm512_fmadd_ps(wv2, xv2, acc[2][2]);
+        acc[2][3] = _mm512_fmadd_ps(wv2, xv3, acc[2][3]);
+        acc[3][0] = _mm512_fmadd_ps(wv3, xv0, acc[3][0]);
+        acc[3][1] = _mm512_fmadd_ps(wv3, xv1, acc[3][1]);
+        acc[3][2] = _mm512_fmadd_ps(wv3, xv2, acc[3][2]);
+        acc[3][3] = _mm512_fmadd_ps(wv3, xv3, acc[3][3]);
+    }
+    const float* w[4] = {w0, w1, w2, w3};
+    const float* x[4] = {x0, x1, x2, x3};
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            float sum = _mm512_reduce_add_ps(acc[r][c]);
+            for (std::int32_t t = i; t < k; ++t) { sum += w[r][t] * x[c][t]; }
+            out[static_cast<std::int64_t>(c) * out_stride + r] = sum;
+        }
+    }
+}
+#endif
+
 inline float gelu_tanh(float z) {
     constexpr float kSqrt2Pi = 0.79788456080286535588F;
     return 0.5F * z * (1.0F + std::tanh(kSqrt2Pi * (z + 0.044715F * z * z * z)));
@@ -204,28 +332,47 @@ void ThreadPool::parallel_for(std::int64_t count,
 
 void gemm(const float* w, const float* x, float* out, std::int32_t n, std::int32_t k,
           std::int32_t tokens, ThreadPool& pool) {
-    // Partition over output rows: each row of w is read once per token block and
-    // every thread writes a disjoint stripe of `out`, so there is nothing shared
-    // to contend on.
-    pool.parallel_for(n, [&](std::int64_t begin, std::int64_t end) {
-        for (std::int64_t row = begin; row < end; ++row) {
-            const float* w_row = w + row * k;
-            for (std::int32_t t = 0; t < tokens; ++t) {
-                const float* x_col = x + static_cast<std::int64_t>(t) * k;
-#if defined(__AVX512F__)
-                __m512 acc = _mm512_setzero_ps();
-                std::int32_t i = 0;
-                for (; i + kLanes <= k; i += kLanes) {
-                    acc = _mm512_fmadd_ps(_mm512_loadu_ps(w_row + i), _mm512_loadu_ps(x_col + i),
-                                          acc);
+    // One barrier for the whole GEMM: partition the output rows once, and let
+    // each thread walk its own rows against every token. An earlier version
+    // tiled tokens in an outer loop and paid a barrier per tile -- 1,512 of them
+    // per forward -- which cost more than the tiling saved.
+    constexpr std::int32_t kBlock = 4;
+    const std::int64_t blocks     = (n + kBlock - 1) / kBlock;
+
+    pool.parallel_for(blocks, [&](std::int64_t begin, std::int64_t end) {
+        for (std::int64_t block = begin; block < end; ++block) {
+            const std::int32_t row0 = static_cast<std::int32_t>(block) * kBlock;
+            const std::int32_t rows = std::min(kBlock, n - row0);
+#if defined(__x86_64__)
+            if (have_avx512() && rows == kBlock) {
+                const float* w0 = w + static_cast<std::int64_t>(row0 + 0) * k;
+                const float* w1 = w + static_cast<std::int64_t>(row0 + 1) * k;
+                const float* w2 = w + static_cast<std::int64_t>(row0 + 2) * k;
+                const float* w3 = w + static_cast<std::int64_t>(row0 + 3) * k;
+                std::int32_t t  = 0;
+                for (; t + kBlock <= tokens; t += kBlock) {
+                    gemm_4x4_avx512(w0, w1, w2, w3, x + static_cast<std::int64_t>(t + 0) * k,
+                                    x + static_cast<std::int64_t>(t + 1) * k,
+                                    x + static_cast<std::int64_t>(t + 2) * k,
+                                    x + static_cast<std::int64_t>(t + 3) * k, k,
+                                    out + static_cast<std::int64_t>(t) * n + row0, n);
                 }
-                float sum = _mm512_reduce_add_ps(acc);
-                for (; i < k; ++i) { sum += w_row[i] * x_col[i]; }
-#else
-                float sum = 0.0F;
-                for (std::int32_t i = 0; i < k; ++i) { sum += w_row[i] * x_col[i]; }
+                for (; t < tokens; ++t) { // ragged tail of tokens
+                    for (std::int32_t r = 0; r < rows; ++r) {
+                        out[static_cast<std::int64_t>(t) * n + row0 + r] =
+                            dot(w + static_cast<std::int64_t>(row0 + r) * k,
+                                x + static_cast<std::int64_t>(t) * k, k);
+                    }
+                }
+                continue;
+            }
 #endif
-                out[static_cast<std::int64_t>(t) * n + row] = sum;
+            for (std::int32_t r = 0; r < rows; ++r) {
+                const float* w_row = w + static_cast<std::int64_t>(row0 + r) * k;
+                for (std::int32_t t = 0; t < tokens; ++t) {
+                    out[static_cast<std::int64_t>(t) * n + row0 + r] =
+                        dot(w_row, x + static_cast<std::int64_t>(t) * k, k);
+                }
             }
         }
     });
@@ -313,19 +460,7 @@ void attention(const float* q, const float* k, const float* v, float* out, std::
             float maximum = -std::numeric_limits<float>::infinity();
             for (std::int32_t key = lo; key < hi; ++key) {
                 const float* k_col = k + static_cast<std::int64_t>(key) * head_dim;
-                float dot          = 0.0F;
-#if defined(__AVX512F__)
-                __m512 acc     = _mm512_setzero_ps();
-                std::int32_t d = 0;
-                for (; d + kLanes <= head_dim; d += kLanes) {
-                    acc = _mm512_fmadd_ps(_mm512_loadu_ps(q_row + d), _mm512_loadu_ps(k_col + d),
-                                          acc);
-                }
-                dot = _mm512_reduce_add_ps(acc);
-                for (; d < head_dim; ++d) { dot += q_row[d] * k_col[d]; }
-#else
-                for (std::int32_t d = 0; d < head_dim; ++d) { dot += q_row[d] * k_col[d]; }
-#endif
+                const float dot = ::sinfer::encoder::cpu::dot(q_row, k_col, head_dim);
                 const float value                            = dot * scale;
                 weights[static_cast<std::size_t>(key - lo)]  = value;
                 maximum                                      = std::max(maximum, value);
@@ -344,17 +479,7 @@ void attention(const float* q, const float* k, const float* v, float* out, std::
             for (std::int32_t key = lo; key < hi; ++key) {
                 const float weight = weights[static_cast<std::size_t>(key - lo)] * inverse;
                 const float* v_col = v + static_cast<std::int64_t>(key) * head_dim;
-#if defined(__AVX512F__)
-                const __m512 w = _mm512_set1_ps(weight);
-                std::int32_t d = 0;
-                for (; d + kLanes <= head_dim; d += kLanes) {
-                    _mm512_storeu_ps(target + d, _mm512_fmadd_ps(w, _mm512_loadu_ps(v_col + d),
-                                                                _mm512_loadu_ps(target + d)));
-                }
-                for (; d < head_dim; ++d) { target[d] += weight * v_col[d]; }
-#else
-                for (std::int32_t d = 0; d < head_dim; ++d) { target[d] += weight * v_col[d]; }
-#endif
+                axpy(weight, v_col, target, head_dim);
             }
         }
     });

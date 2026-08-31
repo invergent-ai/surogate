@@ -198,6 +198,10 @@ sinfer_add_op_test(sinfer_cpu_ops_test
   SOURCES encoder/test_cpu_ops.cpp
   LIBRARIES sinfer_encoder)
 
+add_executable(sinfer_cpu_embed_cli encoder/cpu_embed_cli.cpp)
+target_include_directories(sinfer_cpu_embed_cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${SERVE_ROOT})
+target_link_libraries(sinfer_cpu_embed_cli PRIVATE sinfer_encoder)
+
 # The /v1/embeddings server. Same reason for living here: it needs an artifact,
 # so it is not a ctest, but it must not be allowed to stop compiling.
 add_executable(sinfer_embedding_server ${SERVE_ROOT}/encoder/embedding_server.cpp)

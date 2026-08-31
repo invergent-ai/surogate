@@ -1212,6 +1212,7 @@ add_library(sinfer_encoder STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/encoder/gemma_embedding.cpp
   ${SERVE_ROOT}/encoder/gemma_tokenizer.cpp
   ${SERVE_ROOT}/encoder/cpu/cpu_ops.cpp
+  ${SERVE_ROOT}/encoder/cpu/cpu_gemma_embedding.cpp
 )
 sinfer_internal_includes(sinfer_encoder)
 target_include_directories(sinfer_encoder PRIVATE ${sentencepiece_SOURCE_DIR}/src)
