@@ -46,18 +46,20 @@ Q5Launch select_q5_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         }
         break;
     // Vision tower, 1024-wide (Qwen3.5 2B/4B): attention output is n = k = hidden,
-    // mlp fc2 is k = intermediate below. Schedules mirror the 1152 tower's.
+    // mlp fc2 is k = intermediate below. Measured with ninfer_vision_tower_tune_bench
+    // --hidden 1024. Mirroring 1152 had fc2 on c64 out to t=1148, where c128 in fact
+    // wins from 256, and cut the SIMT path off at 76/120 where it holds to 160.
     case 1024:
         if (n == 1024 && t >= 4 && t <= 131072 && (t % 4) == 0) {
-            if (t <= 76) { return launch_q5_simt_r8_c4; }
-            if (t <= 636) { return launch_q5_mma_r64_c64; }
+            if (t <= 160) { return launch_q5_simt_r8_c4; }
+            if (t <= 1024) { return launch_q5_mma_r64_c64; }
             return launch_q5_mma_r64_c128;
         }
         break;
     case 4096:
         if (n == 1024 && t >= 4 && t <= 131072 && (t % 4) == 0) {
-            if (t <= 120) { return launch_q5_simt_r8_c4; }
-            if (t <= 1148) { return launch_q5_mma_r64_c64; }
+            if (t <= 160) { return launch_q5_simt_r8_c4; }
+            if (t <= 196) { return launch_q5_mma_r64_c64; }
             return launch_q5_mma_r64_c128;
         }
         break;

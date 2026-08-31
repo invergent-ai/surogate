@@ -44,14 +44,19 @@ Q6Launch select_q6_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     case 1536:
         // The vision patch projection. `n` is the tower's hidden width, which is
         // per-checkpoint: 1152 for the Qwen3.6 family and Flash-Next, 1024 for the
-        // Qwen3.5 2B and 4B, 768 for the 0.8B. The launchers below read their
-        // shapes from the tensors, so the widths differ only in which tile size is
-        // fastest; the 1024 schedule mirrors 1152's rather than being measured, and
-        // both are row-tile-64 friendly (1024 = 64x16, 1152 = 64x18).
+        // Qwen3.5 2B and 4B, 768 for the 0.8B. The launchers read their shapes from
+        // the tensors, so the widths differ only in which tile is fastest.
+        //
+        // The 1024 schedule is measured, not mirrored -- ninfer_vision_tower_tune_bench
+        // --hidden 1024. Mirroring 1152's picked c64 where c96 is a third faster, and
+        // ran the SIMT path to t=96 where it stops winning at 64. Boundaries sit on
+        // the stable regions; the harness resolves ~2 us, so adjacent tiles within
+        // that of each other are interchangeable.
         if (n == 1024) {
             if (t < 4 || t > 131072 || (t % 4) != 0) { break; }
-            if (t <= 96) { return launch_q6_simt_r8_c4; }
-            if (t <= 704) { return launch_q6_mma_r64_c64; }
+            if (t <= 32) { return launch_q6_simt_r8_c4; }
+            if (t <= 64) { return launch_q6_simt_r8_c8; }
+            if (t <= 768) { return launch_q6_mma_r64_c96; }
             return launch_q6_mma_r64_c128;
         }
         if (n == 1152) {

@@ -786,3 +786,38 @@ artifact that carries no tower with that as the reason.
 So the three-way distinction is now explicit and each part lives in one place: the
 declaration says what the model is, the target says what it can consume, and the
 source says what this artifact actually holds.
+
+## Measuring the schedules the mirroring had guessed
+
+The 64-wide tower's dispatch entries were added by copying the 72-wide tower's
+tile thresholds — correctness-complete, and silent about speed.
+`ninfer_vision_tower_tune_bench` times each candidate launcher directly for the
+tower's six GEMM shapes, which the other benches in that directory deliberately
+cannot do: they measure *through* the dispatch, leaving implementation selection
+behind the op contract. Tuning needs the opposite.
+
+Mirroring was wrong on four of the six:
+
+| shape | mirrored | measured |
+| --- | --- | --- |
+| patch embedding | SIMT to t=96, then c64 | SIMT to 64, **c96** to 768, then c128 |
+| attention qkv | c64 to 320, then c128 | **c96** to 1024, then c128 |
+| attention output | SIMT to 76, c64 to 636 | SIMT to **160**, c64 to **1024** |
+| mlp fc1 | c64 to 320 | **c96** to 160, then c128 |
+| mlp fc2 | c64 to **1148** | c64 only to 196, then c128 |
+| merger fc1 | r32_c128 to 256 | agrees — r32_c128 to 256, r64_c128 above |
+
+The recurring error is `c64`, which the 1152 schedules favour and which never wins
+on this tower: `c96` is roughly a third faster across the useful range on both q4
+shapes. The worst single entry was fc2 holding c64 out to t=1148 where c128 takes
+over at 256.
+
+Two honest limits on these numbers. The harness resolves about 2 µs, so adjacent
+tiles within that of each other are interchangeable and a few "winners" flip
+between runs — the thresholds are placed on the stable regions, not on individual
+samples. And this is one tower on one card; the 1152 entries are left alone
+because they were already tuned for the targets that ship them.
+
+The image still answers correctly with the tuned tables, the C++ integration suite
+is unchanged at 30/34 with 986 assertions, and the tuning run is reproducible:
+`ninfer_vision_tower_tune_bench --hidden 1024`.
