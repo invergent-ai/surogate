@@ -485,14 +485,18 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         // the host has to reach them as data. Two of those were found and fixed --
         // the prefill graph is now captured with the launches in it, and a round
         // states its slot even when that slot is "none", which stopped base-model
-        // requests from inheriting the previous request's adapter. A third
-        // remains: decode rounds still occasionally read a stale slot, because the
-        // ingress is staged once per request rather than once per round, so a new
-        // request's first replays can run against the previous one's ids.
+        // requests from inheriting the previous request's adapter. Base output is
+        // stable under capture with those two in.
         //
-        // That last one is a cross-request leak, not a rounding difference, so it
-        // is gated rather than shipped. The fix is to stage lora_slots on every
-        // round that stages tokens.
+        // A third remains and is not yet diagnosed: an adapter's output still
+        // varies run to run. Unstaged decode ids were the obvious suspect and are
+        // NOT the cause -- both ordinary staging sites write lora_slots beside
+        // sampling, checked directly. The untested suspects are the chained decode
+        // path, which advances a round on the device without the host restaging
+        // the ingress (PATCHES #32), and the scratch buffer, which the prefill and
+        // decode graphs share. Instrument which graph a varying round replayed
+        // before changing anything; the two fixes above were each found that way
+        // and each guessed wrong first.
         if (options.use_cuda_graph) {
             options.use_cuda_graph    = false;
             options.lora_forced_eager = true;
