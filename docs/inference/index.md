@@ -7,11 +7,6 @@ standalone C++/CUDA runtime that answers OpenAI- and Anthropic-compatible HTTP r
 surogate serve Qwen/Qwen3.6-27B --port 8080
 ```
 
-It is deliberately **not** the training executor. A training step wants a full graph with
-activations retained for backward; a decode round wants one token per sequence at minimum
-latency, forever. Serving is its own runtime, and decode never routes through the training
-graph executor.
-
 ## What the engine does
 
 - **CUDA-graph-captured decode** over a paged KV cache, with continuous batching across lanes.
@@ -25,9 +20,7 @@ graph executor.
   `--cpu-moe-share`).
 - **Vision input** (images, video) for models that carry a vision tower (`--vision`).
 
-Embedding models take a separate, much smaller path: an encoder runs **one forward** — no KV
-cache, no sampler, no CUDA graphs, no round N+1 — so `surogate serve --embed` runs it in its own
-process, on either GPU or CPU. See [Serving models](serving-models.md#embedding-model-cpu-and-gpu).
+Embedding models run it in its own process, on either GPU or CPU. See [Serving models](serving-models.md#embedding-model-cpu-and-gpu).
 
 ## Conversion is transparent
 
@@ -99,13 +92,9 @@ An unrecognised model is refused at load with the reason printed, never served i
 ## Hardware
 
 The engine targets **sm_89 and sm_120** — RTX 4070 and 4090, RTX 5070/5080/5090, and
-RTX Pro 6000 Blackwell. Tensor parallelism is not offered on any of them: P2P is disabled on
-consumer cards, so multi-GPU means data-parallel replicas or pipeline stages.
+RTX Pro 6000 Blackwell. Multi-GPU is available through data-parallel replicas or pipeline stages. Tensor parallelism is not offered on any of them because P2P/NVLink is not enabled on consumer cardds. 
 
-The CPU path covers the **encoder (embedding) models only**. It needs AVX-512, dispatches at
-runtime rather than at build time, and reaches vendor GEMM libraries through a seam:
-oneDNN by default (also what OpenVINO's CPU plugin uses underneath), ZenDNN when injected at
-configure time, and a portable AVX-512 microkernel that is always present.
+The CPU path covers the **encoder (embedding) models only** and needs AVX-512 support in the CPU.
 
 ## Next
 
