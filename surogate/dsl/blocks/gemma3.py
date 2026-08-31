@@ -27,6 +27,24 @@ silently wrong:
   checkpoint, not of the family: EmbeddingGemma sets it, the generative Gemma3
   models do not. It reaches the kernel through ``AttentionConfig.causal``.
 
+**What ``sliding_window`` means once attention is bidirectional.** A causal layer
+masks ``i - j >= W``: a left window of W. A bidirectional one masks
+``abs(i - j) >= W``: W on *each* side. The convention follows from ``causal`` and
+needs no separate declaration, but it must be got right in the kernel, because
+the two reference implementations disagree:
+
+* transformers, ``modeling_gemma3.py:491`` -- ``abs(q_idx - kv_idx) < sliding_window``,
+  so +-512.
+* llama.cpp, ``LLAMA_SWA_TYPE_SYMMETRIC`` in ``llama-hparams.h:462`` -- masks when
+  ``abs(pos_diff) > n_swa / 2``, so +-256, half as wide.
+
+**Follow transformers.** It is the reference implementation for the published
+checkpoint and what produced Google's own numbers. The difference is invisible on
+short inputs -- under 256 tokens the two masks are identical -- and measurable
+beyond: on a 369-token document the pooled embeddings sit at cosine 0.998534, and
+the gap widens with length. Anything that validates only on short strings will
+not see this.
+
 Block variants:
   - Gemma3SlidingBlock: sliding-window attention, gated-GELU MLP
   - Gemma3FullBlock:    full attention, gated-GELU MLP
@@ -104,10 +122,21 @@ _GEMMA3_GELU_MLP_CONFIG = MLPConfig(
 
 #: How a serving artifact stores one Gemma 3 block.
 #:
-#: Every norm carries ``unfold_unit_offset``: Gemma stores RMSNorm weights
-#: zero-centred and applies them as ``1 + w``, so an artifact that shipped the
-#: raw tensor would scale by roughly zero. Folding the offset in at conversion
-#: keeps the runtime's norm ordinary.
+#: Every norm carries ``unfold_unit_offset``. Gemma stores RMSNorm weights
+#: zero-centred and applies them as ``1 + w``; the transform names the state the
+#: *artifact* holds -- the gain already unfolded -- so the runtime reads it with
+#: ``rmsnorm(..., unit_offset=false)``.
+#:
+#: It names a state, not a step, and the work behind it depends on the source:
+#: an HF safetensors checkpoint stores ``w`` and the converter adds the one; a
+#: GGUF already stores ``1 + w`` and the converter does nothing. Measured on
+#: embeddinggemma-300M-Q8_0: ``cos(gguf - 1, hf) == 1.000000`` for every norm.
+#:
+#: Getting this wrong is quiet and expensive in both directions. Unfold twice and
+#: the gain is ``2 + w``; pass ``unit_offset=true`` over an already-unfolded
+#: artifact and it is the same. That is exactly the live qwen3_6 indexer bug,
+#: where the converter left the GGUF's offset folded while the runtime added its
+#: own past 2,051 cached tokens.
 _GEMMA3_SERVE_OBJECTS: tuple[ServeObject, ...] = (
     ServeObject("input_norm", "bf16", ("C",), ("ln1_weight",), transform="unfold_unit_offset"),
     ServeObject("post_attention_norm", "bf16", ("C",), ("ln_post_attn_weight",),

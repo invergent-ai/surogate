@@ -21,6 +21,38 @@ through the ``full_rope_theta`` / ``sliding_rope_theta`` config attributes that
 Gemma4 reads those two bases from a nested ``rope_parameters.*`` block; Gemma 3
 publishes them flat, which is why this model needs its own ``@nn.hf_config``
 rather than another entry in Gemma4's.
+
+Conversion source
+-----------------
+
+EmbeddingGemma converts from ``ggml-org/embeddinggemma-300M-GGUF`` (Q8_0), whose
+architecture string is ``gemma-embedding``. Three facts about that file shape the
+converter:
+
+* **The GGUF under-determines the model.** Its KV carries the geometry, both rope
+  bases, ``sliding_window 512``, ``pooling_type 1`` (mean) and the four
+  ``dense_{2,3}_feat_*`` sizes -- but *not* ``query_pre_attn_scalar``, *not*
+  ``use_bidirectional_attention``, and *not* the sliding-window period.
+  llama.cpp supplies all three from the architecture identity
+  (``models/gemma-embedding.cpp``: ``swa_period = 6`` as a default,
+  ``causal_attn = false`` hardcoded, and an attention scale of
+  ``1/sqrt(n_embd_head_k)``). This declaration is where they come from here,
+  which is the case for the declaration being the source of truth rather than
+  the file.
+
+* **Norms arrive already unfolded.** The GGUF stores ``1 + w`` where the HF
+  checkpoint stores ``w``. Verified against both: ``cos(gguf - 1, hf) ==
+  1.000000`` for every norm tensor. So ``unfold_unit_offset`` -- which names the
+  state the artifact holds, not a step -- costs nothing from this source and an
+  addition from safetensors.
+
+* **Q8_0 is our W8G32_F16S.** Both are int8 codes with one binary16 scale per
+  32-group, so the row-algebra objects repack bit-exactly with no dequantize and
+  no GPU (see ``convert/common/gguf_repack.py``). The Q/K/V fuse is a row
+  operation and qualifies; the embedding-head fold is not, since it mixes ``k``,
+  and dequantizes. Measured end to end against an fp32 reference, Q8_0 costs
+  almost nothing: pooled embeddings at min cosine 0.999913, retrieval ranking
+  unchanged, and the head fold exact at min cosine 1.00000000.
 """
 
 from __future__ import annotations

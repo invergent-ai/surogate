@@ -321,3 +321,95 @@ def test_pooling_policy_is_declared():
     assert model.embedding_normalize == "l2"
     assert model.embedding_dim == 768
     assert model.matryoshka_dims == (768, 512, 256, 128)
+
+
+# ---------------------------------------------------------------------------
+# What the GGUF conversion source does and does not carry
+# ---------------------------------------------------------------------------
+
+GGUF = Path("models/embeddinggemma-300M-Q8_0.gguf")
+
+#: Present in the GGUF KV, so the converter may read them from the file.
+GGUF_SUPPLIES = {
+    "gemma-embedding.block_count": 24,
+    "gemma-embedding.embedding_length": 768,
+    "gemma-embedding.feed_forward_length": 1152,
+    "gemma-embedding.attention.head_count": 3,
+    "gemma-embedding.attention.head_count_kv": 1,
+    "gemma-embedding.attention.key_length": 256,
+    "gemma-embedding.attention.sliding_window": 512,
+    "gemma-embedding.rope.freq_base": 1000000.0,
+    "gemma-embedding.rope.freq_base_swa": 10000.0,
+    "gemma-embedding.pooling_type": 1,  # MEAN
+    "gemma-embedding.dense_2_feat_out": 3072,
+    "gemma-embedding.dense_3_feat_out": 768,
+}
+
+#: Absent from the GGUF KV. llama.cpp supplies each from the architecture
+#: identity (models/gemma-embedding.cpp); here they come from the declaration.
+#: All three are silent when wrong, which is what makes the list worth pinning.
+GGUF_OMITS = (
+    "gemma-embedding.attention.query_pre_attn_scalar",
+    "gemma-embedding.use_bidirectional_attention",
+    "gemma-embedding.attention.sliding_window_pattern",
+)
+
+
+@pytest.mark.skipif(not GGUF.exists(), reason="embeddinggemma-300M-Q8_0.gguf not downloaded")
+def test_gguf_carries_the_geometry_but_not_the_three_that_matter():
+    from gguf import GGUFReader
+
+    reader = GGUFReader(str(GGUF))
+    fields = reader.fields
+    assert fields["general.architecture"].contents() == "gemma-embedding"
+
+    for key, expected in GGUF_SUPPLIES.items():
+        assert key in fields, key
+        assert fields[key].contents() == pytest.approx(expected), key
+
+    for key in GGUF_OMITS:
+        assert key not in fields, f"{key} is now in the GGUF — read it instead of declaring it"
+
+    # And the declaration supplies exactly those three.
+    model = build_from_config(EMBEDDINGGEMMA_CONFIG)
+    assert model.query_pre_attn_scalar == 256
+    assert model.causal is False
+    assert (model.n_sliding_blocks, model.n_full_blocks) == (20, 4)
+
+
+@pytest.mark.skipif(not GGUF.exists(), reason="embeddinggemma-300M-Q8_0.gguf not downloaded")
+def test_gguf_ships_the_head_and_the_norms_pre_unfolded():
+    """316 tensors: the 314 of the safetensors checkpoint plus dense_2/dense_3.
+
+    The norms arrive as ``1 + w`` where the HF checkpoint stores ``w``, so
+    `unfold_unit_offset` is free from this source and an addition from the other.
+    Unfolding twice gives a gain of ``2 + w`` and is entirely quiet.
+    """
+    from gguf import GGUFReader
+    from gguf.quants import dequantize
+
+    reader = GGUFReader(str(GGUF))
+    tensors = {t.name: t for t in reader.tensors}
+    assert len(tensors) == 316
+    assert {"dense_2.weight", "dense_3.weight"} <= set(tensors)
+
+    have = safetensors_keys(CHECKPOINT / "model.safetensors") if (
+        CHECKPOINT / "model.safetensors"
+    ).exists() else None
+    if have is None:
+        pytest.skip("safetensors checkpoint not cached; nothing to compare the offset against")
+
+    import numpy as np
+    from safetensors.torch import load_file
+
+    hf = load_file(CHECKPOINT / "model.safetensors")
+    for gguf_name, hf_name in (
+        ("blk.0.attn_norm.weight", "layers.0.input_layernorm.weight"),
+        ("blk.0.attn_q_norm.weight", "layers.0.self_attn.q_norm.weight"),
+        ("output_norm.weight", "norm.weight"),
+    ):
+        g = dequantize(tensors[gguf_name].data, tensors[gguf_name].tensor_type).astype("float64")
+        h = hf[hf_name].float().numpy().astype("float64")
+        unfolded = g - 1.0
+        cos = float(unfolded @ h / (np.linalg.norm(unfolded) * np.linalg.norm(h)))
+        assert cos == pytest.approx(1.0, abs=1e-6), (gguf_name, cos)
