@@ -720,3 +720,46 @@ launchers with 1152's schedule, which is honest about being mirrored rather than
 measured. That the vision path had exactly one width baked into a kernel dispatch
 is the same defect as `VisionBackboneConfig`, one layer down, and it took an
 actual image to surface it.
+
+## Serving with vision: it works, after eight hardcoded layers
+
+The 2B now answers an image. Asked the colour of the square in a test picture it
+replies "Yellow", and its reasoning describes the picture correctly — "I see a
+large blue square filling most of the image… this refers to the yellow square" —
+which is the image exactly. The tower is running, not producing plausible noise.
+
+Getting there meant generalising the tower's geometry in eight places, each
+invisible from the one above and each found only by sending an actual image:
+
+| layer | was | now |
+| --- | --- | --- |
+| `VisionBackboneConfig` | 27×1152, and it sized *types* | templated on the tower |
+| `ModelView` | family `VisionWeights` | defaulted `VisionCfg` parameter |
+| `q6_dispatch` | patch embedding `n=1152` | + 1024 |
+| `q4_dispatch` | qkv 3456, fc1 4304 | + 3072, 4096 |
+| `q5_dispatch` | output 1152, fc2 `k=4304` | + 1024, `k=4096` |
+| `w8_dispatch` | merger fc1 4608² | + 4096² |
+| 2-D rope | 36 pairs split 18/18 | `Vision2D64`: 32 pairs split 16/16 |
+| vision attention | `kHeadDim=72`, `QKKs=5`, scale = 1/√72 | templated on D, both derived |
+
+The attention kernel is the one that mattered most. Its softmax scale was written
+as the literal `0.11785113019775792073f`, which is 1/√72; fixing only the shape
+checks would have run a 64-wide tower with the wrong scale and returned confident
+nonsense instead of an error. It is now a per-width constant behind a
+`static_assert`, so an unsupported head dim fails to compile rather than scaling
+silently.
+
+Two things this says about the codebase. The family's vision support was written
+for exactly one checkpoint and the assumption was replicated at every level rather
+than expressed once — which is the same disease the declaration work is treating,
+in a place the declaration does not yet reach. And every one of these eight was
+found by running, not by reading: the contract tests compare descriptions to each
+other, and no description was wrong.
+
+Also on the way: `gqa_attention_decode.cu` was instantiating five head geometries
+in one translation unit, ~5.5 min of `cicc` plus ~4.5 of `ptxas` on the critical
+path of every serve build. Split one geometry per TU, that is ~195 s for a build
+that recompiles it and 70–75 s for the ones after. And the 0.8B, which the
+converter had been refusing because the publisher ships no
+`generation_config.json`, now converts in 4.2 s: the `eos_token_id` the engine
+wants from that file is in `config.json`, so the converter derives it.
