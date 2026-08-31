@@ -7,13 +7,15 @@
 // they are here rather than behind the engine's op contract because that
 // contract takes a `cudaStream_t` in 102 of its 104 entry points.
 //
-// Weights arrive dequantised to FP32. The artifact stores W8G32_F16S -- int8
-// codes with one binary16 scale per 32 values -- and decoding it once at load
-// costs 1.2 GB of the host's 504 and buys a dense GEMM instead of a quantised
-// one. That is the right trade here and would not be on a 100 GB model.
+// Weights arrive dequantised to BF16. The artifact stores W8G32_F16S -- int8
+// codes with one binary16 scale per 32 values -- and rounding the decoded
+// values to BF16 measured as no movement in the golden cosine, while halving
+// what every GEMM reads. Decoding at load buys a dense GEMM instead of a
+// quantised one: the right trade at 0.6 GB against a host with 504, and the
+// wrong one on a 100 GB model, where the quantised kernels would come back.
 //
-// Everything is FP32. The GPU path is BF16 because its tensor cores are, and
-// the reference is FP32; on CPU the cheapest thing is also the most accurate.
+// Activations live in FP32 between ops and are narrowed once on the way into
+// each GEMM (see `narrow`); accumulation and every norm stay FP32.
 
 #include <cstddef>
 #include <cstdint>
@@ -93,15 +95,12 @@ enum class GemmBackend {
 
 /// out[n, T] = w[n, k] . x[k, T], with the weight stored BF16.
 ///
-/// BF16 weights, FP32 activations, FP32 output. The weights came from int8 codes
-/// with an FP16 scale, so BF16 storage discards nothing they carried, and it
-/// halves what every GEMM reads while letting Zen 4 use avx512_bf16. Storing
-/// FP32 and asking oneDNN for BF16 *math* is not the same thing and measured
-/// slower: it pays a conversion per call that costs more than the compute saves.
-/// Both operands BF16, output FP32. Measured on this host, BF16 x BF16 through
-/// oneDNN runs at 1,577 GFLOP/s where BF16 weights against FP32 activations run
-/// at 796 -- the conversion inside the kernel costs the fast path. Converting
-/// the activation once outside (see `narrow`) and passing BF16 keeps it.
+/// Both operands BF16, FP32 accumulate and output. Measured on this host
+/// through oneDNN: BF16 x BF16 runs at 1,577 GFLOP/s, BF16 weights against
+/// FP32 activations at 796, and FP32 storage with BF16 *math* slower still --
+/// a conversion inside every call costs more than the compute saves. Narrowing
+/// each activation once outside (see `narrow`) and passing BF16 keeps the fast
+/// path, and lets Zen 4 use avx512_bf16 in the builtin kernel too.
 void gemm(const std::uint16_t* w, const std::uint16_t* x, float* out, std::int32_t n,
           std::int32_t k, std::int32_t tokens, ThreadPool& pool);
 

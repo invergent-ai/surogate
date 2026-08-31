@@ -13,18 +13,28 @@
 // two different tokenizers.
 //
 //   sinfer_embedding_server --artifact model.sinfer [--port 8413] [--device 0]
+//   sinfer_embedding_server --artifact model.sinfer --device cpu
+//
+// CPU serving wants OMP_WAIT_POLICY=ACTIVE in the environment. Everything —
+// oneDNN and the encoder's own kernels — runs on one OpenMP team, so the spin
+// covers the microsecond gaps between phases instead of starving a second team.
+// It must be an environment variable because libgomp reads it before main.
 
 #include "core/device.h"
+#include "encoder/cpu/cpu_gemma_embedding.h"
 #include "encoder/gemma_embedding.h"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <exception>
+#include <functional>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -69,9 +79,9 @@ json error_body(const std::string& message, const char* type) {
 int main(int argc, char** argv) {
     try {
         std::string artifact;
-        std::string host = "127.0.0.1";
-        int port         = 8413;
-        int device_id    = 0;
+        std::string host   = "127.0.0.1";
+        std::string device = "0";
+        int port           = 8413;
         for (int i = 1; i < argc; ++i) {
             const std::string arg(argv[i]);
             const auto next = [&](const char* what) -> std::string {
@@ -85,24 +95,84 @@ int main(int argc, char** argv) {
             } else if (arg == "--port") {
                 port = std::stoi(next("--port"));
             } else if (arg == "--device") {
-                device_id = std::stoi(next("--device"));
+                device = next("--device");
             } else {
                 throw std::invalid_argument("unknown argument: " + arg);
             }
         }
         if (artifact.empty()) { throw std::invalid_argument("--artifact is required"); }
 
-        sinfer::DeviceContext device(device_id);
-        auto model = sinfer::encoder::GemmaEmbedding::load(artifact, device);
-        const auto& config = model.config();
-        std::fprintf(stderr, "loaded %.0f MB, %d layers, %d hidden, max %d tokens\n",
-                     static_cast<double>(model.weight_bytes()) / 1e6, config.layers, config.hidden,
-                     config.max_tokens);
+        // One of the two encoders, behind the same three calls the handler uses.
+        std::unique_ptr<sinfer::DeviceContext> gpu_device;
+        std::unique_ptr<sinfer::encoder::GemmaEmbedding> gpu;
+        std::unique_ptr<sinfer::encoder::cpu::CpuGemmaEmbedding> host_model;
+        if (device == "cpu") {
+            host_model = std::make_unique<sinfer::encoder::cpu::CpuGemmaEmbedding>(
+                sinfer::encoder::cpu::CpuGemmaEmbedding::load(artifact));
+            std::fprintf(stderr, "cpu: %.0f MB on %d threads, gemm backend %s\n",
+                         static_cast<double>(host_model->weight_bytes()) / 1e6,
+                         host_model->threads(), sinfer::encoder::cpu::gemm_backend_name());
+        } else {
+            gpu_device = std::make_unique<sinfer::DeviceContext>(std::stoi(device));
+            gpu        = std::make_unique<sinfer::encoder::GemmaEmbedding>(
+                sinfer::encoder::GemmaEmbedding::load(artifact, *gpu_device));
+            std::fprintf(stderr, "gpu %s: %.0f MB\n", device.c_str(),
+                         static_cast<double>(gpu->weight_bytes()) / 1e6);
+        }
+        const auto& tokenizer = host_model ? host_model->tokenizer() : gpu->tokenizer();
+        const auto embed_batch =
+            [&](const std::vector<std::vector<std::int32_t>>& sequences) {
+                return host_model ? host_model->embed_batch(sequences)
+                                  : gpu->embed_batch(sequences);
+            };
 
-        // One model, one CUDA stream, one arena, so requests are serialised --
-        // but each request is one batched forward, not one per sequence, so the
-        // lock covers real work rather than a queue of small launches.
-        std::mutex model_mutex;
+        // Every forward runs on ONE dedicated thread, not on whichever httplib
+        // worker carried the request. OpenMP keeps its team per master thread,
+        // so a changing master means a fresh team per request — measured as the
+        // difference between 69 ms in a CLI loop and over a second through the
+        // server. The handler posts work here and waits for its result.
+        std::mutex queue_mutex;
+        std::condition_variable queue_wake;
+        std::function<void()> pending;
+        bool stopping = false;
+        std::thread runner([&] {
+            while (true) {
+                std::function<void()> job;
+                {
+                    std::unique_lock<std::mutex> lock(queue_mutex);
+                    queue_wake.wait(lock, [&] { return stopping || pending; });
+                    if (stopping && !pending) { return; }
+                    job = std::move(pending);
+                    pending = nullptr;
+                    // Wake posters blocked on the slot being occupied.
+                    queue_wake.notify_all();
+                }
+                job();
+            }
+        });
+        const auto run_on_model_thread = [&](std::function<void()> job) {
+            std::mutex done_mutex;
+            std::condition_variable done_wake;
+            bool done = false;
+            {
+                // The slot holds one job. A second poster must wait for the
+                // runner to take the first — overwriting it would drop that job
+                // on the floor and leave its requester waiting on a result that
+                // can never come, which is exactly how the first concurrent
+                // benchmark hung one request for its full HTTP timeout.
+                std::unique_lock<std::mutex> lock(queue_mutex);
+                queue_wake.wait(lock, [&] { return !pending; });
+                pending = [&] {
+                    job();
+                    std::lock_guard<std::mutex> done_lock(done_mutex);
+                    done = true;
+                    done_wake.notify_one();
+                };
+            }
+            queue_wake.notify_all();
+            std::unique_lock<std::mutex> lock(done_mutex);
+            done_wake.wait(lock, [&] { return done; });
+        };
 
         httplib::Server server;
         server.Get("/health", [](const httplib::Request&, httplib::Response& response) {
@@ -119,7 +189,7 @@ int main(int argc, char** argv) {
                 if (body.contains("model") && body["model"].is_string()) {
                     model_name = body["model"].get<std::string>();
                 }
-                sequences = parse_input(body.at("input"), model.tokenizer());
+                sequences = parse_input(body.at("input"), tokenizer);
             } catch (const std::exception& error) {
                 response.status = 400;
                 response.set_content(error_body(error.what(), "invalid_request_error").dump(),
@@ -133,10 +203,19 @@ int main(int argc, char** argv) {
                 prompt_tokens += sequence.size();
             }
             try {
-                // One forward for the whole request: the projections see every
-                // sequence as adjacent columns, and only attention loops.
-                const std::lock_guard<std::mutex> lock(model_mutex);
-                const std::vector<std::vector<float>> vectors = model.embed_batch(sequences);
+                // One forward for the whole request, executed on the model
+                // thread: OpenMP keeps its team per master thread, and running
+                // the forward from whichever httplib worker carried the request
+                // rebuilt the team every time — the difference between 69 ms in
+                // a CLI loop and over a second through the server.
+                std::vector<std::vector<float>> vectors;
+                std::exception_ptr failure;
+                run_on_model_thread([&] {
+                    try {
+                        vectors = embed_batch(sequences);
+                    } catch (...) { failure = std::current_exception(); }
+                });
+                if (failure) { std::rethrow_exception(failure); }
                 for (std::size_t index = 0; index < vectors.size(); ++index) {
                     data.push_back(json{{"object", "embedding"},
                                         {"index", index},
@@ -163,7 +242,14 @@ int main(int argc, char** argv) {
         });
 
         std::fprintf(stderr, "listening on %s:%d\n", host.c_str(), port);
-        if (!server.listen(host, port)) {
+        const bool bound = server.listen(host, port);
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex);
+            stopping = true;
+        }
+        queue_wake.notify_one();
+        runner.join();
+        if (!bound) {
             throw std::runtime_error("could not bind " + host + ":" + std::to_string(port));
         }
         return 0;

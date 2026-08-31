@@ -6,11 +6,11 @@
 // kernels in cpu/cpu_ops.h, reading the same artifact. It is a separate
 // implementation rather than a backend behind a virtual interface because the
 // two differ in more than their arithmetic: the GPU binds quantised `Weight`
-// objects on device and the host decodes them to FP32 once at load. What keeps
+// objects on device and the host decodes them to BF16 once at load. What keeps
 // the two honest is not shared code but a shared oracle -- both are checked
 // against the same reference embeddings, to the same tolerance.
 //
-// Weights are decoded to FP32 at load: 1.2 GB for a 300M model, against a host
+// Weights are decoded to BF16 at load: 0.6 GB for a 300M model, against a host
 // that has 504. At 100B parameters this would be the wrong trade and the
 // quantised kernels would have to come back.
 
