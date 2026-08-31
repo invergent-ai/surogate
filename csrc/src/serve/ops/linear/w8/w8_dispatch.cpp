@@ -120,10 +120,14 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         }
         break;
     case 1152:
+        // EmbeddingGemma's MLP down projection, and the one k here that is not a
+        // multiple of 256 -- so the MMA routes cannot take it at all: their
+        // 16-byte scale-row staging would read eight bytes off on every odd row.
+        // SIMT loads scales narrowly and is exact at any k. This is a correctness
+        // constraint, not a tuning choice, and it is enforced in launch_route.
         if (n == 768) { // mlp down
             if (t <= 16) { return launch_w8_simt_r8_c4; }
-            if (t <= 128) { return launch_w8_mma_r32_c128; }
-            return launch_w8_mma_r64_c128;
+            return launch_w8_simt_r8_c8;
         }
         break;
     case 1024:

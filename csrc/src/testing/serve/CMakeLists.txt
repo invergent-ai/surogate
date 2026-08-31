@@ -187,6 +187,12 @@ sinfer_add_test(sinfer_bench_support_test
   LIBRARIES sinfer_engine)
 target_include_directories(sinfer_bench_support_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/bench/targets/qwen3_6_27b)
 
+# The encoder CLI: one sequence in, one vector out. Not a ctest — it needs an
+# artifact — but built beside the tests so it stays compiling.
+add_executable(sinfer_embed_cli encoder/embed_cli.cpp)
+target_include_directories(sinfer_embed_cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${SERVE_ROOT})
+target_link_libraries(sinfer_embed_cli PRIVATE sinfer_encoder)
+
 # Shared Op numerical tests. Target-composed schedule tests are registered separately below.
 set(sinfer_op_tests
   add_bias

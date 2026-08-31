@@ -974,6 +974,7 @@ add_library(sinfer_ops STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/launcher/scatter.cu
   ${SERVE_ROOT}/ops/launcher/sigmoid_gate_mul.cu
   ${SERVE_ROOT}/ops/launcher/mean_pool.cu
+  ${SERVE_ROOT}/ops/launcher/scale.cu
   ${SERVE_ROOT}/ops/launcher/silu_and_mul.cu
   ${SERVE_ROOT}/ops/launcher/vision_attention.cu
   ${SERVE_ROOT}/ops/launcher/vision_pos_embed.cu
@@ -1168,6 +1169,7 @@ add_library(sinfer_ops STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/wrapper/scatter.cpp
   ${SERVE_ROOT}/ops/wrapper/sigmoid_mul.cpp
   ${SERVE_ROOT}/ops/wrapper/mean_pool.cpp
+  ${SERVE_ROOT}/ops/wrapper/scale.cpp
   ${SERVE_ROOT}/ops/wrapper/silu_mul.cpp
   ${SERVE_ROOT}/ops/wrapper/sparse_moe.cpp
   ${SERVE_ROOT}/ops/wrapper/vision_attention.cpp
@@ -1187,6 +1189,12 @@ set_source_files_properties(
   ${SERVE_ROOT}/ops/sparse_moe/marlin/marlin_moe_kernels_generated.cu
   PROPERTIES COMPILE_OPTIONS
   "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;-static-global-template-stub=false>")
+add_library(sinfer_encoder STATIC EXCLUDE_FROM_ALL
+  ${SERVE_ROOT}/encoder/gemma_embedding.cpp
+)
+sinfer_internal_includes(sinfer_encoder)
+target_link_libraries(sinfer_encoder PUBLIC sinfer_core sinfer_ops sinfer_artifact)
+
 sinfer_internal_includes(sinfer_ops)
 # surogate vendor patch (PATCHES.md #25): cutlass headers for the sm_120a
 # blockscaled NVFP4 GEMM TU. Points at the flashinfer-shipped cutlass by

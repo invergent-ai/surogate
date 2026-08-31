@@ -15,6 +15,23 @@ constexpr Invocation convenience(std::int32_t t) { return {t, CallForm::A16Conve
 int w8_a16_conformance() {
     int failures = 0;
 
+    // EmbeddingGemma. Its four shapes are much narrower than anything else here
+    // and were only registered in the dispatch once an encoder needed them; the
+    // T sweep straddles every band boundary, because the first end-to-end run
+    // was correct at 16 tokens and wrong at 18.
+    constexpr std::array kGemmaT{
+        a16(1),   a16(15),  a16(16),  a16(17),  a16(18),  a16(24), a16(32),
+        a16(64),  a16(127), a16(128), a16(129), a16(512), a16(600),
+    };
+    failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
+                          {768, 768, 401U, Comparison::Full, true, kGemmaT});
+    failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
+                          {256, 768, 409U, Comparison::Full, true, kGemmaT});
+    failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
+                          {1152, 768, 419U, Comparison::Full, true, kGemmaT});
+    failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
+                          {768, 1152, 421U, Comparison::Full, true, kGemmaT});
+
     constexpr std::array kN248320K5120{
         a16(1),  a16(6),  a16(16), a16(17), a16(32), a16(33),
         a16(34), a16(48), a16(49), a16(64), a16(65),
