@@ -147,6 +147,7 @@ struct ExpertSlotCache {
     void* pool_memory      = nullptr;
     void* directory_memory = nullptr;
     void* miss_memory      = nullptr;
+    void* stats_memory     = nullptr;
     ops::ExpertSlotPool pool;
     ops::ExpertSlotDirectory directory;
     ops::ExpertMissList misses;
@@ -605,36 +606,66 @@ struct ExpertSlotCache {
         }
     }
 
-    // Diagnostic hit-rate readout (SUROGATE_SERVE_EXPERT_STATS=<rounds>): every `stats_every`
-    // rounds the miss count is read back synchronously, so it perturbs throughput and is not
-    // for measurements. A "round" here is one layer's resolve.
+    // Hit-rate readout (SUROGATE_SERVE_EXPERT_STATS=<rounds>): the counters are accumulated
+    // on the device by the resolve kernel and read back exactly. A "round" is one layer's
+    // resolve.
+    //
+    // What this replaced got three things wrong, and all three flattered the cache. It divided
+    // distinct experts allocated a slot by routed paths *including duplicates* -- different
+    // populations, and the wider the round the more the duplicates diluted it. With a CPU split
+    // it counted PCIe gathers rather than misses, because a miss handed to the host never
+    // reaches the miss list. And it extrapolated: one sampled round stood for the whole window.
+    //
+    // The counters are the kernel's own, so a captured decode keeps counting through replays.
+    // The readout still runs on the host, so it prints on eager rounds; under CUDA graphs the
+    // totals accumulate and appear at the next uncaptured resolve. Nothing is lost, only
+    // deferred -- `--enforce-eager` reports continuously.
     std::int64_t stats_every  = 0;
     std::int64_t stats_rounds = 0;
-    std::int64_t stats_misses = 0;
-    std::int64_t stats_ids    = 0;
-    void record_stats(const Tensor& ids, cudaStream_t stream) {
-        // Hooks run once at capture time and never during graph replays, and a synchronous
-        // readout is illegal on a capturing stream: the readout is an eager-mode
-        // (--no-cuda-graph) diagnostic only.
+    std::array<long long, ops::kExpertSlotStatCount> stats_last{};
+    void record_stats(const Tensor&, cudaStream_t stream) {
+        if (stats_every <= 0 || directory.stats.data == nullptr) { return; }
+        // A synchronous readout is illegal on a capturing stream; the device counters keep
+        // accumulating regardless and the next eager round prints the full total.
         cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
         if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess ||
             capture != cudaStreamCaptureStatusNone) {
             return;
         }
-        ++stats_rounds;
-        stats_ids += ids.numel();
-        if (stats_rounds % stats_every != 0) { return; }
-        long long misses = 0;
-        CUDA_CHECK(cudaMemcpyAsync(&misses, cache_count_ptr(), sizeof(misses), cudaMemcpyDeviceToHost,
-                                   stream));
+        if (++stats_rounds % stats_every != 0) { return; }
+        std::array<long long, ops::kExpertSlotStatCount> counters{};
+        CUDA_CHECK(cudaMemcpyAsync(counters.data(), directory.stats.data, sizeof(counters),
+                                   cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
-        stats_misses += misses * stats_every; // sampled: one readout stands for the window
-        std::fprintf(stderr,
-                     "qwen4exp: expert cache rounds=%lld sampled misses/round=%lld ids/round=%.1f "
-                     "(cumulative sampled miss share %.1f%%)\n",
-                     static_cast<long long>(stats_rounds), misses,
-                     static_cast<double>(stats_ids) / static_cast<double>(stats_rounds),
-                     100.0 * static_cast<double>(stats_misses) / static_cast<double>(stats_ids));
+        // Windowed as well as cumulative: a prompt's wide rounds and a single-user decode's
+        // one-token rounds have completely different miss shapes, and a cumulative-only figure
+        // buries the decode steady state under the prefill that preceded it.
+        const auto report = [](const char* label, const std::array<long long, ops::kExpertSlotStatCount>& c) {
+            const double rounds    = static_cast<double>(c[ops::kExpertSlotStatRounds]);
+            const double lookups   = static_cast<double>(c[ops::kExpertSlotStatLookups]);
+            const double distinct  = static_cast<double>(c[ops::kExpertSlotStatDistinct]);
+            const double resident  = static_cast<double>(c[ops::kExpertSlotStatResident]);
+            const double gathered  = static_cast<double>(c[ops::kExpertSlotStatGathered]);
+            const double host_side = static_cast<double>(c[ops::kExpertSlotStatHostRouted]);
+            if (rounds <= 0.0 || distinct <= 0.0) { return; }
+            // Every rate is over distinct experts asked for, the population the cache answers.
+            // `PCIe` is what crossed the bus; `host` is what the CPU split absorbed; together
+            // they are the misses.
+            std::fprintf(stderr,
+                         "qwen4exp: expert cache %s rounds=%lld distinct/round=%.1f (of %.1f "
+                         "paths) hit %.1f%% miss %.1f%% = PCIe %.1f%% + host %.1f%%\n",
+                         label, static_cast<long long>(c[ops::kExpertSlotStatRounds]),
+                         distinct / rounds, lookups / rounds, 100.0 * resident / distinct,
+                         100.0 * (gathered + host_side) / distinct, 100.0 * gathered / distinct,
+                         100.0 * host_side / distinct);
+        };
+        std::array<long long, ops::kExpertSlotStatCount> window{};
+        for (int i = 0; i < ops::kExpertSlotStatCount; ++i) {
+            window[i] = counters[i] - stats_last[i];
+        }
+        report("window", window);
+        report("total ", counters);
+        stats_last = counters;
     }
     const void* cache_count_ptr() const { return misses.count.data; }
 };
@@ -758,6 +789,15 @@ ExpertSlotCache& expert_slot_cache_for_current_device() {
     cache.enabled = true;
     if (const char* stats = std::getenv("SUROGATE_SERVE_EXPERT_STATS"); stats != nullptr && *stats != '\0') {
         cache.stats_every = std::strtol(stats, nullptr, 10);
+        if (cache.stats_every > 0) {
+            // The counters live on the device and the resolve kernel increments them, so a
+            // captured decode keeps counting through every replay; the host only ever reads.
+            const std::size_t bytes = sizeof(long long) * ops::kExpertSlotStatCount;
+            CUDA_CHECK(cudaMalloc(&cache.stats_memory, bytes));
+            CUDA_CHECK(cudaMemset(cache.stats_memory, 0, bytes));
+            cache.directory.stats =
+                Tensor(cache.stats_memory, DType::I64, {ops::kExpertSlotStatCount});
+        }
     }
     double fraction = 0.0;
     bool auto_share = false;
@@ -1045,16 +1085,123 @@ void mix_into(const Tensor& residual, const ops::HyperConnectionWeights& weights
     maybe_dump_block("inject", inject, stream);
 }
 
+// How long the GPU actually waits for the host round (SUROGATE_SERVE_CPU_MOE_JOIN_PROBE=1).
+//
+// The CPU split forks the host experts onto a side stream and joins them here, and the design
+// assumes the join is free -- that the host round finishes inside the GPU's own expert work.
+// Whether that holds decides where single-user time goes: if the GPU waits, the round is paced
+// by the host and the lever is host round latency, not the PCIe gather. Nothing measured it.
+//
+// A pair of events straddles the wait, and the pair is read one round later, when it has long
+// since completed -- so the probe never adds a synchronise of its own. Two pairs alternate so
+// a round can be in flight while the previous one is read. Eager only: under graph capture an
+// event record is a node and elapsed time between nodes is not a quantity you can ask for.
+struct JoinProbe {
+    // A ring rather than a pair. With two buffers a pair whose events were not yet complete
+    // got overwritten on its next turn, so only the joins that finished fastest were ever
+    // measured -- a probe for stalls that silently dropped the stalls. The ring is deep enough
+    // that the oldest entry has long completed, and it is drained with a blocking wait rather
+    // than a query, so every join is counted.
+    static constexpr int kRing = 16;
+    bool enabled     = false;
+    bool initialised = false;
+    int slot         = 0;
+    bool pending[kRing]{};
+    cudaEvent_t before[kRing]{};
+    cudaEvent_t after[kRing]{};
+    double waited_ms = 0.0;
+    float worst_ms     = 0.0F;
+    std::int64_t joins = 0;
+    std::int64_t combines = 0;
+    std::int64_t reported = 0;
+
+    void ensure() {
+        if (initialised) { return; }
+        initialised = true;
+        for (int i = 0; i < kRing; ++i) {
+            CUDA_CHECK(cudaEventCreate(&before[i]));
+            CUDA_CHECK(cudaEventCreate(&after[i]));
+        }
+    }
+
+    /// Called on every combine, join or not: the report lives here rather than in `wrap`
+    /// because a run where the split never engages takes no joins at all, and that is the
+    /// case the probe most needs to be able to say out loud.
+    void tick() {
+        if (!enabled) { return; }
+        ++combines;
+        if (combines < reported + 512) { return; }
+        reported = combines;
+        if (joins > 0) {
+            std::fprintf(stderr,
+                         "qwen4exp: host-round join waited %.3f ms over %lld joins of %lld "
+                         "combines (mean %.3f ms/join, worst %.3f)\n",
+                         waited_ms, static_cast<long long>(joins),
+                         static_cast<long long>(combines),
+                         waited_ms / static_cast<double>(joins),
+                         static_cast<double>(worst_ms));
+        } else {
+            std::fprintf(stderr,
+                         "qwen4exp: host-round join never taken in %lld combines -- the CPU "
+                         "split did not engage (rounds below --cpu-moe-min-tokens carry no host "
+                         "partial, so every miss of such a round crosses PCIe)\n",
+                         static_cast<long long>(combines));
+        }
+    }
+
+    /// Drains whichever pair has completed, then straddles this join with the other.
+    void wrap(cudaStream_t stream, cudaEvent_t join) {
+        if (!enabled) {
+            CUDA_CHECK(cudaStreamWaitEvent(stream, join, 0));
+            return;
+        }
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess ||
+            capture != cudaStreamCaptureStatusNone) {
+            CUDA_CHECK(cudaStreamWaitEvent(stream, join, 0));
+            return;
+        }
+        ensure();
+        // Reclaim the slot we are about to reuse: it is kRing joins old, so the wait is
+        // nominally free, and blocking rather than querying keeps the sample unbiased.
+        if (pending[slot]) {
+            CUDA_CHECK(cudaEventSynchronize(after[slot]));
+            float ms = 0.0F;
+            CUDA_CHECK(cudaEventElapsedTime(&ms, before[slot], after[slot]));
+            waited_ms += static_cast<double>(ms);
+            if (ms > worst_ms) { worst_ms = ms; }
+            ++joins;
+            pending[slot] = false;
+        }
+        CUDA_CHECK(cudaEventRecord(before[slot], stream));
+        CUDA_CHECK(cudaStreamWaitEvent(stream, join, 0));
+        CUDA_CHECK(cudaEventRecord(after[slot], stream));
+        pending[slot] = true;
+        slot          = (slot + 1) % kRing;
+    }
+};
+
+JoinProbe& join_probe() {
+    static JoinProbe probe = [] {
+        JoinProbe p;
+        const char* on = std::getenv("SUROGATE_SERVE_CPU_MOE_JOIN_PROBE");
+        p.enabled      = on != nullptr && *on != '\0' && *on != '0';
+        return p;
+    }();
+    return probe;
+}
+
 // Scatters a block output into the residual streams with the gates the mix kept.
 void combine_into(const Tensor& block_output, Tensor& residual, cudaStream_t stream) {
     if (t_inject.data == nullptr || t_inject.ne[1] != residual.ne[1]) {
         throw std::logic_error("qwen4exp: combine without a matching mix");
     }
+    join_probe().tick();
     maybe_dump_block("blockout", block_output, stream);
     if (t_partial.device_alias != nullptr) {
         check_device_handoff("a host expert partial", t_partial.device);
         // Join the host round (side stream) before the combine reads its partial.
-        CUDA_CHECK(cudaStreamWaitEvent(stream, t_partial.join, 0));
+        join_probe().wrap(stream, t_partial.join);
         ops::hyper_connection_combine(block_output, t_partial.device_alias, t_inject, residual, stream);
         {
             ExpertSlotCache& cache = expert_slot_cache_for_current_device();

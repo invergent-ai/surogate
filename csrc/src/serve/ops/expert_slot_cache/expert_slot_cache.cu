@@ -121,17 +121,20 @@ __global__ void __launch_bounds__(kResolveThreads)
                    int miss_capacity, unsigned cpu_share_q16, int per_token,
                    int* __restrict__ cpu_tokens,
                    int* __restrict__ cpu_experts, float* __restrict__ cpu_weights,
-                   long long* __restrict__ cpu_count, int cpu_capacity) {
+                   long long* __restrict__ cpu_count, int cpu_capacity,
+                   long long* __restrict__ stats) {
     __shared__ unsigned s_round;
     __shared__ int s_pending;
     __shared__ int s_pending_experts[1024];
     __shared__ int s_cpu_pending;
+    __shared__ int s_distinct;
     const int tid = static_cast<int>(threadIdx.x);
     if (tid == 0) {
         s_round       = *round + 1U;
         *round        = s_round;
         s_pending     = 0;
         s_cpu_pending = 0;
+        s_distinct    = 0;
         *miss_count   = 0;
         if (cpu_count != nullptr) { *cpu_count = 0; }
     }
@@ -144,6 +147,7 @@ __global__ void __launch_bounds__(kResolveThreads)
         const int expert = ids[i];
         if (expert < 0 || expert >= experts) { continue; }
         if (atomicExch(&seen[expert], this_round) == this_round) { continue; } // duplicate
+        atomicAdd(&s_distinct, 1);
         const int slot = layer_table[expert];
         if (slot >= 0) {
             last_used[slot]    = this_round;
@@ -224,6 +228,18 @@ __global__ void __launch_bounds__(kResolveThreads)
         }
         *miss_count   = written < miss_capacity ? written : miss_capacity;
         s_cpu_pending = sent_to_cpu;
+        if (stats != nullptr) {
+            // One block, one thread, launches serialised on the stream: a plain
+            // read-modify-write is enough, and the counters survive graph replay because
+            // the kernel is what increments them.
+            const int gathered = written < miss_capacity ? written : miss_capacity;
+            stats[kExpertSlotStatRounds] += 1;
+            stats[kExpertSlotStatLookups] += count;
+            stats[kExpertSlotStatDistinct] += s_distinct;
+            stats[kExpertSlotStatResident] += s_distinct - s_pending;
+            stats[kExpertSlotStatGathered] += gathered;
+            stats[kExpertSlotStatHostRouted] += sent_to_cpu;
+        }
     }
     __syncthreads();
 
@@ -600,7 +616,8 @@ void expert_slot_resolve(const Tensor& ids, const Tensor& alpha, std::int32_t la
         split ? static_cast<int*>(cpu_jobs->experts.data) : nullptr,
         split ? static_cast<float*>(cpu_jobs->weights.data) : nullptr,
         split ? static_cast<long long*>(cpu_jobs->count.data) : nullptr,
-        split ? cpu_jobs->capacity : 0);
+        split ? cpu_jobs->capacity : 0,
+        static_cast<long long*>(directory.stats.data));
     CUDA_CHECK(cudaGetLastError());
 }
 

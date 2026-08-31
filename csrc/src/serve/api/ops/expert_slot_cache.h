@@ -81,6 +81,30 @@ struct ExpertSlotDirectory {
     // there. A prompt's per-layer expert sweep then cycles inside the ring instead of wiping
     // the decode working set. 0 = plain LRU over every slot.
     std::int32_t scan_ring = 0;
+    /// Optional I64 [kExpertSlotStatCount] of cumulative counters; empty disables counting.
+    Tensor stats;
+};
+
+/// Cumulative resolve counters, accumulated by the kernel itself.
+///
+/// On the device on purpose. The readout they replaced ran on the host, so it saw nothing once
+/// decode was captured into a CUDA graph -- the hook that carried it runs at capture and never
+/// again -- and it extrapolated one sampled round over the whole window. These are incremented
+/// by every resolve, replay included, and read back exactly.
+///
+/// The three populations are kept apart because they answer different questions, and the
+/// readout they replaced conflated them: it divided *distinct experts allocated a slot* by
+/// *routed paths including duplicates*, two different populations, which understates the miss
+/// rate the wider a round gets. With a CPU split on it was narrower still, because a miss handed
+/// to the host never reaches the miss list -- what it reported was PCIe gathers, not misses.
+enum ExpertSlotStat : int {
+    kExpertSlotStatRounds = 0,  ///< resolves; one per layer per round, replays included
+    kExpertSlotStatLookups,     ///< routed paths asked for, duplicates included (tokens * top_k)
+    kExpertSlotStatDistinct,    ///< distinct experts a round asked for, after dedupe
+    kExpertSlotStatResident,    ///< of those, already in a slot: the hits
+    kExpertSlotStatGathered,    ///< of those, missing and fetched over PCIe into a slot
+    kExpertSlotStatHostRouted,  ///< of those, missing and handed to the CPU split instead
+    kExpertSlotStatCount,
 };
 
 /// Per-round miss list written by resolve and consumed by gather; `count` is a device word so
