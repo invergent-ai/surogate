@@ -92,6 +92,8 @@ struct ServeOptions {
     std::vector<LoraModule> lora_modules;
     std::uint32_t max_loras     = 1;
     std::uint32_t max_lora_rank = 16;
+    /// Set when --enable-lora turned CUDA graphs off, so startup can say why.
+    bool lora_forced_eager = false;
     // Process-level explicit overrides layered between registered model/mode defaults and request
     // fields. An omitted seed is replaced per request with a fresh random seed.
     SamplingOverrides sampling_overrides;

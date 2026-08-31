@@ -98,6 +98,22 @@ struct EngineOptions {
     // artifact's, which is the only one whose agreement with tokenizer_config.json the
     // loader can check -- an override is the operator taking that responsibility.
     std::string chat_template_override;
+
+    /// One adapted projection, decoded to BF16 on the host by the serve layer.
+    /// The target's binding code matches these by (layer, module) and hands them
+    /// to the device store keyed by the base weight they adapt; nothing below the
+    /// target needs to know PEFT's naming.
+    struct LoraModulePayload {
+        std::int32_t layer   = -1;    ///< text layer index parsed from the module name
+        std::string module;           ///< "q_proj", "o_proj", ...
+        std::int32_t rank    = 0;
+        std::int32_t in_dim  = 0;
+        std::int32_t out_dim = 0;
+        float scale          = 1.0F;  ///< PEFT alpha/r
+        std::vector<std::uint16_t> a; ///< [rank, in_dim] BF16
+        std::vector<std::uint16_t> b; ///< [out_dim, rank] BF16
+    };
+    std::vector<LoraModulePayload> lora_payloads;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
     // Storage of the pinned host expert bank. Q4G32AM (4-bit affine groups requantised from
     // the artifact's W8 at load) is 59 % of the bytes and near-exact for Q4_K-derived experts,

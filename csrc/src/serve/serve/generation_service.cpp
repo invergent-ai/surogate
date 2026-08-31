@@ -2,6 +2,7 @@
 
 #include "product/media_acquire/acquire.h"
 #include "serve/console_log.h"
+#include "serve/lora_registry.h"
 #include "serve/output_parsers.h"
 #include "serve/tool_call_parser.h"
 #include "serve/translate.h"
@@ -251,6 +252,29 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.media_live_bytes         = options_.media_live_bytes;
     engine_options.media_preprocess_threads = options_.media_preprocess_threads;
     engine_options.chat_template_override   = options_.chat_template;
+    // The adapter's tensors, decoded on the host. The target binds them to its own
+    // weights; a module the target cannot place is refused there rather than
+    // dropped, because a partly applied adapter is worse than none.
+    if (options_.enable_lora && !options_.lora_modules.empty()) {
+        LoraRegistry registry;
+        std::vector<std::pair<std::string, std::string>> modules;
+        for (const auto& module : options_.lora_modules) {
+            modules.emplace_back(module.name, module.path);
+        }
+        registry.load(modules, options_.max_lora_rank);
+        for (const auto& [name, adapter] : registry.adapters()) {
+            std::vector<std::string> skipped;
+            auto payloads = LoraRegistry::read_payloads(adapter, skipped);
+            if (!skipped.empty()) {
+                throw std::invalid_argument(
+                    "--lora-modules '" + name + "': module '" + skipped.front() +
+                    "' carries no layer index, so it cannot be bound to a projection");
+            }
+            for (auto& payload : payloads) {
+                engine_options.lora_payloads.push_back(std::move(payload));
+            }
+        }
+    }
     engine_options.load_progress            = std::move(load_progress);
     engine_              = std::make_unique<sinfer::Engine>(std::move(engine_options));
     prompt_capabilities_ = engine_->prompt_capabilities();

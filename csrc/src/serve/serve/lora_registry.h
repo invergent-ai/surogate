@@ -14,6 +14,8 @@
 // the target that will apply them, because only it knows which projections it
 // fuses and therefore which of the adapter's modules it can honour.
 
+#include "api/types.h"
+
 #include <cstdint>
 #include <filesystem>
 #include <map>
@@ -69,6 +71,13 @@ public:
     }
     /// The adapter a request named, or nullptr when the name is the base model.
     [[nodiscard]] const LoraAdapter* find(const std::string& name) const;
+
+    /// Reads one adapter's tensors and decodes them to BF16, tagged with the text
+    /// layer and module the name encodes. Modules whose name does not carry a
+    /// layer index (an embedding or head adapter, say) are skipped, and reported
+    /// through `skipped` so the caller can refuse rather than quietly drop them.
+    [[nodiscard]] static std::vector<EngineOptions::LoraModulePayload> read_payloads(
+        const LoraAdapter& adapter, std::vector<std::string>& skipped);
 
 private:
     std::map<std::string, LoraAdapter> adapters_;

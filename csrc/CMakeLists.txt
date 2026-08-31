@@ -1172,6 +1172,7 @@ add_library(sinfer_ops STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/wrapper/layer_norm.cpp
   ${SERVE_ROOT}/ops/wrapper/linear_add.cpp
   ${SERVE_ROOT}/ops/wrapper/lora.cpp
+  ${SERVE_ROOT}/ops/wrapper/lora_store.cpp
     ${SERVE_ROOT}/ops/wrapper/linear_pair.cpp
   ${SERVE_ROOT}/ops/wrapper/linear_swiglu.cpp
   ${SERVE_ROOT}/ops/wrapper/mtp_pack.cpp

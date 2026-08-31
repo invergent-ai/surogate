@@ -475,6 +475,16 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                                         " adapters but --max-loras is " +
                                         std::to_string(options.max_loras));
         }
+        // The delta runs two cuBLASLt GEMMs, and their plans are cached per problem
+        // shape. Every shape a round uses would have to be prewarmed before capture;
+        // one that is not is created *during* capture, which measurably corrupts the
+        // graph -- a B=0 adapter, whose delta is exactly zero, changed the output and
+        // changed it differently on each run. Eager is correct and is what the
+        // adapter path is verified in, so it is chosen rather than offered.
+        if (options.use_cuda_graph) {
+            options.use_cuda_graph = false;
+            options.lora_forced_eager = true;
+        }
         std::vector<std::string> seen;
         for (const auto& module : options.lora_modules) {
             if (std::find(seen.begin(), seen.end(), module.name) != seen.end()) {

@@ -2,6 +2,7 @@
 #include <api/targets/qwen3_6/frontend_resources.h>
 #include <api/targets/qwen3_6/prepared_prompt.h>
 
+#include "api/ops/lora_store.h"
 #include "artifact/reader.h"
 #include "targets/qwen3_5_0_8b/impl/load/bindings.h"
 #include "targets/qwen3_5_0_8b/impl/variant.h"
@@ -117,8 +118,68 @@ Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&
     return std::unique_ptr<LoadedModel>(new LoadedModel(std::move(impl)));
 }
 
+namespace {
+
+/// Binds decoded adapter payloads to this target's weights.
+///
+/// Keyed by the base weight's device pointer, because that is what the projection
+/// hooks can see. `q_proj` adapts the fused attention projection's query output --
+/// `attn_input_proj` scatters q/k/v into separate contiguous tensors, so the
+/// delta needs no strided add -- and `o_proj` adapts the attention output.
+///
+/// Every payload must find a home. A module this target cannot place is refused
+/// with its name: an adapter half-applied is a model that is neither the base nor
+/// the fine-tune, and it would answer fluently either way.
+void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& options) {
+    if (options.lora_payloads.empty()) { return; }
+    ops::LoraStore& store = ops::lora_store_for_current_device();
+
+    // Text layer index -> the full-attention layer holding it, since only every
+    // fourth layer is full attention in this family.
+    // Mirrors is_full_layer in this target's bindings: every fourth layer from 3.
+    const auto is_full = [](std::size_t layer) { return layer >= 3 && (layer - 3) % 4 == 0; };
+    std::vector<const detail::FullAttentionWeights*> by_layer(detail::TextConfig::layers, nullptr);
+    std::size_t full_index = 0;
+    for (std::size_t layer = 0; layer < detail::TextConfig::layers; ++layer) {
+        if (is_full(layer)) { by_layer[layer] = &runtime.full_layers.at(full_index++); }
+    }
+
+    for (const auto& payload : options.lora_payloads) {
+        if (payload.layer < 0 || static_cast<std::size_t>(payload.layer) >= by_layer.size() ||
+            by_layer[static_cast<std::size_t>(payload.layer)] == nullptr) {
+            throw std::invalid_argument(
+                "--lora-modules: layer " + std::to_string(payload.layer) + " module '" +
+                payload.module + "' is not a full-attention layer of this model");
+        }
+        const detail::FullAttentionWeights& layer = *by_layer[static_cast<std::size_t>(payload.layer)];
+        const Weight* base                = nullptr;
+        if (payload.module == "q_proj") {
+            const auto* fused = std::get_if<detail::FusedAttentionProjectionPayload>(&layer.projection);
+            if (fused == nullptr) {
+                throw std::invalid_argument(
+                    "--lora-modules: this artifact splits its attention projection, which the "
+                    "q_proj adapter path does not bind");
+            }
+            base = &fused->query_key_gate_value;
+        } else if (payload.module == "o_proj") {
+            base = &layer.output;
+        } else {
+            throw std::invalid_argument(
+                "--lora-modules: module '" + payload.module +
+                "' is not applied by this target (it applies q_proj and o_proj); an adapter "
+                "that is only partly applied would be neither the base model nor the fine-tune");
+        }
+        store.add(base->qdata, payload.a, payload.b, payload.rank, payload.in_dim,
+                  payload.out_dim, payload.scale);
+        ops::lora_prepare(payload.out_dim, payload.in_dim, payload.rank, 1);
+    }
+}
+
+} // namespace
+
 Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineOptions& options) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
+    bind_lora(model.impl_->data.runtime, options);
     return qwen3_6::make_frontend(model.impl_->data.frontend,
                                   qwen3_6::FrontendOptions{
                                       .vision_enabled = model.impl_->data.runtime.features.vision,

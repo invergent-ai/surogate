@@ -4,6 +4,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cctype>
 #include <cstring>
 #include <fstream>
 #include <cmath>
@@ -199,6 +200,114 @@ void LoraRegistry::load(const std::vector<std::pair<std::string, std::string>>& 
 const LoraAdapter* LoraRegistry::find(const std::string& name) const {
     const auto found = adapters_.find(name);
     return found == adapters_.end() ? nullptr : &found->second;
+}
+
+
+
+namespace {
+
+std::uint16_t f32_to_bf16(float value) {
+    std::uint32_t word = 0;
+    std::memcpy(&word, &value, sizeof(word));
+    word += 0x7FFFU + ((word >> 16U) & 1U);
+    return static_cast<std::uint16_t>(word >> 16U);
+}
+
+float f16_to_f32(std::uint16_t bits) {
+    const std::uint32_t sign     = (bits & 0x8000U) << 16U;
+    std::uint32_t exponent       = (bits >> 10U) & 0x1FU;
+    std::uint32_t mantissa       = bits & 0x3FFU;
+    if (exponent == 0) {
+        if (mantissa == 0) {
+            float zero = 0.0F;
+            std::uint32_t word = sign;
+            std::memcpy(&zero, &word, sizeof(zero));
+            return zero;
+        }
+        while ((mantissa & 0x400U) == 0) { mantissa <<= 1U; --exponent; }
+        ++exponent;
+        mantissa &= 0x3FFU;
+    } else if (exponent == 31) {
+        exponent = 255;
+    } else {
+        exponent += 112;
+    }
+    const std::uint32_t word = sign | (exponent << 23U) | (mantissa << 13U);
+    float value              = 0.0F;
+    std::memcpy(&value, &word, sizeof(value));
+    return value;
+}
+
+/// Reads `bytes` at `offset` and returns them as BF16, whatever they were stored as.
+std::vector<std::uint16_t> read_as_bf16(std::ifstream& file, std::uint64_t offset,
+                                        std::uint64_t bytes, bool is_bf16, bool is_f16,
+                                        std::size_t expected) {
+    file.seekg(static_cast<std::streamoff>(offset));
+    std::vector<std::uint16_t> out(expected);
+    if (is_bf16) {
+        file.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(bytes));
+        return out;
+    }
+    if (is_f16) {
+        std::vector<std::uint16_t> raw(expected);
+        file.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(bytes));
+        for (std::size_t i = 0; i < expected; ++i) { out[i] = f32_to_bf16(f16_to_f32(raw[i])); }
+        return out;
+    }
+    std::vector<float> raw(expected);
+    file.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(bytes));
+    for (std::size_t i = 0; i < expected; ++i) { out[i] = f32_to_bf16(raw[i]); }
+    return out;
+}
+
+/// "model.layers.7.self_attn.q_proj" -> (7, "q_proj").
+bool split_module(const std::string& module, std::int32_t& layer, std::string& kind) {
+    constexpr std::string_view kLayers = ".layers.";
+    const std::size_t at = module.find(kLayers);
+    if (at == std::string::npos) { return false; }
+    const std::size_t digits = at + kLayers.size();
+    std::size_t end          = digits;
+    while (end < module.size() && (std::isdigit(static_cast<unsigned char>(module[end])) != 0)) {
+        ++end;
+    }
+    if (end == digits || end >= module.size() || module[end] != '.') { return false; }
+    layer = std::stoi(module.substr(digits, end - digits));
+    const std::size_t last = module.rfind('.');
+    if (last == std::string::npos || last + 1 >= module.size()) { return false; }
+    kind = module.substr(last + 1);
+    return true;
+}
+
+} // namespace
+
+std::vector<EngineOptions::LoraModulePayload> LoraRegistry::read_payloads(
+    const LoraAdapter& adapter, std::vector<std::string>& skipped) {
+    std::ifstream file(adapter.weights_file, std::ios::binary);
+    if (!file) { bad(adapter.name, "cannot reopen " + adapter.weights_file.string()); }
+
+    std::vector<EngineOptions::LoraModulePayload> payloads;
+    for (const LoraTensorPair& pair : adapter.pairs) {
+        EngineOptions::LoraModulePayload payload;
+        if (!split_module(pair.module, payload.layer, payload.module)) {
+            skipped.push_back(pair.module);
+            continue;
+        }
+        payload.rank    = pair.rank;
+        payload.in_dim  = pair.in_dim;
+        payload.out_dim = pair.out_dim;
+        payload.scale   = static_cast<float>(adapter.scale);
+        payload.a = read_as_bf16(file, pair.a_offset, pair.a_bytes, pair.a_is_bf16,
+                                 !pair.a_is_bf16 && pair.a_bytes ==
+                                     static_cast<std::uint64_t>(pair.rank) * pair.in_dim * 2,
+                                 static_cast<std::size_t>(pair.rank) * pair.in_dim);
+        payload.b = read_as_bf16(file, pair.b_offset, pair.b_bytes, pair.b_is_bf16,
+                                 !pair.b_is_bf16 && pair.b_bytes ==
+                                     static_cast<std::uint64_t>(pair.out_dim) * pair.rank * 2,
+                                 static_cast<std::size_t>(pair.out_dim) * pair.rank);
+        if (!file) { bad(adapter.name, "truncated while reading " + pair.module); }
+        payloads.push_back(std::move(payload));
+    }
+    return payloads;
 }
 
 } // namespace sinfer::serve
