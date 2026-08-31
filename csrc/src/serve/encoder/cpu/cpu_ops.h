@@ -91,12 +91,22 @@ enum class GemmBackend {
 // Activations are [rows, tokens] with rows contiguous, matching the GPU path,
 // so the two implementations can be read side by side.
 
-/// out[n, T] = w[n, k] . x[k, T]
-void gemm(const float* w, const float* x, float* out, std::int32_t n, std::int32_t k,
-          std::int32_t tokens, ThreadPool& pool);
+/// out[n, T] = w[n, k] . x[k, T], with the weight stored BF16.
+///
+/// BF16 weights, FP32 activations, FP32 output. The weights came from int8 codes
+/// with an FP16 scale, so BF16 storage discards nothing they carried, and it
+/// halves what every GEMM reads while letting Zen 4 use avx512_bf16. Storing
+/// FP32 and asking oneDNN for BF16 *math* is not the same thing and measured
+/// slower: it pays a conversion per call that costs more than the compute saves.
+/// Both operands BF16, output FP32. Measured on this host, BF16 x BF16 through
+/// oneDNN runs at 1,577 GFLOP/s where BF16 weights against FP32 activations run
+/// at 796 -- the conversion inside the kernel costs the fast path. Converting
+/// the activation once outside (see `narrow`) and passing BF16 keeps it.
+void gemm(const std::uint16_t* w, const std::uint16_t* x, float* out, std::int32_t n,
+          std::int32_t k, std::int32_t tokens, ThreadPool& pool);
 
-/// out[d, T] = table[ids[t], d]
-void embed(const float* table, const std::int32_t* ids, float* out, std::int32_t hidden,
+/// out[d, T] = table[ids[t], d], widening from the BF16 table.
+void embed(const std::uint16_t* table, const std::int32_t* ids, float* out, std::int32_t hidden,
            std::int32_t tokens, std::int32_t vocab);
 
 /// RMSNorm over the fastest axis. `unit_offset` applies gain = 1 + weight,
@@ -126,7 +136,7 @@ private:
 
 /// Rotates [0, head_dim) of every head in place, positions[t] per column.
 void rope(float* x, const std::int32_t* positions, std::int32_t head_dim, std::int32_t heads,
-          std::int32_t tokens, const RopeTable& table);
+          std::int32_t tokens, const RopeTable& table, ThreadPool& pool);
 
 /// Non-causal GQA over one sequence. `window` 0 admits every key; positive W
 /// admits abs(i - j) < W, symmetric -- what a window means once attention is
@@ -134,6 +144,17 @@ void rope(float* x, const std::int32_t* positions, std::int32_t head_dim, std::i
 void attention(const float* q, const float* k, const float* v, float* out, std::int32_t q_heads,
                std::int32_t head_dim, std::int32_t tokens, std::int32_t window, float scale,
                float* scratch, ThreadPool& pool);
+
+/// The gate projection with gelu_tanh and the gating multiply fused into it:
+/// out = gelu_tanh(w . x) * up. Returns false when no backend can fuse, leaving
+/// the caller to run `gemm` then `gelu_mul`.
+[[nodiscard]] bool gemm_gelu_mul(const std::uint16_t* w, const std::uint16_t* x, const float* up,
+                                 float* out, std::int32_t n, std::int32_t k,
+                                 std::int32_t tokens);
+
+/// FP32 to BF16, round to nearest even: the one conversion each activation pays
+/// on its way into a GEMM.
+void narrow(const float* x, std::uint16_t* out, std::int64_t count, ThreadPool& pool);
 
 /// out = gelu_tanh(gate) * up, elementwise.
 void gelu_mul(const float* gate, const float* up, float* out, std::int64_t count,

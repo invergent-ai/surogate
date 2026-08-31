@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <iostream>
 #include <random>
 #include <string>
@@ -57,11 +58,32 @@ int check(const std::string& label, const std::vector<float>& got, const std::ve
     return 0;
 }
 
+std::uint16_t to_bf16(float value) {
+    std::uint32_t word = 0;
+    std::memcpy(&word, &value, sizeof(word));
+    word += 0x7FFFU + ((word >> 16U) & 1U);
+    return static_cast<std::uint16_t>(word >> 16U);
+}
+
+float from_bf16(std::uint16_t bits) {
+    const std::uint32_t word = static_cast<std::uint32_t>(bits) << 16U;
+    float value              = 0.0F;
+    std::memcpy(&value, &word, sizeof(value));
+    return value;
+}
+
 int test_gemm(cpu::ThreadPool& pool) {
     // Gemma's own shapes, and a token count that is not a multiple of anything.
+    // The weight is BF16 as stored; the reference reads the same rounded values,
+    // so the tolerance stays about arithmetic rather than storage.
     const std::int32_t n = 1152, k = 768, tokens = 37;
-    const std::vector<float> w = random_floats(static_cast<std::size_t>(n) * k, 1, -0.3F, 0.3F);
-    const std::vector<float> x = random_floats(static_cast<std::size_t>(k) * tokens, 2, -2.0F, 2.0F);
+    const std::vector<float> raw = random_floats(static_cast<std::size_t>(n) * k, 1, -0.3F, 0.3F);
+    std::vector<std::uint16_t> w(raw.size());
+    for (std::size_t i = 0; i < raw.size(); ++i) { w[i] = to_bf16(raw[i]); }
+    const std::vector<float> raw_x =
+        random_floats(static_cast<std::size_t>(k) * tokens, 2, -2.0F, 2.0F);
+    std::vector<std::uint16_t> x(raw_x.size());
+    for (std::size_t i = 0; i < raw_x.size(); ++i) { x[i] = to_bf16(raw_x[i]); }
     std::vector<float> out(static_cast<std::size_t>(n) * tokens);
     cpu::gemm(w.data(), x.data(), out.data(), n, k, tokens, pool);
 
@@ -70,13 +92,13 @@ int test_gemm(cpu::ThreadPool& pool) {
         for (std::int32_t row = 0; row < n; ++row) {
             double sum = 0.0;
             for (std::int32_t i = 0; i < k; ++i) {
-                sum += static_cast<double>(w[static_cast<std::size_t>(row) * k + i]) *
-                       static_cast<double>(x[static_cast<std::size_t>(t) * k + i]);
+                sum += static_cast<double>(from_bf16(w[static_cast<std::size_t>(row) * k + i])) *
+                       static_cast<double>(from_bf16(x[static_cast<std::size_t>(t) * k + i]));
             }
             want[static_cast<std::size_t>(t) * n + row] = sum;
         }
     }
-    return check("gemm [1152,768] x 37 tokens", out, want, 2e-5);
+    return check("gemm bf16 x bf16 [1152,768] x 37", out, want, 2e-5);
 }
 
 int test_rmsnorm(cpu::ThreadPool& pool) {
