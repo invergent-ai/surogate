@@ -89,6 +89,176 @@ struct InjectScratch {
 // Expert slot cache (phase 2): one pool per device, enabled by SUROGATE_SERVE_EXPERT_SLOTS
 // (slot count; 0 or unset keeps the zero-copy path). The pool/directory/miss list are device
 // memory owned here; the per-layer host banks come from the layer's W8 host Weights.
+// How long the GPU actually waits for the host round (SUROGATE_SERVE_CPU_MOE_JOIN_PROBE=1).
+//
+// The CPU split forks the host experts onto a side stream and joins them here, and the design
+// assumes the join is free -- that the host round finishes inside the GPU's own expert work.
+// Whether that holds decides where single-user time goes: if the GPU waits, the round is paced
+// by the host and the lever is host round latency, not the PCIe gather. Nothing measured it.
+//
+// A pair of events straddles the wait, and the pair is read one round later, when it has long
+// since completed -- so the probe never adds a synchronise of its own. Two pairs alternate so
+// a round can be in flight while the previous one is read. Eager only: under graph capture an
+// event record is a node and elapsed time between nodes is not a quantity you can ask for.
+struct JoinProbe {
+    // A ring rather than a pair. With two buffers a pair whose events were not yet complete
+    // got overwritten on its next turn, so only the joins that finished fastest were ever
+    // measured -- a probe for stalls that silently dropped the stalls. The ring is deep enough
+    // that the oldest entry has long completed, and it is drained with a blocking wait rather
+    // than a query, so every join is counted.
+    static constexpr int kRing = 16;
+    bool enabled     = false;
+    bool initialised = false;
+    int slot         = 0;
+    bool pending[kRing]{};
+    cudaEvent_t before[kRing]{};
+    cudaEvent_t after[kRing]{};
+    double waited_ms = 0.0;
+    float worst_ms     = 0.0F;
+    bool open          = false;
+    std::int64_t joins = 0;
+    std::int64_t combines = 0;
+    std::int64_t reported = 0;
+
+    void ensure() {
+        if (initialised) { return; }
+        initialised = true;
+        for (int i = 0; i < kRing; ++i) {
+            CUDA_CHECK(cudaEventCreate(&before[i]));
+            CUDA_CHECK(cudaEventCreate(&after[i]));
+        }
+    }
+
+    /// Reporting for the gather instance: same cadence, its own wording.
+    void tick_gather() {
+        if (!enabled) { return; }
+        ++combines;
+        if (combines < reported + 512) { return; }
+        reported = combines;
+        if (joins == 0) {
+            std::fprintf(stderr, "qwen4exp: miss-gather never ran in %lld layers\n",
+                         static_cast<long long>(combines));
+            return;
+        }
+        std::fprintf(stderr,
+                     "qwen4exp: miss-gather occupied %.3f ms over %lld layers "
+                     "(mean %.3f ms/layer, worst %.3f)\n",
+                     waited_ms, static_cast<long long>(joins),
+                     waited_ms / static_cast<double>(joins), static_cast<double>(worst_ms));
+    }
+
+    /// Called on every combine, join or not: the report lives here rather than in `wrap`
+    /// because a run where the split never engages takes no joins at all, and that is the
+    /// case the probe most needs to be able to say out loud.
+    void tick() {
+        if (!enabled) { return; }
+        ++combines;
+        if (combines < reported + 512) { return; }
+        reported = combines;
+        if (joins > 0) {
+            std::fprintf(stderr,
+                         "qwen4exp: host-round join waited %.3f ms over %lld joins of %lld "
+                         "combines (mean %.3f ms/join, worst %.3f)\n",
+                         waited_ms, static_cast<long long>(joins),
+                         static_cast<long long>(combines),
+                         waited_ms / static_cast<double>(joins),
+                         static_cast<double>(worst_ms));
+        } else {
+            std::fprintf(stderr,
+                         "qwen4exp: host-round join never taken in %lld combines -- the CPU "
+                         "split did not engage (rounds below --cpu-moe-min-tokens carry no host "
+                         "partial, so every miss of such a round crosses PCIe)\n",
+                         static_cast<long long>(combines));
+        }
+    }
+
+    /// Opens a timed span on `stream`, reclaiming the ring slot it reuses.
+    void begin(cudaStream_t stream) {
+        if (!enabled) { return; }
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess ||
+            capture != cudaStreamCaptureStatusNone) {
+            return;
+        }
+        ensure();
+        if (pending[slot]) {
+            CUDA_CHECK(cudaEventSynchronize(after[slot]));
+            float ms = 0.0F;
+            CUDA_CHECK(cudaEventElapsedTime(&ms, before[slot], after[slot]));
+            waited_ms += static_cast<double>(ms);
+            if (ms > worst_ms) { worst_ms = ms; }
+            ++joins;
+            pending[slot] = false;
+        }
+        CUDA_CHECK(cudaEventRecord(before[slot], stream));
+        open = true;
+    }
+
+    /// Closes the span opened by `begin`.
+    void end(cudaStream_t stream) {
+        if (!enabled || !open) { return; }
+        open = false;
+        CUDA_CHECK(cudaEventRecord(after[slot], stream));
+        pending[slot] = true;
+        slot          = (slot + 1) % kRing;
+    }
+
+    /// Drains whichever pair has completed, then straddles this join with the other.
+    void wrap(cudaStream_t stream, cudaEvent_t join) {
+        if (!enabled) {
+            CUDA_CHECK(cudaStreamWaitEvent(stream, join, 0));
+            return;
+        }
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess ||
+            capture != cudaStreamCaptureStatusNone) {
+            CUDA_CHECK(cudaStreamWaitEvent(stream, join, 0));
+            return;
+        }
+        ensure();
+        // Reclaim the slot we are about to reuse: it is kRing joins old, so the wait is
+        // nominally free, and blocking rather than querying keeps the sample unbiased.
+        if (pending[slot]) {
+            CUDA_CHECK(cudaEventSynchronize(after[slot]));
+            float ms = 0.0F;
+            CUDA_CHECK(cudaEventElapsedTime(&ms, before[slot], after[slot]));
+            waited_ms += static_cast<double>(ms);
+            if (ms > worst_ms) { worst_ms = ms; }
+            ++joins;
+            pending[slot] = false;
+        }
+        CUDA_CHECK(cudaEventRecord(before[slot], stream));
+        CUDA_CHECK(cudaStreamWaitEvent(stream, join, 0));
+        CUDA_CHECK(cudaEventRecord(after[slot], stream));
+        pending[slot] = true;
+        slot          = (slot + 1) % kRing;
+    }
+};
+
+/// How long the PCIe miss-gather occupies the round. The bytes-over-bandwidth estimate says
+/// it is a large share of single-user decode; this measures it, because whether overlapping
+/// the gather with the hit-path compute is worth the surgery depends on the real number.
+JoinProbe& gather_probe() {
+    static JoinProbe probe = [] {
+        JoinProbe p;
+        const char* on = std::getenv("SUROGATE_SERVE_GATHER_PROBE");
+        p.enabled      = on != nullptr && *on != '\0' && *on != '0';
+        return p;
+    }();
+    return probe;
+}
+
+JoinProbe& join_probe() {
+    static JoinProbe probe = [] {
+        JoinProbe p;
+        const char* on = std::getenv("SUROGATE_SERVE_CPU_MOE_JOIN_PROBE");
+        p.enabled      = on != nullptr && *on != '\0' && *on != '0';
+        return p;
+    }();
+    return probe;
+}
+
+
 struct ExpertSlotCache {
     struct Layer {
         ExpertSlotCache* owner = nullptr;
@@ -513,7 +683,10 @@ struct ExpertSlotCache {
             ops::expert_slot_resolve(ids, entry->index, cache.directory, cache.misses, stream,
                                      scan);
         }
+        gather_probe().begin(stream);
         ops::expert_slot_gather(entry->bank, cache.misses, cache.pool, stream);
+        gather_probe().end(stream);
+        gather_probe().tick_gather();
         if (split) { cache.cpu_round(*entry, x, destination, stream); }
         // SUROGATE_SERVE_CPU_MOE_FAKE_WAIT=<ms>: with the split off, still fork a host function
         // that sleeps for <ms> and make the combine wait for it — the host split's stream
@@ -1083,112 +1256,6 @@ void mix_into(const Tensor& residual, const ops::HyperConnectionWeights& weights
     CUDA_CHECK(cudaGetDevice(&t_inject_device));
     maybe_dump_block("mixed", hidden, stream);
     maybe_dump_block("inject", inject, stream);
-}
-
-// How long the GPU actually waits for the host round (SUROGATE_SERVE_CPU_MOE_JOIN_PROBE=1).
-//
-// The CPU split forks the host experts onto a side stream and joins them here, and the design
-// assumes the join is free -- that the host round finishes inside the GPU's own expert work.
-// Whether that holds decides where single-user time goes: if the GPU waits, the round is paced
-// by the host and the lever is host round latency, not the PCIe gather. Nothing measured it.
-//
-// A pair of events straddles the wait, and the pair is read one round later, when it has long
-// since completed -- so the probe never adds a synchronise of its own. Two pairs alternate so
-// a round can be in flight while the previous one is read. Eager only: under graph capture an
-// event record is a node and elapsed time between nodes is not a quantity you can ask for.
-struct JoinProbe {
-    // A ring rather than a pair. With two buffers a pair whose events were not yet complete
-    // got overwritten on its next turn, so only the joins that finished fastest were ever
-    // measured -- a probe for stalls that silently dropped the stalls. The ring is deep enough
-    // that the oldest entry has long completed, and it is drained with a blocking wait rather
-    // than a query, so every join is counted.
-    static constexpr int kRing = 16;
-    bool enabled     = false;
-    bool initialised = false;
-    int slot         = 0;
-    bool pending[kRing]{};
-    cudaEvent_t before[kRing]{};
-    cudaEvent_t after[kRing]{};
-    double waited_ms = 0.0;
-    float worst_ms     = 0.0F;
-    std::int64_t joins = 0;
-    std::int64_t combines = 0;
-    std::int64_t reported = 0;
-
-    void ensure() {
-        if (initialised) { return; }
-        initialised = true;
-        for (int i = 0; i < kRing; ++i) {
-            CUDA_CHECK(cudaEventCreate(&before[i]));
-            CUDA_CHECK(cudaEventCreate(&after[i]));
-        }
-    }
-
-    /// Called on every combine, join or not: the report lives here rather than in `wrap`
-    /// because a run where the split never engages takes no joins at all, and that is the
-    /// case the probe most needs to be able to say out loud.
-    void tick() {
-        if (!enabled) { return; }
-        ++combines;
-        if (combines < reported + 512) { return; }
-        reported = combines;
-        if (joins > 0) {
-            std::fprintf(stderr,
-                         "qwen4exp: host-round join waited %.3f ms over %lld joins of %lld "
-                         "combines (mean %.3f ms/join, worst %.3f)\n",
-                         waited_ms, static_cast<long long>(joins),
-                         static_cast<long long>(combines),
-                         waited_ms / static_cast<double>(joins),
-                         static_cast<double>(worst_ms));
-        } else {
-            std::fprintf(stderr,
-                         "qwen4exp: host-round join never taken in %lld combines -- the CPU "
-                         "split did not engage (rounds below --cpu-moe-min-tokens carry no host "
-                         "partial, so every miss of such a round crosses PCIe)\n",
-                         static_cast<long long>(combines));
-        }
-    }
-
-    /// Drains whichever pair has completed, then straddles this join with the other.
-    void wrap(cudaStream_t stream, cudaEvent_t join) {
-        if (!enabled) {
-            CUDA_CHECK(cudaStreamWaitEvent(stream, join, 0));
-            return;
-        }
-        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
-        if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess ||
-            capture != cudaStreamCaptureStatusNone) {
-            CUDA_CHECK(cudaStreamWaitEvent(stream, join, 0));
-            return;
-        }
-        ensure();
-        // Reclaim the slot we are about to reuse: it is kRing joins old, so the wait is
-        // nominally free, and blocking rather than querying keeps the sample unbiased.
-        if (pending[slot]) {
-            CUDA_CHECK(cudaEventSynchronize(after[slot]));
-            float ms = 0.0F;
-            CUDA_CHECK(cudaEventElapsedTime(&ms, before[slot], after[slot]));
-            waited_ms += static_cast<double>(ms);
-            if (ms > worst_ms) { worst_ms = ms; }
-            ++joins;
-            pending[slot] = false;
-        }
-        CUDA_CHECK(cudaEventRecord(before[slot], stream));
-        CUDA_CHECK(cudaStreamWaitEvent(stream, join, 0));
-        CUDA_CHECK(cudaEventRecord(after[slot], stream));
-        pending[slot] = true;
-        slot          = (slot + 1) % kRing;
-    }
-};
-
-JoinProbe& join_probe() {
-    static JoinProbe probe = [] {
-        JoinProbe p;
-        const char* on = std::getenv("SUROGATE_SERVE_CPU_MOE_JOIN_PROBE");
-        p.enabled      = on != nullptr && *on != '\0' && *on != '0';
-        return p;
-    }();
-    return probe;
 }
 
 // Scatters a block output into the residual streams with the gates the mix kept.

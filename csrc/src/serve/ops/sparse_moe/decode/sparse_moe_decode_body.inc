@@ -627,6 +627,67 @@ void launch_d3_dependent_codec(const Tensor& x, const SparseMoeWeights& weights,
         weights.routed_gate_up_scale, shared_codes, shared_scales, act));
 }
 
+// How long the routed expert kernels run (SUROGATE_SERVE_D3_PROBE=1). This is the whole of
+// the work that could ever be overlapped with an expert miss-gather: everything earlier in the
+// layer feeds the routing the gather depends on. Measuring it sizes that idea before anyone
+// builds it.
+struct D3Probe {
+    static constexpr int kRing = 16;
+    bool enabled = std::getenv("SUROGATE_SERVE_D3_PROBE") != nullptr;
+    bool ready   = false;
+    int slot     = 0;
+    bool pending[kRing]{};
+    cudaEvent_t before[kRing]{};
+    cudaEvent_t after[kRing]{};
+    double ms      = 0.0;
+    long long runs = 0;
+    long long reported = 0;
+
+    void begin(cudaStream_t stream) {
+        if (!enabled) { return; }
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess ||
+            capture != cudaStreamCaptureStatusNone) {
+            enabled = false;
+            return;
+        }
+        if (!ready) {
+            ready = true;
+            for (int i = 0; i < kRing; ++i) {
+                CUDA_CHECK(cudaEventCreate(&before[i]));
+                CUDA_CHECK(cudaEventCreate(&after[i]));
+            }
+        }
+        if (pending[slot]) {
+            CUDA_CHECK(cudaEventSynchronize(after[slot]));
+            float dt = 0.0F;
+            CUDA_CHECK(cudaEventElapsedTime(&dt, before[slot], after[slot]));
+            ms += static_cast<double>(dt);
+            ++runs;
+            pending[slot] = false;
+        }
+        CUDA_CHECK(cudaEventRecord(before[slot], stream));
+    }
+    void end(cudaStream_t stream) {
+        if (!enabled || !ready) { return; }
+        CUDA_CHECK(cudaEventRecord(after[slot], stream));
+        pending[slot] = true;
+        slot          = (slot + 1) % kRing;
+        if (runs >= reported + 512 && runs > 0) {
+            reported = runs;
+            std::fprintf(stderr,
+                         "sparse_moe: routed expert kernels %.3f ms over %lld layers "
+                         "(mean %.4f ms/layer)\n",
+                         ms, runs, ms / static_cast<double>(runs));
+        }
+    }
+};
+
+inline D3Probe& d3_probe() {
+    static D3Probe probe;
+    return probe;
+}
+
 void launch_d2_d3(const Tensor& x, const SparseMoeWeights& weights, Tensor& destination,
                   const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream,
                   const SparseMoeRoundHook* hook) {
@@ -642,19 +703,21 @@ void launch_d2_d3(const Tensor& x, const SparseMoeWeights& weights, Tensor& dest
         hook->resolve(hook->context, workspace.ids, workspace.alpha, x, destination, stream);
     }
 
+    d3_probe().begin(stream);
     switch (weights.routed_gate_up.qtype) {
     case QType::Q4G64_F16S:
         launch_d3_dependent_codec<Q4Codec>(x, weights, workspace, stream);
-        return;
+        break;
     case QType::W8G32_F16S:
         launch_d3_dependent_codec<W8Codec>(x, weights, workspace, stream);
-        return;
+        break;
     case QType::NVFP4:
         launch_d3_dependent_codec<Nvfp4CodecFor<kHidden / 16>>(x, weights, workspace, stream);
-        return;
+        break;
     default:
         throw std::invalid_argument("sparse_moe: unsupported D3 codec");
     }
+    d3_probe().end(stream);
 }
 
 template <class Codec>
