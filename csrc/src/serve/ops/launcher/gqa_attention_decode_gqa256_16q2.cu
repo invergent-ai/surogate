@@ -4,12 +4,12 @@
 
 namespace sinfer::ops::detail {
 
-template void gqa_attention_small_t_launch_for<Gqa35Geometry, GqaAppendInput>(
+template void gqa_attention_small_t_launch_for<Gqa256_16q2, GqaAppendInput>(
     const Tensor&, GqaAppendInput, const Tensor&, float, PagedKVBatchLayerView,
     const GqaSmallTInvocation&, GqaExecutionEnvelope, Tensor&, Tensor&, Tensor&, Tensor&,
     cudaStream_t);
 
-template void gqa_attention_small_t_launch_for<Gqa35Geometry, GqaCachedInput>(
+template void gqa_attention_small_t_launch_for<Gqa256_16q2, GqaCachedInput>(
     const Tensor&, GqaCachedInput, const Tensor&, float, PagedKVBatchLayerView,
     const GqaSmallTInvocation&, GqaExecutionEnvelope, Tensor&, Tensor&, Tensor&, Tensor&,
     cudaStream_t);

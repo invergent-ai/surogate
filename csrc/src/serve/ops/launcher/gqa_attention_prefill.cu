@@ -169,41 +169,21 @@ void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positi
                                            cudaStream_t stream, GqaBlockMask selection) {
     const GqaPrefillDirectMetadata metadata{
         static_cast<const std::int32_t*>(cache.block_table.data)};
-    if (q.ne[1] == Gqa256_24q2::QHeads && cache.num_kv_heads == Gqa256_24q2::KVHeads) {
-        gqa_attention_prompt_attention_launch_for<Gqa256_24q2>(q, positions, scale, cache,
-                                                               metadata, out, stream, selection);
-        return;
-    }
-    if (q.ne[1] == Gqa27Geometry::QHeads) {
-        gqa_attention_prompt_attention_launch_for<Gqa27Geometry>(q, positions, scale, cache,
-                                                                 metadata, out, stream, selection);
-        return;
-    }
-    if (q.ne[1] == Gqa08Geometry::QHeads) {
-        gqa_attention_prompt_attention_launch_for<Gqa08Geometry>(q, positions, scale, cache,
-                                                                 metadata, out, stream, selection);
-        return;
-    }
-    // surogate vendor patch (PATCHES.md #18): the cache resolves the 16-query pair.
-    if (cache.num_kv_heads == Gqa4BGeometry::KVHeads) {
-        gqa_attention_prompt_attention_launch_for<Gqa4BGeometry>(q, positions, scale, cache,
-                                                                 metadata, out, stream, selection);
-        return;
-    }
-    gqa_attention_prompt_attention_launch_for<Gqa35Geometry>(q, positions, scale, cache, metadata,
-                                                             out, stream, selection);
+    gqa_dispatch_geometry(q.ne[0], q.ne[1], cache.num_kv_heads, [&]<typename Geometry>() {
+        gqa_attention_prompt_attention_launch_for<Geometry>(q, positions, scale, cache, metadata,
+                                                            out, stream, selection);
+    });
 }
 
 void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                           PagedKVLayerView cache, cudaStream_t stream) {
     const GqaPrefillDirectMetadata metadata{
         static_cast<const std::int32_t*>(cache.block_table.data)};
-    if (k.ne[1] == Gqa27Geometry::KVHeads) {
-        gqa_kv_append_launch_for<Gqa27Geometry>(k, v, positions, cache, metadata, stream);
-        return;
-    }
-    // KV append depends on KVHeads only; every two-head geometry shares the 35B's.
-    gqa_kv_append_launch_for<Gqa35Geometry>(k, v, positions, cache, metadata, stream);
+    // Append depends on the head dimension and the KV head count only, so it
+    // dispatches on those rather than on a full shape it does not have.
+    gqa_dispatch_kv_geometry(k.ne[0], k.ne[1], [&]<typename Geometry>() {
+        gqa_kv_append_launch_for<Geometry>(k, v, positions, cache, metadata, stream);
+    });
 }
 
 void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor& v,
@@ -218,36 +198,11 @@ void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor&
             .table_rows   = static_cast<const std::int32_t*>(table_rows.data),
             .table_stride = cache.block_tables.ne[0],
         };
-        if (q.ne[1] == Gqa256_24q2::QHeads && cache.num_kv_heads == Gqa256_24q2::KVHeads) {
-            gqa_kv_append_launch_for<Gqa256_24q2>(k, v, positions, cache, metadata, stream);
-            gqa_attention_prompt_attention_launch_for<Gqa256_24q2>(q, positions, scale, cache,
-                                                                   metadata, out, stream, selection);
-            return;
-        }
-        if (q.ne[1] == Gqa27Geometry::QHeads) {
-            gqa_kv_append_launch_for<Gqa27Geometry>(k, v, positions, cache, metadata, stream);
-            gqa_attention_prompt_attention_launch_for<Gqa27Geometry>(q, positions, scale, cache,
-                                                                     metadata, out, stream, selection);
-            return;
-        }
-        if (q.ne[1] == Gqa08Geometry::QHeads) {
-            // KV append is GroupSize-independent; Gqa08's KVHeads matches.
-            gqa_kv_append_launch_for<Gqa08Geometry>(k, v, positions, cache, metadata, stream);
-            gqa_attention_prompt_attention_launch_for<Gqa08Geometry>(q, positions, scale, cache,
-                                                                     metadata, out, stream, selection);
-            return;
-        }
-        // surogate vendor patch (PATCHES.md #18): the cache resolves the
-        // 16-query pair; KV append only uses KVHeads.
-        if (cache.num_kv_heads == Gqa4BGeometry::KVHeads) {
-            gqa_kv_append_launch_for<Gqa4BGeometry>(k, v, positions, cache, metadata, stream);
-            gqa_attention_prompt_attention_launch_for<Gqa4BGeometry>(q, positions, scale, cache,
-                                                                     metadata, out, stream, selection);
-            return;
-        }
-        gqa_kv_append_launch_for<Gqa35Geometry>(k, v, positions, cache, metadata, stream);
-        gqa_attention_prompt_attention_launch_for<Gqa35Geometry>(q, positions, scale, cache,
-                                                                 metadata, out, stream, selection);
+        gqa_dispatch_geometry(q.ne[0], q.ne[1], cache.num_kv_heads, [&]<typename Geometry>() {
+            gqa_kv_append_launch_for<Geometry>(k, v, positions, cache, metadata, stream);
+            gqa_attention_prompt_attention_launch_for<Geometry>(q, positions, scale, cache,
+                                                                metadata, out, stream, selection);
+        });
     };
     if (valid_columns.data == nullptr) {
         launch.template operator()<false>();

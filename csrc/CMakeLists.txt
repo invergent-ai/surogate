@@ -940,11 +940,15 @@ add_library(sinfer_ops STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/launcher/causal_conv1d.cu
   ${SERVE_ROOT}/ops/launcher/embed_gather.cu
   ${SERVE_ROOT}/ops/launcher/gdn_gating.cu
+  # One translation unit per registered GQA shape, named for the shape. The
+  # registry in ops/kernel/gqa_attention_geometry.cuh generates the dispatch and
+  # the extern declarations; a registered shape missing its file here is an
+  # undefined reference at link.
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_24q4.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_16q2.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_8q2.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_16q4.cu
   ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_24q2.cu
-  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa27.cu
-  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa08.cu
-  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa4b.cu
-  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa35.cu
   ${SERVE_ROOT}/ops/launcher/gelu.cu
   ${SERVE_ROOT}/ops/launcher/bidirectional_gqa_attention.cu
   ${SERVE_ROOT}/ops/launcher/swa.cu

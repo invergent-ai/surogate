@@ -1,6 +1,7 @@
 #include "core/arena.h"
 #include "core/paged_kv_cache.h"
 #include "api/ops/gqa_attention.h"
+#include "ops/kernel/gqa_attention_geometry.cuh"
 #include "ops/op_tester.h"
 
 #include <algorithm>
@@ -12,7 +13,9 @@
 #include <iostream>
 #include <limits>
 #include <span>
+#include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace sinfer;
@@ -1323,6 +1326,47 @@ int run_geometry(const Geometry& geometry) {
     return failures;
 }
 
+// The geometry registry is the single list of served shapes. Every entry must be
+// accepted by the public workspace contract, and a shape no entry carries must be
+// refused rather than quietly served by another shape's kernel — that kernel bakes
+// the head counts into its addressing, so the wrong one reads the wrong strides.
+// Driven off the registry macro, so registering a shape extends this coverage by
+// itself.
+int verify_geometry_registration_contract() {
+    int failures = 0;
+    constexpr ops::GqaExecutionEnvelope envelope{1, 1025};
+    const auto accepted = [&](std::int32_t q_heads, std::int32_t kv_heads) {
+        try {
+            (void)ops::gqa_attention_workspace_capacity_bytes(q_heads, kv_heads, DType::BF16,
+                                                              envelope, 1, 1, 8);
+            return true;
+        } catch (const std::invalid_argument&) { return false; }
+    };
+
+#define SINFER_GQA_REGISTERED_CASE(Name)                                                           \
+    if (!accepted(ops::Name::QHeads, ops::Name::KVHeads)) {                                        \
+        std::cerr << "gqa_attention rejected registered geometry " << ops::Name::QHeads << "q"     \
+                  << ops::Name::KVHeads << "\n";                                                   \
+        ++failures;                                                                                \
+    }
+    SINFER_GQA_FOR_EACH_GEOMETRY(SINFER_GQA_REGISTERED_CASE)
+#undef SINFER_GQA_REGISTERED_CASE
+
+    // An unregistered query count; an unregistered pairing of registered counts;
+    // and a KV count no shape carries at all.
+    const std::pair<std::int32_t, std::int32_t> unregistered[] = {
+        {32, 8}, {12, 4}, {8, 4}, {16, 8},
+    };
+    for (const auto& [q_heads, kv_heads] : unregistered) {
+        if (accepted(q_heads, kv_heads)) {
+            std::cerr << "gqa_attention accepted unregistered geometry " << q_heads << "q"
+                      << kv_heads << "\n";
+            ++failures;
+        }
+    }
+    return failures;
+}
+
 int verify_workspace_capacity_contract() {
     int failures = 0;
     for (const DType dtype : {DType::BF16, DType::I8}) {
@@ -1364,6 +1408,7 @@ int main() {
     }
 
     int failures = 0;
+    failures += verify_geometry_registration_contract();
     failures += verify_workspace_capacity_contract();
     for (const Geometry& geometry : kGeometries) { failures += run_geometry(geometry); }
     failures += run_batch_cases();

@@ -10,10 +10,17 @@
 // registration line whose shape is not already present; it must never mean
 // editing a kernel.
 //
-// An unregistered shape is a build error at the dispatcher, never a silent
-// fallback to a slower path.
+// An unregistered shape is a hard error, never a silent fallback onto another
+// shape's kernel: that kernel bakes the head counts into its addressing, so
+// serving one shape with another's kernel reads the wrong strides — wrong
+// numbers and out-of-bounds loads, not merely a slower path. Registering a
+// shape whose decode translation unit is missing is a link error; serving a
+// shape nobody registered throws at the dispatcher.
 
+#include <cstddef>
 #include <cstdint>
+#include <stdexcept>
+#include <string>
 
 namespace sinfer::ops {
 
@@ -45,11 +52,143 @@ using Gqa256_8q2   = GqaGeometry<256, 8, 2, 2>;  // qwen3.5-0.8b
 using Gqa256_16q4  = GqaGeometry<256, 16, 4, 2>; // qwen3.5-4b, qwen3.5-2b
 using Gqa256_24q2  = GqaGeometry<256, 24, 2, 1>; // qwen3.8-flash-next (group of twelve)
 
-// Compatibility aliases for call sites not yet migrated. New code uses the
-// shape names above; these disappear once the last dispatcher is converted.
-using Gqa27Geometry = Gqa256_24q4;
-using Gqa35Geometry = Gqa256_16q2;
-using Gqa08Geometry = Gqa256_8q2;
-using Gqa4BGeometry = Gqa256_16q4;
+// The registry. Every dispatcher below and in the launchers is generated from
+// this list, so a registration line is the whole of adding a shape — with the
+// one exception the linker enforces: the small-T decode launcher is instantiated
+// one geometry per translation unit, so a new entry also needs its
+// ops/launcher/gqa_attention_decode_<name>.cu and a CMake source line. Omitting
+// them is an undefined reference at link time, which is the intended failure.
+#define SINFER_GQA_FOR_EACH_GEOMETRY(X)                                                            \
+    X(Gqa256_24q4)                                                                                 \
+    X(Gqa256_16q2)                                                                                 \
+    X(Gqa256_8q2)                                                                                  \
+    X(Gqa256_16q4)                                                                                 \
+    X(Gqa256_24q2)
+
+namespace detail {
+
+// Sentinel closing the comma-separated pack the registry expands into. Its
+// zero head counts match no registered shape.
+struct GqaGeometryListEnd {
+    static constexpr int HeadDim = 0;
+    static constexpr int QHeads  = 0;
+    static constexpr int KVHeads = 0;
+};
+
+// Registered shapes must be distinct in (QHeads, KVHeads): the dispatchers that
+// see only the head counts — workspace sizing and split capacity, whose public
+// signatures carry no head dimension — rely on that pair naming one shape, and
+// picking the wrong one there under-sizes the split buffers the kernel writes.
+template <typename... Geometries>
+constexpr bool gqa_head_counts_are_distinct() {
+    constexpr std::size_t kCount = sizeof...(Geometries);
+    const int q_heads[kCount]    = {Geometries::QHeads...};
+    const int kv_heads[kCount]   = {Geometries::KVHeads...};
+    for (std::size_t i = 0; i < kCount; ++i) {
+        for (std::size_t j = i + 1; j < kCount; ++j) {
+            if (q_heads[i] == q_heads[j] && kv_heads[i] == kv_heads[j]) { return false; }
+        }
+    }
+    return true;
+}
+
+#define SINFER_GQA_LIST_GEOMETRY(Name) Name,
+static_assert(gqa_head_counts_are_distinct<SINFER_GQA_FOR_EACH_GEOMETRY(
+                  SINFER_GQA_LIST_GEOMETRY) GqaGeometryListEnd>(),
+              "two registered geometries share a (query heads, KV heads) pair");
+#undef SINFER_GQA_LIST_GEOMETRY
+
+// A dispatcher that knows only some of the triple passes 0 for the rest, which
+// prints as "any": the shape is unregistered whatever the missing field held.
+[[noreturn]] inline void throw_unregistered_geometry(std::int64_t head_dim, std::int64_t q_heads,
+                                                     std::int64_t kv_heads) {
+    const auto field = [](std::int64_t value) {
+        return value > 0 ? std::to_string(value) : std::string("any");
+    };
+    throw std::invalid_argument("gqa_attention: unregistered head geometry (head dim " +
+                                field(head_dim) + ", " + field(q_heads) + " query heads over " +
+                                field(kv_heads) +
+                                " KV heads); register the shape in gqa_attention_geometry.cuh");
+}
+
+} // namespace detail
+
+// Invokes `visitor.template operator()<Geometry>()` for the registered shape
+// matching (head_dim, q_heads, kv_heads) exactly. At most one arm can match, so
+// the order of the registry does not affect the result; an unregistered shape
+// throws rather than reaching a kernel built for a different shape.
+template <typename Visitor>
+decltype(auto) gqa_dispatch_geometry(std::int64_t head_dim, std::int64_t q_heads,
+                                     std::int64_t kv_heads, Visitor&& visitor) {
+#define SINFER_GQA_DISPATCH_ARM(Name)                                                              \
+    if (head_dim == Name::HeadDim && q_heads == Name::QHeads && kv_heads == Name::KVHeads) {       \
+        return visitor.template operator()<Name>();                                                \
+    }
+    SINFER_GQA_FOR_EACH_GEOMETRY(SINFER_GQA_DISPATCH_ARM)
+#undef SINFER_GQA_DISPATCH_ARM
+    detail::throw_unregistered_geometry(head_dim, q_heads, kv_heads);
+}
+
+// Head-count-only dispatch, for the capacity and workspace paths whose public
+// signatures carry no head dimension. The pair is unique across the registry
+// (asserted above), so this resolves the same shape the launcher will pick.
+template <typename Visitor>
+decltype(auto) gqa_dispatch_geometry(std::int64_t q_heads, std::int64_t kv_heads,
+                                     Visitor&& visitor) {
+#define SINFER_GQA_DISPATCH_ARM(Name)                                                              \
+    if (q_heads == Name::QHeads && kv_heads == Name::KVHeads) {                                    \
+        return visitor.template operator()<Name>();                                                \
+    }
+    SINFER_GQA_FOR_EACH_GEOMETRY(SINFER_GQA_DISPATCH_ARM)
+#undef SINFER_GQA_DISPATCH_ARM
+    detail::throw_unregistered_geometry(0, q_heads, kv_heads);
+}
+
+// KV-only dispatch, for the cache-append kernels: they touch the head dimension
+// and the KV head count and nothing else, so every registered shape carrying
+// that pair generates identical code and the first match is taken. A pair no
+// registered shape carries throws rather than being appended with another
+// shape's strides.
+template <typename Visitor>
+decltype(auto) gqa_dispatch_kv_geometry(std::int64_t head_dim, std::int64_t kv_heads,
+                                        Visitor&& visitor) {
+#define SINFER_GQA_DISPATCH_KV_ARM(Name)                                                           \
+    if (head_dim == Name::HeadDim && kv_heads == Name::KVHeads) {                                  \
+        return visitor.template operator()<Name>();                                                \
+    }
+    SINFER_GQA_FOR_EACH_GEOMETRY(SINFER_GQA_DISPATCH_KV_ARM)
+#undef SINFER_GQA_DISPATCH_KV_ARM
+    detail::throw_unregistered_geometry(head_dim, 0, kv_heads);
+}
+
+// Whether any registered shape carries this (head dim, KV head count) pair, for
+// callers validating a KV tensor ahead of the append dispatch above.
+inline bool gqa_kv_shape_is_registered(std::int64_t head_dim, std::int64_t kv_heads) {
+#define SINFER_GQA_KV_MATCH(Name)                                                                  \
+    if (head_dim == Name::HeadDim && kv_heads == Name::KVHeads) { return true; }
+    SINFER_GQA_FOR_EACH_GEOMETRY(SINFER_GQA_KV_MATCH)
+#undef SINFER_GQA_KV_MATCH
+    return false;
+}
+
+// The KV-head count of the registered shape serving `q_heads`. A query count can
+// be registered against more than one KV count (16 queries over 2 or 4 KV heads;
+// 24 over 4 or 2), which is why callers pass the head count of whatever KV
+// source they hold; pass 0 when holding none, which resolves only a query count
+// that is unique in the registry. Unresolvable pairs throw.
+inline std::int64_t gqa_registered_kv_heads(std::int64_t q_heads, std::int64_t source_kv_heads) {
+    std::int64_t sole_match = 0;
+    int matches             = 0;
+#define SINFER_GQA_KV_ARM(Name)                                                                    \
+    if (q_heads == Name::QHeads) {                                                                 \
+        if (source_kv_heads == Name::KVHeads) { return Name::KVHeads; }                            \
+        sole_match = Name::KVHeads;                                                                \
+        ++matches;                                                                                 \
+    }
+    SINFER_GQA_FOR_EACH_GEOMETRY(SINFER_GQA_KV_ARM)
+#undef SINFER_GQA_KV_ARM
+    if (matches == 1) { return sole_match; }
+    detail::throw_unregistered_geometry(0, q_heads, source_kv_heads);
+}
 
 } // namespace sinfer::ops

@@ -3075,3 +3075,62 @@ checkpoint. 128 lanes is the configuration — decode ties 96 lanes, TTFT is
 The lesson at two scales now: on this hardware the weight format is worth more
 than every scheduling lever put together. The 4B gained 54 % from it (#83), the
 27B 37 %, and in both cases the levers ranked above it moved nothing.
+
+## 88
+
+**Finishing #54: one geometry registry, and the "unregistered shape fails the
+build" claim made true (2026-08-31).**
+
+**Symptom.** The header comment in `ops/kernel/gqa_attention_geometry.cuh` stated
+the invariant #54 set out to establish — *an unregistered shape is a build error
+at the dispatcher, never a silent fallback to a slower path* — and none of it
+held. #54 parameterised the geometries but left every dispatcher a hand-written
+if-chain, each ending in an unconditional `Gqa35Geometry` arm. Nothing was a
+build error, nothing was checked at the dispatcher, and the fallback was not to
+a slower path: the kernels bake the head counts into their addressing, so a
+shape that reached the last arm would have been served by the 16q2 kernel's
+strides — wrong numbers and out-of-bounds loads.
+
+**Cause.** The shape list existed in four hand-maintained copies that had to
+agree: the geometry header, the decode if-chain, the prefill if-chain, and
+`kv_heads_for_q_heads` / `kv_heads_for_pair` in the wrapper. Only the wrapper's
+copy actually gated anything, so the launchers' fallback was masked as long as
+the copies agreed — and keeping them agreeing is what patches #13 and #18 were
+each doing, one site at a time. `gqa_attention_split_capacity` was a fifth copy
+keyed on the query count alone, which is not a shape: it sizes the split buffers
+the launcher writes, and two shapes sharing a query count need not share
+`DecodeSplitScale`.
+
+**Fix.** One registry, `SINFER_GQA_FOR_EACH_GEOMETRY`, next to the registrations.
+Everything else is generated from it: `gqa_dispatch_geometry` (exact
+head-dim/query/KV match), `gqa_dispatch_kv_geometry` for the append kernels that
+read only the head dimension and KV count, the wrapper's shape resolution, and
+the `extern template` block in the decode dispatcher. No arm falls through — an
+unregistered shape throws naming all three counts and pointing at the header.
+`split_capacity` takes the KV count and resolves through the same registry as
+the launcher. A `static_assert` holds the property the head-count-only dispatch
+depends on: registered shapes are distinct in (query heads, KV heads).
+
+The two failure modes the header now promises are both real. A shape registered
+without its translation unit is an undefined reference at link, which is why the
+per-shape decode files are now named for the shape they instantiate
+(`gqa_attention_decode_gqa256_24q4.cu` and friends) and the model-named
+compatibility typedefs — `Gqa27Geometry`, `Gqa35Geometry`, `Gqa08Geometry`,
+`Gqa4BGeometry` — are gone, as #54 said they would be once the last dispatcher
+converted. A shape nobody registered throws at the dispatcher; it cannot be
+a build error, because the shape arrives in tensor dimensions at runtime, and
+the header now says so rather than claiming otherwise.
+
+**Result.** Behaviour-neutral by construction: every dispatch arm resolves to the
+shape the old chains resolved to, checked arm by arm. `sinfer_gqa_attention_test`
+passes, with a new registry-driven case asserting that all five registered shapes
+are admitted and that unregistered ones (32q8, 12q4, 8q4, 16q8) are refused —
+driven off the macro, so registering a shape extends the coverage by itself.
+
+Still hand-maintained, and worth the next pass: `kHeadDim = 256` is a file-scope
+constant in the wrapper (with `kExpectedScale` its 1/sqrt(256) shadow) and
+`kGqaPrefillHeadDim` its prefill twin, so the head dimension is a registry
+parameter that only the kernels honour; the numerical geometry table in
+`test_gqa_attention.cpp` still lists four shapes by hand and does not cover
+Gqa256_16q4; and `gqa_attention_resolve_route` picks the chunked route on
+`q_heads == 16`, a policy keyed on half a shape.
