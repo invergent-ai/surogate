@@ -2789,3 +2789,66 @@ effective gain of `2+w` on the query side once a sequence passes 2,051 cached
 tokens (below that the selection is dense and the indexer never runs). The
 key-norm side is correct. Verify how qwen3_6 handles its indexer before
 touching the shared family file.
+
+## 2026-08-31 — EmbeddingGemma: the encoder cut, and two bugs on the way in
+
+The ask widened from "serve embeddinggemma-300m on CPU and GPU" to CPU support
+for embedding, reranking, speech2text and text2speech, then narrowed again —
+STT/TTS deferred. The load-bearing decision is which axis to cut on.
+
+**The axis is encoder-vs-decoder, not CPU-vs-GPU.** Roughly 5,500 lines of this
+engine (`program_impl.h` 3,125, `concurrent_executor.h` 1,682,
+`paged_kv_cache.cpp` 477, plus graphs, lanes and samplers) exist to make *round
+N+1* fast. An embedding model runs one forward: no KV cache, no sampler, no
+streaming, no graphs. A scoping pass sized four items "large", and three were
+large only because they assumed the decode path — pooled egress out of
+`prefill_hidden_`, the "prefill licenses exactly one token" contract (and
+EmbeddingGemma has no lm_head, so the usual workaround of burning one vocab GEMM
+does not exist), and a bidirectional windowed GQA geometry. At T ≤ 2048 with 3
+query heads the attention scores are 25 MB: a cuBLAS batched GEMM and one masked
+softmax, not a flash kernel. Cutting on encoder-vs-decoder deletes that work
+rather than doing it; cutting on CPU-vs-GPU would mean porting the decode loop to
+host cores. Estimate: encoder path GPU ~1.5–2 weeks, CPU backend ~1 week on top
+(8 kernels), against 3–4 weeks for a full decoder target.
+
+The host suits it: 2× EPYC 9124, 32c/64t, `avx512_bf16` **and** `avx512_vnni`,
+504 GB. 127 GFLOP per 512-token request against 0.61 GB of weights is
+compute-bound rather than bandwidth-bound, so it batches and scales with cores.
+
+**Two pre-existing bugs, both fixed.** `causal=False` never reached a kernel:
+the DSL has always emitted the attribute and the vision tower has always declared
+it, but `graph_compiler.cpp` parsed `softmax_scale` and `window_size` and never
+`causal`, and all four call sites hardcoded true — while mem_eff supported
+`NoCustomMask` throughout. The tower trained causally for a year. Separately, the
+DSL vision tower had never been traced at all: all seven `matmul_bias` calls
+passed `(matmul_result, bias)` to an op taking `(a, b, bias)`. Both survived
+because the test that should have caught the first asserted
+`"causal=False" in inspect.getsource(...)` — it read the source text, not the
+graph. It traces now.
+
+**Gemma 3 is declared**, both the generative variant and the bare
+`Gemma3TextModel` backbone EmbeddingGemma publishes (root-level tensors, no
+lm_head, bidirectional). Against the real checkpoint the mapping resolves 16
+tensor references with 0 missing and claims all 314 tensors; the compiled IR
+emits 24 attention ops, 20 windowed at 512 and 4 global, every one
+`causal: false` at scale 0.0625. Watch the scale: `query_pre_attn_scalar` equals
+`head_dim` here (both 256), so a wrong implementation that inherits the kernel
+default looks perfect on this checkpoint and breaks on the 27B, whose scalar is
+168 against head_dim 128.
+
+**The head folds.** Both sentence-transformers Dense modules declare an Identity
+activation, so 768→3072→768 is a single linear map and the artifact can store
+their product: 590K parameters instead of 4.7M, one GEMM per request instead of
+two. Measured on the real weights this is not a trade — folding rounds once where
+the pair rounds twice, giving min cosine 0.99999678 against an fp32 reference in
+bf16 versus 0.99999672 unfolded, and 7.6e-08 max deviation in fp32. Reference
+vectors are captured: q0 "capital of France" → its document at 0.569 against
+−0.034 and 0.066, and Matryoshka ranking survives truncate-then-normalise at
+512/256/128.
+
+Not yet built: the converter, and the C++ encoder path. The serve generator
+cannot express this model today — `TargetSpec.attention_interval` means
+GDN-vs-full rather than sliding-vs-full, `attention_scale` hardcodes
+`head_dim ** -0.5`, there is no `sliding_window` or `causal` field, and
+`emit_config.py:28` raises `NotImplementedError` for a pure-attention family.
+That plumbing should follow the C++ contract, not precede it.
