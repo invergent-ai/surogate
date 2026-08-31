@@ -78,6 +78,64 @@ CONTRACT: dict[str, str | Callable[[dict[str, Any]], Any]] = {
     "mtp_layers": "mtp_num_hidden_layers",
 }
 
+
+def _q(config, key):
+    return config.get(key)
+
+
+#: The converter is the third description of the same model, and it restates the
+#: geometry in its own constants (`LAYERS = 48`, `HIDDEN = 2560`). Those are checked
+#: here for the same reason the header's are: nothing else notices when they drift
+#: away from what training compiles. Derived entries are checked too, because a
+#: fused row count that disagrees with its parts is exactly the bug that surfaces
+#: as a load-time shape error on a hundred-gigabyte artifact.
+CONVERTER_CONTRACT: dict[str, str | Callable[[dict[str, Any]], Any]] = {
+    "LAYERS": "n_layers",
+    "HIDDEN": "d_model",
+    "VOCAB": "vocab_size",
+    "FULL_ATTENTION_INTERVAL": "full_attention_interval",
+    "HEAD_DIM": "head_size",
+    "QUERY_HEADS": "num_query_heads",
+    "KV_HEADS": "num_kv_heads",
+    "HC_COUNT": "hc_count",
+    "HC_LOW_RANK": "hc_lowrank",
+    "GDN_CONV_KERNEL": "linear_conv_kernel_dim",
+    "GDN_KEY_HEADS": "linear_num_key_heads",
+    "GDN_VALUE_HEADS": "linear_num_value_heads",
+    "GDN_HEAD_DIM": "linear_key_head_dim",
+    "EXPERTS": "num_experts",
+    "TOP_K": "num_experts_per_tok",
+    "EXPERT_FFN": "d_ff",
+    "SHARED_FFN": "shared_expert_intermediate",
+    "INDEXER_HEADS": "indexer_n_heads",
+    "INDEXER_DIM": "indexer_head_dim",
+    "PLE_NGRAM": "ngram_size",
+    "PLE_HEADS_PER_NGRAM": "heads_per_ngram",
+    "PLE_CONV_KERNEL": "ple_conv_kernel_size",
+    "PLE_EMBED": "ple_embed_dim",
+    "PLE_LAYER": lambda c: (c["ple_layer_ids"][0] - 1) if c.get("ple_layer_ids") else None,
+    "PLE_HEADS": lambda c: (c["ngram_size"] - 1) * c["heads_per_ngram"],
+    "PLE_HEAD_DIM": lambda c: c["ple_embed_dim"] // ((c["ngram_size"] - 1) * c["heads_per_ngram"]),
+    # Derived: the fused row counts the binder and the converter must both agree on.
+    "HC_WIDTH": lambda c: c["hc_count"] * c["d_model"],
+    "QUERY_SIZE": lambda c: c["num_query_heads"] * c["head_size"],
+    "KV_SIZE": lambda c: c["num_kv_heads"] * c["head_size"],
+    "GDN_KEY_DIM": lambda c: c["linear_num_key_heads"] * c["linear_key_head_dim"],
+    "GDN_VALUE_DIM": lambda c: c["linear_num_value_heads"] * c["linear_value_head_dim"],
+    "GDN_CONV_DIM": lambda c: (
+        2 * c["linear_num_key_heads"] * c["linear_key_head_dim"]
+        + c["linear_num_value_heads"] * c["linear_value_head_dim"]
+    ),
+    "GDN_FUSED_ROWS": lambda c: (
+        2 * c["linear_num_key_heads"] * c["linear_key_head_dim"]
+        + 2 * c["linear_num_value_heads"] * c["linear_value_head_dim"]
+    ),
+    "ATTENTION_FUSED_ROWS": lambda c: (
+        2 * c["num_query_heads"] * c["head_size"] + 2 * c["num_kv_heads"] * c["head_size"]
+    ),
+    "ROUTER_ROWS": lambda c: c["num_experts"] + 1,
+}
+
 _CONSTANT = re.compile(
     r"static\s+constexpr\s+(?:int|float|std::int64_t|std::uint32_t|bool)\s+"
     r"(\w+)\s*=\s*([^;]+);"
@@ -168,6 +226,44 @@ def check(target: str, model_dir: str, targets_root: pathlib.Path) -> int:
         print(f"  {len(absent)} declared quantities absent from the header: {', '.join(absent)}")
     for name, got, want in disagreed:
         print(f"  DISAGREE {name}: header={got!r} declaration={want!r}")
+    return len(disagreed) + check_converter(target, config)
+
+
+def check_converter(target: str, config: dict[str, Any]) -> int:
+    """The converter's own geometry constants, against the same declaration."""
+
+    import importlib
+
+    try:
+        inventory = importlib.import_module(
+            f"surogate.serve.tools.convert.{target}.inventory"
+        )
+    except ModuleNotFoundError:
+        print(f"  (no converter inventory for {target}; skipped)")
+        return 0
+
+    constants = {
+        name: value
+        for name, value in vars(inventory).items()
+        if name.isupper() and isinstance(value, int) and not isinstance(value, bool)
+    }
+    agreed, disagreed = 0, []
+    for name, source in CONVERTER_CONTRACT.items():
+        if name not in constants:
+            continue
+        want = source(config) if callable(source) else config.get(source)
+        if want is None:
+            continue
+        if constants[name] == want:
+            agreed += 1
+        else:
+            disagreed.append((name, constants[name], want))
+
+    total = len(getattr(inventory, "TENSOR_SPECS", ()))
+    print(f"  converter inventory: {agreed} constants agree "
+          f"({total} artifact objects declared)")
+    for name, got, want in disagreed:
+        print(f"  DISAGREE {name}: converter={got!r} declaration={want!r}")
     return len(disagreed)
 
 

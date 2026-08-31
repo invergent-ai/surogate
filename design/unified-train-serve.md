@@ -339,3 +339,40 @@ not have to be re-derived when GRPO needs it.
 Next: bindings.h/cpp from the same contract (218 of the 309 differing lines),
 then the converter inventory, then the train/serve numeric parity test, with
 GLM-5.3-Flash written declaration-first as the acceptance test.
+
+## Progress: the third description joins the check (step ②)
+
+Step ② set out to emit `bindings.h/cpp` from the contract. Measuring first
+changed the target. The two dense targets' bindings are **identical** in the
+header and differ by 122 lines in the source, of which ~8 are the namespace and
+the rest are one extra quantisation profile the 4B export happens to support.
+The shapes are not restated there at all: they are already written as
+`TextConfig::` references, so they arrived from the declaration the moment step ①
+generated `config.h`. Generating `bindings.cpp` would have bought almost nothing
+and would have pulled residency and profile policy — genuinely serving decisions
+— into the generator.
+
+The duplication is somewhere else. Artifact object names (`gdn/query_key_value_z`,
+`attention/query_key_gate_value`) are written twice: once in the C++ binder as
+`prefix + leaf`, once whole in the converter's `inventory.py`. And the converter
+restates the geometry in its own constants — `LAYERS = 48`, `HIDDEN = 2560`,
+`HC_COUNT = 4` — a third independent copy of what the declaration compiles. A
+converter and a binder that disagree about a fused row count produce a
+hundred-gigabyte artifact that fails at load; one that disagrees about a layer
+index produces an artifact that loads and is quietly wrong.
+
+So `check_contract.py` now checks both consumers against the declaration. On
+Flash-Next: **30 header constants and 35 converter constants agree, none
+disagree**, across 986 declared artifact objects. The converter table includes the
+derived fused row counts (`ATTENTION_FUSED_ROWS`, `GDN_FUSED_ROWS`, `HC_WIDTH`,
+`ROUTER_ROWS`) precisely because those are what a load-time shape error is made of.
+
+`tests/test_serve_contract.py` turns both checkers into tests that need no GPU, no
+weights and no built extension. The drift detector was verified by injecting
+drift: changing `hc_low_rank` to 256 in the committed header turns the suite red
+with `DISAGREE hc_low_rank: header=256 declaration=320`. A guard that has never
+failed has not been shown to guard anything.
+
+Emitting bindings is still worth doing, but as the *shared* implementation the two
+dense targets already almost are, not as a per-target generator — and after the
+converter inventory, which is where the object names actually live.
