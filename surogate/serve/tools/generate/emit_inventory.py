@@ -139,9 +139,15 @@ def inventory_for(architecture: str, hf_config: dict[str, Any]) -> list[dict[str
     out: list[dict[str, Any]] = []
 
     def emit(name: str, obj) -> None:
+        shape = resolve(obj.shape, symbols)
+        if any(dim == 0 for dim in shape):
+            # The declaration describes this object but this variant has no such
+            # geometry — a text-only checkpoint carries no vision tower. Declaring
+            # it and resolving it away beats maintaining two object lists.
+            return
         out.append({
             "name": name,
-            "shape": resolve(obj.shape, symbols),
+            "shape": shape,
             "format": obj.format,
             "components": obj.components,
             "transform": obj.transform,

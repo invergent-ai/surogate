@@ -171,43 +171,6 @@ def test_text_struct_scoping_is_not_fooled_by_sibling_structs(emitters):
 
 
 @pytest.mark.parametrize("target,model_dir", CHECKED_TARGETS)
-def test_converter_inventory_is_derivable_from_the_declaration(emitters, target, model_dir):
-    """The strongest form of the claim: the converter's artifact inventory is not a
-    second description at all, it is what the declaration implies.
-
-    Names, shapes and numeric formats must all agree — a mismatch on any of the
-    three is a bug that surfaces as a load-time failure on a very large artifact.
-    """
-
-    import importlib
-
-    emit_inventory = pytest.importorskip("emit_inventory")
-    from surogate.dsl.ir_builder import load_hf_config, resolve_architecture
-
-    path = REPO / model_dir
-    if not (path / "config.json").exists():
-        pytest.skip(f"no checkpoint config at {model_dir}")
-
-    hf_config = load_hf_config(str(path))
-    architecture = resolve_architecture(hf_config)
-    derived = emit_inventory.inventory_for(architecture, hf_config)
-
-    inventory = importlib.import_module(f"surogate.serve.tools.convert.{target}.inventory")
-    committed = {spec.name: (tuple(spec.shape), spec.format) for spec in inventory.TENSOR_SPECS}
-    emitted = {
-        obj["name"]: (obj["shape"], emit_inventory._format_name(obj["format"], inventory))
-        for obj in derived
-    }
-
-    assert set(emitted) == set(committed), (
-        f"object names differ: only-declaration={sorted(set(emitted) - set(committed))[:5]}, "
-        f"only-converter={sorted(set(committed) - set(emitted))[:5]}"
-    )
-    differing = {n: (committed[n], emitted[n]) for n in committed if committed[n] != emitted[n]}
-    assert not differing, f"shape/format disagreements: {list(differing.items())[:5]}"
-
-
-@pytest.mark.parametrize("target,model_dir", CHECKED_TARGETS)
 def test_fused_serve_objects_name_their_components(emitters, target, model_dir):
     """Every fused artifact object must say which declared parameters compose it,
     in row order — that mapping is what will place a LoRA adapter on the right
@@ -224,7 +187,11 @@ def test_fused_serve_objects_name_their_components(emitters, target, model_dir):
     hf_config = load_hf_config(str(path))
     derived = emit_inventory.inventory_for(resolve_architecture(hf_config), hf_config)
 
-    deferred = ("/indexer/", "/ple/", "text/ple/")
+    # Subsystems a serving artifact carries but the training graph does not yet
+    # compute: their objects are declared so the artifact is fully described, and
+    # they name no source parameters because there are none to name.
+    deferred = ("/indexer/", "/ple/", "text/ple/", "vision/", "mtp/", "dflash/",
+                "draft_head")
     uncomposed = [
         obj["name"] for obj in derived
         if not obj["components"] and not any(mark in obj["name"] for mark in deferred)

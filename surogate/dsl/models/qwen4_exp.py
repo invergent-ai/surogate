@@ -36,7 +36,13 @@ from ..modules import Embedding, HyperConnection, LMHead, StreamBroadcast
 from ..modules.attention import _resolve_rotary_dim
 from ..modules.moe import MoESharedExpert
 from ..specs import ActivationScope
-from .qwen3_5 import _parse_qwen3_5_layer_types
+from .qwen3_5 import (
+    QWEN3_5_VISION_HEAD_OBJECTS,
+    QWEN3_5_VISION_MERGER_OBJECTS,
+    QWEN3_5_VISION_SERVE_SECTION,
+    _parse_qwen3_5_layer_types,
+    capture_vision_geometry,
+)
 
 
 #: Model-level objects as a serving artifact stores them. The per-layer objects are
@@ -54,6 +60,9 @@ QWEN4_EXP_MODEL_SERVE_OBJECTS: tuple[ServeObject, ...] = (
     ServeObject("text/ple/multipliers", "i32", ("PleMultipliers",), scope="model"),
     ServeObject("text/ple/head_offsets", "i32", ("PleHeads",), scope="model"),
     ServeObject("text/ple/head_vocab_sizes", "i32", ("PleHeads",), scope="model"),
+    # Serving carries the vision tower on every target.
+    *QWEN3_5_VISION_HEAD_OBJECTS,
+    *QWEN3_5_VISION_MERGER_OBJECTS,
 )
 
 #: Objects that exist only on the layer carrying the n-gram memory.
@@ -188,6 +197,7 @@ class _Qwen4ExpBase(nn.Model):
     #: exists only on the layer carrying the n-gram memory.
     _serve_objects_ = QWEN4_EXP_MODEL_SERVE_OBJECTS
     _serve_layer_objects_ = {"ple": QWEN4_EXP_PLE_SERVE_OBJECTS}
+    _serve_sections_ = (QWEN3_5_VISION_SERVE_SECTION,)
     _serve_blocks_ = {
         "attention": Qwen4ExpAttentionBlock,
         "mamba": Qwen4ExpLinearBlock,
@@ -236,6 +246,7 @@ class _Qwen4ExpBase(nn.Model):
         mtp_num_hidden_layers: int,
         chunk_size: int,
         ep_size: int,
+        use_visual_inputs: bool | dict | None = False,
     ) -> None:
         if output_gate_type not in ("silu", "sigmoid"):
             raise ValueError(f"qwen4_exp output_gate_type must be 'silu' or 'sigmoid', got {output_gate_type!r}")
@@ -288,6 +299,9 @@ class _Qwen4ExpBase(nn.Model):
         self.indexer_budget = indexer_budget
         self.indexer_compress_ratio = indexer_compress_ratio
         self.mtp_num_hidden_layers = mtp_num_hidden_layers
+        self.use_visual_inputs = bool(use_visual_inputs)
+        for _key, _value in capture_vision_geometry(use_visual_inputs).items():
+            setattr(self, _key, _value)
 
         # Derived
         self.D = head_size if head_size > 0 else d_model // num_query_heads
@@ -479,6 +493,7 @@ class Qwen4ExpCausalModel(_Qwen4ExpBase):
         mtp_num_hidden_layers: int = 0,
         chunk_size: int = 64,
         ep_size: int = 1,
+        use_visual_inputs: bool | dict | None = False,
     ):
         super().__init__()
         self._init_qwen4_exp(
@@ -492,7 +507,7 @@ class Qwen4ExpCausalModel(_Qwen4ExpBase):
             ple_embed_dim, ngram_vocab_size_base, make_ngram_vocab_size_divisible_by,
             split_ngram_parts, indexer_n_heads, indexer_kv_heads, indexer_head_dim,
             indexer_budget, indexer_compress_ratio, mtp_num_hidden_layers,
-            chunk_size, ep_size,
+            chunk_size, ep_size, use_visual_inputs,
         )
 
 
@@ -500,6 +515,7 @@ class Qwen4ExpCausalModel(_Qwen4ExpBase):
     architecture="Qwen4ExpForConditionalGeneration",
     model_type="qwen4_exp",
     **_with_text_config_prefix(_QWEN4_EXP_TEXT_CONFIG_MAPPING),
+    use_visual_inputs="vision_config",
 )
 class Qwen4ExpConditionalModel(_Qwen4ExpBase):
     """Qwen3.8-Flash-Next text model for ``Qwen4ExpForConditionalGeneration``.
@@ -555,6 +571,7 @@ class Qwen4ExpConditionalModel(_Qwen4ExpBase):
         mtp_num_hidden_layers: int = 0,
         chunk_size: int = 64,
         ep_size: int = 1,
+        use_visual_inputs: bool | dict | None = False,
     ):
         super().__init__()
         self._init_qwen4_exp(
@@ -568,5 +585,5 @@ class Qwen4ExpConditionalModel(_Qwen4ExpBase):
             ple_embed_dim, ngram_vocab_size_base, make_ngram_vocab_size_divisible_by,
             split_ngram_parts, indexer_n_heads, indexer_kv_heads, indexer_head_dim,
             indexer_budget, indexer_compress_ratio, mtp_num_hidden_layers,
-            chunk_size, ep_size,
+            chunk_size, ep_size, use_visual_inputs,
         )

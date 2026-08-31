@@ -117,13 +117,23 @@ def _build_mtp_specs() -> tuple[TensorSpec, ...]:
 
 
 def _build_vision_specs() -> tuple[TensorSpec, ...]:
-    return build_vision_specs(5120)
+    # This target's own tower, not the Qwen3.6 default. Serving carries vision
+    # on every target; the geometry comes from the model's vision_config, which
+    # the DSL declaration is the source of truth for.
+    return build_vision_specs(
+        1024,
+        layers=12,
+        hidden=768,
+        intermediate=3072,
+        qkv_rows=2304,
+        merger_hidden=3072,
+    )
 
 
 TEXT_CORE_TENSOR_SPECS = _build_text_core_specs()
 DRAFT_HEAD_TENSOR_SPECS = _build_draft_head_specs()
 MTP_TENSOR_SPECS = _build_mtp_specs()
-VISION_TENSOR_SPECS: tuple[TensorSpec, ...] = ()  # text-only target
+VISION_TENSOR_SPECS = _build_vision_specs()
 
 TENSOR_SPECS = (
     TEXT_CORE_TENSOR_SPECS

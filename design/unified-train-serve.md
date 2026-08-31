@@ -466,3 +466,49 @@ tower is an export decision, not a property of the architecture. Qwen3.5-4B has 
 `vision_config` and its artifact carries no tower, while the 35B's does. So the
 declaration describes the tower; the target decides whether that section is
 exported.
+
+## Vision is not optional, and the stub that said otherwise
+
+The previous section concluded that whether an artifact ships the vision tower is
+an export decision, on the evidence that three converters carried no vision
+objects. That was reading a stub as a design. The dense converters contain:
+
+```python
+def _build_vision_specs(): return build_vision_specs(5120)
+VISION_TENSOR_SPECS: tuple[TensorSpec, ...] = ()  # text-only target
+```
+
+— a builder that is defined and never called, with a width (5120) that matches
+none of those models' hidden sizes. Unfinished work, not a boundary. Serving
+carries vision on every target.
+
+Fixing it exposed a second thing: the shared `build_vision_specs` hardcoded the
+Qwen3.6 tower, 27 layers of 1152, so it would have been wrong for all three even
+had it been called. The towers differ — the 0.8B is 12 layers of 768, the 2B and
+4B are 24 of 1024, Flash-Next and the 35B are 27 of 1152 — and the geometry was
+sitting unused in each model's `vision_config`, which the declaration collapsed to
+a boolean. The builder now takes the geometry; the declaration supplies it.
+
+Every target now carries its tower, and every converter agrees with the
+declaration exactly:
+
+| target | before | after | vision |
+| --- | --- | --- | --- |
+| qwen3_5_0_8b | 281 | **434** | 153 |
+| qwen3_5_2b | 281 | **578** | 297 |
+| qwen3_5_4b | 369 | **666** | 297 |
+| qwen4exp | 986 | **1319** | 333 |
+| qwen3_6_35b_a3b | 934 | 934 | 333 (already) |
+
+Two consequences worth stating rather than discovering later. The artifact grows,
+and for `qwen4exp` the engine does not yet bind what it now carries — that
+target's `bindings.cpp` contains no `vision/` objects at all and its `VisionConfig`
+is, in its own words, "instantiated but never enabled". The tower travels in the
+artifact and is ignored until the target enables it. And the qwen4exp converter's
+own W8-count invariant caught the change immediately, which is the second time an
+existing check has earned its keep here.
+
+The emitter also gained a small rule that makes this maintainable: an object whose
+declared geometry resolves to zero is not in the artifact. A text-only checkpoint
+carries no tower, and that now falls out of the geometry instead of requiring a
+second object list.

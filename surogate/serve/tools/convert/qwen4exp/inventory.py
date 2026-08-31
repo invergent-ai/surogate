@@ -35,6 +35,7 @@ from surogate.serve.tools.convert.qwen3_6.common.inventory import (
     StoredObjectSpec,
     TensorSpec,
     W8,
+    build_vision_specs,
 )
 
 MODEL_ID = "qwen3.8-flash-next"
@@ -199,7 +200,12 @@ def _build_text_core_specs() -> tuple[TensorSpec, ...]:
 
 
 TEXT_CORE_TENSOR_SPECS = _build_text_core_specs()
-TENSOR_SPECS = TEXT_CORE_TENSOR_SPECS
+
+# Serving carries the vision tower on every target. Flash-Next's is the Qwen3.6
+# tower (27 layers of 1152) merging into this model's 2560-wide text stack.
+VISION_TENSOR_SPECS = build_vision_specs(HIDDEN)
+
+TENSOR_SPECS = TEXT_CORE_TENSOR_SPECS + VISION_TENSOR_SPECS
 PLE_TABLE_SPEC = ResourceSpec(PLE_TABLE_RESOURCE)
 ALL_RESOURCE_SPECS = RESOURCE_SPECS + (PLE_TABLE_SPEC,)
 OBJECT_SPECS: tuple[StoredObjectSpec, ...] = ALL_RESOURCE_SPECS + TENSOR_SPECS
@@ -219,7 +225,14 @@ def validate_inventory() -> None:
     if PLE_LAYER not in GDN_LAYERS:
         raise ValueError("the PLE layer is expected to be a GDN layer")
     per_layer_w8 = 4  # routed gate_up, routed down, shared gate_up, shared down
-    expected_w8 = 2 + LAYERS * per_layer_w8 + len(FULL_ATTENTION_LAYERS) * 2 + len(GDN_LAYERS) * 2
+    vision_w8 = 2  # the merger's two projections; the tower's own weights are K-quants
+    expected_w8 = (
+        2
+        + LAYERS * per_layer_w8
+        + len(FULL_ATTENTION_LAYERS) * 2
+        + len(GDN_LAYERS) * 2
+        + vision_w8
+    )
     if FORMAT_COUNTS[W8] != expected_w8:
         raise ValueError(f"expected {expected_w8} W8 objects, found {FORMAT_COUNTS[W8]}")
 

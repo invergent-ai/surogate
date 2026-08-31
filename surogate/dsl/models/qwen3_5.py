@@ -33,6 +33,12 @@ QWEN3_5_MODEL_SERVE_OBJECTS: tuple[ServeObject, ...] = (
     ServeObject("text/draft_head_token_ids", "i32", ("DraftVocab",), scope="model"),
 )
 
+#: Serving carries the vision tower on every target, so it is declared here rather
+#: than left to each converter. The geometry is this model's own — the towers
+#: differ (0.8B is 12 layers of 768, the 2B and 4B are 24 of 1024) — which is why
+#: a builder that hardcodes one family's tower cannot serve them all.
+
+
 #: The multi-token-prediction head: an embedding/hidden norm pair, a projection
 #: that folds the two together, and one decoder layer identical in shape to a
 #: text attention block — which is why it reuses the same object declarations
@@ -124,6 +130,14 @@ QWEN3_5_VISION_SERVE_SECTION = ServeSection(
     prefix="vision/layers/",
     objects=QWEN3_5_VISION_SERVE_SECTION_OBJECTS,
     repeat="vision_layers",
+)
+
+# Serving always carries the tower, so the model-level object list gains its head
+# and merger. Declared after both halves exist so the ordering stays readable.
+QWEN3_5_MODEL_SERVE_OBJECTS = (
+    *QWEN3_5_MODEL_SERVE_OBJECTS,
+    *QWEN3_5_VISION_HEAD_OBJECTS,
+    *QWEN3_5_VISION_MERGER_OBJECTS,
 )
 
 def _parse_qwen3_5_layer_types(
@@ -246,7 +260,7 @@ class Qwen3_5CausalModel(nn.Model):
     #: vocabulary subset the speculative head predicts over — a property of the
     #: served model, so it is declared rather than hardcoded in a converter.
     _serve_objects_ = QWEN3_5_MODEL_SERVE_OBJECTS
-    _serve_sections_ = (QWEN3_5_MTP_SERVE_SECTION,)
+    _serve_sections_ = (QWEN3_5_MTP_SERVE_SECTION, QWEN3_5_VISION_SERVE_SECTION)
     _serve_blocks_ = {
         "attention": Qwen3_5AttentionBlock,
         "mamba": Qwen3_5LinearBlock,
@@ -441,7 +455,7 @@ class Qwen3_5ConditionalModel(nn.Model):
     #: vocabulary subset the speculative head predicts over — a property of the
     #: served model, so it is declared rather than hardcoded in a converter.
     _serve_objects_ = QWEN3_5_MODEL_SERVE_OBJECTS
-    _serve_sections_ = (QWEN3_5_MTP_SERVE_SECTION,)
+    _serve_sections_ = (QWEN3_5_MTP_SERVE_SECTION, QWEN3_5_VISION_SERVE_SECTION)
     _serve_blocks_ = {
         "attention": Qwen3_5AttentionBlock,
         "mamba": Qwen3_5LinearBlock,

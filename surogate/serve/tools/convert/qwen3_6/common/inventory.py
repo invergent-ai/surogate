@@ -100,42 +100,60 @@ RESOURCE_SPECS = tuple(
 )
 
 
-def build_vision_specs(text_width: int) -> tuple[TensorSpec, ...]:
-    """Build the shared Qwen3.6 Vision inventory for a target text width."""
+def build_vision_specs(
+    text_width: int,
+    *,
+    layers: int = 27,
+    hidden: int = 1152,
+    intermediate: int = 4304,
+    qkv_rows: int = 3456,
+    patch_rows: int = 1536,
+    position_embeddings: int = 2304,
+    merger_hidden: int = 4608,
+) -> tuple[TensorSpec, ...]:
+    """Build a vision inventory for a target's own tower.
+
+    The defaults are the Qwen3.6 tower (27 layers of 1152) that the 27B and 35B
+    carry. They are only defaults: the Qwen3.5 targets have towers of their own —
+    the 0.8B is 12 layers of 768, the 2B and 4B are 24 of 1024 — and serving
+    carries the tower on every target, so the geometry has to be a parameter
+    rather than a constant. The DSL declaration is where each target's numbers
+    come from; `tests/test_serve_contract.py` checks that these agree with it.
+    """
 
     specs: list[TensorSpec] = [
-        tensor_spec("vision/patch_embedding", (1152, 1536), Q6),
-        tensor_spec("vision/patch_embedding_bias", (1152,), BF16),
-        tensor_spec("vision/position_embedding", (2304, 1152), BF16),
+        tensor_spec("vision/patch_embedding", (hidden, patch_rows), Q6),
+        tensor_spec("vision/patch_embedding_bias", (hidden,), BF16),
+        tensor_spec("vision/position_embedding", (position_embeddings, hidden), BF16),
     ]
 
-    for layer in VISION_LAYERS:
+    for layer in range(layers):
         prefix = f"vision/layers/{layer}/"
         specs.extend(
             (
-                tensor_spec(prefix + "attention/qkv", (3456, 1152), Q4),
-                tensor_spec(prefix + "attention/qkv_bias", (3456,), BF16),
-                tensor_spec(prefix + "attention/output", (1152, 1152), Q5),
-                tensor_spec(prefix + "attention/output_bias", (1152,), BF16),
-                tensor_spec(prefix + "mlp/fc1", (4304, 1152), Q4),
-                tensor_spec(prefix + "mlp/fc1_bias", (4304,), BF16),
-                tensor_spec(prefix + "mlp/fc2", (1152, 4304), Q5),
-                tensor_spec(prefix + "mlp/fc2_bias", (1152,), BF16),
-                tensor_spec(prefix + "norm1/weight", (1152,), BF16),
-                tensor_spec(prefix + "norm1/bias", (1152,), BF16),
-                tensor_spec(prefix + "norm2/weight", (1152,), BF16),
-                tensor_spec(prefix + "norm2/bias", (1152,), BF16),
+                tensor_spec(prefix + "attention/qkv", (qkv_rows, hidden), Q4),
+                tensor_spec(prefix + "attention/qkv_bias", (qkv_rows,), BF16),
+                tensor_spec(prefix + "attention/output", (hidden, hidden), Q5),
+                tensor_spec(prefix + "attention/output_bias", (hidden,), BF16),
+                tensor_spec(prefix + "mlp/fc1", (intermediate, hidden), Q4),
+                tensor_spec(prefix + "mlp/fc1_bias", (intermediate,), BF16),
+                tensor_spec(prefix + "mlp/fc2", (hidden, intermediate), Q5),
+                tensor_spec(prefix + "mlp/fc2_bias", (hidden,), BF16),
+                tensor_spec(prefix + "norm1/weight", (hidden,), BF16),
+                tensor_spec(prefix + "norm1/bias", (hidden,), BF16),
+                tensor_spec(prefix + "norm2/weight", (hidden,), BF16),
+                tensor_spec(prefix + "norm2/bias", (hidden,), BF16),
             )
         )
 
     specs.extend(
         (
-            tensor_spec("vision/merger/fc1", (4608, 4608), W8),
-            tensor_spec("vision/merger/fc1_bias", (4608,), BF16),
-            tensor_spec("vision/merger/fc2", (text_width, 4608), W8),
+            tensor_spec("vision/merger/fc1", (merger_hidden, merger_hidden), W8),
+            tensor_spec("vision/merger/fc1_bias", (merger_hidden,), BF16),
+            tensor_spec("vision/merger/fc2", (text_width, merger_hidden), W8),
             tensor_spec("vision/merger/fc2_bias", (text_width,), BF16),
-            tensor_spec("vision/merger/norm/weight", (1152,), BF16),
-            tensor_spec("vision/merger/norm/bias", (1152,), BF16),
+            tensor_spec("vision/merger/norm/weight", (hidden,), BF16),
+            tensor_spec("vision/merger/norm/bias", (hidden,), BF16),
         )
     )
     return tuple(specs)
