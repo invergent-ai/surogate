@@ -1,10 +1,10 @@
 // Run one sequence through the EmbeddingGemma encoder and print the vector.
 //
-// Tokenisation stays in Python for now: this takes token ids so the numerical
-// path can be compared against the reference before a C++ tokenizer exists to
-// disagree with it.
+// Takes text or token ids. `--print-ids` stops after tokenising, which is how
+// the tokenizer is checked against the reference without the model in the way.
 //
 //   sinfer_embed_cli --artifact model.sinfer --tokens 2,105,4368,...
+//   sinfer_embed_cli --artifact model.sinfer --text "some text" [--print-ids]
 
 #include "core/device.h"
 #include "encoder/gemma_embedding.h"
@@ -46,7 +46,10 @@ int main(int argc, char** argv) {
     try {
         std::string artifact;
         std::vector<std::int32_t> tokens;
-        int repeat = 1;
+        std::string text;
+        bool have_text = false;
+        bool print_ids = false;
+        int repeat     = 1;
         for (int i = 1; i < argc; ++i) {
             const std::string_view arg(argv[i]);
             const auto next = [&](const char* what) -> std::string_view {
@@ -57,6 +60,11 @@ int main(int argc, char** argv) {
                 artifact = std::string(next("--artifact"));
             } else if (arg == "--tokens") {
                 tokens = parse_tokens(next("--tokens"));
+            } else if (arg == "--text") {
+                text      = std::string(next("--text"));
+                have_text = true;
+            } else if (arg == "--print-ids") {
+                print_ids = true;
             } else if (arg == "--repeat") {
                 repeat = std::stoi(std::string(next("--repeat")));
             } else {
@@ -64,10 +72,21 @@ int main(int argc, char** argv) {
             }
         }
         if (artifact.empty()) { throw std::invalid_argument("--artifact is required"); }
-        if (tokens.empty()) { throw std::invalid_argument("--tokens is required"); }
+        if (tokens.empty() && !have_text) {
+            throw std::invalid_argument("one of --tokens or --text is required");
+        }
 
         sinfer::DeviceContext device(0);
         auto model = sinfer::encoder::GemmaEmbedding::load(artifact, device);
+        if (have_text) { tokens = model.tokenizer().encode(text); }
+        if (print_ids) {
+            std::printf("[");
+            for (std::size_t i = 0; i < tokens.size(); ++i) {
+                std::printf("%s%d", i == 0 ? "" : ",", tokens[i]);
+            }
+            std::printf("]\n");
+            return 0;
+        }
         std::fprintf(stderr, "loaded %.0f MB of weights; %zu tokens\n",
                      static_cast<double>(model.weight_bytes()) / 1e6, tokens.size());
 

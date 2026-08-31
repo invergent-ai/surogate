@@ -17,6 +17,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/tensor.h"
+#include "encoder/gemma_tokenizer.h"
 
 #include <cstdint>
 #include <filesystem>
@@ -90,6 +91,10 @@ public:
     /// whatever arrived.
     [[nodiscard]] std::vector<std::vector<float>> embed_batch(
         const std::vector<std::vector<std::int32_t>>& sequences);
+
+    /// The tokenizer the artifact ships. Text and ids therefore cannot disagree:
+    /// they come from the same file the weights did.
+    [[nodiscard]] const GemmaTokenizer& tokenizer() const noexcept;
 
     [[nodiscard]] const GemmaEmbeddingConfig& config() const noexcept;
     /// Bytes of device memory the weights occupy.

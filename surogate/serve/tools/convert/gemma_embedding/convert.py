@@ -59,7 +59,12 @@ _W8 = get_format(W8)
 
 #: An embedding request carries no chat template and generates no tokens, so the
 #: frontend is a tokenizer and nothing else.
-FRONTEND_RESOURCES = ("frontend/tokenizer.json", "frontend/tokenizer_config.json")
+#:
+#: The SentencePiece model rather than `tokenizer.json`: upstream SentencePiece
+#: reproduces the HF ids exactly on it, and it is 4.7 MB where the JSON is 33 MB.
+#: `tokenizer_config.json` still travels for the special-token ids and the
+#: sequence limit.
+FRONTEND_RESOURCES = ("frontend/tokenizer.model", "frontend/tokenizer_config.json")
 
 
 # --------------------------------------------------------------------------------------------

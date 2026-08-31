@@ -5,12 +5,12 @@
 // that spans many rounds -- and an embedding request has none of that. It
 // arrives, runs one forward, and returns a vector.
 //
-// `input` accepts token ids (`[int]` or `[[int]]`), which the OpenAI schema
-// permits. It does not yet accept text: the engine's tokenizer requires
-// ByteLevel BPE with a Qwen pretokenizer, and Gemma's is BPE with SentencePiece
-// normalisation and byte fallback, so text input waits on a second tokenizer
-// model. Taking ids also makes a comparison against another engine measure the
-// model rather than two different tokenizers.
+// `input` accepts text (`string` or `[string]`) and token ids (`[int]` or
+// `[[int]]`), which is the whole of the OpenAI schema. Text is encoded by the
+// tokenizer the artifact itself ships, so text and ids cannot disagree about
+// what the weights were trained on. Ids remain useful for benchmarking against
+// another engine, where they keep the measurement on the model rather than on
+// two different tokenizers.
 //
 //   sinfer_embedding_server --artifact model.sinfer [--port 8413] [--device 0]
 
@@ -31,20 +31,29 @@ namespace {
 
 using json = nlohmann::json;
 
-/// `input` is one sequence of ids or a list of them; both are accepted, and a
-/// bare list of integers is the single-sequence form.
-std::vector<std::vector<std::int32_t>> parse_input(const json& input) {
+/// All four `input` forms: one string, a list of strings, one list of ids, or a
+/// list of those. A bare list of integers is the single-sequence id form.
+std::vector<std::vector<std::int32_t>> parse_input(const json& input,
+                                                   const sinfer::encoder::GemmaTokenizer& tokenizer) {
     std::vector<std::vector<std::int32_t>> out;
+    if (input.is_string()) {
+        out.push_back(tokenizer.encode(input.get<std::string>()));
+        return out;
+    }
     if (!input.is_array() || input.empty()) {
-        throw std::invalid_argument("input must be a non-empty array of token ids");
+        throw std::invalid_argument("input must be a string, or a non-empty array");
     }
     if (input.front().is_number_integer()) {
         out.push_back(input.get<std::vector<std::int32_t>>());
         return out;
     }
     for (const json& element : input) {
+        if (element.is_string()) {
+            out.push_back(tokenizer.encode(element.get<std::string>()));
+            continue;
+        }
         if (!element.is_array() || element.empty()) {
-            throw std::invalid_argument("each input must be a non-empty array of token ids");
+            throw std::invalid_argument("each input must be a string or a non-empty array of ids");
         }
         out.push_back(element.get<std::vector<std::int32_t>>());
     }
@@ -110,7 +119,7 @@ int main(int argc, char** argv) {
                 if (body.contains("model") && body["model"].is_string()) {
                     model_name = body["model"].get<std::string>();
                 }
-                sequences = parse_input(body.at("input"));
+                sequences = parse_input(body.at("input"), model.tokenizer());
             } catch (const std::exception& error) {
                 response.status = 400;
                 response.set_content(error_body(error.what(), "invalid_request_error").dump(),

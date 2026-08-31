@@ -115,6 +115,20 @@ FetchContent_Declare(
         EXCLUDE_FROM_ALL
 )
 
+# The Gemma tokenizer. The checkpoint ships tokenizer.model beside
+# tokenizer.json, and upstream SentencePiece reproduces HF's ids exactly on it
+# (verified over 414 cases: whitespace runs, emoji, CJK, Cyrillic, long inputs
+# and 400 random mixed-alphabet strings). Hand-writing a 514,906-merge BPE with
+# byte fallback to match would be strictly worse and far easier to get subtly
+# wrong.
+FetchContent_Declare(
+        sentencepiece
+        QUIET
+        GIT_REPOSITORY https://github.com/google/sentencepiece.git
+        GIT_TAG v0.2.1
+        EXCLUDE_FROM_ALL
+)
+
 FetchContent_Declare(
         cli11
         QUIET
@@ -201,6 +215,11 @@ FetchContent_Declare(
 )
 
 find_package(CUDAToolkit COMPONENTS cuBLAS REQUIRED)
+
+set(SPM_ENABLE_SHARED OFF CACHE BOOL "" FORCE)
+set(SPM_ENABLE_TCMALLOC OFF CACHE BOOL "" FORCE)
+set(SPM_BUILD_TEST OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(sentencepiece)
 
 FetchContent_MakeAvailable(json)
 FetchContent_MakeAvailable(cudnn-fe)
@@ -1191,9 +1210,12 @@ set_source_files_properties(
   "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;-static-global-template-stub=false>")
 add_library(sinfer_encoder STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/encoder/gemma_embedding.cpp
+  ${SERVE_ROOT}/encoder/gemma_tokenizer.cpp
 )
 sinfer_internal_includes(sinfer_encoder)
-target_link_libraries(sinfer_encoder PUBLIC sinfer_core sinfer_ops sinfer_artifact)
+target_include_directories(sinfer_encoder PRIVATE ${sentencepiece_SOURCE_DIR}/src)
+target_link_libraries(sinfer_encoder PUBLIC sinfer_core sinfer_ops sinfer_artifact
+                                     PRIVATE sentencepiece-static)
 
 sinfer_internal_includes(sinfer_ops)
 # surogate vendor patch (PATCHES.md #25): cutlass headers for the sm_120a

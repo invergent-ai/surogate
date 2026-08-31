@@ -13,6 +13,7 @@
 #include "api/ops/rope.h"
 #include "api/ops/scale.h"
 #include "artifact/binder.h"
+#include "encoder/gemma_tokenizer.h"
 #include "artifact/typed_binding.h"
 #include "ops/linear/bf16/bf16_cublaslt.h"
 
@@ -69,6 +70,7 @@ struct GemmaEmbedding::Impl {
     std::unique_ptr<DeviceBuffer> attention_workspace;
     std::size_t attention_workspace_bytes = 0;
     std::unique_ptr<DeviceBuffer> positions;
+    std::unique_ptr<GemmaTokenizer> tokenizer;
 
     [[nodiscard]] Tensor norm(artifact::ObjectHandle handle, std::int32_t width) const {
         return artifact::materialized_tensor(materialized, handle, NumericFormat::BF16, {width});
@@ -86,6 +88,8 @@ GemmaEmbedding::GemmaEmbedding(GemmaEmbedding&&) noexcept          = default;
 GemmaEmbedding& GemmaEmbedding::operator=(GemmaEmbedding&&) noexcept = default;
 
 const GemmaEmbeddingConfig& GemmaEmbedding::config() const noexcept { return impl_->config; }
+
+const GemmaTokenizer& GemmaEmbedding::tokenizer() const noexcept { return *impl_->tokenizer; }
 
 std::uint64_t GemmaEmbedding::weight_bytes() const noexcept {
     return impl_->materialized.stats().device_capacity_bytes;
@@ -137,11 +141,12 @@ GemmaEmbedding GemmaEmbedding::load(const std::filesystem::path& path, DeviceCon
     impl.final_norm     = artifact::bind_device_tensor(binder, "text/final_norm", bf, {hidden});
     impl.embedding_head = artifact::bind_device_tensor(binder, "text/embedding_head", bf,
                                                        {hidden, hidden});
-    // The tokenizer travels with the artifact but is the frontend's business.
-    (void)artifact::bind_raw_resource(binder, "frontend/tokenizer.json");
+    const auto tokenizer_model = artifact::bind_raw_resource(binder, "frontend/tokenizer.model");
     (void)artifact::bind_raw_resource(binder, "frontend/tokenizer_config.json");
 
     impl.materialized = artifact::materialize(*impl.reader, binder.finish(), device);
+    impl.tokenizer = std::make_unique<GemmaTokenizer>(GemmaTokenizer::from_serialized_proto(
+        impl.materialized.resource_bytes(tokenizer_model)));
 
     // Scratch for the widest request. Named for what they hold rather than
     // sized by trial: hidden-wide activations, one intermediate-wide pair for
