@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 constexpr int kRowsPerBlock = 8;
@@ -128,4 +128,4 @@ void launch_q5_simt_split4_exact(const Tensor& x, const Weight& w, Tensor& out,
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

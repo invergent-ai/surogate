@@ -10,7 +10,7 @@
 #include <cstdint>
 #include <type_traits>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 constexpr int kRowsPerBlockDefault = 8;
@@ -115,4 +115,4 @@ void launch_w8_simt_r8_c8(const Tensor& x, const Weight& w, Tensor& out, cudaStr
     launch_route<8>(x, w, out, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

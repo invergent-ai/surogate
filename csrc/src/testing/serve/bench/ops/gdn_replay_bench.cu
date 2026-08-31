@@ -10,7 +10,7 @@
 #include "core/gdn_replay_records.h"
 #include "core/layout.h"
 #include "core/linear_attention_state.h"
-#include "ninfer_bench_common.h"
+#include "sinfer_bench_common.h"
 
 #include <cuda_runtime.h>
 
@@ -27,7 +27,7 @@
 #include <string_view>
 #include <vector>
 
-using namespace ninfer;
+using namespace sinfer;
 
 namespace {
 

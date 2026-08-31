@@ -1,12 +1,12 @@
 // Cold-cache qualification rig for the exact fused BF16 GDN-control projections.
 //
 // Examples:
-//   ./build/bench/ninfer_gdn_gating_proj_bench --35b --candidate auto
-//   ./build/bench/ninfer_gdn_gating_proj_bench --35b \
+//   ./build/bench/sinfer_gdn_gating_proj_bench --35b --candidate auto
+//   ./build/bench/sinfer_gdn_gating_proj_bench --35b \
 //     --candidate mma-split16 -p 128,512,1024
 #include "api/ops/gdn_gating_proj.h"
 #include "api/ops/rmsnorm.h"
-#include "ninfer_bench_common.h"
+#include "sinfer_bench_common.h"
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.h"
 
 #include <cuda_runtime.h>
@@ -21,8 +21,8 @@
 #include <string_view>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::bench;
+using namespace sinfer;
+using namespace sinfer::bench;
 
 namespace {
 

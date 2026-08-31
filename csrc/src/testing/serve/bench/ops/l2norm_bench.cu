@@ -2,9 +2,9 @@
 // [D,heads,T]=[128,16,T], with T=1..6 for decode/verification and T=1024 for prefill.
 //
 // Narrow one-case profiling example:
-//   ./ninfer_l2norm_bench --tokens 1024
+//   ./sinfer_l2norm_bench --tokens 1024
 #include "api/ops/l2norm.h"
-#include "ninfer_bench_common.h"
+#include "sinfer_bench_common.h"
 
 #include <cuda_bf16.h>
 
@@ -12,8 +12,8 @@
 #include <cstdlib>
 #include <cstring>
 
-using namespace ninfer;
-using namespace ninfer::bench;
+using namespace sinfer;
+using namespace sinfer::bench;
 
 namespace {
 

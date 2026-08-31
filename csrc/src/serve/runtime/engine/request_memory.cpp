@@ -8,7 +8,7 @@
 #include <memory>
 #include <stdexcept>
 
-namespace ninfer::runtime {
+namespace sinfer::runtime {
 namespace {
 
 bool is_power_of_two(std::size_t value) noexcept {
@@ -88,4 +88,4 @@ ArenaMemorySummary RequestMemory::summary() const noexcept {
 
 void RequestMemory::reset_peak() noexcept { impl_->peak_bytes = impl_->active_bytes; }
 
-} // namespace ninfer::runtime
+} // namespace sinfer::runtime

@@ -17,7 +17,7 @@
 
 #include <unistd.h>
 
-namespace ninfer::serve {
+namespace sinfer::serve {
 namespace {
 
 using Json = nlohmann::json;
@@ -59,19 +59,19 @@ std::string cuda_uuid_string(const cudaUUID_t& uuid) {
     return out.str();
 }
 
-const char* finish_reason_name(ninfer::FinishReason reason) {
+const char* finish_reason_name(sinfer::FinishReason reason) {
     switch (reason) {
-    case ninfer::FinishReason::None:
+    case sinfer::FinishReason::None:
         return "none";
-    case ninfer::FinishReason::OutputLimit:
+    case sinfer::FinishReason::OutputLimit:
         return "output_limit";
-    case ninfer::FinishReason::ContextCapacity:
+    case sinfer::FinishReason::ContextCapacity:
         return "context_capacity";
-    case ninfer::FinishReason::StopToken:
+    case sinfer::FinishReason::StopToken:
         return "stop_token";
-    case ninfer::FinishReason::StopString:
+    case sinfer::FinishReason::StopString:
         return "stop_string";
-    case ninfer::FinishReason::Cancelled:
+    case sinfer::FinishReason::Cancelled:
         return "cancelled";
     }
     return "unknown";
@@ -91,32 +91,32 @@ std::string tool_choice_name(const ToolChoice& choice) {
     return "unknown";
 }
 
-const char* kv_cache_name(ninfer::KvCacheStorage storage) {
+const char* kv_cache_name(sinfer::KvCacheStorage storage) {
     switch (storage) {
-    case ninfer::KvCacheStorage::BFloat16: return "bf16";
-    case ninfer::KvCacheStorage::Int8Group64: return "int8-group64";
-    case ninfer::KvCacheStorage::Fp8E4M3: return "fp8-e4m3";
+    case sinfer::KvCacheStorage::BFloat16: return "bf16";
+    case sinfer::KvCacheStorage::Int8Group64: return "int8-group64";
+    case sinfer::KvCacheStorage::Fp8E4M3: return "fp8-e4m3";
     }
     return "unknown";
 }
 
-const char* kv_capacity_mode_name(ninfer::KvCapacityMode mode) {
-    return mode == ninfer::KvCapacityMode::Automatic ? "auto" : "explicit";
+const char* kv_capacity_mode_name(sinfer::KvCapacityMode mode) {
+    return mode == sinfer::KvCapacityMode::Automatic ? "auto" : "explicit";
 }
 
-const char* proposal_head_name(ninfer::ProposalHead proposal) {
-    return proposal == ninfer::ProposalHead::Optimized ? "optimized" : "full";
+const char* proposal_head_name(sinfer::ProposalHead proposal) {
+    return proposal == sinfer::ProposalHead::Optimized ? "optimized" : "full";
 }
 
-const char* prefix_reuse_path_name(ninfer::PrefixReusePath path) {
+const char* prefix_reuse_path_name(sinfer::PrefixReusePath path) {
     switch (path) {
-    case ninfer::PrefixReusePath::FullReset:
+    case sinfer::PrefixReusePath::FullReset:
         return "full_reset";
-    case ninfer::PrefixReusePath::AppendAtFrontier:
+    case sinfer::PrefixReusePath::AppendAtFrontier:
         return "append_frontier";
-    case ninfer::PrefixReusePath::RestoreTurnCheckpoint:
+    case sinfer::PrefixReusePath::RestoreTurnCheckpoint:
         return "restore_turn_checkpoint";
-    case ninfer::PrefixReusePath::RestoreResponseCheckpoint:
+    case sinfer::PrefixReusePath::RestoreResponseCheckpoint:
         return "restore_response_checkpoint";
     }
     return "unknown";
@@ -130,7 +130,7 @@ Json event_base(const std::string& server_instance_id, std::uint64_t timestamp, 
                 {"server_instance_id", server_instance_id}};
 }
 
-Json sampler_json(const ninfer::ResolvedSamplingParameters& sampling) {
+Json sampler_json(const sinfer::ResolvedSamplingParameters& sampling) {
     return Json{{"temperature", sampling.temperature},
                 {"top_p", sampling.top_p},
                 {"top_k", sampling.top_k},
@@ -140,7 +140,7 @@ Json sampler_json(const ninfer::ResolvedSamplingParameters& sampling) {
                 {"seed", sampling.seed}};
 }
 
-Json preset_json(const ninfer::SamplingPreset& preset) {
+Json preset_json(const sinfer::SamplingPreset& preset) {
     return Json{{"temperature", preset.temperature},
                 {"top_p", preset.top_p},
                 {"top_k", preset.top_k},
@@ -149,7 +149,7 @@ Json preset_json(const ninfer::SamplingPreset& preset) {
                 {"frequency_penalty", preset.frequency_penalty}};
 }
 
-Json overrides_json(const ninfer::SamplingOverrides& overrides) {
+Json overrides_json(const sinfer::SamplingOverrides& overrides) {
     Json result{{"temperature", nullptr},
                 {"top_p", nullptr},
                 {"top_k", nullptr},
@@ -230,7 +230,7 @@ Json error_json(const ApiError& error) {
                 {"message", error.message}};
 }
 
-Json arena_json(const ninfer::ArenaMemorySummary& arena) {
+Json arena_json(const sinfer::ArenaMemorySummary& arena) {
     return Json{{"capacity_bytes", arena.capacity_bytes},
                 {"used_bytes", arena.used_bytes},
                 {"peak_used_bytes", arena.peak_used_bytes}};
@@ -264,7 +264,7 @@ std::string seconds_str(double seconds) {
 }
 
 // Compact resolved-sampler summary. temperature <= 0 is the exact-argmax path.
-std::string sampler_str(const ninfer::ResolvedSamplingParameters& sampling) {
+std::string sampler_str(const sinfer::ResolvedSamplingParameters& sampling) {
     if (sampling.temperature <= 0.0f) { return "greedy"; }
     std::ostringstream out;
     out << std::fixed << std::setprecision(2) << "temp=" << sampling.temperature
@@ -439,8 +439,8 @@ std::string format_throughput(const ThroughputReport& report) {
 
 std::string format_server_start_json(
     const std::string& server_instance_id, std::uint64_t timestamp, const ServeOptions& options,
-    const ninfer::ModelSamplingDefaults& sampling_defaults, const std::string& public_model_id,
-    const ninfer::LoadSummary& load, const ninfer::MemorySummary& memory,
+    const sinfer::ModelSamplingDefaults& sampling_defaults, const std::string& public_model_id,
+    const sinfer::LoadSummary& load, const sinfer::MemorySummary& memory,
     const ServerLogEnvironment& environment, std::optional<std::uint64_t> artifact_size_bytes) {
     Json record = event_base(server_instance_id, timestamp, "server_start");
 
@@ -646,10 +646,10 @@ JsonlRequestLog::JsonlRequestLog(const std::string& path,
 }
 
 void JsonlRequestLog::write_server_start(const ServeOptions& options,
-                                         const ninfer::ModelSamplingDefaults& sampling_defaults,
+                                         const sinfer::ModelSamplingDefaults& sampling_defaults,
                                          const std::string& public_model_id,
-                                         const ninfer::LoadSummary& load,
-                                         const ninfer::MemorySummary& memory) {
+                                         const sinfer::LoadSummary& load,
+                                         const sinfer::MemorySummary& memory) {
     if (!enabled()) { return; }
     std::error_code error;
     const std::uintmax_t size = std::filesystem::file_size(options.artifact_path, error);
@@ -698,4 +698,4 @@ void JsonlRequestLog::append(std::string record) {
     }
 }
 
-} // namespace ninfer::serve
+} // namespace sinfer::serve

@@ -1,4 +1,4 @@
-// ninfer::ops - argmax wrapper: public api validation and launcher dispatch.
+// sinfer::ops - argmax wrapper: public api validation and launcher dispatch.
 #include "api/ops/argmax.h"
 
 #include "ops/launcher/argmax.h" // detail::argmax_launch
@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 namespace {
 
 std::int64_t numel_allow_zero(const Tensor& t, const char* label) {
@@ -68,4 +68,4 @@ void argmax(const Tensor& logits, Tensor& out, std::int32_t valid_rows, cudaStre
     detail::argmax_launch(logits, out, valid_rows, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

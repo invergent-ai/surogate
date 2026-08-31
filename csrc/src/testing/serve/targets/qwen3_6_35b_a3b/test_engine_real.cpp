@@ -10,33 +10,33 @@
 
 namespace {
 
-ninfer::EngineOptions engine_options(const char* artifact) {
-    ninfer::EngineOptions options;
+sinfer::EngineOptions engine_options(const char* artifact) {
+    sinfer::EngineOptions options;
     options.artifact_path             = artifact;
     options.max_context               = 4096;
-    options.kv_capacity               = ninfer::KvCapacityPolicy::explicit_capacity(4096);
+    options.kv_capacity               = sinfer::KvCapacityPolicy::explicit_capacity(4096);
     options.prefill_chunk             = 1024;
-    options.kv_cache                  = ninfer::KvCacheStorage::Int8Group64;
-    options.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
+    options.kv_cache                  = sinfer::KvCacheStorage::Int8Group64;
+    options.speculative.backend       = sinfer::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens  = 3;
-    options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
+    options.speculative.proposal_head = sinfer::ProposalHead::Optimized;
     options.enable_vision             = true;
     options.use_cuda_graph            = true;
     return options;
 }
 
-ninfer::EngineOptions maximum_engine_options(const char* artifact) {
-    ninfer::EngineOptions options     = engine_options(artifact);
+sinfer::EngineOptions maximum_engine_options(const char* artifact) {
+    sinfer::EngineOptions options     = engine_options(artifact);
     options.max_context               = 262144;
-    options.kv_capacity               = ninfer::KvCapacityPolicy::explicit_capacity(262144);
-    options.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
+    options.kv_capacity               = sinfer::KvCapacityPolicy::explicit_capacity(262144);
+    options.speculative.backend       = sinfer::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens  = 5;
-    options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
+    options.speculative.proposal_head = sinfer::ProposalHead::Optimized;
     return options;
 }
 
-ninfer::RequestOptions greedy_options(std::uint32_t outputs, bool reuse) {
-    ninfer::RequestOptions options;
+sinfer::RequestOptions greedy_options(std::uint32_t outputs, bool reuse) {
+    sinfer::RequestOptions options;
     options.execution.requested_output_tokens = outputs;
     options.execution.sampling.temperature    = 0.0F;
     options.execution.allow_prefix_reuse      = reuse;
@@ -56,8 +56,8 @@ std::vector<std::uint8_t> gradient_ppm() {
     return ppm;
 }
 
-int verify_loaded_product(const ninfer::Engine& engine) {
-    const ninfer::LoadSummary load = engine.load_summary();
+int verify_loaded_product(const sinfer::Engine& engine) {
+    const sinfer::LoadSummary load = engine.load_summary();
     if (load.target != "qwen3_6_35b_a3b" || load.weights_id != "groupwise-int" ||
         load.host_to_device_bytes == 0 || load.artifact_bytes_read < load.host_to_device_bytes) {
         std::cerr << "35B Engine construction has an invalid load summary: target=" << load.target
@@ -65,7 +65,7 @@ int verify_loaded_product(const ninfer::Engine& engine) {
         return 1;
     }
 
-    const ninfer::MemorySummary memory = engine.memory_summary();
+    const sinfer::MemorySummary memory = engine.memory_summary();
     if (memory.weights.capacity_bytes == 0 || memory.weights.used_bytes == 0 ||
         memory.weights.used_bytes > memory.weights.capacity_bytes ||
         memory.sequence.capacity_bytes == 0 || memory.sequence.used_bytes == 0 ||
@@ -79,24 +79,24 @@ int verify_loaded_product(const ninfer::Engine& engine) {
     return 0;
 }
 
-int exercise_text_mtp_and_prefix(ninfer::Engine& engine) {
-    const std::vector<ninfer::TokenId> prompt{248045, 846, 198, 5834, 248046, 198};
-    const ninfer::GenerationResult first =
+int exercise_text_mtp_and_prefix(sinfer::Engine& engine) {
+    const std::vector<sinfer::TokenId> prompt{248045, 846, 198, 5834, 248046, 198};
+    const sinfer::GenerationResult first =
         engine.generate(engine.prepare_tokens(prompt), greedy_options(5, false));
     if (first.generated_token_ids.size() != 5 ||
-        first.speculative.backend != ninfer::SpeculativeBackend::Mtp ||
+        first.speculative.backend != sinfer::SpeculativeBackend::Mtp ||
         first.speculative.rounds == 0) {
         std::cerr << "35B fixed prompt did not complete through MTP: outputs="
                   << first.generated_token_ids.size() << '\n';
         return 1;
     }
 
-    std::vector<ninfer::TokenId> continuation = prompt;
+    std::vector<sinfer::TokenId> continuation = prompt;
     continuation.insert(continuation.end(), first.generated_token_ids.begin(),
                         first.generated_token_ids.end());
     continuation.push_back(198);
 
-    const ninfer::GenerationResult reused =
+    const sinfer::GenerationResult reused =
         engine.generate(engine.prepare_tokens(continuation), greedy_options(2, true));
     const std::uint32_t expected_reuse =
         static_cast<std::uint32_t>(prompt.size() + first.generated_token_ids.size() - 1);
@@ -111,11 +111,11 @@ int exercise_text_mtp_and_prefix(ninfer::Engine& engine) {
         std::cerr << "35B partial-terminal fixture repeats its first token\n";
         return 1;
     }
-    ninfer::RequestOptions stop_options = greedy_options(5, false);
+    sinfer::RequestOptions stop_options = greedy_options(5, false);
     stop_options.stop.token_ids.push_back(first.generated_token_ids[1]);
-    const ninfer::GenerationResult stopped =
+    const sinfer::GenerationResult stopped =
         engine.generate(engine.prepare_tokens(prompt), stop_options);
-    if (stopped.finish_reason != ninfer::FinishReason::StopToken ||
+    if (stopped.finish_reason != sinfer::FinishReason::StopToken ||
         stopped.generated_token_ids.size() != 2 ||
         stopped.generated_token_ids[0] != first.generated_token_ids[0] ||
         stopped.generated_token_ids[1] != first.generated_token_ids[1]) {
@@ -123,11 +123,11 @@ int exercise_text_mtp_and_prefix(ninfer::Engine& engine) {
         return 1;
     }
 
-    std::vector<ninfer::TokenId> stopped_continuation = prompt;
+    std::vector<sinfer::TokenId> stopped_continuation = prompt;
     stopped_continuation.insert(stopped_continuation.end(), stopped.generated_token_ids.begin(),
                                 stopped.generated_token_ids.end());
     stopped_continuation.push_back(198);
-    const ninfer::GenerationResult stopped_reuse = engine.generate(
+    const sinfer::GenerationResult stopped_reuse = engine.generate(
         engine.prepare_tokens(std::move(stopped_continuation)), greedy_options(1, true));
     const std::uint32_t expected_stopped_reuse =
         static_cast<std::uint32_t>(prompt.size() + stopped.generated_token_ids.size() - 1);
@@ -140,38 +140,38 @@ int exercise_text_mtp_and_prefix(ninfer::Engine& engine) {
     return 0;
 }
 
-int exercise_vision(ninfer::Engine& engine) {
+int exercise_vision(sinfer::Engine& engine) {
     engine.reset_memory_peaks();
-    const ninfer::MemorySummary before = engine.memory_summary();
+    const sinfer::MemorySummary before = engine.memory_summary();
     if (before.request_transient.peak_used_bytes != 0) {
         std::cerr << "35B request transient peak did not reset before Vision\n";
         return 1;
     }
-    ninfer::MessagePart image;
-    image.kind              = ninfer::MessagePartKind::Media;
-    image.media.kind        = ninfer::MediaKind::Image;
+    sinfer::MessagePart image;
+    image.kind              = sinfer::MessagePartKind::Media;
+    image.media.kind        = sinfer::MediaKind::Image;
     image.media.bytes       = gradient_ppm();
     image.media.media_type  = "image/x-portable-pixmap";
     image.media.source_name = "inline.ppm";
 
-    ninfer::ChatMessage message;
-    message.role = ninfer::ChatRole::User;
+    sinfer::ChatMessage message;
+    message.role = sinfer::ChatRole::User;
     message.parts.push_back(std::move(image));
-    message.parts.push_back(ninfer::MessagePart{
-        .kind = ninfer::MessagePartKind::Text, .text = "What is visible?", .media = {}});
+    message.parts.push_back(sinfer::MessagePart{
+        .kind = sinfer::MessagePartKind::Text, .text = "What is visible?", .media = {}});
 
-    ninfer::PromptInput input;
+    sinfer::PromptInput input;
     input.messages.push_back(std::move(message));
     input.options.enable_thinking = false;
 
-    const ninfer::GenerationResult result =
+    const sinfer::GenerationResult result =
         engine.generate(engine.prepare(std::move(input)), greedy_options(1, false));
     if (!result.prompt.has_media || result.generated_token_ids.size() != 1 ||
-        result.finish_reason != ninfer::FinishReason::OutputLimit) {
+        result.finish_reason != sinfer::FinishReason::OutputLimit) {
         std::cerr << "35B Vision request did not complete through the public Engine\n";
         return 1;
     }
-    const ninfer::MemorySummary after = engine.memory_summary();
+    const sinfer::MemorySummary after = engine.memory_summary();
     if (after.request_transient.capacity_bytes != before.request_transient.capacity_bytes ||
         after.request_transient.capacity_bytes == 0 || after.request_transient.used_bytes != 0 ||
         after.request_transient.peak_used_bytes == 0 || after.workspace_logical_peak_bytes == 0 ||
@@ -183,9 +183,9 @@ int exercise_vision(ninfer::Engine& engine) {
 }
 
 int exercise_maximum_configuration(const char* artifact) {
-    ninfer::Engine engine(maximum_engine_options(artifact));
-    const ninfer::MemorySummary memory = engine.memory_summary();
-    if (memory.max_context != 262144 || memory.kv_cache != ninfer::KvCacheStorage::Int8Group64 ||
+    sinfer::Engine engine(maximum_engine_options(artifact));
+    const sinfer::MemorySummary memory = engine.memory_summary();
+    if (memory.max_context != 262144 || memory.kv_cache != sinfer::KvCacheStorage::Int8Group64 ||
         memory.kv_payload_bytes == 0 || memory.sequence.capacity_bytes == 0 ||
         memory.sequence.used_bytes == 0 ||
         memory.sequence.used_bytes > memory.sequence.capacity_bytes ||
@@ -198,7 +198,7 @@ int exercise_maximum_configuration(const char* artifact) {
         return 1;
     }
 
-    std::vector<ninfer::TokenId> oversized(262145, 198);
+    std::vector<sinfer::TokenId> oversized(262145, 198);
     bool rejected = false;
     try {
         (void)engine.generate(engine.prepare_tokens(std::move(oversized)),
@@ -211,14 +211,14 @@ int exercise_maximum_configuration(const char* artifact) {
         return 1;
     }
 
-    const std::vector<ninfer::TokenId> prompt{248045, 846, 198, 5834, 248046, 198};
-    const ninfer::GenerationResult probe =
+    const std::vector<sinfer::TokenId> prompt{248045, 846, 198, 5834, 248046, 198};
+    const sinfer::GenerationResult probe =
         engine.generate(engine.prepare_tokens(prompt), greedy_options(1, false));
     if (probe.generated_token_ids.size() != 1) {
         std::cerr << "35B Engine was unusable after rejecting an over-capacity request\n";
         return 1;
     }
-    const ninfer::MemorySummary after = engine.memory_summary();
+    const sinfer::MemorySummary after = engine.memory_summary();
     if (after.workspace_logical_peak_bytes == 0 ||
         after.workspace_logical_peak_bytes > after.workspace.capacity_bytes) {
         std::cerr << "35B maximum configuration did not report its executed workspace phase\n";
@@ -230,14 +230,14 @@ int exercise_maximum_configuration(const char* artifact) {
 } // namespace
 
 int main() {
-    const char* artifact = std::getenv("NINFER_QWEN3_6_35B_A3B_WEIGHTS");
+    const char* artifact = std::getenv("SINFER_QWEN3_6_35B_A3B_WEIGHTS");
     if (artifact == nullptr || *artifact == '\0') {
-        std::cout << "skip: NINFER_QWEN3_6_35B_A3B_WEIGHTS is not set\n";
+        std::cout << "skip: SINFER_QWEN3_6_35B_A3B_WEIGHTS is not set\n";
         return 77;
     }
 
     {
-        ninfer::Engine engine(engine_options(artifact));
+        sinfer::Engine engine(engine_options(artifact));
         if (const int result = verify_loaded_product(engine); result != 0) { return result; }
         if (const int result = exercise_text_mtp_and_prefix(engine); result != 0) { return result; }
         if (const int result = exercise_vision(engine); result != 0) { return result; }

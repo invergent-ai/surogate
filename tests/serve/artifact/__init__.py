@@ -1,1 +1,1 @@
-"""Tests for common NInfer artifact primitives."""
+"""Tests for common SInfer artifact primitives."""

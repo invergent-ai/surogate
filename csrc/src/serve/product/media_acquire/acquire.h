@@ -11,7 +11,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::product::media_acquire {
+namespace sinfer::product::media_acquire {
 
 enum class ErrorKind {
     BudgetExceeded,
@@ -46,4 +46,4 @@ struct Policy {
 
 std::vector<std::uint8_t> acquire_bytes(const Source& source, const Policy& policy = {});
 
-} // namespace ninfer::product::media_acquire
+} // namespace sinfer::product::media_acquire

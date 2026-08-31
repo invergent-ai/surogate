@@ -1,4 +1,4 @@
-"""Fixed Qwen3.6-27B vision-tower schedule over a native NInfer artifact."""
+"""Fixed Qwen3.6-27B vision-tower schedule over a native SInfer artifact."""
 
 from __future__ import annotations
 

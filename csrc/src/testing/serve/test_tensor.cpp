@@ -32,7 +32,7 @@ int expect_size(std::size_t actual, std::size_t expected, const char* label) {
     return 1;
 }
 
-int check_shape(const ninfer::Tensor& t, const std::int32_t (&expected)[4], const char* label) {
+int check_shape(const sinfer::Tensor& t, const std::int32_t (&expected)[4], const char* label) {
     int failures = 0;
     for (int i = 0; i < 4; ++i) {
         if (t.ne[i] != expected[i]) {
@@ -44,7 +44,7 @@ int check_shape(const ninfer::Tensor& t, const std::int32_t (&expected)[4], cons
     return failures;
 }
 
-int check_strides(const ninfer::Tensor& t, const std::int64_t (&expected)[4], const char* label) {
+int check_strides(const sinfer::Tensor& t, const std::int64_t (&expected)[4], const char* label) {
     int failures = 0;
     for (int i = 0; i < 4; ++i) {
         if (t.nb[i] != expected[i]) {
@@ -63,7 +63,7 @@ int main() {
     auto* base                             = storage;
     int failures                           = 0;
 
-    ninfer::Tensor t(base, ninfer::DType::BF16, {2, 3, 4});
+    sinfer::Tensor t(base, sinfer::DType::BF16, {2, 3, 4});
     failures += check_shape(t, {2, 3, 4, 1}, "t");
     failures += check_strides(t, {2, 4, 12, 48}, "t");
     failures += expect_i64(t.numel(), 24, "t.numel");
@@ -73,7 +73,7 @@ int main() {
         std::cerr << "t expected contiguous\n";
     }
 
-    ninfer::Tensor viewed = t.view({4, 6});
+    sinfer::Tensor viewed = t.view({4, 6});
     if (viewed.data != base) {
         ++failures;
         std::cerr << "view changed data pointer\n";
@@ -87,7 +87,7 @@ int main() {
     }
     failures += expect_invalid([&] { (void)t.view({5, 5}); }, "mismatched view");
 
-    ninfer::Tensor sliced = t.slice(1, 1, 2);
+    sinfer::Tensor sliced = t.slice(1, 1, 2);
     if (sliced.data != base + 4) {
         ++failures;
         std::cerr << "slice did not advance by dim-1 stride\n";
@@ -99,7 +99,7 @@ int main() {
         std::cerr << "sliced expected non-contiguous\n";
     }
 
-    ninfer::Tensor permuted = t.permute({2, 1, 0, 3});
+    sinfer::Tensor permuted = t.permute({2, 1, 0, 3});
     if (permuted.data != base) {
         ++failures;
         std::cerr << "permute changed data pointer\n";
@@ -111,7 +111,7 @@ int main() {
         std::cerr << "permuted expected non-contiguous\n";
     }
 
-    ninfer::Tensor reshaped = t.reshape({6, 4});
+    sinfer::Tensor reshaped = t.reshape({6, 4});
     if (reshaped.data != base) {
         ++failures;
         std::cerr << "reshape changed data pointer\n";
@@ -121,7 +121,7 @@ int main() {
     failures += expect_i64(reshaped.numel(), 24, "reshaped.numel");
 
     failures += expect_invalid([&] { (void)sliced.reshape({4, 4}); }, "non-contiguous reshape");
-    failures += expect_invalid([&] { (void)ninfer::Tensor(base, ninfer::DType::BF16, {2, 0}); },
+    failures += expect_invalid([&] { (void)sinfer::Tensor(base, sinfer::DType::BF16, {2, 0}); },
                                "zero dimension");
     failures += expect_invalid([&] { (void)t.slice(4, 0, 1); }, "invalid slice dim");
     failures += expect_invalid([&] { (void)t.slice(1, 2, 2); }, "out-of-range slice");

@@ -22,7 +22,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::test::linear_swiglu {
+namespace sinfer::test::linear_swiglu {
 namespace {
 
 // The criterion belongs to the activation-compute profile, not the weight storage format or a
@@ -333,4 +333,4 @@ int run_profile(std::string_view label, const Profile& profile,
     return failures;
 }
 
-} // namespace ninfer::test::linear_swiglu
+} // namespace sinfer::test::linear_swiglu

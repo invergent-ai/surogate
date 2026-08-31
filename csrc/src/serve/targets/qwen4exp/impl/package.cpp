@@ -11,7 +11,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace ninfer::targets::qwen4exp::detail {
+namespace sinfer::targets::qwen4exp::detail {
 
 class LoadPlan::Impl {
 public:
@@ -37,9 +37,9 @@ LoadedModel::LoadedModel(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(
 
 LoadedModel::~LoadedModel() = default;
 
-} // namespace ninfer::targets::qwen4exp::detail
+} // namespace sinfer::targets::qwen4exp::detail
 
-namespace ninfer::targets::qwen4exp {
+namespace sinfer::targets::qwen4exp {
 namespace {
 
 // generation_config.json of Qwen3.8-Flash-Next (thinking and non-thinking presets as the
@@ -178,4 +178,4 @@ Package::create_program(const LoadedModel& model, SequencePlan&& plan, DeviceCon
         model.impl_->data.runtime, model.impl_->weights_profile, std::move(plan), device);
 }
 
-} // namespace ninfer::targets::qwen4exp
+} // namespace sinfer::targets::qwen4exp

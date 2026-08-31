@@ -20,8 +20,8 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
+using namespace sinfer;
+using namespace sinfer::test;
 
 namespace {
 
@@ -491,8 +491,8 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
 }
 
 int run_record_fold_rounds() {
-    using ninfer::test::input_projection::DevicePackedWeight;
-    using ninfer::test::input_projection::make_bf16_activation;
+    using sinfer::test::input_projection::DevicePackedWeight;
+    using sinfer::test::input_projection::make_bf16_activation;
 
     constexpr FoldProfile kProfile{30, 32, 8192};
     constexpr std::int32_t kHidden       = 2048;

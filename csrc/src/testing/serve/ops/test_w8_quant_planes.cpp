@@ -110,7 +110,7 @@ int main() {
         std::fprintf(stderr, "SKIP: no CUDA device\n");
         return 77;
     }
-    if (ninfer::ops::detail::w8_device_compute_capability() < 120) {
+    if (sinfer::ops::detail::w8_device_compute_capability() < 120) {
         std::fprintf(stderr, "SKIP: quant-plane test needs an sm_120-class GPU\n");
         return 77;
     }
@@ -133,10 +133,10 @@ int main() {
     cudaMemcpy(d_codes, codes.data(), codes.size(), cudaMemcpyHostToDevice);
     cudaMemcpy(d_scales, scales.data(), scales.size() * 2, cudaMemcpyHostToDevice);
 
-    ninfer::Weight weight;
-    weight.qtype           = ninfer::QType::W8G32_F16S;
-    weight.layout          = ninfer::QuantLayout::RowSplit;
-    weight.scale_dtype     = ninfer::DType::FP16;
+    sinfer::Weight weight;
+    weight.qtype           = sinfer::QType::W8G32_F16S;
+    weight.layout          = sinfer::QuantLayout::RowSplit;
+    weight.scale_dtype     = sinfer::DType::FP16;
     weight.group_size      = 32;
     weight.group           = 32;
     weight.ndim            = 2;
@@ -149,8 +149,8 @@ int main() {
     weight.qdata           = d_codes;
     weight.scales          = d_scales;
 
-    ninfer::ops::detail::w8fp8_plane_set_enabled(true);
-    ninfer::ops::detail::w8_prefill_quant_set_mode(ninfer::ops::detail::PrefillQuantMode::Fp4);
+    sinfer::ops::detail::w8fp8_plane_set_enabled(true);
+    sinfer::ops::detail::w8_prefill_quant_set_mode(sinfer::ops::detail::PrefillQuantMode::Fp4);
     cudaStream_t stream = nullptr;
 
     const auto dequant = [&](int row, int i) {
@@ -160,9 +160,9 @@ int main() {
 
     // ---- FP8 plane -----------------------------------------------------------
     {
-        const auto plane = ninfer::ops::detail::w8fp8_plane_for(weight, stream);
+        const auto plane = sinfer::ops::detail::w8fp8_plane_for(weight, stream);
         expect(plane.codes != nullptr, "fp8 plane derives");
-        const auto again = ninfer::ops::detail::w8fp8_plane_for(weight, stream);
+        const auto again = sinfer::ops::detail::w8fp8_plane_for(weight, stream);
         expect(again.codes == plane.codes, "fp8 registry caches");
         cudaStreamSynchronize(stream);
 
@@ -189,7 +189,7 @@ int main() {
 
     // ---- NVFP4 plane (row-major + atom) --------------------------------------
     {
-        const auto plane = ninfer::ops::detail::w4fp4_plane_for(weight, stream);
+        const auto plane = sinfer::ops::detail::w4fp4_plane_for(weight, stream);
         expect(plane.codes != nullptr, "fp4 plane derives");
         expect(plane.sf_atom != nullptr, "fp4 atom sf present");
         cudaStreamSynchronize(stream);
@@ -197,7 +197,7 @@ int main() {
         std::vector<std::uint8_t> nibbles(static_cast<std::size_t>(kRows) * kK / 2);
         std::vector<std::uint8_t> sf(static_cast<std::size_t>(kRows) * kK / 16);
         std::vector<float> row_scales(kRows);
-        const std::size_t atom_bytes = ninfer::ops::detail::w4fp4_sf_atom_bytes(kRows, kK);
+        const std::size_t atom_bytes = sinfer::ops::detail::w4fp4_sf_atom_bytes(kRows, kK);
         std::vector<std::uint8_t> atom(atom_bytes);
         cudaMemcpy(nibbles.data(), plane.codes, nibbles.size(), cudaMemcpyDeviceToHost);
         cudaMemcpy(sf.data(), plane.sf, sf.size(), cudaMemcpyDeviceToHost);

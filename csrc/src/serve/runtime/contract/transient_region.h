@@ -3,7 +3,7 @@
 #include <cstddef>
 #include <span>
 
-namespace ninfer::runtime {
+namespace sinfer::runtime {
 
 struct TransientRegion {
     std::byte* data       = nullptr;
@@ -15,4 +15,4 @@ struct TransientRegion {
     [[nodiscard]] std::span<std::byte> bytes() const noexcept { return {data, size}; }
 };
 
-} // namespace ninfer::runtime
+} // namespace sinfer::runtime

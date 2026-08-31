@@ -8,7 +8,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 template <int Pairs>
 struct alignas(Pairs* static_cast<int>(sizeof(__nv_bfloat162))) Bf16PairPack {
@@ -27,4 +27,4 @@ inline constexpr std::int64_t kBf16x8CacheSizedMaxElements = 32LL * 1024LL * 102
 static_assert(sizeof(Bf16x4Pack) == 8);
 static_assert(sizeof(Bf16x8Pack) == 16);
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

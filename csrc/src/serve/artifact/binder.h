@@ -8,7 +8,7 @@
 #include <string_view>
 #include <vector>
 
-namespace ninfer::artifact {
+namespace sinfer::artifact {
 
 enum class TensorPlacement : std::uint8_t {
     Device,
@@ -64,4 +64,4 @@ private:
     MaterializationPlan materialization_;
 };
 
-} // namespace ninfer::artifact
+} // namespace sinfer::artifact

@@ -11,7 +11,7 @@
 #include <set>
 #include <tuple>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 template <class Kernel>
 inline cudaError_t set_func_attribute_per_device(Kernel* kernel, cudaFuncAttribute attribute, int value) {
@@ -28,4 +28,4 @@ inline cudaError_t set_func_attribute_per_device(Kernel* kernel, cudaFuncAttribu
     return error;
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

@@ -10,7 +10,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 enum class Q4GemvActivationAccess {
     Direct,
@@ -516,4 +516,4 @@ void q4_rowsplit_gemv_kernel(
     if constexpr (JoinPdl) { pdl::wait_for_dependencies(); }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

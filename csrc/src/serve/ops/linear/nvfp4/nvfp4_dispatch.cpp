@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 enum class Nvfp4LinearRoute : std::uint8_t {
@@ -102,4 +102,4 @@ void nvfp4_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPo
     launch_nvfp4_w4a4(x, weight, out, scratch, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

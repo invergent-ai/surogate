@@ -4,7 +4,7 @@
 
 #include <cuda_runtime.h> // cudaStream_t
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 /**
  * Normalizes each logical row over the fastest dimension D=ne[0]:
@@ -21,4 +21,4 @@ namespace ninfer::ops {
  */
 void l2norm(const Tensor& x, float eps, Tensor& out, cudaStream_t stream);
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

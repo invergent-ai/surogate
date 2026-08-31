@@ -10,7 +10,7 @@
 #include <type_traits>
 #include <utility>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 constexpr int kTargetRows             = 9216;
@@ -223,4 +223,4 @@ void w8_attn_input_splitk_mma_launch(const Tensor& x, const Weight& weight, Tens
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

@@ -10,7 +10,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 using Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
@@ -76,4 +76,4 @@ void launch_fp8_small_t(const Tensor& x, const Weight& weight, Tensor& out, cuda
     throw std::logic_error("FP8 vocabulary small-T uses its A16 MMA route");
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <type_traits>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 struct Q4SmallTMmaStoreEpilogue {};
 
@@ -252,4 +252,4 @@ __launch_bounds__(256, 6) __global__
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

@@ -12,7 +12,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 struct Fp8A8Workspace {
     std::uint8_t* codes = nullptr;
@@ -61,4 +61,4 @@ void launch_fp8_a8_quantize(const Tensor& x, const Weight& weight, Fp8A8Workspac
 void launch_fp8_a8(const Tensor& x, const Weight& weight, Tensor& out, Fp8A8Workspace workspace,
                    cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

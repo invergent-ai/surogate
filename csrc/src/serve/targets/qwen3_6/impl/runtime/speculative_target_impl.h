@@ -4,7 +4,7 @@
 #include "api/ops/scatter.h"
 #include "api/ops/speculative_round.h"
 
-namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
+namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS::schedule {
 
 void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
                           TextContext& card, TargetVerifyFrameView frame,
@@ -34,4 +34,4 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
                  execution.device.stream);
 }
 
-} // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule
+} // namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS::schedule

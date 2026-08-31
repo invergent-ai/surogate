@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 template <std::int32_t OutputRows, std::int32_t InputRows>
 struct Fp8Geometry {
@@ -345,4 +345,4 @@ struct Fp8LinearSmallTProductionSchedule<Fp8Residual17408Geometry, ActiveTokens>
                                    Fp8SmallTBlockOrder::RowsContiguous, 1>;
 };
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

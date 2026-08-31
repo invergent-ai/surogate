@@ -38,7 +38,7 @@ def emit_config_h(spec: TargetSpec) -> str:
 
 #include <cstdint>
 
-namespace ninfer::targets::{spec.name}::detail {{
+namespace sinfer::targets::{spec.name}::detail {{
 
 struct TextConfig {{
     static constexpr int hidden       = {spec.hidden};
@@ -122,5 +122,5 @@ inline constexpr std::uint32_t kMaximumMtpDraftTokens    = {spec.mtp_draft_token
 inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 0;
 inline constexpr std::uint32_t kNativeContext            = {spec.native_context};
 
-}} // namespace ninfer::targets::{spec.name}::detail
+}} // namespace sinfer::targets::{spec.name}::detail
 """

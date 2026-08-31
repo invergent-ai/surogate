@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Bit-exactness tests for the direct Q8_0 -> W8G32_F16S repack
-# (csrc/src/serve/ninfer/tools/convert/common/gguf_repack.py, PATCHES.md #14):
+# (csrc/src/serve/sinfer/tools/convert/common/gguf_repack.py, PATCHES.md #14):
 # a synthetic Q8_0 GGUF is moved through the recipe row-algebra evaluator and
 # the resulting row-split payloads must decode to exactly the values gguf-py's
 # own dequantize produces — no requantization anywhere. CPU-only.

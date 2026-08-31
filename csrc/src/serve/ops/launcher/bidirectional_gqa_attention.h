@@ -2,7 +2,7 @@
 
 #include "api/ops/bidirectional_gqa_attention.h"
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 enum class BidirectionalGqaRoute {
     Direct,
@@ -30,4 +30,4 @@ void bidirectional_gqa_attention_launch(const Tensor& q, const Tensor& query_k,
                                         Tensor& partial_m, Tensor& partial_l, Tensor& out,
                                         cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

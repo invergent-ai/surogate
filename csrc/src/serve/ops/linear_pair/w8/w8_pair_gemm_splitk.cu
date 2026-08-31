@@ -13,7 +13,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 constexpr int kRows        = 1024;
@@ -231,4 +231,4 @@ void w8_pair_splitk_medium_launch(W8PairScheduleId schedule, const Tensor& x,
     throw std::invalid_argument("W8 medium pair schedule does not cover this T");
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

@@ -22,7 +22,7 @@
 #include <variant>
 #include <vector>
 
-namespace ninfer::test::linear_add {
+namespace sinfer::test::linear_add {
 namespace {
 
 constexpr std::size_t kOutputScanWords = 1U << 20;
@@ -373,4 +373,4 @@ int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shap
     return failures;
 }
 
-} // namespace ninfer::test::linear_add
+} // namespace sinfer::test::linear_add

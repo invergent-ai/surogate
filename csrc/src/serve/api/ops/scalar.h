@@ -6,7 +6,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 /**
  * Op: finite typed scalar state transitions
@@ -39,4 +39,4 @@ void add_i32_scalars(const Tensor& lhs, const Tensor& rhs, Tensor& destination,
 void increment_i32_scalar(Tensor& scalar, cudaStream_t stream);
 void increment_i64_scalar(Tensor& scalar, cudaStream_t stream);
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

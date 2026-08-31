@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 enum class Bf16ActivationAccess : std::uint8_t {
     Direct,
@@ -155,4 +155,4 @@ struct Bf16LinearSmallTProductionSchedule {
                                 kWeightCache, kPhaseOrder, 1, kUnroll2 ? 2 : 1, 1, 2>;
 };
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

@@ -15,7 +15,7 @@
 
 #include <cuda_runtime.h>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 // Rows of the padded token table Marlin indexes, given the assignment count.
 [[nodiscard]] std::int32_t marlin_moe_padded_rows(std::int32_t assignments,
@@ -64,4 +64,4 @@ void marlin_moe_silu_mul(const void* product, void* out, std::int32_t rows,
 // Whether the route is enabled (SUROGATE_SERVE_MOE_MARLIN, default off while it proves out).
 [[nodiscard]] bool marlin_moe_route_enabled();
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

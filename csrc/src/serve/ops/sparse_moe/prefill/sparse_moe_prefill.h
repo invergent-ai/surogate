@@ -11,7 +11,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 // RTX 5090 codec frontiers balance trace-like and independent expert distributions. The public
 // workspace query starts at the earliest codec-specific prefill route.
@@ -139,4 +139,4 @@ void sparse_moe_prefill_launch(const SparseMoeGeometry& geometry, const Tensor& 
                                const SparseMoePrefillWorkspace& workspace, cudaStream_t stream,
                                const SparseMoeRoundHook* hook = nullptr);
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

@@ -31,7 +31,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::runtime {
+namespace sinfer::runtime {
 
 template <class Instance>
 class ConcurrentExecutor {
@@ -1679,4 +1679,4 @@ private:
     std::thread worker_;
 };
 
-} // namespace ninfer::runtime
+} // namespace sinfer::runtime

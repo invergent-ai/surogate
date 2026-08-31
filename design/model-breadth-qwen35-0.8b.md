@@ -14,7 +14,7 @@ windows this host actually gets (no 18 GB wait).
 | Load bindings | `impl/load/bindings.{h,cpp}` (818 ln) | artifact tensor name → ModelView slot; shapes derive from `TextConfig` |
 | Registration | `impl/package.cpp` (143 ln) | identity strings, sampling defaults, `resolve_weights` |
 | Registry branch | `src/targets/registry.cpp:183-196` | one `if (identity.model_id == ...)` → `construct_registered<Package,...>` |
-| CMake | `src/targets/<key>/CMakeLists.txt` + `src/CMakeLists.txt:309-311` | sources join `ninfer_engine` |
+| CMake | `src/targets/<key>/CMakeLists.txt` + `src/CMakeLists.txt:309-311` | sources join `sinfer_engine` |
 
 The family runtime (`src/targets/qwen3_6/impl/`, 28+13 files) is templated on the
 Variant — **no family code changes** for a new same-family geometry.

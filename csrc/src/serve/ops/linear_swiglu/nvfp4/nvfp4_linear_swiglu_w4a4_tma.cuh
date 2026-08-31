@@ -10,7 +10,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 template <class Schedule>
 struct Nvfp4LinearSwiGluTmaTensorStorage {
@@ -258,4 +258,4 @@ __global__ __launch_bounds__(
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

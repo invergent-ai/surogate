@@ -22,7 +22,7 @@ phase 3 = PP across 8 GPUs with the offload inside each stage; phase 4 (EP) reje
 |---|---|---|
 | Model contract (hc, PLE, GDN sigmoid gate, MoE, indexer) | done | `design/serve-engine-flash-next.md` §5; llama.cpp `study/llama.cpp-master/src/models/qwen4exp.cpp` is the oracle |
 | GGUF-native converter `tools/convert/qwen4exp/` | done | commit 81d818d9; W8 experts, un-tiled GDN V heads, q/k norms stored HF-style (γ−1) |
-| Artifact `/home/densemax2/work/models/ninfer/qwen3_8_flash_next.ninfer` | done, verified | 163.1 GB in 1046 s; scratchpad `verify_flash_artifact.py`: W8 repacks and the 28.8 GB PLE table bit-exact vs the GGUF, requantised gate/up ≤ 5.4e-3 rel-L2, VERIFY_DONE bad=0 |
+| Artifact `/home/densemax2/work/models/sinfer/qwen3_8_flash_next.sinfer` | done, verified | 163.1 GB in 1046 s; scratchpad `verify_flash_artifact.py`: W8 repacks and the 28.8 GB PLE table bit-exact vs the GGUF, requantised gate/up ≤ 5.4e-3 rel-L2, VERIFY_DONE bad=0 |
 | llama.cpp baseline | done | BENCHMARKS.md: 8×5090 39.3 tok/s @1 / 28.8 @32; 1×5090 CPU-MoE 7.1 / 16.3 |
 | Sigmoid-gated RMSNorm, W8 dispatch arms (13312/16384 × 2560, 2560 × 6144) | done | commit d2174926 |
 | Sparse-MoE geometry from the weights (stage A) | done | commit 13a08634 |
@@ -108,7 +108,7 @@ the day's family changes; a GPU-1 rerun with the current binary is queued behind
 Flash-Next measurements and decides it. The ik_llama.cpp build (7cff686d, CUDA + AVX-512)
 succeeded; its server has fused MoE on by default (`-no-fmoe` disables; `-fmoe` is not a flag)
 and the baseline run is queued.
-- Slot cache, first end-to-end attempt (2026-08-28): full build OK, `ninfer_expert_slot_cache_test`
+- Slot cache, first end-to-end attempt (2026-08-28): full build OK, `sinfer_expert_slot_cache_test`
   **passes** (hits keep slots, misses gathered bit-exact through all four planes, eviction
   across layers, active-round protection). The CLI run itself tripped on my option choice
   (`--kv-capacity 4096` exceeds the CLI's usable range for `--max-context 2048`), so the
@@ -491,7 +491,7 @@ copy is the design, and it is also what a multi-host version would use).
   artifact's W8 bank, and a zero-copy run (no slot cache) keeps W8 automatically. Requantisation
   happens while the bank loads (startup ~96 s on this box).
 - Serve on one 5090 with the phase-2 offload (the configuration behind the board rows):
-  `numactl --interleave=all surogate-engine <artifact>.ninfer --max-num-seqs 16 --kv-capacity auto
+  `numactl --interleave=all surogate-engine <artifact>.sinfer --max-num-seqs 16 --kv-capacity auto
   --max-model-len 2048 --expert-slots 3000 --cpu-moe-share auto` — the pool takes 14.6 GiB
   (use `--expert-slots 2000` for 32-64 lanes so the graphs and KV fit), the decode share is
   measured at startup (host vs PCIe rates, ~0.8 here), the prefill share defaults to 0.5
@@ -501,7 +501,7 @@ copy is the design, and it is also what a multi-host version would use).
   (eager only), `SUROGATE_SERVE_ROUND_TIMING=1`, `SUROGATE_CPU_EXPERT_NO_VNNI=1`,
   `SUROGATE_CPU_EXPERT_TILE=1`.
 - Serve on all eight 5090s with pipeline parallelism (phase 3, the configuration behind the
-  8-stage rows): `numactl --interleave=all surogate-engine <artifact>.ninfer --devices
+  8-stage rows): `numactl --interleave=all surogate-engine <artifact>.sinfer --devices
   0,1,2,3,4,5,6,7 --max-num-seqs 64 --kv-capacity auto --max-model-len 2048 --expert-slots 3072`
   — one 6-layer stage per card, each stage materialises only its own layers (~3.4 GiB) and
   holds every expert of those layers in its 14.9 GiB pool, the CPU split is off by default for
@@ -521,7 +521,7 @@ copy is the design, and it is also what a multi-host version would use).
   NUMA/MAXLEN/PORT/OUT/SRVLOG) runs the coherence prompts before and *during* the load;
   `lane.sh` runs a list of probes node-bound on one GPU so two lanes share the host.
 - Convert: `python -m surogate.serve.tools.convert.qwen4exp.convert --gguf <shard1> --frontend
-  models/Qwen3.8-Flash-Next-frontend --out <path>.ninfer --device cuda` (GPU 7 was used).
+  models/Qwen3.8-Flash-Next-frontend --out <path>.sinfer --device cuda` (GPU 7 was used).
 - Verify an artifact against the GGUF: scratchpad `verify_flash_artifact.py` (decode objects,
   compare with gguf-py dequantisation using the converter's algebra; PLE table byte-compare).
 - Build the engine: `cmake --build csrc/build-serve --parallel 32 --target surogate-engine`
@@ -859,7 +859,7 @@ per-head full-vector comparison; llama.cpp's `llama-eval-callback` is the oracle
   last linked at 15:31 with the min-tokens change (so the 33.5 / 33.9 rows are valid; the
   auto-share and allowance changes were never in a running binary). Chains now build the
   serve targets explicitly and print the binary's link time.
-- Batched host kernel measured (2026-08-28, `ninfer_cpu_expert_compute_bench`, 32 threads):
+- Batched host kernel measured (2026-08-28, `sinfer_cpu_expert_compute_bench`, 32 threads):
   decode shape (160 jobs over 512 experts) 236 GB/s mean (was 209); prefill shape at ~10
   tokens per expert (5120 jobs) **574 GB/s-equivalent, 2.4×**; at ~40 tokens per expert
   (20,480 jobs) **900, 3.8×** — the host is compute-bound there (~0.9 TMAC/s with the
@@ -1784,7 +1784,7 @@ Reading: Flash-Next throughput is unchanged (the fix costs nothing; the Q4 bank 
 at full residency), quality went to a perfect battery, and the 27B/35B gained 21-26 % — the
 interleaved-prompt state corruption was degrading the dense/MoE pipeline rounds too. The 8
 stages share one ~90 GB Q4 bank (was ~152 GB W8). The 0.8B mixed-round-corruption board item
-cannot be retested yet: no 0.8B artifact exists in `models/ninfer` — converting one is the
+cannot be retested yet: no 0.8B artifact exists in `models/sinfer` — converting one is the
 prerequisite.
 
 ### Burst-cap retest, 0.8B soak, scan-resistant slot replacement (2026-08-29 17:45)
@@ -2156,7 +2156,7 @@ What that means for the record:
 The owner had the profile removed: the service and `/usr/local/sbin/gpu-thermal-profile.sh`
 are deleted (backup in `~/work/gpu-thermal-profile-backup-2026-08-30/`), `nvidia-smi -rgc`
 reset every card, and the 400 W power limit from `nvidia-power-limit.service` stays. The cards
-are now equivalent, verified with `ninfer_bench` on the 0.8B: GPU 0 774, GPU 2 763, GPU 5 756,
+are now equivalent, verified with `sinfer_bench` on the 0.8B: GPU 0 774, GPU 2 763, GPU 5 756,
 GPU 7 781 tok/s single-stream decode at 2,850-2,977 MHz (GPU 0 read 1,672 MHz an hour before).
 
 **Method changes from this pass**, all in `surogate/serve/tools/probe/board.py`:
@@ -2165,7 +2165,7 @@ in-stream SSE errors count as errors (at 64 users the 30 s `--pending-timeout-ms
 expired a third of the queue inside 200 responses), and an opt-in arrival jitter
 (`SUROGATE_PROBE_JITTER`) because closed-loop clients started together stay in phase and make
 a pipeline alternate between all-prefill and all-decode rounds. And the fast path that was
-here all along: **`csrc/build-serve/serve_bench/ninfer_bench`** — a llama-bench-style pp/tg
+here all along: **`csrc/build-serve/serve_bench/sinfer_bench`** — a llama-bench-style pp/tg
 harness over the engine (load, warm-up and five repetitions of pp512+tg128 on the 0.8B in
 3.4 s). Engine-level questions (flags, binaries, cards, kernels) belong there; the server and
 probe are only for what needs the scheduler: concurrency, TTFT, admission.
@@ -2328,7 +2328,7 @@ and the 4B (+54 %) and 27B (+37 %) gains came from **W8 → NVFP4**, which halve
 from "NVFP4" as such. The 35B's routed gate/up was already Q4G64, so it *grew* 5.9 %; only the
 Q5/Q6 down projection shrank. Per MoE layer 461 MB → 453 MB, and over the whole artifact
 **19.59 GiB → 19.19 GiB, 2.0 %**. A 2 % byte cut cannot move a bandwidth-bound decode, and it
-did not: 347.5 → 343.1 tok/s at batch 1 (`ninfer_bench` tg128), which is the 2 % of bytes minus
+did not: 347.5 → 343.1 tok/s at batch 1 (`sinfer_bench` tg128), which is the 2 % of bytes minus
 the swizzled scale reads.
 
 **And the wide-round cost is real.** NVFP4 has no prefill MMA arm, so rounds wider than 46
@@ -2450,7 +2450,7 @@ Asked whether single-user numbers could improve, without speculation. The arithm
 yes: at one user the whole model streams once per token, and the 4B sat at 43 % of the memory
 ceiling where the 27B sat at 69 % — the signature of something fixed per token. Three probes,
 in parallel: round timing put the scheduler at 0.1 % of wall (decode rounds 95 %); kernel-only
-`ninfer_bench` did 213.5 against 201-204 served, so serving cost 6 %; and a graph-node `nsys`
+`sinfer_bench` did 213.5 against 201-204 served, so serving cost 6 %; and a graph-node `nsys`
 profile put the linears at **65 % of a 4.7 ms token, streaming 2.0 GB of weights in 3.05 ms —
 37 % of bandwidth** — through `cutlass … block_scaled … 128x128x256`, a 128-row MMA tile on one
 row.
@@ -2543,7 +2543,7 @@ grouped block-scaled instantiations, `cutlass_extensions`, and — found only at
 own error/logging/formatting runtime, its DeepSeek block-scale GEMM and its LoRA hook, both of
 which the runner's constructor builds whether or not those paths are taken. One instantiation is
 compiled, `CutlassMoeFCRunner<__nv_fp4_e2m1, __nv_fp4_e2m1, __nv_bfloat16, __nv_bfloat16>`, into
-`ninfer_trtllm_moe` (87 MiB static archive, sm_120a only; a stub library fails loudly elsewhere).
+`sinfer_trtllm_moe` (87 MiB static archive, sm_120a only; a stub library fails loudly elsewhere).
 Two build traps worth recording: the vendored launcher is written against cutlass **4.5.0**, whose
 grouped `LinearCombination` epilogue argument struct differs from our 4.6.1 — under `-std=c++20`
 the aggregate initialisation binds the wrong field and reports "a value of type const float\*\*
@@ -2599,7 +2599,7 @@ for parity with their kernel; the extra came from keeping our scheduler and from
 activation scale they do not use.
 
 The first version routed *every* width through the runner and cost 47 % of single-user decode:
-`ninfer_bench pp512+tg128` read 19,061 pp / 182 tg against the baseline's 13,398 / 347. The
+`sinfer_bench pp512+tg128` read 19,061 pp / 182 tg against the baseline's 13,398 / 347. The
 runner builds a permutation, expert offsets and a grouped problem list before it computes
 anything, and at eight expert rows that scaffolding is the whole round. Splitting at
 `kSparseMoeTrtllmMinTokens` (`SUROGATE_SERVE_MOE_TRTLLM_MIN` overrides it) gives 19,024 pp /
@@ -2667,7 +2667,7 @@ settled it:
 
 **The pure-GPU path scales almost linearly with the chunk and beats llama.cpp 3.2× at 8,192.**
 The CPU prefill split is a loss at *every* width, and its cost grows with the chunk: the host
-GEMM (`ninfer_cpu_expert_compute_bench`, prefill shapes) runs at ~1.06 TMAC/s — 16 % of VNNI
+GEMM (`sinfer_cpu_expert_compute_bench`, prefill shapes) runs at ~1.06 TMAC/s — 16 % of VNNI
 peak, against the ~55 % llama.cpp's own CPU prefill implies — and each layer's combine waits on
 its host tail (`t_partial.join`, variant.cpp), so 60 layers of host GEMM sum into the round.
 Defaulting the prefill share to 0 (decode split untouched — at one token per lane the gather is

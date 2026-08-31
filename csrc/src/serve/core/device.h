@@ -4,11 +4,11 @@
 
 #include <cstddef>
 
-namespace ninfer {
+namespace sinfer {
 
 void cuda_check(cudaError_t err, const char* expr, const char* file, int line);
 
-#define CUDA_CHECK(expr) ::ninfer::cuda_check((expr), #expr, __FILE__, __LINE__)
+#define CUDA_CHECK(expr) ::sinfer::cuda_check((expr), #expr, __FILE__, __LINE__)
 
 struct DeviceContext {
     int device               = 0;
@@ -50,4 +50,4 @@ private:
     cudaEvent_t stop_    = nullptr;
 };
 
-} // namespace ninfer
+} // namespace sinfer

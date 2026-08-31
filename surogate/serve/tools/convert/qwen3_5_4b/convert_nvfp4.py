@@ -29,7 +29,7 @@ from . import recipe_nvfp4 as recipe
 
 
 RECIPE_ID = "qwen3_5_4b-nvfp4-modelopt-v1"
-OUTPUT_BASENAME = "qwen3_5_4b_nvfp4.ninfer"
+OUTPUT_BASENAME = "qwen3_5_4b_nvfp4.sinfer"
 
 
 @dataclass(frozen=True, slots=True)

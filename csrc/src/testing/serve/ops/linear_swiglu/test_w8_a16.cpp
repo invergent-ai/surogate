@@ -5,8 +5,8 @@
 #include <iostream>
 
 int main() {
-    using namespace ninfer;
-    using namespace ninfer::test::linear_swiglu;
+    using namespace sinfer;
+    using namespace sinfer::test::linear_swiglu;
 
     try {
         // One public numerical case begins each materially distinct W8 implementation interval;

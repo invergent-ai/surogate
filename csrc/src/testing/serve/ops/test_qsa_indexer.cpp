@@ -15,8 +15,8 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
+using namespace sinfer;
+using namespace sinfer::test;
 
 namespace {
 
@@ -28,8 +28,8 @@ constexpr float kTheta   = 1.0e7F;
 constexpr float kEps     = 1.0e-6F;
 constexpr int kPageSize  = 64; // kPagedKVPageSize
 
-ninfer::ops::QsaIndexerGeometry geometry(int top_k) {
-    return ninfer::ops::QsaIndexerGeometry{.head_dim   = kHeadDim,
+sinfer::ops::QsaIndexerGeometry geometry(int top_k) {
+    return sinfer::ops::QsaIndexerGeometry{.head_dim   = kHeadDim,
                                            .heads      = kHeads,
                                            .block      = kBlock,
                                            .top_k      = top_k,
@@ -156,7 +156,7 @@ int main() {
         std::vector<int> rows(1, 0);
         DeviceBuffer d_rows = to_device_i32(rows);
         Tensor rows_t(d_rows.p, DType::I32, {1});
-        ninfer::ops::qsa_indexer_append(keys, pos_t, rows_t, count, gain_t, geometry(2048),
+        sinfer::ops::qsa_indexer_append(keys, pos_t, rows_t, count, gain_t, geometry(2048),
                                         cache.batch_view(), nullptr);
         cudaStreamSynchronize(nullptr);
     };
@@ -201,7 +201,7 @@ int main() {
     DeviceBuffer d_q    = to_device_bf16(q);
     DeviceBuffer d_qpos = to_device_i32(q_pos);
     DeviceBuffer d_qrow = to_device_i32(q_rows);
-    const int words     = ninfer::ops::qsa_block_mask_words(tokens, kBlock);
+    const int words     = sinfer::ops::qsa_block_mask_words(tokens, kBlock);
     DeviceBuffer d_mask(static_cast<std::size_t>(words) * rows * sizeof(std::uint32_t));
     WorkspaceArena arena(1 << 20);
     Tensor q_t(d_q.p, DType::BF16, {kHeadDim, kHeads, rows});
@@ -209,7 +209,7 @@ int main() {
     Tensor qrow_t(d_qrow.p, DType::I32, {rows});
     Tensor mask_t(d_mask.p, DType::I32, {words, rows});
 
-    ninfer::ops::qsa_indexer_select(q_t, qpos_t, qrow_t, 1, geometry(2048), cache.batch_view(),
+    sinfer::ops::qsa_indexer_select(q_t, qpos_t, qrow_t, 1, geometry(2048), cache.batch_view(),
                                     tokens, arena, mask_t, nullptr);
     cudaStreamSynchronize(nullptr);
     expect(cudaGetLastError() == cudaSuccess, "select launched cleanly");
@@ -232,7 +232,7 @@ int main() {
 
     // A budget of 32 cells = 8 complete blocks, plus the always-visible tail.
     arena.reset();
-    ninfer::ops::qsa_indexer_select(q_t, qpos_t, qrow_t, 1, geometry(32), cache.batch_view(),
+    sinfer::ops::qsa_indexer_select(q_t, qpos_t, qrow_t, 1, geometry(32), cache.batch_view(),
                                     tokens, arena, mask_t, nullptr);
     cudaStreamSynchronize(nullptr);
     const std::vector<int> mask = from_device_i32(d_mask, static_cast<std::size_t>(words) * rows);

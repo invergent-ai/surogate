@@ -1,6 +1,6 @@
 #pragma once
 
-// ninfer::ops::detail - private launch prototypes for causal_conv1d.
+// sinfer::ops::detail - private launch prototypes for causal_conv1d.
 
 #include "core/tensor.h"
 
@@ -8,7 +8,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 inline constexpr std::int32_t kCausalConvSequenceMaxTokens = 64;
 inline constexpr std::int32_t kCausalConvParallelMaxTokens = 16;
@@ -28,4 +28,4 @@ void causal_conv1d_snapshot_launch(const Tensor& x, const Tensor& weight, Tensor
                                    const Tensor& snapshot_base_slots, Tensor& out,
                                    cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

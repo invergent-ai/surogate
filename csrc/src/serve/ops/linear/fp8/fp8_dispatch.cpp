@@ -10,7 +10,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 enum class Fp8LinearRoute : std::uint8_t {
@@ -126,4 +126,4 @@ void fp8_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPoli
     launch_fp8_a8(x, weight, out, scratch, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

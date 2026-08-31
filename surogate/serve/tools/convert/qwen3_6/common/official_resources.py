@@ -46,7 +46,7 @@ def _derived_frontend_allowed() -> bool:
     # conversions never set it and keep the strict check.
     import os
 
-    return os.environ.get("NINFER_ALLOW_DERIVED_FRONTEND", "") == "1"
+    return os.environ.get("SINFER_ALLOW_DERIVED_FRONTEND", "") == "1"
 
 
 _DERIVABLE_RESOURCES = frozenset(
@@ -77,7 +77,7 @@ def validate_official_resource_hashes(
                 print(
                     f"warning: derived frontend resource {filename}: "
                     f"sha256 {actual} differs from pinned official {expected} "
-                    "(NINFER_ALLOW_DERIVED_FRONTEND=1)",
+                    "(SINFER_ALLOW_DERIVED_FRONTEND=1)",
                     file=sys.stderr,
                 )
                 continue

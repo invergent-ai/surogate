@@ -1,6 +1,6 @@
 #include "ops/attn_input_proj/bf16/bf16_attn_input_plan.h"
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 void bf16_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                               Tensor& k, Tensor& v, cudaStream_t stream) {
@@ -15,4 +15,4 @@ void bf16_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, 
     bf16_attn_input_mma_launch(x, weight, q, gate, k, v, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

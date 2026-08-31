@@ -11,7 +11,7 @@
 #include <cstddef>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 enum class Nvfp4LinearSwiGluRoute {
@@ -145,4 +145,4 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
              scratch.projected.slice(0, kIntermediate, kIntermediate), out, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

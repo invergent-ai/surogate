@@ -11,7 +11,7 @@ from tools.bench.run_serve_corpus import (
 
 def test_request_log_v9_identity_is_accepted() -> None:
     current = {
-        "artifact_type": "ninfer_serve_request_log",
+        "artifact_type": "sinfer_serve_request_log",
         "schema_version": 9,
         "event": "server_start",
     }

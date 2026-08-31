@@ -5,7 +5,7 @@
 
 #include <cuda_bf16.h>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 struct Bf16LinearAddDecodeOutput {
@@ -36,4 +36,4 @@ void bf16_linear_add_decode_launch(const Tensor& x, const Weight& weight, Tensor
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

@@ -20,7 +20,7 @@ def test_report_retains_target_specific_provenance_and_component_bytes(
     report = convert.build_conversion_report(
         model_dir=tmp_path / "model",
         dflash_model_dir=tmp_path / "dflash",
-        out_path=tmp_path / "model.ninfer",
+        out_path=tmp_path / "model.sinfer",
         arguments={},
         base_config_summary={"text": {"hidden_size": 2048}},
         dflash_config_summary={"hidden_size": 2048},

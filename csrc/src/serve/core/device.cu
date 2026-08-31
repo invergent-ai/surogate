@@ -5,7 +5,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer {
+namespace sinfer {
 namespace {
 
 std::string cuda_error_message(const char* prefix, cudaError_t err) {
@@ -187,4 +187,4 @@ float CudaEventTimer::stop_ms() {
     return elapsed_ms();
 }
 
-} // namespace ninfer
+} // namespace sinfer

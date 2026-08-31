@@ -4,7 +4,7 @@
 
 #include <functional>
 
-namespace ninfer {
+namespace sinfer {
 
 class DecodeGraphDefinition {
 public:
@@ -48,4 +48,4 @@ private:
     cudaGraphExec_t exec_ = nullptr;
 };
 
-} // namespace ninfer
+} // namespace sinfer

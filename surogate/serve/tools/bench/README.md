@@ -1,11 +1,11 @@
 # tools/bench
 
-Offline helper for the `ninfer_bench` throughput tool. Correctness/parity tooling lives separately
+Offline helper for the `sinfer_bench` throughput tool. Correctness/parity tooling lives separately
 under [`tools/parity`](../parity).
 
 ## Corpus baker
 
-`ninfer_bench` benchmarks prefill at an exact length by slicing the first `P` token ids of a
+`sinfer_bench` benchmarks prefill at an exact length by slicing the first `P` token ids of a
 committed corpus, so the corpus must be real, in-distribution text (not random tokens) and at
 least as long as the largest prefill you want to run. `make_bench_corpus.py` bakes that corpus
 offline with a local Hugging Face Qwen3.6 tokenizer.
@@ -39,7 +39,7 @@ pip install -r tools/bench/requirements.txt
 ```
 
 The tokenizer is loaded locally only; the tool never downloads from the network. Pass
-`--tokenizer-path` or set `NINFER_TOKENIZER_PATH`.
+`--tokenizer-path` or set `SINFER_TOKENIZER_PATH`.
 
 ## Regenerate / check
 
@@ -61,14 +61,14 @@ python3 tools/bench/make_bench_corpus.py --check
 `--tokens` is the exact committed corpus size and the ceiling on prefill length; increase it (and
 optionally use `--source-text`) to benchmark longer prefills, memory permitting.
 
-## NInfer performance matrix
+## SInfer performance matrix
 
-`run_ninfer_bench_matrix.py` runs the layered public-Engine `ninfer_bench` matrix against the native
-`.ninfer` artifact and stores its local reports under `profiles/bench/`. Its defaults are:
+`run_sinfer_bench_matrix.py` runs the layered public-Engine `sinfer_bench` matrix against the native
+`.sinfer` artifact and stores its local reports under `profiles/bench/`. Its defaults are:
 
 ```text
-artifact: out/qwen3_6_27b.ninfer
-binary:   build/bench/ninfer_bench
+artifact: out/qwen3_6_27b.sinfer
+binary:   build/bench/sinfer_bench
 corpus:   bench/fixtures/bench_corpus.ids
 ```
 
@@ -78,25 +78,25 @@ cover CUDA Graph and eager execution; prefill-only cases vary prompt length and 
 
 ```bash
 # Configure the benchmark targets once; they are off in the default public build.
-cmake -S . -B build -DNINFER_BUILD_BENCHMARKS=ON
+cmake -S . -B build -DSINFER_BUILD_BENCHMARKS=ON
 
 # Inspect commands without running the model.
-python3 tools/bench/run_ninfer_bench_matrix.py --preset core --dry-run
+python3 tools/bench/run_sinfer_bench_matrix.py --preset core --dry-run
 
-# Main run. Builds build/bench/ninfer_bench first, then writes JSON and summary.csv.
-python3 tools/bench/run_ninfer_bench_matrix.py --preset core
+# Main run. Builds build/bench/sinfer_bench first, then writes JSON and summary.csv.
+python3 tools/bench/run_sinfer_bench_matrix.py --preset core
 
 # Longer run that adds 32k/64k prompt and context-decode points.
-python3 tools/bench/run_ninfer_bench_matrix.py --preset full
+python3 tools/bench/run_sinfer_bench_matrix.py --preset full
 
 # Run only the MTP draft-window sweep.
-python3 tools/bench/run_ninfer_bench_matrix.py --preset full --suite mtp_sweep
+python3 tools/bench/run_sinfer_bench_matrix.py --preset full --suite mtp_sweep
 ```
 
 Default outputs:
 
 ```text
-profiles/bench/ninfer-<preset>-<timestamp>/
+profiles/bench/sinfer-<preset>-<timestamp>/
   commands.sh
   manifest.json
   json/<suite>/<case>.json
@@ -109,7 +109,7 @@ Use `--resume` to skip completed JSON reports in an existing `--output-dir`, and
 for a minimal script/runner check. `--no-build` uses the binary supplied by `--bench` without
 building it.
 
-Each raw report must be `ninfer_bench_report` schema v11. The flattened summary and schema-v3 matrix
+Each raw report must be `sinfer_bench_report` schema v11. The flattened summary and schema-v3 matrix
 manifest carry native names from the report: selected target, canonical `weights_id`, artifact,
 load/read/upload/staging values, Engine memory arenas including request transient and CUDA Graph
 allowance, per-test planned logical and allocator-observed workspace peaks, KV capacity and
@@ -149,14 +149,14 @@ position for every request.
 
 ```bash
 python3 tools/bench/run_serve_concurrency.py \
-  --artifact qwen3_6_27b=out/qwen3_6_27b_nvfp4.ninfer \
+  --artifact qwen3_6_27b=out/qwen3_6_27b_nvfp4.sinfer \
   --mode mtp3 --suite decode-saturation \
   --concurrency 1 --concurrency 2 --concurrency 4 \
   --decode-tokens 8192 \
   --output profiles/bench/concurrent-decode
 
 python3 tools/bench/run_serve_concurrency.py \
-  --artifact qwen3_6_27b=out/qwen3_6_27b_nvfp4.ninfer \
+  --artifact qwen3_6_27b=out/qwen3_6_27b_nvfp4.sinfer \
   --mode mtp3 --suite corpus-makespan \
   --concurrency 1 --concurrency 2 \
   --output profiles/bench/concurrent-corpus

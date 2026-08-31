@@ -4,7 +4,7 @@
 
 #include <cuda_runtime.h>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 /**
  * Prepare lane-owned BF16 prefixes as one compact ragged batch.
@@ -20,4 +20,4 @@ void prepare_ragged_prefix(const Tensor& source, const Tensor& lanes, const Tens
                            const Tensor& ends, Tensor& destination, Tensor& positions,
                            Tensor& counts, cudaStream_t stream);
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

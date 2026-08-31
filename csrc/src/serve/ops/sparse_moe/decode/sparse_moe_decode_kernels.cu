@@ -19,7 +19,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 namespace geometry_qwen36 {
 constexpr int kHidden       = 2048;
@@ -95,4 +95,4 @@ void sparse_moe_decode_launch(const SparseMoeGeometry& geometry, const Tensor& x
     throw std::invalid_argument("sparse_moe: geometry has no compiled decode kernels");
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

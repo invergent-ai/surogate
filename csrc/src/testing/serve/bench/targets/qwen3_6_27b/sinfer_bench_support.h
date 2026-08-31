@@ -1,7 +1,7 @@
 #pragma once
 
 // Host-only support for the product throughput benchmark. The benchmark itself drives only the
-// installed ninfer::Engine API; this file owns its CLI, matrix, statistics, and report schema.
+// installed sinfer::Engine API; this file owns its CLI, matrix, statistics, and report schema.
 
 #include "api/types.h"
 
@@ -13,10 +13,10 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::bench {
+namespace sinfer::bench {
 
 inline constexpr int kSchemaVersion                   = 11;
-inline constexpr std::string_view kArtifactType       = "ninfer_bench_report";
+inline constexpr std::string_view kArtifactType       = "sinfer_bench_report";
 inline constexpr std::string_view kDefaultCorpusPath  = "bench/fixtures/bench_corpus.ids";
 inline constexpr int kDecodeSeedTokens                = 1;
 inline constexpr int kDefaultNPrompt                  = 512;
@@ -151,4 +151,4 @@ std::string kv_cache_name(KvCacheStorage storage);
 std::string proposal_head_name(ProposalHead head);
 std::uint64_t file_size_or_zero(const std::string& path);
 
-} // namespace ninfer::bench
+} // namespace sinfer::bench

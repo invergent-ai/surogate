@@ -7,7 +7,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 RowSplitGroupedMmaJob make_job(const Weight& weight, std::int32_t weight_row_offset,
@@ -77,4 +77,4 @@ void q4_q5_gdn_input_grouped_mma_launch(const Tensor& x, const Weight& qk_weight
     });
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

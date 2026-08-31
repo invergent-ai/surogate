@@ -10,8 +10,8 @@
 // L2 flush precedes every measured replay and is outside the timed interval.
 
 // Examples:
-//   ./build/bench/ninfer_gdn_layer_bench
-//   ./build/bench/ninfer_gdn_layer_bench --t-sweep 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16
+//   ./build/bench/sinfer_gdn_layer_bench
+//   ./build/bench/sinfer_gdn_layer_bench --t-sweep 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16
 //       --repeat 50
 
 #include "api/ops/causal_conv1d_silu.h"
@@ -25,7 +25,7 @@
 #include "api/ops/scatter.h"
 
 #include "core/device.h"
-#include "ninfer_bench_common.h"
+#include "sinfer_bench_common.h"
 #include "quantized_weight.cuh"
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.h"
 #include "ops/gdn_input_proj/w8/w8_gdn_input_plan.h"
@@ -46,7 +46,7 @@
 #include <utility>
 #include <vector>
 
-using namespace ninfer;
+using namespace sinfer;
 
 namespace {
 
@@ -87,7 +87,7 @@ struct Result {
     bench::ColdTiming timing;
 };
 
-Weight make_bf16_weight(const ninfer::DeviceBuffer& storage, std::int32_t rows, std::int32_t cols) {
+Weight make_bf16_weight(const sinfer::DeviceBuffer& storage, std::int32_t rows, std::int32_t cols) {
     Weight weight{};
     weight.payload          = storage.p;
     weight.payload_bytes    = static_cast<std::uint64_t>(rows) * cols * sizeof(std::uint16_t);
@@ -109,16 +109,16 @@ Weight make_bf16_weight(const ninfer::DeviceBuffer& storage, std::int32_t rows, 
     return weight;
 }
 
-ninfer::DeviceBuffer make_constant_bf16(std::size_t elements, float value) {
+sinfer::DeviceBuffer make_constant_bf16(std::size_t elements, float value) {
     std::vector<std::uint16_t> host(elements, bench::f32_to_bf16(value));
-    ninfer::DeviceBuffer device(elements * sizeof(std::uint16_t));
+    sinfer::DeviceBuffer device(elements * sizeof(std::uint16_t));
     CUDA_CHECK(cudaMemcpy(device.p, host.data(), device.bytes, cudaMemcpyHostToDevice));
     return device;
 }
 
-ninfer::DeviceBuffer make_constant_f32(std::size_t elements, float value) {
+sinfer::DeviceBuffer make_constant_f32(std::size_t elements, float value) {
     std::vector<float> host(elements, value);
-    ninfer::DeviceBuffer device(elements * sizeof(float));
+    sinfer::DeviceBuffer device(elements * sizeof(float));
     CUDA_CHECK(cudaMemcpy(device.p, host.data(), device.bytes, cudaMemcpyHostToDevice));
     return device;
 }
@@ -240,44 +240,44 @@ struct Resources {
                               ops::linear_add_workspace_capacity_bytes(
                                   QType::W8G32_F16S, kHidden, kValueRows, 1, max_tokens)})) {}
 
-    static ninfer::DeviceBuffer make_constant_i32(std::int32_t value) {
-        ninfer::DeviceBuffer device(sizeof(value));
+    static sinfer::DeviceBuffer make_constant_i32(std::int32_t value) {
+        sinfer::DeviceBuffer device(sizeof(value));
         CUDA_CHECK(cudaMemcpy(device.p, &value, sizeof(value), cudaMemcpyHostToDevice));
         return device;
     }
 
     bench::PackedQuantizedWeight input_weight;
     bench::PackedQuantizedWeight output_weight;
-    ninfer::DeviceBuffer control_storage;
+    sinfer::DeviceBuffer control_storage;
     Weight control_weight;
-    ninfer::DeviceBuffer input_norm;
-    ninfer::DeviceBuffer gdn_norm;
-    ninfer::DeviceBuffer conv_weight;
-    ninfer::DeviceBuffer a_log;
-    ninfer::DeviceBuffer dt_bias;
-    ninfer::DeviceBuffer initial_slot;
-    ninfer::DeviceBuffer snapshot_base_slot;
+    sinfer::DeviceBuffer input_norm;
+    sinfer::DeviceBuffer gdn_norm;
+    sinfer::DeviceBuffer conv_weight;
+    sinfer::DeviceBuffer a_log;
+    sinfer::DeviceBuffer dt_bias;
+    sinfer::DeviceBuffer initial_slot;
+    sinfer::DeviceBuffer snapshot_base_slot;
 
-    ninfer::DeviceBuffer residual;
-    ninfer::DeviceBuffer hidden;
-    ninfer::DeviceBuffer qkv;
-    ninfer::DeviceBuffer z;
-    ninfer::DeviceBuffer qkv_conv;
-    ninfer::DeviceBuffer g;
-    ninfer::DeviceBuffer beta;
-    ninfer::DeviceBuffer q;
-    ninfer::DeviceBuffer k;
-    ninfer::DeviceBuffer v;
-    ninfer::DeviceBuffer q_norm;
-    ninfer::DeviceBuffer k_norm;
-    ninfer::DeviceBuffer recurrent_out;
-    ninfer::DeviceBuffer gated_out;
-    ninfer::DeviceBuffer conv_states;
-    ninfer::DeviceBuffer ssm_states;
+    sinfer::DeviceBuffer residual;
+    sinfer::DeviceBuffer hidden;
+    sinfer::DeviceBuffer qkv;
+    sinfer::DeviceBuffer z;
+    sinfer::DeviceBuffer qkv_conv;
+    sinfer::DeviceBuffer g;
+    sinfer::DeviceBuffer beta;
+    sinfer::DeviceBuffer q;
+    sinfer::DeviceBuffer k;
+    sinfer::DeviceBuffer v;
+    sinfer::DeviceBuffer q_norm;
+    sinfer::DeviceBuffer k_norm;
+    sinfer::DeviceBuffer recurrent_out;
+    sinfer::DeviceBuffer gated_out;
+    sinfer::DeviceBuffer conv_states;
+    sinfer::DeviceBuffer ssm_states;
     WorkspaceArena workspace;
 };
 
-Result run_case(Resources& resources, ninfer::DeviceBuffer& flush, cudaStream_t stream,
+Result run_case(Resources& resources, sinfer::DeviceBuffer& flush, cudaStream_t stream,
                 const Options& options, std::int32_t tokens) {
     Tensor residual(resources.residual.p, DType::BF16, {kHidden, tokens});
     Tensor hidden(resources.hidden.p, DType::BF16, {kHidden, tokens});
@@ -519,7 +519,7 @@ int main(int argc, char** argv) {
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         Resources resources(max_tokens);
-        ninfer::DeviceBuffer flush(options.flush_bytes);
+        sinfer::DeviceBuffer flush(options.flush_bytes);
         std::vector<Result> results;
         results.reserve(options.t_sweep.size());
 
@@ -536,7 +536,7 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "ninfer_gdn_layer_bench: %s\n", error.what());
+        std::fprintf(stderr, "sinfer_gdn_layer_bench: %s\n", error.what());
         return 1;
     }
 }

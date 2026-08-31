@@ -13,7 +13,7 @@
 #include <string>
 #include <utility>
 
-namespace ninfer::serve {
+namespace sinfer::serve {
 
 struct RequestCapacity {
     explicit RequestCapacity(std::size_t limit) : maximum(limit) {}
@@ -39,37 +39,37 @@ struct RequestLifetime {
     std::chrono::steady_clock::time_point deadline;
 };
 
-ApiError request_error_to_api_error(const ninfer::RequestError& exception) {
+ApiError request_error_to_api_error(const sinfer::RequestError& exception) {
     ApiError error;
     error.param   = "messages";
     error.message = exception.what();
     switch (exception.kind()) {
-    case ninfer::RequestErrorKind::ContextLengthExceeded:
+    case sinfer::RequestErrorKind::ContextLengthExceeded:
         error.status = 400;
         error.code   = "context_length_exceeded";
         break;
-    case ninfer::RequestErrorKind::MediaBudgetExceeded:
+    case sinfer::RequestErrorKind::MediaBudgetExceeded:
         error.status = 400;
         error.code   = "media_budget_exceeded";
         break;
-    case ninfer::RequestErrorKind::Overloaded:
+    case sinfer::RequestErrorKind::Overloaded:
         error.param.clear();
         error.status = 429;
         error.type   = "rate_limit_error";
         error.code   = "server_overloaded";
         break;
-    case ninfer::RequestErrorKind::QueueTimeout:
+    case sinfer::RequestErrorKind::QueueTimeout:
         error.param.clear();
         error.status = 503;
         error.type   = "server_error";
         error.code   = "request_queue_timeout";
         break;
-    case ninfer::RequestErrorKind::Cancelled:
+    case sinfer::RequestErrorKind::Cancelled:
         error.status = 499;
         error.type   = "request_cancelled";
         error.code   = "client_disconnected";
         break;
-    case ninfer::RequestErrorKind::Unavailable:
+    case sinfer::RequestErrorKind::Unavailable:
         error.param.clear();
         error.status = 503;
         error.type   = "server_error";
@@ -85,31 +85,31 @@ using Clock = std::chrono::steady_clock;
 
 [[noreturn]] void throw_preparation_cancelled();
 
-[[noreturn]] void throw_media_error(const ninfer::product::media_acquire::Error& exception) {
+[[noreturn]] void throw_media_error(const sinfer::product::media_acquire::Error& exception) {
     ApiError error;
     error.param   = "messages";
     error.message = exception.what();
     switch (exception.kind()) {
-    case ninfer::product::media_acquire::ErrorKind::BudgetExceeded:
+    case sinfer::product::media_acquire::ErrorKind::BudgetExceeded:
         error.status = 400;
         error.code   = "media_budget_exceeded";
         break;
-    case ninfer::product::media_acquire::ErrorKind::RemoteUnavailable:
+    case sinfer::product::media_acquire::ErrorKind::RemoteUnavailable:
         error.status = 502;
         error.type   = "server_error";
         error.code   = "media_fetch_failed";
         break;
-    case ninfer::product::media_acquire::ErrorKind::RemoteTimeout:
+    case sinfer::product::media_acquire::ErrorKind::RemoteTimeout:
         error.status = 504;
         error.type   = "server_error";
         error.code   = "media_fetch_timeout";
         break;
-    case ninfer::product::media_acquire::ErrorKind::DeadlineExceeded:
+    case sinfer::product::media_acquire::ErrorKind::DeadlineExceeded:
         error.status = 503;
         error.type   = "server_error";
         error.code   = "request_queue_timeout";
         break;
-    case ninfer::product::media_acquire::ErrorKind::Cancelled:
+    case sinfer::product::media_acquire::ErrorKind::Cancelled:
         throw_preparation_cancelled();
     }
     throw ApiException(std::move(error));
@@ -134,39 +134,39 @@ using Clock = std::chrono::steady_clock;
     throw ApiException(std::move(error));
 }
 
-ninfer::OwnedMedia acquire_media(const ContentPart& part, Clock::time_point deadline,
+sinfer::OwnedMedia acquire_media(const ContentPart& part, Clock::time_point deadline,
                                  const std::function<bool()>& is_cancelled,
                                  std::size_t& remaining_bytes) {
     if (remaining_bytes == 0) {
-        throw_media_error(ninfer::product::media_acquire::Error(
-            ninfer::product::media_acquire::ErrorKind::BudgetExceeded,
+        throw_media_error(sinfer::product::media_acquire::Error(
+            sinfer::product::media_acquire::ErrorKind::BudgetExceeded,
             "request media exceeds aggregate byte limit"));
     }
-    ninfer::product::media_acquire::Policy policy;
+    sinfer::product::media_acquire::Policy policy;
     policy.max_bytes    = std::min(policy.max_bytes, remaining_bytes);
     policy.deadline     = deadline;
     policy.is_cancelled = is_cancelled;
     std::vector<std::uint8_t> source_bytes;
     try {
-        source_bytes = ninfer::product::media_acquire::acquire_bytes(part.source, policy);
-    } catch (const ninfer::product::media_acquire::Error& exception) {
+        source_bytes = sinfer::product::media_acquire::acquire_bytes(part.source, policy);
+    } catch (const sinfer::product::media_acquire::Error& exception) {
         throw_media_error(exception);
     } catch (const std::invalid_argument& exception) { throw_invalid_input(exception); }
 
     remaining_bytes -= source_bytes.size();
-    ninfer::OwnedMedia media;
+    sinfer::OwnedMedia media;
     media.kind =
-        part.kind == ContentKind::Image ? ninfer::MediaKind::Image : ninfer::MediaKind::Video;
+        part.kind == ContentKind::Image ? sinfer::MediaKind::Image : sinfer::MediaKind::Video;
     media.media_type = part.source.media_type;
     switch (part.source.kind) {
-    case ninfer::product::media_acquire::SourceKind::Path:
-    case ninfer::product::media_acquire::SourceKind::Url:
+    case sinfer::product::media_acquire::SourceKind::Path:
+    case sinfer::product::media_acquire::SourceKind::Url:
         media.source_name = part.source.value;
         break;
-    case ninfer::product::media_acquire::SourceKind::Data:
+    case sinfer::product::media_acquire::SourceKind::Data:
         media.source_name = "inline-data";
         break;
-    case ninfer::product::media_acquire::SourceKind::Bytes:
+    case sinfer::product::media_acquire::SourceKind::Bytes:
         media.source_name = "inline-bytes";
         break;
     }
@@ -174,7 +174,7 @@ ninfer::OwnedMedia acquire_media(const ContentPart& part, Clock::time_point dead
     return media;
 }
 
-[[noreturn]] void throw_request_error(const ninfer::RequestError& exception) {
+[[noreturn]] void throw_request_error(const sinfer::RequestError& exception) {
     throw ApiException(request_error_to_api_error(exception));
 }
 
@@ -182,19 +182,19 @@ void check_preparation_control(Clock::time_point deadline,
                                const std::function<bool()>& is_cancelled) {
     if (is_cancelled && is_cancelled()) { throw_preparation_cancelled(); }
     if (Clock::now() >= deadline) {
-        throw_request_error(ninfer::RequestError(RequestErrorKind::QueueTimeout,
+        throw_request_error(sinfer::RequestError(RequestErrorKind::QueueTimeout,
                                                  "inference request expired during preparation"));
     }
 }
 
-class ServiceOutputSink final : public ninfer::OutputSink {
+class ServiceOutputSink final : public sinfer::OutputSink {
 public:
     ServiceOutputSink(const StreamSink& sink, bool filter_tool_calls)
         : sink_(&sink), filter_tool_calls_(filter_tool_calls) {}
 
-    void publish(ninfer::OutputDelta delta) override {
+    void publish(sinfer::OutputDelta delta) override {
         if (delta.text.empty()) { return; }
-        if (delta.channel == ninfer::OutputChannel::Reasoning) {
+        if (delta.channel == sinfer::OutputChannel::Reasoning) {
             if (sink_->on_reasoning) { sink_->on_reasoning(delta.text); }
         } else {
             std::string visible =
@@ -225,7 +225,7 @@ private:
 
 GenerationService::GenerationService(ServeOptions options, LoadProgress load_progress)
     : options_(std::move(options)) {
-    ninfer::EngineOptions engine_options;
+    sinfer::EngineOptions engine_options;
     engine_options.artifact_path            = options_.artifact_path;
     engine_options.device                   = options_.device;
     engine_options.devices                  = options_.devices;
@@ -250,7 +250,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.media_live_bytes         = options_.media_live_bytes;
     engine_options.media_preprocess_threads = options_.media_preprocess_threads;
     engine_options.load_progress            = std::move(load_progress);
-    engine_              = std::make_unique<ninfer::Engine>(std::move(engine_options));
+    engine_              = std::make_unique<sinfer::Engine>(std::move(engine_options));
     prompt_capabilities_ = engine_->prompt_capabilities();
     request_capacity_    = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
@@ -261,7 +261,7 @@ std::shared_ptr<RequestLifetime> GenerationService::acquire_request_lifetime() c
     {
         std::lock_guard lock(request_capacity_->mutex);
         if (request_capacity_->active >= request_capacity_->maximum) {
-            throw_request_error(ninfer::RequestError(RequestErrorKind::Overloaded,
+            throw_request_error(sinfer::RequestError(RequestErrorKind::Overloaded,
                                                      "inference request queue is full"));
         }
         ++request_capacity_->active;
@@ -280,7 +280,7 @@ std::shared_ptr<RequestLifetime> GenerationService::acquire_request_lifetime() c
 PreparedRequest GenerationService::prepare(const GenerationRequest& request,
                                            std::function<bool()> is_cancelled) const {
     PreparedRequest prepared;
-    ninfer::RequestOptions request_options = to_request_options(request, options_);
+    sinfer::RequestOptions request_options = to_request_options(request, options_);
     prepared.include_usage                 = request.include_usage;
     prepared.tool_capable                  = request.uses_tools() || request.has_tool_history();
     prepared.tool_name_max_length          = request.tool_name_max_length;
@@ -299,8 +299,8 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
     try {
         const auto acquisition_started = Clock::now();
         std::size_t remaining_media_bytes =
-            std::min(options_.max_request_bytes, ninfer::kMaximumPromptMediaBytes);
-        ninfer::PromptInput input =
+            std::min(options_.max_request_bytes, sinfer::kMaximumPromptMediaBytes);
+        sinfer::PromptInput input =
             to_prompt_input(request, semantics, [&](const ContentPart& part) {
                 return acquire_media(part, prepared.lifetime->deadline, is_cancelled,
                                      remaining_media_bytes);
@@ -312,7 +312,7 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
             .deadline     = prepared.lifetime->deadline,
             .cancellation = CancellationView(is_cancelled),
         };
-        ninfer::PreparedPrompt prompt = engine_->prepare(std::move(input), control);
+        sinfer::PreparedPrompt prompt = engine_->prepare(std::move(input), control);
         check_preparation_control(prepared.lifetime->deadline, is_cancelled);
         prepared.prompt_tokens = static_cast<int>(prompt.summary().prompt_tokens);
         prepared.preparation   = prompt.preparation_stats();
@@ -321,7 +321,7 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
         prepared.generation = engine_->submit(std::move(prompt), std::move(request_options),
                                               prepared.lifetime->deadline);
         prepared.sampling   = prepared.generation.resolved_sampling();
-    } catch (const ApiException&) { throw; } catch (const ninfer::RequestError& exception) {
+    } catch (const ApiException&) { throw; } catch (const sinfer::RequestError& exception) {
         throw_request_error(exception);
     } catch (const std::invalid_argument& exception) { throw_invalid_input(exception); }
     return prepared;
@@ -340,8 +340,8 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& request,
         resolve_prompt_semantics(request, options_, prompt_capabilities_);
     try {
         std::size_t remaining_media_bytes =
-            std::min(options_.max_request_bytes, ninfer::kMaximumPromptMediaBytes);
-        ninfer::PromptInput input =
+            std::min(options_.max_request_bytes, sinfer::kMaximumPromptMediaBytes);
+        sinfer::PromptInput input =
             to_prompt_input(request, semantics, [&](const ContentPart& part) {
                 return acquire_media(part, deadline, is_cancelled, remaining_media_bytes);
             });
@@ -354,7 +354,7 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& request,
             static_cast<int>(engine_->count_tokens(std::move(input), control));
         check_preparation_control(deadline, is_cancelled);
         return prompt_tokens;
-    } catch (const ApiException&) { throw; } catch (const ninfer::RequestError& exception) {
+    } catch (const ApiException&) { throw; } catch (const sinfer::RequestError& exception) {
         throw_request_error(exception);
     } catch (const std::invalid_argument& exception) { throw_invalid_input(exception); }
 }
@@ -365,19 +365,19 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     if (sink != nullptr) {
         output_sink = std::make_unique<ServiceOutputSink>(*sink, prepared.tool_capable);
     }
-    ninfer::OutputSink* public_sink = output_sink.get();
-    ninfer::CancellationView cancellation;
+    sinfer::OutputSink* public_sink = output_sink.get();
+    sinfer::CancellationView cancellation;
     if (is_cancelled || (sink != nullptr && sink->is_cancelled)) {
-        cancellation = ninfer::CancellationView([external = std::move(is_cancelled), sink]() {
+        cancellation = sinfer::CancellationView([external = std::move(is_cancelled), sink]() {
             return (external && external()) ||
                    (sink != nullptr && sink->is_cancelled && sink->is_cancelled());
         });
     }
 
-    ninfer::GenerationResult result;
+    sinfer::GenerationResult result;
     try {
         result = prepared.generation.wait(public_sink, cancellation);
-    } catch (const ninfer::RequestError& exception) { throw_request_error(exception); }
+    } catch (const sinfer::RequestError& exception) { throw_request_error(exception); }
     GenerationOutcome outcome;
     outcome.text              = std::move(result.content);
     outcome.reasoning         = std::move(result.reasoning);
@@ -442,4 +442,4 @@ void GenerationService::warmup() {
     }
 }
 
-} // namespace ninfer::serve
+} // namespace sinfer::serve

@@ -1,4 +1,4 @@
-// Implements: include/ninfer/ops/sigmoid_mul.h
+// Implements: include/sinfer/ops/sigmoid_mul.h
 // Finite dispatch: aligned BF16x8 production route, BF16x2 fallback, then
 // scalar fallback for two-byte-aligned sliced storage.
 #include "ops/launcher/sigmoid_gate_mul.h"
@@ -10,7 +10,7 @@
 #include <algorithm>
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 void sigmoid_gate_mul_bf16x8_launch(const Tensor& gate, Tensor& x, int block, cudaStream_t stream) {
     const std::int64_t packs = x.numel() / 8;
@@ -51,4 +51,4 @@ void sigmoid_gate_mul_launch(const Tensor& gate, Tensor& x, cudaStream_t stream)
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

@@ -1,4 +1,4 @@
-// ninfer::ops - L2Norm launcher.
+// sinfer::ops - L2Norm launcher.
 #include "ops/launcher/l2norm.h"
 
 #include "ops/common/math.h"
@@ -9,7 +9,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 void l2norm_launch(const Tensor& x, float eps, Tensor& out, cudaStream_t stream) {
     const std::int32_t d = x.ne[0];
@@ -43,4 +43,4 @@ void l2norm_launch(const Tensor& x, float eps, Tensor& out, cudaStream_t stream)
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

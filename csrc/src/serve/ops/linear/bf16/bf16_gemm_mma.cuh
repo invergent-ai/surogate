@@ -4,7 +4,7 @@
 //
 //   C[M,N] = A[M,K] * B[K,N]
 //
-// A is row-major with contiguous K. Public NInfer activations store one contiguous
+// A is row-major with contiguous K. Public SInfer activations store one contiguous
 // K vector per token, which is the column-major B representation consumed by the
 // row.col MMA atom. M and K come from a compiled geometry; N remains runtime.
 
@@ -15,7 +15,7 @@
 #include <algorithm>
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 enum class Bf16MmaFragmentPipeline : std::uint8_t {
     Serial,
@@ -331,4 +331,4 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) void bf16
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

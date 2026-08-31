@@ -2,7 +2,7 @@
 
 #include <limits>
 
-namespace ninfer::artifact {
+namespace sinfer::artifact {
 namespace {
 
 constexpr std::uint64_t kTensorAlignment = 256;
@@ -216,4 +216,4 @@ RowScaleGeometry row_scale_geometry(NumericFormat format, std::span<const std::u
     return out;
 }
 
-} // namespace ninfer::artifact
+} // namespace sinfer::artifact

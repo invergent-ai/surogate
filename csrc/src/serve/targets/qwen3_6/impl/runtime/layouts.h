@@ -17,7 +17,7 @@
 #include <memory>
 #include <optional>
 
-namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
+namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS {
 
 using TensorLayout = TensorRegion;
 
@@ -81,13 +81,13 @@ struct SequencePlanningInputs {
     std::uint32_t pipeline_boundary_columns = 0;
 };
 
-} // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
+} // namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS
 
-namespace ninfer::targets::qwen3_6::detail {
+namespace sinfer::targets::qwen3_6::detail {
 
 template <>
-struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
-    typename NINFER_QWEN36_VARIANT::WeightsProfile weights_profile;
+struct SequencePlanImpl<SINFER_QWEN36_VARIANT> {
+    typename SINFER_QWEN36_VARIANT::WeightsProfile weights_profile;
     std::uint32_t capacity                 = 0;
     std::uint32_t kv_capacity              = 0;
     std::uint32_t main_page_groups         = 0;
@@ -107,23 +107,23 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     StartupFeatures features;
     bool use_cuda_graph = true;
     int device          = 0;
-    NINFER_QWEN36_RUNTIME_NS::PersistentLayout persistent;
-    NINFER_QWEN36_RUNTIME_NS::WorkspacePlan workspace;
+    SINFER_QWEN36_RUNTIME_NS::PersistentLayout persistent;
+    SINFER_QWEN36_RUNTIME_NS::WorkspacePlan workspace;
     std::size_t request_transient_capacity_bytes = 0;
     std::size_t graph_allowance_bytes            = 0;
     std::size_t device_reservation_bytes         = 0;
 };
 
 template <>
-struct SequencePlannerImpl<NINFER_QWEN36_VARIANT> {
-    NINFER_QWEN36_RUNTIME_NS::SequencePlanningInputs inputs;
+struct SequencePlannerImpl<SINFER_QWEN36_VARIANT> {
+    SINFER_QWEN36_RUNTIME_NS::SequencePlanningInputs inputs;
     runtime::SequenceCapacityCurve curve;
-    std::unique_ptr<SequencePlanImpl<NINFER_QWEN36_VARIANT>> minimum;
+    std::unique_ptr<SequencePlanImpl<SINFER_QWEN36_VARIANT>> minimum;
 };
 
-} // namespace ninfer::targets::qwen3_6::detail
+} // namespace sinfer::targets::qwen3_6::detail
 
-namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
+namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS {
 
 using SequencePlanImpl = qwen3_6::detail::SequencePlanImpl<Variant>;
 
@@ -134,4 +134,4 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
 finalize_sequence_plan_impl(std::unique_ptr<qwen3_6::detail::SequencePlannerImpl<Variant>> planner,
                             std::uint32_t main_page_groups);
 
-} // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
+} // namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS

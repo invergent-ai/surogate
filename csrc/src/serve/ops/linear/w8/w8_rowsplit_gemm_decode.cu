@@ -11,7 +11,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 constexpr int kRows          = 2048;
@@ -98,4 +98,4 @@ void w8_rowsplit_decode_r16_launch(const Tensor& x, const Weight& w, Tensor& out
     launch_decode<16>(x, w, out, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

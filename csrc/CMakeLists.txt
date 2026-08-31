@@ -750,26 +750,26 @@ if(SUROGATE_BUILD_SERVE)
         message(STATUS "serve: requires CUDA >= 13.1; targets disabled")
     else()
         enable_language(C)  # utf8proc
-        set(NINFER_ROOT ${CMAKE_SOURCE_DIR}/src/serve)
+        set(SINFER_ROOT ${CMAKE_SOURCE_DIR}/src/serve)
         set(SUROGATE_VENDOR_DIR ${CMAKE_SOURCE_DIR}/src/third_party)
-        set(NINFER_JSON_INCLUDE "${json_SOURCE_DIR}/single_include")
-        set(NINFER_BUILD_MEDIA_ACQUIRE ON)
-        set(NINFER_BUILD_PROMPT_INPUT ON)
-        set(NINFER_BUILD_SERVE ON)
+        set(SINFER_JSON_INCLUDE "${json_SOURCE_DIR}/single_include")
+        set(SINFER_BUILD_MEDIA_ACQUIRE ON)
+        set(SINFER_BUILD_PROMPT_INPUT ON)
+        set(SINFER_BUILD_SERVE ON)
         # Host deps are best-effort: a training-only machine without
         # pkg-config/libcurl must still configure — serve targets drop out
         # with a status message instead of failing the build.
         find_package(PkgConfig QUIET)
-        option(NINFER_ENABLE_FFMPEG "Serve: build media decoding against FFmpeg" ON)
-        if(NINFER_ENABLE_FFMPEG AND PkgConfig_FOUND)
+        option(SINFER_ENABLE_FFMPEG "Serve: build media decoding against FFmpeg" ON)
+        if(SINFER_ENABLE_FFMPEG AND PkgConfig_FOUND)
             pkg_check_modules(FFMPEG IMPORTED_TARGET
                 libavformat>=60 libavcodec>=60 libavutil>=58 libswscale>=7)
             if(NOT FFMPEG_FOUND)
                 message(STATUS "serve: FFmpeg dev libraries not found; media-decode stub")
-                set(NINFER_ENABLE_FFMPEG OFF)
+                set(SINFER_ENABLE_FFMPEG OFF)
             endif()
         else()
-            set(NINFER_ENABLE_FFMPEG OFF)
+            set(SINFER_ENABLE_FFMPEG OFF)
         endif()
         if(PkgConfig_FOUND)
             pkg_check_modules(LIBCURL IMPORTED_TARGET libcurl>=7.85)
@@ -781,12 +781,12 @@ if(SUROGATE_BUILD_SERVE)
         if(LIBCURL_FOUND)
 
         # ---- serve engine libraries (formerly src/serve/src/CMakeLists.txt) ----
-function(ninfer_internal_includes target)
+function(sinfer_internal_includes target)
   target_include_directories(${target} PRIVATE
     ${SERVE_ROOT}
     ${SUROGATE_VENDOR_DIR}
     ${SUROGATE_VENDOR_DIR}/utf8proc
-    ${NINFER_JSON_INCLUDE})
+    ${SINFER_JSON_INCLUDE})
   # Serve targets build for the RTX arch set (default 120a; sm_89 compiles
   # via the upstream port guards, execution pending Ada hardware). Features
   # above a device's capability gate off at runtime (FP8 plane needs sm_89+,
@@ -797,7 +797,7 @@ function(ninfer_internal_includes target)
       POSITION_INDEPENDENT_CODE ON)
 endfunction()
 
-function(ninfer_cuda_archive target)
+function(sinfer_cuda_archive target)
   set_target_properties(${target} PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON)
@@ -805,7 +805,7 @@ function(ninfer_cuda_archive target)
 endfunction()
 
 # Device/tensor/layout/graph primitives and the model-independent request runtime.
-add_library(ninfer_core STATIC EXCLUDE_FROM_ALL
+add_library(sinfer_core STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/core/arena.cu
   ${SERVE_ROOT}/core/device.cu
   ${SERVE_ROOT}/core/dtype.cpp
@@ -823,50 +823,50 @@ add_library(ninfer_core STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/runtime/engine/kv_capacity.cpp
   ${SERVE_ROOT}/runtime/engine/public_types.cpp
   ${SERVE_ROOT}/runtime/engine/request_memory.cpp)
-ninfer_internal_includes(ninfer_core)
-ninfer_cuda_archive(ninfer_core)
-target_link_libraries(ninfer_core PUBLIC CUDA::cudart CUDA::nvtx3 Threads::Threads)
+sinfer_internal_includes(sinfer_core)
+sinfer_cuda_archive(sinfer_core)
+target_link_libraries(sinfer_core PUBLIC CUDA::cudart CUDA::nvtx3 Threads::Threads)
 # libnuma places the host buffers of an offloaded model (core/numa.*). Optional: without it the
 # engine warns and the operator must run under `numactl --interleave=all` on a multi-socket host.
 find_library(NUMA_LIBRARY NAMES numa)
 if(NUMA_LIBRARY)
-  target_link_libraries(ninfer_core PUBLIC ${NUMA_LIBRARY})
+  target_link_libraries(sinfer_core PUBLIC ${NUMA_LIBRARY})
   message(STATUS "libnuma: ${NUMA_LIBRARY} (host buffer placement enabled)")
 else()
   message(STATUS "libnuma not found: host buffer placement disabled; run multi-socket hosts under numactl --interleave=all")
 endif()
 
-# Generic .ninfer framing, binding, and direct final materialization.
-add_library(ninfer_artifact STATIC EXCLUDE_FROM_ALL
+# Generic .sinfer framing, binding, and direct final materialization.
+add_library(sinfer_artifact STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/artifact/reader.cpp
   ${SERVE_ROOT}/artifact/storage_layouts.cpp
   ${SERVE_ROOT}/artifact/binder.cpp
   ${SERVE_ROOT}/artifact/materializer.cpp
   ${SERVE_ROOT}/artifact/typed_binding.cpp)
-ninfer_internal_includes(ninfer_artifact)
-target_link_libraries(ninfer_artifact PUBLIC ninfer_core)
+sinfer_internal_includes(sinfer_artifact)
+target_link_libraries(sinfer_artifact PUBLIC sinfer_core)
 
 # The warp-specialized SM120 kernel uses setmaxnreg to transfer registers from its
 # producer warpgroup to its consumer warpgroups. Relocatable device code makes ptxas
 # discard that contract, so this self-contained kernel is intentionally compiled in a
-# non-RDC archive and called through a host launcher from ninfer_ops.
+# non-RDC archive and called through a host launcher from sinfer_ops.
 # surogate vendor patch (csrc/src/serve/PATCHES.md): the W4A4 TMA kernels are
 # sm_120-only hardware (TMA + cluster + block-scaled FP4 MMA). Port builds for
 # other architectures link a loud-failure stub instead.
 if("120a" IN_LIST SUROGATE_SERVE_CUDA_ARCHS OR SUROGATE_SERVE_CUDA_ARCHS STREQUAL "120a")
-  add_library(ninfer_nvfp4_tma STATIC EXCLUDE_FROM_ALL
+  add_library(sinfer_nvfp4_tma STATIC EXCLUDE_FROM_ALL
     ${SERVE_ROOT}/ops/linear/nvfp4/nvfp4_w4a4_tma.cu
     ${SERVE_ROOT}/ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cu)
 else()
-  add_library(ninfer_nvfp4_tma STATIC EXCLUDE_FROM_ALL
+  add_library(sinfer_nvfp4_tma STATIC EXCLUDE_FROM_ALL
     ${SERVE_ROOT}/ops/linear/nvfp4/nvfp4_w4a4_tma_stub.cpp)
 endif()
-ninfer_internal_includes(ninfer_nvfp4_tma)
-set_target_properties(ninfer_nvfp4_tma PROPERTIES
+sinfer_internal_includes(sinfer_nvfp4_tma)
+set_target_properties(sinfer_nvfp4_tma PROPERTIES
   CUDA_SEPARABLE_COMPILATION OFF
   CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
-target_compile_options(ninfer_nvfp4_tma PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
-target_link_libraries(ninfer_nvfp4_tma PRIVATE ninfer_core CUDA::cudart CUDA::cuda_driver)
+target_compile_options(sinfer_nvfp4_tma PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+target_link_libraries(sinfer_nvfp4_tma PRIVATE sinfer_core CUDA::cudart CUDA::cuda_driver)
 
 # TensorRT-LLM's CUTLASS fused-MoE runner, vendored from FlashInfer 0.6.16.post3
 # (src/third_party/trtllm_moe, Apache-2.0; NOTICE there records provenance). It is the kernel
@@ -877,7 +877,7 @@ target_link_libraries(ninfer_nvfp4_tma PRIVATE ninfer_core CUDA::cudart CUDA::cu
 set(TRTLLM_MOE_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/src/third_party/trtllm_moe)
 if("120a" IN_LIST SUROGATE_SERVE_CUDA_ARCHS OR SUROGATE_SERVE_CUDA_ARCHS STREQUAL "120a")
   file(GLOB TRTLLM_MOE_GENERATED ${TRTLLM_MOE_ROOT}/cutlass_instantiations/120/gemm_grouped/120/*.generated.cu)
-  add_library(ninfer_trtllm_moe STATIC EXCLUDE_FROM_ALL
+  add_library(sinfer_trtllm_moe STATIC EXCLUDE_FROM_ALL
     ${TRTLLM_MOE_ROOT}/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_fp4_fp4.cu
     ${TRTLLM_MOE_ROOT}/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_tma_warp_specialized_input.cu
     ${TRTLLM_MOE_ROOT}/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_mixed_utils.cu
@@ -896,22 +896,22 @@ if("120a" IN_LIST SUROGATE_SERVE_CUDA_ARCHS OR SUROGATE_SERVE_CUDA_ARCHS STREQUA
     ${TRTLLM_MOE_ROOT}/fused_moe/cutlass_backend/cutlass_fused_moe_instantiation.cu
     ${TRTLLM_MOE_GENERATED}
     ${SERVE_ROOT}/ops/sparse_moe/trtllm/trtllm_moe.cu)
-  target_compile_definitions(ninfer_trtllm_moe PRIVATE
+  target_compile_definitions(sinfer_trtllm_moe PRIVATE
     COMPILE_BLACKWELL_TMA_GEMMS COMPILE_BLACKWELL_SM120_TMA_GROUPED_GEMMS
     ENABLE_BF16 ENABLE_FP8 ENABLE_FP4 USING_OSS_CUTLASS_MOE_GEMM CUTLASS_ENABLE_GDC_FOR_SM100=1
     FLASHINFER_ENABLE_BF16 FLASHINFER_ENABLE_F16 FLASHINFER_ENABLE_FP8_E4M3
     FLASHINFER_ENABLE_FP8_E5M2 FLASHINFER_ENABLE_FP8_E8M0 FLASHINFER_ENABLE_FP4_E2M1)
-  target_compile_options(ninfer_trtllm_moe PRIVATE
+  target_compile_options(sinfer_trtllm_moe PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
     $<$<COMPILE_LANGUAGE:CUDA>:-static-global-template-stub=false>
     $<$<COMPILE_LANGUAGE:CUDA>:--threads=${SUROGATE_NVCC_THREADS}>
     $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 else()
-  add_library(ninfer_trtllm_moe STATIC EXCLUDE_FROM_ALL
+  add_library(sinfer_trtllm_moe STATIC EXCLUDE_FROM_ALL
     ${SERVE_ROOT}/ops/sparse_moe/trtllm/trtllm_moe_stub.cpp)
 endif()
-ninfer_internal_includes(ninfer_trtllm_moe)
-target_include_directories(ninfer_trtllm_moe PRIVATE
+sinfer_internal_includes(sinfer_trtllm_moe)
+target_include_directories(sinfer_trtllm_moe PRIVATE
   ${TRTLLM_MOE_ROOT}
   ${TRTLLM_MOE_ROOT}/nv_internal
   ${TRTLLM_MOE_ROOT}/nv_internal/include
@@ -924,16 +924,16 @@ target_include_directories(ninfer_trtllm_moe PRIVATE
   ${cutlass_SOURCE_DIR}/tools/util/include
   # cutlass's host-compiled headers reach for libcudacxx; nvcc finds CCCL itself, g++ does not.
   ${CUDAToolkit_INCLUDE_DIRS}/cccl)
-set_target_properties(ninfer_trtllm_moe PROPERTIES
+set_target_properties(sinfer_trtllm_moe PROPERTIES
   CUDA_SEPARABLE_COMPILATION OFF
   CUDA_RESOLVE_DEVICE_SYMBOLS OFF
   CUDA_STANDARD 17
   CXX_STANDARD 17)
-target_link_libraries(ninfer_trtllm_moe PRIVATE ninfer_core CUDA::cudart CUDA::cuda_driver)
+target_link_libraries(sinfer_trtllm_moe PRIVATE sinfer_core CUDA::cudart CUDA::cuda_driver)
 
 # Shared mathematical Ops. The list is intentionally explicit: adding a
 # source is a build-boundary decision, not an accidental recursive-glob side effect.
-add_library(ninfer_ops STATIC EXCLUDE_FROM_ALL
+add_library(sinfer_ops STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/launcher/add_bias.cu
   ${SERVE_ROOT}/ops/launcher/argmax.cu
   ${SERVE_ROOT}/ops/launcher/cast.cu
@@ -1177,70 +1177,70 @@ set_source_files_properties(
   ${SERVE_ROOT}/ops/sparse_moe/marlin/marlin_moe_kernels_generated.cu
   PROPERTIES COMPILE_OPTIONS
   "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;-static-global-template-stub=false>")
-ninfer_internal_includes(ninfer_ops)
+sinfer_internal_includes(sinfer_ops)
 # surogate vendor patch (PATCHES.md #25): cutlass headers for the sm_120a
 # blockscaled NVFP4 GEMM TU. Points at the flashinfer-shipped cutlass by
 # default; vendoring a snapshot is tracked.
 # cutlass comes from the main project's FetchContent (v4.6.1).
-set(NINFER_CUTLASS_INCLUDE "${cutlass_SOURCE_DIR}/include")
+set(SINFER_CUTLASS_INCLUDE "${cutlass_SOURCE_DIR}/include")
 # The CPU expert-compute kernels carry their own AVX-512 code path (runtime-detected); the
 # rest of the engine stays generic x86-64.
 set_source_files_properties(${SERVE_ROOT}/ops/cpu_expert_compute/cpu_expert_compute.cpp PROPERTIES
   COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mf16c;-mfma")
 set_source_files_properties(${SERVE_ROOT}/ops/linear/w8a8/w4fp4_cutlass_gemm.cu PROPERTIES
-    INCLUDE_DIRECTORIES "${NINFER_CUTLASS_INCLUDE};${cutlass_SOURCE_DIR}/tools/util/include"
+    INCLUDE_DIRECTORIES "${SINFER_CUTLASS_INCLUDE};${cutlass_SOURCE_DIR}/tools/util/include"
     COMPILE_OPTIONS "--expt-relaxed-constexpr")
-ninfer_cuda_archive(ninfer_ops)
-target_link_libraries(ninfer_ops PUBLIC ninfer_core PRIVATE ninfer_nvfp4_tma ninfer_trtllm_moe CUDA::cublasLt)
+sinfer_cuda_archive(sinfer_ops)
+target_link_libraries(sinfer_ops PUBLIC sinfer_core PRIVATE sinfer_nvfp4_tma sinfer_trtllm_moe CUDA::cublasLt)
 
 # Product-independent text and media mechanisms.
-add_library(ninfer_text STATIC EXCLUDE_FROM_ALL
+add_library(sinfer_text STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/text/unicode.cpp
   ${SUROGATE_VENDOR_DIR}/utf8proc/utf8proc.c)
-ninfer_internal_includes(ninfer_text)
+sinfer_internal_includes(sinfer_text)
 
 # surogate vendor patch (csrc/src/serve/PATCHES.md): stub decode without FFmpeg.
-if(NINFER_ENABLE_FFMPEG)
-  add_library(ninfer_media_decode STATIC EXCLUDE_FROM_ALL
+if(SINFER_ENABLE_FFMPEG)
+  add_library(sinfer_media_decode STATIC EXCLUDE_FROM_ALL
     ${SERVE_ROOT}/media/decode/decode.cpp)
-  ninfer_internal_includes(ninfer_media_decode)
-  target_link_libraries(ninfer_media_decode PRIVATE PkgConfig::FFMPEG)
+  sinfer_internal_includes(sinfer_media_decode)
+  target_link_libraries(sinfer_media_decode PRIVATE PkgConfig::FFMPEG)
 else()
-  add_library(ninfer_media_decode STATIC EXCLUDE_FROM_ALL
+  add_library(sinfer_media_decode STATIC EXCLUDE_FROM_ALL
     ${SERVE_ROOT}/media/decode/decode_stub.cpp)
-  ninfer_internal_includes(ninfer_media_decode)
+  sinfer_internal_includes(sinfer_media_decode)
 endif()
 
-if(NINFER_BUILD_MEDIA_ACQUIRE)
+if(SINFER_BUILD_MEDIA_ACQUIRE)
   # Product-only path/data/HTTP acquisition. No target package links this library.
-  add_library(ninfer_media_acquire STATIC EXCLUDE_FROM_ALL
+  add_library(sinfer_media_acquire STATIC EXCLUDE_FROM_ALL
     ${SERVE_ROOT}/product/media_acquire/acquire.cpp)
-  ninfer_internal_includes(ninfer_media_acquire)
-  target_link_libraries(ninfer_media_acquire PRIVATE PkgConfig::LIBCURL)
+  sinfer_internal_includes(sinfer_media_acquire)
+  target_link_libraries(sinfer_media_acquire PRIVATE PkgConfig::LIBCURL)
 endif()
 
-if(NINFER_BUILD_PROMPT_INPUT)
+if(SINFER_BUILD_PROMPT_INPUT)
   # Owning command-line message input shared by product entry points and target diagnostics.
-  add_library(ninfer_product_prompt_input STATIC EXCLUDE_FROM_ALL
+  add_library(sinfer_product_prompt_input STATIC EXCLUDE_FROM_ALL
     ${SERVE_ROOT}/product/prompt_input/prompt_input.cpp)
-  ninfer_internal_includes(ninfer_product_prompt_input)
-  target_link_libraries(ninfer_product_prompt_input PRIVATE ninfer_media_acquire)
+  sinfer_internal_includes(sinfer_product_prompt_input)
+  target_link_libraries(sinfer_product_prompt_input PRIVATE sinfer_media_acquire)
 endif()
 
-if(NINFER_BUILD_APPS OR BUILD_TESTING)
-  add_library(ninfer_product_load_progress STATIC EXCLUDE_FROM_ALL
+if(SINFER_BUILD_APPS OR BUILD_TESTING)
+  add_library(sinfer_product_load_progress STATIC EXCLUDE_FROM_ALL
     ${SERVE_ROOT}/product/load_progress/load_progress.cpp)
-  ninfer_internal_includes(ninfer_product_load_progress)
+  sinfer_internal_includes(sinfer_product_load_progress)
 endif()
 
 # One cold closed registry plus the opaque public product Engine. Family and exact-target
 # directories contribute their sources directly to this single compile owner below.
-add_library(ninfer_engine STATIC EXCLUDE_FROM_ALL
+add_library(sinfer_engine STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/targets/registry.cpp
   ${SERVE_ROOT}/runtime/contract/sampling.cpp
   ${SERVE_ROOT}/runtime/engine/engine.cpp)
-ninfer_internal_includes(ninfer_engine)
-target_include_directories(ninfer_engine PUBLIC ${SERVE_ROOT})
+sinfer_internal_includes(sinfer_engine)
+target_include_directories(sinfer_engine PUBLIC ${SERVE_ROOT})
 
 add_subdirectory(${SERVE_ROOT}/targets/qwen3_6 serve_t_qwen3_6 EXCLUDE_FROM_ALL)
 add_subdirectory(${SERVE_ROOT}/targets/qwen3_5_0_8b serve_t_qwen3_5_0_8b EXCLUDE_FROM_ALL)
@@ -1250,18 +1250,18 @@ add_subdirectory(${SERVE_ROOT}/targets/qwen3_6_27b serve_t_qwen3_6_27b EXCLUDE_F
 add_subdirectory(${SERVE_ROOT}/targets/qwen3_6_35b_a3b serve_t_qwen3_6_35b_a3b EXCLUDE_FROM_ALL)
 add_subdirectory(${SERVE_ROOT}/targets/qwen4exp serve_t_qwen4exp EXCLUDE_FROM_ALL)
 
-target_link_libraries(ninfer_engine
+target_link_libraries(sinfer_engine
   PRIVATE
-    ninfer_artifact
-    ninfer_core
-    ninfer_ops
-    ninfer_text
-    ninfer_media_decode)
-add_library(ninfer::engine ALIAS ninfer_engine)
+    sinfer_artifact
+    sinfer_core
+    sinfer_ops
+    sinfer_text
+    sinfer_media_decode)
+add_library(sinfer::engine ALIAS sinfer_engine)
 
-if(NINFER_BUILD_SERVE)
+if(SINFER_BUILD_SERVE)
   # HTTP protocol/product adapter. No serving header is part of the public API.
-  add_library(ninfer_serve STATIC EXCLUDE_FROM_ALL
+  add_library(sinfer_serve STATIC EXCLUDE_FROM_ALL
     ${SERVE_ROOT}/serve/openai_schema.cpp
     ${SERVE_ROOT}/serve/responses_schema.cpp
     ${SERVE_ROOT}/serve/anthropic_schema.cpp
@@ -1274,41 +1274,41 @@ if(NINFER_BUILD_SERVE)
     ${SERVE_ROOT}/serve/http_server.cpp
     ${SERVE_ROOT}/serve/responses_http.cpp
     ${SERVE_ROOT}/serve/serve_options.cpp)
-  ninfer_internal_includes(ninfer_serve)
-  target_include_directories(ninfer_serve PRIVATE
+  sinfer_internal_includes(sinfer_serve)
+  target_include_directories(sinfer_serve PRIVATE
     ${SUROGATE_VENDOR_DIR}/cpp-httplib)
-  target_link_libraries(ninfer_serve
-    PUBLIC ninfer_engine Threads::Threads
-    PRIVATE ninfer_media_acquire CUDA::cudart)
+  target_link_libraries(sinfer_serve
+    PUBLIC sinfer_engine Threads::Threads
+    PRIVATE sinfer_media_acquire CUDA::cudart)
 endif()
 
 
         # ---- serve executables (formerly src/serve/apps/CMakeLists.txt) ----
-add_executable(ninfer EXCLUDE_FROM_ALL   # surogate vendor patch (csrc/src/serve/PATCHES.md): product binary names.
+add_executable(sinfer EXCLUDE_FROM_ALL   # surogate vendor patch (csrc/src/serve/PATCHES.md): product binary names.
   ${SERVE_ROOT}/cli/main.cpp
   ${SERVE_ROOT}/cli/options.cpp)
-target_include_directories(ninfer PRIVATE
+target_include_directories(sinfer PRIVATE
   ${SERVE_ROOT}
   ${SERVE_ROOT}
   ${SUROGATE_VENDOR_DIR})
-target_link_libraries(ninfer PRIVATE
-  ninfer_engine
-  ninfer_product_load_progress
-  ninfer_product_prompt_input)
+target_link_libraries(sinfer PRIVATE
+  sinfer_engine
+  sinfer_product_load_progress
+  sinfer_product_prompt_input)
 
-add_executable(ninfer-serve EXCLUDE_FROM_ALL ${SERVE_ROOT}/server/main.cpp)
-target_include_directories(ninfer-serve PRIVATE
-  ${NINFER_JSON_INCLUDE}
+add_executable(sinfer-serve EXCLUDE_FROM_ALL ${SERVE_ROOT}/server/main.cpp)
+target_include_directories(sinfer-serve PRIVATE
+  ${SINFER_JSON_INCLUDE}
   ${SERVE_ROOT}
   ${SERVE_ROOT}
   ${SUROGATE_VENDOR_DIR}
   ${SUROGATE_VENDOR_DIR}/cpp-httplib)
-target_link_libraries(ninfer-serve PRIVATE ninfer_serve ninfer_product_load_progress)
+target_link_libraries(sinfer-serve PRIVATE sinfer_serve sinfer_product_load_progress)
 
 # surogate vendor patch (csrc/src/serve/PATCHES.md): the product binaries carry
-# surogate's name; NInfer attribution lives in NOTICE, not in process names.
-set_target_properties(ninfer PROPERTIES OUTPUT_NAME surogate-engine-cli)
-set_target_properties(ninfer-serve PROPERTIES OUTPUT_NAME surogate-engine)
+# surogate's name; SInfer attribution lives in NOTICE, not in process names.
+set_target_properties(sinfer PROPERTIES OUTPUT_NAME surogate-engine-cli)
+set_target_properties(sinfer-serve PROPERTIES OUTPUT_NAME surogate-engine)
 
 
         if(SUROGATE_SERVE_TESTS)
@@ -1324,9 +1324,9 @@ set_target_properties(ninfer-serve PROPERTIES OUTPUT_NAME surogate-engine)
             nanobind_add_module(_surogate_serve NOSTRIP
                 ${CMAKE_SOURCE_DIR}/src/binding/py_serve.cpp)
             target_include_directories(_surogate_serve PRIVATE
-                ${SERVE_ROOT} ${NINFER_JSON_INCLUDE})
+                ${SERVE_ROOT} ${SINFER_JSON_INCLUDE})
             target_link_libraries(_surogate_serve PRIVATE
-                ninfer_engine ninfer_product_prompt_input)
+                sinfer_engine sinfer_product_prompt_input)
             set_target_properties(_surogate_serve PROPERTIES EXCLUDE_FROM_ALL TRUE)
         endif()
 

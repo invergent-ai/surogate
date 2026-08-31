@@ -10,7 +10,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 using Geometry = Fp8MlpGateUpGeometry;
@@ -40,4 +40,4 @@ void fp8_linear_swiglu_decode_launch(const Tensor& x, const Weight& weight, Tens
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

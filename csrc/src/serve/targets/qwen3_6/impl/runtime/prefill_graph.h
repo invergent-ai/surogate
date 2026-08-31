@@ -36,7 +36,7 @@
 #include <map>
 #include <stdexcept>
 
-namespace ninfer::targets::qwen3_6::detail {
+namespace sinfer::targets::qwen3_6::detail {
 
 struct PrefillGraphIngress {
     std::int32_t base        = 0; // absolute position of the chunk's first token
@@ -217,4 +217,4 @@ private:
     std::size_t graph_bytes_ = 0;
 };
 
-} // namespace ninfer::targets::qwen3_6::detail
+} // namespace sinfer::targets::qwen3_6::detail

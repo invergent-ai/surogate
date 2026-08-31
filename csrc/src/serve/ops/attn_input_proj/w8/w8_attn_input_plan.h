@@ -7,7 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 enum class W8AttnInputScheduleId {
     DecodeR8Direct,
@@ -48,4 +48,4 @@ void w8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Te
 void w8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k, Tensor& v,
                             cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

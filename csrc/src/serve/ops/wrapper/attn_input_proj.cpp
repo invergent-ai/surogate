@@ -19,7 +19,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 namespace {
 
 
@@ -323,4 +323,4 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tens
     detail::w8_attn_input_dispatch(x, query_key_value_weight, q, k, v, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

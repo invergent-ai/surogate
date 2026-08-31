@@ -10,7 +10,7 @@
 
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 template <class Geometry, class Schedule, bool FullTokens>
@@ -25,7 +25,7 @@ void launch_variant(const Tensor& x, const Weight& weight, Tensor& out, cudaStre
                                          Geometry::kOutputRows};
 
     if constexpr (Schedule::kSharedBytes > 48 * 1024) {
-        CUDA_CHECK(::ninfer::ops::set_func_attribute_per_device(
+        CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(
             bf16_gemm_mma_kernel<Geometry, Schedule, FullTokens, Bf16MmaContiguousOutput>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, Schedule::kSharedBytes));
     }
@@ -60,4 +60,4 @@ void launch_bf16_mma(const Tensor& x, const Weight& weight, Tensor& out, cudaStr
     throw std::invalid_argument("bf16 linear MMA: unsupported exact problem");
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

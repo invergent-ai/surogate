@@ -19,7 +19,7 @@
 #include <utility>
 #include <variant>
 
-namespace ninfer {
+namespace sinfer {
 
 
 // The ops layer bounds batched work by kMaximumBatchColumns; the serving
@@ -425,4 +425,4 @@ void Engine::reset_memory_peaks() noexcept {
         impl_->executor);
 }
 
-} // namespace ninfer
+} // namespace sinfer

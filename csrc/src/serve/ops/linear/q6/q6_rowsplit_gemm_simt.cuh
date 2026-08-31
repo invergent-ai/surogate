@@ -23,7 +23,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 template <int RowsPerCta_, int ColsPerTile_, int GroupsPerStage_, int PipelineStages_,
           Cache CodeCache_, int LaunchBoundsMinBlocks_>
@@ -281,4 +281,4 @@ __global__ __launch_bounds__(
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

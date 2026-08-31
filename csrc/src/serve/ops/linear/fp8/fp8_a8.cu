@@ -15,7 +15,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 template <class ActivationGeometry, int Threads = 256>
@@ -80,7 +80,7 @@ void launch_mma(const Weight& weight, Tensor& out, Fp8A8Workspace workspace, std
     const Fp8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), Geometry::kOutputRows};
 
     if constexpr (Schedule::kSharedBytes > 48 * 1024) {
-        CUDA_CHECK(::ninfer::ops::set_func_attribute_per_device(
+        CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(
             fp8_mma_kernel<Geometry, Schedule, FullTokens, Fp8IdentityEpilogue,
                            Fp8ContiguousOutput>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, Schedule::kSharedBytes));
@@ -176,4 +176,4 @@ void launch_fp8_a8(const Tensor& x, const Weight& weight, Tensor& out, Fp8A8Work
     throw std::logic_error("FP8 vocabulary has no A8 route");
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

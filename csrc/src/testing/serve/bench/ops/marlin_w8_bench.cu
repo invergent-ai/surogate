@@ -27,12 +27,12 @@
         }                                                                              \
     } while (0)
 
-using ninfer::ops::detail::marlin_b_out_words;
-using ninfer::ops::detail::marlin_c_tmp_floats;
-using ninfer::ops::detail::marlin_gemm_bf16;
-using ninfer::ops::detail::marlin_repack_fp8_row;
-using ninfer::ops::detail::marlin_repack_w8g32;
-using ninfer::ops::detail::marlin_workspace_locks_count;
+using sinfer::ops::detail::marlin_b_out_words;
+using sinfer::ops::detail::marlin_c_tmp_floats;
+using sinfer::ops::detail::marlin_gemm_bf16;
+using sinfer::ops::detail::marlin_repack_fp8_row;
+using sinfer::ops::detail::marlin_repack_w8g32;
+using sinfer::ops::detail::marlin_workspace_locks_count;
 
 int main() {
     int sms = 0;

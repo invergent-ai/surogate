@@ -10,7 +10,7 @@
 #include <cstdint>
 #include <optional>
 
-namespace ninfer::targets::qwen3_6 {
+namespace sinfer::targets::qwen3_6 {
 
 inline constexpr std::uint32_t kMtpDecodeMaximumDrafts    = 5;
 inline constexpr std::uint32_t kMtpDecodeMaximumWidth     = kMtpDecodeMaximumDrafts + 1;
@@ -314,4 +314,4 @@ struct RoundState {
     RoundState(DeviceSpan backing, const RoundStateLayout& layout);
 };
 
-} // namespace ninfer::targets::qwen3_6
+} // namespace sinfer::targets::qwen3_6

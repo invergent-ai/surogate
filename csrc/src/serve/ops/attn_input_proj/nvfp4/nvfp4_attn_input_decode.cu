@@ -6,7 +6,7 @@
 
 #include <cuda_bf16.h>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 /// The fused [query | key | gate | value] row layout of one attention projection. The 27B
@@ -74,4 +74,4 @@ void nvfp4_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tenso
     launch<Nvfp4AttnInputGeometry, 6144, 1024>(x, weight, q, gate, k, v, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

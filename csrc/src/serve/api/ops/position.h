@@ -6,7 +6,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 /**
  * Op: fill_i32_positions
@@ -51,4 +51,4 @@ void fill_i32_positions(Tensor& positions, std::int32_t start, cudaStream_t stre
 void offset_i32_positions(const Tensor& source, const Tensor& delta, Tensor& destination,
                           cudaStream_t stream);
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

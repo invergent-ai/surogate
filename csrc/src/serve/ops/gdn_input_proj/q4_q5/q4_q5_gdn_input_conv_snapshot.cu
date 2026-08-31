@@ -15,7 +15,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 constexpr int kHidden      = 5120;
@@ -387,4 +387,4 @@ void q4_q5_gdn_input_conv_record_launch(const Tensor& x, const Weight& qk_weight
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

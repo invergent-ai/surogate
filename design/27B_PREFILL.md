@@ -25,7 +25,7 @@ were profiled on 2026-08-27 and neither has been addressed:
 
 Two measurements, an hour apart, took this item apart.
 
-**The kernels were never the limit.** `ninfer_bench` — same binary, same card, no server, no
+**The kernels were never the limit.** `sinfer_bench` — same binary, same card, no server, no
 scheduler — does 12,707 prompt tok/s at pp2048 (13,108 at pp512), *above* vLLM's served 11,818.
 
 **And neither was serving.** Re-measured with the current binary at 100 users, chunk 4,096 and
@@ -60,7 +60,7 @@ knob — more KV, not more kernel.
 
 
 
-`ninfer_bench` runs the same engine with no server, no scheduler and no concurrency:
+`sinfer_bench` runs the same engine with no server, no scheduler and no concurrency:
 
 | shape | 27B kernels | 27B served @100 users | vLLM served @100 users |
 |---|---:|---:|---:|
@@ -105,7 +105,7 @@ The scan's chunk width is chosen for decode. At 2,048-token prompts the same ker
 `sequence_chunks` and the chunked-scan geometry are the knobs; the risk is register pressure
 and the recurrent state's working set, which is why it was left alone.
 
-**Measure first**: `ninfer_bench -p 2048 -n 16` on the 27B gives the prompt-processing rate in
+**Measure first**: `sinfer_bench -p 2048 -n 16` on the 27B gives the prompt-processing rate in
 seconds, and `SUROGATE_SERVE_ROUND_TIMING=1` splits a served round. Sweep the scan width
 offline against the bench before touching the server.
 

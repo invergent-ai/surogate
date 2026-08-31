@@ -1,4 +1,4 @@
-"""Typed binding of a generic NInfer artifact to the Qwen3.6-27B target.
+"""Typed binding of a generic SInfer artifact to the Qwen3.6-27B target.
 
 The converter and this module deliberately implement the target contract on
 opposite sides of the artifact boundary.  Binding resolves persistent names

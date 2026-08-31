@@ -5,7 +5,7 @@
 
 #include <cuda_runtime.h>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 /**
  * Returns the caller-owned transient capacity for every legal patch/segment pair in the supplied
@@ -47,4 +47,4 @@ void vision_attention(const Tensor& q, const Tensor& k, const Tensor& v, const T
 void vision_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                       std::int32_t segment_length, Tensor& out, cudaStream_t stream);
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

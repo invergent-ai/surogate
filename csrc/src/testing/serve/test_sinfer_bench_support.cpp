@@ -1,4 +1,4 @@
-#include "ninfer_bench_support.h"
+#include "sinfer_bench_support.h"
 
 #include <nlohmann/json.hpp>
 
@@ -17,7 +17,7 @@
 namespace {
 
 using Json   = nlohmann::json;
-namespace qb = ninfer::bench;
+namespace qb = sinfer::bench;
 
 int fail(std::string_view message) {
     std::cerr << message << '\n';
@@ -62,9 +62,9 @@ qb::BenchOptions parse_for_test(std::vector<std::string> arguments) {
 int test_cli_contract() {
     int failures                  = 0;
     const qb::BenchOptions parsed = parse_for_test({
-        "ninfer_bench",
+        "sinfer_bench",
         "--weights",
-        "model.ninfer",
+        "model.sinfer",
         "-p",
         "128,512",
         "-n",
@@ -94,7 +94,7 @@ int test_cli_contract() {
         "report.json",
     });
 
-    failures += expect_string(parsed.artifact_path, "model.ninfer", "artifact path");
+    failures += expect_string(parsed.artifact_path, "model.sinfer", "artifact path");
     failures += expect(parsed.n_prompt == std::vector<int>({128, 512}), "prompt list");
     failures += expect(parsed.n_gen == std::vector<int>({64}), "generation list");
     failures += expect(parsed.prompt_gen == std::vector<std::pair<int, int>>({{2048, 128}}),
@@ -102,10 +102,10 @@ int test_cli_contract() {
     failures += expect(parsed.repetitions == 3 && parsed.warmup == 2, "repetition settings");
     failures += expect(parsed.max_context == std::optional<std::uint32_t>(4096), "max context");
     failures += expect(parsed.prefill_chunk == 128, "prefill chunk");
-    failures += expect(parsed.kv_cache == ninfer::KvCacheStorage::Int8Group64, "INT8 KV");
+    failures += expect(parsed.kv_cache == sinfer::KvCacheStorage::Int8Group64, "INT8 KV");
     failures += expect(parsed.mtp_draft_tokens == 5, "MTP window");
     failures +=
-        expect(parsed.proposal_head == ninfer::ProposalHead::Optimized, "optimized proposal head");
+        expect(parsed.proposal_head == sinfer::ProposalHead::Optimized, "optimized proposal head");
     failures += expect(parsed.device == 1 && !parsed.use_cuda_graph, "device and graph settings");
     failures += expect(parsed.profile_measured, "profile-measured flag");
     failures +=
@@ -116,33 +116,33 @@ int test_cli_contract() {
     failures +=
         expect(defaults.size() == 2 && defaults[0].label == "pp512" && defaults[1].label == "tg128",
                "default pp/tg matrix");
-    failures += expect(qb::usage_text("ninfer_bench").find("artifact.ninfer") != std::string::npos,
+    failures += expect(qb::usage_text("sinfer_bench").find("artifact.sinfer") != std::string::npos,
                        "help names native artifact");
-    failures += expect(parse_for_test({"ninfer_bench", "--help"}).help_requested, "help flag");
+    failures += expect(parse_for_test({"sinfer_bench", "--help"}).help_requested, "help flag");
 
-    failures += expect_throws<std::invalid_argument>([] { (void)parse_for_test({"ninfer_bench"}); },
+    failures += expect_throws<std::invalid_argument>([] { (void)parse_for_test({"sinfer_bench"}); },
                                                      "missing artifact");
     failures += expect_throws<std::invalid_argument>(
         [] {
-            (void)parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--lm-head-draft"});
+            (void)parse_for_test({"sinfer_bench", "--weights", "model.sinfer", "--lm-head-draft"});
         },
         "optimized head without MTP");
     failures += expect_throws<std::invalid_argument>(
         [] {
             (void)parse_for_test(
-                {"ninfer_bench", "--weights", "model.ninfer", "--mtp-draft-tokens", "6"});
+                {"sinfer_bench", "--weights", "model.sinfer", "--mtp-draft-tokens", "6"});
         },
         "unsupported MTP window");
     failures += expect_throws<std::invalid_argument>(
         [] {
             (void)parse_for_test(
-                {"ninfer_bench", "--weights", "model.ninfer", "--prefill-chunk", "129"});
+                {"sinfer_bench", "--weights", "model.sinfer", "--prefill-chunk", "129"});
         },
         "misaligned prefill chunk");
     failures += expect_throws<std::invalid_argument>(
         [] {
             (void)parse_for_test(
-                {"ninfer_bench", "--weights", "model.ninfer", "--kv-dtype", "fp8"});
+                {"sinfer_bench", "--weights", "model.sinfer", "--kv-dtype", "fp8"});
         },
         "unsupported KV storage");
     return failures;
@@ -179,7 +179,7 @@ int test_measurement_contract() {
     return failures;
 }
 
-ninfer::GenerationTimings timings(double prepare, double prefill, double decode, double total) {
+sinfer::GenerationTimings timings(double prepare, double prefill, double decode, double total) {
     return {.prepare_seconds = prepare,
             .vision_seconds  = 0.0,
             .prefill_seconds = prefill,
@@ -187,7 +187,7 @@ ninfer::GenerationTimings timings(double prepare, double prefill, double decode,
             .total_seconds   = total};
 }
 
-ninfer::SpeculativeStats speculative(std::uint64_t rounds, std::uint64_t drafted,
+sinfer::SpeculativeStats speculative(std::uint64_t rounds, std::uint64_t drafted,
                                      std::uint64_t accepted, std::uint64_t fallback,
                                      std::vector<std::uint64_t> per_position) {
     return {.enabled               = true,
@@ -222,7 +222,7 @@ qb::BenchEnvironment sample_environment() {
     env.cuda_runtime_version              = "13.1";
     env.cuda_driver_version               = "590.1";
     env.device_id                         = 0;
-    env.artifact_path                     = "model.ninfer";
+    env.artifact_path                     = "model.sinfer";
     env.artifact_file_size_bytes          = 17500000000ULL;
     env.load                              = {.target               = "qwen3_6_27b",
                                              .weights_id           = "groupwise-int",
@@ -236,7 +236,7 @@ qb::BenchEnvironment sample_environment() {
     env.memory.device                     = 0;
     env.memory.max_context                = 4096;
     env.memory.kv_capacity                = 8192;
-    env.memory.kv_cache                   = ninfer::KvCacheStorage::Int8Group64;
+    env.memory.kv_cache                   = sinfer::KvCacheStorage::Int8Group64;
     env.memory.weights                    = {17400000000ULL, 17400000000ULL, 17400000000ULL};
     env.memory.sequence                   = {2000000000ULL, 1900000000ULL, 1900000000ULL};
     env.memory.workspace                  = {100000000ULL, 0, 0};
@@ -245,9 +245,9 @@ qb::BenchEnvironment sample_environment() {
     env.memory.kv_payload_bytes           = 123456ULL;
     env.max_context                       = 4096;
     env.prefill_chunk                     = 1024;
-    env.kv_cache                          = ninfer::KvCacheStorage::Int8Group64;
+    env.kv_cache                          = sinfer::KvCacheStorage::Int8Group64;
     env.mtp_draft_tokens                  = 5;
-    env.proposal_head                     = ninfer::ProposalHead::Optimized;
+    env.proposal_head                     = sinfer::ProposalHead::Optimized;
     env.use_cuda_graph                    = true;
     env.decode_graph_primed               = true;
     env.decode_graph_prime_output_tokens  = 13;
@@ -265,14 +265,14 @@ int test_report_contract() {
     Json report;
     try {
         report = Json::parse(qb::format_json(
-            env, "ninfer_bench --weights model.ninfer --mtp-draft-tokens 5", results));
+            env, "sinfer_bench --weights model.sinfer --mtp-draft-tokens 5", results));
     } catch (const nlohmann::json::exception& error) {
         return fail(std::string("invalid benchmark JSON: ") + error.what());
     }
 
     failures += expect(report.at("schema_version") == 11, "report schema v11");
-    failures += expect(report.at("artifact_type") == "ninfer_bench_report", "report identity");
-    failures += expect(report.at("artifact").at("path") == "model.ninfer", "artifact path");
+    failures += expect(report.at("artifact_type") == "sinfer_bench_report", "report identity");
+    failures += expect(report.at("artifact").at("path") == "model.sinfer", "artifact path");
     failures += expect(report.at("load").at("target") == "qwen3_6_27b", "load target");
     failures += expect(report.at("load").at("weights_id") == "groupwise-int", "load weights id");
     failures +=
@@ -331,7 +331,7 @@ int test_human_and_csv_reports() {
     const std::string table        = qb::format_table(env, results);
     failures += expect(table.find("qwen3_6_27b") != std::string::npos, "table target");
     failures += expect(table.find("groupwise-int") != std::string::npos, "table weights id");
-    failures += expect(table.find("model.ninfer") != std::string::npos, "table artifact");
+    failures += expect(table.find("model.sinfer") != std::string::npos, "table artifact");
     failures +=
         expect(table.find("proposal_head=optimized") != std::string::npos, "table proposal head");
     failures +=
@@ -361,5 +361,5 @@ int main() {
     failures += test_measurement_contract();
     failures += test_report_contract();
     failures += test_human_and_csv_reports();
-    return failures == 0 ? 0 : fail("ninfer_bench support contract failed");
+    return failures == 0 ? 0 : fail("sinfer_bench support contract failed");
 }

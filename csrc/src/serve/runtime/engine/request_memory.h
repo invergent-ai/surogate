@@ -6,7 +6,7 @@
 #include <cstddef>
 #include <memory>
 
-namespace ninfer {
+namespace sinfer {
 
 struct DeviceContext;
 
@@ -39,4 +39,4 @@ private:
 };
 
 } // namespace runtime
-} // namespace ninfer
+} // namespace sinfer

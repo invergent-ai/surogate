@@ -4,7 +4,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 struct Fp8AddResidualEpilogue {
     const __nv_bfloat16* residual;
@@ -16,4 +16,4 @@ struct Fp8AddResidualEpilogue {
     }
 };
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

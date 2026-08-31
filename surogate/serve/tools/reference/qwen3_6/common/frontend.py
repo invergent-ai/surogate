@@ -63,7 +63,7 @@ class Frontend:
                 resources.video_preprocessor_config_json,
             ),
         )
-        with tempfile.TemporaryDirectory(prefix="ninfer-frontend-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="sinfer-frontend-") as temporary:
             directory = Path(temporary)
             for filename, resource in files:
                 (directory / filename).write_bytes(binding.resource_bytes(resource))

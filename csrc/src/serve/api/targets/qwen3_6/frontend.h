@@ -10,7 +10,7 @@
 #include <span>
 #include <vector>
 
-namespace ninfer::targets::qwen3_6 {
+namespace sinfer::targets::qwen3_6 {
 
 inline constexpr std::size_t kTokenDomain = 248077;
 
@@ -145,4 +145,4 @@ private:
 
 [[nodiscard]] Frontend make_frontend(const FrontendResources& resources, FrontendOptions options);
 
-} // namespace ninfer::targets::qwen3_6
+} // namespace sinfer::targets::qwen3_6

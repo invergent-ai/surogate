@@ -1,4 +1,4 @@
-// ninfer::ops - gdn_gating wrapper: public api validation and launcher dispatch.
+// sinfer::ops - gdn_gating wrapper: public api validation and launcher dispatch.
 #include "api/ops/gdn_gating.h"
 
 #include "ops/launcher/gdn_gating.h" // detail::gdn_gating_launch
@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 namespace {
 
 std::int64_t numel_allow_zero(const Tensor& t, const char* label) {
@@ -98,4 +98,4 @@ void gdn_gating(const Tensor& a, const Tensor& b, const Tensor& A_log, const Ten
     detail::gdn_gating_launch(a, b, A_log, dt_bias, g, beta, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

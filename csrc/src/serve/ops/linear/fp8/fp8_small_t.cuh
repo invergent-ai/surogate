@@ -11,7 +11,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 enum class Fp8SmallTFinalization : std::uint8_t {
     Elementwise,
@@ -250,4 +250,4 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

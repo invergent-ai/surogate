@@ -9,7 +9,7 @@
 #include <cstddef>
 #include <optional>
 
-namespace ninfer {
+namespace sinfer {
 
 class DeviceArena;
 
@@ -105,4 +105,4 @@ struct ModelView {
 };
 
 } // namespace targets::qwen3_6
-} // namespace ninfer
+} // namespace sinfer

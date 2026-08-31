@@ -4,7 +4,7 @@
 #include <string>
 #include <vector>
 
-namespace ninfer::product::media_acquire {
+namespace sinfer::product::media_acquire {
 
 enum class SourceKind {
     Path,
@@ -20,4 +20,4 @@ struct Source {
     std::vector<std::uint8_t> bytes;
 };
 
-} // namespace ninfer::product::media_acquire
+} // namespace sinfer::product::media_acquire

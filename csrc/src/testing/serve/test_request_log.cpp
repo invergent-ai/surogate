@@ -16,7 +16,7 @@
 
 namespace {
 
-using namespace ninfer::serve;
+using namespace sinfer::serve;
 using Json = nlohmann::json;
 
 int check(bool condition, const char* message) {
@@ -32,38 +32,38 @@ int main() {
 
     bool protected_artifact_rejected = false;
     try {
-        JsonlRequestLog unsafe("same-path.ninfer", "same-path.ninfer");
+        JsonlRequestLog unsafe("same-path.sinfer", "same-path.sinfer");
     } catch (const std::invalid_argument&) { protected_artifact_rejected = true; }
     failures += check(protected_artifact_rejected,
                       "request log accepted the model artifact as its output path");
 
     ServeOptions options;
-    options.artifact_path                  = "/models/qwen3_6_27b.ninfer";
+    options.artifact_path                  = "/models/qwen3_6_27b.sinfer";
     options.host                           = "127.0.0.1";
     options.port                           = 8123;
     options.api_key                        = "must-not-appear";
     options.model_id_override              = "deployment-alias";
     options.request_log_jsonl              = "requests.jsonl";
     options.max_context                    = 262144;
-    options.kv_capacity                    = ninfer::KvCapacityPolicy::explicit_capacity(524288);
+    options.kv_capacity                    = sinfer::KvCapacityPolicy::explicit_capacity(524288);
     options.prefill_chunk                  = 1024;
     options.log_stats_interval_ms          = 2500;
-    options.kv_cache                       = ninfer::KvCacheStorage::Int8Group64;
-    options.speculative.backend            = ninfer::SpeculativeBackend::Mtp;
+    options.kv_cache                       = sinfer::KvCacheStorage::Int8Group64;
+    options.speculative.backend            = sinfer::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens       = 3;
-    options.speculative.proposal_head      = ninfer::ProposalHead::Optimized;
+    options.speculative.proposal_head      = sinfer::ProposalHead::Optimized;
     options.enable_vision                  = false;
     options.allow_prefix_reuse             = false;
     options.preserve_thinking              = true;
     options.sampling_overrides.temperature = 0.6F;
-    options.startup_argv = {"ninfer-serve", options.artifact_path, "--api-key", "<redacted>"};
+    options.startup_argv = {"sinfer-serve", options.artifact_path, "--api-key", "<redacted>"};
 
-    const ninfer::ModelSamplingDefaults sampling_defaults{
+    const sinfer::ModelSamplingDefaults sampling_defaults{
         .thinking     = {.temperature = 1.0F, .top_k = 20, .top_p = 0.95F},
         .non_thinking = {.temperature = 0.7F, .top_k = 20, .top_p = 0.8F, .presence_penalty = 1.5F},
     };
 
-    ninfer::LoadSummary load;
+    sinfer::LoadSummary load;
     load.target               = "qwen3_6_27b";
     load.model_id             = "qwen3.6-27b";
     load.weights_id           = "groupwise-int";
@@ -75,13 +75,13 @@ int main() {
     load.tensor_count         = 42;
     load.resource_count       = 6;
 
-    ninfer::MemorySummary memory;
+    sinfer::MemorySummary memory;
     memory.max_context                       = 262144;
-    memory.kv_capacity_mode                  = ninfer::KvCapacityMode::Explicit;
+    memory.kv_capacity_mode                  = sinfer::KvCapacityMode::Explicit;
     memory.kv_capacity                       = 524288;
     memory.kv_capacity_page_groups           = 8192;
     memory.kv_capacity_max_page_groups       = 16384;
-    memory.kv_cache                          = ninfer::KvCacheStorage::Int8Group64;
+    memory.kv_cache                          = sinfer::KvCacheStorage::Int8Group64;
     memory.weights.capacity_bytes            = 100;
     memory.sequence.capacity_bytes           = 200;
     memory.workspace.capacity_bytes          = 300;
@@ -251,7 +251,7 @@ int main() {
     GenerationOutcome outcome;
     outcome.prompt_tokens                       = 401;
     outcome.completion_tokens                   = 1024;
-    outcome.finish_reason                       = ninfer::FinishReason::OutputLimit;
+    outcome.finish_reason                       = sinfer::FinishReason::OutputLimit;
     outcome.metrics.prepare_seconds             = 0.1234567890123;
     outcome.metrics.ttft_seconds                = 0.3580246791357;
     outcome.metrics.vision_seconds              = 0.0;
@@ -259,8 +259,8 @@ int main() {
     outcome.metrics.decode_seconds              = 5.3456789012345;
     outcome.metrics.total_seconds               = 5.7037035803702;
     outcome.metrics.prefix_cache_hit_tokens     = 101;
-    outcome.metrics.prefix_reuse_path           = ninfer::PrefixReusePath::RestoreTurnCheckpoint;
-    outcome.metrics.speculative_backend         = ninfer::SpeculativeBackend::Mtp;
+    outcome.metrics.prefix_reuse_path           = sinfer::PrefixReusePath::RestoreTurnCheckpoint;
+    outcome.metrics.speculative_backend         = sinfer::SpeculativeBackend::Mtp;
     outcome.metrics.speculative_draft_window    = 3;
     outcome.metrics.speculative_rounds          = 300;
     outcome.metrics.speculative_draft_tokens    = 900;
@@ -276,7 +276,7 @@ int main() {
                       "computed prefill tokens missing");
     failures += check(done.at("result").at("prefix_reuse_path") == "restore_turn_checkpoint",
                       "prefix reuse path missing");
-    outcome.metrics.prefix_reuse_path = ninfer::PrefixReusePath::RestoreResponseCheckpoint;
+    outcome.metrics.prefix_reuse_path = sinfer::PrefixReusePath::RestoreResponseCheckpoint;
     const Json response_restore =
         Json::parse(format_request_done_json("serve-test", 3001, context, outcome));
     failures += check(response_restore.at("result").at("prefix_reuse_path") ==
@@ -348,7 +348,7 @@ int main() {
 
     const std::filesystem::path log_path =
         std::filesystem::temp_directory_path() /
-        ("ninfer-request-log-test-" + std::to_string(static_cast<long long>(::getpid())) +
+        ("sinfer-request-log-test-" + std::to_string(static_cast<long long>(::getpid())) +
          ".jsonl");
     std::filesystem::remove(log_path);
     {

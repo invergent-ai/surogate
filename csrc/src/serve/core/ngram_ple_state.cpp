@@ -7,7 +7,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer {
+namespace sinfer {
 namespace {
 
 constexpr std::size_t kArenaAlign = 256;
@@ -76,4 +76,4 @@ void NgramPleStatePool::reset_slot(std::int32_t slot, cudaStream_t stream) {
     CUDA_CHECK(cudaMemsetAsync(conv_slot.data, 0, conv_slot.bytes(), stream));
 }
 
-} // namespace ninfer
+} // namespace sinfer

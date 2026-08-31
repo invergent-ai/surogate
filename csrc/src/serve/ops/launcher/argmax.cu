@@ -1,4 +1,4 @@
-// Implements: include/ninfer/ops/argmax.h
+// Implements: include/sinfer/ops/argmax.h
 // Match: validated contiguous BF16 logits and I32 output.
 // Algorithm assumptions: one tile uses a direct reduction; larger domains use
 // zero-initialized atomic winners across route-selected row tiles.
@@ -11,7 +11,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 constexpr std::int32_t kFullPhysicalRows      = 248320;
@@ -80,4 +80,4 @@ void argmax_tiled_atomic_launch(const Tensor& logits, Tensor& out, std::int32_t 
 }
 
 } // namespace
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

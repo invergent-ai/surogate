@@ -9,7 +9,7 @@
 
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 template <class Geometry>
@@ -53,4 +53,4 @@ void launch_fp8_decode(const Tensor& x, const Weight& weight, Tensor& out, cudaS
     throw std::logic_error("FP8 vocabulary decode uses its A16 MMA route");
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

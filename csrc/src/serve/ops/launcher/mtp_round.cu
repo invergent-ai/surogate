@@ -1,4 +1,4 @@
-// Implements: include/ninfer/ops/mtp_round.h
+// Implements: include/sinfer/ops/mtp_round.h
 // Match: validated request-major K=1..5 MTP round transition.
 #include "ops/launcher/mtp_round.h"
 
@@ -7,7 +7,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 void mtp_prepare_next_round_launch(const Tensor& verify_ids, const Tensor& next_anchors,
                                    const Tensor& accepted, const Tensor& updated_frontiers,
@@ -39,4 +39,4 @@ void mtp_prepare_next_round_launch(const Tensor& verify_ids, const Tensor& next_
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

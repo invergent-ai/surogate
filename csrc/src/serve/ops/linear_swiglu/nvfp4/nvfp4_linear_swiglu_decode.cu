@@ -8,7 +8,7 @@
 
 #include <cuda_bf16.h>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 using Geometry = Nvfp4MlpGateUpGeometry;
@@ -74,4 +74,4 @@ void nvfp4_linear_swiglu_decode_launch(const Tensor& x, const Weight& weight, Te
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

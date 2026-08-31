@@ -5,7 +5,7 @@
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_gemv.cuh"
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 namespace {
 
@@ -54,4 +54,4 @@ void nvfp4_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor
     launch<Nvfp4GdnInputGeometry, Nvfp4GdnInputOutput>(x, weight, qkv, z, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

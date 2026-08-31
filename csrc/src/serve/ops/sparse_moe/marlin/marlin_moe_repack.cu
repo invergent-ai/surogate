@@ -19,7 +19,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 // Our codes: row-major [n, k/2], byte b of a row holds values 2b (low nibble) and 2b+1
@@ -113,9 +113,9 @@ void marlin_moe_repack_q4g64(const void* codes, const void* scales_f16, std::int
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 // moe_align_block_size in one block: our gather already sorts rows by expert, so the padded
@@ -165,9 +165,9 @@ void marlin_moe_build_routing(const std::int32_t* expert_offsets, std::int32_t n
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 // Marlin writes the raw [rows, 2*intermediate] gate/up product; our pipeline wants
@@ -200,4 +200,4 @@ void marlin_moe_silu_mul(const void* product, void* out, std::int32_t rows,
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

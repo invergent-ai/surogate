@@ -21,7 +21,7 @@
 
 #include <cuda_bf16.h>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 // surogate patch (PATCHES.md #25): pairing pass for the cutlass path
@@ -190,4 +190,4 @@ void w8a8_linear_swiglu_dispatch(const Tensor& x, const Weight& gate_up_weight, 
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

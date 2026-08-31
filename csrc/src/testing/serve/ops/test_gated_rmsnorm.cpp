@@ -7,9 +7,9 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
-using namespace ninfer::test::norm;
+using namespace sinfer;
+using namespace sinfer::test;
+using namespace sinfer::test::norm;
 
 namespace {
 

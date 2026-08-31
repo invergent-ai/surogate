@@ -10,7 +10,7 @@
 #include <algorithm>
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 enum class SparseMoeSmallTD3Schedule : std::uint8_t;
 enum class SparseMoeSmallTD4Schedule : std::uint8_t;
@@ -64,4 +64,4 @@ void sparse_moe_decode_launch(const SparseMoeGeometry& geometry, const Tensor& x
                               const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream,
                               const SparseMoeRoundHook* hook = nullptr);
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

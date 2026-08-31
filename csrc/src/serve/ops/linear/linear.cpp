@@ -16,7 +16,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 namespace {
 
 std::int64_t checked_numel(const Tensor& tensor, const char* label) {
@@ -173,4 +173,4 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) 
     dispatch_linear(x, w, out, LinearPolicy::A16Only, nullptr, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

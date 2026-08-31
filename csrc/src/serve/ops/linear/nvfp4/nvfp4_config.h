@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 enum class Nvfp4ScaleAccess : std::uint8_t {
     StagedRaw,
@@ -338,4 +338,4 @@ struct Nvfp4LinearSmallTProductionSchedule<Nvfp4Residual17408Geometry, ActiveTok
                             Nvfp4SmallTBlockOrder::RowsContiguous, 1>;
 };
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

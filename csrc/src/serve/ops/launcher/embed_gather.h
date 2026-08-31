@@ -1,12 +1,12 @@
 #pragma once
 
-// ninfer::ops::detail - private launch prototypes for embedding variants.
+// sinfer::ops::detail - private launch prototypes for embedding variants.
 
 #include "core/tensor.h"
 
 #include <cuda_runtime.h>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 enum class W8EmbedRoute {
     Auto,
@@ -26,4 +26,4 @@ void embed_gather_w8_2048_launch(const Tensor& ids, const Weight& table, Tensor&
                                  W8EmbedRoute route, cudaStream_t stream);
 const char* w8_embed_route_name(W8EmbedRoute route);
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

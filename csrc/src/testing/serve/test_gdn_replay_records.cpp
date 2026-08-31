@@ -37,7 +37,7 @@ int expect_size(std::size_t actual, std::size_t expected, const char* label) {
     return 1;
 }
 
-int expect_shape(const ninfer::Tensor& tensor, std::int32_t d0, std::int32_t d1, std::int32_t d2,
+int expect_shape(const sinfer::Tensor& tensor, std::int32_t d0, std::int32_t d1, std::int32_t d2,
                  std::int32_t d3, const char* label) {
     if (tensor.ne[0] == d0 && tensor.ne[1] == d1 && tensor.ne[2] == d2 && tensor.ne[3] == d3) {
         return 0;
@@ -55,9 +55,9 @@ int expect_throw(Fn&& fn, const char* label) {
     return 1;
 }
 
-std::size_t record_bytes(const ninfer::GdnReplayRecordSpec& spec) {
-    ninfer::LayoutBuilder builder;
-    (void)ninfer::plan_gdn_replay_records(builder, spec);
+std::size_t record_bytes(const sinfer::GdnReplayRecordSpec& spec) {
+    sinfer::LayoutBuilder builder;
+    (void)sinfer::plan_gdn_replay_records(builder, spec);
     return builder.finish(256);
 }
 
@@ -66,7 +66,7 @@ std::size_t record_bytes(const ninfer::GdnReplayRecordSpec& spec) {
 int main() {
     int failures = 0;
 
-    const ninfer::GdnReplayRecordSpec spec{
+    const sinfer::GdnReplayRecordSpec spec{
         .layers          = 3,
         .record_capacity = 5,
         .width           = 4,
@@ -76,20 +76,20 @@ int main() {
         .key_dim         = 128,
         .value_dim       = 128,
     };
-    ninfer::LayoutBuilder builder;
-    const auto layout       = ninfer::plan_gdn_replay_records(builder, spec);
+    sinfer::LayoutBuilder builder;
+    const auto layout       = sinfer::plan_gdn_replay_records(builder, spec);
     const std::size_t bytes = builder.finish(256);
     auto backing            = make_backing(bytes);
-    const ninfer::GdnReplayRecords records({backing.get(), bytes}, layout);
+    const sinfer::GdnReplayRecords records({backing.get(), bytes}, layout);
 
     failures += expect_shape(records.conv, 256, 4, 15, 1, "conv plane");
     failures += expect_shape(records.key, 128, 2, 4, 15, "key plane");
     failures += expect_shape(records.value, 128, 6, 4, 15, "value plane");
     failures += expect_shape(records.gate, 2, 6, 4, 15, "gate plane");
-    failures += expect(records.conv.dtype == ninfer::DType::BF16, "conv dtype differs");
-    failures += expect(records.key.dtype == ninfer::DType::BF16, "key dtype differs");
-    failures += expect(records.value.dtype == ninfer::DType::BF16, "value dtype differs");
-    failures += expect(records.gate.dtype == ninfer::DType::FP32, "gate dtype differs");
+    failures += expect(records.conv.dtype == sinfer::DType::BF16, "conv dtype differs");
+    failures += expect(records.key.dtype == sinfer::DType::BF16, "key dtype differs");
+    failures += expect(records.value.dtype == sinfer::DType::BF16, "value dtype differs");
+    failures += expect(records.gate.dtype == sinfer::DType::FP32, "gate dtype differs");
     failures += expect(reinterpret_cast<std::uintptr_t>(records.conv.data) % 256 == 0,
                        "conv plane is not aligned");
     failures += expect(reinterpret_cast<std::uintptr_t>(records.key.data) % 256 == 0,
@@ -152,10 +152,10 @@ int main() {
     // One record row per lane, so the bound is the batch ceiling (#85), not eight.
     failures += expect_throw(
         [&] {
-            ninfer::LayoutBuilder invalid;
-            (void)ninfer::plan_gdn_replay_records(
+            sinfer::LayoutBuilder invalid;
+            (void)sinfer::plan_gdn_replay_records(
                 invalid, {.layers          = 1,
-                          .record_capacity = ninfer::kMaximumBatchColumns + 1,
+                          .record_capacity = sinfer::kMaximumBatchColumns + 1,
                           .width           = 2,
                           .conv_channels   = 1,
                           .qk_heads        = 1,
@@ -167,10 +167,10 @@ int main() {
 
     {
         // ...and the ceiling itself plans: speculation runs at serving concurrency.
-        ninfer::LayoutBuilder ceiling;
-        const auto planned = ninfer::plan_gdn_replay_records(
+        sinfer::LayoutBuilder ceiling;
+        const auto planned = sinfer::plan_gdn_replay_records(
             ceiling, {.layers          = 1,
-                      .record_capacity = ninfer::kMaximumBatchColumns,
+                      .record_capacity = sinfer::kMaximumBatchColumns,
                       .width           = 2,
                       .conv_channels   = 64,
                       .qk_heads        = 1,
@@ -178,12 +178,12 @@ int main() {
                       .key_dim         = 64,
                       .value_dim       = 64});
         failures += expect_size(static_cast<std::size_t>(planned.spec.record_capacity),
-                                static_cast<std::size_t>(ninfer::kMaximumBatchColumns),
+                                static_cast<std::size_t>(sinfer::kMaximumBatchColumns),
                                 "batch-ceiling record capacity");
     }
 
-    ninfer::LayoutBuilder state_builder;
-    const auto state_layout = ninfer::plan_linear_attention_state_pool(
+    sinfer::LayoutBuilder state_builder;
+    const auto state_layout = sinfer::plan_linear_attention_state_pool(
         state_builder, {.layers         = 3,
                         .conv_channels  = 256,
                         .conv_width     = 3,
@@ -191,10 +191,10 @@ int main() {
                         .value_head_dim = 128,
                         .key_head_dim   = 128,
                         .slot_count     = 7,
-                        .conv_dtype     = ninfer::DType::BF16});
+                        .conv_dtype     = sinfer::DType::BF16});
     const std::size_t state_bytes = state_builder.finish(256);
     auto state_backing            = make_backing(state_bytes);
-    ninfer::LinearAttentionStatePool state({state_backing.get(), state_bytes}, state_layout);
+    sinfer::LinearAttentionStatePool state({state_backing.get(), state_bytes}, state_layout);
     const auto all = state.all_layers_view();
     failures += expect(all.conv_layer0.data == state.conv[0].data, "conv layer-0 base differs");
     failures += expect(all.recurrent_layer0.data == state.recurrent[0].data,
@@ -212,7 +212,7 @@ int main() {
     failures += expect_size(static_cast<std::size_t>(records.spec.record_capacity), 5,
                             "independent record capacity");
 
-    const ninfer::Tensor saved = state.conv[1];
+    const sinfer::Tensor saved = state.conv[1];
     state.conv[1].data         = state.conv[0].data;
     failures += expect_throw([&] { (void)state.all_layers_view(); }, "invalid layer stride");
     state.conv[1] = saved;

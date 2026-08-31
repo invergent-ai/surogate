@@ -2,7 +2,7 @@
 
 #include "api/ops/gqa_attention.h"
 
-// ninfer::ops - split-KV GQA small-T attention, BF16 KV-cache partial kernel.
+// sinfer::ops - split-KV GQA small-T attention, BF16 KV-cache partial kernel.
 // Standalone from the int8 kernel (gqa_attention_decode_i8.cuh): shared scaffolding
 // lives in gqa_attention_decode.cuh, but the body/append/load are not shared so the
 // bf16 path can be tuned independently. Processes one KV head, one query-head
@@ -17,7 +17,7 @@
 #include <cstdint>
 
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 // CacheT selects the KV cache storage: __nv_bfloat16 for the full-precision
 // cache, std::uint8_t for the e4m3 one. Only the append and the tile stage
@@ -70,8 +70,8 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
             store_vec(k_dst, gqa_kv_dequant_fp8x8_raw(k_raw));
             store_vec(v_dst, gqa_kv_dequant_fp8x8_raw(v_raw));
         } else {
-            ninfer::ops::cp_async<16>(k_dst, k_src);
-            ninfer::ops::cp_async<16>(v_dst, v_src);
+            sinfer::ops::cp_async<16>(k_dst, k_src);
+            sinfer::ops::cp_async<16>(v_dst, v_src);
         }
     };
 
@@ -287,8 +287,8 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
                         new_token >= 0 && new_token < valid_tokens && key >= first_pos;
                     if (from_new) {
                         const std::int64_t off = gqa_kv_new_index<Geometry>(kv_head, d, new_token);
-                        ninfer::ops::cp_async<16>(k_dst, &input.k[off]);
-                        ninfer::ops::cp_async<16>(v_dst, &input.v[off]);
+                        sinfer::ops::cp_async<16>(k_dst, &input.k[off]);
+                        sinfer::ops::cp_async<16>(v_dst, &input.v[off]);
                     } else {
                         const std::int64_t off = gqa_cache_index<Geometry>(
                             physical_page, kv_head, d, key & kPagedKVPageMask);
@@ -304,8 +304,8 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
                 store_vec(v_dst, make_int4(0, 0, 0, 0));
             }
         }
-        ninfer::ops::cp_commit();
-        ninfer::ops::cp_wait<0>();
+        sinfer::ops::cp_commit();
+        sinfer::ops::cp_wait<0>();
         __syncthreads();
 
         float score[QKNt][4];
@@ -491,4 +491,4 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     }
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

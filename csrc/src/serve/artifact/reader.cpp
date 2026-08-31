@@ -20,12 +20,24 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-namespace ninfer::artifact {
+namespace sinfer::artifact {
 namespace {
 
 using Json = nlohmann::json;
 
+// The format identifier. Spelled a byte at a time, so a text sweep over the tree
+// does not reach it -- when the project was renamed this was the one constant a
+// rename script could not touch, and missing it would have left the Python writer
+// emitting SINFER while this reader demanded NINFER.
 constexpr std::array<std::byte, 8> kMagic = {
+    std::byte{'S'}, std::byte{'I'}, std::byte{'N'}, std::byte{'F'},
+    std::byte{'E'}, std::byte{'R'}, std::byte{0},   std::byte{2},
+};
+
+// What artifacts written before the rename carry. The layout is identical -- only
+// the first byte differs -- so these are recognised in order to say so, rather
+// than reported as "not an artifact".
+constexpr std::array<std::byte, 8> kPreRenameMagic = {
     std::byte{'N'}, std::byte{'I'}, std::byte{'N'}, std::byte{'F'},
     std::byte{'E'}, std::byte{'R'}, std::byte{0},   std::byte{2},
 };
@@ -275,11 +287,17 @@ struct Reader::Impl {
             throw ArtifactError("artifact is shorter than the v2 prefix");
         }
         if (std::equal(kV1Magic.begin(), kV1Magic.end(), file.data())) {
-            throw ArtifactError("NInfer artifact v1 is no longer supported; migrate it with: "
+            throw ArtifactError("SInfer artifact v1 is no longer supported; migrate it with: "
                                 "python3 -m tools.artifact.migrate_v1_to_v2 <artifact>");
         }
+        if (std::equal(kPreRenameMagic.begin(), kPreRenameMagic.end(), file.data())) {
+            throw ArtifactError(
+                "this artifact was written before the sinfer rename; its layout is "
+                "identical and migrating it is a one-byte edit, not a reconversion: "
+                "python3 -m surogate.serve.tools.artifact.rename_magic <artifact>");
+        }
         if (!std::equal(kMagic.begin(), kMagic.end(), file.data())) {
-            throw ArtifactError("artifact magic is not NInfer v2");
+            throw ArtifactError("artifact magic is not SInfer v2");
         }
 
         const auto json_bytes = read_u64_le(file.data() + 8);
@@ -399,4 +417,4 @@ std::size_t Reader::read_direct(std::uint64_t absolute_offset,
     return impl_->file.read_direct(absolute_offset, destination);
 }
 
-} // namespace ninfer::artifact
+} // namespace sinfer::artifact

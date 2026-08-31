@@ -15,7 +15,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 // Padded atom-layout SF byte count for an [n, k] operand (Blk_MN 128, Blk_SF 4).
 [[nodiscard]] constexpr std::size_t w4fp4_sf_atom_bytes(std::int64_t rows,
@@ -36,4 +36,4 @@ bool w4fp4_cutlass_gemm_residual(const std::uint8_t* act_codes, const std::uint8
                                  const float* alpha_one, void* residual_bf16, std::int32_t tokens,
                                  std::int32_t n, std::int32_t k, cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

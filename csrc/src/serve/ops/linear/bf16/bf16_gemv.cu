@@ -7,7 +7,7 @@
 
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 template <class Geometry>
@@ -36,4 +36,4 @@ void launch_bf16_decode(const Tensor& x, const Weight& weight, Tensor& out, cuda
     throw std::invalid_argument("bf16 linear decode: unsupported exact problem");
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

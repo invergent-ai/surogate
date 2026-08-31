@@ -12,7 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 using TmaM256N128   = Nvfp4W4a4TmaSchedule<256, 3, 1>;
@@ -67,7 +67,7 @@ void launch_tma(const std::uint8_t* activation_codes, const std::uint8_t* activa
         make_nvfp4_w4a4_tma_descriptors<Geometry, Schedule::kBlockM>(
             activation_codes, activation_scales, weight_codes, weight_scales, tokens);
     constexpr std::size_t kSharedBytes = sizeof(Nvfp4W4a4TmaSharedStorage<Schedule>);
-    CUDA_CHECK(::ninfer::ops::set_func_attribute_per_device(nvfp4_w4a4_tma_kernel<Geometry, Schedule, Epilogue, Output>,
+    CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(nvfp4_w4a4_tma_kernel<Geometry, Schedule, Epilogue, Output>,
                                              cudaFuncAttributeMaxDynamicSharedMemorySize,
                                              static_cast<int>(kSharedBytes)));
 
@@ -174,4 +174,4 @@ void launch_nvfp4_w4a4_tma_linear_add(Nvfp4Problem problem, const std::uint8_t* 
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

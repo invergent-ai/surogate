@@ -1,6 +1,6 @@
 #pragma once
 //
-// ninfer_bench_common.h — shared bench harness for L1 op performance binaries.
+// sinfer_bench_common.h — shared bench harness for L1 op performance binaries.
 //
 // Adapted from ~/chunked_gdn/bench/bench_common.h. Timing uses CUDA events
 // with inner-iter batching to amortize the per-sample host sync; throughput is
@@ -26,7 +26,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::bench {
+namespace sinfer::bench {
 
 constexpr double kRooflineGBs = 1792.0; // RTX 5090 GDDR7 bandwidth roofline.
 
@@ -336,4 +336,4 @@ inline void print_result(const char* tag, const Result& r) {
         tag, r.median_us, r.min_us, r.p95_us, r.gbs, r.gbs / kRooflineGBs * 100.0, kRooflineGBs);
 }
 
-} // namespace ninfer::bench
+} // namespace sinfer::bench

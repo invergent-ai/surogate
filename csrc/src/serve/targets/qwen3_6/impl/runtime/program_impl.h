@@ -25,7 +25,7 @@
 #include <string>
 #include <utility>
 
-namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
+namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS {
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -3122,4 +3122,4 @@ void ProgramImplCore::reset_memory_peaks() noexcept {
     workspace_logical_peak_bytes = 0;
 }
 
-} // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
+} // namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS

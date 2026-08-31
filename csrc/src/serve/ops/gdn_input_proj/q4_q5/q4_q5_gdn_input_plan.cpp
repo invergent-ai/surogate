@@ -7,7 +7,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 constexpr std::int32_t kAnyCols = std::numeric_limits<std::int32_t>::max();
@@ -136,4 +136,4 @@ void q4_q5_gdn_input_dispatch(const Tensor& x, const Weight& qk_weight,
     q4_q5_gdn_input_execute_plan(plan, x, qk_weight, value_z_weight, qkv, z, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

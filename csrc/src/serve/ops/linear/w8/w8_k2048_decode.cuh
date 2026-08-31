@@ -10,7 +10,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 struct W8DecodeStoreEpilogue {
     template <class Output>
@@ -91,4 +91,4 @@ __global__ __launch_bounds__(RowsPerCta * 32,
     if (lane == 0) { epilogue(output, cta_row0, row, accumulator); }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

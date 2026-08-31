@@ -8,7 +8,7 @@
 
 #include "core/device.h"
 #include "core/paged_kv_cache.h"
-#include "ninfer_bench_common.h"
+#include "sinfer_bench_common.h"
 
 #include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
@@ -27,7 +27,7 @@
 #include <string_view>
 #include <vector>
 
-using namespace ninfer;
+using namespace sinfer;
 
 namespace {
 
@@ -68,7 +68,7 @@ struct Result {
 [[noreturn]] void usage(const char* message) {
     std::fprintf(stderr,
                  "error: %s\n"
-                 "usage: ninfer_context_softmax_attention_bench "
+                 "usage: sinfer_context_softmax_attention_bench "
                  "[--tokens 1,...,16] [--context 0,...,262144] "
                  "[--execution eager|graph|both] [--cache cold|warm|both] "
                  "[--warmup N] [--repeat N] [--profile] [--csv-out PATH]\n",
@@ -410,7 +410,7 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "ninfer_context_softmax_attention_bench: %s\n", error.what());
+        std::fprintf(stderr, "sinfer_context_softmax_attention_bench: %s\n", error.what());
         return 1;
     }
 }

@@ -14,12 +14,12 @@
 #include <cstdio>
 #include <cstdlib>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 namespace {
 [[noreturn]] void w4a4_unavailable(const char* which) {
     std::fprintf(stderr,
-                 "ninfer: %s requires NVFP4 W4A4 tensor-core hardware (sm_120); "
+                 "sinfer: %s requires NVFP4 W4A4 tensor-core hardware (sm_120); "
                  "this build targets an architecture without it. NVFP4 W4A4 "
                  "artifacts are not servable on this GPU.\n",
                  which);
@@ -58,4 +58,4 @@ void launch_nvfp4_linear_swiglu_w4a4_tma(const std::uint8_t*, const std::uint8_t
     w4a4_unavailable("launch_nvfp4_linear_swiglu_w4a4_tma");
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

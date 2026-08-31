@@ -7,7 +7,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 // cuBLASLt block-scaled FP4 route for prefill-width W4A4 GEMMs. The stored weight codes
 // (row-major, K-contiguous e2m1 pairs) and the 128x4-tiled UE4M3 weight scales are consumed
@@ -33,4 +33,4 @@ void nvfp4_cublaslt_gemm(const Weight& weight, std::int32_t row_begin, std::int3
                          std::int32_t out_ld, std::int32_t tokens, float beta,
                          cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

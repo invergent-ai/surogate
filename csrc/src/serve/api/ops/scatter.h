@@ -4,7 +4,7 @@
 
 #include <cuda_runtime.h>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 /**
  * Op: scatter
@@ -71,4 +71,4 @@ void scatter_bf16_batch(const Tensor& source, const Tensor& lanes, const Tensor&
 void extract_bf16_columns(const Tensor& source, std::int32_t source_column, Tensor& destination,
                           cudaStream_t stream);
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

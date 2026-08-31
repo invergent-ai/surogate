@@ -1,7 +1,7 @@
 #pragma once
 
 // Include this once from an exact target translation unit after defining
-// NINFER_QWEN36_VARIANT and NINFER_QWEN36_RUNTIME_NS. The body is shared source; the selected
+// SINFER_QWEN36_VARIANT and SINFER_QWEN36_RUNTIME_NS. The body is shared source; the selected
 // Variant is compile-time data and the only target-dependent calls are its three closed leaves.
 
 #include "targets/qwen3_6/impl/runtime/layouts.h"

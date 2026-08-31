@@ -14,7 +14,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 inline constexpr int kGqaPrefillI8Warps      = 16;
 inline constexpr int kGqaPrefillI8Threads    = kGqaPrefillI8Warps * 32;
@@ -305,8 +305,8 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
             if (key <= max_query_abs) {
                 const std::int64_t off =
                     gqa_kv_quant_scale_index<Geometry>(physical_page, kv_head, 0, key_l);
-                ninfer::ops::cp_async<8>(kd, &cache_k_scale[off]);
-                ninfer::ops::cp_async<8>(vd, &cache_v_scale[off]);
+                sinfer::ops::cp_async<8>(kd, &cache_k_scale[off]);
+                sinfer::ops::cp_async<8>(vd, &cache_v_scale[off]);
             } else {
                 store_vec(kd, make_int2(0, 0));
                 store_vec(vd, make_int2(0, 0));
@@ -330,11 +330,11 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
                 store_vec(vd, make_int4(0, 0, 0, 0));
             }
         }
-        ninfer::ops::cp_commit();
+        sinfer::ops::cp_commit();
     };
 
     issue_kv_tile(0);
-    ninfer::ops::cp_wait<0>();
+    sinfer::ops::cp_wait<0>();
     __syncthreads();
 
     const int gid      = lane >> 2;
@@ -565,7 +565,7 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
                         vf[0], vf[1]);
             }
         }
-        if (has_next) { ninfer::ops::cp_wait<0>(); }
+        if (has_next) { sinfer::ops::cp_wait<0>(); }
         __syncthreads();
     }
 
@@ -602,4 +602,4 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
                                            kGqaPrefillI8Threads);
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

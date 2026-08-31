@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the native NInfer product performance matrix.
+"""Run the native SInfer product performance matrix.
 
 The matrix is intentionally layered instead of fully factorial:
 
@@ -9,7 +9,7 @@ The matrix is intentionally layered instead of fully factorial:
 * CUDA graph is compared only for decode-bearing tests.
 * Prefill-only tests sweep length and chunk size, but not graph on/off.
 
-Raw ninfer_bench reports stay under profiles/bench. This script writes a
+Raw sinfer_bench reports stay under profiles/bench. This script writes a
 descriptive manifest, exact commands, per-case logs, raw JSON reports, and a flat
 summary CSV/JSON that is easy to compare across runs.
 """
@@ -28,8 +28,8 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_BENCH = REPO_ROOT / "build/bench/ninfer_bench"
-DEFAULT_WEIGHTS = REPO_ROOT / "out/qwen3_6_27b.ninfer"
+DEFAULT_BENCH = REPO_ROOT / "build/bench/sinfer_bench"
+DEFAULT_WEIGHTS = REPO_ROOT / "out/qwen3_6_27b.sinfer"
 DEFAULT_CORPUS = REPO_ROOT / "bench/fixtures/bench_corpus.ids"
 
 PREFILL_LENGTHS_CORE = (128, 256, 512, 1024, 2048, 4096, 8192, 16384)
@@ -41,8 +41,8 @@ CONTEXT_FULL_EXTRA = ((32768, 256), (65536, 128))
 PRIMARY_KS = (0, 3, 5)
 SWEEP_KS = (0, 1, 2, 3, 4, 5)
 REPORT_SCHEMA_VERSION = 11
-REPORT_ARTIFACT_TYPE = "ninfer_bench_report"
-REPORT_TOOL = "ninfer_bench"
+REPORT_ARTIFACT_TYPE = "sinfer_bench_report"
+REPORT_TOOL = "sinfer_bench"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -371,7 +371,7 @@ def write_manifest(
     commands: Sequence[dict[str, Any]],
 ) -> None:
     manifest = {
-        "artifact_type": "ninfer_bench_matrix_run",
+        "artifact_type": "sinfer_bench_matrix_run",
         "schema_version": 3,
         "created_at_utc": dt.datetime.now(dt.UTC).isoformat(),
         "preset": args.preset,
@@ -400,7 +400,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--preset", choices=("smoke", "core", "full"), default="core")
     parser.add_argument("--bench", type=Path, default=DEFAULT_BENCH)
     parser.add_argument(
-        "--weights", type=Path, default=DEFAULT_WEIGHTS, help=".ninfer artifact passed to the bench"
+        "--weights", type=Path, default=DEFAULT_WEIGHTS, help=".sinfer artifact passed to the bench"
     )
     parser.add_argument("--corpus", type=Path, default=DEFAULT_CORPUS)
     parser.add_argument("--output-dir", type=Path, default=None)
@@ -412,7 +412,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", help="write commands but do not execute")
     parser.add_argument("--resume", action="store_true", help="skip cases with an existing valid JSON report")
     parser.add_argument(
-        "--no-build", action="store_true", help="do not build build/bench/ninfer_bench"
+        "--no-build", action="store_true", help="do not build build/bench/sinfer_bench"
     )
     return parser.parse_args(argv)
 
@@ -446,7 +446,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     out_dir = args.output_dir
     if out_dir is None:
-        out_dir = REPO_ROOT / "profiles/bench" / f"ninfer-{args.preset}-{utc_stamp()}"
+        out_dir = REPO_ROOT / "profiles/bench" / f"sinfer-{args.preset}-{utc_stamp()}"
     out_dir = out_dir.expanduser().resolve()
     json_dir = out_dir / "json"
     log_dir = out_dir / "logs"
@@ -497,7 +497,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         build_stdout = log_dir / "build.stdout.txt"
         build_stderr = log_dir / "build.stderr.txt"
         rc = run_command(
-            ["cmake", "--build", "build", "-j", "--target", "ninfer_bench"],
+            ["cmake", "--build", "build", "-j", "--target", "sinfer_bench"],
             build_stdout,
             build_stderr,
         )

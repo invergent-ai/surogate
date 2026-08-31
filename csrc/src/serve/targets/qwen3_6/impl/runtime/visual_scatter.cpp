@@ -5,7 +5,7 @@
 
 #include <stdexcept>
 
-namespace ninfer::targets::qwen3_6::detail {
+namespace sinfer::targets::qwen3_6::detail {
 namespace {
 
 void copy_i32(const std::int32_t* source, Tensor& destination, cudaStream_t stream) {
@@ -33,4 +33,4 @@ void scatter_shifted_visual_embeddings(Tensor& input_embeddings, const Tensor& v
     ops::scatter(embeddings, destination_indices, input_embeddings, stream);
 }
 
-} // namespace ninfer::targets::qwen3_6::detail
+} // namespace sinfer::targets::qwen3_6::detail

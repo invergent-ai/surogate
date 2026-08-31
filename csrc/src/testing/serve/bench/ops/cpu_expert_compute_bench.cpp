@@ -2,7 +2,7 @@
 // geometry (2560/512/10/640) from a synthetic planar W8 bank, for decode-shaped rounds
 // (few tokens, many distinct experts) with the pool's thread count.
 //
-//   ninfer_cpu_expert_compute_bench [threads] [experts_in_bank] [jobs_per_round] [rounds] [experts_per_round]
+//   sinfer_cpu_expert_compute_bench [threads] [experts_in_bank] [jobs_per_round] [rounds] [experts_per_round]
 //   (experts_per_round < experts_in_bank draws each round's experts from a subset, i.e. several
 //   tokens per expert as in a prefill round; default = the whole bank)
 #include "api/ops/cpu_expert_compute.h"
@@ -14,7 +14,7 @@
 #include <random>
 #include <vector>
 
-using namespace ninfer;
+using namespace sinfer;
 
 int main(int argc, char** argv) {
     const unsigned threads    = argc > 1 ? static_cast<unsigned>(std::atoi(argv[1])) : 0;

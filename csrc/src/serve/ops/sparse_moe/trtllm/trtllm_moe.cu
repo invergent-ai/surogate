@@ -18,7 +18,7 @@
 #include "tensorrt_llm/kernels/cutlass_kernels/include/common.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h"
 
-namespace ninfer::ops::detail::trtllm_moe {
+namespace sinfer::ops::detail::trtllm_moe {
 namespace {
 
 namespace tk = tensorrt_llm::kernels;
@@ -564,4 +564,4 @@ void run(const Geometry& geometry, const __nv_bfloat16* x, std::int32_t tokens,
     widen(output, routed_sum, static_cast<std::int64_t>(tokens) * geometry.hidden, stream);
 }
 
-} // namespace ninfer::ops::detail::trtllm_moe
+} // namespace sinfer::ops::detail::trtllm_moe

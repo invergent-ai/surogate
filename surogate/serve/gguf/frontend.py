@@ -12,7 +12,7 @@
 #
 # The reconstructed tokenizer.json is semantically equivalent but not
 # byte-identical to the official file, so GGUF-sourced conversions run the
-# vendored converter with NINFER_ALLOW_DERIVED_FRONTEND=1 (PATCHES.md #12),
+# vendored converter with SINFER_ALLOW_DERIVED_FRONTEND=1 (PATCHES.md #12),
 # which downgrades the pinned-hash mismatch to a recorded warning.
 # Equivalence is enforced by tests/serve/test_gguf_frontend.py: the
 # reconstruction must encode/decode identically to the official tokenizer.

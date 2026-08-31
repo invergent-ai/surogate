@@ -17,7 +17,7 @@
 #include <span>
 #include <vector>
 
-namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
+namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS::schedule {
 
 struct VisionItemView {
     std::span<const std::uint16_t> patches;
@@ -111,4 +111,4 @@ private:
     std::vector<CudaEventTimer> timers_;
 };
 
-} // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule
+} // namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS::schedule

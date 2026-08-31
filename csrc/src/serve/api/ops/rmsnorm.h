@@ -4,7 +4,7 @@
 
 #include <cuda_runtime.h> // cudaStream_t
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 /**
  * Applies RMSNorm over the fastest dimension D=ne[0]. For each logical row r:
@@ -23,4 +23,4 @@ namespace ninfer::ops {
 void rmsnorm(const Tensor& x, const Tensor& weight, float eps, bool unit_offset, Tensor& out,
              cudaStream_t stream);
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

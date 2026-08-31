@@ -12,7 +12,7 @@
 #include <string>
 #include <unordered_map>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 constexpr std::size_t kWorkspaceBytes = std::size_t{32} << 20;
@@ -164,4 +164,4 @@ void fp8_cublaslt_gemm(const Weight& weight, std::int32_t row_begin, std::int32_
           "matmul");
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

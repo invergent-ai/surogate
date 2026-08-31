@@ -6,7 +6,7 @@
 
 #include <cstddef>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 enum class Bf16GdnGatingTokenVariant {
     None,
@@ -87,4 +87,4 @@ void bf16_gdn_gating_proj_35_mma_unsplit_launch(Bf16GdnGatingTokenVariant varian
                                                 const Tensor& A_log, const Tensor& dt_bias,
                                                 Tensor& g, Tensor& beta, cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

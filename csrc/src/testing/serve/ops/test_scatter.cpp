@@ -8,8 +8,8 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
+using namespace sinfer;
+using namespace sinfer::test;
 
 namespace {
 

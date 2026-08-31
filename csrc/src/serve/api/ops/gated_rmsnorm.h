@@ -6,7 +6,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 /**
  * Applies RMS normalization over ne[0] and an elementwise SiLU gate. For each logical row r:
@@ -36,4 +36,4 @@ enum class GatedRmsGate : std::uint8_t {
 void gated_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor& z, float eps,
                    GatedRmsGate gate, Tensor& out, cudaStream_t stream);
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

@@ -4,7 +4,7 @@
 #include <array>
 #include <stdexcept>
 
-namespace ninfer::runtime {
+namespace sinfer::runtime {
 namespace {
 
 struct ResourceTotals {
@@ -154,4 +154,4 @@ bool protected_head_safe_without_temporal(const AdmissionProtection& protection,
     return fits(used, capacity);
 }
 
-} // namespace ninfer::runtime
+} // namespace sinfer::runtime

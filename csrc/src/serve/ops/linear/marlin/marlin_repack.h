@@ -7,7 +7,7 @@
 
 #include <cuda_runtime.h>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 // gptq_tmp must hold (k/4)*n uint32; b_out marlin_b_out_words(n,k) uint32;
 // scales_out (k/32)*n bf16.
@@ -28,4 +28,4 @@ void marlin_repack_tiles_q4(const void* gptq_tmp, void* b_out, int n, int k,
 void marlin_repack_fp8_row(const void* codes, const void* row_scales_bf16, int n, int k,
                            void* gptq_tmp, void* b_out, void* scales_out, cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

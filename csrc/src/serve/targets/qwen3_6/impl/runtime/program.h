@@ -26,13 +26,13 @@
 #include <span>
 #include <vector>
 
-namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
+namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS {
 
 using PreparedPromptData    = qwen3_6::PreparedPromptData;
 using RewriteCheckpointKind = qwen3_6::RewriteCheckpointKind;
 using RewriteCheckpointSpec = qwen3_6::RewriteCheckpointSpec;
 
-using ReusePath = ninfer::PrefixReusePath;
+using ReusePath = sinfer::PrefixReusePath;
 
 [[nodiscard]] constexpr bool is_rewrite_checkpoint_restore(ReusePath path) noexcept {
     return path == ReusePath::RestoreTurnCheckpoint || path == ReusePath::RestoreResponseCheckpoint;
@@ -57,12 +57,12 @@ enum class MtpBridgeMode : std::uint8_t {
     AfterExactHit,
 };
 
-} // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
+} // namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS
 
-namespace ninfer::targets::qwen3_6::detail {
+namespace sinfer::targets::qwen3_6::detail {
 
 template <>
-struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
+struct RequestBasePlanImpl<SINFER_QWEN36_VARIANT> {
     runtime::RequestPlanSummary summary;
     ops::SamplingConfig sampling;
     std::uint32_t text_kv_page_entitlement    = 0;
@@ -74,25 +74,25 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
 };
 
 template <>
-struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
+struct RequestPlanImpl<SINFER_QWEN36_VARIANT> {
     runtime::RequestPlanSummary summary;
-    NINFER_QWEN36_RUNTIME_NS::ReusePath reuse = NINFER_QWEN36_RUNTIME_NS::ReusePath::FullReset;
+    SINFER_QWEN36_RUNTIME_NS::ReusePath reuse = SINFER_QWEN36_RUNTIME_NS::ReusePath::FullReset;
     std::uint32_t reuse_base                  = 0;
-    NINFER_QWEN36_RUNTIME_NS::MtpBridgeMode mtp_bridge =
-        NINFER_QWEN36_RUNTIME_NS::MtpBridgeMode::None;
+    SINFER_QWEN36_RUNTIME_NS::MtpBridgeMode mtp_bridge =
+        SINFER_QWEN36_RUNTIME_NS::MtpBridgeMode::None;
     bool prepare_mtp = false;
-    std::optional<NINFER_QWEN36_RUNTIME_NS::VisionPrefillPlan> vision;
-    NINFER_QWEN36_RUNTIME_NS::RewriteCheckpointAction rewrite_checkpoint_action =
-        NINFER_QWEN36_RUNTIME_NS::RewriteCheckpointAction::Drop;
+    std::optional<SINFER_QWEN36_RUNTIME_NS::VisionPrefillPlan> vision;
+    SINFER_QWEN36_RUNTIME_NS::RewriteCheckpointAction rewrite_checkpoint_action =
+        SINFER_QWEN36_RUNTIME_NS::RewriteCheckpointAction::Drop;
     std::optional<qwen3_6::RewriteCheckpointSpec> rewrite_checkpoint_capture;
     ops::SamplingConfig sampling;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
 };
 
-} // namespace ninfer::targets::qwen3_6::detail
+} // namespace sinfer::targets::qwen3_6::detail
 
-namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
+namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS {
 
 using RequestPlanImpl     = qwen3_6::detail::RequestPlanImpl<Variant>;
 using RequestBasePlanImpl = qwen3_6::detail::RequestBasePlanImpl<Variant>;
@@ -448,14 +448,14 @@ private:
     [[nodiscard]] qwen3_6::PagedKVCacheView mtp_kv_view(const SequenceState& sequence) const;
 };
 
-} // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
+} // namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS
 
-namespace ninfer::targets::qwen3_6::detail {
+namespace sinfer::targets::qwen3_6::detail {
 
 template <>
-class ProgramImpl<NINFER_QWEN36_VARIANT> final : public NINFER_QWEN36_RUNTIME_NS::ProgramImplCore {
+class ProgramImpl<SINFER_QWEN36_VARIANT> final : public SINFER_QWEN36_RUNTIME_NS::ProgramImplCore {
 public:
-    using NINFER_QWEN36_RUNTIME_NS::ProgramImplCore::ProgramImplCore;
+    using SINFER_QWEN36_RUNTIME_NS::ProgramImplCore::ProgramImplCore;
 };
 
-} // namespace ninfer::targets::qwen3_6::detail
+} // namespace sinfer::targets::qwen3_6::detail

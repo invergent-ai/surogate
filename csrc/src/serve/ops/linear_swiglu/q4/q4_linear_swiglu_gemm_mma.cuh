@@ -13,7 +13,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 template <class Cfg, bool FullTiles>
 __global__
@@ -159,12 +159,12 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void q4_linear_swiglu_mma_split
 #pragma unroll
     for (int s = 0; s < S; ++s) {
         if (s < NKT) { stage_load(s, s); }
-        ninfer::ops::cp_commit();
+        sinfer::ops::cp_commit();
     }
 
     for (int it = 0; it < NKT; ++it) {
         const int stage = it % S;
-        ninfer::ops::cp_wait<S - 1>();
+        sinfer::ops::cp_wait<S - 1>();
         __syncthreads();
         dequant_to_As(stage, it);
         __syncthreads();
@@ -199,7 +199,7 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void q4_linear_swiglu_mma_split
         __syncthreads();
         const int next = it + S;
         if (next < NKT) { stage_load(stage, next); }
-        ninfer::ops::cp_commit();
+        sinfer::ops::cp_commit();
     }
 
 #pragma unroll
@@ -233,4 +233,4 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void q4_linear_swiglu_mma_split
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

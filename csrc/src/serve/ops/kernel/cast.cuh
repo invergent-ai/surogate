@@ -4,7 +4,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 struct alignas(8) Bf16x4 {
     __nv_bfloat162 lo;
@@ -41,4 +41,4 @@ __global__ void cast_fp32_to_bf16_scalar_kernel(const float* source, __nv_bfloat
     }
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

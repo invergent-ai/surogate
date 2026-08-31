@@ -4,7 +4,7 @@
 
 #include <cuda_runtime.h>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 enum class GeluMode {
     Exact,
@@ -25,4 +25,4 @@ enum class GeluMode {
  */
 void gelu(Tensor& x, GeluMode mode, cudaStream_t stream);
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

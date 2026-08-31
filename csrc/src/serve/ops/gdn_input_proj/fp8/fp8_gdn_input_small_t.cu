@@ -10,7 +10,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 using Geometry = Fp8GdnInputGeometry;
@@ -51,4 +51,4 @@ void fp8_gdn_input_small_t_launch(const Tensor& x, const Weight& weight, Tensor&
     kLaunchers[static_cast<std::size_t>(x.ne[1] - kFp8FirstSmallT)](x, weight, qkv, z, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

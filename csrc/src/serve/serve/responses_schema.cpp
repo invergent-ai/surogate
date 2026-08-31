@@ -19,7 +19,7 @@
 #include <unordered_set>
 #include <utility>
 
-namespace ninfer::serve {
+namespace sinfer::serve {
 namespace {
 
 using Json = nlohmann::json;
@@ -99,7 +99,7 @@ std::string item_id(const Json& item, const char* prefix, const char* param) {
     return item.at("id").get<std::string>();
 }
 
-ninfer::product::media_acquire::Source parse_image_source(const Json& part) {
+sinfer::product::media_acquire::Source parse_image_source(const Json& part) {
     if (part.contains("file_id") && !part.at("file_id").is_null()) {
         bad_request("input_image.file_id is not supported; use image_url", "input",
                     "file_inputs_not_supported");
@@ -119,29 +119,29 @@ ninfer::product::media_acquire::Source parse_image_source(const Json& part) {
         }
     }
 
-    ninfer::product::media_acquire::Source source;
+    sinfer::product::media_acquire::Source source;
     source.value = part.at("image_url").get<std::string>();
     if (source.value.starts_with("data:")) {
-        source.kind = ninfer::product::media_acquire::SourceKind::Data;
+        source.kind = sinfer::product::media_acquire::SourceKind::Data;
     } else if (source.value.starts_with("http://") || source.value.starts_with("https://")) {
-        source.kind = ninfer::product::media_acquire::SourceKind::Url;
+        source.kind = sinfer::product::media_acquire::SourceKind::Url;
     } else {
         bad_request("input_image.image_url must use HTTP(S) or a data URI", "input");
     }
     return source;
 }
 
-ninfer::product::media_acquire::Source parse_video_source(const Json& part) {
+sinfer::product::media_acquire::Source parse_video_source(const Json& part) {
     if (!part.contains("video_url") || !part.at("video_url").is_string() ||
         part.at("video_url").get<std::string>().empty()) {
         bad_request("input_video must contain a non-empty video_url", "input");
     }
-    ninfer::product::media_acquire::Source source;
+    sinfer::product::media_acquire::Source source;
     source.value = part.at("video_url").get<std::string>();
     if (source.value.starts_with("data:")) {
-        source.kind = ninfer::product::media_acquire::SourceKind::Data;
+        source.kind = sinfer::product::media_acquire::SourceKind::Data;
     } else if (source.value.starts_with("http://") || source.value.starts_with("https://")) {
-        source.kind = ninfer::product::media_acquire::SourceKind::Url;
+        source.kind = sinfer::product::media_acquire::SourceKind::Url;
     } else {
         bad_request("input_video.video_url must use HTTP(S) or a data URI", "input");
     }
@@ -785,16 +785,16 @@ std::int64_t completion_time_now() {
         .count();
 }
 
-std::string response_status(ninfer::FinishReason reason) {
+std::string response_status(sinfer::FinishReason reason) {
     switch (reason) {
-    case ninfer::FinishReason::OutputLimit:
-    case ninfer::FinishReason::ContextCapacity:
+    case sinfer::FinishReason::OutputLimit:
+    case sinfer::FinishReason::ContextCapacity:
         return "incomplete";
-    case ninfer::FinishReason::Cancelled:
+    case sinfer::FinishReason::Cancelled:
         return "cancelled";
-    case ninfer::FinishReason::None:
-    case ninfer::FinishReason::StopToken:
-    case ninfer::FinishReason::StopString:
+    case sinfer::FinishReason::None:
+    case sinfer::FinishReason::StopToken:
+    case sinfer::FinishReason::StopString:
         return "completed";
     }
     return "failed";
@@ -1282,4 +1282,4 @@ std::string new_response_id() { return random_id("resp"); }
 
 std::string new_response_item_id(const char* prefix) { return random_id(prefix); }
 
-} // namespace ninfer::serve
+} // namespace sinfer::serve

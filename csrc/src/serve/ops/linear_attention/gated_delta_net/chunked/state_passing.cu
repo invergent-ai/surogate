@@ -1,7 +1,7 @@
 #include "ops/linear_attention/gated_delta_net/chunked/launch.h"
 #include "ops/linear_attention/gated_delta_net/chunked/state_passing.cuh"
 
-namespace ninfer::ops::detail::gated_delta_net::chunked {
+namespace sinfer::ops::detail::gated_delta_net::chunked {
 namespace {
 
 namespace kernel = state_passing;
@@ -29,8 +29,8 @@ cudaError_t launch_fixed(const state_passing_config& cfg, head_map qk_map, int N
 
 cudaError_t launch_state_passing(const state_passing_config& cfg) {
     stage_validator v{"launch_state_passing", cfg.H_qk, cfg.H_v, cfg.L};
-    NINFER_GATED_DELTA_NET_PROPAGATE(v.check_shape());
-    NINFER_GATED_DELTA_NET_PROPAGATE(v.check_full_chunks());
+    SINFER_GATED_DELTA_NET_PROPAGATE(v.check_shape());
+    SINFER_GATED_DELTA_NET_PROPAGATE(v.check_full_chunks());
     if (cfg.W == nullptr || cfg.U == nullptr || cfg.k == nullptr || cfg.g_cumsum == nullptr ||
         cfg.state_in == nullptr || cfg.v_new == nullptr || cfg.h_chunk == nullptr ||
         cfg.state_out == nullptr) {
@@ -40,13 +40,13 @@ cudaError_t launch_state_passing(const state_passing_config& cfg) {
     const auto qk_map     = head_map::of((int)cfg.H_qk, (int)cfg.H_v);
     const std::int64_t NT = cfg.L / BT;
     if (cfg.H_v >= 48) {
-        NINFER_GATED_DELTA_NET_PROPAGATE(v.check_grid(
+        SINFER_GATED_DELTA_NET_PROPAGATE(v.check_grid(
             static_cast<std::int64_t>(cfg.H_v) * kernel::kernel_dims<16>::D_STRIPS, 1));
         return launch_fixed<16>(cfg, qk_map, static_cast<int>(NT));
     }
-    NINFER_GATED_DELTA_NET_PROPAGATE(
+    SINFER_GATED_DELTA_NET_PROPAGATE(
         v.check_grid(static_cast<std::int64_t>(cfg.H_v) * kernel::kernel_dims<32>::D_STRIPS, 1));
     return launch_fixed<32>(cfg, qk_map, static_cast<int>(NT));
 }
 
-} // namespace ninfer::ops::detail::gated_delta_net::chunked
+} // namespace sinfer::ops::detail::gated_delta_net::chunked

@@ -16,7 +16,7 @@
 #include <cstring>
 #include <vector>
 
-using namespace ninfer;
+using namespace sinfer;
 
 namespace {
 

@@ -6,7 +6,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 template <class Schedule>
@@ -39,4 +39,4 @@ void launch_q4_gemv_r1_w8_direct(const Tensor& x, const Weight& w, Tensor& out,
     launch_gemv<Q4GemvR1W8DirectSchedule>(x, w, out, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

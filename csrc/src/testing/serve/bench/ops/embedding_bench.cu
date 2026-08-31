@@ -1,11 +1,11 @@
 // Public aggregate-column benchmark for the registered Qwen3.6 embedding profiles.
 //
-// Every measurement is exactly one ninfer::ops::embedding call. L2 eviction
+// Every measurement is exactly one sinfer::ops::embedding call. L2 eviction
 // completes before the timed interval.
 #include "api/ops/embedding.h"
 
 #include "core/device.h"
-#include "ninfer_bench_common.h"
+#include "sinfer_bench_common.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -17,8 +17,8 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::bench;
+using namespace sinfer;
+using namespace sinfer::bench;
 
 namespace {
 

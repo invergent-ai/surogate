@@ -1,4 +1,4 @@
-"""Inspect a `.ninfer` object directory without model-specific code."""
+"""Inspect a `.sinfer` object directory without model-specific code."""
 
 from __future__ import annotations
 

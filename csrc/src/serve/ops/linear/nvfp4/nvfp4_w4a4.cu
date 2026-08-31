@@ -12,7 +12,7 @@
 #include <stdexcept>
 #include <type_traits>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 using M32N64                      = Nvfp4W4a4MmaSchedule<32, 64, 256, 2, 4, 2, 2>;
@@ -176,4 +176,4 @@ void launch_nvfp4_w4a4(const Tensor& x, const Weight& weight, Tensor& out,
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

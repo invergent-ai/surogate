@@ -8,7 +8,7 @@
 namespace {
 
 using Json = nlohmann::json;
-using ninfer::serve::ServeOptions;
+using sinfer::serve::ServeOptions;
 
 int check(bool condition, const char* message) {
     if (condition) { return 0; }
@@ -23,22 +23,22 @@ int main() {
     ServeOptions options;
     options.max_request_bytes = 1234;
 
-    const ninfer::serve::ApiError media_budget = ninfer::serve::request_error_to_api_error(
-        ninfer::RequestError(ninfer::RequestErrorKind::MediaBudgetExceeded,
+    const sinfer::serve::ApiError media_budget = sinfer::serve::request_error_to_api_error(
+        sinfer::RequestError(sinfer::RequestErrorKind::MediaBudgetExceeded,
                              "vision tokens exceed processor budget"));
     failures += check(media_budget.status == 400 && media_budget.code == "media_budget_exceeded",
                       "media resource rejection did not map to HTTP 400");
-    const ninfer::serve::ApiError context_limit = ninfer::serve::request_error_to_api_error(
-        ninfer::RequestError(ninfer::RequestErrorKind::ContextLengthExceeded,
+    const sinfer::serve::ApiError context_limit = sinfer::serve::request_error_to_api_error(
+        sinfer::RequestError(sinfer::RequestErrorKind::ContextLengthExceeded,
                              "prepared prompt has 200 tokens, exceeding Engine max_context 128"));
     failures +=
         check(context_limit.status == 400 && context_limit.code == "context_length_exceeded" &&
                   context_limit.message.find("200 tokens") != std::string::npos &&
                   context_limit.message.find("128") != std::string::npos,
               "context rejection lost its HTTP classification or capacity details");
-    const ninfer::serve::ApiError cancelled =
-        ninfer::serve::request_error_to_api_error(ninfer::RequestError(
-            ninfer::RequestErrorKind::Cancelled, "request cancelled during preparation"));
+    const sinfer::serve::ApiError cancelled =
+        sinfer::serve::request_error_to_api_error(sinfer::RequestError(
+            sinfer::RequestErrorKind::Cancelled, "request cancelled during preparation"));
     failures += check(cancelled.status == 499 && cancelled.code == "client_disconnected",
                       "preparation cancellation did not retain its HTTP classification");
 
@@ -47,7 +47,7 @@ int main() {
     httplib::Response messages_response;
     messages_response.status = 413;
     const auto messages_result =
-        ninfer::serve::handle_unrendered_http_error(options, messages_request, messages_response);
+        sinfer::serve::handle_unrendered_http_error(options, messages_request, messages_response);
     const Json messages_body = Json::parse(messages_response.body);
     failures += check(messages_result == httplib::Server::HandlerResponse::Handled &&
                           messages_body.at("type") == "error" &&
@@ -61,7 +61,7 @@ int main() {
     httplib::Response openai_response;
     openai_response.status = 413;
     const auto openai_result =
-        ninfer::serve::handle_unrendered_http_error(options, openai_request, openai_response);
+        sinfer::serve::handle_unrendered_http_error(options, openai_request, openai_response);
     const Json openai_body = Json::parse(openai_response.body);
     failures += check(openai_result == httplib::Server::HandlerResponse::Handled &&
                           openai_body.at("error").at("code") == "request_too_large" &&
@@ -74,7 +74,7 @@ int main() {
     authored_response.set_content(R"({"error":{"code":"application_error"}})", "application/json");
     const std::string authored_body = authored_response.body;
     const auto authored_result =
-        ninfer::serve::handle_unrendered_http_error(options, openai_request, authored_response);
+        sinfer::serve::handle_unrendered_http_error(options, openai_request, authored_response);
     failures += check(authored_result == httplib::Server::HandlerResponse::Unhandled &&
                           authored_response.body == authored_body,
                       "application-authored 413 was overwritten by the payload-limit handler");
@@ -82,7 +82,7 @@ int main() {
     httplib::Response other_response;
     other_response.status = 400;
     const auto other_result =
-        ninfer::serve::handle_unrendered_http_error(options, openai_request, other_response);
+        sinfer::serve::handle_unrendered_http_error(options, openai_request, other_response);
     failures += check(other_result == httplib::Server::HandlerResponse::Unhandled &&
                           other_response.body.empty(),
                       "non-413 response was changed by the payload-limit handler");

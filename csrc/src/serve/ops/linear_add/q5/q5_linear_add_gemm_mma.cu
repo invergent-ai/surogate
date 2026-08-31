@@ -9,7 +9,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 using MmaR64C16Schedule =
@@ -83,4 +83,4 @@ void q5_linear_add_mma_r64_c128_launch(const Tensor& x, const Weight& w, Tensor&
     launch_route<MmaR64C128Schedule>(x, w, residual_out, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

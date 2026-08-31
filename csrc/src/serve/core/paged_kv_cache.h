@@ -10,7 +10,7 @@
 #include <span>
 #include <vector>
 
-namespace ninfer {
+namespace sinfer {
 
 inline constexpr std::int32_t kPagedKVPageSize = 64;
 
@@ -210,4 +210,4 @@ struct PagedKVResize {
 // Atomically validates a retained-claim/truncate resize vector, then applies it at a GPU boundary.
 void resize_paged_kv_bundle(std::span<const PagedKVResize> changes);
 
-} // namespace ninfer
+} // namespace sinfer

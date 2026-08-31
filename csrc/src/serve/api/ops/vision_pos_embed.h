@@ -4,7 +4,7 @@
 
 #include <cuda_runtime.h>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 /**
  * Adds a four-corner interpolated position embedding. For d,p:
@@ -24,4 +24,4 @@ namespace ninfer::ops {
 void vision_pos_embed_add(const Tensor& table, const Tensor& indices, const Tensor& weights,
                           Tensor& x, cudaStream_t stream);
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

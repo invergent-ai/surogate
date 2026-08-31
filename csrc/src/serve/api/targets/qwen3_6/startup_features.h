@@ -2,7 +2,7 @@
 
 #include "api/types.h"
 
-namespace ninfer::targets::qwen3_6 {
+namespace sinfer::targets::qwen3_6 {
 
 struct StartupFeatures {
     bool vision                    = false;
@@ -32,4 +32,4 @@ struct StartupFeatures {
     };
 }
 
-} // namespace ninfer::targets::qwen3_6
+} // namespace sinfer::targets::qwen3_6

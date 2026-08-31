@@ -9,7 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 [[nodiscard]] std::size_t fp8_gdn_snapshot_workspace_capacity_bytes(LinearPolicy policy,
                                                                     std::int32_t batch_size,
@@ -44,4 +44,4 @@ void fp8_gdn_record_dispatch(const Tensor& x, const Weight& weight, const Tensor
                              Tensor& key, Tensor& value, Tensor& z, LinearPolicy policy,
                              WorkspaceArena& workspace, cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

@@ -14,7 +14,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 template <int Values>
 struct Bf16SmallTFloatPack {
@@ -241,4 +241,4 @@ struct Bf16SmallTContiguousOutput {
     }
 };
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

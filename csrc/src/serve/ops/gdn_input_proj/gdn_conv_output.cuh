@@ -7,7 +7,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 inline constexpr std::int32_t kGdnQueryRows  = 2048;
 inline constexpr std::int32_t kGdnKeyRows    = 2048;
@@ -76,4 +76,4 @@ make_gdn_conv_output(const Tensor& conv_weight, const Tensor& conv_states,
 
 static_assert(kGdnParentRows == 16384);
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

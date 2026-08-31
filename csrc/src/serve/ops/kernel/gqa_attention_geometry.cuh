@@ -15,7 +15,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 template <int HeadDimValue, int QHeadsValue, int KVHeadsValue, int DecodeSplitScaleValue>
 struct GqaGeometry {
@@ -52,4 +52,4 @@ using Gqa35Geometry = Gqa256_16q2;
 using Gqa08Geometry = Gqa256_8q2;
 using Gqa4BGeometry = Gqa256_16q4;
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

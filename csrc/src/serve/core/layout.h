@@ -9,7 +9,7 @@
 #include <array>
 #include <string_view>
 
-namespace ninfer {
+namespace sinfer {
 
 struct LayoutRegion {
     std::size_t offset    = 0;
@@ -91,4 +91,4 @@ private:
     std::size_t peak_   = 0;
 };
 
-} // namespace ninfer
+} // namespace sinfer

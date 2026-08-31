@@ -29,27 +29,27 @@ namespace nb = nanobind;
 
 namespace {
 
-const char* finish_reason_name(ninfer::FinishReason reason) {
+const char* finish_reason_name(sinfer::FinishReason reason) {
     switch (reason) {
-    case ninfer::FinishReason::None: return "none";
-    case ninfer::FinishReason::OutputLimit: return "output_limit";
-    case ninfer::FinishReason::ContextCapacity: return "context_capacity";
-    case ninfer::FinishReason::StopToken: return "stop_token";
-    case ninfer::FinishReason::StopString: return "stop_string";
-    case ninfer::FinishReason::Cancelled: return "cancelled";
+    case sinfer::FinishReason::None: return "none";
+    case sinfer::FinishReason::OutputLimit: return "output_limit";
+    case sinfer::FinishReason::ContextCapacity: return "context_capacity";
+    case sinfer::FinishReason::StopToken: return "stop_token";
+    case sinfer::FinishReason::StopString: return "stop_string";
+    case sinfer::FinishReason::Cancelled: return "cancelled";
     }
     return "unknown";
 }
 
 // Streams deltas into a Python callable; the engine publishes from its own
 // thread, so every call re-acquires the GIL.
-class CallbackSink final : public ninfer::OutputSink {
+class CallbackSink final : public sinfer::OutputSink {
 public:
     explicit CallbackSink(nb::object callback) : callback_(std::move(callback)) {}
 
-    void publish(ninfer::OutputDelta delta) override {
+    void publish(sinfer::OutputDelta delta) override {
         nb::gil_scoped_acquire gil;
-        callback_(delta.channel == ninfer::OutputChannel::Content ? "content" : "reasoning",
+        callback_(delta.channel == sinfer::OutputChannel::Content ? "content" : "reasoning",
                   delta.text);
     }
 
@@ -62,13 +62,13 @@ public:
     PyEngine(const std::string& artifact, int device, std::uint32_t max_context,
              std::optional<std::uint32_t> kv_capacity, std::uint32_t prefill_chunk,
              std::uint32_t max_concurrency, bool use_cuda_graph) {
-        ninfer::EngineOptions options;
+        sinfer::EngineOptions options;
         options.artifact_path   = artifact;
         options.device          = device;
         options.max_context     = max_context;
         options.kv_capacity     = kv_capacity.has_value()
-                                      ? ninfer::KvCapacityPolicy::explicit_capacity(*kv_capacity)
-                                      : ninfer::KvCapacityPolicy::automatic();
+                                      ? sinfer::KvCapacityPolicy::explicit_capacity(*kv_capacity)
+                                      : sinfer::KvCapacityPolicy::automatic();
         options.prefill_chunk   = prefill_chunk;
         options.max_concurrency = max_concurrency;
         options.use_cuda_graph  = use_cuda_graph;
@@ -78,7 +78,7 @@ public:
 
     std::uint32_t count_tokens(const std::string& prompt, bool enable_thinking) const {
         return engine().count_tokens(
-            ninfer::product::prompt_from_text(prompt, enable_thinking));
+            sinfer::product::prompt_from_text(prompt, enable_thinking));
     }
 
     nb::dict generate(const std::string& prompt, bool enable_thinking, std::uint32_t max_new,
@@ -86,7 +86,7 @@ public:
                       std::optional<std::int32_t> top_k, std::optional<float> min_p,
                       std::optional<std::uint64_t> seed, const std::vector<std::string>& stop,
                       nb::object on_delta) {
-        ninfer::RequestOptions request;
+        sinfer::RequestOptions request;
         request.execution.requested_output_tokens = max_new;
         if (greedy) { request.execution.sampling.temperature = 0.0F; }
         if (temperature) { request.execution.sampling.temperature = *temperature; }
@@ -95,15 +95,15 @@ public:
         if (min_p) { request.execution.sampling.min_p = *min_p; }
         if (seed) { request.execution.sampling.seed = *seed; }
         for (const std::string& text : stop) {
-            request.stop.strings.push_back(ninfer::StopString{.text = text});
+            request.stop.strings.push_back(sinfer::StopString{.text = text});
         }
 
         std::optional<CallbackSink> sink;
         if (!on_delta.is_none()) { sink.emplace(std::move(on_delta)); }
 
-        ninfer::PromptInput input =
-            ninfer::product::prompt_from_text(prompt, enable_thinking);
-        ninfer::GenerationResult result = [&] {
+        sinfer::PromptInput input =
+            sinfer::product::prompt_from_text(prompt, enable_thinking);
+        sinfer::GenerationResult result = [&] {
             nb::gil_scoped_release release;
             return engine().generate(engine().prepare(std::move(input)), std::move(request),
                                      sink ? &*sink : nullptr);
@@ -127,7 +127,7 @@ public:
     }
 
     nb::dict memory_summary() const {
-        const ninfer::MemorySummary memory = engine().memory_summary();
+        const sinfer::MemorySummary memory = engine().memory_summary();
         nb::dict out;
         out["weights_bytes"]   = memory.weights.used_bytes;
         out["sequence_bytes"]  = memory.sequence.used_bytes;
@@ -137,12 +137,12 @@ public:
     }
 
 private:
-    ninfer::Engine& engine() const {
+    sinfer::Engine& engine() const {
         if (!engine_.has_value()) { throw std::runtime_error("engine is not loaded"); }
-        return const_cast<ninfer::Engine&>(*engine_);
+        return const_cast<sinfer::Engine&>(*engine_);
     }
 
-    mutable std::optional<ninfer::Engine> engine_;
+    mutable std::optional<sinfer::Engine> engine_;
 };
 
 } // namespace

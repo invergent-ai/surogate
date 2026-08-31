@@ -13,7 +13,7 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
+using namespace sinfer;
 
 namespace {
 

@@ -6,7 +6,7 @@
 #include <cuda_runtime.h>
 #include <math_constants.h>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 struct SparseMoeRankedValue {
     float value;
@@ -83,4 +83,4 @@ __device__ __forceinline__ void sparse_moe_select_top_k_warp(const float* scores
     if (lane == 0) { *shared_scale = sigmoid(scores[Experts]); }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

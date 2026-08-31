@@ -7,7 +7,7 @@
 #include <utility>
 #include <variant>
 
-namespace ninfer::artifact {
+namespace sinfer::artifact {
 namespace {
 
 std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment) {
@@ -144,4 +144,4 @@ MaterializationPlan Binder::finish() {
     return std::move(materialization_);
 }
 
-} // namespace ninfer::artifact
+} // namespace sinfer::artifact

@@ -29,7 +29,7 @@
 #include <cstdint>
 #include <type_traits>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 struct W8A8ImmaConfig {
     static constexpr int BM      = 64;
@@ -130,7 +130,7 @@ __global__ __launch_bounds__(Cfg::THREADS, 2) void w8a8_imma_gemm_kernel(
             const int local = i / (Cfg::BK / 16);
             const int col   = (i % (Cfg::BK / 16)) * 16;
             const int wrow  = row_map.weight_row(m0 + local);
-            ninfer::ops::cp_async<16, ninfer::ops::Cache::cg>(
+            sinfer::ops::cp_async<16, sinfer::ops::Cache::cg>(
                 &Ws[slot][local * Cfg::BK_PAD + col],
                 &codes[static_cast<std::int64_t>(wrow) * k + kbase + col]);
         }
@@ -143,7 +143,7 @@ __global__ __launch_bounds__(Cfg::THREADS, 2) void w8a8_imma_gemm_kernel(
             const bool valid = n0 + token < tokens;
             const std::int64_t src =
                 static_cast<std::int64_t>(valid ? n0 + token : 0) * k + kbase + col;
-            ninfer::ops::cp_async_zfill<16>(&Xs[slot][token * Cfg::BK_PAD + col], &x_codes[src],
+            sinfer::ops::cp_async_zfill<16>(&Xs[slot][token * Cfg::BK_PAD + col], &x_codes[src],
                                             valid ? 16 : 0);
         }
         for (int i = tid; i < Cfg::BM * 2; i += Cfg::THREADS) {
@@ -164,15 +164,15 @@ __global__ __launch_bounds__(Cfg::THREADS, 2) void w8a8_imma_gemm_kernel(
 
     const int nkt = k / Cfg::BK;
     stage(0, 0);
-    ninfer::ops::cp_commit();
+    sinfer::ops::cp_commit();
 
     for (int kt = 0; kt < nkt; ++kt) {
         const int slot = kt & 1;
-        ninfer::ops::cp_wait<0>();
+        sinfer::ops::cp_wait<0>();
         __syncthreads();
         if (kt + 1 < nkt) {
             stage(kt + 1, slot ^ 1);
-            ninfer::ops::cp_commit();
+            sinfer::ops::cp_commit();
         }
 
 #pragma unroll
@@ -257,4 +257,4 @@ __global__ __launch_bounds__(Cfg::THREADS, 2) void w8a8_imma_gemm_kernel(
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

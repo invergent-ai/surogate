@@ -8,7 +8,7 @@
 #include <cstdint>
 #include <limits>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 constexpr int kD1152Pairs         = 1152 / 2;
@@ -60,4 +60,4 @@ void vision_pos_embed_add_launch(const Tensor& table, const Tensor& indices, con
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

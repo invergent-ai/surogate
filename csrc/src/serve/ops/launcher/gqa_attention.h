@@ -1,6 +1,6 @@
 #pragma once
 
-// ninfer::ops::detail - private launch prototypes for gqa_attention policies.
+// sinfer::ops::detail - private launch prototypes for gqa_attention policies.
 
 #include "core/paged_kv_cache.h"
 #include "core/tensor.h"
@@ -10,7 +10,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 enum class GqaAttentionRoute { SmallT, ChunkedSmallT, Prompt };
 
@@ -67,4 +67,4 @@ void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positi
                                            const PagedKVLayerView& cache, Tensor& out,
                                            cudaStream_t stream, GqaBlockMask selection = {});
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

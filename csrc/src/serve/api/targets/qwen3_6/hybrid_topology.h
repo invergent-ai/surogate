@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-namespace ninfer::targets::qwen3_6 {
+namespace sinfer::targets::qwen3_6 {
 
 inline constexpr std::int32_t kHybridAttentionInterval = 4;
 
@@ -26,4 +26,4 @@ inline constexpr std::int32_t kHybridAttentionInterval = 4;
     return layer - (layer + 1) / kHybridAttentionInterval;
 }
 
-} // namespace ninfer::targets::qwen3_6
+} // namespace sinfer::targets::qwen3_6

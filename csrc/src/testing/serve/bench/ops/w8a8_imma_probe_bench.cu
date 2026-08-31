@@ -17,7 +17,7 @@
 // productized kernel (marlin-class staging) has real headroom.
 
 #include "core/device.h"
-#include "ninfer_bench_common.h"
+#include "sinfer_bench_common.h"
 #include "ops/common/memory.cuh"
 #include "ops/linear/w8a8/w8a8_imma_gemm.cuh"
 #include "quantized_weight.cuh"
@@ -30,7 +30,7 @@
 #include <cstdio>
 #include <vector>
 
-using namespace ninfer;
+using namespace sinfer;
 
 namespace {
 
@@ -78,7 +78,7 @@ __global__ __launch_bounds__(THREADS, 2) void w8a8_imma_kernel(
         for (int i = tid; i < BM * (BK / 16); i += THREADS) {
             const int row = i / (BK / 16);
             const int col = (i % (BK / 16)) * 16;
-            ninfer::ops::cp_async<16, ninfer::ops::Cache::cg>(
+            sinfer::ops::cp_async<16, sinfer::ops::Cache::cg>(
                 &Ws[slot][row * BK + col],
                 &w_codes[static_cast<std::int64_t>(m0 + row) * k + kbase + col]);
         }
@@ -86,7 +86,7 @@ __global__ __launch_bounds__(THREADS, 2) void w8a8_imma_kernel(
         for (int i = tid; i < BN * (BK / 16); i += THREADS) {
             const int token = i / (BK / 16);
             const int col   = (i % (BK / 16)) * 16;
-            ninfer::ops::cp_async<16, ninfer::ops::Cache::cg>(
+            sinfer::ops::cp_async<16, sinfer::ops::Cache::cg>(
                 &Xs[slot][token * BK + col],
                 &x_codes[static_cast<std::int64_t>(n0 + token) * k + kbase + col]);
         }
@@ -109,16 +109,16 @@ __global__ __launch_bounds__(THREADS, 2) void w8a8_imma_kernel(
     const int nkt = k / BK;
     for (int pre = 0; pre < STAGES - 1 && pre < nkt; ++pre) {
         stage(pre, pre);
-        ninfer::ops::cp_commit();
+        sinfer::ops::cp_commit();
     }
 
     for (int kt = 0; kt < nkt; ++kt) {
         const int slot = kt % STAGES;
-        ninfer::ops::cp_wait<STAGES - 2>();
+        sinfer::ops::cp_wait<STAGES - 2>();
         __syncthreads();
         if (kt + STAGES - 1 < nkt) {
             stage(kt + STAGES - 1, (kt + STAGES - 1) % STAGES);
-            ninfer::ops::cp_commit();
+            sinfer::ops::cp_commit();
         }
 
 #pragma unroll
@@ -268,14 +268,14 @@ __global__ __launch_bounds__(THREADS, 2) void w8a8_imma_ldmatrix_kernel(
         for (int i = tid; i < BM * (BK / 16); i += THREADS) {
             const int row = i / (BK / 16);
             const int col = (i % (BK / 16)) * 16;
-            ninfer::ops::cp_async<16, ninfer::ops::Cache::cg>(
+            sinfer::ops::cp_async<16, sinfer::ops::Cache::cg>(
                 &Ws[slot][row * BK_PAD + col],
                 &w_codes[static_cast<std::int64_t>(m0 + row) * k + kbase + col]);
         }
         for (int i = tid; i < BN * (BK / 16); i += THREADS) {
             const int token = i / (BK / 16);
             const int col   = (i % (BK / 16)) * 16;
-            ninfer::ops::cp_async<16, ninfer::ops::Cache::cg>(
+            sinfer::ops::cp_async<16, sinfer::ops::Cache::cg>(
                 &Xs[slot][token * BK_PAD + col],
                 &x_codes[static_cast<std::int64_t>(n0 + token) * k + kbase + col]);
         }
@@ -296,15 +296,15 @@ __global__ __launch_bounds__(THREADS, 2) void w8a8_imma_ldmatrix_kernel(
 
     const int nkt = k / BK;
     stage(0, 0);
-    ninfer::ops::cp_commit();
+    sinfer::ops::cp_commit();
 
     for (int kt = 0; kt < nkt; ++kt) {
         const int slot = kt & 1;
-        ninfer::ops::cp_wait<0>();
+        sinfer::ops::cp_wait<0>();
         __syncthreads();
         if (kt + 1 < nkt) {
             stage(kt + 1, slot ^ 1);
-            ninfer::ops::cp_commit();
+            sinfer::ops::cp_commit();
         }
 
 #pragma unroll

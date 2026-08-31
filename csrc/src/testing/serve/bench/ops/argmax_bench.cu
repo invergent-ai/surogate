@@ -1,10 +1,10 @@
 // Qualification benchmark for the Qwen3.6-35B G1 argmax domains.
 //
-//   ./ninfer_argmax_bench
-//   ./ninfer_argmax_bench --shape full --cols 1
-//   ./ninfer_argmax_bench --shape shortlist --cols 120
+//   ./sinfer_argmax_bench
+//   ./sinfer_argmax_bench --shape full --cols 1
+//   ./sinfer_argmax_bench --shape shortlist --cols 120
 #include "api/ops/argmax.h"
-#include "ninfer_bench_common.h"
+#include "sinfer_bench_common.h"
 
 #include <cuda_runtime.h>
 
@@ -15,8 +15,8 @@
 #include <string>
 #include <string_view>
 
-using namespace ninfer;
-using namespace ninfer::bench;
+using namespace sinfer;
+using namespace sinfer::bench;
 
 namespace {
 
@@ -60,7 +60,7 @@ Options parse_args(int argc, char** argv) {
         } else if (arg == "--cols") {
             options.cols = parse_int(need_value("--cols"), "--cols");
         } else if (arg == "-h" || arg == "--help") {
-            usage(argc > 0 ? argv[0] : "ninfer_argmax_bench");
+            usage(argc > 0 ? argv[0] : "sinfer_argmax_bench");
             std::exit(0);
         } else {
             throw std::invalid_argument("unknown argument: " + std::string(arg));
@@ -130,7 +130,7 @@ int main(int argc, char** argv) {
             run_shape(kShortlistRows, kShortlistRows, options.cols, "shortlist");
         }
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "ninfer_argmax_bench: %s\n", e.what());
+        std::fprintf(stderr, "sinfer_argmax_bench: %s\n", e.what());
         return 2;
     }
     return 0;

@@ -16,7 +16,7 @@
 #include <string>
 #include <type_traits>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 constexpr int kN                  = 48;
@@ -286,7 +286,7 @@ void launch_bf16_prefill_mma(Bf16GdnGatingTokenVariant variant, const Tensor& x,
                     static_cast<unsigned>(SplitK));
     auto launch = [&](auto full_tokens) {
         constexpr bool FullTokens     = decltype(full_tokens)::value;
-        CUDA_CHECK(::ninfer::ops::set_func_attribute_per_device(
+        CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(
             bf16_gdn_gating_proj_gemm_mma_kernel<Geometry, SplitK, FullTokens, Warps,
                                                  NormalizeInput, NormTokenCapacity>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
@@ -720,4 +720,4 @@ void bf16_gdn_gating_proj_35_mma_unsplit_launch(Bf16GdnGatingTokenVariant varian
                                                      stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

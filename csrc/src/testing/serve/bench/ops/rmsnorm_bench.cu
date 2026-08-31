@@ -5,12 +5,12 @@
 //   prefill chunk T=1024
 //
 // Narrow one-case profiling examples:
-//   ./ninfer_rmsnorm_bench --kind dflash_hidden --tokens 1024
-//   ./ninfer_rmsnorm_bench --kind dflash_q --t-sweep 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16
-//   ncu ... ./ninfer_rmsnorm_bench --kind dflash_k --tokens 16 --profile
+//   ./sinfer_rmsnorm_bench --kind dflash_hidden --tokens 1024
+//   ./sinfer_rmsnorm_bench --kind dflash_q --t-sweep 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16
+//   ncu ... ./sinfer_rmsnorm_bench --kind dflash_k --tokens 16 --profile
 #include "api/ops/gated_rmsnorm.h"
 #include "api/ops/rmsnorm.h"
-#include "ninfer_bench_common.h"
+#include "sinfer_bench_common.h"
 #include "ops/kernel/rmsnorm.cuh"
 
 #include <cuda_bf16.h>
@@ -23,8 +23,8 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::bench;
+using namespace sinfer;
+using namespace sinfer::bench;
 
 namespace {
 

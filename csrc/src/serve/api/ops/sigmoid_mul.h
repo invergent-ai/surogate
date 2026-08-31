@@ -4,7 +4,7 @@
 
 #include <cuda_runtime.h> // cudaStream_t
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 /**
  * Elementwise sigmoid gate:
@@ -19,4 +19,4 @@ namespace ninfer::ops {
  */
 void sigmoid_mul(const Tensor& gate, Tensor& x, cudaStream_t stream);
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

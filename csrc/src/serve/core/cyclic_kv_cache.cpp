@@ -7,7 +7,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer {
+namespace sinfer {
 namespace {
 
 constexpr std::size_t kArenaAlign = 256;
@@ -122,4 +122,4 @@ void CyclicKVCache::copy_lane_from(const CyclicKVCache& source, std::int32_t lan
     }
 }
 
-} // namespace ninfer
+} // namespace sinfer

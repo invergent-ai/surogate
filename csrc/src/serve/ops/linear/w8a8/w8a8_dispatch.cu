@@ -16,7 +16,7 @@
 
 #include <cuda_bf16.h>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 struct Split2ColumnMajor {
@@ -313,4 +313,4 @@ void w8a8_gemm_residual(const Tensor& x, const Weight& weight, Tensor& residual_
            workspace, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

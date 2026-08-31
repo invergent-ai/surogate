@@ -12,7 +12,7 @@
 #include <string_view>
 #include <vector>
 
-namespace ninfer::artifact {
+namespace sinfer::artifact {
 
 struct LoadProgress {
     std::function<void(std::string_view, std::uint64_t, std::uint64_t)> callback;
@@ -63,4 +63,4 @@ private:
 MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan& plan,
                                  DeviceContext& device, LoadProgress* progress = nullptr);
 
-} // namespace ninfer::artifact
+} // namespace sinfer::artifact

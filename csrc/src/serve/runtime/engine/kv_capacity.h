@@ -4,10 +4,10 @@
 
 #include <cstddef>
 
-namespace ninfer::runtime {
+namespace sinfer::runtime {
 
 [[nodiscard]] KvCapacityResolution resolve_kv_capacity(const KvCapacityPolicy& policy,
                                                        const SequenceCapacityCurve& curve,
                                                        std::size_t available_runtime_bytes);
 
-} // namespace ninfer::runtime
+} // namespace sinfer::runtime

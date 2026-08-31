@@ -6,7 +6,7 @@
 
 
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 template <class Schedule, bool Full>
@@ -124,4 +124,4 @@ void w8_linear_swiglu_mma_r128_c80_launch(const Tensor& x, const Weight& w,
     launch_route<Schedule>(x, w, out, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

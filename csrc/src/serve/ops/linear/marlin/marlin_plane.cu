@@ -11,7 +11,7 @@
 #include <map>
 #include <mutex>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 bool g_enabled = false;
@@ -602,4 +602,4 @@ bool marlin_w8_run(const Tensor& x, const Weight& weight, Tensor& out, cudaStrea
     return true;
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

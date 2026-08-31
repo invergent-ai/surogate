@@ -10,7 +10,7 @@
 #include <array>
 #include <cstdint>
 
-namespace ninfer::targets::qwen4exp::detail {
+namespace sinfer::targets::qwen4exp::detail {
 
 struct TextConfig {
     static constexpr int hidden       = 2560;
@@ -153,4 +153,4 @@ inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 15;
 // `qwen4exp.context_length = 262144`.
 inline constexpr std::uint32_t kNativeContext            = 262144;
 
-} // namespace ninfer::targets::qwen4exp::detail
+} // namespace sinfer::targets::qwen4exp::detail

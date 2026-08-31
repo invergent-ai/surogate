@@ -13,7 +13,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 using Geometry = Fp8MlpGateUpGeometry;
@@ -33,7 +33,7 @@ void launch_mma(const Weight& weight, Tensor& out, Fp8A8Workspace workspace, std
     const Fp8SwiGluOutput output{static_cast<__nv_bfloat16*>(out.data), kIntermediate};
 
     if constexpr (Sched::kSharedBytes > 48 * 1024) {
-        CUDA_CHECK(::ninfer::ops::set_func_attribute_per_device(
+        CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(
             fp8_mma_kernel<Geometry, Sched, FullTokens, Fp8IdentityEpilogue, Fp8SwiGluOutput,
                            Rows, true>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, Sched::kSharedBytes));
@@ -67,4 +67,4 @@ void fp8_linear_swiglu_a8_launch(const Tensor& x, const Weight& weight, Tensor& 
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

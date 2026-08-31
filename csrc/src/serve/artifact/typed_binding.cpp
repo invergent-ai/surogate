@@ -7,7 +7,7 @@
 #include <span>
 #include <stdexcept>
 
-namespace ninfer::artifact {
+namespace sinfer::artifact {
 namespace {
 
 StorageLayout storage_layout_for(NumericFormat format) {
@@ -192,4 +192,4 @@ Weight materialized_weight(const MaterializedArtifact& materialized, ObjectHandl
     return row_split_weight(materialized, handle, format, rows, columns);
 }
 
-} // namespace ninfer::artifact
+} // namespace sinfer::artifact

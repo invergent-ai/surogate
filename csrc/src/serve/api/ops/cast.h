@@ -4,7 +4,7 @@
 
 #include <cuda_runtime.h>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 /**
  * Op: cast_fp32_to_bf16
@@ -30,4 +30,4 @@ namespace ninfer::ops {
  */
 void cast_fp32_to_bf16(const Tensor& source, Tensor& destination, cudaStream_t stream);
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

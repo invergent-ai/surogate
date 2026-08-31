@@ -8,7 +8,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer {
+namespace sinfer {
 
 struct HostWorkerPool::Impl {
     Impl(std::uint32_t thread_count, std::size_t capacity)
@@ -114,4 +114,4 @@ HostWorkerPool::Snapshot HostWorkerPool::snapshot() const {
         .threads = impl_->threads_count, .queued = impl_->queue.size(), .active = impl_->active};
 }
 
-} // namespace ninfer
+} // namespace sinfer

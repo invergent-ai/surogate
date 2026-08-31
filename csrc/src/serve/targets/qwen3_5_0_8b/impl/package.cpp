@@ -9,7 +9,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace ninfer::targets::qwen3_5_0_8b::detail {
+namespace sinfer::targets::qwen3_5_0_8b::detail {
 
 class LoadPlan::Impl {
 public:
@@ -35,9 +35,9 @@ LoadedModel::LoadedModel(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(
 
 LoadedModel::~LoadedModel() = default;
 
-} // namespace ninfer::targets::qwen3_5_0_8b::detail
+} // namespace sinfer::targets::qwen3_5_0_8b::detail
 
-namespace ninfer::targets::qwen3_5_0_8b {
+namespace sinfer::targets::qwen3_5_0_8b {
 namespace {
 
 // General-task presets published with each exact model. Keep the registrations separate even
@@ -142,4 +142,4 @@ Package::create_program(const LoadedModel& model, SequencePlan&& plan, DeviceCon
         model.impl_->data.runtime, model.impl_->weights_profile, std::move(plan), device);
 }
 
-} // namespace ninfer::targets::qwen3_5_0_8b
+} // namespace sinfer::targets::qwen3_5_0_8b

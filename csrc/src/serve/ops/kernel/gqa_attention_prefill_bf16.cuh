@@ -25,7 +25,7 @@
 #include "ops/kernel/gqa_attention_prefill_common.cuh"
 #include "ops/kernel/gqa_attention_kv_quant.cuh"
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 template <typename Geometry, typename Metadata, typename CacheT = __nv_bfloat16>
 __global__ void gqa_attention_prefill_fill_bf16_kernel(
@@ -243,21 +243,21 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
     int physical_page    = block_table[0];
 
     // Prologue: commit Q, then kick off K(0). The loop's wait<0> below drains both.
-    ninfer::ops::cp_commit();
+    sinfer::ops::cp_commit();
     gqa_prefill_stage_kv<Geometry, CacheT>(k_s, cache_k, kv_head, 0, max_query_abs, physical_page, tid);
-    ninfer::ops::cp_commit();
+    sinfer::ops::cp_commit();
 
     for (int kb = 0; kb < n_block_max; ++kb) {
         const int k0                 = kb * Bc;
         const int next_physical_page = (kb + 1 < n_block_max) ? block_table[kb + 1] : physical_page;
 
-        ninfer::ops::cp_wait<0>(); // K(kb) landed (also publishes q_s / prev PV done)
+        sinfer::ops::cp_wait<0>(); // K(kb) landed (also publishes q_s / prev PV done)
         __syncthreads();
 
         // Overlap V(kb) load against the QK MMA below.
         gqa_prefill_stage_kv<Geometry, CacheT>(v_s, cache_v, kv_head, k0, max_query_abs, physical_page,
                                        tid);
-        ninfer::ops::cp_commit();
+        sinfer::ops::cp_commit();
 
         // S = Q Kᵀ for this warp's 16 rows over all Bc keys, in registers.
         // Software-pipelined like cute's gemm: issue the ldmatrix for contraction
@@ -427,7 +427,7 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
             acc[n][3] *= alpha1;
         }
 
-        ninfer::ops::cp_wait<0>(); // V(kb) landed; QK done reading k_s
+        sinfer::ops::cp_wait<0>(); // V(kb) landed; QK done reading k_s
         __syncthreads();
 
         // Prefetch K(kb+1) into the (now-free) K buffer, overlapping the PV MMA.
@@ -435,7 +435,7 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
             physical_page = next_physical_page;
             gqa_prefill_stage_kv<Geometry, CacheT>(k_s, cache_k, kv_head, (kb + 1) * Bc, max_query_abs,
                                            physical_page, tid);
-            ninfer::ops::cp_commit();
+            sinfer::ops::cp_commit();
         }
 
         // O += P V, contracting over the Bc keys. The (k, n) iteration space is
@@ -495,4 +495,4 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
     gqa_prefill_zero_output_rows<Geometry>(out, q_head, tokens, min(q0 + Br, width), tid, Threads);
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

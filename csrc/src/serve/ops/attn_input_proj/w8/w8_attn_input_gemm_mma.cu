@@ -4,7 +4,7 @@
 #include "ops/common/math.h"
 #include "ops/linear/w8/w8_rowsplit_gemm_mma.cuh"
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 constexpr int kTargetRows    = 9216;
@@ -179,4 +179,4 @@ void w8_companion_attn_input_mma_r128_c80_launch(const Tensor& x, const Weight& 
     launch_route<Schedule, kCompanionRows, kHidden>(x, weight, output, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

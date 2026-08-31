@@ -7,7 +7,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 namespace {
 
 void require_i32_vector(const Tensor& tensor, std::int32_t size, const char* name) {
@@ -65,4 +65,4 @@ void prepare_masked_block(const Tensor& anchors, const Tensor& lengths, const Te
                                         block_size, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

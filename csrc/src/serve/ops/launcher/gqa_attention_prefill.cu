@@ -1,4 +1,4 @@
-// ninfer::ops - gqa_attention prompt-scale launcher: fill k/v at device
+// sinfer::ops - gqa_attention prompt-scale launcher: fill k/v at device
 // positions then launch causal attention over absolute cached history.
 #include "ops/launcher/gqa_attention.h"
 #include "ops/kernel/func_attribute.cuh"
@@ -11,7 +11,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 template <typename Geometry, typename CacheView, typename Metadata>
@@ -27,9 +27,9 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
             "gqa_attention: the QSA selection needs a BF16 KV cache (the quantized kernels are dense)");
     }
     // Both dtype-specialized kernels exceed the default 48 KiB dynamic-smem ceiling.
-    CUDA_CHECK(::ninfer::ops::set_func_attribute_per_device(gqa_attention_prefill_bf16_kernel<Geometry, Metadata>,
+    CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(gqa_attention_prefill_bf16_kernel<Geometry, Metadata>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaPrefillSmemBytes));
-    CUDA_CHECK(::ninfer::ops::set_func_attribute_per_device(gqa_attention_prefill_i8_kernel<Geometry, Metadata>,
+    CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(gqa_attention_prefill_i8_kernel<Geometry, Metadata>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaPrefillI8SmemBytes));
 
     const auto tokens = static_cast<std::int32_t>(q.ne[2]);
@@ -48,7 +48,7 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
                 static_cast<const std::int32_t*>(positions.data), scale,
                 static_cast<__nv_bfloat16*>(out.data), tokens);
     } else if (cache.dtype == DType::FP8_E4M3FN) {
-        CUDA_CHECK(::ninfer::ops::set_func_attribute_per_device(
+        CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(
             gqa_attention_prefill_bf16_kernel<Geometry, Metadata, std::uint8_t>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaPrefillSmemBytes));
         const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillBr)),
@@ -68,7 +68,7 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
             if (selection.block != 4) {
                 throw std::invalid_argument("gqa_attention: unregistered QSA block size");
             }
-            CUDA_CHECK(::ninfer::ops::set_func_attribute_per_device(
+            CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(
                 gqa_attention_prefill_bf16_kernel<Geometry, Metadata, __nv_bfloat16, true, 4>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaPrefillSmemBytes));
             gqa_attention_prefill_bf16_kernel<Geometry, Metadata, __nv_bfloat16, true, 4>
@@ -256,4 +256,4 @@ void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor&
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

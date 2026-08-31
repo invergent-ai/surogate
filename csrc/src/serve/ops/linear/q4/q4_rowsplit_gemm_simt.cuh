@@ -24,7 +24,7 @@
 #include <cstdint>
 #include <type_traits>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 template <int RowsPerCta_, int ColsPerTile_, int GroupsPerStage_, int PipelineStages_,
           Cache CodeCache_, int LaunchBoundsMinBlocks_>
@@ -319,4 +319,4 @@ __global__ __launch_bounds__(
     if constexpr (JoinPdl) { pdl::wait_for_dependencies(); }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

@@ -8,7 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 /**
  * @brief Permitted private activation-compute profiles for a linear projection.
@@ -118,4 +118,4 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
  */
 void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

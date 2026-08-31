@@ -1,11 +1,11 @@
-// ninfer::ops - mask_columns wrapper: public api validation and launcher dispatch.
+// sinfer::ops - mask_columns wrapper: public api validation and launcher dispatch.
 #include "api/ops/mask_columns.h"
 
 #include "ops/launcher/mask_columns.h"
 
 #include <stdexcept>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 void mask_columns_zero(Tensor& matrix, const Tensor& valid_columns, cudaStream_t stream) {
     if (matrix.dtype != DType::FP32 && matrix.dtype != DType::BF16) {
@@ -25,4 +25,4 @@ void mask_columns_zero(Tensor& matrix, const Tensor& valid_columns, cudaStream_t
     detail::mask_columns_zero_launch(matrix, valid_columns, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

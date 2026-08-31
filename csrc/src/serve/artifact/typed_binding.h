@@ -7,7 +7,7 @@
 #include <initializer_list>
 #include <string_view>
 
-namespace ninfer::artifact {
+namespace sinfer::artifact {
 
 class MaterializedArtifact;
 
@@ -29,4 +29,4 @@ class MaterializedArtifact;
                                          ObjectHandle handle, NumericFormat format,
                                          std::int32_t rows, std::int32_t columns);
 
-} // namespace ninfer::artifact
+} // namespace sinfer::artifact

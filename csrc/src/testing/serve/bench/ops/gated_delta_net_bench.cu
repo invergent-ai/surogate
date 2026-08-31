@@ -11,7 +11,7 @@
 // each timed replay.
 #include "api/ops/gated_delta_net.h"
 #include "api/ops/l2norm.h"
-#include "ninfer_bench_common.h"
+#include "sinfer_bench_common.h"
 #include "ops/linear_attention/gated_delta_net/chunked/launch.h"
 
 #include <cuda_runtime.h>
@@ -28,13 +28,13 @@
 #include <string_view>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::bench;
+using namespace sinfer;
+using namespace sinfer::bench;
 
 namespace {
 
-namespace gated_delta_net_detail = ninfer::ops::detail::gated_delta_net;
-namespace chunked_detail         = ninfer::ops::detail::gated_delta_net::chunked;
+namespace gated_delta_net_detail = sinfer::ops::detail::gated_delta_net;
+namespace chunked_detail         = sinfer::ops::detail::gated_delta_net::chunked;
 
 constexpr std::int32_t kDefaultQkHeads      = 16;
 constexpr std::int32_t kDefaultValueHeads   = 48;
@@ -968,7 +968,7 @@ int main(int argc, char** argv) {
         return 0;
     } catch (const std::exception& error) {
         if (stream != nullptr) { cudaStreamDestroy(stream); }
-        std::fprintf(stderr, "ninfer_gated_delta_net_bench: %s\n", error.what());
+        std::fprintf(stderr, "sinfer_gated_delta_net_bench: %s\n", error.what());
         return 1;
     }
 }

@@ -11,7 +11,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 namespace {
 
 constexpr std::int32_t kHeadDim = 128;
@@ -139,4 +139,4 @@ void swa(const Tensor& q, const Tensor& query_k, const Tensor& query_v, const Te
                        partial.acc, partial.m, partial.l, out, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

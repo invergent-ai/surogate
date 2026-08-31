@@ -1,5 +1,5 @@
 #include "api/ops/vision_pos_embed.h"
-#include "ninfer_bench_common.h"
+#include "sinfer_bench_common.h"
 
 #include <cuda_runtime.h>
 
@@ -10,8 +10,8 @@
 #include <cstring>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::bench;
+using namespace sinfer;
+using namespace sinfer::bench;
 
 namespace {
 

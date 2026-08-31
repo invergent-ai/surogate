@@ -15,7 +15,7 @@
 
 namespace {
 
-namespace q36 = ninfer::targets::qwen3_6;
+namespace q36 = sinfer::targets::qwen3_6;
 
 int failures = 0;
 
@@ -39,7 +39,7 @@ void test_topology() {
     }
 }
 
-q36::DecoderStateSpec decoder_spec(ninfer::DType dtype, bool mtp) {
+q36::DecoderStateSpec decoder_spec(sinfer::DType dtype, bool mtp) {
     return q36::DecoderStateSpec{
         .full_attention_layers     = 2,
         .mtp_layers                = 1,
@@ -47,7 +47,7 @@ q36::DecoderStateSpec decoder_spec(ninfer::DType dtype, bool mtp) {
         .kv_heads                  = 2,
         .attention_head_dim        = 64,
         .kv_dtype                  = dtype,
-        .kv_quant_group            = dtype == ninfer::DType::I8 ? q36::kKvQuantGroup : 0,
+        .kv_quant_group            = dtype == sinfer::DType::I8 ? q36::kKvQuantGroup : 0,
         .enable_mtp                = mtp,
         .text_physical_page_groups = 5,
         .mtp_physical_page_groups  = mtp ? 4U : 0U,
@@ -60,15 +60,15 @@ q36::DecoderStateSpec decoder_spec(ninfer::DType dtype, bool mtp) {
                 .value_head_dim = 5,
                 .key_head_dim   = 6,
                 .slot_count     = 4,
-                .conv_dtype     = ninfer::DType::BF16,
+                .conv_dtype     = sinfer::DType::BF16,
             },
     };
 }
 
 void test_decoder_layout() {
-    ninfer::LayoutBuilder bf16_builder;
+    sinfer::LayoutBuilder bf16_builder;
     const q36::DecoderStateLayout bf16 =
-        q36::plan_decoder_state(bf16_builder, decoder_spec(ninfer::DType::BF16, false));
+        q36::plan_decoder_state(bf16_builder, decoder_spec(sinfer::DType::BF16, false));
     (void)bf16_builder.finish(256);
     expect(bf16.text_kv.pool.planes.size() == 4, "BF16 Text KV has K/V planes per layer");
     expect(bf16.text_kv.pool.spec.page_group_count == 5 &&
@@ -76,8 +76,8 @@ void test_decoder_layout() {
                bf16.text_kv.pool.spec.table_rows == 1,
            "Text KV separates five physical pages from three logical pages");
     expect(std::all_of(bf16.text_kv.pool.planes.begin(), bf16.text_kv.pool.planes.end(),
-                       [](const ninfer::PagedKVPlaneLayout& plane) {
-                           return plane.spec.dtype == ninfer::DType::BF16;
+                       [](const sinfer::PagedKVPlaneLayout& plane) {
+                           return plane.spec.dtype == sinfer::DType::BF16;
                        }),
            "BF16 KV has no scale planes");
     expect(!bf16.mtp_kv.has_value(), "disabled MTP omits KV storage");
@@ -86,33 +86,33 @@ void test_decoder_layout() {
     expect(bf16.linear_attention.spec.slot_count == 4, "Linear Attention slot geometry");
     expect(bf16.kv_payload_bytes() == bf16.text_kv.payload_bytes(), "BF16 KV payload accounting");
 
-    ninfer::LayoutBuilder int8_builder;
+    sinfer::LayoutBuilder int8_builder;
     const q36::DecoderStateLayout int8 =
-        q36::plan_decoder_state(int8_builder, decoder_spec(ninfer::DType::I8, true));
+        q36::plan_decoder_state(int8_builder, decoder_spec(sinfer::DType::I8, true));
     (void)int8_builder.finish(256);
     expect(int8.text_kv.pool.planes.size() == 8 &&
-               int8.text_kv.pool.planes[2].spec.dtype == ninfer::DType::FP16 &&
-               int8.text_kv.pool.planes[3].spec.dtype == ninfer::DType::FP16,
+               int8.text_kv.pool.planes[2].spec.dtype == sinfer::DType::FP16 &&
+               int8.text_kv.pool.planes[3].spec.dtype == sinfer::DType::FP16,
            "INT8 Text KV has code and scale planes per layer");
     expect(int8.mtp_kv.has_value() && int8.mtp_kv->layers == 1 &&
                int8.mtp_kv->pool.planes.size() == 4 &&
                int8.mtp_kv->pool.spec.page_group_count == 4 &&
                int8.mtp_kv->pool.spec.logical_page_capacity == 3,
            "enabled MTP has one paged KV layer");
-    expect(int8.mtp_kv && int8.mtp_kv->pool.planes[2].spec.dtype == ninfer::DType::FP16 &&
-               int8.mtp_kv->pool.planes[3].spec.dtype == ninfer::DType::FP16,
+    expect(int8.mtp_kv && int8.mtp_kv->pool.planes[2].spec.dtype == sinfer::DType::FP16 &&
+               int8.mtp_kv->pool.planes[3].spec.dtype == sinfer::DType::FP16,
            "INT8 MTP KV has scale planes");
     expect(int8.kv_payload_bytes() == int8.text_kv.payload_bytes() + int8.mtp_kv->payload_bytes(),
            "INT8 Text/MTP KV payload accounting");
 }
 
 void test_round_layout() {
-    ninfer::LayoutBuilder builder;
+    sinfer::LayoutBuilder builder;
     q36::RoundStateLayout round = q36::begin_round_state_layout(
         builder, q36::RoundStateSpec{
                      .hidden = 32, .output_rows = 128, .draft_window = 5, .enable_mtp = true});
-    const ninfer::TensorRegion exact_prefill =
-        builder.add_tensor(ninfer::DType::BF16, {32, 16}, 256, "exact prefill hidden");
+    const sinfer::TensorRegion exact_prefill =
+        builder.add_tensor(sinfer::DType::BF16, {32, 16}, 256, "exact prefill hidden");
     q36::complete_round_state_layout(builder, round);
     (void)builder.finish(256);
     expect(round.complete, "round layout completes");
@@ -129,7 +129,7 @@ void test_round_layout() {
                round.mtp_decode->alignment_ids.shape[1] == 1,
            "MTP decode frame is explicit");
 
-    ninfer::LayoutBuilder speculative_builder;
+    sinfer::LayoutBuilder speculative_builder;
     q36::RoundStateLayout dflash = q36::begin_round_state_layout(
         speculative_builder,
         q36::RoundStateSpec{
@@ -228,7 +228,7 @@ q36::PreparedPromptData identity_prompt(std::uint8_t digest_byte = 1) {
     return prompt;
 }
 
-void append_text_token(q36::PreparedPromptData& prompt, ninfer::TokenId token,
+void append_text_token(q36::PreparedPromptData& prompt, sinfer::TokenId token,
                        std::int32_t position) {
     const std::size_t old_tokens = prompt.token_ids.size();
     std::vector<std::int32_t> positions;
@@ -246,7 +246,7 @@ void append_text_token(q36::PreparedPromptData& prompt, ninfer::TokenId token,
 
 void test_prefix_identity() {
     q36::PreparedPromptData original    = identity_prompt();
-    std::vector<ninfer::TokenId> ledger = original.token_ids;
+    std::vector<sinfer::TokenId> ledger = original.token_ids;
     q36::detail::ResidentPrefixIdentity resident;
     resident.reserve(16);
     resident.assign(original);

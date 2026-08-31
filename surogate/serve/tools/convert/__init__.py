@@ -1,1 +1,1 @@
-"""NInfer offline conversion packages."""
+"""SInfer offline conversion packages."""

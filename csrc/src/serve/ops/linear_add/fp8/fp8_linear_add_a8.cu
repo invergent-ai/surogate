@@ -15,7 +15,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 template <class Geometry, class Schedule, bool FullTokens>
@@ -29,7 +29,7 @@ void launch_mma(const Weight& weight, Tensor& residual, Fp8A8Workspace workspace
     const Fp8ContiguousOutput destination{output, Geometry::kOutputRows};
 
     if constexpr (Schedule::kSharedBytes > 48 * 1024) {
-        CUDA_CHECK(::ninfer::ops::set_func_attribute_per_device(
+        CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(
             fp8_mma_kernel<Geometry, Schedule, FullTokens, Fp8AddResidualEpilogue,
                            Fp8ContiguousOutput>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, Schedule::kSharedBytes));
@@ -92,4 +92,4 @@ void fp8_linear_add_a8_launch(const Tensor& x, const Weight& weight, Tensor& res
     throw std::invalid_argument("fp8 linear_add: unsupported problem");
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

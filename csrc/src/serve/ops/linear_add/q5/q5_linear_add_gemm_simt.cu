@@ -8,7 +8,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 template <int Cols, int FullSlabs, int Stride>
@@ -37,26 +37,26 @@ void dispatch_shape(const Tensor& x, const Weight& w, Tensor& residual_out, cuda
 template <class Launch>
 void dispatch_cols(std::int32_t cols, Launch&& launch) {
     switch (cols) {
-#define NINFER_Q5_LINEAR_ADD_EXACT(COLS)                                                           \
+#define SINFER_Q5_LINEAR_ADD_EXACT(COLS)                                                           \
     case COLS:                                                                                     \
         launch.template operator()<COLS>();                                                        \
         return
-        NINFER_Q5_LINEAR_ADD_EXACT(2);
-        NINFER_Q5_LINEAR_ADD_EXACT(3);
-        NINFER_Q5_LINEAR_ADD_EXACT(4);
-        NINFER_Q5_LINEAR_ADD_EXACT(5);
-        NINFER_Q5_LINEAR_ADD_EXACT(6);
-        NINFER_Q5_LINEAR_ADD_EXACT(7);
-        NINFER_Q5_LINEAR_ADD_EXACT(8);
-        NINFER_Q5_LINEAR_ADD_EXACT(9);
-        NINFER_Q5_LINEAR_ADD_EXACT(10);
-        NINFER_Q5_LINEAR_ADD_EXACT(11);
-        NINFER_Q5_LINEAR_ADD_EXACT(12);
-        NINFER_Q5_LINEAR_ADD_EXACT(13);
-        NINFER_Q5_LINEAR_ADD_EXACT(14);
-        NINFER_Q5_LINEAR_ADD_EXACT(15);
-        NINFER_Q5_LINEAR_ADD_EXACT(16);
-#undef NINFER_Q5_LINEAR_ADD_EXACT
+        SINFER_Q5_LINEAR_ADD_EXACT(2);
+        SINFER_Q5_LINEAR_ADD_EXACT(3);
+        SINFER_Q5_LINEAR_ADD_EXACT(4);
+        SINFER_Q5_LINEAR_ADD_EXACT(5);
+        SINFER_Q5_LINEAR_ADD_EXACT(6);
+        SINFER_Q5_LINEAR_ADD_EXACT(7);
+        SINFER_Q5_LINEAR_ADD_EXACT(8);
+        SINFER_Q5_LINEAR_ADD_EXACT(9);
+        SINFER_Q5_LINEAR_ADD_EXACT(10);
+        SINFER_Q5_LINEAR_ADD_EXACT(11);
+        SINFER_Q5_LINEAR_ADD_EXACT(12);
+        SINFER_Q5_LINEAR_ADD_EXACT(13);
+        SINFER_Q5_LINEAR_ADD_EXACT(14);
+        SINFER_Q5_LINEAR_ADD_EXACT(15);
+        SINFER_Q5_LINEAR_ADD_EXACT(16);
+#undef SINFER_Q5_LINEAR_ADD_EXACT
     default:
         throw std::invalid_argument("q5 linear_add split2: T must be in [2,16]");
     }
@@ -70,4 +70,4 @@ void q5_linear_add_split2_exact_launch(const Tensor& x, const Weight& w, Tensor&
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

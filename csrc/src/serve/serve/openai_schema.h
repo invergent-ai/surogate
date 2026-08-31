@@ -12,7 +12,7 @@
 #include <optional>
 #include <string>
 
-namespace ninfer::serve {
+namespace sinfer::serve {
 
 // ApiError, ApiException, RequestLimits, and CompletionUsage are the wire-format
 // independent request/error types; they live in request.h and are shared by the
@@ -76,4 +76,4 @@ std::string make_error_body(const ApiError& error);
 std::string new_chat_completion_id();
 std::int64_t unix_time_now();
 
-} // namespace ninfer::serve
+} // namespace sinfer::serve

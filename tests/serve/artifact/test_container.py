@@ -53,7 +53,7 @@ def _payload(spec):
 
 
 def test_v2_round_trip_covers_every_registered_storage(tmp_path):
-    path = tmp_path / "small.ninfer"
+    path = tmp_path / "small.sinfer"
     specs = _small_specs()
     entries = [(spec, _payload(spec)) for spec in specs]
     identity = ArtifactIdentity("test-model", "test-weights")
@@ -105,7 +105,7 @@ def _write_raw(
 
 
 def test_reader_rejects_invalid_framing_schema_and_geometry(tmp_path):
-    path = tmp_path / "invalid.ninfer"
+    path = tmp_path / "invalid.sinfer"
 
     path.write_bytes(PREFIX.pack(MAGIC, 100) + b"{}")
     with pytest.raises(ArtifactError, match="beyond the file"):
@@ -167,10 +167,13 @@ def test_reader_rejects_invalid_framing_schema_and_geometry(tmp_path):
 
 
 def test_reader_rejects_v1_with_the_migration_command(tmp_path):
-    path = tmp_path / "legacy.ninfer"
+    path = tmp_path / "legacy.sinfer"
     _write_raw(
         path,
         {"model_id": "test-model", "objects": [{"unused": True}]},
+        # v1 artifacts predate the sinfer rename, so real ones carry NINFER --
+        # the reader must keep recognising those exact bytes to route them to
+        # the v1 migration rather than calling them corrupt.
         magic=b"NINFER\x00\x01",
     )
     with pytest.raises(

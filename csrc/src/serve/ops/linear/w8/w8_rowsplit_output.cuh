@@ -4,7 +4,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 enum class W8Epilogue {
     Store,
@@ -108,4 +108,4 @@ struct W8SplitOutput4 {
     }
 };
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

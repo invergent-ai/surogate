@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 constexpr int kRowsPerBlock = 8;
@@ -139,4 +139,4 @@ void w8_linear_add_simt_r8_c8_launch(bool full, const Tensor& x, const Weight& w
     launch_variant<8>(full, x, w, residual_out, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

@@ -6,7 +6,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 namespace {
 
 void require_contiguous_nonnull(const Tensor& t, const char* op, const char* name) {
@@ -179,4 +179,4 @@ void proposal_remap_token_ids(Tensor& proposal_tokens, const std::int32_t* id_ma
     detail::proposal_remap_token_ids_launch(proposal_tokens, id_map, n, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

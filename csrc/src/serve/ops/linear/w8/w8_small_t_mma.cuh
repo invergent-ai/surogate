@@ -18,7 +18,7 @@
 #include <cstdint>
 #include <type_traits>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 struct W8SmallTMmaStoreEpilogue {};
 
@@ -358,4 +358,4 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void w8_small_t
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

@@ -1,11 +1,11 @@
 #pragma once
 
-// Implements: include/ninfer/ops/mtp_round.h
+// Implements: include/sinfer/ops/mtp_round.h
 // Match: request-major fixed K=1..5 autoregressive MTP round transition.
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 __global__ void mtp_prepare_next_round_kernel(
     const std::int32_t* verify_ids, const std::int32_t* next_anchors, const std::int32_t* accepted,
@@ -41,4 +41,4 @@ __global__ void mtp_prepare_next_round_kernel(
     }
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

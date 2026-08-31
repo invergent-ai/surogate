@@ -8,7 +8,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace ninfer {
+namespace sinfer {
 
 struct LinearAttentionStatePoolSpec {
     std::uint32_t layers        = 0;
@@ -65,4 +65,4 @@ struct LinearAttentionStatePool {
     void zero_slot(std::int32_t slot, cudaStream_t stream = nullptr);
 };
 
-} // namespace ninfer
+} // namespace sinfer

@@ -15,7 +15,7 @@
 #include <mutex>
 #include <unordered_map>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 constexpr int kThreads = 256;
@@ -238,4 +238,4 @@ W8Fp8QuantizedActivations w8fp8_act_quant(const Tensor& x, void* workspace,
     return {codes, scales};
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

@@ -8,7 +8,7 @@
 
 namespace {
 
-using namespace ninfer::serve;
+using namespace sinfer::serve;
 
 int check(bool condition, const char* message) {
     if (condition) { return 0; }
@@ -28,7 +28,7 @@ ServeOptions parse(std::vector<std::string> arguments) {
 int main() {
     int failures = 0;
 
-    const ServeOptions defaults = parse({"ninfer-serve", "model.ninfer"});
+    const ServeOptions defaults = parse({"sinfer-serve", "model.sinfer"});
     failures += check(defaults.allow_prefix_reuse, "prefix reuse is not enabled by default");
     failures +=
         check(!defaults.preserve_thinking, "thinking history is unexpectedly preserved by default");
@@ -37,14 +37,14 @@ int main() {
                       "request JSONL logging is not disabled by default");
     failures += check(defaults.log_stats_interval_ms == 5000,
                       "periodic throughput interval default mismatch");
-    failures += check(defaults.media_cache_bytes == ninfer::kDefaultMediaCacheBytes &&
-                          defaults.media_live_bytes == ninfer::kDefaultMediaLiveBytes &&
+    failures += check(defaults.media_cache_bytes == sinfer::kDefaultMediaCacheBytes &&
+                          defaults.media_live_bytes == sinfer::kDefaultMediaLiveBytes &&
                           defaults.media_preprocess_threads == 0,
                       "media preparation resource defaults mismatch");
-    failures += check(defaults.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
+    failures += check(defaults.kv_capacity.mode == sinfer::KvCapacityMode::Explicit &&
                           defaults.kv_capacity.explicit_tokens == defaults.max_context,
                       "default KV capacity does not follow max context");
-    failures += check(defaults.speculative.backend == ninfer::SpeculativeBackend::None,
+    failures += check(defaults.speculative.backend == sinfer::SpeculativeBackend::None,
                       "speculative decoding is not disabled by default");
     failures += check(defaults.response_store_max_records == kDefaultResponseStoreRecords &&
                           defaults.response_store_max_bytes == kDefaultResponseStoreBytes,
@@ -60,7 +60,7 @@ int main() {
                       "artifact model id was not selected by default");
 
     const ServeOptions model_alias =
-        parse({"ninfer-serve", "model.ninfer", "--served-model-name", "deployment-alias"});
+        parse({"sinfer-serve", "model.sinfer", "--served-model-name", "deployment-alias"});
     failures +=
         check(model_alias.model_id_override == "deployment-alias" &&
                   resolve_public_model_id(model_alias, "artifact-model") == "deployment-alias",
@@ -68,34 +68,34 @@ int main() {
 
     bool empty_model_id_rejected = false;
     try {
-        (void)parse({"ninfer-serve", "model.ninfer", "--served-model-name", ""});
+        (void)parse({"sinfer-serve", "model.sinfer", "--served-model-name", ""});
     } catch (const std::invalid_argument&) { empty_model_id_rejected = true; }
     failures += check(empty_model_id_rejected, "empty --served-model-name was accepted");
 
-    const ServeOptions dflash = parse({"ninfer-serve", "model.ninfer", "--spec", "dflash",
+    const ServeOptions dflash = parse({"sinfer-serve", "model.sinfer", "--spec", "dflash",
                                        "--draft-tokens", "15", "--lm-head-draft"});
-    failures += check(dflash.speculative.backend == ninfer::SpeculativeBackend::DFlash,
+    failures += check(dflash.speculative.backend == sinfer::SpeculativeBackend::DFlash,
                       "--spec dflash did not select DFlash");
     failures += check(dflash.speculative.draft_tokens == 15,
                       "--draft-tokens did not preserve the DFlash window");
-    failures += check(dflash.speculative.proposal_head == ninfer::ProposalHead::Optimized,
+    failures += check(dflash.speculative.proposal_head == sinfer::ProposalHead::Optimized,
                       "--lm-head-draft did not select the optimized proposal head");
 
     bool dflash_vision_rejected = false;
     try {
-        (void)parse({"ninfer-serve", "model.ninfer", "--spec", "dflash", "--draft-tokens", "15",
+        (void)parse({"sinfer-serve", "model.sinfer", "--spec", "dflash", "--draft-tokens", "15",
                      "--vision"});
     } catch (const std::invalid_argument&) { dflash_vision_rejected = true; }
     failures += check(dflash_vision_rejected, "DFlash and Vision were accepted together");
 
     bool implicit_backend_rejected = false;
     try {
-        (void)parse({"ninfer-serve", "model.ninfer", "--draft-tokens", "3"});
+        (void)parse({"sinfer-serve", "model.sinfer", "--draft-tokens", "3"});
     } catch (const std::invalid_argument&) { implicit_backend_rejected = true; }
     failures += check(implicit_backend_rejected, "--draft-tokens selected a backend implicitly");
 
-    const ServeOptions configured = parse({"ninfer-serve",
-                                           "model.ninfer",
+    const ServeOptions configured = parse({"sinfer-serve",
+                                           "model.sinfer",
                                            "--no-prefix-reuse",
                                            "--vision",
                                            "--max-num-seqs",
@@ -125,7 +125,7 @@ int main() {
     failures +=
         check(configured.max_concurrency == 4, "--max-num-seqs did not reach serving options");
     failures += check(configured.max_context == 4096 &&
-                          configured.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
+                          configured.kv_capacity.mode == sinfer::KvCapacityMode::Explicit &&
                           configured.kv_capacity.explicit_tokens == 8192,
                       "context and KV capacity options were not kept distinct");
     failures += check(configured.max_pending_requests == 12,
@@ -140,14 +140,14 @@ int main() {
                       "media preparation limits did not reach serving options");
 
     const ServeOptions response_store =
-        parse({"ninfer-serve", "model.ninfer", "--response-store-max-records", "42",
+        parse({"sinfer-serve", "model.sinfer", "--response-store-max-records", "42",
                "--response-store-max-mib", "8"});
     failures += check(response_store.response_store_max_records == 42 &&
                           response_store.response_store_max_bytes == (8ULL << 20),
                       "Responses store limits did not reach serving options");
 
     const ServeOptions sampling =
-        parse({"ninfer-serve", "model.ninfer", "--temperature", "0", "--top-p", "0.9", "--top-k",
+        parse({"sinfer-serve", "model.sinfer", "--temperature", "0", "--top-p", "0.9", "--top-k",
                "40", "--min-p", "0.1", "--presence-penalty", "1.25", "--frequency-penalty", "-0.5",
                "--seed", "0"});
     failures += check(sampling.sampling_overrides.temperature == 0.0F &&
@@ -161,13 +161,13 @@ int main() {
 
     GenerationRequest request;
     request.max_tokens = 1;
-    ninfer::PromptCapabilities prompt_capabilities;
+    sinfer::PromptCapabilities prompt_capabilities;
     prompt_capabilities.enable_thinking = true;
     failures += check(to_request_options(request, defaults).execution.allow_prefix_reuse,
                       "default server policy did not reach Engine options");
     failures += check(!to_request_options(request, configured).execution.allow_prefix_reuse,
                       "disabled server policy did not reach Engine options");
-    const ninfer::RequestOptions inherited_sampling = to_request_options(request, sampling);
+    const sinfer::RequestOptions inherited_sampling = to_request_options(request, sampling);
     failures += check(inherited_sampling.execution.sampling.temperature == 0.0F &&
                           inherited_sampling.execution.sampling.top_p == 0.9F &&
                           inherited_sampling.execution.sampling.seed == 0,
@@ -184,47 +184,47 @@ int main() {
               "request preserve-thinking override did not win");
 
     failures +=
-        check(serve_usage_text("ninfer-serve").find("--no-prefix-reuse") != std::string::npos,
+        check(serve_usage_text("sinfer-serve").find("--no-prefix-reuse") != std::string::npos,
               "serve help omits --no-prefix-reuse");
     failures +=
-        check(serve_usage_text("ninfer-serve").find("--preserve-thinking") != std::string::npos,
+        check(serve_usage_text("sinfer-serve").find("--preserve-thinking") != std::string::npos,
               "serve help omits --preserve-thinking");
-    failures += check(serve_usage_text("ninfer-serve").find("--vision") != std::string::npos,
+    failures += check(serve_usage_text("sinfer-serve").find("--vision") != std::string::npos,
                       "serve help omits --vision");
     failures +=
-        check(serve_usage_text("ninfer-serve").find("--log-stats-interval-ms") != std::string::npos,
+        check(serve_usage_text("sinfer-serve").find("--log-stats-interval-ms") != std::string::npos,
               "serve help omits --log-stats-interval-ms");
-    failures += check(serve_usage_text("ninfer-serve").find("--media-preprocess-threads") !=
+    failures += check(serve_usage_text("sinfer-serve").find("--media-preprocess-threads") !=
                           std::string::npos,
                       "serve help omits media preparation controls");
-    failures += check(serve_usage_text("ninfer-serve").find("--kv-capacity") != std::string::npos,
+    failures += check(serve_usage_text("sinfer-serve").find("--kv-capacity") != std::string::npos,
                       "serve help omits --kv-capacity");
-    failures += check(serve_usage_text("ninfer-serve").find("--response-store-max-mib") !=
+    failures += check(serve_usage_text("sinfer-serve").find("--response-store-max-mib") !=
                           std::string::npos,
                       "serve help omits Responses store limits");
     failures +=
-        check(serve_usage_text("ninfer-serve").find("identity.model_id") != std::string::npos,
+        check(serve_usage_text("sinfer-serve").find("identity.model_id") != std::string::npos,
               "serve help omits the artifact-derived model id default");
 
     const ServeOptions inherited =
-        parse({"ninfer-serve", "model.ninfer", "--max-model-len", "16384"});
-    failures += check(inherited.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
+        parse({"sinfer-serve", "model.sinfer", "--max-model-len", "16384"});
+    failures += check(inherited.kv_capacity.mode == sinfer::KvCapacityMode::Explicit &&
                           inherited.kv_capacity.explicit_tokens == 16384,
                       "omitted --kv-capacity did not follow --max-model-len");
 
-    const ServeOptions automatic = parse({"ninfer-serve", "model.ninfer", "--kv-capacity", "auto"});
-    failures += check(automatic.kv_capacity.mode == ninfer::KvCapacityMode::Automatic &&
+    const ServeOptions automatic = parse({"sinfer-serve", "model.sinfer", "--kv-capacity", "auto"});
+    failures += check(automatic.kv_capacity.mode == sinfer::KvCapacityMode::Automatic &&
                           automatic.kv_capacity.explicit_tokens == 0 &&
                           automatic.kv_capacity.automatic_headroom_bytes ==
-                              ninfer::kDefaultKvCapacityHeadroomBytes,
+                              sinfer::kDefaultKvCapacityHeadroomBytes,
                       "--kv-capacity auto did not select automatic sizing");
 
-    const ServeOptions logged = parse({"ninfer-serve", "model.ninfer", "--request-log-jsonl",
+    const ServeOptions logged = parse({"sinfer-serve", "model.sinfer", "--request-log-jsonl",
                                        "requests.jsonl", "--api-key", "do-not-log"});
     failures += check(logged.request_log_jsonl == "requests.jsonl",
                       "--request-log-jsonl did not preserve its path");
     failures +=
-        check(serve_usage_text("ninfer-serve").find("--request-log-jsonl") != std::string::npos,
+        check(serve_usage_text("sinfer-serve").find("--request-log-jsonl") != std::string::npos,
               "serve help omits --request-log-jsonl");
     bool secret_present    = false;
     bool redaction_present = false;

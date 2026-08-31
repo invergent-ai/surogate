@@ -2,7 +2,7 @@
 
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 bool bf16_linear_add_admits(std::int32_t output_rows, std::int32_t input_rows,
                             std::int32_t tokens) noexcept {
@@ -53,4 +53,4 @@ void bf16_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& res
     throw std::logic_error("bf16 linear_add: unknown schedule");
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

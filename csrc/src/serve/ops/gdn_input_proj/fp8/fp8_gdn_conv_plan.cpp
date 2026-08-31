@@ -12,7 +12,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 constexpr std::int32_t kChannels = 10240;
@@ -230,4 +230,4 @@ void fp8_gdn_record_dispatch(const Tensor& x, const Weight& weight, const Tensor
                        fp8_gdn_record_resolve_plan(policy, x.ne[1], x.ne[2]), workspace, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

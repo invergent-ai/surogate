@@ -19,25 +19,25 @@
 // buffers, for 24 KiB total. FP32 g reuses the K buffer that becomes dead
 // while the final K panel is consumed.
 
-namespace ninfer::ops::detail::gated_delta_net::chunked::output {
+namespace sinfer::ops::detail::gated_delta_net::chunked::output {
 
-using ninfer::ops::Cache;
-using ninfer::ops::cp_async;
-using ninfer::ops::cp_commit;
-using ninfer::ops::cp_wait;
-using ninfer::ops::exp2_approx;
-using ninfer::ops::ldmatrix_x2;
-using ninfer::ops::ldmatrix_x4;
-using ninfer::ops::mma_bf16;
-using ninfer::ops::mma_tf32;
-using ninfer::ops::smem_addr;
+using sinfer::ops::Cache;
+using sinfer::ops::cp_async;
+using sinfer::ops::cp_commit;
+using sinfer::ops::cp_wait;
+using sinfer::ops::exp2_approx;
+using sinfer::ops::ldmatrix_x2;
+using sinfer::ops::ldmatrix_x4;
+using sinfer::ops::mma_bf16;
+using sinfer::ops::mma_tf32;
+using sinfer::ops::smem_addr;
 
 static_assert(kChunkSize == 64,
               "stage_chunk_output: kChunkSize must be 64 (kernel hard-codes BT=64)");
 static_assert(kStateDim == 128);
 
 constexpr int N_WARPS = 4;
-constexpr int THREADS = N_WARPS * ninfer::ops::kWarpSize;
+constexpr int THREADS = N_WARPS * sinfer::ops::kWarpSize;
 
 static_assert(BT == N_WARPS * MMA_M,
               "kernel assigns one 16-row strip per warp; BT must equal N_WARPS * MMA_M");
@@ -367,4 +367,4 @@ __launch_bounds__(THREADS, 4) __global__
     }
 }
 
-} // namespace ninfer::ops::detail::gated_delta_net::chunked::output
+} // namespace sinfer::ops::detail::gated_delta_net::chunked::output

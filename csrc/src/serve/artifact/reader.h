@@ -11,7 +11,7 @@
 #include <variant>
 #include <vector>
 
-namespace ninfer::artifact {
+namespace sinfer::artifact {
 
 class ArtifactError : public std::runtime_error {
 public:
@@ -154,4 +154,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace ninfer::artifact
+} // namespace sinfer::artifact

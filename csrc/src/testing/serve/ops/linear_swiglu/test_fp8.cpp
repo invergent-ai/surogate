@@ -5,8 +5,8 @@
 #include <iostream>
 
 int main() {
-    using namespace ninfer;
-    using namespace ninfer::test::linear_swiglu;
+    using namespace sinfer;
+    using namespace sinfer::test::linear_swiglu;
 
     try {
         constexpr std::array<std::int32_t, 2> kA16Cases{1, 2};

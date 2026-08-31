@@ -8,7 +8,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 void q5_linear_add_gemv_residual_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
                                         cudaStream_t stream) {
@@ -30,4 +30,4 @@ void q5_linear_add_gemv_residual_launch(const Tensor& x, const Weight& w, Tensor
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

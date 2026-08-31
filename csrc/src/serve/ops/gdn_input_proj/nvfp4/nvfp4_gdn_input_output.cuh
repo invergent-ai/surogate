@@ -6,7 +6,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 struct Nvfp4GdnInputOutput {
     static constexpr std::int32_t kQkvRows = 10240;
@@ -37,4 +37,4 @@ struct Nvfp4GdnInputOutput {
 static_assert((Nvfp4GdnInputOutput::kQkvRows % 128) == 0);
 static_assert((Nvfp4GdnInputOutput::kZRows % 128) == 0);
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

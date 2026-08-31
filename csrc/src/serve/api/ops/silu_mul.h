@@ -4,7 +4,7 @@
 
 #include <cuda_runtime.h> // cudaStream_t
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 /**
  * Elementwise SwiGLU activation:
@@ -20,4 +20,4 @@ namespace ninfer::ops {
  */
 void silu_mul(const Tensor& gate, const Tensor& up, Tensor& out, cudaStream_t stream);
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

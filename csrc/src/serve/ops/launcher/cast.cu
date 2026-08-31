@@ -7,7 +7,7 @@
 #include <algorithm>
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 constexpr int kBlock   = 256;
@@ -43,4 +43,4 @@ void cast_fp32_to_bf16_launch(const Tensor& source, Tensor& destination, cudaStr
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

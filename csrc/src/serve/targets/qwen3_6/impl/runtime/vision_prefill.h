@@ -7,7 +7,7 @@
 #include <memory>
 #include <vector>
 
-namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
+namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS {
 
 struct VisionUseSpan {
     std::uint32_t begin      = 0;
@@ -20,4 +20,4 @@ struct VisionPrefillPlan {
     std::vector<VisionUseSpan> uses;
 };
 
-} // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
+} // namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS

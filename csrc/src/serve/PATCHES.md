@@ -1,5 +1,11 @@
 # Vendored code under csrc/src/serve/
 
+> **Naming note (2026-08-31):** the engine's own identifiers were renamed
+> `ninfer` -> `sinfer` (namespace, macros, targets, the artifact magic and the
+> `.sinfer` extension). This file is left in its original wording: entries below
+> record what was patched *at the time*, and the upstream project this code came
+> from is still named `ninfer`. Read macro and path names here as historical.
+
 ## serve engine — derived from https://github.com/Neroued/ninfer
 
 (2026-08-26: the vendor directory was flattened into csrc/src/serve as

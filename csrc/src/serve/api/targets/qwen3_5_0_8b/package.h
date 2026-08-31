@@ -10,7 +10,7 @@
 #include <memory>
 #include <string_view>
 
-namespace ninfer {
+namespace sinfer {
 
 struct DeviceContext;
 
@@ -116,4 +116,4 @@ struct Package {
 };
 
 } // namespace targets::qwen3_5_0_8b
-} // namespace ninfer
+} // namespace sinfer

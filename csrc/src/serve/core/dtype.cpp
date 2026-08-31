@@ -2,7 +2,7 @@
 
 #include <stdexcept>
 
-namespace ninfer {
+namespace sinfer {
 
 std::size_t dtype_size(DType dtype) {
     switch (dtype) {
@@ -26,4 +26,4 @@ std::size_t dtype_size(DType dtype) {
     throw std::invalid_argument("invalid DType");
 }
 
-} // namespace ninfer
+} // namespace sinfer

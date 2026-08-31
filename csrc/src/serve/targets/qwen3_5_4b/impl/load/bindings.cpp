@@ -19,7 +19,7 @@
 #include <variant>
 #include <vector>
 
-namespace ninfer::targets::qwen3_5_4b::detail {
+namespace sinfer::targets::qwen3_5_4b::detail {
 namespace {
 
 using artifact::NumericFormat;
@@ -668,4 +668,4 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     }
 }
 
-} // namespace ninfer::targets::qwen3_5_4b::detail
+} // namespace sinfer::targets::qwen3_5_4b::detail

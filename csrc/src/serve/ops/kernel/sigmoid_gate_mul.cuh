@@ -1,6 +1,6 @@
 #pragma once
 
-// Implements: include/ninfer/ops/sigmoid_mul.h
+// Implements: include/sinfer/ops/sigmoid_mul.h
 // Match: contiguous BF16 inputs. Registered aligned/eight-element domains use
 // one 16-byte pack per thread; BF16x2 and scalar routes preserve correctness for
 // smaller alignments and odd tails. Sigmoid remains FP32 expf, not a fit.
@@ -13,7 +13,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 inline constexpr int kSigmoidGateMulPairsPerThread = 4;
 
@@ -85,4 +85,4 @@ __launch_bounds__(256) __global__
     }
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

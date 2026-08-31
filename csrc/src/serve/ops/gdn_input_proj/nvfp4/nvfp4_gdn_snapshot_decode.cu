@@ -5,7 +5,7 @@
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_gemv.cuh"
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 void nvfp4_gdn_snapshot_decode_launch(const Tensor& x, const Weight& weight,
                                       const Tensor& conv_weight, Tensor& conv_states,
@@ -28,4 +28,4 @@ void nvfp4_gdn_snapshot_decode_launch(const Tensor& x, const Weight& weight,
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

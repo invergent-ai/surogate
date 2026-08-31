@@ -1,18 +1,18 @@
 // Cold-cache benchmark for the public pure Linear contract.
 //
 // Examples:
-//   ./build/bench/ninfer_linear_bench --qtype q4 --n 4096 --k 5120 --t 8
-//   ./build/bench/ninfer_linear_bench --qtype q4 --n 4096 --k 5120 --sweep 1:32:1
-//   ./build/bench/ninfer_linear_bench --qtype fp8 --policy a8 --n 14336 --k 5120 --t 1
-//   ./build/bench/ninfer_linear_bench --suite qwen3_6_27b
-//   ncu --profile-from-start off ./build/bench/ninfer_linear_bench \
+//   ./build/bench/sinfer_linear_bench --qtype q4 --n 4096 --k 5120 --t 8
+//   ./build/bench/sinfer_linear_bench --qtype q4 --n 4096 --k 5120 --sweep 1:32:1
+//   ./build/bench/sinfer_linear_bench --qtype fp8 --policy a8 --n 14336 --k 5120 --t 1
+//   ./build/bench/sinfer_linear_bench --suite qwen3_6_27b
+//   ncu --profile-from-start off ./build/bench/sinfer_linear_bench \
 //       --qtype q4 --n 4096 --k 5120 --t 8 --profile
 
 #include "api/ops/linear.h"
 
 #include "core/device.h"
 #include "direct_bf16_weight.cuh"
-#include "ninfer_bench_common.h"
+#include "sinfer_bench_common.h"
 #include "quantized_weight.cuh"
 
 #include <cuda_bf16.h>
@@ -34,8 +34,8 @@
 #include <utility>
 #include <vector>
 
-using namespace ninfer;
-using ninfer::ops::LinearPolicy;
+using namespace sinfer;
+using sinfer::ops::LinearPolicy;
 
 namespace {
 
@@ -833,7 +833,7 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "ninfer_linear_bench: %s\n", error.what());
+        std::fprintf(stderr, "sinfer_linear_bench: %s\n", error.what());
         usage(argv[0]);
         return 2;
     }

@@ -18,7 +18,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 // Stage-3 tiling (PATCHES.md #23): 256-element K-tiles (4 mma-K per staged
 // tile, 2 stages, one barrier per tile) measured -38..47% vs the 64-element
@@ -113,7 +113,7 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MINCTA) void w4fp4_gemm_kernel(
             const int local = i / (Cfg::BKB / 16);
             const int col   = (i % (Cfg::BKB / 16)) * 16;
             const int wrow  = row_map.weight_row(m0 + local);
-            ninfer::ops::cp_async<16, ninfer::ops::Cache::cg>(
+            sinfer::ops::cp_async<16, sinfer::ops::Cache::cg>(
                 &Ws[slot][local * Cfg::BKB_PAD + col],
                 &codes[static_cast<std::int64_t>(wrow) * kb_row + kbase + col]);
         }
@@ -123,7 +123,7 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MINCTA) void w4fp4_gemm_kernel(
             const bool valid = n0 + token < tokens;
             const std::int64_t src =
                 static_cast<std::int64_t>(valid ? n0 + token : 0) * kb_row + kbase + col;
-            ninfer::ops::cp_async_zfill<16>(&Xs[slot][token * Cfg::BKB_PAD + col], &x_codes[src],
+            sinfer::ops::cp_async_zfill<16>(&Xs[slot][token * Cfg::BKB_PAD + col], &x_codes[src],
                                             valid ? 16 : 0);
         }
         // Block scales for this K-tile: 4 async bytes per row/token per
@@ -131,13 +131,13 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MINCTA) void w4fp4_gemm_kernel(
         // synchronous LDG here stalls the stage; measured +16..40%).
         for (int i = tid; i < Cfg::BM; i += Cfg::THREADS) {
             const int wrow = row_map.weight_row(m0 + i);
-            ninfer::ops::cp_async<4 * kHalves>(
+            sinfer::ops::cp_async<4 * kHalves>(
                 &SFWs[slot][i * 4 * kHalves],
                 sf + static_cast<std::int64_t>(wrow) * kg_row + kt * 4 * kHalves);
         }
         for (int i = tid; i < Cfg::BN; i += Cfg::THREADS) {
             const int token = n0 + i < tokens ? n0 + i : tokens - 1;
-            ninfer::ops::cp_async<4 * kHalves>(
+            sinfer::ops::cp_async<4 * kHalves>(
                 &SFXs[slot][i * 4 * kHalves],
                 x_sf + static_cast<std::int64_t>(token) * kg_row + kt * 4 * kHalves);
         }
@@ -155,7 +155,7 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MINCTA) void w4fp4_gemm_kernel(
 #pragma unroll
     for (int st = 0; st < kStages - 1; ++st) {
         if (st < nkt) { stage(st, st); }
-        ninfer::ops::cp_commit();
+        sinfer::ops::cp_commit();
     }
 
     // SF rows for this lane (mapping validated single-mma-exact).
@@ -164,10 +164,10 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MINCTA) void w4fp4_gemm_kernel(
 
     for (int kt = 0; kt < nkt; ++kt) {
         const int slot = kt % kStages;
-        ninfer::ops::cp_wait<kStages - 2>();
+        sinfer::ops::cp_wait<kStages - 2>();
         __syncthreads();
         if (kt + kStages - 1 < nkt) { stage(kt + kStages - 1, (kt + kStages - 1) % kStages); }
-        ninfer::ops::cp_commit();
+        sinfer::ops::cp_commit();
 
 #pragma unroll
         for (int half = 0; half < kHalves; ++half) {
@@ -249,4 +249,4 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MINCTA) void w4fp4_gemm_kernel(
 }
 #endif  // __CUDA_ARCH_FEAT_SM120_ALL
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

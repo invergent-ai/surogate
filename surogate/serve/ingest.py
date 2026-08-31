@@ -27,12 +27,12 @@ from pathlib import Path
 @dataclass(frozen=True)
 class ConverterTarget:
     key: str                 # cache identity component
-    module: str              # python -m <module> under the vendored ninfer root
+    module: str              # python -m <module> under the vendored sinfer root
     display: str
     gguf_repack: bool = False  # converter accepts --gguf-repack (PATCHES.md #14)
 
 
-def _ninfer_root() -> Path | None:
+def _sinfer_root() -> Path | None:
     # Converters are part of the surogate package now; the "root" is the
     # repository root (kept for subprocess cwd/log context only).
     root = Path(__file__).resolve().parent.parent.parent
@@ -42,7 +42,7 @@ def _ninfer_root() -> Path | None:
 def classify_input(spec: str) -> str:
     """'artifact' | 'gguf' | 'safetensors_dir' | 'hf_repo_id' | 'unknown'."""
     p = Path(spec)
-    if p.suffix == ".ninfer" and p.is_file():
+    if p.suffix == ".sinfer" and p.is_file():
         return "artifact"
     if p.suffix == ".gguf" and p.is_file():
         return "gguf"
@@ -149,7 +149,7 @@ def _ensure_from_gguf(gguf_path: Path, *, echo=print) -> Path:
     """
     from surogate.serve.gguf import bridge as serve_gguf
 
-    root = _ninfer_root()
+    root = _sinfer_root()
     if root is None:
         raise SystemExit("surogate serve: vendored engine tree not found (run from a checkout).")
 
@@ -157,7 +157,7 @@ def _ensure_from_gguf(gguf_path: Path, *, echo=print) -> Path:
     # so a hit returns without touching the GGUF — gguf-py's eager KV parse
     # costs ~10s on a 250k-token vocabulary and must stay off this path.
     fp = _gguf_fingerprint(gguf_path)
-    for cached in cache_dir().glob(f"*-gguf-{fp}.ninfer"):
+    for cached in cache_dir().glob(f"*-gguf-{fp}.sinfer"):
         if cached.is_file() and cached.stat().st_size > 0:
             echo(f"surogate serve: using cached engine weights ({cached.name})")
             return cached
@@ -173,7 +173,7 @@ def _ensure_from_gguf(gguf_path: Path, *, echo=print) -> Path:
             "  Registered today: Qwen3.6-27B, Qwen3.8-27B, Qwen3.6-35B-A3B, Qwen3.8-Flash-Next."
         )
 
-    out = cache_dir() / f"{target_key}-gguf-{fp}.ninfer"
+    out = cache_dir() / f"{target_key}-gguf-{fp}.sinfer"
 
     if target_key == "qwen4exp":
         return _convert_gguf_native(root, gguf_path, out, echo=echo)
@@ -229,7 +229,7 @@ def _convert_gguf_native(root: Path, gguf_path: Path, out: Path, *, echo=print) 
         if missing:
             raise SystemExit(f"surogate serve: frontend files missing after download: {missing}")
     out.parent.mkdir(parents=True, exist_ok=True)
-    tmp = out.with_suffix(".ninfer.partial")
+    tmp = out.with_suffix(".sinfer.partial")
     tmp.unlink(missing_ok=True)
     echo(f"surogate serve: preparing engine weights for Qwen3.8-Flash-Next "
          f"(one-time conversion of the GGUF shards; cached at {out})")
@@ -283,13 +283,13 @@ def _run_converter_cached(model_dir: Path, out: Path, *, echo=print,
                           gguf_repack: Path | None = None,
                           no_mtp: bool = False) -> Path:
     """Shared converter driver: model_dir (HF layout) → atomic-published `out`."""
-    root = _ninfer_root()
+    root = _sinfer_root()
     config = _flatten_text_config(json.loads((model_dir / "config.json").read_text()))
     target = converter_for_config(config)
     if target is None:
         raise SystemExit("surogate serve: internal error — bridged model dir maps to no converter.")
     out.parent.mkdir(parents=True, exist_ok=True)
-    tmp = out.with_suffix(".ninfer.partial")
+    tmp = out.with_suffix(".sinfer.partial")
     tmp.unlink(missing_ok=True)
     echo(f"surogate serve: preparing engine weights for {target.display} "
          f"(one-time conversion; cached at {out})")
@@ -312,7 +312,7 @@ def _run_converter_cached(model_dir: Path, out: Path, *, echo=print,
     env = {**os.environ, "PYTHONPATH": str(root) + os.pathsep + os.environ.get("PYTHONPATH", "")}
     if derived_frontend:
         # GGUF-sourced: tokenizer reconstructed from KV (PATCHES.md #12).
-        env["NINFER_ALLOW_DERIVED_FRONTEND"] = "1"
+        env["SINFER_ALLOW_DERIVED_FRONTEND"] = "1"
     result = subprocess.run(cmd, cwd=root, env=env)
     if result.returncode != 0 or not tmp.is_file():
         tmp.unlink(missing_ok=True)
@@ -345,7 +345,7 @@ def ensure_engine_weights(spec: str, *, echo=print) -> Path:
             "safetensors model directory, a Hugging Face repo id, or a .gguf file."
         )
 
-    root = _ninfer_root()
+    root = _sinfer_root()
     if root is None:
         raise SystemExit("surogate serve: vendored engine tree not found (run from a checkout).")
 
@@ -361,7 +361,7 @@ def ensure_engine_weights(spec: str, *, echo=print) -> Path:
         )
 
     fp = source_fingerprint(model_dir)
-    out = cache_dir() / f"{target.key}-{fp}.ninfer"
+    out = cache_dir() / f"{target.key}-{fp}.sinfer"
     if out.is_file() and out.stat().st_size > 0:
         echo(f"surogate serve: using cached engine weights ({out.name})")
         return out

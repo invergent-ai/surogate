@@ -36,7 +36,7 @@ def test_complete_nvfp4_inventory_and_format_allocation() -> None:
     assert len(inventory.LOGICAL_ROW_VIEW_SPECS) == 18
     assert len(inventory.ALIAS_SPECS) == 4
     assert convert_nvfp4.RECIPE_ID == "qwen3_8_27b_nvfp4-v1"
-    assert convert_nvfp4.OUTPUT_BASENAME == "qwen3_8_27b_nvfp4.ninfer"
+    assert convert_nvfp4.OUTPUT_BASENAME == "qwen3_8_27b_nvfp4.sinfer"
 
 
 def test_fused_parent_signatures_and_no_avoidable_split_objects() -> None:

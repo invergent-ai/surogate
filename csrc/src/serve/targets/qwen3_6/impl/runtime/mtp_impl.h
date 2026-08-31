@@ -9,7 +9,7 @@
 
 #include <stdexcept>
 
-namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
+namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS::schedule {
 void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
                             const Tensor& previous_hidden, std::int32_t position,
                             std::span<const std::int32_t> rope_position, bool build_proposal,
@@ -195,4 +195,4 @@ void mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint
     run_prepared(state, executable, body);
 }
 
-} // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule
+} // namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS::schedule

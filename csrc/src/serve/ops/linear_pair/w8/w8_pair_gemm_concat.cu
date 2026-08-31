@@ -8,7 +8,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 constexpr int kRows   = 1024;
@@ -169,4 +169,4 @@ void w8_pair_concat_mma_launch(W8PairScheduleId schedule, bool full, const Tenso
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

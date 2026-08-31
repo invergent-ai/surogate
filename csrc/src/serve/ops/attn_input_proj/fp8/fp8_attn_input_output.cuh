@@ -6,7 +6,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 inline constexpr std::int32_t kFp8AttnInputQueryRows = 6144;
 inline constexpr std::int32_t kFp8AttnInputKeyRows   = 1024;
@@ -54,4 +54,4 @@ struct Fp8AttentionInputOutput {
     }
 };
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

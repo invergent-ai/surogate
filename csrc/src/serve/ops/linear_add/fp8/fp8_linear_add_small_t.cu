@@ -11,7 +11,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 using Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
@@ -115,4 +115,4 @@ void fp8_linear_add_small_t_launch(const Tensor& x, const Weight& weight, Tensor
     throw std::invalid_argument("fp8 linear_add small-T: unsupported problem");
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

@@ -15,7 +15,7 @@ int check(bool condition, const char* message) {
 
 int main() {
     int failures = 0;
-    const ninfer::runtime::SequenceCapacityCurve curve{
+    const sinfer::runtime::SequenceCapacityCurve curve{
         .main_page_tokens                     = 64,
         .minimum_main_page_groups             = 2,
         .maximum_main_page_groups             = 6,
@@ -24,7 +24,7 @@ int main() {
     };
 
     const auto automatic =
-        ninfer::runtime::resolve_kv_capacity(ninfer::KvCapacityPolicy::automatic(50), curve, 1360);
+        sinfer::runtime::resolve_kv_capacity(sinfer::KvCapacityPolicy::automatic(50), curve, 1360);
     failures +=
         check(automatic.main_page_groups == 4 && automatic.resolved_tokens == 256 &&
                   automatic.runtime_reservation_bytes == 1256 &&
@@ -32,12 +32,12 @@ int main() {
               "automatic KV capacity did not select the largest fitting page count");
 
     const auto capped =
-        ninfer::runtime::resolve_kv_capacity(ninfer::KvCapacityPolicy::automatic(50), curve, 10000);
+        sinfer::runtime::resolve_kv_capacity(sinfer::KvCapacityPolicy::automatic(50), curve, 10000);
     failures += check(capped.main_page_groups == 6 && capped.resolved_tokens == 384,
                       "automatic KV capacity exceeded or missed the target maximum");
 
-    const auto explicit_capacity = ninfer::runtime::resolve_kv_capacity(
-        ninfer::KvCapacityPolicy::explicit_capacity(129), curve, 1200);
+    const auto explicit_capacity = sinfer::runtime::resolve_kv_capacity(
+        sinfer::KvCapacityPolicy::explicit_capacity(129), curve, 1200);
     failures +=
         check(explicit_capacity.main_page_groups == 3 && explicit_capacity.resolved_tokens == 192 &&
                   explicit_capacity.runtime_reservation_bytes == 1128,
@@ -45,7 +45,7 @@ int main() {
 
     bool insufficient_rejected = false;
     try {
-        (void)ninfer::runtime::resolve_kv_capacity(ninfer::KvCapacityPolicy::automatic(50), curve,
+        (void)sinfer::runtime::resolve_kv_capacity(sinfer::KvCapacityPolicy::automatic(50), curve,
                                                    1049);
     } catch (const std::invalid_argument&) { insufficient_rejected = true; }
     failures += check(insufficient_rejected,

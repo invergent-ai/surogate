@@ -4,7 +4,7 @@
 
 #include <cuda_runtime.h>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 /**
  * Applies affine LayerNorm over the fastest dimension D=ne[0]. For each logical row r:
@@ -23,4 +23,4 @@ namespace ninfer::ops {
 void layer_norm(const Tensor& x, const Tensor& weight, const Tensor& bias, float eps, Tensor& out,
                 cudaStream_t stream);
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

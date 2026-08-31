@@ -4,7 +4,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 __global__ void scatter_bf16x8_kernel(const uint4* src, const std::int32_t* indices, uint4* dst,
                                       std::int32_t vectors_per_column) {
@@ -65,4 +65,4 @@ __global__ void scatter_bf16_batch_kernel(const uint4* __restrict__ source,
     }
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

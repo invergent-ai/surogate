@@ -12,7 +12,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 using Geometry = Fp8GdnInputGeometry;
@@ -31,7 +31,7 @@ void launch_mma(const Weight& weight, Tensor& qkv, Tensor& z, Fp8A8Workspace wor
                                    static_cast<__nv_bfloat16*>(z.data)};
 
     if constexpr (Sched::kSharedBytes > 48 * 1024) {
-        CUDA_CHECK(::ninfer::ops::set_func_attribute_per_device(
+        CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(
             fp8_mma_kernel<Geometry, Sched, FullTokens, Fp8IdentityEpilogue, Fp8GdnInputOutput>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, Sched::kSharedBytes));
     }
@@ -77,4 +77,4 @@ void fp8_gdn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& qkv,
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

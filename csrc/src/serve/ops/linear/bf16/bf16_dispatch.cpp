@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 Bf16Launch select_bf16_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     const bool supported_problem = (n == 14336 && k == 5120) || (n == 5120 && k == 6144);
@@ -37,4 +37,4 @@ void bf16_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPol
     launch(x, weight, out, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

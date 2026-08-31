@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from tools.bench.run_ninfer_bench_matrix import BenchCase, report_rows
+from tools.bench.run_sinfer_bench_matrix import BenchCase, report_rows
 
 
 def test_schema_v11_report_is_flattened_for_matrix_summary(tmp_path) -> None:
@@ -11,9 +11,9 @@ def test_schema_v11_report_is_flattened_for_matrix_summary(tmp_path) -> None:
         json.dumps(
             {
                 "schema_version": 11,
-                "artifact_type": "ninfer_bench_report",
-                "tool": "ninfer_bench",
-                "artifact": {"path": "model.ninfer"},
+                "artifact_type": "sinfer_bench_report",
+                "tool": "sinfer_bench",
+                "artifact": {"path": "model.sinfer"},
                 "environment": {"gpu_name": "RTX 5090"},
                 "load": {
                     "target": "qwen3_6_27b",
@@ -88,7 +88,7 @@ def test_schema_v11_report_is_flattened_for_matrix_summary(tmp_path) -> None:
     assert (row["target"], row["weights_id"], row["artifact_path"], row["gpu_name"]) == (
         "qwen3_6_27b",
         "nvfp4",
-        "model.ninfer",
+        "model.sinfer",
         "RTX 5090",
     )
     assert (row["decode_path"], row["decode_graph_primed"]) == (

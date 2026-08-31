@@ -3,7 +3,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::targets::qwen3_6 {
+namespace sinfer::targets::qwen3_6 {
 namespace {
 
 std::uint32_t page_count(std::uint32_t capacity) {
@@ -201,4 +201,4 @@ PagedKVCache* DecoderState::mtp_cache() noexcept { return mtp_kv ? &*mtp_kv : nu
 
 const PagedKVCache* DecoderState::mtp_cache() const noexcept { return mtp_kv ? &*mtp_kv : nullptr; }
 
-} // namespace ninfer::targets::qwen3_6
+} // namespace sinfer::targets::qwen3_6

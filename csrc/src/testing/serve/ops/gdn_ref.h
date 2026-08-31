@@ -5,7 +5,7 @@
 #include <stdexcept>
 #include <vector>
 
-namespace ninfer::test::gdn_ref {
+namespace sinfer::test::gdn_ref {
 
 struct Inputs {
     std::int64_t head_dim    = 0;
@@ -154,4 +154,4 @@ inline Result evaluate(const Inputs& in, double scale, bool normalize_qk,
     return result;
 }
 
-} // namespace ninfer::test::gdn_ref
+} // namespace sinfer::test::gdn_ref

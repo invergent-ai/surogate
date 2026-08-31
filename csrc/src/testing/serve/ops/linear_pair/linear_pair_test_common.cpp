@@ -18,7 +18,7 @@
 #include <string>
 #include <vector>
 
-namespace ninfer::test::linear_pair {
+namespace sinfer::test::linear_pair {
 namespace {
 
 constexpr std::int32_t kOutputRows       = 1024;
@@ -334,4 +334,4 @@ int run_w8_a16_shape(std::string_view label, const ShapeCase& shape) {
     return failures;
 }
 
-} // namespace ninfer::test::linear_pair
+} // namespace sinfer::test::linear_pair

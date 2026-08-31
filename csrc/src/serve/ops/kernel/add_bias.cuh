@@ -1,6 +1,6 @@
 #pragma once
 
-// Implements: include/ninfer/ops/add_bias.h
+// Implements: include/sinfer/ops/add_bias.h
 // Match: contiguous BF16 [D,C]. Aligned cache-sized registered domains use
 // 16-byte channel packs with bias reuse across columns; large domains retain a
 // BF16x2 stream, and scalar indexing covers odd/unaligned storage.
@@ -12,7 +12,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 inline constexpr int kAddBiasPairsPerThread = 4;
 
@@ -71,4 +71,4 @@ __global__ void add_bias_kernel(const __nv_bfloat16* bias, __nv_bfloat16* x, std
     }
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

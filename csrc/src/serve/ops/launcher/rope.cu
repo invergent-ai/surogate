@@ -1,4 +1,4 @@
-// ninfer::ops - rope launcher: private token-count tuning and generic fallback.
+// sinfer::ops - rope launcher: private token-count tuning and generic fallback.
 #include "ops/launcher/rope.h"
 
 #include "core/device.h" // CUDA_CHECK
@@ -6,7 +6,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 constexpr int kLargeBlock               = 256;
@@ -205,4 +205,4 @@ void rope_single_launch(const Tensor& positions, int rotary_dim, float theta, Te
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

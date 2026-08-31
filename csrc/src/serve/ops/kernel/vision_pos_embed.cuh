@@ -4,7 +4,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 __global__ void vision_pos_embed_add_d1152_warp_kernel(const __nv_bfloat162* table,
                                                        const std::int32_t* indices,
@@ -103,4 +103,4 @@ __global__ void vision_pos_embed_add_kernel(const __nv_bfloat16* table, const st
     }
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

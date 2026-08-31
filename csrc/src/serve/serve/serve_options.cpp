@@ -11,7 +11,7 @@
 #include <algorithm>
 #include <string_view>
 
-namespace ninfer::serve {
+namespace sinfer::serve {
 namespace {
 
 int parse_nonnegative_int(const char* text, const char* label) {
@@ -102,7 +102,7 @@ KvCapacityPolicy parse_kv_capacity(const char* text) {
 
 std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
-           " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
+           " <model.sinfer> [--host H] [--port N] [--api-key KEY] "
            "[--served-model-name ID] [--max-model-len N|auto] [--kv-capacity N|auto] [--expert-slots N] [--host-expert-bank w8|q4] [--cpu-moe-share F|auto] [--cpu-moe-prefill-share F] [--cpu-moe-min-tokens N] "
            "[--max-num-seqs N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
@@ -425,4 +425,4 @@ std::string resolve_public_model_id(const ServeOptions& options,
     return std::string(artifact_model_id);
 }
 
-} // namespace ninfer::serve
+} // namespace sinfer::serve

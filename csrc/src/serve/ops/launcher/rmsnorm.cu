@@ -1,4 +1,4 @@
-// ninfer::ops - RMSNorm launcher: finite semantic dispatch over general row geometries.
+// sinfer::ops - RMSNorm launcher: finite semantic dispatch over general row geometries.
 #include "ops/launcher/rmsnorm.h"
 
 #include "ops/kernel/rmsnorm.cuh"
@@ -8,9 +8,9 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
-using ninfer::ops::GatedRmsGate;
+using sinfer::ops::GatedRmsGate;
 namespace {
 
 template <RmsEpilogue Epilogue>
@@ -107,4 +107,4 @@ void rmsnorm_launch(const Tensor& x, const Tensor& weight, float eps, bool unit_
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

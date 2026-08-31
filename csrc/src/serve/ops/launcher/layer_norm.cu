@@ -7,7 +7,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 void layer_norm_launch(const Tensor& x, const Tensor& weight, const Tensor& bias, float eps,
                        Tensor& out, cudaStream_t stream) {
@@ -40,4 +40,4 @@ void layer_norm_launch(const Tensor& x, const Tensor& weight, const Tensor& bias
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

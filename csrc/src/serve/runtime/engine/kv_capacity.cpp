@@ -5,7 +5,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::runtime {
+namespace sinfer::runtime {
 namespace {
 
 std::size_t checked_add(std::size_t a, std::size_t b, const char* label) {
@@ -140,4 +140,4 @@ KvCapacityResolution resolve_kv_capacity(const KvCapacityPolicy& policy,
     };
 }
 
-} // namespace ninfer::runtime
+} // namespace sinfer::runtime

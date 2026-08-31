@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <cstdlib>
 
-namespace ninfer::runtime {
+namespace sinfer::runtime {
 
 class GenerationBudget {
 public:
@@ -35,4 +35,4 @@ private:
     FinishReason limit_reason_ = FinishReason::None;
 };
 
-} // namespace ninfer::runtime
+} // namespace sinfer::runtime

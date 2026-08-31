@@ -19,13 +19,13 @@ bool cuda_unavailable(cudaError_t err) {
 
 int expect_throws_device(int device_id) {
     try {
-        ninfer::DeviceContext invalid(device_id);
+        sinfer::DeviceContext invalid(device_id);
     } catch (const std::runtime_error&) { return 0; }
     std::cerr << "DeviceContext(" << device_id << ") did not throw\n";
     return 1;
 }
 
-int check_context(const ninfer::DeviceContext& ctx, const char* label) {
+int check_context(const sinfer::DeviceContext& ctx, const char* label) {
     int failures = 0;
     if (ctx.stream == nullptr) {
         std::cerr << label << " compute stream is null\n";
@@ -66,7 +66,7 @@ int main() {
 
     int failures = 0;
 
-    ninfer::DeviceContext ctx(0);
+    sinfer::DeviceContext ctx(0);
     if (ctx.device != 0) {
         ++failures;
         std::cerr << "ctx.device expected 0, got " << ctx.device << '\n';
@@ -75,7 +75,7 @@ int main() {
     ctx.synchronize();
 
     const cudaStream_t original_stream = ctx.stream;
-    ninfer::DeviceContext moved(std::move(ctx));
+    sinfer::DeviceContext moved(std::move(ctx));
     if (ctx.stream != nullptr || ctx.load_stream != nullptr) {
         ++failures;
         std::cerr << "move construction did not null source streams\n";
@@ -88,7 +88,7 @@ int main() {
 
     failures += expect_throws_device(count);
 
-    ninfer::CudaEventTimer timer(moved);
+    sinfer::CudaEventTimer timer(moved);
     timer.start();
     moved.synchronize();
     const float elapsed_ms = timer.stop_ms();

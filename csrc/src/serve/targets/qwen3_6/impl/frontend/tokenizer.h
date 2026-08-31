@@ -8,7 +8,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace ninfer::targets::qwen3_6::frontend_internal {
+namespace sinfer::targets::qwen3_6::frontend_internal {
 
 struct EncodeOptions {
     bool parse_added_tokens = true;
@@ -62,4 +62,4 @@ private:
     std::vector<int> default_stop_token_ids_;
 };
 
-} // namespace ninfer::targets::qwen3_6::frontend_internal
+} // namespace sinfer::targets::qwen3_6::frontend_internal

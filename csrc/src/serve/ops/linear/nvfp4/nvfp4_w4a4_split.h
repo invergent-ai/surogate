@@ -8,7 +8,7 @@
 #include <cstdint>
 #include <cstdlib>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 // The TMA schedule consumes whole kNvfp4TmaBlockM-token blocks. A serving round is almost
 // never block-aligned (a prefill chunk shares the GEMM with the decode batch), so the aligned
@@ -50,4 +50,4 @@ inline __nv_bfloat16* nvfp4_w4a4_column(void* data, std::int32_t rows, std::int3
     return static_cast<__nv_bfloat16*>(data) + static_cast<std::int64_t>(token) * rows;
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

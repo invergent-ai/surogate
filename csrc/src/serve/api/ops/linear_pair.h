@@ -4,7 +4,7 @@
 
 #include <cuda_runtime.h>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 /**
  * Computes two same-shaped projections of one input:
@@ -23,4 +23,4 @@ namespace ninfer::ops {
 void linear_pair(const Tensor& x, const Weight& first_weight, const Weight& second_weight,
                  Tensor& first_out, Tensor& second_out, cudaStream_t stream);
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

@@ -6,7 +6,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer {
+namespace sinfer {
 namespace {
 
 constexpr std::size_t kArenaAlign = 256;
@@ -223,4 +223,4 @@ void LinearAttentionStatePool::zero_slot(std::int32_t slot, cudaStream_t stream)
     }
 }
 
-} // namespace ninfer
+} // namespace sinfer

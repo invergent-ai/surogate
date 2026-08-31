@@ -1,4 +1,4 @@
-// Implements: include/ninfer/ops/residual_add.h
+// Implements: include/sinfer/ops/residual_add.h
 // Finite dispatch: aligned BF16x8 production route, BF16x2 fallback, then
 // scalar fallback for two-byte-aligned sliced storage.
 #include "ops/launcher/residual_add.h"
@@ -10,7 +10,7 @@
 #include <algorithm>
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 void residual_add_launch(const Tensor& y, Tensor& x, cudaStream_t stream) {
     const std::int64_t n   = x.numel();
@@ -46,4 +46,4 @@ void residual_add_launch(const Tensor& y, Tensor& x, cudaStream_t stream) {
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

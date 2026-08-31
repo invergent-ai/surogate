@@ -23,7 +23,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::targets::qwen4exp::detail {
+namespace sinfer::targets::qwen4exp::detail {
 
 inline constexpr std::size_t kTextLayers          = TextConfig::layers;
 inline constexpr std::size_t kFullAttentionLayers = TextConfig::full_attention_layers();
@@ -218,4 +218,4 @@ public:
     LoadedModelData data;
 };
 
-} // namespace ninfer::targets::qwen4exp::detail
+} // namespace sinfer::targets::qwen4exp::detail

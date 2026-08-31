@@ -1,4 +1,4 @@
-"""Exercise the implemented NInfer HTTP product contract with the standard library."""
+"""Exercise the implemented SInfer HTTP product contract with the standard library."""
 
 from __future__ import annotations
 
@@ -328,8 +328,8 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
     entries = models.get("data")
     if models.get("object") != "list" or not isinstance(entries, list) or len(entries) != 1:
         raise ContractError("model-list response has the wrong shape")
-    if entries[0].get("id") != model or entries[0].get("owned_by") != "ninfer":
-        raise ContractError("model-list response does not identify the configured NInfer model")
+    if entries[0].get("id") != model or entries[0].get("owned_by") != "sinfer":
+        raise ContractError("model-list response does not identify the configured SInfer model")
     single_model = json_response(base_url, "GET", f"/v1/models/{model}")
     if single_model.get("id") != model:
         raise ContractError("single-model response has the wrong id")
@@ -345,7 +345,7 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
         raise ContractError("count_tokens returned a non-positive input_tokens value")
 
     messages = [{"role": "user", "content": "Reply with a single short word."}]
-    stops = ["__NINFER_SMOKE_UNLIKELY_STOP__"]
+    stops = ["__SINFER_SMOKE_UNLIKELY_STOP__"]
     nonstream = openai_nonstream(base_url, model, messages, max_tokens=4, stop=stops)
     expected_message = nonstream["choices"][0]["message"]
     expected_content = expected_message.get("content", "")
@@ -487,7 +487,7 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
         raise ContractError("Anthropic usage input_tokens differs from count_tokens")
 
     return {
-        "format": "ninfer_serve_contract_v2",
+        "format": "sinfer_serve_contract_v2",
         "model": model,
         "count_tokens": input_tokens,
         "openai_finish_reason": stream_finish,

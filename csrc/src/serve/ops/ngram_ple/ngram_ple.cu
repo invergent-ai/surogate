@@ -13,7 +13,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 namespace {
 
 constexpr int kThreads    = 256;
@@ -444,4 +444,4 @@ void ngram_ple_forward(Tensor& residual, const NgramPleColumns& columns, const N
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

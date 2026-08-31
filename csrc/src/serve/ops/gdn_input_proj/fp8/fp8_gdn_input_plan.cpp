@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 enum class Fp8GdnInputRoute : std::uint8_t {
@@ -83,4 +83,4 @@ void fp8_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, 
     fp8_gdn_input_a8_dispatch(x, weight, qkv, z, *workspace, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

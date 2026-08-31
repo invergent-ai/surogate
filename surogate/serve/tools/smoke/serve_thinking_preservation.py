@@ -1,4 +1,4 @@
-"""Run the Qwen3.6 thinking-preservation fixture through a real ninfer-serve process."""
+"""Run the Qwen3.6 thinking-preservation fixture through a real sinfer-serve process."""
 
 from __future__ import annotations
 
@@ -49,14 +49,14 @@ def wait_for_server(base_url: str, process: subprocess.Popen[str], timeout: floa
     last_error: Exception | None = None
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            raise TestFailure(f"ninfer-serve exited during startup with code {process.returncode}")
+            raise TestFailure(f"sinfer-serve exited during startup with code {process.returncode}")
         try:
             if request_json(base_url, "GET", "/health") == {"status": "ok"}:
                 return
         except TestFailure as error:
             last_error = error
         time.sleep(0.25)
-    raise TestFailure(f"ninfer-serve was not healthy after {timeout:g}s: {last_error}")
+    raise TestFailure(f"sinfer-serve was not healthy after {timeout:g}s: {last_error}")
 
 
 def chat_payload(model: str, fixture: dict[str, Any], messages_key: str) -> dict[str, Any]:
@@ -266,7 +266,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifact", type=Path, required=True)
     parser.add_argument("--backend", choices=("mtp", "dflash"), required=True)
-    parser.add_argument("--server-bin", type=Path, default=Path("build/apps/ninfer-serve"))
+    parser.add_argument("--server-bin", type=Path, default=Path("build/apps/sinfer-serve"))
     parser.add_argument(
         "--fixture",
         type=Path,
@@ -290,7 +290,7 @@ def main() -> None:
 
     port = args.port or free_port()
     base_url = f"http://127.0.0.1:{port}"
-    with tempfile.TemporaryDirectory(prefix=f"ninfer-{args.backend}-thinking-") as temporary:
+    with tempfile.TemporaryDirectory(prefix=f"sinfer-{args.backend}-thinking-") as temporary:
         temporary_path = Path(temporary)
         request_log = temporary_path / "requests.jsonl"
         server_log = temporary_path / "server.log"

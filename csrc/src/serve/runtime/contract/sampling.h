@@ -2,7 +2,7 @@
 
 #include "api/types.h"
 
-namespace ninfer::runtime {
+namespace sinfer::runtime {
 
 // Resolves one request at the Engine boundary. The registered preset supplies every omitted
 // model-owned field; an omitted seed remains deterministic for direct Engine callers.
@@ -10,4 +10,4 @@ namespace ninfer::runtime {
                                                           SamplingMode mode,
                                                           const SamplingOverrides& overrides);
 
-} // namespace ninfer::runtime
+} // namespace sinfer::runtime

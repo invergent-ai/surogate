@@ -14,7 +14,7 @@
 #include <string_view>
 #include <vector>
 
-namespace ninfer::targets::qwen3_6_35b_a3b::detail {
+namespace sinfer::targets::qwen3_6_35b_a3b::detail {
 namespace {
 
 using artifact::NumericFormat;
@@ -527,4 +527,4 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     }
 }
 
-} // namespace ninfer::targets::qwen3_6_35b_a3b::detail
+} // namespace sinfer::targets::qwen3_6_35b_a3b::detail

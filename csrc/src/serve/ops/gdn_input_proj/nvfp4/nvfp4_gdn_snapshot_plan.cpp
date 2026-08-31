@@ -6,7 +6,7 @@
 
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 struct Nvfp4GdnProjectedWorkspace {
@@ -92,4 +92,4 @@ void nvfp4_gdn_snapshot_dispatch(const Tensor& x, const Weight& weight, const Te
                                    initial_slot, snapshot_base_slot, query, key, value, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

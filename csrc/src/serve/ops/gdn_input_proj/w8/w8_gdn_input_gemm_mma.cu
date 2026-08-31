@@ -4,7 +4,7 @@
 #include "ops/common/math.h"
 #include "ops/linear/w8/w8_rowsplit_gemm_mma.cuh"
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 constexpr int kRows   = 12288;
@@ -57,4 +57,4 @@ void w8_gdn_input_mma_r64_c128_launch(const Tensor& x, const Weight& weight, Ten
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

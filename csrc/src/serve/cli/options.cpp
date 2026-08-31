@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <string_view>
 
-namespace ninfer::cli {
+namespace sinfer::cli {
 namespace {
 
 std::uint64_t parse_u64(const char* text, std::string_view label) {
@@ -75,7 +75,7 @@ ReasoningEffort parse_reasoning_effort(std::string_view text) {
 
 std::string usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
-           " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
+           " <model.sinfer> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N|auto] [--kv-capacity N|auto] [--expert-slots N] [--host-expert-bank w8|q4] [--cpu-moe-share F] [--cpu-moe-min-tokens N] [--prefill-chunk N] [--max-new N]\n"
            "       [--device N] [--devices A,B,...]\n"
            "       [--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N]\n"
@@ -104,7 +104,7 @@ Options parse_options(int argc, char** argv) {
         options.help_requested = true;
         return options;
     }
-    if (argc < 2) { throw std::invalid_argument(".ninfer model path is required"); }
+    if (argc < 2) { throw std::invalid_argument(".sinfer model path is required"); }
     options.artifact_path     = argv[1];
     bool kv_capacity_explicit = false;
     bool max_context_explicit = false;
@@ -271,4 +271,4 @@ Options parse_options(int argc, char** argv) {
     return options;
 }
 
-} // namespace ninfer::cli
+} // namespace sinfer::cli

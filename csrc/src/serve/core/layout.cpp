@@ -5,7 +5,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer {
+namespace sinfer {
 namespace {
 
 bool is_power_of_two(std::size_t value) { return value != 0 && (value & (value - 1)) == 0; }
@@ -121,4 +121,4 @@ std::size_t WorkspaceLayoutBuilder::peak_bytes(std::size_t alignment) const {
     return align_up(peak_, alignment, "workspace layout");
 }
 
-} // namespace ninfer
+} // namespace sinfer

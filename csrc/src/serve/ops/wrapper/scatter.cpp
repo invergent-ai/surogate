@@ -6,7 +6,7 @@
 #include <cstddef>
 #include <stdexcept>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 void scatter(const Tensor& src, const Tensor& indices, Tensor& dst, cudaStream_t stream) {
     if (src.dtype != DType::BF16 || dst.dtype != DType::BF16 || indices.dtype != DType::I32) {
@@ -88,4 +88,4 @@ void extract_bf16_columns(const Tensor& source, std::int32_t source_column, Tens
                                  cudaMemcpyDeviceToDevice, stream));
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

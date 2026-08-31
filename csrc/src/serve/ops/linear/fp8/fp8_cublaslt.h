@@ -8,7 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 // cuBLASLt FP8 route for prefill-width W8A8 GEMMs on FP8_E4M3FN_ROW_BF16S weights. The
 // weight codes (row-major, K contiguous) and the activation codes from the A8 quantizer are
@@ -45,4 +45,4 @@ void fp8_cublaslt_finish(const float* staging, const __nv_bfloat16* weight_row_s
                          std::int32_t tokens, __nv_bfloat16* out, std::int32_t out_ld,
                          bool accumulate, cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

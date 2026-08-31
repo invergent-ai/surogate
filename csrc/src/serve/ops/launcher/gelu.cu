@@ -8,7 +8,7 @@
 #include <cstdint>
 #include <limits>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 void gelu_launch(Tensor& x, GeluMode mode, cudaStream_t stream) {
     constexpr int block   = 256;
@@ -59,4 +59,4 @@ void gelu_launch(Tensor& x, GeluMode mode, cudaStream_t stream) {
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

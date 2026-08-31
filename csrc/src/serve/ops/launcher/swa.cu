@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 template <int Tokens, class Launch>
@@ -19,27 +19,27 @@ void dispatch_token_case(Launch&& launch) {
 template <class Launch>
 void dispatch_tokens(std::int32_t tokens, Launch&& launch) {
     switch (tokens) {
-#define NINFER_SWA_TOKEN_CASE(TOKENS)                                                              \
+#define SINFER_SWA_TOKEN_CASE(TOKENS)                                                              \
     case TOKENS:                                                                                   \
         dispatch_token_case<TOKENS>(launch);                                                       \
         return
-        NINFER_SWA_TOKEN_CASE(1);
-        NINFER_SWA_TOKEN_CASE(2);
-        NINFER_SWA_TOKEN_CASE(3);
-        NINFER_SWA_TOKEN_CASE(4);
-        NINFER_SWA_TOKEN_CASE(5);
-        NINFER_SWA_TOKEN_CASE(6);
-        NINFER_SWA_TOKEN_CASE(7);
-        NINFER_SWA_TOKEN_CASE(8);
-        NINFER_SWA_TOKEN_CASE(9);
-        NINFER_SWA_TOKEN_CASE(10);
-        NINFER_SWA_TOKEN_CASE(11);
-        NINFER_SWA_TOKEN_CASE(12);
-        NINFER_SWA_TOKEN_CASE(13);
-        NINFER_SWA_TOKEN_CASE(14);
-        NINFER_SWA_TOKEN_CASE(15);
-        NINFER_SWA_TOKEN_CASE(16);
-#undef NINFER_SWA_TOKEN_CASE
+        SINFER_SWA_TOKEN_CASE(1);
+        SINFER_SWA_TOKEN_CASE(2);
+        SINFER_SWA_TOKEN_CASE(3);
+        SINFER_SWA_TOKEN_CASE(4);
+        SINFER_SWA_TOKEN_CASE(5);
+        SINFER_SWA_TOKEN_CASE(6);
+        SINFER_SWA_TOKEN_CASE(7);
+        SINFER_SWA_TOKEN_CASE(8);
+        SINFER_SWA_TOKEN_CASE(9);
+        SINFER_SWA_TOKEN_CASE(10);
+        SINFER_SWA_TOKEN_CASE(11);
+        SINFER_SWA_TOKEN_CASE(12);
+        SINFER_SWA_TOKEN_CASE(13);
+        SINFER_SWA_TOKEN_CASE(14);
+        SINFER_SWA_TOKEN_CASE(15);
+        SINFER_SWA_TOKEN_CASE(16);
+#undef SINFER_SWA_TOKEN_CASE
     default:
         throw std::invalid_argument("swa: unsupported T");
     }
@@ -146,4 +146,4 @@ void swa_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
     });
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

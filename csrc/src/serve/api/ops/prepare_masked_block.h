@@ -6,7 +6,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 /**
  * Op: prepare a batch of finite anchor-and-mask query blocks.
@@ -30,4 +30,4 @@ void prepare_masked_block(const Tensor& anchors, const Tensor& lengths, const Te
                           std::int32_t mask_id, Tensor& ids, Tensor& positions,
                           cudaStream_t stream);
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

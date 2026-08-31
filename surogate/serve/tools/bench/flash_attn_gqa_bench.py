@@ -135,7 +135,7 @@ def metrics_from_result(tokens: int, context: int, mode: str, result: dict[str, 
     }
 
 
-def load_ninfer_csv(path: str) -> dict[tuple[int, int], dict[str, str]]:
+def load_sinfer_csv(path: str) -> dict[tuple[int, int], dict[str, str]]:
     if not path:
         return {}
     out: dict[tuple[int, int], dict[str, str]] = {}
@@ -150,25 +150,25 @@ def load_ninfer_csv(path: str) -> dict[tuple[int, int], dict[str, str]]:
             key = (int(row["T"]), int(row["context"]))
             if key in out:
                 raise SystemExit(
-                    "--ninfer-csv must contain only one execution/cache result for each T/context"
+                    "--sinfer-csv must contain only one execution/cache result for each T/context"
                 )
             out[key] = row
     return out
 
 
-def attach_ninfer_comparison(rows: list[dict], ninfer_rows: dict[tuple[int, int], dict[str, str]]) -> None:
+def attach_sinfer_comparison(rows: list[dict], sinfer_rows: dict[tuple[int, int], dict[str, str]]) -> None:
     for row in rows:
-        ninfer = ninfer_rows.get((int(row["T"]), int(row["context"])))
-        if ninfer is None:
+        sinfer = sinfer_rows.get((int(row["T"]), int(row["context"])))
+        if sinfer is None:
             continue
-        ninfer_us = float(ninfer["median_us"])
-        ninfer_ms = ninfer_us * 1.0e-3
-        ninfer_tflops = float(ninfer["useful_flops"]) / (ninfer_us * 1.0e-6) / 1.0e12
-        row["ninfer_ms"] = ninfer_ms
-        row["ninfer_tflops"] = ninfer_tflops
-        row["flash_vs_ninfer_speedup"] = ninfer_ms / float(row["ms"]) if float(row["ms"]) > 0.0 else None
-        row["flash_vs_ninfer_tflops_ratio"] = (
-            float(row["tflops"]) / ninfer_tflops if ninfer_tflops > 0.0 else None
+        sinfer_us = float(sinfer["median_us"])
+        sinfer_ms = sinfer_us * 1.0e-3
+        sinfer_tflops = float(sinfer["useful_flops"]) / (sinfer_us * 1.0e-6) / 1.0e12
+        row["sinfer_ms"] = sinfer_ms
+        row["sinfer_tflops"] = sinfer_tflops
+        row["flash_vs_sinfer_speedup"] = sinfer_ms / float(row["ms"]) if float(row["ms"]) > 0.0 else None
+        row["flash_vs_sinfer_tflops_ratio"] = (
+            float(row["tflops"]) / sinfer_tflops if sinfer_tflops > 0.0 else None
         )
 
 
@@ -380,9 +380,9 @@ def main() -> int:
     parser.add_argument("--csv-out", default="")
     parser.add_argument("--json-out", default="")
     parser.add_argument(
-        "--ninfer-csv",
+        "--sinfer-csv",
         default="",
-        help="optional ninfer_causal_softmax_attention_bench CSV to merge",
+        help="optional sinfer_causal_softmax_attention_bench CSV to merge",
     )
     parser.add_argument("--seed", type=int, default=1234)
     args = parser.parse_args()
@@ -531,7 +531,7 @@ def main() -> int:
                     f"tc={row['tflops_pct']:6.2f}% ns/key={row['ns_per_key_query']:6.3f}"
                 )
 
-    attach_ninfer_comparison(rows, load_ninfer_csv(args.ninfer_csv))
+    attach_sinfer_comparison(rows, load_sinfer_csv(args.sinfer_csv))
     metadata = {
         "torch_version": torch.__version__,
         "torch_cuda": torch.version.cuda,

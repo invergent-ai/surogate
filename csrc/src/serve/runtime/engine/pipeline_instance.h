@@ -32,7 +32,7 @@
 
 #include <cuda_runtime.h>
 
-namespace ninfer::runtime {
+namespace sinfer::runtime {
 
 template <class Stage>
 class PipelineInstance;
@@ -695,4 +695,4 @@ private:
     }
 };
 
-} // namespace ninfer::runtime
+} // namespace sinfer::runtime

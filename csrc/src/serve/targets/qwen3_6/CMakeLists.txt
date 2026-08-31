@@ -1,4 +1,4 @@
-target_sources(ninfer_engine PRIVATE
+target_sources(sinfer_engine PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/chat_template.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/digest.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/frontend.cpp
@@ -13,5 +13,5 @@ target_sources(ninfer_engine PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/vision/bindings.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/vision/control.cpp)
 
-target_include_directories(ninfer_engine PRIVATE
+target_include_directories(sinfer_engine PRIVATE
   ${SERVE_ROOT})

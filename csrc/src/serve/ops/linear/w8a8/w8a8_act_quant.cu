@@ -4,7 +4,7 @@
 
 #include <cuda_bf16.h>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 constexpr int kThreads = 256;
@@ -62,4 +62,4 @@ W8A8QuantizedActivations w8a8_act_quant(const Tensor& x, void* workspace, cudaSt
     return {codes, scales};
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

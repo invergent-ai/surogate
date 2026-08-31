@@ -15,7 +15,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::test::input_projection {
+namespace sinfer::test::input_projection {
 
 inline std::vector<std::int32_t> sampled_rows(std::int32_t rows, std::int32_t sample_count = 7) {
     if (rows <= 0 || sample_count <= 0) {
@@ -187,4 +187,4 @@ inline std::vector<std::uint16_t> bf16_bits(std::span<const float> values) {
     return bits;
 }
 
-} // namespace ninfer::test::input_projection
+} // namespace sinfer::test::input_projection

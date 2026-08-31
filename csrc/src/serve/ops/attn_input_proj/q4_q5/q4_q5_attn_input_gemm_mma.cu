@@ -8,7 +8,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 RowSplitGroupedMmaJob make_job(const Weight& weight, std::int32_t row_begin, std::int32_t row_count,
@@ -101,4 +101,4 @@ void q4_q5_attn_input_grouped_mma_r32_c64_s4_launch(const Tensor& x, const Weigh
     launch<MmaR32C64S4>(x, query_key_weight, gate_value_weight, q, gate, k, v, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

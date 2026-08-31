@@ -8,7 +8,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 __device__ __forceinline__ float silu(float x) { return x / (1.0f + expf(-x)); }
 
@@ -42,4 +42,4 @@ __device__ __forceinline__ __half2 half2_from_bits(std::uint32_t bits) {
     return load_vec<__half2>(&bits);
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

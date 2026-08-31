@@ -7,7 +7,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 namespace {
 
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
@@ -203,4 +203,4 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
                                           dt_bias, ws, g, beta, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

@@ -14,7 +14,7 @@
 #include <string>
 #include <vector>
 
-namespace ninfer::serve {
+namespace sinfer::serve {
 
 struct GenerationOutcome;
 
@@ -48,7 +48,7 @@ struct BuiltResponse {
     std::vector<ChatTurn> output_history;
 };
 
-// Parse POST /v1/responses. Only NInfer Responses Core capabilities are
+// Parse POST /v1/responses. Only SInfer Responses Core capabilities are
 // accepted; recognized but unsupported OpenAI fields fail explicitly.
 ResponsesRequest parse_responses_request(const nlohmann::json& body, const RequestLimits& limits);
 
@@ -105,4 +105,4 @@ private:
 std::string new_response_id();
 std::string new_response_item_id(const char* prefix);
 
-} // namespace ninfer::serve
+} // namespace sinfer::serve

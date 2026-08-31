@@ -12,7 +12,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 template <int Values>
 struct alignas(Values / 2) Nvfp4CodePack {
@@ -247,4 +247,4 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

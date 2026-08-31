@@ -1,7 +1,7 @@
 # Qwen3.6-27B Python reference
 
 This is the complete target-private Text, Vision, MTP, sampling, state, and weight-residency
-reference over a native `.ninfer` artifact. It uses typed artifact bindings and remains independent
+reference over a native `.sinfer` artifact. It uses typed artifact bindings and remains independent
 from the C++ Engine implementation.
 
 It does not need the original Hugging Face checkpoint at inference time. `Frontend` materializes the
@@ -15,7 +15,7 @@ Install the target dependencies from `requirements.txt`, then run:
 ```bash
 python3 \
   -m tools.reference.qwen3_5_0_8b \
-  --weights out/qwen3_5_0_8b.ninfer \
+  --weights out/qwen3_5_0_8b.sinfer \
   --prompt "请简短介绍一下你自己。" --decode 512
 ```
 

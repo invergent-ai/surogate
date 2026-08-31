@@ -1,4 +1,4 @@
-// ninfer::ops - split-KV GQA small-T launcher and unified route dispatcher.
+// sinfer::ops - split-KV GQA small-T launcher and unified route dispatcher.
 //
 // The launcher template itself lives in gqa_attention_decode_launch.cuh and is
 // instantiated one geometry per translation unit (gqa_attention_decode_*.cu).
@@ -6,7 +6,7 @@
 // a second time, which is what made it the build's critical path.
 #include "ops/launcher/gqa_attention_decode_launch.cuh"
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 extern template void gqa_attention_small_t_launch_for<Gqa256_24q2, GqaAppendInput>(
     const Tensor&, GqaAppendInput, const Tensor&, float, PagedKVBatchLayerView,
@@ -176,4 +176,4 @@ void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, flo
                                                     out, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

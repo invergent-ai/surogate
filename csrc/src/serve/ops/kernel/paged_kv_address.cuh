@@ -4,7 +4,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 inline constexpr int kPagedKVPageShift = 6;
 inline constexpr int kPagedKVPageMask  = kPagedKVPageSize - 1;
@@ -40,4 +40,4 @@ paged_kv_element_offset(const std::int32_t* block_table, std::int32_t head, std:
         paged_kv_physical_page(block_table, position), head, position & kPagedKVPageMask, leading);
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

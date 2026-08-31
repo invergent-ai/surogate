@@ -4,7 +4,7 @@
 
 #include <cuda_runtime.h>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 void w8_linear_swiglu_decode_pair_launch(const Tensor& x, const Weight& w, Tensor& out,
                                          cudaStream_t stream);
@@ -43,4 +43,4 @@ void w8_linear_swiglu_mma_r128_c64_launch(const Tensor& x, const Weight& w, Tens
 void w8_linear_swiglu_mma_r128_c80_launch(const Tensor& x, const Weight& w, Tensor& out,
                                           cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

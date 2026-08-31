@@ -8,7 +8,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 /**
  * Host execution-resource promise for kv_cache_append_prefix.
@@ -54,4 +54,4 @@ void kv_cache_append_prefix(const Tensor& k, const Tensor& v, const Tensor& posi
                             KVCacheAppendPrefixExecutionEnvelope envelope,
                             CyclicKVCacheLayerView cache, cudaStream_t stream);
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

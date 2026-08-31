@@ -1,4 +1,4 @@
-// ninfer::ops - GQA A1/A2/A3 validation and finite route dispatch.
+// sinfer::ops - GQA A1/A2/A3 validation and finite route dispatch.
 #include "core/limits.h"
 #include "api/ops/gqa_attention.h"
 
@@ -12,7 +12,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 namespace {
 
 constexpr std::int32_t kHeadDim                      = 256;
@@ -524,4 +524,4 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
                                                   selection);
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

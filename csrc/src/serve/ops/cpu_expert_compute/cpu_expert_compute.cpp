@@ -30,7 +30,7 @@
 #include <sched.h>
 #endif
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 namespace {
 
 constexpr int kGroup = 32;
@@ -1361,4 +1361,4 @@ void CpuExpertPool::run(const CpuExpertBank& bank, const CpuExpertRound& round) 
     impl.round = nullptr;
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

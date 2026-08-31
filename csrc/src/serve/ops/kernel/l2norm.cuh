@@ -1,6 +1,6 @@
 #pragma once
 
-// ninfer::ops - L2Norm kernels over contiguous BF16 rows.
+// sinfer::ops - L2Norm kernels over contiguous BF16 rows.
 
 #include "ops/common/warp.cuh"
 
@@ -8,7 +8,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 // Fast domain: D in {64, 128, 192, 256}. One warp owns one row and keeps the input in registers.
 template <int Block>
@@ -78,4 +78,4 @@ __launch_bounds__(512) __global__
     }
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

@@ -8,7 +8,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace ninfer::targets::qwen3_6_35b_a3b::detail {
+namespace sinfer::targets::qwen3_6_35b_a3b::detail {
 
 using GraphExecutionProfile = qwen3_6::GraphExecutionProfile;
 
@@ -126,4 +126,4 @@ struct Variant {
                                                                              std::int32_t last);
 };
 
-} // namespace ninfer::targets::qwen3_6_35b_a3b::detail
+} // namespace sinfer::targets::qwen3_6_35b_a3b::detail

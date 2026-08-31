@@ -1,6 +1,6 @@
 # Tests
 
-The retained tests protect current `.ninfer`, numerical operator, target, runtime-transaction,
+The retained tests protect current `.sinfer`, numerical operator, target, runtime-transaction,
 benchmark-report, and external protocol behavior. Repository verification principles are defined in
 [`../AGENTS.md`](../AGENTS.md); Op contract and CUDA implementation guidance is in
 [`../docs/maintainer/op-development.md`](../docs/maintainer/op-development.md).
@@ -24,7 +24,7 @@ benchmark-report, and external protocol behavior. Repository verification princi
 - `targets/qwen3_6_35b_a3b/` — registered inventory/converter contracts, artifact-native diagnostic
   reference, MoE oracle, typed binding, selected-expert row access, 256K INT8 memory calculation,
   and the opt-in real public-Engine route;
-- `test_ninfer_artifact_reader.cpp` — C++ framing, directory, encoded-size, payload-span, and
+- `test_sinfer_artifact_reader.cpp` — C++ framing, directory, encoded-size, payload-span, and
   geometry behavior against a self-contained C++ fixture;
 - `test_request_memory.cpp` — startup-frozen request-transient capacity, stable address,
   activation alignment, rejection, and peak semantics;
@@ -33,7 +33,7 @@ benchmark-report, and external protocol behavior. Repository verification princi
   Responses Item/state/SSE behavior, and incremental tool-call behavior;
 - `test_request_log.cpp` and `test_http_error_handler.cpp` — generation lifecycle records,
   preparation rejections, protocol-shaped payload-limit errors, and application-error preservation;
-- `test_ninfer_bench_support.cpp` — product benchmark CLI, timing boundary, and schema-v9 reports;
+- `test_sinfer_bench_support.cpp` — product benchmark CLI, timing boundary, and schema-v9 reports;
 - `test_bench_matrix.py` — schema-v9 report consumption by the Python matrix summarizer;
 - `test_serve_corpus.py` — serving request-log schema compatibility at the measurement consumer;
 - device/tensor/arena tests — reusable lower-component behavior; KV tests cover the core physical
@@ -60,15 +60,15 @@ ctest --test-dir build --output-on-failure
 Run a focused target for a localized change:
 
 ```bash
-cmake --build build --parallel --target ninfer_sampling_test
-ctest --test-dir build -R ninfer_sampling_test --output-on-failure
+cmake --build build --parallel --target sinfer_sampling_test
+ctest --test-dir build -R sinfer_sampling_test --output-on-failure
 ```
 
 Enable uniform floating-point error records when establishing or reviewing an Op criterion:
 
 ```bash
-NINFER_OP_REPORT_STATS=1 \
-  ctest --test-dir build -V -R '^ninfer_(rmsnorm|gqa_attention)_test$'
+SINFER_OP_REPORT_STATS=1 \
+  ctest --test-dir build -V -R '^sinfer_(rmsnorm|gqa_attention)_test$'
 ```
 
 Every participating comparison emits one `OP_ERROR_STATS` record containing the stable case label,
@@ -79,9 +79,9 @@ Linear tests are independently runnable by weight and activation-compute profile
 
 ```bash
 cmake --build build --parallel --target \
-  ninfer_linear_q4_a16_test ninfer_linear_q5_a16_test \
-  ninfer_linear_q6_a16_test ninfer_linear_w8_a16_test
-ctest --test-dir build -R '^ninfer_linear_(q4|q5|q6|w8)_a16_test$' --output-on-failure
+  sinfer_linear_q4_a16_test sinfer_linear_q5_a16_test \
+  sinfer_linear_q6_a16_test sinfer_linear_w8_a16_test
+ctest --test-dir build -R '^sinfer_linear_(q4|q5|q6|w8)_a16_test$' --output-on-failure
 ```
 
 All Linear files use `ops/linear/linear_test_common.{h,cpp}` and the same
@@ -102,25 +102,25 @@ python3 -m pytest \
   tests/test_bench_matrix.py tests/test_serve_corpus.py
 ```
 
-The Python binding tests use `NINFER_QWEN3_6_27B_ARTIFACT` when set, otherwise they look for
-`out/qwen3_6_27b.ninfer`. They report a pytest skip when neither path provides the real
+The Python binding tests use `SINFER_QWEN3_6_27B_ARTIFACT` when set, otherwise they look for
+`out/qwen3_6_27b.sinfer`. They report a pytest skip when neither path provides the real
 artifact. The 35B-A3B reference binding test follows the same rule with
-`NINFER_QWEN3_6_35B_A3B_ARTIFACT` and `out/qwen3_6_35b_a3b.ninfer`. The remaining Python
+`SINFER_QWEN3_6_35B_A3B_ARTIFACT` and `out/qwen3_6_35b_a3b.sinfer`. The remaining Python
 target tests still run without either artifact.
 
 The C++ prefix/MTP integration test is separately opt-in because it loads the full artifact and
 runs the real engine:
 
 ```bash
-NINFER_QWEN3_6_27B_WEIGHTS=$PWD/out/qwen3_6_27b.ninfer \
-  ctest --test-dir build -R ninfer_qwen3_6_27b_prefix_real_test --output-on-failure
+SINFER_QWEN3_6_27B_WEIGHTS=$PWD/out/qwen3_6_27b.sinfer \
+  ctest --test-dir build -R sinfer_qwen3_6_27b_prefix_real_test --output-on-failure
 ```
 
 Run the peer 35B-A3B route independently:
 
 ```bash
-NINFER_QWEN3_6_35B_A3B_WEIGHTS=$PWD/out/qwen3_6_35b_a3b.ninfer \
-  ctest --test-dir build -R ninfer_qwen3_6_35b_a3b_real_test --output-on-failure
+SINFER_QWEN3_6_35B_A3B_WEIGHTS=$PWD/out/qwen3_6_35b_a3b.sinfer \
+  ctest --test-dir build -R sinfer_qwen3_6_35b_a3b_real_test --output-on-failure
 ```
 
 Without the corresponding variable CTest marks each C++ integration test as skipped. Neither test
@@ -136,7 +136,7 @@ PYTHONPATH=eval eval/.venv/bin/python -m unittest discover \
 Run the serving contract manually after starting a resident server in another terminal:
 
 ```bash
-./build/apps/ninfer-serve out/qwen3_6_27b.ninfer \
+./build/apps/sinfer-serve out/qwen3_6_27b.sinfer \
   --host 127.0.0.1 --port 18080
 ```
 
@@ -156,10 +156,10 @@ inheritance:
 
 ```bash
 python3 tools/smoke/serve_thinking_preservation.py \
-  --artifact out/qwen3_6_27b.ninfer --backend mtp
+  --artifact out/qwen3_6_27b.sinfer --backend mtp
 
 python3 tools/smoke/serve_thinking_preservation.py \
-  --artifact out/qwen3_6_35b_a3b.ninfer --backend dflash
+  --artifact out/qwen3_6_35b_a3b.sinfer --backend dflash
 ```
 
 The shared messages are in

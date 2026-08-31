@@ -17,8 +17,8 @@ int fail(const std::string& message) {
 int check(bool condition, const std::string& message) { return condition ? 0 : fail(message); }
 
 int test_single_call() {
-    const ninfer::serve::ParsedToolCallOutput parsed =
-        ninfer::serve::parse_qwen_tool_call_output("Calling weather.\n"
+    const sinfer::serve::ParsedToolCallOutput parsed =
+        sinfer::serve::parse_qwen_tool_call_output("Calling weather.\n"
                                                    "<tool_call>\n"
                                                    "<function=get_weather>\n"
                                                    "<parameter=city>\nParis\n</parameter>\n"
@@ -40,7 +40,7 @@ int test_single_call() {
 }
 
 int test_multiple_calls_and_json_values() {
-    const ninfer::serve::ParsedToolCallOutput parsed = ninfer::serve::parse_qwen_tool_call_output(
+    const sinfer::serve::ParsedToolCallOutput parsed = sinfer::serve::parse_qwen_tool_call_output(
         "<tool_call>\n"
         "<function=first>\n"
         "<parameter=payload>\n{\"ok\":true,\"items\":[1,2]}\n</parameter>\n"
@@ -68,8 +68,8 @@ int test_multiple_calls_and_json_values() {
 
 int test_malformed_falls_back_to_text() {
     const std::string text = "<tool_call>\n<function=get_weather>\n";
-    const ninfer::serve::ParsedToolCallOutput parsed =
-        ninfer::serve::parse_qwen_tool_call_output(text, 64);
+    const sinfer::serve::ParsedToolCallOutput parsed =
+        sinfer::serve::parse_qwen_tool_call_output(text, 64);
     int failures = 0;
     failures += check(!parsed.is_tool_call_response, "malformed xml is not tool response");
     failures += check(parsed.content == text, "malformed xml preserved as text");
@@ -84,8 +84,8 @@ int test_suffix_after_tool_falls_back_to_text() {
                              "</function>\n"
                              "</tool_call>\n"
                              "extra answer";
-    const ninfer::serve::ParsedToolCallOutput parsed =
-        ninfer::serve::parse_qwen_tool_call_output(text, 64);
+    const sinfer::serve::ParsedToolCallOutput parsed =
+        sinfer::serve::parse_qwen_tool_call_output(text, 64);
     int failures = 0;
     failures += check(!parsed.is_tool_call_response, "non-whitespace suffix falls back to text");
     failures += check(parsed.content == text, "suffix fallback preserves text");
@@ -96,14 +96,14 @@ int test_configured_name_limit() {
     const std::string name(128, 'a');
     const std::string text = "<tool_call>\n<function=" + name + ">\n</function>\n</tool_call>";
 
-    const ninfer::serve::ParsedToolCallOutput anthropic =
-        ninfer::serve::parse_qwen_tool_call_output(text, 128);
-    const ninfer::serve::ParsedToolCallOutput openai =
-        ninfer::serve::parse_qwen_tool_call_output(text, 64);
+    const sinfer::serve::ParsedToolCallOutput anthropic =
+        sinfer::serve::parse_qwen_tool_call_output(text, 128);
+    const sinfer::serve::ParsedToolCallOutput openai =
+        sinfer::serve::parse_qwen_tool_call_output(text, 64);
     const std::string too_long_text =
         "<tool_call>\n<function=" + std::string(129, 'a') + ">\n</function>\n</tool_call>";
-    const ninfer::serve::ParsedToolCallOutput too_long =
-        ninfer::serve::parse_qwen_tool_call_output(too_long_text, 128);
+    const sinfer::serve::ParsedToolCallOutput too_long =
+        sinfer::serve::parse_qwen_tool_call_output(too_long_text, 128);
 
     int failures = 0;
     failures += check(anthropic.is_tool_call_response && anthropic.tool_calls.size() == 1 &&
@@ -117,7 +117,7 @@ int test_configured_name_limit() {
 }
 
 int test_incremental_filter_valid_tool() {
-    ninfer::serve::ToolCallStreamFilter filter;
+    sinfer::serve::ToolCallStreamFilter filter;
     std::string visible;
     visible += filter.feed("Calling weather.  \n<tool_");
     visible += filter.feed("call>\n<function=get_weather>");
@@ -133,13 +133,13 @@ int test_incremental_filter_valid_tool() {
 
 int test_incremental_filter_fallback() {
     const std::string original = "prefix  \n<tool_call>\n<function=broken>";
-    ninfer::serve::ToolCallStreamFilter malformed;
+    sinfer::serve::ToolCallStreamFilter malformed;
     std::string restored;
     restored += malformed.feed(original.substr(0, 10));
     restored += malformed.feed(original.substr(10));
     restored += malformed.finish(false);
 
-    ninfer::serve::ToolCallStreamFilter normal;
+    sinfer::serve::ToolCallStreamFilter normal;
     std::string ordinary;
     ordinary += normal.feed("ordinary text  ");
     ordinary += normal.finish(false);

@@ -21,7 +21,7 @@
 #include <span>
 #include <vector>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 /// One layer's routed experts in host memory (the pinned bank's host pointers).
 /// Storage of the routed expert bank the host (and the miss gather) read.
@@ -110,4 +110,4 @@ private:
 /// sets the group size from which the repack pays).
 [[nodiscard]] bool cpu_expert_compute_has_tile() noexcept;
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

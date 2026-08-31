@@ -5,7 +5,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 inline constexpr int kKVCacheAppendPrefixHeadDim = 128;
 inline constexpr int kKVCacheAppendPrefixHeads   = 8;
@@ -140,4 +140,4 @@ __global__ void kv_cache_append_prefix_paged_kernel(
     }
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

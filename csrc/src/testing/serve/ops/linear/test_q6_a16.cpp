@@ -6,7 +6,7 @@
 
 namespace {
 
-using namespace ninfer::test::linear;
+using namespace sinfer::test::linear;
 
 constexpr Invocation a16(std::int32_t t) { return {t}; }
 
@@ -51,7 +51,7 @@ int q6_a16_conformance() {
 } // namespace
 
 int main() {
-    if (!ninfer::test::linear::cuda_available()) {
+    if (!sinfer::test::linear::cuda_available()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }

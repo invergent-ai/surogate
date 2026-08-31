@@ -12,7 +12,7 @@
 #include <string>
 #include <unordered_map>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 constexpr std::size_t kWorkspaceBytes = 32u << 20;
@@ -158,4 +158,4 @@ void bf16_cublaslt_gemm(const Weight& weight, const Tensor& x, Tensor& out, cuda
           "matmul");
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

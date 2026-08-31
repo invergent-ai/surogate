@@ -10,7 +10,7 @@
 #include <string_view>
 #include <utility>
 
-namespace ninfer::product {
+namespace sinfer::product {
 namespace {
 
 using Json = nlohmann::json;
@@ -273,4 +273,4 @@ PromptInput prompt_from_messages(const std::filesystem::path& path, bool enable_
     return input;
 }
 
-} // namespace ninfer::product
+} // namespace sinfer::product

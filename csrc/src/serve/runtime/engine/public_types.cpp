@@ -2,11 +2,11 @@
 
 #include <utility>
 
-namespace ninfer {
+namespace sinfer {
 
 CancellationView::CancellationView(std::function<bool()> requested)
     : requested_(std::move(requested)) {}
 
 bool CancellationView::requested() const { return requested_ && requested_(); }
 
-} // namespace ninfer
+} // namespace sinfer

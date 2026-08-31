@@ -4,7 +4,7 @@ import numpy as np, sys
 from surogate.serve.tools.convert.qwen4exp import inventory as inv, convert as cv
 from surogate.serve.tools.artifact.container import Artifact
 from surogate.serve.tools.artifact.layouts import decode_direct
-PATH = "/home/densemax2/work/models/ninfer/qwen3_8_flash_next.ninfer"
+PATH = "/home/densemax2/work/models/sinfer/qwen3_8_flash_next.sinfer"
 src = cv.GgufSource("models/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf")
 art = Artifact.open(PATH)
 shape = (inv.GDN_CONV_KERNEL, inv.GDN_CONV_DIM)

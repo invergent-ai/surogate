@@ -25,7 +25,7 @@
 
 #include <cuda_runtime.h> // cudaStream_t
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 struct QsaIndexerGeometry {
     std::int32_t head_dim   = 0; // indexer key/query width
@@ -77,4 +77,4 @@ void qsa_indexer_select(const Tensor& q, const Tensor& positions, const Tensor& 
 [[nodiscard]] std::size_t qsa_indexer_select_workspace_capacity_bytes(
     std::int32_t rows, std::int32_t keys, const QsaIndexerGeometry& geometry);
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

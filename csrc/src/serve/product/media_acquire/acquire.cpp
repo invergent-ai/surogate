@@ -22,7 +22,7 @@
 #include <string_view>
 #include <vector>
 
-namespace ninfer::product::media_acquire {
+namespace sinfer::product::media_acquire {
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -243,7 +243,7 @@ std::vector<std::uint8_t> fetch_url(std::string url, const Policy& policy) {
         curl_easy_setopt(curl.get(), CURLOPT_NOPROGRESS, 0L);
         curl_easy_setopt(curl.get(), CURLOPT_XFERINFOFUNCTION, curl_progress);
         curl_easy_setopt(curl.get(), CURLOPT_XFERINFODATA, &policy);
-        curl_easy_setopt(curl.get(), CURLOPT_USERAGENT, "ninfer/vision");
+        curl_easy_setopt(curl.get(), CURLOPT_USERAGENT, "sinfer/vision");
         const CURLcode code = curl_easy_perform(curl.get());
         if (code != CURLE_OK) {
             check_control(policy);
@@ -359,4 +359,4 @@ std::vector<std::uint8_t> acquire_bytes(const Source& source, const Policy& poli
     return read_path(source, policy);
 }
 
-} // namespace ninfer::product::media_acquire
+} // namespace sinfer::product::media_acquire

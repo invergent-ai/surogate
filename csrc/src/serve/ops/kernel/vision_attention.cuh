@@ -9,7 +9,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 // The tower's head dim: 72 on the Qwen3.6 family and Flash-Next (16 heads of a
 // 1152-wide tower), 64 on every Qwen3.5 tower (16 heads of 1024). The kernel takes
@@ -386,4 +386,4 @@ __launch_bounds__(Br * 2, 128 / Br) __global__ void vision_attention_flash_kerne
     }
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

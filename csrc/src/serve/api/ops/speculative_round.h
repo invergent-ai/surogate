@@ -7,7 +7,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 // Caller-owned transient capacity for every draft-count and batch-size pair in the inclusive
 // domains. token_domain is the fixed sampling profile; invalid domains throw.
@@ -121,4 +121,4 @@ void speculative_select_accepted_hidden(const Tensor& hidden, const Tensor& sele
 void proposal_remap_token_ids(Tensor& proposal_tokens, const std::int32_t* id_map,
                               std::int32_t count, cudaStream_t stream);
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

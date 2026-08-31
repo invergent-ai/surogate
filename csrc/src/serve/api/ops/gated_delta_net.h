@@ -8,7 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 /**
  * Returns the transient arena capacity required by gated_delta_net for the given geometry. It is
@@ -103,4 +103,4 @@ void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tenso
                                    Tensor& value_record, Tensor& gate_record, Tensor& out,
                                    cudaStream_t stream);
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

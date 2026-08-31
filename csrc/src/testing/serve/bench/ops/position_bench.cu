@@ -1,7 +1,7 @@
 // Exact small-T qualification benchmark for offset_i32_positions.
 #include "api/ops/position.h"
 #include "core/device.h"
-#include "ninfer_bench_common.h"
+#include "sinfer_bench_common.h"
 #include "ops/launcher/position.h"
 
 #include <cuda_runtime.h>
@@ -14,8 +14,8 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::bench;
+using namespace sinfer;
+using namespace sinfer::bench;
 
 namespace {
 

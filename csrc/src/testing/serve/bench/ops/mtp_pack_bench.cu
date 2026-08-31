@@ -2,7 +2,7 @@
 
 #include "api/ops/mtp_pack.h"
 
-#include "ninfer_bench_common.h"
+#include "sinfer_bench_common.h"
 
 #include <cuda_runtime.h>
 
@@ -13,8 +13,8 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::bench;
+using namespace sinfer;
+using namespace sinfer::bench;
 
 namespace {
 
@@ -114,7 +114,7 @@ int main(int argc, char** argv) {
                 tokens = parse_tokens(argv[++index]);
             } else {
                 throw std::invalid_argument(
-                    "usage: ninfer_mtp_pack_bench [--op pack|split] [--d 2048|5120] "
+                    "usage: sinfer_mtp_pack_bench [--op pack|split] [--d 2048|5120] "
                     "[--tokens T[,T...]]");
             }
         }
@@ -128,7 +128,7 @@ int main(int argc, char** argv) {
         }
         return 0;
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "ninfer_mtp_pack_bench: %s\n", error.what());
+        std::fprintf(stderr, "sinfer_mtp_pack_bench: %s\n", error.what());
         return 2;
     }
 }

@@ -6,7 +6,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 inline constexpr std::int32_t kBf16LinearAddSmallTMinTokens   = 2;
 inline constexpr std::int32_t kBf16LinearAddSmallTMaxTokens   = 32;
@@ -38,4 +38,4 @@ void bf16_linear_add_mma_launch(const Tensor& x, const Weight& weight, Tensor& r
 void bf16_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
                               cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

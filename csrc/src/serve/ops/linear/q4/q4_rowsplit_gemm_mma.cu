@@ -7,7 +7,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 using Q4MmaR64C32Schedule =
@@ -161,4 +161,4 @@ void launch_q4_mma_r64_c128(const Tensor& x, const Weight& w, Tensor& out, cudaS
     launch_route<Q4MmaR64C128Schedule>(x, w, out, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

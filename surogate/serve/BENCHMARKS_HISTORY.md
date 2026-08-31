@@ -287,8 +287,8 @@ Same card, one run per cell, 48 lanes, fp8 KV auto:
 | balanced 512/128, GPU7 (decode / prompt tok/s) | 826 / 3,303 | 822 / 3,289 | 841 / 3,362 |
 
 Only +4–6 % on the prefill-heavy shape, because the two in-house schedules
-are close. The kernel-level picture (GPU2, `ninfer_gdn_input_proj_bench` and
-the `ninfer_linear_nvfp4_cublaslt_test` timings, TFLOP/s):
+are close. The kernel-level picture (GPU2, `sinfer_gdn_input_proj_bench` and
+the `sinfer_linear_nvfp4_cublaslt_test` timings, TFLOP/s):
 
 | GEMM | tokens | in-house W4A4 | cuBLASLt block-scaled FP4 |
 |---|---:|---:|---:|
@@ -303,7 +303,7 @@ the `ninfer_linear_nvfp4_cublaslt_test` timings, TFLOP/s):
 cuBLASLt (`CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3`, CUDA 13.1) consumes
 the artifact's weight codes and 128×4-tiled scales in place and is
 bit-exact against the in-house kernels on identical quantized inputs
-(`ninfer_linear_nvfp4_cublaslt_test`); it is 1.4–1.9× faster from 64 tokens
+(`sinfer_linear_nvfp4_cublaslt_test`); it is 1.4–1.9× faster from 64 tokens
 up and slower below (the in-house small-T kernels run at the weight-bandwidth
 limit). PATCHES.md #76 routes every W4A4 GEMM from 64 tokens up through cuBLASLt.
 Same card, route off → on, one run each: prefill-heavy 6,139 → 6,528 prompt
@@ -322,7 +322,7 @@ layers 31.8 %. Summing the isolated op benches at the same shape gives only
 graph replay may or may not remove — the next measurement. Isolated costs:
 the prefill attention kernel is 311 µs per layer at 1,073 tokens (488 µs on
 a 2,146-token context), 91 TFLOP/s — ~5× off an FA3-class kernel but only
-5–8 ms of the chunk; the chunked GDN path (`ninfer_gated_delta_net_bench`,
+5–8 ms of the chunk; the chunked GDN path (`sinfer_gated_delta_net_bench`,
 48 value heads, 1,024 tokens) is 287 µs per layer — state passing 47 %,
 WY/WU preparation 30 %, output 23 % — moving 145 MB of intermediates per
 layer at 641 GB/s. Lanes: with #75/#76 in, 64 lanes beat 48 on the balanced
@@ -452,7 +452,7 @@ way as the 27B's:
 **20.9 ms fixed plus 56 us per column** unbatched — and unlike the 27B, the
 column cost is *not* flat. The routed experts are streamed once per round no
 matter how wide it is, so per-token cost falls steeply with width
-(`ninfer_sparse_moe_bench`, q4-q5, cold, one layer):
+(`sinfer_sparse_moe_bench`, q4-q5, cold, one layer):
 
 | columns | 640 | 1,152 | 2,176 | 2,688 | 3,712 |
 |---|---:|---:|---:|---:|---:|

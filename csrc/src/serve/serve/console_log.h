@@ -4,7 +4,7 @@
 #include <string>
 #include <string_view>
 
-namespace ninfer::serve {
+namespace sinfer::serve {
 
 enum class ConsoleLogLevel {
     Info,
@@ -19,4 +19,4 @@ enum class ConsoleLogLevel {
 
 void write_console_log(ConsoleLogLevel level, std::string_view message);
 
-} // namespace ninfer::serve
+} // namespace sinfer::serve

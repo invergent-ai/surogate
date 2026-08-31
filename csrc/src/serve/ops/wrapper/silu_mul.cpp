@@ -1,4 +1,4 @@
-// ninfer::ops — silu_mul wrapper: implements the public api, validates parameters, and
+// sinfer::ops — silu_mul wrapper: implements the public api, validates parameters, and
 // dispatches to the launcher. Host-compiled; never includes the kernel header.
 // See docs/op-development.md §2.
 #include "api/ops/silu_mul.h"
@@ -7,7 +7,7 @@
 
 #include <stdexcept>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 void silu_mul(const Tensor& gate, const Tensor& up, Tensor& out, cudaStream_t stream) {
     if (gate.dtype != DType::BF16 || up.dtype != DType::BF16 || out.dtype != DType::BF16) {
@@ -27,4 +27,4 @@ void silu_mul(const Tensor& gate, const Tensor& up, Tensor& out, cudaStream_t st
     detail::silu_and_mul_launch(gate, up, out, stream); // single variant -> direct dispatch
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

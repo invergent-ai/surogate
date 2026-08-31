@@ -1,4 +1,4 @@
-#include "ninfer_bench_support.h"
+#include "sinfer_bench_support.h"
 
 #include <algorithm>
 #include <array>
@@ -12,7 +12,7 @@
 #include <stdexcept>
 #include <system_error>
 
-namespace ninfer::bench {
+namespace sinfer::bench {
 namespace {
 
 int parse_int(std::string_view text, const char* label) {
@@ -90,9 +90,9 @@ std::vector<std::pair<int, int>> parse_pair_list(std::string_view value, const c
 
 std::string existing_read_path(const std::string& path) {
     if (std::filesystem::exists(path)) { return path; }
-#ifdef NINFER_SOURCE_DIR
+#ifdef SINFER_SOURCE_DIR
     const auto source_relative =
-        (std::filesystem::path(NINFER_SOURCE_DIR) / path).lexically_normal();
+        (std::filesystem::path(SINFER_SOURCE_DIR) / path).lexically_normal();
     if (std::filesystem::exists(source_relative)) { return source_relative.string(); }
 #endif
     return path;
@@ -252,13 +252,13 @@ std::uint32_t BenchTest::required_context(std::uint32_t mtp_draft_tokens) const 
 }
 
 std::string usage_text(std::string_view program) {
-    if (program.empty()) { program = "ninfer_bench"; }
+    if (program.empty()) { program = "sinfer_bench"; }
     std::ostringstream out;
-    out << "Usage: " << program << " --weights <artifact.ninfer> [options]\n\n"
-        << "Product-route throughput benchmark over ninfer::Engine. pp measures Engine prefill;\n"
+    out << "Usage: " << program << " --weights <artifact.sinfer> [options]\n\n"
+        << "Product-route throughput benchmark over sinfer::Engine. pp measures Engine prefill;\n"
         << "tg measures G generated tokens after an untimed one-token seed prefill.\n\n"
         << "Options:\n"
-        << "  --weights <path>            required .ninfer artifact\n"
+        << "  --weights <path>            required .sinfer artifact\n"
         << "  --corpus <path>             token-id corpus (default: " << kDefaultCorpusPath << ")\n"
         << "  -p, --n-prompt <list>       pp lengths, for example 512,2048\n"
         << "  -n, --n-gen <list>          tg lengths, for example 128\n"
@@ -545,7 +545,7 @@ std::vector<double> total_time_series(const TestResult& result) {
 
 std::string format_table(const BenchEnvironment& env, const std::vector<TestResult>& results) {
     std::ostringstream out;
-    out << "ninfer_bench product throughput report\n"
+    out << "sinfer_bench product throughput report\n"
         << "  target:     " << env.load.target << '\n'
         << "  weights:    " << env.load.weights_id << '\n'
         << "  gpu:        " << env.gpu_name << " (device " << env.device_id << ")\n"
@@ -619,7 +619,7 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
     out << "{\n"
         << "  \"schema_version\": " << kSchemaVersion << ",\n"
         << "  \"artifact_type\": \"" << kArtifactType << "\",\n"
-        << "  \"tool\": \"ninfer_bench\",\n"
+        << "  \"tool\": \"sinfer_bench\",\n"
         << "  \"command\": \"" << json_escape(command) << "\",\n"
         << "  \"environment\": {\"gpu_name\": \"" << json_escape(env.gpu_name)
         << "\", \"cuda_runtime_version\": \"" << json_escape(env.cuda_runtime_version)
@@ -840,4 +840,4 @@ std::uint64_t file_size_or_zero(const std::string& path) {
     return error ? 0 : static_cast<std::uint64_t>(size);
 }
 
-} // namespace ninfer::bench
+} // namespace sinfer::bench

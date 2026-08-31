@@ -8,7 +8,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 using GateUpC40Cfg  = GemmCfg<64, 40, 64, 64, 8, 2, 1, false, true, true>;
@@ -68,4 +68,4 @@ void q4_linear_swiglu_mma_split_half_pair_r32_c48_launch(const Tensor& x, const 
     launch_route<GateUpC48Cfg>(x, weight, out, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

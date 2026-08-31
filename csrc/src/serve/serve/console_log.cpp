@@ -7,7 +7,7 @@
 #include <mutex>
 #include <sstream>
 
-namespace ninfer::serve {
+namespace sinfer::serve {
 namespace {
 
 const char* level_name(ConsoleLogLevel level) noexcept {
@@ -55,4 +55,4 @@ void write_console_log(ConsoleLogLevel level, std::string_view message) {
     std::cerr << current_console_log_prefix(level) << message << '\n';
 }
 
-} // namespace ninfer::serve
+} // namespace sinfer::serve

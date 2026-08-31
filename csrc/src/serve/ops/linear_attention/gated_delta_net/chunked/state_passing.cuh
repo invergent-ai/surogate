@@ -10,13 +10,13 @@
 //   value strip 16: 8 warps, ~44 KB dynamic smem, two CTAs/SM;
 //   value strip 32: 16 warps, ~56 KB dynamic smem, one CTA/SM.
 
-namespace ninfer::ops::detail::gated_delta_net::chunked::state_passing {
+namespace sinfer::ops::detail::gated_delta_net::chunked::state_passing {
 
-using ninfer::ops::mma_tf32_bits;
-using ninfer::ops::ldmatrix_x2;
-using ninfer::ops::ldmatrix_x2_t;
-using ninfer::ops::smem_addr;
-using ninfer::ops::exp2_approx;
+using sinfer::ops::mma_tf32_bits;
+using sinfer::ops::ldmatrix_x2;
+using sinfer::ops::ldmatrix_x2_t;
+using sinfer::ops::smem_addr;
+using sinfer::ops::exp2_approx;
 
 static_assert(kChunkSize == 64, "stage_state_passing: kChunkSize must be 64");
 static_assert(kStateDim == 128);
@@ -31,7 +31,7 @@ struct kernel_dims<16> {
     static constexpr int DT_TILES_PER_BLOCK = N_STRIP_PER_BLOCK / MMA_N;
     static constexpr int BT_SPLITS          = 4;
     static constexpr int N_WARPS            = DT_TILES_PER_BLOCK * BT_SPLITS; // 8
-    static constexpr int THREADS            = N_WARPS * ninfer::ops::kWarpSize;
+    static constexpr int THREADS            = N_WARPS * sinfer::ops::kWarpSize;
     static constexpr int MIN_BLOCKS         = 2;
 };
 
@@ -42,7 +42,7 @@ struct kernel_dims<32> {
     static constexpr int DT_TILES_PER_BLOCK = N_STRIP_PER_BLOCK / MMA_N;
     static constexpr int BT_SPLITS          = 4;
     static constexpr int N_WARPS            = DT_TILES_PER_BLOCK * BT_SPLITS; // 16
-    static constexpr int THREADS            = N_WARPS * ninfer::ops::kWarpSize;
+    static constexpr int THREADS            = N_WARPS * sinfer::ops::kWarpSize;
     static constexpr int MIN_BLOCKS         = 1;
 };
 
@@ -535,4 +535,4 @@ __launch_bounds__(kernel_dims<NStrip>::THREADS, kernel_dims<NStrip>::MIN_BLOCKS)
     }
 }
 
-} // namespace ninfer::ops::detail::gated_delta_net::chunked::state_passing
+} // namespace sinfer::ops::detail::gated_delta_net::chunked::state_passing

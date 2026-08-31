@@ -14,11 +14,11 @@
 #include <algorithm>
 #include <stdexcept>
 
-#define NINFER_QWEN36_VARIANT    ::ninfer::targets::qwen3_5_2b::detail::Variant
-#define NINFER_QWEN36_RUNTIME_NS qwen3_5_2b_runtime
+#define SINFER_QWEN36_VARIANT    ::sinfer::targets::qwen3_5_2b::detail::Variant
+#define SINFER_QWEN36_RUNTIME_NS qwen3_5_2b_runtime
 #include "targets/qwen3_6/impl/runtime/instantiate.h"
 
-namespace ninfer::targets::qwen3_5_2b::detail {
+namespace sinfer::targets::qwen3_5_2b::detail {
 namespace {
 
 std::vector<GraphExecutionProfile>
@@ -516,4 +516,4 @@ std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(std::int32_t first,
     return layout.peak_bytes(1);
 }
 
-} // namespace ninfer::targets::qwen3_5_2b::detail
+} // namespace sinfer::targets::qwen3_5_2b::detail

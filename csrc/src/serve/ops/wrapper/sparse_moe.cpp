@@ -14,7 +14,7 @@
 #include <string>
 #include <vector>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 namespace {
 
 struct AddressRange {
@@ -440,4 +440,4 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
     }
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

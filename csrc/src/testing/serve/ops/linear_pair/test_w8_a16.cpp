@@ -6,14 +6,14 @@
 
 namespace {
 
-using ninfer::test::linear_pair::ShapeCase;
+using sinfer::test::linear_pair::ShapeCase;
 
 int w8_a16_conformance() {
     int failures = 0;
 
     constexpr std::array<std::int32_t, 2> kK5120RouteStarts{5, 57};
     constexpr std::array<std::int32_t, 3> kK5120RouteInteriors{2, 24, 128};
-    failures += ninfer::test::linear_pair::run_w8_a16_shape(
+    failures += sinfer::test::linear_pair::run_w8_a16_shape(
         "W8_A16 LinearPair", ShapeCase{5120, 431U, kK5120RouteStarts, kK5120RouteInteriors});
 
     constexpr std::array<std::int32_t, 36> kK2048RouteStarts{
@@ -26,7 +26,7 @@ int w8_a16_conformance() {
         432,  560,  641,  656,  676,  736,  840,  928,  968,  1120, 1296, 1332, 1345,
         1392, 1456, 1576, 1696, 1816, 1921, 1968, 2017, 2112, 2240, 4096,
     };
-    failures += ninfer::test::linear_pair::run_w8_a16_shape(
+    failures += sinfer::test::linear_pair::run_w8_a16_shape(
         "W8_A16 LinearPair", ShapeCase{2048, 433U, kK2048RouteStarts, kK2048RouteInteriors});
     return failures;
 }
@@ -34,7 +34,7 @@ int w8_a16_conformance() {
 } // namespace
 
 int main() {
-    if (!ninfer::test::linear_pair::cuda_available()) {
+    if (!sinfer::test::linear_pair::cuda_available()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }

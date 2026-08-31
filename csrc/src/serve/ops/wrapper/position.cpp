@@ -6,7 +6,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 namespace {
 
 void require_i32_vector(const Tensor& tensor, const char* name) {
@@ -48,4 +48,4 @@ void offset_i32_positions(const Tensor& source, const Tensor& delta, Tensor& des
     detail::offset_i32_positions_launch(source, delta, destination, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

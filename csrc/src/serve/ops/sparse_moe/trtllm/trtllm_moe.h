@@ -12,7 +12,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
-namespace ninfer::ops::detail::trtllm_moe {
+namespace sinfer::ops::detail::trtllm_moe {
 
 struct Geometry {
     std::int32_t hidden            = 0;
@@ -73,4 +73,4 @@ void run(const Geometry& geometry, const __nv_bfloat16* x, std::int32_t tokens,
          const std::int32_t* ids, const float* final_scales, const Nvfp4RoutedExperts& experts,
          void* workspace, std::size_t workspace_capacity, float* routed_sum, cudaStream_t stream);
 
-} // namespace ninfer::ops::detail::trtllm_moe
+} // namespace sinfer::ops::detail::trtllm_moe

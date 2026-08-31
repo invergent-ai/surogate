@@ -8,34 +8,34 @@
 
 #include <functional>
 
-namespace ninfer::serve {
+namespace sinfer::serve {
 
 // Media acquisition is a product-layer concern. Translation preserves part order
 // and asks the caller to turn each wire source into owning bytes before the
 // target frontend sees it.
-using MediaAcquirer = std::function<ninfer::OwnedMedia(const ContentPart&)>;
+using MediaAcquirer = std::function<sinfer::OwnedMedia(const ContentPart&)>;
 
 struct ResolvedPromptSemantics {
     bool enable_thinking = true;
-    std::optional<ninfer::ReasoningEffort> reasoning_effort;
+    std::optional<sinfer::ReasoningEffort> reasoning_effort;
     bool preserve_thinking = false;
 };
 
 ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& req,
                                                  const ServeOptions& server,
-                                                 const ninfer::PromptCapabilities& capabilities);
+                                                 const sinfer::PromptCapabilities& capabilities);
 
-ninfer::PromptInput to_prompt_input(const GenerationRequest& req,
+sinfer::PromptInput to_prompt_input(const GenerationRequest& req,
                                     const ResolvedPromptSemantics& semantics,
                                     const MediaAcquirer& acquire_media);
 
 // Build public request options (output budget, thinking, stop policy, sampler). The
 // sampler is resolved from the request's SamplingParams over the server defaults;
 // --greedy on the server forces exact argmax regardless of the request.
-ninfer::RequestOptions to_request_options(const GenerationRequest& req, const ServeOptions& server);
+sinfer::RequestOptions to_request_options(const GenerationRequest& req, const ServeOptions& server);
 
 // Map an internal finish reason onto the OpenAI wire value. Cancelled maps to
 // "stop" (a disconnected client is not an error state on the wire).
-const char* finish_reason_wire(ninfer::FinishReason reason);
+const char* finish_reason_wire(sinfer::FinishReason reason);
 
-} // namespace ninfer::serve
+} // namespace sinfer::serve

@@ -22,7 +22,7 @@
 #include <variant>
 #include <utility>
 
-namespace ninfer::targets {
+namespace sinfer::targets {
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -31,8 +31,8 @@ void validate_options(const EngineOptions& options) {
     if (options.artifact_path.empty()) {
         throw std::invalid_argument("Engine artifact_path must not be empty");
     }
-    if (options.artifact_path.extension() != ".ninfer") {
-        throw std::invalid_argument("NInfer accepts only .ninfer artifacts");
+    if (options.artifact_path.extension() != ".sinfer") {
+        throw std::invalid_argument("SInfer accepts only .sinfer artifacts");
     }
     // max_context == 0 is the automatic request: the largest context the device's free memory
     // allows, resolved per target in construct_registered / construct_pipeline.
@@ -550,4 +550,4 @@ ConstructedTarget construct_pipeline_target(const EngineOptions& options) {
     throw std::runtime_error("pipeline parallelism is not wired for artifact '" + identity.model_id + "'");
 }
 
-} // namespace ninfer::targets
+} // namespace sinfer::targets

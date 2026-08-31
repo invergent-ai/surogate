@@ -4,7 +4,7 @@
 #include "ops/common/math.h"
 #include "ops/kernel/position.cuh"
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 void fill_i32_positions_launch(Tensor& positions, std::int32_t start, cudaStream_t stream) {
     constexpr int block = 256;
@@ -28,4 +28,4 @@ void offset_i32_positions_block_launch(const Tensor& source, const Tensor& delta
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

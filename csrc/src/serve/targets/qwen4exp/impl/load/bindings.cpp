@@ -11,7 +11,7 @@
 #include <string>
 #include <string_view>
 
-namespace ninfer::targets::qwen4exp::detail {
+namespace sinfer::targets::qwen4exp::detail {
 namespace {
 
 using artifact::NumericFormat;
@@ -508,4 +508,4 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     ple.table.head_dim      = TextConfig::ple_head_dim;
 }
 
-} // namespace ninfer::targets::qwen4exp::detail
+} // namespace sinfer::targets::qwen4exp::detail

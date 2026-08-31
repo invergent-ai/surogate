@@ -9,7 +9,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 inline constexpr int kBidirectionalGqaHeadDim  = 128;
 inline constexpr int kBidirectionalGqaQHeads   = 32;
@@ -717,4 +717,4 @@ __launch_bounds__(WarpsPerBlock * 32, 2) __global__
     }
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

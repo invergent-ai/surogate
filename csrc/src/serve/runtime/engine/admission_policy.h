@@ -8,7 +8,7 @@
 #include <cstdint>
 #include <span>
 
-namespace ninfer::runtime {
+namespace sinfer::runtime {
 
 enum class BackfillClass : std::uint8_t {
     None,
@@ -69,4 +69,4 @@ protected_head_safe_without_temporal(const AdmissionProtection& protection,
                                      std::span<const ActiveAdmissionSnapshot> active,
                                      const AdmissionResources& capacity) noexcept;
 
-} // namespace ninfer::runtime
+} // namespace sinfer::runtime

@@ -4,7 +4,7 @@
 #include "api/ops/vision_attention.h"
 
 #include "core/device.h"
-#include "ninfer_bench_common.h"
+#include "sinfer_bench_common.h"
 
 #include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
@@ -25,7 +25,7 @@
 #include <utility>
 #include <vector>
 
-using namespace ninfer;
+using namespace sinfer;
 
 namespace {
 
@@ -69,7 +69,7 @@ struct Result {
 [[noreturn]] void usage(const char* message) {
     std::fprintf(stderr,
                  "error: %s\n"
-                 "usage: ninfer_packed_softmax_attention_bench "
+                 "usage: sinfer_packed_softmax_attention_bench "
                  "[--entry uniform|packed|both] [--segments S --length L | "
                  "--segment-lengths L1,L2,...] "
                  "[--execution eager|graph|both] [--cache cold|warm|both] "
@@ -419,7 +419,7 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "ninfer_packed_softmax_attention_bench: %s\n", error.what());
+        std::fprintf(stderr, "sinfer_packed_softmax_attention_bench: %s\n", error.what());
         return 1;
     }
 }

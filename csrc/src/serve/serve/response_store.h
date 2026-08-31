@@ -16,7 +16,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace ninfer::serve {
+namespace sinfer::serve {
 
 struct ResponseContextNode {
     std::shared_ptr<const ResponseContextNode> parent;
@@ -67,4 +67,4 @@ private:
     std::size_t current_bytes_ = 0;
 };
 
-} // namespace ninfer::serve
+} // namespace sinfer::serve

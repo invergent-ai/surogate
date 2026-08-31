@@ -17,7 +17,7 @@
 // tile candidates, so store-only ranking transfers to the fused forms.
 
 #include "core/device.h"
-#include "ninfer_bench_common.h"
+#include "sinfer_bench_common.h"
 #include "ops/linear/bf16/bf16_config.h"
 #include "ops/linear/bf16/bf16_gemm_mma_config.h"
 #include "ops/linear/w8/w8_rowsplit_gemm_mma.cuh"
@@ -30,8 +30,8 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::ops::detail;
+using namespace sinfer;
+using namespace sinfer::ops::detail;
 
 namespace {
 
@@ -60,8 +60,8 @@ template <class Schedule>
 void launch_case(const Case& c, const __nv_bfloat16* x, const std::uint8_t* codes,
                  const std::uint8_t* scales, __nv_bfloat16* out, std::int32_t tokens,
                  cudaStream_t stream) {
-    const dim3 grid(static_cast<unsigned>(ninfer::ops::div_up(c.rows, Schedule::BM)),
-                    static_cast<unsigned>(ninfer::ops::div_up(tokens, Schedule::BN)), 1u);
+    const dim3 grid(static_cast<unsigned>(sinfer::ops::div_up(c.rows, Schedule::BM)),
+                    static_cast<unsigned>(sinfer::ops::div_up(tokens, Schedule::BN)), 1u);
     const W8ContiguousOutput output{out, c.rows};
     if ((tokens % Schedule::BN) == 0) {
         w8_rowsplit_gemm_mma_kernel<Schedule, true, W8Epilogue::Store>
@@ -112,7 +112,7 @@ void launch_bf16(const __nv_bfloat16* x, const __nv_bfloat16* w, __nv_bfloat16* 
                  std::int32_t tokens, cudaStream_t stream) {
     using Schedule        = Bf16MmaProductionSchedule<Geometry>;
     constexpr int tiles_m = Geometry::kOutputRows / Schedule::kBlockRows;
-    const int tiles_n     = ninfer::ops::div_up(tokens, Schedule::kBlockCols);
+    const int tiles_n     = sinfer::ops::div_up(tokens, Schedule::kBlockCols);
     const Bf16MmaContiguousOutput output{out, Geometry::kOutputRows};
     if constexpr (Schedule::kSharedBytes > 48 * 1024) {
         static const cudaError_t attr = cudaFuncSetAttribute(

@@ -14,7 +14,7 @@
 #include <string>
 #include <vector>
 
-namespace ninfer::serve {
+namespace sinfer::serve {
 
 // Parse an already-decoded Anthropic Messages body into a GenerationRequest.
 // Top-level `system` becomes a leading system turn; system-role messages retain
@@ -26,7 +26,7 @@ GenerationRequest parse_messages_request(const nlohmann::json& body, const Reque
 
 // Map an internal finish reason (+ whether tool calls were produced) onto the
 // Anthropic stop_reason wire value.
-const char* messages_stop_reason(ninfer::FinishReason reason, bool has_tool_calls);
+const char* messages_stop_reason(sinfer::FinishReason reason, bool has_tool_calls);
 
 // Non-streaming Messages response body (JSON string). Content blocks are emitted
 // in order: an optional `thinking` block (from reasoning), an optional `text`
@@ -62,4 +62,4 @@ std::string make_count_tokens_response(int input_tokens);
 // Message identifier ("msg_...").
 std::string new_message_id();
 
-} // namespace ninfer::serve
+} // namespace sinfer::serve

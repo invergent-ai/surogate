@@ -18,17 +18,17 @@
 #    include "ops/common/memory.cuh"
 #    include "ops/common/warp.cuh"
 #    include <cuda_bf16.h>
-#    define NINFER_KERNELS_HOST_DEVICE __host__ __device__
+#    define SINFER_KERNELS_HOST_DEVICE __host__ __device__
 #else
-#    define NINFER_KERNELS_HOST_DEVICE
+#    define SINFER_KERNELS_HOST_DEVICE
 #endif
 
-namespace ninfer::ops::detail::gated_delta_net {
+namespace sinfer::ops::detail::gated_delta_net {
 
 inline uint3 init_fastdiv_values(std::uint64_t d64) {
     if (d64 == 0 || d64 > static_cast<std::uint64_t>(0xffffffffu)) {
         std::fprintf(stderr,
-                     "ninfer::ops::detail::gated_delta_net::init_fastdiv_values: "
+                     "sinfer::ops::detail::gated_delta_net::init_fastdiv_values: "
                      "invalid divisor %llu\n",
                      static_cast<unsigned long long>(d64));
         std::abort();
@@ -107,9 +107,9 @@ struct head_map {
         return head_map{H_qk_, H_v_, init_fastdiv_values(static_cast<std::uint64_t>(G))};
     }
 
-    NINFER_KERNELS_HOST_DEVICE int group_size() const { return H_v / H_qk; }
+    SINFER_KERNELS_HOST_DEVICE int group_size() const { return H_v / H_qk; }
 
-    NINFER_KERNELS_HOST_DEVICE int qk_head(int h_v) const {
+    SINFER_KERNELS_HOST_DEVICE int qk_head(int h_v) const {
 #if defined(__CUDA_ARCH__)
         return static_cast<int>(fastdiv(static_cast<std::uint32_t>(h_v), group_magic));
 #else
@@ -118,6 +118,6 @@ struct head_map {
     }
 };
 
-} // namespace ninfer::ops::detail::gated_delta_net
+} // namespace sinfer::ops::detail::gated_delta_net
 
-#undef NINFER_KERNELS_HOST_DEVICE
+#undef SINFER_KERNELS_HOST_DEVICE

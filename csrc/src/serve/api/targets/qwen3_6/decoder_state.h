@@ -10,7 +10,7 @@
 #include <optional>
 #include <vector>
 
-namespace ninfer::targets::qwen3_6 {
+namespace sinfer::targets::qwen3_6 {
 
 inline constexpr std::int32_t kKvQuantGroup = 64;
 
@@ -142,4 +142,4 @@ struct DecoderState {
     void reset_state_slot(std::int32_t slot, cudaStream_t stream);
 };
 
-} // namespace ninfer::targets::qwen3_6
+} // namespace sinfer::targets::qwen3_6

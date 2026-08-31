@@ -6,7 +6,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 // Keep the candidate domain separate from the measured production crossover so the two kernel
 // families remain directly comparable in the benchmark overlap.
@@ -20,4 +20,4 @@ void launch_bf16_decode(const Tensor& x, const Weight& weight, Tensor& out, cuda
 void launch_bf16_small_t(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream);
 void launch_bf16_mma(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

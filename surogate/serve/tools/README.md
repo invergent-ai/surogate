@@ -1,4 +1,4 @@
-# NInfer maintainer tools
+# SInfer maintainer tools
 
 `tools/` contains the project-owner workflows for artifact conversion and inspection, independent
 Python references, numerical parity diagnostics, benchmark orchestration, and serving smoke checks.
@@ -25,28 +25,28 @@ for the selected tool.
 
 ## Artifact workflow
 
-The converters consume an official local BF16 checkpoint and write one complete `.ninfer`
+The converters consume an official local BF16 checkpoint and write one complete `.sinfer`
 artifact. The paths below are placeholders for the maintainer's local checkpoint checkouts:
 
 ```bash
 python3 -m tools.convert.qwen3_6_27b.convert \
   --model /path/to/Qwen3.6-27B \
-  --out out/qwen3_6_27b.ninfer
+  --out out/qwen3_6_27b.sinfer
 
 python3 -m tools.convert.qwen3_8_27b.convert \
   --model /path/to/Qwen3.8-27B \
-  --out out/qwen3_8_27b.ninfer
+  --out out/qwen3_8_27b.sinfer
 
 python3 -m tools.convert.qwen3_6_35b_a3b.convert \
   --model /path/to/Qwen3.6-35B-A3B-base \
   --dflash-model /path/to/Qwen3.6-35B-A3B-DFlash \
-  --out out/qwen3_6_35b_a3b.ninfer
+  --out out/qwen3_6_35b_a3b.sinfer
 ```
 
 Inspect either result:
 
 ```bash
-python3 -m tools.artifact.inspect out/qwen3_6_27b.ninfer --objects
+python3 -m tools.artifact.inspect out/qwen3_6_27b.sinfer --objects
 ```
 
 The exact source revisions, inventories, formats, and conversion recipes are recorded in
@@ -57,11 +57,11 @@ Hugging Face instead of running these workflows.
 
 ```bash
 python3 -m tools.reference.qwen3_6_27b \
-  --weights out/qwen3_6_27b.ninfer \
+  --weights out/qwen3_6_27b.sinfer \
   --prompt "请简短介绍一下你自己。" --decode 128
 
 python3 -m tools.reference.qwen3_6_35b_a3b \
-  --weights out/qwen3_6_35b_a3b.ninfer \
+  --weights out/qwen3_6_35b_a3b.sinfer \
   --prompt "请简短介绍一下你自己。" --decode 128
 ```
 
@@ -71,12 +71,12 @@ artifact/source Vision comparison command.
 
 ## Benchmark orchestration
 
-`tools/bench/run_ninfer_bench_matrix.py` builds and runs the public-Engine benchmark matrix and
+`tools/bench/run_sinfer_bench_matrix.py` builds and runs the public-Engine benchmark matrix and
 writes ignored local reports below `profiles/bench/`:
 
 ```bash
-python3 tools/bench/run_ninfer_bench_matrix.py --preset core --dry-run
-python3 tools/bench/run_ninfer_bench_matrix.py --preset core
+python3 tools/bench/run_sinfer_bench_matrix.py --preset core --dry-run
+python3 tools/bench/run_sinfer_bench_matrix.py --preset core
 ```
 
 See [`tools/bench/README.md`](bench/README.md) and [`bench/README.md`](../bench/README.md) for the
@@ -84,7 +84,7 @@ orchestrator and executable contracts.
 
 ## Serving smoke
 
-After starting `ninfer-serve` in another terminal:
+After starting `sinfer-serve` in another terminal:
 
 ```bash
 python3 -m tools.smoke.serve_contract \
@@ -100,5 +100,5 @@ real server and consumes the repository fixture:
 
 ```bash
 python3 tools/smoke/serve_thinking_preservation.py \
-  --artifact out/qwen3_6_27b.ninfer --backend mtp
+  --artifact out/qwen3_6_27b.sinfer --backend mtp
 ```

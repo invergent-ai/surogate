@@ -2,7 +2,7 @@
 
 #include "core/device.h"
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 // One thread per output element, rows fastest: coalesced over the staging and the output.
@@ -39,4 +39,4 @@ void fp8_cublaslt_finish(const float* staging, const __nv_bfloat16* weight_row_s
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

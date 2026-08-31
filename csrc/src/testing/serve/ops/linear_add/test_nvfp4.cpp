@@ -16,8 +16,8 @@
 
 namespace {
 
-using namespace ninfer;
-using namespace ninfer::test;
+using namespace sinfer;
+using namespace sinfer::test;
 
 constexpr double kBf16UnitRoundoff = 1.0 / 256.0;
 constexpr ReductionCriterion kA16Tolerance{
@@ -186,7 +186,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
 } // namespace
 
 int main() {
-    if (ninfer::test::cuda_unavailable()) {
+    if (sinfer::test::cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }

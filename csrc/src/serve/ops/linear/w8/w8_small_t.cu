@@ -9,7 +9,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 template <class Geometry, int ActiveTokens>
@@ -144,4 +144,4 @@ void launch_w8_small_t(const Tensor& x, const Weight& weight, Tensor& out, cudaS
     throw std::invalid_argument("W8 Linear small-T: unsupported exact problem");
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

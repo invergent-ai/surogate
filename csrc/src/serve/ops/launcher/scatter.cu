@@ -5,7 +5,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 void scatter_launch(const Tensor& src, const Tensor& indices, Tensor& dst, cudaStream_t stream) {
     constexpr int block        = 256;
@@ -46,4 +46,4 @@ void scatter_bf16_batch_launch(const Tensor& source, const Tensor& lanes,
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

@@ -1,6 +1,6 @@
 #pragma once
 
-// ninfer::ops - fused gate/up projection followed by SwiGLU.
+// sinfer::ops - fused gate/up projection followed by SwiGLU.
 
 #include "core/arena.h"
 #include "core/tensor.h"
@@ -11,7 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 /**
  * Returns the transient capacity required by LinearSwiGLU for every T in the inclusive
@@ -81,4 +81,4 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, WorkspaceArena& ws,
                    cudaStream_t stream);
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

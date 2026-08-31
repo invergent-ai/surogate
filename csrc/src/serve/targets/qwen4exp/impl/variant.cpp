@@ -31,11 +31,11 @@
 #include <unordered_map>
 #include <vector>
 
-#define NINFER_QWEN36_VARIANT    ::ninfer::targets::qwen4exp::detail::Variant
-#define NINFER_QWEN36_RUNTIME_NS qwen4exp_runtime
+#define SINFER_QWEN36_VARIANT    ::sinfer::targets::qwen4exp::detail::Variant
+#define SINFER_QWEN36_RUNTIME_NS qwen4exp_runtime
 #include "targets/qwen3_6/impl/runtime/instantiate.h"
 
-namespace ninfer::targets::qwen4exp::detail {
+namespace sinfer::targets::qwen4exp::detail {
 namespace {
 
 constexpr std::int32_t kStreams  = TextConfig::hc_count;
@@ -1636,4 +1636,4 @@ std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(std::int32_t, std::
     return 0;
 }
 
-} // namespace ninfer::targets::qwen4exp::detail
+} // namespace sinfer::targets::qwen4exp::detail

@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 void prepare_ragged_prefix(const Tensor& source, const Tensor& lanes, const Tensor& starts,
                            const Tensor& ends, Tensor& destination, Tensor& positions,
@@ -40,4 +40,4 @@ void prepare_ragged_prefix(const Tensor& source, const Tensor& lanes, const Tens
                                          counts, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

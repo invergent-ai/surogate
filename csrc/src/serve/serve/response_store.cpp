@@ -5,7 +5,7 @@
 #include <unordered_set>
 #include <utility>
 
-namespace ninfer::serve {
+namespace sinfer::serve {
 namespace {
 
 std::size_t estimate_turn_bytes(const ChatTurn& turn) {
@@ -153,4 +153,4 @@ void ResponseStore::erase_locked(const std::string& id) {
     records_.erase(found);
 }
 
-} // namespace ninfer::serve
+} // namespace sinfer::serve

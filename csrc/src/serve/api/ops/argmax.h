@@ -6,7 +6,7 @@
 
 #include <cuda_runtime.h> // cudaStream_t
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 /**
  * Computes one vocabulary argmax per column:
@@ -20,4 +20,4 @@ namespace ninfer::ops {
  */
 void argmax(const Tensor& logits, Tensor& out, std::int32_t valid_rows, cudaStream_t stream);
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

@@ -10,7 +10,7 @@
 
 #include "targets/qwen3_6/impl/runtime/residual_policy.h"
 
-namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::workspace_recipe {
+namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS::workspace_recipe {
 
 template <class Allocator>
 Tensor matrix(Allocator& allocator, DType dtype, std::int32_t rows, std::int32_t tokens) {
@@ -290,4 +290,4 @@ DFlashMlpRoots dflash_mlp(Allocator& allocator, std::int32_t tokens) {
     };
 }
 
-} // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::workspace_recipe
+} // namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS::workspace_recipe

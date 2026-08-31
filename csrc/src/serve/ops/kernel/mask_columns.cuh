@@ -1,11 +1,11 @@
 #pragma once
 
-// ninfer::ops - mask_columns kernel: zero-fill trailing columns of a [C,T]
+// sinfer::ops - mask_columns kernel: zero-fill trailing columns of a [C,T]
 // matrix past a device-resident valid-column count (PATCHES.md #27).
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 template <class Element>
 __global__ void mask_columns_zero_kernel(Element* matrix, const std::int32_t* valid_columns,
@@ -19,4 +19,4 @@ __global__ void mask_columns_zero_kernel(Element* matrix, const std::int32_t* va
     for (std::int64_t i = begin + start; i < total; i += step) { matrix[i] = Element(0); }
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

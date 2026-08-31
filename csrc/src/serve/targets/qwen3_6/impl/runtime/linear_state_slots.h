@@ -4,7 +4,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
+namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS {
 
 /** Qwen3.6's target-local mapping from a stable request lane to its two state roles. */
 inline constexpr std::int32_t kNoRewriteCheckpointSlot = -1;
@@ -48,4 +48,4 @@ struct LinearStateSlots {
     }
 };
 
-} // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
+} // namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS

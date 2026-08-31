@@ -8,7 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 inline constexpr std::int32_t kNgramPleMaxHeads = 16;
 inline constexpr std::int32_t kNgramPleMaxNgram = 3;
@@ -123,4 +123,4 @@ void ngram_ple_forward(Tensor& residual, const NgramPleColumns& columns, const N
                        std::int32_t conv_dilation, float eps, WorkspaceArena& workspace,
                        cudaStream_t stream);
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

@@ -12,7 +12,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 constexpr std::int32_t kParentRows = 7168;
@@ -191,4 +191,4 @@ void q4_q5_attn_input_small_t_launch(const Tensor& x, const Weight& query_key_we
     launch_q5(x, gate_value_weight, gate, v, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

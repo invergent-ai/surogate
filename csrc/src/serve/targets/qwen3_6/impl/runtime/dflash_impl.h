@@ -26,7 +26,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
+namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS::schedule {
 namespace {
 
 void require_dflash_state(const PrefillContext& state) {
@@ -431,4 +431,4 @@ void dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size, std
     run_prepared(state, executable, body);
 }
 
-} // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule
+} // namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS::schedule

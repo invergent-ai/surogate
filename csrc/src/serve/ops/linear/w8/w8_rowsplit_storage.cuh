@@ -4,7 +4,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 struct W8RowSplitStorage {
     static constexpr int kGroupK             = 32;
@@ -33,4 +33,4 @@ struct W8ScalarDecodeAtom {
     }
 };
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

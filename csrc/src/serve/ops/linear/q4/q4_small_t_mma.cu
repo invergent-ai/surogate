@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 constexpr int kFirstSmallT    = 2;
@@ -65,4 +65,4 @@ void launch_q4_draft_head_small_t(const Tensor& x, const Weight& weight, Tensor&
     throw std::invalid_argument("Q4 Linear draft-head small-T: unsupported exact problem");
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

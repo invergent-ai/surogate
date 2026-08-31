@@ -194,7 +194,7 @@ existing GGUF bridge; hyper-connection and PLE projections dequantise to BF16.
 ### Phase 1 — the model runs (single GPU, streamed experts, exact ≤ 2,051 ctx)
 
 1. **Converter** `surogate/serve/tools/convert/qwen4exp/`: GGUF (4 shards,
-   lazy) → `.ninfer`. Objects per §5.6. Experts Q4_K/Q5_K/Q5_1/Q8_0 → the
+   lazy) → `.sinfer`. Objects per §5.6. Experts Q4_K/Q5_K/Q5_1/Q8_0 → the
    engine's Q4G64/Q5G64/Q6G64/W8G32 row-split formats through the existing
    GGUF bridge; hyper-connection and PLE projection weights dequantised to
    BF16 (1.3 GB total; they run on the cuBLAS BF16 path); the PLE table kept
@@ -280,7 +280,7 @@ independent single-GPU-offload replicas; the "massive" number.
 
 Inside a PP stage of N GPUs, shard the 512 experts N ways (LPT-planned from
 observed routing, re-planned on a sticky interval), all-to-all dispatch and
-combine over NCCL on its SHM transport (`ninfer_dist` target linking the
+combine over NCCL on its SHM transport (`sinfer_dist` target linking the
 imported `nvidia::nccl`, one communicator per stage), token counts exchanged
 through pinned staging. Compared on the board against PP-only at the same GPU
 count. The arithmetic in D4 says it loses on this box; it is built anyway
@@ -384,4 +384,4 @@ F32`, `ffn_{gate,up}_exps {2560,640,512}`, `ffn_down_exps {640,2560,512}`,
 - Parity: greedy continuations of fixed prompts, token-for-token against A.
 - Throughput: the board's loadgen at 1/16/100 users, 512/128 and 2048/16.
 - Micro: the PCIe/gather/DRAM numbers above (`scratchpad/bw.cu`), P2P probe
-  (`p2p.cu`), `ninfer_sparse_moe_bench` at the new instantiation.
+  (`p2p.cu`), `sinfer_sparse_moe_bench` at the new instantiation.

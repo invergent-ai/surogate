@@ -65,26 +65,26 @@ def main() -> None:
     args = parser.parse_args()
     device = torch.device(args.device)
     model_dir = Path(args.model_dir)
-    ninfer_captures: dict[str, torch.Tensor] = {}
+    sinfer_captures: dict[str, torch.Tensor] = {}
     with RefModel(args.weights, device=device, compile_codec=True) as model, torch.inference_mode():
         batch = Frontend(model.binding).process(
             load_messages(args.messages), thinking=args.thinking
         )
-        ninfer_output = model.encode_vision(
+        sinfer_output = model.encode_vision(
             batch,
             compile_codec=True,
-            tap=lambda name, value: ninfer_captures.__setitem__(
+            tap=lambda name, value: sinfer_captures.__setitem__(
                 name, value.detach().to(device="cpu", dtype=torch.bfloat16)
             ),
         )
-        ninfer_captures["merger"] = torch.cat(
+        sinfer_captures["merger"] = torch.cat(
             [
                 value
-                for value in (ninfer_output.image_embeddings, ninfer_output.video_embeddings)
+                for value in (sinfer_output.image_embeddings, sinfer_output.video_embeddings)
                 if value is not None
             ]
         ).detach().to(device="cpu", dtype=torch.bfloat16)
-        vision_stats = ninfer_output.stats
+        vision_stats = sinfer_output.stats
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
@@ -115,11 +115,11 @@ def main() -> None:
         handle.remove()
 
     comparisons = {
-        name: metrics(ninfer_captures[name], hf_captures[name])
+        name: metrics(sinfer_captures[name], hf_captures[name])
         for name in ("block_00", "block_13", "block_26", "merger")
     }
     report = {
-        "format": "ninfer_vision_bf16_comparison_v1",
+        "format": "sinfer_vision_bf16_comparison_v1",
         "weights": str(Path(args.weights).resolve()),
         "model_dir": str(model_dir.resolve()),
         "image_grid_thw": None if batch.image_grid_thw is None else batch.image_grid_thw.tolist(),

@@ -8,9 +8,9 @@
 #include <stdexcept>
 #include <utility>
 
-namespace ninfer::targets::qwen3_6 {
+namespace sinfer::targets::qwen3_6 {
 
-using detail::NINFER_QWEN36_RUNTIME_NS::Variant;
+using detail::SINFER_QWEN36_RUNTIME_NS::Variant;
 
 template <>
 SequencePlan<Variant>::SequencePlan(
@@ -75,7 +75,7 @@ const runtime::SequenceCapacityCurve& SequencePlanner<Variant>::capacity_curve()
 template <>
 SequencePlan<Variant> SequencePlanner<Variant>::finalize(std::uint32_t main_page_groups) && {
     if (impl_ == nullptr) { throw std::logic_error("sequence planner is empty"); }
-    return SequencePlan<Variant>(detail::NINFER_QWEN36_RUNTIME_NS::finalize_sequence_plan_impl(
+    return SequencePlan<Variant>(detail::SINFER_QWEN36_RUNTIME_NS::finalize_sequence_plan_impl(
         std::move(impl_), main_page_groups));
 }
 
@@ -298,7 +298,7 @@ template <>
 SequencePlanner<Variant> make_sequence_planner<Variant>(DeviceContext& device,
                                                         const EngineOptions& options,
                                                         Variant::WeightsProfile weights_profile) {
-    return SequencePlanner<Variant>(detail::NINFER_QWEN36_RUNTIME_NS::make_sequence_planner_impl(
+    return SequencePlanner<Variant>(detail::SINFER_QWEN36_RUNTIME_NS::make_sequence_planner_impl(
         device, options, weights_profile));
 }
 
@@ -316,4 +316,4 @@ create_program<Variant>(const Variant::ModelView& model, Variant::WeightsProfile
     return std::unique_ptr<Program<Variant>>(new Program<Variant>(std::move(impl)));
 }
 
-} // namespace ninfer::targets::qwen3_6
+} // namespace sinfer::targets::qwen3_6

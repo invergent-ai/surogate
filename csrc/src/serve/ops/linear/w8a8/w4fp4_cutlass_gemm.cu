@@ -18,7 +18,7 @@
 #include "cutlass/kernel_hardware_info.h"
 #include "cutlass/util/packed_stride.hpp"
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 using namespace cute;
@@ -137,4 +137,4 @@ bool w4fp4_cutlass_gemm_residual(const std::uint8_t* act_codes, const std::uint8
                         residual_bf16, tokens, n, k, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

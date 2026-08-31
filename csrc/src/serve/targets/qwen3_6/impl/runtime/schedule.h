@@ -25,11 +25,11 @@
 #include <optional>
 #include <span>
 
-namespace ninfer::targets::qwen3_6::detail {
+namespace sinfer::targets::qwen3_6::detail {
 class PrefillGraphFamily;
-} // namespace ninfer::targets::qwen3_6::detail
+} // namespace sinfer::targets::qwen3_6::detail
 
-namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
+namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS::schedule {
 
 using qwen3_6::PreparedPromptData;
 using qwen3_6::PromptModality;
@@ -210,4 +210,4 @@ void dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size, std
                          DFlashEnvelopes envelopes, ops::GqaExecutionEnvelope target_envelope,
                          DecodeGraphExecutable* executable);
 
-} // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule
+} // namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS::schedule

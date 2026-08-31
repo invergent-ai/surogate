@@ -8,7 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 /**
  * Computes four independent linear projections for each token:
@@ -93,4 +93,4 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight,
 void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tensor& q, Tensor& k,
                      Tensor& v, cudaStream_t stream);
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

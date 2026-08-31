@@ -1,6 +1,6 @@
 #pragma once
 
-// ninfer::ops - fused GDN Q/K/V/Z input projections.
+// sinfer::ops - fused GDN Q/K/V/Z input projections.
 
 #include "core/arena.h"
 #include "core/tensor.h"
@@ -11,7 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 /**
  * Op: gdn_input_proj
@@ -277,4 +277,4 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z
                                 Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
                                 Tensor& z, WorkspaceArena& workspace, cudaStream_t stream);
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

@@ -4,7 +4,7 @@
 
 #include <cuda_runtime.h>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 /**
  * Depthwise causal width-4 convolution followed by SiLU. Let u[c,-3..-1] be the three values in
@@ -59,4 +59,4 @@ void causal_conv1d_silu_snapshot(const Tensor& x, const Tensor& weight, Tensor& 
                                  const Tensor& snapshot_base_slots, Tensor& out,
                                  cudaStream_t stream);
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

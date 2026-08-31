@@ -8,7 +8,7 @@
 
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 template <class Geometry>
@@ -71,4 +71,4 @@ void launch_nvfp4_decode(const Tensor& x, const Weight& weight, Tensor& out, cud
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

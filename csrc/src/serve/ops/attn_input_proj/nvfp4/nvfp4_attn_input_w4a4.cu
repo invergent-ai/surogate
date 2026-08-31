@@ -11,7 +11,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 using Geometry = Nvfp4AttnInputGeometry;
@@ -165,4 +165,4 @@ void nvfp4_attn_input_w4a4_launch(const Tensor& x, const Weight& weight, Tensor&
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

@@ -1,4 +1,4 @@
-// ninfer::ops - causal_conv1d wrapper: public api validation and launcher dispatch.
+// sinfer::ops - causal_conv1d wrapper: public api validation and launcher dispatch.
 #include "core/limits.h"
 #include "api/ops/causal_conv1d_silu.h"
 
@@ -9,7 +9,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 namespace {
 
 std::int64_t numel_allow_zero(const Tensor& t, const char* label) {
@@ -253,4 +253,4 @@ void causal_conv1d_silu_snapshot(const Tensor& x, const Tensor& weight, Tensor& 
                                           initial_state_slots, snapshot_base_slots, out, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

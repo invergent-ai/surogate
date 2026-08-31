@@ -5,7 +5,7 @@
 #include <chrono>
 #include <memory>
 
-namespace ninfer {
+namespace sinfer {
 
 class PreparedPrompt {
 public:
@@ -99,4 +99,4 @@ private:
     std::shared_ptr<Impl> impl_;
 };
 
-} // namespace ninfer
+} // namespace sinfer

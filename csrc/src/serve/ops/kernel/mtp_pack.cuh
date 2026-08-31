@@ -4,7 +4,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 inline constexpr int kMtpAttnRows = 14336;
 inline constexpr int kMtpQRows    = 6144;
@@ -53,4 +53,4 @@ __global__ void mtp_split_attn_in_kernel(const __nv_bfloat16* attn_in, __nv_bflo
     v[static_cast<std::int64_t>(token) * kMtpKvRows + local] = value;
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

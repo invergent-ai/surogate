@@ -9,7 +9,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 __device__ __forceinline__ float2 decode_nvfp4_e2m1x2(std::uint8_t storage) {
     __nv_fp4x2_e2m1 value;
@@ -139,4 +139,4 @@ __device__ __forceinline__ Nvfp4QuantizedK16 quantize_nvfp4_k16(const __nv_bfloa
     return result;
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

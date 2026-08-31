@@ -6,7 +6,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 void gelu(Tensor& x, GeluMode mode, cudaStream_t stream) {
     if (x.dtype != DType::BF16) { throw std::invalid_argument("gelu: x must be BF16"); }
@@ -24,4 +24,4 @@ void gelu(Tensor& x, GeluMode mode, cudaStream_t stream) {
     detail::gelu_launch(x, mode, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

@@ -5,7 +5,7 @@
 #include "api/ops/silu_mul.h"
 
 #include "core/device.h"
-#include "ninfer_bench_common.h"
+#include "sinfer_bench_common.h"
 #include "quantized_weight.cuh"
 #include "ops/linear_swiglu/w8/w8_linear_swiglu_kernels.h"
 #include "ops/linear_swiglu/w8/w8_linear_swiglu_plan.h"
@@ -24,7 +24,7 @@
 #include <string_view>
 #include <vector>
 
-using namespace ninfer;
+using namespace sinfer;
 
 namespace {
 
@@ -142,10 +142,10 @@ int main(int argc, char** argv) {
 
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-        ninfer::DeviceBuffer flush(kFlushBytes);
-        ninfer::DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_t);
-        ninfer::DeviceBuffer output(static_cast<std::size_t>(kOutputRows) * max_t * 2);
-        ninfer::DeviceBuffer gate_up(static_cast<std::size_t>(kGateUpRows) * max_t * 2);
+        sinfer::DeviceBuffer flush(kFlushBytes);
+        sinfer::DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_t);
+        sinfer::DeviceBuffer output(static_cast<std::size_t>(kOutputRows) * max_t * 2);
+        sinfer::DeviceBuffer gate_up(static_cast<std::size_t>(kGateUpRows) * max_t * 2);
         bench::PackedQuantizedWeight packed = bench::make_row_split_weight(
             QType::W8G32_F16S, kGateUpRows, kHidden, kHidden, {0x31, 0x00, 0x3c00});
         WorkspaceArena workspace(1);
@@ -266,7 +266,7 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "ninfer_w8_linear_swiglu_bench: %s\n", error.what());
+        std::fprintf(stderr, "sinfer_w8_linear_swiglu_bench: %s\n", error.what());
         return 1;
     }
 }

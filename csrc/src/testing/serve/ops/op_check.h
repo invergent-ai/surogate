@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <limits>
 
-namespace ninfer::test {
+namespace sinfer::test {
 
 struct PointwiseCriterion {
     double absolute;
@@ -135,4 +135,4 @@ inline bool reduction_passes(const ReductionStats& stats, std::int64_t count,
            stats.maximum_absolute_error <= gross_error_limit(stats, criterion);
 }
 
-} // namespace ninfer::test
+} // namespace sinfer::test

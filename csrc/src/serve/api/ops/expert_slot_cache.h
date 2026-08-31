@@ -21,7 +21,7 @@
 
 #include <cuda_runtime.h>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 /// Host-side bank of one layer's routed experts: the two W8 row-split matrices as the MoE
 /// kernels read them, in pinned, device-mapped host memory. Byte offsets are per plane
@@ -181,4 +181,4 @@ void expert_cpu_partial_add(const void* partial_device_ptr, Tensor& destination,
                                                    std::int32_t layer,
                                                    const SparseMoeWeights& resident_parts);
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

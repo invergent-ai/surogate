@@ -5,7 +5,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 namespace {
 
 void require_scalar(const Tensor& tensor, DType dtype, const char* name) {
@@ -52,4 +52,4 @@ void increment_i64_scalar(Tensor& scalar, cudaStream_t stream) {
     detail::increment_i64_scalar_launch(scalar, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

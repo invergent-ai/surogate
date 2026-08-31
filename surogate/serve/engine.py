@@ -39,9 +39,9 @@ def _load_extension():
 
 
 class Engine:
-    """Blocking generation against a .ninfer artifact.
+    """Blocking generation against a .sinfer artifact.
 
-    >>> engine = Engine("model.ninfer")
+    >>> engine = Engine("model.sinfer")
     >>> result = engine.generate("Hello!", max_new=64, greedy=True)
     >>> print(result["content"])
 

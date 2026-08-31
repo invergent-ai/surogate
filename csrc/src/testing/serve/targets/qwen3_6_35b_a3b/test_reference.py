@@ -20,8 +20,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 def binding():
     path = Path(
         os.environ.get(
-            "NINFER_QWEN3_6_35B_A3B_ARTIFACT",
-            PROJECT_ROOT / "out/qwen3_6_35b_a3b.ninfer",
+            "SINFER_QWEN3_6_35B_A3B_ARTIFACT",
+            PROJECT_ROOT / "out/qwen3_6_35b_a3b.sinfer",
         )
     )
     if not path.is_file():

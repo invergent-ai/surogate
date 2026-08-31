@@ -8,7 +8,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail::gated_delta_net {
+namespace sinfer::ops::detail::gated_delta_net {
 
 inline constexpr int kDvPerWarp = 4;
 inline constexpr int kNumWarps  = 4;
@@ -732,4 +732,4 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
                                                    access.active_columns(coord));
 }
 
-} // namespace ninfer::ops::detail::gated_delta_net
+} // namespace sinfer::ops::detail::gated_delta_net

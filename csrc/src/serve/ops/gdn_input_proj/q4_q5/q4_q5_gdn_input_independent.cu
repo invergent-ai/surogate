@@ -13,7 +13,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 constexpr std::int32_t kQkRows     = 4096;
@@ -212,4 +212,4 @@ void q4_q5_gdn_input_independent_launch(const Tensor& x, const Weight& qk_weight
     launch_q5(x, value_z_weight, value, z, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

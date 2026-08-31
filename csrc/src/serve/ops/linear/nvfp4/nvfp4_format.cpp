@@ -7,7 +7,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
@@ -70,4 +70,4 @@ Nvfp4WeightGeometry validate_nvfp4_weight(const Weight& weight, const char* oper
     return geometry;
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

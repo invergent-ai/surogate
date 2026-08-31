@@ -15,7 +15,7 @@
 #include <algorithm>
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 enum class Fp8MmaFragmentPipeline : std::uint8_t {
     Serial,
@@ -369,4 +369,4 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

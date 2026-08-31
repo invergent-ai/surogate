@@ -10,7 +10,7 @@
 #include <string>
 #include <string_view>
 
-namespace ninfer::targets::qwen3_6::frontend_internal {
+namespace sinfer::targets::qwen3_6::frontend_internal {
 namespace {
 
 using OrderedJson = nlohmann::ordered_json;
@@ -479,4 +479,4 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
     return RenderedChat{.text = std::move(rendered), .rewrite_checkpoint = rewrite_checkpoint};
 }
 
-} // namespace ninfer::targets::qwen3_6::frontend_internal
+} // namespace sinfer::targets::qwen3_6::frontend_internal

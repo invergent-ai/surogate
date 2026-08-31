@@ -1,4 +1,4 @@
-"""Convert the Qwen3.8-Flash-Next GGUF (`qwen4exp`) into a `.ninfer` artifact.
+"""Convert the Qwen3.8-Flash-Next GGUF (`qwen4exp`) into a `.sinfer` artifact.
 
 GGUF-native: the four Unsloth shards are the only weight source (there is no
 bridged HF checkpoint — the base model is 131 safetensors shards on the Hub).

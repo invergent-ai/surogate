@@ -7,7 +7,7 @@
 #include <cstddef>
 #include <utility>
 
-namespace ninfer::pdl {
+namespace sinfer::pdl {
 
 struct LaunchConfig {
     dim3 grid;
@@ -72,4 +72,4 @@ __device__ __forceinline__ void wait_for_dependencies() {
 #endif
 }
 
-} // namespace ninfer::pdl
+} // namespace sinfer::pdl

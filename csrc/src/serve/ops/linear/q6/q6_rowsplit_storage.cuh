@@ -7,7 +7,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 struct Q6RowSplitStorage {
     static constexpr int kGroupK             = 64;
@@ -59,4 +59,4 @@ struct Q6MmaDecodeAtom {
     }
 };
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

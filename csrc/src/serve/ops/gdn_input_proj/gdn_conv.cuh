@@ -6,7 +6,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 struct SnapshotHistoryPublish {
     __nv_bfloat16* state_write;
@@ -118,4 +118,4 @@ struct GdnConvEpilogue {
     }
 };
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

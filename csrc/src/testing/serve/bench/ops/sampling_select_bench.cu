@@ -1,13 +1,13 @@
 // Qualification benchmark for Qwen3.6-35B G2 sampling and G3 MTP accept.
 //
-//   ./ninfer_sampling_select_bench --sample --batch 8 --mode stochastic
-//   ./ninfer_sampling_select_bench --mtp --mode stochastic --mtp-k 5
-//   ./ninfer_sampling_select_bench --matrix
+//   ./sinfer_sampling_select_bench --sample --batch 8 --mode stochastic
+//   ./sinfer_sampling_select_bench --mtp --mode stochastic --mtp-k 5
+//   ./sinfer_sampling_select_bench --matrix
 #include "core/device.h"
 #include "core/tensor.h"
 #include "api/ops/sampling.h"
 #include "api/ops/speculative_round.h"
-#include "ninfer_bench_common.h"
+#include "sinfer_bench_common.h"
 
 #include <cuda_runtime.h>
 
@@ -20,8 +20,8 @@
 #include <string_view>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::bench;
+using namespace sinfer;
+using namespace sinfer::bench;
 
 namespace {
 
@@ -95,7 +95,7 @@ Options parse_args(int argc, char** argv) {
         } else if (arg == "--no-counts") {
             options.counts_active = false;
         } else if (arg == "-h" || arg == "--help") {
-            usage(argc > 0 ? argv[0] : "ninfer_sampling_select_bench");
+            usage(argc > 0 ? argv[0] : "sinfer_sampling_select_bench");
             std::exit(0);
         } else {
             throw std::invalid_argument("unknown argument: " + std::string(arg));
@@ -310,7 +310,7 @@ int main(int argc, char** argv) {
             }
         }
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "ninfer_sampling_select_bench: %s\n", e.what());
+        std::fprintf(stderr, "sinfer_sampling_select_bench: %s\n", e.what());
         return 2;
     }
     return 0;

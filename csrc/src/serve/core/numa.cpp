@@ -13,15 +13,15 @@
 #if defined(__linux__) && __has_include(<numa.h>) && __has_include(<numaif.h>)
 #include <numa.h>
 #include <numaif.h>
-#define NINFER_HAVE_NUMA 1
+#define SINFER_HAVE_NUMA 1
 #else
-#define NINFER_HAVE_NUMA 0
+#define SINFER_HAVE_NUMA 0
 #endif
 
-namespace ninfer {
+namespace sinfer {
 namespace {
 
-#if NINFER_HAVE_NUMA
+#if SINFER_HAVE_NUMA
 /// The node a CUDA device hangs off, read from sysfs via its PCI address. -1 when unknown
 /// (containers often hide the file, and some firmware reports -1 for every device).
 int device_node_from_sysfs(int device) {
@@ -50,7 +50,7 @@ struct nodemask_deleter {
 
 NumaTopology detect() {
     NumaTopology topology;
-#if NINFER_HAVE_NUMA
+#if SINFER_HAVE_NUMA
     if (numa_available() < 0) { return topology; }
     topology.nodes = numa_num_configured_nodes();
     if (topology.nodes <= 1) { return topology; }
@@ -79,7 +79,7 @@ NumaPolicy parse_policy() {
     return NumaPolicy::Auto;
 }
 
-#if NINFER_HAVE_NUMA
+#if SINFER_HAVE_NUMA
 /// Installs an interleave policy over every node. Returns true when the kernel accepted it.
 bool set_interleave_all() {
     struct bitmask* mask = numa_allocate_nodemask();
@@ -118,7 +118,7 @@ NumaPolicy numa_policy() {
 std::string numa_policy_description() {
     const NumaTopology& topology = numa_topology();
     if (!topology.available) {
-#if NINFER_HAVE_NUMA
+#if SINFER_HAVE_NUMA
         return {};
 #else
         return "NUMA placement unavailable (built without libnuma); run under "
@@ -143,7 +143,7 @@ std::string numa_policy_description() {
 
 ScopedMemoryPolicy ScopedMemoryPolicy::interleaved() {
     ScopedMemoryPolicy scope;
-#if NINFER_HAVE_NUMA
+#if SINFER_HAVE_NUMA
     const NumaTopology& topology = numa_topology();
     if (!topology.available || numa_policy() == NumaPolicy::Off) { return scope; }
     if (set_interleave_all()) {
@@ -156,7 +156,7 @@ ScopedMemoryPolicy ScopedMemoryPolicy::interleaved() {
 
 ScopedMemoryPolicy ScopedMemoryPolicy::bound_to(int node) {
     ScopedMemoryPolicy scope;
-#if NINFER_HAVE_NUMA
+#if SINFER_HAVE_NUMA
     const NumaTopology& topology = numa_topology();
     if (!topology.available || numa_policy() == NumaPolicy::Off || node < 0 ||
         node >= topology.nodes) {
@@ -185,9 +185,9 @@ ScopedMemoryPolicy::ScopedMemoryPolicy(ScopedMemoryPolicy&& other) noexcept
 }
 
 ScopedMemoryPolicy::~ScopedMemoryPolicy() {
-#if NINFER_HAVE_NUMA
+#if SINFER_HAVE_NUMA
     if (applied_) { clear_policy(); }
 #endif
 }
 
-} // namespace ninfer
+} // namespace sinfer

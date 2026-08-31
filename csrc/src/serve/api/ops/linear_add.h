@@ -1,6 +1,6 @@
 #pragma once
 
-// ninfer::ops - fused residual += W @ x.
+// sinfer::ops - fused residual += W @ x.
 
 #include "core/arena.h"
 #include "core/tensor.h"
@@ -11,7 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 /**
  * Returns the A16-only transient capacity required by LinearAdd for every T in the inclusive
@@ -72,4 +72,4 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual, WorkspaceAre
 void linear_add(const Tensor& x, const Weight& w, Tensor& residual, LinearPolicy policy,
                 WorkspaceArena& ws, cudaStream_t stream);
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

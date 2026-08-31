@@ -13,7 +13,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer {
+namespace sinfer {
 
 using TokenId = std::int32_t;
 
@@ -519,4 +519,4 @@ struct LoadSummary {
     std::size_t resource_count         = 0;
 };
 
-} // namespace ninfer
+} // namespace sinfer

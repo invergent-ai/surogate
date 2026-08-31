@@ -10,7 +10,7 @@
 #include <span>
 #include <vector>
 
-namespace ninfer::targets::qwen3_6 {
+namespace sinfer::targets::qwen3_6 {
 
 inline constexpr std::size_t kPreparedVisionPatchFeatures = 3ULL * 2ULL * 16ULL * 16ULL;
 inline constexpr std::uint64_t kRawPatchesPerVisionToken  = 4;
@@ -123,4 +123,4 @@ public:
     [[nodiscard]] static PreparedPromptData take(PreparedPrompt&& prompt);
 };
 
-} // namespace ninfer::targets::qwen3_6
+} // namespace sinfer::targets::qwen3_6

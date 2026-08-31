@@ -10,7 +10,7 @@
 #include <algorithm>
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 inline constexpr std::int32_t kSparseMoeSmallTMin = 2;
 // The fixed kernel domain covers the largest codec-specific small-T frontier.
@@ -80,4 +80,4 @@ void sparse_moe_small_t_launch(const SparseMoeGeometry& geometry, const Tensor& 
                                const SparseMoeSmallTWorkspace& workspace, cudaStream_t stream,
                                const SparseMoeRoundHook* hook = nullptr);
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

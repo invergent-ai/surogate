@@ -26,7 +26,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 namespace {
 
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
@@ -1378,4 +1378,4 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z
                                   value, z, LinearPolicy::A16Only, workspace, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

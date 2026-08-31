@@ -10,7 +10,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 using M256N128S3 = Nvfp4W4a4TmaSchedule<256, 3, 1>;
@@ -60,7 +60,7 @@ void launch_nvfp4_linear_swiglu_w4a4_tma(const std::uint8_t* activation_codes,
 
     using Geometry                     = Nvfp4MlpGateUpGeometry;
     constexpr std::size_t kSharedBytes = sizeof(Nvfp4LinearSwiGluTmaSharedStorage<M256N128S3>);
-    CUDA_CHECK(::ninfer::ops::set_func_attribute_per_device(nvfp4_linear_swiglu_w4a4_tma_kernel<Geometry, M256N128S3>,
+    CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(nvfp4_linear_swiglu_w4a4_tma_kernel<Geometry, M256N128S3>,
                                              cudaFuncAttributeMaxDynamicSharedMemorySize,
                                              static_cast<int>(kSharedBytes)));
 
@@ -73,4 +73,4 @@ void launch_nvfp4_linear_swiglu_w4a4_tma(const std::uint8_t* activation_codes,
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

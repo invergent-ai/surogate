@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 void w8_rowsplit_decode_r16_launch(const Tensor& x, const Weight& w, Tensor& out,
                                    cudaStream_t stream);
@@ -154,4 +154,4 @@ void launch_w8_medium_splitk_c144(const Tensor& x, const Weight& w, Tensor& out,
     launch_medium_route<144, 2, 9, 2>(x, w, out, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

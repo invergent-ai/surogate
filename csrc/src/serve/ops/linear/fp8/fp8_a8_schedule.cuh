@@ -3,7 +3,7 @@
 #include "ops/linear/fp8/fp8_a8_mma.cuh"
 #include "ops/linear/fp8/fp8_config.h"
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 template <class Geometry>
 struct Fp8LinearA8ProductionSchedule;
@@ -82,4 +82,4 @@ struct Fp8LinearA8ProductionSchedule<Fp8Residual17408Geometry> {
                                 Fp8MmaFragmentPipeline::PingPong, Fp8MmaRaster::TokenFast>;
 };
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

@@ -10,7 +10,7 @@
 #include <string>
 #include <type_traits>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 namespace {
 
 constexpr int kHeadDim  = 128; // the only registered indexer width
@@ -368,4 +368,4 @@ void qsa_indexer_select(const Tensor& q, const Tensor& positions, const Tensor& 
     }
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

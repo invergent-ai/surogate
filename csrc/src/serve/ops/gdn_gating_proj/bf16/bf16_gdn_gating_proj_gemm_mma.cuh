@@ -21,7 +21,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 inline constexpr int kBf16GdnBlockM     = 16;
 inline constexpr int kBf16GdnBlockK     = 64;
@@ -220,7 +220,7 @@ __global__ __launch_bounds__(Warps * 32, 1) void bf16_gdn_gating_proj_gemm_mma_k
 #pragma unroll
     for (int stage = 0; stage < kBf16GdnStages; ++stage) {
         if (stage < kTilesPerSplit) { stage_load(stage, kt_begin + stage); }
-        ninfer::ops::cp_commit();
+        sinfer::ops::cp_commit();
     }
 
     // ldmatrix fragment lane offsets. A is [M,K], while the token-major x tile
@@ -235,7 +235,7 @@ __global__ __launch_bounds__(Warps * 32, 1) void bf16_gdn_gating_proj_gemm_mma_k
 #pragma unroll 1
     for (int it = 0; it < kTilesPerSplit; ++it) {
         const int stage = it & 1;
-        ninfer::ops::cp_wait<kBf16GdnStages - 1>();
+        sinfer::ops::cp_wait<kBf16GdnStages - 1>();
         __syncthreads();
 
 #pragma unroll
@@ -276,7 +276,7 @@ __global__ __launch_bounds__(Warps * 32, 1) void bf16_gdn_gating_proj_gemm_mma_k
         __syncthreads();
         const int next = it + kBf16GdnStages;
         if (next < kTilesPerSplit) { stage_load(stage, kt_begin + next); }
-        ninfer::ops::cp_commit();
+        sinfer::ops::cp_commit();
     }
 
 #pragma unroll
@@ -375,4 +375,4 @@ __global__ __launch_bounds__(Warps * 32, 1) void bf16_gdn_gating_proj_gemm_mma_k
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

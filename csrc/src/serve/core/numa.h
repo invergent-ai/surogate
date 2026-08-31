@@ -35,7 +35,7 @@
 #include <string>
 #include <vector>
 
-namespace ninfer {
+namespace sinfer {
 
 enum class NumaPolicy { Auto, Interleave, Local, Off };
 
@@ -87,4 +87,4 @@ private:
     std::string what_;
 };
 
-} // namespace ninfer
+} // namespace sinfer

@@ -1,6 +1,6 @@
 #pragma once
 
-// ninfer::ops - split-KV GQA small-T attention shared scaffolding. The bf16 and
+// sinfer::ops - split-KV GQA small-T attention shared scaffolding. The bf16 and
 // int8 partial kernels live in gqa_attention_decode_bf16.cuh and
 // gqa_attention_decode_i8.cuh respectively; they are fully separate kernels (no
 // shared body) so each KV format can be optimized independently. This header owns
@@ -17,7 +17,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 // Head dimension now lives on the geometry (see gqa_attention_geometry.cuh).
 
@@ -258,4 +258,4 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
     out[gqa_q_index<Geometry>(q_head, d, output_column)] = __float2bfloat16(value);
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

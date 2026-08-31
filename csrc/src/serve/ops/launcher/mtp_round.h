@@ -4,7 +4,7 @@
 
 #include <cuda_runtime.h>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 void mtp_prepare_next_round_launch(const Tensor& verify_ids, const Tensor& next_anchors,
                                    const Tensor& accepted, const Tensor& updated_frontiers,
@@ -14,4 +14,4 @@ void mtp_prepare_next_round_launch(const Tensor& verify_ids, const Tensor& next_
                                    Tensor& ar_rope_positions, Tensor& ar_valid_columns,
                                    std::int32_t max_context, cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

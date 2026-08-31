@@ -7,7 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 enum class W8GdnInputScheduleId {
     DecodeR8Direct,
@@ -48,4 +48,4 @@ W8GdnInputConvPlan w8_gdn_input_conv_resolve_plan(const W8GdnInputProblem& probl
 void w8_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                            cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

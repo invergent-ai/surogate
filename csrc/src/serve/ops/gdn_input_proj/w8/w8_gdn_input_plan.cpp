@@ -7,7 +7,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 constexpr std::int32_t kAnyCols = std::numeric_limits<std::int32_t>::max();
@@ -145,4 +145,4 @@ void w8_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, T
     throw std::logic_error("W8 GDN input: unknown schedule");
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

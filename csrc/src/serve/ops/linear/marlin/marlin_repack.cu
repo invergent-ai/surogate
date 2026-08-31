@@ -277,7 +277,7 @@ __global__ void gptq_marlin_repack_kernel(
 
 }  // namespace MARLIN_NAMESPACE_NAME
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 // codes [N, K] int8 (bias-128 symmetric under u8b128 after xor) to the GPTQ
@@ -458,4 +458,4 @@ std::size_t marlin_b_out_words(int n, int k) {
            (static_cast<std::size_t>(n) * MARLIN_NAMESPACE_NAME::tile_size / 4);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

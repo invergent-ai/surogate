@@ -17,7 +17,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 struct Fp8GemvIdentityRows {
     __device__ __forceinline__ int weight_row(int row_begin, int local_row) const {
@@ -172,4 +172,4 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

@@ -40,7 +40,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 // W8 slab traits + dequant. A slab is 1024 K-values.
 // (Scales are staged with 4-byte cp.async because a row's scale plane is only
@@ -245,4 +245,4 @@ __global__ void w8_rowsplit_gemm_simt_kernel(const __nv_bfloat16* __restrict__ x
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

@@ -5,7 +5,7 @@
 
 #include "ops/linear/w8/w8_rowsplit_gemm_mma.cuh"
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 template <int TileCols>
 inline constexpr int kW8PairMmaMinBlocks = TileCols <= 64 ? 3 : 2;
@@ -81,7 +81,7 @@ __launch_bounds__((TileCols / 16) * 32, kW8PairMmaMinBlocks<TileCols>) void w8_p
                 cp_async<16, Cache::cg>(dst, &x[static_cast<std::int64_t>(nn) * k + kk]);
             } else {
                 const int valid = (nn < n && kk < k) ? min(8, k - kk) * 2 : 0;
-                ninfer::ops::cp_async_zfill<16>(
+                sinfer::ops::cp_async_zfill<16>(
                     dst, &x[static_cast<std::int64_t>(nn < n ? nn : 0) * k + (kk < k ? kk : 0)],
                     valid);
             }
@@ -102,7 +102,7 @@ __launch_bounds__((TileCols / 16) * 32, kW8PairMmaMinBlocks<TileCols>) void w8_p
                 cp_async<16, Cache::cg>(dst, &codes[gi * 32 + chunk * 16]);
             } else {
                 const std::int64_t gi = static_cast<std::int64_t>(grow < m ? grow : 0) * kg + g0;
-                ninfer::ops::cp_async_zfill<16>(dst, &codes[gi * 32 + chunk * 16],
+                sinfer::ops::cp_async_zfill<16>(dst, &codes[gi * 32 + chunk * 16],
                                                 grow < m ? 16 : 0);
             }
         }
@@ -120,14 +120,14 @@ __launch_bounds__((TileCols / 16) * 32, kW8PairMmaMinBlocks<TileCols>) void w8_p
                     if (g0 + 8 <= kg) {
                         cp_async<16, Cache::cg>(dst, &scales[gi * 2]);
                     } else {
-                        ninfer::ops::cp_async_zfill<16>(dst, &scales[gi * 2], max(0, kg - g0) * 2);
+                        sinfer::ops::cp_async_zfill<16>(dst, &scales[gi * 2], max(0, kg - g0) * 2);
                     }
                 } else {
                     const bool valid_row   = grow < m;
                     const int valid_scales = valid_row && g0 < kg ? min(8, kg - g0) : 0;
                     const std::int64_t gi =
                         static_cast<std::int64_t>(valid_row ? grow : 0) * kg + min(g0, kg - 1);
-                    ninfer::ops::cp_async_zfill<16>(dst, &scales[gi * 2], valid_scales * 2);
+                    sinfer::ops::cp_async_zfill<16>(dst, &scales[gi * 2], valid_scales * 2);
                 }
             }
         }
@@ -210,12 +210,12 @@ __launch_bounds__((TileCols / 16) * 32, kW8PairMmaMinBlocks<TileCols>) void w8_p
     stage_codes(1, 0);
     stage_scales(0, 0);
     stage_scales(1, 0);
-    ninfer::ops::cp_commit();
+    sinfer::ops::cp_commit();
 
 #pragma unroll 2
     for (int kt = 0; kt < nkt; ++kt) {
         const int stage = kt & 1;
-        ninfer::ops::cp_wait<0>();
+        sinfer::ops::cp_wait<0>();
         __syncthreads();
 
         dequant(0, kt);
@@ -233,7 +233,7 @@ __launch_bounds__((TileCols / 16) * 32, kW8PairMmaMinBlocks<TileCols>) void w8_p
             stage_codes(1, next);
             stage_scales(0, next);
             stage_scales(1, next);
-            ninfer::ops::cp_commit();
+            sinfer::ops::cp_commit();
         }
         mma_pair(1, stage);
     }
@@ -274,4 +274,4 @@ __launch_bounds__((TileCols / 16) * 32, kW8PairMmaMinBlocks<TileCols>) void w8_p
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

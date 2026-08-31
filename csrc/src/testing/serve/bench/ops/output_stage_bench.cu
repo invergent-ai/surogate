@@ -7,7 +7,7 @@
 #include "api/ops/rmsnorm.h"
 
 #include "core/device.h"
-#include "ninfer_bench_common.h"
+#include "sinfer_bench_common.h"
 #include "quantized_weight.cuh"
 #include "ops/linear/q6/q6_dispatch.h"
 
@@ -22,7 +22,7 @@
 #include <string_view>
 #include <vector>
 
-using namespace ninfer;
+using namespace sinfer;
 
 namespace {
 
@@ -105,17 +105,17 @@ int run(const Options& options) {
 
     bench::PackedQuantizedWeight head = bench::make_row_split_weight(
         QType::Q6G64_F16S, kVocab, kHidden, kHidden, {0x35, 0x12, 0x3c00});
-    ninfer::DeviceBuffer residual =
+    sinfer::DeviceBuffer residual =
         bench::make_bf16(static_cast<std::size_t>(kHidden) * kMaxTokens);
     std::vector<std::uint16_t> norm_host(kHidden, bench::f32_to_bf16(0.0F));
-    ninfer::DeviceBuffer norm(norm_host.size() * sizeof(std::uint16_t));
+    sinfer::DeviceBuffer norm(norm_host.size() * sizeof(std::uint16_t));
     CUDA_CHECK(cudaMemcpy(norm.p, norm_host.data(), norm.bytes, cudaMemcpyHostToDevice));
-    ninfer::DeviceBuffer hidden(static_cast<std::size_t>(kHidden) * kMaxTokens *
+    sinfer::DeviceBuffer hidden(static_cast<std::size_t>(kHidden) * kMaxTokens *
                                 sizeof(std::uint16_t));
-    ninfer::DeviceBuffer logits(static_cast<std::size_t>(kVocab) * kMaxTokens *
+    sinfer::DeviceBuffer logits(static_cast<std::size_t>(kVocab) * kMaxTokens *
                                 sizeof(std::uint16_t));
-    ninfer::DeviceBuffer tokens(static_cast<std::size_t>(kMaxTokens) * sizeof(std::int32_t));
-    ninfer::DeviceBuffer flush(options.flush_size);
+    sinfer::DeviceBuffer tokens(static_cast<std::size_t>(kMaxTokens) * sizeof(std::int32_t));
+    sinfer::DeviceBuffer flush(options.flush_size);
     WorkspaceArena workspace(1);
 
     std::printf("# gpu=RTX_5090 cuda=13.1 sm=120a flush_mib=%zu warmup=%d repeat=%d\n",
@@ -158,7 +158,7 @@ int main(int argc, char** argv) {
     try {
         return run(parse_options(argc, argv));
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "ninfer_output_stage_bench: %s\n", error.what());
+        std::fprintf(stderr, "sinfer_output_stage_bench: %s\n", error.what());
         return 2;
     }
 }

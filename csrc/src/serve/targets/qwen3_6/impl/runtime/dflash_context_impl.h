@@ -2,7 +2,7 @@
 
 #include <stdexcept>
 
-namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
+namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS {
 
 DFlashPersistentState::DFlashPersistentState(DeviceSpan backing,
                                              const DFlashPersistentLayout& layout)
@@ -46,4 +46,4 @@ void DFlashPersistentState::restore_rewrite_checkpoint(std::int32_t lane, cudaSt
     local.copy_lane_from(rewrite_checkpoint_local, lane, stream);
 }
 
-} // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
+} // namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS

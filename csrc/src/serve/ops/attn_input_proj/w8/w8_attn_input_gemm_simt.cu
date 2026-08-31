@@ -4,7 +4,7 @@
 #include "ops/common/math.h"
 #include "ops/linear/w8/w8_rowsplit_gemm_simt.cuh"
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 constexpr int kTargetRows    = 9216;
@@ -65,4 +65,4 @@ void w8_attn_input_simt_r8_c4_launch(const Tensor& x, const Weight& weight, Tens
     launch_route<kCompanionRows, kHidden>(x, weight, output, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

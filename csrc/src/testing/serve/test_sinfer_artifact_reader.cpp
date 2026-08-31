@@ -14,14 +14,14 @@
 
 namespace {
 
-using ninfer::artifact::NumericFormat;
-using ninfer::artifact::ObjectDescriptor;
-using ninfer::artifact::Reader;
-using ninfer::artifact::ResourceDescriptor;
-using ninfer::artifact::StorageLayout;
-using ninfer::artifact::TensorDescriptor;
+using sinfer::artifact::NumericFormat;
+using sinfer::artifact::ObjectDescriptor;
+using sinfer::artifact::Reader;
+using sinfer::artifact::ResourceDescriptor;
+using sinfer::artifact::StorageLayout;
+using sinfer::artifact::TensorDescriptor;
 using Json = nlohmann::json;
-using ninfer::test::artifact_fixture::write_fixture;
+using sinfer::test::artifact_fixture::write_fixture;
 
 Json normative_directory() {
     return {
@@ -96,12 +96,12 @@ template <typename Function>
 void expect_artifact_error(Function&& function, std::string_view label) {
     try {
         function();
-    } catch (const ninfer::artifact::ArtifactError&) { return; }
+    } catch (const sinfer::artifact::ArtifactError&) { return; }
     throw std::runtime_error(std::string(label) + " was accepted");
 }
 
 void test_registered_sizes() {
-    using ninfer::artifact::tensor_encoded_size;
+    using sinfer::artifact::tensor_encoded_size;
     constexpr StorageLayout direct   = StorageLayout::ContiguousLeV1;
     constexpr StorageLayout rows     = StorageLayout::RowSplitK128V1;
     constexpr StorageLayout fp8_rows = StorageLayout::RowScaleV1;
@@ -145,14 +145,14 @@ void test_normative_fixture() {
     };
     for (std::size_t i = 0; i < expected_names.size(); ++i) {
         const auto& object = reader.objects()[i];
-        if (ninfer::artifact::object_name(object) != expected_names[i] ||
+        if (sinfer::artifact::object_name(object) != expected_names[i] ||
             reader.find(expected_names[i]) != &object) {
             throw std::runtime_error("fixture name index mismatch");
         }
         const auto payload = reader.payload(object);
         if (payload.absolute_offset !=
-                reader.payload_offset() + ninfer::artifact::object_offset(object) ||
-            payload.data.size() != ninfer::artifact::object_bytes(object) ||
+                reader.payload_offset() + sinfer::artifact::object_offset(object) ||
+            payload.data.size() != sinfer::artifact::object_bytes(object) ||
             payload.data.front() != std::byte(i + 1) || payload.data.back() != std::byte(i + 1)) {
             throw std::runtime_error("fixture payload span mismatch");
         }
@@ -189,10 +189,10 @@ void test_common_validation() {
     {
         auto directory = normative_directory();
         auto fixture =
-            write_fixture(directory, "legacy_v1", ninfer::test::artifact_fixture::kV1Magic);
+            write_fixture(directory, "legacy_v1", sinfer::test::artifact_fixture::kV1Magic);
         try {
             Reader reader(fixture.path);
-        } catch (const ninfer::artifact::ArtifactError& error) {
+        } catch (const sinfer::artifact::ArtifactError& error) {
             if (std::string_view(error.what())
                     .find("python3 -m tools.artifact.migrate_v1_to_v2 <artifact>") ==
                 std::string_view::npos) {

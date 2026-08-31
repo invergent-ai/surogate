@@ -3,7 +3,7 @@
 #include <cmath>
 #include <stdexcept>
 
-namespace ninfer::runtime {
+namespace sinfer::runtime {
 namespace {
 
 void validate(const ResolvedSamplingParameters& sampling) {
@@ -48,4 +48,4 @@ ResolvedSamplingParameters resolve_sampling(const ModelSamplingDefaults& default
     return resolved;
 }
 
-} // namespace ninfer::runtime
+} // namespace sinfer::runtime

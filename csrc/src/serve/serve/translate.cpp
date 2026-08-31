@@ -8,7 +8,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::serve {
+namespace sinfer::serve {
 namespace {
 
 std::uint64_t random_seed() {
@@ -31,9 +31,9 @@ std::uint64_t random_seed() {
     throw ApiException(std::move(error));
 }
 
-ninfer::SamplingOverrides resolve_sampling_overrides(const SamplingParams& request,
+sinfer::SamplingOverrides resolve_sampling_overrides(const SamplingParams& request,
                                                      const ServeOptions& server) {
-    ninfer::SamplingOverrides sampling = server.sampling_overrides;
+    sinfer::SamplingOverrides sampling = server.sampling_overrides;
     if (request.temperature) { sampling.temperature = static_cast<float>(*request.temperature); }
     if (request.top_p) { sampling.top_p = static_cast<float>(*request.top_p); }
     if (request.top_k) { sampling.top_k = static_cast<std::int32_t>(*request.top_k); }
@@ -103,7 +103,7 @@ std::vector<std::string> effective_tool_jsons(const GenerationRequest& request) 
 
 ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& request,
                                                  const ServeOptions& server,
-                                                 const ninfer::PromptCapabilities& capabilities) {
+                                                 const sinfer::PromptCapabilities& capabilities) {
     ResolvedPromptSemantics result{
         .enable_thinking   = request.enable_thinking.value_or(server.enable_thinking),
         .reasoning_effort  = std::nullopt,
@@ -129,13 +129,13 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
 
     switch (requested) {
     case RequestedReasoningEffort::Low:
-        result.reasoning_effort = ninfer::ReasoningEffort::Low;
+        result.reasoning_effort = sinfer::ReasoningEffort::Low;
         break;
     case RequestedReasoningEffort::Medium:
-        result.reasoning_effort = ninfer::ReasoningEffort::Medium;
+        result.reasoning_effort = sinfer::ReasoningEffort::Medium;
         break;
     case RequestedReasoningEffort::XHigh:
-        result.reasoning_effort = ninfer::ReasoningEffort::XHigh;
+        result.reasoning_effort = sinfer::ReasoningEffort::XHigh;
         break;
     case RequestedReasoningEffort::Minimal:
     case RequestedReasoningEffort::High:
@@ -157,30 +157,30 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
     return result;
 }
 
-ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
+sinfer::PromptInput to_prompt_input(const GenerationRequest& request,
                                     const ResolvedPromptSemantics& semantics,
                                     const MediaAcquirer& acquire_media) {
-    ninfer::PromptInput input;
+    sinfer::PromptInput input;
     input.messages.reserve(request.messages.size());
     for (const ChatTurn& turn : request.messages) {
-        ninfer::ChatMessage message;
+        sinfer::ChatMessage message;
         message.role              = turn.role;
         message.reasoning_content = turn.reasoning_content;
         message.tool_call_id      = turn.tool_call_id;
         message.tool_calls.reserve(turn.tool_calls.size());
         for (const ToolCall& call : turn.tool_calls) {
-            message.tool_calls.push_back(ninfer::ToolCall{call.id, call.name, call.arguments_json});
+            message.tool_calls.push_back(sinfer::ToolCall{call.id, call.name, call.arguments_json});
         }
 
         for (const ContentPart& part : turn.content) {
             if (part.kind == ContentKind::Text) {
                 if (!message.parts.empty() && !part.text.empty() &&
-                    message.parts.back().kind == ninfer::MessagePartKind::Text) {
-                    ninfer::MessagePart newline;
+                    message.parts.back().kind == sinfer::MessagePartKind::Text) {
+                    sinfer::MessagePart newline;
                     newline.text = "\n";
                     message.parts.push_back(std::move(newline));
                 }
-                ninfer::MessagePart text;
+                sinfer::MessagePart text;
                 text.text = part.text;
                 message.parts.push_back(std::move(text));
                 continue;
@@ -189,8 +189,8 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
                 if (!acquire_media) {
                     throw std::logic_error("media acquisition callback is not configured");
                 }
-                ninfer::MessagePart media;
-                media.kind  = ninfer::MessagePartKind::Media;
+                sinfer::MessagePart media;
+                media.kind  = sinfer::MessagePartKind::Media;
                 media.media = acquire_media(part);
                 message.parts.push_back(std::move(media));
                 continue;
@@ -214,9 +214,9 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
     return input;
 }
 
-ninfer::RequestOptions to_request_options(const GenerationRequest& request,
+sinfer::RequestOptions to_request_options(const GenerationRequest& request,
                                           const ServeOptions& server) {
-    ninfer::RequestOptions options;
+    sinfer::RequestOptions options;
     options.execution.requested_output_tokens = static_cast<std::uint32_t>(request.max_tokens);
     options.execution.allow_prefix_reuse      = server.allow_prefix_reuse;
     options.execution.sampling             = resolve_sampling_overrides(request.sampling, server);
@@ -227,26 +227,26 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
     for (const std::string& stop : request.stop_strings) {
         if (!stop.empty()) {
             options.stop.strings.push_back(
-                ninfer::StopString{.text              = stop,
-                                   .channel           = ninfer::OutputChannel::Content,
+                sinfer::StopString{.text              = stop,
+                                   .channel           = sinfer::OutputChannel::Content,
                                    .include_in_output = false});
         }
     }
     return options;
 }
 
-const char* finish_reason_wire(ninfer::FinishReason reason) {
+const char* finish_reason_wire(sinfer::FinishReason reason) {
     switch (reason) {
-    case ninfer::FinishReason::OutputLimit:
-    case ninfer::FinishReason::ContextCapacity:
+    case sinfer::FinishReason::OutputLimit:
+    case sinfer::FinishReason::ContextCapacity:
         return "length";
-    case ninfer::FinishReason::None:
-    case ninfer::FinishReason::StopToken:
-    case ninfer::FinishReason::StopString:
-    case ninfer::FinishReason::Cancelled:
+    case sinfer::FinishReason::None:
+    case sinfer::FinishReason::StopToken:
+    case sinfer::FinishReason::StopString:
+    case sinfer::FinishReason::Cancelled:
         return "stop";
     }
     return "stop";
 }
 
-} // namespace ninfer::serve
+} // namespace sinfer::serve

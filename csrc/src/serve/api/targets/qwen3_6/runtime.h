@@ -12,11 +12,11 @@
 #include <span>
 #include <string>
 
-namespace ninfer {
+namespace sinfer {
 struct DeviceContext;
 }
 
-namespace ninfer::targets::qwen3_6 {
+namespace sinfer::targets::qwen3_6 {
 
 enum class TextPhase {
     Prefill,
@@ -229,4 +229,4 @@ create_program(const typename Variant::ModelView& model,
                typename Variant::WeightsProfile weights_profile, SequencePlan<Variant>&& plan,
                DeviceContext& device);
 
-} // namespace ninfer::targets::qwen3_6
+} // namespace sinfer::targets::qwen3_6

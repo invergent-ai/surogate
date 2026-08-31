@@ -8,7 +8,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 namespace {
 
@@ -122,4 +122,4 @@ void w8_pair_gemm_mma_launch(bool full, const Tensor& x, const Weight& first_wei
     launch_tile<128>(full, x, first_weight, second_weight, first_out, second_out, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

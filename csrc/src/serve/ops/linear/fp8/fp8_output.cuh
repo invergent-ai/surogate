@@ -6,7 +6,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 struct Fp8IdentityEpilogue {
     __device__ __forceinline__ float apply(std::int32_t, std::int32_t, float value) const {
@@ -30,4 +30,4 @@ struct Fp8ContiguousOutput {
     }
 };
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

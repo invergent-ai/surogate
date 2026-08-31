@@ -5,7 +5,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 namespace {
 
 void require_contiguous_nonnull(const Tensor& t, const char* op, const char* name) {
@@ -84,4 +84,4 @@ void mtp_prepare_next_round(const Tensor& verify_ids, const Tensor& next_anchors
                                           ar_rope_positions, ar_valid_columns, max_context, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

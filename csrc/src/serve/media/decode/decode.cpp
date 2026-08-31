@@ -26,7 +26,7 @@ extern "C" {
 #include <utility>
 #include <vector>
 
-namespace ninfer::media::decode {
+namespace sinfer::media::decode {
 namespace {
 
 std::string av_error(int code) {
@@ -549,4 +549,4 @@ Video decode_video(std::span<const std::uint8_t> bytes, const Policy& policy, do
     return out;
 }
 
-} // namespace ninfer::media::decode
+} // namespace sinfer::media::decode

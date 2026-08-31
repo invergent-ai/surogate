@@ -7,7 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 enum class W8PairScheduleId {
     TwoSimtR8C4,
@@ -85,4 +85,4 @@ void w8_pair_execute_plan(W8PairPlan plan, const Tensor& x, const Weight& first_
 void w8_pair_dispatch(const Tensor& x, const Weight& first_weight, const Weight& second_weight,
                       Tensor& first_out, Tensor& second_out, cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

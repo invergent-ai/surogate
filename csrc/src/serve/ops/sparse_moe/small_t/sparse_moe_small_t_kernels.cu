@@ -13,7 +13,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 namespace geometry_qwen36 {
 constexpr SparseMoeGeometry kGeometry = kSparseMoeQwen36Geometry;
@@ -49,4 +49,4 @@ void sparse_moe_small_t_launch(const SparseMoeGeometry& geometry, const Tensor& 
     throw std::invalid_argument("sparse_moe: geometry has no compiled small-T kernels");
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

@@ -15,7 +15,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 namespace {
 
 struct Geometry {
@@ -295,4 +295,4 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
     }
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

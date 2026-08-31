@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-namespace ninfer::test::norm {
+namespace sinfer::test::norm {
 
 inline constexpr float kEps = 1.0e-6F;
 
@@ -61,4 +61,4 @@ inline int verify_output_storage(const std::string& label, const GuardedDeviceBu
     return failures;
 }
 
-} // namespace ninfer::test::norm
+} // namespace sinfer::test::norm

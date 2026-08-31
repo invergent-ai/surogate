@@ -8,7 +8,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 inline constexpr std::int32_t kCudaGridYLimit = 65'535;
 
@@ -27,4 +27,4 @@ void for_each_token_slice(std::int32_t tokens, std::int32_t columns_per_block, L
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

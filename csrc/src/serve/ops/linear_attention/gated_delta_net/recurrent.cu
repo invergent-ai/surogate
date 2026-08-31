@@ -9,7 +9,7 @@
 #include <stdexcept>
 #include <type_traits>
 
-namespace ninfer::ops::detail::gated_delta_net {
+namespace sinfer::ops::detail::gated_delta_net {
 namespace {
 
 static_assert(sizeof(GdnReplayFoldKernelRow) == 8);
@@ -255,4 +255,4 @@ void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAll
     throw std::invalid_argument("GDN replay fold launcher received an unregistered geometry");
 }
 
-} // namespace ninfer::ops::detail::gated_delta_net
+} // namespace sinfer::ops::detail::gated_delta_net

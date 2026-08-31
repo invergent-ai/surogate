@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 __global__ void fill_i32_positions_kernel(std::int32_t* positions, std::int32_t count,
                                           std::int32_t start) {
@@ -16,4 +16,4 @@ __global__ void offset_i32_positions_kernel(const std::int32_t* source, const st
     if (i < count) { destination[i] = source[i] + delta[0]; }
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

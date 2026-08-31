@@ -7,7 +7,7 @@
 
 #include <stdexcept>
 
-namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
+namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS::schedule {
 namespace {
 
 auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
@@ -128,4 +128,4 @@ void ordinary_decode_batch(OrdinaryBatchContext& state, std::int32_t batch_size,
     run_prepared(state, executable, body);
 }
 
-} // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule
+} // namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS::schedule

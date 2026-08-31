@@ -15,7 +15,7 @@
 #include <string>
 #include <vector>
 
-namespace ninfer::targets::qwen4exp::detail {
+namespace sinfer::targets::qwen4exp::detail {
 
 struct HostObjectPlan {
     artifact::ObjectHandle handle;
@@ -69,4 +69,4 @@ private:
     std::size_t total_bytes_ = 0;
 };
 
-} // namespace ninfer::targets::qwen4exp::detail
+} // namespace sinfer::targets::qwen4exp::detail

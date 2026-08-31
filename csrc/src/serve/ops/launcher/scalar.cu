@@ -3,7 +3,7 @@
 #include "core/device.h"
 #include "ops/kernel/scalar.cuh"
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 void set_i32_scalar_launch(Tensor& destination, std::int32_t value, cudaStream_t stream) {
     set_i32_scalar_kernel<<<1, 1, 0, stream>>>(static_cast<std::int32_t*>(destination.data), value);
@@ -33,4 +33,4 @@ void increment_i64_scalar_launch(Tensor& scalar, cudaStream_t stream) {
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

@@ -11,7 +11,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::test::direct_bf16_weight {
+namespace sinfer::test::direct_bf16_weight {
 
 struct HostWeight {
     std::int32_t n = 0;
@@ -95,4 +95,4 @@ public:
     DeviceBuffer device;
 };
 
-} // namespace ninfer::test::direct_bf16_weight
+} // namespace sinfer::test::direct_bf16_weight

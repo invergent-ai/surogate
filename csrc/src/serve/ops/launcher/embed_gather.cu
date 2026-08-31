@@ -1,4 +1,4 @@
-// ninfer::ops - embedding launcher: variant grid/block/stream setup.
+// sinfer::ops - embedding launcher: variant grid/block/stream setup.
 #include "ops/launcher/embed_gather.h"
 
 #include "ops/common/math.h"
@@ -8,7 +8,7 @@
 #include <algorithm>
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 constexpr int kBlock          = 128;
@@ -131,4 +131,4 @@ void embed_gather_fp8_launch(const Tensor& ids, const Weight& table, Tensor& out
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

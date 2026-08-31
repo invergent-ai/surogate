@@ -8,7 +8,7 @@
 
 #include <cuda_runtime.h> // cudaStream_t
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 // Counter-based RNG subkey. Distinct purposes keep draws at the same logical position separate.
 enum SamplePurpose : std::int32_t {
@@ -76,4 +76,4 @@ void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
             const SamplingConfig* configs, const Tensor& logical_positions, std::int32_t purpose,
             WorkspaceArena& workspace, cudaStream_t stream);
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

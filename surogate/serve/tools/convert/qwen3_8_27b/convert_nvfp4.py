@@ -5,7 +5,7 @@ Canonical invocation::
     python3 -m tools.convert.qwen3_8_27b.convert_nvfp4 \
       --model /path/to/Qwen3.8-27B/base-hf-bf16 \
       --quantized-model /path/to/Qwen3.8-27B/vllm-nvfp4-fp8 \
-      --out out/qwen3_8_27b_nvfp4.ninfer
+      --out out/qwen3_8_27b_nvfp4.sinfer
 """
 
 from __future__ import annotations
@@ -43,7 +43,7 @@ from . import recipe_nvfp4 as recipe
 
 
 RECIPE_ID = "qwen3_8_27b_nvfp4-v1"
-OUTPUT_BASENAME = "qwen3_8_27b_nvfp4.ninfer"
+OUTPUT_BASENAME = "qwen3_8_27b_nvfp4.sinfer"
 
 _FP8_TARGETS = [
     r"re:.*self_attn\.(q|k|v|o)_proj$",

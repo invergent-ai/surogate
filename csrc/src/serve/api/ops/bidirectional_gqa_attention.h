@@ -9,7 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 /**
  * Host execution-resource promise for bidirectional_gqa_attention.
@@ -65,4 +65,4 @@ void bidirectional_gqa_attention(const Tensor& q, const Tensor& query_k, const T
     GqaContextExecutionEnvelope envelope, std::int32_t min_tokens, std::int32_t max_tokens,
     std::int32_t batch_size);
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

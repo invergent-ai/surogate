@@ -8,7 +8,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 template <class Schedule, bool Full>
@@ -85,42 +85,42 @@ using MmaR64x16C48K128A1 = W8RowSplitMmaGemmSchedule<64, 48, 16, 24, 2, 2, 128, 
 
 } // namespace
 
-#define NINFER_W8_MMA_LAUNCHER(Name, Schedule)                                                     \
+#define SINFER_W8_MMA_LAUNCHER(Name, Schedule)                                                     \
     void Name(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {                \
         launch_route<Schedule>(x, w, out, stream);                                                 \
     }
 
-NINFER_W8_MMA_LAUNCHER(launch_w8_mma_r32_c64, MmaR32C64)
-NINFER_W8_MMA_LAUNCHER(launch_w8_mma_r32_c96, MmaR32C96)
-NINFER_W8_MMA_LAUNCHER(launch_w8_mma_r32_c128, MmaR32C128)
-NINFER_W8_MMA_LAUNCHER(launch_w8_mma_r48_c64, MmaR48C64)
-NINFER_W8_MMA_LAUNCHER(launch_w8_mma_r48_c96, MmaR48C96)
-NINFER_W8_MMA_LAUNCHER(launch_w8_mma_r48_c112, MmaR48C112)
-NINFER_W8_MMA_LAUNCHER(launch_w8_mma_r48_c128, MmaR48C128)
-NINFER_W8_MMA_LAUNCHER(launch_w8_mma_r64_c96, MmaR64C96)
-NINFER_W8_MMA_LAUNCHER(launch_w8_mma_r64_c112, MmaR64C112)
-NINFER_W8_MMA_LAUNCHER(launch_w8_mma_r64_c128, MmaR64C128)
-NINFER_W8_MMA_LAUNCHER(launch_w8_mma_r96_c96, MmaR96C96)
-NINFER_W8_MMA_LAUNCHER(launch_w8_mma_r128_c64, MmaR128C64)
-NINFER_W8_MMA_LAUNCHER(launch_w8_mma_r128_c80, MmaR128C80)
-NINFER_W8_MMA_LAUNCHER(launch_w8_mma_r64x16_c48_k128_a1, MmaR64x16C48K128A1)
+SINFER_W8_MMA_LAUNCHER(launch_w8_mma_r32_c64, MmaR32C64)
+SINFER_W8_MMA_LAUNCHER(launch_w8_mma_r32_c96, MmaR32C96)
+SINFER_W8_MMA_LAUNCHER(launch_w8_mma_r32_c128, MmaR32C128)
+SINFER_W8_MMA_LAUNCHER(launch_w8_mma_r48_c64, MmaR48C64)
+SINFER_W8_MMA_LAUNCHER(launch_w8_mma_r48_c96, MmaR48C96)
+SINFER_W8_MMA_LAUNCHER(launch_w8_mma_r48_c112, MmaR48C112)
+SINFER_W8_MMA_LAUNCHER(launch_w8_mma_r48_c128, MmaR48C128)
+SINFER_W8_MMA_LAUNCHER(launch_w8_mma_r64_c96, MmaR64C96)
+SINFER_W8_MMA_LAUNCHER(launch_w8_mma_r64_c112, MmaR64C112)
+SINFER_W8_MMA_LAUNCHER(launch_w8_mma_r64_c128, MmaR64C128)
+SINFER_W8_MMA_LAUNCHER(launch_w8_mma_r96_c96, MmaR96C96)
+SINFER_W8_MMA_LAUNCHER(launch_w8_mma_r128_c64, MmaR128C64)
+SINFER_W8_MMA_LAUNCHER(launch_w8_mma_r128_c80, MmaR128C80)
+SINFER_W8_MMA_LAUNCHER(launch_w8_mma_r64x16_c48_k128_a1, MmaR64x16C48K128A1)
 
-#undef NINFER_W8_MMA_LAUNCHER
+#undef SINFER_W8_MMA_LAUNCHER
 
-#define NINFER_W8_EXACT_LAUNCHER(Name, Prefix, TileCols)                                           \
+#define SINFER_W8_EXACT_LAUNCHER(Name, Prefix, TileCols)                                           \
     void Name(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {                \
         launch_exact_tail<TileCols>(Prefix, x, w, out, stream);                                    \
     }
 
-NINFER_W8_EXACT_LAUNCHER(launch_w8_exact_mma_r32_c96, launch_w8_mma_r32_c96, 96)
-NINFER_W8_EXACT_LAUNCHER(launch_w8_exact_mma_r32_c128, launch_w8_mma_r32_c128, 128)
-NINFER_W8_EXACT_LAUNCHER(launch_w8_exact_mma_r48_c96, launch_w8_mma_r48_c96, 96)
-NINFER_W8_EXACT_LAUNCHER(launch_w8_exact_mma_r48_c128, launch_w8_mma_r48_c128, 128)
-NINFER_W8_EXACT_LAUNCHER(launch_w8_exact_mma_r64_c96, launch_w8_mma_r64_c96, 96)
-NINFER_W8_EXACT_LAUNCHER(launch_w8_exact_mma_r64_c128, launch_w8_mma_r64_c128, 128)
-NINFER_W8_EXACT_LAUNCHER(launch_w8_exact_mma_r96_c96, launch_w8_mma_r96_c96, 96)
-NINFER_W8_EXACT_LAUNCHER(launch_w8_exact_mma_r128_c80, launch_w8_mma_r128_c80, 80)
+SINFER_W8_EXACT_LAUNCHER(launch_w8_exact_mma_r32_c96, launch_w8_mma_r32_c96, 96)
+SINFER_W8_EXACT_LAUNCHER(launch_w8_exact_mma_r32_c128, launch_w8_mma_r32_c128, 128)
+SINFER_W8_EXACT_LAUNCHER(launch_w8_exact_mma_r48_c96, launch_w8_mma_r48_c96, 96)
+SINFER_W8_EXACT_LAUNCHER(launch_w8_exact_mma_r48_c128, launch_w8_mma_r48_c128, 128)
+SINFER_W8_EXACT_LAUNCHER(launch_w8_exact_mma_r64_c96, launch_w8_mma_r64_c96, 96)
+SINFER_W8_EXACT_LAUNCHER(launch_w8_exact_mma_r64_c128, launch_w8_mma_r64_c128, 128)
+SINFER_W8_EXACT_LAUNCHER(launch_w8_exact_mma_r96_c96, launch_w8_mma_r96_c96, 96)
+SINFER_W8_EXACT_LAUNCHER(launch_w8_exact_mma_r128_c80, launch_w8_mma_r128_c80, 80)
 
-#undef NINFER_W8_EXACT_LAUNCHER
+#undef SINFER_W8_EXACT_LAUNCHER
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

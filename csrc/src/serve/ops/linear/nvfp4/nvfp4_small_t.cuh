@@ -7,7 +7,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 enum class Nvfp4SmallTFinalization {
     Elementwise,
@@ -371,4 +371,4 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_smal
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

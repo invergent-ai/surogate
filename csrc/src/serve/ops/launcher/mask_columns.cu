@@ -1,4 +1,4 @@
-// ninfer::ops - mask_columns launcher: grid/block/stream configuration.
+// sinfer::ops - mask_columns launcher: grid/block/stream configuration.
 #include "ops/launcher/mask_columns.h"
 
 #include "core/device.h"
@@ -7,7 +7,7 @@
 
 #include <cuda_bf16.h>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 void mask_columns_zero_launch(Tensor& matrix, const Tensor& valid_columns, cudaStream_t stream) {
     constexpr int kBlock     = 256;
@@ -26,4 +26,4 @@ void mask_columns_zero_launch(Tensor& matrix, const Tensor& valid_columns, cudaS
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 namespace {
 
 constexpr std::int32_t kHeadDim = 128;
@@ -135,4 +135,4 @@ void kv_cache_append_prefix(const Tensor& k, const Tensor& v, const Tensor& posi
     detail::kv_cache_append_prefix_launch(k, v, positions, counts, lanes, cache, plan, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

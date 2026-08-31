@@ -4,7 +4,7 @@
 
 #include <cuda_runtime.h>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 using Q6Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
@@ -30,4 +30,4 @@ void launch_q6_mma_r64_c112_partial(const Tensor& x, const Weight& w, Tensor& ou
 void launch_q6_mma_r64_c112(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 void launch_q6_mma_r64_c128(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

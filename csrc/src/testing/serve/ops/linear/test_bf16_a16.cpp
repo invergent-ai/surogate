@@ -15,9 +15,9 @@
 
 namespace {
 
-using namespace ninfer;
-using namespace ninfer::test;
-using namespace ninfer::test::direct_bf16_weight;
+using namespace sinfer;
+using namespace sinfer::test;
+using namespace sinfer::test::direct_bf16_weight;
 
 constexpr ReductionCriterion kA16Tolerance{1.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0};
 
@@ -169,7 +169,7 @@ int run_bf16_linear() {
 } // namespace
 
 int main() {
-    if (ninfer::test::cuda_unavailable()) {
+    if (sinfer::test::cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }

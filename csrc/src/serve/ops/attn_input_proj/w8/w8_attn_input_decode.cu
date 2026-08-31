@@ -5,7 +5,7 @@
 #include "ops/linear/w8a8/w4fp4_decode.cuh"
 #include "ops/linear/w8a8/w4fp4_plane.h"
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 namespace {
 
@@ -111,4 +111,4 @@ void w8_companion_attn_input_decode_r16_launch(const Tensor& x, const Weight& we
     launch_companion_decode<16>(x, weight, q, k, v, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

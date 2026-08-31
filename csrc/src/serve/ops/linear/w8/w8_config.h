@@ -4,7 +4,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 enum class W8SmallTMmaScaleAccess : std::uint8_t {
     Direct,
@@ -246,4 +246,4 @@ struct W8LinearSmallTProductionSchedule<W835bMtpProjectionGeometry, ActiveTokens
         W8SmallTMmaSchedule<kKWarps, kTileTokens, kMinBlocks, kScaleAccess, kActivationCache>;
 };
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

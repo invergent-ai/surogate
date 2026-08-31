@@ -15,7 +15,7 @@
 #include <type_traits>
 #include <vector>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 namespace {
 
 constexpr std::int32_t kStateDim    = detail::gated_delta_net::kStateDim;
@@ -310,4 +310,4 @@ void gdn_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLay
                                                 static_cast<std::int32_t>(rows.size()), stream);
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

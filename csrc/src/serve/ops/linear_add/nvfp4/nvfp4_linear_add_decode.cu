@@ -5,7 +5,7 @@
 #include "ops/linear/nvfp4/nvfp4_gemv.cuh"
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_epilogue.cuh"
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 template <class Geometry>
@@ -51,4 +51,4 @@ void nvfp4_linear_add_decode_launch(const Tensor& x, const Weight& weight, Tenso
     throw std::invalid_argument("nvfp4 linear_add: unsupported problem");
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

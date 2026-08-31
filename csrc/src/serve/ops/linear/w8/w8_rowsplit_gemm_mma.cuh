@@ -17,7 +17,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 union alignas(16) W8Bf16x8Bits {
     uint4 raw;
@@ -132,7 +132,7 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
                 cp_async<16, Cache::cg>(dst, &x[static_cast<std::int64_t>(nn) * k + kk]);
             } else {
                 const int valid = (nn < n && kk < k) ? min(8, k - kk) * 2 : 0;
-                ninfer::ops::cp_async_zfill<16>(
+                sinfer::ops::cp_async_zfill<16>(
                     dst, &x[static_cast<std::int64_t>(nn < n ? nn : 0) * k + (kk < k ? kk : 0)],
                     valid);
             }
@@ -156,7 +156,7 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
             } else {
                 const bool valid_row  = output_tile.valid(grow, m);
                 const std::int64_t gi = static_cast<std::int64_t>(valid_row ? grow : 0) * kg + g0;
-                ninfer::ops::cp_async_zfill<16>(dst, &codes[gi * 32 + chunk * 16],
+                sinfer::ops::cp_async_zfill<16>(dst, &codes[gi * 32 + chunk * 16],
                                                 valid_row ? 16 : 0);
             }
         }
@@ -173,7 +173,7 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
                     const int valid_scales = valid_row && g0 < kg ? min(8, kg - g0) : 0;
                     const std::int64_t gi =
                         static_cast<std::int64_t>(valid_row ? grow : 0) * kg + min(g0, kg - 1);
-                    ninfer::ops::cp_async_zfill<16>(dst, &scales[gi * 2], valid_scales * 2);
+                    sinfer::ops::cp_async_zfill<16>(dst, &scales[gi * 2], valid_scales * 2);
                 }
             }
         }
@@ -225,12 +225,12 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
     const int nkt = padded_k / BK;
     stage_x(0, 0);
     stage_w(0);
-    ninfer::ops::cp_commit();
+    sinfer::ops::cp_commit();
 
 #pragma unroll 4
     for (int kt = 0; kt < nkt; ++kt) {
         const int stage = kt % Cfg::STAGES;
-        ninfer::ops::cp_wait<0>();
+        sinfer::ops::cp_wait<0>();
         __syncthreads();
 
         dequant_w(kt);
@@ -242,7 +242,7 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
                 stage_x(next % Cfg::STAGES, next);
             }
             stage_w(next);
-            ninfer::ops::cp_commit();
+            sinfer::ops::cp_commit();
         }
 
         unsigned af[2][MT][4];
@@ -285,7 +285,7 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
             if (next < nkt) {
                 __syncthreads();
                 stage_x(0, next);
-                ninfer::ops::cp_commit();
+                sinfer::ops::cp_commit();
             }
         }
     }
@@ -503,4 +503,4 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

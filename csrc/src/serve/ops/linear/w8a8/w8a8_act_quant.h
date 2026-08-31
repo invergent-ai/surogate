@@ -14,7 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 // A8 engages at and above this token count. The IMMA path measured faster
 // than the A16 routes from T=232 up on every shape (and still ahead at 128;
@@ -36,4 +36,4 @@ struct W8A8QuantizedActivations {
 // and be 16-byte aligned.
 W8A8QuantizedActivations w8a8_act_quant(const Tensor& x, void* workspace, cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

@@ -10,7 +10,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 template <class Geometry, int ActiveTokens>
@@ -57,4 +57,4 @@ void launch_bf16_small_t(const Tensor& x, const Weight& weight, Tensor& out, cud
     throw std::invalid_argument("bf16 linear small-T: unsupported exact problem");
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

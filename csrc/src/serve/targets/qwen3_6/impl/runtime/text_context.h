@@ -25,11 +25,11 @@
 
 #include "targets/qwen3_6/impl/runtime/residual_policy.h"
 
-namespace ninfer::targets::qwen3_6::detail {
+namespace sinfer::targets::qwen3_6::detail {
 class PrefillGraphFamily;
-} // namespace ninfer::targets::qwen3_6::detail
+} // namespace sinfer::targets::qwen3_6::detail
 
-namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
+namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS::schedule {
 
 // Target-private compatibility vocabulary for the mechanically preserved fixed schedule. It is
 // data-only: TextContext is constructed on the stack for one schedule recording/execution and owns
@@ -454,4 +454,4 @@ private:
     std::array<Tensor, TextConfig::gdn_layers()> gdn_conv1d_views_{};
 };
 
-} // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule
+} // namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS::schedule

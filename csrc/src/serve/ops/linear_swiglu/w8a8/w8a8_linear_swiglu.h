@@ -10,7 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 [[nodiscard]] std::size_t w8a8_linear_swiglu_workspace_bytes(std::int32_t gate_up_rows,
                                                              std::int32_t input_rows,
@@ -19,4 +19,4 @@ namespace ninfer::ops::detail {
 void w8a8_linear_swiglu_dispatch(const Tensor& x, const Weight& gate_up_weight, Tensor& out,
                                  WorkspaceArena& workspace, cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

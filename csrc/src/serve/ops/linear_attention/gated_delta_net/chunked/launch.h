@@ -10,13 +10,13 @@
 #include <cstdint>
 #include <cstdio>
 
-#define NINFER_GATED_DELTA_NET_PROPAGATE(expr)                                                     \
+#define SINFER_GATED_DELTA_NET_PROPAGATE(expr)                                                     \
     do {                                                                                           \
-        const cudaError_t ninfer_gated_delta_net_error = (expr);                                   \
-        if (ninfer_gated_delta_net_error != cudaSuccess) { return ninfer_gated_delta_net_error; }  \
+        const cudaError_t sinfer_gated_delta_net_error = (expr);                                   \
+        if (sinfer_gated_delta_net_error != cudaSuccess) { return sinfer_gated_delta_net_error; }  \
     } while (0)
 
-namespace ninfer::ops::detail::gated_delta_net::chunked {
+namespace sinfer::ops::detail::gated_delta_net::chunked {
 
 inline constexpr std::size_t kWorkspaceAlign = 256;
 
@@ -152,4 +152,4 @@ cudaError_t launch_prepare_wy_wu(const prepare_wy_wu_config& cfg);
 cudaError_t launch_state_passing(const state_passing_config& cfg);
 cudaError_t launch_output(const chunk_output_config& cfg);
 
-} // namespace ninfer::ops::detail::gated_delta_net::chunked
+} // namespace sinfer::ops::detail::gated_delta_net::chunked

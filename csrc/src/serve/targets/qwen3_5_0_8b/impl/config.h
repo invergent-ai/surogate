@@ -6,7 +6,7 @@
 
 #include <cstdint>
 
-namespace ninfer::targets::qwen3_5_0_8b::detail {
+namespace sinfer::targets::qwen3_5_0_8b::detail {
 
 struct TextConfig {
     static constexpr int hidden       = 1024;
@@ -90,4 +90,4 @@ inline constexpr std::uint32_t kMaximumMtpDraftTokens    = 5;
 inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 0;
 inline constexpr std::uint32_t kNativeContext            = 262144;
 
-} // namespace ninfer::targets::qwen3_5_0_8b::detail
+} // namespace sinfer::targets::qwen3_5_0_8b::detail

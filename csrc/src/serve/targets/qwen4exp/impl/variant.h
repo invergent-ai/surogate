@@ -15,7 +15,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace ninfer::targets::qwen4exp::detail {
+namespace sinfer::targets::qwen4exp::detail {
 
 using GraphExecutionProfile = qwen3_6::GraphExecutionProfile;
 
@@ -191,4 +191,4 @@ struct Variant {
                                                                              std::int32_t last);
 };
 
-} // namespace ninfer::targets::qwen4exp::detail
+} // namespace sinfer::targets::qwen4exp::detail

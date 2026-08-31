@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <utility>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 using Launch = void (*)(const Tensor&, const Weight&, Tensor&, Tensor&, Tensor&, Tensor&,
@@ -102,4 +102,4 @@ void nvfp4_attn_input_small_t_launch(const Tensor& x, const Weight& weight, Tens
     kLaunchers[x.ne[1] - kNvfp4FirstSmallT](x, weight, q, gate, k, v, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

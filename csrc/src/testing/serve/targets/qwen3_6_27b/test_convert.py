@@ -76,7 +76,7 @@ def test_synthetic_encode_seam_and_descriptive_report(tmp_path):
             quant_target.layout,
         ),
     )
-    path = tmp_path / "mini.ninfer"
+    path = tmp_path / "mini.sinfer"
     with ArtifactWriter(
         path,
         ArtifactIdentity("mini-model", "mini-weights"),

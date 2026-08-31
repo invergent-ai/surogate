@@ -15,8 +15,8 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
+using namespace sinfer;
+using namespace sinfer::test;
 
 namespace {
 
@@ -119,7 +119,7 @@ std::vector<double> doubles(const std::vector<float>& values) {
 template <typename T>
 int verify_exact(const std::string& label, const std::vector<T>& got,
                  const std::vector<T>& expected) {
-    return ninfer::test::verify_exact(label.c_str(), got, expected);
+    return sinfer::test::verify_exact(label.c_str(), got, expected);
 }
 
 int verify_recurrence(const std::string& label, const std::vector<double>& got,

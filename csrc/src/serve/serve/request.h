@@ -20,7 +20,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace ninfer::serve {
+namespace sinfer::serve {
 
 // A structured API error mapped onto an error object + HTTP status. Wire-format
 // independent: each protocol layer renders it into its own error body shape.
@@ -65,7 +65,7 @@ struct ContentPart {
     ContentKind kind = ContentKind::Text;
     std::string text;     // populated for Text
     std::string type_raw; // original OpenAI "type" string (diagnostics / future use)
-    ninfer::product::media_acquire::Source source;
+    sinfer::product::media_acquire::Source source;
 };
 
 struct ToolDefinition {
@@ -207,4 +207,4 @@ struct GenerationRequest {
     }
 };
 
-} // namespace ninfer::serve
+} // namespace sinfer::serve

@@ -1,17 +1,17 @@
 #pragma once
 
-#ifndef NINFER_QWEN36_VARIANT
-#    error "NINFER_QWEN36_VARIANT must name the complete exact Variant"
+#ifndef SINFER_QWEN36_VARIANT
+#    error "SINFER_QWEN36_VARIANT must name the complete exact Variant"
 #endif
-#ifndef NINFER_QWEN36_RUNTIME_NS
-#    error "NINFER_QWEN36_RUNTIME_NS must be a unique identifier for this instantiation"
+#ifndef SINFER_QWEN36_RUNTIME_NS
+#    error "SINFER_QWEN36_RUNTIME_NS must be a unique identifier for this instantiation"
 #endif
 
 #include <api/targets/qwen3_6/runtime.h>
 
-namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
+namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS {
 
-using Variant                        = NINFER_QWEN36_VARIANT;
+using Variant                        = SINFER_QWEN36_VARIANT;
 using WeightsProfile                 = typename Variant::WeightsProfile;
 using TextConfig                     = typename Variant::TextConfig;
 using VisionConfig                   = typename Variant::VisionConfig;
@@ -54,4 +54,4 @@ inline std::vector<GraphExecutionProfile> dflash_graph_profiles(std::uint32_t ca
     return Variant::dflash_graph_profiles(capacity, draft_window, batch_size);
 }
 
-} // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
+} // namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS

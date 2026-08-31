@@ -3,7 +3,7 @@
 This is the complete target-private artifact-native Python reference for the accepted
 `qwen3_6_35b_a3b` artifact profile. It runs the 40-layer Text decoder, top-8 routed and
 gated shared experts, Vision tower and 2048-wide merger, one-layer sparse-MoE MTP model, sampling,
-and persistent KV/GDN state directly from the `.ninfer` object layouts.
+and persistent KV/GDN state directly from the `.sinfer` object layouts.
 
 The accepted artifact also contains the target-private DFlash companion tensors. The reference
 binds their complete typed weight views and can include them in an explicit weight-memory plan, but
@@ -23,7 +23,7 @@ Install the target dependencies from `requirements.txt`, then run:
 ```bash
 python3 \
   -m tools.reference.qwen3_6_35b_a3b \
-  --weights out/qwen3_6_35b_a3b.ninfer \
+  --weights out/qwen3_6_35b_a3b.sinfer \
   --prompt "请简短介绍一下你自己。" --decode 128
 ```
 

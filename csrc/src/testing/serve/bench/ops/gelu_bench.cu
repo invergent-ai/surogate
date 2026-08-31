@@ -1,5 +1,5 @@
 #include "api/ops/gelu.h"
-#include "ninfer_bench_common.h"
+#include "sinfer_bench_common.h"
 #include "ops/common/bf16_vector.cuh"
 
 #include <cuda_bf16.h>
@@ -11,8 +11,8 @@
 #include <cstdlib>
 #include <cstring>
 
-using namespace ninfer;
-using namespace ninfer::bench;
+using namespace sinfer;
+using namespace sinfer::bench;
 
 namespace {
 

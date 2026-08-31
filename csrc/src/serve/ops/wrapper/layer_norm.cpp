@@ -7,7 +7,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 namespace {
 
 std::int64_t checked_numel(const Tensor& t) {
@@ -62,4 +62,4 @@ void layer_norm(const Tensor& x, const Tensor& weight, const Tensor& bias, float
     detail::layer_norm_launch(x, weight, bias, eps, out, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

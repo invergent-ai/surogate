@@ -4,7 +4,7 @@
 
 #include <cuda_runtime.h>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 void w8_linear_add_decode_r4_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
                                     cudaStream_t stream);
@@ -63,4 +63,4 @@ void w8_linear_add_mma_r128_c64_launch(bool full, const Tensor& x, const Weight&
 void w8_linear_add_mma_r128_c80_launch(bool full, const Tensor& x, const Weight& w,
                                        Tensor& residual_out, cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

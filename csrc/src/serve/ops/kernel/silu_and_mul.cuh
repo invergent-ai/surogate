@@ -1,6 +1,6 @@
 #pragma once
 
-// ninfer::ops — silu_mul kernel: out = silu(gate) * up, elementwise.
+// sinfer::ops — silu_mul kernel: out = silu(gate) * up, elementwise.
 // silu(x) = x / (1 + e^-x), computed exactly in fp32 (NOT a polynomial fit).
 // Vectorized over bf16 pairs; included only by its launcher. See
 // docs/op-development.md §6 (no math approximation).
@@ -11,7 +11,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 inline constexpr int kSiluAndMulPairsPerThread = 4;
 
@@ -119,4 +119,4 @@ __launch_bounds__(256) __global__
     }
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

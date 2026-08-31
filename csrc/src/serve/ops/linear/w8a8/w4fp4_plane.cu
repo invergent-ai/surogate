@@ -12,7 +12,7 @@
 #include <mutex>
 #include <unordered_map>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 constexpr int kThreads = 256;
@@ -445,4 +445,4 @@ std::size_t w4fp4_cutlass_workspace_bytes(std::int32_t parent_rows, std::int32_t
     return codes + sf + stage;
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

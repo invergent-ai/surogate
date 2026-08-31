@@ -139,8 +139,8 @@ the rewrite `kExpertBK=64` was always going to force. It is **not** confirmed:
 `ncu` needs GPU counter permissions this host does not grant
 (`ERR_NVGPUCTRPERM`), so the next person should start by getting counters and
 measuring sector efficiency before writing any kernel. The bench
-(`ninfer_sparse_moe_bench`, repaired 2026-08-30 — it had not compiled since the
-geometry argument landed) and `ninfer_sparse_moe_test` are the harness.
+(`sinfer_sparse_moe_bench`, repaired 2026-08-30 — it had not compiled since the
+geometry argument landed) and `sinfer_sparse_moe_test` are the harness.
 
 ## B2 — Flash-Next phase-1 exclusions (2026-08-28)
 
@@ -176,5 +176,5 @@ cuBLASLt at every width, including one token, which cost the 4B 35 % of its sing
 board's closed items). Still open on this family: small-T (2-16 tokens) A16 for hidden-2560
 shapes; the two 2,560-row residual GEMVs at 52-59 % of bandwidth (CTA count is not the limiter —
 measured — split-K next); and making geometries runtime or JIT-compiled so the next model does not
-repeat this. Diagnostic: `nsys --cuda-graph-trace=node` on `ninfer_bench -n 128` — any
+repeat this. Diagnostic: `nsys --cuda-graph-trace=node` on `sinfer_bench -n 128` — any
 `cutlass…block_scaled` kernel at batch 1 is an unregistered shape.

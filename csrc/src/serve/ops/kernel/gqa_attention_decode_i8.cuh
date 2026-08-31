@@ -1,6 +1,6 @@
 #pragma once
 
-// ninfer::ops - split-KV GQA small-T attention, int8 KV-cache partial kernel.
+// sinfer::ops - split-KV GQA small-T attention, int8 KV-cache partial kernel.
 // Historical design: docs/archive/optimization-era/2026-07-08-gqa-decode-int8-kernel-redesign.md.
 //
 //   * QK runs on native m16n8k32.s8 tensor cores. Q is quantized on-chip to int8
@@ -28,7 +28,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 // Store one int8 code into a d-contiguous-as-b16 swizzled tile so the same
 // gqa_small_t_tc_swz / ldmatrix path that serves bf16 tiles serves the int8 tile.
@@ -320,8 +320,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             if (key >= split_start && key < split_end) {
                 const std::int64_t off = gqa_kv_quant_scale_index<Geometry>(
                     physical_page, kv_head, 0, key & kPagedKVPageMask);
-                ninfer::ops::cp_async<8>(&k_scale_s[key_l * Groups], &cache_k_scale[off]);
-                ninfer::ops::cp_async<8>(&v_scale_s[key_l * Groups], &cache_v_scale[off]);
+                sinfer::ops::cp_async<8>(&k_scale_s[key_l * Groups], &cache_k_scale[off]);
+                sinfer::ops::cp_async<8>(&v_scale_s[key_l * Groups], &cache_v_scale[off]);
             } else {
                 store_vec(&k_scale_s[key_l * Groups], make_int2(0, 0));
                 store_vec(&v_scale_s[key_l * Groups], make_int2(0, 0));
@@ -337,20 +337,20 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 const std::int64_t off = gqa_kv_quant_code_index<Geometry>(
                     physical_page, kv_head, d, key & kPagedKVPageMask);
                 std::int8_t* dst = &k_i8[key_l * D + gqa_small_t_tc_swz(key_l, dc * 8) * 2];
-                ninfer::ops::cp_async<16>(dst, &cache_k_i8[off]);
-                ninfer::ops::cp_async<16>(&v_i8[key_l * D + d], &cache_v_i8[off]);
+                sinfer::ops::cp_async<16>(dst, &cache_k_i8[off]);
+                sinfer::ops::cp_async<16>(&v_i8[key_l * D + d], &cache_v_i8[off]);
             } else {
                 std::int8_t* dst = &k_i8[key_l * D + gqa_small_t_tc_swz(key_l, dc * 8) * 2];
                 store_vec(dst, make_int4(0, 0, 0, 0));
                 store_vec(&v_i8[key_l * D + d], make_int4(0, 0, 0, 0));
             }
         }
-        ninfer::ops::cp_commit();
+        sinfer::ops::cp_commit();
     };
 
     int physical_page = physical_pages_s[0];
     issue_kv_tile(first_tile, physical_page);
-    ninfer::ops::cp_wait<0>();
+    sinfer::ops::cp_wait<0>();
     __syncthreads();
 
     for (int kb = 0; kb < key_blocks; ++kb) {
@@ -555,7 +555,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                          vf[0], vf[1]);
             }
         }
-        if (has_next) { ninfer::ops::cp_wait<0>(); }
+        if (has_next) { sinfer::ops::cp_wait<0>(); }
         __syncthreads();
     }
 
@@ -605,4 +605,4 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     }
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

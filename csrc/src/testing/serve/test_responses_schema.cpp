@@ -19,7 +19,7 @@
 namespace {
 
 using Json = nlohmann::json;
-using namespace ninfer::serve;
+using namespace sinfer::serve;
 
 int check(bool condition, const std::string& message) {
     if (condition) { return 0; }
@@ -33,13 +33,13 @@ RequestLimits limits() {
     return value;
 }
 
-ninfer::PromptCapabilities effort_capabilities() {
-    ninfer::PromptCapabilities capabilities;
+sinfer::PromptCapabilities effort_capabilities() {
+    sinfer::PromptCapabilities capabilities;
     capabilities.enable_thinking                 = true;
     capabilities.reasoning_effort.low            = true;
     capabilities.reasoning_effort.medium         = true;
     capabilities.reasoning_effort.xhigh          = true;
-    capabilities.reasoning_effort.default_effort = ninfer::ReasoningEffort::XHigh;
+    capabilities.reasoning_effort.default_effort = sinfer::ReasoningEffort::XHigh;
     return capabilities;
 }
 
@@ -91,7 +91,7 @@ int test_basic_request() {
     int failures                   = 0;
     failures += check(request.generation.model == "qwen3.6-27b", "model parsed");
     failures += check(request.input_turns.size() == 1 &&
-                          request.input_turns[0].role == ninfer::ChatRole::User &&
+                          request.input_turns[0].role == sinfer::ChatRole::User &&
                           request.input_turns[0].content[0].text == "hello",
                       "string input normalized to a user turn");
     failures += check(request.input_items[0].at("type") == "message" &&
@@ -110,14 +110,14 @@ int test_basic_request() {
     failures += check(request.store && !request.stream, "Responses defaults applied");
     ResponsesRequest composed = request;
     ChatTurn previous;
-    previous.role = ninfer::ChatRole::Assistant;
+    previous.role = sinfer::ChatRole::Assistant;
     ContentPart previous_text;
     previous_text.kind = ContentKind::Text;
     previous_text.text = "old answer";
     previous.content.push_back(std::move(previous_text));
     compose_responses_generation_messages(composed, {previous});
     failures += check(composed.generation.messages.size() == 3 &&
-                          composed.generation.messages[0].role == ninfer::ChatRole::Developer &&
+                          composed.generation.messages[0].role == sinfer::ChatRole::Developer &&
                           composed.generation.messages[1].content[0].text == "old answer" &&
                           composed.generation.messages[2].content[0].text == "hello",
                       "instructions, previous context, and current input composed in order");
@@ -135,15 +135,15 @@ int test_instruction_message_order() {
              {"max_output_tokens", 32}},
         limits());
     int failures = check(request.input_turns.size() == 3 &&
-                             request.input_turns[0].role == ninfer::ChatRole::System &&
-                             request.input_turns[1].role == ninfer::ChatRole::User &&
-                             request.input_turns[2].role == ninfer::ChatRole::Developer,
+                             request.input_turns[0].role == sinfer::ChatRole::System &&
+                             request.input_turns[1].role == sinfer::ChatRole::User &&
+                             request.input_turns[2].role == sinfer::ChatRole::Developer,
                          "Responses input instruction roles were lowered or reordered");
     compose_responses_generation_messages(request, {});
     failures += check(request.generation.messages.size() == 3 &&
-                          request.generation.messages[0].role == ninfer::ChatRole::System &&
-                          request.generation.messages[1].role == ninfer::ChatRole::User &&
-                          request.generation.messages[2].role == ninfer::ChatRole::Developer,
+                          request.generation.messages[0].role == sinfer::ChatRole::System &&
+                          request.generation.messages[1].role == sinfer::ChatRole::User &&
+                          request.generation.messages[2].role == sinfer::ChatRole::Developer,
                       "Responses composition changed input instruction order");
     return failures;
 }
@@ -174,7 +174,7 @@ int test_reasoning_effort() {
     const ResolvedPromptSemantics low_semantics =
         resolve_prompt_semantics(low_request, ServeOptions{}, effort_capabilities());
     failures += check(low_semantics.enable_thinking &&
-                          low_semantics.reasoning_effort == ninfer::ReasoningEffort::Low,
+                          low_semantics.reasoning_effort == sinfer::ReasoningEffort::Low,
                       "Responses low effort did not resolve through template capabilities");
 
     Json none                                    = base;
@@ -289,11 +289,11 @@ int test_typed_items_and_tools() {
     const ResponsesRequest request = parse_responses_request(body, limits());
     int failures                   = 0;
     failures += check(request.input_turns.size() == 3, "typed Items grouped into three turns");
-    failures += check(request.input_turns[0].role == ninfer::ChatRole::Assistant &&
+    failures += check(request.input_turns[0].role == sinfer::ChatRole::Assistant &&
                           request.input_turns[0].reasoning_content == "need tools" &&
                           request.input_turns[0].tool_calls.size() == 2,
                       "reasoning and adjacent function calls grouped into one assistant turn");
-    failures += check(request.input_turns[1].role == ninfer::ChatRole::Tool &&
+    failures += check(request.input_turns[1].role == sinfer::ChatRole::Tool &&
                           request.input_turns[1].tool_call_id == "call_1",
                       "function output translated to tool turn");
     failures += check(request.input_turns[2].content[0].kind == ContentKind::Image,
@@ -359,7 +359,7 @@ GenerationOutcome sample_outcome() {
     outcome.prompt_tokens                   = 11;
     outcome.completion_tokens               = 7;
     outcome.reasoning_tokens                = 3;
-    outcome.finish_reason                   = ninfer::FinishReason::StopToken;
+    outcome.finish_reason                   = sinfer::FinishReason::StopToken;
     outcome.metrics.prefix_cache_hit_tokens = 4;
     return outcome;
 }
@@ -399,7 +399,7 @@ int test_response_object() {
                       "terminal output converted to continuation history");
 
     GenerationOutcome incomplete = sample_outcome();
-    incomplete.finish_reason     = ninfer::FinishReason::OutputLimit;
+    incomplete.finish_reason     = sinfer::FinishReason::OutputLimit;
     const Json limited = make_response_object("resp_limit", 123, request, runtime, incomplete).body;
     failures += check(limited.at("status") == "incomplete" &&
                           limited.at("incomplete_details").at("reason") == "max_output_tokens",
@@ -469,7 +469,7 @@ int test_sse_function_call() {
     GenerationOutcome outcome;
     outcome.prompt_tokens     = 8;
     outcome.completion_tokens = 4;
-    outcome.finish_reason     = ninfer::FinishReason::StopToken;
+    outcome.finish_reason     = sinfer::FinishReason::StopToken;
     outcome.tool_calls.push_back(ToolCall{"call_weather", "weather", R"({"city":"Paris"})"});
     ResponsesStreamFinish finish = encoder.finish(outcome);
     wire.insert(wire.end(), finish.events_before_terminal.begin(),

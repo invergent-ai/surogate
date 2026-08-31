@@ -15,15 +15,18 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::test::artifact_fixture {
+namespace sinfer::test::artifact_fixture {
 
 using Json = nlohmann::json;
 
 inline constexpr std::array<std::uint8_t, 8> kV1Magic = {
     'N', 'I', 'N', 'F', 'E', 'R', 0, 1,
 };
+// Matches artifact/reader.cpp. Byte-at-a-time like the reader's, so the project
+// rename had to reach it by hand; kV1Magic above stays as it is because v1 files
+// in the world carry those bytes.
 inline constexpr std::array<std::uint8_t, 8> kMagic = {
-    'N', 'I', 'N', 'F', 'E', 'R', 0, 2,
+    'S', 'I', 'N', 'F', 'E', 'R', 0, 2,
 };
 
 inline std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment) {
@@ -76,7 +79,7 @@ inline TemporaryArtifact write_fixture(const Json& directory, std::string_view s
     }
 
     auto path = std::filesystem::temp_directory_path() /
-                ("ninfer_artifact_" + std::string(suffix) + ".ninfer");
+                ("sinfer_artifact_" + std::string(suffix) + ".sinfer");
     std::ofstream output(path, std::ios::binary | std::ios::trunc);
     output.write(reinterpret_cast<const char*>(file.data()),
                  static_cast<std::streamsize>(file.size()));
@@ -84,4 +87,4 @@ inline TemporaryArtifact write_fixture(const Json& directory, std::string_view s
     return {std::move(path)};
 }
 
-} // namespace ninfer::test::artifact_fixture
+} // namespace sinfer::test::artifact_fixture

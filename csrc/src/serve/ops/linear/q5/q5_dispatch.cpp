@@ -2,7 +2,7 @@
 
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 Q5Launch select_q5_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     if (t <= 0) { throw std::invalid_argument("q5 linear: unsupported shape or T"); }
@@ -46,7 +46,7 @@ Q5Launch select_q5_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         }
         break;
     // Vision tower, 1024-wide (Qwen3.5 2B/4B): attention output is n = k = hidden,
-    // mlp fc2 is k = intermediate below. Measured with ninfer_vision_tower_tune_bench
+    // mlp fc2 is k = intermediate below. Measured with sinfer_vision_tower_tune_bench
     // --hidden 1024. Mirroring 1152 had fc2 on c64 out to t=1148, where c128 in fact
     // wins from 256, and cut the SIMT path off at 76/120 where it holds to 160.
     case 1024:
@@ -109,4 +109,4 @@ void q5_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy pol
     launch(x, w, out, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

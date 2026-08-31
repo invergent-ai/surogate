@@ -1,6 +1,6 @@
 #pragma once
 
-// Implements: include/ninfer/ops/argmax.h
+// Implements: include/sinfer/ops/argmax.h
 // Match: contiguous BF16 [physical_rows,C], valid_rows <= physical_rows, with
 // tuned routes qualified for the 248077-row and 131072-row vocabularies.
 // Algorithm assumptions: one CTA reduces each blockDim.x-row tile and an atomic
@@ -11,7 +11,7 @@
 #include <climits>
 #include <math_constants.h>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 // Small-column execution uses 512 threads to reduce atomic contenders. Aggregate
 // execution dispatches registered vocab profiles to a smaller block so the much
@@ -127,4 +127,4 @@ __launch_bounds__(kArgmaxBlock) __global__
     }
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

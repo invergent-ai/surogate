@@ -14,7 +14,7 @@
 #include <array>
 #include <utility>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 constexpr int kN                 = 34816;
@@ -222,4 +222,4 @@ void q4_linear_swiglu_small_t_exact_launch(const Tensor& x, const Weight& w, Ten
     kSmallTLaunchers[static_cast<std::size_t>(x.ne[1] - 2)](x, w, out, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

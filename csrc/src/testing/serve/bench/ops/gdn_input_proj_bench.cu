@@ -4,7 +4,7 @@
 #include "api/ops/gdn_input_proj.h"
 
 #include "core/device.h"
-#include "ninfer_bench_common.h"
+#include "sinfer_bench_common.h"
 #include "quantized_weight.cuh"
 
 #include <cuda_profiler_api.h>
@@ -24,7 +24,7 @@
 #include <utility>
 #include <vector>
 
-using namespace ninfer;
+using namespace sinfer;
 
 namespace {
 
@@ -61,7 +61,7 @@ struct Result {
 [[noreturn]] void usage(const char* message) {
     std::fprintf(stderr,
                  "error: %s\n"
-                 "usage: ninfer_gdn_input_proj_bench "
+                 "usage: sinfer_gdn_input_proj_bench "
                  "[--format q4q5|w8|nvfp4|fp8|all] [--nvfp4-policy a16|a4] "
                  "[--fp8-policy a16|a8] "
                  "[--tokens T,...] [--cache cold|warm|both] [--warmup N] [--repeat N] "
@@ -431,7 +431,7 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "ninfer_gdn_input_proj_bench: %s\n", error.what());
+        std::fprintf(stderr, "sinfer_gdn_input_proj_bench: %s\n", error.what());
         return 1;
     }
 }

@@ -10,7 +10,7 @@
 
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 using M32N64            = Nvfp4W4a4MmaSchedule<32, 64, 256, 2, 4, 2, 2>;
@@ -103,4 +103,4 @@ void nvfp4_linear_add_w4a4_launch(const Tensor& x, const Weight& weight, Tensor&
     throw std::invalid_argument("nvfp4 linear_add: unsupported problem");
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

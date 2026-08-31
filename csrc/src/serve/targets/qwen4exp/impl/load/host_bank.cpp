@@ -21,12 +21,12 @@
 
 #include <sys/mman.h>
 #if defined(__linux__) && __has_include(<numa.h>) && __has_include(<numaif.h>)
-#define NINFER_HOST_BANK_NUMA 1
+#define SINFER_HOST_BANK_NUMA 1
 #include <numa.h>
 #include <numaif.h>
 #endif
 
-namespace ninfer::targets::qwen4exp::detail {
+namespace sinfer::targets::qwen4exp::detail {
 
 std::size_t HostBankPlan::total_bytes() const noexcept {
     std::size_t total = 0;
@@ -62,7 +62,7 @@ HostBank::HostBank(const HostBankPlan& plan) {
             void* mem = ::mmap(nullptr, object.bytes, PROT_READ | PROT_WRITE,
                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
             if (mem != MAP_FAILED) {
-#if defined(NINFER_HOST_BANK_NUMA)
+#if defined(SINFER_HOST_BANK_NUMA)
                 if (numa_available() >= 0 && numa_num_configured_nodes() > 1) {
                     (void)::mbind(mem, object.bytes, MPOL_INTERLEAVE, numa_all_nodes_ptr->maskp,
                                   numa_all_nodes_ptr->size + 1, 0);
@@ -241,4 +241,4 @@ std::shared_ptr<HostBank> HostBank::shared(const HostBankPlan& plan) {
     return bank;
 }
 
-} // namespace ninfer::targets::qwen4exp::detail
+} // namespace sinfer::targets::qwen4exp::detail

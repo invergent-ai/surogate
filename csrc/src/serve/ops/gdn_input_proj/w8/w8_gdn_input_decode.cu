@@ -6,7 +6,7 @@
 #include "ops/linear/w8a8/w4fp4_decode.cuh"
 #include "ops/linear/w8a8/w4fp4_plane.h"
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 using Output = W8SplitOutput2<8192, 4096>;
@@ -184,4 +184,4 @@ void w8_gdn_input_decode_conv_snapshot_launch(
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

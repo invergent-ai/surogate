@@ -1,4 +1,4 @@
-"""Common Python support for NInfer artifacts."""
+"""Common Python support for SInfer artifacts."""
 
 from .container import (
     MAGIC,

@@ -4,7 +4,7 @@
 
 #include <cuda_runtime.h> // cudaStream_t
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 /**
  * Prepares Gated DeltaNet decay and update gates:
@@ -21,4 +21,4 @@ namespace ninfer::ops {
 void gdn_gating(const Tensor& a, const Tensor& b, const Tensor& A_log, const Tensor& dt_bias,
                 Tensor& g, Tensor& beta, cudaStream_t stream);
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

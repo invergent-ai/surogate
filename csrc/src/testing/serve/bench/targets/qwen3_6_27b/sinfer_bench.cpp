@@ -1,4 +1,4 @@
-#include "ninfer_bench_support.h"
+#include "sinfer_bench_support.h"
 
 #include "api/engine.h"
 
@@ -30,7 +30,7 @@ std::string cuda_version_string(int version) {
     return std::to_string(version / 1000) + "." + std::to_string((version % 1000) / 10);
 }
 
-void fill_cuda_environment(ninfer::bench::BenchEnvironment& env, int device) {
+void fill_cuda_environment(sinfer::bench::BenchEnvironment& env, int device) {
     env.device_id       = device;
     int runtime_version = 0;
     if (cudaRuntimeGetVersion(&runtime_version) == cudaSuccess) {
@@ -52,15 +52,15 @@ void require_cuda(cudaError_t status, const char* operation) {
     }
 }
 
-bool has_decode_tests(const std::vector<ninfer::bench::BenchTest>& tests) {
+bool has_decode_tests(const std::vector<sinfer::bench::BenchTest>& tests) {
     for (const auto& test : tests) {
         if (test.has_decode()) { return true; }
     }
     return false;
 }
 
-ninfer::RequestOptions benchmark_request(const ninfer::bench::BenchTest& test) {
-    ninfer::RequestOptions options;
+sinfer::RequestOptions benchmark_request(const sinfer::bench::BenchTest& test) {
+    sinfer::RequestOptions options;
     options.execution.requested_output_tokens = test.requested_output_tokens();
     options.execution.allow_prefix_reuse      = false;
     options.execution.sampling.temperature    = 0.0F;
@@ -70,14 +70,14 @@ ninfer::RequestOptions benchmark_request(const ninfer::bench::BenchTest& test) {
     return options;
 }
 
-ninfer::bench::RepTiming run_repetition(ninfer::Engine& engine,
-                                        const ninfer::bench::BenchTest& test,
-                                        const std::vector<ninfer::TokenId>& corpus) {
-    const int prompt_tokens = test.kind == ninfer::bench::TestKind::Decode
-                                  ? ninfer::bench::kDecodeSeedTokens
+sinfer::bench::RepTiming run_repetition(sinfer::Engine& engine,
+                                        const sinfer::bench::BenchTest& test,
+                                        const std::vector<sinfer::TokenId>& corpus) {
+    const int prompt_tokens = test.kind == sinfer::bench::TestKind::Decode
+                                  ? sinfer::bench::kDecodeSeedTokens
                                   : test.n_prompt;
-    auto prompt = engine.prepare_tokens(ninfer::bench::prompt_slice(corpus, prompt_tokens), false);
-    ninfer::GenerationResult generated =
+    auto prompt = engine.prepare_tokens(sinfer::bench::prompt_slice(corpus, prompt_tokens), false);
+    sinfer::GenerationResult generated =
         engine.generate(std::move(prompt), benchmark_request(test));
 
     const std::uint32_t expected = test.requested_output_tokens();
@@ -86,28 +86,28 @@ ninfer::bench::RepTiming run_repetition(ninfer::Engine& engine,
                                  std::to_string(generated.generated_token_ids.size()) +
                                  " tokens; expected " + std::to_string(expected));
     }
-    if (generated.finish_reason != ninfer::FinishReason::OutputLimit) {
+    if (generated.finish_reason != sinfer::FinishReason::OutputLimit) {
         throw std::runtime_error(test.label + " did not finish at the requested output limit");
     }
 
-    ninfer::bench::RepTiming timing;
+    sinfer::bench::RepTiming timing;
     timing.timings                 = generated.timings;
     timing.speculative             = std::move(generated.speculative);
     timing.generated_output_tokens = expected;
     return timing;
 }
 
-void prime_decode_graph(ninfer::Engine& engine, ninfer::bench::BenchEnvironment& env,
-                        const std::vector<ninfer::TokenId>& corpus) {
+void prime_decode_graph(sinfer::Engine& engine, sinfer::bench::BenchEnvironment& env,
+                        const std::vector<sinfer::TokenId>& corpus) {
     if (!env.use_cuda_graph || env.decode_graph_prime_output_tokens == 0) { return; }
     const int decode_tokens = static_cast<int>(env.decode_graph_prime_output_tokens - 1);
-    const ninfer::bench::BenchTest prime{ninfer::bench::TestKind::Decode, 0, decode_tokens,
+    const sinfer::bench::BenchTest prime{sinfer::bench::TestKind::Decode, 0, decode_tokens,
                                          "decode-graph-prime"};
     (void)run_repetition(engine, prime, corpus);
     env.decode_graph_primed = true;
 }
 
-void write_output(const ninfer::bench::BenchOptions& options, const std::string& text) {
+void write_output(const sinfer::bench::BenchOptions& options, const std::string& text) {
     if (options.output_file.empty()) {
         std::cout << text;
         return;
@@ -123,47 +123,47 @@ void write_output(const ninfer::bench::BenchOptions& options, const std::string&
 } // namespace
 
 int main(int argc, char** argv) {
-    ninfer::bench::BenchOptions options;
+    sinfer::bench::BenchOptions options;
     try {
-        options = ninfer::bench::parse_args(argc, argv);
+        options = sinfer::bench::parse_args(argc, argv);
     } catch (const std::exception& error) {
-        std::cerr << "ninfer_bench: " << error.what() << '\n';
+        std::cerr << "sinfer_bench: " << error.what() << '\n';
         return 2;
     }
     if (options.help_requested) {
-        std::cout << ninfer::bench::usage_text(argc > 0 ? argv[0] : "ninfer_bench");
+        std::cout << sinfer::bench::usage_text(argc > 0 ? argv[0] : "sinfer_bench");
         return 0;
     }
 
     try {
-        const std::vector<ninfer::TokenId> corpus =
-            ninfer::bench::load_corpus_ids(options.corpus_path);
-        const std::vector<ninfer::bench::BenchTest> tests = ninfer::bench::expand_tests(options);
+        const std::vector<sinfer::TokenId> corpus =
+            sinfer::bench::load_corpus_ids(options.corpus_path);
+        const std::vector<sinfer::bench::BenchTest> tests = sinfer::bench::expand_tests(options);
         if (options.profile_measured && (tests.size() != 1 || options.repetitions != 1)) {
             throw std::invalid_argument(
                 "--profile-measured requires exactly one benchmark test and -r 1");
         }
-        ninfer::bench::validate_prompt_lengths(tests, corpus.size());
-        const std::uint32_t max_context = ninfer::bench::resolve_max_context(
+        sinfer::bench::validate_prompt_lengths(tests, corpus.size());
+        const std::uint32_t max_context = sinfer::bench::resolve_max_context(
             tests, options.max_context, options.mtp_draft_tokens, options.use_cuda_graph);
 
-        ninfer::EngineOptions engine_options;
+        sinfer::EngineOptions engine_options;
         engine_options.artifact_path = options.artifact_path;
         engine_options.device        = options.device;
         engine_options.max_context   = max_context;
-        engine_options.kv_capacity   = ninfer::KvCapacityPolicy::explicit_capacity(max_context);
+        engine_options.kv_capacity   = sinfer::KvCapacityPolicy::explicit_capacity(max_context);
         engine_options.prefill_chunk = options.prefill_chunk;
         engine_options.kv_cache      = options.kv_cache;
         engine_options.speculative.backend       = options.mtp_draft_tokens == 0
-                                                       ? ninfer::SpeculativeBackend::None
-                                                       : ninfer::SpeculativeBackend::Mtp;
+                                                       ? sinfer::SpeculativeBackend::None
+                                                       : sinfer::SpeculativeBackend::Mtp;
         engine_options.speculative.draft_tokens  = options.mtp_draft_tokens;
         engine_options.speculative.proposal_head = options.proposal_head;
         engine_options.use_cuda_graph            = options.use_cuda_graph;
 
-        ninfer::bench::BenchEnvironment env;
+        sinfer::bench::BenchEnvironment env;
         env.artifact_path            = options.artifact_path;
-        env.artifact_file_size_bytes = ninfer::bench::file_size_or_zero(options.artifact_path);
+        env.artifact_file_size_bytes = sinfer::bench::file_size_or_zero(options.artifact_path);
         env.max_context              = max_context;
         env.prefill_chunk            = options.prefill_chunk;
         env.kv_cache                 = options.kv_cache;
@@ -176,28 +176,28 @@ int main(int argc, char** argv) {
         env.corpus_tokens            = corpus.size();
         if (options.use_cuda_graph && has_decode_tests(tests)) {
             env.decode_graph_prime_output_tokens =
-                ninfer::bench::decode_graph_prime_output_tokens(options.mtp_draft_tokens);
+                sinfer::bench::decode_graph_prime_output_tokens(options.mtp_draft_tokens);
         }
 
-        std::cerr << "[ninfer_bench] loading " << options.artifact_path
+        std::cerr << "[sinfer_bench] loading " << options.artifact_path
                   << " (max_context=" << max_context
-                  << ", kv_cache=" << ninfer::bench::kv_cache_name(options.kv_cache) << ")\n";
-        ninfer::Engine engine(std::move(engine_options));
+                  << ", kv_cache=" << sinfer::bench::kv_cache_name(options.kv_cache) << ")\n";
+        sinfer::Engine engine(std::move(engine_options));
         fill_cuda_environment(env, options.device);
         env.load   = engine.load_summary();
         env.memory = engine.memory_summary();
 
         prime_decode_graph(engine, env, corpus);
 
-        std::vector<ninfer::bench::TestResult> results;
+        std::vector<sinfer::bench::TestResult> results;
         results.reserve(tests.size());
         for (std::size_t i = 0; i < tests.size(); ++i) {
             const auto& test = tests[i];
-            std::cerr << "[ninfer_bench] test " << (i + 1) << '/' << tests.size() << ' '
+            std::cerr << "[sinfer_bench] test " << (i + 1) << '/' << tests.size() << ' '
                       << test.label << ": warmup=" << options.warmup
                       << " reps=" << options.repetitions << '\n';
 
-            ninfer::bench::TestResult result;
+            sinfer::bench::TestResult result;
             result.test = test;
             engine.reset_memory_peaks();
             for (int warmup = 0; warmup < options.warmup; ++warmup) {
@@ -215,7 +215,7 @@ int main(int argc, char** argv) {
                 require_cuda(cudaDeviceSynchronize(), "profile post-boundary synchronize");
                 require_cuda(cudaProfilerStop(), "cudaProfilerStop");
             }
-            const ninfer::MemorySummary memory    = engine.memory_summary();
+            const sinfer::MemorySummary memory    = engine.memory_summary();
             result.workspace_peak_bytes           = memory.workspace_logical_peak_bytes;
             result.workspace_allocator_peak_bytes = memory.workspace.peak_used_bytes;
             results.push_back(std::move(result));
@@ -223,20 +223,20 @@ int main(int argc, char** argv) {
 
         std::string report;
         switch (options.output) {
-        case ninfer::bench::OutputFormat::Table:
-            report = ninfer::bench::format_table(env, results);
+        case sinfer::bench::OutputFormat::Table:
+            report = sinfer::bench::format_table(env, results);
             break;
-        case ninfer::bench::OutputFormat::Json:
-            report = ninfer::bench::format_json(env, command_line(argc, argv), results);
+        case sinfer::bench::OutputFormat::Json:
+            report = sinfer::bench::format_json(env, command_line(argc, argv), results);
             break;
-        case ninfer::bench::OutputFormat::Csv:
-            report = ninfer::bench::format_csv(env, results);
+        case sinfer::bench::OutputFormat::Csv:
+            report = sinfer::bench::format_csv(env, results);
             break;
         }
         write_output(options, report);
         return 0;
     } catch (const std::exception& error) {
-        std::cerr << "ninfer_bench: " << error.what() << '\n';
+        std::cerr << "sinfer_bench: " << error.what() << '\n';
         return 1;
     }
 }

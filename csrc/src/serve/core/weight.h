@@ -2,7 +2,7 @@
 
 #include "core/tensor.h"
 
-namespace ninfer {
+namespace sinfer {
 
 // Project a dense Weight (qtype BF16_CTRL / FP32_CTRL, layout Contiguous) to a non-owning Tensor
 // view. ne[i] = shape[i] with contiguous strides. This lets the
@@ -22,4 +22,4 @@ inline Tensor as_dense(const Weight& w) {
     }
 }
 
-} // namespace ninfer
+} // namespace sinfer

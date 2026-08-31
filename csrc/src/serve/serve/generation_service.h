@@ -1,6 +1,6 @@
 #pragma once
 
-// Product-side adapter between HTTP protocol requests and the public NInfer
+// Product-side adapter between HTTP protocol requests and the public SInfer
 // engine. It owns one Engine and keeps protocol concerns (aliases, usage,
 // streaming callbacks, and tool-call parsing) outside the target package.
 
@@ -16,7 +16,7 @@
 #include <string>
 #include <vector>
 
-namespace ninfer::serve {
+namespace sinfer::serve {
 
 struct RequestLifetime;
 struct RequestCapacity;
@@ -37,7 +37,7 @@ struct GenerationMetrics {
     std::uint64_t speculative_fallback_steps  = 0;
     std::vector<std::uint64_t> speculative_accepted_per_position;
     std::uint32_t prefix_cache_hit_tokens     = 0;
-    ninfer::PrefixReusePath prefix_reuse_path = ninfer::PrefixReusePath::FullReset;
+    sinfer::PrefixReusePath prefix_reuse_path = sinfer::PrefixReusePath::FullReset;
 };
 
 struct GenerationOutcome {
@@ -48,7 +48,7 @@ struct GenerationOutcome {
     int completion_tokens              = 0;
     int reasoning_tokens               = 0;
     std::size_t streamed_content_bytes = 0;
-    ninfer::FinishReason finish_reason = ninfer::FinishReason::OutputLimit;
+    sinfer::FinishReason finish_reason = sinfer::FinishReason::OutputLimit;
     GenerationMetrics metrics;
 };
 
@@ -59,14 +59,14 @@ struct StreamSink {
 };
 
 // Translate Engine request failures into the shared protocol-neutral HTTP error contract.
-ApiError request_error_to_api_error(const ninfer::RequestError& exception);
+ApiError request_error_to_api_error(const sinfer::RequestError& exception);
 
 // Preparation ends by synchronously submitting the owning prompt to the Engine FIFO. The returned
 // request keeps its ingress/response lifetime reservation until the HTTP response is released and
 // is consumed exactly once by run().
 struct PreparedRequest {
-    ninfer::GenerationHandle generation;
-    ninfer::ResolvedSamplingParameters sampling;
+    sinfer::GenerationHandle generation;
+    sinfer::ResolvedSamplingParameters sampling;
     double prepare_seconds     = 0.0;
     double acquisition_seconds = 0.0;
     PromptPreparationStats preparation;
@@ -86,17 +86,17 @@ public:
 
     [[nodiscard]] const ServeOptions& options() const noexcept { return options_; }
 
-    [[nodiscard]] ninfer::LoadSummary load_summary() const { return engine_->load_summary(); }
+    [[nodiscard]] sinfer::LoadSummary load_summary() const { return engine_->load_summary(); }
 
-    [[nodiscard]] ninfer::MemorySummary memory_summary() const { return engine_->memory_summary(); }
+    [[nodiscard]] sinfer::MemorySummary memory_summary() const { return engine_->memory_summary(); }
 
-    [[nodiscard]] ninfer::RuntimeStats runtime_stats() const { return engine_->runtime_stats(); }
+    [[nodiscard]] sinfer::RuntimeStats runtime_stats() const { return engine_->runtime_stats(); }
 
-    [[nodiscard]] ninfer::MediaCacheSummary media_cache_summary() const {
+    [[nodiscard]] sinfer::MediaCacheSummary media_cache_summary() const {
         return engine_->media_cache_summary();
     }
 
-    [[nodiscard]] ninfer::ModelSamplingDefaults sampling_defaults() const {
+    [[nodiscard]] sinfer::ModelSamplingDefaults sampling_defaults() const {
         return engine_->sampling_defaults();
     }
 
@@ -115,9 +115,9 @@ private:
     [[nodiscard]] std::shared_ptr<RequestLifetime> acquire_request_lifetime() const;
 
     ServeOptions options_;
-    std::unique_ptr<ninfer::Engine> engine_;
-    ninfer::PromptCapabilities prompt_capabilities_;
+    std::unique_ptr<sinfer::Engine> engine_;
+    sinfer::PromptCapabilities prompt_capabilities_;
     std::shared_ptr<RequestCapacity> request_capacity_;
 };
 
-} // namespace ninfer::serve
+} // namespace sinfer::serve

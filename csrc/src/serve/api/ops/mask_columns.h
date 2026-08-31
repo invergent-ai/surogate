@@ -17,7 +17,7 @@
 
 #include <cuda_runtime.h>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 /**
  * Op: mask_columns_zero
@@ -29,4 +29,4 @@ namespace ninfer::ops {
  */
 void mask_columns_zero(Tensor& matrix, const Tensor& valid_columns, cudaStream_t stream);
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

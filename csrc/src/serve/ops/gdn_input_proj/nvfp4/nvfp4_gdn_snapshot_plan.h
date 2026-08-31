@@ -9,7 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 enum class Nvfp4GdnConvScheduleId {
     DecodeFusedA16,
@@ -63,4 +63,4 @@ void nvfp4_gdn_snapshot_dispatch(const Tensor& x, const Weight& weight, const Te
                                  LinearPolicy policy, WorkspaceArena& workspace,
                                  cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

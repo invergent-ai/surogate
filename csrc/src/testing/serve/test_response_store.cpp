@@ -9,7 +9,7 @@
 
 namespace {
 
-using namespace ninfer::serve;
+using namespace sinfer::serve;
 
 int check(bool condition, const std::string& message) {
     if (condition) { return 0; }
@@ -17,7 +17,7 @@ int check(bool condition, const std::string& message) {
     return 1;
 }
 
-ChatTurn text_turn(ninfer::ChatRole role, std::string text) {
+ChatTurn text_turn(sinfer::ChatRole role, std::string text) {
     ChatTurn turn;
     turn.role = role;
     ContentPart part;
@@ -40,11 +40,11 @@ StoredResponse record(std::string id, ResponseContext context) {
 
 int test_context_dag() {
     const ResponseContext first =
-        append_response_context({}, {text_turn(ninfer::ChatRole::User, "one"),
-                                     text_turn(ninfer::ChatRole::Assistant, "a")});
+        append_response_context({}, {text_turn(sinfer::ChatRole::User, "one"),
+                                     text_turn(sinfer::ChatRole::Assistant, "a")});
     const ResponseContext second =
-        append_response_context(first, {text_turn(ninfer::ChatRole::User, "two"),
-                                        text_turn(ninfer::ChatRole::Assistant, "b")});
+        append_response_context(first, {text_turn(sinfer::ChatRole::User, "two"),
+                                        text_turn(sinfer::ChatRole::Assistant, "b")});
     const std::vector<ChatTurn> flattened = flatten_response_context(second);
     int failures                          = 0;
     failures += check(flattened.size() == 4, "context chain flattened all turns");
@@ -57,14 +57,14 @@ int test_context_dag() {
 int test_lru_and_delete() {
     ResponseStore store(2, 1ULL << 20);
     const ResponseContext root =
-        append_response_context({}, {text_turn(ninfer::ChatRole::User, "root")});
+        append_response_context({}, {text_turn(sinfer::ChatRole::User, "root")});
     store.put(record("resp_1", root));
     const ResponseContext child =
-        append_response_context(root, {text_turn(ninfer::ChatRole::Assistant, "child")});
+        append_response_context(root, {text_turn(sinfer::ChatRole::Assistant, "child")});
     store.put(record("resp_2", child));
     (void)store.get("resp_1"); // resp_2 becomes the least-recently used entry.
     store.put(record("resp_3",
-                     append_response_context(root, {text_turn(ninfer::ChatRole::User, "fork")})));
+                     append_response_context(root, {text_turn(sinfer::ChatRole::User, "fork")})));
 
     int failures = 0;
     failures += check(store.get("resp_1") != nullptr, "get refreshes LRU recency");
@@ -86,7 +86,7 @@ int test_oversized_record() {
     ResponseStore store(4, 256);
     StoredResponse large = record(
         "resp_large",
-        append_response_context({}, {text_turn(ninfer::ChatRole::User, std::string(1024, 'x'))}));
+        append_response_context({}, {text_turn(sinfer::ChatRole::User, std::string(1024, 'x'))}));
     std::string code;
     try {
         store.put(std::move(large));

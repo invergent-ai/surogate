@@ -8,7 +8,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace ninfer::targets::qwen3_5_0_8b::detail {
+namespace sinfer::targets::qwen3_5_0_8b::detail {
 
 using GraphExecutionProfile = qwen3_6::GraphExecutionProfile;
 
@@ -127,4 +127,4 @@ struct Variant {
                           std::uint32_t batch_size);
 };
 
-} // namespace ninfer::targets::qwen3_5_0_8b::detail
+} // namespace sinfer::targets::qwen3_5_0_8b::detail

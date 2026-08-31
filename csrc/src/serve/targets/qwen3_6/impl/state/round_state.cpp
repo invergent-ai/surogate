@@ -5,7 +5,7 @@
 #include <stdexcept>
 #include <type_traits>
 
-namespace ninfer::targets::qwen3_6 {
+namespace sinfer::targets::qwen3_6 {
 namespace {
 
 constexpr std::size_t kArenaAlign = 256;
@@ -391,4 +391,4 @@ RoundState::RoundState(DeviceSpan backing, const RoundStateLayout& layout) {
     }
 }
 
-} // namespace ninfer::targets::qwen3_6
+} // namespace sinfer::targets::qwen3_6

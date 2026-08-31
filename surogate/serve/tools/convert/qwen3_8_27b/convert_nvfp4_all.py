@@ -1,4 +1,4 @@
-"""Convert `sakamakismile/Qwen3.8-27B-MTP-NVFP4` into an all-NVFP4 `.ninfer` artifact.
+"""Convert `sakamakismile/Qwen3.8-27B-MTP-NVFP4` into an all-NVFP4 `.sinfer` artifact.
 
 One checkpoint supplies everything: every language linear as NVFP4 blocks, and
 the bf16 embedding, lm_head, MTP block and vision tower alongside them. The
@@ -30,7 +30,7 @@ from . import recipe_nvfp4 as mixed_recipe
 from . import recipe_nvfp4_all as recipe
 
 RECIPE_ID = "qwen3_8_27b-nvfp4-all-v1"
-OUTPUT_BASENAME = "qwen3_8_27b_nvfp4_all.ninfer"
+OUTPUT_BASENAME = "qwen3_8_27b_nvfp4_all.sinfer"
 
 _CONTROL_SUFFIX = "gdn/a_b_projection"
 
@@ -190,7 +190,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--resources-from",
         default=None,
-        help="take the frontend resources from this existing .ninfer instead of the checkpoint",
+        help="take the frontend resources from this existing .sinfer instead of the checkpoint",
     )
     args = parser.parse_args(argv)
     convert(args.model, args.out, device=args.device, resources_from=args.resources_from)

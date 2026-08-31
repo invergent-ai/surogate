@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 __global__ void set_i32_scalar_kernel(std::int32_t* destination, std::int32_t value) {
     destination[0] = value;
@@ -17,4 +17,4 @@ __global__ void increment_i32_scalar_kernel(std::int32_t* scalar) { ++scalar[0];
 
 __global__ void increment_i64_scalar_kernel(std::int64_t* scalar) { ++scalar[0]; }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

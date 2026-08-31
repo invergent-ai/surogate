@@ -12,7 +12,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 namespace {
 
 constexpr int kThreads    = 256;
@@ -293,4 +293,4 @@ void broadcast_streams(const Tensor& source, std::int32_t streams, Tensor& resid
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

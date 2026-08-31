@@ -15,10 +15,10 @@
 #include <optional>
 #include <string>
 
-namespace ninfer::serve {
+namespace sinfer::serve {
 
 inline constexpr int kRequestLogSchemaVersion        = 10;
-inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
+inline constexpr const char* kRequestLogArtifactType = "sinfer_serve_request_log";
 
 struct RequestLogContext {
     std::uint64_t id = 0;
@@ -35,9 +35,9 @@ struct RequestLogContext {
     bool enable_thinking                   = true;
     bool preserve_thinking                 = false;
     bool preserve_thinking_semantic_change = false;
-    ninfer::ResolvedSamplingParameters sampling;
+    sinfer::ResolvedSamplingParameters sampling;
     double acquisition_seconds = 0.0;
-    ninfer::PromptPreparationStats preparation;
+    sinfer::PromptPreparationStats preparation;
 };
 
 // A parsed generation request that failed during synchronous preparation. It intentionally has a
@@ -76,7 +76,7 @@ struct ThroughputReport {
     std::uint64_t committed_decode_tokens = 0;
     std::uint64_t decode_rounds           = 0;
     std::uint64_t decode_row_rounds       = 0;
-    ninfer::RuntimeStats scheduler;
+    sinfer::RuntimeStats scheduler;
 };
 
 RequestLogContext make_request_log_context(std::uint64_t id, std::string protocol,
@@ -98,10 +98,10 @@ std::string format_throughput(const ThroughputReport& report);
 // object without a trailing newline.
 std::string format_server_start_json(const std::string& server_instance_id,
                                      std::uint64_t timestamp_unix_ms, const ServeOptions& options,
-                                     const ninfer::ModelSamplingDefaults& sampling_defaults,
+                                     const sinfer::ModelSamplingDefaults& sampling_defaults,
                                      const std::string& public_model_id,
-                                     const ninfer::LoadSummary& load,
-                                     const ninfer::MemorySummary& memory,
+                                     const sinfer::LoadSummary& load,
+                                     const sinfer::MemorySummary& memory,
                                      const ServerLogEnvironment& environment,
                                      std::optional<std::uint64_t> artifact_size_bytes);
 std::string format_request_start_json(const std::string& server_instance_id,
@@ -139,9 +139,9 @@ public:
     }
 
     void write_server_start(const ServeOptions& options,
-                            const ninfer::ModelSamplingDefaults& sampling_defaults,
-                            const std::string& public_model_id, const ninfer::LoadSummary& load,
-                            const ninfer::MemorySummary& memory);
+                            const sinfer::ModelSamplingDefaults& sampling_defaults,
+                            const std::string& public_model_id, const sinfer::LoadSummary& load,
+                            const sinfer::MemorySummary& memory);
     void write_request_start(const RequestLogContext& context);
     void write_request_rejected(const RequestRejectionLogContext& context);
     void write_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);
@@ -158,4 +158,4 @@ private:
     bool failed_ = false;
 };
 
-} // namespace ninfer::serve
+} // namespace sinfer::serve

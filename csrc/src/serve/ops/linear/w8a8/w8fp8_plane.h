@@ -31,7 +31,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 struct W8Fp8Plane {
     const std::uint8_t* codes;  // [n, k] e4m3, row-major, 16B-aligned
@@ -68,4 +68,4 @@ struct W8Fp8QuantizedActivations {
 
 W8Fp8QuantizedActivations w8fp8_act_quant(const Tensor& x, void* workspace, cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

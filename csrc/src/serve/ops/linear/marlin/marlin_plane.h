@@ -17,7 +17,7 @@
 
 #include <cuda_runtime.h>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 struct MarlinPlane {
     const void* b_packed = nullptr;  // marlin B tiles (u32)
@@ -115,4 +115,4 @@ void marlin_fp8_close_adoption() noexcept;
 // no plane is available (caller falls back to its own kernels).
 bool marlin_w8_run(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

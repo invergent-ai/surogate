@@ -4,7 +4,7 @@
 
 #include <cuda_bf16.h>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 // Stable CUDA mechanics shared by semantically separate row-split and fused
 // kernels. Format and semantic-Op backends own their codecs, kernel bodies,
@@ -59,4 +59,4 @@ __device__ __forceinline__ int gemm_swz64(int row, int col) {
     return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

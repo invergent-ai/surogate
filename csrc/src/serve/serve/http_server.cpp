@@ -23,7 +23,7 @@
 #include <cstdlib>
 #include <sstream>
 
-namespace ninfer::serve {
+namespace sinfer::serve {
 namespace {
 
 struct StreamingRequest {
@@ -78,8 +78,8 @@ std::string sse_error_event(const ApiError& error) {
     return "data: " + make_error_body(error) + "\n\n";
 }
 
-ThroughputReport make_throughput_report(const ninfer::RuntimeStats& previous,
-                                        const ninfer::RuntimeStats& current,
+ThroughputReport make_throughput_report(const sinfer::RuntimeStats& previous,
+                                        const sinfer::RuntimeStats& current,
                                         double interval_seconds) {
     return ThroughputReport{
         .interval_seconds = interval_seconds,
@@ -173,8 +173,8 @@ void HttpServer::log_throughput(const ThroughputReport& report) {
     if (std::getenv("SUROGATE_SERVE_MEM_TRACE") != nullptr) {
         std::size_t free_bytes = 0, total_bytes = 0;
         cudaMemGetInfo(&free_bytes, &total_bytes);
-        const std::size_t derived = ninfer::ops::detail::w8_derived_plane_bytes();
-        const std::size_t marlin  = ninfer::ops::detail::marlin_plane_bytes();
+        const std::size_t derived = sinfer::ops::detail::w8_derived_plane_bytes();
+        const std::size_t marlin  = sinfer::ops::detail::marlin_plane_bytes();
         std::ostringstream trace;
         trace << "mem-trace derived-planes=" << (derived >> 20) << " MiB marlin-planes="
               << (marlin >> 20) << " MiB free=" << (free_bytes >> 20) << " MiB";
@@ -185,7 +185,7 @@ void HttpServer::log_throughput(const ThroughputReport& report) {
 
 void HttpServer::run_stats_reporter() {
     using Clock                     = std::chrono::steady_clock;
-    ninfer::RuntimeStats previous   = service_->runtime_stats();
+    sinfer::RuntimeStats previous   = service_->runtime_stats();
     Clock::time_point previous_time = Clock::now();
     const auto interval             = std::chrono::milliseconds(options_.log_stats_interval_ms);
 
@@ -195,7 +195,7 @@ void HttpServer::run_stats_reporter() {
             if (stats_cv_.wait_for(lock, interval, [this] { return stats_stopping_; })) { break; }
         }
 
-        const ninfer::RuntimeStats current = service_->runtime_stats();
+        const sinfer::RuntimeStats current = service_->runtime_stats();
         const Clock::time_point now        = Clock::now();
         const ThroughputReport report      = make_throughput_report(
             previous, current, std::chrono::duration<double>(now - previous_time).count());
@@ -204,7 +204,7 @@ void HttpServer::run_stats_reporter() {
         previous_time = now;
     }
 
-    const ninfer::RuntimeStats current = service_->runtime_stats();
+    const sinfer::RuntimeStats current = service_->runtime_stats();
     const Clock::time_point now        = Clock::now();
     const ThroughputReport tail        = make_throughput_report(
         previous, current, std::chrono::duration<double>(now - previous_time).count());
@@ -791,7 +791,7 @@ void HttpServer::attach(GenerationService& service) {
     if (service_ != nullptr) {
         throw std::logic_error("HTTP generation service is already attached");
     }
-    const ninfer::LoadSummary load = service.load_summary();
+    const sinfer::LoadSummary load = service.load_summary();
     public_model_id_               = resolve_public_model_id(options_, load.model_id);
     service_                       = &service;
     request_jsonl_.write_server_start(options_, service.sampling_defaults(), public_model_id_, load,
@@ -819,4 +819,4 @@ bool HttpServer::listen() {
 
 void HttpServer::stop() { server_.stop(); }
 
-} // namespace ninfer::serve
+} // namespace sinfer::serve

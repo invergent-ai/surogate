@@ -3,7 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer {
+namespace sinfer {
 
 enum class DType : std::uint8_t {
     BF16       = 0,
@@ -18,4 +18,4 @@ enum class DType : std::uint8_t {
 
 std::size_t dtype_size(DType dtype);
 
-} // namespace ninfer
+} // namespace sinfer

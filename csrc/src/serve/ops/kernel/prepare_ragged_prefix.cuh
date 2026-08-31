@@ -4,7 +4,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 __global__ void prepare_ragged_prefix_kernel(
     const uint4* __restrict__ source, const std::int32_t* __restrict__ lanes,
@@ -31,4 +31,4 @@ __global__ void prepare_ragged_prefix_kernel(
     }
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

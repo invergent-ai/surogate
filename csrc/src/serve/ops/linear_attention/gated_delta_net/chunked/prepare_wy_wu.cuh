@@ -13,17 +13,17 @@
 // H_v=32 uses 4 warps and 23.75 KiB (4 CTAs/SM). Both retain a 16 KiB FP32
 // T_inv and 0.75 KiB of controls.
 
-namespace ninfer::ops::detail::gated_delta_net::chunked::prepare_wy_wu {
+namespace sinfer::ops::detail::gated_delta_net::chunked::prepare_wy_wu {
 
-using ninfer::ops::mma_tf32;
-using ninfer::ops::Cache;
-using ninfer::ops::cp_async;
-using ninfer::ops::cp_commit;
-using ninfer::ops::cp_wait;
-using ninfer::ops::ldmatrix_x2;
-using ninfer::ops::ldmatrix_x4;
-using ninfer::ops::mma_bf16;
-using ninfer::ops::smem_addr;
+using sinfer::ops::mma_tf32;
+using sinfer::ops::Cache;
+using sinfer::ops::cp_async;
+using sinfer::ops::cp_commit;
+using sinfer::ops::cp_wait;
+using sinfer::ops::ldmatrix_x2;
+using sinfer::ops::ldmatrix_x4;
+using sinfer::ops::mma_bf16;
+using sinfer::ops::smem_addr;
 
 static_assert(kChunkSize == 64, "stage_prepare_wy_wu: kChunkSize must be 64 (kernel hard-codes "
                                 "BT=64 = 4 * BC=16)");
@@ -327,7 +327,7 @@ compute_store_wu_panel(SmemTile<BT> T_view, SmemTile<WU_PANEL_COLS> panel,
     constexpr int STORE_PER_ROW  = WARP_PANEL_COLS / STORE_ELEMS;
     constexpr int STORE_PER_WARP = MMA_M * STORE_PER_ROW;
 #pragma unroll
-    for (int v = lane; v < STORE_PER_WARP; v += ninfer::ops::kWarpSize) {
+    for (int v = lane; v < STORE_PER_WARP; v += sinfer::ops::kWarpSize) {
         const int row  = v / STORE_PER_ROW;
         const int col8 = (v - row * STORE_PER_ROW) * STORE_ELEMS;
         uint4 packed =
@@ -361,7 +361,7 @@ prepare_wy_wu_kernel(const __nv_bfloat16* __restrict__ k_in, const __nv_bfloat16
     static_assert(WU_PANEL_COLS % (BLOCK_WARPS / N_SUB) == 0);
 
     using dims                  = kernel_dims<K_PANEL_COLS, WU_PANEL_COLS>;
-    constexpr int BLOCK_THREADS = BLOCK_WARPS * ninfer::ops::kWarpSize;
+    constexpr int BLOCK_THREADS = BLOCK_WARPS * sinfer::ops::kWarpSize;
     constexpr int N_K_PANELS    = dims::N_K_PANELS;
     constexpr int N_WU_PANELS   = dims::N_WU_PANELS;
 
@@ -425,7 +425,7 @@ prepare_wy_wu_kernel(const __nv_bfloat16* __restrict__ k_in, const __nv_bfloat16
         // Hillis-Steele inclusive scan over per-lane partials (a + bv).
         float partial = a + bv;
 #pragma unroll
-        for (int o = 1; o < ninfer::ops::kWarpSize; o <<= 1) {
+        for (int o = 1; o < sinfer::ops::kWarpSize; o <<= 1) {
             const float n = __shfl_up_sync(0xffffffffu, partial, o);
             if (lane >= o) partial += n;
         }
@@ -520,10 +520,10 @@ prepare_wy_wu_kernel(const __nv_bfloat16* __restrict__ k_in, const __nv_bfloat16
         // panel in output_smem; scaling remains FP32 after T_inv is ready.
         if constexpr (BLOCK_WARPS == 8) {
             if (kp == 0 && warp >= WY_WARPS) {
-                constexpr int HELPER_THREADS = (BLOCK_WARPS - WY_WARPS) * ninfer::ops::kWarpSize;
+                constexpr int HELPER_THREADS = (BLOCK_WARPS - WY_WARPS) * sinfer::ops::kWarpSize;
                 constexpr int VECS_PER_ROW   = WU_PANEL_COLS / 8;
                 constexpr int N_VECS         = BT * VECS_PER_ROW;
-                const int helper_tid         = tid - WY_WARPS * ninfer::ops::kWarpSize;
+                const int helper_tid         = tid - WY_WARPS * sinfer::ops::kWarpSize;
                 Bf16SmemTile<WU_PANEL_COLS> preload{output_smem};
 #pragma unroll
                 for (int v = helper_tid; v < N_VECS; v += HELPER_THREADS) {
@@ -721,4 +721,4 @@ prepare_wy_wu_kernel(const __nv_bfloat16* __restrict__ k_in, const __nv_bfloat16
     }
 }
 
-} // namespace ninfer::ops::detail::gated_delta_net::chunked::prepare_wy_wu
+} // namespace sinfer::ops::detail::gated_delta_net::chunked::prepare_wy_wu

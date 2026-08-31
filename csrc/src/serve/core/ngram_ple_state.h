@@ -7,7 +7,7 @@
 
 #include <cstdint>
 
-namespace ninfer {
+namespace sinfer {
 
 /**
  * Per-slot state of an n-gram PLE layer: the token history the hash needs for the first
@@ -47,4 +47,4 @@ struct NgramPleStatePool {
     void reset_slot(std::int32_t slot, cudaStream_t stream = nullptr);
 };
 
-} // namespace ninfer
+} // namespace sinfer

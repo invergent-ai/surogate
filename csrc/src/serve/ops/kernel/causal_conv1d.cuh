@@ -1,6 +1,6 @@
 #pragma once
 
-// ninfer::ops - causal_conv1d kernel: depthwise causal k=4 with fused SiLU.
+// sinfer::ops - causal_conv1d kernel: depthwise causal k=4 with fused SiLU.
 // SiLU is computed as x / (1 + exp(-x)) in fp32, with no polynomial approximation.
 
 #include "ops/common/math.cuh"
@@ -10,7 +10,7 @@
 #include <cmath>
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 __device__ __forceinline__ void causal_conv1d_acc_pair(__nv_bfloat162 w, __nv_bfloat162 x,
                                                        float& acc0, float& acc1) {
@@ -539,4 +539,4 @@ __global__ void causal_conv1d_batched_snapshot_smallt_kernel(
     }
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

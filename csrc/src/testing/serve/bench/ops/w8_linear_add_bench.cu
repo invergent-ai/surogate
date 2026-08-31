@@ -4,7 +4,7 @@
 #include "api/ops/residual_add.h"
 
 #include "core/device.h"
-#include "ninfer_bench_common.h"
+#include "sinfer_bench_common.h"
 #include "quantized_weight.cuh"
 #include "ops/linear_add/w8/w8_linear_add_kernels.h"
 #include "ops/linear_add/w8/w8_linear_add_plan.h"
@@ -23,7 +23,7 @@
 #include <string_view>
 #include <vector>
 
-using namespace ninfer;
+using namespace sinfer;
 
 namespace {
 
@@ -152,10 +152,10 @@ int main(int argc, char** argv) {
 
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-        ninfer::DeviceBuffer flush(kFlushBytes);
-        ninfer::DeviceBuffer input =
+        sinfer::DeviceBuffer flush(kFlushBytes);
+        sinfer::DeviceBuffer input =
             bench::make_bf16(static_cast<std::size_t>(options.hidden) * max_t);
-        ninfer::DeviceBuffer residual = bench::make_bf16(static_cast<std::size_t>(kRows) * max_t);
+        sinfer::DeviceBuffer residual = bench::make_bf16(static_cast<std::size_t>(kRows) * max_t);
         bench::PackedQuantizedWeight packed = bench::make_row_split_weight(
             QType::W8G32_F16S, kRows, options.hidden, options.hidden, {0x31, 0x00, 0x3c00});
         const std::size_t workspace_capacity = ops::linear_add_workspace_capacity_bytes(
@@ -251,7 +251,7 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "ninfer_w8_linear_add_bench: %s\n", error.what());
+        std::fprintf(stderr, "sinfer_w8_linear_add_bench: %s\n", error.what());
         return 1;
     }
 }

@@ -1,11 +1,11 @@
-"""Convert Qwen3.6-35B-A3B BF16 weights into its exact NInfer artifact.
+"""Convert Qwen3.6-35B-A3B BF16 weights into its exact SInfer artifact.
 
 Canonical invocation::
 
     python -m tools.convert.qwen3_6_35b_a3b.convert \
       --model /home/neroued/models/llm/qwen/Qwen3.6-35B-A3B/base-hf-bf16 \
       --dflash-model /home/neroued/models/llm/qwen/Qwen3.6-35B-A3B/dflash-bf16 \
-      --out out/qwen3_6_35b_a3b.ninfer
+      --out out/qwen3_6_35b_a3b.sinfer
 
 The target deliberately reuses the measured 27B ranking because both checkpoints
 have the same semantic token-id vocabulary.  Draft rows are always gathered from

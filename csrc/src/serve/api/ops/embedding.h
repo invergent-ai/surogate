@@ -4,7 +4,7 @@
 
 #include <cuda_runtime.h>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 /**
  * Gathers one embedding row per token:
@@ -24,4 +24,4 @@ namespace ninfer::ops {
  */
 void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream);
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

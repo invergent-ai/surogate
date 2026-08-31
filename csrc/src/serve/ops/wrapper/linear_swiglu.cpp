@@ -16,7 +16,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 namespace {
 
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
@@ -261,4 +261,4 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, W
     linear_swiglu(x, gate_up_weight, out, LinearPolicy::A16Only, ws, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

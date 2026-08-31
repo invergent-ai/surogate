@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 enum class Nvfp4AttnInputRoute : std::uint8_t {
@@ -98,4 +98,4 @@ void nvfp4_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q,
     nvfp4_attn_input_w4a4_launch(x, weight, q, gate, k, v, scratch, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

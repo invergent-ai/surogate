@@ -1,6 +1,6 @@
 #pragma once
 
-// Implements: include/ninfer/ops/gelu.h
+// Implements: include/sinfer/ops/gelu.h
 // Match: contiguous BF16 storage. Exact-erf and tanh formulas share aligned
 // BF16x8/BF16x2/scalar storage routes but remain separate compile-time math.
 
@@ -11,7 +11,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 inline constexpr int kGeluPairsPerThread = 4;
 
@@ -71,4 +71,4 @@ __global__ void gelu_kernel(__nv_bfloat16* x, std::int64_t n) {
     }
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

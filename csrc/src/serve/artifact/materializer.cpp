@@ -12,7 +12,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::artifact {
+namespace sinfer::artifact {
 namespace {
 
 constexpr std::size_t kSlotBytes        = 64ULL * 1024ULL * 1024ULL;
@@ -255,4 +255,4 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     return out;
 }
 
-} // namespace ninfer::artifact
+} // namespace sinfer::artifact

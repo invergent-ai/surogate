@@ -2,7 +2,7 @@
 
 #include "api/ops/speculative_round.h"
 
-#include "ninfer_bench_common.h"
+#include "sinfer_bench_common.h"
 
 #include <cuda_runtime.h>
 
@@ -14,8 +14,8 @@
 #include <string_view>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::bench;
+using namespace sinfer;
+using namespace sinfer::bench;
 
 namespace {
 
@@ -70,12 +70,12 @@ int main(int argc, char** argv) {
             }
             token_counts = {tokens};
         } else if (argc != 1) {
-            throw std::invalid_argument("usage: ninfer_proposal_remap_bench [--tokens T]");
+            throw std::invalid_argument("usage: sinfer_proposal_remap_bench [--tokens T]");
         }
         for (const int tokens : token_counts) { run(tokens); }
         return 0;
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "ninfer_proposal_remap_bench: %s\n", error.what());
+        std::fprintf(stderr, "sinfer_proposal_remap_bench: %s\n", error.what());
         return 2;
     }
 }

@@ -10,7 +10,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::targets::qwen3_6::frontend_internal {
+namespace sinfer::targets::qwen3_6::frontend_internal {
 
 struct ToolCall {
     std::string id;
@@ -108,4 +108,4 @@ private:
     ChatTemplateSemantics semantics_;
 };
 
-} // namespace ninfer::targets::qwen3_6::frontend_internal
+} // namespace sinfer::targets::qwen3_6::frontend_internal

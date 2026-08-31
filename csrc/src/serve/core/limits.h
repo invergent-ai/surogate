@@ -12,8 +12,8 @@
 
 #include <cstdint>
 
-namespace ninfer {
+namespace sinfer {
 
 inline constexpr std::int32_t kMaximumBatchColumns = 128;
 
-} // namespace ninfer
+} // namespace sinfer

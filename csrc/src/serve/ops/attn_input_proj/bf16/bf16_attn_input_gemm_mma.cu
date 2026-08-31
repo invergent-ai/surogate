@@ -10,7 +10,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 struct Bf16AttentionInputMmaOutput {
@@ -55,7 +55,7 @@ void launch_variant(const Tensor& x, const Weight& weight, Tensor& q, Tensor& ga
     };
 
     if constexpr (Schedule::kSharedBytes > 48 * 1024) {
-        CUDA_CHECK(::ninfer::ops::set_func_attribute_per_device(
+        CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(
             bf16_gemm_mma_kernel<Geometry, Schedule, FullTokens, Bf16AttentionInputMmaOutput>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, Schedule::kSharedBytes));
     }
@@ -79,4 +79,4 @@ void bf16_attn_input_mma_launch(const Tensor& x, const Weight& weight, Tensor& q
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

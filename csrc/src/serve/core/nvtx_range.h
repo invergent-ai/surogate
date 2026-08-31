@@ -5,7 +5,7 @@
 #include <string>
 #include <utility>
 
-namespace ninfer {
+namespace sinfer {
 
 class NvtxRange {
 public:
@@ -24,4 +24,4 @@ private:
     std::string name_;
 };
 
-} // namespace ninfer
+} // namespace sinfer

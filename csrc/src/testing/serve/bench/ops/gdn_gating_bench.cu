@@ -2,16 +2,16 @@
 // shape ([48,T]). This binary is the ncu/nsys target; the GB/s it prints is
 // informational only -- the gate is ncu sustained DRAM % (see
 // docs/op-development.md §8).
-//   ./ninfer_gdn_gating_bench [--decode] [--prefill]   (default: both)
+//   ./sinfer_gdn_gating_bench [--decode] [--prefill]   (default: both)
 #include "api/ops/gdn_gating.h"
-#include "ninfer_bench_common.h"
+#include "sinfer_bench_common.h"
 
 #include <cstdint>
 #include <cstring>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::bench;
+using namespace sinfer;
+using namespace sinfer::bench;
 
 static DeviceBuffer make_f32(std::size_t n, std::uint32_t seed) {
     std::vector<float> h(n);

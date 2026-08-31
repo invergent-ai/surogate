@@ -4,7 +4,7 @@
 
 #include <cuda_runtime.h>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 using W8Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
@@ -42,4 +42,4 @@ void launch_w8_exact_mma_r64_c128(const Tensor&, const Weight&, Tensor&, cudaStr
 void launch_w8_exact_mma_r96_c96(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void launch_w8_exact_mma_r128_c80(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

@@ -7,7 +7,7 @@
 // without that architecture the routed-NVFP4 profile has no kernel at all, so every entry point
 // but `available()` says so rather than returning a wrong answer.
 
-namespace ninfer::ops::detail::trtllm_moe {
+namespace sinfer::ops::detail::trtllm_moe {
 namespace {
 
 [[noreturn]] void unavailable() {
@@ -33,4 +33,4 @@ void run(const Geometry&, const __nv_bfloat16*, std::int32_t, const std::int32_t
     unavailable();
 }
 
-} // namespace ninfer::ops::detail::trtllm_moe
+} // namespace sinfer::ops::detail::trtllm_moe

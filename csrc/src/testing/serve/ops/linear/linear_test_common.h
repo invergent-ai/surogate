@@ -8,7 +8,7 @@
 #include <string_view>
 #include <vector>
 
-namespace ninfer::test::linear {
+namespace sinfer::test::linear {
 
 enum class ActivationCompute : std::uint8_t {
     A16,
@@ -64,4 +64,4 @@ bool cuda_available();
 int run_shape(std::string_view label, ActivationCompute activation_compute,
               WeightGenerator generator, const ShapeCase& shape);
 
-} // namespace ninfer::test::linear
+} // namespace sinfer::test::linear

@@ -1,4 +1,4 @@
-// ninfer::ops - sample wrapper: public api validation and dispatch.
+// sinfer::ops - sample wrapper: public api validation and dispatch.
 #include "api/ops/sampling.h"
 
 #include "ops/common/sampling_workspace.h"
@@ -7,7 +7,7 @@
 #include <algorithm>
 #include <stdexcept>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 std::size_t sampling_workspace_capacity_bytes(std::int32_t token_domain, std::int32_t min_lanes,
                                               std::int32_t max_lanes) {
@@ -59,4 +59,4 @@ void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
                                 scratch, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

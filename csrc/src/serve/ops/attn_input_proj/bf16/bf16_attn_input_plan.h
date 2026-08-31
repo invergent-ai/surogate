@@ -6,7 +6,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 // The Attention epilogue has its own measured crossover. The wider candidate domain remains
 // benchmark-callable so the production boundary is not conflated with template availability.
@@ -24,4 +24,4 @@ void bf16_attn_input_mma_launch(const Tensor& x, const Weight& weight, Tensor& q
 void bf16_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                               Tensor& k, Tensor& v, cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

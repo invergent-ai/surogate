@@ -10,7 +10,7 @@
 #include <sstream>
 #include <string>
 
-namespace ninfer::product {
+namespace sinfer::product {
 namespace {
 
 std::string format_seconds(double seconds) {
@@ -143,4 +143,4 @@ void LoadProgressRenderer::render(std::uint64_t done, std::uint64_t total, Clock
     output_->flush();
 }
 
-} // namespace ninfer::product
+} // namespace sinfer::product

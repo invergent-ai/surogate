@@ -517,7 +517,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
 
 // --- surogate serve entry points -------------------------------------------------------
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 namespace {
 constexpr int kMarlinTileK = 16;
@@ -583,4 +583,4 @@ bool marlin_moe_route_enabled() {
     return enabled;
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

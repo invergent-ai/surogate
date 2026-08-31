@@ -7,7 +7,7 @@
 #include "core/tensor.h"
 #include "ops/linear/w8a8/w8a8_act_quant.h"
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 void w8a8_gemm_split2(const Tensor& x, const Weight& weight, Tensor& first, Tensor& second,
                       WorkspaceArena& workspace, cudaStream_t stream);
@@ -18,4 +18,4 @@ void w8a8_gemm_split4(const Tensor& x, const Weight& weight, Tensor& query, Tens
 void w8a8_gemm_residual(const Tensor& x, const Weight& weight, Tensor& residual_out,
                         WorkspaceArena& workspace, cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

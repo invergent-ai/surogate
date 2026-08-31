@@ -19,7 +19,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 namespace {
 
 void require_tensor(const Tensor& t, DType dtype, std::int32_t n0, std::int32_t columns,
@@ -332,4 +332,4 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
     throw std::invalid_argument("linear_add: unsupported weight format");
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

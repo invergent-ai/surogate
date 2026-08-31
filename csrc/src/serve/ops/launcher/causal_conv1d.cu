@@ -1,4 +1,4 @@
-// ninfer::ops - causal_conv1d launcher: grid/block/stream configuration + kernel launch.
+// sinfer::ops - causal_conv1d launcher: grid/block/stream configuration + kernel launch.
 #include "ops/launcher/causal_conv1d.h"
 
 #include "ops/common/math.h"
@@ -11,7 +11,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 int grid_for(std::int64_t n, int block, const char* label) {
@@ -243,4 +243,4 @@ void causal_conv1d_snapshot_launch(const Tensor& x, const Tensor& weight, Tensor
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

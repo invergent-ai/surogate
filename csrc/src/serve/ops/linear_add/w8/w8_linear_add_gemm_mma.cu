@@ -6,7 +6,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 template <class Schedule, bool Full>
@@ -163,4 +163,4 @@ void w8_linear_add_mma_r128_c80_launch(bool full, const Tensor& x, const Weight&
     launch_variant<Schedule>(full, x, w, residual_out, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

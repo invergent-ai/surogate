@@ -9,7 +9,7 @@
 #include <type_traits>
 #include <utility>
 
-namespace ninfer {
+namespace sinfer {
 
 // Process-local bounded FIFO for ordinary host work. Callers own task semantics, cancellation,
 // and result lifetime; this primitive owns only threads and queue backpressure.
@@ -49,4 +49,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace ninfer
+} // namespace sinfer

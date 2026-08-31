@@ -8,7 +8,7 @@
 #include <cstdint>
 #include <new>
 
-namespace ninfer::ops::detail::gated_delta_net {
+namespace sinfer::ops::detail::gated_delta_net {
 std::size_t chunked_workspace_bytes(std::int32_t value_heads, std::int32_t tokens) {
     if (tokens <= 0) { return 0; }
     return chunked::workspace_bytes(value_heads, tokens);
@@ -72,4 +72,4 @@ void launch_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const Ten
     CUDA_CHECK(chunked::launch_output(output));
 }
 
-} // namespace ninfer::ops::detail::gated_delta_net
+} // namespace sinfer::ops::detail::gated_delta_net

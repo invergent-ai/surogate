@@ -9,19 +9,19 @@
 namespace {
 
 std::filesystem::path artifact_path() {
-    if (const char* env = std::getenv("NINFER_QWEN3_6_35B_A3B_WEIGHTS");
+    if (const char* env = std::getenv("SINFER_QWEN3_6_35B_A3B_WEIGHTS");
         env != nullptr && *env != '\0') {
         return env;
     }
-    return std::filesystem::path(NINFER_SOURCE_DIR) / "out/qwen3_6_35b_a3b.ninfer";
+    return std::filesystem::path(SINFER_SOURCE_DIR) / "out/qwen3_6_35b_a3b.sinfer";
 }
 
-ninfer::targets::qwen3_6::StartupFeatures load_features(bool dflash) {
+sinfer::targets::qwen3_6::StartupFeatures load_features(bool dflash) {
     return {
         .vision = !dflash,
         .speculative =
-            dflash ? ninfer::SpeculativeBackend::DFlash : ninfer::SpeculativeBackend::Mtp,
-        .proposal_head = ninfer::ProposalHead::Optimized,
+            dflash ? sinfer::SpeculativeBackend::DFlash : sinfer::SpeculativeBackend::Mtp,
+        .proposal_head = sinfer::ProposalHead::Optimized,
     };
 }
 
@@ -34,11 +34,11 @@ int main() {
         return 77;
     }
 
-    ninfer::artifact::Reader reader(path);
+    sinfer::artifact::Reader reader(path);
     {
-        ninfer::artifact::Binder binder(reader);
+        sinfer::artifact::Binder binder(reader);
         const auto plan =
-            ninfer::targets::qwen3_6_35b_a3b::detail::bind_artifact(binder, load_features(false));
+            sinfer::targets::qwen3_6_35b_a3b::detail::bind_artifact(binder, load_features(false));
         if (plan.materialization.object_count != 940 ||
             plan.materialization.device_objects.size() != 883 ||
             plan.materialization.host_objects.size() != 6 ||
@@ -50,9 +50,9 @@ int main() {
         }
     }
     {
-        ninfer::artifact::Binder binder(reader);
+        sinfer::artifact::Binder binder(reader);
         const auto plan =
-            ninfer::targets::qwen3_6_35b_a3b::detail::bind_artifact(binder, load_features(true));
+            sinfer::targets::qwen3_6_35b_a3b::detail::bind_artifact(binder, load_features(true));
         if (plan.materialization.object_count != 940 ||
             plan.materialization.device_objects.size() != 586 ||
             plan.materialization.host_objects.size() != 6 ||

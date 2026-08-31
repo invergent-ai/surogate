@@ -11,7 +11,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail::gated_delta_net {
+namespace sinfer::ops::detail::gated_delta_net {
 
 struct alignas(8) GdnReplayFoldKernelRow {
     std::int32_t linear_state_slot;
@@ -61,4 +61,4 @@ void launch_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const Ten
                     Tensor& ssm_state_out, Tensor& out, void* workspace,
                     std::size_t workspace_bytes, cudaStream_t stream);
 
-} // namespace ninfer::ops::detail::gated_delta_net
+} // namespace sinfer::ops::detail::gated_delta_net

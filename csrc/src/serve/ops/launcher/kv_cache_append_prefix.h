@@ -2,7 +2,7 @@
 
 #include "api/ops/kv_cache_append_prefix.h"
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 struct KVCacheAppendPrefixPlan {
     std::int32_t tokens;
@@ -23,4 +23,4 @@ void kv_cache_append_prefix_launch(const Tensor& k, const Tensor& v, const Tenso
                                    CyclicKVCacheLayerView cache,
                                    const KVCacheAppendPrefixPlan& plan, cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

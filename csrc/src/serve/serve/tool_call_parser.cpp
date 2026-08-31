@@ -10,7 +10,7 @@
 #include <stdexcept>
 #include <string_view>
 
-namespace ninfer::serve {
+namespace sinfer::serve {
 namespace {
 
 using Json = nlohmann::json;
@@ -208,4 +208,4 @@ std::string ToolCallStreamFilter::finish(bool is_tool_call_response) {
     return tail;
 }
 
-} // namespace ninfer::serve
+} // namespace sinfer::serve

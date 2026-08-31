@@ -18,7 +18,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 namespace {
 
 constexpr std::size_t kAlign        = 256;
@@ -713,4 +713,4 @@ SparseMoeWeights expert_slot_weights(const ExpertSlotPool& pool,
     return out;
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

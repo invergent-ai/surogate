@@ -19,7 +19,7 @@
 
 #include <cuda_runtime.h>
 
-namespace ninfer::targets::qwen3_6::detail {
+namespace sinfer::targets::qwen3_6::detail {
 
 /// Width of the residual planes: `Config::residual` when the target declares one, else hidden.
 template <class Config>
@@ -164,4 +164,4 @@ struct ResidualHooks {
     }
 };
 
-} // namespace ninfer::targets::qwen3_6::detail
+} // namespace sinfer::targets::qwen3_6::detail

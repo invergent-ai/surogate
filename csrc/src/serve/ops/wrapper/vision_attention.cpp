@@ -9,7 +9,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 namespace {
 
 // Either tower: 72 (Qwen3.6 family, Flash-Next) or 64 (Qwen3.5).
@@ -107,4 +107,4 @@ void vision_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     detail::vision_attention_uniform_launch(q, k, v, segment_length, out, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

@@ -4,7 +4,7 @@
 
 #include <cuda_runtime.h> // cudaStream_t
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 /**
  * Applies split-half NeoX RoPE in place. For pair i in [0,rotary_dim/2), angle phi(i,t), and
@@ -40,4 +40,4 @@ void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tenso
 // from x; Q versus K role does not change the transformation.
 void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& x, cudaStream_t stream);
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

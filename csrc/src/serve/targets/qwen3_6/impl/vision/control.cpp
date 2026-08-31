@@ -7,7 +7,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::targets::qwen3_6 {
+namespace sinfer::targets::qwen3_6 {
 namespace {
 
 constexpr std::int32_t kMerge        = 2;
@@ -160,4 +160,4 @@ VisionControl build_vision_control(const PreparedPromptData& prompt) {
     return out;
 }
 
-} // namespace ninfer::targets::qwen3_6
+} // namespace sinfer::targets::qwen3_6

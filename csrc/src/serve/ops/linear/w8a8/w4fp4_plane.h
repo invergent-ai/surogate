@@ -24,7 +24,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 enum class PrefillQuantMode : std::uint8_t {
     Fp8,  // derived e4m3 plane (PATCHES #20) — default
@@ -81,4 +81,4 @@ const float* w4fp4_alpha_one();
                                                         std::int32_t max_tokens,
                                                         bool with_stage_buffer) noexcept;
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

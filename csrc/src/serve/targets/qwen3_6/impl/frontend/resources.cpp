@@ -6,7 +6,7 @@
 #include <cstddef>
 #include <string>
 
-namespace ninfer::targets::qwen3_6 {
+namespace sinfer::targets::qwen3_6 {
 namespace {
 
 std::string take_string(artifact::MaterializedArtifact& materialized,
@@ -45,4 +45,4 @@ FrontendResources take_frontend_resources(artifact::MaterializedArtifact& materi
     };
 }
 
-} // namespace ninfer::targets::qwen3_6
+} // namespace sinfer::targets::qwen3_6

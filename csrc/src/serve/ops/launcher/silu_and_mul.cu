@@ -1,4 +1,4 @@
-// ninfer::ops — silu_mul launcher: grid/block/stream configuration + kernel launch.
+// sinfer::ops — silu_mul launcher: grid/block/stream configuration + kernel launch.
 // The only translation unit that includes this op's kernel header.
 // See docs/op-development.md §2.
 #include "ops/launcher/silu_and_mul.h"
@@ -11,7 +11,7 @@
 #include <algorithm>
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 bool can_use_dim0_split_fast_path(const Tensor& gate, const Tensor& up, const Tensor& out) {
@@ -91,4 +91,4 @@ void silu_and_mul_launch(const Tensor& gate, const Tensor& up, Tensor& out, cuda
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

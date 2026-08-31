@@ -12,7 +12,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 // surogate vendor patch (PATCHES.md #13): geometry is templated so the
@@ -218,4 +218,4 @@ void w8_linear_swiglu_decode_pair_r16_launch(const Tensor& x, const Weight& w, T
     launch_decode<16>(x, w, out, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

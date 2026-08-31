@@ -10,7 +10,7 @@
 #include <type_traits>
 #include <utility>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 constexpr int kIntermediate = 6144;
@@ -119,4 +119,4 @@ void w8_linear_swiglu_splitk_exact_t_launch(const Tensor& x, const Weight& w, Te
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

@@ -1,4 +1,4 @@
-"""Minimal reader and streaming writer for the NInfer v2 object directory."""
+"""Minimal reader and streaming writer for the SInfer v2 object directory."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from typing import Iterable, Iterator, Sequence, TypeAlias
 from .layouts import align_up, encoded_size, get_layout
 
 
-MAGIC = b"NINFER\x00\x02"
+MAGIC = b"SINFER\x00\x02"
 _V1_MAGIC = b"NINFER\x00\x01"
 PREFIX = struct.Struct("<8sQ")
 PREFIX_BYTES = PREFIX.size
@@ -28,7 +28,7 @@ _RESOURCE_MEMBERS = frozenset({"name", "kind", "encoding", "offset", "bytes"})
 
 
 class ArtifactError(ValueError):
-    """The file does not satisfy the NInfer v2 directory contract."""
+    """The file does not satisfy the SInfer v2 directory contract."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -290,7 +290,7 @@ def _validate_ranges(
 
 
 class Artifact:
-    """Mmap-backed, structurally validated `.ninfer` artifact."""
+    """Mmap-backed, structurally validated `.sinfer` artifact."""
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
@@ -306,11 +306,11 @@ class Artifact:
             magic, json_bytes = PREFIX.unpack(prefix)
             if magic == _V1_MAGIC:
                 raise ArtifactError(
-                    "NInfer artifact v1 is no longer supported; migrate it with: "
+                    "SInfer artifact v1 is no longer supported; migrate it with: "
                     "python3 -m tools.artifact.migrate_v1_to_v2 <artifact>"
                 )
             if magic != MAGIC:
-                raise ArtifactError("artifact magic is not NInfer v2")
+                raise ArtifactError("artifact magic is not SInfer v2")
             if json_bytes == 0:
                 raise ArtifactError("json_bytes must be positive")
             metadata_end = PREFIX_BYTES + json_bytes

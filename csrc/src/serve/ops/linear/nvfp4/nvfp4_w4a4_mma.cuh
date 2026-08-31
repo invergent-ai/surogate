@@ -10,7 +10,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 template <int BlockM, int BlockN, int BlockK, int WarpsM, int WarpsN, int Stages,
           int MinBlocksPerSm>
@@ -422,4 +422,4 @@ __global__ __launch_bounds__(Threads, 512 / Threads) void nvfp4_w4a4_quantize_ke
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

@@ -4,7 +4,7 @@
 
 #include <cuda_runtime.h>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 /**
  * Adds one bias value to every element whose fastest-dimension index is the same:
@@ -20,4 +20,4 @@ namespace ninfer::ops {
  */
 void add_bias(const Tensor& bias, Tensor& x, cudaStream_t stream);
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

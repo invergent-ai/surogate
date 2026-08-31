@@ -15,7 +15,7 @@
 #include <string>
 #include <thread>
 
-namespace ninfer::serve {
+namespace sinfer::serve {
 
 // cpp-httplib invokes the error handler for every application response with status >= 400. Only
 // an empty 413 is its own pre-routing payload-limit rejection; application-authored errors must be
@@ -75,4 +75,4 @@ private:
     bool stats_stopping_ = false;
 };
 
-} // namespace ninfer::serve
+} // namespace sinfer::serve

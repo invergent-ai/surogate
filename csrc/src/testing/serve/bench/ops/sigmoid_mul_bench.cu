@@ -1,5 +1,5 @@
 #include "api/ops/sigmoid_mul.h"
-#include "ninfer_bench_common.h"
+#include "sinfer_bench_common.h"
 #include "ops/launcher/sigmoid_gate_mul.h"
 
 #include <cuda_runtime.h>
@@ -13,8 +13,8 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::bench;
+using namespace sinfer;
+using namespace sinfer::bench;
 
 namespace {
 

@@ -11,17 +11,17 @@
 namespace {
 
 struct PlannedState {
-    ninfer::LinearAttentionStatePoolLayout layout;
+    sinfer::LinearAttentionStatePoolLayout layout;
     std::size_t bytes = 0;
 };
 
 PlannedState plan_state(std::uint32_t layers, std::int32_t conv_channels, std::int32_t conv_width,
                         std::int32_t value_heads, std::int32_t value_head_dim,
                         std::int32_t key_head_dim, std::int32_t slot_count = 1,
-                        ninfer::DType conv_dtype = ninfer::DType::BF16) {
-    ninfer::LayoutBuilder builder;
-    auto layout = ninfer::plan_linear_attention_state_pool(
-        builder, ninfer::LinearAttentionStatePoolSpec{.layers         = layers,
+                        sinfer::DType conv_dtype = sinfer::DType::BF16) {
+    sinfer::LayoutBuilder builder;
+    auto layout = sinfer::plan_linear_attention_state_pool(
+        builder, sinfer::LinearAttentionStatePoolSpec{.layers         = layers,
                                                       .conv_channels  = conv_channels,
                                                       .conv_width     = conv_width,
                                                       .value_heads    = value_heads,
@@ -47,7 +47,7 @@ int expect_size(std::size_t actual, std::size_t expected, const char* label) {
     return 1;
 }
 
-int check_shape(const ninfer::Tensor& tensor, const std::int32_t (&expected)[4],
+int check_shape(const sinfer::Tensor& tensor, const std::int32_t (&expected)[4],
                 const char* label) {
     int failures = 0;
     for (int i = 0; i < 4; ++i) {
@@ -60,7 +60,7 @@ int check_shape(const ninfer::Tensor& tensor, const std::int32_t (&expected)[4],
     return failures;
 }
 
-int expect_device_byte(const ninfer::Tensor& tensor, unsigned char expected, const char* label) {
+int expect_device_byte(const sinfer::Tensor& tensor, unsigned char expected, const char* label) {
     std::vector<unsigned char> host(tensor.bytes());
     CUDA_CHECK(cudaMemcpy(host.data(), tensor.data, host.size(), cudaMemcpyDeviceToHost));
     for (unsigned char value : host) {
@@ -92,11 +92,11 @@ int main() {
     }
 
     int failures = 0;
-    ninfer::DeviceContext ctx(0);
+    sinfer::DeviceContext ctx(0);
     auto state_plan = plan_state(3, 10, 3, 4, 5, 6);
-    ninfer::DeviceArena state_arena(state_plan.bytes);
+    sinfer::DeviceArena state_arena(state_plan.bytes);
     CUDA_CHECK(cudaMemset(state_arena.base(), 0x4a, state_arena.capacity()));
-    ninfer::LinearAttentionStatePool state({state_arena.base(), state_arena.capacity()},
+    sinfer::LinearAttentionStatePool state({state_arena.base(), state_arena.capacity()},
                                            state_plan.layout);
 
     failures += expect_size(state.layer_count(), 3, "state.layer_count");
@@ -114,11 +114,11 @@ int main() {
                                 {10, 3, 1, 1}, "state.conv_slot");
         failures += check_shape(state.recurrent_slot(static_cast<std::uint32_t>(layer), 0),
                                 {6, 5, 4, 1}, "state.recurrent_slot");
-        if (state.conv[layer].dtype != ninfer::DType::BF16) {
+        if (state.conv[layer].dtype != sinfer::DType::BF16) {
             ++failures;
             std::cerr << "conv dtype is not BF16\n";
         }
-        if (state.recurrent[layer].dtype != ninfer::DType::FP32) {
+        if (state.recurrent[layer].dtype != sinfer::DType::FP32) {
             ++failures;
             std::cerr << "recurrent dtype is not FP32\n";
         }
@@ -142,9 +142,9 @@ int main() {
     failures += expect_device_byte(state.recurrent[1], 0, "zeroed recurrent");
 
     auto slotted_plan = plan_state(2, 10, 3, 4, 5, 6, 3);
-    ninfer::DeviceArena slotted_arena(slotted_plan.bytes);
+    sinfer::DeviceArena slotted_arena(slotted_plan.bytes);
     CUDA_CHECK(cudaMemset(slotted_arena.base(), 0, slotted_arena.capacity()));
-    ninfer::LinearAttentionStatePool slotted({slotted_arena.base(), slotted_arena.capacity()},
+    sinfer::LinearAttentionStatePool slotted({slotted_arena.base(), slotted_arena.capacity()},
                                              slotted_plan.layout);
     failures += expect_size(slotted.slot_count(), 3, "slotted.slot_count");
     failures += check_shape(slotted.conv[0], {10, 3, 3, 1}, "slotted.conv");
@@ -152,12 +152,12 @@ int main() {
     failures += check_shape(slotted.conv_slot(0, 2), {10, 3, 1, 1}, "slotted.conv_slot");
     failures += check_shape(slotted.recurrent_slot(0, 2), {6, 5, 4, 1}, "slotted.recurrent_slot");
 
-    ninfer::Tensor conv0             = slotted.conv_slot(0, 0);
-    ninfer::Tensor conv1             = slotted.conv_slot(0, 1);
-    ninfer::Tensor recurrent0        = slotted.recurrent_slot(0, 0);
-    ninfer::Tensor recurrent1        = slotted.recurrent_slot(0, 1);
-    ninfer::Tensor conv1_layer1      = slotted.conv_slot(1, 1);
-    ninfer::Tensor recurrent1_layer1 = slotted.recurrent_slot(1, 1);
+    sinfer::Tensor conv0             = slotted.conv_slot(0, 0);
+    sinfer::Tensor conv1             = slotted.conv_slot(0, 1);
+    sinfer::Tensor recurrent0        = slotted.recurrent_slot(0, 0);
+    sinfer::Tensor recurrent1        = slotted.recurrent_slot(0, 1);
+    sinfer::Tensor conv1_layer1      = slotted.conv_slot(1, 1);
+    sinfer::Tensor recurrent1_layer1 = slotted.recurrent_slot(1, 1);
     CUDA_CHECK(cudaMemset(conv0.data, 0x7a, conv0.bytes()));
     CUDA_CHECK(cudaMemset(conv1.data, 0x6b, conv1.bytes()));
     CUDA_CHECK(cudaMemset(recurrent0.data, 0x5c, recurrent0.bytes()));
@@ -181,11 +181,11 @@ int main() {
     failures += expect_device_byte(slotted.conv_slot(0, 2), 0x6b, "zero kept conv slot2");
     failures += expect_device_byte(slotted.recurrent_slot(0, 2), 0x4d, "zero kept recurrent slot2");
 
-    auto fp32_conv_plan = plan_state(1, 7, 2, 2, 3, 4, 2, ninfer::DType::FP32);
-    ninfer::DeviceArena fp32_conv_arena(fp32_conv_plan.bytes);
-    ninfer::LinearAttentionStatePool fp32_conv({fp32_conv_arena.base(), fp32_conv_arena.capacity()},
+    auto fp32_conv_plan = plan_state(1, 7, 2, 2, 3, 4, 2, sinfer::DType::FP32);
+    sinfer::DeviceArena fp32_conv_arena(fp32_conv_plan.bytes);
+    sinfer::LinearAttentionStatePool fp32_conv({fp32_conv_arena.base(), fp32_conv_arena.capacity()},
                                                fp32_conv_plan.layout);
-    if (fp32_conv.conv[0].dtype != ninfer::DType::FP32) {
+    if (fp32_conv.conv[0].dtype != sinfer::DType::FP32) {
         ++failures;
         std::cerr << "FP32 conv geometry did not retain its dtype\n";
     }

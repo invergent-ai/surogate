@@ -23,7 +23,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 enum class Q5FragmentPipeline {
     Serial,
@@ -540,4 +540,4 @@ void q5_rowsplit_gemm_mma_kernel(
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

@@ -9,7 +9,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
+namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS {
 namespace {
 
 void validate_sampling(const ResolvedSamplingParameters& sampling) {
@@ -349,4 +349,4 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
     return RequestPlan(std::move(plan));
 }
 
-} // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
+} // namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS

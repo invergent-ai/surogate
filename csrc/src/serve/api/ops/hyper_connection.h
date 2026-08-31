@@ -8,7 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 /**
  * Hyper-connection (multi-stream residual) weights. The residual is `streams` copies of the
@@ -70,4 +70,4 @@ void hyper_connection_combine(const Tensor& block_output, const float* extra, co
 void broadcast_streams(const Tensor& source, std::int32_t streams, Tensor& residual,
                        cudaStream_t stream);
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

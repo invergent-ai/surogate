@@ -6,7 +6,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 struct Fp8GdnInputOutput {
     static constexpr std::int32_t kQueryRows = 2048;
@@ -42,4 +42,4 @@ static_assert(Fp8GdnInputOutput::kRows == 16384);
 static_assert((Fp8GdnInputOutput::kQkvRows % 128) == 0);
 static_assert((Fp8GdnInputOutput::kZRows % 128) == 0);
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

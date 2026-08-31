@@ -9,7 +9,7 @@
 #include <cstddef>
 #include <utility>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 using Launch = void (*)(const Tensor&, const Weight&, Tensor&, Tensor&, cudaStream_t);
@@ -48,4 +48,4 @@ void nvfp4_gdn_input_small_t_launch(const Tensor& x, const Weight& weight, Tenso
     kLaunchers[x.ne[1] - kNvfp4FirstSmallT](x, weight, qkv, z, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

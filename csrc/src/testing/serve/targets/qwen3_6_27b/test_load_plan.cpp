@@ -16,22 +16,22 @@
 
 namespace {
 
-using ninfer::artifact::NumericFormat;
-using ninfer::targets::qwen3_6_27b::Package;
-using namespace ninfer::targets::qwen3_6_27b::detail;
+using sinfer::artifact::NumericFormat;
+using sinfer::targets::qwen3_6_27b::Package;
+using namespace sinfer::targets::qwen3_6_27b::detail;
 
 std::filesystem::path artifact_path(const char* environment, const char* filename) {
     if (const char* value = std::getenv(environment); value != nullptr && *value != '\0') {
         return value;
     }
-    return std::filesystem::path(NINFER_SOURCE_DIR) / "out" / filename;
+    return std::filesystem::path(SINFER_SOURCE_DIR) / "out" / filename;
 }
 
-ninfer::targets::qwen3_6::StartupFeatures all_features() {
+sinfer::targets::qwen3_6::StartupFeatures all_features() {
     return {
         .vision        = true,
-        .speculative   = ninfer::SpeculativeBackend::Mtp,
-        .proposal_head = ninfer::ProposalHead::Optimized,
+        .speculative   = sinfer::SpeculativeBackend::Mtp,
+        .proposal_head = sinfer::ProposalHead::Optimized,
     };
 }
 
@@ -44,12 +44,12 @@ bool valid_divisors(const WeightPlan& weight) {
 }
 
 int verify_groupwise(const std::filesystem::path& path) {
-    ninfer::artifact::Reader reader(path);
+    sinfer::artifact::Reader reader(path);
     if (Package::resolve_weights(reader.identity()) != WeightsProfile::Qwen36GroupwiseInt) {
         std::cerr << "groupwise identity resolved to the wrong profile\n";
         return 1;
     }
-    ninfer::artifact::Binder binder(reader);
+    sinfer::artifact::Binder binder(reader);
     const ArtifactLoadPlan plan =
         bind_artifact(binder, WeightsProfile::Qwen36GroupwiseInt, all_features());
     if (plan.materialization.object_count != 1124 ||
@@ -85,12 +85,12 @@ int verify_groupwise(const std::filesystem::path& path) {
 }
 
 int verify_nvfp4(const std::filesystem::path& path) {
-    ninfer::artifact::Reader reader(path);
+    sinfer::artifact::Reader reader(path);
     if (Package::resolve_weights(reader.identity()) != WeightsProfile::Qwen36Nvfp4) {
         std::cerr << "NVFP4 identity resolved to the wrong profile\n";
         return 1;
     }
-    ninfer::artifact::Binder binder(reader);
+    sinfer::artifact::Binder binder(reader);
     const ArtifactLoadPlan plan =
         bind_artifact(binder, WeightsProfile::Qwen36Nvfp4, all_features());
     if (plan.materialization.object_count != 1307 ||
@@ -173,10 +173,10 @@ int verify_rejection() {
 }
 
 int verify_profile_mismatch_rejection() {
-    ninfer::DeviceContext device(0);
-    ninfer::EngineOptions options;
+    sinfer::DeviceContext device(0);
+    sinfer::EngineOptions options;
     options.max_context    = 128;
-    options.kv_capacity    = ninfer::KvCapacityPolicy::explicit_capacity(128);
+    options.kv_capacity    = sinfer::KvCapacityPolicy::explicit_capacity(128);
     options.prefill_chunk  = 128;
     options.use_cuda_graph = false;
     auto planner =
@@ -185,7 +185,7 @@ int verify_profile_mismatch_rejection() {
     auto sequence             = std::move(planner).finalize(pages);
     RuntimeModelView empty_model;
     try {
-        (void)ninfer::targets::qwen3_6::create_program<Variant>(
+        (void)sinfer::targets::qwen3_6::create_program<Variant>(
             empty_model, WeightsProfile::Qwen36Nvfp4, std::move(sequence), device);
     } catch (const std::invalid_argument& error) {
         if (std::string(error.what()).find("weights profile") != std::string::npos) { return 0; }
@@ -198,9 +198,9 @@ int verify_profile_mismatch_rejection() {
 
 int main() {
     const std::filesystem::path groupwise =
-        artifact_path("NINFER_QWEN3_6_27B_WEIGHTS", "qwen3_6_27b.ninfer");
+        artifact_path("SINFER_QWEN3_6_27B_WEIGHTS", "qwen3_6_27b.sinfer");
     const std::filesystem::path nvfp4 =
-        artifact_path("NINFER_QWEN3_6_27B_NVFP4_WEIGHTS", "qwen3_6_27b_nvfp4.ninfer");
+        artifact_path("SINFER_QWEN3_6_27B_NVFP4_WEIGHTS", "qwen3_6_27b_nvfp4.sinfer");
     if (!std::filesystem::is_regular_file(groupwise) || !std::filesystem::is_regular_file(nvfp4)) {
         std::cerr << "skip: both real 27B artifacts are required: groupwise=" << groupwise
                   << " nvfp4=" << nvfp4 << '\n';

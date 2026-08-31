@@ -8,7 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 inline constexpr std::uint32_t kGqaAttentionMaximumVisibleKeys = 262144;
 
@@ -122,4 +122,4 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
                           WorkspaceArena& workspace, Tensor& out, cudaStream_t stream,
                           GqaBlockMask selection = {});
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

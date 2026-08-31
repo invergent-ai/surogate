@@ -1,6 +1,6 @@
 #pragma once
 
-// ninfer::ops::detail - private launch prototype for sample.
+// sinfer::ops::detail - private launch prototype for sample.
 
 #include "core/tensor.h"
 #include "api/ops/sampling.h"
@@ -9,7 +9,7 @@
 
 #include <cuda_runtime.h>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 void sample_batch_launch(const Tensor& logits, Tensor& out, std::int32_t token_domain,
                          const SamplingConfig* configs, const Tensor& logical_positions,
@@ -18,4 +18,4 @@ void sample_batch_launch(const Tensor& logits, Tensor& out, std::int32_t token_d
 [[nodiscard]] std::size_t sampling_workspace_exact_bytes(std::int32_t token_domain,
                                                          std::int32_t columns);
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

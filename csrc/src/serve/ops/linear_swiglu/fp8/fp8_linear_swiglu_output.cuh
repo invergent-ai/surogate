@@ -7,7 +7,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 template <int RowsPerBranch, int IntermediateRows>
 struct Fp8SwiGluRows {
@@ -52,4 +52,4 @@ struct Fp8SwiGluOutput {
     }
 };
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

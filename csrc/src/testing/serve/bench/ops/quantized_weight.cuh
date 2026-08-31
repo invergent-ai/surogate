@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ninfer_bench_common.h"
+#include "sinfer_bench_common.h"
 
 #include <cuda_runtime.h>
 
@@ -10,7 +10,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::bench {
+namespace sinfer::bench {
 
 struct QuantizedWeightFill {
     std::uint8_t low_byte   = 0x31;
@@ -306,4 +306,4 @@ inline Weight row_view(const Weight& parent, std::int32_t row_begin, std::int32_
     return view;
 }
 
-} // namespace ninfer::bench
+} // namespace sinfer::bench

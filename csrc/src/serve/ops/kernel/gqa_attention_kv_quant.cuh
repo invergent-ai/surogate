@@ -1,6 +1,6 @@
 #pragma once
 
-// ninfer::ops - signed int8, per-token group-wise KV cache codec (shared device
+// sinfer::ops - signed int8, per-token group-wise KV cache codec (shared device
 // helpers). Quantization (append) and dequantization (stage) are FUSED into the
 // GQA attention kernels themselves (decode partial kernel, prefill fill/attention);
 // this header only provides the index math, the vectorized dequant, and the scalar
@@ -17,7 +17,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 inline constexpr int kGqaKvQuantHeadDim = 256;
 inline constexpr int kGqaKvQuantGroup   = 64;
@@ -145,4 +145,4 @@ struct GqaKvIsFp8<std::uint8_t> {
     static constexpr bool value = true;
 };
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

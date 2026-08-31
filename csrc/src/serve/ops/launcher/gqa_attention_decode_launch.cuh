@@ -8,7 +8,7 @@
 // changes — only how many of these instantiations share a translation unit.
 #pragma once
 
-// ninfer::ops - split-KV GQA small-T launcher and unified route dispatcher.
+// sinfer::ops - split-KV GQA small-T launcher and unified route dispatcher.
 #include "ops/launcher/gqa_attention.h"
 #include "ops/kernel/func_attribute.cuh"
 
@@ -25,7 +25,7 @@
 #include <stdexcept>
 
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 // Supplies an upper bound for the device-side active-split policy over one explicit execution
@@ -167,7 +167,7 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
         constexpr std::size_t kDynamicBytes =
             DynamicArena ? static_cast<std::size_t>(4 * KeyBlock * Geometry::HeadDim) : 0u;
         if constexpr (DynamicArena) {
-            CUDA_CHECK(::ninfer::ops::set_func_attribute_per_device(
+            CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(
                 gqa_attention_decode_i8_tiled_kernel<Geometry, TokenTile, WarpsPerCta,
                                                      MinBlocksPerSm, KeyBlock, DynamicArena,
                                                      MultiBatch, Masked, CacheInput>,
@@ -311,7 +311,7 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
 
     // BF16 keeps its row-tile warp count; INT8 selects its producer/consumer
     // geometry inside launch_tc_partial_i8.
-#define NINFER_GQA_SMALL_T_DISPATCH(TOKENS, WARPS)                                                 \
+#define SINFER_GQA_SMALL_T_DISPATCH(TOKENS, WARPS)                                                 \
     do {                                                                                           \
         const auto launch_profile = [&]<bool MultiBatch, bool Masked>() {                          \
             if (cache.dtype == DType::I8) {                                                        \
@@ -358,27 +358,27 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
     }
     switch (invocation.width) {
     case 1:
-        NINFER_GQA_SMALL_T_DISPATCH(1, 2);
+        SINFER_GQA_SMALL_T_DISPATCH(1, 2);
         break;
     case 2:
-        NINFER_GQA_SMALL_T_DISPATCH(2, 4);
+        SINFER_GQA_SMALL_T_DISPATCH(2, 4);
         break;
     case 3:
-        NINFER_GQA_SMALL_T_DISPATCH(3, 4);
+        SINFER_GQA_SMALL_T_DISPATCH(3, 4);
         break;
     case 4:
-        NINFER_GQA_SMALL_T_DISPATCH(4, 4);
+        SINFER_GQA_SMALL_T_DISPATCH(4, 4);
         break;
     case 5:
-        NINFER_GQA_SMALL_T_DISPATCH(5, 4);
+        SINFER_GQA_SMALL_T_DISPATCH(5, 4);
         break;
     case 6:
-        NINFER_GQA_SMALL_T_DISPATCH(6, 4);
+        SINFER_GQA_SMALL_T_DISPATCH(6, 4);
         break;
     default:
         throw std::invalid_argument("gqa_attention_small_t_launch: unsupported T");
     }
-#undef NINFER_GQA_SMALL_T_DISPATCH
+#undef SINFER_GQA_SMALL_T_DISPATCH
 
     constexpr int kReduceBlock = 256;
     constexpr int kDChunk      = 64;
@@ -426,4 +426,4 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
     }
     CUDA_CHECK(cudaGetLastError());
 }
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

@@ -10,7 +10,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 using Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
@@ -67,4 +67,4 @@ void nvfp4_linear_add_small_t_launch(const Tensor& x, const Weight& weight, Tens
     throw std::invalid_argument("nvfp4 linear_add: unsupported problem");
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

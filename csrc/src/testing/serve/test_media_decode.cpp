@@ -96,7 +96,7 @@ std::vector<std::uint8_t> decode_base64(std::string_view encoded) {
     return out;
 }
 
-void expect_pixel(const ninfer::media::decode::Image& image, int x, int y,
+void expect_pixel(const sinfer::media::decode::Image& image, int x, int y,
                   std::array<int, 3> expected, int tolerance) {
     const std::size_t offset = (static_cast<std::size_t>(y) * image.width + x) * 3;
     for (int channel = 0; channel < 3; ++channel) {
@@ -110,7 +110,7 @@ void expect_pixel(const ninfer::media::decode::Image& image, int x, int y,
 
 void test_issue_20_unaligned_jpeg() {
     const std::vector<std::uint8_t> encoded  = decode_base64(issue_20_jpeg_base64);
-    const ninfer::media::decode::Image image = ninfer::media::decode::decode_image(encoded, {});
+    const sinfer::media::decode::Image image = sinfer::media::decode::decode_image(encoded, {});
     if (image.width != 300 || image.height != 200 || image.rgb.size() != 300U * 200U * 3U) {
         throw std::runtime_error("decoded JPEG dimensions mismatch");
     }

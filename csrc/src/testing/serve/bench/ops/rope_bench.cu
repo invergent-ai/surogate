@@ -1,14 +1,14 @@
 // Exact-domain RoPE benchmark for Qwen3.6 Text and Vision geometries.
 // Examples:
-//   ./ninfer_rope_bench --text --geometry dflash --axes 1 \
+//   ./sinfer_rope_bench --text --geometry dflash --axes 1 \
 //       --tokens 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16
-//   ./ninfer_rope_bench --text --geometry dflash --tokens 16 --candidate-block 512
-//   ncu ... ./ninfer_rope_bench --text --geometry dflash --tokens 1024 --profile
-//   ./ninfer_rope_bench --vision --patches 8,256,4096,49152,65536
+//   ./sinfer_rope_bench --text --geometry dflash --tokens 16 --candidate-block 512
+//   ncu ... ./sinfer_rope_bench --text --geometry dflash --tokens 1024 --profile
+//   ./sinfer_rope_bench --vision --patches 8,256,4096,49152,65536
 // Add --control for the same-grid, same-payload fixed-resource control.
 #include "core/device.h"
 #include "api/ops/rope.h"
-#include "ninfer_bench_common.h"
+#include "sinfer_bench_common.h"
 #include "ops/kernel/rope.cuh"
 
 #include <cuda_bf16.h>
@@ -20,8 +20,8 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::bench;
+using namespace sinfer;
+using namespace sinfer::bench;
 
 namespace {
 

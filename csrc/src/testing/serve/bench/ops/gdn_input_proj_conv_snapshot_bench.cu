@@ -6,7 +6,7 @@
 #include "api/ops/gdn_input_proj.h"
 
 #include "core/device.h"
-#include "ninfer_bench_common.h"
+#include "sinfer_bench_common.h"
 #include "quantized_weight.cuh"
 
 #include <cuda_runtime.h>
@@ -27,7 +27,7 @@
 #include <utility>
 #include <vector>
 
-using namespace ninfer;
+using namespace sinfer;
 
 namespace {
 
@@ -945,7 +945,7 @@ int main(int argc, char** argv) {
         write_csv(options.csv_out, results, options, context);
         return 0;
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "ninfer_gdn_input_proj_conv_bench: %s\n", error.what());
+        std::fprintf(stderr, "sinfer_gdn_input_proj_conv_bench: %s\n", error.what());
         return 1;
     }
 }

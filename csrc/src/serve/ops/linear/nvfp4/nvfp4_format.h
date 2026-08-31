@@ -4,7 +4,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 struct Nvfp4WeightGeometry {
     std::uint64_t code_plane_bytes;
@@ -15,4 +15,4 @@ struct Nvfp4WeightGeometry {
 
 Nvfp4WeightGeometry validate_nvfp4_weight(const Weight& weight, const char* operation);
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

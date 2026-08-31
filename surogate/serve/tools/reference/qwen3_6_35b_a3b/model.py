@@ -1,4 +1,4 @@
-"""Qwen3.6-35B-A3B reference schedule over a native NInfer artifact."""
+"""Qwen3.6-35B-A3B reference schedule over a native SInfer artifact."""
 
 from __future__ import annotations
 

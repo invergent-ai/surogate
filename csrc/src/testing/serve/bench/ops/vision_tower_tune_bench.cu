@@ -16,10 +16,10 @@
 //   mlp fc2          q5  n=H          k=I
 //   merger fc1       w8  n=4H         k=4H
 //
-//   ninfer_vision_tower_tune_bench [--hidden 1024|1152] [--t-sweep 196,256,...]
+//   sinfer_vision_tower_tune_bench [--hidden 1024|1152] [--t-sweep 196,256,...]
 
 #include "core/device.h"
-#include "ninfer_bench_common.h"
+#include "sinfer_bench_common.h"
 #include "ops/linear/q4/q4_launch.h"
 #include "ops/linear/q5/q5_launch.h"
 #include "ops/linear/q6/q6_launch.h"
@@ -35,7 +35,7 @@
 #include <string_view>
 #include <vector>
 
-using namespace ninfer;
+using namespace sinfer;
 
 namespace {
 
@@ -184,7 +184,7 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "ninfer_vision_tower_tune_bench: %s\n", error.what());
+        std::fprintf(stderr, "sinfer_vision_tower_tune_bench: %s\n", error.what());
         return 1;
     }
 }

@@ -12,7 +12,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 using Geometry = Nvfp4MlpGateUpGeometry;
@@ -93,4 +93,4 @@ void nvfp4_linear_swiglu_w4a4_launch(const Tensor& x, const Weight& weight, Tens
     launch<M48N64>(x, weight, out, workspace, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

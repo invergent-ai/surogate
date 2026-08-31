@@ -24,7 +24,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 __device__ __forceinline__ float w4fp4_e2m1_decode(unsigned nib) {
     // Direct fp32 bit assembly (e2m1 is a float format): m >= 2 -> exponent
@@ -179,4 +179,4 @@ __global__ __launch_bounds__(RowsPerCta * 32, 2) void w4fp4_decode_batch_kernel(
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

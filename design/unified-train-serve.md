@@ -45,8 +45,8 @@ figures below are the corrected ones):
 Of the 309, about 80% carry a shape constant or a quoted tensor name, and the
 rest are the namespace and include renames that follow from the target's name:
 
-    -namespace ninfer::targets::qwen3_5_0_8b::detail {
-    +namespace ninfer::targets::qwen3_5_4b::detail {
+    -namespace sinfer::targets::qwen3_5_0_8b::detail {
+    +namespace sinfer::targets::qwen3_5_4b::detail {
     -    out.gate_up = materialized_weight(materialized, plan.gate_up, 7168, 1024);
     +    out.gate_up = materialized_weight(materialized, plan.gate_up, 18432, 2560);
 
@@ -698,7 +698,7 @@ After that, the forward runs it and the gate opens.
 With `qwen3_6::ModelView` gaining a defaulted `VisionCfg` parameter — so every
 existing instantiation is untouched and the 2B passes its own — the target
 materialises its own tower, and the family runtime already compiles the vision
-forward per variant (`variant.cpp` defines `NINFER_QWEN36_RUNTIME_NS` and pulls in
+forward per variant (`variant.cpp` defines `SINFER_QWEN36_RUNTIME_NS` and pulls in
 `instantiate.h`, and `VisionScheduleConfig` reads whichever `VisionConfig` that
 namespace resolves). So the forward needed no work: removing the gate was enough
 for the engine to start with `--vision` and serve.
@@ -791,7 +791,7 @@ source says what this artifact actually holds.
 
 The 64-wide tower's dispatch entries were added by copying the 72-wide tower's
 tile thresholds — correctness-complete, and silent about speed.
-`ninfer_vision_tower_tune_bench` times each candidate launcher directly for the
+`sinfer_vision_tower_tune_bench` times each candidate launcher directly for the
 tower's six GEMM shapes, which the other benches in that directory deliberately
 cannot do: they measure *through* the dispatch, leaving implementation selection
 behind the op contract. Tuning needs the opposite.
@@ -820,4 +820,4 @@ because they were already tuned for the targets that ship them.
 
 The image still answers correctly with the tuned tables, the C++ integration suite
 is unchanged at 30/34 with 986 assertions, and the tuning run is reproducible:
-`ninfer_vision_tower_tune_bench --hidden 1024`.
+`sinfer_vision_tower_tune_bench --hidden 1024`.

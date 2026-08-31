@@ -12,7 +12,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 using Geometry = Fp8AttnInputGeometry;
@@ -36,7 +36,7 @@ void launch_mma(const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tensor
     };
 
     if constexpr (Sched::kSharedBytes > 48 * 1024) {
-        CUDA_CHECK(::ninfer::ops::set_func_attribute_per_device(
+        CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(
             fp8_mma_kernel<Geometry, Sched, FullTokens, Fp8IdentityEpilogue,
                            Fp8AttentionInputOutput>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, Sched::kSharedBytes));
@@ -92,4 +92,4 @@ void fp8_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, 
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

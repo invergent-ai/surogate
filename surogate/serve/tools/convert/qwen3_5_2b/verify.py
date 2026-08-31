@@ -1,4 +1,4 @@
-"""Structural and representative-source verification for a 27B `.ninfer` artifact."""
+"""Structural and representative-source verification for a 27B `.sinfer` artifact."""
 
 from __future__ import annotations
 
@@ -540,7 +540,7 @@ def _verify_resources_and_frontend(
 
     from transformers import AutoProcessor, GenerationConfig
 
-    with tempfile.TemporaryDirectory(prefix="ninfer-frontend-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="sinfer-frontend-") as temporary:
         directory = Path(temporary)
         for filename, payload in payloads.items():
             (directory / filename).write_bytes(payload)
@@ -626,7 +626,7 @@ def verify_artifact(
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Verify a Qwen3.5-2B NInfer artifact against its source checkpoint"
+        description="Verify a Qwen3.5-2B SInfer artifact against its source checkpoint"
     )
     parser.add_argument("artifact", type=Path)
     parser.add_argument("--model", type=Path, required=True)

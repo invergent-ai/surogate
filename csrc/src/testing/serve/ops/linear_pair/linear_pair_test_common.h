@@ -4,7 +4,7 @@
 #include <span>
 #include <string_view>
 
-namespace ninfer::test::linear_pair {
+namespace sinfer::test::linear_pair {
 
 struct ShapeCase {
     std::int32_t k;
@@ -17,4 +17,4 @@ bool cuda_available();
 
 int run_w8_a16_shape(std::string_view label, const ShapeCase& shape);
 
-} // namespace ninfer::test::linear_pair
+} // namespace sinfer::test::linear_pair

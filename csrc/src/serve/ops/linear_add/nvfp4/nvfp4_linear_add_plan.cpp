@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 enum class Nvfp4LinearAddRoute : std::uint8_t {
@@ -79,4 +79,4 @@ void nvfp4_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& re
     nvfp4_linear_add_w4a4_launch(x, weight, residual, scratch, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

@@ -10,7 +10,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 constexpr std::int32_t kAnyCols = std::numeric_limits<std::int32_t>::max();
@@ -189,4 +189,4 @@ void q4_linear_swiglu_dispatch(const Tensor& x, const Weight& w, Tensor& out, Wo
     q4_linear_swiglu_execute_plan(plan, x, w, out, ws, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

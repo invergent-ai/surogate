@@ -20,7 +20,7 @@
 #include <thread>
 #include <utility>
 
-namespace ninfer::test::linear {
+namespace sinfer::test::linear {
 namespace {
 
 constexpr std::size_t kOutputGuardBytes   = 256;
@@ -393,4 +393,4 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
     return failures;
 }
 
-} // namespace ninfer::test::linear
+} // namespace sinfer::test::linear

@@ -12,7 +12,7 @@
 #include <string>
 #include <string_view>
 
-namespace ninfer::targets::qwen3_6 {
+namespace sinfer::targets::qwen3_6 {
 
 // The vision tower's geometry is per-model, not per-family: the 0.8B ships 12
 // layers of 768, the 2B and 4B 24 of 1024, the 27B/35B and Flash-Next 27 of 1152.
@@ -260,4 +260,4 @@ inline VisionCommonWeightsFor<Config> materialize_vision_common(
     return out;
 }
 
-} // namespace ninfer::targets::qwen3_6
+} // namespace sinfer::targets::qwen3_6

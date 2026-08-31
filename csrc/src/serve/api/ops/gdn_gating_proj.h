@@ -8,7 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 // The geometry is the fixed implementation profile. Each query covers every T in the inclusive
 // interval; invalid profiles or intervals throw.
@@ -88,4 +88,4 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
                           WorkspaceArena& ws, Tensor& h, Tensor& g, Tensor& beta,
                           cudaStream_t stream);
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

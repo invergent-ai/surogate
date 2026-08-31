@@ -2,7 +2,7 @@
 
 #include "api/ops/swa.h"
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 inline constexpr std::int32_t kSwaMaxCandidateSplit = 32;
 
@@ -28,4 +28,4 @@ void swa_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
                 Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out,
                 cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

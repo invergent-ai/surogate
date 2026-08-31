@@ -1,4 +1,4 @@
-"""Closed registry of persistent NInfer tensor numeric formats."""
+"""Closed registry of persistent SInfer tensor numeric formats."""
 
 from __future__ import annotations
 

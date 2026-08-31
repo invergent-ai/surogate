@@ -11,7 +11,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 using Geometry = Fp8GdnInputGeometry;
@@ -136,4 +136,4 @@ void fp8_gdn_record_fused_launch(const Tensor& x, const Weight& weight, const Te
         value, z, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

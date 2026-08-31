@@ -9,7 +9,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 namespace {
 
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
@@ -104,4 +104,4 @@ void linear_pair(const Tensor& x, const Weight& first_weight, const Weight& seco
     detail::w8_pair_dispatch(x, first_weight, second_weight, first_out, second_out, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

@@ -7,7 +7,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 inline constexpr std::int32_t kAnyCols = std::numeric_limits<std::int32_t>::max();
@@ -495,4 +495,4 @@ void bf16_gdn_norm_gating_dispatch(const Tensor& x, const Tensor& norm_weight, f
                                                     scratch.data, g, beta, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

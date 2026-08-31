@@ -8,7 +8,7 @@
 
 #include <cstdint>
 
-namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
+namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS {
 
 struct DFlashPersistentState {
     CyclicKVCache local;
@@ -26,4 +26,4 @@ struct DFlashPersistentState {
     void restore_rewrite_checkpoint(std::int32_t lane, cudaStream_t stream);
 };
 
-} // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
+} // namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS

@@ -1,4 +1,4 @@
-"""Grouped symmetric quantization used by NInfer artifact converters.
+"""Grouped symmetric quantization used by SInfer artifact converters.
 
 The persistent numeric format fixes the code range, group size, and binary16
 scale.  Model-specific recipes decide which tensors use those formats; this

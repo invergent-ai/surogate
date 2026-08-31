@@ -12,7 +12,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 struct alignas(128) Nvfp4W4a4TmaDescriptors {
     CUtensorMap a_codes;
@@ -368,4 +368,4 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

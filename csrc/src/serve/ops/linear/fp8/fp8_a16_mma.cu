@@ -10,7 +10,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 using Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
@@ -52,4 +52,4 @@ void launch_fp8_vocabulary_a16_mma(const Tensor& x, const Weight& weight, Tensor
     kLaunchers[index](x, weight, out, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

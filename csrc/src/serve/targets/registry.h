@@ -13,7 +13,7 @@
 #include <memory>
 #include <variant>
 
-namespace ninfer {
+namespace sinfer {
 
 struct DeviceContext;
 
@@ -236,4 +236,4 @@ struct ConstructedTarget {
                                                  DeviceContext& device);
 
 } // namespace targets
-} // namespace ninfer
+} // namespace sinfer

@@ -48,7 +48,7 @@
 #include <cstdint>
 #include <type_traits>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 // Q5 slab traits + dequant. A slab is 1024 K-values:
 //   nibble/code bytes : 32 B per group  -> kNibU4 uint4 per slab
@@ -518,4 +518,4 @@ __global__ void q5_rowsplit_gemm_simt_kernel(const __nv_bfloat16* __restrict__ x
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

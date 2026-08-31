@@ -16,7 +16,7 @@
 #include <utility>
 #include <variant>
 
-namespace ninfer::targets::qwen3_5_4b::detail {
+namespace sinfer::targets::qwen3_5_4b::detail {
 
 inline constexpr std::size_t kTextLayers          = 32;
 inline constexpr std::size_t kFullAttentionLayers = 8;
@@ -222,4 +222,4 @@ public:
     LoadedModelData data;
 };
 
-} // namespace ninfer::targets::qwen3_5_4b::detail
+} // namespace sinfer::targets::qwen3_5_4b::detail

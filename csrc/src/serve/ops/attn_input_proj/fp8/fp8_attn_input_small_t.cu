@@ -10,7 +10,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 using Geometry = Fp8AttnInputGeometry;
@@ -57,4 +57,4 @@ void fp8_attn_input_small_t_launch(const Tensor& x, const Weight& weight, Tensor
                                                                     stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

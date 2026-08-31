@@ -10,9 +10,9 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
-using namespace ninfer::test::input_projection;
+using namespace sinfer;
+using namespace sinfer::test;
+using namespace sinfer::test::input_projection;
 
 namespace {
 

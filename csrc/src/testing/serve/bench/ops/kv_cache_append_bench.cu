@@ -7,7 +7,7 @@
 #include "core/device.h"
 #include "core/cyclic_kv_cache.h"
 #include "core/paged_kv_cache.h"
-#include "ninfer_bench_common.h"
+#include "sinfer_bench_common.h"
 
 #include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
@@ -25,7 +25,7 @@
 #include <string_view>
 #include <vector>
 
-using namespace ninfer;
+using namespace sinfer;
 
 namespace {
 
@@ -85,7 +85,7 @@ struct Result {
 [[noreturn]] void usage(const char* message) {
     std::fprintf(stderr,
                  "error: %s\n"
-                 "usage: ninfer_kv_cache_append_bench [--mode full|prefix|all] "
+                 "usage: sinfer_kv_cache_append_bench [--mode full|prefix|all] "
                  "[--full-geometry d256-kv4|d256-kv2|all] [--kv-dtype bf16|int8|all] "
                  "[--layout paged|cyclic|all] [--tokens T,...] [--counts C,...] "
                  "[--context L] [--execution eager|graph|both] [--cache cold|warm|both] "
@@ -655,7 +655,7 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "ninfer_kv_cache_append_bench: %s\n", error.what());
+        std::fprintf(stderr, "sinfer_kv_cache_append_bench: %s\n", error.what());
         return 1;
     }
 }

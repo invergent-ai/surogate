@@ -6,11 +6,11 @@
 
 #include <string>
 
-namespace ninfer::artifact {
+namespace sinfer::artifact {
 class MaterializedArtifact;
 }
 
-namespace ninfer::targets::qwen3_6 {
+namespace sinfer::targets::qwen3_6 {
 
 struct FrontendResourcePlan {
     artifact::ObjectHandle tokenizer_json;
@@ -34,4 +34,4 @@ struct FrontendResources {
 [[nodiscard]] FrontendResources take_frontend_resources(artifact::MaterializedArtifact& artifact,
                                                         const FrontendResourcePlan& plan);
 
-} // namespace ninfer::targets::qwen3_6
+} // namespace sinfer::targets::qwen3_6

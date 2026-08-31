@@ -4,7 +4,7 @@
 
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 std::size_t sparse_moe_decode_workspace_bytes(const SparseMoeGeometry& geometry) {
     WorkspaceLayoutBuilder layout;
@@ -28,4 +28,4 @@ SparseMoeDecodePlan resolve_sparse_moe_decode_plan(const SparseMoeGeometry& geom
     return plan;
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

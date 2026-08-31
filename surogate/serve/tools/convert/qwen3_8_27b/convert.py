@@ -4,7 +4,7 @@ Canonical invocation::
 
     python3 -m tools.convert.qwen3_8_27b.convert \
       --model /path/to/Qwen3.8-27B \
-      --out out/qwen3_8_27b.ninfer
+      --out out/qwen3_8_27b.sinfer
 """
 
 from __future__ import annotations

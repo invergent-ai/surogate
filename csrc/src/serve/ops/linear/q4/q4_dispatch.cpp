@@ -2,7 +2,7 @@
 
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     if (t <= 0) { throw std::invalid_argument("q4 linear: unsupported shape or T"); }
@@ -67,7 +67,7 @@ Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         break;
     // The vision tower's qkv (n = 3*hidden) and MLP fc1 (n = intermediate), keyed by
     // the tower width. 1024 is the Qwen3.5 2B/4B tower, 1152 the Qwen3.6 family and
-    // Flash-Next. Measured with ninfer_vision_tower_tune_bench --hidden 1024: c96 wins
+    // Flash-Next. Measured with sinfer_vision_tower_tune_bench --hidden 1024: c96 wins
     // across the useful range on both shapes and c64 never does, which is what
     // mirroring the 1152 schedule had picked.
     case 1024:
@@ -127,4 +127,4 @@ void q4_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy pol
     launch(x, w, out, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

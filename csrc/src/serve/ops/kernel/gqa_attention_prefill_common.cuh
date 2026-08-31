@@ -14,7 +14,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 inline constexpr int kGqaPrefillHeadDim = 256;
 
@@ -84,4 +84,4 @@ __device__ __forceinline__ unsigned gqa_prefill_swz_addr(unsigned lane_base, uns
     return lane_base + ((ck | as) ^ r);
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

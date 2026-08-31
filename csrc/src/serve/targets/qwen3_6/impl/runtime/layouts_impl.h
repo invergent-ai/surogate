@@ -27,7 +27,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
+namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS {
 namespace {
 
 [[nodiscard]] constexpr std::size_t round_up_256(std::size_t bytes) noexcept {
@@ -852,4 +852,4 @@ finalize_sequence_plan_impl(std::unique_ptr<qwen3_6::detail::SequencePlannerImpl
     return plan;
 }
 
-} // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
+} // namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS

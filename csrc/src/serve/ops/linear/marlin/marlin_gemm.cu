@@ -438,7 +438,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
 
 }  // namespace MARLIN_NAMESPACE_NAME
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 int marlin_workspace_locks_count(int sm_count) { return sm_count * 4; }
 
@@ -473,4 +473,4 @@ void marlin_gemm_bf16(const void* a, const void* b_packed, const void* b_scales,
         /*use_atomic_add=*/false, /*use_fp32_reduce=*/true, /*is_zp_float=*/false);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

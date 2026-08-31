@@ -15,7 +15,7 @@
 //                                op_bf16_criterion());
 
 #include "core/arena.h"
-#include "core/tensor.h" // ninfer::DType, ninfer::Tensor (for op call sites)
+#include "core/tensor.h" // sinfer::DType, sinfer::Tensor (for op call sites)
 #include "ops/op_check.h"
 
 #include <cuda_runtime.h>
@@ -37,7 +37,7 @@
 #include <type_traits>
 #include <vector>
 
-namespace ninfer::test {
+namespace sinfer::test {
 
 // --- environment ------------------------------------------------------------
 inline void cuda_check(cudaError_t status, const char* operation) {
@@ -168,7 +168,7 @@ inline std::vector<int> from_device_i32(const DeviceBuffer& d, std::size_t n) {
 // --- verdict ----------------------------------------------------------------
 inline bool error_stats_enabled() {
     static const bool enabled = [] {
-        const char* value = std::getenv("NINFER_OP_REPORT_STATS");
+        const char* value = std::getenv("SINFER_OP_REPORT_STATS");
         return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
     }();
     return enabled;
@@ -360,4 +360,4 @@ inline int verify_reduction(std::string_view label, std::span<const double> got,
     return 1;
 }
 
-} // namespace ninfer::test
+} // namespace sinfer::test

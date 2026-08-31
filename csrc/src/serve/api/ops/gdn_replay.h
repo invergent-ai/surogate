@@ -8,7 +8,7 @@
 #include <cstdint>
 #include <span>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 struct GdnReplayFoldRow {
     std::int32_t linear_state_slot;
@@ -37,4 +37,4 @@ struct GdnReplayFoldRow {
 void gdn_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
                      std::span<const GdnReplayFoldRow> rows, cudaStream_t stream);
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

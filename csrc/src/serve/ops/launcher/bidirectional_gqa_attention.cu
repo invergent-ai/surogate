@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 template <int Tokens, class Launch>
@@ -19,27 +19,27 @@ void dispatch_token_case(Launch&& launch) {
 template <class Launch>
 void dispatch_tokens(std::int32_t tokens, Launch&& launch) {
     switch (tokens) {
-#define NINFER_BIDIRECTIONAL_GQA_TOKEN_CASE(TOKENS)                                                \
+#define SINFER_BIDIRECTIONAL_GQA_TOKEN_CASE(TOKENS)                                                \
     case TOKENS:                                                                                   \
         dispatch_token_case<TOKENS>(launch);                                                       \
         return
-        NINFER_BIDIRECTIONAL_GQA_TOKEN_CASE(1);
-        NINFER_BIDIRECTIONAL_GQA_TOKEN_CASE(2);
-        NINFER_BIDIRECTIONAL_GQA_TOKEN_CASE(3);
-        NINFER_BIDIRECTIONAL_GQA_TOKEN_CASE(4);
-        NINFER_BIDIRECTIONAL_GQA_TOKEN_CASE(5);
-        NINFER_BIDIRECTIONAL_GQA_TOKEN_CASE(6);
-        NINFER_BIDIRECTIONAL_GQA_TOKEN_CASE(7);
-        NINFER_BIDIRECTIONAL_GQA_TOKEN_CASE(8);
-        NINFER_BIDIRECTIONAL_GQA_TOKEN_CASE(9);
-        NINFER_BIDIRECTIONAL_GQA_TOKEN_CASE(10);
-        NINFER_BIDIRECTIONAL_GQA_TOKEN_CASE(11);
-        NINFER_BIDIRECTIONAL_GQA_TOKEN_CASE(12);
-        NINFER_BIDIRECTIONAL_GQA_TOKEN_CASE(13);
-        NINFER_BIDIRECTIONAL_GQA_TOKEN_CASE(14);
-        NINFER_BIDIRECTIONAL_GQA_TOKEN_CASE(15);
-        NINFER_BIDIRECTIONAL_GQA_TOKEN_CASE(16);
-#undef NINFER_BIDIRECTIONAL_GQA_TOKEN_CASE
+        SINFER_BIDIRECTIONAL_GQA_TOKEN_CASE(1);
+        SINFER_BIDIRECTIONAL_GQA_TOKEN_CASE(2);
+        SINFER_BIDIRECTIONAL_GQA_TOKEN_CASE(3);
+        SINFER_BIDIRECTIONAL_GQA_TOKEN_CASE(4);
+        SINFER_BIDIRECTIONAL_GQA_TOKEN_CASE(5);
+        SINFER_BIDIRECTIONAL_GQA_TOKEN_CASE(6);
+        SINFER_BIDIRECTIONAL_GQA_TOKEN_CASE(7);
+        SINFER_BIDIRECTIONAL_GQA_TOKEN_CASE(8);
+        SINFER_BIDIRECTIONAL_GQA_TOKEN_CASE(9);
+        SINFER_BIDIRECTIONAL_GQA_TOKEN_CASE(10);
+        SINFER_BIDIRECTIONAL_GQA_TOKEN_CASE(11);
+        SINFER_BIDIRECTIONAL_GQA_TOKEN_CASE(12);
+        SINFER_BIDIRECTIONAL_GQA_TOKEN_CASE(13);
+        SINFER_BIDIRECTIONAL_GQA_TOKEN_CASE(14);
+        SINFER_BIDIRECTIONAL_GQA_TOKEN_CASE(15);
+        SINFER_BIDIRECTIONAL_GQA_TOKEN_CASE(16);
+#undef SINFER_BIDIRECTIONAL_GQA_TOKEN_CASE
     default:
         throw std::invalid_argument("bidirectional_gqa_attention: unsupported T");
     }
@@ -182,4 +182,4 @@ void bidirectional_gqa_attention_launch(const Tensor& q, const Tensor& query_k,
     });
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

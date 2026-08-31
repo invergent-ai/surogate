@@ -1,4 +1,4 @@
-// Implements: include/ninfer/ops/sampling.h
+// Implements: include/sinfer/ops/sampling.h
 // Match: validated contiguous BF16/I32 tensors and a shared-layout workspace.
 // Algorithm assumptions: launcher and kernels use sampler_multiblock_ok() from
 // the same layout authority, so exactly one finite route owns each shape.
@@ -8,7 +8,7 @@
 #include "ops/kernel/sampling.cuh"
 #include "core/device.h"
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 std::size_t sampling_workspace_exact_bytes(std::int32_t token_domain, std::int32_t columns) {
     return make_sampling_workspace_layout(token_domain, columns).bytes;
@@ -44,4 +44,4 @@ void sample_batch_launch(const Tensor& logits, Tensor& out, std::int32_t token_d
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

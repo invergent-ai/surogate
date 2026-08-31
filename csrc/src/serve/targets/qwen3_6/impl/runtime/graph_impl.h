@@ -3,7 +3,7 @@
 
 #include <stdexcept>
 
-namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
+namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS::schedule {
 
 template <class Context, class Body>
 void run_prepared(Context& state, DecodeGraphExecutable* executable, Body&& body) {
@@ -23,4 +23,4 @@ void capture_graph(Context& state, DecodeGraphDefinition& definition, Body&& bod
     definition.capture(state.execution.device.stream, body);
 }
 
-} // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule
+} // namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS::schedule

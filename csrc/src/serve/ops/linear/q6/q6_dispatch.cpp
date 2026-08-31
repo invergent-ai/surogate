@@ -2,7 +2,7 @@
 
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 Q6Launch select_q6_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     if (t <= 0) { throw std::invalid_argument("q6 linear: unsupported shape or T"); }
@@ -47,7 +47,7 @@ Q6Launch select_q6_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         // Qwen3.5 2B and 4B, 768 for the 0.8B. The launchers read their shapes from
         // the tensors, so the widths differ only in which tile is fastest.
         //
-        // The 1024 schedule is measured, not mirrored -- ninfer_vision_tower_tune_bench
+        // The 1024 schedule is measured, not mirrored -- sinfer_vision_tower_tune_bench
         // --hidden 1024. Mirroring 1152's picked c64 where c96 is a third faster, and
         // ran the SIMT path to t=96 where it stops winning at 64. Boundaries sit on
         // the stable regions; the harness resolves ~2 us, so adjacent tiles within
@@ -96,4 +96,4 @@ void q6_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy pol
     launch(x, w, out, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

@@ -5,7 +5,7 @@ Canonical invocation::
     python3 -m tools.convert.qwen3_6_27b.convert_nvfp4 \
       --model /path/to/Qwen3.6-27B/base-hf-bf16 \
       --nvfp4-model /path/to/Qwen3.6-27B/vllm-nvfp4-bf16 \
-      --out out/qwen3_6_27b_nvfp4.ninfer
+      --out out/qwen3_6_27b_nvfp4.sinfer
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ from . import recipe_nvfp4 as recipe
 
 
 RECIPE_ID = "qwen3_6_27b_nvfp4-v1"
-OUTPUT_BASENAME = "qwen3_6_27b_nvfp4.ninfer"
+OUTPUT_BASENAME = "qwen3_6_27b_nvfp4.sinfer"
 
 
 @dataclass(frozen=True, slots=True)

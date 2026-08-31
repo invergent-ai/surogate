@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 
-namespace ninfer::cli {
+namespace sinfer::cli {
 
 struct Options {
     bool help_requested = false;
@@ -58,4 +58,4 @@ std::uint32_t prefill_chunk  = 2048;
 [[nodiscard]] Options parse_options(int argc, char** argv);
 [[nodiscard]] std::string usage_text(const char* argv0);
 
-} // namespace ninfer::cli
+} // namespace sinfer::cli

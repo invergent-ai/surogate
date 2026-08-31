@@ -9,7 +9,7 @@
 # own KV metadata (frontend.py), the checkpoint-invariant config files come
 # from vendored per-target resources (surogate/serve/resources/), and family
 # modules (qwen35.py) invert llama.cpp's export transforms. The converter then
-# runs with its own preflight checks (NINFER_ALLOW_DERIVED_FRONTEND downgrades
+# runs with its own preflight checks (SINFER_ALLOW_DERIVED_FRONTEND downgrades
 # the tokenizer pinned-hash check to a recorded warning — the reconstruction is
 # semantically equivalent, not byte-identical). Costs one temporary BF16
 # materialization on disk (~2 bytes/param, deleted after conversion); a

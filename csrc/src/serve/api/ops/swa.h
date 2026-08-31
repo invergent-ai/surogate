@@ -9,7 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 /**
  * Host execution-resource promise for swa.
@@ -59,4 +59,4 @@ void swa(const Tensor& q, const Tensor& query_k, const Tensor& query_v, const Te
                                                        std::int32_t max_tokens,
                                                        std::int32_t batch_size);
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

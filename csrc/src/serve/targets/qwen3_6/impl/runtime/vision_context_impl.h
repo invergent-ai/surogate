@@ -22,7 +22,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
+namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS::schedule {
 namespace {
 
 std::size_t checked_mul(std::size_t a, std::size_t b, const char* label) {
@@ -412,4 +412,4 @@ double VisionPrefillSession::elapsed_seconds() const {
     return milliseconds / 1000.0;
 }
 
-} // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule
+} // namespace sinfer::targets::qwen3_6::detail::SINFER_QWEN36_RUNTIME_NS::schedule

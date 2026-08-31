@@ -27,7 +27,7 @@
 #include <cstdint>
 #include <span>
 
-namespace ninfer::runtime {
+namespace sinfer::runtime {
 
 // Opaque ticket for an in-flight round. Targets may encode whatever they need
 // (frame index, graph slot, event id) as long as it round-trips by value.
@@ -56,4 +56,4 @@ concept RoundLifecycle = requires(Program& program, RoundHandle handle,
     { program.maximum_rounds_in_flight() } -> std::convertible_to<std::uint32_t>;
 };
 
-} // namespace ninfer::runtime
+} // namespace sinfer::runtime

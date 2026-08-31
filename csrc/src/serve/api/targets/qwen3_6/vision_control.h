@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace ninfer::targets::qwen3_6 {
+namespace sinfer::targets::qwen3_6 {
 
 struct VisionItemControl {
     PromptModality modality = PromptModality::Image;
@@ -29,4 +29,4 @@ struct VisionControl {
 
 [[nodiscard]] VisionControl build_vision_control(const PreparedPromptData& prompt);
 
-} // namespace ninfer::targets::qwen3_6
+} // namespace sinfer::targets::qwen3_6

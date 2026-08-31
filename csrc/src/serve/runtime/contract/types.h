@@ -7,16 +7,16 @@
 #include <cstdint>
 #include <span>
 
-namespace ninfer::runtime {
+namespace sinfer::runtime {
 
-using ::ninfer::FinishReason;
-using ::ninfer::KvCapacityMode;
-using ::ninfer::KvCapacityPolicy;
-using ::ninfer::OutputChannel;
-using ::ninfer::ResolvedSamplingParameters;
-using ::ninfer::StopPolicy;
-using ::ninfer::StopString;
-using ::ninfer::TokenId;
+using ::sinfer::FinishReason;
+using ::sinfer::KvCapacityMode;
+using ::sinfer::KvCapacityPolicy;
+using ::sinfer::OutputChannel;
+using ::sinfer::ResolvedSamplingParameters;
+using ::sinfer::StopPolicy;
+using ::sinfer::StopString;
+using ::sinfer::TokenId;
 
 // Engine has already selected the registered model/mode preset, applied every explicit override,
 // and validated these values before constructing the runtime request.
@@ -131,4 +131,4 @@ struct KvCapacityResolution {
     std::size_t planned_slack_bytes                  = 0;
 };
 
-} // namespace ninfer::runtime
+} // namespace sinfer::runtime

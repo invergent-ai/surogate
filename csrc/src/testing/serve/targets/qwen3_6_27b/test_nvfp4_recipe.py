@@ -123,7 +123,7 @@ def test_input_divisor_materialization_preserves_positive_fp32_word():
 
 
 def test_converter_rejects_wrong_basename_before_source_or_file_creation(tmp_path):
-    output = tmp_path / "qwen3_6_27b.ninfer"
+    output = tmp_path / "qwen3_6_27b.sinfer"
     with pytest.raises(ValueError, match="output basename"):
         convert_nvfp4.convert(
             tmp_path / "missing-base",

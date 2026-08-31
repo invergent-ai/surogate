@@ -1,6 +1,6 @@
 #pragma once
 
-// Implements: include/ninfer/ops/speculative_round.h
+// Implements: include/sinfer/ops/speculative_round.h
 // Match: contiguous request-major state and BF16 verification logits.
 // Algorithm assumptions: small vocabularies use one cooperative block; the
 // registered full-vocabulary stochastic route uses the sampling partial/group
@@ -13,7 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 __global__ void speculative_prepare_verify_inputs_kernel(const std::int32_t* anchors,
                                                          const std::int32_t* drafts,
@@ -448,4 +448,4 @@ __global__ void proposal_remap_token_ids_kernel(std::int32_t* proposal_tokens,
     if (idx >= 0 && idx < n) { proposal_tokens[i] = id_map[idx]; }
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

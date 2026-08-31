@@ -4,7 +4,7 @@
 
 #include "core/device.h"
 #include "direct_bf16_weight.cuh"
-#include "ninfer_bench_common.h"
+#include "sinfer_bench_common.h"
 #include "ops/linear_add/bf16/bf16_linear_add_plan.h"
 
 #include <cuda_profiler_api.h>
@@ -23,7 +23,7 @@
 #include <string_view>
 #include <vector>
 
-using namespace ninfer;
+using namespace sinfer;
 
 namespace {
 
@@ -355,7 +355,7 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "ninfer_bf16_linear_add_bench: %s\n", error.what());
+        std::fprintf(stderr, "sinfer_bf16_linear_add_bench: %s\n", error.what());
         return 1;
     }
 }

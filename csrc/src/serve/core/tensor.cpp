@@ -4,7 +4,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer {
+namespace sinfer {
 namespace {
 
 std::int64_t checked_mul_i64(std::int64_t a, std::int64_t b) {
@@ -146,4 +146,4 @@ Tensor Tensor::permute(std::initializer_list<int> order) const {
     return out;
 }
 
-} // namespace ninfer
+} // namespace sinfer

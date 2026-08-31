@@ -1,4 +1,4 @@
-"""Migrate one published NInfer v1 artifact to the v2 identity directory in place."""
+"""Migrate one published SInfer v1 artifact to the v2 identity directory in place."""
 
 from __future__ import annotations
 
@@ -101,7 +101,7 @@ def _read_v1_directory(path: Path) -> V1Directory:
         prefix = handle.read(PREFIX_BYTES)
         magic, json_bytes = PREFIX.unpack(prefix)
         if magic != V1_MAGIC:
-            raise MigrationError("artifact magic is not NInfer v1")
+            raise MigrationError("artifact magic is not SInfer v1")
         if json_bytes == 0:
             raise MigrationError("json_bytes must be positive")
         metadata_end = PREFIX_BYTES + json_bytes

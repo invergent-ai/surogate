@@ -12,7 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 inline constexpr int kSamplerBlock               = 256;
 inline constexpr int kSamplerTileItems           = 256;
@@ -114,4 +114,4 @@ inline SamplingWorkspaceLayout make_sampling_workspace_layout(std::int32_t token
     return out;
 }
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

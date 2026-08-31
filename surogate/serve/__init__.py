@@ -9,5 +9,5 @@
 #               synthesis) + one module per model family that needs
 #               llama.cpp export-transform inversions (qwen35.py, ...).
 #
-# The C++ engine itself is vendored at csrc/src/serve/ninfer and built by
+# The C++ engine itself is vendored at csrc/src/serve/sinfer and built by
 # `make serve-build`; surogate/cli/serve.py is the thin exec wrapper.

@@ -8,7 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 /**
  * The closed geometry of one sparse-MoE family instance. The kernels are compiled per
@@ -175,4 +175,4 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
                 Tensor& destination, WorkspaceArena& workspace, cudaStream_t stream,
                 const SparseMoeRoundHook& hook);
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

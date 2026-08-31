@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 namespace {
 
 constexpr int kBlock = 256;
@@ -93,4 +93,4 @@ void kv_cache_append_prefix_launch(const Tensor& k, const Tensor& v, const Tenso
     launch_cyclic(k, v, positions, counts, lanes, cache, plan, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail

@@ -183,7 +183,7 @@ without batch flags understated it 3.9× and are gone.
 - **The 27B's prompt processing is the one place a competitor is ahead, and it is
   not the kernels.** vLLM serves 12,942 prompt tok/s on the prefill-heavy shape
   against our 11,557 — 89 %, measured in one session on one card. Our kernels do
-  **12,707** at pp2048 in `ninfer_bench` with no server at all, which is vLLM's
+  **12,707** at pp2048 in `sinfer_bench` with no server at all, which is vLLM's
   served number to within 2 %, so the loss sits between our kernels and our
   serving. Neither obvious knob touches it: admission is worth 1.5 % and the prompt
   chunk nothing across 2,048-16,384, and vLLM wins while running *less* KV than we
@@ -235,7 +235,7 @@ without batch flags understated it 3.9× and are gone.
   SECONDS 512 128 WARMUP SHARDS` against the launch line in the row's comment
   (shard the clients above ~5k tok/s; one Python process caps a fast engine).
   Engine-level questions — flags, binaries, cards, kernels — belong in
-  `csrc/build-serve/serve_bench/ninfer_bench` instead, which does load, warm-up
+  `csrc/build-serve/serve_bench/sinfer_bench` instead, which does load, warm-up
   and five repetitions of pp512+tg128 in about 3 s (it needs
   `--corpus csrc/src/testing/serve/bench/fixtures/bench_corpus.ids`).
 - **llama.cpp rows** use `study/llama.cpp-master/build/bin/llama-server -ngl 999
@@ -247,7 +247,7 @@ without batch flags understated it 3.9× and are gone.
 - **How to rebuild the 35B's routed-NVFP4 artifact**, if the format is ever
   wanted for a model that arrives on W8:
   `python -m surogate.serve.tools.convert.qwen3_6_35b_a3b.convert --model <BF16 dir>
-  --routed-nvfp4 <compressed-tensors NVFP4 dir> --out <path>.ninfer` — 77 s, and
+  --routed-nvfp4 <compressed-tensors NVFP4 dir> --out <path>.sinfer` — 77 s, and
   the converter refuses anything that is not `compressed-tensors` /
   `nvfp4-pack-quantized` (a ModelOpt export inverts the global-scale convention).
 

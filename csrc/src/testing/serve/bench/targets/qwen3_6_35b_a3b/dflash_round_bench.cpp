@@ -26,24 +26,24 @@
 
 namespace {
 
-namespace target = ninfer::targets::qwen3_6_35b_a3b;
+namespace target = sinfer::targets::qwen3_6_35b_a3b;
 using Clock      = std::chrono::steady_clock;
 
 struct Options {
-    std::filesystem::path artifact = "out/qwen3_6_35b_a3b.ninfer";
+    std::filesystem::path artifact = "out/qwen3_6_35b_a3b.sinfer";
     int device                     = 0;
     int warmup                     = 2;
     int repetitions                = 10;
     std::uint32_t context_tokens   = 128;
     std::uint32_t draft_tokens     = 15;
     std::uint32_t batch_size       = 1;
-    ninfer::ProposalHead proposal  = ninfer::ProposalHead::Optimized;
+    sinfer::ProposalHead proposal  = sinfer::ProposalHead::Optimized;
     bool use_cuda_graph            = true;
 };
 
 void print_usage(const char* executable) {
     std::cout << "usage: " << executable
-              << " [--artifact <model.ninfer>] [--device <id>] [--context <tokens>]"
+              << " [--artifact <model.sinfer>] [--device <id>] [--context <tokens>]"
                  " [--warmup <n>] [--reps <n>] [--draft-tokens <1..15>]"
                  " [--batch <1..8>]"
                  " [--proposal-head full|optimized] [--no-cuda-graph]\n";
@@ -85,16 +85,16 @@ Options parse_options(int argc, char** argv) {
         } else if (argument == "--proposal-head") {
             const std::string_view head(value("--proposal-head"));
             if (head == "full") {
-                options.proposal = ninfer::ProposalHead::Full;
+                options.proposal = sinfer::ProposalHead::Full;
             } else if (head == "optimized") {
-                options.proposal = ninfer::ProposalHead::Optimized;
+                options.proposal = sinfer::ProposalHead::Optimized;
             } else {
                 throw std::invalid_argument("--proposal-head must be full or optimized");
             }
         } else if (argument == "--no-cuda-graph") {
             options.use_cuda_graph = false;
         } else if (argument == "-h" || argument == "--help") {
-            print_usage(argc > 0 ? argv[0] : "ninfer_qwen3_6_35b_a3b_dflash_round_bench");
+            print_usage(argc > 0 ? argv[0] : "sinfer_qwen3_6_35b_a3b_dflash_round_bench");
             std::exit(0);
         } else {
             throw std::invalid_argument("unknown argument: " + std::string(argument));
@@ -111,14 +111,14 @@ Options parse_options(int argc, char** argv) {
     if (options.draft_tokens == 0 || options.draft_tokens > 15) {
         throw std::invalid_argument("--draft-tokens must be in [1,15]");
     }
-    if (options.batch_size == 0 || options.batch_size > ninfer::kMaximumConcurrency) {
+    if (options.batch_size == 0 || options.batch_size > sinfer::kMaximumConcurrency) {
         throw std::invalid_argument("--batch must be in [1,8]");
     }
     return options;
 }
 
-std::vector<ninfer::TokenId> prompt_tokens(std::uint32_t count) {
-    std::vector<ninfer::TokenId> prompt{
+std::vector<sinfer::TokenId> prompt_tokens(std::uint32_t count) {
+    std::vector<sinfer::TokenId> prompt{
         248045, 846,    198, 109266, 3709,  96220, 117443, 97913,
         1710,   248046, 198, 248045, 74455, 198,   248068, 198,
     };
@@ -132,27 +132,27 @@ struct RoundMeasurement {
     std::uint32_t licensed_tokens = 0;
 };
 
-RoundMeasurement measure_round(target::Package::Program& program, ninfer::DeviceContext& device,
+RoundMeasurement measure_round(target::Package::Program& program, sinfer::DeviceContext& device,
                                std::uint32_t batch_size, std::uint32_t draft_tokens) {
-    std::array<std::uint32_t, ninfer::kMaximumConcurrency> lanes{};
-    std::array<ninfer::runtime::RoundBudget, ninfer::kMaximumConcurrency> budgets{};
+    std::array<std::uint32_t, sinfer::kMaximumConcurrency> lanes{};
+    std::array<sinfer::runtime::RoundBudget, sinfer::kMaximumConcurrency> budgets{};
     for (std::uint32_t row = 0; row < batch_size; ++row) {
         lanes[row]   = row;
         budgets[row] = {.generated_tokens_remaining = draft_tokens + 1};
     }
     const auto lane_span = std::span<const std::uint32_t>(lanes.data(), batch_size);
     const auto budget_span =
-        std::span<const ninfer::runtime::RoundBudget>(budgets.data(), batch_size);
-    ninfer::CudaEventTimer timer(device);
+        std::span<const sinfer::runtime::RoundBudget>(budgets.data(), batch_size);
+    sinfer::CudaEventTimer timer(device);
     const auto wall_start = Clock::now();
     timer.start();
     const auto round = program.decode_batch(lane_span, budget_span);
     if (round.row_counts.size() != batch_size) {
         throw std::runtime_error("DFlash benchmark round returned invalid row counts");
     }
-    std::array<std::uint32_t, ninfer::kMaximumConcurrency> accepted{};
-    std::array<std::uint8_t, ninfer::kMaximumConcurrency> terminal{};
-    std::array<std::uint8_t, ninfer::kMaximumConcurrency> cancelled{};
+    std::array<std::uint32_t, sinfer::kMaximumConcurrency> accepted{};
+    std::array<std::uint8_t, sinfer::kMaximumConcurrency> terminal{};
+    std::array<std::uint8_t, sinfer::kMaximumConcurrency> cancelled{};
     std::uint32_t licensed = 0;
     for (std::uint32_t row = 0; row < batch_size; ++row) {
         const std::int32_t count = round.row_counts[row];
@@ -196,27 +196,27 @@ int run(const Options& options) {
         throw std::invalid_argument("context and measured rounds exceed native capacity");
     }
 
-    ninfer::EngineOptions engine;
+    sinfer::EngineOptions engine;
     engine.artifact_path = options.artifact;
     engine.device        = options.device;
     engine.max_context   = static_cast<std::uint32_t>(per_request_capacity);
     engine.kv_capacity =
-        ninfer::KvCapacityPolicy::explicit_capacity(static_cast<std::uint32_t>(capacity));
+        sinfer::KvCapacityPolicy::explicit_capacity(static_cast<std::uint32_t>(capacity));
     engine.prefill_chunk             = 128;
-    engine.kv_cache                  = ninfer::KvCacheStorage::BFloat16;
-    engine.speculative.backend       = ninfer::SpeculativeBackend::DFlash;
+    engine.kv_cache                  = sinfer::KvCacheStorage::BFloat16;
+    engine.speculative.backend       = sinfer::SpeculativeBackend::DFlash;
     engine.speculative.draft_tokens  = options.draft_tokens;
     engine.speculative.proposal_head = options.proposal;
     engine.use_cuda_graph            = options.use_cuda_graph;
     engine.max_concurrency           = options.batch_size;
 
-    ninfer::DeviceContext device(options.device);
-    ninfer::artifact::Reader reader(options.artifact);
+    sinfer::DeviceContext device(options.device);
+    sinfer::artifact::Reader reader(options.artifact);
     const auto weights_profile = target::Package::resolve_weights(reader.identity());
-    ninfer::artifact::Binder binder(reader);
+    sinfer::artifact::Binder binder(reader);
     auto load_plan        = target::Package::plan_load(binder, engine, weights_profile);
     auto planner          = target::Package::make_sequence_planner(device, engine, weights_profile);
-    const auto resolution = ninfer::runtime::resolve_kv_capacity(
+    const auto resolution = sinfer::runtime::resolve_kv_capacity(
         engine.kv_capacity, planner.capacity_curve(), std::numeric_limits<std::size_t>::max());
     auto sequence                      = std::move(planner).finalize(resolution.main_page_groups);
     const std::uint64_t weight_bytes   = load_plan.materialization().device_capacity_bytes;
@@ -234,14 +234,14 @@ int run(const Options& options) {
             " bytes of device memory, but only " + std::to_string(free_bytes) + " bytes are free");
     }
     auto materialized =
-        ninfer::artifact::materialize(reader, load_plan.materialization(), device, nullptr);
+        sinfer::artifact::materialize(reader, load_plan.materialization(), device, nullptr);
     auto model =
         target::Package::construct_loaded_model(std::move(load_plan), std::move(materialized));
     auto frontend                      = target::Package::make_frontend(*model, engine);
     const std::size_t request_capacity = sequence.request_transient_capacity_bytes();
     auto program = target::Package::create_program(*model, std::move(sequence), device);
-    ninfer::runtime::RequestMemory request_memory(device, request_capacity);
-    ninfer::runtime::ResolvedExecutionOptions execution;
+    sinfer::runtime::RequestMemory request_memory(device, request_capacity);
+    sinfer::runtime::ResolvedExecutionOptions execution;
     execution.requested_output_tokens = 1 + measured_rounds * (options.draft_tokens + 1);
     execution.allow_prefix_reuse      = false;
     for (std::uint32_t lane = 0; lane < options.batch_size; ++lane) {
@@ -263,7 +263,7 @@ int run(const Options& options) {
     for (int iteration = 0; iteration < options.warmup; ++iteration) {
         (void)measure_round(*program, device, options.batch_size, options.draft_tokens);
     }
-    std::vector<ninfer::SpeculativeStats> before;
+    std::vector<sinfer::SpeculativeStats> before;
     before.reserve(options.batch_size);
     for (std::uint32_t lane = 0; lane < options.batch_size; ++lane) {
         before.push_back(program->speculative_stats_lane(lane));
@@ -275,7 +275,7 @@ int run(const Options& options) {
         measurements.push_back(
             measure_round(*program, device, options.batch_size, options.draft_tokens));
     }
-    std::vector<ninfer::SpeculativeStats> after;
+    std::vector<sinfer::SpeculativeStats> after;
     after.reserve(options.batch_size);
     for (std::uint32_t lane = 0; lane < options.batch_size; ++lane) {
         after.push_back(program->speculative_stats_lane(lane));
@@ -313,14 +313,14 @@ int run(const Options& options) {
     const double mean_licensed_per_request =
         mean_licensed_per_batch / static_cast<double>(options.batch_size);
 
-    std::cout << "format,ninfer_qwen3_6_35b_a3b_dflash_round_bench_v2\n";
+    std::cout << "format,sinfer_qwen3_6_35b_a3b_dflash_round_bench_v2\n";
     std::cout << "artifact," << options.artifact.string() << '\n';
     std::cout << "device," << device.props.name << '\n';
     std::cout << "context_tokens," << options.context_tokens << '\n';
     std::cout << "draft_tokens," << options.draft_tokens << '\n';
     std::cout << "batch_size," << options.batch_size << '\n';
     std::cout << "proposal_head,"
-              << (options.proposal == ninfer::ProposalHead::Optimized ? "optimized" : "full")
+              << (options.proposal == sinfer::ProposalHead::Optimized ? "optimized" : "full")
               << '\n';
     std::cout << "cuda_graph," << (options.use_cuda_graph ? "true" : "false") << '\n';
     std::cout << "warmup," << options.warmup << '\n';
@@ -351,7 +351,7 @@ int main(int argc, char** argv) {
     try {
         return run(parse_options(argc, argv));
     } catch (const std::exception& error) {
-        std::cerr << "ninfer_qwen3_6_35b_a3b_dflash_round_bench: " << error.what() << '\n';
+        std::cerr << "sinfer_qwen3_6_35b_a3b_dflash_round_bench: " << error.what() << '\n';
         return 1;
     }
 }

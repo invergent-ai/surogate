@@ -12,7 +12,7 @@
 #include <string>
 #include <utility>
 
-namespace ninfer {
+namespace sinfer {
 namespace {
 
 std::int32_t checked_i32(std::uint32_t value, const char* label) {
@@ -474,4 +474,4 @@ void resize_paged_kv_bundle(std::span<const PagedKVResize> changes) {
     }
 }
 
-} // namespace ninfer
+} // namespace sinfer

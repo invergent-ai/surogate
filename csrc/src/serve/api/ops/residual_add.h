@@ -4,7 +4,7 @@
 
 #include <cuda_runtime.h> // cudaStream_t
 
-namespace ninfer::ops {
+namespace sinfer::ops {
 
 /**
  * Elementwise residual update:
@@ -19,4 +19,4 @@ namespace ninfer::ops {
  */
 void residual_add(const Tensor& y, Tensor& x, cudaStream_t stream);
 
-} // namespace ninfer::ops
+} // namespace sinfer::ops

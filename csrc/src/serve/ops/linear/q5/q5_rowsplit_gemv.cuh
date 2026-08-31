@@ -29,7 +29,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace sinfer::ops::detail {
 
 // Issue the cp.async copies for one 16-group tile into a shared buffer slot, then
 // commit them as one pipeline group. Every lane commits (even lanes that issue
@@ -223,4 +223,4 @@ q5_rowsplit_gemv_residual_launch_kernel(const __nv_bfloat16* x, const std::uint8
 }
 
 
-} // namespace ninfer::ops::detail
+} // namespace sinfer::ops::detail
