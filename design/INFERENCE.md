@@ -2913,3 +2913,79 @@ not just this one.
 
 Not built yet: text input (needs a SentencePiece-flavoured tokenizer beside the
 Qwen one), sequence batching, and the CPU backend.
+
+## 2026-08-31 — The CPU encoder: 70 ms at 512 tokens, ahead of llama.cpp everywhere
+
+Two of the three "not built yet" items above are now built: text input and the
+CPU backend. Text input first, because it was the smaller and the more
+self-contained: the artifact ships the model's own `tokenizer.model` (4.7 MB of
+SentencePiece proto, not the 33 MB tokenizer.json), and both the Python and the
+C++ side load it directly — 414/414 and 73/73 ids identical to HF transformers.
+The one wrinkle worth recording: the proto does not carry the post-processor, so
+bos=2 and eos=1 are appended by hand, and a test pins them.
+
+The CPU backend is `csrc/src/serve/encoder/cpu/` — eleven kernels and a
+300-line forward, reading the same artifact, behind the same server binary via
+`--device cpu`. First correct forward: 1,018 ms at 512 tokens. Shipped: 69.2 ms.
+In order, with what each step bought:
+
+| step | ms | what it was |
+|---|---|---|
+| scalar-correct | 1,018 | |
+| AVX-512 microkernel | 739 | runtime dispatch (`__builtin_cpu_supports`), no global `-mavx512f` |
+| rope tables | 337 | inline pow/sin/cos was 6.7M transcendentals per forward — more than every GEMM combined |
+| oneDNN | 260 | cached primitives, gelu+mul fused as post-ops, batched strided attention matmuls |
+| BF16 end to end | ~190 | weights decode W8→BF16 once, activations narrowed once per GEMM; 1,577 GFLOP/s vs 796 mixed |
+| one OpenMP team | **69.2** | the pool's `parallel_for` now runs on the same team oneDNN uses |
+
+The last row is the interesting one. With the encoder's own pool beside
+oneDNN's OpenMP team, every phase boundary parked one team and woke the other —
+three hundred times per forward — and the wait policy could only choose who
+paid: PASSIVE measured 207 ms, ACTIVE 260. With everything on one team the
+handoff no longer exists and the answer inverts: ACTIVE 69.2, PASSIVE 122,
+because the spin now covers microsecond gaps instead of starving a sibling.
+`OMP_WAIT_POLICY=ACTIVE` must come from the environment; libgomp reads it
+before main.
+
+OpenMP had a second lesson waiting in the server. libgomp keeps the team per
+*master thread*, and httplib hands each request to whichever worker is free, so
+serving rebuilt and re-pinned the team once per request: 1,026 ms p50 for the
+same forward the CLI ran in 69. The server now posts every forward to one
+dedicated model thread. The handoff slot holds a single job, and a second
+poster waits for the runner to drain it — overwriting the slot dropped the job
+and hung its requester for the full HTTP timeout, which a concurrent benchmark
+found within minutes.
+
+GEMMs sit behind a vendor seam: `GemmBackend{Builtin, ZenDnn, OneDnn}`, chosen
+from the CPU vendor at runtime with `SINFER_CPU_GEMM` as the override, each
+vendor library compiled in only when injected at configure time, the AVX-512
+builtin always present. oneDNN turned out to be enough — it is also what
+OpenVINO's CPU plugin runs underneath, so the Intel slot is already served;
+ZenDNN builds behind its own flag but brings four transitive dependencies for a
+GEMM that was never the bottleneck.
+
+The head-to-head, through the same `/v1/embeddings` harness with token-id
+inputs, 16 pinned physical cores of one NUMA node, one engine alive at a time
+(an idle ACTIVE team spins its cores and starved llama.cpp by 48% in the first,
+discarded run). llama.cpp gets the same pinning, which is also its own best
+configuration on this host — 180 ms against the 225 its 32-thread default
+reaches:
+
+| 2× EPYC 9124, Q8_0 | surogate | llama.cpp -t 16 | |
+|---|---|---|---|
+| 512 tokens, single stream | **70.4 ms** | 180.1 ms | 2.6× faster |
+| 512 tokens, batch 8 × conc 4 | **14.6 emb/s** | 6.6 emb/s | 2.2× faster |
+| 128 tokens, single stream | **25.4 ms** | 54.3 ms | 2.1× faster |
+| 128 tokens, batch 8 × conc 4 | **41.4 emb/s** | 29.4 emb/s | 1.4× faster |
+
+Ahead in every cell, with the golden-reference cosine at 0.999891 throughout.
+The 1.4× cell is the honest one to watch: one model thread serialises forwards
+by design (a single 512-token forward already saturates the node), so
+concurrency buys nothing here yet, while llama.cpp amortises its floor across
+`-np 4` slots. Sequence batching within a forward — packing the projections,
+attention already per-sequence — is the remaining lever, same as on the GPU.
+
+Still open from this line of work: reranking (the same encoder family with a
+score head where the pool-and-normalise sits — most of this entry is the work),
+and the serve generator, which keeps waiting until the C++ contract stops
+moving.
