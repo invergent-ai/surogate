@@ -1202,10 +1202,13 @@ void Variant::prepare_expert_split(const ModelView& model) {
 void Variant::configure_cpu_moe_prefill(float share, std::uint32_t prefill_chunk) {
     int device = 0;
     CUDA_CHECK(cudaGetDevice(&device));
+    // Same lock as the other configure_* writes: pipeline stages configure concurrently.
+    std::lock_guard<std::mutex> lock(expert_slot_mutex());
     configured_cpu_prefill()[device] = {share, prefill_chunk};
 }
 
 void Variant::configure_cpu_pool_per_socket(bool per_socket) {
+    std::lock_guard<std::mutex> lock(expert_slot_mutex());
     configured_cpu_pool_per_socket() = per_socket;
 }
 

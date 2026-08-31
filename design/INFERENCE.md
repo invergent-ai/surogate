@@ -41,7 +41,7 @@ phase 3 = PP across 8 GPUs with the offload inside each stage; phase 4 (EP) reje
 | Phase 3: pipeline parallelism (`--devices A,B,...`, one layer-range stage per card, residual over pinned host memory, per-stage offload, steady-state software pipeline with prompts as asynchronous batch-0 mixed flights) | **done 2026-08-29** | 2-stage forward bit-exact vs one card at all 48 boundaries; Flash-Next on 8×5090 (3,072 slots/stage, fully resident): 57.9 tok/s @1 (TTFT 237 ms), 383.9 @16 (615 ms); 27B 1,057 @100; 35B-A3B 1,960 @100; answers correct under load at the measured concurrency |
 | Q4 host expert bank (`--host-expert-bank`, **default q4 with the slot cache**) | **done 2026-08-29** | requantiser + VNNI host kernels + gather unpack, all unit-tested (affine grids to 6e-5, kernels 1e-7, unpack byte-exact); process peak 101 GB vs 297, startup 96 s, decode +~10 %; coherence 97/100 vs W8 95/100 (reuse off), needle 12/12 at 3.5k and 11/12 at 5.7k with the indexer |
 | QSA indexer (contexts past 2,051) | **done 2026-08-29** | op + unit test; wired at every text attention site; context cap 262,144; needle retrieval 12/12 at 3.5k and 12/12 at 5.7k tokens (dense control 11/12 each); no indexer kernel runs below the budget |
-| Phase 3 leftovers: the ~2 s synchronous prefill stage-step (bypassed by batch-0 flights, never explained), parallel stage construction (startup ~2 min) | open | see the 2026-08-29 entries; the scan-resistant slot ring shipped 2026-08-29 (2-stage 56.1 → 115.3) |
+| Phase 3 leftovers: the ~2 s synchronous prefill stage-step (bypassed by batch-0 flights, never explained); ~~parallel stage construction~~ **done 2026-08-31** (134 → 125 s — and the measurement shows the real startup cost is ~100 s of host-bank build/pinning that threads cannot help; that is the remaining item) | open | see the 2026-08-29 entries; the scan-resistant slot ring shipped 2026-08-29 (2-stage 56.1 → 115.3) |
 
 ## Next: phase 2 (single-GPU offload) — plan as of 2026-08-28
 
@@ -2729,4 +2729,26 @@ wants small chunks (272/405 at 1,024 against 208/296 at 8,192 for 16/64 users) b
 chunks are what fill eight stages. GGUF warm-up note for anyone re-measuring: the pinned banks
 evict the page cache, and a cold llama.cpp load then outruns a 20-minute ready window; one
 sequential `cat` of the shards (33 s) fixes it.
+
+## 2026-08-31 — parallel stage construction: shipped, and it re-priced the leftover
+
+The 8-card pipeline built its stages one after another in a single thread
+(`registry.cpp construct_pipeline`). Now stage 0 constructs alone — it resolves the shared
+context ceiling and KV capacity the rest plan with — and stages 1..N-1 construct on one thread
+per card, each creating its own `DeviceContext` (whose constructor binds that thread's CUDA
+device). Exceptions join-then-rethrow; summaries and the stage lines print in order;
+`SUROGATE_SERVE_PIPELINE_SERIAL_CONSTRUCT=1` restores the old order. Two configure_* writes the
+constructors make (`configure_cpu_moe_prefill`, `configure_cpu_pool_per_socket`) were unlocked
+globals — a benign latent race made real by this change — and now take `expert_slot_mutex` like
+their siblings. Everything else the audit touched was already safe: the artifact reader is
+mmap + offset-`pread` with no cursor, the expert pools and slot caches sit behind mutexes, and
+the per-device scratch maps are lock-guarded.
+
+A/B on the same binary, Flash-Next on 8 cards: **125 s parallel against 134 s serial**, with the
+16-user probe reproducing the board row (276.7 against 272.3) and coherence 16/16. Not the
+~35 s predicted, and the milestones say why: the seven stage uploads complete within 0.3 s of
+one another (the fan-out works) but only ~5 s of a stage's construction is device work — the
+other ~100 s is the shared host-side prologue, building and pinning ~90 GB of host expert bank,
+which is kernel-page-allocator-bound and indifferent to threads. The leftover is re-priced
+accordingly: the startup lever is the bank build, not the construction order.
 

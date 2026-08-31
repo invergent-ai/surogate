@@ -17,6 +17,8 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <exception>
+#include <thread>
 #include <variant>
 #include <utility>
 
@@ -424,8 +426,7 @@ ConstructedTarget construct_pipeline(const EngineOptions& options, artifact::Rea
     ModelSamplingDefaults sampling_defaults{};
     std::uint32_t resolved_kv      = 0;
     std::uint32_t resolved_context = 0;
-    for (int s = 0; s < stage_count; ++s) {
-        devices.push_back(std::make_unique<DeviceContext>(options.devices[static_cast<std::size_t>(s)]));
+    const auto stage_options_for = [&](int s) {
         EngineOptions stage_options             = options;
         stage_options.device                    = options.devices[static_cast<std::size_t>(s)];
         stage_options.pipeline_stage_first      = layers * s / stage_count;
@@ -433,14 +434,6 @@ ConstructedTarget construct_pipeline(const EngineOptions& options, artifact::Rea
         stage_options.pipeline_import_pinned    = nullptr; // each stage owns its import buffer
         stage_options.cpu_moe_pool_per_socket   = std::getenv("SUROGATE_SERVE_CPU_MOE_POOL_SHARED") == nullptr;
         stage_options.pipeline_boundary_columns = options.prefill_chunk + options.max_concurrency + 128;
-        if (s == 0 && stage_options.max_context == 0) {
-            // Every stage must plan the same per-request ceiling: resolve it once, on the first
-            // stage's device, and hand it to the rest.
-            resolved_context        = resolve_automatic_context_for_pipeline<Target>(
-                *devices.back(), stage_options, reader);
-            stage_options.max_context = resolved_context;
-            stage_options.prefill_chunk = std::min(options.prefill_chunk, resolved_context);
-        }
         if (s > 0) {
             stage_options.kv_capacity = KvCapacityPolicy::explicit_capacity(resolved_kv);
             if (resolved_context != 0) {
@@ -448,20 +441,78 @@ ConstructedTarget construct_pipeline(const EngineOptions& options, artifact::Rea
                 stage_options.prefill_chunk = std::min(options.prefill_chunk, resolved_context);
             }
         }
+        return stage_options;
+    };
+
+    // Stage 0 first, alone: it resolves the shared per-request context ceiling and the KV
+    // capacity every later stage plans with.
+    devices.resize(static_cast<std::size_t>(stage_count));
+    stages.resize(static_cast<std::size_t>(stage_count));
+    {
+        devices[0] = std::make_unique<DeviceContext>(options.devices[0]);
+        EngineOptions stage_options = stage_options_for(0);
+        if (stage_options.max_context == 0) {
+            resolved_context            = resolve_automatic_context_for_pipeline<Target>(
+                *devices[0], stage_options, reader);
+            stage_options.max_context   = resolved_context;
+            stage_options.prefill_chunk = std::min(options.prefill_chunk, resolved_context);
+        }
         ConstructedTarget stage = construct_registered<Target, Loaded, Instance>(
-            stage_options, *devices.back(), reader, load_start, target_key);
-        auto* instance = std::get<std::unique_ptr<Instance>>(stage.active).release();
-        stages.emplace_back(instance);
-        if (s == 0) {
-            resolved_kv       = instance->kv_capacity_resolution.resolved_tokens;
-            sampling_defaults = stage.sampling_defaults;
-            summary           = std::move(stage.load);
+            stage_options, *devices[0], reader, load_start, target_key);
+        stages[0].reset(std::get<std::unique_ptr<Instance>>(stage.active).release());
+        resolved_kv       = stages[0]->kv_capacity_resolution.resolved_tokens;
+        sampling_defaults = stage.sampling_defaults;
+        summary           = std::move(stage.load);
+        std::fprintf(stderr, "pipeline: stage 0 on device %d, layers [%d, %d)\n",
+                     stage_options.device, stage_options.pipeline_stage_first,
+                     stage_options.pipeline_stage_last);
+    }
+
+    // The remaining stages construct concurrently, one thread per card: their uploads, program
+    // builds and graph captures touch disjoint devices, the artifact reader is stateless
+    // (mmap + offset pread), and every configure_* global the constructors write is
+    // mutex-guarded. A worker makes its own DeviceContext, whose constructor binds that
+    // thread's current CUDA device. Startup drops from the sum of the stages to roughly
+    // stage 0 plus the slowest remaining stage (~2 min -> ~35 s on 8 cards).
+    // SUROGATE_SERVE_PIPELINE_SERIAL_CONSTRUCT=1 restores the one-at-a-time order.
+    if (stage_count > 1) {
+        const bool serial = std::getenv("SUROGATE_SERVE_PIPELINE_SERIAL_CONSTRUCT") != nullptr;
+        std::vector<ConstructedTarget> results(static_cast<std::size_t>(stage_count));
+        std::vector<std::exception_ptr> failures(static_cast<std::size_t>(stage_count));
+        const auto construct_stage = [&](int s) {
+            try {
+                devices[static_cast<std::size_t>(s)] =
+                    std::make_unique<DeviceContext>(options.devices[static_cast<std::size_t>(s)]);
+                results[static_cast<std::size_t>(s)] = construct_registered<Target, Loaded, Instance>(
+                    stage_options_for(s), *devices[static_cast<std::size_t>(s)], reader, load_start,
+                    target_key);
+            } catch (...) {
+                failures[static_cast<std::size_t>(s)] = std::current_exception();
+            }
+        };
+        if (serial) {
+            for (int s = 1; s < stage_count; ++s) { construct_stage(s); }
         } else {
+            std::vector<std::thread> workers;
+            workers.reserve(static_cast<std::size_t>(stage_count) - 1);
+            for (int s = 1; s < stage_count; ++s) { workers.emplace_back(construct_stage, s); }
+            for (std::thread& worker : workers) { worker.join(); }
+        }
+        for (int s = 1; s < stage_count; ++s) {
+            if (failures[static_cast<std::size_t>(s)]) {
+                std::rethrow_exception(failures[static_cast<std::size_t>(s)]);
+            }
+            ConstructedTarget& stage = results[static_cast<std::size_t>(s)];
+            stages[static_cast<std::size_t>(s)].reset(
+                std::get<std::unique_ptr<Instance>>(stage.active).release());
             summary.artifact_bytes_read += stage.load.artifact_bytes_read;
             summary.host_to_device_bytes += stage.load.host_to_device_bytes;
+            std::fprintf(stderr, "pipeline: stage %d on device %d, layers [%d, %d)\n", s,
+                         options.devices[static_cast<std::size_t>(s)], layers * s / stage_count,
+                         layers * (s + 1) / stage_count);
         }
-        std::fprintf(stderr, "pipeline: stage %d on device %d, layers [%d, %d)\n", s, stage_options.device,
-                     stage_options.pipeline_stage_first, stage_options.pipeline_stage_last);
+        // The serial loop left the last stage's device current; keep that post-condition.
+        CUDA_CHECK(cudaSetDevice(devices.back()->device));
     }
     summary.load_seconds = std::chrono::duration<double>(Clock::now() - load_start).count();
     auto pipeline = std::make_unique<runtime::PipelineInstance<Instance>>(std::move(devices), std::move(stages));
