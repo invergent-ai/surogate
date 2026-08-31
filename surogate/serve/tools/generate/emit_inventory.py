@@ -40,21 +40,26 @@ def geometry(config: dict[str, Any]) -> dict[str, int]:
     conv_dim = 2 * key_dim + value_dim
     query_size = config["num_query_heads"] * config["head_size"]
     kv_size = config["num_kv_heads"] * config["head_size"]
-    experts, expert_ffn = config["num_experts"], config["d_ff"]
-    shared = config["shared_expert_intermediate"]
+    # MoE-only quantities: a dense declaration simply has none of them.
+    experts = config.get("num_experts", 0)
+    expert_ffn = config["d_ff"]
+    shared = config.get("shared_expert_intermediate", 0)
     ngram, per_gram = config.get("ngram_size", 0), config.get("heads_per_ngram", 0)
     ple_heads = (ngram - 1) * per_gram if ngram else 0
 
     return {
         "C": hidden,
+        "TwoC": 2 * hidden,
         "M": expert_ffn,
+        "TwoM": 2 * expert_ffn,
+        "DraftVocab": config.get("draft_head_vocab", 0),
         "Vocab": config["vocab_size"],
         "HeadDim": config["head_size"],
         "QuerySize": query_size,
         "AttnFusedRows": 2 * query_size + 2 * kv_size,
-        "HcCount": config["hc_count"],
-        "HcWidth": config["hc_count"] * hidden,
-        "HcLowRank": config["hc_lowrank"],
+        "HcCount": config.get("hc_count", 0),
+        "HcWidth": config.get("hc_count", 0) * hidden,
+        "HcLowRank": config.get("hc_lowrank", 0),
         "Hv": heads_v,
         "TwoHv": 2 * heads_v,
         "Vd": dim_v,
@@ -73,6 +78,20 @@ def geometry(config: dict[str, Any]) -> dict[str, int]:
         "PleConvKernel": config.get("ple_conv_kernel_size", 0),
         "PleHeads": ple_heads,
         "PleMultipliers": 2 * ngram,
+        # Vision tower, when the declaration carries one.
+        "VisionHidden": config.get("vision_hidden", 0),
+        "VisionIntermediate": config.get("vision_intermediate", 0),
+        "VisionQkvRows": config.get("vision_qkv_rows", 0),
+        "VisionPatchRows": config.get("vision_patch_rows", 0),
+        "VisionPositionEmbeddings": config.get("vision_position_embeddings", 0),
+        "VisionMergerHidden": config.get("vision_merger_hidden", 0),
+        # DFlash scorer.
+        "DflashHeadDim": config.get("dflash_head_dim", 0),
+        "DflashQkvRows": config.get("dflash_qkv_rows", 0),
+        "DflashAttnCols": config.get("dflash_attn_cols", 0),
+        "DflashGateUpRows": config.get("dflash_gate_up_rows", 0),
+        "DflashFfn": config.get("dflash_ffn", 0),
+        "DflashFeatureRows": config.get("dflash_feature_rows", 0),
     }
 
 
@@ -106,20 +125,16 @@ def inventory_for(architecture: str, hf_config: dict[str, Any]) -> list[dict[str
         raise ValueError(f"no DSL model registered for {architecture}")
     model_class = spec._nn_model_class  # noqa: SLF001
 
-    model_objects = getattr(model_class, "_serve_objects_", None)
-    if model_objects is None:
-        module = sys.modules[model_class.__module__]
-        model_objects = getattr(module, "QWEN4_EXP_MODEL_SERVE_OBJECTS", ())
-        ple_objects = getattr(module, "QWEN4_EXP_PLE_SERVE_OBJECTS", ())
-    else:
-        ple_objects = ()
+    model_objects = getattr(model_class, "_serve_objects_", ())
+    layer_objects = getattr(model_class, "_serve_layer_objects_", {})
+    block_classes = getattr(model_class, "_serve_blocks_", {})
+    if not block_classes:
+        raise ValueError(
+            f"{model_class.__name__} declares no _serve_blocks_; a model without serve "
+            f"objects cannot have its artifact inventory derived"
+        )
 
-    # Block schemas, by the type tag the stack scheduled them under.
-    from surogate.dsl.blocks.qwen4_exp import Qwen4ExpAttentionBlock, Qwen4ExpLinearBlock
-
-    by_type = {"attention": Qwen4ExpAttentionBlock, "mamba": Qwen4ExpLinearBlock}
     block_types = _block_types(config)
-    ple_layer = (config["ple_layer_ids"][0] - 1) if config.get("ple_layer_ids") else None
 
     out: list[dict[str, Any]] = []
 
@@ -132,20 +147,38 @@ def inventory_for(architecture: str, hf_config: dict[str, Any]) -> list[dict[str
             "transform": obj.transform,
         })
 
-    for obj in model_objects:
-        if obj.name == "text/token_embedding":
-            emit(obj.name, obj)
+    leading = [o for o in model_objects if o.name.endswith("token_embedding")]
+    trailing = [o for o in model_objects if o not in leading]
+    for obj in leading:
+        emit(obj.name, obj)
     for layer, block_type in enumerate(block_types):
         prefix = f"text/layers/{layer}/"
-        if layer == ple_layer:
-            for obj in ple_objects:
-                emit(prefix + obj.name, obj)
-        for obj in by_type[block_type].schema.serve_objects:
+        for marker, objects in layer_objects.items():
+            if _layer_matches(marker, layer, config):
+                for obj in objects:
+                    emit(prefix + obj.name, obj)
+        for obj in block_classes[block_type].schema.serve_objects:
             emit(prefix + obj.name, obj)
-    for obj in model_objects:
-        if obj.name != "text/token_embedding":
-            emit(obj.name, obj)
+    for obj in trailing:
+        emit(obj.name, obj)
+
+    for section in getattr(model_class, "_serve_sections_", ()):
+        count = section.repeat if isinstance(section.repeat, int) else config[section.repeat]
+        for index in range(count):
+            prefix = section.prefix if count == 1 else f"{section.prefix}{index}/"
+            for obj in section.objects:
+                emit(prefix + obj.name, obj)
     return out
+
+
+def _layer_matches(marker: str, layer: int, config: dict[str, Any]) -> bool:
+    """Which layers a conditional object group lands on. `ple` follows the
+    declaration's `ple_layer_ids`, which is 1-based where the engine is 0-based."""
+
+    if marker == "ple":
+        ids = config.get("ple_layer_ids") or []
+        return bool(ids) and layer == ids[0] - 1
+    raise ValueError(f"unknown layer-object marker {marker!r}")
 
 
 def _block_types(config: dict[str, Any]) -> list[str]:
@@ -173,11 +206,15 @@ def main() -> int:
 
     module = importlib.import_module(sys.argv[sys.argv.index("--diff") + 1])
     committed = {s.name: (tuple(s.shape), s.format) for s in module.TENSOR_SPECS}
-    derived = {o["name"]: (o["shape"], _format_name(o["format"], module)) for o in emitted}
+    derived = {o["name"]: (o["shape"], o["format"]) for o in emitted}
 
     missing = sorted(set(committed) - set(derived))
     extra = sorted(set(derived) - set(committed))
-    differing = sorted(n for n in set(committed) & set(derived) if committed[n] != derived[n])
+    differing = sorted(
+        n for n in set(committed) & set(derived)
+        if committed[n][0] != derived[n][0]
+        or not formats_agree(derived[n][1], committed[n][1], module)
+    )
 
     print(f"  committed {len(committed)}, derived {len(derived)}")
     for label, names in (("only in converter", missing), ("only in declaration", extra)):
@@ -191,9 +228,23 @@ def main() -> int:
     return len(missing) + len(extra) + len(differing)
 
 
+#: Formats the declaration pins exactly. Anything else is the profile's choice.
+_FIXED_FORMATS = ("bf16", "fp32", "i32")
+
+
 def _format_name(fmt: str, module) -> str:
     return {"w8": module.W8, "bf16": module.BF16, "fp32": module.FP32,
             "i32": module.I32}.get(fmt, fmt)
+
+
+def formats_agree(declared: str, committed: str, module) -> bool:
+    """A declared `quantised` accepts whatever width the export profile picked —
+    the 35B stores routed experts Q4 and their down projections Q5 where the 0.8B
+    stores both W8. What the declaration pins is that a norm is *never* quantised."""
+
+    if declared == "quantised":
+        return committed not in (module.BF16, module.FP32, module.I32)
+    return _format_name(declared, module) == committed
 
 
 if __name__ == "__main__":

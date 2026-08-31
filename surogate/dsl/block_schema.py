@@ -15,7 +15,12 @@ RoutingKind = Literal["none", "topk_softmax", "topk_sigmoid", "expert_choice"]
 #: carries format policy — `quantizable=False` on router and shared-expert weights
 #: is exactly this decision — so naming the serving format here keeps one source of
 #: truth rather than restating the geometry in a converter.
-ServeFormat = Literal["w8", "bf16", "fp32", "i32", "raw"]
+#: `quantised` means the export profile chooses the width — the 35B stores routed
+#: experts Q4, their down projections Q5 and the output head Q6 where the 0.8B
+#: stores all three W8. The declaration fixes only what the *model* fixes: a norm
+#: is never quantised, a weight may be. This is the same distinction `quantizable`
+#: already draws on parameters.
+ServeFormat = Literal["quantised", "w8", "bf16", "fp32", "i32", "raw"]
 
 
 @dataclass(frozen=True)
@@ -45,6 +50,25 @@ class ServeObject:
     #: Layers this object exists on: every layer, or only the ones running this
     #: mixer. `None` means "wherever the block it belongs to runs".
     scope: Literal["block", "model"] = "block"
+
+
+@dataclass(frozen=True)
+class ServeSection:
+    """A sub-stack a serving artifact stores under its own prefix.
+
+    A served checkpoint is not only the text stack: it carries a speculative
+    draft head, and on some targets a vision tower and a DFlash stack. Those are
+    model components, not policy, and the declaration is the single source of
+    truth for what an artifact contains — so they are declared here rather than
+    left for a converter to know about.
+
+    `repeat` names the config key holding the sub-stack's layer count; `1` means
+    the section is not indexed and its objects sit directly under the prefix.
+    """
+
+    prefix: str
+    objects: tuple["ServeObject", ...] = ()
+    repeat: str | int = 1
 
 
 @dataclass(frozen=True)

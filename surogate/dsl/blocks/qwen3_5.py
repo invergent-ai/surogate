@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from .. import nn
-from ..block_schema import BlockSchema, SlotDecl
+from ..block_schema import BlockSchema, ServeObject, SlotDecl
 from ..modules import GatedDeltaNetMixer, GenericMLP, Qwen3_5Attention, RMSNormPlus1, _resolve_rotary_dim
 
 
@@ -144,6 +144,56 @@ QWEN3_5_VL_MODEL_NAME_REMAP: dict[str, str] = {
 }
 
 
+# ---- How a serving artifact stores these blocks -------------------------------
+# Shapes are written against the symbols `emit_inventory.geometry` resolves from
+# the declaration, so a target of any size derives its own inventory. `quantised`
+# leaves the width to the export profile; norms are pinned because a norm is never
+# quantised, which is a property of the model rather than of an export.
+
+#: The pre-norms. Every block has both, whichever mixer it runs.
+_DENSE_NORM_OBJECTS: tuple[ServeObject, ...] = (
+    ServeObject("input_norm", "bf16", ("C",), ("ln1_weight",)),
+    ServeObject("post_attention_norm", "bf16", ("C",), ("ln2_weight",)),
+)
+
+#: The SwiGLU MLP. The declaration already fuses gate and up into one parameter,
+#: with `LoRATarget` offsets naming the halves, so this is a straight pass-through.
+_DENSE_MLP_OBJECTS: tuple[ServeObject, ...] = (
+    ServeObject("mlp/gate_up", "quantised", ("TwoM", "C"), ("mlp_up_weight",)),
+    ServeObject("mlp/down", "quantised", ("C", "M"), ("mlp_down_weight",)),
+)
+
+#: Full attention. The engine wants one projection holding q | k | gate | v, where
+#: the declaration's query projection carries query and gate interleaved per head.
+_DENSE_ATTENTION_OBJECTS: tuple[ServeObject, ...] = (
+    ServeObject(
+        "attention/query_key_gate_value", "quantised", ("AttnFusedRows", "C"),
+        ("full_q_proj_weight", "full_k_proj_weight", "full_v_proj_weight"),
+        transform="split_interleaved_query_gate",
+    ),
+    ServeObject("attention/query_norm", "bf16", ("HeadDim",), ("q_norm_weight",),
+                transform="unfold_unit_offset"),
+    ServeObject("attention/key_norm", "bf16", ("HeadDim",), ("k_norm_weight",),
+                transform="unfold_unit_offset"),
+    ServeObject("attention/output", "quantised", ("C", "QuerySize"), ("full_out_weight",)),
+)
+
+#: Gated delta net. The dense targets keep the two scalar-per-head projections
+#: apart; the MoE family fuses them, which is why that list is declared separately.
+_DENSE_GDN_OBJECTS: tuple[ServeObject, ...] = (
+    ServeObject("gdn/a_log", "fp32", ("Hv",), ("lin_A_log",), transform="log_negate"),
+    ServeObject("gdn/dt_bias", "fp32", ("Hv",), ("lin_dt_bias",)),
+    ServeObject("gdn/convolution", "bf16", ("ConvK", "ConvDim"), ("lin_conv_weight",),
+                transform="transpose_taps"),
+    ServeObject("gdn/a_projection", "bf16", ("Hv", "C"), ("lin_in_proj_a_weight",)),
+    ServeObject("gdn/b_projection", "bf16", ("Hv", "C"), ("lin_in_proj_b_weight",)),
+    ServeObject("gdn/query_key_value_z", "quantised", ("GdnFusedRows", "C"),
+                ("lin_in_proj_qkv_weight", "lin_in_proj_z_weight")),
+    ServeObject("gdn/norm", "bf16", ("Vd",), ("lin_norm_weight",)),
+    ServeObject("gdn/output", "quantised", ("C", "ValueDim"), ("lin_out_weight",)),
+)
+
+
 class Qwen3_5AttentionBlock(nn.Block):
     """Qwen3.5 full-attention decoder block (token mixer + MLP).
 
@@ -163,6 +213,11 @@ class Qwen3_5AttentionBlock(nn.Block):
             SlotDecl("mlp_down_weight", kind="param", shape=("C", "M"), residency="auto"),
             SlotDecl("res_att", shape=("B", "T", "C")),
             SlotDecl("qkv_rope", shape=("B", "T", "QKV"), save_for_backward=True),
+        ),
+        serve_objects=(
+            *_DENSE_NORM_OBJECTS,
+            *_DENSE_ATTENTION_OBJECTS,
+            *_DENSE_MLP_OBJECTS,
         ),
         attrs={"block_family": "qwen3_5_attention"},
     )
@@ -255,6 +310,11 @@ class Qwen3_5LinearBlock(nn.Block):
             SlotDecl("mlp_up_weight", kind="param", shape=("2M", "C"), residency="auto"),
             SlotDecl("mlp_down_weight", kind="param", shape=("C", "M"), residency="auto"),
             SlotDecl("res_att", shape=("B", "T", "C")),
+        ),
+        serve_objects=(
+            *_DENSE_NORM_OBJECTS,
+            *_DENSE_GDN_OBJECTS,
+            *_DENSE_MLP_OBJECTS,
         ),
         attrs={"block_family": "qwen3_5_linear"},
     )

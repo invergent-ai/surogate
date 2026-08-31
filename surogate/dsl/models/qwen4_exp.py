@@ -183,6 +183,16 @@ def _with_text_config_prefix(mapping: dict[str, str]) -> dict[str, str]:
 class _Qwen4ExpBase(nn.Model):
     """Shared constructor/forward for the CausalLM and ConditionalGeneration variants."""
 
+    #: How a serving artifact stores this model. Per-layer objects live on the
+    #: block schemas; these are the ones outside the stack, plus the group that
+    #: exists only on the layer carrying the n-gram memory.
+    _serve_objects_ = QWEN4_EXP_MODEL_SERVE_OBJECTS
+    _serve_layer_objects_ = {"ple": QWEN4_EXP_PLE_SERVE_OBJECTS}
+    _serve_blocks_ = {
+        "attention": Qwen4ExpAttentionBlock,
+        "mamba": Qwen4ExpLinearBlock,
+    }
+
     def _init_qwen4_exp(
         self,
         vocab_size: int,

@@ -419,3 +419,50 @@ reconstructing later.
 Both new guards were verified by breaking them: changing `hc_low_rank` in the
 committed header, and changing one declared serve format, each turn the suite red
 with the specific disagreement named.
+
+## Everything the artifact contains, declared once
+
+Covering one model and calling the pattern proven was premature: seven converters
+exist, and only Flash-Next had been declared. Doing the rest surfaced two things
+the single-model version had no way to show.
+
+**Numeric width is a profile's choice, not the model's.** The 0.8B stores every
+weight W8; the 35B stores routed experts Q4, their down projections Q5 and the
+output head Q6. A fixed `format` per object cannot express both. `ServeFormat`
+gained `quantised`, meaning *the export decides* — and the declaration pins only
+what the model itself pins, which is that a norm is never quantised. That is the
+same line `quantizable` already draws on parameters.
+
+**A served artifact is more than the text stack.** It carries a speculative draft
+head, an MTP head whose single layer mirrors a text block, and on the larger
+targets a 27-layer vision tower and a six-layer DFlash scorer. Those are model
+components, so `ServeSection` now declares them: a prefix, a repeat count read
+from the declaration, and the objects beneath it. The MTP head reuses the block's
+own object declarations rather than restating them, which is why the dense
+family's section is twelve objects and the MoE family's is fifteen — the
+difference is exactly that its one layer is a MoE layer.
+
+Vision geometry now comes from the declaration too: `use_visual_inputs` already
+received the whole `vision_config` and collapsed it to a flag; it keeps the
+geometry instead.
+
+Derived exactly, against every committed converter whose checkpoint config is on
+this machine:
+
+| target | objects | contents |
+| --- | --- | --- |
+| qwen3_5_0_8b | 281 | text + MTP |
+| qwen3_5_2b | 281 | text + MTP |
+| qwen3_5_4b | 369 | text + MTP |
+| qwen4exp | 986 | text + PLE + indexer |
+| qwen3_6_35b_a3b | 934 | text + MTP + vision (333) + DFlash (51) |
+
+Every name, shape and numeric width matches. `qwen3_6_27b` and `qwen3_8_27b` are
+not listed only because their checkpoint configs are not on this machine; nothing
+about them is known to be undeclarable.
+
+One boundary is real and worth stating: whether an artifact *ships* the vision
+tower is an export decision, not a property of the architecture. Qwen3.5-4B has a
+`vision_config` and its artifact carries no tower, while the 35B's does. So the
+declaration describes the tower; the target decides whether that section is
+exported.

@@ -46,6 +46,61 @@ GENERATED_TARGETS = ("qwen3_5_0_8b", "qwen3_5_4b")
 #: duplication rather than remove it.
 CHECKED_TARGETS = (("qwen4exp", "models/Qwen3.8-Flash-Next-frontend"),)
 
+#: Every target whose converter inventory is derivable from the declaration, with
+#: where its checkpoint config lives. `qwen3_6_27b` and `qwen3_8_27b` are absent
+#: only because their configs are not on this machine — nothing about them is
+#: known to be undeclarable.
+INVENTORY_TARGETS = (
+    ("qwen4exp", "dir:models/Qwen3.8-Flash-Next-frontend"),
+    ("qwen3_5_0_8b", "hub:models--Qwen--Qwen3.5-0.8B"),
+    ("qwen3_5_2b", "hub:models--Qwen--Qwen3.5-2B"),
+    ("qwen3_5_4b", "hub:models--Qwen--Qwen3.5-4B"),
+    ("qwen3_6_35b_a3b", "hub:models--Qwen--Qwen3.6-35B-A3B"),
+)
+
+
+def _resolve_source(source: str) -> pathlib.Path | None:
+    kind, value = source.split(":", 1)
+    if kind == "dir":
+        path = REPO / value / "config.json"
+        return path if path.exists() else None
+    import glob as _glob
+    hits = sorted(_glob.glob(
+        str(pathlib.Path.home() / ".cache/huggingface/hub" / value / "snapshots/*/config.json")))
+    return pathlib.Path(hits[0]) if hits else None
+
+
+@pytest.mark.parametrize("target,source", INVENTORY_TARGETS)
+def test_artifact_inventory_derives_from_the_declaration(emitters, target, source):
+    """The whole artifact — text stack, MTP head, vision tower, DFlash scorer —
+    must be what the declaration implies, name, shape and numeric width."""
+
+    import importlib
+
+    emit_inventory = pytest.importorskip("emit_inventory")
+    config_path = _resolve_source(source)
+    if config_path is None:
+        pytest.skip(f"no checkpoint config for {target}")
+
+    hf_config = json.loads(config_path.read_text())
+    architecture = (hf_config.get("architectures") or [hf_config.get("model_type")])[0]
+    derived = emit_inventory.inventory_for(architecture, hf_config)
+
+    inventory = importlib.import_module(f"surogate.serve.tools.convert.{target}.inventory")
+    committed = {s.name: (tuple(s.shape), s.format) for s in inventory.TENSOR_SPECS}
+    emitted = {o["name"]: (o["shape"], o["format"]) for o in derived}
+
+    assert set(emitted) == set(committed), (
+        f"{target}: only-declaration={sorted(set(emitted) - set(committed))[:4]}, "
+        f"only-converter={sorted(set(committed) - set(emitted))[:4]}"
+    )
+    bad = {
+        n: (committed[n], emitted[n]) for n in committed
+        if committed[n][0] != emitted[n][0]
+        or not emit_inventory.formats_agree(emitted[n][1], committed[n][1], inventory)
+    }
+    assert not bad, f"{target}: shape/width disagreements: {list(bad.items())[:4]}"
+
 
 @pytest.mark.parametrize("target", GENERATED_TARGETS)
 def test_generated_target_reproduces_from_declaration(emitters, target):
