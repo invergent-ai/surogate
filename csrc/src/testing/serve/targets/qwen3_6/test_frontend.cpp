@@ -97,7 +97,7 @@ const fi::Tokenizer& official_tokenizer() {
     static const std::string base = [] {
         const char* env = std::getenv("SINFER_QWEN36_TOKENIZER_DIR");
         const std::string dir =
-            env != nullptr ? env : "/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16";
+            env != nullptr ? env : "/home/densemax2/work/models/hf/qwen/Qwen3.6-27B/base-hf-bf16";
         if (!std::ifstream(dir + "/tokenizer.json").good()) {
             std::fprintf(stderr,
                          "SKIP: Qwen3.6-27B tokenizer resources not found (set "

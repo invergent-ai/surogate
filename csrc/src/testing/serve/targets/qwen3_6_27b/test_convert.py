@@ -18,7 +18,7 @@ from tools.convert.qwen3_6_27b import convert, inventory, recipe
 
 
 OFFICIAL_MODEL = Path(
-    "/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16"
+    "/home/densemax2/work/models/hf/qwen/Qwen3.6-27B/base-hf-bf16"
 )
 
 

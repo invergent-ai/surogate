@@ -3,7 +3,7 @@
 #
 # `surogate serve ...` — the native serving engine (design/serve-engine-plan.md).
 #
-# The engine is the C++ server at csrc/src/serve (NInfer-derived), built by
+# The engine is the C++ server at csrc/src/serve, built by
 # `make serve-build`. This wrapper resolves the binary and os.execv's it, so no
 # Python (and no Python CUDA context) stays in the serving process. It must run
 # BEFORE any CUDA-touching import in surogate.cli.main, mirroring jackalope.

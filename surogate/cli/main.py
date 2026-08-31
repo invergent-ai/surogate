@@ -33,7 +33,7 @@ from surogate.cli._jackalope import maybe_exec_jackalope
 
 maybe_exec_jackalope()
 
-# `surogate serve ...` execs the native serving engine (vendored NInfer; see
+# `surogate serve ...` execs the native serving engine (see
 # design/serve-engine-plan.md). Intercepted here, before CUDA-touching imports,
 # so the serving process carries no Python CUDA context. Never returns for serve.
 from surogate.cli.serve import maybe_exec_serve

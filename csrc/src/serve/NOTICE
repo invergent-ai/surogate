@@ -2,16 +2,45 @@ The surogate serve engine in this directory is derived from NInfer
 (https://github.com/Neroued/ninfer), Copyright (c) NInfer contributors,
 licensed under the Apache License, Version 2.0 (see LICENSE.ninfer).
 
+MODIFICATIONS
+-------------
+The files here have been substantially modified from the NInfer originals
+and this directory is not a redistribution of that project. As of
+2026-08-31, measured against the upstream snapshot:
+
+  * 221 source files have no NInfer counterpart at all; they were written
+    for surogate. Whole subsystems are among them, including the
+    Qwen3.8-Flash-Next target, hyper-connections, the n-gram PLE memory,
+    the TRT-LLM cutlass MoE path, host expert offload, and the vision
+    tower's geometry generalisation.
+  * 259 files derived from NInfer have been modified, 16 of them past
+    half their lines.
+  * 106 upstream files were removed.
+  * 232 files remain byte-identical to their NInfer originals, chiefly
+    the row-split quantised GEMM kernels under ops/linear and parts of
+    ops/linear_attention.
+
+Every identifier the engine owns was renamed ninfer -> sinfer on
+2026-08-31 (namespace, macros, build targets, the artifact magic and the
+.sinfer extension). That rename is surogate's; NInfer's name is retained
+in this file, in LICENSE.ninfer, and wherever provenance is discussed,
+because it names their work rather than ours.
+
+The divergence history is PATCHES.md, which continues as the serve
+engineering log.
+
+LAYOUT
+------
 As of 2026-08-26 the code lives here directly as first-class surogate
 source (the former vendor and sub-project layouts are dropped): engine
 modules sit under csrc/src/serve/<module>, the public API under
 csrc/src/serve/api, executables under cli/ and server/, C++ tests and
 benches under csrc/src/testing/serve, and the Python conversion/parity
 tooling under surogate/serve/tools. Targets are defined by the main
-csrc/CMakeLists.txt. Source files retain their NInfer lineage and the
-divergence history is documented in PATCHES.md, which continues as the
-serve engineering log.
+csrc/CMakeLists.txt.
 
+OTHER THIRD-PARTY CODE
+----------------------
 Third-party code under third_party/ (each with its own license):
   cpp-httplib (MIT), nlohmann/json (MIT), utf8proc (MIT-style).
 The NVFP4 GEMM instantiation recipe follows flashinfer

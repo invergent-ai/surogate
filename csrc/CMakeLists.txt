@@ -91,7 +91,7 @@ option(USE_NVML "Enable nvml support for detailed GPU stats reporting" ON)
 option(PYTHON_BINDING "Build python bindings" ON)
 option(ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 
-# Serve engine (csrc/src/serve, derived from NInfer — see src/serve/NOTICE):
+# Serve engine (csrc/src/serve; third-party provenance in src/serve/NOTICE):
 # first-class targets in this project, EXCLUDE_FROM_ALL so `make build` cost
 # is unchanged. Build with e.g. `cmake --build <dir> --target
 # surogate-engine-cli`. Deps (json, cutlass) come from this file's

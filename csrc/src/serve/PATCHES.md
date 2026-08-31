@@ -1,25 +1,25 @@
-# Vendored code under csrc/src/serve/
+# Serve engine changelog
 
-> **Naming note (2026-08-31):** the engine's own identifiers were renamed
-> `ninfer` -> `sinfer` (namespace, macros, targets, the artifact magic and the
-> `.sinfer` extension). This file is left in its original wording: entries below
-> record what was patched *at the time*, and the upstream project this code came
-> from is still named `ninfer`. Read macro and path names here as historical.
+The serve engine under `csrc/src/serve` is first-class surogate source. Its
+third-party provenance — what it was derived from, how far it has diverged, and
+the license that governs the parts still shared — is stated once, in
+[`NOTICE`](NOTICE). This file is the engineering log: what changed, when, and
+why.
 
-## serve engine — derived from https://github.com/Neroued/ninfer
+**Reading older entries.** Two things below are historical and are deliberately
+not rewritten, because an engineering log that edits its own past stops being
+evidence of anything:
 
-(2026-08-26: the vendor directory was flattened into csrc/src/serve as
-first-class surogate source — see NOTICE. This file continues as the
-serve engineering log; entries below #24 predate the flatten and use the
-old ninfer/ paths.)
+- Entries before #24 predate the 2026-08-26 flatten and cite the old
+  `ninfer/`-prefixed paths. The code now lives directly under
+  `csrc/src/serve/<module>`.
+- Identifiers were renamed `ninfer` -> `sinfer` on 2026-08-31 (namespace,
+  macros, build targets, the artifact magic, the `.sinfer` extension). Entries
+  written before that name macros and targets by their names at the time; read
+  `NINFER_ENABLE_FFMPEG` as today's `SINFER_ENABLE_FFMPEG`, and so on.
 
-- License: Apache-2.0 (see `ninfer/LICENSE`). Vendored per the port-first
-  kernel/runtime strategy in `design/serve-engine-plan.md` §2.2 / §3.3.
-- Source snapshot: `study/ninfer` working tree as of 2026-08-23 (upstream
-  git metadata not vendored). Excluded from the vendor copy: `.git/`, `eval/`
-  (Python eval harness), `model-cards/`, `.github/`, `.codex/`, `Dockerfile`.
-- The tree builds as its own CMake project (`make serve-build` at repo root);
-  it is intentionally NOT part of the training `surogate-common` build.
+The engine builds via `make serve-build`; it is intentionally not part of the
+training `surogate-common` build.
 
 ### Local patches (keep this list exhaustive)
 
