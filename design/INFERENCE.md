@@ -2852,3 +2852,64 @@ GDN-vs-full rather than sliding-vs-full, `attention_scale` hardcodes
 `head_dim ** -0.5`, there is no `sliding_window` or `causal` field, and
 `emit_config.py:28` raises `NotImplementedError` for a pure-attention family.
 That plumbing should follow the C++ contract, not precede it.
+
+## 2026-08-31 — EmbeddingGemma serves, and beats llama.cpp per request
+
+End to end: `ggml-org/embeddinggemma-300M-GGUF` → a 358 MB `.sinfer` → 24 layers
+on the GPU → a pooled, projected, L2-normalised vector over `/v1/embeddings`.
+Against an fp32 reference, min cosine **0.999855** across five sequences with
+retrieval ranking intact — q0 reaches its document at 0.5691 where the reference
+says 0.5688 and llama.cpp says 0.5685.
+
+**The shape of it.** This is not a target. There is no Program, no executor, no
+paged cache; those exist to make round N+1 fast and an encoder has no round N+1.
+It shares everything below the round loop — artifact reader, binder, op library
+— and nothing above it. llama.cpp reaches the same conclusion from the other
+side: `LLM_ARCH_GEMMA_EMBEDDING` allocates no KV cache at all
+(`llama-model.cpp:2221` returns `res = nullptr`, grouped with the BERTs).
+
+**Conversion is nearly free.** GGML `Q8_0` and the artifact's `W8G32_F16S` are
+the same format, so 169 of 315 objects repack bit-exactly — every matrix plus
+the embedding table, 99.78% of the parameters, no dequantize and no GPU. 358 MB
+in 9.4 s. Only the norms (which lose a folded one) and the embedding head (two
+sentence-transformers Dense modules composed into one [768,768], because both
+declare Identity) do real work.
+
+**Measured, both on an RTX 5090 at Q8_0 with identical token-id inputs:**
+
+| tokens | surogate | llama.cpp | |
+|---|---|---|---|
+| 128, batch 8 × conc 8 | 278 emb/s | 838 emb/s | 3.0× slower |
+| 512, batch 8 × conc 8 | **168 emb/s** | 133 emb/s | 1.26× faster |
+| 2048, batch 8 × conc 8 | **58.9 emb/s** | 27.2 emb/s | 2.17× faster |
+| 128, single stream | **4.84 ms** | 6.39 ms | 1.32× faster |
+| 512, single stream | **7.36 ms** | 9.92 ms | 1.35× faster |
+| 2048, single stream | **17.78 ms** | 33.65 ms | 1.89× faster |
+
+Per request this is faster at every length. The batched 128-token loss is one
+thing and not a kernel: llama.cpp packs eight sequences into a single forward
+while this serialises on a mutex, so its per-request floor is amortised eight
+ways and ours is not. Batching sequences into one forward is worth more than any
+kernel tuning here — the attention already leads at 2048, where the work per
+request is large enough that the floor stops mattering.
+
+CPU is not served yet. For reference, llama.cpp on this host's 2× EPYC 9124 (32
+threads) reaches ~3,000 tok/s at any concurrency and 225 ms single-stream at 512
+tokens — the model saturates 32 cores with one request, so concurrency there
+buys latency, not throughput.
+
+**One latent bug closed on the way.** The first end-to-end run was correct at 16
+tokens and wrong at 18 — exactly where W8 linear moves from SIMT to the MMA
+route. A T-sweep localised it to one shape, `[768, 1152]` (the MLP down
+projection), wrong for every T ≥ 17 and a hard misaligned-address fault at 128.
+A scale row is `k/32` binary16 values, so `k/16` bytes, and the MMA kernel stages
+them with a 16-byte `cp_async` — aligned only when `k % 256 == 0`. Every k
+registered in this engine's history (1024, 2048, 2560, 4096, 4608, 5120, 6144,
+10240, 16384, 17408) is a multiple of 256; 1152 is the first shape ever to
+violate it, and it did so silently. `launch_route` now refuses `k % 256 != 0`
+outright, k=1152 routes to SIMT, and the four shapes are in the W8 conformance
+test across T = 1..600. The guard protects every future model with an unusual k,
+not just this one.
+
+Not built yet: text input (needs a SentencePiece-flavoured tokenizer beside the
+Qwen one), sequence batching, and the CPU backend.
