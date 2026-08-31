@@ -116,6 +116,7 @@ OrdinaryDecodeState::OrdinaryDecodeState(DeviceSpan backing,
     text_kv_table_rows =
         ingress_tensor(offsetof(OrdinaryDecodeIngress, text_kv_table_rows), DType::I32);
     lanes    = ingress_tensor(offsetof(OrdinaryDecodeIngress, lanes), DType::I32);
+    lora_slots = ingress_tensor(offsetof(OrdinaryDecodeIngress, lora_slots), DType::I32);
     sampling = reinterpret_cast<const ops::SamplingConfig*>(
         static_cast<const unsigned char*>(ingress.data) +
         offsetof(OrdinaryDecodeIngress, sampling));

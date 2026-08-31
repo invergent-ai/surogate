@@ -34,6 +34,11 @@ struct OrdinaryDecodeIngress {
     std::array<std::int32_t, kMaximumConcurrency> rope_positions{};
     std::array<std::int32_t, kMaximumConcurrency> text_kv_table_rows{};
     std::array<std::int32_t, kMaximumConcurrency> lanes{};
+    /// The LoRA slot each lane's request selected, or -1 for the base model.
+    /// It rides in the ingress rather than a buffer of its own because this
+    /// struct is already the round's host-to-device channel, staged in a way a
+    /// captured graph replays correctly -- the property an adapter index needs.
+    std::array<std::int32_t, kMaximumConcurrency> lora_slots{};
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
 };
 
@@ -189,6 +194,7 @@ struct OrdinaryDecodeState {
     Tensor rope_positions;
     Tensor text_kv_table_rows;
     Tensor lanes;
+    Tensor lora_slots;
     const ops::SamplingConfig* sampling = nullptr;
     Tensor sampled_tokens;
     Tensor logits;
