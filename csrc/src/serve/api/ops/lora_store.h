@@ -33,9 +33,12 @@ public:
     /// the bank on first use. `a` is [rank, in] and `b` is [out, rank] in host
     /// BF16; both are zero-padded up to the bank's max_rank. `scale` (PEFT's
     /// alpha/r) is folded into A here, once.
-    void set_slot(const void* base_key, std::int32_t slot, const std::vector<std::uint16_t>& a,
-                  const std::vector<std::uint16_t>& b, std::int32_t rank, std::int32_t in_dim,
-                  std::int32_t out_dim, float scale);
+    /// `port` distinguishes outputs that share a base weight. q, k and v come out
+    /// of one fused projection, so the weight pointer alone cannot say which of
+    /// them an adapter belongs to; the pair can.
+    void set_slot(const void* base_key, std::int32_t port, std::int32_t slot,
+                  const std::vector<std::uint16_t>& a, const std::vector<std::uint16_t>& b,
+                  std::int32_t rank, std::int32_t in_dim, std::int32_t out_dim, float scale);
 
     /// Zeroes a slot across every bank, so a token selecting it adds nothing.
     /// This is what unloading an adapter does: the memory stays, the contribution
@@ -44,8 +47,8 @@ public:
     void clear_slot(std::int32_t slot);
 
     /// The bank for a projection, or nullptr when it has none. Hot path.
-    [[nodiscard]] const LoraBank* find(const void* base_key) const noexcept {
-        const auto found = banks_.find(base_key);
+    [[nodiscard]] const LoraBank* find(const void* base_key, std::int32_t port) const noexcept {
+        const auto found = banks_.find(Key{base_key, port});
         return found == banks_.end() ? nullptr : &found->second.view;
     }
 
@@ -77,7 +80,19 @@ private:
         void* a = nullptr;
         void* b = nullptr;
     };
-    std::unordered_map<const void*, Bank> banks_;
+    struct Key {
+        const void* weight = nullptr;
+        std::int32_t port  = 0;
+        bool operator==(const Key& other) const noexcept {
+            return weight == other.weight && port == other.port;
+        }
+    };
+    struct KeyHash {
+        std::size_t operator()(const Key& key) const noexcept {
+            return std::hash<const void*>{}(key.weight) ^ (static_cast<std::size_t>(key.port) << 1U);
+        }
+    };
+    std::unordered_map<Key, Bank, KeyHash> banks_;
     void* scratch_          = nullptr;
     std::int32_t* uniform_cell_ = nullptr;
     std::int32_t scratch_tokens_ = 0;

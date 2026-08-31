@@ -172,24 +172,44 @@ void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& opt
                 payload.module + "' is not a full-attention layer of this model");
         }
         const detail::FullAttentionWeights& layer = *by_layer[static_cast<std::size_t>(payload.layer)];
-        const Weight* base                = nullptr;
-        if (payload.module == "q_proj") {
+        const Weight* base    = nullptr;
+        std::int32_t port     = 0;
+        // q, k and v leave one fused projection as separate contiguous tensors, so
+        // they share a base weight and are told apart by the port. o and down have
+        // a weight each.
+        if (payload.module == "q_proj" || payload.module == "k_proj" ||
+            payload.module == "v_proj") {
             const auto* fused = std::get_if<detail::FusedAttentionProjectionPayload>(&layer.projection);
             if (fused == nullptr) {
                 throw std::invalid_argument(
                     "--lora-modules: this artifact splits its attention projection, which the "
-                    "q_proj adapter path does not bind");
+                    "attention adapter path does not bind");
             }
             base = &fused->query_key_gate_value;
+            port = payload.module == "q_proj" ? 0 : (payload.module == "k_proj" ? 1 : 2);
         } else if (payload.module == "o_proj") {
             base = &layer.output;
+            port = 3;
+        } else if (payload.module == "down_proj") {
+            const detail::DensePostMixerPayload* mlp = &layer.post_mixer;
+            base = &mlp->down;
+            port = 4;
+        } else if (payload.module == "gate_proj" || payload.module == "up_proj") {
+            // gate and up are one fused weight whose two halves are consumed by
+            // SwiGLU inside the op, so neither half exists as a tensor a delta
+            // could be added to. Adapting them needs the delta inside that op, not
+            // after it; refusing is better than applying half an adapter.
+            throw std::invalid_argument(
+                "--lora-modules: '" + payload.module +
+                "' is not applied yet -- gate and up are fused and consumed by SwiGLU inside the "
+                "projection, so there is no intermediate tensor to add a delta to");
         } else {
             throw std::invalid_argument(
                 "--lora-modules: module '" + payload.module +
-                "' is not applied by this target (it applies q_proj and o_proj); an adapter "
-                "that is only partly applied would be neither the base model nor the fine-tune");
+                "' is not applied by this target (q_proj, k_proj, v_proj, o_proj, down_proj); an "
+                "adapter only partly applied is neither the base model nor the fine-tune");
         }
-        store.set_slot(base->qdata, payload.slot, payload.a, payload.b, payload.rank,
+        store.set_slot(base->qdata, port, payload.slot, payload.a, payload.b, payload.rank,
                        payload.in_dim, payload.out_dim, payload.scale);
     }
     ops::lora_set_active(true);

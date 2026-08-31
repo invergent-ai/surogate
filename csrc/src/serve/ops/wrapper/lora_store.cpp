@@ -72,7 +72,7 @@ Tensor LoraStore::scratch(std::int32_t tokens) const {
     return Tensor(scratch_, DType::BF16, {max_rank_ * scratch_tokens_});
 }
 
-void LoraStore::set_slot(const void* base_key, std::int32_t slot,
+void LoraStore::set_slot(const void* base_key, std::int32_t port, std::int32_t slot,
                          const std::vector<std::uint16_t>& a, const std::vector<std::uint16_t>& b,
                          std::int32_t rank, std::int32_t in_dim, std::int32_t out_dim,
                          float scale) {
@@ -88,7 +88,8 @@ void LoraStore::set_slot(const void* base_key, std::int32_t slot,
         throw std::invalid_argument("lora_store: A must be [rank,in] and B [out,rank]");
     }
 
-    auto found = banks_.find(base_key);
+    const Key key{base_key, port};
+    auto found = banks_.find(key);
     if (found == banks_.end()) {
         Bank bank;
         const std::size_t a_elements =
@@ -104,7 +105,7 @@ void LoraStore::set_slot(const void* base_key, std::int32_t slot,
         bank.view.rank     = max_rank_;
         bank.view.n        = out_dim;
         bank.view.k        = in_dim;
-        found              = banks_.emplace(base_key, bank).first;
+        found              = banks_.emplace(key, bank).first;
     }
     Bank& bank = found->second;
     if (bank.view.k != in_dim || bank.view.n != out_dim) {

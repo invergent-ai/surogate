@@ -179,13 +179,14 @@ namespace {
 /// against whatever the round wrote, and a buffer allocated per call inside the
 /// hook is baked in by address instead -- which is what made an earlier version
 /// of this give a different answer on every replay.
-void apply_lora(const Weight& base, const Tensor& hidden, Tensor& out, cudaStream_t stream) {
+void apply_lora(const Weight& base, std::int32_t port, const Tensor& hidden, Tensor& out,
+                cudaStream_t stream) {
     const bool debug = std::getenv("SUROGATE_SERVE_LORA_DEBUG") != nullptr;
     if (!ops::lora_active()) {
         if (debug) { std::fprintf(stderr, "lora-hook: inactive\n"); }
         return;
     }
-    const ops::LoraBank* bank = ops::lora_store_for_current_device().find(base.qdata);
+    const ops::LoraBank* bank = ops::lora_store_for_current_device().find(base.qdata, port);
     if (bank == nullptr) {
         if (debug) { std::fprintf(stderr, "lora-hook: no bank for this weight\n"); }
         return;
@@ -217,14 +218,16 @@ void Variant::attention_projection(const Tensor& hidden,
     const Weight& fused = std::get<FusedAttentionProjectionPayload>(weights).query_key_gate_value;
     ops::attn_input_proj(hidden, fused, query, gate, key, value, text_policy(fused), workspace,
                          stream);
-    apply_lora(fused, hidden, query, stream);
+    apply_lora(fused, 0, hidden, query, stream);
+    apply_lora(fused, 1, hidden, key, stream);
+    apply_lora(fused, 2, hidden, value, stream);
 }
 
 void Variant::attention_output_projection(const Tensor& attention, const Weight& weight,
                                           Tensor& residual, qwen3_6::TextPhase,
                                           WorkspaceArena& workspace, cudaStream_t stream) {
     ops::linear_add(attention, weight, residual, text_policy(weight), workspace, stream);
-    apply_lora(weight, attention, residual, stream);
+    apply_lora(weight, 3, attention, residual, stream);
 }
 
 void Variant::mtp_attention_projection(const Tensor& hidden,
@@ -357,6 +360,9 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
                        stream);
     ops::linear_add(activation, weights.down, residual, text_policy(weights.down), workspace,
                     stream);
+    // down reads the SwiGLU activation, which is exactly the input its adapter was
+    // trained against.
+    apply_lora(weights.down, 4, activation, residual, stream);
 }
 
 void Variant::mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
