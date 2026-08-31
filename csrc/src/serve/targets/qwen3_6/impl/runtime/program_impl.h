@@ -7,6 +7,7 @@
 #include <cstdlib>
 
 #include "targets/qwen3_6/impl/runtime/schedule.h"
+#include "api/ops/lora_store.h"
 #include "api/ops/gdn_replay.h"
 #include "api/ops/prepare_ragged_prefix.h"
 #include "ops/linear/fp8/fp8_cublaslt.h"
@@ -1639,6 +1640,32 @@ void ProgramImplCore::prepare_graphs() {
         capture_card.set_gdn_state_action(schedule::GdnStateAction::UpdateInPlace, nullptr);
         prepare_representative(1, 1);
         set_device_i32(io.text_kv_table_row, 0); // the bound dummy row
+        // Capture the prefill graphs with the adapter kernels in them. A graph
+        // records the launches it sees, so one captured while no round is
+        // published carries no delta at all and every request replaying it is
+        // served the base model -- while the decode graph, captured through a
+        // path that does publish, applies one. That split is what made an
+        // adapter's output vary with which graph a request happened to use.
+        //
+        // The slot the kernels read is a device cell, not a launch argument, so
+        // capturing with the cell holding -1 records the work without binding it
+        // to any adapter: each replay reads whatever the round wrote.
+        struct LoraCaptureScope {
+            bool held = false;
+            LoraCaptureScope(std::int32_t columns, cudaStream_t stream) {
+                if (!ops::lora_active()) { return; }
+                ops::LoraRound round;
+                round.uniform = true;
+                round.scratch = ops::lora_store_for_current_device().scratch(columns);
+                if (round.scratch.data == nullptr) { return; }
+                ops::lora_store_for_current_device().write_uniform_slot(-1, stream);
+                ops::lora_set_round(round);
+                held = true;
+            }
+            ~LoraCaptureScope() {
+                if (held) { ops::lora_clear_round(); }
+            }
+        } lora_capture(static_cast<std::int32_t>(effective_chunk), device.stream);
         {
             const std::vector<int> warm_ids(static_cast<std::size_t>(effective_chunk), 0);
             const schedule::PrefillChunkResult warm = capture_card.prefill_chunk(

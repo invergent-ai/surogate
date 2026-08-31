@@ -80,38 +80,33 @@ PrefillChunkResult prefill_text_chunk(
     // it on the base model and then decoding with the delta leaves the request
     // reading a cache the adapter never wrote, which looks like a weak adapter
     // rather than a bug.
+    // Publish a round for *every* prefill once adapters are loaded, base-model
+    // requests included, and always write the slot -- -1 when the request selected
+    // no adapter.
+    //
+    // The captured prefill graph contains the delta launches unconditionally, and
+    // they read the slot from a device cell. A base request that skipped the write
+    // therefore inherited whatever the previous request left in the cell and was
+    // served that adapter: base-model output varied run to run while an adapter's
+    // did not. The write is the round's statement of "no adapter", not an
+    // optimisation to skip.
     struct LoraPrefillScope {
         bool held = false;
-        explicit LoraPrefillScope(std::int32_t slot, std::int32_t columns) {
-            const bool dbg = std::getenv("SUROGATE_SERVE_LORA_DEBUG") != nullptr;
-            if (!ops::lora_active() || slot < 0) {
-                if (dbg) {
-                    std::fprintf(stderr, "lora-prefill: skip active=%d slot=%d\n",
-                                 ops::lora_active() ? 1 : 0, slot);
-                }
-                return;
-            }
+        LoraPrefillScope(std::int32_t slot, std::int32_t columns, cudaStream_t stream) {
+            if (!ops::lora_active()) { return; }
             ops::LoraRound round;
             round.uniform = true;
             round.scratch = ops::lora_store_for_current_device().scratch(columns);
-            if (round.scratch.data == nullptr) {
-                if (dbg) {
-                    std::fprintf(stderr, "lora-prefill: no scratch for %d columns\n", columns);
-                }
-                return;
-            }
+            if (round.scratch.data == nullptr) { return; }
+            ops::lora_store_for_current_device().write_uniform_slot(slot, stream);
             ops::lora_set_round(round);
             held = true;
-            if (dbg) { std::fprintf(stderr, "lora-prefill: held slot=%d cols=%d\n", slot, columns); }
         }
         ~LoraPrefillScope() {
             if (held) { ops::lora_clear_round(); }
         }
-    } lora_scope(state.lora_slot, static_cast<std::int32_t>(nominal_length));
-    if (lora_scope.held) {
-        ops::lora_store_for_current_device().write_uniform_slot(state.lora_slot,
-                                                                state.execution.device.stream);
-    }
+    } lora_scope(state.lora_slot, static_cast<std::int32_t>(nominal_length),
+                 state.execution.device.stream);
     if (state.dflash != nullptr) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
         return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end,

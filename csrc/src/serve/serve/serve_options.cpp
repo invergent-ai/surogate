@@ -477,17 +477,22 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         }
         // CUDA graphs off while adapters are loaded.
         //
-        // Eager is correct and reproducible: three adapters resident, each request
-        // selecting its own, every answer identical across runs, and a B=0 adapter
-        // inert. Under capture the same configuration answers differently on
-        // successive runs. The plans that first caused this are gone -- the delta
-        // is a pair of hand-written kernels now, allocating nothing -- and the ids
-        // and scratch are frame- and store-resident, so the remaining suspect is
-        // the capture itself: the prefill graph is recorded at startup, and a round
-        // published only when a request is in flight is not published then, so the
-        // captured graph can carry no adapter kernels while the decode graph does.
-        // Publishing a representative round during capture is the fix; until it is
-        // written and verified, adapters run eager.
+        // Eager is verified: three adapters resident, each request selecting its
+        // own, every answer repeatable, a B=0 adapter inert, and a five-module
+        // adapter applied across q/k/v/o/down. Capture is not, and the reason is
+        // structural rather than a missing call. Once a round is captured, the
+        // delta launches are unconditional and every choice they used to make on
+        // the host has to reach them as data. Two of those were found and fixed --
+        // the prefill graph is now captured with the launches in it, and a round
+        // states its slot even when that slot is "none", which stopped base-model
+        // requests from inheriting the previous request's adapter. A third
+        // remains: decode rounds still occasionally read a stale slot, because the
+        // ingress is staged once per request rather than once per round, so a new
+        // request's first replays can run against the previous one's ids.
+        //
+        // That last one is a cross-request leak, not a rounding difference, so it
+        // is gated rather than shipped. The fix is to stage lora_slots on every
+        // round that stages tokens.
         if (options.use_cuda_graph) {
             options.use_cuda_graph    = false;
             options.lora_forced_eager = true;
