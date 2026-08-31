@@ -940,6 +940,11 @@ add_library(ninfer_ops STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/launcher/causal_conv1d.cu
   ${SERVE_ROOT}/ops/launcher/embed_gather.cu
   ${SERVE_ROOT}/ops/launcher/gdn_gating.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_24q2.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa27.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa08.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa4b.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa35.cu
   ${SERVE_ROOT}/ops/launcher/gelu.cu
   ${SERVE_ROOT}/ops/launcher/bidirectional_gqa_attention.cu
   ${SERVE_ROOT}/ops/launcher/swa.cu
