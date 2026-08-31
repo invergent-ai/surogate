@@ -1,5 +1,6 @@
 """Model Definitions for Python DSL"""
 
+from .gemma3 import Gemma3CausalModel, Gemma3TextModel
 from .gemma4 import Gemma4CausalModel, Gemma4ConditionalModel, Gemma4UnifiedModel
 from .gpt_oss import GptOssModel
 from .laguna import LagunaModel
@@ -27,6 +28,8 @@ __all__ = [
     "LagunaModel",
     "LlamaModel",
     "Lfm2Model",
+    "Gemma3CausalModel",
+    "Gemma3TextModel",
     "Gemma4CausalModel",
     "Gemma4ConditionalModel",
     "Gemma4UnifiedModel",
