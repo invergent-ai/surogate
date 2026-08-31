@@ -636,3 +636,27 @@ carrying objects no binder consumes.
 
 The declaration now describes all of it either way, which is the point: the tower's
 geometry has one home, and both halves read it from there.
+
+## Serving with vision, step one: the tower's geometry stops being a family constant
+
+`qwen3_6::VisionBackboneConfig` pinned one tower — 27 layers of 1152 — and every
+target inherited it, including the three Qwen3.5 targets whose towers are 12 of
+768 and 24 of 1024. Worse than a wrong constant, it sized *types*:
+`std::array<VisionLayerPlan, VisionBackboneConfig::layers>`, so a plan literally
+could not describe a 24-layer tower.
+
+`VisionBackbonePlanFor<Config>`, `VisionCommonWeightsFor<Config>` and
+`VisionWeightsFor<Config>` now take the config, with the old names kept as aliases
+to the default instantiation. Nothing about the shipping targets changes: the 27B
+and 35B compile against the same types they always did. Verified by building the
+serve targets — `qwen3_6_27b` and `qwen3_6_35b_a3b` bindings compile unchanged,
+the engine relinks, loads a converted artifact and answers a real request.
+
+That is deliberately the whole of this step. What remains before a text-only
+target can serve vision is the part with real behaviour in it: give each target a
+`VisionConfig` carrying its own numbers, template `bind_vision_backbone` and the
+vision context on the config (`bindings.cpp` is a translation unit today, so it
+moves to a header or gains explicit instantiations), bind the objects, run the
+tower in the forward, and open the `--vision` gate that currently throws
+"qwen3.5-2b target is text-only". Only then does the converter export the tower
+for those targets, because the engine refuses objects no binder consumes.

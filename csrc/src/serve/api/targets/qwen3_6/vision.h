@@ -12,6 +12,11 @@ class MaterializedArtifact;
 
 namespace ninfer::targets::qwen3_6 {
 
+// The vision tower's geometry is per-model, not per-family: the 0.8B ships 12
+// layers of 768, the 2B and 4B 24 of 1024, the 27B/35B and Flash-Next 27 of 1152.
+// These values are the last of those, kept as the default so every target that
+// inherits them today is unaffected; a target with its own tower overrides them
+// and instantiates the plan and weight types below on its own config.
 struct VisionBackboneConfig {
     static constexpr int layers              = 27;
     static constexpr int hidden              = 1152;
@@ -43,12 +48,18 @@ struct VisionLayerPlan {
     artifact::ObjectHandle norm2_bias;
 };
 
-struct VisionBackbonePlan {
+// Sized by the config rather than by the family, because a plan whose layer array
+// is 27 long cannot describe a 24-layer tower. `VisionBackbonePlan` keeps naming
+// the default instantiation so existing targets are untouched.
+template <class Config>
+struct VisionBackbonePlanFor {
     artifact::ObjectHandle patch_embedding;
     artifact::ObjectHandle patch_embedding_bias;
     artifact::ObjectHandle position_embedding;
-    std::array<VisionLayerPlan, VisionBackboneConfig::layers> layers;
+    std::array<VisionLayerPlan, Config::layers> layers;
 };
+
+using VisionBackbonePlan = VisionBackbonePlanFor<VisionBackboneConfig>;
 
 struct VisionMergerInputPlan {
     artifact::ObjectHandle fc1;
@@ -75,22 +86,28 @@ struct VisionLayerWeights {
     Tensor norm2_bias;
 };
 
-struct VisionCommonWeights {
+template <class Config>
+struct VisionCommonWeightsFor {
     Weight patch_embedding;
     Tensor patch_embedding_bias;
     Tensor position_embedding;
-    std::array<VisionLayerWeights, VisionBackboneConfig::layers> layers;
+    std::array<VisionLayerWeights, Config::layers> layers;
     Weight merger_fc1;
     Tensor merger_fc1_bias;
     Tensor merger_norm_weight;
     Tensor merger_norm_bias;
 };
 
-struct VisionWeights {
-    VisionCommonWeights common;
+using VisionCommonWeights = VisionCommonWeightsFor<VisionBackboneConfig>;
+
+template <class Config>
+struct VisionWeightsFor {
+    VisionCommonWeightsFor<Config> common;
     Weight merger_fc2;
     Tensor merger_fc2_bias;
 };
+
+using VisionWeights = VisionWeightsFor<VisionBackboneConfig>;
 
 [[nodiscard]] VisionBackbonePlan bind_vision_backbone(artifact::Binder& binder,
                                                       artifact::TensorPlacement placement);
