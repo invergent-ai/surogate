@@ -49,6 +49,38 @@ struct LoraWeights {
 void lora_delta(const Tensor& x, const LoraWeights& lora, Tensor& out, Tensor& scratch,
                 cudaStream_t stream);
 
+/// A stacked bank of adapters for one projection: every slot padded to the same
+/// (max_rank, k) and (n, max_rank), so a token's slot index is the only thing
+/// that varies and the launch geometry is constant.
+///
+/// The padding is what makes many adapters cheaper than many code paths. It is
+/// also what makes the delta capturable: a graph records one launch whose shape
+/// does not depend on which adapters happen to be in the batch.
+struct LoraBank {
+    const void* a         = nullptr; ///< BF16 [slots, max_rank, k], alpha/r folded in
+    const void* b         = nullptr; ///< BF16 [slots, n, max_rank]
+    std::int64_t a_stride = 0;       ///< elements between slots in `a`
+    std::int64_t b_stride = 0;       ///< elements between slots in `b`
+    std::int32_t rank     = 0;       ///< max_rank; a shorter adapter is zero-padded
+    std::int32_t n        = 0;
+    std::int32_t k        = 0;
+};
+
+/// out[n, T] += B[ids[t]] · (A[ids[t]] · x[:, t]), per token.
+///
+/// `ids` is device I32 [T]; a negative entry is a base-model token and
+/// contributes nothing, so a round mixing adapted and unadapted requests takes
+/// one launch rather than two. `scratch` is BF16 and at least rank * T long, and
+/// must be storage that outlives a graph replay -- a buffer allocated per call
+/// inside a captured region is baked in by address, which is how this path first
+/// went wrong.
+void lora_delta_batched(const Tensor& x, const LoraBank& bank, const Tensor& ids, Tensor& out,
+                        Tensor& scratch, cudaStream_t stream);
+
+/// BF16 scratch elements `lora_delta_batched` needs for a round of `tokens`.
+[[nodiscard]] std::size_t lora_batched_workspace_elements(std::int32_t rank,
+                                                          std::int32_t tokens) noexcept;
+
 /// Caches the cuBLASLt plans both GEMMs need, for a rank and token count, before
 /// stream capture. Applying an adapter inside a captured graph without this
 /// would allocate on the capture path.

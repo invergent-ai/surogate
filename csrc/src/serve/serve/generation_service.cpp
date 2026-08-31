@@ -2,6 +2,7 @@
 
 #include "product/media_acquire/acquire.h"
 #include "serve/console_log.h"
+#include "api/ops/lora_store.h"
 #include "serve/lora_registry.h"
 #include "serve/output_parsers.h"
 #include "serve/tool_call_parser.h"
@@ -276,7 +277,18 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
         }
     }
     engine_options.load_progress            = std::move(load_progress);
+    const std::size_t requested_lora = engine_options.lora_payloads.size();
     engine_              = std::make_unique<sinfer::Engine>(std::move(engine_options));
+    // Only a target that binds adapters to its own weights can apply them, and most
+    // do not yet. Without this check a request naming an adapter would be answered
+    // by the base model on those targets -- served confidently, and wrong. The
+    // store is populated during load, so an empty one here means nothing bound.
+    if (requested_lora != 0 && ops::lora_store_for_current_device().empty()) {
+        throw std::invalid_argument(
+            "--enable-lora: this target does not apply adapters (only qwen3.5-0.8b binds them "
+            "today), so the adapter would be loaded and silently ignored. Merge it into the "
+            "checkpoint before conversion (`surogate merge`) to serve it here.");
+    }
     prompt_capabilities_ = engine_->prompt_capabilities();
     request_capacity_    = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);

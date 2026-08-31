@@ -4,6 +4,7 @@
 #include "api/ops/lora.h"
 
 #include "api/ops/residual_add.h"
+#include "ops/launcher/lora_batched.h"
 #include "ops/linear/bf16/bf16_cublaslt.h"
 
 #include <stdexcept>
@@ -73,6 +74,42 @@ void lora_delta(const Tensor& x, const LoraWeights& lora, Tensor& out, Tensor& s
     detail::bf16_cublaslt_gemm(lora.a, x, low, stream);
     detail::bf16_cublaslt_gemm(lora.b, low, delta, stream);
     residual_add(delta, out, stream);
+}
+
+std::size_t lora_batched_workspace_elements(std::int32_t rank, std::int32_t tokens) noexcept {
+    if (rank <= 0 || tokens <= 0) { return 0; }
+    return static_cast<std::size_t>(rank) * static_cast<std::size_t>(tokens);
+}
+
+void lora_delta_batched(const Tensor& x, const LoraBank& bank, const Tensor& ids, Tensor& out,
+                        Tensor& scratch, cudaStream_t stream) {
+    if (bank.rank <= 0 || bank.a == nullptr || bank.b == nullptr) { return; }
+    if (x.dtype != DType::BF16 || out.dtype != DType::BF16 || scratch.dtype != DType::BF16) {
+        throw std::invalid_argument("lora_delta_batched: x/out/scratch must be BF16");
+    }
+    if (ids.dtype != DType::I32 || ids.data == nullptr) {
+        throw std::invalid_argument("lora_delta_batched: ids must be a device I32 tensor");
+    }
+    if (!x.is_contiguous() || !out.is_contiguous() || !scratch.is_contiguous()) {
+        throw std::invalid_argument("lora_delta_batched: x/out/scratch must be contiguous");
+    }
+    const std::int32_t tokens = x.ne[1];
+    if (tokens <= 0 || out.ne[1] != tokens || ids.numel() < tokens) {
+        throw std::invalid_argument("lora_delta_batched: ids must cover the round's tokens");
+    }
+    if (x.ne[0] != bank.k || out.ne[0] != bank.n) {
+        throw std::invalid_argument("lora_delta_batched: bank does not match this projection");
+    }
+    if (scratch.numel() <
+        static_cast<std::int64_t>(lora_batched_workspace_elements(bank.rank, tokens))) {
+        throw std::invalid_argument("lora_delta_batched: scratch is smaller than rank x tokens");
+    }
+
+    Tensor low(scratch.data, DType::BF16, {bank.rank, tokens});
+    detail::lora_batched_shrink_launch(x, bank.a, ids, low, bank.k, bank.rank, bank.a_stride,
+                                       stream);
+    detail::lora_batched_expand_launch(low, bank.b, ids, out, bank.n, bank.rank, bank.b_stride,
+                                       stream);
 }
 
 } // namespace sinfer::ops

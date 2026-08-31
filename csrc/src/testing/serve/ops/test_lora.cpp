@@ -208,6 +208,87 @@ void test_refusals() {
     check(no_throw, "rank 0 applies nothing and raises nothing");
 }
 
+/// The batched path: one round, several adapters, some tokens on the base model.
+///
+/// This is the case the single-adapter op cannot express, so it is the one that
+/// matters. The oracle picks each token's slot itself; a kernel that ignored
+/// `ids` and used slot 0 for everything would pass a single-adapter test and
+/// fail here.
+void test_batched(std::int32_t n, std::int32_t k, std::int32_t rank, std::int32_t slots,
+                  const std::vector<std::int32_t>& ids) {
+    const auto tokens = static_cast<std::int32_t>(ids.size());
+    const auto host_x = random_bf16(static_cast<std::size_t>(k) * tokens, 11, 1.0F);
+    const auto host_a = random_bf16(static_cast<std::size_t>(slots) * rank * k, 12, 0.06F);
+    const auto host_b = random_bf16(static_cast<std::size_t>(slots) * n * rank, 13, 0.06F);
+    const auto host_base = random_bf16(static_cast<std::size_t>(n) * tokens, 14, 1.0F);
+
+    GuardedDeviceBuffer x_dev(host_x.size() * sizeof(std::uint16_t));
+    x_dev.copy_from_host(host_x.data(), x_dev.bytes());
+    GuardedDeviceBuffer a_dev(host_a.size() * sizeof(std::uint16_t));
+    a_dev.copy_from_host(host_a.data(), a_dev.bytes());
+    GuardedDeviceBuffer b_dev(host_b.size() * sizeof(std::uint16_t));
+    b_dev.copy_from_host(host_b.data(), b_dev.bytes());
+    GuardedDeviceBuffer out_dev(host_base.size() * sizeof(std::uint16_t));
+    out_dev.copy_from_host(host_base.data(), out_dev.bytes());
+    GuardedDeviceBuffer ids_dev(ids.size() * sizeof(std::int32_t));
+    ids_dev.copy_from_host(ids.data(), ids_dev.bytes());
+    GuardedDeviceBuffer scratch_dev(
+        ops::lora_batched_workspace_elements(rank, tokens) * sizeof(std::uint16_t));
+
+    Tensor x(x_dev.data(), DType::BF16, {k, tokens});
+    Tensor out(out_dev.data(), DType::BF16, {n, tokens});
+    Tensor id_tensor(ids_dev.data(), DType::I32, {tokens});
+    Tensor scratch(scratch_dev.data(), DType::BF16,
+                   {static_cast<std::int32_t>(ops::lora_batched_workspace_elements(rank, tokens))});
+
+    ops::LoraBank bank;
+    bank.a        = a_dev.data();
+    bank.b        = b_dev.data();
+    bank.a_stride = static_cast<std::int64_t>(rank) * k;
+    bank.b_stride = static_cast<std::int64_t>(n) * rank;
+    bank.rank     = rank;
+    bank.n        = n;
+    bank.k        = k;
+
+    ops::lora_delta_batched(x, bank, id_tensor, out, scratch, nullptr);
+    cuda_synchronize();
+    std::vector<std::uint16_t> got(static_cast<std::size_t>(n) * tokens);
+    out_dev.copy_to_host(got.data(), out_dev.bytes());
+
+    double worst = 0.0;
+    for (std::int32_t t = 0; t < tokens; ++t) {
+        const std::int32_t slot = ids[static_cast<std::size_t>(t)];
+        for (std::int32_t row = 0; row < n; ++row) {
+            double delta = 0.0;
+            if (slot >= 0) {
+                for (std::int32_t r = 0; r < rank; ++r) {
+                    double low = 0.0;
+                    for (std::int32_t i = 0; i < k; ++i) {
+                        low += static_cast<double>(from_bf16(
+                                   host_a[(static_cast<std::size_t>(slot) * rank + r) * k + i])) *
+                               static_cast<double>(
+                                   from_bf16(host_x[static_cast<std::size_t>(t) * k + i]));
+                    }
+                    low = static_cast<double>(from_bf16(to_bf16(static_cast<float>(low))));
+                    delta += static_cast<double>(from_bf16(
+                                 host_b[(static_cast<std::size_t>(slot) * n + row) * rank + r])) *
+                             low;
+                }
+            }
+            const double want =
+                static_cast<double>(from_bf16(host_base[static_cast<std::size_t>(t) * n + row])) +
+                delta;
+            const double have =
+                static_cast<double>(from_bf16(got[static_cast<std::size_t>(t) * n + row]));
+            worst = std::max(worst, std::abs(have - want) / std::max(1.0, std::abs(want)));
+        }
+    }
+    const std::string label = "batched n=" + std::to_string(n) + " r=" + std::to_string(rank) +
+                              " slots=" + std::to_string(slots) + " T=" + std::to_string(tokens);
+    check(worst < 1e-2, label + " (relative error " + std::to_string(worst) + ")");
+    std::printf("  %-44s max relative error %.2e\n", label.c_str(), worst);
+}
+
 } // namespace
 
 int main() {
@@ -216,6 +297,11 @@ int main() {
         test_delta(256, 512, 16, 4);  // speculative verify width
         test_delta(512, 2048, 32, 37); // a prefill slice, rank 32
         test_refusals();
+        // Several adapters and base-model tokens in one round, which is the point.
+        test_batched(256, 512, 16, 4, {0, 1, 2, 3, -1, 0, 2, -1});
+        test_batched(1024, 1024, 8, 2, {1, -1, 0, 0});
+        test_batched(64, 128, 4, 1, {-1, -1});        // every token on the base model
+        test_batched(512, 2048, 32, 3, {2, 2, 2, 2}); // one adapter, wide rank
     } catch (const std::exception& error) {
         std::cerr << "lora: " << error.what() << '\n';
         return 1;
