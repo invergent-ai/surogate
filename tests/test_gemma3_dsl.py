@@ -252,3 +252,72 @@ def test_inlined_config_still_matches_the_published_one():
         if key == "architectures":
             continue
         assert published[key] == value, key
+
+
+# ---------------------------------------------------------------------------
+# How a serving artifact stores it
+# ---------------------------------------------------------------------------
+
+
+def test_every_norm_unfolds_its_unit_offset():
+    """Gemma stores RMSNorm weights zero-centred and applies them as 1 + w.
+
+    An artifact shipping the raw tensor scales by roughly zero, so every norm
+    object — four per block, the two QK norms, and the final norm — must name the
+    transform. This is the check that catches a norm added later without it.
+    """
+    from surogate.dsl.blocks.gemma3 import Gemma3FullBlock, Gemma3SlidingBlock
+    from surogate.dsl.models.gemma3 import GEMMA3_MODEL_SERVE_OBJECTS
+
+    objects = list(Gemma3SlidingBlock.schema.serve_objects) + list(GEMMA3_MODEL_SERVE_OBJECTS)
+    norms = [o for o in objects if "norm" in o.name]
+    assert len(norms) == 4 + 2 + 1
+    for obj in norms:
+        assert obj.transform == "unfold_unit_offset", obj.name
+    assert Gemma3FullBlock.schema.serve_objects == Gemma3SlidingBlock.schema.serve_objects
+
+
+def test_block_schemas_satisfy_the_serve_contract():
+    from surogate.dsl.blocks.gemma3 import Gemma3FullBlock, Gemma3SlidingBlock
+
+    for block in (Gemma3SlidingBlock, Gemma3FullBlock):
+        assert block.schema.contract_errors() == (), block.__name__
+        assert len(block.schema.serve_objects) == 11
+
+
+def test_only_the_generative_variant_carries_an_output_head():
+    """EmbeddingGemma's checkpoint stops at norm.weight — there is no lm_head to
+    store, so an artifact holding one would describe a model that does not exist."""
+    text = {o.name for o in Gemma3TextModel._serve_objects_}
+    causal = {o.name for o in Gemma3CausalModel._serve_objects_}
+    assert "text/output_head" in causal
+    assert "text/output_head" not in text
+    assert "text/embedding_head" in text
+    assert "text/embedding_head" not in causal
+
+
+def test_the_embedding_head_is_one_folded_matrix_behind_a_capability():
+    """Both Dense modules declare Identity, so 768->3072->768 composes to [C, C].
+
+    Capability-gated because a text-only target must not be handed an object no
+    binder consumes — the engine refuses to load such an artifact outright.
+    """
+    (head,) = [o for o in Gemma3TextModel._serve_objects_ if o.name == "text/embedding_head"]
+    assert head.shape == ("C", "C")
+    assert head.transform == "compose_linear"
+    assert head.capability == "embedding"
+    assert head.scope == "model"
+    # Everything else is text, so a text-only target exports the backbone alone.
+    assert {o.capability for o in Gemma3TextModel._serve_objects_} == {"text", "embedding"}
+
+
+def test_pooling_policy_is_declared():
+    """The prefix is inside the mean, and Matryoshka truncates before it
+    renormalises. Both are silent when wrong: still unit-ish vectors, worse
+    ranking."""
+    model = build_from_config(EMBEDDINGGEMMA_CONFIG)
+    assert model.pooling == "mean"
+    assert model.pooling_include_prompt is True
+    assert model.embedding_normalize == "l2"
+    assert model.embedding_dim == 768
+    assert model.matryoshka_dims == (768, 512, 256, 128)

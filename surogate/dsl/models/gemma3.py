@@ -67,6 +67,50 @@ GEMMA3_OUTPUT_HEAD_SERVE_OBJECTS: tuple[ServeObject, ...] = (
     ServeObject("text/output_head", "quantised", ("Vocab", "C"), ("lm_head",), scope="model"),
 )
 
+#: EmbeddingGemma's head, as one matrix.
+#:
+#: The checkpoint ships it as two sentence-transformers modules -- 2_Dense
+#: (768->3072) then 3_Dense (3072->768) -- and both declare an *Identity*
+#: activation. Two linear maps with nothing between them compose, so the artifact
+#: stores their product: one [C, C] instead of 4.7M parameters, and one GEMM per
+#: request instead of two.
+#:
+#: Measured on the real weights, this is not a trade. Folding rounds once where
+#: the pair rounds twice, so against an fp32 reference it comes out marginally
+#: ahead in bf16 (min cosine 0.99999678 folded, 0.99999672 unfolded) and within
+#: 7.6e-08 in fp32.
+#:
+#: ``components`` is empty because those two matrices are not declared parameters
+#: of this model: they live in `2_Dense/` and `3_Dense/` sub-directories that the
+#: training weight loader does not reach, so the head is described for serving
+#: only and the converter reads them from the checkpoint. Same shape as the
+#: n-gram tables on qwen4exp, which are artifact objects with no declared source.
+EMBEDDING_GEMMA_HEAD_SERVE_OBJECTS: tuple[ServeObject, ...] = (
+    ServeObject("text/embedding_head", "bf16", ("C", "C"), (),
+                transform="compose_linear", scope="model", capability="embedding"),
+)
+
+#: How the pooled vector is produced, for a target that implements ``embedding``.
+#:
+#: ``include_prompt`` matters and is easy to miss: the task prefix
+#: ("task: search result | query: ") is part of the mean, not stripped before it.
+#: Matryoshka dimensions truncate *then* renormalise -- the other order gives
+#: vectors that are not unit-norm and silently degrades cosine ranking.
+#:
+#: Set on the instance, which makes the class the source of truth, but note that
+#: only the int and the bool currently reach the compiled IR's config dict:
+#: ``py_compiler`` serialises non-declared instance attributes through a filter
+#: that admits ints and bools and drops strings and tuples. Widening it would
+#: also widen what dimension resolution sees, so the serve generator should read
+#: these from the class rather than the IR until there is a reason to change it.
+EMBEDDING_GEMMA_POOLING = {
+    "pooling": "mean",
+    "pooling_include_prompt": True,
+    "embedding_normalize": "l2",
+    "embedding_dim": 768,
+    "matryoshka_dims": (768, 512, 256, 128),
+}
+
 
 def _parse_gemma3_layer_types(
     layer_types: list[str] | None,
@@ -388,6 +432,7 @@ class Gemma3TextModel(_Gemma3Base):
     """
 
     _hf_block_mappings_ = _build_gemma3_mappings("layers.{layer}", "", tied_lm_head=True)
+    _serve_objects_ = GEMMA3_MODEL_SERVE_OBJECTS + EMBEDDING_GEMMA_HEAD_SERVE_OBJECTS
 
     def __init__(
         self,
@@ -427,3 +472,5 @@ class Gemma3TextModel(_Gemma3Base):
             query_pre_attn_scalar=query_pre_attn_scalar,
             causal=not use_bidirectional_attention,
         )
+        for key, value in EMBEDDING_GEMMA_POOLING.items():
+            setattr(self, key, value)
