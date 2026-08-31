@@ -1223,6 +1223,9 @@ add_library(sinfer_encoder STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/encoder/cpu/cpu_gemma_embedding.cpp
 )
 sinfer_internal_includes(sinfer_encoder)
+find_package(OpenMP REQUIRED)
+target_link_libraries(sinfer_encoder PRIVATE OpenMP::OpenMP_CXX)
+target_compile_options(sinfer_encoder PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-fopenmp>)
 target_include_directories(sinfer_encoder PRIVATE ${sentencepiece_SOURCE_DIR}/src)
 target_link_libraries(sinfer_encoder PUBLIC sinfer_core sinfer_ops sinfer_artifact
                                      PRIVATE sentencepiece-static)

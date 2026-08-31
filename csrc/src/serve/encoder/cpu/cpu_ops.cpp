@@ -22,6 +22,10 @@
 #include <stdexcept>
 #include <cstdlib>
 #include <unordered_map>
+
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
 #include <unordered_set>
 
 #if defined(__x86_64__)
@@ -341,11 +345,17 @@ struct ThreadPool::Impl {
 ThreadPool::ThreadPool(ThreadPlan plan) : impl_(std::make_unique<Impl>()) {
     impl_->threads = std::max(1, plan.threads);
     impl_->cpus    = std::move(plan.cpus);
+#if !defined(_OPENMP)
     // One fewer worker than threads: the caller runs a slice too, which keeps a
     // single-threaded plan free of any handoff at all.
     for (int index = 0; index + 1 < impl_->threads; ++index) {
         impl_->workers.emplace_back([impl = impl_.get(), index] { impl->worker(index); });
     }
+#else
+    // Kernels dispatch onto the shared OpenMP team (see parallel_for); size it
+    // to the plan so oneDNN and the elementwise phases use the same threads.
+    omp_set_num_threads(impl_->threads);
+#endif
 }
 
 ThreadPool::~ThreadPool() {
@@ -364,6 +374,34 @@ int ThreadPool::threads() const noexcept { return impl_->threads; }
 void ThreadPool::parallel_for(std::int64_t count,
                               const std::function<void(std::int64_t, std::int64_t)>& body) {
     if (count <= 0) { return; }
+#if defined(_OPENMP)
+    // One team for everything. oneDNN parallelises on OpenMP; if these kernels
+    // ran on a private pool instead, every switch between a matmul and an
+    // elementwise phase would park one team and wake the other — three hundred
+    // times per forward. Running on the same team removes the handoff entirely,
+    // and the affinity the plan chose is applied once per OpenMP thread.
+    const int team = threads();
+    #pragma omp parallel num_threads(team)
+    {
+        const int index = omp_get_thread_num();
+        if (!impl_->cpus.empty()) {
+#if defined(__x86_64__)
+            static thread_local bool pinned = false;
+            if (!pinned) {
+                cpu_set_t set;
+                CPU_ZERO(&set);
+                CPU_SET(impl_->cpus[static_cast<std::size_t>(index) % impl_->cpus.size()], &set);
+                sched_setaffinity(0, sizeof(set), &set);
+                pinned = true;
+            }
+#endif
+        }
+        const std::int64_t per   = (count + team - 1) / team;
+        const std::int64_t begin = std::min<std::int64_t>(count, per * index);
+        const std::int64_t end   = std::min<std::int64_t>(count, begin + per);
+        if (begin < end) { body(begin, end); }
+    }
+#else
     if (impl_->workers.empty()) {
         body(0, count);
         return;
@@ -382,6 +420,7 @@ void ThreadPool::parallel_for(std::int64_t count,
 
     std::unique_lock<std::mutex> lock(impl_->mutex);
     impl_->done.wait(lock, [&] { return impl_->outstanding == 0; });
+#endif
 }
 
 // --- kernels ----------------------------------------------------------------
