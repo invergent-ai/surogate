@@ -37,6 +37,8 @@ struct GemmaEmbeddingConfig {
     std::int32_t intermediate = 1152;
     std::int32_t vocab        = 262144;
     std::int32_t max_tokens   = 2048;
+    /// Total tokens one batched forward may carry, across all its sequences.
+    std::int32_t max_batch_tokens = 8192;
 
     float rms_epsilon = 1.0e-6F;
     /// Local layers mask abs(i - j) >= window; global layers mask nothing.
@@ -74,12 +76,30 @@ public:
     /// of it, because EmbeddingGemma pools the prefix along with the text.
     [[nodiscard]] std::vector<float> embed(std::span<const std::int32_t> tokens);
 
+    /// Several sequences through one forward.
+    ///
+    /// The sequences are concatenated, so every projection sees one wide matrix
+    /// and batches for free -- and the projections are where the work is: at 512
+    /// tokens they are 108 GFLOP against attention's 19. Only attention is
+    /// per-sequence, because one sequence must not attend to the next; it runs
+    /// as a loop over column slices, which costs a few launches and no padding.
+    ///
+    /// Sequences may differ in length and there is no limit on how many: a
+    /// request larger than `max_batch_tokens` is split into forwards that fit,
+    /// which keeps the scratch arena a fixed size rather than a function of
+    /// whatever arrived.
+    [[nodiscard]] std::vector<std::vector<float>> embed_batch(
+        const std::vector<std::vector<std::int32_t>>& sequences);
+
     [[nodiscard]] const GemmaEmbeddingConfig& config() const noexcept;
     /// Bytes of device memory the weights occupy.
     [[nodiscard]] std::uint64_t weight_bytes() const noexcept;
 
 private:
     GemmaEmbedding();
+    /// One forward. Its sequences must already fit `max_batch_tokens`.
+    [[nodiscard]] std::vector<std::vector<float>> embed_chunk(
+        const std::vector<std::vector<std::int32_t>>& sequences);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

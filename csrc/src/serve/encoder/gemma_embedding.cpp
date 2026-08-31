@@ -146,7 +146,7 @@ GemmaEmbedding GemmaEmbedding::load(const std::filesystem::path& path, DeviceCon
     // Scratch for the widest request. Named for what they hold rather than
     // sized by trial: hidden-wide activations, one intermediate-wide pair for
     // the MLP, and q/k/v.
-    const auto tokens  = static_cast<std::size_t>(config.max_tokens);
+    const auto tokens  = static_cast<std::size_t>(config.max_batch_tokens);
     const std::size_t bf16 = sizeof(std::uint16_t);
     const std::size_t arena_bytes =
         bf16 * tokens *
@@ -158,6 +158,8 @@ GemmaEmbedding GemmaEmbedding::load(const std::filesystem::path& path, DeviceCon
         bf16 * 2 * static_cast<std::size_t>(config.hidden) + (1u << 20);
     impl.arena = std::make_unique<DeviceArena>(arena_bytes);
 
+    // Attention is per-sequence, so the score matrix is sized by the longest
+    // single sequence rather than by the batch.
     impl.attention_workspace_bytes =
         ops::encoder_attention_workspace_bytes(config.query_heads, config.max_tokens);
     impl.attention_workspace = std::make_unique<DeviceBuffer>(impl.attention_workspace_bytes);
@@ -170,43 +172,98 @@ GemmaEmbedding GemmaEmbedding::load(const std::filesystem::path& path, DeviceCon
 }
 
 std::vector<float> GemmaEmbedding::embed(std::span<const std::int32_t> tokens) {
-    Impl& impl                        = *impl_;
-    const GemmaEmbeddingConfig& config = impl.config;
-    const auto count                  = static_cast<std::int32_t>(tokens.size());
-    if (count <= 0) { throw std::invalid_argument("embed: needs at least one token"); }
-    if (count > config.max_tokens) {
-        throw std::invalid_argument("embed: " + std::to_string(count) + " tokens exceeds " +
-                                    std::to_string(config.max_tokens));
-    }
-    cudaStream_t stream = impl.device->stream;
+    std::vector<std::vector<std::int32_t>> one{
+        std::vector<std::int32_t>(tokens.begin(), tokens.end())};
+    return embed_batch(one).front();
+}
 
-    // Positions are 0..count-1; an encoder never resumes, so they are never
-    // anything else.
-    std::vector<std::int32_t> host_positions(static_cast<std::size_t>(count));
-    for (std::int32_t i = 0; i < count; ++i) { host_positions[static_cast<std::size_t>(i)] = i; }
-    CUDA_CHECK(cudaMemcpyAsync(impl.positions->p, host_positions.data(),
-                               host_positions.size() * sizeof(std::int32_t),
-                               cudaMemcpyHostToDevice, stream));
+std::vector<std::vector<float>> GemmaEmbedding::embed_batch(
+    const std::vector<std::vector<std::int32_t>>& sequences) {
+    const std::int32_t budget = impl_->config.max_batch_tokens;
+    std::vector<std::vector<float>> out;
+    out.reserve(sequences.size());
+
+    // Greedy partition: fill a forward until the next sequence would not fit.
+    // A single sequence longer than the budget still goes through on its own and
+    // is rejected there against max_tokens, which is the limit that means
+    // something to the model.
+    std::vector<std::vector<std::int32_t>> chunk;
+    std::int32_t chunk_tokens = 0;
+    const auto flush = [&]() {
+        if (chunk.empty()) { return; }
+        std::vector<std::vector<float>> vectors = embed_chunk(chunk);
+        out.insert(out.end(), std::make_move_iterator(vectors.begin()),
+                   std::make_move_iterator(vectors.end()));
+        chunk.clear();
+        chunk_tokens = 0;
+    };
+    for (const std::vector<std::int32_t>& sequence : sequences) {
+        const auto length = static_cast<std::int32_t>(sequence.size());
+        if (!chunk.empty() && chunk_tokens + length > budget) { flush(); }
+        chunk.push_back(sequence);
+        chunk_tokens += length;
+    }
+    flush();
+    return out;
+}
+
+std::vector<std::vector<float>> GemmaEmbedding::embed_chunk(
+    const std::vector<std::vector<std::int32_t>>& sequences) {
+    Impl& impl                         = *impl_;
+    const GemmaEmbeddingConfig& config = impl.config;
+    if (sequences.empty()) { return {}; }
+
+    std::vector<std::int32_t> flat;
+    std::vector<std::int32_t> offsets;
+    std::vector<std::int32_t> lengths;
+    std::vector<std::int32_t> positions;
+    offsets.reserve(sequences.size());
+    lengths.reserve(sequences.size());
+    for (const std::vector<std::int32_t>& sequence : sequences) {
+        const auto length = static_cast<std::int32_t>(sequence.size());
+        if (length <= 0) { throw std::invalid_argument("embed: a sequence is empty"); }
+        if (length > config.max_tokens) {
+            throw std::invalid_argument("embed: " + std::to_string(length) + " tokens exceeds " +
+                                        std::to_string(config.max_tokens));
+        }
+        offsets.push_back(static_cast<std::int32_t>(flat.size()));
+        lengths.push_back(length);
+        flat.insert(flat.end(), sequence.begin(), sequence.end());
+        // Positions restart per sequence: each is its own document, not a
+        // continuation of the one before it.
+        for (std::int32_t i = 0; i < length; ++i) { positions.push_back(i); }
+    }
+    const auto total = static_cast<std::int32_t>(flat.size());
+    if (total > config.max_batch_tokens) {
+        throw std::invalid_argument("embed: batch of " + std::to_string(total) +
+                                    " tokens exceeds max_batch_tokens " +
+                                    std::to_string(config.max_batch_tokens));
+    }
+    const auto batch    = static_cast<std::int32_t>(sequences.size());
+    cudaStream_t stream = impl.device->stream;
 
     DeviceArena& arena = *impl.arena;
     arena.reset();
 
-    DeviceBuffer ids(static_cast<std::size_t>(count) * sizeof(std::int32_t));
-    CUDA_CHECK(cudaMemcpyAsync(ids.p, tokens.data(),
-                               static_cast<std::size_t>(count) * sizeof(std::int32_t),
+    CUDA_CHECK(cudaMemcpyAsync(impl.positions->p, positions.data(),
+                               positions.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice,
+                               stream));
+    DeviceBuffer ids(static_cast<std::size_t>(total) * sizeof(std::int32_t));
+    CUDA_CHECK(cudaMemcpyAsync(ids.p, flat.data(),
+                               static_cast<std::size_t>(total) * sizeof(std::int32_t),
                                cudaMemcpyHostToDevice, stream));
-    const Tensor id_tensor(ids.p, DType::I32, {count});
-    const Tensor position_tensor(impl.positions->p, DType::I32, {count});
+    const Tensor id_tensor(ids.p, DType::I32, {total});
+    const Tensor position_tensor(impl.positions->p, DType::I32, {total});
 
-    Tensor x        = arena.alloc(DType::BF16, {config.hidden, count});
-    Tensor h        = arena.alloc(DType::BF16, {config.hidden, count});
-    Tensor attn     = arena.alloc(DType::BF16, {config.hidden, count});
-    Tensor query    = arena.alloc(DType::BF16, {config.query_size(), count});
-    Tensor key      = arena.alloc(DType::BF16, {config.head_dim, count});
-    Tensor value    = arena.alloc(DType::BF16, {config.head_dim, count});
-    Tensor attn_out = arena.alloc(DType::BF16, {config.query_size(), count});
-    Tensor gate     = arena.alloc(DType::BF16, {config.intermediate, count});
-    Tensor up       = arena.alloc(DType::BF16, {config.intermediate, count});
+    Tensor x        = arena.alloc(DType::BF16, {config.hidden, total});
+    Tensor h        = arena.alloc(DType::BF16, {config.hidden, total});
+    Tensor attn     = arena.alloc(DType::BF16, {config.hidden, total});
+    Tensor query    = arena.alloc(DType::BF16, {config.query_size(), total});
+    Tensor key      = arena.alloc(DType::BF16, {config.head_dim, total});
+    Tensor value    = arena.alloc(DType::BF16, {config.head_dim, total});
+    Tensor attn_out = arena.alloc(DType::BF16, {config.query_size(), total});
+    Tensor gate     = arena.alloc(DType::BF16, {config.intermediate, total});
+    Tensor up       = arena.alloc(DType::BF16, {config.intermediate, total});
 
     ops::embedding(id_tensor, impl.matrix(impl.token_embedding, config.vocab, config.hidden), x,
                    stream);
@@ -216,35 +273,49 @@ std::vector<float> GemmaEmbedding::embed(std::span<const std::int32_t> tokens) {
     ops::scale(x, config.embedding_scale, stream);
 
     for (std::int32_t layer = 0; layer < config.layers; ++layer) {
-        const LayerWeights& w = impl.layers[static_cast<std::size_t>(layer)];
-        const bool global     = config.is_global(layer);
-        const float theta     = global ? config.rope_theta_global : config.rope_theta_local;
+        const LayerWeights& w     = impl.layers[static_cast<std::size_t>(layer)];
+        const bool global         = config.is_global(layer);
+        const float theta         = global ? config.rope_theta_global : config.rope_theta_local;
         const std::int32_t window = global ? 0 : config.sliding_window;
 
         // --- attention, between the sandwich norms -------------------------
+        // Every projection runs once over the whole batch: the sequences are
+        // adjacent columns and a GEMM does not care where one ends.
         ops::rmsnorm(x, impl.norm(w.input_norm, config.hidden), config.rms_epsilon,
                      /*unit_offset*/ true, h, stream);
         ops::linear(h, impl.matrix(w.query, config.query_size(), config.hidden), query, stream);
         ops::linear(h, impl.matrix(w.key, config.head_dim, config.hidden), key, stream);
         ops::linear(h, impl.matrix(w.value, config.head_dim, config.hidden), value, stream);
 
-        // Per-head QK norm: each head's features are contiguous, so the [head_dim,
-        // heads * tokens] view is exactly the rows rmsnorm reduces over.
-        Tensor query_heads(query.data, DType::BF16, {config.head_dim, config.query_heads * count});
-        Tensor key_heads(key.data, DType::BF16, {config.head_dim, count});
+        // Per-head QK norm: each head's features are contiguous, so the
+        // [head_dim, heads * tokens] view is exactly the rows rmsnorm reduces
+        // over -- and it does not care about sequence boundaries either.
+        Tensor query_heads(query.data, DType::BF16, {config.head_dim, config.query_heads * total});
+        Tensor key_heads(key.data, DType::BF16, {config.head_dim, total});
         ops::rmsnorm(query_heads, impl.norm(w.query_norm, config.head_dim), config.rms_epsilon,
                      true, query_heads, stream);
         ops::rmsnorm(key_heads, impl.norm(w.key_norm, config.head_dim), config.rms_epsilon, true,
                      key_heads, stream);
 
-        // rope wants [head_dim, heads, tokens]; Gemma 3 rotates the whole head.
-        Tensor query_rope(query.data, DType::BF16, {config.head_dim, config.query_heads, count});
-        Tensor key_rope(key.data, DType::BF16, {config.head_dim, 1, count});
+        // rope reads its position per column, and positions restart per
+        // sequence, so this too runs once for the batch.
+        Tensor query_rope(query.data, DType::BF16, {config.head_dim, config.query_heads, total});
+        Tensor key_rope(key.data, DType::BF16, {config.head_dim, 1, total});
         ops::rope(position_tensor, config.head_dim, theta, query_rope, key_rope, stream);
 
-        ops::encoder_attention(query, key, value, window, config.attention_scale, attn_out,
-                               impl.attention_workspace->p, impl.attention_workspace_bytes,
-                               stream);
+        // Attention is the one step that must not cross a boundary.
+        for (std::int32_t index = 0; index < batch; ++index) {
+            const std::int32_t offset = offsets[static_cast<std::size_t>(index)];
+            const std::int32_t length = lengths[static_cast<std::size_t>(index)];
+            const Tensor q_slice      = query.slice(1, offset, length);
+            const Tensor k_slice      = key.slice(1, offset, length);
+            const Tensor v_slice      = value.slice(1, offset, length);
+            Tensor out_slice          = attn_out.slice(1, offset, length);
+            ops::encoder_attention(q_slice, k_slice, v_slice, window, config.attention_scale,
+                                   out_slice, impl.attention_workspace->p,
+                                   impl.attention_workspace_bytes, stream);
+        }
+
         ops::linear(attn_out, impl.matrix(w.output, config.hidden, config.query_size()), attn,
                     stream);
         ops::rmsnorm(attn, impl.norm(w.post_attention_norm, config.hidden), config.rms_epsilon,
@@ -268,36 +339,50 @@ std::vector<float> GemmaEmbedding::embed(std::span<const std::int32_t> tokens) {
                  stream);
 
     // --- pool, project, normalise -------------------------------------------
-    Tensor pooled_f32 = arena.alloc(DType::FP32, {config.hidden});
-    ops::mean_pool(h, count, /*accumulate*/ false, pooled_f32, stream);
+    // Pooling is per sequence; the projection that follows is one GEMM over all
+    // of them, since by then each sequence is a single column.
+    Tensor pooled_f32 = arena.alloc(DType::FP32, {config.hidden, batch});
+    Tensor pooled     = arena.alloc(DType::BF16, {config.hidden, batch});
+    for (std::int32_t index = 0; index < batch; ++index) {
+        const std::int32_t offset = offsets[static_cast<std::size_t>(index)];
+        const std::int32_t length = lengths[static_cast<std::size_t>(index)];
+        const Tensor columns      = h.slice(1, offset, length);
+        Tensor slot               = pooled_f32.slice(1, index, 1);
+        Tensor slot_1d(slot.data, DType::FP32, {config.hidden});
+        ops::mean_pool(columns, length, /*accumulate*/ false, slot_1d, stream);
+    }
+    ops::cast_fp32_to_bf16(pooled_f32, pooled, stream);
 
     // The head is one [hidden, hidden] matrix: the checkpoint's two Dense modules
     // composed at conversion, which they may be because both declare Identity.
-    Tensor pooled = arena.alloc(DType::BF16, {config.hidden, 1});
-    {
-        const Tensor source(pooled_f32.data, DType::FP32, {config.hidden, 1});
-        ops::cast_fp32_to_bf16(source, pooled, stream);
-    }
-    Tensor projected = arena.alloc(DType::BF16, {config.hidden, 1});
+    Tensor projected = arena.alloc(DType::BF16, {config.hidden, batch});
+    ops::detail::bf16_cublaslt_prepare(config.hidden, config.hidden, batch);
     ops::detail::bf16_cublaslt_gemm(
         artifact::materialized_weight(impl.materialized, impl.embedding_head, NumericFormat::BF16,
                                       config.hidden, config.hidden),
         pooled, projected, stream);
-    // Smallest eps that keeps 1/sqrt(sum + eps) finite for a zero vector without
-    // perturbing a real one: the pooled vector has norm order 1.
+    // l2norm reduces over ne[0], which is the hidden axis: one call for all of them.
     ops::l2norm(projected, 1.0e-12F, projected, stream);
 
-    std::vector<std::uint16_t> host(static_cast<std::size_t>(config.hidden));
+    const auto elements = static_cast<std::size_t>(config.hidden) * batch;
+    std::vector<std::uint16_t> host(elements);
     CUDA_CHECK(cudaMemcpyAsync(host.data(), projected.data, host.size() * sizeof(std::uint16_t),
                                cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    std::vector<float> out(host.size());
-    for (std::size_t i = 0; i < host.size(); ++i) {
-        const std::uint32_t word = static_cast<std::uint32_t>(host[i]) << 16U;
-        float value              = 0.0F;
-        std::memcpy(&value, &word, sizeof(value));
-        out[i] = value;
+    std::vector<std::vector<float>> out(static_cast<std::size_t>(batch));
+    for (std::int32_t index = 0; index < batch; ++index) {
+        std::vector<float>& vector = out[static_cast<std::size_t>(index)];
+        vector.resize(static_cast<std::size_t>(config.hidden));
+        for (std::int32_t d = 0; d < config.hidden; ++d) {
+            const std::uint32_t word =
+                static_cast<std::uint32_t>(
+                    host[static_cast<std::size_t>(index) * config.hidden + d])
+                << 16U;
+            float value = 0.0F;
+            std::memcpy(&value, &word, sizeof(value));
+            vector[static_cast<std::size_t>(d)] = value;
+        }
     }
     return out;
 }

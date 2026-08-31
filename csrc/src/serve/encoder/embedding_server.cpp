@@ -90,10 +90,9 @@ int main(int argc, char** argv) {
                      static_cast<double>(model.weight_bytes()) / 1e6, config.layers, config.hidden,
                      config.max_tokens);
 
-        // One model, one CUDA stream, one arena: requests are serialised. A
-        // single 512-token sequence is already 512 columns of GEMM, so the card
-        // is not idle while it runs; batching several sequences into one forward
-        // is the next thing worth doing, not a lock to remove.
+        // One model, one CUDA stream, one arena, so requests are serialised --
+        // but each request is one batched forward, not one per sequence, so the
+        // lock covers real work rather than a queue of small launches.
         std::mutex model_mutex;
 
         httplib::Server server;
@@ -121,14 +120,18 @@ int main(int argc, char** argv) {
 
             json data = json::array();
             std::size_t prompt_tokens = 0;
+            for (const std::vector<std::int32_t>& sequence : sequences) {
+                prompt_tokens += sequence.size();
+            }
             try {
+                // One forward for the whole request: the projections see every
+                // sequence as adjacent columns, and only attention loops.
                 const std::lock_guard<std::mutex> lock(model_mutex);
-                for (std::size_t index = 0; index < sequences.size(); ++index) {
-                    prompt_tokens += sequences[index].size();
-                    const std::vector<float> vector = model.embed(sequences[index]);
+                const std::vector<std::vector<float>> vectors = model.embed_batch(sequences);
+                for (std::size_t index = 0; index < vectors.size(); ++index) {
                     data.push_back(json{{"object", "embedding"},
                                         {"index", index},
-                                        {"embedding", vector}});
+                                        {"embedding", vectors[index]}});
                 }
             } catch (const std::exception& error) {
                 response.status = 500;
