@@ -21,6 +21,7 @@ from .qwen3 import Qwen3Block
 from .qwen3_5 import Qwen3_5AttentionBlock, Qwen3_5LinearBlock
 from .qwen3_5_moe import Qwen3_5MoEAttentionBlock, Qwen3_5MoELinearBlock
 from .qwen3_moe import Qwen3MoEBlock
+from .qwen4_exp import Qwen4ExpAttentionBlock, Qwen4ExpLinearBlock
 from .qwen3_vl import Qwen3VLBlock
 
 __all__ = [
@@ -29,6 +30,8 @@ __all__ = [
     "Qwen3_5LinearBlock",
     "Qwen3_5MoEAttentionBlock",
     "Qwen3_5MoELinearBlock",
+    "Qwen4ExpAttentionBlock",
+    "Qwen4ExpLinearBlock",
     "Qwen3VLBlock",
     "Qwen3MoEBlock",
     "GptOssBlock",

@@ -255,3 +255,39 @@ detour around it.
 
 Regression after the whole series, 100 users, 90 seconds, coherent at
 temperature 0: 0.8B 6,692 tok/s, 4B 3,032 tok/s, both zero errors.
+## Progress: the qwen4_exp DSL declaration (2026-08-31)
+
+The declaration-first half is now real for Flash-Next:
+`surogate/dsl/models/qwen4_exp.py` (+ `blocks/qwen4_exp.py`,
+`modules/hyper_connection.py`) compiles the full 48-layer model — 36 GDN + 12
+gated-attention layers, 512-expert top-10 MoE — in 0.1 s, and
+`tests/test_qwen4_exp_dsl.py` holds the contract on CPU with no weights.
+
+What it took beyond composition of existing parts: hyper-connections (the
+model's replacement for every layer norm — four residual streams, mix/combine
+around each sublayer, the final mix standing in for the output norm) are
+expressed in pure DSL ops, no new kernels; the GDN output gate gained a
+`gate_activation` attribute through primitive → emitter → C++ forward/backward
+because Flash-Next gates with sigmoid where Qwen3.5 uses SiLU; and the router
+renormalises its top-10 (`norm_topk_prob=True`), unlike the Qwen3.5-MoE
+declaration it descends from. Three traps worth recording: HF stores
+`hc_norm.weight` zero-centred (the GGUF exporter's `norm.weight` +1 rule
+catches it, which is why GGUF-side references see a plain gamma), the block
+schema rejects routing metadata unless `block_family` contains "moe", and the
+checkpoint is Conditional-only (`model.language_model.*`) with a `.weight`
+suffix on every hyper-connection tensor.
+
+Validated structurally against the Hub's tensor index: the mapping covers the
+checkpoint exactly in both directions — every unused tensor is in a deliberate
+deferral (PLE 137, indexer 36, vision 333, MTP 31), zero unexpected. The
+deferrals are captured as config (ints reach the runtime config, so the future
+generator sees them) but not yet in the training graph; PLE is the one that
+matters — it is load-bearing in the forward pass, so training the real
+checkpoint is not numerically faithful until its three small primitives land
+(n-gram row-index input, signed-sqrt gate, dilated causal conv).
+
+Numeric parity is the next step, and it cannot go through transformers: no
+released or dev version ships `qwen4_exp`, and the checkpoint carries no remote
+code. The path is the one the serve side already built — the GGUF-fed CPU
+references in `surogate/serve/tools/parity/qwen4exp/` against
+`SUROGATE_DEBUG_DUMP_TENSORS` dumps.

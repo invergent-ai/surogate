@@ -21,6 +21,7 @@ from .attention import (
 )
 from .embedding import Embedding, LMHead, ScaledEmbedding
 from .gated_delta_rule import ChunkGatedDeltaRule, GatedDeltaNetMixer
+from .hyper_connection import HyperConnection, HyperConnectionCombine, StreamBroadcast
 from .linear import Linear
 from .mamba import Mamba2Mixer
 from .mlp import GatedMLP, GenericMLP, SimpleMLP, SwiGLUMLP
@@ -67,6 +68,10 @@ __all__ = [
     "Mamba2Mixer",
     "GatedDeltaNetMixer",
     "ChunkGatedDeltaRule",
+    # Hyper-connections (qwen4_exp residual streams)
+    "HyperConnection",
+    "HyperConnectionCombine",
+    "StreamBroadcast",
     # MoE
     "LagunaMoEExperts",
     "MoEExpertsGated",

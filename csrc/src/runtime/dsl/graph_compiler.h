@@ -280,6 +280,7 @@ struct CompiledAttrs {
     bool use_conv_bias = true;
     std::string activation;  // for mamba_conv1d (e.g., "silu")
     bool norm_before_gate = false;
+    std::string gate_activation = "silu";  // mamba_gated_rmsnorm gate activation ("silu" or "sigmoid")
     int repeat_factor = 1;
 
     // Gated delta rule specific

@@ -2018,6 +2018,15 @@ GraphCompiler::resolve_attrs(const Operation& op, CompiledOpType type, const Sha
                 attrs.norm_before_gate = (*v_int != 0);
             }
         }
+        if (auto* attr = find_attr(op.attrs, "gate_activation")) {
+            if (auto v = attr_string(*attr)) {
+                if (*v != "silu" && *v != "sigmoid") {
+                    throw std::runtime_error("mamba_gated_rmsnorm: unsupported gate_activation '" + *v +
+                                             "' (expected 'silu' or 'sigmoid')");
+                }
+                attrs.gate_activation = *v;
+            }
+        }
         // n_groups for gated rmsnorm (passed directly from graph builder)
         if (auto* attr = find_attr(op.attrs, "n_groups")) {
             if (auto v = attr_int(*attr)) {

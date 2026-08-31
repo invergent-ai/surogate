@@ -11,6 +11,7 @@ from .qwen3_5 import Qwen3_5CausalModel, Qwen3_5ConditionalModel
 from .qwen3_5_moe import Qwen3_5MoECausalModel, Qwen3_5MoEConditionalModel
 from .qwen3_moe import Qwen3MoEModel
 from .qwen3_vl import Qwen3VLModel
+from .qwen4_exp import Qwen4ExpCausalModel, Qwen4ExpConditionalModel
 
 __all__ = [
     "Qwen3Model",
@@ -18,6 +19,8 @@ __all__ = [
     "Qwen3_5ConditionalModel",
     "Qwen3_5MoECausalModel",
     "Qwen3_5MoEConditionalModel",
+    "Qwen4ExpCausalModel",
+    "Qwen4ExpConditionalModel",
     "Qwen3VLModel",
     "Qwen3MoEModel",
     "GptOssModel",

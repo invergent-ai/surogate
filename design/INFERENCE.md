@@ -2770,3 +2770,22 @@ cards **85 s parallel / 93 s serial** against 125/134 before. The parallel-over-
 ~8 s because the bank build *was* the shared serial term; what remains is uploads plus the last
 of the host prologue. No behaviour moved: 16-user board probe 270.9 against the 272.3 reference
 row, coherence 16/16, sanity answers coherent on both bank formats.
+
+## 2026-08-31 — Flash-Next joins the DSL: one declaration, both halves
+
+The unified-train-serve step: `surogate/dsl/models/qwen4_exp.py` now declares
+Flash-Next for the training half — hyper-connections in pure DSL composition,
+sigmoid GDN gate plumbed through a new `gate_activation` attr, renormalising
+top-10 router — compiling the real 48-layer config in 0.1 s and matching the
+Hub checkpoint's tensor inventory exactly (details in
+design/unified-train-serve.md). The serve target this board measures is
+untouched; the declaration is the source the generator will read so the next
+model needs no second description.
+
+Found during the same recon, queued as a serve fix: the artifact converter
+passes the QSA indexer's `query_norm` through with the GGUF's +1 still folded
+while the runtime normalises indexer queries with `unit_offset=true` — an
+effective gain of `2+w` on the query side once a sequence passes 2,051 cached
+tokens (below that the selection is dense and the indexer never runs). The
+key-norm side is correct. Verify how qwen3_6 handles its indexer before
+touching the shared family file.

@@ -420,6 +420,26 @@ void silu_backward(Tensor& dinp, const Tensor& inp, const Tensor& dout, long n, 
     }
 }
 
+void sigmoid_forward(Tensor& out, const Tensor& inp, long n, cudaStream_t stream) {
+    if (out.DType == ETensorDType::FP32) {
+        sigmoid_forward(out.get<float>(), inp.get<float>(), n, stream);
+    } else if (out.DType == ETensorDType::BF16) {
+        sigmoid_forward(out.get<nv_bfloat16>(), inp.get<nv_bfloat16>(), n, stream);
+    } else {
+        throw std::logic_error("sigmoid_forward: unsupported dtype");
+    }
+}
+
+void sigmoid_backward(Tensor& dinp, const Tensor& inp, const Tensor& dout, long n, cudaStream_t stream) {
+    if (dinp.DType == ETensorDType::FP32) {
+        sigmoid_backward(dinp.get<float>(), inp.get<float>(), dout.get<float>(), n, stream);
+    } else if (dinp.DType == ETensorDType::BF16) {
+        sigmoid_backward(dinp.get<nv_bfloat16>(), inp.get<nv_bfloat16>(), dout.get<nv_bfloat16>(), n, stream);
+    } else {
+        throw std::logic_error("sigmoid_backward: unsupported dtype");
+    }
+}
+
 void softplus_forward(Tensor& out, const Tensor& inp, long n, cudaStream_t stream) {
     if (out.DType == ETensorDType::FP32) {
         softplus_forward(out.get<float>(), inp.get<float>(), n, stream);
