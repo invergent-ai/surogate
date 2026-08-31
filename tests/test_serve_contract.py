@@ -275,3 +275,24 @@ def test_converter_preflight_accepts_its_own_inventory(target):
     if preflight is None:
         pytest.skip(f"{target} has no preflight_inventory")
     preflight()
+
+
+def test_qwen4exp_inventory_has_a_text_only_variant():
+    """Whether an artifact carries the vision tower is a property of its source.
+
+    The community GGUF exports of Flash-Next drop vision entirely — the 4-shard
+    Q4_K_XL set has 1,224 tensors and none of them vision — so an inventory that
+    unconditionally demands the tower cannot be built from one. Both shapes must
+    exist and differ by exactly the tower.
+    """
+
+    import importlib
+
+    inventory = importlib.import_module("surogate.serve.tools.convert.qwen4exp.inventory")
+    with_tower, _ = inventory.active_specs(vision=True)
+    text_only, _ = inventory.active_specs(vision=False)
+
+    assert len(with_tower) > len(text_only)
+    assert len(with_tower) - len(text_only) == len(inventory.VISION_TENSOR_SPECS)
+    assert not [s for s in text_only if s.name.startswith("vision/")]
+    assert [s for s in with_tower if s.name.startswith("vision/")]

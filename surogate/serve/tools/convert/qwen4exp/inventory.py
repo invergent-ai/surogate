@@ -202,14 +202,28 @@ def _build_text_core_specs() -> tuple[TensorSpec, ...]:
 TEXT_CORE_TENSOR_SPECS = _build_text_core_specs()
 
 # Flash-Next's tower is the Qwen3.6 one (27 layers of 1152, head_dim 72), which is
-# exactly what the vision kernels implement, and the target's binder now consumes
-# it -- so the artifact carries it.
+# exactly what the vision kernels implement. Whether an *artifact* carries it is a
+# property of the export, not of the model: the community GGUF exports drop the
+# tower entirely (the 4-shard Q4_K_XL set has 1,224 tensors and none of them
+# vision), while a safetensors checkpoint has it. So the inventory comes in both
+# shapes and the converter picks by what the source actually provides -- the same
+# way the family already handles MTP-less exports.
 VISION_TENSOR_SPECS = build_vision_specs(HIDDEN)
 
+TEXT_ONLY_TENSOR_SPECS = TEXT_CORE_TENSOR_SPECS
 TENSOR_SPECS = TEXT_CORE_TENSOR_SPECS + VISION_TENSOR_SPECS
 PLE_TABLE_SPEC = ResourceSpec(PLE_TABLE_RESOURCE)
 ALL_RESOURCE_SPECS = RESOURCE_SPECS + (PLE_TABLE_SPEC,)
 OBJECT_SPECS: tuple[StoredObjectSpec, ...] = ALL_RESOURCE_SPECS + TENSOR_SPECS
+#: For sources that carry no vision tower — the community GGUF exports drop it.
+TEXT_ONLY_OBJECT_SPECS: tuple[StoredObjectSpec, ...] = ALL_RESOURCE_SPECS + TEXT_ONLY_TENSOR_SPECS
+
+
+def active_specs(*, vision: bool) -> tuple[tuple, tuple]:
+    """The (tensor, object) spec pair matching what the source provides."""
+
+    return ((TENSOR_SPECS, OBJECT_SPECS) if vision
+            else (TEXT_ONLY_TENSOR_SPECS, TEXT_ONLY_OBJECT_SPECS))
 
 FORMAT_COUNTS = {
     numeric_format: sum(spec.format == numeric_format for spec in TENSOR_SPECS)
@@ -226,7 +240,9 @@ def validate_inventory() -> None:
     if PLE_LAYER not in GDN_LAYERS:
         raise ValueError("the PLE layer is expected to be a GDN layer")
     per_layer_w8 = 4  # routed gate_up, routed down, shared gate_up, shared down
-    vision_w8 = 2  # the merger's two projections; the tower's own weights are K-quants
+    # The merger's two projections are the tower's only W8 objects; the rest are
+    # K-quants. Counted only when the tower is part of this inventory.
+    vision_w8 = 2 if VISION_TENSOR_SPECS and VISION_TENSOR_SPECS[0] in TENSOR_SPECS else 0
     expected_w8 = (
         2 + LAYERS * per_layer_w8 + len(FULL_ATTENTION_LAYERS) * 2 + len(GDN_LAYERS) * 2
         + vision_w8

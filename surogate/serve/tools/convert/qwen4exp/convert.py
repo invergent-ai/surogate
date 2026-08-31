@@ -408,9 +408,17 @@ def convert(gguf: str | Path, frontend_dir: str | Path, out_path: str | Path, *,
     frontend = family_conversion.load_resources(frontend_dir, inv.RESOURCE_SPECS)
     resources: dict[str, object] = {item.name: item.data for item in frontend}
     resources[inv.PLE_TABLE_RESOURCE] = _Sized(int(table_raw.nbytes))
-    plan = family_conversion.build_object_plan(inv.OBJECT_SPECS, resources)  # type: ignore[arg-type]
+    # The tower travels only when the source has one. The community GGUF exports of
+    # this model carry 1,224 tensors and none of them vision, so converting from one
+    # produces a text-only artifact; a safetensors checkpoint produces the full model.
+    has_vision = any(name.startswith(("v.", "mm.")) or "vision" in name
+                     for name in source.tensors)
+    _, object_specs = inv.active_specs(vision=has_vision)
+    print(f"vision tower in source: {'yes' if has_vision else 'no'}", flush=True)
 
-    specs = list(inv.OBJECT_SPECS)
+    plan = family_conversion.build_object_plan(object_specs, resources)  # type: ignore[arg-type]
+
+    specs = list(object_specs)
     total = len(specs)
     print(f"converting {total} objects from {len(source.shards)} shards on {resolved}", flush=True)
     with ArtifactWriter(output, ArtifactIdentity(inv.MODEL_ID, inv.WEIGHTS_ID), plan.specs) as writer:

@@ -494,23 +494,35 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     // Placement is what `--vision` decides: ValidateOnly checks the shapes without
     // spending device memory, which is what a text-only serve of a multimodal
     // checkpoint wants.
-    const artifact::TensorPlacement vision_placement =
-        features.vision ? artifact::TensorPlacement::Device
-                        : artifact::TensorPlacement::ValidateOnly;
-    out.vision_backbone =
-        qwen3_6::bind_vision_backbone<VisionConfig>(binder, vision_placement);
-    out.vision_merger_input =
-        qwen3_6::bind_vision_merger_input<VisionConfig>(binder, vision_placement);
-    out.vision_merger_fc2 =
-        artifact::bind_tensor(binder, "vision/merger/fc2", NumericFormat::W8G32_F16S,
-                              {VisionConfig::output_hidden,
-                               VisionConfig::merger_hidden},
-                              vision_placement);
-    out.vision_merger_fc2_bias =
-        artifact::bind_tensor(binder, "vision/merger/fc2_bias", NumericFormat::BF16,
-                              {VisionConfig::output_hidden}, vision_placement);
-    out.vision_merger_norm =
-        qwen3_6::bind_vision_merger_norm<VisionConfig>(binder, vision_placement);
+    // Whether an artifact carries the tower is a property of its source, not of the
+    // model: the community GGUF exports of this family drop vision entirely. Probe
+    // once and bind only what is there, so a text-only artifact loads; asking for
+    // --vision without one is the error, not the artifact's existence.
+    out.has_vision = binder.has("vision/patch_embedding");
+    if (!out.has_vision && features.vision) {
+        throw std::runtime_error(
+            "qwen3.5-2b: --vision was requested but this artifact carries no vision tower "
+            "(it was converted from a source that has none)");
+    }
+    if (out.has_vision) {
+        const artifact::TensorPlacement vision_placement =
+            features.vision ? artifact::TensorPlacement::Device
+                            : artifact::TensorPlacement::ValidateOnly;
+        out.vision_backbone =
+            qwen3_6::bind_vision_backbone<VisionConfig>(binder, vision_placement);
+        out.vision_merger_input =
+            qwen3_6::bind_vision_merger_input<VisionConfig>(binder, vision_placement);
+        out.vision_merger_fc2 =
+            artifact::bind_tensor(binder, "vision/merger/fc2", NumericFormat::W8G32_F16S,
+                                  {VisionConfig::output_hidden,
+                                   VisionConfig::merger_hidden},
+                                  vision_placement);
+        out.vision_merger_fc2_bias =
+            artifact::bind_tensor(binder, "vision/merger/fc2_bias", NumericFormat::BF16,
+                                  {VisionConfig::output_hidden}, vision_placement);
+        out.vision_merger_norm =
+            qwen3_6::bind_vision_merger_norm<VisionConfig>(binder, vision_placement);
+    }
 
 
 
@@ -613,7 +625,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
                                                        NumericFormat::BF16, {TextConfig::hidden});
     }
 
-    if (plan.features.vision) {
+    if (plan.features.vision && plan.has_vision) {
         auto& vision  = runtime.vision.emplace();
         vision.common = qwen3_6::materialize_vision_common<VisionConfig>(
             backing, plan.vision_backbone, plan.vision_merger_input, plan.vision_merger_norm);

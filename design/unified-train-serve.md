@@ -763,3 +763,26 @@ that recompiles it and 70–75 s for the ones after. And the 0.8B, which the
 converter had been refusing because the publisher ships no
 `generation_config.json`, now converts in 4.2 s: the `eos_token_id` the engine
 wants from that file is in `config.json`, so the converter derives it.
+
+## A tower in the model is not a tower in the artifact
+
+Committing the vision work introduced a bug I caught by checking before starting a
+111 GB conversion: `qwen4exp`'s inventory demanded the 333 vision objects
+unconditionally, and the only local source cannot supply them. The community GGUF
+exports of Flash-Next carry 1,224 tensors and **none of them vision** — the tower
+is dropped on export, exactly as the MTP block is. Converting from one would have
+failed on missing sources, and the recipe-coverage guard added earlier does not
+cover `qwen4exp`, which has no `recipe.py`.
+
+The distinction the code was missing: the *model* has a tower (the declaration is
+right to say so), while whether an *artifact* has one is a property of its
+**source**. The family already had the pattern — `has_dflash = binder.has(...)`,
+probe and tolerate, error only if the feature is actually requested. Vision now
+works the same way: the converter picks its inventory from what the source
+provides (`active_specs(vision=...)`), and both binders probe
+`vision/patch_embedding`, bind only what is there, and refuse `--vision` on an
+artifact that carries no tower with that as the reason.
+
+So the three-way distinction is now explicit and each part lives in one place: the
+declaration says what the model is, the target says what it can consume, and the
+source says what this artifact actually holds.

@@ -115,6 +115,8 @@ struct BindingPlan {
     artifact::ObjectHandle vision_merger_fc2;
     artifact::ObjectHandle vision_merger_fc2_bias;
     qwen3_6::VisionMergerNormPlan vision_merger_norm;
+    //: false when the source carried no tower (GGUF exports drop it).
+    bool has_vision = false;
     // Host-resident objects are copied out of the artifact mapping while the reader lives.
     HostBankPlan host_bank;
 };
