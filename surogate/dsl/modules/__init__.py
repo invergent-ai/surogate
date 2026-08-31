@@ -35,6 +35,7 @@ from .moe import (
     NemotronSharedExpert,
 )
 from .rmsnorm import FusedResidualRMSNorm, RMSNorm, RMSNormPlus1
+from .vision import VisionTower
 from .short_conv import Lfm2ShortConv
 
 __all__ = [
@@ -53,6 +54,8 @@ __all__ = [
     "GatedMLP",
     "SimpleMLP",
     "Lfm2ShortConv",
+    # Vision
+    "VisionTower",
     # Attention
     "GenericGQAttention",
     "GQAAttention",

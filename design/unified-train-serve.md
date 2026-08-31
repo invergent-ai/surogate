@@ -603,3 +603,36 @@ universal means implementing it in those targets — binder, forward and the
 
 Verified end to end: the 2B converts to 281 objects, the engine loads it, and it
 answers a real request. 380 CPU tests pass.
+
+## Training with vision: the tower the declaration was missing
+
+"If the model supports vision, we must be able to train and serve with vision" is
+two pieces of work, and measuring them first settled what each is.
+
+**Training** was closer than it looked. `Qwen3_5ConditionalModel.forward` has
+always scattered `visual_embeds` into the token embeddings by mask, so the
+*injection* path existed; what was missing was the tower that produces them. Every
+primitive a ViT needs is already in the DSL — `layernorm`, `gelu`, `softmax`,
+`matmul_bias`, `transpose`, `permute`, `concat` — and `flash_attention` already
+takes `causal`, so `VisionTower` is pure composition, like hyper-connections: no
+new kernels.
+
+Two details in it are correctness properties that no shape check would catch, so
+they are called out in the module and pinned by tests. The norms are **LayerNorm
+with a bias**, not the RMSNorm the text stack uses everywhere — which is why the
+checkpoint carries `norm1.bias` at all. And the attention is **bidirectional**: a
+vision transformer has no causal structure, and running it causally would still
+produce plausible-looking embeddings.
+
+**Serving** is the larger half and is C++. `qwen3_6::VisionBackboneConfig` is a
+`static constexpr` struct pinned to one tower — 27 layers of 1152, 4304
+intermediate, 16 heads — and every target inherits it. The towers are not the
+same: the 0.8B is 12 layers of 768, the 2B and 4B are 24 of 1024, Flash-Next and
+the 35B are 27 of 1152. So that struct needs the same parameterisation the Python
+side just got, after which the text-only targets need their binder to consume the
+vision objects, their forward to run the tower, and their `--vision` gate opened.
+Until then those targets stay text-only, because the engine refuses an artifact
+carrying objects no binder consumes.
+
+The declaration now describes all of it either way, which is the point: the tower's
+geometry has one home, and both halves read it from there.
