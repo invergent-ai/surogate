@@ -1,6 +1,7 @@
 #include "ops/linear/w8/w8_dispatch.h"
 
 #include <stdexcept>
+#include <string>
 
 namespace sinfer::ops::detail {
 
@@ -48,6 +49,11 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     case 6144:
         if (n == 5120) {
             if (t <= 48) { return launch_w8_small_t; }
+            return launch_w8_mma_r64_c128;
+        }
+        // qwen3.5-2b's MTP MLP down projection (hidden 2048 from intermediate 6144).
+        if (n == 2048) {
+            if (t <= 16) { return launch_w8_simt_r8_c4; }
             return launch_w8_mma_r64_c128;
         }
         // Qwen3.8-Flash-Next attention/GDN output projections (2560 x 6144).
@@ -139,6 +145,29 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
             if (t <= 128) { return launch_w8_mma_r32_c128; }
             return launch_w8_mma_r64_c128;
         }
+        // The MTP block's fused attention projection (5120) and its MLP gate/up
+        // (2 * 3584). The main layers reach their own fused wrappers, so these
+        // shapes appear only under speculation, at the verify width (T = draft
+        // window + 1) and at T=1 for the proposal steps.
+        if (n == 5120 || n == 7168) {
+            if (t <= 16) { return launch_w8_simt_r8_c4; }
+            return launch_w8_mma_r64_c128;
+        }
+        // Its key/value (2 kv heads x 256) and query/gate (8 q heads x 256),
+        // taken unfused because the fused pair's route tables cover only the
+        // 27B and 35B geometries.
+        if (n == 512 || n == 2048) {
+            if (t <= 16) { return launch_w8_simt_r8_c4; }
+            return launch_w8_mma_r32_c128;
+        }
+        break;
+    // qwen3.5-0.8b's MTP MLP down projection (hidden 1024 from intermediate 3584);
+    // speculation-only, like its gate/up sibling above.
+    case 3584:
+        if (n == 1024) {
+            if (t <= 16) { return launch_w8_simt_r8_c4; }
+            return launch_w8_mma_r64_c128;
+        }
         break;
     case 2048:
         switch (n) {
@@ -150,9 +179,17 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
             if (t <= 128) { return launch_w8_mma_r32_c128; }
             return launch_w8_mma_r64_c128;
         case 1024:
+        // The 2b MTP block's unfused key/value (2 kv heads x 256) and its
+        // query/gate (8 q heads x 256).
+        case 512:
+        case 2048:
             if (t <= 4) { return launch_w8_simt_r8_c4; }
             if (t <= 16) { return launch_w8_simt_r8_c8; }
             return launch_w8_mma_r32_c128;
+        // The 2b MTP block's fused attention projection; see the k=1024 note.
+        case 5120:
+            if (t <= 16) { return launch_w8_simt_r8_c4; }
+            return launch_w8_mma_r64_c128;
         case 9216:
             if (t <= 13) { return launch_w8_simt_r8_c4; }
             if (t <= 128) { return launch_w8_mma_r32_c128; }
@@ -228,7 +265,11 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         break;
     }
 
-    throw std::invalid_argument("w8 linear: unsupported shape or T");
+    // Name the geometry: an unregistered (n,k) is the routine way a new model or a
+    // new execution path (speculation widens T) meets this table, and "unsupported
+    // shape or T" alone sends the reader hunting for which one.
+    throw std::invalid_argument("w8 linear: unsupported shape or T (n=" + std::to_string(n) +
+                                ", k=" + std::to_string(k) + ", T=" + std::to_string(t) + ")");
 }
 
 W8Launch select_w8_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearPolicy policy) {

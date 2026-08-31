@@ -196,7 +196,13 @@ void Variant::mtp_attention_projection(const Tensor& hidden,
 
 void Variant::mtp_kv_projection(const Tensor& hidden, const MtpAttentionProjectionWeights& weights,
                                 Tensor& key, Tensor& value, WorkspaceArena&, cudaStream_t stream) {
-    ops::linear_pair(hidden, weights.key, weights.value, key, value, stream);
+    // The fused pair carries tuned route tables for the 27B and 35B geometries
+    // only (K 5120/2048 into 1024 rows). This target's MTP block projects 2 kv
+    // heads -- 512 rows -- so it takes the unfused pair, exactly as its q/gate
+    // sibling below already does. Correctness first; the fusion can follow if a
+    // route table is ever measured for this shape.
+    ops::linear(hidden, weights.key, key, stream);
+    ops::linear(hidden, weights.value, value, stream);
 }
 
 void Variant::mtp_q_gate_projection(const Tensor& hidden,

@@ -756,13 +756,20 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
         return;
     }
 
-    constexpr std::int32_t kHidden    = 2048;
-    constexpr std::int32_t kQueryRows = 2048;
-    constexpr std::int32_t kKeyRows   = 2048;
-    constexpr std::int32_t kValueRows = 4096;
-    constexpr std::int32_t kZRows     = 4096;
-    constexpr std::int32_t kChannels  = kQueryRows + kKeyRows + kValueRows;
-    const ConvGeometry geometry       = require_record_input(x, kHidden);
+    // surogate vendor patch (PATCHES.md #13/#16/#18): the record path keyed the 35B
+    // geometry as constants while its snapshot sibling and the NVFP4 record path had
+    // already been generalized. The small fused structure (0.8b k=1024, 2b k=2048; both
+    // 16 symmetric V heads) is keyed on parent rows -- the 35B and 4b parents carry
+    // 12288 -- and the launcher selects its own per-geometry table from the weight, so
+    // deriving the split here is all that stood between those targets and MTP.
+    const bool small_fused        = weight.n == 8192;
+    const std::int32_t kHidden    = weight.k;
+    const std::int32_t kQueryRows = 2048;
+    const std::int32_t kKeyRows   = 2048;
+    const std::int32_t kValueRows = small_fused ? 2048 : 4096;
+    const std::int32_t kZRows     = small_fused ? 2048 : 4096;
+    const std::int32_t kChannels  = kQueryRows + kKeyRows + kValueRows;
+    const ConvGeometry geometry   = require_record_input(x, kHidden);
     if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8) {
         throw std::invalid_argument("W8 gdn_input_proj_conv_record admits A16 or A8");
     }

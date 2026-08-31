@@ -105,7 +105,8 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
     const std::int32_t value_heads = v.ne[1];
     const std::int32_t width       = q.ne[2];
     const std::int32_t rows        = q.ne[3];
-    const bool registered_heads    = qk_heads == 16 && (value_heads == 48 || value_heads == 32);
+    const bool registered_heads =
+        qk_heads == 16 && (value_heads == 48 || value_heads == 32 || value_heads == 16);
     if (!registered_heads || width < 2 || width > 16 || rows <= 0 || rows > kMaximumRows) {
         throw std::invalid_argument(std::string(kOp) + ": unsupported geometry");
     }
@@ -157,7 +158,10 @@ bool is_registered_fold_geometry(const GdnReplayRecordSpec& spec) {
                              spec.conv_channels == 10240;
     const bool geometry_30 = spec.layers == 30 && spec.qk_heads == 16 && spec.value_heads == 32 &&
                              spec.conv_channels == 8192;
-    return geometry_48 || geometry_30;
+    // qwen3.5-0.8b and 2b share this one: 18 GDN layers, 16 symmetric heads.
+    const bool geometry_18 = spec.layers == 18 && spec.qk_heads == 16 && spec.value_heads == 16 &&
+                             spec.conv_channels == 6144;
+    return geometry_48 || geometry_30 || geometry_18;
 }
 
 void validate_fold_records(const GdnReplayRecords& records) {

@@ -523,6 +523,11 @@ struct FoldGeometry {
 
 using FoldGeometry48x48 = FoldGeometry<48, 16, 48, 10240>;
 using FoldGeometry30x32 = FoldGeometry<30, 16, 32, 8192>;
+// The symmetric small targets (qwen3.5-0.8b and 2b both carry 18 GDN layers of
+// 16 key and 16 value heads, so 2*2048 + 2048 conv channels). Only the strides
+// differ from the registered pair -- kLayers is an identity tag the kernel body
+// never reads, and the grid comes from kValueHeads.
+using FoldGeometry18x16 = FoldGeometry<18, 16, 16, 6144>;
 
 template <class Geometry>
 struct FoldAccess {

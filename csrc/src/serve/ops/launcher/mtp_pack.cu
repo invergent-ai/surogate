@@ -36,7 +36,9 @@ void mtp_split_attn_in_launch(const Tensor& attn_in, Tensor& q, Tensor& k, Tenso
     mtp_split_attn_in_kernel<<<grid, kBlock, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(attn_in.data), static_cast<__nv_bfloat16*>(q.data),
         static_cast<__nv_bfloat16*>(k.data), static_cast<__nv_bfloat16*>(gate.data),
-        static_cast<__nv_bfloat16*>(v.data), attn_in.ne[1]);
+        static_cast<__nv_bfloat16*>(v.data), attn_in.ne[1],
+        static_cast<std::int32_t>(q.ne[0] * q.ne[1]),
+        static_cast<std::int32_t>(k.ne[0] * k.ne[1]));
     CUDA_CHECK(cudaGetLastError());
 }
 
