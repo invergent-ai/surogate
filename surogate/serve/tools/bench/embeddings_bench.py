@@ -1,13 +1,13 @@
 """Measure an OpenAI-compatible ``/v1/embeddings`` endpoint.
 
 Written to compare engines, so it says only what the wire says: it sends batches
-of texts of a known token length and reports how fast the vectors come back. Any
-server implementing the endpoint can be measured, which is the point -- the
+of sequences of a known token length and reports how fast the vectors come back.
+Any server implementing the endpoint can be measured, which is the point -- the
 llama.cpp baseline and our own encoder path run through exactly this harness.
 
-Token lengths are exact, not approximate: texts are built by decoding real token
-ids from the model's own tokenizer, so a request labelled 512 tokens is 512
-tokens on both sides of the comparison.
+Requests carry token ids rather than text, which the OpenAI schema permits. A
+request labelled 512 tokens is then exactly 512 tokens on both sides, and two
+engines are not compared partly on their tokenizers.
 
     python -m surogate.serve.tools.bench.embeddings_bench \\
         --url http://127.0.0.1:8411 --tokens 512 --batch 8 --concurrency 4
@@ -23,41 +23,25 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Sequence
 
-DEFAULT_TOKENIZER = (
-    "~/.cache/huggingface/hub/models--google--embeddinggemma-300m/"
-    "snapshots/57c266a740f537b4dc058e1b0cda161fd15afa75"
-)
 
+def build_inputs(tokens: int, count: int) -> list[list[int]]:
+    """`count` distinct sequences of exactly `tokens` ids.
 
-def build_texts(tokenizer_dir: str, tokens: int, count: int) -> list[str]:
-    """`count` distinct texts, each exactly `tokens` tokens once re-encoded.
+    Token ids rather than text, and the OpenAI schema allows both. Sending ids
+    means the number measured is the model: two engines with different
+    tokenizers would otherwise be compared partly on their tokenizers, and this
+    engine's frontend cannot yet encode Gemma text at all.
 
-    Built from the tokenizer's own vocabulary rather than from prose, so the
-    length is exact and the same on any engine sharing the tokenizer.
+    Ids are drawn from a band well clear of the byte-fallback and special ranges,
+    so nothing here depends on a particular vocabulary beyond its size.
     """
-    from transformers import AutoTokenizer
-
-    tok = AutoTokenizer.from_pretrained(str(Path(tokenizer_dir).expanduser()))
-    # A deterministic slice of ordinary word-like tokens; ids well past the byte
-    # and special ranges decode to printable pieces.
-    pool = list(range(2000, 2000 + max(tokens * 4, 4096)))
-    texts = []
-    for index in range(count):
-        offset = (index * 97) % (len(pool) - tokens)
-        ids = pool[offset : offset + tokens]
-        text = tok.decode(ids)
-        # Re-encoding rarely lands exactly; trim or pad in token space until it does.
-        for _ in range(8):
-            actual = len(tok(text)["input_ids"])
-            if actual == tokens:
-                break
-            ids = ids[: max(1, len(ids) - (actual - tokens))] if actual > tokens else ids + pool[:1] * (tokens - actual)
-            text = tok.decode(ids)
-        texts.append(text)
-    return texts
+    pool_size = 200_000
+    return [
+        [2000 + ((index * 7919 + position * 31) % pool_size) for position in range(tokens)]
+        for index in range(count)
+    ]
 
 
 @dataclass
@@ -79,8 +63,8 @@ class Result:
             self.failures += 1
 
 
-def post(url: str, model: str, texts: Sequence[str], timeout: float) -> tuple[int, int]:
-    body = json.dumps({"model": model, "input": list(texts)}).encode()
+def post(url: str, model: str, inputs: Sequence[Sequence[int]], timeout: float) -> tuple[int, int]:
+    body = json.dumps({"model": model, "input": [list(i) for i in inputs]}).encode()
     request = urllib.request.Request(
         f"{url.rstrip('/')}/v1/embeddings",
         data=body,
@@ -92,7 +76,7 @@ def post(url: str, model: str, texts: Sequence[str], timeout: float) -> tuple[in
     return len(data), len(data[0]["embedding"])
 
 
-def run(url: str, model: str, texts: list[str], batch: int, concurrency: int,
+def run(url: str, model: str, texts: list[list[int]], batch: int, concurrency: int,
         requests: int, timeout: float) -> Result:
     result = Result()
     counter = iter(range(requests))
@@ -128,17 +112,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--url", required=True)
     parser.add_argument("--model", default="embeddinggemma")
     parser.add_argument("--tokens", type=int, default=512)
-    parser.add_argument("--batch", type=int, default=8, help="texts per request")
+    parser.add_argument("--batch", type=int, default=8, help="sequences per request")
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--requests", type=int, default=64)
     parser.add_argument("--warmup", type=int, default=8)
     parser.add_argument("--timeout", type=float, default=120.0)
-    parser.add_argument("--tokenizer", default=DEFAULT_TOKENIZER)
     parser.add_argument("--label", default="")
     args = parser.parse_args(argv)
 
     pool = max(args.batch * 4, 32)
-    texts = build_texts(args.tokenizer, args.tokens, pool)
+    texts = build_inputs(args.tokens, pool)
 
     if args.warmup:
         run(args.url, args.model, texts, args.batch, args.concurrency, args.warmup, args.timeout)
