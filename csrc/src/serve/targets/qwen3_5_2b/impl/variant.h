@@ -25,7 +25,7 @@ struct Variant {
     using PostMixerWeights               = detail::DensePostMixerPayload;
     using MtpAttentionProjectionWeights  = detail::MtpAttentionPayload;
     using MtpPostMixerWeights            = detail::DensePostMixerPayload;
-    using VisionWeights                  = qwen3_6::VisionWeights;
+    using VisionWeights                  = qwen3_6::VisionWeightsFor<detail::VisionConfig>;
     using GraphExecutionProfile          = detail::GraphExecutionProfile;
 
     static constexpr float attention_scale                     = kAttentionScale;

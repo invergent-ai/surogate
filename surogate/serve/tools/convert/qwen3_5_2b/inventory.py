@@ -117,11 +117,15 @@ def _build_mtp_specs() -> tuple[TensorSpec, ...]:
 
 
 def _build_vision_specs() -> tuple[TensorSpec, ...]:
-    # This target's C++ binder is explicitly text-only ("--vision is
-    # unsupported"), and the engine refuses to load an artifact holding an
-    # object no binder consumes. The declaration describes the tower; this
-    # target does not export it until the engine can bind it.
-    return ()
+    # This checkpoint's own tower, which the target's binder now consumes.
+    return build_vision_specs(
+        2048,
+        layers=24,
+        hidden=1024,
+        intermediate=4096,
+        qkv_rows=3072,
+        merger_hidden=4096,
+    )
 
 
 TEXT_CORE_TENSOR_SPECS = _build_text_core_specs()

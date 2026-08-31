@@ -660,3 +660,35 @@ moves to a header or gains explicit instantiations), bind the objects, run the
 tower in the forward, and open the `--vision` gate that currently throws
 "qwen3.5-2b target is text-only". Only then does the converter export the tower
 for those targets, because the engine refuses objects no binder consumes.
+
+## A target's artifact can carry its own tower
+
+The 2B now has a `VisionConfig` of its own — 24 layers of 1024 — written out in
+full rather than inherited-and-overridden, because `head_dim` and `merger_hidden`
+are computed from `hidden` in the base: shadowing `hidden` alone would leave both
+derived from the wrong width and would still compile. Its binding plan is typed on
+that config, and its binder consumes the tower with placement decided by
+`--vision`: `ValidateOnly` checks the shapes without spending device memory, which
+is exactly what a text-only serve of a multimodal checkpoint wants.
+
+End to end, on the real checkpoint: the converter emits 578 objects (297 of them
+vision), the recipe sources all of them, preflight accepts them, conversion writes
+a 3.0 GB artifact in 9.9 s, and **the engine loads it and answers requests** — the
+same artifact shape that failed a few commits ago with "artifact object was not
+consumed by the selected target".
+
+`--vision` still refuses, and deliberately so:
+
+```
+qwen3.5-2b: the vision tower is present in the artifact but the forward pass
+does not run it yet; --vision is not yet supported for this target
+```
+
+Refusing beats accepting and being quietly wrong, which is what binding the
+weights without running them would otherwise produce.
+
+What is left is one layer further in: `qwen3_6::ModelView` holds
+`std::optional<VisionWeights>` at the family's default type, whose layer array is
+27 long where this tower is 24, so materialising the target's tower needs the
+model view templated on the config the same way the plans and binders now are.
+After that, the forward runs it and the gate opens.

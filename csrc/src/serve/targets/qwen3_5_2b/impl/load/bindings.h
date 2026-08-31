@@ -6,6 +6,8 @@
 #include <api/targets/qwen3_6/startup_features.h>
 #include <api/targets/qwen3_6/vision.h>
 
+#include "../config.h"
+
 #include "artifact/binder.h"
 #include "artifact/materializer.h"
 #include "core/tensor.h"
@@ -119,7 +121,9 @@ struct BindingPlan {
     bool has_mtp = false;
     MtpPlan mtp;
 
-    qwen3_6::VisionBackbonePlan vision_backbone;
+    // Typed on this checkpoint's own tower (24 layers of 1024), not the family
+    // default: the plan's layer array is sized by the config.
+    qwen3_6::VisionBackbonePlanFor<VisionConfig> vision_backbone;
     qwen3_6::VisionMergerInputPlan vision_merger_input;
     artifact::ObjectHandle vision_merger_fc2;
     artifact::ObjectHandle vision_merger_fc2_bias;

@@ -283,7 +283,14 @@ def _build_mtp_recipes() -> tuple[TensorRecipe, ...]:
 
 
 def _build_vision_recipes() -> tuple[TensorRecipe, ...]:
-    return ()  # see inventory.py: this target's binder is text-only
+    return build_vision_recipes(
+        2048,
+        layers=24,
+        hidden=1024,
+        intermediate=4096,
+        qkv_rows=3072,
+        merger_hidden=4096,
+    )
 
 
 RECIPE_SPECS = (

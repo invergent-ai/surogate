@@ -66,9 +66,30 @@ struct TextConfig {
 static_assert(TextConfig::full_attention_layers() == 6);
 static_assert(TextConfig::gdn_layers() == 18);
 
-struct VisionConfig : qwen3_6::VisionBackboneConfig {
-    static constexpr int output_hidden = TextConfig::hidden;
+// This checkpoint's own tower: 24 layers of 1024, not the 27 of 1152 the family
+// default describes. Spelled out rather than inherited-and-overridden, because
+// `head_dim` and `merger_hidden` are computed from `hidden` in the base — shadowing
+// `hidden` alone would leave both derived from the wrong width, and the shapes
+// would still compile.
+struct VisionConfig {
+    static constexpr int layers              = 24;
+    static constexpr int hidden              = 1024;
+    static constexpr int intermediate        = 4096;
+    static constexpr int heads               = 16;
+    static constexpr int head_dim            = hidden / heads;
+    static constexpr int patch_dim           = 3 * 2 * 16 * 16;
+    static constexpr int merge               = 2;
+    static constexpr int merge_unit          = merge * merge;
+    static constexpr int merger_hidden       = hidden * merge_unit;
+    static constexpr int position_embeddings = 48 * 48;
+    static constexpr int rotary_dim          = head_dim;
+    static constexpr float rope_theta        = 10'000.0F;
+    static constexpr float norm_epsilon      = 1.0e-6F;
+    static constexpr int output_hidden       = TextConfig::hidden;
 };
+
+static_assert(VisionConfig::hidden % VisionConfig::heads == 0);
+static_assert(VisionConfig::merger_hidden == 4096);
 
 struct DFlashConfig {
     static constexpr bool supported     = false;

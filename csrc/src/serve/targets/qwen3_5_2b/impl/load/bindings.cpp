@@ -489,10 +489,36 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     out.mtp.final_norm = bind_mtp("mtp/final_norm", NumericFormat::BF16, {TextConfig::hidden});
     }
 
-    // Text-only target: the qwen3_5_2b artifact carries no vision objects
-    // (surogate vendor note; --vision is rejected at startup for this target).
+    // This checkpoint ships a vision tower, so the artifact may carry it and the
+    // binder must consume it — the loader rejects any object no binder claims.
+    // Placement is what `--vision` decides: ValidateOnly checks the shapes without
+    // spending device memory, which is what a text-only serve of a multimodal
+    // checkpoint wants.
+    const artifact::TensorPlacement vision_placement =
+        features.vision ? artifact::TensorPlacement::Device
+                        : artifact::TensorPlacement::ValidateOnly;
+    out.vision_backbone =
+        qwen3_6::bind_vision_backbone<VisionConfig>(binder, vision_placement);
+    out.vision_merger_input =
+        qwen3_6::bind_vision_merger_input<VisionConfig>(binder, vision_placement);
+    out.vision_merger_fc2 =
+        artifact::bind_tensor(binder, "vision/merger/fc2", NumericFormat::W8G32_F16S,
+                              {VisionConfig::output_hidden,
+                               VisionConfig::merger_hidden},
+                              vision_placement);
+    out.vision_merger_fc2_bias =
+        artifact::bind_tensor(binder, "vision/merger/fc2_bias", NumericFormat::BF16,
+                              {VisionConfig::output_hidden}, vision_placement);
+    out.vision_merger_norm =
+        qwen3_6::bind_vision_merger_norm<VisionConfig>(binder, vision_placement);
+
+    // The tower's weights are bound but the forward does not run it yet, so a
+    // request for vision would silently produce text-only behaviour. Refuse until
+    // the mixer is wired, rather than accept and be quietly wrong.
     if (features.vision) {
-        throw std::runtime_error("qwen3.5-2b target is text-only: --vision is unsupported");
+        throw std::runtime_error(
+            "qwen3.5-2b: the vision tower is present in the artifact but the forward pass "
+            "does not run it yet; --vision is not yet supported for this target");
     }
 
     load_plan.materialization = binder.finish();
@@ -594,15 +620,12 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
                                                        NumericFormat::BF16, {TextConfig::hidden});
     }
 
-    if (plan.features.vision) {
-        auto& vision  = runtime.vision.emplace();
-        vision.common = qwen3_6::materialize_vision_common(
-            backing, plan.vision_backbone, plan.vision_merger_input, plan.vision_merger_norm);
-        vision.merger_fc2      = artifact::materialized_weight(backing, plan.vision_merger_fc2,
-                                                               NumericFormat::W8G32_F16S, 2048, 4608);
-        vision.merger_fc2_bias = artifact::materialized_tensor(backing, plan.vision_merger_fc2_bias,
-                                                               NumericFormat::BF16, {TextConfig::hidden});
-    }
+    // Materialising this target's tower needs `qwen3_6::ModelView` to hold weights
+    // typed on the target's config; it holds the family default today, whose layer
+    // array is 27 long where this tower is 24. Binding above already validates the
+    // objects, so the artifact is complete and correct — only running the tower is
+    // outstanding, and `features.vision` is refused earlier for exactly that
+    // reason, which is why there is nothing to materialise here.
 }
 
 } // namespace ninfer::targets::qwen3_5_2b::detail
