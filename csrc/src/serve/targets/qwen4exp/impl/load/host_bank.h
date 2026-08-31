@@ -38,6 +38,10 @@ struct HostObject {
     void* host             = nullptr;
     const void* device     = nullptr;
     std::size_t bytes      = 0;
+    /// True when `host` is an mmap'd region pinned with cudaHostRegister (the fast path:
+    /// threaded first-touch then register, ~10 GB/s against cudaHostAlloc's 1.8); false when it
+    /// came from the cudaHostAlloc fallback. Decides the release path.
+    bool registered        = false;
     std::string name;
 };
 

@@ -16,7 +16,15 @@
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
+#include <future>
 #include <thread>
+
+#include <sys/mman.h>
+#if defined(__linux__) && __has_include(<numa.h>) && __has_include(<numaif.h>)
+#define NINFER_HOST_BANK_NUMA 1
+#include <numa.h>
+#include <numaif.h>
+#endif
 
 namespace ninfer::targets::qwen4exp::detail {
 
@@ -40,9 +48,59 @@ HostBank::HostBank(const HostBankPlan& plan) {
         }
         // Every host expert thread reads every expert, so the bank belongs across the nodes
         // rather than on one of them (core/numa.h). The policy has to be in place before the
-        // allocation: pinned pages cannot be moved afterwards.
-        const ScopedMemoryPolicy placement = ScopedMemoryPolicy::interleaved();
-        CUDA_CHECK(cudaHostAlloc(&object.host, object.bytes, cudaHostAllocMapped | cudaHostAllocPortable));
+        // pages exist: pinned pages cannot be moved afterwards.
+        //
+        // Allocation is mmap -> mbind(interleave) -> first-touch from many threads ->
+        // cudaHostRegister. cudaHostAlloc pins at 1.8 GB/s and does not parallelise (measured:
+        // 4 concurrent allocations take exactly as long as one — the kernel serialises them);
+        // faulting the pages from 16 threads and registering the populated region runs at
+        // ~10 GB/s. mbind is used rather than the caller's set_mempolicy scope because the
+        // touch workers' faults, not this thread's, place the pages. cudaHostAlloc stays as
+        // the fallback when any step refuses.
+        object.host = nullptr;
+        {
+            void* mem = ::mmap(nullptr, object.bytes, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (mem != MAP_FAILED) {
+#if defined(NINFER_HOST_BANK_NUMA)
+                if (numa_available() >= 0 && numa_num_configured_nodes() > 1) {
+                    (void)::mbind(mem, object.bytes, MPOL_INTERLEAVE, numa_all_nodes_ptr->maskp,
+                                  numa_all_nodes_ptr->size + 1, 0);
+                }
+#endif
+                {
+                    const std::size_t touch_workers = std::max<std::size_t>(
+                        16, std::thread::hardware_concurrency() / 2);
+                    std::vector<std::thread> touchers;
+                    touchers.reserve(touch_workers);
+                    const std::size_t chunk =
+                        (object.bytes + touch_workers - 1) / touch_workers;
+                    for (std::size_t w = 0; w < touch_workers; ++w) {
+                        const std::size_t begin = w * chunk;
+                        if (begin >= object.bytes) { break; }
+                        const std::size_t count = std::min(chunk, object.bytes - begin);
+                        touchers.emplace_back([mem, begin, count] {
+                            std::memset(static_cast<std::byte*>(mem) + begin, 0, count);
+                        });
+                    }
+                    for (auto& toucher : touchers) { toucher.join(); }
+                }
+                if (cudaHostRegister(mem, object.bytes,
+                                     cudaHostRegisterMapped | cudaHostRegisterPortable) ==
+                    cudaSuccess) {
+                    object.host       = mem;
+                    object.registered = true;
+                } else {
+                    (void)cudaGetLastError();
+                    (void)::munmap(mem, object.bytes);
+                }
+            }
+        }
+        if (object.host == nullptr) {
+            const ScopedMemoryPolicy placement = ScopedMemoryPolicy::interleaved();
+            CUDA_CHECK(cudaHostAlloc(&object.host, object.bytes,
+                                     cudaHostAllocMapped | cudaHostAllocPortable));
+        }
         void* device = nullptr;
         CUDA_CHECK(cudaHostGetDevicePointer(&device, object.host, 0));
         object.device = device;
@@ -106,7 +164,13 @@ HostBank::HostBank(const HostBankPlan& plan) {
 
 HostBank::~HostBank() {
     for (auto& [index, object] : objects_) {
-        if (object.host != nullptr) { (void)cudaFreeHost(object.host); }
+        if (object.host == nullptr) { continue; }
+        if (object.registered) {
+            (void)cudaHostUnregister(object.host);
+            (void)::munmap(object.host, object.bytes);
+        } else {
+            (void)cudaFreeHost(object.host);
+        }
     }
 }
 
@@ -119,8 +183,14 @@ const HostObject& HostBank::object(artifact::ObjectHandle handle) const {
 
 
 std::shared_ptr<HostBank> HostBank::shared(const HostBankPlan& plan) {
+    // The mutex guards only the map. Construction — pinning tens of GB and requantising the
+    // planes — happens outside it, through a per-key future: callers with the same key share
+    // one build, callers with different keys (the pipeline's stages, one bank per layer range)
+    // build concurrently. Holding the lock across construction serialised the stages' bank
+    // builds and was most of the 8-card startup.
     static std::mutex mutex;
     static std::unordered_map<std::string, std::weak_ptr<HostBank>> banks;
+    static std::unordered_map<std::string, std::shared_future<std::shared_ptr<HostBank>>> building;
     std::string key;
     for (const auto& source : plan.objects) {
         key += source.name;
@@ -129,12 +199,45 @@ std::shared_ptr<HostBank> HostBank::shared(const HostBankPlan& plan) {
         if (source.q4_rows > 0) { key += ":q4"; }
         key += ';';
     }
-    std::lock_guard<std::mutex> lock(mutex);
-    if (auto found = banks.find(key); found != banks.end()) {
-        if (auto live = found->second.lock()) { return live; }
+    std::shared_future<std::shared_ptr<HostBank>> pending;
+    std::promise<std::shared_ptr<HostBank>> promise;
+    bool builder = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (auto found = banks.find(key); found != banks.end()) {
+            if (auto live = found->second.lock()) { return live; }
+        }
+        if (auto found = building.find(key); found != building.end()) {
+            pending = found->second;
+        } else {
+            pending       = promise.get_future().share();
+            building[key] = pending;
+            builder       = true;
+        }
     }
-    auto bank  = std::make_shared<HostBank>(plan);
-    banks[key] = bank;
+    if (!builder) {
+        auto bank = pending.get();
+        if (bank != nullptr) { return bank; }
+        // The builder failed; fall through and try to build it ourselves.
+        return HostBank::shared(plan);
+    }
+    std::shared_ptr<HostBank> bank;
+    try {
+        bank = std::make_shared<HostBank>(plan);
+    } catch (...) {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            building.erase(key);
+        }
+        promise.set_value(nullptr); // waiters retry rather than inherit our exception
+        throw;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        banks[key] = bank;
+        building.erase(key);
+    }
+    promise.set_value(bank);
     return bank;
 }
 

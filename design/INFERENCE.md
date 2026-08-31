@@ -2752,3 +2752,21 @@ other ~100 s is the shared host-side prologue, building and pinning ~90 GB of ho
 which is kernel-page-allocator-bound and indifferent to threads. The leftover is re-priced
 accordingly: the startup lever is the bank build, not the construction order.
 
+
+## 2026-08-31 — the bank build itself: 1.8 → 10.2 GB/s pinning, one card starts in 61 s
+
+Two things made the ~100 s host prologue what it was. `HostBank::shared` held a static mutex
+across the *entire* bank construction, so even parallel stage construction queued on one lock —
+it now guards only the lookup maps, builders run outside it, and waiters share a per-key
+`shared_future` (a failed build erases its key so the next caller retries rather than inheriting
+a dead bank). And the allocation itself went through `cudaHostAlloc`, which pins at 1.8 GB/s on
+this kernel and does not parallelise. The bank now takes the long way round: anonymous `mmap`,
+`mbind(MPOL_INTERLEAVE)` when there is more than one NUMA node, first-touch on
+`max(16, cores/2)` threads, then `cudaHostRegister(Mapped|Portable)` — 10.2 GB/s in the
+microbench, 5.7×. The destructor unregisters and unmaps to match.
+
+Measured on the same binary: one card q4 **128 → 61 s** (the w8 bank starts in 45 s), eight
+cards **85 s parallel / 93 s serial** against 125/134 before. The parallel-over-serial gap stays
+~8 s because the bank build *was* the shared serial term; what remains is uploads plus the last
+of the host prologue. No behaviour moved: 16-user board probe 270.9 against the 272.3 reference
+row, coherence 16/16, sanity answers coherent on both bank formats.
