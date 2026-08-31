@@ -42,6 +42,12 @@ public:
         if (p.chunk_kv_len > 0) {
             return false;  // chunked-sequence mode is kvprefix-only
         }
+        if (!p.causal) {
+            // No non-causal path here: an encoder's every-row-sees-every-column
+            // mask is mem_eff's NoCustomMask. Refusing lets the registry fall
+            // through to it rather than silently masking the future away.
+            return false;
+        }
         if (p.Hs <= 0 || p.Hs > kFlashMaxHeadDim) {
             return false;
         }

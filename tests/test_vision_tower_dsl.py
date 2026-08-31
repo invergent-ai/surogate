@@ -76,10 +76,24 @@ def test_tower_head_paths_cover_patch_position_and_merger():
 def test_attention_is_bidirectional_in_the_traced_graph():
     """A ViT has no causal structure. Running it causally still produces
     plausible embeddings, so nothing downstream would catch it — hence a test on
-    the emitted attribute rather than on any output."""
+    the emitted attribute rather than on any output.
 
-    import inspect
+    This read the *source* of ``_encoder_block`` until 2026-08-31, which passed
+    happily for the year the compiler was dropping the attribute on the floor
+    (``graph_compiler.cpp`` parsed ``softmax_scale`` and ``window_size`` but
+    never ``causal``, and every backend hardcoded ``causal = true``). Asserting
+    on a string in a function body cannot see that. Trace the tower instead and
+    read what it actually emitted.
+    """
 
-    source = inspect.getsource(VisionTower._encoder_block)
-    assert "causal=False" in source
-    assert "causal=True" not in source
+    from surogate.dsl.nn import Proxy, Tracer
+
+    tower = build(1024, **dict(hidden=768, layers=12, intermediate=3072, heads=12))
+    tracer = Tracer()
+    patches = Proxy("patches", tracer.graph.input("patches"))
+    tower._trace(tracer, patches)
+
+    attentions = [n for n in tracer.graph.nodes if n.op == "flash_attention"]
+    assert len(attentions) == tower.layers, "every encoder block attends"
+    for node in attentions:
+        assert node.attrs.get("causal") is False, node.outputs

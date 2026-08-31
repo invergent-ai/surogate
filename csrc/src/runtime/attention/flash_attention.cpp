@@ -471,7 +471,7 @@ void CompiledExecutor::dispatch_flash_attention(const CompiledOp& op) {
     params.Hs = Hs;
     params.window_size = window_size;
     params.softmax_scale = op.attrs.softmax_scale;
-    params.causal = true;
+    params.causal = op.attrs.causal;
     params.dtype = qkv.DType;
     params.qkv = qkv;
     params.out = out;
@@ -607,7 +607,7 @@ void CompiledExecutor::dispatch_flash_attention_backward(const CompiledOp& op) {
     params.Hs = Hs;
     params.window_size = window_size;
     params.softmax_scale = op.attrs.softmax_scale;
-    params.causal = true;
+    params.causal = op.attrs.causal;
     params.dtype = qkv.DType;
     params.qkv = qkv;
     params.out = out;

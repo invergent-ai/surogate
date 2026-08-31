@@ -49,6 +49,9 @@ public:
         if (p.dtype != ETensorDType::BF16) {
             throw std::runtime_error("chunked sequence training requires BF16 attention");
         }
+        if (!p.causal) {
+            throw std::runtime_error("chunked sequence training requires causal attention");
+        }
         if (p.B != 1) {
             throw std::runtime_error("chunked sequence training requires per-device batch size 1");
         }

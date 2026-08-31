@@ -273,7 +273,7 @@ class GenericGQAttention(Module):
             )
 
         # -- Flash attention --------------------------------------------
-        fa_kwargs: dict[str, Any] = {"causal": True}
+        fa_kwargs: dict[str, Any] = {"causal": cfg.causal}
         if self.sliding_window:
             fa_kwargs["window_size"] = self.sliding_window
         if cfg.softmax_scale is not None:
