@@ -10,8 +10,9 @@
 namespace sinfer::ops {
 
 void mean_pool(const Tensor& x, int count, bool accumulate, Tensor& out, cudaStream_t stream) {
-    if (x.dtype != DType::BF16 || out.dtype != DType::BF16) {
-        throw std::invalid_argument("mean_pool: x/out must be BF16");
+    if (x.dtype != DType::BF16) { throw std::invalid_argument("mean_pool: x must be BF16"); }
+    if (out.dtype != DType::FP32) {
+        throw std::invalid_argument("mean_pool: out must be FP32; see the header on why");
     }
     if (!x.is_contiguous() || !out.is_contiguous()) {
         throw std::invalid_argument("mean_pool: x/out must be contiguous");

@@ -939,6 +939,7 @@ add_library(sinfer_ops STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/launcher/cast.cu
   ${SERVE_ROOT}/ops/launcher/causal_conv1d.cu
   ${SERVE_ROOT}/ops/launcher/embed_gather.cu
+  ${SERVE_ROOT}/ops/launcher/encoder_attention.cu
   ${SERVE_ROOT}/ops/launcher/gdn_gating.cu
   # One translation unit per registered GQA shape, named for the shape. The
   # registry in ops/kernel/gqa_attention_geometry.cuh generates the dispatch and
@@ -1139,6 +1140,7 @@ add_library(sinfer_ops STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/wrapper/gdn_gating.cpp
   ${SERVE_ROOT}/ops/wrapper/gdn_gating_proj.cpp
   ${SERVE_ROOT}/ops/wrapper/gdn_input_proj.cpp
+  ${SERVE_ROOT}/ops/wrapper/encoder_attention.cpp
   ${SERVE_ROOT}/ops/wrapper/gelu.cpp
   ${SERVE_ROOT}/ops/wrapper/gelu_mul.cpp
   ${SERVE_ROOT}/ops/wrapper/bidirectional_gqa_attention.cpp

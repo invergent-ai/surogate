@@ -191,7 +191,10 @@ target_include_directories(sinfer_bench_support_test PRIVATE ${CMAKE_CURRENT_SOU
 set(sinfer_op_tests
   add_bias
   gelu
+  gelu_mul
   silu_mul
+  mean_pool
+  encoder_attention
   residual_add
   sigmoid_mul
   rmsnorm

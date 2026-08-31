@@ -15,7 +15,7 @@ inline constexpr int kMeanPoolBlock = 256;
 // `scale` is 1/count for a mean and 1.0 for a running sum; `accumulate` adds
 // into out rather than overwriting, so a chunked prefill can pool across calls.
 __launch_bounds__(kMeanPoolBlock) __global__
-    void mean_pool_kernel(const __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ out,
+    void mean_pool_kernel(const __nv_bfloat16* __restrict__ x, float* __restrict__ out,
                           std::int32_t hidden, std::int32_t count, float scale, bool accumulate) {
     const std::int32_t row = blockIdx.x;
     if (row >= hidden) { return; }
@@ -35,7 +35,9 @@ __launch_bounds__(kMeanPoolBlock) __global__
 
     if (threadIdx.x == 0) {
         const float value = partial[0] * scale;
-        out[row] = __float2bfloat16(accumulate ? __bfloat162float(out[row]) + value : value);
+        // FP32 storage: a running sum rounded to BF16 once per chunk drifts far
+        // more than the quantised weights it is summing.
+        out[row] = accumulate ? out[row] + value : value;
     }
 }
 
