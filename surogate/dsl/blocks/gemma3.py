@@ -37,7 +37,7 @@ from __future__ import annotations
 from .. import nn
 from ..activations import Activation
 from ..attention import AttentionConfig
-from ..block_schema import BlockSchema, SlotDecl
+from ..block_schema import BlockSchema, ServeObject, SlotDecl
 from ..mlp import MLPConfig
 from ..modules import GenericGQAttention, GenericMLP, RMSNorm
 
@@ -102,6 +102,32 @@ _GEMMA3_GELU_MLP_CONFIG = MLPConfig(
 )
 
 
+#: How a serving artifact stores one Gemma 3 block.
+#:
+#: Every norm carries ``unfold_unit_offset``: Gemma stores RMSNorm weights
+#: zero-centred and applies them as ``1 + w``, so an artifact that shipped the
+#: raw tensor would scale by roughly zero. Folding the offset in at conversion
+#: keeps the runtime's norm ordinary.
+_GEMMA3_SERVE_OBJECTS: tuple[ServeObject, ...] = (
+    ServeObject("input_norm", "bf16", ("C",), ("ln1_weight",), transform="unfold_unit_offset"),
+    ServeObject("post_attention_norm", "bf16", ("C",), ("ln_post_attn_weight",),
+                transform="unfold_unit_offset"),
+    ServeObject("pre_feedforward_norm", "bf16", ("C",), ("ln2_weight",),
+                transform="unfold_unit_offset"),
+    ServeObject("post_feedforward_norm", "bf16", ("C",), ("ln_post_ff_weight",),
+                transform="unfold_unit_offset"),
+    ServeObject("attention/query_key_value", "quantised", ("QKV", "C"), ("qkv_weight",)),
+    ServeObject("attention/query_norm", "bf16", ("HeadDim",), ("q_norm_weight",),
+                transform="unfold_unit_offset"),
+    ServeObject("attention/key_norm", "bf16", ("HeadDim",), ("k_norm_weight",),
+                transform="unfold_unit_offset"),
+    ServeObject("attention/output", "quantised", ("C", "AttnDim"), ("out_weight",)),
+    ServeObject("mlp/gate", "quantised", ("M", "C"), ("mlp_gate_weight",)),
+    ServeObject("mlp/up", "quantised", ("M", "C"), ("mlp_up_weight",)),
+    ServeObject("mlp/down", "quantised", ("C", "M"), ("mlp_down_weight",)),
+)
+
+
 def _gemma3_schema(block_family: str) -> BlockSchema:
     return BlockSchema(
         slots=(
@@ -113,6 +139,7 @@ def _gemma3_schema(block_family: str) -> BlockSchema:
             SlotDecl("res_att", shape=("B", "T", "C")),
             SlotDecl("qkv_rope", shape=("B", "T", "QKV"), save_for_backward=True),
         ),
+        serve_objects=_GEMMA3_SERVE_OBJECTS,
         attrs={"block_family": block_family},
     )
 

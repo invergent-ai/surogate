@@ -26,6 +26,7 @@ rather than another entry in Gemma4's.
 from __future__ import annotations
 
 from .. import nn
+from ..block_schema import ServeObject
 from ..blocks.gemma3 import GEMMA3_BLOCK_NAME_REMAP, Gemma3FullBlock, Gemma3SlidingBlock
 from ..hf import fuse
 from ..modules import LMHead, RMSNorm, ScaledEmbedding
@@ -46,6 +47,25 @@ GEMMA3_MODEL_NAME_REMAP: dict[str, str] = {
     "lm_head_loss": "loss",
     "lm_head_x_flat": "xF_flat",
 }
+
+
+#: Model-level objects as a serving artifact stores them; the per-layer ones are
+#: declared on the block schemas.
+#:
+#: The final norm carries ``unfold_unit_offset`` for the same reason every block
+#: norm does: Gemma stores RMSNorm weights zero-centred and uses them as ``1 + w``.
+GEMMA3_MODEL_SERVE_OBJECTS: tuple[ServeObject, ...] = (
+    ServeObject("text/token_embedding", "quantised", ("Vocab", "C"), ("embedding",), scope="model"),
+    ServeObject("text/final_norm", "bf16", ("C",), ("final_norm",), scope="model",
+                transform="unfold_unit_offset"),
+)
+
+#: The generative variant's head. EmbeddingGemma has none -- its checkpoint stops
+#: at ``norm.weight`` -- which is why this is separate rather than a member of the
+#: tuple above.
+GEMMA3_OUTPUT_HEAD_SERVE_OBJECTS: tuple[ServeObject, ...] = (
+    ServeObject("text/output_head", "quantised", ("Vocab", "C"), ("lm_head",), scope="model"),
+)
 
 
 def _parse_gemma3_layer_types(
@@ -248,6 +268,10 @@ _GEMMA3_CONFIG_MAPPING = dict(
 
 class _Gemma3Base(nn.Model):
     _name_remap_ = GEMMA3_MODEL_NAME_REMAP
+    #: Per-layer serve objects live on the block schemas; these are outside the
+    #: stack. The output head is added only by the variant that has one.
+    _serve_objects_ = GEMMA3_MODEL_SERVE_OBJECTS
+    _serve_blocks_ = {"sliding": Gemma3SlidingBlock, "full": Gemma3FullBlock}
 
     def _init(
         self,
@@ -302,6 +326,7 @@ class Gemma3CausalModel(_Gemma3Base):
     """Generative Gemma 3 (1B/4B/12B/27B). Tensors under ``model.``, tied LM head."""
 
     _hf_block_mappings_ = _build_gemma3_mappings("model.layers.{layer}", "model", tied_lm_head=True)
+    _serve_objects_ = GEMMA3_MODEL_SERVE_OBJECTS + GEMMA3_OUTPUT_HEAD_SERVE_OBJECTS
 
     def __init__(
         self,
