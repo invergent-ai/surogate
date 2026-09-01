@@ -10,9 +10,29 @@
 
 #include <cstdint>
 #include <stdexcept>
+#include <string>
 
 namespace sinfer::ops::detail {
 namespace {
+
+// A key's int8 group scales are copied as a single cp.async, so they must be a
+// legal transfer width. With kGqaKvQuantGroup at 64 that means a head carrying at
+// least two groups -- head dim 128 or wider. A 64-wide head carries one group,
+// two bytes, which no cp.async width covers, so this kernel cannot be compiled
+// for it at all. Shapes outside the set refuse at the dispatch rather than
+// blocking the build; their bf16 and e4m3 caches are unaffected.
+template <typename Geometry>
+inline constexpr bool kGqaI8PrefillRegistered =
+    (Geometry::HeadDim / kGqaKvQuantGroup) * static_cast<int>(sizeof(__half)) >= 4;
+
+template <typename Geometry>
+void refuse_i8_prefill() {
+    throw std::invalid_argument("gqa_attention prefill: int8 KV is not served for head dim " +
+                                std::to_string(Geometry::HeadDim) + " (its group scales are " +
+                                std::to_string((Geometry::HeadDim / kGqaKvQuantGroup) *
+                                               static_cast<int>(sizeof(__half))) +
+                                " bytes, which is not a cp.async transfer width)");
+}
 
 template <typename Geometry, typename CacheView, typename Metadata>
 void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& positions,
@@ -33,8 +53,11 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
     constexpr int kI8SmemBytes = kGqaPrefillI8SmemBytes<Geometry::HeadDim>;
     CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(gqa_attention_prefill_bf16_kernel<Geometry, Metadata>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
-    CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(gqa_attention_prefill_i8_kernel<Geometry, Metadata>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, kI8SmemBytes));
+    if constexpr (kGqaI8PrefillRegistered<Geometry>) {
+        CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(
+            gqa_attention_prefill_i8_kernel<Geometry, Metadata>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, kI8SmemBytes));
+    }
 
     const auto tokens = static_cast<std::int32_t>(q.ne[2]);
     if (cache.dtype == DType::I8) {
@@ -42,6 +65,9 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
                                   static_cast<unsigned>(Geometry::QHeads), 1u);
         const Tensor& cache_k_scale = cache.k_scale_pages;
         const Tensor& cache_v_scale = cache.v_scale_pages;
+        if constexpr (!kGqaI8PrefillRegistered<Geometry>) {
+            refuse_i8_prefill<Geometry>();
+        } else
         gqa_attention_prefill_i8_kernel<Geometry, Metadata>
             <<<attention_grid, kGqaPrefillI8Threads, kI8SmemBytes, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data),
@@ -112,6 +138,9 @@ void gqa_kv_append_launch_for(const Tensor& k, const Tensor& v, const Tensor& po
             const dim3 fill_grid(static_cast<unsigned>(max_tiles),
                                  static_cast<unsigned>(Geometry::KVHeads),
                                  static_cast<unsigned>(kGqaKvQuantGroups<Geometry>));
+            if constexpr (!kGqaI8PrefillRegistered<Geometry>) {
+                refuse_i8_prefill<Geometry>();
+            } else
             gqa_attention_prefill_fill_i8_page_kernel<Geometry, Metadata>
                 <<<fill_grid, kPageBlock, 0, stream>>>(
                     static_cast<const __nv_bfloat16*>(k.data),
@@ -128,6 +157,9 @@ void gqa_kv_append_launch_for(const Tensor& k, const Tensor& v, const Tensor& po
                 kGqaKvQuantGroups<Geometry>;
             const int fill_grid =
                 static_cast<int>(div_up(fill_units, static_cast<std::int64_t>(kFillWarps)));
+            if constexpr (!kGqaI8PrefillRegistered<Geometry>) {
+                refuse_i8_prefill<Geometry>();
+            } else
             gqa_attention_prefill_fill_i8_kernel<Geometry, Metadata>
                 <<<fill_grid, kFillBlock, 0, stream>>>(
                     static_cast<const __nv_bfloat16*>(k.data),

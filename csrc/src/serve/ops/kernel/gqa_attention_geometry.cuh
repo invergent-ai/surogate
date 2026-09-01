@@ -52,6 +52,10 @@ using Gqa256_8q2   = GqaGeometry<256, 8, 2, 2>;  // qwen3.5-0.8b
 using Gqa256_16q4  = GqaGeometry<256, 16, 4, 2>; // qwen3.5-4b, qwen3.5-2b
 using Gqa256_24q2  = GqaGeometry<256, 24, 2, 1>; // qwen3.8-flash-next (group of twelve)
 using Gqa128_16q8  = GqaGeometry<128, 16, 8, 1>; // qwen3-0.6b (the first 128-wide head)
+// DecodeSplitScale 1: the grid is (KVHeads, splits, batch) and the registry's
+// modal KVHeads*DecodeSplits is about 340, which four KV heads reach at scale 1 --
+// the same reasoning, and the same answer, as the other four-KV-head shape above.
+using Gqa64_32q4   = GqaGeometry<64, 32, 4, 1>;  // tinyllama-1.1b (the first 64-wide head)
 
 // The registry. Every dispatcher below and in the launchers is generated from
 // this list, so a registration line is the whole of adding a shape — with the
@@ -65,7 +69,8 @@ using Gqa128_16q8  = GqaGeometry<128, 16, 8, 1>; // qwen3-0.6b (the first 128-wi
     X(Gqa256_8q2)                                                                                  \
     X(Gqa256_16q4)                                                                                 \
     X(Gqa256_24q2)                                                                                 \
-    X(Gqa128_16q8)
+    X(Gqa128_16q8)                                                                                 \
+    X(Gqa64_32q4)
 
 namespace detail {
 

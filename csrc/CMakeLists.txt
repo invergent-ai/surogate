@@ -972,6 +972,7 @@ add_library(sinfer_ops STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_16q4.cu
   ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_24q2.cu
   ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa128_16q8.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa64_32q4.cu
   ${SERVE_ROOT}/ops/launcher/gelu.cu
   ${SERVE_ROOT}/ops/launcher/lora_batched.cu
   ${SERVE_ROOT}/ops/launcher/lora_fused.cu
@@ -1342,6 +1343,7 @@ target_include_directories(sinfer_engine PUBLIC ${SERVE_ROOT})
 
 add_subdirectory(${SERVE_ROOT}/targets/qwen3_6 serve_t_qwen3_6 EXCLUDE_FROM_ALL)
 add_subdirectory(${SERVE_ROOT}/targets/qwen3 serve_t_qwen3 EXCLUDE_FROM_ALL)
+add_subdirectory(${SERVE_ROOT}/targets/llama serve_t_llama EXCLUDE_FROM_ALL)
 add_subdirectory(${SERVE_ROOT}/targets/qwen3_5_0_8b serve_t_qwen3_5_0_8b EXCLUDE_FROM_ALL)
 add_subdirectory(${SERVE_ROOT}/targets/qwen3_5_2b serve_t_qwen3_5_2b EXCLUDE_FROM_ALL)
 add_subdirectory(${SERVE_ROOT}/targets/qwen3_5_4b serve_t_qwen3_5_4b EXCLUDE_FROM_ALL)
