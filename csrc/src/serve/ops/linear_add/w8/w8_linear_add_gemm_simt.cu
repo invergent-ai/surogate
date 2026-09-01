@@ -73,6 +73,15 @@ __global__ __launch_bounds__(RowsPerCta * 32, 2) void w8_linear_add_decode_kerne
 template <int RowsPerCta>
 void launch_decode(const Tensor& x, const Weight& w, Tensor& residual_out, cudaStream_t stream) {
     static_assert((2048 % RowsPerCta) == 0);
+    // The row count is the grid and kDecodeK is the kernel's compiled reduction
+    // length, so this instantiation computes exactly one geometry. Any other
+    // shape that reaches it silently gets this one's answer.
+    if (w.n != 2048 || w.k != kDecodeK) {
+        throw std::invalid_argument("w8 linear_add decode: unregistered geometry (n=" +
+                                    std::to_string(w.n) + ", k=" + std::to_string(w.k) +
+                                    "); this launcher is compiled for n=2048, k=" +
+                                    std::to_string(kDecodeK));
+    }
     w8_linear_add_decode_kernel<RowsPerCta><<<2048 / RowsPerCta, RowsPerCta * 32, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
         static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(residual_out.data));

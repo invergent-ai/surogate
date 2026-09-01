@@ -7,6 +7,7 @@
 #include <array>
 #include <cstdint>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
 #include <utility>
 
@@ -231,11 +232,21 @@ void w8_attn_input_splitk_mma_launch(const Tensor& x, const Weight& weight, Tens
     if (x.ne[1] < kFirstExactCols || x.ne[1] > 64) {
         throw std::invalid_argument("W8 attention input split-K MMA requires T=2..64");
     }
+    // Each table bakes a row split and a hidden size. Selecting on k alone let a
+    // shape reach a table written for a different model, so the pair decides.
+    const bool registered = (weight.n == 5120 && (weight.k == 1024 || weight.k == 2048)) ||
+                            (weight.n == 10240 && weight.k == 2560) ||
+                            (weight.n == 9216 && weight.k == 2048);
+    if (!registered) {
+        throw std::invalid_argument(
+            "W8 attention input split-K MMA: unregistered gated geometry (n=" +
+            std::to_string(weight.n) + ", k=" + std::to_string(weight.k) + ")");
+    }
     if (x.ne[1] <= kLastTargetExactCols) {
-        const auto& launchers = weight.k == 1024   ? kTarget08Launchers
-                                : weight.n == 10240 ? kTarget4BLaunchers
-                                : weight.n == 5120  ? kTarget2BLaunchers
-                                                    : kTargetLaunchers;
+        const auto& launchers = weight.n == 10240 ? kTarget4BLaunchers
+                                : weight.n == 5120
+                                    ? (weight.k == 1024 ? kTarget08Launchers : kTarget2BLaunchers)
+                                    : kTargetLaunchers;
         launchers[x.ne[1] - kFirstExactCols](x, weight, q, gate, k, v, stream);
     } else {
         launch_target_medium_cols<64, 4, 2, 2>(x, weight, q, gate, k, v, stream);

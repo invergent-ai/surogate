@@ -1,6 +1,9 @@
 #include "ops/attn_input_proj/w8/w8_attn_input_kernels.h"
 
 #include "core/device.h"
+
+#include <stdexcept>
+#include <string>
 #include "ops/linear/w8/w8_k2048_decode.cuh"
 #include "ops/linear/w8a8/w4fp4_decode.cuh"
 #include "ops/linear/w8a8/w4fp4_plane.h"
@@ -9,10 +12,23 @@ namespace sinfer::ops::detail {
 
 namespace {
 
+/// These decode kernels bake their row split and their k into the instantiation,
+/// so a shape that merely reaches one of them is not thereby served by it: it is
+/// served by whichever model's constants that arm was written for. Name the shape
+/// and refuse instead of computing a neighbour's projection.
+void refuse_shape(const Weight& weight, const char* which) {
+    throw std::invalid_argument(std::string("w8 attn_input decode: unregistered ") + which +
+                                " geometry (n=" + std::to_string(weight.n) +
+                                ", k=" + std::to_string(weight.k) + ")");
+}
+
 template <int RowsPerCta>
 void launch_companion_decode(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k, Tensor& v,
                              cudaStream_t stream) {
     constexpr int kRows = 6144;
+    // k is not a template argument here, so the kernel's default (2048) is the
+    // only k this instantiation computes correctly.
+    if (weight.n != kRows || weight.k != 2048) { refuse_shape(weight, "companion"); }
     static_assert((4096 % RowsPerCta) == 0 && (1024 % RowsPerCta) == 0);
     using Output = W8SplitOutput3<4096, 1024, 1024>;
     const Output output{static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
@@ -60,6 +76,7 @@ void w8_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& 
         return;
     }
     if (weight.n == 5120) {
+        if (weight.k != 1024 && weight.k != 2048) { refuse_shape(weight, "gated 5120-row"); }
         constexpr int kRows08       = 5120;
         constexpr int kRowsPerCta08 = 8;
         using Output08              = W8SplitOutput4<2048, 512, 2048, 512>;
@@ -81,6 +98,7 @@ void w8_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& 
         CUDA_CHECK(cudaGetLastError());
         return;
     }
+    if (weight.n != 9216 || weight.k != 2048) { refuse_shape(weight, "gated"); }
     constexpr int kRows       = 9216;
     constexpr int kRowsPerCta = 8;
     static_assert((4096 % kRowsPerCta) == 0 && (512 % kRowsPerCta) == 0);
@@ -100,6 +118,7 @@ void w8_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& 
                                  Tensor& v, cudaStream_t stream) {
     // Qwen3-0.6B's ungated fused qkv: 4096 rows = q2048 | k1024 | v1024 at k 1024.
     if (weight.n == 4096) {
+        if (weight.k != 1024) { refuse_shape(weight, "ungated 4096-row"); }
         constexpr int kRowsQwen3       = 4096;
         constexpr int kRowsPerCtaQwen3 = 8;
         static_assert((2048 % kRowsPerCtaQwen3) == 0 && (1024 % kRowsPerCtaQwen3) == 0);
