@@ -1352,10 +1352,15 @@ int verify_geometry_registration_contract() {
     SINFER_GQA_FOR_EACH_GEOMETRY(SINFER_GQA_REGISTERED_CASE)
 #undef SINFER_GQA_REGISTERED_CASE
 
-    // An unregistered query count; an unregistered pairing of registered counts;
-    // and a KV count no shape carries at all.
+    // Two unregistered query counts; two unregistered pairings of counts that are
+    // each registered elsewhere; and a KV count no shape carries at all.
+    //
+    // Unlike the accepted half above, this list does not extend itself off the
+    // registry macro, so registering a geometry can make an entry here stale --
+    // {16, 8} was listed as carrying an unheld KV count until Gqa128_16q8 was
+    // added. Revisit this list whenever the registry gains a shape.
     const std::pair<std::int32_t, std::int32_t> unregistered[] = {
-        {32, 8}, {12, 4}, {8, 4}, {16, 8},
+        {32, 8}, {12, 4}, {8, 4}, {24, 8}, {16, 16},
     };
     for (const auto& [q_heads, kv_heads] : unregistered) {
         if (accepted(q_heads, kv_heads)) {
