@@ -139,11 +139,12 @@ public:
     /// requests to finish, then release the model's VRAM with its state parked
     /// in host RAM. `wake_up` restores it; requests then run against
     /// byte-identical state. Both are idempotent.
-    void sleep();
+    void sleep(bool preempt = false);
     void wake_up();
     [[nodiscard]] bool is_sleeping() const { return engine_->is_sleeping(); }
     /// Requests currently inside this service (admission-counted).
     [[nodiscard]] std::size_t active_requests() const;
+    void prepare_sleep_backup() { engine_->prepare_sleep_backup(); }
     /// This model's VRAM footprint while awake (sleepable regions).
     [[nodiscard]] std::size_t resident_bytes() const { return engine_->sleepable_bytes(); }
 

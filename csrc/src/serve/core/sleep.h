@@ -69,6 +69,12 @@ std::size_t wake_device(int device, const void* owner = nullptr);
 /// awake). The scheduler sizes resident sets with this.
 [[nodiscard]] std::size_t sleep_owned_bytes(const void* owner) noexcept;
 
+/// Allocate the pinned host backups for `owner`'s Offload regions without
+/// sleeping anything. First-time pinning runs at ~2 GiB/s, so a model's first
+/// eviction would otherwise stall a *different* model's requester by many
+/// seconds; the scheduler pays this at startup instead.
+void sleep_prepare_backups(const void* owner);
+
 /// Free VRAM on `device` right now (cudaMemGetInfo), for budget planning by
 /// callers that are not CUDA translation units themselves.
 [[nodiscard]] std::size_t device_free_bytes(int device) noexcept;

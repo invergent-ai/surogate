@@ -99,11 +99,17 @@ public:
     /// asleep; in-flight work must be drained by the caller first. Requires the
     /// engine to have been built with sleepable allocations (EngineOptions
     /// sleep_enable). Idempotent.
-    void sleep();
+    /// `allow_active` skips the drained-engine requirement: the worker loop
+    /// parks between rounds and in-flight generations resume byte-identically
+    /// after the next wake (their whole state rides the offloaded arenas).
+    void sleep(bool allow_active = false);
     /// First half of sleep on its own: refuse new submissions while leaving
     /// in-flight requests to finish. The caller drains, then calls sleep().
     /// wake() undoes it if the drain is abandoned.
     void sleep_begin();
+    /// Allocate this engine's pinned sleep backup now, so the first sleep is as
+    /// fast as every later one. No-op without sleep_enable.
+    void prepare_sleep_backup();
     /// Map fresh physical memory at the original addresses and restore the
     /// backup. After this, requests run against byte-identical state -- the
     /// prefix cache survives a sleep. Throws if VRAM was taken by another

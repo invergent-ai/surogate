@@ -412,7 +412,7 @@ void Engine::sleep_begin() {
         impl.executor);
 }
 
-void Engine::sleep() {
+void Engine::sleep(bool allow_active) {
     auto& impl = *impl_;
     if (!impl.options.sleep_enable) {
         throw std::logic_error("the engine was built without sleep_enable");
@@ -425,12 +425,7 @@ void Engine::sleep() {
             } else {
                 if (device_asleep(impl.device.device, &impl.ops_context)) { return; } // idempotent
                 executor->set_asleep(true);
-                // Experimental preemptive sleep: with the gate set, active lanes
-                // are allowed -- the worker loop parks between rounds, the lanes'
-                // entire state rides the offloaded arenas, and the generations
-                // resume after wake exactly where they stopped.
-                static const bool preempt = std::getenv("SUROGATE_SLEEP_PREEMPT") != nullptr;
-                if (!preempt && executor->any_active_lane()) {
+                if (!allow_active && executor->any_active_lane()) {
                     executor->set_asleep(false);
                     throw std::logic_error(
                         "sleep requires a drained engine; requests are still in flight");
@@ -467,6 +462,10 @@ void Engine::wake() {
             }
         },
         impl.executor);
+}
+
+void Engine::prepare_sleep_backup() {
+    if (impl_->options.sleep_enable) { sleep_prepare_backups(&impl_->ops_context); }
 }
 
 std::size_t Engine::sleepable_bytes() const { return sleep_owned_bytes(&impl_->ops_context); }

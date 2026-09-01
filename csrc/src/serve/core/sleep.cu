@@ -211,6 +211,16 @@ std::size_t sleep_owned_bytes(const void* owner) noexcept {
     return bytes;
 }
 
+void sleep_prepare_backups(const void* owner) {
+    const std::lock_guard<std::mutex> lock(registry().mutex);
+    for (auto& [base, region] : registry().regions) {
+        if (owner != nullptr && region.owner != owner) { continue; }
+        if (region.tag == SleepTag::Offload && region.backup == nullptr) {
+            CUDA_CHECK(cudaMallocHost(&region.backup, region.bytes));
+        }
+    }
+}
+
 std::size_t device_free_bytes(int device) noexcept {
     if (cudaSetDevice(device) != cudaSuccess) { return 0; }
     std::size_t free_bytes = 0, total_bytes = 0;

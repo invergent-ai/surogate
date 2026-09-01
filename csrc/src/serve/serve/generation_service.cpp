@@ -584,7 +584,7 @@ void GenerationService::unload_lora_adapter(const std::string& name) {
     lora_free_slots_.push_back(slot);
 }
 
-void GenerationService::sleep() {
+void GenerationService::sleep(bool preempt) {
     if (!options_.enable_sleep_mode) {
         throw std::invalid_argument("the server was started without --enable-sleep-mode");
     }
@@ -592,9 +592,11 @@ void GenerationService::sleep() {
     // the engine rejects anything that arrives after this line.
     // (Engine::sleep is idempotent, so two racing sleeps are both fine.)
     engine_->sleep_begin();
-    static const bool preempt = std::getenv("SUROGATE_SLEEP_PREEMPT") != nullptr;
-    if (preempt) {
-        engine_->sleep();
+    static const bool env_preempt = std::getenv("SUROGATE_SLEEP_PREEMPT") != nullptr;
+    if (preempt || env_preempt) {
+        // Preemptive: in-flight generations park mid-flight and resume,
+        // byte-identical, after the next wake.
+        engine_->sleep(/*allow_active=*/true);
         return;
     }
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);

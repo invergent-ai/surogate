@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace sinfer::serve {
@@ -37,8 +38,12 @@ public:
     };
 
     /// `budget_bytes` is the VRAM the resident set may use (measured free at
-    /// startup plus what the already-awake models occupy).
+    /// startup plus what the already-awake models occupy). The constructor also
+    /// pre-pins every model's host backup -- first-time pinning runs at
+    /// ~2 GiB/s and must never land on some other model's requester -- and
+    /// starts the re-wake tick that resumes preempted in-flight work.
     ModelScheduler(std::vector<Entry> entries, std::size_t budget_bytes);
+    ~ModelScheduler();
 
     /// Blocks until `service` is awake and fits, waking and evicting as
     /// needed. Throws on timeout. Also stamps the model's last-use time, so
@@ -55,14 +60,19 @@ private:
         std::chrono::steady_clock::time_point last_used;
         std::chrono::steady_clock::time_point woke_at;
     };
-    bool try_make_room_locked(State& target);
+    bool try_make_room_locked(State& target, bool allow_preempt);
+    void tick_loop();
 
     std::mutex mutex_;
     std::condition_variable cv_;
     std::vector<State> models_;
     std::size_t budget_bytes_;
     std::chrono::milliseconds keep_warm_{3000};
+    std::chrono::milliseconds preempt_after_{5000};
+    std::chrono::milliseconds min_dwell_{2000};
     std::chrono::seconds wait_timeout_{180};
+    bool stopping_ = false;
+    std::thread ticker_;
 };
 
 } // namespace sinfer::serve
