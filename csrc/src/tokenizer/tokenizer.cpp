@@ -14,8 +14,10 @@
 #include <cassert>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <fstream>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -119,6 +121,28 @@ struct Tokenizer::Impl {
 
     // Whether byte-level pre-tokenizer is active
     bool byte_level = false;
+
+    // SentencePiece scheme (Metaspace + byte fallback), as Llama 2, TinyLlama and
+    // the Gemma family use. It is not the same BPE as the GPT-2 byte-level one:
+    // there is no pre-tokenizer regex and no byte-level alphabet. The word mark
+    // takes the place of a space, and what the merges cannot place is spelled one
+    // raw byte at a time through the vocabulary's <0xNN> entries.
+    //
+    // The scheme is decided by the tokenizer.json, never by the architecture:
+    // model_type "llama" covers both Llama 2, which is SentencePiece, and
+    // Llama 3, which is byte-level, so keying on it would be wrong half the time.
+    bool spm = false;
+    std::string spm_replacement;              // the word mark, U+2581 in practice
+    bool spm_prepend            = false;      // normalizer opens the text with one
+    bool spm_strip_leading_space = false;     // decoder removes the one it added
+    std::unordered_map<Rank, uint8_t> spm_byte_of_token;  // <0xNN> -> the byte
+    // "left right" -> its position in the merges list. The byte-level path takes
+    // the vocabulary id as the merge rank, which holds when ids were assigned in
+    // merge order. A SentencePiece conversion orders ids by piece score instead,
+    // so the two disagree -- "\xe2\x96\x81\xe2\x96\x81" sits at id 259 and would
+    // be merged before pairs the training actually learned first. The merges list
+    // is the authority here.
+    std::unordered_map<std::string, int> spm_merge_rank;
 
     // Normalizer type
     enum class Normalizer {
@@ -252,10 +276,115 @@ struct Tokenizer::Impl {
         }
     }
 
+    // Metaspace normalisation: open the text with the word mark, then let the
+    // mark stand in for every space. This is what makes a word-initial piece
+    // distinguishable from the same letters mid-word, which is the whole point
+    // of the scheme.
+    std::string spm_normalize(const std::string& text) const {
+        std::string out;
+        out.reserve(text.size() + spm_replacement.size());
+        // Text that already opens with a space carries its own word mark once the
+        // substitution below runs, so prepending a second one would encode a
+        // space the caller never wrote. This is SentencePiece's dummy-prefix
+        // suppression, and it is observable: " leading space" is "\xe2\x96\x81leading"
+        // and not "\xe2\x96\x81\xe2\x96\x81leading".
+        const bool opens_with_mark =
+            text.rfind(' ', 0) == 0 ||
+            (!spm_replacement.empty() && text.rfind(spm_replacement, 0) == 0);
+        if (spm_prepend && !opens_with_mark) out += spm_replacement;
+        for (char c : text) {
+            if (c == ' ') {
+                out += spm_replacement;
+            } else {
+                out.push_back(c);
+            }
+        }
+        return out;
+    }
+
+    // SentencePiece BPE.
+    //
+    // The byte-level path seeds its merges with single BYTES, which is right when
+    // every byte is itself a vocabulary entry. Here it is not: the word mark is
+    // three bytes and no two of them form a token, so a byte-seeded merge can
+    // never build "\xe2\x96\x81" and spells it as three byte-fallback ids
+    // instead. Seed with whole characters, then merge by the same lowest-rank
+    // rule.
+    void spm_encode(const std::string& text, std::vector<int32_t>& out) const {
+        std::vector<std::string> symbols;
+        for (size_t i = 0; i < text.size();) {
+            const size_t len = std::min(unicode_len_utf8(text[i]), text.size() - i);
+            symbols.emplace_back(text, i, len);
+            i += len;
+        }
+        if (symbols.empty()) return;
+
+        const auto rank_of = [&](const std::string& piece) -> std::optional<Rank> {
+            const std::vector<uint8_t> key(piece.begin(), piece.end());
+            const auto found = encoder.find(key);
+            if (found == encoder.end()) return std::nullopt;
+            return found->second;
+        };
+        const auto merge_rank = [&](const std::string& left,
+                                    const std::string& right) -> std::optional<int> {
+            const auto found = spm_merge_rank.find(left + '\x00' + right);
+            if (found == spm_merge_rank.end()) return std::nullopt;
+            return found->second;
+        };
+
+        // Repeatedly merge the adjacent pair the training learned earliest. Ties
+        // go to the leftmost pair, which is the order a left-to-right scan finds
+        // them in.
+        for (;;) {
+            std::optional<int> best_rank;
+            size_t best_index = 0;
+            for (size_t i = 0; i + 1 < symbols.size(); ++i) {
+                const auto rank = merge_rank(symbols[i], symbols[i + 1]);
+                if (!rank.has_value()) continue;
+                if (!best_rank.has_value() || *rank < *best_rank) {
+                    best_rank  = rank;
+                    best_index = i;
+                }
+            }
+            if (!best_rank.has_value()) break;
+            symbols[best_index] += symbols[best_index + 1];
+            symbols.erase(symbols.begin() + static_cast<long>(best_index) + 1);
+        }
+
+        for (const std::string& symbol : symbols) {
+            const auto rank = rank_of(symbol);
+            if (rank.has_value()) {
+                out.push_back(static_cast<int32_t>(*rank));
+                continue;
+            }
+            // What the merges could not place is spelled one raw byte at a time.
+            for (const unsigned char byte : symbol) {
+                char named[7];
+                std::snprintf(named, sizeof(named), "<0x%02X>", byte);
+                const auto fallback = rank_of(named);
+                if (!fallback.has_value()) {
+                    throw std::runtime_error(
+                        std::string("Tokenizer::encode: vocabulary defines no <0xNN> token for byte ") +
+                        named);
+                }
+                out.push_back(static_cast<int32_t>(*fallback));
+            }
+        }
+    }
+
     // Encode ordinary text (no special token handling).
     std::vector<int32_t> encode_ordinary_impl(const std::string& text) const {
         std::vector<int32_t> result;
         if (text.empty()) return result;
+
+        // SentencePiece has no pre-tokenizer: BPE runs over the whole normalised
+        // chunk, and the vocabulary's keys are the pieces themselves rather than
+        // a byte-level re-encoding of them.
+        if (spm) {
+            TokTimer _t(tok_profile().bpe_ns);
+            spm_encode(spm_normalize(text), result);
+            return result;
+        }
 
         // Pre-tokenize: split by regex patterns.
         // unicode_regex_split already applies byte-level encoding (GPT-2 style)
@@ -420,6 +549,79 @@ Tokenizer Tokenizer::from_pretrained(const std::string& model_dir) {
                 impl.byte_level = true;
                 break;
             }
+        }
+    }
+
+    // ---- SentencePiece (Metaspace + byte fallback) ----
+    // Read off the tokenizer.json rather than the architecture: model_type
+    // "llama" is Llama 2 (SentencePiece) and Llama 3 (byte-level) both.
+    std::function<void(const json&)> scan_normalizer = [&](const json& node) {
+        if (!node.is_object() || !node.contains("type")) return;
+        const std::string type = node.at("type").get<std::string>();
+        if (type == "Sequence" && node.contains("normalizers")) {
+            for (const auto& sub : node.at("normalizers")) scan_normalizer(sub);
+            return;
+        }
+        if (type == "Prepend") {
+            impl.spm_prepend = true;
+            if (node.contains("prepend")) impl.spm_replacement = node.at("prepend").get<std::string>();
+        } else if (type == "Replace" && node.contains("pattern") && node.contains("content")) {
+            const auto& pattern = node.at("pattern");
+            if (pattern.is_object() && pattern.contains("String") &&
+                pattern.at("String").get<std::string>() == " ") {
+                impl.spm_replacement = node.at("content").get<std::string>();
+            }
+        }
+    };
+    if (data.contains("normalizer") && !data["normalizer"].is_null()) {
+        scan_normalizer(data["normalizer"]);
+    }
+    const bool declares_byte_fallback =
+        data.contains("model") && data["model"].contains("byte_fallback") &&
+        data["model"]["byte_fallback"].is_boolean() && data["model"]["byte_fallback"].get<bool>();
+    if (!impl.spm_replacement.empty() || declares_byte_fallback) {
+        impl.spm        = true;
+        impl.byte_level = false;
+        if (model.contains("merges") && model["merges"].is_array()) {
+            int rank = 0;
+            for (const auto& entry : model["merges"]) {
+                std::string left;
+                std::string right;
+                if (entry.is_string()) {
+                    const std::string pair = entry.get<std::string>();
+                    const size_t gap       = pair.find(' ');
+                    if (gap == std::string::npos) continue;
+                    left  = pair.substr(0, gap);
+                    right = pair.substr(gap + 1);
+                } else if (entry.is_array() && entry.size() == 2) {
+                    left  = entry[0].get<std::string>();
+                    right = entry[1].get<std::string>();
+                } else {
+                    continue;
+                }
+                impl.spm_merge_rank.emplace(left + '\x00' + right, rank++);
+            }
+        }
+        if (impl.spm_replacement.empty()) impl.spm_replacement = "\xe2\x96\x81";  // U+2581
+        // The decoder strips the space the Prepend put there.
+        impl.spm_strip_leading_space = impl.spm_prepend;
+        // <0xNN> -> the byte it stands for, so decode can spell it back out.
+        for (const auto& [token, rank] : impl.encoder) {
+            const std::string text(token.begin(), token.end());
+            if (text.size() != 6 || text[0] != '<' || text[1] != '0' || text[2] != 'x' ||
+                text[5] != '>') {
+                continue;
+            }
+            const auto hex = [](char c) -> int {
+                if (c >= '0' && c <= '9') return c - '0';
+                if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                return -1;
+            };
+            const int hi = hex(text[3]);
+            const int lo = hex(text[4]);
+            if (hi < 0 || lo < 0) continue;
+            impl.spm_byte_of_token[rank] = static_cast<uint8_t>(hi * 16 + lo);
         }
     }
 
@@ -751,6 +953,15 @@ std::string Tokenizer::decode(const std::vector<int32_t>& ids) const {
             continue;
         }
 
+        // A <0xNN> token stands for one raw byte, not for its own spelling.
+        if (impl_->spm) {
+            auto bit = impl_->spm_byte_of_token.find(uid);
+            if (bit != impl_->spm_byte_of_token.end()) {
+                byte_level_buf.push_back(static_cast<char>(bit->second));
+                continue;
+            }
+        }
+
         // Regular token — byte-level encoded
         auto it = impl_->decoder.find(uid);
         if (it != impl_->decoder.end()) {
@@ -759,6 +970,27 @@ std::string Tokenizer::decode(const std::vector<int32_t>& ids) const {
     }
 
     flush_byte_level();
+
+    if (impl_->spm) {
+        // Undo the normalizer: the word mark becomes a space again, and the one
+        // the Prepend added comes back off.
+        const std::string& mark = impl_->spm_replacement;
+        std::string undone;
+        undone.reserve(result.size());
+        for (size_t i = 0; i < result.size();) {
+            if (!mark.empty() && result.compare(i, mark.size(), mark) == 0) {
+                undone.push_back(' ');
+                i += mark.size();
+            } else {
+                undone.push_back(result[i]);
+                ++i;
+            }
+        }
+        if (impl_->spm_strip_leading_space && !undone.empty() && undone.front() == ' ') {
+            undone.erase(undone.begin());
+        }
+        result = std::move(undone);
+    }
     return result;
 }
 
