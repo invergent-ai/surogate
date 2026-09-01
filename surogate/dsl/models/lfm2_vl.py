@@ -6,9 +6,8 @@ the DSL declares the *text* backbone: the tower and the projector run outside
 and hand in already-projected image features, which are scattered into the
 embedding stream at the image-token positions.
 
-The only text-side differences from ``Lfm2ForCausalLM`` are that the weights sit
-under ``model.language_model.`` and that the LM head is a real tensor at the root
-rather than being tied to the embedding.
+The only text-side difference from ``Lfm2ForCausalLM`` is that the weights sit
+under ``model.language_model.``; the head stays tied to the embedding.
 """
 
 from __future__ import annotations
@@ -16,7 +15,7 @@ from __future__ import annotations
 from .. import nn
 from ..blocks.common import VL_MODEL_NAME_REMAP
 from ..blocks.lfm2 import Lfm2AttentionBlock, Lfm2ConvBlock
-from ..hf import fuse
+from ..hf import fuse, tied_to
 from ..models.lfm2 import _compute_lfm2_intermediate_size, _resolve_lfm2_layer_types
 from ..modules import Embedding, LMHead, RMSNorm
 from ..specs import ActivationScope
@@ -83,7 +82,12 @@ class Lfm2VlModel(nn.Model):
         # Model-level weights
         "embedding": "model.language_model.embed_tokens.weight",
         "final_norm": "model.language_model.embedding_norm.weight",
-        "lm_head": "lm_head.weight",
+        # LFM2-VL ties its head to the embedding (config default, and the
+        # released checkpoints publish no lm_head.weight). An untied variant
+        # would need the mapping swapped on the class, the way Gemma 4 swaps its
+        # k_eq_v overrides -- the compiler reads this off the class, not the
+        # instance.
+        "lm_head": tied_to("embedding"),
     }
 
     def __init__(

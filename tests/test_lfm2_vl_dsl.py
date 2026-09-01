@@ -13,7 +13,7 @@ def _mini_lfm2_vl_config(**overrides):
         "image_token_id": 396,
         "downsample_factor": 2,
         "projector_hidden_size": 128,
-        "tie_word_embeddings": False,
+        "tie_word_embeddings": True,
         "vision_config": {
             "model_type": "siglip2_vision_model",
             "hidden_size": 48,
@@ -85,8 +85,8 @@ def test_lfm2_vl_weights_live_under_the_language_model_prefix():
 
     assert mappings["embedding"] == "model.language_model.embed_tokens.weight"
     assert mappings["final_norm"] == "model.language_model.embedding_norm.weight"
-    # Unlike Lfm2ForCausalLM, the VL head is a real tensor rather than tied.
-    assert mappings["lm_head"] == "lm_head.weight"
+    # The head is tied: LFM2-VL checkpoints publish no lm_head.weight.
+    assert mappings["lm_head"]["target"] == "embedding"
 
     qkv = mappings["blocks[1].qkv_weight"]
     assert qkv["type"] == "fuse"
