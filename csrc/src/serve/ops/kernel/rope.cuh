@@ -128,18 +128,32 @@ __device__ __forceinline__ void apply_rope_head(__nv_bfloat16* data, std::int64_
         __floats2bfloat162_rn(second.x * c0 + first.x * s0, second.y * c1 + first.y * s1);
 }
 
+/// The head dim a fixed-mode kernel is compiled for. A dispatcher MUST test the
+/// tensor against this before selecting the mode: the kernel strides by it, so a
+/// tensor of any other head dim is walked at the wrong pitch and writes across
+/// its neighbours -- silently, since every index stays inside the allocation
+/// until the last token.
+__host__ __device__ constexpr int rope_fixed_head_dim(RopeKernelMode mode) {
+    return mode == RopeKernelMode::Vision2D       ? 72
+           : mode == RopeKernelMode::Vision2D64   ? 64
+           : mode == RopeKernelMode::DflashText1D ? 128
+                                                  : 256;
+}
+
+/// Rotary pairs the same kernel is compiled for, i.e. rotary_dim / 2.
+__host__ __device__ constexpr int rope_fixed_half(RopeKernelMode mode) {
+    return mode == RopeKernelMode::Vision2D       ? 36
+           : mode == RopeKernelMode::Vision2D64   ? 32
+           : mode == RopeKernelMode::DflashText1D ? 64
+                                                  : 32;
+}
+
 template <RopeKernelMode Mode, int QHeads, int KHeads>
 __global__ void rope_fixed_kernel(const std::int32_t* positions, __nv_bfloat16* q, __nv_bfloat16* k,
                                   std::int32_t tokens, std::int64_t q_token_stride,
                                   std::int64_t k_token_stride) {
-    constexpr int kHeadDim = Mode == RopeKernelMode::Vision2D       ? 72
-                             : Mode == RopeKernelMode::Vision2D64   ? 64
-                             : Mode == RopeKernelMode::DflashText1D ? 128
-                                                                    : 256;
-    constexpr int kHalf    = Mode == RopeKernelMode::Vision2D       ? 36
-                             : Mode == RopeKernelMode::Vision2D64   ? 32
-                             : Mode == RopeKernelMode::DflashText1D ? 64
-                                                                    : 32;
+    constexpr int kHeadDim = rope_fixed_head_dim(Mode);
+    constexpr int kHalf    = rope_fixed_half(Mode);
     const int token        = static_cast<int>(blockIdx.x);
     if (token >= tokens) { return; }
 
@@ -178,8 +192,8 @@ __global__ void rope_fixed_split_kernel(const std::int32_t* positions, __nv_bflo
                                         __nv_bfloat16* k, std::int32_t tokens,
                                         std::int64_t q_token_stride, std::int64_t k_token_stride) {
     static_assert(Mode == RopeKernelMode::DflashText1D);
-    constexpr int kHeadDim       = 128;
-    constexpr int kHalf          = 64;
+    constexpr int kHeadDim       = rope_fixed_head_dim(Mode);
+    constexpr int kHalf          = rope_fixed_half(Mode);
     constexpr int kCombinedHeads = QHeads + KHeads;
     constexpr int kHeadGroups    = (kCombinedHeads + HeadsPerBlock - 1) / HeadsPerBlock;
     const int token              = static_cast<int>(blockIdx.x) / kHeadGroups;

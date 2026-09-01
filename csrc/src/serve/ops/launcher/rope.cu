@@ -1,5 +1,7 @@
 // sinfer::ops - rope launcher: private token-count tuning and generic fallback.
 #include "ops/launcher/rope.h"
+#include <stdexcept>
+#include <string>
 
 #include "core/device.h" // CUDA_CHECK
 #include "ops/kernel/rope.cuh"
@@ -30,9 +32,25 @@ bool bf16x2_aligned(const Tensor& tensor) {
            tensor.nb[2] % static_cast<std::int64_t>(alignof(__nv_bfloat162)) == 0;
 }
 
+/// Refuses a tensor whose head dim is not the one `Mode` was compiled for. Every
+/// fixed launch goes through here, so a dispatcher that forgets the test gets a
+/// refusal naming the shape rather than a kernel striding across its neighbours.
+template <RopeKernelMode Mode>
+void require_fixed_head_dim(const Tensor* tensor, const char* label) {
+    if (tensor == nullptr) { return; }
+    if (tensor->ne[0] != rope_fixed_head_dim(Mode)) {
+        throw std::invalid_argument(std::string("rope: ") + label + " head dim " +
+                                    std::to_string(tensor->ne[0]) +
+                                    " does not match the fixed kernel's " +
+                                    std::to_string(rope_fixed_head_dim(Mode)));
+    }
+}
+
 template <RopeKernelMode Mode, int QHeads, int KHeads>
 void launch_fixed_block(const Tensor& positions, Tensor* q, Tensor* k, int block,
                         cudaStream_t stream) {
+    require_fixed_head_dim<Mode>(q, "query");
+    require_fixed_head_dim<Mode>(k, "key");
     const int tokens = positions.ne[0];
     rope_fixed_kernel<Mode, QHeads, KHeads><<<tokens, block, 0, stream>>>(
         static_cast<const std::int32_t*>(positions.data),
@@ -89,7 +107,9 @@ bool launch_fixed_pair(const Tensor& positions, int rotary_dim, float theta, Ten
         }
         return true;
     }
-    if (rotary_dim == 64 && theta == 1.0e7F) {
+    const bool text_head_dim = q.ne[0] == rope_fixed_head_dim(RopeKernelMode::Text1D) &&
+                               k.ne[0] == rope_fixed_head_dim(RopeKernelMode::Text1D);
+    if (rotary_dim == 64 && theta == 1.0e7F && text_head_dim) {
         if (q.ne[1] == 24 && k.ne[1] == 4) {
             if (axes == 1) {
                 launch_fixed<RopeKernelMode::Text1D, 24, 4>(positions, &q, &k, stream);
@@ -111,11 +131,15 @@ bool launch_fixed_pair(const Tensor& positions, int rotary_dim, float theta, Ten
             }
         }
     }
-    if (axes == 2 && rotary_dim == 72 && theta == 10'000.0F && q.ne[1] == 16 && k.ne[1] == 16) {
+    if (axes == 2 && rotary_dim == 72 && theta == 10'000.0F && q.ne[1] == 16 &&
+        k.ne[1] == 16 && q.ne[0] == rope_fixed_head_dim(RopeKernelMode::Vision2D) &&
+        k.ne[0] == rope_fixed_head_dim(RopeKernelMode::Vision2D)) {
         launch_fixed<RopeKernelMode::Vision2D, 16, 16>(positions, &q, &k, stream);
         return true;
     }
-    if (axes == 2 && rotary_dim == 64 && theta == 10'000.0F && q.ne[1] == 16 && k.ne[1] == 16) {
+    if (axes == 2 && rotary_dim == 64 && theta == 10'000.0F && q.ne[1] == 16 &&
+        k.ne[1] == 16 && q.ne[0] == rope_fixed_head_dim(RopeKernelMode::Vision2D64) &&
+        k.ne[0] == rope_fixed_head_dim(RopeKernelMode::Vision2D64)) {
         launch_fixed<RopeKernelMode::Vision2D64, 16, 16>(positions, &q, &k, stream);
         return true;
     }
@@ -129,7 +153,12 @@ void launch_fixed_single(const Tensor& positions, Tensor& x, cudaStream_t stream
 
 template <int Heads>
 bool launch_text_single(const Tensor& positions, int axes, Tensor& x, cudaStream_t stream) {
-    if (x.ne[1] != Heads) { return false; }
+    // Head count alone does not identify the kernel: Text1D and TextMrope are
+    // compiled for head dim 256, and the QSA indexer arrives here with four
+    // 128-wide heads at the same rotary_dim and theta.
+    if (x.ne[1] != Heads || x.ne[0] != rope_fixed_head_dim(RopeKernelMode::Text1D)) {
+        return false;
+    }
     if (axes == 1) {
         launch_fixed_single<RopeKernelMode::Text1D, Heads>(positions, x, stream);
         return true;
@@ -163,11 +192,13 @@ bool launch_fixed_single_dispatch(const Tensor& positions, int rotary_dim, float
             return true;
         }
     }
-    if (axes == 2 && rotary_dim == 72 && theta == 10'000.0F && x.ne[1] == 16) {
+    if (axes == 2 && rotary_dim == 72 && theta == 10'000.0F && x.ne[1] == 16 &&
+        x.ne[0] == rope_fixed_head_dim(RopeKernelMode::Vision2D)) {
         launch_fixed_single<RopeKernelMode::Vision2D, 16>(positions, x, stream);
         return true;
     }
-    if (axes == 2 && rotary_dim == 64 && theta == 10'000.0F && x.ne[1] == 16) {
+    if (axes == 2 && rotary_dim == 64 && theta == 10'000.0F && x.ne[1] == 16 &&
+        x.ne[0] == rope_fixed_head_dim(RopeKernelMode::Vision2D64)) {
         launch_fixed_single<RopeKernelMode::Vision2D64, 16>(positions, x, stream);
         return true;
     }

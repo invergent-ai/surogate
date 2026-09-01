@@ -431,6 +431,15 @@ int main() {
     failures += run_single_case({"27b mtp k mrope", 256, 64, 3, 128, kTextTheta}, 4, 8192);
     failures += run_single_case({"35b mtp k text", 256, 64, 1, 5, kTextTheta}, 2, 16384, 8);
 
+    // The QSA indexer: four 128-wide heads carrying the same rotary_dim and theta
+    // as the family's 256-wide text heads. Head count alone does not identify the
+    // kernel, and while the dispatcher tested only that, this shape matched the
+    // 256-wide `launch_text_single<4>` arm and was walked at a 256-element head
+    // stride -- so heads 2 and 3 landed outside their token's slice.
+    failures += run_single_case({"qsa indexer prefill", 128, 64, 1, 128, kTextTheta}, 4, 4096);
+    failures += run_single_case({"qsa indexer decode", 128, 64, 1, 1, kTextTheta}, 4, 262'000);
+    failures += run_single_case({"qsa indexer strided", 128, 64, 1, 7, kTextTheta}, 4, 8192, 16);
+
     failures += run_vision_packed_case();
 
     // DFlash proposal consumes 2..16 tokens; context append uses the single-K form.
