@@ -38,6 +38,7 @@ struct ServeOptions {
         std::uint32_t kv_tokens    = 0; ///< required: extras size their KV explicitly
         std::uint32_t max_num_seqs = 0; ///< 0 = inherit the primary's
         std::uint32_t max_context  = 0; ///< 0 = inherit the primary's
+        SpeculativeOptions speculative; ///< off unless spec=/draft-tokens= given
     };
     std::vector<ExtraModel> extra_models;
     std::string request_log_jsonl;                // empty => structured request logging disabled

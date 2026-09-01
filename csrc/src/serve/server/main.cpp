@@ -98,10 +98,10 @@ int main(int argc, char** argv) {
             extra_options.extra_models.clear();
             extra_options.enable_lora = false;
             extra_options.lora_modules.clear();
-            // Speculative backends are artifact-specific; extras opt in later,
-            // per model, rather than inheriting a primary flag their artifact
-            // may not carry.
-            extra_options.speculative = {};
+            // Speculative backends are artifact-specific, so extras never
+            // inherit the primary's flag -- they opt in per model via
+            // spec=mtp|dflash[,draft-tokens=N].
+            extra_options.speculative = extra.speculative;
             const auto extra_start = Clock::now();
             try {
                 extra_services.push_back(std::make_unique<sinfer::serve::GenerationService>(

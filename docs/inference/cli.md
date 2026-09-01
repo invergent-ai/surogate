@@ -105,7 +105,7 @@ what is missing, rather than silently serving unaccelerated.
 
 | Flag | Meaning |
 |---|---|
-| `--model name=path[,kv-tokens=N][,max-num-seqs=N][,max-model-len=N]` | Serve an additional model beside the primary; repeatable. Requests select it by `name` in the `model` field; `/v1/models` lists everything. `kv-tokens` is required — each extra states its KV budget explicitly. |
+| `--model name=path[,kv-tokens=N][,max-num-seqs=N][,max-model-len=N][,spec=mtp\|dflash][,draft-tokens=N]` | Serve an additional model beside the primary; repeatable. Requests select it by `name` in the `model` field; `/v1/models` lists everything. `kv-tokens` is required — each extra states its KV budget explicitly. |
 
 Each model runs its own engine — weights, cache, scheduler, CUDA graphs — on
 its own stream inside one process, so concurrent requests for different models

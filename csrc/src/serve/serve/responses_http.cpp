@@ -1,4 +1,5 @@
 #include "serve/http_server.h"
+#include "serve/model_scheduler.h"
 
 #include "serve/openai_schema.h"
 #include "serve/responses_schema.h"
@@ -210,7 +211,16 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
         request                   = parse_responses_request(parse_json_body(req), limits);
-        validate_model(request.generation.model, public_model_id_);
+        t_routed_service = nullptr;
+        if (request.generation.model != public_model_id_) {
+            const auto extra = extra_services_.find(request.generation.model);
+            if (extra == extra_services_.end()) {
+                validate_model(request.generation.model, public_model_id_);
+            } else {
+                t_routed_service = extra->second;
+            }
+        }
+        if (scheduler_ != nullptr) { scheduler_->ensure_awake(&svc()); }
         if (request.previous_response_id) {
             const std::shared_ptr<const StoredResponse> previous =
                 response_store_.get(*request.previous_response_id);
@@ -232,7 +242,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     const std::uint64_t req_id = ++request_seq_;
     PreparedRequest prepared;
     try {
-        prepared = service_->prepare(request.generation, [&req] { return disconnected(req); });
+        prepared = svc().prepare(request.generation, [&req] { return disconnected(req); });
     } catch (const ApiException& exception) {
         const ApiError error = responses_error(exception.error());
         log_request_rejected(make_request_rejection_log_context(req_id, "openai_responses",
@@ -256,7 +266,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     if (!request.stream) {
         try {
             const GenerationOutcome outcome =
-                service_->run(prepared, nullptr, [&req] { return disconnected(req); });
+                svc().run(prepared, nullptr, [&req] { return disconnected(req); });
             const ResponsesRuntimeValues runtime = runtime_values(prepared, &outcome);
             BuiltResponse response = make_response_object(id, created, request, runtime, outcome);
             if (request.store) {
@@ -291,9 +301,10 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
 
     res.set_header("Cache-Control", "no-cache");
     res.set_header("X-Accel-Buffering", "no");
+    GenerationService* const routed = &svc();
     res.set_chunked_content_provider(
         "text/event-stream",
-        [this, stream](std::size_t, httplib::DataSink& sink) -> bool {
+        [this, stream, routed](std::size_t, httplib::DataSink& sink) -> bool {
             if (stream->started) {
                 sink.done();
                 return true;
@@ -313,7 +324,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                            (sink.is_writable && !sink.is_writable());
                 };
 
-                const GenerationOutcome outcome = service_->run(stream->prepared, &output);
+                const GenerationOutcome outcome = routed->run(stream->prepared, &output);
                 ResponsesStreamFinish finished  = stream->encoder->finish(outcome);
                 if (stream->request.store) {
                     StoredResponse stored;
@@ -360,9 +371,18 @@ void HttpServer::handle_response_input_tokens(const httplib::Request& req, httpl
         limits.default_max_tokens = options_.default_max_tokens;
         ResponsesRequest request =
             parse_response_input_tokens_request(parse_json_body(req), limits);
-        validate_model(request.generation.model, public_model_id_);
+        t_routed_service = nullptr;
+        if (request.generation.model != public_model_id_) {
+            const auto extra = extra_services_.find(request.generation.model);
+            if (extra == extra_services_.end()) {
+                validate_model(request.generation.model, public_model_id_);
+            } else {
+                t_routed_service = extra->second;
+            }
+        }
+        if (scheduler_ != nullptr) { scheduler_->ensure_awake(&svc()); }
         const int tokens =
-            service_->count_prompt_tokens(request.generation, [&req] { return disconnected(req); });
+            svc().count_prompt_tokens(request.generation, [&req] { return disconnected(req); });
         res.set_content(make_response_input_tokens_body(tokens), "application/json");
     } catch (const ApiException& exception) {
         write_error(res, responses_error(exception.error()));

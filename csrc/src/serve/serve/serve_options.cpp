@@ -393,9 +393,24 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                     extra.max_num_seqs = static_cast<std::uint32_t>(std::stoul(val));
                 } else if (key == "max-model-len") {
                     extra.max_context = static_cast<std::uint32_t>(std::stoul(val));
+                } else if (key == "spec") {
+                    if (val == "mtp") {
+                        extra.speculative.backend = SpeculativeBackend::Mtp;
+                    } else if (val == "dflash") {
+                        extra.speculative.backend = SpeculativeBackend::DFlash;
+                    } else {
+                        throw std::invalid_argument("--model: spec= takes mtp or dflash");
+                    }
+                    if (extra.speculative.draft_tokens == 0) {
+                        extra.speculative.draft_tokens = 3;
+                    }
+                } else if (key == "draft-tokens") {
+                    extra.speculative.draft_tokens =
+                        static_cast<std::uint32_t>(std::stoul(val));
                 } else {
-                    throw std::invalid_argument("--model: unknown key '" + key +
-                                                "' (kv-tokens, max-num-seqs, max-model-len)");
+                    throw std::invalid_argument(
+                        "--model: unknown key '" + key +
+                        "' (kv-tokens, max-num-seqs, max-model-len, spec, draft-tokens)");
                 }
                 if (comma == std::string::npos) { break; }
                 cursor = comma + 1;
