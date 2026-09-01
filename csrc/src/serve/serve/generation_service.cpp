@@ -307,7 +307,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     // by the base model on those targets -- served confidently, and wrong. The
     // directory is registered during load, so an empty one here means nothing can
     // bind, at startup or from the runtime endpoints.
-    if (lora_requested && !ops::lora_store_for_current_device().has_bindings()) {
+    if (lora_requested && !engine_->lora_store().has_bindings()) {
         throw std::invalid_argument(
             "--enable-lora: this target does not apply adapters, so one would be loaded and "
             "silently ignored. Merge it into the checkpoint before conversion (`surogate merge`) "
@@ -509,7 +509,7 @@ void GenerationService::load_lora_adapter(const std::string& name, const std::st
     if (!options_.enable_lora) {
         throw std::invalid_argument("the server was started without --enable-lora");
     }
-    ops::LoraStore& store = ops::lora_store_for_current_device();
+    ops::LoraStore& store = engine_->lora_store();
     if (!store.has_bindings()) {
         throw std::invalid_argument("this target does not apply adapters");
     }
@@ -559,7 +559,7 @@ void GenerationService::load_lora_adapter(const std::string& name, const std::st
         lora_free_slots_.push_back(slot);
         throw;
     }
-    ops::lora_set_active(true);
+    store.set_active(true);
     const std::lock_guard<std::mutex> lock(lora_mutex_);
     lora_slot_of_[name] = slot;
 }
@@ -579,7 +579,7 @@ void GenerationService::unload_lora_adapter(const std::string& name) {
     // nothing from here on -- it degrades to the base model instead of reading
     // another adapter's weights. The slot goes to the back of the free list so it
     // is the last one a later load reuses.
-    ops::lora_store_for_current_device().clear_slot(slot);
+    engine_->lora_store().clear_slot(slot);
     const std::lock_guard<std::mutex> lock(lora_mutex_);
     lora_free_slots_.push_back(slot);
 }

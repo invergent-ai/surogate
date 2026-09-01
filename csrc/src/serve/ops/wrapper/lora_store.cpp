@@ -3,6 +3,7 @@
 #include "api/ops/lora_store.h"
 
 #include "core/device.h"
+#include "core/engine_context.h"
 #include "ops/kernel/lora_fused_limits.h"
 
 #include <algorithm>
@@ -249,22 +250,14 @@ void LoraStore::write_uniform_slot(std::int32_t slot, cudaStream_t stream) const
     CUDA_CHECK(cudaMemcpyAsync(uniform_cell_, &slot, sizeof(slot), cudaMemcpyHostToDevice, stream));
 }
 
-LoraStore& lora_store_for_current_device() {
-    static std::mutex mutex;
-    static std::map<int, LoraStore> stores;
-    int device = 0;
-    CUDA_CHECK(cudaGetDevice(&device));
-    const std::lock_guard<std::mutex> lock(mutex);
-    return stores[device];
-}
+LoraStore& lora_store_for_current_device() { return engine_slot<LoraStore>(); }
 
 namespace {
-bool g_lora_active = false;
 thread_local LoraRound t_round;
 } // namespace
 
-bool lora_active() { return g_lora_active; }
-void lora_set_active(bool active) { g_lora_active = active; }
+bool lora_active() { return engine_slot<LoraStore>().active(); }
+void lora_set_active(bool active) { engine_slot<LoraStore>().set_active(active); }
 
 void lora_set_round(const LoraRound& round) { t_round = round; }
 void lora_clear_round() { t_round = LoraRound{}; }

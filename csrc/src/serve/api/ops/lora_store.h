@@ -108,6 +108,10 @@ public:
     void write_uniform_slot(std::int32_t slot, cudaStream_t stream) const;
 
     [[nodiscard]] bool empty() const noexcept { return banks_.empty(); }
+    /// True once any adapter machinery is live for this engine; the projection
+    /// hooks read it to skip the lookup in the common case.
+    [[nodiscard]] bool active() const noexcept { return active_; }
+    void set_active(bool active) noexcept { active_ = active; }
     [[nodiscard]] std::int32_t slots() const noexcept { return slots_; }
     [[nodiscard]] std::int32_t max_rank() const noexcept { return max_rank_; }
 
@@ -144,9 +148,12 @@ private:
     std::int32_t scratch_tokens_ = 0;
     std::int32_t slots_    = 0;
     std::int32_t max_rank_ = 0;
+    bool active_           = false;
 };
 
-/// The active store for the current device; empty unless adapters were loaded.
+/// The engine-bound store (via the thread's ops context; the process default
+/// serves single-engine paths and tools). The name is historical -- an engine
+/// serves one device, so per-engine and per-device coincide.
 [[nodiscard]] LoraStore& lora_store_for_current_device();
 
 /// True when any adapter is resident, so the projection hooks skip the lookup in

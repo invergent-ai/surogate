@@ -7,6 +7,10 @@
 
 namespace sinfer {
 
+namespace ops {
+class LoraStore;
+} // namespace ops
+
 class PreparedPrompt {
 public:
     PreparedPrompt() noexcept;
@@ -106,6 +110,9 @@ public:
     /// process meanwhile; the engine stays asleep and the call can be retried.
     void wake();
     [[nodiscard]] bool is_sleeping() const;
+
+    /// This engine's adapter store (runtime load/unload operates on it).
+    [[nodiscard]] ops::LoraStore& lora_store();
 
     [[nodiscard]] MemorySummary memory_summary() const;
     [[nodiscard]] RuntimeStats runtime_stats() const;

@@ -15,6 +15,10 @@
 
 namespace sinfer {
 
+namespace ops {
+class EngineOpsContext;
+} // namespace ops
+
 using TokenId = std::int32_t;
 
 // surogate vendor patch (PATCHES.md #29): raised 8 -> 16 for the multi-user
@@ -127,6 +131,10 @@ struct EngineOptions {
     /// Route the long-lived device arenas through VMM-backed regions so the
     /// engine can sleep (release VRAM, addresses stable) and wake fast.
     bool sleep_enable = false;
+    /// The engine's op-layer state home (owned by the Engine; internal). The
+    /// executor's worker thread binds it so op planes and adapter banks resolve
+    /// per engine, which is what lets several engines share one process.
+    ops::EngineOpsContext* ops_context = nullptr;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
     // Storage of the pinned host expert bank. Q4G32AM (4-bit affine groups requantised from
     // the artifact's W8 at load) is 59 % of the bytes and near-exact for Q4_K-derived experts,

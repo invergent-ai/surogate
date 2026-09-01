@@ -36,7 +36,10 @@ enum class SleepTag {
 [[nodiscard]] bool sleepable_allocations_enabled() noexcept;
 void set_sleepable_allocations(bool enabled) noexcept;
 
-/// Reserve + map a sleepable region on `device`. Registered with SleepTag::Offload.
+/// Reserve + map a sleepable region on `device`, registered with
+/// SleepTag::Offload and owned by the thread's bound ops context, so one
+/// engine's sleep leaves its neighbours' memory mapped. A null `owner` filter
+/// on the operations below matches every region (tools, single-engine paths).
 [[nodiscard]] void* sleep_alloc(std::size_t bytes, int device);
 
 /// Tear down a sleepable region (any state). Returns false when `base` is not a
@@ -49,15 +52,15 @@ void sleep_tag_region(const void* base, SleepTag tag);
 /// Back up Offload regions to pinned host, then unmap and release the physical
 /// pages of every region on `device`. Returns bytes released. The caller must
 /// have quiesced all work on the device.
-std::size_t sleep_device(int device);
+std::size_t sleep_device(int device, const void* owner = nullptr);
 
 /// Map fresh physical pages at the original addresses and restore Offload
 /// regions. Returns bytes mapped. Throws on allocation failure (VRAM taken by
 /// another process while asleep); regions already woken stay woken, so a retry
 /// finishes the job.
-std::size_t wake_device(int device);
+std::size_t wake_device(int device, const void* owner = nullptr);
 
-[[nodiscard]] bool device_asleep(int device) noexcept;
+[[nodiscard]] bool device_asleep(int device, const void* owner = nullptr) noexcept;
 
 /// Pinned-host bytes currently held as sleep backups for `device`.
 [[nodiscard]] std::size_t sleep_backup_bytes(int device) noexcept;

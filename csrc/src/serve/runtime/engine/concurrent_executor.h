@@ -2,6 +2,7 @@
 
 // Small fixed-capacity request scheduling and batched decode execution for every backend.
 
+#include "core/engine_context.h"
 #include "api/types.h"
 #include "runtime/contract/types.h"
 #include "runtime/engine/admission_policy.h"
@@ -61,7 +62,8 @@ public:
             admission_capacity_.main_kv_pages == 0) {
             throw std::logic_error("target admission capacity does not match the Engine");
         }
-        worker_ = std::thread([this] { worker_loop(); });
+        ops_context_ = options.ops_context;
+        worker_      = std::thread([this] { worker_loop(); });
     }
 
     /// Refuse new submissions while asleep. The caller drains in-flight work
@@ -1417,6 +1419,10 @@ private:
     }
 
     void worker_loop() noexcept {
+        // Every round this thread runs must resolve op-plane state (Marlin
+        // scratch, LoRA banks) in this engine's context -- the same one target
+        // construction bound, so captured-graph addresses and eager calls agree.
+        if (ops_context_ != nullptr) { ops::bind_ops_context(ops_context_); }
         bool previous_unit_was_decode = false;
         for (;;) {
             {
@@ -1712,6 +1718,7 @@ private:
     RuntimeStats published_stats_;
     bool stopping_ = false;
     bool failed_   = false;
+    ops::EngineOpsContext* ops_context_ = nullptr;
     std::thread worker_;
 };
 

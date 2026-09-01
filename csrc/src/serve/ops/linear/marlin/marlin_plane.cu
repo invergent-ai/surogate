@@ -1,6 +1,7 @@
 // Derived Marlin residency registry (see marlin_plane.h for the scheme).
 
 #include "ops/linear/marlin/marlin_plane.h"
+#include "core/engine_context.h"
 
 #include "ops/linear/marlin/marlin_gemm.h"
 #include "ops/linear/marlin/marlin_repack.h"
@@ -37,17 +38,36 @@ struct ScratchState {
     std::size_t a_bytes   = 0;
     bool frozen           = false;
 };
+// Everything mutable the plane owns, homed per engine so two models in one
+// process cannot race the staging scratch or close each other's adoption.
+struct MarlinPlaneState {
+    std::map<int, ScratchState> scratch_by_device; // pipeline stages: one per device
+    bool adoption_closed          = false;
+    int fixed_m                   = 32;
+    void* fused_parent            = nullptr;
+    std::size_t fused_parent_bytes = 0;
+    ~MarlinPlaneState() {
+        for (auto& [device, state] : scratch_by_device) {
+            if (state.scratch.gemm_out != nullptr) { (void)cudaFree(state.scratch.gemm_out); }
+            if (state.scratch.a_pad != nullptr) { (void)cudaFree(state.scratch.a_pad); }
+        }
+        if (fused_parent != nullptr) { (void)cudaFree(fused_parent); }
+    }
+};
+MarlinPlaneState& plane_state() { return engine_slot<MarlinPlaneState>(); }
 ScratchState& scratch_state() {
-    static std::map<int, ScratchState> states;
     int device = 0;
     (void)cudaGetDevice(&device);
-    return states[device];
+    return plane_state().scratch_by_device[device];
 }
 #define g_scratch (scratch_state().scratch)
 #define g_scratch_out_bytes (scratch_state().out_bytes)
 #define g_scratch_a_bytes (scratch_state().a_bytes)
 #define g_scratch_frozen (scratch_state().frozen)
-bool g_adoption_closed          = false;
+#define g_adoption_closed (plane_state().adoption_closed)
+#define g_fixed_m (plane_state().fixed_m)
+#define g_fused_parent (plane_state().fused_parent)
+#define g_fused_parent_bytes (plane_state().fused_parent_bytes)
 
 bool ensure_scratch(std::size_t out_bytes, std::size_t a_bytes, cudaStream_t stream) {
     if (g_scratch.gemm_out != nullptr && out_bytes <= g_scratch_out_bytes &&
@@ -150,7 +170,6 @@ void marlin_plane_freeze_scratch() noexcept { g_scratch_frozen = true; }
 // pointer stability and happens later.
 void marlin_fp8_close_adoption() noexcept { g_adoption_closed = true; }
 
-int g_fixed_m = 32;
 void marlin_set_fixed_m(int lanes) noexcept {
     // The band follows the lane ceiling. It was pinned to 32 while a wide
     // band corrupted the 0.8B under sustained load; that fault was the
@@ -384,8 +403,6 @@ MarlinPlane marlin_fp8_plane_for(const Weight& weight, cudaStream_t stream) {
 // exactly one buffer and surfaced as an arena exhaustion during warmup. It is
 // scratch with the same lifetime as the Marlin scratch beside it, so it lives
 // there instead, and grows on demand before capture.
-void* g_fused_parent            = nullptr;
-std::size_t g_fused_parent_bytes = 0;
 
 void* marlin_fused_parent(std::size_t bytes, cudaStream_t stream) {
     if (bytes == 0) { return nullptr; }

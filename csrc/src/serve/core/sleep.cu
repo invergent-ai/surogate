@@ -3,6 +3,7 @@
 #include "core/sleep.h"
 
 #include "core/device.h"
+#include "core/engine_context.h"
 
 #include <atomic>
 #include <chrono>
@@ -30,6 +31,7 @@ void driver_check(CUresult result, const char* what) {
 }
 
 struct Region {
+    const void* owner                   = nullptr;
     int device                          = 0;
     CUdeviceptr va                      = 0;
     std::size_t bytes                   = 0; ///< granularity-rounded mapped size
@@ -96,6 +98,7 @@ void* sleep_alloc(std::size_t bytes, int device) {
         cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM),
         "cuMemGetAllocationGranularity");
     Region region;
+    region.owner  = ops::current_ops_owner();
     region.device = device;
     region.bytes  = (bytes + granularity - 1) / granularity * granularity;
     driver_check(cuMemAddressReserve(&region.va, region.bytes, 0, 0, 0), "cuMemAddressReserve");
@@ -141,7 +144,7 @@ void sleep_tag_region(const void* base, SleepTag tag) {
     found->second.tag = tag;
 }
 
-std::size_t sleep_device(int device) {
+std::size_t sleep_device(int device, const void* owner) {
     using Clock = std::chrono::steady_clock;
     const std::lock_guard<std::mutex> lock(registry().mutex);
     CUDA_CHECK(cudaSetDevice(device));
@@ -149,6 +152,7 @@ std::size_t sleep_device(int device) {
     double pin_ms = 0, copy_ms = 0, unmap_ms = 0;
     for (auto& [base, region] : registry().regions) {
         if (region.device != device || region.asleep) { continue; }
+        if (owner != nullptr && region.owner != owner) { continue; }
         if (region.tag == SleepTag::Offload) {
             if (region.backup == nullptr) {
                 const auto t0 = Clock::now();
@@ -172,7 +176,7 @@ std::size_t sleep_device(int device) {
     return released;
 }
 
-std::size_t wake_device(int device) {
+std::size_t wake_device(int device, const void* owner) {
     using Clock = std::chrono::steady_clock;
     const std::lock_guard<std::mutex> lock(registry().mutex);
     CUDA_CHECK(cudaSetDevice(device));
@@ -180,6 +184,7 @@ std::size_t wake_device(int device) {
     double map_ms = 0, copy_ms = 0;
     for (auto& [base, region] : registry().regions) {
         if (region.device != device || !region.asleep) { continue; }
+        if (owner != nullptr && region.owner != owner) { continue; }
         const auto t0 = Clock::now();
         map_region(region); // throws on OOM; earlier regions stay woken for retry
         map_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
@@ -197,10 +202,11 @@ std::size_t wake_device(int device) {
     return mapped;
 }
 
-bool device_asleep(int device) noexcept {
+bool device_asleep(int device, const void* owner) noexcept {
     const std::lock_guard<std::mutex> lock(registry().mutex);
     for (const auto& [base, region] : registry().regions) {
-        if (region.device == device && region.asleep) { return true; }
+        if (region.device == device && region.asleep &&
+            (owner == nullptr || region.owner == owner)) { return true; }
     }
     return false;
 }

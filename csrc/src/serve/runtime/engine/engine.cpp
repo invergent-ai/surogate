@@ -7,6 +7,8 @@
 #include "ops/linear/w8a8/w4fp4_plane.h"
 #include "ops/linear/marlin/marlin_plane.h"
 #include "ops/linear/w8a8/w8fp8_plane.h"
+#include "api/ops/lora_store.h"
+#include "core/engine_context.h"
 #include "core/sleep.h"
 #include "runtime/engine/concurrent_executor.h"
 #include "targets/registry.h"
@@ -162,6 +164,13 @@ public:
 
     explicit Impl(EngineOptions engine_options)
         : options(std::move(engine_options)), device(options.device) {
+        // The engine's op-layer state home. Bound here so everything target
+        // construction creates -- Marlin scratch and adoption, LoRA banks,
+        // sleepable arenas (which record this as their owner) -- lands in THIS
+        // engine's context; the executor's worker thread binds the same object,
+        // so addresses captured into graphs now and used by rounds later agree.
+        options.ops_context = &ops_context;
+        ops::bind_ops_context(&ops_context);
         // surogate vendor patch (PATCHES.md #20): the engine opts into the
         // derived FP8 prefill plane (op tests stay int8-exact by default;
         // SUROGATE_SERVE_FP8_PREFILL=0 vetoes).
@@ -226,6 +235,7 @@ public:
             },
             active);
         set_sleepable_allocations(false);
+        ops::bind_ops_context(nullptr);
     }
 
     ~Impl() noexcept {
@@ -235,6 +245,9 @@ public:
         } catch (...) {}
     }
 
+    // Declared first so it is destroyed last: the executor's teardown and the
+    // arenas' teardown may still touch context-homed state.
+    ops::EngineOpsContext ops_context;
     EngineOptions options;
     DeviceContext device;
     targets::ActiveTarget active;
@@ -410,7 +423,7 @@ void Engine::sleep() {
             if constexpr (std::is_same_v<Executor, std::monostate>) {
                 throw std::logic_error("concurrent Engine executor is unavailable");
             } else {
-                if (device_asleep(impl.device.device)) { return; } // idempotent
+                if (device_asleep(impl.device.device, &impl.ops_context)) { return; } // idempotent
                 executor->set_asleep(true);
                 // Experimental preemptive sleep: with the gate set, active lanes
                 // are allowed -- the worker loop parks between rounds, the lanes'
@@ -427,7 +440,7 @@ void Engine::sleep() {
                 // that certain before touching memory.
                 auto paused = executor->pause_execution();
                 impl.device.synchronize();
-                const std::size_t released = sleep_device(impl.device.device);
+                const std::size_t released = sleep_device(impl.device.device, &impl.ops_context);
                 std::fprintf(stderr, "engine: asleep, released %.2f GiB of device memory\n",
                              static_cast<double>(released) / (1024.0 * 1024.0 * 1024.0));
             }
@@ -443,9 +456,9 @@ void Engine::wake() {
             if constexpr (std::is_same_v<Executor, std::monostate>) {
                 throw std::logic_error("concurrent Engine executor is unavailable");
             } else {
-                if (device_asleep(impl.device.device)) {
+                if (device_asleep(impl.device.device, &impl.ops_context)) {
                     auto paused = executor->pause_execution();
-                    const std::size_t mapped = wake_device(impl.device.device);
+                    const std::size_t mapped = wake_device(impl.device.device, &impl.ops_context);
                     impl.device.synchronize();
                     std::fprintf(stderr, "engine: awake, restored %.2f GiB of device memory\n",
                                  static_cast<double>(mapped) / (1024.0 * 1024.0 * 1024.0));
@@ -455,6 +468,8 @@ void Engine::wake() {
         },
         impl.executor);
 }
+
+ops::LoraStore& Engine::lora_store() { return impl_->ops_context.slot<ops::LoraStore>(); }
 
 bool Engine::is_sleeping() const {
     return std::visit(
