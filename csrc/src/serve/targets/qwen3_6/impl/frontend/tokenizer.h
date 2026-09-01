@@ -7,6 +7,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace sinfer::targets::qwen3_6::frontend_internal {
@@ -60,6 +61,14 @@ public:
     [[nodiscard]] const std::vector<int>& default_stop_token_ids() const noexcept {
         return default_stop_token_ids_;
     }
+
+    /// True when this checkpoint's chat template is rendered by the project
+    /// tokenizer rather than reproduced by the family's hand-written ChatML.
+    [[nodiscard]] bool renders_chat_template() const noexcept;
+    /// Renders the artifact's own Jinja template. Messages are (role, content).
+    [[nodiscard]] std::string render_chat_template(
+        const std::vector<std::pair<std::string, std::string>>& messages,
+        bool add_generation_prompt) const;
 
     [[nodiscard]] bool is_special_token(int id) const noexcept;
     [[nodiscard]] bool is_valid_token(int id) const noexcept;

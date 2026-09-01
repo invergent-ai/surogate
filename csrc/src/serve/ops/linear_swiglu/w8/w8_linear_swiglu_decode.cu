@@ -215,6 +215,11 @@ void dispatch_decode(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t
         launch_decode<RowsPerCta, 9216, 2560>(x, w, out, stream);
         return;
     }
+    // tinyllama-1.1b: 11264 gate_up rows over hidden 2048, so 5632 out.
+    if (w.k == 2048 && intermediate == 5632) {
+        launch_decode<RowsPerCta, 5632, 2048>(x, w, out, stream);
+        return;
+    }
     throw std::invalid_argument("W8 LinearSwiGLU decode: no instantiation for gate_up_rows " +
                                 std::to_string(w.n) + " over k " + std::to_string(w.k));
 }

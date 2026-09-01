@@ -792,7 +792,10 @@ Tokenizer Tokenizer::from_sources(const Sources& sources) {
             impl.unk_id = resolve_token_id(config, "unk_token");
         }
 
-        impl.add_bos = config.value("add_bos_token", false);
+        // Defaults to whatever the post-processor already established: a
+        // SentencePiece conversion states its prefix there and says nothing here,
+        // and reading the absent key as "false" would drop the BOS it asked for.
+        impl.add_bos = config.value("add_bos_token", impl.add_bos);
         impl.add_eos = config.value("add_eos_token", false);
 
         // Load chat template (Jinja2 string) — parse directly, skip capability probing.

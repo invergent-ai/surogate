@@ -218,7 +218,16 @@ load_added_tokens(const Json& root, std::string_view label, std::vector<std::str
         AddedToken token = parse_added_token(item, label);
         validate_supported_added_token(token, label);
         const auto index = static_cast<std::size_t>(token.id);
-        if (occupied_vocab_ids.contains(token.id)) {
+        // A SentencePiece conversion states its specials twice: once in
+        // model.vocab, where they hold real ids, and again in added_tokens so the
+        // splitter keeps them whole. That is a restatement, not a collision --
+        // the id and the content agree on both sides. A byte-level conversion
+        // keeps its added tokens out of the vocabulary entirely, never reaches
+        // this branch, and keeps the strictness it had.
+        const auto vocab_entry    = occupied_vocab_tokens.find(token.content);
+        const bool restates_vocab = vocab_entry != occupied_vocab_tokens.end() &&
+                                    vocab_entry->second == token.id;
+        if (occupied_vocab_ids.contains(token.id) && !restates_vocab) {
             throw std::invalid_argument("field added_tokens overlaps existing id in " +
                                         std::string(label));
         }
@@ -226,7 +235,7 @@ load_added_tokens(const Json& root, std::string_view label, std::vector<std::str
             throw std::invalid_argument("field added_tokens has duplicate id in " +
                                         std::string(label));
         }
-        if (occupied_vocab_tokens.contains(token.content) ||
+        if ((occupied_vocab_tokens.contains(token.content) && !restates_vocab) ||
             !seen_added_contents.emplace(token.content, token.id).second) {
             throw std::invalid_argument("field added_tokens has duplicate content mapping in " +
                                         std::string(label));
@@ -695,6 +704,21 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
         sources.tokenizer_config_json = std::string(resources.tokenizer_config_json);
         spm_.reset(new spm_delegate::Handle{::tokenizer::Tokenizer::from_sources(sources)});
     }
+}
+
+bool Tokenizer::renders_chat_template() const noexcept { return spm_ != nullptr; }
+
+std::string Tokenizer::render_chat_template(
+    const std::vector<std::pair<std::string, std::string>>& messages,
+    bool add_generation_prompt) const {
+    if (!spm_) {
+        throw std::logic_error("Tokenizer::render_chat_template: no template renderer for this "
+                               "checkpoint");
+    }
+    std::vector<::tokenizer::ChatMessage> converted;
+    converted.reserve(messages.size());
+    for (const auto& [role, content] : messages) { converted.push_back({role, content}); }
+    return spm_->inner.apply_chat_template(converted, add_generation_prompt);
 }
 
 std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options) const {

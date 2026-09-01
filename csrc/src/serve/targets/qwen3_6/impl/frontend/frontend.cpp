@@ -240,7 +240,20 @@ fi::CompiledChatTemplate compile_chat_template(const FrontendResources& resource
         return fi::CompiledChatTemplate::resolve(override_template);
     }
     validate_tokenizer_config(resources);
-    return fi::CompiledChatTemplate::resolve(resources.chat_template_jinja);
+    // The artifact's own template may reference eos_token; the recognised ones
+    // write their markers themselves and ignore it.
+    const Json tokenizer_config =
+        parse_resource_json(resources.tokenizer_config_json, "tokenizer_config.json");
+    std::string eos_token;
+    if (tokenizer_config.contains("eos_token")) {
+        const Json& eos = tokenizer_config.at("eos_token");
+        if (eos.is_string()) {
+            eos_token = eos.get<std::string>();
+        } else if (eos.is_object() && eos.contains("content") && eos.at("content").is_string()) {
+            eos_token = eos.at("content").get<std::string>();
+        }
+    }
+    return fi::CompiledChatTemplate::resolve(resources.chat_template_jinja, eos_token);
 }
 
 [[noreturn]] void throw_processor_error(const fi::ProcessorError& error) {
@@ -978,8 +991,34 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         result.prepare.tokenize_seconds    = processed.stats.tokenize_seconds;
         result.identity.rewrite_checkpoint = processed.rewrite_checkpoint;
     } else {
-        const fi::RenderedChat rendered =
-            impl_->chat_template.render(messages, render_options(options));
+        // A checkpoint whose template this family does not reproduce by hand is
+        // rendered by the tokenizer, from the artifact's own Jinja.
+        fi::RenderedChat rendered;
+        if (impl_->tokenizer->renders_chat_template()) {
+            std::vector<std::pair<std::string, std::string>> plain;
+            plain.reserve(messages.size());
+            const auto role_name = [](ChatRole role) -> std::string {
+                switch (role) {
+                case ChatRole::System:
+                case ChatRole::Developer:
+                    return "system";
+                case ChatRole::User:
+                    return "user";
+                case ChatRole::Assistant:
+                    return "assistant";
+                case ChatRole::Tool:
+                    return "tool";
+                }
+                throw std::invalid_argument("chat template: unknown role");
+            };
+            for (const fi::ChatMessage& message : messages) {
+                plain.emplace_back(role_name(message.role), message.rendered_content());
+            }
+            rendered.text =
+                impl_->tokenizer->render_chat_template(plain, options.add_generation_prompt);
+        } else {
+            rendered = impl_->chat_template.render(messages, render_options(options));
+        }
         const auto tokenize_started = Clock::now();
         fi::EncodedChat encoded     = fi::encode_rendered_chat(*impl_->tokenizer, rendered);
         result.prepare.tokenize_seconds =

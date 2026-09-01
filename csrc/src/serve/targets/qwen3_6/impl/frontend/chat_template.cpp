@@ -1,3 +1,4 @@
+#include <minja/minja.hpp>
 #include "targets/qwen3_6/impl/frontend/chat_template.h"
 
 #include "targets/qwen3_6/impl/frontend/digest.h"
@@ -325,7 +326,8 @@ std::string ChatMessage::rendered_content(bool add_vision_id, int* image_count,
     return out;
 }
 
-CompiledChatTemplate CompiledChatTemplate::resolve(std::string_view source) {
+CompiledChatTemplate CompiledChatTemplate::resolve(std::string_view source,
+                                                   std::string_view eos_token) {
     const Sha256Digest digest = sha256(source);
     if (digest == kThinkingToggleTemplateDigest || digest == kQwen35ThinkingToggleTemplateDigest ||
         digest == kQwen35UnslothThinkingToggleTemplateDigest ||
@@ -336,8 +338,14 @@ CompiledChatTemplate CompiledChatTemplate::resolve(std::string_view source) {
     if (digest == kReasoningEffortTemplateDigest) {
         return CompiledChatTemplate(ChatTemplateSemantics::ReasoningEffort);
     }
-    throw std::invalid_argument("unsupported frontend/chat_template.jinja (sha256 " +
-                                sha256_hex(digest) + ")");
+    // Anything else is rendered as the artifact wrote it. The digest allowlist
+    // above stays because those templates are not rendered at all -- they are
+    // reproduced by hand, and a changed byte would silently change the prompt.
+    // A template outside it gets no such reproduction and needs none.
+    CompiledChatTemplate compiled(ChatTemplateSemantics::Jinja);
+    compiled.jinja_source_ = std::string(source);
+    compiled.eos_token_    = std::string(eos_token);
+    return compiled;
 }
 
 PromptCapabilities CompiledChatTemplate::capabilities() const noexcept {
@@ -355,6 +363,14 @@ PromptCapabilities CompiledChatTemplate::capabilities() const noexcept {
 RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messages,
                                           ChatRenderOptions options) const {
     if (messages.empty()) { throw std::invalid_argument("chat messages must not be empty"); }
+
+    if (semantics_ == ChatTemplateSemantics::Jinja) {
+        // Rendered by the project tokenizer, which already drives minja and is
+        // the same renderer training uses. Reaching here means a caller rendered
+        // without asking the tokenizer first.
+        throw std::logic_error(
+            "chat template: this artifact's template is rendered by the tokenizer");
+    }
 
     const bool effort_template = semantics_ == ChatTemplateSemantics::ReasoningEffort;
     const std::string_view reasoning_instructions =

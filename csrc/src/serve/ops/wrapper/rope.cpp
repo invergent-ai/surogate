@@ -93,11 +93,18 @@ void require_model_mode(int axes, int rotary_dim, std::int32_t head_dim) {
         }
         return;
     }
-    // 1-D D128: the DFlash draft head (R128) and the QSA indexer's queries (R64), both served
-    // by the generic kernel.
-    if (axes == 1 && head_dim == 128 && rotary_dim <= 128) { return; }
+    // 1-D narrow heads: the DFlash draft head (D128/R128), the QSA indexer's
+    // queries (D128/R64) and a 64-wide head rotating in full (D64/R64). All three
+    // are served by the generic kernel, which reads its head dim and rotary dim
+    // from the call rather than baking them, so the constraint is only that the
+    // rotation fits inside the head.
+    if (axes == 1 && (head_dim == 128 || head_dim == 64) && rotary_dim <= head_dim) { return; }
     if (head_dim != kTextHeadDim || rotary_dim > kTextHeadDim) {
-        throw std::invalid_argument("rope: Text mode requires D256 or one-dimensional D128/R128");
+        throw std::invalid_argument(
+            "rope: Text mode requires D256, or one-dimensional D128 or D64 with a rotary dim "
+            "no wider than the head (head_dim " +
+            std::to_string(head_dim) + ", rotary_dim " + std::to_string(rotary_dim) + ", axes " +
+            std::to_string(axes) + ")");
     }
     if (axes == 3 && rotary_dim != 64) {
         throw std::invalid_argument("rope: 3-D Text MRoPE requires rotary_dim=64");

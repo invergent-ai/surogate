@@ -1,5 +1,6 @@
 #pragma once
 
+
 #include <api/targets/qwen3_6/prepared_prompt.h>
 #include <api/types.h>
 
@@ -91,11 +92,19 @@ struct RenderedChat {
 enum class ChatTemplateSemantics : std::uint8_t {
     ThinkingToggle,
     ReasoningEffort,
+    /// The artifact's own Jinja, rendered as written. The two above are
+    /// hand-written ChatML for templates this family recognises by digest; this
+    /// one carries no assumption about the format at all, which is what a
+    /// checkpoint from outside the family needs.
+    Jinja,
 };
 
 class CompiledChatTemplate {
 public:
-    [[nodiscard]] static CompiledChatTemplate resolve(std::string_view source);
+    /// `eos_token` is only consulted by the Jinja path, whose templates
+    /// routinely reference it; the recognised templates write their own markers.
+    [[nodiscard]] static CompiledChatTemplate resolve(std::string_view source,
+                                                      std::string_view eos_token = {});
 
     [[nodiscard]] PromptCapabilities capabilities() const noexcept;
     [[nodiscard]] RenderedChat render(const std::vector<ChatMessage>& messages,
@@ -106,6 +115,11 @@ private:
         : semantics_(semantics) {}
 
     ChatTemplateSemantics semantics_;
+
+    // Jinja path only. The parsed template is shared rather than owned outright
+    // so this stays copyable, which the two hand-written semantics are.
+    std::string jinja_source_;
+    std::string eos_token_;
 };
 
 } // namespace sinfer::targets::qwen3_6::frontend_internal
