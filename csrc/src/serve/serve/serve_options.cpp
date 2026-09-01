@@ -366,6 +366,44 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.enable_auto_tool_choice = true;
         } else if (arg == "--chat-template") {
             options.chat_template_path = require_value("--chat-template");
+        } else if (arg == "--model") {
+            // --model name=path[,kv-tokens=N][,max-num-seqs=N][,max-model-len=N]
+            const std::string value = require_value("--model");
+            ServeOptions::ExtraModel extra;
+            std::size_t cursor = 0;
+            bool first         = true;
+            while (cursor <= value.size()) {
+                const std::size_t comma = value.find(',', cursor);
+                const std::string part =
+                    value.substr(cursor, comma == std::string::npos ? std::string::npos
+                                                                    : comma - cursor);
+                const std::size_t eq = part.find('=');
+                if (eq == std::string::npos) {
+                    throw std::invalid_argument("--model expects name=path[,key=value...]");
+                }
+                const std::string key = part.substr(0, eq);
+                const std::string val = part.substr(eq + 1);
+                if (first) {
+                    extra.name          = key;
+                    extra.artifact_path = val;
+                    first               = false;
+                } else if (key == "kv-tokens") {
+                    extra.kv_tokens = static_cast<std::uint32_t>(std::stoul(val));
+                } else if (key == "max-num-seqs") {
+                    extra.max_num_seqs = static_cast<std::uint32_t>(std::stoul(val));
+                } else if (key == "max-model-len") {
+                    extra.max_context = static_cast<std::uint32_t>(std::stoul(val));
+                } else {
+                    throw std::invalid_argument("--model: unknown key '" + key +
+                                                "' (kv-tokens, max-num-seqs, max-model-len)");
+                }
+                if (comma == std::string::npos) { break; }
+                cursor = comma + 1;
+            }
+            if (extra.name.empty() || extra.artifact_path.empty()) {
+                throw std::invalid_argument("--model expects name=path[,key=value...]");
+            }
+            options.extra_models.push_back(std::move(extra));
         } else if (arg == "--enable-sleep-mode") {
             options.enable_sleep_mode = true;
         } else if (arg == "--enable-lora") {
@@ -465,6 +503,33 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (!options.lora_modules.empty() && !options.enable_lora) {
         throw std::invalid_argument("--lora-modules needs --enable-lora");
+    }
+    if (!options.extra_models.empty()) {
+        std::vector<std::string> names;
+        for (const auto& extra : options.extra_models) {
+            if (extra.kv_tokens == 0) {
+                throw std::invalid_argument(
+                    "--model " + extra.name +
+                    ": kv-tokens=N is required -- extra models size their KV explicitly so the "
+                    "deployment's memory split is stated, not discovered");
+            }
+            for (const auto& seen : names) {
+                if (seen == extra.name) {
+                    throw std::invalid_argument("--model: duplicate name '" + extra.name + "'");
+                }
+            }
+            names.push_back(extra.name);
+        }
+        if (options.devices.size() > 1) {
+            throw std::invalid_argument(
+                "--model extras support single-device serving today (the primary may still "
+                "pipeline; run extras on their own devices via their own flags later)");
+        }
+        if (options.enable_lora) {
+            throw std::invalid_argument(
+                "--enable-lora with --model extras is not wired yet; adapters would need "
+                "per-model namespaces");
+        }
     }
     if (options.enable_sleep_mode && options.devices.size() > 1) {
         throw std::invalid_argument(

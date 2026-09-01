@@ -431,14 +431,16 @@ void HttpServer::register_routes() {
 }
 
 void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {
-    res.set_content(make_models_list(public_model_id_, unix_time_now(),
-                                     service_->lora_adapter_names()),
+    std::vector<std::string> additional = service_->lora_adapter_names();
+    for (const auto& [name, service] : extra_services_) { additional.push_back(name); }
+    res.set_content(make_models_list(public_model_id_, unix_time_now(), additional),
                     "application/json");
 }
 
 void HttpServer::handle_model(const httplib::Request& req, httplib::Response& res) const {
     const std::string id = req.matches.size() > 1 ? req.matches[1].str() : std::string();
-    if (id != public_model_id_ && service_->lora_slot(id) < 0) {
+    if (id != public_model_id_ && service_->lora_slot(id) < 0 &&
+        extra_services_.count(id) == 0) {
         ApiError error;
         error.status  = 404;
         error.type    = "invalid_request_error";
@@ -451,6 +453,7 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
 }
 
 void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::Response& res) {
+    t_routed_service = nullptr; // keep-alive threads must not inherit a route
     nlohmann::json body;
     try {
         body = nlohmann::json::parse(req.body);
@@ -467,19 +470,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
         request                   = parse_chat_completion_request(body, limits);
-        // A request selects an adapter by naming it in `model`; the base id keeps
-        // meaning the unadapted model.
-        if (request.model != public_model_id_) {
-            if (service_->lora_slot(request.model) < 0) {
-                ApiError error;
-                error.status  = 404;
-                error.type    = "invalid_request_error";
-                error.code    = "model_not_found";
-                error.message = "model '" + request.model + "' not found";
-                throw ApiException(std::move(error));
-            }
-            request.lora_adapter = request.model;
-        }
+        // `model` selects a served model or one of the primary's adapters.
+        t_routed_service = &route_model(request.model, &request.lora_adapter);
     } catch (const ApiException& e) {
         write_error(res, e.error());
         return;
@@ -488,7 +480,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     const std::uint64_t req_id = ++request_seq_;
     PreparedRequest prepared;
     try {
-        prepared = service_->prepare(
+        prepared = svc().prepare(
             request, [&req] { return req.is_connection_alive && !req.is_connection_alive(); });
     } catch (const ApiException& e) {
         log_request_rejected(make_request_rejection_log_context(req_id, "openai_chat_completions",
@@ -516,7 +508,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
 
     if (!request.stream) {
         try {
-            const GenerationOutcome outcome = service_->run(prepared, nullptr, [&req] {
+            const GenerationOutcome outcome = svc().run(prepared, nullptr, [&req] {
                 return req.is_connection_alive && !req.is_connection_alive();
             });
             log_request_done(log_context, outcome);
@@ -547,9 +539,10 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     res.set_header("Cache-Control", "no-cache");
     res.set_header("X-Accel-Buffering", "no");
 
+    GenerationService* const routed = &svc();
     res.set_chunked_content_provider(
         "text/event-stream",
-        [this, stream, id, created, model, include_usage, tool_capable,
+        [this, stream, id, created, model, include_usage, tool_capable, routed,
          log_context](std::size_t, httplib::DataSink& sink) -> bool {
             if (stream->started) {
                 sink.done();
@@ -587,7 +580,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                            (sink.is_writable && !sink.is_writable());
                 };
 
-                const GenerationOutcome outcome = service_->run(stream->prepared, &output);
+                const GenerationOutcome outcome = routed->run(stream->prepared, &output);
                 log_request_done(log_context, outcome);
                 ensure_role();
                 const std::string_view remaining = unstreamed_content(outcome);
@@ -652,6 +645,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
 }
 
 void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Response& res) {
+    t_routed_service = nullptr;
     nlohmann::json body;
     try {
         body = nlohmann::json::parse(req.body);
@@ -666,7 +660,7 @@ void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Respo
         RequestLimits limits;
         limits.default_max_tokens       = options_.default_max_tokens;
         const GenerationRequest request = parse_messages_request(body, limits);
-        const int input_tokens          = service_->count_prompt_tokens(
+        const int input_tokens          = svc().count_prompt_tokens(
             request, [&req] { return req.is_connection_alive && !req.is_connection_alive(); });
         res.set_content(make_count_tokens_response(input_tokens), "application/json");
     } catch (const ApiException& e) {
@@ -681,6 +675,7 @@ void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Respo
 }
 
 void HttpServer::handle_messages(const httplib::Request& req, httplib::Response& res) {
+    t_routed_service = nullptr;
     nlohmann::json body;
     try {
         body = nlohmann::json::parse(req.body);
@@ -699,6 +694,10 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         // The Anthropic endpoint accepts any `model` string (Claude Code sends real
         // Claude model names) and echoes it back; it never 404s on model id.
         request = parse_messages_request(body, limits);
+        // Soft routing: an extra's served id selects it; anything else stays on
+        // the primary, preserving this endpoint's never-404 contract.
+        const auto extra = extra_services_.find(request.model);
+        if (extra != extra_services_.end()) { t_routed_service = extra->second; }
     } catch (const ApiException& e) {
         write_messages_error(res, e.error());
         return;
@@ -714,7 +713,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     const std::uint64_t req_id = ++request_seq_;
     PreparedRequest prepared;
     try {
-        prepared = service_->prepare(
+        prepared = svc().prepare(
             request, [&req] { return req.is_connection_alive && !req.is_connection_alive(); });
     } catch (const ApiException& e) {
         log_request_rejected(
@@ -742,7 +741,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
 
     if (!request.stream) {
         try {
-            const GenerationOutcome outcome = service_->run(prepared, nullptr, [&req] {
+            const GenerationOutcome outcome = svc().run(prepared, nullptr, [&req] {
                 return req.is_connection_alive && !req.is_connection_alive();
             });
             log_request_done(log_context, outcome);
@@ -773,9 +772,10 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     res.set_header("Cache-Control", "no-cache");
     res.set_header("X-Accel-Buffering", "no");
 
+    GenerationService* const routed = &svc();
     res.set_chunked_content_provider(
         "text/event-stream",
-        [this, stream, id, model, input_tokens, tool_capable,
+        [this, stream, id, model, input_tokens, tool_capable, routed,
          log_context](std::size_t, httplib::DataSink& sink) -> bool {
             if (stream->started) {
                 sink.done();
@@ -820,7 +820,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                            (sink.is_writable && !sink.is_writable());
                 };
 
-                const GenerationOutcome outcome = service_->run(stream->prepared, &output);
+                const GenerationOutcome outcome = routed->run(stream->prepared, &output);
                 log_request_done(log_context, outcome);
                 const std::string_view remaining = unstreamed_content(outcome);
 
@@ -893,6 +893,33 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
 }
 
 bool HttpServer::bind() { return server_.bind_to_port(options_.host, options_.port); }
+
+thread_local GenerationService* HttpServer::t_routed_service = nullptr;
+
+void HttpServer::attach_extra(GenerationService& service) {
+    const sinfer::LoadSummary load = service.load_summary();
+    const std::string id           = service.options().model_id_override.value_or(load.model_id);
+    if (id == public_model_id_ || extra_services_.count(id) != 0) {
+        throw std::logic_error("multi-model: served id '" + id + "' is not unique");
+    }
+    extra_services_.emplace(id, &service);
+}
+
+GenerationService& HttpServer::route_model(const std::string& model, std::string* lora_adapter) {
+    if (model == public_model_id_) { return *service_; }
+    const auto extra = extra_services_.find(model);
+    if (extra != extra_services_.end()) { return *extra->second; }
+    if (service_->lora_slot(model) >= 0) {
+        if (lora_adapter != nullptr) { *lora_adapter = model; }
+        return *service_;
+    }
+    ApiError error;
+    error.status  = 404;
+    error.type    = "invalid_request_error";
+    error.code    = "model_not_found";
+    error.message = "model '" + model + "' not found";
+    throw ApiException(std::move(error));
+}
 
 void HttpServer::attach(GenerationService& service) {
     if (service_ != nullptr) {

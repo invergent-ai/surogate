@@ -74,6 +74,38 @@ int main(int argc, char** argv) {
         const auto load_start = Clock::now();
         sinfer::serve::GenerationService service(options, load_progress.callback());
         server.attach(service);
+        // Extra models: each its own Engine in this process, constructed
+        // SEQUENTIALLY -- startup accounting (KV auto-size, the graph
+        // allowance) measures free-VRAM deltas and assumes it owns the GPU
+        // while it runs. Concurrent construction attributed one engine's
+        // allocations to another's graph capture and aborted it.
+        std::vector<std::unique_ptr<sinfer::serve::GenerationService>> extra_services;
+        for (const auto& extra : options.extra_models) {
+            sinfer::serve::ServeOptions extra_options = options;
+            extra_options.artifact_path             = extra.artifact_path;
+            extra_options.model_id_override         = extra.name;
+            extra_options.kv_capacity =
+                sinfer::KvCapacityPolicy::explicit_capacity(extra.kv_tokens);
+            if (extra.max_num_seqs != 0) { extra_options.max_concurrency = extra.max_num_seqs; }
+            if (extra.max_context != 0) { extra_options.max_context = extra.max_context; }
+            extra_options.extra_models.clear();
+            extra_options.enable_lora = false;
+            extra_options.lora_modules.clear();
+            // Speculative backends are artifact-specific; extras opt in later,
+            // per model, rather than inheriting a primary flag their artifact
+            // may not carry.
+            extra_options.speculative = {};
+            const auto extra_start = Clock::now();
+            extra_services.push_back(std::make_unique<sinfer::serve::GenerationService>(
+                extra_options, load_progress.callback()));
+            server.attach_extra(*extra_services.back());
+            std::ostringstream extra_loaded;
+            extra_loaded << "model '" << extra.name << "' loaded in "
+                         << std::chrono::duration<double>(Clock::now() - extra_start).count()
+                         << " s";
+            sinfer::serve::write_console_log(sinfer::serve::ConsoleLogLevel::Info,
+                                             extra_loaded.str());
+        }
         std::ostringstream loaded;
         loaded << "model loaded in "
                << std::chrono::duration<double>(Clock::now() - load_start).count() << " s";

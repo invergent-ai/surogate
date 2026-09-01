@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstdint>
 #include <mutex>
+#include <map>
 #include <string>
 #include <thread>
 
@@ -32,6 +33,8 @@ public:
     // Engine is ready, then listen() enters the blocking accept loop on the already-bound socket.
     bool bind();
     void attach(GenerationService& service);
+    /// An additional model served from this process; routed by its served id.
+    void attach_extra(GenerationService& service);
     bool listen();
     void stop();
 
@@ -66,6 +69,17 @@ private:
     /// Adapters this server may serve; empty unless --enable-lora named some.
     ServeOptions options_;
     std::string public_model_id_;
+    /// Extra models by served id. Built at attach time, read-only afterwards.
+    std::map<std::string, GenerationService*> extra_services_;
+    /// The service a request routed to, bound per HTTP worker thread for the
+    /// handler's duration; falls back to the primary.
+    static thread_local GenerationService* t_routed_service;
+    [[nodiscard]] GenerationService& svc() const {
+        return t_routed_service != nullptr ? *t_routed_service : *service_;
+    }
+    /// Routes `model`: an extra's id, the primary id, or a primary adapter
+    /// (writes `lora_adapter`). Throws ApiException 404 otherwise.
+    GenerationService& route_model(const std::string& model, std::string* lora_adapter);
     ResponseStore response_store_;
     JsonlRequestLog request_jsonl_;
     httplib::Server server_;

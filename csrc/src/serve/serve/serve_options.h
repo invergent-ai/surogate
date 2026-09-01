@@ -27,6 +27,19 @@ struct ServeOptions {
     int port         = 8080;
     std::string api_key;                          // empty => no auth
     std::optional<std::string> model_id_override; // unset => artifact identity.model_id
+
+    /// Additional models served from the same process (multi-model serving).
+    /// Each runs its own Engine -- arenas, worker thread, stream, graphs --
+    /// inside the shared CUDA context, which is what lets concurrent rounds
+    /// from different models overlap instead of time-slicing.
+    struct ExtraModel {
+        std::string name;          ///< served model id; requests route by it
+        std::string artifact_path;
+        std::uint32_t kv_tokens    = 0; ///< required: extras size their KV explicitly
+        std::uint32_t max_num_seqs = 0; ///< 0 = inherit the primary's
+        std::uint32_t max_context  = 0; ///< 0 = inherit the primary's
+    };
+    std::vector<ExtraModel> extra_models;
     std::string request_log_jsonl;                // empty => structured request logging disabled
     std::uint32_t max_context              = 8192;
     KvCapacityPolicy kv_capacity           = KvCapacityPolicy::explicit_capacity(8192);
