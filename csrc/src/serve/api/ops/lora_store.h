@@ -16,9 +16,11 @@
 // and what lets tokens of different adapters share a kernel.
 
 #include "api/ops/lora.h"
+#include "core/arena.h"
 
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -123,8 +125,9 @@ public:
 private:
     struct Bank {
         LoraBank view;
-        void* a = nullptr;
-        void* b = nullptr;
+        void* a  = nullptr;
+        void* b  = nullptr;
+        bool raw = false; ///< individually cudaMalloc'd (pre-freeze path); arena otherwise
     };
     struct Key {
         const void* weight = nullptr;
@@ -139,6 +142,11 @@ private:
         }
     };
     std::unordered_map<Key, Bank, KeyHash> banks_;
+    /// One arena for every registered bank plus the scratch and the slot cell,
+    /// allocated by ensure_banks. It is an owning DeviceArena, so under sleep
+    /// mode it joins the engine's sleepable estate as an Offload region: a
+    /// slept model's adapters leave VRAM with it and come back byte-identical.
+    std::unique_ptr<DeviceArena> storage_;
     std::map<std::pair<std::int32_t, std::string>, ModuleBinding> directory_;
     std::map<std::string, std::string> refusals_;
     std::map<std::pair<std::int32_t, std::string>, std::string> layer_refusals_;
@@ -149,6 +157,8 @@ private:
     std::int32_t slots_    = 0;
     std::int32_t max_rank_ = 0;
     bool active_           = false;
+    bool raw_round_state_  = false; ///< scratch/cell cudaMalloc'd (directory-less use)
+    void ensure_raw_round_state();
 };
 
 /// The engine-bound store (via the thread's ops context; the process default

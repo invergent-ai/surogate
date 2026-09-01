@@ -513,6 +513,13 @@ void GenerationService::load_lora_adapter(const std::string& name, const std::st
     if (!store.has_bindings()) {
         throw std::invalid_argument("this target does not apply adapters");
     }
+    // The banks live in the engine's sleepable estate now, so uploading into a
+    // slept model would write into unmapped memory.
+    if (engine_->is_sleeping()) {
+        throw std::invalid_argument(
+            "the model is asleep; wake it (POST /wake_up, or send it a request) before loading "
+            "an adapter");
+    }
     // Parse and validate outside the lock -- reading safetensors can take a
     // moment and requests resolving names must not wait on it.
     LoraRegistry registry;
@@ -574,6 +581,14 @@ void GenerationService::unload_lora_adapter(const std::string& name) {
         }
         slot = found->second;
         lora_slot_of_.erase(found);
+    }
+    if (engine_->is_sleeping()) {
+        // Undo the erase and refuse: clearing banks in a slept model would write
+        // into unmapped memory.
+        const std::lock_guard<std::mutex> relock(lora_mutex_);
+        lora_slot_of_[name] = slot;
+        throw std::invalid_argument(
+            "the model is asleep; wake it before unloading an adapter");
     }
     // Zeroed, not freed: a request already in flight that selected this slot adds
     // nothing from here on -- it degrades to the base model instead of reading

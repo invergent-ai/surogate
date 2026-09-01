@@ -14,6 +14,7 @@
 #include <map>
 #include <mutex>
 #include <stdexcept>
+#include <vector>
 
 namespace sinfer::ops {
 namespace {
@@ -44,11 +45,15 @@ void* upload_zeroed(std::size_t elements) {
 
 LoraStore::~LoraStore() {
     for (auto& [key, bank] : banks_) {
-        cudaFree(bank.a);
-        cudaFree(bank.b);
+        if (bank.raw) {
+            cudaFree(bank.a);
+            cudaFree(bank.b);
+        }
     }
-    cudaFree(scratch_);
-    cudaFree(uniform_cell_);
+    if (raw_round_state_) {
+        cudaFree(scratch_);
+        cudaFree(uniform_cell_);
+    }
 }
 
 void LoraStore::configure(std::int32_t slots, std::int32_t max_rank, std::int32_t max_tokens) {
@@ -61,11 +66,20 @@ void LoraStore::configure(std::int32_t slots, std::int32_t max_rank, std::int32_
     slots_          = slots;
     max_rank_       = max_rank;
     scratch_tokens_ = max_tokens;
+    // The device memory -- scratch, slot cell, banks -- is allocated by
+    // ensure_banks, in one arena, so that under sleep mode the whole adapter
+    // estate is a single Offload region of the engine. Direct users that never
+    // register a directory (tools, tests) get raw allocations lazily below.
+}
+
+void LoraStore::ensure_raw_round_state() {
+    if (scratch_ != nullptr) { return; }
     // Wide enough for a split site's low vectors: up to three pairs share one
     // launch, each padded to max_rank.
-    scratch_        = upload_zeroed(static_cast<std::size_t>(kLoraFusedPairLimit) * max_rank *
-                               max_tokens);
+    scratch_ = upload_zeroed(static_cast<std::size_t>(kLoraFusedPairLimit) * max_rank_ *
+                             scratch_tokens_);
     CUDA_CHECK(cudaMalloc(&uniform_cell_, sizeof(std::int32_t)));
+    raw_round_state_        = true;
     const std::int32_t none = -1;
     CUDA_CHECK(cudaMemcpy(uniform_cell_, &none, sizeof(none), cudaMemcpyHostToDevice));
 }
@@ -102,7 +116,9 @@ void LoraStore::set_slot(const void* base_key, std::int32_t port, std::int32_t s
                 "created by ensure_banks before serving so captured graphs and the lock-free "
                 "find() stay valid; register the module in the target's directory");
         }
+        ensure_raw_round_state();
         Bank bank;
+        bank.raw = true;
         const std::size_t a_elements =
             static_cast<std::size_t>(slots_) * max_rank_ * in_dim;
         const std::size_t b_elements =
@@ -182,12 +198,49 @@ void LoraStore::register_layer_refusal(std::int32_t layer, std::string module, s
 
 void LoraStore::ensure_banks() {
     if (slots_ == 0) { throw std::logic_error("lora_store: configure() first"); }
+    // Everything in one owning arena: bank pairs for every registered module,
+    // the round scratch, the uniform slot cell. Allocated here -- inside the
+    // engine's construction window -- so under sleep mode it registers as one
+    // sleepable Offload region and a slept model's adapters leave VRAM with it.
+    std::size_t total = static_cast<std::size_t>(kLoraFusedPairLimit) * max_rank_ *
+                            scratch_tokens_ * sizeof(std::uint16_t) +
+                        256; // cell + alignment slack
+    struct Planned {
+        Key key;
+        std::size_t a_bytes;
+        std::size_t b_bytes;
+        const ModuleBinding* binding;
+    };
+    std::vector<Planned> planned;
     for (const auto& [where, binding] : directory_) {
         const Key key{binding.key, binding.port};
         if (banks_.find(key) != banks_.end()) { continue; }
+        bool queued = false;
+        for (const auto& item : planned) {
+            if (item.key == key) { queued = true; break; }
+        }
+        if (queued) { continue; }
+        const std::size_t a_bytes =
+            static_cast<std::size_t>(slots_) * max_rank_ * binding.in * sizeof(std::uint16_t);
+        const std::size_t b_bytes =
+            static_cast<std::size_t>(slots_) * binding.out * max_rank_ * sizeof(std::uint16_t);
+        planned.push_back({key, a_bytes, b_bytes, &binding});
+        total += a_bytes + b_bytes + 512;
+    }
+    storage_ = std::make_unique<DeviceArena>(total);
+    CUDA_CHECK(cudaMemset(storage_->base(), 0, storage_->capacity()));
+    scratch_ = storage_
+                   ->alloc_bytes(static_cast<std::size_t>(kLoraFusedPairLimit) * max_rank_ *
+                                 scratch_tokens_ * sizeof(std::uint16_t))
+                   .data;
+    uniform_cell_ = static_cast<std::int32_t*>(storage_->alloc_bytes(sizeof(std::int32_t)).data);
+    const std::int32_t none = -1;
+    CUDA_CHECK(cudaMemcpy(uniform_cell_, &none, sizeof(none), cudaMemcpyHostToDevice));
+    for (const Planned& item : planned) {
+        const ModuleBinding& binding = *item.binding;
         Bank bank;
-        bank.a             = upload_zeroed(static_cast<std::size_t>(slots_) * max_rank_ * binding.in);
-        bank.b             = upload_zeroed(static_cast<std::size_t>(slots_) * binding.out * max_rank_);
+        bank.a             = storage_->alloc_bytes(item.a_bytes).data;
+        bank.b             = storage_->alloc_bytes(item.b_bytes).data;
         bank.view.a        = bank.a;
         bank.view.b        = bank.b;
         bank.view.a_stride = static_cast<std::int64_t>(max_rank_) * binding.in;
@@ -195,7 +248,7 @@ void LoraStore::ensure_banks() {
         bank.view.rank     = max_rank_;
         bank.view.n        = binding.out;
         bank.view.k        = binding.in;
-        banks_.emplace(key, bank);
+        banks_.emplace(item.key, bank);
     }
     frozen_ = true;
 }
