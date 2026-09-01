@@ -68,8 +68,11 @@ public:
     /// first; holding the execution mutex during the transition guarantees the
     /// worker loop is parked, not mid-round.
     void set_asleep(bool asleep) {
-        std::lock_guard lock(queue_mutex_);
-        asleep_ = asleep;
+        {
+            std::lock_guard lock(queue_mutex_);
+            asleep_ = asleep;
+        }
+        queue_cv_.notify_all();
     }
     [[nodiscard]] bool asleep() const {
         std::lock_guard lock(queue_mutex_);
@@ -1418,13 +1421,18 @@ private:
         for (;;) {
             {
                 std::unique_lock lock(queue_mutex_);
+                // Preemptive sleep parks the loop here between rounds even with
+                // active lanes; their state is in the offloaded arenas and the
+                // requests resume exactly where they stopped after wake.
+                queue_cv_.wait(lock, [&] { return !asleep_ || stopping_; });
                 if (!stopping_ && pending_.empty()) {
                     bool active = false;
                     for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
                         active = active || slots_[lane] != nullptr;
                     }
                     if (!active) {
-                        queue_cv_.wait(lock, [&] { return stopping_ || !pending_.empty(); });
+                        queue_cv_.wait(lock,
+                                       [&] { return stopping_ || (!pending_.empty() && !asleep_); });
                     }
                 }
                 if (stopping_) {

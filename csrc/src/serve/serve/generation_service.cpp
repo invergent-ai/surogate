@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <thread>
 #include <cstddef>
 #include <mutex>
@@ -591,6 +592,11 @@ void GenerationService::sleep() {
     // the engine rejects anything that arrives after this line.
     // (Engine::sleep is idempotent, so two racing sleeps are both fine.)
     engine_->sleep_begin();
+    static const bool preempt = std::getenv("SUROGATE_SLEEP_PREEMPT") != nullptr;
+    if (preempt) {
+        engine_->sleep();
+        return;
+    }
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
     while (true) {
         {
