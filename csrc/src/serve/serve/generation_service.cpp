@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <thread>
 #include <cstddef>
 #include <mutex>
 #include <stdexcept>
@@ -253,6 +254,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.media_live_bytes         = options_.media_live_bytes;
     engine_options.media_preprocess_threads = options_.media_preprocess_threads;
     engine_options.chat_template_override   = options_.chat_template;
+    engine_options.sleep_enable             = options_.enable_sleep_mode;
     // The adapter's tensors, decoded on the host. The target binds them to its own
     // weights; a module the target cannot place is refused there rather than
     // dropped, because a partly applied adapter is worse than none.
@@ -580,6 +582,32 @@ void GenerationService::unload_lora_adapter(const std::string& name) {
     const std::lock_guard<std::mutex> lock(lora_mutex_);
     lora_free_slots_.push_back(slot);
 }
+
+void GenerationService::sleep() {
+    if (!options_.enable_sleep_mode) {
+        throw std::invalid_argument("the server was started without --enable-sleep-mode");
+    }
+    // Refusing new submissions first turns the drain below into a bounded wait:
+    // the engine rejects anything that arrives after this line.
+    // (Engine::sleep is idempotent, so two racing sleeps are both fine.)
+    engine_->sleep_begin();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+    while (true) {
+        {
+            const std::lock_guard<std::mutex> lock(request_capacity_->mutex);
+            if (request_capacity_->active == 0) { break; }
+        }
+        if (std::chrono::steady_clock::now() > deadline) {
+            engine_->wake();
+            throw std::runtime_error(
+                "sleep timed out waiting for in-flight requests to finish; the model stays awake");
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    engine_->sleep();
+}
+
+void GenerationService::wake_up() { engine_->wake(); }
 
 void GenerationService::warmup() {
     try {

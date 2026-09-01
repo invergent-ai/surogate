@@ -135,6 +135,14 @@ public:
 
     void warmup();
 
+    /// Sleep level 1 (vLLM parity): refuse new work, wait for in-flight
+    /// requests to finish, then release the model's VRAM with its state parked
+    /// in host RAM. `wake_up` restores it; requests then run against
+    /// byte-identical state. Both are idempotent.
+    void sleep();
+    void wake_up();
+    [[nodiscard]] bool is_sleeping() const { return engine_->is_sleeping(); }
+
 private:
     [[nodiscard]] std::shared_ptr<RequestLifetime> acquire_request_lifetime() const;
 

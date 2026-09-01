@@ -89,6 +89,24 @@ public:
 
     [[nodiscard]] const EngineOptions& options() const;
     [[nodiscard]] LoadSummary load_summary() const;
+    /// Sleep level 1: back the model's device memory up to pinned host and
+    /// release the physical VRAM, keeping every virtual address (and therefore
+    /// every captured CUDA graph) valid. New submissions are refused while
+    /// asleep; in-flight work must be drained by the caller first. Requires the
+    /// engine to have been built with sleepable allocations (EngineOptions
+    /// sleep_enable). Idempotent.
+    void sleep();
+    /// First half of sleep on its own: refuse new submissions while leaving
+    /// in-flight requests to finish. The caller drains, then calls sleep().
+    /// wake() undoes it if the drain is abandoned.
+    void sleep_begin();
+    /// Map fresh physical memory at the original addresses and restore the
+    /// backup. After this, requests run against byte-identical state -- the
+    /// prefix cache survives a sleep. Throws if VRAM was taken by another
+    /// process meanwhile; the engine stays asleep and the call can be retried.
+    void wake();
+    [[nodiscard]] bool is_sleeping() const;
+
     [[nodiscard]] MemorySummary memory_summary() const;
     [[nodiscard]] RuntimeStats runtime_stats() const;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;

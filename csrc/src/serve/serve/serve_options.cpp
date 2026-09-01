@@ -119,6 +119,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--spec mtp|dflash --draft-tokens N] "
            "[--default-max-tokens N] "
            "[--vision] [--enforce-eager] [--no-prefix-reuse] "
+           "[--enable-sleep-mode] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -149,6 +150,8 @@ std::string serve_usage_text(const char* argv0) {
            "         resumes from its prefix instead of re-prefilling it; one state slot per lane\n"
            "         (72 MiB each on the 27B), off by default\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
+           "       --enable-sleep-mode adds POST /sleep and /wake_up: sleeping releases VRAM\n"
+           "                           (weights and cache parked in host RAM), waking restores in ~a second\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
@@ -363,6 +366,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.enable_auto_tool_choice = true;
         } else if (arg == "--chat-template") {
             options.chat_template_path = require_value("--chat-template");
+        } else if (arg == "--enable-sleep-mode") {
+            options.enable_sleep_mode = true;
         } else if (arg == "--enable-lora") {
             options.enable_lora = true;
         } else if (arg == "--lora-modules") {
@@ -460,6 +465,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (!options.lora_modules.empty() && !options.enable_lora) {
         throw std::invalid_argument("--lora-modules needs --enable-lora");
+    }
+    if (options.enable_sleep_mode && options.devices.size() > 1) {
+        throw std::invalid_argument(
+            "--enable-sleep-mode supports single-device serving today; pipeline stages would "
+            "each need their own sleep transition");
     }
     if (options.enable_lora) {
         // Zero modules is a valid start: adapters can arrive later through

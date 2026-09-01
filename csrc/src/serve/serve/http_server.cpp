@@ -323,6 +323,50 @@ void HttpServer::register_routes() {
                    [this](const httplib::Request& req, httplib::Response& res) {
                        handle_response_delete(req, res);
                    });
+    // vLLM's sleep-mode routes: sleeping releases VRAM (state parked in host
+    // RAM), waking restores it in about the PCIe copy time. Generation while
+    // asleep is refused by the engine with a 503 naming /wake_up.
+    server_.Post("/sleep", [this](const httplib::Request& req, httplib::Response& res) {
+        if (!options_.enable_sleep_mode) {
+            res.status = 400;
+            res.set_content("the server was started without --enable-sleep-mode", "text/plain");
+            return;
+        }
+        const std::string level = req.get_param_value("level");
+        if (!level.empty() && level != "1") {
+            res.status = 400;
+            res.set_content("only sleep level 1 is implemented (weights parked in host RAM); "
+                            "level 2 (discard weights) is not",
+                            "text/plain");
+            return;
+        }
+        try {
+            service_->sleep();
+        } catch (const std::exception& e) {
+            res.status = 500;
+            res.set_content(e.what(), "text/plain");
+            return;
+        }
+        log_line("sleep: model asleep, VRAM released");
+        res.set_content("{\"is_sleeping\": true}", "application/json");
+    });
+    server_.Post("/wake_up", [this](const httplib::Request&, httplib::Response& res) {
+        try {
+            service_->wake_up();
+        } catch (const std::exception& e) {
+            res.status = 500;
+            res.set_content(e.what(), "text/plain");
+            return;
+        }
+        log_line("sleep: model awake");
+        res.set_content("{\"is_sleeping\": false}", "application/json");
+    });
+    server_.Get("/is_sleeping", [this](const httplib::Request&, httplib::Response& res) {
+        res.set_content(service_->is_sleeping() ? "{\"is_sleeping\": true}"
+                                                : "{\"is_sleeping\": false}",
+                        "application/json");
+    });
+
     // vLLM's runtime adapter management routes, same request bodies.
     server_.Post("/v1/load_lora_adapter", [this](const httplib::Request& req,
                                                  httplib::Response& res) {

@@ -64,6 +64,29 @@ public:
         worker_ = std::thread([this] { worker_loop(); });
     }
 
+    /// Refuse new submissions while asleep. The caller drains in-flight work
+    /// first; holding the execution mutex during the transition guarantees the
+    /// worker loop is parked, not mid-round.
+    void set_asleep(bool asleep) {
+        std::lock_guard lock(queue_mutex_);
+        asleep_ = asleep;
+    }
+    [[nodiscard]] bool asleep() const {
+        std::lock_guard lock(queue_mutex_);
+        return asleep_;
+    }
+    [[nodiscard]] std::unique_lock<std::mutex> pause_execution() {
+        return std::unique_lock<std::mutex>(execution_mutex_);
+    }
+    [[nodiscard]] bool any_active_lane() const {
+        std::lock_guard lock(queue_mutex_);
+        if (!pending_.empty()) { return true; }
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            if (slots_[lane] != nullptr) { return true; }
+        }
+        return false;
+    }
+
     ~ConcurrentExecutor() noexcept {
         {
             std::lock_guard lock(queue_mutex_);
@@ -137,6 +160,10 @@ public:
         std::uint64_t request_id = 0;
         {
             std::lock_guard lock(queue_mutex_);
+            if (asleep_) {
+                throw RequestError(RequestErrorKind::Unavailable,
+                                   "the model is asleep; wake it with POST /wake_up");
+            }
             if (stopping_ || failed_) {
                 throw RequestError(RequestErrorKind::Unavailable,
                                    "inference engine is unavailable");
@@ -1630,6 +1657,7 @@ private:
     mutable std::mutex queue_mutex_;
     mutable std::mutex stats_mutex_;
     std::condition_variable queue_cv_;
+    bool asleep_ = false; ///< guarded by queue_mutex_; set by sleep(), cleared by wake()
     std::deque<std::shared_ptr<Request>> pending_;
     std::size_t outstanding_       = 0;
     std::uint64_t next_request_id_ = 1;

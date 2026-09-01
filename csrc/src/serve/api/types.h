@@ -124,6 +124,9 @@ struct EngineOptions {
     /// preallocated and the delta kernels captured, so adapters loaded later
     /// through the runtime endpoints work under the graphs recorded at startup.
     bool lora_enable = false;
+    /// Route the long-lived device arenas through VMM-backed regions so the
+    /// engine can sleep (release VRAM, addresses stable) and wake fast.
+    bool sleep_enable = false;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
     // Storage of the pinned host expert bank. Q4G32AM (4-bit affine groups requantised from
     // the artifact's W8 at load) is 59 % of the bytes and near-exact for Q4_K-derived experts,

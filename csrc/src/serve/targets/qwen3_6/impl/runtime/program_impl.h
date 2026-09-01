@@ -1,3 +1,4 @@
+#include "core/sleep.h"
 #include "ops/linear/marlin/marlin_plane.h"
 #include "ops/linear/w8a8/w4fp4_plane.h"
 #include "ops/linear/w8a8/w8fp8_plane.h"
@@ -270,6 +271,13 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     if (model.weights_arena == nullptr) {
         throw std::invalid_argument("Qwen3.6 model view has no owning weight arena");
     }
+    // Sleep mode: the workspace is per-round scratch, fully rewritten before any
+    // read, so its pages can be dropped rather than backed up to host. The
+    // persistent arena keeps the Offload default -- it holds KV values and
+    // init-once fills (position cells, zeroed states, table rows) that must
+    // come back byte-identical, and backing it up also keeps the prefix cache
+    // warm across a sleep.
+    sleep_tag_region(workspace_storage.base(), SleepTag::Discard);
     if (model.features != plan.features || model.mtp.has_value() != plan.features.mtp() ||
         model.dflash.has_value() != plan.features.dflash() ||
         model.optimized_proposal.has_value() != plan.features.optimized_proposal() ||

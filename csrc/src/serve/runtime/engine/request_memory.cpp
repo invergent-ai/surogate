@@ -2,6 +2,7 @@
 
 #include "core/arena.h"
 #include "core/device.h"
+#include "core/sleep.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -23,6 +24,9 @@ public:
         if (capacity != 0) {
             CUDA_CHECK(cudaSetDevice(device));
             arena = std::make_unique<DeviceArena>(capacity);
+            // Per-request transient scratch: activated and rewritten for each
+            // request, so sleep can drop its pages instead of backing them up.
+            sleep_tag_region(arena->base(), SleepTag::Discard);
         }
     }
 

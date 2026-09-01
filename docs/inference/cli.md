@@ -101,6 +101,12 @@ frequently strip it. `dflash` needs a drafter checkpoint that is converted in
 alongside the model. Either way a model without one refuses at startup, naming
 what is missing, rather than silently serving unaccelerated.
 
+### Sleep mode
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--enable-sleep-mode` | off | Adds `POST /sleep` and `POST /wake_up`. Sleeping releases the model's VRAM with all state parked in host RAM; waking restores it in about a second. Single-device serving. |
+
 ### LoRA adapters
 
 Serve PEFT adapters beside the base model, several at once, each addressable by

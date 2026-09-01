@@ -89,6 +89,7 @@ struct ServeOptions {
         std::string path;
     };
     bool enable_lora = false;
+    bool enable_sleep_mode = false;
     std::vector<LoraModule> lora_modules;
     std::uint32_t max_loras     = 1;
     std::uint32_t max_lora_rank = 16;

@@ -1,5 +1,7 @@
 #include "core/arena.h"
 
+#include "core/sleep.h"
+
 #include <cuda_runtime.h>
 
 #include <cstdio>
@@ -39,6 +41,7 @@ std::uintptr_t align_up_addr(std::uintptr_t addr, std::size_t align) {
 
 void free_device(void*& ptr) noexcept {
     if (ptr != nullptr) {
+        if (sleep_free(ptr)) { return; } // a sleepable region owns its own teardown
         log_cuda_error("cudaFree", cudaFree(ptr));
         ptr = nullptr;
     }
@@ -134,6 +137,23 @@ DeviceArena::Scope::Scope(Scope&& other) noexcept
 DeviceArena::DeviceArena(std::size_t capacity_bytes) {
     if (capacity_bytes == 0) {
         throw std::invalid_argument("DeviceArena capacity must be nonzero");
+    }
+
+    // Sleep mode routes the long-lived arenas through VMM-backed regions whose
+    // addresses survive an unmap/remap cycle -- everything below (tensors,
+    // captured graphs) holds raw pointers into this storage, so sleeping must
+    // never move it. The registry's default tag is Offload: contents are
+    // restored byte-identical unless a call site explicitly opts into Discard.
+    if (sleepable_allocations_enabled()) {
+        int device              = 0;
+        const cudaError_t which = cudaGetDevice(&device);
+        if (which != cudaSuccess) {
+            throw std::runtime_error(cuda_error_message("cudaGetDevice failed", which));
+        }
+        base_ = sleep_alloc(capacity_bytes, device);
+        cap_  = capacity_bytes;
+        off_  = 0;
+        return;
     }
 
     void* ptr             = nullptr;

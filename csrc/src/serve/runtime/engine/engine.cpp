@@ -7,6 +7,7 @@
 #include "ops/linear/w8a8/w4fp4_plane.h"
 #include "ops/linear/marlin/marlin_plane.h"
 #include "ops/linear/w8a8/w8fp8_plane.h"
+#include "core/sleep.h"
 #include "runtime/engine/concurrent_executor.h"
 #include "targets/registry.h"
 
@@ -164,6 +165,10 @@ public:
         // surogate vendor patch (PATCHES.md #20): the engine opts into the
         // derived FP8 prefill plane (op tests stay int8-exact by default;
         // SUROGATE_SERVE_FP8_PREFILL=0 vetoes).
+        // Sleep mode: every owning DeviceArena constructed while this is set
+        // becomes a VMM-backed sleepable region. Scoped to target construction
+        // so arenas made elsewhere (tests, later tools) stay ordinary.
+        set_sleepable_allocations(options.sleep_enable);
         ops::detail::w8fp8_plane_set_enabled(true);
         ops::detail::marlin_plane_set_enabled(true);
         ops::detail::marlin_set_fixed_m(static_cast<int>(options.max_concurrency));
@@ -220,6 +225,7 @@ public:
                 }
             },
             active);
+        set_sleepable_allocations(false);
     }
 
     ~Impl() noexcept {
@@ -374,6 +380,88 @@ const EngineOptions& Engine::options() const {
 LoadSummary Engine::load_summary() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return impl_->load;
+}
+
+void Engine::sleep_begin() {
+    auto& impl = *impl_;
+    if (!impl.options.sleep_enable) {
+        throw std::logic_error("the engine was built without sleep_enable");
+    }
+    std::visit(
+        [&](auto& executor) {
+            using Executor = std::remove_cvref_t<decltype(executor)>;
+            if constexpr (std::is_same_v<Executor, std::monostate>) {
+                throw std::logic_error("concurrent Engine executor is unavailable");
+            } else {
+                executor->set_asleep(true);
+            }
+        },
+        impl.executor);
+}
+
+void Engine::sleep() {
+    auto& impl = *impl_;
+    if (!impl.options.sleep_enable) {
+        throw std::logic_error("the engine was built without sleep_enable");
+    }
+    std::visit(
+        [&](auto& executor) {
+            using Executor = std::remove_cvref_t<decltype(executor)>;
+            if constexpr (std::is_same_v<Executor, std::monostate>) {
+                throw std::logic_error("concurrent Engine executor is unavailable");
+            } else {
+                if (device_asleep(impl.device.device)) { return; } // idempotent
+                executor->set_asleep(true);
+                if (executor->any_active_lane()) {
+                    executor->set_asleep(false);
+                    throw std::logic_error(
+                        "sleep requires a drained engine; requests are still in flight");
+                }
+                // With submissions refused and no active lanes, the worker loop
+                // is parked on its queue wait; holding the execution mutex makes
+                // that certain before touching memory.
+                auto paused = executor->pause_execution();
+                impl.device.synchronize();
+                const std::size_t released = sleep_device(impl.device.device);
+                std::fprintf(stderr, "engine: asleep, released %.2f GiB of device memory\n",
+                             static_cast<double>(released) / (1024.0 * 1024.0 * 1024.0));
+            }
+        },
+        impl.executor);
+}
+
+void Engine::wake() {
+    auto& impl = *impl_;
+    std::visit(
+        [&](auto& executor) {
+            using Executor = std::remove_cvref_t<decltype(executor)>;
+            if constexpr (std::is_same_v<Executor, std::monostate>) {
+                throw std::logic_error("concurrent Engine executor is unavailable");
+            } else {
+                if (device_asleep(impl.device.device)) {
+                    auto paused = executor->pause_execution();
+                    const std::size_t mapped = wake_device(impl.device.device);
+                    impl.device.synchronize();
+                    std::fprintf(stderr, "engine: awake, restored %.2f GiB of device memory\n",
+                                 static_cast<double>(mapped) / (1024.0 * 1024.0 * 1024.0));
+                }
+                executor->set_asleep(false);
+            }
+        },
+        impl.executor);
+}
+
+bool Engine::is_sleeping() const {
+    return std::visit(
+        [](auto& executor) -> bool {
+            using Executor = std::remove_cvref_t<decltype(executor)>;
+            if constexpr (std::is_same_v<Executor, std::monostate>) {
+                return false;
+            } else {
+                return executor->asleep();
+            }
+        },
+        impl_->executor);
 }
 
 MemorySummary Engine::memory_summary() const {

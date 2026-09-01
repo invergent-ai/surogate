@@ -33,6 +33,9 @@ reports, which is how you keep a client's hard-coded model string working.
 | `GET` | `/v1/models`, `/v1/models/{id}` | Model listing |
 | `POST` | `/v1/messages` | **Anthropic** Messages API |
 | `POST` | `/v1/messages/count_tokens` | **Anthropic** token counting |
+| `POST` | `/sleep` | Release the model's VRAM, state parked in host RAM (`--enable-sleep-mode`) |
+| `POST` | `/wake_up` | Restore the model; sub-second for most models |
+| `GET` | `/is_sleeping` | Sleep state |
 | `POST` | `/v1/load_lora_adapter` | Load a PEFT adapter at runtime (`--enable-lora` servers) |
 | `POST` | `/v1/unload_lora_adapter` | Unload an adapter by name |
 | `GET` | `/health` | Readiness probe |
@@ -99,6 +102,31 @@ curl -N http://127.0.0.1:8080/v1/chat/completions \
        "stream_options":{"include_usage":true},
        "messages":[{"role":"user","content":"Count to five."}]}'
 ```
+
+## Sleep mode
+
+On a server started with `--enable-sleep-mode`, the model can release its VRAM
+without shutting down, mirroring vLLM's endpoints:
+
+```bash
+curl -X POST -d '' http://localhost:8080/sleep      # level 1 (the only level)
+curl -X POST -d '' http://localhost:8080/wake_up
+curl http://localhost:8080/is_sleeping
+```
+
+Sleeping waits for in-flight requests to finish, then copies the model's device
+memory — weights, KV cache, every piece of state — into pinned host RAM and
+releases the physical VRAM. Waking copies it back at PCIe speed and the server
+resumes exactly where it was: identical outputs, prefix cache intact, no
+recapture. Measured on a 27B (30 GiB of device state): sleeping leaves ~800 MiB
+resident, waking takes ~0.6 s. The first sleep also allocates the pinned host
+backup, which takes several seconds once; the backup is weights-plus-cache
+sized, so budget host RAM accordingly.
+
+While asleep, `/health` answers normally and generation requests get a 503
+naming `/wake_up`. Send an empty body (`-d ''`) with the bare POSTs — a POST
+with neither body nor `Content-Length` waits out a read timeout before the
+server acts.
 
 ## LoRA adapters at runtime
 
