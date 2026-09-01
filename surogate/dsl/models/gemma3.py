@@ -254,6 +254,13 @@ def _build_gemma3_model(
     cls.sliding_rope_theta = sliding_rope_theta
     cls.full_rope_theta = full_rope_theta
     cls.D = head_size
+    # Gemma 3 rotates the whole head; the serve contract reads this off the
+    # declaration rather than assuming rotary_dim == head_size, because the
+    # Qwen3.x family it shares a runtime with rotates only part of one.
+    cls.rotary_dim = head_size
+    # Surfaced for the serve contract: the same factor ScaledEmbedding applies
+    # below, so the engine scales identically rather than rediscovering it.
+    cls.embedding_scale = float(d_model) ** 0.5
 
     cls.block_types = _parse_gemma3_layer_types(layer_types, n_layers, sliding_window_pattern)
     cls.n_sliding_blocks = sum(1 for t in cls.block_types if t == "sliding")

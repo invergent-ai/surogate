@@ -209,6 +209,14 @@ def from_dsl(
         linear_attention=linear_attention,
         native_context=int(config.get("max_seq") or TargetSpec.native_context),
         attention_interval=int(config.get("full_attention_interval", 4)),
+        # A windowed model states all three or none of them: the window itself,
+        # how often a layer escapes it, and the base its windowed layers rotate
+        # at. Read from the declaration, which is where the checkpoint's own
+        # config was mapped.
+        sliding_window=int(config.get("sliding_window", 0) or 0),
+        sliding_window_period=int(config.get("sliding_window_pattern", 0) or 0),
+        sliding_rope_theta=float(config.get("sliding_rope_theta", 0.0) or 0.0),
+        embedding_scale=float(config.get("embedding_scale", 0.0) or 0.0),
         params=_params(ir),
         **overrides,
     )

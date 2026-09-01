@@ -1698,6 +1698,10 @@ def compile_model_spec(
             _important_int_attrs = {"d_ff"}
             _important_float_attrs = {
                 "routed_scaling_factor",
+                # Gemma scales its embedding lookup by sqrt(hidden). The serving
+                # engine has to apply the same factor, and reading it off the
+                # declaration is what stops the two from drifting apart.
+                "embedding_scale",
                 "sliding_rope_theta",
                 "sliding_partial_rotary_factor",
                 "full_rope_theta",

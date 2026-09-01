@@ -103,6 +103,29 @@ class TargetSpec:
     #: family constant", which only a target sharing that family's tokenizer may.
     token_domain: int = 0
 
+    #: Causal sliding-window attention. Zero is a model whose every layer sees
+    #: the whole context. When set, a query at position i admits keys j with
+    #: ``i - j < sliding_window`` -- exactly `sliding_window` keys including its
+    #: own, which is FlashAttention's ``window_size=(sliding_window - 1, 0)`` and
+    #: the convention vLLM passes for Gemma 3.
+    sliding_window: int = 0
+
+    #: Layers whose attention is windowed, as a repeating period: with
+    #: `sliding_window_period` 6, every 6th layer sees the whole context and the
+    #: other five are windowed. Zero means the window, if any, applies to every
+    #: layer.
+    sliding_window_period: int = 0
+
+    #: Rope base for windowed layers. Gemma 3 rotates its local layers 100x
+    #: faster than its global ones, so one theta cannot describe the model.
+    #: Zero means every layer uses `rope_theta`.
+    sliding_rope_theta: float = 0.0
+
+    #: Embedding scale applied after the lookup. Gemma multiplies by
+    #: sqrt(hidden), downcast to the activation dtype before the multiply --
+    #: doing it in fp32 and rounding after gives a different answer.
+    embedding_scale: float = 0.0
+
     def validate(self) -> None:
         if not self.name.isidentifier():
             raise ValueError(f"target name {self.name!r} must be a C++ identifier")
