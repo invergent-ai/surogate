@@ -6,6 +6,7 @@
 // input.  The test never reproduces the device RNG algorithm or uses another
 // production path as a golden.
 #include "api/ops/sampling.h"
+#include "ops/common/sampling_workspace.h"
 #include "ops/op_tester.h"
 
 #include <algorithm>
@@ -587,14 +588,27 @@ int main() {
         return 77;
     }
 
-    int failures            = 0;
-    const std::size_t at_16 = ops::sampling_workspace_capacity_bytes(257, 16, 16);
-    if (ops::sampling_workspace_capacity_bytes(256, 1, 16) != 0 || at_16 == 0 ||
-        ops::sampling_workspace_capacity_bytes(257, 17, 17) != 0 ||
-        ops::sampling_workspace_capacity_bytes(257, 1, 17) != at_16) {
-        std::cerr << "sampling workspace route boundary contract failed\n";
-        ++failures;
-    }
+    int failures = 0;
+    // The multi-block column cap is read from kSamplerMaxColumns, not restated.
+    // It has moved twice -- 16, then 32, then tied to the ops batch bound -- and
+    // the literal 16 these boundaries used to carry went stale silently both
+    // times. The header defining it says "Never hardcode it again"; that applies
+    // on this side of the contract too.
+    constexpr std::int32_t kCap = ops::kSamplerMaxColumns;
+    const auto capacity = [](std::int32_t domain, std::int32_t lo, std::int32_t hi) {
+        return ops::sampling_workspace_capacity_bytes(domain, lo, hi);
+    };
+    const auto expect = [&](bool ok, const char* what) {
+        if (!ok) {
+            std::cerr << "sampling workspace route boundary: " << what << "\n";
+            ++failures;
+        }
+    };
+    expect(capacity(256, 1, kCap) == 0, "sized a domain that fits one sampler tile");
+    expect(capacity(257, kCap, kCap) != 0, "reported no capacity at the column cap");
+    expect(capacity(257, kCap + 1, kCap + 1) == 0, "sized a round past the column cap");
+    expect(capacity(257, 1, kCap + 1) == capacity(257, 1, kCap),
+           "did not saturate an interval that runs past the column cap");
     try {
         (void)ops::sampling_workspace_capacity_bytes(257, 0, 16);
         std::cerr << "sampling workspace accepted an invalid lane interval\n";

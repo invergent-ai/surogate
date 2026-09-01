@@ -41,9 +41,15 @@ int main() {
                           defaults.media_live_bytes == sinfer::kDefaultMediaLiveBytes &&
                           defaults.media_preprocess_threads == 0,
                       "media preparation resource defaults mismatch");
-    failures += check(defaults.kv_capacity.mode == sinfer::KvCapacityMode::Explicit &&
-                          defaults.kv_capacity.explicit_tokens == defaults.max_context,
-                      "default KV capacity does not follow max context");
+    // With no --max-model-len the context auto-resolves from free device memory
+    // (1c76e237), so there is no fixed number for the KV pool to follow and it
+    // auto-resolves with it. This used to assert Explicit(max_context), which was
+    // the contract while max_context defaulted to a literal 8192.
+    failures += check(defaults.max_context == 0, "max context does not default to auto");
+    failures += check(defaults.kv_capacity.mode == sinfer::KvCapacityMode::Automatic &&
+                          defaults.kv_capacity.automatic_headroom_bytes ==
+                              sinfer::kDefaultKvCapacityHeadroomBytes,
+                      "default KV capacity does not auto-resolve with the context");
     failures += check(defaults.speculative.backend == sinfer::SpeculativeBackend::None,
                       "speculative decoding is not disabled by default");
     failures += check(defaults.response_store_max_records == kDefaultResponseStoreRecords &&
