@@ -28,6 +28,11 @@ struct ServeOptions {
     std::string api_key;                          // empty => no auth
     std::optional<std::string> model_id_override; // unset => artifact identity.model_id
 
+    struct LoraModule {
+        std::string name;
+        std::string path;
+    };
+
     /// Additional models served from the same process (multi-model serving).
     /// Each runs its own Engine -- arenas, worker thread, stream, graphs --
     /// inside the shared CUDA context, which is what lets concurrent rounds
@@ -39,6 +44,11 @@ struct ServeOptions {
         std::uint32_t max_num_seqs = 0; ///< 0 = inherit the primary's
         std::uint32_t max_context  = 0; ///< 0 = inherit the primary's
         SpeculativeOptions speculative; ///< off unless spec=/draft-tokens= given
+        /// This model's own adapters (lora=name:path keys, repeatable). Names
+        /// share one flat namespace with every served id and every other
+        /// model's adapters, because a request selects by the single `model`
+        /// string; collisions are refused at startup.
+        std::vector<LoraModule> lora;
     };
     std::vector<ExtraModel> extra_models;
     std::string request_log_jsonl;                // empty => structured request logging disabled
@@ -98,10 +108,6 @@ struct ServeOptions {
     /// --max-loras and --max-lora-rank bound what a deployment will admit, and are
     /// checked at load so a too-large adapter is refused with its rank named rather
     /// than at the first request.
-    struct LoraModule {
-        std::string name;
-        std::string path;
-    };
     bool enable_lora = false;
     bool enable_sleep_mode = false;
     std::vector<LoraModule> lora_modules;

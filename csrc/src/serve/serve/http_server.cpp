@@ -388,7 +388,22 @@ void HttpServer::register_routes() {
             return;
         }
         try {
-            service_->load_lora_adapter(name, path);
+            GenerationService& target = routed_management_service(req);
+            // The flat namespace holds at runtime too: refuse a name any other
+            // service already answers to.
+            if (name == public_model_id_ || extra_services_.count(name) != 0) {
+                throw std::invalid_argument("'" + name + "' is a served model id");
+            }
+            if (service_->lora_slot(name) >= 0 && &target != service_) {
+                throw std::invalid_argument("adapter '" + name + "' already exists on the primary");
+            }
+            for (auto& [id, extra] : extra_services_) {
+                if (extra->lora_slot(name) >= 0 && &target != extra) {
+                    throw std::invalid_argument("adapter '" + name + "' already exists on '" +
+                                                id + "'");
+                }
+            }
+            target.load_lora_adapter(name, path);
         } catch (const std::exception& e) {
             res.status = 400;
             res.set_content(e.what(), "text/plain");
@@ -414,7 +429,7 @@ void HttpServer::register_routes() {
             return;
         }
         try {
-            service_->unload_lora_adapter(name);
+            routed_management_service(req).unload_lora_adapter(name);
         } catch (const std::exception& e) {
             res.status = 400;
             res.set_content(e.what(), "text/plain");
@@ -434,7 +449,12 @@ void HttpServer::register_routes() {
 
 void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {
     std::vector<std::string> additional = service_->lora_adapter_names();
-    for (const auto& [name, service] : extra_services_) { additional.push_back(name); }
+    for (const auto& [name, service] : extra_services_) {
+        additional.push_back(name);
+        for (const std::string& adapter : service->lora_adapter_names()) {
+            additional.push_back(adapter);
+        }
+    }
     res.set_content(make_models_list(public_model_id_, unix_time_now(), additional),
                     "application/json");
 }
@@ -905,8 +925,15 @@ thread_local GenerationService* HttpServer::t_routed_service = nullptr;
 void HttpServer::attach_extra(GenerationService& service) {
     const sinfer::LoadSummary load = service.load_summary();
     const std::string id           = service.options().model_id_override.value_or(load.model_id);
-    if (id == public_model_id_ || extra_services_.count(id) != 0) {
+    if (id == public_model_id_ || extra_services_.count(id) != 0 ||
+        service_->lora_slot(id) >= 0) {
         throw std::logic_error("multi-model: served id '" + id + "' is not unique");
+    }
+    for (const std::string& adapter : service.lora_adapter_names()) {
+        if (adapter == public_model_id_ || service_->lora_slot(adapter) >= 0) {
+            throw std::logic_error("multi-model: adapter '" + adapter +
+                                   "' collides with another served name");
+        }
     }
     extra_services_.emplace(id, &service);
 }
@@ -924,9 +951,18 @@ GenerationService& HttpServer::route_model(const std::string& model, std::string
     if (model == public_model_id_) { return *service_; }
     const auto extra = extra_services_.find(model);
     if (extra != extra_services_.end()) { return *extra->second; }
+    // Adapter names share one flat namespace across every service (uniqueness
+    // is enforced at startup and at runtime load), so the first owner is the
+    // only owner.
     if (service_->lora_slot(model) >= 0) {
         if (lora_adapter != nullptr) { *lora_adapter = model; }
         return *service_;
+    }
+    for (auto& [name, service] : extra_services_) {
+        if (service->lora_slot(model) >= 0) {
+            if (lora_adapter != nullptr) { *lora_adapter = model; }
+            return *service;
+        }
     }
     ApiError error;
     error.status  = 404;

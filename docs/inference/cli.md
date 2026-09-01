@@ -105,7 +105,7 @@ what is missing, rather than silently serving unaccelerated.
 
 | Flag | Meaning |
 |---|---|
-| `--model name=path[,kv-tokens=N][,max-num-seqs=N][,max-model-len=N][,spec=mtp\|dflash][,draft-tokens=N]` | Serve an additional model beside the primary; repeatable. Requests select it by `name` in the `model` field; `/v1/models` lists everything. `kv-tokens` is required — each extra states its KV budget explicitly. |
+| `--model name=path[,kv-tokens=N][,max-num-seqs=N][,max-model-len=N][,spec=mtp\|dflash][,draft-tokens=N][,lora=name:path]` | Serve an additional model beside the primary; repeatable. `lora=` (repeatable within one `--model`) gives that model its own adapters. Requests select it by `name` in the `model` field; `/v1/models` lists everything. `kv-tokens` is required — each extra states its KV budget explicitly. |
 
 Each model runs its own engine — weights, cache, scheduler, CUDA graphs — on
 its own stream inside one process, so concurrent requests for different models
@@ -153,6 +153,13 @@ effect.
 
 Adapters run under CUDA graphs and with quantized (e.g. NVFP4) base weights;
 the delta is computed in BF16 beside the base projection either way.
+
+On a multi-model server, every model carries its own adapters — the primary's
+via these flags, an extra's via `lora=name:path` keys in its `--model` entry —
+and all served names (models and adapters alike) share one flat namespace,
+because a request selects by the single `model` string. Collisions are refused
+at startup and at runtime load. The runtime endpoints target a specific model
+with `?model=NAME`.
 
 ### Sampling defaults
 

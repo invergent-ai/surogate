@@ -404,6 +404,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                     if (extra.speculative.draft_tokens == 0) {
                         extra.speculative.draft_tokens = 3;
                     }
+                } else if (key == "lora") {
+                    const std::size_t colon = val.find(':');
+                    if (colon == std::string::npos || colon == 0 || colon + 1 == val.size()) {
+                        throw std::invalid_argument("--model: lora= takes name:path");
+                    }
+                    extra.lora.push_back({val.substr(0, colon), val.substr(colon + 1)});
                 } else if (key == "draft-tokens") {
                     extra.speculative.draft_tokens =
                         static_cast<std::uint32_t>(std::stoul(val));
@@ -540,10 +546,24 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 "--model extras support single-device serving today (the primary may still "
                 "pipeline; run extras on their own devices via their own flags later)");
         }
-        if (options.enable_lora) {
-            throw std::invalid_argument(
-                "--enable-lora with --model extras is not wired yet; adapters would need "
-                "per-model namespaces");
+        // One flat namespace: a request selects by the single `model` string, so
+        // every served id and every adapter name -- the primary's and each
+        // extra's -- must be distinct. Served-id-vs-adapter collisions that
+        // involve the primary's artifact identity are enforced at attach, where
+        // that identity is known.
+        std::vector<std::string> reserved = names;
+        for (const auto& module : options.lora_modules) { reserved.push_back(module.name); }
+        for (const auto& extra : options.extra_models) {
+            for (const auto& module : extra.lora) { reserved.push_back(module.name); }
+        }
+        std::sort(reserved.begin(), reserved.end());
+        for (std::size_t i = 1; i < reserved.size(); ++i) {
+            if (reserved[i] == reserved[i - 1]) {
+                throw std::invalid_argument(
+                    "'" + reserved[i] +
+                    "' is used twice across model and adapter names; every name must be unique "
+                    "because a request selects by the single `model` field");
+            }
         }
     }
     if (options.enable_sleep_mode && options.devices.size() > 1) {

@@ -96,8 +96,10 @@ int main(int argc, char** argv) {
             if (extra.max_num_seqs != 0) { extra_options.max_concurrency = extra.max_num_seqs; }
             if (extra.max_context != 0) { extra_options.max_context = extra.max_context; }
             extra_options.extra_models.clear();
-            extra_options.enable_lora = false;
-            extra_options.lora_modules.clear();
+            // Each extra brings its own adapters (lora=name:path keys); capacity
+            // knobs (--max-loras/--max-lora-rank) are shared with the primary.
+            extra_options.enable_lora  = !extra.lora.empty();
+            extra_options.lora_modules = extra.lora;
             // Speculative backends are artifact-specific, so extras never
             // inherit the primary's flag -- they opt in per model via
             // spec=mtp|dflash[,draft-tokens=N].

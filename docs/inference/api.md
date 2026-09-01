@@ -36,8 +36,8 @@ reports, which is how you keep a client's hard-coded model string working.
 | `POST` | `/sleep` | Release a model's VRAM, state parked in host RAM (`--enable-sleep-mode`; `?model=NAME` on multi-model servers) |
 | `POST` | `/wake_up` | Restore a model; sub-second for most models (`?model=NAME`) |
 | `GET` | `/is_sleeping` | Sleep state (`?model=NAME`) |
-| `POST` | `/v1/load_lora_adapter` | Load a PEFT adapter at runtime (`--enable-lora` servers) |
-| `POST` | `/v1/unload_lora_adapter` | Unload an adapter by name |
+| `POST` | `/v1/load_lora_adapter` | Load a PEFT adapter at runtime (`--enable-lora`; `?model=NAME` targets a specific model on multi-model servers) |
+| `POST` | `/v1/unload_lora_adapter` | Unload an adapter by name (`?model=NAME`) |
 | `GET` | `/health` | Readiness probe |
 | `POST` | `/v1/embeddings` | Embeddings — served by `surogate serve --embed`, a separate process |
 
