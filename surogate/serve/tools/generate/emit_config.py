@@ -29,9 +29,9 @@ def emit_config_h(spec: TargetSpec) -> str:
         return _emit_dense_config_h(spec)
     return f"""#pragma once
 
-#include <api/targets/qwen3_6/frontend.h>
-#include <api/targets/qwen3_6/hybrid_topology.h>
-#include <api/targets/qwen3_6/vision.h>
+#include <api/family/frontend.h>
+#include <api/family/hybrid_topology.h>
+#include <api/family/vision.h>
 
 #include <cstdint>
 
@@ -45,7 +45,7 @@ struct TextConfig {{
     // The output matrix is padded for the selected kernels. Only token IDs in
     // [0, token_domain) are tokenizer-addressable and valid sampling results.
     static constexpr int output_rows  = {spec.vocab};
-    static constexpr int token_domain = static_cast<int>(qwen3_6::kTokenDomain);
+    static constexpr int token_domain = static_cast<int>(family::kTokenDomain);
 
     static constexpr int gdn_conv_kernel      = {l.conv_kernel};
     static constexpr int gdn_conv_state_width = gdn_conv_kernel - 1;
@@ -59,7 +59,7 @@ struct TextConfig {{
     static constexpr int head_dim    = {a.head_dim};
     static constexpr int rotary_dim  = {a.rotary_dim};
 
-    static constexpr int full_attention_interval = qwen3_6::kHybridAttentionInterval;
+    static constexpr int full_attention_interval = family::kHybridAttentionInterval;
     static constexpr float rms_epsilon           = {_float_literal(spec.rms_epsilon)};
     static constexpr float rope_theta            = {_float_literal(spec.rope_theta)};
 
@@ -76,26 +76,26 @@ struct TextConfig {{
     static constexpr int mtp_mlp_gate_up_rows     = 2 * intermediate;
 
     [[nodiscard]] static constexpr bool is_full_attention(int layer) {{
-        return qwen3_6::is_full_attention_layer(layer);
+        return family::is_full_attention_layer(layer);
     }}
 
     [[nodiscard]] static constexpr int full_attention_layers() {{
-        return qwen3_6::full_attention_layers(layers);
+        return family::full_attention_layers(layers);
     }}
 
-    [[nodiscard]] static constexpr int gdn_layers() {{ return qwen3_6::gdn_layers(layers); }}
+    [[nodiscard]] static constexpr int gdn_layers() {{ return family::gdn_layers(layers); }}
 
     [[nodiscard]] static constexpr int full_attention_index(int layer) {{
-        return qwen3_6::full_attention_index(layer);
+        return family::full_attention_index(layer);
     }}
 
-    [[nodiscard]] static constexpr int gdn_index(int layer) {{ return qwen3_6::gdn_index(layer); }}
+    [[nodiscard]] static constexpr int gdn_index(int layer) {{ return family::gdn_index(layer); }}
 }};
 
 static_assert(TextConfig::full_attention_layers() == {spec.full_attention_layers});
 static_assert(TextConfig::gdn_layers() == {spec.gdn_layers});
 
-struct VisionConfig : qwen3_6::VisionBackboneConfig {{
+struct VisionConfig : family::VisionBackboneConfig {{
     static constexpr int output_hidden = TextConfig::hidden;
 }};
 
@@ -146,9 +146,9 @@ def _emit_dense_config_h(spec: TargetSpec) -> str:
     a = spec.attention
     return f"""#pragma once
 
-#include <api/targets/qwen3_6/frontend.h>
-#include <api/targets/qwen3_6/hybrid_topology.h>
-#include <api/targets/qwen3_6/vision.h>
+#include <api/family/frontend.h>
+#include <api/family/hybrid_topology.h>
+#include <api/family/vision.h>
 
 #include <cstdint>
 
@@ -209,7 +209,7 @@ struct TextConfig {{
 static_assert(TextConfig::full_attention_layers() == {spec.layers});
 static_assert(TextConfig::gdn_layers() == 0);
 
-struct VisionConfig : qwen3_6::VisionBackboneConfig {{
+struct VisionConfig : family::VisionBackboneConfig {{
     static constexpr int output_hidden = TextConfig::hidden;
 }};
 
