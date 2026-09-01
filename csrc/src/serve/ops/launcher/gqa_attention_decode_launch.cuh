@@ -318,7 +318,22 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
         const std::int32_t per_split       = Geometry::KVHeads * invocation.batch_size;
         const std::int32_t wanted          = per_split > 0 ? div_up(kTargetCtas, per_split) : splits;
         const std::int32_t floored         = wanted < 1 ? 1 : wanted;
-        splits                             = splits < floored ? splits : floored;
+        const std::int32_t occupancy_split = splits < floored ? splits : floored;
+        // A split stages its page ids in a fixed 64-entry shared array, so it may
+        // span at most 64 pages. The clamp above only ever lowers the split count,
+        // and lowering it widens each split -- so a shape with many KV heads (the
+        // clamp divides by them) can be pushed past the page budget and write off
+        // the end of that array. Keep the count at or above what the budget needs,
+        // still capped by the split capacity the partial buffers were sized for.
+        // The tile allowance covers the leading partial tile a split may start on.
+        constexpr std::int32_t kMaxPagesPerSplit = 64;
+        constexpr std::int32_t kMaxTokenTile     = 128;
+        constexpr std::int32_t kKeysPerSplitCap =
+            kMaxPagesPerSplit * kPagedKVPageSize - kMaxTokenTile;
+        const std::int32_t page_floor =
+            implementation_window > 0 ? div_up(implementation_window, kKeysPerSplitCap) : 1;
+        const std::int32_t needed = occupancy_split > page_floor ? occupancy_split : page_floor;
+        splits                    = splits < needed ? splits : needed;
     }
 
     // BF16 keeps its row-tile warp count; INT8 selects its producer/consumer
