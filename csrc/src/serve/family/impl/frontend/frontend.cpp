@@ -219,13 +219,20 @@ void validate_tokenizer_config(const FrontendResources& resources) {
         throw std::invalid_argument(
             "tokenizer_config.json does not use the official <|endoftext|> pad token");
     }
-    if (!tokenizer_config.contains("chat_template") ||
-        !tokenizer_config.at("chat_template").is_string()) {
-        throw std::invalid_argument(
-            "tokenizer_config.json.chat_template must contain the loaded chat template");
+    // The template must be present and must be the one that was loaded. Where a
+    // checkpoint *states* it is the part that is not universal: Qwen and Llama
+    // carry it inside tokenizer_config.json, while Gemma 3 ships a real
+    // chat_template.jinja and omits the key entirely -- the newer HF convention.
+    // Demanding the key of both would refuse a checkpoint for saying the same
+    // thing in the newer of two places, so what is asserted is that the two
+    // agree where both exist, and that the template exists at all.
+    if (resources.chat_template_jinja.empty()) {
+        throw std::invalid_argument("the artifact carries no frontend/chat_template.jinja");
     }
-    if (tokenizer_config.at("chat_template").get_ref<const std::string&>() !=
-        resources.chat_template_jinja) {
+    if (tokenizer_config.contains("chat_template") &&
+        tokenizer_config.at("chat_template").is_string() &&
+        tokenizer_config.at("chat_template").get_ref<const std::string&>() !=
+            resources.chat_template_jinja) {
         throw std::invalid_argument(
             "tokenizer_config.json.chat_template does not match frontend/chat_template.jinja");
     }

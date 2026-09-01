@@ -47,7 +47,8 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, CacheT* cache_k,
     CacheT* cache_v, const std::int32_t* block_tables, const std::int32_t* valid_columns,
     const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
-    std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity, float scale,
+    std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity,
+    std::int32_t sliding_window, float scale,
     __nv_bfloat16* partial_acc, float* partial_m, float* partial_l,
     GqaBlockMask block_mask = GqaBlockMask{}) {
     static_assert(TokenTile >= 1 && TokenTile <= 6);
@@ -359,19 +360,19 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
             const int key0 = k0 + col0;
             const int key1 = col1 + k0;
             score[nt][0] = (row0 < row_count && key0 >= split_start && key0 < split_end &&
-                            key0 <= qabs0 && gqa_block_visible<Sparse, SparseBlock>(mask0, key0))
+                            key0 <= qabs0 && gqa_within_window(qabs0, key0, sliding_window) && gqa_block_visible<Sparse, SparseBlock>(mask0, key0))
                                ? score[nt][0] * scale
                                : -CUDART_INF_F;
             score[nt][1] = (row0 < row_count && key1 >= split_start && key1 < split_end &&
-                            key1 <= qabs0 && gqa_block_visible<Sparse, SparseBlock>(mask0, key1))
+                            key1 <= qabs0 && gqa_within_window(qabs0, key1, sliding_window) && gqa_block_visible<Sparse, SparseBlock>(mask0, key1))
                                ? score[nt][1] * scale
                                : -CUDART_INF_F;
             score[nt][2] = (row1 < row_count && key0 >= split_start && key0 < split_end &&
-                            key0 <= qabs1 && gqa_block_visible<Sparse, SparseBlock>(mask1, key0))
+                            key0 <= qabs1 && gqa_within_window(qabs1, key0, sliding_window) && gqa_block_visible<Sparse, SparseBlock>(mask1, key0))
                                ? score[nt][2] * scale
                                : -CUDART_INF_F;
             score[nt][3] = (row1 < row_count && key1 >= split_start && key1 < split_end &&
-                            key1 <= qabs1 && gqa_block_visible<Sparse, SparseBlock>(mask1, key1))
+                            key1 <= qabs1 && gqa_within_window(qabs1, key1, sliding_window) && gqa_block_visible<Sparse, SparseBlock>(mask1, key1))
                                ? score[nt][3] * scale
                                : -CUDART_INF_F;
             bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));

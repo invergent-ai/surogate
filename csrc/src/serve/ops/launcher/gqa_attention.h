@@ -22,6 +22,8 @@ struct GqaSmallTInvocation {
     std::int32_t column_begin   = 0;
     std::int32_t width          = 0;
     std::int32_t batch_size     = 1;
+    /// Causal sliding window, zero for unbounded. See GqaExecutionEnvelope.
+    std::int32_t sliding_window = 0;
 };
 
 // Splits the launcher will use for this shape, which sizes the partial buffers
@@ -62,7 +64,7 @@ void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& position
 void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                  const Tensor& positions, const Tensor& valid_columns,
                                  const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
-                                 Tensor& out, cudaStream_t stream, GqaBlockMask selection = {});
+                                 Tensor& out, cudaStream_t stream, GqaBlockMask selection = {}, std::int32_t sliding_window = 0);
 
 void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                           PagedKVLayerView cache, cudaStream_t stream);

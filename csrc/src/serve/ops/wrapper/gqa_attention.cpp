@@ -490,7 +490,7 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
         return;
     }
     detail::gqa_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows, scale,
-                                        cache, out, stream, selection);
+                                        cache, out, stream, selection, envelope.sliding_window);
 }
 
 void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,

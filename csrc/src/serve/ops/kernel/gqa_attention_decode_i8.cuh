@@ -62,7 +62,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         std::int8_t* cache_v_i8, __half* cache_k_scale, __half* cache_v_scale,
         const std::int32_t* block_tables, const std::int32_t* valid_columns,
         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
-        std::int32_t column_begin, std::int32_t logical_capacity, float scale,
+        std::int32_t column_begin, std::int32_t logical_capacity,
+        std::int32_t sliding_window, float scale,
         __nv_bfloat16* partial_acc, float* partial_m, float* partial_l) {
     constexpr int Wc                   = WarpsPerCta;
     constexpr int RowCount             = TokenTile * Geometry::GroupSize;
@@ -430,19 +431,19 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 const int key0 = k0 + col0;
                 const int key1 = k0 + col1;
                 score[nt][0] =
-                    (row0 < RowCount && key0 >= split_start && key0 < split_end && key0 <= qabs0)
+                    (row0 < RowCount && key0 >= split_start && key0 < split_end && key0 <= qabs0 && gqa_within_window(qabs0, key0, sliding_window))
                         ? score[nt][0] * scale
                         : -CUDART_INF_F;
                 score[nt][1] =
-                    (row0 < RowCount && key1 >= split_start && key1 < split_end && key1 <= qabs0)
+                    (row0 < RowCount && key1 >= split_start && key1 < split_end && key1 <= qabs0 && gqa_within_window(qabs0, key1, sliding_window))
                         ? score[nt][1] * scale
                         : -CUDART_INF_F;
                 score[nt][2] =
-                    (row1 < RowCount && key0 >= split_start && key0 < split_end && key0 <= qabs1)
+                    (row1 < RowCount && key0 >= split_start && key0 < split_end && key0 <= qabs1 && gqa_within_window(qabs1, key0, sliding_window))
                         ? score[nt][2] * scale
                         : -CUDART_INF_F;
                 score[nt][3] =
-                    (row1 < RowCount && key1 >= split_start && key1 < split_end && key1 <= qabs1)
+                    (row1 < RowCount && key1 >= split_start && key1 < split_end && key1 <= qabs1 && gqa_within_window(qabs1, key1, sliding_window))
                         ? score[nt][3] * scale
                         : -CUDART_INF_F;
                 bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));

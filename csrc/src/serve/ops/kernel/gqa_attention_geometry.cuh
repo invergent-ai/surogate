@@ -41,6 +41,14 @@ struct GqaGeometry {
     static constexpr int DecodeSplits     = 85 * DecodeSplitScale;
 };
 
+/// Whether a key at absolute position `key` is inside a query's causal window.
+/// `window <= 0` is unbounded. The bound is `qabs - key < window`, i.e. exactly
+/// `window` keys including the query's own -- FlashAttention's
+/// `window_size = (window - 1, 0)`, which is what vLLM passes for Gemma 3.
+__device__ __forceinline__ bool gqa_within_window(int qabs, int key, int window) {
+    return window <= 0 || (qabs - key) < window;
+}
+
 // ---- Registered shapes ------------------------------------------------------
 //
 // Named <head dim>_<query heads>q<KV heads>. The comment records which

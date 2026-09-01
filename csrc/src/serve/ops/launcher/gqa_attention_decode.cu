@@ -66,6 +66,7 @@ void gqa_attention_small_t_launch(const Tensor& q, const Tensor& k, const Tensor
         .column_begin  = column_begin,
         .width         = width,
         .batch_size    = q.ne[3],
+        .sliding_window = envelope.sliding_window,
     };
     gqa_dispatch_geometry(q.ne[0], q.ne[1], cache.num_kv_heads, [&]<typename Geometry>() {
         gqa_attention_small_t_launch_for<Geometry>(q, input, pos, scale, cache, invocation,
@@ -88,6 +89,7 @@ void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, flo
         .column_begin  = 0,
         .width         = q.ne[2],
         .batch_size    = 1,
+        .sliding_window = envelope.sliding_window,
     };
     const PagedKVBatchLayerView batch_cache = single_row_batch_view(cache);
     gqa_dispatch_geometry(q.ne[0], q.ne[1], batch_cache.num_kv_heads, [&]<typename Geometry>() {

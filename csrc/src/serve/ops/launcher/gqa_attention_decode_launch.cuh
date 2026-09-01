@@ -138,7 +138,7 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
                     ? nullptr
                     : static_cast<const std::int32_t*>(invocation.table_rows->data),
                 cache.block_tables.ne[0], invocation.width, invocation.full_width,
-                invocation.column_begin, logical_capacity, scale,
+                invocation.column_begin, logical_capacity, invocation.sliding_window, scale,
                 static_cast<__nv_bfloat16*>(partial_acc.data),
                 static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
                 invocation.selection);
@@ -159,7 +159,8 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
             ? nullptr
             : static_cast<const std::int32_t*>(invocation.table_rows->data),
         cache.block_tables.ne[0], invocation.width, invocation.full_width, invocation.column_begin,
-        logical_capacity, scale, static_cast<__nv_bfloat16*>(partial_acc.data),
+        logical_capacity, invocation.sliding_window, scale,
+        static_cast<__nv_bfloat16*>(partial_acc.data),
         static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
     CUDA_CHECK(cudaGetLastError());
 }
@@ -200,7 +201,8 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                     ? nullptr
                     : static_cast<const std::int32_t*>(invocation.table_rows->data),
                 cache.block_tables.ne[0], invocation.full_width, invocation.column_begin,
-                logical_capacity, scale, static_cast<__nv_bfloat16*>(partial_acc.data),
+                logical_capacity, invocation.sliding_window, scale,
+        static_cast<__nv_bfloat16*>(partial_acc.data),
                 static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
     };
     if constexpr (TokenTile == 6) {

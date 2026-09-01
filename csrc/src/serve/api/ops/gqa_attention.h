@@ -24,6 +24,14 @@ struct GqaBlockMask {
 struct GqaExecutionEnvelope {
     std::uint32_t min_visible_keys = 0;
     std::uint32_t max_visible_keys = 0;
+
+    /// Causal sliding window, zero for a layer that sees its whole context. A
+    /// query at absolute position i admits keys j with `i - j < sliding_window`
+    /// -- exactly `sliding_window` keys including its own, which is
+    /// FlashAttention's `window_size = (sliding_window - 1, 0)` and what vLLM
+    /// passes for Gemma 3. A route that cannot honour it must refuse rather than
+    /// return unwindowed attention, which is a wrong answer that looks right.
+    std::int32_t sliding_window = 0;
 };
 
 /**

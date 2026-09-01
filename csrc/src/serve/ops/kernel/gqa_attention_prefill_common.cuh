@@ -35,6 +35,9 @@ static_assert(kGqaPrefillSmemBytes<256> == 98304);
 
 struct GqaPrefillDirectMetadata {
     const std::int32_t* table;
+    /// Causal sliding window, zero for unbounded. A query at absolute position i
+    /// admits keys j with `i - j < sliding_window`.
+    std::int32_t window = 0;
 
     __device__ __forceinline__ std::int32_t valid_tokens(std::int32_t width) const { return width; }
 
@@ -47,6 +50,8 @@ struct GqaPrefillBatchMetadata {
     const std::int32_t* valid_columns;
     const std::int32_t* table_rows;
     std::int32_t table_stride;
+    /// Causal sliding window, zero for unbounded. See GqaPrefillDirectMetadata.
+    std::int32_t window = 0;
 
     __device__ __forceinline__ std::int32_t valid_tokens(std::int32_t width) const {
         if constexpr (Masked) {

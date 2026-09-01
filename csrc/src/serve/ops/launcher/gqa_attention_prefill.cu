@@ -226,7 +226,8 @@ void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positi
 void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                  const Tensor& positions, const Tensor& valid_columns,
                                  const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
-                                 Tensor& out, cudaStream_t stream, GqaBlockMask selection) {
+                                 Tensor& out, cudaStream_t stream, GqaBlockMask selection,
+                                 std::int32_t sliding_window) {
     const auto launch = [&]<bool Masked>() {
         const GqaPrefillBatchMetadata<Masked> metadata{
             .tables = static_cast<const std::int32_t*>(cache.block_tables.data),
@@ -234,6 +235,7 @@ void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor&
                 Masked ? static_cast<const std::int32_t*>(valid_columns.data) : nullptr,
             .table_rows   = static_cast<const std::int32_t*>(table_rows.data),
             .table_stride = cache.block_tables.ne[0],
+            .window       = sliding_window,
         };
         gqa_dispatch_geometry(q.ne[0], q.ne[1], cache.num_kv_heads, [&]<typename Geometry>() {
             gqa_kv_append_launch_for<Geometry>(k, v, positions, cache, metadata, stream);

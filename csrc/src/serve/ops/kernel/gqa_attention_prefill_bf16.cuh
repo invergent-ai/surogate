@@ -351,19 +351,19 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
             for (int nt = 0; nt < QKNt; ++nt) {
                 const int key0 = k0 + nt * 8 + 2 * lid;
                 const int key1 = key0 + 1;
-                score[nt][0] = (qrow0 < tokens && key0 <= qabs0 &&
+                score[nt][0] = (qrow0 < tokens && key0 <= qabs0 && gqa_within_window(qabs0, key0, metadata.window) &&
                                 gqa_block_visible<Sparse, SparseBlock>(mask0, key0))
                                    ? score[nt][0]
                                    : -CUDART_INF_F;
-                score[nt][1] = (qrow0 < tokens && key1 <= qabs0 &&
+                score[nt][1] = (qrow0 < tokens && key1 <= qabs0 && gqa_within_window(qabs0, key1, metadata.window) &&
                                 gqa_block_visible<Sparse, SparseBlock>(mask0, key1))
                                    ? score[nt][1]
                                    : -CUDART_INF_F;
-                score[nt][2] = (qrow1 < tokens && key0 <= qabs1 &&
+                score[nt][2] = (qrow1 < tokens && key0 <= qabs1 && gqa_within_window(qabs1, key0, metadata.window) &&
                                 gqa_block_visible<Sparse, SparseBlock>(mask1, key0))
                                    ? score[nt][2]
                                    : -CUDART_INF_F;
-                score[nt][3] = (qrow1 < tokens && key1 <= qabs1 &&
+                score[nt][3] = (qrow1 < tokens && key1 <= qabs1 && gqa_within_window(qabs1, key1, metadata.window) &&
                                 gqa_block_visible<Sparse, SparseBlock>(mask1, key1))
                                    ? score[nt][3]
                                    : -CUDART_INF_F;
