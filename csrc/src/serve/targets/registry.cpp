@@ -275,6 +275,22 @@ Qwen3DenseInstance::Qwen3DenseInstance(std::unique_ptr<LoadedQwen3Dense> stable_
 
 Qwen3DenseInstance::~Qwen3DenseInstance() = default;
 
+LoadedLlama::LoadedLlama(std::unique_ptr<Llama::LoadedModel> stable_model,
+                         const EngineOptions& options)
+    : model(std::move(stable_model)), frontend(Llama::make_frontend(*model, options)) {}
+
+LoadedLlama::~LoadedLlama() = default;
+
+LlamaInstance::LlamaInstance(std::unique_ptr<LoadedLlama> stable_loaded,
+                             runtime::KvCapacityResolution resolution,
+                             Llama::SequencePlan sequence_plan, DeviceContext& device)
+    : loaded(std::move(stable_loaded)), kv_capacity_resolution(resolution),
+      request_memory(device, sequence_plan.request_transient_capacity_bytes()),
+      capacity(sequence_plan.capacity()),
+      program(Llama::create_program(*loaded->model, std::move(sequence_plan), device)) {}
+
+LlamaInstance::~LlamaInstance() = default;
+
 LoadedQwen3_5_0_8B::LoadedQwen3_5_0_8B(std::unique_ptr<Qwen3_5_0_8B::LoadedModel> stable_model,
                                      const EngineOptions& options)
     : model(std::move(stable_model)), frontend(Qwen3_5_0_8B::make_frontend(*model, options)) {}
@@ -382,6 +398,11 @@ ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& 
 
     artifact::Reader reader(options.artifact_path);
     const auto& identity = reader.identity();
+    if (identity.model_id == Llama::model_id) {
+        return construct_registered<Llama, LoadedLlama, LlamaInstance>(
+            options, device, reader, load_start, Llama::target_key);
+    }
+
     if (identity.model_id == Qwen3Dense::model_id) {
         return construct_registered<Qwen3Dense, LoadedQwen3Dense, Qwen3DenseInstance>(
             options, device, reader, load_start, Qwen3Dense::target_key);

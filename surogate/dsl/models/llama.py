@@ -43,7 +43,7 @@ class LlamaModel(nn.Model):
         num_kv_heads: int = 8,
         d_ff: int = 11008,
         max_seq: int = 4096,
-        head_size: int = 128,
+        head_size: int = 0,
         eps: float = 1e-6,
     ):
         super().__init__()
@@ -57,7 +57,14 @@ class LlamaModel(nn.Model):
         self.head_size = head_size
         self.eps = eps
 
+        # A checkpoint predating the explicit `head_dim` key (TinyLlama, Llama 2)
+        # omits it, so the head dim is derived. Surface the resolved value rather
+        # than the argument: the serve contract reads these attributes off the
+        # instance, and would otherwise take the default over the truth.
         self.D = head_size if head_size > 0 else d_model // num_query_heads
+        self.head_size = self.D
+        # Llama rotates the whole head.
+        self.rotary_dim = self.D
 
         self.embedding = Embedding(vocab_size, d_model)
         self.blocks = nn.BlockStack(
@@ -66,7 +73,7 @@ class LlamaModel(nn.Model):
             d_model=d_model,
             num_query_heads=num_query_heads,
             num_kv_heads=num_kv_heads,
-            head_size=head_size,
+            head_size=self.D,
             d_ff=d_ff,
             max_seq=max_seq,
             eps=eps,

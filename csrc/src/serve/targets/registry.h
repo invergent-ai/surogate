@@ -3,6 +3,7 @@
 #include "api/types.h"
 #include "runtime/engine/pipeline_instance.h"
 #include "runtime/engine/request_memory.h"
+#include <api/targets/llama/package.h>
 #include <api/targets/qwen3/package.h>
 #include <api/targets/qwen3_5_0_8b/package.h>
 #include <api/targets/qwen3_5_2b/package.h>
@@ -20,6 +21,7 @@ struct DeviceContext;
 
 namespace targets {
 
+using Llama           = llama::Package;
 using Qwen3Dense      = qwen3::Package;
 using Qwen3_5_0_8B    = qwen3_5_0_8b::Package;
 using Qwen3_5_2B      = qwen3_5_2b::Package;
@@ -27,6 +29,35 @@ using Qwen3_5_4B      = qwen3_5_4b::Package;
 using Qwen3_6_27B    = qwen3_6_27b::Package;
 using Qwen3_6_35BA3B = qwen3_6_35b_a3b::Package;
 using Qwen38FlashNext = qwen4exp::Package;
+
+struct LoadedLlama {
+    std::unique_ptr<Llama::LoadedModel> model;
+    Llama::Frontend frontend;
+
+    LoadedLlama(std::unique_ptr<Llama::LoadedModel> stable_model, const EngineOptions& options);
+    ~LoadedLlama();
+
+    LoadedLlama(const LoadedLlama&)            = delete;
+    LoadedLlama& operator=(const LoadedLlama&) = delete;
+};
+
+struct LlamaInstance {
+    using Package = Llama;
+
+    std::unique_ptr<LoadedLlama> loaded;
+    runtime::KvCapacityResolution kv_capacity_resolution;
+    runtime::RequestMemory request_memory;
+    const std::uint32_t capacity;
+    std::unique_ptr<Llama::Program> program;
+
+    LlamaInstance(std::unique_ptr<LoadedLlama> stable_loaded,
+                  runtime::KvCapacityResolution resolution, Llama::SequencePlan sequence_plan,
+                  DeviceContext& device);
+    ~LlamaInstance();
+
+    LlamaInstance(const LlamaInstance&)            = delete;
+    LlamaInstance& operator=(const LlamaInstance&) = delete;
+};
 
 struct LoadedQwen3Dense {
     std::unique_ptr<Qwen3Dense::LoadedModel> model;
@@ -243,7 +274,7 @@ using Qwen3_6_27BPipeline     = runtime::PipelineInstance<Qwen3_6_27BInstance>;
 using Qwen3_6_35BA3BPipeline  = runtime::PipelineInstance<Qwen3_6_35BA3BInstance>;
 
 using ActiveTarget =
-    std::variant<std::unique_ptr<Qwen3DenseInstance>,
+    std::variant<std::unique_ptr<LlamaInstance>, std::unique_ptr<Qwen3DenseInstance>,
                  std::unique_ptr<Qwen3_5_0_8BInstance>,
                  std::unique_ptr<Qwen3_5_2BInstance>,
                  std::unique_ptr<Qwen3_5_4BInstance>, std::unique_ptr<Qwen3_6_27BInstance>,
