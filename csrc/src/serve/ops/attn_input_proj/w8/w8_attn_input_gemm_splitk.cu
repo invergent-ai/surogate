@@ -166,6 +166,44 @@ constexpr auto make_qwen3_launchers(std::index_sequence<Offsets...>) {
 constexpr auto kQwen3Launchers = make_qwen3_launchers(
     std::make_index_sequence<kLastCompanionExactCols - kFirstExactCols + 1>{});
 
+// TinyLlama-1.1B ungated fused qkv exact-T split path (rows 2560 = q2048 |
+// k256 | v256, hidden 2048). Same structure as the Qwen3 table above; the bands
+// were not measured for this shape, they are that table's, which is the closest
+// registered parent.
+using TinyOutput = W8SplitOutput3<2048, 256, 256>;
+
+template <int ActiveCols>
+void launch_tiny_active_cols(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k, Tensor& v,
+                             cudaStream_t stream) {
+    static_assert((2048 % kRowsPerCta) == 0 && (256 % kRowsPerCta) == 0);
+    const TinyOutput output{static_cast<__nv_bfloat16*>(q.data),
+                            static_cast<__nv_bfloat16*>(k.data),
+                            static_cast<__nv_bfloat16*>(v.data)};
+    launch_output<ActiveCols, 2560, 2048>(x, weight, output, stream);
+}
+
+template <std::size_t... Offsets>
+constexpr auto make_tiny_launchers(std::index_sequence<Offsets...>) {
+    return std::array<CompanionLauncher, sizeof...(Offsets)>{
+        &launch_tiny_active_cols<kFirstExactCols + static_cast<int>(Offsets)>...};
+}
+
+constexpr auto kTinyLaunchers = make_tiny_launchers(
+    std::make_index_sequence<kLastCompanionExactCols - kFirstExactCols + 1>{});
+
+template <int TileCols, int KSplits, int NGroups, int MinBlocks>
+void launch_tiny_medium_cols(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k, Tensor& v,
+                             cudaStream_t stream) {
+    const TinyOutput output{static_cast<__nv_bfloat16*>(q.data),
+                            static_cast<__nv_bfloat16*>(k.data),
+                            static_cast<__nv_bfloat16*>(v.data)};
+    w8_rowsplit_medium_t_splitk_kernel<2048, TileCols, KSplits, NGroups, MinBlocks>
+        <<<2560 / kRowsPerCta, KSplits * NGroups * 32, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const std::uint8_t*>(weight.qdata),
+            static_cast<const std::uint8_t*>(weight.scales), output, x.ne[1]);
+}
+
 template <int TileCols, int KSplits, int NGroups, int MinBlocks>
 void launch_qwen3_medium_cols(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k,
                               Tensor& v, cudaStream_t stream) {
@@ -267,6 +305,21 @@ void w8_attn_input_splitk_mma_launch(const Tensor& x, const Weight& weight, Tens
             launch_qwen3_medium_cols<48, 4, 2, 3>(x, weight, q, k, v, stream);
         } else {
             launch_qwen3_medium_cols<64, 4, 2, 2>(x, weight, q, k, v, stream);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    // TinyLlama's ungated parent. Its route table hands this schedule T=2..64.
+    if (weight.n == 2560) {
+        if (x.ne[1] < kFirstExactCols || x.ne[1] > 64) {
+            throw std::invalid_argument("W8 tinyllama attention input split-K MMA requires T=2..64");
+        }
+        if (x.ne[1] <= kLastCompanionExactCols) {
+            kTinyLaunchers[x.ne[1] - kFirstExactCols](x, weight, q, k, v, stream);
+        } else if (x.ne[1] <= 48) {
+            launch_tiny_medium_cols<48, 4, 2, 3>(x, weight, q, k, v, stream);
+        } else {
+            launch_tiny_medium_cols<64, 4, 2, 2>(x, weight, q, k, v, stream);
         }
         CUDA_CHECK(cudaGetLastError());
         return;

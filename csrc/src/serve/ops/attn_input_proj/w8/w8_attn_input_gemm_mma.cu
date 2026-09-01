@@ -113,6 +113,18 @@ void w8_attn_input_mma_r32_c128_launch(const Tensor& x, const Weight& weight, Te
         launch_route<Schedule, 4096, 1024>(x, weight, output, stream);
         return;
     }
+    // TinyLlama-1.1B ungated fused qkv (rows 2560 = q2048 | k256 | v256, hidden
+    // 2048): 32 query heads and 4 KV heads at head dim 64, the narrowest KV
+    // plane the row-split epilogue has carried.
+    if (weight.n == 2560) {
+        using OutputTiny = W8SplitOutput3<2048, 256, 256>;
+        static_assert((2048 % Schedule::BM) == 0 && (256 % Schedule::BM) == 0);
+        const OutputTiny output{static_cast<__nv_bfloat16*>(q.data),
+                                static_cast<__nv_bfloat16*>(k.data),
+                                static_cast<__nv_bfloat16*>(v.data)};
+        launch_route<Schedule, 2560, 2048>(x, weight, output, stream);
+        return;
+    }
     const CompanionOutput output{static_cast<__nv_bfloat16*>(q.data),
                                  static_cast<__nv_bfloat16*>(k.data),
                                  static_cast<__nv_bfloat16*>(v.data)};
@@ -131,6 +143,18 @@ void w8_attn_input_mma_r64_c128_launch(const Tensor& x, const Weight& weight, Te
                                  static_cast<__nv_bfloat16*>(k.data),
                                  static_cast<__nv_bfloat16*>(v.data)};
         launch_route<Schedule, 4096, 1024>(x, weight, output, stream);
+        return;
+    }
+    // TinyLlama-1.1B ungated fused qkv (rows 2560 = q2048 | k256 | v256, hidden
+    // 2048). The 256-row KV planes are exactly four of this schedule's 64-row
+    // tiles, which is the whole reason this tile size still applies.
+    if (weight.n == 2560) {
+        using OutputTiny = W8SplitOutput3<2048, 256, 256>;
+        static_assert((2048 % Schedule::BM) == 0 && (256 % Schedule::BM) == 0);
+        const OutputTiny output{static_cast<__nv_bfloat16*>(q.data),
+                                static_cast<__nv_bfloat16*>(k.data),
+                                static_cast<__nv_bfloat16*>(v.data)};
+        launch_route<Schedule, 2560, 2048>(x, weight, output, stream);
         return;
     }
     const CompanionOutput output{static_cast<__nv_bfloat16*>(q.data),
