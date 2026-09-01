@@ -350,7 +350,10 @@ CompiledChatTemplate CompiledChatTemplate::resolve(std::string_view source,
 
 PromptCapabilities CompiledChatTemplate::capabilities() const noexcept {
     PromptCapabilities result;
-    result.enable_thinking = true;
+    // The two hand-written templates open a reasoning turn; an artifact's own
+    // template is rendered as written and has no such mode, so claiming one would
+    // route its whole answer into reasoning_content.
+    result.enable_thinking = semantics_ != ChatTemplateSemantics::Jinja;
     if (semantics_ == ChatTemplateSemantics::ReasoningEffort) {
         result.reasoning_effort.low            = true;
         result.reasoning_effort.medium         = true;

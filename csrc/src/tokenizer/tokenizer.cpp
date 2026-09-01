@@ -941,7 +941,8 @@ std::vector<std::vector<int32_t>> Tokenizer::encode_batch(const std::vector<std:
     return results;
 }
 
-std::string Tokenizer::decode(const std::vector<int32_t>& ids) const {
+std::string Tokenizer::decode(const std::vector<int32_t>& ids,
+                              bool strip_leading_space) const {
     // Accumulate byte-level-encoded text in segments, decode each segment
     // when we hit a special token (which is stored as plain text, not byte-level).
     std::string result;
@@ -1002,7 +1003,8 @@ std::string Tokenizer::decode(const std::vector<int32_t>& ids) const {
                 ++i;
             }
         }
-        if (impl_->spm_strip_leading_space && !undone.empty() && undone.front() == ' ') {
+        if (strip_leading_space && impl_->spm_strip_leading_space && !undone.empty() &&
+            undone.front() == ' ') {
             undone.erase(undone.begin());
         }
         result = std::move(undone);

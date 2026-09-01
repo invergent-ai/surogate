@@ -1030,7 +1030,10 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     }
     (void)checked_token_count(result.token_ids.size());
     result.identity.reusable   = true;
-    result.starts_in_reasoning = options.add_generation_prompt && options.enable_thinking;
+    // A template with no reasoning turn never starts in one, whatever the request
+    // asked for: its capabilities are what the artifact can actually do.
+    result.starts_in_reasoning = options.add_generation_prompt && options.enable_thinking &&
+                                 impl_->chat_template.capabilities().enable_thinking;
     result.prepare.seconds     = std::chrono::duration<double>(Clock::now() - start).count();
     return PreparedPrompt(std::move(prepared));
 }

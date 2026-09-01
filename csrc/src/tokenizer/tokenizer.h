@@ -73,8 +73,11 @@ public:
     std::vector<std::vector<int32_t>> encode_batch(const std::vector<std::string>& texts,
                                                    bool add_special_tokens = false) const;
 
-    // Decode token IDs back to text.
-    std::string decode(const std::vector<int32_t>& ids) const;
+    // Decode token IDs back to text. `strip_leading_space` undoes the word mark
+    // the normalizer prepends, which is only correct for a whole sequence -- a
+    // caller decoding one token at a time must pass false or every word loses the
+    // space in front of it.
+    std::string decode(const std::vector<int32_t>& ids, bool strip_leading_space = true) const;
 
     // Single token encode/decode.
     int32_t encode_single_token(const std::string& token_bytes) const;

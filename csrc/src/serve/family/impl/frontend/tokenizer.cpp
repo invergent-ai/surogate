@@ -813,7 +813,8 @@ std::string Tokenizer::decode(std::span<const int> ids, DecodeOptions options) c
 std::string Tokenizer::decode_token_bytes(int id, bool skip_special_tokens) const {
     if (spm_) {
         if (skip_special_tokens && is_special_token(id)) { return {}; }
-        return spm_->inner.decode(std::vector<std::int32_t>{id});
+        // One token, not a sequence: the leading space is this token's own.
+        return spm_->inner.decode(std::vector<std::int32_t>{id}, false);
     }
     static const std::unordered_map<std::uint32_t, char> byte_decoder = build_byte_level_decoder();
 
