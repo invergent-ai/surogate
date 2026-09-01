@@ -9,6 +9,7 @@
 #include <iostream>
 #include <new>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace {
@@ -26,7 +27,34 @@ template <typename Exception, typename Fn>
 int expect_throws(Fn&& fn, const char* label) {
     try {
         fn();
-    } catch (const Exception&) { return 0; }
+    } catch (const Exception&) {
+        return 0;
+    } catch (const std::exception& other) {
+        // An unexpected exception has to be a reported failure, not a terminate.
+        // While this only caught the type it wanted, a changed exception type
+        // escaped main and aborted, which cannot name the case that failed and
+        // stops every later case in this file from running at all.
+        std::cerr << label << " threw an unexpected exception: " << other.what() << '\n';
+        return 1;
+    }
+    std::cerr << label << " did not throw expected exception\n";
+    return 1;
+}
+
+/// Same, and checks the message says which allocation ran the arena out.
+template <typename Exception, typename Fn>
+int expect_throws_message(Fn&& fn, const char* needle, const char* label) {
+    try {
+        fn();
+    } catch (const Exception& error) {
+        if (std::string(error.what()).find(needle) != std::string::npos) { return 0; }
+        std::cerr << label << " threw the expected type with an unexpected message: "
+                  << error.what() << '\n';
+        return 1;
+    } catch (const std::exception& other) {
+        std::cerr << label << " threw an unexpected exception: " << other.what() << '\n';
+        return 1;
+    }
     std::cerr << label << " did not throw expected exception\n";
     return 1;
 }
@@ -147,8 +175,12 @@ int main() {
 
     const std::size_t used_before_failures = arena.used();
     const std::size_t peak_before_failures = arena.peak_used();
-    failures += expect_throws<std::bad_alloc>(
-        [&] { (void)arena.alloc(sinfer::DType::FP32, {300}, 256); }, "arena oom");
+    // Exhaustion names its own numbers rather than throwing a bare std::bad_alloc
+    // (01b68136, PATCHES.md #61/#62: an anonymous exception here cost a debugging
+    // cycle). Assert the contract that replaced it, message included.
+    failures += expect_throws_message<std::runtime_error>(
+        [&] { (void)arena.alloc(sinfer::DType::FP32, {300}, 256); }, "workspace arena exhausted",
+        "arena oom");
     failures += expect_size(arena.used(), used_before_failures, "arena.used after oom");
     failures += expect_size(arena.peak_used(), peak_before_failures, "arena.peak after oom");
 
