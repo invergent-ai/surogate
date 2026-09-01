@@ -135,6 +135,25 @@ void w8_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& 
         CUDA_CHECK(cudaGetLastError());
         return;
     }
+    // tinyllama-1.1b's ungated fused qkv: 2560 rows = q2048 | k256 | v256 at
+    // k 2048. 32 query heads and 4 KV heads at head dim 64.
+    if (weight.n == 2560) {
+        if (weight.k != 2048) { refuse_shape(weight, "ungated 2560-row"); }
+        constexpr int kRowsTiny       = 2560;
+        constexpr int kRowsPerCtaTiny = 8;
+        static_assert((2048 % kRowsPerCtaTiny) == 0 && (256 % kRowsPerCtaTiny) == 0);
+        using OutputTiny = W8SplitOutput3<2048, 256, 256>;
+        const OutputTiny output{static_cast<__nv_bfloat16*>(q.data),
+                                static_cast<__nv_bfloat16*>(k.data),
+                                static_cast<__nv_bfloat16*>(v.data)};
+        w8_k2048_decode_kernel<kRowsTiny, kRowsPerCtaTiny, OutputTiny, W8DecodeStoreEpilogue, 2048>
+            <<<kRowsTiny / kRowsPerCtaTiny, kRowsPerCtaTiny * 32, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(x.data),
+                static_cast<const std::uint8_t*>(weight.qdata),
+                static_cast<const std::uint8_t*>(weight.scales), output);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     launch_companion_decode<8>(x, weight, q, k, v, stream);
 }
 

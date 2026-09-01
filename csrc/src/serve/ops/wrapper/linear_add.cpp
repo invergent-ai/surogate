@@ -220,7 +220,9 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         // qwen3-0.6b: its attention output {1024, 2048} is already the 0.8b shape
         // above; only the mlp down {1024, 3072} is new.
         const bool q3_06b = w.n == 1024 && w.k == 3072;
-        if (!base && !q08 && !q4b && !q3_06b) {
+        // tinyllama-1.1b mlp down; its attention output is the 2b shape already.
+        const bool tinyllama = w.n == 2048 && w.k == 5632;
+        if (!base && !q08 && !q4b && !q3_06b && !tinyllama) {
             throw std::invalid_argument("linear_add: unsupported W8 shape (n " +
                                         std::to_string(w.n) + ", k " + std::to_string(w.k) + ")");
         }

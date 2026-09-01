@@ -15,6 +15,8 @@
 #include "ops/linear/nvfp4/nvfp4_format.h"
 
 #include <cstddef>
+#include <array>
+#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -322,12 +324,32 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tens
                                     ", T=" + std::to_string(cols) + ")");
     };
     if (cols <= 0) { refuse("T must be positive"); }
-    if (!((kRows == 6144 && kHidden == 2048) || (kRows == 4096 && kHidden == 1024))) {
+    // Each entry is (parent rows, hidden, query rows, kv rows). The split is a
+    // property of the shape, not something to derive from one of its dimensions:
+    // three registered parents now carry three different kv widths.
+    struct UngatedSplit {
+        std::int32_t rows;
+        std::int32_t hidden;
+        std::int32_t q_rows;
+        std::int32_t kv_rows;
+    };
+    static constexpr std::array<UngatedSplit, 3> kUngated{{
+        {6144, 2048, 4096, 1024}, // the qwen3.6 companion
+        {4096, 1024, 2048, 1024}, // qwen3-0.6b: 16 query, 8 kv, head dim 128
+        {2560, 2048, 2048, 256},  // tinyllama-1.1b: 32 query, 4 kv, head dim 64
+    }};
+    const auto* split = std::find_if(kUngated.begin(), kUngated.end(), [&](const UngatedSplit& e) {
+        return e.rows == kRows && e.hidden == kHidden;
+    });
+    if (split == kUngated.end()) {
         refuse("no registered ungated query/key/value geometry; register the shape in "
                "w8_attn_input_plan.cpp and instantiate its launchers");
     }
-    const std::int32_t kQRows  = kRows == 6144 ? 4096 : 2048;
-    const std::int32_t kKvRows = 1024;
+    const std::int32_t kQRows  = split->q_rows;
+    const std::int32_t kKvRows = split->kv_rows;
+    if (kQRows + 2 * kKvRows != kRows) {
+        refuse("registered ungated split does not close over the parent's rows");
+    }
     require_matrix(x, kHidden, cols, "x");
     require_matrix(q, kQRows, cols, "q");
     require_matrix(k, kKvRows, cols, "k");

@@ -258,7 +258,10 @@ bool w8_linear_add_admits(const W8LinearAddProblem& problem) noexcept {
     // shape above; only the mlp down {1024, 3072} is new. Same row count, so it
     // resolves through the 0.8b route table below.
     const bool q3_06b = problem.rows == 1024 && problem.k == 3072;
-    return (base || q08 || q2b || q4b || q3_06b) && problem.padded_k == problem.k &&
+    // tinyllama-1.1b: its attention output {2048, 2048} is already the 2b shape
+    // above; only the mlp down {2048, 5632} is new.
+    const bool tinyllama = problem.rows == 2048 && problem.k == 5632;
+    return (base || q08 || q2b || q4b || q3_06b || tinyllama) && problem.padded_k == problem.k &&
            problem.cols >= 1;
 }
 

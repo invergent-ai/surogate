@@ -124,9 +124,15 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     const bool q3_06b_shape = x.ne[0] == 1024 && out.ne[0] == 3072 && gate_up_weight.n == 6144 &&
                               gate_up_weight.k == 1024 && gate_up_weight.padded_shape[0] == 6144 &&
                               gate_up_weight.padded_shape[1] == 1024;
+    // tinyllama-1.1b mlp (2048 -> 2x5632).
+    const bool tinyllama_shape = x.ne[0] == 2048 && out.ne[0] == 5632 &&
+                                 gate_up_weight.n == 11264 && gate_up_weight.k == 2048 &&
+                                 gate_up_weight.padded_shape[0] == 11264 &&
+                                 gate_up_weight.padded_shape[1] == 2048;
     if (t <= 0 || x.ne[2] != 1 || x.ne[3] != 1 || out.ne[1] != t || out.ne[2] != 1 ||
         out.ne[3] != 1 ||
-        (!large_shape && !w8_shape && !q08_shape && !q4b_shape && !q3_06b_shape)) {
+        (!large_shape && !w8_shape && !q08_shape && !q4b_shape && !q3_06b_shape &&
+         !tinyllama_shape)) {
         throw std::invalid_argument(
             "linear_swiglu: invalid tensor shape (x " + std::to_string(x.ne[0]) + "x" +
             std::to_string(x.ne[1]) + ", out " + std::to_string(out.ne[0]) + "x" +
@@ -151,7 +157,8 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     const bool q4_weight = large_shape && gate_up_weight.qtype == QType::Q4G64_F16S &&
                            gate_up_weight.group_size == 64 && gate_up_weight.group == 64 &&
                            common_row_split;
-    const bool w8_weight = (w8_shape || q08_shape || q4b_shape || q3_06b_shape) &&
+    const bool w8_weight = (w8_shape || q08_shape || q4b_shape || q3_06b_shape ||
+                            tinyllama_shape) &&
                            gate_up_weight.qtype == QType::W8G32_F16S &&
                            gate_up_weight.group_size == 32 && gate_up_weight.group == 32 &&
                            gate_up_weight.qhigh == nullptr &&

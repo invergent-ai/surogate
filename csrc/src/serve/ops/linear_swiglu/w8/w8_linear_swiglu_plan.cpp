@@ -100,6 +100,18 @@ static_assert(routes_are_closed(kQ4BRoutes),
 static_assert(routes_are_closed(kQ3_06bRoutes),
               "W8 LinearSwiGLU 0.6b routes must be exact and closed");
 
+// tinyllama-1.1b mlp {11264->5632, k=2048}. It shares k with the base shape,
+// whose exact-T instantiations are baked 12288 wide, so -- exactly as for the
+// 0.6b at k=1024 -- it takes only the kernels that read their extents from the
+// weight: the SIMT decode and the runtime-shaped MMA tiles.
+constexpr std::array<RouteSpec, 3> kTinyLlamaRoutes{{
+    {1, 1, W8LinearSwiGluScheduleId::DecodePairR16},
+    {2, 1024, W8LinearSwiGluScheduleId::MmaR32C128},
+    {1025, kAnyCols, W8LinearSwiGluScheduleId::MmaR64C128},
+}};
+static_assert(routes_are_closed(kTinyLlamaRoutes),
+              "W8 LinearSwiGLU tinyllama routes must be exact and closed");
+
 bool supported_shape(const W8LinearSwiGluProblem& problem) noexcept {
     // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b mlp {7168->3584, k=1024}.
     const bool base = problem.gate_up_rows == 12288 && problem.output_rows == 6144 &&
@@ -113,7 +125,10 @@ bool supported_shape(const W8LinearSwiGluProblem& problem) noexcept {
     // reuses that shape's exact-T instantiations; only the row counts differ.
     const bool q3_06b = problem.gate_up_rows == 6144 && problem.output_rows == 3072 &&
                         problem.k == 1024 && problem.padded_k == 1024;
-    return base || q08 || q4b || q3_06b;
+    // tinyllama-1.1b mlp {11264->5632, k=2048}.
+    const bool tinyllama = problem.gate_up_rows == 11264 && problem.output_rows == 5632 &&
+                           problem.k == 2048 && problem.padded_k == 2048;
+    return base || q08 || q4b || q3_06b || tinyllama;
 }
 
 } // namespace
@@ -187,6 +202,11 @@ W8LinearSwiGluPlan w8_linear_swiglu_resolve_plan(const W8LinearSwiGluProblem& pr
     if (problem.k == 1024) {
         return problem.gate_up_rows == 6144 ? resolve_from(kQ3_06bRoutes)
                                             : resolve_from(kQ08Routes);
+    }
+    // k=2048 is shared the same way: the base table's exact-T bakes are 12288
+    // wide and would run tinyllama's weight at the wrong row count.
+    if (problem.k == 2048 && problem.gate_up_rows == 11264) {
+        return resolve_from(kTinyLlamaRoutes);
     }
     return resolve_from(kRoutes);
 }

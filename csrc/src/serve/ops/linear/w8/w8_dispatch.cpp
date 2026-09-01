@@ -179,6 +179,13 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         }
         break;
     case 2048:
+        // tinyllama-1.1b's lm head (32000 rows at hidden 2048). Untied, so it is
+        // a matrix of its own rather than the embedding read a second time.
+        if (n == 32000) {
+            if (t <= 16) { return launch_w8_simt_r8_c4; }
+            if (t <= 128) { return launch_w8_mma_r32_c128; }
+            return launch_w8_mma_r64_c128;
+        }
         switch (n) {
         // surogate vendor patch (PATCHES.md #16/#29): qwen3.5-2b heads.
         case 248320:
