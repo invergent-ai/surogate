@@ -99,11 +99,26 @@ bool ModelScheduler::try_make_room_locked(State& target, bool allow_preempt) {
             if (state.entry.service->is_sleeping()) { continue; }
             const bool busy = state.entry.service->active_requests() != 0;
             if (busy && !allow_preempt) { continue; }
-            if (now - state.last_used < keep_warm_ && !busy) { continue; }
+            // The preemption fence: a busy model yields only to an equal or
+            // higher priority target. A lower-priority requester waits for the
+            // natural drain instead -- that is what priority means here.
+            if (busy && state.entry.priority > target.entry.priority) { continue; }
+            // Idle models of any tier stay evictable (nothing pins VRAM by
+            // being idle), but higher tiers keep their warmth longer.
+            const auto warmth = state.entry.priority == 2   ? keep_warm_ * 2
+                                : state.entry.priority == 0 ? keep_warm_ / 2
+                                                            : keep_warm_;
+            if (!busy && now - state.last_used < warmth) { continue; }
             if (busy && now - state.woke_at < min_dwell_) { continue; }
-            // Idle victims strictly before busy ones; LRU within each class.
-            if (victim == nullptr || (busy_pick && !busy) ||
-                (busy_pick == busy && state.last_used < victim->last_used)) {
+            // Idle victims strictly before busy ones; within a class, lower
+            // priority first, then LRU.
+            const bool better =
+                victim == nullptr || (busy_pick && !busy) ||
+                (busy_pick == busy &&
+                 (state.entry.priority < victim->entry.priority ||
+                  (state.entry.priority == victim->entry.priority &&
+                   state.last_used < victim->last_used)));
+            if (better) {
                 victim    = &state;
                 busy_pick = busy;
             }

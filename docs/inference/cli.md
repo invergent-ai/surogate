@@ -105,7 +105,8 @@ what is missing, rather than silently serving unaccelerated.
 
 | Flag | Meaning |
 |---|---|
-| `--model name=path[,kv-tokens=N][,max-num-seqs=N][,max-model-len=N][,spec=mtp\|dflash][,draft-tokens=N][,lora=name:path]` | Serve an additional model beside the primary; repeatable. `lora=` (repeatable within one `--model`) gives that model its own adapters. Requests select it by `name` in the `model` field; `/v1/models` lists everything. `kv-tokens` is required — each extra states its KV budget explicitly. |
+| `--model name=path[,kv-tokens=N][,max-num-seqs=N][,max-model-len=N][,spec=mtp\|dflash][,draft-tokens=N][,lora=name:path][,priority=high\|normal\|low]` | Serve an additional model beside the primary; repeatable. `lora=` (repeatable within one `--model`) gives that model its own adapters. |
+| `--model-priority high\|normal\|low` | The primary model's scheduler weight class. Requests select it by `name` in the `model` field; `/v1/models` lists everything. `kv-tokens` is required — each extra states its KV budget explicitly. |
 
 Each model runs its own engine — weights, cache, scheduler, CUDA graphs — on
 its own stream inside one process, so concurrent requests for different models
@@ -117,8 +118,13 @@ With `--enable-sleep-mode` as well, the models need not all fit at once: a
 request for a model that is asleep waits while the scheduler frees room —
 sleeping the least recently used idle models — and wakes it, typically in
 under a second (the first eviction of a model also allocates its host backup,
-which takes a few seconds once). Busy models are never evicted; requests
-queue until room can be made. Management endpoints take `?model=NAME`.
+which takes a few seconds once). After a grace period a busy model can be
+preempted at a round boundary — its generations park and resume byte-identically
+after re-wake. Priorities shape all of it: eviction takes lower-priority models
+first, a busy model yields only to an equal-or-higher-priority requester (a
+lower-priority request waits for the natural drain instead), and higher tiers
+keep their warmth longer. Idle models of any tier remain evictable, so nothing
+pins VRAM by doing nothing. Management endpoints take `?model=NAME`.
 
 ### Sleep mode
 

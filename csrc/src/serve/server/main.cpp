@@ -86,7 +86,13 @@ int main(int argc, char** argv) {
         // constructs after the already-built, idle ones are put to sleep. The
         // scheduler then juggles the working set per request.
         std::vector<sinfer::serve::ModelScheduler::Entry> scheduled;
-        scheduled.push_back({server.public_model_id(), &service});
+        const auto priority_of = [](sinfer::serve::ServeOptions::ModelPriority p) {
+            return p == sinfer::serve::ServeOptions::ModelPriority::High   ? 2
+                   : p == sinfer::serve::ServeOptions::ModelPriority::Low ? 0
+                                                                          : 1;
+        };
+        scheduled.push_back(
+            {server.public_model_id(), &service, priority_of(options.model_priority)});
         for (const auto& extra : options.extra_models) {
             sinfer::serve::ServeOptions extra_options = options;
             extra_options.artifact_path             = extra.artifact_path;
@@ -123,7 +129,8 @@ int main(int argc, char** argv) {
                     extra_options, load_progress.callback()));
             }
             server.attach_extra(*extra_services.back());
-            scheduled.push_back({extra.name, extra_services.back().get()});
+            scheduled.push_back(
+                {extra.name, extra_services.back().get(), priority_of(extra.priority)});
             std::ostringstream extra_loaded;
             extra_loaded << "model '" << extra.name << "' loaded in "
                          << std::chrono::duration<double>(Clock::now() - extra_start).count()

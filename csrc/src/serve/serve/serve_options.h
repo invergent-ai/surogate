@@ -28,6 +28,9 @@ struct ServeOptions {
     std::string api_key;                          // empty => no auth
     std::optional<std::string> model_id_override; // unset => artifact identity.model_id
 
+    /// Scheduler weight class for a model under multi-model overcommit.
+    enum class ModelPriority { Low, Normal, High };
+
     struct LoraModule {
         std::string name;
         std::string path;
@@ -49,8 +52,11 @@ struct ServeOptions {
         /// model's adapters, because a request selects by the single `model`
         /// string; collisions are refused at startup.
         std::vector<LoraModule> lora;
+        ModelPriority priority = ModelPriority::Normal; ///< priority=high|normal|low
     };
     std::vector<ExtraModel> extra_models;
+    /// The primary model's scheduler weight class (--model-priority).
+    ModelPriority model_priority = ModelPriority::Normal;
     std::string request_log_jsonl;                // empty => structured request logging disabled
     std::uint32_t max_context              = 8192;
     KvCapacityPolicy kv_capacity           = KvCapacityPolicy::explicit_capacity(8192);

@@ -35,6 +35,7 @@ public:
     struct Entry {
         std::string name;
         GenerationService* service = nullptr;
+        int priority               = 1; ///< 0 low, 1 normal, 2 high
     };
 
     /// `budget_bytes` is the VRAM the resident set may use (measured free at

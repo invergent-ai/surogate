@@ -366,6 +366,17 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.enable_auto_tool_choice = true;
         } else if (arg == "--chat-template") {
             options.chat_template_path = require_value("--chat-template");
+        } else if (arg == "--model-priority") {
+            const std::string value = require_value("--model-priority");
+            if (value == "high") {
+                options.model_priority = ServeOptions::ModelPriority::High;
+            } else if (value == "normal") {
+                options.model_priority = ServeOptions::ModelPriority::Normal;
+            } else if (value == "low") {
+                options.model_priority = ServeOptions::ModelPriority::Low;
+            } else {
+                throw std::invalid_argument("--model-priority takes high, normal or low");
+            }
         } else if (arg == "--model") {
             // --model name=path[,kv-tokens=N][,max-num-seqs=N][,max-model-len=N]
             const std::string value = require_value("--model");
@@ -404,6 +415,16 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                     if (extra.speculative.draft_tokens == 0) {
                         extra.speculative.draft_tokens = 3;
                     }
+                } else if (key == "priority") {
+                    if (val == "high") {
+                        extra.priority = ServeOptions::ModelPriority::High;
+                    } else if (val == "normal") {
+                        extra.priority = ServeOptions::ModelPriority::Normal;
+                    } else if (val == "low") {
+                        extra.priority = ServeOptions::ModelPriority::Low;
+                    } else {
+                        throw std::invalid_argument("--model: priority= takes high, normal or low");
+                    }
                 } else if (key == "lora") {
                     const std::size_t colon = val.find(':');
                     if (colon == std::string::npos || colon == 0 || colon + 1 == val.size()) {
@@ -416,7 +437,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 } else {
                     throw std::invalid_argument(
                         "--model: unknown key '" + key +
-                        "' (kv-tokens, max-num-seqs, max-model-len, spec, draft-tokens)");
+                        "' (kv-tokens, max-num-seqs, max-model-len, spec, draft-tokens, priority, lora)");
                 }
                 if (comma == std::string::npos) { break; }
                 cursor = comma + 1;
