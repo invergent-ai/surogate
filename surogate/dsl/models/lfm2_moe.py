@@ -102,6 +102,9 @@ class Lfm2MoeModel(nn.Model):
         # the same w1/w3/w2 names, so the gate/up pair must be named explicitly --
         # the default derivation only knows gate_proj/up_proj.
         "router_weight": f"{_FFN}.gate.weight",
+        # The aux-loss-free selection bias. LFM2-MoE parks it on the feed-forward
+        # rather than under experts/ the way Laguna does.
+        "e_score_correction_bias": f"{_FFN}.expert_bias",
         "experts_gate_up": stack_experts(
             f"{_FFN}.experts.{{expert}}.w1.weight",
             fuse_gate_up=True,
@@ -200,7 +203,7 @@ class Lfm2MoeModel(nn.Model):
         moe_kwargs = dict(
             num_experts=num_experts,
             num_experts_per_tok=num_experts_per_tok,
-            norm_topk_prob=norm_topk_prob,
+            routed_scaling_factor=routed_scaling_factor,
             ep_size=ep_size,
         )
 

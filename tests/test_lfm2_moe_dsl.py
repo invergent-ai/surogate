@@ -65,6 +65,17 @@ def test_lfm2_moe_uses_raw_intermediate_sizes():
     assert config["moe_d_ff"] == 96
 
 
+def test_lfm2_moe_routes_with_sigmoid_and_a_selection_bias():
+    # HF's Lfm2MoeTopKRouter scores with sigmoid and picks top-k on
+    # (score + expert_bias), weighting winners by their UNBIASED score. A softmax
+    # router would be silently different arithmetic, so assert the emitted op.
+    ir = _compile()
+    ops = {op["kernel_type"] for op in ir["forward"]["operations"]}
+    assert "moe_sigmoid" in ops
+    assert "moe_softmax" not in ops
+    assert ir["hf_mapping"]["blocks[2].e_score_correction_bias"] == "model.layers.2.feed_forward.expert_bias"
+
+
 def test_lfm2_moe_maps_per_expert_checkpoint_tensors():
     mappings = _compile()["hf_mapping"]
 

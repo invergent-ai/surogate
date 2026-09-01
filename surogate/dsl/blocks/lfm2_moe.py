@@ -8,7 +8,10 @@ carries up to four block shapes; the dense pair is LFM2's own
 counterparts.
 
 The router is sigmoid-gated with an aux-loss-free selection bias: the bias moves
-which experts win top-k, never the weight a winner is applied with.
+which experts win top-k, never the weight a winner is applied with. That is the
+same routing Laguna uses, so the expert module is shared -- the alternative,
+``MoEExpertsGated``, emits a softmax router and would have trained this model
+with routing arithmetic its checkpoint was never fitted to.
 """
 
 from __future__ import annotations
@@ -17,13 +20,16 @@ from .. import nn
 from ..attention import AttentionConfig
 from ..block_schema import BlockSchema, DistributionDecl, EPTopology, RoutingSchema, SlotDecl, StreamingHint
 from ..dim import B, Dim, T
-from ..modules import GenericGQAttention, Lfm2ShortConv, MoEExpertsGated, RMSNorm
+from ..modules import GenericGQAttention, LagunaMoEExperts, Lfm2ShortConv, RMSNorm
 from .common import MOE_BLOCK_NAME_REMAP
 from .lfm2 import LFM2_ATTENTION_BLOCK_REMAP, LFM2_CONV_BLOCK_REMAP
 
 # The MoE half of the name remap, lifted off the dense-MoE block so the two
 # families cannot drift apart.
-_MOE_REMAP_TAIL: dict[str, str] = {k: v for k, v in MOE_BLOCK_NAME_REMAP.items() if k.startswith("moe_")}
+_MOE_REMAP_TAIL: dict[str, str] = {
+    **{k: v for k, v in MOE_BLOCK_NAME_REMAP.items() if k.startswith("moe_")},
+    "moe_e_score_correction_bias": "e_score_correction_bias",
+}
 
 # Operator halves of the LFM2 remaps, with the dense MLP entries dropped.
 _LFM2_ATTENTION_OPERATOR_REMAP: dict[str, str] = {
@@ -40,6 +46,12 @@ LFM2_MOE_CONV_BLOCK_REMAP: dict[str, str] = {**_LFM2_CONV_OPERATOR_REMAP, **_MOE
 def _moe_slots() -> tuple[SlotDecl, ...]:
     return (
         SlotDecl("router_weight", kind="param", shape=("E", "C"), distribution=DistributionDecl.router_replicated()),
+        SlotDecl(
+            "e_score_correction_bias",
+            kind="param",
+            shape=("E",),
+            distribution=DistributionDecl.router_replicated(),
+        ),
         SlotDecl(
             "experts_gate_up",
             kind="param",
@@ -106,7 +118,7 @@ class Lfm2MoeAttentionBlock(nn.Block):
         num_experts: int,
         num_experts_per_tok: int,
         eps: float = 1e-5,
-        norm_topk_prob: bool = True,
+        routed_scaling_factor: float = 1.0,
         ep_size: int = 1,
     ):
         super().__init__()
@@ -125,12 +137,12 @@ class Lfm2MoeAttentionBlock(nn.Block):
             config=AttentionConfig(qk_norm=True, eps=eps),
         )
         self.ffn_norm = RMSNorm(d_model, eps=eps)
-        self.moe = MoEExpertsGated(
+        self.moe = LagunaMoEExperts(
             d_model,
             d_ff,
             num_experts,
             num_experts_per_tok,
-            norm_topk_prob=norm_topk_prob,
+            routed_scaling_factor=routed_scaling_factor,
             ep_size=ep_size,
         )
 
@@ -181,7 +193,7 @@ class Lfm2MoeConvBlock(nn.Block):
         conv_kernel: int = 3,
         eps: float = 1e-5,
         conv_bias: bool = False,
-        norm_topk_prob: bool = True,
+        routed_scaling_factor: float = 1.0,
         ep_size: int = 1,
     ):
         super().__init__()
@@ -191,12 +203,12 @@ class Lfm2MoeConvBlock(nn.Block):
         self.operator_norm = RMSNorm(d_model, eps=eps)
         self.short_conv = Lfm2ShortConv(d_model, conv_kernel=conv_kernel, use_bias=conv_bias)
         self.ffn_norm = RMSNorm(d_model, eps=eps)
-        self.moe = MoEExpertsGated(
+        self.moe = LagunaMoEExperts(
             d_model,
             d_ff,
             num_experts,
             num_experts_per_tok,
-            norm_topk_prob=norm_topk_prob,
+            routed_scaling_factor=routed_scaling_factor,
             ep_size=ep_size,
         )
 
