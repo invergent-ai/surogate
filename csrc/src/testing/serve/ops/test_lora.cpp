@@ -12,6 +12,7 @@
 #include "ops/op_tester.h"
 
 #include <cmath>
+#include <memory>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
@@ -290,6 +291,105 @@ void test_batched(std::int32_t n, std::int32_t k, std::int32_t rank, std::int32_
     std::printf("  %-44s max relative error %.2e\n", label.c_str(), worst);
 }
 
+// The fused site (one launch, up to three pairs sharing x) against the same CPU
+// reference the two-kernel path is held to, mixed base and adapted tokens.
+void test_fused(const std::vector<std::int32_t>& ns, std::int32_t k, std::int32_t rank,
+                std::int32_t slots, const std::vector<std::int32_t>& ids) {
+    const auto tokens = static_cast<std::int32_t>(ids.size());
+    const auto pair_count = static_cast<std::int32_t>(ns.size());
+    const auto host_x = random_bf16(static_cast<std::size_t>(k) * tokens, 21, 1.0F);
+    GuardedDeviceBuffer x_dev(host_x.size() * sizeof(std::uint16_t));
+    x_dev.copy_from_host(host_x.data(), x_dev.bytes());
+    Tensor x(x_dev.data(), DType::BF16, {k, tokens});
+    GuardedDeviceBuffer ids_dev(ids.size() * sizeof(std::int32_t));
+    ids_dev.copy_from_host(ids.data(), ids_dev.bytes());
+    Tensor id_tensor(ids_dev.data(), DType::I32, {tokens});
+
+    std::vector<std::vector<std::uint16_t>> host_a, host_b, host_base;
+    std::vector<std::unique_ptr<GuardedDeviceBuffer>> a_dev, b_dev, out_dev;
+    std::vector<ops::LoraBank> banks(pair_count);
+    std::vector<Tensor> outs(pair_count);
+    std::vector<const ops::LoraBank*> bank_ptrs(pair_count);
+    std::vector<Tensor*> out_ptrs(pair_count);
+    for (std::int32_t p = 0; p < pair_count; ++p) {
+        const std::int32_t n = ns[static_cast<std::size_t>(p)];
+        host_a.push_back(random_bf16(static_cast<std::size_t>(slots) * rank * k, 22 + p, 0.06F));
+        host_b.push_back(random_bf16(static_cast<std::size_t>(slots) * n * rank, 32 + p, 0.06F));
+        host_base.push_back(random_bf16(static_cast<std::size_t>(n) * tokens, 42 + p, 1.0F));
+        a_dev.push_back(std::make_unique<GuardedDeviceBuffer>(host_a.back().size() * 2));
+        a_dev.back()->copy_from_host(host_a.back().data(), a_dev.back()->bytes());
+        b_dev.push_back(std::make_unique<GuardedDeviceBuffer>(host_b.back().size() * 2));
+        b_dev.back()->copy_from_host(host_b.back().data(), b_dev.back()->bytes());
+        out_dev.push_back(std::make_unique<GuardedDeviceBuffer>(host_base.back().size() * 2));
+        out_dev.back()->copy_from_host(host_base.back().data(), out_dev.back()->bytes());
+        ops::LoraBank& bank = banks[static_cast<std::size_t>(p)];
+        bank.a        = a_dev.back()->data();
+        bank.b        = b_dev.back()->data();
+        bank.a_stride = static_cast<std::int64_t>(rank) * k;
+        bank.b_stride = static_cast<std::int64_t>(n) * rank;
+        bank.rank     = rank;
+        bank.n        = n;
+        bank.k        = k;
+        outs[static_cast<std::size_t>(p)]      = Tensor(out_dev.back()->data(), DType::BF16, {n, tokens});
+        bank_ptrs[static_cast<std::size_t>(p)] = &bank;
+        out_ptrs[static_cast<std::size_t>(p)]  = &outs[static_cast<std::size_t>(p)];
+    }
+
+    std::int64_t scratch_elems = 0;
+    for (const ops::LoraBank& bank : banks) { scratch_elems += bank.rank; }
+    scratch_elems *= tokens;
+    GuardedDeviceBuffer scratch_dev(static_cast<std::size_t>(scratch_elems) * 2);
+    Tensor scratch(scratch_dev.data(), DType::BF16,
+                   {static_cast<std::int32_t>(scratch_elems)});
+    ops::lora_delta_fused(x, bank_ptrs.data(), out_ptrs.data(), pair_count, id_tensor, nullptr,
+                          scratch, nullptr);
+    cuda_synchronize();
+
+    double worst = 0.0;
+    for (std::int32_t p = 0; p < pair_count; ++p) {
+        const std::int32_t n = ns[static_cast<std::size_t>(p)];
+        std::vector<std::uint16_t> got(static_cast<std::size_t>(n) * tokens);
+        out_dev[static_cast<std::size_t>(p)]->copy_to_host(got.data(),
+                                                           got.size() * sizeof(std::uint16_t));
+        const auto& a_host    = host_a[static_cast<std::size_t>(p)];
+        const auto& b_host    = host_b[static_cast<std::size_t>(p)];
+        const auto& base_host = host_base[static_cast<std::size_t>(p)];
+        for (std::int32_t t = 0; t < tokens; ++t) {
+            const std::int32_t slot = ids[static_cast<std::size_t>(t)];
+            for (std::int32_t row = 0; row < n; ++row) {
+                double delta = 0.0;
+                if (slot >= 0) {
+                    for (std::int32_t r = 0; r < rank; ++r) {
+                        double partial = 0.0;
+                        for (std::int32_t i = 0; i < k; ++i) {
+                            const auto a_bits =
+                                a_host[(static_cast<std::size_t>(slot) * rank + r) * k + i];
+                            const auto x_bits = host_x[static_cast<std::size_t>(t) * k + i];
+                            partial += static_cast<double>(from_bf16(a_bits)) *
+                                       static_cast<double>(from_bf16(x_bits));
+                        }
+                        const auto b_bits =
+                            b_host[(static_cast<std::size_t>(slot) * n + row) * rank + r];
+                        delta += static_cast<double>(from_bf16(b_bits)) * partial;
+                    }
+                }
+                const double want =
+                    static_cast<double>(
+                        from_bf16(base_host[static_cast<std::size_t>(t) * n + row])) +
+                    delta;
+                const double have =
+                    static_cast<double>(from_bf16(got[static_cast<std::size_t>(t) * n + row]));
+                const double scale = std::max(1.0, std::abs(want));
+                worst              = std::max(worst, std::abs(want - have) / scale);
+            }
+        }
+    }
+    const std::string label = "fused pairs=" + std::to_string(pair_count) + " k=" +
+                              std::to_string(k) + " T=" + std::to_string(tokens);
+    check(worst < 1e-2, label + " (relative error " + std::to_string(worst) + ")");
+    std::printf("  %-44s max relative error %.2e\n", label.c_str(), worst);
+}
+
 void test_directory() {
     ops::LoraStore store;
     store.configure(/*slots=*/2, /*max_rank=*/8, /*max_tokens=*/64);
@@ -334,6 +434,10 @@ void test_directory() {
 int main() {
     try {
         test_directory();
+        test_fused({256, 64, 64}, 1024, 8, 3, {0, -1, 2, 1});  // the q/k/v shape, mixed tokens
+        test_fused({512}, 3584, 8, 2, {1});                    // a lone down site, T=1
+        test_fused({128, 128}, 96, 16, 2, {-1, -1});           // all-base tokens stay exact
+        test_fused({4096, 1024, 1024}, 2560, 8, 3, {0, 2, -1, 1}); // wide site -> the split path
         test_delta(64, 128, 8, 1);    // decode width
         test_delta(256, 512, 16, 4);  // speculative verify width
         test_delta(512, 2048, 32, 37); // a prefill slice, rank 32

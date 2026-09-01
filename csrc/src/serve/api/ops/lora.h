@@ -81,6 +81,18 @@ void lora_delta_batched(const Tensor& x, const LoraBank& bank, const Tensor& ids
                         const std::int32_t* uniform_slot, Tensor& out, Tensor& scratch,
                         cudaStream_t stream);
 
+/// The one-launch flavor: shrink and expand of up to three projections that
+/// share an input, low vectors in shared memory instead of a scratch tensor.
+/// This is what the serving hooks use -- an adapter site was two launches per
+/// module and q/k/v were six, and a round's delta cost was kernel entry, not
+/// math. `banks`/`outs` are parallel arrays of `pair_count` (1..3) entries; all
+/// pairs read the same `x`. Selection is per token via `ids`, or the device
+/// cell `uniform_slot` when `ids` is empty; a negative slot contributes
+/// nothing.
+void lora_delta_fused(const Tensor& x, const LoraBank* const* banks, Tensor* const* outs,
+                      std::int32_t pair_count, const Tensor& ids,
+                      const std::int32_t* uniform_slot, Tensor& scratch, cudaStream_t stream);
+
 /// BF16 scratch elements `lora_delta_batched` needs for a round of `tokens`.
 [[nodiscard]] std::size_t lora_batched_workspace_elements(std::int32_t rank,
                                                           std::int32_t tokens) noexcept;

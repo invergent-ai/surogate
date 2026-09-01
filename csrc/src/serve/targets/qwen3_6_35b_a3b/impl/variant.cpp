@@ -131,9 +131,7 @@ void Variant::attention_projection(const Tensor& hidden,
                                    Tensor& gate, Tensor& key, Tensor& value, qwen3_6::TextPhase,
                                    WorkspaceArena&, cudaStream_t stream) {
     ops::attn_input_proj(hidden, weights.query_key_gate_value, query, gate, key, value, stream);
-    qwen3_6::apply_lora(weights.query_key_gate_value, 0, hidden, query, stream);
-    qwen3_6::apply_lora(weights.query_key_gate_value, 1, hidden, key, stream);
-    qwen3_6::apply_lora(weights.query_key_gate_value, 2, hidden, value, stream);
+    qwen3_6::apply_lora_qkv(weights.query_key_gate_value, hidden, query, key, value, stream);
 }
 
 void Variant::attention_output_projection(const Tensor& attention, const Weight& weight,

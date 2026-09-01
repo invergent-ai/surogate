@@ -5,6 +5,8 @@
 
 #include "api/ops/residual_add.h"
 #include "ops/launcher/lora_batched.h"
+#include "ops/launcher/lora_fused.h"
+#include "ops/kernel/lora_fused_limits.h"
 #include "ops/linear/bf16/bf16_cublaslt.h"
 
 #include <stdexcept>
@@ -115,6 +117,68 @@ void lora_delta_batched(const Tensor& x, const LoraBank& bank, const Tensor& ids
                                        uniform_slot, stream);
     detail::lora_batched_expand_launch(low, bank.b, ids, out, bank.n, bank.rank, bank.b_stride,
                                        uniform_slot, stream);
+}
+
+void lora_delta_fused(const Tensor& x, const LoraBank* const* banks, Tensor* const* outs,
+                      std::int32_t pair_count, const Tensor& ids,
+                      const std::int32_t* uniform_slot, Tensor& scratch, cudaStream_t stream) {
+    if (pair_count <= 0 || pair_count > kLoraFusedPairLimit) {
+        throw std::invalid_argument("lora_delta_fused: 1..3 pairs");
+    }
+    const bool per_token = ids.data != nullptr;
+    if (per_token && ids.dtype != DType::I32) {
+        throw std::invalid_argument("lora_delta_fused: ids must be a device I32 tensor");
+    }
+    if (!per_token && uniform_slot == nullptr) { return; }
+    if (x.dtype != DType::BF16 || !x.is_contiguous()) {
+        throw std::invalid_argument("lora_delta_fused: x must be contiguous BF16");
+    }
+    const std::int32_t tokens = x.ne[1];
+    if (tokens <= 0 || (per_token && ids.numel() < tokens)) {
+        throw std::invalid_argument("lora_delta_fused: ids must cover the round's tokens");
+    }
+    for (std::int32_t p = 0; p < pair_count; ++p) {
+        const LoraBank* bank = banks[p];
+        Tensor* out          = outs[p];
+        if (bank == nullptr || bank->rank <= 0 || bank->a == nullptr || bank->b == nullptr) {
+            throw std::invalid_argument("lora_delta_fused: every pair needs a live bank");
+        }
+        if (bank->rank > kLoraFusedRankLimit) {
+            throw std::invalid_argument("lora_delta_fused: rank exceeds the fused kernel's limit");
+        }
+        if (out->dtype != DType::BF16 || !out->is_contiguous() || out->ne[1] != tokens) {
+            throw std::invalid_argument("lora_delta_fused: outputs must be contiguous BF16 [n, T]");
+        }
+        // One x for every pair is the point of the fusion, so one k too.
+        if (bank->k != x.ne[0] || out->ne[0] != bank->n) {
+            throw std::invalid_argument("lora_delta_fused: bank does not match this projection");
+        }
+    }
+    // One launch when the recomputation is cheap, two when it is not. Every
+    // stage-2 block of the one-launch kernel redoes stage 1, so its extra A
+    // traffic is tokens x blocks x total_rank x k -- negligible for a narrow
+    // site at decode, gigabytes for a wide site under a prefill chunk. The
+    // threshold is where the measured curves crossed on the 0.8b/4b geometries.
+    std::int64_t total_rows = 0, total_rank = 0;
+    for (std::int32_t p = 0; p < pair_count; ++p) {
+        total_rows += banks[p]->n;
+        total_rank += banks[p]->rank;
+    }
+    const std::int64_t blocks = (total_rows + 127) / 128;
+    const std::int64_t redundant_bytes =
+        static_cast<std::int64_t>(tokens) * blocks * total_rank * x.ne[0] * 2;
+    constexpr std::int64_t kRedundancyBudget = 2LL << 20;
+    if (redundant_bytes <= kRedundancyBudget) {
+        detail::lora_fused_delta_launch(x, banks, outs, pair_count, ids, uniform_slot, stream);
+        return;
+    }
+    if (scratch.dtype != DType::BF16 || !scratch.is_contiguous() ||
+        scratch.numel() < total_rank * tokens) {
+        throw std::invalid_argument(
+            "lora_delta_fused: this site needs scratch of at least total_rank x tokens");
+    }
+    detail::lora_split_delta_launch(x, banks, outs, pair_count, ids, uniform_slot, scratch,
+                                    stream);
 }
 
 } // namespace sinfer::ops

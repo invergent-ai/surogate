@@ -179,6 +179,7 @@ namespace {
 /// hook is baked in by address instead -- which is what made an earlier version
 /// of this give a different answer on every replay.
 using qwen3_6::apply_lora;
+using qwen3_6::apply_lora_qkv;
 
 } // namespace
 
@@ -194,9 +195,7 @@ void Variant::attention_projection(const Tensor& hidden,
     const Weight& fused = std::get<FusedAttentionProjectionPayload>(weights).query_key_gate_value;
     ops::attn_input_proj(hidden, fused, query, gate, key, value, text_policy(fused), workspace,
                          stream);
-    apply_lora(fused, 0, hidden, query, stream);
-    apply_lora(fused, 1, hidden, key, stream);
-    apply_lora(fused, 2, hidden, value, stream);
+    apply_lora_qkv(fused, hidden, query, key, value, stream);
 }
 
 void Variant::attention_output_projection(const Tensor& attention, const Weight& weight,

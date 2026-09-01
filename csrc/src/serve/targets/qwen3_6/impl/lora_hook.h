@@ -42,10 +42,43 @@ inline void apply_lora(const Weight& base, std::int32_t port, const Tensor& hidd
     }
     if (debug) { std::fprintf(stderr, "lora-hook: applying\n"); }
     static const Tensor kNoIds{};
-    ops::lora_delta_batched(hidden, *bank, round.slots != nullptr ? *round.slots : kNoIds,
-                            round.uniform ? ops::lora_store_for_current_device().uniform_cell()
-                                          : nullptr,
-                            out, const_cast<Tensor&>(round.scratch), stream);
+    const ops::LoraBank* banks[1] = {bank};
+    Tensor* outs[1]               = {&out};
+    ops::lora_delta_fused(hidden, banks, outs, 1,
+                          round.slots != nullptr ? *round.slots : kNoIds,
+                          round.uniform ? ops::lora_store_for_current_device().uniform_cell()
+                                        : nullptr,
+                          const_cast<Tensor&>(round.scratch), stream);
+}
+
+/// The q/k/v site: three projections out of one fused weight, one launch. They
+/// read the same hidden column, which is what makes the shared-input fusion
+/// legal; a site whose banks are absent contributes nothing.
+inline void apply_lora_qkv(const Weight& base, const Tensor& hidden, Tensor& query, Tensor& key,
+                           Tensor& value, cudaStream_t stream) {
+    if (!ops::lora_active()) { return; }
+    ops::LoraStore& store = ops::lora_store_for_current_device();
+    const ops::LoraBank* banks[3] = {store.find(base.qdata, 0), store.find(base.qdata, 1),
+                                     store.find(base.qdata, 2)};
+    Tensor* candidates[3]         = {&query, &key, &value};
+    const ops::LoraBank* live[3]  = {};
+    Tensor* outs[3]               = {};
+    std::int32_t pairs            = 0;
+    for (int p = 0; p < 3; ++p) {
+        if (banks[p] != nullptr) {
+            live[pairs] = banks[p];
+            outs[pairs] = candidates[p];
+            ++pairs;
+        }
+    }
+    if (pairs == 0) { return; }
+    const ops::LoraRound& round = ops::lora_current_round();
+    if (!round.valid()) { return; }
+    static const Tensor kNoIds{};
+    ops::lora_delta_fused(hidden, live, outs, pairs,
+                          round.slots != nullptr ? *round.slots : kNoIds,
+                          round.uniform ? store.uniform_cell() : nullptr,
+                          const_cast<Tensor&>(round.scratch), stream);
 }
 
 } // namespace sinfer::targets::qwen3_6

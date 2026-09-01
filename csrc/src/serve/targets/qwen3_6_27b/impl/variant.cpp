@@ -184,9 +184,7 @@ void Variant::attention_projection(const Tensor& hidden,
     const Weight& fused = std::get<FusedAttentionProjectionPayload>(weights).query_key_gate_value;
     ops::attn_input_proj(hidden, fused, query, gate, key, value, text_policy(fused), workspace,
                          stream);
-    qwen3_6::apply_lora(fused, 0, hidden, query, stream);
-    qwen3_6::apply_lora(fused, 1, hidden, key, stream);
-    qwen3_6::apply_lora(fused, 2, hidden, value, stream);
+    qwen3_6::apply_lora_qkv(fused, hidden, query, key, value, stream);
 }
 
 void Variant::attention_output_projection(const Tensor& attention, const Weight& weight,

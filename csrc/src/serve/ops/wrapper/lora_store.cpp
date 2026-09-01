@@ -3,6 +3,7 @@
 #include "api/ops/lora_store.h"
 
 #include "core/device.h"
+#include "ops/kernel/lora_fused_limits.h"
 
 #include <algorithm>
 #include <cmath>
@@ -59,7 +60,10 @@ void LoraStore::configure(std::int32_t slots, std::int32_t max_rank, std::int32_
     slots_          = slots;
     max_rank_       = max_rank;
     scratch_tokens_ = max_tokens;
-    scratch_        = upload_zeroed(static_cast<std::size_t>(max_rank) * max_tokens);
+    // Wide enough for a split site's low vectors: up to three pairs share one
+    // launch, each padded to max_rank.
+    scratch_        = upload_zeroed(static_cast<std::size_t>(kLoraFusedPairLimit) * max_rank *
+                               max_tokens);
     CUDA_CHECK(cudaMalloc(&uniform_cell_, sizeof(std::int32_t)));
     const std::int32_t none = -1;
     CUDA_CHECK(cudaMemcpy(uniform_cell_, &none, sizeof(none), cudaMemcpyHostToDevice));
@@ -69,7 +73,7 @@ Tensor LoraStore::scratch(std::int32_t tokens) const {
     if (scratch_ == nullptr || tokens <= 0 || tokens > scratch_tokens_) { return Tensor{}; }
     // The view is the widest allocation, not the round's width: a captured graph
     // must see one shape, and the kernels bound their work by the ids they read.
-    return Tensor(scratch_, DType::BF16, {max_rank_ * scratch_tokens_});
+    return Tensor(scratch_, DType::BF16, {kLoraFusedPairLimit * max_rank_ * scratch_tokens_});
 }
 
 void LoraStore::set_slot(const void* base_key, std::int32_t port, std::int32_t slot,

@@ -1536,9 +1536,7 @@ void Variant::attention_projection(const Tensor& hidden,
     ops::extract_bf16_columns(fused, TextConfig::query_size + TextConfig::kv_size, gate, stream);
     ops::extract_bf16_columns(fused, 2 * TextConfig::query_size + TextConfig::kv_size, value,
                               stream);
-    qwen3_6::apply_lora(weights.query_key_gate_value, 0, hidden, query, stream);
-    qwen3_6::apply_lora(weights.query_key_gate_value, 1, hidden, key, stream);
-    qwen3_6::apply_lora(weights.query_key_gate_value, 2, hidden, value, stream);
+    qwen3_6::apply_lora_qkv(weights.query_key_gate_value, hidden, query, key, value, stream);
 }
 
 void Variant::attention_output_projection(const Tensor& attention, const Weight& weight,
