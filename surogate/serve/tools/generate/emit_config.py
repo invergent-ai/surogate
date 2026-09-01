@@ -182,6 +182,33 @@ struct TextConfig {{
     static constexpr float rms_epsilon           = {_float_literal(spec.rms_epsilon)};
     static constexpr float rope_theta            = {_float_literal(spec.rope_theta)};
 
+    // Causal sliding-window attention. Zero is a model whose every layer sees the
+    // whole context; otherwise a query at position i admits keys j with
+    // `i - j < sliding_window`, i.e. exactly `sliding_window` keys including its
+    // own. `sliding_window_period` is how often a layer escapes the window: with
+    // 6, every 6th layer is global. Windowed layers rotate at their own base.
+    static constexpr int sliding_window          = {spec.sliding_window};
+    static constexpr int sliding_window_period   = {spec.sliding_window_period};
+    static constexpr float sliding_rope_theta    = {_float_literal(spec.sliding_rope_theta or spec.rope_theta)};
+
+    // Applied to the embedding lookup before the first block. Zero means none.
+    static constexpr float embedding_scale       = {_float_literal(spec.embedding_scale)};
+
+    /// True when this layer sees the whole context. A model with no window has
+    /// every layer global; otherwise the period says which escape it. Gemma 3
+    /// counts from the end -- its last layer is global -- which is what
+    /// `(layer + 1) % period == 0` expresses.
+    [[nodiscard]] static constexpr bool is_windowed_attention(int layer) {{
+        if (sliding_window <= 0) {{ return false; }}
+        if (sliding_window_period <= 0) {{ return true; }}
+        return ((layer + 1) % sliding_window_period) != 0;
+    }}
+
+    /// The rope base this layer rotates at.
+    [[nodiscard]] static constexpr float layer_rope_theta(int layer) {{
+        return is_windowed_attention(layer) ? sliding_rope_theta : rope_theta;
+    }}
+
     static constexpr int key_dim               = 0;
     static constexpr int value_dim             = 0;
     static constexpr int convolution_dim       = 0;
