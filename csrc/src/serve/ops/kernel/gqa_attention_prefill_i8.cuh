@@ -20,38 +20,57 @@ inline constexpr int kGqaPrefillI8Warps      = 16;
 inline constexpr int kGqaPrefillI8Threads    = kGqaPrefillI8Warps * 32;
 inline constexpr int kGqaPrefillI8Br         = 64;
 inline constexpr int kGqaPrefillI8Bc         = 64;
-inline constexpr int kGqaPrefillI8Groups     = kGqaPrefillHeadDim / kGqaKvQuantGroup;
-inline constexpr int kGqaPrefillI8DB16       = kGqaPrefillHeadDim / 2;
 inline constexpr int kGqaPrefillI8RowTiles   = kGqaPrefillI8Br / 16;
 inline constexpr int kGqaPrefillI8DConsumers = kGqaPrefillI8Warps / kGqaPrefillI8RowTiles;
 
-inline constexpr int kGqaPrefillI8QBytes = kGqaPrefillI8Br * kGqaPrefillHeadDim;
+// Everything below is a function of the head dimension, so it is a template over
+// it rather than a file constant: a launcher asks for the arena of the geometry it
+// is about to launch. The tile widths are unchanged; only the head is.
+template <int HeadDim>
+inline constexpr int kGqaPrefillI8Groups = HeadDim / kGqaKvQuantGroup;
+template <int HeadDim>
+inline constexpr int kGqaPrefillI8DB16 = HeadDim / 2;
+
+template <int HeadDim>
+inline constexpr int kGqaPrefillI8QBytes = kGqaPrefillI8Br * HeadDim;
+template <int HeadDim>
 inline constexpr int kGqaPrefillI8QScaleBytes =
-    kGqaPrefillI8Br * kGqaPrefillI8Groups * static_cast<int>(sizeof(float));
-inline constexpr int kGqaPrefillI8KBytes = kGqaPrefillI8Bc * kGqaPrefillHeadDim;
-inline constexpr int kGqaPrefillI8VBytes = kGqaPrefillI8Bc * kGqaPrefillHeadDim;
+    kGqaPrefillI8Br * kGqaPrefillI8Groups<HeadDim> * static_cast<int>(sizeof(float));
+template <int HeadDim>
+inline constexpr int kGqaPrefillI8KBytes = kGqaPrefillI8Bc * HeadDim;
+template <int HeadDim>
+inline constexpr int kGqaPrefillI8VBytes = kGqaPrefillI8Bc * HeadDim;
+template <int HeadDim>
 inline constexpr int kGqaPrefillI8VStageBytes =
-    kGqaPrefillI8Bc * kGqaPrefillHeadDim * static_cast<int>(sizeof(__half));
+    kGqaPrefillI8Bc * HeadDim * static_cast<int>(sizeof(__half));
 inline constexpr int kGqaPrefillI8PBytes =
     kGqaPrefillI8Br * kGqaPrefillI8Bc * static_cast<int>(sizeof(__half));
+template <int HeadDim>
 inline constexpr int kGqaPrefillI8ScaleBytes =
-    2 * kGqaPrefillI8Bc * kGqaPrefillI8Groups * static_cast<int>(sizeof(__half));
+    2 * kGqaPrefillI8Bc * kGqaPrefillI8Groups<HeadDim> * static_cast<int>(sizeof(__half));
 inline constexpr int kGqaPrefillI8StatsBytes =
     2 * kGqaPrefillI8Br * static_cast<int>(sizeof(float));
-inline constexpr int kGqaPrefillI8SmemBytes = kGqaPrefillI8QBytes + kGqaPrefillI8QScaleBytes +
-                                              kGqaPrefillI8KBytes + kGqaPrefillI8VBytes +
-                                              kGqaPrefillI8VStageBytes + kGqaPrefillI8PBytes +
-                                              kGqaPrefillI8ScaleBytes + kGqaPrefillI8StatsBytes;
+template <int HeadDim>
+inline constexpr int kGqaPrefillI8SmemBytes =
+    kGqaPrefillI8QBytes<HeadDim> + kGqaPrefillI8QScaleBytes<HeadDim> +
+    kGqaPrefillI8KBytes<HeadDim> + kGqaPrefillI8VBytes<HeadDim> +
+    kGqaPrefillI8VStageBytes<HeadDim> + kGqaPrefillI8PBytes + kGqaPrefillI8ScaleBytes<HeadDim> +
+    kGqaPrefillI8StatsBytes;
 
-static_assert(kGqaPrefillI8Groups == 4);
+// Tuning invariants of the 256-wide instantiation, which is the one the warp
+// schedule and the 120-register budget below were measured against: four 64-wide
+// quantization groups per head and a 92,672-byte arena. They assert that
+// instantiation, not the template -- a 128-wide head carries two groups and a
+// smaller arena, and is correct with different numbers.
+static_assert(kGqaPrefillI8Groups<256> == 4);
 static_assert(kGqaPrefillI8DConsumers == 4);
-static_assert(kGqaPrefillI8SmemBytes == 92672);
+static_assert(kGqaPrefillI8SmemBytes<256> == 92672);
 
 __device__ __forceinline__ void gqa_prefill_i8_store_swz(std::int8_t* tile, int row, int d,
-                                                         std::int8_t code) {
+                                                         int d_b16_stride, std::int8_t code) {
     const int col_b16 = d >> 1;
     const int byte    = d & 1;
-    const int off     = (row * kGqaPrefillI8DB16 + gqa_prefill_swz(row, col_b16)) * 2 + byte;
+    const int off     = (row * d_b16_stride + gqa_prefill_swz(row, col_b16)) * 2 + byte;
     tile[off]         = code;
 }
 
@@ -89,16 +108,17 @@ __launch_bounds__(256) __global__
                                               __half* __restrict__ scale_k,
                                               __half* __restrict__ scale_v, std::int32_t width) {
     constexpr int Warps         = 8;
+    constexpr int Groups        = kGqaKvQuantGroups<Geometry>;
     constexpr unsigned FullMask = 0xffffffffu;
     const int tokens            = metadata.valid_tokens(width);
     const int warp              = static_cast<int>(threadIdx.x) >> 5;
     const int lane              = static_cast<int>(threadIdx.x) & 31;
     const int unit              = static_cast<int>(blockIdx.x) * Warps + warp;
-    const int units             = tokens * Geometry::KVHeads * kGqaPrefillI8Groups;
+    const int units             = tokens * Geometry::KVHeads * Groups;
     if (unit >= units) { return; }
 
-    const int group                 = unit % kGqaPrefillI8Groups;
-    const int tmp                   = unit / kGqaPrefillI8Groups;
+    const int group                 = unit % Groups;
+    const int tmp                   = unit / Groups;
     const int kv_head               = tmp % Geometry::KVHeads;
     const int token                 = tmp / Geometry::KVHeads;
     const int position              = positions[0] + token;
@@ -195,17 +215,17 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_i8_page_kernel
     const int position = base_position + token;
     const int page_off = position & kPagedKVPageMask;
     const std::int64_t code_base =
-        paged_kv_page_head_offset<kGqaKvQuantHeadDim, Geometry::KVHeads>(physical_page, kv_head) +
-        static_cast<std::int64_t>(page_off) * kGqaKvQuantHeadDim + group * kGqaKvQuantGroup;
+        paged_kv_page_head_offset<Geometry::HeadDim, Geometry::KVHeads>(physical_page, kv_head) +
+        static_cast<std::int64_t>(page_off) * Geometry::HeadDim + group * kGqaKvQuantGroup;
     cache_k[code_base + lane]      = gqa_kv_quant_code(k0, kinv);
     cache_k[code_base + lane + 32] = gqa_kv_quant_code(k1, kinv);
     cache_v[code_base + lane]      = gqa_kv_quant_code(v0, vinv);
     cache_v[code_base + lane + 32] = gqa_kv_quant_code(v1, vinv);
     if (lane == 0) {
         const std::int64_t scale_offset =
-            paged_kv_page_head_offset<kGqaKvQuantGroups, Geometry::KVHeads>(physical_page,
-                                                                            kv_head) +
-            static_cast<std::int64_t>(page_off) * kGqaKvQuantGroups + group;
+            paged_kv_page_head_offset<kGqaKvQuantGroups<Geometry>, Geometry::KVHeads>(
+                physical_page, kv_head) +
+            static_cast<std::int64_t>(page_off) * kGqaKvQuantGroups<Geometry> + group;
         scale_k[scale_offset] = ksh;
         scale_v[scale_offset] = vsh;
     }
@@ -218,11 +238,11 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
     const __half* __restrict__ cache_v_scale, Metadata metadata,
     const std::int32_t* __restrict__ positions, float scale, __nv_bfloat16* __restrict__ out,
     std::int32_t width) {
-    constexpr int D             = kGqaPrefillHeadDim;
+    constexpr int D             = Geometry::HeadDim;
     constexpr int Br            = kGqaPrefillI8Br;
     constexpr int Bc            = kGqaPrefillI8Bc;
-    constexpr int DB16          = kGqaPrefillI8DB16;
-    constexpr int Groups        = kGqaPrefillI8Groups;
+    constexpr int DB16          = kGqaPrefillI8DB16<D>;
+    constexpr int Groups        = kGqaPrefillI8Groups<D>;
     constexpr int GroupKc       = kGqaKvQuantGroup / 32;
     constexpr int QKNt          = Bc / 8;
     constexpr int PVNtPerWarp   = D / (kGqaPrefillI8DConsumers * 8);
@@ -234,17 +254,20 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
     constexpr unsigned FullMask = 0xffffffffu;
 
     static_assert(GroupKc == 2);
-    static_assert(PVNtPerWarp == 8);
+    // Each of the four d-slice warps owns PVNtPerWarp eight-wide output n-tiles and
+    // together they must tile the head exactly (eight tiles each at head dim 256,
+    // four at 128).
+    static_assert(PVNtPerWarp >= 1 && PVNtPerWarp * kGqaPrefillI8DConsumers * 8 == D);
 
     extern __shared__ __align__(16) unsigned char smem_raw[];
     std::int8_t* q_i8 = reinterpret_cast<std::int8_t*>(smem_raw);
-    float* q_scale    = reinterpret_cast<float*>(q_i8 + kGqaPrefillI8QBytes);
+    float* q_scale    = reinterpret_cast<float*>(q_i8 + kGqaPrefillI8QBytes<D>);
     std::int8_t* k_i8 = reinterpret_cast<std::int8_t*>(reinterpret_cast<unsigned char*>(q_scale) +
-                                                       kGqaPrefillI8QScaleBytes);
-    std::int8_t* v_i8 = k_i8 + kGqaPrefillI8KBytes;
-    __half* v_f16     = reinterpret_cast<__half*>(v_i8 + kGqaPrefillI8VBytes);
+                                                       kGqaPrefillI8QScaleBytes<D>);
+    std::int8_t* v_i8 = k_i8 + kGqaPrefillI8KBytes<D>;
+    __half* v_f16     = reinterpret_cast<__half*>(v_i8 + kGqaPrefillI8VBytes<D>);
     __half* p_s       = reinterpret_cast<__half*>(reinterpret_cast<unsigned char*>(v_f16) +
-                                                  kGqaPrefillI8VStageBytes);
+                                                  kGqaPrefillI8VStageBytes<D>);
     __half* k_scale_s =
         reinterpret_cast<__half*>(reinterpret_cast<unsigned char*>(p_s) + kGqaPrefillI8PBytes);
     __half* v_scale_s    = k_scale_s + Bc * Groups;
@@ -290,12 +313,19 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
         absmax          = warp_max(absmax, FullMask);
         const float qs  = absmax > 0.0f ? absmax / 127.0f : 0.0f;
         const float inv = qs > 0.0f ? 1.0f / qs : 0.0f;
-        gqa_prefill_i8_store_swz(q_i8, row, d0, gqa_kv_quant_code(x0, inv));
-        gqa_prefill_i8_store_swz(q_i8, row, d1, gqa_kv_quant_code(x1, inv));
+        gqa_prefill_i8_store_swz(q_i8, row, d0, DB16, gqa_kv_quant_code(x0, inv));
+        gqa_prefill_i8_store_swz(q_i8, row, d1, DB16, gqa_kv_quant_code(x1, inv));
         if (lane == 0) { q_scale[row * Groups + grp] = qs; }
     }
     __syncthreads();
 
+    // One key's group scales are exactly Groups halves wide. Copying a fixed eight
+    // bytes is right only for a head carrying four groups; on a two-group head it
+    // would land in the next key's slot, and on the last key past the end of the
+    // plane.
+    constexpr int ScaleBytes = Groups * static_cast<int>(sizeof(__half));
+    static_assert(ScaleBytes == 4 || ScaleBytes == 8 || ScaleBytes == 16,
+                  "a key's group scales must be a cp.async transfer width");
     auto issue_kv_tile = [&](int tile_k0) {
         const int physical_page = block_table[tile_k0 >> kPagedKVPageShift];
         for (int key_l = tid; key_l < Bc; key_l += kGqaPrefillI8Threads) {
@@ -305,11 +335,14 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
             if (key <= max_query_abs) {
                 const std::int64_t off =
                     gqa_kv_quant_scale_index<Geometry>(physical_page, kv_head, 0, key_l);
-                sinfer::ops::cp_async<8>(kd, &cache_k_scale[off]);
-                sinfer::ops::cp_async<8>(vd, &cache_v_scale[off]);
+                sinfer::ops::cp_async<ScaleBytes>(kd, &cache_k_scale[off]);
+                sinfer::ops::cp_async<ScaleBytes>(vd, &cache_v_scale[off]);
             } else {
-                store_vec(kd, make_int2(0, 0));
-                store_vec(vd, make_int2(0, 0));
+#pragma unroll
+                for (int grp = 0; grp < Groups; ++grp) {
+                    kd[grp] = __float2half_rn(0.0f);
+                    vd[grp] = __float2half_rn(0.0f);
+                }
             }
         }
 #pragma unroll 1
@@ -347,14 +380,16 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
     const int b_koff   = ((lane >> 3) & 1) << 3;
 
     // Keeping exactly two group scales live is the spill-free 120-register point on SM120.
-    // Groups 2/3 reload per key tile; retaining all four creates an 8-byte stack frame.
-    float q_scale_r0[Groups - 2];
-    float q_scale_r1[Groups - 2];
+    // The last two groups reload per key tile; retaining all four at head dim 256
+    // creates an 8-byte stack frame. A head with only two groups holds none.
+    constexpr int ResidentGroups = Groups > 2 ? Groups - 2 : 0;
+    float q_scale_r0[ResidentGroups > 0 ? ResidentGroups : 1];
+    float q_scale_r1[ResidentGroups > 0 ? ResidentGroups : 1];
     if (warp < ProducerWarps) {
         const int scale_row0 = warp * 16 + gid;
         const int scale_row1 = scale_row0 + 8;
 #pragma unroll
-        for (int grp = 0; grp < Groups - 2; ++grp) {
+        for (int grp = 0; grp < ResidentGroups; ++grp) {
             float qs0       = lid == 0 ? q_scale[scale_row0 * Groups + grp] : 0.0f;
             float qs1       = lid == 0 ? q_scale[scale_row1 * Groups + grp] : 0.0f;
             q_scale_r0[grp] = __shfl_sync(FullMask, qs0, gid * 4);
@@ -387,7 +422,7 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
             for (int grp = 0; grp < Groups; ++grp) {
                 float qs0;
                 float qs1;
-                if (grp < Groups - 2) {
+                if (grp < ResidentGroups) {
                     qs0 = q_scale_r0[grp];
                     qs1 = q_scale_r1[grp];
                 } else {
@@ -517,11 +552,19 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
                 const int d     = dc * 8;
                 const int key   = k0 + key_l;
                 __half* dst     = &v_f16[key_l * D + gqa_prefill_swz(key_l, d)];
-                if (key <= max_query_abs) {
-                    const int grp = d >> 6;
-                    __half vs     = __float2half_rn(0.0f);
-                    if ((lane & 7) == 0) { vs = v_scale_s[key_l * Groups + grp]; }
-                    vs = __shfl_sync(FullMask, vs, grp * 8);
+                const int grp   = d >> 6;
+                const bool live = key <= max_query_abs;
+                // Eight lanes share one 64-wide group, and the first of them reads
+                // its scale. Which lane that is follows from the lane's own
+                // position, not from the group index: a warp covers one key on a
+                // 256-wide head but two on a 128-wide one, so broadcasting from
+                // grp*8 would cross into the other key -- and for the same reason
+                // the masked tail is no longer warp-uniform, so the broadcast has
+                // to sit outside it.
+                __half vs = __float2half_rn(0.0f);
+                if (live && (lane & 7) == 0) { vs = v_scale_s[key_l * Groups + grp]; }
+                vs = __shfl_sync(FullMask, vs, lane & ~7);
+                if (live) {
                     store_vec(dst, gqa_prefill_i8_dequant_f16x8(&v_i8[key_l * D + d], vs));
                 } else {
                     store_vec(dst, make_int4(0, 0, 0, 0));

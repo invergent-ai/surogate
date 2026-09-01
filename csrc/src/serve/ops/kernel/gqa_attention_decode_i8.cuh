@@ -72,7 +72,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     constexpr int D                    = Geometry::HeadDim;
     constexpr int DB16                 = D / 2;
     constexpr int Threads              = Wc * 32;
-    constexpr int Groups               = kGqaKvQuantGroups;
+    constexpr int Groups               = kGqaKvQuantGroups<Geometry>;
     constexpr int GroupKc              = kGqaKvQuantGroup / 32;
     constexpr int QKKs                 = D / 32;
     constexpr int QKNt                 = Bc / 8;

@@ -16,14 +16,22 @@
 
 namespace sinfer::ops {
 
-inline constexpr int kGqaPrefillHeadDim = 256;
+inline constexpr int kGqaPrefillBr      = 64;
+inline constexpr int kGqaPrefillBc       = 64;
+inline constexpr int kGqaPrefillThreads  = 128;
 
-inline constexpr int kGqaPrefillBr        = 64;
-inline constexpr int kGqaPrefillBc        = 64;
-inline constexpr int kGqaPrefillThreads   = 128;
-inline constexpr int kGqaPrefillSmemBytes = (kGqaPrefillBr + 2 * kGqaPrefillBc) *
-                                            kGqaPrefillHeadDim *
-                                            static_cast<int>(sizeof(__nv_bfloat16));
+// Dynamic shared-memory arena of the BF16 prompt kernel: one Q tile plus the K
+// and V tiles it streams over, all bf16. The head dimension is a template
+// parameter rather than a file constant, so a launcher asks for the arena of the
+// geometry it is about to launch: 96 KiB at head dim 256, 48 KiB at 128.
+template <int HeadDim>
+inline constexpr int kGqaPrefillSmemBytes =
+    (kGqaPrefillBr + 2 * kGqaPrefillBc) * HeadDim * static_cast<int>(sizeof(__nv_bfloat16));
+
+// The 256-wide arena is the one every shipped geometry runs in and the one the
+// warp schedule was tuned against; it must stay at 96 KiB, which is above the
+// 48 KiB default ceiling and below the 100 KiB SM120 opt-in limit.
+static_assert(kGqaPrefillSmemBytes<256> == 98304);
 
 struct GqaPrefillDirectMetadata {
     const std::int32_t* table;
@@ -55,7 +63,7 @@ struct GqaPrefillBatchMetadata {
 
 template <typename Geometry>
 __device__ __forceinline__ std::int64_t gqa_prefill_q_index(int q_head, int d, int token) {
-    return static_cast<std::int64_t>(d) + static_cast<std::int64_t>(kGqaPrefillHeadDim) *
+    return static_cast<std::int64_t>(d) + static_cast<std::int64_t>(Geometry::HeadDim) *
                                               (static_cast<std::int64_t>(q_head) +
                                                static_cast<std::int64_t>(Geometry::QHeads) * token);
 }
@@ -65,10 +73,11 @@ __device__ __forceinline__ void gqa_prefill_zero_output_rows(__nv_bfloat16* out,
                                                              int row_begin, int row_end, int tid,
                                                              int threads) {
     if (row_begin >= row_end) { return; }
-    const int elements = (row_end - row_begin) * kGqaPrefillHeadDim;
+    constexpr int D    = Geometry::HeadDim;
+    const int elements = (row_end - row_begin) * D;
     for (int element = tid; element < elements; element += threads) {
-        const int row = row_begin + element / kGqaPrefillHeadDim;
-        const int d   = element - (row - row_begin) * kGqaPrefillHeadDim;
+        const int row = row_begin + element / D;
+        const int d   = element - (row - row_begin) * D;
         out[gqa_prefill_q_index<Geometry>(q_head, d, row)] = __float2bfloat16(0.0f);
     }
 }

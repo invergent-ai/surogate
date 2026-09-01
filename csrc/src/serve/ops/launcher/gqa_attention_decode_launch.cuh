@@ -28,6 +28,18 @@
 namespace sinfer::ops::detail {
 namespace {
 
+// Whether the int8 decode kernel has a warp route for this shape. That kernel
+// splits a Br x HeadDim output across Wc/RowTiles consumer warps, each of which
+// must own a whole number of eight-wide n-tiles; the warp counts below were tuned
+// for the 256-wide heads whose query group is four to eight, and no other shape
+// divides into them (a group of two leaves twenty-four consumer warps sharing one
+// row tile; a group of twelve leaves one). Shapes outside it have no int8 decode
+// kernel and say so at the dispatch rather than compiling one that would address
+// its own output wrongly. Their bf16 and e4m3 caches are unaffected.
+template <typename Geometry>
+inline constexpr bool kGqaI8DecodeRegistered =
+    Geometry::HeadDim == 256 && Geometry::GroupSize >= 4 && Geometry::GroupSize <= 8;
+
 // Supplies an upper bound for the device-side active-split policy over one explicit execution
 // envelope. Eager calls normally pass an exact window; graph calls pass their target-private
 // replay interval. The dtype-aware wrapper below adds the measured INT8 specializations.
@@ -315,9 +327,12 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
     do {                                                                                           \
         const auto launch_profile = [&]<bool MultiBatch, bool Masked>() {                          \
             if (cache.dtype == DType::I8) {                                                        \
-                if constexpr (Geometry::GroupSize > 8) {                                           \
+                if constexpr (!kGqaI8DecodeRegistered<Geometry>) {                                 \
                     throw std::invalid_argument(                                                   \
-                        "gqa_attention: int8 KV is not served for this head geometry");            \
+                        "gqa_attention: int8 KV is not served for head dim " +                     \
+                        std::to_string(Geometry::HeadDim) + " with " +                             \
+                        std::to_string(Geometry::QHeads) + " query heads over " +                  \
+                        std::to_string(Geometry::KVHeads) + " KV heads");                          \
                 } else {                                                                           \
                     launch_tc_partial_i8<Geometry, (TOKENS), MultiBatch, Masked>(                  \
                         q, input, pos, scale, cache, invocation, logical_capacity,                 \

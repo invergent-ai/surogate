@@ -971,6 +971,7 @@ add_library(sinfer_ops STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_8q2.cu
   ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_16q4.cu
   ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa256_24q2.cu
+  ${SERVE_ROOT}/ops/launcher/gqa_attention_decode_gqa128_16q8.cu
   ${SERVE_ROOT}/ops/launcher/gelu.cu
   ${SERVE_ROOT}/ops/launcher/lora_batched.cu
   ${SERVE_ROOT}/ops/launcher/lora_fused.cu

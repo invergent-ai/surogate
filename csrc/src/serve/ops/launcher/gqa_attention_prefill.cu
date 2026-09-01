@@ -26,11 +26,15 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
         throw std::invalid_argument(
             "gqa_attention: the QSA selection needs a BF16 KV cache (the quantized kernels are dense)");
     }
-    // Both dtype-specialized kernels exceed the default 48 KiB dynamic-smem ceiling.
+    // Both dtype-specialized kernels size their arena from the geometry's head
+    // dimension; at 256 both exceed the default 48 KiB dynamic-smem ceiling, and
+    // raising the limit for a kernel that would fit anyway is harmless.
+    constexpr int kSmemBytes   = kGqaPrefillSmemBytes<Geometry::HeadDim>;
+    constexpr int kI8SmemBytes = kGqaPrefillI8SmemBytes<Geometry::HeadDim>;
     CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(gqa_attention_prefill_bf16_kernel<Geometry, Metadata>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaPrefillSmemBytes));
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
     CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(gqa_attention_prefill_i8_kernel<Geometry, Metadata>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaPrefillI8SmemBytes));
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, kI8SmemBytes));
 
     const auto tokens = static_cast<std::int32_t>(q.ne[2]);
     if (cache.dtype == DType::I8) {
@@ -39,7 +43,7 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
         const Tensor& cache_k_scale = cache.k_scale_pages;
         const Tensor& cache_v_scale = cache.v_scale_pages;
         gqa_attention_prefill_i8_kernel<Geometry, Metadata>
-            <<<attention_grid, kGqaPrefillI8Threads, kGqaPrefillI8SmemBytes, stream>>>(
+            <<<attention_grid, kGqaPrefillI8Threads, kI8SmemBytes, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data),
                 static_cast<const std::int8_t*>(cache_k.data),
                 static_cast<const std::int8_t*>(cache_v.data),
@@ -50,11 +54,11 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
     } else if (cache.dtype == DType::FP8_E4M3FN) {
         CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(
             gqa_attention_prefill_bf16_kernel<Geometry, Metadata, std::uint8_t>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaPrefillSmemBytes));
+            cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
         const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillBr)),
                                   static_cast<unsigned>(Geometry::QHeads), 1u);
         gqa_attention_prefill_bf16_kernel<Geometry, Metadata, std::uint8_t>
-            <<<attention_grid, kGqaPrefillThreads, kGqaPrefillSmemBytes, stream>>>(
+            <<<attention_grid, kGqaPrefillThreads, kSmemBytes, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data),
                 static_cast<const std::uint8_t*>(cache_k.data),
                 static_cast<const std::uint8_t*>(cache_v.data), metadata,
@@ -70,9 +74,9 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
             }
             CUDA_CHECK(::sinfer::ops::set_func_attribute_per_device(
                 gqa_attention_prefill_bf16_kernel<Geometry, Metadata, __nv_bfloat16, true, 4>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaPrefillSmemBytes));
+                cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
             gqa_attention_prefill_bf16_kernel<Geometry, Metadata, __nv_bfloat16, true, 4>
-                <<<attention_grid, kGqaPrefillThreads, kGqaPrefillSmemBytes, stream>>>(
+                <<<attention_grid, kGqaPrefillThreads, kSmemBytes, stream>>>(
                     static_cast<const __nv_bfloat16*>(q.data),
                     static_cast<const __nv_bfloat16*>(cache_k.data),
                     static_cast<const __nv_bfloat16*>(cache_v.data), metadata,
@@ -80,7 +84,7 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
                     static_cast<__nv_bfloat16*>(out.data), tokens, selection);
         } else {
             gqa_attention_prefill_bf16_kernel<Geometry, Metadata>
-                <<<attention_grid, kGqaPrefillThreads, kGqaPrefillSmemBytes, stream>>>(
+                <<<attention_grid, kGqaPrefillThreads, kSmemBytes, stream>>>(
                     static_cast<const __nv_bfloat16*>(q.data),
                     static_cast<const __nv_bfloat16*>(cache_k.data),
                     static_cast<const __nv_bfloat16*>(cache_v.data), metadata,
@@ -107,7 +111,7 @@ void gqa_kv_append_launch_for(const Tensor& k, const Tensor& v, const Tensor& po
             const int max_tiles          = div_up(tokens + kTokensPerTile - 1, kTokensPerTile);
             const dim3 fill_grid(static_cast<unsigned>(max_tiles),
                                  static_cast<unsigned>(Geometry::KVHeads),
-                                 static_cast<unsigned>(kGqaKvQuantGroups));
+                                 static_cast<unsigned>(kGqaKvQuantGroups<Geometry>));
             gqa_attention_prefill_fill_i8_page_kernel<Geometry, Metadata>
                 <<<fill_grid, kPageBlock, 0, stream>>>(
                     static_cast<const __nv_bfloat16*>(k.data),
@@ -120,7 +124,8 @@ void gqa_kv_append_launch_for(const Tensor& k, const Tensor& v, const Tensor& po
         } else {
             constexpr int kFillWarps = kFillBlock / 32;
             const std::int64_t fill_units =
-                static_cast<std::int64_t>(tokens) * Geometry::KVHeads * kGqaKvQuantGroups;
+                static_cast<std::int64_t>(tokens) * Geometry::KVHeads *
+                kGqaKvQuantGroups<Geometry>;
             const int fill_grid =
                 static_cast<int>(div_up(fill_units, static_cast<std::int64_t>(kFillWarps)));
             gqa_attention_prefill_fill_i8_kernel<Geometry, Metadata>
@@ -138,7 +143,7 @@ void gqa_kv_append_launch_for(const Tensor& k, const Tensor& v, const Tensor& po
         constexpr int kBlock           = Geometry::KVHeads == 4 ? 128 : 96;
         constexpr int kFillVecElems    = 8;
         const std::int64_t kv_elements = static_cast<std::int64_t>(tokens) * Geometry::KVHeads *
-                                         (kGqaPrefillHeadDim / kFillVecElems);
+                                         (Geometry::HeadDim / kFillVecElems);
         const int fill_grid =
             static_cast<int>(div_up(kv_elements, static_cast<std::int64_t>(kBlock)));
         if (cache.dtype == DType::FP8_E4M3FN) {

@@ -204,9 +204,15 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
             if (p_tok >= split_start && p_tok < split_end && p_tok >= 0 &&
                 p_tok < logical_capacity) {
                 const std::int64_t new_off = gqa_kv_new_index<Geometry>(kv_head, d, token);
-                const int lane             = tid & 31;
-                int physical_page = lane == 0 ? paged_kv_physical_page(block_table, p_tok) : 0;
-                physical_page     = __shfl_sync(FullMask, physical_page, 0);
+                // Every lane looks its own page up. The lane0-plus-broadcast form
+                // this replaced was valid only while a warp was guaranteed to
+                // share one `p_tok`, which holds exactly when D / 8 == 32, i.e.
+                // head dim 256: at 128 a warp spans two tokens, so the broadcast
+                // both hangs (a full-mask shuffle under a predicate the warp no
+                // longer agrees on) and writes the upper half of the warp to the
+                // wrong page. The lookup is one L1-resident int load next to the
+                // int4 K/V traffic either side of it.
+                const int physical_page = paged_kv_physical_page(block_table, p_tok);
                 const std::int64_t cache_off =
                     gqa_cache_index<Geometry>(physical_page, kv_head, d, p_tok & kPagedKVPageMask);
                 if constexpr (kFp8Cache) {

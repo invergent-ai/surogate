@@ -19,28 +19,32 @@
 
 namespace sinfer::ops {
 
-inline constexpr int kGqaKvQuantHeadDim = 256;
-inline constexpr int kGqaKvQuantGroup   = 64;
-inline constexpr int kGqaKvQuantGroups  = kGqaKvQuantHeadDim / kGqaKvQuantGroup;
+// A quantization group is 64 values wide whatever the head is; how many groups a
+// head carries follows from its width, so it is a property of the geometry rather
+// than a constant of the codec (four at head dim 256, two at 128).
+inline constexpr int kGqaKvQuantGroup = 64;
+
+template <typename Geometry>
+inline constexpr int kGqaKvQuantGroups = Geometry::HeadDim / kGqaKvQuantGroup;
 
 template <typename Geometry>
 __device__ __forceinline__ std::int64_t gqa_kv_quant_code_index(int physical_page, int kv_head,
                                                                 int d, int page_offset) {
-    return paged_kv_element_offset<kGqaKvQuantHeadDim, Geometry::KVHeads>(physical_page, kv_head,
-                                                                          page_offset, d);
+    return paged_kv_element_offset<Geometry::HeadDim, Geometry::KVHeads>(physical_page, kv_head,
+                                                                         page_offset, d);
 }
 
 template <typename Geometry>
 __device__ __forceinline__ std::int64_t gqa_kv_quant_scale_index(int physical_page, int kv_head,
                                                                  int group, int page_offset) {
-    return paged_kv_element_offset<kGqaKvQuantGroups, Geometry::KVHeads>(physical_page, kv_head,
-                                                                         page_offset, group);
+    return paged_kv_element_offset<kGqaKvQuantGroups<Geometry>, Geometry::KVHeads>(
+        physical_page, kv_head, page_offset, group);
 }
 
 template <typename Geometry>
 __device__ __forceinline__ std::int64_t gqa_kv_quant_src_index(int kv_head, int d, int token) {
     return static_cast<std::int64_t>(d) +
-           static_cast<std::int64_t>(kGqaKvQuantHeadDim) *
+           static_cast<std::int64_t>(Geometry::HeadDim) *
                (static_cast<std::int64_t>(kv_head) +
                 static_cast<std::int64_t>(Geometry::KVHeads) * token);
 }

@@ -51,6 +51,7 @@ using Gqa256_16q2  = GqaGeometry<256, 16, 2, 2>; // qwen3.6-35b-a3b
 using Gqa256_8q2   = GqaGeometry<256, 8, 2, 2>;  // qwen3.5-0.8b
 using Gqa256_16q4  = GqaGeometry<256, 16, 4, 2>; // qwen3.5-4b, qwen3.5-2b
 using Gqa256_24q2  = GqaGeometry<256, 24, 2, 1>; // qwen3.8-flash-next (group of twelve)
+using Gqa128_16q8  = GqaGeometry<128, 16, 8, 1>; // qwen3-0.6b (the first 128-wide head)
 
 // The registry. Every dispatcher below and in the launchers is generated from
 // this list, so a registration line is the whole of adding a shape — with the
@@ -63,7 +64,8 @@ using Gqa256_24q2  = GqaGeometry<256, 24, 2, 1>; // qwen3.8-flash-next (group of
     X(Gqa256_16q2)                                                                                 \
     X(Gqa256_8q2)                                                                                  \
     X(Gqa256_16q4)                                                                                 \
-    X(Gqa256_24q2)
+    X(Gqa256_24q2)                                                                                 \
+    X(Gqa128_16q8)
 
 namespace detail {
 
@@ -169,6 +171,19 @@ inline bool gqa_kv_shape_is_registered(std::int64_t head_dim, std::int64_t kv_he
     SINFER_GQA_FOR_EACH_GEOMETRY(SINFER_GQA_KV_MATCH)
 #undef SINFER_GQA_KV_MATCH
     return false;
+}
+
+// The head dimension of the registered shape carrying this (query, KV) head
+// pair, for callers that hold the head counts and need the width the kernels
+// will address -- workspace sizing, and the validation that refuses a q/out
+// tensor or a softmax scale belonging to another shape. The pair is unique across
+// the registry (asserted above); an unregistered one throws.
+inline std::int64_t gqa_registered_head_dim(std::int64_t q_heads, std::int64_t kv_heads) {
+#define SINFER_GQA_HEAD_DIM_ARM(Name)                                                              \
+    if (q_heads == Name::QHeads && kv_heads == Name::KVHeads) { return Name::HeadDim; }
+    SINFER_GQA_FOR_EACH_GEOMETRY(SINFER_GQA_HEAD_DIM_ARM)
+#undef SINFER_GQA_HEAD_DIM_ARM
+    detail::throw_unregistered_geometry(0, q_heads, kv_heads);
 }
 
 // The KV-head count of the registered shape serving `q_heads`. A query count can
