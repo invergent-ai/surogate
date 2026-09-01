@@ -6,6 +6,8 @@ from .gpt_oss import GptOssModel
 from .laguna import LagunaModel
 from .llama import LlamaModel
 from .lfm2 import Lfm2Model
+from .lfm2_moe import Lfm2MoeModel
+from .lfm2_vl import Lfm2VlModel
 from .nemotron_h import NemotronHModel, from_hf_config, parse_hybrid_pattern, to_standard_hybrid_pattern
 from .qwen3 import Qwen3Model
 from .qwen3_5 import Qwen3_5CausalModel, Qwen3_5ConditionalModel
@@ -28,6 +30,8 @@ __all__ = [
     "LagunaModel",
     "LlamaModel",
     "Lfm2Model",
+    "Lfm2MoeModel",
+    "Lfm2VlModel",
     "Gemma3CausalModel",
     "Gemma3TextModel",
     "Gemma4CausalModel",

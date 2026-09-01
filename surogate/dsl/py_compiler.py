@@ -489,6 +489,8 @@ def _serialize_hf_spec(spec: Any) -> Any:
             payload["num_experts"] = spec.num_experts
         if spec.fuse_gate_up:
             payload["fuse_gate_up"] = spec.fuse_gate_up
+        if getattr(spec, "up_pattern", ""):
+            payload["up_pattern"] = spec.up_pattern
         return payload
     raise DSLError(
         ErrorCode.E010,

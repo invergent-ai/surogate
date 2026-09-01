@@ -126,6 +126,11 @@ class StackExpertsMapping:
     pattern: str  # Pattern with {expert} placeholder
     num_experts: int = 0  # 0 = auto-detect from model config
     fuse_gate_up: bool = False  # If True, fuse gate_proj and up_proj into gate_up
+    # The up-projection pattern, when the checkpoint does not name the pair
+    # gate_proj/up_proj. Empty keeps the default derivation (``gate_proj`` in
+    # ``pattern`` replaced by ``up_proj``), which is what most checkpoints want;
+    # LFM2-MoE, for instance, names the pair w1/w3 and must state it.
+    up_pattern: str = ""
 
     def __repr__(self) -> str:
         if self.num_experts > 0:
@@ -222,6 +227,7 @@ def stack_experts(
     *,
     num_experts: int = 0,
     fuse_gate_up: bool = False,
+    up_pattern: str = "",
 ) -> StackExpertsMapping:
     """Create a mapping to stack per-expert HF tensors into batched format.
 
@@ -252,7 +258,7 @@ def stack_experts(
             fuse_gate_up=True
         )
     """
-    return StackExpertsMapping(pattern=pattern, num_experts=num_experts, fuse_gate_up=fuse_gate_up)
+    return StackExpertsMapping(pattern=pattern, num_experts=num_experts, fuse_gate_up=fuse_gate_up, up_pattern=up_pattern)
 
 
 # Type alias for any HF mapping spec
