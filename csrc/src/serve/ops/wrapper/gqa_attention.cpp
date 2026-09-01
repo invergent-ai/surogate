@@ -224,6 +224,12 @@ void validate_envelope(GqaExecutionEnvelope envelope, const PagedKVLayerView& ca
     if (envelope.max_visible_keys < static_cast<std::uint32_t>(tokens)) {
         throw std::invalid_argument(std::string(op) + ": execution envelope is shorter than T");
     }
+    // Zero means unbounded; a negative window is not a window, and the kernels'
+    // predicate would read it as unbounded too, which is the wrong answer that
+    // looks right. Refuse it here, where the envelope is first seen.
+    if (envelope.sliding_window < 0) {
+        throw std::invalid_argument(std::string(op) + ": negative sliding window");
+    }
 }
 
 void validate_attention_tensors(const Tensor& q, const Tensor& positions, const Tensor& out,

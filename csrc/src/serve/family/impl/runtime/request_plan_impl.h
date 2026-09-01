@@ -1,4 +1,5 @@
 #include "family/impl/runtime/instance.h"
+#include "family/impl/runtime/prefill_graph.h"
 #include "family/impl/runtime/program.h"
 #include <cstdlib>
 
@@ -108,11 +109,16 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     base->sampling                       = translate_sampling(options.sampling);
     base->allow_prefix_reuse             = options.allow_prefix_reuse;
     base->lora_slot                      = options.lora_slot;
-    // The mixed prefill graph writes a 128-rounded chunk window, pad columns included, so
-    // the request must own the pages up to its rounded prompt as well as its output extent;
-    // otherwise mapping the last chunk lands outside the entitlement and the round dies.
-    const std::uint32_t rounded_prompt_tokens =
-        ((base->summary.prompt_tokens + 127U) / 128U) * 128U;
+    // A prefill graph chunk writes its whole 128-rounded bucket, pad columns included,
+    // so the request must own the pages that window can reach as well as its output
+    // extent, or mapping the chunk lands outside the entitlement and the round dies.
+    // The window is rounded from the chunk's cursor, not from zero: a prefix-reuse
+    // follow-up or a rewrite-checkpoint restore starts at an arbitrary frontier, and
+    // a chunk at cursor c reaches c + roundup128(prompt - c), which is at most
+    // prompt + 127. Reserving to the rounded prompt alone assumed every chunk starts
+    // 128-aligned, and a follow-up with a short output budget then killed the engine.
+    const std::uint32_t graph_reach_tokens =
+        PrefillGraphFamily::graph_prefill_reach(base->summary.prompt_tokens);
     const std::uint32_t reserved_context_tokens = static_cast<std::uint32_t>(std::min<std::uint64_t>(
         capacity,
         std::max<std::uint64_t>(
@@ -120,7 +126,7 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
                 (base->summary.effective_output_tokens == 0
                      ? 0U
                      : base->summary.effective_output_tokens - 1U),
-            rounded_prompt_tokens)));
+            graph_reach_tokens)));
     base->text_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
     if (speculative_backend == SpeculativeBackend::Mtp) {
         const std::uint32_t mtp_tokens    = static_cast<std::uint32_t>(std::min<std::uint64_t>(

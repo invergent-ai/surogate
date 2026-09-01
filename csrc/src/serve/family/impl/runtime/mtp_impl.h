@@ -38,6 +38,10 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
                                rope_position.size_bytes(), cudaMemcpyHostToDevice,
                                state.execution.device.stream));
     const auto bridge_visible = static_cast<std::uint32_t>(position + 1);
+    // The MTP head's envelopes are deliberately unwindowed: no target with a
+    // draft head declares a sliding window, and the head is not a stack layer,
+    // so layer_sliding_window() has no layer index to key on for it. A windowed
+    // model that grows an MTP head must decide its window here, on purpose.
     const ops::GqaExecutionEnvelope bridge_envelope{bridge_visible, bridge_visible};
     card.mtp_forward_batch(next_token, previous_hidden, position_view, bridge_envelope, mtp_hidden,
                            build_proposal ? 0 : -1, build_proposal ? &logits : nullptr,

@@ -444,6 +444,13 @@ private:
     void unbind_sequence_kv(SequenceState& sequence) noexcept;
     void materialize_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
                                  std::uint32_t backend_tokens = 0);
+    // Maps the pages a graph chunk starting at `cursor` will write: its whole
+    // 128-rounded bucket, pad columns included, which admission (mapped to the
+    // prompt only) does not cover. A window past capacity is left unmapped --
+    // the graph layer refuses such a chunk and the eager body writes only the
+    // real tokens, which admission already mapped.
+    void materialize_graph_chunk_window(SequenceState& sequence, std::uint32_t cursor,
+                                        std::uint32_t nominal);
     void trim_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
                           std::uint32_t backend_tokens = 0);
     void release_sequence_growth_entitlement(SequenceState& sequence) noexcept;

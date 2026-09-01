@@ -104,11 +104,14 @@ constexpr std::array<RouteSpec, 5> kQ4B29Routes{{
     {1025, kAnyCols, W8LinearAddScheduleId::MmaR48C128},
 }};
 
-// qwen3-0.6b mlp down {1024, 3072}. Both the exact-T split-K table and the
-// medium split-K family bake their hidden extent (2048/3584 here, 4096/6144 for
-// the larger shapes) and none is 3072, so this shape takes only the kernels that
-// read their extents from the weight: the SIMT decode and the MMA tiles. The
-// 0.6b attention output {1024, 2048} is the 0.8b shape and keeps its table.
+// Every admitted shape with no bake of its own. The exact-T split-K tables and
+// the medium split-K family bake both extents (rows and k), so a shape that is
+// not one of theirs takes only the kernels that read both from the weight: the
+// SIMT decode and the runtime-tiled MMA. Today that is qwen3-0.6b's mlp down
+// {1024, 3072}, tinyllama's {2048, 5632}, and gemma-3-270m's {640, 1024|2048}.
+// The MMA tiles still need k % 256 == 0 for their 16-byte scale-row staging;
+// every k here satisfies it, and an admitted k that did not would be refused by
+// the same rule the ops/linear route already enforces.
 constexpr std::array<RouteSpec, 3> kExtentAgnosticRoutes{{
     {1, 1, W8LinearAddScheduleId::SimtR8C4},
     {2, 1024, W8LinearAddScheduleId::MmaR32C128},
@@ -255,8 +258,8 @@ bool w8_linear_add_admits(const W8LinearAddProblem& problem) noexcept {
     // surogate vendor patch (PATCHES.md #18): qwen3.5-4b output/down.
     const bool q4b  = problem.rows == 2560 && (problem.k == 4096 || problem.k == 9216);
     // qwen3-0.6b: its attention output {1024, 2048} already rides the 0.8b
-    // shape above; only the mlp down {1024, 3072} is new. Same row count, so it
-    // resolves through the 0.8b route table below.
+    // shape above; only the mlp down {1024, 3072} is new, and it has no bake, so
+    // it resolves through the extent-agnostic table below.
     const bool q3_06b = problem.rows == 1024 && problem.k == 3072;
     // tinyllama-1.1b: its attention output {2048, 2048} is already the 2b shape
     // above; only the mlp down {2048, 5632} is new.
@@ -300,15 +303,13 @@ W8LinearAddPlan w8_linear_add_resolve_plan(const W8LinearAddProblem& problem) {
     // surogate vendor patch (PATCHES.md #29): qwen3.5-4b (2560 rows) has its
     // exact-T bakes now (T=2..16, k=4096/9216).
     if (problem.rows == 2560) { return resolve_from(kQ4B29Routes); }
-    // The exact-T and medium split-K families bake their hidden extent, and 4096
-    // and 6144 are the only two bakes they have. Both launchers choose between
-    // them with a bare `if (k == 4096) ... else ...`, so a k that is neither does
-    // not fail there -- it silently runs over the wrong extent. tinyllama's mlp
-    // down {2048, 5632} is exactly that shape: it reached kK4096Routes as the
-    // catch-all and read 4096 of its 5632 input rows. An unbaked k takes the
-    // table whose kernels read their extents from the weight, which is the same
-    // rule the extent-agnostic table above already states for {1024, 3072}.
-    if (problem.k != 4096 && problem.k != 6144) {
+    // The exact-T and medium split-K bakes that remain are 2048 rows over k 4096
+    // or 6144, and both launchers refuse any other geometry. This branch keeps an
+    // admitted shape from ever reaching them: anything unbaked takes the table
+    // whose kernels read both extents from the weight, the rule the
+    // extent-agnostic table above states. tinyllama's mlp down {2048, 5632} is
+    // the shape that used to fall through here to the 4096 bake.
+    if (problem.rows != 2048 || (problem.k != 4096 && problem.k != 6144)) {
         return resolve_from(kExtentAgnosticRoutes);
     }
     return problem.k == 6144 ? resolve_from(kK6144Routes) : resolve_from(kK4096Routes);

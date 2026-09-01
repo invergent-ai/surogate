@@ -48,7 +48,8 @@ struct TextConfig {
     // Applied to the embedding lookup before the first block. Zero means none.
     static constexpr float embedding_scale       = 2.529822e1F;
 
-    /// True when this layer sees the whole context. A model with no window has
+    /// True when this layer attends through the sliding window, false for a global
+    /// layer that sees the whole context. A model with no window has
     /// every layer global; otherwise the period says which escape it. Gemma 3
     /// counts from the end -- its last layer is global -- which is what
     /// `(layer + 1) % period == 0` expresses.

@@ -3134,3 +3134,60 @@ parameter that only the kernels honour; the numerical geometry table in
 `test_gqa_attention.cpp` still lists four shapes by hand and does not cover
 Gqa256_16q4; and `gqa_attention_resolve_route` picks the chunked route on
 `q_heads == 16`, a policy keyed on half a shape.
+
+## 89
+
+**The plain prefill path had #55's page overflow too, and the entitlement assumed 128-aligned chunk starts (2026-09-01).**
+
+#55 called its KV-page overflow "mixed-only, because only the mixed path
+pairs a 128-rounded window with an un-mapped tail". The plain prefill graph
+pairs them identically: `try_prefill_graph_chunk` replays a body that writes
+its whole 128-rounded bucket, pad columns included, and admission maps pages
+only to the prompt. Whenever `bucket > ceil(L/64)*64` the pad tail wrote
+past the mapped pages. Measured on gemma-3-270m at ten prompt lengths, the
+rule predicted every one: 20, 60, 130, 259, 400, 520 and 799 tokens wrong,
+100, 200 and 984 right. On a cold engine this is the "first request is
+fluent nonsense" symptom every bring-up on the branch had been verifying
+against with a single request. #55's own claim stands corrected here rather
+than rewritten there.
+
+Mapping the rounded window before the chunk (as `advance_prefill_mixed` has
+done since #55) exposed the second half. The entitlement #77 reserves is
+`max(prompt + out - 1, roundup128(prompt))`, rounded from cursor zero — it
+assumes every chunk starts 128-aligned. A prefix-reuse follow-up or a
+rewrite-checkpoint restore starts at an arbitrary frontier, and a chunk at
+cursor c reaches `c + roundup128(prompt - c)`, up to `prompt + 127`. With a
+short output budget the mapping then fell outside the entitlement, and that
+throw is deliberately fatal (#77 keeps it as the invariant check), so a
+multi-turn chat with `max_tokens` under about 120 took the engine down.
+Reproduced on qwen3.5-0.8b: base 569, prompt 603, out 16 → pages=11
+mapped=10 entitled=10, worker loop fatal, every later request 503.
+
+Fixed in three places, and the invariant now lives where the write is:
+
+- `PrefillGraphFamily::graph_prefill_reach(prompt) = prompt + 127` is what a
+  request is entitled to, and `test_prefill_graph_reach` pins the lemma
+  exhaustively (every cursor of every prompt up to 4096, unaligned
+  capacities included) and the two recipes that killed the engine.
+- `try_prefill_graph_chunk` and `try_mixed_graph_chunk` refuse a bucket
+  that would run past capacity and fall back to the eager body, which writes
+  exactly the real tokens. The caller's mapping
+  (`materialize_graph_chunk_window`, now one helper for both drivers) is a
+  hit-rate optimisation, never a correctness gate, and never maps past
+  capacity.
+- The block-table row is exactly `page_count(capacity)` wide with no bound in
+  the append kernel, so a bucket past capacity would otherwise have written
+  into the next lane's page ids (explicit `--max-model-len` need not be a
+  multiple of 128). The refusal above closes that on both paths.
+
+Same day, tinyllama's mlp down {2048, 5632} fell through the W8 linear_add
+plan's catch-all into the k=4096 route table, whose exact-T and medium
+split-K schedules bake (rows, k) and selected the bake with a bare
+`if (k == 4096) else 6144`: eager T=21 silently ran the 4096 bake over 5632
+input rows; graph capture at T=128 threw and was fatal behind a message
+blaming memory. An unbaked (rows, k) now takes the extent-agnostic table,
+and both launchers refuse rather than borrow, naming rows and k.
+
+Verification discipline changed with it: one request against a cold engine
+is not evidence. Repeat it, cross the threshold the change is about, and
+diff against HF over the same artifact.

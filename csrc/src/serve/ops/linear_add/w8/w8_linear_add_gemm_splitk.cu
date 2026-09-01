@@ -103,16 +103,12 @@ void launch_medium(const Tensor& x, Tensor& residual_out, const Weight& weight,
 template <int TileCols, int KSplits, int NGroups, int MinBlocks>
 void dispatch_medium_shape(const Tensor& x, const Weight& weight, Tensor& residual_out,
                            cudaStream_t stream) {
-    // Both arms bake their extent, so the else must not be a catch-all: the
-    // caller is expected to have routed an unbaked k elsewhere, and if it did
-    // not, saying so beats reading the wrong number of input rows.
+    // (rows, k) is vetted by w8_linear_add_medium_splitk_launch before any arm
+    // is reached; this only picks the bake.
     if (weight.k == 4096) {
         launch_medium<4096, TileCols, KSplits, NGroups, MinBlocks>(x, residual_out, weight, stream);
-    } else if (weight.k == 6144) {
-        launch_medium<6144, TileCols, KSplits, NGroups, MinBlocks>(x, residual_out, weight, stream);
     } else {
-        throw std::invalid_argument("W8 linear_add medium split-K: no bake for k " +
-                                    std::to_string(weight.k));
+        launch_medium<6144, TileCols, KSplits, NGroups, MinBlocks>(x, residual_out, weight, stream);
     }
 }
 
@@ -143,14 +139,16 @@ void w8_linear_add_splitk_mma_launch(const Tensor& x, const Weight& weight, Tens
                                     ? (weight.k == 3584 ? kQ08K3584Launchers : kQ08K2048Launchers)
                                     : kQ2bK2048Launchers;
         launchers[x.ne[1] - kFirstExactCols](x, weight, residual_out, stream);
-    } else if (weight.k == 6144) {
+    } else if (weight.n == kRows && weight.k == 6144) {
         kK6144ProjectionLaunchers[x.ne[1] - kFirstExactCols](x, weight, residual_out, stream);
-    } else if (weight.k == 4096) {
+    } else if (weight.n == kRows && weight.k == 4096) {
         kK4096ProjectionLaunchers[x.ne[1] - kFirstExactCols](x, weight, residual_out, stream);
     } else {
-        // Same rule the small-target tables above enforce: these launchers bake
-        // 4096, so an unlisted k must be refused rather than run through them.
-        throw std::invalid_argument("W8 linear_add exact split-K: no table for k " +
+        // Same rule the small-target tables above enforce. These tables bake both
+        // extents -- kRows rows over k 4096 or 6144 -- so anything else must be
+        // refused rather than run through a neighbour's bake.
+        throw std::invalid_argument("W8 linear_add exact split-K: no table for rows " +
+                                    std::to_string(weight.n) + " over k " +
                                     std::to_string(weight.k));
     }
     CUDA_CHECK(cudaGetLastError());
@@ -159,8 +157,16 @@ void w8_linear_add_splitk_mma_launch(const Tensor& x, const Weight& weight, Tens
 void w8_linear_add_medium_splitk_launch(const Tensor& x, const Weight& weight, Tensor& residual_out,
                                         cudaStream_t stream) {
     const std::int32_t t = x.ne[1];
-    if ((weight.k != 4096 && weight.k != 6144) || t < 49 || t > 128) {
+    if (t < 49 || t > 128) {
         throw std::invalid_argument("W8 linear_add medium split-K requires T=49..128");
+    }
+    // The medium bakes are kRows rows over k 4096 or 6144, and dispatch_medium_shape
+    // selects between the two by k alone, so this is the one place that refuses
+    // any other geometry -- and says which one, rather than complaining about T.
+    if (weight.n != kRows || (weight.k != 4096 && weight.k != 6144)) {
+        throw std::invalid_argument("W8 linear_add medium split-K: no table for rows " +
+                                    std::to_string(weight.n) + " over k " +
+                                    std::to_string(weight.k));
     }
     if (t <= 64) {
         dispatch_medium_shape<64, 8, 4, 1>(x, weight, residual_out, stream);

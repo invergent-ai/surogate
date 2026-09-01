@@ -79,6 +79,9 @@ sinfer_add_test(sinfer_sampling_defaults_test
 sinfer_add_test(sinfer_kv_cache_test
   SOURCES test_kv_cache.cpp
   LIBRARIES sinfer_core)
+sinfer_add_test(sinfer_prefill_graph_reach_test
+  SOURCES test_prefill_graph_reach.cpp
+  LIBRARIES sinfer_core)
 sinfer_add_test(sinfer_state_store_test
   SOURCES test_state_store.cpp
   LIBRARIES sinfer_core)

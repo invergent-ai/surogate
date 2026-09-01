@@ -1166,6 +1166,19 @@ void ProgramImplCore::materialize_sequence_kv(SequenceState& sequence, std::uint
     }
 }
 
+void ProgramImplCore::materialize_graph_chunk_window(SequenceState& sequence, std::uint32_t cursor,
+                                                     std::uint32_t nominal) {
+    // The window is rounded from the chunk's cursor, which prefix reuse and
+    // rewrite-checkpoint restores place at arbitrary frontiers; the request's
+    // entitlement covers this (PrefillGraphFamily::graph_prefill_reach), so the
+    // mapping cannot fall outside it. Past capacity the graph declines to run
+    // and the eager body writes only the real tokens, already mapped.
+    const std::uint32_t window =
+        cursor + static_cast<std::uint32_t>(PrefillGraphFamily::chunk_bucket_for(nominal));
+    if (window > capacity) { return; }
+    materialize_sequence_kv(sequence, window, 0);
+}
+
 void ProgramImplCore::trim_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
                                        std::uint32_t backend_tokens) {
     if (!sequence.kv || main_tokens > capacity || backend_tokens > main_tokens) {
@@ -1899,18 +1912,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             }
             schedule::PrefillChunkResult result;
             if (staged.use_graph) {
-                // The same page overflow PATCHES.md #55 fixed for mixed rounds, which
-                // that entry called "mixed-only". It is not: a plain graph chunk writes
-                // its whole 128-rounded bucket, pad columns included, while KV is mapped
-                // in units of 64 up to the prompt length. Whenever the bucket exceeds the
-                // mapped window -- a 20-token prompt maps 64 and the graph writes 128 --
-                // the pad tail lands in whatever block-table slots follow, which is
-                // another sequence's KV or unmapped storage. Map the window the graph
-                // actually writes, before it runs.
-                const std::uint32_t graph_window =
-                    staged.cursor +
-                    static_cast<std::uint32_t>(PrefillGraphFamily::chunk_bucket_for(nominal));
-                materialize_sequence_kv(sequence, std::min(graph_window, capacity), 0);
+                materialize_graph_chunk_window(sequence, staged.cursor, nominal);
                 // Chunk-atomic scratch ownership: restore this prompt's state into the shared
                 // scratch slot right before its chunk runs (the lane slot always holds the
                 // prompt's current state — zeros after a reset, the resident state for
@@ -2533,21 +2535,8 @@ ProgramImplCore::launch_mixed_round(std::span<const std::uint32_t> prefill_lanes
             // The graph ladder rounds the chunk up to a 128 bucket, so the
             // nominal leaves room for both the rounding and the batch bucket
             // inside the prefill_chunk workspace window (graph_nominal above).
-            // The graph writes a whole 128-rounded chunk, pad columns included,
-            // but KV pages are mapped in units of kPagedKVPageSize = 64 up to
-            // the prompt length. A prompt whose length lands in the upper half
-            // of a 128-block therefore has the pad columns writing past its
-            // mapped pages and into whatever block-table slots follow — another
-            // sequence's KV. That is the mixed-round corruption: intermittent
-            // (it depends on prompt length mod 128), mixed-only, and it shows up
-            // as a wrong token in a DIFFERENT lane's stream. Map the rounded
-            // window before replaying.
             if (graph_nominal > 0) {
-                const std::uint32_t graph_window =
-                    staged.cursor + static_cast<std::uint32_t>(
-                                        PrefillGraphFamily::chunk_bucket_for(graph_nominal));
-                materialize_sequence_kv(prefill_sequence,
-                                        std::min(graph_window, capacity), 0);
+                materialize_graph_chunk_window(prefill_sequence, staged.cursor, graph_nominal);
             }
             if (graph_nominal > 0) {
                 schedule::TextContext::MixedDecodeSlice bucket_slice;

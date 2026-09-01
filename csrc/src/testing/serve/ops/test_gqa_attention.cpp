@@ -1334,6 +1334,13 @@ int run_geometry(const Geometry& geometry) {
             {66, 63, 129, 604u, 32},  {17, 31, 48, 605u, 8},
             // Degenerate: every query admits only its own key.
             {7, 17, 512, 606u, 1},
+            // Decode route (tokens <= 6 takes the small-T split kernels, not the
+            // prefill kernels) with a window shorter than the history, so the
+            // split kernels' own window predicate and the reducer's handling of
+            // splits the window empties are what is under test here.
+            {4, 700, 704, 607u, 512},
+            {1, 1000, 1001, 608u, 64},
+            {6, 300, 306, 609u, 128},
         };
         for (const AttentionCase& test_case : window_cases) {
             failures += run_a1_case(geometry, dtype, test_case, MappingPattern::Identity);

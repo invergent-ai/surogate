@@ -22,6 +22,7 @@
 // always available and numerically authoritative.
 
 #include "core/decode_graph.h"
+#include "api/types.h"
 #include "core/device.h"
 #include "core/tensor.h"
 
@@ -118,6 +119,14 @@ public:
     // KV for the window the graph actually writes (PATCHES.md #55).
     [[nodiscard]] static std::int32_t chunk_bucket_for(std::uint32_t length) noexcept {
         return static_cast<std::int32_t>(((length + 127U) / 128U) * 128U);
+    }
+    // The furthest token a graph chunk of this prompt can write, from any cursor.
+    // A chunk starting at c writes [c, c + chunk_bucket_for(prompt - c)), and
+    // c + roundup128(prompt - c) <= prompt + 127 for every c in [0, prompt]. This
+    // is what a request must be entitled to, since chunk starts are not aligned:
+    // prefix reuse and rewrite-checkpoint restores begin at arbitrary frontiers.
+    [[nodiscard]] static std::uint32_t graph_prefill_reach(std::uint32_t prompt_tokens) noexcept {
+        return prompt_tokens + 127U;
     }
 
     [[nodiscard]] static std::int32_t mixed_key(std::int32_t chunk_bucket,

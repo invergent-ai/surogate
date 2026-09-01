@@ -2263,6 +2263,12 @@ bool TextContext::try_mixed_graph_chunk(std::span<const int> full_ids, std::uint
         chunk_bucket + batch_bucket > static_cast<std::int32_t>(prefill_chunk_)) {
         return false;
     }
+    // Same refusal as try_prefill_graph_chunk: the prefill side of the mixed body
+    // writes its whole bucket from text_kv_base_, and must not run past capacity.
+    if (static_cast<std::uint32_t>(text_kv_base_) + static_cast<std::uint32_t>(chunk_bucket) >
+        family.kv_capacity()) {
+        return false;
+    }
 
     std::int32_t* staging = family.ids_staging();
     const auto ids        = full_ids.subspan(begin, nominal);
@@ -2309,6 +2315,14 @@ bool TextContext::try_prefill_graph_chunk(std::span<const int> ids, int t0, int 
     if (len <= 0) { return false; }
     const std::int32_t bucket = family.bucket_for(len);
     if (bucket < len) { return false; }
+    // The captured body writes every column of its bucket, pad columns included,
+    // through block-table rows that are exactly one capacity wide with no bound
+    // check in the append. A chunk whose bucket would run past capacity is not
+    // replayed: the eager body writes exactly `len`, which admission mapped.
+    if (static_cast<std::uint32_t>(base_i + t0) + static_cast<std::uint32_t>(bucket) >
+        family.kv_capacity()) {
+        return false;
+    }
 
     std::int32_t* staging = family.ids_staging();
     for (int i = 0; i < len; ++i) { staging[i] = ids[static_cast<std::size_t>(t0 + i)]; }
