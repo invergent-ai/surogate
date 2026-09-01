@@ -154,45 +154,65 @@ void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& opt
                         static_cast<std::int32_t>(widest));
     }
 
-    // Text layer index -> the full-attention layer holding it, since only every
-    // fourth layer is full attention in this family.
-    // Mirrors is_full_layer in this target's bindings: every fourth layer from 3.
+    // Text layer index -> that layer's weights. Attention modules exist only on
+    // the full-attention layers (every fourth from 3 in this family); the MLP
+    // exists on every layer, so down_proj must route through GDN layers too -- a
+    // real PEFT adapter carries it on all of them.
     const auto is_full = [](std::size_t layer) { return layer >= 3 && (layer - 3) % 4 == 0; };
-    std::vector<const detail::FullAttentionWeights*> by_layer(detail::TextConfig::layers, nullptr);
+    std::vector<const detail::FullAttentionWeights*> attention_by_layer(detail::TextConfig::layers,
+                                                                        nullptr);
+    std::vector<const detail::DensePostMixerPayload*> mlp_by_layer(detail::TextConfig::layers,
+                                                                   nullptr);
     std::size_t full_index = 0;
+    std::size_t gdn_index  = 0;
     for (std::size_t layer = 0; layer < detail::TextConfig::layers; ++layer) {
-        if (is_full(layer)) { by_layer[layer] = &runtime.full_layers.at(full_index++); }
+        if (is_full(layer)) {
+            const detail::FullAttentionWeights& full = runtime.full_layers.at(full_index++);
+            attention_by_layer[layer]                = &full;
+            mlp_by_layer[layer]                      = &full.post_mixer;
+        } else {
+            mlp_by_layer[layer] = &runtime.gdn_layers.at(gdn_index++).post_mixer;
+        }
     }
 
     for (const auto& payload : options.lora_payloads) {
-        if (payload.layer < 0 || static_cast<std::size_t>(payload.layer) >= by_layer.size() ||
-            by_layer[static_cast<std::size_t>(payload.layer)] == nullptr) {
-            throw std::invalid_argument(
-                "--lora-modules: layer " + std::to_string(payload.layer) + " module '" +
-                payload.module + "' is not a full-attention layer of this model");
+        if (payload.layer < 0 ||
+            static_cast<std::size_t>(payload.layer) >= mlp_by_layer.size()) {
+            throw std::invalid_argument("--lora-modules: layer " + std::to_string(payload.layer) +
+                                        " is outside this model");
         }
-        const detail::FullAttentionWeights& layer = *by_layer[static_cast<std::size_t>(payload.layer)];
+        const detail::FullAttentionWeights* attention =
+            attention_by_layer[static_cast<std::size_t>(payload.layer)];
         const Weight* base    = nullptr;
         std::int32_t port     = 0;
         // q, k and v leave one fused projection as separate contiguous tensors, so
         // they share a base weight and are told apart by the port. o and down have
         // a weight each.
         if (payload.module == "q_proj" || payload.module == "k_proj" ||
-            payload.module == "v_proj") {
-            const auto* fused = std::get_if<detail::FusedAttentionProjectionPayload>(&layer.projection);
-            if (fused == nullptr) {
+            payload.module == "v_proj" || payload.module == "o_proj") {
+            if (attention == nullptr) {
                 throw std::invalid_argument(
-                    "--lora-modules: this artifact splits its attention projection, which the "
-                    "attention adapter path does not bind");
+                    "--lora-modules: layer " + std::to_string(payload.layer) + " module '" +
+                    payload.module +
+                    "' -- this layer is linear attention, which has no self_attn projections; an "
+                    "adapter naming them here was trained against a different architecture");
             }
-            base = &fused->query_key_gate_value;
-            port = payload.module == "q_proj" ? 0 : (payload.module == "k_proj" ? 1 : 2);
-        } else if (payload.module == "o_proj") {
-            base = &layer.output;
-            port = 3;
+            if (payload.module == "o_proj") {
+                base = &attention->output;
+                port = 3;
+            } else {
+                const auto* fused =
+                    std::get_if<detail::FusedAttentionProjectionPayload>(&attention->projection);
+                if (fused == nullptr) {
+                    throw std::invalid_argument(
+                        "--lora-modules: this artifact splits its attention projection, which the "
+                        "attention adapter path does not bind");
+                }
+                base = &fused->query_key_gate_value;
+                port = payload.module == "q_proj" ? 0 : (payload.module == "k_proj" ? 1 : 2);
+            }
         } else if (payload.module == "down_proj") {
-            const detail::DensePostMixerPayload* mlp = &layer.post_mixer;
-            base = &mlp->down;
+            base = &mlp_by_layer[static_cast<std::size_t>(payload.layer)]->down;
             port = 4;
         } else if (payload.module == "gate_proj" || payload.module == "up_proj") {
             // gate and up are one fused weight whose two halves are consumed by

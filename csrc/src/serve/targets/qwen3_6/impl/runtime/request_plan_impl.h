@@ -209,14 +209,15 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             sequence.dflash_context_frontier == sequence.execution_frontier;
         if (sequence.execution_frontier != 0 && dflash_append_ready &&
             qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
-                                            sequence.execution_frontier)) {
+                                            sequence.execution_frontier, base.lora_slot)) {
             plan->reuse      = ReusePath::AppendAtFrontier;
             plan->reuse_base = sequence.execution_frontier;
         } else if (sequence.rewrite_checkpoint.valid && sequence.rewrite_checkpoint.frontier != 0 &&
                    sequence.rewrite_checkpoint.frontier <= prompt.token_ids.size() &&
                    qwen3_6::detail::prefix_matches(prompt, sequence.ledger,
                                                    sequence.prefix_identity,
-                                                   sequence.rewrite_checkpoint.frontier)) {
+                                                   sequence.rewrite_checkpoint.frontier,
+                                                   base.lora_slot)) {
             plan->reuse      = restore_path(sequence.rewrite_checkpoint.kind);
             plan->reuse_base = sequence.rewrite_checkpoint.frontier;
         }
@@ -253,7 +254,7 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         desired && plan->reuse != ReusePath::FullReset && sequence.rewrite_checkpoint.valid &&
         sequence.rewrite_checkpoint.frontier == desired->frontier &&
         qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
-                                        desired->frontier);
+                                        desired->frontier, base.lora_slot);
     if (!desired) {
         plan->rewrite_checkpoint_action = RewriteCheckpointAction::Drop;
     } else if (existing_checkpoint_matches) {

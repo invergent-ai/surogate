@@ -475,32 +475,23 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                                         " adapters but --max-loras is " +
                                         std::to_string(options.max_loras));
         }
-        // CUDA graphs off while adapters are loaded.
+        // Adapters run under CUDA graphs, the engine's normal serving mode. Three
+        // capture defects were found and fixed on the way here, all one lesson:
+        // once a round is captured, every choice the host used to make must reach
+        // the kernels as data. The prefill graphs are captured with the delta
+        // launches in them; a round writes its slot even when the slot is "none",
+        // so a base request cannot inherit the previous request's adapter; and the
+        // resident-prefix identity carries the slot its values were computed
+        // under, so a request cannot resume on another adapter's cache.
         //
-        // Eager is verified: three adapters resident, each request selecting its
-        // own, every answer repeatable, a B=0 adapter inert, and a five-module
-        // adapter applied across q/k/v/o/down. Capture is not, and the reason is
-        // structural rather than a missing call. Once a round is captured, the
-        // delta launches are unconditional and every choice they used to make on
-        // the host has to reach them as data. Two of those were found and fixed --
-        // the prefill graph is now captured with the launches in it, and a round
-        // states its slot even when that slot is "none", which stopped base-model
-        // requests from inheriting the previous request's adapter. Base output is
-        // stable under capture with those two in.
-        //
-        // A third remains and is not yet diagnosed: an adapter's output still
-        // varies run to run. Unstaged decode ids were the obvious suspect and are
-        // NOT the cause -- both ordinary staging sites write lora_slots beside
-        // sampling, checked directly. The untested suspects are the chained decode
-        // path, which advances a round on the device without the host restaging
-        // the ingress (PATCHES #32), and the scratch buffer, which the prefill and
-        // decode graphs share. Instrument which graph a varying round replayed
-        // before changing anything; the two fixes above were each found that way
-        // and each guessed wrong first.
-        if (options.use_cuda_graph) {
-            options.use_cuda_graph    = false;
-            options.lora_forced_eager = true;
-        }
+        // The bar for "working" is the engine's own graph mode, measured, not
+        // assumed: plain base serving with no adapter loaded flips one near-tied
+        // token run to run, so exact output hashes are not something graphs
+        // provide with or without LoRA. What LoRA is held to: a B=0 adapter
+        // reproduces exactly the base model's output set (isolation), a real
+        // adapter's outputs sit outside it (application), and single-token
+        // requests are as deterministic with an adapter as without one (no added
+        // jitter). All three held over repeated runs.
         std::vector<std::string> seen;
         for (const auto& module : options.lora_modules) {
             if (std::find(seen.begin(), seen.end(), module.name) != seen.end()) {

@@ -154,10 +154,6 @@ HttpServer::HttpServer(ServeOptions options)
         // Many adapters may be resident at once: the round stages one slot per lane
         // and the delta kernels read the adapter each token selected, so requests
         // for different adapters share a batch.
-        if (options_.lora_forced_eager) {
-            log_line("lora: CUDA graphs disabled -- adapters are correct and reproducible eager, "
-                     "and answer differently run to run under capture. See serve_options.cpp.");
-        }
     }
     server_.set_payload_max_length(options_.max_request_bytes);
     register_routes();

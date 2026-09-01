@@ -61,12 +61,14 @@ void ResidentPrefixIdentity::reserve(std::size_t tokens) {
 }
 
 void ResidentPrefixIdentity::clear() noexcept {
+    lora_slot_ = -1;
     token_types_.clear();
     for (auto& axis : positions_) { axis.clear(); }
     vision_items_.clear();
 }
 
-void ResidentPrefixIdentity::assign(const PreparedPromptData& prompt) {
+void ResidentPrefixIdentity::assign(const PreparedPromptData& prompt, std::int32_t lora_slot) {
+    lora_slot_ = lora_slot;
     const std::size_t tokens = prompt.token_ids.size();
     if (prompt.token_types.size() != tokens || prompt.positions.size() != 3 * tokens) {
         throw std::invalid_argument("prepared prompt identity metadata has an invalid shape");
@@ -112,7 +114,10 @@ void ResidentPrefixIdentity::truncate(std::size_t tokens) {
     vision_items_.resize(retained_items);
 }
 
-bool ResidentPrefixIdentity::matches(const PreparedPromptData& prompt, std::size_t count) const {
+bool ResidentPrefixIdentity::matches(const PreparedPromptData& prompt, std::size_t count,
+                                     std::int32_t requester_lora_slot) const {
+    // Reusing zero tokens asserts nothing about whose values they were.
+    if (count != 0 && requester_lora_slot != lora_slot_) { return false; }
     const std::size_t prompt_tokens = prompt.token_ids.size();
     if (count > prompt_tokens || count > size() || prompt.token_types.size() != prompt_tokens ||
         prompt.positions.size() != 3 * prompt_tokens) {
@@ -146,12 +151,13 @@ bool ResidentPrefixIdentity::matches(const PreparedPromptData& prompt, std::size
 }
 
 bool prefix_matches(const PreparedPromptData& prompt, const std::vector<TokenId>& resident_tokens,
-                    const ResidentPrefixIdentity& resident_identity, std::size_t count) {
+                    const ResidentPrefixIdentity& resident_identity, std::size_t count,
+                    std::int32_t requester_lora_slot) {
     if (count > prompt.token_ids.size() || count > resident_tokens.size()) { return false; }
     return std::equal(prompt.token_ids.begin(),
                       prompt.token_ids.begin() + static_cast<std::ptrdiff_t>(count),
                       resident_tokens.begin()) &&
-           resident_identity.matches(prompt, count);
+           resident_identity.matches(prompt, count, requester_lora_slot);
 }
 
 } // namespace sinfer::targets::qwen3_6::detail
