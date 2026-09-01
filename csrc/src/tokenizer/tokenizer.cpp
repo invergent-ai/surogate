@@ -468,20 +468,33 @@ Tokenizer& Tokenizer::operator=(Tokenizer&&) noexcept = default;
 
 Tokenizer Tokenizer::from_pretrained(const std::string& model_dir) {
     namespace fs = std::filesystem;
-    auto dir = fs::path(model_dir);
+    const auto dir = fs::path(model_dir);
 
-    auto tokenizer_json_path = dir / "tokenizer.json";
-    if (!fs::exists(tokenizer_json_path)) {
+    const auto slurp = [](const fs::path& path) -> std::string {
+        if (!fs::exists(path)) return {};
+        std::ifstream f(path);
+        return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    };
+
+    Sources sources;
+    sources.tokenizer_json = slurp(dir / "tokenizer.json");
+    if (sources.tokenizer_json.empty()) {
         throw std::runtime_error(fmt::format("tokenizer.json not found in {}", model_dir));
+    }
+    sources.model_config_json     = slurp(dir / "config.json");
+    sources.tokenizer_config_json = slurp(dir / "tokenizer_config.json");
+    sources.chat_template_jinja   = slurp(dir / "chat_template.jinja");
+    return from_sources(sources);
+}
+
+Tokenizer Tokenizer::from_sources(const Sources& sources) {
+    if (sources.tokenizer_json.empty()) {
+        throw std::runtime_error("Tokenizer::from_sources: tokenizer_json is required");
     }
 
     // Parse tokenizer.json using fast (unordered) JSON — ~100x faster than ordered_json
     // for the 10+ MB file with 150k+ vocab entries.
-    fast_json data;
-    {
-        std::ifstream f(tokenizer_json_path);
-        data = fast_json::parse(f);
-    }
+    const fast_json data = fast_json::parse(sources.tokenizer_json);
 
     Tokenizer tok;
     auto& impl = *tok.impl_;
@@ -630,14 +643,9 @@ Tokenizer Tokenizer::from_pretrained(const std::string& model_dir) {
     // Each pattern has a matching hand-optimized C++ implementation in unicode.cpp,
     // so no regex engine is needed.
     std::string architecture;
-    auto model_config_path = dir / "config.json";
-    if (fs::exists(model_config_path)) {
-        fast_json model_config;
-        {
-            std::ifstream f(model_config_path);
-            model_config = fast_json::parse(f);
-        }
-        architecture = model_config.value("model_type", "");
+    if (!sources.model_config_json.empty()) {
+        const fast_json model_config = fast_json::parse(sources.model_config_json);
+        architecture                 = model_config.value("model_type", "");
     }
 
     if (architecture == "qwen2" || architecture == "qwen3" || architecture == "qwen3_moe" ||
@@ -731,13 +739,8 @@ Tokenizer Tokenizer::from_pretrained(const std::string& model_dir) {
     }
 
     // ---- Load tokenizer_config.json for extra metadata ----
-    auto config_path = dir / "tokenizer_config.json";
-    if (fs::exists(config_path)) {
-        fast_json config;
-        {
-            std::ifstream f(config_path);
-            config = fast_json::parse(f);
-        }
+    if (!sources.tokenizer_config_json.empty()) {
+        const fast_json config = fast_json::parse(sources.tokenizer_config_json);
 
         // BOS/EOS/PAD token resolution
         auto resolve_token_id = [&](const fast_json& config, const std::string& key) -> int32_t {
@@ -784,7 +787,7 @@ Tokenizer Tokenizer::from_pretrained(const std::string& model_dir) {
         // A standalone chat_template.jinja takes precedence (HF convention): some
         // checkpoints set the config field to "{% include 'chat_template.jinja' %}",
         // which minja cannot resolve.
-        if (!fs::exists(dir / "chat_template.jinja") && config.contains("chat_template") &&
+        if (sources.chat_template_jinja.empty() && config.contains("chat_template") &&
             config["chat_template"].is_string()) {
             std::string tmpl_str = config["chat_template"].get<std::string>();
             impl.template_uses_strftime = tmpl_str.find("strftime_now") != std::string::npos;
@@ -803,10 +806,8 @@ Tokenizer Tokenizer::from_pretrained(const std::string& model_dir) {
 
     // If no chat template in tokenizer_config.json, check for chat_template.jinja file
     if (!impl.chat_tmpl_root) {
-        auto jinja_path = dir / "chat_template.jinja";
-        if (fs::exists(jinja_path)) {
-            std::ifstream f(jinja_path);
-            std::string tmpl_str((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        if (!sources.chat_template_jinja.empty()) {
+            const std::string tmpl_str = sources.chat_template_jinja;
             impl.template_uses_strftime = tmpl_str.find("strftime_now") != std::string::npos;
             impl.chat_tmpl_root = minja::Parser::parse(tmpl_str,
                                                        {

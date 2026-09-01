@@ -42,8 +42,22 @@ public:
     Tokenizer(Tokenizer&&) noexcept;
     Tokenizer& operator=(Tokenizer&&) noexcept;
 
+    // The files a tokenizer is built from, already in memory. `tokenizer_json` is
+    // required; the rest may be empty. This is what lets a caller that holds the
+    // resources rather than a directory -- the serving engine reads them out of
+    // its model artifact -- build the same tokenizer without staging temp files.
+    struct Sources {
+        std::string tokenizer_json;
+        std::string model_config_json;      // config.json: names the pre-tokenizer family
+        std::string tokenizer_config_json;  // specials, chat template
+        std::string chat_template_jinja;    // standalone template, if the checkpoint ships one
+    };
+
     // Load from a HuggingFace model directory (reads tokenizer.json + tokenizer_config.json)
     static Tokenizer from_pretrained(const std::string& model_dir);
+
+    // Same, from sources already in memory.
+    static Tokenizer from_sources(const Sources& sources);
 
     // Encode text to token IDs. Special tokens in the text are NOT encoded unless
     // they appear in allowed_special.
