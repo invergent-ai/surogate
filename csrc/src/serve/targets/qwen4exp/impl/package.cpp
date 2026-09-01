@@ -1,4 +1,5 @@
 #include <api/targets/qwen4exp/package.h>
+#include "targets/qwen3_6/impl/lora_bind.h"
 #include <api/targets/qwen3_6/frontend_resources.h>
 #include <api/targets/qwen3_6/prepared_prompt.h>
 
@@ -115,8 +116,19 @@ Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&
     return std::unique_ptr<LoadedModel>(new LoadedModel(std::move(impl)));
 }
 
+namespace {
+
+void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& options) {
+    qwen3_6::bind_lora_moe_hybrid<detail::TextConfig>(runtime, options, [](std::size_t layer) {
+        return detail::TextConfig::is_full_attention(static_cast<int>(layer));
+    });
+}
+
+} // namespace
+
 Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineOptions& options) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
+    bind_lora(model.impl_->data.runtime, options);
     return qwen3_6::make_frontend(model.impl_->data.frontend,
                                   qwen3_6::FrontendOptions{
                                       .vision_enabled = false,

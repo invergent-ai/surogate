@@ -101,6 +101,34 @@ frequently strip it. `dflash` needs a drafter checkpoint that is converted in
 alongside the model. Either way a model without one refuses at startup, naming
 what is missing, rather than silently serving unaccelerated.
 
+### LoRA adapters
+
+Serve PEFT adapters beside the base model, several at once, each addressable by
+name. A request selects one by putting the adapter's name in `model`; the base
+id keeps meaning the unadapted model, and requests for different adapters share
+a batch. Adapters can also be loaded and unloaded at runtime through
+`POST /v1/load_lora_adapter` and `POST /v1/unload_lora_adapter`, without a
+restart — see the API page.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--enable-lora` | off | Prepare the adapter machinery. Valid with zero adapters named — they can arrive later through the runtime endpoints. |
+| `--lora-modules name=path,...` | — | PEFT adapter directories to load at startup, each addressable as `name` |
+| `--max-loras N` | 1 | Resident adapter slots |
+| `--max-lora-rank N` | 16 | Largest adapter rank accepted |
+
+Adapters apply to `q_proj`, `k_proj`, `v_proj`, `o_proj`, and — on dense-MLP
+models — `down_proj`. A module the server cannot apply is refused at load with
+the reason, rather than skipped: an adapter only partly applied is neither the
+base model nor the fine-tune. Two refusals you may meet: `gate_proj`/`up_proj`
+are fused and consumed inside the SwiGLU projection, and Mixture-of-Experts
+models route their MLP through per-expert weights; in both cases, merging the
+adapter into the checkpoint before conversion (`surogate merge`) serves its full
+effect.
+
+Adapters run under CUDA graphs and with quantized (e.g. NVFP4) base weights;
+the delta is computed in BF16 beside the base projection either way.
+
 ### Sampling defaults
 
 `--temperature`, `--top-p`, `--top-k`, `--min-p`, `--presence-penalty`, `--frequency-penalty`,

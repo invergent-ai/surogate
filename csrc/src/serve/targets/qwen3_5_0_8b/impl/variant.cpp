@@ -8,8 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-#include "api/ops/lora_store.h"
-#include "api/ops/lora.h"
+#include "targets/qwen3_6/impl/lora_hook.h"
 #include "api/ops/linear_pair.h"
 #include "api/ops/linear_swiglu.h"
 #include "api/ops/mtp_pack.h"
@@ -179,30 +178,7 @@ namespace {
 /// against whatever the round wrote, and a buffer allocated per call inside the
 /// hook is baked in by address instead -- which is what made an earlier version
 /// of this give a different answer on every replay.
-void apply_lora(const Weight& base, std::int32_t port, const Tensor& hidden, Tensor& out,
-                cudaStream_t stream) {
-    const bool debug = std::getenv("SUROGATE_SERVE_LORA_DEBUG") != nullptr;
-    if (!ops::lora_active()) {
-        if (debug) { std::fprintf(stderr, "lora-hook: inactive\n"); }
-        return;
-    }
-    const ops::LoraBank* bank = ops::lora_store_for_current_device().find(base.qdata, port);
-    if (bank == nullptr) {
-        if (debug) { std::fprintf(stderr, "lora-hook: no bank for this weight\n"); }
-        return;
-    }
-    const ops::LoraRound& round = ops::lora_current_round();
-    if (!round.valid()) {
-        if (debug) { std::fprintf(stderr, "lora-hook: no round published\n"); }
-        return;
-    }
-    if (debug) { std::fprintf(stderr, "lora-hook: applying\n"); }
-    static const Tensor kNoIds{};
-    ops::lora_delta_batched(hidden, *bank, round.slots != nullptr ? *round.slots : kNoIds,
-                            round.uniform ? ops::lora_store_for_current_device().uniform_cell()
-                                          : nullptr,
-                            out, const_cast<Tensor&>(round.scratch), stream);
-}
+using qwen3_6::apply_lora;
 
 } // namespace
 

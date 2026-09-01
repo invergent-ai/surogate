@@ -1,6 +1,7 @@
 #include "targets/qwen4exp/impl/variant.h"
 #include "core/numa.h"
 
+#include "targets/qwen3_6/impl/lora_hook.h"
 #include "api/ops/causal_conv1d_silu.h"
 #include "api/ops/embedding.h"
 #include "api/ops/gdn_gating.h"
@@ -1535,6 +1536,9 @@ void Variant::attention_projection(const Tensor& hidden,
     ops::extract_bf16_columns(fused, TextConfig::query_size + TextConfig::kv_size, gate, stream);
     ops::extract_bf16_columns(fused, 2 * TextConfig::query_size + TextConfig::kv_size, value,
                               stream);
+    qwen3_6::apply_lora(weights.query_key_gate_value, 0, hidden, query, stream);
+    qwen3_6::apply_lora(weights.query_key_gate_value, 1, hidden, key, stream);
+    qwen3_6::apply_lora(weights.query_key_gate_value, 2, hidden, value, stream);
 }
 
 void Variant::attention_output_projection(const Tensor& attention, const Weight& weight,
@@ -1543,6 +1547,9 @@ void Variant::attention_output_projection(const Tensor& attention, const Weight&
     auto scope     = workspace.scope();
     Tensor output  = workspace.alloc(DType::BF16, {kHidden, attention.ne[1]});
     ops::linear(attention, weight, output, kPolicy, workspace, stream);
+    // Before the hyper-connection combine: the delta belongs to o_proj's output,
+    // and the combine is what distributes it across the residual streams.
+    qwen3_6::apply_lora(weight, 3, attention, output, stream);
     combine_into(output, residual, stream);
 }
 

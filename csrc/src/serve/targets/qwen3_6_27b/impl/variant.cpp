@@ -1,5 +1,6 @@
 #include "targets/qwen3_6_27b/impl/variant.h"
 
+#include "targets/qwen3_6/impl/lora_hook.h"
 #include "api/ops/attn_input_proj.h"
 #include "api/ops/gdn_gating_proj.h"
 #include "api/ops/gdn_input_proj.h"
@@ -183,12 +184,16 @@ void Variant::attention_projection(const Tensor& hidden,
     const Weight& fused = std::get<FusedAttentionProjectionPayload>(weights).query_key_gate_value;
     ops::attn_input_proj(hidden, fused, query, gate, key, value, text_policy(fused), workspace,
                          stream);
+    qwen3_6::apply_lora(fused, 0, hidden, query, stream);
+    qwen3_6::apply_lora(fused, 1, hidden, key, stream);
+    qwen3_6::apply_lora(fused, 2, hidden, value, stream);
 }
 
 void Variant::attention_output_projection(const Tensor& attention, const Weight& weight,
                                           Tensor& residual, qwen3_6::TextPhase,
                                           WorkspaceArena& workspace, cudaStream_t stream) {
     ops::linear_add(attention, weight, residual, text_policy(weight), workspace, stream);
+    qwen3_6::apply_lora(weight, 3, attention, residual, stream);
 }
 
 void Variant::mtp_attention_projection(const Tensor& hidden,
@@ -337,6 +342,9 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
                        stream);
     ops::linear_add(activation, weights.down, residual, text_policy(weights.down), workspace,
                     stream);
+    // down reads the SwiGLU activation, which is exactly the input its adapter
+    // was trained against.
+    qwen3_6::apply_lora(weights.down, 4, activation, residual, stream);
 }
 
 void Variant::mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,

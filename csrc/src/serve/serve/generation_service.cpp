@@ -306,9 +306,9 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     // bind, at startup or from the runtime endpoints.
     if (lora_requested && !ops::lora_store_for_current_device().has_bindings()) {
         throw std::invalid_argument(
-            "--enable-lora: this target does not apply adapters (only qwen3.5-0.8b binds them "
-            "today), so the adapter would be loaded and silently ignored. Merge it into the "
-            "checkpoint before conversion (`surogate merge`) to serve it here.");
+            "--enable-lora: this target does not apply adapters, so one would be loaded and "
+            "silently ignored. Merge it into the checkpoint before conversion (`surogate merge`) "
+            "to serve it here.");
     }
     prompt_capabilities_ = engine_->prompt_capabilities();
     request_capacity_    = std::make_shared<RequestCapacity>(

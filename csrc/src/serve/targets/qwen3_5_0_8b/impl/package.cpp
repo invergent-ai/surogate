@@ -4,7 +4,7 @@
 
 #include <algorithm>
 
-#include "api/ops/lora_store.h"
+#include "targets/qwen3_6/impl/lora_bind.h"
 #include "artifact/reader.h"
 #include "targets/qwen3_5_0_8b/impl/load/bindings.h"
 #include "targets/qwen3_5_0_8b/impl/variant.h"
@@ -133,96 +133,8 @@ namespace {
 /// with its name: an adapter half-applied is a model that is neither the base nor
 /// the fine-tune, and it would answer fluently either way.
 void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& options) {
-    if (!options.lora_enable && options.lora_payloads.empty()) { return; }
-    ops::LoraStore& store = ops::lora_store_for_current_device();
-    if (store.empty()) {
-        // The widest round an adapter can see: a prefill chunk, or every lane
-        // times the verify window when a draft is in flight. Sizing this for
-        // lanes alone left every prompt without a scratch, so the prompt was
-        // built on the base model while the generated tokens carried the delta --
-        // an adapter that looked weak rather than unapplied.
-        const std::uint32_t window = options.speculative.backend == SpeculativeBackend::None
-                                         ? 1U
-                                         : options.speculative.draft_tokens + 1U;
-        const std::uint32_t decode_columns =
-            std::max<std::uint32_t>(options.max_concurrency, 1) * window;
-        const std::uint32_t widest =
-            std::max<std::uint32_t>(decode_columns, std::max<std::uint32_t>(options.prefill_chunk, 1));
-        store.configure(static_cast<std::int32_t>(std::max<std::uint32_t>(options.lora_slots, 1)),
-                        static_cast<std::int32_t>(std::max<std::uint32_t>(options.lora_max_rank, 1)),
-                        static_cast<std::int32_t>(widest));
-    }
-
-    // The directory: where every adaptable module of every layer lives on this
-    // model, registered once so loading is target-agnostic afterwards -- at
-    // startup and from the runtime endpoints alike. q, k and v leave one fused
-    // projection as separate contiguous tensors, so they share a bank key and are
-    // told apart by the port; o and down have a weight each. Attention modules
-    // exist only on the full-attention layers (every fourth from 3); the MLP is on
-    // every layer.
-    using Binding          = ops::LoraStore::ModuleBinding;
-    const auto is_full     = [](std::size_t layer) { return layer >= 3 && (layer - 3) % 4 == 0; };
-    std::size_t full_index = 0;
-    std::size_t gdn_index  = 0;
-    for (std::size_t layer = 0; layer < detail::TextConfig::layers; ++layer) {
-        const auto index = static_cast<std::int32_t>(layer);
-        const detail::DensePostMixerPayload* mlp = nullptr;
-        if (is_full(layer)) {
-            const detail::FullAttentionWeights& full = runtime.full_layers.at(full_index++);
-            mlp                                      = &full.post_mixer;
-            const auto* fused =
-                std::get_if<detail::FusedAttentionProjectionPayload>(&full.projection);
-            if (fused != nullptr) {
-                const void* qkv = fused->query_key_gate_value.qdata;
-                store.register_module(index, "q_proj",
-                                      Binding{qkv, 0, detail::TextConfig::hidden,
-                                              detail::TextConfig::query_heads *
-                                                  detail::TextConfig::head_dim});
-                store.register_module(index, "k_proj",
-                                      Binding{qkv, 1, detail::TextConfig::hidden,
-                                              detail::TextConfig::kv_heads *
-                                                  detail::TextConfig::head_dim});
-                store.register_module(index, "v_proj",
-                                      Binding{qkv, 2, detail::TextConfig::hidden,
-                                              detail::TextConfig::kv_heads *
-                                                  detail::TextConfig::head_dim});
-            } else {
-                store.register_layer_refusal(
-                    index, "q_proj",
-                    "this artifact splits its attention projection, which the attention adapter "
-                    "path does not bind");
-            }
-            store.register_module(index, "o_proj",
-                                  Binding{full.output.qdata,
-                                          3,
-                                          detail::TextConfig::query_heads *
-                                              detail::TextConfig::head_dim,
-                                          detail::TextConfig::hidden});
-        } else {
-            mlp = &runtime.gdn_layers.at(gdn_index++).post_mixer;
-            for (const char* module : {"q_proj", "k_proj", "v_proj", "o_proj"}) {
-                store.register_layer_refusal(
-                    index, module,
-                    "this layer is linear attention, which has no self_attn projections; an "
-                    "adapter naming them here was trained against a different architecture");
-            }
-        }
-        store.register_module(index, "down_proj",
-                              Binding{mlp->down.qdata, 4, detail::TextConfig::intermediate,
-                                      detail::TextConfig::hidden});
-    }
-    for (const char* module : {"gate_proj", "up_proj"}) {
-        store.register_refusal(module,
-                               "gate and up are fused and consumed by SwiGLU inside the "
-                               "projection, so there is no intermediate tensor to add a delta to");
-    }
-    store.ensure_banks();
-
-    for (const auto& payload : options.lora_payloads) {
-        store.set_module_slot(payload.layer, payload.module, payload.slot, payload.a, payload.b,
-                              payload.rank, payload.in_dim, payload.out_dim, payload.scale);
-    }
-    ops::lora_set_active(true);
+    qwen3_6::bind_lora_hybrid<detail::TextConfig, detail::FusedAttentionProjectionPayload>(
+        runtime, options, [](std::size_t layer) { return layer >= 3 && (layer - 3) % 4 == 0; });
 }
 
 } // namespace

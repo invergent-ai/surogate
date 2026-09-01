@@ -1,5 +1,6 @@
 #include "targets/qwen3_6_35b_a3b/impl/variant.h"
 
+#include "targets/qwen3_6/impl/lora_hook.h"
 #include "api/ops/attn_input_proj.h"
 #include "api/ops/gdn_gating_proj.h"
 #include "api/ops/gdn_input_proj.h"
@@ -130,12 +131,16 @@ void Variant::attention_projection(const Tensor& hidden,
                                    Tensor& gate, Tensor& key, Tensor& value, qwen3_6::TextPhase,
                                    WorkspaceArena&, cudaStream_t stream) {
     ops::attn_input_proj(hidden, weights.query_key_gate_value, query, gate, key, value, stream);
+    qwen3_6::apply_lora(weights.query_key_gate_value, 0, hidden, query, stream);
+    qwen3_6::apply_lora(weights.query_key_gate_value, 1, hidden, key, stream);
+    qwen3_6::apply_lora(weights.query_key_gate_value, 2, hidden, value, stream);
 }
 
 void Variant::attention_output_projection(const Tensor& attention, const Weight& weight,
                                           Tensor& residual, qwen3_6::TextPhase,
                                           WorkspaceArena& workspace, cudaStream_t stream) {
     ops::linear_add(attention, weight, residual, workspace, stream);
+    qwen3_6::apply_lora(weight, 3, attention, residual, stream);
 }
 
 void Variant::mtp_attention_projection(const Tensor& hidden,

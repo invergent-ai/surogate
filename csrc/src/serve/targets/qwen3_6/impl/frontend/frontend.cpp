@@ -379,7 +379,24 @@ void append_delta(PublishedOutput& output, OutputChannel channel, std::string te
     }
 }
 
-std::size_t valid_utf8_prefix_size(std::string_view bytes) {
+// The longest valid-UTF-8 prefix of the pending bytes, and whether what stopped
+// the scan is an invalid sequence (as opposed to a clean end or an incomplete
+// tail a later token may finish).
+//
+// Invalid is an outcome, not an exception: with a byte-fallback vocabulary the
+// model is free to compose any byte sequence, so a malformed one is a property
+// of sampled output, not of the engine. It used to throw here -- and the worker
+// loop treats any throw as fatal, so one degenerate generation (a violent
+// adapter, an unlucky high-temperature run) took the whole engine down with it,
+// every later request answering 503. The caller replaces the offending byte
+// with U+FFFD and continues, which is also what terminalize already did for an
+// incomplete trailing sequence.
+struct Utf8Scan {
+    std::size_t size = 0; ///< bytes safe to emit
+    bool invalid     = false; ///< bytes[size] starts an invalid sequence
+};
+
+Utf8Scan valid_utf8_prefix(std::string_view bytes) {
     std::size_t offset = 0;
     while (offset < bytes.size()) {
         const auto lead         = static_cast<unsigned char>(bytes[offset]);
@@ -402,24 +419,21 @@ std::size_t valid_utf8_prefix_size(std::string_view bytes) {
             codepoint = lead & 0x07U;
             minimum   = 0x10000U;
         } else {
-            throw std::invalid_argument("invalid UTF-8 leading byte in generated token stream");
+            return {offset, true};
         }
-        if (offset + length > bytes.size()) { return offset; }
+        if (offset + length > bytes.size()) { return {offset, false}; }
         for (std::size_t index = 1; index < length; ++index) {
             const auto byte = static_cast<unsigned char>(bytes[offset + index]);
-            if ((byte & 0xc0U) != 0x80U) {
-                throw std::invalid_argument(
-                    "invalid UTF-8 continuation byte in generated token stream");
-            }
+            if ((byte & 0xc0U) != 0x80U) { return {offset, true}; }
             codepoint = (codepoint << 6U) | (byte & 0x3fU);
         }
         if (codepoint < minimum || (codepoint >= 0xd800U && codepoint <= 0xdfffU) ||
             codepoint > 0x10ffffU) {
-            throw std::invalid_argument("invalid UTF-8 codepoint in generated token stream");
+            return {offset, true};
         }
         offset += length;
     }
-    return offset;
+    return {offset, false};
 }
 
 std::size_t longest_suffix_prefix(std::string_view text, std::string_view marker,
@@ -561,11 +575,19 @@ void feed_token_bytes(DecoderState& state, std::string bytes, const StopPolicy& 
                       PublishedOutput& emitted, std::uint32_t committed_tokens,
                       StopMatch* best_match) {
     state.utf8_pending += bytes;
-    const std::size_t valid = valid_utf8_prefix_size(state.utf8_pending);
-    if (valid == 0) { return; }
-    const std::string text = state.utf8_pending.substr(0, valid);
-    state.utf8_pending.erase(0, valid);
-    feed_decoded_text(state, text, policy, emitted, committed_tokens, best_match);
+    while (true) {
+        const Utf8Scan scan = valid_utf8_prefix(state.utf8_pending);
+        if (scan.size != 0) {
+            const std::string text = state.utf8_pending.substr(0, scan.size);
+            state.utf8_pending.erase(0, scan.size);
+            feed_decoded_text(state, text, policy, emitted, committed_tokens, best_match);
+        }
+        if (!scan.invalid) { return; }
+        // One replacement character per offending byte, then rescan: the bytes
+        // after it may resume as valid text.
+        state.utf8_pending.erase(0, 1);
+        feed_decoded_text(state, "\xef\xbf\xbd", policy, emitted, committed_tokens, best_match);
+    }
 }
 
 void terminalize(DecoderState& state, const StopPolicy& policy, PublishedOutput& emitted,

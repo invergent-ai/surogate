@@ -7,6 +7,7 @@
 // which no smoke test catches.
 
 #include "api/ops/lora.h"
+#include "api/ops/lora_store.h"
 
 #include "ops/op_tester.h"
 
@@ -289,10 +290,50 @@ void test_batched(std::int32_t n, std::int32_t k, std::int32_t rank, std::int32_
     std::printf("  %-44s max relative error %.2e\n", label.c_str(), worst);
 }
 
+void test_directory() {
+    ops::LoraStore store;
+    store.configure(/*slots=*/2, /*max_rank=*/8, /*max_tokens=*/64);
+    int base_a = 0, base_b = 0; // any distinct non-null keys; never dereferenced here
+    store.register_module(0, "q_proj", {&base_a, 0, 16, 32});
+    store.register_module(0, "k_proj", {&base_a, 1, 16, 8});
+    store.register_module(1, "down_proj", {&base_b, 4, 24, 16});
+    store.register_refusal("gate_proj", "fused into SwiGLU");
+    store.register_layer_refusal(1, "q_proj", "linear attention here");
+    store.ensure_banks();
+    check(store.has_bindings(), "directory registers");
+    check(store.find(&base_a, 0) != nullptr && store.find(&base_a, 1) != nullptr &&
+              store.find(&base_b, 4) != nullptr,
+          "ensure_banks creates every registered bank");
+    check(store.find(&base_a, 2) == nullptr, "unregistered ports have no bank");
+
+    const std::vector<std::uint16_t> a16(8 * 16, 0), b32(32 * 8, 0), a24(8 * 24, 0),
+        b16(16 * 8, 0);
+    store.set_module_slot(0, "q_proj", 0, a16, b32, 8, 16, 32, 1.0F); // fits
+    store.set_module_slot(1, "down_proj", 1, a24, b16, 8, 24, 16, 1.0F);
+
+    const auto refused = [&](int layer, const char* module, std::int32_t in, std::int32_t out,
+                             const char* needle) {
+        try {
+            std::vector<std::uint16_t> a(static_cast<std::size_t>(8) * in, 0);
+            std::vector<std::uint16_t> b(static_cast<std::size_t>(out) * 8, 0);
+            store.set_module_slot(layer, module, 0, a, b, 8, in, out, 1.0F);
+            return false;
+        } catch (const std::invalid_argument& error) {
+            return std::string(error.what()).find(needle) != std::string::npos;
+        }
+    };
+    check(refused(0, "gate_proj", 16, 32, "SwiGLU"), "module-wide refusal names the reason");
+    check(refused(1, "q_proj", 16, 32, "linear attention"), "layer refusal names the reason");
+    check(refused(2, "q_proj", 16, 32, "not applied"), "unregistered module is refused");
+    check(refused(0, "q_proj", 16, 64, "different model"), "shape mismatch names both shapes");
+    std::printf("  directory: register/ensure/apply/refuse all behave\n");
+}
+
 } // namespace
 
 int main() {
     try {
+        test_directory();
         test_delta(64, 128, 8, 1);    // decode width
         test_delta(256, 512, 16, 4);  // speculative verify width
         test_delta(512, 2048, 32, 37); // a prefill slice, rank 32

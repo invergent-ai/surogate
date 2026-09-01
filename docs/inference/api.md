@@ -33,6 +33,8 @@ reports, which is how you keep a client's hard-coded model string working.
 | `GET` | `/v1/models`, `/v1/models/{id}` | Model listing |
 | `POST` | `/v1/messages` | **Anthropic** Messages API |
 | `POST` | `/v1/messages/count_tokens` | **Anthropic** token counting |
+| `POST` | `/v1/load_lora_adapter` | Load a PEFT adapter at runtime (`--enable-lora` servers) |
+| `POST` | `/v1/unload_lora_adapter` | Unload an adapter by name |
 | `GET` | `/health` | Readiness probe |
 | `POST` | `/v1/embeddings` | Embeddings — served by `surogate serve --embed`, a separate process |
 
@@ -97,6 +99,29 @@ curl -N http://127.0.0.1:8080/v1/chat/completions \
        "stream_options":{"include_usage":true},
        "messages":[{"role":"user","content":"Count to five."}]}'
 ```
+
+## LoRA adapters at runtime
+
+On a server started with `--enable-lora`, adapters can be added and removed
+without a restart, mirroring vLLM's endpoints:
+
+```bash
+curl -X POST http://localhost:8080/v1/load_lora_adapter \
+  -H 'Content-Type: application/json' \
+  -d '{"lora_name": "my-tune", "lora_path": "/path/to/peft/adapter"}'
+
+curl -X POST http://localhost:8080/v1/unload_lora_adapter \
+  -H 'Content-Type: application/json' \
+  -d '{"lora_name": "my-tune"}'
+```
+
+A loaded adapter appears in `/v1/models` and is selected per request by naming
+it in `model`. Loading validates the adapter fully before it becomes routable —
+wrong shapes, unsupported modules, a taken name, or exhausted `--max-loras`
+slots are refused with the reason, and a failed load leaves nothing behind.
+Unloading zeroes the adapter's contribution immediately; a request already in
+flight that selected it finishes against the base model rather than reading
+freed weights.
 
 ## Responses API
 
