@@ -207,6 +207,10 @@ Tensor LinearAttentionStatePool::recurrent_slot(std::uint32_t layer, std::int32_
 }
 
 void LinearAttentionStatePool::copy_slot(std::int32_t src, std::int32_t dst, cudaStream_t stream) {
+    // A pure-attention target holds an empty pool: there is no per-layer state
+    // to move, and validating "layer 0" would refuse a layer that correctly
+    // does not exist.
+    if (layer_count() == 0) { return; }
     validate_layer_slot(*this, 0, src, "LinearAttentionStatePool copy_slot source");
     validate_layer_slot(*this, 0, dst, "LinearAttentionStatePool copy_slot destination");
     if (src == dst) { return; }
@@ -225,6 +229,7 @@ void LinearAttentionStatePool::copy_slot(std::int32_t src, std::int32_t dst, cud
 }
 
 void LinearAttentionStatePool::zero_slot(std::int32_t slot, cudaStream_t stream) {
+    if (layer_count() == 0) { return; } // empty pool: nothing to clear
     validate_layer_slot(*this, 0, slot, "LinearAttentionStatePool zero_slot");
     for (std::uint32_t layer = 0; layer < layer_count(); ++layer) {
         const Tensor state = conv_slot(layer, slot);

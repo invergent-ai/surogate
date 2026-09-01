@@ -389,7 +389,15 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     ResidualHooks<Variant>::layer_prologue_workspace_capacity_bytes(first, last));
         }
         attention_stage(layout, first, last, phase, batch_size, min_width, max_width, envelope);
-        gdn_stage(layout, first, last, phase, path, batch_size, min_width, max_width);
+        // A pure-attention target has no linear mixer, so it needs none of the
+        // GDN scratch -- and cannot size it anyway: every extent below derives
+        // from a GDN head count that is zero here, which the tensor constructor
+        // rejects rather than silently allocating nothing.
+        if constexpr (TextConfig::gdn_layers() > 0) {
+            gdn_stage(layout, first, last, phase, path, batch_size, min_width, max_width);
+        } else {
+            (void)path;
+        }
         post_mixer_stage(layout, first, last, phase);
     };
     const auto proposal_scratch = [&](WorkspaceLayoutBuilder& layout, std::int32_t columns) {
