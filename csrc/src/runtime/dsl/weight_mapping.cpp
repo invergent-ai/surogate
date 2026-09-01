@@ -5,6 +5,8 @@
 
 #include "runtime/dsl/weight_mapping.h"
 
+#include "runtime/dsl/mapping_spec.h"
+
 #include <cctype>
 #include <optional>
 #include <stdexcept>
@@ -34,6 +36,7 @@ struct WeightSpec {
     int dim = 0;
     bool optional = false;
     bool fuse_gate_up = false;  // For StackExperts: fuse gate+up into gate_up format
+    std::string up_source;      // For StackExperts: explicit up-projection pattern
     int num_experts = 0;        // For StackExperts: number of experts (0 = auto)
 };
 
@@ -192,6 +195,11 @@ WeightSpec parse_weight_spec(const AttrValue& value) {
         if (const auto* fuse_val = find_key(map, "fuse_gate_up")) {
             if (auto fuse = as_bool(*fuse_val)) {
                 spec.fuse_gate_up = *fuse;
+            }
+        }
+        if (const auto* up_val = find_key(map, "up_pattern")) {
+            if (auto up = as_string(*up_val)) {
+                spec.up_source = *up;
             }
         }
         if (const auto* num_val = find_key(map, "num_experts")) {
@@ -440,13 +448,9 @@ public:
                     if (spec.fuse_gate_up) {
                         // For gate_up: register both gate_proj and up_proj patterns
                         // The pattern is for gate_proj; derive up_proj by replacing gate_proj with up_proj
-                        std::string gate_pattern = spec.source;
-                        std::string up_pattern = spec.source;
-                        // Replace gate_proj with up_proj in the pattern
-                        std::size_t pos = up_pattern.find("gate_proj");
-                        if (pos != std::string::npos) {
-                            up_pattern.replace(pos, 9, "up_proj");
-                        }
+                        const std::string gate_pattern = spec.source;
+                        const std::string up_pattern =
+                            MappingSpec::derive_up_pattern(spec.source, spec.up_source);
                         add_expert_pattern(gate_pattern, modules::TensorTarget::ExpertGate, nullptr, spec.optional);
                         add_expert_pattern(up_pattern, modules::TensorTarget::ExpertUp, nullptr, spec.optional);
                     } else {

@@ -183,12 +183,8 @@ bool DslWeightLoader::load_expert(const std::string& name,
 
     if (spec->kind == MappingSpec::Kind::StackExperts && spec->fuse_gate_up) {
         // Fused gate_up: target is [2*D, C], load up_proj into first D rows, gate into next D.
-        std::string gate_pattern = spec->source;
-        std::string up_pattern = spec->source;
-        std::size_t pos = up_pattern.find("gate_proj");
-        if (pos != std::string::npos) {
-            up_pattern.replace(pos, 9, "up_proj");
-        }
+        const std::string gate_pattern = spec->source;
+        const std::string up_pattern = MappingSpec::derive_up_pattern(spec->source, spec->up_source);
 
         const long fused_rows = target.Sizes[0];  // 2*D
         const long D = fused_rows / 2;
@@ -728,12 +724,8 @@ bool DslWeightLoader::load_stack_experts(const MappingSpec& spec,
 
     if (spec.fuse_gate_up) {
         // Fused gate_up layout: [E, 2*D, C] where first D rows are up, next D rows are gate.
-        std::string gate_pattern = spec.source;
-        std::string up_pattern = spec.source;
-        std::size_t pos = up_pattern.find("gate_proj");
-        if (pos != std::string::npos) {
-            up_pattern.replace(pos, 9, "up_proj");
-        }
+        const std::string gate_pattern = spec.source;
+        const std::string up_pattern = MappingSpec::derive_up_pattern(spec.source, spec.up_source);
 
         const long fused_rows = target.Rank >= 2 ? target.Sizes[1] : 1;
         const long D = fused_rows / 2;
