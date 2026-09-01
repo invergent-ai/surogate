@@ -64,8 +64,15 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
     v_bits[1] = 0x0001U;
     g[0]      = std::bit_cast<float>(0x80000000U);
     beta[0]   = std::bit_cast<float>(0x00000001U);
+    // The recurrent state is bf16 in the pool (7fc710a5); this test still built
+    // it as float, which the op refuses outright.
     std::vector<float> state(state_elements);
     fill_uniform(state, seed + 5, -0.03F, 0.03F);
+    round_to_bf16(state);
+    std::vector<std::uint16_t> state_bits(state_elements);
+    for (std::size_t index = 0; index < state_elements; ++index) {
+        state_bits[index] = f32_to_bf16(state[index]);
+    }
 
     std::vector<std::int32_t> initial_slots(static_cast<std::size_t>(batch));
     std::vector<std::int32_t> snapshot_bases(static_cast<std::size_t>(batch));
@@ -79,8 +86,8 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
     DeviceBuffer device_v       = to_device(v_bits);
     DeviceBuffer device_g       = to_device(g);
     DeviceBuffer device_beta    = to_device(beta);
-    DeviceBuffer snapshot_state = to_device(state);
-    DeviceBuffer record_state   = to_device(state);
+    DeviceBuffer snapshot_state = to_device(state_bits);
+    DeviceBuffer record_state   = to_device(state_bits);
     DeviceBuffer device_initial = to_device(initial_slots);
     DeviceBuffer device_bases   = to_device(snapshot_bases);
     DeviceBuffer device_valid;
@@ -102,9 +109,9 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
     Tensor v(device_v.p, DType::BF16, {kStateDim, value_heads, width, batch});
     Tensor g_tensor(device_g.p, DType::FP32, {value_heads, width, batch});
     Tensor beta_tensor(device_beta.p, DType::FP32, {value_heads, width, batch});
-    Tensor snapshot_states(snapshot_state.p, DType::FP32,
+    Tensor snapshot_states(snapshot_state.p, DType::BF16,
                            {kStateDim, kStateDim, value_heads, slots});
-    Tensor record_states(record_state.p, DType::FP32, {kStateDim, kStateDim, value_heads, slots});
+    Tensor record_states(record_state.p, DType::BF16, {kStateDim, kStateDim, value_heads, slots});
     Tensor valid;
     if (!dense) { valid = Tensor(device_valid.p, DType::I32, {batch}); }
     Tensor initial(device_initial.p, DType::I32, {batch});
@@ -192,8 +199,9 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
         }
     }
 
-    const std::vector<float> state_after = from_device<float>(record_state, state_elements);
-    if (state_after != state) {
+    const std::vector<std::uint16_t> state_after =
+        from_device<std::uint16_t>(record_state, state_elements);
+    if (state_after != state_bits) {
         std::cerr << "replay record modified source state" << suffix << "\n";
         ++failures;
     }

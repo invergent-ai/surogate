@@ -27,9 +27,23 @@ constexpr ReductionCriterion gated_delta_net_output_bf16_criterion() {
             /*gross_relative_to_max_reference=*/5.5e-3};
 }
 
-constexpr ReductionCriterion gated_delta_net_state_fp32_criterion() {
-    return {/*relative_l2=*/2.7e-3, /*gross_absolute=*/1.0e-5,
-            /*gross_relative_to_max_reference=*/3.9e-3};
+// The recurrent state is stored bf16 (7fc710a5, "store GDN recurrent state in
+// bf16, compute unchanged"), so it carries the same storage quantisation as the
+// output beside it and is held to the same floor. The tighter numbers this used
+// to carry (2.7e-3 / 3.9e-3) were calibrated when the state was fp32-stored: the
+// compute did not change, the storage did, and against an fp64 oracle a
+// bf16-stored value is off by up to about a ULP -- roughly 1e-3 at the ~0.15
+// magnitudes these states reach.
+//
+// The gross bound is derived, not tuned: 3.9e-3 is the compute allowance this
+// criterion carried while the state was fp32-stored, and bf16 keeps 8 mantissa
+// bits, so storing an already-computed value costs up to half a ULP more --
+// 2^-9, about 2.0e-3 relative. Their sum is 5.9e-3, rounded to 6.0e-3. Nothing
+// about the arithmetic changed, so the compute term is unchanged and the
+// storage term is the whole of the difference.
+constexpr ReductionCriterion gated_delta_net_state_criterion() {
+    return {/*relative_l2=*/4.1e-3, /*gross_absolute=*/1.0e-5,
+            /*gross_relative_to_max_reference=*/6.0e-3};
 }
 
 struct Case {
@@ -127,6 +141,14 @@ int verify_recurrence(const std::string& label, const std::vector<double>& got,
     return verify_reduction(label.c_str(), got, expected, criterion);
 }
 
+std::vector<double> bf16_doubles(std::vector<std::uint16_t>::const_iterator begin,
+                                 std::vector<std::uint16_t>::const_iterator end) {
+    std::vector<double> out;
+    out.reserve(static_cast<std::size_t>(end - begin));
+    for (auto it = begin; it != end; ++it) { out.push_back(bf16_to_f32(*it)); }
+    return out;
+}
+
 std::vector<double> read_f32(const void* device, std::size_t count) {
     return doubles(from_device<float>(device, count));
 }
@@ -166,9 +188,10 @@ int inplace_case(const Case& test_case, std::uint32_t seed) {
     const gdn_ref::Result ref =
         gdn_ref::evaluate(in, static_cast<double>(scale), test_case.normalize_qk);
     DeviceInputs device(in);
-    GuardedDeviceBuffer state(in.state.size() * sizeof(float));
+    const std::vector<std::uint16_t> state_bits = bf16_bits(in.state);
+    GuardedDeviceBuffer state(state_bits.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer out(in.v.size() * sizeof(std::uint16_t));
-    state.copy_from_host(in.state.data(), state.bytes());
+    state.copy_from_host(state_bits.data(), state.bytes());
     out.fill(0xff);
 
     Tensor q(device.q.p, DType::BF16, {kStateDim, test_case.qk_heads, test_case.tokens});
@@ -176,7 +199,7 @@ int inplace_case(const Case& test_case, std::uint32_t seed) {
     Tensor v(device.v.p, DType::BF16, {kStateDim, test_case.value_heads, test_case.tokens});
     Tensor g(device.g.p, DType::FP32, {test_case.value_heads, test_case.tokens});
     Tensor beta(device.beta.p, DType::FP32, {test_case.value_heads, test_case.tokens});
-    Tensor state_tensor(state.data(), DType::FP32, {kStateDim, kStateDim, test_case.value_heads});
+    Tensor state_tensor(state.data(), DType::BF16, {kStateDim, kStateDim, test_case.value_heads});
     Tensor out_tensor(out.data(), DType::BF16,
                       {kStateDim, test_case.value_heads, test_case.tokens});
     const std::size_t workspace_bytes = ops::gated_delta_net_workspace_capacity_bytes(
@@ -192,8 +215,8 @@ int inplace_case(const Case& test_case, std::uint32_t seed) {
     int failures            = 0;
     failures += verify_recurrence(label + " out", from_device_bf16(out.data(), in.v.size()),
                                   ref.out, gated_delta_net_output_bf16_criterion());
-    failures += verify_recurrence(label + " state", read_f32(state.data(), in.state.size()),
-                                  ref.final_state, gated_delta_net_state_fp32_criterion());
+    failures += verify_recurrence(label + " state", from_device_bf16(state.data(), in.state.size()),
+                                  ref.final_state, gated_delta_net_state_criterion());
     failures += state.verify_guards((label + " state").c_str());
     failures += out.verify_guards((label + " out").c_str());
     failures += verify_common_inputs_unchanged(label, in, device.q, device.k, device.v, device.g,
@@ -211,10 +234,11 @@ int distinct_state_case(const Case& test_case, std::uint32_t seed) {
     const gdn_ref::Result ref =
         gdn_ref::evaluate(in, static_cast<double>(scale), test_case.normalize_qk);
     DeviceInputs device(in);
-    GuardedDeviceBuffer state_in(in.state.size() * sizeof(float));
-    GuardedDeviceBuffer state_out(in.state.size() * sizeof(float));
+    const std::vector<std::uint16_t> state_bits = bf16_bits(in.state);
+    GuardedDeviceBuffer state_in(state_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer state_out(state_bits.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer out(in.v.size() * sizeof(std::uint16_t));
-    state_in.copy_from_host(in.state.data(), state_in.bytes());
+    state_in.copy_from_host(state_bits.data(), state_in.bytes());
     state_out.fill(0xff);
     out.fill(0xff);
 
@@ -223,9 +247,9 @@ int distinct_state_case(const Case& test_case, std::uint32_t seed) {
     Tensor v(device.v.p, DType::BF16, {kStateDim, test_case.value_heads, test_case.tokens});
     Tensor g(device.g.p, DType::FP32, {test_case.value_heads, test_case.tokens});
     Tensor beta(device.beta.p, DType::FP32, {test_case.value_heads, test_case.tokens});
-    Tensor state_in_tensor(state_in.data(), DType::FP32,
+    Tensor state_in_tensor(state_in.data(), DType::BF16,
                            {kStateDim, kStateDim, test_case.value_heads});
-    Tensor state_out_tensor(state_out.data(), DType::FP32,
+    Tensor state_out_tensor(state_out.data(), DType::BF16,
                             {kStateDim, kStateDim, test_case.value_heads});
     Tensor out_tensor(out.data(), DType::BF16,
                       {kStateDim, test_case.value_heads, test_case.tokens});
@@ -242,10 +266,12 @@ int distinct_state_case(const Case& test_case, std::uint32_t seed) {
     int failures            = 0;
     failures += verify_recurrence(label + " out", from_device_bf16(out.data(), in.v.size()),
                                   ref.out, gated_delta_net_output_bf16_criterion());
-    failures += verify_recurrence(label + " state", read_f32(state_out.data(), in.state.size()),
-                                  ref.final_state, gated_delta_net_state_fp32_criterion());
+    failures += verify_recurrence(label + " state",
+                                  from_device_bf16(state_out.data(), in.state.size()),
+                                  ref.final_state, gated_delta_net_state_criterion());
     failures += verify_exact(label + " state-in unchanged",
-                             from_device<float>(state_in.data(), in.state.size()), in.state);
+                             from_device<std::uint16_t>(state_in.data(), in.state.size()),
+                             state_bits);
     failures += state_in.verify_guards((label + " state-in").c_str());
     failures += state_out.verify_guards((label + " state-out").c_str());
     failures += out.verify_guards((label + " out").c_str());
@@ -270,9 +296,10 @@ int snapshot_case(const Case& test_case, int slots, int initial_slot, int snapsh
               initial_states.begin() + static_cast<std::size_t>(initial_slot) * state_size);
 
     DeviceInputs device(in);
-    GuardedDeviceBuffer states(initial_states.size() * sizeof(float));
+    const std::vector<std::uint16_t> initial_bits = bf16_bits(initial_states);
+    GuardedDeviceBuffer states(initial_bits.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer out(in.v.size() * sizeof(std::uint16_t));
-    states.copy_from_host(initial_states.data(), states.bytes());
+    states.copy_from_host(initial_bits.data(), states.bytes());
     out.fill(0xff);
     DeviceBuffer device_initial_slot       = to_device_i32({initial_slot});
     DeviceBuffer device_snapshot_base_slot = to_device_i32({snapshot_base_slot});
@@ -282,7 +309,7 @@ int snapshot_case(const Case& test_case, int slots, int initial_slot, int snapsh
     Tensor v(device.v.p, DType::BF16, {kStateDim, test_case.value_heads, test_case.tokens});
     Tensor g(device.g.p, DType::FP32, {test_case.value_heads, test_case.tokens});
     Tensor beta(device.beta.p, DType::FP32, {test_case.value_heads, test_case.tokens});
-    Tensor states_tensor(states.data(), DType::FP32,
+    Tensor states_tensor(states.data(), DType::BF16,
                          {kStateDim, kStateDim, test_case.value_heads, slots});
     Tensor initial_slot_tensor(device_initial_slot.p, DType::I32, {1});
     Tensor snapshot_base_slot_tensor(device_snapshot_base_slot.p, DType::I32, {1});
@@ -294,7 +321,8 @@ int snapshot_case(const Case& test_case, int slots, int initial_slot, int snapsh
     cuda_synchronize();
 
     const std::string label             = std::string(test_case.name) + " snapshot";
-    const std::vector<float> got_states = from_device<float>(states.data(), initial_states.size());
+    const std::vector<std::uint16_t> got_states =
+        from_device<std::uint16_t>(states.data(), initial_bits.size());
     const auto got_updated_begin =
         got_states.begin() + static_cast<std::size_t>(snapshot_base_slot) * state_size;
     const auto got_updated_end =
@@ -303,18 +331,18 @@ int snapshot_case(const Case& test_case, int slots, int initial_slot, int snapsh
     failures += verify_recurrence(label + " out", from_device_bf16(out.data(), in.v.size()),
                                   ref.out, gated_delta_net_output_bf16_criterion());
     failures += verify_recurrence(label + " updated state slots",
-                                  doubles(std::vector<float>(got_updated_begin, got_updated_end)),
-                                  ref.snapshots, gated_delta_net_state_fp32_criterion());
+                                  bf16_doubles(got_updated_begin, got_updated_end), ref.snapshots,
+                                  gated_delta_net_state_criterion());
     const auto initial_updated_begin =
-        initial_states.begin() + static_cast<std::size_t>(snapshot_base_slot) * state_size;
+        initial_bits.begin() + static_cast<std::size_t>(snapshot_base_slot) * state_size;
     const auto initial_updated_end =
         initial_updated_begin + static_cast<std::size_t>(test_case.tokens) * state_size;
     failures += verify_exact(label + " slots before destination unchanged",
-                             std::vector<float>(got_states.begin(), got_updated_begin),
-                             std::vector<float>(initial_states.begin(), initial_updated_begin));
+                             std::vector<std::uint16_t>(got_states.begin(), got_updated_begin),
+                             std::vector<std::uint16_t>(initial_bits.begin(), initial_updated_begin));
     failures += verify_exact(label + " slots after destination unchanged",
-                             std::vector<float>(got_updated_end, got_states.end()),
-                             std::vector<float>(initial_updated_end, initial_states.end()));
+                             std::vector<std::uint16_t>(got_updated_end, got_states.end()),
+                             std::vector<std::uint16_t>(initial_updated_end, initial_bits.end()));
     failures +=
         verify_exact(label + " initial-slot scalar unchanged",
                      from_device_i32(device_initial_slot, 1), std::vector<int>{initial_slot});
@@ -397,9 +425,10 @@ int batched_snapshot_case(const Case& test_case, const std::vector<int>& initial
     }
 
     DeviceInputs device(aggregate);
-    GuardedDeviceBuffer states(initial_states.size() * sizeof(float));
+    const std::vector<std::uint16_t> initial_bits = bf16_bits(initial_states);
+    GuardedDeviceBuffer states(initial_bits.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer out(aggregate.v.size() * sizeof(std::uint16_t));
-    states.copy_from_host(initial_states.data(), states.bytes());
+    states.copy_from_host(initial_bits.data(), states.bytes());
     out.fill(0xff);
     DeviceBuffer device_initial_slots  = to_device(initial_slots);
     DeviceBuffer device_snapshot_bases = to_device(snapshot_bases);
@@ -411,7 +440,7 @@ int batched_snapshot_case(const Case& test_case, const std::vector<int>& initial
     Tensor v(device.v.p, DType::BF16, {kStateDim, test_case.value_heads, width, batch});
     Tensor g(device.g.p, DType::FP32, {test_case.value_heads, width, batch});
     Tensor beta(device.beta.p, DType::FP32, {test_case.value_heads, width, batch});
-    Tensor states_tensor(states.data(), DType::FP32,
+    Tensor states_tensor(states.data(), DType::BF16,
                          {kStateDim, kStateDim, test_case.value_heads, slots});
     Tensor valid_tensor;
     if (masked) { valid_tensor = Tensor(device_valid_columns.p, DType::I32, {batch}); }
@@ -451,27 +480,29 @@ int batched_snapshot_case(const Case& test_case, const std::vector<int>& initial
         }
     }
 
-    const std::vector<float> got_states = from_device<float>(states.data(), initial_states.size());
+    const std::vector<std::uint16_t> got_states =
+        from_device<std::uint16_t>(states.data(), initial_bits.size());
     for (int row = 0; row < batch; ++row) {
         const int valid = masked ? valid_columns[static_cast<std::size_t>(row)] : width;
         const std::size_t begin =
             static_cast<std::size_t>(snapshot_bases[static_cast<std::size_t>(row)]) * state_size;
         failures += verify_recurrence(
             label + " row " + std::to_string(row) + " snapshots",
-            doubles(std::vector<float>(got_states.begin() + begin,
-                                       got_states.begin() + begin +
-                                           static_cast<std::size_t>(valid) * state_size)),
+            bf16_doubles(got_states.begin() + begin,
+                         got_states.begin() + begin +
+                             static_cast<std::size_t>(valid) * state_size),
             references[static_cast<std::size_t>(row)].snapshots,
-            gated_delta_net_state_fp32_criterion());
+            gated_delta_net_state_criterion());
     }
     for (int slot = 0; slot < slots; ++slot) {
         if (written_slots[static_cast<std::size_t>(slot)]) continue;
         const std::size_t begin = static_cast<std::size_t>(slot) * state_size;
         failures += verify_exact(
             label + " untouched slot " + std::to_string(slot),
-            std::vector<float>(got_states.begin() + begin, got_states.begin() + begin + state_size),
-            std::vector<float>(initial_states.begin() + begin,
-                               initial_states.begin() + begin + state_size));
+            std::vector<std::uint16_t>(got_states.begin() + begin,
+                                       got_states.begin() + begin + state_size),
+            std::vector<std::uint16_t>(initial_bits.begin() + begin,
+                                       initial_bits.begin() + begin + state_size));
     }
     failures +=
         verify_exact(label + " initial selectors unchanged",

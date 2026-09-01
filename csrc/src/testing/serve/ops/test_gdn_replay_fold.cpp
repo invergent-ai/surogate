@@ -70,7 +70,7 @@ int verify_fold_oracle(const FoldProfile profile, std::int32_t width, std::int32
                        std::uint32_t seed, const std::vector<std::uint16_t>& key_records,
                        const std::vector<std::uint16_t>& value_records,
                        const std::vector<std::uint32_t>& gate_records,
-                       const std::vector<float>& actual) {
+                       const std::vector<std::uint16_t>& actual) {
     gdn_ref::Inputs input;
     input.head_dim    = kStateDim;
     input.qk_heads    = kQkHeads;
@@ -109,7 +109,11 @@ int verify_fold_oracle(const FoldProfile profile, std::int32_t width, std::int32
 
     const gdn_ref::Result expected =
         gdn_ref::evaluate(input, 1.0 / std::sqrt(static_cast<double>(kStateDim)), true);
-    const std::vector<double> actual_double(actual.begin(), actual.end());
+    // `actual` is the stored state, which is bf16; decode rather than widening
+    // the bit patterns.
+    std::vector<double> actual_double(actual.size());
+    std::transform(actual.begin(), actual.end(), actual_double.begin(),
+                   [](std::uint16_t bits) { return static_cast<double>(bf16_to_f32(bits)); });
     return verify_reduction("gdn replay fold independent recurrent-state oracle", actual_double,
                             expected.final_state, recurrent_state_criterion());
 }
@@ -128,7 +132,11 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
     const std::int32_t outer              = profile.layers * kRecordCapacity;
     const std::size_t recurrent_slot_elements =
         static_cast<std::size_t>(kStateDim) * kStateDim * profile.value_heads;
-    const std::size_t recurrent_slot_bytes = recurrent_slot_elements * sizeof(float);
+    // The recurrent state is stored bf16 (7fc710a5: "store GDN recurrent state
+    // in bf16, compute unchanged"), like the convolution state below it. This
+    // test still sized and typed it as float, so it handed FP32 to an op that
+    // requires BF16 and aborted before asserting anything.
+    const std::size_t recurrent_slot_bytes = recurrent_slot_elements * sizeof(std::uint16_t);
     const std::size_t conv_slot_elements   = static_cast<std::size_t>(profile.conv_channels) * 3;
     const std::size_t conv_slot_bytes      = conv_slot_elements * sizeof(std::uint16_t);
 
@@ -313,7 +321,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
     base_device.copy_from_host(&local_base_slot, sizeof(local_base_slot));
 
     const Tensor q_tensor(q.p, DType::BF16, {kStateDim, kQkHeads, width, 1});
-    Tensor local_states(local_snapshot_state.p, DType::FP32,
+    Tensor local_states(local_snapshot_state.p, DType::BF16,
                         {kStateDim, kStateDim, profile.value_heads, width + 1});
     Tensor output(out.p, DType::BF16, {kStateDim, profile.value_heads, width, 1});
     Tensor initial_selector(initial_device.p, DType::I32, {1});
@@ -325,7 +333,8 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
         for (std::int32_t row = 0; row < rows; ++row) {
             const float initial_value =
                 signed_pattern(seed + 500009U + layer * 227U + row * 43U, 0.01F);
-            const std::vector<float> initial_recurrent(recurrent_slot_elements, initial_value);
+            const std::vector<std::uint16_t> initial_recurrent(recurrent_slot_elements,
+                                                              f32_to_bf16(initial_value));
             const Tensor actual_initial = state_pool.recurrent_slot(
                 static_cast<std::uint32_t>(layer), slots[static_cast<std::size_t>(row)]);
             cuda_check(cudaMemcpy(actual_initial.data, initial_recurrent.data(),
@@ -396,8 +405,8 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
     const std::string suffix = " L=" + std::to_string(profile.layers) +
                                " Hv=" + std::to_string(profile.value_heads) +
                                " T=" + std::to_string(width) + " B=" + std::to_string(rows);
-    std::vector<float> actual_recurrent(recurrent_slot_elements);
-    std::vector<float> expected_recurrent_host(recurrent_slot_elements);
+    std::vector<std::uint16_t> actual_recurrent(recurrent_slot_elements);
+    std::vector<std::uint16_t> expected_recurrent_host(recurrent_slot_elements);
     std::vector<std::uint16_t> actual_conv(conv_slot_elements);
     std::vector<std::uint16_t> expected_conv_host(conv_slot_elements);
     for (std::int32_t layer = 0; layer < profile.layers; ++layer) {
@@ -442,7 +451,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
         }
     }
 
-    std::vector<float> inactive_recurrent(recurrent_slot_elements);
+    std::vector<std::uint16_t> inactive_recurrent(recurrent_slot_elements);
     std::vector<std::uint16_t> inactive_conv(conv_slot_elements);
     for (std::int32_t layer = 0; layer < profile.layers; ++layer) {
         for (std::int32_t slot = 0; slot < slot_count; ++slot) {
@@ -453,7 +462,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
                                   cudaMemcpyDeviceToHost),
                        "download inactive recurrent state");
             if (!std::all_of(inactive_recurrent.begin(), inactive_recurrent.end(),
-                             [](float value) { return value == 0.0F; })) {
+                             [](std::uint16_t value) { return value == 0; })) {
                 std::cerr << "fold modified inactive recurrent slot" << suffix << " layer=" << layer
                           << " slot=" << slot << "\n";
                 return failures + 1;
@@ -551,7 +560,8 @@ int run_record_fold_rounds() {
     const std::size_t conv_slot_elements = static_cast<std::size_t>(kProfile.conv_channels) * 3;
     for (std::int32_t layer = 0; layer < kProfile.layers; ++layer) {
         const float initial_value = signed_pattern(1911U + layer * 47U, 0.01F);
-        const std::vector<float> recurrent(recurrent_slot_elements, initial_value);
+        const std::vector<std::uint16_t> recurrent(recurrent_slot_elements,
+                                                   f32_to_bf16(initial_value));
         const Tensor recurrent_slot =
             state_pool.recurrent_slot(static_cast<std::uint32_t>(layer), kInitialSlot);
         cuda_check(cudaMemcpy(recurrent_slot.data, recurrent.data(), recurrent_slot.bytes(),
@@ -688,8 +698,8 @@ int run_record_fold_rounds() {
                 state_pool.recurrent_slot(static_cast<std::uint32_t>(layer), kInitialSlot);
             const Tensor snapshot_recurrent =
                 state_pool.recurrent_slot(static_cast<std::uint32_t>(layer), commit - 1);
-            if (from_device<float>(folded_recurrent.data, recurrent_slot_elements) !=
-                from_device<float>(snapshot_recurrent.data, recurrent_slot_elements)) {
+            if (from_device<std::uint16_t>(folded_recurrent.data, recurrent_slot_elements) !=
+                from_device<std::uint16_t>(snapshot_recurrent.data, recurrent_slot_elements)) {
                 std::cerr << "record-fold recurrent mismatch round=" << round << " layer=" << layer
                           << "\n";
                 return failures + 1;
