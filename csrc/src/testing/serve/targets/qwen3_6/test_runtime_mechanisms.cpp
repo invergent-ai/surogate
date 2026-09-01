@@ -249,37 +249,53 @@ void test_prefix_identity() {
     std::vector<sinfer::TokenId> ledger = original.token_ids;
     q36::detail::ResidentPrefixIdentity resident;
     resident.reserve(16);
-    resident.assign(original);
+    // Prefix reuse is keyed by adapter as well as by tokens (f376ac18): KV
+    // computed with an adapter's deltas in q/k/v is that adapter's KV. -1 is the
+    // base model.
+    constexpr std::int32_t kBaseSlot = -1;
+    resident.assign(original, kBaseSlot);
 
-    expect(q36::detail::prefix_matches(original, ledger, resident, original.token_ids.size()),
+    expect(q36::detail::prefix_matches(original, ledger, resident, original.token_ids.size(), kBaseSlot),
            "identical multimodal prefix identity");
 
     q36::PreparedPromptData changed_media = identity_prompt(2);
     expect(!q36::detail::prefix_matches(changed_media, ledger, resident,
-                                        changed_media.token_ids.size()),
+                                        changed_media.token_ids.size(), kBaseSlot),
            "different media content must not reuse placeholder tokens");
-    expect(q36::detail::prefix_matches(changed_media, ledger, resident, 1),
+    expect(q36::detail::prefix_matches(changed_media, ledger, resident, 1, kBaseSlot),
            "media wholly after the frontier does not affect prefix identity");
-    expect(!q36::detail::prefix_matches(original, ledger, resident, 2),
+    expect(!q36::detail::prefix_matches(original, ledger, resident, 2, kBaseSlot),
            "frontier must not divide one Vision item");
 
     q36::PreparedPromptData changed_position = identity_prompt();
     changed_position.positions[0] += 1;
     expect(!q36::detail::prefix_matches(changed_position, ledger, resident,
-                                        changed_position.token_ids.size()),
+                                        changed_position.token_ids.size(), kBaseSlot),
            "different MRoPE positions must not reuse resident state");
 
     resident.append_generated(1, original.rope_delta);
     ledger.push_back(12);
     append_text_token(original, 12, 4);
-    expect(q36::detail::prefix_matches(original, ledger, resident, ledger.size()),
+    expect(q36::detail::prefix_matches(original, ledger, resident, ledger.size(), kBaseSlot),
            "generated multimodal continuation identity");
 
     const q36::PreparedPromptData prompt_only = identity_prompt();
     resident.truncate(prompt_only.token_ids.size());
     ledger.resize(prompt_only.token_ids.size());
-    expect(q36::detail::prefix_matches(prompt_only, ledger, resident, ledger.size()),
+    expect(q36::detail::prefix_matches(prompt_only, ledger, resident, ledger.size(), kBaseSlot),
            "truncated multimodal continuation identity");
+
+    // The adapter half of the key, which shipped without coverage here: identical
+    // tokens under a different adapter must not reuse the base model's state.
+    expect(!q36::detail::prefix_matches(prompt_only, ledger, resident, ledger.size(), 0),
+           "a different adapter must not reuse resident state");
+    q36::detail::ResidentPrefixIdentity adapted;
+    adapted.reserve(16);
+    adapted.assign(prompt_only, 0);
+    expect(!q36::detail::prefix_matches(prompt_only, ledger, adapted, ledger.size(), kBaseSlot),
+           "the base model must not reuse an adapter's resident state");
+    expect(q36::detail::prefix_matches(prompt_only, ledger, adapted, ledger.size(), 0),
+           "the same adapter reuses its own resident state");
 }
 
 } // namespace
