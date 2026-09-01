@@ -469,6 +469,8 @@ void Engine::wake() {
         impl.executor);
 }
 
+std::size_t Engine::sleepable_bytes() const { return sleep_owned_bytes(&impl_->ops_context); }
+
 ops::LoraStore& Engine::lora_store() { return impl_->ops_context.slot<ops::LoraStore>(); }
 
 bool Engine::is_sleeping() const {

@@ -111,6 +111,10 @@ public:
     void wake();
     [[nodiscard]] bool is_sleeping() const;
 
+    /// VRAM this engine's sleepable regions occupy while awake -- its cost in
+    /// a resident set. Zero when built without sleep_enable.
+    [[nodiscard]] std::size_t sleepable_bytes() const;
+
     /// This engine's adapter store (runtime load/unload operates on it).
     [[nodiscard]] ops::LoraStore& lora_store();
 

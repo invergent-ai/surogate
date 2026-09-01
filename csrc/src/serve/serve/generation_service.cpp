@@ -615,6 +615,11 @@ void GenerationService::sleep() {
 
 void GenerationService::wake_up() { engine_->wake(); }
 
+std::size_t GenerationService::active_requests() const {
+    const std::lock_guard<std::mutex> lock(request_capacity_->mutex);
+    return request_capacity_->active;
+}
+
 void GenerationService::warmup() {
     try {
         GenerationRequest request;

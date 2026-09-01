@@ -33,9 +33,9 @@ reports, which is how you keep a client's hard-coded model string working.
 | `GET` | `/v1/models`, `/v1/models/{id}` | Model listing |
 | `POST` | `/v1/messages` | **Anthropic** Messages API |
 | `POST` | `/v1/messages/count_tokens` | **Anthropic** token counting |
-| `POST` | `/sleep` | Release the model's VRAM, state parked in host RAM (`--enable-sleep-mode`) |
-| `POST` | `/wake_up` | Restore the model; sub-second for most models |
-| `GET` | `/is_sleeping` | Sleep state |
+| `POST` | `/sleep` | Release a model's VRAM, state parked in host RAM (`--enable-sleep-mode`; `?model=NAME` on multi-model servers) |
+| `POST` | `/wake_up` | Restore a model; sub-second for most models (`?model=NAME`) |
+| `GET` | `/is_sleeping` | Sleep state (`?model=NAME`) |
 | `POST` | `/v1/load_lora_adapter` | Load a PEFT adapter at runtime (`--enable-lora` servers) |
 | `POST` | `/v1/unload_lora_adapter` | Unload an adapter by name |
 | `GET` | `/health` | Readiness probe |

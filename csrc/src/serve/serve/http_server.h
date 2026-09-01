@@ -35,6 +35,8 @@ public:
     void attach(GenerationService& service);
     /// An additional model served from this process; routed by its served id.
     void attach_extra(GenerationService& service);
+    /// Overcommit mode: the scheduler wakes and evicts models per request.
+    void attach_scheduler(class ModelScheduler& scheduler);
     bool listen();
     void stop();
 
@@ -74,12 +76,15 @@ private:
     /// The service a request routed to, bound per HTTP worker thread for the
     /// handler's duration; falls back to the primary.
     static thread_local GenerationService* t_routed_service;
+    class ModelScheduler* scheduler_ = nullptr;
     [[nodiscard]] GenerationService& svc() const {
         return t_routed_service != nullptr ? *t_routed_service : *service_;
     }
     /// Routes `model`: an extra's id, the primary id, or a primary adapter
     /// (writes `lora_adapter`). Throws ApiException 404 otherwise.
     GenerationService& route_model(const std::string& model, std::string* lora_adapter);
+    /// The service a management endpoint (?model=) addresses; primary default.
+    GenerationService& routed_management_service(const httplib::Request& req);
     ResponseStore response_store_;
     JsonlRequestLog request_jsonl_;
     httplib::Server server_;

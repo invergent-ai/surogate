@@ -1,4 +1,6 @@
 #include "product/load_progress/load_progress.h"
+#include "core/sleep.h"
+#include "serve/model_scheduler.h"
 #include "serve/console_log.h"
 #include "serve/generation_service.h"
 #include "serve/http_server.h"
@@ -80,6 +82,11 @@ int main(int argc, char** argv) {
         // while it runs. Concurrent construction attributed one engine's
         // allocations to another's graph capture and aborted it.
         std::vector<std::unique_ptr<sinfer::serve::GenerationService>> extra_services;
+        // Overcommit: with sleep mode on, a later engine that cannot fit
+        // constructs after the already-built, idle ones are put to sleep. The
+        // scheduler then juggles the working set per request.
+        std::vector<sinfer::serve::ModelScheduler::Entry> scheduled;
+        scheduled.push_back({server.public_model_id(), &service});
         for (const auto& extra : options.extra_models) {
             sinfer::serve::ServeOptions extra_options = options;
             extra_options.artifact_path             = extra.artifact_path;
@@ -96,9 +103,25 @@ int main(int argc, char** argv) {
             // may not carry.
             extra_options.speculative = {};
             const auto extra_start = Clock::now();
-            extra_services.push_back(std::make_unique<sinfer::serve::GenerationService>(
-                extra_options, load_progress.callback()));
+            try {
+                extra_services.push_back(std::make_unique<sinfer::serve::GenerationService>(
+                    extra_options, load_progress.callback()));
+            } catch (const std::exception& first_error) {
+                if (!options.enable_sleep_mode) { throw; }
+                // Assume memory pressure: park everything idle and retry once.
+                sinfer::serve::write_console_log(
+                    sinfer::serve::ConsoleLogLevel::Info,
+                    std::string("model '") + extra.name + "' did not fit awake (" +
+                        first_error.what() + "); sleeping idle models and retrying");
+                service.sleep();
+                for (auto& built : extra_services) {
+                    if (built->active_requests() == 0) { built->sleep(); }
+                }
+                extra_services.push_back(std::make_unique<sinfer::serve::GenerationService>(
+                    extra_options, load_progress.callback()));
+            }
             server.attach_extra(*extra_services.back());
+            scheduled.push_back({extra.name, extra_services.back().get()});
             std::ostringstream extra_loaded;
             extra_loaded << "model '" << extra.name << "' loaded in "
                          << std::chrono::duration<double>(Clock::now() - extra_start).count()
@@ -140,6 +163,32 @@ int main(int argc, char** argv) {
         g_server.store(&server);
         std::signal(SIGINT, handle_signal);
         std::signal(SIGTERM, handle_signal);
+
+        std::unique_ptr<sinfer::serve::ModelScheduler> scheduler;
+        if (options.enable_sleep_mode && !options.extra_models.empty()) {
+            // Budget = what the awake models occupy plus what is still free,
+            // minus headroom for transient allocations outside the arenas.
+            std::size_t awake_bytes = 0;
+            for (const auto& entry : scheduled) {
+                if (!entry.service->is_sleeping()) {
+                    awake_bytes += entry.service->resident_bytes();
+                }
+            }
+            const std::size_t free_bytes = sinfer::device_free_bytes(options.devices.empty()
+                                                                          ? options.device
+                                                                          : options.devices.front());
+            const std::size_t headroom = 1ULL << 30;
+            const std::size_t budget =
+                awake_bytes + (free_bytes > headroom ? free_bytes - headroom : 0);
+            scheduler = std::make_unique<sinfer::serve::ModelScheduler>(std::move(scheduled),
+                                                                        budget);
+            server.attach_scheduler(*scheduler);
+            std::ostringstream plan;
+            plan << "multi-model scheduler: budget "
+                 << static_cast<double>(budget) / (1024.0 * 1024.0 * 1024.0) << " GiB across "
+                 << (options.extra_models.size() + 1) << " models";
+            sinfer::serve::write_console_log(sinfer::serve::ConsoleLogLevel::Info, plan.str());
+        }
 
         std::ostringstream listening;
         listening << "listening on http://" << options.host << ':' << options.port

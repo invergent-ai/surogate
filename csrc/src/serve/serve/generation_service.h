@@ -142,6 +142,10 @@ public:
     void sleep();
     void wake_up();
     [[nodiscard]] bool is_sleeping() const { return engine_->is_sleeping(); }
+    /// Requests currently inside this service (admission-counted).
+    [[nodiscard]] std::size_t active_requests() const;
+    /// This model's VRAM footprint while awake (sleepable regions).
+    [[nodiscard]] std::size_t resident_bytes() const { return engine_->sleepable_bytes(); }
 
 private:
     [[nodiscard]] std::shared_ptr<RequestLifetime> acquire_request_lifetime() const;

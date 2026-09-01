@@ -202,6 +202,22 @@ std::size_t wake_device(int device, const void* owner) {
     return mapped;
 }
 
+std::size_t sleep_owned_bytes(const void* owner) noexcept {
+    const std::lock_guard<std::mutex> lock(registry().mutex);
+    std::size_t bytes = 0;
+    for (const auto& [base, region] : registry().regions) {
+        if (owner == nullptr || region.owner == owner) { bytes += region.bytes; }
+    }
+    return bytes;
+}
+
+std::size_t device_free_bytes(int device) noexcept {
+    if (cudaSetDevice(device) != cudaSuccess) { return 0; }
+    std::size_t free_bytes = 0, total_bytes = 0;
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) { return 0; }
+    return free_bytes;
+}
+
 bool device_asleep(int device, const void* owner) noexcept {
     const std::lock_guard<std::mutex> lock(registry().mutex);
     for (const auto& [base, region] : registry().regions) {

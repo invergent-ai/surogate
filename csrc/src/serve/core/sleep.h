@@ -65,4 +65,12 @@ std::size_t wake_device(int device, const void* owner = nullptr);
 /// Pinned-host bytes currently held as sleep backups for `device`.
 [[nodiscard]] std::size_t sleep_backup_bytes(int device) noexcept;
 
+/// Mapped bytes of the regions owned by `owner` (their VRAM footprint while
+/// awake). The scheduler sizes resident sets with this.
+[[nodiscard]] std::size_t sleep_owned_bytes(const void* owner) noexcept;
+
+/// Free VRAM on `device` right now (cudaMemGetInfo), for budget planning by
+/// callers that are not CUDA translation units themselves.
+[[nodiscard]] std::size_t device_free_bytes(int device) noexcept;
+
 } // namespace sinfer

@@ -1,6 +1,7 @@
 #include "serve/http_server.h"
 
 #include "serve/lora_registry.h"
+#include "serve/model_scheduler.h"
 
 #include "serve/anthropic_schema.h"
 #include "serve/console_log.h"
@@ -341,7 +342,7 @@ void HttpServer::register_routes() {
             return;
         }
         try {
-            service_->sleep();
+            routed_management_service(req).sleep();
         } catch (const std::exception& e) {
             res.status = 500;
             res.set_content(e.what(), "text/plain");
@@ -350,9 +351,9 @@ void HttpServer::register_routes() {
         log_line("sleep: model asleep, VRAM released");
         res.set_content("{\"is_sleeping\": true}", "application/json");
     });
-    server_.Post("/wake_up", [this](const httplib::Request&, httplib::Response& res) {
+    server_.Post("/wake_up", [this](const httplib::Request& req, httplib::Response& res) {
         try {
-            service_->wake_up();
+            routed_management_service(req).wake_up();
         } catch (const std::exception& e) {
             res.status = 500;
             res.set_content(e.what(), "text/plain");
@@ -361,9 +362,10 @@ void HttpServer::register_routes() {
         log_line("sleep: model awake");
         res.set_content("{\"is_sleeping\": false}", "application/json");
     });
-    server_.Get("/is_sleeping", [this](const httplib::Request&, httplib::Response& res) {
-        res.set_content(service_->is_sleeping() ? "{\"is_sleeping\": true}"
-                                                : "{\"is_sleeping\": false}",
+    server_.Get("/is_sleeping", [this](const httplib::Request& req, httplib::Response& res) {
+        res.set_content(routed_management_service(req).is_sleeping()
+                            ? "{\"is_sleeping\": true}"
+                            : "{\"is_sleeping\": false}",
                         "application/json");
     });
 
@@ -472,6 +474,9 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         request                   = parse_chat_completion_request(body, limits);
         // `model` selects a served model or one of the primary's adapters.
         t_routed_service = &route_model(request.model, &request.lora_adapter);
+        // Overcommit: a sleeping model is woken here (evicting idle neighbours
+        // for room); the request waits instead of failing.
+        if (scheduler_ != nullptr) { scheduler_->ensure_awake(t_routed_service); }
     } catch (const ApiException& e) {
         write_error(res, e.error());
         return;
@@ -698,6 +703,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         // the primary, preserving this endpoint's never-404 contract.
         const auto extra = extra_services_.find(request.model);
         if (extra != extra_services_.end()) { t_routed_service = extra->second; }
+        if (scheduler_ != nullptr) { scheduler_->ensure_awake(&svc()); }
     } catch (const ApiException& e) {
         write_messages_error(res, e.error());
         return;
@@ -905,6 +911,15 @@ void HttpServer::attach_extra(GenerationService& service) {
     extra_services_.emplace(id, &service);
 }
 
+GenerationService& HttpServer::routed_management_service(const httplib::Request& req) {
+    const std::string model = req.get_param_value("model");
+    if (model.empty()) { return *service_; }
+    const auto extra = extra_services_.find(model);
+    if (extra != extra_services_.end()) { return *extra->second; }
+    if (model == public_model_id_) { return *service_; }
+    throw std::invalid_argument("unknown model '" + model + "'");
+}
+
 GenerationService& HttpServer::route_model(const std::string& model, std::string* lora_adapter) {
     if (model == public_model_id_) { return *service_; }
     const auto extra = extra_services_.find(model);
@@ -920,6 +935,8 @@ GenerationService& HttpServer::route_model(const std::string& model, std::string
     error.message = "model '" + model + "' not found";
     throw ApiException(std::move(error));
 }
+
+void HttpServer::attach_scheduler(ModelScheduler& scheduler) { scheduler_ = &scheduler; }
 
 void HttpServer::attach(GenerationService& service) {
     if (service_ != nullptr) {

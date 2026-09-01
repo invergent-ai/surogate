@@ -101,6 +101,25 @@ frequently strip it. `dflash` needs a drafter checkpoint that is converted in
 alongside the model. Either way a model without one refuses at startup, naming
 what is missing, rather than silently serving unaccelerated.
 
+### Serving several models from one process
+
+| Flag | Meaning |
+|---|---|
+| `--model name=path[,kv-tokens=N][,max-num-seqs=N][,max-model-len=N]` | Serve an additional model beside the primary; repeatable. Requests select it by `name` in the `model` field; `/v1/models` lists everything. `kv-tokens` is required — each extra states its KV budget explicitly. |
+
+Each model runs its own engine — weights, cache, scheduler, CUDA graphs — on
+its own stream inside one process, so concurrent requests for different models
+genuinely share the GPU rather than time-slicing it (measured: two busy models
+in one process reach ~1.3× the aggregate of the same pair in two processes).
+An idle co-resident model costs nothing but its memory.
+
+With `--enable-sleep-mode` as well, the models need not all fit at once: a
+request for a model that is asleep waits while the scheduler frees room —
+sleeping the least recently used idle models — and wakes it, typically in
+under a second (the first eviction of a model also allocates its host backup,
+which takes a few seconds once). Busy models are never evicted; requests
+queue until room can be made. Management endpoints take `?model=NAME`.
+
 ### Sleep mode
 
 | Flag | Default | Meaning |
