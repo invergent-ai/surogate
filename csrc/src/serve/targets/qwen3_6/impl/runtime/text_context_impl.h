@@ -902,10 +902,18 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     debug_probe<Variant>("v_proj_raw", v_flat, s);
 
     const auto results = workspace_recipe::text_attention_results<TextConfig>(work_, T);
-    Tensor qn          = results.normalized_query.view({kCfg.head_dim, kCfg.n_q, T});
-    Tensor kn          = results.normalized_key.view({kCfg.head_dim, kCfg.n_kv, T});
-    ops::rmsnorm(q, *w.q_norm, kCfg.rms_eps, norm_unit_offset<Variant>(), qn, s);
-    ops::rmsnorm(k, *w.k_norm, kCfg.rms_eps, norm_unit_offset<Variant>(), kn, s);
+    // A target without a per-head query/key norm has nothing to write into the
+    // normalised planes, so rope runs in place on the projection's own output.
+    Tensor qn = attention_qk_norm<Variant>()
+                    ? results.normalized_query.view({kCfg.head_dim, kCfg.n_q, T})
+                    : q;
+    Tensor kn = attention_qk_norm<Variant>()
+                    ? results.normalized_key.view({kCfg.head_dim, kCfg.n_kv, T})
+                    : k;
+    if constexpr (attention_qk_norm<Variant>()) {
+        ops::rmsnorm(q, *w.q_norm, kCfg.rms_eps, norm_unit_offset<Variant>(), qn, s);
+        ops::rmsnorm(k, *w.k_norm, kCfg.rms_eps, norm_unit_offset<Variant>(), kn, s);
+    }
     debug_probe<Variant>("q_post_headnorm", qn.view({kCfg.q_size, T}), s);
     debug_probe<Variant>("k_post_headnorm", kn.view({kCfg.kv_size, T}), s);
     const Tensor& cache_positions =
@@ -1587,10 +1595,16 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
 
                 const auto results = workspace_recipe::text_attention_results<TextConfig>(work_,
                                                                                          total);
-                Tensor qn = results.normalized_query.view({kCfg.head_dim, kCfg.n_q, total});
-                Tensor kn = results.normalized_key.view({kCfg.head_dim, kCfg.n_kv, total});
-                ops::rmsnorm(q, *full.q_norm, kCfg.rms_eps, norm_unit_offset<Variant>(), qn, s);
-                ops::rmsnorm(k, *full.k_norm, kCfg.rms_eps, norm_unit_offset<Variant>(), kn, s);
+                Tensor qn = attention_qk_norm<Variant>()
+                                ? results.normalized_query.view({kCfg.head_dim, kCfg.n_q, total})
+                                : q;
+                Tensor kn = attention_qk_norm<Variant>()
+                                ? results.normalized_key.view({kCfg.head_dim, kCfg.n_kv, total})
+                                : k;
+                if constexpr (attention_qk_norm<Variant>()) {
+                    ops::rmsnorm(q, *full.q_norm, kCfg.rms_eps, norm_unit_offset<Variant>(), qn, s);
+                    ops::rmsnorm(k, *full.k_norm, kCfg.rms_eps, norm_unit_offset<Variant>(), kn, s);
+                }
                 debug_probe<Variant>("q_post_headnorm", qn.view({kCfg.q_size, total}), s);
                 debug_probe<Variant>("k_post_headnorm", kn.view({kCfg.kv_size, total}), s);
 
@@ -2014,10 +2028,16 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
 
                 const auto results = workspace_recipe::text_attention_results<TextConfig>(work_,
                                                                                          total);
-                Tensor qn = results.normalized_query.view({kCfg.head_dim, kCfg.n_q, total});
-                Tensor kn = results.normalized_key.view({kCfg.head_dim, kCfg.n_kv, total});
-                ops::rmsnorm(q, *full.q_norm, kCfg.rms_eps, norm_unit_offset<Variant>(), qn, s);
-                ops::rmsnorm(k, *full.k_norm, kCfg.rms_eps, norm_unit_offset<Variant>(), kn, s);
+                Tensor qn = attention_qk_norm<Variant>()
+                                ? results.normalized_query.view({kCfg.head_dim, kCfg.n_q, total})
+                                : q;
+                Tensor kn = attention_qk_norm<Variant>()
+                                ? results.normalized_key.view({kCfg.head_dim, kCfg.n_kv, total})
+                                : k;
+                if constexpr (attention_qk_norm<Variant>()) {
+                    ops::rmsnorm(q, *full.q_norm, kCfg.rms_eps, norm_unit_offset<Variant>(), qn, s);
+                    ops::rmsnorm(k, *full.k_norm, kCfg.rms_eps, norm_unit_offset<Variant>(), kn, s);
+                }
 
                 Tensor rope_positions = roots.positions;
                 Tensor rope_all       = rope_positions.view({total});

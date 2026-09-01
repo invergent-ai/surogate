@@ -40,6 +40,20 @@ template <class Variant>
     }
 }
 
+/// Per-head query/key normalisation. The family normalises each attention head's
+/// queries and keys before rope, and its checkpoints carry the weights for it.
+/// Llama has no such weights at all, so a target whose artifact does not bind
+/// them declares false and the step is skipped rather than applied to a plane
+/// nothing wrote.
+template <class Variant>
+[[nodiscard]] constexpr bool attention_qk_norm() {
+    if constexpr (requires { Variant::attention_qk_norm; }) {
+        return Variant::attention_qk_norm;
+    } else {
+        return true;
+    }
+}
+
 /// RMSNorm weight convention. This family's checkpoints store zero-centred norm
 /// weights, so the scale a kernel must apply is `1 + w`. A variant whose
 /// checkpoint stores the scale directly -- classic Qwen3 does -- declares false,
