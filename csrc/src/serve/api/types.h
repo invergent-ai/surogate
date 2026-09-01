@@ -120,6 +120,10 @@ struct EngineOptions {
     /// launch geometry the projection hooks and a captured graph both need.
     std::uint32_t lora_slots    = 0;
     std::uint32_t lora_max_rank = 0;
+    /// Prepare the adapter machinery even with no adapters named: banks are
+    /// preallocated and the delta kernels captured, so adapters loaded later
+    /// through the runtime endpoints work under the graphs recorded at startup.
+    bool lora_enable = false;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
     // Storage of the pinned host expert bank. Q4G32AM (4-bit affine groups requantised from
     // the artifact's W8 at load) is 59 % of the bytes and near-exact for Q4_K-derived experts,

@@ -256,43 +256,55 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     // The adapter's tensors, decoded on the host. The target binds them to its own
     // weights; a module the target cannot place is refused there rather than
     // dropped, because a partly applied adapter is worse than none.
-    if (options_.enable_lora && !options_.lora_modules.empty()) {
-        LoraRegistry registry;
-        std::vector<std::pair<std::string, std::string>> modules;
-        for (const auto& module : options_.lora_modules) {
-            modules.emplace_back(module.name, module.path);
-        }
-        registry.load(modules, options_.max_lora_rank);
-        // Slots are assigned here, once, in the order the deployment named them,
-        // and a request's adapter is turned into its slot index at admission. The
-        // engine below never sees a name.
+    if (options_.enable_lora) {
+        // The engine prepares the adapter machinery even with no adapters named:
+        // banks preallocated and the delta kernels captured, so adapters loaded
+        // later through the runtime endpoints work under the graphs recorded at
+        // startup.
+        engine_options.lora_enable   = true;
         engine_options.lora_slots    = options_.max_loras;
         engine_options.lora_max_rank = options_.max_lora_rank;
         std::int32_t slot            = 0;
-        for (const auto& [name, adapter] : registry.adapters()) {
-            std::vector<std::string> skipped;
-            auto payloads = LoraRegistry::read_payloads(adapter, skipped);
-            if (!skipped.empty()) {
-                throw std::invalid_argument(
-                    "--lora-modules '" + name + "': module '" + skipped.front() +
-                    "' carries no layer index, so it cannot be bound to a projection");
+        if (!options_.lora_modules.empty()) {
+            LoraRegistry registry;
+            std::vector<std::pair<std::string, std::string>> modules;
+            for (const auto& module : options_.lora_modules) {
+                modules.emplace_back(module.name, module.path);
             }
-            for (auto& payload : payloads) {
-                payload.slot = slot;
-                engine_options.lora_payloads.push_back(std::move(payload));
+            registry.load(modules, options_.max_lora_rank);
+            // Slots are assigned here, once, in the order the deployment named
+            // them, and a request's adapter is turned into its slot index at
+            // admission. The engine below never sees a name.
+            for (const auto& [name, adapter] : registry.adapters()) {
+                std::vector<std::string> skipped;
+                auto payloads = LoraRegistry::read_payloads(adapter, skipped);
+                if (!skipped.empty()) {
+                    throw std::invalid_argument(
+                        "--lora-modules '" + name + "': module '" + skipped.front() +
+                        "' carries no layer index, so it cannot be bound to a projection");
+                }
+                for (auto& payload : payloads) {
+                    payload.slot = slot;
+                    engine_options.lora_payloads.push_back(std::move(payload));
+                }
+                lora_slot_of_[name] = slot;
+                ++slot;
             }
-            lora_slot_of_[name] = slot;
-            ++slot;
+        }
+        for (std::int32_t free = slot; free < static_cast<std::int32_t>(options_.max_loras);
+             ++free) {
+            lora_free_slots_.push_back(free);
         }
     }
     engine_options.load_progress            = std::move(load_progress);
-    const std::size_t requested_lora = engine_options.lora_payloads.size();
+    const bool lora_requested = engine_options.lora_enable;
     engine_              = std::make_unique<sinfer::Engine>(std::move(engine_options));
     // Only a target that binds adapters to its own weights can apply them, and most
     // do not yet. Without this check a request naming an adapter would be answered
     // by the base model on those targets -- served confidently, and wrong. The
-    // store is populated during load, so an empty one here means nothing bound.
-    if (requested_lora != 0 && ops::lora_store_for_current_device().empty()) {
+    // directory is registered during load, so an empty one here means nothing can
+    // bind, at startup or from the runtime endpoints.
+    if (lora_requested && !ops::lora_store_for_current_device().has_bindings()) {
         throw std::invalid_argument(
             "--enable-lora: this target does not apply adapters (only qwen3.5-0.8b binds them "
             "today), so the adapter would be loaded and silently ignored. Merge it into the "
@@ -488,6 +500,85 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
         outcome.streamed_content_bytes = output_sink->finish(is_tool_call_response);
     }
     return outcome;
+}
+
+void GenerationService::load_lora_adapter(const std::string& name, const std::string& path) {
+    if (!options_.enable_lora) {
+        throw std::invalid_argument("the server was started without --enable-lora");
+    }
+    ops::LoraStore& store = ops::lora_store_for_current_device();
+    if (!store.has_bindings()) {
+        throw std::invalid_argument("this target does not apply adapters");
+    }
+    // Parse and validate outside the lock -- reading safetensors can take a
+    // moment and requests resolving names must not wait on it.
+    LoraRegistry registry;
+    registry.load({{name, path}}, options_.max_lora_rank);
+    const auto& adapters = registry.adapters();
+    const auto found     = adapters.find(name);
+    if (found == adapters.end()) {
+        throw std::invalid_argument("adapter '" + name + "' did not load");
+    }
+    std::vector<std::string> skipped;
+    auto payloads = LoraRegistry::read_payloads(found->second, skipped);
+    if (!skipped.empty()) {
+        throw std::invalid_argument("module '" + skipped.front() +
+                                    "' carries no layer index, so it cannot be bound");
+    }
+
+    std::int32_t slot = -1;
+    {
+        const std::lock_guard<std::mutex> lock(lora_mutex_);
+        if (lora_slot_of_.count(name) != 0) {
+            throw std::invalid_argument("adapter '" + name + "' is already loaded");
+        }
+        if (lora_free_slots_.empty()) {
+            throw std::invalid_argument(
+                "all " + std::to_string(options_.max_loras) +
+                " adapter slots are in use -- unload one, or restart with a larger --max-loras");
+        }
+        slot = lora_free_slots_.front();
+        lora_free_slots_.erase(lora_free_slots_.begin());
+    }
+
+    // The uploads write only this slot's regions, which no request can select yet
+    // -- the name becomes routable below, after every module landed. On failure
+    // the slot is scrubbed and returned, so a half-written adapter is never
+    // servable.
+    try {
+        for (const auto& payload : payloads) {
+            store.set_module_slot(payload.layer, payload.module, slot, payload.a, payload.b,
+                                  payload.rank, payload.in_dim, payload.out_dim, payload.scale);
+        }
+    } catch (...) {
+        store.clear_slot(slot);
+        const std::lock_guard<std::mutex> lock(lora_mutex_);
+        lora_free_slots_.push_back(slot);
+        throw;
+    }
+    ops::lora_set_active(true);
+    const std::lock_guard<std::mutex> lock(lora_mutex_);
+    lora_slot_of_[name] = slot;
+}
+
+void GenerationService::unload_lora_adapter(const std::string& name) {
+    std::int32_t slot = -1;
+    {
+        const std::lock_guard<std::mutex> lock(lora_mutex_);
+        const auto found = lora_slot_of_.find(name);
+        if (found == lora_slot_of_.end()) {
+            throw std::invalid_argument("adapter '" + name + "' is not loaded");
+        }
+        slot = found->second;
+        lora_slot_of_.erase(found);
+    }
+    // Zeroed, not freed: a request already in flight that selected this slot adds
+    // nothing from here on -- it degrades to the base model instead of reading
+    // another adapter's weights. The slot goes to the back of the free list so it
+    // is the last one a later load reuses.
+    ops::lora_store_for_current_device().clear_slot(slot);
+    const std::lock_guard<std::mutex> lock(lora_mutex_);
+    lora_free_slots_.push_back(slot);
 }
 
 void GenerationService::warmup() {

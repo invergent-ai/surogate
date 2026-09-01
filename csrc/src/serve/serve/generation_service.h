@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <memory>
 #include <string>
 #include <vector>
@@ -88,9 +89,26 @@ public:
     [[nodiscard]] const ServeOptions& options() const noexcept { return options_; }
     /// The bank slot for an adapter name, or -1 for the base model.
     [[nodiscard]] std::int32_t lora_slot(const std::string& name) const {
+        const std::lock_guard<std::mutex> lock(lora_mutex_);
         const auto found = lora_slot_of_.find(name);
         return found == lora_slot_of_.end() ? -1 : found->second;
     }
+    /// The resident adapter names, for /v1/models and model routing.
+    [[nodiscard]] std::vector<std::string> lora_adapter_names() const {
+        const std::lock_guard<std::mutex> lock(lora_mutex_);
+        std::vector<std::string> names;
+        names.reserve(lora_slot_of_.size());
+        for (const auto& [name, slot] : lora_slot_of_) { names.push_back(name); }
+        return names;
+    }
+    /// Loads a PEFT adapter directory into a free slot, addressable by `name`
+    /// from the next request on. Throws std::invalid_argument with the reason on
+    /// refusal -- bad adapter, name taken, no free slot, module not applicable.
+    void load_lora_adapter(const std::string& name, const std::string& path);
+    /// Unloads by name. The slot is zeroed, so a request already in flight that
+    /// selected it degrades to the base model rather than reading freed weights;
+    /// the slot is reused last among the free ones.
+    void unload_lora_adapter(const std::string& name);
 
     [[nodiscard]] sinfer::LoadSummary load_summary() const { return engine_->load_summary(); }
 
@@ -121,9 +139,15 @@ private:
     [[nodiscard]] std::shared_ptr<RequestLifetime> acquire_request_lifetime() const;
 
     ServeOptions options_;
-    /// Adapter name -> bank slot, fixed at load. A request carries the name; the
-    /// round carries the slot, and nothing below this class knows the name.
+    /// Adapter name -> bank slot. A request carries the name; the round carries
+    /// the slot, and nothing below this class knows the name. Guarded by
+    /// lora_mutex_ because the runtime endpoints mutate it while request threads
+    /// resolve names. Freed slots go to the back of the free list so a just-
+    /// unloaded slot is the last to be reused -- an in-flight request still naming
+    /// it reads zeros (base model), not another adapter's fresh weights.
+    mutable std::mutex lora_mutex_;
     std::map<std::string, std::int32_t> lora_slot_of_;
+    std::vector<std::int32_t> lora_free_slots_;
     std::unique_ptr<sinfer::Engine> engine_;
     sinfer::PromptCapabilities prompt_capabilities_;
     std::shared_ptr<RequestCapacity> request_capacity_;

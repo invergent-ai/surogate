@@ -91,6 +91,12 @@ void LoraStore::set_slot(const void* base_key, std::int32_t port, std::int32_t s
     const Key key{base_key, port};
     auto found = banks_.find(key);
     if (found == banks_.end()) {
+        if (frozen_) {
+            throw std::logic_error(
+                "lora_store: this projection has no bank and the store is frozen -- banks are "
+                "created by ensure_banks before serving so captured graphs and the lock-free "
+                "find() stay valid; register the module in the target's directory");
+        }
         Bank bank;
         const std::size_t a_elements =
             static_cast<std::size_t>(slots_) * max_rank_ * in_dim;
@@ -149,6 +155,75 @@ void LoraStore::set_slot(const void* base_key, std::int32_t port, std::int32_t s
         std::fprintf(stderr, "lora-slot: slot=%d rank=%d in=%d out=%d scale=%.3f |A|max=%.5f |B|max=%.5f\n",
                      slot, rank, in_dim, out_dim, static_cast<double>(scale), a_abs, b_abs);
     }
+}
+
+void LoraStore::register_module(std::int32_t layer, std::string module, ModuleBinding binding) {
+    if (frozen_) { throw std::logic_error("lora_store: the directory is frozen after ensure_banks"); }
+    if (binding.key == nullptr || binding.in <= 0 || binding.out <= 0) {
+        throw std::invalid_argument("lora_store: a module binding needs a key and positive shapes");
+    }
+    directory_.emplace(std::make_pair(layer, std::move(module)), binding);
+}
+
+void LoraStore::register_refusal(std::string module, std::string reason) {
+    if (frozen_) { throw std::logic_error("lora_store: the directory is frozen after ensure_banks"); }
+    refusals_.emplace(std::move(module), std::move(reason));
+}
+
+void LoraStore::register_layer_refusal(std::int32_t layer, std::string module, std::string reason) {
+    if (frozen_) { throw std::logic_error("lora_store: the directory is frozen after ensure_banks"); }
+    layer_refusals_.emplace(std::make_pair(layer, std::move(module)), std::move(reason));
+}
+
+void LoraStore::ensure_banks() {
+    if (slots_ == 0) { throw std::logic_error("lora_store: configure() first"); }
+    for (const auto& [where, binding] : directory_) {
+        const Key key{binding.key, binding.port};
+        if (banks_.find(key) != banks_.end()) { continue; }
+        Bank bank;
+        bank.a             = upload_zeroed(static_cast<std::size_t>(slots_) * max_rank_ * binding.in);
+        bank.b             = upload_zeroed(static_cast<std::size_t>(slots_) * binding.out * max_rank_);
+        bank.view.a        = bank.a;
+        bank.view.b        = bank.b;
+        bank.view.a_stride = static_cast<std::int64_t>(max_rank_) * binding.in;
+        bank.view.b_stride = static_cast<std::int64_t>(binding.out) * max_rank_;
+        bank.view.rank     = max_rank_;
+        bank.view.n        = binding.out;
+        bank.view.k        = binding.in;
+        banks_.emplace(key, bank);
+    }
+    frozen_ = true;
+}
+
+void LoraStore::set_module_slot(std::int32_t layer, const std::string& module, std::int32_t slot,
+                                const std::vector<std::uint16_t>& a,
+                                const std::vector<std::uint16_t>& b, std::int32_t rank,
+                                std::int32_t in_dim, std::int32_t out_dim, float scale) {
+    const auto refused = refusals_.find(module);
+    if (refused != refusals_.end()) {
+        throw std::invalid_argument("adapter module '" + module + "': " + refused->second);
+    }
+    const auto layer_refused = layer_refusals_.find({layer, module});
+    if (layer_refused != layer_refusals_.end()) {
+        throw std::invalid_argument("adapter module '" + module + "' on layer " +
+                                    std::to_string(layer) + ": " + layer_refused->second);
+    }
+    const auto found = directory_.find({layer, module});
+    if (found == directory_.end()) {
+        throw std::invalid_argument(
+            "adapter module '" + module + "' on layer " + std::to_string(layer) +
+            " is not applied by this target; an adapter only partly applied is neither the base "
+            "model nor the fine-tune");
+    }
+    const ModuleBinding& binding = found->second;
+    if (in_dim != binding.in || out_dim != binding.out) {
+        throw std::invalid_argument(
+            "adapter module '" + module + "' on layer " + std::to_string(layer) + " is [" +
+            std::to_string(out_dim) + "," + std::to_string(in_dim) + "] but this model's is [" +
+            std::to_string(binding.out) + "," + std::to_string(binding.in) +
+            "] -- the adapter was trained against a different model");
+    }
+    set_slot(binding.key, binding.port, slot, a, b, rank, in_dim, out_dim, scale);
 }
 
 void LoraStore::clear_slot(std::int32_t slot) {

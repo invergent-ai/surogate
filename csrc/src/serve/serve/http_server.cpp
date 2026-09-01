@@ -141,20 +141,6 @@ HttpServer::HttpServer(ServeOptions options)
     server_.new_task_queue         = [queued_requests, worker_count] {
         return new httplib::ThreadPool(worker_count, queued_requests);
     };
-    // Adapters are read and validated here, before the port opens: an adapter the
-    // deployment named but cannot be served is a startup failure, not a surprise
-    // waiting for the first request that selects it.
-    if (options_.enable_lora) {
-        std::vector<std::pair<std::string, std::string>> modules;
-        modules.reserve(options_.lora_modules.size());
-        for (const auto& module : options_.lora_modules) {
-            modules.emplace_back(module.name, module.path);
-        }
-        lora_.load(modules, options_.max_lora_rank);
-        // Many adapters may be resident at once: the round stages one slot per lane
-        // and the delta kernels read the adapter each token selected, so requests
-        // for different adapters share a batch.
-    }
     server_.set_payload_max_length(options_.max_request_bytes);
     register_routes();
 }
@@ -337,6 +323,60 @@ void HttpServer::register_routes() {
                    [this](const httplib::Request& req, httplib::Response& res) {
                        handle_response_delete(req, res);
                    });
+    // vLLM's runtime adapter management routes, same request bodies.
+    server_.Post("/v1/load_lora_adapter", [this](const httplib::Request& req,
+                                                 httplib::Response& res) {
+        nlohmann::json body;
+        try {
+            body = nlohmann::json::parse(req.body);
+        } catch (const std::exception&) {
+            res.status = 400;
+            res.set_content("request body is not valid JSON", "text/plain");
+            return;
+        }
+        const std::string name = body.value("lora_name", "");
+        const std::string path = body.value("lora_path", "");
+        if (name.empty() || path.empty()) {
+            res.status = 400;
+            res.set_content("both lora_name and lora_path are required", "text/plain");
+            return;
+        }
+        try {
+            service_->load_lora_adapter(name, path);
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(e.what(), "text/plain");
+            return;
+        }
+        log_line("lora: loaded adapter '" + name + "' from " + path);
+        res.set_content("Success: LoRA adapter '" + name + "' added successfully", "text/plain");
+    });
+    server_.Post("/v1/unload_lora_adapter", [this](const httplib::Request& req,
+                                                   httplib::Response& res) {
+        nlohmann::json body;
+        try {
+            body = nlohmann::json::parse(req.body);
+        } catch (const std::exception&) {
+            res.status = 400;
+            res.set_content("request body is not valid JSON", "text/plain");
+            return;
+        }
+        const std::string name = body.value("lora_name", "");
+        if (name.empty()) {
+            res.status = 400;
+            res.set_content("lora_name is required", "text/plain");
+            return;
+        }
+        try {
+            service_->unload_lora_adapter(name);
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(e.what(), "text/plain");
+            return;
+        }
+        log_line("lora: unloaded adapter '" + name + "'");
+        res.set_content("Success: LoRA adapter '" + name + "' removed successfully", "text/plain");
+    });
     server_.Post("/v1/messages/count_tokens",
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_count_tokens(req, res);
@@ -347,15 +387,14 @@ void HttpServer::register_routes() {
 }
 
 void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {
-    std::vector<std::string> adapters;
-    for (const auto& [name, adapter] : lora_.adapters()) { adapters.push_back(name); }
-    res.set_content(make_models_list(public_model_id_, unix_time_now(), adapters),
+    res.set_content(make_models_list(public_model_id_, unix_time_now(),
+                                     service_->lora_adapter_names()),
                     "application/json");
 }
 
 void HttpServer::handle_model(const httplib::Request& req, httplib::Response& res) const {
     const std::string id = req.matches.size() > 1 ? req.matches[1].str() : std::string();
-    if (id != public_model_id_ && lora_.find(id) == nullptr) {
+    if (id != public_model_id_ && service_->lora_slot(id) < 0) {
         ApiError error;
         error.status  = 404;
         error.type    = "invalid_request_error";
@@ -387,8 +426,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         // A request selects an adapter by naming it in `model`; the base id keeps
         // meaning the unadapted model.
         if (request.model != public_model_id_) {
-            const LoraAdapter* adapter = lora_.find(request.model);
-            if (adapter == nullptr) {
+            if (service_->lora_slot(request.model) < 0) {
                 ApiError error;
                 error.status  = 404;
                 error.type    = "invalid_request_error";
@@ -396,7 +434,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 error.message = "model '" + request.model + "' not found";
                 throw ApiException(std::move(error));
             }
-            request.lora_adapter = adapter->name;
+            request.lora_adapter = request.model;
         }
     } catch (const ApiException& e) {
         write_error(res, e.error());

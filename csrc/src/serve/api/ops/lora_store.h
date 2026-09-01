@@ -18,8 +18,10 @@
 #include "api/ops/lora.h"
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace sinfer::ops {
@@ -39,6 +41,46 @@ public:
     void set_slot(const void* base_key, std::int32_t port, std::int32_t slot,
                   const std::vector<std::uint16_t>& a, const std::vector<std::uint16_t>& b,
                   std::int32_t rank, std::int32_t in_dim, std::int32_t out_dim, float scale);
+
+    /// Where an adapter module lands on this model: the projection's bank key and
+    /// which of its outputs, plus the shapes an adapter must have to fit it.
+    struct ModuleBinding {
+        const void* key   = nullptr;
+        std::int32_t port = 0;
+        std::int32_t in   = 0;
+        std::int32_t out  = 0;
+    };
+
+    /// Target startup registers where every adaptable module of every layer lives,
+    /// and why the non-adaptable ones are refused. The directory is what makes
+    /// loading target-agnostic afterwards: an adapter names "layers.7.down_proj"
+    /// and the store knows the rest, whether the load happens at startup or from a
+    /// runtime endpoint.
+    void register_module(std::int32_t layer, std::string module, ModuleBinding binding);
+    /// A module refused on every layer (e.g. gate/up fused into SwiGLU).
+    void register_refusal(std::string module, std::string reason);
+    /// A module refused on one layer (e.g. attention names on a linear-attention layer).
+    void register_layer_refusal(std::int32_t layer, std::string module, std::string reason);
+
+    /// Creates every registered bank, zero-filled, then freezes the directory.
+    ///
+    /// Banks must all exist before the first round is captured, for two reasons
+    /// with the same root. A captured graph records only the launches it sees, and
+    /// the hooks launch only for projections that have a bank -- so a bank created
+    /// later would leave every already-captured graph without its kernels, and a
+    /// runtime-loaded adapter silently absent under graphs. And creation inserts
+    /// into the map the hot-path find() reads without a lock, which is only safe
+    /// while nothing serves. After the freeze, loading an adapter only writes into
+    /// memory that already exists.
+    void ensure_banks();
+
+    /// Writes one adapter module into `slot`, resolving (layer, module) through
+    /// the directory. Refusals and missing bindings throw with the module named.
+    void set_module_slot(std::int32_t layer, const std::string& module, std::int32_t slot,
+                         const std::vector<std::uint16_t>& a, const std::vector<std::uint16_t>& b,
+                         std::int32_t rank, std::int32_t in_dim, std::int32_t out_dim, float scale);
+
+    [[nodiscard]] bool has_bindings() const noexcept { return !directory_.empty(); }
 
     /// Zeroes a slot across every bank, so a token selecting it adds nothing.
     /// This is what unloading an adapter does: the memory stays, the contribution
@@ -93,6 +135,10 @@ private:
         }
     };
     std::unordered_map<Key, Bank, KeyHash> banks_;
+    std::map<std::pair<std::int32_t, std::string>, ModuleBinding> directory_;
+    std::map<std::string, std::string> refusals_;
+    std::map<std::pair<std::int32_t, std::string>, std::string> layer_refusals_;
+    bool frozen_ = false;
     void* scratch_          = nullptr;
     std::int32_t* uniform_cell_ = nullptr;
     std::int32_t scratch_tokens_ = 0;

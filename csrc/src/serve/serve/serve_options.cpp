@@ -462,9 +462,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--lora-modules needs --enable-lora");
     }
     if (options.enable_lora) {
-        if (options.lora_modules.empty()) {
-            throw std::invalid_argument("--enable-lora needs at least one --lora-modules name=path");
-        }
+        // Zero modules is a valid start: adapters can arrive later through
+        // POST /v1/load_lora_adapter. The capacity flags still bound them.
         if (options.max_loras == 0) { throw std::invalid_argument("--max-loras must be positive"); }
         if (options.max_lora_rank == 0) {
             throw std::invalid_argument("--max-lora-rank must be positive");

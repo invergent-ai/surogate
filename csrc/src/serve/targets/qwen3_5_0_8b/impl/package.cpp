@@ -133,18 +133,17 @@ namespace {
 /// with its name: an adapter half-applied is a model that is neither the base nor
 /// the fine-tune, and it would answer fluently either way.
 void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& options) {
-    if (options.lora_payloads.empty()) { return; }
+    if (!options.lora_enable && options.lora_payloads.empty()) { return; }
     ops::LoraStore& store = ops::lora_store_for_current_device();
     if (store.empty()) {
-        // The widest round an adapter can see: one column per lane, times the
-        // verify window when a draft is in flight.
+        // The widest round an adapter can see: a prefill chunk, or every lane
+        // times the verify window when a draft is in flight. Sizing this for
+        // lanes alone left every prompt without a scratch, so the prompt was
+        // built on the base model while the generated tokens carried the delta --
+        // an adapter that looked weak rather than unapplied.
         const std::uint32_t window = options.speculative.backend == SpeculativeBackend::None
                                          ? 1U
                                          : options.speculative.draft_tokens + 1U;
-        // The widest round an adapter can see is a prefill chunk, not a decode
-        // batch: sizing this for lanes alone left every prompt without a scratch,
-        // so the prompt was built on the base model while the generated tokens
-        // carried the delta -- an adapter that looked weak rather than unapplied.
         const std::uint32_t decode_columns =
             std::max<std::uint32_t>(options.max_concurrency, 1) * window;
         const std::uint32_t widest =
@@ -154,83 +153,74 @@ void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& opt
                         static_cast<std::int32_t>(widest));
     }
 
-    // Text layer index -> that layer's weights. Attention modules exist only on
-    // the full-attention layers (every fourth from 3 in this family); the MLP
-    // exists on every layer, so down_proj must route through GDN layers too -- a
-    // real PEFT adapter carries it on all of them.
-    const auto is_full = [](std::size_t layer) { return layer >= 3 && (layer - 3) % 4 == 0; };
-    std::vector<const detail::FullAttentionWeights*> attention_by_layer(detail::TextConfig::layers,
-                                                                        nullptr);
-    std::vector<const detail::DensePostMixerPayload*> mlp_by_layer(detail::TextConfig::layers,
-                                                                   nullptr);
+    // The directory: where every adaptable module of every layer lives on this
+    // model, registered once so loading is target-agnostic afterwards -- at
+    // startup and from the runtime endpoints alike. q, k and v leave one fused
+    // projection as separate contiguous tensors, so they share a bank key and are
+    // told apart by the port; o and down have a weight each. Attention modules
+    // exist only on the full-attention layers (every fourth from 3); the MLP is on
+    // every layer.
+    using Binding          = ops::LoraStore::ModuleBinding;
+    const auto is_full     = [](std::size_t layer) { return layer >= 3 && (layer - 3) % 4 == 0; };
     std::size_t full_index = 0;
     std::size_t gdn_index  = 0;
     for (std::size_t layer = 0; layer < detail::TextConfig::layers; ++layer) {
+        const auto index = static_cast<std::int32_t>(layer);
+        const detail::DensePostMixerPayload* mlp = nullptr;
         if (is_full(layer)) {
             const detail::FullAttentionWeights& full = runtime.full_layers.at(full_index++);
-            attention_by_layer[layer]                = &full;
-            mlp_by_layer[layer]                      = &full.post_mixer;
+            mlp                                      = &full.post_mixer;
+            const auto* fused =
+                std::get_if<detail::FusedAttentionProjectionPayload>(&full.projection);
+            if (fused != nullptr) {
+                const void* qkv = fused->query_key_gate_value.qdata;
+                store.register_module(index, "q_proj",
+                                      Binding{qkv, 0, detail::TextConfig::hidden,
+                                              detail::TextConfig::query_heads *
+                                                  detail::TextConfig::head_dim});
+                store.register_module(index, "k_proj",
+                                      Binding{qkv, 1, detail::TextConfig::hidden,
+                                              detail::TextConfig::kv_heads *
+                                                  detail::TextConfig::head_dim});
+                store.register_module(index, "v_proj",
+                                      Binding{qkv, 2, detail::TextConfig::hidden,
+                                              detail::TextConfig::kv_heads *
+                                                  detail::TextConfig::head_dim});
+            } else {
+                store.register_layer_refusal(
+                    index, "q_proj",
+                    "this artifact splits its attention projection, which the attention adapter "
+                    "path does not bind");
+            }
+            store.register_module(index, "o_proj",
+                                  Binding{full.output.qdata,
+                                          3,
+                                          detail::TextConfig::query_heads *
+                                              detail::TextConfig::head_dim,
+                                          detail::TextConfig::hidden});
         } else {
-            mlp_by_layer[layer] = &runtime.gdn_layers.at(gdn_index++).post_mixer;
-        }
-    }
-
-    for (const auto& payload : options.lora_payloads) {
-        if (payload.layer < 0 ||
-            static_cast<std::size_t>(payload.layer) >= mlp_by_layer.size()) {
-            throw std::invalid_argument("--lora-modules: layer " + std::to_string(payload.layer) +
-                                        " is outside this model");
-        }
-        const detail::FullAttentionWeights* attention =
-            attention_by_layer[static_cast<std::size_t>(payload.layer)];
-        const Weight* base    = nullptr;
-        std::int32_t port     = 0;
-        // q, k and v leave one fused projection as separate contiguous tensors, so
-        // they share a base weight and are told apart by the port. o and down have
-        // a weight each.
-        if (payload.module == "q_proj" || payload.module == "k_proj" ||
-            payload.module == "v_proj" || payload.module == "o_proj") {
-            if (attention == nullptr) {
-                throw std::invalid_argument(
-                    "--lora-modules: layer " + std::to_string(payload.layer) + " module '" +
-                    payload.module +
-                    "' -- this layer is linear attention, which has no self_attn projections; an "
+            mlp = &runtime.gdn_layers.at(gdn_index++).post_mixer;
+            for (const char* module : {"q_proj", "k_proj", "v_proj", "o_proj"}) {
+                store.register_layer_refusal(
+                    index, module,
+                    "this layer is linear attention, which has no self_attn projections; an "
                     "adapter naming them here was trained against a different architecture");
             }
-            if (payload.module == "o_proj") {
-                base = &attention->output;
-                port = 3;
-            } else {
-                const auto* fused =
-                    std::get_if<detail::FusedAttentionProjectionPayload>(&attention->projection);
-                if (fused == nullptr) {
-                    throw std::invalid_argument(
-                        "--lora-modules: this artifact splits its attention projection, which the "
-                        "attention adapter path does not bind");
-                }
-                base = &fused->query_key_gate_value;
-                port = payload.module == "q_proj" ? 0 : (payload.module == "k_proj" ? 1 : 2);
-            }
-        } else if (payload.module == "down_proj") {
-            base = &mlp_by_layer[static_cast<std::size_t>(payload.layer)]->down;
-            port = 4;
-        } else if (payload.module == "gate_proj" || payload.module == "up_proj") {
-            // gate and up are one fused weight whose two halves are consumed by
-            // SwiGLU inside the op, so neither half exists as a tensor a delta
-            // could be added to. Adapting them needs the delta inside that op, not
-            // after it; refusing is better than applying half an adapter.
-            throw std::invalid_argument(
-                "--lora-modules: '" + payload.module +
-                "' is not applied yet -- gate and up are fused and consumed by SwiGLU inside the "
-                "projection, so there is no intermediate tensor to add a delta to");
-        } else {
-            throw std::invalid_argument(
-                "--lora-modules: module '" + payload.module +
-                "' is not applied by this target (q_proj, k_proj, v_proj, o_proj, down_proj); an "
-                "adapter only partly applied is neither the base model nor the fine-tune");
         }
-        store.set_slot(base->qdata, port, payload.slot, payload.a, payload.b, payload.rank,
-                       payload.in_dim, payload.out_dim, payload.scale);
+        store.register_module(index, "down_proj",
+                              Binding{mlp->down.qdata, 4, detail::TextConfig::intermediate,
+                                      detail::TextConfig::hidden});
+    }
+    for (const char* module : {"gate_proj", "up_proj"}) {
+        store.register_refusal(module,
+                               "gate and up are fused and consumed by SwiGLU inside the "
+                               "projection, so there is no intermediate tensor to add a delta to");
+    }
+    store.ensure_banks();
+
+    for (const auto& payload : options.lora_payloads) {
+        store.set_module_slot(payload.layer, payload.module, payload.slot, payload.a, payload.b,
+                              payload.rank, payload.in_dim, payload.out_dim, payload.scale);
     }
     ops::lora_set_active(true);
 }
