@@ -13,6 +13,7 @@
 #include "ops/linear_swiglu/w8/w8_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/w8a8/w8a8_linear_swiglu.h"
 
+#include <string>
 #include <cstdint>
 #include <stdexcept>
 
@@ -119,9 +120,20 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     const bool q4b_shape = x.ne[0] == 2560 && out.ne[0] == 9216 && gate_up_weight.n == 18432 &&
                            gate_up_weight.k == 2560 && gate_up_weight.padded_shape[0] == 18432 &&
                            gate_up_weight.padded_shape[1] == 2560;
+    // qwen3-0.6b mlp (1024 -> 2x3072).
+    const bool q3_06b_shape = x.ne[0] == 1024 && out.ne[0] == 3072 && gate_up_weight.n == 6144 &&
+                              gate_up_weight.k == 1024 && gate_up_weight.padded_shape[0] == 6144 &&
+                              gate_up_weight.padded_shape[1] == 1024;
     if (t <= 0 || x.ne[2] != 1 || x.ne[3] != 1 || out.ne[1] != t || out.ne[2] != 1 ||
-        out.ne[3] != 1 || (!large_shape && !w8_shape && !q08_shape && !q4b_shape)) {
-        throw std::invalid_argument("linear_swiglu: invalid tensor shape");
+        out.ne[3] != 1 ||
+        (!large_shape && !w8_shape && !q08_shape && !q4b_shape && !q3_06b_shape)) {
+        throw std::invalid_argument(
+            "linear_swiglu: invalid tensor shape (x " + std::to_string(x.ne[0]) + "x" +
+            std::to_string(x.ne[1]) + ", out " + std::to_string(out.ne[0]) + "x" +
+            std::to_string(out.ne[1]) + ", gate_up n " + std::to_string(gate_up_weight.n) + " k " +
+            std::to_string(gate_up_weight.k) + ", padded " +
+            std::to_string(gate_up_weight.padded_shape[0]) + "x" +
+            std::to_string(gate_up_weight.padded_shape[1]) + ")");
     }
     if (!x.is_contiguous() || !out.is_contiguous()) {
         throw std::invalid_argument("linear_swiglu: x/out must be contiguous");
@@ -139,7 +151,7 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     const bool q4_weight = large_shape && gate_up_weight.qtype == QType::Q4G64_F16S &&
                            gate_up_weight.group_size == 64 && gate_up_weight.group == 64 &&
                            common_row_split;
-    const bool w8_weight = (w8_shape || q08_shape || q4b_shape) &&
+    const bool w8_weight = (w8_shape || q08_shape || q4b_shape || q3_06b_shape) &&
                            gate_up_weight.qtype == QType::W8G32_F16S &&
                            gate_up_weight.group_size == 32 && gate_up_weight.group == 32 &&
                            gate_up_weight.qhigh == nullptr &&

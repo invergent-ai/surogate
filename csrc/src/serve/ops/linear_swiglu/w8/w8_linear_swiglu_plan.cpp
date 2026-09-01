@@ -3,6 +3,7 @@
 #include "ops/linear_swiglu/w8/w8_linear_swiglu_kernels.h"
 
 #include <array>
+#include <string>
 #include <limits>
 #include <stdexcept>
 
@@ -73,16 +74,31 @@ constexpr std::array<RouteSpec, 4> kQ4BRoutes{{
     {257, kAnyCols, W8LinearSwiGluScheduleId::MmaR64C128},
 }};
 
-static_assert(
-    [] {
-        std::int64_t expected = 1;
-        for (const RouteSpec& route : kQ4BRoutes) {
-            if (route.first != expected || route.first > route.last) { return false; }
-            expected = static_cast<std::int64_t>(route.last) + 1;
-        }
-        return expected == static_cast<std::int64_t>(kAnyCols) + 1;
-    }(),
-    "W8 LinearSwiGLU 4b routes must be exact and closed");
+// qwen3-0.6b mlp {6144->3072, k=1024}. The exact-T split-K table is baked per
+// (intermediate, hidden) and only 3584/1024 exists at this hidden size, so this
+// shape takes the runtime-shaped MMA tiles for every T above decode: they read
+// both extents from the weight and 3072 divides every registered BM/2. Decode
+// has its own 3072 instantiation. A tuned exact-T table can follow later.
+constexpr std::array<RouteSpec, 3> kQ3_06bRoutes{{
+    {1, 1, W8LinearSwiGluScheduleId::DecodePairR16},
+    {2, 256, W8LinearSwiGluScheduleId::MmaR32C64},
+    {257, kAnyCols, W8LinearSwiGluScheduleId::MmaR64C128},
+}};
+
+template <std::size_t N>
+constexpr bool routes_are_closed(const std::array<RouteSpec, N>& routes) {
+    std::int64_t expected = 1;
+    for (const RouteSpec& route : routes) {
+        if (route.first != expected || route.first > route.last) { return false; }
+        expected = static_cast<std::int64_t>(route.last) + 1;
+    }
+    return expected == static_cast<std::int64_t>(kAnyCols) + 1;
+}
+
+static_assert(routes_are_closed(kQ4BRoutes),
+              "W8 LinearSwiGLU 4b routes must be exact and closed");
+static_assert(routes_are_closed(kQ3_06bRoutes),
+              "W8 LinearSwiGLU 0.6b routes must be exact and closed");
 
 bool supported_shape(const W8LinearSwiGluProblem& problem) noexcept {
     // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b mlp {7168->3584, k=1024}.
@@ -93,7 +109,11 @@ bool supported_shape(const W8LinearSwiGluProblem& problem) noexcept {
     // surogate vendor patch (PATCHES.md #18): qwen3.5-4b mlp.
     const bool q4b = problem.gate_up_rows == 18432 && problem.output_rows == 9216 &&
                      problem.k == 2560 && problem.padded_k == 2560;
-    return base || q08 || q4b;
+    // qwen3-0.6b mlp {6144->3072, k=1024}. Same k as the 0.8b above, so it
+    // reuses that shape's exact-T instantiations; only the row counts differ.
+    const bool q3_06b = problem.gate_up_rows == 6144 && problem.output_rows == 3072 &&
+                        problem.k == 1024 && problem.padded_k == 1024;
+    return base || q08 || q4b || q3_06b;
 }
 
 } // namespace
@@ -137,7 +157,11 @@ bool w8_linear_swiglu_admits(const W8LinearSwiGluProblem& problem) noexcept {
 W8LinearSwiGluPlan w8_linear_swiglu_resolve_plan(const W8LinearSwiGluProblem& problem) {
     if (!w8_linear_swiglu_admits(problem)) {
         throw std::invalid_argument(
-            "W8 LinearSwiGLU: exact problem or column count is not admitted");
+            "W8 LinearSwiGLU: exact problem or column count is not admitted (gate_up_rows " +
+            std::to_string(problem.gate_up_rows) + ", output_rows " +
+            std::to_string(problem.output_rows) + ", k " + std::to_string(problem.k) +
+            ", padded_k " + std::to_string(problem.padded_k) + ", cols " +
+            std::to_string(problem.cols) + ")");
     }
     // 4b (k=2560) has no exact-T instantiations: decode + the runtime-shaped
     // mma bands only (A8 takes T >= 224 in the engine anyway).
@@ -149,11 +173,22 @@ W8LinearSwiGluPlan w8_linear_swiglu_resolve_plan(const W8LinearSwiGluProblem& pr
         }
         throw std::logic_error("W8 LinearSwiGLU: 4b problem has no route");
     }
-    const auto& routes = problem.k == 1024 ? kQ08Routes : kRoutes;
-    for (const RouteSpec& route : routes) {
-        if (problem.cols >= route.first && problem.cols <= route.last) { return {route.schedule}; }
+    const auto resolve_from = [&](const auto& routes) -> W8LinearSwiGluPlan {
+        for (const RouteSpec& route : routes) {
+            if (problem.cols >= route.first && problem.cols <= route.last) {
+                return {route.schedule};
+            }
+        }
+        throw std::logic_error("W8 LinearSwiGLU: admitted problem has no route");
+    };
+    // Two models share k=1024 and differ in intermediate, so the table has to be
+    // chosen on the pair: the 0.8b's exact-T bakes are 3584-wide and would run
+    // the 0.6b's weight at the wrong row count.
+    if (problem.k == 1024) {
+        return problem.gate_up_rows == 6144 ? resolve_from(kQ3_06bRoutes)
+                                            : resolve_from(kQ08Routes);
     }
-    throw std::logic_error("W8 LinearSwiGLU: admitted problem has no route");
+    return resolve_from(kRoutes);
 }
 
 void w8_linear_swiglu_execute_plan(const W8LinearSwiGluPlan& plan, const Tensor& x, const Weight& w,

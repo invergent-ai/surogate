@@ -1,6 +1,9 @@
 #include "ops/linear_swiglu/w8/w8_linear_swiglu_kernels.h"
 
 #include "core/device.h"
+
+#include <stdexcept>
+#include <string>
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
@@ -186,36 +189,50 @@ void launch_decode(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t s
 
 } // namespace
 
-void w8_linear_swiglu_decode_pair_launch(const Tensor& x, const Weight& w, Tensor& out,
-                                         cudaStream_t stream) {
-    if (w.k == 1024) {
-        launch_decode<8, 3584, 1024>(x, w, out, stream);
+// The kernel bakes both extents, so the dispatch has to name the whole geometry.
+// Keying it on the hidden extent alone was wrong the moment two models shared a
+// hidden size and differed in intermediate -- qwen3.5-0.8b and qwen3-0.6b both
+// have k=1024 with intermediate 3584 and 3072 -- and it failed silently: the
+// 0.6b ran 3584 rows of another model's weight and produced NaNs. An
+// unregistered pair now says so.
+template <int RowsPerCta>
+void dispatch_decode(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    const std::int32_t intermediate = w.n / 2;
+    if (w.k == 2048 && intermediate == 6144) {
+        launch_decode<RowsPerCta, 6144, 2048>(x, w, out, stream);
         return;
     }
-    launch_decode<8>(x, w, out, stream);
+    if (w.k == 1024 && intermediate == 3584) {
+        launch_decode<RowsPerCta, 3584, 1024>(x, w, out, stream);
+        return;
+    }
+    // qwen3-0.6b mlp (2x3072, k=1024).
+    if (w.k == 1024 && intermediate == 3072) {
+        launch_decode<RowsPerCta, 3072, 1024>(x, w, out, stream);
+        return;
+    }
+    if (w.k == 2560 && intermediate == 9216) {
+        launch_decode<RowsPerCta, 9216, 2560>(x, w, out, stream);
+        return;
+    }
+    throw std::invalid_argument("W8 LinearSwiGLU decode: no instantiation for gate_up_rows " +
+                                std::to_string(w.n) + " over k " + std::to_string(w.k));
+}
+
+void w8_linear_swiglu_decode_pair_launch(const Tensor& x, const Weight& w, Tensor& out,
+                                         cudaStream_t stream) {
+    dispatch_decode<8>(x, w, out, stream);
 }
 
 void w8_linear_swiglu_decode_pair_r4_launch(const Tensor& x, const Weight& w, Tensor& out,
                                             cudaStream_t stream) {
-    if (w.k == 1024) {
-        launch_decode<4, 3584, 1024>(x, w, out, stream);
-        return;
-    }
-    launch_decode<4>(x, w, out, stream);
+    dispatch_decode<4>(x, w, out, stream);
 }
 
 void w8_linear_swiglu_decode_pair_r16_launch(const Tensor& x, const Weight& w, Tensor& out,
                                              cudaStream_t stream) {
     // surogate vendor patches (PATCHES.md #13/#18): per-geometry decode.
-    if (w.k == 1024) {
-        launch_decode<16, 3584, 1024>(x, w, out, stream);
-        return;
-    }
-    if (w.k == 2560) {
-        launch_decode<16, 9216, 2560>(x, w, out, stream);
-        return;
-    }
-    launch_decode<16>(x, w, out, stream);
+    dispatch_decode<16>(x, w, out, stream);
 }
 
 } // namespace sinfer::ops::detail

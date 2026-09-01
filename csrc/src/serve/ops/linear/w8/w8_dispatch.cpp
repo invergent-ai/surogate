@@ -145,6 +145,15 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
             if (t <= 128) { return launch_w8_mma_r32_c128; }
             return launch_w8_mma_r64_c128;
         }
+        // qwen3-0.6b's lm head (151936 rows at hidden 1024). It rides the same
+        // routes as the 0.8b heads above; the T<=32 small-T arm there is an
+        // instantiation measured for 248320 rows, so this shape takes the SIMT
+        // band and the runtime MMA tiles either side of it.
+        if (n == 151936) {
+            if (t <= 16) { return launch_w8_simt_r8_c4; }
+            if (t <= 128) { return launch_w8_mma_r32_c128; }
+            return launch_w8_mma_r64_c128;
+        }
         // The MTP block's fused attention projection (5120) and its MLP gate/up
         // (2 * 3584). The main layers reach their own fused wrappers, so these
         // shapes appear only under speculation, at the verify width (T = draft

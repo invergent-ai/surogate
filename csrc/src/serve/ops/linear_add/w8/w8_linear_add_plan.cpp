@@ -3,6 +3,7 @@
 #include "ops/linear_add/w8/w8_linear_add_kernels.h"
 #include "ops/common/token_slices.h"
 
+#include <string>
 #include <array>
 #include <limits>
 #include <stdexcept>
@@ -103,6 +104,17 @@ constexpr std::array<RouteSpec, 5> kQ4B29Routes{{
     {1025, kAnyCols, W8LinearAddScheduleId::MmaR48C128},
 }};
 
+// qwen3-0.6b mlp down {1024, 3072}. Both the exact-T split-K table and the
+// medium split-K family bake their hidden extent (2048/3584 here, 4096/6144 for
+// the larger shapes) and none is 3072, so this shape takes only the kernels that
+// read their extents from the weight: the SIMT decode and the MMA tiles. The
+// 0.6b attention output {1024, 2048} is the 0.8b shape and keeps its table.
+constexpr std::array<RouteSpec, 3> kQ3_06bRoutes{{
+    {1, 1, W8LinearAddScheduleId::SimtR8C4},
+    {2, 1024, W8LinearAddScheduleId::MmaR32C128},
+    {1025, kAnyCols, W8LinearAddScheduleId::MmaR48C128},
+}};
+
 template <std::size_t N>
 constexpr bool routes_are_closed(const std::array<RouteSpec, N>& routes) {
     std::int64_t expected = 1;
@@ -114,7 +126,7 @@ constexpr bool routes_are_closed(const std::array<RouteSpec, N>& routes) {
 }
 
 static_assert(routes_are_closed(kK4096Routes) && routes_are_closed(kK6144Routes) &&
-                  routes_are_closed(kQ08Routes) &&
+                  routes_are_closed(kQ08Routes) && routes_are_closed(kQ3_06bRoutes) &&
                   routes_are_closed(kQ2BRoutes) && routes_are_closed(kQ4B29Routes),
               "W8 LinearAdd routes must be exact, contiguous, and closed");
 
@@ -242,12 +254,21 @@ bool w8_linear_add_admits(const W8LinearAddProblem& problem) noexcept {
     const bool q2b  = problem.rows == 2048 && problem.k == 2048;
     // surogate vendor patch (PATCHES.md #18): qwen3.5-4b output/down.
     const bool q4b  = problem.rows == 2560 && (problem.k == 4096 || problem.k == 9216);
-    return (base || q08 || q2b || q4b) && problem.padded_k == problem.k && problem.cols >= 1;
+    // qwen3-0.6b: its attention output {1024, 2048} already rides the 0.8b
+    // shape above; only the mlp down {1024, 3072} is new. Same row count, so it
+    // resolves through the 0.8b route table below.
+    const bool q3_06b = problem.rows == 1024 && problem.k == 3072;
+    return (base || q08 || q2b || q4b || q3_06b) && problem.padded_k == problem.k &&
+           problem.cols >= 1;
 }
 
 W8LinearAddPlan w8_linear_add_resolve_plan(const W8LinearAddProblem& problem) {
     if (!w8_linear_add_admits(problem)) {
-        throw std::invalid_argument("w8 linear_add: exact problem or column count is not admitted");
+        throw std::invalid_argument("w8 linear_add: exact problem or column count is not admitted "
+                                    "(rows " + std::to_string(problem.rows) + ", k " +
+                                    std::to_string(problem.k) + ", padded_k " +
+                                    std::to_string(problem.padded_k) + ", cols " +
+                                    std::to_string(problem.cols) + ")");
     }
     const auto resolve_from = [&](const auto& routes) -> W8LinearAddPlan {
         for (const RouteSpec& route : routes) {
@@ -257,7 +278,11 @@ W8LinearAddPlan w8_linear_add_resolve_plan(const W8LinearAddProblem& problem) {
         }
         throw std::logic_error("w8 linear_add: admitted problem has no covering route");
     };
-    if (problem.rows == 1024) { return resolve_from(kQ08Routes); }
+    if (problem.rows == 1024) {
+        // The row count alone does not name the geometry here: the 0.8b's exact-T
+        // bakes are k=2048/3584, and the 0.6b's mlp down is k=3072.
+        return problem.k == 3072 ? resolve_from(kQ3_06bRoutes) : resolve_from(kQ08Routes);
+    }
     // qwen3.5-2b output projections (measured on an idle RTX 5090,
     // bench/ops/q08_route_sweep_bench: 472 -> r32c96 63.5us, 888 -> r48c128
     // 102.8us (+26% over r32c128), 1024 -> r32c128, 1912 -> r48c128).

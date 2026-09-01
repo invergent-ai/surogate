@@ -7,6 +7,7 @@
 #include <array>
 #include <cstdint>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
 #include <utility>
 
@@ -109,12 +110,19 @@ void w8_linear_swiglu_splitk_exact_t_launch(const Tensor& x, const Weight& w, Te
     if (x.ne[1] < kFirstExactT || x.ne[1] > kLastExactT) {
         throw std::invalid_argument("W8 LinearSwiGLU exact split-K requires T=2..48");
     }
-    if (w.k == 1024) {
+    // Each table bakes an (intermediate, hidden) pair, so the hidden extent alone
+    // does not name one: qwen3.5-0.8b and qwen3-0.6b are both k=1024. A geometry
+    // with no table of its own is refused rather than run through another's.
+    if (w.k == 1024 && w.n == 7168) {
         kQ08Launchers[x.ne[1] - kFirstExactT](x, w, out, stream);
-    } else if (w.k == 2560) {
+    } else if (w.k == 2560 && w.n == 18432) {
         kQ4BLaunchers[x.ne[1] - kFirstExactT](x, w, out, stream);
-    } else {
+    } else if (w.k == kHidden && w.n == 2 * kIntermediate) {
         kLaunchers[x.ne[1] - kFirstExactT](x, w, out, stream);
+    } else {
+        throw std::invalid_argument(
+            "W8 LinearSwiGLU exact split-K: no table for gate_up_rows " + std::to_string(w.n) +
+            " over k " + std::to_string(w.k));
     }
     CUDA_CHECK(cudaGetLastError());
 }

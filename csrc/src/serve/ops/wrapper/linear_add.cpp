@@ -217,8 +217,12 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         const bool base = w.n == 2048 && (w.k == 4096 || w.k == 6144 || w.k == 2048);
         const bool q08  = w.n == 1024 && (w.k == 2048 || w.k == 3584);
         const bool q4b  = w.n == 2560 && (w.k == 4096 || w.k == 9216);
-        if (!base && !q08 && !q4b) {
-            throw std::invalid_argument("linear_add: unsupported W8 shape");
+        // qwen3-0.6b: its attention output {1024, 2048} is already the 0.8b shape
+        // above; only the mlp down {1024, 3072} is new.
+        const bool q3_06b = w.n == 1024 && w.k == 3072;
+        if (!base && !q08 && !q4b && !q3_06b) {
+            throw std::invalid_argument("linear_add: unsupported W8 shape (n " +
+                                        std::to_string(w.n) + ", k " + std::to_string(w.k) + ")");
         }
         if (!aligned_to(x.data, 16) || !aligned_to(residual_out.data, 16) ||
             !aligned_to(w.qdata, 16) || !aligned_to(w.scales, 16)) {

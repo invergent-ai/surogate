@@ -7,6 +7,7 @@
 #include <array>
 #include <cstdint>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace sinfer::ops::detail {
@@ -120,6 +121,15 @@ void w8_linear_add_splitk_mma_launch(const Tensor& x, const Weight& weight, Tens
         if (x.ne[1] > kQ4bLastExactCols) {
             throw std::invalid_argument(
                 "W8 linear_add: small-target exact tables cover T=2..32");
+        }
+        // Every table bakes its hidden extent, so an unlisted k must be refused
+        // rather than silently run through a neighbour's: qwen3-0.6b's mlp down
+        // is {1024, 3072} and would otherwise have taken the 2048 table.
+        if ((weight.n == 2560 && weight.k != 9216 && weight.k != 4096) ||
+            (weight.n == 1024 && weight.k != 3584 && weight.k != 2048)) {
+            throw std::invalid_argument("W8 linear_add exact split-K: no table for rows " +
+                                        std::to_string(weight.n) + " over k " +
+                                        std::to_string(weight.k));
         }
         const auto& launchers = weight.n == 2560
                                     ? (weight.k == 9216 ? kQ4bK9216Launchers : kQ4bK4096Launchers)
