@@ -921,7 +921,7 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     const Tensor& rope_positions =
         active_rope_positions_ != nullptr ? *active_rope_positions_ : io_.rope_pos;
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
-    ops::rope(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
+    ops::rope(rope_for_op, kCfg.rotary_dim, layer_rope_theta<TextConfig>(fidx), qn, kn, s);
     debug_probe<Variant>("q_post_rope", qn.view({kCfg.q_size, T}), s);
     debug_probe<Variant>("k_post_rope", kn.view({kCfg.kv_size, T}), s);
 
@@ -1620,7 +1620,8 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                                                    sizeof(std::int32_t),
                                                cudaMemcpyDeviceToDevice, s));
                 }
-                ops::rope(rope_all, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
+                ops::rope(rope_all, kCfg.rotary_dim, layer_rope_theta<TextConfig>(layer), qn, kn,
+                          s);
                 debug_probe<Variant>("q_post_rope", qn.view({kCfg.q_size, total}), s);
                 debug_probe<Variant>("k_post_rope", kn.view({kCfg.kv_size, total}), s);
 
@@ -2048,7 +2049,8 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
                                                    sizeof(std::int32_t),
                                                cudaMemcpyDeviceToDevice, s));
                 }
-                ops::rope(rope_all, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
+                ops::rope(rope_all, kCfg.rotary_dim, layer_rope_theta<TextConfig>(layer), qn, kn,
+                          s);
 
                 Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, total});
                 {

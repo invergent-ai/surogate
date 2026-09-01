@@ -8,12 +8,15 @@
 #include "api/ops/embedding.h"
 #include "api/ops/gated_rmsnorm.h"
 #include "api/ops/rmsnorm.h"
+#include "api/ops/scale.h"
 #include "core/arena.h"
 #include "core/ngram_ple_state.h"
 #include "core/tensor.h"
 #include "family/impl/runtime/prologue_columns.h"
 
+#include <bit>
 #include <cstddef>
+#include <cstdint>
 #include <cstdint>
 #include <optional>
 
@@ -51,6 +54,44 @@ template <class Variant>
         return Variant::attention_qk_norm;
     } else {
         return true;
+    }
+}
+
+/// The value a bf16 buffer would hold for `x`, round-to-nearest-even.
+constexpr float as_bf16(float x) {
+    const std::uint32_t bits    = std::bit_cast<std::uint32_t>(x);
+    const std::uint32_t rounded = (bits + 0x7fffU + ((bits >> 16U) & 1U)) & 0xffff0000U;
+    return std::bit_cast<float>(rounded);
+}
+
+/// The factor a model applies to its embedding lookup, zero for none.
+///
+/// Rounded to bf16 deliberately. Gemma downcasts the scalar to the weight dtype
+/// before multiplying -- `embed_scale.to(self.weight.dtype)` in transformers'
+/// modeling_gemma3.py, and vLLM does the same -- so applying the fp32 value
+/// would be a different model: sqrt(640) is 25.2982 while bf16 holds 25.25, a
+/// 0.19% difference that lands on every token of every prompt.
+template <class Variant>
+[[nodiscard]] constexpr float embedding_scale() {
+    if constexpr (requires { Variant::TextConfig::embedding_scale; }) {
+        return as_bf16(Variant::TextConfig::embedding_scale);
+    } else {
+        return 0.0F;
+    }
+}
+
+/// The rope base a layer rotates at.
+///
+/// Gemma 3 rotates its windowed layers at a base 100x smaller than its global
+/// ones, so a single `rope_theta` cannot describe the model. A config that says
+/// nothing keeps the one base it always had, which is every target but that one.
+template <class TextConfig>
+[[nodiscard]] constexpr float layer_rope_theta(int layer) {
+    if constexpr (requires { TextConfig::layer_rope_theta(layer); }) {
+        return TextConfig::layer_rope_theta(layer);
+    } else {
+        (void)layer;
+        return TextConfig::rope_theta;
     }
 }
 
@@ -162,6 +203,9 @@ struct ResidualHooks {
         } else {
             (void)work;
             ops::embedding(ids, model.token_embedding, residual, stream);
+            if constexpr (embedding_scale<Variant>() != 0.0F) {
+                ops::scale(residual, embedding_scale<Variant>(), stream);
+            }
         }
     }
 
