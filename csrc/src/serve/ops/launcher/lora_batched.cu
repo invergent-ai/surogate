@@ -8,13 +8,10 @@ namespace sinfer::ops::detail {
 void lora_batched_shrink_launch(const Tensor& x, const void* a_bank, const Tensor& ids, Tensor& low,
                                 std::int32_t k, std::int32_t rank, std::int64_t a_stride,
                                 const std::int32_t* uniform, cudaStream_t stream) {
-    // One warp per rank row, four rows per block: rank is at most 64, so the grid
-    // is a handful of blocks per token and the geometry depends only on (rank,
-    // tokens) -- both fixed for a captured graph.
-    constexpr int kRowsPerBlock = 4;
-    const dim3 block(32, kRowsPerBlock, 1);
-    const dim3 grid(static_cast<unsigned>((rank + kRowsPerBlock - 1) / kRowsPerBlock),
-                    static_cast<unsigned>(x.ne[1]), 1);
+    // One 128-thread block per (token, rank row); the geometry depends only on
+    // (rank, tokens), both fixed for a captured graph.
+    const dim3 block(kLoraShrinkThreads, 1, 1);
+    const dim3 grid(static_cast<unsigned>(rank), static_cast<unsigned>(x.ne[1]), 1);
     lora_batched_shrink_kernel<<<grid, block, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(a_bank),
         static_cast<const std::int32_t*>(ids.data), static_cast<__nv_bfloat16*>(low.data), k, rank,
