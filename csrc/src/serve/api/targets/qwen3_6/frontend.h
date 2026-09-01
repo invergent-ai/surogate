@@ -23,6 +23,13 @@ struct FrontendOptions {
     std::uint32_t media_preprocess_threads = 0;
     /// Replaces the artifact's chat template when non-empty (--chat-template).
     std::string chat_template_override;
+    /// Whether the artifact's tokenizer is one of the family's registered
+    /// Qwen3.5/3.6 checkpoints, whose exact 248,077-token domain and Vision
+    /// token IDs are then asserted. A target outside that family (a dense Qwen3,
+    /// Llama or Gemma stack) clears this: its tokenizer is a different, smaller
+    /// domain and has no Vision tokens at all, and asserting the family's would
+    /// reject a correct artifact.
+    bool registered_tokenizer = true;
 };
 
 struct FrontendResources;

@@ -109,7 +109,14 @@ struct DFlashAppendContext {
 struct MtpGqaEnvelopes {
     ops::GqaExecutionEnvelope target_verify;
     ops::GqaExecutionEnvelope batch;
-    std::array<ops::GqaExecutionEnvelope, kMaximumMtpDraftTokens - 1> ar;
+    // One envelope per autoregressive draft step after the first, so K-1 of them
+    // -- and none at all for a target with no MTP head, where K is 0. Written as
+    // an unsigned `K - 1` that was an array of four billion envelopes, which GCC
+    // reports as "passing too large argument on stack" from the lambda that
+    // captures this struct, several headers away from the cause.
+    std::array<ops::GqaExecutionEnvelope,
+               kMaximumMtpDraftTokens == 0 ? 0 : kMaximumMtpDraftTokens - 1>
+        ar;
 };
 
 struct DFlashEnvelopes {

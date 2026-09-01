@@ -142,6 +142,15 @@ void validate_pixel_pipeline(const Json& config, std::string_view resource) {
 }
 
 fi::ProcessorOptions processor_options(const FrontendResources& resources) {
+    // A text-only artifact publishes neither preprocessor config -- Qwen3-0.6B
+    // ships no image or video preprocessor at all -- and the engine refuses to
+    // load an artifact carrying an object no binder consumes, so the target
+    // cannot fabricate them either. The processor then keeps its defaults and is
+    // never asked for a pixel: such a target refuses `--vision` at load.
+    if (resources.preprocessor_config_json.empty() &&
+        resources.video_preprocessor_config_json.empty()) {
+        return fi::ProcessorOptions{};
+    }
     const Json image =
         parse_resource_json(resources.preprocessor_config_json, "preprocessor_config.json");
     const Json video = parse_resource_json(resources.video_preprocessor_config_json,
@@ -648,7 +657,9 @@ public:
                 options.media_cache_bytes, options.media_live_bytes,
                 options.media_preprocess_threads, static_cast<std::size_t>(minimum_live));
         }
-        if (registered_checkpoint) { validate_registered_tokenizer(*tokenizer); }
+        if (registered_checkpoint && options.registered_tokenizer) {
+            validate_registered_tokenizer(*tokenizer);
+        }
         for (const int token : tokenizer->default_stop_token_ids()) {
             if (!tokenizer->is_valid_token(token)) {
                 throw std::invalid_argument(

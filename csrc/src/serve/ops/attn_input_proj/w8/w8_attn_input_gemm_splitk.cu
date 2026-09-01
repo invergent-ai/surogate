@@ -141,6 +141,43 @@ constexpr auto make_target4b_launchers(std::index_sequence<Offsets...>) {
 constexpr auto kTarget4BLaunchers = make_target4b_launchers(
     std::make_index_sequence<kLastTargetExactCols - kFirstExactCols + 1>{});
 
+// Qwen3-0.6B ungated fused qkv exact-T split path (rows 4096 = q2048 | k1024 |
+// v1024, hidden 1024). Same structure as the gated tables above; the three-output
+// entry below routes T=2..32 here and the wider bands onto the medium-T tiles.
+using Qwen3Output = W8SplitOutput3<2048, 1024, 1024>;
+
+template <int ActiveCols>
+void launch_qwen3_active_cols(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k,
+                              Tensor& v, cudaStream_t stream) {
+    static_assert((2048 % kRowsPerCta) == 0 && (1024 % kRowsPerCta) == 0);
+    const Qwen3Output output{static_cast<__nv_bfloat16*>(q.data),
+                             static_cast<__nv_bfloat16*>(k.data),
+                             static_cast<__nv_bfloat16*>(v.data)};
+    launch_output<ActiveCols, 4096, 1024>(x, weight, output, stream);
+}
+
+template <std::size_t... Offsets>
+constexpr auto make_qwen3_launchers(std::index_sequence<Offsets...>) {
+    return std::array<CompanionLauncher, sizeof...(Offsets)>{
+        &launch_qwen3_active_cols<kFirstExactCols + static_cast<int>(Offsets)>...};
+}
+
+constexpr auto kQwen3Launchers = make_qwen3_launchers(
+    std::make_index_sequence<kLastCompanionExactCols - kFirstExactCols + 1>{});
+
+template <int TileCols, int KSplits, int NGroups, int MinBlocks>
+void launch_qwen3_medium_cols(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k,
+                              Tensor& v, cudaStream_t stream) {
+    const Qwen3Output output{static_cast<__nv_bfloat16*>(q.data),
+                             static_cast<__nv_bfloat16*>(k.data),
+                             static_cast<__nv_bfloat16*>(v.data)};
+    w8_rowsplit_medium_t_splitk_kernel<1024, TileCols, KSplits, NGroups, MinBlocks>
+        <<<4096 / kRowsPerCta, KSplits * NGroups * 32, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const std::uint8_t*>(weight.qdata),
+            static_cast<const std::uint8_t*>(weight.scales), output, x.ne[1]);
+}
+
 constexpr auto kTargetLaunchers =
     make_target_launchers(std::make_index_sequence<kLastTargetExactCols - kFirstExactCols + 1>{});
 constexpr auto kCompanionLaunchers = make_companion_launchers(
@@ -208,6 +245,21 @@ void w8_attn_input_splitk_mma_launch(const Tensor& x, const Weight& weight, Tens
 
 void w8_attn_input_splitk_mma_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k,
                                      Tensor& v, cudaStream_t stream) {
+    // Qwen3-0.6B's ungated parent. Its route table hands this schedule T=2..64.
+    if (weight.n == 4096) {
+        if (x.ne[1] < kFirstExactCols || x.ne[1] > 64) {
+            throw std::invalid_argument("W8 qwen3 attention input split-K MMA requires T=2..64");
+        }
+        if (x.ne[1] <= kLastCompanionExactCols) {
+            kQwen3Launchers[x.ne[1] - kFirstExactCols](x, weight, q, k, v, stream);
+        } else if (x.ne[1] <= 48) {
+            launch_qwen3_medium_cols<48, 4, 2, 3>(x, weight, q, k, v, stream);
+        } else {
+            launch_qwen3_medium_cols<64, 4, 2, 2>(x, weight, q, k, v, stream);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     if (x.ne[1] < kFirstExactCols || x.ne[1] > 96) {
         throw std::invalid_argument("W8 companion attention input split-K MMA requires T=2..96");
     }

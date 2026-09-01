@@ -52,6 +52,15 @@ constexpr Sha256Digest kQwen354BThinkingToggleTemplateDigest{
     0x16, 0xf8, 0xd1, 0x4a, 0x88, 0x9f, 0xf9, 0xed, 0xe0, 0x7b, 0xca, 0x09, 0x9c, 0x28, 0xf7, 0x15,
 };
 
+// Qwen3-0.6B publishes no chat_template.jinja; its converter lifts the
+// template out of tokenizer_config.json verbatim. It is the same
+// enable_thinking toggle mechanism as the Qwen3.5/3.6 family template, with
+// Qwen3's own tool-call block, so it maps to the same ThinkingToggle semantics.
+constexpr Sha256Digest kQwen3ThinkingToggleTemplateDigest{
+    0xa5, 0x5e, 0xe1, 0xb1, 0x66, 0x01, 0x28, 0xb7, 0x09, 0x87, 0x23, 0xe0, 0xab, 0xcd, 0x92, 0xca,
+    0xa0, 0x78, 0x80, 0x61, 0x05, 0x1c, 0x62, 0xd5, 0x1c, 0xbe, 0x87, 0xd9, 0xcf, 0x19, 0x74, 0xd8,
+};
+
 constexpr std::string_view kLowReasoningInstructions =
     "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to "
     "the conclusion without unnecessary elaboration.";
@@ -320,7 +329,8 @@ CompiledChatTemplate CompiledChatTemplate::resolve(std::string_view source) {
     const Sha256Digest digest = sha256(source);
     if (digest == kThinkingToggleTemplateDigest || digest == kQwen35ThinkingToggleTemplateDigest ||
         digest == kQwen35UnslothThinkingToggleTemplateDigest ||
-        digest == kQwen354BThinkingToggleTemplateDigest) {
+        digest == kQwen354BThinkingToggleTemplateDigest ||
+        digest == kQwen3ThinkingToggleTemplateDigest) {
         return CompiledChatTemplate(ChatTemplateSemantics::ThinkingToggle);
     }
     if (digest == kReasoningEffortTemplateDigest) {

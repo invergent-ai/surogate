@@ -79,6 +79,9 @@ struct ModelConfig {
 inline constexpr ModelConfig kCfg{};
 using Hooks = ResidualHooks<Variant>;
 inline constexpr float kAttnScale                     = kAttentionScale;
+// False only for a target whose attention has no output gate (a dense GQA
+// stack); every hybrid target in the family leaves it at the default.
+inline constexpr bool kAttentionOutputGate            = qwen3_6::detail::attention_output_gate<Variant>();
 inline constexpr std::uint32_t kPrefillChunkAlignment = 128;
 
 struct MlpW {

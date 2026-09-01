@@ -98,6 +98,24 @@ void w8_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& 
 
 void w8_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k,
                                  Tensor& v, cudaStream_t stream) {
+    // Qwen3-0.6B's ungated fused qkv: 4096 rows = q2048 | k1024 | v1024 at k 1024.
+    if (weight.n == 4096) {
+        constexpr int kRowsQwen3       = 4096;
+        constexpr int kRowsPerCtaQwen3 = 8;
+        static_assert((2048 % kRowsPerCtaQwen3) == 0 && (1024 % kRowsPerCtaQwen3) == 0);
+        using OutputQwen3 = W8SplitOutput3<2048, 1024, 1024>;
+        const OutputQwen3 output{static_cast<__nv_bfloat16*>(q.data),
+                                 static_cast<__nv_bfloat16*>(k.data),
+                                 static_cast<__nv_bfloat16*>(v.data)};
+        w8_k2048_decode_kernel<kRowsQwen3, kRowsPerCtaQwen3, OutputQwen3, W8DecodeStoreEpilogue,
+                               1024>
+            <<<kRowsQwen3 / kRowsPerCtaQwen3, kRowsPerCtaQwen3 * 32, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(x.data),
+                static_cast<const std::uint8_t*>(weight.qdata),
+                static_cast<const std::uint8_t*>(weight.scales), output);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     launch_companion_decode<8>(x, weight, q, k, v, stream);
 }
 

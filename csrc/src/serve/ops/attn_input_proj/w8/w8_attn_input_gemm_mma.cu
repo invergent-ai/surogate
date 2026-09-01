@@ -103,6 +103,16 @@ void w8_attn_input_mma_r32_c128_launch(const Tensor& x, const Weight& weight, Te
                                        Tensor& v, cudaStream_t stream) {
     using Schedule = W8RowSplitMmaGemmSchedule<32, 128, 32, 16, 2>;
     static_assert((4096 % Schedule::BM) == 0 && (1024 % Schedule::BM) == 0);
+    // Qwen3-0.6B ungated fused qkv (rows 4096 = q2048 | k1024 | v1024, hidden 1024).
+    if (weight.n == 4096) {
+        using OutputQwen3 = W8SplitOutput3<2048, 1024, 1024>;
+        static_assert((2048 % Schedule::BM) == 0 && (1024 % Schedule::BM) == 0);
+        const OutputQwen3 output{static_cast<__nv_bfloat16*>(q.data),
+                                 static_cast<__nv_bfloat16*>(k.data),
+                                 static_cast<__nv_bfloat16*>(v.data)};
+        launch_route<Schedule, 4096, 1024>(x, weight, output, stream);
+        return;
+    }
     const CompanionOutput output{static_cast<__nv_bfloat16*>(q.data),
                                  static_cast<__nv_bfloat16*>(k.data),
                                  static_cast<__nv_bfloat16*>(v.data)};
@@ -113,6 +123,16 @@ void w8_attn_input_mma_r64_c128_launch(const Tensor& x, const Weight& weight, Te
                                        Tensor& v, cudaStream_t stream) {
     using Schedule = W8RowSplitMmaGemmSchedule<64, 128, 64, 16, 2, 2>;
     static_assert((4096 % Schedule::BM) == 0 && (1024 % Schedule::BM) == 0);
+    // Qwen3-0.6B ungated fused qkv (rows 4096 = q2048 | k1024 | v1024, hidden 1024).
+    if (weight.n == 4096) {
+        using OutputQwen3 = W8SplitOutput3<2048, 1024, 1024>;
+        static_assert((2048 % Schedule::BM) == 0 && (1024 % Schedule::BM) == 0);
+        const OutputQwen3 output{static_cast<__nv_bfloat16*>(q.data),
+                                 static_cast<__nv_bfloat16*>(k.data),
+                                 static_cast<__nv_bfloat16*>(v.data)};
+        launch_route<Schedule, 4096, 1024>(x, weight, output, stream);
+        return;
+    }
     const CompanionOutput output{static_cast<__nv_bfloat16*>(q.data),
                                  static_cast<__nv_bfloat16*>(k.data),
                                  static_cast<__nv_bfloat16*>(v.data)};

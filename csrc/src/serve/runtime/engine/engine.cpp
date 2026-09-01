@@ -147,6 +147,7 @@ GenerationResult GenerationHandle::wait(OutputSink* sink, const CancellationView
 
 class Engine::Impl {
 public:
+    using ExecutorQwen3 = runtime::ConcurrentExecutor<targets::Qwen3DenseInstance>;
     using Executor08 = runtime::ConcurrentExecutor<targets::Qwen3_5_0_8BInstance>;
     using Executor2B = runtime::ConcurrentExecutor<targets::Qwen3_5_2BInstance>;
     using Executor4B = runtime::ConcurrentExecutor<targets::Qwen3_5_4BInstance>;
@@ -156,7 +157,8 @@ public:
     using ExecutorPP   = runtime::ConcurrentExecutor<targets::Qwen38FlashNextPipeline>;
     using ExecutorPP27 = runtime::ConcurrentExecutor<targets::Qwen3_6_27BPipeline>;
     using ExecutorPP35 = runtime::ConcurrentExecutor<targets::Qwen3_6_35BA3BPipeline>;
-    using Executor   = std::variant<std::monostate, std::unique_ptr<Executor08>,
+    using Executor   = std::variant<std::monostate, std::unique_ptr<ExecutorQwen3>,
+                                  std::unique_ptr<Executor08>,
                                   std::unique_ptr<Executor2B>, std::unique_ptr<Executor4B>,
                                   std::unique_ptr<Executor27>, std::unique_ptr<Executor35>,
                                   std::unique_ptr<ExecutorFN>, std::unique_ptr<ExecutorPP>,
@@ -213,7 +215,9 @@ public:
             [&](auto& target_ptr) -> Executor {
                 using Instance =
                     typename std::remove_reference_t<decltype(target_ptr)>::element_type;
-                if constexpr (std::is_same_v<Instance, targets::Qwen3_5_0_8BInstance>) {
+                if constexpr (std::is_same_v<Instance, targets::Qwen3DenseInstance>) {
+                    return std::make_unique<ExecutorQwen3>(*target_ptr, options);
+                } else if constexpr (std::is_same_v<Instance, targets::Qwen3_5_0_8BInstance>) {
                     return std::make_unique<Executor08>(*target_ptr, options);
                 } else if constexpr (std::is_same_v<Instance, targets::Qwen3_5_2BInstance>) {
                     return std::make_unique<Executor2B>(*target_ptr, options);

@@ -5,6 +5,7 @@
 #include <array>
 #include <limits>
 #include <stdexcept>
+#include <string>
 
 namespace sinfer::ops::detail {
 namespace {
@@ -44,6 +45,16 @@ constexpr std::array<RouteSpec, 4> kTarget4BRoutes{{
     {129, kAnyCols, W8AttnInputScheduleId::MmaR64C128},
 }};
 
+// Qwen3-0.6B's ungated fused qkv: rows 4096 = q2048 | k1024 | v1024 at hidden
+// 1024. Same four-band structure as the gated target tables; the bands were not
+// measured for this shape, they are the family's defaults for a small parent.
+constexpr std::array<RouteSpec, 4> kQwen3Routes{{
+    {1, 1, W8AttnInputScheduleId::DecodeR8Direct},
+    {2, 64, W8AttnInputScheduleId::SplitKMmaDirect},
+    {65, 128, W8AttnInputScheduleId::MmaR32C128},
+    {129, kAnyCols, W8AttnInputScheduleId::MmaR64C128},
+}};
+
 constexpr std::array<RouteSpec, 9> kCompanionRoutes{{
     {1, 1, W8AttnInputScheduleId::DecodeR8Direct},
     {2, 96, W8AttnInputScheduleId::SplitKMmaDirect},
@@ -67,7 +78,7 @@ constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes) {
 }
 
 static_assert(catalog_is_closed(kTargetRoutes) && catalog_is_closed(kTarget2BRoutes) &&
-                  catalog_is_closed(kTarget4BRoutes),
+                  catalog_is_closed(kTarget4BRoutes) && catalog_is_closed(kQwen3Routes),
               "W8 target attention input routes must be exact and closed");
 static_assert(catalog_is_closed(kCompanionRoutes),
               "W8 companion attention input routes must be exact and closed");
@@ -75,6 +86,15 @@ static_assert(catalog_is_closed(kCompanionRoutes),
 bool is_companion_shape(const W8AttnInputProblem& problem) noexcept {
     return problem.input_rows == 2048 && problem.query_rows == 4096 && problem.kv_rows == 1024 &&
            problem.parent_rows == 6144 && problem.padded_k == 2048;
+}
+
+// The other three-output (ungated) shape: Qwen3-0.6B, 16 query heads and 8 KV
+// heads at head dim 128 over hidden 1024. It shares the companion's public entry
+// point and nothing else -- different parent, different hidden, different row
+// split -- so it is keyed separately rather than folded into that predicate.
+bool is_qwen3_ungated_shape(const W8AttnInputProblem& problem) noexcept {
+    return problem.input_rows == 1024 && problem.query_rows == 2048 && problem.kv_rows == 1024 &&
+           problem.parent_rows == 4096 && problem.padded_k == 1024;
 }
 
 bool supported_shape(const W8AttnInputProblem& problem) noexcept {
@@ -92,6 +112,7 @@ bool supported_shape(const W8AttnInputProblem& problem) noexcept {
                           problem.parent_rows == 10240 && problem.input_rows == 2560 &&
                           problem.padded_k == 2560;
     if (q4b_qkgv) { return true; }
+    if (is_qwen3_ungated_shape(problem)) { return true; }
     return problem.input_rows == 2048 && problem.padded_k == 2048 &&
            (target_qkgv || is_companion_shape(problem));
 }
@@ -131,7 +152,12 @@ bool w8_attn_input_admits(const W8AttnInputProblem& problem) noexcept {
 W8AttnInputPlan w8_attn_input_resolve_plan(const W8AttnInputProblem& problem) {
     if (!w8_attn_input_admits(problem)) {
         throw std::invalid_argument(
-            "W8 attention input: exact problem or column count is not admitted");
+            "W8 attention input: no registered geometry for parent rows " +
+            std::to_string(problem.parent_rows) + " (query " +
+            std::to_string(problem.query_rows) + " | kv " + std::to_string(problem.kv_rows) +
+            ") over k " + std::to_string(problem.padded_k) + " at T " +
+            std::to_string(problem.cols) +
+            "; register the shape in w8_attn_input_plan.cpp and instantiate its launchers");
     }
     const auto resolve_from = [&](const auto& routes) -> W8AttnInputPlan {
         for (const RouteSpec& route : routes) {
@@ -142,6 +168,7 @@ W8AttnInputPlan w8_attn_input_resolve_plan(const W8AttnInputProblem& problem) {
         throw std::logic_error("W8 attention input: admitted problem has no covering route");
     };
     if (is_companion_shape(problem)) { return resolve_from(kCompanionRoutes); }
+    if (is_qwen3_ungated_shape(problem)) { return resolve_from(kQwen3Routes); }
     if (problem.parent_rows == 5120 && problem.input_rows == 2048) {
         return resolve_from(kTarget2BRoutes);
     }
@@ -201,10 +228,12 @@ void w8_attn_input_execute_plan(const W8AttnInputPlan& plan, const Tensor& x, co
     const W8AttnInputProblem problem{x.ne[0], q.ne[0], k.ne[0], weight.n, weight.padded_shape[1],
                                      x.ne[1]};
     const W8AttnInputPlan resolved = w8_attn_input_resolve_plan(problem);
-    if (problem.parent_rows != 6144 || problem.kv_rows != 1024 ||
+    if (!(is_companion_shape(problem) || is_qwen3_ungated_shape(problem)) ||
         resolved.schedule != plan.schedule) {
         throw std::invalid_argument(
-            "W8 attention input: plan does not match exact three-output problem");
+            "W8 attention input: plan does not match exact three-output problem (parent rows " +
+            std::to_string(problem.parent_rows) + ", k " + std::to_string(problem.padded_k) +
+            ", T " + std::to_string(problem.cols) + ")");
     }
     switch (plan.schedule) {
     case W8AttnInputScheduleId::DecodeR8Direct:

@@ -938,7 +938,8 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
                            batch_text_kv_->batch_layer_view(fidx), *active_gqa_envelope_, work_, a,
                            s, selection);
     }
-    ops::sigmoid_mul(gate, a, s);
+    // A dense stack writes no gate rows; see attention_output_gate<Variant>().
+    if constexpr (kAttentionOutputGate) { ops::sigmoid_mul(gate, a, s); }
 
     Variant::attention_output_projection(a.view({kCfg.q_size, T}), *w.o_proj, x, ph, work_, s);
 }
@@ -1631,7 +1632,8 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                                        kAttnScale, batch_text_kv_->batch_layer_view(fidx),
                                        decode.envelope, work_, ab, s, decode_selection);
                 }
-                ops::sigmoid_mul(gate, a, s);
+                // A dense stack writes no gate rows; see attention_output_gate<Variant>().
+                if constexpr (kAttentionOutputGate) { ops::sigmoid_mul(gate, a, s); }
                 Variant::attention_output_projection(a.view({kCfg.q_size, total}), *full.o_proj, x,
                                                      Phase::Prefill, work_, s);
                 if (timing) { lap(timer.begin, timer.attn, acc_attn); }
@@ -2047,7 +2049,8 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
                                        kAttnScale, batch_text_kv_->batch_layer_view(fidx),
                                        decode_envelope, work_, ab, s, decode_selection);
                 }
-                ops::sigmoid_mul(gate, a, s);
+                // A dense stack writes no gate rows; see attention_output_gate<Variant>().
+                if constexpr (kAttentionOutputGate) { ops::sigmoid_mul(gate, a, s); }
                 Variant::attention_output_projection(a.view({kCfg.q_size, total}), *full.o_proj, x,
                                                      Phase::Prefill, work_, s);
             }

@@ -60,6 +60,22 @@ template <class Variant>
     }
 }
 
+/// Whether the attention output is gated. Every hybrid target in the family fuses
+/// an output gate beside the query rows of its attention projection and
+/// multiplies the attention result by its logistic sigmoid, so that is the
+/// default and no existing target declares anything. A plain GQA stack (Qwen3,
+/// Llama, Gemma) writes no gate rows: it declares `attention_output_gate =
+/// false` and the family skips the multiply rather than applying it to whatever
+/// the unwritten gate plane happened to hold.
+template <class Variant>
+[[nodiscard]] constexpr bool attention_output_gate() {
+    if constexpr (requires { Variant::attention_output_gate; }) {
+        return Variant::attention_output_gate;
+    } else {
+        return true;
+    }
+}
+
 /// Activation of the GDN output gate (`z`): SiLU unless the variant declares otherwise
 /// (Qwen3.8-Flash-Next gates with the logistic sigmoid).
 template <class Variant>

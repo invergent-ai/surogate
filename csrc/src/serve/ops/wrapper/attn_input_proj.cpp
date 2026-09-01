@@ -308,12 +308,26 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight,
 
 void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tensor& q, Tensor& k,
                      Tensor& v, cudaStream_t stream) {
-    constexpr std::int32_t kHidden = 2048;
-    constexpr std::int32_t kQRows  = 4096;
-    constexpr std::int32_t kKvRows = 1024;
-    constexpr std::int32_t kRows   = 6144;
-    const std::int32_t cols        = x.ne[1];
-    if (cols <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
+    // Two registered ungated parents, keyed on parent rows the way the gated
+    // dispatch above is: 6144 = q4096 | k1024 | v1024 over hidden 2048 (the
+    // Qwen3.6 companion), and 4096 = q2048 | k1024 | v1024 over hidden 1024
+    // (Qwen3-0.6B, 16 query heads and 8 KV heads at head dim 128).
+    const std::int32_t kRows   = query_key_value_weight.n;
+    const std::int32_t kHidden = query_key_value_weight.k;
+    const std::int32_t cols    = x.ne[1];
+    const auto refuse          = [&](const char* why) {
+        throw std::invalid_argument(std::string("attn_input_proj: ") + why +
+                                    " (parent rows n=" + std::to_string(kRows) +
+                                    ", k=" + std::to_string(kHidden) +
+                                    ", T=" + std::to_string(cols) + ")");
+    };
+    if (cols <= 0) { refuse("T must be positive"); }
+    if (!((kRows == 6144 && kHidden == 2048) || (kRows == 4096 && kHidden == 1024))) {
+        refuse("no registered ungated query/key/value geometry; register the shape in "
+               "w8_attn_input_plan.cpp and instantiate its launchers");
+    }
+    const std::int32_t kQRows  = kRows == 6144 ? 4096 : 2048;
+    const std::int32_t kKvRows = 1024;
     require_matrix(x, kHidden, cols, "x");
     require_matrix(q, kQRows, cols, "q");
     require_matrix(k, kKvRows, cols, "k");
