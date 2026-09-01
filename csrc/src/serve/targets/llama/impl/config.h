@@ -1,8 +1,8 @@
 #pragma once
 
-#include <api/targets/qwen3_6/frontend.h>
-#include <api/targets/qwen3_6/hybrid_topology.h>
-#include <api/targets/qwen3_6/vision.h>
+#include <api/family/frontend.h>
+#include <api/family/hybrid_topology.h>
+#include <api/family/vision.h>
 
 #include <cstdint>
 
@@ -63,7 +63,7 @@ struct TextConfig {
 static_assert(TextConfig::full_attention_layers() == 22);
 static_assert(TextConfig::gdn_layers() == 0);
 
-struct VisionConfig : qwen3_6::VisionBackboneConfig {
+struct VisionConfig : family::VisionBackboneConfig {
     static constexpr int output_hidden = TextConfig::hidden;
 };
 

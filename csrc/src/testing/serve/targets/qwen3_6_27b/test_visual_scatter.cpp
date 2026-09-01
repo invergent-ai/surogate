@@ -1,6 +1,6 @@
 #include "ops/op_tester.h"
 #include "targets/qwen3_6_27b/impl/config.h"
-#include "targets/qwen3_6/impl/runtime/visual_scatter.h"
+#include "family/impl/runtime/visual_scatter.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -40,13 +40,13 @@ int main() {
         DeviceBuffer dinput = to_device_bf16(token_embeddings);
         Tensor input(dinput.p, DType::BF16, {d, t});
         work.reset();
-        const auto window = targets::qwen3_6::plan_mtp_alignment_window(
+        const auto window = family::plan_mtp_alignment_window(
             static_cast<std::uint32_t>(prompt_tokens), 0, t);
-        const auto overlap = targets::qwen3_6::shifted_visual_overlap(
+        const auto overlap = family::shifted_visual_overlap(
             scatter_indices, static_cast<std::uint32_t>(prompt_tokens), window);
         Tensor destination_indices =
             work.alloc(DType::I32, {static_cast<std::int32_t>(overlap.size())});
-        targets::qwen3_6::detail::scatter_shifted_visual_embeddings(input, visual, overlap,
+        family::detail::scatter_shifted_visual_embeddings(input, visual, overlap,
                                                                     destination_indices, nullptr);
         cudaDeviceSynchronize();
 

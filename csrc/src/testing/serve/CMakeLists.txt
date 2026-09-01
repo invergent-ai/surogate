@@ -95,15 +95,15 @@ set_tests_properties(
   sinfer_state_store_test
   PROPERTIES SKIP_RETURN_CODE 77)
 # Family frontend and one opt-in real-artifact prefix/MTP integration test.
-sinfer_add_test(sinfer_qwen3_6_frontend_test
-  SOURCES targets/qwen3_6/test_frontend.cpp
+sinfer_add_test(sinfer_family_frontend_test
+  SOURCES family/test_frontend.cpp
   NEEDS_SOURCE_DIR
   LIBRARIES sinfer_engine sinfer_core)
-target_include_directories(sinfer_qwen3_6_frontend_test PRIVATE
-  ${SERVE_ROOT}/targets/qwen3_6/export
-  ${SERVE_ROOT}/targets/qwen3_6/impl)
-sinfer_add_test(sinfer_qwen3_6_runtime_mechanisms_test
-  SOURCES targets/qwen3_6/test_runtime_mechanisms.cpp
+target_include_directories(sinfer_family_frontend_test PRIVATE
+  ${SERVE_ROOT}/family/export
+  ${SERVE_ROOT}/family/impl)
+sinfer_add_test(sinfer_family_runtime_mechanisms_test
+  SOURCES family/test_runtime_mechanisms.cpp
   LIBRARIES sinfer_engine sinfer_core)
 sinfer_add_test(sinfer_qwen3_6_27b_prefix_real_test
   SOURCES targets/qwen3_6_27b/test_engine_prefix_real.cpp
@@ -130,7 +130,7 @@ sinfer_add_test(sinfer_qwen3_6_27b_load_plan_test
   NEEDS_SOURCE_DIR
   LIBRARIES sinfer_engine)
 target_include_directories(sinfer_qwen3_6_27b_load_plan_test PRIVATE
-  ${SERVE_ROOT}/targets/qwen3_6/export
+  ${SERVE_ROOT}/family/export
   ${SERVE_ROOT}/targets/qwen3_6_27b/export)
 target_link_libraries(sinfer_qwen3_6_27b_load_plan_test PRIVATE CUDA::cudart)
 set_tests_properties(sinfer_qwen3_6_27b_load_plan_test PROPERTIES SKIP_RETURN_CODE 77)
@@ -147,7 +147,7 @@ sinfer_add_test(sinfer_qwen3_6_35b_a3b_dflash_load_plan_test
   NEEDS_SOURCE_DIR
   LIBRARIES sinfer_engine)
 target_include_directories(sinfer_qwen3_6_35b_a3b_dflash_load_plan_test PRIVATE
-  ${SERVE_ROOT}/targets/qwen3_6/export
+  ${SERVE_ROOT}/family/export
   ${SERVE_ROOT}/targets/qwen3_6_35b_a3b/export)
 target_link_libraries(sinfer_qwen3_6_35b_a3b_dflash_load_plan_test PRIVATE CUDA::cudart)
 set_tests_properties(sinfer_qwen3_6_35b_a3b_dflash_load_plan_test
@@ -358,5 +358,5 @@ foreach(test_target IN LISTS sinfer_qwen3_6_27b_internal_tests)
   target_include_directories(${test_target} PRIVATE
     ${SERVE_ROOT}/targets/qwen3_6_27b/impl
     ${SERVE_ROOT}/targets/qwen3_6_27b/export
-    ${SERVE_ROOT}/targets/qwen3_6/export)
+    ${SERVE_ROOT}/family/export)
 endforeach()

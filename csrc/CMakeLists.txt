@@ -1355,7 +1355,7 @@ target_compile_definitions(sinfer_engine PRIVATE FMT_HEADER_ONLY=1)
 sinfer_internal_includes(sinfer_engine)
 target_include_directories(sinfer_engine PUBLIC ${SERVE_ROOT})
 
-add_subdirectory(${SERVE_ROOT}/targets/qwen3_6 serve_t_qwen3_6 EXCLUDE_FROM_ALL)
+add_subdirectory(${SERVE_ROOT}/family serve_family EXCLUDE_FROM_ALL)
 add_subdirectory(${SERVE_ROOT}/targets/qwen3 serve_t_qwen3 EXCLUDE_FROM_ALL)
 add_subdirectory(${SERVE_ROOT}/targets/llama serve_t_llama EXCLUDE_FROM_ALL)
 add_subdirectory(${SERVE_ROOT}/targets/qwen3_5_0_8b serve_t_qwen3_5_0_8b EXCLUDE_FROM_ALL)

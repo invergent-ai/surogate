@@ -1,7 +1,7 @@
 #include <api/targets/qwen4exp/package.h>
-#include "targets/qwen3_6/impl/lora_bind.h"
-#include <api/targets/qwen3_6/frontend_resources.h>
-#include <api/targets/qwen3_6/prepared_prompt.h>
+#include "family/impl/lora_bind.h"
+#include <api/family/frontend_resources.h>
+#include <api/family/prepared_prompt.h>
 
 #include "artifact/reader.h"
 #include "ops/linear/bf16/bf16_cublaslt.h"
@@ -81,7 +81,7 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
 
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
                                      WeightsProfile weights_profile) {
-    const qwen3_6::StartupFeatures features = qwen3_6::startup_features(options);
+    const family::StartupFeatures features = family::startup_features(options);
     if (features.vision) {
         throw std::runtime_error("qwen3.8-flash-next: vision is not served by this target");
     }
@@ -119,7 +119,7 @@ Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&
 namespace {
 
 void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& options) {
-    qwen3_6::bind_lora_moe_hybrid<detail::TextConfig>(runtime, options, [](std::size_t layer) {
+    family::bind_lora_moe_hybrid<detail::TextConfig>(runtime, options, [](std::size_t layer) {
         return detail::TextConfig::is_full_attention(static_cast<int>(layer));
     });
 }
@@ -129,8 +129,8 @@ void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& opt
 Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineOptions& options) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
     bind_lora(model.impl_->data.runtime, options);
-    return qwen3_6::make_frontend(model.impl_->data.frontend,
-                                  qwen3_6::FrontendOptions{
+    return family::make_frontend(model.impl_->data.frontend,
+                                  family::FrontendOptions{
                                       .vision_enabled = false,
                                       .max_context    = options.max_context,
                                       .media_cache_bytes        = options.media_cache_bytes,
@@ -176,7 +176,7 @@ Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
         detail::Variant::prewarm_device_scratch();
         CUDA_CHECK(cudaSetDevice(previous));
     }
-    return qwen3_6::make_sequence_planner<detail::Variant>(device, options, weights_profile);
+    return family::make_sequence_planner<detail::Variant>(device, options, weights_profile);
 }
 
 std::unique_ptr<Package::Program>
@@ -187,7 +187,7 @@ Package::create_program(const LoadedModel& model, SequencePlan&& plan, DeviceCon
     ops::detail::bf16_cublaslt_prewarm();
     detail::Variant::prewarm_device_scratch();
     detail::Variant::prepare_expert_split(model.impl_->data.runtime);
-    return qwen3_6::create_program<detail::Variant>(
+    return family::create_program<detail::Variant>(
         model.impl_->data.runtime, model.impl_->weights_profile, std::move(plan), device);
 }
 

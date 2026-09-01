@@ -475,10 +475,10 @@ void validate_draft_ids(const artifact::Binder& binder, artifact::ObjectHandle h
 } // namespace
 
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
-                               qwen3_6::StartupFeatures features) {
+                               family::StartupFeatures features) {
     ArtifactLoadPlan load_plan;
     BindingPlan& out = load_plan.bindings;
-    out.frontend     = qwen3_6::bind_frontend_resources(binder);
+    out.frontend     = family::bind_frontend_resources(binder);
     out.features     = features;
 
     const NumericFormat vocabulary_format = endpoint_format(weights_profile);
@@ -544,13 +544,13 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     const artifact::TensorPlacement vision_placement =
         features.vision ? artifact::TensorPlacement::Device
                         : artifact::TensorPlacement::ValidateOnly;
-    out.vision_backbone     = qwen3_6::bind_vision_backbone<qwen3_6::VisionBackboneConfig>(binder, vision_placement);
-    out.vision_merger_input = qwen3_6::bind_vision_merger_input<qwen3_6::VisionBackboneConfig>(binder, vision_placement);
+    out.vision_backbone     = family::bind_vision_backbone<family::VisionBackboneConfig>(binder, vision_placement);
+    out.vision_merger_input = family::bind_vision_merger_input<family::VisionBackboneConfig>(binder, vision_placement);
     out.vision_merger_fc2   = artifact::bind_tensor(
         binder, "vision/merger/fc2", NumericFormat::W8G32_F16S, {5120, 4608}, vision_placement);
     out.vision_merger_fc2_bias = artifact::bind_tensor(
         binder, "vision/merger/fc2_bias", NumericFormat::BF16, {5120}, vision_placement);
-    out.vision_merger_norm = qwen3_6::bind_vision_merger_norm<qwen3_6::VisionBackboneConfig>(binder, vision_placement);
+    out.vision_merger_norm = family::bind_vision_merger_norm<family::VisionBackboneConfig>(binder, vision_placement);
 
     load_plan.materialization = binder.finish();
     return load_plan;
@@ -558,7 +558,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
 
 LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized)
     : backing(std::move(materialized)) {
-    frontend = qwen3_6::take_frontend_resources(backing, plan.frontend);
+    frontend = family::take_frontend_resources(backing, plan.frontend);
 
     runtime.weights_arena = &backing.device_arena();
     runtime.features      = plan.features;
@@ -651,7 +651,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
 
     if (plan.features.vision) {
         auto& vision  = runtime.vision.emplace();
-        vision.common = qwen3_6::materialize_vision_common<qwen3_6::VisionBackboneConfig>(
+        vision.common = family::materialize_vision_common<family::VisionBackboneConfig>(
             backing, plan.vision_backbone, plan.vision_merger_input, plan.vision_merger_norm);
         vision.merger_fc2      = artifact::materialized_weight(backing, plan.vision_merger_fc2,
                                                                NumericFormat::W8G32_F16S, 5120, 4608);

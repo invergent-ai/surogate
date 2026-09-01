@@ -31,8 +31,8 @@ static_assert(TextConfig::query_projection_rows == TextConfig::query_size,
 /// which Qwen3-0.6B does not publish. The unfilled halves of the plan stay
 /// default-constructed and `take_text_only_frontend_resources` leaves their
 /// strings empty, which is what the frontend reads as "no pixel pipeline".
-qwen3_6::FrontendResourcePlan bind_text_only_frontend_resources(artifact::Binder& binder) {
-    qwen3_6::FrontendResourcePlan plan;
+family::FrontendResourcePlan bind_text_only_frontend_resources(artifact::Binder& binder) {
+    family::FrontendResourcePlan plan;
     plan.tokenizer_json = artifact::bind_raw_resource(binder, "frontend/tokenizer.json");
     plan.tokenizer_config_json =
         artifact::bind_raw_resource(binder, "frontend/tokenizer_config.json");
@@ -48,10 +48,10 @@ std::string take_resource_string(artifact::MaterializedArtifact& materialized,
     return std::string(reinterpret_cast<const char*>(bytes.data()), bytes.size());
 }
 
-qwen3_6::FrontendResources
+family::FrontendResources
 take_text_only_frontend_resources(artifact::MaterializedArtifact& materialized,
-                                  const qwen3_6::FrontendResourcePlan& plan) {
-    qwen3_6::FrontendResources out;
+                                  const family::FrontendResourcePlan& plan) {
+    family::FrontendResources out;
     out.tokenizer_json         = take_resource_string(materialized, plan.tokenizer_json);
     out.tokenizer_config_json  = take_resource_string(materialized, plan.tokenizer_config_json);
     out.chat_template_jinja    = take_resource_string(materialized, plan.chat_template_jinja);
@@ -118,7 +118,7 @@ void bind_text_layers(artifact::Binder& binder, WeightsProfile weights_profile, 
 } // namespace
 
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
-                               qwen3_6::StartupFeatures features) {
+                               family::StartupFeatures features) {
     ArtifactLoadPlan load_plan;
     BindingPlan& out = load_plan.bindings;
     out.frontend     = bind_text_only_frontend_resources(binder);

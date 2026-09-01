@@ -2,10 +2,10 @@
 
 #include <memory>
 #include <api/targets/qwen4exp/package.h>
-#include <api/targets/qwen3_6/frontend_resources.h>
-#include <api/targets/qwen3_6/model_view.h>
-#include <api/targets/qwen3_6/startup_features.h>
-#include <api/targets/qwen3_6/vision.h>
+#include <api/family/frontend_resources.h>
+#include <api/family/model_view.h>
+#include <api/family/startup_features.h>
+#include <api/family/vision.h>
 
 #include "api/ops/hyper_connection.h"
 #include "api/ops/ngram_ple.h"
@@ -94,8 +94,8 @@ struct TextLayerPlan {
 };
 
 struct BindingPlan {
-    qwen3_6::FrontendResourcePlan frontend;
-    qwen3_6::StartupFeatures features;
+    family::FrontendResourcePlan frontend;
+    family::StartupFeatures features;
     bool host_bank_q4 = false; // the routed expert objects are requantised to Q4G32AM
     artifact::ObjectHandle token_embedding;
     std::array<TextLayerPlan, kTextLayers> text_layers;
@@ -110,11 +110,11 @@ struct BindingPlan {
     // The vision tower. Flash-Next ships the same 27x1152 tower the Qwen3.6 targets
     // do, so the family's default VisionBackboneConfig describes it exactly and no
     // per-target geometry is needed here.
-    qwen3_6::VisionBackbonePlan vision_backbone;
-    qwen3_6::VisionMergerInputPlan vision_merger_input;
+    family::VisionBackbonePlan vision_backbone;
+    family::VisionMergerInputPlan vision_merger_input;
     artifact::ObjectHandle vision_merger_fc2;
     artifact::ObjectHandle vision_merger_fc2_bias;
-    qwen3_6::VisionMergerNormPlan vision_merger_norm;
+    family::VisionMergerNormPlan vision_merger_norm;
     //: false when the source carried no tower (GGUF exports drop it).
     bool has_vision = false;
     // Host-resident objects are copied out of the artifact mapping while the reader lives.
@@ -128,7 +128,7 @@ struct ArtifactLoadPlan {
 
 /// `stage_first/stage_last` (0/0 = every layer) restrict device residency to the layers of a
 /// pipeline stage.
-ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeatures features,
+ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures features,
                                int stage_first = 0, int stage_last = 0,
                                bool host_bank_q4 = false);
 
@@ -177,9 +177,9 @@ struct PleWeights {
 };
 
 using FamilyModelView =
-    qwen3_6::ModelView<AttentionProjectionPayload, GdnProjectionPayload, SparseMoePayload,
+    family::ModelView<AttentionProjectionPayload, GdnProjectionPayload, SparseMoePayload,
                        AttentionProjectionPayload, SparseMoePayload,
-                       qwen3_6::DFlashWeights<1>, kFullAttentionLayers, kGdnLayers>;
+                       family::DFlashWeights<1>, kFullAttentionLayers, kGdnLayers>;
 
 /// The family view plus what the residual hooks need: the output mixer and the PLE layer.
 struct RuntimeModelView : FamilyModelView {
@@ -191,7 +191,7 @@ using FullAttentionWeights = RuntimeModelView::FullLayer;
 using GdnWeights           = RuntimeModelView::GdnLayer;
 using MtpWeights           = RuntimeModelView::MtpLayer;
 using DFlashWeights        = RuntimeModelView::DFlash;
-using DFlashLayerWeights   = qwen3_6::DFlashLayerWeights;
+using DFlashLayerWeights   = family::DFlashLayerWeights;
 
 class LoadedModelData {
 public:
@@ -204,7 +204,7 @@ public:
 
     artifact::MaterializedArtifact backing;
     std::shared_ptr<HostBank> host_bank; // shared by the pipeline stages of one process
-    qwen3_6::FrontendResources frontend;
+    family::FrontendResources frontend;
     RuntimeModelView runtime;
 };
 

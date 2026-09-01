@@ -1,10 +1,10 @@
 #pragma once
 
 #include <api/targets/qwen3/package.h>
-#include <api/targets/qwen3_6/frontend_resources.h>
-#include <api/targets/qwen3_6/model_view.h>
-#include <api/targets/qwen3_6/startup_features.h>
-#include <api/targets/qwen3_6/vision.h>
+#include <api/family/frontend_resources.h>
+#include <api/family/model_view.h>
+#include <api/family/startup_features.h>
+#include <api/family/vision.h>
 
 #include "artifact/binder.h"
 #include "artifact/materializer.h"
@@ -56,10 +56,10 @@ struct BindingPlan {
     /// Only four of the family plan's six slots are filled. Qwen3-0.6B publishes
     /// no image or video preprocessor config, and the loader refuses an artifact
     /// carrying an object no binder consumed -- so this target binds its own
-    /// four rather than reusing `qwen3_6::bind_frontend_resources`, which would
+    /// four rather than reusing `family::bind_frontend_resources`, which would
     /// demand two objects the artifact does not have.
-    qwen3_6::FrontendResourcePlan frontend;
-    qwen3_6::StartupFeatures features;
+    family::FrontendResourcePlan frontend;
+    family::StartupFeatures features;
 
     WeightPlan token_embedding;
     std::array<TextLayerPlan, kTextLayers> text_layers;
@@ -75,7 +75,7 @@ struct ArtifactLoadPlan {
 };
 
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
-                               qwen3_6::StartupFeatures features);
+                               family::StartupFeatures features);
 
 struct DensePostMixerPayload {
     Weight gate_up;
@@ -105,8 +105,8 @@ struct MtpAttentionPayload {
 };
 
 using RuntimeModelView =
-    qwen3_6::ModelView<FusedAttentionProjectionPayload, GdnProjectionPayload, DensePostMixerPayload,
-                       MtpAttentionPayload, DensePostMixerPayload, qwen3_6::DFlashWeights<1>,
+    family::ModelView<FusedAttentionProjectionPayload, GdnProjectionPayload, DensePostMixerPayload,
+                       MtpAttentionPayload, DensePostMixerPayload, family::DFlashWeights<1>,
                        kFullAttentionLayers, kGdnLayers>;
 using FullAttentionWeights = RuntimeModelView::FullLayer;
 using GdnWeights           = RuntimeModelView::GdnLayer;
@@ -122,7 +122,7 @@ public:
     LoadedModelData& operator=(LoadedModelData&&)      = delete;
 
     artifact::MaterializedArtifact backing;
-    qwen3_6::FrontendResources frontend;
+    family::FrontendResources frontend;
     RuntimeModelView runtime;
 };
 

@@ -3,8 +3,8 @@
 #include "api/types.h"
 #include "runtime/contract/types.h"
 #include "runtime/contract/transient_region.h"
-#include <api/targets/qwen3_6/frontend.h>
-#include <api/targets/qwen3_6/runtime.h>
+#include <api/family/frontend.h>
+#include <api/family/runtime.h>
 
 #include <cstdint>
 #include <memory>
@@ -39,9 +39,9 @@ enum class WeightsProfile : std::uint8_t {
     Qwen38Nvfp4All,
 };
 
-using Frontend       = qwen3_6::Frontend;
-using PreparedPrompt = qwen3_6::PreparedPrompt;
-using OutputSession  = qwen3_6::OutputSession;
+using Frontend       = family::Frontend;
+using PreparedPrompt = family::PreparedPrompt;
+using OutputSession  = family::OutputSession;
 
 class LoadPlan {
 public:
@@ -97,11 +97,11 @@ struct Package {
     using Frontend        = detail::Frontend;
     using PreparedPrompt  = detail::PreparedPrompt;
     using OutputSession   = detail::OutputSession;
-    using SequencePlanner = qwen3_6::SequencePlanner<detail::Variant>;
-    using SequencePlan    = qwen3_6::SequencePlan<detail::Variant>;
-    using RequestBasePlan = qwen3_6::RequestBasePlan<detail::Variant>;
-    using RequestPlan     = qwen3_6::RequestPlan<detail::Variant>;
-    using Program         = qwen3_6::Program<detail::Variant>;
+    using SequencePlanner = family::SequencePlanner<detail::Variant>;
+    using SequencePlan    = family::SequencePlan<detail::Variant>;
+    using RequestBasePlan = family::RequestBasePlan<detail::Variant>;
+    using RequestPlan     = family::RequestPlan<detail::Variant>;
+    using Program         = family::Program<detail::Variant>;
 
     [[nodiscard]] static ModelSamplingDefaults sampling_defaults(std::string_view model);
     [[nodiscard]] static WeightsProfile resolve_weights(const artifact::ArtifactIdentity& identity);

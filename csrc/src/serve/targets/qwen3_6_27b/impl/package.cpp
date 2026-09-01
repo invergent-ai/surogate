@@ -1,7 +1,7 @@
 #include <api/targets/qwen3_6_27b/package.h>
-#include "targets/qwen3_6/impl/lora_bind.h"
-#include <api/targets/qwen3_6/frontend_resources.h>
-#include <api/targets/qwen3_6/prepared_prompt.h>
+#include "family/impl/lora_bind.h"
+#include <api/family/frontend_resources.h>
+#include <api/family/prepared_prompt.h>
 
 #include "artifact/reader.h"
 #include "targets/qwen3_6_27b/impl/load/bindings.h"
@@ -109,7 +109,7 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
                                      WeightsProfile weights_profile) {
     return LoadPlan(std::make_unique<LoadPlan::Impl>(
         weights_profile,
-        detail::bind_artifact(binder, weights_profile, qwen3_6::startup_features(options))));
+        detail::bind_artifact(binder, weights_profile, family::startup_features(options))));
 }
 
 std::unique_ptr<Package::LoadedModel>
@@ -124,7 +124,7 @@ Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&
 namespace {
 
 void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& options) {
-    qwen3_6::bind_lora_hybrid<detail::TextConfig, detail::FusedAttentionProjectionPayload>(
+    family::bind_lora_hybrid<detail::TextConfig, detail::FusedAttentionProjectionPayload>(
         runtime, options, [](std::size_t layer) { return layer >= 3 && (layer - 3) % 4 == 0; });
 }
 
@@ -133,8 +133,8 @@ void bind_lora(const detail::RuntimeModelView& runtime, const EngineOptions& opt
 Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineOptions& options) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
     bind_lora(model.impl_->data.runtime, options);
-    return qwen3_6::make_frontend(model.impl_->data.frontend,
-                                  qwen3_6::FrontendOptions{
+    return family::make_frontend(model.impl_->data.frontend,
+                                  family::FrontendOptions{
                                       .vision_enabled = model.impl_->data.runtime.features.vision,
                                       .max_context    = options.max_context,
                                       .media_cache_bytes        = options.media_cache_bytes,
@@ -147,13 +147,13 @@ Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineO
 Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
                                                         const EngineOptions& options,
                                                         WeightsProfile weights_profile) {
-    return qwen3_6::make_sequence_planner<detail::Variant>(device, options, weights_profile);
+    return family::make_sequence_planner<detail::Variant>(device, options, weights_profile);
 }
 
 std::unique_ptr<Package::Program>
 Package::create_program(const LoadedModel& model, SequencePlan&& plan, DeviceContext& device) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
-    return qwen3_6::create_program<detail::Variant>(
+    return family::create_program<detail::Variant>(
         model.impl_->data.runtime, model.impl_->weights_profile, std::move(plan), device);
 }
 

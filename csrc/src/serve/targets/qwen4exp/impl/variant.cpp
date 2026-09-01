@@ -1,7 +1,7 @@
 #include "targets/qwen4exp/impl/variant.h"
 #include "core/numa.h"
 
-#include "targets/qwen3_6/impl/lora_hook.h"
+#include "family/impl/lora_hook.h"
 #include "api/ops/causal_conv1d_silu.h"
 #include "api/ops/embedding.h"
 #include "api/ops/gdn_gating.h"
@@ -32,9 +32,9 @@
 #include <unordered_map>
 #include <vector>
 
-#define SINFER_QWEN36_VARIANT    ::sinfer::targets::qwen4exp::detail::Variant
-#define SINFER_QWEN36_RUNTIME_NS qwen4exp_runtime
-#include "targets/qwen3_6/impl/runtime/instantiate.h"
+#define SINFER_FAMILY_VARIANT    ::sinfer::targets::qwen4exp::detail::Variant
+#define SINFER_FAMILY_RUNTIME_NS qwen4exp_runtime
+#include "family/impl/runtime/instantiate.h"
 
 namespace sinfer::targets::qwen4exp::detail {
 namespace {
@@ -1468,7 +1468,7 @@ void Variant::post_mixer_norm(const Tensor& residual, const PostMixerWeights& we
 }
 
 void Variant::layer_prologue(const ModelView& model, int layer, Tensor& residual,
-                             const qwen3_6::detail::PrologueColumns& columns,
+                             const family::detail::PrologueColumns& columns,
                              NgramPleStatePool* ple_state, WorkspaceArena& workspace,
                              cudaStream_t stream) {
     maybe_dump_layer(layer, residual, stream);
@@ -1524,7 +1524,7 @@ std::size_t Variant::layer_prologue_workspace_capacity_bytes(std::int32_t first,
 
 void Variant::attention_projection(const Tensor& hidden,
                                    const FullAttentionProjectionWeights& weights, Tensor& query,
-                                   Tensor& gate, Tensor& key, Tensor& value, qwen3_6::TextPhase,
+                                   Tensor& gate, Tensor& key, Tensor& value, family::TextPhase,
                                    WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope                = workspace.scope();
     const std::int32_t tokens = hidden.ne[1];
@@ -1536,18 +1536,18 @@ void Variant::attention_projection(const Tensor& hidden,
     ops::extract_bf16_columns(fused, TextConfig::query_size + TextConfig::kv_size, gate, stream);
     ops::extract_bf16_columns(fused, 2 * TextConfig::query_size + TextConfig::kv_size, value,
                               stream);
-    qwen3_6::apply_lora_qkv(weights.query_key_gate_value, hidden, query, key, value, stream);
+    family::apply_lora_qkv(weights.query_key_gate_value, hidden, query, key, value, stream);
 }
 
 void Variant::attention_output_projection(const Tensor& attention, const Weight& weight,
-                                          Tensor& residual, qwen3_6::TextPhase,
+                                          Tensor& residual, family::TextPhase,
                                           WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope     = workspace.scope();
     Tensor output  = workspace.alloc(DType::BF16, {kHidden, attention.ne[1]});
     ops::linear(attention, weight, output, kPolicy, workspace, stream);
     // Before the hyper-connection combine: the delta belongs to o_proj's output,
     // and the combine is what distributes it across the residual streams.
-    qwen3_6::apply_lora(weight, 3, attention, output, stream);
+    family::apply_lora(weight, 3, attention, output, stream);
     combine_into(output, residual, stream);
 }
 
@@ -1568,7 +1568,7 @@ void Variant::mtp_q_gate_projection(const Tensor&, const MtpAttentionProjectionW
 }
 
 void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeights& weights,
-                                   Tensor& qkv, Tensor& output_gate, qwen3_6::TextPhase,
+                                   Tensor& qkv, Tensor& output_gate, family::TextPhase,
                                    WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope                = workspace.scope();
     const std::int32_t tokens = static_cast<std::int32_t>(hidden.ne[1] * hidden.ne[2]);
@@ -1586,7 +1586,7 @@ void Variant::gdn_input_projection_snapshot(
     const Tensor& hidden, const GdnProjectionWeights& weights, const Tensor& conv_weight,
     Tensor& conv_states, const Tensor& valid_columns, const Tensor& initial_slot,
     const Tensor& snapshot_base_slot, Tensor& query, Tensor& key, Tensor& value,
-    Tensor& output_gate, qwen3_6::TextPhase phase, WorkspaceArena& workspace,
+    Tensor& output_gate, family::TextPhase phase, WorkspaceArena& workspace,
     cudaStream_t stream) {
     auto scope               = workspace.scope();
     const std::int32_t width = hidden.ne[1];
@@ -1610,13 +1610,13 @@ void Variant::gdn_input_projection_snapshot(
 void Variant::gdn_input_projection_record(const Tensor&, const GdnProjectionWeights&,
                                           const Tensor&, const Tensor&, const Tensor&,
                                           const Tensor&, Tensor&, Tensor&, Tensor&, Tensor&,
-                                          Tensor&, qwen3_6::TextPhase, WorkspaceArena&,
+                                          Tensor&, family::TextPhase, WorkspaceArena&,
                                           cudaStream_t) {
     throw std::logic_error("qwen4exp: speculative replay records are not served");
 }
 
 void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, Tensor& residual,
-                                    qwen3_6::TextPhase, WorkspaceArena& workspace,
+                                    family::TextPhase, WorkspaceArena& workspace,
                                     cudaStream_t stream) {
     auto scope    = workspace.scope();
     Tensor output = workspace.alloc(DType::BF16, {kHidden, hidden.ne[1]});
@@ -1645,7 +1645,7 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor&,
 }
 
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
-                         qwen3_6::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
+                         family::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope                = workspace.scope();
     const std::int32_t tokens = hidden.ne[1];
     // The MoE op adds into its destination; a zeroed plane turns that into a plain store.
@@ -1786,7 +1786,7 @@ std::size_t Variant::mtp_q_gate_projection_workspace_capacity_bytes(std::int32_t
 }
 
 std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfile,
-                                                                   qwen3_6::TextPhase,
+                                                                   family::TextPhase,
                                                                    std::int32_t first,
                                                                    std::int32_t last) {
     // The mix hook's planes live in the same mixer scope as the projection.
@@ -1796,7 +1796,7 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
 }
 
 std::size_t Variant::attention_output_projection_workspace_capacity_bytes(WeightsProfile,
-                                                                          qwen3_6::TextPhase,
+                                                                          family::TextPhase,
                                                                           std::int32_t first,
                                                                           std::int32_t last) {
     return plane_bytes(kHidden, last, DType::BF16) +
@@ -1804,7 +1804,7 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(Weight
 }
 
 std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfile,
-                                                                   qwen3_6::TextPhase,
+                                                                   family::TextPhase,
                                                                    std::int32_t first,
                                                                    std::int32_t last) {
     return plane_bytes(TextConfig::gdn_projection_rows, last, DType::BF16) +
@@ -1812,7 +1812,7 @@ std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfil
 }
 
 std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(
-    WeightsProfile profile, qwen3_6::TextPhase phase, std::int32_t batch_size,
+    WeightsProfile profile, family::TextPhase phase, std::int32_t batch_size,
     std::int32_t min_width, std::int32_t max_width) {
     const std::int32_t tokens = batch_size * max_width;
     return 2 * plane_bytes(TextConfig::convolution_dim, tokens, DType::BF16) +
@@ -1821,7 +1821,7 @@ std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(
 }
 
 std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(WeightsProfile,
-                                                                          qwen3_6::TextPhase,
+                                                                          family::TextPhase,
                                                                           std::int32_t,
                                                                           std::int32_t,
                                                                           std::int32_t) {
@@ -1829,7 +1829,7 @@ std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(Weight
 }
 
 std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfile,
-                                                                    qwen3_6::TextPhase,
+                                                                    family::TextPhase,
                                                                     std::int32_t first,
                                                                     std::int32_t last) {
     return plane_bytes(kHidden, last, DType::BF16) +
@@ -1843,7 +1843,7 @@ std::size_t Variant::gdn_norm_control_projection_workspace_capacity_bytes(std::i
            2 * plane_bytes(heads, last, DType::BF16);
 }
 
-std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile, qwen3_6::TextPhase,
+std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile, family::TextPhase,
                                                          std::int32_t first, std::int32_t last) {
     return mix_capacity(first, last) + plane_bytes(kHidden, last, DType::BF16) +
            round_up(ops::sparse_moe_workspace_capacity_bytes(ops::kSparseMoeFlashNextGeometry,

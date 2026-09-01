@@ -8,7 +8,7 @@
 #include "runtime/engine/admission_policy.h"
 #include "runtime/engine/request_memory.h"
 #include "runtime/generation/generation_budget.h"
-#include "api/targets/qwen3_6/frontend.h"
+#include "api/family/frontend.h"
 
 #include <algorithm>
 #include <array>
@@ -150,7 +150,7 @@ public:
         friend class ConcurrentExecutor;
     };
 
-    Submission submit(targets::qwen3_6::PreparedPrompt prompt, PromptSummary prompt_summary,
+    Submission submit(family::PreparedPrompt prompt, PromptSummary prompt_summary,
                       double prepare_seconds, ResolvedRequestOptions options,
                       Clock::time_point pending_deadline = {}) {
         const Clock::time_point submitted = Clock::now();
@@ -307,8 +307,8 @@ private:
     }
 
     struct Request {
-        Request(std::uint64_t request_identity, targets::qwen3_6::PreparedPrompt input,
-                targets::qwen3_6::OutputSession output_session, PromptSummary summary,
+        Request(std::uint64_t request_identity, family::PreparedPrompt input,
+                family::OutputSession output_session, PromptSummary summary,
                 double frontend_seconds, ResolvedRequestOptions request_options,
                 Clock::time_point limit, Clock::time_point submit_time)
             : id(request_identity), prompt(std::move(input)), output(std::move(output_session)),
@@ -316,8 +316,8 @@ private:
               options(std::move(request_options)), deadline(limit), submitted(submit_time) {}
 
         const std::uint64_t id;
-        targets::qwen3_6::PreparedPrompt prompt;
-        targets::qwen3_6::OutputSession output;
+        family::PreparedPrompt prompt;
+        family::OutputSession output;
         PromptSummary prompt_summary;
         double prepare_seconds = 0.0;
         ResolvedRequestOptions options;
@@ -388,7 +388,7 @@ private:
     };
 
     void append_output(const std::shared_ptr<Request>& request,
-                       targets::qwen3_6::PublishedOutput output) {
+                       family::PublishedOutput output) {
         if (output.empty()) { return; }
         {
             std::lock_guard lock(request->mutex);

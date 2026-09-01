@@ -221,12 +221,12 @@ SparseMoePayload load_moe(const artifact::MaterializedArtifact& backing, const H
 
 } // namespace
 
-ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeatures features,
+ArtifactLoadPlan bind_artifact(artifact::Binder& binder, family::StartupFeatures features,
                                int stage_first, int stage_last, bool host_bank_q4) {
     const bool staged = stage_last > 0;
     ArtifactLoadPlan load_plan;
     BindingPlan& out    = load_plan.bindings;
-    out.frontend        = qwen3_6::bind_frontend_resources(binder);
+    out.frontend        = family::bind_frontend_resources(binder);
     out.features        = features;
     out.host_bank_q4    = host_bank_q4;
     out.token_embedding = device(binder, "text/token_embedding", NumericFormat::W8G32_F16S,
@@ -362,17 +362,17 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeature
             features.vision ? artifact::TensorPlacement::Device
                             : artifact::TensorPlacement::ValidateOnly;
         out.vision_backbone =
-            qwen3_6::bind_vision_backbone<qwen3_6::VisionBackboneConfig>(binder, vision_placement);
+            family::bind_vision_backbone<family::VisionBackboneConfig>(binder, vision_placement);
         out.vision_merger_input =
-            qwen3_6::bind_vision_merger_input<qwen3_6::VisionBackboneConfig>(binder, vision_placement);
+            family::bind_vision_merger_input<family::VisionBackboneConfig>(binder, vision_placement);
         out.vision_merger_fc2 = artifact::bind_tensor(
             binder, "vision/merger/fc2", artifact::NumericFormat::W8G32_F16S,
-            {TextConfig::hidden, qwen3_6::VisionBackboneConfig::merger_hidden}, vision_placement);
+            {TextConfig::hidden, family::VisionBackboneConfig::merger_hidden}, vision_placement);
         out.vision_merger_fc2_bias =
             artifact::bind_tensor(binder, "vision/merger/fc2_bias", artifact::NumericFormat::BF16,
                                   {TextConfig::hidden}, vision_placement);
         out.vision_merger_norm =
-            qwen3_6::bind_vision_merger_norm<qwen3_6::VisionBackboneConfig>(binder, vision_placement);
+            family::bind_vision_merger_norm<family::VisionBackboneConfig>(binder, vision_placement);
     }
 
     load_plan.materialization = binder.finish();
@@ -381,7 +381,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeature
 
 LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized)
     : backing(std::move(materialized)), host_bank(HostBank::shared(plan.host_bank)) {
-    frontend = qwen3_6::take_frontend_resources(backing, plan.frontend);
+    frontend = family::take_frontend_resources(backing, plan.frontend);
 
     runtime.weights_arena   = &backing.device_arena();
     runtime.features        = plan.features;

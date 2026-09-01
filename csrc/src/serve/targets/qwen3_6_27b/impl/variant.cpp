@@ -1,6 +1,6 @@
 #include "targets/qwen3_6_27b/impl/variant.h"
 
-#include "targets/qwen3_6/impl/lora_hook.h"
+#include "family/impl/lora_hook.h"
 #include "api/ops/attn_input_proj.h"
 #include "api/ops/gdn_gating_proj.h"
 #include "api/ops/gdn_input_proj.h"
@@ -15,9 +15,9 @@
 #include <algorithm>
 #include <stdexcept>
 
-#define SINFER_QWEN36_VARIANT    ::sinfer::targets::qwen3_6_27b::detail::Variant
-#define SINFER_QWEN36_RUNTIME_NS qwen3_6_27b_runtime
-#include "targets/qwen3_6/impl/runtime/instantiate.h"
+#define SINFER_FAMILY_VARIANT    ::sinfer::targets::qwen3_6_27b::detail::Variant
+#define SINFER_FAMILY_RUNTIME_NS qwen3_6_27b_runtime
+#include "family/impl/runtime/instantiate.h"
 
 namespace sinfer::targets::qwen3_6_27b::detail {
 namespace {
@@ -174,7 +174,7 @@ std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t,
 
 void Variant::attention_projection(const Tensor& hidden,
                                    const FullAttentionProjectionWeights& weights, Tensor& query,
-                                   Tensor& gate, Tensor& key, Tensor& value, qwen3_6::TextPhase,
+                                   Tensor& gate, Tensor& key, Tensor& value, family::TextPhase,
                                    WorkspaceArena& workspace, cudaStream_t stream) {
     if (const auto* split = std::get_if<SplitAttentionProjectionPayload>(&weights)) {
         ops::attn_input_proj(hidden, split->query_key, split->gate_value, query, gate, key, value,
@@ -184,14 +184,14 @@ void Variant::attention_projection(const Tensor& hidden,
     const Weight& fused = std::get<FusedAttentionProjectionPayload>(weights).query_key_gate_value;
     ops::attn_input_proj(hidden, fused, query, gate, key, value, text_policy(fused), workspace,
                          stream);
-    qwen3_6::apply_lora_qkv(fused, hidden, query, key, value, stream);
+    family::apply_lora_qkv(fused, hidden, query, key, value, stream);
 }
 
 void Variant::attention_output_projection(const Tensor& attention, const Weight& weight,
-                                          Tensor& residual, qwen3_6::TextPhase,
+                                          Tensor& residual, family::TextPhase,
                                           WorkspaceArena& workspace, cudaStream_t stream) {
     ops::linear_add(attention, weight, residual, text_policy(weight), workspace, stream);
-    qwen3_6::apply_lora(weight, 3, attention, residual, stream);
+    family::apply_lora(weight, 3, attention, residual, stream);
 }
 
 void Variant::mtp_attention_projection(const Tensor& hidden,
@@ -222,7 +222,7 @@ void Variant::mtp_q_gate_projection(const Tensor& hidden,
 }
 
 void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeights& weights,
-                                   Tensor& qkv, Tensor& output_gate, qwen3_6::TextPhase,
+                                   Tensor& qkv, Tensor& output_gate, family::TextPhase,
                                    WorkspaceArena& workspace, cudaStream_t stream) {
     Tensor output_gate_flat =
         output_gate.view({TextConfig::value_dim, static_cast<int>(hidden.ne[1])});
@@ -248,7 +248,7 @@ void Variant::gdn_input_projection_snapshot(
     const Tensor& hidden, const GdnProjectionWeights& weights, const Tensor& conv_weight,
     Tensor& conv_states, const Tensor& valid_columns, const Tensor& initial_slot,
     const Tensor& snapshot_base_slot, Tensor& query, Tensor& key, Tensor& value,
-    Tensor& output_gate, qwen3_6::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
+    Tensor& output_gate, family::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
     auto workspace_scope     = workspace.scope();
     const DeviceSpan storage = workspace.alloc_bytes(gdn_snapshot_workspace_bytes(hidden, weights));
     WorkspaceArena leaf_workspace(storage);
@@ -280,7 +280,7 @@ void Variant::gdn_input_projection_record(const Tensor& hidden, const GdnProject
                                           const Tensor& conv_weight, const Tensor& conv_states,
                                           const Tensor& valid_columns, const Tensor& initial_slots,
                                           Tensor& conv_record, Tensor& query, Tensor& key,
-                                          Tensor& value, Tensor& output_gate, qwen3_6::TextPhase,
+                                          Tensor& value, Tensor& output_gate, family::TextPhase,
                                           WorkspaceArena& workspace, cudaStream_t stream) {
     auto workspace_scope     = workspace.scope();
     const DeviceSpan storage = workspace.alloc_bytes(gdn_record_workspace_bytes(hidden, weights));
@@ -310,7 +310,7 @@ void Variant::gdn_input_projection_record(const Tensor& hidden, const GdnProject
 }
 
 void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, Tensor& residual,
-                                    qwen3_6::TextPhase, WorkspaceArena& workspace,
+                                    family::TextPhase, WorkspaceArena& workspace,
                                     cudaStream_t stream) {
     ops::linear_add(hidden, weight, residual, text_policy(weight), workspace, stream);
 }
@@ -333,7 +333,7 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
 }
 
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
-                         qwen3_6::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
+                         family::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope        = workspace.scope();
     Tensor activation = workspace.alloc(DType::BF16, {TextConfig::intermediate, hidden.ne[1]});
     ops::linear_swiglu(hidden, weights.gate_up, activation, text_policy(weights.gate_up), workspace,
@@ -342,7 +342,7 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
                     stream);
     // down reads the SwiGLU activation, which is exactly the input its adapter
     // was trained against.
-    qwen3_6::apply_lora(weights.down, 4, activation, residual, stream);
+    family::apply_lora(weights.down, 4, activation, residual, stream);
 }
 
 void Variant::mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
@@ -381,7 +381,7 @@ std::size_t Variant::mtp_q_gate_projection_workspace_capacity_bytes(std::int32_t
 }
 
 std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfile weights_profile,
-                                                                   qwen3_6::TextPhase,
+                                                                   family::TextPhase,
                                                                    std::int32_t first,
                                                                    std::int32_t last) {
     validate_token_interval(first, last);
@@ -401,7 +401,7 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
 }
 
 std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
-    WeightsProfile weights_profile, qwen3_6::TextPhase, std::int32_t first, std::int32_t last) {
+    WeightsProfile weights_profile, family::TextPhase, std::int32_t first, std::int32_t last) {
     validate_token_interval(first, last);
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
@@ -423,7 +423,7 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
 }
 
 std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfile weights_profile,
-                                                                   qwen3_6::TextPhase,
+                                                                   family::TextPhase,
                                                                    std::int32_t first,
                                                                    std::int32_t last) {
     validate_token_interval(first, last);
@@ -445,7 +445,7 @@ std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfil
 }
 
 std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(
-    WeightsProfile weights_profile, qwen3_6::TextPhase, std::int32_t batch_size, std::int32_t first,
+    WeightsProfile weights_profile, family::TextPhase, std::int32_t batch_size, std::int32_t first,
     std::int32_t last) {
     validate_token_interval(first, last);
     switch (weights_profile) {
@@ -475,7 +475,7 @@ std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(
 }
 
 std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(
-    WeightsProfile weights_profile, qwen3_6::TextPhase, std::int32_t batch_size, std::int32_t first,
+    WeightsProfile weights_profile, family::TextPhase, std::int32_t batch_size, std::int32_t first,
     std::int32_t last) {
     validate_token_interval(first, last);
     switch (weights_profile) {
@@ -505,7 +505,7 @@ std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(
 }
 
 std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfile weights_profile,
-                                                                    qwen3_6::TextPhase,
+                                                                    family::TextPhase,
                                                                     std::int32_t first,
                                                                     std::int32_t last) {
     validate_token_interval(first, last);
@@ -534,7 +534,7 @@ std::size_t Variant::gdn_norm_control_projection_workspace_capacity_bytes(std::i
 }
 
 std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_profile,
-                                                         qwen3_6::TextPhase, std::int32_t first,
+                                                         family::TextPhase, std::int32_t first,
                                                          std::int32_t last) {
     validate_token_interval(first, last);
     switch (weights_profile) {

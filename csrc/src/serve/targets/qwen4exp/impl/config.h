@@ -3,9 +3,9 @@
 // Qwen3.8-Flash-Next (`qwen4exp`). Geometry from the GGUF metadata and HF config; the
 // forward-pass contract is design/serve-engine-flash-next.md §5.
 
-#include <api/targets/qwen3_6/frontend.h>
-#include <api/targets/qwen3_6/hybrid_topology.h>
-#include <api/targets/qwen3_6/vision.h>
+#include <api/family/frontend.h>
+#include <api/family/hybrid_topology.h>
+#include <api/family/vision.h>
 
 #include <array>
 #include <cstdint>
@@ -19,7 +19,7 @@ struct TextConfig {
 
     static constexpr int output_rows  = 248320;
     static constexpr int eos_token    = 248044; // also cuts the n-gram context
-    static constexpr int token_domain = static_cast<int>(qwen3_6::kTokenDomain);
+    static constexpr int token_domain = static_cast<int>(family::kTokenDomain);
 
     // Hyper-connections: the residual is `hc_count` streams of `hidden`, mixed through a
     // low-rank bottleneck before every block and scattered back with per-stream weights.
@@ -116,7 +116,7 @@ static_assert(TextConfig::ple_embed == TextConfig::hidden);
 static_assert(TextConfig::gdn_projection_rows == 16384 && TextConfig::query_projection_rows == 13312);
 
 // The family's vision context is instantiated but never enabled for this target.
-struct VisionConfig : qwen3_6::VisionBackboneConfig {
+struct VisionConfig : family::VisionBackboneConfig {
     static constexpr int output_hidden = TextConfig::hidden;
 };
 

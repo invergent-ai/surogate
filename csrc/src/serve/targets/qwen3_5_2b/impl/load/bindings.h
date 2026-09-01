@@ -1,10 +1,10 @@
 #pragma once
 
 #include <api/targets/qwen3_5_2b/package.h>
-#include <api/targets/qwen3_6/frontend_resources.h>
-#include <api/targets/qwen3_6/model_view.h>
-#include <api/targets/qwen3_6/startup_features.h>
-#include <api/targets/qwen3_6/vision.h>
+#include <api/family/frontend_resources.h>
+#include <api/family/model_view.h>
+#include <api/family/startup_features.h>
+#include <api/family/vision.h>
 
 #include "../config.h"
 
@@ -107,8 +107,8 @@ struct MtpPlan {
 };
 
 struct BindingPlan {
-    qwen3_6::FrontendResourcePlan frontend;
-    qwen3_6::StartupFeatures features;
+    family::FrontendResourcePlan frontend;
+    family::StartupFeatures features;
 
     WeightPlan token_embedding;
     std::array<TextLayerPlan, kTextLayers> text_layers;
@@ -123,11 +123,11 @@ struct BindingPlan {
 
     // Typed on this checkpoint's own tower (24 layers of 1024), not the family
     // default: the plan's layer array is sized by the config.
-    qwen3_6::VisionBackbonePlanFor<VisionConfig> vision_backbone;
-    qwen3_6::VisionMergerInputPlan vision_merger_input;
+    family::VisionBackbonePlanFor<VisionConfig> vision_backbone;
+    family::VisionMergerInputPlan vision_merger_input;
     artifact::ObjectHandle vision_merger_fc2;
     artifact::ObjectHandle vision_merger_fc2_bias;
-    qwen3_6::VisionMergerNormPlan vision_merger_norm;
+    family::VisionMergerNormPlan vision_merger_norm;
     //: false when the source carried no tower (GGUF exports drop it).
     bool has_vision = false;
 };
@@ -138,7 +138,7 @@ struct ArtifactLoadPlan {
 };
 
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
-                               qwen3_6::StartupFeatures features);
+                               family::StartupFeatures features);
 
 struct DensePostMixerPayload {
     Weight gate_up;
@@ -197,8 +197,8 @@ struct MtpAttentionPayload {
 };
 
 using RuntimeModelView =
-    qwen3_6::ModelView<FullAttentionProjectionPayload, GdnProjectionPayload, DensePostMixerPayload,
-                       MtpAttentionPayload, DensePostMixerPayload, qwen3_6::DFlashWeights<6>,
+    family::ModelView<FullAttentionProjectionPayload, GdnProjectionPayload, DensePostMixerPayload,
+                       MtpAttentionPayload, DensePostMixerPayload, family::DFlashWeights<6>,
                        kFullAttentionLayers, kGdnLayers, VisionConfig>;
 using FullAttentionWeights = RuntimeModelView::FullLayer;
 using GdnWeights           = RuntimeModelView::GdnLayer;
@@ -214,7 +214,7 @@ public:
     LoadedModelData& operator=(LoadedModelData&&)      = delete;
 
     artifact::MaterializedArtifact backing;
-    qwen3_6::FrontendResources frontend;
+    family::FrontendResources frontend;
     RuntimeModelView runtime;
 };
 

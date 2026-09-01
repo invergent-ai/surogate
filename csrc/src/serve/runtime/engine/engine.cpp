@@ -54,14 +54,14 @@ std::string context_capacity_error(std::uint32_t prompt_tokens, std::uint32_t ma
 class PreparedPrompt::Impl {
 public:
     Impl(PromptSummary prompt_summary, PromptPreparationStats preparation, SamplingMode mode,
-         targets::qwen3_6::PreparedPrompt prepared)
+         family::PreparedPrompt prepared)
         : summary(std::move(prompt_summary)), prepare(std::move(preparation)), sampling_mode(mode),
           value(std::move(prepared)) {}
 
     PromptSummary summary;
     PromptPreparationStats prepare;
     SamplingMode sampling_mode = SamplingMode::Thinking;
-    targets::qwen3_6::PreparedPrompt value;
+    family::PreparedPrompt value;
 };
 
 PreparedPrompt::PreparedPrompt() noexcept                            = default;
