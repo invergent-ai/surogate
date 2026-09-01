@@ -3,6 +3,7 @@
 from .deepseek_v4 import DeepseekV4Model
 from .gemma3 import Gemma3CausalModel, Gemma3TextModel
 from .gemma4 import Gemma4CausalModel, Gemma4ConditionalModel, Gemma4UnifiedModel
+from .glm5_next import Glm5NextConditionalModel
 from .gpt_oss import GptOssModel
 from .laguna import LagunaModel
 from .llama import LlamaModel
@@ -27,6 +28,7 @@ __all__ = [
     "Qwen4ExpConditionalModel",
     "Qwen3VLModel",
     "Qwen3MoEModel",
+    "Glm5NextConditionalModel",
     "GptOssModel",
     "LagunaModel",
     "LlamaModel",

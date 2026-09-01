@@ -15,6 +15,12 @@ from .gemma4 import (
     Gemma4SlidingBlock,
     Gemma4SlidingMoEBlock,
 )
+from .glm5_next import (
+    Glm5NextKdaDenseBlock,
+    Glm5NextKdaMoEBlock,
+    Glm5NextMlaDenseBlock,
+    Glm5NextMlaMoEBlock,
+)
 from .gpt_oss import GptOssBlock
 from .laguna import LagunaDenseBlock, LagunaSparseBlock
 from .llama import LlamaBlock
@@ -52,6 +58,10 @@ __all__ = [
     "Lfm2MoeAttentionBlock",
     "Lfm2MoeConvBlock",
     # GLM-5.3-Flash hybrid blocks (KDA / NoPE-MLA x dense / MoE)
+    "Glm5NextKdaDenseBlock",
+    "Glm5NextKdaMoEBlock",
+    "Glm5NextMlaDenseBlock",
+    "Glm5NextMlaMoEBlock",
     # DeepSeek-V4 hybrid blocks (attention schedule x MoE schedule)
     "DeepseekV4SlidingMoEBlock",
     "DeepseekV4SlidingHashBlock",

@@ -22,6 +22,13 @@ from .attention import (
 from .deepseek_v4 import DeepseekV4Attention, DeepseekV4MoEExperts
 from .embedding import Embedding, LMHead, ScaledEmbedding
 from .gated_delta_rule import ChunkGatedDeltaRule, GatedDeltaNetMixer
+from .glm5_next import (
+    Glm5NextHyperConnection,
+    Glm5NextHyperConnectionCombine,
+    Glm5NextHyperHead,
+    Glm5NextKimiDeltaMixer,
+    Glm5NextLatentAttention,
+)
 from .hyper_connection import HyperConnection, HyperConnectionCombine, StreamBroadcast
 from .linear import Linear
 from .mamba import Mamba2Mixer
@@ -75,6 +82,12 @@ __all__ = [
     "ChunkGatedDeltaRule",
     # Hyper-connections (qwen4_exp residual streams)
     "HyperConnection",
+    # Manifold-constrained hyper-connections + KDA / NoPE-MLA (glm5_next)
+    "Glm5NextHyperConnection",
+    "Glm5NextHyperConnectionCombine",
+    "Glm5NextHyperHead",
+    "Glm5NextKimiDeltaMixer",
+    "Glm5NextLatentAttention",
     "HyperConnectionCombine",
     "StreamBroadcast",
     # MoE
