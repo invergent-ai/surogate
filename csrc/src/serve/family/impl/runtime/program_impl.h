@@ -1899,6 +1899,18 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             }
             schedule::PrefillChunkResult result;
             if (staged.use_graph) {
+                // The same page overflow PATCHES.md #55 fixed for mixed rounds, which
+                // that entry called "mixed-only". It is not: a plain graph chunk writes
+                // its whole 128-rounded bucket, pad columns included, while KV is mapped
+                // in units of 64 up to the prompt length. Whenever the bucket exceeds the
+                // mapped window -- a 20-token prompt maps 64 and the graph writes 128 --
+                // the pad tail lands in whatever block-table slots follow, which is
+                // another sequence's KV or unmapped storage. Map the window the graph
+                // actually writes, before it runs.
+                const std::uint32_t graph_window =
+                    staged.cursor +
+                    static_cast<std::uint32_t>(PrefillGraphFamily::chunk_bucket_for(nominal));
+                materialize_sequence_kv(sequence, std::min(graph_window, capacity), 0);
                 // Chunk-atomic scratch ownership: restore this prompt's state into the shared
                 // scratch slot right before its chunk runs (the lane slot always holds the
                 // prompt's current state — zeros after a reset, the resident state for

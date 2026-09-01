@@ -109,7 +109,7 @@ constexpr std::array<RouteSpec, 5> kQ4B29Routes{{
 // the larger shapes) and none is 3072, so this shape takes only the kernels that
 // read their extents from the weight: the SIMT decode and the MMA tiles. The
 // 0.6b attention output {1024, 2048} is the 0.8b shape and keeps its table.
-constexpr std::array<RouteSpec, 3> kQ3_06bRoutes{{
+constexpr std::array<RouteSpec, 3> kExtentAgnosticRoutes{{
     {1, 1, W8LinearAddScheduleId::SimtR8C4},
     {2, 1024, W8LinearAddScheduleId::MmaR32C128},
     {1025, kAnyCols, W8LinearAddScheduleId::MmaR48C128},
@@ -126,7 +126,7 @@ constexpr bool routes_are_closed(const std::array<RouteSpec, N>& routes) {
 }
 
 static_assert(routes_are_closed(kK4096Routes) && routes_are_closed(kK6144Routes) &&
-                  routes_are_closed(kQ08Routes) && routes_are_closed(kQ3_06bRoutes) &&
+                  routes_are_closed(kQ08Routes) && routes_are_closed(kExtentAgnosticRoutes) &&
                   routes_are_closed(kQ2BRoutes) && routes_are_closed(kQ4B29Routes),
               "W8 LinearAdd routes must be exact, contiguous, and closed");
 
@@ -287,11 +287,11 @@ W8LinearAddPlan w8_linear_add_resolve_plan(const W8LinearAddProblem& problem) {
     };
     // gemma-3-270m's two shapes take the runtime-tiled routes; its 640 rows have
     // no exact-T bake of their own, and the k=2048 branch below is the 2b's.
-    if (problem.rows == 640) { return resolve_from(kQ3_06bRoutes); }
+    if (problem.rows == 640) { return resolve_from(kExtentAgnosticRoutes); }
     if (problem.rows == 1024) {
         // The row count alone does not name the geometry here: the 0.8b's exact-T
         // bakes are k=2048/3584, and the 0.6b's mlp down is k=3072.
-        return problem.k == 3072 ? resolve_from(kQ3_06bRoutes) : resolve_from(kQ08Routes);
+        return problem.k == 3072 ? resolve_from(kExtentAgnosticRoutes) : resolve_from(kQ08Routes);
     }
     // qwen3.5-2b output projections (measured on an idle RTX 5090,
     // bench/ops/q08_route_sweep_bench: 472 -> r32c96 63.5us, 888 -> r48c128
@@ -300,6 +300,17 @@ W8LinearAddPlan w8_linear_add_resolve_plan(const W8LinearAddProblem& problem) {
     // surogate vendor patch (PATCHES.md #29): qwen3.5-4b (2560 rows) has its
     // exact-T bakes now (T=2..16, k=4096/9216).
     if (problem.rows == 2560) { return resolve_from(kQ4B29Routes); }
+    // The exact-T and medium split-K families bake their hidden extent, and 4096
+    // and 6144 are the only two bakes they have. Both launchers choose between
+    // them with a bare `if (k == 4096) ... else ...`, so a k that is neither does
+    // not fail there -- it silently runs over the wrong extent. tinyllama's mlp
+    // down {2048, 5632} is exactly that shape: it reached kK4096Routes as the
+    // catch-all and read 4096 of its 5632 input rows. An unbaked k takes the
+    // table whose kernels read their extents from the weight, which is the same
+    // rule the extent-agnostic table above already states for {1024, 3072}.
+    if (problem.k != 4096 && problem.k != 6144) {
+        return resolve_from(kExtentAgnosticRoutes);
+    }
     return problem.k == 6144 ? resolve_from(kK6144Routes) : resolve_from(kK4096Routes);
 }
 
