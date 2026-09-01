@@ -351,7 +351,10 @@ private:
     }
 
     [[nodiscard]] const MtpW& mtp_weights() const;
-    void attn_mix(const FullLayerW& weights, Tensor& x, int index, Phase phase);
+    // `index` selects this layer's KV plane (the full-attention index); `layer` is
+    // the absolute layer index, which is what the per-layer rope base and sliding
+    // window are declared over. They coincide only in a stack that is all attention.
+    void attn_mix(const FullLayerW& weights, Tensor& x, int index, int layer, Phase phase);
     void gdn_mix(const GdnLayerW& weights, Tensor& x, int index, Phase phase);
     void mlp_tail(const Tensor* post_norm, const MlpW& weights, Tensor& x, Phase phase);
     void run_layers(Tensor& x, Phase phase);

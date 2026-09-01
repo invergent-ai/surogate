@@ -61,16 +61,22 @@ void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& position
                                          Tensor& partial_m, Tensor& partial_l, Tensor& out,
                                          cudaStream_t stream, GqaBlockMask selection = {});
 
+// `sliding_window` is deliberately required and deliberately ahead of the defaulted
+// `selection`: a window that defaults to 0 reads as "unbounded" but means "the caller
+// forgot", and the two are indistinguishable at the call site. Making it positional
+// turns an unforwarded window into a compile error instead of silent wrong attention.
 void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                  const Tensor& positions, const Tensor& valid_columns,
                                  const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
-                                 Tensor& out, cudaStream_t stream, GqaBlockMask selection = {}, std::int32_t sliding_window = 0);
+                                 Tensor& out, cudaStream_t stream, std::int32_t sliding_window,
+                                 GqaBlockMask selection = {});
 
 void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                           PagedKVLayerView cache, cudaStream_t stream);
 
 void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positions, float scale,
                                            const PagedKVLayerView& cache, Tensor& out,
-                                           cudaStream_t stream, GqaBlockMask selection = {});
+                                           cudaStream_t stream, std::int32_t sliding_window,
+                                           GqaBlockMask selection = {});
 
 } // namespace sinfer::ops::detail

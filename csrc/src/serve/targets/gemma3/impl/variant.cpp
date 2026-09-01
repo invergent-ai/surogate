@@ -204,30 +204,6 @@ void Variant::attention_projection(const Tensor& hidden,
 }
 
 void Variant::attention_output_projection(const Tensor& attention, const Weight& weight,
-                                          Tensor& residual, family::TextPhase,
-                                          WorkspaceArena& workspace, cudaStream_t stream) {
-    // INCOMPLETE, and loudly so. Gemma sandwiches its attention block: the
-    // residual takes `post_attention_layernorm(o_proj(attention))`, not
-    // `o_proj(attention)`. The norm is bound and materialised
-    // (`AttentionProjectionPayload::post_attention_norm`) and the overload below
-    // applies it -- but the shared runtime calls this leaf with `*w.o_proj` and
-    // nothing else, so from here the weight is unreachable. Applying it needs one
-    // change in `family/impl/runtime/`, which this target does not own:
-    // route `*w.projection` to this leaf (the three call sites in
-    // text_context_impl.h) and the seven-argument overload takes over.
-    static bool warned = [] {
-        std::fprintf(stderr,
-                     "gemma3: post_attention_norm is bound but NOT applied -- the shared runtime "
-                     "does not yet hand the attention payload to attention_output_projection. "
-                     "Output is not Gemma 3 until it does.\n");
-        return true;
-    }();
-    (void)warned;
-    ops::linear_add(attention, weight, residual, kTextPolicy, workspace, stream);
-    apply_lora(weight, kOutputPort, attention, residual, stream);
-}
-
-void Variant::attention_output_projection(const Tensor& attention, const Weight& weight,
                                           const FullAttentionProjectionWeights& weights,
                                           Tensor& residual, family::TextPhase,
                                           WorkspaceArena& workspace, cudaStream_t stream) {

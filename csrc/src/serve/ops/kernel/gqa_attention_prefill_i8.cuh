@@ -479,7 +479,10 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
             const int row1             = row0 + 8;
             const int qabs0            = row0 < tile_rows ? base_pos + q0 + row0 : -1;
             const int qabs1            = row1 < tile_rows ? base_pos + q0 + row1 : -1;
-            const bool full_score_tile = q0 + Br <= tokens && k0 + Bc - 1 <= base_pos + q0;
+            // See the bf16 twin: a fully-causal tile is mask-free only when its
+            // oldest key is still inside the window of its newest query.
+            const bool full_score_tile = q0 + Br <= tokens && k0 + Bc - 1 <= base_pos + q0 &&
+                                         gqa_within_window(max_query_abs, k0, metadata.window);
             float bm0                  = -CUDART_INF_F;
             float bm1                  = -CUDART_INF_F;
 #pragma unroll
@@ -487,10 +490,19 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
                 const int key0 = k0 + nt * 8 + 2 * lid;
                 const int key1 = key0 + 1;
                 if (!full_score_tile) {
-                    score[nt][0] = key0 <= qabs0 ? score[nt][0] : -CUDART_INF_F;
-                    score[nt][1] = key1 <= qabs0 ? score[nt][1] : -CUDART_INF_F;
-                    score[nt][2] = key0 <= qabs1 ? score[nt][2] : -CUDART_INF_F;
-                    score[nt][3] = key1 <= qabs1 ? score[nt][3] : -CUDART_INF_F;
+                    const int w  = metadata.window;
+                    score[nt][0] = (key0 <= qabs0 && gqa_within_window(qabs0, key0, w))
+                                       ? score[nt][0]
+                                       : -CUDART_INF_F;
+                    score[nt][1] = (key1 <= qabs0 && gqa_within_window(qabs0, key1, w))
+                                       ? score[nt][1]
+                                       : -CUDART_INF_F;
+                    score[nt][2] = (key0 <= qabs1 && gqa_within_window(qabs1, key0, w))
+                                       ? score[nt][2]
+                                       : -CUDART_INF_F;
+                    score[nt][3] = (key1 <= qabs1 && gqa_within_window(qabs1, key1, w))
+                                       ? score[nt][3]
+                                       : -CUDART_INF_F;
                 }
                 bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
                 bm1 = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));

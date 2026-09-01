@@ -17,7 +17,6 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
-#include <cstdint>
 #include <optional>
 
 #include <cuda_runtime.h>
@@ -92,6 +91,30 @@ template <class TextConfig>
     } else {
         (void)layer;
         return TextConfig::rope_theta;
+    }
+}
+
+/// The sliding window this layer attends over, in keys, or 0 for a layer that
+/// sees its whole context.
+///
+/// The window is a property of a *layer*, not of a round: Gemma 3 alternates five
+/// windowed layers to one global one, so no single value describes a forward pass.
+/// A config that says nothing is unwindowed everywhere, which is every target but
+/// that one. `layer` is the absolute layer index, the same index
+/// `layer_rope_theta` takes -- the two must agree, because a windowed layer is
+/// exactly the layer that rotates at the local base.
+template <class TextConfig>
+[[nodiscard]] constexpr std::int32_t layer_sliding_window(int layer) {
+    if constexpr (requires {
+                      TextConfig::sliding_window;
+                      TextConfig::is_windowed_attention(layer);
+                  }) {
+        return TextConfig::is_windowed_attention(layer)
+                   ? static_cast<std::int32_t>(TextConfig::sliding_window)
+                   : 0;
+    } else {
+        (void)layer;
+        return 0;
     }
 }
 

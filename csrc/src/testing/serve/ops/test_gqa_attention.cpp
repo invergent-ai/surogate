@@ -66,6 +66,9 @@ struct AttentionCase {
     std::int32_t base;
     std::uint32_t envelope_max;
     std::uint32_t seed;
+    /// Causal sliding window in keys, 0 for unbounded. A query at absolute
+    /// position i admits keys j with `i - j < sliding_window`.
+    std::int32_t sliding_window = 0;
 };
 
 enum class MappingPattern { Identity, Offset, Fragmented };
@@ -438,7 +441,8 @@ double cache_value(const HostCache& cache, bool key, std::int32_t head, std::int
 }
 
 std::vector<double> ideal_attention(const std::vector<float>& q, const HostCache& cache,
-                                    const std::vector<std::int32_t>& positions) {
+                                    const std::vector<std::int32_t>& positions,
+                                    std::int32_t sliding_window = 0) {
     const Geometry& geometry  = cache.geometry;
     const std::int32_t tokens = static_cast<std::int32_t>(positions.size());
     std::vector<double> output(static_cast<std::size_t>(kHeadDim) *
@@ -449,10 +453,13 @@ std::vector<double> ideal_attention(const std::vector<float>& q, const HostCache
     std::vector<double> probabilities(scores.size());
     for (std::int32_t token = 0; token < tokens; ++token) {
         const std::int32_t visible = positions[static_cast<std::size_t>(token)] + 1;
+        // A window drops the oldest keys, so the sum runs over [first, visible).
+        const std::int32_t first =
+            sliding_window > 0 ? std::max(0, visible - sliding_window) : 0;
         for (std::int32_t q_head = 0; q_head < geometry.q_heads; ++q_head) {
             const std::int32_t kv_head = q_head / geometry.query_group();
             double max_score           = -std::numeric_limits<double>::infinity();
-            for (std::int32_t position = 0; position < visible; ++position) {
+            for (std::int32_t position = first; position < visible; ++position) {
                 double dot = 0.0;
                 for (std::int32_t d = 0; d < kHeadDim; ++d) {
                     dot += static_cast<double>(q[q_index(geometry, q_head, d, token)]) *
@@ -464,19 +471,19 @@ std::vector<double> ideal_attention(const std::vector<float>& q, const HostCache
             }
 
             double sum = 0.0;
-            for (std::int32_t position = 0; position < visible; ++position) {
+            for (std::int32_t position = first; position < visible; ++position) {
                 const double probability =
                     std::exp(scores[static_cast<std::size_t>(position)] - max_score);
                 probabilities[static_cast<std::size_t>(position)] = probability;
                 sum += probability;
             }
-            for (std::int32_t position = 0; position < visible; ++position) {
+            for (std::int32_t position = first; position < visible; ++position) {
                 probabilities[static_cast<std::size_t>(position)] /= sum;
             }
 
             for (std::int32_t d = 0; d < kHeadDim; ++d) {
                 double value = 0.0;
-                for (std::int32_t position = 0; position < visible; ++position) {
+                for (std::int32_t position = first; position < visible; ++position) {
                     value += probabilities[static_cast<std::size_t>(position)] *
                              cache_value(cache, false, kv_head, position, d);
                 }
@@ -950,7 +957,8 @@ int run_a1_case(const Geometry& geometry, DType dtype, const AttentionCase& test
     const HostCache initial = make_cache(geometry, dtype, max_context, test_case.seed + 10u);
     HostCache expected      = initial;
     append_cache(expected, k, v, positions);
-    const std::vector<double> reference = ideal_attention(q, expected, positions);
+    const std::vector<double> reference =
+        ideal_attention(q, expected, positions, test_case.sliding_window);
     DeviceCache cache(initial, mapping);
 
     const std::vector<std::uint16_t> q_bits = to_bf16_bits(q);
@@ -978,7 +986,7 @@ int run_a1_case(const Geometry& geometry, DType dtype, const AttentionCase& test
     Tensor ttable_row(dtable_row.data(), DType::I32, {1});
     Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, test_case.tokens});
     const ops::GqaExecutionEnvelope envelope{static_cast<std::uint32_t>(total),
-                                             test_case.envelope_max};
+                                             test_case.envelope_max, test_case.sliding_window};
     const std::size_t workspace_bytes = ops::gqa_attention_workspace_capacity_bytes(
         geometry.q_heads, geometry.kv_heads, dtype, envelope, 1, test_case.tokens, test_case.tokens);
     GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
@@ -1024,7 +1032,8 @@ int run_a3_case(const Geometry& geometry, DType dtype, const AttentionCase& test
     }
 
     const HostCache cache_host = make_cache(geometry, dtype, max_context, test_case.seed + 10u);
-    const std::vector<double> reference = ideal_attention(q, cache_host, positions);
+    const std::vector<double> reference =
+        ideal_attention(q, cache_host, positions, test_case.sliding_window);
     DeviceCache cache(cache_host, mapping);
 
     const std::vector<std::uint16_t> q_bits = to_bf16_bits(q);
@@ -1040,7 +1049,7 @@ int run_a3_case(const Geometry& geometry, DType dtype, const AttentionCase& test
     Tensor tp(dp.data(), DType::I32, {test_case.tokens});
     Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, test_case.tokens});
     const ops::GqaExecutionEnvelope envelope{static_cast<std::uint32_t>(total),
-                                             test_case.envelope_max};
+                                             test_case.envelope_max, test_case.sliding_window};
     const std::size_t workspace_bytes = ops::gqa_attention_workspace_capacity_bytes(
         geometry.q_heads, geometry.kv_heads, dtype, envelope, 1, test_case.tokens, test_case.tokens);
     GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
@@ -1309,6 +1318,25 @@ int run_geometry(const Geometry& geometry) {
             {17, 31, 48, 303u},
         };
         for (const AttentionCase& test_case : a3_cases) {
+            failures += run_a3_case(geometry, dtype, test_case, MappingPattern::Identity);
+        }
+
+        // Causal sliding window. The 200-token cases are the ones that matter:
+        // with Br = Bc = 64, a query tile at 128 against a key tile at 0 is
+        // wholly below the diagonal, so the prefill kernel takes its "every key
+        // here is visible, no mask needed" fast path. That premise holds for pure
+        // causality and fails under a window -- a fully-causal tile is precisely
+        // an old-key tile, and the ones furthest below the diagonal are the first
+        // to fall out. A window shorter than the prompt is what makes such a tile
+        // reachable, so a case with tokens <= 64 cannot catch it.
+        const AttentionCase window_cases[] = {
+            {200, 0, 256, 601u, 64},  {200, 0, 256, 602u, 128}, {200, 0, 256, 603u, 192},
+            {66, 63, 129, 604u, 32},  {17, 31, 48, 605u, 8},
+            // Degenerate: every query admits only its own key.
+            {7, 17, 512, 606u, 1},
+        };
+        for (const AttentionCase& test_case : window_cases) {
+            failures += run_a1_case(geometry, dtype, test_case, MappingPattern::Identity);
             failures += run_a3_case(geometry, dtype, test_case, MappingPattern::Identity);
         }
 

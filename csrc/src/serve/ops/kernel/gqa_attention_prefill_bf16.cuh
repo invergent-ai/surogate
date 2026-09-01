@@ -327,8 +327,15 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
         const int qabs0            = (qrow0 < tokens) ? base_pos + qrow0 : -1;
         const int qabs1            = (qrow1 < tokens) ? base_pos + qrow1 : -1;
         // A sparse chunk never has a "full" tile: every key must pass its query's selection.
-        const bool full_score_tile =
-            !Sparse && (q0 + Br <= tokens) && ((k0 + Bc - 1) <= (base_pos + q0));
+        //
+        // "Every key in this tile is causally visible" is not "every key in this tile
+        // needs no mask". Under a sliding window a fully-causal tile is precisely an
+        // OLD-key tile -- the ones furthest below the diagonal are the first to fall
+        // out of the window -- so the tile is only mask-free when its oldest key is
+        // still within the window of its newest query.
+        const bool full_score_tile = !Sparse && (q0 + Br <= tokens) &&
+                                     ((k0 + Bc - 1) <= (base_pos + q0)) &&
+                                     gqa_within_window(max_query_abs, k0, metadata.window);
         const std::uint32_t* mask0 =
             Sparse && qrow0 < tokens
                 ? block_mask.words + static_cast<std::int64_t>(qrow0) * block_mask.stride
@@ -378,8 +385,14 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
         const float nm1        = fmaxf(m1, bm1);
         const float nm0_scaled = nm0 * scale_l2;
         const float nm1_scaled = nm1 * scale_l2;
-        const float alpha0     = exp2_approx(__fmaf_rn(m0, scale_l2, -nm0_scaled));
-        const float alpha1     = exp2_approx(__fmaf_rn(m1, scale_l2, -nm1_scaled));
+        // A window can mask a whole tile, leaving both maxima at -inf; the rescale
+        // would then be exp2(-inf + inf) = NaN and would poison the row's accumulator
+        // for every later tile. The running sums are zero there, so alpha is too.
+        // (The decode kernels have carried this guard since they were written.)
+        const float alpha0 =
+            (m0 == -CUDART_INF_F) ? 0.0f : exp2_approx(__fmaf_rn(m0, scale_l2, -nm0_scaled));
+        const float alpha1 =
+            (m1 == -CUDART_INF_F) ? 0.0f : exp2_approx(__fmaf_rn(m1, scale_l2, -nm1_scaled));
 
         // P = exp2(S - m), repacked into the PV A-fragment layout, plus local block row-sum.
         // The row-sum allreduce is deferred to the epilogue; only row max must be reduced per tile.

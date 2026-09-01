@@ -874,7 +874,7 @@ void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor
     proposal_argmax(hidden, logits, draft_tokens);
 }
 
-void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
+void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, int layer, Phase ph) {
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
     if (active_gqa_envelope_ == nullptr) {
@@ -921,7 +921,7 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     const Tensor& rope_positions =
         active_rope_positions_ != nullptr ? *active_rope_positions_ : io_.rope_pos;
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
-    ops::rope(rope_for_op, kCfg.rotary_dim, layer_rope_theta<TextConfig>(fidx), qn, kn, s);
+    ops::rope(rope_for_op, kCfg.rotary_dim, layer_rope_theta<TextConfig>(layer), qn, kn, s);
     debug_probe<Variant>("q_post_rope", qn.view({kCfg.q_size, T}), s);
     debug_probe<Variant>("k_post_rope", kn.view({kCfg.kv_size, T}), s);
 
@@ -936,6 +936,11 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
         w, h, T, cache_positions, rope_positions, kv_table_rows, indexer_columns_per_row,
         static_cast<std::int32_t>(active_gqa_envelope_->max_visible_keys),
         batch_text_kv_->batch_layer_view(fidx));
+    // The round binding says how many keys the launch must be sized for; the window
+    // says how many of them this layer may look at. Stamp the layer's window onto a
+    // copy -- widening the round binding could not express an alternating stack.
+    ops::GqaExecutionEnvelope layer_envelope = *active_gqa_envelope_;
+    layer_envelope.sliding_window            = layer_sliding_window<TextConfig>(layer);
     if (active_sequence_batch_ != 0) {
         const std::int32_t width = active_sequence_width_;
         if (width <= 0 || width * active_sequence_batch_ != T) {
@@ -948,12 +953,12 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
         Tensor position_batch = cache_positions.view({width, active_sequence_batch_});
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
         ops::gqa_attention(q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows,
-                           kAttnScale, batch_text_kv_->batch_layer_view(fidx),
-                           *active_gqa_envelope_, work_, a_batch, s, selection);
+                           kAttnScale, batch_text_kv_->batch_layer_view(fidx), layer_envelope,
+                           work_, a_batch, s, selection);
     } else {
         ops::gqa_attention(qn, kn, v, cache_positions, Tensor{}, kv_table_rows, kAttnScale,
-                           batch_text_kv_->batch_layer_view(fidx), *active_gqa_envelope_, work_, a,
-                           s, selection);
+                           batch_text_kv_->batch_layer_view(fidx), layer_envelope, work_, a, s,
+                           selection);
     }
     // A dense stack writes no gate rows; see attention_output_gate<Variant>().
     if constexpr (kAttentionOutputGate) { ops::sigmoid_mul(gate, a, s); }
@@ -1260,7 +1265,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     nvtx::Category::Attention, static_cast<std::uint64_t>(layer));
                 auto mixer_scope = work_.scope();
                 if (timing) { cudaEventRecord(timer.begin, ctx_.stream); }
-                attn_mix(full, x, fidx, ph);
+                attn_mix(full, x, fidx, layer, ph);
                 if (timing) { lap(timer.begin, timer.attn, acc_attn); }
             }
             {
@@ -1622,6 +1627,9 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                 }
                 ops::rope(rope_all, kCfg.rotary_dim, layer_rope_theta<TextConfig>(layer), qn, kn,
                           s);
+                // A windowed layer looks at fewer keys than the round is sized for;
+                // see layer_sliding_window() in residual_policy.h.
+                const std::int32_t layer_window = layer_sliding_window<TextConfig>(layer);
                 debug_probe<Variant>("q_post_rope", qn.view({kCfg.q_size, total}), s);
                 debug_probe<Variant>("k_post_rope", kn.view({kCfg.kv_size, total}), s);
 
@@ -1635,7 +1643,7 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                         ops::set_i32_scalar(io_.text_kv_table_row, segments[sg].kv_table_row, s);
                     }
                     const auto seen = static_cast<std::uint32_t>(segments[sg].kv_base + len);
-                    const ops::GqaExecutionEnvelope envelope{seen, seen};
+                    const ops::GqaExecutionEnvelope envelope{seen, seen, layer_window};
                     Tensor qa = qn.slice(2, off, len);
                     Tensor ka = kn.slice(2, off, len);
                     Tensor va = v.slice(2, off, len);
@@ -1661,9 +1669,11 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                         rope_all.slice(0, prefill_cols, batch), decode.kv_table_rows, 1,
                         static_cast<std::int32_t>(decode.envelope.max_visible_keys),
                         batch_text_kv_->batch_layer_view(fidx));
+                    ops::GqaExecutionEnvelope decode_layer_envelope = decode.envelope;
+                    decode_layer_envelope.sliding_window                = layer_window;
                     ops::gqa_attention(qb, kb, vb, position_batch, Tensor{}, decode.kv_table_rows,
                                        kAttnScale, batch_text_kv_->batch_layer_view(fidx),
-                                       decode.envelope, work_, ab, s, decode_selection);
+                                       decode_layer_envelope, work_, ab, s, decode_selection);
                 }
                 // A dense stack writes no gate rows; see attention_output_gate<Variant>().
                 if constexpr (kAttentionOutputGate) { ops::sigmoid_mul(gate, a, s); }
@@ -2052,6 +2062,13 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
                 }
                 ops::rope(rope_all, kCfg.rotary_dim, layer_rope_theta<TextConfig>(layer), qn, kn,
                           s);
+                // A windowed layer looks at fewer keys than the round is sized for;
+                // see layer_sliding_window() in residual_policy.h.
+                const std::int32_t layer_window = layer_sliding_window<TextConfig>(layer);
+                ops::GqaExecutionEnvelope prefill_layer_envelope = prefill_envelope;
+                prefill_layer_envelope.sliding_window                = layer_window;
+                ops::GqaExecutionEnvelope decode_layer_envelope = decode_envelope;
+                decode_layer_envelope.sliding_window            = layer_window;
 
                 Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, total});
                 {
@@ -2067,8 +2084,8 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
                         batch_text_kv_->batch_layer_view(fidx));
                     ops::gqa_attention(qa, ka, va, positions_prefill, Tensor{},
                                        io_.text_kv_table_row, kAttnScale,
-                                       batch_text_kv_->batch_layer_view(fidx), prefill_envelope,
-                                       work_, aa, s, segment_selection);
+                                       batch_text_kv_->batch_layer_view(fidx),
+                                       prefill_layer_envelope, work_, aa, s, segment_selection);
                 }
                 if (batch > 0) {
                     Tensor qb = qn.slice(2, prefill_cols, batch)
@@ -2088,7 +2105,7 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
                         batch_text_kv_->batch_layer_view(fidx));
                     ops::gqa_attention(qb, kb, vb, position_batch, Tensor{}, decode.kv_table_rows,
                                        kAttnScale, batch_text_kv_->batch_layer_view(fidx),
-                                       decode_envelope, work_, ab, s, decode_selection);
+                                       decode_layer_envelope, work_, ab, s, decode_selection);
                 }
                 // A dense stack writes no gate rows; see attention_output_gate<Variant>().
                 if constexpr (kAttentionOutputGate) { ops::sigmoid_mul(gate, a, s); }

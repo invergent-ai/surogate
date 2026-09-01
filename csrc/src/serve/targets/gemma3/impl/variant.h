@@ -93,19 +93,14 @@ struct Variant {
                                      Tensor& gate, Tensor& key, Tensor& value,
                                      family::TextPhase phase, WorkspaceArena& workspace,
                                      cudaStream_t stream);
-    /// What the family calls today: o_proj straight into the residual.
-    ///
-    /// Gemma needs one more step between the two -- `post_attention_layernorm`
-    /// over the projection's output, before the add -- and this signature cannot
-    /// reach the weight for it: the family hands this leaf `*w.o_proj` and
-    /// nothing else, and the family's one `FullLayer` norm slot is already spoken
-    /// for by the pre-mixer norm. The overload below is that step, written and
-    /// ready; it is selected the moment the shared runtime routes the projection
-    /// payload here (see variant.cpp).
-    static void attention_output_projection(const Tensor& attention, const Weight& weight,
-                                            Tensor& residual, family::TextPhase phase,
-                                            WorkspaceArena& workspace, cudaStream_t stream);
     /// The complete Gemma attention tail: `residual += post_attention_norm(o_proj(attention))`.
+    ///
+    /// Gemma sandwiches its attention block, so the residual takes
+    /// `post_attention_layernorm(o_proj(attention))` rather than `o_proj(attention)`.
+    /// Only the payload overload is declared: the family's plain `(attention, weight,
+    /// residual, ...)` form cannot reach the norm weight, and declaring it as well
+    /// would leave `ResidualHooks::attention_output` a fallback that silently drops
+    /// the norm if its `requires` clause ever stopped matching.
     /// Argument order follows `ResidualHooks::attention_norm`, where the payload
     /// comes after the tensors it belongs to.
     static void attention_output_projection(const Tensor& attention, const Weight& weight,

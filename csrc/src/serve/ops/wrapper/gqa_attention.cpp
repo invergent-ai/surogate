@@ -490,7 +490,7 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
         return;
     }
     detail::gqa_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows, scale,
-                                        cache, out, stream, selection, envelope.sliding_window);
+                                        cache, out, stream, envelope.sliding_window, selection);
 }
 
 void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,
@@ -547,7 +547,7 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
         return;
     }
     detail::gqa_attention_prompt_attention_launch(q, positions, scale, cache, out, stream,
-                                                  selection);
+                                                  envelope.sliding_window, selection);
 }
 
 } // namespace sinfer::ops
