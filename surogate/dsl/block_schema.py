@@ -10,7 +10,18 @@ DistributionKind = Literal["replicated", "sharded_dim", "expert_parallel", "rout
 Residency = Literal["auto", "gpu", "cpu_pinned_stream", "cpu_pageable", "nvme_offload"]
 SlotKind = Literal["activation", "param", "scratch", "param_grad", "activation_grad"]
 Lifetime = Literal["op", "layer", "block", "model", "persistent"]
-RoutingKind = Literal["none", "topk_softmax", "topk_sigmoid", "expert_choice"]
+RoutingKind = Literal[
+    "none",
+    "topk_softmax",
+    "topk_sigmoid",
+    # DeepSeek-V4: scores are `sqrt(softplus(logits))`, selected on
+    # `score + e_score_correction_bias`, renormalised over the winners.
+    "topk_sqrtsoftplus",
+    # DeepSeek-V4 bootstrap layers: expert *selection* is a frozen
+    # `tid2eid[input_ids]` lookup; the learned gate still supplies the weights.
+    "hash_topk",
+    "expert_choice",
+]
 #: Numeric format a serving artifact stores a weight in. The declaration already
 #: carries format policy — `quantizable=False` on router and shared-expert weights
 #: is exactly this decision — so naming the serving format here keeps one source of

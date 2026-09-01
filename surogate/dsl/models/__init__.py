@@ -1,5 +1,6 @@
 """Model Definitions for Python DSL"""
 
+from .deepseek_v4 import DeepseekV4Model
 from .gemma3 import Gemma3CausalModel, Gemma3TextModel
 from .gemma4 import Gemma4CausalModel, Gemma4ConditionalModel, Gemma4UnifiedModel
 from .gpt_oss import GptOssModel
@@ -32,6 +33,7 @@ __all__ = [
     "Lfm2Model",
     "Lfm2MoeModel",
     "Lfm2VlModel",
+    "DeepseekV4Model",
     "Gemma3CausalModel",
     "Gemma3TextModel",
     "Gemma4CausalModel",

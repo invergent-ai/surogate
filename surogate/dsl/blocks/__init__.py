@@ -1,5 +1,13 @@
 """Transformer Blocks for Python DSL"""
 
+from .deepseek_v4 import (
+    DeepseekV4CsaHashBlock,
+    DeepseekV4CsaMoEBlock,
+    DeepseekV4HcaHashBlock,
+    DeepseekV4HcaMoEBlock,
+    DeepseekV4SlidingHashBlock,
+    DeepseekV4SlidingMoEBlock,
+)
 from .gemma4 import (
     Gemma4FullBlock,
     Gemma4FullMoEBlock,
@@ -11,6 +19,7 @@ from .gpt_oss import GptOssBlock
 from .laguna import LagunaDenseBlock, LagunaSparseBlock
 from .llama import LlamaBlock
 from .lfm2 import Lfm2AttentionBlock, Lfm2ConvBlock
+from .lfm2_moe import Lfm2MoeAttentionBlock, Lfm2MoeConvBlock
 from .nemotron_h import (
     NemotronHAttentionBlock,
     NemotronHMamba2Block,
@@ -40,6 +49,16 @@ __all__ = [
     "LlamaBlock",
     "Lfm2AttentionBlock",
     "Lfm2ConvBlock",
+    "Lfm2MoeAttentionBlock",
+    "Lfm2MoeConvBlock",
+    # GLM-5.3-Flash hybrid blocks (KDA / NoPE-MLA x dense / MoE)
+    # DeepSeek-V4 hybrid blocks (attention schedule x MoE schedule)
+    "DeepseekV4SlidingMoEBlock",
+    "DeepseekV4SlidingHashBlock",
+    "DeepseekV4CsaMoEBlock",
+    "DeepseekV4CsaHashBlock",
+    "DeepseekV4HcaMoEBlock",
+    "DeepseekV4HcaHashBlock",
     # Gemma4 hybrid blocks
     "Gemma4SlidingBlock",
     "Gemma4FullBlock",

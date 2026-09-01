@@ -19,6 +19,7 @@ from .attention import (
     Qwen3VLAttention,
     _resolve_rotary_dim,
 )
+from .deepseek_v4 import DeepseekV4Attention, DeepseekV4MoEExperts
 from .embedding import Embedding, LMHead, ScaledEmbedding
 from .gated_delta_rule import ChunkGatedDeltaRule, GatedDeltaNetMixer
 from .hyper_connection import HyperConnection, HyperConnectionCombine, StreamBroadcast
@@ -67,6 +68,7 @@ __all__ = [
     "Gemma4Attention",
     "Gemma4SharedKVAttention",
     "NemotronAttention",
+    "DeepseekV4Attention",
     # SSM / linear attention
     "Mamba2Mixer",
     "GatedDeltaNetMixer",
@@ -83,4 +85,5 @@ __all__ = [
     "Gemma4MoEExperts",
     "NemotronMoEExperts",
     "NemotronSharedExpert",
+    "DeepseekV4MoEExperts",
 ]
