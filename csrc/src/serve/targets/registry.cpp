@@ -275,6 +275,22 @@ Qwen3DenseInstance::Qwen3DenseInstance(std::unique_ptr<LoadedQwen3Dense> stable_
 
 Qwen3DenseInstance::~Qwen3DenseInstance() = default;
 
+LoadedGemma3::LoadedGemma3(std::unique_ptr<Gemma3::LoadedModel> stable_model,
+                           const EngineOptions& options)
+    : model(std::move(stable_model)), frontend(Gemma3::make_frontend(*model, options)) {}
+
+LoadedGemma3::~LoadedGemma3() = default;
+
+Gemma3Instance::Gemma3Instance(std::unique_ptr<LoadedGemma3> stable_loaded,
+                               runtime::KvCapacityResolution resolution,
+                               Gemma3::SequencePlan sequence_plan, DeviceContext& device)
+    : loaded(std::move(stable_loaded)), kv_capacity_resolution(resolution),
+      request_memory(device, sequence_plan.request_transient_capacity_bytes()),
+      capacity(sequence_plan.capacity()),
+      program(Gemma3::create_program(*loaded->model, std::move(sequence_plan), device)) {}
+
+Gemma3Instance::~Gemma3Instance() = default;
+
 LoadedLlama::LoadedLlama(std::unique_ptr<Llama::LoadedModel> stable_model,
                          const EngineOptions& options)
     : model(std::move(stable_model)), frontend(Llama::make_frontend(*model, options)) {}
@@ -398,6 +414,10 @@ ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& 
 
     artifact::Reader reader(options.artifact_path);
     const auto& identity = reader.identity();
+    if (identity.model_id == Gemma3::model_id) {
+        return construct_registered<Gemma3, LoadedGemma3, Gemma3Instance>(
+            options, device, reader, load_start, Gemma3::target_key);
+    }
     if (identity.model_id == Llama::model_id) {
         return construct_registered<Llama, LoadedLlama, LlamaInstance>(
             options, device, reader, load_start, Llama::target_key);

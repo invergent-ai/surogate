@@ -261,7 +261,11 @@ bool w8_linear_add_admits(const W8LinearAddProblem& problem) noexcept {
     // tinyllama-1.1b: its attention output {2048, 2048} is already the 2b shape
     // above; only the mlp down {2048, 5632} is new.
     const bool tinyllama = problem.rows == 2048 && problem.k == 5632;
-    return (base || q08 || q2b || q4b || q3_06b || tinyllama) && problem.padded_k == problem.k &&
+    // gemma-3-270m: attention output {640, 1024} and mlp down {640, 2048}. Its
+    // hidden is narrower than anything else registered here, so both are new.
+    const bool gemma3 = problem.rows == 640 && (problem.k == 1024 || problem.k == 2048);
+    return (base || q08 || q2b || q4b || q3_06b || tinyllama || gemma3) &&
+           problem.padded_k == problem.k &&
            problem.cols >= 1;
 }
 
@@ -281,6 +285,9 @@ W8LinearAddPlan w8_linear_add_resolve_plan(const W8LinearAddProblem& problem) {
         }
         throw std::logic_error("w8 linear_add: admitted problem has no covering route");
     };
+    // gemma-3-270m's two shapes take the runtime-tiled routes; its 640 rows have
+    // no exact-T bake of their own, and the k=2048 branch below is the 2b's.
+    if (problem.rows == 640) { return resolve_from(kQ3_06bRoutes); }
     if (problem.rows == 1024) {
         // The row count alone does not name the geometry here: the 0.8b's exact-T
         // bakes are k=2048/3584, and the 0.6b's mlp down is k=3072.

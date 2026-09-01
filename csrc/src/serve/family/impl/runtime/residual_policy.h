@@ -224,6 +224,29 @@ struct ResidualHooks {
     }
 
     /// Residual planes into the attention block's input.
+    /// The attention output back into the residual.
+    ///
+    /// Most models project and add. Gemma 3 normalises in between -- it carries
+    /// four sandwich norms per layer where this family has slots for two, and
+    /// `post_attention_layernorm` is the one with nowhere to go. A variant that
+    /// needs the projection weights (to reach that norm) declares the longer
+    /// form and gets it; everything else keeps the projection-and-add it had.
+    static void attention_output(const Tensor& attention, const Weight& o_proj,
+                                 const typename Variant::FullAttentionProjectionWeights& weights,
+                                 Tensor& residual, TextPhase phase, WorkspaceArena& work,
+                                 cudaStream_t stream) {
+        if constexpr (requires {
+                          Variant::attention_output_projection(attention, o_proj, weights, residual,
+                                                               phase, work, stream);
+                      }) {
+            Variant::attention_output_projection(attention, o_proj, weights, residual, phase, work,
+                                                 stream);
+        } else {
+            (void)weights;
+            Variant::attention_output_projection(attention, o_proj, residual, phase, work, stream);
+        }
+    }
+
     static void attention_norm(const Tensor& residual, const Tensor& norm, float eps,
                                const typename Variant::FullAttentionProjectionWeights& weights,
                                Tensor& hidden, WorkspaceArena& work, cudaStream_t stream) {

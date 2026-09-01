@@ -125,6 +125,22 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
             break;
         }
         break;
+    // gemma-3-270m, hidden 640: attention query (4 x 256), key and value (1 x 256),
+    // the two MLP projections, and the tied lm head. Bands follow the schedule the
+    // other narrow-hidden entries use; nothing here is measured yet.
+    case 640:
+        switch (n) {
+        case 1024:
+        case 256:
+        case 2048:
+        case 262144:
+            if (t <= 16) { return launch_w8_simt_r8_c4; }
+            if (t <= 128) { return launch_w8_mma_r32_c128; }
+            return launch_w8_mma_r64_c128;
+        default:
+            break;
+        }
+        break;
     case 1152:
         // EmbeddingGemma's MLP down projection, and the one k here that is not a
         // multiple of 256 -- so the MMA routes cannot take it at all: their
@@ -137,6 +153,12 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         }
         break;
     case 1024:
+        // gemma-3-270m's attention output (640 rows from 4 x 256).
+        if (n == 640) {
+            if (t <= 16) { return launch_w8_simt_r8_c4; }
+            if (t <= 128) { return launch_w8_mma_r32_c128; }
+            return launch_w8_mma_r64_c128;
+        }
         // surogate vendor patch (PATCHES.md #13/#29): qwen3.5-0.8b heads
         // (lm head 248320, draft head 131072; hidden 1024).
         if (n == 248320 || n == 131072) {
@@ -179,6 +201,12 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         }
         break;
     case 2048:
+        // gemma-3-270m's MLP down projection (hidden 640 from intermediate 2048).
+        if (n == 640) {
+            if (t <= 16) { return launch_w8_simt_r8_c4; }
+            if (t <= 128) { return launch_w8_mma_r32_c128; }
+            return launch_w8_mma_r64_c128;
+        }
         // tinyllama-1.1b's lm head (32000 rows at hidden 2048). Untied, so it is
         // a matrix of its own rather than the embedding read a second time.
         if (n == 32000) {
