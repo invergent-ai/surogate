@@ -1,4 +1,5 @@
 #include "api/ops/speculative_round.h"
+#include "ops/common/sampling_workspace.h"
 #include "ops/op_tester.h"
 
 #include <algorithm>
@@ -419,16 +420,36 @@ int main() {
     }
 
     int failures = 0;
-    const std::size_t k15 =
-        ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(257, 15, 15, 1, 1);
-    if (k15 == 0 || k15 != ops::sampling_workspace_capacity_bytes(257, 16, 16) ||
-        ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(257, 16, 16, 1, 1) != 0 ||
-        ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(257, 1, 16, 1, 1) != k15 ||
-        ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(257, 15, 15, 1, 2) !=
-            2 * k15) {
-        std::cerr << "speculative accept workspace did not close over K+1 sampling columns\n";
-        ++failures;
-    }
+    // The accept pass samples K+1 columns for K drafts, one row per batch lane.
+    //
+    // These are written against kSamplerMaxColumns rather than restating its
+    // value. The cap has moved twice -- 16, then 32, then tied to the ops batch
+    // bound -- and the literal 16 that used to stand here went stale silently
+    // both times, so this contract check failed on a cap it was not testing.
+    // The header that defines it says "Never hardcode it again"; that applies
+    // on this side of the contract too.
+    constexpr int kCap    = ops::kSamplerMaxColumns;
+    const auto accept     = [](std::int32_t lo, std::int32_t hi, std::int32_t batch) {
+        return ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(257, lo, hi, 1,
+                                                                             batch);
+    };
+    const auto expect = [&](bool ok, const char* what) {
+        if (!ok) {
+            std::cerr << "speculative accept workspace: " << what << "\n";
+            ++failures;
+        }
+    };
+    const std::size_t k15 = accept(15, 15, 1);
+    expect(k15 != 0, "reported no capacity for a 15-draft round");
+    expect(k15 == ops::sampling_workspace_capacity_bytes(257, 16, 16),
+           "did not close over K+1 sampling columns");
+    // A draft count at the cap needs cap+1 columns, which the sampler declines
+    // outright -- so the accept pass reports no capacity rather than too little.
+    expect(accept(kCap, kCap, 1) == 0, "sized a round whose K+1 exceeds the sampler column cap");
+    // Above the cap the interval saturates instead of growing.
+    expect(accept(1, kCap + 4, 1) == accept(1, kCap - 1, 1),
+           "did not saturate a draft interval that runs past the column cap");
+    expect(accept(15, 15, 2) == 2 * k15, "did not scale by the batch bound");
     try {
         (void)ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(257, 0, 15, 1, 1);
         std::cerr << "speculative accept workspace accepted an invalid draft interval\n";
