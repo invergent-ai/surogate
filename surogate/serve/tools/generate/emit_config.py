@@ -26,10 +26,7 @@ def emit_config_h(spec: TargetSpec) -> str:
     a = spec.attention
     l = spec.linear_attention
     if l is None:
-        raise NotImplementedError(
-            "config emission currently covers hybrid (attention + gated delta net) "
-            "targets; a pure-attention family needs its own layout section"
-        )
+        return _emit_dense_config_h(spec)
     return f"""#pragma once
 
 #include <api/targets/qwen3_6/frontend.h>
@@ -119,6 +116,120 @@ inline constexpr float kAttentionScale                   = {spec.attention_scale
 inline constexpr float kGdnScale                         = {spec.gdn_scale!r}F;
 inline constexpr std::uint32_t kPrefillChunkAlignment    = 128;
 inline constexpr std::uint32_t kMaximumMtpDraftTokens    = {spec.mtp_draft_tokens};
+inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 0;
+inline constexpr std::uint32_t kNativeContext            = {spec.native_context};
+
+}} // namespace sinfer::targets::{spec.name}::detail
+"""
+
+
+def _emit_dense_config_h(spec: TargetSpec) -> str:
+    """A pure-attention target: every layer is full attention.
+
+    The family runtime is written over a layer schedule, not over the presence of
+    a linear mixer, so a dense model is expressible as the degenerate hybrid
+    where `is_full_attention` is true everywhere and `gdn_layers()` is zero. The
+    GDN geometry is still emitted, as zeros, because the shared runtime reads
+    those constants unconditionally when it sizes its (then empty) linear state;
+    leaving them out would not compile.
+
+    Two constants differ in kind rather than value from the hybrid emitter, and
+    both are load-bearing:
+
+      * `query_projection_rows` is `query_size`, not `2 * query_size`. The
+        hybrid family fuses an output gate beside the query rows; a plain
+        attention stack has no gate, and a target that claimed one would read
+        the projection with the wrong stride.
+      * `full_attention_interval` is 1, so the schedule helpers resolve to the
+        identity rather than to the family's every-fourth-layer rule.
+    """
+    a = spec.attention
+    return f"""#pragma once
+
+#include <api/targets/qwen3_6/frontend.h>
+#include <api/targets/qwen3_6/hybrid_topology.h>
+#include <api/targets/qwen3_6/vision.h>
+
+#include <cstdint>
+
+namespace sinfer::targets::{spec.name}::detail {{
+
+struct TextConfig {{
+    static constexpr int hidden       = {spec.hidden};
+    static constexpr int layers       = {spec.layers};
+    static constexpr int intermediate = {spec.intermediate};
+
+    // The output matrix is padded for the selected kernels. Only token IDs in
+    // [0, token_domain) are tokenizer-addressable and valid sampling results.
+    static constexpr int output_rows  = {spec.vocab};
+    static constexpr int token_domain = static_cast<int>(qwen3_6::kTokenDomain);
+
+    // No linear mixer. These stay declared because the shared runtime reads them
+    // when it sizes the linear-attention state, which is empty here.
+    static constexpr int gdn_conv_kernel      = 0;
+    static constexpr int gdn_conv_state_width = 0;
+    static constexpr int gdn_key_heads        = 0;
+    static constexpr int gdn_key_head_dim     = 0;
+    static constexpr int gdn_value_heads      = 0;
+    static constexpr int gdn_value_head_dim   = 0;
+
+    static constexpr int query_heads = {a.query_heads};
+    static constexpr int kv_heads    = {a.kv_heads};
+    static constexpr int head_dim    = {a.head_dim};
+    static constexpr int rotary_dim  = {a.rotary_dim};
+
+    static constexpr int full_attention_interval = 1;
+    static constexpr float rms_epsilon           = {_float_literal(spec.rms_epsilon)};
+    static constexpr float rope_theta            = {_float_literal(spec.rope_theta)};
+
+    static constexpr int key_dim               = 0;
+    static constexpr int value_dim             = 0;
+    static constexpr int convolution_dim       = 0;
+    static constexpr int query_size            = query_heads * head_dim;
+    static constexpr int kv_size               = kv_heads * head_dim;
+    // Ungated: the projection carries query rows only, unlike the hybrid family.
+    static constexpr int query_projection_rows = query_size;
+
+    static constexpr int mtp_layers               = 0;
+    static constexpr int mtp_input_rows           = 0;
+    static constexpr int mtp_attention_input_rows = 0;
+    static constexpr int mtp_mlp_gate_up_rows     = 0;
+
+    [[nodiscard]] static constexpr bool is_full_attention(int) {{ return true; }}
+
+    [[nodiscard]] static constexpr int full_attention_layers() {{ return layers; }}
+
+    [[nodiscard]] static constexpr int gdn_layers() {{ return 0; }}
+
+    [[nodiscard]] static constexpr int full_attention_index(int layer) {{ return layer; }}
+
+    [[nodiscard]] static constexpr int gdn_index(int) {{ return -1; }}
+}};
+
+static_assert(TextConfig::full_attention_layers() == {spec.layers});
+static_assert(TextConfig::gdn_layers() == 0);
+
+struct VisionConfig : qwen3_6::VisionBackboneConfig {{
+    static constexpr int output_hidden = TextConfig::hidden;
+}};
+
+struct DFlashConfig {{
+    static constexpr bool supported     = false;
+    static constexpr int local_layers   = 0;
+    static constexpr int local_capacity = 0;
+    static constexpr int kv_heads       = 0;
+    static constexpr int head_dim       = 0;
+    static constexpr int feature_rows   = 0;
+    static constexpr int hidden         = 0;
+    static constexpr int intermediate   = 0;
+    static constexpr int query_size     = 0;
+    static constexpr int kv_size        = 0;
+}};
+
+inline constexpr float kAttentionScale                   = {spec.attention_scale!r}F;
+inline constexpr float kGdnScale                         = 0.0F;
+inline constexpr std::uint32_t kPrefillChunkAlignment    = 128;
+inline constexpr std::uint32_t kMaximumMtpDraftTokens    = 0;
 inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 0;
 inline constexpr std::uint32_t kNativeContext            = {spec.native_context};
 

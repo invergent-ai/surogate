@@ -60,6 +60,9 @@ class Qwen3Model(nn.Model):
         self.d_ff = d_ff
         self.max_seq = max_seq
         self.head_size = head_size
+        # Qwen3 rotates the whole head (no partial_rotary_factor), which the
+        # serve contract reads off the declaration rather than re-deriving.
+        self.rotary_dim = self.head_size
         self.eps = eps
         self.use_qkv_bias = use_qkv_bias
         self.use_qk_norm = use_qk_norm

@@ -75,7 +75,13 @@ std::int64_t layer_stride_bytes(const std::vector<Tensor>& tensors, const char* 
 LinearAttentionStatePoolLayout
 plan_linear_attention_state_pool(LayoutBuilder& builder, const LinearAttentionStatePoolSpec& spec) {
     if (spec.layers == 0) {
-        throw std::invalid_argument("LinearAttentionStatePool layers must be nonzero");
+        // A pure-attention target has no linear mixer. That is a real model
+        // shape, not a misconfiguration: the pool is empty, occupies nothing,
+        // and every accessor below refuses because nothing may ask it for a
+        // layer that does not exist.
+        LinearAttentionStatePoolLayout empty;
+        empty.spec = spec;
+        return empty;
     }
     if (spec.layers > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::overflow_error("LinearAttentionStatePool layer count exceeds int32");
@@ -114,6 +120,13 @@ plan_linear_attention_state_pool(LayoutBuilder& builder, const LinearAttentionSt
 LinearAttentionStatePool::LinearAttentionStatePool(DeviceSpan backing,
                                                    const LinearAttentionStatePoolLayout& layout)
     : spec(layout.spec) {
+    if (spec.layers == 0) {
+        if (!layout.conv.empty() || !layout.recurrent.empty()) {
+            throw std::invalid_argument(
+                "LinearAttentionStatePool declares no layers but carries state");
+        }
+        return; // pure-attention target: nothing to map
+    }
     if (layout.conv.empty() || layout.recurrent.size() != layout.conv.size() ||
         layout.conv.size() != spec.layers) {
         throw std::invalid_argument(
