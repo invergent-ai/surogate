@@ -61,6 +61,11 @@ int check_shape(const sinfer::Tensor& tensor, const std::int32_t (&expected)[4],
 }
 
 int expect_device_byte(const sinfer::Tensor& tensor, unsigned char expected, const char* label) {
+    // Everything this file writes is queued on the context's stream, which is
+    // created cudaStreamNonBlocking and so is not ordered against the legacy null
+    // stream this read uses. Synchronise the device rather than relying on the
+    // caller to have done it.
+    CUDA_CHECK(cudaDeviceSynchronize());
     std::vector<unsigned char> host(tensor.bytes());
     CUDA_CHECK(cudaMemcpy(host.data(), tensor.data, host.size(), cudaMemcpyDeviceToHost));
     for (unsigned char value : host) {
@@ -95,7 +100,7 @@ int main() {
     sinfer::DeviceContext ctx(0);
     auto state_plan = plan_state(3, 10, 3, 4, 5, 6);
     sinfer::DeviceArena state_arena(state_plan.bytes);
-    CUDA_CHECK(cudaMemset(state_arena.base(), 0x4a, state_arena.capacity()));
+    CUDA_CHECK(cudaMemsetAsync(state_arena.base(), 0x4a, state_arena.capacity(), ctx.stream));
     sinfer::LinearAttentionStatePool state({state_arena.base(), state_arena.capacity()},
                                            state_plan.layout);
 
@@ -118,9 +123,11 @@ int main() {
             ++failures;
             std::cerr << "conv dtype is not BF16\n";
         }
-        if (state.recurrent[layer].dtype != sinfer::DType::FP32) {
+        // The recurrent state is bf16 since 7fc710a5 ("store GDN recurrent state
+        // in bf16, compute unchanged"), like the convolution state above it.
+        if (state.recurrent[layer].dtype != sinfer::DType::BF16) {
             ++failures;
-            std::cerr << "recurrent dtype is not FP32\n";
+            std::cerr << "recurrent dtype is not BF16\n";
         }
         if (state.conv[layer].data == state.recurrent[layer].data) {
             ++failures;
@@ -136,6 +143,11 @@ int main() {
         std::cerr << "state layers alias\n";
     }
 
+    // The fills above and the pool's own work must share a stream: ctx.stream is
+    // created cudaStreamNonBlocking, so it does not order against the legacy null
+    // stream a plain cudaMemset uses. Mixing the two let copy_slot read a slot
+    // before its fill had landed -- which showed up as a slot that "was not
+    // copied" while its neighbours were.
     state.zero_slot(0, ctx.stream);
     ctx.synchronize();
     failures += expect_device_byte(state.conv[0], 0, "zeroed conv");
@@ -143,7 +155,7 @@ int main() {
 
     auto slotted_plan = plan_state(2, 10, 3, 4, 5, 6, 3);
     sinfer::DeviceArena slotted_arena(slotted_plan.bytes);
-    CUDA_CHECK(cudaMemset(slotted_arena.base(), 0, slotted_arena.capacity()));
+    CUDA_CHECK(cudaMemsetAsync(slotted_arena.base(), 0, slotted_arena.capacity(), ctx.stream));
     sinfer::LinearAttentionStatePool slotted({slotted_arena.base(), slotted_arena.capacity()},
                                              slotted_plan.layout);
     failures += expect_size(slotted.slot_count(), 3, "slotted.slot_count");
@@ -158,12 +170,12 @@ int main() {
     sinfer::Tensor recurrent1        = slotted.recurrent_slot(0, 1);
     sinfer::Tensor conv1_layer1      = slotted.conv_slot(1, 1);
     sinfer::Tensor recurrent1_layer1 = slotted.recurrent_slot(1, 1);
-    CUDA_CHECK(cudaMemset(conv0.data, 0x7a, conv0.bytes()));
-    CUDA_CHECK(cudaMemset(conv1.data, 0x6b, conv1.bytes()));
-    CUDA_CHECK(cudaMemset(recurrent0.data, 0x5c, recurrent0.bytes()));
-    CUDA_CHECK(cudaMemset(recurrent1.data, 0x4d, recurrent1.bytes()));
-    CUDA_CHECK(cudaMemset(conv1_layer1.data, 0x3c, conv1_layer1.bytes()));
-    CUDA_CHECK(cudaMemset(recurrent1_layer1.data, 0x2d, recurrent1_layer1.bytes()));
+    CUDA_CHECK(cudaMemsetAsync(conv0.data, 0x7a, conv0.bytes(), ctx.stream));
+    CUDA_CHECK(cudaMemsetAsync(conv1.data, 0x6b, conv1.bytes(), ctx.stream));
+    CUDA_CHECK(cudaMemsetAsync(recurrent0.data, 0x5c, recurrent0.bytes(), ctx.stream));
+    CUDA_CHECK(cudaMemsetAsync(recurrent1.data, 0x4d, recurrent1.bytes(), ctx.stream));
+    CUDA_CHECK(cudaMemsetAsync(conv1_layer1.data, 0x3c, conv1_layer1.bytes(), ctx.stream));
+    CUDA_CHECK(cudaMemsetAsync(recurrent1_layer1.data, 0x2d, recurrent1_layer1.bytes(), ctx.stream));
 
     slotted.copy_slot(1, 2, ctx.stream);
     ctx.synchronize();
