@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstddef>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
@@ -35,9 +36,22 @@ struct TokenizerResources {
     std::string_view generation_config_json;
 };
 
+namespace spm_delegate {
+/// Opaque holder for the project tokenizer (csrc/src/tokenizer), so this header
+/// does not drag its includes into every frontend translation unit.
+struct Handle;
+void destroy(Handle* handle);
+struct Deleter {
+    void operator()(Handle* handle) const { destroy(handle); }
+};
+} // namespace spm_delegate
+
 class Tokenizer {
 public:
     explicit Tokenizer(TokenizerResources resources);
+    ~Tokenizer();
+    Tokenizer(Tokenizer&&) noexcept;
+    Tokenizer& operator=(Tokenizer&&) noexcept;
 
     std::vector<int> encode(std::string_view text, EncodeOptions options = {}) const;
     std::string decode(std::span<const int> ids, DecodeOptions options = {}) const;
@@ -60,6 +74,12 @@ private:
     std::vector<AddedToken> added_tokens_;
     std::array<std::vector<std::size_t>, 256> added_token_candidates_;
     std::vector<int> default_stop_token_ids_;
+
+    /// Set when this checkpoint uses the SentencePiece scheme, which the
+    /// byte-level path above cannot represent. Encode and decode delegate to it;
+    /// everything else -- the vocabulary, the added tokens, the stop ids -- is
+    /// still read here, because the artifact contract is the same either way.
+    std::unique_ptr<spm_delegate::Handle, spm_delegate::Deleter> spm_;
 };
 
 } // namespace sinfer::targets::qwen3_6::frontend_internal

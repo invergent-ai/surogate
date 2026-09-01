@@ -192,12 +192,29 @@ fi::ProcessorOptions processor_options(const FrontendResources& resources) {
 void validate_tokenizer_config(const FrontendResources& resources) {
     const Json tokenizer_config =
         parse_resource_json(resources.tokenizer_config_json, "tokenizer_config.json");
-    if (tokenizer_config.value("add_bos_token", true) ||
-        tokenizer_config.value("add_prefix_space", true)) {
+    // These defaults encode a byte-level checkpoint's contract: it adds no BOS and
+    // no prefix space, and a checkpoint that omits the keys means "false". A
+    // SentencePiece checkpoint omits them too and means the opposite -- TinyLlama
+    // states its BOS in the tokenizer.json post-processor and states nothing here
+    // -- so the absent keys cannot be read the same way for both. The scheme is
+    // settled where it is described, in the tokenizer.json.
+    const Json tokenizer_json = parse_resource_json(resources.tokenizer_json, "tokenizer.json");
+    const bool sentencepiece =
+        tokenizer_json.contains("model") && tokenizer_json.at("model").is_object() &&
+        tokenizer_json.at("model").value("byte_fallback", false);
+    if (!sentencepiece && (tokenizer_config.value("add_bos_token", true) ||
+                           tokenizer_config.value("add_prefix_space", true))) {
         throw std::invalid_argument(
             "tokenizer_config.json does not match Qwen3.6 tokenizer prefix semantics");
     }
-    if (!tokenizer_config.contains("pad_token") || !tokenizer_config.at("pad_token").is_string() ||
+    // The pad token must be stated, and for a byte-level checkpoint it must be the
+    // family's own: an artifact claiming a different one is not the model this
+    // target was built for. Its identity is not universal, though -- TinyLlama
+    // pads with </s> -- so what is asserted elsewhere is that one is declared.
+    if (!tokenizer_config.contains("pad_token") || !tokenizer_config.at("pad_token").is_string()) {
+        throw std::invalid_argument("tokenizer_config.json declares no pad token");
+    }
+    if (!sentencepiece &&
         tokenizer_config.at("pad_token").get<std::string>() != "<|endoftext|>") {
         throw std::invalid_argument(
             "tokenizer_config.json does not use the official <|endoftext|> pad token");

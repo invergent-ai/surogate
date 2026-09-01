@@ -1338,6 +1338,20 @@ add_library(sinfer_engine STATIC EXCLUDE_FROM_ALL
   ${SERVE_ROOT}/targets/registry.cpp
   ${SERVE_ROOT}/runtime/contract/sampling.cpp
   ${SERVE_ROOT}/runtime/engine/engine.cpp)
+# The project's tokenizer, shared with training. The serving frontend delegates
+# to it for SentencePiece checkpoints (Llama 2, TinyLlama, Gemma), whose scheme
+# its own byte-level BPE cannot represent. Pure C++ with no CUDA dependency.
+target_sources(sinfer_engine PRIVATE
+  ${CMAKE_SOURCE_DIR}/src/tokenizer/tokenizer.cpp
+  ${CMAKE_SOURCE_DIR}/src/tokenizer/tok_profile.cpp
+  ${CMAKE_SOURCE_DIR}/src/tokenizer/unicode.cpp
+  ${CMAKE_SOURCE_DIR}/src/tokenizer/unicode_data.cpp)
+target_include_directories(sinfer_engine PRIVATE ${CMAKE_SOURCE_DIR}/src
+                                                 ${CMAKE_SOURCE_DIR}/src/tokenizer
+                                                 ${minja_SOURCE_DIR}/include
+                                                 ${fmt_SOURCE_DIR}/include)
+target_compile_definitions(sinfer_engine PRIVATE FMT_HEADER_ONLY=1)
+
 sinfer_internal_includes(sinfer_engine)
 target_include_directories(sinfer_engine PUBLIC ${SERVE_ROOT})
 

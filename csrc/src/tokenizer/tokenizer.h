@@ -83,6 +83,9 @@ public:
     // Vocabulary info.
     int32_t vocab_size() const;
     int32_t bos_token_id() const;
+    // Whether this checkpoint opens a sequence with its BOS, from either
+    // tokenizer_config's add_bos_token or the tokenizer.json post-processor.
+    bool adds_bos() const;
     int32_t eos_token_id() const;
     int32_t pad_token_id() const;
 

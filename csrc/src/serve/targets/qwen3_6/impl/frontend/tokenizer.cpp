@@ -1,4 +1,7 @@
 #include "targets/qwen3_6/impl/frontend/tokenizer.h"
+// The project tokenizer, shared with training. Included by path because this
+// file is itself a tokenizer.h and would otherwise find itself.
+#include "tokenizer/tokenizer.h"
 
 #include "text/unicode.h"
 
@@ -599,6 +602,50 @@ void append_bpe_ids(std::vector<int>& ids, std::string_view text, bool has_bpe_m
 
 } // namespace
 
+namespace spm_delegate {
+struct Handle {
+    ::tokenizer::Tokenizer inner;
+};
+void destroy(Handle* handle) { delete handle; }
+} // namespace spm_delegate
+
+namespace {
+
+/// True when the tokenizer.json describes the SentencePiece scheme rather than
+/// the byte-level one: a normalizer that substitutes a word mark for a space, or
+/// a model that declares byte fallback. Read off the file, never off the target
+/// -- model_type "llama" is byte-level for Llama 3 and SentencePiece for Llama 2.
+bool describes_sentencepiece(const Json& root) {
+    const auto normalizer_marks_words = [](const Json& node, auto&& self) -> bool {
+        if (!node.is_object() || !node.contains("type") || !node.at("type").is_string()) {
+            return false;
+        }
+        const std::string type = node.at("type").get<std::string>();
+        if (type == "Prepend" || type == "Replace") { return true; }
+        if (type == "Sequence" && node.contains("normalizers") &&
+            node.at("normalizers").is_array()) {
+            for (const Json& item : node.at("normalizers")) {
+                if (self(item, self)) { return true; }
+            }
+        }
+        return false;
+    };
+    if (root.contains("normalizer") && !root.at("normalizer").is_null() &&
+        normalizer_marks_words(root.at("normalizer"), normalizer_marks_words)) {
+        return true;
+    }
+    return root.contains("model") && root.at("model").is_object() &&
+           root.at("model").contains("byte_fallback") &&
+           root.at("model").at("byte_fallback").is_boolean() &&
+           root.at("model").at("byte_fallback").get<bool>();
+}
+
+} // namespace
+
+Tokenizer::~Tokenizer()                            = default;
+Tokenizer::Tokenizer(Tokenizer&&) noexcept         = default;
+Tokenizer& Tokenizer::operator=(Tokenizer&&) noexcept = default;
+
 Tokenizer::Tokenizer(TokenizerResources resources) {
     if (resources.tokenizer_json.empty() || resources.tokenizer_config_json.empty() ||
         resources.generation_config_json.empty()) {
@@ -637,10 +684,36 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
     bpe_merge_ranks_        = load_bpe_merge_ranks(model, tokenizer_label);
     has_bpe_merges_         = true;
     default_stop_token_ids_ = load_default_stop_token_ids(resources.generation_config_json);
+
+    // A SentencePiece checkpoint is encoded by the project tokenizer, which
+    // implements that scheme. Everything above still applies: the vocabulary,
+    // the added tokens and the stop ids are the artifact's either way, and only
+    // the text-to-ids mapping differs.
+    if (describes_sentencepiece(root)) {
+        ::tokenizer::Tokenizer::Sources sources;
+        sources.tokenizer_json        = std::string(resources.tokenizer_json);
+        sources.tokenizer_config_json = std::string(resources.tokenizer_config_json);
+        spm_.reset(new spm_delegate::Handle{::tokenizer::Tokenizer::from_sources(sources)});
+    }
 }
 
 std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options) const {
     if (text.empty()) { return {}; }
+    if (spm_) {
+        // The project tokenizer handles added tokens itself, so the option maps
+        // onto which of its two entry points to call.
+        const std::string owned(text);
+        std::vector<int> ids = options.parse_added_tokens
+                                   ? spm_->inner.encode_with_special_tokens(owned)
+                                   : spm_->inner.encode_ordinary(owned);
+        // Llama opens every sequence with its BOS. It comes from the
+        // post-processor rather than the chat template, so nothing upstream has
+        // added it, and a prompt without one is a prompt the model never saw.
+        if (options.parse_added_tokens && spm_->inner.adds_bos()) {
+            ids.insert(ids.begin(), spm_->inner.bos_token_id());
+        }
+        return ids;
+    }
     if (!options.parse_added_tokens) {
         std::vector<int> ids;
         append_bpe_ids(ids, text, has_bpe_merges_, bpe_merge_ranks_, vocab_token_to_id_);
@@ -689,6 +762,21 @@ std::string Tokenizer::decode(std::span<const int> ids, DecodeOptions options) c
         (!ids.empty() && is_stop_token_id(options.stop_token_ids, ids.back())) ? ids.size() - 1
                                                                                : ids.size();
 
+    if (spm_) {
+        // Decoding is not per-token here: the word mark becomes a space only in
+        // the finished string, so the ids are handed over whole.
+        std::vector<std::int32_t> kept;
+        kept.reserve(ids.size());
+        for (std::size_t i = 0; i < ids.size(); ++i) {
+            if (i == terminal_stop_index) { continue; }
+            if (options.skip_special_tokens && is_special_token(ids[i])) { continue; }
+            kept.push_back(ids[i]);
+        }
+        text = spm_->inner.decode(kept);
+        (void)uni::utf8_codepoints(text, "Tokenizer::decode reconstructed output");
+        return text;
+    }
+
     for (std::size_t i = 0; i < ids.size(); ++i) {
         const int id = ids[i];
         if (i == terminal_stop_index) { continue; }
@@ -699,6 +787,10 @@ std::string Tokenizer::decode(std::span<const int> ids, DecodeOptions options) c
 }
 
 std::string Tokenizer::decode_token_bytes(int id, bool skip_special_tokens) const {
+    if (spm_) {
+        if (skip_special_tokens && is_special_token(id)) { return {}; }
+        return spm_->inner.decode(std::vector<std::int32_t>{id});
+    }
     static const std::unordered_map<std::uint32_t, char> byte_decoder = build_byte_level_decoder();
 
     if (skip_special_tokens && is_special_token(id)) { return {}; }

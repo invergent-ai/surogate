@@ -616,6 +616,18 @@ Tokenizer Tokenizer::from_sources(const Sources& sources) {
             }
         }
         if (impl.spm_replacement.empty()) impl.spm_replacement = "\xe2\x96\x81";  // U+2581
+        // A SentencePiece conversion states its prefix in the post-processor
+        // rather than in tokenizer_config: TinyLlama sets no add_bos_token and
+        // still opens every sequence with <s>. Reading only the config would
+        // hand the model a prompt shape it never saw in training.
+        if (data.contains("post_processor") && !data["post_processor"].is_null()) {
+            const auto& post = data["post_processor"];
+            if (post.value("type", std::string()) == "TemplateProcessing" &&
+                post.contains("single") && post["single"].is_array() &&
+                !post["single"].empty() && post["single"][0].contains("SpecialToken")) {
+                impl.add_bos = true;
+            }
+        }
         // The decoder strips the space the Prepend put there.
         impl.spm_strip_leading_space = impl.spm_prepend;
         // <0xNN> -> the byte it stands for, so decode can spell it back out.
@@ -1031,6 +1043,10 @@ std::string Tokenizer::decode_single_token(int32_t id) const {
 int32_t Tokenizer::vocab_size() const {
     return impl_->vocab_size_;
 }
+bool Tokenizer::adds_bos() const {
+    return impl_->add_bos && impl_->bos_id >= 0;
+}
+
 int32_t Tokenizer::bos_token_id() const {
     return impl_->bos_id;
 }
