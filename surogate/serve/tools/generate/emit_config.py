@@ -162,7 +162,7 @@ struct TextConfig {{
     // The output matrix is padded for the selected kernels. Only token IDs in
     // [0, token_domain) are tokenizer-addressable and valid sampling results.
     static constexpr int output_rows  = {spec.vocab};
-    static constexpr int token_domain = static_cast<int>(qwen3_6::kTokenDomain);
+    static constexpr int token_domain = {spec.token_domain or spec.vocab};
 
     // No linear mixer. These stay declared because the shared runtime reads them
     // when it sizes the linear-attention state, which is empty here.

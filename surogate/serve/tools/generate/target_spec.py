@@ -97,6 +97,12 @@ class TargetSpec:
     #: and by LoRA serving once it exists.
     params: tuple[ParamSpec, ...] = ()
 
+    #: Token ids the tokenizer can actually address. Distinct from `vocab`,
+    #: which is the output matrix's padded row count: sampling must never be
+    #: allowed to return a row that decodes to nothing. Zero means "inherit the
+    #: family constant", which only a target sharing that family's tokenizer may.
+    token_domain: int = 0
+
     def validate(self) -> None:
         if not self.name.isidentifier():
             raise ValueError(f"target name {self.name!r} must be a C++ identifier")

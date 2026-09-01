@@ -195,8 +195,10 @@ def from_dsl(
                 "rope_theta is a config pass-through and is absent from this checkpoint config"
             )
 
+    token_domain = overrides.pop("token_domain", 0)
     spec = TargetSpec(
         name=name,
+        token_domain=int(token_domain),
         hidden=int(need("d_model")),
         layers=int(need("n_layers")),
         intermediate=int(need("d_ff")),
