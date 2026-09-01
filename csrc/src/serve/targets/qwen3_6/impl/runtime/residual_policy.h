@@ -40,6 +40,21 @@ template <class Variant>
     }
 }
 
+/// RMSNorm weight convention. This family's checkpoints store zero-centred norm
+/// weights, so the scale a kernel must apply is `1 + w`. A variant whose
+/// checkpoint stores the scale directly -- classic Qwen3 does -- declares false,
+/// and the difference is not subtle: applying the offset to a plain weight
+/// multiplies every norm by roughly `1 + w` instead of `w`, which leaves a model
+/// that still emits fluent text and means none of it.
+template <class Variant>
+[[nodiscard]] constexpr bool norm_unit_offset() {
+    if constexpr (requires { Variant::norm_unit_offset; }) {
+        return Variant::norm_unit_offset;
+    } else {
+        return true;
+    }
+}
+
 /// Debug probe for parity work: a variant may observe intermediate tensors of the family's
 /// layer loop by tag (the default is a no-op that compiles away).
 template <class Variant>
@@ -145,7 +160,8 @@ struct ResidualHooks {
             Variant::final_residual_mix(model, residual, hidden, work, stream);
         } else {
             (void)work;
-            ops::rmsnorm(residual, model.final_norm, eps, true, hidden, stream);
+            ops::rmsnorm(residual, model.final_norm, eps, norm_unit_offset<Variant>(), hidden,
+                         stream);
         }
     }
 
@@ -160,7 +176,7 @@ struct ResidualHooks {
         } else {
             (void)weights;
             (void)work;
-            ops::rmsnorm(residual, norm, eps, true, hidden, stream);
+            ops::rmsnorm(residual, norm, eps, norm_unit_offset<Variant>(), hidden, stream);
         }
     }
 
@@ -175,7 +191,7 @@ struct ResidualHooks {
         } else {
             (void)weights;
             (void)work;
-            ops::rmsnorm(residual, norm, eps, true, hidden, stream);
+            ops::rmsnorm(residual, norm, eps, norm_unit_offset<Variant>(), hidden, stream);
         }
     }
 };

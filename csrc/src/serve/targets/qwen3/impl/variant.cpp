@@ -4,10 +4,17 @@
 #include "api/ops/linear_add.h"
 #include "api/ops/linear_swiglu.h"
 
+#include "core/device.h"
 #include "targets/qwen3_6/impl/lora_hook.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <map>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 #define SINFER_QWEN36_VARIANT    ::sinfer::targets::qwen3::detail::Variant
 #define SINFER_QWEN36_RUNTIME_NS qwen3_runtime
@@ -274,6 +281,70 @@ std::size_t Variant::mtp_q_gate_projection_workspace_capacity_bytes(std::int32_t
 
 std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(std::int32_t, std::int32_t) {
     return 0;
+}
+
+
+// Parity probe. SUROGATE_SERVE_DUMP_RESIDUAL=<dir> writes each tagged attention
+// intermediate of the first forward as raw BF16 behind a 16-byte header
+// {magic, rows, columns, occurrence}. Layers run in order, so the occurrence
+// count of a tag is its layer index -- which keeps the family's probe signature
+// (tag, tensor, stream) unchanged. Synchronises the stream, so it is only ever
+// on for parity work.
+namespace {
+
+const char* probe_directory() {
+    static const char* dir = [] {
+        const char* raw = std::getenv("SUROGATE_SERVE_DUMP_RESIDUAL");
+        return (raw != nullptr && *raw != '\0') ? raw : nullptr;
+    }();
+    return dir;
+}
+
+std::int32_t probe_columns() {
+    static const std::int32_t columns = [] {
+        const char* raw = std::getenv("SUROGATE_SERVE_DUMP_COLUMNS");
+        return (raw != nullptr && *raw != '\0') ? std::atoi(raw) : 0;
+    }();
+    return columns;
+}
+
+std::map<std::string, int>& probe_counts() {
+    static std::map<std::string, int> counts;
+    return counts;
+}
+
+} // namespace
+
+void Variant::debug_probe(const char* tag, const Tensor& tensor, cudaStream_t stream) {
+    const char* dir = probe_directory();
+    if (dir == nullptr || tensor.data == nullptr) { return; }
+    // Prompt-sized rounds only: a long generation would otherwise write a file per
+    // decode step per layer.
+    if (tensor.ne[1] > 64) { return; }
+    // Warmup runs forwards of its own before any request, so a plain "first N
+    // occurrences" rule would spend the budget before the prompt under study
+    // arrives. Select the round by its width instead: SUROGATE_SERVE_DUMP_COLUMNS
+    // names the column count to capture, and the occurrence counter is kept per
+    // (tag, width) so the captured round's layers number 0..N-1 whatever ran
+    // before it.
+    if (probe_columns() > 0 && tensor.ne[1] != probe_columns()) { return; }
+    const std::string key = std::string(tag) + "@" + std::to_string(tensor.ne[1]);
+    const int occurrence  = probe_counts()[key]++;
+    if (occurrence >= TextConfig::layers) { return; }
+
+    const std::size_t bytes = tensor.bytes();
+    std::vector<std::byte> host(bytes);
+    CUDA_CHECK(cudaMemcpyAsync(host.data(), tensor.data, bytes, cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    const std::string path =
+        std::string(dir) + "/" + tag + "_" + std::to_string(occurrence) + ".bin";
+    FILE* file = std::fopen(path.c_str(), "wb");
+    if (file == nullptr) { return; }
+    const std::int32_t header[4] = {0x51335042, tensor.ne[0], tensor.ne[1], occurrence};
+    std::fwrite(header, sizeof(header), 1, file);
+    std::fwrite(host.data(), 1, bytes, file);
+    std::fclose(file);
 }
 
 } // namespace sinfer::targets::qwen3::detail

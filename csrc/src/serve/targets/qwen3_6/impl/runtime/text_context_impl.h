@@ -883,7 +883,9 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
 
     const auto projection = workspace_recipe::text_attention_projection<TextConfig>(work_, T);
     Tensor h              = projection.hidden;
+    debug_probe<Variant>("residual_in", x, s);
     Hooks::attention_norm(x, *w.input_norm, kCfg.rms_eps, *w.projection, h, work_, s);
+    debug_probe<Variant>("post_input_norm", h, s);
 
     Tensor q         = projection.query.view({kCfg.head_dim, kCfg.n_q, T});
     Tensor gate      = projection.gate.view({kCfg.head_dim, kCfg.n_q, T});
@@ -895,18 +897,25 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     Tensor v_flat    = v.view({kCfg.kv_size, T});
     Variant::attention_projection(h, *w.projection, q_flat, gate_flat, k_flat, v_flat, ph, work_,
                                   s);
+    debug_probe<Variant>("q_proj_raw", q_flat, s);
+    debug_probe<Variant>("k_proj_raw", k_flat, s);
+    debug_probe<Variant>("v_proj_raw", v_flat, s);
 
     const auto results = workspace_recipe::text_attention_results<TextConfig>(work_, T);
     Tensor qn          = results.normalized_query.view({kCfg.head_dim, kCfg.n_q, T});
     Tensor kn          = results.normalized_key.view({kCfg.head_dim, kCfg.n_kv, T});
-    ops::rmsnorm(q, *w.q_norm, kCfg.rms_eps, true, qn, s);
-    ops::rmsnorm(k, *w.k_norm, kCfg.rms_eps, true, kn, s);
+    ops::rmsnorm(q, *w.q_norm, kCfg.rms_eps, norm_unit_offset<Variant>(), qn, s);
+    ops::rmsnorm(k, *w.k_norm, kCfg.rms_eps, norm_unit_offset<Variant>(), kn, s);
+    debug_probe<Variant>("q_post_headnorm", qn.view({kCfg.q_size, T}), s);
+    debug_probe<Variant>("k_post_headnorm", kn.view({kCfg.kv_size, T}), s);
     const Tensor& cache_positions =
         active_cache_positions_ != nullptr ? *active_cache_positions_ : io_.pos;
     const Tensor& rope_positions =
         active_rope_positions_ != nullptr ? *active_rope_positions_ : io_.rope_pos;
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
     ops::rope(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
+    debug_probe<Variant>("q_post_rope", qn.view({kCfg.q_size, T}), s);
+    debug_probe<Variant>("k_post_rope", kn.view({kCfg.kv_size, T}), s);
 
     Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, T});
     const Tensor& kv_table_rows =
@@ -1558,8 +1567,10 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                 const auto projection = workspace_recipe::text_attention_projection<TextConfig>(
                     work_, total);
                 Tensor h = projection.hidden;
+                debug_probe<Variant>("residual_in", x, s);
                 Hooks::attention_norm(x, *full.input_norm, kCfg.rms_eps, *full.projection, h,
                                       work_, s);
+                debug_probe<Variant>("post_input_norm", h, s);
                 Tensor q         = projection.query.view({kCfg.head_dim, kCfg.n_q, total});
                 Tensor gate      = projection.gate.view({kCfg.head_dim, kCfg.n_q, total});
                 Tensor k         = projection.key.view({kCfg.head_dim, kCfg.n_kv, total});
@@ -1570,13 +1581,18 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                 Tensor v_flat    = v.view({kCfg.kv_size, total});
                 Variant::attention_projection(h, *full.projection, q_flat, gate_flat, k_flat,
                                               v_flat, Phase::Prefill, work_, s);
+                debug_probe<Variant>("q_proj_raw", q_flat, s);
+                debug_probe<Variant>("k_proj_raw", k_flat, s);
+                debug_probe<Variant>("v_proj_raw", v_flat, s);
 
                 const auto results = workspace_recipe::text_attention_results<TextConfig>(work_,
                                                                                          total);
                 Tensor qn = results.normalized_query.view({kCfg.head_dim, kCfg.n_q, total});
                 Tensor kn = results.normalized_key.view({kCfg.head_dim, kCfg.n_kv, total});
-                ops::rmsnorm(q, *full.q_norm, kCfg.rms_eps, true, qn, s);
-                ops::rmsnorm(k, *full.k_norm, kCfg.rms_eps, true, kn, s);
+                ops::rmsnorm(q, *full.q_norm, kCfg.rms_eps, norm_unit_offset<Variant>(), qn, s);
+                ops::rmsnorm(k, *full.k_norm, kCfg.rms_eps, norm_unit_offset<Variant>(), kn, s);
+                debug_probe<Variant>("q_post_headnorm", qn.view({kCfg.q_size, total}), s);
+                debug_probe<Variant>("k_post_headnorm", kn.view({kCfg.kv_size, total}), s);
 
                 Tensor rope_positions = roots.positions;
                 if (rope_delta_ != 0) {
@@ -1591,6 +1607,8 @@ PrefillChunkResult TextContext::mixed_chunk_multi(std::span<const MixedPrefillSe
                                                cudaMemcpyDeviceToDevice, s));
                 }
                 ops::rope(rope_all, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
+                debug_probe<Variant>("q_post_rope", qn.view({kCfg.q_size, total}), s);
+                debug_probe<Variant>("k_post_rope", kn.view({kCfg.kv_size, total}), s);
 
                 Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, total});
                 for (std::size_t sg = 0; sg < segments.size(); ++sg) {
@@ -1998,8 +2016,8 @@ void TextContext::mixed_graph_window(std::int32_t chunk_bucket, std::int32_t bat
                                                                                          total);
                 Tensor qn = results.normalized_query.view({kCfg.head_dim, kCfg.n_q, total});
                 Tensor kn = results.normalized_key.view({kCfg.head_dim, kCfg.n_kv, total});
-                ops::rmsnorm(q, *full.q_norm, kCfg.rms_eps, true, qn, s);
-                ops::rmsnorm(k, *full.k_norm, kCfg.rms_eps, true, kn, s);
+                ops::rmsnorm(q, *full.q_norm, kCfg.rms_eps, norm_unit_offset<Variant>(), qn, s);
+                ops::rmsnorm(k, *full.k_norm, kCfg.rms_eps, norm_unit_offset<Variant>(), kn, s);
 
                 Tensor rope_positions = roots.positions;
                 Tensor rope_all       = rope_positions.view({total});

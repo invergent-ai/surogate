@@ -55,6 +55,17 @@ struct Variant {
     /// unwritten gate plane last held.
     static constexpr bool attention_output_gate = false;
 
+    /// Classic Qwen3 stores RMSNorm scales directly, not zero-centred: the
+    /// scale is `w`, not `1 + w`. The hybrid targets declare nothing and get the
+    /// family default.
+    static constexpr bool norm_unit_offset = false;
+
+
+    /// Parity probe: under SUROGATE_SERVE_DUMP_RESIDUAL the family loop's
+    /// attention intermediates are written out, tagged and numbered by the order
+    /// the layers run in. A no-op unless the variable is set.
+    static void debug_probe(const char* tag, const Tensor& tensor, cudaStream_t stream);
+
     static void attention_projection(const Tensor& hidden,
                                      const FullAttentionProjectionWeights& weights, Tensor& query,
                                      Tensor& gate, Tensor& key, Tensor& value,
