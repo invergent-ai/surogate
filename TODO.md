@@ -47,10 +47,12 @@ before the next. Run the suite with `CUDA_VISIBLE_DEVICES=<free gpu> ctest
 - [ ] **TODO** Decode key-range re-basing. Higher risk per review: feed the policy the tile-aligned extent or half the splits go neutral; a 1-KV-head layer collapses to ~9–18 CTAs on a 170-SM part so latency may not follow bytes; reduction order changes, and HF-exactness is the gate.
 - [ ] **TODO** `Gqa256_4q1` `DecodeSplitScale`: apply the tile floor only to the default tiers, never to the measured INT8 special cases (`24/scale`, `32/scale` bands are deliberately sub-tile).
 
-## Group 7 — Gemma sandwich norms — **TODO**
+## Group 7 — Gemma sandwich norms — **DONE** (`913dc6e3`)
 
-- [ ] **TODO** `rmsnorm` + `residual_add` at both sandwich sites cost 72 extra graph nodes and 36 planes per round. Add a generic accumulating `rmsnorm_add` (`out += bf16(rmsnorm(x) * gain)`, bit-identical to the two-step form), use it at both sites, shrink the workspace accounting; measure decode tok/s and TTFT.
-- [ ] **TODO** (with the above) gemma3's `attention_output_workspace_bytes` still reserves `linear_add` capacity for a path the leaf never runs; delete it when the accounting is rewritten.
+- [x] **DONE** Generic `ops::rmsnorm_add` (`out += bf16(rmsnorm(x) * gain)`), used at both sandwich sites. **Measured**: largest captured decode graph 353 → 317 nodes (exactly 36 = one `residual_add` per site × 18 layers, 10.2% of dispatch); single-user decode 439.2 → 445.1 tok/s (+1.3%, interleaved A/B/A/B, 8 samples each). Bit-identical to the pair it replaces, pinned by a composition test over 7 shapes; removing the pre-add rounding fails 3 of them.
+- [x] **DONE** The dead `linear_add` reservation in `attention_output_workspace_bytes` is gone, and each leaf drops one hidden-wide plane.
+- Note: the review's original "72 nodes / 36 planes" was 2× too high — only `residual_add` is removed per site, since a row-wide reduction cannot fuse into the GEMM. Measurement confirms 36.
+- Graph node counts are now reportable behind `SUROGATE_SERVE_GRAPH_NODES`; nothing else exposed what a captured round costs to dispatch.
 
 ## Performance found along the way
 
