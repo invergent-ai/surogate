@@ -39,9 +39,16 @@ bridged checkpoint as before.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
+
+from surogate.serve.tools.convert.common.row_algebra import (
+    SOURCE_STRIDE,
+    RowProgram,
+    RowShapeMismatch,
+    collect_sources,
+    evaluate_rows,
+)
 
 import numpy as np
 import torch
@@ -49,14 +56,9 @@ import torch
 from surogate.serve.tools.artifact.layouts import encode_row_split, row_split_geometry
 from surogate.serve.tools.artifact.numeric import QuantFormat, get_format
 from surogate.serve.tools.convert.common.recipe import (
-    Concat,
     Expression,
     GatherRows,
-    Reshape,
-    Slice,
-    SourceTensor,
     TensorRecipe,
-    Transpose,
 )
 
 _REPACK_FORMAT = "W8G32_F16S"
@@ -116,25 +118,15 @@ REPACKABLE_TYPES = {
     "Q5_0": (22, _planes_q5_0),
     "IQ4_NL": (18, _planes_iq4_nl),
 }
-_SOURCE_STRIDE = 1 << 40  # global row id = source_index * stride + row
+# The row algebra lives in row_algebra.py now, shared with the compressed-tensors
+# path; these aliases keep this module's internal references unchanged.
+_SOURCE_STRIDE = SOURCE_STRIDE
+_RowProgram = RowProgram
+_collect_sources = collect_sources
 
 
 class RepackError(ValueError):
     pass
-
-
-@dataclass(frozen=True, slots=True)
-class _RowProgram:
-    """Row-only evaluation of one recipe expression.
-
-    ``rows`` holds global row ids over ``sources`` (in first-use order); the
-    flattened order is the object's logical row order because every supported
-    expression keeps the trailing K axis untouched.
-    """
-
-    sources: tuple[str, ...]
-    rows: np.ndarray  # int64 [N]
-    k: int
 
 
 class GgufRepackSource:
@@ -211,85 +203,18 @@ class GgufRepackSource:
     ) -> _RowProgram | None:
         """Evaluate an expression to global row ids, or None if unsupported.
 
-        Values are ndarrays over the row axes only (the trailing K axis of
-        every node is asserted equal and dropped); any expression touching K
-        or mixing K extents is rejected.
+        The walker itself is ``row_algebra.evaluate_rows``; this binds it to
+        the GGUF's sources and reports a shape disagreement as a RepackError.
         """
 
-        sources: list[str] = []
-
-        def source_index(name: str) -> int:
-            if name not in self.sources:
-                raise _Unsupported()
-            try:
-                return sources.index(name)
-            except ValueError:
-                sources.append(name)
-                return len(sources) - 1
-
-        def walk(node: Expression) -> tuple[np.ndarray, int]:
-            if isinstance(node, SourceTensor):
-                if len(node.shape) != 2 or node.name not in self.sources:
-                    raise _Unsupported()
-                n, k = node.shape
-                actual = self.source_shape(node.name)
-                if actual != (n, k):
-                    raise RepackError(
-                        f"{node.name}: GGUF shape {actual} != recipe shape {(n, k)}"
-                    )
-                index = source_index(node.name)
-                ids = np.arange(n, dtype=np.int64) + index * _SOURCE_STRIDE
-                return ids, k
-            if isinstance(node, Reshape):
-                ids, k = walk(node.source)
-                if not node.shape or node.shape[-1] != k:
-                    raise _Unsupported()
-                return ids.reshape(node.shape[:-1]), k
-            if isinstance(node, Slice):
-                ids, k = walk(node.source)
-                if node.axis >= ids.ndim:  # slicing the K axis
-                    raise _Unsupported()
-                return (
-                    np.take(ids, np.arange(node.begin, node.end), axis=node.axis),
-                    k,
-                )
-            if isinstance(node, Transpose):
-                ids, k = walk(node.source)
-                full_rank = ids.ndim + 1
-                if tuple(node.axes)[-1] != full_rank - 1:
-                    raise _Unsupported()  # moves the K axis
-                return ids.transpose(tuple(node.axes)[:-1]), k
-            if isinstance(node, Concat):
-                parts = [walk(part) for part in node.sources]
-                ks = {k for _, k in parts}
-                if len(ks) != 1:
-                    raise _Unsupported()
-                first = parts[0][0]
-                if node.axis >= first.ndim:  # concatenating along K
-                    raise _Unsupported()
-                return (
-                    np.concatenate([ids for ids, _ in parts], axis=node.axis),
-                    ks.pop(),
-                )
-            if isinstance(node, GatherRows):
-                if token_ids is None:
-                    raise _Unsupported()
-                ids, k = walk(node.source)
-                if ids.ndim != 1:
-                    raise _Unsupported()
-                gathered = ids[token_ids.astype(np.int64)]
-                if gathered.shape[0] != node.rows:
-                    raise RepackError(
-                        f"GatherRows: {gathered.shape[0]} ids != declared {node.rows}"
-                    )
-                return gathered, k
-            raise _Unsupported()  # Cast, DraftHeadTokenIds, unknown nodes
-
         try:
-            ids, k = walk(expression)
-        except _Unsupported:
-            return None
-        return _RowProgram(tuple(sources), ids.reshape(-1), k)
+            return evaluate_rows(
+                expression,
+                {name: self.source_shape(name) for name in self.sources},
+                token_ids,
+            )
+        except RowShapeMismatch as error:
+            raise RepackError(str(error)) from error
 
     # -- public plan/payload API -------------------------------------------
 
@@ -373,22 +298,6 @@ class GgufRepackSource:
             spec_format,
             tuple(spec.shape),
         )
-
-
-class _Unsupported(Exception):
-    pass
-
-
-def _collect_sources(node: Expression, out: set[str]) -> None:
-    if isinstance(node, SourceTensor):
-        out.add(node.name)
-    elif isinstance(node, (Reshape, Slice, Transpose)):
-        _collect_sources(node.source, out)
-    elif isinstance(node, Concat):
-        for part in node.sources:
-            _collect_sources(part, out)
-    elif isinstance(node, GatherRows):
-        _collect_sources(node.source, out)
 
 
 __all__ = ["GgufRepackSource", "RepackError"]
