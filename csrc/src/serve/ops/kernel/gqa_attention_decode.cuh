@@ -77,6 +77,22 @@ __device__ __forceinline__ bool gqa_valid_q_head(int kv_head, int q_head) {
            q_head < (kv_head + 1) * Geometry::GroupSize && q_head < Geometry::QHeads;
 }
 
+/// The first key any token of this tile may attend to.
+///
+/// A sliding window makes the oldest keys invisible to every token at once: the
+/// earliest query in the tile admits keys from `first_pos - window + 1`, and
+/// nothing below that can contribute to any of them. Splitting the range from
+/// here, rather than from key zero, is what keeps a windowed layer's decode cost
+/// bounded by its window instead of by the whole context.
+///
+/// The split kernels and the reducer must agree on the range exactly -- they
+/// derive the active split count from it independently -- so both call this.
+__device__ __forceinline__ int gqa_small_t_key_lo(int first_pos, int sliding_window) {
+    if (sliding_window <= 0) { return 0; }
+    const int lo = first_pos - sliding_window + 1;
+    return lo > 0 ? lo : 0;
+}
+
 template <typename Geometry>
 __device__ __forceinline__ int gqa_small_t_default_splits(int window) {
     int target_keys_per_split = 480 / Geometry::DecodeSplitScale;
@@ -147,7 +163,7 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
     const __nv_bfloat16* partial_acc, const float* partial_m, const float* partial_l,
     const std::int32_t* positions, const std::int32_t* valid_columns, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t batch_size,
-    std::int32_t split_count, __nv_bfloat16* out) {
+    std::int32_t split_count, std::int32_t sliding_window, __nv_bfloat16* out) {
     static_assert(DChunk > 0 && DChunk <= Geometry::HeadDim);
 
     const int q_head      = static_cast<int>(blockIdx.x);
@@ -167,8 +183,9 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
 
     if constexpr (Offset) { positions += column_begin; }
     if constexpr (MultiBatch) { positions += batch * full_width; }
-    const int last_pos = positions[tokens - 1];
-    int output_column  = token;
+    const int last_pos  = positions[tokens - 1];
+    const int first_pos = positions[0];
+    int output_column   = token;
     if constexpr (Offset) { output_column += column_begin; }
     if constexpr (MultiBatch) { output_column += batch * full_width; }
 
@@ -182,7 +199,9 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
         partial_l += partial_stat_row;
     }
 
-    const int window = last_pos + 1;
+    // The same range the split kernels partitioned, derived the same way.
+    const int key_lo = gqa_small_t_key_lo(first_pos, sliding_window);
+    const int window = (last_pos + 1) - key_lo;
     const int active_split_count =
         gqa_small_t_active_splits<Geometry, Int8>(window, split_count, tokens);
 

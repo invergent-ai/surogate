@@ -996,6 +996,12 @@ int run_a1_case(const Geometry& geometry, DType dtype, const AttentionCase& test
     const std::size_t workspace_bytes = ops::gqa_attention_workspace_capacity_bytes(
         geometry.q_heads, geometry.kv_heads, dtype, envelope, 1, test_case.tokens, test_case.tokens);
     GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
+    // Poison the partial buffers. A split kernel returns without writing when it
+    // is past the active count, so an unwritten split leaves whatever was here;
+    // zeros contribute nothing to the reduction and hide a reducer that disagrees
+    // with the kernel about how many splits are live. 0xff makes those lanes NaN,
+    // which the comparison cannot absorb.
+    workspace_buffer.fill(0xff);
     WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
 
     ops::gqa_attention(tq, tk, tv, tp, Tensor{}, ttable_row, kAttentionScale, cache.batch_view(),
@@ -1059,6 +1065,12 @@ int run_a3_case(const Geometry& geometry, DType dtype, const AttentionCase& test
     const std::size_t workspace_bytes = ops::gqa_attention_workspace_capacity_bytes(
         geometry.q_heads, geometry.kv_heads, dtype, envelope, 1, test_case.tokens, test_case.tokens);
     GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
+    // Poison the partial buffers. A split kernel returns without writing when it
+    // is past the active count, so an unwritten split leaves whatever was here;
+    // zeros contribute nothing to the reduction and hide a reducer that disagrees
+    // with the kernel about how many splits are live. 0xff makes those lanes NaN,
+    // which the comparison cannot absorb.
+    workspace_buffer.fill(0xff);
     WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
 
     ops::gqa_attention_cached(tq, tp, kAttentionScale, cache.view(), envelope, workspace, tout,
@@ -1233,6 +1245,12 @@ int run_batch_case(const Geometry& geometry, DType dtype, const BatchAttentionCa
     const std::size_t workspace_bytes = ops::gqa_attention_workspace_capacity_bytes(
         geometry.q_heads, geometry.kv_heads, dtype, envelope, batch, test_case.width, test_case.width);
     GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
+    // Poison the partial buffers. A split kernel returns without writing when it
+    // is past the active count, so an unwritten split leaves whatever was here;
+    // zeros contribute nothing to the reduction and hide a reducer that disagrees
+    // with the kernel about how many splits are live. 0xff makes those lanes NaN,
+    // which the comparison cannot absorb.
+    workspace_buffer.fill(0xff);
     WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
 
     const bool masked = std::any_of(test_case.valid_columns.begin(), test_case.valid_columns.end(),

@@ -171,7 +171,12 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
         return;
     }
 
-    const int window = last_pos + 1;
+    // Partition the keys this tile can actually see, not every key ever written.
+    // Below `key_lo` the window excludes every token in the tile, so those keys
+    // were staged and scored only to be masked away.
+    const int key_lo = gqa_small_t_key_lo(first_pos, sliding_window);
+    const int key_hi = last_pos + 1;
+    const int window = key_hi - key_lo;
     const int active_split_count =
         gqa_small_t_active_splits<Geometry, false>(window, split_count, TokenTile);
     if (split >= active_split_count) { return; }
@@ -180,9 +185,9 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     const bool tile_split   = logical_tiles >= active_split_count;
     const int units_per_split =
         tile_split ? div_up(logical_tiles, active_split_count) : div_up(window, active_split_count);
-    const int split_start = split * units_per_split * (tile_split ? Bc : 1);
+    const int split_start = key_lo + split * units_per_split * (tile_split ? Bc : 1);
     const int split_limit = split_start + units_per_split * (tile_split ? Bc : 1);
-    const int split_end   = (split_limit < window) ? split_limit : window;
+    const int split_end   = (split_limit < key_hi) ? split_limit : key_hi;
     if (split_start >= split_end) {
         write_neutral();
         return;
