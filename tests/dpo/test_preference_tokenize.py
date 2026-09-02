@@ -244,3 +244,51 @@ def test_padding_still_present_when_rows_differ_in_length():
     assert b.width == max(lengths)
     for k in range(b.n_seq):
         assert np.all(np.diff(b.position_ids[k]) == 1)
+
+
+# ── the width must keep the divisibility the config was validated for ──
+
+
+def test_width_is_rounded_up_to_the_requested_multiple():
+    """`sequence_len` is validated against `lmhead_chunks` at config time; a
+    trimmed width has to carry that forward itself.
+
+    The fused lm-head splits `B * T` into `lmhead_chunks` equal nano-batches by
+    truncating division and runs exactly that many, so a non-divisible width
+    silently drops the remainder. In the reference forward those tokens come
+    back as logprob 0.0, and because the width is the *longest* row, the dropped
+    tail belongs to a row with real scored tokens: wrong margins, no error.
+    """
+    tok = FakeTok()
+    rows = [
+        {"prompt": "un prompt ceva mai lung aici", "chosen": "raspuns lung", "rejected": "raspuns scurt"},
+        {"prompt": "scurt", "chosen": "da", "rejected": "nu"},
+    ]
+    natural = tokenize_preference_pairs(rows, tok, max_len=2048)
+    aligned = tokenize_preference_pairs(rows, tok, max_len=2048, width_multiple=16)
+
+    assert aligned.width % 16 == 0
+    assert aligned.width >= natural.width
+    assert aligned.width - natural.width < 16  # rounded up, not inflated
+
+
+def test_alignment_never_exceeds_the_cap():
+    """Rounding up must not push the width past `max_len`, whatever multiple is
+    asked for."""
+    tok = FakeTok()
+    rows = [{"prompt": "scrie un cuvant", "chosen": "mergeam acasa", "rejected": "mergeram acasa"}]
+    b = tokenize_preference_pairs(rows, tok, max_len=8, width_multiple=64)
+
+    assert b.width <= 8
+
+
+def test_padding_from_alignment_is_still_one_document():
+    """The pad cells alignment adds are padding like any other, and must not
+    read as document boundaries."""
+    tok = FakeTok()
+    rows = [{"prompt": "scrie un cuvant", "chosen": "mergeam acasa", "rejected": "mergeram acasa"}]
+    b = tokenize_preference_pairs(rows, tok, max_len=2048, width_multiple=16)
+
+    assert b.width > int(b.seq_len.max()), "alignment must have added padding here"
+    for k in range(b.n_seq):
+        assert np.all(np.diff(b.position_ids[k]) == 1)

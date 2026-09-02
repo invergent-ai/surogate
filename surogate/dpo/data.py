@@ -111,7 +111,12 @@ def _diff_segments(
 
 
 def tokenize_preference_pairs(
-    rows: list[dict], tok, max_len: int, pad_id: int | None = None, span_mask: bool = False
+    rows: list[dict],
+    tok,
+    max_len: int,
+    pad_id: int | None = None,
+    span_mask: bool = False,
+    width_multiple: int = 1,
 ) -> PrefBatch:
     """Tokenize {prompt, chosen, rejected} rows into a one-sequence-per-row PrefBatch.
 
@@ -121,6 +126,14 @@ def tokenize_preference_pairs(
     span_mask=True confines loss_mask to the disjoint token blocks where chosen
     and rejected differ. Identical-tokenization rows, and rows where truncation
     removes every differing token from either side, are dropped.
+
+    width_multiple rounds the row width up, clamped by max_len. The engine
+    slices the fused lm-head into `lmhead_chunks` equal nano-batches by
+    truncating division (`fused_lm_head_loss.cpp`), so a `B * width` that is not
+    divisible silently drops the remainder rather than erroring, and in the
+    reference forward those tokens come back as logprob 0.0. `sequence_len` is
+    validated against `lmhead_chunks` at config time; a trimmed width has to
+    carry that property forward itself.
     """
     if pad_id is None:
         pad_id = tok.pad_token_id
@@ -193,6 +206,8 @@ def tokenize_preference_pairs(
     # `max_len` made a short pair cost a full-length forward. `_layout_sequence`
     # has already left-truncated every row to `max_len`, so this cannot exceed it.
     width = max(len(ids) for ids, _ in seqs)
+    if width_multiple > 1:
+        width = min(int(max_len), -(-width // width_multiple) * width_multiple)
     input_ids = np.full((n_seq, width), pad_id, dtype=np.int32)
     targets = np.zeros((n_seq, width), dtype=np.int32)
     loss_mask = np.zeros((n_seq, width), dtype=np.uint8)
@@ -292,7 +307,12 @@ def precompute_ref_logprobs(trainer, batch: PrefBatch, engine_b: int, host_rows:
         rows = end - start
         ids = np.zeros((chunk, max_len), dtype=np.int32)
         tgt = np.zeros((chunk, max_len), dtype=np.int32)
-        pos = np.zeros((chunk, max_len), dtype=np.int32)
+        # Filler rows get the same monotonic ramp as real ones. Zero-filling
+        # them would make each of their pad tokens a length-1 document and flip
+        # doc masking on for this chunk alone (see the module docstring).
+        pos = np.broadcast_to(
+            np.arange(max_len, dtype=np.int32), (chunk, max_len)
+        ).copy()
         ids[:rows] = batch.input_ids[start:end]
         tgt[:rows] = batch.targets[start:end]
         pos[:rows] = batch.position_ids[start:end]

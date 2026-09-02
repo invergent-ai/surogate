@@ -25,6 +25,7 @@ forward and optimizes the chosen-vs-rejected likelihood gap directly.
 """
 
 import json
+import math
 import shutil
 import tempfile
 import time
@@ -45,6 +46,12 @@ from surogate.utils.lora_compat import ensure_surogate_lora_compat, ensure_vllm_
 from surogate.utils.tensor import to_surogate_dtype
 
 logger = get_logger()
+
+# NVFP4's RHT transform hard-throws unless B*T is a multiple of 16
+# (csrc/.../nvfp4_recipe.cpp). Only reachable on a full-finetune DPO run, but
+# folding it into the width alignment costs a few pad tokens and removes the
+# failure mode entirely.
+_NVFP4_BT_MULTIPLE = 16
 
 
 def _normalize_pref_row(row: dict) -> dict:
@@ -154,11 +161,19 @@ def dpo_main(config: DPOTrainConfig, args=None) -> None:
     # has to come from the tokenized batch: `sequence_len` is the cap, the batch
     # reports the width the data actually needed.
     rows = _load_pref_datasets(config.datasets or [], num_workers=config.dataloader_num_workers or 1)
+    # The trimmed width has to keep the divisibility `sequence_len` was
+    # validated for. The fused lm-head splits `B * T` into `lmhead_chunks` equal
+    # nano-batches by truncating division and silently drops the remainder; the
+    # NVFP4 path additionally hard-requires a multiple of 16. Aligning the width
+    # covers both, and can only round up to at most `sequence_len`, which is
+    # already a valid width by construction.
+    align = math.lcm(max(1, int(config.lmhead_chunks or 1)), _NVFP4_BT_MULTIPLE)
     batch = tokenize_preference_pairs(
         rows,
         config.tokenizer,
         max_len=int(config.sequence_len),
         span_mask=config.loss.span_mask,
+        width_multiple=align,
     )
     T = batch.width
     n_rows = len(rows)
