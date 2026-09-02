@@ -178,11 +178,23 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     bind_text_layers(binder, weights_profile, out);
     out.final_norm = artifact::bind_device_tensor(binder, "text/final_norm", NumericFormat::BF16,
                                                   {TextConfig::hidden});
-    // `tie_word_embeddings` is a property of the checkpoint, not of the artifact:
-    // Gemma 3 ties the head to the embedding and the converter resolves that,
-    // storing the head as its own object.
-    out.output_head = bind_weight(binder, "text/output_head", vocabulary_format,
-                                  {TextConfig::output_rows, TextConfig::hidden});
+    // The head is the embedding table. Gemma 3 ties them and ships no
+    // `lm_head.weight` at all, so the converter stores one table and names
+    // `text/output_head` a logical role on it -- `ALIAS_SPECS` in
+    // `surogate/serve/tools/convert/gemma3/inventory.py`, the same shape as
+    // `mtp/token_embedding` on the qwen3_5_0_8b target. Binding it a second time
+    // would put two ~168 MB tables on a device whose whole model is ~270 MB, and
+    // there is no second object to bind: the artifact does not carry one.
+    //
+    // `tie_word_embeddings` is a property of the checkpoint rather than of the
+    // architecture, so an artifact converted from an untied export does store its
+    // own head, and this binds it where it is present. The probe is what lets one
+    // binder read both artifact shapes; an object no binder consumes is refused at
+    // load, so the two cannot be collapsed into an unconditional bind.
+    out.output_head = binder.has("text/output_head")
+                          ? bind_weight(binder, "text/output_head", vocabulary_format,
+                                        {TextConfig::output_rows, TextConfig::hidden})
+                          : out.token_embedding;
 
     load_plan.materialization = binder.finish();
     return load_plan;
@@ -229,7 +241,9 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     }
     static_assert(kGdnLayers == 0, "a Gemma 3 layer is never a linear mixer");
 
-    runtime.final_norm  = materialized_norm(backing, plan.final_norm, TextConfig::hidden);
+    runtime.final_norm = materialized_norm(backing, plan.final_norm, TextConfig::hidden);
+    // Where the head is aliased, `plan.output_head` *is* `plan.token_embedding`,
+    // so this reads back the one uploaded table rather than a second copy of it.
     runtime.output_head = materialized_weight(backing, plan.output_head, TextConfig::output_rows,
                                               TextConfig::hidden);
 }

@@ -107,10 +107,11 @@ struct BindingPlan {
     artifact::ObjectHandle final_norm;
     /// Gemma 3 ties its LM head to the embedding table -- the checkpoint ships no
     /// `lm_head.weight` at all, and `_build_gemma3_mappings` resolves `lm_head`
-    /// to `embed_tokens.weight`. The converter still stores the head as its own
-    /// object rather than an alias (the gather and the output matmul want
-    /// different residency), so this is an ordinary binding, exactly as on
-    /// Qwen3-0.6B, which is also tied.
+    /// to `embed_tokens.weight`. The converter stores the one table and names
+    /// `text/output_head` a logical role on it, so on a tied artifact this holds
+    /// `token_embedding`'s handle rather than a second binding; see
+    /// `bindings.cpp`. It is an ordinary binding only for an artifact converted
+    /// from an untied export, which stores a head of its own.
     WeightPlan output_head;
 };
 

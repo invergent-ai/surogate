@@ -9,8 +9,11 @@ Canonical invocation::
 This is the Llama recipe with the differences Gemma 3 actually has.  Four are
 structural and live in `inventory.py`: four sandwich norms per layer, Q/K/V and
 gate/up kept separate rather than fused, per-head query and key norms, and a
-head that is tied to the embedding but still stored.  Three more are properties
-of the numbers rather than of the object list, and each is silent when wrong:
+head that is tied to the embedding and therefore *not stored* — `text/output_head`
+is a role `inventory.ALIAS_SPECS` puts on `text/token_embedding`, and
+`targets/gemma3/impl/load/bindings.cpp` fills both from the one table.  Three
+more are properties of the numbers rather than of the object list, and each is
+silent when wrong:
 
 * **The norms are zero-centred and pass through untouched.**  `Gemma3RMSNorm`
   is `x_normed * (1 + w)`, so a Gemma checkpoint stores `w`, not the scale.  The
@@ -29,13 +32,14 @@ of the numbers rather than of the object list, and each is silent when wrong:
   would apply it twice.
 
 * **The local/global schedule and the attention scale are compile-time constants
-  in the engine.**  `config.h` bakes in `sliding_window 512`, a period of 6
-  counted from the end, the two rope bases, and `kAttentionScale = 0.0625` —
-  which is `query_pre_attn_scalar ** -0.5` for a scalar of 256, *not*
-  `1/sqrt(head_dim)` in general (Gemma3-27B has scalar 168 against head_dim
-  128).  So the converter checks the checkpoint's `layer_types` against the rule
-  and its `query_pre_attn_scalar` against the constant, rather than letting an
-  artifact that disagrees load and be served with the wrong masks.
+  in the engine.**  `config.h` bakes in `sliding_window 512`, the schedule itself
+  as `kWindowedAttention` (one bool per layer), the two rope bases, and
+  `kAttentionScale = 0.0625` — which is `query_pre_attn_scalar ** -0.5` for a
+  scalar of 256, *not* `1/sqrt(head_dim)` in general (Gemma3-27B has scalar 168
+  against head_dim 128).  So the converter resolves the checkpoint's own schedule
+  — from `layer_types` or from a `sliding_window_pattern` period, whichever the
+  export wrote — and refuses one that disagrees, rather than letting an artifact
+  load and be served with the wrong masks and rope bases.
 
 Two facts about the release shape the code below.  It is a single unsharded
 `model.safetensors` with no index, like the TinyLlama and Qwen3 releases.  And
@@ -88,32 +92,39 @@ RECIPE_ID = "gemma3-v1"
 ResourcePayload = family_conversion.ResourcePayload
 ObjectPlan = family_conversion.ObjectPlan
 
-#: Members of `config.json` that must hold for the registered target. Geometry is
-#: read out of the file rather than asserted against a second copy of itself;
-#: these are the members that are not geometry, plus the architecture identity.
+#: Members of `config.json` that must hold for the registered target, and that
+#: every exporter writes. Geometry is read out of the file rather than asserted
+#: against a second copy of itself; these are the members that are not geometry,
+#: plus the architecture identity.
 #:
 #: `hidden_activation`, not `hidden_act`: Gemma 3 spells it the long way, and the
-#: value is the tanh approximation of GELU rather than SiLU. The two softcapping
-#: members are `null` on this checkpoint and the engine implements neither, so a
-#: checkpoint that set one would be served without it.
-#: `use_bidirectional_attention` separates a generative Gemma 3 from the encoder
-#: backbone that shares the declaration; the engine is causal.
+#: value is the tanh approximation of GELU rather than SiLU.
+#:
+#: This table is checked with `check_members`, whose test is
+#: `actual.get(name) != value` — an absent key reads as `None` and so is a
+#: mismatch for every entry whose expected value is not `None`. That is what
+#: "required" means here, and it is why the table below has to stay disjoint from
+#: this one: a key named in both is required, and the optional table never gets a
+#: say.
 _REQUIRED_CONFIG = {
     "architectures": ["Gemma3ForCausalLM"],
     "hidden_activation": "gelu_pytorch_tanh",
     "attention_bias": False,
-    "attention_dropout": 0.0,
     "rms_norm_eps": 1e-6,
     "rope_scaling": None,
-    "attn_logit_softcapping": None,
-    "final_logit_softcapping": None,
-    "use_bidirectional_attention": False,
 }
 
-#: Members that only some exporter versions write, with the value an absent key
-#: asserts. `use_bidirectional_attention` post-dates the first Gemma 3 exports
-#: and is false for every generative checkpoint; the softcapping members are
-#: likewise absent from older configs and inactive when absent.
+#: Members only some exporter versions write, with the value an absent key
+#: asserts: present-and-wrong is refused, absent is tolerated
+#: (`check_optional_members`). Nothing here may also appear above.
+#:
+#: `use_bidirectional_attention` separates a generative Gemma 3 from the encoder
+#: backbone that shares the declaration; the engine is causal, and the key
+#: post-dates the first Gemma 3 exports, which is exactly the case this table
+#: exists for. The two softcapping members are absent from older configs and
+#: inactive when absent; the engine implements neither, so a checkpoint that set
+#: one would be served without it. `attention_dropout` is inference-inert but
+#: names a checkpoint trained with a dropout the engine cannot reproduce.
 _OPTIONAL_CONFIG = {
     "use_bidirectional_attention": False,
     "attn_logit_softcapping": None,
@@ -124,9 +135,16 @@ _OPTIONAL_CONFIG = {
 #: What the engine holds as compile-time constants in
 #: `csrc/src/serve/targets/gemma3/impl/config.h`. A checkpoint that disagrees
 #: with any of them would load and be served wrong, so it is refused here.
+#:
+#: The local/global schedule is *not* here. It used to be, as
+#: `"_sliding_window_pattern": 6`, and that entry refused every newer
+#: `transformers` export: those state the schedule as a `layer_types` list and
+#: write no period at all, so `check_members` saw an absent key and called it a
+#: mismatch. `check_layer_schedule` below subsumes it — it accepts either
+#: spelling, resolves the per-layer schedule the way the DSL does, and compares
+#: the result against the array the header states.
 _ENGINE_CONSTANTS = {
     "sliding_window": inventory.SLIDING_WINDOW,
-    "_sliding_window_pattern": inventory.SLIDING_WINDOW_PERIOD,
     "rope_theta": 1000000.0,
     "rope_local_base_freq": 10000.0,
     # kAttentionScale = 0.0625 = 256 ** -0.5. Not the same thing as
@@ -182,33 +200,82 @@ def check_optional_members(
         raise ValueError("checkpoint config mismatch:\n  " + "\n  ".join(mismatches))
 
 
-def check_layer_schedule(config: Mapping[str, object], geometry: inventory.Geometry) -> None:
-    """The local/global schedule the engine bakes in, against the one shipped.
+def resolve_layer_schedule(
+    config: Mapping[str, object],
+    geometry: inventory.Geometry,
+) -> list[str]:
+    """The checkpoint's own local/global schedule, one entry per layer.
 
-    `config.h::is_windowed_attention` is `(layer + 1) % period != 0` — a period
-    counted from the end, so the last layer is global. A checkpoint whose own
-    `layer_types` said otherwise would be served with the wrong mask and the
-    wrong rope base on every layer where they disagree, and nothing downstream
-    would notice: both kinds of layer store identical objects.
+    Gemma 3 states this two ways and a given export writes only one of them. The
+    original configs carry a *period* — `sliding_window_pattern`, written
+    `_sliding_window_pattern` by the exporter of the day — and layer `i` is
+    global when `(i + 1) % period == 0`, so the last layer is. Newer
+    `transformers` exports resolve that themselves and ship a `layer_types` list
+    instead, with no period anywhere in the file. Both are valid and both have to
+    land on the same schedule.
+
+    The rule is not restated here: `surogate/dsl/models/gemma3.py` already owns
+    it, and a second copy is a second thing to get wrong. Entries come back as
+    the DSL names them — `"sliding"` or `"full"`.
     """
 
-    declared = config.get("layer_types")
-    if not declared:
-        return
-    expected = [
-        "full_attention" if layer in inventory.GLOBAL_ATTENTION_LAYERS else "sliding_attention"
-        for layer in range(geometry.layers)
-    ]
-    if list(declared) != expected:
-        disagreeing = [
-            layer
-            for layer, (got, want) in enumerate(zip(declared, expected))
-            if got != want
-        ]
+    # Imported inside the function: the DSL package pulls in the training stack,
+    # and a converter that fails to import because of it would be worse than the
+    # duplication this avoids.
+    from surogate.dsl.models.gemma3 import (  # noqa: PLC2701 - one rule, one owner
+        _parse_gemma3_layer_types,
+    )
+
+    layer_types = config.get("layer_types")
+    # Both spellings are live. `Gemma3TextConfig.__post_init__` reads
+    # `sliding_window_pattern` as a back-compat kwarg and keeps it as
+    # `_sliding_window_pattern`, so Hub configs written before that move carry the
+    # plain name and ones written since carry the underscored one —
+    # gemma-3-270m-it carries `_sliding_window_pattern: 6`. `or`, not a `.get`
+    # default: a config that states the plain key as `null` would otherwise
+    # shadow the underscored one that holds the value.
+    period = config.get("sliding_window_pattern") or config.get("_sliding_window_pattern")
+    if not layer_types and not period:
         raise ValueError(
-            "checkpoint layer_types do not follow the schedule the engine bakes "
-            f"in ((layer + 1) % {inventory.SLIDING_WINDOW_PERIOD} == 0 is global); "
-            f"layers {disagreeing[:8]} disagree"
+            "config.json states no attention schedule: neither a layer_types "
+            "list nor a sliding_window_pattern / _sliding_window_pattern period. "
+            "Gemma 3 alternates windowed against global attention and the engine "
+            "bakes the resolved schedule in, so it cannot be guessed"
+        )
+    return _parse_gemma3_layer_types(
+        list(layer_types) if layer_types else None,
+        geometry.layers,
+        int(period) if period else 0,
+    )
+
+
+def check_layer_schedule(config: Mapping[str, object], geometry: inventory.Geometry) -> None:
+    """The schedule the engine bakes in, against the one the checkpoint states.
+
+    The target header states the schedule as data — `config.h::kWindowedAttention`,
+    one bool per layer, read through `is_windowed_attention(layer)` — and
+    `inventory.WINDOWED_ATTENTION` is this side's copy of it. A checkpoint that
+    disagreed would be served with the wrong mask and the wrong rope base on
+    every layer where they differ, and nothing downstream would notice: a
+    windowed layer and a global one store identical objects.
+    """
+
+    resolved = resolve_layer_schedule(config, geometry)
+    expected = ["sliding" if windowed else "full" for windowed in inventory.WINDOWED_ATTENTION]
+    disagreeing = [
+        layer for layer, (got, want) in enumerate(zip(resolved, expected)) if got != want
+    ]
+    if disagreeing:
+        detail = ", ".join(
+            f"{layer}: checkpoint {resolved[layer]}, target {expected[layer]}"
+            for layer in disagreeing[:8]
+        )
+        raise ValueError(
+            "checkpoint attention schedule disagrees with the one "
+            "csrc/src/serve/targets/gemma3/impl/config.h states as "
+            f"kWindowedAttention; {len(disagreeing)} of {geometry.layers} layers "
+            f"disagree ({detail}"
+            f"{', ...' if len(disagreeing) > 8 else ''})"
         )
 
 
@@ -243,7 +310,12 @@ def validate_config(config: Mapping[str, object]) -> tuple[inventory.Geometry, d
             "rope_theta",
             "rope_local_base_freq",
             "sliding_window",
+            # Whichever spelling this export used; newer ones write neither and
+            # state `layer_types` instead. The report records what was read
+            # rather than a normalisation of it.
+            "sliding_window_pattern",
             "_sliding_window_pattern",
+            "layer_types",
             "query_pre_attn_scalar",
             "max_position_embeddings",
             "attention_bias",
@@ -263,6 +335,9 @@ def validate_config(config: Mapping[str, object]) -> tuple[inventory.Geometry, d
             "output_gate": False,
             "qk_norm": True,
             "global_layers": list(inventory.GLOBAL_ATTENTION_LAYERS),
+            # The resolved schedule, so the report says which layers were served
+            # windowed whichever way the checkpoint spelled it.
+            "layer_schedule": resolve_layer_schedule(config, geometry),
         },
         "norms": {
             "per_layer": 4,
@@ -374,22 +449,23 @@ def build_recipes(
             )
         )
 
-    recipes.extend(
-        (
-            TensorRecipe("text/final_norm", source("model.norm.weight", (hidden,))),
+    recipes.append(TensorRecipe("text/final_norm", source("model.norm.weight", (hidden,))))
+    if not tied_output_head:
+        # `tie_word_embeddings` is a property of the checkpoint in hand, not of
+        # the architecture, so an untied Gemma 3 stores a head of its own and
+        # reads it from `lm_head.weight`. Every published `Gemma3ForCausalLM`
+        # ties, and gemma-3-270m-it ships no `lm_head.weight` at all, so this is
+        # the branch that does not run today.
+        recipes.append(
             TensorRecipe(
-                "text/output_head",
-                # Gemma 3 ties the head and ships no `lm_head.weight` at all, so
-                # the tied branch is the live one here — unlike Qwen3-0.6B, which
-                # is tied and still publishes a bit-identical copy. The untied
-                # branch stays because `tie_word_embeddings` is a property of the
-                # checkpoint in hand, not of the architecture.
-                embedding
-                if tied_output_head
-                else source("lm_head.weight", (geometry.vocab, hidden)),
-            ),
+                "text/output_head", source("lm_head.weight", (geometry.vocab, hidden))
+            )
         )
-    )
+    # The tied case has no `text/output_head` recipe because it has no such
+    # object: `inventory.ALIAS_SPECS` makes the head a role served by
+    # `text/token_embedding`, and the binder fills both from the one table.
+    # Giving it the embedding's expression instead would quantise 167.8M elements
+    # a second time and write ~170 MB of byte-identical duplicate.
     return tuple(recipes)
 
 
@@ -397,8 +473,13 @@ RECIPE_SPECS = build_recipes()
 RECIPES_BY_NAME = {recipe.object_name: recipe for recipe in RECIPE_SPECS}
 
 
-def validate_recipe_coverage() -> None:
-    _validate_recipe_coverage(RECIPE_SPECS, inventory.TENSOR_SPECS)
+def validate_recipe_coverage(
+    recipes: Sequence[TensorRecipe] = RECIPE_SPECS,
+    *,
+    tied_output_head: bool = True,
+) -> None:
+    stored, _ = inventory.active_specs(tied_output_head=tied_output_head)
+    _validate_recipe_coverage(recipes, stored)
 
 
 def source_requirements(recipes: Sequence[TensorRecipe] = RECIPE_SPECS) -> dict:
@@ -575,46 +656,75 @@ class ConversionPreflight:
     source: SourcePreflight
     resources: tuple[ResourcePayload, ...]
     object_plan: ObjectPlan
+    #: What this checkpoint stores, which is one object short of the declaration
+    #: when the head is tied. The writer walks this, not the module-level list.
+    object_specs: tuple[inventory.StoredObjectSpec, ...]
+    tied_output_head: bool
 
     @property
     def recipes_by_name(self) -> dict[str, TensorRecipe]:
         return {recipe.object_name: recipe for recipe in self.recipes}
 
 
-def preflight_inventory() -> None:
-    """The inventory the recipe and the writer agree to produce."""
+def preflight_inventory(*, tied_output_head: bool = True) -> None:
+    """The inventory the recipe and the writer agree to produce.
 
-    expected_tensors = 1 + inventory.LAYERS * inventory.LAYER_OBJECT_COUNT + 2
-    if len(inventory.TENSOR_SPECS) != expected_tensors:
+    The embedding, thirteen objects a layer, the final norm — and the output head
+    only where the checkpoint unties it. A tied checkpoint stores the head as a
+    role on `text/token_embedding` (`inventory.ALIAS_SPECS`), so it is one object
+    short of the declaration, which is the count `TENSOR_SPECS` still carries.
+    """
+
+    declared_tensors = 1 + inventory.LAYERS * inventory.LAYER_OBJECT_COUNT + 2
+    if len(inventory.TENSOR_SPECS) != declared_tensors:
         raise ValueError(
             f"registered inventory holds {len(inventory.TENSOR_SPECS)} tensors, "
-            f"expected {expected_tensors}"
+            f"expected {declared_tensors}"
+        )
+    stored_tensors, object_specs = inventory.active_specs(tied_output_head=tied_output_head)
+    expected_stored = declared_tensors - (1 if tied_output_head else 0)
+    if len(stored_tensors) != expected_stored:
+        raise ValueError(
+            f"stored inventory holds {len(stored_tensors)} tensors, "
+            f"expected {expected_stored}"
         )
     if len(inventory.RESOURCE_SPECS) != 4:
         raise ValueError("registered inventory does not hold the four text resources")
-    if len(inventory.OBJECT_SPECS) != expected_tensors + 4:
+    if len(object_specs) != expected_stored + 4:
         raise ValueError("registered object inventory is incomplete")
-    validate_recipe_coverage()
+    validate_recipe_coverage(
+        build_recipes(tied_output_head=tied_output_head),
+        tied_output_head=tied_output_head,
+    )
 
 
-def build_object_plan(resources: Mapping[str, bytes]) -> ObjectPlan:
-    preflight_inventory()
-    return family_conversion.build_object_plan(inventory.OBJECT_SPECS, resources)
+def build_object_plan(
+    resources: Mapping[str, bytes],
+    *,
+    tied_output_head: bool = True,
+) -> ObjectPlan:
+    preflight_inventory(tied_output_head=tied_output_head)
+    _, object_specs = inventory.active_specs(tied_output_head=tied_output_head)
+    return family_conversion.build_object_plan(object_specs, resources)
 
 
 def preflight_conversion(model_dir: str | Path) -> ConversionPreflight:
     model = Path(model_dir)
     config = family_conversion.load_json(model / "config.json")
     geometry, summary = validate_config(config)
-    preflight_inventory()
-    # Which tensor the output head reads is a property of the checkpoint, not of
-    # the target, so the recipe is rebuilt for the checkpoint in hand rather than
-    # the module-level one being used blind.
-    recipes = build_recipes(geometry, tied_output_head=tied_output_head(config))
-    _validate_recipe_coverage(recipes, inventory.TENSOR_SPECS)
+    # Whether the head is its own object is a property of the checkpoint, not of
+    # the target, so both the recipe and the object list are built for the
+    # checkpoint in hand rather than the module-level ones being used blind.
+    tied = tied_output_head(config)
+    preflight_inventory(tied_output_head=tied)
+    recipes = build_recipes(geometry, tied_output_head=tied)
+    stored_specs, object_specs = inventory.active_specs(tied_output_head=tied)
+    _validate_recipe_coverage(recipes, stored_specs)
     source_preflight = preflight_sources(model, recipes)
     resources = load_resources(model)
-    plan = build_object_plan({item.name: item.data for item in resources})
+    plan = build_object_plan(
+        {item.name: item.data for item in resources}, tied_output_head=tied
+    )
     return ConversionPreflight(
         model_dir=model,
         geometry=geometry,
@@ -623,6 +733,8 @@ def preflight_conversion(model_dir: str | Path) -> ConversionPreflight:
         source=source_preflight,
         resources=resources,
         object_plan=plan,
+        object_specs=object_specs,
+        tied_output_head=tied,
     )
 
 
@@ -721,8 +833,8 @@ def convert(
         ) as writer:
             if writer.objects != preflight.object_plan.objects:
                 raise RuntimeError("writer object plan differs from completed preflight")
-            total = len(inventory.OBJECT_SPECS)
-            for index, spec in enumerate(inventory.OBJECT_SPECS, start=1):
+            total = len(preflight.object_specs)
+            for index, spec in enumerate(preflight.object_specs, start=1):
                 if isinstance(spec, inventory.ResourceSpec):
                     payload = resources[spec.name]
                 else:

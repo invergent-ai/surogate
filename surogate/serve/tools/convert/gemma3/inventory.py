@@ -36,6 +36,14 @@ every one of them comes from the declaration rather than from a family habit:
   untouched.  Only a GGUF source, which stores the folded `1 + w`, has to
   subtract; see `convert/gemma_embedding/sources.py`.
 
+* **The tied head is not stored.**  Gemma 3 ties `lm_head` to the embedding and
+  ships no `lm_head.weight`, so `text/output_head` is a logical role served by
+  the stored `text/token_embedding` (`ALIAS_SPECS`), the way `mtp/token_embedding`
+  is on `qwen3_5_0_8b`.  The declaration still names the head — aliasing is a
+  storage decision and `ServeObject` does not express it — which is why
+  `TENSOR_SPECS` (what the model has, and what `--diff` compares) and
+  `STORED_TENSOR_SPECS` (what the artifact writes) are two lists here.
+
 Row order convention, shared with the rest of the package: every 2-D object is
 logical ``[rows = outputs, k = inputs]``.
 
@@ -144,17 +152,28 @@ KV_SIZE = GEOMETRY.kv_size
 FULL_ATTENTION_LAYERS = tuple(range(LAYERS))
 
 #: The *other* axis, and the one that is easy to confuse with the name above.
-#: Gemma 3 alternates local against global attention on a period, counting from
-#: the end: `config.h::is_windowed_attention` is `(layer + 1) % period != 0`, so
-#: the last layer is global. Nothing in the artifact depends on the schedule —
-#: a windowed layer and a global one store identical objects — but the converter
-#: checks the checkpoint's own `layer_types` against it, because the engine bakes
-#: the rule in as a constant and a checkpoint that disagreed would be served with
-#: the wrong masks and the wrong rope bases, in silence.
+#: Gemma 3 alternates local against global attention. Nothing in the artifact
+#: depends on the schedule — a windowed layer and a global one store identical
+#: objects — but the converter checks the checkpoint's resolved schedule against
+#: it, because the engine bakes the schedule in and a checkpoint that disagreed
+#: would be served with the wrong masks and the wrong rope bases, in silence.
+#:
+#: `WINDOWED_ATTENTION` is the converter's copy of what the target header states
+#: as data: `config.h::kWindowedAttention`, one bool per layer, true where the
+#: layer is windowed, read through `config.h::is_windowed_attention(layer)`.
+#: Gemma 3 *derives* that array from a period counted from the end — layer
+#: `(layer + 1) % period == 0` is global, so the last layer is — but the period
+#: is not the contract: newer `transformers` exports state the schedule as a
+#: `layer_types` list and write no period at all, and both spellings have to land
+#: on the same array. The period stays because it is how this release's schedule
+#: is generated and because the checkpoint may spell it that way.
 SLIDING_WINDOW = 512
 SLIDING_WINDOW_PERIOD = 6
+WINDOWED_ATTENTION: tuple[bool, ...] = tuple(
+    (layer + 1) % SLIDING_WINDOW_PERIOD != 0 for layer in range(LAYERS)
+)
 GLOBAL_ATTENTION_LAYERS = tuple(
-    layer for layer in range(LAYERS) if (layer + 1) % SLIDING_WINDOW_PERIOD == 0
+    layer for layer, windowed in enumerate(WINDOWED_ATTENTION) if not windowed
 )
 
 
@@ -179,6 +198,30 @@ RESOURCE_SPECS = tuple(
         "frontend/generation_config.json",
     )
 )
+
+
+#: One alias, and it is the largest object in the run. `Gemma3ForCausalLM` ties
+#: the head to the embedding — `gemma-3-270m-it` ships no `lm_head.weight` at all
+#: — so `text/output_head` is a logical *role* served by the stored
+#: `text/token_embedding`, exactly as `mtp/token_embedding` is on the
+#: `qwen3_5_0_8b` target. Storing it instead would quantise 167.8M elements
+#: twice, carry ~170 MB of byte-identical duplicate in the artifact, and hold two
+#: ~168 MB tables on a device whose whole model is ~270 MB.
+#:
+#: Nothing else is aliased: no MTP head reuses the text embedding, and no object
+#: is stored in an order a second consumer needs permuted.
+#:
+#: `csrc/src/serve/targets/gemma3/impl/load/bindings.cpp` is the other half — it
+#: binds `text/token_embedding` once and fills both roles from that one handle.
+#: An artifact that stored the head separately would be refused there ("artifact
+#: object was not consumed by the selected target"), so the two halves have to
+#: move together.
+ALIAS_SPECS: tuple[LogicalAliasSpec, ...] = (
+    LogicalAliasSpec("text/output_head", ("text/token_embedding",)),
+)
+
+#: The roles above, as names: what `build_stored_tensor_specs` leaves out.
+ALIASED_OBJECT_NAMES = frozenset(spec.role_pattern for spec in ALIAS_SPECS)
 
 
 def build_tensor_specs(geometry: Geometry = GEOMETRY) -> tuple[TensorSpec, ...]:
@@ -226,32 +269,79 @@ def build_tensor_specs(geometry: Geometry = GEOMETRY) -> tuple[TensorSpec, ...]:
     specs.extend(
         (
             tensor_spec("text/final_norm", (hidden,), BF16),
-            # Stored, not aliased, even though this checkpoint ties the head to
-            # the embedding: the head is bound as its own device tensor, and the
-            # embedding gather and the output matmul want different residency.
-            # Qwen3-0.6B is tied too and stores it the same way.
+            # Declared, and stored only when the checkpoint unties it; see
+            # `ALIAS_SPECS` and `build_stored_tensor_specs` below.
             tensor_spec("text/output_head", (geometry.vocab, hidden), W8),
         )
     )
     return tuple(specs)
 
 
+def build_stored_tensor_specs(
+    geometry: Geometry = GEOMETRY,
+    *,
+    tied_output_head: bool = True,
+) -> tuple[TensorSpec, ...]:
+    """The objects the artifact actually writes, in the same order.
+
+    Aliasing is a storage decision, and the declaration does not express it: the
+    model has an `lm_head`, so `emit_inventory` derives a `text/output_head`
+    whatever the checkpoint ties. What a *tied* checkpoint stores is one object
+    fewer, because the head is the embedding table — see `ALIAS_SPECS`.
+    """
+
+    specs = build_tensor_specs(geometry)
+    if not tied_output_head:
+        return specs
+    return tuple(spec for spec in specs if spec.name not in ALIASED_OBJECT_NAMES)
+
+
 def build_object_specs(
     geometry: Geometry = GEOMETRY,
+    *,
+    tied_output_head: bool = True,
 ) -> tuple[StoredObjectSpec, ...]:
-    return RESOURCE_SPECS + build_tensor_specs(geometry)
+    return RESOURCE_SPECS + build_stored_tensor_specs(
+        geometry, tied_output_head=tied_output_head
+    )
 
 
+def active_specs(
+    *,
+    tied_output_head: bool,
+    geometry: Geometry = GEOMETRY,
+) -> tuple[tuple[TensorSpec, ...], tuple[StoredObjectSpec, ...]]:
+    """Both lists for the checkpoint in hand, the way `qwen4exp` selects a variant.
+
+    Which one a run uses is a property of the checkpoint (`tie_word_embeddings`),
+    not of the target, so `convert.py` asks for it rather than reading the
+    module-level tuples blind.
+    """
+
+    tensors = build_stored_tensor_specs(geometry, tied_output_head=tied_output_head)
+    return tensors, RESOURCE_SPECS + tensors
+
+
+#: Every object this model *has*, in declaration order — the list
+#: `serve/tools/generate/emit_inventory.py --diff` compares against, and the one
+#: `tests/test_serve_contract.py` would use. It is not the list the artifact
+#: writes: see `STORED_TENSOR_SPECS`.
 TEXT_CORE_TENSOR_SPECS = build_tensor_specs()
 TENSOR_SPECS = TEXT_CORE_TENSOR_SPECS
-OBJECT_SPECS: tuple[StoredObjectSpec, ...] = RESOURCE_SPECS + TENSOR_SPECS
 
+#: What a tied checkpoint — which is every published `Gemma3ForCausalLM`, and
+#: `gemma-3-270m-it` in particular — actually stores.
+STORED_TENSOR_SPECS = build_stored_tensor_specs()
+OBJECT_SPECS: tuple[StoredObjectSpec, ...] = RESOURCE_SPECS + STORED_TENSOR_SPECS
+
+# The numeric profile of the artifact, so these count what is written rather than
+# what is declared.
 FORMAT_COUNTS = {
-    numeric_format: sum(spec.format == numeric_format for spec in TENSOR_SPECS)
+    numeric_format: sum(spec.format == numeric_format for spec in STORED_TENSOR_SPECS)
     for numeric_format in FORMAT_NAMES
 }
 LAYOUT_COUNTS = {
-    layout: sum(spec.layout == layout for spec in TENSOR_SPECS)
+    layout: sum(spec.layout == layout for spec in STORED_TENSOR_SPECS)
     for layout in LAYOUT_NAMES
 }
 
@@ -263,13 +353,8 @@ LAYOUT_COUNTS = {
 #: name the whole of one.
 LOGICAL_ROW_VIEW_SPECS: tuple[LogicalRowViewSpec, ...] = ()
 
-#: No aliases: no MTP head reuses the text embedding, the tied output head is
-#: stored rather than aliased, and no object is stored in an order a second
-#: consumer needs permuted.
-ALIAS_SPECS: tuple[LogicalAliasSpec, ...] = ()
-
-
 __all__ = [
+    "ALIASED_OBJECT_NAMES",
     "ALIAS_SPECS",
     "BF16",
     "CONTIGUOUS_LAYOUT",
@@ -301,6 +386,7 @@ __all__ = [
     "ResourceSpec",
     "SLIDING_WINDOW",
     "SLIDING_WINDOW_PERIOD",
+    "STORED_TENSOR_SPECS",
     "StoredObjectSpec",
     "TARGET_KEY",
     "TENSOR_SPECS",
@@ -309,7 +395,10 @@ __all__ = [
     "VOCAB",
     "W8",
     "WEIGHTS_ID",
+    "WINDOWED_ATTENTION",
+    "active_specs",
     "build_object_specs",
+    "build_stored_tensor_specs",
     "build_tensor_specs",
     "tensor_spec",
 ]
