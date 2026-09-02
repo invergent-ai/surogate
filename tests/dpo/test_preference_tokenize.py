@@ -41,7 +41,9 @@ def test_masks_and_targets_and_pairing():
 
     assert b.n_pairs == 1
     assert b.n_seq == 2
-    assert b.input_ids.shape == (2, 32)
+    # Width tracks the data, not the `max_len` cap: these rows are far short
+    # of 32, and allocating at the cap was the padding waste bug 26 removes.
+    assert b.input_ids.shape == (2, int(b.seq_len.max()))
 
     for k in range(2):
         L = int(b.seq_len[k])
@@ -214,3 +216,51 @@ def test_padding_change_does_not_touch_the_loss():
         L = int(b.seq_len[k])
         assert b.loss_mask[k, L:].sum() == 0
         assert np.all(b.targets[k, L:] == 0)
+
+
+# ── the batch is sized to the data, not to the config ──────────────
+
+
+def test_batch_width_tracks_the_data_not_the_cap():
+    """A 50-token pair used to cost a 2048-token forward, three times over:
+    the policy pass, the frozen reference pass, and the backward."""
+    tok = FakeTok()
+    rows = [{"prompt": "scrie un cuvant", "chosen": "mergeam acasa", "rejected": "mergeram acasa"}]
+    b = tokenize_preference_pairs(rows, tok, max_len=2048)
+
+    longest = int(b.seq_len.max())
+    assert b.max_len == longest, f"width {b.max_len} should track the longest row {longest}"
+    assert b.input_ids.shape == (b.n_seq, longest)
+    assert b.position_ids.shape == (b.n_seq, longest)
+    assert b.loss_mask.shape == (b.n_seq, longest)
+
+
+def test_the_cap_still_drops_what_does_not_fit():
+    """Trimming must not turn the cap into a suggestion: rows too long for
+    `max_len` are still dropped, and the width never exceeds it."""
+    tok = FakeTok()
+    rows = [
+        {"prompt": "a b c d e f g h", "chosen": "x y z", "rejected": "p q r"},
+        {"prompt": "scurt", "chosen": "da", "rejected": "nu"},
+    ]
+    b = tokenize_preference_pairs(rows, tok, max_len=4)
+
+    assert b.max_len <= 4
+    assert int(b.seq_len.max()) <= 4
+
+
+def test_padding_still_present_when_rows_differ_in_length():
+    """Trimming is to the longest row, not per row: shorter rows keep their
+    padding, and it still must not read as document boundaries."""
+    tok = FakeTok()
+    rows = [
+        {"prompt": "un prompt ceva mai lung aici", "chosen": "raspuns lung", "rejected": "raspuns scurt"},
+        {"prompt": "scurt", "chosen": "da", "rejected": "nu"},
+    ]
+    b = tokenize_preference_pairs(rows, tok, max_len=2048)
+
+    lengths = {int(x) for x in b.seq_len}
+    assert len(lengths) > 1, "fixture must contain rows of differing length"
+    assert b.max_len == max(lengths)
+    for k in range(b.n_seq):
+        assert np.all(np.diff(b.position_ids[k]) == 1)

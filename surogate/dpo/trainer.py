@@ -144,11 +144,31 @@ def _reference_free_logprobs(
 def dpo_main(config: DPOTrainConfig, args=None) -> None:
     ngpu = max(1, int(config.gpus or 1))
     B = int(config.per_device_train_batch_size)
-    T = int(config.sequence_len)
     if B % 2 != 0:
         raise ValueError(f"per_device_train_batch_size must be even (pairs are 2 rows); got {B}")
     pairs_per_gpu = B // 2
     checkpoint_dir = config.checkpoint_dir or str(Path(config.output_dir))
+
+    # --- tokenize preference pairs, before anything is sized to T -----------
+    # The trainer's arena and buffers are allocated for `seq_len` at
+    # construction, so T has to be known first. Reading the data here rather
+    # than after the build is what lets it be the length the data actually
+    # needs instead of the configured ceiling; `sequence_len` stays the cap,
+    # and rows that do not fit it are still dropped during tokenization.
+    #
+    # Nothing between here and the old position reads the data: the IR build
+    # and JIT compile depend only on `config.model_dir`. Doing it first also
+    # means a dataset that cannot be tokenized fails before the JIT compile
+    # rather than after it.
+    rows = _load_pref_datasets(config.datasets or [], num_workers=config.dataloader_num_workers or 1)
+    batch = tokenize_preference_pairs(
+        rows,
+        config.tokenizer,
+        max_len=int(config.sequence_len),
+        span_mask=config.loss.span_mask,
+    )
+    T = int(batch.max_len)
+    logger.info(f"Tokenized {batch.n_pairs} preference pairs (from {len(rows)} rows)")
 
     # --- compile the DSL IR + JIT kernels (mirrors SurogateTrainerWrapper) ---
     from surogate.dsl.ir_builder import build_dsl_ir_for_model
@@ -208,10 +228,6 @@ def dpo_main(config: DPOTrainConfig, args=None) -> None:
         else:
             logger.info("No DPO checkpoint found; starting from step 0")
 
-    # --- tokenize preference pairs -----------------------------------------
-    rows = _load_pref_datasets(config.datasets or [], num_workers=config.dataloader_num_workers or 1)
-    batch = tokenize_preference_pairs(rows, config.tokenizer, max_len=T, span_mask=config.loss.span_mask)
-    logger.info(f"Tokenized {batch.n_pairs} preference pairs (from {len(rows)} rows)")
     Path(config.output_dir).mkdir(parents=True, exist_ok=True)
     # Reference log-probs are computed INLINE per micro-step (see module docstring):
     # the frozen-ref forward must share the policy step's exact batch so fp8's

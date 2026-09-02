@@ -181,10 +181,16 @@ def tokenize_preference_pairs(
         )
 
     n_seq = 2 * n_pairs
-    input_ids = np.full((n_seq, max_len), pad_id, dtype=np.int32)
-    targets = np.zeros((n_seq, max_len), dtype=np.int32)
-    loss_mask = np.zeros((n_seq, max_len), dtype=np.uint8)
-    position_ids = np.zeros((n_seq, max_len), dtype=np.int32)
+    # Width is the longest row that survived, not the configured cap. `max_len`
+    # is the most a row *may* be, and allocating at it made a 50-token pair cost
+    # a 2048-token forward, paid three times per step: the policy pass, the
+    # frozen reference pass, and the backward. Rows too long for the cap have
+    # already been dropped above, so this can only shrink the buffer.
+    width = min(int(max_len), max(len(ids) for ids, _ in seqs))
+    input_ids = np.full((n_seq, width), pad_id, dtype=np.int32)
+    targets = np.zeros((n_seq, width), dtype=np.int32)
+    loss_mask = np.zeros((n_seq, width), dtype=np.uint8)
+    position_ids = np.zeros((n_seq, width), dtype=np.int32)
     seq_len = np.zeros((n_seq,), dtype=np.int32)
 
     for k, (ids, prompt_len) in enumerate(seqs):
@@ -208,11 +214,11 @@ def tokenize_preference_pairs(
         # absorbed into the row's single document this way, and loss_mask and
         # targets are already zero there, so nothing about the loss moves. The
         # SFT tokenizer does the same, for the same reason (train/tokenize.py).
-        position_ids[k] = np.arange(max_len, dtype=np.int32)
+        position_ids[k] = np.arange(width, dtype=np.int32)
         seq_len[k] = L
 
     return PrefBatch(
-        max_len=max_len,
+        max_len=width,
         n_pairs=n_pairs,
         input_ids=input_ids,
         targets=targets,
