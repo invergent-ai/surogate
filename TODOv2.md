@@ -521,7 +521,7 @@ Same on Q5_K and Q6_K (5.8e-3, 5.7e-3). An 8-bit symmetric grid cannot land on a
   | 8 | latency p50 | **0.37 s** | 1.53 s | **4.1x** |
 
   Isolated kernel rates on the same file (`llama-bench -fa 1`) are 97,062 vs 39,511 prefill and 864 vs 809 decode; the concurrency gap is wider than the single-stream gap because llama.cpp's server does not batch these as well.
-- [ ] **K2 — Q8_0 and the legacy types**: W8G32's decode kernel against mmvq's Q8_0 on the same tensor; keep the faster, exactness is equal.
+- [x] **K2 — Q8_0: keep W8G32 (2026-09-02).** They are the *same numeric format* — signed int8 codes with one binary16 scale per 32 — at the same 8.5 bits per weight, so the repack is exact and free and there is no accuracy question, only which kernel runs. W8G32's are the tuned ones and the only ones with fused variants (the projection-and-convolution kernel, the W8A8 IMMA prefill, the Marlin band), and K5c measured what losing that fusion costs: 6 % of decode. Porting mmvq's Q8_0 would add a slower path. Q4_0, Q5_0 and IQ4_NL keep their existing bit-exact repack into W8 for the same reason.
 - [x] **K3 — wide-batch route (prefill), 2026-09-02.** Taken *not* by porting MMQ. MMQ's premise is that the activation is worth quantising to int8 so the weight can stay packed; on a 5090 the BF16 tensor cores make the opposite trade better: expand a bounded row tile of the weight to BF16 **once** and hand it to cuBLASLt, so the weight is read a single time however wide the batch is (the GEMV route re-reads it every eight columns, which was the whole 12x prefill regression). It is also the *more accurate* of the two routes — the activation is never quantised — and it is ~200 lines against MMQ's ~6,000.
   - `ggml_dequant.cuh` holds the five ported dequantisers (lifted out of the embedding gather, which now shares them); `ggml_dequant.cu` expands a row range into a BF16 tile; `bf16_cublaslt_gemm_raw` takes raw operands with an explicit output leading dimension, so a tile writes its row range of the real output and the plan cache is keyed by it. Tile budget 32 MiB — whole weights in one pass at every geometry the tree serves, the widest (a 27B `gate_up` at [34816, 5120]) in eleven.
   - Threshold `SUROGATE_GGML_WIDE_MIN_TOKENS`, default **65**, from bytes per parameter: the GEMV route moves 0.56·ceil(T/8) for a Q4_K, the wide route ~4.6 always, and they cross near 64.
@@ -543,7 +543,18 @@ Same on Q5_K and Q6_K (5.8e-3, 5.7e-3). An 8-bit symmetric grid cannot land on a
 - [ ] **F — FP8**: compressed-tensors per-channel/per-tensor is per-row with an FP32 scale (add `_F32S`, or accept the BF16 cast); HF fine-grained block-128 (what the trainer loads as `prequant_fp8`) needs block-indexed scales in the fp8 family and a prefill route.
 - [x] **B — BF16**: correctness done (cuBLASLt off the table, `8d1b9cc4`); the registered shapes keep the hand kernels.
 
-M2 (geometry templating), M4 (unified loading) and M5 (cleanup) stand; the K-line is the main line and goes first.
+### Where the K-line stands (2026-09-02)
+
+Done and measured: K0 the bar, K1 the native K-quant read path, K2 Q8_0 by decision, K3 the wide-batch route, K5c built and left off, B BF16. The product claim holds end to end — `surogate serve models/Qwen3.5-0.8B-Q4_K_M.gguf` converts in 1.8 s, serves the file's own Q4_K/Q5_K/Q6_K blocks, and beats both llama.cpp and vLLM on the same card at one and eight users.
+
+Open, in the order they matter:
+
+1. **Fused K-quant GDN projection-and-convolution.** Unlocks K5c's 8 % of bytes, which today costs more in launches than it saves in bandwidth.
+2. **K4 — MoE.** mmvq's `ids` indirection is routed-expert decode; `mul_mat_id` is the prefill; the host expert bank wants `ggml_vec_dot_q4_K_q8_K`. No MoE GGUF small enough to iterate on is on this disk, so it needs a download first.
+3. **K6 — retire Q4G64/Q5G64/Q6G64** once nothing emits them, and `surogate quantize` by writing a BF16 GGUF and calling `llama-quantize` (their quantiser, imatrix included) rather than porting `ggml-quants.c`.
+4. **N (NVFP4 ModelOpt ingest)** and **F (FP8 strategies)** — neither blocks GGUF.
+
+M2 (geometry templating), M4 (unified loading) and M5 (`--no-cache`, `surogate convert`) stand behind these.
 
 ## 6. Progress log
 
