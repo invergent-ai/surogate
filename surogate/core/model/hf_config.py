@@ -158,6 +158,25 @@ class HfConfigFactory:
             res["modules_to_not_convert"] = quantization_config.get(
                 "modules_to_not_convert", quantization_config.get("ignore", [])
             )
+        elif quant_method == "compressed-tensors":
+            # llm-compressor exports. The config declares per-module schemes
+            # (config_groups with targets, plus ignore, both allowing "re:"
+            # regexes), so there is no single bit width or skip list to report
+            # here: the summary is the first group's weight arguments, and the
+            # per-module answer is quant_schemes.resolve_checkpoint(model_dir).
+            # `ignore` is deliberately NOT copied into modules_to_not_convert --
+            # that list is matched as globs downstream, which would misread the
+            # regex entries.
+            res["quant_method"] = "compressed-tensors"
+            res["format"] = quantization_config.get("format")
+            groups = quantization_config.get("config_groups") or {}
+            first = next(iter(groups.values()), None) if isinstance(groups, dict) else None
+            weights = (first or {}).get("weights") if isinstance(first, dict) else None
+            if isinstance(weights, dict):
+                if weights.get("num_bits") is not None:
+                    res["quant_bits"] = weights["num_bits"]
+                res["weight_strategy"] = weights.get("strategy")
+                res["weight_group_size"] = weights.get("group_size")
         elif quant_method is not None:
             res["quant_method"] = quant_method
         return res or None
