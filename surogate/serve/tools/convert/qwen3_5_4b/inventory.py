@@ -7,6 +7,7 @@ materialization live in the sibling conversion recipe.
 from __future__ import annotations
 
 from surogate.serve.tools.convert.common.inventory import (
+    tied_duplicate_objects,
     BF16,
     CONTIGUOUS_LAYOUT,
     DIRECT_FORMATS,
@@ -146,11 +147,18 @@ TENSOR_SPECS_NO_MTP = TEXT_CORE_TENSOR_SPECS + DRAFT_HEAD_TENSOR_SPECS + VISION_
 OBJECT_SPECS_NO_MTP: tuple[StoredObjectSpec, ...] = RESOURCE_SPECS + TENSOR_SPECS_NO_MTP
 
 
-def active_specs(*, mtp: bool) -> tuple[tuple, tuple]:
+# A community GGUF export of this family is text-only: it drops the vision tower the way it
+# often drops the MTP block. The loader already probes for one (`binder.has("vision/...")`)
+# and only refuses `--vision` against an artifact without it, so the artifact may omit the
+# vision/* objects entirely.
+def active_specs(*, mtp: bool, vision: bool = True) -> tuple[tuple, tuple]:
     """(tensor_specs, object_specs) for the requested artifact variant."""
+    tensors = TEXT_CORE_TENSOR_SPECS + DRAFT_HEAD_TENSOR_SPECS
     if mtp:
-        return TENSOR_SPECS, OBJECT_SPECS
-    return TENSOR_SPECS_NO_MTP, OBJECT_SPECS_NO_MTP
+        tensors += MTP_TENSOR_SPECS
+    if vision:
+        tensors += VISION_TENSOR_SPECS
+    return tensors, RESOURCE_SPECS + tensors
 
 FORMAT_COUNTS = {
     numeric_format: sum(spec.format == numeric_format for spec in TENSOR_SPECS)

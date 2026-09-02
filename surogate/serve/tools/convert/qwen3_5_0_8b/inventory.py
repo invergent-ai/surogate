@@ -7,6 +7,7 @@ materialization live in the sibling conversion recipe.
 from __future__ import annotations
 
 from surogate.serve.tools.convert.common.inventory import (
+    tied_duplicate_objects,
     BF16,
     CONTIGUOUS_LAYOUT,
     DIRECT_FORMATS,

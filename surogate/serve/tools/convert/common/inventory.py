@@ -178,7 +178,32 @@ def build_vision_specs(
     return tuple(specs)
 
 
+
+def tied_duplicate_objects(recipes_by_name, specs) -> tuple[str, ...]:
+    """Object names whose recipe is byte-for-byte another object's, in spec order.
+
+    A tied language-model head is the whole of this today: the checkpoint has no
+    `lm_head.weight` and the recipe reads `embed_tokens.weight`, so the artifact would carry
+    the vocabulary table twice -- on a 2B Q4_K_M that is 417 MB of 2,050, and every one of
+    those bytes is read again on each decode step. The loader binds the survivor once and
+    points both plans at it; an artifact that predates this still carries both and still loads.
+    """
+    seen: dict = {}
+    duplicates: list[str] = []
+    for spec in specs:
+        name = getattr(spec, "name", None)
+        recipe = recipes_by_name.get(name)
+        if recipe is None:
+            continue
+        key = (repr(recipe.expression), tuple(spec.shape), spec.format, spec.layout)
+        if key in seen:
+            duplicates.append(name)
+        else:
+            seen[key] = name
+    return tuple(duplicates)
+
 __all__ = [
+    "tied_duplicate_objects",
     "BF16",
     "CONTIGUOUS_LAYOUT",
     "DIRECT_FORMATS",

@@ -447,7 +447,12 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     }
     out.final_norm =
         artifact::bind_device_tensor(binder, "text/final_norm", NumericFormat::BF16, {TextConfig::hidden});
-    out.output_head = bind_linear_weight(binder, "text/output_head", {TextConfig::output_rows, TextConfig::hidden});
+    // A tied head and the token embedding are the same vocabulary table. A converter
+    // that noticed the tie stored it once; both plans then read that one object.
+    // Artifacts written before that carry a second copy, and still bind it.
+    out.output_head = binder.has("text/output_head")
+                          ? bind_linear_weight(binder, "text/output_head", {TextConfig::output_rows, TextConfig::hidden})
+                          : out.token_embedding;
     const artifact::TensorPlacement proposal_placement =
         features.optimized_proposal() ? artifact::TensorPlacement::Device
                                       : artifact::TensorPlacement::ValidateOnly;

@@ -189,12 +189,14 @@ def load_resources(model_dir: str | Path) -> tuple[ResourcePayload, ...]:
 
 
 def build_object_plan(
-    resources: Mapping[str, bytes], *, mtp: bool = True, native: Mapping[str, str] | None = None
+    resources: Mapping[str, bytes], *, mtp: bool = True,
+    native: Mapping[str, str] | None = None, object_specs=None
 ) -> ObjectPlan:
     """Compute every payload-relative object offset for the selected variant. `native` names
     the objects served as K-quants verbatim from a GGUF, with their format rewritten."""
     preflight_inventory()
-    _, object_specs = inventory.active_specs(mtp=mtp)
+    if object_specs is None:
+        _, object_specs = inventory.active_specs(mtp=mtp)
     if native:
         object_specs = GgufRepackSource.native_specs(object_specs, native)
     return family_conversion.build_object_plan(object_specs, resources)
@@ -250,6 +252,7 @@ def preflight_conversion(
     *,
     mtp: bool = True,
     native: Mapping[str, str] | None = None,
+    object_specs=None,
 ) -> ConversionPreflight:
     """Finish all checkpoint, inventory, shortlist, and offset work before writing."""
 
@@ -271,7 +274,8 @@ def preflight_conversion(
         source = recipe.preflight_sources(model)
     resources = load_resources(model)
     resource_map = {resource.name: resource.data for resource in resources}
-    object_plan = build_object_plan(resource_map, mtp=mtp, native=native)
+    object_plan = build_object_plan(resource_map, mtp=mtp, native=native,
+                                    object_specs=object_specs)
     ranking = _repo_root() / draft_head.DEFAULT_RANKING
     draft = draft_head.compute_shortlist(ranking, model)
     return ConversionPreflight(
@@ -381,6 +385,16 @@ def convert(
     repack = GgufRepackSource(gguf_repack) if gguf_repack else None
     recipes = active_recipes(mtp=mtp)
     active_tensor_specs, active_object_specs = inventory.active_specs(mtp=mtp)
+    # A tied head duplicates the vocabulary table; drop the copy and let the loader point
+    # both plans at the survivor.
+    tied = set(inventory.tied_duplicate_objects(recipes, active_tensor_specs))
+    if tied:
+        active_tensor_specs = tuple(s for s in active_tensor_specs if s.name not in tied)
+        active_object_specs = tuple(
+            s for s in active_object_specs if getattr(s, "name", None) not in tied
+        )
+        recipes = {n: r for n, r in recipes.items() if n not in tied}
+        print(f"tied objects dropped: {', '.join(sorted(tied))}", flush=True)
     native = repack.plan_native(recipes, active_tensor_specs) if repack is not None else {}
     planned = plan_repack(repack, recipes, active_tensor_specs, native)
     repacked_names = frozenset(planned)
@@ -389,7 +403,7 @@ def convert(
         active_object_specs = GgufRepackSource.native_specs(active_object_specs, native)
         print(f"native K-quants: {len(native)} objects served as the GGUF stores them", flush=True)
     preflight = preflight_conversion(
-        model, repack, planned + tuple(native), mtp=mtp, native=native
+        model, repack, planned + tuple(native) + tuple(sorted(tied)), mtp=mtp, native=native, object_specs=active_object_specs
     )
 
     print(

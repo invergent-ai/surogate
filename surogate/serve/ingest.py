@@ -281,6 +281,31 @@ def _repack_planner(root: Path, target_key: str):
     return plan
 
 
+def _has_vision_tensors(model_dir: Path) -> bool:
+    """True when the HF-layout dir holds any `model.visual.*` weight."""
+    index = model_dir / "model.safetensors.index.json"
+    if index.is_file():
+        weight_map = json.loads(index.read_text()).get("weight_map", {})
+        return any(name.startswith("model.visual.") for name in weight_map)
+    for shard in model_dir.glob("*.safetensors"):
+        from safetensors import safe_open  # lazy: only for a single-shard dir
+        with safe_open(str(shard), framework="pt") as reader:
+            if any(name.startswith("model.visual.") for name in reader.keys()):
+                return True
+    return False
+
+
+def _converter_options(root: Path | None, module: str) -> str:
+    """The converter module's own source, to ask whether it accepts a flag."""
+    if root is None:
+        return ""
+    source = root.joinpath(*module.split(".")).with_suffix(".py")
+    try:
+        return source.read_text()
+    except OSError:
+        return ""
+
+
 def _run_converter_cached(model_dir: Path, out: Path, *, echo=print,
                           derived_frontend: bool = False,
                           gguf_repack: Path | None = None,
@@ -306,6 +331,13 @@ def _run_converter_cached(model_dir: Path, out: Path, *, echo=print,
         cmd += ["--gguf-repack", str(gguf_repack)]
     if no_mtp:
         cmd += ["--no-mtp"]
+    # A text-only export of a vision family (every community GGUF of these, so far) carries no
+    # visual.* tensors; the artifact then omits vision/* entirely and the loader, which already
+    # probes for a tower, refuses only `--vision` against it.
+    if "--no-vision" in _converter_options(root, target.module) and not _has_vision_tensors(model_dir):
+        echo("surogate serve: this checkpoint carries no vision tower — converting text-only "
+             "(`--vision` will be unavailable for it).")
+        cmd += ["--no-vision"]
     if os.environ.get("SUROGATE_CONVERT_DEVICE"):
         cmd += ["--device", os.environ["SUROGATE_CONVERT_DEVICE"]]
     if os.environ.get("SUROGATE_SERVE_DRY"):
