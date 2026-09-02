@@ -1,6 +1,7 @@
 // The demand-mapped KV plane region: a granule maps when its first page is taken and goes
 // back once its last is returned, addresses hold across an unmap/remap so a captured graph
 // keeps replaying into it, VRAM actually drops, and sleep/wake restore what was in use.
+#include "core/device_footprint.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
 #include "core/elastic_kv_region.h"
@@ -31,10 +32,25 @@ int expect(bool ok, const char* label) {
     return 1;
 }
 
-std::size_t device_free() {
-    std::size_t free_bytes = 0, total = 0;
-    (void)cudaMemGetInfo(&free_bytes, &total);
-    return free_bytes;
+// What this process holds on the device.
+//
+// The two assertions below are about this region's own mapping and unmapping,
+// and `cudaMemGetInfo` answers for the whole device: run beside anything else
+// that allocates -- the rest of the suite under `ctest -j`, say -- a neighbour
+// taking memory between the two samples masks the VRAM this region gave back,
+// and "unmapping returned the VRAM" fails for a region that unmapped correctly.
+// The per-process figure cancels that traffic. Where the driver will not
+// attribute it (no NVML, a PID namespace), the caller below skips the
+// comparison rather than making a device-wide claim about one process.
+struct DeviceHeld {
+    std::size_t bytes = 0;
+    bool attributed   = false;
+};
+
+DeviceHeld device_held() {
+    const sinfer::DeviceFootprint sample = sinfer::sample_device_footprint();
+    if (sample.attributed) { return {sample.process_used_bytes, true}; }
+    return {0, false};
 }
 
 unsigned char* page_address(sinfer::ElasticKvRegion& region, std::size_t plane_offset,
@@ -67,11 +83,15 @@ int region_cases(sinfer::DeviceContext& device) {
     failures += expect(region.mapped_bytes() == 0, "no footprint before demand");
 
     // Page 40 lives in granule 1: acquiring it maps on the spot.
-    const std::size_t free_before = device_free();
+    const DeviceHeld held_before = device_held();
     region.acquire_page(40);
     region.wait_idle();
     failures += expect(region.mapped_granules() == 1, "granule 1 mapped on demand");
-    failures += expect(free_before - device_free() >= 4 * kMiB, "mapping took real VRAM");
+    const DeviceHeld held_mapped_probe = device_held();
+    if (held_before.attributed && held_mapped_probe.attributed) {
+        failures += expect(held_mapped_probe.bytes - held_before.bytes >= 4 * kMiB,
+                           "mapping took real VRAM");
+    }
 
     // A captured graph writes into page 40 of plane 0.
     unsigned char* target = page_address(region, spec.planes[0].offset, 40);
@@ -90,11 +110,15 @@ int region_cases(sinfer::DeviceContext& device) {
 
     // Release: the granule empties, the fence passes, the worker unmaps it, and the VRAM
     // comes back.
-    const std::size_t free_mapped = device_free();
+    const DeviceHeld held_mapped = device_held();
     region.release_page(40);
     region.wait_idle();
     failures += expect(region.mapped_granules() == 0, "empty granule unmapped after the fence");
-    failures += expect(device_free() - free_mapped >= 4 * kMiB, "unmapping returned the VRAM");
+    const DeviceHeld held_unmapped = device_held();
+    if (held_mapped.attributed && held_unmapped.attributed) {
+        failures += expect(held_mapped.bytes - held_unmapped.bytes >= 4 * kMiB,
+                           "unmapping returned the VRAM");
+    }
 
     // Remap by taking the page again, replay the same executable: the addresses it baked
     // are the same addresses, now backed by fresh pages.
