@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
 
 namespace sinfer::ops::detail {
 
@@ -35,6 +36,16 @@ struct W8LinearSwiGluPlan {
     W8LinearSwiGluScheduleId schedule;
 };
 
+/// A (gate_up_rows, output_rows, k) geometry the W8 fused SwiGLU serves. The
+/// plan owns the list; the conformance test reads it from here rather than
+/// restating it, which is how the wrapper's own gate is checked against it.
+struct W8LinearSwiGluShape {
+    std::int32_t gate_up_rows;
+    std::int32_t output_rows;
+    std::int32_t k;
+};
+
+std::span<const W8LinearSwiGluShape> w8_linear_swiglu_registered_shapes() noexcept;
 const char* w8_linear_swiglu_schedule_name(W8LinearSwiGluScheduleId schedule) noexcept;
 bool w8_linear_swiglu_schedule_uses_mma(W8LinearSwiGluScheduleId schedule) noexcept;
 bool w8_linear_swiglu_admits(const W8LinearSwiGluProblem& problem) noexcept;

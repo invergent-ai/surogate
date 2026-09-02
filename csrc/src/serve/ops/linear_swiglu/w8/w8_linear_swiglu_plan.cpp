@@ -3,6 +3,7 @@
 #include "ops/linear_swiglu/w8/w8_linear_swiglu_kernels.h"
 
 #include <array>
+#include <span>
 #include <string>
 #include <limits>
 #include <stdexcept>
@@ -112,23 +113,34 @@ constexpr std::array<RouteSpec, 3> kTinyLlamaRoutes{{
 static_assert(routes_are_closed(kTinyLlamaRoutes),
               "W8 LinearSwiGLU tinyllama routes must be exact and closed");
 
-bool supported_shape(const W8LinearSwiGluProblem& problem) noexcept {
-    // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b mlp {7168->3584, k=1024}.
-    const bool base = problem.gate_up_rows == 12288 && problem.output_rows == 6144 &&
-                      problem.k == 2048 && problem.padded_k == 2048;
-    const bool q08 = problem.gate_up_rows == 7168 && problem.output_rows == 3584 &&
-                     problem.k == 1024 && problem.padded_k == 1024;
+// The one list of (gate_up_rows, output_rows, k) geometries this op serves in
+// W8. The wrapper's shape gate is wider, because it also covers the codecs this
+// plan does not (the 27B's {34816 -> 17408, k=5120} is Q4/Q5), so the two are
+// not the same set and must not be merged -- but every shape here must be one
+// the wrapper accepts, which the conformance test checks rather than assumes.
+constexpr auto kRegisteredShapes = std::to_array<W8LinearSwiGluShape>({
+    // qwen3.5-2b mlp.
+    {12288, 6144, 2048},
+    // surogate vendor patch (PATCHES.md #13): qwen3.5-0.8b mlp.
+    {7168, 3584, 1024},
     // surogate vendor patch (PATCHES.md #18): qwen3.5-4b mlp.
-    const bool q4b = problem.gate_up_rows == 18432 && problem.output_rows == 9216 &&
-                     problem.k == 2560 && problem.padded_k == 2560;
-    // qwen3-0.6b mlp {6144->3072, k=1024}. Same k as the 0.8b above, so it
-    // reuses that shape's exact-T instantiations; only the row counts differ.
-    const bool q3_06b = problem.gate_up_rows == 6144 && problem.output_rows == 3072 &&
-                        problem.k == 1024 && problem.padded_k == 1024;
-    // tinyllama-1.1b mlp {11264->5632, k=2048}.
-    const bool tinyllama = problem.gate_up_rows == 11264 && problem.output_rows == 5632 &&
-                           problem.k == 2048 && problem.padded_k == 2048;
-    return base || q08 || q4b || q3_06b || tinyllama;
+    {18432, 9216, 2560},
+    // qwen3-0.6b mlp. Same k as the 0.8b above, so it reuses that shape's
+    // exact-T instantiations; only the row counts differ.
+    {6144, 3072, 1024},
+    // tinyllama-1.1b mlp.
+    {11264, 5632, 2048},
+});
+
+bool supported_shape(const W8LinearSwiGluProblem& problem) noexcept {
+    if (problem.padded_k != problem.k) { return false; }
+    for (const W8LinearSwiGluShape& shape : kRegisteredShapes) {
+        if (shape.gate_up_rows == problem.gate_up_rows &&
+            shape.output_rows == problem.output_rows && shape.k == problem.k) {
+            return true;
+        }
+    }
+    return false;
 }
 
 } // namespace
@@ -163,6 +175,10 @@ const char* w8_linear_swiglu_schedule_name(W8LinearSwiGluScheduleId schedule) no
 
 bool w8_linear_swiglu_schedule_uses_mma(W8LinearSwiGluScheduleId schedule) noexcept {
     return schedule != W8LinearSwiGluScheduleId::DecodePairR16;
+}
+
+std::span<const W8LinearSwiGluShape> w8_linear_swiglu_registered_shapes() noexcept {
+    return kRegisteredShapes;
 }
 
 bool w8_linear_swiglu_admits(const W8LinearSwiGluProblem& problem) noexcept {
