@@ -170,7 +170,8 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     case QType::Q4_K:
     case QType::Q5_K:
     case QType::Q6_K:
-        return detail::ggml::ggml_linear_workspace_capacity_bytes(input_rows, max_tokens);
+        return detail::ggml::ggml_linear_workspace_capacity_bytes(output_rows, input_rows,
+                                                                   max_tokens);
     case QType::FP32_CTRL:
     case QType::I32_CTRL:
         break;

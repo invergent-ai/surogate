@@ -49,7 +49,9 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
     if (detail::ggml::is_ggml_qtype(qtype)) {
         // gate and up projected into two [M, T] BF16 planes, then silu_mul.
         const std::size_t half = static_cast<std::size_t>(gate_up_rows / 2) * max_tokens * sizeof(std::uint16_t);
-        return 2 * (half + 256) + detail::ggml::ggml_linear_workspace_capacity_bytes(input_rows, max_tokens);
+        return 2 * (half + 256) +
+               detail::ggml::ggml_linear_workspace_capacity_bytes(gate_up_rows / 2, input_rows,
+                                                                  max_tokens);
     }
     if (qtype == QType::W8G32_F16S) {
         if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8) {

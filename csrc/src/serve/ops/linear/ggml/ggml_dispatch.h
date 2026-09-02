@@ -37,6 +37,8 @@ void ggml_linear_add(const Tensor& x, const Weight& w, Tensor& residual, Workspa
 void ggml_project_rows(const Tensor& x, const Weight& w, std::int32_t row_begin, Tensor& out,
                        WorkspaceArena* workspace, cudaStream_t stream);
 
-std::size_t ggml_linear_workspace_capacity_bytes(std::int32_t input_rows, std::int32_t max_tokens);
+std::size_t ggml_linear_workspace_capacity_bytes(std::int32_t output_rows,
+                                                std::int32_t input_rows,
+                                                std::int32_t max_tokens);
 
 } // namespace sinfer::ops::detail::ggml

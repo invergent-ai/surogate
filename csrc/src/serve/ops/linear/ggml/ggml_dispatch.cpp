@@ -157,7 +157,7 @@ void ggml_linear(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena* 
     require_ggml_weight(w, "ggml linear");
     require_x_out(x, w.k, out, w.n, "ggml linear");
     const std::int32_t tokens = x.ne[1];
-    const std::size_t bytes   = linear_workspace_bytes(w.k, tokens);
+    const std::size_t bytes   = linear_workspace_bytes(w.n, w.k, tokens);
     auto scope                = workspace != nullptr ? std::optional(workspace->scope()) : std::nullopt;
     const Scratch s           = scratch(workspace, bytes, stream);
     linear_launch(ggml_type_for(w.qtype), w.qdata, w.n, w.k, static_cast<const __nv_bfloat16*>(x.data),
@@ -169,7 +169,7 @@ void ggml_linear_add(const Tensor& x, const Weight& w, Tensor& residual, Workspa
     require_ggml_weight(w, "ggml linear_add");
     require_x_out(x, w.k, residual, w.n, "ggml linear_add");
     const std::int32_t tokens = x.ne[1];
-    const std::size_t bytes   = linear_workspace_bytes(w.k, tokens);
+    const std::size_t bytes   = linear_workspace_bytes(w.n, w.k, tokens);
     auto scope                = workspace != nullptr ? std::optional(workspace->scope()) : std::nullopt;
     const Scratch s           = scratch(workspace, bytes, stream);
     linear_add_launch(ggml_type_for(w.qtype), w.qdata, w.n, w.k, static_cast<const __nv_bfloat16*>(x.data),
@@ -188,18 +188,21 @@ void ggml_project_rows(const Tensor& x, const Weight& w, std::int32_t row_begin,
     const std::size_t row_bytes = static_cast<std::size_t>(w.k / QK_K) * block_bytes(type);
     const auto* blocks = static_cast<const std::byte*>(w.qdata) + static_cast<std::size_t>(row_begin) * row_bytes;
     const std::int32_t tokens = x.ne[1];
-    const std::size_t bytes   = linear_workspace_bytes(w.k, tokens);
+    // the row range is the matrix this call actually multiplies, so it sizes the tile too
+    const std::size_t bytes   = linear_workspace_bytes(rows, w.k, tokens);
     auto scope                = workspace != nullptr ? std::optional(workspace->scope()) : std::nullopt;
     const Scratch s           = scratch(workspace, bytes, stream);
     linear_launch(type, blocks, rows, w.k, static_cast<const __nv_bfloat16*>(x.data), tokens,
                   static_cast<__nv_bfloat16*>(out.data), s.data, s.bytes, stream);
 }
 
-std::size_t ggml_linear_workspace_capacity_bytes(std::int32_t input_rows, std::int32_t max_tokens) {
-    if (input_rows <= 0 || (input_rows % QK_K) != 0 || max_tokens <= 0) {
+std::size_t ggml_linear_workspace_capacity_bytes(std::int32_t output_rows,
+                                                std::int32_t input_rows,
+                                                std::int32_t max_tokens) {
+    if (output_rows <= 0 || input_rows <= 0 || (input_rows % QK_K) != 0 || max_tokens <= 0) {
         throw std::invalid_argument("ggml linear workspace: k must be a multiple of 256");
     }
-    return linear_workspace_bytes(input_rows, max_tokens) + 256;
+    return linear_workspace_bytes(output_rows, input_rows, max_tokens) + 256;
 }
 
 } // namespace sinfer::ops::detail::ggml

@@ -29,8 +29,9 @@ struct PlanKey {
     std::int32_t rows;
     std::int32_t k;
     std::int32_t tokens;
+    std::int32_t ldc; // output elements per column; rows for a contiguous [rows, tokens]
     bool operator==(const PlanKey& other) const noexcept {
-        return rows == other.rows && k == other.k && tokens == other.tokens;
+        return rows == other.rows && k == other.k && tokens == other.tokens && ldc == other.ldc;
     }
 };
 
@@ -38,7 +39,8 @@ struct PlanKeyHash {
     std::size_t operator()(const PlanKey& key) const noexcept {
         return (static_cast<std::size_t>(key.rows) * 0x9E3779B1u) ^
                (static_cast<std::size_t>(key.k) * 0x85EBCA77u) ^
-               (static_cast<std::size_t>(key.tokens) * 0xC2B2AE3Du);
+               (static_cast<std::size_t>(key.tokens) * 0xC2B2AE3Du) ^
+               (static_cast<std::size_t>(key.ldc) * 0x27D4EB2Fu);
     }
 };
 
@@ -110,7 +112,7 @@ const Plan& plan_for(DeviceState& state, const PlanKey& key) {
     // engine's [rows, tokens] tensor.
     check(cublasLtMatrixLayoutCreate(&plan.a, CUDA_R_16BF, key.k, key.rows, key.k), "a");
     check(cublasLtMatrixLayoutCreate(&plan.b, CUDA_R_16BF, key.k, key.tokens, key.k), "b");
-    check(cublasLtMatrixLayoutCreate(&plan.c, CUDA_R_16BF, key.rows, key.tokens, key.rows), "c");
+    check(cublasLtMatrixLayoutCreate(&plan.c, CUDA_R_16BF, key.rows, key.tokens, key.ldc), "c");
     cublasLtMatmulPreference_t preference = nullptr;
     check(cublasLtMatmulPreferenceCreate(&preference), "preference");
     const std::size_t workspace_bytes = kWorkspaceBytes;
@@ -162,7 +164,7 @@ void bf16_cublaslt_prepare(std::int32_t rows, std::int32_t k, std::int32_t token
     }
     DeviceState& state = state_for_current_device();
     const std::lock_guard<std::mutex> lock(state.mutex);
-    (void)plan_for(state, PlanKey{rows, k, tokens});
+    (void)plan_for(state, PlanKey{rows, k, tokens, rows});
 }
 
 namespace {
@@ -172,7 +174,7 @@ void gemm_with_beta(const Weight& weight, const Tensor& x, Tensor& out, float be
     require_operands(weight, x, out);
     DeviceState& state = state_for_current_device();
     const std::lock_guard<std::mutex> lock(state.mutex);
-    const Plan& plan  = plan_for(state, PlanKey{weight.n, weight.k, x.ne[1]});
+    const Plan& plan  = plan_for(state, PlanKey{weight.n, weight.k, x.ne[1], weight.n});
     const float alpha = 1.0F;
     check(cublasLtMatmul(state.handle, plan.op, &alpha, weight.qdata, plan.a, x.data, plan.b,
                          &beta, out.data, plan.c, out.data, plan.c, &plan.algo, state.workspace,
@@ -189,6 +191,26 @@ void bf16_cublaslt_gemm(const Weight& weight, const Tensor& x, Tensor& out, cuda
 void bf16_cublaslt_gemm_accumulate(const Weight& weight, const Tensor& x, Tensor& out,
                                    cudaStream_t stream) {
     gemm_with_beta(weight, x, out, 1.0F, stream);
+}
+
+void bf16_cublaslt_gemm_raw(const void* weight, std::int32_t n, std::int32_t k, const void* x,
+                            std::int32_t tokens, void* out, std::int32_t ldc, float beta,
+                            cudaStream_t stream) {
+    const auto aligned = [](const void* pointer) {
+        return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & 15u) == 0;
+    };
+    if (n <= 0 || k <= 0 || tokens <= 0 || ldc < n || (n % 8) != 0 || (k % 8) != 0 ||
+        (ldc % 8) != 0 || !aligned(weight) || !aligned(x) || !aligned(out)) {
+        throw std::invalid_argument("bf16 cuBLASLt raw: n, k and ldc must be positive multiples "
+                                    "of 8 with ldc >= n and every operand 16-byte aligned");
+    }
+    DeviceState& state = state_for_current_device();
+    const std::lock_guard<std::mutex> lock(state.mutex);
+    const Plan& plan  = plan_for(state, PlanKey{n, k, tokens, ldc});
+    const float alpha = 1.0F;
+    check(cublasLtMatmul(state.handle, plan.op, &alpha, weight, plan.a, x, plan.b, &beta, out,
+                         plan.c, out, plan.c, &plan.algo, state.workspace, kWorkspaceBytes, stream),
+          "matmul");
 }
 
 } // namespace sinfer::ops::detail

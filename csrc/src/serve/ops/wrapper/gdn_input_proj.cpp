@@ -932,7 +932,8 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int
         throw std::invalid_argument("gdn_input_proj workspace: invalid token interval");
     }
     if (detail::ggml::is_ggml_qtype(parent_qtype)) {
-        return detail::ggml::ggml_linear_workspace_capacity_bytes(input_rows, max_tokens);
+        return detail::ggml::ggml_linear_workspace_capacity_bytes(parent_rows, input_rows,
+                                                                   max_tokens);
     }
     if (parent_qtype == QType::NVFP4) {
         const bool registered = parent_rows == detail::Nvfp4GdnInputGeometry::kOutputRows &&
@@ -1211,7 +1212,7 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
         const std::int32_t widest = batch_size * max_width;
         return composed_snapshot_capacity(
             parent_rows, widest,
-            detail::ggml::ggml_linear_workspace_capacity_bytes(input_rows, widest));
+            detail::ggml::ggml_linear_workspace_capacity_bytes(parent_rows, input_rows, widest));
     }
     if (parent_qtype == QType::FP8_E4M3FN_ROW_BF16S &&
         parent_rows == detail::Fp8GdnInputGeometry::kOutputRows &&
@@ -1298,8 +1299,8 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     validate_policy(policy);
     require_record_capacity_domain(batch_size, min_width, max_width);
     if (detail::ggml::is_ggml_qtype(parent_qtype)) {
-        return detail::ggml::ggml_linear_workspace_capacity_bytes(input_rows,
-                                                                    batch_size * max_width);
+        return detail::ggml::ggml_linear_workspace_capacity_bytes(parent_rows, input_rows,
+                                                                   batch_size * max_width);
     }
     if (parent_qtype == QType::FP8_E4M3FN_ROW_BF16S &&
         parent_rows == detail::Fp8GdnInputGeometry::kOutputRows &&

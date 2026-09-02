@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <algorithm>
 #include <random>
 #include <string>
 #include <vector>
@@ -114,6 +115,20 @@ Weight make_weight(const Fixture& f, void* d_blocks) {
     return w;
 }
 
+// A linear takes one of two routes and they do different arithmetic, so each is checked
+// against the arithmetic it actually performs: below the threshold the activation is
+// quantised to int8 per 32 (the GEMV route), above it the BF16 activation goes to the tensor
+// cores untouched (the dequantise-once route, which is the more accurate of the two).
+bool takes_wide_route(int rows, int k, int tokens) {
+    return tokens >= gg::wide_min_tokens() && (rows % 8) == 0 && (k % 8) == 0;
+}
+
+std::vector<double> exact_activation(const std::vector<__nv_bfloat16>& x) {
+    std::vector<double> y(x.size());
+    for (std::size_t i = 0; i < x.size(); ++i) { y[i] = __bfloat162float(x[i]); }
+    return y;
+}
+
 // The kernel's own activation quantisation, on the host, in the same arithmetic.
 std::vector<double> quantised_activation(const std::vector<__nv_bfloat16>& x, int k, int tokens) {
     std::vector<double> y(static_cast<std::size_t>(k) * tokens);
@@ -193,7 +208,9 @@ int run_case(const Fixture& f, int tokens, bool bf16_out, void* d_blocks, void* 
              std::size_t scratch_bytes) {
     const int n = f.n, k = f.k;
     const auto x = random_activation(k, tokens, static_cast<unsigned>(1234 + tokens + 7 * static_cast<int>(f.type)));
-    const std::vector<double> ref = reference(f, quantised_activation(x, k, tokens), tokens, nullptr);
+    const bool wide = bf16_out && takes_wide_route(n, k, tokens);
+    const std::vector<double> ref =
+        reference(f, wide ? exact_activation(x) : quantised_activation(x, k, tokens), tokens, nullptr);
     __nv_bfloat16* d_x = nullptr;
     void* d_out        = nullptr;
     CHECK_CUDA(cudaMalloc(&d_x, x.size() * sizeof(__nv_bfloat16)));
@@ -215,8 +232,8 @@ int run_case(const Fixture& f, int tokens, bool bf16_out, void* d_blocks, void* 
     }
     CHECK_CUDA(cudaFree(d_x));
     CHECK_CUDA(cudaFree(d_out));
-    return report(f, bf16_out ? "launch bf16" : "launch f32", tokens, score(got, ref),
-                  bf16_out ? 4e-3 : 2e-5, bf16_out ? 8e-3 : 2e-4);
+    return report(f, wide ? "launch bf16 (wide)" : (bf16_out ? "launch bf16" : "launch f32"), tokens,
+                  score(got, ref), bf16_out ? 4e-3 : 2e-5, bf16_out ? 8e-3 : 2e-4);
 }
 
 // linear_add_launch: residual += W x, BF16 residual.
@@ -231,7 +248,10 @@ int run_accumulate(const Fixture& f, int tokens, void* d_blocks, void* d_scratch
         residual[i] = __float2bfloat16(normal(rng));
         base[i]     = __bfloat162float(residual[i]);
     }
-    const std::vector<double> ref = reference(f, quantised_activation(x, k, tokens), tokens, &base);
+    const std::vector<double> ref =
+        reference(f, takes_wide_route(n, k, tokens) ? exact_activation(x)
+                                                    : quantised_activation(x, k, tokens),
+                  tokens, &base);
     __nv_bfloat16* d_x   = nullptr;
     __nv_bfloat16* d_res = nullptr;
     CHECK_CUDA(cudaMalloc(&d_x, x.size() * sizeof(__nv_bfloat16)));
@@ -246,14 +266,18 @@ int run_accumulate(const Fixture& f, int tokens, void* d_blocks, void* d_scratch
     CHECK_CUDA(cudaFree(d_res));
     std::vector<float> got(raw.size());
     for (std::size_t i = 0; i < got.size(); ++i) { got[i] = __bfloat162float(raw[i]); }
-    return report(f, "linear_add_launch", tokens, score(got, ref), 4e-3, 8e-3);
+    return report(f, takes_wide_route(n, k, tokens) ? "linear_add (wide)" : "linear_add_launch",
+                  tokens, score(got, ref), 4e-3, 8e-3);
 }
 
 // ops::linear with no workspace: the wrapper, the QType dispatch and the engine-slot scratch.
 int run_wrapper_linear(const Fixture& f, int tokens, void* d_blocks) {
     const int n = f.n, k = f.k;
     const auto x = random_activation(k, tokens, static_cast<unsigned>(4242 + tokens));
-    const std::vector<double> ref = reference(f, quantised_activation(x, k, tokens), tokens, nullptr);
+    const std::vector<double> ref =
+        reference(f, takes_wide_route(n, k, tokens) ? exact_activation(x)
+                                                    : quantised_activation(x, k, tokens),
+                  tokens, nullptr);
     __nv_bfloat16* d_x   = nullptr;
     __nv_bfloat16* d_out = nullptr;
     CHECK_CUDA(cudaMalloc(&d_x, x.size() * sizeof(__nv_bfloat16)));
@@ -334,7 +358,12 @@ int main() {
             void* d_blocks = nullptr;
             CHECK_CUDA(cudaMalloc(&d_blocks, f.blocks.size()));
             CHECK_CUDA(cudaMemcpy(d_blocks, f.blocks.data(), f.blocks.size(), cudaMemcpyHostToDevice));
-            const std::size_t scratch_bytes = gg::linear_workspace_bytes(f.k, 17);
+            // The GEMV route needs its int8 planes, the wide route its dequantisation tile;
+            // one buffer covers whichever the widest case picks.
+            const int widest = big ? 2 : 512;
+            const std::size_t scratch_bytes =
+                std::max(gg::linear_workspace_bytes(f.n, f.k, widest),
+                         gg::linear_workspace_bytes(f.n, f.k, 1));
             void* d_scratch = nullptr;
             CHECK_CUDA(cudaMalloc(&d_scratch, scratch_bytes));
             for (const int tokens : {1, 2, 3, 5, 8, 17}) {
@@ -344,7 +373,14 @@ int main() {
             }
             failures += run_case(f, 1, true, d_blocks, d_scratch, scratch_bytes);
             ++cases;
-            for (const int tokens : {1, 3}) {
+            // Wide batches: above the threshold these run the dequantise-once tensor-core
+            // route, so the same reference now covers both of a linear's two shapes.
+            for (const int tokens : {64, 65, 512}) {
+                if (big) { continue; }
+                failures += run_case(f, tokens, true, d_blocks, d_scratch, scratch_bytes);
+                ++cases;
+            }
+            for (const int tokens : {1, 3, 128}) {
                 if (big && tokens > 1) { continue; }
                 failures += run_accumulate(f, tokens, d_blocks, d_scratch, scratch_bytes);
                 ++cases;

@@ -92,7 +92,8 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
         throw std::invalid_argument("linear_add workspace: invalid token interval");
     }
     if (detail::ggml::is_ggml_qtype(qtype)) {
-        return detail::ggml::ggml_linear_workspace_capacity_bytes(input_rows, max_tokens);
+        return detail::ggml::ggml_linear_workspace_capacity_bytes(output_rows, input_rows,
+                                                                   max_tokens);
     }
     if (qtype == QType::BF16_CTRL) {
         if (policy != LinearPolicy::A16Only) {
