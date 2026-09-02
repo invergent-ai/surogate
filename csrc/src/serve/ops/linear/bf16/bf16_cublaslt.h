@@ -24,4 +24,8 @@ void bf16_cublaslt_prepare(std::int32_t rows, std::int32_t k, std::int32_t token
 /// contiguous BF16 [rows,T]. T is any positive count.
 void bf16_cublaslt_gemm(const Weight& weight, const Tensor& x, Tensor& out, cudaStream_t stream);
 
+/// out += weight · x, same plan: beta is a per-call scalar, not part of the descriptors.
+void bf16_cublaslt_gemm_accumulate(const Weight& weight, const Tensor& x, Tensor& out,
+                                   cudaStream_t stream);
+
 } // namespace sinfer::ops::detail

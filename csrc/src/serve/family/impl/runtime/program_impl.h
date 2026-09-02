@@ -427,6 +427,10 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     // cudaMalloc. Build them here, while nothing is capturing (#85).
     ops::detail::nvfp4_cublaslt_prewarm();
     ops::detail::fp8_cublaslt_prewarm();
+    // The BF16 plane too, now that a shape off its small registry routes here: its device
+    // state is a 32 MiB workspace, and allocating that inside the capture window charges it
+    // to the graph allowance. qwen4exp already prewarms it for the same reason.
+    ops::detail::bf16_cublaslt_prewarm();
     prepare_graphs();
     work.reset();
     work.reset_peak();

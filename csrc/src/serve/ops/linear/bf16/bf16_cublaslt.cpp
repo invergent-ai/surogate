@@ -165,17 +165,30 @@ void bf16_cublaslt_prepare(std::int32_t rows, std::int32_t k, std::int32_t token
     (void)plan_for(state, PlanKey{rows, k, tokens});
 }
 
-void bf16_cublaslt_gemm(const Weight& weight, const Tensor& x, Tensor& out, cudaStream_t stream) {
+namespace {
+
+void gemm_with_beta(const Weight& weight, const Tensor& x, Tensor& out, float beta,
+                    cudaStream_t stream) {
     require_operands(weight, x, out);
     DeviceState& state = state_for_current_device();
     const std::lock_guard<std::mutex> lock(state.mutex);
     const Plan& plan  = plan_for(state, PlanKey{weight.n, weight.k, x.ne[1]});
     const float alpha = 1.0F;
-    const float beta  = 0.0F;
     check(cublasLtMatmul(state.handle, plan.op, &alpha, weight.qdata, plan.a, x.data, plan.b,
                          &beta, out.data, plan.c, out.data, plan.c, &plan.algo, state.workspace,
                          kWorkspaceBytes, stream),
           "matmul");
+}
+
+} // namespace
+
+void bf16_cublaslt_gemm(const Weight& weight, const Tensor& x, Tensor& out, cudaStream_t stream) {
+    gemm_with_beta(weight, x, out, 0.0F, stream);
+}
+
+void bf16_cublaslt_gemm_accumulate(const Weight& weight, const Tensor& x, Tensor& out,
+                                   cudaStream_t stream) {
+    gemm_with_beta(weight, x, out, 1.0F, stream);
 }
 
 } // namespace sinfer::ops::detail

@@ -90,7 +90,7 @@ const fi::CompiledChatTemplate& reasoning_effort_template() {
     return value;
 }
 
-const fi::Tokenizer& official_tokenizer() {
+const std::string& official_tokenizer_dir() {
     // surogate patch: host-environmental fixture (upstream hardcoded the
     // author's checkout). SINFER_FAMILY_TOKENIZER_DIR overrides; absent
     // resources SKIP the test (ctest exit 77) instead of aborting.
@@ -106,6 +106,11 @@ const fi::Tokenizer& official_tokenizer() {
         }
         return dir;
     }();
+    return base;
+}
+
+const fi::Tokenizer& official_tokenizer() {
+    const std::string& base                 = official_tokenizer_dir();
     static const std::string tokenizer_json = read_file((base + "/tokenizer.json").c_str());
     static const std::string tokenizer_config_json = read_file((base + "/tokenizer_config.json").c_str());
     static const std::string generation_config_json =
@@ -331,25 +336,32 @@ int test_official_tokenizer_merge() {
 
 int test_transformers5_config_without_decoder() {
     // A transformers-5 `TokenizersBackend` tokenizer_config.json states add_prefix_space and
-    // no add_bos_token at all, and carries no added_tokens_decoder: tokenizer.json's
-    // added_tokens is the sole authority. Such a config must load, and tokenize exactly as
-    // the official config with its decoder does -- the decoder was a cross-check of the same
-    // facts, never a second source of them.
-    FrontendResources modern = resources();
-    nlohmann::json config    = nlohmann::json::parse(modern.tokenizer_config_json);
+    // carries neither add_bos_token nor added_tokens_decoder: tokenizer.json's added_tokens is
+    // the only place the special tokens are stated. Both keys were once required -- the first
+    // defaulted to true when absent, against its own comment; the second was demanded outright
+    // -- and either refused such a checkpoint outright. Strip them from the fixture's own
+    // config: the tokenizer must build and encode exactly as the untouched one does, because
+    // they were a cross-check of facts tokenizer.json already carries, never a second source.
+    const std::string& base = official_tokenizer_dir();
+    nlohmann::json config =
+        nlohmann::json::parse(read_file((base + "/tokenizer_config.json").c_str()));
     config.erase("added_tokens_decoder");
     config.erase("add_bos_token");
-    config["tokenizer_class"]    = "TokenizersBackend";
-    modern.tokenizer_config_json = config.dump();
-    int failures                 = 0;
+    config["tokenizer_class"] = "TokenizersBackend";
+
+    const std::string text = "<|im_start|>user\nhello, Donau<|im_end|>\n";
+    // Encoded by the untouched configuration first, so a failure below belongs to the
+    // stripped one and not to the fixture's tokenizer.json.
+    const std::vector<int> expected = official_tokenizer().encode(text);
+    int failures                    = 0;
     try {
-        fi::Tokenizer tokenizer({.tokenizer_json         = modern.tokenizer_json,
-                                 .tokenizer_config_json  = modern.tokenizer_config_json,
-                                 .generation_config_json = modern.generation_config_json});
-        const std::string text = "<|im_start|>user\nhello<|im_end|>\n<|image_pad|>";
-        failures += check(tokenizer.encode(text) == official_tokenizer().encode(text),
+        fi::Tokenizer tokenizer(
+            {.tokenizer_json         = read_file((base + "/tokenizer.json").c_str()),
+             .tokenizer_config_json  = config.dump(),
+             .generation_config_json = read_file((base + "/generation_config.json").c_str())});
+        failures += check(tokenizer.encode(text) == expected,
                           "a tokenizer_config.json without added_tokens_decoder tokenized "
-                          "differently from the official one");
+                          "differently from the same config with it");
     } catch (const std::exception& error) {
         std::cerr << "transformers-5 tokenizer_config.json refused: " << error.what() << '\n';
         failures += check(false, "a transformers-5 tokenizer_config.json was refused");

@@ -1,5 +1,7 @@
 #include "ops/linear_add/bf16/bf16_linear_add_plan.h"
 
+#include "ops/linear/bf16/bf16_cublaslt.h"
+
 #include <stdexcept>
 
 namespace sinfer::ops::detail {
@@ -12,7 +14,11 @@ bool bf16_linear_add_admits(std::int32_t output_rows, std::int32_t input_rows,
 Bf16LinearAddScheduleId bf16_linear_add_select(std::int32_t output_rows, std::int32_t input_rows,
                                                std::int32_t tokens) {
     if (!bf16_linear_add_admits(output_rows, input_rows, tokens)) {
-        throw std::invalid_argument("bf16 linear_add: unsupported exact problem");
+        if (tokens <= 0 || output_rows <= 0 || input_rows <= 0 || (output_rows % 8) != 0 ||
+            (input_rows % 8) != 0) {
+            throw std::invalid_argument("bf16 linear_add: unsupported exact problem");
+        }
+        return Bf16LinearAddScheduleId::CublasLt;
     }
     if (tokens == 1) { return Bf16LinearAddScheduleId::Decode; }
     if (tokens <= kBf16LinearAddSmallTDispatchEnd) { return Bf16LinearAddScheduleId::SmallT; }
@@ -30,6 +36,8 @@ const char* bf16_linear_add_schedule_name(Bf16LinearAddScheduleId schedule) noex
         return "linear_add.bf16.aggregate_mma.residual";
     case Bf16LinearAddScheduleId::Mma:
         return "linear_add.bf16.mma.residual";
+    case Bf16LinearAddScheduleId::CublasLt:
+        return "linear_add.bf16.cublaslt.residual";
     }
     return "linear_add.bf16.unknown";
 }
@@ -48,6 +56,9 @@ void bf16_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& res
         return;
     case Bf16LinearAddScheduleId::Mma:
         bf16_linear_add_mma_launch(x, weight, residual, stream);
+        return;
+    case Bf16LinearAddScheduleId::CublasLt:
+        bf16_cublaslt_gemm_accumulate(weight, x, residual, stream);
         return;
     }
     throw std::logic_error("bf16 linear_add: unknown schedule");

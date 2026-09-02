@@ -1,4 +1,5 @@
 #include "ops/linear/bf16/bf16_dispatch.h"
+#include "ops/linear/bf16/bf16_cublaslt.h"
 
 #include "ops/linear/bf16/bf16_config.h"
 #include "ops/linear/bf16/bf16_launch.h"
@@ -8,10 +9,24 @@
 
 namespace sinfer::ops::detail {
 
+// A shape outside the registered pair runs on cuBLASLt at every width: shape-generic, and
+// what the two registered shapes fall back to past their small-T ladders anyway. A weight
+// stored BF16 by a quantized export -- the modules its config left alone -- is the first
+// caller to reach this route off the table.
+void launch_bf16_cublaslt(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    bf16_cublaslt_gemm(weight, x, out, stream);
+}
+
 Bf16Launch select_bf16_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
-    const bool supported_problem = (n == 14336 && k == 5120) || (n == 5120 && k == 6144);
-    if (!supported_problem || t <= 0) {
+    if (t <= 0 || n <= 0 || k <= 0) {
         throw std::invalid_argument("bf16 linear: unsupported shape or T");
+    }
+    const bool supported_problem = (n == 14336 && k == 5120) || (n == 5120 && k == 6144);
+    if (!supported_problem) {
+        if ((n % 8) != 0 || (k % 8) != 0) {
+            throw std::invalid_argument("bf16 linear: unsupported shape or T");
+        }
+        return launch_bf16_cublaslt;
     }
     if (t == 1) { return launch_bf16_decode; }
     const std::int32_t small_t_end =

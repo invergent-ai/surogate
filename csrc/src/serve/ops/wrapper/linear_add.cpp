@@ -178,7 +178,10 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
             throw std::invalid_argument("BF16 linear_add admits only A16");
         }
         require_bf16(w);
-        if (!detail::bf16_linear_add_admits(w.n, w.k, t)) {
+        // bf16_linear_add_select routes an 8-aligned shape off the registered one to
+        // cuBLASLt; only a shape it cannot run at all is refused here.
+        if (!detail::bf16_linear_add_admits(w.n, w.k, t) &&
+            ((w.n % 8) != 0 || (w.k % 8) != 0)) {
             throw std::invalid_argument("linear_add: unsupported BF16 shape");
         }
         if (!aligned_to(x.data, 16) || !aligned_to(residual_out.data, 16) ||

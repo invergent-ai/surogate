@@ -18,6 +18,9 @@ enum class Bf16LinearAddScheduleId : std::uint8_t {
     SmallT,
     AggregateMma,
     Mma,
+    /// Any 8-aligned shape outside the registered one, at every width: cuBLASLt accumulating
+    /// into the residual. What a weight stored BF16 by a quantized export runs on.
+    CublasLt,
 };
 
 bool bf16_linear_add_admits(std::int32_t output_rows, std::int32_t input_rows,
