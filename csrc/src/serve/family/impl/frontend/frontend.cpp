@@ -242,8 +242,12 @@ void validate_tokenizer_config(const FrontendResources& resources) {
     const bool sentencepiece =
         tokenizer_json.contains("model") && tokenizer_json.at("model").is_object() &&
         tokenizer_json.at("model").value("byte_fallback", false);
-    if (!sentencepiece && (tokenizer_config.value("add_bos_token", true) ||
-                           tokenizer_config.value("add_prefix_space", true))) {
+    // Absent means false, as the comment above says and as transformers' fast tokenizers
+    // behave: a transformers-5 `TokenizersBackend` config carries add_prefix_space but no
+    // add_bos_token key at all, and defaulting the missing key to true rejected an export
+    // whose tokenizer does exactly what this check wants.
+    if (!sentencepiece && (tokenizer_config.value("add_bos_token", false) ||
+                           tokenizer_config.value("add_prefix_space", false))) {
         throw std::invalid_argument(
             "tokenizer_config.json does not match Qwen3.6 tokenizer prefix semantics");
     }

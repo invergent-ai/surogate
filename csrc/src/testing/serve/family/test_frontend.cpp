@@ -329,6 +329,34 @@ int test_official_tokenizer_merge() {
     return failures;
 }
 
+int test_transformers5_config_without_decoder() {
+    // A transformers-5 `TokenizersBackend` tokenizer_config.json states add_prefix_space and
+    // no add_bos_token at all, and carries no added_tokens_decoder: tokenizer.json's
+    // added_tokens is the sole authority. Such a config must load, and tokenize exactly as
+    // the official config with its decoder does -- the decoder was a cross-check of the same
+    // facts, never a second source of them.
+    FrontendResources modern = resources();
+    nlohmann::json config    = nlohmann::json::parse(modern.tokenizer_config_json);
+    config.erase("added_tokens_decoder");
+    config.erase("add_bos_token");
+    config["tokenizer_class"]    = "TokenizersBackend";
+    modern.tokenizer_config_json = config.dump();
+    int failures                 = 0;
+    try {
+        fi::Tokenizer tokenizer({.tokenizer_json         = modern.tokenizer_json,
+                                 .tokenizer_config_json  = modern.tokenizer_config_json,
+                                 .generation_config_json = modern.generation_config_json});
+        const std::string text = "<|im_start|>user\nhello<|im_end|>\n<|image_pad|>";
+        failures += check(tokenizer.encode(text) == official_tokenizer().encode(text),
+                          "a tokenizer_config.json without added_tokens_decoder tokenized "
+                          "differently from the official one");
+    } catch (const std::exception& error) {
+        std::cerr << "transformers-5 tokenizer_config.json refused: " << error.what() << '\n';
+        failures += check(false, "a transformers-5 tokenizer_config.json was refused");
+    }
+    return failures;
+}
+
 int test_repeated_special_tokens_scan_linearly() {
     constexpr std::string_view token = "<|image_pad|>";
     std::string text;
@@ -1324,6 +1352,7 @@ int main() {
     const Frontend frontend       = FrontendFactory::create_component(owned);
     int failures                  = 0;
     failures += test_official_tokenizer_merge();
+    failures += test_transformers5_config_without_decoder();
     failures += test_repeated_special_tokens_scan_linearly();
     failures += test_official_chat_template();
     failures += test_ordered_instruction_turns();

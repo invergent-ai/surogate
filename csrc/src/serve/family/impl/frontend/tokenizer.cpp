@@ -252,6 +252,10 @@ void merge_added_tokens_decoder(const Json& root, std::string_view label,
                                 const std::unordered_set<int>& occupied_vocab_ids,
                                 const std::unordered_map<std::string, int>& occupied_vocab_tokens,
                                 std::vector<AddedToken>& tokens) {
+    // tokenizer.json's added_tokens is the base and, in the transformers-5 config shape
+    // (`TokenizersBackend`), the only place the special tokens are stated: that config has
+    // no added_tokens_decoder at all. Nothing to merge, nothing to cross-check.
+    if (!root.contains("added_tokens_decoder")) { return; }
     const Json& decoder = require_object_field(root, "added_tokens_decoder", label);
     std::unordered_map<int, std::size_t> token_by_id;
     std::unordered_map<std::string, int> token_by_content;
