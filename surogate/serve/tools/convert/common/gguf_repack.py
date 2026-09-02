@@ -120,6 +120,19 @@ def _planes_iq4_nl(blocks: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 NATIVE_TYPES = {"Q2_K": 84, "Q3_K": 110, "Q4_K": 144, "Q5_K": 176, "Q6_K": 210}
 _NATIVE_LAYOUT = "ggml-blocks-v1"
 
+# What a fused object is called once it is stored as two differently-typed halves. The names
+# match the ones the 35B target already binds, and the public split ops take exactly this pair.
+HALF_NAMES = {"gdn/query_key_value_z": ("gdn/query_key_value", "gdn/z")}
+
+
+def half_names(object_name: str) -> tuple[str, str] | None:
+    """The two object names a fused parent splits into, or None if it has no registered split."""
+    for suffix, halves in HALF_NAMES.items():
+        if object_name.endswith(suffix):
+            prefix = object_name[: -len(suffix)]
+            return (prefix + halves[0], prefix + halves[1])
+    return None
+
 REPACKABLE_TYPES = {
     "Q8_0": (34, _planes_q8_0),
     "Q4_0": (18, _planes_q4_0),
@@ -304,6 +317,23 @@ class GgufRepackSource:
         return planned
 
     @staticmethod
+    def native_half_specs(tensor_specs: Sequence, halves: Mapping[str, tuple]) -> tuple:
+        """Each planned fused spec replaced, in place, by its two typed halves."""
+        out = []
+        for spec in tensor_specs:
+            runs = halves.get(getattr(spec, "name", None))
+            if runs is None:
+                out.append(spec)
+                continue
+            names = half_names(spec.name)
+            for name, (gguf_type, rows) in zip(names, runs):
+                out.append(
+                    replace(spec, name=name, shape=(rows, int(spec.shape[1])),
+                            format=gguf_type, layout=_NATIVE_LAYOUT)
+                )
+        return tuple(out)
+
+    @staticmethod
     def native_specs(tensor_specs: Sequence, plan: Mapping[str, str]) -> tuple:
         """The specs with each natively planned object's format and layout rewritten."""
         out = []
@@ -335,8 +365,10 @@ class GgufRepackSource:
         spec,
         recipe: TensorRecipe,
         token_ids: torch.Tensor | np.ndarray | None,
+        row_slice: slice | None = None,
     ) -> bytes:
-        """The object's superblock bytes: the recipe's rows gathered from the file verbatim."""
+        """The object's superblock bytes: the recipe's rows gathered from the file verbatim.
+        `row_slice` takes one half of a parent that splits into differently-typed objects."""
         ids = None
         if token_ids is not None:
             ids = (
@@ -347,24 +379,77 @@ class GgufRepackSource:
         program = self._evaluate_rows(recipe.expression, ids)
         if program is None:
             raise RepackError(f"{spec.name}: expression is not row-repackable")
-        n = int(program.rows.shape[0])
-        if (n, program.k) != tuple(spec.shape):
+        if row_slice is None and (int(program.rows.shape[0]), program.k) != tuple(spec.shape):
             raise RepackError(
-                f"{spec.name}: native shape {(n, program.k)} != spec {tuple(spec.shape)}"
+                f"{spec.name}: native shape {(int(program.rows.shape[0]), program.k)} "
+                f"!= spec {tuple(spec.shape)}"
             )
-        types = {self.native_type_of(name) for name in program.sources}
-        if types != {spec.format}:
-            raise RepackError(f"{spec.name}: sources are {types}, spec is {spec.format}")
+        if row_slice is None:
+            types = {self.native_type_of(name) for name in program.sources}
+            if types != {spec.format}:
+                raise RepackError(f"{spec.name}: sources are {types}, spec is {spec.format}")
         row_bytes = (program.k // 256) * NATIVE_TYPES[spec.format]
+        rows = program.rows if row_slice is None else program.rows[row_slice]
+        n = int(rows.shape[0])
         out = np.empty((n, row_bytes), dtype=np.uint8)
-        source_of = program.rows // _SOURCE_STRIDE
-        row_of = program.rows % _SOURCE_STRIDE
+        source_of = rows // _SOURCE_STRIDE
+        row_of = rows % _SOURCE_STRIDE
         for index, source_name in enumerate(program.sources):
             mask = source_of == index
             if not mask.any():
                 continue
             out[mask] = self._native_rows(source_name)[row_of[mask]]
         return out.tobytes()
+
+    def plan_native_halves(
+        self,
+        recipes_by_name: Mapping[str, TensorRecipe],
+        tensor_specs: Sequence,
+        *,
+        with_token_ids: bool = True,
+    ) -> dict[str, tuple[tuple[str, int], ...]]:
+        """{object: ((ggml type, rows), ...)} for a quantised-linear object whose rows all come
+        from native K-quants but of more than one type, in contiguous runs.
+
+        A fused parent cannot hold two formats, and requantising the minority to the majority
+        would lose what serving the file natively is for; the object is stored as one per run
+        instead and the loader binds the halves. Only two runs are produced today, which is
+        what the checkpoints on hand need (a GDN input projection whose qkv half is Q5_K and
+        whose z half is Q4_K); anything else is left to the dequantise path.
+        """
+        # OFF by default, and measured: on Qwen3.5-0.8B-Q4_K_M the split shrinks the artifact
+        # 713 -> 652 MB and still loses 6 % of decode (885 -> 828 tok/s), because the fused
+        # parent runs one tuned W8 projection-and-convolution kernel per GDN layer while the
+        # split runs two K-quant GEMVs and an unfused convolution -- two extra launches a layer,
+        # eighteen layers, against a ~1.1 ms step. The bytes are worth having once the K-quant
+        # GDN convolution is fused too; until then the dequantised parent is the faster serve.
+        if os.environ.get("SUROGATE_GGUF_SPLIT_HALVES", "0") == "0":
+            return {}
+        probe = np.zeros(1, dtype=np.int64) if with_token_ids else None
+        planned: dict[str, tuple[tuple[str, int], ...]] = {}
+        for spec in tensor_specs:
+            if getattr(spec, "kind", None) != "tensor" or spec.format != _REPACK_FORMAT:
+                continue
+            recipe = recipes_by_name.get(spec.name)
+            if recipe is None or isinstance(recipe.expression, GatherRows):
+                continue
+            program = self._evaluate_rows(recipe.expression, probe)
+            if program is None or program.k != int(spec.shape[1]) or program.k % 256:
+                continue
+            types = [self.native_type_of(name) for name in program.sources]
+            if any(t is None for t in types) or len(set(types)) < 2:
+                continue
+            per_row = [types[int(index)] for index in (program.rows // _SOURCE_STRIDE)]
+            runs: list[list] = []
+            for gguf_type in per_row:
+                if runs and runs[-1][0] == gguf_type:
+                    runs[-1][1] += 1
+                else:
+                    runs.append([gguf_type, 1])
+            if len(runs) != 2 or half_names(spec.name) is None:
+                continue
+            planned[spec.name] = tuple((str(t), int(rows)) for t, rows in runs)
+        return planned
 
     def covered_sources(
         self, recipes_by_name: Mapping[str, TensorRecipe], planned: Sequence[str]

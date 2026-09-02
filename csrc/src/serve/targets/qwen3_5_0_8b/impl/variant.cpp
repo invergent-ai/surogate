@@ -52,11 +52,13 @@ std::size_t gdn_snapshot_workspace_bytes(const Tensor& hidden,
                                          const Variant::GdnProjectionWeights& weights) {
     const std::int32_t batch = hidden.ne[2];
     const std::int32_t width = hidden.ne[1];
-    if (std::holds_alternative<SplitGdnInputProjectionPayload>(weights.input_projection)) {
+    if (const auto* split =
+            std::get_if<SplitGdnInputProjectionPayload>(&weights.input_projection)) {
         return std::max(kMinimumLeafWorkspaceBytes,
-                        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-                            TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim, batch,
-                            width, width));
+                        ops::gdn_input_proj_conv_snapshot_split_workspace_capacity_bytes(
+                            split->query_key_value.qtype, TextConfig::convolution_dim,
+                            TextConfig::value_dim, TextConfig::hidden,
+                            text_policy(split->query_key_value), batch, width, width));
     }
     const Weight& parent =
         std::get<FusedGdnInputProjectionPayload>(weights.input_projection).query_key_value_z;
@@ -70,11 +72,13 @@ std::size_t gdn_record_workspace_bytes(const Tensor& hidden,
                                        const Variant::GdnProjectionWeights& weights) {
     const std::int32_t batch = hidden.ne[2];
     const std::int32_t width = hidden.ne[1];
-    if (std::holds_alternative<SplitGdnInputProjectionPayload>(weights.input_projection)) {
+    if (const auto* split =
+            std::get_if<SplitGdnInputProjectionPayload>(&weights.input_projection)) {
         return std::max(kMinimumLeafWorkspaceBytes,
-                        ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
-                            TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim, batch,
-                            width, width));
+                        ops::gdn_input_proj_conv_record_split_workspace_capacity_bytes(
+                            split->query_key_value.qtype, TextConfig::convolution_dim,
+                            TextConfig::value_dim, TextConfig::hidden,
+                            text_policy(split->query_key_value), batch, width, width));
     }
     const Weight& parent =
         std::get<FusedGdnInputProjectionPayload>(weights.input_projection).query_key_value_z;
@@ -226,8 +230,8 @@ void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeig
         output_gate.view({TextConfig::value_dim, static_cast<int>(hidden.ne[1])});
     if (const auto* split =
             std::get_if<SplitGdnInputProjectionPayload>(&weights.input_projection)) {
-        ops::gdn_input_proj(hidden, split->query_key, split->value_z, qkv, output_gate_flat,
-                            stream);
+        ops::gdn_input_proj_split(hidden, split->query_key_value, split->z, qkv, output_gate_flat,
+                                  text_policy(split->query_key_value), workspace, stream);
         return;
     }
     const Weight& fused =
@@ -247,10 +251,10 @@ void Variant::gdn_input_projection_snapshot(
     Tensor output_gate_view = output_gate.view({TextConfig::value_dim, hidden.ne[1], hidden.ne[2]});
     if (const auto* split =
             std::get_if<SplitGdnInputProjectionPayload>(&weights.input_projection)) {
-        ops::gdn_input_proj_conv_snapshot(hidden, split->query_key, split->value_z, conv_weight,
-                                          conv_states, valid_columns, initial_slot,
-                                          snapshot_base_slot, query, key, value, output_gate_view,
-                                          leaf_workspace, stream);
+        ops::gdn_input_proj_conv_snapshot_split(
+            hidden, split->query_key_value, split->z, conv_weight, conv_states, valid_columns,
+            initial_slot, snapshot_base_slot, query, key, value, output_gate_view,
+            text_policy(split->query_key_value), leaf_workspace, stream);
         return;
     }
     const Weight& fused =
@@ -272,10 +276,10 @@ void Variant::gdn_input_projection_record(const Tensor& hidden, const GdnProject
     Tensor output_gate_view = output_gate.view({TextConfig::value_dim, hidden.ne[1], hidden.ne[2]});
     if (const auto* split =
             std::get_if<SplitGdnInputProjectionPayload>(&weights.input_projection)) {
-        ops::gdn_input_proj_conv_record(hidden, split->query_key, split->value_z, conv_weight,
-                                        conv_states, valid_columns, initial_slots, conv_record,
-                                        query, key, value, output_gate_view, leaf_workspace,
-                                        stream);
+        ops::gdn_input_proj_conv_record_split(
+            hidden, split->query_key_value, split->z, conv_weight, conv_states, valid_columns,
+            initial_slots, conv_record, query, key, value, output_gate_view,
+            text_policy(split->query_key_value), leaf_workspace, stream);
         return;
     }
     const Weight& fused =

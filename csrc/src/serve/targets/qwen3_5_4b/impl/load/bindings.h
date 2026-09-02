@@ -51,9 +51,13 @@ struct FullAttentionPlan {
     WeightPlan output;
 };
 
+// The halves a GGUF splits this parent into: the checkpoint holds one qkv tensor and one z
+// tensor, and a K-quant export may quantise them differently (Q5_K and Q4_K in the files on
+// hand), so they cannot share an object. Row order in the fused parent is q|k|v then z, which
+// is exactly this boundary.
 struct SplitGdnInputProjectionPlan {
-    WeightPlan query_key;
-    WeightPlan value_z;
+    WeightPlan query_key_value;
+    WeightPlan z;
 };
 
 struct FusedGdnInputProjectionPlan {
@@ -153,8 +157,8 @@ using FullAttentionProjectionPayload =
     std::variant<SplitAttentionProjectionPayload, FusedAttentionProjectionPayload>;
 
 struct SplitGdnInputProjectionPayload {
-    Weight query_key;
-    Weight value_z;
+    Weight query_key_value;
+    Weight z;
 };
 
 struct FusedGdnInputProjectionPayload {

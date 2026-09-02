@@ -23,7 +23,11 @@ from surogate.serve.tools.artifact.container import (
     ArtifactObject,
     ArtifactWriter,
 )
-from surogate.serve.tools.convert.common.gguf_repack import GgufRepackSource, RepackError
+from surogate.serve.tools.convert.common.gguf_repack import (
+    GgufRepackSource,
+    RepackError,
+    half_names,
+)
 from surogate.serve.tools.convert.common.quantize import pick_device
 from surogate.serve.tools.convert.common.safetensors import ShardReader
 from surogate.serve.tools.convert.common import conversion as family_conversion
@@ -401,14 +405,22 @@ def convert(
         recipes = {n: r for n, r in recipes.items() if n not in tied}
         print(f"tied objects dropped: {', '.join(sorted(tied))}", flush=True)
     native = repack.plan_native(recipes, active_tensor_specs) if repack is not None else {}
-    planned = plan_repack(repack, recipes, active_tensor_specs, native)
+    # A fused parent whose halves carry different K-quant types is stored as two objects; the
+    # loader binds the pair and the split ops project each half straight into its destination.
+    halves = repack.plan_native_halves(recipes, active_tensor_specs) if repack is not None else {}
+    planned = plan_repack(repack, recipes, active_tensor_specs, set(native) | set(halves))
     repacked_names = frozenset(planned)
+    if halves:
+        active_tensor_specs = GgufRepackSource.native_half_specs(active_tensor_specs, halves)
+        active_object_specs = GgufRepackSource.native_half_specs(active_object_specs, halves)
+        print(f"native K-quant halves: {len(halves)} fused parents stored as typed pairs",
+              flush=True)
     if native:
         active_tensor_specs = GgufRepackSource.native_specs(active_tensor_specs, native)
         active_object_specs = GgufRepackSource.native_specs(active_object_specs, native)
         print(f"native K-quants: {len(native)} objects served as the GGUF stores them", flush=True)
     preflight = preflight_conversion(
-        model, repack, planned + tuple(native) + tuple(sorted(tied)), mtp=mtp, vision=vision, native=native, object_specs=active_object_specs
+        model, repack, planned + tuple(native) + tuple(sorted(tied)) + tuple(halves), mtp=mtp, vision=vision, native=native, object_specs=active_object_specs
     )
 
     print(
@@ -418,6 +430,15 @@ def convert(
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     resources = {resource.name: resource.data for resource in preflight.resources}
+    # object name -> (fused parent recipe, the rows of that parent it holds)
+    half_lookup: dict[str, tuple[str, slice]] = {}
+    for parent, runs in halves.items():
+        names = half_names(parent)
+        first = 0
+        for name, (_, rows) in zip(names, runs):
+            half_lookup[name] = (parent, slice(first, first + rows))
+            first += rows
+
     with ShardReader(model) as reader:
         with ArtifactWriter(
             output,
@@ -430,6 +451,12 @@ def convert(
                 repacked = False
                 if isinstance(spec, inventory.ResourceSpec):
                     payload = resources[spec.name]
+                elif repack is not None and spec.name in half_lookup:
+                    parent, row_slice = half_lookup[spec.name]
+                    payload = repack.payload_for_native(
+                        spec, recipes[parent], None, row_slice=row_slice
+                    )
+                    repacked = True
                 elif repack is not None and spec.name in native:
                     # A K-quant served as the GGUF stores it: rows gathered verbatim.
                     token_ids = None

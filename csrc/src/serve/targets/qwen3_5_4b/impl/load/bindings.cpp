@@ -205,9 +205,14 @@ load_attention_projection(const FullAttentionPlan& plan,
 
 GdnInputProjectionPayload
 load_gdn_input_projection(const GdnPlan& plan, const artifact::MaterializedArtifact& materialized) {
-    // Same as the attention split above: never constructed for this target.
-    if (std::holds_alternative<SplitGdnInputProjectionPlan>(plan.input_projection)) {
-        throw std::invalid_argument("gdn input projection: split plans are not produced for this target");
+    // A GGUF whose qkv and z halves carry different K-quant types is stored as two objects.
+    if (const auto* split = std::get_if<SplitGdnInputProjectionPlan>(&plan.input_projection)) {
+        return SplitGdnInputProjectionPayload{
+            .query_key_value = materialized_weight(materialized, split->query_key_value,
+                                                   TextConfig::convolution_dim, TextConfig::hidden),
+            .z = materialized_weight(materialized, split->z, TextConfig::value_dim,
+                                     TextConfig::hidden),
+        };
     }
     const auto& fused = std::get<FusedGdnInputProjectionPlan>(plan.input_projection);
     return FusedGdnInputProjectionPayload{
@@ -261,10 +266,21 @@ void bind_groupwise_text_layers(artifact::Binder& binder, BindingPlan& out) {
                 .b_projection = bind_weight(binder, prefix + "gdn/b_projection",
                                             NumericFormat::BF16, {TextConfig::gdn_value_heads, TextConfig::hidden}),
             };
-            target.gdn.input_projection = FusedGdnInputProjectionPlan{
-                .query_key_value_z =
-                    bind_linear_weight(binder, prefix + "gdn/query_key_value_z", {TextConfig::convolution_dim + TextConfig::value_dim, TextConfig::hidden}),
-            };
+            if (binder.has(prefix + "gdn/query_key_value")) {
+                target.gdn.input_projection = SplitGdnInputProjectionPlan{
+                    .query_key_value = bind_linear_weight(
+                        binder, prefix + "gdn/query_key_value",
+                        {TextConfig::convolution_dim, TextConfig::hidden}),
+                    .z = bind_linear_weight(binder, prefix + "gdn/z",
+                                            {TextConfig::value_dim, TextConfig::hidden}),
+                };
+            } else {
+                target.gdn.input_projection = FusedGdnInputProjectionPlan{
+                    .query_key_value_z = bind_linear_weight(
+                        binder, prefix + "gdn/query_key_value_z",
+                        {TextConfig::convolution_dim + TextConfig::value_dim, TextConfig::hidden}),
+                };
+            }
             target.gdn.norm = artifact::bind_device_tensor(binder, prefix + "gdn/norm",
                                                            NumericFormat::BF16, {TextConfig::gdn_key_head_dim});
             target.gdn.output =
