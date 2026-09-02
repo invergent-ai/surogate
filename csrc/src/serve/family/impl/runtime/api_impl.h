@@ -251,6 +251,16 @@ void Program<Variant>::kv_settle() noexcept {
 }
 
 template <>
+bool Program<Variant>::kv_under_pressure() const noexcept {
+    return impl_->kv_under_pressure();
+}
+
+template <>
+bool Program<Variant>::kv_service_pressure() noexcept {
+    return impl_->kv_service_pressure();
+}
+
+template <>
 void Program<Variant>::reset_memory_peaks() noexcept {
     impl_->reset_memory_peaks();
 }

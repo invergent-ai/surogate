@@ -44,12 +44,27 @@ struct ElasticKvRegionSpec {
     /// this region's unmapped remainder as spoken for, so co-resident pools that could not
     /// all fill at once are refused at startup, as arena pools are, not mid-round.
     std::uint32_t cap_pages        = 0;
+    /// Overcommit: `cap_pages` is a guaranteed floor rather than a ceiling. Entitlements past
+    /// it are admitted through `try_entitle`, a device-wide gate over every region's
+    /// outstanding (entitled or guaranteed, not yet mapped) bytes against the memory actually
+    /// free, so co-resident pools share the device's idle KV instead of each holding its own.
+    bool overcommit                = false;
+    /// Bytes the gate never entitles into: CUDA graphs are captured lazily per bucket and a
+    /// capture that cannot instantiate is fatal, and workspaces grow with the widest round.
+    std::size_t headroom_bytes     = 0;
+    /// Tests: what the gate reads as free device bytes (default cudaMemGetInfo).
+    std::size_t (*free_bytes_probe)() = nullptr;
     std::vector<ElasticKvPlane> planes;
 };
 
-/// Bytes every elastic region on `device` could still map without exceeding its cap: what a
-/// new engine must leave free. Zero when no region is registered there.
+/// Bytes every elastic region on `device` could still map that are spoken for — its guaranteed
+/// cap or its entitlement, whichever is larger, less what it has mapped: what a new engine must
+/// leave free. Zero when no region is registered there.
 [[nodiscard]] std::size_t elastic_kv_unmapped_commitment(int device) noexcept;
+
+/// True while a region on `device` was recently refused an entitlement by the gate: regions
+/// there give up their reserve and executors give up retained lanes until it clears.
+[[nodiscard]] bool elastic_kv_device_pressure(int device) noexcept;
 
 class ElasticKvRegion {
 public:
@@ -79,6 +94,19 @@ public:
     std::size_t sleep();
     /// Map the granules that held pages, restore them, and let the reserve refill. Returns bytes mapped.
     std::size_t wake();
+
+    /// Overcommit gate: may the pool's entitlement become `pages`? Within the guaranteed cap
+    /// always; beyond it when every region's outstanding bytes plus this growth still fit the
+    /// device's free memory. Records the entitlement when it says yes; a no flags pressure on
+    /// the device and asks the other regions there to release their reserves.
+    [[nodiscard]] bool try_entitle(std::uint32_t pages) noexcept;
+    /// Records the pool's entitlement without gating (decreases, and the per-round resync).
+    void set_entitled_pages(std::uint32_t pages) noexcept;
+    /// Another region on the device is short: give back every free granule, reserve included.
+    /// Any thread may ask; the engine's own thread performs it at its next round boundary
+    /// through `flush_reserve_release`, since only that thread may fence the engine's stream.
+    void release_reserve() noexcept;
+    void flush_reserve_release() noexcept;
 
     /// Blocks until the worker has no pending map or unmap work (tests, teardown).
     void wait_idle();

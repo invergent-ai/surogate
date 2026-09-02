@@ -259,6 +259,10 @@ public:
     [[nodiscard]] PagedKVOccupancy kv_occupancy() const noexcept;
     /// Blocks until an elastic Main pool has no map or unmap work pending (no-op otherwise).
     void kv_settle() noexcept;
+    /// An elastic Main pool on a device whose gate recently refused an entitlement.
+    [[nodiscard]] bool kv_under_pressure() const noexcept;
+    /// Round boundary: perform a reserve release another engine asked for, report pressure.
+    bool kv_service_pressure() noexcept;
 
     void reset_memory_peaks() noexcept;
 

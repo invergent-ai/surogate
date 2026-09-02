@@ -37,6 +37,9 @@ struct DecoderStateSpec {
     std::uint32_t text_physical_page_groups = 0;
     // Elastic Main pool: pages that may be physical at once (0 = all of the above).
     std::uint32_t text_physical_page_cap    = 0;
+    // Elastic Main pool: the cap is a guaranteed floor and pages past it are gated on the
+    // device's free memory at admission (core/elastic_kv_region.h).
+    bool elastic_kv_overcommit              = false;
     std::uint32_t mtp_physical_page_groups  = 0;
     LinearAttentionStatePoolSpec linear_attention;
     // Per-slot state of a layer prologue (n-gram memory); absent for targets without one.

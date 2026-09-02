@@ -3329,3 +3329,31 @@ reproducer and counts garbage as a leak.
 the paired request's tokens equal to the solo run's. Elastic pool: 12/12.
 `sinfer_kv_cache_test`, `sinfer_elastic_kv_region_test`,
 `sinfer_gqa_attention_test` pass.
+
+## 92
+
+**Elastic KV overcommit: the cap becomes a floor, growth past it is gated
+on the device's free memory (2026-09-02).**
+
+`--elastic-kv-overcommit`. The ledger keeps each region's guaranteed cap,
+its entitlement and what it has mapped; `ElasticKvRegion::try_entitle`
+admits growth past the floor when every region's outstanding bytes plus
+the growth plus a headroom (`SUROGATE_SERVE_ELASTIC_KV_HEADROOM_MIB`,
+default 1024, for lazily captured graphs) fit what is free. Automatic
+sizing under overcommit resolves the floor to one full-context request.
+
+Three crashes on the way, each a rule now: a reservation must never ask the
+gate a second time (the pool carries the approval from `can_admit_lane` to
+`reserve`, or the round's ledger resync turns a refusal into `bad_alloc`);
+only the engine's own thread may fence its stream (the worker-side reserve
+release invalidated a graph capture in flight — it is now a flag the
+executor flushes at its round boundary, capture-checked); and the admission
+policy must be told when the device, not the incumbents, blocked a head
+(`kv_under_pressure`), or `make_admission_protection` throws on a head that
+"fits". A refusal marks the device for two seconds: reserves trim to zero,
+retained lanes go back, other regions release their reserves, and an
+engine whose whole queue waits paces its retries.
+
+Measured: 27B+4B both-hot parity (312 + 624 tok/s); contention between two
+4B engines with 4 GB of demand into 2.4 GB of room: 298 + 326 requests, 0
+errors, free memory pinned at the headroom, reserves back afterwards.

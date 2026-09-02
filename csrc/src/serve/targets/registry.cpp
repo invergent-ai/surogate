@@ -215,10 +215,19 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
                                                                   preflight_runtime_bytes);
         effective.prefill_chunk = std::min(options.prefill_chunk, effective.max_context);
     }
+    if (effective.elastic_kv_overcommit) { effective.elastic_kv = true; }
     auto sequence_planner = Target::make_sequence_planner(device, effective, weights_profile);
     const runtime::SequenceCapacityCurve curve = sequence_planner.capacity_curve();
+    // Overcommit: the physical cap is a guaranteed floor of one full-context request; every
+    // page past it is entitled through the device gate at admission. An automatic policy
+    // must not size the floor to what is free, or the first engine would guarantee itself
+    // everything and the sharing would never start.
+    const KvCapacityPolicy kv_policy =
+        effective.elastic_kv_overcommit && effective.kv_capacity.mode == KvCapacityMode::Automatic
+            ? KvCapacityPolicy::explicit_capacity(effective.max_context)
+            : effective.kv_capacity;
     (void)runtime::resolve_kv_capacity(
-        effective.kv_capacity, curve,
+        kv_policy, curve,
         subtract_saturating(preflight_runtime_bytes, elastic_kv_unmapped_commitment(device.device)));
 
     auto progress     = artifact_progress(options.load_progress);
@@ -231,7 +240,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     // Elastic pools on this device have mapped only what they use so far; what they may still
     // map is not free for this engine's cap, or two engines would fill against each other.
     runtime::KvCapacityResolution capacity_resolution = runtime::resolve_kv_capacity(
-        effective.kv_capacity, curve,
+        kv_policy, curve,
         subtract_saturating(
             subtract_saturating(current_free_device_bytes(), derived_residency_bytes),
             elastic_kv_unmapped_commitment(device.device)));

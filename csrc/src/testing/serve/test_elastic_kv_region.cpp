@@ -171,6 +171,128 @@ int pool_cases(sinfer::DeviceContext& device) {
     return failures;
 }
 
+// Overcommit: the cap is a floor, growth past it is gated on what the device has free, and a
+// refusal marks the device and asks the other regions there for their reserves.
+std::size_t g_fake_free = 0;
+std::size_t fake_free() { return g_fake_free; }
+
+sinfer::ElasticKvRegionSpec overcommit_spec(sinfer::DeviceContext& device, std::uint32_t reserve) {
+    sinfer::ElasticKvRegionSpec spec;
+    spec.device           = device.device;
+    spec.fence_stream     = device.stream;
+    spec.page_count       = kPages;   // 4 granules of 32 pages
+    spec.granule_pages    = kGranule;
+    spec.reserve_granules = reserve;
+    spec.cap_pages        = kGranule; // one granule guaranteed
+    spec.overcommit       = true;
+    spec.headroom_bytes   = 0; // the arithmetic below counts granules, not an engine's headroom
+    spec.free_bytes_probe = &fake_free;
+    spec.planes           = {{0, kPageBytes}, {8 * kMiB, kPageBytes}};
+    spec.bytes            = 16 * kMiB;
+    return spec;
+}
+
+int overcommit_cases(sinfer::DeviceContext& device) {
+    int failures = 0;
+    const int dev = device.device;
+    g_fake_free   = 64 * kMiB; // construction charges the floor against this
+    // A reserve of two, then a granule mapped and released: the reserve keeps it mapped until
+    // a release_reserve (what a refused neighbour sends) unmaps it.
+    {
+        sinfer::ElasticKvRegion a(overcommit_spec(device, 2));
+        a.wait_idle();
+        a.acquire_page(0);
+        a.release_page(0);
+        a.wait_idle();
+        failures += expect(a.mapped_granules() >= 1, "reserve keeps the freed granule mapped");
+        a.release_reserve();          // any thread asks
+        a.flush_reserve_release();    // the engine thread performs it at its round boundary
+        a.wait_idle();
+        failures += expect(a.mapped_granules() == 0, "release_reserve unmapped the reserve");
+    }
+    sinfer::ElasticKvRegion a(overcommit_spec(device, 0));
+    sinfer::ElasticKvRegion b(overcommit_spec(device, 0));
+    a.wait_idle();
+    b.wait_idle();
+    const std::size_t granule = a.granule_bytes(); // 4 MiB: 2 MiB in each plane
+    failures += expect(sinfer::elastic_kv_unmapped_commitment(dev) == 2 * granule,
+                       "two floors outstanding before any entitlement");
+
+    // Within the floor: no probe consulted.
+    g_fake_free = 0;
+    failures += expect(a.try_entitle(kGranule), "the floor is always granted");
+    failures += expect(!sinfer::elastic_kv_device_pressure(dev), "no pressure within the floor");
+
+    // Past the floor: others' outstanding (b's floor, 1 granule) + growth (2) + slack (2) = 5
+    // granules must fit.
+    g_fake_free = 4 * granule;
+    failures += expect(!a.try_entitle(2 * kGranule), "gate refuses when the device is short");
+    failures += expect(sinfer::elastic_kv_device_pressure(dev), "a refusal marks pressure");
+    g_fake_free = 5 * granule;
+    failures += expect(a.try_entitle(2 * kGranule), "gate admits when it fits exactly");
+    failures += expect(sinfer::elastic_kv_unmapped_commitment(dev) == 3 * granule,
+                       "a's entitlement and b's floor are outstanding");
+
+    // Mapping reduces what is outstanding: a maps its first granule.
+    a.acquire_page(0);
+    a.wait_idle();
+    failures += expect(sinfer::elastic_kv_unmapped_commitment(dev) == 2 * granule,
+                       "a mapped granule is no longer outstanding");
+    // b growing to 3 granules: a's outstanding (1) + growth (3) + slack (2) = 6.
+    g_fake_free = 5 * granule;
+    failures += expect(!b.try_entitle(3 * kGranule), "b refused at five granules free");
+    g_fake_free = 6 * granule;
+    failures += expect(b.try_entitle(3 * kGranule), "b admitted at six granules free");
+    // Shrinking never asks.
+    g_fake_free = 0;
+    failures += expect(b.try_entitle(kGranule), "shrinking is always granted");
+    b.set_entitled_pages(0);
+    failures += expect(sinfer::elastic_kv_unmapped_commitment(dev) == 2 * granule,
+                       "b back to its floor, a's second granule outstanding");
+    a.release_page(0);
+    a.wait_idle();
+    return failures;
+}
+
+int pool_overcommit_cases(sinfer::DeviceContext& device) {
+    int failures = 0;
+    sinfer::LayoutBuilder builder;
+    sinfer::PagedKVPoolLayout layout =
+        sinfer::plan_paged_kv_pool(builder, {.page_group_count      = 1024,
+                                             .logical_page_capacity = 1024,
+                                             .table_rows            = 2,
+                                             .elastic               = true,
+                                             .physical_page_cap     = 256, // one granule
+                                             .overcommit            = true,
+                                             .planes = {{sinfer::DType::I8, 64, 2},
+                                                        {sinfer::DType::I8, 64, 2}}});
+    const std::size_t arena_bytes = builder.finish(256, "test arena");
+    sinfer::DeviceArena arena(arena_bytes);
+    g_fake_free = 64 * kMiB;
+    const sinfer::PagedKVElasticOptions options{.device           = device.device,
+                                                .free_bytes_probe = &fake_free,
+                                                .fence_stream     = device.stream,
+                                                .reserve_granules = 0,
+                                                .headroom_bytes   = 0};
+    sinfer::PagedKVPool pool({arena.base(), arena.capacity()}, layout, &options);
+    pool.elastic_region()->wait_idle();
+    failures += expect(pool.capacity_pages() == 1024, "overcommit admits against the whole span");
+    g_fake_free = 0;
+    failures += expect(pool.can_reserve(200), "a reservation within the floor needs no free memory");
+    failures += expect(!pool.can_reserve(300), "a reservation past the floor is gated");
+    g_fake_free = 64 * kMiB;
+    failures += expect(pool.can_reserve(300), "and admitted when the device has room");
+    auto allocation = pool.reserve(300);
+    failures += expect(pool.occupancy().entitled_pages == 300, "entitlement recorded");
+    failures += expect(sinfer::elastic_kv_unmapped_commitment(device.device) ==
+                           2 * pool.elastic_region()->granule_bytes(),
+                       "two granules outstanding for 300 pages");
+    allocation.release();
+    pool.elastic_region()->wait_idle();
+    failures += expect(pool.occupancy().entitled_pages == 0, "entitlement released");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -188,6 +310,8 @@ int main() {
         sinfer::DeviceContext device(0);
         int failures = region_cases(device);
         failures += pool_cases(device);
+        failures += overcommit_cases(device);
+        failures += pool_overcommit_cases(device);
         if (failures == 0) { std::cout << "OK elastic kv region\n"; }
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

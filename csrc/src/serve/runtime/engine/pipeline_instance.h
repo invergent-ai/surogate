@@ -277,6 +277,17 @@ public:
     void kv_settle() noexcept {
         for (Stage* stage : stages_) { stage->program->kv_settle(); }
     }
+    [[nodiscard]] bool kv_under_pressure() const noexcept {
+        for (Stage* stage : stages_) {
+            if (stage->program->kv_under_pressure()) { return true; }
+        }
+        return false;
+    }
+    bool kv_service_pressure() noexcept {
+        bool pressure = false;
+        for (Stage* stage : stages_) { pressure = stage->program->kv_service_pressure() || pressure; }
+        return pressure;
+    }
     void reset_memory_peaks() noexcept {
         for (Stage* stage : stages_) { stage->program->reset_memory_peaks(); }
     }

@@ -75,6 +75,7 @@ struct SequencePlanningInputs {
     std::vector<std::uint32_t> kv_skip_layers;
     bool rewrite_checkpoints               = false;
     bool elastic_kv                        = false;
+    bool elastic_kv_overcommit             = false;
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
     bool use_cuda_graph = true;
@@ -112,6 +113,7 @@ struct SequencePlanImpl<SINFER_FAMILY_VARIANT> {
     std::vector<std::uint32_t> kv_skip_layers;
     bool rewrite_checkpoints               = false;
     bool elastic_kv                        = false;
+    bool elastic_kv_overcommit             = false;
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
     bool use_cuda_graph = true;

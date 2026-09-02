@@ -19,7 +19,7 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
                               std::uint32_t physical_page_groups,
                               const std::vector<std::uint32_t>& skip_layers,
                               std::int32_t indexer_head_dim, bool elastic = false,
-                              std::uint32_t physical_page_cap = 0) {
+                              std::uint32_t physical_page_cap = 0, bool overcommit = false) {
     if (layers == 0 ||
         layers > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
         kv_heads <= 0 || head_dim <= 0 || table_rows <= 0) {
@@ -60,6 +60,7 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
     pool_spec.table_rows            = table_rows;
     pool_spec.elastic               = elastic;
     pool_spec.physical_page_cap     = elastic ? physical_page_cap : 0;
+    pool_spec.overcommit            = elastic && overcommit;
     const std::size_t planes_per_layer =
         (grouped ? 4ULL : 2ULL) + (indexer_head_dim > 0 ? 1ULL : 0ULL);
     pool_spec.planes.reserve(static_cast<std::size_t>(layers) * planes_per_layer);
@@ -100,7 +101,7 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
                                 spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,
                                 spec.kv_table_rows, spec.text_physical_page_groups,
                                 spec.kv_skip_layers, spec.indexer_head_dim, spec.elastic_kv,
-                                spec.text_physical_page_cap);
+                                spec.text_physical_page_cap, spec.elastic_kv_overcommit);
     if (spec.enable_mtp) {
         layout.mtp_kv = plan_cache(builder, spec.mtp_layers, spec.capacity, spec.kv_heads,
                                    spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,

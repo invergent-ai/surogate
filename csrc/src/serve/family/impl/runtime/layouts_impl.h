@@ -185,6 +185,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .kv_table_rows             = static_cast<std::int32_t>(plan.max_concurrency),
                      .text_physical_page_groups = physical_pages,
                      .text_physical_page_cap    = plan.elastic_kv ? plan.main_page_groups : 0U,
+                     .elastic_kv_overcommit     = plan.elastic_kv && plan.elastic_kv_overcommit,
                      .mtp_physical_page_groups  = mtp_physical_pages,
                      .linear_attention =
                          {
@@ -747,6 +748,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->kv_skip_layers      = inputs.kv_skip_layers;
     impl->rewrite_checkpoints = inputs.rewrite_checkpoints;
     impl->elastic_kv          = inputs.elastic_kv;
+    impl->elastic_kv_overcommit = inputs.elastic_kv_overcommit;
     impl->persistent          = persistent_layout(*impl);
     impl->workspace           = build_workspace_plan(*impl);
     if (impl->features.vision) {
@@ -828,6 +830,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .kv_skip_layers = options.kv_cache_skip_layers,
         .rewrite_checkpoints = options.rewrite_checkpoints,
         .elastic_kv     = options.elastic_kv,
+        .elastic_kv_overcommit = options.elastic_kv_overcommit,
         .proposal_head  = options.speculative.proposal_head,
         .features       = family::startup_features(options),
         .use_cuda_graph = options.use_cuda_graph,

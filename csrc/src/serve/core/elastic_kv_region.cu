@@ -7,14 +7,17 @@
 #include <cuda.h>
 
 #include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <map>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace sinfer {
 namespace {
@@ -35,11 +38,19 @@ CUmemAllocationProp allocation_prop(int device) {
     return prop;
 }
 
-// The process-wide commitment ledger: each region's cap in bytes and what it has mapped.
+// The process-wide commitment ledger: each region's guaranteed cap, its entitlement and what
+// it has mapped, all in bytes. Outstanding is what it may still map that is spoken for.
 struct Commitment {
-    int device       = 0;
-    std::size_t cap  = 0;
-    std::size_t mapped = 0;
+    int device           = 0;
+    std::size_t cap      = 0;
+    std::size_t entitled = 0;
+    std::size_t mapped   = 0;
+    ElasticKvRegion* region = nullptr;
+
+    [[nodiscard]] std::size_t outstanding() const noexcept {
+        const std::size_t spoken_for = std::max(cap, entitled);
+        return spoken_for > mapped ? spoken_for - mapped : 0;
+    }
 };
 std::mutex& ledger_mutex() {
     static std::mutex instance;
@@ -49,16 +60,38 @@ std::map<const void*, Commitment>& ledger() {
     static std::map<const void*, Commitment> instance;
     return instance;
 }
+// Pressure: the last time the gate refused a region on each device.
+using PressureClock = std::chrono::steady_clock;
+constexpr auto kPressureHold = std::chrono::seconds(2);
+std::map<int, PressureClock::time_point>& pressure_marks() {
+    static std::map<int, PressureClock::time_point> instance;
+    return instance;
+}
+// Caller holds the ledger mutex.
+std::size_t outstanding_on(int device, const void* except) noexcept {
+    std::size_t bytes = 0;
+    for (const auto& [key, entry] : ledger()) {
+        if (entry.device == device && key != except) { bytes += entry.outstanding(); }
+    }
+    return bytes;
+}
+std::size_t device_free_bytes() noexcept {
+    std::size_t free_bytes = 0, total_bytes = 0;
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) { return 0; }
+    return free_bytes;
+}
 
 } // namespace
 
 std::size_t elastic_kv_unmapped_commitment(int device) noexcept {
     const std::lock_guard<std::mutex> lock(ledger_mutex());
-    std::size_t bytes = 0;
-    for (const auto& [key, entry] : ledger()) {
-        if (entry.device == device && entry.cap > entry.mapped) { bytes += entry.cap - entry.mapped; }
-    }
-    return bytes;
+    return outstanding_on(device, nullptr);
+}
+
+bool elastic_kv_device_pressure(int device) noexcept {
+    const std::lock_guard<std::mutex> lock(ledger_mutex());
+    const auto it = pressure_marks().find(device);
+    return it != pressure_marks().end() && PressureClock::now() - it->second < kPressureHold;
 }
 
 struct ElasticKvRegion::Impl {
@@ -74,6 +107,7 @@ struct ElasticKvRegion::Impl {
         std::uint32_t granule                = 0;
         std::uint64_t generation             = 0;
         cudaEvent_t fence                    = nullptr;
+        bool forced                          = false; ///< a release: past the reserve threshold
     };
 
     ElasticKvRegionSpec spec;
@@ -89,6 +123,7 @@ struct ElasticKvRegion::Impl {
     std::deque<Job> jobs;
     bool stopping = false;
     bool busy     = false;
+    bool release_requested = false; ///< another region on the device is short
     std::thread worker;
 
     // ---- device mapping (caller holds mutex) ----
@@ -147,6 +182,7 @@ struct ElasticKvRegion::Impl {
     // must not go through an unmap and a map (96 driver calls on the 27B) in between.
     std::uint32_t trim_threshold() const noexcept {
         if (spec.reserve_granules == 0) { return 0; } // no reserve: every empty granule goes back
+        if (elastic_kv_device_pressure(spec.device)) { return 0; } // the device is short: no reserve
         return std::max<std::uint32_t>(2 * spec.reserve_granules, spec.reserve_granules + 2);
     }
 
@@ -171,7 +207,7 @@ struct ElasticKvRegion::Impl {
             if (job.kind == Job::Kind::Trim) {
                 // Map the lowest unmapped granules until the reserve is met. The pool hands out
                 // low page ids first, so these are the granules demand reaches next.
-                if (!asleep) {
+                if (!asleep && !elastic_kv_device_pressure(spec.device)) {
                     for (std::uint32_t g = 0;
                          g < granules && mapped_free_count() < spec.reserve_granules; ++g) {
                         if (!state[g].mapped) {
@@ -199,7 +235,7 @@ struct ElasticKvRegion::Impl {
                 Granule& granule = state[job.granule];
                 if (!asleep && granule.mapped && granule.used_pages == 0 &&
                     granule.generation == job.generation &&
-                    mapped_free_count() > trim_threshold()) {
+                    (job.forced || mapped_free_count() > trim_threshold())) {
                     unmap_granule(job.granule);
                 }
             }
@@ -248,8 +284,8 @@ ElasticKvRegion::ElasticKvRegion(ElasticKvRegionSpec spec) : impl_(std::make_uni
         const std::uint32_t cap_pages = impl.spec.cap_pages != 0 ? impl.spec.cap_pages : impl.spec.page_count;
         const std::size_t cap_granules = (cap_pages + impl.spec.granule_pages - 1) / impl.spec.granule_pages;
         const std::size_t cap_bytes    = cap_granules * impl.granule_bytes;
-        std::size_t free_bytes = 0, total_bytes = 0;
-        CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+        const std::size_t free_bytes =
+            impl.spec.free_bytes_probe != nullptr ? impl.spec.free_bytes_probe() : device_free_bytes();
         const std::size_t spoken_for = elastic_kv_unmapped_commitment(impl.spec.device);
         if (cap_bytes > free_bytes - std::min(spoken_for, free_bytes)) {
             throw std::runtime_error(
@@ -259,7 +295,7 @@ ElasticKvRegion::ElasticKvRegion(ElasticKvRegionSpec spec) : impl_(std::make_uni
                 " MiB free");
         }
         const std::lock_guard<std::mutex> lock(ledger_mutex());
-        ledger()[impl_.get()] = Commitment{impl.spec.device, cap_bytes, 0};
+        ledger()[impl_.get()] = Commitment{impl.spec.device, cap_bytes, 0, 0, this};
     }
     driver_check(cuMemAddressReserve(&impl.va, impl.spec.bytes, granularity, 0, 0),
                  "cuMemAddressReserve");
@@ -363,6 +399,90 @@ std::uint32_t ElasticKvRegion::mapped_granules() const noexcept {
     std::uint32_t count = 0;
     for (const Impl::Granule& granule : impl_->state) { count += granule.mapped ? 1U : 0U; }
     return count;
+}
+
+bool ElasticKvRegion::try_entitle(std::uint32_t pages) noexcept {
+    Impl& impl = *impl_;
+    const std::size_t granules = (static_cast<std::size_t>(pages) + impl.spec.granule_pages - 1) /
+                                 impl.spec.granule_pages;
+    const std::size_t bytes = granules * impl.granule_bytes;
+    std::vector<ElasticKvRegion*> to_release;
+    {
+        const std::lock_guard<std::mutex> lock(ledger_mutex());
+        Commitment& mine = ledger()[impl_.get()];
+        // Within the guarantee, or not growing: nothing to ask.
+        if (bytes <= mine.cap || bytes <= mine.entitled) {
+            mine.entitled = bytes;
+            return true;
+        }
+        if (!impl.spec.overcommit) { return false; }
+        // Beyond the guarantee: every region's outstanding bytes, this growth on top of what is
+        // already mapped here, and two granules of slack for the reserve maps in flight must
+        // fit what the device has free right now.
+        const std::size_t others = outstanding_on(impl.spec.device, impl_.get());
+        const std::size_t growth = bytes > mine.mapped ? bytes - mine.mapped : 0;
+        // Two granules cover the reserve maps in flight; the spec's headroom is what the
+        // engine keeps for graph captures and workspace growth.
+        const std::size_t slack = std::max(2 * impl.granule_bytes, impl.spec.headroom_bytes);
+        const std::size_t free_bytes =
+            impl.spec.free_bytes_probe != nullptr ? impl.spec.free_bytes_probe() : device_free_bytes();
+        if (others + growth + slack <= free_bytes) {
+            mine.entitled = bytes;
+            return true;
+        }
+        pressure_marks()[impl.spec.device] = PressureClock::now();
+        for (const auto& [key, entry] : ledger()) {
+            if (entry.device == impl.spec.device && key != impl_.get() && entry.region != nullptr) {
+                to_release.push_back(entry.region);
+            }
+        }
+    }
+    // Off the ledger lock: each region takes its own mutex to post the job.
+    for (ElasticKvRegion* region : to_release) { region->release_reserve(); }
+    return false;
+}
+
+void ElasticKvRegion::set_entitled_pages(std::uint32_t pages) noexcept {
+    Impl& impl = *impl_;
+    const std::size_t granules = (static_cast<std::size_t>(pages) + impl.spec.granule_pages - 1) /
+                                 impl.spec.granule_pages;
+    const std::lock_guard<std::mutex> lock(ledger_mutex());
+    ledger()[impl_.get()].entitled = granules * impl.granule_bytes;
+}
+
+void ElasticKvRegion::release_reserve() noexcept {
+    Impl& impl = *impl_;
+    const std::lock_guard<std::mutex> lock(impl.mutex);
+    impl.release_requested = true;
+}
+
+void ElasticKvRegion::flush_reserve_release() noexcept {
+    Impl& impl = *impl_;
+    const std::lock_guard<std::mutex> lock(impl.mutex);
+    if (!impl.release_requested || impl.asleep || impl.stopping) { return; }
+    // Only the engine's own thread may fence its stream: a record from anywhere else lands
+    // inside whatever that thread is capturing and invalidates the capture. Same rule as
+    // release_page: while a capture is in flight, leave it for the next boundary.
+    cudaStreamCaptureStatus capturing = cudaStreamCaptureStatusNone;
+    if (impl.spec.fence_stream != nullptr &&
+        (cudaStreamIsCapturing(impl.spec.fence_stream, &capturing) != cudaSuccess ||
+         capturing != cudaStreamCaptureStatusNone)) {
+        return;
+    }
+    impl.release_requested = false;
+    for (std::uint32_t g = 0; g < impl.granules; ++g) {
+        Impl::Granule& granule = impl.state[g];
+        if (!granule.mapped || granule.used_pages != 0) { continue; }
+        cudaEvent_t fence = nullptr;
+        if (impl.spec.fence_stream != nullptr) {
+            if (cudaEventCreateWithFlags(&fence, cudaEventDisableTiming) != cudaSuccess) { continue; }
+            if (cudaEventRecord(fence, impl.spec.fence_stream) != cudaSuccess) {
+                (void)cudaEventDestroy(fence);
+                continue;
+            }
+        }
+        impl.post(Impl::Job{Impl::Job::Kind::Unmap, g, granule.generation, fence, /*forced=*/true});
+    }
 }
 
 void ElasticKvRegion::wait_idle() {

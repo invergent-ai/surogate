@@ -86,6 +86,10 @@ struct PagedKVPoolSpec {
     // this, the page count above being only the virtual span any one sequence may reach into.
     // Zero means the whole pool.
     std::uint32_t physical_page_cap     = 0;
+    // Elastic pools: the cap above is a guaranteed floor, not a ceiling; entitlements past it
+    // go through the region's device-wide gate (ElasticKvRegion::try_entitle), so admission
+    // is bounded by the page count and by what the device actually has free.
+    bool overcommit                     = false;
     std::vector<PagedKVPlaneSpec> planes;
 };
 
@@ -110,8 +114,10 @@ struct PagedKVPoolLayout {
 /// What an elastic pool needs from its engine to map on demand.
 struct PagedKVElasticOptions {
     int device                     = 0;
+    std::size_t (*free_bytes_probe)() = nullptr; ///< tests: what the overcommit gate reads as free
     cudaStream_t fence_stream      = nullptr;
     std::uint32_t reserve_granules = 4;
+    std::size_t headroom_bytes     = 0;       ///< overcommit: what the gate leaves free
 };
 
 [[nodiscard]] PagedKVPoolLayout plan_paged_kv_pool(LayoutBuilder& builder,
@@ -168,6 +174,10 @@ public:
     [[nodiscard]] std::uint32_t mapped_pages() const noexcept;
     [[nodiscard]] std::uint32_t free_pages() const noexcept;
     [[nodiscard]] bool can_reserve(std::uint32_t page_entitlement) const noexcept;
+    /// May an allocation's entitlement go from `old_pages` to `new_pages`? Page arithmetic,
+    /// and for an overcommitting elastic pool the device gate; admission asks this.
+    [[nodiscard]] bool can_replace_entitlement(std::uint32_t old_pages,
+                                               std::uint32_t new_pages) const noexcept;
     [[nodiscard]] PagedKVAllocation reserve(std::uint32_t page_entitlement);
 
     /// Occupancy snapshot. `granule_bytes` is the mapping quantum a demand-mapped pool would
@@ -187,8 +197,6 @@ private:
     friend class PagedKVAllocation;
     friend void resize_paged_kv_bundle(std::span<const PagedKVResize> changes);
 
-    [[nodiscard]] bool can_replace_entitlement(std::uint32_t old_pages,
-                                               std::uint32_t new_pages) const noexcept;
     [[nodiscard]] std::vector<std::int32_t> take_pages(std::uint32_t count,
                                                        std::int32_t preferred_first);
     void return_pages(std::span<const std::int32_t> pages) noexcept;
@@ -199,6 +207,11 @@ private:
 
     PagedKVPoolSpec spec_;
     std::unique_ptr<ElasticKvRegion> elastic_; ///< owns the planes' memory when elastic
+    // Overcommit: the entitlement total the device gate last approved. Admission asks with
+    // can_reserve/can_replace_entitlement and reserves a moment later; the per-round ledger
+    // resync in between must not make the reservation ask the gate a second time.
+    mutable std::uint32_t gate_approved_total_ = 0;
+    [[nodiscard]] bool gate_allows(std::uint32_t total_pages) const noexcept;
     std::vector<Tensor> planes_;
     Tensor block_tables_;
     std::vector<std::int32_t> free_page_ids_;

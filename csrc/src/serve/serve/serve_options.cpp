@@ -119,7 +119,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--spec mtp|dflash --draft-tokens N] "
            "[--default-max-tokens N] "
            "[--vision] [--enforce-eager] [--no-prefix-reuse] "
-           "[--enable-sleep-mode] [--elastic-kv] "
+           "[--enable-sleep-mode] [--elastic-kv] [--elastic-kv-overcommit] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -152,6 +152,9 @@ std::string serve_usage_text(const char* argv0) {
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
            "       --elastic-kv maps the Main KV pool's pages on demand: the pool keeps its planned\n"
            "                    size, but only pages in use (plus a small reserve) hold VRAM\n"
+           "       --elastic-kv-overcommit (implies --elastic-kv) guarantees each model only its\n"
+           "                    --kv-capacity (one full-context request when auto) and admits every\n"
+           "                    page past that against the device's free memory, shared across models\n"
            "       --enable-sleep-mode adds POST /sleep and /wake_up: sleeping releases VRAM\n"
            "                           (weights and cache parked in host RAM), waking restores in ~a second\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
@@ -352,6 +355,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.enable_vision = true;
         } else if (arg == "--elastic-kv") {
             options.elastic_kv = true;
+        } else if (arg == "--elastic-kv-overcommit") {
+            options.elastic_kv            = true;
+            options.elastic_kv_overcommit = true;
         } else if (arg == "--enforce-eager") {
             options.use_cuda_graph = false;
         } else if (arg == "--no-prefix-reuse") {

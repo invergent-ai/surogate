@@ -137,7 +137,12 @@ PagedKVPool::PagedKVPool(DeviceSpan backing, const PagedKVPoolLayout& layout,
         region.page_count       = spec_.page_group_count;
         region.granule_pages    = layout.elastic_granule_pages;
         region.reserve_granules = elastic->reserve_granules;
-        region.cap_pages        = capacity_pages();
+        region.cap_pages        = spec_.physical_page_cap != 0
+                                      ? std::min(spec_.physical_page_cap, spec_.page_group_count)
+                                      : spec_.page_group_count;
+        region.overcommit       = spec_.overcommit;
+        region.free_bytes_probe = elastic->free_bytes_probe;
+        region.headroom_bytes   = elastic->headroom_bytes;
         for (const PagedKVPlaneLayout& plane : layout.planes) {
             const auto& shape = plane.storage.shape;
             const Tensor page(nullptr, plane.storage.dtype, {shape[0], shape[1], shape[2], 1});
@@ -204,20 +209,30 @@ std::uint32_t PagedKVPool::free_pages() const noexcept {
 }
 
 std::uint32_t PagedKVPool::capacity_pages() const noexcept {
-    return spec_.elastic && spec_.physical_page_cap != 0
+    return spec_.elastic && spec_.physical_page_cap != 0 && !spec_.overcommit
                ? std::min(spec_.physical_page_cap, spec_.page_group_count)
                : spec_.page_group_count;
 }
 
+bool PagedKVPool::gate_allows(std::uint32_t total_pages) const noexcept {
+    if (!elastic_) { return true; }
+    if (total_pages <= gate_approved_total_) { return true; }
+    if (!elastic_->try_entitle(total_pages)) { return false; }
+    gate_approved_total_ = total_pages;
+    return true;
+}
+
 bool PagedKVPool::can_reserve(std::uint32_t page_entitlement) const noexcept {
     return page_entitlement != 0 && page_entitlement <= logical_page_capacity() &&
-           page_entitlement <= capacity_pages() - entitled_pages_;
+           page_entitlement <= capacity_pages() - entitled_pages_ &&
+           gate_allows(entitled_pages_ + page_entitlement);
 }
 
 bool PagedKVPool::can_replace_entitlement(std::uint32_t old_pages,
                                           std::uint32_t new_pages) const noexcept {
     return old_pages <= entitled_pages_ && new_pages <= logical_page_capacity() &&
-           new_pages <= capacity_pages() - (entitled_pages_ - old_pages);
+           new_pages <= capacity_pages() - (entitled_pages_ - old_pages) &&
+           gate_allows(entitled_pages_ - old_pages + new_pages);
 }
 
 PagedKVAllocation PagedKVPool::reserve(std::uint32_t page_entitlement) {
@@ -228,6 +243,9 @@ PagedKVAllocation PagedKVPool::reserve(std::uint32_t page_entitlement) {
 }
 
 PagedKVOccupancy PagedKVPool::occupancy(std::size_t granule_bytes) const noexcept {
+    // The per-round resync of the ledger: a can_reserve that admitted nothing left the
+    // entitlement it asked for recorded until here.
+    if (elastic_) { elastic_->set_entitled_pages(entitled_pages_); }
     PagedKVOccupancy out;
     out.page_group_count = spec_.page_group_count;
     out.capacity_pages   = capacity_pages();
@@ -388,10 +406,16 @@ void PagedKVPool::return_pages(std::span<const std::int32_t> pages) noexcept {
     }
 }
 
-void PagedKVPool::add_entitlement(std::uint32_t pages) noexcept { entitled_pages_ += pages; }
+void PagedKVPool::add_entitlement(std::uint32_t pages) noexcept {
+    entitled_pages_ += pages;
+    gate_approved_total_ = 0; // consumed: the next growth asks the gate afresh
+    if (elastic_) { elastic_->set_entitled_pages(entitled_pages_); }
+}
 
 void PagedKVPool::replace_entitlement(std::uint32_t old_pages, std::uint32_t new_pages) noexcept {
     entitled_pages_ = entitled_pages_ - old_pages + new_pages;
+    if (new_pages > old_pages) { gate_approved_total_ = 0; }
+    if (elastic_) { elastic_->set_entitled_pages(entitled_pages_); }
 }
 
 void PagedKVPool::acquire_row(std::int32_t row) {

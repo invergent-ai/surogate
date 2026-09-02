@@ -961,6 +961,15 @@ private:
             if (head_lane) {
                 return admit_planned_request(head, *head_lane, BackfillClass::None, 0);
             }
+            // Elastic overcommit: the device gate, not the incumbents, refused the head. The
+            // protection policy reasons on lanes and pages and would find the head unblocked;
+            // the head simply waits for memory (retained lanes go back at the round boundary,
+            // the other engines' reserves have been asked for) and retries next round.
+            if (instance_.program->kv_under_pressure()) {
+                protection_.reset();
+                return control_progress ? AdmissionProgress::ControlProgress
+                                        : AdmissionProgress::None;
+            }
 
             const ActiveAdmissionSet active = active_admission_set();
             if (active.size == 0) {
@@ -1461,6 +1470,18 @@ private:
                         queue_cv_.wait(lock,
                                        [&] { return stopping_ || (!pending_.empty() && !asleep_); });
                     }
+                } else if (!stopping_ && !pending_.empty()) {
+                    // Requests waiting on the elastic overcommit gate with nothing running:
+                    // memory comes back on other engines' round boundaries, not ours, so pace
+                    // the retries instead of spinning through admission.
+                    bool active = false;
+                    for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                        active = active || slots_[lane] != nullptr;
+                    }
+                    if (!active && instance_.program->kv_under_pressure()) {
+                        queue_cv_.wait_for(lock, std::chrono::milliseconds(5),
+                                           [&] { return stopping_; });
+                    }
                 }
                 if (stopping_) {
                     lock.unlock();
@@ -1494,6 +1515,16 @@ private:
                     seg_timer_.maybe_report();
                     pipelined_iteration(have_pending);
                     continue;
+                }
+                // Elastic overcommit: a device short of KV asks every engine on it for its
+                // prefix cache first. Retained lanes are the one thing an idle lane holds.
+                if (instance_.program->kv_service_pressure()) {
+                    for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                        if (slots_[lane] == nullptr && instance_.program->has_retained_lane(lane)) {
+                            instance_.program->evict_retained_lane(lane);
+                            invalidate_lane_plans(lane);
+                        }
+                    }
                 }
                 const RoundMembership membership = build_round_membership();
                 seg_timer_.boundary += std::chrono::duration<double>(Clock::now() - seg_t0).count();

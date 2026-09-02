@@ -191,6 +191,12 @@ public:
     [[nodiscard]] PagedKVOccupancy kv_occupancy() const noexcept;
     /// Blocks until an elastic Main pool has no map or unmap work pending (no-op otherwise).
     void kv_settle() noexcept;
+    /// True while the device this program's elastic pool lives on is short of KV memory:
+    /// the executor gives up its retained (prefix-cache) lanes until it clears.
+    [[nodiscard]] bool kv_under_pressure() const noexcept;
+    /// Round boundary on the executor thread: gives back the reserve if another engine on the
+    /// device asked, and reports whether the device is under pressure.
+    bool kv_service_pressure() noexcept;
     void reset_memory_peaks() noexcept;
     /// Pipeline stage before the last: the pinned buffer holding the residual it exports
     /// (the next stage's `pipeline_import_pinned`); null for a whole-model program.

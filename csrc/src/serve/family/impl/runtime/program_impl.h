@@ -329,6 +329,13 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
             const char* raw = std::getenv("SUROGATE_SERVE_ELASTIC_KV_RESERVE");
             return raw != nullptr && *raw != '\0' ? static_cast<std::uint32_t>(std::atoi(raw)) : 4U;
         }(),
+        // Overcommit gate headroom: what stays free for lazily captured graphs and workspace
+        // growth. A capture that cannot instantiate is fatal, so this errs large.
+        .headroom_bytes = [] {
+            const char* raw = std::getenv("SUROGATE_SERVE_ELASTIC_KV_HEADROOM_MIB");
+            const long mib  = raw != nullptr && *raw != '\0' ? std::strtol(raw, nullptr, 10) : 1024;
+            return static_cast<std::size_t>(mib > 0 ? mib : 0) << 20;
+        }(),
     };
     decoder = std::make_unique<family::DecoderState>(backing, plan.persistent.decoder, &elastic_kv);
     if (plan.persistent.replay_records) {
@@ -445,10 +452,11 @@ bool ProgramImplCore::can_admit_lane(std::uint32_t lane, const RequestPlan& plan
         return false;
     }
     const SequenceState& sequence = sequences[lane];
-    const auto can_replace        = [](const PagedKVPool& pool, std::uint32_t old_pages,
+    // The pool's own test: the page arithmetic, and for an overcommitting elastic pool the
+    // device gate — a refusal there must keep the request pending, not fail its reservation.
+    const auto can_replace = [](const PagedKVPool& pool, std::uint32_t old_pages,
                                 std::uint32_t new_pages) {
-        return old_pages <= pool.entitled_pages() && new_pages <= pool.logical_page_capacity() &&
-               new_pages <= pool.capacity_pages() - (pool.entitled_pages() - old_pages);
+        return pool.can_replace_entitlement(old_pages, new_pages);
     };
     const std::uint32_t old_text = sequence.kv ? sequence.kv->text.page_entitlement() : 0;
     if (!can_replace(decoder->text_kv.pool(), old_text, plan.impl_->text_kv_page_entitlement)) {
@@ -480,15 +488,15 @@ bool ProgramImplCore::can_admit_lane_after_retained_eviction(
         }
     }
 
+    // The retained lanes' entitlements go back before the new one is taken: the pool's test
+    // with them folded into the pages being replaced (device gate included).
     const auto can_replace = [](const PagedKVPool& pool, std::uint32_t old_pages,
                                 std::uint32_t reclaimable_pages, std::uint32_t new_pages) {
         if (old_pages > pool.entitled_pages() ||
-            reclaimable_pages > pool.entitled_pages() - old_pages ||
-            new_pages > pool.logical_page_capacity()) {
+            reclaimable_pages > pool.entitled_pages() - old_pages) {
             return false;
         }
-        const std::uint32_t committed = pool.entitled_pages() - old_pages - reclaimable_pages;
-        return new_pages <= pool.capacity_pages() - committed;
+        return pool.can_replace_entitlement(old_pages + reclaimable_pages, new_pages);
     };
 
     const SequenceState& sequence = sequences[lane];
@@ -3281,6 +3289,18 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
 
 PagedKVOccupancy ProgramImplCore::kv_occupancy() const noexcept {
     return decoder->text_kv.pool().occupancy();
+}
+
+bool ProgramImplCore::kv_service_pressure() noexcept {
+    if (ElasticKvRegion* region = decoder->text_kv.pool().elastic_region()) {
+        region->flush_reserve_release();
+    }
+    return kv_under_pressure();
+}
+
+bool ProgramImplCore::kv_under_pressure() const noexcept {
+    return decoder->text_kv.pool().elastic_region() != nullptr &&
+           elastic_kv_device_pressure(device.device);
 }
 
 void ProgramImplCore::kv_settle() noexcept {

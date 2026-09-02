@@ -183,6 +183,10 @@ struct EngineOptions {
     // its planned size as a virtual span and only the pages in use, plus a small reserve,
     // hold physical memory. Off by default while it is being validated.
     bool elastic_kv                    = false;
+    // With elastic_kv: the pool's physical cap is a guaranteed floor (one full-context request
+    // under automatic sizing) and every page past it is admitted through a device-wide gate
+    // on free memory, so co-resident engines share the device's idle KV.
+    bool elastic_kv_overcommit         = false;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;
