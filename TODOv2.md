@@ -258,8 +258,8 @@ that one file** with zero code naming it, answers "Paris.", and the
 per-tensor formats in the artifact equal what `compressed_tensors` resolves
 from its `quantization_config`.
 
-- [ ] Detection: compressed-tensors parsed in `hf_config.py` through the library; `ingest.py:64`'s substring test removed.
-- [ ] Resolver: meta-device skeleton + checkpoint-derived module names, library matcher, `ignore` first by name (proven exact, §4a). Output is library-native `QuantizationScheme` per module; the map to storage format is a separate, small table.
+- [x] Detection: `HfConfigFactory.get_quant_info` has a compressed-tensors branch (`surogate/core/model/hf_config.py`); the four existing branches answer as before. `ingest.py:64`'s substring test is still there until the converter side moves over.
+- [x] Resolver: `surogate/core/model/quant_schemes.py` — `resolve_checkpoint(model_dir)` → per-module `QuantizationScheme`, library matcher only, `ignore` first by name, cross-checked against the file both ways. `tests/test_quant_schemes.py`: 7 unit cases on a meta-device Llama + the real export (30,880 = 30,880, 10.5 s). The map from scheme to storage format is the next, separate table.
 - [ ] Converter: structure from the architecture's mapping, format from the resolver; `_validate_nvfp4_config`'s single-group and `_validate_source_manifest`'s histogram assertions gone.
 - [ ] C++: `Binder` gains a read-format path; shape still asserted; routability check per op.
 - [ ] C++: `WeightsProfile` removed from the family interface; `resolve_weights` collapses; the planner takes formats from the load plan.
@@ -401,8 +401,15 @@ histograms read from the headers:
 
 ## 4c. M4 findings
 
-- [~] NVFP4 scale swizzle: trainer (`quant_fp4.cu:1512-1529`) vs serve
-  (`layouts.py:466-483`, `nvfp4_config.h:181-188`). Being compared.
+- [x] **The trainer's and serve's NVFP4 scale swizzles are the same layout.**
+  Trainer `scale_swizzled_offset` (`quant_fp4.cu:285-299`) expands to
+  `(rb·⌈cols/4⌉ + col/4)·512 + (rem%32)·16 + (rem/32)·4 + col%4`; serve's
+  `nvfp4_tiled_scale_offset` (`nvfp4_config.h:181-188`) is
+  `(m_tile·tiles + group/4)·512 + (ri&31)·16 + (ri>>5)·4 + (group&3)` —
+  term for term the same, and serve's Python `swizzle_nvfp4_scales`
+  permute reproduces it. Checked numerically: 0 mismatches over
+  256×1024, 9216×2048, 14336×5120 and 128×64 (every scale word). One
+  codec is a pure merge, no conversion step.
 
 ## 5. Surveys feeding this document — all complete
 
