@@ -726,6 +726,22 @@ inline double dot_fp64(const PackedWeight& packed, std::int32_t row, const float
     return acc;
 }
 
+/// One logical row, decoded once, in the oracle's own precision.
+///
+/// `logical_weight_fp64` validates the packing metadata and switches on the
+/// quantisation type on every call. That is invisible for a spot check and
+/// ruinous inside a GEMM oracle that walks the same row once per token: the
+/// NVFP4 and FP8 phases of the input-projection tests spent 31 of their 39
+/// seconds re-decoding rows they had already decoded.
+inline std::vector<double> materialize_row_fp64(const PackedWeight& packed, std::int32_t row) {
+    const std::int32_t k = packed.weight.shape[1];
+    std::vector<double> decoded(static_cast<std::size_t>(k));
+    for (std::int32_t column = 0; column < k; ++column) {
+        decoded[static_cast<std::size_t>(column)] = logical_weight_fp64(packed, row, column);
+    }
+    return decoded;
+}
+
 inline std::vector<float> materialize_rows_fp32(const PackedWeight& packed,
                                                 std::span<const std::int32_t> rows) {
     if (rows.empty()) {

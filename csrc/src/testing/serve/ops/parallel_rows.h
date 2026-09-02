@@ -13,11 +13,30 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <future>
 #include <thread>
 #include <vector>
 
 namespace sinfer::test {
+
+/// Threads an oracle pool may hold.
+///
+/// The suite runs under `ctest -j`, so several test processes are live at once
+/// and a pool sized to the whole machine in each of them oversubscribes badly:
+/// eight processes holding 64 threads apiece on 64 cores took the suite from
+/// 53 s to 132 s and pushed a CPU-bound test past its own tolerance. A modest
+/// per-process pool composes with the outer parallelism instead of fighting it;
+/// SUROGATE_TEST_ORACLE_THREADS overrides it for a test run on its own.
+inline std::int32_t oracle_pool_threads() {
+    const std::int32_t hardware =
+        std::max(1, static_cast<std::int32_t>(std::thread::hardware_concurrency()));
+    if (const char* requested = std::getenv("SUROGATE_TEST_ORACLE_THREADS")) {
+        const int parsed = std::atoi(requested);
+        if (parsed > 0) { return std::min(hardware, static_cast<std::int32_t>(parsed)); }
+    }
+    return std::min(hardware, std::int32_t{8});
+}
 
 /// Applies `function(begin, end)` to a partition of [0, rows) over a shared
 /// pool. Use this when a chunk carries state of its own -- a scratch buffer
@@ -25,8 +44,7 @@ namespace sinfer::test {
 template <class Function>
 void parallel_row_ranges(std::int32_t rows, Function&& function) {
     if (rows <= 0) { return; }
-    static const std::int32_t available =
-        std::max(1, static_cast<std::int32_t>(std::thread::hardware_concurrency()));
+    static const std::int32_t available = oracle_pool_threads();
     static HostWorkerPool pool(static_cast<std::uint32_t>(available), 4096);
 
     const std::int32_t threads = std::min(rows, available);
@@ -56,8 +74,7 @@ void parallel_row_ranges(std::int32_t rows, Function&& function) {
 template <class Function>
 void parallel_rows(std::int32_t rows, Function&& function) {
     if (rows <= 0) { return; }
-    static const std::int32_t available =
-        std::max(1, static_cast<std::int32_t>(std::thread::hardware_concurrency()));
+    static const std::int32_t available = oracle_pool_threads();
     static HostWorkerPool pool(static_cast<std::uint32_t>(available), 4096);
 
     const std::int32_t threads = std::min(rows, available);

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ops/parallel_rows.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
 
@@ -145,16 +146,25 @@ inline std::vector<double>
 projection_oracle(const quantized_weight::PackedWeight& weight, std::int32_t weight_row_offset,
                   std::int32_t output_rows, const std::vector<float>& activation,
                   std::int32_t hidden, std::int32_t tokens, std::int32_t sample_count = 7) {
-    std::vector<double> expected;
     const std::vector<std::int32_t> selected = sampled_rows(output_rows, sample_count);
-    expected.reserve(selected.size() * static_cast<std::size_t>(tokens));
-    for (const std::int32_t local_row : selected) {
+    std::vector<double> expected(selected.size() * static_cast<std::size_t>(tokens));
+    // Decode each sampled row once and dot it against every token, rather than
+    // decoding the whole row again for each token. Same values in the same
+    // summation order -- the weight is simply not re-derived per token.
+    sinfer::test::parallel_rows(static_cast<std::int32_t>(selected.size()),
+                                [&](std::int32_t index) {
+        const std::vector<double> row = quantized_weight::materialize_row_fp64(
+            weight, weight_row_offset + selected[static_cast<std::size_t>(index)]);
         for (std::int32_t token = 0; token < tokens; ++token) {
-            expected.push_back(quantized_weight::dot_fp64(
-                weight, weight_row_offset + local_row,
-                activation.data() + static_cast<std::size_t>(token) * hidden, hidden));
+            const float* column = activation.data() + static_cast<std::size_t>(token) * hidden;
+            double accumulated  = 0.0;
+            for (std::int32_t i = 0; i < hidden; ++i) {
+                accumulated += row[static_cast<std::size_t>(i)] * static_cast<double>(column[i]);
+            }
+            expected[static_cast<std::size_t>(index) * static_cast<std::size_t>(tokens) +
+                     static_cast<std::size_t>(token)] = accumulated;
         }
-    }
+    });
     return expected;
 }
 
