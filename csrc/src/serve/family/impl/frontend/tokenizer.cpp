@@ -702,6 +702,7 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
         ::tokenizer::Tokenizer::Sources sources;
         sources.tokenizer_json        = std::string(resources.tokenizer_json);
         sources.tokenizer_config_json = std::string(resources.tokenizer_config_json);
+        sources.chat_template_jinja   = std::string(resources.chat_template_jinja);
         spm_.reset(new spm_delegate::Handle{::tokenizer::Tokenizer::from_sources(sources)});
     }
 }

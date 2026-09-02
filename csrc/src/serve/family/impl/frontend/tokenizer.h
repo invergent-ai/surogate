@@ -35,6 +35,10 @@ struct TokenizerResources {
     std::string_view tokenizer_json;
     std::string_view tokenizer_config_json;
     std::string_view generation_config_json;
+    /// The chat template in force. The SentencePiece delegate renders it; a
+    /// standalone template takes precedence over tokenizer_config.json's copy,
+    /// which is the HF convention the project tokenizer implements.
+    std::string_view chat_template_jinja;
 };
 
 namespace spm_delegate {

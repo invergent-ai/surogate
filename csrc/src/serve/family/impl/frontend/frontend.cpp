@@ -189,6 +189,46 @@ fi::ProcessorOptions processor_options(const FrontendResources& resources) {
     return options;
 }
 
+/// The chat template a tokenizer_config.json states, in each form HF writes it,
+/// or nullopt when it states none.
+///
+/// Three forms exist. A plain string is the common one. A list of
+/// `{name, template}` objects is the multi-template form, which HF reads into a
+/// dict and serves from the entry named "default" -- it raises without that
+/// entry, whatever the list holds, so a list without one is refused here rather
+/// than guessed at. And the key may be absent: Gemma 3 ships a real
+/// chat_template.jinja and omits it, the newer convention.
+///
+/// Anything else -- null, a number, an object, a malformed list -- is refused.
+/// Reading those as "states nothing" is what made this check fail open: the
+/// artifact's template would then be served with no cross-check at all, which
+/// is the failure the check exists to prevent.
+std::optional<std::string> stated_chat_template(const Json& tokenizer_config) {
+    if (!tokenizer_config.contains("chat_template")) { return std::nullopt; }
+    const Json& stated = tokenizer_config.at("chat_template");
+    if (stated.is_string()) { return stated.get<std::string>(); }
+    if (!stated.is_array()) {
+        throw std::invalid_argument(
+            "tokenizer_config.json.chat_template must be a string or a list of {name, template} "
+            "objects");
+    }
+    std::string names;
+    for (const Json& entry : stated) {
+        if (!entry.is_object() || !entry.contains("name") || !entry.at("name").is_string() ||
+            !entry.contains("template") || !entry.at("template").is_string()) {
+            throw std::invalid_argument("tokenizer_config.json.chat_template list holds an entry "
+                                        "that is not a {name, template} object of strings");
+        }
+        const std::string& name = entry.at("name").get_ref<const std::string&>();
+        if (name == "default") { return entry.at("template").get<std::string>(); }
+        if (!names.empty()) { names += ", "; }
+        names += name;
+    }
+    throw std::invalid_argument(
+        "tokenizer_config.json.chat_template is a list with no \"default\" entry (" + names +
+        "); the checkpoint does not say which template it serves");
+}
+
 void validate_tokenizer_config(const FrontendResources& resources) {
     const Json tokenizer_config =
         parse_resource_json(resources.tokenizer_config_json, "tokenizer_config.json");
@@ -229,10 +269,8 @@ void validate_tokenizer_config(const FrontendResources& resources) {
     if (resources.chat_template_jinja.empty()) {
         throw std::invalid_argument("the artifact carries no frontend/chat_template.jinja");
     }
-    if (tokenizer_config.contains("chat_template") &&
-        tokenizer_config.at("chat_template").is_string() &&
-        tokenizer_config.at("chat_template").get_ref<const std::string&>() !=
-            resources.chat_template_jinja) {
+    const std::optional<std::string> stated = stated_chat_template(tokenizer_config);
+    if (stated.has_value() && *stated != resources.chat_template_jinja) {
         throw std::invalid_argument(
             "tokenizer_config.json.chat_template does not match frontend/chat_template.jinja");
     }
@@ -674,7 +712,19 @@ public:
           tokenizer(std::make_shared<const fi::Tokenizer>(
               fi::TokenizerResources{.tokenizer_json         = resources.tokenizer_json,
                                      .tokenizer_config_json  = resources.tokenizer_config_json,
-                                     .generation_config_json = resources.generation_config_json})),
+                                     .generation_config_json = resources.generation_config_json,
+                                     // The project tokenizer renders the SentencePiece path's
+                                     // chat template, and prefers a standalone one over the
+                                     // config's copy. Hand it the template this frontend serves --
+                                     // the operator's override when there is one, the artifact's
+                                     // jinja otherwise -- so both render paths agree on which
+                                     // template is in force. Without it the delegate fell back to
+                                     // tokenizer_config.json's own copy, which is why an artifact
+                                     // must splice one in to render at all.
+                                     .chat_template_jinja =
+                                         options.chat_template_override.empty()
+                                             ? resources.chat_template_jinja
+                                             : std::string_view(options.chat_template_override)})),
           processor(processor_options(resources)), vision_enabled(options.vision_enabled) {
         if (options.max_context == 0) {
             throw std::invalid_argument("frontend max_context must be nonzero");
@@ -945,6 +995,12 @@ PreparedPromptData PreparedPromptAccess::take(PreparedPrompt&& prompt) {
     if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
     auto data = std::move(prompt.data_);
     return std::move(*data);
+}
+
+void FrontendTestAccess::check_tokenizer_config(const FrontendResources& resources) {
+    // Qualified: unqualified lookup from a member body finds the declaration in
+    // the class before the file-local function, and would recurse.
+    sinfer::family::validate_tokenizer_config(resources);
 }
 
 const PreparedPromptData& FrontendTestAccess::inspect(const PreparedPrompt& prompt) {

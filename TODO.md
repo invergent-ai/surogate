@@ -15,7 +15,10 @@ built, tested, verified on GPU 1 and committed before the next.
 
 ## Group 2 — frontend
 
-- [ ] **TODO** `validate_tokenizer_config` fails open on a present-but-non-string `chat_template` (HF list form, null). Resolve the template whatever form it takes and require agreement with `chat_template.jinja`; unit-test the JSON forms without tokenizer resources.
+- [x] **DONE** (Group 2 commit) `validate_tokenizer_config` no longer fails open: string, list-with-`default`, or absent; every other form refused by name; `sinfer_family_tokenizer_config_test` covers the forms without tokenizer resources.
+- [x] **DONE** (Group 2 commit) The SentencePiece delegate now renders the template the frontend serves (artifact jinja, or the `--chat-template` override, which it silently ignored before).
+- [ ] **TODO** (Group 4) converter `_tokenizer_config_with_template` should refuse an explicit `null` and `_chat_template()`'s message should say "is not a string" for the list form.
+- [ ] **DEFERRED** `test_frontend.cpp` asserts `resources("{{ messages }}")` throws, but `resolve` stopped throwing for unknown templates in 3bc719fd; the test skips without tokenizer resources so nobody sees it.
 
 ## Group 3 — generator / DSL
 
