@@ -68,6 +68,14 @@ using Gqa64_32q4   = GqaGeometry<64, 32, 4, 1>;  // tinyllama-1.1b (the first 64
 // takes its parallelism from that dimension. At scale 1 it would ask for 85 CTAs,
 // a half-empty wave; 4 restores the registry's modal 340 by splitting the keys
 // instead, which is the dimension a multi-query shape has left.
+// Its DecodeSplitScale of 4 makes the lowest tier target 16 keys per split
+// against a 32-key tile, so a split stages a whole tile to admit half of it.
+// Flooring the target at the tile was measured and is a small loss: with one KV
+// head the grid is (KVHeads, splits, batch), so the split count *is* the
+// parallelism, and halving it halves the CTAs on a 170-SM part for staging the
+// floor was meant to save -- 413.4 to 410.3 tok/s at an 8k context, both arms
+// interleaved twice. The scale is buying grid width, and that is worth more
+// here than tile-sized splits.
 using Gqa256_4q1   = GqaGeometry<256, 4, 1, 4>;  // gemma-3-270m (the first MQA shape)
 
 // The registry. Every dispatcher below and in the launchers is generated from

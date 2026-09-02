@@ -1,3 +1,4 @@
+#include "ops/parallel_rows.h"
 #include "ops/linear_swiglu/w8/w8_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/linear_swiglu_test_common.h"
 
@@ -138,17 +139,7 @@ std::vector<double> linear_swiglu_oracle_fp64(const Profile& profile,
     const auto active_by_column = index_nonzero_activations(activation, profile.input_rows, tokens);
     std::vector<double> output(checked_elements(profile.output_rows, tokens, "oracle output size"));
 
-    const unsigned hardware_threads = std::max(1U, std::thread::hardware_concurrency());
-    const std::int32_t thread_count =
-        std::min(profile.output_rows, static_cast<std::int32_t>(hardware_threads));
-    std::vector<std::thread> workers;
-    workers.reserve(static_cast<std::size_t>(thread_count));
-    for (std::int32_t thread = 0; thread < thread_count; ++thread) {
-        const std::int32_t row_begin = static_cast<std::int32_t>(
-            static_cast<std::int64_t>(profile.output_rows) * thread / thread_count);
-        const std::int32_t row_end = static_cast<std::int32_t>(
-            static_cast<std::int64_t>(profile.output_rows) * (thread + 1) / thread_count);
-        workers.emplace_back([&, row_begin, row_end] {
+    sinfer::test::parallel_row_ranges(profile.output_rows, [&](std::int32_t row_begin, std::int32_t row_end) {
             std::vector<double> gate(static_cast<std::size_t>(tokens));
             std::vector<double> up(static_cast<std::size_t>(tokens));
             for (std::int32_t row = row_begin; row < row_end; ++row) {
@@ -172,9 +163,7 @@ std::vector<double> linear_swiglu_oracle_fp64(const Profile& profile,
                     output[static_cast<std::size_t>(token) * profile.output_rows + row] = fused;
                 }
             }
-        });
-    }
-    for (std::thread& worker : workers) { worker.join(); }
+    });
     return output;
 }
 

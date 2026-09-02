@@ -1,3 +1,4 @@
+#include "ops/parallel_rows.h"
 #include "ops/linear/linear_test_common.h"
 
 #include "core/arena.h"
@@ -250,16 +251,7 @@ void cpu_linear_gemm_fp64(const float* weight, const float* activation, double* 
         throw std::invalid_argument("linear test: invalid FP64 GEMM argument");
     }
 
-    const unsigned hardware_threads = std::max(1U, std::thread::hardware_concurrency());
-    const std::int32_t thread_count = std::min(n, static_cast<std::int32_t>(hardware_threads));
-    std::vector<std::thread> workers;
-    workers.reserve(static_cast<std::size_t>(thread_count));
-    for (std::int32_t thread = 0; thread < thread_count; ++thread) {
-        const std::int32_t row_begin =
-            static_cast<std::int32_t>((static_cast<std::int64_t>(n) * thread) / thread_count);
-        const std::int32_t row_end =
-            static_cast<std::int32_t>((static_cast<std::int64_t>(n) * (thread + 1)) / thread_count);
-        workers.emplace_back([=] {
+    sinfer::test::parallel_row_ranges(n, [&](std::int32_t row_begin, std::int32_t row_end) {
             for (std::int32_t row = row_begin; row < row_end; ++row) {
                 const float* weight_row = weight + static_cast<std::size_t>(row) * k;
                 for (std::int32_t token_begin = 0; token_begin < t; token_begin += kOracleTBlock) {
@@ -281,9 +273,7 @@ void cpu_linear_gemm_fp64(const float* weight, const float* activation, double* 
                     }
                 }
             }
-        });
-    }
-    for (std::thread& worker : workers) { worker.join(); }
+    });
 }
 
 bool cuda_available() { return !test::cuda_unavailable(); }
