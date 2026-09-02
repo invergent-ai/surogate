@@ -147,25 +147,9 @@ GenerationResult GenerationHandle::wait(OutputSink* sink, const CancellationView
 
 class Engine::Impl {
 public:
-    using ExecutorGemma3 = runtime::ConcurrentExecutor<targets::Gemma3Instance>;
-    using ExecutorLlama = runtime::ConcurrentExecutor<targets::LlamaInstance>;
-    using ExecutorQwen3 = runtime::ConcurrentExecutor<targets::Qwen3DenseInstance>;
-    using Executor08 = runtime::ConcurrentExecutor<targets::Qwen3_5_0_8BInstance>;
-    using Executor2B = runtime::ConcurrentExecutor<targets::Qwen3_5_2BInstance>;
-    using Executor4B = runtime::ConcurrentExecutor<targets::Qwen3_5_4BInstance>;
-    using Executor27 = runtime::ConcurrentExecutor<targets::Qwen3_6_27BInstance>;
-    using Executor35 = runtime::ConcurrentExecutor<targets::Qwen3_6_35BA3BInstance>;
-    using ExecutorFN = runtime::ConcurrentExecutor<targets::Qwen38FlashNextInstance>;
-    using ExecutorPP   = runtime::ConcurrentExecutor<targets::Qwen38FlashNextPipeline>;
-    using ExecutorPP27 = runtime::ConcurrentExecutor<targets::Qwen3_6_27BPipeline>;
-    using ExecutorPP35 = runtime::ConcurrentExecutor<targets::Qwen3_6_35BA3BPipeline>;
-    using Executor   = std::variant<std::monostate, std::unique_ptr<ExecutorGemma3>,
-                                  std::unique_ptr<ExecutorLlama>, std::unique_ptr<ExecutorQwen3>,
-                                  std::unique_ptr<Executor08>,
-                                  std::unique_ptr<Executor2B>, std::unique_ptr<Executor4B>,
-                                  std::unique_ptr<Executor27>, std::unique_ptr<Executor35>,
-                                  std::unique_ptr<ExecutorFN>, std::unique_ptr<ExecutorPP>,
-                                  std::unique_ptr<ExecutorPP27>, std::unique_ptr<ExecutorPP35>>;
+    // One ConcurrentExecutor per target instance, derived from the registry's
+    // own list so a new target needs no edit here.
+    using Executor = runtime::ExecutorVariantFor<targets::ActiveTarget>;
 
     explicit Impl(EngineOptions engine_options)
         : options(std::move(engine_options)), device(options.device) {
@@ -214,35 +198,15 @@ public:
         if (constructed.resolved_max_context != 0) {
             options.max_context = constructed.resolved_max_context;
         }
-        executor          = std::visit(
+        // Every arm of what used to be a twelve-way if-constexpr ladder here
+        // built ConcurrentExecutor<Instance> from the instance it matched, so
+        // the ladder only restated its own subject.
+        executor = std::visit(
             [&](auto& target_ptr) -> Executor {
                 using Instance =
                     typename std::remove_reference_t<decltype(target_ptr)>::element_type;
-                if constexpr (std::is_same_v<Instance, targets::Gemma3Instance>) {
-                    return std::make_unique<ExecutorGemma3>(*target_ptr, options);
-                } else if constexpr (std::is_same_v<Instance, targets::LlamaInstance>) {
-                    return std::make_unique<ExecutorLlama>(*target_ptr, options);
-                } else if constexpr (std::is_same_v<Instance, targets::Qwen3DenseInstance>) {
-                    return std::make_unique<ExecutorQwen3>(*target_ptr, options);
-                } else if constexpr (std::is_same_v<Instance, targets::Qwen3_5_0_8BInstance>) {
-                    return std::make_unique<Executor08>(*target_ptr, options);
-                } else if constexpr (std::is_same_v<Instance, targets::Qwen3_5_2BInstance>) {
-                    return std::make_unique<Executor2B>(*target_ptr, options);
-                } else if constexpr (std::is_same_v<Instance, targets::Qwen3_5_4BInstance>) {
-                    return std::make_unique<Executor4B>(*target_ptr, options);
-                } else if constexpr (std::is_same_v<Instance, targets::Qwen3_6_27BInstance>) {
-                    return std::make_unique<Executor27>(*target_ptr, options);
-                } else if constexpr (std::is_same_v<Instance, targets::Qwen3_6_35BA3BInstance>) {
-                    return std::make_unique<Executor35>(*target_ptr, options);
-                } else if constexpr (std::is_same_v<Instance, targets::Qwen38FlashNextPipeline>) {
-                    return std::make_unique<ExecutorPP>(*target_ptr, options);
-                } else if constexpr (std::is_same_v<Instance, targets::Qwen3_6_27BPipeline>) {
-                    return std::make_unique<ExecutorPP27>(*target_ptr, options);
-                } else if constexpr (std::is_same_v<Instance, targets::Qwen3_6_35BA3BPipeline>) {
-                    return std::make_unique<ExecutorPP35>(*target_ptr, options);
-                } else {
-                    return std::make_unique<ExecutorFN>(*target_ptr, options);
-                }
+                return std::make_unique<runtime::ConcurrentExecutor<Instance>>(*target_ptr,
+                                                                              options);
             },
             active);
         set_sleepable_allocations(false);

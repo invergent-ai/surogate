@@ -29,6 +29,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <variant>
 #include <utility>
 #include <vector>
 
@@ -1773,5 +1774,24 @@ private:
     ops::EngineOpsContext* ops_context_ = nullptr;
     std::thread worker_;
 };
+
+/// The executor variant matching a variant of target instances.
+///
+/// An engine holds whichever executor its loaded target needs, so the two
+/// variants have to stay in step: one alternative each, in the same order, plus
+/// the empty state an engine has before it constructs one. Writing the second
+/// list out by hand meant that adding a target and forgetting this file gave a
+/// std::get on the wrong alternative rather than a compile error, so it derives
+/// from the first list instead.
+template <class TargetVariant> struct ExecutorVariant;
+
+template <class... Instances>
+struct ExecutorVariant<std::variant<std::unique_ptr<Instances>...>> {
+    using type =
+        std::variant<std::monostate, std::unique_ptr<ConcurrentExecutor<Instances>>...>;
+};
+
+template <class TargetVariant>
+using ExecutorVariantFor = typename ExecutorVariant<TargetVariant>::type;
 
 } // namespace sinfer::runtime
